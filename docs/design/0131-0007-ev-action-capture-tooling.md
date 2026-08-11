@@ -1,7 +1,7 @@
 # `ev_action` capture tooling — make the system-view corpus mechanical, not artisanal
 
-**Status:** in progress — S7.1/S7.2/S7.3/S7.5/S7.6 landed 2026-08-11; S7.4 (the
-Go generator) pending. See "Implementation status" and "Findings" at the end.
+**Status:** accepted — all six slices landed 2026-08-11 (S7.4, the Go
+generator, last). See "Implementation status" and "Findings" at the end.
 **Date:** 2026-08-11
 **Milestone:** M0131 (S7)
 
@@ -173,11 +173,29 @@ emitters, S7.5 the unknown-`atttypid` hard error, S7.6 `--verify`) and
 `internal/initdb/nailed_view_manifest_test.go` (guard #2, offline — the
 manifest is checked in, so only re-capturing needs a real PG).
 
-Pending: **S7.4**, `cmd/gen-nailed-view-tables/main.go`, which renders the
-manifest into `internal/initdb/nailed_view_seed_data.go`. Until it exists the
-`nailedRel`/`nailedAttr` tables stay hand-written in `relcache_init.go` and the
-manifest *checks* them rather than *generating* them — which is why guard #2 is
-worth having on its own. S8b's guards consume the same manifest.
+**S7.4 landed 2026-08-11 (the last slice).** `cmd/gen-nailed-view-tables/main.go`
+(`//go:build ignore`, run from the repo root, stdout redirected per the
+`cmd/gen-pg-proc-data` convention) renders the manifest into
+`internal/initdb/nailed_view_seed_data.go` — a `nailedViewSeedRels()` returning
+all six views' `nailedRel` rows with their `nailedAttr` lists. The six
+hand-written `pgStat*ViewAttrs()` functions and the six literal `nailedRel` rows
+they fed are **deleted**; `nailedLocalRels` now appends `nailedViewSeedRels()`
+to its hand-written catalog-heap literal, and `nailedViewSeedAttrs(name)` gives
+the pin tests a by-name accessor. Two derivations the generator refuses to make
+silently: it emits the manifest's `goopg_reltype` (2249 RECORDOID) rather than
+upstream's per-view composite type, keeping the upstream value in a comment
+until S6.5; and it aborts on `relnatts != len(attrs)`, on a non-identity
+oracle→goopg OID pair, or on out-of-order `attnum`s.
+
+What guard #2 (`nailed_view_manifest_test.go`) means after S7.4: the attribute
+comparison is now manifest-against-manifest-derived and can no longer catch a
+transcription bug (there is nothing left to transcribe) — but it is **not**
+vacuous. It is now the *stale-generated-file* detector: re-capture the manifest
+without re-running the generator and it fails, which is the realistic mistake in
+an S9 widening pass. Its non-derived assertions (pin table ↔ manifest, goopg
+reltype still 2249, `relkind='v'`, `nailedLocalRels` wiring) are unaffected.
+
+S8b's guards consume the same manifest.
 
 Two deviations from the design as written, both forced by the oracle:
 
@@ -222,6 +240,16 @@ The generalisable lesson is the one M0131-S6 already paid for once with
 wrong often enough that it needs a machine oracle, not more care.** The six
 nailed views are now covered; every *other* `nailedAttr` table in
 `relcache_init.go` is still hand-written and unchecked.
+
+**Generating the tables moved the six views' bootstrap pg_class rows.** They
+used to be interleaved in `nailedLocalRels` (wal_receiver first, then the
+batched-28 five); they are now appended in the manifest's capture order, which
+is `systemViewOIDPins()`' ascending-OID order. Heap row order is not a catalog
+invariant — PG reaches these rows by index or seqscan — and the risk that
+mattered (`flattenRels` derives `IsShared` from `heaps[0]`) is unaffected
+because the views are appended after the catalog heaps, never before. Verified,
+not assumed: `internal/initdb` and the whole `^TestE2E_` family, including
+`TestE2E_PGColdStartOnGoopgDataDir`, are green with the reordered seed.
 
 Noted, not fixed: goopg's own runtime virtual replication views
 (`internal/initdb/replication_views.go`) declare **every** column as `text`,

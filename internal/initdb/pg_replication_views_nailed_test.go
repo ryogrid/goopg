@@ -98,7 +98,7 @@ func TestPgStatReplicationViewAttrs(t *testing.T) {
 		{"sync_state", 25, -1},
 		{"reply_time", 1184, 8},
 	}
-	checkViewAttrs(t, "pg_stat_replication", pgStatReplicationViewAttrs(), want)
+	checkViewAttrs(t, "pg_stat_replication", nailedViewSeedAttrs("pg_stat_replication"), want)
 }
 
 // TestPgStatRecoveryPrefetchViewAttrs pins the 10 column descriptors for
@@ -120,7 +120,7 @@ func TestPgStatRecoveryPrefetchViewAttrs(t *testing.T) {
 		{"block_distance", 23, 4},
 		{"io_depth", 23, 4},
 	}
-	checkViewAttrs(t, "pg_stat_recovery_prefetch", pgStatRecoveryPrefetchViewAttrs(), want)
+	checkViewAttrs(t, "pg_stat_recovery_prefetch", nailedViewSeedAttrs("pg_stat_recovery_prefetch"), want)
 }
 
 // TestPgStatSubscriptionViewAttrs pins the 11 column descriptors for
@@ -143,7 +143,7 @@ func TestPgStatSubscriptionViewAttrs(t *testing.T) {
 		{"latest_end_lsn", 3220, 8},
 		{"latest_end_time", 1184, 8},
 	}
-	checkViewAttrs(t, "pg_stat_subscription", pgStatSubscriptionViewAttrs(), want)
+	checkViewAttrs(t, "pg_stat_subscription", nailedViewSeedAttrs("pg_stat_subscription"), want)
 }
 
 // TestPgReplicationSlotsViewAttrs pins the 21 column descriptors for
@@ -178,7 +178,7 @@ func TestPgReplicationSlotsViewAttrs(t *testing.T) {
 		{"failover", 16, 1},
 		{"synced", 16, 1},
 	}
-	checkViewAttrs(t, "pg_replication_slots", pgReplicationSlotsViewAttrs(), want)
+	checkViewAttrs(t, "pg_replication_slots", nailedViewSeedAttrs("pg_replication_slots"), want)
 }
 
 // TestPgStatReplicationSlotsViewAttrs pins the 10 column descriptors for
@@ -206,7 +206,7 @@ func TestPgStatReplicationSlotsViewAttrs(t *testing.T) {
 		{"total_bytes", 20, 8},
 		{"stats_reset", 1184, 8},
 	}
-	checkViewAttrs(t, "pg_stat_replication_slots", pgStatReplicationSlotsViewAttrs(), want)
+	checkViewAttrs(t, "pg_stat_replication_slots", nailedViewSeedAttrs("pg_stat_replication_slots"), want)
 }
 
 // checkViewAttrs is a shared helper for the five view attr tests.

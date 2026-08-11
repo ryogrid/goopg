@@ -281,7 +281,13 @@ var nailedSharedRels = flattenRels([]nailedRel{
 })
 
 // nailedLocalRels lists all local nailed relations (heaps + indexes flattened).
-var nailedLocalRels = flattenRels([]nailedRel{
+//
+// The hand-written literal below carries the catalog heaps; the nailed system
+// VIEWS are appended from nailedViewSeedRels(), which is generated from the
+// real-PG capture in nailed_view_manifest.tsv (M0131-S7.4). Views come last
+// because that is the manifest's capture order, and because the heap rows must
+// keep their historical positions — flattenRels takes IsShared from heaps[0].
+var nailedLocalRels = flattenRels(append([]nailedRel{
 	{1247, "pg_type", 71, 'r', 14, false, pgTypeAttrs()},
 	{1249, "pg_attribute", 75, 'r', 24, false, pgAttributeAttrs()},
 	{1259, "pg_class", 83, 'r', 34, false, pgClassAttrs()},
@@ -694,17 +700,21 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// true). The pg_rewrite _RETURN rows carrying ev_action landed with
 	// Step 3dm (pg_rewrite_bootstrap.go); M0131-S6 flipped relhasrules
 	// on, so a hosted PG actually runs RelationBuildRuleLock over them.
-	{pgStatWalReceiverViewOID, "pg_stat_wal_receiver", 2249, 'v', 15, false, pgStatWalReceiverAttrs()},
-	// M0106-0010 batched-28: seed pg_class + pg_attribute rows for the 5
+	//
+	// M0131-S7.4: this row and the five batched-28 replication views below it
+	// used to be six literals here, each with a hand-transcribed
+	// pgStat*ViewAttrs() column table. They now come from
+	// nailedViewSeedRels() (nailed_view_seed_data.go), generated out of the
+	// oracle capture in nailed_view_manifest.tsv, and are appended to this
+	// literal below. The comment above is retained because
+	// it records WHY the row exists and what a hosted PG does with it; the
+	// values themselves are no longer written by hand.
+	//
+	// M0106-0010 batched-28 seeded pg_class + pg_attribute rows for the 5
 	// remaining replication views so PG's RangeVarGetRelid returns a non-zero
-	// OID. RelType=2249 (RECORDOID) matches the underlying SRF's prorettype.
-	// pg_rewrite _RETURN rows are deferred to batched-29 (Step 3dm).
-	{pgStatReplicationViewOID, "pg_stat_replication", 2249, 'v', 20, false, pgStatReplicationViewAttrs()},
-	{pgStatRecoveryPrefetchViewOID, "pg_stat_recovery_prefetch", 2249, 'v', 10, false, pgStatRecoveryPrefetchViewAttrs()},
-	{pgStatSubscriptionViewOID, "pg_stat_subscription", 2249, 'v', 11, false, pgStatSubscriptionViewAttrs()},
-	{pgReplicationSlotsViewOID, "pg_replication_slots", 2249, 'v', 21, false, pgReplicationSlotsViewAttrs()},
-	{pgStatReplicationSlotsViewOID, "pg_stat_replication_slots", 2249, 'v', 10, false, pgStatReplicationSlotsViewAttrs()},
-}, []idxSpec{
+	// OID; RelType=2249 (RECORDOID) matches the underlying SRF's prorettype,
+	// and their pg_rewrite _RETURN rows landed with batched-29 (Step 3dm).
+}, nailedViewSeedRels()...), []idxSpec{
 	{OID: 2703, Name: "pg_type_oid_index"},
 	{OID: 2704, Name: "pg_type_typname_nsp_index"},
 	{OID: 2658, Name: "pg_attribute_relid_attnam_index"},
@@ -2599,162 +2609,33 @@ func pgRewriteAttrs() []nailedAttr {
 	}
 }
 
-
-// pgStatWalReceiverAttrs returns the 15 pg_attribute rows for the
-// `pg_catalog.pg_stat_wal_receiver` view (M0106-0010 Step 3dl). Column
-// order, names, and types are verbatim from
-// `postgres/src/backend/catalog/system_views.sql:945-963`, which
-// projects all 15 OUT-args of `pg_stat_get_wal_receiver()` (pg_proc OID
-// 3317, see Step 3dj/3dk). View columns inherit nullability from the
-// underlying expression so pg_attribute.attnotnull is false even for
-// fixed-width columns.
+// nailedViewSeedAttrs returns the pg_attribute descriptors of one nailed
+// system view, by relation name. The tables themselves are generated from the
+// oracle capture — nailed_view_seed_data.go, rendered by
+// cmd/gen-nailed-view-tables/main.go out of nailed_view_manifest.tsv
+// (M0131-S7.4).
 //
-// Type OID legend (verbatim from `postgres/src/include/catalog/pg_proc.dat:5671`):
+// The six hand-transcribed pgStat*ViewAttrs() functions this replaced were
+// read off system_views.sql and pg_proc.dat by eye, and at least one was wrong
+// in a way only a live PG could settle: pg_stat_replication_slots.slot_name is
+// text (25, len -1) — the OUT parameter of pg_stat_get_replication_slot
+// (pg_proc.dat:5676-5680) — not the name (19, len 64) column of the
+// pg_replication_slots base view it is named after (system_views.sql:
+// 1045-1059). A hosted PG builds its TupleDesc from these rows, so name/64
+// against a text datum deforms garbage (tupdesc.c:105); it stayed latent only
+// because the view returns no rows when no slot exists.
 //
-//	int4 = 23, text = 25, pg_lsn = 3220, timestamptz = 1184
-func pgStatWalReceiverAttrs() []nailedAttr {
-	return []nailedAttr{
-		{Name: "pid", TypeOID: 23, Num: 1, Len: 4},
-		{Name: "status", TypeOID: 25, Num: 2, Len: -1},
-		{Name: "receive_start_lsn", TypeOID: 3220, Num: 3, Len: 8},
-		{Name: "receive_start_tli", TypeOID: 23, Num: 4, Len: 4},
-		{Name: "written_lsn", TypeOID: 3220, Num: 5, Len: 8},
-		{Name: "flushed_lsn", TypeOID: 3220, Num: 6, Len: 8},
-		{Name: "received_tli", TypeOID: 23, Num: 7, Len: 4},
-		{Name: "last_msg_send_time", TypeOID: 1184, Num: 8, Len: 8},
-		{Name: "last_msg_receipt_time", TypeOID: 1184, Num: 9, Len: 8},
-		{Name: "latest_end_lsn", TypeOID: 3220, Num: 10, Len: 8},
-		{Name: "latest_end_time", TypeOID: 1184, Num: 11, Len: 8},
-		{Name: "slot_name", TypeOID: 25, Num: 12, Len: -1},
-		{Name: "sender_host", TypeOID: 25, Num: 13, Len: -1},
-		{Name: "sender_port", TypeOID: 23, Num: 14, Len: 4},
-		{Name: "conninfo", TypeOID: 25, Num: 15, Len: -1},
+// Panics on an unknown name: every caller is compile-time-fixed catalog code,
+// so a miss means the manifest lost a view and the bootstrap seed would be
+// silently incomplete.
+func nailedViewSeedAttrs(relName string) []nailedAttr {
+	for _, r := range nailedViewSeedRels() {
+		if r.RelName == relName {
+			return r.Attrs
+		}
 	}
-}
-
-// pgStatReplicationViewAttrs returns the 20 pg_attribute rows for the
-// pg_catalog.pg_stat_replication view (OID 12231, batched-28).
-// Column order and types from system_views.sql:906-930 + pg_proc.dat (OID 3099).
-// View columns inherit nullability from the underlying expression → NotNull=false.
-func pgStatReplicationViewAttrs() []nailedAttr {
-	return []nailedAttr{
-		{Name: "pid", TypeOID: 23, Num: 1, Len: 4},
-		{Name: "usesysid", TypeOID: 26, Num: 2, Len: 4},
-		{Name: "usename", TypeOID: 19, Num: 3, Len: 64},
-		{Name: "application_name", TypeOID: 25, Num: 4, Len: -1},
-		{Name: "client_addr", TypeOID: 869, Num: 5, Len: -1},
-		{Name: "client_hostname", TypeOID: 25, Num: 6, Len: -1},
-		{Name: "client_port", TypeOID: 23, Num: 7, Len: 4},
-		{Name: "backend_start", TypeOID: 1184, Num: 8, Len: 8},
-		{Name: "backend_xmin", TypeOID: 28, Num: 9, Len: 4},
-		{Name: "state", TypeOID: 25, Num: 10, Len: -1},
-		{Name: "sent_lsn", TypeOID: 3220, Num: 11, Len: 8},
-		{Name: "write_lsn", TypeOID: 3220, Num: 12, Len: 8},
-		{Name: "flush_lsn", TypeOID: 3220, Num: 13, Len: 8},
-		{Name: "replay_lsn", TypeOID: 3220, Num: 14, Len: 8},
-		{Name: "write_lag", TypeOID: 1186, Num: 15, Len: 16},
-		{Name: "flush_lag", TypeOID: 1186, Num: 16, Len: 16},
-		{Name: "replay_lag", TypeOID: 1186, Num: 17, Len: 16},
-		{Name: "sync_priority", TypeOID: 23, Num: 18, Len: 4},
-		{Name: "sync_state", TypeOID: 25, Num: 19, Len: -1},
-		{Name: "reply_time", TypeOID: 1184, Num: 20, Len: 8},
-	}
-}
-
-// pgStatRecoveryPrefetchViewAttrs returns the 10 pg_attribute rows for the
-// pg_catalog.pg_stat_recovery_prefetch view (OID 12244, batched-28).
-// Column order and types from system_views.sql:965-977 + pg_proc.dat (OID 6248).
-func pgStatRecoveryPrefetchViewAttrs() []nailedAttr {
-	return []nailedAttr{
-		{Name: "stats_reset", TypeOID: 1184, Num: 1, Len: 8},
-		{Name: "prefetch", TypeOID: 20, Num: 2, Len: 8},
-		{Name: "hit", TypeOID: 20, Num: 3, Len: 8},
-		{Name: "skip_init", TypeOID: 20, Num: 4, Len: 8},
-		{Name: "skip_new", TypeOID: 20, Num: 5, Len: 8},
-		{Name: "skip_fpw", TypeOID: 20, Num: 6, Len: 8},
-		{Name: "skip_rep", TypeOID: 20, Num: 7, Len: 8},
-		{Name: "wal_distance", TypeOID: 23, Num: 8, Len: 4},
-		{Name: "block_distance", TypeOID: 23, Num: 9, Len: 4},
-		{Name: "io_depth", TypeOID: 23, Num: 10, Len: 4},
-	}
-}
-
-// pgStatSubscriptionViewAttrs returns the 11 pg_attribute rows for the
-// pg_catalog.pg_stat_subscription view (OID 12248, batched-28).
-// Column order and types from system_views.sql:979-994 + pg_proc.dat (OID 6118).
-func pgStatSubscriptionViewAttrs() []nailedAttr {
-	return []nailedAttr{
-		{Name: "subid", TypeOID: 26, Num: 1, Len: 4},
-		{Name: "subname", TypeOID: 19, Num: 2, Len: 64},
-		{Name: "worker_type", TypeOID: 25, Num: 3, Len: -1},
-		{Name: "pid", TypeOID: 23, Num: 4, Len: 4},
-		{Name: "leader_pid", TypeOID: 23, Num: 5, Len: 4},
-		{Name: "relid", TypeOID: 26, Num: 6, Len: 4},
-		{Name: "received_lsn", TypeOID: 3220, Num: 7, Len: 8},
-		{Name: "last_msg_send_time", TypeOID: 1184, Num: 8, Len: 8},
-		{Name: "last_msg_receipt_time", TypeOID: 1184, Num: 9, Len: 8},
-		{Name: "latest_end_lsn", TypeOID: 3220, Num: 10, Len: 8},
-		{Name: "latest_end_time", TypeOID: 1184, Num: 11, Len: 8},
-	}
-}
-
-// pgReplicationSlotsViewAttrs returns the 21 pg_attribute rows for the
-// pg_catalog.pg_replication_slots view (OID 12261, batched-28).
-// Column order and types from system_views.sql:1019-1043 + pg_proc.dat (OID 3781).
-// PG18 adds two_phase_at, inactive_since, conflicting, invalidation_reason,
-// failover, synced as the last six entries.
-func pgReplicationSlotsViewAttrs() []nailedAttr {
-	return []nailedAttr{
-		{Name: "slot_name", TypeOID: 19, Num: 1, Len: 64},
-		{Name: "plugin", TypeOID: 19, Num: 2, Len: 64},
-		{Name: "slot_type", TypeOID: 25, Num: 3, Len: -1},
-		{Name: "datoid", TypeOID: 26, Num: 4, Len: 4},
-		{Name: "database", TypeOID: 19, Num: 5, Len: 64},
-		{Name: "temporary", TypeOID: 16, Num: 6, Len: 1},
-		{Name: "active", TypeOID: 16, Num: 7, Len: 1},
-		{Name: "active_pid", TypeOID: 23, Num: 8, Len: 4},
-		{Name: "xmin", TypeOID: 28, Num: 9, Len: 4},
-		{Name: "catalog_xmin", TypeOID: 28, Num: 10, Len: 4},
-		{Name: "restart_lsn", TypeOID: 3220, Num: 11, Len: 8},
-		{Name: "confirmed_flush_lsn", TypeOID: 3220, Num: 12, Len: 8},
-		{Name: "wal_status", TypeOID: 25, Num: 13, Len: -1},
-		{Name: "safe_wal_size", TypeOID: 20, Num: 14, Len: 8},
-		{Name: "two_phase", TypeOID: 16, Num: 15, Len: 1},
-		{Name: "two_phase_at", TypeOID: 3220, Num: 16, Len: 8},
-		{Name: "inactive_since", TypeOID: 1184, Num: 17, Len: 8},
-		{Name: "conflicting", TypeOID: 16, Num: 18, Len: 1},
-		{Name: "invalidation_reason", TypeOID: 25, Num: 19, Len: -1},
-		{Name: "failover", TypeOID: 16, Num: 20, Len: 1},
-		{Name: "synced", TypeOID: 16, Num: 21, Len: 1},
-	}
-}
-
-// pgStatReplicationSlotsViewAttrs returns the 10 pg_attribute rows for the
-// pg_catalog.pg_stat_replication_slots view (OID 12266, batched-28).
-// Column order and types from system_views.sql:1045-1059 + pg_proc.dat (OID 6169).
-func pgStatReplicationSlotsViewAttrs() []nailedAttr {
-	return []nailedAttr{
-		// text(25), NOT name(19). M0131-S7's oracle capture caught this
-		// transcription bug: the view selects `s.slot_name`, the OUT
-		// parameter of pg_stat_get_replication_slot (pg_proc.dat:5676-5680,
-		// proallargtypes starts `{text,text,…}`), NOT `r.slot_name` from the
-		// pg_replication_slots base view — that one really is name(19), which
-		// is where the wrong value came from (system_views.sql:1045-1059).
-		// A hosted PG builds its TupleDesc from these rows, so name/64 here
-		// against a text/-1 datum deforms garbage (tupdesc.c:105). It stayed
-		// latent only because the view returns zero rows with no slots
-		// defined, which is what M0131-S6's evaluability assertion sees.
-		{Name: "slot_name", TypeOID: 25, Num: 1, Len: -1},
-		{Name: "spill_txns", TypeOID: 20, Num: 2, Len: 8},
-		{Name: "spill_count", TypeOID: 20, Num: 3, Len: 8},
-		{Name: "spill_bytes", TypeOID: 20, Num: 4, Len: 8},
-		{Name: "stream_txns", TypeOID: 20, Num: 5, Len: 8},
-		{Name: "stream_count", TypeOID: 20, Num: 6, Len: 8},
-		{Name: "stream_bytes", TypeOID: 20, Num: 7, Len: 8},
-		{Name: "total_txns", TypeOID: 20, Num: 8, Len: 8},
-		{Name: "total_bytes", TypeOID: 20, Num: 9, Len: 8},
-		{Name: "stats_reset", TypeOID: 1184, Num: 10, Len: 8},
-	}
+	panic("nailedViewSeedAttrs: no generated seed for system view " + relName +
+		" (re-run scripts/capture-ev-action.sh, then cmd/gen-nailed-view-tables)")
 }
 
 func pgTriggerAttrs() []nailedAttr {
