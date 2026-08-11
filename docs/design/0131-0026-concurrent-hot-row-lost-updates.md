@@ -113,27 +113,71 @@ with and without `BEGIN`/`COMMIT`: **exactly 1600 of 1600**, `count(*)` correct.
 | `pgbench_tellers` | under-applied | **exact** | −68 881 |
 | `pgbench_branches` | ~10× over | −54 588 (under) | −68 881 |
 
-## 7. What is still open (M0131-S32.2)
+## 7. M0131-S32.2 — the SeqScan arm (fixed 2026-08-12, loop #146)
 
-The SeqScan-driven arm still loses updates: `NOIDX=1 ROWS=1 CLIENTS=8 N=200`
-lands 1063 of 1600. The duplicate-live-row class is gone (`count(*)` is correct
-and `epq_self_modified`/`epq_chain_notfound` are both zero), so the remaining
-loss is NOT in the write phase — it is in the **scan** phase: the statement finds
-no matching row at all and reports `UPDATE 0`. The suspicion is a visibility
-gap where the old version is treated as dead because its xmax committed, while
-the successor's xmin committed after the statement snapshot, so neither version
-is visible and the row momentarily vanishes. `pgbench_branches` (5 rows) is
-planned as a SeqScan, which is why it is the one table still diverging.
+The SeqScan-driven arm lost updates for two further reasons, both in the
+**scan-phase** EPQ loop (`updateOp.Next`, inside the `scanMatching` callback) —
+a loop the S32.1 fixes never touched, because S32.1 only hardened the two
+*write-phase* loops.
 
-Resume point: instrument the `s321ScanNoRow` counter (already declared) in the
-seq-scan update path and compare `mvcc.TupleVisible` against
-`HeapTupleSatisfiesUpdate` (`postgres/src/backend/access/heap/heapam_visibility.c`).
+**Defect C — the same silent chain-follow skip, one loop earlier.** When the
+scan-phase EPQ loop's `epqFollowHOT`/`epqFollowChain` produced nothing it did
+`return nil // row deleted by concurrent tx`, dropping the row from `pending`
+before the write phase ever saw it. That is why the losses looked like a scan
+problem from outside: the row never entered `pending`, so the statement reported
+`UPDATE 0` with no write-phase counter firing. As in S32.1 the premise is wrong —
+a chain tip owned by a transaction still in flight is not a delete. Fix: the same
+`epqChainPendingWriter` + `epqWait` + retry, bounded by `epqRetryLimit`.
+Measured effect alone: `scan_epq_notfound` 20 708 → 4 852.
+
+**Defect D — the EPQ snapshot leaked into the scan, forking one row into many.**
+`epqWait` refreshes `ctx.Snap` (so the following `epqRecheckVisible` sees the
+committer). In the write-phase loops that is harmless — the scan is over. In the
+scan-phase loop it is not: `scanMatching` decides tuple visibility from the very
+same `ctx.Snap`. Refreshing it mid-scan lets the rest of the scan see versions
+committed *after* statement start, so the same logical row is handed to the
+callback twice — once as the version live at statement start, once as a
+successor another session has since committed. Both entries land in `pending`,
+both are written, and because they are two *different* physical tuples the
+S32.1 `TM_SelfModified` guard (which keys on our own xmax) does not fire: the
+row forks into two live versions, then those fork again. At
+`NOIDX=1 ROWS=1 CLIENTS=8 N=200` a one-row table ended with 130 live rows and
+`sum(v)` 96 435 instead of 1600 — the pgbench_branches "over-applied"
+signature. Upstream holds the scan's snapshot fixed for the whole statement and
+confines the EPQ re-fetch to the tuple being updated
+(`postgres/src/backend/executor/execMain.c`, `EvalPlanQual*`). Fix: save
+`ctx.Snap` before the loop and restore it on every path that returns to the
+scan.
+
+Both defects are needed: with only C the fork gets worse (166 live rows); with
+only D the losses remain.
+
+### Result
+
+`analysis/concurrent-hotrow.sh` is now exact — 1600/1600, `count(*)` correct,
+zero client errors — in all four configurations: `NOIDX=1` ROWS=1 and ROWS=5,
+the IndexScan arm ROWS=1 and ROWS=5, with and without `BEGIN`/`COMMIT`.
+
+`RUNS=1 LOADSEC=30 analysis/atomicity-nocrash-control.sh` (pgbench TPC-B,
+scale 5, 16 clients):
+
+| table | S32.1 | S32.2 | `sum(delta)` |
+|---|---|---|---|
+| `pgbench_accounts` | exact | exact | −969 135 |
+| `pgbench_tellers` | exact | exact | −969 135 |
+| `pgbench_branches` | −54 588 vs −68 881 (−21 %) | −966 698 (−0.25 %) | −969 135 |
+
+So theresidual is now ~0.25 % on the single hottest 5-row table under a
+4-table `BEGIN`/`COMMIT` workload, tracked as **M0131-S32.3**; the isolated
+single-table repro is exact.
 
 ## 8. Files
 
 - `internal/executor/operators_storage.go` — `epqChainPendingWriter`, the
   pending-writer wait in both EPQ loops, the `TM_SelfModified` guard in both.
 - `internal/executor/s321_probe.go` — env-gated diagnostic counters
-  (`GOOPG_S321_PROBE=1`) and the `GOOPG_S321_NOWAIT=1` A/B kill switch.
-  Temporary; remove with S32.2.
+  (`GOOPG_S321_PROBE=1`) and the `GOOPG_S321_NOWAIT=1` / `GOOPG_S322_NOWAIT=1`
+  A/B kill switches (write-phase and scan-phase wait respectively — the split is
+  what attributed the fork to defect D rather than to defect C). Temporary;
+  remove with M0131-S32.3.
 - `analysis/concurrent-hotrow.sh` — the deterministic minimal repro / gate.

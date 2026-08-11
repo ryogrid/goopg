@@ -4995,6 +4995,20 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			oldRow := cloneRow(evalRow)
 			beforeFiredP1 := false
 			if !isInheritChild {
+				// M0131-S32.2: this EPQ loop runs INSIDE the scan callback, and
+				// epqWait refreshes ctx.Snap — the very snapshot scanMatching is
+				// using to decide which tuples to hand us. Leaking the refreshed
+				// snapshot back into the scan lets the rest of the scan see
+				// versions committed after statement start, so the SAME logical
+				// row can be handed to this callback twice (once as the old
+				// version, once as a successor written by another session) and the
+				// statement then writes BOTH — forking one logical row into two
+				// live versions (the over-application signature). Upstream keeps
+				// the scan's snapshot fixed for the whole statement and confines
+				// the EPQ re-fetch to the updating tuple
+				// (postgres/src/backend/executor/execMain.c EvalPlanQual*), so the
+				// refreshed snapshot must not outlive this loop.
+				scanSnap := o.ctx.Snap
 				for epqRetry := 0; ; epqRetry++ {
 					s, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: captureRel, Block: writeBlk})
 					if perr != nil {
@@ -5082,7 +5096,36 @@ func (o *updateOp) Next() (TupleSlot, error) {
 						}
 					}
 					if !found {
-						return nil // row deleted by concurrent tx
+						// M0131-S32.2: the SeqScan arm's scan-phase EPQ loop had
+						// the same defect S32.1 fixed in the write-phase loops —
+						// a failed chain-follow was read as "row deleted by a
+						// concurrent tx" and the row was dropped from `pending`
+						// silently, so the statement reported `UPDATE 0` while a
+						// live successor existed. Under contention the tip is
+						// routinely owned by a writer that has not committed yet
+						// (its xmin is invisible to any snapshot), which is not a
+						// delete. PG blocks on that updater (XactLockTableWait in
+						// heap_lock_tuple, driven by ExecUpdate's TM_Updated loop)
+						// and re-fetches. Do the same: wait, refresh the RC
+						// snapshot, and re-run the loop; epqRetryLimit bounds it.
+						// epqWait already refreshes ctx.Snap on return, so the
+						// retry re-walks the chain under a snapshot that includes
+						// the writer we just waited for.
+						if pendXID, inflight := epqChainPendingWriter(o.ctx, captureRel, writeBlk, writeSlot); inflight && !s322NoWait &&
+							epqRetry < epqRetryLimit(o.ctx.Tx.Isolation) {
+							s321Note(s321ScanEPQPendingWait)
+							if dl, terr := epqWait(o.ctx, pendXID); terr != nil {
+								terr.Pos = o.plan.Pos()
+								return terr
+							} else if dl {
+								return &ExecError{Code: "40001", Pos: o.plan.Pos(),
+									Message: "could not serialize access due to concurrent update (deadlock)"}
+							}
+							continue
+						}
+						s321Note(s321ScanEPQNotFound)
+						o.ctx.Snap = scanSnap
+						return nil // row genuinely deleted by concurrent tx
 					}
 					clear(o.ctx.MultiAssignSubqCache)
 					for i := range captureCols {
@@ -5106,6 +5149,8 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					writeBlk, writeSlot = newBlk, newSlot
 					continue
 				}
+				// Hand the scan back its own snapshot (see scanSnap above).
+				o.ctx.Snap = scanSnap
 				if len(scanTbl.Triggers) > 0 {
 					ret, ok, err := fireTriggers(o.ctx, scanTbl, "before", "update", oldRow, newRow)
 					if err != nil {
@@ -5135,6 +5180,9 @@ func (o *updateOp) Next() (TupleSlot, error) {
 		}); err != nil {
 			return nil, err
 		}
+	}
+	if len(pending) == 0 {
+		s321Note(s321ScanNoRow)
 	}
 	hotEligibleSeq := hotUpdateEligible(o.plan, o.ctx)
 	// M0118-0003 (write-path half): classify this UPDATE for the row-lock wait

@@ -1,50 +1,43 @@
-Task: M0131-S32.1 — FIXED for the index-driven UPDATE arm and committed.
-Successor filed: **M0131-S32.2** (SeqScan arm, scan-phase loss).
+Task: M0131-S32.2 — FIXED and committed. Successor filed: **M0131-S32.3**.
 
-Root cause (loop #145), two defects with opposite signs:
-(A) The EvalPlanQual retry loop read a failed chain-follow as "the row is gone"
-    (`if !chainFound { epqSkip = true; break }`) and skipped the row SILENTLY
-    while still reporting `UPDATE 1`. Under contention the chain tip is
-    routinely owned by a transaction that has not committed yet, so the write
-    is dropped: 1112 of 1946 attempts. PG blocks on that updater
-    (XactLockTableWait) and re-fetches. Fix = `epqChainPendingWriter` +
-    `epqWait` + RC snapshot refresh + retry, in BOTH EPQ loops.
-(B) Retrying exposed convergence: two `pending` entries of one statement reach
-    the same physical tuple; `isConcurrentlyUpdated` ignores our own xmax, so
-    the second re-stamped a tuple we had already killed and inserted a SECOND
-    live version (1720 live rows in a 1-row table) — the pgbench_branches ~10x
-    over-application. Fix = PG's `TM_SelfModified` skip at both EPQ loop tops.
+Root cause (loop #146), both in the SCAN-phase EPQ loop inside
+`updateOp.Next`'s `scanMatching` callback (S32.1 only hardened the two
+WRITE-phase loops):
+(C) `return nil // row deleted by concurrent tx` on a failed chain-follow —
+    the same not-found-means-deleted skip S32.1 fixed one loop later. The row
+    never entered `pending`, so the statement reported `UPDATE 0` and no
+    write-phase counter fired; that is why S32.1 mis-filed the residue as an
+    `mvcc.TupleVisible` hole. Fix = `epqChainPendingWriter` + `epqWait` +
+    retry (scan_epq_notfound 20708 -> 4852).
+(D) `epqWait` refreshes `ctx.Snap`, and `scanMatching` uses that SAME snapshot
+    for visibility. Refreshing mid-scan let the rest of the scan see
+    post-statement commits, so one logical row was handed to the callback
+    twice (two DIFFERENT physical tuples ⇒ the S32.1 TM_SelfModified guard
+    cannot fire) and forked: 130 live rows in a 1-row table. Fix = save/restore
+    `ctx.Snap` around the loop. PG keeps the scan snapshot fixed
+    (execMain.c EvalPlanQual*).
 
-Files: `internal/executor/operators_storage.go`, new
-`internal/executor/s321_probe.go` (env-gated counters, `GOOPG_S321_PROBE=1`,
-plus `GOOPG_S321_NOWAIT=1` A/B kill switch — both temporary, delete with S32.2),
-new `analysis/concurrent-hotrow.sh` (minimal repro + gate),
-`docs/design/0131-0026-concurrent-hot-row-lost-updates.md`,
+Files: `internal/executor/operators_storage.go` (seq arm scan-phase loop),
+`internal/executor/s321_probe.go` (+2 counters, +`GOOPG_S322_NOWAIT` A/B
+switch — temporary, delete with S32.3),
+`docs/design/0131-0026-concurrent-hot-row-lost-updates.md` §7,
 `docs/design/README.md`, `.ralph/fix_plan.md`, `.ralph/deferral_ledger.md`.
 
-Next step: work **M0131-S32.2**. Gate `NOIDX=1 ROWS=1 CLIENTS=8 N=200 bash
-analysis/concurrent-hotrow.sh` lands 1063/1600. Write-phase classes are CLOSED
-there (`count(*)` correct, `epq_self_modified=0`, `epq_chain_notfound=0`) — the
-statement finds NO row and reports `UPDATE 0`, so start in the SCAN phase:
-instrument the already-declared `s321ScanNoRow` counter, then diff
-`mvcc.TupleVisible` against `HeapTupleSatisfiesUpdate`
-(`postgres/src/backend/access/heap/heapam_visibility.c`). Hypothesis: goopg
-treats a version as dead the moment its xmax COMMITS regardless of
-statement-snapshot visibility, so a hot row briefly has no visible version.
-pgbench_branches (5 rows) is planned as a SeqScan — it is the last table
-diverging in the S32.1 gate.
+Next step: work **M0131-S32.3** — pgbench control still 0.25% short on
+`pgbench_branches` (-966698 vs -969135) while the isolated repro is exact in
+every config. The harnesses differ by the multi-statement 4-table
+BEGIN/COMMIT, so FIRST extend `analysis/concurrent-hotrow.sh` with a TXN mode
+that writes a second table inside the same transaction; then re-run with
+`GOOPG_S321_PROBE=1` and read `epq_chain_pending_wait`/`scan_epq_pending_wait`
+against `epqRetryLimit`/`maxEPQRetriesRC` (suspicion: retry ceiling reached
+under longer xmax lifetimes).
 
-Harness trap hit this loop: an orphaned server from an earlier probe still
-listening on the port absorbs the whole run (fresh server fails to bind, psql
-still connects, numbers come from the wrong cluster). concurrent-hotrow.sh now
-preflights the port; atomicity-nocrash-control.sh does NOT.
-
-Gates run: concurrent-hotrow.sh exact 1600/1600 at ROWS=1 and ROWS=5, with and
-without BEGIN/COMMIT (was 470/1600); `RUNS=1 LOADSEC=30
-analysis/atomicity-nocrash-control.sh` — sum(tbalance) now EXACT (-68881, was
--14938), sum(bbalance) -54588 (was -309543 ~10x over), still OVERALL: FAIL by
-design until S32.2; `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
-PASS (rc=0); `scripts/tpch-spotcheck.sh` RESULT=PASS (Q12=2, Q13=35).
+Gates run: `analysis/concurrent-hotrow.sh` PASS 1600/1600, count(*) exact,
+0 client errors, all four configs (NOIDX ROWS=1/5, index arm ROWS=1/5, TXN
+on/off); `RUNS=1 LOADSEC=30 analysis/atomicity-nocrash-control.sh` —
+abalance/tbalance EXACT, bbalance -966698 vs -969135, OVERALL FAIL by design
+until S32.3; `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
+PASS; `scripts/tpch-spotcheck.sh` RESULT=PASS (Q12=2, Q13=35).
 NOT run: TPC-DS SF0.5 gate (~1 h).
 
 In-flight: none.

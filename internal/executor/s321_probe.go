@@ -24,6 +24,11 @@ var s321Enabled = os.Getenv("GOOPG_S321_PROBE") == "1"
 // against the pre-fix behaviour without rebuilding. Diagnostic only.
 var s321NoWait = os.Getenv("GOOPG_S321_NOWAIT") == "1"
 
+// s322NoWait isolates the S32.2 SCAN-phase pending-writer wait from the S32.1
+// write-phase one, so a run can attribute a behaviour change to exactly one of
+// the two. Diagnostic only; goes away with s321NoWait.
+var s322NoWait = os.Getenv("GOOPG_S322_NOWAIT") == "1"
+
 var s321Counters [s321NumSites]atomic.Int64
 
 type s321Site int
@@ -41,6 +46,8 @@ const (
 	s321ScanDedup                           // pending dedupe suppressed a duplicate index hit
 	s321EPQSelfModified                     // EPQ: target already killed by THIS txn -> skip
 	s321EPQChainPendingWait                 // EPQ: chain tip owned by an in-flight writer -> wait + retry
+	s321ScanEPQNotFound                     // S32.2: scan-phase EPQ gave up on the chain -> row SKIPPED
+	s321ScanEPQPendingWait                  // S32.2: scan-phase chain tip in flight -> wait + retry
 	s321NumSites
 )
 
@@ -48,6 +55,7 @@ var s321Names = [s321NumSites]string{
 	"hot_skip_itemid", "hot_skip_concurrent", "hot_nospace", "hot_applied",
 	"epq_chain_notfound", "epq_oldget_fail", "epq_chain_followed", "epq_wrote",
 	"scan_no_row", "scan_dedup", "epq_self_modified", "epq_chain_pending_wait",
+	"scan_epq_notfound", "scan_epq_pending_wait",
 }
 
 var s321Events atomic.Int64
