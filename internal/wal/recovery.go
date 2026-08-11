@@ -2734,6 +2734,16 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 				return false, err
 			}
 			return true, nil
+		case xlogHeap2LockUpdated:
+			// M0131-S21a-2 part 4: XLOG_HEAP_LOCK's near-sibling — a tuple-lock
+			// request (FOR UPDATE/SHARE, an FK RI check) that finds its target
+			// already updated by a concurrent live transaction re-locks the
+			// newest visible version of the chain instead, on RM_HEAP2 because
+			// the chain walk can cross multiple row versions.
+			if err := replayDecodedXLogHeap2LockUpdated(mgr, r, xlog); err != nil {
+				return false, err
+			}
+			return true, nil
 		case xlogHeap2NewCid:
 			// M0131-S21a: XLOG_HEAP2_NEW_CID exists solely so logical decoding
 			// can map a catalog tuple to the command id that produced it;
@@ -3551,6 +3561,54 @@ func replayDecodedXLogHeapConfirm(mgr *storage.Manager, r Record, xlog *XLogDeco
 	}
 	if err := storage.PageSetHeapTupleCtid(page, offnum, storage.ItemPointer{Block: block.Block, Offset: offnum}); err != nil {
 		return fmt.Errorf("wal: xlog heap-confirm apply: %w", err)
+	}
+	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
+	return mgr.WriteBlock(block.Rel, block.Block, page)
+}
+
+// replayDecodedXLogHeap2LockUpdated applies a real-PG XLOG_HEAP2_LOCK_UPDATED,
+// mirroring heap_xlog_lock_updated (heapam_xlog.c). M0131-S21a-2 part 4.
+//
+// It is XLOG_HEAP_LOCK's near-sibling on RM_HEAP2: emitted by
+// heap_lock_updated_tuple_rec when a tuple-lock request discovers the row it
+// locked was concurrently updated and re-locks the newest visible version in
+// the update chain instead. The wire struct (xl_heap_lock_updated) is
+// byte-identical to xl_heap_lock's — same decode, same infobits translation —
+// so this reuses decodeXLogHeapLockMainData and xlogHeapLockInfomaskBits; only
+// the tuple mutation differs (storage.PageApplyHeapLockUpdatedRedo omits the
+// locked-only t_ctid/HOT_UPDATED fixup and the cmax stamp — see its doc
+// comment for why).
+func replayDecodedXLogHeap2LockUpdated(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
+	block, ok := xlogBlockRefByID(xlog, 0)
+	if !ok {
+		return fmt.Errorf("wal: xlog heap2-lock-updated missing block 0")
+	}
+	if block.HasImage && block.ImageApply {
+		return restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN))
+	}
+	xmax, offnum, infobits, flags, err := decodeXLogHeapLockMainData(xlog.MainData)
+	if err != nil {
+		return err
+	}
+	// XLH_LOCK_ALL_FROZEN_CLEARED runs BEFORE and independently of the heap
+	// page redo, same as XLOG_HEAP_LOCK (part 3's rationale applies verbatim:
+	// "the visibility map may need to be fixed even if the heap page is
+	// already up-to-date", heapam_xlog.c heap_xlog_lock_updated).
+	if flags&xlhLockAllFrozenCleared != 0 {
+		if err := redoClearVMBitsForHeapBlock(mgr, block.Rel, block.Block, storage.VMAllFrozen); err != nil {
+			return fmt.Errorf("wal: xlog heap2-lock-updated vm: %w", err)
+		}
+	}
+	page, skip, err := redoExistingHeapPageForBlock(mgr, block, storage.LSN(r.EndLSN))
+	if err != nil {
+		return fmt.Errorf("wal: xlog heap2-lock-updated: %w", err)
+	}
+	if skip {
+		return nil
+	}
+	infomaskBits, infomask2Bits := xlogHeapLockInfomaskBits(infobits)
+	if err := storage.PageApplyHeapLockUpdatedRedo(page, offnum, storage.TransactionID(xmax), infomaskBits, infomask2Bits); err != nil {
+		return fmt.Errorf("wal: xlog heap2-lock-updated apply: %w", err)
 	}
 	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
 	return mgr.WriteBlock(block.Rel, block.Block, page)

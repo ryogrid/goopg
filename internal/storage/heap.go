@@ -1551,6 +1551,65 @@ func PageApplyHeapLockRedo(p Page, slot uint16, xmax TransactionID, infomaskBits
 	return nil
 }
 
+// PageApplyHeapLockUpdatedRedo re-applies a PostgreSQL XLOG_HEAP2_LOCK_UPDATED
+// record's tuple mutation, mirroring heap_xlog_lock_updated (heapam_xlog.c)
+// byte for byte. M0131-S21a-2 part 4.
+//
+// It is XLOG_HEAP_LOCK's near-sibling — emitted by heap_lock_updated_tuple_rec
+// when a tuple-lock request (SELECT ... FOR UPDATE/SHARE, an FK RI check, an
+// UPDATE about to rewrite its target row) discovers the row it locked was
+// concurrently updated and re-locks the newest visible version of the chain —
+// but upstream's redo is deliberately smaller than PageApplyHeapLockRedo's:
+// there is no "locked-only" t_ctid/HOT_UPDATED fixup (a lock taken on an
+// already-updated tuple can never legitimately claim to be the chain's head)
+// and no cmax stamp (a re-locked older version was never the transaction's
+// own command target, so FirstCommandId would be a fabricated cmax).
+//
+// infomaskBits / infomask2Bits are xlogHeapLockInfomaskBits' output — the
+// caller has already translated xl_heap_lock_updated's infobits_set wire byte
+// (the struct is byte-identical to xl_heap_lock's).
+//
+// blk/slot/p semantics match PageApplyHeapLockRedo. Callers hold the page
+// write lock and set pd_lsn themselves.
+func PageApplyHeapLockUpdatedRedo(p Page, slot uint16, xmax TransactionID, infomaskBits, infomask2Bits uint16) error {
+	if slot == 0 {
+		return ErrInvalidSlot
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return err
+	}
+	idx := int(slot) - 1
+	if idx < 0 || idx >= count {
+		return ErrInvalidSlot
+	}
+	item, err := readItemID(p, idx)
+	if err != nil {
+		return err
+	}
+	// Upstream elog(PANIC, "invalid lp") here; goopg returns the error so the
+	// caller can name the record that carried the bad offset.
+	if item.Flags != ItemIDNormal {
+		return fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, slot, item.Flags)
+	}
+	off := int(item.Offset)
+	if off+22 > len(p) {
+		return fmt.Errorf("%w: slot=%d off=%d", ErrCorruptTuple, slot, off)
+	}
+	infomask2 := binary.LittleEndian.Uint16(p[off+18 : off+20])
+	infomask := binary.LittleEndian.Uint16(p[off+20 : off+22])
+
+	infomask &^= HeapXmaxBits | HeapMoved
+	infomask2 &^= HeapKeysUpdated
+	infomask |= infomaskBits & (HeapXmaxIsMulti | HeapXmaxLockOnly | HeapXmaxExclLock | HeapXmaxKeyShrLock)
+	infomask2 |= infomask2Bits & HeapKeysUpdated
+	binary.LittleEndian.PutUint32(p[off+4:off+8], uint32(xmax))
+
+	binary.LittleEndian.PutUint16(p[off+18:off+20], infomask2)
+	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
+	return nil
+}
+
 // PageSetHeapTupleXmaxMulti stamps the given heap tuple's xmax with a
 // MultiXactId and the caller-computed hint bits (see internal/multixact.HintBits).
 // It is the multixact sibling of PageSetHeapTupleLockOnly: where that helper

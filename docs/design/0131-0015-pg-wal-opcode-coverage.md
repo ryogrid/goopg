@@ -626,6 +626,52 @@ LSN-skipped and that it does not create an absent fork; and the addressing
 math's three boundaries (within a byte, across a byte, across a vm page) round-
 tripped through `parseVMPage` so redo and the fork writer cannot drift.
 
+### S21a-2 — implementation notes, part 4: HEAP2_LOCK_UPDATED (landed 2026-08-12)
+
+`XLOG_HEAP2_LOCK_UPDATED` (0x60) is `XLOG_HEAP_LOCK`'s near-sibling, emitted by
+`heap_lock_updated_tuple_rec` when a tuple-lock request — `SELECT ... FOR
+UPDATE/SHARE`, a foreign-key RI check, an `UPDATE` about to rewrite its target
+row — discovers the row it locked was concurrently updated by a still-live
+transaction. Rather than lock the (now-stale) version it started with, PG walks
+the update chain and locks the newest visible version instead; that record is
+this opcode. It lives on RM_HEAP2 rather than RM_HEAP because the chain walk
+can cross multiple row versions, unlike a plain lock which always targets the
+tuple the statement is looking at.
+
+**The wire struct is byte-identical to `xl_heap_lock`'s** — `xmax`(4) +
+`offnum`(2) + `infobits_set`(1) + `flags`(1), same layout, same field meaning
+— so `replayDecodedXLogHeap2LockUpdated` reuses part 2's
+`decodeXLogHeapLockMainData`, `xlogHeapLockInfomaskBits`,
+`redoExistingHeapPageForBlock`, and the `XLH_LOCK_ALL_FROZEN_CLEARED` →
+`redoClearVMBitsForHeapBlock` call verbatim, in the same before-and-independent
+position relative to the tuple redo.
+
+**The tuple mutation is deliberately smaller than `PageApplyHeapLockRedo`'s.**
+Upstream's `heap_xlog_lock_updated` clears `HEAP_XMAX_BITS|HEAP_MOVED`, ORs in
+the infobits, and stamps `xmax` — full stop. It has **no** "locked-only"
+branch (no `t_ctid` self-pointer, no `HEAP_HOT_UPDATED` clear) and **no**
+`cmax` stamp, both present in `heap_xlog_lock`. The reason is what the opcode
+means: the tuple being restamped is *not* the chain head the original locker
+was targeting — it is an older, already-updated version being re-locked in
+passing — so it can never legitimately claim to own the forward chain link
+(clearing it would corrupt a live successor pointer) or claim `FirstCommandId`
+as its own command's cmax (the locking backend's *actual* command target is a
+different tuple version). New `storage.PageApplyHeapLockUpdatedRedo` is this
+reduced set of operations, not a parameterised call into
+`PageApplyHeapLockRedo` — the two functions must diverge on exactly these two
+points, so keeping them textually separate makes an accidental reconvergence
+a diff, not a silent behavior change.
+
+Guards (`internal/wal/heap_lock_updated_pg_test.go`, 7 tests, all proven
+fail-when-broken by three scripted reverts): a pre-existing forward `t_ctid`
+link and `HEAP_HOT_UPDATED` survive untouched; a pre-existing `cmax` sentinel
+survives untouched; stale `HEAP_XMAX_*`/`HEAP_MOVED` bits are still cleared;
+the pd_lsn idempotency interlock; the RBM_NORMAL absent-page skip; the
+"invalid lp" refusal; the main-data length refusal; and
+`XLH_LOCK_ALL_FROZEN_CLEARED` clearing the VM's `ALL_FROZEN` bit through the
+shared `redoClearVMBitsForHeapBlock` call (proving the new dispatch case wires
+it correctly, not just that the shared helper works).
+
 ## Guards
 
 1. Per-opcode unit tests over fixtures captured from a real PG 18.3 via

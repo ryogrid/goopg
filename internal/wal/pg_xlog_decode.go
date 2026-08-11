@@ -79,6 +79,15 @@ const (
 	// visibility-map fork rather than the main fork.
 	xlogHeap2Visible uint8 = 0x40
 
+	// XLOG_HEAP2_LOCK_UPDATED (M0131-S21a-2 part 4, heapam_xlog.h:65): the
+	// near-sibling of XLOG_HEAP_LOCK, emitted when a tuple-lock request
+	// (SELECT ... FOR UPDATE/SHARE, a FK RI check, an UPDATE about to
+	// rewrite a row) discovers the row was already updated by a concurrent
+	// still-live transaction — the locker re-locks the *newest visible
+	// version* of the row via heap_lock_updated_tuple_rec, which is on RM_HEAP2
+	// because it can chain across multiple row versions.
+	xlogHeap2LockUpdated uint8 = 0x60
+
 	// xlogVisibilitymapXLogCatalogRel is VISIBILITYMAP_XLOG_CATALOG_REL
 	// (visibilitymapdefs.h:31): an xl_heap_visible flags bit that exists only
 	// on the wire, telling a hot standby that the relation is catalog-ish when
