@@ -314,3 +314,42 @@ and retry the lookup — never keep a dirty duplicate.
 Gate for the fix: `analysis/pageident_probe.sh` must report zero
 `PAGEIDENT-DUPSLOT` / `PAGEIDENT-EMIT-REGRESS` over several runs, and
 `RUNS=3 bash analysis/crashprobe30.sh` must stop losing rows for this cause.
+
+## Update 2026-08-11 (loop #137) — FIXED
+
+The fix landed in `Pool.pinNewXID` (`internal/storage/bufpool.go`), and it is
+narrower than the direction sketched above. Publishing the bufmap entry *before*
+`mgr.Extend` is not available to us: the block number does not exist until
+Extend returns, so there is no tag to publish. What actually made the duplicate
+durable was step 3, and only step 3 — step 1's publication is unreachable
+(`pinMu` is held, the slot is not in the bufmap, and `claimVictim` skips it
+because it is pinned).
+
+So the "fall through: keep our publication" branch is gone. A losing extender
+now always un-publishes (`s.tag = BufferTag{}` + `releaseVictimSlot`, matching
+`pinLoad`'s loser path) and re-acquires the block through the normal `Pool.Pin`
+path. `Pin` is the important detail: the old code only tried `tryPinSlot`, which
+*refuses a slot with `ioInflight` set* — precisely the state the winner is in
+while it reads the block, i.e. exactly the interleaving that produced the
+duplicate. `Pin` instead waits out that read on the per-slot semaphore. Nothing
+is lost by handing the caller the winner's slot: the page the winner reads back
+is the initialized image `Extend` itself just wrote to disk.
+
+Guard: `TestPinNewLosingExtenderDoesNotKeepDuplicateSlot`
+(`internal/storage/bufpool_extendrace_test.go`) drives the interleaving
+deterministically — the racing `Pin` is started from inside `OnExtendDone` (the
+window where `pinMu` is not held) and parked inside its read via `OnPinWait`, so
+the extender reaches `bmInsert` while the winner still has `ioInflight` set. It
+asserts `PinNew` returns the bufmap's slot and that no second slot is left
+holding the tag. Pre-fix it fails on both assertions (`slot 1 is a duplicate
+live copy of {{0 1 7301 0} 1} (mapped slot is 2)`); post-fix it passes, also
+under `-race`.
+
+Measured: `LOADSEC=60 CLIENTS=24 bash analysis/pageident_probe.sh` ×3 reports
+**zero** `PAGEIDENT-*` events (it fired in ~3 of 4 runs before). `RUNS=3 bash
+analysis/crashprobe30.sh` still FAILs, as expected — its remaining failures are
+the atomicity/row-loss signature of S30.1/S30.2 (the WAL tail discarded at crash
+recovery, `docs/design/0131-0020`), a different defect that this slice does not
+touch. The `GOOPG_PAGEIDENT_PROBE` instrumentation stays in the tree until S30
+as a whole closes; it is the only detector for this family and costs nothing
+when the env var is unset.

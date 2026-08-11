@@ -1749,18 +1749,31 @@ func (p *Pool) pinNewXID(rel RelFileNode, createXID TransactionID) (*Slot, Block
 
 	// Insert into bufmap. Under pinMu, no other goroutine can insert the same tag.
 	if !p.bmInsert(tag, int32(victimIdx), gen) {
-		// Another goroutine published this block while we were in Extend.
-		// Use their slot and release ours.
-		if existingIdx, existingGen := p.bm.Lookup(tag); existingIdx >= 0 {
-			if existing := p.tryPinSlot(existingIdx, existingGen); existing != nil {
-				p.traceSlotEvent(int32(victimIdx), evReleaseVictimSlot, tag, s.state.Load(), 0)
-				s.tag = BufferTag{}
-				s.state.Store(0)
-				p.pinMu.Unlock()
-				return existing, blk, nil
-			}
+		// Another goroutine published this block while we were inside Extend:
+		// the block joins nblocks the instant Extend returns, so a concurrent
+		// Pin misses the bufmap and loads it into a slot of its own.
+		//
+		// We MUST give ours up. Keeping an un-mapped valid+dirty publication
+		// (the pre-M0131-S30.3 "fall through" branch) leaves two live slots for
+		// one block: the un-mapped one is a normal clock-sweep victim, so its
+		// near-empty image is later written back over whatever the mapped slot
+		// accumulated, and every subsequent HOT update on the resurrected page
+		// re-uses line pointers that the WAL already spent (S30.3's
+		// new_off = 2, 3, 4 … signature).
+		//
+		// Un-publish, then re-acquire through the normal Pin path — unlike a
+		// bare tryPinSlot it also waits out the winner's in-flight read instead
+		// of failing on stateIO. The page the winner reads is exactly the
+		// initialized image Extend just wrote to disk, so nothing is lost.
+		p.traceSlotEvent(int32(victimIdx), evReleaseVictimSlot, tag, s.state.Load(), 0)
+		s.tag = BufferTag{}
+		p.releaseVictimSlot(victimIdx)
+		p.pinMu.Unlock()
+		existing, err := p.Pin(tag)
+		if err != nil {
+			return nil, InvalidBlockNumber, err
 		}
-		// Fall through: keep our publication.
+		return existing, blk, nil
 	}
 
 	p.pinMu.Unlock()
