@@ -852,6 +852,7 @@ func (r *relFile) readBlock(blk BlockNumber, buf []byte) error {
 		return fmt.Errorf("read %s blk %d: short %d of %d", r.path, blk, n, BlockSize)
 	}
 	recordIOTrace(BufferTag{Rel: r.rel, Block: blk}, "postRead", buf)
+	PageIdentityObserve(BufferTag{Rel: r.rel, Block: blk}, buf, "postRead")
 	return r.verifyOnRead(blk, buf)
 }
 
@@ -873,6 +874,7 @@ func (r *relFile) writeBlock(blk BlockNumber, buf []byte) error {
 		return fmt.Errorf("write %s blk %d: short %d of %d", r.path, blk, n, BlockSize)
 	}
 	recordIOTrace(BufferTag{Rel: r.rel, Block: blk}, "postWrite", written)
+	PageIdentityObserve(BufferTag{Rel: r.rel, Block: blk}, written, "postWrite")
 	return nil
 }
 
@@ -891,6 +893,7 @@ func (r *relFile) extend(buf []byte) (BlockNumber, error) {
 	}
 	r.nblocks++
 	recordIOTrace(BufferTag{Rel: r.rel, Block: blk}, "postExtend", written)
+	PageIdentityExtend(BufferTag{Rel: r.rel, Block: blk})
 	return blk, nil
 }
 
@@ -938,6 +941,7 @@ func (r *relFile) extendBatch(buf []byte, n int) (BlockNumber, error) {
 	r.nblocks += BlockNumber(n)
 	for i := 0; i < n; i++ {
 		recordIOTrace(BufferTag{Rel: r.rel, Block: first + BlockNumber(i)}, "postExtendBatch", big[i*BlockSize:(i+1)*BlockSize])
+		PageIdentityExtend(BufferTag{Rel: r.rel, Block: first + BlockNumber(i)})
 	}
 	return first, nil
 }

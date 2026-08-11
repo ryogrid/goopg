@@ -119,3 +119,81 @@ Unchanged: `RUNS=3 bash analysis/crashprobe30.sh` must print `OVERALL: PASS`.
 The preserved directory gives the fix a second, faster gate: starting goopg on a
 copy of `/tmp/s30_3_repro/data` must succeed, and afterwards block 130 of
 `pgbench_tellers` must be a page the runtime could actually have produced.
+
+## Update 2026-08-11 (loop #134): the probe was built and BOTH prime suspects
+## came back negative — but a third, unlogged page mutation was found
+
+### The probe
+
+`internal/storage/pageident_probe.go` (temporary, gated on
+`GOOPG_PAGEIDENT_PROBE=1`) exploits the two invariants this document derived:
+
+* for a given `(rel, block)` the heap line-pointer **count only ever grows**
+  (`PageAddHeapTuple` appends at `count+1`; `VacuumHeapPageBySlots` never
+  shrinks the array), so a count below the high-water mark previously seen for
+  that tag proves the slot's *bytes* belong to a different block than its *tag*
+  → `PAGEIDENT-REGRESS`;
+* a block number is handed out by `extend`/`extendBatch` exactly once, so a
+  hand-out of a block that already carried tuples → `PAGEIDENT-REEXTEND`.
+
+It observes at every disk read, every disk write, every pre-eviction flush, and
+inside `tryApplyHOTUpdate` under the content lock. Only heap pages are checked:
+a btree page legitimately loses line pointers on split (`pd_special != BlockSize`
+is the filter — without it the first run reported 336 benign split hits,
+`lp=205 high=407`, on the pgbench indexes).
+
+Driver: `analysis/pageident_probe.sh` (same load as `crashprobe30.sh`, no kill).
+
+### Result: negative on both suspects
+
+| run | load | heap `PAGEIDENT-REGRESS` | `PAGEIDENT-REEXTEND` |
+|---|---|---|---|
+| `analysis/pageident_probe.sh` | scale 5, 16 clients, 45 s, no crash (1805 TPS) | 0 | 0 |
+| `RUNS=1 PORT=5536 analysis/crashprobe30.sh` | the original probe, kill at 30 s — **reproduced the loss (497287/500000 rows, 2713 missing)** | 0 | 0 |
+
+So buffer-pool tag/content aliasing did **not** occur in a run that did lose
+committed rows. Suspect 2 is dead on inspection rather than measurement:
+`relFile.readBlock` returns `ErrShortRead` for `blk >= nblocks` and `pinLoad`
+propagates that error — there is no path that publishes a silently `PageInit`-ed
+page for a block past EOF. (`goopg smgr O_CREATE recreates removed files` applies
+to a whole missing *fork*, not to a short one.)
+
+### What the probe surfaced instead: an UNLOGGED page mutation in this very path
+
+`tryApplyHOTUpdate`'s orphan-cleanup arm (`operators_storage.go:3746`) calls
+`storage.PageRemoveHeapTuple(s.Page(), newSlot)` when the old-slot stamp fails —
+and emits **no WAL record at all** for that mutation, while the `PagePruneOpt`
+that usually *caused* the failure was logged (`markHeapPruneOptDirty`).
+`PageRemoveHeapTuple` does not merely blank the line pointer: when the removed
+slot is the last one it **shrinks `pd_lower`** (`heap.go:697-699`), i.e. it
+reduces the page's line-pointer count. The slot is already dirty from the logged
+prune, so the mutation reaches disk — and replay, which never saw it, rebuilds a
+*larger* page than the runtime had. That is the S30.3 signature exactly: the
+runtime and the WAL disagreeing about a page's line-pointer array, with no record
+to explain the difference.
+
+It shrinks by one line pointer per occurrence, so it does not by itself explain
+`185 → 1`; it is filed as its own defect (**M0131-S30.5**) rather than as the
+S30.3 root cause. Upstream has no unlogged heap-page mutation of this kind:
+`PageRepairFragmentation` truncates trailing unused line pointers only inside a
+vacuum/prune that is itself WAL-logged under a cleanup lock
+(`postgres/src/backend/storage/page/bufpage.c`).
+
+### Where S30.3 stands
+
+Still open, and the search space is now smaller. Remaining candidates, in order:
+
+1. the unlogged mutation above, or another like it, applied repeatedly (the probe
+   would only catch it once the page is re-read or re-flushed — a page mutated
+   and then lost to the crash is invisible to `postWrite`/`postRead`);
+2. the emit side writing a `new_off` that is not the `newSlot` it used
+   (`markHeapHotUpdateDirty`'s encoding is not yet independently verified against
+   the runtime value — worth one assertion);
+3. replay applying a correctly-decoded record to a page it rebuilt differently
+   earlier in the stream (i.e. the divergence starts at an EARLIER record for
+   block 130, not at 826236).
+
+Next probe: extend `PageIdentityObserve` to fire inside `PageRemoveHeapTuple`
+itself and at `markHeapHotUpdateDirty` (asserting `new_off == newSlot` and
+`newSlot == PageLinePointerCount(page)`), so an emit-time inconsistency is caught
+before the crash can hide it.

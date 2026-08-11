@@ -3668,7 +3668,13 @@ func tryApplyHOTUpdate(
 		}
 		return false, nil // fall back to delete+insert; caller re-checks
 	}
-newSlot, addErr := storage.PageAddHeapTuple(s.Page(), tup)
+	// M0131-S30.3 probe (temporary, GOOPG_PAGEIDENT_PROBE=1): this is the exact
+	// site whose WAL record and on-disk page disagree. Under the content lock
+	// the line-pointer count is stable, so a count BELOW the high-water mark
+	// previously seen for {rel, blk} proves the slot's bytes belong to another
+	// block. See internal/storage/pageident_probe.go.
+	storage.PageIdentityObserve(storage.BufferTag{Rel: rel, Block: blk}, s.Page(), "hotUpdate")
+	newSlot, addErr := storage.PageAddHeapTuple(s.Page(), tup)
 	if addErr != nil && errors.Is(addErr, storage.ErrNoSpaceInPage) {
 		// Page full: attempt opportunistic pruning before giving up on HOT.
 		if ctx.EnableOpportunisticPrune && ctx.TxnMgr != nil {

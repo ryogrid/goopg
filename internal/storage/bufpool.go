@@ -1546,6 +1546,7 @@ func (p *Pool) evictVictim(victimIdx int, wasDirty bool, oldTag BufferTag) error
 		p.OnFlushWait()
 	}
 	recordIOTrace(oldTag, "preFlush", s.page)
+	PageIdentityObserve(oldTag, s.page, "preFlush")
 	flushErr := p.flushSlot(oldTag, s.page)
 	if p.OnFlushDone != nil {
 		p.OnFlushDone()

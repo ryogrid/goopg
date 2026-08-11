@@ -1,44 +1,43 @@
 (idle — nothing in flight)
 
-Loop #133 ROOT-CAUSED **M0131-S30.3** (diagnosis only — no engine change yet).
-Committed docs + tracker updates; design `docs/design/0131-0021-s303-replay-page-identity-divergence.md`.
+Loop #134 worked **M0131-S30.3** (diagnosis; probe landed, no engine fix yet).
 
-**Deterministic offline repro is PRESERVED**: `cp -a /tmp/s30_3_repro/data /tmp/try`
-then start goopg on `/tmp/try` → refuses to start in ~35 s with
-`wal replay: replay record 826236 lsn[154662577,154662656]: xlog heap-update add
-new tuple: storage: not enough free space in page`. (Copy it somewhere durable if
-/tmp is at risk; 251 MB.)
+**Built the probe the previous loop specified** — `internal/storage/pageident_probe.go`
+(`GOOPG_PAGEIDENT_PROBE=1`), driver `analysis/pageident_probe.sh`. It reports
+`PAGEIDENT-REGRESS` (a heap page under a tag has FEWER line pointers than the
+high-water mark for that tag = buffer tag/content aliasing) and
+`PAGEIDENT-REEXTEND` (extend hands out a block that already carried tuples).
+Observes at every disk read, disk write, pre-eviction flush, and in
+`tryApplyHOTUpdate` under the content lock. Heap-only filter is
+`pd_special == BlockSize` — WITHOUT it btree splits give 336 benign hits
+(`lp=205 high=407`); don't re-discover that.
 
-**Root cause (new, supersedes "the non-HOT replay arm is wrong"):** the record is
-`HOT_UPDATE rel 1663/5/16407 (pgbench_tellers) blk 130, old_off 1, new_off 2` —
-goopg's decode and real `pg_waldump` agree byte-for-byte. That page holds 185
-line pointers, ALL LP_NORMAL, 28 bytes free, `pd_lsn=123846600` = exactly the last
-record touching it (idx 707555, a DELETE), and NO record of any kind touches it for
-the next ~120k records. `new_off: 2` is impossible there: `PageAddHeapTuple`
-(`internal/storage/heap.go:537`) always appends at count+1 (never reuses a free
-slot) and `VacuumHeapPageBySlots` never shrinks the LP array. So the runtime's page
-had ONE line pointer — freshly `PageInit`-ed. It is a **page-identity** bug, not a
-free-space/missing-prune bug; replay is faithful (pre- and post-prefix-replay page
-images match).
+**Both S30.3 prime suspects are REFUTED — do not re-test:**
+1. buffer-pool tag/content aliasing — ZERO hits in a clean 45 s scale-5/16-client
+   run AND in a `crashprobe30` run that DID lose rows (497287/500000, 2713 missing).
+2. `IsNew`-driven silent `PageInit` past a shortened file — no such path:
+   `relFile.readBlock` returns `ErrShortRead` for `blk >= nblocks` and `pinLoad`
+   propagates the error (never publishes a zero page).
 
-**Ruled out — do not re-test:** missing prune records (they exist; rmid 9 = Heap2
-`PRUNE_ON_ACCESS`, 161 on this rel — and note rmid 11 is **Btree**, not Heap2);
-"a prune explains new_off=2" (it cannot); unlogged `XLOG_SMGR_TRUNCATE` in the
-window (all 7 sit at idx ≤ 504370); a goopg decode bug; replay corrupting the page.
+**New defect found and filed as M0131-S30.5:** `tryApplyHOTUpdate`'s orphan-cleanup
+arm (`operators_storage.go:3746`) calls `storage.PageRemoveHeapTuple` and emits NO
+WAL — and that function SHRINKS `pd_lower` when the removed slot is last
+(`heap.go:697-699`). Slot is already dirty from the logged prune, so it reaches
+disk and replay rebuilds a larger page. One LP per occurrence, so it is not the
+`185 -> 1` root cause.
 
-Next step: instrument `tryApplyHOTUpdate` (`internal/executor/operators_storage.go:3555`)
-to log `{rel, blk, PageLinePointerCount, newSlot, pd_lsn}` at emit time plus a
-tag/content consistency check at `storage.Pool.Pin`, then run the 30 s pgbench load —
-NO crash needed; the divergence forms while running normally. Suspects: buffer-pool
-tag/content aliasing; `IsNew`-driven silent `PageInit` past a shortened file.
+Next step (S30.3): fire `PageIdentityObserve` inside `PageRemoveHeapTuple`, and
+assert at `markHeapHotUpdateDirty` that the emitted `new_off` equals both `newSlot`
+and `PageLinePointerCount(page)` — catch an emit-time inconsistency before the
+crash hides it. If clean, walk block 130's records from the START of the stream.
 
-Nightly triage: `ci/logs/action-items.md` still run `20260811-014635` (AI-…-001..012),
-all already filed under M-NIGHTLY; nothing new.
+Repro still preserved: `cp -a /tmp/s30_3_repro/data /tmp/try` → goopg refuses to
+start in ~35 s (251 MB; copy somewhere durable if /tmp is at risk).
 
-Gates run: units suite PASS (warm cache); `make ralph-state-guard` OK after self-repair;
-pgbench smoke via the commit hook. tpch-spotcheck not required (docs/tracker only).
+Nightly triage: `ci/logs/action-items.md` still run `20260811-014635`
+(AI-…-001..012), all already filed under M-NIGHTLY; nothing new.
 
-Note: an unowned goopg server is listening on 127.0.0.1:5533 (pid 1510790, `goopg-sub`) —
-not started by this loop; use 5536+ for throwaway servers until it is reaped.
+Gates run: units suite PASS; `make ralph-state-guard` OK after self-repair;
+pgbench smoke via the commit hook. Design `docs/design/0131-0021` §Update 2026-08-11.
 
 In-flight: none.
