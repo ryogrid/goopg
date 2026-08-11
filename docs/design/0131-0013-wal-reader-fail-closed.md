@@ -1,0 +1,261 @@
+# WAL reader fail-closed — an unrecognised record is not end-of-WAL, and a recycled segment is not WAL
+
+**Status:** draft
+**Date:** 2026-08-11
+**Milestone:** M0131 (Theme F, S16 + S19)
+
+## Problem
+
+goopg's WAL reader collapses two situations into one outcome. A
+**torn/zero/CRC-failed tail** — bytes that were never durable — and a
+**decodable-but-unhandled record** — bytes that *are* durable and *do* mean
+something — both stop the walk, log a `slog.Warn`, and report success. The second
+case is silent data loss, made permanent by the first subsequent write.
+
+Separately, goopg writes and decodes `xlp_pageaddr` but **never compares it**,
+and that comparison is upstream's only defence against a recycled WAL segment
+full of stale, CRC-valid records. goopg zero-fills recycled segments so it never
+needed the check on its own directories; a real PG's `pg_wal` does not.
+
+S16 is a live data-loss fix worth landing even if no other Theme F slice ever
+does; S19 also repairs the **clean** reverse path (S3), not only the crash path.
+
+## Design
+
+### S16 — an unrecognised record must not be end-of-WAL
+
+**S16.1 — the structural rmid bound is wrong.** `internal/wal/xlog_record.go:218-220`:
+
+```go
+if h.Rmid > MaxKnownRmgr && h.Rmid < RmgrGoopgCustomBase {
+    return h, fmt.Errorf("%w: unknown rmid=%d", ErrInvalidRecordHeader, h.Rmid)
+}
+```
+
+`MaxKnownRmgr = RmgrSeq = 15` (`xlog_record.go:65`, `:71`);
+`RmgrGoopgCustomBase = 128` (`:79`). PG 18's real maximum is 21 —
+`postgres/src/include/access/rmgrlist.h:28-49` defines 22 resource managers, in
+ID order: **0 XLOG, 1 Transaction, 2 Storage (`RM_SMGR_ID`), 3 CLOG, 4 Database,
+5 Tablespace, 6 MultiXact, 7 RelMap, 8 Standby, 9 Heap2, 10 Heap, 11 Btree,
+12 Hash, 13 Gin, 14 Gist, 15 Sequence, 16 SPGist, 17 BRIN, 18 CommitTs,
+19 ReplicationOrigin, 20 Generic, 21 LogicalMessage.**
+
+Raise the bound to PG's real `RM_MAX_BUILTIN_ID` (21) so 16..21 decode as records; keep
+rejecting `(21, 128)`, which remains a genuine "emitted by a newer producer"
+branch. Note 6, 18 and 19 are *not* index AMs and do occur in ordinary PG
+workloads.
+
+**Which rmids take which path today.** The split is the whole point of S16:
+
+- **6 MultiXact, 12 Hash, 13 Gin, 14 Gist** are ≤ `MaxKnownRmgr`, so they pass
+  the header guard, decode, fall through `replayDecodedXLogRecord` to
+  `default: return false, unsupportedDecodedXLogRecord(r)`
+  (`internal/wal/recovery.go:2525-2526`, message built at `:2605-2612`), and
+  startup **refuses**. That half is safe.
+- **16 SPGist, 17 BRIN, 18 CommitTs, 19 ReplicationOrigin, 20 Generic,
+  21 LogicalMessage** fail *header decode* at `:218-220` and are read as
+  **end-of-WAL**. Silent loss. A single `pg_logical_emit_message` in a PG crash
+  tail is enough.
+
+**S16.2 — split the two meanings collapsed into `endOfWAL`.**
+`readAllPageAware` (`internal/wal/reader.go:102-218`) has four failure arms and
+every one of them ends in `break`:
+
+| Arm | Condition | Preallocated-tail guard | Silent size guard | Warn |
+|---|---|---|---|---|
+| header decode | `:152-165` | `:157` | `:160-162` | `:163` |
+| `xl_tot_len < 24` | `:167-176` | `:168` | `:171-173` | `:174` |
+| body decode | `:183-196` | `:188` | `:191-193` | `:194` |
+| size mismatch | `:197-211` | `:202` | `:205-207` | `:208` |
+
+The `if int64(len(stream)-off) <= segSize { break }` guards at `:160`, `:171`,
+`:191` and `:205` suppress even the warning for **any tail inside the last
+segment** — which is precisely where a crash tail always is. `endOfWAL`
+(`reader.go:243-249`) is a `slog.Warn` and nothing more.
+
+Return an explicit stop reason from `readAllPageAware` and surface it through
+`ReadAll`: a torn/zero/CRC-failed tail is end-of-WAL, a decodable-but-unhandled
+record is an error the caller must see. Delete the four unconditional
+`<= segSize` breaks.
+
+Two failure classes ride the *body-decode* arm and are swallowed the same way,
+which is why S16.2 is the real fix rather than S16.1:
+
+- **`XLOG_TBLSPC` / unsupported tablespace OID** —
+  `internal/wal/pg_xlog_decode.go:362-365`.
+- **`wal_compression`** — `pg_xlog_decode.go:345-350` **already** errors
+  explicitly (`"wal: compressed PostgreSQL backup block images are not supported
+  yet"`), contrary to Theme F's S16.5 framing; see §Citation corrections. The
+  error is nevertheless swallowed by `:191-193` and reported as a clean
+  end-of-WAL.
+
+**S16.3 — the btree `default:` arm is unsound for PG-authored records.**
+`internal/wal/recovery.go:2516-2523`:
+
+```go
+default:
+    // Other btree records (dedup / delete / reuse-page / …) are
+    // not flipped yet and are emitted with full-page images; restore
+    // each block from its FPI.
+    if err := replayDecodedXLogHeapFPIBlocks(mgr, r, xlog); err != nil {
+        return false, err
+    }
+    return true, nil
+```
+
+`replayDecodedXLogHeapFPIBlocks` (`:2535-2545`) **`continue`s** over any block
+lacking `HasImage && ImageApply` (`:2537-2539`) and returns nil — so the arm
+reports `applied=true` having applied nothing. The comment's premise ("emitted
+with full-page images") holds for goopg-emitted records and **not** for PG's:
+`XLogRecordAssemble` decides per block, `needs_backup = (page_lsn <= RedoRecPtr)`
+(`postgres/src/backend/access/transam/xloginsert.c:620`) — an FPI only on a
+page's **first touch after a checkpoint** — and `needs_backup = false`
+unconditionally when `!doPageWrites` (`:609-610`, i.e. `full_page_writes=off`).
+A PG `XLOG_BTREE_DEDUP` / `_DELETE` / `_INSERT_UPPER` from anywhere but the first
+touch after a checkpoint therefore carries main data and no image, and is
+**silently discarded while reporting success** — index corruption with no
+diagnostic.
+
+Fix: apply FPIs only if **every** mutated block carries `ImageApply`; otherwise
+`unsupportedDecodedXLogRecord`. This converts silent corruption into refusal, and
+is a hard prerequisite for S21b — without it a btree-opcode regression is
+indistinguishable from success.
+
+**S16.4 — audit the `RmgrXLog` `default:`.** `recovery.go:2245-2249` returns
+`false, nil` for every unmatched RM_XLOG opcode with the comment *"Other RmgrXLog
+opcodes (checkpoint, noop, switch, …) need no physical replay action on the
+standby."* True for NOOP / SWITCH / CHECKPOINT_ONLINE / CHECKPOINT_SHUTDOWN /
+NEXTOID / RESTORE_POINT / FPW_CHANGE / BACKUP_END / END_OF_RECOVERY /
+CHECKPOINT_REDO; not true for `XLOG_FPI_FOR_HINT` (0xA0, silently discards
+torn-page protection — S21a) or `XLOG_OVERWRITE_CONTRECORD` (0xD0). Enumerate the
+no-op set explicitly and error on anything else.
+
+**S16.5 — `wal_compression`.** Already implemented; keep the slice only to wrap
+the error in `ErrCorruptRecord` for consistency with its neighbours and to prove
+via test that it now reaches the caller rather than being absorbed by S16.2's
+deleted guard.
+
+**The caller chain, end to end.** S16.2's stop reason must reach process exit, so
+the whole path matters:
+
+```
+readAllPageAware  (reader.go:102)   →  stop reason, today discarded
+  ReadAll         (reader.go)
+    ReplayFromDirWithMgr (recovery.go:3686-3697)  → returns err unless fs.ErrNotExist
+      ReplayRecords      (recovery.go:1918-1932)  → wraps: "wal: replay record %d lsn[%d,%d]: %w"
+        ApplyRecord      (recovery.go:2011-2030)  → routes to replayDecodedXLogRecord
+      initdb.Open        (open.go:347-350)        → "goopg: wal replay: %w", mgr.Close()
+        → non-zero exit
+```
+
+Note the asymmetry the fix removes: `ApplyRecord`'s errors already ride this
+chain to a refused start (that is why rmids 6/12/13/14 are safe), while
+`readAllPageAware`'s do not reach it at all.
+
+### S19 — validate `xlp_pageaddr`; stop trusting recycled segments
+
+**The gap.** goopg has five `PageAddr` sites — field `internal/wal/xlog_page.go:91`,
+encode `:120`, decode `:144`, write `internal/wal/xlog_emit.go:125` and
+`internal/initdb/wal_bootstrap.go:70` — and **no comparison site anywhere**; a
+grep across `internal/` and `cmd/` returns only those plus tests. Upstream
+compares at `postgres/src/backend/access/transam/xlogreader.c:1324-1337`, whose
+comment names the exact case: *"This check typically fails when an old WAL
+segment is recycled, and hasn't yet been overwritten with new data yet."*
+
+goopg got away with it because `recycleSegmentFile`
+(`internal/wal/writer.go:2369-2379`) renames **and then zero-fills**, while
+upstream's `InstallXLogFileSegment` (`xlog.c:3559`) is a bare `durable_rename`
+(`:3598`; the `durable_unlink` at `:3579` is the `!find_free` path only) and
+never fills. A real PG's `pg_wal` therefore routinely holds **full-size future
+segments packed with stale, CRC-valid records from a previous WAL cycle** — every
+row of the end-of-WAL contract except row 10 passes on those bytes.
+
+**S19.1 — the reader half.** In `readAllPageAware`'s page-header block
+(`reader.go:129-139`), require `hdr.PageAddr == baseOffset + off` and a
+consistent `hdr.TLI`; otherwise stop as end-of-WAL (rows 10/11 of the contract).
+Consider validating `xlp_sysid` against `pg_control.system_identifier` while here
+— upstream does, at `xlogreader.c:1281-1289`, and M0131-S2 made the identifier
+readable.
+
+**S19.2 — the writer half, per Hard-won Rule #2 (sibling paths must agree).**
+`scanLastSegmentEnd` (`internal/wal/writer.go:1494`, main walk `:1538-1549`) is a
+byte-for-byte sibling of the reader walk and needs the same check. Two adjacent
+assumptions in `detectWritePos` (`writer.go:1287`) also break on a PG directory:
+
+- **"non-final segments are fully used"** (`:1433-1439`) — the loop adds the full
+  `sz` for every segment but the last and only scans the last one. A PG recycled
+  segment sitting between real ones therefore contributes its whole size.
+- **the phantom-drop loop** (`:1409-1417`) — it walks back from the highest
+  segment while `usedBytes == 0`, i.e. while a segment scans as *entirely empty*.
+  A PG recycled segment scans as **non-empty** (stale valid records), so the loop
+  breaks on the first iteration and `writePos` lands tens of MB past the true end
+  of WAL, **inside garbage**.
+
+**Carry this hedge exactly, do not upgrade it.** The **reader** half is
+conditional: it only misbehaves when the last real page ends exactly on a page
+boundary, so the walk steps onto the first stale page and reads its header. The
+common case is saved by the zero tail of PG's memset WAL buffer, which trips row
+1 or row 6 first. The **writer** half is *unconditional* and should reproduce
+directly. Design and test accordingly: the writer fixture is the load-bearing
+one.
+
+**S19 is not gated on the crash work.** A cleanly shut down PG directory has
+recycled segments too, so this repairs S3's clean reverse path as well.
+
+**Risk.** This is the slice in Theme F most likely to break goopg's *own* restart
+path — a `PageAddr` mismatch that today is invisible becomes a truncated WAL
+tail. Land it behind the pgbench smoke and a crash-restart test, not unit tests
+alone.
+
+## Guards
+
+1. **S16.1/S16.2 — the rmid unit test.** Feed `readAllPageAware` a valid record,
+   then an rmid-18 record, then more valid records; assert a **non-tail stop**
+   (an explicit error surfaced to the caller). Today: 1 record, no error.
+2. **S16.3 — the btree unit test.** A PG-shaped `XLOG_BTREE_DEDUP` with block
+   data and **no** image now errors instead of returning `applied=true`.
+3. **S16.4** — a table-driven test over the enumerated RM_XLOG no-op opcode set,
+   plus one unknown opcode asserting refusal.
+4. **S16.5** — a compressed-image block reaches the caller as an error rather
+   than a clean end-of-WAL.
+5. **Caller-chain test** — the S16.1 stream, replayed via
+   `ReplayFromDirWithMgr`, produces a non-nil error (proving the reason survives
+   `ReadAll` → `ReplayRecords` → `Open`).
+6. **S19 — the recycled-segment fixture.** A directory with a real PG segment
+   followed by a hand-crafted recycled segment of stale valid records; assert
+   `ReadAll` stops at the real end **and** `detectWritePos` returns the real end.
+   Both halves, in one fixture.
+7. **RACE on `internal/wal`** for S16 and S19.
+8. **SMOKE (pgbench) + a crash-restart test** for S19 specifically, plus SPOT
+   (`scripts/tpch-spotcheck.sh`) — S19 is flagged as the slice most likely to
+   break goopg's own restart.
+9. UNITS + SMOKE green.
+
+## References
+
+**Citation corrections vs Theme F** (re-checked against the tree 2026-08-11; every
+other S16/S19 citation holds): the `<= segSize` silent breaks are `:160-162`,
+`:171-173`, `:191-193`, `:205-207` — Theme F's `:157`/`:169`/`:186`/`:198` are the
+neighbouring `isPreallocatedTail` guards; `endOfWAL` is `:243-249` (`:212-241` is
+its doc comment) and `readAllPageAware` spans `:102-218` with its header-decode
+arm at `:152-165`; `detectWritePos`'s "fully used" assumption is `:1433-1439`;
+`PageAddr` has five sites, not three; **S16.5 is substantially discharged**
+(`pg_xlog_decode.go:345-350` already errors on the compress bit, in the
+block-header decoder rather than `decodeXLogBlockImage:387-408`); upstream ranges
+are `xlogreader.c:1324-1337` (pageaddr), `:1217-1223` (CRC), `:769-778`
+(contrecord length).
+
+
+- `docs/design/0131-bidirectional-cluster-dir-coldstart-and-system-views.md`
+  §"Theme F" — S16, S19
+- `docs/design/0131-0012-crash-state-cluster-dir-interchange.md` §"The end-of-WAL
+  contract" (rows 1–16 are the contract S16.2 and S19.1 implement)
+- `postgres/src/include/access/rmgrlist.h:28-49`
+- `postgres/src/backend/access/transam/xlogreader.c:1142-1190`, `:1234-1370`,
+  `:626-632`, `:757-778`
+- `postgres/src/backend/access/transam/xloginsert.c:604-647` — FPI decision
+- `postgres/src/backend/access/transam/xlog.c:3558-3608` —
+  `InstallXLogFileSegment`
+- memory: `pattern_sibling_paths_must_agree` (Hard-won Rule #2),
+  `wal_pg_faithful_rmgr_dispatch_preference`,
+  `goopg_wal_xl_prev_1based_pg_waldump`
