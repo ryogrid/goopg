@@ -187,8 +187,8 @@ Two opcodes handled; the other twelve **silently no-op'd** (`recovery.go:2245-22
 | opcode | hex | goopg | upstream redo | produced by |
 |---|---|---|---|---|
 | `INSERT_LEAF` | 0x00 | H `:2453` | `btree_xlog_insert(t,f,f)` `nbtxlog.c:160-250` | ordinary index insert |
-| `INSERT_UPPER` | 0x10 | **S** | `btree_xlog_insert(f,f,f)` | downlink insert after a child split (`nbtinsert.c:1342`) |
-| `INSERT_META` | 0x20 | **S** | `btree_xlog_insert(f,t,f)` | ditto, when the fast-root also moves (`nbtinsert.c:1348`) |
+| `INSERT_UPPER` | 0x10 | H (S21b part 1) | `btree_xlog_insert(f,f,f)` | downlink insert after a child split (`nbtinsert.c:1342`) |
+| `INSERT_META` | 0x20 | H (S21b part 1) | `btree_xlog_insert(f,t,f)` | ditto, when the fast-root also moves (`nbtinsert.c:1348`) |
 | `SPLIT_L` / `SPLIT_R` | 0x30/0x40 | H `:2470` | `btree_xlog_split` `:251` | page split |
 | `INSERT_POST` | 0x50 | **S** | `btree_xlog_insert(t,f,t)` | insert splitting a **posting list** on a deduplicated leaf (`nbtinsert.c:1337`) |
 | `DEDUP` | 0x60 | **S** | `btree_xlog_dedup` `:464-556` | leaf deduplication before a split (`nbtdedup.c:265`) |
@@ -198,7 +198,7 @@ Two opcodes handled; the other twelve **silently no-op'd** (`recovery.go:2245-22
 | `MARK_PAGE_HALFDEAD` | 0xB0 | H `:2494` | `btree_xlog_mark_page_halfdead` `:717` | page deletion, first phase |
 | `VACUUM` | 0xC0 | H `:2486` | `btree_xlog_vacuum` `:598` | `VACUUM` index pass |
 | `REUSE_PAGE` | 0xD0 | **S** | **no-op outside hot standby** `:1006-1015` | recycling a deleted page (`nbtpage.c:933-953`, itself gated on `XLogStandbyInfoActive()`) |
-| `META_CLEANUP` | 0xE0 | **S** | `_bt_restore_meta(record, 0)` `:82` | `VACUUM`'s metapage cleanup-XID update (`nbtpage.c:304`) |
+| `META_CLEANUP` | 0xE0 | H (S21b part 1) | `_bt_restore_meta(record, 0)` `:82` | `VACUUM`'s metapage cleanup-XID update (`nbtpage.c:304`) |
 
 **Correction to the Theme F list: `XLOG_BTREE_REUSE_PAGE` needs no redo.** Its
 whole body is `if (InHotStandby) ResolveRecoveryConflictWithSnapshotFullXid(…)`,
@@ -810,8 +810,66 @@ the new arm has not swallowed its nearest logical-decoding-only neighbour.
 
 **S21a-2 is now CLOSED.** Next: S21b (btree, ~6 opcodes — `INSERT_UPPER` 0x10,
 `INSERT_META` 0x20, `INSERT_POST` 0x50, `DEDUP` 0x60, `DELETE` 0x70,
-`META_CLEANUP` 0xE0; `REUSE_PAGE` 0xD0 needs no redo and was recognised in
-S21a-1), gated on S16 which is already done.
+`META_CLEANUP` 0xE0; `REUSE_PAGE` 0xD0 needs no redo), gated on S16 which is
+already done.
+
+### S21b — implementation notes, part 1: INSERT_UPPER + INSERT_META + META_CLEANUP (landed 2026-08-12)
+
+The three btree opcodes whose whole redo is *insert a downlink and/or rewrite the
+metapage* — no new page primitive, so they group naturally against the posting-list
+pair (`INSERT_POST`/`DEDUP`, part 2) and the item-array rewrite (`DELETE`, part 3).
+
+`replayDecodedXLogBtreeInsert` grew upstream's own two arguments — the function is
+literally `btree_xlog_insert(isleaf, ismeta, posting)` (`nbtxlog.c:160-247`)
+instantiated four ways, and goopg already had the `(true,false,false)` one — plus
+two limbs in upstream's order:
+
+- **block 1, when `!isleaf`.** An insert into an internal page IS the completion of
+  the child's split, so redo clears the child's `BTP_INCOMPLETE_SPLIT`
+  (`_bt_clear_incomplete_split`, `:132-155`). Upstream reads it *before* block 0 and
+  **unconditionally**: `_bt_insertonpg` registers `cbuf` as block 1 on every `!isleaf`
+  path (`nbtinsert.c:1342-1343`), and `XLogReadBufferForRedo` PANICs on an
+  unregistered id. goopg therefore REFUSES a record missing block 1 rather than
+  skipping the limb, which would leave a permanently half-split child while replay
+  reported success (its own guard).
+- **block 2, when `ismeta`.** The metapage, registered `REGBUF_WILL_INIT`
+  (`nbtinsert.c:1359-1360`) and rebuilt from the carried `xl_btree_metadata`.
+
+**The block-0 image branch must NOT return early** — the shape the pre-S21b insert
+replay had, since with one limb there was nothing to fall through to. Upstream's
+`XLogReadBufferForRedo` reports `BLK_RESTORED` for block 0 only and
+`btree_xlog_insert` still reaches `if (ismeta) _bt_restore_meta(record, 2)`;
+returning after the image restore leaves the metapage naming a stale root with
+replay reporting success. That is the one non-obvious limb, so it has a dedicated
+guard.
+
+`_bt_restore_meta` became the shared `replayDecodedXLogBtreeRestoreMeta(…, blockID,
+what)` — three call sites now need it on **two different block ids**:
+`INSERT_META` and `NEWROOT` on block 2, `META_CLEANUP` on block 0. Hard-coding the
+id (the obvious refactor) would silently rebuild the wrong page for `META_CLEANUP`,
+so the id is a parameter and the guard seeds a second page to prove it. The
+`NEWROOT` metapage limb was folded onto the helper unchanged — its error strings
+were already identical.
+
+`XLOG_BTREE_META_CLEANUP`'s entire upstream redo is `_bt_restore_meta(record, 0)`:
+`_bt_set_cleanup_info` (`nbtpage.c:304`) stamping `btm_last_cleanup_num_delpages`
+after a `VACUUM`, touching no other page.
+
+**Correction to the S21a-2 closing note:** it said `REUSE_PAGE` 0xD0 "was
+recognised in S21a-1". It was not — S21a-1's six recognised no-ops are
+`HEAP_TRUNCATE`, `HEAP2_NEW_CID`, `XACT_ASSIGNMENT`, `XACT_INVALIDATIONS`,
+`STANDBY_LOCK` and `STANDBY_INVALIDATIONS`, none of them RM_BTREE. 0xD0 still falls
+to the `default:` refusal and is part 3's work.
+
+5 guards in `internal/wal/btree_insert_upper_pg_test.go`, ALL proven fail-when-broken
+by 4 scripted reverts (dropped child limb → 2 FAIL; early return on a block-0 image
+→ 1 FAIL; `META_CLEANUP` reading block 2 → 1 FAIL; all three dispatch arms removed
+→ 5 FAIL).
+
+**Remaining in S21b:** part 2 `INSERT_POST` 0x50 + `DEDUP` 0x60 (both need
+`_bt_swap_posting`/`_bt_form_posting`, the first posting-list *writers* in goopg —
+`internal/access/btree/posting.go` only parses), part 3 `DELETE` 0x70 +
+`META_CLEANUP`'s neighbour `REUSE_PAGE` 0xD0 as a recognised no-op.
 
 ## Guards
 

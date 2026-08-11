@@ -2826,7 +2826,34 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			// data, no FPI — replay re-inserts by key. A real-PG leaf insert
 			// carrying a full-page image is restored via the FPI branch inside
 			// replayDecodedXLogBtreeInsert.
-			if err := replayDecodedXLogBtreeInsert(mgr, r, xlog); err != nil {
+			if err := replayDecodedXLogBtreeInsert(mgr, r, xlog, true, false); err != nil {
+				return false, err
+			}
+			return true, nil
+		case xlogBtreeInsertUpper:
+			// M0131-S21b part 1: PG-only — goopg's own downlink inserts ride
+			// RecordKindBtreeSplit/NewRoot. An insert into an internal page also
+			// finishes the child's split, so redo clears the child's
+			// BTP_INCOMPLETE_SPLIT flag off block 1 (nbtxlog.c:160-177).
+			if err := replayDecodedXLogBtreeInsert(mgr, r, xlog, false, false); err != nil {
+				return false, err
+			}
+			return true, nil
+		case xlogBtreeInsertMeta:
+			// M0131-S21b part 1: INSERT_UPPER plus the metapage rewrite PG folds
+			// in when the internal insert also moved the fast root
+			// (nbtinsert.c:1346-1361).
+			if err := replayDecodedXLogBtreeInsert(mgr, r, xlog, false, true); err != nil {
+				return false, err
+			}
+			return true, nil
+		case xlogBtreeMetaCleanup:
+			// M0131-S21b part 1: upstream's whole redo for this opcode is
+			// `_bt_restore_meta(record, 0)` (nbtxlog.c) — VACUUM's
+			// _bt_set_cleanup_info stamping btm_last_cleanup_num_delpages on the
+			// metapage, with no other page touched. The metapage is block 0 here,
+			// not block 2 as in the insert/newroot records.
+			if err := replayDecodedXLogBtreeRestoreMeta(mgr, xlog, storage.LSN(r.EndLSN), 0, "btree-meta-cleanup"); err != nil {
 				return false, err
 			}
 			return true, nil
@@ -4036,44 +4063,104 @@ func replayDecodedXLogHeapUpdate(mgr *storage.Manager, r Record, xlog *XLogDecod
 // That unblocks 3b-2c-ii-B2-c, the flip.)
 
 // replayDecodedXLogBtreeInsert applies a PG-format xl_btree_insert: insert the
-// IndexTuple carried in block 0's data into the leaf page at the offset number
+// IndexTuple carried in block 0's data into the target page at the offset number
 // carried in the record's main data, exactly as upstream btree_xlog_insert
-// does. Mirrors the native replayBtreeInsert, so goopg↔goopg replay is
-// identical; a full-page image is restored instead. Idempotent via pd_lsn.
-func replayDecodedXLogBtreeInsert(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
+// (nbtxlog.c:160-247) does. Mirrors the native replayBtreeInsert, so goopg↔goopg
+// replay is identical; a full-page image is restored instead. Idempotent via
+// pd_lsn.
+//
+// `isleaf` / `ismeta` are upstream's own arguments, set from the opcode:
+// INSERT_LEAF (true,false), INSERT_UPPER (false,false), INSERT_META
+// (false,true). goopg only ever emits INSERT_LEAF; the other two arrive from a
+// real PG crash tail (M0131-S21b part 1) and add two limbs:
+//
+//   - block 1 (!isleaf) — an insert into an INTERNAL page is what finishes the
+//     child's split, so redo clears the child's BTP_INCOMPLETE_SPLIT flag.
+//     Upstream does this FIRST, before touching block 0, and unconditionally:
+//     _bt_insertonpg always registers cbuf as block 1 on the !isleaf path
+//     (nbtinsert.c:1342-1343), so a missing block 1 is a malformed record, not
+//     an optional limb.
+//   - block 2 (ismeta) — the metapage, rebuilt from the carried
+//     xl_btree_metadata. Registered WILL_INIT (nbtinsert.c:1359-1360), so it is
+//     re-initialised from scratch rather than read-modify-written.
+//
+// Each limb carries its own pd_lsn idempotency, matching the per-buffer
+// discipline of upstream's redo (and of replayDecodedXLogBtreeNewRoot): a replay
+// interrupted between limbs resumes correctly. Note the block-0 image branch
+// does NOT return early — upstream's BLK_RESTORED only skips block 0's manual
+// mutation, the metapage limb still runs.
+func replayDecodedXLogBtreeInsert(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord, isleaf, ismeta bool) error {
+	endLSN := storage.LSN(r.EndLSN)
+
+	if !isleaf {
+		child, ok := xlogBlockRefByID(xlog, 1)
+		if !ok {
+			return fmt.Errorf("wal: xlog btree-insert missing block 1 (child of an internal-page insert)")
+		}
+		if child.HasImage && child.ImageApply {
+			if err := restoreDecodedXLogBlockImage(mgr, child, endLSN); err != nil {
+				return fmt.Errorf("wal: xlog btree-insert child image: %w", err)
+			}
+		} else if err := replayExistingXLogBlock(mgr, child, endLSN, btree.ReplayClearIncompleteSplit); err != nil {
+			return fmt.Errorf("wal: xlog btree-insert child apply: %w", err)
+		}
+	}
+
 	block, ok := xlogBlockRefByID(xlog, 0)
 	if !ok {
 		return fmt.Errorf("wal: xlog btree-insert missing block 0")
 	}
 	if block.HasImage && block.ImageApply {
-		return restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN))
+		if err := restoreDecodedXLogBlockImage(mgr, block, endLSN); err != nil {
+			return err
+		}
+	} else {
+		if len(xlog.MainData) < sizeOfXLogBtreeInsertData {
+			return fmt.Errorf("wal: xlog btree-insert: main data len %d (want >= %d)", len(xlog.MainData), sizeOfXLogBtreeInsertData)
+		}
+		offnum := binary.LittleEndian.Uint16(xlog.MainData[0:2])
+		if err := replayExistingXLogBlock(mgr, block, endLSN, func(page storage.Page) error {
+			return btree.ApplyInsertRecordAt(page, block.Data, offnum)
+		}); err != nil {
+			return fmt.Errorf("wal: xlog btree-insert apply: %w", err)
+		}
 	}
-	nblocks, err := mgr.NBlocks(block.Rel)
+
+	if !ismeta {
+		return nil
+	}
+	return replayDecodedXLogBtreeRestoreMeta(mgr, xlog, endLSN, 2, "btree-insert")
+}
+
+// replayDecodedXLogBtreeRestoreMeta is upstream's _bt_restore_meta
+// (nbtxlog.c:80-127): rebuild the metapage at `blockID` from the carried
+// xl_btree_metadata. The buffer is registered WILL_INIT at every call site, so
+// the block need not exist yet.
+//
+// M0131-S21b part 1. Factored out because two opcodes need it on different
+// block ids — XLOG_BTREE_INSERT_META on block 2 and XLOG_BTREE_META_CLEANUP on
+// block 0 — and XLOG_BTREE_NEWROOT already open-codes the same thing on block 2.
+func replayDecodedXLogBtreeRestoreMeta(mgr *storage.Manager, xlog *XLogDecodedRecord, endLSN storage.LSN, blockID byte, what string) error {
+	meta, ok := xlogBlockRefByID(xlog, blockID)
+	if !ok {
+		return fmt.Errorf("wal: xlog %s missing block %d (metapage)", what, blockID)
+	}
+	if meta.HasImage && meta.ImageApply {
+		if err := restoreDecodedXLogBlockImage(mgr, meta, endLSN); err != nil {
+			return fmt.Errorf("wal: xlog %s meta image: %w", what, err)
+		}
+		return nil
+	}
+	md, err := decodeXLogBtreeMetadata(meta.Data)
 	if err != nil {
-		return err
+		return fmt.Errorf("wal: xlog %s meta: %w", what, err)
 	}
-	if block.Block >= nblocks {
-		return fmt.Errorf("wal: xlog btree-insert: block %d does not exist (nblocks=%d)", block.Block, nblocks)
+	if err := replayInitedXLogBlock(mgr, meta, endLSN, func(page storage.Page) error {
+		return btree.ReplayRestoreMetaPage(page, md)
+	}); err != nil {
+		return fmt.Errorf("wal: xlog %s meta apply: %w", what, err)
 	}
-	page := make(storage.Page, storage.BlockSize)
-	if err := mgr.ReadBlock(block.Rel, block.Block, page); err != nil {
-		return err
-	}
-	if storage.IsNew(page) {
-		return fmt.Errorf("wal: xlog btree-insert: block %d is uninitialised", block.Block)
-	}
-	if storage.MustHeader(page).LSN() >= storage.LSN(r.EndLSN) {
-		return nil // already applied
-	}
-	if len(xlog.MainData) < sizeOfXLogBtreeInsertData {
-		return fmt.Errorf("wal: xlog btree-insert: main data len %d (want >= %d)", len(xlog.MainData), sizeOfXLogBtreeInsertData)
-	}
-	offnum := binary.LittleEndian.Uint16(xlog.MainData[0:2])
-	if err := btree.ApplyInsertRecordAt(page, block.Data, offnum); err != nil {
-		return fmt.Errorf("wal: xlog btree-insert apply: %w", err)
-	}
-	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
-	return mgr.WriteBlock(block.Rel, block.Block, page)
+	return nil
 }
 
 // replayDecodedXLogBtreeNewRoot applies a PG-format xl_btree_newroot, mirroring
@@ -4133,26 +4220,9 @@ func replayDecodedXLogBtreeNewRoot(mgr *storage.Manager, r Record, xlog *XLogDec
 		}
 	}
 
-	meta, ok := xlogBlockRefByID(xlog, 2)
-	if !ok {
-		return fmt.Errorf("wal: xlog btree-newroot missing block 2 (metapage)")
-	}
-	if meta.HasImage && meta.ImageApply {
-		if err := restoreDecodedXLogBlockImage(mgr, meta, endLSN); err != nil {
-			return fmt.Errorf("wal: xlog btree-newroot meta image: %w", err)
-		}
-		return nil
-	}
-	md, err := decodeXLogBtreeMetadata(meta.Data)
-	if err != nil {
-		return fmt.Errorf("wal: xlog btree-newroot meta: %w", err)
-	}
-	if err := replayInitedXLogBlock(mgr, meta, endLSN, func(page storage.Page) error {
-		return btree.ReplayRestoreMetaPage(page, md)
-	}); err != nil {
-		return fmt.Errorf("wal: xlog btree-newroot meta apply: %w", err)
-	}
-	return nil
+	// Shared with XLOG_BTREE_INSERT_META / XLOG_BTREE_META_CLEANUP since
+	// M0131-S21b part 1 — all three limbs are upstream's one _bt_restore_meta.
+	return replayDecodedXLogBtreeRestoreMeta(mgr, xlog, endLSN, 2, "btree-newroot")
 }
 
 // replayDecodedXLogBtreeMarkPageHalfDead applies a PG-format
