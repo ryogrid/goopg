@@ -196,6 +196,125 @@ func DecodeXLogLongPageHeader(src []byte) (XLogLongPageHeader, error) {
 	}, nil
 }
 
+// xlogPageValidator is goopg's port of upstream's
+// `XLogReaderValidatePageHeader` (postgres/src/backend/access/transam/
+// xlogreader.c:1250-1370) together with the two cross-page fields it keeps in
+// XLogReaderState (`latestPagePtr` / `latestPageTLI`).
+//
+// M0131-S19. Until this existed, goopg DECODED xlp_pageaddr (see
+// DecodeXLogPageHeader) and WROTE it (buildPageHeader) but never COMPARED it,
+// so any page whose magic happened to be right was accepted at face value.
+// That is exactly the case upstream's pageaddr check exists to catch: goopg
+// zero-fills a recycled segment, but PostgreSQL does not —
+// `InstallXLogFileSegment` (xlog.c:3559) is a bare durable_rename, so a real
+// PG's pg_wal holds full-size "future" segments still packed with CRC-valid
+// records from a previous write cycle. Reading such a segment as live WAL
+// walks records that were superseded long ago; on the writer side it puts the
+// resume position tens of megabytes past the true end of the stream, inside
+// that stale data.
+//
+// A zero value is ready to use once segSize is set; `seen` starts false so the
+// first page has no predecessor to compare its timeline against.
+type xlogPageValidator struct {
+	segSize       int64
+	latestPagePtr uint64
+	latestPageTLI uint32
+	seen          bool
+}
+
+// check validates the page header at the head of buf for the page whose
+// absolute WAL byte offset is pageAddr, and folds the page into the
+// cross-page timeline state. A non-nil error means "this is not the page that
+// belongs here" — every caller treats that as end-of-WAL, which is what
+// upstream does too (a false return from XLogReaderValidatePageHeader ends
+// the read).
+//
+// buf must hold at least the header size implied by pageAddr — 40 bytes at a
+// segment boundary, 24 bytes elsewhere; callers already bounds-check that
+// before slicing.
+func (v *xlogPageValidator) check(buf []byte, pageAddr uint64) error {
+	hdr, err := DecodeXLogPageHeader(buf)
+	if err != nil {
+		return err
+	}
+	// Upstream splits this into two branches (xlogreader.c:1276-1317): a long
+	// header anywhere but offset 0 is "invalid info bits", and offset 0
+	// without one is "first page of file doesn't have a long header".
+	isSegStart := v.segSize > 0 && pageAddr%uint64(v.segSize) == 0
+	isLong := hdr.Info&XLPLongHeader != 0
+	if isSegStart != isLong {
+		return fmt.Errorf("%w: xlp_info=0x%04x at page addr %d (segment start=%v)",
+			ErrInvalidPageHeader, hdr.Info, pageAddr, isSegStart)
+	}
+	if isLong {
+		long, lerr := DecodeXLogLongPageHeader(buf)
+		if lerr != nil {
+			return lerr
+		}
+		// xlp_sysid is deliberately NOT checked here: the validator has no
+		// pg_control handle, and threading one in reaches the crash-recovery
+		// path. Ledgered under S19 — the two size cross-checks below are the
+		// cheap half of upstream's triple.
+		if v.segSize > 0 && int64(long.SegSize) != v.segSize {
+			return fmt.Errorf("%w: xlp_seg_size=%d, expected %d", ErrInvalidPageHeader, long.SegSize, v.segSize)
+		}
+		if int64(long.XLogBlcksz) != XLOGBlockSize {
+			return fmt.Errorf("%w: xlp_xlog_blcksz=%d, expected %d", ErrInvalidPageHeader, long.XLogBlcksz, XLOGBlockSize)
+		}
+	}
+	// The recycled-segment defence proper (xlogreader.c:1319-1337).
+	if hdr.PageAddr != pageAddr {
+		return fmt.Errorf("%w: unexpected xlp_pageaddr %d at page addr %d (recycled segment?)",
+			ErrInvalidPageHeader, hdr.PageAddr, pageAddr)
+	}
+	// Child timelines always get a TLI greater than their parent's, so TLI
+	// must never go backwards across successive pages of a consistent
+	// sequence (xlogreader.c:1339-1364). Only pages beyond the last one seen
+	// are compared, matching upstream's re-read tolerance.
+	if v.seen && pageAddr > v.latestPagePtr && hdr.TLI < v.latestPageTLI {
+		return fmt.Errorf("%w: out-of-sequence timeline ID %d (after %d) at page addr %d",
+			ErrInvalidPageHeader, hdr.TLI, v.latestPageTLI, pageAddr)
+	}
+	v.latestPagePtr = pageAddr
+	v.latestPageTLI = hdr.TLI
+	v.seen = true
+	return nil
+}
+
+// checkSpan validates every page header that a record occupying
+// data[off:off+consumed] straddles. `base` is the absolute WAL byte address
+// of data[0].
+//
+// This is not an extra: a record that crosses a page boundary swallows the
+// next page's header via extractRecordBytes, which skips header bytes without
+// looking at them. Without checkSpan the walkers only ever validate a page
+// whose header they land on exactly — i.e. only when the previous record
+// happened to end flush against the boundary — so a stale page is caught or
+// missed depending on record tiling. Upstream has no such hole: XLogReadRecord
+// validates each page as it reads it, continuation pages included
+// (postgres/src/backend/access/transam/xlogreader.c, XLogReadRecord's
+// ReadPageInternal loop).
+//
+// A boundary sitting exactly at the record's first byte is skipped — the
+// walkers handle that case themselves before decoding the record.
+func (v *xlogPageValidator) checkSpan(data []byte, off int, consumed int, base uint64) error {
+	start := base + uint64(off)
+	end := start + uint64(consumed)
+	// First boundary strictly after start.
+	p := (start/uint64(XLOGBlockSize) + 1) * uint64(XLOGBlockSize)
+	for ; p < end; p += uint64(XLOGBlockSize) {
+		idx := int(p - base)
+		hsize := pageHeaderSizeAt(int64(p), v.segSize)
+		if idx+hsize > len(data) {
+			return fmt.Errorf("%w: truncated page header at page addr %d", ErrInvalidPageHeader, p)
+		}
+		if err := v.check(data[idx:idx+hsize], p); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // XLogFileName returns the upstream-compatible WAL segment filename
 // for (tli, segno, segSize). Format: `<TLI:%08X><Log:%08X><Seg:%08X>`,
 // where Log = (segno * segSize) / 4 GiB and Seg = segno mod

@@ -1,6 +1,6 @@
 # WAL reader fail-closed — an unrecognised record is not end-of-WAL, and a recycled segment is not WAL
 
-**Status:** S16 CLOSED 2026-08-11 (S16.1/.2/.5 then S16.3/.4); S19 still open
+**Status:** CLOSED 2026-08-11 — S16 (S16.1/.2/.5 then S16.3/.4) and S19 (S19.1/.2)
 **Date:** 2026-08-11
 **Milestone:** M0131 (Theme F, S16 + S19)
 
@@ -354,6 +354,93 @@ nothing because an orphaned server from an earlier session held 5533, and the
 workload silently landed in *its* cluster.)
 
 **S16 is now CLOSED.** S16.1/.2/.5 landed in the prior loop, S16.3/.4 here.
+
+## Implementation notes — what landed 2026-08-11 (S19.1 / S19.2) — S19 CLOSED
+
+**The shared port.** `xlogPageValidator` (`internal/wal/xlog_page.go`) is
+goopg's port of `XLogReaderValidatePageHeader` *plus* the two cross-page fields
+upstream keeps in `XLogReaderState` (`latestPagePtr` / `latestPageTLI`). It
+carries five rules: long-vs-short header form must match the page's position in
+the segment; `xlp_seg_size` and `xlp_xlog_blcksz` must match this cluster's
+geometry; `xlp_pageaddr` must equal the address the page is stored at; and
+`xlp_tli` must not go backwards relative to the last page seen *at a lower
+address* (upstream's re-read tolerance, kept verbatim). One type, two call
+sites — the reader and writer halves cannot drift, which is what Hard-won Rule
+#2 is asking for here.
+
+**`xlp_sysid` is deliberately NOT checked** — ledgered. The validator has no
+`pg_control` handle and threading one in reaches the crash-recovery path;
+the two geometry cross-checks are the cheap two-thirds of upstream's triple.
+
+**The design's hedge was right about the writer half and wrong about *why* the
+reader half is conditional.** The writer fixture reproduced immediately:
+`detectWritePos` returned **32904** against a true end of **136**, i.e. a whole
+segment past the end, inside stale bytes — exactly the predicted failure. The
+reader fixture, however, did *not* reproduce at first, and the reason was a
+sixth hole the design did not name:
+
+> **`extractRecordBytes` swallows page headers without looking at them.** A
+> record that straddles a page boundary is reassembled by skipping the
+> intervening header bytes. So validating only where the *walk* lands on a
+> boundary means a stale page is caught or missed **depending on record
+> tiling** — with 400 uniform records the boundary always fell inside a record
+> and the stale page was never examined at all. This is not upstream's
+> behaviour: `XLogReadRecord` validates each page as it reads it, continuation
+> pages included.
+
+Hence `xlogPageValidator.checkSpan`, called by both walkers after
+`extractRecordBytes` and before the assembled bytes are trusted: it validates
+every page header strictly inside the record's byte span. With it, the reader
+fixture stops at the real end; without it, all 400 records come back and the
+stale page is replayed as live WAL. The design's "conditional on the last page
+ending exactly on a boundary" statement was therefore *describing the bug in the
+fix*, not a property of the WAL: with `checkSpan` the reader half is
+unconditional too.
+
+**Where the checks sit.** Reader (`readAllPageAware`, `reader.go`): the
+contrecord pre-skip (validate before trusting `xlp_rem_len` — a stale header can
+carry a previous cycle's `rem_len` and skip an arbitrary distance), the
+page-boundary branch, and the post-`extractRecordBytes` span. Writer
+(`scanLastSegmentEnd`, `writer.go`): the same three. The writer's first-page
+failure returns `usedBytes = 0`, which is what lets `detectWritePos`'s
+phantom-drop loop step over the segment — no change was needed to the loop
+itself or to the "non-final segments are fully used" rule, because a recycled
+segment now scans as empty and is dropped before either can misfire.
+
+**An all-zero header is still checked first, everywhere.** That is goopg's own
+preallocated-tail sentinel and must keep meaning end-of-WAL, not "corrupt page";
+routing it through the validator would only add a spurious warning.
+
+**Guards** (`internal/wal/recycled_segment_test.go`), all proven
+fail-when-broken by scripted revert over a `/tmp` backup, four break directions,
+each caught by a *different* assertion:
+
+1. `TestDetectWritePos_IgnoresPGRecycledFutureSegment` — a real segment 0
+   followed by a byte-for-byte copy of it installed as segment 1, which is
+   precisely what `durable_rename` recycling produces. Load-bearing half.
+2. `TestReadAll_StopsAtStalePageAddr` — page 1's `xlp_pageaddr` falsified in
+   place, everything else about the page left valid; asserts a non-vacuous
+   baseline first, then that no surviving record reaches past the stale page.
+3. `TestXLogPageValidatorMatchesUpstreamChecks` — one subtest per ported rule,
+   so a future loosening is named rather than inferred.
+
+Note the older `TestDetectWritePos_*` fixtures use `segSize = 1024`, which is
+**smaller than `XLOGBlockSize`** and therefore never crosses a page boundary at
+all; the S19 fixtures use `4 * XLOGBlockSize` so page headers actually exist
+where the walkers expect them.
+
+**Gates:** the 3 new guards PASS + each proven failing without the fix;
+`internal/wal` PASS (5.7 s) and RACE PASS (8.2 s); `internal/initdb` PASS (65 s,
+covers the crash/recovery fixtures); `internal/testport` `TestPort_Recovery` +
+`TestE2E_` PASS (112 s); **crash-restart smoke** — fresh cluster, `pgbench -i -s
+5`, 18 353 txns, `SIGKILL` the postmaster via `postmaster.pid`, restart:
+`count|sum` identical across the crash (`500000|-301853`) and a further pgbench
+run clean at 924 tps; SPOT `scripts/tpch-spotcheck.sh` RESULT=PASS (Q12 rows=2,
+Q13 rows=35). *Trap re-encountered:* the first crash-restart attempt silently
+talked to an **orphaned server from an earlier session** already bound to 5533
+(`bind: address already in use` was buried in the log while `pg_isready`
+answered happily) — always grep the server log for that string before believing
+a lifecycle result.
 
 ## References
 

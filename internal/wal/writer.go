@@ -1526,7 +1526,22 @@ func scanLastSegmentEnd(walDir string, segNo uint64, tli uint32, segSize int64, 
 	// a fatal "wal: decode at offset N: invalid record header: unknown rmid=31"
 	// on a subsequent crash restart. Upstream skips xlp_rem_len for the same
 	// reason when it picks a page up mid-record (xlogreader.c).
+	// M0131-S19: the sibling of readAllPageAware's validator (Hard-won Rule
+	// #2). This half is the load-bearing one: a PG-recycled segment scans as
+	// non-empty, so without the pageaddr check detectWritePos's phantom-drop
+	// loop breaks on the first stale segment and the resume position lands
+	// tens of MB past the true end of the stream.
+	pv := xlogPageValidator{segSize: cfgSegSize}
+
 	if hsize := pageHeaderSizeAt(streamBase, cfgSegSize); len(data) >= hsize {
+		if !isZeroBytes(data[:hsize]) {
+			if verr := pv.check(data[:hsize], uint64(streamBase)); verr != nil {
+				// Not this segment's own first page — treat the whole
+				// segment as holding nothing, which is what lets the
+				// phantom-drop loop in detectWritePos step over it.
+				return 0, 0, nil
+			}
+		}
 		if hdr, derr := DecodeXLogPageHeader(data[:hsize]); derr == nil && hdr.Info&XLPFirstIsContRecord != 0 {
 			off = hsize + maxAlignXLog(int(hdr.RemLen))
 			if off >= len(data) {
@@ -1543,6 +1558,11 @@ func scanLastSegmentEnd(walDir string, segNo uint64, tli uint32, segSize int64, 
 				return int64(off), lastRecPtr, nil
 			}
 			if isZeroBytes(data[off : off+hsize]) {
+				return int64(off), lastRecPtr, nil
+			}
+			// M0131-S19: stale page from an earlier write cycle — the
+			// records beyond it are not ours. End of stream.
+			if verr := pv.check(data[off:off+hsize], uint64(pos)); verr != nil {
 				return int64(off), lastRecPtr, nil
 			}
 			off += hsize
@@ -1577,6 +1597,12 @@ func scanLastSegmentEnd(walDir string, segNo uint64, tli uint32, segSize int64, 
 		if len(fullBytes) < total {
 			// Truncated tail — treat as EOS so we don't
 			// consume a partially-written record.
+			return int64(off), lastRecPtr, nil
+		}
+		// M0131-S19 (sibling of readAllPageAware's identical call): any page
+		// header swallowed by this record was skipped unvalidated by
+		// extractRecordBytes.
+		if verr := pv.checkSpan(data, off, consumed, uint64(streamBase)); verr != nil {
 			return int64(off), lastRecPtr, nil
 		}
 		decoded, err := decodeRecordXLogDetailed(fullBytes)

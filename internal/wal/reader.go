@@ -104,6 +104,13 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 	var records []Record
 	off := 0
 
+	// M0131-S19: every page header this walk crosses is validated against the
+	// address it is stored at (and against the previous page's timeline)
+	// before its bytes are trusted — see xlogPageValidator. `pos` below is
+	// stream-relative, but baseOffset is a whole multiple of segSize, so the
+	// absolute page address is simply baseOffset+off.
+	pv := xlogPageValidator{segSize: segSize}
+
 	// root-0032: the stream does not necessarily begin on a record boundary.
 	// It starts at the first segment of the live run, and the record that was
 	// being written when that segment began may have started in a segment that
@@ -117,6 +124,18 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 	// is not replayable and predates the retention keep point, so dropping it is
 	// correct, not lossy.
 	if hsize := pageHeaderSizeAt(0, segSize); len(stream) >= hsize {
+		// M0131-S19: validate before trusting xlp_rem_len. On a recycled
+		// segment the stale header can carry XLP_FIRST_IS_CONTRECORD with a
+		// rem_len from the previous cycle, which would skip an arbitrary
+		// distance into bytes that are not this record's tail.
+		// An all-zero header is the preallocated-tail EOS sentinel, not a
+		// corrupt page — leave it to the main loop's isZeroBytes branch.
+		if !isZeroBytes(stream[:hsize]) {
+			if err := pv.check(stream[:hsize], baseOffset); err != nil {
+				endOfWAL(0, baseOffset, "invalid page header", err)
+				return nil, nil
+			}
+		}
 		if hdr, err := DecodeXLogPageHeader(stream[:hsize]); err == nil && hdr.Info&XLPFirstIsContRecord != 0 {
 			off = hsize + maxAlignXLog(int(hdr.RemLen))
 			if off > len(stream) {
@@ -133,6 +152,14 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 				break
 			}
 			if isZeroBytes(stream[off : off+hsize]) {
+				break
+			}
+			// M0131-S19: a page that does not claim the address it is stored
+			// at is not part of this stream — the classic signature of a
+			// recycled segment PostgreSQL renamed into place without
+			// zero-filling. Upstream ends the read here too.
+			if err := pv.check(stream[off:off+hsize], baseOffset+uint64(off)); err != nil {
+				endOfWAL(off, baseOffset, "invalid page header", err)
 				break
 			}
 			off += hsize
@@ -180,6 +207,13 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 		paddedTotal := maxAlignXLog(total)
 		fullBytes, consumed := extractRecordBytes(stream[off:], pos, segSize, paddedTotal)
 		if len(fullBytes) < total {
+			break
+		}
+		// M0131-S19: extractRecordBytes just skipped any page headers this
+		// record straddles without looking at them. Validate them before the
+		// assembled bytes are trusted.
+		if verr := pv.checkSpan(stream, off, consumed, baseOffset); verr != nil {
+			endOfWAL(off, baseOffset, "invalid page header", verr)
 			break
 		}
 		decoded, err := decodeRecordXLogDetailed(fullBytes)
