@@ -1,6 +1,6 @@
 # WAL reader fail-closed — an unrecognised record is not end-of-WAL, and a recycled segment is not WAL
 
-**Status:** S16.1 / S16.2 / S16.5 LANDED 2026-08-11; S16.3, S16.4 and S19 still open
+**Status:** S16 CLOSED 2026-08-11 (S16.1/.2/.5 then S16.3/.4); S19 still open
 **Date:** 2026-08-11
 **Milestone:** M0131 (Theme F, S16 + S19)
 
@@ -285,12 +285,75 @@ proven fail-when-broken by temporarily restoring the old bound and the
 PASS + `-race` PASS, `internal/initdb` PASS, `internal/storage` PASS, UNITS
 PASS, pgbench smoke via the commit hook.
 
-**Still open in S16:** S16.3 (btree `default:` arm must refuse unless every
-mutated block carries `ImageApply`) and S16.4 (enumerate the `RmgrXLog` no-op
-opcode set and error on the rest). Both are replay-side, both risk turning a
-today-silent no-op into a refused start on goopg's own WAL, and both therefore
-want a crash-restart gate rather than unit tests alone — ledgered, fix_plan row
-left unchecked.
+## Implementation notes — what landed 2026-08-11 (S16.3 / S16.4) — S16 CLOSED
+
+The replay-side half. S16.1/S16.2 stopped the *reader* silently truncating the
+stream; these two stop the *dispatcher* silently under-applying a record it did
+hand to redo. Both former failure modes returned `applied=true`, which is worse
+than an error — the caller had no way to tell a real replay from a skipped one.
+
+**S16.3.** New `requireFullPageImages` (`recovery.go`) gates the btree
+`default:` arm: every block reference must carry `HasImage && ImageApply`, and
+a record with no block references at all is refused too, else the arm returns
+`ErrUnsupportedRecord`. The old code called `replayDecodedXLogHeapFPIBlocks`
+unconditionally, which `continue`s past an imageless block and then reported
+success. This was harmless for goopg's own WAL — every `RecordKind`
+`rmgr_map.go` maps to `RmgrBtree` has a named arm above the default — and data
+loss for a real-PG crash tail, where PG emits an FPI only on a page's FIRST
+post-checkpoint touch, so the second `XLOG_BTREE_DEDUP` on a page carries block
+DATA and no image.
+
+**S16.4.** `RmgrXLog`'s opcode space is now enumerated instead of collapsed
+into one silent `default: return false, nil`. Three changes:
+
+- The benign set is named explicitly: `CHECKPOINT_SHUTDOWN`,
+  `CHECKPOINT_ONLINE`, `NOOP`, `SWITCH`, `BACKUP_END`, `RESTORE_POINT`,
+  `FPW_CHANGE`, `END_OF_RECOVERY`, `OVERWRITE_CONTRECORD`, `CHECKPOINT_REDO`.
+  Each is a genuine physical no-op for page-level replay; checkpoint contents
+  *are* consumed, but via the control-file/redo-start path, not here.
+- `XLOG_FPI_FOR_HINT` gets a real arm. Upstream replays it on the same arm as
+  `XLOG_FPI` (`xlog.c:8748`); goopg used to drop it into the blanket no-op, so a
+  PG hint-bit page was silently DISCARDED. goopg never emits FOR_HINT, so this
+  only ever fires on a real-PG crash tail — the path M0131 exists to make work.
+- Everything else is refused, **including `XLOG_NEXTOID`**, which is why this
+  slice exists: `xlog_redo` sets `nextOid` exactly from it
+  (`xlog.c:8292-8308`), so dropping one lets goopg re-issue OIDs a crashed PG
+  had already allocated after the last checkpoint. Real redo is S21a; until
+  then a refused start beats a rewound OID counter. Ledgered.
+
+**One live self-inflicted hazard found and avoided — the reason S16.4 was
+flagged.** `xlogInfoDefault` (0xF0) is *not* a PG opcode: it is goopg's own
+`classifyXLogRecord` marker for an EMPTY-payload record
+(`format.go:151-153`), and it lands on `RmgrXLog`. The first cut of the refusing
+`default:` arm therefore made goopg refuse *its own* WAL — caught by the
+existing `TestApplyRecordPrefersDecodedXLogForUnknownPayloadKind`, not by the
+new guards. 0xF0 is now in the benign set with the reasoning inline. This costs
+no real-PG coverage: PG's opcode space is the high nibble only and it defines
+nothing at 0xF0, so a real PG producer can never emit the value. It also
+removes 0xF0 from the "undefined opcode" refusal cases — 0xC0 is now the only
+free slot goopg does not claim.
+
+**Guards** (`internal/wal/reader_fail_closed_test.go`, all proven
+fail-when-broken by scripted patches over a /tmp backup — 3 tests FAIL with the
+arms reverted, and the 10 benign no-op subtests correctly kept PASSing):
+`TestReplayRefusesBtreeFallbackWithoutFullPageImages` (4 subtests: no blocks,
+single imageless block, imageless block in either position, plus the
+counterweight that an all-image record is still accepted),
+`TestReplayRmgrXLogOpcodeCoverage` (11 benign + 2 refused), and
+`TestReplayAppliesXLogFPIForHint`.
+
+**Crash-restart gate** (what the plan asked for instead of unit tests alone):
+`goopg init` → btree-heavy workload on a PK + a secondary index (20k inserts, a
+modulo DELETE, 10k more inserts, VACUUM) → `kill -9` → restart → repeat with a
+second uncheckpointed round (15k inserts + a modulo DELETE). Row counts are
+identical across both crashes (23334, then 36429), index lookups still resolve,
+and the restart logs contain **zero** refusal/unsupported lines — so neither
+S16.3 nor S16.4 turned a today-silent no-op into a refused start on goopg's own
+WAL. (Note: the run must be on a genuinely free port — the first attempt bound
+nothing because an orphaned server from an earlier session held 5533, and the
+workload silently landed in *its* cluster.)
+
+**S16 is now CLOSED.** S16.1/.2/.5 landed in the prior loop, S16.3/.4 here.
 
 ## References
 

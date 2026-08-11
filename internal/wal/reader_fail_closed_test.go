@@ -296,3 +296,179 @@ func encodeTestPGCompressedImageRecord(t *testing.T) []byte {
 	copy(rec[SizeOfXLogRecord:], fragments)
 	return rec
 }
+
+// --- M0131-S16.3 / S16.4: the REPLAY-side half of "fail closed" -------------
+//
+// S16.1/S16.2 stopped the reader from silently truncating the stream. These
+// two guards stop the *dispatcher* from silently under-applying a record it
+// did hand to redo. Both failure modes reported applied=true, which is worse
+// than an error: the caller has no way to tell a real replay from a skipped
+// one.
+
+// btreeRecordWithBlocks builds a decoded (not encoded) btree record under an
+// opcode goopg has no native redo for, with one block reference per entry in
+// withImage. Working at the decoded level keeps the guard focused on the
+// dispatch decision rather than on frame encoding, which S16.1's guards
+// already cover.
+func btreeRecordWithBlocks(info uint8, withImage ...bool) Record {
+	blocks := make([]XLogBlockRef, 0, len(withImage))
+	for i, img := range withImage {
+		blocks = append(blocks, XLogBlockRef{
+			ID:         byte(i),
+			Rel:        storage.RelFileNode{DBOid: 5, RelOid: uint32(16400 + i)},
+			Block:      storage.BlockNumber(i),
+			HasImage:   img,
+			ImageApply: img,
+			Data:       []byte{1, 2, 3},
+		})
+	}
+	return Record{XLog: &XLogDecodedRecord{
+		Header: XLogRecord{Rmid: RmgrBtree, Info: info},
+		Blocks: blocks,
+	}}
+}
+
+// TestReplayRefusesBtreeFallbackWithoutFullPageImages is the S16.3 guard.
+//
+// xlogBtreeDedup (0xD0) is a real PG opcode with no named arm in goopg, so it
+// lands on the btree `default:` arm, whose only replay strategy is restoring
+// every mutated page from its FPI. PG emits an FPI only on a page's FIRST
+// touch after a checkpoint — so the second dedup on a page carries block DATA
+// and no image. Before S16.3 that block was `continue`d past and the record
+// reported applied=true: an index mutation silently dropped on a PG crash
+// tail. Every block must carry an applicable image or the record is refused.
+func TestReplayRefusesBtreeFallbackWithoutFullPageImages(t *testing.T) {
+	const xlogBtreeDedup = 0xD0 // XLOG_BTREE_DEDUP (nbtxlog.h)
+
+	cases := []struct {
+		name   string
+		blocks []bool
+	}{
+		{"no blocks at all", nil},
+		{"single block without image", []bool{false}},
+		{"second of two blocks without image", []bool{true, false}},
+		{"first of two blocks without image", []bool{false, true}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := btreeRecordWithBlocks(xlogBtreeDedup, tc.blocks...)
+			applied, err := replayDecodedXLogRecord(nil, rec)
+			if err == nil {
+				t.Fatalf("replay err = nil (applied=%v), want refusal", applied)
+			}
+			if !errors.Is(err, ErrUnsupportedRecord) {
+				t.Fatalf("replay err = %v, want ErrUnsupportedRecord", err)
+			}
+			if applied {
+				t.Fatal("applied = true alongside error")
+			}
+		})
+	}
+
+	// The counterweight: an all-image record still satisfies the
+	// precondition, so S16.3 does not refuse the case the fallback exists
+	// for. (The apply itself needs a storage manager and is covered by the
+	// btree FPI replay tests.)
+	rec := btreeRecordWithBlocks(xlogBtreeDedup, true, true)
+	if err := requireFullPageImages(rec, rec.XLog); err != nil {
+		t.Fatalf("all-image record refused: %v", err)
+	}
+}
+
+// TestReplayRmgrXLogOpcodeCoverage is the S16.4 guard: RM_XLOG_ID's opcode
+// space is enumerated, not collapsed into one silent no-op.
+//
+// The dangerous member is XLOG_NEXTOID. Upstream xlog_redo sets nextOid
+// EXACTLY from it (xlog.c:8292-8308); dropping one lets goopg re-issue OIDs a
+// crashed PG had already allocated after the last checkpoint. Before S16.4 it
+// was a no-op indistinguishable from XLOG_SWITCH.
+func TestReplayRmgrXLogOpcodeCoverage(t *testing.T) {
+	benign := []struct {
+		name string
+		info uint8
+	}{
+		{"XLOG_CHECKPOINT_SHUTDOWN", xlogXLogCheckpointShutdown},
+		{"XLOG_CHECKPOINT_ONLINE", xlogXLogCheckpointOnline},
+		{"XLOG_NOOP", xlogXLogNoop},
+		{"XLOG_SWITCH", xlogXLogSwitch},
+		{"XLOG_BACKUP_END", xlogXLogBackupEnd},
+		{"XLOG_RESTORE_POINT", xlogXLogRestorePoint},
+		{"XLOG_FPW_CHANGE", xlogXLogFPWChange},
+		{"XLOG_END_OF_RECOVERY", xlogXLogEndOfRecovery},
+		{"XLOG_OVERWRITE_CONTRECORD", xlogXLogOverwriteContrecord},
+		{"XLOG_CHECKPOINT_REDO", xlogXLogCheckpointRedo},
+		// Not a PG opcode: goopg's own empty-payload marker
+		// (classifyXLogRecord, format.go:151-153). Refusing it would make
+		// goopg refuse its own WAL — the exact self-inflicted hazard this
+		// slice was flagged for. PG defines nothing at 0xF0, so keeping it
+		// benign costs no real-PG coverage.
+		{"goopg xlogInfoDefault (empty payload)", xlogInfoDefault},
+	}
+	for _, tc := range benign {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := Record{XLog: &XLogDecodedRecord{
+				Header: XLogRecord{Rmid: RmgrXLog, Info: tc.info},
+			}}
+			applied, err := replayDecodedXLogRecord(nil, rec)
+			if err != nil {
+				t.Fatalf("replay err = %v, want nil (enumerated benign no-op)", err)
+			}
+			if applied {
+				t.Fatal("applied = true, want false (physical no-op)")
+			}
+		})
+	}
+
+	refused := []struct {
+		name string
+		info uint8
+	}{
+		// The whole point of S16.4: NEXTOID is not benign. Real work is
+		// M0131-S21a; until then a refused start beats a rewound OID counter.
+		{"XLOG_NEXTOID", xlogXLogNextOid},
+		// The one opcode value PG 18 leaves undefined that goopg does not
+		// claim either — a newer producer, or corruption that survived the
+		// CRC check by construction. (0xF0, the other free slot, is goopg's
+		// own empty-payload marker and is in the benign set above.)
+		{"undefined opcode 0xC0", 0xC0},
+	}
+	for _, tc := range refused {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := Record{XLog: &XLogDecodedRecord{
+				Header: XLogRecord{Rmid: RmgrXLog, Info: tc.info},
+			}}
+			applied, err := replayDecodedXLogRecord(nil, rec)
+			if err == nil {
+				t.Fatalf("replay err = nil (applied=%v), want refusal", applied)
+			}
+			if !errors.Is(err, ErrUnsupportedRecord) {
+				t.Fatalf("replay err = %v, want ErrUnsupportedRecord", err)
+			}
+			if applied {
+				t.Fatal("applied = true alongside error")
+			}
+		})
+	}
+}
+
+// TestReplayAppliesXLogFPIForHint pins the third S16.4 change: XLOG_FPI_FOR_HINT
+// used to fall into the blanket `default:` no-op and its page was DROPPED.
+// Upstream replays it on the same arm as XLOG_FPI (xlog.c:8748). goopg never
+// emits FOR_HINT, so this only ever fires on a real-PG crash tail — which is
+// exactly the path M0131 exists to make work.
+func TestReplayAppliesXLogFPIForHint(t *testing.T) {
+	rec := Record{XLog: &XLogDecodedRecord{
+		Header: XLogRecord{Rmid: RmgrXLog, Info: xlogXLogFPIForHint},
+	}}
+	// No blocks and no manager: the arm must still report that it OWNS the
+	// opcode (applied=true, no error) rather than falling through to the
+	// no-op set. Upstream tolerates a FOR_HINT block with no image, so an
+	// empty block list is not an error here (unlike the S16.3 btree arm).
+	applied, err := replayDecodedXLogRecord(nil, rec)
+	if err != nil {
+		t.Fatalf("replay err = %v, want nil", err)
+	}
+	if !applied {
+		t.Fatal("applied = false: XLOG_FPI_FOR_HINT fell through to the no-op set again")
+	}
+}

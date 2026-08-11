@@ -2242,10 +2242,52 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 				return false, err
 			}
 			return true, nil
-		default:
-			// Other RmgrXLog opcodes (checkpoint, noop, switch, …) need no
-			// physical replay action on the standby.
+		case xlogXLogFPIForHint:
+			// M0131-S16.4: upstream xlog_redo handles XLOG_FPI_FOR_HINT on the
+			// SAME arm as XLOG_FPI (xlog.c:8748) — both carry nothing but block
+			// references and are replayed by restoring their images. The only
+			// difference is tolerance: a FOR_HINT block may legitimately carry
+			// no image (the hint bit was already durable via a concurrent FPI),
+			// where a bare XLOG_FPI without one is an ERROR upstream. goopg
+			// never emits FOR_HINT (rmgr_map.go maps PageImage → XLOG_FPI), so
+			// this arm exists purely for a real-PG crash tail; before S16.4 it
+			// fell into the default no-op and the hint-bit page was DROPPED.
+			if err := replayDecodedXLogHeapFPIBlocks(mgr, r, xlog); err != nil {
+				return false, err
+			}
+			return true, nil
+		case xlogXLogCheckpointShutdown, xlogXLogCheckpointOnline,
+			xlogXLogNoop, xlogXLogSwitch, xlogXLogBackupEnd,
+			xlogXLogRestorePoint, xlogXLogFPWChange, xlogXLogEndOfRecovery,
+			xlogXLogOverwriteContrecord, xlogXLogCheckpointRedo,
+			xlogInfoDefault:
+			// M0131-S16.4: the ENUMERATED benign set. Each of these is a
+			// genuine physical no-op for goopg's page-level replay — upstream
+			// xlog_redo either does nothing at all (NOOP, SWITCH,
+			// RESTORE_POINT, CHECKPOINT_REDO) or updates only shared-memory /
+			// recovery bookkeeping goopg does not maintain (the two CHECKPOINT
+			// opcodes, BACKUP_END, END_OF_RECOVERY, FPW_CHANGE,
+			// OVERWRITE_CONTRECORD). Checkpoint contents ARE consumed by goopg,
+			// but through the separate control-file/redo-start path, not here.
+			//
+			// xlogInfoDefault (0xF0) is the odd one out: it is not a PG opcode
+			// at all but goopg's own classifyXLogRecord marker for an
+			// EMPTY-payload record (format.go:151-153). It must stay a no-op
+			// or goopg refuses to replay its own WAL. Keeping it here rather
+			// than in the refused set costs no real-PG coverage, because PG's
+			// opcode space is the high nibble only and it defines nothing at
+			// 0xF0 — a real PG producer can never emit this value.
 			return false, nil
+		default:
+			// M0131-S16.4: everything else — including XLOG_NEXTOID — is
+			// refused rather than silently skipped. XLOG_NEXTOID is the reason
+			// this arm stopped being a blanket no-op: xlog_redo sets nextOid
+			// EXACTLY from it (xlog.c:8292-8308), so dropping one lets goopg
+			// re-issue OIDs a crashed PG had already allocated after the last
+			// checkpoint. Implementing it is M0131-S21a; until then, refusing
+			// to start beats starting with a rewound OID counter. goopg emits
+			// no NEXTOID of its own, so this cannot fire on goopg's own WAL.
+			return false, fmt.Errorf("%w: %s", ErrUnsupportedRecord, unsupportedDecodedXLogRecord(r))
 		}
 	case RmgrXact:
 		switch xlog.Header.Info & xlogXactOpMask {
@@ -2514,9 +2556,25 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			}
 			return true, nil
 		default:
-			// Other btree records (dedup / delete / reuse-page / …) are
-			// not flipped yet and are emitted with full-page images; restore
-			// each block from its FPI.
+			// Other btree records (dedup / delete / reuse-page / …) have no
+			// native redo in goopg yet; the only way to apply one is to restore
+			// every block it mutated from a full-page image.
+			//
+			// M0131-S16.3: that is a CONDITION, not an assumption. This arm
+			// used to call replayDecodedXLogHeapFPIBlocks unconditionally,
+			// which silently `continue`s past any block lacking an apply-image
+			// and then reported applied=true. For goopg's own WAL that was
+			// harmless (goopg emits none of these opcodes — every kind
+			// rmgr_map.go maps to RmgrBtree has a named arm above). For a real
+			// PG crash tail it is data loss: PG emits an FPI only on a page's
+			// FIRST touch after a checkpoint, so the second XLOG_BTREE_DEDUP
+			// on a page carries block DATA and no image — and we dropped the
+			// mutation while telling the caller it had been applied. Refuse
+			// instead, so an unreplayable index change stops the start rather
+			// than corrupting the index silently.
+			if err := requireFullPageImages(r, xlog); err != nil {
+				return false, err
+			}
 			if err := replayDecodedXLogHeapFPIBlocks(mgr, r, xlog); err != nil {
 				return false, err
 			}
@@ -2600,6 +2658,35 @@ func replayXLogParameterChange(mgr *storage.Manager, xlog *XLogDecodedRecord) (b
 		return false, fmt.Errorf("wal: XLOG_PARAMETER_CHANGE: %w", err)
 	}
 	return true, nil
+}
+
+// requireFullPageImages reports an ErrUnsupportedRecord unless EVERY block
+// reference of the record carries an applicable full-page image — the
+// precondition for replaying a record goopg has no native redo for by simply
+// restoring its pages.
+//
+// M0131-S16.3. A record with zero block references is refused too: an
+// image-only replay of a record that mutated nothing recorded here cannot be
+// the whole truth, and silently succeeding is precisely the failure mode this
+// slice exists to remove. The error names the offending block so a refused
+// start says which record and which page could not be replayed, rather than
+// "recovery failed".
+func requireFullPageImages(r Record, xlog *XLogDecodedRecord) error {
+	if len(xlog.Blocks) == 0 {
+		return fmt.Errorf("%w: rmid=%d info=0x%02x lsn[%d,%d] has no block references to restore",
+			ErrUnsupportedRecord, xlog.Header.Rmid, xlog.Header.Info&XLRRmgrInfoMask,
+			r.StartLSN, r.EndLSN)
+	}
+	for i, block := range xlog.Blocks {
+		if block.HasImage && block.ImageApply {
+			continue
+		}
+		return fmt.Errorf("%w: rmid=%d info=0x%02x lsn[%d,%d] block %d (rel %v blk %d) carries no applicable full-page image (has_image=%t apply=%t) and goopg has no native redo for this opcode",
+			ErrUnsupportedRecord, xlog.Header.Rmid, xlog.Header.Info&XLRRmgrInfoMask,
+			r.StartLSN, r.EndLSN, i, block.Rel, block.Block,
+			block.HasImage, block.ImageApply)
+	}
+	return nil
 }
 
 func unsupportedDecodedXLogRecord(r Record) error {

@@ -79,6 +79,25 @@ const (
 	// Used by recordKindToRmgrInfo (doc 04 §3.1) to map PageImage.
 	xlogXLogFPI uint8 = 0xB0
 
+	// M0131-S16.4: the REST of RM_XLOG_ID's opcode space
+	// (pg_control.h:68-82). Named so replayDecodedXLogRecord can enumerate
+	// the benign no-ops explicitly and refuse anything outside the list,
+	// instead of collapsing the whole space into one silent `default:`.
+	// XLOG_NEXTOID is deliberately absent from the benign set — see the
+	// default arm in recovery.go.
+	xlogXLogCheckpointShutdown  uint8 = 0x00 // XLOG_CHECKPOINT_SHUTDOWN
+	xlogXLogCheckpointOnline    uint8 = 0x10 // XLOG_CHECKPOINT_ONLINE
+	xlogXLogNoop                uint8 = 0x20 // XLOG_NOOP
+	xlogXLogNextOid             uint8 = 0x30 // XLOG_NEXTOID (NOT benign)
+	xlogXLogSwitch              uint8 = 0x40 // XLOG_SWITCH
+	xlogXLogBackupEnd           uint8 = 0x50 // XLOG_BACKUP_END
+	xlogXLogRestorePoint        uint8 = 0x70 // XLOG_RESTORE_POINT
+	xlogXLogFPWChange           uint8 = 0x80 // XLOG_FPW_CHANGE
+	xlogXLogEndOfRecovery       uint8 = 0x90 // XLOG_END_OF_RECOVERY
+	xlogXLogFPIForHint          uint8 = 0xA0 // XLOG_FPI_FOR_HINT
+	xlogXLogOverwriteContrecord uint8 = 0xD0 // XLOG_OVERWRITE_CONTRECORD
+	xlogXLogCheckpointRedo      uint8 = 0xE0 // XLOG_CHECKPOINT_REDO
+
 	// CLOG_TRUNCATE (clog.h:56), RM_CLOG_ID's (only non-zeropage)
 	// opcode. Used by recordKindToRmgrInfo (doc 04 §3.1) to map
 	// ClogTruncate.
