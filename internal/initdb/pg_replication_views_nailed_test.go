@@ -15,11 +15,15 @@ func TestNailedLocalRelsContainsFiveReplicationViews(t *testing.T) {
 		natts   int16
 		reltype uint32
 	}{
-		{12102, "pg_stat_replication", 20, 2249},
-		{12103, "pg_stat_recovery_prefetch", 10, 2249},
-		{12104, "pg_stat_subscription", 11, 2249},
-		{12105, "pg_replication_slots", 21, 2249},
-		{12106, "pg_stat_replication_slots", 10, 2249},
+		// OIDs PINNED to PG 18.3's initdb assignment by M0131-S8a (they
+		// were the goopg-private 12102..12106). Literals on purpose: this
+		// test is the lock-in, so it must not read the same constants the
+		// production table does.
+		{12231, "pg_stat_replication", 20, 2249},
+		{12244, "pg_stat_recovery_prefetch", 10, 2249},
+		{12248, "pg_stat_subscription", 11, 2249},
+		{12261, "pg_replication_slots", 21, 2249},
+		{12266, "pg_stat_replication_slots", 10, 2249},
 	}
 
 	for _, tc := range cases {
@@ -66,7 +70,7 @@ func TestNailedLocalRelsContainsFiveReplicationViews(t *testing.T) {
 }
 
 // TestPgStatReplicationViewAttrs pins the 20 column descriptors for
-// pg_catalog.pg_stat_replication (OID 12102, system_views.sql:906-930).
+// pg_catalog.pg_stat_replication (OID 12231, system_views.sql:906-930).
 func TestPgStatReplicationViewAttrs(t *testing.T) {
 	want := []struct {
 		Name    string
@@ -94,11 +98,11 @@ func TestPgStatReplicationViewAttrs(t *testing.T) {
 		{"sync_state", 25, -1},
 		{"reply_time", 1184, 8},
 	}
-	checkViewAttrs(t, "pg_stat_replication", pgStatReplicationViewAttrs(), want)
+	checkViewAttrs(t, "pg_stat_replication", nailedViewSeedAttrs("pg_stat_replication"), want)
 }
 
 // TestPgStatRecoveryPrefetchViewAttrs pins the 10 column descriptors for
-// pg_catalog.pg_stat_recovery_prefetch (OID 12103, system_views.sql:965-977).
+// pg_catalog.pg_stat_recovery_prefetch (OID 12244, system_views.sql:965-977).
 func TestPgStatRecoveryPrefetchViewAttrs(t *testing.T) {
 	want := []struct {
 		Name    string
@@ -116,11 +120,11 @@ func TestPgStatRecoveryPrefetchViewAttrs(t *testing.T) {
 		{"block_distance", 23, 4},
 		{"io_depth", 23, 4},
 	}
-	checkViewAttrs(t, "pg_stat_recovery_prefetch", pgStatRecoveryPrefetchViewAttrs(), want)
+	checkViewAttrs(t, "pg_stat_recovery_prefetch", nailedViewSeedAttrs("pg_stat_recovery_prefetch"), want)
 }
 
 // TestPgStatSubscriptionViewAttrs pins the 11 column descriptors for
-// pg_catalog.pg_stat_subscription (OID 12104, system_views.sql:979-994).
+// pg_catalog.pg_stat_subscription (OID 12248, system_views.sql:979-994).
 func TestPgStatSubscriptionViewAttrs(t *testing.T) {
 	want := []struct {
 		Name    string
@@ -139,11 +143,11 @@ func TestPgStatSubscriptionViewAttrs(t *testing.T) {
 		{"latest_end_lsn", 3220, 8},
 		{"latest_end_time", 1184, 8},
 	}
-	checkViewAttrs(t, "pg_stat_subscription", pgStatSubscriptionViewAttrs(), want)
+	checkViewAttrs(t, "pg_stat_subscription", nailedViewSeedAttrs("pg_stat_subscription"), want)
 }
 
 // TestPgReplicationSlotsViewAttrs pins the 21 column descriptors for
-// pg_catalog.pg_replication_slots (OID 12105, system_views.sql:1019-1043).
+// pg_catalog.pg_replication_slots (OID 12261, system_views.sql:1019-1043).
 // PG18 adds two_phase_at/inactive_since/conflicting/invalidation_reason/
 // failover/synced as the final six entries.
 func TestPgReplicationSlotsViewAttrs(t *testing.T) {
@@ -174,18 +178,24 @@ func TestPgReplicationSlotsViewAttrs(t *testing.T) {
 		{"failover", 16, 1},
 		{"synced", 16, 1},
 	}
-	checkViewAttrs(t, "pg_replication_slots", pgReplicationSlotsViewAttrs(), want)
+	checkViewAttrs(t, "pg_replication_slots", nailedViewSeedAttrs("pg_replication_slots"), want)
 }
 
 // TestPgStatReplicationSlotsViewAttrs pins the 10 column descriptors for
-// pg_catalog.pg_stat_replication_slots (OID 12106, system_views.sql:1045-1059).
+// pg_catalog.pg_stat_replication_slots (OID 12266, system_views.sql:1045-1059).
 func TestPgStatReplicationSlotsViewAttrs(t *testing.T) {
 	want := []struct {
 		Name    string
 		TypeOID uint32
 		Len     int16
 	}{
-		{"slot_name", 19, 64},
+		// text(25), not name(19): the view selects `s.slot_name`, the OUT
+		// parameter of pg_stat_get_replication_slot (pg_proc.dat:5676-5680),
+		// not `r.slot_name` from the pg_replication_slots base view. This
+		// test pinned the wrong value from the day it was written; M0131-S7's
+		// oracle capture (scripts/capture-ev-action.sh) caught it and the
+		// value below now comes from a real PG 18.3's own pg_attribute.
+		{"slot_name", 25, -1},
 		{"spill_txns", 20, 8},
 		{"spill_count", 20, 8},
 		{"spill_bytes", 20, 8},
@@ -196,7 +206,7 @@ func TestPgStatReplicationSlotsViewAttrs(t *testing.T) {
 		{"total_bytes", 20, 8},
 		{"stats_reset", 1184, 8},
 	}
-	checkViewAttrs(t, "pg_stat_replication_slots", pgStatReplicationSlotsViewAttrs(), want)
+	checkViewAttrs(t, "pg_stat_replication_slots", nailedViewSeedAttrs("pg_stat_replication_slots"), want)
 }
 
 // checkViewAttrs is a shared helper for the five view attr tests.

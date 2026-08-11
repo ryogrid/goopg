@@ -71,6 +71,12 @@ type Runtime struct {
 	// See docs/design/0005-0001-streaming-replication-architecture.md.
 	Standby bool
 
+	// Recovery is true when `<DataDir>/recovery.signal` was present
+	// at Open time. cmd/goopg start uses this to enter archive recovery
+	// (fetch WAL segments via restore_command, replay them, then
+	// promote). See docs/design/0130-0009-recovery-signal-archive-recovery.md.
+	Recovery bool
+
 	// walwriterStop, when non-nil, is closed by Close() to signal the
 	// background WAL writer loop to exit. nil when the loop wasn't
 	// started (WalWriterDelay == 0 in tests).
@@ -440,11 +446,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// Atomic B-tree split record (Landing 3a of M0002 — see
 	// docs/design/0002-0002-btree-concurrency.md). Same import-cycle
 	// dodge as logFPI.
-	logBtreeSplit := func(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, sibBlk storage.BlockNumber, sibPage storage.Page) (storage.LSN, error) {
-		// A8: emit a PG RM_BTREE split record carrying the post-split pages as
-		// full-page images instead of the goopg-native body. Recovery restores
-		// the images via the RmgrBtree default (FPI) arm.
-		payload, err := wal.EncodeBtreeSplitPG(rel, leftBlk, rightBlk, leftPage, rightPage, sibBlk, sibPage)
+	logBtreeSplit := func(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, prePage, leftPage, rightPage storage.Page, newItem []byte, sibBlk storage.BlockNumber, sibPage storage.Page, childBlk storage.BlockNumber) (storage.LSN, error) {
+		// A8: emit a PG RM_BTREE split record. Since M0130-S11.5b-2 the left
+		// half is described incrementally from prePage + newItem when that
+		// reproduces the page the primary wrote, and logged as a full-page
+		// image when it does not.
+		payload, err := wal.EncodeBtreeSplitPG(rel, leftBlk, rightBlk, prePage, leftPage, rightPage, newItem, sibBlk, sibPage, childBlk)
 		if err != nil {
 			return 0, err
 		}
@@ -474,12 +481,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	}
 
 	// Logical btree non-split insert change record.
-	logBtreeInsert := func(rel storage.RelFileNode, blk storage.BlockNumber, item []byte) (storage.LSN, error) {
+	logBtreeInsert := func(rel storage.RelFileNode, blk storage.BlockNumber, offnum uint16, item []byte) (storage.LSN, error) {
 		// A5: emit a PostgreSQL xl_btree_insert (INSERT_LEAF) record with the
-		// IndexTuple as block-0 data instead of the goopg-native body. offnum=0
-		// (goopg replay re-inserts by key). Recovery routes it to
-		// replayDecodedXLogBtreeInsert.
-		payload, err := wal.EncodeBtreeInsertPG(rel, blk, 0, item)
+		// IndexTuple as block-0 data instead of the goopg-native body. Recovery
+		// routes it to replayDecodedXLogBtreeInsert.
+		//
+		// M0130-S11.4 slice 3b-2c-ii-B2-b-ii: offnum is now the REAL physical
+		// offset number the writer placed the tuple at, where it used to be a
+		// placeholder 0 because goopg replay re-inserted by key. That closes
+		// A5's documented parity gap (a real-PG standby applies at offnum) and
+		// is what lets goopg's own replay stop needing the index's key format.
+		payload, err := wal.EncodeBtreeInsertPG(rel, blk, offnum, item)
 		if err != nil {
 			return 0, err
 		}
@@ -522,11 +534,11 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// `btree.VacuumIndexPages` so per-page vacuum cost is
 	// proportional to surviving items rather than 8 KiB of
 	// page bytes.
-	logBtreeVacuum := func(rel storage.RelFileNode, blk storage.BlockNumber, page storage.Page) (storage.LSN, error) {
-		// A8: emit a PG RM_BTREE vacuum record carrying the post-vacuum page as a
-		// full-page image instead of the goopg-native kept-items body. Recovery
-		// restores the image via the RmgrBtree default (FPI) arm.
-		payload, err := wal.EncodeBtreeVacuumPG(rel, blk, page)
+	logBtreeVacuum := func(rel storage.RelFileNode, blk storage.BlockNumber, prePage, page storage.Page, deleted []uint16) (storage.LSN, error) {
+		// M0130-S11.5c: emit PG's xl_btree_vacuum — main data {ndeleted,
+		// nupdated} plus the deleted offset numbers as block-0 data, or a
+		// full-page image when the rewrite is not a plain deletion.
+		payload, err := wal.EncodeBtreeVacuumPG(rel, blk, prePage, page, deleted)
 		if err != nil {
 			return 0, err
 		}
@@ -537,50 +549,64 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return storage.LSN(end), nil
 	}
 
-	// M0079-0003 logical records covering the remaining FPI
-	// fallback paths in btree page deletion + root replacement.
+	// Btree page deletion, phase 2 of 2 (M0130-S11.5d-3b-2): emit PG's
+	// xl_btree_unlink_page — main data {leftsib, rightsib, level, safexid,
+	// leaf*}, block 0 the target (WILL_INIT, redo rewrites it as an empty
+	// deleted page), blocks 1/2 the siblings, block 3 the half-dead leaf of a
+	// multi-level subtree, block 4 the metapage on the _META variant. Replaces
+	// the goopg-native `RecordKindBtreeUnlinkPage`, which covered BOTH upstream
+	// phases in one record under an RM_BTREE/XLOG_BTREE_UNLINK_PAGE header — a
+	// standby reading it casts the main data to a struct it is not and then
+	// PANICs in XLogInitBufferForRedo on a block id that was never registered.
 	logBtreeUnlinkPage := func(rel storage.RelFileNode, req storage.BtreeUnlinkPageRequest) (storage.LSN, error) {
-		payload := wal.EncodeBtreeUnlinkPage(wal.BtreeUnlinkPagePayload{
-			Rel:              rel,
-			LeafBlk:          req.LeafBlk,
-			LeafFlagsAfter:   req.LeafFlagsAfter,
-			HasLeftSib:       req.HasLeftSib,
-			LeftSibBlk:       req.LeftSibBlk,
-			LeftSibNewNext:   req.LeftSibNewNext,
-			HasRightSib:      req.HasRightSib,
-			RightSibBlk:      req.RightSibBlk,
-			RightSibNewPrev:  req.RightSibNewPrev,
-			HasParent:        req.HasParent,
-			ParentBlk:        req.ParentBlk,
-			ParentRemoveSlot: req.ParentRemoveSlot,
-		})
-		_, end, err := walWriter.Append(payload)
-		if err != nil {
-			return 0, err
-		}
-		return storage.LSN(end), nil
-	}
-	logBtreeNewRoot := func(rel storage.RelFileNode, rootBlk storage.BlockNumber, rootPage storage.Page, metaBlk storage.BlockNumber, metaPage storage.Page) (storage.LSN, error) {
-		// A8: emit a PG RM_BTREE new-root record carrying the new root page
-		// (backup block 0) and the updated metapage (backup block 2) as full-page
-		// images instead of the goopg-native (rootBlk, level, items) body.
-		// Recovery restores both images via the RmgrBtree default (FPI) arm.
-		payload, err := wal.EncodeBtreeNewRootPG(rel, rootBlk, rootPage, metaBlk, metaPage)
-		if err != nil {
-			return 0, err
-		}
-		_, end, err := walWriter.Append(payload)
-		if err != nil {
-			return 0, err
-		}
-		return storage.LSN(end), nil
-	}
-	logBtreeMarkPageHalfDead := func(rel storage.RelFileNode, leafBlk storage.BlockNumber, flagsAfter uint16) (storage.LSN, error) {
-		payload := wal.EncodeBtreeMarkPageHalfDead(wal.BtreeMarkHalfDeadPayload{
+		payload, err := wal.EncodeBtreeUnlinkPagePG(wal.BtreeUnlinkPagePGRequest{
 			Rel:        rel,
-			LeafBlk:    leafBlk,
-			FlagsAfter: flagsAfter,
+			TargetBlk:  req.TargetBlk,
+			TargetPage: req.TargetPage,
+			SafeXid:    req.SafeXid,
+			LeafBlk:    req.LeafBlk,
+			LeafPage:   req.LeafPage,
+			MetaBlk:    req.MetaBlk,
+			MetaPage:   req.MetaPage,
 		})
+		if err != nil {
+			return 0, err
+		}
+		_, end, err := walWriter.Append(payload)
+		if err != nil {
+			return 0, err
+		}
+		return storage.LSN(end), nil
+	}
+	logBtreeNewRoot := func(rel storage.RelFileNode, rootBlk storage.BlockNumber, rootPage storage.Page, leftChildBlk storage.BlockNumber, metaBlk storage.BlockNumber, metaPage storage.Page) (storage.LSN, error) {
+		// A8 / M0130-S11.5a: emit a PG RM_BTREE new-root record — main data
+		// xl_btree_newroot{rootblk, level}, block 0 the new root's item area in
+		// _bt_restore_page form, block 1 the left child (incomplete-split clear),
+		// block 2 the metapage as xl_btree_metadata. Content-parity with
+		// upstream _bt_newroot; no longer full-page images.
+		payload, err := wal.EncodeBtreeNewRootPG(rel, rootBlk, rootPage, leftChildBlk, metaBlk, metaPage)
+		if err != nil {
+			return 0, err
+		}
+		_, end, err := walWriter.Append(payload)
+		if err != nil {
+			return 0, err
+		}
+		return storage.LSN(end), nil
+	}
+	// Btree page deletion, phase 1 of 2 (M0130-S11.5d-3b-2): emit PG's
+	// xl_btree_mark_page_halfdead — main data {poffset, leafblk, leftblk,
+	// rightblk, topparent}, block 0 the leaf (WILL_INIT; redo rebuilds it as a
+	// half-dead page carrying the dummy top-parent high key), block 1 the
+	// parent whose downlink is retargeted-and-deleted. Replaces the native
+	// `RecordKindBtreeMarkPageHalfDead` (leafblk + a flags word, no registered
+	// blocks at all) — see EncodeBtreeMarkPageHalfDeadPG for why that record
+	// PANICs a standby rather than merely diverging.
+	logBtreeMarkPageHalfDead := func(rel storage.RelFileNode, req storage.BtreeMarkPageHalfDeadRequest) (storage.LSN, error) {
+		payload, err := wal.EncodeBtreeMarkPageHalfDeadPG(rel, req.LeafBlk, req.LeafPage, req.ParentBlk, req.POffset, req.TopParent)
+		if err != nil {
+			return 0, err
+		}
 		_, end, err := walWriter.Append(payload)
 		if err != nil {
 			return 0, err
@@ -925,6 +951,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return int64(n), true
 	})
 	txnMgr := mvcc.NewManager()
+	// M0130-S11.5d-3c: b-tree page deletion's recycle horizon. `next` is
+	// upstream's ReadNextFullTransactionId (stamped into the deleted page as
+	// its BTDeletedPageData.safexid); `oldestVisible` is the boundary
+	// GlobalVisCheckRemovableFullXid tests — a deleted block stays a tombstone
+	// until no live snapshot can still be descending to it. Both are widened
+	// from goopg's 32-bit XID space with the epoch pinned to 0, the same
+	// convention internal/amcheck uses.
+	pool.SetBtreeRecycleHorizon(func() (next, oldestVisible uint64) {
+		return uint64(txnMgr.NextXID()), uint64(txnMgr.OldestXmin())
+	})
 	// Wire the M0008 logical-decoding xact-marker hook: every
 	// successful Commit / Rollback against this manager appends
 	// an EncodeXactCommit / EncodeXactAbort record to the WAL
@@ -2149,6 +2185,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
+
+	// M0130-S3: restore runtime CREATE EXTENSION entries from the pg_extension
+	// heap so installed extensions are visible after a restart.
+	if err := reloadUserExtensionsFromHeap(mgr, cat, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: pg_extension reload: %w", err)
+	}
 		return nil, fmt.Errorf("goopg: pg_collation reload: %w", err)
 	}
 	if err := reloadUserConversionsFromHeap(mgr, cat, clog); err != nil {
@@ -2317,6 +2362,11 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: standby signal: %w", err)
 	}
+	recovery, err := IsRecovery(abs)
+	if err != nil {
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: recovery signal: %w", err)
+	}
 
 	rt := &Runtime{
 		StorageMgr:     mgr,
@@ -2335,12 +2385,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		Activity:       act,
 		DataDir:        abs,
 		Standby:        standby,
+		Recovery:       recovery,
 		FSM:            storage.NewFSM(),
 		VM:             storage.NewVisibilityMap(),
 	}
 
-	// M0080-0003: load persistent Visibility Map state from
-	// `<DataDir>/global/pg_vm_state.bin` if present. A missing
+	// M0130-S1: load persistent Visibility Map state from per-relation
+	// _vm fork files if present. A missing
 	// file is fine — that's the fresh-from-init case OR a cluster
 	// from before VM persistence existed. Failure to load is a
 	// hard startup error so the operator sees the issue rather
@@ -2348,19 +2399,19 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// CORRECT semantically — a cleared VM bit is a conservative
 	// "must check heap" — but would degrade index-only-scan
 	// performance until the next VACUUM rebuilt the bits).
-	if err := rt.VM.Load(storage.VMStatePath(rt.DataDir)); err != nil {
+	if err := rt.VM.VMLoadForks(rt.DataDir); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: vm load: %w", err)
 	}
 
-	// M0080-0004: load persistent FSM state. Same shape /
+	// M0130-S1: load persistent FSM state from per-relation. Same shape /
 	// nil-safety as the VM load above. A missing file is the
 	// fresh-cluster case; a corrupt one is a hard startup
 	// failure (running with stale FSM bits would direct INSERTs
 	// to wrong pages and waste time on retries).
-	if err := rt.FSM.Load(storage.FSMStatePath(rt.DataDir)); err != nil {
+	if err := rt.FSM.FSMLoadForks(rt.DataDir); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
@@ -3092,17 +3143,17 @@ func (r *Runtime) SaveVM() error {
 	if r == nil || r.VM == nil {
 		return nil
 	}
-	return r.VM.Save(storage.VMStatePath(r.DataDir))
+	return r.VM.VMSaveForks(r.DataDir, nil)
 }
 
-// SaveFSM writes the runtime's FSM state to
-// `<DataDir>/global/pg_fsm_state.bin` atomically. Same shape
-// as SaveVM. (M0080-0004.)
+// SaveFSM writes the runtime's FSM state to per-relation _fsm fork
+// files under base/<dbOid>/ (PG-compatible format). Same shape
+// as SaveVM. (M0130-S1.)
 func (r *Runtime) SaveFSM() error {
 	if r == nil || r.FSM == nil {
 		return nil
 	}
-	return r.FSM.Save(storage.FSMStatePath(r.DataDir))
+	return r.FSM.FSMSaveForks(r.DataDir, nil)
 }
 
 // Close releases the runtime's storage handles. Safe to call
@@ -3480,7 +3531,21 @@ func loadUserIndexesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, c
 				collOID = pgIdx.indCollation[i]
 			}
 			colOpClasses = append(colOpClasses, cat.ResolveIndexColumnOpclassName(classOID, col.Type.Name, btreeMethodOID))
-			colCollations = append(colCollations, cat.ResolveIndexColumnCollationName(collOID))
+			// M0130-S11.6: indcollation is no longer "nonzero iff explicit
+			// COLLATE" — it now carries the key column's own collation for
+			// every collatable key, because a real PG 18.3 cannot compare an
+			// index key without it (42P22). So an OID that merely repeats the
+			// column's collation is NOT an explicit clause and must reverse-
+			// resolve to "", or a checkpointed restart would invent a
+			// `COLLATE "default"` that pg_get_indexdef/\d/pg_dump then print.
+			// That is upstream's own test in pg_get_indexdef_worker
+			// (ruleutils.c): print COLLATE only when indcollation differs from
+			// the column's collation.
+			collName := ""
+			if collOID != 0 && collOID != executor.IndexKeyColumnCollationOID(cat, tbl, col.Name) {
+				collName = cat.ResolveIndexColumnCollationName(collOID)
+			}
+			colCollations = append(colCollations, collName)
 		}
 		if len(colNames) == 0 {
 			continue

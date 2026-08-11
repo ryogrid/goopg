@@ -112,6 +112,9 @@ func (w *walFlushRecorder) FlushUpTo(lsn uint64) error {
 	return nil
 }
 
+func (w *walFlushRecorder) WalRecords() int64 { return 0 }
+func (w *walFlushRecorder) WalBytes() int64   { return 0 }
+
 // TestMarkDirtyHintFlushBarrier pins the C3-S3 async-commit fix: a page
 // dirtied ONLY by an unlogged hint (pd_lsn untouched) must still force a
 // WAL flush up to the frontier observed at mark time before the page

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 )
 
 // Record is one decoded WAL record from the stream.
@@ -357,7 +358,7 @@ func IsValidWalSegSize(size int64) bool {
 // is therefore the authoritative answer for a caller that only has a directory
 // path, and it costs one 40-byte read.
 func detectSegmentSizeAt(walDir string, segNo uint64) int64 {
-	f, err := os.Open(filepath.Join(walDir, formatSegmentName(segNo)))
+	f, err := openSegmentFile(walDir, segNo)
 	if err != nil {
 		return 0
 	}
@@ -375,6 +376,34 @@ func detectSegmentSizeAt(walDir string, segNo uint64) int64 {
 		return 0
 	}
 	return size
+}
+
+// openSegmentFile tries to open the WAL segment for segNo, first with TLI=1
+// (the bootstrap timeline, which covers most goopg clusters) and then with
+// any other TLI found in the pg_wal directory. Returns the open file handle
+// or the error from the last attempt.
+func openSegmentFile(walDir string, segNo uint64) (*os.File, error) {
+	// Fast path: TLI=1.
+	path := filepath.Join(walDir, FormatSegmentName(segNo))
+	if f, err := os.Open(path); err == nil {
+		return f, nil
+	}
+	// Slow path: scan for any segment file with the matching log+seg suffix.
+	// The segment name format is TLI(8)+LOG(8)+SEG(8) = 24 hex chars.
+	entries, err := os.ReadDir(walDir)
+	if err != nil {
+		return nil, fmt.Errorf("wal: readdir %s: %w", walDir, err)
+	}
+	suffix := FormatSegmentName(segNo)[8:] // log+seg portion (last 16 hex digits)
+	for _, e := range entries {
+		name := e.Name()
+		if len(name) == 24 && strings.HasSuffix(name, suffix) {
+			if f, err := os.Open(filepath.Join(walDir, name)); err == nil {
+				return f, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("wal: segment %s not found in %s", FormatSegmentName(segNo), walDir)
 }
 
 // liveSegmentRunStart returns the first segment number of the longest
@@ -396,19 +425,22 @@ func liveSegmentRunStart(segNos []uint64) uint64 {
 // readStreamFrom concatenates all WAL segments starting at firstSegNo
 // into a single byte slice. Stops on the first gap (missing segment)
 // or when the last segment is shorter than segSize (lazy-grow sentinel).
+// TLI-tolerant: tries TLI=1 first, then falls back to any timeline.
 func readStreamFrom(walDir string, segSize int64, firstSegNo uint64) ([]byte, error) {
 	stream := make([]byte, 0)
 	for segNo := firstSegNo; ; segNo++ {
-		path := filepath.Join(walDir, formatSegmentName(segNo))
-		b, err := os.ReadFile(path)
+		f, err := openSegmentFile(walDir, segNo)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				break
-			}
-			return nil, fmt.Errorf("wal: read %s: %w", path, err)
+			break // gap — no more segments match any TLI
+		}
+		readPath := f.Name()
+		b, readErr := os.ReadFile(readPath)
+		_ = f.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("wal: read %s: %w", readPath, readErr)
 		}
 		if int64(len(b)) > segSize {
-			return nil, fmt.Errorf("wal: segment %s too large: %d > %d", path, len(b), segSize)
+			return nil, fmt.Errorf("wal: segment %s too large: %d > %d", readPath, len(b), segSize)
 		}
 		stream = append(stream, b...)
 		// Legacy lazy-grown last segment: shorter than segSize means

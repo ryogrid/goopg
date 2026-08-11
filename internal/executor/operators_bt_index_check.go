@@ -25,13 +25,17 @@ package executor
 //   - VerifyBtreeLevelSiblingLinks per level (leftmost-descent right-link walk),
 //   - VerifyBtreeParentDownlinks on every internal page (parent-check only).
 //
-// The heapallindexed (heap↔index completeness), rootdescend, and checkunique
-// arguments are accepted for call-shape compatibility with pg_amcheck but their
-// deeper tiers are deferred to S5: heapallindexed needs MVCC-aware heap-tuple →
-// index-key extraction (the engine seam VerifyBtreeHeapAllIndexedRelation
-// exists, but forming the heap entry set is the missing piece), and the default
-// pg_amcheck B-tree probe passes `heapallindexed := false`. This deferral
-// mirrors S3's nil-XidStatusFunc clog-tier deferral. M0110-0003.
+// plus, when the call passes `checkunique := true` on a UNIQUE index,
+//   - VerifyBtreeUnique over the leaf level (btIndexCheckUnique below), the
+//     heap-visibility-aware duplicate-key tier. M0119-0006.
+//
+// The heapallindexed and rootdescend arguments are still accepted for call-shape
+// compatibility with pg_amcheck without running their tiers: heapallindexed needs
+// MVCC-aware heap-tuple → index-key extraction (the engine seam
+// VerifyBtreeHeapAllIndexedRelation exists, but forming the heap entry set is the
+// missing piece), and the default pg_amcheck B-tree probe passes
+// `heapallindexed := false`. This deferral mirrors S3's nil-XidStatusFunc
+// clog-tier deferral. M0110-0003.
 
 import (
 	"fmt"
@@ -40,6 +44,7 @@ import (
 	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/amcheck"
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
@@ -131,7 +136,22 @@ func evalBtIndexCheck(x *planner.FuncCall, row Row, ctx *Context, parentCheck bo
 		return page, nil
 	}
 
-	reports, err := btIndexVerify(src, nblocks, idx.Name, parentCheck)
+	cmpKeys := btIndexOpClassComparator(idx, im, ctx, x.Pos())
+	// The index's on-page key format is a per-index catalog property, resolved
+	// from the same catalog entry as the opclass comparator above (M0130-S11.4
+	// slice 3b-2c-ii-B2-b). It is nil-descriptor / blob for every index today,
+	// but this is where the answer comes from once the writers flip, so the
+	// engine's readers are never handed a format they had to assume.
+	keyFmt := btree.IndexFormatFor(ctx.pgIndexKeyDesc(idx))
+	reports, err := btIndexVerify(src, nblocks, idx.Name, parentCheck, cmpKeys, keyFmt)
+	if err == nil && len(reports) == 0 {
+		// checkunique runs only on a structurally sound index: upstream reaches
+		// bt_entry_unique_check from inside bt_target_page_check, which never
+		// runs once an earlier per-page invariant has ereport(ERROR)ed.
+		var ureports []amcheck.BtreeReport
+		ureports, err = btIndexCheckUnique(x, row, ctx, idx, src, parentCheck, cmpKeys, keyFmt)
+		reports = append(reports, ureports...)
+	}
 	if err != nil {
 		// A genuine read error (not a corruption finding) maps to internal error.
 		return NullDatum, &ExecError{Code: "XX000", Pos: x.Pos(), Message: err.Error()}
@@ -149,7 +169,7 @@ func evalBtIndexCheck(x *planner.FuncCall, row Row, ctx *Context, parentCheck bo
 // returns every finding (so the SQL surface can report the count, mirroring how
 // the standalone realtree test exercises the same tiers). It returns a Go error
 // only for a genuine page-read failure, never for a corruption finding.
-func btIndexVerify(src amcheck.PageSource, nblocks storage.BlockNumber, name string, parentCheck bool) ([]amcheck.BtreeReport, error) {
+func btIndexVerify(src amcheck.PageSource, nblocks storage.BlockNumber, name string, parentCheck bool, cmpKeys amcheck.KeyComparator, keyFmt btree.IndexFormat) ([]amcheck.BtreeReport, error) {
 	var reports []amcheck.BtreeReport
 
 	// Per-page tiers over every block, including the metapage (block 0).
@@ -159,7 +179,7 @@ func btIndexVerify(src amcheck.PageSource, nblocks storage.BlockNumber, name str
 			return nil, err
 		}
 		reports = append(reports, amcheck.VerifyBtreePage(p, blk, name)...)
-		reports = append(reports, amcheck.VerifyBtreeItemOrder(p, blk, name)...)
+		reports = append(reports, amcheck.VerifyBtreeItemOrderCmp(p, blk, name, keyFmt, cmpKeys)...)
 	}
 
 	// A tree with only the metapage (an empty index, or none) has no key levels
@@ -175,7 +195,7 @@ func btIndexVerify(src amcheck.PageSource, nblocks storage.BlockNumber, name str
 		return nil, err
 	}
 	if meta := btree.ParseMeta(metaPage); meta.Root != 0 {
-		for _, lm := range btIndexLeftmostByLevel(src, meta.Root) {
+		for _, lm := range btIndexLeftmostByLevel(src, meta.Root, keyFmt) {
 			reports = append(reports, amcheck.VerifyBtreeLevelSiblingLinks(src, lm, name)...)
 		}
 	}
@@ -193,10 +213,257 @@ func btIndexVerify(src amcheck.PageSource, nblocks storage.BlockNumber, name str
 			if op.IsLeaf() || op.IsDeleted() {
 				continue
 			}
-			reports = append(reports, amcheck.VerifyBtreeParentDownlinks(src, blk, name)...)
+			reports = append(reports, amcheck.VerifyBtreeParentDownlinks(src, blk, name, keyFmt, cmpKeys)...)
 		}
 	}
 	return reports, nil
+}
+
+// btIndexCheckUnique runs amcheck's `checkunique` tier when the call requested
+// it and the target index actually declares UNIQUE — upstream's two gates,
+// `state->checkunique` and `state->indexinfo->ii_Unique` (verify_nbtree.c:1650).
+// A non-unique index, or a call that left the argument at its false default
+// (which is what pg_amcheck emits unless `--checkunique` is passed), yields no
+// findings without touching the heap.
+//
+// The argument is positional: bt_index_check(index, heapallindexed, checkunique)
+// puts it third, bt_index_parent_check(index, heapallindexed, rootdescend,
+// checkunique) fourth — the parser strips named-argument labels and keeps the
+// written order (M0097-0003), which for both pg_amcheck call shapes is the
+// declared order.
+//
+// Heap visibility is the tier's one real dependency and is supplied here from
+// the executor's own MVCC state, mirroring upstream's use of a registered
+// transaction snapshot taken once per index check (verify_nbtree.c:471). Without
+// a snapshot in Context there is nothing to judge liveness against, so the tier
+// is skipped rather than answered wrongly. M0119-0006.
+func btIndexCheckUnique(x *planner.FuncCall, row Row, ctx *Context, idx *catalog.Index,
+	src amcheck.PageSource, parentCheck bool, cmpKeys amcheck.KeyComparator, keyFmt btree.IndexFormat,
+) ([]amcheck.BtreeReport, error) {
+	argIdx := 2
+	if parentCheck {
+		argIdx = 3
+	}
+	if len(x.Args) <= argIdx {
+		return nil, nil
+	}
+	d, err := evalExpr(x.Args[argIdx], row, ctx)
+	if err != nil {
+		return nil, err
+	}
+	if d.IsNull() || !d.BoolValue() {
+		return nil, nil
+	}
+	// The tier's equality test must be TID-BLIND under the tuple format: a
+	// duplicate is two entries sharing a KEY at two different heap rows, and the
+	// tuple format puts the heap TID inside the key, so the default bytewise
+	// comparator would find every entry distinct and report nothing. A
+	// user-opclass comparator (cmpKeys != nil) never coexists with a descriptor —
+	// buildPGIndexKeyDesc refuses an index that declares one — so the two
+	// branches cannot both apply. M0130-S11.4 slice 3b-2c-ii-B2-c.
+	if cmpKeys == nil && keyFmt.KeyDesc() != nil {
+		cmpKeys = keyFmt.CompareKeyAttrs
+	}
+	if !idx.Unique || idx.Table == nil || ctx.Snap.Xmax == 0 {
+		// Xmax == 0 is an unseeded snapshot (no transaction snapshot was taken
+		// for this statement); there is nothing to judge tuple liveness against.
+		return nil, nil
+	}
+
+	heapRel := ctx.Catalog.RelFileNode(idx.Table)
+	visible := func(tid storage.ItemPointer) bool {
+		s, perr := ctx.Pool.Pin(storage.BufferTag{Rel: heapRel, Block: tid.Block})
+		if perr != nil {
+			return false
+		}
+		s.RLock()
+		tup, gerr := storage.PageGetHeapTuple(s.Page(), tid.Offset)
+		s.RUnlock()
+		ctx.Pool.Unpin(s)
+		if gerr != nil {
+			// An index entry pointing at an unreadable heap slot is heap damage,
+			// which verify_heapam reports; it is not a live duplicate.
+			return false
+		}
+		return mvcc.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.CmdID,
+			ctx.comboStore(), ctx.MultiXact)
+	}
+	return amcheck.VerifyBtreeUnique(src, idx.Name, keyFmt, cmpKeys, visible)
+}
+
+// btIndexOpClassComparator returns the operator-class key comparator to verify
+// idx under, or nil to use the engine's built-in key-byte order.
+//
+// Upstream amcheck always compares through the index's support function 1
+// (BTORDER_PROC, resolved from pg_amproc for the index's opclass) — see
+// _bt_compare / _bt_mkscankey in nbtutils.c, which verify_nbtree.c builds its
+// BTScanInsert from. goopg's B-tree is key-encoding based, so a *built-in*
+// opclass has no catalog function to call and nil (btree.CompareKeys) is the
+// faithful answer: the encoding IS that opclass's order.
+//
+// A *user-created* class (CREATE OPERATOR CLASS … USING btree … FUNCTION 1 f)
+// does name a real comparator, and pg_amcheck's 005_opclass_damage.pl injects
+// corruption by repointing exactly that pg_amproc row at a function that sorts
+// the other way. Verifying under the catalog-resolved function is what makes the
+// physically-unchanged index then report `item order invariant violated`.
+//
+// Scope: any index whose key columns are all plain (non-expression) columns of a
+// type the B-tree key decoder can invert (decodeIndexKeyColumn — int4/int8/
+// float8/numeric/date/timestamp(tz)/text-like/enum), with at least one key column
+// declaring a user opclass. Composite keys are compared column by column, each
+// under its own opclass — the column-wise contract of upstream's _bt_compare,
+// which walks scan-key attributes in order and stops at the first non-equal one.
+// Key columns that resolve to no user routine keep the engine's own byte order
+// for that column (their encoding IS the built-in opclass's order).
+//
+// INCLUDE (covering) columns need no special handling: goopg encodes a B-tree
+// key from the *key* columns alone (encodeCompositeBTreeKey walks idx.Columns;
+// no non-key attribute is ever appended), so a covering index's key bytes are
+// exactly the column-by-column walk below. That matches upstream, where
+// non-key attributes never participate in ordering — _bt_compare stops at
+// IndexRelationGetNumberOfKeyAttributes. M0119-0006.
+func btIndexOpClassComparator(idx *catalog.Index, im *catalog.InMemory, ctx *Context, pos int) amcheck.KeyComparator {
+	if len(idx.Columns) == 0 || idx.Table == nil {
+		return nil
+	}
+	method := idx.Method
+	if method == "" {
+		method = "btree"
+	}
+	type keyCol struct {
+		col     catalog.Column
+		routine *catalog.Routine // nil → this column keeps the engine's byte order
+	}
+	cols := make([]keyCol, 0, len(idx.Columns))
+	anyRoutine := false
+	for i, name := range idx.Columns {
+		if name == "" {
+			// Expression key column. There is no catalog column to read the
+			// type off, so resolve the expression's static result type
+			// (planner.ExprResultType) and map it onto the surrogate type whose
+			// decoder consumes exactly the bytes the expression-key ENCODER
+			// wrote (exprKeyDecodeType). M0119-0006.
+			surrogate, allowRoutine, ok := exprKeyColumnType(idx, i)
+			if !ok {
+				return nil
+			}
+			kc := keyCol{col: catalog.Column{Name: "", Type: surrogate}}
+			if allowRoutine && i < len(idx.ColOpClasses) && idx.ColOpClasses[i] != "" {
+				if procOID, found := im.LookupOpClassSupportProcOID(idx.ColOpClasses[i],
+					catalog.AccessMethodOIDByName(method), 1); found {
+					if r := ctx.Catalog.Routines().LookupByOID(procOID); r != nil && len(r.ArgTypes) == 2 {
+						kc.routine = r
+						anyRoutine = true
+					}
+				}
+			}
+			cols = append(cols, kc)
+			continue
+		}
+		var col *catalog.Column
+		for j := range idx.Table.Columns {
+			if strings.EqualFold(idx.Table.Columns[j].Name, name) {
+				col = &idx.Table.Columns[j]
+				break
+			}
+		}
+		if col == nil {
+			return nil
+		}
+		kc := keyCol{col: *col}
+		if i < len(idx.ColOpClasses) && idx.ColOpClasses[i] != "" {
+			if procOID, ok := im.LookupOpClassSupportProcOID(idx.ColOpClasses[i],
+				catalog.AccessMethodOIDByName(method), 1); ok {
+				if r := ctx.Catalog.Routines().LookupByOID(procOID); r != nil && len(r.ArgTypes) == 2 {
+					kc.routine = r
+					anyRoutine = true
+				}
+			}
+		}
+		cols = append(cols, kc)
+	}
+	if !anyRoutine {
+		// Every key column resolves to a built-in class: the encoding already
+		// is that order, so nil (btree.CompareKeys) is the faithful answer and
+		// avoids a per-comparison decode.
+		return nil
+	}
+	return func(a, b []byte) int {
+		ao, bo := 0, 0
+		for _, kc := range cols {
+			ad, an, aerr := decodeIndexKeyColumn(a[ao:], kc.col)
+			bd, bn, berr := decodeIndexKeyColumn(b[bo:], kc.col)
+			if aerr != nil || berr != nil || an <= 0 || bn <= 0 {
+				// Not a decodable key at this position: the negative-infinity
+				// pivot tuple on an internal page carries an empty key
+				// (findChildBlock), and a truncated separator may stop short of
+				// this column. Byte order over what remains is correct for
+				// those, exactly as it is for the leftmost downlink upstream
+				// treats as minus infinity.
+				return btree.CompareKeys(a[ao:], b[bo:])
+			}
+			if cmp := btIndexCompareKeyColumn(kc.routine, a[ao:ao+an], b[bo:bo+bn], ad, bd, ctx, pos); cmp != 0 {
+				return cmp
+			}
+			ao += an
+			bo += bn
+		}
+		// Equal on every key column: any trailing bytes decide, as they do for
+		// the engine's own comparator.
+		return btree.CompareKeys(a[ao:], b[bo:])
+	}
+}
+
+// exprKeyColumnType resolves the decode surrogate for expression key column i
+// of idx: the column type under which decodeIndexKeyColumn consumes exactly the
+// bytes the expression-key encoder wrote for that column, and whether a user
+// opclass comparator may be given the decoded Datum.
+//
+// Two resolutions have to succeed. First the expression's static SQL result
+// type (planner.ExprResultType over the same resolved Expr the build path uses,
+// so the comparator can never disagree with what was indexed). Then the mapping
+// from that SQL type onto the encoding actually produced (exprKeyDecodeType) —
+// see its comment for why the two differ. Either failing returns ok=false and
+// the caller falls back to whole-key byte order, which is what this arm did
+// unconditionally before M0119-0006.
+func exprKeyColumnType(idx *catalog.Index, i int) (surrogate catalog.Type, allowRoutine bool, ok bool) {
+	if i >= len(idx.ColExprs) || idx.ColExprs[i] == nil || idx.Table == nil {
+		return catalog.Type{}, false, false
+	}
+	planExpr, err := planner.ResolveIndexPredicate(*idx.ColExprs[i], idx.Table)
+	if err != nil || planExpr == nil {
+		return catalog.Type{}, false, false
+	}
+	sqlType, resolved := planner.ExprResultType(planExpr)
+	if !resolved {
+		return catalog.Type{}, false, false
+	}
+	return exprKeyDecodeType(sqlType)
+}
+
+// btIndexCompareKeyColumn orders one key column: through the operator class's
+// FUNCTION 1 routine when the column declares a user class, otherwise by the
+// column's encoded bytes (which are the built-in class's order by construction).
+func btIndexCompareKeyColumn(routine *catalog.Routine, aRaw, bRaw []byte, ad, bd Datum, ctx *Context, pos int) int {
+	if routine == nil {
+		return btree.CompareKeys(aRaw, bRaw)
+	}
+	res, err := executeStoredRoutine(routine, []Datum{ad, bd}, ctx, pos)
+	if err != nil || res.IsNull() {
+		// A comparator that errors or returns NULL cannot decide the ordering;
+		// fall back rather than manufacture a bogus finding (upstream would
+		// ereport, but amcheck's contract here is report-and-continue over the
+		// whole index).
+		return btree.CompareKeys(aRaw, bRaw)
+	}
+	switch {
+	case res.Int < 0:
+		return -1
+	case res.Int > 0:
+		return 1
+	default:
+		return 0
+	}
 }
 
 // btIndexLeftmostByLevel descends root → leftmost child at each level via the
@@ -205,7 +472,7 @@ func btIndexVerify(src amcheck.PageSource, nblocks storage.BlockNumber, name str
 // read/decode error or an empty internal page stops the descent gracefully (the
 // per-page tier already flagged the structural fault); a visited-set guards
 // against a downlink cycle so a corrupt tree cannot loop forever.
-func btIndexLeftmostByLevel(src amcheck.PageSource, root storage.BlockNumber) []storage.BlockNumber {
+func btIndexLeftmostByLevel(src amcheck.PageSource, root storage.BlockNumber, keyFmt btree.IndexFormat) []storage.BlockNumber {
 	var out []storage.BlockNumber
 	seen := make(map[storage.BlockNumber]bool)
 	for blk := root; ; {
@@ -222,7 +489,7 @@ func btIndexLeftmostByLevel(src amcheck.PageSource, root storage.BlockNumber) []
 		if op.IsLeaf() {
 			return out
 		}
-		dls, err := btree.PageDownlinks(p)
+		dls, err := keyFmt.PageDownlinks(p)
 		if err != nil || len(dls) == 0 {
 			return out
 		}
@@ -259,6 +526,11 @@ func btIndexReportDetail(reports []amcheck.BtreeReport) string {
 			b.WriteByte('\n')
 		}
 		fmt.Fprintf(&b, "block %d: %s", r.Block, r.Msg)
+		if r.Detail != "" {
+			// The uniqueness tier carries upstream's own errdetail text
+			// (bt_report_duplicate); pass it through verbatim.
+			fmt.Fprintf(&b, " %s", r.Detail)
+		}
 	}
 	return b.String()
 }

@@ -285,10 +285,10 @@ func vacLeafTIDs(t *testing.T, bt *BTree, blk storage.BlockNumber) []storage.Ite
 	if err != nil {
 		t.Fatalf("pinR(%d): %v", blk, err)
 	}
-	items, err := pageItems(slot.Page())
+	items, err := blobFormat.pageItems(slot.Page())
 	bt.unpinR(slot)
 	if err != nil {
-		t.Fatalf("pageItems(%d): %v", blk, err)
+		t.Fatalf("blobFormat.pageItems(%d): %v", blk, err)
 	}
 	tids := make([]storage.ItemPointer, 0, len(items))
 	for _, it := range items {

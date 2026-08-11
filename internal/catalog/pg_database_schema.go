@@ -6,6 +6,10 @@ import "github.com/goopg/goopg/internal/storage"
 // (postgres/src/include/catalog/pg_database.h).
 const PgDatabaseRelationOID uint32 = 1262
 
+// PgDatabaseDatConnLimitOrdinal is the 0-based column ordinal of
+// pg_database.datconnlimit within PgDatabaseColumnsPG18.
+const PgDatabaseDatConnLimitOrdinal = 8
+
 // PgDatabaseDatFrozenXIDOrdinal is the 0-based column ordinal of
 // pg_database.datfrozenxid within PgDatabaseColumnsPG18.
 const PgDatabaseDatFrozenXIDOrdinal = 9

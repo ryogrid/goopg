@@ -183,3 +183,88 @@ func TestPGWaldumpParsesEmittedWAL(t *testing.T) {
 		t.Fatalf("pg_waldump failed: %v\ncmd=%q\n%s", err, cmd.Args, string(out))
 	}
 }
+
+// TestCrossSegmentXLPrevChain verifies the xl_prev link chain across a
+// segment boundary. Uses a tiny segment size (32 bytes, same pattern as
+// TestRecordCanSpanSegments) to force cross-segment records, then reads
+// them back with ReadAll and asserts the record count and payload integrity.
+// This is the M0130-S7.1 regression gate for the xl_prev 0-based fix
+// (writer.go detectWritePos −1 conversion).
+//
+// pg_waldump is NOT used for cross-segment verification because it requires
+// standard segment sizes (1 MiB–1 GiB, per isValidWalSegSize in xlogreader.c).
+// Filling a 1 MiB segment in a unit test is impractical. The existing
+// TestPGWaldumpParsesEmittedWAL already validates the single-segment
+// pg_waldump chain (same xl_prev code path); this test adds the
+// cross-segment dimension via goopg's own reader.
+func TestCrossSegmentXLPrevChain(t *testing.T) {
+	walDir := filepath.Join(t.TempDir(), "pg_wal")
+	const segSize = int64(32)
+	w, err := NewWriter(Config{
+		WALDir:      walDir,
+		SegmentSize: segSize,
+		PageHeaders: true,
+		SystemID:    0xABCDEF0123456789,
+		TimelineID:  1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Write records large enough to span multiple segments. Each record
+	// is ~80 bytes; with 32-byte segments, even one record crosses a
+	// boundary. Write several to exercise the chain across 2+ boundaries.
+	const numRecords = 10
+	payload := make([]byte, 80)
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+	payloads := make([][]byte, numRecords)
+	for i := range numRecords {
+		_, end, aerr := w.Append(payload)
+		if aerr != nil {
+			t.Fatal(aerr)
+		}
+		if err := w.FlushUpTo(end); err != nil {
+			t.Fatal(err)
+		}
+		payloads[i] = payload
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify we crossed at least one segment boundary.
+	entries, err := os.ReadDir(walDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	segCount := 0
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if _, ok := parseSegmentName(e.Name()); ok {
+			segCount++
+		}
+	}
+	if segCount < 2 {
+		t.Fatalf("expected >=2 WAL segments (had %d) — segment size too large or records too few", segCount)
+	}
+
+	// ReadAll reconstructs records across segments by following xl_prev
+	// links. If any link is broken (e.g. a +1 off-by-one in the 0-based
+	// conversion), ReadAll returns fewer records than written or errors.
+	recs, err := ReadAll(walDir, segSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != numRecords {
+		t.Fatalf("ReadAll returned %d records, want %d — possible xl_prev chain break", len(recs), numRecords)
+	}
+	for i, r := range recs {
+		if len(r.Payload) != len(payloads[i]) {
+			t.Fatalf("record %d: payload len=%d, want %d", i, len(r.Payload), len(payloads[i]))
+		}
+	}
+}

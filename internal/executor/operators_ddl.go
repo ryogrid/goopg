@@ -255,8 +255,19 @@ func (o *ddlOp) execCreateExtension(s *parser.CreateExtensionStmt) error {
 		// Only failure mode is a duplicate without IF NOT EXISTS.
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
+	// M0130-S3: journal the extension as a real pg_extension heap row
+	// so it survives restart and is visible on a PG standby.
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		extOID := im.ExtensionOID(s.Name)
+		nsOID := im.SchemaOID(schema)
+		if err := writeExtensionCatalogRow(o.ctx, extOID, nsOID, s.Name, version); err != nil {
+			return fmt.Errorf("pg_extension journal: %w", err)
+		}
+	}
 	return nil
-}
+	}
+
+	// execDropExtension handles DROP EXTENSION [IF EXISTS] name.
 
 // inPlaceTablespacesEnabled reports the session-effective
 // allow_in_place_tablespaces GUC. Defaults to false when no GetSetting hook is
@@ -1014,7 +1025,7 @@ func (o *ddlOp) execCreatePublication(s *parser.CreatePublicationStmt) error {
 		}
 		tables = append(tables, tbl.QualifiedName())
 	}
-	pub, err := o.ctx.PubSub.CreatePublicationAsOwner(s.Name, tables, opts, o.currentDDLOwnerOID())
+	pub, err := o.ctx.PubSub.CreatePublicationAsOwner(s.Name, tables, opts, o.currentDDLOwnerOID(), catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
@@ -1044,10 +1055,11 @@ func (o *ddlOp) execDropPublication(s *parser.DropPublicationStmt) error {
 	// the pg_publication row and its pg_publication_rel members (kind 51
 	// retired).
 	var pubOID uint32
-	if pub, ok := o.ctx.PubSub.LookupPublication(s.Name); ok && pub != nil {
+	pubDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+	if pub, ok := o.ctx.PubSub.LookupPublication(s.Name, pubDBOid); ok && pub != nil {
 		pubOID = pub.OID
 	}
-	if err := o.ctx.PubSub.DropPublication(s.Name); err != nil {
+	if err := o.ctx.PubSub.DropPublication(s.Name, pubDBOid); err != nil {
 		if s.IfExists {
 			return nil
 		}
@@ -1087,12 +1099,13 @@ func (o *ddlOp) execDropSubscription(s *parser.DropSubscriptionStmt) error {
 	if o.ctx.PubSub == nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "DROP SUBSCRIPTION requires PubSub registry in Context"}
 	}
+	subDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 	// Capture the OID before the registry drop so B4.4 can stamp the heap row.
 	var dropOID uint32
-	if sub, ok := o.ctx.PubSub.LookupSubscription(s.Name); ok {
+	if sub, ok := o.ctx.PubSub.LookupSubscription(s.Name, subDBOid); ok {
 		dropOID = sub.OID
 	}
-	if err := o.ctx.PubSub.DropSubscription(s.Name); err != nil {
+	if err := o.ctx.PubSub.DropSubscription(s.Name, subDBOid); err != nil {
 		if s.IfExists {
 			return nil
 		}
@@ -1140,12 +1153,13 @@ func (o *ddlOp) execAlterPublicationOwner(s *parser.AlterPublicationOwnerStmt) e
 	if err != nil {
 		return err
 	}
-	if serr := o.ctx.PubSub.SetPublicationOwner(s.Name, ownerOID); serr != nil {
+	pubDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+	if serr := o.ctx.PubSub.SetPublicationOwner(s.Name, ownerOID, pubDBOid); serr != nil {
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: serr.Error()}
 	}
 	// B3.3: the owner change is a canonical pg_publication heap UPDATE
 	// (kind 52 retired).
-	if pub, ok := o.ctx.PubSub.LookupPublication(s.Name); ok && pub != nil {
+	if pub, ok := o.ctx.PubSub.LookupPublication(s.Name, pubDBOid); ok && pub != nil {
 		if uerr := upsertPublicationCatalogRow(o.ctx, pub); uerr != nil {
 			return fmt.Errorf("pg_publication journal: %w", uerr)
 		}
@@ -1160,15 +1174,16 @@ func (o *ddlOp) execAlterSubscriptionOwner(s *parser.AlterSubscriptionOwnerStmt)
 	if o.ctx.PubSub == nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "ALTER SUBSCRIPTION requires PubSub registry in Context"}
 	}
+	subDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 	ownerOID, err := o.resolveNewOwnerOID(s.NewOwner, s.Pos())
 	if err != nil {
 		return err
 	}
-	if serr := o.ctx.PubSub.SetSubscriptionOwner(s.Name, ownerOID); serr != nil {
+	if serr := o.ctx.PubSub.SetSubscriptionOwner(s.Name, ownerOID, subDBOid); serr != nil {
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: serr.Error()}
 	}
 	// B4.4: re-sync the pg_subscription heap row's subowner (replaces kind 55).
-	if sub, ok := o.ctx.PubSub.LookupSubscription(s.Name); ok {
+	if sub, ok := o.ctx.PubSub.LookupSubscription(s.Name, subDBOid); ok {
 		if err := syncSubscriptionRow(o.ctx, sub.OID, sub); err != nil {
 			return fmt.Errorf("pg_subscription heap write: %w", err)
 		}
@@ -9231,6 +9246,20 @@ func (o *ddlOp) execAlterTableAddColumn(stmt *parser.AlterTableStmt, tbl *catalo
 	if err := o.addColumnRecursive(tbl, newCol, act, stmt, true); err != nil {
 		return err
 	}
+	// M0130-S3: sync the new column set to the pg_attribute heap so a
+	// PG standby (and a goopg restart) see the added column. Same
+	// delete-old-rows + re-sync pattern as every other ALTER TABLE path.
+	if catalogHeapSyncAvailable(o.ctx) {
+		if err := o.ctx.MaterializeWriterXID(); err == nil {
+			xmax := o.ctx.Tx.XID
+			for _, dbOid := range tableCatalogDBOids(o.ctx) {
+				deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+			}
+		}
+		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+			return fmt.Errorf("DDL catalog sync: %w", syncErr)
+		}
+	}
 	// M0106-0011: ALTER TABLE ADD COLUMN mutates the relation's
 	// pg_attribute row set and bumps pg_class.relnatts. Flag the txn
 	// so the commit-time xact-marker hook unlinks + regenerates
@@ -10354,11 +10383,11 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 	if xp != nil {
 		predExpr = xp.Predicate
 	}
-	if predExpr != nil {
-		buildErr = o.bulkBuildBTreeWithPredicate(idxRel, tbl, cols, unique, nullsNotDistinct, idxName.String(), pos, predExpr)
-	} else {
-		buildErr = o.bulkBuildBTree(idxRel, tbl, cols, unique, nullsNotDistinct, idxName.String(), pos)
-	}
+	// M0119-0006: resolve expression key columns so the build indexes them too.
+	// Before this, `CREATE INDEX ON t(lower(c))` over pre-existing rows built an
+	// EMPTY index while INSERT-time maintenance did populate it.
+	keyExprs := resolveIndexKeyExprs(tbl, idx)
+	buildErr = o.bulkBuildBTreeFull(idx, idxRel, tbl, cols, keyExprs, unique, nullsNotDistinct, idxName.String(), pos, predExpr)
 	if buildErr != nil {
 		_ = o.ctx.Catalog.DropIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		o.ctx.Pool.InvalidateRel(idxRel)
@@ -10384,20 +10413,24 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 	return nil
 }
 
-// bulkBuildBTree collects all heap entries into memory, then calls
+// bulkBuildBTreeFull collects all heap entries into memory, then calls
 // btree.BulkCreate for a sort-then-build pass (M0047-0001). This replaces
 // the old Create+backfillBTree flow and is significantly faster for large
 // tables because it avoids per-key tree traversals and page splits.
-func (o *ddlOp) bulkBuildBTree(idxRel storage.RelFileNode, tbl *catalog.Table, cols []*catalog.Column, unique, nullsNotDistinct bool, indexName string, pos int) error {
-	return o.bulkBuildBTreeWithPredicate(idxRel, tbl, cols, unique, nullsNotDistinct, indexName, pos, nil)
-}
-
-func (o *ddlOp) bulkBuildBTreeWithPredicate(idxRel storage.RelFileNode, tbl *catalog.Table, cols []*catalog.Column, unique, nullsNotDistinct bool, indexName string, pos int, predExpr planner.Expr) error {
-	entries, err := o.collectBTreeEntries(tbl, cols, unique, nullsNotDistinct, indexName, pos, predExpr)
+// keyExprs (M0119-0006) carries the resolved expression key columns of an
+// expression index, parallel to cols (see encodeCompositeBTreeKeyWithExprs);
+// callers building a plain index pass nil and get the pre-existing behaviour.
+// predExpr is the partial-index predicate, or nil.
+// idx is the catalog index the build is FOR (M0130-S11.4 slice 3b-2c-ii-A). It
+// is not derivable from idxRel — REINDEX CONCURRENTLY builds into a shadow
+// relfile — and the bulk sort needs it: the build's own ordering and every
+// later reader's must come from the same key descriptor.
+func (o *ddlOp) bulkBuildBTreeFull(idx *catalog.Index, idxRel storage.RelFileNode, tbl *catalog.Table, cols []*catalog.Column, keyExprs []planner.Expr, unique, nullsNotDistinct bool, indexName string, pos int, predExpr planner.Expr) error {
+	entries, err := o.collectBTreeEntries(idx, tbl, cols, keyExprs, unique, nullsNotDistinct, indexName, pos, predExpr)
 	if err != nil {
 		return err
 	}
-	_, err = btree.BulkCreateWithXID(o.ctx.Pool, idxRel, entries, o.ctx.Tx.XID)
+	_, err = bulkCreateIndexBTree(o.ctx, idx, idxRel, entries)
 	if err != nil {
 		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 	}
@@ -10406,7 +10439,12 @@ func (o *ddlOp) bulkBuildBTreeWithPredicate(idxRel storage.RelFileNode, tbl *cat
 
 // collectBTreeEntries scans the heap, decodes visible tuples, encodes
 // B-tree keys, enforces uniqueness, and returns the entries for bulk build.
-func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, unique, nullsNotDistinct bool, indexName string, pos int, predExpr planner.Expr) ([]btree.BulkEntry, error) {
+//
+// idx is the index being built (M0130-S11.4 slice 3b-2c-ii-B2-c-v). Every key
+// this loop encodes, and the order + duplicate test it then applies to them,
+// are properties of THAT index's key format, not of the column list: see
+// `indexBuildEntryKey` and `sortBuildEntriesFindDuplicate`.
+func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols []*catalog.Column, keyExprs []planner.Expr, unique, nullsNotDistinct bool, indexName string, pos int, predExpr planner.Expr) ([]btree.BulkEntry, error) {
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 	nBlocks, err := o.ctx.Pool.NBlocks(rel)
 	if err != nil {
@@ -10495,7 +10533,7 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 					continue
 				}
 			}
-			key, hasNullKey, encErr := encodeCompositeBTreeKey(row, cols, pos)
+			key, hasNullKey, encErr := o.ctx.indexBuildEntryKey(idx, cols, keyExprs, row, storage.ItemPointer{Block: blk, Offset: i}, pos)
 			if encErr != nil {
 				o.ctx.Pool.Unpin(slot)
 				return nil, encErr
@@ -10550,38 +10588,31 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 	// (matching its convention) and walk adjacencies for the
 	// unique check.
 	if unique && len(entries) > 1 {
-		sortBulkEntriesByKey(entries)
-		for i := 1; i < len(entries); i++ {
-			if bytesEqual(entries[i].Key, entries[i-1].Key) {
-				return nil, &ExecError{Code: "23505", Pos: pos,
-					Message: fmt.Sprintf("could not create unique index %q", indexName)}
-			}
+		if sortBuildEntriesFindDuplicate(o.ctx.pgIndexKeyDesc(idx), entries) {
+			return nil, &ExecError{Code: "23505", Pos: pos,
+				Message: fmt.Sprintf("could not create unique index %q", indexName)}
 		}
 	}
 	return entries, nil
 }
 
-// sortBulkEntriesByKey (M0055-0006 Phase E) sorts in place by
-// byte-wise key order, the same order BulkBuild expects.
-func sortBulkEntriesByKey(entries []btree.BulkEntry) {
-	sort.SliceStable(entries, func(i, j int) bool {
-		return string(entries[i].Key) < string(entries[j].Key)
-	})
-}
+// `sortBulkEntriesByKey` (M0055-0006 Phase E, sort by `string(key)`) and
+// `bytesEqual` lived here until M0130-S11.4 slice 3b-2c-ii-B2-c-v folded both
+// into `sortBuildEntriesFindDuplicate`. They are deleted rather than left
+// unused on purpose: each was a bare assertion that a btree key is an opaque
+// byte string whose bytewise order is the index order, which is true of exactly
+// one of the two key formats, and a surviving copy is something a later build
+// path can reach for without noticing that.
 
-// bytesEqual is a small no-allocation byte slice equality check.
-func bytesEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
+// backfillBTree is the pre-M0047-0001 insert-one-at-a-time index build, kept
+// after `bulkBuildBTreeFull` replaced it. It has NO callers.
+//
+// M0130-S11.4 slice 3b-2c-ii-B2-c-v did not route it, and a caller must not be
+// re-added without doing so: it still calls `encodeCompositeBTreeKey` (a key
+// with no heap TID) and still dedups with `seen[string(key)]` (a byte-identity
+// test). Both are blob-format assertions — see `indexBuildEntryKey` and
+// `sortBuildEntriesFindDuplicate` for what the tuple format needs instead, and
+// the deferral-ledger row for B2-c-v.
 func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*catalog.Column, unique, nullsNotDistinct bool, indexName string, pos int) error {
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 	nBlocks, err := o.ctx.Pool.NBlocks(rel)
@@ -10750,11 +10781,52 @@ func parseReloptionBool(s string) (bool, bool) {
 // divergence that made CREATE INDEX over any NULL-containing column fail
 // (PostgreSQL admits NULLs in unique indexes, distinct by default).
 func encodeCompositeBTreeKey(row Row, cols []*catalog.Column, pos int) (key []byte, hasNullKey bool, err *ExecError) {
+	return encodeCompositeBTreeKeyWithExprs(nil, row, cols, nil, pos)
+}
+
+// encodeCompositeBTreeKeyWithExprs is encodeCompositeBTreeKey extended with the
+// resolved expression key columns of an expression index (M0119-0006): keyExprs
+// is parallel to cols, and keyExprs[i] is non-nil exactly where cols[i] is nil
+// because idx.Columns[i] == "" (an expression key such as `lower(col)`).
+//
+// Before this existed the bulk-build path skipped expression key columns
+// outright, so `CREATE INDEX ON t(lower(c))` over pre-existing rows produced an
+// EMPTY index — and REINDEX threw away the entries that the runtime maintain
+// path (encodeExprIndexKey in operators_storage.go) had written on INSERT.
+// The two paths are siblings and must encode identically, so this evaluates the
+// same resolved expression and reuses the same encodeArbiterExprKey encoder.
+//
+// Three outcomes, matching the runtime path's own semantics:
+//   - expression yields NULL          → hasNullKey (row not indexable, no null bitmap)
+//   - expression result kind has no   → key == nil, so the caller skips the row
+//     btree encoding (encodeArbiterExprKey covers string/int/numeric/
+//     timestamp/bool/enum/bytea by kind, plus float4/float8 by resolved type;
+//     see its comment for the encoder per kind)
+//   - otherwise                       → bytes appended in key-column order
+func encodeCompositeBTreeKeyWithExprs(ctx *Context, row Row, cols []*catalog.Column, keyExprs []planner.Expr, pos int) (key []byte, hasNullKey bool, err *ExecError) {
 	var out []byte
-	for _, col := range cols {
+	for i, col := range cols {
 		if col == nil {
-			// Expression column — cannot encode from raw row during bulk build.
-			// Callers building expression indexes must handle this separately.
+			if ctx == nil || i >= len(keyExprs) || keyExprs[i] == nil {
+				// Expression column with no resolved expression — cannot encode
+				// from raw row during bulk build; caller skips the row.
+				continue
+			}
+			v, evalErr := evalExpr(keyExprs[i], row, ctx)
+			if evalErr != nil {
+				// A key expression that cannot be evaluated over stored data is
+				// not a build failure here; the row is simply not indexed (the
+				// runtime maintain path makes the same call).
+				return nil, false, nil
+			}
+			if v.IsNull() {
+				return nil, true, nil
+			}
+			k := encodeArbiterExprKey(ctx, v, keyExprs[i], pos)
+			if k == nil {
+				return nil, false, nil
+			}
+			out = append(out, k...)
 			continue
 		}
 		v := row[col.Ordinal]
@@ -10770,6 +10842,31 @@ func encodeCompositeBTreeKey(row Row, cols []*catalog.Column, pos int) (key []by
 		out = append(out, k...)
 	}
 	return out, false, nil
+}
+
+// resolveIndexKeyExprs resolves idx's stored expression key columns
+// (idx.ColExprs, set where idx.Columns[i] == "") against tbl so the bulk-build
+// path can evaluate them per row. Returns nil when idx has no expression key
+// column, which keeps every plain index on the byte-for-byte-unchanged path.
+func resolveIndexKeyExprs(tbl *catalog.Table, idx *catalog.Index) []planner.Expr {
+	if idx == nil || len(idx.ColExprs) == 0 {
+		return nil
+	}
+	var out []planner.Expr
+	for i, name := range idx.Columns {
+		if name != "" || i >= len(idx.ColExprs) || idx.ColExprs[i] == nil {
+			continue
+		}
+		planExpr, err := planner.ResolveIndexPredicate(*idx.ColExprs[i], tbl)
+		if err != nil || planExpr == nil {
+			continue
+		}
+		if out == nil {
+			out = make([]planner.Expr, len(idx.Columns))
+		}
+		out[i] = planExpr
+	}
+	return out
 }
 
 // nndNullKeyDedupKey builds an in-memory-only dedup key for a row that has at
@@ -10816,6 +10913,13 @@ func nndNullKeyDedupKey(row Row, cols []*catalog.Column, pos int) ([]byte, *Exec
 // 42804 — the analyzer should have caught it but the runtime guard
 // makes the failure mode crisp.
 func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *ExecError) {
+	// ARRAY column: catalog.Type carries the ELEMENT type in Name plus
+	// IsArray=true (codec_array.go), so every type predicate below would answer
+	// for the element and mis-claim the array. Route arrays to the array_ops
+	// (array_cmp) encoding BEFORE the scalar switch. M0119-0006.
+	if col.Type.IsArray {
+		return encodeArrayBTreeKey(v, col, pos)
+	}
 	// Unknown-literal coercion (sibling of the seq-scan promoteCrossKind path):
 	// a probe key built from a quoted literal (`WHERE id = '1'`) arrives as
 	// KindString even for an int/numeric/timestamp column, because bare string
@@ -10844,7 +10948,19 @@ func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *Ex
 			// Leave unparseable strings as-is; the kind checks below produce
 			// the existing 42804 for a genuinely non-coercible probe.
 			v = tryParseStringAs(KindTime, v.StringValue())
+		default:
+			// int2 / oid / bool / bytea / time probes (btree_scalar_keys.go).
+			coerced, cErr := coerceScalarKeyStringDatum(v, col, pos)
+			if cErr != nil {
+				return nil, cErr
+			}
+			v = coerced
 		}
+	}
+	// int2 / oid / bool / bytea / time — see btree_scalar_keys.go for why each
+	// encoding is what it is (the type's default opclass order, not its text).
+	if k, handled, encErr := encodeScalarBTreeKey(v, col, pos); handled {
+		return k, encErr
 	}
 	switch {
 	case isInt4Type(col.Type.Name):
@@ -10924,27 +11040,11 @@ func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *Ex
 		return btree.EncodeVarchar([]byte(v.StringValue())), nil
 	case isFloat8Type(col.Type.Name):
 		// float4/float8 stored as text; decode then re-encode sortably.
-		var f float64
-		switch v.Kind {
-		case KindString:
-			var err error
-			f, err = strconv.ParseFloat(v.StringValue(), 64)
-			if err != nil {
+		f, badSyntax, ok := datumToFloat64ForKey(v)
+		if !ok {
+			if badSyntax {
 				return nil, &ExecError{Code: "22003", Pos: pos, Message: fmt.Sprintf("invalid float value %q for index key", v.StringValue())}
 			}
-		case KindInt:
-			f = float64(v.Int)
-		case KindNumeric:
-			// Convert NUMERIC datum (mantissa * 10^-scale) to float64.
-			m := numericMant(v)
-			fv, _ := new(big.Float).SetInt(m).Float64()
-			if v.Scale > 0 {
-				fv /= math.Pow10(int(v.Scale))
-			} else if v.Scale < 0 {
-				fv *= math.Pow10(-int(v.Scale))
-			}
-			f = fv
-		default:
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not float at runtime (kind %d)", col.Name, v.Kind)}
 		}
 		return btree.EncodeFloat8(f), nil
@@ -11085,6 +11185,40 @@ func isTimestamptzType(name string) bool {
 }
 
 // isFloat8Type returns true for float8 / float4 / real / double precision.
+// datumToFloat64ForKey coerces a runtime Datum holding a float4/float8 value to
+// the float64 that btree.EncodeFloat8 orders on. goopg has no KindFloat: the
+// codec renders a stored float through PGFloatOut and then re-parses it
+// (floatTextDatum), so the SAME float column yields KindNumeric for a value that
+// prints as a plain decimal ("1.5") and KindString for one that does not
+// ("1e+30", "Infinity", "NaN"). Every float key encoder must therefore accept
+// both kinds, or one index would mix two encodings and lose its ordering.
+//
+// badSyntax distinguishes an unparseable string (PG's 22003 for an index key)
+// from a kind that is not a float at all (42804); both return ok=false.
+func datumToFloat64ForKey(v Datum) (f float64, badSyntax, ok bool) {
+	switch v.Kind {
+	case KindString:
+		parsed, err := strconv.ParseFloat(v.StringValue(), 64)
+		if err != nil {
+			return 0, true, false
+		}
+		return parsed, false, true
+	case KindInt:
+		return float64(v.Int), false, true
+	case KindNumeric:
+		// Convert NUMERIC datum (mantissa * 10^-scale) to float64.
+		m := numericMant(v)
+		fv, _ := new(big.Float).SetInt(m).Float64()
+		if v.Scale > 0 {
+			fv /= math.Pow10(int(v.Scale))
+		} else if v.Scale < 0 {
+			fv *= math.Pow10(-int(v.Scale))
+		}
+		return fv, false, true
+	}
+	return 0, false, false
+}
+
 func isFloat8Type(name string) bool {
 	switch strings.ToLower(name) {
 	case "float8", "float4", "real", "double precision", "double", "float":
@@ -11113,6 +11247,14 @@ func isSupportedBTreeKeyType(name string) bool {
 	return isInt4Type(name) || isInt8Type(name) || isNumericType(name) ||
 		isVarcharType(name) || isCharType(name) || isTimestampType(name) ||
 		isTimestamptzType(name) || isDateType(name) || isFloat8Type(name) ||
+		// int2 / oid / bool / bytea / time — M0119-0006 (btree_scalar_keys.go).
+		isInt2Type(name) || isOidType(name) || isBoolType(name) ||
+		isByteaType(name) || isTimeOfDayType(name) ||
+		// timetz — M0119-0006, the two-part key (btree_scalar_keys.go).
+		isTimeTzType(name) ||
+		// interval — M0119-0006, the lossy 128-bit comparison span
+		// (btree_interval_key.go).
+		isIntervalTypeName(name) ||
 		strings.ToLower(name) == "uuid"
 }
 
@@ -11556,7 +11698,7 @@ func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int, only boo
 		// have no entries to clear. (Btrees track their
 		// own free space inline.) Pair the FSM/VM cleanup
 		// only with the heap rel above.
-		if _, err := btree.CreateWithXID(o.ctx.Pool, idxRel, o.ctx.Tx.XID); err != nil {
+		if _, err := createIndexBTree(o.ctx, idx, idxRel); err != nil {
 			return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 		}
 	}
@@ -13728,8 +13870,18 @@ func resyncIndexHeapRow(ctx *Context, idx *catalog.Index) error {
 		RelOid: catalog.IndexRelationId,
 		Fork:   storage.MainFork,
 	}
-	if _, err := writeHeapRowCanonical(ctx, pgIndexRel, pgIndexColumnsPG18(), buildUserPGIndexRow(ctx.Catalog, idx)); err != nil {
+	resyncTID, err := writeHeapRowCanonical(ctx, pgIndexRel, pgIndexColumnsPG18(), buildUserPGIndexRow(ctx.Catalog, idx))
+	if err != nil {
 		return fmt.Errorf("pg_index replica-identity resync: %w", err)
+	}
+	// The rewrite lands at a NEW heap TID, so both pg_index indexes need an
+	// entry pointing at it — otherwise PG's sysscan follows the stamped-dead
+	// old TID and the resynced flags are invisible (AI-20260810-011258-003).
+	if err := insertPgIndexIndrelidIndexEntry(ctx, tableOIDForIndex(idx), resyncTID); err != nil {
+		return fmt.Errorf("pg_index_indrelid_index resync: %w", err)
+	}
+	if err := insertPgIndexIndexrelidIndexEntry(ctx, idx.OID, resyncTID); err != nil {
+		return fmt.Errorf("pg_index_indexrelid_index resync: %w", err)
 	}
 	if err := mirrorTouchedCatalogsToPostgresDB(ctx); err != nil {
 		return fmt.Errorf("mirror catalogs to postgres db: %w", err)
@@ -13782,8 +13934,43 @@ func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 		RelOid: catalog.IndexRelationId,
 		Fork:   storage.MainFork,
 	}
-	if _, err := writeHeapRowCanonical(ctx, pgIndexRel, pgIndexColumnsPG18(), buildUserPGIndexRow(ctx.Catalog, idx)); err != nil {
+	indexTID, err := writeHeapRowCanonical(ctx, pgIndexRel, pgIndexColumnsPG18(), buildUserPGIndexRow(ctx.Catalog, idx))
+	if err != nil {
 		return fmt.Errorf("pg_index: %w", err)
+	}
+	// AI-20260810-011258-003 blocker #8: index the pg_index row. PG's
+	// RelationGetIndexList discovers a relation's indexes ONLY through
+	// pg_index_indrelid_index (2678) and then resolves each row through the
+	// INDEXRELID syscache (2679); until both were maintained here, a PG 18.3
+	// instance on a goopg cluster saw goopg-created indexes as nonexistent and
+	// silently skipped index maintenance for its own INSERTs.
+	if err := insertPgIndexIndrelidIndexEntry(ctx, tableOIDForIndex(idx), indexTID); err != nil {
+		return fmt.Errorf("pg_index_indrelid_index for index: %w", err)
+	}
+	if err := insertPgIndexIndexrelidIndexEntry(ctx, idx.OID, indexTID); err != nil {
+		return fmt.Errorf("pg_index_indexrelid_index for index: %w", err)
+	}
+
+	// AI-20260810-011258-003 blocker #11: write the INDEX relation's own
+	// pg_attribute rows (upstream index_create → ConstructTupleDescriptor →
+	// AppendAttributeTuples). PG rebuilds an index's TupleDesc from
+	// pg_attribute like any other relation; without these rows the first
+	// RelationBuildTupleDesc on the index ERRORs "pg_attribute catalog is
+	// missing N attribute(s)".
+	attrRel := storage.RelFileNode{
+		DBOid:  heapDBOid,
+		RelOid: catalog.AttributeRelationId,
+		Fork:   storage.MainFork,
+	}
+	attrRows, attrNames := buildUserPGAttributeRowsForIndex(ctx.Catalog, idx)
+	for i, attrRow := range attrRows {
+		attrTID, err := writeHeapRowCanonical(ctx, attrRel, pgAttributeColumnsPG18(), attrRow)
+		if err != nil {
+			return fmt.Errorf("pg_attribute for index attr %q: %w", attrNames[i], err)
+		}
+		if err := insertPgAttributeRelidAttnumIndexEntry(ctx, idx.OID, int16(i+1), attrTID); err != nil {
+			return fmt.Errorf("pg_attribute_relid_attnum_index for index attr %q: %w", attrNames[i], err)
+		}
 	}
 
 	// M0106-0011: CREATE INDEX (and ALTER TABLE ADD PRIMARY KEY) writes a
@@ -13805,6 +13992,49 @@ func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 		if err := mirrorTouchedCatalogsToPostgresDB(ctx); err != nil {
 			return fmt.Errorf("mirror catalogs to postgres db: %w", err)
 		}
+	}
+	// M0130-S11.6: the BASE relation's `relhasindex` now depends on the set of
+	// indexes on it (pgClassRelhasindex), so creating one has to rewrite the
+	// table's own pg_class row — upstream's index_create → index_update_stats →
+	// heap_inplace_update. Without this the flag keeps whatever CREATE TABLE
+	// wrote, which is always false: no index exists yet at that point, so a PG
+	// 18.3 on this cluster would go on skipping RelationGetIndexList forever.
+	//
+	// It runs in BOTH directions on purpose. Adding an index goopg cannot
+	// describe (an expression key, a `numeric` column, …) must take the flag
+	// back DOWN on a table that had it, because relhasindex is per-relation
+	// while the key format is per-index: PG would otherwise open the new
+	// blob-format tree with the opclass comparator. See pgClassRelhasindex.
+	if err := resyncTableClassHeapRowForIndexSet(ctx, idx.Table); err != nil {
+		return err
+	}
+	return nil
+}
+
+// resyncTableClassHeapRowForIndexSet rewrites the pg_class (and, as a
+// consequence of reusing the proven delete-old-rows + syncTableToCatalogHeap
+// arm, pg_attribute/pg_attrdef/pg_rewrite) heap rows of a BASE table whose
+// index set just changed, so `relhasindex` on disk matches what
+// pgClassRelhasindex now computes (M0130-S11.6).
+//
+// Only the CREATE side is wired. DROP INDEX deliberately leaves the flag alone,
+// which is upstream's behaviour too — `index_drop` never clears relhasindex; a
+// stale true is harmless (RelationGetIndexList finds no pg_index rows and gives
+// up), and it cannot become unsafe here because the flag is only ever true when
+// EVERY index on the table is descriptor-bearing, so removing one leaves the
+// survivors describable.
+func resyncTableClassHeapRowForIndexSet(ctx *Context, tbl *catalog.Table) error {
+	if tbl == nil || !catalogHeapSyncAvailable(ctx) {
+		return nil
+	}
+	if err := ctx.MaterializeWriterXID(); err == nil {
+		xmax := ctx.Tx.XID
+		for _, dbOid := range tableCatalogDBOids(ctx) {
+			deleteCatalogRowsForOID(ctx, dbOid, tbl.OID, xmax)
+		}
+	}
+	if err := syncTableToCatalogHeap(ctx, tbl); err != nil {
+		return fmt.Errorf("pg_class relhasindex resync for %q: %w", tbl.Name, err)
 	}
 	return nil
 }
@@ -14717,7 +14947,7 @@ func (o *ddlOp) materializeView(tbl *catalog.Table, selectPlan planner.Node) err
 				}
 			}
 			idxName := idx.QualifiedName()
-			if err := o.bulkBuildBTree(idxRel, tbl, cols, idx.Unique, idx.NullsNotDistinct, idxName, 0); err != nil {
+			if err := o.bulkBuildBTreeFull(idx, idxRel, tbl, cols, resolveIndexKeyExprs(tbl, idx), idx.Unique, idx.NullsNotDistinct, idxName, 0, nil); err != nil {
 				return err
 			}
 		}
@@ -15789,6 +16019,26 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					return nil
 				}
 			}
+		case "extension":
+			// M0130-S3: DROP EXTENSION stamps xmax on the pg_extension
+			// heap row so the drop survives restart.
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				name := s.Names[0].String()
+				extOID := im.ExtensionOID(name)
+				if extOID == 0 {
+					if s.IfExists {
+						o.ctx.AddNotice(fmt.Sprintf("extension %q does not exist, skipping", name))
+						return nil
+					}
+					return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("extension %q does not exist", name)}
+				}
+				im.DropExtension(name)
+				if catalogHeapSyncAvailable(o.ctx) {
+					deleteExtensionCatalogRow(o.ctx, extOID)
+				}
+				return nil
+			}
+
 		case "event trigger":
 			// Drop the dump-visible pg_event_trigger registry entry (DU-002,
 			// M0119-0004) so a dropped event trigger stops round-tripping
@@ -20481,7 +20731,7 @@ func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAct
 		idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
 		o.ctx.Pool.InvalidateRel(idxRel)
 		_ = o.ctx.Pool.Manager().TruncateRelation(idxRel)
-		_, _ = btree.CreateWithXID(o.ctx.Pool, idxRel, o.ctx.Tx.XID)
+		_, _ = createIndexBTree(o.ctx, idx, idxRel)
 	}
 
 	// Phase 4: re-insert all rows with the new column layout and rebuild indexes.
@@ -20618,7 +20868,7 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 		idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
 		o.ctx.Pool.InvalidateRel(idxRel)
 		_ = o.ctx.Pool.Manager().TruncateRelation(idxRel)
-		_, _ = btree.CreateWithXID(o.ctx.Pool, idxRel, o.ctx.Tx.XID)
+		_, _ = createIndexBTree(o.ctx, idx, idxRel)
 	}
 
 	// Phase 4: re-insert all rows with the new encoding.

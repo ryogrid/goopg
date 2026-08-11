@@ -122,17 +122,17 @@ func TestLPDeadSkippedByPageReaders(t *testing.T) {
 	defer func() { slot.RUnlock(); bt.pool.Unpin(slot) }()
 	p := slot.Page()
 
-	if keys, err := PageItemKeys(p); err != nil {
+	if keys, err := (IndexFormat{}).PageItemKeys(p); err != nil {
 		t.Fatalf("PageItemKeys: %v", err)
 	} else if len(keys) != 2 {
 		t.Fatalf("PageItemKeys returned %d keys, want 2 (dead skipped)", len(keys))
 	}
-	if entries, err := PageLeafEntries(p); err != nil {
+	if entries, err := (IndexFormat{}).PageLeafEntries(p); err != nil {
 		t.Fatalf("PageLeafEntries: %v", err)
 	} else if len(entries) != 2 {
 		t.Fatalf("PageLeafEntries returned %d, want 2", len(entries))
 	}
-	if items, err := pageItems(p); err != nil {
+	if items, err := blobFormat.pageItems(p); err != nil {
 		t.Fatalf("pageItems: %v", err)
 	} else if len(items) != 2 {
 		t.Fatalf("pageItems returned %d, want 2", len(items))
@@ -300,7 +300,9 @@ func TestRangeScanWithPosCoordinates(t *testing.T) {
 			t.Fatal(err)
 		}
 		p := slot.Page()
-		raw, rerr := storage.PageGetItemRawAllowDead(p, e.pos.Slot)
+		// ScanPos.Slot is a DATA slot (S11.2b): on a non-rightmost page the
+		// physical offset is one higher, because P_HIKEY owns offset 1.
+		raw, rerr := pgGetItemRawAllowDead(p, e.pos.Slot)
 		if rerr != nil {
 			t.Fatalf("blk=%d slot=%d: %v", e.pos.Blk, e.pos.Slot, rerr)
 		}

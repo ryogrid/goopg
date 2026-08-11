@@ -8,6 +8,9 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/pgarray"
+	"github.com/goopg/goopg/internal/pgnodes"
 )
 
 // User-table array columns (e.g. `p int4[]`) carry catalog.Type{Name:"int4",
@@ -35,31 +38,11 @@ const arrayHeaderSize = 24 // bytes 0..23: varlena + ndim + dataoffset + elemtyp
 // arrayElemTypeInfo returns the element pg_type OID, fixed byte width (-1 for
 // varlena), and storage alignment for an array element type name. ok is false
 // for an unsupported element type.
+// The table itself lives in internal/pgarray so the logical-replication decoder
+// (internal/wal/pgoutput.go), which cannot import the executor, reads the same
+// on-disk blobs through the same element table and renderer. M0119-0006.
 func arrayElemTypeInfo(elemName string) (oid uint32, size, align int, varlena, ok bool) {
-	switch strings.ToLower(elemName) {
-	case "int2", "smallint":
-		return 21, 2, 2, false, true
-	case "int4", "integer", "int", "serial", "serial4":
-		return 23, 4, 4, false, true
-	case "int8", "bigint", "bigserial", "serial8":
-		return 20, 8, 8, false, true
-	case "oid":
-		return 26, 4, 4, false, true
-	case "float4", "real":
-		return 700, 4, 4, false, true
-	case "float8", "double precision", "double", "float":
-		return 701, 8, 8, false, true
-	case "bool", "boolean":
-		return 16, 1, 1, false, true
-	case "text":
-		return 25, -1, 4, true, true
-	case "varchar", "character varying":
-		return 1043, -1, 4, true, true
-	case "bpchar", "char", "character":
-		return 1042, -1, 4, true, true
-	default:
-		return 0, 0, 0, false, false
-	}
+	return pgarray.ElemTypeInfo(elemName)
 }
 
 // encodeArrayValuePG encodes an array-typed datum (t.IsArray) into a PG-native
@@ -96,6 +79,18 @@ func encodeArrayValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		}
 		body = append(body, eb...)
 	}
+	// Upstream construct_md_array (postgres/src/backend/utils/adt/arrayfuncs.c)
+	// re-aligns the running length AFTER each element, the last one included, so
+	// a PG array's VARSIZE is padded up to the element alignment. goopg used to
+	// stop at the final element, which was invisible to any reader (elements are
+	// found by count, never by scanning to the end) but made the blob a different
+	// SIZE from the one PG writes for the same value — visible to pg_column_size,
+	// to a byte-compare against a PG-written tuple, and to pg_amcheck. Pinned on
+	// PG 18.3: a 1-element timetz array is 40 bytes = MAXALIGN(24 + 12), a
+	// 1-element `\x01` bytea array is 32 = align4(24 + 5). M0119-0006.
+	if pad := alignPad(len(body), align); pad > 0 {
+		body = append(body, make([]byte, pad)...)
+	}
 	total := arrayHeaderSize + len(body)
 	buf := make([]byte, total)
 	binary.LittleEndian.PutUint32(buf[0:4], uint32(total)<<2)
@@ -120,10 +115,72 @@ func alignPad(off, align int) int {
 // Fixed-length elements are stored raw (no per-element length header); varlena
 // elements use a 4-byte varlena header (the form decodeTextArray expects).
 func encodeArrayElem(elemName, e string, varlena bool) ([]byte, error) {
+	lower := strings.ToLower(elemName)
 	if varlena {
+		// numeric is the one varlena element whose body is NOT the text the
+		// user typed: like the scalar arm in encodeValuePG it stores PG's
+		// base-10000 NumericData, so the varlena header wraps that body
+		// instead of the decimal string. Every other varlena element type
+		// goopg supports (text/varchar/bpchar) IS its own text.
+		if lower == "numeric" || lower == "decimal" {
+			body, nerr := pgnodes.NumericBodyFromText(strings.TrimSpace(e))
+			if nerr != nil {
+				return nil, &ExecError{Code: "22P02",
+					Message: fmt.Sprintf("invalid input syntax for type numeric: %q", e)}
+			}
+			return array4ByteVarlenaBytes(body), nil
+		}
+		if lower == "bytea" {
+			// Sibling of encodeValuePG's "bytea" arm: an element arrives as the
+			// TEXT inside the array literal, which upstream routes through
+			// byteain, and the stored body is the RAW bytes. Note the header is
+			// array4ByteVarlenaBytes, not the scalar arm's varlenaPayloadBytes:
+			// a scalar bytea may use PG's 1-byte short header, while inside an
+			// array body the elements are the always-4-byte form at align 4
+			// (pinned on PG 18.3: three 1-byte bytea elements make a 48-byte
+			// array = 24-byte header + 3 × MAXALIGN-padded 8).
+			raw, err := byteaIn(e, 0)
+			if err != nil {
+				return nil, err
+			}
+			return array4ByteVarlenaBytes(raw), nil
+		}
 		return array4ByteVarlena(e), nil
 	}
-	switch strings.ToLower(elemName) {
+	switch lower {
+	case "date", "time", "timestamp", "timestamptz", "timetz":
+		// The date-time element images, delegated to the SCALAR encoder rather
+		// than re-derived here (Hard-won Rule #2 — the element and the column
+		// must produce identical bytes, and every one of these arms already
+		// accepts the KindString an array element always is: date/timestamp go
+		// through parseCopyTimestamp plus the ±infinity literals, time through
+		// parseTimeString, timetz through parseTimeTZString). The widths the
+		// element table declares (4/8/8/8/12) are exactly what those arms
+		// return, which is what keeps the array body self-describing.
+		return encodeValuePG(catalog.Type{Name: lower}, NewStringDatum(e))
+	case "uuid":
+		// Sibling of encodeValuePG's "uuid" arm: pg_uuid_t, 16 raw bytes.
+		s := normalizeUUIDStr(strings.TrimSpace(e))
+		raw, ok := uuidBytesFromCanonical(s)
+		if !ok || !isValidUUIDStr(s) {
+			return nil, &ExecError{Code: "22P02",
+				Message: fmt.Sprintf("invalid input syntax for type uuid: %q", e)}
+		}
+		return append([]byte(nil), raw[:]...), nil
+	case "interval":
+		// Sibling of encodeValuePG's "interval" arm: {time int64, day int32,
+		// month int32}. An array element always arrives as the text inside the
+		// array literal, so interval_in's tokenizer is the only entry point.
+		months, days, micros, ok := parser.ParseIntervalBody(strings.TrimSpace(e))
+		if !ok {
+			return nil, &ExecError{Code: "22007",
+				Message: fmt.Sprintf("invalid input syntax for type interval: %q", e)}
+		}
+		var b [16]byte
+		binary.LittleEndian.PutUint64(b[0:8], uint64(micros))
+		binary.LittleEndian.PutUint32(b[8:12], uint32(days))
+		binary.LittleEndian.PutUint32(b[12:16], uint32(months))
+		return b[:], nil
 	case "int2", "smallint":
 		v, err := strconv.ParseInt(strings.TrimSpace(e), 10, 64)
 		if err != nil {
@@ -188,10 +245,16 @@ func encodeArrayElem(elemName, e string, varlena bool) ([]byte, error) {
 // header used inside array data (PG never uses the 1-byte short header for
 // elements stored with 'i' alignment in an array body).
 func array4ByteVarlena(s string) []byte {
-	total := len(s) + 4
+	return array4ByteVarlenaBytes([]byte(s))
+}
+
+// array4ByteVarlenaBytes is array4ByteVarlena over an arbitrary body — used by
+// the numeric element arm, whose body is a NumericData image rather than text.
+func array4ByteVarlenaBytes(body []byte) []byte {
+	total := len(body) + 4
 	buf := make([]byte, total)
 	binary.LittleEndian.PutUint32(buf[0:4], uint32(total)<<2)
-	copy(buf[4:], s)
+	copy(buf[4:], body)
 	return buf
 }
 
@@ -205,96 +268,16 @@ func decodeArrayValuePG(t catalog.Type, data []byte) (Datum, int, error) {
 	}
 	// payload starts at ndim (the varlena header was stripped):
 	//   [0:4] ndim [4:8] dataoffset [8:12] elemtype [12:16] dims[0] [16:20] lbound[0]
-	if len(payload) < 20 {
-		// Empty / 0-dim array (ndim==0) → "{}".
-		return NewStringDatum("{}"), consumed, nil
+	// The rendering itself lives in internal/pgarray, shared with the pgoutput
+	// decoder (M0119-0006).
+	text, err := pgarray.RenderText(t.Name, payload)
+	if err != nil {
+		return Datum{}, 0, err
 	}
-	ndim := int32(binary.LittleEndian.Uint32(payload[0:4]))
-	if ndim == 0 {
-		return NewStringDatum("{}"), consumed, nil
-	}
-	n := int(binary.LittleEndian.Uint32(payload[12:16]))
-	if n <= 0 {
-		return NewStringDatum("{}"), consumed, nil
-	}
-	_, size, align, varlena, ok := arrayElemTypeInfo(t.Name)
-	if !ok {
-		size, align, varlena = -1, 4, true
-	}
-	elemData := payload[20:]
-	var sb strings.Builder
-	sb.WriteByte('{')
-	off := 0
-	for i := 0; i < n; i++ {
-		if pad := alignPad(off, align); pad > 0 {
-			off += pad
-		}
-		s, adv, derr := decodeArrayElem(t.Name, elemData[min(off, len(elemData)):], varlena, size)
-		if derr != nil {
-			return Datum{}, 0, derr
-		}
-		if i > 0 {
-			sb.WriteByte(',')
-		}
-		sb.WriteString(s)
-		off += adv
-	}
-	sb.WriteByte('}')
-	return NewStringDatum(sb.String()), consumed, nil
-}
-
-func decodeArrayElem(elemName string, data []byte, varlena bool, size int) (string, int, error) {
-	if varlena {
-		if len(data) < 4 {
-			return "", 0, fmt.Errorf("truncated array text element")
-		}
-		sz := int(binary.LittleEndian.Uint32(data[0:4]) >> 2)
-		if sz < 4 || sz > len(data) {
-			return "", 0, fmt.Errorf("truncated array text element body")
-		}
-		return quoteArrayTextElem(string(data[4:sz])), sz, nil
-	}
-	if len(data) < size {
-		return "", 0, fmt.Errorf("truncated fixed array element")
-	}
-	switch strings.ToLower(elemName) {
-	case "int2", "smallint":
-		return strconv.FormatInt(int64(int16(binary.LittleEndian.Uint16(data[:2]))), 10), 2, nil
-	case "int4", "integer", "int", "serial", "serial4":
-		return strconv.FormatInt(int64(int32(binary.LittleEndian.Uint32(data[:4]))), 10), 4, nil
-	case "int8", "bigint", "bigserial", "serial8":
-		return strconv.FormatInt(int64(binary.LittleEndian.Uint64(data[:8])), 10), 8, nil
-	case "oid":
-		return strconv.FormatUint(uint64(binary.LittleEndian.Uint32(data[:4])), 10), 4, nil
-	case "float4", "real":
-		return PGFloatOut(float64(math.Float32frombits(binary.LittleEndian.Uint32(data[:4]))), 32), 4, nil
-	case "float8", "double precision", "double", "float":
-		return PGFloatOut(math.Float64frombits(binary.LittleEndian.Uint64(data[:8])), 64), 8, nil
-	case "bool", "boolean":
-		if data[0] != 0 {
-			return "t", 1, nil
-		}
-		return "f", 1, nil
-	default:
-		return "", 0, fmt.Errorf("unsupported fixed array element type %q", elemName)
-	}
+	return NewStringDatum(text), consumed, nil
 }
 
 // quoteArrayTextElem applies PG array-output quoting: an element is double-
 // quoted when empty, equal to the literal NULL, or containing a character that
 // would otherwise be ambiguous ({ } , " \ or whitespace).
-func quoteArrayTextElem(s string) string {
-	if s == "" || strings.EqualFold(s, "null") || strings.ContainsAny(s, "{},\"\\ \t\n\r") {
-		var sb strings.Builder
-		sb.WriteByte('"')
-		for i := 0; i < len(s); i++ {
-			if s[i] == '"' || s[i] == '\\' {
-				sb.WriteByte('\\')
-			}
-			sb.WriteByte(s[i])
-		}
-		sb.WriteByte('"')
-		return sb.String()
-	}
-	return s
-}
+func quoteArrayTextElem(s string) string { return pgarray.QuoteTextElem(s) }

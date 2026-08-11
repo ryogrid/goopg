@@ -124,6 +124,24 @@ var pgConvEncAliases = map[string]string{
 	"windows950":   "BIG5",
 }
 
+// pgEncodingBELast is PG_ENCODING_BE_LAST (= PG_KOI8U) from pg_wchar.h.
+// PG_VALID_BE_ENCODING(enc) is `enc >= 0 && enc <= pgEncodingBELast`; encodings
+// with a higher ID (SJIS, BIG5, GBK, UHC, GB18030, JOHAB, SHIFT_JIS_2004) are
+// client-only and are not legal server-side encodings. M0122-0008.
+const pgEncodingBELast = 34 // PG_KOI8U
+
+// ValidServerEncodingName checks whether name resolves to a known encoding that
+// is valid as a server-side database encoding (PG_VALID_BE_ENCODING). Returns
+// the pg_enc integer ID, or -1 if unknown or client-only. Mirrors PG's
+// pg_valid_server_encoding in src/common/encnames.c. M0122-0008.
+func ValidServerEncodingName(name string) int32 {
+	id := EncodingNameToID(name)
+	if id < 0 || id > pgEncodingBELast {
+		return -1
+	}
+	return id
+}
+
 // EncodingNameToID resolves an encoding name (any case, with arbitrary
 // punctuation that clean_encoding_name strips) to its pg_enc integer ID, or -1
 // if unknown. It first matches a canonical pg_enc2name name, then falls back to

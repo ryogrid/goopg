@@ -11,25 +11,34 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
+// blobFmt is the on-page key format every test in this package builds its
+// pages in: goopg's opaque order-preserving key blobs, which is the zero
+// btree.IndexFormat. The tiers take the format from their caller (it is a
+// per-index catalog property the page bytes do not carry — see the note above
+// KeyComparator in verify_nbtree.go), and these tests are bytes-only, so they
+// state the blob choice here once rather than at ~60 call sites.
+var blobFmt = btree.IndexFormat{}
+
 // btSpecial returns the byte offset where the B-tree opaque special area
 // begins, mirroring btree.go's btSpecialOffset (BlockSize - SizeOfBTPageOpaque).
 func btSpecial() int { return storage.BlockSize - btree.SizeOfBTPageOpaque }
 
 // makeMetaPage builds a metapage (block 0) carrying the given magic and
-// version, mirroring btree.writeMeta's layout (payload at SizeOfPageHeaderData:
-// magic, version, ...). The remaining metadata fields are left zero — the
-// verify tier only inspects magic and version. It self-checks the bytes through
-// the real decoder so a future layout change fails loudly here rather than
-// silently exercising garbage.
+// version, on the upstream shape M0130-S11.3 flipped to: a PG-format page
+// (16-byte special area, BTP_META) with BTMetaPageData at PageGetContents. The
+// remaining metadata fields are left zero — the verify tier only inspects
+// magic and version. It self-checks the bytes through the real decoder so a
+// future layout change fails loudly here rather than silently exercising
+// garbage.
 func makeMetaPage(t *testing.T, magic, version uint32) storage.Page {
 	t.Helper()
 	p := make(storage.Page, storage.BlockSize)
-	if err := storage.InitPage(p); err != nil {
-		t.Fatalf("InitPage: %v", err)
+	if err := btree.InitPGMetaPage(p, 0, 0, true); err != nil {
+		t.Fatalf("InitPGMetaPage: %v", err)
 	}
-	off := storage.SizeOfPageHeaderData
-	binary.LittleEndian.PutUint32(p[off:off+4], magic)
-	binary.LittleEndian.PutUint32(p[off+4:off+8], version)
+	m := btree.ReadPGMetaPage(p)
+	m.Magic, m.Version = magic, version
+	btree.WritePGMetaPage(p, m)
 	if got := btree.ParseMeta(p); got.Magic != magic || got.Version != version {
 		t.Fatalf("makeMetaPage self-check: ParseMeta=%+v, want magic=%#x version=%d", got, magic, version)
 	}
@@ -42,12 +51,10 @@ func makeMetaPage(t *testing.T, magic, version uint32) storage.Page {
 func makeDataPage(t *testing.T, flags uint16, level uint32) storage.Page {
 	t.Helper()
 	p := make(storage.Page, storage.BlockSize)
-	if err := storage.InitPage(p); err != nil {
-		t.Fatalf("InitPage: %v", err)
+	if err := btree.InitPGBTPage(p); err != nil {
+		t.Fatalf("InitPGBTPage: %v", err)
 	}
-	off := btSpecial()
-	binary.LittleEndian.PutUint32(p[off+8:off+12], level) // Level
-	binary.LittleEndian.PutUint16(p[off+12:off+14], flags)
+	btree.WritePGOpaque(p, btree.PGBTPageOpaque{Level: level, Flags: pgFlagsForTest(flags)})
 	op := btree.ParseOpaque(p)
 	if op.Flags != flags || op.Level != level {
 		t.Fatalf("makeDataPage self-check: ParseOpaque flags=%#x level=%d, want flags=%#x level=%d", op.Flags, op.Level, flags, level)
@@ -239,53 +246,110 @@ func TestVerifyBtreePage_DeletedPageSuppressesItemCount(t *testing.T) {
 	}
 }
 
-// btItemRaw marshals a B-tree line-pointer item in the on-disk layout parseItem
-// expects: keyLen(2) | block(4) | offset(2) | key. The TID is left zero — the
-// item-order / high-key tier compares only keys.
+// pgInitTestPage initialises an upstream-shaped B-tree page and, when the page
+// is NOT rightmost, installs the P_HIKEY placeholder that upstream requires
+// there. Since M0130-S11.2b the first line pointer of a non-rightmost page IS
+// the high key, so a builder that starts writing data at offset 1 silently
+// loses its first item to the high-key reader.
+//
+// The placeholder is all-0xFF, i.e. above every key these tests use, so the
+// high-key invariant tier stays quiet on pages built for the other tiers.
+func pgInitTestPage(t *testing.T, p storage.Page, next storage.BlockNumber, level uint32, flags uint16) {
+	t.Helper()
+	if err := btree.InitPGBTPage(p); err != nil {
+		t.Fatalf("InitPGBTPage: %v", err)
+	}
+	pgNext := next
+	if next == storage.InvalidBlockNumber {
+		pgNext = btree.PNone
+	}
+	btree.WritePGOpaque(p, btree.PGBTPageOpaque{Next: pgNext, Level: level, Flags: pgFlagsForTest(flags)})
+	if pgNext != btree.PNone {
+		if _, err := storage.PageAddItemRaw(p, btItemRaw([]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff})); err != nil {
+			t.Fatalf("PageAddItemRaw P_HIKEY placeholder: %v", err)
+		}
+	}
+}
+
+// pgFlagsForTest mirrors btree's own legacy->BTP_* flag translation for the
+// page builders here, which speak the engine's in-memory flag names. It is
+// deliberately a duplicate of an unexported mapping: the point of these tests
+// is to construct pages INDEPENDENTLY of the writer, so importing the writer's
+// translator would hide a drift in it.
+func pgFlagsForTest(legacy uint16) uint16 {
+	var out uint16
+	for _, m := range []struct{ legacy, pg uint16 }{
+		{btree.BTLeaf, btree.BTPLeaf},
+		{btree.BTRoot, btree.BTPRoot},
+		{btree.BTDeleted, btree.BTPDeleted},
+		{btree.BTIncompleteSplit, btree.BTPIncompleteSplit},
+		{btree.BTHalfDead, btree.BTPHalfDead},
+		{btree.BTHasGarbage, btree.BTPHasGarbage},
+	} {
+		if legacy&m.legacy != 0 {
+			out |= m.pg
+		}
+	}
+	return out
+}
+
+// btItemRaw marshals a plain (non-pivot) B-tree line-pointer item through the
+// engine's own encoder. The TID is left zero — the item-order / high-key tier
+// compares only keys.
 func btItemRaw(key []byte) []byte {
-	raw := make([]byte, 8+len(key))
-	binary.LittleEndian.PutUint16(raw[0:2], uint16(len(key)))
-	copy(raw[8:], key)
-	return raw
+	return btree.PGBTItemRaw(key, storage.ItemPointer{})
+}
+
+// btHighKeyRaw marshals a P_HIKEY separator, which since M0130-S11.4 slice 3a
+// is a PIVOT tuple (INDEX_ALT_TID_MASK + natts) rather than a plain item.
+func btHighKeyRaw(key []byte) []byte {
+	return btree.PGBTPivotRaw(key, 0)
 }
 
 // makeItemsPage builds a non-meta B-tree page carrying keys as line pointers in
-// slot order, with the given opaque flags/level/next-sibling and optional high
-// key. It sets pd_special/pd_upper to the B-tree special offset before adding
-// items (mirroring btree.initPage) so item data grows above the opaque area
-// instead of clobbering it, then writes the opaque bytes (mirroring
-// btree.writeOpaque). A non-nil highKey sets BTHasHighKey. Self-checks the
-// decoded opaque and key sequence through the real readers so a layout change
-// fails loudly here rather than silently exercising garbage.
+// data-slot order, with the given opaque flags/level/next-sibling and optional
+// high key.
+//
+// Since M0130-S11.2b the page is built the way the engine builds one: an
+// upstream 16-byte special area (btree.InitPGBTPage + btree.WritePGOpaque, with
+// the P_NONE sentinel translation), the high key as an ordinary item at P_HIKEY
+// so data starts at P_FIRSTKEY, and no "has high key" flag — presence is
+// derived from btpo_next. `next` is given in the engine's in-memory spelling
+// (storage.InvalidBlockNumber for "rightmost"), and a non-nil highKey therefore
+// requires a real sibling. Self-checks the decoded opaque and key sequence
+// through the real readers so a layout change fails loudly here rather than
+// silently exercising garbage.
 func makeItemsPage(t *testing.T, flags uint16, level uint32, next storage.BlockNumber, highKey []byte, keys ...[]byte) storage.Page {
 	t.Helper()
 	p := make(storage.Page, storage.BlockSize)
-	if err := storage.InitPage(p); err != nil {
-		t.Fatalf("InitPage: %v", err)
+	if highKey != nil && next == storage.InvalidBlockNumber {
+		t.Fatalf("makeItemsPage: a high key requires a right sibling (upstream derives presence from btpo_next)")
 	}
-	h := storage.MustHeader(p)
-	h.SetSpecial(uint16(btSpecial()))
-	h.SetUpper(uint16(btSpecial()))
+	if highKey != nil {
+		if err := btree.InitPGBTPage(p); err != nil {
+			t.Fatalf("InitPGBTPage: %v", err)
+		}
+		btree.WritePGOpaque(p, btree.PGBTPageOpaque{Next: next, Level: level, Flags: pgFlagsForTest(flags)})
+		if _, err := storage.PageAddItemRaw(p, btHighKeyRaw(highKey)); err != nil {
+			t.Fatalf("PageAddItemRaw high key: %v", err)
+		}
+	} else {
+		// No separator asked for: pgInitTestPage still has to install the
+		// P_HIKEY placeholder when the page is non-rightmost, since data may
+		// not start at offset 1 there.
+		pgInitTestPage(t, p, next, level, flags)
+	}
 	for i, k := range keys {
 		if _, err := storage.PageAddItemRaw(p, btItemRaw(k)); err != nil {
 			t.Fatalf("PageAddItemRaw[%d]: %v", i, err)
 		}
 	}
-	if highKey != nil {
-		flags |= btree.BTHasHighKey
-	}
-	off := btSpecial()
-	binary.LittleEndian.PutUint32(p[off+4:off+8], uint32(next)) // Next
-	binary.LittleEndian.PutUint32(p[off+8:off+12], level)       // Level
-	binary.LittleEndian.PutUint16(p[off+12:off+14], flags)      // Flags
-	binary.LittleEndian.PutUint16(p[off+14:off+16], uint16(len(highKey)))
-	copy(p[off+16:off+16+len(highKey)], highKey)
 
 	op := btree.ParseOpaque(p)
 	if op.Flags != flags || op.Level != level || op.Next != next {
 		t.Fatalf("makeItemsPage opaque self-check: got %+v, want flags=%#x level=%d next=%d", op, flags, level, next)
 	}
-	got, err := btree.PageItemKeys(p)
+	got, err := blobFmt.PageItemKeys(p)
 	if err != nil {
 		t.Fatalf("makeItemsPage PageItemKeys self-check: %v", err)
 	}
@@ -395,10 +459,12 @@ func TestVerifyBtreeItemOrder_InternalNegInfinityClean(t *testing.T) {
 	}
 }
 
-// A rightmost page (Next == InvalidBlockNumber) has no high key to honour even
-// if a stale high key value lingers in its opaque area.
+// A rightmost page has NO high key at all — since M0130-S11.2b presence is
+// derived from btpo_next, so there is no stale separator to mistake for one and
+// item 1 is real data. k(5) would violate a k(3) separator; on a rightmost page
+// nothing is reported.
 func TestVerifyBtreeItemOrder_RightmostNoHighKeyCheck(t *testing.T) {
-	p := makeItemsPage(t, btree.BTLeaf, 0, storage.InvalidBlockNumber, k(3), k(1), k(5))
+	p := makeItemsPage(t, btree.BTLeaf, 0, storage.InvalidBlockNumber, nil, k(1), k(5))
 	if rs := VerifyBtreeItemOrder(p, 9, "ix"); len(rs) != 0 {
 		t.Fatalf("rightmost page reported %d, want 0 (high key not enforced): %+v", len(rs), rs)
 	}
@@ -601,15 +667,12 @@ func TestVerifyBtreeSiblingLinks_SinglePageLevel(t *testing.T) {
 
 // --- Cross-level downlink tier (VerifyBtreeParentDownlinks) ------------------
 
-// btDownlinkRaw marshals an internal-page line pointer in parseItem's on-disk
-// layout (keyLen(2) | child-block(4) | offset(2) | key), setting the downlink's
-// child block — the field btItemRaw leaves zero.
+// btDownlinkRaw marshals an internal-page downlink through the engine's own
+// encoder. Since M0130-S11.4 slice 3a that is a PIVOT tuple: the child block
+// lives in t_tid's block half and the offset half carries natts, not a line
+// pointer.
 func btDownlinkRaw(key []byte, child storage.BlockNumber) []byte {
-	raw := make([]byte, 8+len(key))
-	binary.LittleEndian.PutUint16(raw[0:2], uint16(len(key)))
-	binary.LittleEndian.PutUint32(raw[2:6], uint32(child))
-	copy(raw[8:], key)
-	return raw
+	return btree.PGBTPivotRaw(key, child)
 }
 
 // dl is a (separator key, child block) downlink for makeInternalPage.
@@ -626,22 +689,14 @@ type dl struct {
 func makeInternalPage(t *testing.T, level uint32, next storage.BlockNumber, downlinks ...dl) storage.Page {
 	t.Helper()
 	p := make(storage.Page, storage.BlockSize)
-	if err := storage.InitPage(p); err != nil {
-		t.Fatalf("InitPage: %v", err)
-	}
-	h := storage.MustHeader(p)
-	h.SetSpecial(uint16(btSpecial()))
-	h.SetUpper(uint16(btSpecial()))
+	// Flags = 0 → internal (not leaf), not deleted.
+	pgInitTestPage(t, p, next, level, 0)
 	for i, d := range downlinks {
 		if _, err := storage.PageAddItemRaw(p, btDownlinkRaw(d.key, d.child)); err != nil {
 			t.Fatalf("PageAddItemRaw[%d]: %v", i, err)
 		}
 	}
-	off := btSpecial()
-	binary.LittleEndian.PutUint32(p[off+4:off+8], uint32(next)) // Next
-	binary.LittleEndian.PutUint32(p[off+8:off+12], level)       // Level
-	// Flags = 0 → internal (not leaf), not deleted.
-	got, err := btree.PageDownlinks(p)
+	got, err := blobFmt.PageDownlinks(p)
 	if err != nil {
 		t.Fatalf("makeInternalPage PageDownlinks self-check: %v", err)
 	}
@@ -670,7 +725,7 @@ func TestVerifyBtreeParentDownlinks_Clean(t *testing.T) {
 		2: makeItemsPage(t, btree.BTLeaf, 0, 3, k(5), k(1), k(3)),
 		3: makeItemsPage(t, btree.BTLeaf, 0, none, nil, k(5), k(7)),
 	}
-	if rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix"); len(rs) != 0 {
+	if rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix", blobFmt, nil); len(rs) != 0 {
 		t.Fatalf("clean parent reported %d, want 0: %+v", len(rs), rs)
 	}
 }
@@ -682,7 +737,7 @@ func TestVerifyBtreeParentDownlinks_LowerBoundViolation(t *testing.T) {
 		2: makeItemsPage(t, btree.BTLeaf, 0, 3, k(5), k(1), k(3)),
 		3: makeItemsPage(t, btree.BTLeaf, 0, none, nil, k(4), k(7)), // k(4) < k(5)
 	}
-	rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix")
+	rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix", blobFmt, nil)
 	want := `down-link lower bound invariant violated for index "ix"`
 	if len(rs) != 1 || rs[0].Msg != want {
 		t.Fatalf("lower-bound case = %+v, want single %q", rs, want)
@@ -699,7 +754,7 @@ func TestVerifyBtreeParentDownlinks_DownlinkToDeleted(t *testing.T) {
 		2: makeItemsPage(t, btree.BTLeaf, 0, 3, k(5), k(1), k(3)),
 		3: makeItemsPage(t, btree.BTLeaf|btree.BTDeleted, 0, none, nil),
 	}
-	rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix")
+	rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix", blobFmt, nil)
 	want := `downlink to deleted page found in index "ix"`
 	if len(rs) != 1 || rs[0].Msg != want {
 		t.Fatalf("deleted-child case = %+v, want single %q", rs, want)
@@ -717,7 +772,7 @@ func TestVerifyBtreeParentDownlinks_ChildLevelNotOneDown(t *testing.T) {
 		2: makeItemsPage(t, btree.BTLeaf, 0, 3, k(5), k(1), k(3)),
 		3: makeItemsPage(t, btree.BTLeaf, 2, none, nil, k(5)), // level 2, expected 0
 	}
-	rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix")
+	rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix", blobFmt, nil)
 	want := `downlink points to block in index "ix" whose level is not one level down`
 	if len(rs) != 1 || rs[0].Msg != want {
 		t.Fatalf("level case = %+v, want single %q", rs, want)
@@ -734,7 +789,7 @@ func TestVerifyBtreeParentDownlinks_NegInfChildItemSkipped(t *testing.T) {
 		// real separators k(6), k(8) — all real keys >= the parent's k(5).
 		3: makeInternalPage(t, 1, none, dl{nil, 10}, dl{k(6), 11}, dl{k(8), 12}),
 	}
-	if rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix"); len(rs) != 0 {
+	if rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix", blobFmt, nil); len(rs) != 0 {
 		t.Fatalf("internal child with neg-inf item reported %d, want 0: %+v", len(rs), rs)
 	}
 }
@@ -746,7 +801,7 @@ func TestVerifyBtreeParentDownlinks_InternalChildRealKeyBelowBound(t *testing.T)
 		1: makeInternalPage(t, 2, none, dl{k(5), 3}),
 		3: makeInternalPage(t, 1, none, dl{nil, 10}, dl{k(4), 11}), // k(4) < k(5)
 	}
-	rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix")
+	rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix", blobFmt, nil)
 	want := `down-link lower bound invariant violated for index "ix"`
 	if len(rs) != 1 || rs[0].Msg != want {
 		t.Fatalf("internal-child real-key case = %+v, want single %q", rs, want)
@@ -758,21 +813,21 @@ func TestVerifyBtreeParentDownlinks_LeafParentNoFindings(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
 		1: makeItemsPage(t, btree.BTLeaf, 0, none, nil, k(1), k(2)),
 	}
-	if rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix"); rs != nil {
+	if rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix", blobFmt, nil); rs != nil {
 		t.Fatalf("leaf parent reported %+v, want nil", rs)
 	}
 }
 
 // The metapage carries no downlinks; nil (no read attempted).
 func TestVerifyBtreeParentDownlinks_MetaPageNil(t *testing.T) {
-	if rs := VerifyBtreeParentDownlinks(mapSource(nil), btree.MetaBlock, "ix"); rs != nil {
+	if rs := VerifyBtreeParentDownlinks(mapSource(nil), btree.MetaBlock, "ix", blobFmt, nil); rs != nil {
 		t.Fatalf("metapage reported %+v, want nil", rs)
 	}
 }
 
 // An unreadable parent surfaces as a damaged-page finding, not a panic.
 func TestVerifyBtreeParentDownlinks_DamagedParent(t *testing.T) {
-	rs := VerifyBtreeParentDownlinks(mapSource(nil), 7, "ix")
+	rs := VerifyBtreeParentDownlinks(mapSource(nil), 7, "ix", blobFmt, nil)
 	if len(rs) != 1 || !strings.Contains(rs[0].Msg, "has a damaged page at block 7") {
 		t.Fatalf("damaged parent = %+v, want single damaged-page finding", rs)
 	}
@@ -784,7 +839,7 @@ func TestVerifyBtreeParentDownlinks_DanglingChild(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
 		1: makeInternalPage(t, 1, none, dl{nil, 99}), // child 99 absent
 	}
-	rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix")
+	rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix", blobFmt, nil)
 	if len(rs) != 1 || !strings.Contains(rs[0].Msg, "has a damaged page at block 99") {
 		t.Fatalf("dangling child = %+v, want single damaged-page finding for block 99", rs)
 	}

@@ -57,6 +57,7 @@ const (
 	xlogBtreeSplitL           uint8 = 0x30 // XLOG_BTREE_SPLIT_L
 	xlogBtreeSplitR           uint8 = 0x40 // XLOG_BTREE_SPLIT_R
 	xlogBtreeUnlinkPage       uint8 = 0x80 // XLOG_BTREE_UNLINK_PAGE
+	xlogBtreeUnlinkPageMeta   uint8 = 0x90 // XLOG_BTREE_UNLINK_PAGE_META
 	xlogBtreeNewRoot          uint8 = 0xA0 // XLOG_BTREE_NEWROOT
 	xlogBtreeMarkPageHalfDead uint8 = 0xB0 // XLOG_BTREE_MARK_PAGE_HALFDEAD
 	xlogBtreeVacuum           uint8 = 0xC0 // XLOG_BTREE_VACUUM

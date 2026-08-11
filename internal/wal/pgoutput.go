@@ -32,7 +32,10 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/pgarray"
+	"github.com/goopg/goopg/internal/pgdatetime"
 	"github.com/goopg/goopg/internal/pglz"
+	"github.com/goopg/goopg/internal/pgnodes"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -206,7 +209,7 @@ func (p *PgOutput) writeRelation(rel *RelationDef) error {
 		// keys; refines once 0008-0003 lands.
 		buf = append(buf, 1)
 		buf = appendCString(buf, col.Name)
-		buf = appendUint32(buf, pgoTypeOIDFor(col.Type.Name))
+		buf = appendUint32(buf, pgoColumnTypeOID(col.Type))
 		// atttypmod: v0 doesn't track typmod separately;
 		// upstream emits -1 (the "no modifier" sentinel)
 		// for that case.
@@ -342,8 +345,18 @@ func encodePgoTuplePhysical(cols []ColumnDef, body, bitmap []byte, storedNatts i
 // names here are the lowercase canonical catalog names (same as pgoDecodeValue).
 func pgoPhysicalAlign(off int, t catalog.Type) int {
 	align := 4
+	// A user array column is catalog.Type{Name:<ELEMENT type>, IsArray:true} —
+	// Name is the ELEMENT's name, so every arm below would claim the array and
+	// impose the ELEMENT's alignment (e.g. 8 for `interval[]`). On disk an array
+	// is always a varlena ArrayType blob, i.e. PG 'i' / 4-byte alignment, so the
+	// IsArray test has to come first. M0119-0006.
+	if t.IsArray {
+		return (off + 3) &^ 3
+	}
 	switch t.Name {
-	case "bool", "boolean", "name":
+	case "bool", "boolean", "name",
+		// uuid: pg_type OID 2950 is typalign 'c', typlen 16 (M0119-0006).
+		"uuid":
 		align = 1
 	case "char":
 		if len(t.Args) == 0 {
@@ -354,7 +367,9 @@ func pgoPhysicalAlign(off int, t catalog.Type) int {
 	case "int2", "smallint":
 		align = 2
 	case "int8", "bigint", "bigserial", "float8", "double precision", "double",
-		"timestamp", "timestamptz", "time", "timetz":
+		"timestamp", "timestamptz", "time", "timetz",
+		// interval: pg_type OID 1186 is typalign 'd', typlen 16.
+		"interval":
 		align = 8
 	}
 	if align <= 1 {
@@ -369,6 +384,25 @@ func pgoPhysicalAlign(off int, t catalog.Type) int {
 // same text pgoDecodeValue would for the same logical value so the subscriber's
 // apply worker parses it identically. M0111-0002.
 func pgoDecodePhysicalValue(t catalog.Type, data []byte) ([]byte, int, error) {
+	// Array columns FIRST, for the reason spelled out in pgoPhysicalAlign: Name
+	// holds the ELEMENT type, so the switch below would decode a `uuid[]`
+	// column's ArrayType blob as a bare 16-byte pg_uuid_t — emitting garbage to
+	// the subscriber AND mis-advancing the offset of every following column in
+	// the tuple. The blob is a varlena; the text rendering is the very same
+	// internal/pgarray.RenderText the heap decoder
+	// (executor.decodeArrayValuePG) uses, so a replicated array reaches the
+	// subscriber spelled exactly as a local SELECT spells it. M0119-0006.
+	if t.IsArray {
+		payload, n, err := pgoDecodePhysicalVarlena(data)
+		if err != nil {
+			return nil, 0, err
+		}
+		text, err := pgarray.RenderText(t.Name, payload)
+		if err != nil {
+			return nil, 0, err
+		}
+		return []byte(text), n, nil
+	}
 	switch t.Name {
 	case "bool", "boolean":
 		if len(data) < 1 {
@@ -449,6 +483,61 @@ func pgoDecodePhysicalValue(t catalog.Type, data []byte) ([]byte, int, error) {
 		}
 		micros := int64(binary.LittleEndian.Uint64(data[:8]))
 		return []byte(time.UnixMicro(micros).UTC().Format("15:04:05.000000")), 12, nil
+	case "interval":
+		// Sibling of executor.encodeValuePG's "interval" arm: PG's fixed
+		// 16-byte {time int64, day int32, month int32}. Before interval columns
+		// gained that layout the varlena fall-through below returned the stored
+		// text and happened to be right; it would now emit 16 raw bytes read as
+		// a varlena header. The text is rendered by the same
+		// pgdatetime.FormatInterval the executor's Datum.Format calls, so a
+		// replicated interval reaches the subscriber spelled exactly as a local
+		// SELECT spells it.
+		if len(data) < 16 {
+			return nil, 0, fmt.Errorf("interval: short read")
+		}
+		micros := int64(binary.LittleEndian.Uint64(data[:8]))
+		days := int32(binary.LittleEndian.Uint32(data[8:12]))
+		months := int32(binary.LittleEndian.Uint32(data[12:16]))
+		return []byte(pgdatetime.FormatInterval(months, days, micros)), 16, nil
+	case "uuid":
+		// Sibling of executor.encodeValuePG's "uuid" arm: PG's fixed 16-byte
+		// pg_uuid_t. Before uuid columns gained that layout the varlena
+		// fall-through below returned the stored 36-char text and happened to
+		// be right; it would now read the first raw byte as a varlena header.
+		// Rendered by uuid_out's rule (lowercase hex, hyphens after bytes
+		// 4/6/8/10) so the subscriber sees exactly what a local SELECT prints.
+		// M0119-0006.
+		if len(data) < 16 {
+			return nil, 0, fmt.Errorf("uuid: short read")
+		}
+		const hexdigits = "0123456789abcdef"
+		out := make([]byte, 0, 36)
+		for i := 0; i < 16; i++ {
+			if i == 4 || i == 6 || i == 8 || i == 10 {
+				out = append(out, '-')
+			}
+			out = append(out, hexdigits[data[i]>>4], hexdigits[data[i]&0x0f])
+		}
+		return out, 16, nil
+	case "numeric", "decimal":
+		// Sibling of executor.encodeValuePG's "numeric" arm: PG's base-10000
+		// NumericData behind a varlena header. Before numeric columns gained
+		// that layout the varlena fall-through below returned the stored
+		// decimal string and happened to be right; it would now ship the raw
+		// digit array to the subscriber as if it were text, WITHOUT erroring —
+		// the same silent-garbage shape the uuid slice found here.
+		// pgnodes.NumericTextFromStoredPayload renders numeric_out's text and
+		// also accepts the pre-flip payload, so replication out of a cluster
+		// that predates the flip keeps working. M0119-0006.
+		payload, n, err := pgoDecodePhysicalVarlena(data)
+		if err != nil {
+			return nil, 0, err
+		}
+		s, err := pgnodes.NumericTextFromStoredPayload(payload)
+		if err != nil {
+			return nil, 0, err
+		}
+		return []byte(s), n, nil
 	}
 	// External on-disk TOAST pointer: logical replication of toasted values is
 	// not supported in v0 — fail loudly rather than emit a garbled value.
@@ -509,6 +598,23 @@ func pgoPhysEpoch() time.Time {
 // Unknown types fall back to 25 (text) — the apply worker still gets a string.
 func pgoTypeOIDFor(name string) uint32 {
 	return catalog.TypeNameToOID(name)
+}
+
+// pgoColumnTypeOID resolves the pg_type OID a Relation message must advertise
+// for a column. An array column is catalog.Type{Name:<ELEMENT>, IsArray:true},
+// so Name alone yields the ELEMENT OID (23 for `int4[]`) and the subscriber is
+// told the column is a plain int4 while the values on the wire are array text
+// like "{1,2}". Fold through the element→array map for the real OID (_int4 =
+// 1007). M0119-0006.
+func pgoColumnTypeOID(t catalog.Type) uint32 {
+	base := pgoTypeOIDFor(t.Name)
+	if !t.IsArray {
+		return base
+	}
+	if arr := catalog.ArrayOIDForBase(base); arr != 0 {
+		return arr
+	}
+	return base
 }
 
 // pgoTimestamp returns upstream's "Postgres epoch microseconds"

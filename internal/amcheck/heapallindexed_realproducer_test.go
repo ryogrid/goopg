@@ -10,6 +10,12 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
+// blobFmt is the on-page key format the external tests build their pages in —
+// goopg's opaque key blobs, the zero btree.IndexFormat. The amcheck tiers take
+// the format from their caller (a per-index catalog property; see the note
+// above amcheck.KeyComparator), so these bytes-only tests state it once here.
+var blobFmt = btree.IndexFormat{}
+
 // The heapallindexed tier (heapallindexed.go) rests on a single sibling-path
 // invariant: the fingerprint phase (index leaf entries, read by
 // CollectBtreeLeafEntries -> btree.PageLeafEntries) and the probe phase (heap
@@ -178,7 +184,7 @@ func TestVerifyHeapAllIndexed_RealProducers_RoundTripSilent(t *testing.T) {
 	defer cleanup()
 	heapSrc, nblocks := buildRealHeap(t)
 
-	idxLeaves, err := amcheck.CollectBtreeLeafEntries(idxSrc)
+	idxLeaves, err := amcheck.CollectBtreeLeafEntries(idxSrc, blobFmt)
 	if err != nil {
 		t.Fatalf("CollectBtreeLeafEntries: %v", err)
 	}
@@ -201,7 +207,7 @@ func TestVerifyHeapAllIndexed_RealProducers_RoundTripSilent(t *testing.T) {
 
 	// Composed driver: the index relation walk + probe, exactly as the SRF wires
 	// it (index PageSource in, heap probe set in).
-	r, err := amcheck.VerifyBtreeHeapAllIndexedRelation(idxSrc, heapEntries, name, tbl, seed)
+	r, err := amcheck.VerifyBtreeHeapAllIndexedRelation(idxSrc, blobFmt, heapEntries, name, tbl, seed)
 	if err != nil {
 		t.Fatalf("VerifyBtreeHeapAllIndexedRelation: %v", err)
 	}
@@ -231,7 +237,7 @@ func TestVerifyHeapAllIndexed_RealProducers_DetectsMissingIndexEntry(t *testing.
 	defer cleanup()
 	heapSrc, nblocks := buildRealHeap(t)
 
-	idxLeaves, err := amcheck.CollectBtreeLeafEntries(idxSrc)
+	idxLeaves, err := amcheck.CollectBtreeLeafEntries(idxSrc, blobFmt)
 	if err != nil {
 		t.Fatalf("CollectBtreeLeafEntries: %v", err)
 	}

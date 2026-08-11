@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -12,10 +12,8 @@ import (
 // dateBTreeKey mirrors the encodeBTreeKeyForColumn date path: a date is stored
 // as int32 days since the PG epoch (2000-01-01) and encoded via the
 // order-preserving int4 key encoder.
-func dateBTreeKey(d time.Time) []byte {
-	micros := d.UTC().UnixMicro() - pgEpochUnixMicros
-	days := int32(micros / (24 * 3600 * 1000000))
-	return btree.EncodeInt4(days)
+func dateBTreeKey(t *testing.T, ctx *Context, idx *catalog.Index, d time.Time) []byte {
+	return indexProbeForTest(t, ctx, idx, NewTimeDatum(d))
 }
 
 // TestDDLCreateDateBTreeIndexAcceptsType pins the M0118-0001 acceptance
@@ -57,13 +55,13 @@ func TestDDLCreateDateBTreeIndexAcceptsType(t *testing.T) {
 		t.Fatal("index not in catalog after CREATE INDEX")
 	}
 	idxRel := ctx.Catalog.IndexRelFileNode(idx)
-	tree, err := btree.Open(ctx.Pool, idxRel)
+	tree, err := openIndexBTree(ctx, idx, idxRel)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	for _, d := range dates {
-		key := dateBTreeKey(d)
+		key := dateBTreeKey(t, ctx, idx, d)
 		_, found, err := tree.Search(key)
 		if err != nil || !found {
 			t.Fatalf("Search(%v): found=%v err=%v", d, found, err)
@@ -106,15 +104,15 @@ func TestDDLDateRangeScanParity(t *testing.T) {
 	}
 	idx, _ := ctx.Catalog.LookupIndex(parser.ObjectName{Name: "idx_eff_date"})
 	idxRel := ctx.Catalog.IndexRelFileNode(idx)
-	tree, err := btree.Open(ctx.Pool, idxRel)
+	tree, err := openIndexBTree(ctx, idx, idxRel)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	rangeStart := time.Date(2008, 1, 1, 0, 0, 0, 0, time.UTC)
 	rangeEnd := time.Date(2009, 5, 15, 0, 0, 0, 0, time.UTC)
-	lo := dateBTreeKey(rangeStart)
-	hi := dateBTreeKey(rangeEnd)
+	lo := dateBTreeKey(t, ctx, idx, rangeStart)
+	hi := dateBTreeKey(t, ctx, idx, rangeEnd)
 	indexCount := 0
 	if err := tree.RangeScan(lo, hi, func(_ []byte, _ storage.ItemPointer) (bool, error) {
 		indexCount++

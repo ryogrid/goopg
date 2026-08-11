@@ -61,9 +61,15 @@ func RunCopyTo(ctx *Context, plan *planner.Copy, emit func([]byte) error) (count
 		format = copyToFormatFromOptions(plan.Options)
 	}
 	dateStyle, dateOrder := "ISO", "MDY"
+	// timeZone feeds the timestamptz columns only (config.FormatTimestampTZ);
+	// "" means the boot default, UTC.
+	timeZone := ""
 	if ctx.GetSetting != nil {
 		if v, ok := ctx.GetSetting("datestyle"); ok {
 			dateStyle, dateOrder = config.ParseDateStyleValue(v)
+		}
+		if v, ok := ctx.GetSetting("timezone"); ok {
+			timeZone = v
 		}
 	}
 
@@ -112,9 +118,9 @@ func RunCopyTo(ctx *Context, plan *planner.Copy, emit func([]byte) error) (count
 		case binary:
 			buf, encErr = AppendCopyBinaryRow(buf, row, cols)
 		case format.csv:
-			buf, encErr = EncodeCopyCsvRow(buf, row, cols, format, dateStyle, dateOrder)
+			buf, encErr = EncodeCopyCsvRow(buf, row, cols, format, dateStyle, dateOrder, timeZone)
 		default:
-			buf, encErr = EncodeCopyTextRow(buf, row, cols, dateStyle, dateOrder)
+			buf, encErr = EncodeCopyTextRow(buf, row, cols, dateStyle, dateOrder, timeZone)
 		}
 		if encErr != nil {
 			return count, binary, encErr

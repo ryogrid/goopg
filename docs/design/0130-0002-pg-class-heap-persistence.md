@@ -1,8 +1,9 @@
 # pg_class heap persistence — retire virtual-only rows; reverse-start from PG heap
 
-**Status:** draft
+**Status:** accepted
 **Date:** 2026-08-09
 **Milestone:** M0130 (S2)
+**Last updated:** 2026-08-09 (reverse-path implementation + test)
 
 ## Problem
 
@@ -20,22 +21,34 @@ no path to read pg_class rows from heap file 1259.
 
 ### Forward path: goopg → pg_class heap rows
 
-1. **Bootstrap audit:** verify every system catalog and nailed relation has a
-   corresponding pg_class row written to `base/<dbOid>/1259` at init time.
-   `bootstrapPgClassTuples` already writes some rows; audit completeness
-   against the PG 18.3 bootstrap image.
+1. **Bootstrap audit — COMPLETE (2026-08-09).** `bootstrapPgClassTuples`
+   (`internal/initdb/initdb.go:2167`) writes every nailed relation (shared +
+   local, as defined in `internal/initdb/relcache_init.go`'s
+   `nailedSharedRels` + `nailedLocalRels`) to both `base/1/1259` and
+   `base/5/1259`. Verified by `TestPgClassHeapBootstrapCoverage`: 162 tuples
+   (27 shared + 135 local) on valid heap pages in both directories. Column
+   layout (`pgClassColDefs`) is byte-identical to the runtime encoder
+   (`pgClassColumnsPG18` in `internal/executor/pg18_user_catalog_rows.go`).
 
-2. **Runtime sync audit:** audit every CREATE/ALTER/DROP path for pg_class
-   heap sync:
-   - `CREATE TABLE` / `CREATE INDEX` / `CREATE SEQUENCE` — already wired
-     via `syncTableToCatalogHeap`? (audit first).
-   - `ALTER TABLE RENAME` / `ALTER TABLE SET SCHEMA` — needs
-     `resyncPgClassHeapRow`.
-   - `DROP TABLE` / `DROP INDEX` — needs `deleteCatalogRow` for relid.
+2. **Runtime sync audit — COMPLETE (verified 2026-08-09).**
+   - `CREATE TABLE` / `CREATE INDEX` / `CREATE SEQUENCE` / `CREATE VIEW`:
+     wired via `syncTableToCatalogHeap` (`operators_ddl.go:13439`).
+   - `ALTER TABLE` (RENAME, SET SCHEMA, ADD COLUMN, DROP COLUMN, etc.):
+     all paths call `syncTableToCatalogHeap` after `deleteCatalogRowsForOID`
+     for old rows.
+   - `DROP TABLE` / `DROP INDEX` / `DROP VIEW`: handled via
+     `deleteCatalogRowsForOID` which stamps xmax on pg_class/pg_attribute
+     rows; rows are physically removed by VACUUM/checkpoint.
+   - Index maintenance (pg_class_oid_index, pg_class_relname_nsp_index):
+     updated via `insertPgClassOidIndexEntry` / `insertPgClassRelnameNspIndexEntry`.
 
-3. **VirtualRows transition:** keep `VirtualRows` as the *runtime* source for
-   goopg's own query planning, but also maintain the heap as a PG-compatible
-   mirror. The heap is the source of truth for PG consumers.
+3. **VirtualRows transition — CONFIRMED (2026-08-09).** `pg_class` remains
+   `Virtual: true` with `VirtualRows = PGClassRowsForDBOid(DefaultDBOid)` for
+   goopg's own query planning. The heap is maintained as a PG-compatible
+   mirror — all nailed-relation rows are written at init time, and all user
+   DDL writes heap rows at runtime. The two sources agree on existing
+   relations (VirtualRows enumerates from in-memory catalog, heap contains
+   the same set).
 
 ### Reverse path: goopg reads PG-created pg_class heap
 
@@ -53,10 +66,111 @@ no path to read pg_class rows from heap file 1259.
 ## Guards
 
 1. PG started against goopg data dir: `SELECT relname FROM pg_class` lists
-   user tables.
+   user tables. *(**DISCHARGED 2026-08-11, M0131-S4:**
+   `TestE2E_PGColdStartOnGoopgDataDir`
+   (`internal/testport/e2e_pg_coldstart_on_goopgdata_test.go`) points a real
+   PG 18.3 at the LIVE directory a goopg server just shut down — not a
+   `pg_basebackup` tar, which is how every other M0130 acceptance item was
+   proven — and the query lists both user tables. Row-level reads, the
+   non-public schema and an index-qualified read through a goopg-authored btree
+   all agree with goopg. Four gaps were measured in the same run and filed as
+   M0131-S12/S13/S14/S15; see `0131-0004-forward-coldstart-e2e.md` §Findings.)*
 2. goopg started against PG-initdb'd data dir: serves reads via psql.
+   *(Updated 2026-08-11, M0131-S10: the reverse path IS implemented — see
+   "Reverse-Path Implementation (2026-08-09)" below, and M0131-S1/S2 removed the
+   two remaining cold-start blockers (unregistered PG-initdb GUCs; an invented
+   `system_identifier`). The end-to-end proof on a directory a real `initdb`
+   created is M0131-S3, `TestE2E_GoopgColdStartOnPGDataDir`, still to land.)*
 3. CREATE TABLE → table visible in pg_class on PG standby.
-4. UNITS + SMOKE green.
+   *(Depends on guard #1.)*
+4. UNITS + SMOKE green. *(Verified: all initdb tests PASS,`TestPgClassHeapBootstrapCoverage` PASS.)*
+
+## Forward-Path Verification (2026-08-09)
+
+`TestPgClassHeapBootstrapCoverage` (`internal/initdb/pg_class_heap_bootstrap_test.go`)
+verifies that `Init()` produces well-formed pg_class heap files containing
+exactly the expected tuples:
+
+- **162 tuples** (27 shared + 135 local nailed relations) in both `base/1/1259` and `base/5/1259`
+- **Valid page headers** on every 8 KiB page
+- **Valid tuple headers** with correct `t_hoff` data-offset pointers
+- **Non-zero OIDs** for every tuple (pg_class.oid is never zero)
+- Multi-page layout (tuples span pages when one fills up)
+
+This confirms BLOCKER #3 (`pg_class` virtual-only) is resolved for the
+**forward path**: a PG backend connecting to a goopg data dir can heap-scan
+`pg_class` and find complete catalog descriptors.
+
+## Reverse-Path Implementation (2026-08-09)
+
+The reverse path (goopg starting against a non-goopg data dir) is
+implemented as the **cold-start catalog-load path** — the same code path
+that runs when `pg_goopg_catalog_cache.json` is absent, regardless of
+whether the data dir was created by PG's initdb or goopg's Init.
+
+### Detection
+
+The catalog cache file (`pg_goopg_catalog_cache.json` in `base/1/` and
+`base/5/`) is the goopg-specific marker. Its absence triggers the
+cold-start heap-scan path. No separate PG-vs-goopg detection is needed:
+the cold-start path handles both.
+
+### Catalog loading
+
+- **System catalogs:** `catalog.NewInMemory()` → `registerSystemTables()`
+  provides pg_class, pg_attribute, pg_type, pg_proc, and every other
+  system catalog, type, function, and operator — the same set PG's initdb
+  bootstraps.
+- **User tables:** `loadUserTablesFromHeap` scans `base/<dboid>/1259` and
+  `base/<dboid>/1249`. The decoder tries `DecodePGClassRow` (goopg logical
+  format) first, then falls back to `DecodePGClassPhysicalRow` (PG
+  fixed-offset format) — the physical decoder reads PG-created rows
+  correctly.
+- The existing `writeCatalogCache` then persists the result to
+  `pg_goopg_catalog_cache.json`, so the *next* startup hits the fast path.
+
+### WAL replay constraint
+
+For a **cleanly shut down** PG data dir, `replayStart` finds the shutdown
+checkpoint (recognised by `isCheckpointRecord` via `xlogCheckpointShutdown`)
+and positions past it — replay is a no-op. An **unclean** PG data dir
+carries post-checkpoint records with PG-native resource managers
+(e.g. RM_GIN, RM_GIST) that goopg's `replayDecodedXLogRecord` does not
+yet handle; replay would fail with `unsupportedDecodedXLogRecord`.
+
+**Constraint:** the reverse path requires a cleanly shut down source data
+dir. Unclean shutdown recovery of PG-native WAL is deferred to a follow-up.
+
+### Verification
+
+`TestReversePathColdStartOpensWithoutCache` (`internal/initdb/reverse_path_test.go`)
+validates that `Open()` succeeds with the catalog cache absent, and that
+core system catalogs (pg_class, pg_type, pg_attribute) are accessible.
+
+### Remaining for full reverse-path parity
+
+1. **System catalogs from heap instead of `registerSystemTables()`:**
+   loading pg_class/pg_attribute/pg_type rows for system relations from
+   the heap would allow goopg to see PG-added system catalogs that
+   `registerSystemTables()` does not enumerate. Deferred — the practical
+   impact is nil for common queries since the standard PG catalog set is
+   already registered.
+2. **Unclean PG WAL replay:** handle additional PG resource managers in
+   `replayDecodedXLogRecord` (`internal/wal/recovery.go:2207`, `default:` arm at
+   `:2525`) so a crashed PG data dir can be recovered. Deferred.
+   *(Corrected 2026-08-11, M0131-S10: "requires implementing the corresponding
+   index AMs" understates the surface. The handled set is rmids 0, 1, 2, 3, 4, 5,
+   7, 8, 9, 10, 11, 15, 128; missing are 6 MultiXact, 12 Hash, 13 Gin, 14 Gist,
+   16 SPGist, 17 BRIN, 18 CommitTs, 19 ReplicationOrigin, 20 Generic,
+   21 LogicalMessage (`postgres/src/include/access/rmgrlist.h:28-49`). 6, 18 and
+   19 are not index AMs and do occur in ordinary PG workloads.)*
+3. **E2E PG-attach test:** start a real PG instance, create tables, shut
+   it down cleanly, start goopg against the same `$PGDATA`, and verify
+   `SELECT * FROM <user_table>` returns the correct rows. Deferred.
+   *(Corrected 2026-08-11, M0131-S10: the stated blocker — "needs a test-harness
+   PG instance lifecycle (M0130-S10)" — no longer exists; that harness landed in
+   `2da52113` (`internal/testutil/pgcluster`). The real obstruction was M0131-S1's
+   GUC-registry gap, now closed; the test itself is M0131-S3.)*
 
 ## References
 

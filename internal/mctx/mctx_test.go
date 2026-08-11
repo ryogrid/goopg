@@ -123,6 +123,71 @@ func TestOversizedAlloc(t *testing.T) {
 	}
 }
 
+// TestOversizedChunkNeverEntersSizePool guards the invariant the (offset,
+// length) encoding rests on: every chunk in a size pool has cap exactly ==
+// that pool's size class. offset is chunkIdx*c.cs + offsetWithinChunk, so a
+// recycled chunk with cap > c.cs lets an allocation land at an in-chunk
+// offset >= c.cs, which aliases to chunkIdx+1 and makes Bytes() resolve into
+// a different (often nonexistent) chunk. growChunk allocates such oversized
+// chunks by design (make([]byte, 0, n) for n > cs) and Release hands every
+// chunk to putChunk keyed by c.cs, so the leak needs an explicit guard.
+// Regression gate for the load-sensitive internal/mctx race-gate failure
+// (AI-20260810-011258, `TestMultipleChunks: second chunk: got ""`).
+func TestOversizedChunkNeverEntersSizePool(t *testing.T) {
+	putChunk(defaultChunkSize, make([]byte, 0, defaultChunkSize+100))
+	putChunk(smallChunkSize, make([]byte, 0, smallChunkSize+100))
+	for _, cs := range []uint32{defaultChunkSize, smallChunkSize} {
+		for i := 0; i < 64; i++ {
+			if got := cap(getChunk(cs)); got != int(cs) {
+				t.Fatalf("getChunk(%d) returned cap %d: an oversized chunk leaked into the size pool", cs, got)
+			}
+		}
+	}
+}
+
+// TestAllocBytesRoundTripAcrossChunks poisons the size pool the way a released
+// context holding an oversized chunk used to, then checks every allocation
+// still resolves to its own bytes across several chunk boundaries. Before the
+// putChunk cap guard this failed with Bytes() returning nil for the first
+// allocation whose in-chunk offset reached c.cs.
+func TestAllocBytesRoundTripAcrossChunks(t *testing.T) {
+	putChunk(defaultChunkSize, make([]byte, 0, defaultChunkSize+4096))
+
+	c := Acquire(nil, KindStmt)
+	defer c.Release()
+
+	const blk = 1024
+	nBlocks := 4 * defaultChunkSize / blk
+	offs := make([]uint32, nBlocks)
+	lens := make([]uint32, nBlocks)
+	for i := 0; i < nBlocks; i++ {
+		payload := make([]byte, blk)
+		for j := range payload {
+			payload[j] = byte(i + j)
+		}
+		offs[i], lens[i] = c.AllocBytes(payload)
+		// Read back immediately: a stale read here is an aliasing bug, not a
+		// lifetime bug.
+		got := c.Bytes(offs[i], lens[i])
+		if len(got) != blk {
+			t.Fatalf("block %d: Bytes returned %d bytes, want %d (offset %d aliased outside its chunk)", i, len(got), blk, offs[i])
+		}
+		for j := range got {
+			if got[j] != byte(i+j) {
+				t.Fatalf("block %d byte %d: got %d, want %d", i, j, got[j], byte(i+j))
+			}
+		}
+	}
+	// And again after all allocation, so a late growChunk that memmoves the
+	// chunk tail cannot invalidate an earlier offset.
+	for i := 0; i < nBlocks; i++ {
+		got := c.Bytes(offs[i], lens[i])
+		if len(got) != blk || got[0] != byte(i) {
+			t.Fatalf("block %d re-read: got %d bytes, first byte %v", i, len(got), got)
+		}
+	}
+}
+
 func TestMultipleChunks(t *testing.T) {
 	c := Acquire(nil, KindStmt)
 	defer c.Release()

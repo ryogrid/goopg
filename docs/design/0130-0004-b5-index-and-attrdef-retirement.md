@@ -1,6 +1,6 @@
 # B5 groups A+B — index/attrdef native WAL kinds verification (landed 2026-07-18)
 
-**Status:** draft
+**Status:** accepted
 **Date:** 2026-08-09
 **Milestone:** M0130 (S4 — verification)
 
@@ -45,11 +45,22 @@ the retirement is complete and adds regression gates.
 
 ## Gates
 
-1. grep-audit clean.
-2. UNITS + wal suite green.
-3. `WALPgWaldumpCompat` — records parsed.
-4. SurvivesRestart: defaults survive restart.
-5. Standby E2E: index DDL replays on PG standby.
+1. grep-audit clean. ✅ Verified 2026-08-09: zero emit sites; all references are
+   in comments documenting the retirement.
+2. UNITS + wal suite green. ✅ PASS (all 3 new regression tests + existing suite).
+3. `WALPgWaldumpCompat` — records parsed. ✅ PASS (unchanged by this task).
+4. SurvivesRestart: defaults survive restart. ✅ Existing coverage in
+   `internal/initdb/index_ddl_recovery_test.go` + `internal/initdb/ddl_catalog_sync_test.go`.
+5. Standby E2E: index DDL replays on PG standby. ✅
+   `TestE2E_FailoverGoopgToPG` covers CREATE/ALTER INDEX post-failover.
+6. Regression gates (added 2026-08-09):
+   - `TestActiveRecordKindValuesNotRetiredB5IndexAttrdef` — enumerates every
+     active RecordKind constant; fails if any uses retired byte values 20, 21,
+     69, or 94.
+   - `TestNativeApplyRecordKindKnownRejectsRetiredB5IndexAttrdef` — confirms
+     `nativeApplyRecordKindKnown` returns false for retired kind bytes, so legacy
+     WAL records route to the PG-xlog path (FATAL on real PG standby) rather than
+     being silently dropped.
 
 ## References
 

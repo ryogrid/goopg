@@ -293,7 +293,23 @@ func (c *Cluster) Start() error {
 func (c *Cluster) Stop() error {
 	if c.postgresCmd != nil && c.postgresCmd.Process != nil {
 		_ = c.postgresCmd.Process.Signal(os.Interrupt)
-		_ = c.postgresCmd.Wait()
+		// Bounded wait, then SIGKILL. A fast shutdown normally completes in
+		// well under a second, but a postmaster that has entered crash
+		// recovery after a backend SIGSEGV can sit in PM_RECOVERY and never
+		// act on the SIGINT — M0131-S4 hit exactly that and hung the whole
+		// `go test` for its 20-minute timeout instead of reporting the crash
+		// that caused it. A stuck teardown must never outlive the finding.
+		done := make(chan struct{})
+		go func() {
+			_ = c.postgresCmd.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(20 * time.Second):
+			_ = c.postgresCmd.Process.Kill()
+			<-done
+		}
 		c.postgresCmd = nil
 	}
 	if c.logFile != nil {
@@ -385,6 +401,22 @@ func (c *Cluster) QueryScalar(t *testing.T, sqlText string) string {
 		t.Fatalf("pgcluster: psql query %q: %v\n%s", sqlText, err, out)
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// PSQLCombined runs psql with the standard connection flags plus the caller's
+// args and returns combined stdout+stderr WITHOUT failing the test. Use it when
+// the error text is itself the measurement — M0131-S4 has to tell an XX002
+// corrupted-page error (a regression signal) apart from an ordinary wrong-row
+// mismatch, which QueryScalar's t.Fatalf would collapse into one outcome.
+func (c *Cluster) PSQLCombined(args ...string) (string, error) {
+	full := append([]string{
+		"-h", c.Host(), "-p", fmt.Sprintf("%d", c.Port()),
+		"-U", c.user, "-d", c.database,
+	}, args...)
+	cmd := exec.Command(filepath.Join(c.bin, "psql"), full...)
+	cmd.Env = c.env()
+	out, err := cmd.CombinedOutput()
+	return string(out), err
 }
 
 // Pgbench runs the upstream pgbench binary against this cluster and

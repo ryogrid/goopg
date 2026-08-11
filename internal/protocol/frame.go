@@ -160,6 +160,19 @@ type FrameWriter struct {
 	OnBeforeWrite func()
 	OnAfterWrite  func()
 
+	// TxStatusFn, when non-nil, supplies the 1-byte transaction status that
+	// ReadyForQuery / ReadyForQueryAfterError put in the 'Z' message: 'I'
+	// (idle), 'T' (in a transaction block) or 'E' (in a FAILED transaction
+	// block). The server installs it from serveConn so the byte tracks the
+	// connection's connTxState. afterError is true when the 'Z' terminates an
+	// ErrorResponse — see ReadyForQueryAfterError.
+	//
+	// Clients act on this byte: libpq exposes it as PQtransactionStatus, and
+	// pgbench uses it to decide whether a failed transaction still needs a
+	// ROLLBACK. A connection that always answered 'I' made pgbench skip that
+	// ROLLBACK and then hit 25P02 on the next BEGIN (AI-20260810-011258-006).
+	TxStatusFn func(afterError bool) TransactionStatus
+
 	// M0092-0004: per-connection scratch buffers for WriteDataRowReuse.
 	// Reused across rows AND across statements on the same connection
 	// (pgbench-style workloads issue many single-row SELECTs in a row).

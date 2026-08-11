@@ -329,6 +329,37 @@ func formatIOTimingsLine(s *nodeStats) string {
 	return "I/O Timings: shared " + strings.Join(parts, " ")
 }
 
+// formatWalLine renders the upstream "WAL: records=N bytes=K" text
+// (show_wal_usage in postgres/src/backend/commands/explain.c),
+// omitting the whole line when both counters are zero and each individual
+// records=/bytes= term when that counter is zero. M0122-0003.
+func formatWalLine(s *nodeStats) string {
+	if s.walRecords == 0 && s.walBytes == 0 {
+		return ""
+	}
+	parts := make([]string, 0, 2)
+	if s.walRecords > 0 {
+		parts = append(parts, fmt.Sprintf("records=%d", s.walRecords))
+	}
+	if s.walBytes > 0 {
+		parts = append(parts, fmt.Sprintf("bytes=%d", s.walBytes))
+	}
+	return "WAL: " + strings.Join(parts, " ")
+}
+
+// formatMemoryLine renders the upstream "Memory: used=NkB  allocated=NkB"
+// text (show_memory_counters in postgres/src/backend/commands/explain.c),
+// omitting the whole line when memAllocated is zero. M0122-0003.
+func formatMemoryLine(s *nodeStats) string {
+	if s.memAllocated == 0 && s.memPeak == 0 {
+		return ""
+	}
+	// used = peak bytes (the most in-use at any point), allocated = total ever allocated
+	usedKB := s.memPeak / 1024
+	allocatedKB := s.memAllocated / 1024
+	return fmt.Sprintf("Memory: used=%dkB  allocated=%dkB", usedKB, allocatedKB)
+}
+
 func (o *explainOp) Next() (TupleSlot, error) {
 	if o.idx >= len(o.rows) {
 		return nil, EOF
@@ -1297,6 +1328,26 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 		}
 	}
 
+	// EXPLAIN (ANALYZE, WAL) emits a "WAL: records=N bytes=K"
+	// detail line per node (M0122-0003).
+	if opts.Wal {
+		if s, ok := stats[n]; ok && s != nil {
+			if line := formatWalLine(s); line != "" {
+				*rows = append(*rows, Row{NewStringDatum(detailIndent + line)})
+			}
+		}
+	}
+
+	// EXPLAIN (ANALYZE, MEMORY) emits a "Memory: used=NkB  allocated=NkB"
+	// detail line per node (M0122-0003).
+	if opts.Memory {
+		if s, ok := stats[n]; ok && s != nil {
+			if line := formatMemoryLine(s); line != "" {
+				*rows = append(*rows, Row{NewStringDatum(detailIndent + line)})
+			}
+		}
+	}
+
 	if opts.Verbose {
 		if cols := schemaColumnNames(n); len(cols) > 0 {
 			outline := indent + "  Output: " + strings.Join(cols, ", ")
@@ -1400,6 +1451,14 @@ func planToJSONWithStats(n planner.Node, opts parser.ExplainOptions, stats nodeS
 				obj["Temp I/O Read Time"] = float64(0)
 				obj["Temp I/O Write Time"] = float64(0)
 			}
+		}
+		// EXPLAIN (ANALYZE, MEMORY): per-node memory counters
+		// in kB, matching PG's show_memory_counters JSON output.
+		// Outside the opts.Buffers block — memory is independent
+		// of buffer tracking. M0122-0003.
+		if opts.Memory {
+			obj["Memory Used"] = s.memPeak / 1024
+			obj["Memory Allocated"] = s.memAllocated / 1024
 		}
 	}
 	// Re-render Plans recursively with stats, replacing the

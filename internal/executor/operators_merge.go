@@ -894,14 +894,15 @@ func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 	if oldGerr == nil {
 		oldTupleBytes, _ = oldTup.MarshalBinary()
 	}
-	// For cross-partition moves: use PageSetHeapTupleMovedPartition which sets
-	// BOTH xmax AND the sentinel CTID {InvalidBlockNumber, MovedPartitionsOffsetNumber}
+	// For cross-partition moves: use stampMovedPartitionOldTuple, which sets
+	// xmax, the sentinel CTID {InvalidBlockNumber, MovedPartitionsOffsetNumber}
 	// so that concurrent EPQ callers can detect the partition move via
-	// epqSlotMovedToAnotherPartition. For same-partition updates: use the standard
-	// PageSetHeapTupleXmax + stampOldCtid chain. M0100-0007.
+	// epqSlotMovedToAnotherPartition, and cmax so this transaction's own later
+	// scans stop seeing the moved-away row. For same-partition updates: use the
+	// standard PageSetHeapTupleXmax + stampOldCtid chain. M0100-0007.
 	crossPart := destRel != rel
 	if crossPart {
-		if err := storage.PageSetHeapTupleMovedPartition(s.Page(), slot, effectiveWriterXID(ctx)); err != nil {
+		if err := stampMovedPartitionOldTuple(ctx, s.Page(), slot); err != nil {
 			s.Unlock()
 			ctx.Pool.Unpin(s)
 			return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}

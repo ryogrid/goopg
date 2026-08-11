@@ -16,6 +16,7 @@ import (
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/lockwait"
+	"github.com/goopg/goopg/internal/mb"
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
@@ -176,7 +177,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 			if err := w.WriteCommandComplete(tag); err != nil {
 				return err
 			}
-			return w.WriteReadyForQuery(protocol.TxStatusIdle)
+			return w.ReadyForQuery()
 		}
 		if first, rest, tag, ok := splitLeadingCompatNoopDDL(sql); ok {
 			if tag == "CREATE SCHEMA" {
@@ -205,7 +206,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 				if err := w.WriteCommandComplete(tag); err != nil {
 					return err
 				}
-				return w.WriteReadyForQuery(protocol.TxStatusIdle)
+				return w.ReadyForQuery()
 			}
 		}
 		msg, extra := syntaxErrorMsg(err)
@@ -215,7 +216,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		if err := w.WriteEmptyQueryResponse(); err != nil {
 			return err
 		}
-		return w.WriteReadyForQuery(protocol.TxStatusIdle)
+		return w.ReadyForQuery()
 	}
 	// Session-level explicit transaction support (M0096-0005):
 	// When the client has issued BEGIN, reuse the open TxnMgr transaction
@@ -527,6 +528,11 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		s.removeRoleCredential(name)
 	}
 	ectx.Promote = s.cfg.Promote
+	// Same registry the walsender's CREATE_REPLICATION_SLOT /
+	// DROP_REPLICATION_SLOT commands mutate, so the SQL functions and the
+	// wire commands see one shared slot set (sibling-path rule).
+	// M-NIGHTLY AI-20260810-011258-003.
+	ectx.ReplSlots = s.cfg.Slots
 	if s.cfg.IsStandby != nil {
 		ectx.IsStandby = s.cfg.IsStandby()
 	}
@@ -1095,7 +1101,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 	if err := s.deliverNotifications(w, connTx); err != nil {
 		return err
 	}
-	return w.WriteReadyForQuery(protocol.TxStatusIdle)
+	return w.ReadyForQuery()
 }
 
 // sessionStatsTarget reads the effective `default_statistics_target`
@@ -2354,6 +2360,25 @@ func (s *Server) wireExtensionRows(ectx *executor.Context, dbName string) {
 			return ptc.PGTSConfigRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
 		}
 	}
+	// pg_publication must likewise reflect the connecting database's own
+	// CREATE PUBLICATION'd publications, not always DefaultDBOid's.
+	// Mirrors the pg_ts_config wiring above. PubSub is separate from
+	// catalog.InMemory, so we wire it directly through s.cfg.PubSub.
+	// M0119-0004 (DU-002 per-DB publication scoping).
+	if s.cfg.PubSub != nil {
+		ectx.PgPublicationRows = func() [][]string {
+			return publicationRowsForDBOid(s.cfg.PubSub, catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
+	// pg_subscription must likewise reflect the connecting database's own
+	// CREATE SUBSCRIPTION'd subscriptions, not always DefaultDBOid's.
+	// Mirrors the pg_publication wiring above. M0119-0004 (DU-002 per-DB
+	// subscription scoping).
+	if s.cfg.PubSub != nil {
+		ectx.PgSubscriptionRows = func() [][]string {
+			return subscriptionRowsForDBOid(s.cfg.PubSub, catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
 }
 
 // pgClassRowLister is implemented by catalog.InMemory to expose a
@@ -2481,6 +2506,91 @@ type pgTSDictRowLister interface {
 // M0122-0007 4e follow-up (DU-002 round-trip probe unblock).
 type pgTSConfigRowLister interface {
 	PGTSConfigRowsForDBOid(dbOid uint32) [][]string
+}
+
+// publicationRowsForDBOid builds the pg_publication VirtualRows for dbOid
+// from the PubSub registry, matching the wireExtensionRows convention of
+// filtering catalog views to the connecting database. M0119-0004 (DU-002
+// per-DB publication scoping).
+func publicationRowsForDBOid(ps *catalog.PubSub, dbOid uint32) [][]string {
+	pubs := ps.PublicationsForDBOid(dbOid)
+	if len(pubs) == 0 {
+		return nil
+	}
+	out := make([][]string, 0, len(pubs))
+	for _, pub := range pubs {
+		out = append(out, []string{
+			fmt.Sprintf("%d", pub.OID),
+			pub.Name,
+			fmt.Sprintf("%d", pub.Owner),
+			boolToText(pub.AllTables),
+			boolToText(pub.PublishInsert),
+			boolToText(pub.PublishUpdate),
+			boolToText(pub.PublishDelete),
+			"f", // pubtruncate
+			"f", // pubviaroot
+			"n", // pubgencols
+		})
+	}
+	return out
+}
+
+// subscriptionRowsForDBOid builds the pg_subscription VirtualRows for dbOid
+// from the PubSub registry, matching the publicationRowsForDBOid convention.
+// M0119-0004 (DU-002 per-DB subscription scoping).
+func subscriptionRowsForDBOid(ps *catalog.PubSub, dbOid uint32) [][]string {
+	subs := ps.SubscriptionsForDBOid(dbOid)
+	if len(subs) == 0 {
+		return nil
+	}
+	out := make([][]string, 0, len(subs))
+	for _, sub := range subs {
+		out = append(out, []string{
+			fmt.Sprintf("%d", sub.OID),
+			fmt.Sprintf("%d", catalog.FirstUserOID), // subdbid — matches pg_database.oid
+			sub.Name,
+			fmt.Sprintf("%d", sub.Owner), // subowner
+			boolToText(sub.Enabled),
+			"f",   // subbinary
+			"f",   // substream
+			"d",   // subtwophasestate disabled
+			"f",   // subdisableonerr
+			"t",   // subpasswordrequired (upstream default)
+			"f",   // subrunasowner (upstream default)
+			"any", // suborigin (LOGICALREP_ORIGIN_ANY upstream default)
+			"f",   // subfailover (upstream default)
+			sub.Conninfo,
+			sub.SlotName,
+			"local", // subsynccommit
+			formatStringList(sub.Publications),
+		})
+	}
+	return out
+}
+
+// boolToText converts a bool to "t"/"f" for pg_catalog VirtualRows
+// (mirrors replicate_views.go:boolText). M0119-0004.
+func boolToText(b bool) string {
+	if b {
+		return "t"
+	}
+	return "f"
+}
+
+// formatStringList formats a []string as a PG text-array literal
+// (mirrors initdb/replication_views.go:formatStringList). M0119-0004.
+func formatStringList(xs []string) string {
+	if len(xs) == 0 {
+		return "{}"
+	}
+	out := "{"
+	for i, x := range xs {
+		if i > 0 {
+			out += ","
+		}
+		out += x
+	}
+	return out + "}"
 }
 
 func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog, dbOid uint32) {
@@ -2952,6 +3062,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				}
 				cells = append(cells, valueBuf[start:len(valueBuf)])
 			}
+			cells = s.maybeConvertCellsForClientEncoding(cells, ctx.GetSetting)
 			if err := w.PutDataRowScratch(cells, valueBuf); err != nil {
 				_ = op.Close()
 				return err
@@ -3250,14 +3361,11 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 			return append(dst, config.FormatDate(d.TimeValue(), style, order)...)
 		}
 		return d.AppendValueText(dst)
-	case "timestamp", "timestamptz":
+	case "timestamp":
 		// Timestamp columns render per the session's DateStyle GUC (style x
 		// order), matching PostgreSQL's EncodeDateTime with print_tz=false.
-		// Previously hardcoded ISO regardless of `SET datestyle`. No
-		// session-timezone-aware conversion/offset for timestamptz yet
-		// (separate deferred gap — matches this column's pre-existing
-		// behavior, unchanged by this fix). M-NIGHTLY (run 20260714-011651)
-		// DateStyle output-rendering follow-up.
+		// Previously hardcoded ISO regardless of `SET datestyle`. M-NIGHTLY
+		// (run 20260714-011651) DateStyle output-rendering follow-up.
 		if d.Kind == executor.KindTime {
 			style, order := "ISO", "MDY"
 			if getSetting != nil {
@@ -3266,6 +3374,27 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 				}
 			}
 			return append(dst, config.FormatTimestamp(d.TimeValue(), style, order)...)
+		}
+		return d.AppendValueText(dst)
+	case "timestamptz":
+		// timestamptz_out: convert the stored (UTC) instant into the session's
+		// TimeZone GUC and print the zone, which plain `timestamp` above does
+		// not. Split off from the shared "timestamp" case in M0119-0006 —
+		// before that, goopg printed a timestamptz with no zone at all and
+		// never left UTC, so under `SET TimeZone` the text READ as a different
+		// instant than the one stored.
+		if d.Kind == executor.KindTime {
+			style, order := "ISO", "MDY"
+			zone := ""
+			if getSetting != nil {
+				if v, ok := getSetting("datestyle"); ok {
+					style, order = config.ParseDateStyleValue(v)
+				}
+				if v, ok := getSetting("timezone"); ok {
+					zone = v
+				}
+			}
+			return append(dst, config.FormatTimestampTZ(d.TimeValue(), style, order, zone)...)
 		}
 		return d.AppendValueText(dst)
 	case "time":
@@ -3362,6 +3491,46 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 	default:
 		return d.AppendValueText(dst)
 	}
+}
+
+// maybeConvertCellsForClientEncoding transcodes each non-nil DataRow cell from
+// server encoding (UTF8) to client_encoding when the two differ. The conversion
+// uses mb.BuiltinLookup (the 128 bootstrap pg_conversion rows); user-created
+// CREATE CONVERSION entries are not yet consulted. A conversion failure falls
+// back to the raw server-encoding bytes (noError semantics — a malformed
+// character in one cell should not break the whole result set).
+// M0122-0008: encoding conversion first slice (LATIN1 ↔ UTF8).
+func (s *Server) maybeConvertCellsForClientEncoding(cells [][]byte, getSetting func(string) (string, bool)) [][]byte {
+	encName, ok := getSetting("client_encoding")
+	if !ok || encName == "" {
+		return cells
+	}
+	encName = strings.ToUpper(encName)
+	if encName == "UTF8" || encName == "UNICODE" {
+		return cells
+	}
+	// Resolve encoding name to PG encoding ID via the catalog table.
+	// catalog.EncodingNameToID returns -1 for unknown names.
+	clientEnc := catalog.EncodingNameToID(encName)
+	if clientEnc < 0 {
+		return cells
+	}
+	// SQL_ASCII means no conversion.
+	if clientEnc == 0 {
+		return cells
+	}
+	for i, cell := range cells {
+		if cell == nil {
+			continue
+		}
+		converted, err := mb.DoEncodingConversion(cell, mb.PG_UTF8, clientEnc, mb.BuiltinLookup)
+		if err != nil {
+			// Fall back to raw bytes on conversion failure (noError).
+			continue
+		}
+		cells[i] = converted
+	}
+	return cells
 }
 
 // appendFloat8Text formats a datum for wire output as a float8/float4 value.
@@ -3687,6 +3856,7 @@ func (s *Server) executeFetch(_ context.Context, w *protocol.FrameWriter, ectx *
 				valueBuf = d.AppendValueText(valueBuf)
 				cells = append(cells, valueBuf[start:len(valueBuf)])
 			}
+			cells = s.maybeConvertCellsForClientEncoding(cells, ectx.GetSetting)
 			if err := w.PutDataRowScratch(cells, valueBuf); err != nil {
 				return err
 			}

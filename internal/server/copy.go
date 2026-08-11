@@ -189,6 +189,22 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameW
 	ectx.Snap = snap
 	asyncCommit := sessionAsyncCommit(sess)
 	ectx.AsyncCommit = asyncCommit
+	// A standalone `COPY ... TO STDOUT` built its executor context by hand and
+	// never attached the session GUC hooks, so it was the one COPY path that
+	// could not see `SET datestyle` / `SET timezone` — RunCopyTo's lookups all
+	// fell back to the boot defaults and output rendering silently ignored the
+	// session. The INLINE COPY path (runInlineCopy) has always had them, since
+	// it borrows the batch's ectx; this brings the two into line. M0119-0006.
+	if sess != nil {
+		ectx.GetSetting = func(name string) (string, bool) {
+			_, eff, ok := sess.Get(name)
+			return eff, ok
+		}
+		ectx.GetSettingDisplay = func(name string) (string, bool) {
+			_, eff, ok := sess.GetDisplay(name)
+			return eff, ok
+		}
+	}
 
 	switch plan.Direction {
 	case planner.CopyTo:
@@ -213,7 +229,7 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameW
 		if err := w.WriteCommandComplete(fmt.Sprintf("COPY %d", count)); err != nil {
 			return nil, err
 		}
-		if err := w.WriteReadyForQuery(protocol.TxStatusIdle); err != nil {
+		if err := w.ReadyForQuery(); err != nil {
 			return nil, err
 		}
 		return nil, nil
@@ -232,7 +248,7 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameW
 			if err := w.WriteCommandComplete(fmt.Sprintf("COPY %d", count)); err != nil {
 				return nil, err
 			}
-			if err := w.WriteReadyForQuery(protocol.TxStatusIdle); err != nil {
+			if err := w.ReadyForQuery(); err != nil {
 				return nil, err
 			}
 			return nil, nil
@@ -491,7 +507,7 @@ func (s *Server) handleCopyToStdoutQuery(w *protocol.FrameWriter, matchable stri
 	if err := w.WriteCommandComplete("COPY 1"); err != nil {
 		return nil, err
 	}
-	if err := w.WriteReadyForQuery(protocol.TxStatusIdle); err != nil {
+	if err := w.ReadyForQuery(); err != nil {
 		return nil, err
 	}
 	return nil, nil
@@ -515,7 +531,7 @@ func (s *Server) handleCopyInFrame(w *protocol.FrameWriter, st *copyInState, f p
 						return true, cerr
 					}
 					maybeForceGCAfterCommit()
-					if cerr := w.WriteReadyForQuery(protocol.TxStatusIdle); cerr != nil {
+					if cerr := w.ReadyForQuery(); cerr != nil {
 						return true, cerr
 					}
 					return true, nil
@@ -538,7 +554,7 @@ func (s *Server) handleCopyInFrame(w *protocol.FrameWriter, st *copyInState, f p
 				}); werr != nil {
 					return true, werr
 				}
-				if werr := w.WriteReadyForQuery(protocol.TxStatusIdle); werr != nil {
+				if werr := w.ReadyForQueryAfterError(); werr != nil {
 					return true, werr
 				}
 				return true, nil
@@ -565,7 +581,7 @@ func (s *Server) handleCopyInFrame(w *protocol.FrameWriter, st *copyInState, f p
 					}); werr != nil {
 						return true, werr
 					}
-					if werr := w.WriteReadyForQuery(protocol.TxStatusIdle); werr != nil {
+					if werr := w.ReadyForQueryAfterError(); werr != nil {
 						return true, werr
 					}
 					return true, nil
@@ -580,7 +596,7 @@ func (s *Server) handleCopyInFrame(w *protocol.FrameWriter, st *copyInState, f p
 				return true, err
 			}
 			maybeForceGCAfterCommit()
-			if err := w.WriteReadyForQuery(protocol.TxStatusIdle); err != nil {
+			if err := w.ReadyForQuery(); err != nil {
 				return true, err
 			}
 			return true, nil
@@ -592,7 +608,7 @@ func (s *Server) handleCopyInFrame(w *protocol.FrameWriter, st *copyInState, f p
 		if err := w.WriteCommandComplete(fmt.Sprintf("COPY %d", st.rows)); err != nil {
 			return true, err
 		}
-		if err := w.WriteReadyForQuery(protocol.TxStatusIdle); err != nil {
+		if err := w.ReadyForQuery(); err != nil {
 			return true, err
 		}
 		return true, nil
@@ -613,7 +629,7 @@ func (s *Server) handleCopyInFrame(w *protocol.FrameWriter, st *copyInState, f p
 		}); err != nil {
 			return true, err
 		}
-		if err := w.WriteReadyForQuery(protocol.TxStatusIdle); err != nil {
+		if err := w.ReadyForQueryAfterError(); err != nil {
 			return true, err
 		}
 		return true, nil
@@ -637,7 +653,7 @@ func (s *Server) handleCopyInFrame(w *protocol.FrameWriter, st *copyInState, f p
 		}); err != nil {
 			return true, err
 		}
-		if err := w.WriteReadyForQuery(protocol.TxStatusIdle); err != nil {
+		if err := w.ReadyForQueryAfterError(); err != nil {
 			return true, err
 		}
 		return true, nil

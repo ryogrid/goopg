@@ -2,6 +2,7 @@ package executor
 
 import (
 	"fmt"
+	"math/big"
 	"strconv"
 	"strings"
 	"time"
@@ -107,7 +108,7 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 	}
 
 	idxRel := ctx.Catalog.IndexRelFileNode(o.plan.Index)
-	tree, err := btree.Open(ctx.Pool, idxRel)
+	tree, err := openIndexBTree(ctx, o.plan.Index, idxRel)
 	if err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
@@ -140,7 +141,7 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 		loBytes = key
 		hiBytes = key
 		if len(o.plan.Index.Columns) > 1 {
-			hiBytes = appendCompositeUpperPadding(key)
+			hiBytes = o.ctx.compositeUpperBound(o.plan.Index, key)
 		}
 	default:
 		lo, hi, ok, err := o.lookupRangeBounds()
@@ -153,7 +154,7 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 		loBytes = lo
 		hiBytes = hi
 		if len(o.plan.Index.Columns) > 1 && hiBytes != nil {
-			hiBytes = appendCompositeUpperPadding(hiBytes)
+			hiBytes = o.ctx.compositeUpperBound(o.plan.Index, hiBytes)
 		}
 	}
 
@@ -165,9 +166,18 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 		ssiRecordHashBucketRead(ctx, heapRel.DBOid, o.plan.Index.OID, loBytes)
 	}
 
+	// Some key encodings cannot be inverted (interval's key is the lossy
+	// comparison span — btree_interval_key.go), so the decode-from-key fast
+	// path below has nothing to decode. Reading the heap instead is always
+	// correct, just slower — and it is what the ALL_VISIBLE flag is an
+	// optimization over — whereas letting decodeRowFromKey error would fail the
+	// whole query. Decided once per scan: it is a property of the index's
+	// column types, not of the row.
+	keyDecodable := o.indexKeyIsDecodable()
+
 	scanFn := func(key []byte, ptr storage.ItemPointer) (bool, error) {
 		// Fast path: ALL_VISIBLE → decode from key, zero heap reads.
-		if ctx.VM != nil && ctx.VM.AllVisible(heapRel, ptr.Block) {
+		if keyDecodable && ctx.VM != nil && ctx.VM.AllVisible(heapRel, ptr.Block) {
 			row, err := o.decodeRowFromKey(key)
 			if err != nil {
 				return false, &ExecError{Code: "XX000", Pos: o.plan.Pos(),
@@ -345,8 +355,57 @@ func (o *indexOnlyScanOp) Close() error {
 	return nil
 }
 
+// indexKeyIsDecodable reports whether decodeRowFromKey can invert this index's
+// key. False for an index any of whose key columns has a deliberately
+// non-invertible encoding — `interval`, whose key is upstream's
+// interval_cmp_value span (btree_interval_key.go), and any ARRAY whose element
+// type the key layer cannot render back (btree_key_decodable.go, which owns the
+// whole answer). The whole index is declined rather than the single column
+// because the composite walk decodes columns in order and cannot skip one whose
+// byte width it does not know.
+//
+// Not consulted on the pgIndexKeyDesc (PG tuple-image) path: there the key
+// carries per-attribute datums, so nothing is lost — but such an index does not
+// take the fast path through this predicate either, since decodeRowFromKey
+// routes on the descriptor first.
+func (o *indexOnlyScanOp) indexKeyIsDecodable() bool {
+	if o.plan.Index == nil || o.ctx == nil || o.ctx.Catalog == nil {
+		return true
+	}
+	for _, colName := range o.plan.Index.Columns {
+		col, ok := o.ctx.Catalog.LookupColumn(o.plan.Table, colName)
+		if !ok {
+			continue // the decode path reports this one itself
+		}
+		if !indexKeyColumnIsDecodable(*col) {
+			return false
+		}
+	}
+	return true
+}
+
 // decodeRowFromKey extracts covered column values from a B-tree key.
 func (o *indexOnlyScanOp) decodeRowFromKey(key []byte) (Row, error) {
+	// Tuple format (M0130-S11.4 slice 3b-2c-ii-B2-c, the flip): the key is one
+	// IndexTuple image, not a concatenation of order-preserving segments, so
+	// neither the single-column fast lane nor the running-offset loop below can
+	// read it — they would consume a type's width out of a null bitmap and an
+	// alignment hole. `pgIndexTupleKeyDatums` is the inverse of the encoder that
+	// wrote it; the projection onto Covered is shared with the blob path, since
+	// only the DECODE differs between the two formats, never which columns the
+	// scan is answering from.
+	if desc := o.ctx.pgIndexKeyDesc(o.plan.Index); desc != nil {
+		keyCols := pgIndexKeyColumns(o.plan.Index)
+		vals, err := pgIndexTupleKeyDatums(desc, keyCols, key)
+		if err != nil {
+			return nil, err
+		}
+		decoded := make(map[string]Datum, len(keyCols))
+		for i, col := range keyCols {
+			decoded[col.Name] = vals[i]
+		}
+		return o.projectCovered(decoded)
+	}
 	if len(o.plan.Index.Columns) == 1 && len(o.plan.Covered) == 1 {
 		d, err := decodeBTreeKeyToDatum(key, o.plan.Covered[0])
 		if err != nil {
@@ -369,6 +428,12 @@ func (o *indexOnlyScanOp) decodeRowFromKey(key []byte) (Row, error) {
 		decoded[colName] = d
 		off += n
 	}
+	return o.projectCovered(decoded)
+}
+
+// projectCovered picks the scan's output columns out of the decoded key
+// attributes. Shared by both key formats — see decodeRowFromKey.
+func (o *indexOnlyScanOp) projectCovered(decoded map[string]Datum) (Row, error) {
 	row := make(Row, len(o.plan.Covered))
 	for i, col := range o.plan.Covered {
 		d, ok := decoded[col.Name]
@@ -380,6 +445,16 @@ func (o *indexOnlyScanOp) decodeRowFromKey(key []byte) (Row, error) {
 	return row, nil
 }
 
+// numericDatumFromBig wraps a decoded NUMERIC mantissa/scale pair in a Datum,
+// taking the int64 fast lane when the mantissa fits and the big.Int overflow
+// lane otherwise — the same split the codec makes (see datum.go). M0119-0006.
+func numericDatumFromBig(m *big.Int, scale int16) Datum {
+	if m.IsInt64() {
+		return NewNumericInt64Datum(m.Int64(), scale)
+	}
+	return NewNumericBigDatum(m, scale)
+}
+
 // decodeIndexKeyColumn decodes one column from a B-tree key slice and returns
 // the Datum plus the number of bytes consumed. Used by the multi-column path.
 func decodeIndexKeyColumn(key []byte, col catalog.Column) (Datum, int, error) {
@@ -388,6 +463,19 @@ func decodeIndexKeyColumn(key []byte, col catalog.Column) (Datum, int, error) {
 	// width before delegating — btree.DecodeInt4 / DecodeInt8 enforce
 	// `len(b) == width`, which fails when the multi-column loop passes
 	// the still-trailing remainder of a composite key.
+	// ARRAY column: Type.Name is the ELEMENT type, so every predicate below (and
+	// in decodeScalarBTreeKey) answers for the element and would consume the
+	// element's width out of a longer array segment. Route arrays first, the
+	// mirror of encodeBTreeKeyForColumn's own array-first routing. M0119-0006.
+	if col.Type.IsArray {
+		return decodeArrayBTreeKey(key, col)
+	}
+	// int2 / oid / bool / bytea / time (btree_scalar_keys.go). Routed BEFORE the
+	// switch below so neither of these types can reach the `default:` arm, which
+	// reads any 8 leading bytes as an enum float8 without ever erroring.
+	if d, n, handled, err := decodeScalarBTreeKey(key, typeName); handled {
+		return d, n, err
+	}
 	switch {
 	case isInt4Type(typeName):
 		if len(key) < 4 {
@@ -423,6 +511,16 @@ func decodeIndexKeyColumn(key []byte, col catalog.Column) (Datum, int, error) {
 		v, err := btree.DecodeInt4(key[:4])
 		ts := pgEpoch.Add(time.Duration(v) * 24 * time.Hour)
 		return NewTimeDatum(ts), 4, err
+	case isNumericType(typeName):
+		// NUMERIC keys are variable-length but self-delimiting, so the
+		// composite walk can consume exactly this column. Value-preserving,
+		// not byte-preserving: EncodeNumericKey strips trailing mantissa
+		// zeros, so 1.50 decodes as (15, scale 1). M0119-0006.
+		m, scale, n, err := btree.DecodeNumericKey(key)
+		if err != nil {
+			return NullDatum, 0, err
+		}
+		return numericDatumFromBig(m, scale), n, nil
 	case isVarcharType(typeName), isCharType(typeName), isTextType(typeName), isNameType(typeName),
 		strings.ToLower(typeName) == "uuid":
 		raw, n, err := btree.DecodeVarcharLen(key)
@@ -481,6 +579,27 @@ func (o *indexOnlyScanOp) decodeRowFromHeap(t storage.HeapTuple) (Row, error) {
 // back to an executor Datum.
 func decodeBTreeKeyToDatum(key []byte, col catalog.Column) (Datum, error) {
 	typeName := col.Type.Name
+	// Sibling of decodeIndexKeyColumn's array routing (same ordering rationale:
+	// an array's Type.Name is its ELEMENT type name, so it must not reach any
+	// scalar predicate). Strict on the width: a single-column key is the whole
+	// key, so bytes trailing the array's end marker mean this is not the
+	// encoding we think it is. M0119-0006.
+	if col.Type.IsArray {
+		d, n, err := decodeArrayBTreeKey(key, col)
+		if err != nil {
+			return NullDatum, err
+		}
+		if n != len(key) {
+			return NullDatum, fmt.Errorf("btree: array key for column %q has %d trailing bytes", col.Name, len(key)-n)
+		}
+		return d, nil
+	}
+	// Sibling of decodeIndexKeyColumn's routing — both must invert
+	// encodeScalarBTreeKey, or an int2/oid/bool/bytea/time key column decodes
+	// one way in a single-column IOS and another way in a composite one.
+	if d, _, handled, err := decodeScalarBTreeKey(key, typeName); handled {
+		return d, err
+	}
 	switch {
 	case isInt4Type(typeName):
 		v, err := btree.DecodeInt4(key)
@@ -503,7 +622,28 @@ func decodeBTreeKeyToDatum(key []byte, col catalog.Column) (Datum, error) {
 		}
 		return NewStringDatum(strconv.FormatFloat(v, 'g', -1, 64)), nil
 
-	case isVarcharType(typeName), isCharType(typeName), isTextType(typeName), isNameType(typeName):
+	case isNumericType(typeName):
+		// Sibling of the multi-column branch in decodeIndexKeyColumn — both
+		// must invert EncodeNumericKey, or a NUMERIC key column decodes one
+		// way in a single-column IOS and another way in a composite one.
+		// M0119-0006.
+		m, scale, _, err := btree.DecodeNumericKey(key)
+		if err != nil {
+			return NullDatum, err
+		}
+		return numericDatumFromBig(m, scale), nil
+
+	case isVarcharType(typeName), isCharType(typeName), isTextType(typeName), isNameType(typeName),
+		strings.EqualFold(typeName, "uuid"):
+		// uuid rides EncodeVarchar (its canonical lowercase-hex text compares as
+		// uuid_cmp's memcmp does), and its sibling decodeIndexKeyColumn has
+		// always listed it here. Without this arm uuid reached the `default:`
+		// enum guess below, which reads the first 8 ASCII bytes as a float8 sort
+		// order and NEVER errors: a single-column index-only scan over a uuid
+		// column answered from the key returned an empty enum Datum instead of
+		// the uuid. Latent today only because a uuid index takes the PG
+		// tuple-image key path (pgIndexTupleKeys), which is exactly why the
+		// blob sibling drifted. M0119-0006, Hard-won Rule #2.
 		b, err := btree.DecodeVarchar(key)
 		if err != nil {
 			return NullDatum, err
@@ -554,7 +694,7 @@ func (o *indexOnlyScanOp) lookupKeys() ([]byte, bool, error) {
 				len(o.plan.Keys), o.plan.Index.Name, len(o.plan.Index.Columns)),
 		}
 	}
-	var probe []byte
+	parts := make([]indexProbeKeyPart, 0, len(o.plan.Keys))
 	for i, ke := range o.plan.Keys {
 		v, err := evalExpr(ke, nil, o.ctx)
 		if err != nil {
@@ -571,11 +711,11 @@ func (o *indexOnlyScanOp) lookupKeys() ([]byte, bool, error) {
 				Message: fmt.Sprintf("indexed column %q not found on table %q", colName, o.plan.Table.Name),
 			}
 		}
-		segment, encErr := encodeBTreeKeyForColumn(v, col, ke.Pos())
-		if encErr != nil {
-			return nil, false, encErr
-		}
-		probe = append(probe, segment...)
+		parts = append(parts, indexProbeKeyPart{col: col, val: v, pos: ke.Pos()})
+	}
+	probe, encErr := o.ctx.indexProbeKey(o.plan.Index, parts)
+	if encErr != nil {
+		return nil, false, encErr
 	}
 	return probe, true, nil
 }
@@ -596,7 +736,7 @@ func (o *indexOnlyScanOp) lookupKey() ([]byte, bool, error) {
 		return nil, false, &ExecError{Code: "XX000", Pos: o.plan.Pos(),
 			Message: fmt.Sprintf("indexed column %q not found", o.plan.Index.Columns[0])}
 	}
-	k, encErr := encodeBTreeKeyForColumn(v, col, o.plan.Key.Pos())
+	k, encErr := o.ctx.indexProbeKey(o.plan.Index, []indexProbeKeyPart{{col: col, val: v, pos: o.plan.Key.Pos()}})
 	if encErr != nil {
 		return nil, false, encErr
 	}
@@ -617,7 +757,7 @@ func (o *indexOnlyScanOp) lookupRangeBounds() (lo, hi []byte, ok bool, err error
 		if v.IsNull() {
 			return nil, nil, false, nil
 		}
-		k, encE := encodeBTreeKeyForColumn(v, col, o.plan.LowKey.Pos())
+		k, encE := o.ctx.indexProbeKey(o.plan.Index, []indexProbeKeyPart{{col: col, val: v, pos: o.plan.LowKey.Pos()}})
 		if encE != nil {
 			return nil, nil, false, encE
 		}
@@ -631,7 +771,7 @@ func (o *indexOnlyScanOp) lookupRangeBounds() (lo, hi []byte, ok bool, err error
 		if v.IsNull() {
 			return nil, nil, false, nil
 		}
-		k, encE := encodeBTreeKeyForColumn(v, col, o.plan.HighKey.Pos())
+		k, encE := o.ctx.indexProbeKey(o.plan.Index, []indexProbeKeyPart{{col: col, val: v, pos: o.plan.HighKey.Pos()}})
 		if encE != nil {
 			return nil, nil, false, encE
 		}

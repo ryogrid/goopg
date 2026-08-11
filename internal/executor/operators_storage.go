@@ -5,11 +5,17 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/mctx"
@@ -79,6 +85,57 @@ func errTupleAlreadyModified(verb string, pos int) *ExecError {
 	}
 }
 
+// wfgDebug dumps the exact wait-for cycle to stderr whenever
+// registerWFGAndCheckCycle reports a deadlock (`GOOPG_DEBUG_WFG=1`).
+//
+// It exists because the WFG's deadlock verdict is only as good as its edges,
+// and a wrong edge is indistinguishable from a real cycle at the call site:
+// the caller just sees `dl == true` and raises 40001. pgbench TPC-B is
+// deadlock-free by construction (every transaction takes its row locks in the
+// fixed order accounts → tellers → branches, so wait-for edges only ever point
+// "forward" and cannot close), yet the nightly stage reports thousands of
+// `could not serialize access due to concurrent update (deadlock)` errors —
+// so the reported cycles must contain at least one edge that does not
+// correspond to a live wait. Printing the participants (and the age of each
+// edge) is the only way to identify which one. Off by default; this is a
+// diagnostic for AI-20260810-011258-006, not a supported log channel.
+var wfgDebug = os.Getenv("GOOPG_DEBUG_WFG") == "1"
+
+// wfgEdgeInfo is the per-edge provenance kept only while wfgDebug is on: when
+// the edge was registered and which epqWait call site created it. Held in a
+// side map so the hot path keeps its plain XID→XID edge.
+type wfgEdgeInfo struct {
+	since  time.Time
+	site   string
+	target string
+}
+
+// wfgDebugTarget records, per waiting XID, the exact tuple its next epqWait is
+// about to block on. Written by wfgNoteTarget at the call site (which has the
+// RelFileNode/block/slot epqWait itself never sees) and folded into the cycle
+// dump. Debug-only (GOOPG_DEBUG_WFG=1).
+var wfgDebugTarget = make(map[storage.TransactionID]string)
+
+func wfgNoteTarget(xid storage.TransactionID, rel storage.RelFileNode, blk storage.BlockNumber, slot uint16, h storage.HeapTupleHeader) {
+	// superseded=true means the version we are about to block on already has a
+	// successor (t_ctid points elsewhere): PG would have walked the chain to the
+	// head before deciding whom to wait for, so an edge derived here is an edge
+	// to a transaction that may not hold the row's current version at all.
+	superseded := h.CTID.Block != blk || h.CTID.Offset != slot
+	t := fmt.Sprintf("rel=%d blk=%d slot=%d xmin=%d xmax=%d ctid=(%d,%d) superseded=%v im=%#x",
+		rel.RelOid, blk, slot, h.Xmin, h.Xmax, h.CTID.Block, h.CTID.Offset, superseded, h.Infomask)
+	wfgMu.Lock()
+	wfgDebugTarget[xid] = t
+	wfgMu.Unlock()
+}
+
+var wfgDebugInfo = make(map[storage.TransactionID]wfgEdgeInfo)
+
+// wfgDebugActivity is the pg_stat_activity registry, captured from the first
+// waiting Context so the cycle dump can name the SQL each participant is
+// running. Debug-only; nil until the first wait under GOOPG_DEBUG_WFG=1.
+var wfgDebugActivity atomic.Pointer[activity.ActivityRegistry]
+
 // registerWFGAndCheckCycle adds the edge myXID→blockingXID and walks the
 // graph up to maxWFGHops looking for a cycle (deadlock). Returns true when
 // a cycle is detected; the edge is removed before returning (caller must NOT
@@ -88,9 +145,16 @@ func registerWFGAndCheckCycle(myXID, blockingXID storage.TransactionID) bool {
 	wfgMu.Lock()
 	defer wfgMu.Unlock()
 	waitForGraph[myXID] = blockingXID
+	if wfgDebug {
+		wfgDebugInfo[myXID] = wfgEdgeInfo{since: time.Now(), site: wfgCallSite(), target: wfgDebugTarget[myXID]}
+	}
 	cur := blockingXID
 	for i := 0; i < maxWFGHops; i++ {
 		if cur == myXID {
+			if wfgDebug {
+				dumpWFGCycle(myXID, blockingXID)
+				delete(wfgDebugInfo, myXID)
+			}
 			delete(waitForGraph, myXID)
 			return true
 		}
@@ -103,12 +167,73 @@ func registerWFGAndCheckCycle(myXID, blockingXID storage.TransactionID) bool {
 	return false
 }
 
+// dumpWFGCycle prints the cycle myXID→blockingXID→…→myXID that
+// registerWFGAndCheckCycle just closed. Called with wfgMu held.
+func dumpWFGCycle(myXID, blockingXID storage.TransactionID) {
+	var b strings.Builder
+	now := time.Now()
+	edge := func(from storage.TransactionID) string {
+		i, ok := wfgDebugInfo[from]
+		if !ok {
+			return "(no info)"
+		}
+		return i.site + " " + i.target + " age=" + now.Sub(i.since).Round(time.Microsecond).String()
+	}
+	fmt.Fprintf(&b, "WFG deadlock: %d [%s]", myXID, edge(myXID))
+	cur := blockingXID
+	for i := 0; i < maxWFGHops; i++ {
+		fmt.Fprintf(&b, " -> %d", cur)
+		if cur == myXID {
+			break
+		}
+		fmt.Fprintf(&b, " [%s]", edge(cur))
+		next, ok := waitForGraph[cur]
+		if !ok {
+			b.WriteString(" -> (no edge)")
+			break
+		}
+		cur = next
+	}
+	fmt.Fprintf(&b, "  [graph size %d]\n", len(waitForGraph))
+	if reg := wfgDebugActivity.Load(); reg != nil {
+		for _, be := range reg.Snapshot() {
+			if be.BackendXID == "" || be.BackendXID == "0" {
+				continue
+			}
+			x, err := strconv.ParseUint(be.BackendXID, 10, 64)
+			if err != nil {
+				continue
+			}
+			xid := storage.TransactionID(x)
+			if xid != myXID {
+				if _, onPath := wfgDebugInfo[xid]; !onPath {
+					continue
+				}
+			}
+			fmt.Fprintf(&b, "    xid %d: %s\n", xid, strings.Join(strings.Fields(be.Query), " "))
+		}
+	}
+	os.Stderr.WriteString(b.String())
+}
+
 // deregisterWFG removes myXID from the wait-for graph after a snapshot
 // refresh completes.
 func deregisterWFG(myXID storage.TransactionID) {
 	wfgMu.Lock()
 	delete(waitForGraph, myXID)
+	if wfgDebug {
+		delete(wfgDebugInfo, myXID)
+	}
 	wfgMu.Unlock()
+}
+
+// wfgCallSite names the epqWait/waitPgClassInplaceXID caller that created the
+// current edge (skip: wfgCallSite, registerWFGAndCheckCycle, epqWait).
+func wfgCallSite() string {
+	if _, file, line, ok := runtime.Caller(3); ok {
+		return filepath.Base(file) + ":" + strconv.Itoa(line)
+	}
+	return "?"
 }
 
 // waitPgClassInplaceXID is the deadlock-aware wait that the intra-grant-inplace
@@ -176,6 +301,9 @@ func epqWait(ctx *Context, xmax storage.TransactionID) (deadlock bool, timeout *
 		return false, nil
 	}
 	if ctx.Tx.XID != storage.InvalidTransactionID {
+		if wfgDebug && ctx.Activity != nil {
+			wfgDebugActivity.CompareAndSwap(nil, ctx.Activity)
+		}
 		if registerWFGAndCheckCycle(ctx.Tx.XID, xmax) {
 			return true, nil
 		}
@@ -3084,7 +3212,7 @@ func isConcurrentlyUpdated(h storage.HeapTupleHeader, myXID storage.TransactionI
 	}
 	// Beyond this point, any xmax/HOT marker is from a DIFFERENT
 	// transaction.
-	if h.Infomask&storage.HeapHotUpdated != 0 {
+	if h.IsHotUpdated() {
 		// M0100-0005: If the HOT-updating transaction already aborted, the
 		// HeapHotUpdated flag is stale — the row is not actually "concurrently
 		// updated", so proceed directly without EPQ retry.
@@ -3388,6 +3516,32 @@ func stampUpdaterXmaxNonHOT(ctx *Context, page storage.Page, slot uint16, hdr st
 	return nil
 }
 
+// stampMovedPartitionOldTuple stamps the old tuple of a cross-partition UPDATE
+// (a row whose new key routes it to a different partition child): xmax plus the
+// {InvalidBlockNumber, MovedPartitionsOffsetNumber} sentinel CTID, and then the
+// deleting command id (cmax).
+//
+// The cmax half is not optional. Upstream heap_delete calls
+// HeapTupleHeaderSetCmax (heapam.c:3065) unconditionally and only *afterwards*
+// adds HeapTupleHeaderSetMovedPartitions (heapam.c:3071) — the sentinel is an
+// addition to the normal delete stamp, not a replacement for it. goopg's three
+// cross-partition stamp sites previously wrote only the sentinel, leaving the
+// tuple's stale t_cid (its cmin, from whichever command inserted it) to stand in
+// for cmax. mvcc.TupleVisible then reaches the `effXmax == currentXID` arm and
+// reads `cmax >= curcid` as "deleted by a later command — pre-image visible", so
+// the deleting transaction kept seeing its own moved-away row. Other sessions
+// were unaffected (they judge xmax by the snapshot, never by cmax), which is why
+// the bug only ever surfaced in the writer's own re-scan.
+//
+// M-NIGHTLY AI-20260809-020705-018 (isolation spec merge-update, permutation
+// `pa_merge1 pa_merge2a c1 pa_select2 c2`).
+func stampMovedPartitionOldTuple(ctx *Context, page storage.Page, slot uint16) error {
+	if err := storage.PageSetHeapTupleMovedPartition(page, slot, effectiveWriterXID(ctx)); err != nil {
+		return err
+	}
+	return storage.PageSetHeapTupleCmax(page, slot, ctx.GetCurrentCommandId(true), false)
+}
+
 // tryApplyHOTUpdate attempts a same-page HOT update of the tuple at
 // (blk, oldSlot). It:
 //  1. Encodes newRow with HeapOnlyTuple set in the tuple infomask.
@@ -3437,7 +3591,8 @@ func tryApplyHOTUpdate(
 	} else {
 		tup = storage.NewHeapTuple(xmin, storage.InvalidTransactionID, body)
 	}
-	tup.Header.Infomask |= storage.HeapOnlyTuple
+	// HEAP_ONLY_TUPLE lives in t_infomask2 (M0131-S11; htup_details.h:568).
+	tup.Header.SetHeapOnly()
 	tup.Header.SetNatts(len(cols))
 	tup.Header.Infomask |= storage.HeapXmaxInvalid
 	// HEAP_HASVARWIDTH: PG18 nocachegetattr crashes when this bit is
@@ -3498,6 +3653,9 @@ func tryApplyHOTUpdate(
 		xmax := concurrentModifierXID(oldTuple.Header, ctx.MultiXact)
 		s.Unlock()
 		ctx.Pool.Unpin(s)
+		if wfgDebug {
+			wfgNoteTarget(ctx.Tx.XID, rel, blk, oldSlot, oldTuple.Header)
+		}
 		if dl, terr := epqWait(ctx, xmax); terr != nil {
 			return false, terr
 		} else if dl {
@@ -3823,6 +3981,12 @@ func (o *updateOp) nextVirtualPgDatabase() (TupleSlot, error) {
 				datname = rawRow[datnameOrd]
 			}
 			im.SetDatabaseConnLimit(datname, int32(newVal.Int))
+			// M0122-0006: persist the new datconnlimit to the on-disk
+			// pg_database heap row (global/1262) so it survives restart.
+			// Best-effort — the in-memory registry is goopg's truth.
+			if dbOid, ok := im.ResolveDatabaseOid(datname); ok && dbOid != 0 {
+				_ = PersistDatConnLimit(o.ctx, dbOid, int32(newVal.Int))
+			}
 			row[connLimitOrd] = newVal
 		}
 		o.appendUpdateRetRow(row)
@@ -3919,7 +4083,7 @@ func (o *updateOp) nextVirtualPgAmproc() (TupleSlot, error) {
 func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column) (TupleSlot, error) {
 	ix := o.idxScan
 	idxRel := o.ctx.Catalog.IndexRelFileNode(ix.Index)
-	tree, err := btree.Open(o.ctx.Pool, idxRel)
+	tree, err := openIndexBTree(o.ctx, ix.Index, idxRel)
 	if err != nil {
 		return nil, &ExecError{Code: "XX000", Pos: ix.Pos(), Message: err.Error()}
 	}
@@ -3937,7 +4101,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		return nil, &ExecError{Code: "XX000", Pos: ix.Pos(),
 			Message: fmt.Sprintf("indexed column %q not found on table %q", ix.Index.Columns[0], ix.Table.Name)}
 	}
-	keyBytes, encErr := encodeBTreeKeyForColumn(v, col, ix.Key.Pos())
+	keyBytes, encErr := o.ctx.indexProbeKey(ix.Index, []indexProbeKeyPart{{col: col, val: v, pos: ix.Key.Pos()}})
 	if encErr != nil {
 		return nil, encErr
 	}
@@ -3958,7 +4122,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 
 	hiBytes := keyBytes
 	if len(ix.Index.Columns) > 1 {
-		hiBytes = appendCompositeUpperPadding(keyBytes)
+		hiBytes = o.ctx.compositeUpperBound(ix.Index, keyBytes)
 	}
 	err = tree.RangeScan(keyBytes, hiBytes, func(_ []byte, ptr storage.ItemPointer) (bool, error) {
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: heapRel, Block: ptr.Block})
@@ -4032,6 +4196,24 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		if o.plan.ViewCheckQual != nil {
 			if err := checkViewCheckOption(o.ctx, o.plan.ViewCheckQual, o.plan.ViewCheckName, newRow); err != nil {
 				return false, err
+			}
+		}
+		// AI-20260810-011258-006: one physical tuple must be updated AT MOST
+		// ONCE by a single UPDATE. A non-HOT update inserts a fresh index entry
+		// while the old entry stays until VACUUM, so a repeatedly-updated row
+		// accumulates SEVERAL live index entries for the same key. Each is
+		// scanned here and each resolves — via followHOTChain — to the SAME live
+		// tuple, so without this guard `UPDATE … SET bal = bal + :d WHERE aid=?`
+		// applied the delta once per surviving index entry (pgbench TPC-B
+		// balance drift), and the per-tuple xmax stamps it issued for the
+		// duplicates made two clients wait on each other's leftovers in the same
+		// hot page — the false deadlocks in this action item. Upstream cannot
+		// hit this: ExecUpdate is driven by the plan's tuple stream and
+		// heap_update on an already-self-updated tuple returns TM_SelfModified
+		// (postgres/src/backend/access/heap/heapam.c), it does not re-apply.
+		for i := range pending {
+			if pending[i].blk == ptr.Block && pending[i].slot == actualSlot {
+				return true, nil
 			}
 		}
 		pending = append(pending, pendingUpdate{
@@ -4144,7 +4326,10 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 					// the original snapshot, matching PG's EvalPlanQual semantics
 					// (chain-follow uses refreshed snapshot; qual eval uses origSnap).
 					origSnap := o.ctx.Snap
-					if dl, terr := epqWait(o.ctx, xmax); terr != nil {
+					if wfgDebug {
+						wfgNoteTarget(o.ctx.Tx.XID, rel, pu.blk, pu.slot, oldTup.Header)
+					}
+						if dl, terr := epqWait(o.ctx, xmax); terr != nil {
 						terr.Pos = o.plan.Pos()
 						return nil, terr
 					} else if dl {
@@ -4341,7 +4526,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				}
 				var stampIdxErr error
 				if isCrossPartitionMoveIdx {
-					stampIdxErr = storage.PageSetHeapTupleMovedPartition(s.Page(), pu.slot, effectiveWriterXID(o.ctx))
+					stampIdxErr = stampMovedPartitionOldTuple(o.ctx, s.Page(), pu.slot)
 				} else if oldHdrTup, herr := storage.PageGetHeapTuple(s.Page(), pu.slot); herr == nil {
 					// Preserve a pre-existing non-conflicting foreign locker into a
 					// {updater + survivors} multi (M0118-0004 producer). Non-HOT
@@ -5061,7 +5246,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				}
 				var stampErr error
 				if isCrossPartitionMove {
-					stampErr = storage.PageSetHeapTupleMovedPartition(s.Page(), pu.slot, effectiveWriterXID(o.ctx))
+					stampErr = stampMovedPartitionOldTuple(o.ctx, s.Page(), pu.slot)
 				} else if oldHdrTup, herr := storage.PageGetHeapTuple(s.Page(), pu.slot); herr == nil {
 					// Preserve a pre-existing non-conflicting foreign locker into a
 					// {updater + survivors} multi (M0118-0004 producer). Non-HOT
@@ -6962,11 +7147,48 @@ func waitForConflictingRowLock(ctx *Context, rel storage.RelFileNode, blk storag
 // cat is optional (may be nil): when provided, KindString values on enum-typed
 // columns are converted to KindEnum so encoding is consistent with the probe path.
 func encodeIndexKeyFromCols(idx *catalog.Index, cols []catalog.Column, row Row, cat ...catalog.Catalog) ([]byte, error) {
+	keyCols, vals, ok := indexRowKeyValues(idx, cols, row, cat...)
+	if !ok {
+		return nil, nil
+	}
+	var out []byte
+	for i, v := range vals {
+		keyPart, err := encodeBTreeKeyForColumn(v, keyCols[i], 0)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, keyPart...)
+	}
+	return out, nil
+}
+
+// indexRowKeyValues projects a heap row down to idx's KEY attributes: for each
+// name in idx.Columns it resolves the column in cols (case-insensitively, the
+// spelling the catalog stores), reads the row value at that column's position,
+// and normalises enum labels.
+//
+// ok is false — not an error — when the projection cannot be made at all:
+// a key column that is not in cols (an expression key, `Columns[i] == ""`), a
+// position past the end of the row, or a NULL key value. Those are exactly the
+// cases `encodeIndexKeyFromCols` has always answered with a nil key, and the
+// callers read a nil key as "this row is not in this index" (NULLs do not
+// participate in unique constraints; an expression index takes the
+// `encodeExprIndexKey` fallback).
+//
+// M0130-S11.4 slice 3b-2c-ii-B2-c-iv split this out of the encoder because the
+// PROJECTION is format-independent while the encoding is not: the tuple-format
+// funnels in pgindex_btree.go need the same columns, the same row positions and
+// the same enum normalisation, and deriving them a second time is precisely the
+// sibling-pair divergence the ledger keeps recording. The returned columns are
+// pointers INTO cols, parallel to vals and to the descriptor attributes
+// buildPGIndexKeyDesc derives from the same idx.Columns order.
+func indexRowKeyValues(idx *catalog.Index, cols []catalog.Column, row Row, cat ...catalog.Catalog) ([]*catalog.Column, []Datum, bool) {
 	var im *catalog.InMemory
 	if len(cat) > 0 && cat[0] != nil {
 		im, _ = cat[0].(*catalog.InMemory)
 	}
-	var out []byte
+	keyCols := make([]*catalog.Column, 0, len(idx.Columns))
+	vals := make([]Datum, 0, len(idx.Columns))
 	for _, idxColName := range idx.Columns {
 		var col *catalog.Column
 		var colOrd int
@@ -6978,11 +7200,11 @@ func encodeIndexKeyFromCols(idx *catalog.Index, cols []catalog.Column, row Row, 
 			}
 		}
 		if col == nil || colOrd >= len(row) {
-			return nil, nil
+			return nil, nil, false
 		}
 		v := row[colOrd]
 		if v.IsNull() {
-			return nil, nil // NULLs don't participate in unique constraints
+			return nil, nil, false // NULLs don't participate in unique constraints
 		}
 		// For enum columns: convert KindString labels to KindEnum (sort order)
 		// so encoding matches the btree probe path. M0097-0022.
@@ -6997,13 +7219,10 @@ func encodeIndexKeyFromCols(idx *catalog.Index, cols []catalog.Column, row Row, 
 				}
 			}
 		}
-		keyPart, err := encodeBTreeKeyForColumn(v, col, 0)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, keyPart...)
+		keyCols = append(keyCols, col)
+		vals = append(vals, v)
 	}
-	return out, nil
+	return keyCols, vals, true
 }
 
 // maintainUniqueIndexesForInsert updates all unique/primary btree indexes
@@ -7017,17 +7236,29 @@ func maintainUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []cat
 	}
 	for _, idx := range ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
 		idxRel := ctx.Catalog.IndexRelFileNode(idx)
-		tree, err := btree.Open(ctx.Pool, idxRel)
+		tree, err := openIndexBTree(ctx, idx, idxRel)
 		if err != nil {
 			continue
 		}
-		key, err := encodeIndexKeyFromCols(idx, cols, row, ctx.Catalog)
+		key, err := ctx.indexEntryKey(idx, cols, row, ptr)
 		if err != nil || key == nil {
 			// Fall back to expression-column encoding for expression-based indexes
 			// (e.g. CREATE UNIQUE INDEX ON t(lower(col))). encodeIndexKeyFromCols
 			// returns nil when idx.Columns[i]=="" (expression column); evaluate the
 			// stored ColExprs to produce the btree key so concurrent sessions can
 			// detect the in-progress insert via the arbiter scan. M0100-0005.
+			//
+			// The fallback is a BLOB-format repair, and only that: it concatenates
+			// per-column blobs, so under the tuple format it would file a key the
+			// tree cannot parse — an entry addressed by garbage rather than a
+			// missing entry. An index the descriptor resolver ACCEPTS is never an
+			// expression index anyway (buildPGIndexKeyDesc refuses those), so the
+			// only way to arrive here with a descriptor is a refusal by the tuple
+			// encoder itself, which must not be papered over.
+			// M0130-S11.4 slice 3b-2c-ii-B2-c-vii.
+			if ctx.pgIndexKeyDesc(idx) != nil {
+				continue
+			}
 			key = encodeExprIndexKey(ctx, idx, tbl, row)
 			if key == nil {
 				continue
@@ -7092,7 +7323,7 @@ func encodeExprIndexKey(ctx *Context, idx *catalog.Index, tbl *catalog.Table, ro
 			if err != nil || v.IsNull() {
 				return nil
 			}
-			k := encodeArbiterExprKey(v, 0)
+			k := encodeArbiterExprKey(ctx, v, planExpr, 0)
 			if k == nil {
 				return nil
 			}
@@ -7160,8 +7391,8 @@ func nndKeyColumnsEqual(idx *catalog.Index, cols []catalog.Column, oldRow, newRo
 		if oldNull {
 			continue
 		}
-		oldKey, oerr := encodeBTreeKeyForColumn(oldRow[ord], col, 0)
-		newKey, nerr := encodeBTreeKeyForColumn(newRow[ord], col, 0)
+		oldKey, oerr := indexColumnFingerprint(oldRow[ord], col)
+		newKey, nerr := indexColumnFingerprint(newRow[ord], col)
 		if oerr != nil || nerr != nil || !bytes.Equal(oldKey, newKey) {
 			return false
 		}
@@ -7199,8 +7430,11 @@ func nndDetail(idx *catalog.Index, cols []catalog.Column, row Row) string {
 // collision cannot be found by a btree probe; instead this seq-scans the heap
 // for a live tuple whose index-key columns match the candidate's NULL pattern
 // and non-NULL values exactly — NULL equals NULL, and a non-NULL column compares
-// byte-equal under the column's index encoding (encodeBTreeKeyForColumn), so the
-// comparison matches what the btree would consider equal. Returns the first
+// byte-equal under the column's index encoding (indexColumnFingerprint), so the
+// comparison matches what the btree would consider equal. The fingerprint is
+// per-COLUMN and TID-free on purpose: the candidate and the scanned rows are
+// different heap tuples, so a tuple-format key would never compare equal and the
+// scan would find no duplicate at all (M0130-S11.4 slice 3b-2c-ii-B2-c-viii). Returns the first
 // matching tuple's ItemPointer and true. The ItemPointer is surfaced for the
 // ON CONFLICT follow-up slice (design 0119-0004 §2.1); the plain INSERT/UPDATE
 // callers only consume the boolean. Mirrors the heap-scan pattern of
@@ -7252,7 +7486,7 @@ func resolveNNDKeyColsFromRow(tbl *catalog.Table, idx *catalog.Index, cols []cat
 		}
 		kc := nndKeyCol{tblOrd: tblOrd, col: col, candNull: candVal.IsNull()}
 		if !kc.candNull {
-			enc, eerr := encodeBTreeKeyForColumn(candVal, col, 0)
+			enc, eerr := indexColumnFingerprint(candVal, col)
 			if eerr != nil {
 				return nil, false
 			}
@@ -7337,7 +7571,7 @@ func scanNNDLiveMatches(ctx *Context, tbl *catalog.Table, rel storage.RelFileNod
 					match = false
 					break
 				}
-				existKey, eerr := encodeBTreeKeyForColumn(existVal, kc.col, 0)
+				existKey, eerr := indexColumnFingerprint(existVal, kc.col)
 				if eerr != nil || !bytes.Equal(existKey, kc.candKey) {
 					match = false
 					break
@@ -7390,11 +7624,11 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 			continue
 		}
 		idxRel := ctx.Catalog.IndexRelFileNode(idx)
-		tree, err := btree.Open(ctx.Pool, idxRel)
+		tree, err := openIndexBTree(ctx, idx, idxRel)
 		if err != nil {
 			continue
 		}
-		key, err := encodeIndexKeyFromCols(idx, cols, row, ctx.Catalog)
+		key, err := ctx.indexRowProbeKey(idx, cols, row)
 		if err != nil || key == nil {
 			// NULLS NOT DISTINCT: a candidate row with NULL key column(s) has no
 			// btree key (encodeIndexKeyFromCols returns nil) and is never stored
@@ -7443,9 +7677,16 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 // it matches exactly the value the btree stores (collation / type
 // normalisation included). If either row cannot be encoded, it conservatively
 // reports "changed" so the caller still performs the uniqueness probe.
+//
+// This is a VALUE fingerprint, not a tree key: the two encodings are never
+// handed to a btree, only compared with each other. It therefore goes through
+// `indexKeyFingerprint` and must NOT move to `indexEntryKey` when the tuple
+// format lands — a tuple key embeds the row's heap TID, and oldRow/newRow are
+// different heap tuples, so every UPDATE would report "key changed" and re-probe
+// every unique index. M0130-S11.4 slices 3b-2c-ii-B2-c-iv and -viii.
 func indexKeyColumnsChanged(idx *catalog.Index, cols []catalog.Column, oldRow, newRow Row, cat catalog.Catalog) bool {
-	oldKey, oerr := encodeIndexKeyFromCols(idx, cols, oldRow, cat)
-	newKey, nerr := encodeIndexKeyFromCols(idx, cols, newRow, cat)
+	oldKey, oerr := indexKeyFingerprint(idx, cols, oldRow, cat)
+	newKey, nerr := indexKeyFingerprint(idx, cols, newRow, cat)
 	if oerr != nil || nerr != nil {
 		return true
 	}
@@ -7504,11 +7745,11 @@ func checkUniqueIndexesForUpdate(ctx *Context, tbl *catalog.Table, cols []catalo
 			continue
 		}
 		idxRel := ctx.Catalog.IndexRelFileNode(idx)
-		tree, err := btree.Open(ctx.Pool, idxRel)
+		tree, err := openIndexBTree(ctx, idx, idxRel)
 		if err != nil {
 			continue
 		}
-		key, err := encodeIndexKeyFromCols(idx, cols, newRow, ctx.Catalog)
+		key, err := ctx.indexRowProbeKey(idx, cols, newRow)
 		if err != nil || key == nil {
 			// NULLS NOT DISTINCT: new version has NULL key column(s). The old
 			// version was already stamped xmax = effectiveWriterXID before this
@@ -7572,11 +7813,11 @@ func checkExclusionConstraintsForInsert(ctx *Context, tbl *catalog.Table, cols [
 		switch idx.ExclusionOp {
 		case "=":
 			idxRel := ctx.Catalog.IndexRelFileNode(idx)
-			tree, err := btree.Open(ctx.Pool, idxRel)
+			tree, err := openIndexBTree(ctx, idx, idxRel)
 			if err != nil {
 				continue
 			}
-			key, err := encodeIndexKeyFromCols(idx, cols, row, ctx.Catalog)
+			key, err := ctx.indexRowProbeKey(idx, cols, row)
 			if err != nil || key == nil {
 				continue
 			}

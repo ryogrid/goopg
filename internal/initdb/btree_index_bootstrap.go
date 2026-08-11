@@ -1292,6 +1292,81 @@ func bootstrapPgIndexIndexrelidIndex(dataDir string, tids map[uint32]heapTID) er
 	return nil
 }
 
+// bootstrapPgIndexIndrelidIndex overwrites the empty btree placeholders at
+// base/{1,5}/2678 and global/2678 with a populated btree carrying one
+// IndexTuple per Form_pg_index heap row, keyed on `indrelid` (the INDEXED
+// relation, not the index itself). NON-unique: a table with N indexes owns N
+// entries under the same key.
+//
+// Why this is needed (M-NIGHTLY AI-20260810-011258-003, blocker #8): PG's
+// `RelationGetIndexList` (postgres/src/backend/utils/cache/relcache.c:4767)
+// builds a relation's index list with
+// `systable_beginscan(pg_index, IndexIndrelidIndexId /* 2678 */, true, …)` and
+// has NO seq-scan fallback once the index exists. goopg left 2678 as the
+// Step-3k EMPTY placeholder (only 2679, keyed on indexrelid, was populated by
+// bootstrapPgIndexIndexrelidIndex), so a PG 18.3 instance running on a
+// goopg-built cluster saw EVERY relation as index-less: `ExecInsertIndexTuples`
+// had nothing to maintain, and rows the promoted PG inserted itself were
+// absent from goopg-created indexes (`WHERE id=5 AND val='…'` returned 0 rows
+// through an Index Scan while `WHERE id=5` returned 1). Ground truth was
+// `pg_waldump` on the promoted PG: `Heap INSERT` + `Transaction COMMIT` with
+// ZERO RM_BTREE records — nothing arrived at goopg's replay to lose.
+//
+// Duplicate keys are emitted in (indrelid, heap TID) order, which is also the
+// order PG's own bulk build produces (nbtsort.c sorts on the key columns plus
+// the heap TID tiebreak added in PG 12).
+func bootstrapPgIndexIndrelidIndex(dataDir string, tids map[uint32]heapTID) error {
+	type entry struct {
+		indrelid uint32
+		block    uint32
+		off      uint16
+	}
+	// The indexrelid→indrelid mapping lives in the same table the heap rows
+	// were written from, so no extra plumbing through bootstrapPgIndexTuples
+	// is needed.
+	indrelidOf := make(map[uint32]uint32)
+	for _, e := range pgIndexInitialEntries() {
+		indrelidOf[e.IndexRelid] = e.IndRelid
+	}
+	entries := make([]entry, 0, len(tids))
+	for indexrelid, t := range tids {
+		indrelid, ok := indrelidOf[indexrelid]
+		if !ok {
+			return fmt.Errorf("pg_index_indrelid_index: no pgIndexInitialEntries row for indexrelid %d", indexrelid)
+		}
+		entries = append(entries, entry{indrelid: indrelid, block: t.Block, off: t.Offset})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].indrelid != entries[j].indrelid {
+			return entries[i].indrelid < entries[j].indrelid
+		}
+		if entries[i].block != entries[j].block {
+			return entries[i].block < entries[j].block
+		}
+		return entries[i].off < entries[j].off
+	})
+
+	tuples := make([][]byte, len(entries))
+	for i, e := range entries {
+		tuples[i] = pgBuildIndexTupleOidKey(e.block, e.off, e.indrelid)
+	}
+	file, err := pgBuildBtreeBulkLoad(tuples, 1)
+	if err != nil {
+		return fmt.Errorf("pg_index_indrelid_index bulk-load: %w", err)
+	}
+
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+		filepath.Join(dataDir, "global"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(2678, 10)), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_index_indrelid_index in %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
 // pgBuildIndexTupleOidOidOidInt2Key constructs an IndexTuple for the
 // (oid amprocfamily, oid amproclefttype, oid amprocrighttype,
 // int2 amprocnum) composite key used by pg_amproc_fam_proc_index

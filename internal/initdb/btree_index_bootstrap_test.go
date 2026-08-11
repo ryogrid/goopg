@@ -579,7 +579,9 @@ func TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree(t *testing.T) {
 		174,  // pg_user_mapping_oid_index ← Step 3cp
 		175,  // pg_user_mapping_user_server_index ← Step 3cp
 		2965, // pg_db_role_setting_databaseid_rol_index ← Step 3cu
-		2654, 2655, 2658, 2659, 2662, 2663,
+		2654, 2655,
+		2656, 2657, // pg_attrdef_adrelid_adnum_index / pg_attrdef_oid_index ← AI-20260810-011258-003
+		2658, 2659, 2662, 2663,
 		2665, // pg_constraint_conrelid_contypid_conname_index ← batched-48
 		2667, 2678, 2679, 2680,
 		2684, 2685, // pg_namespace_nspname_index, pg_namespace_oid_index ← Step 3t

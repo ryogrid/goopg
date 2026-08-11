@@ -210,16 +210,29 @@ func decodeRecordXLog(stream []byte) ([]byte, int, error) {
 	return decoded.Payload, decoded.Consumed, nil
 }
 
-// formatSegmentName generates a PG-compatible WAL segment filename for
+// FormatSegmentName generates a PG-compatible WAL segment filename for
 // the given absolute segment number (segNo * DefaultSegmentSize = first byte
-// of the segment). Uses TLI=1 (the bootstrap timeline). Mirrors
-// XLogFilePath() in postgres/src/include/access/xlog_internal.h.
-func formatSegmentName(segNo uint64) string {
-	const tli = 1
+// of the segment), using TLI=1 (the bootstrap timeline). For multi-timeline
+// naming, use FormatSegmentNameTLI.
+// Mirrors XLogFilePath() in postgres/src/include/access/xlog_internal.h.
+func FormatSegmentName(segNo uint64) string {
+	return FormatSegmentNameTLI(segNo, 1)
+}
+
+// FormatSegmentNameTLI returns a PG-compatible WAL segment filename with the
+// given timeline ID. Mirrors XLogFilePath() with the caller-supplied TLI.
+func FormatSegmentNameTLI(segNo uint64, tli uint32) string {
 	totalBytes := segNo * uint64(DefaultSegmentSize)
 	logNo := uint32(totalBytes >> 32)
 	segInLog := uint32((totalBytes & 0xFFFFFFFF) / uint64(DefaultSegmentSize))
 	return fmt.Sprintf("%08X%08X%08X", tli, logNo, segInLog)
+}
+
+// formatSegmentName is the legacy internal name for callers that always use
+// TLI=1 (tests, legacy code). Callers that need a specific TLI should use
+// FormatSegmentNameTLI directly.
+func formatSegmentName(segNo uint64) string {
+	return FormatSegmentName(segNo)
 }
 
 // parseSegmentName parses a PG-compatible WAL segment filename

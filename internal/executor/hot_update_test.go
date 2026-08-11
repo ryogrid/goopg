@@ -117,7 +117,7 @@ func TestHOTUpdateSamePage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("old tuple slot 1: %v", err)
 	}
-	if oldTuple.Header.Infomask&storage.HeapHotUpdated == 0 {
+	if !oldTuple.Header.IsHotUpdated() {
 		t.Errorf("old tuple slot 1 missing HeapHotUpdated flag (infomask=0x%04x)", oldTuple.Header.Infomask)
 	}
 	if oldTuple.Header.CTID.Offset != 2 {
@@ -131,7 +131,7 @@ func TestHOTUpdateSamePage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new HOT-only tuple slot 2: %v", err)
 	}
-	if newTuple.Header.Infomask&storage.HeapOnlyTuple == 0 {
+	if !newTuple.Header.IsHeapOnly() {
 		t.Errorf("new HOT-only tuple slot 2 missing HeapOnlyTuple flag (infomask=0x%04x)", newTuple.Header.Infomask)
 	}
 	if newTuple.Header.Xmax != storage.InvalidTransactionID {
@@ -204,7 +204,7 @@ func TestHOTUpdateIndexedColumnFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("old tuple: %v", err)
 	}
-	if oldTuple.Header.Infomask&storage.HeapHotUpdated != 0 {
+	if oldTuple.Header.IsHotUpdated() {
 		t.Errorf("non-HOT update must not set HeapHotUpdated (infomask=0x%04x)", oldTuple.Header.Infomask)
 	}
 }
@@ -272,7 +272,7 @@ func TestFollowHOTChainDirect(t *testing.T) {
 	// Slot 1: old tuple — created in xid=4 (visible to snap), deleted by
 	// xid=5 (our transaction → invisible to us), with HEAP_HOT_UPDATED.
 	old := storage.NewHeapTuple(4, xid, []byte("old"))
-	old.Header.Infomask |= storage.HeapHotUpdated
+	old.Header.SetHotUpdated()
 	old.Header.CTID = storage.ItemPointer{Block: 0, Offset: 2}
 	s1, err := storage.PageAddHeapTuple(page, old)
 	if err != nil || s1 != 1 {
@@ -281,7 +281,7 @@ func TestFollowHOTChainDirect(t *testing.T) {
 
 	// Slot 2: new HOT-only tuple created by xid=5 (visible to self).
 	newT := storage.NewHeapTuple(xid, storage.InvalidTransactionID, []byte("new"))
-	newT.Header.Infomask |= storage.HeapOnlyTuple
+	newT.Header.SetHeapOnly()
 	s2, err := storage.PageAddHeapTuple(page, newT)
 	if err != nil || s2 != 2 {
 		t.Fatalf("add new tuple: slot=%d err=%v", s2, err)
@@ -295,7 +295,7 @@ func TestFollowHOTChainDirect(t *testing.T) {
 	if gotSlot != 2 {
 		t.Errorf("gotSlot=%d, want 2", gotSlot)
 	}
-	if got.Header.Infomask&storage.HeapOnlyTuple == 0 {
+	if !got.Header.IsHeapOnly() {
 		t.Errorf("returned tuple missing HeapOnlyTuple (infomask=0x%04x)", got.Header.Infomask)
 	}
 
@@ -304,7 +304,7 @@ func TestFollowHOTChainDirect(t *testing.T) {
 	if !found2 {
 		t.Fatal("followHOTChain from slot 2: not found")
 	}
-	if slot2 != 2 || got2.Header.Infomask&storage.HeapOnlyTuple == 0 {
+	if slot2 != 2 || !got2.Header.IsHeapOnly() {
 		t.Errorf("direct hit on slot 2 failed: slot=%d infomask=0x%04x", slot2, got2.Header.Infomask)
 	}
 }

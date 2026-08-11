@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/executor/kvcache"
@@ -274,6 +275,13 @@ type Context struct {
 	// Nil outside a split aggregate, which is the serial case.
 	PartialAggStates map[*planner.Aggregate]*aggPartialAccum
 
+	// pgKeyDescCache memoises buildPGIndexKeyDesc per index OID for this
+	// statement (M0130-S11.4 slice 3b-2c-ii-A). A present-but-nil entry is
+	// the memoised "this layer cannot describe that index" answer, so the
+	// refusal costs one derivation, not one per row. Populated lazily by
+	// (*Context).pgIndexKeyDesc; nil until the first index btree is opened.
+	pgKeyDescCache map[uint32]*btree.PGIndexKeyDesc
+
 	// AnalyzeRandSeed, when non-zero, makes ANALYZE's reservoir
 	// sampler reproducible. Tests set it; production leaves it
 	// zero so the sampler reseeds from the wall clock.
@@ -487,6 +495,16 @@ type Context struct {
 	// disables the bound and the wait reverts to async behaviour
 	// (commit returns immediately). M0102-0005.
 	WAL *wal.Writer
+
+	// ReplSlots exposes the cluster's replication-slot registry to the
+	// SQL-callable slot functions (pg_create_physical_replication_slot,
+	// pg_drop_replication_slot). It is the SAME *wal.Slots the walsender
+	// path uses for CREATE_REPLICATION_SLOT / DROP_REPLICATION_SLOT, so
+	// the SQL and replication-protocol entry points cannot diverge — the
+	// recurring sibling-path trap. nil means the server was started
+	// without slot support, and the functions raise 0A000 exactly as the
+	// wire commands do. M-NIGHTLY AI-20260810-011258-003.
+	ReplSlots *wal.Slots
 
 	// SyncRep is the synchronous-replication wait primitive. execCommit
 	// calls SyncRep.WaitForLSN(commitLSN, mode) after local flush when
@@ -779,6 +797,20 @@ type Context struct {
 	// close over CurrentDatabaseOid. M0122-0007 4e follow-up (DU-002
 	// round-trip probe unblock).
 	PgTSConfigRows func() [][]string
+
+	// PgPublicationRows mirrors PgTSDictRows above for the pg_publication
+	// catalog table: it lists CurrentDatabaseOid's own CREATE PUBLICATION'd
+	// publications rather than always DefaultDBOid's (catalog.PubSub's
+	// PublicationsForDBOid). Wired by the server to close over
+	// CurrentDatabaseOid. M0119-0004 (DU-002 per-DB publication scoping).
+	PgPublicationRows func() [][]string
+
+	// PgSubscriptionRows mirrors PgPublicationRows above for the
+	// pg_subscription catalog table: it lists CurrentDatabaseOid's own CREATE
+	// SUBSCRIPTION'd subscriptions rather than always DefaultDBOid's
+	// (catalog.PubSub's SubscriptionsForDBOid). Wired by the server to close
+	// over CurrentDatabaseOid. M0119-0004 (DU-002 per-DB subscription scoping).
+	PgSubscriptionRows func() [][]string
 
 	// NonSuperuserRole, when non-empty, means the session is currently running
 	// under a non-superuser role (set via SET SESSION AUTHORIZATION). Privilege

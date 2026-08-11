@@ -51,7 +51,7 @@ func followHOTChain(page storage.Page, startSlot uint16, snap mvcc.Snapshot, xid
 		if mvcc.TupleVisible(t.Header, snap, xid, curcid, combo, mxs) {
 			return t, cur, true
 		}
-		if t.Header.Infomask&storage.HeapHotUpdated == 0 {
+		if !t.Header.IsHotUpdated() {
 			// Chain end: tuple is not visible and has no successor.
 			return storage.HeapTuple{}, 0, false
 		}
@@ -94,7 +94,7 @@ func followHOTChainNoCopy(page storage.Page, startSlot uint16, snap mvcc.Snapsho
 		if mvcc.TupleVisible(t.Header, snap, xid, curcid, combo, mxs) {
 			return t, cur, true
 		}
-		if t.Header.Infomask&storage.HeapHotUpdated == 0 {
+		if !t.Header.IsHotUpdated() {
 			return storage.HeapTuple{}, 0, false
 		}
 		next := t.Header.CTID.Offset
@@ -147,7 +147,7 @@ func heapChainDeadToAll(page storage.Page, startSlot uint16, oldestXmin storage.
 		if !storage.TupleDeadToAll(t.Header, oldestXmin) {
 			return false
 		}
-		if t.Header.Infomask&storage.HeapHotUpdated == 0 {
+		if !t.Header.IsHotUpdated() {
 			return true // chain ends here; every member was dead-to-all
 		}
 		next := t.Header.CTID.Offset
@@ -319,7 +319,7 @@ func (o *indexScanOp) openPrep(ctx *Context) error {
 	// back to the relation-grain SIREAD. See ssiRecordIndexScanGapLock for the
 	// multiple-row-versions rationale.
 	idxRel := ctx.Catalog.IndexRelFileNode(o.plan.Index)
-	tree, err := btree.Open(ctx.Pool, idxRel)
+	tree, err := openIndexBTree(ctx, o.plan.Index, idxRel)
 	if err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
@@ -403,14 +403,12 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 		}
 		loBytes = key
 		hiBytes = key
-		// Composite-index leading-column probe (M0053-0001):
-		// page keys carry suffix bytes for the trailing columns, so the
-		// inclusive upper bound must be widened to match every key whose
-		// leading bytes equal `key`. CompareKeys is byte-wise via
-		// bytes.Compare; appending 0xFF padding produces an upper bound
-		// that exceeds any realistic trailing-column encoding.
+		// Composite-index leading-column probe (M0053-0001): the inclusive
+		// upper bound must cover every key whose leading columns equal `key`.
+		// How that is expressed depends on the key format — see
+		// (*Context).compositeUpperBound.
 		if len(o.plan.Index.Columns) > 1 {
-			hiBytes = appendCompositeUpperPadding(key)
+			hiBytes = o.ctx.compositeUpperBound(o.plan.Index, key)
 		}
 	} else {
 		// Range scan: evaluate lo/hi bounds independently.
@@ -425,7 +423,7 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 		loBytes = lo
 		hiBytes = hiB
 		if len(o.plan.Index.Columns) > 1 && hiBytes != nil {
-			hiBytes = appendCompositeUpperPadding(hiBytes)
+			hiBytes = o.ctx.compositeUpperBound(o.plan.Index, hiBytes)
 		}
 	}
 
@@ -684,7 +682,7 @@ func (o *indexScanOp) lookupKeys() ([]byte, bool, error) {
 			Message: fmt.Sprintf("indexScanOp.lookupKeys: planner supplied %d keys for index %q with %d columns", len(o.plan.Keys), o.plan.Index.Name, len(o.plan.Index.Columns)),
 		}
 	}
-	var probe []byte
+	parts := make([]indexProbeKeyPart, 0, len(o.plan.Keys))
 	for i, ke := range o.plan.Keys {
 		v, err := evalExprSlot(ke, o.outerSlot, o.ctx)
 		if err != nil {
@@ -701,11 +699,11 @@ func (o *indexScanOp) lookupKeys() ([]byte, bool, error) {
 				Message: fmt.Sprintf("indexed column %q not found on table %q", colName, o.plan.Table.Name),
 			}
 		}
-		segment, encErr := encodeBTreeKeyForColumn(v, col, ke.Pos())
-		if encErr != nil {
-			return nil, false, encErr
-		}
-		probe = append(probe, segment...)
+		parts = append(parts, indexProbeKeyPart{col: col, val: v, pos: ke.Pos()})
+	}
+	probe, encErr := o.ctx.indexProbeKey(o.plan.Index, parts)
+	if encErr != nil {
+		return nil, false, encErr
 	}
 	return probe, true, nil
 }
@@ -726,7 +724,7 @@ func (o *indexScanOp) lookupKey() ([]byte, bool, error) {
 	if !ok {
 		return nil, false, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf("indexed column %q not found on table %q", o.plan.Index.Columns[0], o.plan.Table.Name)}
 	}
-	key, encErr := encodeBTreeKeyForColumn(v, col, o.plan.Key.Pos())
+	key, encErr := o.ctx.indexProbeKey(o.plan.Index, []indexProbeKeyPart{{col: col, val: v, pos: o.plan.Key.Pos()}})
 	if encErr != nil {
 		return nil, false, encErr
 	}
@@ -756,7 +754,7 @@ func (o *indexScanOp) lookupRangeBounds() (loKey []byte, hiKey []byte, ok bool, 
 			// NULL lower bound → skip entire scan (no row can satisfy >= NULL)
 			return nil, nil, false, nil
 		}
-		k, encErr := encodeBTreeKeyForColumn(v, col, o.plan.LowKey.Pos())
+		k, encErr := o.ctx.indexProbeKey(o.plan.Index, []indexProbeKeyPart{{col: col, val: v, pos: o.plan.LowKey.Pos()}})
 		if encErr != nil {
 			return nil, nil, false, encErr
 		}
@@ -772,7 +770,7 @@ func (o *indexScanOp) lookupRangeBounds() (loKey []byte, hiKey []byte, ok bool, 
 			// NULL upper bound → skip entire scan (no row can satisfy <= NULL)
 			return nil, nil, false, nil
 		}
-		k, encErr := encodeBTreeKeyForColumn(v, col, o.plan.HighKey.Pos())
+		k, encErr := o.ctx.indexProbeKey(o.plan.Index, []indexProbeKeyPart{{col: col, val: v, pos: o.plan.HighKey.Pos()}})
 		if encErr != nil {
 			return nil, nil, false, encErr
 		}
@@ -788,8 +786,9 @@ func (o *indexScanOp) lookupRangeBounds() (loKey []byte, hiKey []byte, ok bool, 
 // index probe (M0053-0001). It must exceed the maximum suffix-column
 // encoding for any plausible composite key. 64 bytes covers up to
 // ~8 trailing int4/int8 columns, ~3 NUMERIC(38) columns, or 1 varchar(60).
-// PostgreSQL's MaxHighKeyLen on goopg is 32, but leaf keys are not
-// truncated, so a generous bound is required.
+// This is a SCAN-KEY padding, not an on-disk bound: separators are suffix-
+// truncated (M0130-S11.4 3b-3c) but a leaf key is not, so the padding has to
+// cover a whole trailing key encoding.
 const compositeUpperPaddingLen = 64
 
 // appendCompositeUpperPadding returns key with `compositeUpperPaddingLen`

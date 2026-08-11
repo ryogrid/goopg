@@ -3,7 +3,6 @@ package executor
 import (
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -42,12 +41,12 @@ func TestDDLCreateVarcharBTreeIndexAcceptsType(t *testing.T) {
 		t.Fatal("index not in catalog after CREATE INDEX")
 	}
 	idxRel := ctx.Catalog.IndexRelFileNode(idx)
-	tree, err := btree.Open(ctx.Pool, idxRel)
+	tree, err := openIndexBTree(ctx, idx, idxRel)
 	if err != nil {
-		t.Fatalf("btree.Open: %v", err)
+		t.Fatalf("openIndexBTree: %v", err)
 	}
 	for _, seg := range []string{"FURNITURE", "HOUSEHOLD", "MACHINERY"} {
-		_, found, err := tree.Search(btree.EncodeVarchar([]byte(seg)))
+		_, found, err := tree.Search(indexProbeForTest(t, ctx, idx, NewStringDatum(seg)))
 		if err != nil || !found {
 			t.Fatalf("Search(%q): found=%v err=%v", seg, found, err)
 		}
@@ -115,13 +114,13 @@ func TestDDLVarcharIndexSeqScanParity(t *testing.T) {
 	}
 	idx, _ := ctx.Catalog.LookupIndex(parser.ObjectName{Name: "idx_mktseg_seg"})
 	idxRel := ctx.Catalog.IndexRelFileNode(idx)
-	tree, err := btree.Open(ctx.Pool, idxRel)
+	tree, err := openIndexBTree(ctx, idx, idxRel)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Count FURNITURE rows via RangeScan with exact key.
-	targetKey := btree.EncodeVarchar([]byte("FURNITURE"))
+	targetKey := indexProbeForTest(t, ctx, idx, NewStringDatum("FURNITURE"))
 	indexCount := 0
 	if err := tree.RangeScan(targetKey, targetKey, func(_ []byte, _ storage.ItemPointer) (bool, error) {
 		indexCount++

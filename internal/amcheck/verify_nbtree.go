@@ -59,14 +59,32 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
+// The on-page key format is a per-index catalog property, exactly like the
+// opclass KeyComparator below: an index whose keys are stored as PG index
+// tuples (a key descriptor resolved by btree.IndexFormatFor) must be decoded by
+// the tuple decoder, and one whose keys are goopg's opaque order-preserving
+// blobs by the blob decoder. Neither is derivable from the page bytes, and the
+// tiers take an indexName, not an index — so every tier that decodes keys takes
+// a btree.IndexFormat from its caller, which internal/executor's bt_index_check
+// resolves from the catalog entry (ctx.pgIndexKeyDesc) the same way it resolves
+// the comparator. The zero IndexFormat is the blob format, which is what the
+// page-bytes-only convenience wrappers and tests pass.
+// M0130-S11.4 slice 3b-2c-ii-B2-b-iii.
+
 // BtreeReport is one B-tree index corruption finding. Block is the 0-based
 // block number the corruption was found on; Msg is the upstream-matching
 // corruption message (verbatim from verify_nbtree.c, including the
 // in index "<name>" clause, so the later SQL surface and the
 // 003_check/005_opclass_damage ports can reuse it).
+// Detail carries the upstream errdetail_internal text for the findings whose
+// upstream ereport has one and whose content is not derivable from Block alone
+// (today: the uniqueness tier's index/heap TID pair, verify_nbtree.c's
+// bt_report_duplicate). It is empty for tiers whose upstream detail is just the
+// block number, which the SQL surface already renders. M0119-0006.
 type BtreeReport struct {
-	Block storage.BlockNumber
-	Msg   string
+	Block  storage.BlockNumber
+	Msg    string
+	Detail string
 }
 
 // VerifyBtreePage runs the page-structural bt_index_check tier on a single
@@ -196,7 +214,42 @@ func VerifyBtreePage(p storage.Page, blkno storage.BlockNumber, indexName string
 // metapage and deleted pages hold no orderable items and yield nil. A page whose
 // items cannot be decoded surfaces as a finding, never a Go error, matching the
 // report-and-continue model of the heap engine.
+// It decodes the page under the blob key format (the zero btree.IndexFormat);
+// a caller holding the index's catalog entry must use VerifyBtreeItemOrderCmp
+// and pass the resolved format.
 func VerifyBtreeItemOrder(p storage.Page, blkno storage.BlockNumber, indexName string) []BtreeReport {
+	return VerifyBtreeItemOrderCmp(p, blkno, indexName, btree.IndexFormat{}, nil)
+}
+
+// KeyComparator compares two encoded index keys, returning <0, 0 or >0 exactly
+// like btree.CompareKeys. It is the seam through which a caller supplies an
+// *operator-class* comparator instead of the engine's built-in byte order.
+//
+// Upstream amcheck never compares index keys itself: every comparison goes
+// through the index's own support function 1 (`_bt_compare` → the BTORDER_PROC
+// resolved from pg_amproc for the index's opclass, verify_nbtree.c's
+// `bt_index_check` operating on a fully-built `BTScanInsert` key). That is what
+// makes pg_amcheck's 005_opclass_damage.pl work: it swaps the pg_amproc row of a
+// custom operator class to a comparator that sorts the other way, and the *same*
+// physically-unchanged index then reports `item order invariant violated`,
+// because the check is performed under the new sort order.
+//
+// goopg's engine is key-encoding based (order-preserving bytes, btree.CompareKeys),
+// so the opclass comparator is injected here rather than being intrinsic. A nil
+// KeyComparator selects btree.CompareKeys — the default for every index whose key
+// column uses a built-in operator class. M0119-0006 (005_opclass_damage).
+type KeyComparator func(a, b []byte) int
+
+// VerifyBtreeItemOrderCmp is VerifyBtreeItemOrder with the index's two catalog
+// properties supplied explicitly: keyFmt is the on-page key format the page is
+// decoded under (see the note above KeyComparator's block), and cmpKeys the key
+// comparator. Both invariants — high key and item order — are evaluated under
+// the comparator, matching upstream where a single opclass comparator governs
+// every key comparison amcheck performs on the index.
+func VerifyBtreeItemOrderCmp(p storage.Page, blkno storage.BlockNumber, indexName string, keyFmt btree.IndexFormat, cmpKeys KeyComparator) []BtreeReport {
+	if cmpKeys == nil {
+		cmpKeys = btree.CompareKeys
+	}
 	// The metapage has no data items; deleted pages hold none either (their
 	// level field is type-punned and the page carries no live tuples).
 	if blkno == btree.MetaBlock {
@@ -207,22 +260,27 @@ func VerifyBtreeItemOrder(p storage.Page, blkno storage.BlockNumber, indexName s
 		return nil
 	}
 
-	keys, err := btree.PageItemKeys(p)
+	keys, err := keyFmt.PageItemKeys(p)
 	if err != nil {
 		return []BtreeReport{{Block: blkno, Msg: fmt.Sprintf(
 			"index \"%s\" has a damaged page at block %d: %v", indexName, blkno, err)}}
 	}
 
 	leaf := opaque.IsLeaf()
-	// A non-rightmost page that carries a high key bounds every item from above.
-	// This mirrors the engine's keyExceedsHighKey gating (rightmost pages have no
-	// high key to honour).
-	checkHighKey := opaque.HasHighKey() && opaque.Next != storage.InvalidBlockNumber
+	// A non-rightmost page carries a high key at P_HIKEY that bounds every data
+	// item from above. This mirrors the engine's keyExceedsHighKey gating
+	// (rightmost pages have no high key to honour). PageItemKeys returns DATA
+	// item keys only, so the separator is never compared against itself.
+	highKey, checkHighKey, hkErr := keyFmt.PageHighKey(p)
+	if hkErr != nil {
+		return []BtreeReport{{Block: blkno, Msg: fmt.Sprintf(
+			"index \"%s\" has a damaged page at block %d: %v", indexName, blkno, hkErr)}}
+	}
 
 	for i, key := range keys {
 		if checkHighKey {
 			// Leaf: key <= high key. Internal: key < high key.
-			cmp := btree.CompareKeys(key, opaque.HighKey)
+			cmp := cmpKeys(key, highKey)
 			if (leaf && cmp > 0) || (!leaf && cmp >= 0) {
 				return []BtreeReport{{Block: blkno, Msg: fmt.Sprintf(
 					"high key invariant violated for index \"%s\"", indexName)}}
@@ -231,7 +289,7 @@ func VerifyBtreeItemOrder(p storage.Page, blkno storage.BlockNumber, indexName s
 		// Item order: current key must not be greater than the next item's key
 		// (a strict decrease is the only violation — see the doc comment above
 		// on why goopg tolerates equal adjacent keys).
-		if i+1 < len(keys) && btree.CompareKeys(key, keys[i+1]) > 0 {
+		if i+1 < len(keys) && cmpKeys(key, keys[i+1]) > 0 {
 			return []BtreeReport{{Block: blkno, Msg: fmt.Sprintf(
 				"item order invariant violated for index \"%s\"", indexName)}}
 		}
@@ -399,12 +457,25 @@ func VerifyBtreeLevelSiblingLinks(src PageSource, leftmost storage.BlockNumber, 
 //     surfaces as a damaged-page finding, never a Go panic, matching the
 //     report-and-continue model of the other tiers.
 //
+// keyFmt is the on-page key format the parent and its children are decoded
+// under, and cmpKeys the index's opclass comparator (nil selects
+// btree.CompareKeys). The lower-bound test goes through cmpKeys for the same
+// reason the item-order tier does: upstream routes EVERY key comparison
+// amcheck makes on an index through that index's support function 1, so
+// invariant_l_nontarget_offset (verify_nbtree.c:2500-2540) and bt_target_page
+// share one ordering. Comparing the bound with btree.CompareKeys instead would
+// both miss opclass damage the item-order tier reports and, once keys are
+// stored as PG index tuples, byte-compare whole tuples rather than key columns.
+//
 // Like the other tiers it returns 0 or 1 findings: upstream ereport(ERROR)s on
 // the first violation, so the first downlink problem the scan reaches is
 // conclusive. A leaf or deleted parentBlk (no downlinks to descend) and the
 // metapage yield nil. It performs only the cross-level checks; per-page
 // structure and key order are run separately and composed by the SQL surface.
-func VerifyBtreeParentDownlinks(src PageSource, parentBlk storage.BlockNumber, indexName string) []BtreeReport {
+func VerifyBtreeParentDownlinks(src PageSource, parentBlk storage.BlockNumber, indexName string, keyFmt btree.IndexFormat, cmpKeys KeyComparator) []BtreeReport {
+	if cmpKeys == nil {
+		cmpKeys = btree.CompareKeys
+	}
 	if parentBlk == btree.MetaBlock {
 		return nil
 	}
@@ -422,7 +493,7 @@ func VerifyBtreeParentDownlinks(src PageSource, parentBlk storage.BlockNumber, i
 		return nil
 	}
 
-	downlinks, err := btree.PageDownlinks(parent)
+	downlinks, err := keyFmt.PageDownlinks(parent)
 	if err != nil {
 		return []BtreeReport{{Block: parentBlk, Msg: fmt.Sprintf(
 			"index \"%s\" has a damaged page at block %d: %v", indexName, parentBlk, err)}}
@@ -452,7 +523,7 @@ func VerifyBtreeParentDownlinks(src PageSource, parentBlk storage.BlockNumber, i
 		// Down-link lower bound: every real child key must be >= the parent's
 		// separator key for this child. Skip the child's negative-infinity item
 		// (the first item of an internal child, stored with the empty key).
-		keys, err := btree.PageItemKeys(child)
+		keys, err := keyFmt.PageItemKeys(child)
 		if err != nil {
 			return []BtreeReport{{Block: dl.Child, Msg: fmt.Sprintf(
 				"index \"%s\" has a damaged page at block %d: %v", indexName, dl.Child, err)}}
@@ -464,7 +535,7 @@ func VerifyBtreeParentDownlinks(src PageSource, parentBlk storage.BlockNumber, i
 				// bound applies (offset_is_negative_infinity).
 				continue
 			}
-			if btree.CompareKeys(k, dl.Key) < 0 {
+			if cmpKeys(k, dl.Key) < 0 {
 				return []BtreeReport{{Block: dl.Child, Msg: fmt.Sprintf(
 					"down-link lower bound invariant violated for index \"%s\"", indexName)}}
 			}

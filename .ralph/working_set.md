@@ -1,29 +1,21 @@
-Task: M0119-0004 — Fix TestPort_TSConfigSurvivesRestart (TSConfig lost on restart)
+(idle — nothing in flight)
 
-Files:
-- internal/initdb/catalog_heap_reload.go: reloadUserTSConfigsFromHeap — DBOid: cat.DBOID() → catalog.DefaultDBOid
+Last loop (#118) landed **M0131-S9.0**, the tooling precondition for S9's
+corpus widening. Committed; fix_plan's S9 entry records it, S9 itself stays `[ ]`.
 
-Key symbols:
-- reloadUserTSConfigsFromHeap: reload path that reads TS configs from catalog heap
-- pgTSConfigRel / upsertTSConfigCatalogRow: write path (hardcodes DefaultDBOid)
-- ListUserTSConfigs: filters by uc.DBOid == dbOid (the query-time filter)
-- NamespaceDBOid / DefaultDBOid / PostgresDBOid: the dual-mirror catalog DBOid scheme
+Two of the three hand-edits S7.4 ledgered are now closed — the `pg_rewrite`
+`_RETURN` seed rows are generated from the manifest's `rule_oid`, and the
+per-view `//go:embed` lines are one glob into an `embed.FS`. Adding a view is
+now: `scripts/capture-ev-action.sh <view>` then
+`go run cmd/gen-nailed-view-tables/main.go > internal/initdb/nailed_view_seed_data.go`.
 
-Hypothesis/Findings:
-- Root cause: `reloadUserTSConfigsFromHeap` stamped `DBOid: cat.DBOID()` (= PostgresDBOid=5), but `ListUserTSConfigs` filters by `NamespaceDBOid(CurrentDatabaseOid)` (= DefaultDBOid=1). The write side (`pgTSConfigRel()`) uses DefaultDBOid and mirrors to PostgresDBOid, so the reload correctly reads from the mirrored location but stamps the wrong DBOid.
-- TS dicts don't have this bug because `ListUserTSDicts` has no DBOid filter.
-- Fix: changed `DBOid: cat.DBOID()` → `DBOid: catalog.DefaultDBOid` in reloadUserTSConfigsFromHeap.
-- Deferred: per-DB catalog heap routing for pg_ts_config (the write path always uses DefaultDBOid regardless of creating database). Tracked in deferral ledger.
-- Pre-existing failures: TestPort_IsolationMergeUpdate (line count mismatch, normalization issue, unrelated).
+**Next per the banner: M0131-S9.1** — capture the 23 SRF-only views listed in
+`docs/design/0131-0009-system-view-corpus-widening.md` §"S9.1". Two notes from
+that doc worth carrying: capture `pg_stat_bgwriter`/`pg_stat_checkpointer`
+**last** (they have no `FROM` at all — an unmeasured `RTE_RESULT` shape — so an
+unknown node tag surfaces against a two-view blast radius), and add the
+`MaxHeapTupleSize` (~8160 B) assertion to the capture script's blob emitter
+first, since `pg_rewrite`'s TOAST pair (2838/2839) is not bootstrapped and an
+overflowing capture would otherwise seed an unreadable row.
 
-Next step: Advance M0119-0004 — run TestPort_PgDumpConnectionSetup to identify the next catalog-view parity gap, or pick up the next M0119 sub-item.
-
-Gates run:
-- go build ./...: PASS
-- go test ./internal/initdb/... ./internal/catalog/... ./internal/executor/... ./internal/server/...: PASS
-- TestPort_TSConfigSurvivesRestart: PASS (was FAILING before fix)
-- TestPort_TSDictSurvivesRestart: PASS (no regression)
-- RALPH_PRECOMMIT_SCOPE=units + smoke: PASS (0 failed, all 3 workloads)
-- make ralph-state-guard: PASS
-
-In-flight: none
+Remaining unchecked M0131 tasks after S9: S12, S13, S14, S15, S8b.

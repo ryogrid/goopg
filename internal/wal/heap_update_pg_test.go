@@ -57,7 +57,7 @@ func TestApplyRecordReplaysPGHeapUpdateSamePage(t *testing.T) {
 	if oldAfter.Header.CTID != (storage.ItemPointer{Block: 0, Offset: 2}) {
 		t.Fatalf("old t_ctid = %+v, want {0,2}", oldAfter.Header.CTID)
 	}
-	if oldAfter.Header.Infomask&storage.HeapHotUpdated != 0 {
+	if oldAfter.Header.IsHotUpdated() {
 		t.Fatalf("old tuple must NOT carry HEAP_HOT_UPDATED on a non-HOT update")
 	}
 	if oldAfter.Header.Infomask&storage.HeapXmaxInvalid != 0 {
@@ -73,7 +73,7 @@ func TestApplyRecordReplaysPGHeapUpdateSamePage(t *testing.T) {
 	if newAfter.Header.CTID != (storage.ItemPointer{Block: 0, Offset: 2}) {
 		t.Fatalf("new t_ctid = %+v, want self {0,2}", newAfter.Header.CTID)
 	}
-	if newAfter.Header.Infomask&storage.HeapOnlyTuple != 0 {
+	if newAfter.Header.IsHeapOnly() {
 		t.Fatalf("new tuple must NOT carry HEAP_ONLY_TUPLE")
 	}
 	if string(newAfter.Data) != "new" {
@@ -143,7 +143,7 @@ func TestApplyRecordReplaysPGHeapUpdateCrossPage(t *testing.T) {
 	if oldAfter.Header.CTID != (storage.ItemPointer{Block: 1, Offset: 2}) {
 		t.Fatalf("old t_ctid = %+v, want {1,2} (cross-page forward link)", oldAfter.Header.CTID)
 	}
-	if oldAfter.Header.Infomask&storage.HeapHotUpdated != 0 {
+	if oldAfter.Header.IsHotUpdated() {
 		t.Fatalf("old tuple must NOT carry HEAP_HOT_UPDATED")
 	}
 

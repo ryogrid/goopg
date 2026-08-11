@@ -2304,9 +2304,10 @@ func promoteCrossKind(a, b Datum) (Datum, Datum) {
 	} else if bIsString && !aIsString {
 		b = tryParseStringAs(a.Kind, b.StringValue())
 	}
-	// KindInterval has no text parse path yet — leave as-is so
-	// the caller still errors instead of silently producing an
-	// invalid comparison.
+	// KindInterval parses through tryParseStringAs like every other target
+	// (it gained its arm when interval columns started decoding as
+	// KindInterval); a string neither side can parse is returned unchanged so
+	// the caller still errors instead of silently comparing garbage.
 	return a, b
 }
 
@@ -2321,6 +2322,49 @@ func promoteCrossKind(a, b Datum) (Datum, Datum) {
 // recognised too.
 func hasISODatePrefix(s string) bool {
 	return len(s) >= 10 && s[4] == '-' && s[7] == '-'
+}
+
+// arraySubscriptElemDatum re-types one array element's already-unquoted text as
+// the element type's own Datum, reporting false when the type has no kind of its
+// own here (text-likes, uuid, the fixed-width integers the caller's own fast path
+// already covers) or when the text does not parse.
+//
+// Scope note (M0119-0006): only the element types whose Datum kind changes the
+// ANSWER are routed. Upstream types every subscript through the element type's
+// input function, but goopg's KindTime rendering is not yet byte-identical to
+// the array codec's element spelling, so routing date/time/timestamp here would
+// trade a comparison fix for a rendering regression — recorded in the deferral
+// ledger rather than guessed at. Falling through leaves the pre-existing text
+// behaviour, which is already correct for ISO date/timestamp comparisons because
+// their spelling sorts the same way their values do.
+func arraySubscriptElemDatum(elemType, elem string) (Datum, bool) {
+	switch strings.ToLower(elemType) {
+	case "interval":
+		// Same tokenizer as interval_in and the storage-encode arm, so the
+		// element re-renders through formatInterval exactly as the array codec
+		// spelled it.
+		if months, days, micros, ok := parser.ParseIntervalBody(elem); ok {
+			return NewIntervalDatumFull(months, days, micros), true
+		}
+	case "numeric", "decimal", "float8", "float4", "double precision", "real":
+		// Numeric equality is value-based, so '1.50' = '1.5'; as text they differ.
+		// The scale survives the round trip, so `n[1]` still prints 1.50.
+		//
+		// The float types land here too, because goopg has no KindFloat: a
+		// float8 COLUMN already decodes to KindNumeric and renders through the
+		// same path, so routing float elements here makes the subscript agree
+		// with its own scalar column. Without it `f[1] > f[2]` over
+		// ARRAY[9.5,10.2]::float8[] answered t (text: "9.5" > "10.2") where PG
+		// answers f. A spelling parseNumeric cannot take (scientific notation)
+		// falls through to the pre-existing text behaviour rather than guessing.
+		if v, scale, ok := parseNumericFast(elem); ok {
+			return Datum{Kind: KindNumeric, Int: v, Scale: scale}, true
+		}
+		if m, sc, err := parseNumeric(elem); err == nil {
+			return newNumeric(m, int(sc)), true
+		}
+	}
+	return NullDatum, false
 }
 
 func tryParseStringAs(target DatumKind, s string) Datum {
@@ -2342,7 +2386,16 @@ func tryParseStringAs(target DatumKind, s string) Datum {
 		// shape as the unpadded-field defect, one type over. PG never has this
 		// ambiguity: transformExpr coerces the unknown literal to the column's
 		// type before evaluation.
-		if hasISODatePrefix(pgdatetime.NormalizeInput(s)) {
+		// M0119-0006: a separator-less digit run is a date to DecodeDateTime
+		// ('20200101') but a time of day to DecodeTimeOnly ('040506'), and this
+		// path has no target type to decide with. Take the date reading only for
+		// the widths that cannot also be a time — see
+		// pgdatetime.RunTogetherDateIsTimeAmbiguous.
+		normalized := pgdatetime.NormalizeDateTimeInput(s, false)
+		if pgdatetime.RunTogetherDateIsTimeAmbiguous(s) {
+			normalized = pgdatetime.NormalizeInput(s)
+		}
+		if hasISODatePrefix(normalized) {
 			if t, err := parseCopyTimestamp(s); err == nil {
 				return NewTimeDatum(t)
 			}
@@ -2358,6 +2411,19 @@ func tryParseStringAs(target DatumKind, s string) Datum {
 		}
 		if t, err := parseCopyTimestamp(s); err == nil {
 			return NewTimeDatum(t)
+		}
+	case KindInterval:
+		// `i > '10 days'` on an interval column: the literal is `unknown`
+		// upstream and transformExpr coerces it to interval before the operator
+		// is resolved, so both sides reach interval_gt. goopg has no such
+		// coercion pass, and until interval columns were stored in PG's native
+		// layout both sides happened to be strings, so the comparison "worked"
+		// lexicographically and wrongly. With the column now KindInterval the
+		// string side must be parsed here or the pair falls through to the
+		// Format()-vs-Format() fallback below — text comparison again, just one
+		// level down. Same tokenizer as interval_in / the storage-encode arm.
+		if months, days, micros, ok := parser.ParseIntervalBody(s); ok {
+			return NewIntervalDatumFull(months, days, micros)
 		}
 	}
 	return NewStringDatum(s)
@@ -2818,16 +2884,11 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 	}
 	switch x.Type {
 	case "bool", "boolean":
-		v := strings.TrimSpace(strings.ToLower(x.Value))
-		switch v {
-		case "t", "tr", "tru", "true", "y", "ye", "yes", "on", "1":
-			return NewBoolDatum(true), nil
-		case "f", "fa", "fal", "fals", "false", "n", "no", "of", "off", "0":
-			return NewBoolDatum(false), nil
-		default:
-			return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(),
-				Message: fmt.Sprintf("invalid input syntax for type boolean: %q", x.Value)}
+		if b, ok := pgBoolIn(x.Value); ok {
+			return NewBoolDatum(b), nil
 		}
+		return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(),
+			Message: fmt.Sprintf("invalid input syntax for type boolean: %q", x.Value)}
 
 	case "int2", "smallint":
 		n, err := parseIntegerInput(x.Value, "smallint", 16)
@@ -2944,12 +3005,13 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 		if inf, ok := parseDateInfinityLiteral(x.Value); ok {
 			return inf, nil
 		}
-		// M0125-0007: PG's DecodeDate reads each numeric field on its own, so
-		// '2002-5-1' is the same date as '2002-05-01'. Normalise to the padded
-		// spelling the fixed Go layout below requires.
-		t, err := time.Parse("2006-01-02", pgdatetime.NormalizeInput(x.Value))
+		// M0125-0007 / M0119-0006: PG's DecodeDate reads each numeric field on
+		// its own ('2002-5-1' is '2002-05-01') and accepts a trailing era token
+		// ('2020-01-01 BC'); parsePGDateText applies both around the fixed Go
+		// layout, which can express neither.
+		t, err := parsePGDateText(x.Value)
 		if err != nil {
-			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid date %q: %v", x.Value, err)}
+			return Datum{}, dateTimeInputError(err, "date", x.Value, x.Pos())
 		}
 		x.CachedTime = t.UTC()
 		x.CacheValid = true
@@ -2988,26 +3050,26 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 		if inf, ok := parseTimestampInfinityLiteral(x.Value); ok {
 			return inf, nil
 		}
-		layouts := []string{
-			"2006-01-02 15:04:05.999999-07",
-			"2006-01-02 15:04:05-07",
-			"2006-01-02 15:04-07",
-			"2006-01-02 15:04:05.999999",
-			"2006-01-02 15:04:05",
-			"2006-01-02 15:04",
-			"2006-01-02",
-		}
 		// M0125-0007: same field-at-a-time acceptance as the date case above —
 		// PG takes '2002-5-1 3:4:5' for a timestamp, the layouts below do not.
-		normalized := pgdatetime.NormalizeInput(x.Value)
-		for _, layout := range layouts {
-			if t, err := time.Parse(layout, normalized); err == nil {
-				x.CachedTime = t.UTC()
-				x.CacheValid = true
-				return NewTimeDatum(x.CachedTime), nil
+		// M0119-0006: the whole entry point (era split + normalisation + the
+		// shared pgTimestampLayouts table) is now parsePGTimestampText, which
+		// the COPY/encode path calls too, so the literal path and the COPY path
+		// can no longer accept different spellings of the same timestamp.
+		// M0119-0006: the literal's own type decides what happens to a zone the
+		// input carries — TIMESTAMP '2020-01-01 10:00:00+05:30' is 10:00:00, the
+		// offset parsed and thrown away, while the TIMESTAMPTZ spelling of the
+		// same text is 04:30:00 UTC. See tsZoneMode.
+		t, err := parsePGTimestampTextZone(x.Value, tsZoneModeForType(x.Type))
+		if err != nil {
+			if ee := dateTimeInputError(err, x.Type, x.Value, x.Pos()); ee.Code == "22008" {
+				return Datum{}, ee
 			}
+			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid timestamp %q", x.Value)}
 		}
-		return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid timestamp %q", x.Value)}
+		x.CachedTime = t
+		x.CacheValid = true
+		return NewTimeDatum(x.CachedTime), nil
 	default:
 		// Unknown type — treat as text literal. Covers enum/domain casts in v0.
 		// M0097-0017: enum/domain type casts return the string value as-is.
@@ -3280,16 +3342,11 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 		case KindBool:
 			return d, nil
 		case KindString:
-			v := strings.TrimSpace(strings.ToLower(d.StringValue()))
-			switch v {
-			case "t", "tr", "tru", "true", "y", "ye", "yes", "on", "1":
-				return NewBoolDatum(true), nil
-			case "f", "fa", "fal", "fals", "false", "n", "no", "of", "off", "0":
-				return NewBoolDatum(false), nil
-			default:
-				return Datum{}, &ExecError{Code: "22P02", Pos: pos,
-					Message: fmt.Sprintf("invalid input syntax for type boolean: %q", d.StringValue())}
+			if b, ok := pgBoolIn(d.StringValue()); ok {
+				return NewBoolDatum(b), nil
 			}
+			return Datum{}, &ExecError{Code: "22P02", Pos: pos,
+				Message: fmt.Sprintf("invalid input syntax for type boolean: %q", d.StringValue())}
 		case KindInt:
 			return NewBoolDatum(d.Int != 0), nil
 		default:
@@ -3620,12 +3677,21 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			if inf, ok := parseDateInfinityLiteral(s); ok {
 				return inf, nil
 			}
-			if t, err := parseCopyTimestamp(s); err == nil {
-				t2 := t.UTC()
-				return NewDateDatum(time.Date(t2.Year(), t2.Month(), t2.Day(), 0, 0, 0, 0, time.UTC)), nil
+			// date_in decodes a zone field and then ignores it, so the day comes
+			// from the wall clock as written: '2020-01-02 02:00:00+05:30'::date
+			// is 2020-01-02, not the previous day (tsZoneMode). It likewise never
+			// composes date with time, so an hour-24 / leap-second day carry is
+			// dropped too — '2020-01-01 24:00:00'::date is the 1st.
+			t, err := parseDateInputText(s)
+			if err != nil {
+				// M0119-0006: a range failure (no year zero, or a value the
+				// KindTime carrier cannot hold) keeps its own 22008 wording —
+				// reporting it as a syntax error points the user at the
+				// spelling, which is not what is wrong with it.
+				return Datum{}, dateTimeInputError(err, "date", s, pos)
 			}
-			return Datum{}, &ExecError{Code: "22007", Pos: pos,
-				Message: fmt.Sprintf("invalid input syntax for type date: %q", s)}
+			t2 := t.UTC()
+			return NewDateDatum(time.Date(t2.Year(), t2.Month(), t2.Day(), 0, 0, 0, 0, time.UTC)), nil
 		}
 		if d.Kind == KindTime {
 			// A ±infinity timestamp/date sentinel casts to the same-signed date
@@ -3674,10 +3740,11 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			if inf, ok := parseTimestampInfinityLiteral(d.StringValue()); ok {
 				return inf, nil
 			}
-			ts, err := parseCopyTimestamp(d.StringValue())
+			// `::timestamp` discards a zone the text carries, `::timestamptz`
+			// applies it (tsZoneMode).
+			ts, err := parseCopyTimestampZone(d.StringValue(), tsZoneModeForType(targetType))
 			if err != nil {
-				return Datum{}, &ExecError{Code: "22007", Pos: pos,
-					Message: fmt.Sprintf("invalid input syntax for type timestamp: %q", d.StringValue())}
+				return Datum{}, dateTimeInputError(err, "timestamp", d.StringValue(), pos)
 			}
 			return NewTimeDatum(ts), nil
 		}
@@ -7818,6 +7885,10 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return NewTimeDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), ns, time.UTC)), nil
 	case "current_catalog":
 		return NewStringDatum("postgres"), nil
+	case "pg_client_encoding":
+		return evalPgClientEncoding(row, ctx)
+	case "getdatabaseencoding":
+		return evalGetDatabaseEncoding(row, ctx)
 	case "current_setting":
 		if len(x.Args) >= 1 {
 			nameArg, err := evalExpr(x.Args[0], row, ctx)
@@ -8492,6 +8563,15 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				return NullDatum, nil
 			}
 			elem := elems[n-1]
+			// The planner stamped the element type onto ReturnType (its exprType
+			// array_subscript arm). Re-type the element text through that type's
+			// own input path so the subscript yields the element type's Datum
+			// kind instead of text — otherwise compareDatum never reaches the
+			// interval_cmp_value / numeric ladders and `c[1] = c[2]` compares the
+			// two element SPELLINGS. M0119-0006.
+			if d, ok := arraySubscriptElemDatum(x.ReturnType, elem); ok {
+				return d, nil
+			}
 			// Try to infer element type: if the element looks like a plain integer
 			// (no decimal point, no quotes), return an integer datum for correct
 			// psql alignment and comparison semantics. Matches PG's behaviour where
@@ -8792,16 +8872,17 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				if _, ok := parseDateInfinityLiteral(v); ok {
 					return NewBoolDatum(true), nil
 				}
-				// M0125-0007: pg_input_is_valid must agree with the cast path,
-				// which now accepts PG's unpadded month/day fields.
-				_, err := time.Parse("2006-01-02", pgdatetime.NormalizeInput(v))
+				// M0125-0007 / M0119-0006: pg_input_is_valid must agree with the
+				// cast path, so it goes through the same entry point (unpadded
+				// fields, trailing era token, no year zero).
+				_, err := parsePGDateText(v)
 				return NewBoolDatum(err == nil), nil
 			case "timestamp", "timestamptz":
 				// 'infinity' / '-infinity' are valid timestamp input (#5(d-iv)).
 				if _, ok := parseTimestampInfinityLiteral(v); ok {
 					return NewBoolDatum(true), nil
 				}
-				_, err := parseCopyTimestamp(v)
+				_, err := parseCopyTimestampZone(v, tsZoneModeForType(t))
 				return NewBoolDatum(err == nil), nil
 			default:
 				// varchar(N) / character varying(N) / char(N) / bpchar(N). M0097-0003.
@@ -11548,6 +11629,18 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			return NewStringDatum(catalog.EncodingIDToName(int32(encArg.Int))), nil
 		}
+case "pg_char_to_encoding":
+	// pg_char_to_encoding(name) → int4: resolves an encoding name
+	// (any case, with arbitrary punctuation that clean_encoding_name
+	// strips) to its pg_enc integer ID, or -1 if unknown. Mirrors
+	// pg_char_to_encoding in encnames.c. NULL input → NULL. M0122-0008.
+	if len(x.Args) >= 1 {
+		encArg, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil || encArg.IsNull() {
+			return NullDatum, nil
+		}
+		return Datum{Kind: KindInt, Int: int64(catalog.EncodingNameToID(encArg.StringValue()))}, nil
+	}
 	case "pg_column_size":
 		if len(x.Args) == 1 {
 			v, err := evalExpr(x.Args[0], row, ctx)
@@ -11606,6 +11699,15 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 		}
 		return NewBoolDatum(true), nil
+	// SQL-callable replication-slot management (slotfuncs.c). Both were
+	// already in pg_proc but had no executor arm, so the M0130-S10 E2E
+	// harness got 42883 from `SELECT pg_create_physical_replication_slot(…)`
+	// on a goopg primary. See expr_replslot.go.
+	// M-NIGHTLY AI-20260810-011258-003.
+	case "pg_create_physical_replication_slot":
+		return evalPgCreatePhysicalReplicationSlot(x, row, ctx)
+	case "pg_drop_replication_slot":
+		return evalPgDropReplicationSlot(x, row, ctx)
 	// currtid2(relname text, tid tid) → tid: returns the latest visible TID
 	// for a row in the named relation. M0097-0038.
 	case "currtid2":
@@ -13492,12 +13594,8 @@ func currentSchemasArray(ctx *Context, includeImplicit bool) (Datum, error) {
 }
 
 func isValidBoolInput(v string) bool {
-	switch strings.TrimSpace(strings.ToLower(v)) {
-	case "t", "tr", "tru", "true", "y", "ye", "yes", "on", "1",
-		"f", "fa", "fal", "fals", "false", "n", "no", "of", "off", "0":
-		return true
-	}
-	return false
+	_, ok := pgBoolIn(v)
+	return ok
 }
 
 // hashPartTypesCompatible returns true if the arg type is compatible with the column type
@@ -14866,4 +14964,45 @@ func canonicalTypeName(name string) string {
 		return "character"
 	}
 	return name
+}
+
+// evalPgClientEncoding returns the current session's client_encoding as a name,
+// mirroring PG's pg_client_encoding() (postgres/src/backend/utils/adt/mb/pg_wchar.c).
+// It reads the live client_encoding GUC value; falls back to "UTF8" when the
+// setting is unavailable (nil context / nil GetSetting). M0122-0008.
+func evalPgClientEncoding(row Row, ctx *Context) (Datum, error) {
+	enc := "UTF8"
+	if ctx != nil && ctx.GetSetting != nil {
+		if v, ok := ctx.GetSetting("client_encoding"); ok {
+			enc = v
+		}
+	}
+	return NewStringDatum(enc), nil
+}
+
+// evalGetDatabaseEncoding returns the current database's encoding as a name,
+// mirroring PG's getdatabaseencoding() (postgres/src/backend/utils/adt/dbsize.c).
+// It reads the encoding ID from the in-memory catalog and maps it to a canonical
+// name; falls back to "UTF8" when the context or catalog is unavailable.
+// M0122-0008.
+func evalGetDatabaseEncoding(row Row, ctx *Context) (Datum, error) {
+	if ctx == nil || ctx.Catalog == nil {
+		return NewStringDatum("UTF8"), nil
+	}
+	dbName := ctx.CurrentDatabase
+	if dbName == "" {
+		dbName = "postgres"
+	}
+	// DatabaseEncoding lives on *InMemory, not the Catalog interface. Type-assert
+	// so this works against the production implementation; the fallback covers
+	// tests that supply a different Catalog implementation.
+	var encID int32 = -1
+	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+		encID = im.DatabaseEncoding(dbName)
+	}
+	encName := catalog.EncodingIDToName(encID)
+	if encName == "" {
+		encName = "UTF8"
+	}
+	return NewStringDatum(encName), nil
 }

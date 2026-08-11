@@ -118,8 +118,9 @@ func TestE2E_ChecksumStreamingGoopgToPG(t *testing.T) {
 	// creates the slot, streams the (checksummed) data dir, and writes
 	// standby.signal + postgresql.auto.conf.
 	runGoopgBasebackupToPG(t, repo, pgBasebackupBin, primary, standbyDir, slotName)
-	// Ensure relcache init files are present on the PG standby (M0106).
-	copyInitFiles(t, primary.DataDir(), standbyDir)
+	// M0131-S10: the M0106-era relcache-init-file copy was deleted here — PG
+	// unlinks every `pg_internal.init` in `StartupXLOG` before a backend can
+	// read one. docs/design/0131-0010-copyinitfiles-retirement.md.
 	configurePGStandbyFromGoopgBackup(t, standbyDir,
 		primaryConninfoForPGStandby(primary, slotName), slotName)
 

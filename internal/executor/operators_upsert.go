@@ -153,7 +153,7 @@ func (o *upsertOp) Open(ctx *Context) error {
 	}
 	if o.plan.OnConflict.ArbiterIndex != nil {
 		idxRel := ctx.Catalog.IndexRelFileNode(o.plan.OnConflict.ArbiterIndex)
-		tree, err := btree.Open(ctx.Pool, idxRel)
+		tree, err := openIndexBTree(ctx, o.plan.OnConflict.ArbiterIndex, idxRel)
 		if err != nil {
 			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 		}
@@ -346,7 +346,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 			// call in applyInsert used a pre-computed key (no re-eval), so we
 			// compensate with two explicit calls here.
 			for range 2 {
-				if _, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos()); err != nil {
+				if _, err := o.ctx.arbiterProbeKey(o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos()); err != nil {
 					return nil, err
 				}
 			}
@@ -358,7 +358,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 			// no-op (no side-effectful evaluation). Mirrors PG's ExecBuildArbiterKey
 			// call in ExecOnConflictUpdate.
 			if o.plan.OnConflict.ArbiterIndex != nil {
-				if _, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos()); err != nil {
+				if _, err := o.ctx.arbiterProbeKey(o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos()); err != nil {
 					return nil, err
 				}
 			}
@@ -398,7 +398,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 					// the arbiter expression once more, then wait and re-probe with the
 					// already-computed key so completion stays blocked until the other
 					// transaction settles.
-					if _, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos()); err != nil {
+					if _, err := o.ctx.arbiterProbeKey(o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos()); err != nil {
 						return nil, err
 					}
 					qctx := o.ctx.Ctx
@@ -416,7 +416,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 						}
 						if waited {
 							// Re-run arbiter expression after spec token released.
-							if _, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos()); err != nil {
+							if _, err := o.ctx.arbiterProbeKey(o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos()); err != nil {
 								return nil, err
 							}
 						}
@@ -588,7 +588,7 @@ func (o *upsertOp) routeAndOpenLeaf(inserted Row) (*catalog.Table, *btree.BTree,
 		return leaf, nil, nil
 	}
 	idxRel := o.ctx.Catalog.IndexRelFileNode(leafIdx)
-	tree, err := btree.Open(o.ctx.Pool, idxRel)
+	tree, err := openIndexBTree(o.ctx, leafIdx, idxRel)
 	if err != nil {
 		return nil, nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
@@ -644,7 +644,7 @@ func (o *upsertOp) probeArbiter(rel storage.RelFileNode, cols []catalog.Column, 
 	if o.arbiterTree == nil {
 		return nil, storage.ItemPointer{}, nil, false, nil
 	}
-	key, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos())
+	key, err := o.ctx.arbiterProbeKey(o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos())
 	if err != nil {
 		return nil, storage.ItemPointer{}, nil, false, err
 	}
@@ -702,7 +702,7 @@ func (o *upsertOp) probeArbiterByKey(rel storage.RelFileNode, cols []catalog.Col
 			// Re-pin the page and follow the chain so a concurrent HOT update
 			// doesn't leave the arbiter probe without a conflict match.
 			// M0100-0005 (Bug A — HOT path).
-			if tuple.Header.Infomask&storage.HeapHotUpdated != 0 && o.ctx.Pool != nil {
+			if tuple.Header.IsHotUpdated() && o.ctx.Pool != nil {
 				hotBuf, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
 				if perr == nil {
 					hotBuf.RLock()
@@ -849,7 +849,7 @@ func (o *upsertOp) findInProgressConflict(rel storage.RelFileNode, inserted Row)
 	if o.arbiterTree == nil || o.ctx == nil {
 		return 0, false, false, nil
 	}
-	key, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos())
+	key, err := o.ctx.arbiterProbeKey(o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos())
 	if err != nil || key == nil {
 		return 0, false, false, nil
 	}
@@ -960,7 +960,7 @@ func (o *upsertOp) applyInsert(rel storage.RelFileNode, tbl *catalog.Table, cols
 	// here until the controller releases the Phase-B advisory lock.
 	var phaseBKey []byte
 	if o.plan.OnConflict != nil && o.plan.OnConflict.ArbiterIndex != nil {
-		key, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, insertedParent, o.plan.Pos())
+		key, err := o.ctx.arbiterProbeKey(o.plan.OnConflict, o.plan.Table, insertedParent, o.plan.Pos())
 		if err != nil {
 			return storage.ItemPointer{}, err
 		}
@@ -980,7 +980,24 @@ func (o *upsertOp) applyInsert(rel storage.RelFileNode, tbl *catalog.Table, cols
 	// Insert the arbiter btree entry using the pre-computed Phase B key so the
 	// expression is not re-evaluated (avoiding extra NOTICEs for plain INSERT).
 	if phaseBKey != nil {
-		_ = o.maintainArbiter(phaseBKey, ptr)
+		// The Phase-B key is a PROBE key: it was built before the heap write, so
+		// it cannot carry the TID the row now lives at. Under the blob format
+		// that is exactly the entry key too (no TID in the bytes), and reusing it
+		// is the point — it is what keeps a side-effectful arbiter expression
+		// from being evaluated a second time. Under the tuple format the entry
+		// key embeds the heap TID, so it has to be rebuilt now that there is one;
+		// such an index has no expression key column (buildPGIndexKeyDesc refuses
+		// those), so the rebuild costs a projection and repeats no side effect.
+		// M0130-S11.4 slice 3b-2c-ii-B2-c-vii.
+		entryKey := phaseBKey
+		if o.ctx.pgIndexKeyDesc(o.plan.OnConflict.ArbiterIndex) != nil {
+			k, err := o.ctx.arbiterEntryKey(o.plan.OnConflict, o.plan.Table, insertedParent, ptr, o.plan.Pos())
+			if err != nil {
+				return storage.ItemPointer{}, err
+			}
+			entryKey = k
+		}
+		_ = o.maintainArbiter(entryKey, ptr)
 		// Register the speculative insertion token now that the unique index
 		// entry is visible. SettleSpec is called by the caller after
 		// probeSpeculativeConflict returns. M0100-0006b.
@@ -1102,7 +1119,7 @@ func (o *upsertOp) applyUpdate(rel storage.RelFileNode, tbl *catalog.Table, cols
 	// This produces 2 NOTICEs for blurt_and_lock_* expression indexes, mirroring
 	// PG's ExecOnConflictUpdate → ExecUpdate → ExecInsertIndexTuples behavior.
 	if o.plan.OnConflict != nil && o.plan.OnConflict.ArbiterIndex != nil {
-		key, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, updatedParent, o.plan.Pos())
+		key, err := o.ctx.arbiterEntryKey(o.plan.OnConflict, o.plan.Table, updatedParent, newPtr, o.plan.Pos())
 		if err != nil {
 			return err
 		}
@@ -1192,12 +1209,17 @@ func (o *upsertOp) maintainNonArbiterIndexesCapture(tbl *catalog.Table, cols []c
 			continue
 		}
 		idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
-		tree, err := btree.Open(o.ctx.Pool, idxRel)
+		tree, err := openIndexBTree(o.ctx, idx, idxRel)
 		if err != nil {
 			continue
 		}
-		key, err := encodeIndexKeyFromCols(idx, cols, row, o.ctx.Catalog)
+		key, err := o.ctx.indexEntryKey(idx, cols, row, ptr)
 		if err != nil || key == nil {
+			// Blob-format repair only — see maintainUniqueIndexesForInsert's note
+			// on this fallback (M0130-S11.4 slice 3b-2c-ii-B2-c-vii).
+			if o.ctx.pgIndexKeyDesc(idx) != nil {
+				continue
+			}
 			key = encodeExprIndexKey(o.ctx, idx, tbl, row)
 			if key == nil {
 				continue
@@ -1226,16 +1248,28 @@ func (o *upsertOp) maintainNonArbiterIndexesForUpdate(tbl *catalog.Table, cols [
 			continue
 		}
 		idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
-		tree, err := btree.Open(o.ctx.Pool, idxRel)
+		tree, err := openIndexBTree(o.ctx, idx, idxRel)
 		if err != nil {
 			continue
 		}
-		if cached, ok := o.specIndexKeys[idx.OID]; ok && o.indexKeyUnchangedFromSpec(idx, cols, row) {
+		// The cache exists to avoid RE-EVALUATING a side-effectful expression
+		// index, and a blob key is TID-free, so the spec row's key is literally
+		// the updated row's key. A tuple-format key is not: it carries the heap
+		// TID of the row it was built for, and this insert points at a different
+		// one. Such an index is never an expression index (buildPGIndexKeyDesc
+		// refuses those), so re-encoding it costs nothing but a projection.
+		// M0130-S11.4 slice 3b-2c-ii-B2-c-iv.
+		if cached, ok := o.specIndexKeys[idx.OID]; ok && o.ctx.pgIndexKeyDesc(idx) == nil && o.indexKeyUnchangedFromSpec(idx, cols, row) {
 			_ = tree.Insert(cached, ptr)
 			continue
 		}
-		key, err := encodeIndexKeyFromCols(idx, cols, row, o.ctx.Catalog)
+		key, err := o.ctx.indexEntryKey(idx, cols, row, ptr)
 		if err != nil || key == nil {
+			// Blob-format repair only — see maintainUniqueIndexesForInsert's note
+			// on this fallback (M0130-S11.4 slice 3b-2c-ii-B2-c-vii).
+			if o.ctx.pgIndexKeyDesc(idx) != nil {
+				continue
+			}
 			key = encodeExprIndexKey(o.ctx, idx, tbl, row)
 			if key == nil {
 				continue
@@ -1436,7 +1470,7 @@ func (o *upsertOp) cancelSpeculativeRow(rel storage.RelFileNode, ptr storage.Ite
 }
 
 func (o *upsertOp) maintainArbiterRow(row Row, ptr storage.ItemPointer) error {
-	key, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, row, o.plan.Pos())
+	key, err := o.ctx.arbiterEntryKey(o.plan.OnConflict, o.plan.Table, row, ptr, o.plan.Pos())
 	if err != nil {
 		return err
 	}
@@ -1511,7 +1545,7 @@ func encodeArbiterKey(ctx *Context, oc *planner.OnConflictPlan, tbl *catalog.Tab
 				return nil, nil
 			}
 			// Encode the expression result as a text/varchar key.
-			k := encodeArbiterExprKey(v, pos)
+			k := encodeArbiterExprKey(ctx, v, oc.ArbiterExprs[i], pos)
 			if k == nil {
 				return nil, &ExecError{Code: "42804", Pos: pos, Message: "expression-based arbiter column produced unsupported datum type"}
 			}
@@ -1533,16 +1567,231 @@ func encodeArbiterKey(ctx *Context, oc *planner.OnConflictPlan, tbl *catalog.Tab
 	return out, nil
 }
 
-// encodeArbiterExprKey encodes a Datum produced by an expression-based
-// arbiter column into BTree key bytes. Supports text/string and integer
-// datums (the most common expression result types).
-func encodeArbiterExprKey(v Datum, pos int) []byte {
+// encodeArbiterExprKey encodes a Datum produced by an expression key column
+// into BTree key bytes. It is the expression-side sibling of
+// encodeBTreeKeyForColumn and is shared by all three expression-key paths:
+// ON CONFLICT arbiter probing (encodeArbiterKey), the runtime index-maintain
+// path (encodeExprIndexKey in operators_storage.go) and the bulk build /
+// REINDEX path (encodeCompositeBTreeKeyWithExprs in operators_ddl.go). Every
+// arm must therefore stay byte-identical across those callers — a key written
+// by one and re-derived by another has to land on the same bytes.
+//
+// Dispatch is on the runtime Datum kind rather than a declared column type,
+// because an expression key column has no catalog column to consult
+// (idx.Columns[i] == ""). Kind dispatch is sound as long as an expression
+// yields a stable kind across rows, which holds for every builtin goopg
+// evaluates today EXCEPT float4/float8 (see the deferral ledger row for the
+// remaining mixed-kind cases).
+//
+// float is the exception, and the reason keyExpr exists. goopg has no
+// KindFloat: the codec re-parses a stored float's PGFloatOut text
+// (floatTextDatum), so one float column yields KindNumeric for 1.5 and
+// KindString for 1e+30 / Infinity / NaN. Under pure kind dispatch those two
+// rows would land in the SAME index under DIFFERENT encodings (EncodeNumericKey
+// vs EncodeVarchar), which is not an ordering at all. So when the key
+// expression's static result type (planner.ExprResultType) is a float type,
+// every row goes through EncodeFloat8 — the same encoder a float8 *column* key
+// uses, whose bit-flip order puts NaN last exactly as PG's float8 opclass does.
+// keyExpr may be nil (callers that have no resolved expression); then the kind
+// dispatch below applies unchanged.
+//
+// enum is the second type-directed arm, and the reason ctx exists. An enum
+// *column* key is EncodeFloat8(enumsortorder) — the label's DECLARATION order,
+// which is what PG's enum_ops orders by (enum_cmp → enumsortorder,
+// src/backend/utils/adt/enum.c) — and every column path converts a KindString
+// label to KindEnum first (M0097-0022) precisely so that holds. An expression
+// key column has no catalog column, so that conversion never ran and a label
+// reached the KindString arm below: the index came out in ALPHABETICAL label
+// order ('happy' < 'ok' < 'sad') instead of enum order (sad < ok < happy). Two
+// consequences, both real: an ordered read of the index disagrees with the
+// type's ordering, and a row whose datum did arrive as KindEnum (the seq-scan
+// path injects those) encoded 8 float bytes into the same index as the label
+// bytes — the float bug's mixed-encoding shape again. So when the key
+// expression's static result type names a user enum, the label is resolved
+// through the catalog and every row goes through EncodeFloat8(sort order).
+//
+// Each arm reuses the same order-preserving encoder that the equivalent
+// declared column type would use, so bytewise comparison of the encoded key
+// reproduces the SQL ordering of the expression's result type:
+//
+//	KindString  → EncodeVarchar   (text/varchar/uuid/name)
+//	KindInt     → EncodeInt8      (int2/int4/int8 widened to int64)
+//	KindNumeric → EncodeNumericKey(mantissa, scale)
+//	KindTime    → EncodeTimestamp (micros since the PG epoch; date/time
+//	                               subtypes order correctly under the same
+//	                               scale, so no subtype tag is needed)
+//	KindBool    → EncodeInt8(0/1) (false < true, PG's boolean btree order)
+//	KindEnum    → EncodeFloat8(sort order)  — same as the enum column path
+//	KindBytes   → EncodeVarchar   (bytea; escaped encoding is bytewise-order
+//	                               preserving and self-terminating)
+//
+// Returns nil for a kind with no btree encoding; callers treat that as
+// "row not indexable" rather than an error.
+func encodeArbiterExprKey(ctx *Context, v Datum, keyExpr planner.Expr, pos int) []byte {
+	if exprKeyIsFloat(keyExpr) {
+		f, _, ok := datumToFloat64ForKey(v)
+		if !ok {
+			return nil
+		}
+		return btree.EncodeFloat8(f)
+	}
+	if et, ok := exprKeyEnumType(ctx, keyExpr); ok {
+		order, ok := enumSortOrderForKey(et, v)
+		if !ok {
+			// A value that is not a label of this enum cannot be placed in the
+			// type's order; the row is simply not indexed, as for any other
+			// kind the encoder has no arm for.
+			return nil
+		}
+		return btree.EncodeFloat8(order)
+	}
 	switch v.Kind {
 	case KindString:
 		return btree.EncodeVarchar([]byte(v.StringValue()))
 	case KindInt:
 		return btree.EncodeInt8(v.Int)
+	case KindNumeric:
+		return btree.EncodeNumericKey(numericMant(v), v.Scale)
+	case KindTime:
+		return btree.EncodeTimestamp(v.TimeValue().Sub(pgEpoch).Microseconds())
+	case KindBool:
+		if v.BoolValue() {
+			return btree.EncodeInt8(1)
+		}
+		return btree.EncodeInt8(0)
+	case KindEnum:
+		return btree.EncodeFloat8(v.EnumSortOrder())
+	case KindBytes:
+		return btree.EncodeVarchar(v.BytesValue())
 	}
 	return nil
+}
+
+// exprKeyIsFloat reports whether an index key expression's static result type is
+// a float type, which is the one case where encodeArbiterExprKey cannot dispatch
+// on the runtime Datum kind (see its comment). Resolution failure means "not
+// known to be float" and leaves the kind dispatch in charge — the pre-M0119-0006
+// behaviour — so an expression whose type goopg cannot resolve is never made
+// worse by this check.
+func exprKeyIsFloat(keyExpr planner.Expr) bool {
+	if keyExpr == nil {
+		return false
+	}
+	t, ok := planner.ExprResultType(keyExpr)
+	return ok && !t.IsArray && isFloat8Type(t.Name)
+}
+
+// exprKeyEnumType reports the enum type an index key expression yields, when it
+// yields one. Like exprKeyIsFloat, a resolution failure means "not known to be
+// an enum" and leaves the runtime kind dispatch in charge, so nothing an earlier
+// goopg indexed stops being indexed.
+//
+// planner.ExprResultType already returns a user enum's type NAME for the shapes
+// an enum key expression actually takes (a ColumnRef of enum type, a CAST to the
+// enum, a CASE over them); it is the catalog, not the planner, that decides
+// whether that name is an enum. exactTypeOID deliberately refuses to resolve
+// non-builtin type names, so a FuncCall *over* an enum argument still declines —
+// conservative in the same direction.
+func exprKeyEnumType(ctx *Context, keyExpr planner.Expr) (*catalog.EnumType, bool) {
+	if ctx == nil || keyExpr == nil {
+		return nil, false
+	}
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok || im == nil {
+		return nil, false
+	}
+	t, ok := planner.ExprResultType(keyExpr)
+	if !ok || t.IsArray || t.Name == "" {
+		return nil, false
+	}
+	et, isEnum := im.LookupEnum(t.Name)
+	if !isEnum || et == nil {
+		return nil, false
+	}
+	return et, true
+}
+
+// enumSortOrderForKey resolves the enumsortorder an enum-typed key datum encodes
+// under. A datum that already went through a KindEnum injection carries the
+// order; one that did not is still the raw label, and the catalog entry is what
+// turns it into an order — the same label→order step every enum COLUMN path
+// performs before calling encodeBTreeKeyForColumn (M0097-0022).
+func enumSortOrderForKey(et *catalog.EnumType, v Datum) (float64, bool) {
+	switch v.Kind {
+	case KindEnum:
+		return v.EnumSortOrder(), true
+	case KindString:
+		label := v.StringValue()
+		for _, ev := range et.Values {
+			if ev.Label == label {
+				return ev.SortOrder, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// exprKeyDecodeType is the DECODE-side twin of encodeArbiterExprKey: given the
+// statically resolved SQL result type of an expression key column
+// (planner.ExprResultType), it returns the *surrogate* column type whose
+// decoder in decodeIndexKeyColumn consumes exactly the bytes the encoder above
+// wrote, plus whether a user opclass comparator may be handed the decoded
+// Datum.
+//
+// The surrogate is NOT always the SQL type, because encodeArbiterExprKey
+// dispatches on the runtime Datum *kind*, not on a declared type — every
+// integer width goes through EncodeInt8 (8 bytes) where an int4 *column* key
+// would be 4, and every date/time value goes through EncodeTimestamp (micros)
+// where a date *column* key would be int4 days. Decoding an expression key
+// under its SQL type would therefore consume the wrong width and desynchronize
+// the whole composite walk. Any change to an encodeArbiterExprKey arm must
+// change the matching row here (Hard-won Rule #2: sibling paths move together;
+// TestExprKeyDecodeTypeRoundTrip pins the pairing).
+//
+// allowRoutine is false where the surrogate's decoded Datum kind does not match
+// what a comparator declared over the SQL type expects: a bool expression
+// decodes as an integer 0/1 and a bytea expression as a string, so feeding
+// either to a user FUNCTION 1 routine could invent an ordering. Those columns
+// still decode (so the walk stays aligned) but keep the engine's byte order,
+// which for both encodings is the type's own order anyway.
+//
+// ok=false means the expression's key bytes are not invertible at all — the
+// caller must decline the whole index. That covers the kinds encodeArbiterExprKey
+// has no arm for (float4/float8 — such a row is simply not indexed today) and
+// enums, whose EncodeFloat8(sort order) key cannot be turned back into a label
+// without the enum catalog entry.
+func exprKeyDecodeType(t catalog.Type) (surrogate catalog.Type, allowRoutine bool, ok bool) {
+	if t.IsArray {
+		return catalog.Type{}, false, false
+	}
+	switch strings.ToLower(t.Name) {
+	case "int2", "smallint", "int4", "int", "integer", "int8", "bigint", "oid":
+		// KindInt → EncodeInt8, regardless of the declared width.
+		return catalog.Type{Name: "int8"}, true, true
+	case "bool", "boolean":
+		// KindBool → EncodeInt8(0/1): decodes as an integer, not a boolean.
+		return catalog.Type{Name: "int8"}, false, true
+	case "numeric", "decimal":
+		return catalog.Type{Name: "numeric"}, true, true
+	case "date", "time", "time without time zone", "timestamp",
+		"timestamp without time zone", "timestamptz", "timestamp with time zone":
+		// KindTime → EncodeTimestamp (int64 micros) for every subtype.
+		return catalog.Type{Name: "timestamp"}, true, true
+	case "text", "varchar", "character varying", "char", "character", "bpchar",
+		"name", "uuid":
+		return catalog.Type{Name: "text"}, true, true
+	case "bytea":
+		// KindBytes → EncodeVarchar: same self-delimiting form as text, but the
+		// decoded Datum is a string of raw bytes.
+		return catalog.Type{Name: "text"}, false, true
+	case "float4", "float8", "real", "double precision", "double", "float":
+		// Type-directed arm (exprKeyIsFloat), not kind dispatch: every float key
+		// is EncodeFloat8, exactly as a float8 COLUMN key is. allowRoutine is
+		// true because the decode is the column path's decode too — a float8
+		// column key also comes back as the 'g'-formatted string a comparator
+		// declared over float8 already sees.
+		return catalog.Type{Name: "float8"}, true, true
+	}
+	return catalog.Type{}, false, false
 }
  

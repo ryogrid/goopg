@@ -6,14 +6,19 @@ package executor
 // RecordKindCreateView(103) / RecordKindCreateMatView(102) records. A real PG18
 // standby replays the heap insert (no rmid-128).
 //
-// NARROW removal (see the deferral ledger): ev_action stores the view's SELECT
-// as SQL TEXT (goopg's pg_node_tree-as-text convention, shared with
-// pg_attrdef.adbin / pg_statistic_ext.stxexprs), NOT a canonical nodeToString
-// dump — goopg has no node-tree serializer. pg_class.relhasrules stays FALSE for
-// user views, so a real PG standby does not try to expand the rule it cannot
-// parse (the view replays and exists, but querying it on the standby needs
-// canonical ev_action + relhasrules=true — a SEPARATE, blocked track). goopg's
-// own reload (loadViewsFromHeap) re-parses the SQL text to rebuild the view AST.
+// ev_action carries one of two forms (see canonicalViewEvAction): a canonical
+// PG18 pg_node_tree for the view shapes pgnodes.ResolveViewQuery supports, or
+// goopg's pg_node_tree-as-text fallback (shared with pg_attrdef.adbin /
+// pg_statistic_ext.stxexprs) for everything else. goopg's own reload
+// (loadViewsFromHeap) discriminates on the leading "({" and re-parses the SQL
+// text form to rebuild the view AST.
+//
+// M0123-S3 superseded this file's original "relhasrules stays FALSE for user
+// views" note: buildUserPGClassRow now stamps relhasrules = tbl.RuleIsCanonical
+// (pg18_user_catalog_rows.go), so a real PG DOES enter the rule-loading path
+// for a canonical view. M0131-S5 removed the last blocker behind it — the heap
+// row is now indexed in 2692/2693, because RelationBuildRuleLock finds the rule
+// only through 2693 and has no seq-scan fallback (see writeViewRewriteRow).
 // Column layout: postgres/src/include/catalog/pg_rewrite.h (8 cols).
 
 import (
@@ -26,6 +31,12 @@ import (
 )
 
 const pgRewriteRelOID = 2618 // pg_rewrite
+
+// viewRuleName is the rulename PG gives every ON-SELECT view rule
+// (ViewSelectRuleName, postgres/src/include/rewrite/rewriteDefine.h). It is
+// also half the 2693 index key, so the heap row and the leaf must use the
+// same literal.
+const viewRuleName = "_RETURN"
 
 // pgRewriteEvClassOffset is the byte offset of ev_class (column 3) in the
 // canonical pg_rewrite tuple data: oid(4) + rulename(name, 64) = 68.
@@ -89,20 +100,32 @@ func canonicalViewEvAction(ctx *Context, tbl *catalog.Table, sqlText string) (ev
 // ev_action forms by the leading "({" and rebuilds the view AST accordingly.
 func writeViewRewriteRow(ctx *Context, tbl *catalog.Table, evAction string) error {
 	rel := pgRewriteRel(ctx)
+	ruleOID := ctx.Catalog.AllocOID()
 	row := Row{
-		NewIntDatum(int64(ctx.Catalog.AllocOID())), // oid (rule OID; identity only)
-		NewStringDatum("_RETURN"),                  // rulename
-		NewIntDatum(int64(tbl.OID)),                // ev_class
-		NewIntDatum(int64('1')),                    // ev_type = CMD_SELECT
-		NewIntDatum(int64('O')),                    // ev_enabled = ALWAYS
-		NewBoolDatum(true),                         // is_instead
-		NewStringDatum("<>"),                       // ev_qual (empty node tree)
-		NewStringDatum(evAction),                   // ev_action (canonical node tree or SQL text)
+		NewIntDatum(int64(ruleOID)),  // oid (rule OID; identity only)
+		NewStringDatum(viewRuleName), // rulename
+		NewIntDatum(int64(tbl.OID)),  // ev_class
+		NewIntDatum(int64('1')),      // ev_type = CMD_SELECT
+		NewIntDatum(int64('O')),      // ev_enabled = ALWAYS
+		NewBoolDatum(true),           // is_instead
+		NewStringDatum("<>"),         // ev_qual (empty node tree)
+		NewStringDatum(evAction),     // ev_action (canonical node tree or SQL text)
 	}
-	if _, err := writeHeapRowCanonical(ctx, rel, PGRewriteColumnsPG18(), row); err != nil {
+	tid, err := writeHeapRowCanonical(ctx, rel, PGRewriteColumnsPG18(), row)
+	if err != nil {
 		return err
 	}
-	return nil
+	// M0131-S5: index the row in pg_rewrite's two declared btrees. goopg's own
+	// reload seq-scans base/<dbOid>/2618 and needs neither, but a real PG's
+	// RelationBuildRuleLock reaches the rule ONLY through 2693 (indexOK=true
+	// with no seq-scan fallback), so an unindexed row makes the view
+	// unqueryable there (42809) even though pg_get_viewdef — which goes through
+	// SPI, i.e. a planned seq-scan — reconstructs it correctly. 2693 first: it
+	// is the load-bearing one.
+	if err := insertPgRewriteRelRulenameIndexEntry(ctx, tbl.OID, viewRuleName, tid); err != nil {
+		return err
+	}
+	return insertPgRewriteOidIndexEntry(ctx, ruleOID, tid)
 }
 
 // viewRelationResolver adapts the live catalog to pgnodes.RelationResolver so

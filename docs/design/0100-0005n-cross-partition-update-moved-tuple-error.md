@@ -189,3 +189,89 @@ End-to-end: `go test -race ./internal/executor/ ./internal/storage/
 diff narrows from 13 → 11 missing lines; the remaining 11 are all
 inside trigger-driven permutations on `footrg` (separate scope, see
 above).
+
+## Addendum (2026-08-10) — the sentinel stamp must also write cmax
+
+Status: accepted (M-NIGHTLY, AI-20260809-020705-018)
+
+The original change treated `PageSetHeapTupleMovedPartition` as a
+*replacement* for the ordinary delete-half stamp: the three
+cross-partition sites branched
+
+```go
+if isCrossPartitionMove {
+        stampErr = storage.PageSetHeapTupleMovedPartition(page, slot, writerXID)
+} else {
+        stampErr = stampUpdaterXmaxNonHOT(ctx, page, slot, hdr, true)  // …+ PageSetHeapTupleCmax
+}
+```
+
+so the cross-partition arm wrote `t_xmax` and the sentinel `t_ctid`
+but never `t_cid`. Upstream does not branch this way. `heap_delete`
+calls `HeapTupleHeaderSetCmax` unconditionally
+(`heapam.c:3065`) and only *afterwards* adds
+`HeapTupleHeaderSetMovedPartitions` (`heapam.c:3071`) — the sentinel is
+an addition to the normal delete stamp, not an alternative to it.
+
+### Why the omission was invisible for three months
+
+`t_cid` is a union: it holds cmin until the tuple is deleted, then
+cmax. Skipping the cmax write leaves the *inserting* command's cmin in
+place, and `mvcc.TupleVisible` reads it back as cmax in the
+`effXmax == currentXID` arm:
+
+```
+cmax >= curcid → "deleted by a later command" → pre-image visible
+cmax <  curcid → invisible
+```
+
+Only the moving transaction itself takes that arm — every other session
+judges `t_xmax` against its snapshot and never consults cmax — so the
+moved-away row stayed correctly hidden from all readers except its own
+writer. It also only misbehaves when the stale cmin happens to be `>=`
+the writer's current command id, i.e. when the row was inserted late in
+some *earlier, longer* transaction and moved early in a *fresh* one.
+A same-transaction insert-then-move (the shape most unit tests use)
+always has cmin `<` curcid and silently produced the right answer.
+
+The isolation spec `merge-update`, permutation
+`pa_merge1 pa_merge2a c1 pa_select2 c2`, hits the bad case exactly: the
+spec's multi-statement `setup` block gives `pa_target`'s rows a high
+cmin, and session s2 then performs a `WHEN NOT MATCHED BY SOURCE`
+cross-partition UPDATE at command 1. `pa_select2` — s2's own re-scan —
+returned 3 rows where PG returns 2, the surplus row being the
+moved-away pre-image. The step's own `RETURNING` output was correct
+throughout, which is what made the failure read as a phantom.
+
+### Fix
+
+All three sites now go through one helper,
+`stampMovedPartitionOldTuple` (`operators_storage.go`), which writes
+xmax + sentinel + cmax in upstream's order:
+
+- `operators_merge.go::mergeApplyUpdate` (MERGE cross-partition move)
+- `operators_storage.go` updateOp index-scan arm
+- `operators_storage.go` updateOp seq-scan arm
+
+### Verification
+
+- `internal/executor/epq_moved_partition_test.go::TestStampMovedPartitionOldTupleWritesCmax`
+  — asserts the helper writes cmax, preserves the sentinel, and hides
+  the row from the writer's next command. Its
+  `bare_sentinel_stamp_leaks_the_row` sub-test asserts the *pre-fix*
+  stamp still leaks the row, so the gate cannot pass vacuously if the
+  visibility rule later changes.
+- `TestPort_IsolationMergeUpdate` — PASSES (was the only reproducing
+  failure of the 23 testport items in nightly run `20260809-020705`).
+- `TestPort_IsolationPartitionKeyUpdate1..4`, `TestPort_IsolationMergeDelete`,
+  `TestPort_IsolationMergeInsertUpdate` — green (sibling cross-partition
+  coverage for the two plain-UPDATE sites).
+
+### Still deferred
+
+goopg never allocates combo CIDs: all four `PageSetHeapTupleCmax`
+call-sites (this helper included) pass `isCombo=false`, and
+`mvcc.AdjustCmax` has no non-test callers. A tuple inserted *and*
+cross-partition-moved by the same transaction therefore loses its cmin
+to the cmax write, so a cursor opened before the move can misjudge the
+pre-image. See the deferral ledger row dated 2026-08-10.

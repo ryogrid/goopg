@@ -33,7 +33,7 @@ func TestApplyRecordReplaysPGHeapHotUpdate(t *testing.T) {
 	// HOT update: new version at slot 2, updater xid 99.
 	const xmax = storage.TransactionID(99)
 	newTup := storage.NewHeapTuple(xmax, storage.InvalidTransactionID, []byte("new"))
-	newTup.Header.Infomask |= storage.HeapOnlyTuple // HOT new version
+	newTup.Header.SetHeapOnly() // HOT new version
 	newBytes, err := newTup.MarshalBinary()
 	if err != nil {
 		t.Fatal(err)
@@ -59,7 +59,7 @@ func TestApplyRecordReplaysPGHeapHotUpdate(t *testing.T) {
 	if oldAfter.Header.CTID != (storage.ItemPointer{Block: 0, Offset: 2}) {
 		t.Fatalf("old t_ctid = %+v, want {0,2} (->new)", oldAfter.Header.CTID)
 	}
-	if oldAfter.Header.Infomask&storage.HeapHotUpdated == 0 {
+	if !oldAfter.Header.IsHotUpdated() {
 		t.Fatalf("old tuple missing HEAP_HOT_UPDATED")
 	}
 
@@ -73,7 +73,7 @@ func TestApplyRecordReplaysPGHeapHotUpdate(t *testing.T) {
 	if newAfter.Header.CTID != (storage.ItemPointer{Block: 0, Offset: 2}) {
 		t.Fatalf("new t_ctid = %+v, want self {0,2}", newAfter.Header.CTID)
 	}
-	if newAfter.Header.Infomask&storage.HeapOnlyTuple == 0 {
+	if !newAfter.Header.IsHeapOnly() {
 		t.Fatalf("new tuple missing HEAP_ONLY_TUPLE")
 	}
 	if string(newAfter.Data) != "new" {

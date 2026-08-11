@@ -4,7 +4,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -46,14 +45,13 @@ func TestDDLCreateTimestampBTreeIndexAcceptsType(t *testing.T) {
 		t.Fatal("index not in catalog after CREATE INDEX")
 	}
 	idxRel := ctx.Catalog.IndexRelFileNode(idx)
-	tree, err := btree.Open(ctx.Pool, idxRel)
+	tree, err := openIndexBTree(ctx, idx, idxRel)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	for _, d := range dates {
-		micros := d.Sub(pgEpoch).Microseconds()
-		key := btree.EncodeTimestamp(micros)
+		key := indexProbeForTest(t, ctx, idx, NewTimeDatum(d))
 		_, found, err := tree.Search(key)
 		if err != nil || !found {
 			t.Fatalf("Search(%v): found=%v err=%v", d, found, err)
@@ -98,14 +96,14 @@ func TestDDLTimestampRangeScanParity(t *testing.T) {
 	}
 	idx, _ := ctx.Catalog.LookupIndex(parser.ObjectName{Name: "idx_shipdate"})
 	idxRel := ctx.Catalog.IndexRelFileNode(idx)
-	tree, err := btree.Open(ctx.Pool, idxRel)
+	tree, err := openIndexBTree(ctx, idx, idxRel)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// RangeScan [1995-01-01, 1995-12-31] — should return exactly 3 rows.
-	lo := btree.EncodeTimestamp(time.Date(1995, 1, 1, 0, 0, 0, 0, time.UTC).Sub(pgEpoch).Microseconds())
-	hi := btree.EncodeTimestamp(time.Date(1995, 12, 31, 0, 0, 0, 0, time.UTC).Sub(pgEpoch).Microseconds())
+	lo := indexProbeForTest(t, ctx, idx, NewTimeDatum(time.Date(1995, 1, 1, 0, 0, 0, 0, time.UTC)))
+	hi := indexProbeForTest(t, ctx, idx, NewTimeDatum(time.Date(1995, 12, 31, 0, 0, 0, 0, time.UTC)))
 	indexCount := 0
 	if err := tree.RangeScan(lo, hi, func(_ []byte, _ storage.ItemPointer) (bool, error) {
 		indexCount++

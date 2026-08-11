@@ -196,3 +196,111 @@ func alignForTest(am int64, as int16, bm int64, bs int16) (int64, int64, int16) 
 	}
 	return am, bm, common
 }
+
+// TestDecodeNumericKeyRoundTrip pins DecodeNumericKey as the inverse of
+// EncodeNumericKey (M0119-0006: the amcheck operator-class comparator must
+// hand the user's FUNCTION 1 routine the *value*, not the key bytes).
+//
+// The round trip is value-preserving, not byte-preserving: EncodeNumericKey
+// strips trailing mantissa zeros, so (150,2) comes back as (15,1). Both denote
+// 1.5, which is what every caller compares on.
+func TestDecodeNumericKeyRoundTrip(t *testing.T) {
+	cases := []struct {
+		name      string
+		mant      int64
+		scale     int16
+		wantMant  int64
+		wantScale int16
+	}{
+		{"zero", 0, 0, 0, 0},
+		{"zero-scaled", 0, 4, 0, 0},
+		{"one", 1, 0, 1, 0},
+		{"one-point-five", 15, 1, 15, 1},
+		{"trailing-zeros-normalise", 150, 2, 15, 1},
+		{"hundred", 100, 0, 100, 0},
+		{"negative", -12345, 3, -12345, 3},
+		{"negative-int", -42, 0, -42, 0},
+		{"tiny", 1, 9, 1, 9},
+		{"negative-tiny", -7, 9, -7, 9},
+		{"max-int64", math.MaxInt64, 0, math.MaxInt64, 0},
+		{"min-int64", math.MinInt64, 0, math.MinInt64, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			enc := encodeNumericInt64(c.mant, c.scale)
+			m, s, n, err := DecodeNumericKey(enc)
+			if err != nil {
+				t.Fatalf("DecodeNumericKey(%d,%d): %v", c.mant, c.scale, err)
+			}
+			if n != len(enc) {
+				t.Fatalf("consumed %d bytes, key is %d", n, len(enc))
+			}
+			if m.Cmp(big.NewInt(c.wantMant)) != 0 || s != c.wantScale {
+				t.Fatalf("got (%s,%d), want (%d,%d)", m.String(), s, c.wantMant, c.wantScale)
+			}
+			// Re-encoding the decoded pair must reproduce the same key bytes.
+			if got := EncodeNumericKey(m, s); !bytes.Equal(got, enc) {
+				t.Fatalf("re-encode mismatch: %x vs %x", got, enc)
+			}
+		})
+	}
+}
+
+// TestDecodeNumericKeyBigMantissa covers the big.Int lane (M0041-0004 widened
+// the encoder past int64; the decoder must not narrow it back).
+func TestDecodeNumericKeyBigMantissa(t *testing.T) {
+	big1, _ := new(big.Int).SetString("123456789012345678901234567891", 10)
+	for _, mant := range []*big.Int{big1, new(big.Int).Neg(big1)} {
+		enc := EncodeNumericKey(mant, 5)
+		m, s, n, err := DecodeNumericKey(enc)
+		if err != nil {
+			t.Fatalf("DecodeNumericKey: %v", err)
+		}
+		if n != len(enc) || s != 5 || m.Cmp(mant) != 0 {
+			t.Fatalf("got (%s,%d,%d), want (%s,5,%d)", m, s, n, mant, len(enc))
+		}
+	}
+}
+
+// TestDecodeNumericKeyComposite pins the self-delimiting property: a decoder
+// handed a composite key that continues past this column must consume exactly
+// this column's bytes. This is the contract the amcheck column-by-column walk
+// (btIndexOpClassComparator) depends on.
+func TestDecodeNumericKeyComposite(t *testing.T) {
+	first := encodeNumericInt64(-2500, 2)
+	second := encodeNumericInt64(31415, 4)
+	composite := append(append([]byte{}, first...), second...)
+
+	m, s, n, err := DecodeNumericKey(composite)
+	if err != nil {
+		t.Fatalf("first column: %v", err)
+	}
+	if n != len(first) || m.Cmp(big.NewInt(-25)) != 0 || s != 0 {
+		t.Fatalf("first column got (%s,%d,%d), want (-25,0,%d)", m, s, n, len(first))
+	}
+	m2, s2, n2, err := DecodeNumericKey(composite[n:])
+	if err != nil {
+		t.Fatalf("second column: %v", err)
+	}
+	if n2 != len(second) || m2.Cmp(big.NewInt(31415)) != 0 || s2 != 4 {
+		t.Fatalf("second column got (%s,%d,%d), want (31415,4,%d)", m2, s2, n2, len(second))
+	}
+}
+
+// TestDecodeNumericKeyRejectsGarbage: a key slice that is not a numeric key
+// must error rather than manufacture a value — the comparator falls back to
+// byte order on error, which is only safe if errors are actually reported.
+func TestDecodeNumericKeyRejectsGarbage(t *testing.T) {
+	for _, bad := range [][]byte{
+		{},
+		{0x7F},                                   // bad sign byte
+		{0x02, 0x80, 0x00, 0x00},                 // truncated exponent
+		{0x02, 0x80, 0x00, 0x00, 0x00, '1', '2'}, // missing terminator
+		{0x02, 0x80, 0x00, 0x00, 0x00, 'x', 0x00}, // non-digit
+		{0x02, 0x80, 0x00, 0x00, 0x00, 0x00},      // no digits
+	} {
+		if _, _, _, err := DecodeNumericKey(bad); err == nil {
+			t.Fatalf("DecodeNumericKey(%x) = nil error, want error", bad)
+		}
+	}
+}

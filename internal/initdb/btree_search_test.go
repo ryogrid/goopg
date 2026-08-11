@@ -119,30 +119,42 @@ func TestPgRewriteRowLayout(t *testing.T) {
 	t.Logf("pg_rewrite file size: %d bytes (%d pages)", len(data), len(data)/8192)
 
 	le := binary.LittleEndian
-	// Read page 0 header
-	page := data[0:8192]
-	lower := le.Uint16(page[12:14])
-	nSlots := int(lower-24) / 4
-	t.Logf("Page 0: pd_lower=%d, nSlots=%d", lower, nSlots)
 
-	if nSlots == 0 {
-		t.Fatal("pg_rewrite page 0 is empty!")
-		return
+	// Locate pg_stat_wal_receiver's rule row by its OID rather than by slot
+	// position: M0131-S9.0 generates the seed rows from the capture manifest,
+	// so heap order follows capture order (which is not a catalog invariant and
+	// will shift again as M0131-S9 widens the corpus). The layout assertions
+	// below are about one row's bytes, not about which slot holds it.
+	var tupleData []byte
+	for pageNo := 0; pageNo*8192 < len(data) && tupleData == nil; pageNo++ {
+		page := data[pageNo*8192 : (pageNo+1)*8192]
+		lower := le.Uint16(page[12:14])
+		if lower < 24 {
+			continue
+		}
+		nSlots := int(lower-24) / 4
+		t.Logf("Page %d: pd_lower=%d, nSlots=%d", pageNo, lower, nSlots)
+		for slot := 0; slot < nSlots; slot++ {
+			lp := le.Uint32(page[24+slot*4 : 28+slot*4])
+			off := int(lp & 0x7FFF)
+			size := int((lp >> 17) & 0x7FFF)
+			if off == 0 || size == 0 || off+24 > len(page) {
+				continue
+			}
+			tHoff := int(page[off+22])
+			d := page[off+tHoff:]
+			if len(d) < 4 || le.Uint32(d[0:4]) != pgRewriteOIDPgStatWalReceiverReturn {
+				continue
+			}
+			t.Logf("pg_stat_wal_receiver._RETURN at page %d slot %d: offset=%d size=%d t_hoff=%d",
+				pageNo, slot+1, off, size, tHoff)
+			tupleData = d
+			break
+		}
 	}
-
-	// Read slot 1's line pointer
-	lp := le.Uint32(page[24:28])
-	off := lp & 0x7FFF
-	size := (lp >> 17) & 0x7FFF
-	t.Logf("Slot 1: offset=%d, size=%d", off, size)
-
-	// The tuple header is at page[off:off+24] (t_hoff=24)
-	tupleHdr := page[int(off) : int(off)+24]
-	tHoff := tupleHdr[22]
-	t.Logf("t_hoff=%d", tHoff)
-
-	// Tuple data starts at page[off+tHoff:]
-	tupleData := page[int(off)+int(tHoff):]
+	if tupleData == nil {
+		t.Fatalf("no pg_rewrite row with OID %d (pg_stat_wal_receiver._RETURN)", pgRewriteOIDPgStatWalReceiverReturn)
+	}
 
 	// Column layout:
 	// [0:4] oid
@@ -193,9 +205,12 @@ func TestPgRewriteRowLayout(t *testing.T) {
 	if compressionMethod != 0 {
 		t.Errorf("ev_action compression method = %d, want 0 (PGLZ)", compressionMethod)
 	}
-	// The raw (decompressed) size of pg_stat_wal_receiver ev_action is 5928 bytes.
-	if rawSize != 5928 {
-		t.Errorf("ev_action rawSize = %d, want 5928 (pg_stat_wal_receiver nodeToString)", rawSize)
+	// The raw (decompressed) size must be the captured blob's own length —
+	// derived from the embedded .dat rather than re-typed, so a re-capture that
+	// legitimately changes the blob does not need this constant edited, while a
+	// row that lost or truncated its payload still fails.
+	if want := len(nailedViewEvAction("pg_stat_wal_receiver")); rawSize != want {
+		t.Errorf("ev_action rawSize = %d, want %d (pg_stat_wal_receiver nodeToString)", rawSize, want)
 	}
 	// Compressed size must be smaller than raw+4 (otherwise we wouldn't have compressed).
 	if compressedTotalSize >= rawSize+4 {

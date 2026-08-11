@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/parser"
@@ -360,7 +359,7 @@ func vacuumIndexes(ctx *Context, tbl *catalog.Table, deadTIDs []storage.ItemPoin
 			continue
 		}
 		idxRel := ctx.Catalog.IndexRelFileNode(idx)
-		tree, err := btree.Open(ctx.Pool, idxRel)
+		tree, err := openIndexBTree(ctx, idx, idxRel)
 		if err != nil {
 			continue // index may not exist yet (e.g. freshly created)
 		}

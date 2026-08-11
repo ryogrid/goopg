@@ -84,3 +84,35 @@ func RemoveStandbySignal(dataDir string) error {
 	}
 	return nil
 }
+
+// IsRecovery reports whether `<dataDir>/recovery.signal` is present.
+// A missing data directory or unreadable file returns (false, nil) —
+// callers reading the flag at boot want a "not in recovery" answer in
+// the absence of a signal, not a hard error. Other I/O errors are
+// surfaced.
+func IsRecovery(dataDir string) (bool, error) {
+	if dataDir == "" {
+		return false, nil
+	}
+	path := filepath.Join(dataDir, RecoverySignalFile)
+	_, err := os.Stat(path)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, err
+}
+
+// RemoveRecoverySignal deletes the recovery.signal trigger file.
+// Called by the archive-recovery completion path after all available
+// WAL has been replayed and the server promotes to primary. Safe to
+// call when the file doesn't exist (no-op).
+func RemoveRecoverySignal(dataDir string) error {
+	path := filepath.Join(dataDir, RecoverySignalFile)
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}

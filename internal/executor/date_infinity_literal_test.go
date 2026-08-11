@@ -57,8 +57,16 @@ func TestDateInfinityLiteral(t *testing.T) {
 		{"SELECT pg_input_is_valid('not-a-date', 'date') FROM t", "f"},
 		// Ordering: +infinity sorts above every finite date, -infinity below
 		// (compareDatum KindTime orders by the Int sentinel).
-		{"SELECT date 'infinity' > date '9999-12-31' FROM t", "t"},
-		{"SELECT date '-infinity' < date '0001-01-01' FROM t", "t"},
+		// The finite operands are the extremes of the range goopg can store, not
+		// PG's ('9999-12-31' / '0001-01-01'): the KindTime Datum counts
+		// NANOSECONDS since 1970, so anything outside 1677-09-21 .. 2262-04-11
+		// is now a loud 22008 instead of the silently WRAPPED date it used to
+		// decode to (see date_era_and_range_input_test.go and the M0119-0006
+		// ledger row for the carrier fix that restores PG's full range). The
+		// assertion — a sentinel orders outside every finite date — is
+		// unchanged.
+		{"SELECT date 'infinity' > date '2262-04-11' FROM t", "t"},
+		{"SELECT date '-infinity' < date '1678-01-01' FROM t", "t"},
 	}
 	for _, c := range cases {
 		t.Run(c.sql, func(t *testing.T) {

@@ -2281,6 +2281,12 @@ type InMemory struct {
 	// Absent entries report -1 (PG's "no limit" default, pg_database.h) via
 	// DatabaseConnLimit's comma-ok lookup.
 	databaseConnLimit map[string]int32
+	// databaseEncoding holds the per-database encoding (pg_database.encoding,
+	// pg_enc integer ID). Set at CREATE DATABASE time from the ENCODING option
+	// (or inherited from the template). Absent entries (bootstrap databases
+	// or databases created before this field was added) report PG_UTF8 (6)
+	// via DatabaseEncoding. M0122-0008.
+	databaseEncoding map[string]int32
 	// databaseOwner holds `pg_database.datdba` for databases registered via
 	// CreateDatabase/RegisterDatabaseDuringRecovery (M0122-0007 DROP DATABASE
 	// ownership check). Absent entries (the bootstrap postgres/template0/
@@ -3743,6 +3749,7 @@ func NewInMemory() *InMemory {
 		routines:               NewRoutines(),
 		databases:              map[string]bool{"postgres": true, "template1": true, "template0": true},
 		databaseConnLimit:      make(map[string]int32),
+		databaseEncoding:       make(map[string]int32),
 		databaseOwner:          make(map[string]uint32),
 		databaseOid:            make(map[string]uint32),
 		dbRoleSettings:         make(map[uint32][]string),
@@ -5030,6 +5037,7 @@ func (c *InMemory) DropDatabase(name string) error {
 	}
 	delete(c.databases, name)
 	delete(c.databaseConnLimit, name)
+	delete(c.databaseEncoding, name)
 	delete(c.databaseOwner, name)
 	delete(c.databaseOid, name)
 	return nil
@@ -5229,6 +5237,30 @@ func (c *InMemory) SetDatabaseConnLimit(name string, limit int32) bool {
 		return false
 	}
 	c.databaseConnLimit[name] = limit
+	return true
+}
+
+// DatabaseEncoding returns the per-database encoding (pg_enc integer ID) for
+// name, or PG_UTF8 (6) if none was explicitly set — all bootstrap databases
+// and databases created before M0122-0008 default to UTF8. M0122-0008.
+func (c *InMemory) DatabaseEncoding(name string) int32 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if enc, ok := c.databaseEncoding[name]; ok {
+		return enc
+	}
+	return 6 // PG_UTF8
+}
+
+// SetDatabaseEncoding records a per-database encoding for name. Returns false
+// if name is not a registered database. M0122-0008.
+func (c *InMemory) SetDatabaseEncoding(name string, encoding int32) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.databases[name] {
+		return false
+	}
+	c.databaseEncoding[name] = encoding
 	return true
 }
 
@@ -12970,6 +13002,35 @@ func (c *InMemory) CreateExtension(name, schema, version, database string, ifNot
 	return nil
 }
 
+
+	// DropExtension removes a runtime pg_extension entry (DROP EXTENSION).
+	// The caller (execDropCompat) has already validated the extension exists and
+	// captured its OID for heap cleanup.
+	func (c *InMemory) DropExtension(name string) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		delete(c.extensions, strings.ToLower(name))
+	}
+
+	// CreateExtensionDuringRecovery re-registers an extension at startup from the
+	// pg_extension heap (M0130-S3). Unlike CreateExtension (which mints a new OID
+	// via nextOID++), this records the pg_extension-derived OID verbatim so the
+	// reloaded extensions match their on-disk OIDs.
+	func (c *InMemory) CreateExtensionDuringRecovery(name, schema, version, database string, oid uint32) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		lc := strings.ToLower(name)
+		if _, ok := c.extensions[lc]; ok {
+			return // already registered
+		}
+		c.extensions[lc] = &extensionRow{
+			oid:      oid,
+			name:     name,
+			schema:   schema,
+			version:  version,
+			database: database,
+		}
+	}
 // ExtensionOID returns the runtime pg_extension OID for the named extension, or
 // 0 if no extension by that name is installed. Used by COMMENT ON EXTENSION to
 // key the pg_description row on the extension's catalog OID (classoid 3079) so
@@ -13468,6 +13529,31 @@ func (c *InMemory) ListUserConversionsForDBOid(dbOid uint32) []*UserConversion {
 		}
 	}
 	return out
+}
+
+// FindDefaultConversionProc returns the proc OID for the default conversion
+// between forEnc and toEnc, searching user-created conversions (CREATE
+// CONVERSION). Built-in conversion pairs (the 128 bootstrap rows seeded by
+// initdb) are resolved at the executor level via mb.BuiltinLookup, which
+// matches the known proc OIDs. Mirrors PG's FindDefaultConversion
+// (namespace.c:4083 → pg_conversion.c:152, CONDEFAULT syscache scan).
+// The caller resolves the returned OID to an mb.ConvProc.
+func (c *InMemory) FindDefaultConversionProc(forEnc, toEnc int32, dbOid ...uint32) (uint32, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	resolveDBOid := DefaultDBOid
+	if len(dbOid) > 0 {
+		resolveDBOid = dbOid[0]
+	}
+	// Walk in reverse so later-created conversions shadow earlier ones.
+	for i := len(c.userConversions) - 1; i >= 0; i-- {
+		uc := c.userConversions[i]
+		if uc.ForEncoding == forEnc && uc.ToEncoding == toEnc &&
+			uc.Default && uc.DBOid == resolveDBOid {
+			return uc.FuncOID, true
+		}
+	}
+	return 0, false
 }
 
 // PGConversionRowsForDBOid builds the pg_conversion catalog row-set for
@@ -19249,6 +19335,39 @@ func (c *InMemory) SetAmProcMemberProc(oid, newProcOID uint32) bool {
 		}
 	}
 	return false
+}
+
+// LookupOpClassSupportProcOID resolves the pg_amproc.amproc OID of support
+// function number procNum for the *user-created* operator class named
+// opClassName under access method methodOID — PG's
+// `get_opfamily_proc(opclass's opcfamily, opcintype, opcintype, procNum)`
+// (utils/cache/lsyscache.c), the lookup `_bt_first`/amcheck perform to find an
+// index's BTORDER_PROC (procNum 1) comparator.
+//
+// It reads the live amProcMembers store, so a runtime
+// `UPDATE pg_catalog.pg_amproc SET amproc = ...` (nextVirtualPgAmproc →
+// SetAmProcMemberProc) is observed immediately — that is the corruption-injection
+// mechanism pg_amcheck's 005_opclass_damage.pl relies on. Built-in (BKI-pinned)
+// operator classes are deliberately NOT covered: their comparators are the
+// engine's own key encoding, not a catalog-resolved function.
+// M0119-0006 (005_opclass_damage).
+func (c *InMemory) LookupOpClassSupportProcOID(opClassName string, methodOID, procNum uint32) (uint32, bool) {
+	var classOID uint32
+	for _, uoc := range c.ListUserOperatorClasses() {
+		if uoc.Method == methodOID && uoc.Name == opClassName {
+			classOID = uoc.OID
+			break
+		}
+	}
+	if classOID == 0 {
+		return 0, false
+	}
+	for _, m := range c.ListAmProcMembers() {
+		if m.ClassOID == classOID && m.ProcNum == procNum && m.ProcOID != 0 {
+			return m.ProcOID, true
+		}
+	}
+	return 0, false
 }
 
 // amGISTMethodOID / amSPGistMethodOID are pg_am.oid for "gist"/"spgist"

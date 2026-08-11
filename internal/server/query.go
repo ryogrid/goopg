@@ -56,7 +56,7 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 		if err := w.WriteEmptyQueryResponse(); err != nil {
 			return err
 		}
-		return w.WriteReadyForQuery(protocol.TxStatusIdle)
+		return w.ReadyForQuery()
 	}
 
 	// Per-statement query logging (GOOPG_LOG_STATEMENT). Logged here — the
@@ -157,7 +157,7 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 		if err := w.WriteCommandComplete("GRANT"); err != nil {
 			return err
 		}
-		return w.WriteReadyForQuery(protocol.TxStatusIdle)
+		return w.ReadyForQuery()
 	}
 
 	// A single-statement, autocommit REVOKE is recorded symmetrically so the
@@ -169,7 +169,7 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 		if err := w.WriteCommandComplete("REVOKE"); err != nil {
 			return err
 		}
-		return w.WriteReadyForQuery(protocol.TxStatusIdle)
+		return w.ReadyForQuery()
 	}
 
 	switch {
@@ -201,7 +201,7 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 		if err := w.WriteCommandComplete("SET"); err != nil {
 			return err
 		}
-		return w.WriteReadyForQuery(protocol.TxStatusIdle)
+		return w.ReadyForQuery()
 	// SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED | IMMEDIATE } controls
 	// runtime constraint deferral, NOT a GUC — route through the parser-based
 	// executor (which builds a SetConstraintsStmt and updates the executor
@@ -215,7 +215,7 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 		if err := w.WriteCommandComplete("SET CONSTRAINTS"); err != nil {
 			return err
 		}
-		return w.WriteReadyForQuery(protocol.TxStatusIdle)
+		return w.ReadyForQuery()
 	// SET LOCAL SESSION AUTHORIZATION name — must check before generic "SET LOCAL ".
 	case strings.HasPrefix(upper, "SET LOCAL SESSION AUTHORIZATION "),
 		upper == "SET LOCAL SESSION AUTHORIZATION":
@@ -234,7 +234,7 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 		if err := w.WriteCommandComplete("SET"); err != nil {
 			return err
 		}
-		return w.WriteReadyForQuery(protocol.TxStatusIdle)
+		return w.ReadyForQuery()
 	// SET LOCAL ROLE rolename — must check before generic "SET LOCAL ", which
 	// would otherwise mis-parse "ROLE rolename" as GUC name "role" and fail
 	// with "unrecognized configuration parameter" ("role" is not a
@@ -257,7 +257,7 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 		if err := w.WriteCommandComplete("SET"); err != nil {
 			return err
 		}
-		return w.WriteReadyForQuery(protocol.TxStatusIdle)
+		return w.ReadyForQuery()
 	case strings.HasPrefix(upper, "SET LOCAL "):
 		return s.handleSet(w, sess, matchable[len("SET LOCAL "):], true)
 	// SET SESSION AUTHORIZATION name — track non-superuser role for privilege checks.
@@ -280,7 +280,7 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 		if err := w.WriteCommandComplete("SET"); err != nil {
 			return err
 		}
-		return w.WriteReadyForQuery(protocol.TxStatusIdle)
+		return w.ReadyForQuery()
 	// SET ROLE rolename — track the effective role for privilege checks.
 	// Must be before the generic "SET " case so "ROLE" is not passed to handleSet.
 	// Like SET SESSION AUTHORIZATION, a non-superuser target populates
@@ -302,7 +302,7 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 		if err := w.WriteCommandComplete("SET"); err != nil {
 			return err
 		}
-		return w.WriteReadyForQuery(protocol.TxStatusIdle)
+		return w.ReadyForQuery()
 	case strings.HasPrefix(upper, "SET "):
 		return s.handleSet(w, sess, matchable[len("SET "):], false)
 	case upper == "RESET ALL":
@@ -310,7 +310,7 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 		if err := w.WriteCommandComplete("RESET"); err != nil {
 			return err
 		}
-		return w.WriteReadyForQuery(protocol.TxStatusIdle)
+		return w.ReadyForQuery()
 	// RESET SESSION AUTHORIZATION — restore superuser status.
 	// Must be checked before the generic "RESET " case so "SESSION AUTHORIZATION"
 	// is not used verbatim as a GUC parameter name.
@@ -322,7 +322,7 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 		if err := w.WriteCommandComplete("RESET"); err != nil {
 			return err
 		}
-		return w.WriteReadyForQuery(protocol.TxStatusIdle)
+		return w.ReadyForQuery()
 	// RESET ROLE — restore the bootstrap superuser's full privileges.
 	case upper == "RESET ROLE":
 		if connTx != nil {
@@ -332,7 +332,7 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 		if err := w.WriteCommandComplete("RESET"); err != nil {
 			return err
 		}
-		return w.WriteReadyForQuery(protocol.TxStatusIdle)
+		return w.ReadyForQuery()
 	case strings.HasPrefix(upper, "RESET "):
 		name := strings.TrimSpace(matchable[len("RESET "):])
 		if err := sess.Reset(name); err != nil {
@@ -341,7 +341,7 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 		if err := w.WriteCommandComplete("RESET"); err != nil {
 			return err
 		}
-		return w.WriteReadyForQuery(protocol.TxStatusIdle)
+		return w.ReadyForQuery()
 	}
 
 	if s.cfg.hasStorage() {
@@ -374,7 +374,7 @@ func (s *Server) handleShow(w *protocol.FrameWriter, sess *config.SessionRegistr
 	if err := w.WriteCommandComplete("SHOW"); err != nil {
 		return err
 	}
-	return w.WriteReadyForQuery(protocol.TxStatusIdle)
+	return w.ReadyForQuery()
 }
 
 // handleShowAll returns every variable as (name, setting). Upstream also
@@ -396,7 +396,7 @@ func (s *Server) handleShowAll(w *protocol.FrameWriter, sess *config.SessionRegi
 	if err := w.WriteCommandComplete("SHOW"); err != nil {
 		return err
 	}
-	return w.WriteReadyForQuery(protocol.TxStatusIdle)
+	return w.ReadyForQuery()
 }
 
 // handleSet applies a SET / SET LOCAL statement. Body is the text after
@@ -413,7 +413,7 @@ func (s *Server) handleSet(w *protocol.FrameWriter, sess *config.SessionRegistry
 	if err := w.WriteCommandComplete("SET"); err != nil {
 		return err
 	}
-	return w.WriteReadyForQuery(protocol.TxStatusIdle)
+	return w.ReadyForQuery()
 }
 
 // splitSet splits "name = value", "name TO value", or "name value" into
@@ -469,7 +469,7 @@ func (s *Server) respondSelectOne(w *protocol.FrameWriter) error {
 	if err := w.WriteCommandComplete("SELECT 1"); err != nil {
 		return err
 	}
-	return w.WriteReadyForQuery(protocol.TxStatusIdle)
+	return w.ReadyForQuery()
 }
 
 // errQueryErrorSent is a sentinel returned by writeQueryError when the
@@ -500,7 +500,10 @@ func (s *Server) writeQueryError(w *protocol.FrameWriter, code sqlstate.Code, ms
 	if err := w.WriteErrorResponse(fields); err != nil {
 		return err
 	}
-	if err := w.WriteReadyForQuery(protocol.TxStatusIdle); err != nil {
+	// afterError: an explicit transaction block that is erroring right now
+	// reports 'E', even though dispatch marks connTxState failed only after
+	// this returns errQueryErrorSent. See connTxState.wireStatus.
+	if err := w.ReadyForQueryAfterError(); err != nil {
 		return err
 	}
 	return errQueryErrorSent

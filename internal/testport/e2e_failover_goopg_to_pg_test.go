@@ -150,8 +150,10 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 			t.Logf("[diag] base/%d/%s (%s) size=%d hasBenchLog=%v", dboid, rel.file, rel.label, st.Size(), hasBench)
 		}
 	}
-	// M0106: ensure relcache init files are on the standby.
-	copyInitFiles(t, primary.DataDir(), standbyDir)
+	// M0131-S10: the `copyInitFiles` workaround that used to run here was
+	// deleted — `StartupXLOG` unlinks every `pg_internal.init` before any
+	// backend can read one (xlog.c:5633 → relcache.c:6899-6954), so the copy
+	// never had an effect. See docs/design/0131-0010-copyinitfiles-retirement.md.
 	// Overwrite postgresql.auto.conf for precise conninfo control
 	// (application_name needed for sync mode).
 	configurePGStandbyFromGoopgBackup(t, standbyDir, primaryConninfoForPGStandby(primary, slotName), slotName)
@@ -501,14 +503,40 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 			t.Fatalf("standby pg_get_viewdef(b5c_view3)=%q, missing %q", vd3, want)
 		}
 	}
-	// KNOWN BLOCKER (deferral ledger 2026-07-19, M0123-S3 sub-slice 2c): a direct
-	// `SELECT * FROM b5c_view` on the promoted standby still fails 42809 — PG's
-	// rewriter uses the relcache rule lock (rd_rules), not the direct pg_rewrite
-	// scan pg_get_viewdef uses, and the copied pg_internal.init caches a ruleless
-	// relcache entry for the view. Row-level standby evaluation waits on relcache
-	// rd_rules population; the canonical serializer itself is proven above.
-	if _, err := pgCountMaybe(standby, "SELECT count(*) FROM public.b5c_view"); err == nil {
-		t.Logf("[m0123] standby row-level view expansion now works — promote the deferred gate")
+	// M0131-S5 — THE gate this milestone slice exists for, promoted from a soft
+	// t.Logf. `SELECT * FROM <view>` on the promoted standby used to fail 42809:
+	// PG's rewriter expands a view through the relcache rule lock (rd_rules), not
+	// the direct pg_rewrite scan pg_get_viewdef uses, and `RelationBuildRuleLock`
+	// (relcache.c:785-806) populates rd_rules by scanning pg_rewrite (2618) via
+	// `pg_rewrite_rel_rulename_index` (2693, NOT 2620 = pg_trigger) with
+	// `indexOK=true` — a hard constant, so systable_beginscan (genam.c:397-401)
+	// has no seq-scan fallback. goopg wrote the heap row and discarded the TID,
+	// so the scan found nothing, rd_rules stayed NULL, the view kept
+	// rd_tableam == NULL and the planner raised at plancat.c:139-147.
+	// writeViewRewriteRow now maintains 2692/2693 (and both mirror to base/5),
+	// so all three canonical views must expand row-for-row.
+	//
+	// The pg_internal.init copy this test used to blame was never the cause (it
+	// is unlinked in StartupXLOG and saves no rules anyway —
+	// docs/design/0131-0010-copyinitfiles-retirement.md).
+	wantViewRows, err := pgCountMaybe(standby, "SELECT count(*) FROM public.bench_log WHERE client > 0")
+	if err != nil {
+		t.Fatalf("standby base-table count for the view gate: %v", err)
+	}
+	// Non-vacuity: all three views select `client > 0` (b5c_view2 also
+	// `src IS NOT NULL`, but src is NOT NULL in the DDL), so a zero here would
+	// make every comparison below trivially true.
+	if wantViewRows == 0 {
+		t.Fatalf("standby has 0 bench_log rows with client > 0 — the view gate would be vacuous")
+	}
+	for _, view := range []string{"b5c_view", "b5c_view2", "b5c_view3"} {
+		got, err := pgCountMaybe(standby, "SELECT count(*) FROM public."+view)
+		if err != nil {
+			t.Fatalf("standby SELECT count(*) FROM %s: %v (rd_rules NULL — is the 2693 leaf missing?)", view, err)
+		}
+		if got != wantViewRows {
+			t.Fatalf("standby count(*) FROM %s = %d, want %d (base rows with client > 0)", view, got, wantViewRows)
+		}
 	}
 
 	// B2-prep: the goopg-created function must be resolvable and executable
@@ -612,20 +640,36 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 
 func runGoopgBasebackupToPG(t *testing.T, repo, bin string, primary *cluster.Cluster, outDir, slotName string) {
 	t.Helper()
+	runGoopgBasebackupToPGSlot(t, repo, bin, primary, outDir, slotName, true)
+}
+
+// runGoopgBasebackupToPGSlot is runGoopgBasebackupToPG with control over
+// whether pg_basebackup creates the slot itself (`-C`). Callers that already
+// created the slot — e.g. TestE2E_PGStandbyFullCycle, which exercises the
+// SQL-callable pg_create_physical_replication_slot — must pass createSlot=false;
+// `-C` against an existing slot is a hard error ("replication slot already
+// exists"), exactly as upstream behaves.
+func runGoopgBasebackupToPGSlot(t *testing.T, repo, bin string, primary *cluster.Cluster, outDir, slotName string, createSlot bool) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, bin,
+	args := []string{
 		"-h", "127.0.0.1",
 		"-p", mustGoopgPort(primary.ListenAddr()),
 		"-U", "postgres",
 		"-D", outDir,
 		"-X", "stream",
-		"-C",
+	}
+	if createSlot {
+		args = append(args, "-C")
+	}
+	args = append(args,
 		"-S", slotName,
 		"-R",
 		"--no-sync",
 		"--no-manifest",
 		"-l", "TestE2E_FailoverGoopgToPG")
+	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Env = clientToolEnv(repo)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("pg_basebackup from goopg failed: %v\n%s", err, out)
@@ -789,40 +833,12 @@ func runGoopgToPGMultiHostInsert(psqlBin, repo string, primary *cluster.Cluster,
 	return nil
 }
 
-// copyInitFiles copies relcache init files from primary to standby.
-// These are generated by goopg init with mode 0o400 (read-only) to
-// prevent PG's write_relcache_init_file from overwriting them.
-func copyInitFiles(t *testing.T, primaryDir, standbyDir string) {
-	t.Helper()
-	for _, rel := range []string{
-		"global/pg_internal.init",
-		"base/1/pg_internal.init",
-	} {
-		src := filepath.Join(primaryDir, rel)
-		dst := filepath.Join(standbyDir, rel)
-		data, err := os.ReadFile(src)
-		if err != nil {
-			t.Errorf("copyInitFiles: read %s: %v", rel, err)
-			continue
-		}
-		t.Logf("copyInitFiles: copying %s (%d bytes)", rel, len(data))
-		if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
-			t.Errorf("copyInitFiles: mkdir %s: %v", filepath.Dir(dst), err)
-			continue
-		}
-		// If the file already exists (e.g. from the tar), remove it
-		// first since 0o400 prevents truncation.
-		_ = os.Remove(dst)
-		if err := os.WriteFile(dst, data, 0o400); err != nil {
-			t.Errorf("copyInitFiles: write %s: %v", rel, err)
-		}
-		if rel == "base/1/pg_internal.init" {
-			dst5 := filepath.Join(standbyDir, "base", "5", "pg_internal.init")
-			if err := os.MkdirAll(filepath.Dir(dst5), 0o700); err == nil {
-				_ = os.Remove(dst5)
-				os.WriteFile(dst5, data, 0o400)
-				t.Logf("copyInitFiles: also copied to base/5/ (%d bytes)", len(data))
-			}
-		}
-	}
-}
+// M0131-S10 deleted `copyInitFiles` here. It copied goopg's
+// `global/pg_internal.init` and `base/1/pg_internal.init` (plus a `base/5/`
+// duplicate) onto the standby at mode 0o400, on the belief that PG would load
+// them. It was inert on four independent grounds — the init-file format saves
+// no rules (relcache.c:6444-6453), views never pass `RelationIdIsInInitFile`
+// (:6820-6835), `StartupXLOG` unlinks every copy before any backend runs
+// (xlog.c:5633 → relcache.c:6899-6954, including the `base/5/` one), and both
+// engines exclude the file from a base backup (basebackup.go:113,
+// basebackup.c:203). docs/design/0131-0010-copyinitfiles-retirement.md.

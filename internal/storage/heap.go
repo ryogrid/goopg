@@ -115,10 +115,23 @@ const (
 	// following an index pointer must walk the chain (same page, follow
 	// CTID.Offset) until they find a tuple without this bit set.
 	// Mirrors PostgreSQL's HEAP_HOT_UPDATED (0x4000).
+	//
+	// M0131-S11: this bit lives in **t_infomask2**, not t_infomask —
+	// HeapTupleHeaderSetHotUpdated writes `tup->t_infomask2 |=
+	// HEAP_HOT_UPDATED` (htup_details.h:550) and the reader at :542 tests
+	// the same field. goopg kept it in t_infomask until 2026-08-11, which
+	// made every HOT chain mutually unreadable across engines: goopg read
+	// zero rows from a PG-authored chain, and a PG reading a goopg page saw
+	// 0x4000/0x8000 in t_infomask as HEAP_MOVED_OFF/HEAP_MOVED_IN and took
+	// the pre-9.0 t_xvac visibility path (heapam_visibility.c:183/:202).
+	// Access the bits through IsHotUpdated/SetHotUpdated/IsHeapOnly/
+	// SetHeapOnly below rather than naming the field, so the reader and
+	// writer siblings can never drift apart again.
 	HeapHotUpdated uint16 = 0x4000
 	// HeapOnlyTuple indicates this tuple is a HOT-only version: it was
 	// inserted as the successor in a HOT update chain and has no direct
-	// index entry. Mirrors PostgreSQL's HEAP_ONLY_TUPLE (0x8000).
+	// index entry. Mirrors PostgreSQL's HEAP_ONLY_TUPLE (0x8000), and like
+	// HeapHotUpdated it lives in t_infomask2 (htup_details.h:568).
 	HeapOnlyTuple uint16 = 0x8000
 
 	// HEAP_HASNULL indicates the tuple contains NULL values (null bitmap
@@ -314,6 +327,21 @@ type HeapTuple struct {
 func (h *HeapTupleHeader) SetNatts(natts int) {
 	h.Infomask2 = (h.Infomask2 &^ HeapNattsMask) | (uint16(natts) & HeapNattsMask)
 }
+
+// IsHotUpdated mirrors HeapTupleHeaderIsHotUpdated
+// (postgres/src/include/access/htup_details.h:542) minus the xmin/xmax hint
+// screening, which callers that need it apply themselves (internal/amcheck).
+// The bit is read from t_infomask2 — see HeapHotUpdated for why.
+func (h *HeapTupleHeader) IsHotUpdated() bool { return h.Infomask2&HeapHotUpdated != 0 }
+
+// SetHotUpdated mirrors HeapTupleHeaderSetHotUpdated (htup_details.h:550).
+func (h *HeapTupleHeader) SetHotUpdated() { h.Infomask2 |= HeapHotUpdated }
+
+// IsHeapOnly mirrors HeapTupleHeaderIsHeapOnly (htup_details.h:562).
+func (h *HeapTupleHeader) IsHeapOnly() bool { return h.Infomask2&HeapOnlyTuple != 0 }
+
+// SetHeapOnly mirrors HeapTupleHeaderSetHeapOnly (htup_details.h:568).
+func (h *HeapTupleHeader) SetHeapOnly() { h.Infomask2 |= HeapOnlyTuple }
 
 func NewHeapTuple(xmin, xmax TransactionID, data []byte) HeapTuple {
 	out := make([]byte, len(data))
@@ -684,12 +712,21 @@ func PageAddItemRaw(p Page, raw []byte) (uint16, error) {
 	}
 	lower := int(h.Lower())
 	upper := int(h.Upper())
-	needed := itemIDSize + len(raw)
+	// MAXALIGNed placement, exactly as PageAddItemExtended does it
+	// (postgres/src/backend/storage/page/bufpage.c): the allocation is
+	// MAXALIGN(size) but the line pointer records the UNALIGNED size, so a
+	// reader still recovers the item's true length from lp_len (and, for a
+	// B-tree blob key, its key length as lp_len - SizeOfIndexTupleData).
+	// Keeping pd_upper 8-byte aligned is what lets a real PG backend deform
+	// an item in place: index_deform_tuple / heap_deform_tuple read
+	// alignment-sensitive datums directly off the page. M0130-S11.4 3b-3a.
+	alignedSize := maxAlign8(len(raw))
+	needed := itemIDSize + alignedSize
 	if upper-lower < needed {
 		return 0, ErrNoSpaceInPage
 	}
-	newUpper := upper - len(raw)
-	copy(p[newUpper:upper], raw)
+	newUpper := upper - alignedSize
+	copy(p[newUpper:newUpper+len(raw)], raw)
 	count, err := PageLinePointerCount(p)
 	if err != nil {
 		return 0, err
@@ -725,7 +762,9 @@ func PageInsertItemRawAt(p Page, slot uint16, raw []byte) (uint16, error) {
 	}
 	lower := int(h.Lower())
 	upper := int(h.Upper())
-	needed := itemIDSize + len(raw)
+	// MAXALIGNed placement — see PageAddItemRaw. M0130-S11.4 3b-3a.
+	alignedSize := maxAlign8(len(raw))
+	needed := itemIDSize + alignedSize
 	if upper-lower < needed {
 		return 0, ErrNoSpaceInPage
 	}
@@ -736,12 +775,12 @@ func PageInsertItemRawAt(p Page, slot uint16, raw []byte) (uint16, error) {
 	if int(slot) < 1 || int(slot) > count+1 {
 		return 0, fmt.Errorf("PageInsertItemRawAt: slot %d out of range [1,%d]", slot, count+1)
 	}
-	// Append the new tuple bytes at upper-len(raw); existing tuple
+	// Append the new tuple bytes at upper-MAXALIGN(len(raw)); existing tuple
 	// data on the page does NOT need to move (each line pointer
 	// references its tuple by absolute offset, so existing items
 	// remain addressable).
-	newUpper := upper - len(raw)
-	copy(p[newUpper:upper], raw)
+	newUpper := upper - alignedSize
+	copy(p[newUpper:newUpper+len(raw)], raw)
 	// Shift the line-pointer array's [slot-1 .. count) entries right
 	// by one slot (line pointers are 0-based in the array but
 	// 1-based externally).
@@ -814,11 +853,16 @@ func PageReplaceItemRaw(p Page, slot uint16, raw []byte) error {
 	}
 	lower := int(h.Lower())
 	upper := int(h.Upper())
-	if upper-lower < len(raw) {
+	// MAXALIGNed placement — see PageAddItemRaw. The in-place branch above
+	// deliberately does NOT reuse this item's alignment padding: a page
+	// written before M0130-S11.4 3b-3a has no padding to reuse, so growing
+	// into it would clobber the neighbouring item.
+	alignedSize := maxAlign8(len(raw))
+	if upper-lower < alignedSize {
 		return ErrNoSpaceInPage
 	}
-	newUpper := upper - len(raw)
-	copy(p[newUpper:upper], raw)
+	newUpper := upper - alignedSize
+	copy(p[newUpper:newUpper+len(raw)], raw)
 	newID := ItemID{Offset: uint16(newUpper), Flags: id.Flags, Length: uint16(len(raw))}
 	if err := writeItemID(p, int(slot)-1, newID); err != nil {
 		return err
@@ -1050,6 +1094,43 @@ func PageSetHeapTupleXmax(p Page, slot uint16, xmax TransactionID) error {
 	if pruneXID := MustHeader(p).PruneXID(); xmax > TransactionID(pruneXID) {
 		MustHeader(p).SetPruneXID(uint32(xmax))
 	}
+	return nil
+}
+
+// PageSetHeapTupleXmaxCommitted sets the HEAP_XMAX_COMMITTED hint bit on the
+// tuple at the 1-based slot. The caller must already have set xmax via
+// PageSetHeapTupleXmax (or the tuple was written with a non-zero xmax).
+// This is used by catalog-row stamping (stampCatalogRows) so that runtime
+// seq-scan visibility (TupleVisibleSubxact) takes the fast
+// HeapXmaxCommitted path, avoiding a snapshot-based fallthrough that may
+// incorrectly hold a re-synced catalog row visible after the deleting
+// transaction committed. DU-002.
+func PageSetHeapTupleXmaxCommitted(p Page, slot uint16) error {
+	if slot == 0 {
+		return ErrInvalidSlot
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return err
+	}
+	idx := int(slot) - 1
+	if idx < 0 || idx >= count {
+		return ErrInvalidSlot
+	}
+	item, err := readItemID(p, idx)
+	if err != nil {
+		return err
+	}
+	if item.Flags != ItemIDNormal {
+		return fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, slot, item.Flags)
+	}
+	off := int(item.Offset)
+	if off+22 > len(p) {
+		return fmt.Errorf("%w: slot=%d off=%d", ErrCorruptTuple, slot, off)
+	}
+	infomask := binary.LittleEndian.Uint16(p[off+20 : off+22])
+	infomask |= HeapXmaxCommitted
+	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
 	return nil
 }
 
@@ -1417,12 +1498,16 @@ func PageStampHotOldTuple(p Page, oldSlot uint16, xmax TransactionID, blk BlockN
 	// Set CTID to (blk, newSlot) — same-page chain link.
 	binary.LittleEndian.PutUint32(p[off+12:off+16], uint32(blk))
 	binary.LittleEndian.PutUint16(p[off+16:off+18], newSlot)
-	// Update infomask: clear lock-only bits (a delete supersedes any
-	// lingering row-lock), then set HeapHotUpdated.
+	// Update t_infomask at [20:22]: clear lock-only bits (a delete supersedes
+	// any lingering row-lock).
 	infomask := binary.LittleEndian.Uint16(p[off+20 : off+22])
 	infomask &^= HeapXmaxLockOnly | HeapXmaxLockMask | HeapXmaxInvalid | HeapXmaxIsMulti
-	infomask |= HeapHotUpdated
 	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
+	// Mark the HOT chain in t_infomask2 at [18:20] — HEAP_HOT_UPDATED lives
+	// there, not in t_infomask (M0131-S11; htup_details.h:550).
+	infomask2 := binary.LittleEndian.Uint16(p[off+18 : off+20])
+	infomask2 |= HeapHotUpdated
+	binary.LittleEndian.PutUint16(p[off+18:off+20], infomask2)
 	// Advance pd_prune_xid (M0046-0002): the old HOT tuple is dead
 	// once xmax is committed and xmax < OldestXmin.
 	if pruneXID := MustHeader(p).PruneXID(); xmax > TransactionID(pruneXID) {
@@ -1522,18 +1607,20 @@ func PageStampHotOldTupleMulti(p Page, oldSlot uint16, multi TransactionID, info
 	// Set CTID to (blk, newSlot) — same-page HOT chain link.
 	binary.LittleEndian.PutUint32(p[off+12:off+16], uint32(blk))
 	binary.LittleEndian.PutUint16(p[off+16:off+18], newSlot)
-	// t_infomask2 at [18:20]: refresh HEAP_KEYS_UPDATED from the multi hint.
+	// t_infomask2 at [18:20]: refresh HEAP_KEYS_UPDATED from the multi hint,
+	// and mark the HOT chain — HEAP_HOT_UPDATED lives in this field, not in
+	// t_infomask (M0131-S11; htup_details.h:550).
 	infomask2 := binary.LittleEndian.Uint16(p[off+18 : off+20])
 	infomask2 &^= HeapKeysUpdated
 	infomask2 |= infomask2Bits & HeapKeysUpdated
+	infomask2 |= HeapHotUpdated
 	binary.LittleEndian.PutUint16(p[off+18:off+20], infomask2)
-	// t_infomask at [20:22]: clear xmax-classification bits, OR in the multi
-	// hint bits (which set HEAP_XMAX_IS_MULTI and clear HEAP_XMAX_LOCK_ONLY for
-	// an updater-bearing multi), then mark the HOT chain.
+	// t_infomask at [20:22]: clear xmax-classification bits, then OR in the
+	// multi hint bits (which set HEAP_XMAX_IS_MULTI and clear
+	// HEAP_XMAX_LOCK_ONLY for an updater-bearing multi).
 	infomask := binary.LittleEndian.Uint16(p[off+20 : off+22])
 	infomask &^= HeapXmaxLockMask | HeapXmaxLockOnly | HeapXmaxInvalid | HeapXmaxCommitted | HeapXmaxIsMulti
 	infomask |= infomaskBits
-	infomask |= HeapHotUpdated
 	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
 	// Advance pd_prune_xid (M0046-0002) using the real update member: the old
 	// HOT tuple is dead once the updater commits and is < OldestXmin. The multi

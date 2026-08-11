@@ -3,7 +3,6 @@ package executor
 import (
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
@@ -337,12 +336,12 @@ func TestDDLCreateIndexBuildsSearchableBTree(t *testing.T) {
 		t.Fatal("index not in catalog after CREATE INDEX")
 	}
 	rel := ctx.Catalog.IndexRelFileNode(idx)
-	tree, err := btree.Open(ctx.Pool, rel)
+	tree, err := openIndexBTree(ctx, idx, rel)
 	if err != nil {
-		t.Fatalf("btree.Open: %v", err)
+		t.Fatalf("openIndexBTree: %v", err)
 	}
 	for _, k := range []int32{1, 2, 3} {
-		if _, found, err := tree.Search(btree.EncodeInt4(k)); err != nil || !found {
+		if _, found, err := tree.Search(indexProbeForTest(t, ctx, idx, Datum{Kind: KindInt, Int: int64(k)})); err != nil || !found {
 			t.Fatalf("index search key=%d found=%v err=%v", k, found, err)
 		}
 	}
@@ -507,11 +506,11 @@ func TestDDLAlterTableAddPrimaryKeyCreatesUniqueIndex(t *testing.T) {
 	if !idx.Unique || !idx.Primary {
 		t.Fatalf("index flags: unique=%v primary=%v", idx.Unique, idx.Primary)
 	}
-	tree, err := btree.Open(ctx.Pool, ctx.Catalog.IndexRelFileNode(idx))
+	tree, err := openIndexBTree(ctx, idx, ctx.Catalog.IndexRelFileNode(idx))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, found, err := tree.Search(btree.EncodeInt4(2)); err != nil || !found {
+	if _, found, err := tree.Search(indexProbeForTest(t, ctx, idx, Datum{Kind: KindInt, Int: 2})); err != nil || !found {
 		t.Fatalf("primary-key index search found=%v err=%v", found, err)
 	}
 }

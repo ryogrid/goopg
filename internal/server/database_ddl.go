@@ -481,6 +481,43 @@ func createDatabaseTemplateName(sql string) string {
 	return m[2]
 }
 
+// createDatabaseEncodingRe matches the `ENCODING [=] <name>` option
+// (gram.y's createdb_opt_item ENCODING case) within a CREATE DATABASE
+// statement's trailing option list. Applied only to the substring AFTER the
+// new database's own name, like createDatabaseTemplateRe. M0122-0008.
+var createDatabaseEncodingRe = regexp.MustCompile(`(?i)\bencoding\s*=?\s*(?:"([^"]*)"|'([^']*)'|([A-Za-z_][A-Za-z0-9_$]*))`)
+
+// extractEncodingRawFromSQL returns the raw ENCODING option value from a CREATE
+// DATABASE statement. sql must already be known (via classifyDatabaseDDL) to be
+// a CREATE DATABASE statement. Returns ("", false) when no ENCODING [=] <name>
+// option is present. The returned string is the exact name as written (unquoted
+// for bare identifiers, without surrounding quotes for quoted forms) — the
+// caller passes it to catalog.ValidServerEncodingName for validation and uses
+// it verbatim for error messages. M0122-0008.
+func extractEncodingRawFromSQL(sql string) (string, bool) {
+	s := strings.TrimSpace(sql)
+	for strings.HasSuffix(s, ";") {
+		s = strings.TrimSpace(strings.TrimSuffix(s, ";"))
+	}
+	lower := strings.ToLower(s)
+	if !strings.HasPrefix(lower, "create database ") {
+		return "", false
+	}
+	rest := s[len("create database "):]
+	_, end := extractFirstIdentifierSpan(rest)
+	m := createDatabaseEncodingRe.FindStringSubmatch(rest[end:])
+	if m == nil {
+		return "", false
+	}
+	if m[1] != "" {
+		return m[1], true // double-quoted
+	}
+	if m[2] != "" {
+		return m[2], true // single-quoted (PG also accepts this)
+	}
+	return m[3], true // bare identifier
+}
+
 // extractFirstIdentifier reads the first SQL identifier from s,
 // honouring double-quoted form. Returns "" when s is empty or
 // the leading token is not an identifier.
@@ -1234,9 +1271,9 @@ func (s *Server) syncCopiedTableCatalogHeap(newOid uint32, tbl *catalog.Table) e
 // real PG18 standby replays the XLOG_HEAP_INSERT; goopg's own pg_database is
 // still served from the registry VirtualRows. A nil Pool/TxnMgr (test/embedded)
 // is a no-op, matching syncCopiedTableCatalogHeap.
-func (s *Server) syncPgDatabaseHeapRow(newOid uint32, name string, owner, templateOid uint32) error {
+func (s *Server) syncPgDatabaseHeapRow(newOid uint32, name string, owner, templateOid uint32, encodingOverride int32) error {
 	return s.runPgDatabaseHeapTxn(func(ectx *executor.Context) error {
-		return executor.SyncPgDatabaseCatalogRow(ectx, newOid, name, owner, templateOid)
+		return executor.SyncPgDatabaseCatalogRow(ectx, newOid, name, owner, templateOid, encodingOverride)
 	})
 }
 
@@ -1403,6 +1440,20 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole 
 		if err != nil {
 			return true, "", err
 		}
+		// M0122-0008: validate ENCODING option before creating the
+		// database. An invalid or client-only encoding name is rejected
+		// early (mirrors PG's createdb in dbcommands.c). The resolved
+		// pg_enc ID replaces the template's encoding in the heap row.
+		var dbEncodingID int32 = -1
+		if rawEnc, ok := extractEncodingRawFromSQL(sql); ok {
+			dbEncodingID = catalog.ValidServerEncodingName(rawEnc)
+			if dbEncodingID < 0 {
+				return true, "", &databaseDDLError{
+					code: sqlstate.InvalidParameterValue,
+					msg:  fmt.Sprintf("encoding %q does not exist", rawEnc),
+				}
+			}
+		}
 		if len(tmplTables) > 0 || len(tmplSequences) > 0 || len(tmplViews) > 0 || len(tmplMatViews) > 0 {
 			// PG: dbcommands.c createdb(), CountOtherDBBackends(src_dboid)
 			// (ERRCODE_OBJECT_IN_USE) — real PostgreSQL refuses to copy a
@@ -1433,6 +1484,12 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole 
 				}
 			}
 			return true, "", err
+		}
+		// M0122-0008: persist the ENCODING choice in the catalog registry.
+		if dbEncodingID >= 0 {
+			if encReg, ok := s.cfg.Catalog.(databaseEncodingRegistry); ok {
+				encReg.SetDatabaseEncoding(name, dbEncodingID)
+			}
 		}
 		// M0122-0007 physical-storage-isolation slice 2: create base/<oid>
 		// (+ PG_VERSION) BEFORE the WAL append that makes the CREATE durable —
@@ -1533,7 +1590,7 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole 
 				}
 			}
 		}
-		if err := s.syncPgDatabaseHeapRow(oid, name, owner, cloneTemplateOid); err != nil && s.cfg.Logger != nil {
+		if err := s.syncPgDatabaseHeapRow(oid, name, owner, cloneTemplateOid, dbEncodingID); err != nil && s.cfg.Logger != nil {
 			s.cfg.Logger.Warn("pg_database heap row sync failed", "database", name, "err", err)
 		}
 		// The RM_DBASE XLOG_DBASE_CREATE_WAL_LOG record + the template0 catalog
@@ -1749,7 +1806,7 @@ func (s *Server) handleDatabaseDDLBypass(sql, liveDBName, actingRole string, res
 	if err := w.WriteCommandComplete(tag); err != nil {
 		return true, err
 	}
-	return true, w.WriteReadyForQuery(protocol.TxStatusIdle)
+	return true, w.ReadyForQuery()
 }
 
 // databaseRegistry is the subset of catalog.Catalog the database-DDL
@@ -1785,6 +1842,15 @@ type databaseConfigRegistry interface {
 // M0119-0006 (AC-002 residual #1).
 type databaseConnLimitRegistry interface {
 	DatabaseConnLimit(name string) int32
+}
+
+// databaseEncodingRegistry is the subset of catalog.Catalog the CREATE
+// DATABASE ... ENCODING handler needs to persist the encoding choice.
+// catalog.InMemory satisfies this interface. Separate from databaseRegistry
+// for the same reason databaseConnLimitRegistry is (see its doc comment).
+// M0122-0008.
+type databaseEncodingRegistry interface {
+	SetDatabaseEncoding(name string, encoding int32) bool
 }
 
 // databaseTemplateRegistry is the subset of catalog.Catalog CREATE

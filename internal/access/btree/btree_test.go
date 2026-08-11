@@ -1,6 +1,7 @@
 package btree
 
 import (
+	"encoding/binary"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -188,7 +189,12 @@ func TestSplitInvokesLogSplit(t *testing.T) {
 		left, right storage.BlockNumber
 	}
 	var calls []call
-	logSplit := func(_ storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, sibBlk storage.BlockNumber, sibPage storage.Page) (storage.LSN, error) {
+	logSplit := func(_ storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, prePage, leftPage, rightPage storage.Page, newItem []byte, sibBlk storage.BlockNumber, sibPage storage.Page, childBlk storage.BlockNumber) (storage.LSN, error) {
+		// M0130-S11.5b-3: upstream registers a child (backup block 3) exactly
+		// when the split page is INTERNAL, and never for a leaf split.
+		if isLeaf := readOpaque(leftPage).IsLeaf(); isLeaf != (childBlk == storage.InvalidBlockNumber) {
+			t.Errorf("split of leaf=%v carried childBlk=%d", isLeaf, childBlk)
+		}
 		if len(leftPage) != storage.BlockSize || len(rightPage) != storage.BlockSize {
 			t.Errorf("page sizes = %d/%d, want %d", len(leftPage), len(rightPage), storage.BlockSize)
 		}
@@ -399,5 +405,74 @@ func TestReopen(t *testing.T) {
 	}
 	if ptr.Block != 7 {
 		t.Errorf("Search ptr = %+v, want Block=7", ptr)
+	}
+}
+
+// TestInternalSplitLogsAndClearsChild pins M0130-S11.5b-3 on the WRITER side.
+// An internal page is only ever inserted into to finish a split one level down,
+// so upstream's `_bt_split` clears that child's BTP_INCOMPLETE_SPLIT inside the
+// same critical section and logs the child as backup block 3 (nbtinsert.c:1957
+// and :1989). goopg used to leave the clear to `clearIncompleteSplit` after the
+// parent insert returned — a separate record, and none at all from a real PG
+// standby's point of view, whose `_bt_clear_incomplete_split(record, 3)` PANICs
+// on an unregistered block id.
+//
+// The keys are deliberately wide so the ROOT fills and splits — a tree that only
+// ever splits leaves would pass this test vacuously, which is why an internal
+// split not happening is a failure rather than a skip.
+func TestInternalSplitLogsAndClearsChild(t *testing.T) {
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: t.TempDir()})
+	defer mgr.Close()
+	pool, err := storage.NewPool(mgr, storage.PoolConfig{Slots: 64})
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	defer pool.Close()
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 9101, Fork: storage.MainFork}
+
+	var internalSplits int
+	var children []storage.BlockNumber
+	logSplit := func(_ storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, prePage, leftPage, rightPage storage.Page, newItem []byte, sibBlk storage.BlockNumber, sibPage storage.Page, childBlk storage.BlockNumber) (storage.LSN, error) {
+		if readOpaque(leftPage).IsLeaf() {
+			if childBlk != storage.InvalidBlockNumber {
+				t.Errorf("leaf split carried childBlk=%d (upstream has no cbuf there)", childBlk)
+			}
+			return storage.LSN(1), nil
+		}
+		internalSplits++
+		if childBlk == storage.InvalidBlockNumber {
+			t.Fatalf("internal split of blk %d logged no child block", leftBlk)
+		}
+		children = append(children, childBlk)
+		return storage.LSN(1), nil
+	}
+
+	bt, err := CreateWithOptions(pool, rel, Options{LogSplit: logSplit})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	key := make([]byte, 240)
+	for i := 0; i < 4000; i++ {
+		binary.BigEndian.PutUint32(key[:4], uint32(i))
+		if err := bt.Insert(key, storage.ItemPointer{Block: storage.BlockNumber(i + 1), Offset: 1}); err != nil {
+			t.Fatalf("Insert(%d): %v", i, err)
+		}
+	}
+	if internalSplits == 0 {
+		t.Fatal("no internal split occurred — the test proves nothing; widen the keys or raise the row count")
+	}
+
+	// The clear must be visible on the page the record names, not merely
+	// promised by a later record: that is what makes block 3 sufficient.
+	for _, blk := range children {
+		slot, err := bt.pinR(blk)
+		if err != nil {
+			t.Fatalf("pin child %d: %v", blk, err)
+		}
+		incomplete := readOpaque(slot.Page()).HasIncompleteSplit()
+		bt.unpinR(slot)
+		if incomplete {
+			t.Errorf("child %d still flagged incomplete-split after its parent's split", blk)
+		}
 	}
 }

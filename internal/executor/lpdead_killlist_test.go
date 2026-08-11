@@ -70,7 +70,7 @@ func TestHeapChainDeadToAllOracle(t *testing.T) {
 		p := newPage()
 		// root: dead, HOT-updated -> slot 2 (live).
 		root := storage.NewHeapTuple(1, 5, []byte("root"))
-		root.Header.Infomask |= storage.HeapHotUpdated
+		root.Header.SetHotUpdated()
 		root.Header.CTID = storage.ItemPointer{Block: 0, Offset: 2}
 		s1, err := storage.PageAddHeapTuple(p, root)
 		if err != nil {
@@ -87,7 +87,7 @@ func TestHeapChainDeadToAllOracle(t *testing.T) {
 	t.Run("chain_all_dead", func(t *testing.T) {
 		p := newPage()
 		root := storage.NewHeapTuple(1, 4, []byte("root"))
-		root.Header.Infomask |= storage.HeapHotUpdated
+		root.Header.SetHotUpdated()
 		root.Header.CTID = storage.ItemPointer{Block: 0, Offset: 2}
 		s1, err := storage.PageAddHeapTuple(p, root)
 		if err != nil {

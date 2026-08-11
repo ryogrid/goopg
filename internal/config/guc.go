@@ -130,7 +130,8 @@ type Variable struct {
 	Flags       VarFlag
 	MinVal      float64 // valid for Int/Real
 	MaxVal      float64
-	EnumOptions []string // valid for Enum
+	EnumOptions []string            // valid for Enum
+	CheckFn     func(string) error  // optional post-canonicalisation validation
 }
 
 // canonicalize normalises an incoming string value into the form we
@@ -280,6 +281,11 @@ func (v *Variable) canonicalizeFrom(current, value string) (string, error) {
 		}
 		return fStr, nil
 	case TypeString:
+		if v.CheckFn != nil {
+			if err := v.CheckFn(value); err != nil {
+				return "", err
+			}
+		}
 		return value, nil
 	case TypeEnum:
 		for _, opt := range v.EnumOptions {

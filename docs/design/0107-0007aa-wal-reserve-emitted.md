@@ -209,6 +209,60 @@ go test -race -count=1 ./internal/wal/                                       →
 go vet ./internal/wal/                                                       →  clean
 ```
 
+### Addendum 2026-08-10 — the race-closure assertion was vacuous (AI-20260810-011258-001)
+
+The nightly race-gate reddened on
+`…ConcurrentChainAndStripePublishConsistent`, but *not* on a data race
+or an invariant violation: the failure was the test's own non-vacuity
+guard, `reader took zero snapshots`. Two distinct scheduling hazards
+were involved, and the guard as written covered only the first.
+
+1. **The reader was never scheduled.** The reader goroutine was spawned
+   after the writers and the main goroutine proceeded straight to
+   `wg.Wait(); close(stop)`. The writers' 8 × 500 reservations complete
+   in well under a millisecond, so the reader could observe `stop`
+   already closed on its very first loop iteration and return having
+   asserted nothing. This is not merely theoretical — it reproduces on
+   **100 % of runs under `GOMAXPROCS=1 -race`**, and intermittently at
+   full package load, which is how the nightly hit it. In isolation at
+   default `GOMAXPROCS` it passes 200/200, which is why it survived
+   review.
+
+2. **`observed > 0` was the wrong invariant.** The assertion body only
+   does work on a snapshot that catches a stripe **mid-flight**
+   (`v != lsnIdle`); a snapshot of an all-idle tracker asserts nothing.
+   So a reader that was scheduled but starved across the whole write
+   burst would satisfy `observed > 0` while still proving nothing. The
+   old guard passes a mutation in which the writers perform *zero*
+   reservations; the new one fails it.
+
+Both hazards are now closed **by construction** rather than left to
+scheduler luck:
+
+- the reader signals `readerLive` after completing its first snapshot,
+  and the writers do not start until that signal arrives — so the
+  reader is known to be *running*, not merely spawned;
+- the counter is `witnessed`, incremented only on snapshots that caught
+  at least one stripe non-idle, and the write burst **repeats** (bounded
+  at 200 rounds) until `witnessed > 0`. The bound exists so a genuinely
+  wedged reader fails the test instead of hanging it.
+
+This is the general lesson, not a one-off: a non-vacuity guard must
+count the executions of *the assertion*, not the iterations of the loop
+that contains it. Mutation-verified in both directions —
+
+```
+# assertion is live: publish the stripe at curr, violating v < curr
+tracker.setInsertingAt(stripe, int64(t.curr))   →  FAIL "snapshot violation: stripe 5 insertingAt=914761, curr=914761"
+                                                   (under GOMAXPROCS=1, where the OLD test took zero snapshots)
+# guard is live: no writer ever in flight
+perWorker = 0                                   →  FAIL "reader never caught a stripe in flight across 200 rounds"
+
+go test -race -count=50 -run '…ConcurrentChainAndStripePublishConsistent' ./internal/wal/  (GOMAXPROCS=1)  →  PASS
+go test -race -count=1 ./internal/wal/                                                                     →  PASS (7.7 s)
+go test -race -count=1 ./internal/wal/                                     (GOMAXPROCS=1)                  →  PASS (8.2 s)
+```
+
 ## PG-compat
 
 None — pure in-memory primitive; produces no on-disk bytes, does not

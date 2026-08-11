@@ -185,16 +185,22 @@ func TestReplayHeapVacuumIdempotent(t *testing.T) {
 func TestEncodeDecodeBtreeInsertRoundTrip(t *testing.T) {
 	rel := storage.RelFileNode{DBOid: 33, RelOid: 44, Fork: storage.MainFork}
 	itemBytes := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06}
-	enc := EncodeBtreeInsert(rel, 9, itemBytes)
+	enc := EncodeBtreeInsert(rel, 9, 7, itemBytes)
 	if enc[0] != RecordKindBtreeInsert {
 		t.Errorf("kind byte = %d, want %d", enc[0], RecordKindBtreeInsert)
 	}
-	gotRel, gotBlk, gotItem, err := DecodeBtreeInsert(enc)
+	gotRel, gotBlk, gotOffnum, gotItem, err := DecodeBtreeInsert(enc)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if gotRel != rel || gotBlk != 9 {
 		t.Errorf("decoded rel/blk = %v %d", gotRel, gotBlk)
+	}
+	// M0130-S11.4 slice 3b-2c-ii-B2-b-ii: the offset number is part of the
+	// record, and replay depends on it round-tripping exactly (it is the ONLY
+	// thing that decides where the item lands — there is no by-key fallback).
+	if gotOffnum != 7 {
+		t.Errorf("decoded offnum = %d, want 7", gotOffnum)
 	}
 	if string(gotItem) != string(itemBytes) {
 		t.Errorf("decoded item = %x want %x", gotItem, itemBytes)

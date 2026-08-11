@@ -1,6 +1,6 @@
 # Per-relation FSM/VM fork files — retire aggregate `pg_fsm_state.bin` / `pg_vm_state.bin`
 
-**Status:** draft
+**Status:** accepted
 **Date:** 2026-08-09
 **Milestone:** M0130 (S1)
 **Supersedes:** the aggregate formats in `internal/storage/fsm.go` and `internal/storage/vm.go`

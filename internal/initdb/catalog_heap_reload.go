@@ -614,7 +614,8 @@ func parsePGCharArrayPayload(b []byte) []byte {
 // ev_class, must already be registered with its relkind).
 //
 // Only user rules (ev_class >= FirstUserOID) are processed: the six bootstrap
-// replication-view _RETURN rules (ev_class 12100..12106) carry canonical
+// replication-view _RETURN rules (ev_class 12231..12266, pinned to upstream
+// by M0131-S8a — see system_view_oid_pins.go) carry canonical
 // nodeToString ev_action blobs that are NOT re-parsable SQL and whose views are
 // nailed relcache entries, so they are skipped by the OID filter.
 //
@@ -751,9 +752,10 @@ func reloadDatabasesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 		return nil
 	}
 	type dbRow struct {
-		oid   uint32
-		name  string
-		owner uint32
+		oid       uint32
+		name      string
+		owner     uint32
+		connLimit int32
 	}
 	rel := storage.RelFileNode{DBOid: 0, RelOid: catalog.PgDatabaseRelationOID, Fork: storage.MainFork}
 	cols := catalog.PgDatabaseColumnsPG18()
@@ -764,7 +766,12 @@ func reloadDatabasesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 			if derr := executor.DecodeRowIntoMctxPGTuple(d, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
 				return nil, false, derr
 			}
-			return dbRow{oid: uint32(d[0].Int), name: d[1].StringValue(), owner: uint32(d[2].Int)}, false, nil
+			return dbRow{
+				oid:       uint32(d[0].Int),
+				name:      d[1].StringValue(),
+				owner:     uint32(d[2].Int),
+				connLimit: int32(d[catalog.PgDatabaseDatConnLimitOrdinal].Int),
+			}, false, nil
 		})
 	if err != nil {
 		return err
@@ -775,9 +782,13 @@ func reloadDatabasesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 			continue // bootstrap databases are registered at construction
 		}
 		cat.RegisterDatabaseDuringRecovery(db.name, db.owner, db.oid)
+		// M0122-0006: restore datconnlimit from the heap row so a
+		// restart preserves the value set by UPDATE pg_database SET
+		// datconnlimit.
+		cat.SetDatabaseConnLimit(db.name, db.connLimit)
 	}
-	return nil
-}
+		return nil
+	}
 
 // reloadRolesFromAuthidHeap is B4.5's pg_authid reload — the generic heap-scan
 // replacement for the retired LoadRolesFromAuthidHeap (raw os.ReadFile) +
@@ -2291,8 +2302,18 @@ func reloadUserPublicationsFromHeap(mgr *storage.Manager, cat *catalog.InMemory,
 	if err != nil {
 		return err
 	}
+	// pg_publication is per-database, but the registry key is the NAMESPACE
+	// db oid, not the storage db oid: NamespaceDBOid folds a "postgres"
+	// connection (PostgresDBOid = 5) back onto DefaultDBOid = 1, which is
+	// where every live CREATE PUBLICATION registers (resolveDBOid's default,
+	// and what dispatch.go's pg_publication lister queries via
+	// NamespaceDBOid(ectx.CurrentDatabaseOid)). Stamping the raw cat.DBOID()
+	// here filed reloaded rows under 5 and made every publication vanish
+	// after a restart — the same mismatch f1e73ce0 fixed for pg_ts_config.
+	nsDBOid := catalog.NamespaceDBOid(cat.DBOID())
 	for _, raw := range rows {
 		pr := raw.(pubRow)
+		pr.pub.DBOid = nsDBOid
 		pr.pub.Tables = membersByPub[pr.pub.OID]
 		pubsub.CreatePublicationDuringRecovery(&pr.pub)
 		cat.SetPublicationHeapTID(pr.pub.OID, catalog.SchemaHeapTID{Block: uint32(pr.tid.Block), Offset: pr.tid.Offset})
@@ -2642,6 +2663,49 @@ func reloadUserAccessMethodsFromHeap(mgr *storage.Manager, cat *catalog.InMemory
 	for _, raw := range rows {
 		am := raw.(catalog.AccessMethod)
 		cat.RegisterAccessMethodDuringRecovery(&am)
+	}
+	return nil
+}
+
+// reloadUserExtensionsFromHeap (M0130-S3) is the pg_extension reload —
+// reads base/*/3079 to reconstruct the in-memory runtime extension registry
+// after a restart. Each row maps onto the catalog extensionRow.
+func reloadUserExtensionsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	extCols := executor.PGExtensionColumnsPG18()
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 3079, Fork: storage.MainFork}
+	type extRec struct {
+		oid     uint32
+		name    string
+		schema  string
+		version string
+		dbName  string
+	}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_extension",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(extCols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, extCols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			nsOID := uint32(decoded[3].Int)
+			schema := cat.SchemaNameForOID(nsOID)
+			if schema == "" {
+				schema = "public"
+			}
+			return extRec{
+				oid:     uint32(decoded[0].Int),
+				name:    decoded[1].StringValue(),
+				schema:  schema,
+				version: decoded[5].StringValue(),
+				dbName:  "", // database is per-catalog reload scope
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		r := raw.(extRec)
+		cat.CreateExtensionDuringRecovery(r.name, r.schema, r.version, "", r.oid)
 	}
 	return nil
 }

@@ -16,6 +16,7 @@ package executor
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math"
 	"strconv"
 	"strings"
@@ -396,6 +397,52 @@ const (
 	cCollationOID uint32 = 950
 )
 
+// IndexKeyColumnCollationOID returns the collation OID a key column of an index
+// carries with no explicit `COLLATE` clause on the index itself — i.e. the heap
+// column's own `pg_attribute.attcollation`: its per-column `COLLATE <name>` if
+// it has one, otherwise the type's `pg_type.typcollation` (100 `default` for
+// text/varchar/bpchar and their arrays, 950 `C` for `name`, 0 for everything
+// non-collatable).
+//
+// This is the value upstream's ComputeIndexAttrs puts in `pg_index.indcollation`
+// (src/backend/catalog/index.c), and both sides of goopg's persistence need it:
+// buildUserPGIndexRow writes it, and the checkpointed-restart reload
+// (internal/initdb/open.go) compares against it to decide whether the decoded
+// OID means an EXPLICIT collation — upstream's own rule in
+// pg_get_indexdef_worker, which prints a COLLATE clause only when indcollation
+// differs from the column's collation. Exported for that second caller.
+//
+// Returns 0 for an expression key (no heap column to read) — ledgered with the
+// rest of the expression-index gaps.
+func IndexKeyColumnCollationOID(cat catalog.Catalog, tbl *catalog.Table, colName string) uint32 {
+	if tbl == nil || colName == "" {
+		return 0
+	}
+	col := findColumnByName(tbl, colName)
+	if col == nil {
+		return 0
+	}
+	typOID := catalog.TypeNameToOID(col.Type.Name)
+	if typOID == catalog.OIDBpChar && col.Type.Name == "char" && len(col.Type.Args) == 0 {
+		typOID = catalog.OIDChar
+	}
+	base := userTypeAttrsForOID(typOID).TypCollation
+	// A per-column COLLATE shadows the type default, but only on a collatable
+	// type — the same guard buildUserPGAttributeRow applies to attcollation,
+	// which is the field this must agree with.
+	if col.Collation != "" && base != 0 {
+		if oid := collationNameToOID(col.Collation); oid != 0 {
+			return oid
+		}
+		if cat != nil {
+			if oid := cat.ResolveIndexColumnCollationOID(col.Collation); oid != 0 {
+				return oid
+			}
+		}
+	}
+	return base
+}
+
 // collationNameToOID resolves a bare pg_collation.collname (as captured from a
 // column's `COLLATE <name>` clause) to its BKI-pinned OID. The mapping mirrors
 // the seven built-in collations populated in catalog.pgCollation.VirtualRows
@@ -487,6 +534,18 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 	if relopts := catalog.TableReloptionsElements(tbl); len(relopts) > 0 {
 		reloptionsDatum = NewBytesDatum(pgTextArrayBytes(relopts))
 	}
+	// relhasindex — M0130-S11.6, the last step of the PG-format-user-nbtree
+	// work (S11.1..S11.5) and the close of AI-20260810-011258-003 blocker #10.
+	// PG's ExecInitModifyTable only opens a result relation's indexes when
+	// `rd_rel->relhasindex` is set, and plancat.c's get_relation_info gates
+	// RelationGetIndexList on the same flag, so while this was hardcoded false
+	// a real PG 18.3 on a goopg cluster silently did NO index maintenance for
+	// its own INSERTs and never planned an index scan. It could not be flipped
+	// before S11.2b/S11.3/S11.4 because goopg's USER btree files were a private
+	// format (272-byte opaque, a hand-rolled metapage, a concatenated key blob)
+	// that `_bt_checkpage` rejects: the flag would only have converted a silent
+	// gap into `index "…" contains corrupted page at block 0` (blocker #12).
+	// See pgClassRelhasindex for why it is not simply `len(indexes) > 0`.
 	return Row{
 		NewIntDatum(int64(tbl.OID)),                                // oid
 		NewStringDatum(tbl.Name),                                   // relname (name)
@@ -502,7 +561,7 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 		NewIntDatum(0),                                             // relallvisible
 		NewIntDatum(0),                                             // relallfrozen
 		NewIntDatum(0),                                             // reltoastrelid
-		NewBoolDatum(false),                                        // relhasindex (updated by CREATE INDEX later)
+		NewBoolDatum(pgClassRelhasindex(cat, tbl)),                 // relhasindex (M0130-S11.6 — see the note above)
 		NewBoolDatum(false),                                        // relisshared
 		NewStringDatum(relpersistence),                             // relpersistence
 		NewStringDatum(relkind),                                    // relkind
@@ -529,6 +588,52 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 // owning table ('u' for an index on an UNLOGGED table, 'p' otherwise). An index
 // always shares its table's persistence in PG, so this keeps the two pg_class
 // rows consistent for a standby / pg_amcheck reading the catalog.
+// pgClassRelhasindex computes the `relhasindex` a real PG 18.3 attached to this
+// cluster may safely act on (M0130-S11.6).
+//
+// It is NOT `len(cat.IndexesOnTable(tbl)) > 0`, the value goopg's own virtual
+// pg_class row reports (catalog.go's VirtualRows path). goopg's on-disk index
+// key format is a per-INDEX property with nothing on disk recording it: since
+// the S11.4 flip an index that `buildPGIndexKeyDesc` can describe stores real
+// per-attribute PG datums — the shape upstream's `_bt_compare` orders — while
+// one it refuses (expression key, explicit opclass, non-bytewise collation, a
+// type with no 3b-2a comparator, and the two whose goopg heap image is not PG's,
+// `numeric`/`uuid`) keeps goopg's order-preserving key BLOB. A blob-format tree
+// is a structurally valid nbtree — PG-shaped pages, a PG metapage, real
+// `IndexTupleData` items, so `_bt_checkpage` accepts it — but its keys are
+// ordered by goopg's encoding, not by the opclass. Handing such an index to PG
+// would not fail loudly: PG would descend it with the wrong comparator, return
+// wrong rows, and on INSERT file entries where goopg's own descent never looks.
+//
+// So the flag is all-or-nothing per relation, because `relhasindex` is: PG's
+// `RelationGetIndexList` reads pg_index for EVERY index once the flag is set,
+// and there is no per-index way to hide one. A table carrying even one
+// undescribable index therefore reports false and keeps the pre-S11.6
+// behaviour — the silent no-index-maintenance gap, which is recoverable
+// (goopg maintains the index itself), rather than a mis-ordered write, which
+// is not. Ledgered.
+//
+// With the S11.4 gate off (`pgIndexTupleKeys == false`) every index is blob
+// format, so this is false for every table: the pre-slice behaviour, unchanged.
+func pgClassRelhasindex(cat catalog.Catalog, tbl *catalog.Table) bool {
+	if !pgIndexTupleKeys || cat == nil || tbl == nil {
+		return false
+	}
+	idxs := cat.IndexesOnTable(tbl)
+	if len(idxs) == 0 {
+		return false
+	}
+	for _, idx := range idxs {
+		if idx == nil {
+			return false
+		}
+		if _, err := buildPGIndexKeyDesc(idx); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
 func indexPersistence(idx *catalog.Index) string {
 	if idx.Table != nil && idx.Table.Unlogged {
 		return "u"
@@ -965,6 +1070,89 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 	}
 }
 
+// setPGAttributeCol overwrites one column of a pg_attribute row by NAME rather
+// than by literal slice index, so the index-attribute overrides below survive
+// any future reordering of pgAttributeColumnsPG18 / buildUserPGAttributeRow.
+func setPGAttributeCol(row Row, name string, d Datum) {
+	for i, c := range pgAttributeColumnsPG18() {
+		if c.Name == name {
+			if i < len(row) {
+				row[i] = d
+			}
+			return
+		}
+	}
+}
+
+// buildUserPGAttributeRowsForIndex builds the pg_attribute rows PG's
+// index_create writes for the INDEX relation itself — one per index attribute
+// (key columns first, then INCLUDE columns), attnum 1..indnatts.
+//
+// AI-20260810-011258-003 blocker #11. An index relation is a relation: PG
+// rebuilds its TupleDesc from pg_attribute like any other, and once blocker
+// #10 made a goopg-created index reachable (relhasindex), a PG 18.3 on a goopg
+// cluster hit `pg_attribute catalog is missing 1 attribute(s) for relation OID
+// <index>` in RelationBuildTupleDesc the first time it opened the index.
+// goopg's own catalog never needed these rows (it reads catalog.Index), so the
+// gap was invisible from goopg's side — the recurring sibling-path failure.
+//
+// The per-attribute values mirror upstream ConstructTupleDescriptor
+// (src/backend/catalog/index.c): the heap column's type/len/byval/align/
+// storage/typmod/collation are copied verbatim, while the *relation-level*
+// flags are reset — attnotnull=false, atthasdef/atthasmissing=false,
+// attidentity/attgenerated='\0', attislocal=true, attinhcount=0, and
+// attacl/attoptions/attfdwoptions/attmissingval/attstattarget NULL — because
+// an index attribute carries none of the heap column's constraints.
+//
+// An EXPRESSION key column (Columns[i] == "") is named `pg_expression_<attnum>`
+// exactly as upstream does, but its type is emitted as the parent column-less
+// `text` fallback: goopg has no expression type resolver reachable from here.
+// That divergence is ledgered, not silently absorbed.
+func buildUserPGAttributeRowsForIndex(cat catalog.Catalog, idx *catalog.Index) ([]Row, []string) {
+	if idx == nil || idx.Table == nil {
+		return nil, nil
+	}
+	names := make([]string, 0, len(idx.Columns)+len(idx.IncludeColumns))
+	names = append(names, idx.Columns...)
+	names = append(names, idx.IncludeColumns...)
+
+	rows := make([]Row, 0, len(names))
+	attnames := make([]string, 0, len(names))
+	for i, colName := range names {
+		attnum := int16(i + 1)
+		attname := colName
+		var src catalog.Column
+		if col, ok := cat.LookupColumn(idx.Table, colName); ok && colName != "" {
+			src = *col
+		} else {
+			// Expression key column (or a column that vanished from the
+			// parent): upstream names it pg_expression_<attnum>.
+			attname = fmt.Sprintf("pg_expression_%d", attnum)
+			src = catalog.Column{Name: attname, Type: catalog.Type{Name: "text"}}
+		}
+		row := buildUserPGAttributeRow(cat, idx.Table, src)
+		setPGAttributeCol(row, "attrelid", NewIntDatum(int64(idx.OID)))
+		setPGAttributeCol(row, "attname", NewStringDatum(attname))
+		setPGAttributeCol(row, "attnum", NewIntDatum(int64(attnum)))
+		setPGAttributeCol(row, "attnotnull", NewBoolDatum(false))
+		setPGAttributeCol(row, "atthasdef", NewBoolDatum(false))
+		setPGAttributeCol(row, "atthasmissing", NewBoolDatum(false))
+		setPGAttributeCol(row, "attidentity", NewStringDatum(""))
+		setPGAttributeCol(row, "attgenerated", NewStringDatum(""))
+		setPGAttributeCol(row, "attisdropped", NewBoolDatum(false))
+		setPGAttributeCol(row, "attislocal", NewBoolDatum(true))
+		setPGAttributeCol(row, "attinhcount", NewIntDatum(0))
+		setPGAttributeCol(row, "attacl", NullDatum)
+		setPGAttributeCol(row, "attoptions", NullDatum)
+		setPGAttributeCol(row, "attfdwoptions", NullDatum)
+		setPGAttributeCol(row, "attmissingval", NullDatum)
+		setPGAttributeCol(row, "attstattarget", NullDatum)
+		rows = append(rows, row)
+		attnames = append(attnames, attname)
+	}
+	return rows, attnames
+}
+
 // pgAttTypmod computes the PG-canonical pg_attribute.atttypmod from a column's
 // declared type arguments (e.g. the (10,2) in numeric(10,2)). It mirrors the
 // per-type typmodin functions in PostgreSQL so that catalog clients — notably
@@ -1132,7 +1320,21 @@ func buildUserPGIndexRow(cat catalog.Catalog, idx *catalog.Index) Row {
 			explicitCollation = idx.ColCollations[i]
 		}
 		indclassOIDs[i] = cat.ResolveIndexColumnOpclassOID(explicitClass, colTypeName(colName), opclassMethodOID)
-		indcollationOIDs[i] = cat.ResolveIndexColumnCollationOID(explicitCollation)
+		// An explicit `COLLATE` on the index column wins; otherwise the entry
+		// is the KEY COLUMN'S OWN collation, not InvalidOid. Upstream's
+		// ComputeIndexAttrs (src/backend/catalog/index.c) fills collationIds[]
+		// from the heap attribute's attcollation, and `_bt_mkscankey` hands
+		// that OID to the comparison function — so a zero here on a collatable
+		// key made a real PG 18.3 fail every scan and every insert on the index
+		// with `42P22: could not determine which collation to use for string
+		// comparison`. It was invisible until M0130-S11.6 set relhasindex and
+		// PG actually opened the index. Non-collatable types keep 0, which is
+		// what upstream writes for them.
+		collOID := cat.ResolveIndexColumnCollationOID(explicitCollation)
+		if collOID == 0 {
+			collOID = IndexKeyColumnCollationOID(cat, idx.Table, colName)
+		}
+		indcollationOIDs[i] = collOID
 	}
 
 	// indoption: per-key ASC/DESC + NULLS FIRST/LAST bitmask, mirroring

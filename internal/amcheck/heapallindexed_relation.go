@@ -43,7 +43,8 @@ import (
 // It descends from the metapage's Root to the leftmost leaf (following the
 // leftmost downlink at each internal level), then follows btpo_next across the
 // leaf level. src yields each page's raw bytes by block number — the SQL surface
-// fills it from the index's smgr, tests from a map. Fully deleted leaf pages
+// fills it from the index's smgr, tests from a map; keyFmt is the index's
+// on-page key format (the zero value is the blob format). Fully deleted leaf pages
 // carry no live items and are skipped (their fields may be type-punned), matching
 // the per-page tiers' deleted-page exemption.
 //
@@ -54,7 +55,7 @@ import (
 // returned as an error so the SQL surface surfaces it rather than silently
 // fingerprinting a truncated entry set (which would manufacture spurious "lacks
 // matching index tuple" reports — the heapallindexed soundness invariant).
-func CollectBtreeLeafEntries(src PageSource) ([]btree.LeafEntry, error) {
+func CollectBtreeLeafEntries(src PageSource, keyFmt btree.IndexFormat) ([]btree.LeafEntry, error) {
 	if src == nil {
 		return nil, fmt.Errorf("amcheck: nil page source")
 	}
@@ -69,7 +70,7 @@ func CollectBtreeLeafEntries(src PageSource) ([]btree.LeafEntry, error) {
 		return nil, nil
 	}
 
-	leftmost, err := leftmostLeafBlock(src, meta.Root)
+	leftmost, err := leftmostLeafBlock(src, meta.Root, keyFmt)
 	if err != nil {
 		return nil, err
 	}
@@ -93,7 +94,7 @@ func CollectBtreeLeafEntries(src PageSource) ([]btree.LeafEntry, error) {
 		// A fully deleted page is unlinked and holds no live items; skip it
 		// rather than decoding type-punned fields.
 		if !opaque.IsDeleted() {
-			leafEntries, err := btree.PageLeafEntries(p)
+			leafEntries, err := keyFmt.PageLeafEntries(p)
 			if err != nil {
 				return nil, fmt.Errorf("amcheck: decoding leaf block %d: %w", current, err)
 			}
@@ -109,7 +110,7 @@ func CollectBtreeLeafEntries(src PageSource) ([]btree.LeafEntry, error) {
 // The descent is bounded by a visited set so a corrupt downlink cycle terminates
 // with an error rather than looping forever — a bytes-only checker cannot
 // otherwise guarantee termination.
-func leftmostLeafBlock(src PageSource, root storage.BlockNumber) (storage.BlockNumber, error) {
+func leftmostLeafBlock(src PageSource, root storage.BlockNumber, keyFmt btree.IndexFormat) (storage.BlockNumber, error) {
 	visited := make(map[storage.BlockNumber]bool)
 	current := root
 	for {
@@ -129,7 +130,7 @@ func leftmostLeafBlock(src PageSource, root storage.BlockNumber) (storage.BlockN
 		if opaque.IsLeaf() {
 			return current, nil
 		}
-		downlinks, err := btree.PageDownlinks(p)
+		downlinks, err := keyFmt.PageDownlinks(p)
 		if err != nil {
 			return 0, fmt.Errorf("amcheck: decoding internal block %d during leftmost descent: %w", current, err)
 		}
@@ -150,14 +151,14 @@ func leftmostLeafBlock(src PageSource, root storage.BlockNumber) (storage.BlockN
 // "heap tuple (b,o) from table \"T\" lacks matching index tuple within index \"I\""
 // message.
 //
-// idxSrc yields the index's pages; heapEntries are formed by the wire layer's
+// idxSrc yields the index's pages and keyFmt is their key format; heapEntries are formed by the wire layer's
 // heap scan (see the scope note above); seed is the Bloom hash seed (the SQL
 // surface randomizes it per run so a different false-positive-masked subset is
 // caught on re-check, tests pin it). An index-walk error (unreadable page,
 // structural cycle) is returned rather than yielding a truncated fingerprint set
 // that would manufacture spurious reports.
-func VerifyBtreeHeapAllIndexedRelation(idxSrc PageSource, heapEntries []btree.LeafEntry, indexName, tableName string, seed uint64) ([]BtreeReport, error) {
-	leafEntries, err := CollectBtreeLeafEntries(idxSrc)
+func VerifyBtreeHeapAllIndexedRelation(idxSrc PageSource, keyFmt btree.IndexFormat, heapEntries []btree.LeafEntry, indexName, tableName string, seed uint64) ([]BtreeReport, error) {
+	leafEntries, err := CollectBtreeLeafEntries(idxSrc, keyFmt)
 	if err != nil {
 		return nil, err
 	}

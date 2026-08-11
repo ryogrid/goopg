@@ -180,7 +180,7 @@ func TestPagePruneOptHOTChainRedirect(t *testing.T) {
 
 	// Slot 1: HOT chain root — indexed, dead (xmax=5), HEAP_HOT_UPDATED, CTID→2
 	root := NewHeapTuple(1, xid, []byte("root"))
-	root.Header.Infomask |= HeapHotUpdated
+	root.Header.SetHotUpdated()
 	root.Header.CTID = ItemPointer{Block: 0, Offset: 2}
 	s1, err := PageAddHeapTuple(page, root)
 	if err != nil || s1 != 1 {
@@ -189,7 +189,7 @@ func TestPagePruneOptHOTChainRedirect(t *testing.T) {
 
 	// Slot 2: HOT-only successor, still live (xmin=5, xmax=0)
 	succ := NewHeapTuple(xid, InvalidTransactionID, []byte("succ"))
-	succ.Header.Infomask |= HeapOnlyTuple
+	succ.Header.SetHeapOnly()
 	s2, err := PageAddHeapTuple(page, succ)
 	if err != nil || s2 != 2 {
 		t.Fatalf("add succ: slot=%d err=%v", s2, err)

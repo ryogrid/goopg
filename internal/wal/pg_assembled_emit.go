@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
+	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -283,10 +284,14 @@ const sizeOfXLogBtreeInsertData = 2
 // EncodeBtreeInsertPG builds a PostgreSQL xl_btree_insert record for one leaf
 // index-tuple insertion (XLOG_BTREE_INSERT_LEAF), framed for the assembled path.
 // Main data is xl_btree_insert{offnum}; block 0 carries the new IndexTuple as
-// block data. goopg replay re-inserts the tuple by key (btree.ApplyInsertRecord)
-// and does not need offnum, so the emit path passes 0 — a documented parity gap
-// (a real-PG standby would need the true leaf offset). xl_xid = 0 (btree index
-// changes are not logical user-data events).
+// block data. `offnum` is the physical 1-based offset number the writer placed
+// the tuple at, which both a real-PG standby and goopg replay
+// (btree.ApplyInsertRecordAt) apply at. It used to be a hard-coded 0 — a
+// documented parity gap — because goopg replay re-inserted the tuple by key;
+// M0130-S11.4 slice 3b-2c-ii-B2-b-ii made the offset real, since re-deriving
+// the slot needs the index's comparison semantics and recovery has no catalog
+// to resolve them from. xl_xid = 0 (btree index changes are not logical
+// user-data events).
 func EncodeBtreeInsertPG(rel storage.RelFileNode, blk storage.BlockNumber, offnum uint16, item []byte) ([]byte, error) {
 	if len(item) == 0 {
 		return nil, fmt.Errorf("wal: btree-insert item is empty")
@@ -443,87 +448,558 @@ func EncodeHeapFreezePG(rel storage.RelFileNode, blk storage.BlockNumber, frozen
 	return framePGAssembled(RmgrHeap2, xlogHeap2PruneVacuumClean, 0, body), nil
 }
 
-// EncodeBtreeSplitPG builds a PostgreSQL RM_BTREE split record (XLOG_BTREE_SPLIT_L
-// opcode) carrying the post-split left, right, and (non-rightmost) sibling pages
-// as full-page images. goopg's split record already holds the exact final page
-// bytes, so this reuses the A0 FPI encoder rather than reconstructing PG's
-// incremental xl_btree_split main-data: block 0 = left (mutated in place), block
-// 1 = right (WILL_INIT — a new block), block 2 = the left sibling's right-link
-// update (non-rightmost only). Every block carries BKPIMAGE_APPLY, so replay
-// (replayDecodedXLogHeapFPIBlocks via the RmgrBtree default arm) restores the
-// images — identical to the native replayBtreeSplit and PG's BLK_RESTORED redo.
-// The right block extends when it does not yet exist. No main-data is carried
-// (the images are authoritative — a documented deviation from PG's incremental
-// xl_btree_split); xl_xid = 0.
-func EncodeBtreeSplitPG(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, sibBlk storage.BlockNumber, sibPage storage.Page) ([]byte, error) {
+// sizeOfXLogBtreeSplitData is PG's SizeOfBtreeSplit: level(4) + firstrightoff(2)
+// + newitemoff(2) + postingoff(2). No tail padding — the uint32 leads.
+const sizeOfXLogBtreeSplitData = 10
+
+// EncodeBtreeSplitPG builds a PostgreSQL RM_BTREE split record
+// (XLOG_BTREE_SPLIT_R opcode), shaped for upstream `btree_xlog_split`
+// (nbtxlog.c:180-352). M0130-S11.5b replaced the previous image-only form,
+// which carried NO main data at all: upstream's redo opens with an
+// unconditional `XLogRecGetData` cast to `xl_btree_split` and reads
+// `xlrec->level` before it looks at any block, so an FPI-only record is
+// unreplayable by the engine it is shaped for — the images made goopg↔goopg
+// replay work and nothing else.
+//
+//	main data: xl_btree_split{level, firstrightoff, newitemoff, postingoff}
+//	block 0:   the left half — either the incremental form (the new item when it
+//	           landed on this half, then the page's new high key) or a full-page
+//	           image (see below)
+//	block 1:   the new right sibling, WILL_INIT, block data = its item area in
+//	           `_bt_restore_page` order — NO image
+//	block 2:   the page that was the left page's right sibling, no data
+//	           (non-rightmost split only; redo only patches its back-link)
+//	block 3:   the child one level down whose incomplete-split flag this
+//	           insertion finishes, no data (INTERNAL split only)
+//
+// Block 1 must be content, not an image: upstream's redo rebuilds the right
+// page from scratch on every replay (`XLogInitBufferForRedo` + `_bt_pageinit` +
+// `_bt_restore_page`) and would overwrite a restored image with whatever the
+// block data says — an empty page if there were none. The right page's opaque
+// header is not carried at all; redo derives it from the record's level and
+// block tags, so this encoder REFUSES a right page whose header does not match
+// `btree.SplitRightPageOpaque`, rather than logging a record whose redo builds
+// a different page than the primary wrote.
+//
+// Block 0 as an image is upstream-legal, not a shortcut around it: PG's own
+// `_bt_split` logs the left half incrementally (the new item plus the page's
+// new high key) but its redo reaches that path only under `BLK_NEEDS_REDO` —
+// with a backup image the left half takes `BLK_RESTORED` and the incremental
+// rebuild, along with firstrightoff/newitemoff/postingoff, is skipped entirely.
+// Upstream says as much in the comment above its own `XLogRegisterBufData`
+// ("If XLogInsert decides that it can omit orignewitem due to logging a
+// full-page image of the left page, everything still works out").
+//
+// M0130-S11.5b-2 makes the incremental form the DEFAULT, so a split record is
+// two tuples rather than a page. It is not unconditional, because goopg's split
+// is not upstream's: `splitPage` reads the whole page out, appends the new item,
+// runs a DEDUP CONSOLIDATION pass over the merged list and refills both halves,
+// so the left half can hold posting tuples that were never on the original page,
+// can have lost the pre-split page's LP_DEAD-marked items, and (on a root split)
+// still carries BTP_ROOT where upstream's `_bt_split` clears it. None of that is
+// describable by three offsets.
+//
+// Rather than enumerate those cases here and hope the list stays complete, the
+// encoder asks the pages: `btree.DescribeSplitLeft` derives the description from
+// the pre-split page and the two halves, `btree.CheckSplitLeft` replays it and
+// compares the result with the left half the primary actually wrote, and only a
+// clean reproduction is logged incrementally. Anything else falls back to the
+// image — the same CheckVacuumDelete discipline S11.5c introduced. A caller with
+// no pre-split page or no new item (the pre-runtime/bulk paths) gets the image
+// too.
+//
+// Under the image the three offsets are never read by any redo — upstream's or
+// goopg's — but they are still filled in consistently rather than zeroed: the
+// record is logged as SPLIT_R (new item on the right), firstrightoff is where
+// the right half begins in the split page's offset numbering (P_FIRSTDATAKEY is
+// 2 — the post-split left page is never rightmost, it links to the new right
+// page), newitemoff equals it because the new item is the first right item under
+// that description, and postingoff is 0 (no posting split). A reader that
+// ignores the image and believes the main data therefore still gets a coherent
+// story, just not the one the primary actually executed.
+//
+// postingoff is 0 in BOTH forms: goopg has no posting-list split at insert time
+// (its dedup pass runs over the whole page instead), and a non-zero value would
+// make redo run `_bt_swap_posting` over an item the primary never rewrote.
+//
+// Block 3 exists on an INTERNAL split only, and is MANDATORY there
+// (M0130-S11.5b-3): an internal page is only ever inserted into to complete a
+// split one level down, and upstream's redo clears that child's
+// BTP_INCOMPLETE_SPLIT under `if (!isleaf) _bt_clear_incomplete_split(record,
+// 3)` before it touches any other block. `XLogReadBufferForRedo` PANICs on an
+// unregistered block id rather than reporting it, so a level > 0 record without
+// block 3 does not merely lose the flag clear — it takes a real PG standby
+// down. The encoder therefore refuses that combination, the same way
+// EncodeBtreeNewRootPG refuses a level > 0 newroot with no block 1. A leaf
+// split must NOT carry one: upstream has no cbuf there, and a block 3 its redo
+// never reads would be a record PG cannot round-trip.
+//
+// The block carries no data because there is nothing to describe: the primary
+// clears the flag itself (`splitPage`, mirroring _bt_split's own
+// `cpageop->btpo_flags &= ~BTP_INCOMPLETE_SPLIT`) and redo re-derives the same
+// mutation from the page it finds.
+//
+// xl_xid = 0 (index maintenance is not a logical user-data event).
+func EncodeBtreeSplitPG(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, prePage, leftPage, rightPage storage.Page, newItem []byte, sibBlk storage.BlockNumber, sibPage storage.Page, childBlk storage.BlockNumber) ([]byte, error) {
 	if len(leftPage) != storage.BlockSize || len(rightPage) != storage.BlockSize {
 		return nil, fmt.Errorf("wal: btree-split left/right page must be %d bytes", storage.BlockSize)
 	}
+	level, err := btree.CheckSplitRightPageOpaque(rightPage, leftBlk, sibBlk)
+	if err != nil {
+		return nil, fmt.Errorf("wal: btree-split: %w", err)
+	}
+	rightData, err := btree.PGRestorePageData(rightPage)
+	if err != nil {
+		return nil, fmt.Errorf("wal: btree-split right items: %w", err)
+	}
+
+	leftData, err := btree.PGDataItemCount(leftPage)
+	if err != nil {
+		return nil, fmt.Errorf("wal: btree-split left item count: %w", err)
+	}
+	// P_FIRSTDATAKEY of the post-split left page: it links to the new right
+	// page, so it is never rightmost and its first data item sits past P_HIKEY.
+	firstRightOff := uint16(2 + leftData)
+	newItemOff := firstRightOff
+	info := xlogBtreeSplitR
+	leftBlock := BlockRef{ID: 0, Rel: rel, Block: leftBlk, Image: &FullPageImage{Page: leftPage, Apply: true}}
+
+	// The incremental left half, when the split the primary performed is one
+	// upstream's record can describe AND replaying that description reproduces
+	// the page it wrote.
+	if desc, derr := btree.DescribeSplitLeft(prePage, leftPage, rightPage, newItem); derr == nil &&
+		btree.CheckSplitLeft(prePage, leftPage, level, rightBlk, desc) == nil {
+		firstRightOff = desc.FirstRightOff
+		newItemOff = desc.NewItemOff
+		if desc.NewItemOnLeft {
+			info = xlogBtreeSplitL
+		}
+		leftBlock = BlockRef{ID: 0, Rel: rel, Block: leftBlk, Data: btree.SplitLeftBlockData(desc)}
+	}
+
+	mainData := make([]byte, sizeOfXLogBtreeSplitData)
+	binary.LittleEndian.PutUint32(mainData[0:4], level)
+	binary.LittleEndian.PutUint16(mainData[4:6], firstRightOff)
+	binary.LittleEndian.PutUint16(mainData[6:8], newItemOff)
+	binary.LittleEndian.PutUint16(mainData[8:10], 0) // postingoff
+
 	blocks := []BlockRef{
-		{ID: 0, Rel: rel, Block: leftBlk, Image: &FullPageImage{Page: leftPage, Apply: true}},
-		{ID: 1, Rel: rel, Block: rightBlk, SameRel: true, WillInit: true, Image: &FullPageImage{Page: rightPage, Apply: true}},
+		leftBlock,
+		{ID: 1, Rel: rel, Block: rightBlk, SameRel: true, WillInit: true, Data: rightData},
 	}
 	if sibBlk != storage.InvalidBlockNumber {
 		if len(sibPage) != storage.BlockSize {
 			return nil, fmt.Errorf("wal: btree-split sibling page must be %d bytes", storage.BlockSize)
 		}
-		blocks = append(blocks, BlockRef{ID: 2, Rel: rel, Block: sibBlk, SameRel: true, Image: &FullPageImage{Page: sibPage, Apply: true}})
+		blocks = append(blocks, BlockRef{ID: 2, Rel: rel, Block: sibBlk, SameRel: true})
 	}
-	body, err := assembleXLogRecord(nil, blocks)
+	if level > 0 {
+		if childBlk == storage.InvalidBlockNumber {
+			return nil, fmt.Errorf("wal: btree-split at level %d has no child block", level)
+		}
+		blocks = append(blocks, BlockRef{ID: 3, Rel: rel, Block: childBlk, SameRel: true})
+	} else if childBlk != storage.InvalidBlockNumber {
+		return nil, fmt.Errorf("wal: btree-split at level 0 must not carry child block %d", childBlk)
+	}
+	body, err := assembleXLogRecord(mainData, blocks)
 	if err != nil {
 		return nil, err
 	}
-	return framePGAssembled(RmgrBtree, xlogBtreeSplitL, 0, body), nil
+	return framePGAssembled(RmgrBtree, info, 0, body), nil
 }
 
+// sizeOfXLogBtreeVacuumData is PG's SizeOfBtreeVacuum: ndeleted(2) +
+// nupdated(2).
+const sizeOfXLogBtreeVacuumData = 4
+
 // EncodeBtreeVacuumPG builds a PostgreSQL RM_BTREE vacuum record
-// (XLOG_BTREE_VACUUM opcode) carrying the post-vacuum leaf page as a full-page
-// image (backup block 0). goopg's vacuum pass already holds the exact final page
-// bytes (dead items removed, opaque flags updated), so this reuses the A0 FPI
-// encoder rather than reconstructing PG's incremental xl_btree_vacuum main-data
-// (ndeleted/nupdated + offset arrays). BKPIMAGE_APPLY makes replay
-// (replayDecodedXLogHeapFPIBlocks via the RmgrBtree default arm) restore the
-// image, identical to the native replayBtreeVacuum and PG's BLK_RESTORED redo.
-// No main-data is carried (the image is authoritative — a documented deviation
-// from PG's incremental xl_btree_vacuum); xl_xid = 0.
-func EncodeBtreeVacuumPG(rel storage.RelFileNode, blk storage.BlockNumber, page storage.Page) ([]byte, error) {
+// (XLOG_BTREE_VACUUM opcode), shaped for upstream `btree_xlog_vacuum`
+// (nbtxlog.c:479-528):
+//
+//	main data: xl_btree_vacuum{ndeleted, nupdated}
+//	block 0:   the leaf page. Either
+//	           (a) block data = the ndeleted deleted offset numbers (uint16
+//	               each, ascending), no image — the incremental form; or
+//	           (b) a full-page image with ndeleted = nupdated = 0.
+//
+// M0130-S11.5c. The previous form carried NO main data at all, only the image.
+// Unlike newroot/split that is not outright unreplayable — upstream dereferences
+// `xlrec` only under BLK_NEEDS_REDO, which an applied image skips — but the
+// record still lies to everything that reads it without replaying it, starting
+// with `pg_waldump`'s `btree_desc`, which prints ndeleted/nupdated off the end
+// of a zero-length main-data area. Both forms below now carry the struct.
+//
+// Which form is chosen is decided by asking whether the deletion DESCRIBES what
+// the primary did, not by trusting the caller: `btree.CheckVacuumDelete` replays
+// the offsets against the pre-vacuum page and compares the result with the page
+// VACUUM actually wrote. It says no in two cases goopg's vacuum reaches and PG's
+// does not:
+//
+//   - the page carried POSTING LISTS. goopg's vacuum filters an EXPANDED item
+//     list (one entry per TID) and re-marshals the survivors individually, so a
+//     posting tuple that lost one TID — or none — comes back as several ordinary
+//     tuples. Upstream keeps it a posting tuple and describes the change with
+//     `xl_btree_update` (nupdated), which is a rewrite of one item, not a change
+//     of the page's item count. goopg never emits nupdated > 0.
+//   - the page went EMPTY. VACUUM then also stamps BTDeleted|BTHalfDead (phase 1
+//     of page deletion), and no `btree_xlog_vacuum` sets those flags.
+//
+// The caller may also pass deleted = nil outright (the dedup-recovery rewrite in
+// _bt_insertonpg's fallback path reuses this record for a page rewrite that is a
+// CONSOLIDATION, not a deletion — there are no deleted offsets to name).
+//
+// The image form is upstream-legal for the same reason block 0 of the split
+// record is: redo takes BLK_RESTORED and skips the incremental arm entirely.
+// xl_xid = 0 (index maintenance is not a logical user-data event).
+func EncodeBtreeVacuumPG(rel storage.RelFileNode, blk storage.BlockNumber, prePage, page storage.Page, deleted []uint16) ([]byte, error) {
 	if len(page) != storage.BlockSize {
 		return nil, fmt.Errorf("wal: btree-vacuum page must be %d bytes", storage.BlockSize)
 	}
-	blocks := []BlockRef{{ID: 0, Rel: rel, Block: blk, Image: &FullPageImage{Page: page, Apply: true}}}
-	body, err := assembleXLogRecord(nil, blocks)
+	incremental := len(deleted) > 0 && len(prePage) == storage.BlockSize &&
+		btree.CheckVacuumDelete(prePage, page, deleted) == nil
+
+	mainData := make([]byte, sizeOfXLogBtreeVacuumData)
+	var block BlockRef
+	if incremental {
+		binary.LittleEndian.PutUint16(mainData[0:2], uint16(len(deleted)))
+		blockData := make([]byte, 0, 2*len(deleted))
+		for _, off := range deleted {
+			blockData = binary.LittleEndian.AppendUint16(blockData, off)
+		}
+		block = BlockRef{ID: 0, Rel: rel, Block: blk, Data: blockData}
+	} else {
+		block = BlockRef{ID: 0, Rel: rel, Block: blk, Image: &FullPageImage{Page: page, Apply: true}}
+	}
+	body, err := assembleXLogRecord(mainData, []BlockRef{block})
 	if err != nil {
 		return nil, err
 	}
 	return framePGAssembled(RmgrBtree, xlogBtreeVacuum, 0, body), nil
 }
 
+// sizeOfXLogBtreeNewRootData is PG's SizeOfBtreeNewroot: rootblk(4) + level(4).
+const sizeOfXLogBtreeNewRootData = 8
+
+// sizeOfXLogBtreeMetadata is sizeof(xl_btree_metadata): six uint32 fields, a
+// bool, and 3 bytes of tail padding to the struct's 4-byte alignment. PG's
+// _bt_restore_meta asserts the block-data length is EXACTLY this, so the
+// padding is part of the wire format, not an artefact.
+const sizeOfXLogBtreeMetadata = 28
+
+// encodeXLogBtreeMetadata serialises a metapage as PG's xl_btree_metadata
+// (nbtxlog.h). btm_magic and btm_last_cleanup_num_heap_tuples are NOT carried:
+// upstream's redo re-asserts the magic and resets num_heap_tuples to -1.0.
+func encodeXLogBtreeMetadata(m btree.PGBTMetaPage) []byte {
+	out := make([]byte, sizeOfXLogBtreeMetadata)
+	binary.LittleEndian.PutUint32(out[0:4], m.Version)
+	binary.LittleEndian.PutUint32(out[4:8], uint32(m.Root))
+	binary.LittleEndian.PutUint32(out[8:12], m.Level)
+	binary.LittleEndian.PutUint32(out[12:16], uint32(m.FastRoot))
+	binary.LittleEndian.PutUint32(out[16:20], m.FastLevel)
+	binary.LittleEndian.PutUint32(out[20:24], m.LastCleanupNumDelpages)
+	if m.AllEqualImage {
+		out[24] = 1
+	}
+	return out
+}
+
+// decodeXLogBtreeMetadata is encodeXLogBtreeMetadata's inverse.
+func decodeXLogBtreeMetadata(b []byte) (btree.PGBTMetaPage, error) {
+	if len(b) != sizeOfXLogBtreeMetadata {
+		return btree.PGBTMetaPage{}, fmt.Errorf("wal: xl_btree_metadata is %d bytes, want %d", len(b), sizeOfXLogBtreeMetadata)
+	}
+	le := binary.LittleEndian
+	return btree.PGBTMetaPage{
+		Version:                le.Uint32(b[0:4]),
+		Root:                   storage.BlockNumber(le.Uint32(b[4:8])),
+		Level:                  le.Uint32(b[8:12]),
+		FastRoot:               storage.BlockNumber(le.Uint32(b[12:16])),
+		FastLevel:              le.Uint32(b[16:20]),
+		LastCleanupNumDelpages: le.Uint32(b[20:24]),
+		AllEqualImage:          b[24] != 0,
+	}, nil
+}
+
 // EncodeBtreeNewRootPG builds a PostgreSQL RM_BTREE new-root record
-// (XLOG_BTREE_NEWROOT opcode) carrying the freshly-built root page (backup block
-// 0, WILL_INIT — a new block) and the updated metapage (backup block 2, matching
-// PG's block numbering; block 1 = left child is unused because goopg does not
-// mutate the old root during root replacement). Both ride as full-page images:
-// goopg's createNewRoot holds the exact final bytes for both pages, so this
-// reuses the A0 FPI encoder rather than reconstructing PG's xl_btree_newroot
-// main-data (rootblk + level, which PG's redo uses to rebuild the metapage).
-// BKPIMAGE_APPLY makes replay restore both images via the RmgrBtree default arm
-// — matching native replayBtreeNewRoot (which reconstructs the metapage from
-// rootblk/level) and PG's BLK_RESTORED redo. No main-data is carried (the images
-// are authoritative — a documented deviation from PG's incremental
-// xl_btree_newroot); xl_xid = 0.
-func EncodeBtreeNewRootPG(rel storage.RelFileNode, rootBlk storage.BlockNumber, rootPage storage.Page, metaBlk storage.BlockNumber, metaPage storage.Page) ([]byte, error) {
+// (XLOG_BTREE_NEWROOT opcode), byte-faithful to upstream `_bt_newroot`
+// (nbtinsert.c:2556-2597). M0130-S11.5a replaced the previous full-page-image
+// form: an FPI-only record has a PG-shaped HEADER but no `xl_btree_newroot` main
+// data, and a real PG standby's `btree_xlog_newroot` reads that struct
+// unconditionally — the images made goopg↔goopg replay work while leaving the
+// record unreplayable by the engine it is shaped for.
+//
+//	main data: xl_btree_newroot{rootblk, level}
+//	block 0:   the new root, WILL_INIT, block data = its item area in
+//	           `_bt_restore_page` order (level > 0 only; a level-0 root is empty)
+//	block 1:   the left child, so redo can clear its incomplete-split flag
+//	           (level > 0 only — upstream's redo touches block 1 under exactly
+//	           the same condition)
+//	block 2:   the metapage, WILL_INIT, block data = xl_btree_metadata
+//
+// `level` and the item area come from rootPage, and the metadata from metaPage,
+// so the caller cannot describe the record inconsistently with the pages it is
+// logging. xl_xid = 0 (index changes are not logical user-data events).
+//
+// The level-0 case has no upstream counterpart in `_bt_newroot` (upstream never
+// builds a leaf root through it); goopg reaches it from VACUUM's root reset
+// (`resetToEmptyRoot`). It is nonetheless exactly what upstream's redo handles:
+// `btree_xlog_newroot` initialises the page, sets BTP_ROOT|BTP_LEAF for level 0
+// and skips both the item restore and block 1.
+func EncodeBtreeNewRootPG(rel storage.RelFileNode, rootBlk storage.BlockNumber, rootPage storage.Page, leftChildBlk storage.BlockNumber, metaBlk storage.BlockNumber, metaPage storage.Page) ([]byte, error) {
 	if len(rootPage) != storage.BlockSize || len(metaPage) != storage.BlockSize {
 		return nil, fmt.Errorf("wal: btree-newroot root/meta page must be %d bytes", storage.BlockSize)
 	}
-	blocks := []BlockRef{
-		{ID: 0, Rel: rel, Block: rootBlk, WillInit: true, Image: &FullPageImage{Page: rootPage, Apply: true}},
-		{ID: 2, Rel: rel, Block: metaBlk, SameRel: true, Image: &FullPageImage{Page: metaPage, Apply: true}},
+	level := btree.ReadPGOpaque(rootPage).Level
+	mainData := make([]byte, sizeOfXLogBtreeNewRootData)
+	binary.LittleEndian.PutUint32(mainData[0:4], uint32(rootBlk))
+	binary.LittleEndian.PutUint32(mainData[4:8], level)
+
+	blocks := []BlockRef{{ID: 0, Rel: rel, Block: rootBlk, WillInit: true}}
+	if level > 0 {
+		if leftChildBlk == storage.InvalidBlockNumber {
+			return nil, fmt.Errorf("wal: btree-newroot at level %d has no left child block", level)
+		}
+		data, err := btree.PGRestorePageData(rootPage)
+		if err != nil {
+			return nil, fmt.Errorf("wal: btree-newroot root items: %w", err)
+		}
+		blocks[0].Data = data
+		blocks = append(blocks, BlockRef{ID: 1, Rel: rel, Block: leftChildBlk, SameRel: true})
 	}
-	body, err := assembleXLogRecord(nil, blocks)
+	blocks = append(blocks, BlockRef{
+		ID: 2, Rel: rel, Block: metaBlk, SameRel: true, WillInit: true,
+		Data: encodeXLogBtreeMetadata(btree.ReadPGMetaPage(metaPage)),
+	})
+	body, err := assembleXLogRecord(mainData, blocks)
 	if err != nil {
 		return nil, err
 	}
 	return framePGAssembled(RmgrBtree, xlogBtreeNewRoot, 0, body), nil
+}
+
+// sizeOfXLogBtreeMarkPageHalfDeadData is PG's SizeOfBtreeMarkPageHalfDead:
+// poffset(2) + 2 bytes of C alignment padding + leafblk(4) + leftblk(4) +
+// rightblk(4) + topparent(4) = 20. The padding is part of the wire format —
+// upstream casts the main-data area straight to the struct.
+const sizeOfXLogBtreeMarkPageHalfDeadData = 20
+
+// EncodeBtreeMarkPageHalfDeadPG builds a PostgreSQL RM_BTREE phase-1
+// page-deletion record (XLOG_BTREE_MARK_PAGE_HALFDEAD opcode), shaped for
+// upstream `btree_xlog_mark_page_halfdead` (nbtxlog.c:762-848) and emitted by
+// `_bt_mark_page_halfdead` (nbtpage.c):
+//
+//	main data: xl_btree_mark_page_halfdead{poffset, leafblk, leftblk, rightblk,
+//	                                       topparent}
+//	block 0:   the leaf, WILL_INIT, no block data — redo recreates the half-dead
+//	           page from the main data alone
+//	block 1:   the to-be-deleted subtree's parent, so redo can remove the
+//	           downlink
+//
+// M0130-S11.5d-1. The record goopg emitted before this
+// (`EncodeBtreeMarkPageHalfDead`, RecordKind 25) carried leafblk plus a flags
+// word and NO registered blocks at all, under a header that nevertheless
+// announced RM_BTREE/XLOG_BTREE_MARK_PAGE_HALFDEAD. That is the same trap
+// S11.5a found under newroot, one degree worse: upstream's redo does not merely
+// misread the main data, it calls `XLogInitBufferForRedo(record, 0)`
+// unconditionally, and a block id that was never registered is a PANIC in
+// `XLogReadBufferForRedoExtended`, not a bad page. A standby therefore dies on
+// the first goopg page deletion rather than diverging quietly.
+//
+// `leftblk`/`rightblk` are read off leafPage rather than taken from the caller,
+// for the same reason EncodeBtreeNewRootPG derives level from the page it logs:
+// the record must not be able to describe a page differently from the page.
+//
+// `topparent` is InvalidBlockNumber when the leaf is itself the top of the
+// subtree being deleted — upstream writes exactly that when `topparent ==
+// leafblkno`. `poffset` is a PHYSICAL OffsetNumber in the parent.
+// xl_xid = 0 (index maintenance is not a logical user-data event).
+func EncodeBtreeMarkPageHalfDeadPG(rel storage.RelFileNode, leafBlk storage.BlockNumber, leafPage storage.Page, parentBlk storage.BlockNumber, poffset uint16, topparent storage.BlockNumber) ([]byte, error) {
+	if len(leafPage) != storage.BlockSize {
+		return nil, fmt.Errorf("wal: btree-mark-halfdead leaf page must be %d bytes", storage.BlockSize)
+	}
+	if parentBlk == storage.InvalidBlockNumber {
+		// Upstream registers block 1 unconditionally and its redo reads it
+		// unconditionally; a root-only tree never reaches _bt_mark_page_halfdead
+		// because a root is not deletable.
+		return nil, fmt.Errorf("wal: btree-mark-halfdead has no parent block")
+	}
+	if poffset == 0 {
+		return nil, fmt.Errorf("wal: btree-mark-halfdead poffset 0 is not a valid OffsetNumber")
+	}
+	if topparent == leafBlk {
+		return nil, fmt.Errorf("wal: btree-mark-halfdead topparent %d must be InvalidBlockNumber when it is the leaf itself", topparent)
+	}
+	op := btree.ReadPGOpaque(leafPage)
+	mainData := make([]byte, sizeOfXLogBtreeMarkPageHalfDeadData)
+	binary.LittleEndian.PutUint16(mainData[0:2], poffset)
+	binary.LittleEndian.PutUint32(mainData[4:8], uint32(leafBlk))
+	binary.LittleEndian.PutUint32(mainData[8:12], uint32(op.Prev))
+	binary.LittleEndian.PutUint32(mainData[12:16], uint32(op.Next))
+	binary.LittleEndian.PutUint32(mainData[16:20], uint32(topparent))
+
+	body, err := assembleXLogRecord(mainData, []BlockRef{
+		{ID: 0, Rel: rel, Block: leafBlk, WillInit: true},
+		{ID: 1, Rel: rel, Block: parentBlk, SameRel: true},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return framePGAssembled(RmgrBtree, xlogBtreeMarkPageHalfDead, 0, body), nil
+}
+
+// sizeOfXLogBtreeUnlinkPageData is PG's SizeOfBtreeUnlinkPage:
+// leftsib(4) + rightsib(4) + level(4) + 4 bytes of C alignment padding +
+// safexid(8) + leafleftsib(4) + leafrightsib(4) + leaftopparent(4) = 36. The
+// padding exists because FullTransactionId is a uint64 and therefore 8-byte
+// aligned; like every other main-data struct it is cast, not parsed, so the
+// hole is wire format. 36 is `offsetof(leaftopparent) + sizeof(BlockNumber)` —
+// upstream registers the offsetof size, not sizeof(struct), so the record does
+// NOT carry the struct's own 4 bytes of trailing padding.
+const sizeOfXLogBtreeUnlinkPageData = 36
+
+// BtreeUnlinkPagePGRequest is the input to EncodeBtreeUnlinkPagePG. The record's
+// link/level fields are deliberately NOT in it: they are read off the pages
+// being logged (see EncodeBtreeUnlinkPagePG).
+type BtreeUnlinkPagePGRequest struct {
+	Rel storage.RelFileNode
+	// TargetBlk / TargetPage are the page being unlinked. TargetPage may be
+	// either its pre- or post-mutation image: the unlink preserves btpo_prev,
+	// btpo_next and btpo_level, which are the only fields read from it.
+	TargetBlk  storage.BlockNumber
+	TargetPage storage.Page
+	// SafeXid is the FullTransactionId stamped by BTPageSetDeleted — upstream's
+	// `ReadNextFullTransactionId()` at deletion time, the XID from which the
+	// block becomes recyclable.
+	SafeXid uint64
+	// LeafBlk is the half-dead leaf at the bottom of the subtree being deleted.
+	// It equals TargetBlk on the last (or only) page of the subtree, in which
+	// case LeafPage must be nil and no block 3 is registered.
+	LeafBlk  storage.BlockNumber
+	LeafPage storage.Page
+	// MetaBlk / MetaPage make this the XLOG_BTREE_UNLINK_PAGE_META variant.
+	// MetaBlk is storage.InvalidBlockNumber when the metapage is untouched.
+	MetaBlk  storage.BlockNumber
+	MetaPage storage.Page
+}
+
+// EncodeBtreeUnlinkPagePG builds a PostgreSQL RM_BTREE phase-2 page-deletion
+// record (XLOG_BTREE_UNLINK_PAGE, or …_META when a metapage is supplied),
+// shaped for upstream `btree_xlog_unlink_page` (nbtxlog.c:850-1005) and emitted
+// by `_bt_unlink_halfdead_page` (nbtpage.c:2680-2740):
+//
+//	main data: xl_btree_unlink_page{leftsib, rightsib, level, safexid,
+//	                                leafleftsib, leafrightsib, leaftopparent}
+//	block 0:   the target, WILL_INIT, no data — redo rewrites it as an empty
+//	           deleted page from the main data alone
+//	block 1:   the left sibling, ONLY when the target has one
+//	block 2:   the right sibling, unconditionally
+//	block 3:   the half-dead leaf, ONLY when the target is an internal page —
+//	           WILL_INIT, no data, redo recreates it with the next child down
+//	block 4:   the metapage on the _META variant, WILL_INIT + xl_btree_metadata
+//
+// M0130-S11.5d-2, the second half of the pair S11.5d-1 started. goopg's native
+// `RecordKindBtreeUnlinkPage` covers BOTH phases in one record and is emitted
+// under this same RM_BTREE/0x80 header, so a standby reading it hits the same
+// class of failure S11.5d-1 documented for phase 1: the main data is read as a
+// struct it is not, and `XLogInitBufferForRedo(record, 0)` PANICs on a block id
+// that was never registered.
+//
+// Every structural field is read off a page rather than accepted from the
+// caller, the discipline S11.5a/S11.5d-1 established — the record must not be
+// able to describe a page differently from the page it logs. `leftsib`,
+// `rightsib` and `level` come from the target's opaque; `leafleftsib` and
+// `leafrightsib` from the leaf's; `leaftopparent` from the leaf's dummy high
+// key, which is where `_bt_unlink_halfdead_page` has just written it (nbtpage.c
+// BTreeTupleSetTopParent(leafhikey, leaftopparent)) and where the NEXT
+// invocation will read it back from.
+//
+// A rightmost target is refused rather than encoded: upstream's redo reads block
+// 2 unconditionally, so "no right sibling" has no representation in this record
+// at all — which is consistent, because `_bt_pagedel` never deletes a rightmost
+// page (it would have to update the parent's high key).
+//
+// xl_xid = 0 (index maintenance is not a logical user-data event).
+func EncodeBtreeUnlinkPagePG(req BtreeUnlinkPagePGRequest) ([]byte, error) {
+	if len(req.TargetPage) != storage.BlockSize {
+		return nil, fmt.Errorf("wal: btree-unlink-page target page must be %d bytes", storage.BlockSize)
+	}
+	op := btree.ReadPGOpaque(req.TargetPage)
+	leftsib, rightsib, level := op.Prev, op.Next, op.Level
+	if rightsib == btree.PNone {
+		return nil, fmt.Errorf("wal: btree-unlink-page target %d is rightmost; upstream redo reads block 2 unconditionally", req.TargetBlk)
+	}
+	if leftsib == req.TargetBlk || rightsib == req.TargetBlk {
+		return nil, fmt.Errorf("wal: btree-unlink-page target %d is its own sibling", req.TargetBlk)
+	}
+
+	// Upstream's own values for the target-is-leaf case: the leaf's links ARE
+	// the target's, and there is no next child down because this is the last
+	// page of the subtree being deleted.
+	leafleftsib, leafrightsib := leftsib, rightsib
+	leaftopparent := storage.InvalidBlockNumber
+	blocks := []BlockRef{{ID: 0, Rel: req.Rel, Block: req.TargetBlk, WillInit: true}}
+	if leftsib != btree.PNone {
+		blocks = append(blocks, BlockRef{ID: 1, Rel: req.Rel, Block: leftsib, SameRel: true})
+	}
+	blocks = append(blocks, BlockRef{ID: 2, Rel: req.Rel, Block: rightsib, SameRel: true})
+
+	if req.LeafBlk != req.TargetBlk {
+		if level == 0 {
+			return nil, fmt.Errorf("wal: btree-unlink-page leaf %d differs from level-0 target %d", req.LeafBlk, req.TargetBlk)
+		}
+		if len(req.LeafPage) != storage.BlockSize {
+			return nil, fmt.Errorf("wal: btree-unlink-page internal target needs the half-dead leaf page")
+		}
+		leafOp := btree.ReadPGOpaque(req.LeafPage)
+		if leafOp.Flags&btree.BTPHalfDead == 0 {
+			return nil, fmt.Errorf("wal: btree-unlink-page leaf %d is not half-dead", req.LeafBlk)
+		}
+		hikey, ok, err := btree.PGHighKeyRaw(req.LeafPage)
+		if err != nil {
+			return nil, fmt.Errorf("wal: btree-unlink-page leaf high key: %w", err)
+		}
+		if !ok {
+			return nil, fmt.Errorf("wal: btree-unlink-page half-dead leaf %d has no top-parent high key", req.LeafBlk)
+		}
+		leafleftsib, leafrightsib = leafOp.Prev, leafOp.Next
+		leaftopparent = btree.BTreeTupleGetDownLink(hikey)
+		// Upstream's Assert: a valid leaftopparent means there is still a level
+		// between the leaf and the target, so the target sits at level > 1.
+		if leaftopparent != storage.InvalidBlockNumber && level <= 1 {
+			return nil, fmt.Errorf("wal: btree-unlink-page leaftopparent %d at target level %d (want > 1)", leaftopparent, level)
+		}
+		blocks = append(blocks, BlockRef{ID: 3, Rel: req.Rel, Block: req.LeafBlk, SameRel: true, WillInit: true})
+	} else if req.LeafPage != nil {
+		return nil, fmt.Errorf("wal: btree-unlink-page target %d is the leaf; no separate leaf page may be logged", req.TargetBlk)
+	}
+
+	info := xlogBtreeUnlinkPage
+	if req.MetaBlk != storage.InvalidBlockNumber {
+		if len(req.MetaPage) != storage.BlockSize {
+			return nil, fmt.Errorf("wal: btree-unlink-page meta page must be %d bytes", storage.BlockSize)
+		}
+		blocks = append(blocks, BlockRef{
+			ID: 4, Rel: req.Rel, Block: req.MetaBlk, SameRel: true, WillInit: true,
+			Data: encodeXLogBtreeMetadata(btree.ReadPGMetaPage(req.MetaPage)),
+		})
+		info = xlogBtreeUnlinkPageMeta
+	}
+
+	mainData := make([]byte, sizeOfXLogBtreeUnlinkPageData)
+	le := binary.LittleEndian
+	le.PutUint32(mainData[0:4], uint32(leftsib))
+	le.PutUint32(mainData[4:8], uint32(rightsib))
+	le.PutUint32(mainData[8:12], level)
+	le.PutUint64(mainData[16:24], req.SafeXid)
+	le.PutUint32(mainData[24:28], uint32(leafleftsib))
+	le.PutUint32(mainData[28:32], uint32(leafrightsib))
+	le.PutUint32(mainData[32:36], uint32(leaftopparent))
+
+	body, err := assembleXLogRecord(mainData, blocks)
+	if err != nil {
+		return nil, err
+	}
+	return framePGAssembled(RmgrBtree, info, 0, body), nil
 }
 
 // EncodePageImagePG builds a PostgreSQL RM_XLOG standalone full-page-image record

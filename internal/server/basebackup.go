@@ -369,7 +369,7 @@ func (s *Server) replyBaseBackup(ctx context.Context, w *protocol.FrameWriter, a
 	if err := w.WriteCommandComplete("BASE_BACKUP"); err != nil {
 		return err
 	}
-	return w.WriteReadyForQuery(protocol.TxStatusIdle)
+	return w.ReadyForQuery()
 }
 
 // writeRecPtrResult emits the (recptr text, tli int8) one-row

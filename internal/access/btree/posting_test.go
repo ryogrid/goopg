@@ -15,13 +15,13 @@ func TestPostingMarshalRoundTrip(t *testing.T) {
 		{Block: 1, Offset: 2},
 		{Block: 100, Offset: 5},
 	}
-	raw := marshalPosting(key, tids)
+	raw := blobFormat.marshalPosting(key, tids)
 
 	if !isPostingRaw(raw) {
 		t.Fatal("isPostingRaw should be true")
 	}
 
-	gotKey, gotTIDs, err := parsePostingRaw(raw)
+	gotKey, gotTIDs, err := blobFormat.parsePostingRaw(raw)
 	if err != nil {
 		t.Fatalf("parsePostingRaw: %v", err)
 	}
@@ -41,16 +41,29 @@ func TestPostingMarshalRoundTrip(t *testing.T) {
 // TestIsPostingRaw distinguishes posting from regular raw items.
 func TestIsPostingRaw(t *testing.T) {
 	// Regular item bytes from item.marshal().
-	it := item{keyLen: 4, ptr: storage.ItemPointer{Block: 0, Offset: 1}, key: EncodeInt4(42)}
+	it := item{ptr: storage.ItemPointer{Block: 0, Offset: 1}, key: EncodeInt4(42)}
 	reg := it.marshal()
 	if isPostingRaw(reg) {
 		t.Error("regular item should not be detected as posting")
 	}
 
-	// Posting item.
-	post := marshalPosting(EncodeInt4(42), []storage.ItemPointer{{Block: 0, Offset: 1}})
+	// Posting item (>= 2 TIDs — nbtree.h's BTreeTupleSetPosting rejects a
+	// one-TID "posting list", so a degenerate one is no longer constructible).
+	post := blobFormat.marshalPosting(EncodeInt4(42), []storage.ItemPointer{{Block: 0, Offset: 1}, {Block: 0, Offset: 2}})
 	if !isPostingRaw(post) {
 		t.Error("posting item should be detected as posting")
+	}
+
+	// A plain item whose heap TID has a large block number must NOT read back
+	// as a posting list: before S11.4 slice 2 the posting discriminator was the
+	// high bit of a leading keyLen field, which now lands inside t_tid's bi_hi
+	// half. The discriminator moved to t_info's INDEX_ALT_TID_MASK with it.
+	high := item{ptr: storage.ItemPointer{Block: 0xFFFF_FFF0, Offset: 0xFFF0}, key: EncodeInt4(42)}.marshal()
+	if isPostingRaw(high) {
+		t.Error("plain item with a high heap-TID block read back as a posting list")
+	}
+	if _, err := parseItem(high); err != nil {
+		t.Errorf("parseItem(high-block plain item): %v", err)
 	}
 }
 
@@ -58,15 +71,15 @@ func TestIsPostingRaw(t *testing.T) {
 // posting-list rawItems while unique keys remain as regular items.
 func TestDeduplicateToRawItems(t *testing.T) {
 	items := []item{
-		{keyLen: 4, ptr: storage.ItemPointer{Block: 0, Offset: 1}, key: EncodeInt4(1)},
-		{keyLen: 4, ptr: storage.ItemPointer{Block: 0, Offset: 2}, key: EncodeInt4(2)},
-		{keyLen: 4, ptr: storage.ItemPointer{Block: 0, Offset: 3}, key: EncodeInt4(2)}, // dup
-		{keyLen: 4, ptr: storage.ItemPointer{Block: 1, Offset: 1}, key: EncodeInt4(3)},
-		{keyLen: 4, ptr: storage.ItemPointer{Block: 1, Offset: 2}, key: EncodeInt4(3)}, // dup
-		{keyLen: 4, ptr: storage.ItemPointer{Block: 1, Offset: 3}, key: EncodeInt4(3)}, // dup
+		{ptr: storage.ItemPointer{Block: 0, Offset: 1}, key: EncodeInt4(1)},
+		{ptr: storage.ItemPointer{Block: 0, Offset: 2}, key: EncodeInt4(2)},
+		{ptr: storage.ItemPointer{Block: 0, Offset: 3}, key: EncodeInt4(2)}, // dup
+		{ptr: storage.ItemPointer{Block: 1, Offset: 1}, key: EncodeInt4(3)},
+		{ptr: storage.ItemPointer{Block: 1, Offset: 2}, key: EncodeInt4(3)}, // dup
+		{ptr: storage.ItemPointer{Block: 1, Offset: 3}, key: EncodeInt4(3)}, // dup
 	}
 
-	raws := deduplicateToRawItems(items)
+	raws := deduplicateToRawItems(indexFormat{}, items)
 	if len(raws) != 3 { // keys 1, 2, 3
 		t.Fatalf("expected 3 raw items, got %d", len(raws))
 	}
@@ -80,7 +93,7 @@ func TestDeduplicateToRawItems(t *testing.T) {
 	if !isPostingRaw(raws[1].raw) {
 		t.Error("key=2 should be a posting item")
 	}
-	_, tids2, _ := parsePostingRaw(raws[1].raw)
+	_, tids2, _ := blobFormat.parsePostingRaw(raws[1].raw)
 	if len(tids2) != 2 {
 		t.Errorf("key=2 posting should have 2 TIDs, got %d", len(tids2))
 	}
@@ -89,7 +102,7 @@ func TestDeduplicateToRawItems(t *testing.T) {
 	if !isPostingRaw(raws[2].raw) {
 		t.Error("key=3 should be a posting item")
 	}
-	_, tids3, _ := parsePostingRaw(raws[2].raw)
+	_, tids3, _ := blobFormat.parsePostingRaw(raws[2].raw)
 	if len(tids3) != 3 {
 		t.Errorf("key=3 posting should have 3 TIDs, got %d", len(tids3))
 	}
@@ -249,13 +262,12 @@ func TestDeduplicateOversizedPostingSplits(t *testing.T) {
 	items := make([]item, dupCount)
 	for i := 0; i < dupCount; i++ {
 		items[i] = item{
-			keyLen: uint16(len(key)),
-			ptr:    storage.ItemPointer{Block: storage.BlockNumber(i / 100), Offset: uint16(i%100 + 1)},
-			key:    key,
+			ptr: storage.ItemPointer{Block: storage.BlockNumber(i / 100), Offset: uint16(i%100 + 1)},
+			key: key,
 		}
 	}
 
-	raws := deduplicateToRawItems(items)
+	raws := deduplicateToRawItems(indexFormat{}, items)
 
 	if len(raws) < 2 {
 		t.Fatalf("expected the run to be split into >=2 posting items, got %d", len(raws))
@@ -272,7 +284,7 @@ func TestDeduplicateOversizedPostingSplits(t *testing.T) {
 			t.Errorf("raw %d should still be a posting item after split", i)
 			continue
 		}
-		_, tids, err := parsePostingRaw(ri.raw)
+		_, tids, err := blobFormat.parsePostingRaw(ri.raw)
 		if err != nil {
 			t.Errorf("parsePostingRaw chunk %d: %v", i, err)
 			continue
@@ -326,7 +338,7 @@ func TestDeduplicateOversizedPostingSurvivesBulkCreate(t *testing.T) {
 func TestPostingKeyOf(t *testing.T) {
 	key := []byte("testkey")
 	tids := []storage.ItemPointer{{Block: 1, Offset: 2}, {Block: 3, Offset: 4}}
-	raw := marshalPosting(key, tids)
+	raw := blobFormat.marshalPosting(key, tids)
 
 	got := postingKeyOf(raw)
 	if string(got) != string(key) {
@@ -343,19 +355,19 @@ func TestPageItemKeys(t *testing.T) {
 	initPage(p, BTPageOpaque{Prev: storage.InvalidBlockNumber, Next: storage.InvalidBlockNumber, Flags: BTLeaf})
 
 	// Slot 1: regular single-TID item, key = int4(1).
-	reg := item{keyLen: uint16(len(EncodeInt4(1))), ptr: storage.ItemPointer{Block: 0, Offset: 1}, key: EncodeInt4(1)}
+	reg := item{ptr: storage.ItemPointer{Block: 0, Offset: 1}, key: EncodeInt4(1)}
 	if _, err := storage.PageAddItemRaw(p, reg.marshal()); err != nil {
 		t.Fatalf("add regular: %v", err)
 	}
 	// Slot 2: posting item, key = int4(2), three TIDs — must collapse to one key.
-	post := marshalPosting(EncodeInt4(2), []storage.ItemPointer{
+	post := blobFormat.marshalPosting(EncodeInt4(2), []storage.ItemPointer{
 		{Block: 0, Offset: 2}, {Block: 0, Offset: 3}, {Block: 1, Offset: 1},
 	})
 	if _, err := storage.PageAddItemRaw(p, post); err != nil {
 		t.Fatalf("add posting: %v", err)
 	}
 
-	keys, err := PageItemKeys(p)
+	keys, err := (IndexFormat{}).PageItemKeys(p)
 	if err != nil {
 		t.Fatalf("PageItemKeys: %v", err)
 	}
@@ -380,17 +392,17 @@ func TestPageLeafEntries(t *testing.T) {
 
 	// Slot 1: regular single-TID item, key = int4(1), TID = (0,1).
 	regTID := storage.ItemPointer{Block: 0, Offset: 1}
-	reg := item{keyLen: uint16(len(EncodeInt4(1))), ptr: regTID, key: EncodeInt4(1)}
+	reg := item{ptr: regTID, key: EncodeInt4(1)}
 	if _, err := storage.PageAddItemRaw(p, reg.marshal()); err != nil {
 		t.Fatalf("add regular: %v", err)
 	}
 	// Slot 2: posting item, key = int4(2), three TIDs — must expand to three.
 	postTIDs := []storage.ItemPointer{{Block: 0, Offset: 2}, {Block: 0, Offset: 3}, {Block: 1, Offset: 1}}
-	if _, err := storage.PageAddItemRaw(p, marshalPosting(EncodeInt4(2), postTIDs)); err != nil {
+	if _, err := storage.PageAddItemRaw(p, blobFormat.marshalPosting(EncodeInt4(2), postTIDs)); err != nil {
 		t.Fatalf("add posting: %v", err)
 	}
 
-	entries, err := PageLeafEntries(p)
+	entries, err := (IndexFormat{}).PageLeafEntries(p)
 	if err != nil {
 		t.Fatalf("PageLeafEntries: %v", err)
 	}

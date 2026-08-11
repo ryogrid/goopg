@@ -44,7 +44,7 @@ func TestReplayPGHeapPruneRedirectOnlyCompactsLikeRuntime(t *testing.T) {
 		t.Fatal(err)
 	}
 	tip := storage.NewHeapTuple(deadXID, storage.InvalidTransactionID, []byte("tip"))
-	tip.Header.Infomask |= storage.HeapOnlyTuple
+	tip.Header.SetHeapOnly()
 	tipSlot, err := storage.PageAddHeapTuple(base, tip)
 	if err != nil {
 		t.Fatal(err)

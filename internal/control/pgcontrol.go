@@ -42,6 +42,13 @@ var pgCRCTable = crc32.MakeTable(crc32.Castagnoli)
 // pg_control file. Field names and byte offsets match pg_control.h (PG18,
 // x86_64 layout). Immutable build-constant fields are not exposed here.
 type ControlFileData struct {
+	// offset 0: system_identifier (uint64) — the cluster identity assigned
+	// once at bootstrap (xlog.c:5099-5101 via InitControlFile) and never
+	// mutated afterwards. DECODE-ONLY: encodeControlFileData deliberately
+	// does not write it back, so UpdateControlFile's read-mutate-write cycle
+	// preserves the original bytes and a caller that leaves this field zero
+	// cannot clobber the cluster identity. M0131-S2.
+	SystemIdentifier uint64
 	// offset 16: DBState enum (uint32)
 	State uint32
 	// offset 24: pg_time_t / int64 — seconds since Unix epoch
@@ -116,6 +123,7 @@ type ControlFileData struct {
 func decodeControlFileData(buf []byte) *ControlFileData {
 	le := binary.LittleEndian
 	return &ControlFileData{
+		SystemIdentifier:             le.Uint64(buf[0:]),
 		State:                        le.Uint32(buf[16:]),
 		Time:                         int64(le.Uint64(buf[24:])),
 		CheckPoint:                   le.Uint64(buf[32:]),
@@ -230,6 +238,8 @@ func UpdateControlFile(dataDir string, fn func(*ControlFileData)) error {
 
 // ReadControlFile reads the current pg_control values from dataDir.
 // Returns nil when the file does not exist (fresh cluster before initdb completes).
+// Verifies the CRC32C over the first 292 bytes; a mismatch returns an error so
+// callers (like LoadOrCreateTimelineID) can fall back to the secondary copy.
 // Callers that need to compare GUC echo fields against live configuration
 // use this to avoid a spurious read+write cycle via UpdateControlFile.
 func ReadControlFile(dataDir string) (*ControlFileData, error) {
@@ -243,6 +253,13 @@ func ReadControlFile(dataDir string) (*ControlFileData, error) {
 	}
 	if len(buf) < pgControlCRCOffset+4 {
 		return nil, fmt.Errorf("control: pg_control too short (%d bytes)", len(buf))
+	}
+	// Verify CRC32C so a corrupt or placeholder pg_control (e.g. a test
+	// stub filled with 0xC0) does not pass as valid. M0130-S8.
+	stored := binary.LittleEndian.Uint32(buf[pgControlCRCOffset:])
+	computed := crc32.Checksum(buf[:pgControlCRCOffset], pgCRCTable)
+	if stored != computed {
+		return nil, fmt.Errorf("control: pg_control CRC mismatch: stored=0x%08X computed=0x%08X", stored, computed)
 	}
 	return decodeControlFileData(buf), nil
 }

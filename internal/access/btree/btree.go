@@ -20,40 +20,43 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
-// SizeOfBTPageOpaque is the on-disk size of the per-page B-tree opaque
-// area. v3 grew it from 24 to 48 bytes to carry a variable-length
-// HighKey (M0011-0002 — see
-// docs/design/0011-0002-btree-numeric-build-and-uniqueness.md), which
-// is required for NUMERIC keys whose encoded form exceeds the
-// previous 4-byte field. v4 widened the HighKey field from 32 to 256
-// bytes to accommodate text/varchar B-tree keys (e.g. road.name in
-// create_index regress). Layout, in little-endian:
+// SizeOfBTPageOpaque is the on-disk size of the per-page B-tree opaque area.
+// Since M0130-S11.2b it is upstream's MAXALIGN(sizeof(BTPageOpaqueData)) — the
+// exact 16 bytes `_bt_checkpage` demands — and the layout is pgformat.go's
+// (btpo_prev, btpo_next, btpo_level, btpo_flags, btpo_cycleid). It is retained
+// as an alias rather than deleted because out-of-package callers size the
+// per-page payload budget from it.
 //
-//	offset 0  Prev        (4 bytes)
-//	offset 4  Next        (4 bytes)
-//	offset 8  Level       (4 bytes)
-//	offset 12 Flags       (2 bytes)
-//	offset 14 HighKeyLen  (2 bytes)
-//	offset 16 HighKey     (256 bytes; bytes 0..HighKeyLen valid)
-const SizeOfBTPageOpaque = 272
+// It used to be 272: goopg carried the page's high key INSIDE the opaque as a
+// length-prefixed byte string (v3 grew the area to 48 bytes for NUMERIC keys,
+// v4 to 272 for text/varchar keys). The high key now lives where upstream puts
+// it — a normal item at P_HIKEY, offset 1 — so nothing but the five upstream
+// fields remains in the special area. See pgpage.go and
+// docs/design/0130-0011-nbtree-pg-on-disk-format.md.
+const SizeOfBTPageOpaque = SizeOfBTPageOpaquePG
 
-// MaxHighKeyLen bounds the on-disk HighKey field. v4 widened this
-// from 32 to 256 bytes so text/varchar B-tree keys (which can be
-// longer than int4=4 or NUMERIC≤25) are stored without truncation.
-// Keys longer than 256 bytes are not supported by the bulk-loader or
-// split path and will return an error; in practice all regress-test
-// and TPC-H index keys fit comfortably within this bound.
-const MaxHighKeyLen = 256
+// (MaxHighKeyLen — goopg's 256-byte separator ceiling — was deleted by
+// M0130-S11.4 slice 3b-3d. It was never upstream's rule: nbtree bounds an ITEM,
+// not a high key, at a third of a page (BTMaxItemSize, _bt_check_third_page),
+// and lets the separator be whatever suffix truncation leaves. CheckPGBTThirdPage
+// is now that gate, run where upstream runs it — the leaf insert path and both
+// bulk-loader levels.)
 
 // btSpecialOffset is where the opaque area starts on every B-tree page.
-const btSpecialOffset = storage.BlockSize - SizeOfBTPageOpaque
+const btSpecialOffset = pgSpecialOffset
 
-// PageFlag values for btpo_flags.
+// PageFlag values for btpo_flags — goopg's IN-MEMORY flag set, which is not
+// the on-disk one. readOpaque/writeOpaque translate between these and the
+// upstream BTP_* bits in pgformat.go (pgFlags/legacyFlags); only BTLeaf,
+// BTRoot, BTDeleted and BTHasGarbage happen to share upstream's numbering.
+//
+// There is deliberately no BTHasHighKey bit. Upstream has none either: 0x0008
+// is BTP_META, and P_FIRSTDATAKEY derives high-key presence from P_RIGHTMOST
+// (the sibling link) alone. HasHighKey() is therefore computed, not stored.
 const (
-	BTLeaf       uint16 = 0x0001
-	BTRoot       uint16 = 0x0002
-	BTDeleted    uint16 = 0x0004
-	BTHasHighKey uint16 = 0x0008
+	BTLeaf    uint16 = 0x0001
+	BTRoot    uint16 = 0x0002
+	BTDeleted uint16 = 0x0004
 	// BTIncompleteSplit (M0055-0004 Phase C) marks a page as the
 	// LEFT half of a freshly-completed split whose parent
 	// downlink has not yet been inserted. Writers descending to
@@ -84,40 +87,49 @@ const (
 	MetaBlock storage.BlockNumber = 0
 	rootStart storage.BlockNumber = 1
 
-	btreeMagic   uint32 = 0x053162
-	btreeVersion uint32 = 4 // bumped by M0011-0002 (v3: variable-length HighKey, 48-byte opaque); v4: widened HighKey field to 256 bytes for text keys (272-byte opaque)
-
 	// BTreeMagic and BTreeVersion expose the on-disk metapage magic and
 	// version for out-of-package readers that validate a metapage without
 	// opening the tree — notably the amcheck verify engine
-	// (internal/amcheck). Keeping a single exported source of truth prevents
-	// the magic/version from drifting between the writer (writeMeta) and any
-	// independent validator.
-	BTreeMagic   = btreeMagic
-	BTreeVersion = btreeVersion
+	// (internal/amcheck). They are upstream's BTREE_MAGIC / BTREE_VERSION,
+	// declared once in pgformat.go.
+	//
+	// BTreeVersion must STAY 4: a real PG rejects anything else in
+	// _bt_getmeta. It is therefore not available as a break marker for
+	// goopg's own format changes — M0130-S11.2b moved the high key onto the
+	// page and M0130-S11.3 flipped the metapage to BTMetaPageData, neither
+	// with a version bump, so an index written before those commits is
+	// unreadable and must be REINDEXed. (Historically the value did double
+	// duty: v3 = variable-length HighKey in a 48-byte opaque, v4 = 256-byte
+	// HighKey field in a 272-byte opaque.)
+	BTreeMagic   = BTreeMagicPG
+	BTreeVersion = BTreeVersionPG
 )
 
-// BTreeMeta is the v0 metapage payload.
-type BTreeMeta struct {
-	Magic     uint32
-	Version   uint32
-	Root      storage.BlockNumber
-	Level     uint32
-	FastRoot  storage.BlockNumber
-	FastLevel uint32
-}
+// The metapage payload type is PGBTMetaPage (pgformat.go) — upstream's
+// 48-byte BTMetaPageData, written by WritePGMetaPage at PageGetContents of a
+// PG-shaped block 0. goopg's private 24-byte `BTreeMeta` payload on a page
+// with a zero-length special area was retired by M0130-S11.3; it was the
+// reason a real PG's _bt_checkpage failed on the very first page it read
+// ("contains corrupted page at block 0").
 
-// BTPageOpaque is the typed view over the special area at the end of
-// each B-tree page. HighKey is meaningful only when BTHasHighKey is
-// set in Flags; from v3 onwards it carries a variable-length key
-// bounded by MaxHighKeyLen so NUMERIC and other variable-width
-// encodings fit (M0011-0002).
+// BTPageOpaque is the engine's typed view over the special area at the end of
+// each B-tree page. It is NOT the on-disk struct: since M0130-S11.2b the bytes
+// are upstream's BTPageOpaqueData (pgformat.go) and readOpaque/writeOpaque
+// translate. Two things stay in goopg spelling in memory, because converting
+// them is orthogonal to on-disk fidelity and touching all ~65 sites in the same
+// commit would multiply the flip's blast radius (deferral ledger, S11.2b):
+//
+//   - "no sibling" is storage.InvalidBlockNumber here and P_NONE (0) on disk;
+//   - Flags carries the legacy BT* bits, translated to/from BTP_* on the way
+//     in and out.
+//
+// The high key is gone from this struct entirely — it is an item at P_HIKEY on
+// the page, reached through PGHighKeyRaw/pgSetHighKeyRaw.
 type BTPageOpaque struct {
-	Prev    storage.BlockNumber
-	Next    storage.BlockNumber
-	Level   uint32
-	Flags   uint16
-	HighKey []byte
+	Prev  storage.BlockNumber
+	Next  storage.BlockNumber
+	Level uint32
+	Flags uint16
 }
 
 // IsLeaf reports whether the page carries leaf items.
@@ -141,10 +153,11 @@ func (o BTPageOpaque) IsRoot() bool { return o.Flags&BTRoot != 0 }
 // fields such as the level, so structural validators must exempt them.
 func (o BTPageOpaque) IsDeleted() bool { return o.Flags&BTDeleted != 0 }
 
-// HasHighKey reports whether this page advertises a high-key
-// boundary. Pages without a high key are rightmost on their level
+// HasHighKey reports whether this page advertises a high-key boundary. It is
+// upstream's !P_RIGHTMOST, not a stored bit: a page has a high key exactly
+// when it has a right sibling. Pages without one are rightmost on their level
 // (or freshly created) and cover all remaining keys.
-func (o BTPageOpaque) HasHighKey() bool { return o.Flags&BTHasHighKey != 0 }
+func (o BTPageOpaque) HasHighKey() bool { return o.Next != storage.InvalidBlockNumber }
 
 // HasGarbage reports the BTHasGarbage hint (C3: at least one ItemIDDead
 // line pointer may be present).
@@ -158,55 +171,78 @@ func (o BTPageOpaque) HasGarbage() bool { return o.Flags&BTHasGarbage != 0 }
 // decoder would silently drift on the next bump.
 func ParseOpaque(p storage.Page) BTPageOpaque { return readOpaque(p) }
 
-// readOpaque returns the parsed opaque from page bytes.
+// readOpaque returns the parsed opaque from page bytes, translating the
+// on-disk upstream form (16-byte BTPageOpaqueData, P_NONE siblings, BTP_* flag
+// bits) into the engine's in-memory spelling. See BTPageOpaque.
 func readOpaque(p storage.Page) BTPageOpaque {
-	off := btSpecialOffset
-	o := BTPageOpaque{
-		Prev:  storage.BlockNumber(binary.LittleEndian.Uint32(p[off : off+4])),
-		Next:  storage.BlockNumber(binary.LittleEndian.Uint32(p[off+4 : off+8])),
-		Level: binary.LittleEndian.Uint32(p[off+8 : off+12]),
-		Flags: binary.LittleEndian.Uint16(p[off+12 : off+14]),
+	pg := ReadPGOpaque(p)
+	return BTPageOpaque{
+		Prev:  legacySibling(pg.Prev),
+		Next:  legacySibling(pg.Next),
+		Level: pg.Level,
+		Flags: legacyFlags(pg.Flags),
 	}
-	hkLen := int(binary.LittleEndian.Uint16(p[off+14 : off+16]))
-	if hkLen > MaxHighKeyLen {
-		hkLen = MaxHighKeyLen // defensive: truncate corrupt length to bounded slice
-	}
-	if hkLen > 0 {
-		o.HighKey = append([]byte(nil), p[off+16:off+16+hkLen]...)
-	}
-	return o
 }
 
-// writeOpaque persists the opaque into page bytes. Panics if HighKey
-// exceeds MaxHighKeyLen — by construction (int4=4, NUMERIC≤25) this
-// can only fire for a future encoding that grew past the format
-// budget.
+// writeOpaque persists the opaque into page bytes in the upstream on-disk
+// form. btpo_cycleid is written as 0: goopg has no vacuum cycle ID (upstream
+// uses it only to detect a concurrent split during a vacuum scan), and 0 is
+// upstream's own "not in a cycle" value.
 func writeOpaque(p storage.Page, o BTPageOpaque) {
-	if len(o.HighKey) > MaxHighKeyLen {
-		panic(fmt.Sprintf("btree: HighKey length %d exceeds MaxHighKeyLen %d", len(o.HighKey), MaxHighKeyLen))
-	}
-	off := btSpecialOffset
-	binary.LittleEndian.PutUint32(p[off:off+4], uint32(o.Prev))
-	binary.LittleEndian.PutUint32(p[off+4:off+8], uint32(o.Next))
-	binary.LittleEndian.PutUint32(p[off+8:off+12], o.Level)
-	binary.LittleEndian.PutUint16(p[off+12:off+14], o.Flags)
-	binary.LittleEndian.PutUint16(p[off+14:off+16], uint16(len(o.HighKey)))
-	// Zero the HighKey region first so leftover bytes from a longer
-	// previous HighKey don't survive a shorter rewrite.
-	for i := 0; i < MaxHighKeyLen; i++ {
-		p[off+16+i] = 0
-	}
-	copy(p[off+16:off+16+len(o.HighKey)], o.HighKey)
+	WritePGOpaque(p, PGBTPageOpaque{
+		Prev:  pgSibling(o.Prev),
+		Next:  pgSibling(o.Next),
+		Level: o.Level,
+		Flags: pgFlags(o.Flags),
+	})
 }
 
-// keyExceedsHighKey reports whether `key` is strictly greater than
-// `op.HighKey` — i.e., the search has overshot this page and must
-// follow op.Next under right-link recovery.
-func keyExceedsHighKey(op BTPageOpaque, key []byte) bool {
-	if !op.HasHighKey() || op.Next == storage.InvalidBlockNumber {
+// pageHighKey returns the page's separator key, or ok=false when the page is
+// rightmost. The high key is stored as an ordinary item at P_HIKEY whose key
+// bytes are the separator; its pointer half is unused (S11.4 turns it into a
+// real pivot tuple whose t_tid carries the downlink).
+func (f indexFormat) pageHighKey(p storage.Page) (key []byte, ok bool, err error) {
+	raw, ok, err := PGHighKeyRaw(p)
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	it, perr := f.parse(raw)
+	if perr != nil {
+		maybeDumpPageOnParseErr(p, "pageHighKey: parseItem")
+		return nil, false, perr
+	}
+	return it.key, true, nil
+}
+
+// PageHighKey exposes pageHighKey to out-of-package structural validators
+// (internal/amcheck), for the same single-decoder reason as ParseOpaque and
+// PageItemKeys: the high key's on-page representation is a format detail that
+// has already moved once (opaque field -> P_HIKEY item) and a second decoder
+// would silently drift on the next move.
+// Since 3b-2c-ii-B2-b the caller says which format the page is in (the zero
+// IndexFormat is the blob format, which is what every index resolves to until
+// the writers flip); see IndexFormat in pgitemcodec.go.
+func (fm IndexFormat) PageHighKey(p storage.Page) (key []byte, ok bool, err error) {
+	return fm.f.pageHighKey(p)
+}
+
+// highKeyItem builds the P_HIKEY item that carries `key` as the page's
+// separator. Since M0130-S11.4 slice 3a it is a real nbtree PIVOT tuple
+// (`_bt_truncate`'s output), not a plain item — see PGBTPivotRaw.
+func highKeyItem(key []byte) item {
+	return item{key: append([]byte(nil), key...), pivot: true}
+}
+
+// keyExceedsHighKey reports whether `key` is strictly greater than the page's
+// high key — i.e., the search has overshot this page and must follow btpo_next
+// under right-link recovery. A rightmost page (or an unreadable high key, which
+// the structural validators report separately) never overshoots.
+func keyExceedsHighKey(f indexFormat, p storage.Page, key []byte) bool {
+	hk, ok, err := f.pageHighKey(p)
+	if err != nil || !ok {
 		return false
 	}
-	return CompareKeys(key, op.HighKey) > 0
+	return f.compare(key, hk) > 0
 }
 
 // itemOvershootsHighKey reports whether a new item keyed `key` belongs
@@ -220,26 +256,28 @@ func keyExceedsHighKey(op BTPageOpaque, key []byte) bool {
 // stored-item invariant in VerifyBtreeItemOrder (verify_nbtree.go) —
 // HighKey is itself the separator that was pushed up when this page last
 // split, so a downlink equal to it belongs to the right sibling.
-func itemOvershootsHighKey(op BTPageOpaque, key []byte) bool {
-	if !op.HasHighKey() || op.Next == storage.InvalidBlockNumber {
+func itemOvershootsHighKey(f indexFormat, p storage.Page, op BTPageOpaque, key []byte) bool {
+	hk, ok, err := f.pageHighKey(p)
+	if err != nil || !ok {
 		return false
 	}
-	cmp := CompareKeys(key, op.HighKey)
+	res := f.compare(key, hk)
 	if op.IsLeaf() {
-		return cmp > 0
+		return res > 0
 	}
-	return cmp >= 0
+	return res >= 0
 }
 
-// initPage prepares a freshly extended block as a B-tree page with the
-// given opaque content. The page starts empty (no items).
+// initPage prepares a freshly extended block as a B-tree page with the given
+// opaque content. The page starts empty (no items) — including no high key,
+// so `o` must describe a rightmost page unless the caller installs one (via
+// pgSetHighKeyRaw) before any data item is added: the data-slot wrappers read
+// the rightmost bit back off the page, so a non-rightmost page with no P_HIKEY
+// item mis-numbers every subsequent access.
 func initPage(p storage.Page, o BTPageOpaque) {
-	if err := storage.InitPage(p); err != nil {
+	if err := InitPGBTPage(p); err != nil {
 		panic(err)
 	}
-	h := storage.MustHeader(p)
-	h.SetSpecial(uint16(btSpecialOffset))
-	h.SetUpper(uint16(btSpecialOffset))
 	writeOpaque(p, o)
 }
 
@@ -248,13 +286,19 @@ func initPage(p storage.Page, o BTPageOpaque) {
 // On internal pages the pointer's Block is the child page; on leaf
 // pages the pointer is the heap row (block, line-pointer-slot).
 type item struct {
-	keyLen uint16
-	ptr    storage.ItemPointer
-	key    []byte
+	ptr storage.ItemPointer
+	key []byte
+	// pivot marks the item as an nbtree PIVOT tuple — every internal-page
+	// downlink and every P_HIKEY separator (M0130-S11.4 slice 3a). It is an
+	// IN-MEMORY flag only: on disk the fact lives in INDEX_ALT_TID_MASK plus
+	// t_tid's offset half (BTreeTupleIsPivot), and parseItemBody reads it back
+	// off the tuple. It exists because several paths parse an item and
+	// re-marshal it (the vacuum/LP_DEAD page rewrites, split redistribution);
+	// without carrying the flag through, a round trip would silently demote a
+	// pivot to a plain tuple and hand a real PG nbtree status bits as a heap
+	// TID.
+	pivot bool
 }
-
-// itemPrefixSize is the fixed bytes before key_bytes.
-const itemPrefixSize = 2 + 4 + 2
 
 // MaxItemsPerPage is the goopg analogue of upstream's MaxIndexTuplesPerPage
 // (postgres/src/include/access/itup.h): an upper bound on how many line-pointer
@@ -263,44 +307,169 @@ const itemPrefixSize = 2 + 4 + 2
 // bound, mirroring palloc_btree_page's `maxoffset > MaxIndexTuplesPerPage` test
 // (postgres/contrib/amcheck/verify_nbtree.c:3397).
 //
-// The divisor is goopg's minimum per-item footprint: a 4-byte line pointer (the
+// The divisor is the minimum per-item footprint: a 4-byte line pointer (the
 // itemIDSize that pageHasSpaceFor reserves) plus the smallest possible item
-// body. The smallest body is a bare itemPrefix with a zero-length key — an
-// internal page's negative-infinity downlink. goopg stores items unaligned
-// (pageHasSpaceFor reserves exactly itemIDSize+itemPrefixSize+len(key)), so
-// there is no MAXALIGN term, unlike upstream's MAXALIGN(sizeof(IndexTupleData)+1).
+// body. The smallest body is a bare IndexTupleData header with a zero-length
+// key — an internal page's negative-infinity downlink, 8 bytes, which is
+// already MAXALIGNed. Upstream's divisor is MAXALIGN(sizeof(IndexTupleData)+1)
+// = 16 because it assumes at least one key byte; goopg keeps 8, which makes
+// this bound LOOSER than upstream's and therefore still free of the false
+// positives that would turn a legal zero-key page into a corruption report.
 // Like upstream the bound is deliberately conservative: it ignores the per-page
 // special (opaque) area, so the true maximum is a little lower — that headroom is
-// exactly what keeps the corruption check free of false positives. Defined here,
-// alongside itemPrefixSize, so the tuple-size accounting has a single source of
-// truth (the engine never re-derives the inline item layout).
-const MaxItemsPerPage = (storage.BlockSize - storage.SizeOfPageHeaderData) / (4 + itemPrefixSize)
+// exactly what keeps the corruption check free of false positives.
+const MaxItemsPerPage = (storage.BlockSize - storage.SizeOfPageHeaderData) / (4 + SizeOfIndexTupleData)
 
+// marshal encodes the item as an upstream `IndexTupleData`
+// (postgres/src/include/access/itup.h), which since M0130-S11.4 slice 2 is
+// goopg's ONLY on-page index-tuple representation:
+//
+//	[0:6]  t_tid   — ItemPointerData: the heap TID on a leaf page, the child
+//	                 block number on an internal page (upstream's
+//	                 BTreeTupleSetDownLink, which writes exactly this field).
+//	[6:8]  t_info  — flags | size. Size is the WHOLE tuple length, which is how
+//	                 a reader recovers the key length; goopg keys carry no NULLs
+//	                 and no varlena header of their own, so INDEX_NULL_MASK /
+//	                 INDEX_VAR_MASK / INDEX_ALT_TID_MASK are all clear.
+//	[8:]   key     — the opaque order-preserving key encoding.
+//
+// The key bytes are still ONE opaque blob rather than per-attribute PG binary
+// datums: slice 3 replaces them (and with them `CompareKeys`) with a real
+// index tuple descriptor. Until then a real PG can walk goopg's line pointers,
+// sizes, downlinks and heap TIDs — everything `_bt_checkpage` and the page
+// structure need — but cannot yet `index_deform_tuple` the key itself.
+//
+// Of the two MAXALIGNs slice 2 deferred, 3b-3a restored the second and only
+// the second. PageAddItemExtended's MAXALIGNed PLACEMENT is now reproduced
+// (storage.PageAddItemRaw and friends) — it was always safe here, because the
+// alignment lands in pd_upper and the padding BETWEEN items while lp_len keeps
+// the exact size, so a blob key's length is still size - SizeOfIndexTupleData.
+// index_form_tuple's MAXALIGNed tuple SIZE stays deferred for exactly the
+// reason slice 2 gave: it would round t_info's size field, and for a blob key
+// that field IS the key length. It becomes safe per-index once every index is
+// descriptor-bearing (the key length then comes from the descriptor, not from
+// arithmetic on the size) — see the ledger row.
+//
+// The 13-bit INDEX_SIZE_MASK cannot overflow here: a body must fit in a page,
+// and BlockSize (8192) minus the page header already leaves less than 8191.
+// Since M0130-S11.4 slice 3b-2c-ii-B1 this is the BLOB format's encoder
+// specifically, reached through `indexFormat.marshal` (pgitemcodec.go) — a
+// descriptor-bearing index's key is already a whole tuple and needs no header
+// synthesised around it. Call sites go through the format, never here.
 func (it item) marshal() []byte {
-	out := make([]byte, itemPrefixSize+len(it.key))
-	binary.LittleEndian.PutUint16(out[0:2], it.keyLen)
-	binary.LittleEndian.PutUint32(out[2:6], uint32(it.ptr.Block))
-	binary.LittleEndian.PutUint16(out[6:8], it.ptr.Offset)
-	copy(out[itemPrefixSize:], it.key)
+	if it.pivot {
+		return PGBTPivotRaw(it.key, it.ptr.Block)
+	}
+	return PGBTItemRaw(it.key, it.ptr)
+}
+
+// PGBTItemRaw is the exported form of `(item).marshal` — the ONE encoder for a
+// plain on-page nbtree item. Exported so out-of-package structural validators
+// and their fixtures (internal/amcheck) build pages through the engine's own
+// encoder instead of a second hand-rolled one, which is how the pre-S11.4
+// layout came to have four independent transcriptions.
+func PGBTItemRaw(key []byte, tid storage.ItemPointer) []byte {
+	out := make([]byte, SizeOfIndexTupleData+len(key))
+	PutPGItemPointer(out, tid)
+	binary.LittleEndian.PutUint16(out[6:8], uint16(len(out)))
+	copy(out[SizeOfIndexTupleData:], key)
 	return out
 }
 
+// PGBTPivotRaw is the ONE encoder for an nbtree PIVOT tuple — an internal-page
+// downlink or a P_HIKEY separator. It is upstream's `_bt_truncate` output for
+// goopg's current key shape: `index_truncate_tuple` copies the key attributes
+// that must be kept, `BTreeTupleSetDownLink` puts the child block in t_tid's
+// block half, and `BTreeTupleSetNAtts` stamps the kept-attribute count into
+// t_tid's offset half together with INDEX_ALT_TID_MASK.
+//
+// natts is 1 for a keyed pivot and 0 for the negative-infinity downlink (the
+// first item of every internal page, which upstream also stores as a
+// zero-attribute pivot). goopg's key is still ONE opaque blob, so 1 is the only
+// non-zero count expressible: a composite index's separator is one blob to this
+// layer, and true suffix truncation to a prefix of the key attributes needs the
+// per-attribute datums of slice 3b. Ledger row.
+//
+// The tiebreaker-heap-TID pivot representation (`_bt_truncate`'s `keepnatts >
+// nkeyatts` branch, taken when the split point falls between two equal keys) is
+// likewise deferred: goopg's descent treats the separator as inclusive rather
+// than as a strict lower bound, so adopting the tiebreaker would change routing,
+// not just the tuple's bytes. Ledger row.
+//
+// A high key's t_tid block half is written P_NONE (0). Upstream leaves whatever
+// block `firstright` carried there, because its pivot starts life as a copy of
+// that tuple; the field is only read as BTreeTupleGetTopParent, and only on a
+// half-dead page, so a deterministic 0 is both safe and easier to assert on.
+func PGBTPivotRaw(key []byte, child storage.BlockNumber) []byte {
+	out := make([]byte, SizeOfIndexTupleData+len(key))
+	binary.LittleEndian.PutUint16(out[6:8], uint16(len(out)))
+	copy(out[SizeOfIndexTupleData:], key)
+	BTreeTupleSetDownLink(out, child)
+	natts := uint16(1)
+	if len(key) == 0 {
+		natts = 0 // negative infinity: no key attributes survive truncation
+	}
+	if err := BTreeTupleSetNAtts(out, natts, false); err != nil {
+		// Unreachable: natts is 0 or 1 and heapTID is false.
+		panic(err)
+	}
+	return out
+}
+
+// downlinkItem builds an internal-page pivot tuple whose t_tid addresses
+// `child` (upstream's `BTreeTupleSetDownLink`).
+func downlinkItem(key []byte, child storage.BlockNumber) item {
+	return item{ptr: storage.ItemPointer{Block: child}, key: key, pivot: true}
+}
+
+// parseItemBody validates the IndexTupleData header shared by parseItem and
+// parseItemNoCopy and returns the tuple's data area plus whether it is a pivot.
+//
+// Since M0130-S11.4 slice 3a a PIVOT tuple decodes here rather than being
+// rejected — internal-page downlinks and P_HIKEY separators are pivots, and
+// every generic page reader (pageItems, PageItemKeys, readPageItem, …) walks
+// internal pages too. The two halves of t_tid mean different things for a
+// pivot, so they are translated here, once: the block half is the downlink and
+// the offset half is nbtree status data (natts | BT_PIVOT), never a line
+// pointer, so it is dropped rather than handed on as part of a heap TID.
+//
+// A POSTING tuple still errors out: it has its own decoder in posting.go, and
+// its t_tid halves mean a third thing again (TID count and array offset).
+func parseItemBody(raw []byte) (storage.ItemPointer, []byte, bool, error) {
+	if len(raw) < SizeOfIndexTupleData {
+		return storage.ItemPointer{}, nil, false, fmt.Errorf("btree: item too short (%d bytes)", len(raw))
+	}
+	size := PGIndexTupleSize(raw)
+	if size != len(raw) {
+		return storage.ItemPointer{}, nil, false, fmt.Errorf("btree: item length mismatch t_info size=%d total=%d", size, len(raw))
+	}
+	if !PGIndexTupleIsAltTID(raw) {
+		return PGIndexTupleTID(raw), raw[SizeOfIndexTupleData:], false, nil
+	}
+	if BTreeTupleIsPosting(raw) {
+		return storage.ItemPointer{}, nil, false,
+			fmt.Errorf("btree: item is a posting-list tuple (t_info=%#x)", pgTInfo(raw))
+	}
+	body := raw[SizeOfIndexTupleData:]
+	// Defensive: goopg never writes the tiebreaker representation yet (see
+	// PGBTPivotRaw), but a pivot that carries one keeps a trailing
+	// ItemPointerData that is NOT part of the key.
+	if PGIndexTupleTID(raw).Offset&BTPivotHeapTIDAttr != 0 {
+		if len(body) < SizeOfItemPointerData {
+			return storage.ItemPointer{}, nil, false,
+				fmt.Errorf("btree: heap-TID pivot too short (%d bytes)", len(raw))
+		}
+		body = body[:len(body)-SizeOfItemPointerData]
+	}
+	return storage.ItemPointer{Block: BTreeTupleGetDownLink(raw)}, body, true, nil
+}
+
 func parseItem(raw []byte) (item, error) {
-	if len(raw) < itemPrefixSize {
-		return item{}, fmt.Errorf("btree: item too short (%d bytes)", len(raw))
+	ptr, key, pivot, err := parseItemBody(raw)
+	if err != nil {
+		return item{}, err
 	}
-	keyLen := binary.LittleEndian.Uint16(raw[0:2])
-	if int(keyLen)+itemPrefixSize != len(raw) {
-		return item{}, fmt.Errorf("btree: item length mismatch keyLen=%d total=%d", keyLen, len(raw))
-	}
-	return item{
-		keyLen: keyLen,
-		ptr: storage.ItemPointer{
-			Block:  storage.BlockNumber(binary.LittleEndian.Uint32(raw[2:6])),
-			Offset: binary.LittleEndian.Uint16(raw[6:8]),
-		},
-		key: append([]byte(nil), raw[itemPrefixSize:]...),
-	}, nil
+	return item{ptr: ptr, key: append([]byte(nil), key...), pivot: pivot}, nil
 }
 
 // parseItemNoCopy returns an `item` whose `key` field ALIASES `raw`
@@ -309,21 +478,11 @@ func parseItem(raw []byte) (item, error) {
 // callers don't retain key, so we can skip the per-slot
 // allocation that the regular `parseItem` does.
 func parseItemNoCopy(raw []byte) (item, error) {
-	if len(raw) < itemPrefixSize {
-		return item{}, fmt.Errorf("btree: item too short (%d bytes)", len(raw))
+	ptr, key, pivot, err := parseItemBody(raw)
+	if err != nil {
+		return item{}, err
 	}
-	keyLen := binary.LittleEndian.Uint16(raw[0:2])
-	if int(keyLen)+itemPrefixSize != len(raw) {
-		return item{}, fmt.Errorf("btree: item length mismatch keyLen=%d total=%d", keyLen, len(raw))
-	}
-	return item{
-		keyLen: keyLen,
-		ptr: storage.ItemPointer{
-			Block:  storage.BlockNumber(binary.LittleEndian.Uint32(raw[2:6])),
-			Offset: binary.LittleEndian.Uint16(raw[6:8]),
-		},
-		key: raw[itemPrefixSize:], // alias — caller must not retain
-	}, nil
+	return item{ptr: ptr, key: key, pivot: pivot}, nil // key aliases raw — caller must not retain
 }
 
 // EncodeInt4 is the canonical key encoding for v0 (4-byte big-endian int32).
@@ -348,6 +507,24 @@ func DecodeInt4(b []byte) (int32, error) {
 func EncodeInt8(key int64) []byte {
 	var b [8]byte
 	binary.BigEndian.PutUint64(b[:], uint64(key)^0x8000000000000000)
+	return b[:]
+}
+
+// EncodeInt128 encodes a signed 128-bit value, given as its two's-complement
+// (high int64, low uint64) halves, into a sortable 16-byte representation: the
+// same sign-bit flip EncodeInt4/EncodeInt8 use, applied to the HIGH half only.
+// Flipping just the high half is sufficient and necessary — the low half is a
+// pure magnitude continuation whose unsigned big-endian order is already the
+// correct tiebreak once the high halves are equal.
+//
+// The only user is the `interval` index key (M0119-0006): upstream's
+// interval_cmp_value (postgres/src/backend/utils/adt/timestamp.c) reduces an
+// interval to an INT128 span because month*30 days scaled to microseconds
+// overflows int64.
+func EncodeInt128(hi int64, lo uint64) []byte {
+	var b [16]byte
+	binary.BigEndian.PutUint64(b[0:8], uint64(hi)^0x8000000000000000)
+	binary.BigEndian.PutUint64(b[8:16], lo)
 	return b[:]
 }
 
@@ -376,8 +553,10 @@ func DecodeInt8(b []byte) (int64, error) {
 // Where d_1.d_2…d_n × 10^E is the value's scientific normalisation
 // after stripping trailing zeros from the mantissa.
 //
-// Decoding is intentionally not provided: the B-tree never inverts the
-// encoding; index probes always re-encode from the live datum.
+// The B-tree itself never inverts this encoding — index probes always
+// re-encode from the live datum. DecodeNumericKey exists for the callers
+// that must read a stored key back (amcheck's operator-class comparator
+// dispatch, index-only-scan key projection); see M0119-0006.
 //
 // M0041-0004 widens the mantissa parameter from int64 to *big.Int so
 // arbitrary-precision NUMERIC values (e.g. results of TPC-H Q8's
@@ -436,6 +615,90 @@ func EncodeNumericKey(mantissa *big.Int, scale int16) []byte {
 		out = append(out, 0x00) // less than any digit byte; shorter sorts first
 	}
 	return out
+}
+
+// DecodeNumericKey inverts EncodeNumericKey over the head of b, returning the
+// value as mantissa * 10^(-scale) plus the number of bytes the key occupied.
+// The encoding is self-delimiting (a fixed 6-byte frame plus a digit run ended
+// by a terminator that can never be a digit byte), so a composite key can be
+// walked column by column through it — that is what the amcheck operator-class
+// comparator does (M0119-0006).
+//
+// Because EncodeNumericKey strips trailing mantissa zeros, the returned pair is
+// the *normalised* representation: (1.50 :: numeric) round-trips as (15, 1),
+// not (150, 2). The two denote the same value, which is the property callers
+// (key comparison, IOS projection) rely on. The returned scale is never
+// negative — a value like 100 normalises to E=2 with one digit, and rather than
+// hand back scale -2 the mantissa is expanded to 100 with scale 0, so every
+// caller can treat Scale as an unsigned digit count exactly as the codec does.
+func DecodeNumericKey(b []byte) (mantissa *big.Int, scale int16, n int, err error) {
+	if len(b) == 0 {
+		return nil, 0, 0, fmt.Errorf("btree: numeric key truncated (empty)")
+	}
+	switch b[0] {
+	case 0x01:
+		return big.NewInt(0), 0, 1, nil
+	case 0x00, 0x02:
+	default:
+		return nil, 0, 0, fmt.Errorf("btree: bad numeric key sign byte 0x%02x", b[0])
+	}
+	negative := b[0] == 0x00
+	if len(b) < 6 {
+		return nil, 0, 0, fmt.Errorf("btree: numeric key truncated, got %d bytes", len(b))
+	}
+	biased := binary.BigEndian.Uint32(b[1:5])
+	var E int32
+	term := byte(0x00)
+	if negative {
+		E = int32(0x7FFFFFFF) - int32(biased)
+		term = 0xFF
+	} else {
+		E = int32(biased - 0x80000000)
+	}
+	// Digits run until the terminator; it is 0x00 (below '0') for positive keys
+	// and 0xFF (above '9') for negative ones, so it can never be mistaken for a
+	// digit byte of this column.
+	end := -1
+	for i := 5; i < len(b); i++ {
+		if b[i] == term {
+			end = i
+			break
+		}
+		if b[i] < '0' || b[i] > '9' {
+			return nil, 0, 0, fmt.Errorf("btree: bad numeric key digit 0x%02x", b[i])
+		}
+	}
+	if end < 0 {
+		return nil, 0, 0, fmt.Errorf("btree: numeric key missing terminator")
+	}
+	digits := make([]byte, end-5)
+	for i := range digits {
+		d := b[5+i] - '0'
+		if negative {
+			d = 9 - d // undo the digit inversion that makes bigger magnitudes sort smaller
+		}
+		digits[i] = '0' + d
+	}
+	if len(digits) == 0 {
+		return nil, 0, 0, fmt.Errorf("btree: numeric key has no digits")
+	}
+	m, ok := new(big.Int).SetString(string(digits), 10)
+	if !ok {
+		return nil, 0, 0, fmt.Errorf("btree: bad numeric key digits %q", digits)
+	}
+	// E = ndigits - 1 - scale  (see EncodeNumericKey).
+	s := int32(len(digits)) - 1 - E
+	if s < 0 {
+		m.Mul(m, new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(-s)), nil))
+		s = 0
+	}
+	if s > math.MaxInt16 {
+		return nil, 0, 0, fmt.Errorf("btree: numeric key scale %d out of range", s)
+	}
+	if negative {
+		m.Neg(m)
+	}
+	return m, int16(s), end + 1, nil
 }
 
 // EncodeVarchar encodes a variable-length string as a self-terminating
@@ -595,6 +858,12 @@ func DecodeVarchar(b []byte) ([]byte, error) {
 
 // CompareKeys is straight bytewise lexicographic comparison.
 //
+// Since M0130-S11.4 slice 3b-2c-i the engine no longer calls this directly:
+// every ordering decision goes through `indexFormat.compare` (pgkeycmp.go),
+// for which this is the nil-descriptor branch. It stays exported because the
+// out-of-package structural validators (internal/amcheck) and the executor's
+// bt_index_check need to name goopg's default key order explicitly.
+//
 // For int4 keys (all 4 bytes) this matches numeric order by
 // construction of EncodeInt4. For NUMERIC keys (variable length)
 // it matches numeric order via the sign + biased-exponent + digits
@@ -627,6 +896,15 @@ type BTree struct {
 	pool     *storage.Pool
 	rel      storage.RelFileNode
 	logSplit LogSplitFunc
+
+	// keyFmt is the index's key FORMAT (M0130-S11.4 slices 3b-2c-i and
+	// 3b-2c-ii-B1) — the one place every ordering AND item-layout decision in
+	// this package resolves. Its zero value is the blob format: the bytewise
+	// order goopg's key encodings are built for, over header-less key
+	// payloads. A non-nil descriptor switches the whole tree to `_bt_compare`
+	// over PG binary datums, with whole index tuples as its key operands. See
+	// pgkeycmp.go and pgitemcodec.go.
+	keyFmt indexFormat
 
 	// splitMu serialises split-path inserts and metapage
 	// publication. (M0055-0004-followup-stage2-splitmu-removal:
@@ -855,18 +1133,18 @@ type fastPathItemIdent struct {
 // DebugVerifyFastPathInserts is false.
 func (bt *BTree) insertItemSortedVerified(site string, blk storage.BlockNumber, p storage.Page, it item) (int, error) {
 	if !bt.DebugVerifyFastPathInserts {
-		return insertItemSorted(p, it)
+		return insertItemSorted(bt.format(), p, it)
 	}
-	pre, err := pageItems(p)
+	pre, err := bt.format().pageItems(p)
 	if err != nil {
 		panic(err)
 	}
 	preSnap := append([]item(nil), pre...)
-	lineIdx, err := insertItemSorted(p, it)
+	lineIdx, err := insertItemSorted(bt.format(), p, it)
 	if err != nil {
 		return 0, err
 	}
-	post, err := pageItems(p)
+	post, err := bt.format().pageItems(p)
 	if err != nil {
 		panic(err)
 	}
@@ -978,7 +1256,7 @@ type RewriteLogEvent struct {
 	Seq             uint64
 	Block           storage.BlockNumber
 	Phase           string // "dedup-recovery" or "split"
-	PreLineCount    int    // storage.PageLinePointerCount(slot.Page()) just before pageItems()
+	PreLineCount    int    // PGDataItemCount(slot.Page()) just before pageItems()
 	PostPageItems   []InsertLogRecord
 	PostDedup       []InsertLogRecord
 }
@@ -1058,7 +1336,7 @@ func (bt *BTree) RecordFlushSnapshot(tag storage.BufferTag, page storage.Page) {
 	if !bt.DebugTraceFlushes || tag.Rel != bt.rel {
 		return
 	}
-	items, err := pageItems(page)
+	items, err := bt.format().pageItems(page)
 	if err != nil {
 		return
 	}
@@ -1109,7 +1387,7 @@ func (bt *BTree) RecordReloadSnapshot(tag storage.BufferTag, page storage.Page) 
 	if !bt.DebugTraceReloads || tag.Rel != bt.rel {
 		return
 	}
-	items, err := pageItems(page)
+	items, err := bt.format().pageItems(page)
 	if err != nil {
 		return
 	}
@@ -1254,7 +1532,7 @@ func (bt *BTree) recordContentMuLock(blk storage.BlockNumber, page storage.Page)
 	if !bt.DebugTraceContentMu {
 		return
 	}
-	recs := snapshotPageItemsAsLog(blk, page)
+	recs := bt.format().snapshotPageItemsAsLog(blk, page)
 	if recs == nil {
 		return
 	}
@@ -1276,7 +1554,7 @@ func (bt *BTree) recordContentMuUnlock(blk storage.BlockNumber, page storage.Pag
 	if !bt.DebugTraceContentMu {
 		return
 	}
-	recs := snapshotPageItemsAsLog(blk, page)
+	recs := bt.format().snapshotPageItemsAsLog(blk, page)
 	bt.insertLogMu.Lock()
 	before, ok := bt.contentMuBefore[blk]
 	if ok {
@@ -1295,8 +1573,8 @@ func (bt *BTree) recordContentMuUnlock(blk storage.BlockNumber, page storage.Pag
 // (not an error) on decode failure, matching RecordFlushSnapshot/
 // RecordReloadSnapshot's best-effort behavior — this is debug
 // instrumentation, not a correctness path.
-func snapshotPageItemsAsLog(blk storage.BlockNumber, page storage.Page) []InsertLogRecord {
-	items, err := pageItems(page)
+func (f indexFormat) snapshotPageItemsAsLog(blk storage.BlockNumber, page storage.Page) []InsertLogRecord {
+	items, err := f.pageItems(page)
 	if err != nil {
 		return nil
 	}
@@ -1342,20 +1620,23 @@ func (bt *BTree) ContentMuRecordsForBlock(blk storage.BlockNumber) []ContentMuEv
 // writer's insert and leaving the tree structurally inconsistent.
 // Keeping the lock held end-to-end across both branches (recycled
 // and fresh-PinNew) removes the window entirely.
+//
+// M0130-S11.5d-3c: a block on the free list is a CANDIDATE, not a guarantee.
+// Upstream's `_bt_allocbuf` re-reads each FSM-supplied block and only uses it
+// when `BTPageIsRecyclable` holds; a page deleted while some snapshot could
+// still be descending to it must stay a tombstone. This mirrors that: pop
+// candidates until one is recyclable, put the rest back, and extend the file
+// when none is.
 func (bt *BTree) pinNewOrRecycled() (*storage.Slot, storage.BlockNumber, error) {
-	if blk, ok := bt.popRecycledBlock(); ok {
-		slot, err := bt.pool.Pin(storage.BufferTag{Rel: bt.rel, Block: blk})
-		if err != nil {
-			// Could not re-pin; fall back to fresh allocation.
-			return bt.pinNewLocked()
-		}
+	if slot, blk, ok := bt.popRecyclableBlock(); ok {
 		// Re-initialise the page bytes so the recycled slot looks
 		// like a fresh PinNew result. The page must be zeroed under
 		// the content lock so a concurrent reader never observes a
 		// partially-zeroed page (M0118-0130: "btree: item length
-		// mismatch keyLen=9 total=37"). The lock is intentionally
-		// NOT released here — see the function doc.
-		slot.Lock()
+		// mismatch keyLen=9 total=37"). popRecyclableBlock already
+		// returns the slot content-locked (it had to read the page to
+		// judge recyclability), and the lock is intentionally NOT
+		// released here — see the function doc.
 		page := slot.Page()
 		for i := range page {
 			page[i] = 0
@@ -1406,6 +1687,74 @@ func (bt *BTree) popRecycledBlock() (storage.BlockNumber, bool) {
 	blk := bt.freeList[n]
 	bt.freeList = bt.freeList[:n]
 	return blk, true
+}
+
+// popRecyclableBlock (M0130-S11.5d-3c) returns a pinned, content-LOCKED slot
+// for a free-list block whose page satisfies PGPageIsRecyclable, i.e. whose
+// deletion is old enough that no in-flight scan can still hold a downlink to
+// it. It is upstream's `_bt_allocbuf` loop (nbtpage.c:875-975), which likewise
+// treats an FSM-supplied block as a candidate and falls through to extending
+// the relation when none passes.
+//
+// Blocks that are not yet recyclable go BACK on the free list — they are
+// tombstones, not garbage, and a later allocation (by which time the horizon
+// has advanced) will take them. A block that cannot be pinned is dropped, as
+// before: it is unreachable from the tree, so leaking it is the safe outcome.
+func (bt *BTree) popRecyclableBlock() (*storage.Slot, storage.BlockNumber, bool) {
+	oldestVisible, gated := bt.recycleHorizon()
+	var keep []storage.BlockNumber
+	defer func() {
+		if len(keep) > 0 {
+			bt.freeListMu.Lock()
+			bt.freeList = append(bt.freeList, keep...)
+			bt.freeListMu.Unlock()
+		}
+	}()
+	for {
+		blk, ok := bt.popRecycledBlock()
+		if !ok {
+			return nil, storage.InvalidBlockNumber, false
+		}
+		slot, err := bt.pool.Pin(storage.BufferTag{Rel: bt.rel, Block: blk})
+		if err != nil {
+			continue
+		}
+		slot.Lock()
+		// Without a horizon source the pre-S11.5d-3c contract stands: the
+		// free list is authoritative and the page is not consulted at all.
+		// (Legacy non-WAL deletion paths stamp no safexid, and every unit
+		// test that builds a bare pool lands here.)
+		if !gated || PGPageIsRecyclable(slot.Page(), oldestVisible) {
+			return slot, blk, true
+		}
+		slot.Unlock()
+		bt.pool.Unpin(slot)
+		keep = append(keep, blk)
+	}
+}
+
+// recycleHorizon reads the GlobalVisCheckRemovableFullXid boundary from the
+// pool's configured source. `gated` is false when no source is wired, in which
+// case deletion stamps safexid 0 and every free-list block recycles at once.
+func (bt *BTree) recycleHorizon() (oldestVisible uint64, gated bool) {
+	fn := bt.pool.BtreeRecycleHorizon()
+	if fn == nil {
+		return 0, false
+	}
+	_, oldestVisible = fn()
+	return oldestVisible, true
+}
+
+// nextSafeXid is upstream's `ReadNextFullTransactionId()` at the point
+// `_bt_unlink_halfdead_page` stamps BTDeletedPageData.safexid (M0130-S11.5d-3c).
+// Returns 0 — "recyclable immediately" — when no horizon source is wired.
+func (bt *BTree) nextSafeXid() uint64 {
+	fn := bt.pool.BtreeRecycleHorizon()
+	if fn == nil {
+		return 0
+	}
+	next, _ := fn()
+	return next
 }
 
 // RecycledPageCount returns the number of pages currently in the
@@ -1470,7 +1819,19 @@ func (bt *BTree) ResetStats() {
 // callers pass it as sibBlk with its post-relink image as sibPage.
 // On a rightmost split sibBlk is storage.InvalidBlockNumber and
 // sibPage is nil.
-type LogSplitFunc func(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, sibBlk storage.BlockNumber, sibPage storage.Page) (storage.LSN, error)
+//
+// childBlk (M0130-S11.5b-3) is upstream's backup block 3: on an INTERNAL split
+// it is the page one level down whose BTIncompleteSplit flag this insertion
+// finishes — cleared by the caller in the same critical section, exactly as
+// _bt_split does — so the record can describe the clear too. It is
+// storage.InvalidBlockNumber on a leaf split, where upstream has no cbuf.
+//
+// prePage and newItem (M0130-S11.5b-2) are the split page as it stood BEFORE
+// the rewrite and the raw item whose insertion caused the split. They exist so
+// the record can describe the left half incrementally — "the pre-split items up
+// to here, with this one spliced in" — instead of shipping a page image. Both
+// nil is legal and means "log the image".
+type LogSplitFunc func(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, prePage, leftPage, rightPage storage.Page, newItem []byte, sibBlk storage.BlockNumber, sibPage storage.Page, childBlk storage.BlockNumber) (storage.LSN, error)
 
 // Options carries optional dependencies for Open/Create. The zero
 // value works for tests and callers that don't need WAL-backed
@@ -1483,6 +1844,13 @@ type Options struct {
 	// block-0 smgr-create WAL record when the index relfile is created
 	// (A9). Zero for non-transactional/bootstrap builds.
 	CreateXID storage.TransactionID
+	// KeyDesc is the index's key descriptor (M0130-S11.4 slice 3b-2c-i),
+	// built from the catalog by internal/executor's buildPGIndexKeyDesc.
+	// nil — every caller today — means goopg's opaque order-preserving key
+	// encoding compared bytewise, which is what the current writers emit.
+	// Supplying one switches the tree to `_bt_compare` over PG binary
+	// datums and REQUIRES the tuple-shaped key operands 3b-2c-ii writes.
+	KeyDesc *PGIndexKeyDesc
 }
 
 // Open returns a handle to an existing B-tree on rel. Validates the
@@ -1497,12 +1865,16 @@ func Open(pool *storage.Pool, rel storage.RelFileNode) (*BTree, error) {
 
 // OpenWithOptions is the wired-up Open variant.
 func OpenWithOptions(pool *storage.Pool, rel storage.RelFileNode, opts Options) (*BTree, error) {
-	bt := &BTree{pool: pool, rel: rel, logSplit: opts.LogSplit}
+	bt := &BTree{pool: pool, rel: rel, logSplit: opts.LogSplit, keyFmt: indexFormat{desc: opts.KeyDesc}}
 	meta, err := bt.readMeta()
 	if err != nil {
 		return nil, err
 	}
-	if meta.Magic != btreeMagic || meta.Version != btreeVersion {
+	// _bt_getmeta's acceptance test: the magic must match exactly, and the
+	// version must lie in [BTREE_MIN_VERSION, BTREE_VERSION]. goopg only ever
+	// writes BTREE_VERSION, but accepting the older versions the oracle
+	// accepts keeps Open from rejecting an index a real PG built.
+	if meta.Magic != BTreeMagicPG || meta.Version < BTreeMinVersionPG || meta.Version > BTreeVersionPG {
 		return nil, ErrNotABTree
 	}
 	return bt, nil
@@ -1521,6 +1893,14 @@ func CreateWithXID(pool *storage.Pool, rel storage.RelFileNode, xid storage.Tran
 	return CreateWithOptions(pool, rel, Options{LogSplit: adaptPoolLogSplit(pool), CreateXID: xid})
 }
 
+// PoolLogSplit returns the pool's split-WAL hook in btree's LogSplitFunc
+// shape, or nil when no hook is wired. It is what Open/Create install by
+// default; it is exported for callers that must assemble an Options value
+// themselves and still want the standard hook — internal/executor's
+// indexBTreeOptions, which adds the index key descriptor (M0130-S11.4 slice
+// 3b-2c-ii-A) and would otherwise silently drop split WAL logging.
+func PoolLogSplit(pool *storage.Pool) LogSplitFunc { return adaptPoolLogSplit(pool) }
+
 // adaptPoolLogSplit returns the pool's split-WAL hook in btree's
 // LogSplitFunc shape, or nil when no hook is wired (tests etc.).
 func adaptPoolLogSplit(pool *storage.Pool) LogSplitFunc {
@@ -1528,14 +1908,14 @@ func adaptPoolLogSplit(pool *storage.Pool) LogSplitFunc {
 	if hook == nil {
 		return nil
 	}
-	return func(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, sibBlk storage.BlockNumber, sibPage storage.Page) (storage.LSN, error) {
-		return hook(rel, leftBlk, rightBlk, leftPage, rightPage, sibBlk, sibPage)
+	return func(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, prePage, leftPage, rightPage storage.Page, newItem []byte, sibBlk storage.BlockNumber, sibPage storage.Page, childBlk storage.BlockNumber) (storage.LSN, error) {
+		return hook(rel, leftBlk, rightBlk, prePage, leftPage, rightPage, newItem, sibBlk, sibPage, childBlk)
 	}
 }
 
 // CreateWithOptions is the wired-up Create variant.
 func CreateWithOptions(pool *storage.Pool, rel storage.RelFileNode, opts Options) (*BTree, error) {
-	bt := &BTree{pool: pool, rel: rel, logSplit: opts.LogSplit}
+	bt := &BTree{pool: pool, rel: rel, logSplit: opts.LogSplit, keyFmt: indexFormat{desc: opts.KeyDesc}}
 
 	// Ensure the relation file starts at block 0 (see
 	// BulkCreateWithOptions for rationale).
@@ -1584,17 +1964,15 @@ func CreateWithOptions(pool *storage.Pool, rel storage.RelFileNode, opts Options
 	}
 	rootSlot.Unlock()
 
-	// Initialise the metapage.
+	// Initialise the metapage (_bt_initmetapage: BTP_META opaque, the
+	// 48-byte BTMetaPageData at PageGetContents, pd_lower advanced past it).
 	metaSlot.Lock()
-	storage.InitPage(metaSlot.Page())
-	writeMeta(metaSlot.Page(), BTreeMeta{
-		Magic:     btreeMagic,
-		Version:   btreeVersion,
-		Root:      rootBlk,
-		Level:     0,
-		FastRoot:  rootBlk,
-		FastLevel: 0,
-	})
+	if err := initMetaPage(metaSlot.Page(), rootBlk, 0); err != nil {
+		metaSlot.Unlock()
+		pool.Unpin(rootSlot)
+		pool.Unpin(metaSlot)
+		return nil, err
+	}
 	if err := bt.markDirtyWithPageRecord(metaSlot, MetaBlock); err != nil {
 		metaSlot.Unlock()
 		pool.Unpin(rootSlot)
@@ -1616,15 +1994,29 @@ var (
 
 // readMeta loads the metapage under a shared content latch so the
 // read sees a torn-byte-free snapshot.
-func (bt *BTree) readMeta() (BTreeMeta, error) {
+//
+// The page is gated on CheckPGBTPage — the oracle's own _bt_checkpage — before
+// its bytes are decoded. That turns the one failure mode of the S11.3 format
+// break into a clean error: an index file written before the flip has a
+// zero-length special area, and its 24-byte payload happens to share the
+// magic/version offsets with BTMetaPageData, so without this check it would
+// open "successfully" and then decode Root/Level from the wrong bytes.
+func (bt *BTree) readMeta() (PGBTMetaPage, error) {
 	slot, err := bt.pool.Pin(storage.BufferTag{Rel: bt.rel, Block: MetaBlock})
 	if err != nil {
-		return BTreeMeta{}, err
+		return PGBTMetaPage{}, err
 	}
 	slot.RLock()
-	m := parseMeta(slot.Page())
+	err = CheckPGBTPage(slot.Page(), MetaBlock)
+	var m PGBTMetaPage
+	if err == nil {
+		m = ReadPGMetaPage(slot.Page())
+	}
 	slot.RUnlock()
 	bt.pool.Unpin(slot)
+	if err != nil {
+		return PGBTMetaPage{}, err
+	}
 	return m, nil
 }
 
@@ -1673,32 +2065,22 @@ func (bt *BTree) unpinW(s *storage.Slot) {
 // ParseMeta exposes the metapage decode for out-of-package readers (the
 // amcheck verify engine) that validate a metapage's magic/version without
 // opening the tree. See ParseOpaque for the single-source-of-truth rationale.
-func ParseMeta(p storage.Page) BTreeMeta { return parseMeta(p) }
+func ParseMeta(p storage.Page) PGBTMetaPage { return ReadPGMetaPage(p) }
 
-func parseMeta(p storage.Page) BTreeMeta {
-	off := storage.SizeOfPageHeaderData
-	return BTreeMeta{
-		Magic:     binary.LittleEndian.Uint32(p[off : off+4]),
-		Version:   binary.LittleEndian.Uint32(p[off+4 : off+8]),
-		Root:      storage.BlockNumber(binary.LittleEndian.Uint32(p[off+8 : off+12])),
-		Level:     binary.LittleEndian.Uint32(p[off+12 : off+16]),
-		FastRoot:  storage.BlockNumber(binary.LittleEndian.Uint32(p[off+16 : off+20])),
-		FastLevel: binary.LittleEndian.Uint32(p[off+20 : off+24]),
-	}
-}
-
-func writeMeta(p storage.Page, m BTreeMeta) {
-	off := storage.SizeOfPageHeaderData
-	binary.LittleEndian.PutUint32(p[off:off+4], m.Magic)
-	binary.LittleEndian.PutUint32(p[off+4:off+8], m.Version)
-	binary.LittleEndian.PutUint32(p[off+8:off+12], uint32(m.Root))
-	binary.LittleEndian.PutUint32(p[off+12:off+16], m.Level)
-	binary.LittleEndian.PutUint32(p[off+16:off+20], uint32(m.FastRoot))
-	binary.LittleEndian.PutUint32(p[off+20:off+24], m.FastLevel)
-	// Bump pd_lower so PageLinePointerCount on this page (if anyone
-	// ever asks) reports zero rather than walking into our payload.
-	h := storage.MustHeader(p)
-	h.SetLower(uint16(off + 24))
+// initMetaPage builds block 0 from scratch: upstream's _bt_initmetapage with
+// the one goopg-specific decision baked in, namely allequalimage.
+//
+// goopg deduplicates unconditionally at build time (deduplicateToRawItems in
+// bulkload.go) and on insert, so the metapage MUST advertise allequalimage —
+// upstream's amcheck errors with "index %s has posting list tuples but
+// metapage indicates !allequalimage" otherwise, and a real PG would refuse to
+// add to an existing posting list. The faithful computation is per-opclass
+// (_bt_allequalimage in nbtutils.c, opclass support function 4, false for e.g.
+// numeric and nondeterministic collations); goopg has no equalimage support
+// functions yet, so the flag is unconditional here and the per-opclass
+// computation is a deferral-ledger row (M0130-S11.3).
+func initMetaPage(p storage.Page, root storage.BlockNumber, level uint32) error {
+	return InitPGMetaPage(p, root, level, true /* allequalimage */)
 }
 
 // markDirtyWithPageRecord routes metadata-page mutations through
@@ -1724,12 +2106,12 @@ func (bt *BTree) updateRootMeta(root storage.BlockNumber, level uint32) error {
 	if err != nil {
 		return err
 	}
-	m := parseMeta(slot.Page())
+	m := ReadPGMetaPage(slot.Page())
 	m.Root = root
 	m.Level = level
 	m.FastRoot = root
 	m.FastLevel = level
-	writeMeta(slot.Page(), m)
+	WritePGMetaPage(slot.Page(), m)
 	err = bt.markDirtyWithPageRecord(slot, MetaBlock)
 	bt.unpinW(slot)
 	if err != nil {
@@ -1747,34 +2129,34 @@ func (bt *BTree) updateRootMeta(root storage.BlockNumber, level uint32) error {
 // then replays the entry back as Normal pointing at a recycled heap slot
 // (C3-S1 review MUST-FIX 1). PG's btbulkdelete likewise deletes by TID
 // regardless of LP_DEAD.
-func pageItemsWithDead(p storage.Page) ([]item, []bool, error) {
-	count, err := storage.PageLinePointerCount(p)
+func (f indexFormat) pageItemsWithDead(p storage.Page) ([]item, []bool, error) {
+	count, err := PGDataItemCount(p)
 	if err != nil {
 		return nil, nil, err
 	}
 	out := make([]item, 0, count)
 	dead := make([]bool, 0, count)
 	for slot := uint16(1); slot <= uint16(count); slot++ {
-		isDead, derr := storage.PageItemIsDead(p, slot)
+		isDead, derr := pgItemIsDead(p, slot)
 		if derr != nil {
 			return nil, nil, derr
 		}
-		raw, err := storage.PageGetItemRawAllowDead(p, slot)
+		raw, err := pgGetItemRawAllowDead(p, slot)
 		if err != nil {
 			return nil, nil, err
 		}
 		if isPostingRaw(raw) {
-			key, tids, perr := parsePostingRaw(raw)
+			its, perr := f.postingItems(raw)
 			if perr != nil {
 				maybeDumpPageOnParseErr(p, "pageItemsWithDead: parsePostingRaw")
 				return nil, nil, perr
 			}
-			for _, tid := range tids {
-				out = append(out, item{keyLen: uint16(len(key)), ptr: tid, key: key})
+			for _, it := range its {
+				out = append(out, it)
 				dead = append(dead, isDead)
 			}
 		} else {
-			it, perr := parseItem(raw)
+			it, perr := f.parse(raw)
 			if perr != nil {
 				maybeDumpPageOnParseErr(p, "pageItemsWithDead: parseItem")
 				return nil, nil, perr
@@ -1786,36 +2168,34 @@ func pageItemsWithDead(p storage.Page) ([]item, []bool, error) {
 	return out, dead, nil
 }
 
-func pageItems(p storage.Page) ([]item, error) {
-	count, err := storage.PageLinePointerCount(p)
+func (f indexFormat) pageItems(p storage.Page) ([]item, error) {
+	count, err := PGDataItemCount(p)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]item, 0, count)
 	for slot := uint16(1); slot <= uint16(count); slot++ {
-		if dead, derr := storage.PageItemIsDead(p, slot); derr == nil && dead {
+		if dead, derr := pgItemIsDead(p, slot); derr == nil && dead {
 			// C3-S1: ItemIDDead entries are invisible to every reader —
 			// the referenced heap tuple is dead to all snapshots and the
 			// entry awaits the pre-split purge / VACUUM.
 			continue
 		}
-		raw, err := storage.PageGetItemRaw(p, slot)
+		raw, err := pgGetItemRaw(p, slot)
 		if err != nil {
 			return nil, err
 		}
 		// Posting-list items (M0047-0003) are expanded to individual
 		// (key, TID) pairs so callers like insertItemSorted work correctly.
 		if isPostingRaw(raw) {
-			key, tids, perr := parsePostingRaw(raw)
+			its, perr := f.postingItems(raw)
 			if perr != nil {
 				maybeDumpPageOnParseErr(p, "pageItems: parsePostingRaw")
 				return nil, perr
 			}
-			for _, tid := range tids {
-				out = append(out, item{keyLen: uint16(len(key)), ptr: tid, key: key})
-			}
+			out = append(out, its...)
 		} else {
-			it, perr := parseItem(raw)
+			it, perr := f.parse(raw)
 			if perr != nil {
 				maybeDumpPageOnParseErr(p, "pageItems: parseItem")
 				return nil, perr
@@ -1839,32 +2219,32 @@ func pageItems(p storage.Page) ([]item, error) {
 // keys through the canonical on-disk reader here instead of re-implementing the
 // item layout — the same single-source-of-truth discipline as ParseMeta /
 // ParseOpaque (the inline 2-byte-length key layout is a v3->v4 drift hazard).
-func PageItemKeys(p storage.Page) ([][]byte, error) {
-	count, err := storage.PageLinePointerCount(p)
+func (fm IndexFormat) PageItemKeys(p storage.Page) ([][]byte, error) {
+	count, err := PGDataItemCount(p)
 	if err != nil {
 		return nil, err
 	}
 	out := make([][]byte, 0, count)
 	for slot := uint16(1); slot <= uint16(count); slot++ {
-		if dead, derr := storage.PageItemIsDead(p, slot); derr == nil && dead {
+		if dead, derr := pgItemIsDead(p, slot); derr == nil && dead {
 			// C3-S1: ItemIDDead entries are invisible to every reader —
 			// the referenced heap tuple is dead to all snapshots and the
 			// entry awaits the pre-split purge / VACUUM.
 			continue
 		}
-		raw, err := storage.PageGetItemRaw(p, slot)
+		raw, err := pgGetItemRaw(p, slot)
 		if err != nil {
 			return nil, err
 		}
 		if isPostingRaw(raw) {
-			key, _, perr := parsePostingRaw(raw)
+			key, _, perr := fm.f.parsePostingRaw(raw)
 			if perr != nil {
 				maybeDumpPageOnParseErr(p, "PageItemKeys: parsePostingRaw")
 				return nil, perr
 			}
 			out = append(out, key)
 		} else {
-			it, perr := parseItem(raw)
+			it, perr := fm.f.parse(raw)
 			if perr != nil {
 				maybeDumpPageOnParseErr(p, "PageItemKeys: parseItem")
 				return nil, perr
@@ -1895,44 +2275,80 @@ type LeafEntry struct {
 // Exported, like PageItemKeys / PageDownlinks, so amcheck's heapallindexed
 // checker (internal/amcheck.VerifyBtreeHeapAllIndexed) fingerprints the leaf
 // entries through the canonical on-disk reader here instead of re-deriving the
-// inline (keyLen, TID) item layout — the same single-source-of-truth discipline
+// inline IndexTupleData item layout — the same single-source-of-truth discipline
 // that guards against the v3->v4 layout drift. Unlike PageItemKeys (which
 // collapses a posting item to its one separator key for the item-order tier),
 // this expands posting items because heapallindexed fingerprints every heap TID
 // the index references.
-func PageLeafEntries(p storage.Page) ([]LeafEntry, error) {
-	count, err := storage.PageLinePointerCount(p)
+func (fm IndexFormat) PageLeafEntries(p storage.Page) ([]LeafEntry, error) {
+	items, err := fm.PageLeafItems(p)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]LeafEntry, 0, count)
+	out := make([]LeafEntry, 0, len(items))
+	for _, it := range items {
+		out = append(out, LeafEntry{Key: it.Key, TID: it.TID})
+	}
+	return out, nil
+}
+
+// LeafItem is PageLeafEntries' (key, heap TID) pair plus the on-page location
+// it was read from: the line-pointer Slot and, for a posting-list item, the
+// position of this TID within the posting list (PostingIndex; -1 for a plain
+// item). Upstream amcheck's uniqueness tier reports exactly these coordinates
+// in its errdetail — `Index tid=(blk,off) posting N and tid=(...) …`,
+// verify_nbtree.c's bt_report_duplicate — which the collapsed LeafEntry shape
+// cannot express. M0119-0006.
+// Slot is the PHYSICAL line-pointer offset, not the data-item index: upstream
+// reports the on-page offset number, and since S11.2b the two differ by one on
+// a non-rightmost page (P_HIKEY occupies offset 1).
+type LeafItem struct {
+	Key          []byte
+	TID          storage.ItemPointer
+	Slot         uint16
+	PostingIndex int
+}
+
+// PageLeafItems returns every (key, heap TID) entry on a B-tree leaf page in
+// physical slot order, expanding posting-list items to one entry per TID and
+// retaining each entry's slot / posting position (see LeafItem).
+//
+// PageLeafEntries is a thin projection of this reader, so the two never drift
+// apart on the ItemIDDead skip or the posting-list expansion rule — the
+// sibling-paths-must-agree discipline that guards the on-disk item layout.
+func (fm IndexFormat) PageLeafItems(p storage.Page) ([]LeafItem, error) {
+	count, err := PGDataItemCount(p)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]LeafItem, 0, count)
 	for slot := uint16(1); slot <= uint16(count); slot++ {
-		if dead, derr := storage.PageItemIsDead(p, slot); derr == nil && dead {
+		if dead, derr := pgItemIsDead(p, slot); derr == nil && dead {
 			// C3-S1: ItemIDDead entries are invisible to every reader —
 			// the referenced heap tuple is dead to all snapshots and the
 			// entry awaits the pre-split purge / VACUUM.
 			continue
 		}
-		raw, err := storage.PageGetItemRaw(p, slot)
+		raw, err := pgGetItemRaw(p, slot)
 		if err != nil {
 			return nil, err
 		}
 		if isPostingRaw(raw) {
-			key, tids, perr := parsePostingRaw(raw)
+			its, perr := fm.f.postingItems(raw)
 			if perr != nil {
-				maybeDumpPageOnParseErr(p, "PageLeafEntries: parsePostingRaw")
+				maybeDumpPageOnParseErr(p, "PageLeafItems: parsePostingRaw")
 				return nil, perr
 			}
-			for _, tid := range tids {
-				out = append(out, LeafEntry{Key: key, TID: tid})
+			for i, it := range its {
+				out = append(out, LeafItem{Key: it.key, TID: it.ptr, Slot: pgDataSlot(p, slot), PostingIndex: i})
 			}
 		} else {
-			it, perr := parseItem(raw)
+			it, perr := fm.f.parse(raw)
 			if perr != nil {
-				maybeDumpPageOnParseErr(p, "PageLeafEntries: parseItem")
+				maybeDumpPageOnParseErr(p, "PageLeafItems: parseItem")
 				return nil, perr
 			}
-			out = append(out, LeafEntry{Key: it.key, TID: it.ptr})
+			out = append(out, LeafItem{Key: it.key, TID: it.ptr, Slot: pgDataSlot(p, slot), PostingIndex: -1})
 		}
 	}
 	return out, nil
@@ -1958,26 +2374,26 @@ type Downlink struct {
 // Exported, like PageItemKeys, so amcheck's cross-level checker
 // (internal/amcheck.VerifyBtreeParentDownlinks) follows each parent downlink to
 // its child through the canonical on-disk reader here instead of re-deriving the
-// inline (keyLen, child-block) item layout — the same single-source-of-truth
+// inline IndexTupleData item layout — the same single-source-of-truth
 // discipline that guards against the v3->v4 layout drift.
-func PageDownlinks(p storage.Page) ([]Downlink, error) {
-	count, err := storage.PageLinePointerCount(p)
+func (fm IndexFormat) PageDownlinks(p storage.Page) ([]Downlink, error) {
+	count, err := PGDataItemCount(p)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]Downlink, 0, count)
 	for slot := uint16(1); slot <= uint16(count); slot++ {
-		if dead, derr := storage.PageItemIsDead(p, slot); derr == nil && dead {
+		if dead, derr := pgItemIsDead(p, slot); derr == nil && dead {
 			// C3-S1: ItemIDDead entries are invisible to every reader —
 			// the referenced heap tuple is dead to all snapshots and the
 			// entry awaits the pre-split purge / VACUUM.
 			continue
 		}
-		raw, err := storage.PageGetItemRaw(p, slot)
+		raw, err := pgGetItemRaw(p, slot)
 		if err != nil {
 			return nil, err
 		}
-		it, perr := parseItem(raw)
+		it, perr := fm.f.parse(raw)
 		if perr != nil {
 			maybeDumpPageOnParseErr(p, "PageDownlinks: parseItem")
 			return nil, perr
@@ -1993,9 +2409,9 @@ func PageDownlinks(p storage.Page) ([]Downlink, error) {
 // key. By v0 convention the leftmost internal item carries the empty
 // key (lowest possible), so the search is well-defined for the first
 // child too.
-func findChildBlock(items []item, key []byte) storage.BlockNumber {
+func findChildBlock(f indexFormat, items []item, key []byte) storage.BlockNumber {
 	idx := sort.Search(len(items), func(i int) bool {
-		return CompareKeys(items[i].key, key) > 0
+		return f.compare(items[i].key, key) > 0
 	})
 	if idx == 0 {
 		// All items are > key; descend through the first item anyway
@@ -2011,8 +2427,8 @@ func findChildBlock(items []item, key []byte) storage.BlockNumber {
 // child block to descend into for `key`, without decoding all items
 // first.  Replaces the pageItems + findChildBlock pair (which allocated
 // a slice of all items on every descent).  M0027-0001.
-func findChildBlockDirect(p storage.Page, key []byte) (storage.BlockNumber, error) {
-	count, err := storage.PageLinePointerCount(p)
+func findChildBlockDirect(f indexFormat, p storage.Page, key []byte) (storage.BlockNumber, error) {
+	count, err := PGDataItemCount(p)
 	if err != nil {
 		return 0, err
 	}
@@ -2022,15 +2438,15 @@ func findChildBlockDirect(p storage.Page, key []byte) (storage.BlockNumber, erro
 	// Binary search across line pointers.
 	n := count
 	idx := sort.Search(n, func(i int) bool {
-		raw, err := storage.PageGetItemRawAllowDead(p, uint16(i+1)) // C3-S1: dead items keep ordering bytes
+		raw, err := pgGetItemRawAllowDead(p, uint16(i+1)) // C3-S1: dead items keep ordering bytes
 		if err != nil {
 			return true // will surface at the final error check
 		}
-		it, err := parseItem(raw)
+		it, err := f.parse(raw)
 		if err != nil {
 			return true
 		}
-		return CompareKeys(it.key, key) > 0
+		return f.compare(it.key, key) > 0
 	})
 	// sort.Search returns [0, n]; idx==n means all items ≤ key.
 	if idx >= n {
@@ -2041,11 +2457,11 @@ func findChildBlockDirect(p storage.Page, key []byte) (storage.BlockNumber, erro
 		idx--
 	}
 	// idx==0 stays 0: first child.
-	raw, err := storage.PageGetItemRawAllowDead(p, uint16(idx+1)) // C3-S1
+	raw, err := pgGetItemRawAllowDead(p, uint16(idx+1)) // C3-S1
 	if err != nil {
 		return 0, err
 	}
-	it, err := parseItem(raw)
+	it, err := f.parse(raw)
 	if err != nil {
 		maybeDumpPageOnParseErr(p, "findChildBlockDirect: parseItem")
 		return 0, err
@@ -2079,7 +2495,7 @@ func (bt *BTree) descendToLeaf(key []byte) (leafBlk storage.BlockNumber, path []
 		// Right-link recovery: a concurrent split may have moved
 		// our target keys to the right sibling. Follow op.Next
 		// until we land on a page that covers the search key.
-		if keyExceedsHighKey(op, key) {
+		if keyExceedsHighKey(bt.format(), slot.Page(), key) {
 			next := op.Next
 			bt.unpinR(slot)
 			cur = next
@@ -2112,7 +2528,7 @@ func (bt *BTree) descendToLeaf(key []byte) (leafBlk storage.BlockNumber, path []
 
 		// Binary-search the internal page directly, without decoding
 		// all items (avoids allocation & linear decode — M0027-0001).
-		child, err := findChildBlockDirect(slot.Page(), key)
+		child, err := findChildBlockDirect(bt.format(), slot.Page(), key)
 		bt.unpinR(slot)
 		if err != nil {
 			return 0, nil, fmt.Errorf("%w (blk=%d rel=%+v)", err, cur, bt.rel)
@@ -2126,10 +2542,19 @@ func (bt *BTree) descendToLeaf(key []byte) (leafBlk storage.BlockNumber, path []
 // pages on the way up if needed.
 func (bt *BTree) Insert(key []byte, ptr storage.ItemPointer) error {
 	bt.stats.inserts.Add(1) // M0055-0001
-	it := item{
-		keyLen: uint16(len(key)),
-		ptr:    ptr,
-		key:    append([]byte(nil), key...),
+	it := item{ptr: ptr, key: append([]byte(nil), key...)}
+
+	// _bt_doinsert's 1/3-of-a-page restriction (M0130-S11.4 slice 3b-3d — the
+	// rule that replaced goopg's 256-byte MaxHighKeyLen). Upstream checks in
+	// _bt_findinsertloc, once the leaf is pinned; goopg has two leaf writers
+	// below (tryInsertNoSplit and insertIntoBlock) and the answer does not
+	// depend on the page, so the gate sits at the one door they share. The LEAF
+	// bound is the tighter one: it leaves room for the tiebreaker heap TID
+	// _bt_truncate may append to a separator derived from this row, which is
+	// what makes the split path's pivot check and the bulk loader's separator
+	// reserve sound.
+	if err := CheckPGBTThirdPage(true, MaxAlign(bt.format().bodySize(it.key))); err != nil {
+		return err
 	}
 
 	// Fast path: no split required. Writers touching different leaves
@@ -2155,7 +2580,9 @@ func (bt *BTree) Insert(key []byte, ptr storage.ItemPointer) error {
 	if err != nil {
 		return err
 	}
-	return bt.insertIntoBlock(leafBlk, path, it)
+	// No child completes a split here: `it` is a leaf tuple, upstream's isleaf
+	// arm, which registers no cbuf (M0130-S11.5b-3).
+	return bt.insertIntoBlock(leafBlk, path, it, storage.InvalidBlockNumber)
 }
 
 var errNeedsSplit = errors.New("btree: insert needs split")
@@ -2183,11 +2610,10 @@ func (bt *BTree) tryInsertNoSplit(it item) error {
 	}
 	defer bt.unpinW(slot)
 
-	op := readOpaque(slot.Page())
-	if keyExceedsHighKey(op, it.key) {
+	if keyExceedsHighKey(bt.format(), slot.Page(), it.key) {
 		return errNeedsSplit
 	}
-	if !pageHasSpaceFor(slot.Page(), it) {
+	if !bt.format().pageHasSpaceFor(slot.Page(), it) {
 		return errNeedsSplit
 	}
 
@@ -2197,9 +2623,10 @@ func (bt *BTree) tryInsertNoSplit(it item) error {
 	}
 	bt.traceInsert(leafBlk, lineIdx, it)
 	if logIns := bt.pool.LogBtreeInsert(); logIns != nil {
-		itemBytes := it.marshal()
+		itemBytes := bt.format().marshal(it)
+		offnum := pgPhysOffnum(slot.Page(), lineIdx)
 		return bt.pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
-			return logIns(bt.rel, leafBlk, itemBytes)
+			return logIns(bt.rel, leafBlk, offnum, itemBytes)
 		})
 	}
 	bt.pool.MarkDirty(slot)
@@ -2217,7 +2644,14 @@ func (bt *BTree) tryInsertNoSplit(it item) error {
 // The split sequence stamps a high key on the left page BEFORE
 // dropping its latch — readers that descended to it under shared
 // latch will follow the new right-link to find the moved keys.
-func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNumber, it item) error {
+//
+// childBlk (M0130-S11.5b-3) is upstream's `cbuf`: the page one level down whose
+// BTIncompleteSplit flag `it` — a separator being pushed up — finishes.
+// storage.InvalidBlockNumber for a leaf tuple, which is the only other way in.
+// Every internal-page insertion in goopg completes a child split, so this is
+// non-Invalid exactly when the pinned page turns out to be internal; the split
+// path below both clears the flag and logs the child as backup block 3.
+func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNumber, it item, childBlk storage.BlockNumber) error {
 	// Lehman-Yao move-right: `blk` was decided by the caller (a fresh
 	// descendToLeaf under splitMu, or a path[] ancestor recorded before
 	// or during this connection's own split). `bt.splitMu` only
@@ -2248,13 +2682,26 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		}
 		held.hold(slot)
 		op = readOpaque(slot.Page())
-		if itemOvershootsHighKey(op, it.key) {
+		if itemOvershootsHighKey(bt.format(), slot.Page(), op, it.key) {
 			next := op.Next
 			held.release()
 			blk = next
 			continue
 		}
 		break
+	}
+
+	// _bt_findinsertloc's "Check 1/3 of a page restriction" (M0130-S11.4 slice
+	// 3b-3d — the rule that replaced MaxHighKeyLen). insertIntoBlock serves both
+	// levels — a leaf tuple from Insert, a separator from _bt_insert_parent — so
+	// the bound comes from the pinned page: a LEAF tuple is charged the tighter
+	// BTMaxItemSize, which leaves room for the tiebreaker heap TID _bt_truncate
+	// may later append to a separator derived from it, and the pivot that
+	// results is charged the looser bound on the level above. Rejecting here is
+	// what makes every later size argument sound (the split path's pivot check,
+	// the bulk loader's separator reserve).
+	if err := CheckPGBTThirdPage(op.Flags&BTLeaf != 0, MaxAlign(bt.format().bodySize(it.key))); err != nil {
+		return err
 	}
 
 	// Test-only fault injection: fires exactly where insertItemSorted
@@ -2264,7 +2711,7 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		bt.panicBeforeLeafWrite(blk)
 	}
 
-	if pageHasSpaceFor(slot.Page(), it) {
+	if bt.format().pageHasSpaceFor(slot.Page(), it) {
 		lineIdx, err := bt.insertItemSortedVerified("insertIntoBlock-nosplit", blk, slot.Page(), it)
 		if err != nil {
 			// pageHasSpaceFor and PageInsertItemRawAt disagreed
@@ -2283,9 +2730,10 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 			// wired (test helpers, pre-runtime callers).
 			var derr error
 			if logIns := bt.pool.LogBtreeInsert(); logIns != nil {
-				itemBytes := it.marshal()
+				itemBytes := bt.format().marshal(it)
+				offnum := pgPhysOffnum(slot.Page(), lineIdx)
 				derr = bt.pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
-					return logIns(bt.rel, blk, itemBytes)
+					return logIns(bt.rel, blk, offnum, itemBytes)
 				})
 			} else {
 				bt.pool.MarkDirty(slot)
@@ -2315,19 +2763,39 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// rightSlot is already content-locked by pinNewOrRecycled (its
 	// locked-return contract) — no separate Lock() here.
 
-	// The right sibling inherits the original page's high key
-	// (or has none, if this was the rightmost page on its level).
-	rightOpaque := BTPageOpaque{
-		Prev:    blk,
-		Next:    op.Next,
-		Level:   op.Level,
-		Flags:   op.Flags & ^BTRoot, // right sibling is never the root (root stays the original blk during a split, until we lift)
-		HighKey: op.HighKey,
+	// The right sibling inherits the original page's high key (or has none,
+	// if this was the rightmost page on its level). Read it off the LEFT page
+	// before anything is rewritten — after the refill below the left page
+	// carries the NEW separator instead.
+	inheritedHK, inheritedOK, err := PGHighKeyRaw(slot.Page())
+	if err != nil {
+		rightSlot.Unlock()
+		bt.pool.Unpin(rightSlot)
+		held.release()
+		return err
 	}
-	if !op.HasHighKey() {
-		rightOpaque.Flags &^= BTHasHighKey
-	}
+	// The right sibling is never the root (the root stays the original blk
+	// during a split, until we lift), and it does not inherit the split page's
+	// garbage hint: the refill below writes only LIVE items (pageItems skips
+	// dead-marked ones), so the hint would be stale-set from birth.
+	//
+	// M0130-S11.5b pinned this to SplitRightPageOpaque — the header upstream's
+	// split REDO builds — so the page the primary writes and the page a replay
+	// of the same record builds are byte-identical, which is what lets the
+	// split record log this page as content rather than as an image.
+	rightOpaque := SplitRightPageOpaque(op.Level, blk, op.Next)
 	initPage(rightSlot.Page(), rightOpaque)
+	// The high key must land BEFORE any data item: initPage wrote btpo_next,
+	// so the page already reports itself non-rightmost and the data-slot
+	// wrappers are already biased past P_HIKEY.
+	if inheritedOK {
+		if err := pgSetHighKeyRaw(rightSlot.Page(), inheritedHK); err != nil {
+			rightSlot.Unlock()
+			bt.pool.Unpin(rightSlot)
+			held.release()
+			return err
+		}
+	}
 
 	// M-NIGHTLY investigation aid (AI-20260708-064334-001, 6th loop):
 	// snapshot the two checkpoints that matter for localizing a lost
@@ -2339,16 +2807,16 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// compaction — holding a live reference into it would read corrupted
 	// data once dedupConsolidate runs). Zero cost when DebugTraceInserts
 	// is off (traceRewrite no-ops immediately).
-	preLineCount, _ := storage.PageLinePointerCount(slot.Page())
+	preLineCount, _ := PGDataItemCount(slot.Page())
 
-	allItems, err := pageItems(slot.Page())
+	allItems, err := bt.format().pageItems(slot.Page())
 	if err != nil {
 		rightSlot.Unlock()
 		bt.pool.Unpin(rightSlot)
 		held.release()
 		return err
 	}
-	allItems = appendSorted(allItems, it)
+	allItems = appendSorted(bt.format(), allItems, it)
 	var postPageItemsSnap []item
 	if bt.DebugTraceInserts {
 		postPageItemsSnap = append([]item(nil), allItems...)
@@ -2360,19 +2828,23 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// page may fit comfortably in a single leaf after dedup,
 	// avoiding the split entirely. We bail back to the no-split
 	// path if dedup recovers enough space.
-	allItems = dedupConsolidate(allItems)
+	allItems = dedupConsolidate(bt.format(), allItems)
 	var postDedupSnap []item
 	if bt.DebugTraceInserts {
 		postDedupSnap = append([]item(nil), allItems...)
 	}
-	if compactRawSize(allItems) < pageFreeBudget(slot.Page())+pageOccupied(slot.Page()) {
+	// The data budget is the whole payload area LESS the high key, which
+	// resetPageItems re-installs before any data item goes back on (S11.2b:
+	// the separator is a page item now, not opaque-area reserve, so it has to
+	// be paid for out of the same budget).
+	if bt.format().compactRawSize(allItems)+pageHighKeyFootprint(slot.Page()) < pageFreeBudget(slot.Page())+pageOccupied(slot.Page()) {
 		bt.traceRewrite(blk, "dedup-recovery", preLineCount, postPageItemsSnap, postDedupSnap)
 		// Re-attempt no-split insert with the dedup'd content.
 		// Reset the page and write the dedup'd items back, no
 		// split needed. The right-side allocation is rolled back.
 		resetPageItems(slot.Page())
 		for _, x := range allItems {
-			lineIdx := mustInsertItemSorted(slot.Page(), x)
+			lineIdx := mustInsertItemSorted(bt.format(), slot.Page(), x)
 			bt.traceInsert(blk, lineIdx, x)
 		}
 		// Drop the freshly-allocated right slot — split avoided.
@@ -2394,10 +2866,12 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 			writeOpaque(slot.Page(), opAfter)
 		}
 		if logVac := bt.pool.LogBtreeVacuum(); logVac != nil {
-			// A8: the record carries the post-vacuum page as a full-page image,
-			// so pass the mutated page rather than the kept-items projection.
+			// M0130-S11.5c: this rewrite is a dedup CONSOLIDATION, not a
+			// deletion — items merged into posting tuples, so no set of
+			// deleted offset numbers describes it. Pass none and let the
+			// encoder log the page as a full-page image.
 			if err := bt.pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
-				return logVac(bt.rel, blk, slot.Page())
+				return logVac(bt.rel, blk, nil, slot.Page(), nil)
 			}); err != nil {
 				held.release()
 				return err
@@ -2417,35 +2891,56 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// equivalent to count-midpoint; for variable-width keys it
 	// produces balanced halves in bytes (the on-disk metric the
 	// page fill threshold actually cares about).
-	mid := byteAwareSplitLoc(allItems)
+	mid := bt.format().byteAwareSplitLoc(allItems)
 	leftItems := allItems[:mid]
 	rightItems := allItems[mid:]
 
-	// Reset left page to empty, refill.
-	resetPageItems(slot.Page())
-	for _, x := range leftItems {
-		lineIdx := mustInsertItemSorted(slot.Page(), x)
-		bt.traceInsert(blk, lineIdx, x)
+	// _bt_split's separator. On a LEAF split it is `_bt_truncate(lastleft,
+	// firstright)` — the shortest key that still separates the two halves,
+	// with lastleft's heap TID kept as the tiebreaker when no key attribute
+	// distinguishes them (M0130-S11.4 slice 3b-3c). On an INTERNAL split the
+	// first right item is already a truncated pivot from the leaf split that
+	// produced it, and upstream copies it verbatim; truncateSeparator says the
+	// same by returning a pivot operand unchanged.
+	var lastLeft item
+	if len(leftItems) > 0 {
+		lastLeft = leftItems[len(leftItems)-1]
 	}
-	for _, x := range rightItems {
-		lineIdx := mustInsertItemSorted(rightSlot.Page(), x)
-		bt.traceInsert(rightBlk, lineIdx, x)
-	}
-
-	// Stamp the new high key onto the left page: left now covers
-	// keys ≤ HighKey, the rest live on rightBlk via the
-	// right-link. This is the Lehman-Yao invariant readers rely on.
-	op.Next = rightBlk
-	op.Flags |= BTHasHighKey
-	sepKey := rightItems[0].key
-	if len(sepKey) > MaxHighKeyLen {
+	sepKey := bt.format().truncateSeparator(lastLeft, rightItems[0])
+	// _bt_check_third_page on the resulting PIVOT (3b-3d). The separator lands
+	// on this page at P_HIKEY and a copy of it lands on the parent, so it is
+	// charged the internal-level bound — the looser one, which exists exactly to
+	// absorb the tiebreaker heap TID truncateSeparator may have just appended.
+	// Unreachable unless a leaf item slipped past insertIntoBlock's own gate.
+	if err := CheckPGBTThirdPage(false, MaxAlign(bt.format().bodySize(sepKey))); err != nil {
 		rightSlot.Unlock()
 		bt.pool.Unpin(rightSlot)
 		held.release()
-		return fmt.Errorf("btree: separator key length %d exceeds MaxHighKeyLen %d",
-			len(sepKey), MaxHighKeyLen)
+		return err
 	}
-	op.HighKey = append([]byte(nil), sepKey...)
+
+	// Reset left page to empty, then — BEFORE any data item goes back on —
+	// stamp the right-link and the new high key: left now covers keys ≤
+	// sepKey, the rest live on rightBlk via the right-link (the Lehman-Yao
+	// invariant readers rely on). Order is load-bearing since S11.2b: the
+	// data-slot wrappers derive P_FIRSTDATAKEY from the page's own btpo_next,
+	// so refilling first and relinking afterwards would write every item one
+	// slot to the left of where the finished page says its data begins.
+	// M0130-S11.5b-2: the split record describes the left half as a cut of the
+	// PRE-SPLIT page with the new item spliced in, so the encoder needs that
+	// page — this is the last moment it exists. Copied only when a record will
+	// actually be emitted; the encoder falls back to a full-page image (and
+	// ignores both of these) whenever the description cannot reproduce the page
+	// this rewrite is about to write.
+	var prePage storage.Page
+	var newItemRaw []byte
+	if bt.logSplit != nil {
+		prePage = append(storage.Page(nil), slot.Page()...)
+		newItemRaw = bt.format().marshal(it)
+	}
+
+	resetPageItems(slot.Page())
+	op.Next = rightBlk
 	// M0055-0004-followup-finish-split: mark the LEFT page as
 	// incomplete-split before releasing latches. Cleared after
 	// the parent downlink insert succeeds. Crash-replay leaves
@@ -2454,6 +2949,21 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// resume guarantee).
 	op.Flags |= BTIncompleteSplit
 	writeOpaque(slot.Page(), op)
+	if err := pgSetHighKeyRaw(slot.Page(), bt.format().marshal(highKeyItem(sepKey))); err != nil {
+		rightSlot.Unlock()
+		bt.pool.Unpin(rightSlot)
+		held.release()
+		return err
+	}
+
+	for _, x := range leftItems {
+		lineIdx := mustInsertItemSorted(bt.format(), slot.Page(), x)
+		bt.traceInsert(blk, lineIdx, x)
+	}
+	for _, x := range rightItems {
+		lineIdx := mustInsertItemSorted(bt.format(), rightSlot.Page(), x)
+		bt.traceInsert(rightBlk, lineIdx, x)
+	}
 
 	// Non-rightmost split: the page that was left's right sibling
 	// still has btpo_prev pointing at the left block. Relink it to
@@ -2481,6 +2991,35 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		writeOpaque(sibSlot.Page(), sibOp)
 	}
 
+	// M0130-S11.5b-3: an INTERNAL split is always finishing a split one level
+	// down, so upstream's `_bt_split` clears that child's BTP_INCOMPLETE_SPLIT
+	// inside the same critical section and logs the child as backup block 3.
+	// goopg used to leave the clear to the caller's `clearIncompleteSplit`
+	// after the parent insert returned — a separate record, and none at all
+	// from a real PG standby's point of view, which PANICs when
+	// `btree_xlog_split`'s `_bt_clear_incomplete_split(record, 3)` finds block
+	// 3 unregistered. Do it here instead; the caller's later call sees the flag
+	// already clear and becomes a no-op. Pinning a lower-level page while
+	// holding this level's latches is the DESCENT direction, which is why it
+	// cannot deadlock against a concurrent reader (and the whole split path is
+	// serialised by splitMu within this *BTree anyway).
+	var childSlot *storage.Slot
+	if childBlk != storage.InvalidBlockNumber {
+		childSlot, err = bt.pinW(childBlk)
+		if err != nil {
+			if sibSlot != nil {
+				bt.unpinW(sibSlot)
+			}
+			rightSlot.Unlock()
+			bt.pool.Unpin(rightSlot)
+			held.release()
+			return fmt.Errorf("btree: pin incomplete-split child %d: %w", childBlk, err)
+		}
+		childOp := readOpaque(childSlot.Page())
+		childOp.Flags &^= BTIncompleteSplit
+		writeOpaque(childSlot.Page(), childOp)
+	}
+
 	// Atomic split WAL record (Landing 3a). When a writer is
 	// available, emit ONE record covering both pages (plus the
 	// relinked old right sibling on a non-rightmost split) and stamp
@@ -2497,8 +3036,11 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		if sibSlot != nil {
 			sibPage = sibSlot.Page()
 		}
-		lsn, lerr := bt.logSplit(bt.rel, blk, rightBlk, slot.Page(), rightSlot.Page(), sibBlk, sibPage)
+		lsn, lerr := bt.logSplit(bt.rel, blk, rightBlk, prePage, slot.Page(), rightSlot.Page(), newItemRaw, sibBlk, sibPage, childBlk)
 		if lerr != nil {
+			if childSlot != nil {
+				bt.unpinW(childSlot)
+			}
 			if sibSlot != nil {
 				bt.unpinW(sibSlot)
 			}
@@ -2512,23 +3054,33 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		if sibSlot != nil {
 			bt.pool.MarkDirtyWithLSNLocked(sibSlot, lsn)
 		}
+		if childSlot != nil {
+			bt.pool.MarkDirtyWithLSNLocked(childSlot, lsn)
+		}
 	} else {
 		bt.pool.MarkDirty(slot)
 		bt.pool.MarkDirty(rightSlot)
 		if sibSlot != nil {
 			bt.pool.MarkDirty(sibSlot)
 		}
+		if childSlot != nil {
+			bt.pool.MarkDirty(childSlot)
+		}
+	}
+	if childSlot != nil {
+		bt.unpinW(childSlot)
 	}
 	if sibSlot != nil {
 		bt.unpinW(sibSlot)
 	}
 
-	// The separator key going up is the smallest key in the right page.
-	sepItem := item{
-		keyLen: rightItems[0].keyLen,
-		ptr:    storage.ItemPointer{Block: rightBlk, Offset: 0},
-		key:    append([]byte(nil), rightItems[0].key...),
-	}
+	// The separator going up is the one just installed as the left page's high
+	// key, NOT the first right key again: upstream's `_bt_insert_parent` builds
+	// the parent's new item from the left page's high key for exactly this
+	// reason (nbtinsert.c). Since 3b-3c that key is truncated, and a parent
+	// downlink that re-stated the untruncated key would route descents to a
+	// boundary the level below no longer draws.
+	sepItem := downlinkItem(append([]byte(nil), sepKey...), rightBlk)
 
 	rightSlot.Unlock()
 	bt.pool.Unpin(rightSlot)
@@ -2551,11 +3103,13 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// Otherwise, insert the separator into the parent.
 	parentBlk := path[len(path)-1]
 	parentPath := path[:len(path)-1]
-	if err := bt.insertIntoBlock(parentBlk, parentPath, sepItem); err != nil {
+	if err := bt.insertIntoBlock(parentBlk, parentPath, sepItem, blk); err != nil {
 		return err
 	}
 	// Parent insert succeeded — clear the INCOMPLETE_SPLIT flag
-	// on the left page. (M0055-0004-followup.)
+	// on the left page. (M0055-0004-followup.) A cascading parent SPLIT has
+	// already cleared it under its own record (S11.5b-3), in which case this
+	// is a no-op; the parent's no-split path still leaves it to us.
 	return bt.clearIncompleteSplit(blk)
 }
 
@@ -2564,12 +3118,20 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 // a successful split sequence (parent downlink inserted), and
 // by `finishSplit` when a writer / vacuum encounters a stale
 // incomplete-split marker from a crashed prior run.
+// Since M0130-S11.5b-3 a cascading parent SPLIT clears the flag itself (under
+// the split record, as _bt_split does), so this is frequently reached with the
+// flag already clear; it then returns without writing or logging anything
+// rather than emitting a redundant page record.
 func (bt *BTree) clearIncompleteSplit(blk storage.BlockNumber) error {
 	slot, err := bt.pinW(blk)
 	if err != nil {
 		return err
 	}
 	op := readOpaque(slot.Page())
+	if op.Flags&BTIncompleteSplit == 0 {
+		bt.unpinW(slot)
+		return nil
+	}
 	op.Flags &^= BTIncompleteSplit
 	writeOpaque(slot.Page(), op)
 	err = bt.markDirtyWithPageRecord(slot, blk)
@@ -2634,9 +3196,15 @@ func (bt *BTree) finishSplit(blk storage.BlockNumber) error {
 	}
 	// Read the high key + Next to reconstruct the separator
 	// item that the original split was about to push up.
-	if !op.HasHighKey() || op.Next == storage.InvalidBlockNumber {
-		// Defensive: malformed half-state. Clear the flag and
-		// hope the parent caught up via some other path.
+	hk, hasHK, hkErr := bt.format().pageHighKey(slot.Page())
+	if hkErr != nil {
+		bt.unpinW(slot)
+		return hkErr
+	}
+	if !hasHK {
+		// Defensive: malformed half-state (btpo_next says rightmost, so
+		// there is no separator to push up). Clear the flag and hope the
+		// parent caught up via some other path.
 		op.Flags &^= BTIncompleteSplit
 		writeOpaque(slot.Page(), op)
 		bt.markDirtyWithPageRecord(slot, blk)
@@ -2644,7 +3212,7 @@ func (bt *BTree) finishSplit(blk storage.BlockNumber) error {
 		return nil
 	}
 	rightBlk := op.Next
-	sepKey := append([]byte(nil), op.HighKey...)
+	sepKey := append([]byte(nil), hk...)
 	bt.unpinW(slot)
 
 	// Walk to the parent and insert the separator. We descend by
@@ -2662,12 +3230,8 @@ func (bt *BTree) finishSplit(blk storage.BlockNumber) error {
 	}
 	parentBlk := path[len(path)-1]
 	parentPath := path[:len(path)-1]
-	sepItem := item{
-		keyLen: uint16(len(sepKey)),
-		ptr:    storage.ItemPointer{Block: rightBlk, Offset: 0},
-		key:    sepKey,
-	}
-	if err := bt.insertIntoBlock(parentBlk, parentPath, sepItem); err != nil {
+	sepItem := downlinkItem(sepKey, rightBlk)
+	if err := bt.insertIntoBlock(parentBlk, parentPath, sepItem, blk); err != nil {
 		return err
 	}
 	return bt.clearIncompleteSplit(blk)
@@ -2689,29 +3253,11 @@ func (bt *BTree) clearRootFlag(blk storage.BlockNumber) error {
 	return nil
 }
 
-// ApplyInsertRecord re-runs one B-tree non-split insert against
-// the given page bytes during WAL replay (see
-// docs/design/0002-0003-redo-records.md). The raw item is the
-// same payload the writer emitted (item.marshal output: keyLen +
-// ptr.block + ptr.offset + key). The page must already be a
-// valid initialised B-tree page; replay never creates a fresh
-// btree page from a logical insert (a split record handles that
-// case).
-//
-// Idempotency is the caller's responsibility: WAL recovery
-// compares page pd_lsn against the record's end-LSN before
-// invoking this. The function is "apply unconditionally".
-func ApplyInsertRecord(page storage.Page, raw []byte) error {
-	it, err := parseItem(raw)
-	if err != nil {
-		return err
-	}
-	if !pageHasSpaceFor(page, it) {
-		return fmt.Errorf("btree: replay of insert: page has no space for keyLen=%d", it.keyLen)
-	}
-	mustInsertItemSorted(page, it)
-	return nil
-}
+// (M0130-S11.4 slice 3b-2c-ii-B2-b-ii removed the by-key insert replay that
+// used to live here — see ApplyInsertRecordAt in replay.go, which places the
+// recorded bytes at the recorded offset number and therefore needs neither the
+// index's key format nor its comparison semantics. See
+// docs/design/0002-0003-redo-records.md.)
 
 func (bt *BTree) createNewRoot(leftBlk, rightBlk storage.BlockNumber, rightKey []byte, level uint32) error {
 	// M0055-0004-followup-stage2-splitmu-removal (race-safe
@@ -2733,11 +3279,7 @@ func (bt *BTree) createNewRoot(leftBlk, rightBlk storage.BlockNumber, rightKey [
 		// already lifted a new root above `leftBlk`. Insert our
 		// separator into the current root through the regular
 		// path.
-		sepItem := item{
-			keyLen: uint16(len(rightKey)),
-			ptr:    storage.ItemPointer{Block: rightBlk, Offset: 0},
-			key:    append([]byte(nil), rightKey...),
-		}
+		sepItem := downlinkItem(append([]byte(nil), rightKey...), rightBlk)
 		_, parentPath, err := bt.descendToLeaf(rightKey)
 		if err != nil {
 			return err
@@ -2748,7 +3290,7 @@ func (bt *BTree) createNewRoot(leftBlk, rightBlk storage.BlockNumber, rightKey [
 			// latest state.
 			return bt.createNewRoot(leftBlk, rightBlk, rightKey, level)
 		}
-		return bt.insertIntoBlock(parentPath[0], parentPath[:0], sepItem)
+		return bt.insertIntoBlock(parentPath[0], parentPath[:0], sepItem, leftBlk)
 	}
 
 	rootSlot, rootBlk, err := bt.pool.PinNew(bt.rel)
@@ -2764,18 +3306,10 @@ func (bt *BTree) createNewRoot(leftBlk, rightBlk storage.BlockNumber, rightKey [
 	})
 
 	// Leftmost internal item: empty key, pointer to leftBlk.
-	leftItem := item{
-		keyLen: 0,
-		ptr:    storage.ItemPointer{Block: leftBlk, Offset: 0},
-		key:    nil,
-	}
-	rightItem := item{
-		keyLen: uint16(len(rightKey)),
-		ptr:    storage.ItemPointer{Block: rightBlk, Offset: 0},
-		key:    append([]byte(nil), rightKey...),
-	}
-	mustInsertItemSorted(rootSlot.Page(), leftItem)
-	mustInsertItemSorted(rootSlot.Page(), rightItem)
+	leftItem := downlinkItem(nil, leftBlk)
+	rightItem := downlinkItem(append([]byte(nil), rightKey...), rightBlk)
+	mustInsertItemSorted(bt.format(), rootSlot.Page(), leftItem)
+	mustInsertItemSorted(bt.format(), rootSlot.Page(), rightItem)
 
 	// M0079-0004 / A8: emit a single PG RM_BTREE new-root record covering
 	// both the new root page (backup block 0) and the updated metapage
@@ -2793,13 +3327,15 @@ func (bt *BTree) createNewRoot(leftBlk, rightBlk storage.BlockNumber, rightKey [
 			bt.pool.Unpin(rootSlot)
 			return err
 		}
-		m := parseMeta(metaSlot.Page())
+		m := ReadPGMetaPage(metaSlot.Page())
 		m.Root = rootBlk
 		m.Level = level
 		m.FastRoot = rootBlk
 		m.FastLevel = level
-		writeMeta(metaSlot.Page(), m)
-		lsn, err := emitter(bt.rel, rootBlk, rootSlot.Page(), MetaBlock, metaSlot.Page())
+		WritePGMetaPage(metaSlot.Page(), m)
+		// leftBlk is upstream's backup block 1: the child whose
+		// incomplete-split flag redo clears (_bt_newroot registers `lbuf`).
+		lsn, err := emitter(bt.rel, rootBlk, rootSlot.Page(), leftBlk, MetaBlock, metaSlot.Page())
 		if err != nil {
 			bt.unpinW(metaSlot)
 			rootSlot.Unlock()
@@ -2824,23 +3360,9 @@ func (bt *BTree) createNewRoot(leftBlk, rightBlk storage.BlockNumber, rightKey [
 	return bt.updateRootMeta(rootBlk, level)
 }
 
-// itemEncodedSize returns the number of bytes the raw item occupies on a page,
-// including the line-pointer ItemID (4 bytes) and the prefix+key body.
-// This is the single source of truth for the budget both pageHasSpaceFor and
-// PageInsertItemRawAt depend on — they were once computed from different
-// expressions and a mismatch at a nearly-full leaf triggered the
-// "not enough free space in page" panic (root-0040).
-func itemEncodedSize(it item) int {
-	const itemIDSize = 4 // matches storage.itemIDSize
-	return itemIDSize + itemPrefixSize + len(it.key)
-}
-
-// pageHasSpaceFor reports whether `it` would fit on `p` if appended.
-func pageHasSpaceFor(p storage.Page, it item) bool {
-	h := storage.MustHeader(p)
-	free := int(h.Upper()) - int(h.Lower())
-	return free >= itemEncodedSize(it)
-}
+// itemEncodedSize / pageHasSpaceFor moved onto indexFormat in M0130-S11.4
+// slice 3b-2c-ii-B1 (pgitemcodec.go): what an item costs on a page depends on
+// whether its key carries its own tuple header, which is a per-index property.
 
 // insertItemSorted (M0055-0002 Phase A) writes `it` into its
 // sorted position on the page WITHOUT decoding and re-encoding
@@ -2860,8 +3382,8 @@ func pageHasSpaceFor(p storage.Page, it item) bool {
 // via pageHasSpaceFor should use mustInsertItemSorted; callers on the
 // no-split fast path should route storage.ErrNoSpaceInPage to the split
 // path instead of panicking (root-0040).
-func insertItemSorted(p storage.Page, it item) (int, error) {
-	count, err := storage.PageLinePointerCount(p)
+func insertItemSorted(f indexFormat, p storage.Page, it item) (int, error) {
+	count, err := PGDataItemCount(p)
 	if err != nil {
 		panic(err)
 	}
@@ -2871,11 +3393,11 @@ func insertItemSorted(p storage.Page, it item) (int, error) {
 	lo, hi := 0, count
 	for lo < hi {
 		mid := (lo + hi) >> 1
-		midItem, err := readPageItem(p, mid)
+		midItem, err := f.readPageItem(p, mid)
 		if err != nil {
 			panic(err)
 		}
-		if CompareKeys(midItem.key, it.key) < 0 {
+		if f.compare(midItem.key, it.key) < 0 {
 			lo = mid + 1
 		} else {
 			hi = mid
@@ -2886,10 +3408,10 @@ func insertItemSorted(p storage.Page, it item) (int, error) {
 	// accumulates over many duplicate inserts. The pre-split
 	// dedup compaction variant — see `dedupPageBeforeSplit` —
 	// is the safer landing for steady-state dedup retention.)
-	raw := it.marshal()
+	raw := f.marshal(it)
 	// PageInsertItemRawAt is 1-based, line-pointer index lo is
 	// 0-based; convert.
-	if _, err := storage.PageInsertItemRawAt(p, uint16(lo+1), raw); err != nil {
+	if _, err := pgInsertItemRawAt(p, uint16(lo+1), raw); err != nil {
 		return 0, err
 	}
 	return lo, nil
@@ -2900,8 +3422,8 @@ func insertItemSorted(p storage.Page, it item) (int, error) {
 // createNewRoot, WAL replay). A panic here means the space estimate and
 // the real insert logic have diverged — a logic bug, not a runtime
 // condition.
-func mustInsertItemSorted(p storage.Page, it item) int {
-	idx, err := insertItemSorted(p, it)
+func mustInsertItemSorted(f indexFormat, p storage.Page, it item) int {
+	idx, err := insertItemSorted(f, p, it)
 	if err != nil {
 		panic(err)
 	}
@@ -2948,15 +3470,15 @@ func (bt *BTree) tryInsertOnCachedRightmost(blk storage.BlockNumber, it item) (b
 	// ranges, the cache may point at a leaf that's rightmost
 	// for one writer's range but irrelevant for another's;
 	// fall back to the descent path in that case.
-	count, perr := storage.PageLinePointerCount(slot.Page())
+	count, perr := PGDataItemCount(slot.Page())
 	if perr == nil && count > 0 {
-		first, ferr := readPageItem(slot.Page(), 0)
-		if ferr == nil && CompareKeys(it.key, first.key) < 0 {
+		first, ferr := bt.format().readPageItem(slot.Page(), 0)
+		if ferr == nil && bt.format().compare(it.key, first.key) < 0 {
 			bt.unpinW(slot)
 			return false, nil
 		}
 	}
-	if !pageHasSpaceFor(slot.Page(), it) {
+	if !bt.format().pageHasSpaceFor(slot.Page(), it) {
 		bt.unpinW(slot)
 		return false, nil
 	}
@@ -2967,9 +3489,10 @@ func (bt *BTree) tryInsertOnCachedRightmost(blk storage.BlockNumber, it item) (b
 	}
 	bt.traceInsert(blk, lineIdx, it)
 	if logIns := bt.pool.LogBtreeInsert(); logIns != nil {
-		itemBytes := it.marshal()
+		itemBytes := bt.format().marshal(it)
+		offnum := pgPhysOffnum(slot.Page(), lineIdx)
 		err := bt.pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
-			return logIns(bt.rel, blk, itemBytes)
+			return logIns(bt.rel, blk, offnum, itemBytes)
 		})
 		bt.unpinW(slot)
 		return true, err
@@ -3005,7 +3528,7 @@ func (bt *BTree) tryInsertOnCachedRightmost(blk storage.BlockNumber, it item) (b
 // from the expanded list. That alone bounds duplicate-heavy
 // workloads where the same heap tuple shows up multiple times
 // in the bulk-build's input.
-func dedupConsolidate(items []item) []item {
+func dedupConsolidate(f indexFormat, items []item) []item {
 	if len(items) <= 1 {
 		return items
 	}
@@ -3016,7 +3539,7 @@ func dedupConsolidate(items []item) []item {
 			continue
 		}
 		prev := out[len(out)-1]
-		if CompareKeys(prev.key, it.key) == 0 && prev.ptr == it.ptr {
+		if f.compare(prev.key, it.key) == 0 && prev.ptr == it.ptr {
 			// Exact duplicate — drop.
 			continue
 		}
@@ -3029,10 +3552,10 @@ func dedupConsolidate(items []item) []item {
 // size of every item in `items` plus the per-item line-pointer
 // overhead. Used to decide whether dedup recovered enough space
 // to skip the split.
-func compactRawSize(items []item) int {
+func (f indexFormat) compactRawSize(items []item) int {
 	total := 0
 	for _, it := range items {
-		total += itemEncodedSize(it)
+		total += f.itemEncodedSize(it)
 	}
 	return total
 }
@@ -3045,6 +3568,21 @@ func pageFreeBudget(p storage.Page) int {
 		return 0
 	}
 	return int(h.Upper()) - int(h.Lower())
+}
+
+// pageHighKeyFootprint is the number of payload bytes the page's separator
+// occupies (line pointer + item body), or 0 on a rightmost page. Whole-page
+// rewrite paths must subtract it from the data budget: the separator survives
+// resetPageItems, so it is not free space even though it is not a data item.
+func pageHighKeyFootprint(p storage.Page) int {
+	raw, ok, err := PGHighKeyRaw(p)
+	if err != nil || !ok {
+		return 0
+	}
+	const itemIDSize = 4 // matches storage.itemIDSize
+	// MAXALIGNed, matching what PageAddItemRaw will actually allocate when the
+	// separator is re-added by a whole-page rewrite (M0130-S11.4 3b-3a).
+	return itemIDSize + MaxAlign(len(raw))
 }
 
 // pageOccupied returns the bytes already used by line pointers
@@ -3071,18 +3609,18 @@ func pageOccupied(p storage.Page) int {
 // item) and the maximum is len(items)-1 so the right side is
 // non-empty. A degenerate single-item input returns 1 (caller
 // guarantees ≥ 2 items because we're splitting a full page).
-func byteAwareSplitLoc(items []item) int {
+func (f indexFormat) byteAwareSplitLoc(items []item) int {
 	if len(items) <= 2 {
 		return 1
 	}
 	total := 0
 	sizes := make([]int, len(items))
 	for i, it := range items {
-		// 8-byte fixed prefix + variable-length key (per
+		// 8-byte IndexTupleData header + variable-length key (per
 		// `(item).marshal()` layout). We use the encoded size
 		// rather than just key length so the metric matches the
 		// on-page footprint.
-		sizes[i] = 8 + len(it.key)
+		sizes[i] = SizeOfIndexTupleData + len(it.key)
 		total += sizes[i]
 	}
 	half := total / 2
@@ -3115,16 +3653,16 @@ func byteAwareSplitLoc(items []item) int {
 // (M0047-0003) it returns the FIRST tid bundled in the posting
 // — that's enough for the binary search since all posting tids
 // share the same key.
-func readPageItem(p storage.Page, idx int) (item, error) {
+func (f indexFormat) readPageItem(p storage.Page, idx int) (item, error) {
 	// C3-S1: AllowDead — this is a binary-search ordering probe; Dead
 	// items retain valid key bytes until purged, and result filtering
 	// happens at the caller's visibility layer.
-	raw, err := storage.PageGetItemRawAllowDead(p, uint16(idx+1))
+	raw, err := pgGetItemRawAllowDead(p, uint16(idx+1))
 	if err != nil {
 		return item{}, err
 	}
 	if isPostingRaw(raw) {
-		key, tids, perr := parsePostingRaw(raw)
+		key, tids, perr := f.parsePostingRaw(raw)
 		if perr != nil {
 			maybeDumpPageOnParseErr(p, "readPageItem: parsePostingRaw")
 			return item{}, perr
@@ -3133,18 +3671,21 @@ func readPageItem(p storage.Page, idx int) (item, error) {
 		if len(tids) > 0 {
 			ptr = tids[0]
 		}
-		return item{keyLen: uint16(len(key)), ptr: ptr, key: key}, nil
+		// The parsed key already names tids[0] in the tuple format, so the
+		// item is self-consistent: this is the posting's FIRST entry, which is
+		// what an ordering probe against the run wants.
+		return item{ptr: ptr, key: key}, nil
 	}
-	it, perr := parseItem(raw)
+	it, perr := f.parse(raw)
 	if perr != nil {
 		maybeDumpPageOnParseErr(p, "readPageItem: parseItem")
 	}
 	return it, perr
 }
 
-func appendSorted(items []item, it item) []item {
+func appendSorted(f indexFormat, items []item, it item) []item {
 	idx := sort.Search(len(items), func(i int) bool {
-		return CompareKeys(items[i].key, it.key) >= 0
+		return f.compare(items[i].key, it.key) >= 0
 	})
 	out := make([]item, len(items)+1)
 	copy(out[:idx], items[:idx])
@@ -3153,15 +3694,33 @@ func appendSorted(items []item, it item) []item {
 	return out
 }
 
-// resetPageItems clears the page's tuple region and line-pointer array
-// while keeping the opaque area intact.
+// resetPageItems clears the page's DATA items while keeping the opaque area
+// and the high key intact.
+//
+// Preserving the high key is not a convenience: since S11.2b the high key is a
+// page item at P_HIKEY, and a non-rightmost page that has lost it is
+// structurally invalid — P_FIRSTDATAKEY still says data starts at offset 2, so
+// the first refilled item would be written into a slot that does not exist yet.
+// Every caller (the split and dedup-recovery rewrites, the VACUUM kept-items
+// rewrites, WAL replay) rewrites only the data items, so re-installing the
+// separator here is exactly right; the split path overwrites it immediately
+// afterwards with the new separator.
 func resetPageItems(p storage.Page) {
+	hk, hasHK, err := PGHighKeyRaw(p)
+	if err != nil {
+		panic(err)
+	}
 	h := storage.MustHeader(p)
 	h.SetLower(uint16(storage.SizeOfPageHeaderData))
 	h.SetUpper(uint16(btSpecialOffset))
 	// Zero the in-between bytes for cleanliness; not strictly required.
 	for i := storage.SizeOfPageHeaderData; i < btSpecialOffset; i++ {
 		p[i] = 0
+	}
+	if hasHK {
+		if err := pgSetHighKeyRaw(p, hk); err != nil {
+			panic(err)
+		}
 	}
 }
 
@@ -3185,21 +3744,50 @@ func (bt *BTree) Search(key []byte) (storage.ItemPointer, bool, error) {
 			return storage.ItemPointer{}, false, err
 		}
 		op := readOpaque(slot.Page())
-		if keyExceedsHighKey(op, key) {
+		if keyExceedsHighKey(bt.format(), slot.Page(), key) {
 			next := op.Next
 			bt.unpinR(slot)
 			cur = next
 			continue
 		}
-		items, err := pageItems(slot.Page())
+		items, err := bt.format().pageItems(slot.Page())
 		bt.unpinR(slot)
 		if err != nil {
 			return storage.ItemPointer{}, false, err
 		}
 		idx := sort.Search(len(items), func(i int) bool {
-			return CompareKeys(items[i].key, key) >= 0
+			return bt.format().compare(items[i].key, key) >= 0
 		})
-		if idx >= len(items) || CompareKeys(items[idx].key, key) != 0 {
+		if idx >= len(items) {
+			// M0130-S11.4 slice 3b-2c-ii-B2-c (the flip): the probe can sort
+			// before every entry on this page and still have its matches on the
+			// next one. Under the blob format that was unreachable — a probe key
+			// and an entry key for the same value are the SAME bytes, so descent
+			// landed on the page the group starts on. Under the tuple format the
+			// probe carries the zero heap TID (minus infinity in the
+			// heapkeyspace tiebreak) while the entry carries the row's real one,
+			// so a group beginning exactly at a page boundary sits one page to
+			// the right of where the probe descends. Upstream has the same shape
+			// and answers it the same way: `_bt_binsrch` returns an offset past
+			// the end and `_bt_first` steps right (`_bt_stepright`, nbtsearch.c).
+			// This terminates for the usual reason a right-walk does: the first
+			// item on the next page is >= the probe, so the next iteration
+			// either matches or reports absence.
+			if op.Next == storage.InvalidBlockNumber {
+				return storage.ItemPointer{}, false, nil
+			}
+			cur = op.Next
+			continue
+		}
+		// compareKeyAttrs, not compare: `Search` asks "is there an entry with
+		// these key attributes?", and under the tuple format `compare` also
+		// weighs the heap TID, which a search key never carries — full-key
+		// equality against a real entry is then impossible by construction and
+		// every unique-index probe would report "no such key". This is the
+		// grouping question B2-c-vi named, asked at the scan's front door.
+		// Identical to the old test under the blob format, where both are
+		// `CompareKeys`.
+		if bt.format().compareKeyAttrs(items[idx].key, key) != 0 {
 			return storage.ItemPointer{}, false, nil
 		}
 		return items[idx].ptr, true, nil
@@ -3277,9 +3865,9 @@ func (bt *BTree) rangeScanPos(lo, hi []byte, fn func(key []byte, ptr storage.Ite
 		// have returned a leaf that has since been split. Skip
 		// rightward until we land on a page whose key range
 		// covers `lo` (or we run out of pages).
-		// When lo is nil, keyExceedsHighKey(op, nil) is always false
+		// When lo is nil, keyExceedsHighKey(page, nil) is always false
 		// (nil compares less than any real key), so we never skip — correct.
-		if lo != nil && keyExceedsHighKey(op, lo) {
+		if lo != nil && keyExceedsHighKey(bt.format(), slot.Page(), lo) {
 			next := op.Next
 			bt.unpinR(slot)
 			cur = next
@@ -3293,7 +3881,7 @@ func (bt *BTree) rangeScanPos(lo, hi []byte, fn func(key []byte, ptr storage.Ite
 		// allocations in the select-only pprof. All current
 		// callers are CAT-1 (see contract above); none retain
 		// key beyond fn, none re-enter the btree.
-		count, countErr := storage.PageLinePointerCount(slot.Page())
+		count, countErr := PGDataItemCount(slot.Page())
 		pageLSN := storage.MustHeader(slot.Page()).LSN()
 		nextBlk := op.Next
 		stop := false
@@ -3304,7 +3892,7 @@ func (bt *BTree) rangeScanPos(lo, hi []byte, fn func(key []byte, ptr storage.Ite
 				// M0091-0002: NoCopy aliases the still-pinned
 				// page; we never retain it past `fn`'s return,
 				// and the pin is held across this whole loop.
-				r, rawErr := storage.PageGetItemRawNoCopy(slot.Page(), s)
+				r, rawErr := pgGetItemRawNoCopy(slot.Page(), s)
 				if rawErr != nil {
 					// Includes ItemIDDead slots (ErrUnsupportedItem):
 					// C3-S1 — dead entries are invisible to scans.
@@ -3316,14 +3904,18 @@ func (bt *BTree) rangeScanPos(lo, hi []byte, fn func(key []byte, ptr storage.Ite
 					// Out-of-scope for M0091; pgbench pkey is
 					// non-posting so this branch doesn't fire
 					// in the target workload.
-					key, tids, perr := parsePostingRaw(r)
+					key, tids, perr := bt.format().parsePostingRaw(r)
 					if perr != nil {
 						continue
 					}
-					if lo != nil && CompareKeys(key, lo) < 0 {
+					if lo != nil && bt.format().compare(key, lo) < 0 {
 						continue
 					}
-					if hi != nil && CompareKeys(key, hi) > 0 {
+					// compareHigh, not compare: a bound naming only a prefix of
+					// the key attributes is PLUS infinity beyond them (see
+					// pgkeycmp.go, slice 3b-2c-ii-B2-c-i). Identical to compare
+					// for the blob format.
+					if hi != nil && bt.format().compareHigh(key, hi) > 0 {
 						stop = true
 						break slotLoop
 					}
@@ -3342,14 +3934,15 @@ func (bt *BTree) rangeScanPos(lo, hi []byte, fn func(key []byte, ptr storage.Ite
 				} else {
 					// M0091-0002: parseItemNoCopy aliases the
 					// page; key MUST NOT be retained by fn.
-					it, perr := parseItemNoCopy(r)
+					it, perr := bt.format().parseNoCopy(r)
 					if perr != nil {
 						continue
 					}
-					if lo != nil && CompareKeys(it.key, lo) < 0 {
+					if lo != nil && bt.format().compare(it.key, lo) < 0 {
 						continue
 					}
-					if hi != nil && CompareKeys(it.key, hi) > 0 {
+					// compareHigh: see the posting branch above.
+					if hi != nil && bt.format().compareHigh(it.key, hi) > 0 {
 						stop = true
 						break slotLoop
 					}

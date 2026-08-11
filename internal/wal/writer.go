@@ -393,6 +393,15 @@ type Writer struct {
 	// sharded stats.Counter) because fsyncs are already serialised through
 	// group commit, unlike per-buffer read/write/extend ops.
 	sharedFsyncTimeNanos atomic.Int64
+
+	// walRecords counts the lifetime number of WAL records appended
+	// (incremented once per successful Append call). walBytes counts
+	// the lifetime total bytes written to WAL (record payload size,
+	// not including the xlog record header). Both back EXPLAIN (WAL)
+	// output (M0122-0003). Plain atomic.Int64 because the per-stripe
+	// locks serialise the counter bumps within Append already.
+	walRecords atomic.Int64
+	walBytes   atomic.Int64
 }
 
 type state struct {
@@ -631,6 +640,17 @@ func (w *Writer) SetWalWriterFlushAfter(bytes int64) { w.walWriterFlushAfter.Sto
 // headers it must skip.
 func (w *Writer) PageHeadersEnabled() bool { return w.pageHeaders }
 
+// TimelineID returns the WAL writer's current timeline ID (M0130-S8).
+// This is the TLI stamped into new segment filenames and WAL page headers.
+// The TLI is set at construction from Config.TimelineID and is immutable
+// for the lifetime of the Writer — no locking needed.
+func (w *Writer) TimelineID() uint32 {
+	if w.stateRef == nil {
+		return 1
+	}
+	return w.stateRef.tli
+}
+
 // Format returns the active on-disk WAL format the writer is
 // emitting. Mirrors the Config.PageHeaders flag the writer was
 // constructed with — static for the lifetime of the Writer.
@@ -749,6 +769,18 @@ func (w *Writer) PreallocatedBytes() int64 {
 	return w.walBufferCounters.preallocatedBytes.Sum()
 }
 
+// WalRecords returns the lifetime total WAL records appended.
+// Atomic load; backs EXPLAIN (WAL) output (M0122-0003).
+func (w *Writer) WalRecords() int64 {
+	return w.walRecords.Load()
+}
+
+// WalBytes returns the lifetime total WAL record payload bytes appended.
+// Atomic load; backs EXPLAIN (WAL) output (M0122-0003).
+func (w *Writer) WalBytes() int64 {
+	return w.walBytes.Load()
+}
+
 // WrittenLSN returns the LSN of the last byte the writer has
 // appended (durable or not). Cheap and lock-free; suitable for
 // the checkpointer's max_wal_size trigger.
@@ -842,6 +874,10 @@ func (w *Writer) Append(payload []byte) (uint64, uint64, error) {
 	// the buffer overflows.
 	if st := w.stateRef; st != nil && st.walBuf != nil {
 		if start, end, ok, err := st.tryAppend(payload); ok {
+			if err == nil {
+				w.walRecords.Add(1)
+				w.walBytes.Add(int64(len(payload)))
+			}
 			return start, end, err
 		}
 	}
@@ -865,8 +901,12 @@ func (w *Writer) Append(payload []byte) (uint64, uint64, error) {
 	default:
 	}
 	start, end, err := st.append(payload)
-	if err == nil && st.onAppend != nil {
-		st.onAppend()
+	if err == nil {
+		w.walRecords.Add(1)
+		w.walBytes.Add(int64(len(payload)))
+		if st.onAppend != nil {
+			st.onAppend()
+		}
 	}
 	return start, end, err
 }
@@ -1251,11 +1291,24 @@ func detectWritePos(walDir string, segSize int64, pageHeaders bool) (int64, uint
 	}
 
 	segSizes := make(map[uint64]int64)
+	// M0130-S10 blocker #6: the on-disk TLI per segment. parseSegmentName
+	// discards the timeline, and every downstream recomposition of the
+	// filename used to assume TLI=1 — so goopg refused to start on a base
+	// backup taken from a PROMOTED PG (timeline 2, pg_wal full of
+	// `00000002…` segments) with "wal: read …/000000010000000000000002: no
+	// such file or directory". The reader side has been TLI-tolerant since
+	// openSegmentFile's fallback scan; this is its writer-side twin
+	// (Hard-won Rule #2 — sibling paths must change together).
+	segTLIs := make(map[uint64]uint32)
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
-		segNo, ok := parseSegmentName(e.Name())
+		// segSize=0 → DefaultSegmentSize, exactly what the previous
+		// parseSegmentName call did: segment *names* are always derived
+		// from DefaultSegmentSize in this package (FormatSegmentNameTLI),
+		// independently of the configured runtime segment size.
+		tli, segNo, ok := ParseXLogFileName(e.Name(), 0)
 		if !ok {
 			continue
 		}
@@ -1275,6 +1328,14 @@ func detectWritePos(walDir string, segSize int64, pageHeaders bool) (int64, uint
 			continue
 		}
 		segSizes[segNo] = st.Size()
+		// Same segment number present on several timelines (a promoted
+		// cluster keeps the pre-switch copy alongside the new one): prefer
+		// the highest TLI, mirroring upstream XLogFileReadAnyTLI, which
+		// walks expectedTLEs newest-timeline-first
+		// (postgres/src/backend/access/transam/xlog.c).
+		if tli > segTLIs[segNo] {
+			segTLIs[segNo] = tli
+		}
 	}
 
 	if len(segSizes) == 0 {
@@ -1312,6 +1373,10 @@ func detectWritePos(walDir string, segSize int64, pageHeaders bool) (int64, uint
 		}
 	}
 	firstSegNo := segNos[0]
+	// The timeline the retained run lives on. Used only to name a segment
+	// that is NOT on disk (the gap diagnostic below), where no filename
+	// exists to read a TLI from.
+	runTLI := segTLIs[firstSegNo]
 
 	// M0007 eager-lookahead follow-up: state.eagerPreallocSegment can
 	// leave a fully zero-filled "future" segment on disk beyond the
@@ -1342,7 +1407,7 @@ func detectWritePos(walDir string, segSize int64, pageHeaders bool) (int64, uint
 	// tolerates more defensively.
 	lastIdx := len(segNos) - 1
 	for lastIdx > 0 && segSizes[segNos[lastIdx]] == segSize {
-		usedBytes, _, scanErr := scanLastSegmentEnd(walDir, segNos[lastIdx], segSizes[segNos[lastIdx]], segSize, pageHeaders)
+		usedBytes, _, scanErr := scanLastSegmentEnd(walDir, segNos[lastIdx], segTLIs[segNos[lastIdx]], segSizes[segNos[lastIdx]], segSize, pageHeaders)
 		if scanErr != nil {
 			return 0, 0, scanErr
 		}
@@ -1362,11 +1427,11 @@ func detectWritePos(walDir string, segSize int64, pageHeaders bool) (int64, uint
 	for i := 0; i < len(segNos); i++ {
 		expected := firstSegNo + uint64(i)
 		if segNos[i] != expected {
-			return 0, 0, fmt.Errorf("wal: gap at segment %s", formatSegmentName(expected))
+			return 0, 0, fmt.Errorf("wal: gap at segment %s", FormatSegmentNameTLI(expected, runTLI))
 		}
 		sz := segSizes[expected]
 		if i < len(segNos)-1 && sz != segSize {
-			return 0, 0, fmt.Errorf("wal: non-final segment %s has size %d, expected %d", formatSegmentName(expected), sz, segSize)
+			return 0, 0, fmt.Errorf("wal: non-final segment %s has size %d, expected %d", FormatSegmentNameTLI(expected, segTLIs[expected]), sz, segSize)
 		}
 		if i < len(segNos)-1 {
 			writePos += sz
@@ -1377,7 +1442,7 @@ func detectWritePos(walDir string, segSize int64, pageHeaders bool) (int64, uint
 		// both legacy lazy-grown segments (writePos == sz, no
 		// trailing zeros) and preallocated full-size segments
 		// (writePos < sz, zero-fill tail).
-		usedBytes, lastRecPtr, scanErr := scanLastSegmentEnd(walDir, expected, sz, segSize, pageHeaders)
+		usedBytes, lastRecPtr, scanErr := scanLastSegmentEnd(walDir, expected, segTLIs[expected], sz, segSize, pageHeaders)
 		if scanErr != nil {
 			return 0, 0, scanErr
 		}
@@ -1420,8 +1485,17 @@ func detectWritePos(walDir string, segSize int64, pageHeaders bool) (int64, uint
 // `pageHeaders=true` walks the file's interleaved page headers and
 // XLogRecord-framed bytes; `false` keeps the legacy flat record-stream
 // walk.
-func scanLastSegmentEnd(walDir string, segNo uint64, segSize int64, cfgSegSize int64, pageHeaders bool) (int64, uint64, error) {
-	path := filepath.Join(walDir, formatSegmentName(segNo))
+//
+// `tli` is the timeline the segment file is actually named on, as read off
+// disk by detectWritePos — not an assumption. A base backup taken from a
+// promoted PG carries `00000002…` segments (M0130-S10 blocker #6); passing 0
+// keeps the historical TLI=1 behaviour for callers that have no timeline
+// context.
+func scanLastSegmentEnd(walDir string, segNo uint64, tli uint32, segSize int64, cfgSegSize int64, pageHeaders bool) (int64, uint64, error) {
+	if tli == 0 {
+		tli = 1
+	}
+	path := filepath.Join(walDir, FormatSegmentNameTLI(segNo, tli))
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return 0, 0, fmt.Errorf("wal: read %s: %w", path, err)
@@ -2198,7 +2272,7 @@ func (s *state) removeOldSegments(keepLSN uint64, distanceEstimateBytes, complet
 			for existing[nextTarget] {
 				nextTarget++
 			}
-			newPath := filepath.Join(s.cfg.WALDir, formatSegmentName(nextTarget))
+			newPath := filepath.Join(s.cfg.WALDir, FormatSegmentNameTLI(nextTarget, s.tli))
 			if rerr := recycleSegmentFile(oldPath, newPath, s.cfg.SegmentSize); rerr != nil {
 				if errors.Is(rerr, os.ErrNotExist) {
 					continue
@@ -2358,7 +2432,7 @@ func (s *state) openSegment(segNo uint64) (*os.File, error) {
 	if f, ok := s.files[segNo]; ok {
 		return f, nil
 	}
-	path := filepath.Join(s.cfg.WALDir, formatSegmentName(segNo))
+	path := filepath.Join(s.cfg.WALDir, FormatSegmentNameTLI(segNo, s.tli))
 
 	// Detect first-time creation so the preallocator only zero-fills
 	// new segments. Existing files (legacy lazy mode, or a re-open
@@ -2418,7 +2492,7 @@ func (s *state) eagerPreallocSegment(segNo uint64) {
 	if !s.cfg.Preallocate {
 		return
 	}
-	finalPath := filepath.Join(s.cfg.WALDir, formatSegmentName(segNo))
+	finalPath := filepath.Join(s.cfg.WALDir, FormatSegmentNameTLI(segNo, s.tli))
 	if _, err := os.Stat(finalPath); err == nil {
 		return
 	}

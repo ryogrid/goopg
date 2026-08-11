@@ -34,6 +34,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/config"
+	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/storage"
@@ -43,36 +44,95 @@ import (
 // systemIdentifierFile is the path (relative to the data directory) where
 // the 8-byte cluster system identifier is stored. Matches PostgreSQL's
 // pg_control convention: a random uint64 generated at initdb time that
-// uniquely identifies the cluster. M0101-0001.
+// uniquely identifies the cluster. M0101-0001. Since M0131-S2 this is a
+// SECONDARY copy — pg_control's system_identifier is authoritative.
 const systemIdentifierFile = "global/system_identifier"
 
-// LoadOrCreateSystemID reads the cluster system identifier from
-// <dataDir>/global/system_identifier. If the file does not exist (e.g. for
-// clusters created by older goopg versions), it generates a new random uint64,
-// persists it, and returns it. This value is embedded in every PG-compatible
-// WAL page header so pg_waldump can cross-check segment consistency.
+// LoadOrCreateSystemID resolves the cluster system identifier, with
+// pg_control as the authoritative source. Resolution order (M0131-S2,
+// mirroring LoadOrCreateTimelineID in timeline.go):
+//
+//  1. global/pg_control's system_identifier (offset 0) — authoritative.
+//     This is what upstream assigns once at BootStrapXLOG
+//     (postgres/src/backend/access/transam/xlog.c:5099-5101) and the only
+//     copy PG itself keeps.
+//  2. the goopg-private global/system_identifier flat file — fallback when
+//     pg_control is absent or fails its CRC check (a fresh `goopg init`
+//     still in progress, or a cluster from an older goopg).
+//  3. a freshly generated random uint64 — a genuinely new cluster.
+//
+// The flat file is always (re)written from the resolved value, so a
+// directory PostgreSQL's initdb created adopts *its* identity instead of
+// having goopg invent a second, disagreeing one. A disagreement between
+// the two copies is only reachable via a crash between the two writes or a
+// hand-edited directory, so it is logged before pg_control wins.
+//
+// This value is embedded in every PG-compatible WAL page header as
+// xlp_sysid — upstream's reader rejects a segment whose xlp_sysid differs
+// from its own control file (xlogreader.c:1282-1286) — and is reported by
+// IDENTIFY_SYSTEM and BASE_BACKUP.
 func LoadOrCreateSystemID(dataDir string) (uint64, error) {
 	path := filepath.Join(dataDir, systemIdentifierFile)
-	data, err := os.ReadFile(path)
-	if err == nil {
-		if len(data) != 8 {
-			return 0, fmt.Errorf("goopg: system_identifier: unexpected length %d", len(data))
+	flatID, flatErr := readSystemIDFile(dataDir)
+
+	// 1. pg_control wins whenever it is present and passes its CRC check.
+	// ReadControlFile returns (nil, nil) for an absent file and an error on
+	// a CRC mismatch, so a corrupt control file falls through to the flat
+	// file rather than poisoning the cluster identity.
+	if cd, ctrlErr := control.ReadControlFile(dataDir); ctrlErr == nil && cd != nil && cd.SystemIdentifier != 0 {
+		if flatErr != nil || flatID != cd.SystemIdentifier {
+			if flatErr == nil {
+				log.Printf("goopg: WARNING: global/system_identifier (%d) disagrees with pg_control (%d); pg_control wins",
+					flatID, cd.SystemIdentifier)
+			}
+			if err := writeSystemIDFile(path, cd.SystemIdentifier); err != nil {
+				return 0, err
+			}
 		}
-		return binary.LittleEndian.Uint64(data), nil
+		return cd.SystemIdentifier, nil
 	}
-	if !errors.Is(err, os.ErrNotExist) {
-		return 0, fmt.Errorf("goopg: read system_identifier: %w", err)
+
+	// 2. pg_control absent or unreadable: fall back to the flat file.
+	if flatErr == nil {
+		return flatID, nil
 	}
-	// Generate a new random system identifier.
+	if !errors.Is(flatErr, os.ErrNotExist) {
+		return 0, flatErr
+	}
+
+	// 3. Neither exists: generate a new random system identifier.
 	var buf [8]byte
 	if _, err := rand.Read(buf[:]); err != nil {
 		return 0, fmt.Errorf("goopg: generate system_identifier: %w", err)
 	}
 	id := binary.LittleEndian.Uint64(buf[:])
-	if err := os.WriteFile(path, buf[:], 0o600); err != nil {
-		return 0, fmt.Errorf("goopg: write system_identifier: %w", err)
+	if err := writeSystemIDFile(path, id); err != nil {
+		return 0, err
 	}
 	return id, nil
+}
+
+// readSystemIDFile reads the goopg-private global/system_identifier flat
+// file. Returns a wrapped os.ErrNotExist when the file is absent.
+func readSystemIDFile(dataDir string) (uint64, error) {
+	data, err := os.ReadFile(filepath.Join(dataDir, systemIdentifierFile))
+	if err != nil {
+		return 0, fmt.Errorf("goopg: read system_identifier: %w", err)
+	}
+	if len(data) != 8 {
+		return 0, fmt.Errorf("goopg: system_identifier: unexpected length %d", len(data))
+	}
+	return binary.LittleEndian.Uint64(data), nil
+}
+
+// writeSystemIDFile persists id (little-endian, 8 bytes) to path.
+func writeSystemIDFile(path string, id uint64) error {
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], id)
+	if err := os.WriteFile(path, buf[:], 0o600); err != nil {
+		return fmt.Errorf("goopg: write system_identifier: %w", err)
+	}
+	return nil
 }
 
 // CatalogVersion is the value written into the data directory's
@@ -1071,6 +1131,14 @@ func Init(opts Options) error {
 	if err := bootstrapPgIndexIndexrelidIndex(abs, pgIndexTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_index_indexrelid_index: %w", err)
 	}
+	// M-NIGHTLY AI-20260810-011258-003 blocker #8: 2678
+	// (pg_index_indrelid_index) is the index PG's RelationGetIndexList scans
+	// to discover a relation's indexes; while it stayed an empty placeholder
+	// a PG on a goopg cluster performed ZERO index maintenance on
+	// goopg-created indexes. See bootstrapPgIndexIndrelidIndex.
+	if err := bootstrapPgIndexIndrelidIndex(abs, pgIndexTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_index_indrelid_index: %w", err)
+	}
 	// M0106-0010 batched-19: overwrite base/{1,5}/2687 + global/2687 with
 	// a populated btree carrying one oid-keyed IndexTuple per pg_opclass row
 	// (177 rows, potentially multi-page) so PG's LookupOpclassInfo finds
@@ -1816,7 +1884,10 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 		828,  // pg_default_acl_oid_index (Step 3am)
 		2650, // pg_aggregate_fnoid_index (Step 3x)
 		2653, // pg_amop_fam_strat_index (Step 3y)
-		2654, 2655, 2658, 2659,
+		2654, 2655,
+		2656, // pg_attrdef_adrelid_adnum_index (AI-20260810-011258-003)
+		2657, // pg_attrdef_oid_index (AI-20260810-011258-003)
+		2658, 2659,
 		2660, // pg_cast_oid_index (Step 3ab)
 		2661, // pg_cast_source_target_index (Step 3ac)
 		2662, 2663,
@@ -1958,7 +2029,10 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 		828,  // pg_default_acl_oid_index (Step 3am)
 		2650, // pg_aggregate_fnoid_index (Step 3x)
 		2653, // pg_amop_fam_strat_index (Step 3y)
-		2654, 2655, 2658, 2659,
+		2654, 2655,
+		2656, // pg_attrdef_adrelid_adnum_index (AI-20260810-011258-003)
+		2657, // pg_attrdef_oid_index (AI-20260810-011258-003)
+		2658, 2659,
 		2660, // pg_cast_oid_index (Step 3ab)
 		2661, // pg_cast_source_target_index (Step 3ac)
 		2662, 2663,
@@ -2052,7 +2126,10 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 		828,  // pg_default_acl_oid_index (Step 3am)
 		2650, // pg_aggregate_fnoid_index (Step 3x)
 		2653, // pg_amop_fam_strat_index (Step 3y)
-		2654, 2655, 2658, 2659,
+		2654, 2655,
+		2656, // pg_attrdef_adrelid_adnum_index (AI-20260810-011258-003)
+		2657, // pg_attrdef_oid_index (AI-20260810-011258-003)
+		2658, 2659,
 		2660, // pg_cast_oid_index (Step 3ab)
 		2661, // pg_cast_source_target_index (Step 3ac)
 		2662, 2663,
@@ -2697,6 +2774,11 @@ func pgProcRow(e pgProcEntry) executor.Row {
 	if e.ArgNames != nil {
 		argNames = executor.NewBytesDatum(textArrayBytes(e.ArgNames))
 	}
+	// pg_proc.dat carries no argument defaults; upstream attaches them by
+	// replaying system_functions.sql at the end of initdb. goopg replays that
+	// file's effect from a table instead — see pg_proc_seed_defaults.go for why
+	// a real PG standby cannot resolve short call forms without it.
+	nargDefaults, argDefaults := pgProcSeedArgDefaults(e.OID)
 	return executor.Row{
 		executor.NewIntDatum(int64(e.OID)), // 1  oid
 		executor.NewStringDatum(e.Name),    // 2  proname
@@ -2720,13 +2802,13 @@ func pgProcRow(e pgProcEntry) executor.Row {
 		executor.NewStringDatum(string(vol)),             // 15 provolatile
 		executor.NewStringDatum(string(parallel)),        // 16 proparallel
 		executor.NewIntDatum(int64(len(argTypes))),       // 17 pronargs
-		executor.NewIntDatum(0),                          // 18 pronargdefaults
+		executor.NewIntDatum(int64(nargDefaults)),        // 18 pronargdefaults
 		executor.NewIntDatum(int64(e.RetType)),           // 19 prorettype
 		executor.NewBytesDatum(oidVectorBytes(argTypes)), // 20 proargtypes
 		allArgs,                                // 21 proallargtypes
 		argModes,                               // 22 proargmodes
 		argNames,                               // 23 proargnames
-		executor.NewStringDatum(""),            // 24 proargdefaults (pg_node_tree)
+		executor.NewStringDatum(argDefaults),   // 24 proargdefaults (pg_node_tree)
 		executor.NewStringDatum(""),            // 25 protrftypes
 		executor.NewStringDatum(e.HandlerName), // 26 prosrc — fmgr internal lookup key
 		executor.NewStringDatum(""),            // 27 probin
@@ -4781,6 +4863,14 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// 10=contypid (oid). PG declares UNIQUE not PKEY.
 		entry(2665, 2606, []int16{9, 10, 2}, []uint32{oidOps, oidOps, nameOps}, []uint32{0, 0, cCollation}, true, false), // pg_constraint_conrelid_contypid_conname_index
 		entry(2688, 2617, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                         // pg_operator_oid_index
+		// M-NIGHTLY AI-20260810-011258-003: pg_attrdef's declared indexes
+		// (postgres/src/include/catalog/pg_attrdef.h:53-54). pg_attrdef
+		// attnums: 1=oid, 2=adrelid, 3=adnum, 4=adbin. PG's AttrDefaultFetch
+		// scans 2656 for (adrelid, adnum) — without a pg_index row the
+		// standby FATALs `could not open relation with OID 2656` on any
+		// table that has a column DEFAULT.
+		entry(2656, 2604, []int16{2, 3}, []uint32{oidOps, int2Ops}, []uint32{0, 0}, true, false), // pg_attrdef_adrelid_adnum_index (UNIQUE, not PKEY)
+		entry(2657, 2604, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                 // pg_attrdef_oid_index (UNIQUE PRIMARY)
 		entry(2680, 2611, []int16{1, 3}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true),                          // pg_inherits_relid_seqno_index
 		// pg_namespace columns (PG18, pg_namespace.h): 1=oid, 2=nspname,
 		// 3=nspowner, 4=nspacl. PG18 indexing.h:
@@ -5780,11 +5870,25 @@ func pgClassRow(rel nailedRel) executor.Row {
 	relHasRules := false
 	if rel.RelKind == 'v' {
 		relFilenode = 0
-		// Keep relHasRules=false: the view is found in pg_class (name lookup works)
-		// and PG won't try to load the rewrite rule. Querying the view will return
-		// an error (no storage) but won't crash. Needed until the ev_action format
-		// is fully compatible with the running PG18 version.
-		// relHasRules = true
+		// M0131-S6 (2026-08-11): relhasrules FLIPPED to true. The old
+		// rationale ("Needed until the ev_action format is fully
+		// compatible with the running PG18 version") is discharged: the
+		// six nailed views' ev_action blobs are verbatim PG 18.3 dumps
+		// of system_views.sql (pg_rewrite_bootstrap.go), both pg_rewrite
+		// btrees 2692/2693 are bootstrapped, and M0131-S8a repinned the
+		// view OIDs to upstream's own initdb assignments so the
+		// view-on-view :relid inside pg_stat_replication_slots'
+		// ev_action resolves. With relhasrules=false, PG's
+		// RelationBuildDesc takes the else arm at
+		// postgres/src/backend/utils/cache/relcache.c:1249-1255 and
+		// never scans pg_rewrite, so a hosted PG cannot evaluate any of
+		// the six; true is what makes RelationBuildRuleLock run.
+		//
+		// Scope limit: this is written at initdb time, so it reaches
+		// only freshly `goopg init`'d directories. An existing goopg
+		// $PGDATA keeps relhasrules='f' on disk — re-initdb required,
+		// there is no in-place upgrade path (ledgered under M0131-S6).
+		relHasRules = true
 	}
 	return executor.Row{
 		executor.NewIntDatum(int64(rel.OID)), // 0: oid

@@ -3,7 +3,6 @@ package executor
 import (
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -43,9 +42,9 @@ func TestDDLCreateCharBTreeIndexAcceptsType(t *testing.T) {
 		t.Fatal("index not in catalog after CREATE INDEX")
 	}
 	idxRel := ctx.Catalog.IndexRelFileNode(idx)
-	tree, err := btree.Open(ctx.Pool, idxRel)
+	tree, err := openIndexBTree(ctx, idx, idxRel)
 	if err != nil {
-		t.Fatalf("btree.Open: %v", err)
+		t.Fatalf("openIndexBTree: %v", err)
 	}
 
 	// Search with trimmed probe key — should find the padded row too.
@@ -54,7 +53,7 @@ func TestDDLCreateCharBTreeIndexAcceptsType(t *testing.T) {
 		{"BUILDING", "BUILDING"},
 		{"MACHINERY", "MACHINERY "},
 	} {
-		key := btree.EncodeChar([]byte(seg.probe))
+		key := indexProbeForTest(t, ctx, idx, NewStringDatum(seg.probe))
 		_, found, err := tree.Search(key)
 		if err != nil || !found {
 			t.Fatalf("Search(%q via %q): found=%v err=%v", seg.probe, seg.stored, found, err)

@@ -167,6 +167,48 @@ func TestNormalizeRegressOutputDropsUnsupportedPLpgSQLExistsNoise(t *testing.T) 
 	}
 }
 
+// TestNormalizeRegressOutputStripsErrorPositionLines locks the LINE/caret rule
+// that M0129-S10 (commit d6bcc190) removed on the premise that goopg emits
+// FieldPosition on every error path. It does not — the P field only rides an
+// ExecError with a non-zero Pos — and the 2026-08-09 nightly reported 26
+// previously-passing regress cases diverging on nothing but the position lines
+// (AI-20260809-020705-024..049).
+//
+// The suite's own top-level result cannot catch this: a diverging case reports
+// t.Skip, so TestPort_RegressSuite still says PASS. This unit test is the gate.
+func TestNormalizeRegressOutputStripsErrorPositionLines(t *testing.T) {
+	// Shape from regress/int2: PG carries the position, goopg does not.
+	pgSide := "INSERT INTO INT2_TBL(f1) VALUES ('34.5');\n" +
+		"ERROR:  invalid input syntax for type smallint: \"34.5\"\n" +
+		"LINE 1: INSERT INTO INT2_TBL(f1) VALUES ('34.5');\n" +
+		"                                         ^\n"
+	goopgSide := "INSERT INTO INT2_TBL(f1) VALUES ('34.5');\n" +
+		"ERROR:  invalid input syntax for type smallint: \"34.5\"\n"
+	if got, want := NormalizeRegressOutput(goopgSide), NormalizeRegressOutput(pgSide); got != want {
+		t.Fatalf("position lines not stripped: goopg=%q pg=%q", got, want)
+	}
+
+	// Shape from regress/limit: the asymmetry runs the other way — goopg emits
+	// a position on a CREATE VIEW error where PG emits none.
+	pgSide = "ERROR:  syntax error at or near \"FOR\"\n"
+	goopgSide = "ERROR:  syntax error at or near \"FOR\"\n" +
+		"LINE 1: CREATE VIEW limit_thousand_v_3 AS SELECT thousand FROM onek\n" +
+		"                                          ^\n"
+	if got, want := NormalizeRegressOutput(goopgSide), NormalizeRegressOutput(pgSide); got != want {
+		t.Fatalf("reverse-direction position lines not stripped: goopg=%q pg=%q", got, want)
+	}
+
+	// Non-vacuity: stripping positions must not make differing message TEXT
+	// compare equal, and must not eat ordinary output rows.
+	if NormalizeRegressOutput("ERROR:  a\n") == NormalizeRegressOutput("ERROR:  b\n") {
+		t.Fatal("position stripping swallowed a real message difference")
+	}
+	const row = " x | y ^ z"
+	if got := NormalizeRegressOutput(row + "\n"); got != row {
+		t.Fatalf("caret rule ate a data row: %q", got)
+	}
+}
+
 func TestNormalizeRegressOutputDropsEmptyMVCCSizeBlock(t *testing.T) {
 	in := " size_before | size_after\n" +
 		"-------------+------------\n" +

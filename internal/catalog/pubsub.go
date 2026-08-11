@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -37,6 +38,15 @@ type Publication struct {
 	// true. Insertion order is preserved so views render rows
 	// in the order an operator added them.
 	Tables []string
+	// DBOid is the real physical database oid this publication was CREATE
+	// PUBLICATION'd under (mirrors Subscription.DBOid + UserTSConfig.DBOid).
+	// Two distinct databases may each create a same-named publication without
+	// colliding (the DU-002 pg_dump round-trip restores a dump's publications
+	// into a fresh database whose registry must not clash with the source
+	// database's). Defaults to DefaultDBOid for every call site that does not
+	// pass an explicit dbOid (resolveDBOid's convention), keeping the pre-DU-002
+	// single-DB behaviour. M0119-0004 (DU-002 per-DB publication scoping).
+	DBOid uint32
 }
 
 // Subscription is one CREATE SUBSCRIPTION's catalog row.
@@ -147,6 +157,21 @@ func NewPubSub() *PubSub {
 	}
 }
 
+// pubMapKey returns the compound map key for a (dbOid, name) pair.
+// The public-facing API uses variadic dbOid with resolveDBOid for backward
+// compatibility, but internally the map key must be compound to support
+// same-named publications under different databases. M0119-0004.
+func pubMapKey(dbOid uint32, name string) string {
+	return fmt.Sprintf("%d.%s", dbOid, strings.ToLower(name))
+}
+
+// subMapKey returns the compound map key for a (dbOid, subName) pair.
+// Mirrors pubMapKey — same-named subscriptions in different databases must
+// not collide. M0119-0004 (DU-002 per-DB subscription scoping).
+func subMapKey(dbOid uint32, name string) string {
+	return fmt.Sprintf("%d.%s", dbOid, strings.ToLower(name))
+}
+
 // PublicationOptions controls the optional fields of a
 // CreatePublication call. Zero values match the upstream
 // `CREATE PUBLICATION` defaults: insert/update/delete/truncate
@@ -177,18 +202,27 @@ func DefaultPublicationOptions() PublicationOptions {
 // TABLE list. Returns ErrPublicationExists when name is taken. Callers that
 // know the connection's currently-effective role should use
 // CreatePublicationAsOwner instead.
-func (p *PubSub) CreatePublication(name string, tables []string, opts PublicationOptions) (*Publication, error) {
-	return p.CreatePublicationAsOwner(name, tables, opts, 10)
+// dbOid is variadic (mirrors CreateTable/CreateTSConfig's convention) and sets
+// Publication.DBOid; omitted defaults to DefaultDBOid via resolveDBOid,
+// matching pre-DU-002 single-DB behavior.
+func (p *PubSub) CreatePublication(name string, tables []string, opts PublicationOptions, dbOid ...uint32) (*Publication, error) {
+	return p.CreatePublicationAsOwner(name, tables, opts, 10, dbOid...)
 }
 
 // CreatePublicationAsOwner is CreatePublication with an explicit owner OID —
 // the role that issued CREATE PUBLICATION, mirroring PostgreSQL's
 // GetUserId()-as-owner convention (CreatePublication, publicationcmds.c).
 // DU-002 slice 424.
-func (p *PubSub) CreatePublicationAsOwner(name string, tables []string, opts PublicationOptions, owner uint32) (*Publication, error) {
+// dbOid is variadic (mirrors CreateTable/CreateTSConfig's convention) and sets
+// Publication.DBOid; omitted defaults to DefaultDBOid via resolveDBOid,
+// matching pre-DU-002 single-DB behavior. M0119-0004 (DU-002 per-DB
+// publication scoping).
+func (p *PubSub) CreatePublicationAsOwner(name string, tables []string, opts PublicationOptions, owner uint32, dbOid ...uint32) (*Publication, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if _, ok := p.publications[name]; ok {
+	oid := resolveDBOid(dbOid)
+	key := pubMapKey(oid, name)
+	if _, ok := p.publications[key]; ok {
 		return nil, ErrPublicationExists
 	}
 	pub := &Publication{
@@ -199,12 +233,13 @@ func (p *PubSub) CreatePublicationAsOwner(name string, tables []string, opts Pub
 		PublishInsert: opts.PublishInsert,
 		PublishUpdate: opts.PublishUpdate,
 		PublishDelete: opts.PublishDelete,
+		DBOid:         oid,
 	}
 	if !opts.AllTables && len(tables) > 0 {
 		pub.Tables = append(pub.Tables, tables...)
 	}
 	p.nextOID++
-	p.publications[name] = pub
+	p.publications[key] = pub
 	out := *pub
 	out.Tables = append([]string(nil), pub.Tables...)
 	return &out, nil
@@ -214,10 +249,13 @@ func (p *PubSub) CreatePublicationAsOwner(name string, tables []string, opts Pub
 // ErrPublicationNotFound when name is unknown. Backs ALTER PUBLICATION name
 // OWNER TO newowner. DU-002 slice 425 (M0119-0004, loop #65 ledger
 // follow-up).
-func (p *PubSub) SetPublicationOwner(name string, owner uint32) error {
+// dbOid is variadic (mirrors LookupPublication); omitted defaults to
+// DefaultDBOid. M0119-0004.
+func (p *PubSub) SetPublicationOwner(name string, owner uint32, dbOid ...uint32) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	pub, ok := p.publications[name]
+	oid := resolveDBOid(dbOid)
+	pub, ok := p.publications[pubMapKey(oid, name)]
 	if !ok {
 		return ErrPublicationNotFound
 	}
@@ -227,28 +265,55 @@ func (p *PubSub) SetPublicationOwner(name string, owner uint32) error {
 
 // DropPublication removes a publication. Returns
 // ErrPublicationNotFound when name is unknown.
-func (p *PubSub) DropPublication(name string) error {
+// dbOid is variadic (mirrors LookupPublication); omitted defaults to
+// DefaultDBOid. M0119-0004 (DU-002 per-DB publication scoping).
+func (p *PubSub) DropPublication(name string, dbOid ...uint32) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if _, ok := p.publications[name]; !ok {
+	oid := resolveDBOid(dbOid)
+	key := pubMapKey(oid, name)
+	if _, ok := p.publications[key]; !ok {
 		return ErrPublicationNotFound
 	}
-	delete(p.publications, name)
+	delete(p.publications, key)
 	return nil
 }
 
 // LookupPublication returns a copy of the named publication, or
 // nil/false when it doesn't exist.
-func (p *PubSub) LookupPublication(name string) (*Publication, bool) {
+// dbOid is variadic (mirrors CreateTable/CreateTSConfig's convention);
+// omitted defaults to DefaultDBOid via resolveDBOid, matching pre-DU-002
+// single-DB behavior. M0119-0004 (DU-002 per-DB publication scoping).
+func (p *PubSub) LookupPublication(name string, dbOid ...uint32) (*Publication, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	pub, ok := p.publications[name]
+	oid := resolveDBOid(dbOid)
+	pub, ok := p.publications[pubMapKey(oid, name)]
 	if !ok {
 		return nil, false
 	}
 	out := *pub
 	out.Tables = append([]string(nil), pub.Tables...)
 	return &out, true
+}
+
+// PublicationsForDBOid returns every publication belonging to dbOid in name
+// order. Each entry is a deep copy. M0119-0004 (DU-002 per-DB publication
+// scoping).
+func (p *PubSub) PublicationsForDBOid(dbOid uint32) []*Publication {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	var out []*Publication
+	for _, pub := range p.publications {
+		if pub.DBOid != dbOid {
+			continue
+		}
+		cp := *pub
+		cp.Tables = append([]string(nil), pub.Tables...)
+		out = append(out, &cp)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
 }
 
 // CreatePublicationDuringRecovery is the idempotent version of
@@ -265,7 +330,7 @@ func (p *PubSub) CreatePublicationDuringRecovery(pub *Publication) {
 	defer p.mu.Unlock()
 	out := *pub
 	out.Tables = append([]string(nil), pub.Tables...)
-	p.publications[pub.Name] = &out
+	p.publications[pubMapKey(pub.DBOid, pub.Name)] = &out
 	if pub.OID >= p.nextOID {
 		p.nextOID = pub.OID + 1
 	}
@@ -276,16 +341,16 @@ func (p *PubSub) CreatePublicationDuringRecovery(pub *Publication) {
 // discards the found/not-found result — replay does not care whether the
 // publication was still present. DU-002 restart-persistence follow-up
 // (M0119-0004, loop #67 ledger resume point).
-func (p *PubSub) DropPublicationDuringRecovery(name string) {
-	_ = p.DropPublication(name)
+func (p *PubSub) DropPublicationDuringRecovery(name string, dbOid ...uint32) {
+	_ = p.DropPublication(name, dbOid...)
 }
 
 // SetPublicationOwnerDuringRecovery is the discard-result recovery
 // counterpart to SetPublicationOwner, mirroring
 // DropPublicationDuringRecovery. DU-002 restart-persistence follow-up
 // (M0119-0004, loop #67 ledger resume point).
-func (p *PubSub) SetPublicationOwnerDuringRecovery(name string, owner uint32) {
-	_ = p.SetPublicationOwner(name, owner)
+func (p *PubSub) SetPublicationOwnerDuringRecovery(name string, owner uint32, dbOid ...uint32) {
+	_ = p.SetPublicationOwner(name, owner, dbOid...)
 }
 
 // Publications returns every publication in name order. Each
@@ -321,10 +386,15 @@ func (p *PubSub) CreateSubscription(name, conninfo string, publications []string
 // dbOid is variadic (mirrors CreateTable/CreateIndex's convention) and
 // sets Subscription.DBOid; omitted defaults to DefaultDBOid via
 // resolveDBOid, matching pre-4d-ii-part-2b-item-1 behavior.
+// M0119-0004 (DU-002 per-DB subscription scoping): uses subMapKey for
+// compound-key isolation — same-named subscriptions in different databases
+// no longer collide.
 func (p *PubSub) CreateSubscriptionAsOwner(name, conninfo string, publications []string, slotName string, enabled bool, owner uint32, dbOid ...uint32) (*Subscription, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if _, ok := p.subscriptions[name]; ok {
+	oid := resolveDBOid(dbOid)
+	key := subMapKey(oid, name)
+	if _, ok := p.subscriptions[key]; ok {
 		return nil, ErrSubscriptionExists
 	}
 	if slotName == "" {
@@ -338,10 +408,10 @@ func (p *PubSub) CreateSubscriptionAsOwner(name, conninfo string, publications [
 		Publications: append([]string(nil), publications...),
 		Enabled:      enabled,
 		SlotName:     slotName,
-		DBOid:        resolveDBOid(dbOid),
+		DBOid:        oid,
 	}
 	p.nextOID++
-	p.subscriptions[name] = sub
+	p.subscriptions[key] = sub
 	out := *sub
 	out.Publications = append([]string(nil), sub.Publications...)
 	return &out, nil
@@ -351,10 +421,13 @@ func (p *PubSub) CreateSubscriptionAsOwner(name, conninfo string, publications [
 // ErrSubscriptionNotFound when name is unknown. Backs ALTER SUBSCRIPTION name
 // OWNER TO newowner. DU-002 slice 425 (M0119-0004, loop #65 ledger
 // follow-up).
-func (p *PubSub) SetSubscriptionOwner(name string, owner uint32) error {
+// dbOid is variadic (mirrors LookupSubscription); omitted defaults to
+// DefaultDBOid. M0119-0004.
+func (p *PubSub) SetSubscriptionOwner(name string, owner uint32, dbOid ...uint32) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	sub, ok := p.subscriptions[name]
+	oid := resolveDBOid(dbOid)
+	sub, ok := p.subscriptions[subMapKey(oid, name)]
 	if !ok {
 		return ErrSubscriptionNotFound
 	}
@@ -366,23 +439,36 @@ func (p *PubSub) SetSubscriptionOwner(name string, owner uint32) error {
 // ErrSubscriptionNotFound when name is unknown. Tablesync rows
 // for the subscription are dropped at the same time so a
 // re-CREATE under the same name doesn't inherit stale state.
-func (p *PubSub) DropSubscription(name string) error {
+// dbOid is variadic (mirrors LookupPublication); omitted defaults to
+// DefaultDBOid. M0119-0004 (DU-002 per-DB subscription scoping).
+func (p *PubSub) DropSubscription(name string, dbOid ...uint32) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if _, ok := p.subscriptions[name]; !ok {
+	oid := resolveDBOid(dbOid)
+	key := subMapKey(oid, name)
+	if _, ok := p.subscriptions[key]; !ok {
 		return ErrSubscriptionNotFound
 	}
-	delete(p.subscriptions, name)
+	delete(p.subscriptions, key)
+	// subRels is still keyed by bare subName (not compound); the
+	// tablesync path passes a dbOid-qualified subName to the
+	// methods below but the storage key remains the name alone.
+	// For the drop case we delete by name — a same-named sub in a
+	// different DB (different compound key) won't share tablesync
+	// rows anyway. M0119-0004.
 	delete(p.subRels, name)
 	return nil
 }
 
 // LookupSubscription returns a copy of the named subscription, or
 // nil/false when it doesn't exist.
-func (p *PubSub) LookupSubscription(name string) (*Subscription, bool) {
+// dbOid is variadic (mirrors LookupPublication); omitted defaults to
+// DefaultDBOid. M0119-0004 (DU-002 per-DB subscription scoping).
+func (p *PubSub) LookupSubscription(name string, dbOid ...uint32) (*Subscription, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	sub, ok := p.subscriptions[name]
+	oid := resolveDBOid(dbOid)
+	sub, ok := p.subscriptions[subMapKey(oid, name)]
 	if !ok {
 		return nil, false
 	}
@@ -396,12 +482,14 @@ func (p *PubSub) LookupSubscription(name string) (*Subscription, bool) {
 // (internal/initdb/pubsub_ddl_recovery.go). Mirrors
 // CreatePublicationDuringRecovery. DU-002 restart-persistence follow-up
 // (M0119-0004, loop #67 ledger resume point).
+// M0119-0004: uses subMapKey with sub.DBOid so recovery replay doesn't
+// collide across databases.
 func (p *PubSub) CreateSubscriptionDuringRecovery(sub *Subscription) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	out := *sub
 	out.Publications = append([]string(nil), sub.Publications...)
-	p.subscriptions[sub.Name] = &out
+	p.subscriptions[subMapKey(sub.DBOid, sub.Name)] = &out
 	if sub.OID >= p.nextOID {
 		p.nextOID = sub.OID + 1
 	}
@@ -413,16 +501,34 @@ func (p *PubSub) CreateSubscriptionDuringRecovery(sub *Subscription) {
 // (B4.4 reloads live subscriptions from the pg_subscription heap, so a DROP is
 // implicit — its row is xmax-stamped and skipped by the reload — but this stays
 // for symmetry.)
-func (p *PubSub) DropSubscriptionDuringRecovery(name string) {
-	_ = p.DropSubscription(name)
+// M0119-0004: accepts variadic dbOid (mirrors DropSubscription).
+func (p *PubSub) DropSubscriptionDuringRecovery(name string, dbOid ...uint32) {
+	_ = p.DropSubscription(name, dbOid...)
 }
 
 // SetSubscriptionOwnerDuringRecovery is the discard-result recovery
 // counterpart to SetSubscriptionOwner, mirroring
 // SetPublicationOwnerDuringRecovery. DU-002 restart-persistence follow-up
 // (M0119-0004, loop #67 ledger resume point).
-func (p *PubSub) SetSubscriptionOwnerDuringRecovery(name string, owner uint32) {
-	_ = p.SetSubscriptionOwner(name, owner)
+// M0119-0004: accepts variadic dbOid (mirrors SetSubscriptionOwner).
+func (p *PubSub) SetSubscriptionOwnerDuringRecovery(name string, owner uint32, dbOid ...uint32) {
+	_ = p.SetSubscriptionOwner(name, owner, dbOid...)
+}
+
+// findSubByName scans the compound-keyed subscriptions map for a
+// subscription whose Name matches (case-insensitive). Returns nil,false when
+// no match is found. O(n) over the map — acceptable because the number of
+// subscriptions is typically single-digit. M0119-0004: used by subRels
+// methods that previously indexed by bare name; now that the map uses
+// compound keys (subMapKey), the old p.subscriptions[name] lookup no longer
+// works.
+func (p *PubSub) findSubByName(name string) (*Subscription, bool) {
+	for _, sub := range p.subscriptions {
+		if strings.EqualFold(sub.Name, name) {
+			return sub, true
+		}
+	}
+	return nil, false
 }
 
 // Subscriptions returns every subscription in name order. Each
@@ -441,6 +547,25 @@ func (p *PubSub) Subscriptions() []*Subscription {
 		sub.Publications = append([]string(nil), p.subscriptions[n].Publications...)
 		out = append(out, &sub)
 	}
+	return out
+}
+
+// SubscriptionsForDBOid returns every subscription belonging to dbOid in name
+// order. Each entry is a deep copy. M0119-0004 (DU-002 per-DB subscription
+// scoping).
+func (p *PubSub) SubscriptionsForDBOid(dbOid uint32) []*Subscription {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	var out []*Subscription
+	for _, sub := range p.subscriptions {
+		if sub.DBOid != dbOid {
+			continue
+		}
+		cp := *sub
+		cp.Publications = append([]string(nil), sub.Publications...)
+		out = append(out, &cp)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 
@@ -494,7 +619,7 @@ var validSubRelTransitions = map[string]map[string]struct{}{
 func (p *PubSub) AddSubscriptionRel(subName string, relOID uint32) (*SubscriptionRel, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	sub, ok := p.subscriptions[subName]
+	sub, ok := p.findSubByName(subName)
 	if !ok {
 		return nil, ErrSubscriptionNotFound
 	}

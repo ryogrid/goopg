@@ -1,0 +1,110 @@
+package executor
+
+// End-to-end gate for the array arm of indexKeyIsDecodable (M0119-0006, design
+// docs/design/0119-0006-array-index-key-decodability.md).
+
+import "testing"
+
+// TestArrayIndexOnlyScanReadsHeapForRefusedElement reproduces the defect this
+// slice fixed. An `interval[]` (or `date[]`) column is indexable, the page is
+// ALL_VISIBLE, and the planner promotes the query to an IndexOnlyScan — so
+// before the fix the scan answered FROM the key, hit decodeArrayKeyElemText's
+// refusal mid-decode, and failed the whole SELECT with
+//
+//	XX000: IOS decode: btree: interval key is the comparison span …
+//
+// The predicate now declines the index up front and the scan reads the heap,
+// which is what the scalar `interval` case has done since the interval-key
+// slice. Both element types here are refused for the SAME structural reason —
+// their B-tree key is upstream's lossy comparison span (interval_cmp_value, and
+// timetz's GMT-equivalent time, which has folded the zone away) — so there is
+// nothing left to render. `date` used to be a third case, refused for the other
+// reason (no heap element image to agree with); the 26th slice gave it one and
+// the 27th re-armed it, so it moved to TestArrayIndexOnlyScanAnswersFromKey.
+func TestArrayIndexOnlyScanReadsHeapForRefusedElement(t *testing.T) {
+	cases := []struct {
+		name, colType, insert, probe, want string
+	}{
+		{"interval", "interval[]", "{1 mon,2 hours}", "{3 days}", `{"3 days"}`},
+		{"timetz", "timetz[]", "{01:02:03+01}", "{04:05:06+02}", "{04:05:06+02}"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx, cleanup := newVMFixture(t)
+			defer cleanup()
+
+			runComposite(t, ctx,
+				"CREATE TABLE arr_ios (a "+c.colType+")",
+				"CREATE INDEX arr_ios_idx ON arr_ios (a)",
+				"INSERT INTO arr_ios VALUES ('"+c.insert+"')",
+				"INSERT INTO arr_ios VALUES ('"+c.probe+"')",
+			)
+			vacuumThen(t, ctx, "arr_ios")
+
+			q := "SELECT a FROM arr_ios WHERE a = '" + c.probe + "'"
+			if ios := findIndexOnlyScan(planOne(t, q, ctx.Catalog)); ios == nil {
+				t.Skip("planner did not promote to IndexOnlyScan; the fast path is not reachable")
+			}
+			rows := runQuery(t, ctx, q)
+			if len(rows) != 1 {
+				t.Fatalf("rows=%d want 1 (%v)", len(rows), rows)
+			}
+			if got := rows[0][0].Format(); got != c.want {
+				t.Errorf("row=%q want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// TestArrayIndexOnlyScanAnswersFromKey is the payoff side of the same predicate
+// (27th slice): for the five element types whose heap image is now upstream's
+// own (date/time/timestamp/timestamptz/bytea — 26th slice), the scan is allowed
+// back onto the ALL_VISIBLE fast path and must answer the query FROM THE KEY,
+// with the text PG prints. Before this slice each of these declined the fast
+// path and paid a heap fetch for every row.
+//
+// The `want` strings are PG 18.3's array_out spellings (timestamp/timestamptz
+// contain a space and are therefore quoted; bytea's `\x` form is quoted because
+// of the backslash) — the point of the test is that the KEY path produces them,
+// not merely that some path does.
+func TestArrayIndexOnlyScanAnswersFromKey(t *testing.T) {
+	cases := []struct {
+		name, colType, insert, probe, want string
+	}{
+		{"date", "date[]", "{2020-01-02}", "{2021-03-04}", "{2021-03-04}"},
+		{"time", "time[]", "{01:02:03}", "{04:05:06}", "{04:05:06}"},
+		{"timestamp", "timestamp[]", "{2020-01-02 03:04:05}", "{2021-03-04 05:06:07}",
+			`{"2021-03-04 05:06:07"}`},
+		{"timestamptz", "timestamptz[]", "{2020-01-02 03:04:05+00}", "{2021-03-04 05:06:07+00}",
+			`{"2021-03-04 05:06:07+00"}`},
+		// array_out escapes the backslash inside the quoted element, so PG prints
+		// the two-character run `\\` before the hex: {"\\x0304"}.
+		{"bytea", "bytea[]", `{\x0102}`, `{\x0304}`, `{"\\x0304"}`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx, cleanup := newVMFixture(t)
+			defer cleanup()
+
+			runComposite(t, ctx,
+				"CREATE TABLE arr_iosk (a "+c.colType+")",
+				"CREATE INDEX arr_iosk_idx ON arr_iosk (a)",
+				"INSERT INTO arr_iosk VALUES ('"+c.insert+"')",
+				"INSERT INTO arr_iosk VALUES ('"+c.probe+"')",
+			)
+			vacuumThen(t, ctx, "arr_iosk")
+
+			q := "SELECT a FROM arr_iosk WHERE a = '" + c.probe + "'"
+			if ios := findIndexOnlyScan(planOne(t, q, ctx.Catalog)); ios == nil {
+				t.Fatalf("%s[] was NOT promoted to IndexOnlyScan — the re-armed fast path is unreachable", c.name)
+			}
+			rows := runQuery(t, ctx, q)
+			if len(rows) != 1 {
+				t.Fatalf("rows=%d want 1 (%v)", len(rows), rows)
+			}
+			if got := rows[0][0].Format(); got != c.want {
+				t.Errorf("row=%q want %q", got, c.want)
+			}
+		})
+	}
+}

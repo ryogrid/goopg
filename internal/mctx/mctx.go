@@ -71,6 +71,26 @@ type Context struct {
 	gen      uint32 // bumped on Reset; for debug use-after-Reset detection
 	kind     Kind
 	cs       uint32 // chunkSize for this context
+
+	// lc tracks lifetime memory counters used by EXPLAIN (MEMORY).
+	// Stored as a pointer to keep Context ≤96 B (design constraint).
+	lc *lifetimeCounters
+}
+
+// lifetimeCounters are the per-Context memory counters that survive
+// Reset(). totalAllocated is the cumulative sum of cap across all chunks
+// ever created; currentBytes is the sum of len(buf) across all live
+// chunks; peakBytes is the high-water mark of currentBytes.
+type lifetimeCounters struct {
+	totalAllocated int64
+	currentBytes   int64
+	peakBytes      int64
+}
+
+func (c *Context) ensureLC() {
+	if c.lc == nil {
+		c.lc = &lifetimeCounters{}
+	}
 }
 
 // --- registry ---
@@ -183,6 +203,20 @@ func getChunk(cs uint32) []byte {
 }
 
 func putChunk(cs uint32, b []byte) {
+	// Only exact-size-class buffers may be pooled. growChunk allocates an
+	// oversized chunk (make([]byte, 0, n) for n > cs) whenever a single
+	// allocation exceeds the chunk size, and Release hands *every* chunk to
+	// putChunk keyed by c.cs — so without this guard a cap>cs buffer lands in
+	// the cs pool and getChunk later returns it to an unrelated context. That
+	// breaks the invariant the (offset, length) encoding rests on: offset is
+	// chunkIdx*cs + offsetWithinChunk, so an allocation at an in-chunk offset
+	// >= cs aliases to chunkIdx+1 and Bytes() resolves into the wrong (often
+	// nonexistent) chunk, silently returning nil. An undersized buffer is
+	// likewise rejected — pooling one would make getChunk hand out a chunk
+	// that cannot hold cs bytes.
+	if cap(b) != int(cs) {
+		return
+	}
 	b = b[:0]
 	switch cs {
 	case defaultChunkSize:
@@ -223,15 +257,30 @@ func (c *Context) Generation() uint32 { return c.gen }
 
 // Reset rewinds all chunks to length 0, cascades to children, and bumps gen.
 // Backing arrays are retained for the next allocation cycle.
+// currentBytes is reset to 0; totalAllocated and peakBytes are lifetime
+// counters and are NOT reset.
 func (c *Context) Reset() {
+	c.ensureLC()
 	for i := range c.chunks {
 		c.chunks[i].buf = c.chunks[i].buf[:0]
 	}
 	c.head = 0
 	c.gen++
+	c.lc.currentBytes = 0
 	for _, child := range c.children {
 		child.Reset()
 	}
+}
+
+// Usage returns the lifetime memory counters: totalAllocated is the
+// cumulative sum of cap across all chunks ever created, peak is the
+// high-water mark of currentBytes (in-use bytes). Both are in bytes
+// and are never reset by Reset().
+func (c *Context) Usage() (allocated int64, peak int64) {
+	if c.lc == nil {
+		return 0, 0
+	}
+	return c.lc.totalAllocated, c.lc.peakBytes
 }
 
 // Release returns chunks to the pool, cascades Release to children, and
@@ -269,12 +318,14 @@ func (c *Context) Release() {
 // growChunk adds a new chunk of size cs (or n if oversized) AFTER the
 // current head, preserving the small-chunk tail (mirrors Arena.Allocate).
 func (c *Context) growChunk(n int) {
+	c.ensureLC()
 	var buf []byte
 	if n > int(c.cs) {
 		buf = make([]byte, 0, n)
 	} else {
 		buf = getChunk(c.cs)
 	}
+	c.lc.totalAllocated += int64(cap(buf))
 	newIdx := int(c.head) + 1
 	// Insert after head.
 	c.chunks = append(c.chunks, chunk{})
@@ -285,6 +336,7 @@ func (c *Context) growChunk(n int) {
 
 // Alloc returns n zero-initialized bytes owned by c.
 func (c *Context) Alloc(n int) []byte {
+	c.ensureLC()
 	if n <= 0 {
 		return nil
 	}
@@ -293,7 +345,9 @@ func (c *Context) Alloc(n int) []byte {
 		defer permMu.Unlock()
 	}
 	if len(c.chunks) == 0 {
-		c.chunks = append(c.chunks, chunk{buf: getChunk(c.cs)})
+		buf := getChunk(c.cs)
+		c.lc.totalAllocated += int64(cap(buf))
+		c.chunks = append(c.chunks, chunk{buf: buf})
 		c.head = 0
 	}
 	cur := &c.chunks[c.head]
@@ -308,17 +362,24 @@ func (c *Context) Alloc(n int) []byte {
 	for i := range result {
 		result[i] = 0
 	}
+	c.lc.currentBytes += int64(n)
+	if c.lc.currentBytes > c.lc.peakBytes {
+		c.lc.peakBytes = c.lc.currentBytes
+	}
 	return result
 }
 
 // AllocAligned returns aligned storage. align must be a power of two in [1, 64].
 func (c *Context) AllocAligned(n, align int) []byte {
+	c.ensureLC()
 	if c.isShared() {
 		permMu.Lock()
 		defer permMu.Unlock()
 	}
 	if len(c.chunks) == 0 {
-		c.chunks = append(c.chunks, chunk{buf: getChunk(c.cs)})
+		buf := getChunk(c.cs)
+		c.lc.totalAllocated += int64(cap(buf))
+		c.chunks = append(c.chunks, chunk{buf: buf})
 		c.head = 0
 	}
 	cur := &c.chunks[c.head]
@@ -340,6 +401,10 @@ func (c *Context) AllocAligned(n, align int) []byte {
 	for i := range result {
 		result[i] = 0
 	}
+	c.lc.currentBytes += int64(n)
+	if c.lc.currentBytes > c.lc.peakBytes {
+		c.lc.peakBytes = c.lc.currentBytes
+	}
 	return result
 }
 
@@ -347,6 +412,7 @@ func (c *Context) AllocAligned(n, align int) []byte {
 // offset = chunkIdx * defaultChunkSize + byteOffsetWithinChunk.
 // This matches executor.Arena's Allocate offset semantics exactly.
 func (c *Context) allocBytes(b []byte) (offset, length uint32) {
+	c.ensureLC()
 	n := len(b)
 	if n == 0 {
 		return 0, 0
@@ -356,7 +422,9 @@ func (c *Context) allocBytes(b []byte) (offset, length uint32) {
 		defer permMu.Unlock()
 	}
 	if len(c.chunks) == 0 {
-		c.chunks = append(c.chunks, chunk{buf: getChunk(c.cs)})
+		buf := getChunk(c.cs)
+		c.lc.totalAllocated += int64(cap(buf))
+		c.chunks = append(c.chunks, chunk{buf: buf})
 		c.head = 0
 	}
 	cur := &c.chunks[c.head]
@@ -366,6 +434,10 @@ func (c *Context) allocBytes(b []byte) (offset, length uint32) {
 	}
 	start := len(cur.buf)
 	cur.buf = append(cur.buf, b...)
+	c.lc.currentBytes += int64(n)
+	if c.lc.currentBytes > c.lc.peakBytes {
+		c.lc.peakBytes = c.lc.currentBytes
+	}
 	// offset = chunkIdx * chunkSize + byteOffsetWithinChunk
 	off := uint32(c.head)*c.cs + uint32(start)
 	return off, uint32(n)

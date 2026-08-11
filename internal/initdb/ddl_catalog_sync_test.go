@@ -282,3 +282,52 @@ func TestCreateIndexSyncsToPGClass(t *testing.T) {
 		t.Errorf("relkind=%q want 'i'", row.RelKind)
 	}
 }
+
+// TestAddColumnSurvivesRestart verifies that ALTER TABLE ADD COLUMN syncs the
+// new pg_attribute heap rows, so the added column is visible after a clean
+// restart (M0130-S3).
+func TestAddColumnSurvivesRestart(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+
+	rt1, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDDL(t, rt1, "CREATE TABLE addcol (id int4 NOT NULL)")
+	runDDL(t, rt1, "ALTER TABLE addcol ADD COLUMN extra text")
+
+	tbl1, ok := rt1.Catalog.LookupTable(parser.ObjectName{Name: "addcol"})
+	if !ok {
+		t.Fatal("addcol not found in catalog before restart")
+	}
+	if len(tbl1.Columns) != 2 {
+		t.Fatalf("before restart: want 2 columns, got %d", len(tbl1.Columns))
+	}
+	if tbl1.Columns[1].Name != "extra" {
+		t.Errorf("before restart: column[1].Name=%q want extra", tbl1.Columns[1].Name)
+	}
+
+	if err := rt1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt2.Close()
+
+	tbl2, ok := rt2.Catalog.LookupTable(parser.ObjectName{Name: "addcol"})
+	if !ok {
+		t.Fatal("addcol not found in catalog after restart")
+	}
+	if len(tbl2.Columns) != 2 {
+		t.Fatalf("after restart: want 2 columns, got %d — ADD COLUMN not synced to heap", len(tbl2.Columns))
+	}
+	if tbl2.Columns[1].Name != "extra" {
+		t.Errorf("after restart: column[1].Name=%q want extra", tbl2.Columns[1].Name)
+	}
+}

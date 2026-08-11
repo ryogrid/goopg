@@ -3,7 +3,6 @@ package executor
 import (
 	"fmt"
 
-	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
@@ -72,7 +71,7 @@ func queueDeferredExclusionCheck(ctx *Context, tbl *catalog.Table, idx *catalog.
 	}
 	switch idx.ExclusionOp {
 	case "=":
-		key, err := encodeIndexKeyFromCols(idx, cols, row, ctx.Catalog)
+		key, err := ctx.indexRowProbeKey(idx, cols, row)
 		if err != nil || key == nil {
 			return // NULL key column never conflicts.
 		}
@@ -183,7 +182,7 @@ func runAllDeferredExclusionChecks(ctx *Context, checks []DeferredExclusionCheck
 func recheckDeferredExclusionEq(ctx *Context, tbl *catalog.Table, idx *catalog.Index, key []byte, detail string) error {
 	rel := ctx.Catalog.RelFileNode(tbl)
 	idxRel := ctx.Catalog.IndexRelFileNode(idx)
-	tree, err := btree.Open(ctx.Pool, idxRel)
+	tree, err := openIndexBTree(ctx, idx, idxRel)
 	if err != nil {
 		// Index unreadable (e.g. dropped in-txn) — nothing to enforce.
 		return nil

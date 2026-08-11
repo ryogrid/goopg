@@ -41,6 +41,10 @@ const (
 	pgClassOidIndexOID             uint32 = 2662
 	pgClassRelnameNspIndexOID      uint32 = 2663
 	pgAttributeRelidAttnumIndexOID uint32 = 2659
+	pgAttrdefAdrelidAdnumIndexOID  uint32 = 2656
+	pgAttrdefOidIndexOID           uint32 = 2657
+	pgIndexIndrelidIndexOID        uint32 = 2678
+	pgIndexIndexrelidIndexOID      uint32 = 2679
 )
 
 // All bootstrap btrees write their root-leaf at block 1 (block 0 is the
@@ -207,6 +211,44 @@ const (
 	pgProcPronameArgsNspIndexOID = 2691
 )
 
+// pg_rewrite index OIDs (postgres/src/include/catalog/pg_rewrite.h:56-57).
+// M0131-S5. Note 2620 — named in three deferral-ledger rows as "the pg_rewrite
+// index" — is actually pg_trigger (pg_trigger.h:34); the pg_rewrite pair is
+// 2692/2693 on heap 2618.
+const (
+	pgRewriteOidIndexOID         uint32 = 2692
+	pgRewriteRelRulenameIndexOID uint32 = 2693
+)
+
+// The (oid, NameData) key shape 2693 needs — the COLUMN-REVERSED sibling of
+// buildIndexTupleNameOidKey — already exists as buildIndexTupleOidNameKey /
+// cmpKeyOidName (sys_pg_enum.go, added for pg_enum_typid_label_index 3503).
+// Both are byte-identical to initdb's pgBuildIndexTupleOidNameKey, which is
+// what bootstrapPgRewriteRelRulenameIndex writes, so runtime entries sort
+// correctly beside the bootstrap ones in the same leaf.
+
+// insertPgRewriteRelRulenameIndexEntry inserts an entry into
+// pg_rewrite_rel_rulename_index (2693, RewriteRelRulenameIndexId) for
+// ((ev_class, rulename) → heap TID). This index is LOAD-BEARING for a real PG
+// hosted on a goopg catalog: RelationBuildRuleLock
+// (postgres/src/backend/utils/cache/relcache.c:785-806) scans pg_rewrite with
+// indexOK=true — a hard constant, so systable_beginscan
+// (access/index/genam.c:397-401) has no seq-scan fallback. An empty 2693 leaves
+// rd_rules == NULL, the view keeps rd_tableam == NULL, and the planner raises
+// 42809 at optimizer/util/plancat.c:139-147. M0131-S5.
+func insertPgRewriteRelRulenameIndexEntry(ctx *Context, evClass uint32, ruleName string, tid storage.ItemPointer) error {
+	tup := buildIndexTupleOidNameKey(uint32(tid.Block), tid.Offset, evClass, ruleName)
+	return insertCanonicalSysBtreeLeaf(ctx, pgRewriteRelRulenameIndexOID, tup, cmpKeyOidName)
+}
+
+// insertPgRewriteOidIndexEntry inserts an entry into pg_rewrite_oid_index
+// (2692, RewriteOidIndexId) for (rule oid → heap TID). Used by PG's RULEOID
+// syscache and the dependency machinery (RemoveRewriteRuleById). M0131-S5.
+func insertPgRewriteOidIndexEntry(ctx *Context, oid uint32, tid storage.ItemPointer) error {
+	tup := buildIndexTupleOidKey(uint32(tid.Block), tid.Offset, oid)
+	return insertCanonicalSysBtreeLeaf(ctx, pgRewriteOidIndexOID, tup, cmpKeyUint32)
+}
+
 // pg_type index OIDs (postgres/src/include/catalog/pg_type.h). B2.1a.
 const (
 	pgTypeOidIndexOID        = 2703
@@ -342,6 +384,32 @@ func insertPgNamespaceNspnameIndexEntry(ctx *Context, nspname string, tid storag
 func insertPgNamespaceOidIndexEntry(ctx *Context, oid uint32, tid storage.ItemPointer) error {
 	tup := buildIndexTupleOidKey(uint32(tid.Block), tid.Offset, oid)
 	return insertCanonicalSysBtreeLeaf(ctx, pgNamespaceOidIndexOID, tup, cmpKeyUint32)
+}
+
+// insertPgIndexIndrelidIndexEntry inserts an entry into
+// pg_index_indrelid_index (OID 2678, IndexIndrelidIndexId) for
+// (indrelid → pg_index heap TID). NON-unique: one entry per index of the
+// relation.
+//
+// This is the index PG's `RelationGetIndexList` (relcache.c) scans to learn
+// which indexes a relation has; a pg_index heap row that is not present here
+// is invisible to a PG 18.3 instance reading a goopg cluster, which then
+// performs NO index maintenance for that index (its own INSERTs emit zero
+// RM_BTREE records). AI-20260810-011258-003 blocker #8.
+func insertPgIndexIndrelidIndexEntry(ctx *Context, indrelid uint32, tid storage.ItemPointer) error {
+	tup := buildIndexTupleOidKey(uint32(tid.Block), tid.Offset, indrelid)
+	return insertCanonicalSysBtreeLeaf(ctx, pgIndexIndrelidIndexOID, tup, cmpKeyUint32)
+}
+
+// insertPgIndexIndexrelidIndexEntry inserts an entry into
+// pg_index_indexrelid_index (OID 2679, IndexRelidIndexId) for
+// (indexrelid → pg_index heap TID). PG resolves every Form_pg_index through
+// the INDEXRELID syscache, which falls back to a sysscan on THIS index; once
+// 2678 makes an index discoverable, its 2679 entry must exist too or the
+// relcache build FATALs with "cache lookup failed for index <oid>".
+func insertPgIndexIndexrelidIndexEntry(ctx *Context, indexrelid uint32, tid storage.ItemPointer) error {
+	tup := buildIndexTupleOidKey(uint32(tid.Block), tid.Offset, indexrelid)
+	return insertCanonicalSysBtreeLeaf(ctx, pgIndexIndexrelidIndexOID, tup, cmpKeyUint32)
 }
 
 // insertCanonicalSysBtreeLeaf inserts indexTuple into the leaf-root page of
@@ -566,4 +634,24 @@ func insertPgClassRelnameNspIndexEntry(ctx *Context, relname string, relnamespac
 func insertPgAttributeRelidAttnumIndexEntry(ctx *Context, attrelid uint32, attnum int16, tid storage.ItemPointer) error {
 	tup := buildIndexTupleOidInt2Key(uint32(tid.Block), tid.Offset, attrelid, attnum)
 	return insertCanonicalSysBtreeLeaf(ctx, pgAttributeRelidAttnumIndexOID, tup, cmpKeyOidInt2)
+}
+
+// insertPgAttrdefAdrelidAdnumIndexEntry inserts an entry into
+// pg_attrdef_adrelid_adnum_index (OID 2656, AttrDefaultIndexId) for
+// ((adrelid, adnum) → heap TID). PG's AttrDefaultFetch (relcache.c) reads
+// every column default through THIS index, never by seq-scan, so a
+// pg_attrdef heap row that is not indexed is invisible to a PG standby even
+// though the heap insert replayed byte-correctly. Key shape is identical to
+// pg_attribute_relid_attnum_index (oid, int2). AI-20260810-011258-003.
+func insertPgAttrdefAdrelidAdnumIndexEntry(ctx *Context, adrelid uint32, adnum int16, tid storage.ItemPointer) error {
+	tup := buildIndexTupleOidInt2Key(uint32(tid.Block), tid.Offset, adrelid, adnum)
+	return insertCanonicalSysBtreeLeaf(ctx, pgAttrdefAdrelidAdnumIndexOID, tup, cmpKeyOidInt2)
+}
+
+// insertPgAttrdefOidIndexEntry inserts an entry into pg_attrdef_oid_index
+// (OID 2657, AttrDefaultOidIndexId) for (oid → heap TID). Used by PG's
+// GetAttrDefaultColumnAddress / RemoveAttrDefaultById dependency paths.
+func insertPgAttrdefOidIndexEntry(ctx *Context, oid uint32, tid storage.ItemPointer) error {
+	tup := buildIndexTupleOidKey(uint32(tid.Block), tid.Offset, oid)
+	return insertCanonicalSysBtreeLeaf(ctx, pgAttrdefOidIndexOID, tup, cmpKeyUint32)
 }

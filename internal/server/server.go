@@ -265,6 +265,12 @@ type Config struct {
 	// `<DataDir>/global/pg_control` once that file exists.
 	SystemID string
 
+	// Timeline is the cluster's current TLI, read from pg_control at
+	// startup (M0130-S8). Reported by IDENTIFY_SYSTEM and used to
+	// validate START_REPLICATION TIMELINE n. Zero means "use TLI=1"
+	// — the default for a freshly-initialised cluster.
+	Timeline uint32
+
 	// DataDir, when set, controls where the server writes its
 	// `postmaster.pid` file and binds its operator-facing control
 	// socket. Empty disables both — useful for in-process tests
@@ -1424,7 +1430,7 @@ func (s *Server) sendStartupReply(w *protocol.FrameWriter, sess *config.SessionR
 	if err := w.WriteBackendKeyData(pid, secret); err != nil {
 		return err
 	}
-	if err := w.WriteReadyForQuery(protocol.TxStatusIdle); err != nil {
+	if err := w.ReadyForQuery(); err != nil {
 		return err
 	}
 	return w.Flush()
@@ -1511,6 +1517,13 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 	// connTxState.End() at COMMIT/ROLLBACK (and on teardown via
 	// rollbackOpenTxnOnTeardown).
 	connTx.LockBackendID = lockmgr.BackendID(s.nextBackendID.Add(1))
+	// Every ReadyForQuery on this connection now reports the live transaction
+	// status ('I'/'T'/'E') instead of a hard-coded 'I'. libpq surfaces the byte
+	// as PQtransactionStatus; pgbench reads it after a failed command to decide
+	// whether the failed block still needs a ROLLBACK, and a permanent 'I' made
+	// it skip that ROLLBACK and abort on the next BEGIN with 25P02
+	// (AI-20260810-011258-006). See connTxState.wireStatus.
+	w.TxStatusFn = connTx.wireStatus
 	// LISTEN/NOTIFY identity: the backend PID is the source of NOTIFY deliveries
 	// and the SessionRegistry is the hub key. On teardown drop every channel
 	// registration and undelivered notification for this session, mirroring
@@ -1747,7 +1760,7 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 			}
 		case protocol.MsgSync:
 			extended.syncRequired = false
-			if err := w.WriteReadyForQuery(protocol.TxStatusIdle); err != nil {
+			if err := w.ReadyForQuery(); err != nil {
 				return
 			}
 		case protocol.MsgFlush:
@@ -1763,7 +1776,7 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 			if err != nil {
 				return
 			}
-			if err := w.WriteReadyForQuery(protocol.TxStatusIdle); err != nil {
+			if err := w.ReadyForQueryAfterError(); err != nil {
 				return
 			}
 		}

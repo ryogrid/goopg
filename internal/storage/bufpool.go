@@ -94,6 +94,14 @@ func (s *Slot) Unlock()  { s.contentMu.Unlock() }
 func (s *Slot) RLock()   { s.contentMu.RLock() }
 func (s *Slot) RUnlock() { s.contentMu.RUnlock() }
 
+// TryRLock attempts the shared content lock without blocking, reporting
+// whether it was taken (the caller must RUnlock on true). It exists so a
+// caller can ASSERT that some other code path is holding a page's exclusive
+// latch — the b-tree page-deletion protocol (M0130-S11.5d-3b) is only correct
+// if the pages named by an unlink record are still latched when the record is
+// emitted, and that is otherwise unobservable.
+func (s *Slot) TryRLock() bool { return s.contentMu.TryRLock() }
+
 // valid is a read helper for tests/internal callers.
 func (s *Slot) isValid() bool { return stateValid(s.state.Load()) }
 
@@ -130,6 +138,11 @@ type Pool struct {
 	logBtreeUnlinkPage       LogBtreeUnlinkPageFunc
 	logBtreeNewRoot          LogBtreeNewRootFunc
 	logBtreeMarkPageHalfDead LogBtreeMarkPageHalfDeadFunc
+	// btreeRecycleHorizon is the b-tree page-deletion XID horizon source
+	// (M0130-S11.5d-3c). Set after construction rather than through PoolConfig
+	// because the transaction manager that answers it is created after the
+	// pool. See BtreeRecycleHorizonFunc.
+	btreeRecycleHorizon atomic.Pointer[BtreeRecycleHorizonFunc]
 	// M0080-0001 logical record for VACUUM FREEZE.
 	logHeapFreeze LogHeapFreezeFunc
 	// logHeapHotUpdate emits an atomic HOT-update WAL record.
@@ -654,6 +667,10 @@ type PoolConfig struct {
 // enforce write-ahead ordering.
 type WALFlusher interface {
 	FlushUpTo(lsn uint64) error
+	// WalRecords returns the lifetime total WAL records appended (M0122-0003).
+	WalRecords() int64
+	// WalBytes returns the lifetime total WAL record payload bytes (M0122-0003).
+	WalBytes() int64
 }
 
 // LogBtreeSplitFunc emits one atomic WAL record covering a B-tree page split.
@@ -661,7 +678,19 @@ type WALFlusher interface {
 // relinked to rightBlk and sibPage its post-relink image, so the relink is
 // crash-atomic with the split; on a rightmost split sibBlk is
 // InvalidBlockNumber and sibPage is nil.
-type LogBtreeSplitFunc func(rel RelFileNode, leftBlk, rightBlk BlockNumber, leftPage, rightPage Page, sibBlk BlockNumber, sibPage Page) (LSN, error)
+//
+// childBlk (M0130-S11.5b-3) is upstream's backup block 3: on an INTERNAL split
+// it is the page one level down whose incomplete-split flag this insertion
+// finishes, so redo can clear that flag under the same record. It is
+// InvalidBlockNumber on a leaf split, where upstream has no cbuf either.
+//
+// prePage and newItem (M0130-S11.5b-2) describe the left half INCREMENTALLY:
+// prePage is the split page as it stood before the rewrite and newItem the raw
+// item whose insertion caused the split, which together let the encoder log
+// "these items, cut here, with this one spliced in" instead of a page-sized
+// image. Both may be nil — the encoder then logs the image, as it also does
+// when the two cannot reproduce the page the primary wrote.
+type LogBtreeSplitFunc func(rel RelFileNode, leftBlk, rightBlk BlockNumber, prePage, leftPage, rightPage Page, newItem []byte, sibBlk BlockNumber, sibPage Page, childBlk BlockNumber) (LSN, error)
 
 // LogHeapInsertFunc emits one logical heap-insert redo record. initPage marks
 // the first tuple on a freshly-initialised page (XLOG_HEAP_INIT_PAGE) so a
@@ -669,7 +698,12 @@ type LogBtreeSplitFunc func(rel RelFileNode, leftBlk, rightBlk BlockNumber, left
 type LogHeapInsertFunc func(rel RelFileNode, blk BlockNumber, lineSlot uint16, tuple []byte, initPage bool) (LSN, error)
 
 // LogBtreeInsertFunc emits one logical B-tree non-split insert redo record.
-type LogBtreeInsertFunc func(rel RelFileNode, blk BlockNumber, item []byte) (LSN, error)
+// `offnum` is the physical 1-based offset number the item was placed at, which
+// replay re-inserts at verbatim (upstream xl_btree_insert.offnum; M0130-S11.4
+// slice 3b-2c-ii-B2-b-ii). It is not a convenience: recovery cannot re-derive
+// the slot by key, because that needs the index's comparison semantics and
+// recovery holds a relfilenode with no catalog to resolve them from.
+type LogBtreeInsertFunc func(rel RelFileNode, blk BlockNumber, offnum uint16, item []byte) (LSN, error)
 
 // LogHeapDeleteFunc emits one logical heap-delete (xmax stamp) redo record.
 type LogHeapDeleteFunc func(rel RelFileNode, blk BlockNumber, lineSlot uint16, xmax TransactionID, oldTuple []byte) (LSN, error)
@@ -680,37 +714,80 @@ type LogHeapLockFunc func(rel RelFileNode, blk BlockNumber, lineSlot uint16, xma
 // LogHeapVacuumFunc emits one logical heap-vacuum (page prune) redo record.
 type LogHeapVacuumFunc func(rel RelFileNode, blk BlockNumber, deadSlots []uint16) (LSN, error)
 
-// LogBtreeVacuumFunc emits one btree-vacuum redo record. A8: the record now
-// carries the post-vacuum page as a full-page image (see wal.EncodeBtreeVacuumPG),
-// so the caller passes the mutated page rather than the kept-items projection.
-type LogBtreeVacuumFunc func(rel RelFileNode, blk BlockNumber, page Page) (LSN, error)
+// LogBtreeVacuumFunc emits one btree-vacuum redo record (PG's
+// xl_btree_vacuum). M0130-S11.5c: the caller passes BOTH pages — the page as it
+// was before the rewrite and the page it wrote — plus the physical offset
+// numbers it deleted, so the encoder can check that "delete these offsets"
+// reproduces the written page and fall back to a full-page image when it does
+// not. `prePage` may be nil and `deleted` empty; that asks for the image form
+// outright (the dedup-recovery rewrite is a consolidation, not a deletion).
+type LogBtreeVacuumFunc func(rel RelFileNode, blk BlockNumber, prePage, page Page, deleted []uint16) (LSN, error)
 
-// BtreeUnlinkPageRequest collects the 4-page mutation control info.
+// BtreeUnlinkPageRequest is the PHASE 2 half of btree page deletion — upstream's
+// xl_btree_unlink_page (M0130-S11.5d-3b-2). It carries PAGES, not link fields:
+// the encoder reads leftsib/rightsib/level off the target image and
+// leafleftsib/leafrightsib/leaftopparent off the half-dead leaf's dummy high
+// key, so the record cannot describe a page differently from the page the
+// primary wrote (the discipline S11.5a established, and the reason the old
+// native record's advisory control fields — including ParentRemoveSlot — are
+// gone).
 type BtreeUnlinkPageRequest struct {
-	LeafBlk          BlockNumber
-	LeafFlagsAfter   uint16
-	HasLeftSib       bool
-	LeftSibBlk       BlockNumber
-	LeftSibNewNext   BlockNumber
-	HasRightSib      bool
-	RightSibBlk      BlockNumber
-	RightSibNewPrev  BlockNumber
-	HasParent        bool
-	ParentBlk        BlockNumber
-	ParentRemoveSlot uint16
+	// TargetBlk / TargetPage are the page being unlinked. TargetPage is the
+	// POST-mutation image: goopg relinks the nearest LIVE siblings rather than
+	// the target's own btpo_prev/btpo_next (a vacuum pass marks a whole
+	// adjacent run dead before unlinking any of it), so the pre-mutation links
+	// on the page are not the blocks this record relinks.
+	TargetBlk  BlockNumber
+	TargetPage Page
+	// SafeXid is the FullTransactionId BTPageSetDeleted stamps — the XID from
+	// which the block becomes recyclable. Read from the cluster XID counter at
+	// deletion time via Pool.BtreeRecycleHorizon (M0130-S11.5d-3c); 0 when no
+	// horizon source is wired, which means "recyclable immediately".
+	SafeXid uint64
+	// LeafBlk / LeafPage are the half-dead leaf at the bottom of the subtree.
+	// LeafBlk == TargetBlk (and LeafPage nil) for the single-page deletion
+	// goopg performs; a deeper subtree registers the leaf as block 3.
+	LeafBlk  BlockNumber
+	LeafPage Page
+	// MetaBlk / MetaPage select the _META variant; MetaBlk is
+	// InvalidBlockNumber when the metapage is untouched.
+	MetaBlk  BlockNumber
+	MetaPage Page
 }
 
-// LogBtreeUnlinkPageFunc emits the M0079-0003 atomic page-deletion redo record.
+// LogBtreeUnlinkPageFunc emits the phase-2 page-deletion redo record.
 type LogBtreeUnlinkPageFunc func(rel RelFileNode, req BtreeUnlinkPageRequest) (LSN, error)
 
-// LogBtreeNewRootFunc emits the root-replacement record. A8: the record now
-// carries the new root page (backup block 0) and the updated metapage (backup
-// block 2) as full-page images (see wal.EncodeBtreeNewRootPG), so the caller
-// passes both mutated pages rather than the (rootBlk, level, items) projection.
-type LogBtreeNewRootFunc func(rel RelFileNode, rootBlk BlockNumber, rootPage Page, metaBlk BlockNumber, metaPage Page) (LSN, error)
+// LogBtreeNewRootFunc emits the root-replacement record. A8: the record carries
+// the new root page (backup block 0) and the updated metapage (backup block 2),
+// so the caller passes both mutated pages rather than the (rootBlk, level,
+// items) projection. M0130-S11.5a: they now ride as PG block DATA rather than
+// full-page images (see wal.EncodeBtreeNewRootPG), which adds `leftChildBlk` —
+// upstream's backup block 1, the child whose incomplete-split flag redo clears.
+// Pass InvalidBlockNumber when the new root is a level-0 (leaf) root, which has
+// no children; the encoder rejects the inconsistent combinations.
+type LogBtreeNewRootFunc func(rel RelFileNode, rootBlk BlockNumber, rootPage Page, leftChildBlk BlockNumber, metaBlk BlockNumber, metaPage Page) (LSN, error)
 
-// LogBtreeMarkPageHalfDeadFunc emits the M0079-0003 leaf-only half-dead transition record.
-type LogBtreeMarkPageHalfDeadFunc func(rel RelFileNode, leafBlk BlockNumber, flagsAfter uint16) (LSN, error)
+// BtreeMarkPageHalfDeadRequest is the PHASE 1 half of btree page deletion —
+// upstream's xl_btree_mark_page_halfdead (M0130-S11.5d-3b-2). Like its phase-2
+// twin it passes the leaf PAGE: the record's leftblk/rightblk are read off it,
+// never accepted from the caller.
+type BtreeMarkPageHalfDeadRequest struct {
+	LeafBlk  BlockNumber
+	LeafPage Page
+	// ParentBlk / POffset locate the downlink being retargeted-and-deleted.
+	// POffset is a PHYSICAL OffsetNumber, and is never 0: upstream registers
+	// the parent unconditionally and its redo reads it unconditionally.
+	ParentBlk BlockNumber
+	POffset   uint16
+	// TopParent is the root of the subtree being deleted, or
+	// InvalidBlockNumber when that is the leaf itself (goopg's only case so
+	// far — it deletes one page at a time).
+	TopParent BlockNumber
+}
+
+// LogBtreeMarkPageHalfDeadFunc emits the phase-1 half-dead transition record.
+type LogBtreeMarkPageHalfDeadFunc func(rel RelFileNode, req BtreeMarkPageHalfDeadRequest) (LSN, error)
 
 // LogHeapFreezeFunc emits the M0080-0001 heap-freeze redo record.
 type LogHeapFreezeFunc func(rel RelFileNode, blk BlockNumber, frozenSlots []uint16) (LSN, error)
@@ -874,6 +951,39 @@ func (p *Pool) LogHeapUpdate() LogHeapUpdateFunc { return p.logHeapUpdate }
 // LogHeapPruneOpt returns the configured opportunistic-pruning change-record hook.
 func (p *Pool) LogHeapPruneOpt() LogHeapPruneOptFunc { return p.logHeapPruneOpt }
 
+// BtreeRecycleHorizonFunc reports the two FullTransactionIds b-tree page
+// deletion needs (M0130-S11.5d-3c):
+//
+//   - next: upstream's `ReadNextFullTransactionId()`, stamped into the deleted
+//     page as its BTDeletedPageData.safexid;
+//   - oldestVisible: the boundary `GlobalVisCheckRemovableFullXid` tests
+//     against — the oldest XID any live snapshot can still see, below which a
+//     deleted page can no longer be reached by an in-flight scan.
+//
+// Both are epoch-0 FullTransactionIds (goopg's 32-bit XID space widened; see
+// btree.PGPageIsRecyclable).
+type BtreeRecycleHorizonFunc func() (next, oldestVisible uint64)
+
+// SetBtreeRecycleHorizon installs the page-deletion XID horizon source. Called
+// once during startup wiring, after the transaction manager exists. When unset,
+// b-tree deletion stamps safexid 0 and recycles blocks immediately — the
+// pre-S11.5d-3c behaviour that throwaway pools in tests rely on.
+func (p *Pool) SetBtreeRecycleHorizon(fn BtreeRecycleHorizonFunc) {
+	if fn == nil {
+		p.btreeRecycleHorizon.Store(nil)
+		return
+	}
+	p.btreeRecycleHorizon.Store(&fn)
+}
+
+// BtreeRecycleHorizon returns the configured horizon source, or nil.
+func (p *Pool) BtreeRecycleHorizon() BtreeRecycleHorizonFunc {
+	if fn := p.btreeRecycleHorizon.Load(); fn != nil {
+		return *fn
+	}
+	return nil
+}
+
 // SetFullPageWrites toggles full-page-image emission at runtime.
 func (p *Pool) SetFullPageWrites(on bool) { p.fullPageWrites.Store(on) }
 
@@ -1018,6 +1128,16 @@ func (p *Pool) Manager() *Manager { return p.mgr }
 // shared_blks_read (postgres/src/include/executor/instrument.h).
 func (p *Pool) BufferCounters() (hit, read, dirtied, written int64) {
 	return p.sharedHitCount.Load(), p.sharedReadCount.Load(), p.sharedDirtiedCount.Load(), p.sharedWrittenCount.Load()
+}
+
+// WalCounters returns the WAL writer's cumulative record and byte counters.
+// EXPLAIN (WAL) diffs a before/after snapshot (M0122-0003).
+// Returns 0,0 when WAL is nil (e.g. in tests that don't wire it).
+func (p *Pool) WalCounters() (records, bytes int64) {
+	if p.wal == nil {
+		return 0, 0
+	}
+	return p.wal.WalRecords(), p.wal.WalBytes()
 }
 
 // AddReadTimeNanos accumulates n nanoseconds of real disk-read wait time

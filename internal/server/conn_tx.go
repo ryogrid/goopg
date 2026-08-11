@@ -32,6 +32,7 @@ import (
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/protocol"
 )
 
 // cursorEntry holds the state of an open SQL cursor. M0097-0042.
@@ -392,6 +393,38 @@ func (c *connTxState) SnapshotLocalRoleIfNeeded(local bool) {
 	}
 	prior := c.NonSuperuserRole
 	c.LocalRolePriorValue = &prior
+}
+
+// wireStatus computes the ReadyForQuery transaction-status byte for this
+// connection, mirroring PostgreSQL's TransactionBlockStatusCode()
+// (src/backend/access/transam/xact.c):
+//
+//	'I' — idle, no transaction block open
+//	'T' — a transaction block is open and valid
+//	'E' — a transaction block is open but aborted (25P02)
+//
+// afterError is set by the ErrorResponse path. goopg's dispatch loop calls
+// Fail() only AFTER the error has been written (dispatch.go, errQueryErrorSent),
+// while upstream aborts the transaction before emitting 'Z'; reporting 'E' for
+// an explicit block that is erroring right now restores upstream's ordering
+// without moving the Fail() call.
+//
+// A prepared transaction reports 'I': PREPARE TRANSACTION ends the client's
+// transaction block even though goopg keeps the underlying transaction open
+// until COMMIT/ROLLBACK PREPARED.
+func (c *connTxState) wireStatus(afterError bool) protocol.TransactionStatus {
+	if c == nil {
+		return protocol.TxStatusIdle
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.active || c.preparedGid != "" {
+		return protocol.TxStatusIdle
+	}
+	if c.failed || afterError {
+		return protocol.TxStatusInFailedTransaction
+	}
+	return protocol.TxStatusInTransaction
 }
 
 // InExplicit reports whether an explicit transaction is currently active.

@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/config"
+	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/initdb"
 	"github.com/goopg/goopg/internal/server"
 	"github.com/goopg/goopg/internal/wal"
@@ -282,6 +283,19 @@ func (sc *standbyController) finalizePromotion() error {
 		if err := initdb.WriteTimelineID(sc.rt.DataDir, newTLI); err != nil {
 			return fmt.Errorf("promote: persist new timeline_id: %w", err)
 		}
+		// M0130-S8: update pg_control's CheckPoint copy so the
+		// authoritative TLI source reflects the promotion. Mirrors
+		// upstream CreateEndOfRecoveryRecord's control-file update
+		// (xlog.c:5638-5642). The flat file above is updated first so a
+		// crash between WriteTimelineID and UpdateControlFile still has
+		// the correct TLI in at least one place — LoadOrCreateTimelineID
+		// gives pg_control precedence on restart.
+		if err := control.UpdateControlFile(sc.rt.DataDir, func(cd *control.ControlFileData) {
+			cd.CheckPointCopyThisTLI = newTLI
+			cd.CheckPointCopyPrevTLI = oldTLI
+		}); err != nil {
+			return fmt.Errorf("promote: update pg_control TLI: %w", err)
+		}
 		sc.logger.Info("promote: timeline bumped",
 			"old_tli", oldTLI, "new_tli", newTLI, "switch_lsn", endLSN,
 			"history_file", filepath.Join(walDir, wal.TimelineHistoryFileName(newTLI)))
@@ -377,6 +391,65 @@ func boundPromoteToServer(sc *standbyController) func() error {
 // this avoids drift if the layout ever changes.
 func walDirFor(rt *initdb.Runtime) string {
 	return filepath.Join(rt.DataDir, "pg_wal")
+}
+
+// promoteAfterRecovery runs the post-recovery promotion sequence for
+// archive recovery (M0130-S9). Mirrors finalizePromotion but does not
+// require a standby controller — the archive recovery loop already
+// replayed all available WAL. Steps:
+//
+//  1. Compute the new TLI (oldTLI + 1).
+//  2. Append a history entry for oldTLI + endLSN.
+//  3. Write the timeline history file for newTLI.
+//  4. Persist newTLI to the flat file and pg_control.
+//  5. Remove recovery.signal.
+func promoteAfterRecovery(rt *initdb.Runtime, logger *slog.Logger) error {
+	if rt.DataDir == "" {
+		return nil
+	}
+	oldTLI, err := initdb.LoadOrCreateTimelineID(rt.DataDir)
+	if err != nil {
+		return fmt.Errorf("promote after recovery: load timeline_id: %w", err)
+	}
+	newTLI := oldTLI + 1
+	walDir := walDirFor(rt)
+
+	// Use WrittenLSN as the switch point (the archive recovery loop
+	// replayed everything through the WAL writer).
+	var endLSN uint64
+	if rt.WAL != nil {
+		endLSN = rt.WAL.WrittenLSN()
+	}
+
+	prev, err := wal.ReadHistory(walDir, oldTLI)
+	if err != nil {
+		return fmt.Errorf("promote after recovery: read prior history: %w", err)
+	}
+	entries := append(prev, wal.TimelineHistoryEntry{
+		TLI:       oldTLI,
+		SwitchLSN: endLSN,
+		Reason:    "archive recovery complete",
+	})
+	if err := wal.WriteHistory(walDir, newTLI, entries); err != nil {
+		return fmt.Errorf("promote after recovery: write timeline history: %w", err)
+	}
+	if err := initdb.WriteTimelineID(rt.DataDir, newTLI); err != nil {
+		return fmt.Errorf("promote after recovery: persist new timeline_id: %w", err)
+	}
+	if err := control.UpdateControlFile(rt.DataDir, func(cd *control.ControlFileData) {
+		cd.CheckPointCopyThisTLI = newTLI
+		cd.CheckPointCopyPrevTLI = oldTLI
+	}); err != nil {
+		return fmt.Errorf("promote after recovery: update pg_control TLI: %w", err)
+	}
+
+	if err := initdb.RemoveRecoverySignal(rt.DataDir); err != nil {
+		return fmt.Errorf("promote after recovery: remove recovery.signal: %w", err)
+	}
+	logger.Info("archive recovery promotion complete",
+		"old_tli", oldTLI, "new_tli", newTLI, "switch_lsn", endLSN,
+		"history_file", filepath.Join(walDir, wal.TimelineHistoryFileName(newTLI)))
+	return nil
 }
 
 // reqStandbyConfig is a no-op compile-time check that the wal +

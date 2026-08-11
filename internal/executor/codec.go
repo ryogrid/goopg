@@ -10,7 +10,9 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mctx"
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/pglz"
+	"github.com/goopg/goopg/internal/pgnodes"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -169,6 +171,26 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 	return s, nil
 }
 
+// pgBoolIn reproduces PostgreSQL's boolean input conversion —
+// `parse_bool_with_len` (postgres/src/backend/utils/adt/bool.c), which boolin
+// calls after trimming surrounding whitespace. The accepted spellings are the
+// unambiguous prefixes of "true"/"false"/"yes"/"no"/"on"/"off" plus "1"/"0";
+// note "o" alone is NOT accepted (it cannot distinguish on from off).
+// Returns (value, true) on success, (false, false) for unrecognised input.
+//
+// Single source of truth for the four sites that used to carry their own copy
+// of this table (evalTypedStringLit, evalCast, isValidBoolInput, and the
+// encodeValuePG bool arm) — Hard-won Rule #2.
+func pgBoolIn(s string) (bool, bool) {
+	switch strings.TrimSpace(strings.ToLower(s)) {
+	case "t", "tr", "tru", "true", "y", "ye", "yes", "on", "1":
+		return true, true
+	case "f", "fa", "fal", "fals", "false", "n", "no", "of", "off", "0":
+		return false, true
+	}
+	return false, false
+}
+
 // encodeValuePG encodes a single datum in PG-native format.
 func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 	// A user array column (e.g. `p int4[]`) carries Type.Name="int4" plus
@@ -180,10 +202,26 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 	}
 	switch strings.ToLower(t.Name) {
 	case "bool", "boolean":
-		if d.Kind != KindBool {
+		var b bool
+		switch d.Kind {
+		case KindBool:
+			b = d.BoolValue()
+		case KindString:
+			// A bare quoted literal (`INSERT INTO t(b) VALUES ('true')`) is
+			// typed `unknown` upstream and reaches the column through boolin
+			// (postgres/src/backend/utils/adt/bool.c), so PG loads every
+			// pg_dump / COPY-style script that quotes its booleans. Sibling to
+			// the KindString arms every other scalar case below already has.
+			var ok bool
+			b, ok = pgBoolIn(d.StringValue())
+			if !ok {
+				return nil, &ExecError{Code: "22P02",
+					Message: fmt.Sprintf("invalid input syntax for type boolean: %q", d.StringValue())}
+			}
+		default:
 			return nil, fmt.Errorf("expected bool, got kind %d", d.Kind)
 		}
-		if d.BoolValue() {
+		if b {
 			return []byte{1}, nil
 		}
 		return []byte{0}, nil
@@ -309,11 +347,13 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 			if inf, ok := parseTimestampInfinityLiteral(d.StringValue()); ok {
 				d = inf
 			} else {
-				t, err := parseCopyTimestamp(d.StringValue())
+				// A zone in the text belongs to the value only for timestamptz;
+				// `timestamp` decodes and discards it (tsZoneMode).
+				ts, err := parseCopyTimestampZone(d.StringValue(), tsZoneModeForType(t.Name))
 				if err != nil {
 					return nil, &ExecError{Code: "22007", Pos: 0, Message: fmt.Sprintf("invalid input syntax for type timestamp: %q", d.StringValue())}
 				}
-				d = NewTimeDatum(t.UTC())
+				d = NewTimeDatum(ts.UTC())
 			}
 		}
 		if d.Kind != KindTime {
@@ -341,11 +381,14 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 			if inf, ok := parseDateInfinityLiteral(d.StringValue()); ok {
 				d = inf
 			} else {
-				t, err := parseCopyTimestamp(d.StringValue())
+				// date_in never looks at the decoded zone, nor at an hour-24 /
+				// leap-second day carry, so the wall clock as written picks the
+				// day (parseDateInputText).
+				ts, err := parseDateInputText(d.StringValue())
 				if err != nil {
 					return nil, &ExecError{Code: "22007", Pos: 0, Message: fmt.Sprintf("invalid input syntax for type date: %q", d.StringValue())}
 				}
-				d = NewTimeDatum(t.UTC())
+				d = NewTimeDatum(ts.UTC())
 			}
 		}
 		if d.Kind != KindTime {
@@ -399,6 +442,52 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		// Our Scale stores minutes east of UTC; convert: pgOffset = -Scale*60.
 		pgOffset := int32(-d.TimeTZOffsetSecs())
 		binary.LittleEndian.PutUint32(buf[8:], uint32(pgOffset))
+		return buf[:], nil
+	case "interval":
+		// PG's Interval is a fixed 16-byte, 8-byte-aligned struct
+		// (postgres/src/include/datatype/timestamp.h):
+		//
+		//	typedef struct { TimeOffset time; int32 day; int32 month; } Interval;
+		//
+		// so time (int64 microseconds) sits at offset 0, day at 8, month at 12
+		// — pg_type row {OID 1186, typlen 16, typalign 'd', typbyval false},
+		// seeded that way in internal/initdb/pg_type_seed_data.go since the
+		// beginning. goopg nevertheless stored an interval column through the
+		// varlena default arm, i.e. as the *text* the user typed, which made
+		// every runtime interval operation lexicographic: `ORDER BY i` sorted
+		// '2 hours' after '10 days', `i > interval '10 days'` kept '2 hours'
+		// and dropped '1 mon', `i = interval '30 days'` missed the '1 mon' PG
+		// calls equal, and the value echoed back verbatim ('2 hours') where PG
+		// prints '02:00:00'. Storing the three fields is what makes compareDatum's
+		// existing interval_cmp_value port (expr.go, KindInterval arm) and
+		// formatInterval reachable for a stored column at all.
+		//
+		// The ±infinity sentinels need no special case: INTERVAL_NOEND /
+		// INTERVAL_NOBEGIN *are* all-fields-at-their-extreme, so field-wise
+		// storage round-trips them exactly.
+		var months, days int32
+		var micros int64
+		switch d.Kind {
+		case KindInterval:
+			months, days, micros = d.IntervalMonthsValue(), d.IntervalDaysValue(), d.IntervalMicrosValue()
+		case KindString:
+			// A bare quoted literal (`INSERT INTO t(i) VALUES ('1 mon')`) is
+			// `unknown` upstream and reaches the column through interval_in.
+			// parser.ParseIntervalBody is the same tokenizer `'…'::interval`
+			// uses, so the two entry points cannot disagree.
+			var ok bool
+			months, days, micros, ok = parser.ParseIntervalBody(d.StringValue())
+			if !ok {
+				return nil, &ExecError{Code: "22007",
+					Message: fmt.Sprintf("invalid input syntax for type interval: %q", d.StringValue())}
+			}
+		default:
+			return nil, fmt.Errorf("expected interval, got kind %d", d.Kind)
+		}
+		var buf [16]byte
+		binary.LittleEndian.PutUint64(buf[:8], uint64(micros))
+		binary.LittleEndian.PutUint32(buf[8:12], uint32(days))
+		binary.LittleEndian.PutUint32(buf[12:16], uint32(months))
 		return buf[:], nil
 	case "name":
 		// PG NameData: fixed 64 bytes, '\0'-padded. The name type silently
@@ -518,17 +607,34 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		binary.LittleEndian.PutUint32(buf[:], v)
 		return buf[:], nil
 	case "numeric", "decimal":
-		// Store as PG varlena-text. coerceTextLikeDatum yields the decimal
-		// string for KindNumeric/KindInt and passes a KindString through
-		// verbatim (e.g. INSERT ... VALUES ('123.45') arriving as text) —
-		// numericText alone reads only the Int/Scale fields and would emit
-		// "0" for a KindString. M0111-0002 (restores the string→numeric path
-		// the removed legacy encodeValue had).
+		// M0119-0006: PG's base-10000 NumericData varlena (numeric.c
+		// make_result), not the decimal string this arm used to store. The
+		// string was a heap-format divergence of exactly the class the uuid
+		// and interval slices closed — pg_type says numeric is a varlena, so
+		// the descriptor never caught it, but a reader that trusts the TYPE
+		// (a PG 18.3 standby, pg_amcheck's heap tier, a logical subscriber)
+		// hands the payload to numeric_out as a NumericData and reads the
+		// first two ASCII characters as n_header. It also mis-ORDERED a
+		// PG-format index tuple, which is why pgIndexKeyImageIsPGFaithful had
+		// to refuse numeric until now.
+		//
+		// coerceTextLikeDatum still produces the text first: it yields the
+		// decimal string for KindNumeric/KindInt and passes a KindString
+		// through verbatim (e.g. INSERT ... VALUES ('123.45') arriving as
+		// text), where numericText alone reads only the Int/Scale fields and
+		// would emit "0" for a KindString (M0111-0002). The text is then the
+		// input to numeric_in's port, so no precision is lost that the Datum
+		// was carrying.
 		s, err := coerceTextLikeDatum(t, d)
 		if err != nil {
 			return nil, err
 		}
-		return varlenaTextBytes(s), nil
+		body, nerr := pgnodes.NumericBodyFromText(s)
+		if nerr != nil {
+			return nil, &ExecError{Code: "22P02",
+				Message: fmt.Sprintf("invalid input syntax for type numeric: %q", s)}
+		}
+		return varlenaBytes(body), nil
 	case "aclitem[]", "_aclitem":
 		// PG binary empty ArrayType, elemtype = aclitem (1033).
 		// PG's deconstruct_array asserts on ARR_ELEMTYPE; a text varlena
@@ -626,8 +732,23 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 			return varlenaTextBytes(s), nil
 		}
 	case "uuid":
-		// Validate and normalize UUID to canonical lowercase-with-dashes format.
-		// M0097-0029.
+		// PG's uuid is a fixed 16-byte, 1-byte-aligned, PLAIN-storage type
+		// (pg_type OID 2950: typlen 16, typalign 'c', typstorage 'p' —
+		// postgres/src/include/utils/uuid.h `struct pg_uuid_t { unsigned char
+		// data[UUID_LEN]; }`), and internal/initdb/pg_type_seed_data.go has
+		// seeded exactly that row since initdb existed. goopg nevertheless
+		// stored the 36-character canonical TEXT through varlenaTextBytes, so
+		// the heap disagreed with its own catalog by 21 bytes and by the
+		// varlena header: a PG standby reading a goopg uuid column takes the
+		// first text byte as a varlena length header and returns garbage,
+		// and the attcacheoff fast path (heaptuple.c nocachegetattr) walks
+		// past the column with attlen 16 while the value occupies 37.
+		//
+		// Only the STORAGE changes here — the in-memory Datum stays the
+		// canonical KindString the rest of the engine (index keys,
+		// comparisons, output) already speaks, and lowercase-hex text order is
+		// the same order as uuid_cmp's memcmp over these bytes, so no answer
+		// moves. M0119-0006 (was M0097-0029).
 		if d.Kind != KindString {
 			return nil, fmt.Errorf("expected string for uuid, got kind %d", d.Kind)
 		}
@@ -636,7 +757,12 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 			return nil, &ExecError{Code: "22P02",
 				Message: fmt.Sprintf("invalid input syntax for type uuid: %q", s)}
 		}
-		return varlenaTextBytes(normalizeUUIDStr(s)), nil
+		raw, ok := uuidBytesFromCanonical(normalizeUUIDStr(s))
+		if !ok {
+			return nil, &ExecError{Code: "22P02",
+				Message: fmt.Sprintf("invalid input syntax for type uuid: %q", s)}
+		}
+		return append([]byte(nil), raw[:]...), nil
 	case "pg_node_tree":
 		// KindBytes passthrough: pre-encoded varlena bytes (e.g. PGLZ-compressed
 		// varlena produced by pglzVarlenaDatum in initdb bootstrap).
@@ -686,6 +812,25 @@ func emptyArrayTypeBytes(elemType uint32) []byte {
 // means by it.
 func varlenaPayloadBytes(b []byte) []byte {
 	return varlenaTextBytes(string(b))
+}
+
+// varlenaBytes is varlenaTextBytes for a payload that is not text — the same
+// header rule (PG's heap_fill_tuple prefers the 1-byte short header whenever
+// the value fits and the attribute's storage is not 'p'), applied to raw bytes.
+// Used by the numeric arm, whose payload is a NumericData body. M0119-0006.
+func varlenaBytes(b []byte) []byte {
+	total := len(b) + 1
+	if total <= 127 {
+		buf := make([]byte, total)
+		buf[0] = byte(total<<1) | 1
+		copy(buf[1:], b)
+		return buf
+	}
+	total = len(b) + 4
+	buf := make([]byte, total)
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(total)<<2)
+	copy(buf[4:], b)
+	return buf
 }
 
 func varlenaTextBytes(s string) []byte {
@@ -907,9 +1052,15 @@ func physicalPGTypeAlign(t catalog.Type) int {
 		return 2
 	case "int4", "integer", "int", "serial", "oid", "regproc", "float4", "real", "date", "xid":
 		return 4
-	case "int8", "bigint", "bigserial", "pg_lsn", "float8", "double precision", "double", "timestamp", "timestamptz", "time", "timetz":
+	case "int8", "bigint", "bigserial", "pg_lsn", "float8", "double precision", "double", "timestamp", "timestamptz", "time", "timetz",
+		// interval is typalign 'd' (pg_type OID 1186) even though its 16 bytes
+		// exceed a Datum — the struct's leading field is an int64.
+		"interval":
 		return 8
-	case "name":
+	case "name",
+		// uuid is pg_type OID 2950: typlen 16, typalign 'c'. Its 16 bytes
+		// exceed a Datum but carry no field wider than a byte. M0119-0006.
+		"uuid":
 		return 1 // PG 'c' alignment (fixed-size, 1-byte aligned)
 	case "aclitem[]", "_aclitem", "text[]", "_text", "oid[]", "_oid", "int2[]", "_int2", "char[]", "_char", "float4[]", "_float4", "anyarray", "pg_node_tree", "oidvector", "int2vector":
 		return 4 // PG 'i' alignment for varlena ArrayType / pg_node_tree / oidvector / int2vector
@@ -939,6 +1090,8 @@ func pgPhysicalTypeIsVarlena(t catalog.Type) bool {
 		"pg_lsn",
 		"oid", "regproc",
 		"timestamp", "timestamptz", "date", "time", "timetz",
+		"interval", // typlen 16, not varlena
+		"uuid",     // typlen 16, typalign 'c', typstorage 'p' — not varlena
 		"name",
 		"float4", "real",
 		"float8", "double precision", "double",
@@ -1127,6 +1280,17 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 		pgOffset := int32(binary.LittleEndian.Uint32(data[8:12]))
 		offsetSecs := int(-pgOffset)
 		return NewTimeTZDatum(pgTimeFromMicros(micros), offsetSecs), 12, nil
+	case "interval":
+		// Sibling of the "interval" arm in encodeValuePG: PG's fixed 16-byte
+		// {time int64, day int32, month int32} at typalign 'd'. Every field is
+		// stored raw, so the ±infinity sentinels round-trip without a case.
+		if len(data) < 16 {
+			return Datum{}, 0, fmt.Errorf("truncated interval")
+		}
+		micros := int64(binary.LittleEndian.Uint64(data[:8]))
+		days := int32(binary.LittleEndian.Uint32(data[8:12]))
+		months := int32(binary.LittleEndian.Uint32(data[12:16]))
+		return NewIntervalDatumFull(months, days, micros), 16, nil
 	case "char":
 		// Single-byte internal "char" type (no length modifier): fixed 1-byte
 		// field. "char(N)" (with args) is bpchar (varlena) and is handled by
@@ -1189,20 +1353,20 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 		f8 := math.Float64frombits(binary.LittleEndian.Uint64(data[:8]))
 		return floatTextDatum(PGFloatOut(f8, 64)), 8, nil
 	case "uuid":
-		// goopg stores UUID as varlena-text (canonical lowercase-with-dashes
-		// format). Decode: read the varlena payload and return as KindString.
-		// UUID rows were previously silently dropped because this case was
-		// missing and the default returned "unsupported PostgreSQL physical
-		// type". M0097-0029.
-		payload, n, err := decodePhysicalPGVarlena(data)
-		if err != nil {
-			return Datum{}, 0, err
+		// Sibling of the "uuid" arm in encodeValuePG: PG's fixed 16-byte
+		// pg_uuid_t at typalign 'c'. The Datum stays the canonical
+		// lowercase-with-dashes KindString the engine speaks everywhere else,
+		// rendered by uuid_out's port — so this is the only place the on-disk
+		// bytes are seen. M0119-0006 (was M0097-0029, varlena-text).
+		if len(data) < 16 {
+			return Datum{}, 0, fmt.Errorf("truncated uuid")
 		}
+		s := uuidCanonicalFromBytes(data[:16])
 		if sctx != nil {
-			moff, mlen := sctx.AllocBytes(payload)
-			return newStringArenaDatum(sctx, moff, mlen), n, nil
+			moff, mlen := sctx.AllocBytes([]byte(s))
+			return newStringArenaDatum(sctx, moff, mlen), 16, nil
 		}
-		return NewStringDatum(string(payload)), n, nil
+		return NewStringDatum(s), 16, nil
 	case "bytea":
 		if len(data) >= 13 && data[0] == 0x01 {
 			ptr := make([]byte, 12)
@@ -1219,14 +1383,24 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 		}
 		return NewBytesDatum(append([]byte(nil), payload...)), n, nil
 	case "numeric", "decimal":
-		// goopg encodes numeric as varlena-text (via the default encodeValuePG
-		// path which calls varlenaTextBytes). Decode: read the varlena payload
-		// as a plain text string and parse it back to KindNumeric.
+		// Sibling of the "numeric" arm in encodeValuePG: PG's base-10000
+		// NumericData behind a varlena header (M0119-0006). The in-memory
+		// Datum is unchanged — KindNumeric mantissa+scale — so this and the
+		// encoder are the only two places the on-disk bytes are seen.
+		//
+		// NumericTextFromStoredPayload also accepts the pre-flip payload (the
+		// decimal string): the flip has no on-disk migration, and every
+		// cluster that predates it — the TPC-H and TPC-DS benchmark clusters
+		// among them — holds text in its numeric columns. See that function
+		// for why the two forms are exactly, not heuristically, disjoint.
 		payload, n, err := decodePhysicalPGVarlena(data)
 		if err != nil {
 			return Datum{}, 0, err
 		}
-		text := string(payload)
+		text, err := pgnodes.NumericTextFromStoredPayload(payload)
+		if err != nil {
+			return Datum{}, 0, err
+		}
 		if v, scale, ok := parseNumericFastInt(text); ok {
 			return Datum{Kind: KindNumeric, Int: v, Scale: scale}, n, nil
 		}
@@ -1539,6 +1713,65 @@ func normalizeUUIDStr(s string) string {
 		return s[0:8] + "-" + s[8:12] + "-" + s[12:16] + "-" + s[16:20] + "-" + s[20:32]
 	}
 	return s
+}
+
+// uuidBytesFromCanonical packs the canonical lowercase-with-dashes rendering
+// produced by normalizeUUIDStr into PG's on-disk pg_uuid_t — a bare
+// UUID_LEN (16) byte array, big-endian in the sense that the leftmost text
+// hex pair is byte 0 (postgres/src/backend/utils/adt/uuid.c, string_to_uuid).
+// s must already have passed isValidUUIDStr + normalizeUUIDStr; ok is false
+// only if it did not.
+func uuidBytesFromCanonical(s string) ([16]byte, bool) {
+	var out [16]byte
+	if len(s) != 36 {
+		return out, false
+	}
+	hexVal := func(c byte) (byte, bool) {
+		switch {
+		case c >= '0' && c <= '9':
+			return c - '0', true
+		case c >= 'a' && c <= 'f':
+			return c - 'a' + 10, true
+		}
+		return 0, false
+	}
+	j := 0
+	for i := 0; i < 36; {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if s[i] != '-' {
+				return [16]byte{}, false
+			}
+			i++
+			continue
+		}
+		hi, ok1 := hexVal(s[i])
+		lo, ok2 := hexVal(s[i+1])
+		if !ok1 || !ok2 {
+			return [16]byte{}, false
+		}
+		out[j] = hi<<4 | lo
+		j++
+		i += 2
+	}
+	if j != 16 {
+		return [16]byte{}, false
+	}
+	return out, true
+}
+
+// uuidCanonicalFromBytes is uuidBytesFromCanonical's inverse and the port of
+// PG's uuid_out (uuid.c): 32 lowercase hex digits with hyphens after bytes
+// 4, 6, 8 and 10.
+func uuidCanonicalFromBytes(b []byte) string {
+	const hexdigits = "0123456789abcdef"
+	out := make([]byte, 0, 36)
+	for i := 0; i < 16; i++ {
+		if i == 4 || i == 6 || i == 8 || i == 10 {
+			out = append(out, '-')
+		}
+		out = append(out, hexdigits[b[i]>>4], hexdigits[b[i]&0x0f])
+	}
+	return string(out)
 }
 
 func encodeVarlen(b []byte) []byte {

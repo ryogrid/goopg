@@ -594,6 +594,11 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		if sysID, err := initdb.LoadOrCreateSystemID(*dataDir); err == nil {
 			cfg.SystemID = fmt.Sprintf("%d", sysID)
 		}
+		// M0130-S8: report the cluster's real TLI from pg_control in
+		// IDENTIFY_SYSTEM and respect it in START_REPLICATION TIMELINE n.
+		if tli, err := initdb.LoadOrCreateTimelineID(*dataDir); err == nil {
+			cfg.Timeline = tli
+		}
 		cfg.SyncRep = rt.SyncRep
 		// M0102-0005: prime the SyncRep rule from the GUC value so the
 		// first commit on a freshly-started cluster sees the configured
@@ -777,6 +782,41 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		}()
 	} else {
 		close(cpDone)
+	}
+
+	// Archive recovery: when `<DataDir>/recovery.signal` was present
+	// at Open time (and standby.signal is NOT), fetch missing WAL
+	// segments from the archive via restore_command, replay them, and
+	// promote to a new timeline. This is a one-shot boot-time pass;
+	// it completes BEFORE the server starts accepting connections —
+	// it does not spawn a background controller.
+	//
+	// M0130-S9: archive recovery mirrors upstream xlogrecovery.c's
+	// recovery loop: restore_command fetches each segment, replay
+	// applies it, and when the archive is exhausted the server
+	// promotes.
+	if rt != nil && rt.Recovery && !rt.Standby {
+		restoreCmd := stringGUC(registry, "restore_command", "")
+		if restoreCmd == "" {
+			logger.Warn("recovery.signal present but restore_command is empty — archive recovery disabled; starting as primary")
+			if err := initdb.RemoveRecoverySignal(rt.DataDir); err != nil {
+				logger.Warn("failed to remove recovery.signal", "err", err)
+			}
+		} else {
+			logger.Info("archive recovery starting", "restore_command", restoreCmd)
+			if err := wal.RunArchiveRecovery(rt.StorageMgr, rt.DataDir, restoreCmd, 0); err != nil {
+				fmt.Fprintf(stderr, "goopg start: archive recovery: %v\n", err)
+				return 1
+			}
+			logger.Info("archive recovery complete; promoting to primary")
+			// Promote: bump TLI, write history, update pg_control,
+			// and remove recovery.signal. Mirrors finalizePromotion
+			// in standby.go but without the standby controller.
+			if err := promoteAfterRecovery(rt, logger); err != nil {
+				fmt.Fprintf(stderr, "goopg start: promote after recovery: %v\n", err)
+				return 1
+			}
+		}
 	}
 
 	// Standby mode: when `<DataDir>/standby.signal` was present at

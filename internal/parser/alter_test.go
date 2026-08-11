@@ -825,3 +825,35 @@ func TestParseAlterTableReplicaIdentity(t *testing.T) {
 		}
 	}
 }
+
+// TestParseAlterTableSetAccessMethod covers `ALTER TABLE ... SET ACCESS METHOD name`
+// (PG15+). pg_dump emits this for partitioned tables whose relam differs from the
+// default. goopg only supports `heap`; the executor rejects any other AM.
+// DU-002: next blocker after NOT NULL colname in CREATE TABLE INHERITS.
+func TestParseAlterTableSetAccessMethod(t *testing.T) {
+	cases := []struct {
+		sql      string
+		wantAM   string
+	}{
+		{"ALTER TABLE t SET ACCESS METHOD heap", "heap"},
+		{"ALTER TABLE t SET ACCESS METHOD HEAP", "heap"},
+		{"ALTER TABLE public.part SET ACCESS METHOD heap", "heap"},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T", tc.sql, stmts[0])
+		}
+		if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableSetAccessMethod {
+			t.Fatalf("Parse(%q): actions=%+v", tc.sql, at.Actions)
+		}
+		act := at.Actions[0]
+		if act.AccessMethodName != tc.wantAM {
+			t.Errorf("Parse(%q): AccessMethodName=%q want %q", tc.sql, act.AccessMethodName, tc.wantAM)
+		}
+	}
+}

@@ -84,17 +84,41 @@ func TestVacuumIndexPagesCascadesEmptyInternalPage(t *testing.T) {
 		t.Fatalf("expected %d removed, got %d", len(deadTIDs), removed)
 	}
 
-	// The cascaded-away internal page must now be flagged deleted.
-	if !vacOpaque(t, tree, targetInternal).IsDeleted() {
-		t.Fatalf("cascaded internal page %d was expected deleted (BTDeleted) but is still live", targetInternal)
+	// M0130-S11.5d-3a changed the SHAPE of the guarantee this test
+	// protects, not the guarantee itself. The parent limb of page deletion
+	// is now upstream's retarget-and-delete, which refuses to delete a page
+	// whose downlink is its parent's RIGHTMOST item (ErrParentRightmostChild
+	// — `_bt_lock_subtree_parent`). The last item on an internal page is by
+	// definition its rightmost child, so a downlink removal can no longer
+	// take an internal page to zero items at all: the empty-internal-page
+	// condition this test was written for (AI-20260706-201855-001) is now
+	// structurally unreachable rather than repaired after the fact by the
+	// cascade. targetInternal therefore survives holding exactly its last
+	// child, whose leaf stays empty-but-live — precisely what upstream
+	// leaves behind when `_bt_pagedel` gives up.
+	if vacOpaque(t, tree, targetInternal).IsDeleted() {
+		t.Fatalf("internal page %d must NOT be deleted: its last child cannot be unlinked", targetInternal)
 	}
+	survivors := readItemsForTest(t, tree, targetInternal)
+	if len(survivors) != 1 {
+		t.Fatalf("internal page %d should retain exactly its rightmost child, got %d downlinks",
+			targetInternal, len(survivors))
+	}
+	// The invariant that actually mattered: NO internal page anywhere in the
+	// tree is left live with zero items, which is what findChildBlockDirect's
+	// `count == 0` guard used to trip over during descent.
+	assertNoEmptyLiveInternalPage(t, tree)
 
-	// The root must no longer downlink to it (this is the actual fix:
-	// pre-fix, the root retained a stale downlink to a now-empty page).
+	// The root still downlinks to it — the page is live, so a stale downlink
+	// is not what the root holds.
+	var rootHasTarget bool
 	for _, it := range readItemsForTest(t, tree, meta.Root) {
 		if it.ptr.Block == targetInternal {
-			t.Fatalf("root still downlinks to cascaded-away internal page %d", targetInternal)
+			rootHasTarget = true
 		}
+	}
+	if !rootHasTarget {
+		t.Fatalf("root lost its downlink to the still-live internal page %d", targetInternal)
 	}
 
 	// A full-range scan must succeed with the exact expected remaining
@@ -121,6 +145,38 @@ func TestVacuumIndexPagesCascadesEmptyInternalPage(t *testing.T) {
 	}
 }
 
+// assertNoEmptyLiveInternalPage sweeps every block of the index and fails if
+// any LIVE internal page holds zero items — the condition
+// findChildBlockDirect's `count == 0` guard raises "btree: empty internal page"
+// on. M0130-S11.5d-3a made it structurally unreachable from the page-deletion
+// path; this asserts that directly instead of asserting the cascade that used
+// to repair it after the fact.
+func assertNoEmptyLiveInternalPage(t *testing.T, bt *BTree) {
+	t.Helper()
+	nblocks, err := bt.pool.NBlocks(bt.rel)
+	if err != nil {
+		t.Fatalf("NBlocks: %v", err)
+	}
+	for blk := storage.BlockNumber(1); blk < nblocks; blk++ {
+		slot, err := bt.pinR(blk)
+		if err != nil {
+			t.Fatalf("pinR(%d): %v", blk, err)
+		}
+		op := readOpaque(slot.Page())
+		count, cerr := PGDataItemCount(slot.Page())
+		bt.unpinR(slot)
+		if cerr != nil {
+			continue // not a btree data page (metapage / uninitialised)
+		}
+		if op.IsLeaf() || op.IsDeleted() || op.IsHalfDead() {
+			continue
+		}
+		if count == 0 {
+			t.Fatalf("live internal page %d has zero items", blk)
+		}
+	}
+}
+
 // readItemsForTest reads and decodes every item on blk under a shared latch.
 func readItemsForTest(t *testing.T, bt *BTree, blk storage.BlockNumber) []item {
 	t.Helper()
@@ -128,10 +184,10 @@ func readItemsForTest(t *testing.T, bt *BTree, blk storage.BlockNumber) []item {
 	if err != nil {
 		t.Fatalf("pinR(%d): %v", blk, err)
 	}
-	items, err := pageItems(slot.Page())
+	items, err := blobFormat.pageItems(slot.Page())
 	bt.unpinR(slot)
 	if err != nil {
-		t.Fatalf("pageItems(%d): %v", blk, err)
+		t.Fatalf("blobFormat.pageItems(%d): %v", blk, err)
 	}
 	return items
 }

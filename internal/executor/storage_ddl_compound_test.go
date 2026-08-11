@@ -1,11 +1,9 @@
 package executor
 
 import (
-	"math/big"
 	"testing"
 	"time"
 
-	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -42,26 +40,21 @@ func TestDDLCompoundTimestampNumericIndex(t *testing.T) {
 		t.Fatalf("CREATE INDEX (timestamp, numeric): %v", err)
 	}
 
-	idx, ok := ctx.Catalog.LookupIndex(parser.ObjectName{Name: "idx_ship_order"})
-	if !ok {
-		t.Fatal("compound index not in catalog")
-	}
-	tree, err := btree.Open(ctx.Pool, ctx.Catalog.IndexRelFileNode(idx))
-	if err != nil {
-		t.Fatal(err)
-	}
+	idx, tree := openIndexTreeForTest(t, ctx, "idx_ship_order")
 
 	// Probe: (1995-01-15, 2) — should find exactly 1 row.
-	micros := date1995.Sub(pgEpoch).Microseconds()
-	probeKey := append(btree.EncodeTimestamp(micros), btree.EncodeNumericKey(big.NewInt(2), 0)...)
+	probeKey := indexProbeMultiForTest(t, ctx, idx, NewTimeDatum(date1995), NewNumericInt64Datum(2, 0))
 	_, found, err := tree.Search(probeKey)
 	if err != nil || !found {
 		t.Fatalf("compound probe (1995-01-15, 2): found=%v err=%v", found, err)
 	}
 
-	// Range scan for all rows with shipdate in [1995-01-15, 1995-01-15].
-	loKey := append(btree.EncodeTimestamp(micros), btree.EncodeNumericKey(big.NewInt(-9999999), 0)...)
-	hiKey := append(btree.EncodeTimestamp(micros), btree.EncodeNumericKey(big.NewInt(9999999), 0)...)
+	// Range scan for all rows with shipdate in [1995-01-15, 1995-01-15]: a
+	// leading-attribute prefix, widened by the engine's own upper-bound funnel
+	// (0xFF padding under the blob format, a truncated pivot under the tuple
+	// format — see compositeUpperBound).
+	loKey := indexProbeMultiForTest(t, ctx, idx, NewTimeDatum(date1995))
+	hiKey := ctx.compositeUpperBound(idx, loKey)
 	count := 0
 	if err := tree.RangeScan(loKey, hiKey, func(_ []byte, _ storage.ItemPointer) (bool, error) {
 		count++
@@ -114,25 +107,22 @@ func TestDDLCompoundCharNumericIndex(t *testing.T) {
 		t.Fatalf("CREATE INDEX (char, numeric): %v", err)
 	}
 
-	idx, _ := ctx.Catalog.LookupIndex(parser.ObjectName{Name: "idx_seg_cust"})
-	tree, err := btree.Open(ctx.Pool, ctx.Catalog.IndexRelFileNode(idx))
-	if err != nil {
-		t.Fatal(err)
-	}
+	idx, tree := openIndexTreeForTest(t, ctx, "idx_seg_cust")
 
 	// Probe with unpadded "BUILDING" — should find the custkey=5 row
 	// because trim collapses "BUILDING  " and "BUILDING" to the same prefix.
-	probeKey := append(btree.EncodeChar([]byte("BUILDING")), btree.EncodeNumericKey(big.NewInt(5), 0)...)
+	probeKey := indexProbeMultiForTest(t, ctx, idx, NewStringDatum("BUILDING"), NewNumericInt64Datum(5, 0))
 	_, found, err := tree.Search(probeKey)
 	if err != nil || !found {
 		t.Fatalf("compound probe (BUILDING, 5): found=%v err=%v", found, err)
 	}
 
-	// Total rows in index = 3.
+	// Total rows in index = 3: a leading-attribute range that spans every
+	// segment present, widened by the engine's upper-bound funnel.
 	totalCount := 0
 	if err := tree.RangeScan(
-		append(btree.EncodeChar([]byte("")), btree.EncodeNumericKey(big.NewInt(-9999999), 0)...),
-		append(btree.EncodeChar([]byte("ZZZZZ")), btree.EncodeNumericKey(big.NewInt(9999999), 0)...),
+		indexProbeMultiForTest(t, ctx, idx, NewStringDatum("")),
+		ctx.compositeUpperBound(idx, indexProbeMultiForTest(t, ctx, idx, NewStringDatum("ZZZZZ"))),
 		func(_ []byte, _ storage.ItemPointer) (bool, error) {
 			totalCount++
 			return true, nil
@@ -172,16 +162,10 @@ func TestDDLCompoundVarcharNumericIndex(t *testing.T) {
 		t.Fatalf("CREATE INDEX (varchar, numeric): %v", err)
 	}
 
-	idx, _ := ctx.Catalog.LookupIndex(parser.ObjectName{Name: "idx_type_part"})
-	tree, err := btree.Open(ctx.Pool, ctx.Catalog.IndexRelFileNode(idx))
-	if err != nil {
-		t.Fatal(err)
-	}
+	idx, tree := openIndexTreeForTest(t, ctx, "idx_type_part")
 
-	probeKey := append(
-		btree.EncodeVarchar([]byte("ECONOMY ANODIZED BRASS")),
-		btree.EncodeNumericKey(big.NewInt(20), 0)...,
-	)
+	probeKey := indexProbeMultiForTest(t, ctx, idx,
+		NewStringDatum("ECONOMY ANODIZED BRASS"), NewNumericInt64Datum(20, 0))
 	_, found, err := tree.Search(probeKey)
 	if err != nil || !found {
 		t.Fatalf("compound probe (ECONOMY ANODIZED BRASS, 20): found=%v err=%v", found, err)
@@ -218,21 +202,11 @@ func TestDDLCompoundThreeColumnIndex(t *testing.T) {
 		t.Fatalf("CREATE INDEX (timestamp, numeric, numeric): %v", err)
 	}
 
-	idx, _ := ctx.Catalog.LookupIndex(parser.ObjectName{Name: "idx_ord3"})
-	tree, err := btree.Open(ctx.Pool, ctx.Catalog.IndexRelFileNode(idx))
-	if err != nil {
-		t.Fatal(err)
-	}
+	idx, tree := openIndexTreeForTest(t, ctx, "idx_ord3")
 
 	// Probe: (1996-01-02, 370, 2) — should hit row id=2.
-	micros := d1.Sub(pgEpoch).Microseconds()
-	probeKey := append(
-		btree.EncodeTimestamp(micros),
-		append(
-			btree.EncodeNumericKey(big.NewInt(370), 0),
-			btree.EncodeNumericKey(big.NewInt(2), 0)...,
-		)...,
-	)
+	probeKey := indexProbeMultiForTest(t, ctx, idx,
+		NewTimeDatum(d1), NewNumericInt64Datum(370, 0), NewNumericInt64Datum(2, 0))
 	_, found, err := tree.Search(probeKey)
 	if err != nil || !found {
 		t.Fatalf("3-column compound probe: found=%v err=%v", found, err)
@@ -241,8 +215,9 @@ func TestDDLCompoundThreeColumnIndex(t *testing.T) {
 	// Index should contain all 3 rows.
 	count := 0
 	if err := tree.RangeScan(
-		btree.EncodeTimestamp(dateMicrosCompound(1990, 1, 1)),
-		btree.EncodeTimestamp(dateMicrosCompound(2030, 1, 1)),
+		indexProbeMultiForTest(t, ctx, idx, NewTimeDatum(time.Date(1990, 1, 1, 0, 0, 0, 0, time.UTC))),
+		ctx.compositeUpperBound(idx,
+			indexProbeMultiForTest(t, ctx, idx, NewTimeDatum(time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)))),
 		func(_ []byte, _ storage.ItemPointer) (bool, error) {
 			count++
 			return true, nil
@@ -253,10 +228,4 @@ func TestDDLCompoundThreeColumnIndex(t *testing.T) {
 	if count != 3 {
 		t.Fatalf("3-column index: got %d rows, want 3", count)
 	}
-}
-
-// dateMicrosCompound is a local helper for this file.
-func dateMicrosCompound(year, month, day int) int64 {
-	t := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
-	return t.Sub(pgEpoch).Microseconds()
 }

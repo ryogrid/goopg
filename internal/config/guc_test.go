@@ -467,3 +467,45 @@ func TestPredicateLockGUCDefaults(t *testing.T) {
 		t.Error("expected max_predicate_locks_per_page=-1 to be rejected (must be >= 0)")
 	}
 }
+
+// TestClientEncodingValidation verifies SET client_encoding rejects unknown
+// encoding names and accepts valid ones. M0122-0008.
+func TestClientEncodingValidation(t *testing.T) {
+	r := BuildDefaultRegistry()
+	sess := NewSessionRegistry(r)
+
+	// Valid encodings (canonical names).
+	for _, enc := range []string{
+		"UTF8", "LATIN1", "SQL_ASCII", "EUC_JP", "WIN1252",
+		"SJIS", "GBK", "BIG5", // client-only encodings are valid for client_encoding
+	} {
+		if err := sess.Set("client_encoding", enc, false); err != nil {
+			t.Errorf("SET client_encoding = %q: unexpected error: %v", enc, err)
+		}
+	}
+
+	// Valid encodings (aliases — punctuation-stripped, lowercased).
+	for _, enc := range []string{
+		"utf8", "utf-8", "utf_8",
+		"unicode",
+		"latin1", "LATIN-1",
+		"sql_ascii", "sql-ascii",
+	} {
+		if err := sess.Set("client_encoding", enc, false); err != nil {
+			t.Errorf("SET client_encoding = %q: unexpected error: %v", enc, err)
+		}
+	}
+
+	// Invalid encodings.
+	for _, enc := range []string{
+		"INVALID",
+		"UTF-16",
+		"ASCII",
+		"",
+		"latin42",
+	} {
+		if err := sess.Set("client_encoding", enc, false); err == nil {
+			t.Errorf("SET client_encoding = %q: expected error, got nil", enc)
+		}
+	}
+}

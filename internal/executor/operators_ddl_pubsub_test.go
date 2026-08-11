@@ -201,7 +201,7 @@ func TestCreateSubscriptionRoutesToConnectionRealDBOid(t *testing.T) {
 	if err := runDDL(t, ctx, sql); err != nil {
 		t.Fatalf("runDDL: %v", err)
 	}
-	sub, ok := ctx.PubSub.LookupSubscription("s")
+	sub, ok := ctx.PubSub.LookupSubscription("s", otherDBOid)
 	if !ok {
 		t.Fatal("subscription s not registered")
 	}

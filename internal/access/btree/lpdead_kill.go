@@ -68,18 +68,18 @@ func (bt *BTree) KillItems(kills []KillItem) {
 			if k.Pos.PageLSN != ks[0].Pos.PageLSN {
 				continue // mixed captures on one leaf: only the verified LSN wins
 			}
-			raw, rerr := storage.PageGetItemRawAllowDead(p, k.Pos.Slot)
+			raw, rerr := pgGetItemRawAllowDead(p, k.Pos.Slot)
 			if rerr != nil {
 				continue
 			}
 			if isPostingRaw(raw) {
 				continue // O-C3-1: posting kills deferred
 			}
-			it, perr := parseItem(raw)
+			it, perr := bt.format().parse(raw)
 			if perr != nil || it.ptr != k.Ptr {
 				continue // TID pre-filter (paranoia under an equal LSN)
 			}
-			if storage.PageSetItemIDDead(p, k.Pos.Slot) == nil {
+			if pgSetItemIDDead(p, k.Pos.Slot) == nil {
 				marked = true
 			}
 		}

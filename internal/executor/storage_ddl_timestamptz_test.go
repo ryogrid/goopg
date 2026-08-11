@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
@@ -27,17 +27,27 @@ func TestEvalTypedStringLitTimestampForms(t *testing.T) {
 		valid := []struct {
 			in   string
 			want time.Time
+			// wantNoTZ is the answer for `timestamp` WITHOUT time zone when it
+			// differs from the timestamptz one, i.e. for the offset-bearing
+			// spellings only: timestamp_in decodes the zone and then discards it
+			// (M0119-0006, tsZoneMode), so the wall clock stands as written.
+			// The zero value means "same as want".
+			wantNoTZ time.Time
 		}{
-			{"2010-04-01 10:00", utc(2010, 4, 1, 10, 0, 0)},         // seconds-less (the spec's form)
-			{"2010-04-01 11:00", utc(2010, 4, 1, 11, 0, 0)},         // seconds-less
-			{"2010-04-01 10:00:00", utc(2010, 4, 1, 10, 0, 0)},      // explicit seconds (regression)
-			{"2010-04-01 10:00:00.5", utc(2010, 4, 1, 10, 0, 0)},    // fractional seconds (regression)
-			{"2010-04-01", utc(2010, 4, 1, 0, 0, 0)},                // date only (regression)
-			{"2010-04-01 10:00:00-04", utc(2010, 4, 1, 14, 0, 0)},   // explicit offset honoured
-			{"2010-04-01 10:00-04", utc(2010, 4, 1, 14, 0, 0)},      // seconds-less + offset
-			{"2010-04-01 10:00:00.5-04", utc(2010, 4, 1, 14, 0, 0)}, // fractional + offset
+			{in: "2010-04-01 10:00", want: utc(2010, 4, 1, 10, 0, 0)},      // seconds-less (the spec's form)
+			{in: "2010-04-01 11:00", want: utc(2010, 4, 1, 11, 0, 0)},      // seconds-less
+			{in: "2010-04-01 10:00:00", want: utc(2010, 4, 1, 10, 0, 0)},   // explicit seconds (regression)
+			{in: "2010-04-01 10:00:00.5", want: utc(2010, 4, 1, 10, 0, 0)}, // fractional seconds (regression)
+			{in: "2010-04-01", want: utc(2010, 4, 1, 0, 0, 0)},             // date only (regression)
+			// Explicit offset: honoured by timestamptz, discarded by timestamp.
+			{in: "2010-04-01 10:00:00-04", want: utc(2010, 4, 1, 14, 0, 0), wantNoTZ: utc(2010, 4, 1, 10, 0, 0)},
+			{in: "2010-04-01 10:00-04", want: utc(2010, 4, 1, 14, 0, 0), wantNoTZ: utc(2010, 4, 1, 10, 0, 0)},
+			{in: "2010-04-01 10:00:00.5-04", want: utc(2010, 4, 1, 14, 0, 0), wantNoTZ: utc(2010, 4, 1, 10, 0, 0)},
 		}
 		for _, tc := range valid {
+			if typ == "timestamp" && !tc.wantNoTZ.IsZero() {
+				tc.want = tc.wantNoTZ
+			}
 			x := &planner.TypedStringLit{Type: typ, Value: tc.in}
 			d, err := evalTypedStringLit(x)
 			if err != nil {
@@ -69,8 +79,8 @@ func TestEvalTypedStringLitTimestampForms(t *testing.T) {
 // timestamptzBTreeKey mirrors the encodeBTreeKeyForColumn timestamptz path:
 // timestamptz shares the int64-micros-since-epoch on-disk form with timestamp
 // without time zone, so it encodes via EncodeTimestamp(micros).
-func timestamptzBTreeKey(ts time.Time) []byte {
-	return btree.EncodeTimestamp(ts.Sub(pgEpoch).Microseconds())
+func timestamptzBTreeKey(t *testing.T, ctx *Context, idx *catalog.Index, ts time.Time) []byte {
+	return indexProbeForTest(t, ctx, idx, NewTimeDatum(ts))
 }
 
 // TestDDLCreateTimestamptzBTreeIndexAcceptsType pins the M0118-0001 acceptance
@@ -113,13 +123,13 @@ func TestDDLCreateTimestamptzBTreeIndexAcceptsType(t *testing.T) {
 		t.Fatal("index not in catalog after CREATE INDEX")
 	}
 	idxRel := ctx.Catalog.IndexRelFileNode(idx)
-	tree, err := btree.Open(ctx.Pool, idxRel)
+	tree, err := openIndexBTree(ctx, idx, idxRel)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	for _, ts := range times {
-		key := timestamptzBTreeKey(ts)
+		key := timestamptzBTreeKey(t, ctx, idx, ts)
 		_, found, err := tree.Search(key)
 		if err != nil || !found {
 			t.Fatalf("Search(%v): found=%v err=%v", ts, found, err)
@@ -162,15 +172,15 @@ func TestDDLTimestamptzRangeScanParity(t *testing.T) {
 	}
 	idx, _ := ctx.Catalog.LookupIndex(parser.ObjectName{Name: "idx_start_time"})
 	idxRel := ctx.Catalog.IndexRelFileNode(idx)
-	tree, err := btree.Open(ctx.Pool, idxRel)
+	tree, err := openIndexBTree(ctx, idx, idxRel)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	rangeStart := time.Date(2010, 4, 1, 13, 0, 0, 0, time.UTC)
 	rangeEnd := time.Date(2010, 4, 1, 14, 0, 0, 0, time.UTC)
-	lo := timestamptzBTreeKey(rangeStart)
-	hi := timestamptzBTreeKey(rangeEnd)
+	lo := timestamptzBTreeKey(t, ctx, idx, rangeStart)
+	hi := timestamptzBTreeKey(t, ctx, idx, rangeEnd)
 	indexCount := 0
 	if err := tree.RangeScan(lo, hi, func(_ []byte, _ storage.ItemPointer) (bool, error) {
 		indexCount++
