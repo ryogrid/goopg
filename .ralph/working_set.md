@@ -1,55 +1,50 @@
-Task: M0131-S32 — FIXED and committed. Successor filed: **M0131-S32.1**.
+Task: M0131-S32.1 — FIXED for the index-driven UPDATE arm and committed.
+Successor filed: **M0131-S32.2** (SeqScan arm, scan-phase loss).
 
-Root cause (loop #144): every HOT/CTID chain walker capped its loop at a
-hand-written `const maxChain = 64`, so version 65 of a repeatedly-HOT-updated
-row was unreachable. The index scan driving `UPDATE … WHERE id=1` then found no
-live tuple, wrote NOTHING, and still reported `UPDATE 1`. The "S31
-index-unreachable" symptom in the same repro was a CONSEQUENCE of the same
-truncation, not a second defect, and `pruneChainTip`'s identical cap is why the
-page looked permanently full.
+Root cause (loop #145), two defects with opposite signs:
+(A) The EvalPlanQual retry loop read a failed chain-follow as "the row is gone"
+    (`if !chainFound { epqSkip = true; break }`) and skipped the row SILENTLY
+    while still reporting `UPDATE 1`. Under contention the chain tip is
+    routinely owned by a transaction that has not committed yet, so the write
+    is dropped: 1112 of 1946 attempts. PG blocks on that updater
+    (XactLockTableWait) and re-fetches. Fix = `epqChainPendingWriter` +
+    `epqWait` + RC snapshot refresh + retry, in BOTH EPQ loops.
+(B) Retrying exposed convergence: two `pending` entries of one statement reach
+    the same physical tuple; `isConcurrentlyUpdated` ignores our own xmax, so
+    the second re-stamped a tuple we had already killed and inserted a SECOND
+    live version (1720 live rows in a 1-row table) — the pgbench_branches ~10x
+    over-application. Fix = PG's `TM_SelfModified` skip at both EPQ loop tops.
 
-Fix: new PG-faithful `storage.MaxHeapTuplesPerPage` (291 at 8 KiB — the exact
-bound, since a HOT chain visits distinct slots of ONE page) for the four
-single-page walkers; explicit `maxCTIDChainWalk = 1<<20` corruption backstop for
-the two CROSS-page t_ctid walkers (PG's `heap_get_latest_tid` is uncapped).
-
-Files: `internal/storage/heap.go` (const + parity test), `internal/storage/prune.go`,
-`internal/executor/operators_index.go`, `internal/executor/operators_storage.go`,
-`internal/executor/hot_update_test.go` (new `TestHOTUpdateChainBeyond64Versions`),
-`internal/storage/heap_test.go`, `analysis/atomicity-nocrash-control.sh`
-(now asserts tellers/branches), `docs/design/0131-0025-single-row-update-stall.md`,
+Files: `internal/executor/operators_storage.go`, new
+`internal/executor/s321_probe.go` (env-gated counters, `GOOPG_S321_PROBE=1`,
+plus `GOOPG_S321_NOWAIT=1` A/B kill switch — both temporary, delete with S32.2),
+new `analysis/concurrent-hotrow.sh` (minimal repro + gate),
+`docs/design/0131-0026-concurrent-hot-row-lost-updates.md`,
 `docs/design/README.md`, `.ralph/fix_plan.md`, `.ralph/deferral_ledger.md`.
 
-Next step: work **M0131-S32.1** — the concurrent arm, still wrong in BOTH
-directions with the S32 fix in place (16 clients, scale 5, no crash:
-`sum(delta) = -31482`, `sum(abalance)` exact, `sum(tbalance) = -14938`
-under-applied, `sum(bbalance) = -309543` ~10x OVER-applied, identical LIVE and
-after a clean restart). Gate: `RUNS=1 LOADSEC=30 bash
-analysis/atomicity-nocrash-control.sh` (its header records `OVERALL: FAIL` as
-the KNOWN state — read the per-table lines). Start at the duplicate-live-index-
-entry path for the over-application: `internal/executor/operators_storage.go:4244`,
-whose AI-20260810-011258-006 guard dedupes only WITHIN one statement's `pending`
-set. Tellers' under-application has the opposite sign — measure the two tables
-separately before assuming one cause. Second, independent follow-up in the
-ledger: an UPDATE's reported row count still comes from the planned row set, not
-from rows actually written.
+Next step: work **M0131-S32.2**. Gate `NOIDX=1 ROWS=1 CLIENTS=8 N=200 bash
+analysis/concurrent-hotrow.sh` lands 1063/1600. Write-phase classes are CLOSED
+there (`count(*)` correct, `epq_self_modified=0`, `epq_chain_notfound=0`) — the
+statement finds NO row and reports `UPDATE 0`, so start in the SCAN phase:
+instrument the already-declared `s321ScanNoRow` counter, then diff
+`mvcc.TupleVisible` against `HeapTupleSatisfiesUpdate`
+(`postgres/src/backend/access/heap/heapam_visibility.c`). Hypothesis: goopg
+treats a version as dead the moment its xmax COMMITS regardless of
+statement-snapshot visibility, so a hot row briefly has no visible version.
+pgbench_branches (5 rows) is planned as a SeqScan — it is the last table
+diverging in the S32.1 gate.
 
-Ruled out for S32, do not re-test: `tryApplyHOTUpdate`'s under-lock
-`isConcurrentlyUpdated` re-check, `isConcurrentlyUpdated` itself, the `!used`
-EPQ fallback, and the page-capacity hypothesis — the cause was the walk bound.
+Harness trap hit this loop: an orphaned server from an earlier probe still
+listening on the port absorbs the whole run (fresh server fails to bind, psql
+still connects, numbers come from the wrong cluster). concurrent-hotrow.sh now
+preflights the port; atomicity-nocrash-control.sh does NOT.
 
-Gates run: `analysis/hotstall.sh` PASS at N=300 AND N=2000 (was FAIL at 64);
-`TestHOTUpdateChainBeyond64Versions` PASS, and confirmed it FAILs at exactly
-"after update 65: v=64" with the bound put back to 64;
-`TestMaxHeapTuplesPerPagePGParity` PASS; `RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh` PASS (executor+storage rerun, rest cached);
-`scripts/tpch-spotcheck.sh` RESULT=PASS (Q12=2, Q13=35); commit-hook pgbench
-smoke PASS; `make ralph-state-guard` PASS (auto-repaired the stale completed
-marker). NOT run: TPC-DS SF0.5 gate (~1 h) — the change is a chain-walk bound
-with a deterministic repro plus the spotcheck; run it next loop if S32.1 work
-touches the same paths.
-
-Nightly triage: `ci/logs/action-items.md` still run `20260811-014635`
-(AI-…-001..012) — all 12 already filed under M-NIGHTLY; nothing new to file.
+Gates run: concurrent-hotrow.sh exact 1600/1600 at ROWS=1 and ROWS=5, with and
+without BEGIN/COMMIT (was 470/1600); `RUNS=1 LOADSEC=30
+analysis/atomicity-nocrash-control.sh` — sum(tbalance) now EXACT (-68881, was
+-14938), sum(bbalance) -54588 (was -309543 ~10x over), still OVERALL: FAIL by
+design until S32.2; `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
+PASS (rc=0); `scripts/tpch-spotcheck.sh` RESULT=PASS (Q12=2, Q13=35).
+NOT run: TPC-DS SF0.5 gate (~1 h).
 
 In-flight: none.
