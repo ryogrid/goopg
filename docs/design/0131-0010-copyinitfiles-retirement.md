@@ -1,6 +1,6 @@
 # Retire `copyInitFiles` — delete a provably inert test workaround and correct the record it created
 
-**Status:** draft
+**Status:** accepted (landed 2026-08-11)
 **Date:** 2026-08-11
 **Milestone:** M0131 (S10)
 

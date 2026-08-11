@@ -68,7 +68,11 @@ no path to read pg_class rows from heap file 1259.
 1. PG started against goopg data dir: `SELECT relname FROM pg_class` lists
    user tables. *(Needs E2E PG-attach test — not yet implemented.)*
 2. goopg started against PG-initdb'd data dir: serves reads via psql.
-   *(Reverse path not yet implemented.)*
+   *(Updated 2026-08-11, M0131-S10: the reverse path IS implemented — see
+   "Reverse-Path Implementation (2026-08-09)" below, and M0131-S1/S2 removed the
+   two remaining cold-start blockers (unregistered PG-initdb GUCs; an invented
+   `system_identifier`). The end-to-end proof on a directory a real `initdb`
+   created is M0131-S3, `TestE2E_GoopgColdStartOnPGDataDir`, still to land.)*
 3. CREATE TABLE → table visible in pg_class on PG standby.
    *(Depends on guard #1.)*
 4. UNITS + SMOKE green. *(Verified: all initdb tests PASS,`TestPgClassHeapBootstrapCoverage` PASS.)*
@@ -143,14 +147,22 @@ core system catalogs (pg_class, pg_type, pg_attribute) are accessible.
    `registerSystemTables()` does not enumerate. Deferred — the practical
    impact is nil for common queries since the standard PG catalog set is
    already registered.
-2. **Unclean PG WAL replay:** handle additional PG resource managers
-   (RM_GIN, RM_GIST, RM_SPGIST, RM_BRIN, etc.) in
-   `replayDecodedXLogRecord` so a crashed PG data dir can be recovered.
-   Deferred — requires implementing the corresponding index AMs.
+2. **Unclean PG WAL replay:** handle additional PG resource managers in
+   `replayDecodedXLogRecord` (`internal/wal/recovery.go:2207`, `default:` arm at
+   `:2525`) so a crashed PG data dir can be recovered. Deferred.
+   *(Corrected 2026-08-11, M0131-S10: "requires implementing the corresponding
+   index AMs" understates the surface. The handled set is rmids 0, 1, 2, 3, 4, 5,
+   7, 8, 9, 10, 11, 15, 128; missing are 6 MultiXact, 12 Hash, 13 Gin, 14 Gist,
+   16 SPGist, 17 BRIN, 18 CommitTs, 19 ReplicationOrigin, 20 Generic,
+   21 LogicalMessage (`postgres/src/include/access/rmgrlist.h:28-49`). 6, 18 and
+   19 are not index AMs and do occur in ordinary PG workloads.)*
 3. **E2E PG-attach test:** start a real PG instance, create tables, shut
    it down cleanly, start goopg against the same `$PGDATA`, and verify
-   `SELECT * FROM <user_table>` returns the correct rows. Deferred —
-   needs a test-harness PG instance lifecycle (M0130-S10).
+   `SELECT * FROM <user_table>` returns the correct rows. Deferred.
+   *(Corrected 2026-08-11, M0131-S10: the stated blocker — "needs a test-harness
+   PG instance lifecycle (M0130-S10)" — no longer exists; that harness landed in
+   `2da52113` (`internal/testutil/pgcluster`). The real obstruction was M0131-S1's
+   GUC-registry gap, now closed; the test itself is M0131-S3.)*
 
 ## References
 

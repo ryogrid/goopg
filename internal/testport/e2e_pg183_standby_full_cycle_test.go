@@ -95,8 +95,10 @@ func TestE2E_PGStandbyFullCycle(t *testing.T) {
 	// hard error in upstream pg_basebackup.
 	runGoopgBasebackupToPGSlot(t, repo, pgBasebackupBin, primary, standbyDir, forwardSlot, false)
 
-	// Copy relcache init files so PG can resolve catalog entries.
-	copyInitFiles(t, primary.DataDir(), standbyDir)
+	// M0131-S10: no relcache-init-file copy here. `StartupXLOG` unlinks every
+	// `pg_internal.init` before any backend can read one, so the copy this
+	// test used to make was inert.
+	// docs/design/0131-0010-copyinitfiles-retirement.md.
 
 	// Configure PG standby.
 	configurePGStandbyFromGoopgBackup(t, standbyDir,
@@ -335,9 +337,13 @@ func waitForPhysicalStreamingPGtoGoopg(t *testing.T, pgPrimary *pgcluster.Cluste
 		//
 		// This probes the two SRFs that `pg_stat_replication` is built from
 		// rather than the view itself. The PG in this phase runs on a data
-		// directory that goopg's initdb created, and a goopg-built catalog
-		// carries no rewrite rules that PG's relcache can load
-		// (`pg_internal.init` is written ruleless — ledgered gap), so PG
+		// directory that goopg's initdb created. PG rebuilds its relcache from
+		// the heap, and `RelationBuildRuleLock` (relcache.c:801-805) finds the
+		// rules by scanning `pg_rewrite` (2618) through index
+		// `pg_rewrite_rel_rulename_index` (2693) with `indexOK=true` — there is
+		// no seq-scan fallback, so an index goopg never populates at runtime
+		// yields `rd_rules = NULL` (M0131-S5 closes this; M0131-S6 flips
+		// `relhasrules` for the nailed system views). PG therefore
 		// answers any `SELECT ... FROM <view>` with
 		// `cannot open relation "pg_stat_replication" / This operation is not
 		// supported for views`. The join below is exactly the view body from

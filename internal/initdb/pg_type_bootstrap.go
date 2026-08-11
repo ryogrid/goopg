@@ -321,7 +321,9 @@ func pgTypeRow(e pgTypeEntry) executor.Row {
 //
 // PG18's `StartupXLOG` (xlog.c:5633) unconditionally invokes
 // `RelationCacheInitFileRemove()` at WAL recovery start, wiping every
-// `pg_internal.init` copied by `copyInitFiles()`. So every backend
+// `pg_internal.init` in the data directory (the E2E `copyInitFiles`
+// workaround that used to seed them was deleted in M0131-S10 for
+// exactly this reason). So every backend
 // rebuilds tupledesc from the heap; `TupleDescInitEntry`
 // (tupdesc.c:902) reads `typeForm->typalign` via SysCache lookup of
 // pg_type by OID. If that byte isn't one of 'c'/'s'/'i'/'d', the next
