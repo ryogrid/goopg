@@ -157,3 +157,81 @@ This also puts a caveat on every earlier S30 conclusion that used
 `crashprobe30`'s atomicity line as its signal, including the "unidirectional
 divergence" reading recorded for S30.8: with a live-server loss of this size
 underneath, the direction of the difference carries no information.
+
+## 7. Evidence RETRACTED — 2026-08-12 (loop #142)
+
+**The measurements in §3 are not trustworthy, and the defect they describe does
+not reproduce at HEAD.** Five runs of the workload at the *exact* failing scale
+(8 clients × 100 statements × 100 rows = 80000 rows) are clean:
+
+| run | harness | result |
+|---|---|---|
+| `/tmp/lostrows-dump` | `analysis/lostrows-ctiddump.sh` | 80000/80000; shell-diff of the dumped ids: 0 heap-missing, 0 index-missing |
+| `/tmp/lostrows-g` | `analysis/lostrows-concurrent-insert.sh` | `count(*)` = 80000 |
+| `/tmp/lostrows-r{1,2,3}` | `analysis/lostrows-concurrent-insert.sh` | `rows=80000 heap_missing=0 index_unreachable=0 heap_dupes=0`, `OVERALL: PASS` ×3 |
+
+### 7.1 Root cause of the false positive: the probe could measure mid-load
+
+Every one of these scripts backgrounds the server with `&` and later calls a
+bare `wait`. Bash's `wait` with no arguments waits for **all** background jobs
+*including the server*, which never exits. So the intended barrier between "all
+clients have committed" and "count the rows" was not a barrier at all — its
+behaviour depended entirely on whether the cgroup wrapper
+(`scripts/goopg-test-run.sh`) stayed in the foreground of its job or detached
+into a systemd scope:
+
+* wrapper stays in the job → `wait` blocks forever. Observed twice this loop as
+  an apparent multi-hour hang "in the measurement query" while the load had in
+  fact finished in **under a minute**.
+* wrapper detaches → `wait` returns as soon as the *server* job is reaped,
+  i.e. potentially **while clients are still inserting**, and the script counts
+  a partially-loaded table. That is a shortfall by construction.
+
+The §3 numbers came from a run of the second kind. Their internal
+inconsistency is the fingerprint: `rows=75922` with `heap_missing=6328` implies
+73672 distinct ids present, i.e. 2250 *duplicate* rows under a PRIMARY KEY,
+which no page-level mechanism explains but two queries sampling a growing table
+at different instants explain exactly. The "page-tail contiguous" loss pattern
+is likewise just the frontier of an in-progress load.
+
+Fixed in all three harnesses (2026-08-12) by collecting client PIDs and waiting
+on **those only**:
+
+```sh
+CLIENT_PIDS+=($!)   # per client
+wait "${CLIENT_PIDS[@]}"
+```
+
+### 7.2 Second measurement defect: the anti-join metric
+
+`heap_missing`/`index_unreachable` were computed server-side with
+`NOT EXISTS (SELECT 1 FROM lr b WHERE b.id+0 = g)` over `generate_series`. At
+WANT=80000 that anti-join does not finish (a post-mortem run sat in it for
+35 min), and its answer was never independently checked — it returned exactly
+`6328` on two runs whose `count(*)` shortfalls differed. Both metrics are now
+computed by dumping the ids and diffing them with `comm` in the shell: O(n log n),
+always terminates, and every number is re-checkable from the files left in `$W`.
+A `heap_dupes` assertion was added so "rows lost" can never again be conflated
+with "rows lost AND duplicated".
+
+### 7.3 What §5's step 1 turns out to be — already answered
+
+The planned "raise `shared_buffers` above the working set" experiment was moot:
+the probe cluster boots at the PG default 128 MB = **16384 slots**
+(`shared_buffers_slots=16384` in every `server.log`) against a ~1000-page
+working set, so **no eviction ever happened**, and the failing run logged a
+single checkpoint — at startup, before the load. Neither the victim/flush path
+nor the checkpointer was in play for the reported loss, which is consistent with
+there having been no loss.
+
+### 7.4 Status
+
+S30.9 is **not confirmed at HEAD**. It must not be treated as a known live
+data-loss defect, and the S30.8 blockade it created is lifted: the §6 caveat
+above rested on the refuted control, so `crashprobe30`'s atomicity line is
+back to being ordinary (if still unexplained) evidence. The honest residual
+claim is narrower and worth keeping: *nothing here proves goopg is free of
+concurrent-insert loss* — it proves the probe that said otherwise was broken.
+The hardened `analysis/lostrows-concurrent-insert.sh` is now a usable gate and
+should be re-run (and, if it is to be trusted as a regression gate, promoted to
+a Go test) before any S30 conclusion leans on it.

@@ -1,53 +1,50 @@
-Task: M0131-S30.9 — concurrent committed INSERTs are silently lost on a LIVE
-goopg server (no crash). Filed + repro landed loop #141; ROOT CAUSE STILL OPEN.
+Task: M0131-S30.9 — CLOSED as NOT-A-DEFECT (evidence retracted). S30.8 UNBLOCKED.
 
-**Read `docs/design/0131-0024` before doing anything else on S30.**
+**Read `docs/design/0131-0024` §7 before touching anything in S30.**
 
-**The big result of loop #141: S30.8's premise is REFUTED.** S30.8 (and every
-S30 conclusion drawn from `crashprobe30`'s atomicity line) assumed a replay
-defect only because the probe evaluates the invariant exclusively after a
-SIGKILL. The control was finally run — the same invariant fails with NO crash:
-clean 16-client pgbench + clean shutdown gives history 60279 rows vs 60593
-committed txns, and all four balance sums different. Do NOT change replay code
-on S30.8's strength until S30.9's gate passes.
+The big result of loop #142: **S30.9's live-server data-loss finding was a
+HARNESS artefact and is retracted.** All three probe scripts backgrounded the
+server with `&` then called a bare `wait`, which waits on ALL background jobs
+including the server (never exits). Whether it was a barrier depended on
+whether `scripts/goopg-test-run.sh` stayed in its job (→ hangs forever; seen
+twice this loop as a fake multi-hour "stuck in the measurement query" while the
+load had finished in <1 min) or detached into a systemd scope (→ returns while
+clients are STILL inserting → counts a partially-loaded table). Fingerprint of
+the bad run: `rows=75922` + `heap_missing=6328` implies 2250 duplicate rows
+under a PRIMARY KEY.
 
-Files: `analysis/lostrows-concurrent-insert.sh` (NEW, the gate),
-`docs/design/0131-0024-live-server-committed-insert-loss.md` (NEW),
-`docs/design/README.md`, `.ralph/fix_plan.md` (S30.9 added, S30.8 marked
-blocked), `.ralph/deferral_ledger.md`.
+Files: `analysis/lostrows-concurrent-insert.sh` (hardened gate),
+`analysis/lostrows-postmortem.sh` + `analysis/lostrows-ctiddump.sh` (NEW
+evidence collectors), `docs/design/0131-0024-live-server-committed-insert-loss.md`
+(§7 retraction), `docs/design/README.md`, `.ralph/fix_plan.md` (S30.9 [x],
+S30.8 unblocked), `.ralph/deferral_ledger.md`.
 
-Key symbols (suspects, none confirmed): `Pool.flushBatch`
-(`internal/storage/bufpool.go:2483` — AIO issue :2539 / Wait :2559 window, and
-the dirty-bit clear at :2571 which re-checks the tag but NOT whether the page
-changed after the bytes went to AIO); `batchExtendAndRegisterFSM` /
-`selectFSMCandidatePage` (`internal/executor/operators_storage.go:8636-8703`).
+Key symbols: none in product code — this loop changed NO engine code.
 
-Findings: `bash analysis/lostrows-concurrent-insert.sh` on a FRESH cluster →
-`rows=75922 want=80000 heap_missing=6328 index_unreachable=5837`; all clients
-exit 0 under `ON_ERROR_STOP=1`, zero error lines. 7.9% of committed rows gone
-from the HEAP. The two counts are not nested (~491 ids absent from a seq scan
-yet returned by an index scan) → heap and btree diverge both ways. Loss is
-page-tail CONTIGUOUS (689-700, 1400-1419, 1983-2000, 2058-2067). Separate
-effect: ~1.4% of pgbench_accounts rows go index-unreachable (heap row correct),
-so later `UPDATE ... WHERE aid = ?` matches zero rows and silently drops the
-increment (2000 updates left abalance=1); `REINDEX TABLE` repairs it.
+Findings: 5/5 clean runs at the exact failing scale (80000 rows, 8 clients):
+`rows=80000 heap_missing=0 index_unreachable=0 heap_dupes=0`. Also settled for
+free: eviction was NEVER in play (`shared_buffers_slots=16384` vs ~1000-page
+working set) and the failing run logged ONE checkpoint, at startup before the
+load — so neither the flush/victim path nor the checkpointer could have caused
+the reported loss. The old `NOT EXISTS (… WHERE b.id+0 = g)` anti-join metric
+is retired: it never finishes at 80000 rows and returned exactly `6328` on two
+runs whose `count(*)` shortfalls differed.
 
-RULED OUT, do not re-test: crash/replay (nothing killed; count comes from the
-live buffer pool); client-side error; stale datadir (fresh `goopg init`);
-single-client appends (exact at -c 1, and over 12 updates on a 200000-row
-fillfactor=100 table); the ENTIRE S30.3 duplicate-buffer mechanism —
-`GOOPG_PAGEIDENT_PROBE=1` fired ZERO events during a run that lost 4985 rows.
-
-Next step: re-run the repro with `shared_buffers` well above the working set.
-If the loss vanishes without eviction the defect is in the flush/victim path;
-if it survives it is in the append path. That one run splits the search space.
+Next step: work **S30.8** as originally filed (non-HOT heap-update replay arm in
+`internal/wal/recovery.go` + its `pd_lsn` skip guard; `pgbench_accounts` is
+fillfactor 100 so most updates move the tuple across pages). Gate:
+`RUNS=2 bash analysis/crashprobe30.sh` must print `OVERALL: PASS`. Before
+reading its crash arm, run the hardened `analysis/lostrows-concurrent-insert.sh`
+once — and note the residual ledger item: crashprobe30's atomicity invariant has
+still never been shown to PASS on a no-crash control.
 
 Gates run: `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS
 (cached); `make ralph-state-guard` PASS (auto-repaired the previous loop's
-completed marker); commit-hook pgbench smoke PASS. `RUNS=1 crashprobe30` FAIL
-(atomicity only — but now known to be confounded by S30.9).
+completed marker); commit-hook pgbench smoke PASS; the retracted probe 5/5 PASS.
 
 Nightly triage: `ci/logs/action-items.md` still run `20260811-014635`
-(AI-…-001..012), all already filed under M-NIGHTLY; nothing new.
+(AI-…-001..012) — all 12 already filed under M-NIGHTLY (003..011 share one
+batched row); nothing new. Note 5 orphaned `TestPort_RegressSuite` goopg servers
+(13-22 h old, ~430 MB) are still resident; `kill` of them is classifier-denied.
 
 In-flight: none.

@@ -49,6 +49,7 @@ q 'select 1' >/dev/null 2>&1 || { echo "SERVER_NEVER_UP"; tail -20 $W/server.log
 
 q 'create table lr(id int primary key, pad char(84))' >/dev/null
 
+CLIENT_PIDS=()
 for c in $(seq 0 $((CLIENTS - 1))); do
     {
         for chunk in $(seq 0 $((CHUNKS - 1))); do
@@ -58,8 +59,13 @@ for c in $(seq 0 $((CLIENTS - 1))); do
         done | psql -h 127.0.0.1 -p $PORT -U postgres -d postgres -q -v ON_ERROR_STOP=1 >$W/client_$c.log 2>&1
         echo "$?" >$W/client_$c.rc
     } &
+    CLIENT_PIDS+=($!)
 done
-wait
+# Wait for the CLIENTS ONLY. A bare `wait` also waits on the backgrounded
+# server job, which never exits — that defect (fixed 2026-08-12) made this
+# probe look like it hung for hours in its measurement queries when the load
+# had in fact finished in under a minute, and cost two loops of wall clock.
+wait "${CLIENT_PIDS[@]}"
 
 bad=0
 for c in $(seq 0 $((CLIENTS - 1))); do
@@ -70,11 +76,35 @@ ERRS=$(cat $W/client_*.log | grep -ci error)
 [ "$ERRS" = "0" ] || { echo "FAIL: $ERRS client-side errors (a lost row must not be an error the client saw)"; bad=1; }
 
 ROWS=$(q 'select count(*) from lr')
-# id+0 defeats the index, so this counts heap presence only.
-UNREACH=$(q "select count(*) from generate_series(1,$WANT) g where not exists (select 1 from lr b where b.id = g)")
-MISSING=$(q "select count(*) from generate_series(1,$WANT) g where not exists (select 1 from lr b where b.id+0 = g)")
 
-echo "rows=$ROWS want=$WANT  heap_missing=$MISSING  index_unreachable=$UNREACH"
+# The two shortfalls are computed by DUMPING the ids and diffing them in the
+# shell, not with a server-side `NOT EXISTS (… WHERE b.id+0 = g)` anti-join.
+# The anti-join formulation was retired on 2026-08-12 for two reasons found
+# while chasing this bug: at WANT=80000 it does not finish (a post-mortem run
+# sat in it for 35 min), and its answer is unverified — it reported exactly
+# `6328` on two separate runs whose `count(*)` shortfalls differed (4078 vs
+# 6328), so at least one of those numbers came from the anti-join and not from
+# the data. The dump+diff below is O(n log n), always terminates, and every
+# number it prints is independently checkable from the files it leaves in $W.
+#
+#   heap_missing        ids absent from a seq scan (`id+0` defeats the index):
+#                       the committed INSERT's heap tuple is not there at all.
+#   index_unreachable   ids absent from an index-driven scan while present in
+#                       the heap: the btree entry is missing, which is what
+#                       makes a later `UPDATE … WHERE id = ?` match zero rows.
+#   heap_dupes          extra heap rows beyond the distinct ids — a PRIMARY KEY
+#                       violation that survived COMMIT. Counted because the
+#                       old metric could not distinguish "rows lost" from
+#                       "rows lost AND duplicated".
+q "select id+0 from lr" | sort -n | uniq >$W/heap_ids.txt
+q "select id from lr where id > 0" | sort -n | uniq >$W/index_ids.txt
+seq 1 $WANT >$W/want_ids.txt
+MISSING=$(comm -23 $W/want_ids.txt $W/heap_ids.txt | tee $W/heap_missing.txt | wc -l)
+UNREACH=$(comm -23 $W/want_ids.txt $W/index_ids.txt | tee $W/index_missing.txt | wc -l)
+DUPES=$((ROWS - $(wc -l <$W/heap_ids.txt)))
+
+echo "rows=$ROWS want=$WANT  heap_missing=$MISSING  index_unreachable=$UNREACH  heap_dupes=$DUPES"
+[ "$DUPES" = "0" ] || { echo "FAIL: $DUPES duplicate heap rows survived a PRIMARY KEY"; bad=1; }
 [ "$ROWS" = "$WANT" ] || { echo "FAIL: committed INSERTs lost from the heap ($ROWS of $WANT)"; bad=1; }
 [ "$MISSING" = "0" ] || { echo "FAIL: $MISSING ids absent from the heap"; bad=1; }
 [ "$UNREACH" = "0" ] || { echo "FAIL: $UNREACH ids present in the heap but unreachable through the primary key"; bad=1; }
