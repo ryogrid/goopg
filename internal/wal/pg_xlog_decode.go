@@ -346,7 +346,11 @@ func decodeXLogBlockRefHeader(src []byte, lastRel storage.RelFileNode, haveRel b
 			if off+sizeOfXLogRecordBlockCompressHead > len(src) {
 				return xlogBlockMeta{}, 0, storage.RelFileNode{}, false, fmt.Errorf("%w: truncated block image compression header", ErrCorruptRecord)
 			}
-			return xlogBlockMeta{}, 0, storage.RelFileNode{}, false, fmt.Errorf("wal: compressed PostgreSQL backup block images are not supported yet")
+			// M0131-S16.5: wrapped in ErrUnsupportedRecord so the reader
+			// surfaces it to the caller instead of absorbing it as a
+			// clean end-of-WAL — these bytes are a real, durable record.
+			return xlogBlockMeta{}, 0, storage.RelFileNode{}, false, fmt.Errorf(
+				"%w: compressed PostgreSQL backup block images are not supported yet", ErrUnsupportedRecord)
 		}
 	}
 	if forkFlags&bkpBlockSameRel != 0 {
@@ -359,16 +363,27 @@ func decodeXLogBlockRefHeader(src []byte, lastRel storage.RelFileNode, haveRel b
 			return xlogBlockMeta{}, 0, storage.RelFileNode{}, false, fmt.Errorf("%w: truncated relfilelocator", ErrCorruptRecord)
 		}
 		spcOID := binary.LittleEndian.Uint32(src[off : off+4])
-		if spcOID != 0 && spcOID != pgDefaultTableSpaceOID && spcOID != pgGlobalTableSpaceOID {
-			return xlogBlockMeta{}, 0, storage.RelFileNode{}, false, fmt.Errorf(
-				"wal: unsupported PostgreSQL tablespace OID %d locator=%x fork_flags=0x%02x data_len=%d",
-				spcOID, src[off:off+sizeOfRelFileLocator], forkFlags, meta.dataLen)
-		}
-		// spcOID is dropped: the shared-vs-per-DB routing is carried by dbOid
-		// (0 → global/, via sharedOrPerDBRelDir). A shared catalog's locator is
+		// For the two built-in tablespaces spcOID is dropped: the
+		// shared-vs-per-DB routing is carried by dbOid (0 → global/, via
+		// sharedOrPerDBRelDir). A shared catalog's locator is
 		// spcOid=1664/dbOid=0; TblOid stays 0 so relDir resolves to global/.
 		// B4.1a.
+		//
+		// M0131-S16.2: a USER tablespace OID used to be rejected here, and the
+		// reader then reported that rejection as a clean end-of-WAL — so every
+		// record behind the first pg_tblspc-resident relation was dropped on
+		// goopg's OWN restart path (exposed by
+		// TestIndexTablespaceSurvivesRestartViaCatalogHeap the moment the
+		// reader stopped swallowing the error). Carry the OID into TblOid
+		// instead: storage.relDir already routes a non-zero TblOid through
+		// pg_tblspc/<TblOid>/<version dir>/<dbOid> (smgr.go:624-636,
+		// M0122-0007), which is exactly where the emitter put the file.
+		tblOID := spcOID
+		if spcOID == pgDefaultTableSpaceOID || spcOID == pgGlobalTableSpaceOID {
+			tblOID = 0
+		}
 		meta.ref.Rel = storage.RelFileNode{
+			TblOid: tblOID,
 			DBOid:  binary.LittleEndian.Uint32(src[off+4 : off+8]),
 			RelOid: binary.LittleEndian.Uint32(src[off+8 : off+12]),
 		}

@@ -1,46 +1,38 @@
 (idle — nothing in flight)
 
-Loop #122 landed **M0131-S17** — goopg now stamps `pg_control.State =
-DB_IN_PRODUCTION` at the end of `Open`, before any client is accepted. This
-closed a LIVE data-loss bug: a SIGKILL inside the first `checkpoint_timeout`
-(300 s) left the directory claiming `DB_SHUTDOWNED`, so a hosted PG took none
-of the three `InRecovery` arms (`xlogrecovery.c:924-936`), skipped
-`PerformWalRecovery()` entirely, and overwrote goopg's committed WAL tail with
-no PANIC and nothing alarming logged.
+Loop #123 landed the data-loss half of **M0131-S16** (S16.1 + S16.2 + S16.5):
+an unrecognised WAL record is no longer end-of-WAL.
 
 Carry-forward:
 
-- **The remaining "LAND FIRST" data-loss item is M0131-S16** (WAL reader treats
-  rmids 16-21 as end-of-WAL → silent truncation → permanent on first append,
-  design `0131-0013`). That is the cheapest high-value next pick unless the
-  banner moves.
-- **S18.1 is the natural follow-on to what just landed**: the new stamp rides
-  `control.UpdateControlFile`, whose `os.WriteFile` is `O_TRUNC` + no fsync, so
-  a crash mid-write leaves a zero-length `pg_control` and PG PANICs `read 0 of
-  296`. Ledgered. S18 also carries the nine undecoded `checkPointCopy` fields
-  and the hardcoded TLI 1 (which stomps a promoted cluster).
-- **goopg still has NO reader of `pg_control.State`** (S17.3 probe, ledgered) —
-  it cannot tell its own crashed directory from a clean one. That is S20.1. The
-  fix_plan's "S15 changes that" pointer was stale; the reader is S20.
-- The fix_plan's S17 row cited design `0131-0013`; the real doc is
-  **`0131-0014`** (0131-0013 is the WAL-reader doc). Corrected in the check-off
-  text; other Theme F rows may carry the same off-by-one — check before trusting
-  a design filename in this milestone's rows.
-- Nightly `20260811-014635` (12 items) was **already filed** by a prior loop at
-  fix_plan.md:717 — do not re-file. 9 of them are `regress/*` "output mismatch;
-  normalization rules need extension", the same recurring class as the
-  20260809 batch.
+- **S16 stays UNCHECKED**: S16.3 (btree `default:` arm must refuse unless every
+  mutated block carries `ImageApply`) and S16.4 (enumerate the `RmgrXLog` no-op
+  opcodes; `XLOG_NEXTOID` moves to S21a) are still open. Both are replay-side
+  and can turn a today-silent no-op into a refused start on goopg's OWN WAL, so
+  they need a crash-restart gate (SIGKILL + restart over a btree-heavy
+  workload), not unit tests alone. Ledgered; design `0131-0013` §Implementation
+  notes lists them.
+- **The next Theme F pick is S19** (validate `xlp_pageaddr`/`xlp_tli`; a
+  recycled PG segment is full of stale CRC-valid records). Same design doc.
+  Flagged RISKY — it is the slice most likely to break goopg's own restart, and
+  the *writer* half (`detectWritePos`/`scanLastSegmentEnd`) is the load-bearing
+  one, not the reader half.
+- **Discovery worth remembering:** goopg's own emitter writes the real `TblOid`
+  into a block-ref locator, but the decoder rejected every non-1663/1664
+  tablespace OID — so every record touching a `pg_tblspc`-resident relation was
+  read as a clean end-of-WAL **on goopg's own restart**. Invisible until the
+  reader stopped swallowing decode errors. Fixed here; the sibling
+  `decodeXLogSmgrCreate` had had the right mapping all along (Hard-won Rule #2).
+- Nightly `20260811-014635` (12 items) was already filed at fix_plan.md:717 —
+  re-verified this loop, do not re-file.
 
-Technique worth reusing: the guard was proven fail-when-broken by
-short-circuiting `stampInProduction` with a temporary `if true { return nil }`
-(file backed up to /tmp, restored, rebuild verified) — `got 1, want 6`. A green
-new test on a startup path proves very little otherwise.
+Technique worth reusing (same as last loop): every new guard was proven
+fail-when-broken by temporarily restoring `MaxKnownRmgr = RmgrSeq` and the four
+`<= segSize` breaks via a scripted patch over /tmp backups — 4 FAIL, and the two
+"still end-of-WAL" guards correctly kept PASSing.
 
-Gates run this loop: new `TestOpenStampsDBInProduction` PASS (and PASS-inverted
-without the fix), `internal/initdb` PASS (65 s), `internal/control` +
-`internal/wal` PASS, `TestE2E_{PGColdStartOnGoopgDataDir,GoopgColdStartOnPGDataDir}`
-PASS (27 s), whole `^TestE2E_` family PASS, UNITS PASS, pgbench smoke via the
-commit hook, `make ralph-state-guard` OK (auto-repaired the stale
-completed-marker, as usual).
+Gates run this loop: `internal/wal` PASS + `-race` PASS, `internal/initdb` PASS
+(70 s — it caught the tablespace bug), `internal/storage` PASS, UNITS PASS,
+pgbench smoke via the commit hook, `make ralph-state-guard` OK.
 
 In-flight: none.

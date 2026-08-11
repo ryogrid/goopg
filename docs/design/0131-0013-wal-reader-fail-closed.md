@@ -1,6 +1,6 @@
 # WAL reader fail-closed — an unrecognised record is not end-of-WAL, and a recycled segment is not WAL
 
-**Status:** draft
+**Status:** S16.1 / S16.2 / S16.5 LANDED 2026-08-11; S16.3, S16.4 and S19 still open
 **Date:** 2026-08-11
 **Milestone:** M0131 (Theme F, S16 + S19)
 
@@ -230,6 +230,67 @@ alone.
    (`scripts/tpch-spotcheck.sh`) — S19 is flagged as the slice most likely to
    break goopg's own restart.
 9. UNITS + SMOKE green.
+
+## Implementation notes — what landed 2026-08-11 (S16.1 / S16.2 / S16.5)
+
+**S16.1.** `internal/wal/xlog_record.go` now names rmids 16..21
+(`RmgrSPGist` … `RmgrLogicalMessage`) and `MaxKnownRmgr = RmgrLogicalMessage`
+(upstream `RM_MAX_BUILTIN_ID`). The constant is deliberately re-documented as
+the *protocol* bound rather than "what goopg can replay": refusing a record
+goopg cannot apply is the replay dispatcher's job, where the refusal reaches
+the caller instead of being mistaken for a torn tail. `(21, 128)` is still
+rejected, so the existing rmid-99 / rmid-127 decoder tests are unchanged.
+
+**S16.2.** New sentinel `ErrUnsupportedRecord` (`format.go`) names the class the
+design separates out: bytes that are intact and durable but that goopg cannot
+decode or apply, as opposed to `ErrCorruptRecord`'s never-durable ones. In
+`readAllPageAware`:
+
+- the four unconditional `int64(len(stream)-off) <= segSize` breaks are gone
+  (the `isPreallocatedTail` guards stay — a zero tail is still a silent stop);
+- the body-decode arm returns `ErrUnsupportedRecord` to the caller. This is
+  sound *because* `decodeRecordXLogDetailed` verifies the record CRC **before**
+  parsing the body, so anything raising that sentinel is durable by
+  construction;
+- the header-decode arm gained `durableUnknownRecord`, which re-checks the
+  record's own CRC over `xl_tot_len` bytes. CRC-valid ⇒ a real record from a
+  producer this build does not understand ⇒ error to the caller; otherwise ⇒
+  end-of-WAL, as before. False-positive cost is a 2^-32 collision producing a
+  loud refused start; the false negative it replaces is silent data loss.
+
+**S16.5.** The compressed-image and non-default-tablespace errors are wrapped in
+`ErrUnsupportedRecord` so they ride the new path.
+
+**A latent goopg-side data-loss bug this exposed.** The non-default-tablespace
+rejection in `decodeXLogBlockRefHeader` did not only affect PG-authored WAL:
+goopg's own block-ref encoder writes the real `TblOid` into the locator
+(`xlog_assemble.go:130`), so **every** goopg record touching a
+`pg_tblspc`-resident relation was rejected by goopg's own decoder and reported
+as a clean end-of-WAL — dropping the rest of the stream on goopg's own restart.
+It was invisible until the reader stopped swallowing the error, at which point
+`TestIndexTablespaceSurvivesRestartViaCatalogHeap` failed with
+`unsupported PostgreSQL tablespace OID 16407`. Fixed by carrying the OID into
+`RelFileNode.TblOid` (1663/1664 → 0), which is exactly the mapping the sibling
+`decodeXLogSmgrCreate` (`recovery.go:4528-4544`) already performed for
+`xl_smgr_create`, and which `storage.relDir` (`smgr.go:624-636`) routes through
+`pg_tblspc/<oid>/<version dir>/<dbOid>`. Hard-won Rule #2 in miniature: the two
+decode siblings disagreed, and only one of them had a test.
+
+**Guards run:** `internal/wal/reader_fail_closed_test.go` (6 new tests: PG-only
+rmgrs survive the walk; the dispatcher refuses them; a CRC-valid unknown rmid
+errors to the caller; torn tail and zero tail still stop silently; a compressed
+image errors; the user-tablespace locator round-trips). Every new guard was
+proven fail-when-broken by temporarily restoring the old bound and the
+`<= segSize` breaks (4 FAIL, the two tail guards still PASS). `internal/wal`
+PASS + `-race` PASS, `internal/initdb` PASS, `internal/storage` PASS, UNITS
+PASS, pgbench smoke via the commit hook.
+
+**Still open in S16:** S16.3 (btree `default:` arm must refuse unless every
+mutated block carries `ImageApply`) and S16.4 (enumerate the `RmgrXLog` no-op
+opcode set and error on the rest). Both are replay-side, both risk turning a
+today-silent no-op into a refused start on goopg's own WAL, and both therefore
+want a crash-restart gate rather than unit tests alone — ledgered, fix_plan row
+left unchecked.
 
 ## References
 

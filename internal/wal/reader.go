@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -152,13 +153,18 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 		h, err := DecodeXLogRecordHeader(header)
 		if err != nil {
 			// M0088-0001: see ReadAll. Page-aware path uses
-			// "everything from the corrupt header on is zero" OR
-			// "within one segment-size of EOF" as the EOS signal.
+			// "everything from the corrupt header on is zero" as the EOS
+			// signal.
 			if isPreallocatedTail(stream[off:]) {
 				break
 			}
-			if int64(len(stream)-off) <= segSize {
-				break
+			// M0131-S16.2: a header goopg cannot validate is end-of-WAL only
+			// when the bytes were never durable. If the record's own CRC
+			// checks out, these bytes ARE a record — from a producer goopg
+			// does not understand — and stopping here would silently drop it
+			// and everything after it, which the next append then overwrites.
+			if derr := durableUnknownRecord(stream, off, pos, segSize, header, err); derr != nil {
+				return records, fmt.Errorf("wal: lsn %d: %w", baseOffset+uint64(off)+1, derr)
 			}
 			endOfWAL(off, baseOffset, "invalid record header", err)
 			break
@@ -166,9 +172,6 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 		total := int(h.TotLen)
 		if total < xlogRecordHeaderSize {
 			if isPreallocatedTail(stream[off:]) {
-				break
-			}
-			if int64(len(stream)-off) <= segSize {
 				break
 			}
 			endOfWAL(off, baseOffset, "bad xlog total length", fmt.Errorf("xl_tot_len=%d", total))
@@ -181,14 +184,20 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 		}
 		decoded, err := decodeRecordXLogDetailed(fullBytes)
 		if err != nil {
+			// M0131-S16.2/S16.5: ErrUnsupportedRecord is only ever raised
+			// AFTER the record CRC has validated (decodeRecordXLogDetailed
+			// verifies the CRC before parsing the body), so these bytes are
+			// durable by construction — a compressed backup-block image or a
+			// non-default tablespace locator, not a torn tail. It must reach
+			// the caller.
+			if errors.Is(err, ErrUnsupportedRecord) {
+				return records, fmt.Errorf("wal: lsn %d: %w", baseOffset+uint64(off)+1, err)
+			}
 			tailStart := off + consumed
 			if tailStart > len(stream) {
 				tailStart = len(stream)
 			}
 			if isPreallocatedTail(stream[tailStart:]) {
-				break
-			}
-			if int64(len(stream)-off) <= segSize {
 				break
 			}
 			endOfWAL(off, baseOffset, "record failed to decode", err)
@@ -200,9 +209,6 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 				tailStart = len(stream)
 			}
 			if isPreallocatedTail(stream[tailStart:]) {
-				break
-			}
-			if int64(len(stream)-off) <= segSize {
 				break
 			}
 			endOfWAL(off, baseOffset, "record size mismatch",
@@ -219,6 +225,43 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 
 // (afterCorruptIsZeroTail was removed in A9 with the legacy ReadAll walk; the
 // PG-frame page-aware walk uses isPreallocatedTail directly.)
+
+// durableUnknownRecord decides whether a record whose HEADER failed validation
+// is nevertheless a real, durable record — in which case it returns a non-nil
+// ErrUnsupportedRecord to be surfaced to the caller, and nil when the bytes
+// look like the garbage tail of a crash (the end-of-WAL case).
+//
+// M0131-S16.2. The two cases are distinguished exactly the way upstream's
+// XLogReaderValidatePageHeader/ValidXLogRecord pair does: xl_crc is computed
+// over the whole record, so a header goopg rejects (unknown rmid in
+// (RM_MAX_BUILTIN_ID, 128), nonzero padding, undefined framework bits) whose
+// CRC still checks out cannot be an accident — it was written by a producer
+// this build does not understand. Treating that as end-of-WAL drops it and
+// every record behind it, and detectWritePos then appends over the survivors,
+// making the loss permanent on the first write.
+//
+// The residual false-positive risk is a 2^-32 CRC collision on garbage; the
+// consequence of a false positive is a refused start (loud, recoverable), and
+// of the false NEGATIVE this replaces, silent data loss.
+func durableUnknownRecord(stream []byte, off int, pos, segSize int64, header []byte, cause error) error {
+	if len(header) < xlogRecordHeaderSize {
+		return nil
+	}
+	total := int(binary.LittleEndian.Uint32(header[0:4]))
+	if total < xlogRecordHeaderSize || total > len(stream)-off {
+		return nil
+	}
+	fullBytes, _ := extractRecordBytes(stream[off:], pos, segSize, maxAlignXLog(total))
+	if len(fullBytes) < total {
+		return nil
+	}
+	want := binary.LittleEndian.Uint32(header[20:24])
+	if err := VerifyXLogRecordCRC(fullBytes[:xlogRecordHeaderSize], fullBytes[xlogRecordHeaderSize:total], want); err != nil {
+		return nil
+	}
+	return fmt.Errorf("%w: CRC-valid record goopg cannot decode (rmid=%d xl_info=0x%02x xl_tot_len=%d): %w",
+		ErrUnsupportedRecord, header[17], header[16], total, cause)
+}
 
 // endOfWAL logs where the record walk stopped and why. root-0032: reaching a
 // record that fails validation ENDS recovery, it is not a fatal error — the
