@@ -61,6 +61,29 @@ func replayCLogFromWAL(walDir string, clog *mvcc.CLog, txnMgr *mvcc.Manager) err
 	// checkpoint's pg_control state.
 	startIdx, _ := wal.ExportedReplayStart(records)
 	for _, r := range records[startIdx:] {
+		// M0131-S30.7: nextXID must be beyond EVERY replayed record's XID,
+		// not only the XIDs that reached a commit/abort record. Upstream does
+		// exactly this, unconditionally, for each record it applies:
+		// AdvanceNextFullTransactionIdPastXid(record->xl_xid) in
+		// ApplyWalRecord (postgres/src/backend/access/transam/xlogrecovery.c:1942).
+		//
+		// Without it goopg's post-crash nextXID was max(committed XID)+1, so
+		// the XIDs of transactions that were IN FLIGHT at the crash — whose
+		// heap records are in the WAL (a concurrent commit flushes them) and
+		// ARE replayed — got handed out again to new transactions. When such a
+		// new transaction committed, it stamped the crashed transaction's XID
+		// Committed and resurrected its replayed half, tearing an atomic
+		// transaction apart. Measured on the preserved crashprobe30 clusters:
+		// WAL tail carried XIDs up to 59985 with the last commit at 59974,
+		// while the restarted server resumed at nextXid 59977.
+		//
+		// Advancing here also tightens the MarkUnknownAsAborted sweep in
+		// initdb.Open, which stamps every still-Unknown XID below nextXID
+		// Aborted — that is what makes an in-flight transaction's replayed
+		// tuples correctly invisible, as upstream's clog-absent XIDs are.
+		if r.XLog != nil && r.XLog.Header.XID != 0 {
+			txnMgr.SetNextXID(storage.TransactionID(r.XLog.Header.XID) + 1)
+		}
 		// --- Native goopg commit/abort records ---
 		if len(r.Payload) >= wal.XactRecordSize {
 			switch r.Payload[0] {

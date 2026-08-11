@@ -347,3 +347,75 @@ func TestReplayCLogFromWAL_RecoversUnflushedAbort(t *testing.T) {
 		t.Errorf("NextXID = %d after replay, want > %d (XID-reuse window)", next, xid)
 	}
 }
+
+// TestReplayCLogFromWAL_AdvancesPastInFlightXID pins M0131-S30.7: nextXID after
+// crash recovery must be beyond the XID of EVERY replayed record, not only
+// beyond the XIDs that reached a commit/abort record.
+//
+// The crashprobe30 measurement that motivated this: the WAL tail carried
+// records for XIDs up to 59985 (transactions still in flight when the server
+// was SIGKILLed — a concurrent commit had already flushed their heap records),
+// the last commit record was 59974, and the restarted server resumed handing
+// out XIDs at 59977. Those reused XIDs were then stamped Committed by NEW
+// transactions, resurrecting the in-flight transactions' replayed half and
+// breaking pgbench's atomicity invariant
+// (sum(pgbench_accounts.abalance) != sum(pgbench_history.delta)) in both
+// directions. Upstream advances unconditionally per record —
+// AdvanceNextFullTransactionIdPastXid(record->xl_xid),
+// postgres/src/backend/access/transam/xlogrecovery.c:1942.
+func TestReplayCLogFromWAL_AdvancesPastInFlightXID(t *testing.T) {
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "pg_wal")
+
+	clog, err := mvcc.OpenCLog(filepath.Join(dir, "pg_xact"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := clog.EnablePGSLRUMirror(filepath.Join(dir, "pg_xact_slru")); err != nil {
+		t.Fatal(err)
+	}
+	txnMgr := mvcc.NewManager()
+
+	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const committed = storage.TransactionID(11)
+	const inFlight = storage.TransactionID(17)
+	if _, _, err := w.Append(wal.EncodeXactCommit(committed)); err != nil {
+		t.Fatalf("Append commit: %v", err)
+	}
+	// A record belonging to a transaction that never committed: same shape as
+	// the pgbench UPDATE whose commit record never made it to disk.
+	framed, err := wal.EncodeSmgrCreatePG(storage.RelFileNode{DBOid: 5, RelOid: 16407}, inFlight)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := w.Append(framed); err != nil {
+		t.Fatalf("Append in-flight record: %v", err)
+	}
+	_ = w.Close()
+
+	if err := replayCLogFromWAL(walDir, clog, txnMgr); err != nil {
+		t.Fatalf("replayCLogFromWAL: %v", err)
+	}
+
+	if got := txnMgr.NextXID(); got <= inFlight {
+		t.Errorf("NextXID = %d after replay, want > %d — the in-flight XID would be REUSED", got, inFlight)
+	}
+	// The in-flight XID must not be committed: the implicit-abort sweep in
+	// initdb.Open (MarkUnknownAsAborted, bounded by NextXID) is what stamps it
+	// Aborted, and it can only reach XIDs below NextXID.
+	if got := clog.GetStatus(inFlight); got == mvcc.TxnStatusCommitted {
+		t.Errorf("GetStatus(%d) = Committed after replay, want not-committed", inFlight)
+	}
+	if err := clog.MarkUnknownAsAborted(txnMgr.NextXID()); err != nil {
+		t.Fatalf("MarkUnknownAsAborted: %v", err)
+	}
+	if got := clog.GetStatus(inFlight); got != mvcc.TxnStatusAborted {
+		t.Errorf("GetStatus(%d) after sweep = %v, want Aborted", inFlight, got)
+	}
+	if got := clog.GetStatus(committed); got != mvcc.TxnStatusCommitted {
+		t.Errorf("GetStatus(%d) after sweep = %v, want Committed", committed, got)
+	}
+}
