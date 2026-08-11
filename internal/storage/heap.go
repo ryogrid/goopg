@@ -659,10 +659,13 @@ func PageGetHeapTupleNoCopy(p Page, slot uint16) (HeapTuple, error) {
 // page is treated as full.
 // PageRemoveHeapTuple marks the 1-based slot as LP_UNUSED, freeing the line
 // pointer. If the slot is the last line pointer, pd_lower is decremented to
-// reclaim the array entry. The tuple body bytes in the upper region become
-// garbage; they are reclaimed by the next VACUUM / page compaction
-// (VacuumHeapPageBySlots). Returns ErrInvalidSlot for out-of-range slot
-// numbers and ErrUnsupportedItem if the slot is not LP_NORMAL.
+// reclaim the array entry, and pd_upper is raised back over the item body when
+// that body is the topmost one — so removing the item that was just appended
+// restores the page exactly (M0131-S30.5). For any other slot the tuple body
+// bytes in the upper region become garbage; they are reclaimed by the next
+// VACUUM / page compaction (VacuumHeapPageBySlots). Returns ErrInvalidSlot for
+// out-of-range slot numbers and ErrUnsupportedItem if the slot is not
+// LP_NORMAL.
 //
 // This is the inverse of PageAddHeapTuple for the orphan-cleanup path: when
 // tryApplyHOTUpdate writes a new tuple to the page but the subsequent old-slot
@@ -696,6 +699,22 @@ func PageRemoveHeapTuple(p Page, slot uint16) error {
 	if idx == count-1 {
 		h := MustHeader(p)
 		h.SetLower(uint16(SizeOfPageHeaderData + idx*itemIDSize))
+		// M0131-S30.5: also give pd_upper back when the removed item's body
+		// is the topmost one, i.e. it sits exactly at pd_upper. Together with
+		// the pd_lower shrink above that makes this call an EXACT undo of the
+		// PageAddHeapTuple that placed it, which is what the orphan-cleanup
+		// caller needs: the add emitted no WAL, so the page must return to
+		// its last-logged state or replay rebuilds a page that disagrees with
+		// the one the runtime flushed. Restoring only pd_lower left pd_upper
+		// permanently lowered — an unlogged free-space loss that accumulates
+		// on the page and is exactly the runtime/WAL divergence family
+		// M0131-S30.3 is chasing. The vacated bytes fall back inside
+		// [pd_lower, pd_upper), i.e. PG's FPI hole, so they are not part of
+		// the page image either way (postgres/src/backend/access/transam/
+		// xloginsert.c XLogRecordAssemble).
+		if int(item.Offset) == int(h.Upper()) {
+			h.SetUpper(uint16(int(item.Offset) + maxAlign8(int(item.Length))))
+		}
 	}
 	// Tuple body is NOT zeroed — the bytes in [pd_upper, pd_special) are
 	// garbage; VacuumHeapPageBySlots repacks survivors and reclaims the space.

@@ -1,43 +1,39 @@
 (idle — nothing in flight)
 
-Loop #134 worked **M0131-S30.3** (diagnosis; probe landed, no engine fix yet).
+Loop #135 worked **M0131-S30.5** — CLOSED and committed.
 
-**Built the probe the previous loop specified** — `internal/storage/pageident_probe.go`
-(`GOOPG_PAGEIDENT_PROBE=1`), driver `analysis/pageident_probe.sh`. It reports
-`PAGEIDENT-REGRESS` (a heap page under a tag has FEWER line pointers than the
-high-water mark for that tag = buffer tag/content aliasing) and
-`PAGEIDENT-REEXTEND` (extend hands out a block that already carried tuples).
-Observes at every disk read, disk write, pre-eviction flush, and in
-`tryApplyHOTUpdate` under the content lock. Heap-only filter is
-`pd_special == BlockSize` — WITHOUT it btree splits give 336 benign hits
-(`lp=205 high=407`); don't re-discover that.
+**Fix:** `PageRemoveHeapTuple` (`internal/storage/heap.go`) is now an exact undo of
+`PageAddHeapTuple`: when the removed slot is the LAST line pointer and its body sits
+exactly at `pd_upper`, `pd_upper` is raised back over the body (MAXALIGNed) in
+addition to the existing `pd_lower` shrink. Rationale that neither filed candidate
+had: the orphan-cleanup add is ALSO unlogged, so the add/remove pair needs no WAL
+record — it needs to be a page no-op, and it was not (it leaked one tuple's free
+space per occurrence out of a page the WAL says still has it). Interior removals
+unchanged. Guards: `TestPageRemoveHeapTupleUndoesAppend` (verified FAILS pre-fix,
+`pd_upper=8056 want=8096`) / `TestPageRemoveHeapTupleInteriorSlotKeepsUpper`.
 
-**Both S30.3 prime suspects are REFUTED — do not re-test:**
-1. buffer-pool tag/content aliasing — ZERO hits in a clean 45 s scale-5/16-client
-   run AND in a `crashprobe30` run that DID lose rows (497287/500000, 2713 missing).
-2. `IsNew`-driven silent `PageInit` past a shortened file — no such path:
-   `relFile.readBlock` returns `ErrShortRead` for `blk >= nblocks` and `pinLoad`
-   propagates the error (never publishes a zero page).
+**Still open in M0131-S30 (next candidates, in order):**
+- **S30.3** — the big one (`185 -> 1` line pointers). Prime suspects 1 (buffer
+  tag/content aliasing) and 2 (`IsNew` PageInit past a shortened file) are REFUTED,
+  do not re-test. Probe exists: `internal/storage/pageident_probe.go`
+  (`GOOPG_PAGEIDENT_PROBE=1`, driver `analysis/pageident_probe.sh`); heap-only
+  filter is `pd_special == BlockSize` (without it btree splits give 336 benign
+  hits). Remaining candidates: (a) assert at `markHeapHotUpdateDirty` that the
+  emitted `new_off` equals BOTH `newSlot` and `PageLinePointerCount(page)` — catch
+  an emit-time inconsistency; (b) if clean, walk block 130's records from the START
+  of the stream (divergence may begin far before record 826236).
+- S30.1 / S30.2 / S30.4 (WAL-tail-vs-segment-padding, WARN-that-still-starts,
+  no-checkpoint) — all untouched.
+- Ledger row 2026-08-11: same arm still leaves an unlogged OLD-slot mutation when
+  `PageSetHeapTupleCmax` fails after a successful multixact stamp.
 
-**New defect found and filed as M0131-S30.5:** `tryApplyHOTUpdate`'s orphan-cleanup
-arm (`operators_storage.go:3746`) calls `storage.PageRemoveHeapTuple` and emits NO
-WAL — and that function SHRINKS `pd_lower` when the removed slot is last
-(`heap.go:697-699`). Slot is already dirty from the logged prune, so it reaches
-disk and replay rebuilds a larger page. One LP per occurrence, so it is not the
-`185 -> 1` root cause.
-
-Next step (S30.3): fire `PageIdentityObserve` inside `PageRemoveHeapTuple`, and
-assert at `markHeapHotUpdateDirty` that the emitted `new_off` equals both `newSlot`
-and `PageLinePointerCount(page)` — catch an emit-time inconsistency before the
-crash hides it. If clean, walk block 130's records from the START of the stream.
-
-Repro still preserved: `cp -a /tmp/s30_3_repro/data /tmp/try` → goopg refuses to
-start in ~35 s (251 MB; copy somewhere durable if /tmp is at risk).
+Repro for S30.3 still preserved: `cp -a /tmp/s30_3_repro/data /tmp/try` → goopg
+refuses to start in ~35 s (251 MB; copy somewhere durable if /tmp is at risk).
 
 Nightly triage: `ci/logs/action-items.md` still run `20260811-014635`
 (AI-…-001..012), all already filed under M-NIGHTLY; nothing new.
 
-Gates run: units suite PASS; `make ralph-state-guard` OK after self-repair;
-pgbench smoke via the commit hook. Design `docs/design/0131-0021` §Update 2026-08-11.
+Gates run: units suite PASS; storage package tests PASS (new guards verified to fail
+pre-fix); `make ralph-state-guard` OK; pgbench smoke via the commit hook.
 
 In-flight: none.

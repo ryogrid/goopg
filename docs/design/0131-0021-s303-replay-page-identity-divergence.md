@@ -197,3 +197,40 @@ Next probe: extend `PageIdentityObserve` to fire inside `PageRemoveHeapTuple`
 itself and at `markHeapHotUpdateDirty` (asserting `new_off == newSlot` and
 `newSlot == PageLinePointerCount(page)`), so an emit-time inconsistency is caught
 before the crash can hide it.
+
+## Update 2026-08-11 (loop #135) — S30.5 FIXED: the orphan cleanup is now an exact undo
+
+The unlogged mutation found above is closed. The fix is neither of the two
+candidates the defect was filed with (emit a one-slot prune record / stop
+shrinking `pd_lower`); both miss that **the append is unlogged too**.
+
+`tryApplyHOTUpdate`'s orphan arm does `PageAddHeapTuple` → (stamp fails) →
+`PageRemoveHeapTuple`. Neither call emits WAL, so the pair does not need a
+record at all — it needs to be a *no-op on the page*. It was not:
+`PageAddHeapTuple` moves both `pd_lower` (+4) and `pd_upper` (−MAXALIGN(len)),
+while `PageRemoveHeapTuple` restored only `pd_lower`. Every occurrence therefore
+leaked one tuple's worth of free space out of a page that the WAL says still has
+it — a runtime/WAL divergence with no record to explain it, i.e. the S30.3
+signature in miniature.
+
+`PageRemoveHeapTuple` (`internal/storage/heap.go`) now also raises `pd_upper`
+back over the item body when the removed slot is the last line pointer *and* its
+body sits exactly at `pd_upper` — precisely the state left by an append, so the
+call becomes an exact inverse. Interior removals are unchanged (blank the
+pointer in place; sliding the array would renumber later slots, which is
+`VacuumHeapPageBySlots`' job). The vacated bytes fall back inside
+`[pd_lower, pd_upper)` — PG's FPI hole (`xloginsert.c XLogRecordAssemble`) — so
+they are not part of the page image on either side.
+
+Guards: `TestPageRemoveHeapTupleUndoesAppend` (fails on the pre-fix file with
+`pd_upper=8056 want=8096`) and `TestPageRemoveHeapTupleInteriorSlotKeepsUpper`
+in `internal/storage/heap_test.go`.
+
+One divergence of the same family remains open in this arm and is recorded in
+the deferral ledger: when the multi-xact stamp of the OLD slot succeeds and the
+following `PageSetHeapTupleCmax` fails, the old tuple's `xmax` stays mutated
+with no WAL behind it. That path is not undone here.
+
+S30.3 itself is unchanged: candidate 1 above is now partly discharged (this was
+one such mutation, and it is one line pointer per occurrence — not `185 → 1`),
+leaving candidates 2 and 3 as the next probes.

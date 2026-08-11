@@ -3743,6 +3743,14 @@ func tryApplyHOTUpdate(
 		// cleanup the tuple persists as a live HEAP_ONLY_TUPLE
 		// with no CTID link, wasting space and inflating the
 		// line-pointer count. M0118-0131.
+		//
+		// Neither the add nor this removal emits WAL, so the pair MUST
+		// leave the page exactly as the last logged record left it —
+		// otherwise the buffer that reaches disk (it is already dirty
+		// from the logged PagePruneOpt above) disagrees with the page
+		// replay rebuilds. PageAddHeapTuple always appends, so newSlot
+		// is the last line pointer and PageRemoveHeapTuple undoes it
+		// exactly, pd_lower AND pd_upper. M0131-S30.5 / heap.go.
 		if remErr := storage.PageRemoveHeapTuple(s.Page(), newSlot); remErr != nil {
 			// Non-fatal: page is still structurally valid; the
 			// orphan wastes space until the next VACUUM repacks
