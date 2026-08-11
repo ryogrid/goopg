@@ -187,8 +187,8 @@ one opcode, and the table is the test's specification:
 | `COPY t FROM …` | Heap2 (9) | `XLOG_HEAP2_MULTI_INSERT` | 0x50 |
 | `VACUUM t` | Heap2 (9) | `XLOG_HEAP2_VISIBLE` | 0x40 |
 | `SELECT … FOR UPDATE` | Heap (10) | `XLOG_HEAP_LOCK` | 0x60 |
-| `TRUNCATE t2` | Heap (10) | `XLOG_HEAP_TRUNCATE` | 0x30 |
-| …same statement | Storage (2) | `XLOG_SMGR_TRUNCATE` | 0x20 |
+| `BEGIN; CREATE TABLE t2; …; TRUNCATE t2; COMMIT` | Storage (2) | `XLOG_SMGR_TRUNCATE` | 0x20 |
+| ~~`TRUNCATE t2`~~ | ~~Heap (10)~~ | ~~`XLOG_HEAP_TRUNCATE`~~ | ~~0x30~~ — **struck, see correction below** |
 | `SAVEPOINT s1; …` | Transaction (1) | `XLOG_XACT_ASSIGNMENT` | 0x50 |
 | …its `COMMIT` | Transaction (1) | `XLOG_XACT_COMMIT` + `subxacts[]` | 0x00 |
 | index-heavy INSERT | Btree (11) | `INSERT_LEAF` / `_UPPER` / `_META` / `_POST` / `SPLIT_L`/`_R` / `DEDUP` | 0x00/0x10/0x20/0x50/0x30/0x40/0x60 |
@@ -201,6 +201,46 @@ Values from `postgres/src/include/access/heapam_xlog.h:36`, `:39`, `:63-64`;
 upstream macro is `CLOG_ZEROPAGE`*) is deliberately **out** of the workload: it
 needs 32768 XIDs to fire, which is a load test, not an E2E. Cover it with an
 S21a unit test over a captured record instead.
+
+**Opcode-table correction (2026-08-12, found by running it).** Guard 7 — dump the
+crash tail with `pg_waldump` and require every table row to be present — earned
+its keep on the first run by failing on two rows the table got wrong:
+
+- **`TRUNCATE t2` emits neither truncate record** when `t2` pre-exists.
+  `ExecuteTruncateGuts` (`postgres/src/backend/commands/tablecmds.c:2200`) only
+  truncates in place — `heap_truncate_one_rel` → `RelationTruncate` →
+  `XLOG_SMGR_TRUNCATE` — when `rel->rd_createSubid == mySubid`. Otherwise it takes
+  the transaction-safe path, `RelationSetNewRelfilenumber`, which emits a
+  Storage/CREATE for the new relfilenode and no truncate record at all. The
+  workload therefore wraps `CREATE TABLE` + `INSERT` + `TRUNCATE` in one
+  transaction.
+- **`XLOG_HEAP_TRUNCATE` is unreachable at `wal_level = replica`** and is dropped
+  from the required set. It is emitted only under `relids_logged != NIL`, guarded
+  by `Assert(XLogLogicalInfoActive())` (`tablecmds.c:2303`), and upstream's own
+  `heap_redo` treats it as a no-op: *"TRUNCATE is a no-op because the actions are
+  already logged as SMGR WAL records. TRUNCATE WAL record only exists for logical
+  decoding"* (`postgres/src/backend/access/heap/heapam_xlog.c:1201-1207`).
+  Requiring it would force this crash-recovery test onto an unrepresentative
+  `wal_level = logical` cluster to cover a record that changes nothing on replay.
+  goopg's `RmgrHeap` arm has no case for it and refuses — a real gap, but one
+  that belongs to S21 and a ledger row, not to this test's guard.
+
+**S28 — LANDED (2026-08-12), self-arming against S21.** `internal/testport/
+e2e_goopg_crashstart_on_pgdata_test.go` runs the PG-side workload, captures
+twelve answers, `KillHard()`s, asserts `postmaster.pid` survives and
+`pg_control.State != DB_SHUTDOWNED`, and clears guard 7 — all green today.
+goopg then refuses the tail at `wal: unsupported xlog record rmid=0 info=0x30`,
+i.e. **`XLOG_NEXTOID`**, which every PG cluster emits routinely: S21 is
+unchecked, and the design said from the start that S28 needs S21a at minimum.
+
+Rather than land a red test that re-states a known-open task on every nightly,
+the goopg half is a **self-arming skip**: `unsupportedXLogOpcode` recognises
+*that specific refusal* in the server log and skips with the opcode in the
+message. Any other startup failure — checksum, decode error, panic — stays
+fatal, and the moment S21/S22/S23 close the gap the start succeeds and the
+assertions run with nobody having to remember to un-skip anything. The
+`_Concurrent` variant ships alongside as the S24 re-arm trigger, `t.Skip`ped
+with the rmid-6 reason in its message (guard 9).
 
 Two assertions beyond row equality: the SAVEPOINT rows must be **visible**
 (S22's `subxacts[]` gap makes committed subtransactions invisible, and
