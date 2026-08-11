@@ -397,6 +397,66 @@ and stamp every returned XID with `xactStampAndAdvance`. Abort records carry the
 same chunk (`xl_xact_abort`, `xact.h:336-347`) and want the same treatment with
 `isCommit=false`.
 
+### S21a-2 — implementation notes, part 1: MULTI_INSERT + the replay gap (landed 2026-08-12)
+
+S21a-2 is the page-**mutating** half. It lands opcode by opcode, each landing
+shrinking S28's self-arming skip. This section covers the first two, which share
+one new helper.
+
+**`XLOG_HEAP2_MULTI_INSERT` (0x50) — `replayDecodedXLogHeapMultiInsert`.** Every
+COPY: `heap_multi_insert` packs one page's worth of tuples into a single record,
+so a crash tail taken during a bulk load is made almost entirely of these. Redo
+mirrors `heap_xlog_multi_insert` (`heapam_xlog.c:600-731`):
+
+- Main data is `xl_heap_multi_insert{uint8 flags; uint16 ntuples;
+  OffsetNumber offsets[]}` — C alignment puts `ntuples` at byte 2 and the array
+  at byte 4 (`SizeOfHeapMultiInsert = 4`, `heapam_xlog.h:188`).
+- **The offsets array is present only when `XLOG_HEAP_INIT_PAGE` is CLEAR.** With
+  the bit set the page is reinitialised and tuple *i* lands at
+  `FirstOffsetNumber + i`, so upstream saves the array's bytes. Reading the
+  init-page layout for a non-init record (or vice versa) is silent corruption,
+  not a decode error — hence a dedicated guard for each.
+- Block 0's data run is the SHORTALIGNed sequence of
+  `xl_multi_insert_tuple{datalen, t_infomask2, t_infomask, t_hoff}` + `datalen`
+  tuple bytes. Upstream PANICs with "total tuple length mismatch" if the walk
+  does not consume the run exactly; goopg refuses the record, because a short
+  walk means an unconsumed tuple that would be dropped while replay reports
+  success.
+- The per-tuple rebuild is byte-identical to the single-tuple `xl_heap_insert`
+  path (xmin from `xl_xid`, invalid xmax, self-pointing `t_ctid`), so the two now
+  share `buildTupleFromXLogHeapHeader` — `xl_multi_insert_tuple[2:7]` is the same
+  `{t_infomask2, t_infomask, t_hoff}` triple as `xl_heap_header`.
+- `XLH_INSERT_ALL_VISIBLE_CLEARED` / `ALL_FROZEN_SET` are mirrored onto the page
+  header's `PD_ALL_VISIBLE` bit, as upstream does inline. The *fork* half of the
+  visibility map is `XLOG_HEAP2_VISIBLE`'s job (still open).
+
+**The replay gap — `redoHeapPageForBlock`.** A record referencing a block past
+the fork's flushed length is not an error: the primary extended the relation in
+shared buffers and logged the insert, but the extension itself is not WAL-logged
+and the dirty page never reached disk. Upstream zero-extends up to the block
+(`XLogReadBufferExtended` → `ExtendBufferedRelTo` with `EB_PERFORMING_RECOVERY`,
+`xlogutils.c:479-539`); goopg's heap-insert arm answered
+`"xlog heap-insert replay gap block=N nblocks=M"` and refused the whole start.
+The new helper does the acquire-or-extend-or-skip decision for both heap redo
+paths — `pd_lsn` idempotency for a page that exists, `PageInit` when
+`XLOG_HEAP_INIT_PAGE`/`BKPBLOCK_WILL_INIT`/all-zero, zero-fill of the
+intervening blocks otherwise. Fixing it inside the shared helper is what makes
+the two paths siblings rather than two copies that drift.
+
+**One deviation, recorded in the ledger.** Upstream's
+`PageAddItem(overwrite=true)` can refill an already-allocated (dead) line
+pointer in place; goopg's `PageInsertItemRawAt` would *shift* the line-pointer
+array and displace the tuple already at that slot. Redo refuses that case with
+`ErrUnsupportedRecord` rather than corrupting the page silently — reachable only
+when PG reused a dead line pointer on the target page, which a plain COPY into a
+freshly extended or append-only page never does.
+
+Guards (`internal/wal/heap_multi_insert_pg_test.go`, 6 tests / 9 subtests, all
+proven fail-when-broken by scripted reverts): init-page apply, explicit-offsets
+apply, idempotent re-apply, zero-extend across a 2-block gap **on both heap
+paths**, the two malformed-block-data refusals, and the line-pointer-reuse
+refusal.
+
 ## Guards
 
 1. Per-opcode unit tests over fixtures captured from a real PG 18.3 via

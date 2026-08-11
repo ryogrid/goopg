@@ -2695,6 +2695,17 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 				return false, err
 			}
 			return true, nil
+		case xlogHeap2MultiInsert:
+			// M0131-S21a-2: every COPY. heap_multi_insert packs one page's worth
+			// of tuples into a single record, so a PG crash tail taken during a
+			// bulk load is made almost entirely of these. Note this case is
+			// reachable only because the switch masks with xlogHeapOpMask (0x70)
+			// — a COPY onto a freshly extended page arrives as 0xD0, MULTI_INSERT
+			// OR'd with XLOG_HEAP_INIT_PAGE.
+			if err := replayDecodedXLogHeapMultiInsert(mgr, r, xlog); err != nil {
+				return false, err
+			}
+			return true, nil
 		case xlogHeap2NewCid:
 			// M0131-S21a: XLOG_HEAP2_NEW_CID exists solely so logical decoding
 			// can map a catalog tuple to the command id that produced it;
@@ -2936,37 +2947,12 @@ func replayDecodedXLogHeapInsert(mgr *storage.Manager, r Record, xlog *XLogDecod
 	if err != nil {
 		return err
 	}
-	nblocks, err := mgr.NBlocks(block.Rel)
+	page, skip, err := redoHeapPageForBlock(mgr, block, storage.LSN(r.EndLSN), xlog.Header.Info&xlogHeapInit != 0)
 	if err != nil {
-		return err
+		return fmt.Errorf("wal: xlog heap-insert: %w", err)
 	}
-	page := make(storage.Page, storage.BlockSize)
-	switch {
-	case block.Block < nblocks:
-		if err := mgr.ReadBlock(block.Rel, block.Block, page); err != nil {
-			return err
-		}
-		if !storage.IsNew(page) && storage.MustHeader(page).LSN() >= storage.LSN(r.EndLSN) {
-			return nil
-		}
-		if block.WillInit || xlog.Header.Info&xlogHeapInit != 0 || storage.IsNew(page) {
-			if err := storage.InitPage(page); err != nil {
-				return err
-			}
-		}
-	case block.Block == nblocks:
-		if err := storage.InitPage(page); err != nil {
-			return err
-		}
-		got, err := mgr.Extend(block.Rel, page)
-		if err != nil {
-			return err
-		}
-		if got != block.Block {
-			return fmt.Errorf("wal: xlog heap-insert extend returned block %d, want %d", got, block.Block)
-		}
-	default:
-		return fmt.Errorf("wal: xlog heap-insert replay gap block=%d nblocks=%d", block.Block, nblocks)
+	if skip {
+		return nil
 	}
 	got, err := storage.PageInsertItemRawAt(page, offnum, tupleRaw)
 	if err != nil {
@@ -2977,6 +2963,238 @@ func replayDecodedXLogHeapInsert(mgr *storage.Manager, r Record, xlog *XLogDecod
 	}
 	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
 	return mgr.WriteBlock(block.Rel, block.Block, page)
+}
+
+// redoHeapPageForBlock acquires the heap page a PG-format redo routine is about
+// to mutate, mirroring upstream XLogReadBufferExtended (xlogutils.c:479-539).
+//
+// M0131-S21a-2. Two behaviours upstream has that goopg's per-opcode replay
+// functions were each open-coding (or getting wrong):
+//
+//   - **The replay gap is not an error.** A crash tail routinely references a
+//     block past the fork's flushed length: the primary extended the relation
+//     in shared buffers and logged the insert, but the extension itself is not
+//     WAL-logged and the dirty page never reached disk. Upstream's answer is to
+//     zero-extend the fork up to the referenced block ("hm, page doesn't exist
+//     in file" → ExtendBufferedRelTo with EB_PERFORMING_RECOVERY) and carry on.
+//     goopg's heap-insert arm instead returned "replay gap block=N nblocks=M",
+//     which refuses the whole start.
+//   - **pd_lsn is the idempotency guard**, checked only for a page that already
+//     exists; a freshly extended page has no LSN to compare against.
+//
+// forceInit is the caller's XLOG_HEAP_INIT_PAGE bit: upstream reinitialises the
+// page unconditionally in that case (XLogInitBufferForRedo + PageInit) rather
+// than reading it, because the record's tuple offsets are relative to an empty
+// page. block.WillInit (BKPBLOCK_WILL_INIT) and an all-zero page get the same
+// treatment.
+//
+// Returns skip=true when the page is already at or past this record's LSN, in
+// which case the returned page must not be written.
+func redoHeapPageForBlock(mgr *storage.Manager, block XLogBlockRef, endLSN storage.LSN, forceInit bool) (storage.Page, bool, error) {
+	nblocks, err := mgr.NBlocks(block.Rel)
+	if err != nil {
+		return nil, false, err
+	}
+	page := make(storage.Page, storage.BlockSize)
+	if block.Block < nblocks {
+		if err := mgr.ReadBlock(block.Rel, block.Block, page); err != nil {
+			return nil, false, err
+		}
+		if !storage.IsNew(page) && storage.MustHeader(page).LSN() >= endLSN {
+			return nil, true, nil
+		}
+		if forceInit || block.WillInit || storage.IsNew(page) {
+			if err := storage.InitPage(page); err != nil {
+				return nil, false, err
+			}
+		}
+		return page, false, nil
+	}
+	// Zero-extend the fork up to (but not including) the target block, exactly
+	// as upstream does — the intervening pages are genuinely empty on the
+	// primary too, and any record that fills them arrives later in the stream.
+	zero := make(storage.Page, storage.BlockSize)
+	for blk := nblocks; blk < block.Block; blk++ {
+		got, err := mgr.Extend(block.Rel, zero)
+		if err != nil {
+			return nil, false, err
+		}
+		if got != blk {
+			return nil, false, fmt.Errorf("zero-extend returned block %d, want %d", got, blk)
+		}
+	}
+	if err := storage.InitPage(page); err != nil {
+		return nil, false, err
+	}
+	got, err := mgr.Extend(block.Rel, page)
+	if err != nil {
+		return nil, false, err
+	}
+	if got != block.Block {
+		return nil, false, fmt.Errorf("extend returned block %d, want %d", got, block.Block)
+	}
+	return page, false, nil
+}
+
+// replayDecodedXLogHeapMultiInsert applies a real-PG XLOG_HEAP2_MULTI_INSERT,
+// mirroring heap_xlog_multi_insert (heapam_xlog.c:600-731). This is every COPY:
+// heap_multi_insert batches as many tuples as fit on one page into a single
+// record, so a PG crash tail taken during a bulk load is almost entirely made
+// of these.
+//
+// M0131-S21a-2. Wire format: main data is xl_heap_multi_insert
+// {uint8 flags; uint16 ntuples; OffsetNumber offsets[ntuples]} — and the
+// offsets array is present ONLY when XLOG_HEAP_INIT_PAGE is clear. With the bit
+// set the page is reinitialised and the tuples land at FirstOffsetNumber+i, so
+// upstream saves the array's bytes (heapam.c:2607-2611 sets the bit exactly
+// when the page was freshly extended, which is why the RM_HEAP2 arm must mask
+// with XLOG_HEAP_OPMASK — see the mask note there).
+//
+// Block 0's data run is a sequence of SHORTALIGNed xl_multi_insert_tuple
+// headers, each immediately followed by its `datalen` tuple bytes (everything
+// past the fixed 23-byte heap-tuple header: null bitmap, alignment padding and
+// column data, verbatim).
+func replayDecodedXLogHeapMultiInsert(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
+	block, ok := xlogBlockRefByID(xlog, 0)
+	if !ok {
+		return fmt.Errorf("wal: xlog heap-multi-insert missing block 0")
+	}
+	if block.Rel.Fork != storage.MainFork {
+		return fmt.Errorf("wal: xlog heap-multi-insert fork=%d, want main fork", block.Rel.Fork)
+	}
+	if block.HasImage && block.ImageApply {
+		return restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN))
+	}
+	isInit := xlog.Header.Info&xlogHeapInit != 0
+	flags, offsets, err := decodeXLogHeapMultiInsertMainData(xlog.MainData, isInit)
+	if err != nil {
+		return err
+	}
+	tuples, err := decodeXLogMultiInsertTuples(block.Data, len(offsets))
+	if err != nil {
+		return err
+	}
+	page, skip, err := redoHeapPageForBlock(mgr, block, storage.LSN(r.EndLSN), isInit)
+	if err != nil {
+		return fmt.Errorf("wal: xlog heap-multi-insert: %w", err)
+	}
+	if skip {
+		return nil
+	}
+	for i, offnum := range offsets {
+		// Upstream PANICs on "invalid max offset number" when the target slot
+		// is more than one past the page's end; goopg's PageInsertItemRawAt
+		// enforces the same [1, count+1] range. What goopg cannot do is
+		// upstream's PageAddItem(overwrite=true) reuse of an ALREADY-ALLOCATED
+		// line pointer — PageInsertItemRawAt would shift the array and displace
+		// the existing item — so that case is refused rather than silently
+		// corrupting the page (deferral ledger, S21a-2).
+		count, err := storage.PageLinePointerCount(page)
+		if err != nil {
+			return fmt.Errorf("wal: xlog heap-multi-insert page: %w", err)
+		}
+		if int(offnum) <= count {
+			return fmt.Errorf("%w: xlog heap-multi-insert entry %d targets already-allocated line pointer %d (page has %d) — goopg redo has no in-place line-pointer reuse",
+				ErrUnsupportedRecord, i, offnum, count)
+		}
+		tupleRaw := buildTupleFromXLogHeapHeader(tuples[i].header, tuples[i].data,
+			storage.TransactionID(xlog.Header.XID), block.Block, offnum)
+		got, err := storage.PageInsertItemRawAt(page, offnum, tupleRaw)
+		if err != nil {
+			return fmt.Errorf("wal: xlog heap-multi-insert apply entry %d: %w", i, err)
+		}
+		if got != offnum {
+			return fmt.Errorf("wal: xlog heap-multi-insert slot drift: got %d, want %d (entry %d, block %d)", got, offnum, i, block.Block)
+		}
+	}
+	// The visibility-map bits upstream mirrors onto the heap page itself. The
+	// VM fork update is XLOG_HEAP2_VISIBLE's job (still S21a-2); these two are
+	// the page-header half heap_xlog_multi_insert does inline.
+	hdr := storage.MustHeader(page)
+	if flags&xlogHeapInsertAllVisibleCleared != 0 {
+		hdr.SetFlags(hdr.Flags() &^ storage.PDAllVisible)
+	} else if flags&xlogHeapInsertAllFrozenSet != 0 {
+		hdr.SetFlags(hdr.Flags() | storage.PDAllVisible)
+	}
+	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
+	return mgr.WriteBlock(block.Rel, block.Block, page)
+}
+
+// decodeXLogHeapMultiInsertMainData parses xl_heap_multi_insert. When isInit is
+// set the offsets array is absent and the tuples land at FirstOffsetNumber+i;
+// the returned slice is synthesised for that case so the caller has one shape.
+func decodeXLogHeapMultiInsertMainData(mainData []byte, isInit bool) (flags uint8, offsets []uint16, err error) {
+	if len(mainData) < sizeOfXLogHeapMultiInsertData {
+		return 0, nil, fmt.Errorf("wal: invalid xlog heap-multi-insert main-data len %d (want >= %d)",
+			len(mainData), sizeOfXLogHeapMultiInsertData)
+	}
+	flags = mainData[0]
+	ntuples := int(binary.LittleEndian.Uint16(mainData[2:4]))
+	if ntuples == 0 {
+		return 0, nil, fmt.Errorf("wal: xlog heap-multi-insert carries zero tuples")
+	}
+	offsets = make([]uint16, ntuples)
+	if isInit {
+		// FirstOffsetNumber is 1 in PG and goopg alike (line pointers are
+		// 1-based); heap_xlog_multi_insert lands tuple i at
+		// FirstOffsetNumber + i on a reinitialised page.
+		for i := range offsets {
+			offsets[i] = 1 + uint16(i)
+		}
+		return flags, offsets, nil
+	}
+	want := sizeOfXLogHeapMultiInsertData + 2*ntuples
+	if len(mainData) < want {
+		return 0, nil, fmt.Errorf("wal: xlog heap-multi-insert main-data len %d < %d for %d offsets",
+			len(mainData), want, ntuples)
+	}
+	for i := range offsets {
+		offsets[i] = binary.LittleEndian.Uint16(mainData[sizeOfXLogHeapMultiInsertData+2*i:])
+	}
+	return flags, offsets, nil
+}
+
+// xlogMultiInsertTuple is one (xl_multi_insert_tuple header, tuple data) pair
+// carved out of a multi-insert record's block-0 data run. header is the 5-byte
+// xl_heap_header-shaped slice {t_infomask2, t_infomask, t_hoff} the shared
+// tuple builder consumes.
+type xlogMultiInsertTuple struct {
+	header []byte
+	data   []byte
+}
+
+// decodeXLogMultiInsertTuples splits block 0's data run into ntuples entries.
+// Upstream walks it with `xlhdr = (xl_multi_insert_tuple *) SHORTALIGN(tupdata)`
+// and PANICs at the end if the walk did not consume the run exactly
+// ("total tuple length mismatch") — the same exactness is enforced here, since a
+// short walk means the record was mis-parsed and the extra bytes are a tuple
+// that would be silently dropped.
+func decodeXLogMultiInsertTuples(data []byte, ntuples int) ([]xlogMultiInsertTuple, error) {
+	out := make([]xlogMultiInsertTuple, 0, ntuples)
+	off := 0
+	for i := 0; i < ntuples; i++ {
+		off += off & 1 // SHORTALIGN
+		if off+sizeOfXLogMultiInsertTuple > len(data) {
+			return nil, fmt.Errorf("wal: xlog heap-multi-insert block data truncated at tuple %d (off %d of %d)", i, off, len(data))
+		}
+		hdr := data[off : off+sizeOfXLogMultiInsertTuple]
+		datalen := int(binary.LittleEndian.Uint16(hdr[0:2]))
+		off += sizeOfXLogMultiInsertTuple
+		if off+datalen > len(data) {
+			return nil, fmt.Errorf("wal: xlog heap-multi-insert tuple %d datalen %d overruns block data (off %d of %d)", i, datalen, off, len(data))
+		}
+		out = append(out, xlogMultiInsertTuple{
+			// hdr[2:7] is {t_infomask2, t_infomask, t_hoff} — the same three
+			// fields, in the same order, as xl_heap_header.
+			header: hdr[2:sizeOfXLogMultiInsertTuple],
+			data:   data[off : off+datalen],
+		})
+		off += datalen
+	}
+	if off != len(data) {
+		return nil, fmt.Errorf("wal: xlog heap-multi-insert total tuple length mismatch: consumed %d of %d block-data bytes", off, len(data))
+	}
+	return out, nil
 }
 
 func xlogBlockRefByID(xlog *XLogDecodedRecord, id byte) (XLogBlockRef, bool) {
@@ -3034,17 +3252,30 @@ func decodeXLogHeapInsertTuple(block XLogBlockRef, xid storage.TransactionID, of
 	// verbatim. Verbatim concatenation preserves the null bitmap; the previous
 	// prefix-stripping reconstruction only handled bitmap-less tuples (and
 	// rejected a non-zero bitmap outright).
-	dataPortion := block.Data[sizeOfXLogHeapHeaderData:]
-	out := make([]byte, storage.SizeOfHeapTupleHeaderData+len(dataPortion))
+	return buildTupleFromXLogHeapHeader(block.Data[:sizeOfXLogHeapHeaderData],
+		block.Data[sizeOfXLogHeapHeaderData:], xid, block.Block, offnum), nil
+}
+
+// buildTupleFromXLogHeapHeader rebuilds a marshaled heap tuple from the
+// (t_infomask2, t_infomask, t_hoff) triple a WAL record carries plus the tuple
+// bytes past the fixed 23-byte header. Shared by the xl_heap_insert and
+// xl_heap_multi_insert redo paths (M0131-S21a-2), whose per-tuple headers
+// differ only in the multi-insert's leading `datalen` field — upstream's
+// heap_xlog_insert and heap_xlog_multi_insert rebuild the tuple identically
+// from that point on.
+//
+// header must be exactly the 5 bytes {t_infomask2[2], t_infomask[2], t_hoff[1]}.
+func buildTupleFromXLogHeapHeader(header, data []byte, xid storage.TransactionID, blk storage.BlockNumber, offnum uint16) []byte {
+	out := make([]byte, storage.SizeOfHeapTupleHeaderData+len(data))
 	binary.LittleEndian.PutUint32(out[0:4], uint32(xid))                           // t_xmin
 	binary.LittleEndian.PutUint32(out[4:8], uint32(storage.InvalidTransactionID))  // t_xmax
-	binary.LittleEndian.PutUint32(out[8:12], uint32(storage.InvalidTransactionID)) // t_field3 (xvac)
-	binary.LittleEndian.PutUint32(out[12:16], uint32(block.Block))                 // t_ctid.block (self)
+	binary.LittleEndian.PutUint32(out[8:12], uint32(storage.InvalidTransactionID)) // t_field3 (xvac / cmin)
+	binary.LittleEndian.PutUint32(out[12:16], uint32(blk))                         // t_ctid.block (self)
 	binary.LittleEndian.PutUint16(out[16:18], offnum)                              // t_ctid.offset (self)
-	copy(out[18:22], block.Data[0:4])                                              // t_infomask2 + t_infomask
-	out[22] = block.Data[4]                                                        // t_hoff
-	copy(out[storage.SizeOfHeapTupleHeaderData:], dataPortion)
-	return out, nil
+	copy(out[18:22], header[0:4])                                                  // t_infomask2 + t_infomask
+	out[22] = header[4]                                                            // t_hoff
+	copy(out[storage.SizeOfHeapTupleHeaderData:], data)
+	return out
 }
 
 // decodeXLogHeapDeleteMainData parses the fixed xl_heap_delete struct from a

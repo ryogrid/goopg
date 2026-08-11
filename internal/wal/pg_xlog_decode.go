@@ -70,7 +70,18 @@ const (
 	// M0131-S21a: the RM_HEAP2_ID opcodes goopg never emits
 	// (heapam_xlog.h:59-66). NEW_CID is logical-decoding-only and a physical
 	// no-op; the rest are real page mutations still awaiting redo (S21a-2).
-	xlogHeap2NewCid uint8 = 0x70 // XLOG_HEAP2_NEW_CID
+	xlogHeap2NewCid      uint8 = 0x70 // XLOG_HEAP2_NEW_CID
+	xlogHeap2MultiInsert uint8 = 0x50 // XLOG_HEAP2_MULTI_INSERT
+
+	// XLH_INSERT_* flag bits carried in xl_heap_insert/xl_heap_multi_insert's
+	// `flags` byte (heapam_xlog.h:72-79). Redo consults only the two
+	// visibility-map bits: ALL_VISIBLE_CLEARED clears PD_ALL_VISIBLE on the
+	// heap page, ALL_FROZEN_SET sets it (heapam_xlog.c, heap_xlog_multi_insert).
+	// The remaining bits (LAST_IN_MULTI, IS_SPECULATIVE, CONTAINS_NEW_TUPLE,
+	// ON_TOAST_RELATION) exist for logical decoding and speculative-insert
+	// bookkeeping and have no physical effect.
+	xlogHeapInsertAllVisibleCleared uint8 = 1 << 0
+	xlogHeapInsertAllFrozenSet      uint8 = 1 << 5
 
 	// XLOG_HEAP_LOCK (heapam_xlog.h:39), shares RM_HEAP_ID's opmask
 	// with xlogHeap{Insert,Delete,Update,HotUpdate,Inplace}. Used by
@@ -153,6 +164,16 @@ const (
 	sizeOfRelFileLocator              = 12
 	sizeOfXLogHeapInsertData          = 3
 	sizeOfXLogHeapHeaderData          = 5
+	// sizeOfXLogHeapMultiInsertData is SizeOfHeapMultiInsert —
+	// offsetof(xl_heap_multi_insert, offsets) (heapam_xlog.h:188). The struct is
+	// {uint8 flags; uint16 ntuples; OffsetNumber offsets[]}, so C's alignment
+	// puts ntuples at byte 2 and the offsets array at byte 4.
+	sizeOfXLogHeapMultiInsertData = 4
+	// sizeOfXLogMultiInsertTuple is SizeOfMultiInsertTuple —
+	// offsetof(xl_multi_insert_tuple, t_hoff) + sizeof(uint8)
+	// (heapam_xlog.h:199): {uint16 datalen; uint16 t_infomask2;
+	// uint16 t_infomask; uint8 t_hoff} = 7 bytes, tuple data following.
+	sizeOfXLogMultiInsertTuple = 7
 
 	pgDefaultTableSpaceOID uint32 = 1663
 	// pgGlobalTableSpaceOID is GLOBALTABLESPACE_OID: the tablespace of the
