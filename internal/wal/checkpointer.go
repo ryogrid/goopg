@@ -96,11 +96,12 @@ type CheckpointerConfig struct {
 	// Interval is the period between automatic checkpoints
 	// (mirrors upstream's checkpoint_timeout).
 	Interval time.Duration
-	// MaxWALBytes, when > 0, fires a checkpoint as soon as the
-	// WAL bytes written since the last checkpoint exceed this
-	// threshold (mirrors upstream's max_wal_size). Requires the
-	// underlying writer to satisfy volumeReporter; otherwise the
-	// trigger is a no-op.
+	// MaxWALBytes, when > 0, is upstream's max_wal_size expressed in
+	// bytes. It is NOT the trigger distance: like PG, the distance is
+	// derived from it by CalculateCheckpointSegments — see
+	// checkpointSegments/volumeTriggerFires. Requires the underlying
+	// writer to satisfy volumeReporter; otherwise the trigger is a
+	// no-op.
 	MaxWALBytes uint64
 	// VolumeCheckInterval is how often the loop polls
 	// WrittenLSN to evaluate the volume trigger between timer
@@ -297,6 +298,16 @@ type Checkpointer struct {
 	lastCheckpointRedoLSN  atomic.Uint64
 	lastCheckpointStartLSN atomic.Uint64
 
+	// volumeAnchor is the fallback RedoRecPtr for the max_wal_size
+	// trigger before this process has completed its first checkpoint:
+	// the writer position observed when Run started. Upstream always has
+	// a RedoRecPtr — recovery seeds it from the checkpoint it started
+	// from — so the elapsed-segment count is measured from "where this
+	// server began writing" rather than from LSN 0. Anchoring at 0 would
+	// make every restart of a cluster whose WAL has already passed
+	// max_wal_size fire a checkpoint on the first poll (M0131-S30.4).
+	volumeAnchor atomic.Uint64
+
 	// distMu guards priorRedoLSN/checkPointDistanceEstimate. Checkpoints
 	// are infrequent (seconds-to-minutes apart) so a plain mutex — rather
 	// than lock-free float CAS — is fine here.
@@ -486,6 +497,9 @@ func (c *Checkpointer) Run(ctx context.Context) error {
 	var volumeC <-chan time.Time
 	vr, _ := c.wal.(volumeReporter)
 	if c.cfg.MaxWALBytes > 0 && vr != nil {
+		// Seed the pre-first-checkpoint RedoRecPtr stand-in — see
+		// volumeAnchor's doc comment.
+		c.volumeAnchor.Store(vr.WrittenLSN())
 		vt := time.NewTicker(c.cfg.VolumeCheckInterval)
 		defer vt.Stop()
 		volumeC = vt.C
@@ -513,21 +527,97 @@ func (c *Checkpointer) Run(ctx context.Context) error {
 	}
 }
 
-// volumeTriggerFires reports whether the WAL has accumulated more
-// than MaxWALBytes since the last successful checkpoint. The
-// "since the last checkpoint" anchor uses the current writer
-// position when no checkpoint has run yet, which matches
-// upstream's CheckpointSegments / CheckPointsReqd accounting:
-// the very first window starts from server start.
-func (c *Checkpointer) volumeTriggerFires(vr volumeReporter) bool {
-	written := vr.WrittenLSN()
-	last := c.lastCheckpointLSN.Load()
-	if last == 0 {
-		// No checkpoint yet — anchor on server start (LSN 0)
-		// so MaxWALBytes still gates the very first window.
-		return written >= c.cfg.MaxWALBytes
+// segmentSize reports the WAL segment size this checkpointer reasons in,
+// falling back to the 16 MiB default when the config leaves it unset.
+func (c *Checkpointer) segmentSize() uint64 {
+	if c.cfg.SegmentSize > 0 {
+		return uint64(c.cfg.SegmentSize)
 	}
-	return written > last && (written-last) >= c.cfg.MaxWALBytes
+	return uint64(DefaultSegmentSize)
+}
+
+// checkpointSegments mirrors upstream's CalculateCheckpointSegments
+// (xlog.c:2170-2198): max_wal_size is the ceiling on WAL kept for one
+// checkpoint cycle, and a spread checkpoint itself consumes
+// checkpoint_completion_target more segments while it runs, so the trigger
+// distance is max_wal_size / (1 + checkpoint_completion_target) — NOT
+// max_wal_size itself. Rounded down, floored at 1, exactly like upstream.
+//
+// M0131-S30.4: goopg used the raw byte value, so at the shared PG defaults
+// (max_wal_size = 1 GiB, checkpoint_completion_target = 0.9, 16 MiB
+// segments) it checkpointed every 1024 MiB where PG checkpoints every
+// 32 segments = 512 MiB — half as often as the oracle under identical
+// settings.
+func (c *Checkpointer) checkpointSegments() uint64 {
+	segs := uint64(float64(c.cfg.MaxWALBytes/c.segmentSize()) / (1.0 + c.completionTargetForSegments()))
+	if segs < 1 {
+		segs = 1
+	}
+	return segs
+}
+
+// completionTargetForSegments clamps CompletionTarget into [0,1] for the
+// segment math. SetCompletionTarget already clamps, but the field is also
+// settable directly through a CheckpointerConfig literal.
+func (c *Checkpointer) completionTargetForSegments() float64 {
+	t := c.cfg.CompletionTarget
+	if t < 0 {
+		return 0
+	}
+	if t > 1 {
+		return 1
+	}
+	return t
+}
+
+// volumeTriggerFires reports whether enough WAL segments have elapsed since
+// the last checkpoint's REDO point to warrant a new checkpoint, mirroring
+// upstream's XLogCheckpointNeeded (xlog.c:2279-2289):
+//
+//	new_segno >= old_segno + (CheckPointSegments - 1)
+//
+// with old_segno taken from RedoRecPtr. Two deviations were fixed in
+// M0131-S30.4: the distance is now CheckPointSegments (see
+// checkpointSegments), and the anchor is the checkpoint's redo point rather
+// than the checkpoint RECORD's end LSN. The record trails redo by the whole
+// flush phase plus the running-xacts record, so anchoring on it silently
+// shortened every window after the first by that gap.
+func (c *Checkpointer) volumeTriggerFires(vr volumeReporter) bool {
+	if c.cfg.MaxWALBytes == 0 {
+		return false
+	}
+	written := vr.WrittenLSN()
+	segSize := c.segmentSize()
+	// lastCheckpointRedoLSN is stored 1-based (internal convention);
+	// convert back to the 0-based byte position segment numbers use.
+	anchor := c.volumeAnchor.Load()
+	if redo := c.lastCheckpointRedoLSN.Load(); redo > 0 {
+		anchor = redo - 1
+	}
+	newSegNo := written / segSize
+	oldSegNo := anchor / segSize
+	if newSegNo < oldSegNo {
+		return false
+	}
+	return newSegNo-oldSegNo >= c.elapsedSegmentsNeeded()
+}
+
+// elapsedSegmentsNeeded is XLogCheckpointNeeded's `CheckPointSegments - 1`
+// with a floor of one elapsed segment. The floor exists because of WHERE
+// the two engines evaluate the test: upstream calls XLogCheckpointNeeded
+// from XLogWrite only when it has just opened a NEW segment
+// (xlog.c:2415-2440), so at CheckPointSegments == 1 — any max_wal_size
+// below two segments' worth — it still checkpoints once per segment.
+// goopg instead polls on VolumeCheckInterval, where a bare
+// `elapsed >= 0` is satisfied on every tick: measured on a 48 MB
+// max_wal_size cluster, that produced 42 checkpoints in 40 s of pgbench,
+// most of them against WAL that had not advanced a single segment
+// (M0131-S30.4).
+func (c *Checkpointer) elapsedSegmentsNeeded() uint64 {
+	if segs := c.checkpointSegments(); segs > 1 {
+		return segs - 1
+	}
+	return 1
 }
 
 // CheckpointNow performs a synchronous, IMMEDIATE-speed

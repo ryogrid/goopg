@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -228,10 +229,12 @@ func TestCheckpointerDoDWritePacing(t *testing.T) {
 }
 
 // TestCheckpointerVolumeTrigger pins the max_wal_size path.
-// We arm a small MaxWALBytes threshold, append enough records
-// through the writer to cross it, and expect a checkpoint
-// before Interval elapses. Interval is set to an hour so any
-// success here came from the volume trigger, not the timer.
+// We arm a small max_wal_size (2 segments, completion target 0 ->
+// CheckPointSegments = 2, so the trigger fires one segment past the
+// anchor), append enough records through the writer to cross a segment
+// boundary, and expect a checkpoint before Interval elapses. Interval is
+// set to an hour so any success here came from the volume trigger, not
+// the timer.
 func TestCheckpointerVolumeTrigger(t *testing.T) {
 	walDir := filepath.Join(t.TempDir(), "pg_wal")
 	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: 4096})
@@ -243,7 +246,9 @@ func TestCheckpointerVolumeTrigger(t *testing.T) {
 	flusher := &fakeFlusher{flushSignalChan: make(chan struct{}, 16)}
 	cp := NewCheckpointer(flusher, w, CheckpointerConfig{
 		Interval:            time.Hour,
-		MaxWALBytes:         128, // very small threshold
+		SegmentSize:         4096,
+		MaxWALBytes:         2 * 4096,
+		CompletionTarget:    0,
 		VolumeCheckInterval: 5 * time.Millisecond,
 		Logger:              slog.New(slog.NewTextHandler(nilDiscardWriter{}, nil)),
 	})
@@ -259,9 +264,10 @@ func TestCheckpointerVolumeTrigger(t *testing.T) {
 		<-done
 	}()
 
-	// Force the writer past the threshold.
-	for i := 0; i < 10; i++ {
-		if _, _, err := w.Append([]byte("aaaaaaaaaaaaaaaa")); err != nil {
+	// Force the writer past the first segment boundary.
+	payload := bytes.Repeat([]byte("a"), 512)
+	for i := 0; i < 16; i++ {
+		if _, _, err := w.Append(payload); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -281,29 +287,101 @@ func TestCheckpointerVolumeTrigger(t *testing.T) {
 	}
 }
 
+// TestCheckpointerCheckPointSegments pins goopg's CalculateCheckpointSegments
+// port (xlog.c:2170-2198): segments = floor(max_wal_size/segsize /
+// (1 + checkpoint_completion_target)), floored at 1. The PG-default row is
+// the one M0131-S30.4 was about: 1 GiB / 16 MiB = 64 segments, divided by
+// 1.9, is 33 — so PG checkpoints 33-1 = 32 segments (512 MiB) past redo,
+// where goopg previously waited the full 1024 MiB.
+func TestCheckpointerCheckPointSegments(t *testing.T) {
+	const mib = 1024 * 1024
+	cases := []struct {
+		name       string
+		maxWAL     uint64
+		segSize    int64
+		target     float64
+		wantSegs   uint64
+		wantMiBGap uint64 // (segs-1) * segSize, the actual trigger distance
+	}{
+		{"pg-defaults", 1024 * mib, 16 * mib, 0.9, 33, 512},
+		{"target-zero", 1024 * mib, 16 * mib, 0, 64, 63 * 16},
+		{"target-one", 1024 * mib, 16 * mib, 1.0, 32, 31 * 16},
+		// CheckPointSegments = 1: upstream still checkpoints once per
+		// segment because it only tests at a segment switch, so the
+		// polled distance floors at one segment rather than zero.
+		{"below-one-segment", 8 * mib, 16 * mib, 0.9, 1, 16},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cp := &Checkpointer{cfg: CheckpointerConfig{
+				MaxWALBytes:      tc.maxWAL,
+				SegmentSize:      tc.segSize,
+				CompletionTarget: tc.target,
+			}}
+			if got := cp.checkpointSegments(); got != tc.wantSegs {
+				t.Errorf("checkpointSegments = %d; want %d", got, tc.wantSegs)
+			}
+			gap := cp.elapsedSegmentsNeeded() * uint64(tc.segSize) / mib
+			if gap != tc.wantMiBGap {
+				t.Errorf("trigger distance = %d MiB; want %d MiB", gap, tc.wantMiBGap)
+			}
+		})
+	}
+}
+
 // TestCheckpointerVolumeTriggerThreshold pins the boundary on
-// volumeTriggerFires: at threshold-1 it must not fire; at
-// threshold it must.
+// volumeTriggerFires against upstream's XLogCheckpointNeeded: it compares
+// SEGMENT NUMBERS (new_segno >= old_segno + CheckPointSegments - 1) and
+// anchors on the last checkpoint's REDO pointer, not on the checkpoint
+// record's end LSN (M0131-S30.4).
 func TestCheckpointerVolumeTriggerThreshold(t *testing.T) {
-	cp := &Checkpointer{cfg: CheckpointerConfig{MaxWALBytes: 100}}
+	const seg = 4096
+	// max_wal_size = 4 segments, completion target 0 -> CheckPointSegments
+	// = 4 -> fire once 3 segments have elapsed past the anchor.
+	cp := &Checkpointer{cfg: CheckpointerConfig{
+		MaxWALBytes:      4 * seg,
+		SegmentSize:      seg,
+		CompletionTarget: 0,
+	}}
 
-	// No checkpoint yet, written < threshold -> no fire.
-	if cp.volumeTriggerFires(stubReporter{lsn: 99}) {
-		t.Error("fired at written=99, threshold=100, lastCkpt=0")
+	// No checkpoint yet: the anchor is where Run observed the writer.
+	// Two segments elapsed -> no fire; three -> fire.
+	cp.volumeAnchor.Store(0)
+	if cp.volumeTriggerFires(stubReporter{lsn: 3*seg - 1}) {
+		t.Error("fired after 2 elapsed segments; CheckPointSegments-1 = 3")
 	}
-	// No checkpoint yet, written == threshold -> fire.
-	if !cp.volumeTriggerFires(stubReporter{lsn: 100}) {
-		t.Error("did not fire at written=100, threshold=100, lastCkpt=0")
+	if !cp.volumeTriggerFires(stubReporter{lsn: 3 * seg}) {
+		t.Error("did not fire after 3 elapsed segments")
 	}
 
-	// After a checkpoint at lsn=200, gap < threshold -> no fire.
-	cp.lastCheckpointLSN.Store(200)
-	if cp.volumeTriggerFires(stubReporter{lsn: 250}) {
-		t.Error("fired at gap=50, threshold=100")
+	// A non-zero anchor shifts the window: a server restarted with the
+	// WAL already deep into segment 100 must not checkpoint immediately.
+	cp.volumeAnchor.Store(100 * seg)
+	if cp.volumeTriggerFires(stubReporter{lsn: 100*seg + 10}) {
+		t.Error("fired immediately at the start anchor")
 	}
-	// gap == threshold -> fire.
-	if !cp.volumeTriggerFires(stubReporter{lsn: 300}) {
-		t.Error("did not fire at gap=100, threshold=100")
+	if !cp.volumeTriggerFires(stubReporter{lsn: 103 * seg}) {
+		t.Error("did not fire 3 segments past the start anchor")
+	}
+
+	// Once a checkpoint has run, redo (stored 1-based) is the anchor —
+	// NOT lastCheckpointLSN, which trails redo by the flush phase.
+	cp.lastCheckpointRedoLSN.Store(200*seg + 1)
+	cp.lastCheckpointLSN.Store(202 * seg) // deliberately far past redo
+	if cp.volumeTriggerFires(stubReporter{lsn: 202*seg + seg - 1}) {
+		t.Error("fired 2 segments past redo; must measure from redo, not the record LSN")
+	}
+	if !cp.volumeTriggerFires(stubReporter{lsn: 203 * seg}) {
+		t.Error("did not fire 3 segments past redo")
+	}
+}
+
+// TestCheckpointerVolumeTriggerDisabled pins that max_wal_size = 0 never
+// fires, independent of the writer position.
+func TestCheckpointerVolumeTriggerDisabled(t *testing.T) {
+	cp := &Checkpointer{cfg: CheckpointerConfig{SegmentSize: 4096}}
+	if cp.volumeTriggerFires(stubReporter{lsn: 1 << 40}) {
+		t.Error("fired with MaxWALBytes = 0")
 	}
 }
 
