@@ -3,7 +3,9 @@ package storage
 import (
 	"fmt"
 	"os"
+	"runtime/debug"
 	"sync"
+	"sync/atomic"
 )
 
 // TEMPORARY diagnostic for M0131-S30.3 (docs/design/0131-0021): replay and the
@@ -87,7 +89,94 @@ func PageIdentityObserve(tag BufferTag, page []byte, note string) {
 		fmt.Fprintf(os.Stderr,
 			"PAGEIDENT-REGRESS rel=%d/%d/%d blk=%d lp=%d high=%d pd_lsn=%d note=%s\n",
 			tag.Rel.TblOid, tag.Rel.DBOid, tag.Rel.RelOid, tag.Block, cnt, high, lsn, note)
+		pageIdentStack(note)
 	}
+}
+
+// pageIdentStack prints the goroutine stack of the first few regressions so the
+// MUTATION site is named, not just the site that later noticed the smaller page.
+// Bounded because a regressing page tends to be observed repeatedly (write,
+// read, mutate) and an unbounded dump would bury the log.
+var pageIdentStacks atomic.Int32
+
+func pageIdentStack(note string) {
+	if pageIdentStacks.Add(1) > 4 {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "PAGEIDENT-STACK note=%s\n%s\n", note, debug.Stack())
+}
+
+// PageIdentityAssertEmit is the EMIT-side half of the probe (M0131-S30.3 step
+// (a)). PageIdentityObserve catches a page whose CONTENT regressed; this
+// catches the complementary case where the content is fine but the value the
+// runtime writes into the WAL record does not describe the page it just
+// mutated.
+//
+// Two invariants are checked at the moment the HOT-update record's `new_off`
+// is handed to the WAL:
+//
+//   - PageAddHeapTuple always APPENDS, so immediately after it the new slot is
+//     the last line pointer: newOff == PageLinePointerCount(page). A mismatch
+//     means the page changed identity between the add and the emit, or that
+//     newOff was carried over from a different page entirely.
+//   - newOff must be at least the high-water line-pointer count seen for this
+//     tag. The S30.3 record's `new_off: 2` against a 185-line-pointer block 130
+//     is exactly this violation, so it fires even if the page under the pointer
+//     has meanwhile been replaced.
+//
+// Caller must hold the page's content lock (the counts are only stable there).
+func PageIdentityAssertEmit(tag BufferTag, page []byte, newOff uint16, note string) {
+	if !pageIdentProbeEnabled {
+		return
+	}
+	if tag.Rel.Fork != MainFork {
+		return
+	}
+	cnt, err := PageLinePointerCount(page)
+	if err != nil {
+		return
+	}
+	h, herr := Header(page)
+	if herr != nil {
+		return
+	}
+	if int(h.Special()) != BlockSize { // heap pages only — see PageIdentityObserve
+		return
+	}
+	pageIdentMu.Lock()
+	high, seen := pageIdentHigh[tag]
+	if !seen || cnt > high {
+		pageIdentHigh[tag] = cnt
+	}
+	pageIdentMu.Unlock()
+	if int(newOff) != cnt {
+		fmt.Fprintf(os.Stderr,
+			"PAGEIDENT-EMIT-OFF rel=%d/%d/%d blk=%d new_off=%d lp=%d high=%d pd_lsn=%d note=%s\n",
+			tag.Rel.TblOid, tag.Rel.DBOid, tag.Rel.RelOid, tag.Block, newOff, cnt, high, h.LSN(), note)
+	}
+	if seen && int(newOff) < high {
+		fmt.Fprintf(os.Stderr,
+			"PAGEIDENT-EMIT-REGRESS rel=%d/%d/%d blk=%d new_off=%d lp=%d high=%d pd_lsn=%d note=%s\n",
+			tag.Rel.TblOid, tag.Rel.DBOid, tag.Rel.RelOid, tag.Block, newOff, cnt, high, h.LSN(), note)
+	}
+}
+
+// PageIdentityAssertCount reports when a page's line-pointer count differs from
+// want. Used to prove the unlogged add/remove pair of the HOT orphan-cleanup
+// arm (M0131-S30.5) really is a page no-op: after PageRemoveHeapTuple the count
+// must be back to what it was before PageAddHeapTuple, or the buffer that
+// reaches disk disagrees with the page replay rebuilds.
+func PageIdentityAssertCount(tag BufferTag, page []byte, want int, note string) {
+	if !pageIdentProbeEnabled {
+		return
+	}
+	cnt, err := PageLinePointerCount(page)
+	if err != nil || cnt == want {
+		return
+	}
+	fmt.Fprintf(os.Stderr,
+		"PAGEIDENT-COUNT rel=%d/%d/%d blk=%d lp=%d want=%d note=%s\n",
+		tag.Rel.TblOid, tag.Rel.DBOid, tag.Rel.RelOid, tag.Block, cnt, want, note)
 }
 
 // PageIdentityExtend records that blk was just handed out by extend/extendBatch
@@ -108,4 +197,17 @@ func PageIdentityExtend(tag BufferTag) {
 			"PAGEIDENT-REEXTEND rel=%d/%d/%d blk=%d prevHigh=%d\n",
 			tag.Rel.TblOid, tag.Rel.DBOid, tag.Rel.RelOid, tag.Block, high)
 	}
+}
+
+// PageIdentityReportDupSlot reports a slot mutating a page under a tag that the
+// bufmap associates with a DIFFERENT slot — two live buffers for one block.
+// See Pool.probeAssertSlotIsMapped (M0131-S30.3).
+func PageIdentityReportDupSlot(tag BufferTag, slotIdx, mappedIdx int32, note string) {
+	if !pageIdentProbeEnabled {
+		return
+	}
+	fmt.Fprintf(os.Stderr,
+		"PAGEIDENT-DUPSLOT rel=%d/%d/%d blk=%d slot=%d mapped=%d note=%s\n",
+		tag.Rel.TblOid, tag.Rel.DBOid, tag.Rel.RelOid, tag.Block, slotIdx, mappedIdx, note)
+	pageIdentStack("dupslot:" + note)
 }

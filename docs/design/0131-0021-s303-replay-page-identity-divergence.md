@@ -234,3 +234,83 @@ with no WAL behind it. That path is not undone here.
 S30.3 itself is unchanged: candidate 1 above is now partly discharged (this was
 one such mutation, and it is one line pointer per occurrence — not `185 → 1`),
 leaving candidates 2 and 3 as the next probes.
+
+## Update 2026-08-11 (loop #136) — ROOT CAUSE: two live buffers for one block
+
+S30.3 is **root-caused**, and it needs neither a crash nor the preserved 251 MB
+cluster to reproduce: `bash analysis/pageident_probe.sh` (45–60 s pgbench,
+`GOOPG_PAGEIDENT_PROBE=1`) reproduces the exact `new_off: 2` against a
+185-line-pointer block in 3 of 4 runs.
+
+### What the probe was extended with
+
+The observe-side probe alone (loop #134) reported ZERO hits, because it watched
+page *content* only at I/O boundaries. Three additions made the defect visible:
+
+* `PageIdentityAssertEmit` (`internal/storage/pageident_probe.go`) — the
+  **emit side**. At the moment `markHeapHotUpdateDirty` is handed `new_off`,
+  under the content lock, assert `new_off == PageLinePointerCount(page)`
+  (`PAGEIDENT-EMIT-OFF`) and `new_off >= high-water count for {rel, blk}`
+  (`PAGEIDENT-EMIT-REGRESS`). The second is literally the S30.3 record.
+* `PageIdentityObserve` at every `MarkDirty` / `MarkDirtyChangeRecord` /
+  `MarkDirtyLogicalChange`, using the **slot's own tag** — every page mutation
+  funnels through one of these, so the regression is caught at the mutating
+  call path, with `PAGEIDENT-STACK` naming it.
+* `Pool.probeAssertSlotIsMapped` — the decisive invariant: *a pinned slot about
+  to mutate its page must BE the bufmap's slot for its own tag*. Violation is
+  reported as `PAGEIDENT-DUPSLOT`.
+
+### The causal chain, as logged
+
+```
+PAGEIDENT-DUPSLOT  rel=0/5/16407 blk=149 slot=11706 mapped=11707 note=markDirtyRecord
+PAGEIDENT-REGRESS  ... blk=149 lp=1 high=185 note=preFlush     <- stale slot flushed
+PAGEIDENT-REGRESS  ... blk=149 lp=1 high=185 note=postWrite    <- over the real block
+PAGEIDENT-REGRESS  ... blk=149 lp=1 high=185 note=hotUpdate
+PAGEIDENT-EMIT-REGRESS ... blk=149 new_off=2 lp=2 high=185     <- the S30.3 record
+```
+
+Two buffer slots hold `{pgbench_tellers, blk 149}` at once. The stale one carries
+a near-empty page; because it is dirty it is eventually flushed and **overwrites
+the real 185-tuple block on disk**, after which every HOT update through it emits
+`new_off = 2, 3, 4 …`. Replay then rebuilds a page the runtime never had — and on
+the crashed cluster the surviving on-disk image is the 185-line-pointer one,
+which is why replay of `new_off: 2` fails with "not enough free space in page".
+`mapped` is consistently `slot+1`, i.e. two adjacent victims from the clock hand:
+two concurrent claimants for the same block.
+
+### Where the second buffer comes from
+
+`Pool.pinNewXID` (`internal/storage/bufpool.go`) releases `pinMu` across
+`mgr.Extend` — necessarily, it is I/O. The moment `Extend` returns, the block
+**exists on disk and is inside `nblocks`**, so any other backend may `Pin` it,
+miss the bufmap and load it into a different slot through `pinLoad`. The
+extender then re-takes `pinMu` and:
+
+1. publishes its own slot as valid+**dirty**+pinned (`s.tag = tag`,
+   `s.state.Store(newSt)`) — *before* consulting the bufmap;
+2. calls `bmInsert`, and on failure tries the existing slot;
+3. if that `tryPinSlot` also fails, **falls through keeping its own
+   publication** — a slot that is valid, dirty and tagged, but not the bufmap's
+   slot for that tag.
+
+Step 1 alone is enough to produce a mutable duplicate; step 3 makes it durable.
+The un-mapped dirty slot is a normal eviction candidate, so its stale content
+reaches disk. Upstream has no such window: `ReadBuffer_common`'s extension path
+holds the relation-extension lock and inserts the buffer into the mapping under
+`BufMappingLock` before the block is visible to anyone else
+(`postgres/src/backend/storage/buffer/bufmgr.c`).
+
+### Fix direction (next loop, S30.3 fix slice)
+
+Make extend-and-publish atomic with respect to `Pin`: reserve the block number
+and insert the bufmap entry with `ioInflight` set *before* releasing `pinMu` for
+the write (mirroring `pinLoad`'s publish-then-read order), so a concurrent
+`Pin` waits on the slot semaphore instead of racing a disk read. The
+"fall through: keep our publication" branch must go: an extender that loses the
+publication race must un-publish its slot (clear tag/state, `releaseVictimSlot`)
+and retry the lookup — never keep a dirty duplicate.
+
+Gate for the fix: `analysis/pageident_probe.sh` must report zero
+`PAGEIDENT-DUPSLOT` / `PAGEIDENT-EMIT-REGRESS` over several runs, and
+`RUNS=3 bash analysis/crashprobe30.sh` must stop losing rows for this cause.

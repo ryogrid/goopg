@@ -3674,6 +3674,14 @@ func tryApplyHOTUpdate(
 	// previously seen for {rel, blk} proves the slot's bytes belong to another
 	// block. See internal/storage/pageident_probe.go.
 	storage.PageIdentityObserve(storage.BufferTag{Rel: rel, Block: blk}, s.Page(), "hotUpdate")
+	// Line-pointer count before the (unlogged) append, so the orphan-cleanup
+	// arm below can assert the add/remove pair left the page untouched.
+	lpBeforeAdd := -1
+	if storage.PageIdentityProbeEnabled() {
+		if n, cerr := storage.PageLinePointerCount(s.Page()); cerr == nil {
+			lpBeforeAdd = n
+		}
+	}
 	newSlot, addErr := storage.PageAddHeapTuple(s.Page(), tup)
 	if addErr != nil && errors.Is(addErr, storage.ErrNoSpaceInPage) {
 		// Page full: attempt opportunistic pruning before giving up on HOT.
@@ -3755,6 +3763,9 @@ func tryApplyHOTUpdate(
 			// Non-fatal: page is still structurally valid; the
 			// orphan wastes space until the next VACUUM repacks
 			// the page. Do not surface this to the client.
+		} else if lpBeforeAdd >= 0 {
+			// M0131-S30.3 probe: prove the unlogged pair is a page no-op.
+			storage.PageIdentityAssertCount(storage.BufferTag{Rel: rel, Block: blk}, s.Page(), lpBeforeAdd, "hotOrphanClean")
 		}
 		s.Unlock()
 		ctx.Pool.Unpin(s)
@@ -3768,6 +3779,11 @@ func tryApplyHOTUpdate(
 		return false, stampErr
 	}
 
+	// M0131-S30.3 probe step (a): the value about to be written into the record's
+	// new_off must describe THIS page — newSlot == line-pointer count, and never
+	// below the high-water count seen for {rel, blk}. Still under the content
+	// lock, so the counts are stable.
+	storage.PageIdentityAssertEmit(storage.BufferTag{Rel: rel, Block: blk}, s.Page(), newSlot, "hotUpdateEmit")
 	derr := markHeapHotUpdateDirty(ctx.Pool, s, rel, blk, oldSlot, newSlot, effectiveWriterXID(ctx), tupleBytes)
 	s.Unlock()
 	ctx.Pool.Unpin(s)

@@ -1,39 +1,40 @@
 (idle — nothing in flight)
 
-Loop #135 worked **M0131-S30.5** — CLOSED and committed.
+Loop #136 worked **M0131-S30.3 step (a)** — the probe fired and S30.3 is
+**ROOT-CAUSED** (diagnosis committed; the FIX is the next loop's task).
 
-**Fix:** `PageRemoveHeapTuple` (`internal/storage/heap.go`) is now an exact undo of
-`PageAddHeapTuple`: when the removed slot is the LAST line pointer and its body sits
-exactly at `pd_upper`, `pd_upper` is raised back over the body (MAXALIGNed) in
-addition to the existing `pd_lower` shrink. Rationale that neither filed candidate
-had: the orphan-cleanup add is ALSO unlogged, so the add/remove pair needs no WAL
-record — it needs to be a page no-op, and it was not (it leaked one tuple's free
-space per occurrence out of a page the WAL says still has it). Interior removals
-unchanged. Guards: `TestPageRemoveHeapTupleUndoesAppend` (verified FAILS pre-fix,
-`pd_upper=8056 want=8096`) / `TestPageRemoveHeapTupleInteriorSlotKeepsUpper`.
+**Root cause: two live buffer slots for one block.** `Pool.pinNewXID`
+(`internal/storage/bufpool.go`) releases `pinMu` across `mgr.Extend`; the moment
+Extend returns the block is inside `nblocks`, so another backend Pins it, misses
+the bufmap and loads it into a SECOND slot — while the extender publishes its own
+slot valid+dirty+pinned BEFORE `bmInsert`, and on `bmInsert` failure + failed
+`tryPinSlot` **falls through keeping its own publication** (un-mapped dirty
+duplicate). That stale near-empty page is a normal eviction candidate, overwrites
+the real 185-tuple block, and every later HOT update through it emits
+`new_off = 2, 3, 4 …` — exactly the S30.3 record.
 
-**Still open in M0131-S30 (next candidates, in order):**
-- **S30.3** — the big one (`185 -> 1` line pointers). Prime suspects 1 (buffer
-  tag/content aliasing) and 2 (`IsNew` PageInit past a shortened file) are REFUTED,
-  do not re-test. Probe exists: `internal/storage/pageident_probe.go`
-  (`GOOPG_PAGEIDENT_PROBE=1`, driver `analysis/pageident_probe.sh`); heap-only
-  filter is `pd_special == BlockSize` (without it btree splits give 336 benign
-  hits). Remaining candidates: (a) assert at `markHeapHotUpdateDirty` that the
-  emitted `new_off` equals BOTH `newSlot` and `PageLinePointerCount(page)` — catch
-  an emit-time inconsistency; (b) if clean, walk block 130's records from the START
-  of the stream (divergence may begin far before record 826236).
-- S30.1 / S30.2 / S30.4 (WAL-tail-vs-segment-padding, WARN-that-still-starts,
-  no-checkpoint) — all untouched.
-- Ledger row 2026-08-11: same arm still leaves an unlogged OLD-slot mutation when
-  `PageSetHeapTupleCmax` fails after a successful multixact stamp.
+**NEXT STEP (the fix slice):** publish the bufmap entry with `ioInflight` set
+BEFORE releasing `pinMu` for the extend write (mirror `pinLoad`'s
+publish-then-IO order so a concurrent Pin waits on the slot semaphore), and
+delete the "fall through: keep our publication" branch — a loser must un-publish
+(clear tag/state, `releaseVictimSlot`) and retry the lookup.
+Gate: `bash analysis/pageident_probe.sh` ×3+ with zero
+`PAGEIDENT-DUPSLOT`/`PAGEIDENT-EMIT-REGRESS` (it fires in ~3 of 4 runs today at
+`LOADSEC=60 CLIENTS=24`), then `RUNS=3 bash analysis/crashprobe30.sh`.
 
-Repro for S30.3 still preserved: `cp -a /tmp/s30_3_repro/data /tmp/try` → goopg
-refuses to start in ~35 s (251 MB; copy somewhere durable if /tmp is at risk).
+**Repro is now cheap** — no crash, no preserved cluster: 60 s pgbench under
+`GOOPG_PAGEIDENT_PROBE=1`. Probe additions this loop (all temporary, remove when
+S30.3 closes): `PageIdentityAssertEmit`, `PageIdentityAssertCount`,
+`PageIdentityReportDupSlot`, `pageIdentStack` (stack on first 4 regressions),
+`Pool.probeAssertSlotIsMapped`, observe at every `MarkDirty*` with the slot tag.
+
+Still open in M0131-S30: S30.1 / S30.2 / S30.4 (all untouched). Ledger row
+2026-08-11 (HOT arm's unlogged xmax on a failed `PageSetHeapTupleCmax`) open.
 
 Nightly triage: `ci/logs/action-items.md` still run `20260811-014635`
 (AI-…-001..012), all already filed under M-NIGHTLY; nothing new.
 
-Gates run: units suite PASS; storage package tests PASS (new guards verified to fail
-pre-fix); `make ralph-state-guard` OK; pgbench smoke via the commit hook.
+Gates run: units suite PASS; `make ralph-state-guard` OK (auto-repaired progress
+marker); pgbench smoke via the commit hook.
 
 In-flight: none.
