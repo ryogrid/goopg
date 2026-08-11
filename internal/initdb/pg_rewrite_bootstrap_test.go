@@ -54,7 +54,13 @@ func TestPgRewriteInitialEntriesContainsPgStatWalReceiverReturn(t *testing.T) {
 	if len(entries) != 6 {
 		t.Fatalf("pgRewriteInitialEntries: %d rows, want 6", len(entries))
 	}
-	e := entries[0]
+	// M0131-S9.0: the rows come from the manifest in capture order, so the
+	// wal_receiver entry is no longer index 0. Look it up by view instead of
+	// re-pinning an order that is not a catalog invariant.
+	e, ok := nailedViewRewriteEntry("pg_stat_wal_receiver")
+	if !ok {
+		t.Fatalf("no seeded _RETURN rule for pg_stat_wal_receiver")
+	}
 	if e.OID != pgRewriteOIDPgStatWalReceiverReturn {
 		t.Errorf("OID = %d, want %d", e.OID, pgRewriteOIDPgStatWalReceiverReturn)
 	}
@@ -94,23 +100,30 @@ func TestPgRewriteInitialEntriesContainsPgStatWalReceiverReturn(t *testing.T) {
 // pg_node_tree framing that PG's stringToNode expects.
 func TestReplicationViewRewriteEntries(t *testing.T) {
 	type want struct {
+		view    string
 		oid     uint32
 		evClass uint32
 		minLen  int
 	}
 	wants := []want{
-		{pgRewriteOIDPgStatReplicationReturn, pgStatReplicationViewOID, 5000},
-		{pgRewriteOIDPgStatRecoveryPrefetchReturn, pgStatRecoveryPrefetchViewOID, 1000},
-		{pgRewriteOIDPgStatSubscriptionReturn, pgStatSubscriptionViewOID, 1000},
-		{pgRewriteOIDPgReplicationSlotsReturn, pgReplicationSlotsViewOID, 1000},
-		{pgRewriteOIDPgStatReplicationSlotsReturn, pgStatReplicationSlotsViewOID, 1000},
+		{"pg_stat_replication", pgRewriteOIDPgStatReplicationReturn, pgStatReplicationViewOID, 5000},
+		{"pg_stat_recovery_prefetch", pgRewriteOIDPgStatRecoveryPrefetchReturn, pgStatRecoveryPrefetchViewOID, 1000},
+		{"pg_stat_subscription", pgRewriteOIDPgStatSubscriptionReturn, pgStatSubscriptionViewOID, 1000},
+		{"pg_replication_slots", pgRewriteOIDPgReplicationSlotsReturn, pgReplicationSlotsViewOID, 1000},
+		{"pg_stat_replication_slots", pgRewriteOIDPgStatReplicationSlotsReturn, pgStatReplicationSlotsViewOID, 1000},
 	}
-	entries := replicationViewRewriteEntries()
-	if len(entries) != len(wants) {
-		t.Fatalf("replicationViewRewriteEntries: %d rows, want %d", len(entries), len(wants))
+	// M0131-S9.0: the entries are generated from the manifest, so this pins the
+	// five batched-29 rules by view name rather than by position — the
+	// hand-written slice they used to index into is gone.
+	if got := len(pgRewriteInitialEntries()); got != len(wants)+1 {
+		t.Fatalf("pgRewriteInitialEntries: %d rows, want %d (five batched-29 + wal_receiver)", got, len(wants)+1)
 	}
 	for i, w := range wants {
-		e := entries[i]
+		e, ok := nailedViewRewriteEntry(w.view)
+		if !ok {
+			t.Errorf("[%d] no seeded _RETURN rule for %s", i, w.view)
+			continue
+		}
 		if e.OID != w.oid {
 			t.Errorf("[%d] OID = %d, want %d", i, e.OID, w.oid)
 		}

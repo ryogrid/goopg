@@ -270,6 +270,69 @@ S9.4 as a successor milestone and file the ledger row when S9.3 lands.
    functions as its prerequisites — not left implicit.
 9. UNITS + SMOKE green.
 
+## S9.0 — the mechanical precondition (landed 2026-08-11)
+
+S7.4 generated the views' `pg_class`/`pg_attribute` tables but left three
+artefacts hand-edited, and ledgered them as S9.1's precondition: **the
+`pg_rewrite` seed rows, the per-view `//go:embed` line for each `ev_action`
+blob, and the view-OID constants.** Two of the three are now closed, which is
+what makes S9.1's 23 views a capture-and-regenerate pass rather than 23×3 hand
+edits.
+
+**The `pg_rewrite` rows are generated.** `cmd/gen-nailed-view-tables` gained a
+second emitter, `nailedViewRewriteEntries()`, rendered from the manifest's
+`rule_oid` column. Every other field of an ON-SELECT rule is a constant of the
+form — `_RETURN`, `ev_type` `'1'` (CMD_SELECT), `ev_enabled` `'O'` (ALWAYS),
+`is_instead` true, `ev_qual` `"<>"` — so the generator writes them as literals
+and derives nothing new. `pgRewriteInitialEntries()` is now a one-line delegate
+and `replicationViewRewriteEntries()` (the five hand-written batched-29 rows) is
+deleted. The invariant this buys: a view cannot reach disk seeded into
+`pg_class` but absent from `pg_rewrite`, which is the
+`cache lookup failed for rule …` FATAL that M0106-0010 Step 3dm phase B exists
+to prevent and the most likely way a widening pass regresses.
+
+**The `//go:embed` lines are gone**, replaced by one glob into an `embed.FS`
+(`internal/initdb/nailed_view_ev_action.go`) resolved by view name.
+`nailedViewEvAction(view)` panics — deliberately — on a missing or
+non-parenthesised blob: the caller is bootstrap seed construction, and seeding
+`ev_action` (BKI_FORCE_NOT_NULL) empty produces a cluster whose failure surfaces
+much later inside a hosted PG's `stringToNode`, against a catalog nobody
+suspects.
+
+*The glob costs a guard the hand-written form got for free.* Six `//go:embed`
+lines fail the **build** when a `.dat` is missing; a glob matching five files
+instead of six compiles happily. So set equality is asserted explicitly
+(`TestNailedViewEvActionBlobSetMatchesSeededViews`): every seeded view owns a
+blob, every blob belongs to a seeded view — the second direction catching a
+stale `.dat` for a view no longer in the manifest.
+`TestNailedViewRewriteEntriesCoverEverySeededView` pins the `pg_rewrite` half
+(one rule per view, no duplicate `ev_class`, the fixed rule form, and the
+`ev_action` being *that view's own* blob), and
+`TestNailedViewEvActionRejectsUnknownView` pins the loud-failure contract.
+
+**The third artefact, the view-OID constants, is deliberately left.** They are
+now referenced only by tests (`system_view_oid_pins_test.go`,
+`pg_rewrite_bootstrap_test.go`) — the seed path reads OIDs from the manifest —
+so they function as an independent hand-written pin that the generated table is
+checked against. Generating them too would make both sides of that comparison
+derive from one source. S9.1 adds no new constants.
+
+Two order assumptions broke and were fixed rather than preserved, both because
+generated rows follow the manifest's capture order:
+`TestPgRewriteInitialEntriesContainsPgStatWalReceiverReturn` indexed
+`entries[0]` and `TestPgRewriteRowLayout` (`btree_search_test.go`) read heap
+**slot 1**. Both now locate the row by OID/name. Heap row order is not a
+catalog invariant — PG reaches these rows by index or seqscan — and it will
+shift again with every S9 capture, so a test that pins it is a test that fails
+for the wrong reason. `TestPgRewriteRowLayout`'s `rawSize` expectation is now
+`len(nailedViewEvAction("pg_stat_wal_receiver"))` rather than the literal 5928,
+so a legitimate re-capture does not need the constant edited while a truncated
+payload still fails.
+
+Gates: `internal/initdb` PASS (61 s), `^TestE2E_` PASS (105 s, includes
+`TestE2E_PGColdStartOnGoopgDataDir` — a real PG reading the reordered
+`pg_rewrite` heap), UNITS PASS, pgbench smoke via the commit hook.
+
 ## References
 
 - M0131 implementation plan §S9, `docs/design/0131-bidirectional-cluster-dir-coldstart-and-system-views.md`

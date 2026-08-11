@@ -29,6 +29,15 @@
 //     internal/initdb/system_view_oid_pins_test.go ties the hand-written OID
 //     constants to the same pin table, so the literals here cannot drift from
 //     the constants without a guard firing.
+//
+// M0131-S9.0 added the second emitter, nailedViewRewriteEntries(): the
+// Form_pg_rewrite _RETURN seed row per view, whose rule OID is the manifest's
+// rule_oid column. Every other field of that row is a constant of the ON-SELECT
+// rule form (rulename "_RETURN", ev_type CMD_SELECT, ev_enabled ALWAYS,
+// is_instead true, empty ev_qual), and the ev_action body is resolved at
+// runtime from the embedded blob by view name rather than through a per-view
+// //go:embed var — see internal/initdb/nailed_view_ev_action.go. Together those
+// close two of the three hand-edits S7.4 ledgered as S9.1's precondition.
 package main
 
 import (
@@ -196,6 +205,35 @@ func main() {
 				die("%s: attribute %d is out of order (attnum %d)", r.Name, i+1, a.Num)
 			}
 		}
+		// A rule OID of 0 would seed a pg_rewrite row that the 2692 oid index
+		// cannot address, and InvalidOid is not a value upstream's initdb ever
+		// assigns — so it means the capture script failed to read pg_rewrite
+		// for this view (a view captured with no _RETURN rule at all).
+		if r.RuleOID == 0 {
+			die("%s: manifest carries rule OID 0 — re-run scripts/capture-ev-action.sh %s", r.Name, r.Name)
+		}
+		// The rule OID shares the 12000..16383 initdb band with the view OID,
+		// and a collision between the two would make pg_class and pg_rewrite
+		// disagree about which object an OID names.
+		if r.RuleOID == r.GoopgOID {
+			die("%s: rule OID %d collides with the view OID", r.Name, r.RuleOID)
+		}
+	}
+	// Cross-view OID uniqueness: with 80 views to come (M0131-S9), a duplicate
+	// pinned OID is a realistic capture/merge mistake and its symptom on a
+	// hosted PG is an arbitrary one of the two objects winning a syscache
+	// lookup.
+	seen := map[uint32]string{}
+	for _, r := range rels {
+		for _, p := range []struct {
+			oid  uint32
+			what string
+		}{{r.GoopgOID, "view"}, {r.RuleOID, "rule"}} {
+			if prev, dup := seen[p.oid]; dup {
+				die("OID %d is claimed by both %s and %s (%s)", p.oid, prev, r.Name, p.what)
+			}
+			seen[p.oid] = r.Name
+		}
 	}
 
 	out := os.Stdout
@@ -233,6 +271,37 @@ func main() {
 			fmt.Fprintf(out, "},\n")
 		}
 		fmt.Fprintf(out, "\t\t\t},\n")
+		fmt.Fprintf(out, "\t\t},\n")
+	}
+	fmt.Fprintf(out, "\t}\n")
+	fmt.Fprintf(out, "}\n")
+
+	// Second emitter (M0131-S9.0): the ON-SELECT rule seed rows.
+	fmt.Fprintf(out, "\n")
+	fmt.Fprintf(out, "// nailedViewRewriteEntries returns the %d ON-SELECT (_RETURN) rules that back\n", len(rels))
+	fmt.Fprintf(out, "// the on-disk system views, rendered from the same manifest as\n")
+	fmt.Fprintf(out, "// nailedViewSeedRels. A hosted PG opening a view with relhasrules=true\n")
+	fmt.Fprintf(out, "// resolves the rule through SearchSysCache2(RULERELNAME, view_oid, \"_RETURN\")\n")
+	fmt.Fprintf(out, "// and FATALs with \"cache lookup failed for rule …\" if the row is absent, so\n")
+	fmt.Fprintf(out, "// every rel row above owes exactly one entry here.\n")
+	fmt.Fprintf(out, "//\n")
+	fmt.Fprintf(out, "// Only the OIDs and the ev_class link vary: an ON-SELECT view rule is always\n")
+	fmt.Fprintf(out, "// _RETURN / CMD_SELECT ('1') / ALWAYS ('O') / INSTEAD, with an empty ev_qual\n")
+	fmt.Fprintf(out, "// (\"<>\"). The ev_action body is read from the embedded capture by view name\n")
+	fmt.Fprintf(out, "// (nailed_view_ev_action.go), which is why adding a view needs no //go:embed\n")
+	fmt.Fprintf(out, "// line.\n")
+	fmt.Fprintf(out, "func nailedViewRewriteEntries() []pgRewriteEntry {\n")
+	fmt.Fprintf(out, "\treturn []pgRewriteEntry{\n")
+	for _, r := range rels {
+		fmt.Fprintf(out, "\t\t{\n")
+		fmt.Fprintf(out, "\t\t\tOID:       %d,\n", r.RuleOID)
+		fmt.Fprintf(out, "\t\t\tRuleName:  \"_RETURN\",\n")
+		fmt.Fprintf(out, "\t\t\tEvClass:   %d, // %s\n", r.GoopgOID, r.Name)
+		fmt.Fprintf(out, "\t\t\tEvType:    '1',\n")
+		fmt.Fprintf(out, "\t\t\tEvEnabled: 'O',\n")
+		fmt.Fprintf(out, "\t\t\tIsInstead: true,\n")
+		fmt.Fprintf(out, "\t\t\tEvQual:    \"<>\",\n")
+		fmt.Fprintf(out, "\t\t\tEvAction:  nailedViewEvAction(%q),\n", r.Name)
 		fmt.Fprintf(out, "\t\t},\n")
 	}
 	fmt.Fprintf(out, "\t}\n")

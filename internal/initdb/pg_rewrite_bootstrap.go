@@ -23,30 +23,11 @@
 package initdb
 
 import (
-	_ "embed"
 	"fmt"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/executor"
 )
-
-//go:embed pg_stat_wal_receiver_ev_action.dat
-var pgStatWalReceiverEvAction string
-
-//go:embed pg_stat_replication_ev_action.dat
-var pgStatReplicationEvAction string
-
-//go:embed pg_stat_recovery_prefetch_ev_action.dat
-var pgStatRecoveryPrefetchEvAction string
-
-//go:embed pg_stat_subscription_ev_action.dat
-var pgStatSubscriptionEvAction string
-
-//go:embed pg_replication_slots_ev_action.dat
-var pgReplicationSlotsEvAction string
-
-//go:embed pg_stat_replication_slots_ev_action.dat
-var pgStatReplicationSlotsEvAction string
 
 // Rule OIDs for the six replication-view _RETURN rules.
 //
@@ -126,80 +107,39 @@ type pgRewriteEntry struct {
 // pg_stat_replication_slots (whose blob DOES embed its base view's relid
 // 12261 twice) because M0131-S8a pinned goopg's pg_replication_slots to that
 // same upstream OID.
+//
+// M0131-S9.0: the rows are no longer written out here. They are generated from
+// internal/initdb/nailed_view_manifest.tsv into nailedViewRewriteEntries()
+// alongside the pg_class/pg_attribute tables the same capture produced, so a
+// view cannot reach disk with a seeded relation but no rule (the
+// "cache lookup failed for rule …" FATAL) or vice versa. Adding a view to the
+// on-disk corpus is now: capture, regenerate, done.
 func pgRewriteInitialEntries() []pgRewriteEntry {
-	base := []pgRewriteEntry{
-		{
-			OID:       pgRewriteOIDPgStatWalReceiverReturn,
-			RuleName:  "_RETURN",
-			EvClass:   pgStatWalReceiverViewOID,
-			EvType:    '1', // CMD_SELECT
-			EvEnabled: 'O', // ALWAYS
-			IsInstead: true,
-			EvQual:    "<>", // empty node tree — no WHERE clause on the rule
-			EvAction:  pgStatWalReceiverEvAction,
-		},
-	}
-	return append(base, replicationViewRewriteEntries()...)
+	return nailedViewRewriteEntries()
 }
 
-// replicationViewRewriteEntries returns the five _RETURN rule entries for
-// the remaining replication views seeded in batched-28
-// (pg_stat_replication, pg_stat_recovery_prefetch, pg_stat_subscription,
-// pg_replication_slots, pg_stat_replication_slots). These follow the same
-// ev_action capture pattern as the wal_receiver entry above.
-func replicationViewRewriteEntries() []pgRewriteEntry {
-	return []pgRewriteEntry{
-		{
-			OID:       pgRewriteOIDPgStatReplicationReturn,
-			RuleName:  "_RETURN",
-			EvClass:   pgStatReplicationViewOID,
-			EvType:    '1',
-			EvEnabled: 'O',
-			IsInstead: true,
-			EvQual:    "<>",
-			EvAction:  pgStatReplicationEvAction,
-		},
-		{
-			OID:       pgRewriteOIDPgStatRecoveryPrefetchReturn,
-			RuleName:  "_RETURN",
-			EvClass:   pgStatRecoveryPrefetchViewOID,
-			EvType:    '1',
-			EvEnabled: 'O',
-			IsInstead: true,
-			EvQual:    "<>",
-			EvAction:  pgStatRecoveryPrefetchEvAction,
-		},
-		{
-			OID:       pgRewriteOIDPgStatSubscriptionReturn,
-			RuleName:  "_RETURN",
-			EvClass:   pgStatSubscriptionViewOID,
-			EvType:    '1',
-			EvEnabled: 'O',
-			IsInstead: true,
-			EvQual:    "<>",
-			EvAction:  pgStatSubscriptionEvAction,
-		},
-		{
-			OID:       pgRewriteOIDPgReplicationSlotsReturn,
-			RuleName:  "_RETURN",
-			EvClass:   pgReplicationSlotsViewOID,
-			EvType:    '1',
-			EvEnabled: 'O',
-			IsInstead: true,
-			EvQual:    "<>",
-			EvAction:  pgReplicationSlotsEvAction,
-		},
-		{
-			OID:       pgRewriteOIDPgStatReplicationSlotsReturn,
-			RuleName:  "_RETURN",
-			EvClass:   pgStatReplicationSlotsViewOID,
-			EvType:    '1',
-			EvEnabled: 'O',
-			IsInstead: true,
-			EvQual:    "<>",
-			EvAction:  pgStatReplicationSlotsEvAction,
-		},
+// nailedViewRewriteEntry returns the seeded _RETURN rule for the named system
+// view. Used by guards that assert one view's row rather than the whole set;
+// it fails the lookup loudly because a missing view here means the manifest and
+// the caller disagree about what is on disk.
+func nailedViewRewriteEntry(view string) (pgRewriteEntry, bool) {
+	for _, e := range nailedViewRewriteEntries() {
+		if e.EvClass == nailedViewSeedOID(view) {
+			return e, true
+		}
 	}
+	return pgRewriteEntry{}, false
+}
+
+// nailedViewSeedOID returns the generated pg_class OID for the named system
+// view, or 0 if it is not part of the on-disk corpus.
+func nailedViewSeedOID(view string) uint32 {
+	for _, r := range nailedViewSeedRels() {
+		if r.RelName == view {
+			return r.OID
+		}
+	}
+	return 0
 }
 
 // pgStatWalReceiverViewOID mirrors the OID assigned in Step 3dl's

@@ -162,3 +162,80 @@ func nailedViewSeedRels() []nailedRel {
 		},
 	}
 }
+
+// nailedViewRewriteEntries returns the 6 ON-SELECT (_RETURN) rules that back
+// the on-disk system views, rendered from the same manifest as
+// nailedViewSeedRels. A hosted PG opening a view with relhasrules=true
+// resolves the rule through SearchSysCache2(RULERELNAME, view_oid, "_RETURN")
+// and FATALs with "cache lookup failed for rule …" if the row is absent, so
+// every rel row above owes exactly one entry here.
+//
+// Only the OIDs and the ev_class link vary: an ON-SELECT view rule is always
+// _RETURN / CMD_SELECT ('1') / ALWAYS ('O') / INSTEAD, with an empty ev_qual
+// ("<>"). The ev_action body is read from the embedded capture by view name
+// (nailed_view_ev_action.go), which is why adding a view needs no //go:embed
+// line.
+func nailedViewRewriteEntries() []pgRewriteEntry {
+	return []pgRewriteEntry{
+		{
+			OID:       12234,
+			RuleName:  "_RETURN",
+			EvClass:   12231, // pg_stat_replication
+			EvType:    '1',
+			EvEnabled: 'O',
+			IsInstead: true,
+			EvQual:    "<>",
+			EvAction:  nailedViewEvAction("pg_stat_replication"),
+		},
+		{
+			OID:       12243,
+			RuleName:  "_RETURN",
+			EvClass:   12240, // pg_stat_wal_receiver
+			EvType:    '1',
+			EvEnabled: 'O',
+			IsInstead: true,
+			EvQual:    "<>",
+			EvAction:  nailedViewEvAction("pg_stat_wal_receiver"),
+		},
+		{
+			OID:       12247,
+			RuleName:  "_RETURN",
+			EvClass:   12244, // pg_stat_recovery_prefetch
+			EvType:    '1',
+			EvEnabled: 'O',
+			IsInstead: true,
+			EvQual:    "<>",
+			EvAction:  nailedViewEvAction("pg_stat_recovery_prefetch"),
+		},
+		{
+			OID:       12251,
+			RuleName:  "_RETURN",
+			EvClass:   12248, // pg_stat_subscription
+			EvType:    '1',
+			EvEnabled: 'O',
+			IsInstead: true,
+			EvQual:    "<>",
+			EvAction:  nailedViewEvAction("pg_stat_subscription"),
+		},
+		{
+			OID:       12264,
+			RuleName:  "_RETURN",
+			EvClass:   12261, // pg_replication_slots
+			EvType:    '1',
+			EvEnabled: 'O',
+			IsInstead: true,
+			EvQual:    "<>",
+			EvAction:  nailedViewEvAction("pg_replication_slots"),
+		},
+		{
+			OID:       12269,
+			RuleName:  "_RETURN",
+			EvClass:   12266, // pg_stat_replication_slots
+			EvType:    '1',
+			EvEnabled: 'O',
+			IsInstead: true,
+			EvQual:    "<>",
+			EvAction:  nailedViewEvAction("pg_stat_replication_slots"),
+		},
+	}
+}
