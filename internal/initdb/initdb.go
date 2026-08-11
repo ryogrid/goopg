@@ -34,6 +34,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/config"
+	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/storage"
@@ -43,36 +44,95 @@ import (
 // systemIdentifierFile is the path (relative to the data directory) where
 // the 8-byte cluster system identifier is stored. Matches PostgreSQL's
 // pg_control convention: a random uint64 generated at initdb time that
-// uniquely identifies the cluster. M0101-0001.
+// uniquely identifies the cluster. M0101-0001. Since M0131-S2 this is a
+// SECONDARY copy — pg_control's system_identifier is authoritative.
 const systemIdentifierFile = "global/system_identifier"
 
-// LoadOrCreateSystemID reads the cluster system identifier from
-// <dataDir>/global/system_identifier. If the file does not exist (e.g. for
-// clusters created by older goopg versions), it generates a new random uint64,
-// persists it, and returns it. This value is embedded in every PG-compatible
-// WAL page header so pg_waldump can cross-check segment consistency.
+// LoadOrCreateSystemID resolves the cluster system identifier, with
+// pg_control as the authoritative source. Resolution order (M0131-S2,
+// mirroring LoadOrCreateTimelineID in timeline.go):
+//
+//  1. global/pg_control's system_identifier (offset 0) — authoritative.
+//     This is what upstream assigns once at BootStrapXLOG
+//     (postgres/src/backend/access/transam/xlog.c:5099-5101) and the only
+//     copy PG itself keeps.
+//  2. the goopg-private global/system_identifier flat file — fallback when
+//     pg_control is absent or fails its CRC check (a fresh `goopg init`
+//     still in progress, or a cluster from an older goopg).
+//  3. a freshly generated random uint64 — a genuinely new cluster.
+//
+// The flat file is always (re)written from the resolved value, so a
+// directory PostgreSQL's initdb created adopts *its* identity instead of
+// having goopg invent a second, disagreeing one. A disagreement between
+// the two copies is only reachable via a crash between the two writes or a
+// hand-edited directory, so it is logged before pg_control wins.
+//
+// This value is embedded in every PG-compatible WAL page header as
+// xlp_sysid — upstream's reader rejects a segment whose xlp_sysid differs
+// from its own control file (xlogreader.c:1282-1286) — and is reported by
+// IDENTIFY_SYSTEM and BASE_BACKUP.
 func LoadOrCreateSystemID(dataDir string) (uint64, error) {
 	path := filepath.Join(dataDir, systemIdentifierFile)
-	data, err := os.ReadFile(path)
-	if err == nil {
-		if len(data) != 8 {
-			return 0, fmt.Errorf("goopg: system_identifier: unexpected length %d", len(data))
+	flatID, flatErr := readSystemIDFile(dataDir)
+
+	// 1. pg_control wins whenever it is present and passes its CRC check.
+	// ReadControlFile returns (nil, nil) for an absent file and an error on
+	// a CRC mismatch, so a corrupt control file falls through to the flat
+	// file rather than poisoning the cluster identity.
+	if cd, ctrlErr := control.ReadControlFile(dataDir); ctrlErr == nil && cd != nil && cd.SystemIdentifier != 0 {
+		if flatErr != nil || flatID != cd.SystemIdentifier {
+			if flatErr == nil {
+				log.Printf("goopg: WARNING: global/system_identifier (%d) disagrees with pg_control (%d); pg_control wins",
+					flatID, cd.SystemIdentifier)
+			}
+			if err := writeSystemIDFile(path, cd.SystemIdentifier); err != nil {
+				return 0, err
+			}
 		}
-		return binary.LittleEndian.Uint64(data), nil
+		return cd.SystemIdentifier, nil
 	}
-	if !errors.Is(err, os.ErrNotExist) {
-		return 0, fmt.Errorf("goopg: read system_identifier: %w", err)
+
+	// 2. pg_control absent or unreadable: fall back to the flat file.
+	if flatErr == nil {
+		return flatID, nil
 	}
-	// Generate a new random system identifier.
+	if !errors.Is(flatErr, os.ErrNotExist) {
+		return 0, flatErr
+	}
+
+	// 3. Neither exists: generate a new random system identifier.
 	var buf [8]byte
 	if _, err := rand.Read(buf[:]); err != nil {
 		return 0, fmt.Errorf("goopg: generate system_identifier: %w", err)
 	}
 	id := binary.LittleEndian.Uint64(buf[:])
-	if err := os.WriteFile(path, buf[:], 0o600); err != nil {
-		return 0, fmt.Errorf("goopg: write system_identifier: %w", err)
+	if err := writeSystemIDFile(path, id); err != nil {
+		return 0, err
 	}
 	return id, nil
+}
+
+// readSystemIDFile reads the goopg-private global/system_identifier flat
+// file. Returns a wrapped os.ErrNotExist when the file is absent.
+func readSystemIDFile(dataDir string) (uint64, error) {
+	data, err := os.ReadFile(filepath.Join(dataDir, systemIdentifierFile))
+	if err != nil {
+		return 0, fmt.Errorf("goopg: read system_identifier: %w", err)
+	}
+	if len(data) != 8 {
+		return 0, fmt.Errorf("goopg: system_identifier: unexpected length %d", len(data))
+	}
+	return binary.LittleEndian.Uint64(data), nil
+}
+
+// writeSystemIDFile persists id (little-endian, 8 bytes) to path.
+func writeSystemIDFile(path string, id uint64) error {
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], id)
+	if err := os.WriteFile(path, buf[:], 0o600); err != nil {
+		return fmt.Errorf("goopg: write system_identifier: %w", err)
+	}
+	return nil
 }
 
 // CatalogVersion is the value written into the data directory's

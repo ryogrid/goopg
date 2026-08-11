@@ -1,6 +1,6 @@
 # `LoadOrCreateSystemID` reads pg_control first — stop inventing a system identifier on a PG-authored directory
 
-**Status:** draft
+**Status:** accepted (landed 2026-08-11, M0131-S2)
 **Date:** 2026-08-11
 **Milestone:** M0131 (S2)
 
@@ -144,3 +144,29 @@ not repair a directory goopg has already written a divergent identity into.
 - `postgres/src/backend/access/transam/xlogreader.c:1282-1286` — reader rejects a mismatched `xlp_sysid`
 - `docs/design/0131-bidirectional-cluster-dir-coldstart-and-system-views.md` §S2
 - `docs/design/0130-0008-multi-timeline-streaming-and-timeline-reconciliation.md` — the timeline precedent
+
+## Outcome (landed 2026-08-11)
+
+Implemented as designed, with no deviation from the three-way resolution order.
+
+- `internal/control/pgcontrol.go`: `ControlFileData.SystemIdentifier uint64`
+  decoded from `buf[0:8]`. **Decode-only** — `encodeControlFileData` deliberately
+  does not write it back, so `UpdateControlFile`'s read-mutate-write cycle
+  preserves the original bytes and a caller that leaves the field zero cannot
+  clobber the cluster identity.
+- `internal/initdb/initdb.go`: `LoadOrCreateSystemID` restructured to
+  pg_control → flat file → random, with the flat file (re)written from the
+  resolved value and a WARNING log on the disagreement case. Split out
+  `readSystemIDFile` / `writeSystemIDFile` so the flat-file access mirrors
+  `readTimelineIDFile` / `WriteTimelineID`.
+- The `Init` ordering assumption was re-verified rather than assumed:
+  `LoadOrCreateSystemID` at `initdb.go:1250` still precedes the only
+  init-sequence pg_control writer, `writePgControl` at `:1264`, so a fresh
+  `goopg init` still falls through to random generation unchanged.
+
+Guards 1-5 landed as `internal/initdb/systemid_pgcontrol_test.go`
+(`TestLoadOrCreateSystemID_AdoptsPgControl`, `…_PgControlWinsOnDisagreement`,
+`…_FreshCluster`, `…_CorruptPgControlFallsBack`,
+`TestInitSystemIDMatchesPgControlAndBootstrapWAL` — the last asserting the flat
+file, pg_control offset 0, and the bootstrap segment's `xlp_sysid` at bytes
+24:32 all agree).

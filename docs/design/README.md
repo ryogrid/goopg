@@ -1059,7 +1059,7 @@ Append new rows in numeric order. Do not reorder.
 
 | 0131 | [Bidirectional cluster-directory cold-start + real-PG system-view hosting — implementation plan (M0131)](0131-bidirectional-cluster-dir-coldstart-and-system-views.md) | planned |
 | 0131-0001 | [GUC registry accepts a PG-18-initdb postgresql.conf (10 unregistered settings)](0131-0001-guc-registry-pg-initdb-conf-compat.md) | accepted |
-| 0131-0002 | [system_identifier reads pg_control before inventing an ID (sibling of the M0130-S8.1 timeline fix)](0131-0002-system-identifier-pgcontrol-fallback.md) | draft |
+| 0131-0002 | [system_identifier reads pg_control before inventing an ID (sibling of the M0130-S8.1 timeline fix)](0131-0002-system-identifier-pgcontrol-fallback.md) | accepted |
 | 0131-0003 | [Reverse cold-start E2E — real initdb → PG workload → clean stop → goopg serves the directory](0131-0003-reverse-coldstart-e2e.md) | draft |
 | 0131-0004 | [Forward cold-start E2E — goopg init → goopg workload → clean stop → real PG serves the directory](0131-0004-forward-coldstart-e2e.md) | draft |
 | 0131-0005 | [Runtime pg_rewrite index maintenance (2692 + 2693) — the real cause of "a hosted PG cannot evaluate a user view"](0131-0005-pg-rewrite-runtime-index-maintenance.md) | draft |
