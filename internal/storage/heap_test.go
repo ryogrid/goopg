@@ -883,3 +883,16 @@ func TestParseHeapTupleRejectsCorruptInput(t *testing.T) {
 		t.Error("expected error for hoff < SizeOfHeapTupleHeaderData")
 	}
 }
+
+// TestMaxHeapTuplesPerPagePGParity pins the constant to PG's macro value for an
+// 8 KiB page (htup_details.h:629 — (8192-24)/(MAXALIGN(23)+4) = 291). It is the
+// bound every HOT/CTID chain walker uses, so a silent drift here would resurrect
+// M0131-S32 (versions past the bound unreachable through the index).
+func TestMaxHeapTuplesPerPagePGParity(t *testing.T) {
+	if BlockSize != 8192 {
+		t.Skipf("PG reference value 291 assumes BLCKSZ=8192, got %d", BlockSize)
+	}
+	if MaxHeapTuplesPerPage != 291 {
+		t.Errorf("MaxHeapTuplesPerPage=%d, want 291 (PG MaxHeapTuplesPerPage for BLCKSZ=8192)", MaxHeapTuplesPerPage)
+	}
+}

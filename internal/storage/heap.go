@@ -16,6 +16,21 @@ const (
 	// DefaultHeapTupleHoff is the aligned tuple data offset used by v0
 	// tuples without null bitmap/OID.
 	DefaultHeapTupleHoff = 24
+
+	// MaxHeapTuplesPerPage is the upper bound on the number of line pointers
+	// a heap page can hold, mirroring PG's macro of the same name
+	// (postgres/src/include/access/htup_details.h:629): every tuple must be
+	// maxaligned and carry one line pointer. 291 for an 8 KiB page.
+	//
+	// It is also the only correct bound for a HOT/CTID chain walk: a chain
+	// visits distinct slots on one page, so a walk that has taken more than
+	// MaxHeapTuplesPerPage steps has provably hit a cycle. Chain walkers used
+	// an arbitrary 64 until M0131-S32, which silently made the 65th version of
+	// a row unreachable through the index (docs/design/0131-0025).
+	// MAXALIGN(SizeofHeapTupleHeader) is spelled out arithmetically because Go
+	// const initialisers cannot call a helper: (23+7)/8*8 = 24.
+	MaxHeapTuplesPerPage = (BlockSize - SizeOfPageHeaderData) /
+		((SizeOfHeapTupleHeaderData+7)/8*8 + itemIDSize)
 )
 
 var (

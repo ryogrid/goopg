@@ -1,57 +1,53 @@
-Task: M0131-S30.8 control run — VALIDATED; surfaced and filed **M0131-S32**, a
-new highest-severity wrong-answer defect. No engine code changed this loop.
+Task: M0131-S32 — FIXED and committed. Successor filed: **M0131-S32.1**.
 
-**Read `docs/design/0131-0025-single-row-update-stall.md` before touching S30/S32.**
+Root cause (loop #144): every HOT/CTID chain walker capped its loop at a
+hand-written `const maxChain = 64`, so version 65 of a repeatedly-HOT-updated
+row was unreachable. The index scan driving `UPDATE … WHERE id=1` then found no
+live tuple, wrote NOTHING, and still reported `UPDATE 1`. The "S31
+index-unreachable" symptom in the same repro was a CONSEQUENCE of the same
+truncation, not a second defect, and `pruneChainTip`'s identical cap is why the
+page looked permanently full.
 
-Result of loop #143, in order:
+Fix: new PG-faithful `storage.MaxHeapTuplesPerPage` (291 at 8 KiB — the exact
+bound, since a HOT chain visits distinct slots of ONE page) for the four
+single-page walkers; explicit `maxCTIDChainWalk = 1<<20` corruption backstop for
+the two CROSS-page t_ctid walkers (PG's `heap_get_latest_tid` is uncapped).
 
-1. The no-crash CONTROL loop #142 said had never been run correctly is now a
-   committed harness (`analysis/atomicity-nocrash-control.sh`). It **PASSES 2/2**:
-   `sum(abalance) == sum(delta)` exact, LIVE and after a clean stop+restart, with
-   `count(*) from pgbench_history` matching pgbench's own transaction count.
-   So the invariant is valid and **S30.8's premise SURVIVES** — `RUNS=2
-   crashprobe30` still FAILs 2/2 at the same HEAD (31384 != 44061;
-   -157231 != -165901), i.e. the failure really does require a crash.
-2. Localised that crash failure on the preserved `/tmp/crashprobe30/run1` using
-   `pgbench_history` as per-row ground truth: the 12677 gap decomposes EXACTLY as
-   1 account off its own history sum by 568 + **11 accounts with non-zero
-   `abalance` and NO history row** (-12109). That is the REVERSE of S30.8's filed
-   direction — the accounts UPDATE survived and the history INSERT did not (or an
-   in-flight txn's update is visible when it should be aborted, i.e. S30.7's
-   `MarkUnknownAsAborted` arm is incomplete). Note goopg has no `xmin` system
-   column, so XIDs could not be read back from SQL.
-3. While checking whether tellers/branches were usable signals, found they
-   diverge on the CLEAN control too (-90351 / -182750 vs -54526). Reduced that to
-   **M0131-S32**: ONE session, 300 autocommit `UPDATE t SET v=v+1 WHERE id=1`
-   drives `v` to exactly 64 and it then freezes forever, while every remaining
-   statement reports `UPDATE 1` and commits. No concurrency, no crash, no error.
-   The S31 index-unreachable signature reappears alongside it (`WHERE id=1`
-   returns nothing; `WHERE id+0=1` returns the stale row).
+Files: `internal/storage/heap.go` (const + parity test), `internal/storage/prune.go`,
+`internal/executor/operators_index.go`, `internal/executor/operators_storage.go`,
+`internal/executor/hot_update_test.go` (new `TestHOTUpdateChainBeyond64Versions`),
+`internal/storage/heap_test.go`, `analysis/atomicity-nocrash-control.sh`
+(now asserts tellers/branches), `docs/design/0131-0025-single-row-update-stall.md`,
+`docs/design/README.md`, `.ralph/fix_plan.md`, `.ralph/deferral_ledger.md`.
 
-Files: `analysis/atomicity-nocrash-control.sh` (NEW control),
-`analysis/hotstall.sh` (NEW minimal S32 repro, gate `OVERALL: PASS`),
-`docs/design/0131-0025-single-row-update-stall.md`, `docs/design/README.md`,
-`.ralph/fix_plan.md` (S32 filed; S30.8 control result appended),
-`.ralph/deferral_ledger.md`.
+Next step: work **M0131-S32.1** — the concurrent arm, still wrong in BOTH
+directions with the S32 fix in place (16 clients, scale 5, no crash:
+`sum(delta) = -31482`, `sum(abalance)` exact, `sum(tbalance) = -14938`
+under-applied, `sum(bbalance) = -309543` ~10x OVER-applied, identical LIVE and
+after a clean restart). Gate: `RUNS=1 LOADSEC=30 bash
+analysis/atomicity-nocrash-control.sh` (its header records `OVERALL: FAIL` as
+the KNOWN state — read the per-table lines). Start at the duplicate-live-index-
+entry path for the over-application: `internal/executor/operators_storage.go:4244`,
+whose AI-20260810-011258-006 guard dedupes only WITHIN one statement's `pending`
+set. Tellers' under-application has the opposite sign — measure the two tables
+separately before assuming one cause. Second, independent follow-up in the
+ledger: an UPDATE's reported row count still comes from the planned row set, not
+from rows actually written.
 
-Key symbols (for the NEXT loop, none edited yet): `tryApplyHOTUpdate`
-(`internal/executor/operators_storage.go:3555`), its `oldItem.Flags !=
-storage.ItemIDNormal` skip return (`:3625`, stale comment), the `!used` fallback
-EPQ loop (`:4328`), `isConcurrentlyUpdated` (`:3180`).
+Ruled out for S32, do not re-test: `tryApplyHOTUpdate`'s under-lock
+`isConcurrentlyUpdated` re-check, `isConcurrentlyUpdated` itself, the `!used`
+EPQ fallback, and the page-capacity hypothesis — the cause was the walk bound.
 
-Ruled out for S32, do not re-test: all three concurrency guards above — they
-cannot fire with one client.
-
-Next step: work **M0131-S32**. Put an unconditional counter on every
-`used == false` return of `tryApplyHOTUpdate` and on entry to the `!used`
-fallback, run `bash analysis/hotstall.sh`, and see which arm handles updates 65+.
-Independently, the statement reports `UPDATE 1` while writing nothing — the row
-count comes from the planned row set, not from rows written.
-
-Gates run: `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS
-(cached); `make ralph-state-guard` PASS (auto-repaired the previous loop's
-completed marker); commit-hook pgbench smoke PASS; new control PASS 2/2;
-`crashprobe30` FAIL 2/2 as expected; `analysis/hotstall.sh` reproduces.
+Gates run: `analysis/hotstall.sh` PASS at N=300 AND N=2000 (was FAIL at 64);
+`TestHOTUpdateChainBeyond64Versions` PASS, and confirmed it FAILs at exactly
+"after update 65: v=64" with the bound put back to 64;
+`TestMaxHeapTuplesPerPagePGParity` PASS; `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh` PASS (executor+storage rerun, rest cached);
+`scripts/tpch-spotcheck.sh` RESULT=PASS (Q12=2, Q13=35); commit-hook pgbench
+smoke PASS; `make ralph-state-guard` PASS (auto-repaired the stale completed
+marker). NOT run: TPC-DS SF0.5 gate (~1 h) — the change is a chain-walk bound
+with a deterministic repro plus the spotcheck; run it next loop if S32.1 work
+touches the same paths.
 
 Nightly triage: `ci/logs/action-items.md` still run `20260811-014635`
 (AI-…-001..012) — all 12 already filed under M-NIGHTLY; nothing new to file.

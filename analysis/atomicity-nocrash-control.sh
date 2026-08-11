@@ -30,6 +30,15 @@
 # waited for, and the wait is verified by parsing pgbench's completion line
 # before any query runs.  A partially-loaded table must never be measurable.
 #
+# CURRENT EXPECTED RESULT (2026-08-12, after the M0131-S32 chain-walk fix):
+# the accounts/history arm PASSES, and the tellers/branches arm added on
+# 2026-08-12 FAILS — under 16 clients the two narrow tables both diverge from
+# sum(delta), in BOTH directions (one under-applied, one ~10x over-applied).
+# That is the still-open concurrent half of S32, filed as M0131-S32.1; the
+# single-client half is fixed and guarded by analysis/hotstall.sh and
+# TestHOTUpdateChainBeyond64Versions. So `OVERALL: FAIL` here is the KNOWN
+# state, not a fresh regression — read the per-table lines, not just the verdict.
+#
 # Usage: RUNS=2 bash analysis/atomicity-nocrash-control.sh
 set -u
 REPO=/home/ryo/work/goopg/goopg
@@ -49,18 +58,30 @@ q() { psql -h 127.0.0.1 -p $PORT -U postgres -d postgres -Atc "$1" 2>&1; }
 measure() {
     local label=$1
     read -r N DISTINCT MN MX <<<"$(q "select count(*)||' '||count(distinct aid)||' '||min(aid)||' '||max(aid) from pgbench_accounts")"
-    local ABAL DELTA HN IDXN
+    local ABAL DELTA HN IDXN TBAL BBAL
     ABAL=$(q "select coalesce(sum(abalance),0) from pgbench_accounts")
     DELTA=$(q "select coalesce(sum(delta),0) from pgbench_history")
     HN=$(q "select count(*) from pgbench_history")
     IDXN=$(q "select count(*) from pgbench_accounts where aid between 1 and $ROWS")
+    # M0131-S32: TPC-B updates accounts, tellers AND branches by the same
+    # :delta in one transaction, so all three sums must equal sum(delta).
+    # Only accounts was checked until 2026-08-12, and it is the one table too
+    # wide (500k rows at scale 5) to hit the defect — tellers (50 rows) and
+    # branches (5 rows) update the SAME row thousands of times, which is
+    # exactly what the truncated 64-version chain walk broke. These two are
+    # therefore the sensitive arm of this control, not redundant with accounts.
+    TBAL=$(q "select coalesce(sum(tbalance),0) from pgbench_tellers")
+    BBAL=$(q "select coalesce(sum(bbalance),0) from pgbench_branches")
     echo "  [$label] count=$N distinct=$DISTINCT min=$MN max=$MX idx_count=$IDXN"
     echo "  [$label] sum(abalance)=$ABAL sum(history.delta)=$DELTA history_rows=$HN (pgbench processed=$PROCESSED)"
+    echo "  [$label] sum(tbalance)=$TBAL sum(bbalance)=$BBAL"
     local bad=0
     [ "$N" = "$ROWS" ] || { echo "  FAIL[$label]: count(*)=$N want $ROWS"; bad=1; }
     [ "$DISTINCT" = "$ROWS" ] || { echo "  FAIL[$label]: count(distinct aid)=$DISTINCT want $ROWS"; bad=1; }
     [ "$IDXN" = "$ROWS" ] || { echo "  FAIL[$label]: index-driven count=$IDXN want $ROWS"; bad=1; }
     [ "$ABAL" = "$DELTA" ] || { echo "  FAIL[$label]: ATOMICITY sum(abalance)=$ABAL != sum(delta)=$DELTA"; bad=1; }
+    [ "$TBAL" = "$DELTA" ] || { echo "  FAIL[$label]: ATOMICITY sum(tbalance)=$TBAL != sum(delta)=$DELTA"; bad=1; }
+    [ "$BBAL" = "$DELTA" ] || { echo "  FAIL[$label]: ATOMICITY sum(bbalance)=$BBAL != sum(delta)=$DELTA"; bad=1; }
     [ "$HN" = "$PROCESSED" ] || { echo "  FAIL[$label]: history_rows=$HN != pgbench processed=$PROCESSED"; bad=1; }
     return $bad
 }

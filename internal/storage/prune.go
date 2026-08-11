@@ -238,7 +238,12 @@ func pagePruneCore(p Page, oldestXmin TransactionID) (PruneResult, int, error) {
 // the slot of the first tuple that is NOT dead (the live chain tip).
 // Returns 0 when the entire chain is dead or the chain exceeds the depth limit.
 func pruneChainTip(p Page, startSlot uint16, isDead func(HeapTupleHeader) bool) uint16 {
-	const maxChain = 64
+	// A chain lives on one page, so MaxHeapTuplesPerPage is the tightest
+	// correct cycle guard; PG's heap_prune_chain sizes its chainitems[] array
+	// by exactly this bound. The arbitrary 64 used here until M0131-S32 made
+	// long chains unprunable, which is what kept the page permanently full
+	// (docs/design/0131-0025).
+	const maxChain = MaxHeapTuplesPerPage
 	cur := startSlot
 	for i := 0; i < maxChain; i++ {
 		item, err := readItemID(p, int(cur)-1)

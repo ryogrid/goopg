@@ -308,3 +308,56 @@ func TestFollowHOTChainDirect(t *testing.T) {
 		t.Errorf("direct hit on slot 2 failed: slot=%d infomask=0x%04x", slot2, got2.Header.Infomask)
 	}
 }
+
+// TestHOTUpdateChainBeyond64Versions is the M0131-S32 regression guard: a HOT
+// chain longer than 64 versions must stay reachable through the index.
+//
+// Every chain walker used an arbitrary `maxChain = 64`, so version 65 of a
+// repeatedly-HOT-updated row became invisible to the index scan while a seq
+// scan still returned version 64. Because the UPDATE's row count comes from the
+// planned row set, each subsequent statement still reported `UPDATE 1` and
+// committed — one client, one row, no crash, no error, and a silently wrong
+// value (docs/design/0131-0025). The correct bound is
+// storage.MaxHeapTuplesPerPage: a chain visits distinct slots of ONE page.
+//
+// 120 updates is comfortably past 64 and below the 291-slot page limit, so the
+// whole chain stays on one page and no non-HOT fallback masks the defect.
+func TestHOTUpdateChainBeyond64Versions(t *testing.T) {
+	ctx, _, cleanup := newHOTFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (id int, v bigint)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO t VALUES (1, 0)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runDDL(t, ctx, "CREATE INDEX t_idx ON t (id)"); err != nil {
+		t.Fatal(err)
+	}
+
+	const updates = 120
+	for i := 1; i <= updates; i++ {
+		if err := runDDL(t, ctx, "UPDATE t SET v = v + 1 WHERE id = 1"); err != nil {
+			t.Fatalf("update %d: %v", i, err)
+		}
+		// Read back through the index after every update: the defect froze the
+		// value silently, so only a per-step check identifies the exact
+		// version at which the chain became unreachable.
+		rows := runQuery(t, ctx, "SELECT v FROM t WHERE id = 1")
+		if len(rows) != 1 {
+			t.Fatalf("after update %d: index scan returned %d rows, want 1"+
+				" (chain walk truncated — see docs/design/0131-0025)", i, len(rows))
+		}
+		if got := rows[0][0].Int; got != int64(i) {
+			t.Fatalf("after update %d: v=%d, want %d (committed update silently not applied)", i, got, i)
+		}
+	}
+
+	// A seq scan must agree with the index scan — the original symptom was the
+	// two disagreeing (index returned nothing, seq returned the stale row).
+	seq := runQuery(t, ctx, "SELECT v FROM t WHERE id + 0 = 1")
+	if len(seq) != 1 || seq[0][0].Int != int64(updates) {
+		t.Fatalf("seq scan disagrees with index scan: %+v, want v=%d", seq, updates)
+	}
+}

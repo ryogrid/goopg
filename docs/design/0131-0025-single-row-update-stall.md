@@ -1,6 +1,79 @@
 # 0131-0025 — a single-session UPDATE loop on one row silently stops applying after 64 updates
 
-Status: **diagnosed, unfixed** (M0131-S32). Filed 2026-08-12 (loop #143).
+Status: **root-caused and FIXED for the single-session case** (M0131-S32);
+the concurrent case is a distinct, still-open defect (M0131-S32.1).
+Filed 2026-08-12 (loop #143), fixed 2026-08-12 (loop #144).
+
+## Root cause (loop #144)
+
+Every HOT/CTID chain walker in goopg bounded its loop with a hand-written
+`const maxChain = 64`:
+
+| site | function |
+|---|---|
+| `internal/executor/operators_index.go` | `followHOTChain`, `followHOTChainNoCopy`, `heapChainDeadToAll` |
+| `internal/executor/operators_storage.go` | `epqChainCheckMovedPartition`, `epqFollowChainFull` |
+| `internal/storage/prune.go` | `pruneChainTip` |
+
+A HOT chain grows by one version per HOT update, so the 65th version of a
+repeatedly-updated row sits at chain depth 65 and `followHOTChain` gave up
+before reaching it, returning `found == false`. Consequences, all silent:
+
+- The index scan driving `UPDATE … WHERE id = 1` found no live tuple, so the
+  statement's `pending` set was empty and it wrote **nothing** — while still
+  reporting `UPDATE 1`, because the row count comes from the planned row set.
+- `SELECT … WHERE id = 1` (index) returned nothing; `WHERE id+0 = 1` (seq scan)
+  still returned version 64, whose `xmax` was never stamped since no update was
+  ever applied. That is the "index-unreachable row" symptom this doc first
+  attributed to S31 — here it is a *consequence* of the same truncation, not a
+  second defect.
+- `pruneChainTip` gave up at the same depth, so the dead versions were never
+  reclaimed and the page stayed full — which is why the boundary looked like a
+  page-capacity edge.
+
+Nothing in PG behaves this way: `heap_hot_search_buffer` loops until
+`at_chain_end` with no step cap, and `heap_prune_chain` sizes its `chainitems[]`
+array by `MaxHeapTuplesPerPage` (291 for an 8 KiB page) — the real bound, since
+a HOT chain visits *distinct slots of one page*, so exceeding it proves a cycle.
+
+## Fix
+
+- New `storage.MaxHeapTuplesPerPage` (`internal/storage/heap.go`), the
+  PG-faithful `(BLCKSZ - SizeOfPageHeaderData) / (MAXALIGN(SizeofHeapTupleHeader)
+  + sizeof(ItemIdData))` = 291, pinned to PG's value by
+  `TestMaxHeapTuplesPerPagePGParity`.
+- All four single-page walkers (`followHOTChain`, `followHOTChainNoCopy`,
+  `heapChainDeadToAll`, `pruneChainTip`) now bound by it.
+- The two **cross-page** t_ctid walkers (`epqChainCheckMovedPartition`,
+  `epqFollowChainFull`) span pages, so no per-page bound applies; they use
+  `maxCTIDChainWalk = 1<<20`, an explicit corruption backstop mirroring PG's
+  uncapped `heap_get_latest_tid` loop.
+
+Verification: `analysis/hotstall.sh` reports `OVERALL: PASS` at N=300 **and at
+N=2000** (2000 sequential updates on one row, index read == seq read == 2000);
+`TestHOTUpdateChainBeyond64Versions` (`internal/executor/hot_update_test.go`)
+reads the value back through the index after every one of 120 updates, and fails
+at exactly "after update 65: v=64" when the bound is put back to 64.
+
+## Still open: M0131-S32.1 (the concurrent arm)
+
+`analysis/atomicity-nocrash-control.sh` was extended this loop to assert
+`sum(tbalance)` and `sum(bbalance)` against `sum(delta)` — the arm that first
+exposed S32 (§2 below) and the sensitive one, since 50 tellers / 5 branches
+means the same row is updated thousands of times. With the chain-walk fix in
+place, scale 5 / 16 clients / 30 s still fails, LIVE and after a clean restart:
+
+| table | sum | vs sum(delta) = -31482 |
+|---|---|---|
+| `pgbench_accounts.abalance` | -31482 | exact |
+| `pgbench_tellers.tbalance` | -14938 | under-applied |
+| `pgbench_branches.bbalance` | -309543 | ~10× **over**-applied |
+
+Both directions are wrong, so this is not the same truncation: it is a
+concurrent hot-row update defect (over-application points at the
+duplicate-index-entry path guarded by AI-20260810-011258-006, which dedupes
+only *within* one statement). The script's header records that `OVERALL: FAIL`
+is the known state there.
 
 Related: [`0131-0019`](0131-0019-index-entry-loss-on-update.md) (the HOT-chain
 prune/redirect defect, S31), [`0131-0020`](0131-0020-crash-recovery-row-loss-confirmed.md)

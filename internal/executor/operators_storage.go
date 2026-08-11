@@ -495,6 +495,17 @@ func epqSlotMovedToAnotherPartition(ctx *Context, rel storage.RelFileNode,
 	return storage.IsMovedToAnotherPartition(tup.Header.CTID)
 }
 
+// maxCTIDChainWalk bounds the CROSS-page t_ctid chain walks below. Unlike a
+// HOT chain (one page, so storage.MaxHeapTuplesPerPage is the exact bound), a
+// non-HOT update chain spans pages and has no structural length limit — PG's
+// equivalents (heap_get_latest_tid, heap_lock_updated_tuple_rec) loop with no
+// cap at all and rely on the chain being acyclic. This is therefore a pure
+// corruption backstop, deliberately far above any reachable chain length: the
+// arbitrary 64 it replaced (M0131-S32) silently truncated real chains, which
+// is a wrong answer, whereas an over-large backstop costs only time on an
+// already-corrupt page.
+const maxCTIDChainWalk = 1 << 20
+
 // epqChainCheckMovedPartition walks the UPDATE chain starting at (rel, blk,
 // slot) via t_ctid and reports whether any tuple in the chain carries the
 // moved-to-another-partition sentinel.  Unlike `epqSlotMovedToAnotherPartition`
@@ -513,7 +524,7 @@ func epqChainCheckMovedPartition(ctx *Context, rel storage.RelFileNode,
 	// Strategy 1 (fast path): walk the t_ctid chain.  PG always updates the
 	// old tuple's t_ctid to point to the new version on UPDATE; HOT
 	// in-partition updates in goopg do too (PageStampHotOldTuple).
-	const maxChain = 64
+	const maxChain = maxCTIDChainWalk
 	curBlk, curSlot := blk, slot
 	for i := 0; i < maxChain; i++ {
 		s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: curBlk})
@@ -662,7 +673,7 @@ func isChainTailCTID(ctid storage.ItemPointer, curBlk storage.BlockNumber, curSl
 // correlated sub-plans run against the original snapshot (PG EvalPlanQual semantics).
 func epqFollowChainFull(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber,
 	slot uint16, cols []catalog.Column, pred planner.Expr, origSnap *mvcc.Snapshot) (relNode storage.RelFileNode, found epqChainResult, movedPart bool) {
-	const maxChain = 64
+	const maxChain = maxCTIDChainWalk
 	curBlk, curSlot := blk, slot
 	for i := 0; i < maxChain; i++ {
 		s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: curBlk})
