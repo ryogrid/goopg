@@ -1,21 +1,43 @@
 (idle — nothing in flight)
 
-Last loop (#118) landed **M0131-S9.0**, the tooling precondition for S9's
-corpus widening. Committed; fix_plan's S9 entry records it, S9 itself stays `[ ]`.
+Loop #120 landed **M0131-S9.1b**: the on-disk system-view corpus is **30 views**
+(`pg_stat_bgwriter` 12293, `pg_stat_checkpointer` 12297 added), both evaluate on
+a real PG 18.3 hosted on a goopg `$PGDATA`, and design 0131-0009's guard #2 now
+has BOTH halves. One capture run + one generator run, zero hand-edits.
 
-Two of the three hand-edits S7.4 ledgered are now closed — the `pg_rewrite`
-`_RETURN` seed rows are generated from the manifest's `rule_oid`, and the
-per-view `//go:embed` lines are one glob into an `embed.FS`. Adding a view is
-now: `scripts/capture-ev-action.sh <view>` then
-`go run cmd/gen-nailed-view-tables/main.go > internal/initdb/nailed_view_seed_data.go`.
+Carry-forward for the next loop:
 
-**Next per the banner: M0131-S9.1** — capture the 23 SRF-only views listed in
-`docs/design/0131-0009-system-view-corpus-widening.md` §"S9.1". Two notes from
-that doc worth carrying: capture `pg_stat_bgwriter`/`pg_stat_checkpointer`
-**last** (they have no `FROM` at all — an unmeasured `RTE_RESULT` shape — so an
-unknown node tag surfaces against a two-view blast radius), and add the
-`MaxHeapTupleSize` (~8160 B) assertion to the capture script's blob emitter
-first, since `pg_rewrite`'s TOAST pair (2838/2839) is not bootstrapped and an
-overflowing capture would otherwise seed an unreadable row.
+- **Next per the banner: M0131-S12** — bulk-load `pg_opclass_am_name_nsp_index`
+  (2686) at initdb. It is the same failure shape as the `pg_amop` 2653 blocker
+  that keeps `pg_timezone_abbrevs` off disk and blocks EVERY future system view
+  with an `ORDER BY`, so landing it before S9.2 pays twice. Subtasks S12.1–S12.5
+  are spelled out in fix_plan; note S12.5 INVERTS
+  `assertEmptyOpclassIndexStillBlocksSorts`.
+- **`assertNonCorpusSystemViewIsStillAbsent` is fail-when-fixed on
+  `pg_catalog.pg_tables`** — the moment S9.2 adopts pg_tables that assertion
+  goes red on purpose; re-point it at the next un-adopted view, don't delete it.
+- **F4 correction worth remembering:** `RTE_RESULT` is a PLANNER construct and
+  never appears in `pg_rewrite.ev_action`. A FROM-less view serialises an empty
+  `:rtable`/`:fromlist`. The still-unmeasured shape is `LATERAL`
+  (`pg_statio_all_tables`, `pg_stats_ext`).
+- **F6, ledgered not fixed:** goopg's virtual `pg_stat_checkpointer`
+  (`internal/initdb/open.go:2625-2646`) omits `num_done`, adds `total_time`, and
+  types all 11 columns `text`. Same COUNT as upstream, different SET — a
+  count-only audit passes. Resume point is in the ledger row; a table-driven
+  `nailedViewSeedAttrs(name)` vs virtual-`Columns` test would audit the whole
+  corpus at once.
 
-Remaining unchecked M0131 tasks after S9: S12, S13, S14, S15, S8b.
+Procedure reminder for any corpus widening: add pins to
+`internal/initdb/system_view_oid_pins.go`, then
+`scripts/capture-ev-action.sh $(sed -n 's/^\t\t{"\([a-z_]*\)".*/\1/p'
+internal/initdb/system_view_oid_pins.go)` (the script REWRITES the whole
+manifest — always pass the FULL list), then
+`go run cmd/gen-nailed-view-tables/main.go > internal/initdb/nailed_view_seed_data.go`,
+then add the view to `nailedSystemViewProbeSet()` in
+`internal/testport/e2e_pg_coldstart_on_goopgdata_test.go`.
+
+Gates run this loop: `internal/initdb` PASS (64 s), `^TestE2E_` family PASS
+(100 s), `capture-ev-action.sh --verify` PASS (30/30 byte-identical), UNITS
+PASS, pgbench smoke via the commit hook, `make ralph-state-guard` OK.
+
+In-flight: none.

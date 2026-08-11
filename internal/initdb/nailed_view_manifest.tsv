@@ -237,6 +237,23 @@ attr	pg_stat_archiver	4	failed_count	20	8	f	f
 attr	pg_stat_archiver	5	last_failed_wal	25	-1	f	f
 attr	pg_stat_archiver	6	last_failed_time	1184	8	f	f
 attr	pg_stat_archiver	7	stats_reset	1184	8	f	f
+rel	pg_stat_bgwriter	12293	12293	12296	12295	2249	v	4
+attr	pg_stat_bgwriter	1	buffers_clean	20	8	f	f
+attr	pg_stat_bgwriter	2	maxwritten_clean	20	8	f	f
+attr	pg_stat_bgwriter	3	buffers_alloc	20	8	f	f
+attr	pg_stat_bgwriter	4	stats_reset	1184	8	f	f
+rel	pg_stat_checkpointer	12297	12297	12300	12299	2249	v	11
+attr	pg_stat_checkpointer	1	num_timed	20	8	f	f
+attr	pg_stat_checkpointer	2	num_requested	20	8	f	f
+attr	pg_stat_checkpointer	3	num_done	20	8	f	f
+attr	pg_stat_checkpointer	4	restartpoints_timed	20	8	f	f
+attr	pg_stat_checkpointer	5	restartpoints_req	20	8	f	f
+attr	pg_stat_checkpointer	6	restartpoints_done	20	8	f	f
+attr	pg_stat_checkpointer	7	write_time	701	8	f	f
+attr	pg_stat_checkpointer	8	sync_time	701	8	f	f
+attr	pg_stat_checkpointer	9	buffers_written	20	8	f	f
+attr	pg_stat_checkpointer	10	slru_written	20	8	f	f
+attr	pg_stat_checkpointer	11	stats_reset	1184	8	f	f
 rel	pg_stat_io	12301	12301	12304	12303	2249	v	20
 attr	pg_stat_io	1	backend_type	25	-1	f	f
 attr	pg_stat_io	2	object	25	-1	f	f

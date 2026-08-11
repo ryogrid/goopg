@@ -253,6 +253,7 @@ func TestE2E_PGColdStartOnGoopgDataDir(t *testing.T) {
 	assertSystemViewOIDsArePinnedToUpstream(t, pg)
 
 	assertNailedSystemViewsAreEvaluable(t, pg, goopgDir)
+	assertNonCorpusSystemViewIsStillAbsent(t, pg)
 
 	// Row-level reads over user tables. S4.4 originally carried no view
 	// assertion at all because a hosted PG could not evaluate ANY view on a
@@ -619,17 +620,20 @@ func assertProconfigGapStillCrashesSQLFunctions(t *testing.T, pg *pgcluster.Clus
 // systemViewOIDPins() table (which internal/testport cannot see anyway, and
 // which would make the check circular if it could).
 //
-// The first six are M0131-S8a's replication views; the remaining 23 are
+// The first six are M0131-S8a's replication views; the next 22 are
 // M0131-S9.1's SRF-only tranche — every one `FROM <set-returning function>`
 // with no catalog relation and no view dependency, hence zero in-band :relid
-// in its ev_action. Captured 2026-08-11 from a throwaway `initdb --no-sync`.
+// in its ev_action. M0131-S9.1b adds the last two, pg_stat_bgwriter (12293)
+// and pg_stat_checkpointer (12297): they have no FROM clause AT ALL
+// (system_views.sql:1150-1169), so their Query carries an RTE_RESULT — the
+// fifth RTE kind, which 0131-0009 §"Two unmeasured ev_action shapes" flagged
+// as never having been round-tripped through a hosted PG. Their presence in
+// THIS list is the measurement. Captured 2026-08-11 from a throwaway
+// `initdb --no-sync`.
 //
-// Deliberately absent: pg_stat_bgwriter (12293) and pg_stat_checkpointer
-// (12297), whose FROM-less Query carries an RTE_RESULT that no captured blob
-// exercises yet (0131-0009 §"Two unmeasured ev_action shapes"); and
-// pg_timezone_abbrevs (12122), whose ORDER BY needs a pg_amop row goopg does
-// not bootstrap ("operator 664 is not a valid ordering operator") — this probe
-// is what found that, and it is ledgered.
+// Deliberately absent: pg_timezone_abbrevs (12122), whose ORDER BY needs a
+// pg_amop row goopg does not bootstrap ("operator 664 is not a valid ordering
+// operator") — this probe is what found that, and it is ledgered.
 func nailedSystemViewProbeSet() []struct {
 	view string
 	oid  string
@@ -660,6 +664,8 @@ func nailedSystemViewProbeSet() []struct {
 		{"pg_catalog.pg_replication_slots", "12261"},
 		{"pg_catalog.pg_stat_replication_slots", "12266"},
 		{"pg_catalog.pg_stat_archiver", "12289"},
+		{"pg_catalog.pg_stat_bgwriter", "12293"},
+		{"pg_catalog.pg_stat_checkpointer", "12297"},
 		{"pg_catalog.pg_stat_io", "12301"},
 		{"pg_catalog.pg_stat_wal", "12305"},
 		{"pg_catalog.pg_stat_progress_basebackup", "12329"},
@@ -714,9 +720,10 @@ func assertSystemViewOIDsArePinnedToUpstream(t *testing.T, pg *pgcluster.Cluster
 func assertNailedSystemViewsAreEvaluable(t *testing.T, pg *pgcluster.Cluster, goopgDir string) {
 	t.Helper()
 	// M0131-S9.1 widened this from the six replication views to the whole
-	// on-disk corpus (nailedSystemViewProbeSet). The per-view Errorf is what
-	// makes that affordable: 29 independent blobs, and a bad tupledesc names
-	// its own view instead of forcing a bisect.
+	// on-disk corpus (nailedSystemViewProbeSet), and S9.1b added the
+	// RTE_RESULT pair. The per-view Errorf is what makes that affordable: 30
+	// independent blobs, and a bad tupledesc names its own view instead of
+	// forcing a bisect.
 	for _, tc := range nailedSystemViewProbeSet() {
 		view := tc.view
 		out, err := pgQueryScalarAllowError(pg, "SELECT * FROM "+view+" LIMIT 0")
@@ -731,6 +738,47 @@ func assertNailedSystemViewsAreEvaluable(t *testing.T, pg *pgcluster.Cluster, go
 				"RelationBuildRuleLock rejected it.\n--- PG log ---\n%s",
 				view, err, out, tailLines(string(logTail), 60))
 		}
+	}
+}
+
+// assertNonCorpusSystemViewIsStillAbsent mechanises the BEFORE half of design
+// 0131-0009's guard #2 (M0131-S9.1b).
+//
+// The evaluability probe above proves only an after-state: every view goopg
+// seeds on disk can be evaluated by a hosted PG. On its own that is compatible
+// with a world where PG resolves these names for some reason unrelated to
+// goopg's seeding — so the guard is only half a guard. The missing half is a
+// view that goopg has NOT adopted, which must fail with 42P01
+// (undefined_table), because goopg's ~118 system relations are catalog.Table
+// {Virtual:true} objects that never reach the pg_class heap
+// (internal/catalog/catalog.go:335-342, skipped at :7025-7034). Passing both
+// halves is what makes the corpus list, and not something ambient, the cause.
+//
+// pg_tables is the probe on purpose: it is the named head of the M0131-S9.2
+// tranche (views over real catalogs). When S9.2 lands this assertion FAILS —
+// invert it then by moving pg_tables into nailedSystemViewProbeSet() and
+// re-pointing this helper at whatever the next un-adopted view is. That is the
+// same fail-when-fixed discipline as the S12/S13 finding locks above.
+func assertNonCorpusSystemViewIsStillAbsent(t *testing.T, pg *pgcluster.Cluster) {
+	t.Helper()
+	const view = "pg_catalog.pg_tables"
+	out, err := pgQueryScalarAllowError(pg, "SELECT * FROM "+view+" LIMIT 0")
+	if err == nil {
+		t.Errorf("hosted PG evaluated %s, which is NOT in the on-disk corpus "+
+			"(nailedSystemViewProbeSet) — either M0131-S9.2 has landed (then add "+
+			"pg_tables to the corpus and re-point this probe at the next "+
+			"un-adopted view), or the evaluability probe above is passing for a "+
+			"reason unrelated to goopg's seeding. Output: %q", view, strings.TrimSpace(out))
+		return
+	}
+	// 42P01 specifically: "does not exist" is the virtual-relation gap. Any
+	// other error (42809 no-rules, a crash, a tupledesc elog) would mean the
+	// row IS on disk and something downstream rejected it, which is a
+	// different — and interesting — failure.
+	if !strings.Contains(out, "does not exist") {
+		t.Errorf("hosted PG rejected %s, but NOT with the expected 42P01 "+
+			"undefined_table — a non-corpus view is supposed to be missing from "+
+			"the pg_class heap entirely:\n%s", view, out)
 	}
 }
 
