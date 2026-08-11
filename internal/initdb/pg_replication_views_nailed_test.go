@@ -15,11 +15,15 @@ func TestNailedLocalRelsContainsFiveReplicationViews(t *testing.T) {
 		natts   int16
 		reltype uint32
 	}{
-		{12102, "pg_stat_replication", 20, 2249},
-		{12103, "pg_stat_recovery_prefetch", 10, 2249},
-		{12104, "pg_stat_subscription", 11, 2249},
-		{12105, "pg_replication_slots", 21, 2249},
-		{12106, "pg_stat_replication_slots", 10, 2249},
+		// OIDs PINNED to PG 18.3's initdb assignment by M0131-S8a (they
+		// were the goopg-private 12102..12106). Literals on purpose: this
+		// test is the lock-in, so it must not read the same constants the
+		// production table does.
+		{12231, "pg_stat_replication", 20, 2249},
+		{12244, "pg_stat_recovery_prefetch", 10, 2249},
+		{12248, "pg_stat_subscription", 11, 2249},
+		{12261, "pg_replication_slots", 21, 2249},
+		{12266, "pg_stat_replication_slots", 10, 2249},
 	}
 
 	for _, tc := range cases {
@@ -66,7 +70,7 @@ func TestNailedLocalRelsContainsFiveReplicationViews(t *testing.T) {
 }
 
 // TestPgStatReplicationViewAttrs pins the 20 column descriptors for
-// pg_catalog.pg_stat_replication (OID 12102, system_views.sql:906-930).
+// pg_catalog.pg_stat_replication (OID 12231, system_views.sql:906-930).
 func TestPgStatReplicationViewAttrs(t *testing.T) {
 	want := []struct {
 		Name    string
@@ -98,7 +102,7 @@ func TestPgStatReplicationViewAttrs(t *testing.T) {
 }
 
 // TestPgStatRecoveryPrefetchViewAttrs pins the 10 column descriptors for
-// pg_catalog.pg_stat_recovery_prefetch (OID 12103, system_views.sql:965-977).
+// pg_catalog.pg_stat_recovery_prefetch (OID 12244, system_views.sql:965-977).
 func TestPgStatRecoveryPrefetchViewAttrs(t *testing.T) {
 	want := []struct {
 		Name    string
@@ -120,7 +124,7 @@ func TestPgStatRecoveryPrefetchViewAttrs(t *testing.T) {
 }
 
 // TestPgStatSubscriptionViewAttrs pins the 11 column descriptors for
-// pg_catalog.pg_stat_subscription (OID 12104, system_views.sql:979-994).
+// pg_catalog.pg_stat_subscription (OID 12248, system_views.sql:979-994).
 func TestPgStatSubscriptionViewAttrs(t *testing.T) {
 	want := []struct {
 		Name    string
@@ -143,7 +147,7 @@ func TestPgStatSubscriptionViewAttrs(t *testing.T) {
 }
 
 // TestPgReplicationSlotsViewAttrs pins the 21 column descriptors for
-// pg_catalog.pg_replication_slots (OID 12105, system_views.sql:1019-1043).
+// pg_catalog.pg_replication_slots (OID 12261, system_views.sql:1019-1043).
 // PG18 adds two_phase_at/inactive_since/conflicting/invalidation_reason/
 // failover/synced as the final six entries.
 func TestPgReplicationSlotsViewAttrs(t *testing.T) {
@@ -178,7 +182,7 @@ func TestPgReplicationSlotsViewAttrs(t *testing.T) {
 }
 
 // TestPgStatReplicationSlotsViewAttrs pins the 10 column descriptors for
-// pg_catalog.pg_stat_replication_slots (OID 12106, system_views.sql:1045-1059).
+// pg_catalog.pg_stat_replication_slots (OID 12266, system_views.sql:1045-1059).
 func TestPgStatReplicationSlotsViewAttrs(t *testing.T) {
 	want := []struct {
 		Name    string

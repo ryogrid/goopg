@@ -1,8 +1,8 @@
 # System-view OID policy — pin to upstream, or rewrite every captured blob
 
-**Status:** draft
+**Status:** accepted (implemented 2026-08-11, M0131-S8a)
 **Date:** 2026-08-11
-**Milestone:** M0131 (S8)
+**Milestone:** M0131 (S8a)
 
 ## Problem
 
@@ -183,3 +183,99 @@ and the view OID moves `12105 → 12261` instead.
 - `internal/initdb/relcache_init.go:670-697`,
   `internal/initdb/pg_rewrite_bootstrap.go:15-70`,
   `internal/catalog/catalog.go:3604`
+
+## Findings (implementation, 2026-08-11 — M0131-S8a)
+
+Option A landed as recommended. Everything the design predicted about the
+mechanism held; three things it left open are now settled by measurement.
+
+**1. The oracle's assignment is deterministic — verified, not assumed.** Two
+independent throwaway `initdb --no-sync` runs of PG 18.3
+(`postgres/local_install/`) produced byte-identical assignments. Captured:
+
+| view | view OID | rule OID | upstream reltype | relnatts |
+|---|---|---|---|---|
+| `pg_stat_replication` | 12231 | 12234 | 12233 | 20 |
+| `pg_stat_wal_receiver` | 12240 | 12243 | 12242 | 15 |
+| `pg_stat_recovery_prefetch` | 12244 | 12247 | 12246 | 10 |
+| `pg_stat_subscription` | 12248 | 12251 | 12250 | 11 |
+| `pg_replication_slots` | **12261** | 12264 | 12263 | 21 |
+| `pg_stat_replication_slots` | 12266 | 12269 | 12268 | 10 |
+
+`pg_replication_slots = 12261` confirms the design's deduction from the blob's
+`eref` colnames exactly. Every `relnatts` matches goopg's nailed `RelNatts`, so
+the repin is an OID change only — no shape change.
+
+**2. The S6 landmine is disarmed by the policy itself, with no blob edit.**
+S6.1 offered "fix the blob (12261 → 12105) or repin per S8". Repinning
+`pg_replication_slots` to 12261 makes the verbatim
+`pg_stat_replication_slots_ev_action.dat` correct as-captured, so **S6.1 is
+discharged and should be struck rather than done** — there is no longer a blob
+to patch, and S6.2's invariant guard is implemented here (guard 3) rather than
+there. Proven non-vacuous: temporarily un-pinning the view to 12105 makes guard
+3 fail on exactly that blob's two `:relid 12261` occurrences.
+
+**3. The band ceiling, measured.** PG 18.3's initdb tops out at 13626 across
+every OID-bearing catalog in a fresh template (max over
+pg_class 13619 / pg_type 13621 / pg_rewrite 13622 / pg_proc 13626 /
+pg_constraint 13301 / pg_namespace 13273). `goopgOnlySystemViewOIDBase = 15000`
+is set from that number, leaving ~1.4k of headroom for PG minor-version growth
+below it. The design asked for "a reserved disjoint sub-band" without a value;
+this is it.
+
+**4. Reordering risk, checked and clear.** The repin breaks the old
+coincidence that declaration order equalled ascending-OID order (rule OIDs were
+12101, 12107…12111; they are now 12234, 12243, …, with `pg_stat_wal_receiver`
+declared first but no longer lowest). Every btree bootstrap in
+`internal/initdb/btree_index_bootstrap.go` sorts explicitly before building the
+leaf — all 20+ `bootstrap*Index` functions, including both pg_rewrite indexes
+(`:1620`, `:1683`) and both pg_class indexes (`:939`, `:1085`) — so no index
+leaf depends on declaration order. Had one not sorted, this change would have
+produced a mis-ordered on-disk btree that a hosted PG binary-searches.
+
+**5. The reload OID filter is unaffected.** `catalog_heap_reload.go`'s
+`evClass < catalog.FirstUserOID` test still skips all six bootstrap rules
+(12231..12266 < 16384); only its comment's OID range needed updating.
+
+**6. `reltype` is now a *recorded* divergence, not an unknown.** S6.5 asked to
+"probe, do not assume" whether upstream mints a per-view composite type: it
+does (12233, 12242, 12246, 12250, 12263, 12268), where goopg's nailed rows all
+carry 2249 RECORDOID. The captured values are in the pinned table and
+`TestNailedViewRelTypeDivergenceIsDeliberate` asserts RECORDOID is still the
+only divergence — adopting the composite OIDs requires real `pg_type` rows to
+back them, which is left to S6.5/S9 with a ledger row. **S6.5's probe is
+therefore answered; what remains under it is the implementation.**
+
+### Guards as implemented
+
+`internal/initdb/system_view_oid_pins_test.go`, 6 tests, all with
+non-vacuity assertions:
+
+| design guard | test |
+|---|---|
+| 1 nailed view OIDs match upstream | `TestNailedViewOIDsMatchUpstreamPins` (both directions: an unpinned nailed view is an error too) |
+| 2 rule OIDs match upstream | `TestPgRewriteRuleOIDsMatchUpstreamPins` (reads what the bootstrap actually seeds) |
+| 3 no unmapped in-band relid in any blob | `TestEvActionBlobsCarryNoUnmappedInBandRelid` |
+| 4 disjointness + in-band | `TestSystemViewOIDPinsAreDisjointAndInBand` (also re-checks `catalog.FirstUserOID == FirstNormalObjectId`, the policy's premise) |
+| 5 version stamp | `TestSystemViewOIDPinsOracleStampMatchesTree` (`server_version` BootVal + `config.CatalogVersionNo`) |
+| — constants vs table | `TestSystemViewOIDPinConstantsAgree` |
+
+Guard 1's acceptance measurement is additionally taken **against a live PG**, in
+`assertSystemViewOIDsArePinnedToUpstream`
+(`internal/testport/e2e_pg_coldstart_on_goopgdata_test.go`): a real PG 18.3
+hosted on a goopg catalog resolves all six `pg_catalog.<view>::regclass::oid`
+to upstream's own values. The unit guards compare goopg's tables to a table;
+this compares goopg's on-disk bytes to a live PG's name→OID resolution. It is
+`::regclass` rather than `SELECT * FROM <view>` because `relhasrules` is still
+`'f'` — evaluation is S6.
+
+### Scope limit (ledgered)
+
+The repin, like S6's flip, reaches only freshly `goopg init`'d directories:
+these OIDs are written by `bootstrapPgClassTuples` at initdb time. Every
+existing goopg `$PGDATA` keeps 12100/12102..12106 on disk. There is **no
+in-place upgrade path** — and unlike a `relhasrules` flag flip, a stale
+directory now also disagrees with the committed `ev_action` corpus, so the
+`pg_stat_replication_slots` blob on such a directory still names a
+non-existent 12261. Re-initdb is required. Every M0131 gate initdbs fresh, so
+nothing catches this automatically.

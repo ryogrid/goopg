@@ -12,9 +12,13 @@
 // pg_stat_wal_receiver) — it parses to a SELECT FROM
 // pg_stat_get_wal_receiver() RANGETBLENTRY with rtekind=3 (function),
 // funcid=3317, and 15 TargetEntries matching the view column order.
-// No view-side relid appears in the tree (the RTE references the
-// underlying function, not the view's pg_class OID), so no OID
-// rewriting is needed when porting the dump across PG/goopg.
+// No view-side relid appears in THIS view's tree (the RTE references the
+// underlying function, not the view's pg_class OID). That was over-claimed
+// for the corpus as a whole: pg_stat_replication_slots is a view ON a view
+// (system_views.sql:1045 → :1019) and its blob embeds `:relid 12261` twice.
+// M0131-S8a settles it by policy rather than by rewriting — goopg's
+// system-view OIDs are pinned to upstream's initdb assignment, so an
+// embedded relid is already correct. See system_view_oid_pins.go.
 
 package initdb
 
@@ -44,29 +48,39 @@ var pgReplicationSlotsEvAction string
 //go:embed pg_stat_replication_slots_ev_action.dat
 var pgStatReplicationSlotsEvAction string
 
-// Rule OIDs for the six replication-view _RETURN rules. Assigned from
-// PG18's FirstUnpinnedObjectId..FirstNormalObjectId range (12000..16383).
-// View OIDs 12100..12106 are reserved in relcache_init.go; rule OIDs
-// start at 12101 (adjacent to wal_receiver view 12100) and continue at
-// 12107..12111 for the five batched-28 views (12102..12106).
+// Rule OIDs for the six replication-view _RETURN rules.
+//
+// M0131-S8a (2026-08-11): these were goopg-private assignments (12101,
+// 12107..12111) chosen adjacent to the view OIDs. They are now PINNED to
+// what PG 18.3's own initdb assigns to each view's _RETURN rule, per the
+// Option-A policy in system_view_oid_pins.go — a hosted PG's
+// RewriteOidIndexId (2692) lookups must agree with the tree's own
+// pg_rewrite rows, so rule OIDs are pinned alongside the view OIDs rather
+// than left goopg-private. Values come from systemViewOIDPins(); the guard
+// test asserts each constant equals its table row.
 const (
-	pgRewriteOIDPgStatWalReceiverReturn      uint32 = 12101
-	pgRewriteOIDPgStatReplicationReturn      uint32 = 12107
-	pgRewriteOIDPgStatRecoveryPrefetchReturn uint32 = 12108
-	pgRewriteOIDPgStatSubscriptionReturn     uint32 = 12109
-	pgRewriteOIDPgReplicationSlotsReturn     uint32 = 12110
-	pgRewriteOIDPgStatReplicationSlotsReturn uint32 = 12111
+	pgRewriteOIDPgStatWalReceiverReturn      uint32 = 12243
+	pgRewriteOIDPgStatReplicationReturn      uint32 = 12234
+	pgRewriteOIDPgStatRecoveryPrefetchReturn uint32 = 12247
+	pgRewriteOIDPgStatSubscriptionReturn     uint32 = 12251
+	pgRewriteOIDPgReplicationSlotsReturn     uint32 = 12264
+	pgRewriteOIDPgStatReplicationSlotsReturn uint32 = 12269
 )
 
 // View OIDs for the five batched-28 replication views (mirrors of the
 // nailedLocalRels entries in relcache_init.go; kept here for
-// pg_rewrite.ev_class cross-reference).
+// pg_rewrite.ev_class cross-reference). PINNED to upstream by M0131-S8a —
+// see systemViewOIDPins(). The pg_replication_slots repin (12105 → 12261)
+// also disarms the M0131-S6 landmine for free: the verbatim
+// pg_stat_replication_slots ev_action blob embeds `:relid 12261` twice (its
+// base view — system_views.sql:1045 selects from :1019), which now names
+// the right relation with no blob edit at all.
 const (
-	pgStatReplicationViewOID      uint32 = 12102
-	pgStatRecoveryPrefetchViewOID uint32 = 12103
-	pgStatSubscriptionViewOID     uint32 = 12104
-	pgReplicationSlotsViewOID     uint32 = 12105
-	pgStatReplicationSlotsViewOID uint32 = 12106
+	pgStatReplicationViewOID      uint32 = 12231
+	pgStatRecoveryPrefetchViewOID uint32 = 12244
+	pgStatSubscriptionViewOID     uint32 = 12248
+	pgReplicationSlotsViewOID     uint32 = 12261
+	pgStatReplicationSlotsViewOID uint32 = 12266
 )
 
 // pgRewriteColDefs returns the canonical PG18 8-column Form_pg_rewrite
@@ -104,11 +118,14 @@ type pgRewriteEntry struct {
 }
 
 // pgRewriteInitialEntries returns one row per ON-SELECT rule needed for
-// the nailed local replication views (all six in the 12100..12106 range).
+// the nailed local replication views (all six in the 12231..12266 range).
 // Each ev_action is a verbatim nodeToString(Query) dump captured from an
 // upstream PG18 instance running system_views.sql; no OID rewriting is
-// needed because the RTEs reference the backing SRF funcid, not the view's
-// pg_class OID.
+// needed — for five of the six because their RTEs reference the backing SRF
+// funcid rather than a view's pg_class OID, and for
+// pg_stat_replication_slots (whose blob DOES embed its base view's relid
+// 12261 twice) because M0131-S8a pinned goopg's pg_replication_slots to that
+// same upstream OID.
 func pgRewriteInitialEntries() []pgRewriteEntry {
 	base := []pgRewriteEntry{
 		{
@@ -187,8 +204,9 @@ func replicationViewRewriteEntries() []pgRewriteEntry {
 
 // pgStatWalReceiverViewOID mirrors the OID assigned in Step 3dl's
 // nailedLocalRels entry. Keep in sync — pg_rewrite.ev_class is the
-// foreign key into pg_class.
-const pgStatWalReceiverViewOID uint32 = 12100
+// foreign key into pg_class. PINNED to upstream by M0131-S8a (was the
+// goopg-private 12100) — see systemViewOIDPins().
+const pgStatWalReceiverViewOID uint32 = 12240
 
 // pgRewriteRow builds the 8-column Form_pg_rewrite row in
 // pgRewriteColDefs order. All columns are BKI_FORCE_NOT_NULL so the

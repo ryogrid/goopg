@@ -614,7 +614,8 @@ func parsePGCharArrayPayload(b []byte) []byte {
 // ev_class, must already be registered with its relkind).
 //
 // Only user rules (ev_class >= FirstUserOID) are processed: the six bootstrap
-// replication-view _RETURN rules (ev_class 12100..12106) carry canonical
+// replication-view _RETURN rules (ev_class 12231..12266, pinned to upstream
+// by M0131-S8a — see system_view_oid_pins.go) carry canonical
 // nodeToString ev_action blobs that are NOT re-parsable SQL and whose views are
 // nailed relcache entries, so they are skipped by the OID filter.
 //

@@ -667,12 +667,19 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// `SELECT status FROM pg_catalog.pg_stat_wal_receiver` probe no longer
 	// errors with `42P01 relation "pg_stat_wal_receiver" does not exist`.
 	//
-	// OID 12100 is a goopg-private stable assignment in the
-	// `FirstUnpinnedObjectId..FirstNormalObjectId` range (PG18:
-	// 12000..16383). PG itself assigns system_views.sql view OIDs
-	// dynamically at initdb time, so there is no upstream-canonical OID
-	// to mirror; 12100 is chosen unilaterally and pinned by regression
-	// test.
+	// OID: PINNED to upstream by M0131-S8a (2026-08-11). This used to read
+	// "12100 is a goopg-private stable assignment … there is no
+	// upstream-canonical OID to mirror; 12100 is chosen unilaterally" —
+	// that premise was wrong in the way that matters. PG assigns
+	// system_views.sql view OIDs dynamically at initdb time, but the
+	// assignment is DETERMINISTIC for a fixed build (verified across two
+	// independent throwaway initdb runs), and a dependent view's captured
+	// `ev_action` embeds its base view's assigned OID — so a
+	// goopg-private choice is not free, it is a rewrite obligation on
+	// every future blob. goopg therefore adopts upstream's values;
+	// pg_stat_wal_receiver is 12240, not 12100. Policy, argument and the
+	// full pinned table: internal/initdb/system_view_oid_pins.go and
+	// docs/design/0131-0008-system-view-oid-policy.md.
 	//
 	// RelType=2249 (RECORDOID) matches the underlying function's
 	// prorettype (pg_proc.dat:5670) so any code path that consults
@@ -685,16 +692,16 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// true). The pg_rewrite row carrying ev_action is the next blocker
 	// (Step 3dm) — without it the view is openable but `SELECT` returns
 	// no rows.
-	{12100, "pg_stat_wal_receiver", 2249, 'v', 15, false, pgStatWalReceiverAttrs()},
+	{pgStatWalReceiverViewOID, "pg_stat_wal_receiver", 2249, 'v', 15, false, pgStatWalReceiverAttrs()},
 	// M0106-0010 batched-28: seed pg_class + pg_attribute rows for the 5
 	// remaining replication views so PG's RangeVarGetRelid returns a non-zero
 	// OID. RelType=2249 (RECORDOID) matches the underlying SRF's prorettype.
 	// pg_rewrite _RETURN rows are deferred to batched-29 (Step 3dm).
-	{12102, "pg_stat_replication", 2249, 'v', 20, false, pgStatReplicationViewAttrs()},
-	{12103, "pg_stat_recovery_prefetch", 2249, 'v', 10, false, pgStatRecoveryPrefetchViewAttrs()},
-	{12104, "pg_stat_subscription", 2249, 'v', 11, false, pgStatSubscriptionViewAttrs()},
-	{12105, "pg_replication_slots", 2249, 'v', 21, false, pgReplicationSlotsViewAttrs()},
-	{12106, "pg_stat_replication_slots", 2249, 'v', 10, false, pgStatReplicationSlotsViewAttrs()},
+	{pgStatReplicationViewOID, "pg_stat_replication", 2249, 'v', 20, false, pgStatReplicationViewAttrs()},
+	{pgStatRecoveryPrefetchViewOID, "pg_stat_recovery_prefetch", 2249, 'v', 10, false, pgStatRecoveryPrefetchViewAttrs()},
+	{pgStatSubscriptionViewOID, "pg_stat_subscription", 2249, 'v', 11, false, pgStatSubscriptionViewAttrs()},
+	{pgReplicationSlotsViewOID, "pg_replication_slots", 2249, 'v', 21, false, pgReplicationSlotsViewAttrs()},
+	{pgStatReplicationSlotsViewOID, "pg_stat_replication_slots", 2249, 'v', 10, false, pgStatReplicationSlotsViewAttrs()},
 }, []idxSpec{
 	{OID: 2703, Name: "pg_type_oid_index"},
 	{OID: 2704, Name: "pg_type_typname_nsp_index"},
@@ -2591,7 +2598,7 @@ func pgStatWalReceiverAttrs() []nailedAttr {
 }
 
 // pgStatReplicationViewAttrs returns the 20 pg_attribute rows for the
-// pg_catalog.pg_stat_replication view (OID 12102, batched-28).
+// pg_catalog.pg_stat_replication view (OID 12231, batched-28).
 // Column order and types from system_views.sql:906-930 + pg_proc.dat (OID 3099).
 // View columns inherit nullability from the underlying expression → NotNull=false.
 func pgStatReplicationViewAttrs() []nailedAttr {
@@ -2620,7 +2627,7 @@ func pgStatReplicationViewAttrs() []nailedAttr {
 }
 
 // pgStatRecoveryPrefetchViewAttrs returns the 10 pg_attribute rows for the
-// pg_catalog.pg_stat_recovery_prefetch view (OID 12103, batched-28).
+// pg_catalog.pg_stat_recovery_prefetch view (OID 12244, batched-28).
 // Column order and types from system_views.sql:965-977 + pg_proc.dat (OID 6248).
 func pgStatRecoveryPrefetchViewAttrs() []nailedAttr {
 	return []nailedAttr{
@@ -2638,7 +2645,7 @@ func pgStatRecoveryPrefetchViewAttrs() []nailedAttr {
 }
 
 // pgStatSubscriptionViewAttrs returns the 11 pg_attribute rows for the
-// pg_catalog.pg_stat_subscription view (OID 12104, batched-28).
+// pg_catalog.pg_stat_subscription view (OID 12248, batched-28).
 // Column order and types from system_views.sql:979-994 + pg_proc.dat (OID 6118).
 func pgStatSubscriptionViewAttrs() []nailedAttr {
 	return []nailedAttr{
@@ -2657,7 +2664,7 @@ func pgStatSubscriptionViewAttrs() []nailedAttr {
 }
 
 // pgReplicationSlotsViewAttrs returns the 21 pg_attribute rows for the
-// pg_catalog.pg_replication_slots view (OID 12105, batched-28).
+// pg_catalog.pg_replication_slots view (OID 12261, batched-28).
 // Column order and types from system_views.sql:1019-1043 + pg_proc.dat (OID 3781).
 // PG18 adds two_phase_at, inactive_since, conflicting, invalidation_reason,
 // failover, synced as the last six entries.
@@ -2688,7 +2695,7 @@ func pgReplicationSlotsViewAttrs() []nailedAttr {
 }
 
 // pgStatReplicationSlotsViewAttrs returns the 10 pg_attribute rows for the
-// pg_catalog.pg_stat_replication_slots view (OID 12106, batched-28).
+// pg_catalog.pg_stat_replication_slots view (OID 12266, batched-28).
 // Column order and types from system_views.sql:1045-1059 + pg_proc.dat (OID 6169).
 func pgStatReplicationSlotsViewAttrs() []nailedAttr {
 	return []nailedAttr{

@@ -250,6 +250,7 @@ func TestE2E_PGColdStartOnGoopgDataDir(t *testing.T) {
 	}
 
 	assertEmptyOpclassIndexStillBlocksSorts(t, pg)
+	assertSystemViewOIDsArePinnedToUpstream(t, pg)
 
 	// Row-level reads. S4.4 — no view assertions: a hosted PG cannot evaluate
 	// ANY view on a goopg directory today (the rewriter reads relcache
@@ -594,6 +595,54 @@ func assertProconfigGapStillCrashesSQLFunctions(t *testing.T, pg *pgcluster.Clus
 // pgQueryColumn runs a one-column SELECT through psql -tA and returns the
 // non-empty lines. Ordering is whatever the plan produces — callers sort in Go
 // until M0131-S12 lands.
+// assertSystemViewOIDsArePinnedToUpstream is M0131-S8a's acceptance measurement,
+// and it can only be taken here: it asks a REAL PG 18.3, hosted on a goopg
+// catalog, what OID each nailed system view has — and requires the answer to be
+// the OID that PG's own initdb would have assigned.
+//
+// S8a chose Option A (pin to upstream) over rewriting relids inside every
+// captured ev_action blob, because a view-on-view's blob embeds its base view's
+// initdb-assigned OID. This probe is the claim's other half: the unit guards in
+// internal/initdb check goopg's tables against a table, whereas this checks
+// goopg's on-disk bytes against a live PG's own name→OID resolution.
+//
+// The probe is `::regclass::oid` rather than a SELECT from the views: the nailed
+// views still carry relhasrules='f', so a hosted PG cannot EVALUATE them yet
+// (that is M0131-S6). Name resolution needs only the pg_class row, which is
+// exactly what this test is measuring.
+func assertSystemViewOIDsArePinnedToUpstream(t *testing.T, pg *pgcluster.Cluster) {
+	t.Helper()
+	// Upstream PG 18.3 initdb assignments, captured 2026-08-11 from a
+	// throwaway `initdb --no-sync` (two independent runs, identical). These
+	// are literals on purpose — the point is to compare against the oracle,
+	// not against goopg's own systemViewOIDPins() table.
+	want := []struct {
+		view string
+		oid  string
+	}{
+		{"pg_catalog.pg_stat_replication", "12231"},
+		{"pg_catalog.pg_stat_wal_receiver", "12240"},
+		{"pg_catalog.pg_stat_recovery_prefetch", "12244"},
+		{"pg_catalog.pg_stat_subscription", "12248"},
+		{"pg_catalog.pg_replication_slots", "12261"},
+		{"pg_catalog.pg_stat_replication_slots", "12266"},
+	}
+	for _, tc := range want {
+		got, err := pgQueryScalarAllowError(pg, "SELECT '"+tc.view+"'::regclass::oid")
+		if err != nil {
+			t.Fatalf("hosted PG cannot resolve %s at all: %v\n%s", tc.view, err, got)
+		}
+		if g := strings.TrimSpace(got); g != tc.oid {
+			t.Fatalf("hosted PG resolves %s to OID %s, want upstream's %s — "+
+				"M0131-S8a pins goopg's system-view OIDs to PG 18.3's initdb "+
+				"assignment (internal/initdb/system_view_oid_pins.go). A "+
+				"mismatch means a captured ev_action that embeds this view's "+
+				"relid names a relation this cluster does not have.",
+				tc.view, g, tc.oid)
+		}
+	}
+}
+
 func pgQueryColumn(t *testing.T, pg *pgcluster.Cluster, sqlText string) []string {
 	t.Helper()
 	out, err := pgQueryScalarAllowError(pg, sqlText)

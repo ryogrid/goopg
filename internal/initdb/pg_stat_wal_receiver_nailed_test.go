@@ -9,7 +9,8 @@ import "testing"
 // reply `42P01` for the E2E test's
 // `SELECT status FROM pg_catalog.pg_stat_wal_receiver` probe.
 func TestNailedLocalRelsContainsPgStatWalReceiver(t *testing.T) {
-	const viewOID = 12100
+	// PINNED to upstream by M0131-S8a (was the goopg-private 12100).
+	const viewOID = 12240
 
 	var got *nailedRel
 	for i := range nailedLocalRels {
@@ -86,11 +87,11 @@ func TestNailedLocalRelsContainsPgStatWalReceiver(t *testing.T) {
 // pgClassRow change: views (relkind='v') write relfilenode=0 and relam=0,
 // while relhasrules=true so PG's relcache fetches the ON-SELECT rewrite
 // rule. Without these overrides, PG would attempt to open the view's
-// non-existent `base/<db>/12100` heap file at relcache-build time and
+// non-existent `base/<db>/12240` heap file at relcache-build time and
 // FATAL.
 func TestPgClassRowForViewSetsZeroRelfilenode(t *testing.T) {
 	rel := nailedRel{
-		OID:      12100,
+		OID:      12240,
 		RelName:  "pg_stat_wal_receiver",
 		RelType:  2249,
 		RelKind:  'v',
@@ -108,7 +109,7 @@ func TestPgClassRowForViewSetsZeroRelfilenode(t *testing.T) {
 	if row[7].Int != 0 {
 		t.Fatalf("view pg_class.relfilenode=%d want 0", row[7].Int)
 	}
-	// NAILED replication system views (12100-12106) keep relhasrules=false: their
+	// NAILED replication system views (12231-12266) keep relhasrules=false: their
 	// canonical ev_action IS present, but PG serves these views from its own
 	// built-in relcache entries, so enabling standby-side rule expansion for them
 	// is a separate track. M0123-S3 sub-slice 2c landed canonical ev_action +
