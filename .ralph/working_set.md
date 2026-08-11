@@ -1,45 +1,47 @@
 (idle — nothing in flight)
 
-Last loop (#105): M0119-0006 **40th slice — textual month names on
-date/timestamp INPUT**. Design `docs/design/0119-0006-textual-month-name-date-input.md`
-(new) + README row `0119-0006w`. Ledger: 3 new rows appended.
+Last loop (#106): **M0131-S1 — GUC registry accepts a PG-18-initdb
+`postgresql.conf`** — DONE and ticked. The banner flipped to M0131 (user
+directive 2026-08-11), so the baton's M0119 suggestion was correctly overridden.
 
-M-NIGHTLY duty this loop: `ci/logs/action-items.md` still run `20260811-014635`
-(12 items, unchanged since loop #100). All 12 already filed; the 11 open ones
-are PARKED per the banner (not gates the priority milestones depend on).
-M0130 is fully checked (CLOSED), so M0119 is head.
+M-NIGHTLY duty: `ci/logs/action-items.md` still run `20260811-014635` (12 items,
+unchanged since loop #100). All 12 already filed; the 11 open ones stay PARKED.
 
-What landed: new `internal/pgdatetime/monthname.go`
-(`normalizeTextualMonthDate`, `joinNormalizedDate`, `monthNameValue` = the 21
-`MONTH` rows of `datetktbl`), hooked into `normalizeInput` as a THIRD arm after
-`padDateFields` / `expandRunTogetherDate`, gated on the `runTogetherDate` flag
-so only `NormalizeDateTimeInput` (DecodeDateTime's context) reaches it.
+What landed: **ten** accepted-stub GUCs (not the designed 8) in
+`internal/config/defaults.go` `BuildDefaultRegistry` + ten commented entries in
+`internal/config/postgresql.conf.sample`; new `checkFileMode` CheckFn; new
+`internal/config/pg_initdb_conf_test.go` (5 tests); two
+`internal/initdb/config_seed_test.go` expectations updated.
 
-Key discovery: a textual month needs NO DateStyle modelling. `DecodeDate` runs
-a text-first pass ("look first for text fields, since that will be unambiguous
-month"), so the month is in `fmask` before any numeric run and MON-DD-YYYY /
-DD-MON-YYYY / YYYY-MON-DD all take one path. Only `DecodeNumber`'s two
-`DATEORDER_YMD`-gated branches were skipped. Under MDY, `'02-May-1'` is
-2001-05-02 (oracle-confirmed).
+Design-table corrections found against `guc_tables.c`: `log_file_mode` BootVal is
+`0600` not `0640` (`0640` is what initdb writes under `-g`); the Linux DSM enum
+is `posix|sysv|mmap`. `log_file_mode` is `TypeString`+CheckFn, not `TypeInt`,
+because `parseIntWithUnit` is base-10 and there is no octal display hook —
+ledgered.
 
-Two oracle-checked refusals (NOT omissions): `'2002-May-1T10:20:30'` is an
-ERROR on PG 18.3 though the numeric-month spelling parses; `:` is barred from
-the date token so `'10:00 May'` cannot build a date.
+Guard 3 proven end-to-end: `goopg init --lc-messages=C -T english -g -D /tmp/s1data`
+then `goopg start --listen 127.0.0.1:5539` **starts** (exit 1 before this slice);
+`SHOW` returns `lc_time=C`, `log_file_mode=0640`,
+`default_text_search_config=pg_catalog.english`, `lc_messages=C`. Server stopped.
 
-Next loop: per banner (M-NIGHTLY filing unconditional, M0130 CLOSED, then M0119
-top-to-bottom, then M0122). Remaining M0119-0006 datetime candidates: the
-`Datum.Int` KindTime carrier move ns→MICROSECONDS (282 refs, multi-loop —
-also the reason NO BC date round-trips end-to-end today); the variable-width
-day field that would give `'2002-May-100'` / `'2002-5-100'` PG's 22008 (one fix
-closes both, needs `DateTokenMonthDay` widened); routing
-`pgnodes.parseDateFields` through `pgdatetime` (planner/executor divergence);
-`TimeSubTimestampTZ` producers (unlocks the `::text` cast zone); POSIX
-`TimeZone` spellings; the target-type-less parse paths; `timetz`'s bare-time
-zone; DateStyle MDY/DMY *numeric* input orders.
+Key discovery for later M0131 slices: the initdb-authored portion of the real
+reference conf now applies with zero errors, but the WHOLE file still fails on
+`unix_socket_directories` / `maintenance_work_mem` / `wal_compression` — all
+under `CUSTOMIZED OPTIONS`, i.e. bench-script additions, not initdb output. S3's
+E2E uses a pristine initdb dir and will not see this; a real-world dir would.
 
-Gates: build clean; `internal/pgdatetime` + `internal/executor` + `internal/pgnodes`
-PASS; `TestPort_RegressSuite` PASS (251s); `RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh` PASS; `scripts/tpch-spotcheck.sh` PASS
-(Q12=2, Q13=35). pgbench smoke via the commit hook.
+**Orphan noted:** something is already listening on 127.0.0.1:5533 (an older
+goopg build — it answered `SHOW lc_time` with "unrecognized configuration
+parameter"). Not started by this loop; worth reaping.
+
+Next loop: per banner — M-NIGHTLY filing, then M0131 top-to-bottom. Next
+unchecked is **M0131-S2** (`LoadOrCreateSystemID` reads pg_control first,
+`internal/initdb/initdb.go:54-76`); design doc `0131-0002` already drafted.
+Note S10 is flagged LAND EARLY and is independent of S2.
+
+Gates: `go build ./...` clean; `internal/config` + `internal/initdb` PASS;
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS (warm cache).
+pgbench smoke via the commit hook. tpch-spotcheck NOT run — config-registration
+only, no planner/executor/codec path touched.
 
 In-flight: none

@@ -39,6 +39,8 @@
 # - Authentication -
 
 #scram_iterations = 4096                # 1-1073741824
+#password_encryption = 'scram-sha-256'  # md5 | scram-sha-256; accepted,
+                                        # verifier form follows pg_hba
 
 
 #------------------------------------------------------------------------------
@@ -49,6 +51,8 @@
 
 #shared_buffers = 128MB                 # min 128kB
                                         # (change requires restart)
+#dynamic_shared_memory_type = posix     # posix | sysv | mmap; accepted,
+                                        # goopg allocates no DSM segments
 #transaction_buffers = 0                # CLOG SLRU page-cache buffers;
                                         # 0 = auto from shared_buffers
                                         # (change requires restart)
@@ -248,6 +252,10 @@
 # - What To Log -
 
 #log_line_prefix = '%m [%p] '           # supported escapes: %m %p %u %d %a %x %%
+#log_timezone = 'GMT'                   # accepted; goopg log timestamps are
+                                        # not zone-formatted
+#log_file_mode = 0600                   # 0000-0777 octal; accepted, goopg
+                                        # does not write log files itself
 
 # - Process Title / I/O Timing -
 
@@ -276,6 +284,9 @@
 #------------------------------------------------------------------------------
 
 #vacuum_cost_delay = 0                  # 0-100 ms; 0 disables cost-based delay
+#autovacuum_worker_slots = 16           # 1-262143; accepted, goopg has no
+                                        # autovacuum worker pool
+                                        # (change requires restart)
 #autovacuum_freeze_max_age = 200000000  # 100000-2000000000 xids
                                         # (change requires restart)
 
@@ -318,6 +329,15 @@
                                         # sql_standard | iso_8601
 #TimeZone = 'UTC'
 #timezone_abbreviations = 'Default'     # select timezone abbreviation set
+#lc_messages = ''                       # accepted; goopg emits English only
+#lc_monetary = 'C'                      # accepted; money formatting is
+                                        # C-locale by construction
+#lc_numeric = 'C'                       # accepted; numeric output is
+                                        # C-locale by construction
+#lc_time = 'C'                          # accepted; internal/pgdatetime is
+                                        # C-locale by construction
+#default_text_search_config = 'pg_catalog.simple'# accepted; goopg has no
+                                        # text-search configurations
 #client_encoding = 'UTF8'               # actually defaults to whatever the
                                         # client negotiates at startup
 

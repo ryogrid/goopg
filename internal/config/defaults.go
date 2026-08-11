@@ -1,6 +1,11 @@
 package config
 
-import "math"
+import (
+	"fmt"
+	"math"
+	"strconv"
+	"strings"
+)
 
 // BuildDefaultRegistry returns a Registry seeded with every GUC the
 // goopg server currently advertises. Variables added here should cite
@@ -142,6 +147,89 @@ func BuildDefaultRegistry() *Registry {
 		Name: "default_toast_compression", Type: TypeEnum, BootVal: "pglz",
 		EnumOptions: []string{"pglz", "lz4"},
 		Context:     ContextUserset, Scope: ScopeSession | ScopeTransaction,
+	}))
+	// initdb-authored GUCs (M0131-S1). Every name below is written into a
+	// postgresql.conf by an initdb — either a stock PG 18.3 initdb (the
+	// first eight, verified against a real PG-written conf) or goopg's own
+	// `goopg init` when a locale / text-search / --pwfile / group-access
+	// flag is passed (internal/initdb/config_seed.go:32-83,
+	// internal/initdb/locale.go:235-245). Until they were registered,
+	// ApplyConfigEntries (guc.go) made each one a hard "unrecognized
+	// configuration parameter" error and cmd/goopg/main.go exited 1 — so
+	// goopg refused to start on a PG-created data directory (and, for the
+	// last two plus the lc_* four, on one of its OWN directories) before
+	// reading a single catalog page.
+	//
+	// All ten are ACCEPTED STUBS in the sense of the pg_dump block above:
+	// parsed, range/enum-checked, stored, reportable via SHOW — and read by
+	// no engine code. goopg is a single process with no DSM segments and no
+	// autovacuum worker pool; it emits English messages only, formats
+	// money/numeric/date in the C locale by construction
+	// (internal/pgdatetime, PGFloatOut); it has no text-search
+	// configurations on disk; it has no zone-aware log formatter; and its
+	// CREATE ROLE ... PASSWORD path does not consult password_encryption
+	// (internal/initdb/auth_bootstrap.go:170 picks the verifier form from
+	// the pg_hba auth methods directly). Behavioral no-ops, ledgered.
+	//
+	// Names, contexts, boot values and enum option lists mirror
+	// postgres/src/backend/utils/misc/guc_tables.c (:5247
+	// dynamic_shared_memory_type, :4321 log_timezone, :3598
+	// autovacuum_worker_slots, :4435-4471 the lc_* four, :4811
+	// default_text_search_config, :5362 password_encryption, :2546
+	// log_file_mode) — PG's default, never a goopg-tuned value.
+	r.MustRegister(NewVariable(Variable{
+		// dynamic_shared_memory_options (dsm_impl.c:95-109) minus the
+		// Windows-only entry, matching the Linux reference build.
+		Name: "dynamic_shared_memory_type", Type: TypeEnum, BootVal: "posix",
+		EnumOptions: []string{"posix", "sysv", "mmap"},
+		Context:     ContextPostmaster, Scope: ScopeSession,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "log_timezone", Type: TypeString, BootVal: "GMT",
+		Context: ContextSigHup, Scope: ScopeSession,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "autovacuum_worker_slots", Type: TypeInt, BootVal: "16",
+		MinVal: 1, MaxVal: 262143, // MAX_BACKENDS
+		Context: ContextPostmaster, Scope: ScopeSession,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "lc_messages", Type: TypeString, BootVal: "",
+		Context: ContextSuset, Scope: ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "lc_monetary", Type: TypeString, BootVal: "C",
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "lc_numeric", Type: TypeString, BootVal: "C",
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "lc_time", Type: TypeString, BootVal: "C",
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "default_text_search_config", Type: TypeString, BootVal: "pg_catalog.simple",
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "password_encryption", Type: TypeEnum, BootVal: "scram-sha-256",
+		EnumOptions: []string{"md5", "scram-sha-256"},
+		Context:     ContextUserset, Scope: ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		// Upstream models this as an int parsed with strtol(..., base 0)
+		// and *displayed* in octal by show_log_file_mode (guc_tables.c:2556),
+		// so the only spellings that ever appear in a conf file or in SHOW
+		// are octal ones. goopg keeps the literal text and validates it with
+		// the same base-0 parse plus upstream's 0000-0777 range, which
+		// reproduces PG's accept/reject set and PG's display for every
+		// octal-spelled value; a decimal-spelled input is where the two
+		// diverge (PG re-renders it as octal, goopg echoes it back).
+		Name: "log_file_mode", Type: TypeString, BootVal: "0600",
+		Context: ContextSigHup, Scope: ScopeSession,
+		CheckFn: checkFileMode,
 	}))
 	// SSI predicate-lock sizing (M0104-0003). Names, defaults, and
 	// ranges mirror postgres/src/backend/utils/misc/guc_tables.c so
@@ -1302,4 +1390,21 @@ func BuildDefaultRegistry() *Registry {
 	}))
 
 	return r
+}
+
+// checkFileMode validates a file-permission GUC value the way upstream's
+// parse_int does for log_file_mode (guc_tables.c:2546-2556): strtol with
+// base 0, so a leading "0" means octal and "0x" means hex, then the
+// declared 0000-0777 range. Kept as a CheckFn on a TypeString variable
+// because goopg preserves the literal spelling for SHOW rather than
+// re-rendering it through show_log_file_mode.
+func checkFileMode(value string) error {
+	n, err := strconv.ParseInt(strings.TrimSpace(value), 0, 64)
+	if err != nil {
+		return fmt.Errorf("invalid file mode value %q", value)
+	}
+	if n < 0 || n > 0o777 {
+		return fmt.Errorf("value %s out of range [0000, 0777]", value)
+	}
+	return nil
 }

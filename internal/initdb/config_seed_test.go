@@ -40,7 +40,13 @@ func TestInitTextSearchConfig(t *testing.T) {
 		t.Fatalf("Init: %v", err)
 	}
 	got := confLine(t, dir, "default_text_search_config")
-	want := "default_text_search_config = 'pg_catalog.german'"
+	// Since M0131-S1 registered the GUC, postgresql.conf.sample carries a
+	// commented default_text_search_config entry, so replaceGUCValue
+	// rewrites that line in place and preserves its trailing comment —
+	// upstream replace_guc_value does the same (initdb.c: "now append the
+	// original comment if any"). Before S1 there was no template line to
+	// match and the assignment was appended bare.
+	want := "default_text_search_config = 'pg_catalog.german' # accepted; goopg has no"
 	if got != want {
 		t.Errorf("default_text_search_config line = %q, want %q", got, want)
 	}
@@ -63,8 +69,10 @@ func TestInitSuccessfulCreationOptions(t *testing.T) {
 		t.Fatalf("Init: %v", err)
 	}
 	got := confLine(t, dir, "default_text_search_config")
-	// "german" is a bare identifier, so it is written unquoted.
-	want := "default_text_search_config = german"
+	// "german" is a bare identifier, so it is written unquoted. The
+	// trailing comment comes from the shipped template entry (see
+	// TestInitTextSearchConfig).
+	want := "default_text_search_config = german # accepted; goopg has no"
 	if got != want {
 		t.Errorf("default_text_search_config line = %q, want %q", got, want)
 	}
