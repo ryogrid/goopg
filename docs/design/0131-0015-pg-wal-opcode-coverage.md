@@ -90,7 +90,7 @@ arrives as `XLOG_SMGR_TRUNCATE`.
 
 | opcode | hex | goopg | upstream redo | produced by |
 |---|---|---|---|---|
-| `XLOG_HEAP2_REWRITE` | 0x00 | **X** | `heap_xlog_logical_rewrite` `rewriteheap.c:1073` | `VACUUM FULL`/`CLUSTER` **with a logical slot** (`rewriteheap.c:894`) |
+| `XLOG_HEAP2_REWRITE` | 0x00 | **REFUSED** (S21a-2 pt 7) | `heap_xlog_logical_rewrite` `rewriteheap.c:1073` | `VACUUM FULL`/`CLUSTER` **with a logical slot** (`rewriteheap.c:894`) |
 | `..._PRUNE_ON_ACCESS` | 0x10 | H `:2439` | `heap_xlog_prune_freeze` `:30` | opportunistic prune on any read |
 | `..._PRUNE_VACUUM_SCAN` | 0x20 | H `:2439` | ditto | `VACUUM` first pass |
 | `..._PRUNE_VACUUM_CLEANUP` | 0x30 | H `:2439` | ditto | `VACUUM` freeze |
@@ -767,10 +767,51 @@ and then truncates it per the flags, matching upstream's recreate-then-drop
 order; the default/global tablespace OID remap round-trips through the new
 decoder.
 
-**STILL OPEN in S21a-2: `HEAP2_REWRITE`'s loud refusal** (0x00 RM_HEAP2,
-out-of-scope `VACUUM FULL`/`CLUSTER` with a logical slot — needs an
-`ErrUnsupportedRecord`-style message, not real redo). Then S21b (btree, ~6
-opcodes, gated on S16 which is already done).
+### S21a-2 part 7 — `XLOG_HEAP2_REWRITE`'s loud refusal (landed 2026-08-12)
+
+The last opcode of S21a-2, and the only one whose landing is a *refusal* rather
+than a redo. `XLOG_HEAP2_REWRITE` (0x00 RM_HEAP2) is emitted while a
+`VACUUM FULL` / `CLUSTER` rewrites a table whose pre-rewrite row versions a
+logical replication slot may still have to decode — `rewriteheap.c:894`, reached
+only through `logical_rewrite_log_mapping`, i.e. `wal_level=logical` plus a slot
+that can reach the relation. Its redo touches no relation page: it truncates a
+`pg_logical/mappings/` file to the record's `offset`, rewrites the mapping tail
+(old-ctid → new-ctid), and fsyncs it (`heap_xlog_logical_rewrite`,
+`rewriteheap.c:1073-1160`).
+
+**Why refusing is the honest answer.** goopg has no `pg_logical/mappings`
+consumer, so neither alternative is defensible. Implementing the redo maintains
+a file nothing reads — a half implementation whose only effect is to make the
+gap invisible. Recognising it as a no-op (the treatment `HEAP2_NEW_CID` gets one
+arm below, and for good reason: that record has no physical effect at all) would
+leave a slot on the resulting cluster decoding the rewritten table against
+mappings that stop mid-rewrite, with nothing reporting an error. So the arm
+returns `(false, err)` with `ErrUnsupportedRecord` and a message naming the
+feature — the operator learns *this cluster ran VACUUM FULL/CLUSTER on a table
+with a logical replication slot*, not "recovery failed". Same shape as the
+2PC refusal (`xlogXactPrepare`/`CommitPrepared`/`AbortPrepared`) already in
+`replayDecodedXLogRecord`.
+
+The `ErrUnsupportedRecord` wrapping is not cosmetic: it is the class the reader
+uses to distinguish a durable record it cannot handle from a torn crash tail
+(`format.go`, M0131-S16.2). Before this arm the record fell to RM_HEAP2's
+`default:`, which returns a bare error carrying no class at all.
+
+Guards (`internal/wal/heap2_rewrite_pg_test.go`, 3 tests, proven fail-when-broken
+by a scripted revert of the dispatch case — both refusal guards fail with the
+generic `unsupported xlog record rmid=9 info=0x00`): the dispatch arm refuses
+with `ErrUnsupportedRecord`, `applied=false`, and a message mentioning
+`logical` / `VACUUM FULL` / `CLUSTER`; a real-shaped 40-byte
+`xl_heap_rewrite_mapping` record (`{mapped_xid, mapped_db, mapped_rel, offset,
+num_mappings, start_lsn}`, no block references) driven through
+encode→decode→`ApplyRecord` reaches that same refusal rather than an earlier
+decode error; and `XLOG_HEAP2_NEW_CID` (0x70) still returns `(false, nil)`, so
+the new arm has not swallowed its nearest logical-decoding-only neighbour.
+
+**S21a-2 is now CLOSED.** Next: S21b (btree, ~6 opcodes — `INSERT_UPPER` 0x10,
+`INSERT_META` 0x20, `INSERT_POST` 0x50, `DEDUP` 0x60, `DELETE` 0x70,
+`META_CLEANUP` 0xE0; `REUSE_PAGE` 0xD0 needs no redo and was recognised in
+S21a-1), gated on S16 which is already done.
 
 ## Guards
 

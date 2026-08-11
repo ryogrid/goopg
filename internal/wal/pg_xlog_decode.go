@@ -73,6 +73,16 @@ const (
 	xlogHeap2NewCid      uint8 = 0x70 // XLOG_HEAP2_NEW_CID
 	xlogHeap2MultiInsert uint8 = 0x50 // XLOG_HEAP2_MULTI_INSERT
 
+	// XLOG_HEAP2_REWRITE (M0131-S21a-2 part 7, heapam_xlog.h:59) is emitted by
+	// a VACUUM FULL / CLUSTER of a table whose old row versions a logical
+	// replication slot may still need (rewriteheap.c:894, reached only via
+	// logical_rewrite_log_mapping, i.e. wal_level=logical plus a slot).
+	// Its redo writes no page at all: it (re)writes a tail of a
+	// pg_logical/mappings/ file that maps a pre-rewrite ctid to its
+	// post-rewrite one (rewriteheap.c:1073-1160). goopg refuses it — see the
+	// dispatch arm in replayDecodedXLogRecord.
+	xlogHeap2Rewrite uint8 = 0x00
+
 	// XLOG_HEAP2_VISIBLE (M0131-S21a-2 part 3): every VACUUM that marks a page
 	// all-visible emits one, and so does an INSERT that freezes a page it
 	// filled itself. It is the FIRST record whose redo writes the

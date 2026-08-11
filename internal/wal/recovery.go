@@ -2790,6 +2790,32 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			// used during logical decoding"). Recognised so a wal_level=logical
 			// PG tail does not refuse the start.
 			return false, nil
+		case xlogHeap2Rewrite:
+			// M0131-S21a-2 part 7: a loud refusal, deliberately not a redo and
+			// deliberately not a no-op. XLOG_HEAP2_REWRITE is emitted while a
+			// VACUUM FULL / CLUSTER rewrites a table whose pre-rewrite row
+			// versions a logical replication slot may still have to decode
+			// (rewriteheap.c:894 — reachable only at wal_level=logical, and
+			// only for a relation logical decoding can reach). Its redo writes
+			// no relation page: it truncates a pg_logical/mappings/ file to the
+			// record's offset and rewrites the mapping tail from
+			// old-ctid → new-ctid, then fsyncs it (heap_xlog_logical_rewrite,
+			// rewriteheap.c:1073-1160).
+			//
+			// goopg has no pg_logical/mappings consumer, so there is no honest
+			// middle: replaying it would mean maintaining a file nothing reads,
+			// and skipping it silently would leave a slot on the resulting
+			// cluster decoding the rewritten table against mappings that stop
+			// mid-rewrite — the pre-rewrite tuples become undecodable without
+			// anything reporting an error. Refusing names the feature instead,
+			// so the operator sees "goopg cannot start on this $PGDATA because
+			// of a logical-slot table rewrite" rather than a silently divergent
+			// slot. ErrUnsupportedRecord (not the bare error) is what keeps the
+			// reader from mistaking this for end-of-WAL and overwriting every
+			// record after it (format.go, M0131-S16.2).
+			return false, fmt.Errorf("%w: %s (logical-decoding rewrite mappings are not supported; "+
+				"this cluster ran VACUUM FULL/CLUSTER on a table with a logical replication slot)",
+				ErrUnsupportedRecord, unsupportedDecodedXLogRecord(r))
 		default:
 			return false, unsupportedDecodedXLogRecord(r)
 		}
