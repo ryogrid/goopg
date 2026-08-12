@@ -549,6 +549,75 @@ whole `^TestE2E_` family PASS (90 s), `capture-ev-action.sh --verify` PASS
 (33/33 byte-identical), `go vet` clean, UNITS PASS, pgbench smoke via the
 commit hook.
 
+## Implementation status — S9.2b (2026-08-12)
+
+**The corpus is 35 views and it now reads SHARED catalogs.** `pg_roles`
+(12000/12003) and `pg_stat_activity` (12226/12229) — S9.2's two remaining
+named heads — were pinned in `internal/initdb/system_view_oid_pins.go`,
+captured in ONE `scripts/capture-ev-action.sh <35 views>` run and rendered by
+ONE `go run cmd/gen-nailed-view-tables/main.go > nailed_view_seed_data.go`.
+The other 33 `.dat` files came back byte-identical from that same run, which is
+a determinism re-measurement the tranche gets for free.
+
+**What is new about the shape.** S9.2a's joins were over *local* catalogs
+(`pg_class` 1259, `pg_namespace` 2615, `pg_tablespace` 1213 — the last is
+shared but nailed). These two read the shared catalogs a hosted PG resolves
+through `base/5`: `pg_roles` is `FROM pg_authid` (1260) `LEFT JOIN
+pg_db_role_setting` (2964), and `pg_stat_activity` joins
+`pg_stat_get_activity(NULL)` against `pg_authid` **and** `pg_database` (1262) —
+the corpus's first blob mixing an SRF with catalog relations in one join tree,
+which is the exact shape S9's filing predicted would need measuring. A hosted
+PG 18.3 evaluates both (`assertNailedSystemViewsAreEvaluable`), so no new RTE
+kind or shared-relation resolution gap fell out. Both base sets are sub-12000
+bootstrap constants, so the blobs still carry zero in-band `:relid` (measured:
+`pg_roles` embeds 1260/2964, `pg_stat_activity` 1260/1262) and S9.3 remains the
+first slice needing view-on-view ordering.
+
+**Guard #5 was checked BEFORE pinning, per S9.2a's own advice**, on a throwaway
+PG 18.3 with `pg_column_size(r.ev_action)`: `pg_roles` 2167 B and
+`pg_stat_activity` 4780 B against the 8000 B inline budget — both comfortable.
+The same probe sized six further S9.2/S9.3 candidates and found a **second**
+TOAST-ceiling breach beyond `pg_indexes` (9002 B): `pg_seclabels` at
+**35379 B** stored (203378 B raw), 4.4× `pg_indexes` and by far the largest
+blob measured. Ledgered — it widens the `DECLARE_TOAST(pg_rewrite, 2838, 2839)`
+blocker from one view to a class, and 35 KB will not fit an inline tuple by any
+amount of header shaving. Under the ceiling and still unadopted:
+`pg_shadow` 2015 B, `pg_group` 1428 B, `pg_user` 1356 B, `pg_rules` 3774 B,
+`pg_policies` 5439 B, `pg_stat_database` 2721 B, `pg_stat_all_tables` 5473 B.
+
+Guard #2 (`assertNonCorpusSystemViewIsStillAbsent`) is UNCHANGED this slice:
+its subject `pg_indexes` is still un-adopted for the measured TOAST reason, so
+unlike S9.2a there was no red assertion to re-point.
+
+### Findings — S9.2b
+
+**F10 — the dual-definition hazard, third measurement, and this time goopg's
+own answers are the ones that survive.** Probed on a live goopg server
+(fresh `init`, port 5533): unlike `pg_views`/`pg_matviews` in F8, both of these
+views DO answer on goopg — `pg_roles` returns 18 rows and `pg_stat_activity`
+4 — so seeding did not disturb the virtual path and the two engines agree that
+the views exist. They disagree about everything else:
+
+| view | goopg virtual | on-disk / upstream |
+|---|---|---|
+| `pg_roles` | OID 1259102, **4** cols (`oid`, `rolname`, `rolsuper`, `rolcanlogin`) | OID 12000, **13** cols, PG-typed |
+| `pg_stat_activity` | OID **16403**, **21** cols (no `query_id`) | OID 12226, **22** cols, PG-typed |
+
+`pg_roles` at 4-vs-13 is the widest column-count gap measured in the milestone
+(F9's `pg_tables` was 3-vs-8). The sharper finding is `pg_stat_activity`'s
+**16403**: that is in the `FirstUserOID = 16384` band, i.e. a *system* view
+whose virtual relation was minted by the runtime user-relation allocator, so
+its OID is not even stable across clusters — a strictly worse divergence than
+the synthetic `1259xxx` values F9 found, and one that would collide with a user
+relation's OID on a cluster that created one first. Ledgered, not fixed:
+reconciling the virtual definitions changes goopg-client-visible output and is
+a slice of its own.
+
+Gates: `internal/initdb` PASS (93 s), `TestE2E_PGColdStartOnGoopgDataDir` PASS,
+whole `^TestE2E_` family PASS (90 s), `capture-ev-action.sh --verify` PASS
+(35/35 byte-identical), `go build ./...` + `go vet` clean, UNITS PASS, pgbench
+smoke via the commit hook.
+
 ## References
 
 - M0131 implementation plan §S9, `docs/design/0131-bidirectional-cluster-dir-coldstart-and-system-views.md`

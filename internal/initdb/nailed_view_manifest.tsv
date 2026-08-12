@@ -4,6 +4,20 @@
 #
 # rel  <name> <oracle_oid> <goopg_oid> <rule_oid> <oracle_reltype> <goopg_reltype> <relkind> <relnatts>
 # attr <name> <attnum> <attname> <atttypid> <attlen> <attnotnull> <attisdropped>
+rel	pg_roles	12000	12000	12003	12002	2249	v	13
+attr	pg_roles	1	rolname	19	64	f	f
+attr	pg_roles	2	rolsuper	16	1	f	f
+attr	pg_roles	3	rolinherit	16	1	f	f
+attr	pg_roles	4	rolcreaterole	16	1	f	f
+attr	pg_roles	5	rolcreatedb	16	1	f	f
+attr	pg_roles	6	rolcanlogin	16	1	f	f
+attr	pg_roles	7	rolreplication	16	1	f	f
+attr	pg_roles	8	rolconnlimit	23	4	f	f
+attr	pg_roles	9	rolpassword	25	-1	f	f
+attr	pg_roles	10	rolvaliduntil	1184	8	f	f
+attr	pg_roles	11	rolbypassrls	16	1	f	f
+attr	pg_roles	12	rolconfig	1009	-1	f	f
+attr	pg_roles	13	oid	26	4	f	f
 rel	pg_views	12028	12028	12031	12030	2249	v	4
 attr	pg_views	1	schemaname	19	64	f	f
 attr	pg_views	2	viewname	19	64	f	f
@@ -133,6 +147,29 @@ attr	pg_backend_memory_contexts	7	total_nblocks	20	8	f	f
 attr	pg_backend_memory_contexts	8	free_bytes	20	8	f	f
 attr	pg_backend_memory_contexts	9	free_chunks	20	8	f	f
 attr	pg_backend_memory_contexts	10	used_bytes	20	8	f	f
+rel	pg_stat_activity	12226	12226	12229	12228	2249	v	22
+attr	pg_stat_activity	1	datid	26	4	f	f
+attr	pg_stat_activity	2	datname	19	64	f	f
+attr	pg_stat_activity	3	pid	23	4	f	f
+attr	pg_stat_activity	4	leader_pid	23	4	f	f
+attr	pg_stat_activity	5	usesysid	26	4	f	f
+attr	pg_stat_activity	6	usename	19	64	f	f
+attr	pg_stat_activity	7	application_name	25	-1	f	f
+attr	pg_stat_activity	8	client_addr	869	-1	f	f
+attr	pg_stat_activity	9	client_hostname	25	-1	f	f
+attr	pg_stat_activity	10	client_port	23	4	f	f
+attr	pg_stat_activity	11	backend_start	1184	8	f	f
+attr	pg_stat_activity	12	xact_start	1184	8	f	f
+attr	pg_stat_activity	13	query_start	1184	8	f	f
+attr	pg_stat_activity	14	state_change	1184	8	f	f
+attr	pg_stat_activity	15	wait_event_type	25	-1	f	f
+attr	pg_stat_activity	16	wait_event	25	-1	f	f
+attr	pg_stat_activity	17	state	25	-1	f	f
+attr	pg_stat_activity	18	backend_xid	28	4	f	f
+attr	pg_stat_activity	19	backend_xmin	28	4	f	f
+attr	pg_stat_activity	20	query_id	20	8	f	f
+attr	pg_stat_activity	21	query	25	-1	f	f
+attr	pg_stat_activity	22	backend_type	25	-1	f	f
 rel	pg_stat_replication	12231	12231	12234	12233	2249	v	20
 attr	pg_stat_replication	1	pid	23	4	f	f
 attr	pg_stat_replication	2	usesysid	26	4	f	f

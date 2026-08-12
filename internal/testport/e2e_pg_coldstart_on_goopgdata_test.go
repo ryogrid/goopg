@@ -266,7 +266,8 @@ func TestE2E_PGColdStartOnGoopgDataDir(t *testing.T) {
 	// `pg_stat_activity`, which was the wrong target — that view is not in
 	// goopg's nailed set (it has no bootstrapped pg_class/pg_rewrite rows at
 	// all, so it would fail 42P01 for an unrelated reason and is S9's work).
-	// The six views S6 actually enables are the ones probed.
+	// M0131-S9.2b did that work: pg_stat_activity (12226) is now IN the probe
+	// set above, so the TODO is discharged rather than merely re-scoped.
 	pgLog := pgLogPathFor(goopgDir)
 	if got := s4Scalar(t, pg, pgLog, "SELECT count(*) FROM public.s4_items"); got != wantCount {
 		t.Fatalf("hosted PG count(*) on a goopg-written heap = %q, goopg said %q", got, wantCount)
@@ -729,6 +730,13 @@ func assertHostedPGCanCallSQLBuiltins(t *testing.T, pg *pgcluster.Cluster, logPa
 // bootstrap constant, so these blobs still embed no in-band :relid and the
 // tranche needed no view-on-view ordering.
 //
+// M0131-S9.2b adds the two that read SHARED catalogs: pg_roles (12000) is
+// `FROM pg_authid` (1260) LEFT JOIN pg_db_role_setting (2964), and
+// pg_stat_activity (12226) joins pg_stat_get_activity(NULL) against pg_authid
+// AND pg_database (1262) — the first blob mixing an SRF with catalog relations
+// in one join tree. Both base sets are sub-12000 bootstrap constants, so still
+// no in-band :relid.
+//
 // Deliberately absent: pg_timezone_abbrevs (12122), whose ORDER BY needs a
 // pg_amop row goopg does not bootstrap ("operator 664 is not a valid ordering
 // operator") — this probe is what found that, and it is ledgered. And
@@ -743,6 +751,7 @@ func nailedSystemViewProbeSet() []struct {
 		view string
 		oid  string
 	}{
+		{"pg_catalog.pg_roles", "12000"},
 		{"pg_catalog.pg_views", "12028"},
 		{"pg_catalog.pg_tables", "12033"},
 		{"pg_catalog.pg_matviews", "12038"},
@@ -758,6 +767,7 @@ func nailedSystemViewProbeSet() []struct {
 		{"pg_catalog.pg_shmem_allocations", "12134"},
 		{"pg_catalog.pg_shmem_allocations_numa", "12138"},
 		{"pg_catalog.pg_backend_memory_contexts", "12142"},
+		{"pg_catalog.pg_stat_activity", "12226"},
 		{"pg_catalog.pg_stat_replication", "12231"},
 		{"pg_catalog.pg_stat_slru", "12236"},
 		{"pg_catalog.pg_stat_wal_receiver", "12240"},
@@ -825,7 +835,7 @@ func assertNailedSystemViewsAreEvaluable(t *testing.T, pg *pgcluster.Cluster, go
 	t.Helper()
 	// M0131-S9.1 widened this from the six replication views to the whole
 	// on-disk corpus (nailedSystemViewProbeSet), and S9.1b added the
-	// RTE_RESULT pair. The per-view Errorf is what makes that affordable: 30
+	// RTE_RESULT pair. The per-view Errorf is what makes that affordable: 35
 	// independent blobs, and a bad tupledesc names its own view instead of
 	// forcing a bisect.
 	for _, tc := range nailedSystemViewProbeSet() {

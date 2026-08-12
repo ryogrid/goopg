@@ -113,6 +113,15 @@ func systemViewOIDPins() []systemViewOIDPin {
 		// varlena against the script's 8000 B inline budget — ceiling #1 of
 		// design 0131-0009, and the FIRST view in the corpus to breach it.
 		// The prerequisite is DECLARE_TOAST(pg_rewrite, 2838, 2839); ledgered.
+		// M0131-S9.2b (2026-08-12): the shared-catalog tranche. pg_roles is
+		// `FROM pg_authid` (1260) LEFT JOIN pg_db_role_setting (2964) and
+		// pg_stat_activity joins pg_stat_get_activity(NULL) against pg_authid
+		// (1260) AND pg_database (1262) — the first captured blobs that read
+		// SHARED catalogs, and pg_stat_activity is the first that mixes an SRF
+		// with catalog relations in one join tree. Every base OID is again a
+		// sub-12000 bootstrap constant, so no in-band `:relid` and no
+		// view-on-view ordering (measured, not assumed).
+		{"pg_roles", 12000, 12003, 12002, 13},
 		{"pg_views", 12028, 12031, 12030, 4},
 		{"pg_tables", 12033, 12036, 12035, 8},
 		{"pg_matviews", 12038, 12041, 12040, 7},
@@ -135,6 +144,8 @@ func systemViewOIDPins() []systemViewOIDPin {
 		{"pg_shmem_allocations", 12134, 12137, 12136, 4},
 		{"pg_shmem_allocations_numa", 12138, 12141, 12140, 3},
 		{"pg_backend_memory_contexts", 12142, 12145, 12144, 10},
+		// M0131-S9.2b, continued (see the pg_roles comment above).
+		{"pg_stat_activity", 12226, 12229, 12228, 22},
 		// The six M0131-S8a views, interleaved by upstream OID.
 		{"pg_stat_replication", 12231, 12234, 12233, 20},
 		{"pg_stat_slru", 12236, 12239, 12238, 9},
