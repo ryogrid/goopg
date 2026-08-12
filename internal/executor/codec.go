@@ -326,18 +326,9 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		binary.LittleEndian.PutUint64(buf[:], u)
 		return buf[:], nil
 	case "oid", "regproc":
-		var v int64
-		switch d.Kind {
-		case KindInt:
-			v = d.Int
-		case KindString:
-			var err error
-			v, err = coerceStringToInt64(d.StringValue(), "oid")
-			if err != nil {
-				return nil, err
-			}
-		default:
-			return nil, fmt.Errorf("expected int, got kind %d", d.Kind)
+		v, err := pgUnsignedIDFromDatum(d, "oid", 32)
+		if err != nil {
+			return nil, err
 		}
 		var buf [4]byte
 		binary.LittleEndian.PutUint32(buf[:], uint32(v))
@@ -563,17 +554,31 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		var buf8 [8]byte
 		binary.LittleEndian.PutUint64(buf8[:], math.Float64bits(f))
 		return buf8[:], nil
-	case "xid", "xid8":
-		// PG TransactionId: 4-byte unsigned LE
-		var v uint32
-		switch d.Kind {
-		case KindInt:
-			v = uint32(d.Int)
-		default:
-			return nil, fmt.Errorf("expected int for xid, got kind %d", d.Kind)
+	case "xid":
+		// PG TransactionId: 4-byte unsigned LE (pg_type OID 28, typlen 4).
+		v, err := pgUnsignedIDFromDatum(d, "xid", 32)
+		if err != nil {
+			return nil, err
 		}
 		var buf [4]byte
-		binary.LittleEndian.PutUint32(buf[:], v)
+		binary.LittleEndian.PutUint32(buf[:], uint32(v))
+		return buf[:], nil
+	case "xid8":
+		// M0119-0006 (54th slice): xid8 shared the `xid` arm and was written as
+		// FOUR bytes, silently truncating a FullTransactionId to its low 32
+		// bits. pg_type OID 5069 is typlen **8**, typbyval FLOAT8PASSBYVAL,
+		// typalign 'd' (postgres/src/include/catalog/pg_type.dat) — goopg's own
+		// internal/initdb/pg_type_seed_data.go:190 already seeds Len: 8 — so the
+		// heap disagreed with the catalog it ships by four bytes AND by the
+		// alignment of every column after it, which is exactly what a hosted PG
+		// deforming the tuple with its own descriptor reads. See
+		// physicalPGTypeAlign, whose 'd' arm this slice also gained.
+		v, err := pgUnsignedIDFromDatum(d, "xid8", 64)
+		if err != nil {
+			return nil, err
+		}
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], v)
 		return buf[:], nil
 	case "numeric", "decimal":
 		// M0119-0006: PG's base-10000 NumericData varlena (numeric.c
@@ -1063,7 +1068,11 @@ func physicalPGTypeAlign(t catalog.Type) int {
 	case "int8", "bigint", "bigserial", "pg_lsn", "float8", "double precision", "double", "timestamp", "timestamptz", "time", "timetz",
 		// interval is typalign 'd' (pg_type OID 1186) even though its 16 bytes
 		// exceed a Datum — the struct's leading field is an int64.
-		"interval":
+		"interval",
+		// xid8 is typalign 'd' (pg_type OID 5069, typlen 8) — it had been
+		// falling through to the default 4 while its 4-byte encode hid the
+		// consequence. M0119-0006 (54th slice); `xid` (OID 28) stays 'i' above.
+		"xid8":
 		return 8
 	case "name",
 		// uuid is pg_type OID 2950: typlen 16, typalign 'c'. Its 16 bytes
@@ -1217,12 +1226,21 @@ func decodePhysicalPGValueMctxStyled(t catalog.Type, data []byte, sctx *mctx.Con
 			return Datum{}, 0, fmt.Errorf("truncated oid")
 		}
 		return NewIntDatum(int64(binary.LittleEndian.Uint32(data[:4]))), 4, nil
-	case "xid", "xid8":
-		// encodeValuePG writes xid/xid8 as a 4-byte LE TransactionId.
+	case "xid":
+		// encodeValuePG writes xid as a 4-byte LE TransactionId.
 		if len(data) < 4 {
 			return Datum{}, 0, fmt.Errorf("truncated xid")
 		}
 		return NewIntDatum(int64(binary.LittleEndian.Uint32(data[:4]))), 4, nil
+	case "xid8":
+		// Decode twin of the "xid8" encode arm — 8 LE bytes, pg_type 5069's
+		// typlen. Splitting it out of the shared "xid" arm is the decode half of
+		// the 54th slice's truncation fix; leaving it here would have read four
+		// bytes of an eight-byte column and left the next column's offset short.
+		if len(data) < 8 {
+			return Datum{}, 0, fmt.Errorf("truncated xid8")
+		}
+		return NewIntDatum(int64(binary.LittleEndian.Uint64(data[:8]))), 8, nil
 	case "name":
 		// PG NameData: fixed 64 bytes, '\0'-padded (see encodeValuePG).
 		if len(data) < 64 {
@@ -1858,6 +1876,42 @@ func encodeVarlen(b []byte) []byte {
 	binary.BigEndian.PutUint32(out[:4], uint32(len(b)))
 	copy(out[4:], b)
 	return out
+}
+
+// pgUnsignedIDFromDatum coerces a Datum to the unsigned integer an
+// oid/regproc/xid/xid8 column stores. All four are PG's "unsigned identifier"
+// family — typbyval, no varlena, and printed by oidout/xidout/xid8out with the
+// UNSIGNED %u/UINT64_FORMAT conversion — while goopg's Datum carries a signed
+// int64, so the whole family shares one coercion and one range rule.
+//
+// bits is 32 for oid/regproc/xid and 64 for xid8. The bound mirrors upstream
+// uint32in_subr (postgres/src/backend/utils/adt/numutils.c, reached from oidin
+// via oid.c:41) and xid8in's uint64in_subr: a value outside the type's range is
+// 22003, never a silent wrap. typeName is the name PG puts in that message.
+//
+// M0119-0006 (54th slice): extracted so the heap arms of encodeValuePG and the
+// binary-COPY arms of datumToCopyBinary (copy_binary.go) cannot drift — the two
+// are twins under Hard-won Rule #2, differing only in byte order. This mirrors
+// the 53rd slice's pgFloatFromDatum extraction.
+func pgUnsignedIDFromDatum(d Datum, typeName string, bits int) (uint64, error) {
+	var v int64
+	switch d.Kind {
+	case KindInt:
+		v = d.Int
+	case KindString:
+		var err error
+		v, err = coerceStringToInt64(d.StringValue(), typeName)
+		if err != nil {
+			return 0, err
+		}
+	default:
+		return 0, fmt.Errorf("expected int for %s, got kind %d", typeName, d.Kind)
+	}
+	if v < 0 || (bits == 32 && v > math.MaxUint32) {
+		return 0, &ExecError{Code: "22003",
+			Message: fmt.Sprintf("value %q is out of range for type %s", strings.TrimSpace(d.Format()), typeName)}
+	}
+	return uint64(v), nil
 }
 
 // floatTextDatum converts a PGFloatOut rendering into the Datum shape the

@@ -3350,6 +3350,26 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       of reading the transition list, and the abbreviation table is still
       goopg's 40-entry map rather than the GUC-selected file. Design
       `0125-0007-…` §17 + README row.
+      **54th slice (2026-08-13): binary `COPY` of the unsigned-identifier family
+      (`oid`/`regproc`/`xid`/`xid8`) and `uuid`, both directions.** The default's
+      `KindInt` escape shipped EIGHT bytes where `oidsend`/`regprocsend`/`xidsend`
+      are `pq_sendint32`, and `uuid` shipped its 36-char TEXT where `uuid_send` is
+      `pq_sendbytes(…, 16)`; the decode half handed all five back as raw-bytes
+      string Datums. Coercion + upstream's 22003 range rule extracted into a
+      shared `pgUnsignedIDFromDatum` so heap and wire cannot drift (the 53rd
+      slice's `pgFloatFromDatum` move repeated). **The finding was `xid8`, and
+      only the heap-agreement twin test could reach it:** its COPY arm was
+      ACCIDENTALLY right at HEAD, so the pin pointed at the heap instead —
+      `encodeValuePG` shared the 4-byte `xid` arm and truncated a
+      `FullTransactionId` to 32 bits, `physicalPGTypeAlign` returned 4 where
+      `pg_type` 5069 says `'d'`, and `internal/wal/pgoutput.go` had the same
+      4-byte arm. Item stays UNCHECKED (standing slice-by-slice cluster).
+      7 fail-when-broken guards red at HEAD; oracle E2E byte-identical both
+      directions incl. `xid8 = 9007199254740993`. 1 ledger row resolved, 3 filed
+      (`reg*`/`cid` still varlena text on the heap; `xid8` above
+      `math.MaxInt64` unrepresentable in the signed-`int64` Datum;
+      `interval`/`jsonb`/`bpchar` arms still missing). Design
+      `0119-0006-copy-binary-oid-family.md` + README row.
 
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).

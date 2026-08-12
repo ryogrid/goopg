@@ -202,6 +202,68 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 		b := make([]byte, 8)
 		binary.BigEndian.PutUint64(b, math.Float64bits(f))
 		return b, nil
+	case "oid", "regproc":
+		// M0119-0006 (54th slice): before this arm an `oid` column fell through
+		// to the default's KindInt escape and shipped EIGHT big-endian bytes.
+		// Upstream oidsend (postgres/src/backend/utils/adt/oid.c:71) is
+		// pq_sendint32 — exactly four — so every binary COPY of an oid column
+		// produced a stream a real PG client rejects with "incorrect binary data
+		// format" (CopyReadBinaryAttribute's pq_getmsgend). regproc shares the
+		// arm because regprocsend IS oidsend upstream ("Exactly the same as
+		// oidsend, so share code", regproc.c:208-212) — the same pairing the
+		// heap codec already uses.
+		v, err := pgUnsignedIDFromDatum(d, "oid", 32)
+		if err != nil {
+			return nil, err
+		}
+		b := make([]byte, 4)
+		binary.BigEndian.PutUint32(b, uint32(v))
+		return b, nil
+	case "xid":
+		// xidsend (postgres/src/backend/utils/adt/xid.c:67) is pq_sendint32 over
+		// the 4-byte TransactionId — same width and same default-arm bug as oid.
+		v, err := pgUnsignedIDFromDatum(d, "xid", 32)
+		if err != nil {
+			return nil, err
+		}
+		b := make([]byte, 4)
+		binary.BigEndian.PutUint32(b, uint32(v))
+		return b, nil
+	case "xid8":
+		// xid8send (xid.c:225) is pq_sendint64 over the FullTransactionId. The
+		// default arm happened to ship the right EIGHT bytes for this one type,
+		// which is why the divergence hid here and surfaced on the heap side
+		// instead (see the "xid8" arm of encodeValuePG). Naming it explicitly is
+		// what makes the two twins provably agree rather than coincidentally.
+		v, err := pgUnsignedIDFromDatum(d, "xid8", 64)
+		if err != nil {
+			return nil, err
+		}
+		b := make([]byte, 8)
+		binary.BigEndian.PutUint64(b, v)
+		return b, nil
+	case "uuid":
+		// uuid_send (postgres/src/backend/utils/adt/uuid.c:192) is
+		// pq_sendbytes(uuid->data, UUID_LEN) — the raw 16 bytes, which is
+		// byte-for-byte what the heap already stores since the uuid arm of
+		// encodeValuePG stopped storing text. Before this arm the default shipped
+		// the 36-character canonical TEXT under FORMAT binary; unlike the float
+		// case that is not silent corruption (36 != 16, so uuid_recv's
+		// pq_getmsgbytes fails) but it is still a stream no PG client can read.
+		if d.Kind != KindString {
+			return nil, fmt.Errorf("expected string for uuid, got kind %d", d.Kind)
+		}
+		s := d.StringValue()
+		if !isValidUUIDStr(s) {
+			return nil, &ExecError{Code: "22P02",
+				Message: fmt.Sprintf("invalid input syntax for type uuid: %q", s)}
+		}
+		raw, ok := uuidBytesFromCanonical(normalizeUUIDStr(s))
+		if !ok {
+			return nil, &ExecError{Code: "22P02",
+				Message: fmt.Sprintf("invalid input syntax for type uuid: %q", s)}
+		}
+		return append([]byte(nil), raw[:]...), nil
 	case "bool", "boolean":
 		if d.Kind != KindBool {
 			return nil, fmt.Errorf("expected bool, got kind %d", d.Kind)
@@ -346,6 +408,39 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 		}
 		f8 := math.Float64frombits(binary.BigEndian.Uint64(payload))
 		return floatTextDatum(PGFloatOut(f8, 64)), nil
+	case "oid", "regproc":
+		// Decode twin of the "oid"/"regproc" encode arm. Upstream oidrecv
+		// (oid.c:60) is pq_getmsgint(buf, sizeof(Oid)) and regprocrecv IS oidrecv
+		// (regproc.c:198-202); the binary COPY parser's pq_getmsgend makes any
+		// other length "incorrect binary data format". The Datum shape is the
+		// heap decode arm's — NewIntDatum over the UNSIGNED 32-bit value, so an
+		// oid that entered through binary COPY compares and indexes identically
+		// to the same oid entering through INSERT. Before this arm the default
+		// handed back the raw bytes as a STRING Datum (Hard-won Rule #2).
+		if len(payload) != 4 {
+			return Datum{}, fmt.Errorf("oid: expected 4 bytes, got %d", len(payload))
+		}
+		return NewIntDatum(int64(binary.BigEndian.Uint32(payload))), nil
+	case "xid":
+		// xidrecv (xid.c:56) — pq_getmsgint over sizeof(TransactionId).
+		if len(payload) != 4 {
+			return Datum{}, fmt.Errorf("xid: expected 4 bytes, got %d", len(payload))
+		}
+		return NewIntDatum(int64(binary.BigEndian.Uint32(payload))), nil
+	case "xid8":
+		// xid8recv (xid.c:215) — pq_getmsgint64 over the FullTransactionId.
+		if len(payload) != 8 {
+			return Datum{}, fmt.Errorf("xid8: expected 8 bytes, got %d", len(payload))
+		}
+		return NewIntDatum(int64(binary.BigEndian.Uint64(payload))), nil
+	case "uuid":
+		// uuid_recv (uuid.c:181) copies exactly UUID_LEN bytes. The Datum is the
+		// canonical lowercase-with-dashes KindString the heap decode produces —
+		// the engine has no uuid Kind and speaks that text everywhere else.
+		if len(payload) != 16 {
+			return Datum{}, fmt.Errorf("uuid: expected 16 bytes, got %d", len(payload))
+		}
+		return NewStringDatum(uuidCanonicalFromBytes(payload)), nil
 	case "bool", "boolean":
 		if len(payload) != 1 {
 			return Datum{}, fmt.Errorf("bool: expected 1 byte, got %d", len(payload))
