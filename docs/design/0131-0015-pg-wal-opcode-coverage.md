@@ -1130,6 +1130,60 @@ marker — so a real PG starting on a goopg `$PGDATA` still loses the
 subtransaction tree of a goopg-committed transaction. That is the emit-side
 mirror of this slice, and it belongs with the commit path, not with recovery.
 
+### S21c — implementation notes: in-place line-pointer reuse (landed 2026-08-12)
+
+Found while gating S22: with S21a's `XLOG_NEXTOID` refusal gone, the S28 crash
+E2E's next stop was
+
+```
+xlog heap-multi-insert entry 0 targets already-allocated line pointer N — goopg redo has no in-place line-pointer reuse
+```
+
+**One upstream call, three goopg call sites.** `heap_xlog_insert`,
+`heap_xlog_multi_insert` and `heap_xlog_update` all place their tuple with the
+identical `PageAddItemExtended(page, item, size, offnum, PAI_OVERWRITE |
+PAI_IS_HEAP)` (`postgres/src/backend/storage/page/bufpage.c:193-330`). That one
+call hides two cases, and goopg needs two different primitives for them:
+
+| case | upstream | goopg |
+|---|---|---|
+| `offnum` past the array end | append | `PageInsertItemRawAt` (its `[1,count+1]` check *is* upstream's "invalid max offset number" PANIC) |
+| `offnum` inside the array, pointer LP_UNUSED | fill IN PLACE | `PageReplaceItemRaw` + `PageSetLinePointerNormal` |
+| `offnum` inside the array, pointer USED | WARNING "will not overwrite a used ItemId" → caller PANICs | refuse with `ErrUnsupportedRecord` |
+
+The in-place case is **ordinary traffic, not an exotic shape**: any page pruned
+before the insert carries LP_UNUSED holes, so a `COPY` after a `VACUUM` — the
+S28 workload exactly — reaches it constantly.
+
+The three sites disagreed in three different ways, which is why this is one
+slice and not three:
+
+- **multi-insert** refused loudly (the message above) — honest, but a refusal.
+- **single insert** had *no check at all*: it called `PageInsertItemRawAt`
+  directly, which SHIFTS the line-pointer array right. The row at the target
+  slot silently moves to the next one and every ctid pointing at it goes stale —
+  silent corruption where upstream PANICs. This is the sibling-path rule
+  (`pattern_sibling_paths_must_agree`) paying off: nothing in the S21a-2 work
+  pointed at this path, and its own tests were green.
+- **update** ignored `new_offnum` altogether — it APPENDED via
+  `PageAddHeapTuple` and then merely complained when the resulting slot
+  disagreed (`"xlog heap-update new-slot drift: got 48, want 5"`), which is a
+  refusal on every real-PG tail that updates into a hole.
+
+All three now route through `redoHeapPageAddItemOverwrite`
+(`internal/wal/recovery.go`), which is the goopg spelling of that upstream call.
+Keeping the USED-pointer case a hard refusal is deliberate: a used slot means
+the page on disk disagrees with the record, and writing anyway trades a loud
+start failure for a wrong ctid discovered much later.
+
+**Effect on the S28 gate:** `TestE2E_GoopgCrashStartOnPGDataDir` advanced from
+refusing at replay record 24720 to 43900, where it now stops at a *different*
+defect — `"xlog heap-update: block 41 is uninitialised"`. That is the update
+path missing S21a-2's `redoHeapPageForBlock` treatment (zero-extend past the
+replay gap + honour `XLOG_HEAP_INIT_PAGE`), which the insert paths already have.
+Filed as **M0131-S21d** with a ledger row; it is a page-acquisition defect, not
+a line-pointer one, so it is not folded in here.
+
 ## Guards
 
 1. Per-opcode unit tests over fixtures captured from a real PG 18.3 via
@@ -1152,9 +1206,13 @@ mirror of this slice, and it belongs with the commit path, not with recovery.
    committed; an `XLOG_XACT_ASSIGNMENT` record leaves CLOG **untouched** (today it
    stamps aborted); an E2E whose PG workload opens a `SAVEPOINT`, writes, releases
    and commits before the kill sees those rows after a goopg start.
-8. The S28 reverse crash E2E (`0131-0017`) with the full opcode workload: COPY,
+8. S21c: an insert into an LP_UNUSED hole replays IN PLACE without shifting the
+   array — asserted on **both** the insert and multi-insert paths, since a green
+   test on one proves nothing about the other; and a USED target line pointer is
+   refused on both.
+9. The S28 reverse crash E2E (`0131-0017`) with the full opcode workload: COPY,
    VACUUM, `SELECT … FOR UPDATE`, TRUNCATE, SAVEPOINT, index-heavy insert.
-9. UNITS + RACE (`internal/wal`, `internal/initdb`) + SMOKE + SPOT green.
+10. UNITS + RACE (`internal/wal`, `internal/initdb`) + SMOKE + SPOT green.
 
 ## References
 

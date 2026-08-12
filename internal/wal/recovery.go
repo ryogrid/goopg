@@ -3132,12 +3132,13 @@ func replayDecodedXLogHeapInsert(mgr *storage.Manager, r Record, xlog *XLogDecod
 	if skip {
 		return nil
 	}
-	got, err := storage.PageInsertItemRawAt(page, offnum, tupleRaw)
-	if err != nil {
-		return fmt.Errorf("wal: xlog heap-insert apply: %w", err)
-	}
-	if got != offnum {
-		return fmt.Errorf("wal: xlog heap-insert replay slot drift: got %d, want %d (block %d)", got, offnum, block.Block)
+	// M0131-S21c sibling: heap_xlog_insert uses the same
+	// PageAddItemExtended(PAI_OVERWRITE) as heap_xlog_multi_insert, so a single
+	// INSERT into a pruned page's LP_UNUSED hole must reuse the pointer in place
+	// too. This path used to call PageInsertItemRawAt directly, which SHIFTED
+	// the array — the same bug the multi-insert path refused loudly.
+	if err := redoHeapPageAddItemOverwrite(page, offnum, tupleRaw); err != nil {
+		return fmt.Errorf("wal: xlog heap-insert apply (block %d): %w", block.Block, err)
 	}
 	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
 	return mgr.WriteBlock(block.Rel, block.Block, page)
@@ -3214,6 +3215,63 @@ func redoHeapPageForBlock(mgr *storage.Manager, block XLogBlockRef, endLSN stora
 	return page, false, nil
 }
 
+// redoHeapPageAddItemOverwrite places `raw` at the 1-based offset `offnum` on a
+// heap page, mirroring the call every heap redo routine makes:
+// PageAddItemExtended(page, item, size, offnum, PAI_OVERWRITE | PAI_IS_HEAP)
+// (postgres/src/backend/storage/page/bufpage.c:193-330).
+//
+// M0131-S21c. Two distinct cases hide behind that one upstream call, and goopg
+// needs two different primitives for them:
+//
+//   - offnum is past the end of the line-pointer array (the common case): the
+//     pointer is appended. PageInsertItemRawAt does this, and its [1, count+1]
+//     range check is upstream's "invalid max offset number" PANIC.
+//   - offnum is INSIDE the array: upstream takes the PAI_OVERWRITE branch and
+//     fills the existing line pointer IN PLACE, without shifting anything. A
+//     real-PG crash tail reaches this whenever the page was pruned before the
+//     insert (a COPY after a VACUUM leaves LP_UNUSED holes), so it is ordinary
+//     traffic, not an exotic shape. PageInsertItemRawAt is the WRONG primitive
+//     here — it would shift the array right and displace whatever occupies the
+//     following slots — so the in-place pair PageReplaceItemRaw (which allocates
+//     fresh tuple bytes at pd_upper for a zero-length pointer, leaving pd_lower
+//     alone) + PageSetLinePointerNormal (PageReplaceItemRaw deliberately
+//     preserves the old flags) is used instead.
+//
+// Upstream refuses the in-place branch when the target is `ItemIdIsUsed() ||
+// ItemIdHasStorage()` — WARNING "will not overwrite a used ItemId", returning
+// InvalidOffsetNumber, which every heap redo caller turns into a PANIC
+// ("failed to add tuple"). goopg keeps that as a hard refusal too: a used slot
+// means the page on disk disagrees with the record, and writing anyway is
+// silent corruption that surfaces much later as a wrong ctid.
+func redoHeapPageAddItemOverwrite(page storage.Page, offnum uint16, raw []byte) error {
+	count, err := storage.PageLinePointerCount(page)
+	if err != nil {
+		return fmt.Errorf("read line-pointer count: %w", err)
+	}
+	if int(offnum) > count {
+		got, err := storage.PageInsertItemRawAt(page, offnum, raw)
+		if err != nil {
+			return err
+		}
+		if got != offnum {
+			return fmt.Errorf("slot drift: got %d, want %d", got, offnum)
+		}
+		return nil
+	}
+	id, err := storage.PageGetItemID(page, offnum)
+	if err != nil {
+		return fmt.Errorf("read line pointer %d: %w", offnum, err)
+	}
+	if id.Flags != storage.ItemIDUnused || id.Length != 0 {
+		return fmt.Errorf("%w: will not overwrite used line pointer %d (flags=%d len=%d, page has %d) — the page disagrees with the record",
+			ErrUnsupportedRecord, offnum, id.Flags, id.Length, count)
+	}
+	if err := storage.PageReplaceItemRaw(page, offnum, raw); err != nil {
+		return fmt.Errorf("reuse line pointer %d: %w", offnum, err)
+	}
+	return storage.PageSetLinePointerNormal(page, offnum)
+}
+
 // replayDecodedXLogHeapMultiInsert applies a real-PG XLOG_HEAP2_MULTI_INSERT,
 // mirroring heap_xlog_multi_insert (heapam_xlog.c:600-731). This is every COPY:
 // heap_multi_insert batches as many tuples as fit on one page into a single
@@ -3260,29 +3318,10 @@ func replayDecodedXLogHeapMultiInsert(mgr *storage.Manager, r Record, xlog *XLog
 		return nil
 	}
 	for i, offnum := range offsets {
-		// Upstream PANICs on "invalid max offset number" when the target slot
-		// is more than one past the page's end; goopg's PageInsertItemRawAt
-		// enforces the same [1, count+1] range. What goopg cannot do is
-		// upstream's PageAddItem(overwrite=true) reuse of an ALREADY-ALLOCATED
-		// line pointer — PageInsertItemRawAt would shift the array and displace
-		// the existing item — so that case is refused rather than silently
-		// corrupting the page (deferral ledger, S21a-2).
-		count, err := storage.PageLinePointerCount(page)
-		if err != nil {
-			return fmt.Errorf("wal: xlog heap-multi-insert page: %w", err)
-		}
-		if int(offnum) <= count {
-			return fmt.Errorf("%w: xlog heap-multi-insert entry %d targets already-allocated line pointer %d (page has %d) — goopg redo has no in-place line-pointer reuse",
-				ErrUnsupportedRecord, i, offnum, count)
-		}
 		tupleRaw := buildTupleFromXLogHeapHeader(tuples[i].header, tuples[i].data,
 			storage.TransactionID(xlog.Header.XID), block.Block, offnum)
-		got, err := storage.PageInsertItemRawAt(page, offnum, tupleRaw)
-		if err != nil {
-			return fmt.Errorf("wal: xlog heap-multi-insert apply entry %d: %w", i, err)
-		}
-		if got != offnum {
-			return fmt.Errorf("wal: xlog heap-multi-insert slot drift: got %d, want %d (entry %d, block %d)", got, offnum, i, block.Block)
+		if err := redoHeapPageAddItemOverwrite(page, offnum, tupleRaw); err != nil {
+			return fmt.Errorf("wal: xlog heap-multi-insert apply entry %d (block %d): %w", i, block.Block, err)
 		}
 	}
 	// The visibility-map bits upstream mirrors onto the heap page itself. The
@@ -4056,16 +4095,16 @@ func replayDecodedXLogHeapUpdate(mgr *storage.Manager, r Record, xlog *XLogDecod
 		return storage.PageStampUpdatedOldTuple(p, oldOffnum, storage.TransactionID(oldXmax), block.Block, newOffnum)
 	}
 	if storage.MustHeader(page).LSN() < storage.LSN(r.EndLSN) {
-		tup, err := storage.ParseHeapTuple(newTupleBytes)
-		if err != nil {
-			return fmt.Errorf("wal: xlog heap-update parse new tuple: %w", err)
-		}
-		gotSlot, err := storage.PageAddHeapTuple(page, tup)
-		if err != nil {
+		// M0131-S21c: place the new version AT new_offnum, exactly as
+		// heap_xlog_update's PageAddItemExtended(..., xlrec->new_offnum,
+		// PAI_OVERWRITE | PAI_IS_HEAP) does — the third member of the
+		// insert/multi-insert/update sibling family. This used to APPEND
+		// (PageAddHeapTuple) and then merely complain when the resulting slot
+		// disagreed with the record ("new-slot drift"), which refused the start
+		// on every real-PG tail that updates into a pruned page's hole: the
+		// append lands at the end of the array while the record says slot N.
+		if err := redoHeapPageAddItemOverwrite(page, newOffnum, newTupleBytes); err != nil {
 			return fmt.Errorf("wal: xlog heap-update add new tuple: %w", err)
-		}
-		if gotSlot != newOffnum {
-			return fmt.Errorf("wal: xlog heap-update new-slot drift: got %d, want %d", gotSlot, newOffnum)
 		}
 		if samePage {
 			if err := stampOld(page); err != nil {

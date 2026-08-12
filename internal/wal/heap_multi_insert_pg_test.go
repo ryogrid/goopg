@@ -345,13 +345,18 @@ func TestReplayPGHeapMultiInsertRejectsMalformedBlockData(t *testing.T) {
 	})
 }
 
-// TestReplayPGHeapMultiInsertRefusesLinePointerReuse: upstream's
-// PageAddItem(overwrite=true) can fill an already-allocated (dead) line pointer
-// in place; goopg's PageInsertItemRawAt would SHIFT the array instead and
-// displace the tuple already at that slot. The refusal is the honest answer
-// until redo grows in-place reuse — a shifted page is silent corruption that
-// only shows up as a wrong ctid much later. Ledger row: M0131-S21a-2.
-func TestReplayPGHeapMultiInsertRefusesLinePointerReuse(t *testing.T) {
+// TestReplayPGHeapMultiInsertRefusesUsedLinePointer: upstream's
+// PageAddItemExtended(PAI_OVERWRITE) refuses a target line pointer that is
+// still USED — WARNING "will not overwrite a used ItemId" (bufpage.c:227-236),
+// which heap_xlog_multi_insert turns into a "failed to add tuple" PANIC. goopg
+// refuses too rather than shifting the array (PageInsertItemRawAt's behaviour),
+// which would displace the tuple already at that slot and only surface much
+// later as a wrong ctid.
+//
+// M0131-S21c narrowed this refusal: the LP_UNUSED case it used to reject as
+// well now replays in place — see
+// TestReplayPGHeapInsertReusesUnusedLinePointer.
+func TestReplayPGHeapMultiInsertRefusesUsedLinePointer(t *testing.T) {
 	mgr := storage.NewManager(storage.ManagerConfig{DataDir: t.TempDir()})
 	defer mgr.Close()
 	rel := storage.RelFileNode{DBOid: 1, RelOid: 4026, Fork: storage.MainFork}
@@ -375,6 +380,128 @@ func TestReplayPGHeapMultiInsertRefusesLinePointerReuse(t *testing.T) {
 	err := applyPGRecordErr(t, mgr, framed, 800)
 	if err == nil {
 		t.Fatal("replay accepted a multi-insert onto an already-allocated line pointer")
+	}
+	if !errors.Is(err, ErrUnsupportedRecord) {
+		t.Fatalf("err = %v, want ErrUnsupportedRecord", err)
+	}
+}
+
+// TestReplayPGHeapInsertReusesUnusedLinePointer is M0131-S21c's guard: a real
+// PG tail routinely inserts INTO a hole left by an earlier prune (a COPY after
+// a VACUUM — exactly the S28 crash-start workload), and upstream fills that
+// LP_UNUSED line pointer IN PLACE via PageAddItemExtended(PAI_OVERWRITE).
+//
+// Before S21c the multi-insert path refused the whole start here and the single
+// -insert path silently SHIFTED the line-pointer array, displacing the row in
+// the following slot. Both are asserted, since heap_xlog_insert and
+// heap_xlog_multi_insert make the identical upstream call and now share
+// redoHeapPageAddItemOverwrite — a green test on one proves nothing about the
+// other (sibling-path rule).
+func TestReplayPGHeapInsertReusesUnusedLinePointer(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		build func(rel storage.RelFileNode, slot uint16, val string) []byte
+	}{
+		{"multi-insert", func(rel storage.RelFileNode, slot uint16, val string) []byte {
+			return buildMultiInsertPG(t, rel, 0, 12, 0, []uint16{slot},
+				multiInsertTuples(t, 12, val), false)
+		}},
+		{"insert", func(rel storage.RelFileNode, slot uint16, val string) []byte {
+			framed, err := EncodeHeapInsertPG(rel, 0, slot, multiInsertTuples(t, 12, val)[0], false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return framed
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr := storage.NewManager(storage.ManagerConfig{DataDir: t.TempDir()})
+			defer mgr.Close()
+			rel := storage.RelFileNode{DBOid: 1, RelOid: 4027, Fork: storage.MainFork}
+
+			// Seed slots 1..3, then prune slot 2 — the LP_UNUSED hole a
+			// VACUUM leaves behind. Slot 3 must still be readable afterwards:
+			// it is what a shifting insert would displace.
+			for _, seed := range []struct {
+				slot uint16
+				val  string
+			}{{1, "a"}, {2, "b"}, {3, "c"}} {
+				framed, err := EncodeHeapInsertPG(rel, 0, seed.slot,
+					multiInsertTuples(t, 4, seed.val)[0], seed.slot == 1)
+				if err != nil {
+					t.Fatal(err)
+				}
+				applyPGRecord(t, mgr, framed, uint64(100+seed.slot))
+			}
+			page := make(storage.Page, storage.BlockSize)
+			if err := mgr.ReadBlock(rel, 0, page); err != nil {
+				t.Fatal(err)
+			}
+			if err := storage.PageRemoveHeapTuple(page, 2); err != nil {
+				t.Fatal(err)
+			}
+			if err := mgr.WriteBlock(rel, 0, page); err != nil {
+				t.Fatal(err)
+			}
+			if id, err := storage.PageGetItemID(page, 2); err != nil || id.Flags != storage.ItemIDUnused {
+				t.Fatalf("seeded slot 2 = %+v (err %v), want LP_UNUSED", id, err)
+			}
+
+			if err := applyPGRecordErr(t, mgr, tc.build(rel, 2, "reused"), 800); err != nil {
+				t.Fatalf("replay refused an insert into an LP_UNUSED hole: %v", err)
+			}
+
+			if err := mgr.ReadBlock(rel, 0, page); err != nil {
+				t.Fatal(err)
+			}
+			count, err := storage.PageLinePointerCount(page)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if count != 3 {
+				t.Fatalf("line pointers = %d, want 3 (the array was shifted, not reused)", count)
+			}
+			for slot, want := range map[uint16]string{1: "a", 2: "reused", 3: "c"} {
+				tup, err := storage.PageGetHeapTuple(page, slot)
+				if err != nil {
+					t.Fatalf("slot %d: %v", slot, err)
+				}
+				if string(tup.Data) != want {
+					t.Fatalf("slot %d data = %q, want %q", slot, tup.Data, want)
+				}
+			}
+		})
+	}
+}
+
+// TestReplayPGHeapInsertRefusesUsedLinePointer is the single-insert twin of
+// TestReplayPGHeapMultiInsertRefusesUsedLinePointer. Until M0131-S21c this path
+// had NO check at all: PageInsertItemRawAt shifted the array and the row at the
+// target slot moved to the next one, so every ctid pointing at it went stale —
+// silent corruption where upstream PANICs.
+func TestReplayPGHeapInsertRefusesUsedLinePointer(t *testing.T) {
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: t.TempDir()})
+	defer mgr.Close()
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 4028, Fork: storage.MainFork}
+
+	for _, seed := range []struct {
+		slot uint16
+		val  string
+	}{{1, "a"}, {2, "b"}} {
+		framed, err := EncodeHeapInsertPG(rel, 0, seed.slot, multiInsertTuples(t, 4, seed.val)[0], seed.slot == 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		applyPGRecord(t, mgr, framed, uint64(100+seed.slot))
+	}
+
+	framed, err := EncodeHeapInsertPG(rel, 0, 1, multiInsertTuples(t, 12, "clash")[0], false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = applyPGRecordErr(t, mgr, framed, 800)
+	if err == nil {
+		t.Fatal("replay accepted a heap-insert onto a USED line pointer")
 	}
 	if !errors.Is(err, ErrUnsupportedRecord) {
 		t.Fatalf("err = %v, want ErrUnsupportedRecord", err)
