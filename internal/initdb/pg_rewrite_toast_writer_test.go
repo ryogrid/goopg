@@ -176,14 +176,16 @@ func TestExternalizeVarlenaPayloadIncompressibleLayout(t *testing.T) {
 // than a silent change in what goopg's initdb writes to base/{1,5}/2838.
 func TestPgRewriteEvActionDatumSwitchesRepresentation(t *testing.T) {
 	// rule OID -> view, for the captures whose ev_action does not fit inline.
-	// Upstream's stored sizes are 9002 / 9316 / 12196 / 35379 / 10475 B.
-	// M0131-S9.3f added the fifth and largest: pg_seclabels' 203378 B raw
-	// value compresses to 34093 B over 18 chunks, more than the other four
-	// together.
+	// Upstream's stored sizes are 9002 / 9316 / 12196 / 11481 / 35379 / 10475 B.
+	// M0131-S9.3f added the largest: pg_seclabels' 203378 B raw value
+	// compresses to 34093 B over 18 chunks, more than the other four together.
+	// M0131-S9.3g added the sixth and LAST — pg_stats_ext_exprs (rule 12066),
+	// 92109 B raw over 6 chunks, which completes upstream's 80-view corpus.
 	wantToasted := map[uint32]string{
 		12046: "pg_indexes",
 		12056: "pg_stats",
 		12061: "pg_stats_ext",
+		12066: "pg_stats_ext_exprs",
 		12102: "pg_seclabels",
 		12177: "pg_statio_all_tables",
 	}

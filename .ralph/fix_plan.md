@@ -4377,7 +4377,51 @@ Theme C — Real PG hosted on goopg evaluates views (closes "goopg cannot host a
       `TestE2E_PGColdStartOnGoopgDataDir` PASS (-count=1), UNITS PASS,
       `go build ./...` + `go vet` clean, pgbench smoke via the hook. Design
       `0131-0009` §S9.3e + F25/F26.
-      **S9.3f LANDED 2026-08-12 — the last instance of ceiling #4 CLOSED,
+      **S9.3g LANDED 2026-08-12 — the corpus is upstream's 80 of 80 and the
+      LAST ceiling (#6) is CLOSED.** `pg_stats_ext_exprs` (12063) is on disk and
+      evaluable on a hosted PG. Landed: a real `pg_type` row for **10029**
+      (`pg_statistic`'s composite rowtype — `'c'`/`'C'`, `'d'`/`'x'`, record I/O
+      quad 2290/2291/2402/2403), the new `pgTypeRelidOverlay` (`pgTypeRow` had
+      hardcoded `typrelid = 0` since M0106),
+      `nailedLocalRels{2619}.RelType` 83 → **10029**, and the pin
+      `{"pg_stats_ext_exprs", 12063, 12066, 12065, 17}` + whole-80 re-capture
+      (all 79 incumbent blobs byte-identical again). The two catalog halves are
+      coupled by CONSTRUCTION, not by comment: `pgTypeBootstrapEntryMap()` now
+      derives part of its OID set from `nailedRel.RelType`, so reverting the
+      pg_class side deletes the pg_type row with it (measured — break direction
+      2 reproduces break direction 1's `type with OID 10029 does not exist`).
+      **The slice's real content was F30, and it was NOT the missing row.**
+      With 10029 seeded a hosted PG still died on `TRAP: failed
+      Assert("OidIsValid(typentry->typrelid)")` from `add_paths_to_joinrel` →
+      `lookup_type_cache`: `_pg_statistic` (10028) was typed `'c'` under an
+      explicit comment that the value "carries no special meaning for the
+      standby's TupleDescInitEntry path" — true of that path, false of every
+      other. An array of a composite is a BASE type upstream (`'b'`), and
+      `insert_rel_type_cache_if_needed` (`typcache.c:3082`) asserts a valid
+      `typrelid` for anything claiming `'c'`, so a composite row with
+      `typrelid = 0` kills the backend rather than erroring. The audit found
+      **four more already-shipped instances** — the `BKI_ROWTYPE_OID` rows
+      71/75/81/83 (pg_type/pg_attribute/pg_proc/pg_class), generated out of
+      `pg_type.dat` and seeded with `typrelid = 0` since M0106, latent only
+      because nothing had yet type-cached a catalog rowtype as a VALUE. New
+      guard `TestPgTypeCompositeRowsCarryTyprelid` pins both directions
+      (`pg_class.reltype` and `pg_type.typrelid` are mutual inverses). Three
+      expectation guards moved with the capture: the toasted-rule set
+      (five → six, +12066 at 6 chunks), `base/{1,5}/2838` (10 → 12 pages) and
+      the hosted-PG chunk list (`12067/6/11089`; upstream 11481 B). 2 ledger
+      rows (the nine header-declared `BKI_ROWTYPE_OID` rowtypes goopg still does
+      not seed at all — `cmd/gen-pg-type-data` reads only `pg_type.dat`; and the
+      view being proven to PLAN but not to produce rows, since a goopg cluster
+      has no extended-statistics data to unnest). Gates: `internal/initdb` PASS
+      (226 s), `^TestE2E_` family PASS (106 s),
+      `TestE2E_PGColdStartOnGoopgDataDir` PASS + 2 scripted break directions,
+      UNITS PASS, `go build ./...` + `go vet` clean, pgbench smoke via the hook.
+      Design `0131-0009` §S9.3g + F30.
+      **Remaining in S9: no ceilings and no pg_catalog views — only S9.4**
+      (`information_schema`, 65 views, expected to defer), whose
+      fail-when-fixed tripwire (`information_schema.tables`) F29 already
+      installed.
+      **Superseded — S9.3f LANDED 2026-08-12 — the last instance of ceiling #4 CLOSED,
       corpus 78 → 79 of 80.** `pg_seclabels` (12099) is on disk and evaluable
       on a hosted PG. `pg_seclabel` (3596) and `pg_largeobject_metadata` (2995)
       are now EMPTY on-disk nailed catalogs (`pgSecLabelAttrs()` 5 cols —

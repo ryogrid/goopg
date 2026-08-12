@@ -842,6 +842,15 @@ func nailedSystemViewProbeSet() []struct {
 		{"pg_catalog.pg_sequences", "12048"},
 		{"pg_catalog.pg_stats", "12053"},
 		{"pg_catalog.pg_stats_ext", "12058"},
+		// M0131-S9.3g: the LAST of upstream's 80, and the corpus's only
+		// member that needed a pg_type row for a CATALOG's own rowtype.
+		// unnest(stxdexpr) yields _pg_statistic (10028) elements, so
+		// lookup_type_cache() resolves 10029 and dereferences its typrelid;
+		// with no such row a hosted PG raised "type with OID 10029 does not
+		// exist" and then died on Assert("OidIsValid(typentry->typrelid)")
+		// (typcache.c:3082) in abort. pgTypeCanonical(10029) +
+		// pgTypeRelidOverlay + nailedLocalRels{2619}.RelType = 10029.
+		{"pg_catalog.pg_stats_ext_exprs", "12063"},
 		{"pg_catalog.pg_publication_tables", "12068"},
 		{"pg_catalog.pg_locks", "12073"},
 		{"pg_catalog.pg_cursors", "12077"},
@@ -1128,6 +1137,7 @@ func assertHostedPGSeesPgRewriteToastRelation(t *testing.T, pg *pgcluster.Cluste
 		"12047/5/8674",   // pg_indexes           (upstream: 5 chunks / 9002 B)
 		"12057/5/8985",   // pg_stats             (upstream: 5 / 9316)
 		"12062/6/11743",  // pg_stats_ext         (upstream: 7 / 12196)
+		"12067/6/11089",  // pg_stats_ext_exprs   (upstream: 6 / 11481) — M0131-S9.3g
 		"12103/18/34093", // pg_seclabels         (upstream: 18 / 35379) — M0131-S9.3f
 		"12178/6/10125",  // pg_statio_all_tables (upstream: 6 / 10475)
 	}

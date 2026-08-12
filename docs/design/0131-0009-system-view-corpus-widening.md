@@ -1236,6 +1236,79 @@ the acceptance, not collateral: pg_type's column count (14 → 32,
 `initdb_test.go`), `base/{1,5}/2838`'s page count (6 → 10) and the toasted-rule
 set (four → five, +12102).
 
+## Implementation status — S9.3g (2026-08-12)
+
+**The corpus is upstream's 80 of 80.** `pg_stats_ext_exprs` (12063) is on disk
+and evaluable on a hosted PG, ceiling #6 is closed, and no `pg_catalog` view
+from `system_views.sql` is left out.
+
+Landed:
+
+1. **A real `pg_type` row for 10029**, `pg_statistic`'s composite rowtype:
+   `pgTypeCanonical(10029)` (`'c'`/`'C'`, `'d'`/`'x'`, the record I/O quad
+   2290/2291/2402/2403), `pgTypeElemArrayOverlay[10029] = {0, 10028, 0}` and a
+   new `pgTypeRelidOverlay` — `pgTypeRow` had hardcoded `typrelid = 0` for
+   every row since M0106, which is correct for base/pseudo/array types and
+   fatal for a composite.
+2. **`nailedLocalRels{2619}.RelType` 83 → 10029.** The two halves are coupled
+   by construction rather than by comment: `pgTypeBootstrapEntryMap()` now
+   derives part of its OID set from `nailedRel.RelType`, so reverting the
+   pg_class side deletes the pg_type row with it (measured — break direction 2
+   below reproduces break direction 1's error, not a different one).
+3. `{"pg_stats_ext_exprs", 12063, 12066, 12065, 17}` pinned, the whole 80-view
+   list re-captured, `nailed_view_seed_data.go` regenerated. All 79 incumbent
+   `.dat` blobs came back byte-identical — the third free whole-corpus
+   `--verify`.
+4. **F30 — the crash was not the missing row.**
+
+### Findings — S9.3g
+
+**F30 — `typtype='c'` is a promise about `typrelid`, and goopg had made it five
+times without keeping it.** With the 10029 row seeded, a hosted PG still died on
+`TRAP: failed Assert("OidIsValid(typentry->typrelid)")` — from
+`add_paths_to_joinrel` → `lookup_type_cache`, i.e. type-caching an operand,
+nothing to do with the new row. The culprit was `_pg_statistic` (10028), which
+goopg typed `'c'` with an explicit comment that the value "carries no special
+meaning for the standby's `TupleDescInitEntry` path". True of that path, false
+of every other: an ARRAY of a composite is a BASE type upstream (`typtype='b'`,
+verified against a fresh PG 18.3), and `insert_rel_type_cache_if_needed`
+(`typcache.c:3082`) asserts a valid `typrelid` for anything claiming `'c'`. A
+composite row with `typrelid = 0` does not degrade — it takes the backend down,
+which is why this could never have been the absence probe (F29).
+
+The same audit found **four more** already-shipped instances: the
+`BKI_ROWTYPE_OID` rows 71/75/81/83 (`pg_type`, `pg_attribute`, `pg_proc`,
+`pg_class`), generated out of `pg_type.dat` by `cmd/gen-pg-type-data` since
+M0106 and seeded with `typrelid = 0`. They were latent only because nothing had
+yet type-cached a catalog rowtype as a VALUE rather than reading the catalog.
+All five now resolve through `pgTypeRelidOverlay`, and
+`TestPgTypeCompositeRowsCarryTyprelid` pins the invariant in both directions:
+every seeded `typtype='c'` row has a `typrelid`, that OID names a nailed
+relation, and that relation's `RelType` points back — `pg_class.reltype` and
+`pg_type.typrelid` are mutual inverses.
+
+The generalisable lesson is the twin of F27's. F27: *a view that joins a catalog
+audits that catalog's whole description.* F30: *a field goopg fills in for one
+consumer's benefit is read by every other consumer too* — the 10028 comment
+scoped its own correctness to the one code path the author had in mind, and the
+value stayed wrong for five years' worth of others.
+
+**Ceilings after S9.3g: none.** Every view in `system_views.sql` is on disk and
+evaluable. S9's remaining sub-slice is S9.4 (`information_schema`, 65 views,
+expected to defer), whose fail-when-fixed tripwire —
+`information_schema.tables` in `assertNonCorpusSystemViewIsStillAbsent` — F29
+already put in place.
+
+Gates: `internal/initdb` PASS (226 s), `TestE2E_PGColdStartOnGoopgDataDir` PASS
+plus two scripted break directions (dropping the 10029 row and reverting
+`RelType` both yield `type with OID 10029 does not exist`; the pre-fix 10028
+`typtype` reproduced the `typcache.c:3082` TRAP live), whole `^TestE2E_` family
+PASS (106 s), UNITS PASS, `go build ./...` + `go vet` clean, pgbench smoke via
+the commit hook. Three expectation guards moved with the capture, as always:
+the toasted-rule set (five → six, +12066 at 6 chunks), `base/{1,5}/2838`
+(10 → 12 pages) and the hosted-PG chunk list (`12067/6/11089`; upstream stores
+11481 B, the usual 3-4% pglz divergence).
+
 ## References
 
 - M0131 implementation plan §S9, `docs/design/0131-bidirectional-cluster-dir-coldstart-and-system-views.md`

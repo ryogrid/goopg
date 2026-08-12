@@ -215,17 +215,22 @@ func systemViewOIDPins() []systemViewOIDPin {
 		//   (relcache_init.go, mappedLocalCatalogPlaceholderOIDs) and pins the
 		//   view below, closing ceiling #4 for good.)
 		//
-		//   pg_stats_ext_exprs (12063, 11481 B) needs pg_type 10029, the
-		//   COMPOSITE rowtype of pg_statistic. goopg seeds the array type
-		//   10028 (_pg_statistic) and points its typelem at 10029, but no
-		//   pg_type row for 10029 exists, so a hosted PG fails with "type with
-		//   OID 10029 does not exist" and then trips
+		//   (pg_stats_ext_exprs (12063, 11481 B) was the LAST view held out of
+		//   the corpus, by ceiling #6: it needs pg_type 10029, the COMPOSITE
+		//   rowtype of pg_statistic. goopg seeded the array type 10028
+		//   (_pg_statistic) and pointed its typelem at 10029, but no pg_type
+		//   row for 10029 existed, so a hosted PG failed with "type with OID
+		//   10029 does not exist" and then tripped
 		//   Assert("OidIsValid(typentry->typrelid)") (typcache.c:3082) during
-		//   transaction abort. This is a NEW ceiling — #6 — and the first one
-		//   that is about a catalog's own rowtype rather than a missing
-		//   relation or an unpopulated column. Ledgered.
+		//   transaction abort. It was the only ceiling about a catalog's own
+		//   ROWTYPE rather than a missing relation or an unpopulated column.
+		//   M0131-S9.3g writes the 10029 row (pgTypeCanonical +
+		//   pgTypeRelidOverlay) and flips nailedLocalRels{2619}.RelType from
+		//   the 83 placeholder to 10029, closing ceiling #6 and completing
+		//   upstream's 80.)
 		{"pg_stats", 12053, 12056, 12055, 17},
 		{"pg_stats_ext", 12058, 12061, 12060, 15},
+		{"pg_stats_ext_exprs", 12063, 12066, 12065, 17},
 		{"pg_publication_tables", 12068, 12071, 12070, 5},
 		{"pg_locks", 12073, 12076, 12075, 16},
 		{"pg_cursors", 12077, 12080, 12079, 6},

@@ -24,8 +24,15 @@ func TestNailedLocalRelsContainsPgStatistic(t *testing.T) {
 	if rel.RelName != "pg_statistic" {
 		t.Errorf("Name=%q, want pg_statistic", rel.RelName)
 	}
-	if rel.RelType != 83 {
-		t.Errorf("RelType=%d, want 83 (no StatisticRelation_Rowtype_Id in PG18)", rel.RelType)
+	// M0131-S9.3g: 83 (pg_class's rowtype, the placeholder every
+	// non-formrdesc'd nailed rel carried) until pg_stats_ext_exprs needed a
+	// hosted PG to build a record tupledesc for a pg_statistic value. PG18
+	// declares no StatisticRelation_Rowtype_Id constant, but upstream's initdb
+	// still ASSIGNS the rowtype an OID — 10029 — and lookup_type_cache()
+	// reaches pg_class.reltype through it. Must agree with
+	// pgTypeCanonical(10029) and pgTypeRelidOverlay[10029] == 2619.
+	if rel.RelType != 10029 {
+		t.Errorf("RelType=%d, want 10029 (pg_statistic's initdb-assigned rowtype)", rel.RelType)
 	}
 	if rel.RelKind != 'r' {
 		t.Errorf("RelKind=%q, want r", rel.RelKind)

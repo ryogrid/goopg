@@ -130,6 +130,24 @@ attr	pg_stats_ext	12	most_common_vals	1009	-1	f	f
 attr	pg_stats_ext	13	most_common_val_nulls	1000	-1	f	f
 attr	pg_stats_ext	14	most_common_freqs	1022	-1	f	f
 attr	pg_stats_ext	15	most_common_base_freqs	1022	-1	f	f
+rel	pg_stats_ext_exprs	12063	12063	12066	12065	2249	v	17
+attr	pg_stats_ext_exprs	1	schemaname	19	64	f	f
+attr	pg_stats_ext_exprs	2	tablename	19	64	f	f
+attr	pg_stats_ext_exprs	3	statistics_schemaname	19	64	f	f
+attr	pg_stats_ext_exprs	4	statistics_name	19	64	f	f
+attr	pg_stats_ext_exprs	5	statistics_owner	19	64	f	f
+attr	pg_stats_ext_exprs	6	expr	25	-1	f	f
+attr	pg_stats_ext_exprs	7	inherited	16	1	f	f
+attr	pg_stats_ext_exprs	8	null_frac	700	4	f	f
+attr	pg_stats_ext_exprs	9	avg_width	23	4	f	f
+attr	pg_stats_ext_exprs	10	n_distinct	700	4	f	f
+attr	pg_stats_ext_exprs	11	most_common_vals	2277	-1	f	f
+attr	pg_stats_ext_exprs	12	most_common_freqs	1021	-1	f	f
+attr	pg_stats_ext_exprs	13	histogram_bounds	2277	-1	f	f
+attr	pg_stats_ext_exprs	14	correlation	700	4	f	f
+attr	pg_stats_ext_exprs	15	most_common_elems	2277	-1	f	f
+attr	pg_stats_ext_exprs	16	most_common_elem_freqs	1021	-1	f	f
+attr	pg_stats_ext_exprs	17	elem_count_histogram	1021	-1	f	f
 rel	pg_publication_tables	12068	12068	12071	12070	2249	v	5
 attr	pg_publication_tables	1	pubname	19	64	f	f
 attr	pg_publication_tables	2	schemaname	19	64	f	f

@@ -523,8 +523,16 @@ var nailedLocalRels = flattenRels(append([]nailedRel{
 	// once Step 3cd cleared the pg_statistic_ext family. Without a pg_class
 	// row, `RelationBuildDesc(2619) → ScanPgRelation(2619)` returns NULL
 	// and the backend FATALs with `could not open relation with OID 2619`.
-	// RelType=83 is safe because pg_statistic is not formrdesc'd (no
-	// `StatisticRelation_Rowtype_Id` constant in PG18 headers). Schema per
+	// RelType was 83 (the placeholder every non-formrdesc'd rel carries; safe
+	// because pg_statistic has no `StatisticRelation_Rowtype_Id` constant in
+	// PG18 headers) until M0131-S9.3g made it 10029, pg_statistic's REAL
+	// initdb-assigned rowtype. That mattered as soon as a hosted PG had to
+	// treat a pg_statistic value as a composite: pg_stats_ext_exprs unnests
+	// pg_statistic_ext_data.stxdexpr (_pg_statistic, 10028) whose typelem is
+	// 10029, and lookup_type_cache() dereferences that row's typrelid. The
+	// pg_type side is pgTypeCanonical(10029) + pgTypeRelidOverlay; the two
+	// must agree, which pgTypeBootstrapEntryMap now enforces by deriving the
+	// seeded OID set from RelType. Schema per
 	// `postgres/src/include/catalog/pg_statistic.h` (PG18,
 	// StatisticRelationId == 2619). 31 columns total: 3 leading fixed
 	// NOT NULL key columns (starelid oid, staattnum int2, stainherit bool)
@@ -534,7 +542,7 @@ var nailedLocalRels = flattenRels(append([]nailedRel{
 	// (BKI_LOOKUP_OPT) + 5×stanumbers _float4 NULLABLE + 5×stavalues
 	// anyarray NULLABLE. pg_statistic has no `oid` system column —
 	// attnums start at 1 = starelid.
-	{2619, "pg_statistic", 83, 'r', 31, false, pgStatisticAttrs()},
+	{2619, "pg_statistic", 10029, 'r', 31, false, pgStatisticAttrs()},
 	// M0106-0010 step 3cg: pg_subscription_rel is opened during PG-standby
 	// boot once Step 3cf cleared the pg_subscription index pair. Without a
 	// pg_class row, `RelationBuildDesc(6102) → ScanPgRelation(6102)` returns
