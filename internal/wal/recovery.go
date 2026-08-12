@@ -4044,6 +4044,88 @@ func xlogHeapUpdateCarriesTuple(xlog *XLogDecodedRecord) bool {
 	return ok && len(block.Data) > 0 && !(block.HasImage && block.ImageApply)
 }
 
+// decodeXLogHeapUpdateNewTuple rebuilds an xl_heap_update's new tuple from
+// block 0's data, splicing back the prefix/suffix bytes the record left out.
+//
+// M0131-S21g. Upstream's log_heap_update (postgres/src/backend/access/heap/
+// heapam.c:8730-8800) compares the old and new versions byte-for-byte and, when
+// they share a leading and/or trailing run inside the data area, logs only
+// `uint16 prefixlen` / `uint16 suffixlen` in place of those bytes. heap_xlog_update
+// (heapam_xlog.c:933-1005) reverses it: read the two optional lengths, then the
+// xl_heap_header, then assemble
+//
+//	SizeofHeapTupleHeader | bitmap+padding (t_hoff - 23 bytes, from the record)
+//	                      | prefixlen bytes from the OLD tuple's data area
+//	                      | the rest of the record's tuple bytes
+//	                      | suffixlen bytes from the OLD tuple's tail
+//
+// oldTuple is the marshaled old version read off the page (same page — upstream
+// asserts newblk == oldblk whenever either flag is set) and may be nil when
+// neither flag is present, which is the shape goopg's own emit always produces.
+//
+// This is not a rare corner: a catalog UPDATE that flips one flag byte (say
+// pg_class.relhasindex after CREATE INDEX) compresses down to a handful of
+// bytes, and before this landed such a record replayed as a ~4-byte tuple that
+// the pg_class reload could not decode — a real PG's `CREATE TABLE` survived the
+// crash tail as an index and toast row with no table row behind them.
+func decodeXLogHeapUpdateNewTuple(block XLogBlockRef, flags uint8, oldTuple []byte,
+	xid storage.TransactionID, offnum uint16) ([]byte, error) {
+	rec := block.Data
+	var prefixLen, suffixLen int
+	takeLen := func(what string) (int, error) {
+		if len(rec) < 2 {
+			return 0, fmt.Errorf("wal: xlog heap-update block-data too short for %s length", what)
+		}
+		v := int(binary.LittleEndian.Uint16(rec[:2]))
+		rec = rec[2:]
+		return v, nil
+	}
+	var err error
+	if flags&xlhUpdatePrefixFromOld != 0 {
+		if prefixLen, err = takeLen("prefix"); err != nil {
+			return nil, err
+		}
+	}
+	if flags&xlhUpdateSuffixFromOld != 0 {
+		if suffixLen, err = takeLen("suffix"); err != nil {
+			return nil, err
+		}
+	}
+	if len(rec) < sizeOfXLogHeapHeaderData {
+		return nil, fmt.Errorf("wal: invalid xlog heap-update block-data len %d (want >= %d)",
+			len(rec), sizeOfXLogHeapHeaderData)
+	}
+	header, body := rec[:sizeOfXLogHeapHeaderData], rec[sizeOfXLogHeapHeaderData:]
+	if prefixLen == 0 && suffixLen == 0 {
+		// Uncompressed: byte-for-byte the xl_heap_insert shape.
+		return buildTupleFromXLogHeapHeader(header, body, xid, block.Block, offnum), nil
+	}
+	// hoffExtra is upstream's `xlhdr.t_hoff - SizeofHeapTupleHeader`: the null
+	// bitmap plus its alignment padding, which is logged in full and so must be
+	// re-emitted BEFORE the spliced-in prefix.
+	hoffExtra := int(header[4]) - storage.SizeOfHeapTupleHeaderData
+	if hoffExtra < 0 || hoffExtra > len(body) {
+		return nil, fmt.Errorf("wal: xlog heap-update t_hoff %d out of range (block data %d)", header[4], len(body))
+	}
+	if len(oldTuple) < storage.SizeOfHeapTupleHeaderData {
+		return nil, fmt.Errorf("wal: xlog heap-update prefix/suffix splice needs the old tuple (got %d bytes)", len(oldTuple))
+	}
+	oldHoff := int(oldTuple[22]) // t_hoff of the marshaled old version
+	if oldHoff < storage.SizeOfHeapTupleHeaderData || oldHoff > len(oldTuple) {
+		return nil, fmt.Errorf("wal: xlog heap-update old tuple t_hoff %d out of range (len %d)", oldHoff, len(oldTuple))
+	}
+	if prefixLen < 0 || suffixLen < 0 || prefixLen+suffixLen > len(oldTuple)-oldHoff {
+		return nil, fmt.Errorf("wal: xlog heap-update prefix %d + suffix %d exceed the old tuple's %d data bytes",
+			prefixLen, suffixLen, len(oldTuple)-oldHoff)
+	}
+	out := make([]byte, 0, len(body)+prefixLen+suffixLen)
+	out = append(out, body[:hoffExtra]...)
+	out = append(out, oldTuple[oldHoff:oldHoff+prefixLen]...)
+	out = append(out, body[hoffExtra:]...)
+	out = append(out, oldTuple[len(oldTuple)-suffixLen:]...)
+	return buildTupleFromXLogHeapHeader(header, out, xid, block.Block, offnum), nil
+}
+
 // replayDecodedXLogHeapUpdate applies a tuple-carrying xl_heap_update. hot
 // selects the old-tuple stamp: HOT (same-page chain link + HeapHotUpdated)
 // vs plain non-HOT (B0.2 catalog ALTERs — xmax + forward ctid, possibly
@@ -4056,11 +4138,7 @@ func replayDecodedXLogHeapUpdate(mgr *storage.Manager, r Record, xlog *XLogDecod
 	if block.HasImage && block.ImageApply {
 		return restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN))
 	}
-	oldXmax, oldOffnum, _, _, _, newOffnum, err := decodeXLogHeapUpdateMainData(xlog.MainData)
-	if err != nil {
-		return err
-	}
-	newTupleBytes, err := decodeXLogHeapInsertTuple(block, storage.TransactionID(xlog.Header.XID), newOffnum)
+	oldXmax, oldOffnum, _, flags, _, newOffnum, err := decodeXLogHeapUpdateMainData(xlog.MainData)
 	if err != nil {
 		return err
 	}
@@ -4096,6 +4174,29 @@ func replayDecodedXLogHeapUpdate(mgr *storage.Manager, r Record, xlog *XLogDecod
 		return storage.PageStampUpdatedOldTuple(p, oldOffnum, storage.TransactionID(oldXmax), block.Block, newOffnum)
 	}
 	if !skip {
+		// M0131-S21g: the new tuple's bytes are only WHOLE in goopg's own
+		// emit. A real PG's log_heap_update (heapam.c:8730-8800) strips the
+		// prefix and suffix the new version shares with the old one and stores
+		// their lengths instead, so redo has to splice them back in from the
+		// old version — which upstream can do because those two flags are only
+		// ever set when both versions are on the SAME page
+		// (heapam_xlog.c:933-945 asserts newblk == oldblk).
+		var oldTuple []byte
+		if flags&(xlhUpdatePrefixFromOld|xlhUpdateSuffixFromOld) != 0 {
+			if oldBlock.Block != block.Block {
+				return fmt.Errorf("wal: xlog heap-update prefix/suffix compression with cross-page old tuple (old blk %d, new blk %d)",
+					oldBlock.Block, block.Block)
+			}
+			oldTuple, err = storage.PageGetItemRaw(page, oldOffnum)
+			if err != nil {
+				return fmt.Errorf("wal: xlog heap-update read old tuple for prefix/suffix splice (slot %d): %w", oldOffnum, err)
+			}
+		}
+		newTupleBytes, err := decodeXLogHeapUpdateNewTuple(block, flags, oldTuple,
+			storage.TransactionID(xlog.Header.XID), newOffnum)
+		if err != nil {
+			return err
+		}
 		// M0131-S21c: place the new version AT new_offnum, exactly as
 		// heap_xlog_update's PageAddItemExtended(..., xlrec->new_offnum,
 		// PAI_OVERWRITE | PAI_IS_HEAP) does — the third member of the

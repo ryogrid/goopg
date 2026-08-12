@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"encoding/binary"
 	"testing"
 
 	"github.com/goopg/goopg/internal/storage"
@@ -307,5 +308,155 @@ func TestApplyRecordReplaysPGHeapUpdateSkipsMissingOldPage(t *testing.T) {
 		t.Fatal(err)
 	} else if nblocks != 1 {
 		t.Fatalf("nblocks = %d, want 1 — a missing OLD page must not extend the fork", nblocks)
+	}
+}
+
+// TestApplyRecordReplaysPGHeapUpdatePrefixSuffixFromOld pins M0131-S21g: a real
+// PG's log_heap_update (heapam.c:8730-8800) does not log the bytes the new
+// version shares with the old one. When the two tuples share a leading and/or
+// trailing run inside the data area it logs `uint16 prefixlen` / `uint16
+// suffixlen` in front of the xl_heap_header and drops those bytes, and
+// heap_xlog_update (heapam_xlog.c:933-1005) splices them back in from the old
+// tuple ON THE SAME PAGE (upstream asserts newblk == oldblk for both flags).
+//
+// goopg's own emit never sets either flag, so nothing in a goopg↔goopg stream
+// exercises this — but a real PG's stream is full of it, and the damage was
+// silent rather than loud: replay wrote the record's *middle* bytes as if they
+// were the whole tuple. That is what left a crashed PG's `CREATE TABLE`
+// half-recovered — pg_class's relhasindex flip compresses to a ~4-byte record,
+// so the reload found the table's index and toast rows with a 4-byte husk where
+// the table row should be, and `s28_items` did not exist
+// (TestE2E_GoopgCrashStartOnPGDataDir).
+func TestApplyRecordReplaysPGHeapUpdatePrefixSuffixFromOld(t *testing.T) {
+	const (
+		prefix = "PREFIX__"
+		suffix = "__SUFFIX"
+	)
+	cases := []struct {
+		name          string
+		oldData       string
+		newData       string
+		prefixLen     int
+		suffixLen     int
+		flags         uint8
+		wantBlockData int // bytes of tuple body actually logged
+	}{
+		{
+			name:      "prefix and suffix",
+			oldData:   prefix + "OLDMID" + suffix,
+			newData:   prefix + "NEWMIDDLE" + suffix,
+			prefixLen: len(prefix), suffixLen: len(suffix),
+			flags:         xlhUpdatePrefixFromOld | xlhUpdateSuffixFromOld,
+			wantBlockData: len("NEWMIDDLE"),
+		},
+		{
+			name:      "prefix only",
+			oldData:   prefix + "OLDTAIL",
+			newData:   prefix + "NEWTAILLONGER",
+			prefixLen: len(prefix), suffixLen: 0,
+			flags:         xlhUpdatePrefixFromOld,
+			wantBlockData: len("NEWTAILLONGER"),
+		},
+		{
+			name:      "suffix only",
+			oldData:   "OLDHEAD" + suffix,
+			newData:   "NEWHEADLONGER" + suffix,
+			prefixLen: 0, suffixLen: len(suffix),
+			flags:         xlhUpdateSuffixFromOld,
+			wantBlockData: len("NEWHEADLONGER"),
+		},
+	}
+
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+			defer mgr.Close()
+
+			rel := storage.RelFileNode{DBOid: 1, RelOid: uint32(920 + i), Fork: storage.MainFork}
+
+			oldTup := storage.NewHeapTuple(42, storage.InvalidTransactionID, []byte(tc.oldData))
+			oldTup.Header.CTID = storage.ItemPointer{Block: 0, Offset: 1}
+			oldBytes, err := oldTup.MarshalBinary()
+			if err != nil {
+				t.Fatal(err)
+			}
+			insertFramed, err := EncodeHeapInsertPG(rel, 0, 1, oldBytes, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			applyPGRecord(t, mgr, insertFramed, 100)
+
+			const xmax = storage.TransactionID(77)
+			newTup := storage.NewHeapTuple(xmax, storage.InvalidTransactionID, []byte(tc.newData))
+			newBytes, err := newTup.MarshalBinary()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Hand-build the COMPRESSED record: goopg's encoders deliberately
+			// never emit this shape, so the pin has to speak PG's bytes
+			// directly — lengths first, then xl_heap_header, then only the
+			// bytes that differ.
+			headerAndData := heapHeaderPlusData(newBytes)
+			header := headerAndData[:sizeOfXLogHeapHeaderData]
+			body := headerAndData[sizeOfXLogHeapHeaderData:]
+			// hoffExtra (the null bitmap + its padding — here just PG's
+			// MAXALIGN byte) is logged in full and precedes the prefix, exactly
+			// as upstream writes it.
+			hoffExtra := int(header[4]) - storage.SizeOfHeapTupleHeaderData
+			logged := body[:hoffExtra]
+			middle := body[hoffExtra+tc.prefixLen : len(body)-tc.suffixLen]
+			if len(middle) != tc.wantBlockData {
+				t.Fatalf("test setup: logged body = %d bytes, want %d", len(middle), tc.wantBlockData)
+			}
+			blockData := make([]byte, 0, 4+len(header)+len(logged)+len(middle))
+			if tc.flags&xlhUpdatePrefixFromOld != 0 {
+				blockData = binary.LittleEndian.AppendUint16(blockData, uint16(tc.prefixLen))
+			}
+			if tc.flags&xlhUpdateSuffixFromOld != 0 {
+				blockData = binary.LittleEndian.AppendUint16(blockData, uint16(tc.suffixLen))
+			}
+			blockData = append(blockData, header...)
+			blockData = append(blockData, logged...)
+			blockData = append(blockData, middle...)
+
+			mainData := make([]byte, sizeOfXLogHeapUpdateData)
+			binary.LittleEndian.PutUint32(mainData[0:4], uint32(xmax)) // old_xmax
+			binary.LittleEndian.PutUint16(mainData[4:6], 1)            // old_offnum
+			mainData[7] = xlhUpdateContainsNewTuple | tc.flags
+			binary.LittleEndian.PutUint16(mainData[12:14], 2) // new_offnum
+
+			recBody, err := assembleXLogRecord(mainData, []BlockRef{{
+				ID: 0, Rel: rel, Block: 0, Data: blockData,
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			applyPGRecord(t, mgr, framePGAssembled(RmgrHeap, xlogHeapUpdate, uint32(xmax), recBody), 200)
+
+			page := make(storage.Page, storage.BlockSize)
+			if err := mgr.ReadBlock(rel, 0, page); err != nil {
+				t.Fatal(err)
+			}
+			newAfter, err := storage.PageGetHeapTuple(page, 2)
+			if err != nil {
+				t.Fatalf("new version at slot 2: %v", err)
+			}
+			if string(newAfter.Data) != tc.newData {
+				t.Fatalf("new tuple data = %q, want %q — the prefix/suffix taken from the old "+
+					"version on the same page was not spliced back in", newAfter.Data, tc.newData)
+			}
+			oldAfter, err := storage.PageGetHeapTuple(page, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(oldAfter.Data) != tc.oldData {
+				t.Fatalf("old tuple data = %q, want %q (the splice must not disturb its source)", oldAfter.Data, tc.oldData)
+			}
+			if oldAfter.Header.Xmax != xmax {
+				t.Fatalf("old t_xmax = %d, want %d", oldAfter.Header.Xmax, xmax)
+			}
+		})
 	}
 }

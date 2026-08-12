@@ -1235,6 +1235,68 @@ corrupting, none is the gate's current stop, and converting them flips several
 opcodes from "refuse the start" to "silently skip" at once. Filed as
 **M0131-S21f** with a ledger row rather than folded in.
 
+### S21g — implementation notes: the new tuple is not all in the record (landed 2026-08-12)
+
+**S28 is GREEN.** A real PostgreSQL 18.3 cluster that was SIGKILLed mid-life is
+now served by goopg end to end: recovery replays PG's crash tail, every one of
+the E2E's twelve row-equality checks matches PG's own pre-crash answers, and the
+row PG had `SELECT … FOR UPDATE`'d is readable *and* updatable afterwards.
+
+S21d's closing note predicted the remaining stop was a catalog-cold-start gap
+(filed as S21e: "goopg's boot does not build its in-memory catalog from the
+on-disk `pg_class`/`pg_attribute` it just replayed"). **That diagnosis was
+wrong, and the way it was wrong is the lesson.** goopg's boot reload was fine —
+`loadUserTablesFromHeapForDB` scanned the replayed `base/5/1259` and kept 424 of
+429 tuples. What it could not decode were exactly three of them, with
+`pg_class physical row too short: len=4`, and the three were exactly
+`s28_items`, `s28_sub` and `s28_scratch`. Their *index* and *toast* pg_class
+rows reloaded perfectly. A crashed PG's `CREATE TABLE` survived as an index and
+a toast relation with a 4-byte husk where the table row should be.
+
+The cause is that **an `xl_heap_update` does not necessarily carry the whole new
+tuple.** Upstream's `log_heap_update`
+(`postgres/src/backend/access/heap/heapam.c:8730-8800`) compares the two
+versions byte-for-byte and, when they share a leading and/or trailing run inside
+the data area, logs `uint16 prefixlen` / `uint16 suffixlen` in front of the
+`xl_heap_header` and *omits those bytes entirely*, setting
+`XLH_UPDATE_PREFIX_FROM_OLD` (0x20) / `XLH_UPDATE_SUFFIX_FROM_OLD` (0x40).
+`heap_xlog_update` (`heapam_xlog.c:933-1005`) reverses it, assembling
+
+```
+SizeofHeapTupleHeader | bitmap+padding (t_hoff-23 bytes, from the record)
+                      | prefixlen bytes from the OLD tuple's data area
+                      | the rest of the record's tuple bytes
+                      | suffixlen bytes from the OLD tuple's tail
+```
+
+goopg discarded the `flags` byte (`_` in the `decodeXLogHeapUpdateMainData`
+destructuring) and treated block 0's data as an `xl_heap_insert` payload, so it
+wrote *the middle bytes* as the whole tuple. `decodeXLogHeapUpdateNewTuple`
+(`internal/wal/recovery.go`) now does the splice, reading the old version off the
+page with `storage.PageGetItemRaw` — legitimate because upstream asserts
+`newblk == oldblk` whenever either flag is set, and goopg refuses the record
+rather than guessing if a cross-page reference arrives with one.
+
+Two things worth carrying forward:
+
+- **This failure was silent, not loud.** Every other S21 slice announced itself
+  by refusing to start. This one replayed "successfully" and produced a
+  structurally valid page containing a corrupt tuple; only a decoder downstream
+  (the catalog reload) noticed. When a redo routine's input is *self-describing
+  minus the parts the writer knew redo could reconstruct*, dropping a flag byte
+  is a data-corruption bug wearing a green test.
+- **A catalog UPDATE is the worst case for it.** Flipping
+  `pg_class.relhasindex` after `CREATE INDEX` changes one byte in a ~150-byte
+  row, so prefix+suffix compression takes the logged tuple down to ~4 bytes —
+  which is why the symptom appeared on tables and not on their indexes.
+
+The tuple is now also built *inside* the `BLK_NEEDS_REDO` branch rather than
+before page acquisition, matching upstream, since the reconstruction needs the
+page anyway.
+
+S21e is therefore **resolved by root cause, not by the work it described**: no
+cold-start catalog change was needed or made.
+
 ## Guards
 
 1. Per-opcode unit tests over fixtures captured from a real PG 18.3 via
@@ -1266,9 +1328,15 @@ opcodes from "refuse the start" to "silently skip" at once. Filed as
    exist"`), while a cross-page record whose OLD block is missing still applies
    the new version and merely skips the stamp — the extend/skip asymmetry
    asserted on both halves.
-10. The S28 reverse crash E2E (`0131-0017`) with the full opcode workload: COPY,
+10. S21g: an `xl_heap_update` carrying `XLH_UPDATE_PREFIX_FROM_OLD` and/or
+   `XLH_UPDATE_SUFFIX_FROM_OLD` reconstructs the FULL new tuple from the old
+   version on the same page — asserted for prefix+suffix, prefix-only and
+   suffix-only, since the three take different branches upstream; proven
+   fail-when-broken by re-inserting the "treat it as uncompressed" path, which
+   leaves the tuple holding only the record's middle bytes.
+11. The S28 reverse crash E2E (`0131-0017`) with the full opcode workload: COPY,
    VACUUM, `SELECT … FOR UPDATE`, TRUNCATE, SAVEPOINT, index-heavy insert.
-11. UNITS + RACE (`internal/wal`, `internal/initdb`) + SMOKE + SPOT green.
+12. UNITS + RACE (`internal/wal`, `internal/initdb`) + SMOKE + SPOT green.
 
 ## References
 

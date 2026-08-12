@@ -209,6 +209,17 @@ const sizeOfXLogHeapUpdateData = 14
 // block 0 carries the new tuple's data.
 const xlhUpdateContainsNewTuple uint8 = 0x10
 
+// xlhUpdatePrefixFromOld / xlhUpdateSuffixFromOld are PG's
+// XLH_UPDATE_PREFIX_FROM_OLD / XLH_UPDATE_SUFFIX_FROM_OLD (heapam_xlog.h:91-92).
+// log_heap_update strips the bytes the new tuple shares with the old one from
+// the record and stores only the two lengths, so redo has to splice them back
+// in from the old version (M0131-S21g). goopg never SETS them — its own emit is
+// always the uncompressed form — but a real PG's stream is full of them.
+const (
+	xlhUpdatePrefixFromOld uint8 = 0x20
+	xlhUpdateSuffixFromOld uint8 = 0x40
+)
+
 // EncodeHeapHotUpdatePG builds a PostgreSQL xl_heap_update record for one HOT
 // (same-page) update, framed for the assembled-record Append path. Main data is
 // xl_heap_update{old_xmax, old_offnum, old_infobits_set=0, flags=CONTAINS_NEW_TUPLE,
