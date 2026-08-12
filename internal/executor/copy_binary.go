@@ -139,6 +139,28 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 		return nil, err
 	}
 	switch strings.ToLower(t.Name) {
+	case "int2", "smallint":
+		// M0119-0006 (52nd slice): before this arm `int2` fell through to the
+		// default's KindInt escape and shipped EIGHT big-endian bytes where
+		// upstream int2send (postgres/src/backend/utils/adt/int.c:98 —
+		// pq_sendint16) ships exactly two, so every binary COPY of a smallint
+		// column produced a stream a real PG client rejects with "incorrect
+		// binary data format" (CopyReadBinaryAttribute's pq_getmsgend,
+		// postgres/src/backend/commands/copyfromparse.c). The range check
+		// mirrors the heap int2 encode arm (codec.go) rather than truncating:
+		// PG can never hold an out-of-range int2 Datum, so a value that is out
+		// of range here is goopg-side corruption and deserves 22003, not a
+		// silent wrap.
+		if d.Kind != KindInt {
+			return nil, fmt.Errorf("expected int, got kind %d", d.Kind)
+		}
+		if d.Int < -32768 || d.Int > 32767 {
+			return nil, &ExecError{Code: "22003",
+				Message: fmt.Sprintf("value %q is out of range for type smallint", strings.TrimSpace(d.Format()))}
+		}
+		b := make([]byte, 2)
+		binary.BigEndian.PutUint16(b, uint16(int16(d.Int)))
+		return b, nil
 	case "int4", "integer", "int":
 		if d.Kind != KindInt {
 			return nil, fmt.Errorf("expected int, got kind %d", d.Kind)
@@ -251,6 +273,19 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 		return Datum{}, err
 	}
 	switch strings.ToLower(t.Name) {
+	case "int2", "smallint":
+		// Decode twin of the "int2" encode arm. Upstream int2recv (int.c:87) is
+		// pq_getmsgint(buf, sizeof(int16)); the length is enforced because the
+		// binary COPY parser runs pq_getmsgend after each attribute, so a field
+		// that is not exactly two bytes is "incorrect binary data format"
+		// upstream and an error here. Before this arm the payload came back
+		// from the default as a STRING Datum — a smallint column silently held
+		// two raw bytes of text (Hard-won Rule #2: encode and decode are twins).
+		if len(payload) != 2 {
+			return Datum{}, fmt.Errorf("int2: expected 2 bytes, got %d", len(payload))
+		}
+		v := int16(binary.BigEndian.Uint16(payload))
+		return Datum{Kind: KindInt, Int: int64(v)}, nil
 	case "int4", "integer", "int":
 		if len(payload) != 4 {
 			return Datum{}, fmt.Errorf("int4: expected 4 bytes, got %d", len(payload))
