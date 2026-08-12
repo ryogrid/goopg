@@ -493,3 +493,187 @@ func TestReplayNextOIDFromWALNoRecords(t *testing.T) {
 		t.Fatalf("missing walDir: got (%d, %v), want (0, nil)", got, err)
 	}
 }
+
+// --- M0131-S22: opcode dispatch + commit-record subxacts[] ---------------
+
+// newRecoveryCLog opens the pair of stores the clog replay pass writes through
+// (flat file + PG SLRU mirror), matching the other tests in this file.
+func newRecoveryCLog(t *testing.T, dir string) *mvcc.CLog {
+	t.Helper()
+	clog, err := mvcc.OpenCLog(filepath.Join(dir, "pg_xact"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := clog.EnablePGSLRUMirror(filepath.Join(dir, "pg_xact_slru")); err != nil {
+		t.Fatal(err)
+	}
+	return clog
+}
+
+// TestReplayCLogFromWAL_PGCommitStampsSubxacts is the S22 core guard. A real
+// PG commit record for a transaction that used a SAVEPOINT carries an
+// XACT_XINFO_HAS_SUBXACTS chunk, and upstream's xact_redo_commit stamps the
+// whole tree via TransactionIdCommitTree (xact.c:6182). Before S22 goopg
+// stamped only the top-level XID, so initdb.Open's MarkUnknownAsAborted sweep
+// stamped every subtransaction ABORTED — the committed transaction's
+// after-the-savepoint rows silently vanished after a reverse crash start.
+func TestReplayCLogFromWAL_PGCommitStampsSubxacts(t *testing.T) {
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "pg_wal")
+	clog := newRecoveryCLog(t, dir)
+	txnMgr := mvcc.NewManager()
+
+	const top = storage.TransactionID(900)
+	subs := []storage.TransactionID{901, 902, 903}
+
+	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := wal.EncodeXactCommitPGWithSubxacts(top, subs, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := w.Append(payload); err != nil {
+		t.Fatalf("Append commit: %v", err)
+	}
+	_ = w.Close()
+
+	if err := replayCLogFromWAL(walDir, clog, txnMgr); err != nil {
+		t.Fatalf("replayCLogFromWAL: %v", err)
+	}
+	for _, xid := range append([]storage.TransactionID{top}, subs...) {
+		if got := clog.GetStatus(xid); got != mvcc.TxnStatusCommitted {
+			t.Errorf("XID %d: got %v, want TxnStatusCommitted (whole tree must be stamped)", xid, got)
+		}
+	}
+	// nextXID must clear the HIGHEST XID in the tree, not just the top-level
+	// one (upstream: TransactionIdLatest over xid+subxacts, xact.c:6190).
+	if got := txnMgr.NextXID(); got <= subs[len(subs)-1] {
+		t.Errorf("NextXID = %d, want > %d (highest subxact)", got, subs[len(subs)-1])
+	}
+}
+
+// TestReplayCLogFromWAL_PGAbortStampsSubxacts: the abort twin
+// (TransactionIdAbortTree, xact.c:6259). A subtransaction of an aborted
+// transaction must be Aborted explicitly, not left to the sweep — the sweep
+// only covers XIDs below nextXID, and it is the same code path either way, so
+// a silent divergence here is a sibling-path bug waiting to happen.
+func TestReplayCLogFromWAL_PGAbortStampsSubxacts(t *testing.T) {
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "pg_wal")
+	clog := newRecoveryCLog(t, dir)
+	txnMgr := mvcc.NewManager()
+
+	const top = storage.TransactionID(950)
+	subs := []storage.TransactionID{951, 952}
+
+	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := wal.EncodeXactAbortPGWithSubxacts(top, subs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := w.Append(payload); err != nil {
+		t.Fatalf("Append abort: %v", err)
+	}
+	_ = w.Close()
+
+	if err := replayCLogFromWAL(walDir, clog, txnMgr); err != nil {
+		t.Fatalf("replayCLogFromWAL: %v", err)
+	}
+	for _, xid := range append([]storage.TransactionID{top}, subs...) {
+		if got := clog.GetStatus(xid); got != mvcc.TxnStatusAborted {
+			t.Errorf("XID %d: got %v, want TxnStatusAborted", xid, got)
+		}
+	}
+}
+
+// TestReplayCLogFromWAL_PGAssignmentIsNotAnAbort pins the second half of the
+// S22 bug. The scanner used to compute `isCommit := info&OpMask == COMMIT` for
+// ANY RM_XACT_ID record with a non-zero XID, so an XLOG_XACT_ASSIGNMENT (0x50)
+// — which a real PG emits for every batch of PGPROC_MAX_CACHED_SUBXIDS
+// subtransactions, long BEFORE the transaction ends — stamped its still-running
+// XID ABORTED. The later commit record for the same tree then had to fight a
+// durable abort stamp. Upstream's xact_redo switches on the opcode and touches
+// the clog only for COMMIT/ABORT (xact.c:6398-6444).
+func TestReplayCLogFromWAL_PGAssignmentIsNotAnAbort(t *testing.T) {
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "pg_wal")
+	clog := newRecoveryCLog(t, dir)
+	txnMgr := mvcc.NewManager()
+
+	const top = storage.TransactionID(1000)
+	subs := []storage.TransactionID{1001, 1002}
+
+	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assign, err := wal.EncodeXactAssignmentPG(top, subs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := w.Append(assign); err != nil {
+		t.Fatalf("Append assignment: %v", err)
+	}
+	_ = w.Close()
+
+	if err := replayCLogFromWAL(walDir, clog, txnMgr); err != nil {
+		t.Fatalf("replayCLogFromWAL: %v", err)
+	}
+	for _, xid := range append([]storage.TransactionID{top}, subs...) {
+		if got := clog.GetStatus(xid); got == mvcc.TxnStatusAborted {
+			t.Errorf("XID %d: XLOG_XACT_ASSIGNMENT stamped it Aborted; an assignment is not a completion record", xid)
+		}
+	}
+}
+
+// TestReplayCLogFromWAL_PGAssignmentThenCommit is the end-to-end shape of the
+// real tail: assignment records first, the commit last. The tree must end up
+// COMMITTED. Measured with a scripted revert: this one does NOT catch the
+// missing opcode dispatch on its own (the later commit overwrites the bogus
+// abort stamp, so that half self-heals in this ordering — which is why the
+// standalone-assignment guard above exists), but it does catch a dropped
+// subxact walk, and it pins the two halves working together on the record
+// sequence a real PG actually writes.
+func TestReplayCLogFromWAL_PGAssignmentThenCommit(t *testing.T) {
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "pg_wal")
+	clog := newRecoveryCLog(t, dir)
+	txnMgr := mvcc.NewManager()
+
+	const top = storage.TransactionID(1100)
+	subs := []storage.TransactionID{1101, 1102}
+
+	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assign, err := wal.EncodeXactAssignmentPG(top, subs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := w.Append(assign); err != nil {
+		t.Fatal(err)
+	}
+	commit, err := wal.EncodeXactCommitPGWithSubxacts(top, subs, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := w.Append(commit); err != nil {
+		t.Fatal(err)
+	}
+	_ = w.Close()
+
+	if err := replayCLogFromWAL(walDir, clog, txnMgr); err != nil {
+		t.Fatalf("replayCLogFromWAL: %v", err)
+	}
+	for _, xid := range append([]storage.TransactionID{top}, subs...) {
+		if got := clog.GetStatus(xid); got != mvcc.TxnStatusCommitted {
+			t.Errorf("XID %d: got %v, want TxnStatusCommitted", xid, got)
+		}
+	}
+}

@@ -326,15 +326,41 @@ const (
 // appended, so standby replay unlinks the relcache init files (the old
 // RecordKindXactCommitInval signal). No block references; opcode = XLOG_XACT_COMMIT.
 func EncodeXactCommitPG(xid storage.TransactionID, hasInvals bool) ([]byte, error) {
+	return EncodeXactCommitPGWithSubxacts(xid, nil, hasInvals)
+}
+
+// EncodeXactCommitPGWithSubxacts is EncodeXactCommitPG with an explicit
+// subtransaction list (M0131-S22). When subxacts is non-empty the body gains
+// XLOG_XACT_HAS_INFO + xinfo{HAS_SUBXACTS} + xl_xact_subxacts{nsubxacts,
+// subxacts[]}, in the chunk order ParseCommitRecord walks (xact.c:5673-5732):
+// xinfo, dbinfo, subxacts, …, invals. That is the shape a real PG writes for
+// any transaction that used a SAVEPOINT, and the shape whose replay
+// (ParseXactRecord + the initdb clog pass) stamps the whole transaction tree
+// instead of only its top-level XID.
+func EncodeXactCommitPGWithSubxacts(xid storage.TransactionID, subxacts []storage.TransactionID, hasInvals bool) ([]byte, error) {
 	info := xlogXactCommit
-	var mainData []byte
+	var xinfo uint32
 	if hasInvals {
+		xinfo |= xactXinfoHasInvals
+	}
+	if len(subxacts) > 0 {
+		xinfo |= xactXinfoHasSubxacts
+	}
+	mainData := make([]byte, minSizeOfXactCommit) // xact_time = 0
+	if xinfo != 0 {
 		info |= xlogXactHasInfo
-		mainData = make([]byte, minSizeOfXactCommit+8) // xact_time(8) + xinfo(4) + nmsgs(4)
-		binary.LittleEndian.PutUint32(mainData[8:12], xactXinfoHasInvals)
-		// mainData[12:16] = nmsgs = 0 (goopg carries no message array).
-	} else {
-		mainData = make([]byte, minSizeOfXactCommit) // xact_time = 0
+		mainData = binary.LittleEndian.AppendUint32(mainData, xinfo)
+	}
+	if len(subxacts) > 0 {
+		mainData = binary.LittleEndian.AppendUint32(mainData, uint32(int32(len(subxacts))))
+		for _, sub := range subxacts {
+			mainData = binary.LittleEndian.AppendUint32(mainData, uint32(sub))
+		}
+	}
+	if hasInvals {
+		// nmsgs = 0 (goopg carries no message array). The invals chunk is last
+		// of the chunks goopg writes, matching upstream's order.
+		mainData = binary.LittleEndian.AppendUint32(mainData, 0)
 	}
 	body, err := assembleXLogRecord(mainData, nil)
 	if err != nil {
@@ -347,12 +373,57 @@ func EncodeXactCommitPG(xid storage.TransactionID, hasInvals bool) ([]byte, erro
 // no chunks). The aborting xid is carried in the header (xl_xid); opcode =
 // XLOG_XACT_ABORT.
 func EncodeXactAbortPG(xid storage.TransactionID) ([]byte, error) {
+	return EncodeXactAbortPGWithSubxacts(xid, nil)
+}
+
+// EncodeXactAbortPGWithSubxacts is EncodeXactAbortPG with an explicit
+// subtransaction list (M0131-S22). xl_xact_abort shares xl_xact_commit's chunk
+// prefix and order (xact.h:334-345), so the encoding is the commit one minus
+// the invals chunk aborts never carry.
+func EncodeXactAbortPGWithSubxacts(xid storage.TransactionID, subxacts []storage.TransactionID) ([]byte, error) {
+	info := xlogXactAbort
 	mainData := make([]byte, minSizeOfXactCommit) // xact_time = 0
+	if len(subxacts) > 0 {
+		info |= xlogXactHasInfo
+		mainData = binary.LittleEndian.AppendUint32(mainData, xactXinfoHasSubxacts)
+		mainData = binary.LittleEndian.AppendUint32(mainData, uint32(int32(len(subxacts))))
+		for _, sub := range subxacts {
+			mainData = binary.LittleEndian.AppendUint32(mainData, uint32(sub))
+		}
+	}
 	body, err := assembleXLogRecord(mainData, nil)
 	if err != nil {
 		return nil, err
 	}
-	return framePGAssembled(RmgrXact, xlogXactAbort, uint32(xid), body), nil
+	return framePGAssembled(RmgrXact, info, uint32(xid), body), nil
+}
+
+// EncodeXactAssignmentPG builds a PostgreSQL xl_xact_assignment record
+// (XLOG_XACT_ASSIGNMENT, xact.h:218-223): the top-level XID a batch of
+// subtransaction XIDs belongs to. goopg does not emit this on its own commit
+// path — it rebuilds its subxact map from the native RecordKindXactAssignment
+// marker — but a real PG tail is full of them (one per
+// PGPROC_MAX_CACHED_SUBXIDS batch), and both replay passes must tolerate them:
+// the physical pass as a page-level no-op, the initdb clog pass by NOT
+// mistaking one for an abort (M0131-S22).
+func EncodeXactAssignmentPG(xtop storage.TransactionID, subxacts []storage.TransactionID) ([]byte, error) {
+	mainData := make([]byte, 0, 8+4*len(subxacts))
+	mainData = binary.LittleEndian.AppendUint32(mainData, uint32(xtop))
+	mainData = binary.LittleEndian.AppendUint32(mainData, uint32(int32(len(subxacts))))
+	for _, sub := range subxacts {
+		mainData = binary.LittleEndian.AppendUint32(mainData, uint32(sub))
+	}
+	body, err := assembleXLogRecord(mainData, nil)
+	if err != nil {
+		return nil, err
+	}
+	// xl_xid is the subtransaction currently assigning (PG logs the record from
+	// the subxact's own context); the last of the batch stands in for it.
+	recXID := xtop
+	if len(subxacts) > 0 {
+		recXID = subxacts[len(subxacts)-1]
+	}
+	return framePGAssembled(RmgrXact, xlogXactAssignment, uint32(recXID), body), nil
 }
 
 // xactCommitCarriesInvals reports whether a decoded xl_xact_commit body signals

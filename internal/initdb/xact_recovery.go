@@ -107,10 +107,43 @@ func replayCLogFromWAL(walDir string, clog *mvcc.CLog, txnMgr *mvcc.Manager) err
 		}
 		// --- Canonical PG-format records (emitted alongside native in
 		//     PageHeaders mode, M0106-0010 batched-46). ---
-		if r.XLog != nil && r.XLog.Header.Rmid == wal.RmgrXact && r.XLog.Header.XID != 0 {
+		if r.XLog != nil && r.XLog.Header.Rmid == wal.RmgrXact {
+			// M0131-S22: dispatch on the OPCODE. This branch used to read
+			// "isCommit := info&OpMask == XLOG_XACT_COMMIT" and stamp
+			// unconditionally, which made every RM_XACT_ID record that is not a
+			// commit — XLOG_XACT_ASSIGNMENT (0x50) and XLOG_XACT_INVALIDATIONS
+			// (0x60), both of which a real PG tail carries for any
+			// savepoint-using or catalog-touching workload — stamp its
+			// (still-running!) XID ABORTED. Upstream's xact_redo (xact.c:6398)
+			// switches on the opcode and touches the clog only for
+			// COMMIT/ABORT (and their two-phase variants, which goopg refuses
+			// in the physical pass).
+			op := r.XLog.Header.Info & wal.XlogXactOpMask
+			if op != wal.XlogXactCommit && op != wal.XlogXactAbort {
+				continue
+			}
+			if r.XLog.Header.XID == 0 {
+				continue
+			}
 			xid := storage.TransactionID(r.XLog.Header.XID)
-			isCommit := (r.XLog.Header.Info & wal.XlogXactOpMask) == wal.XlogXactCommit
+			isCommit := op == wal.XlogXactCommit
 			xactStampAndAdvance(clog, txnMgr, xid, isCommit)
+			// M0131-S22: stamp the whole transaction TREE, as
+			// TransactionIdCommitTree / TransactionIdAbortTree do
+			// (xact.c:6182, 6259). Without this a committed transaction's
+			// subtransaction XIDs stay Unknown and initdb.Open's
+			// MarkUnknownAsAborted sweep stamps them Aborted, so every row
+			// written after a SAVEPOINT disappears from an otherwise-committed
+			// transaction. A body goopg cannot parse leaves the top-level stamp
+			// standing (the pre-S22 behaviour) rather than failing the start:
+			// the reader already CRC-verified these bytes, so a parse error
+			// means an unfamiliar record shape, and the top-level status is
+			// still strictly better than none.
+			if parsed, perr := wal.ParseXactRecord(r.XLog.Header.Info, r.XLog.MainData); perr == nil {
+				for _, sub := range parsed.Subxacts {
+					xactStampAndAdvance(clog, txnMgr, storage.TransactionID(sub), isCommit)
+				}
+			}
 			continue
 		}
 		// A9: PG-format clog truncation (RM_CLOG / CLOG_TRUNCATE). Decode the

@@ -1063,6 +1063,73 @@ before updates → 2 FAIL; re-forming a posting for a single survivor → 1 FAIL
 `DELETE` nor `DEDUP` (no LP_DEAD deletion pass, no dedup pass), and `REUSE_PAGE`'s
 hot-standby conflict resolution has no counterpart because goopg has no hot standby.
 
+### S22 — implementation notes (landed 2026-08-12)
+
+Both bugs fixed in one slice; the plan above survived contact with the code
+essentially unchanged, with three refinements worth recording.
+
+**Bug (a), dispatch.** `internal/initdb/xact_recovery.go` now reads the opcode
+first and `continue`s on anything that is not `XLOG_XACT_COMMIT` /
+`XLOG_XACT_ABORT`. The plan said "0x10/0x30/0x40 error"; the implementation
+**skips** them instead, because the *physical* pass already refuses two-phase
+records loudly (`recovery.go`, `RmgrXact` arm — "two-phase commit recovery is not
+supported") and `initdb.Open` runs that pass first. A second refusal here would
+be unreachable code duplicating a message; a second *stamp* is what had to go.
+
+**Bug (b), `subxacts[]`.** New `internal/wal/pg_xact_parse.go`:
+
+```go
+func ParseXactRecord(info uint8, mainData []byte) (XactParsed, error)
+```
+
+Named for `ParseCommitRecord`/`ParseAbortRecord` rather than the plan's
+`ParseXactCommitSubxacts`, and returning a struct (`Xinfo` + `Subxacts`) rather
+than a bare slice, so the later chunks (relfilelocators, dropped stats, invals)
+have somewhere to land when a future slice needs them. The walk stops after the
+subxact array, as planned. `xactCommitCarriesInvals` is left alone — it reads the
+`xinfo` word at a fixed offset and stays correct regardless of what follows it.
+
+Three implementation facts the plan did not carry:
+
+1. **A truncation is an error, not a short read.** A partially decoded subxact
+   list is strictly worse than none: the decoded half gets stamped committed and
+   the undecoded half is swept ABORTED by `MarkUnknownAsAborted`, tearing the
+   transaction exactly the way S22 exists to prevent. The caller treats a parse
+   error as "keep the top-level stamp, skip the tree" — the pre-S22 behaviour —
+   rather than failing the start, since the reader has already CRC-verified
+   these bytes so a parse error means an unfamiliar shape, not corruption.
+2. **`nextXID` must clear the highest subxact,** not just `xl_xid`; upstream
+   takes `TransactionIdLatest(xid, nsubxacts, subxacts)` before
+   `AdvanceNextFullTransactionIdPastXid` (`xact.c:6190`). Falls out for free
+   here because `xactStampAndAdvance` advances per XID.
+3. **The emit side gained the mirror encoders** —
+   `EncodeXactCommitPGWithSubxacts`, `EncodeXactAbortPGWithSubxacts`,
+   `EncodeXactAssignmentPG` (`internal/wal/pg_assembled_emit.go`), with the
+   old two-arg entry points delegating. goopg's commit path passes no subxacts
+   yet (ledger row), so today they exist to build the records replay is tested
+   against — but they are the shape the emit side will need, and writing the
+   chunk order once means encoder and decoder cannot drift apart.
+
+Guards: 6 in `internal/wal/xact_parse_pg_test.go` (minimal commit, commit with
+subxacts, subxacts + invals in one record, a hand-built body carrying the
+`dbinfo` chunk goopg never emits, four truncation cut points, the abort twin)
+and 4 in `internal/initdb/xact_recovery_test.go` (commit tree stamped committed
++ `nextXID` past the highest subxact, abort tree, a standalone
+`XLOG_XACT_ASSIGNMENT` that must leave CLOG untouched, assignment-then-commit).
+Proven fail-when-broken by 2 scripted reverts: dropping the opcode dispatch → 1
+FAIL; dropping the subxact walk → 3 FAIL. Recorded from those reverts: the
+assignment-then-commit ordering **self-heals** the dispatch bug (the later
+commit overwrites the bogus abort stamp), which is why the standalone-assignment
+guard is the one that catches it — the damaging case is the assignment whose
+commit record has not been written yet, i.e. every transaction in flight at the
+crash.
+
+**Still deferred** (ledger row): goopg never *emits* `subxacts[]` in its own
+commit records — its subxact map rides the native `RecordKindXactAssignment`
+marker — so a real PG starting on a goopg `$PGDATA` still loses the
+subtransaction tree of a goopg-committed transaction. That is the emit-side
+mirror of this slice, and it belongs with the commit path, not with recovery.
+
 ## Guards
 
 1. Per-opcode unit tests over fixtures captured from a real PG 18.3 via
