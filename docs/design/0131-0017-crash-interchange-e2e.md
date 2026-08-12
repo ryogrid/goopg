@@ -345,6 +345,39 @@ assertions run with nobody having to remember to un-skip anything. The
 `_Concurrent` variant ships alongside as the S24 re-arm trigger, `t.Skip`ped
 with the rmid-6 reason in its message (guard 9).
 
+**S28 COMPLETE — the skip no longer fires, and the last assertion landed
+(2026-08-12).** Two things changed since the paragraph above was written, both
+observed by running the test rather than by reading code:
+
+- **goopg now replays the PG-authored crash tail end to end.** The
+  `XLOG_NEXTOID` refusal is gone (S26/S27-era opcode work), so `g.Start()`
+  succeeds, the self-arming skip is dead code that stays as the tripwire it was
+  designed to be, and all fourteen captured answers are compared for real. That
+  was verified by corrupting one expected answer and watching goopg's own value
+  come back in the failure message — the checks execute, they are not skipped
+  past.
+- **The uncommitted-rows assertion is in.** It was deferred because `pgcluster.
+  Exec` is `psql -c`, whose backend exits — and therefore rolls back — before
+  the helper returns, so no transaction could be left open across the kill. The
+  new `pgcluster.Session` (`internal/testutil/pgcluster/session.go`) pins ONE
+  `database/sql` connection (`sql.Conn`, not `sql.DB`: a pool would run the
+  `INSERT` and the `COMMIT` on different backends) and holds it until the test
+  ends. The workload inserts 100 rows in that session, never commits, and the
+  test asserts through goopg that they are absent after recovery.
+
+  Three things make that assertion non-vacuous, because "recovery discarded the
+  rows" and "the rows were never written" look identical afterwards: the rows are
+  asserted **visible inside their own transaction**; a second session asserts the
+  backend is in **`idle in transaction`** (via `application_name`) so there is a
+  live transaction to kill; and a committed **marker row** is inserted after them,
+  which flushes the single WAL stream up to its own LSN and thereby pins the
+  uncommitted records on disk — SIGKILL loses WAL buffers, not the log. The marker
+  is the positive half of the pair: it must survive, the uncommitted rows must not.
+
+  Guard 13 closes the loop in the bytes: `pg_waldump` must show at least one
+  record for that XID and **no COMMIT** for it. All three of its failure branches
+  were proven to bite.
+
 Two assertions beyond row equality: the SAVEPOINT rows must be **visible**
 (S22's `subxacts[]` gap makes committed subtransactions invisible, and
 `internal/initdb/xact_recovery.go:87-92` stamps an `ASSIGNMENT` record ABORTED),
@@ -445,6 +478,12 @@ trigger for M0131-S24")` — so the trigger is code, not a ledger sentence.
 12. UNITS + SMOKE green —
     `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` plus the git
     hook's mandatory pgbench smoke on every commit (never `--no-verify`).
+13. The transaction that was open at kill time left records in the crash tail and
+    **no COMMIT** for its XID (`assertUncommittedXIDInTail`), and its 100 rows are
+    absent through goopg afterwards while the committed marker row inserted after
+    them survives. Without the first half the absence check passes for an engine
+    that replayed nothing, or for a run where the uncommitted records never left
+    the WAL buffers.
 
 ## References
 
