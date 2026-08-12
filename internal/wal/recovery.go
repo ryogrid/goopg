@@ -3545,22 +3545,15 @@ func replayDecodedXLogHeapDelete(mgr *storage.Manager, r Record, xlog *XLogDecod
 	if err != nil {
 		return err
 	}
-	nblocks, err := mgr.NBlocks(block.Rel)
+	// M0131-S21f: RBM_NORMAL, like upstream's heap_xlog_delete. An absent or
+	// all-zero page is BLK_NOTFOUND and the record does nothing; it used to be
+	// a hard error that refused the whole start.
+	page, skip, err := redoExistingHeapPageForBlock(mgr, block, storage.LSN(r.EndLSN))
 	if err != nil {
-		return err
+		return fmt.Errorf("wal: xlog heap-delete: %w", err)
 	}
-	if block.Block >= nblocks {
-		return fmt.Errorf("wal: xlog heap-delete: block %d does not exist (nblocks=%d)", block.Block, nblocks)
-	}
-	page := make(storage.Page, storage.BlockSize)
-	if err := mgr.ReadBlock(block.Rel, block.Block, page); err != nil {
-		return err
-	}
-	if storage.IsNew(page) {
-		return fmt.Errorf("wal: xlog heap-delete: block %d is uninitialised", block.Block)
-	}
-	if storage.MustHeader(page).LSN() >= storage.LSN(r.EndLSN) {
-		return nil // already applied
+	if skip {
+		return nil
 	}
 	if err := storage.PageSetHeapTupleXmax(page, offnum, storage.TransactionID(xmax)); err != nil {
 		return fmt.Errorf("wal: xlog heap-delete apply: %w", err)
@@ -3633,6 +3626,17 @@ func xlogHeapLockInfomaskBits(infobits uint8) (infomask, infomask2 uint16) {
 // corrupt anything on these two opcodes — a lost row-lock stamp or speculative
 // confirmation is bookkeeping about a transaction that the crash ended anyway —
 // but it does hide a real inconsistency.
+//
+// M0131-S21f widened the caller set from those two opcodes (lock, confirm) to
+// every PG-format record that edits an existing page: heap delete, heap
+// prune/freeze, and — via replayExistingXLogBlock — the btree edit-shaped
+// records. They had each hand-rolled the same NBlocks + ReadBlock sequence but
+// ended it in a hard error, so a stream whose later records drop or truncate
+// the relation refused the whole start. The skip is now shared, and so is the
+// deviation note above: it applies to all of them, and it is wider than the
+// original two, because losing a prune or a btree deletion on a page that DOES
+// survive would be a real divergence. Upstream catches exactly that with the
+// invalid-page table; goopg still cannot.
 //
 // Returns skip=true when there is nothing to do (page absent, uninitialised, or
 // already at/past this record's LSN).
@@ -4967,24 +4971,20 @@ func replayInitedXLogBlock(mgr *storage.Manager, block XLogBlockRef, endLSN stor
 
 // replayExistingXLogBlock applies `apply` to a block the record mutates in
 // place. Unlike replayInitedXLogBlock the page must already exist and be
-// initialised: the mutation reads the current contents.
+// initialised: the mutation reads the current contents. When it does not exist,
+// the record is SKIPPED (upstream's BLK_NOTFOUND), not refused — see
+// redoExistingHeapPageForBlock for why, and for the invalid-page-table
+// deviation that skip carries.
 func replayExistingXLogBlock(mgr *storage.Manager, block XLogBlockRef, endLSN storage.LSN, apply func(storage.Page) error) error {
-	nblocks, err := mgr.NBlocks(block.Rel)
+	// M0131-S21f: every edit-shaped btree record upstream reads with
+	// XLogReadBufferForRedo (RBM_NORMAL) — nbtxlog.c's insert-on-existing-page,
+	// delete, vacuum and mark-page-halfdead arms all skip on BLK_NOTFOUND.
+	page, skip, err := redoExistingHeapPageForBlock(mgr, block, endLSN)
 	if err != nil {
 		return err
 	}
-	if block.Block >= nblocks {
-		return fmt.Errorf("wal: block %d does not exist (nblocks=%d)", block.Block, nblocks)
-	}
-	page := make(storage.Page, storage.BlockSize)
-	if err := mgr.ReadBlock(block.Rel, block.Block, page); err != nil {
-		return err
-	}
-	if storage.IsNew(page) {
-		return fmt.Errorf("wal: block %d is uninitialised", block.Block)
-	}
-	if storage.MustHeader(page).LSN() >= endLSN {
-		return nil // already applied
+	if skip {
+		return nil
 	}
 	if err := apply(page); err != nil {
 		return err
@@ -5110,22 +5110,15 @@ func replayDecodedXLogHeapPrune(mgr *storage.Manager, r Record, xlog *XLogDecode
 	if err != nil {
 		return err
 	}
-	nblocks, err := mgr.NBlocks(block.Rel)
+	// M0131-S21f: RBM_NORMAL, like upstream's heap_xlog_prune_freeze. A pruned
+	// page that a later record in this same stream drops or truncates away is
+	// BLK_NOTFOUND, and the prune is moot rather than fatal.
+	page, skip, err := redoExistingHeapPageForBlock(mgr, block, storage.LSN(r.EndLSN))
 	if err != nil {
-		return err
+		return fmt.Errorf("wal: xlog heap-prune: %w", err)
 	}
-	if block.Block >= nblocks {
-		return fmt.Errorf("wal: xlog heap-prune: block %d does not exist (nblocks=%d)", block.Block, nblocks)
-	}
-	page := make(storage.Page, storage.BlockSize)
-	if err := mgr.ReadBlock(block.Rel, block.Block, page); err != nil {
-		return err
-	}
-	if storage.IsNew(page) {
-		return fmt.Errorf("wal: xlog heap-prune: block %d is uninitialised", block.Block)
-	}
-	if storage.MustHeader(page).LSN() >= storage.LSN(r.EndLSN) {
-		return nil // already applied
+	if skip {
+		return nil
 	}
 	if len(frozenSlots) > 0 {
 		if err := storage.PageFreezeBySlots(page, frozenSlots); err != nil {

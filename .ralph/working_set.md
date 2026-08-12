@@ -1,44 +1,43 @@
 (idle — nothing in flight)
 
-M0131-S21g LANDED (loop #170) — **the S28 reverse crash E2E is GREEN**. A real PG
-18.3 cluster SIGKILLed mid-life is now served by goopg end to end: all twelve
-row-equality checks match PG's own pre-crash answers, and the `FOR UPDATE` row is
-readable and updatable afterwards.
+M0131-S21f LANDED (loop #171) — the last three PG-format redo paths that refused
+where upstream skips now share one RBM_NORMAL prologue.
 
-Files: `internal/wal/recovery.go` (new `decodeXLogHeapUpdateNewTuple`,
-`replayDecodedXLogHeapUpdate` now keeps the flags byte and builds the tuple inside
-the BLK_NEEDS_REDO branch), `internal/wal/pg_assembled_emit.go` (the two flag
-constants), `internal/wal/heap_update_pg_test.go` (3 sub-tests), design
-`docs/design/0131-0015-*` §"S21g" + Guard 10, fix_plan (S21g checked, S21e closed),
-3 ledger rows.
+Files: `internal/wal/recovery.go` (`replayDecodedXLogHeapDelete`,
+`replayDecodedXLogHeapPrune`, `replayExistingXLogBlock` all route through
+`redoExistingHeapPageForBlock`; its comment now documents the widened
+deviation), new `internal/wal/redo_blknotfound_pg_test.go`, design
+`docs/design/0131-0015-pg-wal-opcode-coverage.md` §"S21f" + Guard 11 (old 12
+renumbered to 13), fix_plan S21f checked, 1 ledger row.
 
-The discovery: **S21e's diagnosis was wrong.** It is not cold-start catalog
-visibility. The boot reload scanned the replayed `base/5/1259` and kept 424 of 429
-pg_class tuples; the three it could not decode (`physical row too short: len=4`)
-were exactly `s28_items`/`s28_sub`/`s28_scratch`, whose index and toast rows
-reloaded fine. Replay wrote the husks: `log_heap_update` omits the leading/trailing
-run the new version shares with the old one (`XLH_UPDATE_PREFIX_FROM_OLD` 0x20 /
-`SUFFIX_FROM_OLD` 0x40, lengths logged in front of the `xl_heap_header`), and goopg
-discarded the flags byte and wrote the record's MIDDLE bytes as the whole tuple. A
-`pg_class.relhasindex` flip compresses to ~4 bytes — which is why tables were hit
-and their indexes were not.
+Worth carrying: the four-line "NBlocks + ReadBlock + hard error" prologue had
+been copied FIVE times and had already drifted once — the consolidation matters
+more than the behaviour flip. And the flip is not free: the invalid-page-table
+deviation the helper documents was written for lock/confirm ("a lost stamp is
+bookkeeping about a transaction the crash ended anyway") and that argument does
+NOT cover a lost prune or btree deletion on a page that does survive. Ledger row
+names the resume point (an invalid-page map with forget-paths, checked at the
+end of `Recover`).
 
-Worth carrying: this one was SILENT. Every other S21 slice announced itself by
-refusing to start; this produced a structurally valid page holding a corrupt tuple,
-and only a decoder downstream noticed.
+Gates: `internal/wal` + `internal/storage` + `internal/access/btree` PASS,
+`-race` on the touched wal tests PASS, UNITS precommit PASS (warm cache), S28
+reverse crash E2E PASS, both cold-start E2Es (`GoopgColdStartOnPGDataDir`,
+`PGColdStartOnGoopgDataDir`) PASS, pgbench smoke via the commit hook,
+`make ralph-state-guard` OK (auto-repaired the stale completed marker).
+Fail-when-broken proven: restoring the hard error inside the shared helper fails
+all three sub-tests.
 
-Gates: `internal/wal` + `internal/storage` + `internal/initdb` PASS, `-race` on the
-touched wal tests PASS, UNITS precommit PASS (warm cache), **S28 E2E PASS** (was
-red for 5 loops), S3 cold-start E2E still PASS, pgbench smoke via the commit hook,
-`make ralph-state-guard` OK. Fail-when-broken proven by re-inserting the
-"treat it as uncompressed" path → all 3 sub-tests fail.
+Note for the next loop: the testport E2Es launch the server via
+`go run ./cmd/goopg`, so `go test`'s cache is BLIND to `internal/wal` changes —
+a cached PASS there is stale. Force those with `-count=1` (one-off probe, not a
+gate run).
 
-Nightly triage: `ci/logs/action-items.md` still run `20260812-005501`; all 4 `## AI-`
-items already filed under M-NIGHTLY, nothing new.
+Nightly triage: `ci/logs/action-items.md` still run `20260812-005501`; all 4
+`## AI-` items already filed under M-NIGHTLY, nothing new.
 
-Next loop (banner = M-NIGHTLY filing, then M0131): S21f (mechanical, 3 redo paths
-that refuse where upstream skips) or S23 (the cheap LogicalMessage/Generic/CommitTs
-tail). Both ledger rows from this loop (new_xmax, ALL_VISIBLE_CLEARED) are small
-enough to fold into whichever is picked.
+Next loop (banner = M-NIGHTLY filing, then M0131): S23 (the cheap
+LogicalMessage / ReplicationOrigin / Generic / CommitTs tail) is the obvious
+next slice; the two S21g ledger rows (new_xmax, ALL_VISIBLE_CLEARED) are small
+enough to fold into it.
 
 In-flight: none.

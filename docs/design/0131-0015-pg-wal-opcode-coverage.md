@@ -1297,6 +1297,43 @@ page anyway.
 S21e is therefore **resolved by root cause, not by the work it described**: no
 cold-start catalog change was needed or made.
 
+### S21f — implementation notes: the last three hand-rolled page prologues (landed 2026-08-12)
+
+S21d fixed `heap_xlog_update`'s buffer acquisition; the sibling audit it filed
+named three more PG-format redo paths that had each hand-rolled the same
+`NBlocks` + `ReadBlock` prologue and ended it in a **hard error**:
+
+| path | upstream | was |
+|---|---|---|
+| `replayDecodedXLogHeapDelete` | `heap_xlog_delete`, `XLogReadBufferForRedo` RBM_NORMAL | `"xlog heap-delete: block N does not exist"` |
+| `replayDecodedXLogHeapPrune` | `heap_xlog_prune_freeze`, same | `"xlog heap-prune: block N does not exist"` |
+| `replayExistingXLogBlock` (every edit-shaped btree record) | `nbtxlog.c`'s delete/vacuum/dedup/halfdead arms, same | `"block N does not exist"` |
+
+Upstream treats an absent or all-zero page as `BLK_NOTFOUND` and the redo
+routine does nothing (`xlogutils.c:500-540`). The page can only be missing
+because a **later** record in the same stream drops or truncates the relation,
+so the mutation is moot — while goopg's refusal turned an ordinary
+"created and dropped before the checkpoint" tail into an unstartable cluster.
+
+All three now route through `redoExistingHeapPageForBlock` (`recovery.go`), the
+RBM_NORMAL helper S21a-2 already introduced for HEAP_LOCK/HEAP_CONFIRM. That
+consolidation is the point: the four-line prologue had been copied five times
+and had already drifted once.
+
+It also **widens the invalid-page-table deviation** that helper documents, and
+the widening is not free. For lock/confirm the note argued the skip cannot
+corrupt anything — a lost row-lock stamp is bookkeeping about a transaction the
+crash ended anyway. That argument does **not** extend to a lost prune or a lost
+btree deletion on a page that *does* survive: upstream would catch exactly that
+case with its invalid-page hash and PANIC at end of recovery, and goopg still
+keeps no such table. The deviation is recorded in the helper's comment and in
+the ledger; the alternative — keeping the hard error — is strictly worse,
+because it fails the common legitimate case to catch the rare illegitimate one.
+
+Deliberately unchanged: `replayInitedXLogBlock` (WILL_INIT / RBM_ZERO callers —
+they must still extend) and the "invalid lp"-class refusals inside the apply
+callbacks, which are corrupt-record errors, not missing-page ones.
+
 ## Guards
 
 1. Per-opcode unit tests over fixtures captured from a real PG 18.3 via
@@ -1334,9 +1371,14 @@ cold-start catalog change was needed or made.
    suffix-only, since the three take different branches upstream; proven
    fail-when-broken by re-inserting the "treat it as uncompressed" path, which
    leaves the tuple holding only the record's middle bytes.
-11. The S28 reverse crash E2E (`0131-0017`) with the full opcode workload: COPY,
+11. S21f: a heap-delete, a heap-prune and a btree-dedup record naming a block
+   past the end of an existing fork are all SKIPPED without error **and**
+   without extending the fork (`TestApplyRecordPGRedoSkipsAbsentPage`, one
+   sub-test each). Proven fail-when-broken by restoring the hard error inside
+   `redoExistingHeapPageForBlock`, which fails all three.
+12. The S28 reverse crash E2E (`0131-0017`) with the full opcode workload: COPY,
    VACUUM, `SELECT … FOR UPDATE`, TRUNCATE, SAVEPOINT, index-heavy insert.
-12. UNITS + RACE (`internal/wal`, `internal/initdb`) + SMOKE + SPOT green.
+13. UNITS + RACE (`internal/wal`, `internal/initdb`) + SMOKE + SPOT green.
 
 ## References
 
