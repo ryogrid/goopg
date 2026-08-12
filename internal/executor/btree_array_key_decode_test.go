@@ -248,16 +248,20 @@ func TestBtIndexCheck_OpClassDamageDetectedAfterArrayColumn(t *testing.T) {
 // there was no heap element image to agree with, and the 26th slice gave them
 // one.
 //
-// numeric is the one KNOWN divergence and is asserted as such rather than
-// skipped, so the day it is fixed this test says so (deferral ledger 2026-08-12):
-// EncodeNumericKey strips trailing mantissa zeros, so the key for 1.50 decodes
-// as 1.5 and the display scale PG preserves is gone.
+// The loop is driven by indexKeyColumnRendersHeapText, not by
+// indexKeyColumnIsDecodable: the 34th slice split those two questions apart
+// precisely because `numeric` answers them differently. Its key IS decodable
+// (the amcheck comparator needs that and keeps it) but does NOT render the heap's
+// text, because EncodeNumericKey strips trailing mantissa zeros — 1.50's key
+// decodes as 1.5. The scale-lossy exception this test used to assert inline is
+// therefore gone: numeric no longer reaches the fast path at all, and the
+// non-vacuity block below pins that it is refused for the RENDERING reason and
+// not by a decoder regression.
 func TestArrayKeyTextMatchesHeapText(t *testing.T) {
-	const scaleLossyType = "numeric"
-	checked, sawLossy := 0, false
+	checked := 0
 	for _, c := range indexKeyTypeCases() {
 		col := catalog.Column{Name: "c", Type: catalog.Type{Name: c.typ, IsArray: true}}
-		if !indexKeyColumnIsDecodable(col) {
+		if !indexKeyColumnRendersHeapText(col) {
 			continue
 		}
 		lit := "{" + c.lit + "}"
@@ -278,28 +282,58 @@ func TestArrayKeyTextMatchesHeapText(t *testing.T) {
 			t.Fatalf("%s[]: heap decode: %v", c.typ, err)
 		}
 		fromKey, fromHeap := keyDatum.StringValue(), heapDatum.StringValue()
-		if c.typ == scaleLossyType {
-			sawLossy = true
-			if fromKey == fromHeap {
-				t.Errorf("%s[]: key and heap now AGREE (%q) — the display-scale "+
-					"deferral row is resolved; drop this exception", c.typ, fromKey)
-			}
-			continue
-		}
 		checked++
 		if fromKey != fromHeap {
 			t.Errorf("%s[]: index-only scan would print %q where the heap prints %q",
 				c.typ, fromKey, fromHeap)
 		}
 	}
-	// Non-vacuity: the loop must actually reach the five types this slice
-	// re-armed, not silently skip them via the decodability predicate.
+	// Non-vacuity: the loop must actually reach the five types the 27th slice
+	// re-armed, not silently skip them via the predicate.
 	for _, typ := range []string{"date", "time", "timestamp", "timestamptz", "bytea"} {
-		if !indexKeyColumnIsDecodable(catalog.Column{Name: "c", Type: catalog.Type{Name: typ, IsArray: true}}) {
-			t.Errorf("%s[] is refused by indexKeyColumnIsDecodable — the 27th slice regressed", typ)
+		if !indexKeyColumnRendersHeapText(catalog.Column{Name: "c", Type: catalog.Type{Name: typ, IsArray: true}}) {
+			t.Errorf("%s[] is refused by indexKeyColumnRendersHeapText — the 27th slice regressed", typ)
 		}
 	}
-	if checked < 10 || !sawLossy {
-		t.Fatalf("degenerate case table: checked=%d sawLossy=%v", checked, sawLossy)
+	// …and numeric must be refused for the RENDERING reason specifically. If a
+	// later change made the decoder itself refuse numeric, the loop above would
+	// still be green while bt_index_check quietly stopped working on every
+	// numeric index — the exact trade the 34th slice declined to make.
+	numArr := catalog.Column{Name: "c", Type: catalog.Type{Name: "numeric", IsArray: true}}
+	if indexKeyColumnRendersHeapText(numArr) {
+		t.Error("numeric[] now renders heap text — if EncodeNumericKey learned the " +
+			"display scale, re-check that UNIQUE on numeric still collapses 1.0 and 1.00")
+	}
+	if !indexKeyColumnIsDecodable(numArr) {
+		t.Error("numeric[] is no longer DECODABLE — the comparator lane regressed; " +
+			"renderability was supposed to be the only thing numeric loses")
+	}
+	if checked < 10 {
+		t.Fatalf("degenerate case table: checked=%d", checked)
+	}
+}
+
+// TestIndexKeyRenderableIsNarrowerThanDecodable pins the containment the 34th
+// slice's two predicates are built on: a column whose key cannot be inverted at
+// all can never render the heap's text either. Stated as a test because the two
+// functions are edited independently, and an inversion of the relation would let
+// an index-only scan onto a fast path whose decoder errors — XX000 for the whole
+// query, which is what the array arm of the predicate was introduced to stop.
+func TestIndexKeyRenderableIsNarrowerThanDecodable(t *testing.T) {
+	sawRefusal := false
+	for _, c := range indexKeyTypeCases() {
+		for _, isArray := range []bool{false, true} {
+			col := catalog.Column{Name: "c", Type: catalog.Type{Name: c.typ, IsArray: isArray}}
+			renderable, decodable := indexKeyColumnRendersHeapText(col), indexKeyColumnIsDecodable(col)
+			if renderable && !decodable {
+				t.Errorf("%s(array=%v): renderable but not decodable", c.typ, isArray)
+			}
+			if !renderable {
+				sawRefusal = true
+			}
+		}
+	}
+	if !sawRefusal {
+		t.Fatal("degenerate case table: nothing is refused")
 	}
 }

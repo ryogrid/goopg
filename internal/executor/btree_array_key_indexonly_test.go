@@ -3,7 +3,10 @@ package executor
 // End-to-end gate for the array arm of indexKeyIsDecodable (M0119-0006, design
 // docs/design/0119-0006-array-index-key-decodability.md).
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestArrayIndexOnlyScanReadsHeapForRefusedElement reproduces the defect this
 // slice fixed. An `interval[]` (or `date[]`) column is indexable, the page is
@@ -53,6 +56,85 @@ func TestArrayIndexOnlyScanReadsHeapForRefusedElement(t *testing.T) {
 				t.Errorf("row=%q want %q", got, c.want)
 			}
 		})
+	}
+}
+
+// TestNumericIndexOnlyScanKeepsDisplayScale is the defect the 34th slice fixed,
+// and it is a wrong-ANSWER defect rather than a failed query: `{2.70}` came back
+// as `{2.7}` whenever the planner promoted the scan to an IndexOnlyScan over an
+// ALL_VISIBLE page, and as `{2.70}` otherwise — the same stored row printing two
+// ways depending on the plan. PG 18.3 prints `{2.70}` (numeric carries its
+// display scale), which is also what goopg's own heap decode prints.
+//
+// The cause is not repairable in the encoder: EncodeNumericKey strips trailing
+// mantissa zeros so numerically equal values encode to identical bytes, and that
+// byte-identity is exactly what makes a UNIQUE index on numeric reject `1.00`
+// after `1.0` (TestNumericUniqueCollapsesDisplayScale below holds that end
+// down). The key cannot carry the scale and stay an equality-collapsing key, so
+// the scan reads the heap instead — the same resolution `interval[]` gets.
+//
+// The scalar arm is here too because it is a DIFFERENT code path with the same
+// exposure: it takes the single-column lane of decodeRowFromKey rather than the
+// composite walk, and an index stored in the PG tuple-image format bypasses the
+// blob decode entirely (the predicate is asked only of the blob format).
+// Whichever route this fixture's index takes, the printed text must be the
+// heap's.
+func TestNumericIndexOnlyScanKeepsDisplayScale(t *testing.T) {
+	cases := []struct {
+		name, colType, insert, probe, want string
+	}{
+		{"scalar", "numeric", "1.50", "2.70", "2.70"},
+		{"array", "numeric[]", "{1.50}", "{2.70}", "{2.70}"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx, cleanup := newVMFixture(t)
+			defer cleanup()
+
+			runComposite(t, ctx,
+				"CREATE TABLE num_ios (a "+c.colType+")",
+				"CREATE INDEX num_ios_idx ON num_ios (a)",
+				"INSERT INTO num_ios VALUES ('"+c.insert+"')",
+				"INSERT INTO num_ios VALUES ('"+c.probe+"')",
+			)
+			vacuumThen(t, ctx, "num_ios")
+
+			q := "SELECT a FROM num_ios WHERE a = '" + c.probe + "'"
+			if ios := findIndexOnlyScan(planOne(t, q, ctx.Catalog)); ios == nil {
+				t.Skip("planner did not promote to IndexOnlyScan; the fast path is not reachable")
+			}
+			rows := runQuery(t, ctx, q)
+			if len(rows) != 1 {
+				t.Fatalf("rows=%d want 1 (%v)", len(rows), rows)
+			}
+			if got := rows[0][0].Format(); got != c.want {
+				t.Errorf("row=%q want %q (the heap's spelling)", got, c.want)
+			}
+		})
+	}
+}
+
+// TestNumericUniqueCollapsesDisplayScale is the other half of the trade, held
+// down so a later attempt to "fix" EncodeNumericKey by appending the display
+// scale fails HERE instead of silently admitting a duplicate. PG compares
+// numerics with numeric_cmp, which ignores display scale, so `1.00` after `1.0`
+// is a duplicate key; goopg gets that from byte-identical keys, and appending
+// scale bytes — trailing or not — would make the two keys differ.
+func TestNumericUniqueCollapsesDisplayScale(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	runComposite(t, ctx,
+		"CREATE TABLE num_uq (a numeric UNIQUE)",
+		"INSERT INTO num_uq VALUES ('1.0')",
+	)
+	_, err := runQueryErr(t, ctx, "INSERT INTO num_uq VALUES ('1.00')")
+	if err == nil {
+		t.Fatal("INSERT 1.00 after 1.0 succeeded — UNIQUE on numeric no longer " +
+			"collapses display scale; PG raises 23505")
+	}
+	if !strings.Contains(err.Error(), "23505") {
+		t.Errorf("err=%v, want a 23505 duplicate-key error", err)
 	}
 }
 

@@ -90,8 +90,15 @@ func TestPGHeapEncodingPreservesTextLikeInsertCoercions(t *testing.T) {
 	if gotChar[4].String != "c" || !gotChar[4].Valid {
 		t.Fatalf("char id=4 got %v, want \"c\"", gotChar[4])
 	}
-	if v := gotChar[3]; v.Valid && v.String != "" {
-		t.Fatalf("char id=3 got %v, want empty-string-ish row", v)
+	// A bare `char` is character(1), and bpchar_input blank-pads '' out to the
+	// declared width — so PG stores and returns ONE SPACE here, not the empty
+	// string. Measured on PG 18.3 with this exact table: `octet_length(v)` is 1
+	// for every row including id=3, and the DataRow read through `cat -A` is
+	// " $". The old expectation ("empty-string-ish") encoded goopg's missing
+	// bpchar padding, which the 57th M0119-0006 slice fixed; the varchar
+	// assertion above is unchanged because varchar does not pad.
+	if v := gotChar[3]; !v.Valid || v.String != " " {
+		t.Fatalf("char id=3 got %v, want a single space (bpchar(1) blank padding)", v)
 	}
 
 	if _, err := db.ExecContext(ctx, `INSERT INTO pgenc_varchar VALUES (5, 'cd')`); err == nil {

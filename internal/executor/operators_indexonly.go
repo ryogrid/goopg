@@ -387,20 +387,28 @@ func (o *indexOnlyScanOp) Close() error {
 // because the composite walk decodes columns in order and cannot skip one whose
 // byte width it does not know.
 //
-// Not consulted on the pgIndexKeyDesc (PG tuple-image) path: there the key
-// carries per-attribute datums, so nothing is lost — but such an index does not
-// take the fast path through this predicate either, since decodeRowFromKey
-// routes on the descriptor first.
+// It also asks the narrower question indexKeyColumnRendersHeapText owns (34th
+// slice): a key that inverts to the right VALUE but the wrong SPELLING is worse
+// than a refusal, because the scan succeeds and prints a different row than the
+// heap would. `numeric` is that case — its key has no display scale — and it is
+// asked only of the BLOB key format, since the display scale is present on the
+// pgIndexKeyDesc (PG tuple-image) path, whose key carries per-attribute datums.
+// decodeRowFromKey routes on that same descriptor, so the two agree on which
+// decode this predicate is judging.
 func (o *indexOnlyScanOp) indexKeyIsDecodable() bool {
 	if o.plan.Index == nil || o.ctx == nil || o.ctx.Catalog == nil {
 		return true
 	}
+	blobKey := o.ctx.pgIndexKeyDesc(o.plan.Index) == nil
 	for _, colName := range o.plan.Index.Columns {
 		col, ok := o.ctx.Catalog.LookupColumn(o.plan.Table, colName)
 		if !ok {
 			continue // the decode path reports this one itself
 		}
 		if !indexKeyColumnIsDecodable(*col) {
+			return false
+		}
+		if blobKey && !indexKeyColumnRendersHeapText(*col) {
 			return false
 		}
 	}

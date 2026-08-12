@@ -396,3 +396,111 @@ func TestStreamReplayerWaitsForCompleteRawPGWALRecord(t *testing.T) {
 		t.Fatalf("Run err=%v", err)
 	}
 }
+
+// TestStreamReplayerEndOfWALOnPartialTail pins the promotion-drain
+// stop condition against the failure nightly AI-20260812-005501-001
+// hit: `goopg promote: drain timed out after 5s (apply_lsn=50347104,
+// target=50347312)`.
+//
+// A primary's walsender cuts the stream at an arbitrary byte offset,
+// so the tail the walreceiver appends verbatim is routinely a
+// partially-transmitted record. ApplyLSN advances only to record
+// boundaries, so the old drain rule (`ApplyLSN >= WrittenLSN`) is
+// then unreachable *by construction* — no amount of waiting closes
+// the gap, and promotion fails a full 5 s later. Upstream treats a
+// short tail as end-of-WAL rather than an error (xlogrecovery.c
+// ReadRecord) and finishes recovery at the last complete record;
+// AtEndOfWAL is goopg's equivalent signal.
+//
+// Non-vacuity: the test asserts the byte-parity gap is still open
+// when AtEndOfWAL goes true. Were the partial tail somehow fully
+// applied, that assertion fails and the test stops proving anything
+// about the real condition.
+func TestStreamReplayerEndOfWALOnPartialTail(t *testing.T) {
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "pg_wal")
+	w, err := NewWriter(Config{
+		WALDir:             walDir,
+		SegmentSize:        DefaultSegmentSize,
+		PageHeaders:        true,
+		SystemID:           1,
+		TimelineID:         1,
+		WALBuffers:         256,
+		SenderMemoryBuffer: 32,
+	})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	defer w.Close()
+
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+
+	rel := storage.RelFileNode{DBOid: 123, RelOid: 456, Fork: storage.MainFork}
+	for i := 0; i <= 7; i++ {
+		page := make(storage.Page, storage.BlockSize)
+		if err := storage.InitPage(page); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := mgr.Extend(rel, page); err != nil {
+			t.Fatalf("Extend block %d: %v", i, err)
+		}
+	}
+
+	iter, err := NewRecordIterator(w, walDir, DefaultSegmentSize, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer iter.Close()
+
+	sr := NewStreamReplayer(mgr, 0)
+	if sr.AtEndOfWAL() {
+		t.Fatal("AtEndOfWAL true before Run: a replayer with no iterator must not report end-of-WAL")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- sr.Run(ctx, iter) }()
+
+	recordBytes, _, _ := encodeTestPGHeapInsertRecord(t)
+	_, end, err := w.AppendRaw(append(buildTestLongPageHeader(t), recordBytes...))
+	if err != nil {
+		t.Fatalf("AppendRaw whole record: %v", err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && sr.ApplyLSN() < end {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if sr.ApplyLSN() != end {
+		t.Fatalf("ApplyLSN = %d, want %d before truncation", sr.ApplyLSN(), end)
+	}
+
+	// The cut: a full record header (so the reader learns TotLen) with
+	// the body 8 bytes short — exactly the shape a mid-record stream
+	// cut leaves behind.
+	if _, _, err := w.AppendRaw(recordBytes[:len(recordBytes)-8]); err != nil {
+		t.Fatalf("AppendRaw partial record: %v", err)
+	}
+
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && !sr.AtEndOfWAL() {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !sr.AtEndOfWAL() {
+		t.Fatalf("AtEndOfWAL still false with a partial tail: apply_lsn=%d written_lsn=%d — promotion would hang until drainTimeout",
+			sr.ApplyLSN(), w.WrittenLSN())
+	}
+	if sr.ApplyLSN() != end {
+		t.Fatalf("ApplyLSN = %d, want %d: a partial record must not advance the apply cursor", sr.ApplyLSN(), end)
+	}
+	if written := w.WrittenLSN(); sr.ApplyLSN() >= written {
+		t.Fatalf("non-vacuity: apply_lsn=%d already >= written_lsn=%d, so the old byte-parity drain rule would have succeeded and this test proves nothing",
+			sr.ApplyLSN(), written)
+	}
+
+	cancel()
+	if err := <-runErr; err != nil {
+		t.Fatalf("Run err=%v", err)
+	}
+}

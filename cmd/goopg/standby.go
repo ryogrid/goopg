@@ -207,6 +207,25 @@ func (sc *standbyController) runPromote(ctx context.Context) error {
 		if applied >= target {
 			break
 		}
+		// `target` is a byte position, `applied` a record boundary, and
+		// the two need not ever meet: the primary's walsender cuts the
+		// stream at an arbitrary byte offset, so the tail the receiver
+		// appended is routinely a partially-transmitted record (or page
+		// padding no record covers). Upstream recovery ends at the last
+		// *complete* record in exactly this situation
+		// (xlogrecovery.c ReadRecord: a short tail is end-of-WAL, not an
+		// error), so once replay is parked with nothing left to read we
+		// are drained even though applied < target. Sound only because
+		// the receiver above has already exited — nothing can append
+		// after this point. Nightly AI-20260812-005501-001 failed here
+		// with a 208-byte shortfall that no amount of waiting could
+		// close.
+		if sc.replayer != nil && sc.replayer.AtEndOfWAL() {
+			sc.logger.Info("promote: replay reached end of WAL short of the written tail",
+				"apply_lsn", applied, "written_lsn", target,
+				"partial_tail_bytes", target-applied)
+			break
+		}
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("promote: drain cancelled at apply_lsn=%d target=%d: %w",

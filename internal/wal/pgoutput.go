@@ -562,7 +562,13 @@ func pgoDecodePhysicalValue(t catalog.Type, data []byte) ([]byte, int, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	return append([]byte(nil), payload...), n, nil
+	// A bpchar column's heap image is trimmed (executor's coerceTextLikeDatum),
+	// where upstream's is blank-padded to the declared width; a real PG
+	// publisher therefore emits all N characters in the change message and this
+	// one emitted only the significant ones. Same catalog.PadBpchar the DataRow
+	// and COPY renderers call, so the four boundaries cannot drift (Hard-won
+	// Rule #2). No-op for every other varlena type. M0119-0006 (57th slice).
+	return []byte(catalog.PadBpchar(t, string(payload))), n, nil
 }
 
 // pgoDecodePhysicalVarlena reads a PG varlena (short 1-byte or 4-byte header)

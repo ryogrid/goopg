@@ -192,6 +192,26 @@ func keyMetaForSysBtree(indexOID uint32) (btreeIndexKeyMeta, bool) {
 		return btreeIndexKeyMeta{tupleSize: 80, nkeyatts: 2}, true
 	case pgConversionDefaultIndexOID:
 		return btreeIndexKeyMeta{tupleSize: 24, nkeyatts: 4}, true
+	// M-NIGHTLY AI-20260811-014635-002: these nine were wired onto the
+	// runtime insert path (insertCanonicalSysBtreeLeaf) without ever being
+	// registered here. That is invisible until a leaf-root actually fills:
+	// the insert path itself never consults this table, so every one of them
+	// worked for the first page of entries and then failed the split with
+	// "split: unsupported system btree OID N". receipt-report.spec reached it
+	// on 2678 only at permutation 152. Layouts are read off the builders the
+	// insert sites call, not inferred: buildIndexTupleOidKey {16,1},
+	// buildIndexTupleOidInt2Key {16,2}, buildIndexTupleNameKey {72,1},
+	// buildIndexTupleOidNameKey {80,2}.
+	case pgIndexIndrelidIndexOID, pgIndexIndexrelidIndexOID,
+		pgAttrdefOidIndexOID, pgRewriteOidIndexOID,
+		pgSequenceSeqrelidIndexOID, pgExtensionOidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	case pgAttrdefAdrelidAdnumIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 2}, true
+	case pgExtensionNameIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 72, nkeyatts: 1}, true
+	case pgRewriteRelRulenameIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 80, nkeyatts: 2}, true
 	default:
 		return btreeIndexKeyMeta{}, false
 	}

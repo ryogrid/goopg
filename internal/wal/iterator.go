@@ -53,7 +53,27 @@ type RecordIterator struct {
 	pageHeaders bool
 	lastWaitPos int64
 	lastWaitEnd uint64
+	// parkedAtEnd is set while Next is blocked at the *end of the WAL
+	// stream*: the cursor has either reached the tail, or points at a
+	// record whose bytes run past WrittenLSN and therefore were never
+	// received. It is deliberately NOT set when Next blocks on bytes
+	// that exist but are not yet readable (see errWALBytesUndrained),
+	// because those will arrive on their own. Read via AtEndOfWAL.
+	// Written only by the single goroutine driving Next, read by
+	// observers (the promotion drain), hence atomic.
+	parkedAtEnd atomic.Bool
 }
+
+// errWALBytesUndrained marks the *transient* flavour of
+// ErrLSNNotWritten: the requested bytes lie inside WrittenLSN — so
+// they exist and will become readable — but are in neither the
+// writer's buffer nor a segment file at this instant. The definitive
+// flavour (bare ErrLSNNotWritten) means the bytes run past
+// WrittenLSN and were never appended at all. End-of-WAL detection
+// must fire only on the definitive one. It wraps ErrLSNNotWritten so
+// every existing `errors.Is(err, ErrLSNNotWritten)` check keeps
+// matching.
+var errWALBytesUndrained = fmt.Errorf("%w: wal bytes not yet drained", ErrLSNNotWritten)
 
 // RawChunk is one contiguous slice of the physical WAL byte stream.
 // StartLSN / EndLSN use PostgreSQL's 0-based byte positions so a
@@ -223,14 +243,15 @@ func (it *RecordIterator) Next(ctx context.Context) (Record, error) {
 						it.lastWaitPos = it.pos
 						it.lastWaitEnd = written
 					}
-					select {
-					case <-it.wake:
-						continue
-					case <-ctx.Done():
-						return Record{}, ctx.Err()
-					case <-it.writer.done:
-						return Record{}, ErrClosed
+					// Bare ErrLSNNotWritten here means the record at
+					// the cursor runs past WrittenLSN: the stream was
+					// cut mid-record and the rest was never received.
+					// errWALBytesUndrained means the opposite — the
+					// bytes exist and a drain will surface them.
+					if err := it.parkUntilWake(ctx, !errors.Is(err, errWALBytesUndrained)); err != nil {
+						return Record{}, err
 					}
+					continue
 				}
 				return Record{}, err
 			}
@@ -241,15 +262,64 @@ func (it *RecordIterator) Next(ctx context.Context) (Record, error) {
 		}
 		// At tail: drain any stale wake-up so the next signal is
 		// guaranteed to be post-cursor, then block.
-		select {
-		case <-it.wake:
-			continue
-		case <-ctx.Done():
-			return Record{}, ctx.Err()
-		case <-it.writer.done:
-			return Record{}, ErrClosed
+		if err := it.parkUntilWake(ctx, true); err != nil {
+			return Record{}, err
 		}
 	}
+}
+
+// parkUntilWake blocks until the writer signals fresh bytes, the
+// context is cancelled, or the writer closes. Returns nil on a
+// wake-up (the caller re-evaluates its cursor), ctx.Err() on
+// cancellation, ErrClosed when the writer shut down.
+//
+// `atEndOfWAL` says whether the block is because the stream has no
+// more bytes (true) or because bytes that do exist are momentarily
+// unreadable (false). The flag is published for the whole blocked
+// window so AtEndOfWAL can tell those apart, and from "the consumer
+// is still chewing through available records".
+func (it *RecordIterator) parkUntilWake(ctx context.Context, atEndOfWAL bool) error {
+	it.parkedAtEnd.Store(atEndOfWAL)
+	defer it.parkedAtEnd.Store(false)
+	select {
+	case <-it.wake:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-it.writer.done:
+		return ErrClosed
+	}
+}
+
+// AtEndOfWAL reports that the iterator has consumed every *complete*
+// record the writer holds and cannot advance further without new
+// bytes being appended.
+//
+// This is the end-of-WAL condition upstream recovery uses: a WAL
+// stream received from a primary is cut at an arbitrary byte offset,
+// so its tail is routinely a partially-transmitted record (or page
+// padding). `xlogrecovery.c`'s ReadRecord treats such a tail as the
+// end of the stream rather than an error, and recovery finishes at
+// the last complete record. Byte-level parity with WrittenLSN is NOT
+// a reachable condition in that case, which is why the promotion
+// drain waits on this instead.
+//
+// Correctness precondition: the caller must have stopped whatever
+// appends to the writer (the walreceiver) before trusting a true
+// result — otherwise "cannot advance right now" is a transient state
+// and records still in flight would be skipped. `standbyController.
+// runPromote` cancels the receiver and waits for it to exit first.
+//
+// A tail that exists but is momentarily unreadable (still in the
+// writer's buffer, not yet drained to a segment) does NOT count as
+// end-of-WAL — those bytes wake the iterator on their own, so
+// reporting them as end-of-WAL would drop received records. That
+// case is classified at the read site via errWALBytesUndrained.
+func (it *RecordIterator) AtEndOfWAL() bool {
+	if it.closed.Load() {
+		return true
+	}
+	return it.parkedAtEnd.Load()
 }
 
 // NextRaw returns the next contiguous physical WAL byte chunk starting at the
@@ -470,7 +540,7 @@ func (it *RecordIterator) readBytesAt(pos int64, n int) ([]byte, error) {
 		}
 		drained := int64(it.writer.DrainedLSN())
 		if cur >= drained {
-			return nil, ErrLSNNotWritten
+			return nil, fmt.Errorf("%w: pos=%d drained=%d", errWALBytesUndrained, cur, drained)
 		}
 		segNo := uint64(cur / it.segSize)
 		segOff := cur % it.segSize

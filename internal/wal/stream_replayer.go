@@ -51,6 +51,11 @@ type StreamReplayer struct {
 	applyLSN uint64
 	records  uint64
 	applied  uint64
+	// iter is the iterator the current Run call is draining. Held so
+	// observers outside the replay goroutine (the promotion drain)
+	// can ask whether replay has reached end-of-WAL. nil before the
+	// first Run.
+	iter *RecordIterator
 }
 
 // NewStreamReplayer constructs a replayer rooted at `mgr`.
@@ -84,6 +89,25 @@ func (sr *StreamReplayer) ApplyLSN() uint64 {
 	return sr.applyLSN
 }
 
+// AtEndOfWAL reports that replay has applied every complete record
+// the local WAL writer holds and is parked waiting for bytes that
+// have not arrived. Returns false before Run has started.
+//
+// The promotion drain uses this as its stop condition because
+// ApplyLSN can never reach WrittenLSN when the received stream was
+// cut mid-record — see RecordIterator.AtEndOfWAL for the full
+// argument and its correctness precondition (the appender must be
+// stopped first).
+func (sr *StreamReplayer) AtEndOfWAL() bool {
+	sr.mu.Lock()
+	iter := sr.iter
+	sr.mu.Unlock()
+	if iter == nil {
+		return false
+	}
+	return iter.AtEndOfWAL()
+}
+
 // Stats returns a snapshot of the replayer's progress counters: the
 // total number of records observed (including markers) and the
 // number that triggered a real page mutation.
@@ -108,6 +132,9 @@ func (sr *StreamReplayer) Run(ctx context.Context, iter *RecordIterator) error {
 	if iter == nil {
 		return errors.New("wal: StreamReplayer.Run: nil iterator")
 	}
+	sr.mu.Lock()
+	sr.iter = iter
+	sr.mu.Unlock()
 	for {
 		rec, err := iter.Next(ctx)
 		if err != nil {

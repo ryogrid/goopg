@@ -7,6 +7,9 @@ It is driven entirely by coding agents as a study in agent-led implementation:
 can an AI agent build and evolve a meaningful PostgreSQL-like server while
 staying behaviourally aligned with upstream PostgreSQL?
 
+The project currently targets **x86-64 Linux only** (developed and tested under
+WSL2); other platforms and architectures are out of scope for now.
+
 The project has three research axes:
 
 1. **Agent-driven implementation** — can coding agents produce correct,
@@ -27,9 +30,17 @@ under `postgres/` and is used as the reference for correctness.
 
 ## Implemented Features
 
+> **A note on "implemented":** a feature listed as implemented exists and is
+> exercised, but that does **not** necessarily mean the implementation is
+> complete or exhaustive — many features are partial or carry known gaps. For a
+> per-feature breakdown of what is implemented, deferred, or missing, see
+> [`docs/reference/coverage_table.csv`](docs/reference/coverage_table.csv).
+
+The highlights below are a non-exhaustive excerpt of the major subsystems:
+
 ### Wire Protocol & Connection
 - PostgreSQL wire protocol v3 (simple and extended query modes)
-- `trust` and `reject` authentication (pg_hba.conf)
+- Authentication via `pg_hba.conf`: `trust`, `reject`, `md5`, `scram-sha-256`
 - GUC / `postgresql.conf` parser with `SHOW`, `SET`, `RESET`
 - `pg_stat_activity` system view
 
@@ -69,6 +80,7 @@ under `postgres/` and is used as the reference for correctness.
 - SELECT FOR UPDATE / FOR SHARE (pessimistic row locking)
 - Aggregates: COUNT, SUM, AVG, MIN, MAX, ARRAY_AGG, STRING_AGG
 - Type coercions, CASE/WHEN, CAST, string/date/numeric operators
+- JSON / JSONB data type support
 - LIMIT / OFFSET / ORDER BY / GROUP BY / HAVING
 - EXPLAIN and EXPLAIN ANALYZE
 
@@ -97,15 +109,37 @@ under `postgres/` and is used as the reference for correctness.
 - `pg_class`, `pg_attribute`, `pg_index` heap tables in PG18-compatible format
 - `pg_namespace`, `pg_type`, `pg_proc` views
 - `CREATE TABLE`, `DROP TABLE`, `ALTER TABLE`
+- `CREATE SEQUENCE`, `nextval`/`currval`
 - `CREATE VIEW`, `DROP VIEW`
 - `CREATE INDEX`, `DROP INDEX`
 - `CREATE PUBLICATION`, `CREATE SUBSCRIPTION`
 - Catalog recovery from heap on startup (no JSON side-channel)
 - `pg_internal.init` relcache init file written for PG standby fast-start
 
+### Procedural SQL
+- `plpgsql` stored procedures / functions (incl. `EXCEPTION` blocks)
+- Triggers on INSERT / UPDATE / DELETE
+
 ### Benchmark Coverage
-- All 22 HammerDB TPC-H queries pass (SF=1, verified 2026-05-26)
+- All 22 HammerDB TPC-H queries pass (SF=1)
 - pgbench: standard, simple-update, select-only workloads
+
+---
+
+## Project Status
+
+goopg is an ongoing experiment; the current state in brief:
+
+- **Direct I/O** — not yet implemented. It proved harder than initially
+  expected, so storage still goes through the OS page cache.
+- **Performance** — on OLTP, `pgbench` reaches roughly half of vanilla
+  PostgreSQL's throughput. OLAP workloads (TPC-H, TPC-DS) run end-to-end, but
+  most queries are several to tens of times slower than PostgreSQL.
+- **Replication** — goopg can form a streaming-replication pair with vanilla
+  PostgreSQL 18.3, and even keeps working when the two sides' data-cluster
+  directories are swapped; a notable result for a from-scratch engine.
+- **Test parity** — roughly 70% of PostgreSQL's own test suite passes against
+  goopg.
 
 ---
 
@@ -204,48 +238,21 @@ go test ./internal/testport/... -v -timeout 300s
 
 ## Repository Layout
 
+First level only (git-tracked directories; dot-directories and scratch
+directories such as `tmp/` are omitted):
+
 ```
-cmd/goopg/          entry point (init / start / stop / promote)
-internal/
-  analyzer/         semantic analysis (type resolution, name binding)
-  catalog/          in-memory catalog, publication/subscription state
-  executor/         query execution operators
-  initdb/           cluster bootstrap and open/close lifecycle
-  mvcc/             MVCC manager, snapshots, ProcArray, clog
-  parser/           SQL parser
-  planner/          query planner (cost model, join order, statistics)
-  server/           wire-protocol server, dispatcher
-  storage/          buffer pool, heap pages, B-tree, WAL, VM, FSM
-  testport/         end-to-end replication and PostgreSQL interop tests
-  testutil/         test cluster harnesses
-  vacuum/           VACUUM and autovacuum
-  wal/              WAL writer, reader, classifier, replication
-docs/
-  design/           design documents per subsystem
-  milestones/       milestone tracking (numbered 0001–0116+)
-practice/           research notes and reference material
-postgres/           PostgreSQL 18 source submodule (oracle reference)
-bench/              TPC-H and pgbench benchmark scripts
+analysis/             investigation and performance-analysis notes
+bench/                TPC-H / TPC-DS / pgbench benchmark harnesses
+ci/                   CI workflows and nightly batch jobs
+cmd/                  Go entry point (CLI: init / start / stop / promote)
+docs/                 design docs, milestone tracking, reference material
+internal/             all backend packages (parser, planner, executor, storage, wal, mvcc, …)
+maintenance_prompts/  housekeeping scripts for the Ralph tracker files
+postgres/             upstream PostgreSQL 18.3 source (submodule; read-only oracle)
+practice/             research notes and reference material
+scripts/              build / test / benchmark helper scripts
+third-party/          vendored third-party code (e.g. tpcds-postgres submodule)
+tools/                auxiliary developer tooling (gocomplexity, mdtablefix, …)
+wp/                   WordPress compatibility test fixture
 ```
-
----
-
-## Active Milestones
-
-| Milestone | Title | Status |
-|-----------|-------|--------|
-| M0094 | Replication E2E completion & TAP test porting | in-progress |
-| M0095 | Client-tools TAP test porting | in-progress |
-| M0096 | RC isolation-test suite: feature implementation & spec pass | in-progress |
-| M0097 | pg_regress coverage: feature parity & test pass | in-progress |
-| M0100 | RC isolation-test suite: runtime correctness closure | in-progress |
-| M0104 | SERIALIZABLE isolation via SSI anomaly prevention | planned |
-| M0106 | PG relcache init file compatibility | planned |
-| M0107 | Performance optimization refactor | planned |
-| M0112 | pg_statistic heap table for ANALYZE persistence | planned |
-| M0113 | Heap-based index recovery via pg_index | planned |
-| M0114 | pg_internal.init relcache fast-start cache | planned |
-| M0115 | Heap tuple hint bit caching | planned |
-| M0116 | Multi-column Index-Only Scan key decoding | planned |
-
-See `docs/milestones/README.md` for the full milestone index.

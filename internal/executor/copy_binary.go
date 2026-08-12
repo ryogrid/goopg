@@ -392,7 +392,14 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 		// text / varchar / char / bytea — raw bytes
 		switch d.Kind {
 		case KindString:
-			return []byte(d.StringValue()), nil
+			// bpcharsend IS textsend (postgres/src/backend/utils/adt/
+			// varchar.c), so the bytes look accidentally right — but what
+			// textsend ships is the STORED image, which upstream keeps
+			// blank-padded to the declared width and goopg keeps trimmed.
+			// Measured on PG 18.3: a `char(10)` holding 'ab' is a length-10
+			// binary field; goopg wrote 2. catalog.PadBpchar restores it and
+			// is a no-op for text/varchar/bytea. M0119-0006 (57th slice).
+			return []byte(catalog.PadBpchar(t, d.StringValue())), nil
 		case KindBytes:
 			return d.BytesValue(), nil
 		case KindInt:
