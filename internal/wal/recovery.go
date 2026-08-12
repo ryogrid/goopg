@@ -3765,7 +3765,7 @@ func replayDecodedXLogHeapDelete(mgr *storage.Manager, r Record, xlog *XLogDecod
 	if block.HasImage && block.ImageApply {
 		return restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN))
 	}
-	xmax, offnum, _, _, err := decodeXLogHeapDeleteMainData(xlog.MainData)
+	xmax, offnum, infobits, flags, err := decodeXLogHeapDeleteMainData(xlog.MainData)
 	if err != nil {
 		return err
 	}
@@ -3779,7 +3779,18 @@ func replayDecodedXLogHeapDelete(mgr *storage.Manager, r Record, xlog *XLogDecod
 	if skip {
 		return nil
 	}
-	if err := storage.PageSetHeapTupleXmax(page, offnum, storage.TransactionID(xmax)); err != nil {
+	// M0131-S21h: infobits_set is not decoration. A real PG stamps a
+	// MultiXactId in xl_heap_delete.xmax whenever the deleted row was also held
+	// by a locker (XLHL_XMAX_IS_MULTI) — the FK FOR KEY SHARE case — and this
+	// arm used to drop the byte on the floor, replaying the multi as a plain
+	// xid. PageApplyHeapDeleteRedo mirrors heap_xlog_delete in full (infomask
+	// reset + fix_infomask_from_infobits, IS_SUPER's xmin clear, cmax, prunable
+	// and the t_ctid self/moved-partitions link), where the old call stamped
+	// nothing but xmax.
+	imask, imask2 := xlogHeapLockInfomaskBits(infobits)
+	if err := storage.PageApplyHeapDeleteRedo(page, offnum, storage.TransactionID(xmax), imask, imask2,
+		block.Block, storage.TransactionID(xlog.Header.XID),
+		flags&xlhDeleteIsSuper != 0, flags&xlhDeleteIsPartitionMove != 0); err != nil {
 		return fmt.Errorf("wal: xlog heap-delete apply: %w", err)
 	}
 	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
@@ -4366,7 +4377,7 @@ func replayDecodedXLogHeapUpdate(mgr *storage.Manager, r Record, xlog *XLogDecod
 	if block.HasImage && block.ImageApply {
 		return restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN))
 	}
-	oldXmax, oldOffnum, _, flags, _, newOffnum, err := decodeXLogHeapUpdateMainData(xlog.MainData)
+	oldXmax, oldOffnum, oldInfobits, flags, _, newOffnum, err := decodeXLogHeapUpdateMainData(xlog.MainData)
 	if err != nil {
 		return err
 	}
@@ -4395,11 +4406,17 @@ func replayDecodedXLogHeapUpdate(mgr *storage.Manager, r Record, xlog *XLogDecod
 		return err
 	}
 	samePage := oldBlock.Block == block.Block
+	// M0131-S21h: old_infobits_set is the only place a record says the OLD
+	// version's xmax is a MultiXactId (an UPDATE of a row a concurrent xact
+	// holds FOR KEY SHARE). It used to be discarded, so such a stamp replayed
+	// as a bare xid; PageApplyHeapUpdateOldRedo mirrors heap_xlog_update's
+	// old-tuple block in full (infomask reset + fix_infomask_from_infobits, the
+	// HOT_UPDATED set/clear branch, cmax and prunable) where the PageStamp*
+	// producer helpers could only write xmax + the forward link.
+	oldIMask, oldIMask2 := xlogHeapLockInfomaskBits(oldInfobits)
 	stampOld := func(p storage.Page) error {
-		if hot {
-			return storage.PageStampHotOldTuple(p, oldOffnum, storage.TransactionID(oldXmax), block.Block, newOffnum)
-		}
-		return storage.PageStampUpdatedOldTuple(p, oldOffnum, storage.TransactionID(oldXmax), block.Block, newOffnum)
+		return storage.PageApplyHeapUpdateOldRedo(p, oldOffnum, storage.TransactionID(oldXmax),
+			oldIMask, oldIMask2, hot, block.Block, newOffnum, storage.TransactionID(xlog.Header.XID))
 	}
 	if !skip {
 		// M0131-S21g: the new tuple's bytes are only WHOLE in goopg's own

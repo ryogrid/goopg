@@ -1555,6 +1555,85 @@ Guards: `TestReplayOpcodeSpaceCoverageForHandledRmgrs` (74 opcode subtests + 14
 undefined-value controls). Gates: `internal/wal` PASS and `-race` PASS,
 `internal/initdb` PASS, UNITS, pgbench smoke via the commit hook.
 
+### S21h — the opcode was handled; the record's `infobits_set` was not (2026-08-12)
+
+S21's arms answer *"is this opcode dispatched?"*. S21h is the first slice to ask
+the next question of an arm that had been green since B0.2: **does it apply the
+whole record?** For `XLOG_HEAP_DELETE` and `XLOG_HEAP_UPDATE` the answer was no
+— both discarded `infobits_set` / `old_infobits_set`:
+
+```go
+xmax, offnum, _, _, err := decodeXLogHeapDeleteMainData(xlog.MainData)   // before
+oldXmax, oldOffnum, _, flags, _, newOffnum, err := decodeXLogHeapUpdateMainData(...)
+```
+
+**F36 — a discarded `infobits_set` turns a MultiXactId into an xid.** Upstream's
+`heap_xlog_delete` / `heap_xlog_update` call `fix_infomask_from_infobits`
+(`heapam_xlog.c`), and `XLHL_XMAX_IS_MULTI` is the *only* place either record
+says its `xmax` field is a **MultiXactId** rather than a transaction id. PG sets
+it whenever the deleted/updated row was also held by a locker — the commonest
+real-world producer being an FK RI check's `FOR KEY SHARE`, i.e. two concurrent
+inserts of children referencing one parent. Replaying that as a bare xid left a
+page whose xmax is a multi wearing an xid's clothes, and every downstream reader
+then judged the delete against an arbitrary transaction id instead of taking
+`mvcc.TupleVisible`'s conservative `HEAP_XMAX_IS_MULTI` branch
+(`visibility.go:126-146`). This is a **PG→goopg** defect specifically: goopg's
+own emit hardcodes `infobits_set = 0` (`pg_assembled_emit.go:174`, `:242`,
+`:274`), so no goopg-authored record could ever have exposed it — which is why
+it survived every goopg↔goopg replay test. It is reachable through a landed
+path, not hypothetical: S21a-2 already restores `HEAP_XMAX_IS_MULTI` from
+`xl_heap_lock`, so the redo layer was *already* accepting multis it could not
+resolve, but only on the lock-only arm where visibility short-circuits.
+
+**F37 — the same two arms were dropping four more of upstream's mutations.**
+Enumerating `heap_xlog_delete` against goopg's arm (rather than checking only
+the bit the multi finding named) found that the old call, `PageSetHeapTupleXmax`,
+wrote xmax and nothing else. Also missing: `HeapTupleHeaderClearHotUpdated`,
+`cmax = FirstCommandId`, `PageSetPrunable`, the self-pointing `t_ctid`, and both
+flag branches — `XLH_DELETE_IS_SUPER` (which kills a speculatively inserted
+tuple by clearing **xmin**, not by stamping xmax, so goopg's unconditional xmax
+stamp left the aborted tuple alive to any snapshot that ignores the deleter) and
+`XLH_DELETE_IS_PARTITION_MOVE` (the `t_ctid` sentinel that makes a reader raise
+*"tuple to be locked was already moved to another partition"*). The update arm
+was missing the `HOT_UPDATED` **clear** on the non-HOT branch, cmax and prunable.
+
+**F38 — `PageSetPrunable`'s input is the record's xid, and goopg's producers
+keep the wrong extreme.** Upstream passes `XLogRecGetXid(record)`, never the
+stamped xmax; the two differ exactly when xmax is a multi, so feeding xmax in
+would pin an arbitrary MultiXactId into `pd_prune_xid`. Separately, upstream's
+`PageSetPrunable` keeps the **oldest** candidate xid while goopg's producer-side
+`PageStamp*` helpers keep the **newest** — a pre-existing divergence left in
+place here and ledgered; the new redo helpers take upstream's rule
+(`pageSetPrunablePG`).
+
+Landed: `storage.PageApplyHeapDeleteRedo` and
+`storage.PageApplyHeapUpdateOldRedo` (`internal/storage/heap.go`), siblings of
+S21a-2's `PageApplyHeapLockRedo` / `PageApplyHeapLockUpdatedRedo` and
+deliberately NOT the producer helpers — the runtime path stamps a write goopg is
+performing right now (always a plain xid), redo must reproduce whatever PG
+decided. `recovery.go`'s two arms translate the wire byte through the existing
+`xlogHeapLockInfomaskBits` (upstream shares one `fix_infomask_from_infobits`
+across all three record types) and pass the record xid, the `IS_SUPER` /
+`IS_PARTITION_MOVE` flags and the HOT-ness. The delete and update arms moved
+together because they are the sibling pair the rule names: `old_infobits_set` is
+byte-identical in purpose to `infobits_set`.
+
+Guards (`internal/wal/heap_delete_update_infobits_pg_test.go`, records
+hand-built because goopg has no encoder for a shape it does not emit): the
+multi/keyshare/keys-updated restore, the goopg-authored `infobits_set = 0`
+control (proving goopg↔goopg replay is byte-unchanged), `IS_SUPER`,
+`IS_PARTITION_MOVE`, the prunable-from-record-xid pin, and the update pair over
+both opcodes. Two break directions proven fail-when-broken by scripted revert
+(restore the old `PageSetHeapTupleXmax` call → 4 FAILs; restore the old
+`PageStamp*` closure → both update subtests FAIL).
+
+Still deferred: `XLH_DELETE_ALL_VISIBLE_CLEARED` / the update's two
+`ALL_VISIBLE_CLEARED` flags do not clear `PD_ALL_VISIBLE` or the visibility map
+in this arm (ledgered), and the restored multi is still unresolvable at read
+time until **S24** lands the durable `pg_multixact` SLRU — with S21h the tuple
+takes the conservative invisible branch instead of a wrong one, which is what
+makes S24 safe to keep deferred.
+
 ## References
 
 - `docs/design/0131-bidirectional-cluster-dir-coldstart-and-system-views.md`

@@ -155,6 +155,16 @@ const sizeOfXLogHeapDeleteData = 8
 // (heapam_xlog.h): main data carries the pre-delete tuple after xl_heap_delete.
 const xlhDeleteContainsOldTuple uint8 = 0x02
 
+// xlhDeleteIsSuper / xlhDeleteIsPartitionMove are PG's XLH_DELETE_IS_SUPER and
+// XLH_DELETE_IS_PARTITION_MOVE (heapam_xlog.h:105-106). goopg emits neither —
+// its upsert path locks before inserting rather than speculating, and it has no
+// partitioning — but replay honours both, because a hosted PG's WAL carries
+// them (M0131-S21h).
+const (
+	xlhDeleteIsSuper         uint8 = 0x08
+	xlhDeleteIsPartitionMove uint8 = 0x10
+)
+
 // EncodeHeapDeletePG builds a PostgreSQL xl_heap_delete record for one heap
 // deletion (an xmax stamp on the deleted tuple), framed for the assembled-record
 // Append path. Main data is xl_heap_delete{xmax, offnum, infobits_set, flags};
