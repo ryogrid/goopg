@@ -126,6 +126,12 @@ func ParseCopyBinaryRows(data []byte, cols []catalog.Column) (rows []Row, traile
 	return rows, false, pos, nil
 }
 
+// tzDispLimitSecs mirrors upstream TZDISP_LIMIT
+// ((MAX_TZDISP_HOUR + 1) * SECS_PER_HOUR = 16 h, postgres/src/include/
+// datatype/timestamp.h:143-144) — the sanity bound timetz_recv applies to a
+// received GMT displacement.
+const tzDispLimitSecs = int32(16 * 60 * 60)
+
 // --- type-specific binary encoders ---
 
 func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
@@ -165,6 +171,33 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
 		}
 		return encodeTimestampBinary(d.TimeValue().UTC()), nil
+	case "time", "time without time zone":
+		// M0119-0006 (51st slice): before this arm `time` fell through to the
+		// default and shipped Datum.Format()'s TEXT under FORMAT binary — a
+		// stream no real PG client can read. Upstream time_send
+		// (postgres/src/backend/utils/adt/date.c) is exactly the 8-byte
+		// big-endian TimeADT, i.e. the same microseconds-since-midnight the heap
+		// stores; taking them from pgTimeMicros rather than from Hour/Minute/
+		// Second is what carries the hour-24 rule (50th slice) into COPY.
+		if d.Kind != KindTime {
+			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
+		}
+		b := make([]byte, 8)
+		binary.BigEndian.PutUint64(b, uint64(pgTimeMicros(d.TimeValue())))
+		return b, nil
+	case "timetz", "time with time zone":
+		// Sibling of the "time" arm. Upstream timetz_send is TimeADT then the
+		// int32 zone; the zone's sign convention is PG's (positive = WEST of
+		// UTC) while Datum.Scale keeps minutes EAST, so it negates — identical
+		// to the heap "timetz" arm in codec.go, which is the twin this must
+		// agree with (Hard-won Rule #2).
+		if d.Kind != KindTime {
+			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
+		}
+		b := make([]byte, 12)
+		binary.BigEndian.PutUint64(b[:8], uint64(pgTimeMicros(d.TimeValue())))
+		binary.BigEndian.PutUint32(b[8:], uint32(int32(-d.TimeTZOffsetSecs())))
+		return b, nil
 	case "date":
 		if d.Kind != KindTime {
 			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
@@ -251,6 +284,40 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 			return NewTimestampTZDatum(ts), nil
 		}
 		return NewTimeDatum(ts), nil
+	case "time", "time without time zone":
+		// Decode twin of the "time" arm in datumToCopyBinary. Upstream time_recv
+		// range-checks the received TimeADT against [0, USECS_PER_DAY] — the
+		// bound is INCLUSIVE, `24:00:00` being a real TimeADT — and raises
+		// 22008 outside it, which is what a corrupt or foreign stream deserves
+		// instead of a silently out-of-range Datum. (AdjustTimeForTypmod's
+		// rounding is NOT applied here: goopg truncates at display, ledgered
+		// under M0119-0006.)
+		if len(payload) != 8 {
+			return Datum{}, fmt.Errorf("time: expected 8 bytes, got %d", len(payload))
+		}
+		micros := int64(binary.BigEndian.Uint64(payload))
+		if micros < 0 || micros > usecsPerDay {
+			return Datum{}, &ExecError{Code: "22008", Message: "time out of range"}
+		}
+		return NewTimeDatum(pgTimeFromMicros(micros)), nil
+	case "timetz", "time with time zone":
+		// Decode twin of the "timetz" encode arm; upstream timetz_recv reads the
+		// TimeADT then the int32 zone and applies the same TZDISP_LIMIT sanity
+		// check (±16 h, postgres/src/include/datatype/timestamp.h) with its own
+		// 22009 code. Zone sign is flipped back to Datum.Scale's east-of-UTC.
+		if len(payload) != 12 {
+			return Datum{}, fmt.Errorf("timetz: expected 12 bytes, got %d", len(payload))
+		}
+		micros := int64(binary.BigEndian.Uint64(payload[:8]))
+		if micros < 0 || micros > usecsPerDay {
+			return Datum{}, &ExecError{Code: "22008", Message: "time out of range"}
+		}
+		pgOffset := int32(binary.BigEndian.Uint32(payload[8:12]))
+		if pgOffset <= -tzDispLimitSecs || pgOffset >= tzDispLimitSecs {
+			return Datum{}, &ExecError{Code: "22009",
+				Message: "time zone displacement out of range"}
+		}
+		return NewTimeTZDatum(pgTimeFromMicros(micros), int(-pgOffset)), nil
 	case "date":
 		if len(payload) != 4 {
 			return Datum{}, fmt.Errorf("date: expected 4 bytes, got %d", len(payload))
