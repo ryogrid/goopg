@@ -103,22 +103,26 @@ func TestPGClassColumnsCount(t *testing.T) {
 }
 
 // TestPGAttributeColumnsCount checks the pg_attribute schema column count.
-// The schema is the 25-column layout written by initdb.pgAttrColDefs:
-// 24 leading columns plus attstattarget appended last (DU-002 slice 24).
+// The schema is the 25-column layout written by initdb.pgAttrColDefs, in PG18
+// FormData_pg_attribute order since M0131-S14.1 — attstattarget at #21
+// (ordinal 20), between attcollation and attacl, and attmissingval last.
+// Full-order enforcement lives in the initdb/executor canonical-order guards;
+// this one spot-checks the ordinals the decoder is most sensitive to.
 func TestPGAttributeColumnsCount(t *testing.T) {
 	cols := PGAttributeColumns()
 	if got := len(cols); got != 25 {
 		t.Errorf("PGAttributeColumns: len=%d want 25", got)
 	}
-	// Verify key columns are present at the right ordinals. attstattarget is
-	// the trailing column (ordinal 24); the leading 24 are unchanged.
+	// Verify key columns are present at the right ordinals, including the whole
+	// nullable tail — that is the part M0131-S14.1 permuted into PG18 order.
 	wantCols := []struct {
 		ord  int
 		name string
 	}{
 		{0, "attrelid"}, {1, "attname"}, {2, "atttypid"}, {4, "attnum"},
 		{10, "attcompression"}, {11, "attnotnull"}, {16, "attisdropped"},
-		{24, "attstattarget"},
+		{19, "attcollation"}, {20, "attstattarget"}, {21, "attacl"},
+		{22, "attoptions"}, {23, "attfdwoptions"}, {24, "attmissingval"},
 	}
 	for _, wc := range wantCols {
 		if wc.ord >= len(cols) {

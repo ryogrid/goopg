@@ -758,7 +758,7 @@ func TestUserPGAttributeCompressionOverride(t *testing.T) {
 // emits nothing; attstattarget was hardcoded NULL so a declared target was
 // silently dropped from the dump.
 func TestUserPGAttributeStatTargetOverride(t *testing.T) {
-	const attstattargetIdx = 24 // attstattarget position (last) in the user pg_attribute row
+	attstattargetIdx := pgAttributeColIdxForTest(t, "attstattarget")
 	tbl := &catalog.Table{Name: "t", OID: 99003}
 
 	// No override: attstattarget is NULL (the PG18 default → no SET STATISTICS).
@@ -796,7 +796,7 @@ func TestUserPGAttributeStatTargetOverride(t *testing.T) {
 // goopg's array_to_string(attoptions, ', ') renders so pg_dump re-emits the
 // clause.
 func TestUserPGAttributeOptionsOverride(t *testing.T) {
-	const attoptionsIdx = 21 // attoptions position in the user pg_attribute row
+	attoptionsIdx := pgAttributeColIdxForTest(t, "attoptions")
 	tbl := &catalog.Table{Name: "t", OID: 99004}
 
 	// No options: attoptions is NULL.
@@ -823,7 +823,7 @@ func TestUserPGAttributeOptionsOverride(t *testing.T) {
 // options (`CREATE FOREIGN TABLE (col type OPTIONS (name 'value', …))`) —
 // pg_attribute.attfdwoptions. DU-002 slice 418.
 func TestUserPGAttributeFDWOptionsOverride(t *testing.T) {
-	const attfdwoptionsIdx = 22 // attfdwoptions position in the user pg_attribute row
+	attfdwoptionsIdx := pgAttributeColIdxForTest(t, "attfdwoptions")
 	tbl := &catalog.Table{Name: "t", OID: 99005}
 
 	// No FDW options: attfdwoptions is NULL.

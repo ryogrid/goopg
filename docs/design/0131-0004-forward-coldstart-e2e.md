@@ -289,11 +289,44 @@ What is missing is PG's **fast-default** mechanism: since PG 11, ADD COLUMN with
 a non-volatile DEFAULT does not rewrite the heap but stores the value in
 `pg_attribute.attmissingval` with `atthasmissing = true`, and short tuples
 materialise it on read. goopg neither rewrites the rows nor records the missing
-value. Underneath sits a sharper fact: `attmissingval` does not exist as a
-column at all on the hosted PG (`SELECT attmissingval FROM pg_attribute` →
-42703), so goopg's `pg_attribute` heap is short of at least one attribute in its
-own self-description (the rows for relid 1249). Lock-in:
-`assertFastDefaultGapReadsNullOnHostedPG`.
+value. Underneath sat a sharper fact, and **that half is FIXED (S14.1,
+2026-08-12)**: `attmissingval` did not exist as a column at all on the hosted PG
+(`SELECT attmissingval FROM pg_attribute` → 42703). The remaining fast-default
+gap is S14.2/S14.3. Lock-in: `assertFastDefaultGapReadsNullOnHostedPG`, which
+now asserts the S14.1 half positively and only the fast-default half
+fail-when-fixed.
+
+*S14.1, as measured and fixed.* The 42703 was **not** a missing heap row —
+goopg's rows for relid 1249 always numbered 25, `attmissingval` among them. It
+was `pg_class.relnatts = 24` on the nailed pg_attribute row. PG unlinks goopg's
+`pg_internal.init` at startup (`xlog.c:5633` `RelationCacheInitFileRemove`) and
+builds `pg_attribute` from its own compiled 25-column `Desc_pg_attribute`, but
+`RelationCacheInitializePhase3` then copies `rd_rel` straight out of goopg's
+`pg_class` tuple — so the short `relnatts` truncated the last column off an
+otherwise correct descriptor. In PG18 order that last column is `attmissingval`.
+
+Correcting `relnatts` exposed a permutation beneath it. goopg ordered the five
+nullable trailing columns
+`attacl/attoptions/attfdwoptions/attmissingval/attstattarget`; PG18 orders them
+`attstattarget/attacl/attoptions/attfdwoptions/attmissingval`. The old code
+appended `attstattarget` last on the stated theory that its canonical position
+was #4 — true through PG16, but PG18 moved it after `attcollation` when it
+became nullable. With all five NULL the two orders are physically
+indistinguishable (identical null bitmap, unchanged `t_hoff`), which is why it
+survived this long; `ALTER COLUMN … SET STATISTICS` writes `attstattarget`, and
+a hosted PG would then have read that `int2` as `attacl`.
+
+goopg described `pg_attribute` in four places and they had drifted apart:
+`initdb.pgAttrColDefs`, `catalog.PGAttributeColumns` and
+`executor.pgAttributeColumnsPG18` shared the wrong tail order, while
+`initdb.pgAttributeAttrs` (the `pg_internal.init` descriptor) was a 24-column
+PG-11-era layout with an `attcacheoff` PG18 no longer has. `pgAttributeAttrs`
+now DERIVES from `pgAttrColDefs` through a shared helper, so that pair cannot
+drift again; the other two are pinned by
+`TestPGAttributeSelfDescriptionIsPG18Canonical` (initdb) and
+`TestPGAttributeColumnsPG18IsCanonical` (executor), which spell out PG18's order
+in full. This is the [[pattern_sibling_paths_must_agree]] failure mode for the
+third time in this milestone (S13's `pg_proc`, Step 3u's `attoptions`, now this).
 
 **F4 — a goopg-`CREATE DATABASE`-minted database is unopenable (→ M0131-S15).**
 Connecting to `s4other` fails with

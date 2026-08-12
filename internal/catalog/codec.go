@@ -662,16 +662,25 @@ func PGClassColumns() []Column {
 // heap encoding follows this column order, so the schema must agree with it
 // for the executor's decoder to read correct values.
 //
-// NOTE: attstattarget is appended LAST rather than placed at its PG18-canonical
-// position (#4, after atttypid). goopg's on-disk pg_attribute layout is already
-// non-canonical (it omits attcacheoff and orders attlen before attnum), and the
-// fixed-offset physical decoder (DecodePGAttributePhysicalRow) reads attrelid/
-// attname/atttypid/attnum/attnotnull/attisdropped by hardcoded byte offset.
-// Appending attstattarget as a nullable trailing column (always NULL, exactly
-// like attacl/attoptions/attfdwoptions/attmissingval) keeps every existing byte
-// offset valid and grows the null bitmap 3→4 bytes within the same MAXALIGN(8)
-// boundary (t_hoff stays 32). SELECT resolves columns by name, so the trailing
-// position is transparent to queries such as pg_dump's getTableAttrs.
+// M0131-S14.1: the order is now byte-for-byte PG18-canonical
+// (postgres/src/include/catalog/pg_attribute.h FormData_pg_attribute) —
+// attstattarget sits at #21, between attcollation and attacl, and attcacheoff
+// is absent because PG18 removed it from the catalog. An earlier revision
+// appended attstattarget LAST on the theory that its canonical position was #4
+// (true of PG16 and earlier, NOT of PG18, which moved it after attcollation in
+// upstream commit "Make attstattarget nullable"), so the tail read
+// attacl/attoptions/attfdwoptions/attmissingval/attstattarget where PG18 reads
+// attstattarget/attacl/attoptions/attfdwoptions/attmissingval.
+//
+// That was invisible for as long as all five were NULL — the null bitmap is
+// identical under either permutation when every bit is clear — but a hosted
+// real PostgreSQL decodes goopg's rows with its own compiled struct, so a
+// single non-NULL member of the group (an `ALTER COLUMN … SET STATISTICS`
+// writes attstattarget) made PG read that value as attacl. Reordering costs
+// nothing physically: attstattarget is a nullable pass-by-value int2, so no
+// fixed-width byte offset moves, the bitmap stays 4 bytes and t_hoff stays 32,
+// which is why DecodePGAttributePhysicalRow's hardcoded offsets for
+// attrelid/attname/atttypid/attnum/attnotnull/attisdropped are untouched.
 func PGAttributeColumns() []Column {
 	cols := []Column{
 		{Name: "attrelid", Type: Type{Name: "oid"}},
@@ -694,6 +703,7 @@ func PGAttributeColumns() []Column {
 		{Name: "attislocal", Type: Type{Name: "bool"}},
 		{Name: "attinhcount", Type: Type{Name: "int2"}},
 		{Name: "attcollation", Type: Type{Name: "oid"}},
+		{Name: "attstattarget", Type: Type{Name: "int2"}},
 		// attacl is a PG-native _aclitem array (OID 1034), not text: a column GRANT
 		// stores it as a binary ArrayType blob that the seqscan/index-scan ACL hook
 		// decodes to canonical aclitemout text on read (mirrors pg_type.typacl).
@@ -703,7 +713,6 @@ func PGAttributeColumns() []Column {
 		{Name: "attoptions", Type: Type{Name: "text"}},
 		{Name: "attfdwoptions", Type: Type{Name: "text"}},
 		{Name: "attmissingval", Type: Type{Name: "text"}},
-		{Name: "attstattarget", Type: Type{Name: "int2"}},
 	}
 	for i := range cols {
 		cols[i].Ordinal = i

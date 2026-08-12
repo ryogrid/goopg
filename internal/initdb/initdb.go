@@ -6001,10 +6001,11 @@ func pgClassReltablespaceFor(isShared bool) executor.Datum {
 	return executor.NewIntDatum(0)
 }
 
-// pgAttrColDefs returns the 25 pg_attribute column descriptors. attstattarget
-// is appended last (not at its PG18-canonical position #4); see
-// catalog.PGAttributeColumns for the rationale (preserves the fixed-offset
-// physical decoder and keeps t_hoff stable). Always emitted NULL.
+// pgAttrColDefs returns the 25 pg_attribute column descriptors in PG18-canonical
+// order (M0131-S14.1) — attstattarget at #21, between attcollation and attacl,
+// and no attcacheoff, exactly as FormData_pg_attribute declares them. See
+// catalog.PGAttributeColumns for why the tail order matters to a hosted PG even
+// though the five trailing columns are usually all NULL.
 func pgAttrColDefs() []catalog.Column {
 	return []catalog.Column{
 		{Name: "attrelid", Type: catalog.Type{Name: "oid"}},
@@ -6027,6 +6028,7 @@ func pgAttrColDefs() []catalog.Column {
 		{Name: "attislocal", Type: catalog.Type{Name: "bool"}},
 		{Name: "attinhcount", Type: catalog.Type{Name: "int2"}},
 		{Name: "attcollation", Type: catalog.Type{Name: "oid"}},
+		{Name: "attstattarget", Type: catalog.Type{Name: "int2"}},
 		// attacl is a PG-native _aclitem array (OID 1034), not text: a column
 		// GRANT stores it as a binary ArrayType blob and the seqscan/index-scan ACL
 		// hook decodes it to canonical aclitemout text on read. Declaring it text
@@ -6036,7 +6038,6 @@ func pgAttrColDefs() []catalog.Column {
 		{Name: "attoptions", Type: catalog.Type{Name: "text"}},
 		{Name: "attfdwoptions", Type: catalog.Type{Name: "text"}},
 		{Name: "attmissingval", Type: catalog.Type{Name: "text"}},
-		{Name: "attstattarget", Type: catalog.Type{Name: "int2"}},
 	}
 }
 
@@ -6064,20 +6065,30 @@ func pgAttrEntriesForRel(rel nailedRel) []nailedAttr {
 		return attrs
 	}
 	if rel.OID == catalog.AttributeRelationId {
-		cols := pgAttrColDefs()
-		attrs := make([]nailedAttr, len(cols))
-		for i, c := range cols {
-			attrs[i] = nailedAttr{
-				Name:    c.Name,
-				TypeOID: pgCatalogTypeOID(c.Type.Name),
-				Num:     int16(i + 1),
-				Len:     int16(pgCatalogTypeLen(c.Type.Name)),
-				NotNull: pgCatalogTypeLen(c.Type.Name) != -1,
-			}
-		}
-		return attrs
+		return nailedAttrsFromColDefs(pgAttrColDefs())
 	}
 	return rel.Attrs
+}
+
+// nailedAttrsFromColDefs projects a catalog column list onto the nailedAttr
+// shape. pg_attribute's self-description uses it from BOTH sides — the heap
+// rows here and the pg_internal.init descriptor in pgAttributeAttrs — so the
+// two can never drift (M0131-S14.1; they had, by one column and a permutation).
+func nailedAttrsFromColDefs(cols []catalog.Column) []nailedAttr {
+	attrs := make([]nailedAttr, len(cols))
+	for i, c := range cols {
+		attrs[i] = nailedAttr{
+			Name:    c.Name,
+			TypeOID: pgCatalogTypeOID(c.Type.Name),
+			Num:     int16(i + 1),
+			// Varlena columns (attlen=-1) are nullable; fixed-size catalog
+			// columns are NOT NULL. PG's att_addlength_pointer asserts on
+			// attlen=0, so we must not produce that value.
+			Len:     int16(pgCatalogTypeLen(c.Type.Name)),
+			NotNull: pgCatalogTypeLen(c.Type.Name) != -1,
+		}
+	}
+	return attrs
 }
 
 // pgAttributeRow builds one pg_attribute tuple.
@@ -6103,6 +6114,7 @@ func pgAttributeRow(relOID uint32, a nailedAttr) executor.Row {
 		executor.NewBoolDatum(true),  // attislocal
 		executor.NewIntDatum(0),      // attinhcount
 		executor.NewIntDatum(0),      // attcollation
+		executor.NullDatum,           // attstattarget (PG18 BKI_FORCE_NULL default)
 		// Step 3u: Emit NULL (not empty-text varlena) for the four nullable
 		// trailing varlena/array columns. Previously NewStringDatum("") wrote
 		// a 1-byte empty varlena which PG's RelationGetIndexAttOptions →
@@ -6116,7 +6128,6 @@ func pgAttributeRow(relOID uint32, a nailedAttr) executor.Row {
 		executor.NullDatum, // attoptions
 		executor.NullDatum, // attfdwoptions
 		executor.NullDatum, // attmissingval
-		executor.NullDatum, // attstattarget (PG18 BKI_FORCE_NULL default)
 	}
 }
 

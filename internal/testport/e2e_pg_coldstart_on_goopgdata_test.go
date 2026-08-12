@@ -521,15 +521,29 @@ func assertGoopgCreatedDatabaseStillUnopenableByPG(t *testing.T, repo string, pg
 // the rows nor records the missing value, so PG sees short tuples with no
 // missing value and yields NULL.
 //
-// Underneath that sits a second, sharper fact: `attmissingval` does not exist
-// as a column at all on the hosted PG —
-// `SELECT attmissingval FROM pg_attribute` errors 42703 — so goopg's
-// pg_attribute heap is short of at least one attribute in its own
-// self-description (the rows for relid 1249), not merely unpopulated for
-// s4_items.
+// Underneath that sat a second, sharper fact, and THAT half is now FIXED
+// (M0131-S14.1): `SELECT attmissingval FROM pg_attribute` used to error 42703
+// on the hosted PG. Not because the column was missing from goopg's heap — the
+// rows for relid 1249 always had 25 attributes — but because the nailed
+// pg_class row said relnatts = 24. PG unlinks goopg's pg_internal.init at
+// startup (xlog.c:5633 RelationCacheInitFileRemove) and builds pg_attribute
+// from its own compiled 25-column Desc_pg_attribute, then
+// RelationCacheInitializePhase3 copies rd_rel out of goopg's pg_class tuple —
+// and the short relnatts truncated the last column off the descriptor. In PG18
+// order that last column is attmissingval, hence the 42703.
 //
-// Filed as M0131-S14 with a deferral-ledger row. When S14 lands, this assertion
-// FAILS — invert it then to a direct equality against goopg's own answer.
+// Fixing relnatts exposed the permutation underneath it: goopg ordered the five
+// nullable trailing columns attacl/attoptions/attfdwoptions/attmissingval/
+// attstattarget, PG18 orders them attstattarget/attacl/attoptions/
+// attfdwoptions/attmissingval (attstattarget moved to #21 when it became
+// nullable; the old code's comment still claimed #4, which was PG16's). All
+// five NULL made the two indistinguishable — same null bitmap — but
+// `ALTER COLUMN … SET STATISTICS` writes attstattarget, and a hosted PG would
+// then have read that int2 as attacl. Both halves are asserted positively below.
+//
+// What remains deferred is the fast-default mechanism itself (S14.2/S14.3),
+// still asserted fail-when-fixed. When it lands, that assertion FAILS — invert
+// it then to a direct equality against goopg's own answer.
 func assertFastDefaultGapReadsNullOnHostedPG(t *testing.T, pg *pgcluster.Cluster, logPath, goopgAnswer string) {
 	t.Helper()
 	// The half that works, asserted positively: pg_attrdef survived the cold
@@ -548,6 +562,25 @@ func assertFastDefaultGapReadsNullOnHostedPG(t *testing.T, pg *pgcluster.Cluster
 			"this is M0130's pg_attrdef 2604/2656/2657 work, and it is NOT the known "+
 			"fast-default gap (M0131-S14)", got)
 	}
+	// S14.1, asserted positively: pg_attribute must describe itself to the
+	// hosted PG with all 25 PG18 attributes, in PG18 order. Reading
+	// attmissingval AT ALL is the 42703 regression tripwire; reading the tail's
+	// attnums is the permutation tripwire. Both queries are answered from
+	// goopg's own heap rows for relid 1249.
+	if got := s4Scalar(t, pg, logPath, "SELECT count(*) FROM pg_attribute WHERE attmissingval IS NOT NULL"); got != "0" {
+		t.Fatalf("hosted PG reads %q non-NULL pg_attribute.attmissingval rows, want 0 — "+
+			"a 42703 here instead means goopg's nailed pg_class relnatts for OID 1249 "+
+			"went short again (M0131-S14.1)", got)
+	}
+	if got := s4Scalar(t, pg, logPath,
+		`SELECT string_agg(attname, ',' ORDER BY attnum)
+		   FROM pg_attribute WHERE attrelid = 1249 AND attnum > 20`); got !=
+		"attstattarget,attacl,attoptions,attfdwoptions,attmissingval" {
+		t.Fatalf("goopg's pg_attribute self-description tail = %q, want PG18's "+
+			"\"attstattarget,attacl,attoptions,attfdwoptions,attmissingval\" — the four "+
+			"sibling column lists have drifted apart again (M0131-S14.1)", got)
+	}
+
 	// The half that does not, asserted in the fail-when-fixed direction.
 	nulls := s4Scalar(t, pg, logPath, "SELECT count(*) FROM public.s4_items WHERE tag IS NULL")
 	if nulls != "15" {

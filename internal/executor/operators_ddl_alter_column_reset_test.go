@@ -54,7 +54,7 @@ func TestAlterColumnResetOptionsClearsNamedEntriesOnly(t *testing.T) {
 	// live from catalog.Table), so drive the same row-shape helper the
 	// pg_dump-fidelity test for the SET side uses directly, rather than
 	// re-deriving a full heap query harness here.
-	const attoptionsIdx = 21
+	attoptionsIdx := pgAttributeColIdxForTest(t, "attoptions")
 	row := buildUserPGAttributeRow(nil, tbl, col)
 	if got := row[attoptionsIdx].StringValue(); got != "{n_distinct_inherited=-0.1}" {
 		t.Errorf("attoptions after RESET (n_distinct) = %q, want {n_distinct_inherited=-0.1}", got)

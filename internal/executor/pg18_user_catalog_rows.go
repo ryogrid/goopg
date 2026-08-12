@@ -75,8 +75,9 @@ func pgClassColumnsPG18() []catalog.Column {
 }
 
 // pgAttributeColumnsPG18 mirrors initdb.pgAttrColDefs — the goopg pg_attribute
-// row layout (25 columns). attstattarget is appended last (always NULL); see
-// catalog.PGAttributeColumns for why it is not at its PG18-canonical position.
+// row layout (25 columns), in PG18-canonical order since M0131-S14.1 —
+// attstattarget at #21, between attcollation and attacl. See
+// catalog.PGAttributeColumns for why that position is not cosmetic.
 func pgAttributeColumnsPG18() []catalog.Column {
 	return []catalog.Column{
 		{Name: "attrelid", Type: catalog.Type{Name: "oid"}},
@@ -99,11 +100,11 @@ func pgAttributeColumnsPG18() []catalog.Column {
 		{Name: "attislocal", Type: catalog.Type{Name: "bool"}},
 		{Name: "attinhcount", Type: catalog.Type{Name: "int2"}},
 		{Name: "attcollation", Type: catalog.Type{Name: "oid"}},
+		{Name: "attstattarget", Type: catalog.Type{Name: "int2"}},
 		{Name: "attacl", Type: catalog.Type{Name: "aclitem[]"}},
 		{Name: "attoptions", Type: catalog.Type{Name: "text"}},
 		{Name: "attfdwoptions", Type: catalog.Type{Name: "text"}},
 		{Name: "attmissingval", Type: catalog.Type{Name: "text"}},
-		{Name: "attstattarget", Type: catalog.Type{Name: "int2"}},
 	}
 }
 
@@ -1057,16 +1058,18 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 			return NewIntDatum(0)
 		}(), // attinhcount
 		NewIntDatum(int64(attCollationOID)), // attcollation (type default; per-column COLLATE override, slice 188)
-		// attacl / attoptions / attfdwoptions / attmissingval are nullable
-		// varlena columns; PG18 stores NULL when unset. NullDatum signals
-		// EncodeRowPG to skip the column and the bitmap helper to clear
-		// its bit. attstattarget (last) is NULL by default but carries the
-		// per-column SET STATISTICS override when one is set (DU-002 slice 184).
+		// attstattarget / attacl / attoptions / attfdwoptions / attmissingval
+		// are the five nullable trailing columns; PG18 stores NULL when unset.
+		// NullDatum signals EncodeRowPG to skip the column and the bitmap
+		// helper to clear its bit. attstattarget leads the group (PG18-canonical
+		// #21, M0131-S14.1) and is the one that is routinely NOT null — it
+		// carries the per-column SET STATISTICS override (DU-002 slice 184),
+		// which is exactly why its position had to be corrected.
+		attStatTargetDatum, // attstattarget (NULL default; integer override)
 		attaclDatum,        // attacl (NULL default; _aclitem blob after a column GRANT)
 		attOptionsDatum,    // attoptions (NULL default; text[] literal when set)
 		attFDWOptionsDatum, // attfdwoptions (NULL default; text[] literal when set)
 		NullDatum,          // attmissingval
-		attStatTargetDatum, // attstattarget (NULL default; integer override)
 	}
 }
 
@@ -2188,11 +2191,11 @@ func buildUserPGAttributeRowForCompositeField(cat catalog.Catalog, ct *catalog.C
 		NewBoolDatum(true),                       // attislocal
 		NewIntDatum(0),                           // attinhcount
 		NewIntDatum(int64(attCollationOID)),      // attcollation (type default; per-field COLLATE override, slice 257)
+		NullDatum,                                // attstattarget
 		NullDatum,                                // attacl
 		NullDatum,                                // attoptions
 		NullDatum,                                // attfdwoptions
 		NullDatum,                                // attmissingval
-		NullDatum,                                // attstattarget
 	}
 }
 
