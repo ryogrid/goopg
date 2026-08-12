@@ -676,8 +676,11 @@ func EncodeBtreeSplitPG(rel storage.RelFileNode, leftBlk, rightBlk storage.Block
 	// The incremental left half, when the split the primary performed is one
 	// upstream's record can describe AND replaying that description reproduces
 	// the page it wrote.
-	if desc, derr := btree.DescribeSplitLeft(prePage, leftPage, rightPage, newItem); derr == nil &&
-		btree.CheckSplitLeft(prePage, leftPage, level, rightBlk, desc) == nil {
+	// The decision lives in btree.SplitLeftIsIncremental so the primary's
+	// pd_lsn stamp can ask the SAME question (M0131-S26b): under this branch
+	// block 0 carries no image, so the left page still owes its first-touch
+	// FPI and must not advance the native-image watermark.
+	if desc, ok := btree.SplitLeftIsIncremental(prePage, leftPage, rightPage, newItem, level, rightBlk); ok {
 		firstRightOff = desc.FirstRightOff
 		newItemOff = desc.NewItemOff
 		if desc.NewItemOnLeft {

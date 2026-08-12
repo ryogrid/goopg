@@ -172,7 +172,10 @@ btree split hot path and wants its own gates.
 ## Deferred (S26 itself is done; these are separate items)
 
 1. **FPI watermark advanced without an image** on multi-page btree records —
-   M0131-S26b, described in *Hook audit* above.
+   M0131-S26b, described in *Hook audit* above. **FIXED 2026-08-12**; design
+   [0131-0034](0131-0034-fpi-watermark-bare-blocks.md). The audit's block list
+   was one short: `xl_btree_mark_page_halfdead`'s **parent (block 1)** is the
+   same bare shape and was fixed with the rest.
 2. **Unlogged in-place shared-catalog updates** (class B, `pg_database`):
    `datconnlimit` and `datfrozenxid` are written into the heap page with no WAL
    record at all, so they survive a crash only when the epoch's FPI happened to
