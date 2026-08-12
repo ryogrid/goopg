@@ -1066,6 +1066,11 @@ func bootstrapPgClassRelnameNspIndex(dataDir string, tids map[uint32]heapTID) er
 
 	allRels := append([]nailedRel{}, nailedSharedRels...)
 	allRels = append(allRels, nailedLocalRels...)
+	// M0131-S20.1: the pg_rewrite TOAST pair has pg_class rows too, and a
+	// hosted PG resolves `pg_toast.pg_toast_2618` through THIS index
+	// (RELNAMENSP syscache). Omitting them here would leave the heap row
+	// unreachable by name.
+	allRels = append(allRels, nailedToastRels()...)
 
 	entries := make([]entry, 0, len(allRels))
 	for _, rel := range allRels {
@@ -1075,13 +1080,15 @@ func bootstrapPgClassRelnameNspIndex(dataDir string, tids map[uint32]heapTID) er
 		}
 		entries = append(entries, entry{
 			name: rel.RelName,
-			nsp:  11, // pg_catalog
+			nsp:  pgClassRelnamespaceFor(rel.OID), // 11 pg_catalog / 99 pg_toast
 			blk:  t.Block,
 			off:  t.Offset,
 		})
 	}
 	// Sort by relname (NameData byte comparison), then relnamespace.
-	// All nailed rels share relnamespace=11, so the primary sort is sufficient.
+	// Nailed catalogs are all relnamespace=11 and the TOAST pair's names are
+	// unique, so the secondary key never actually decides an ordering today —
+	// it is applied anyway because the index key IS (relname, relnamespace).
 	sort.Slice(entries, func(i, j int) bool {
 		if entries[i].name != entries[j].name {
 			return entries[i].name < entries[j].name

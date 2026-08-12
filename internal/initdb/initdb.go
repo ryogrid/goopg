@@ -1338,6 +1338,15 @@ func Init(opts Options) error {
 	if err := bootstrapPgRewriteRelRulenameIndex(abs, pgRewriteTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_rewrite_rel_rulename_index: %w", err)
 	}
+	// M0131-S20.1: DECLARE_TOAST(pg_rewrite, 2838, 2839). The pg_class /
+	// pg_attribute / pg_index rows for the pair are produced by the
+	// bootstrappers above (nailedToastRels / pgIndexInitialEntries); this
+	// writes the two physical files. pg_class(2618).reltoastrelid now names
+	// 2838, so the relation must exist even while it is still empty —
+	// PG's RelationInitPhysicalAddr runs on relcache load, not on first read.
+	if err := bootstrapToastRelationFiles(abs); err != nil {
+		return fmt.Errorf("goopg init: toast relation files: %w", err)
+	}
 	// M0106-0010 step 3w: write an empty heap page for every mapped local
 	// catalog that lacks a dedicated bootstrapper (pg_aggregate=2600,
 	// pg_type=1247, pg_namespace=2615, …). Without these files PG's
@@ -2320,6 +2329,10 @@ func bootstrapPgClassTuples(dataDir string) (map[uint32]heapTID, error) {
 	cols := pgClassColDefs()
 	allRels := append([]nailedRel{}, nailedSharedRels...)
 	allRels = append(allRels, nailedLocalRels...)
+	// M0131-S20.1: the TOAST pair rides in the pg_class heap but NOT in
+	// nailedLocalRels — see nailedToastRels for why (no pg_type row, no
+	// pg_internal.init entry).
+	allRels = append(allRels, nailedToastRels()...)
 	tids, err := writeMultiPageHeap(dataDir, "1259", cols, allRels, func(rel nailedRel) executor.Row {
 		return pgClassRow(rel)
 	})
@@ -2350,6 +2363,7 @@ func bootstrapPgAttributeTuples(dataDir string) (map[pgAttrTIDKey]heapTID, error
 	attrCols := pgAttrColDefs()
 	allRels := append([]nailedRel{}, nailedSharedRels...)
 	allRels = append(allRels, nailedLocalRels...)
+	allRels = append(allRels, nailedToastRels()...) // M0131-S20.1
 	type rowKey struct {
 		AttRelID uint32
 		AttNum   int16
@@ -4948,6 +4962,14 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// Single-column oid_ops UNIQUE PRIMARY over pg_rewrite heap OID
 		// 2618. Companion to OID 2693 (ev_class/rulename UNIQUE non-PKEY).
 		entry(2692, 2618, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_rewrite_oid_index
+		// M0131-S20.1: pg_toast_2618_index, the UNIQUE PRIMARY btree over
+		// (chunk_id oid_ops, chunk_seq int4_ops) that every detoast walks
+		// (postgres/src/backend/access/common/toast_internals.c →
+		// systable_beginscan_ordered(toastidx, …)). Declared upstream by
+		// DECLARE_TOAST(pg_rewrite, 2838, 2839) rather than by an explicit
+		// DECLARE_UNIQUE_INDEX, and confirmed against a PG 18.3 oracle:
+		// indrelid 2838, indkey "1 2", indclass "1981 1978", indisprimary t.
+		entry(2839, 2838, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_2618_index
 		// pg_trigger columns (PG18, pg_trigger.h): 1=oid, 2=tgrelid,
 		// 3=tgparentid, 4=tgname. Index = btree(tgrelid, tgname).
 		entry(2701, 2620, []int16{2, 4}, []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true, false), // pg_trigger_tgrelid_tgname_index
@@ -5950,11 +5972,12 @@ func pgClassColDefs() []catalog.Column {
 // pgClassRow builds a 14-col pg_class tuple matching pgClassColDefs order.
 func pgClassRow(rel nailedRel) executor.Row {
 	relType := rel.RelType
-	if relType == 0 {
+	if relType == 0 && !isNailedToastRel(rel) {
 		relType = rel.OID
 	}
 	relAm := int64(0)
-	if rel.RelKind == 'r' {
+	// M0131-S20.1: relkind 't' (TOAST) is heap-AM storage exactly like 'r'.
+	if rel.RelKind == 'r' || rel.RelKind == 't' {
 		relAm = 2
 	} else if rel.RelKind == 'i' {
 		relAm = 403
@@ -5992,7 +6015,9 @@ func pgClassRow(rel nailedRel) executor.Row {
 	return executor.Row{
 		executor.NewIntDatum(int64(rel.OID)), // 0: oid
 		executor.NewStringDatum(rel.RelName), // 4: relname
-		executor.NewIntDatum(11),             // 68: relnamespace
+		// 68: relnamespace — 11 (pg_catalog) for every nailed catalog, 99
+		// (pg_toast) for a bootstrapped TOAST pair (M0131-S20.1).
+		executor.NewIntDatum(int64(pgClassRelnamespaceFor(rel.OID))),
 		executor.NewIntDatum(int64(relType)), // 72: reltype
 		executor.NewIntDatum(0),              // 76: reloftype
 		executor.NewIntDatum(10),             // 80: relowner
@@ -6016,9 +6041,14 @@ func pgClassRow(rel nailedRel) executor.Row {
 		executor.NewIntDatum(0),                            // 96: relpages
 		executor.NewIntDatum(0),                            // 100: reltuples
 		executor.NewIntDatum(0),                            // 104: relallvisible
-		executor.NewIntDatum(0),                            // 108: relallfrozen
-		executor.NewIntDatum(0),                            // 112: reltoastrelid
-		executor.NewBoolDatum(false),                       // 116: relhasindex
+		executor.NewIntDatum(0), // 108: relallfrozen
+		// 112: reltoastrelid — 2838 on pg_rewrite (DECLARE_TOAST), 0 elsewhere.
+		// 116: relhasindex — true on a TOAST heap, whose (chunk_id, chunk_seq)
+		// btree is the only way PG reaches a chunk. Every other nailed heap
+		// keeps the historical false (goopg's index rows live in pg_index and
+		// PG re-derives them; changing that is out of this slice's scope).
+		executor.NewIntDatum(int64(pgClassReltoastrelidFor(rel.OID))),
+		executor.NewBoolDatum(isNailedToastRelOID(rel.OID)), // 116: relhasindex
 		executor.NewBoolDatum(rel.IsShared),                // 117: relisshared
 		executor.NewStringDatum("p"),                       // 118: relpersistence
 		executor.NewStringDatum(string(rune(rel.RelKind))), // 119: relkind
@@ -6163,7 +6193,9 @@ func pgAttributeRow(relOID uint32, a nailedAttr) executor.Row {
 		executor.NewIntDatum(0),  // attndims
 		executor.NewBoolDatum(pgTypeByVal(a.TypeOID)),
 		executor.NewStringDatum(pgTypeAlignChar(a.TypeOID)),
-		executor.NewStringDatum(pgTypeStorageChar(a.TypeOID)),
+		// attstorage: type-derived, except on a TOAST relation's own columns,
+		// which upstream pins to 'p' (M0131-S20.1).
+		executor.NewStringDatum(pgAttrStorageChar(relOID, a.TypeOID)),
 		executor.NewStringDatum(""), // attcompression
 		executor.NewBoolDatum(a.NotNull),
 		executor.NewBoolDatum(false), // atthasdef

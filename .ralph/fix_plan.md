@@ -4214,6 +4214,45 @@ Theme C — Real PG hosted on goopg evaluates views (closes "goopg cannot host a
       (96 s), `--verify` PASS (71/71), `go build ./...` + `go vet` clean,
       UNITS PASS, pgbench smoke via the hook. Design `0131-0009`
       §"Implementation status — S9.3d" + F18/F19. 2 ledger rows.
+      **S20.1 LANDED 2026-08-12 — ceiling #1's relation pair exists on disk;
+      the eight views behind it are now blocked only by the chunk writer.**
+      `DECLARE_TOAST(pg_rewrite, 2838, 2839)` (pg_rewrite.h:54) was the named
+      blocker for eight of the nine remaining views, and goopg bootstrapped
+      NEITHER relation — an out-of-line `varatt_external` pointer would have
+      named a relation that does not exist. This slice lands the pair itself,
+      every field measured on a throwaway PG 18.3 oracle rather than inferred:
+      pg_class 2838 (relnamespace **99**, reltype **0**, relam 2, relkind 't',
+      relnatts 3, relhasindex t) + 2839 (relam 403, relkind 'i', relnatts 2),
+      their pg_attribute rows (`attstorage='p'` — a chunk is never itself
+      toasted), the pg_index row (indkey "1 2", oid_ops + int4_ops, UNIQUE
+      PRIMARY), `pg_class(2618).reltoastrelid = 2838`, and the two physical
+      files in base/{1,5}. New `internal/initdb/pg_rewrite_toast_bootstrap.go`
+      holds the declaration as DATA (`nailedToastPairs`), and the pair is
+      deliberately NOT a member of `nailedLocalRels`: that list also drives
+      `bootstrapPgTypeTuples` (a TOAST relation has no pg_type row — a
+      defaulted reltype=OID would trip PG's `tdtypeid` assertion) and
+      `writeRelcacheInitFile` (PG never opens a TOAST relation in the critical
+      relcache phase). `bootstrapPgClassRelnameNspIndex` learned the namespace
+      it had hardcoded to 11. **Acceptance: a hosted real PG cold-started on a
+      goopg $PGDATA resolves `pg_toast.pg_toast_2618` BY NAME and scans it**
+      (`assertHostedPGSeesPgRewriteToastRelation`); non-vacuity verified by
+      emptying `nailedToastPairs()` — all three reads fail, the last with
+      `relation "pg_toast.pg_toast_2618" does not exist`. Second measurement
+      worth carrying: **79 of the oracle's ~160 pg_rewrite rows are toasted**,
+      including views goopg already hosts INLINE (`pg_roles`, `pg_tables`,
+      `pg_stat_activity`, …) — inline vs external is not a divergence PG can
+      observe, so only the eight oversize captures are forced out of line.
+      Gates: `internal/initdb` PASS (113 s), `^TestE2E_` family PASS (96 s),
+      `TestE2E_PGColdStartOnGoopgDataDir` PASS + the deliberate fail-when-broken
+      run, UNITS PASS, `go build ./...` + `go vet` clean, pgbench smoke via the
+      hook. Design `0131-0035-pg-rewrite-toast.md`. 2 ledger rows.
+      **Next: S20.2** — the chunk writer (1996-byte chunks of the COMPRESSED
+      payload, multi-page heap: `pg_seclabels` is 18 chunks), goopg's own
+      detoast-on-reload sibling path (`loadViewsFromHeap` must read back what
+      it wrote), the `capture-ev-action.sh` guard-#5 relaxation to "inline OR
+      toastable", and the eight captures. Then invert
+      `assertNonCorpusSystemViewIsStillAbsent` (subject `pg_indexes`) onto the
+      ninth view, `pg_policies`, whose blocker is unrelated.
       **Next in S9:** two ceilings left, both initdb-bootstrap gaps. The
       `pg_rewrite` TOAST (2838/2839) slice is the critical path — it gates
       EIGHT of the nine remaining views (`pg_indexes`, `pg_stats`,

@@ -258,6 +258,7 @@ func TestE2E_PGColdStartOnGoopgDataDir(t *testing.T) {
 
 	assertNailedSystemViewsAreEvaluable(t, pg, goopgDir)
 	assertNonCorpusSystemViewIsStillAbsent(t, pg)
+	assertHostedPGSeesPgRewriteToastRelation(t, pg)
 
 	// Row-level reads over user tables. S4.4 originally carried no view
 	// assertion at all because a hosted PG could not evaluate ANY view on a
@@ -1000,6 +1001,53 @@ func assertNonCorpusSystemViewIsStillAbsent(t *testing.T, pg *pgcluster.Cluster)
 		t.Errorf("hosted PG rejected %s, but NOT with the expected 42P01 "+
 			"undefined_table — a non-corpus view is supposed to be missing from "+
 			"the pg_class heap entirely:\n%s", view, out)
+	}
+}
+
+// assertHostedPGSeesPgRewriteToastRelation is M0131-S20.1's acceptance probe:
+// a hosted PG cold-started on a goopg $PGDATA must find pg_rewrite's TOAST
+// relation pair — DECLARE_TOAST(pg_rewrite, 2838, 2839),
+// postgres/src/include/catalog/pg_rewrite.h:54 — which goopg's initdb
+// bootstrapped for the first time in this slice.
+//
+// Why it earns its place next to the system-view probes: eight of the nine
+// upstream pg_catalog views still missing from the on-disk corpus are missing
+// for exactly one reason, and it is this pair's absence. Their ev_action
+// pg_node_trees do not fit an inline heap tuple (pg_indexes 9002 B …
+// pg_seclabels 35379 B against MaxHeapTupleSize ≈ 8160 B), so they must be
+// stored out of line — and an external varatt pointer is only meaningful if
+// the relation it names exists and is reachable.
+//
+// The three reads escalate deliberately:
+//
+//  1. pg_class(2618).reltoastrelid — the field PG's detoast path dereferences
+//     (heap_fetch_toast_slice → table_open(toastrelid)). A 0 here turns every
+//     external pointer into "missing chunk number 0 for toast value".
+//  2. the pair's own pg_class rows, resolved by NAME through
+//     pg_class_relname_nsp_index, which is what proves relnamespace = 99
+//     (pg_toast) reached both the heap row and the index key.
+//  3. a real read of the TOAST heap, which opens the relation, resolves its
+//     physical file and reads block 0. It is empty by design at S20.1 — the
+//     chunk writer and the eight view captures are S20.2 — and "empty" is
+//     exactly what upstream's initdb produces before the first oversize datum.
+func assertHostedPGSeesPgRewriteToastRelation(t *testing.T, pg *pgcluster.Cluster) {
+	t.Helper()
+	if got := pgQueryColumn(t, pg, "SELECT reltoastrelid FROM pg_class WHERE oid = 2618"); len(got) != 1 || got[0] != "2838" {
+		t.Errorf("hosted PG reads pg_rewrite.reltoastrelid = %v, want [2838] — "+
+			"without it an external ev_action pointer cannot be detoasted", got)
+	}
+	got := pgQueryColumn(t, pg,
+		"SELECT relname::text || '/' || relkind::text || '/' || relnamespace::regnamespace::text "+
+			"FROM pg_class WHERE oid IN (2838, 2839) ORDER BY oid")
+	want := []string{"pg_toast_2618/t/pg_toast", "pg_toast_2618_index/i/pg_toast"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("hosted PG reads the pg_rewrite TOAST pair as %v, want %v", got, want)
+	}
+	if out, err := pgQueryScalarAllowError(pg, "SELECT count(*) FROM pg_toast.pg_toast_2618"); err != nil {
+		t.Errorf("hosted PG cannot read pg_toast.pg_toast_2618: %v\n%s", err, strings.TrimSpace(out))
+	} else if strings.TrimSpace(out) != "0" {
+		t.Errorf("pg_toast.pg_toast_2618 holds %q chunks, want 0 — S20.1 seeds the "+
+			"relation pair only; the chunk writer is S20.2", strings.TrimSpace(out))
 	}
 }
 

@@ -1,50 +1,47 @@
 (idle — nothing in flight)
 
-M0131-S9.3d landed and committed. The on-disk system-view corpus is **71 of
-upstream's 80 `pg_catalog` views**; S9 stays unchecked (two ceilings left, both
-initdb-bootstrap gaps, and they account for exactly the nine missing views).
+M0131-S20.1 landed and committed. `DECLARE_TOAST(pg_rewrite, 2838, 2839)` — the
+blocker for EIGHT of the nine remaining `pg_catalog` views — now exists on a
+freshly `goopg init`'d directory, and a hosted real PG resolves
+`pg_toast.pg_toast_2618` by name and scans it.
 
-Landed: eleven views pinned + captured in ONE 71-view
-`scripts/capture-ev-action.sh` run + ONE `cmd/gen-nailed-view-tables` run
-(other 60 blobs byte-identical): `pg_available_extensions` 12081,
-`pg_available_extension_versions` 12085, `pg_timezone_abbrevs` 12122,
-`pg_stat_user_functions` 12279, `pg_stat_xact_user_functions` 12284,
-`pg_stat_progress_{analyze,vacuum,cluster,create_index,copy}`
-12309/12314/12319/12324/12333, `pg_stat_subscription_stats` 12347.
+Landed: `internal/initdb/pg_rewrite_toast_bootstrap.go` (declaration as DATA:
+`nailedToastPairs`/`nailedToastRels`), pg_class + pg_attribute rows, the
+pg_index row for 2839, `pg_class(2618).reltoastrelid = 2838`, both physical
+files in base/{1,5}; `bootstrapPgClassRelnameNspIndex` learned the namespace it
+had hardcoded to 11. Design `docs/design/0131-0035-pg-rewrite-toast.md`.
 
 Worth carrying:
-- **The selection method is the finding (F19).** Do NOT pick the next tranche
-  by subject family. Ask the oracle for every `pg_catalog` view with a
-  `_RETURN` rule (oid, rule oid, reltype, relnatts,
-  `pg_column_size(ev_action)`, in-band `:relid` via
-  `regexp_matches(ev_action::text, ':relid (1[2-9][0-9]{3})','g')`) and diff
-  against `systemViewOIDPins()`. That one query found eleven views blocked by
-  nothing at all.
-- **F18 — re-measure a recorded ceiling before believing it.**
-  `pg_timezone_abbrevs` sat on the blocked list through five tranches after
-  M0131-S12 had already fixed it (2653/2654 bulk-load). No guard re-probes a
-  ceiling; only `pg_indexes` has a fail-when-fixed assertion.
-- Remaining nine, a closed list: **eight** behind `DECLARE_TOAST(pg_rewrite,
-  2838, 2839)` — `pg_indexes` 9002 B, `pg_stats` 9316 B, `pg_stats_ext`
-  12196 B, `pg_stats_ext_exprs` 11481 B, `pg_seclabels` 35379 B (multi-chunk),
-  `pg_statio_all_tables` 10475 B + `pg_statio_{sys,user}_tables` under guard
-  #4 — and `pg_policies` behind an on-disk `pg_policy` (3256).
-- Non-vacuity recipe used this loop: add un-seeded `pg_indexes` (12043) to
-  `nailedSystemViewProbeSet` → `TestE2E_PGColdStartOnGoopgDataDir` FAILS in
-  ~2 s. That test is genuinely ~2.5 s; short runtime is not a skip.
-- Editing hazard (still live): the pin parser in `capture-ev-action.sh` anchors
-  on `},$`, so a TRAILING COMMENT on a pin line silently drops that pin.
+- **The pair must NOT join `nailedLocalRels`.** That list also drives
+  `bootstrapPgTypeTuples` (a TOAST relation has NO pg_type row; a defaulted
+  reltype=OID trips PG's `tdtypeid` assertion, relcache.c:4293) and
+  `writeRelcacheInitFile` (PG never opens a TOAST relation in the critical
+  relcache phase). Separate list + explicit wiring at the three sites that DO
+  want it.
+- **Oracle first, always.** Every field came from a throwaway PG 18.3
+  (`initdb` + `pg_ctl -o "-k $D -c listen_addresses=''"` on a unix socket —
+  TCP 5599 was already occupied). Notable: `attstorage='p'`, `reltype 0`,
+  no pg_depend rows, chunk size 1996, and the compressed payload is what gets
+  chunked (`sum(length(chunk_data)) == pg_column_size`).
+- **79 of the oracle's ~160 pg_rewrite rows are toasted**, including views
+  goopg hosts INLINE today. Inline vs external is not a divergence PG can
+  observe — only the eight oversize captures are forced out of line.
+- Adding a pg_index entry breaks `TestPgIndexInitialEntriesIndkeyMatchesPG18`
+  (a pinned count + map) — extend it in the same edit.
+- `go test ./internal/testport/` does NOT invalidate its cache when
+  `internal/initdb` changes (it drives a built binary), so a non-vacuity probe
+  there needs an explicit one-off `-count=1`.
 
-Gates: `internal/initdb` PASS (111 s), `^TestE2E_` family PASS (96 s),
+Gates: `internal/initdb` PASS (113 s), `^TestE2E_` family PASS (96 s),
 `TestE2E_PGColdStartOnGoopgDataDir` PASS + deliberate fail-when-broken run,
-`--verify` PASS (71/71 byte-identical), `go build ./...` + `go vet` clean,
-UNITS PASS, pgbench smoke via the hook.
+UNITS PASS, `go build ./...` + `go vet` clean, pgbench smoke via the hook.
 
-Nightly triage: `ci/logs/action-items.md` still run `20260812-005501`; all 4
+Nightly triage: `ci/logs/action-items.md` still run `20260812-005501`; all four
 `## AI-` items already filed under M-NIGHTLY — nothing new to file.
 
-Next loop (banner = M-NIGHTLY filing, then M0131): the `pg_rewrite` TOAST slice
-(unscoped — needs a design doc; must be multi-chunk), or `pg_policy` as an
-on-disk relation.
+Next loop (banner = M-NIGHTLY filing, then M0131): **S20.2** — the chunk writer
+(1996-byte chunks, multi-page heap; `pg_seclabels` is 18 chunks), the
+`loadViewsFromHeap` detoast SIBLING, capture guard #5 → "inline OR toastable",
+then the eight captures and the `pg_indexes` guard inversion.
 
 In-flight: none.
