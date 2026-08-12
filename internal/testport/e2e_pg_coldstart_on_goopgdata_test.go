@@ -766,6 +766,13 @@ func assertHostedPGCanCallSQLBuiltins(t *testing.T, pg *pgcluster.Cluster, logPa
 // all six here is what proves guard #4's base-before-dependent pin ordering
 // holds at more than one edge.
 //
+// M0131-S9.3b finishes S9.3's reachable population with the per-index and
+// per-sequence statistics families: bases pg_stat_all_indexes (12187),
+// pg_statio_all_indexes (12200) and pg_statio_all_sequences (12213), each with
+// its {sys,user} dependent pair. That takes the corpus to 58 views over ten
+// view-on-view edges, and makes the two index bases (6826 B / 6799 B stored)
+// the closest any seeded blob sits to the 8000 B inline budget.
+//
 // Deliberately absent: the pg_statio_*_tables triple. Its base
 // pg_statio_all_tables (12174) stores at 10475 B, over the 8000 B inline
 // heap-tuple budget, so the base cannot be seeded and — under guard #4 — its
@@ -806,6 +813,15 @@ func nailedSystemViewProbeSet() []struct {
 		{"pg_catalog.pg_stat_xact_sys_tables", "12161"},
 		{"pg_catalog.pg_stat_user_tables", "12165"},
 		{"pg_catalog.pg_stat_xact_user_tables", "12170"},
+		{"pg_catalog.pg_stat_all_indexes", "12187"},
+		{"pg_catalog.pg_stat_sys_indexes", "12192"},
+		{"pg_catalog.pg_stat_user_indexes", "12196"},
+		{"pg_catalog.pg_statio_all_indexes", "12200"},
+		{"pg_catalog.pg_statio_sys_indexes", "12205"},
+		{"pg_catalog.pg_statio_user_indexes", "12209"},
+		{"pg_catalog.pg_statio_all_sequences", "12213"},
+		{"pg_catalog.pg_statio_sys_sequences", "12218"},
+		{"pg_catalog.pg_statio_user_sequences", "12222"},
 		{"pg_catalog.pg_stat_activity", "12226"},
 		{"pg_catalog.pg_stat_replication", "12231"},
 		{"pg_catalog.pg_stat_slru", "12236"},

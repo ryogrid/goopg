@@ -237,6 +237,42 @@ func systemViewOIDPins() []systemViewOIDPin {
 		{"pg_stat_xact_sys_tables", 12161, 12164, 12163, 12},
 		{"pg_stat_user_tables", 12165, 12168, 12167, 30},
 		{"pg_stat_xact_user_tables", 12170, 12173, 12172, 12},
+		// M0131-S9.3b (2026-08-12): the rest of S9.3's reachable population —
+		// the per-index and per-sequence statistics families. Three more
+		// bases with two dependents each, so this tranche adds SIX view-on-
+		// view edges in one capture run (the corpus goes 4 -> 10 edges over
+		// 2 -> 5 bases). Measured against the oracle before pinning (stored
+		// ev_action size / in-band :relid set):
+		//
+		//   pg_stat_all_indexes      12187  6826 B  (no in-band relid)
+		//   pg_stat_sys_indexes      12192  1714 B  :relid 12187
+		//   pg_stat_user_indexes     12196  1716 B  :relid 12187
+		//   pg_statio_all_indexes    12200  6799 B  (no in-band relid)
+		//   pg_statio_sys_indexes    12205  1625 B  :relid 12200
+		//   pg_statio_user_indexes   12209  1628 B  :relid 12200
+		//   pg_statio_all_sequences  12213  2431 B  (no in-band relid)
+		//   pg_statio_sys_sequences  12218  1559 B  :relid 12213
+		//   pg_statio_user_sequences 12222  1561 B  :relid 12213
+		//
+		// F14 (0131-0009) holds again at 3-for-3: every dependent stores at
+		// roughly a quarter of its base, because the rewritten Query names
+		// the base as ONE RTE_RELATION instead of re-expanding its SRF join.
+		// The two index bases sit at 6.8 kB — the closest any captured blob
+		// has come to the 8000 B inline budget without breaching it — while
+		// their dependents are nowhere near it, which is why ceiling #1 can
+		// only ever bite a base.
+		//
+		// Guard #4 (base before dependent) orders each triple; the bases are
+		// listed first here for the same reason.
+		{"pg_stat_all_indexes", 12187, 12190, 12189, 9},
+		{"pg_statio_all_indexes", 12200, 12203, 12202, 7},
+		{"pg_statio_all_sequences", 12213, 12216, 12215, 5},
+		{"pg_stat_sys_indexes", 12192, 12195, 12194, 9},
+		{"pg_stat_user_indexes", 12196, 12199, 12198, 9},
+		{"pg_statio_sys_indexes", 12205, 12208, 12207, 7},
+		{"pg_statio_user_indexes", 12209, 12212, 12211, 7},
+		{"pg_statio_sys_sequences", 12218, 12221, 12220, 5},
+		{"pg_statio_user_sequences", 12222, 12225, 12224, 5},
 		{"pg_stat_activity", 12226, 12229, 12228, 22},
 		// The six M0131-S8a views, interleaved by upstream OID.
 		{"pg_stat_replication", 12231, 12234, 12233, 20},

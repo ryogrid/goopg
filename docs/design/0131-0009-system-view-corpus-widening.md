@@ -826,6 +826,65 @@ whole `^TestE2E_` family PASS (92 s), `capture-ev-action.sh --verify` PASS
 (49/49 byte-identical), `go build ./...` + `go vet` clean, UNITS PASS, pgbench
 smoke via the commit hook.
 
+## Implementation status — S9.3b (2026-08-12)
+
+**S9.3's reachable population is finished: the corpus is 58 views over TEN
+view-on-view edges and five bases.** The per-index and per-sequence statistics
+families landed in one capture run:
+
+| view | OID / rule | stored `ev_action` | in-band `:relid` |
+|---|---|---|---|
+| `pg_stat_all_indexes` | 12187 / 12190 | 6826 B | — |
+| `pg_stat_sys_indexes` | 12192 / 12195 | 1714 B | 12187 |
+| `pg_stat_user_indexes` | 12196 / 12199 | 1716 B | 12187 |
+| `pg_statio_all_indexes` | 12200 / 12203 | 6799 B | — |
+| `pg_statio_sys_indexes` | 12205 / 12208 | 1625 B | 12200 |
+| `pg_statio_user_indexes` | 12209 / 12212 | 1628 B | 12200 |
+| `pg_statio_all_sequences` | 12213 / 12216 | 2431 B | — |
+| `pg_statio_sys_sequences` | 12218 / 12221 | 1559 B | 12213 |
+| `pg_statio_user_sequences` | 12222 / 12225 | 1561 B | 12213 |
+
+Mechanics unchanged and now boring, which is the point: one
+`scripts/capture-ev-action.sh <58 views>` run plus one
+`cmd/gen-nailed-view-tables` run; the other 49 blobs came back byte-identical
+and `--verify` re-derives all 58 against a fresh throwaway PG 18.3. No
+hand-edited blob, table, rule row or `//go:embed` line — S9.0's claim holds at
+9.7× the original corpus, and S9.3a's four-edge exercise of guard #4 scales to
+six more edges without a tooling change.
+
+### Findings — S9.3b
+
+**F15 — F14's dependent/base ratio is a structural constant, not a
+coincidence of the table family.** Across all three new bases, each dependent
+stores at 23–64 % of its base (1714/6826 = 25 %, 1625/6799 = 24 %,
+1559/2431 = 64 %), and the ratio tracks *how much of the base's tree is SRF
+join* rather than anything about the dependent: the two index bases expand a
+9- and 7-column `pg_stat_get_*` join, while `pg_statio_all_sequences` is a
+small 5-column tree whose dependents therefore cannot save as much. The
+prediction from F14 — that only bases can breach the inline ceiling — now holds
+at 5 bases / 10 dependents with no counterexample. The tightest margin measured
+so far is `pg_stat_all_indexes` at 6826 B against the 8000 B budget: 85 % of
+inline capacity, which is a standing argument that the `pg_rewrite` TOAST slice
+is a near-term prerequisite for further base captures, not a distant one.
+
+**No new ceiling.** Every view S9.3 can reach is now seeded; what remains of
+S9.3 is exactly the `pg_statio_*_tables` triple withheld by ceiling #1 (base
+`pg_statio_all_tables` 12174 at 10475 B), unchanged from S9.3a. The
+"every ceiling is an initdb-bootstrap gap" generalisation holds at five for
+five — S9.3b added no ceiling of any kind, and is the first slice in S9 that
+found no new finding class at all.
+
+Remaining in S9: the `pg_statio_*_tables` triple behind `pg_rewrite` TOAST
+(2838/2839), `pg_indexes` behind the same, `pg_group` +
+`pg_publication_tables` behind `pg_type.typelem`/`typarray` population (F13),
+`pg_timezone_abbrevs`, and S9.4's 65 `information_schema` views (expected to be
+deferred with a ledger row).
+
+Gates: `internal/initdb` PASS (103 s), whole `^TestE2E_` family PASS (92 s,
+includes `TestE2E_PGColdStartOnGoopgDataDir`), `capture-ev-action.sh --verify`
+PASS (58/58 byte-identical), `go build ./...` + `go vet` clean, UNITS PASS,
+pgbench smoke via the commit hook.
+
 ## References
 
 - M0131 implementation plan §S9, `docs/design/0131-bidirectional-cluster-dir-coldstart-and-system-views.md`
