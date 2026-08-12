@@ -147,3 +147,41 @@ have checkpointed during ~180 MiB of WAL is a separate question worth asking.
 `RUNS=3 bash analysis/crashprobe30.sh` must print `OVERALL: PASS`. Every assertion is
 index-independent, the kill is self-verifying, and the atomicity invariant makes a
 torn transaction a hard failure rather than a judgement call.
+
+## CLOSED 2026-08-12 (loop #145) — the gate passes 6/6 at `fb8affdb`
+
+The gate this document defines (`RUNS=3 bash analysis/crashprobe30.sh` printing
+`OVERALL: PASS`) now passes, and passes repeatably: **two independent batches of
+three runs, 6/6 PASS**, at `fb8affdb` with `bin/goopg` freshly built from that
+tree. Logs: `/tmp/cp30_head_fb8affdb.log`, `/tmp/cp30_head_confirm.log`.
+
+Every assertion this document called for is satisfied in every run:
+
+| assertion | result (all 6 runs) |
+|---|---|
+| row survival | `count(*) = distinct(aid) = 500000`, `min=1`, `max=500000` |
+| atomicity invariant | `sum(abalance) == sum(history.delta)` **exactly** |
+| index parity | `idx_count=500000`, `heap_anti_missing=0` |
+| kill was real | `KILL_PROVEN` (pid + `/proc/<pid>/cmdline` verified before, `/proc` gone after) |
+
+The per-run `sum` values differ widely and change sign across runs (+71742,
++477315, +301490, −747056, −193358, +612803) — that is the expected shape, since
+each run kills pgbench at a different point; what matters is that the two sides
+agree to the byte every time. The pre-fix signature was a *disagreement* between
+the two sums, first bidirectional and then (after S30.7's XID-reuse fix)
+unidirectional; neither shape survives.
+
+No code changed in the closing loop. The defects were fixed by the sub-items
+S30.1 / S30.1b / S30.2 / S30.3 / S30.4 / S30.5 / S30.6 / S30.7 / S30.8 (see
+`0131-0022`, `0131-0023`, `0131-0027`, `0131-0028`, `0131-0029`) plus **M0131-S32**
+(`0131-0025`), whose hand-written `const maxChain = 64` truncation in every
+HOT/CTID chain walker was recorded at filing time as *"plausibly contributes to
+S30's crash-probe divergences"*. That prediction is now confirmed by measurement:
+S32 was the last change to land before this gate flipped from failing to passing.
+
+**Residual scope, deliberately not closed here.** `crashprobe30.sh` is a manual
+shell probe; nothing runs it automatically. The automated crash-recovery
+coverage is the still-open `M0131-S27` (forward crash E2E, incl. stale pidfile
+and torn contrecord) and `M0131-S28` (reverse crash E2E). Until those land, a
+regression in this area is invisible to every gate the pre-commit hook and the
+nightly batch run. See the ledger row dated 2026-08-12 under `M0131-S30`.
