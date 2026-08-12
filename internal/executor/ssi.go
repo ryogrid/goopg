@@ -121,12 +121,60 @@ func ssiHashBucket(key []byte) storage.BlockNumber {
 // spec, "page level predicate locking in hash index"). The index OID is used as
 // the predicate-lock relation so these page tags never collide with the heap
 // relation's tuple/page locks.
+//
+// `key` MUST be a FINGERPRINT (`ssiHashProbeFingerprint` / `indexKeyFingerprint`,
+// the blob concatenation), never the tree search key `indexProbeKey` builds.
+// The two stopped being the same bytes at the M0130-S11.4 flip: a describable
+// index's search key is now a tuple image (zero `t_tid` + `t_info` + the
+// aligned attribute), so a reader passing it hashed into a bucket no writer
+// could ever compute and the whole spec's 18 conflicting permutations stopped
+// aborting. `pgindex_fingerprint.go` states the policy; this is the reader half
+// of the pair it names.
 func ssiRecordHashBucketRead(ctx *Context, dbOid, indexOID uint32, key []byte) {
 	if !ssiActive(ctx) || indexOID == 0 || len(key) == 0 {
 		return
 	}
 	tag := mvcc.PageLockTag(dbOid, indexOID, ssiHashBucket(key))
 	ctx.TxnMgr.AcquirePredicateLock(ctx.Tx.Handle, tag)
+}
+
+// ssiHashProbeFingerprint encodes a SERIALIZABLE hash-index probe's key values
+// the way `ssiRecordHashIndexInsert` encodes the INSERTed row's — the blob
+// concatenation of `indexColumnFingerprint`, i.e. exactly what
+// `encodeIndexKeyFromCols` produces (it is that function's loop, over probe
+// values instead of row values).
+//
+// This exists because the reader and the writer cannot share the SCAN key. A
+// scan descends the tree with `(*Context).indexProbeKey`, which after the
+// M0130-S11.4 flip returns a tuple image for any index `buildPGIndexKeyDesc`
+// can describe — and a `USING hash` index IS describable, because goopg builds
+// it on the B-tree substrate with `Method == "btree"` and only `DeclaredHash`
+// remembers the declaration (`pgindex_fingerprint.go`'s claim that the
+// descriptor "refuses" these is wrong, and the refusal it names is the
+// access-method check at `pgindex_keydesc.go`). The writer, by contrast, can
+// never produce a tuple image: it would embed the writing row's heap TID and no
+// reader could match it. So the FINGERPRINT is the only format both halves can
+// compute, and both halves must call into this file to get it.
+//
+// Returns nil when any part cannot be encoded; the callers then fall back to
+// the relation-grain SIREAD, which over-approximates (false positives) rather
+// than losing the conflict.
+func ssiHashProbeFingerprint(idx *catalog.Index, parts []indexProbeKeyPart) []byte {
+	if idx == nil || !idx.DeclaredHash || len(parts) == 0 {
+		return nil
+	}
+	var out []byte
+	for _, p := range parts {
+		if p.col == nil {
+			return nil
+		}
+		b, err := indexColumnFingerprint(p.val, p.col)
+		if err != nil {
+			return nil
+		}
+		out = append(out, b...)
+	}
+	return out
 }
 
 // ssiRecordHashIndexInsert is the SERIALIZABLE write-path hook for INSERTs into
@@ -142,9 +190,17 @@ func ssiRecordHashBucketRead(ctx *Context, dbOid, indexOID uint32, key []byte) {
 // and it must match what the READER (ssiRecordHashBucketRead) computed from an
 // expression. It therefore goes through `indexKeyFingerprint` rather than moving
 // to `indexEntryKey`: a tuple-format key embeds the writing row's heap TID, so
-// every writer would hash into a different bucket than its readers. (These are
-// DeclaredHash indexes in any case, which buildPGIndexKeyDesc refuses.)
+// every writer would hash into a different bucket than its readers.
 // M0130-S11.4 slices 3b-2c-ii-B2-c-iv and -viii.
+//
+// A parenthetical here used to add "(These are DeclaredHash indexes in any
+// case, which buildPGIndexKeyDesc refuses.)" — that is FALSE and it is what let
+// the reader half regress silently. `buildPGIndexKeyDesc` refuses on
+// `idx.Method`, and goopg records a `USING hash` index as `Method == "btree"`
+// (it is built on the B-tree substrate) with only `DeclaredHash` remembering
+// the declaration. So these indexes ARE describable, their scans DID move to
+// the tuple format at the flip, and only the writer stayed on the fingerprint.
+// The reader now goes through `ssiHashProbeFingerprint`.
 func ssiRecordHashIndexInsert(ctx *Context, tbl *catalog.Table, cols []catalog.Column, row Row, dbOid uint32) error {
 	if !ssiActive(ctx) || tbl == nil {
 		return nil

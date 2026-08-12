@@ -760,12 +760,41 @@ CommandCounter on BasicSession and seeding fresh contexts from it.
       "cluster needs REINDEX" instead of emitting N opaque query errors;
       (b) the TPC-H cluster (65433, db `tpch`) is still un-REINDEXed, blocked
       on the same per-DB catalog scoping gap the ledger records for ANALYZE.
-- [ ] **testport/TestPort_IsolationPredicateHash** — FAILed
+- [x] **testport/TestPort_IsolationPredicateHash** — FIXED 2026-08-13
       (AI-20260811-014635-001, AI-20260812-005501-003, AI-20260813-005117-016;
       repro: `go test -v -run
-      '^TestPort_IsolationPredicateHash$' ./internal/testport/`). PARKED per
-      banner (not a gate the priority milestones depend on). Re-confirmed FAILing
-      at HEAD `f645621b` on 2026-08-13 (0.81 s).
+      '^TestPort_IsolationPredicateHash$' ./internal/testport/`). **The bucket
+      SIREAD's two halves stopped encoding the key the same way at the
+      M0130-S11.4 tuple-format flip.** The READER handed
+      `ssiRecordHashBucketRead` its scan `loBytes` — after the flip a tuple image
+      (`00000000000010001400000000000000` for `p = 20`) — while the WRITER kept
+      hashing the blob fingerprint (`80000014`), which it has no choice about: a
+      tuple key embeds the writing row's heap TID, so no reader could ever match
+      it. Different bytes, different FNV bucket, so the conflict-in walk visited
+      a tag nobody held and **all 18 conflicting permutations stopped aborting
+      while the 12 different-bucket ones still passed** — i.e. the regression
+      wore the shape of the reduced-false-positive result the design wants.
+      The unit guard that existed for exactly this hazard
+      (`TestHashIndexIsNeverDescribableSoTheSSIBucketPairingHolds`) was
+      **vacuous**: it built `idx.Method = "hash"`, but `CREATE INDEX … USING
+      hash` records `Method == "btree"` with only `DeclaredHash` set, and
+      `buildPGIndexKeyDesc` refuses on `Method` — so the refusal it asserted
+      never fires for a real hash index, and `ssi.go` repeated the same false
+      claim in prose. Fix: new `ssiHashProbeFingerprint(idx, parts)` (the blob
+      encoder's loop over probe VALUES) is captured in
+      `indexScanOp`/`indexOnlyScanOp.hashProbeFingerprint` at
+      `lookupKey`/`lookupKeys` and passed to `ssiRecordHashBucketRead`; no
+      fingerprint ⇒ fall back to the relation-grain SIREAD rather than holding
+      nothing. Two fail-when-broken guards replace the vacuous one
+      (`TestDeclaredHashIndexIsDescribableSoBothSSIHalvesMustFingerprint`,
+      which also asserts the search key is a DIFFERENT encoding so it cannot go
+      vacuous, and `TestHashBucketReadCallSitesPassTheFingerprint`, a source pin
+      — the value test cannot see which bytes the operator actually passes).
+      Gates: target spec PASS; `predicate-gist`/`predicate-gin`/
+      `predicate-lock-hot-tuple`/`multiple-row-versions`/`read-write-unique`1-4
+      PASS; `internal/executor` + `internal/mvcc` PASS; UNITS PASS;
+      `scripts/tpch-spotcheck.sh` PASS. Design `0118-0099` + README row.
+      1 ledger row (NULL-key and range probes still take no bucket lock).
 - [ ] **testport/TestPort_IsolationReceiptReport** — FAILed
       (AI-20260811-014635-002, AI-20260812-005501-004, AI-20260813-005117-017;
       repro: `go test -v -run

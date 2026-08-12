@@ -129,3 +129,48 @@ Bounded to SERIALIZABLE equality scans / INSERTs on `DeclaredHash` indexes:
   locking after a restart. UPDATE/DELETE on a hash-indexed column do not yet take
   the bucket conflict-in (no current spec needs it; the INSERT path is the one
   `predicate-hash` exercises).
+
+## 2026-08-13 — the reader/writer key formats split, and the whole mechanism went silent (M-NIGHTLY AI-20260811-014635-001, -20260812-005501-003, -20260813-005117-016)
+
+The bucket tag is only a rendezvous while both halves encode the key the same
+way. They stopped doing so at the M0130-S11.4 tuple-format flip:
+
+- the READER handed `ssiRecordHashBucketRead` its scan `loBytes`, i.e. whatever
+  `(*Context).indexProbeKey` returned — after the flip a **tuple image** for any
+  index `buildPGIndexKeyDesc` can describe (zero `t_tid`, `t_info`, then the
+  aligned attribute: `00000000000010001400000000000000` for `p = 20`);
+- the WRITER kept using `indexKeyFingerprint`, the **blob** concatenation
+  (`80000014` for the same value) — it has no choice, since a tuple key would
+  embed the writing row's heap TID and no reader could ever match it.
+
+Two different byte strings, two different FNV buckets, so
+`CheckForSerializableConflictInReportingFailure` walked a tag no reader held.
+All 18 conflicting permutations of `predicate-hash.spec` stopped aborting while
+the 12 different-bucket permutations still "passed" — the failure looked like a
+*reduced*-false-positive result, which is the direction the design wants.
+
+Why no unit test caught it: `TestHashIndexIsNeverDescribableSoTheSSIBucketPairingHolds`
+built its fixture with `idx.Method = "hash"`, and `buildPGIndexKeyDesc`'s refusal
+is on `Method`. But `CREATE INDEX … USING hash` records `Method == "btree"` (§goopg
+builds it on the B-tree substrate, above) with only `DeclaredHash` set — so the
+guard asserted a property of a fixture that cannot occur, and the comment in
+`ssi.go` repeated the same false claim in prose.
+
+**Fix.** The reader now computes the tag from a fingerprint of the same probe
+parts, never from the search key: `ssiHashProbeFingerprint(idx, parts)` (ssi.go)
+is `encodeIndexKeyFromCols`'s loop over probe values, so the two halves are one
+encoder apart by construction. `indexScanOp` / `indexOnlyScanOp` capture it in
+`hashProbeFingerprint` where they build the probe (`lookupKey` / `lookupKeys`)
+and pass THAT to `ssiRecordHashBucketRead`. When no fingerprint can be made
+(a range probe on the IOS path, an unencodable key part) the scan falls back to
+the relation-grain SIREAD instead of holding nothing — over-approximating is the
+safe direction; losing the edge is not.
+
+**Guards** (both fail-when-broken): the vacuous descriptor test is replaced by
+`TestDeclaredHashIndexIsDescribableSoBothSSIHalvesMustFingerprint`, which asserts
+the index IS describable, that reader and writer fingerprints (and buckets) are
+equal, and — for non-vacuity — that the search key is a *different* encoding; and
+`TestHashBucketReadCallSitesPassTheFingerprint` pins by source that both call
+sites hand over `hashProbeFingerprint`, since the value test cannot see which
+bytes the operator actually passes, and passing `loBytes` is exactly how this
+regressed with every unit test green.

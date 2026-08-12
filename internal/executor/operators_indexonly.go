@@ -41,6 +41,11 @@ type indexOnlyScanOp struct {
 	// after the scan so a subsequent index-only scan reflects PG's prune-on-read
 	// (horizons.spec, M0118-0009). nil keys are never inserted.
 	touchedBlocks map[storage.BlockNumber]struct{}
+	// hashProbeFingerprint is the blob-format encoding of this scan's probe key
+	// (ssiHashProbeFingerprint) — the bytes the hash-bucket SIREAD tag must be
+	// derived from, as opposed to the tuple-image search key the same probe
+	// descends the tree with. Set by lookupKey/lookupKeys.
+	hashProbeFingerprint []byte
 }
 
 // setHeapFetchCounter implements the heapFetchCounter interface so EXPLAIN
@@ -122,6 +127,7 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
 
+	o.hashProbeFingerprint = nil
 	var loBytes, hiBytes []byte
 	switch {
 	case len(o.plan.Keys) > 0:
@@ -168,11 +174,19 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 	}
 
 	// Hash-index equality probe: take the bucket-grain SIREAD on the index
-	// (design 0118-0099) in place of the relation-grain lock skipped above.
-	// loBytes is the encoded probe key (== hiBytes for the single-column
-	// equality a hash index supports). No-op outside SERIALIZABLE.
-	if isHashIdx && len(loBytes) > 0 {
-		ssiRecordHashBucketRead(ctx, heapRel.DBOid, o.plan.Index.OID, loBytes)
+	// (design 0118-0099) in place of the relation-grain lock skipped above. The
+	// tag comes from the probe's FINGERPRINT (ssiHashProbeFingerprint) — the
+	// same encoding ssiRecordHashIndexInsert hashes — NOT from loBytes, which is
+	// the tree search key and, for a describable index, a tuple image. No-op
+	// outside SERIALIZABLE. When no fingerprint could be made (a range probe, or
+	// an unencodable key part) the relation-grain lock skipped above is taken
+	// after all: over-approximating is safe, holding nothing is not.
+	if isHashIdx {
+		if len(o.hashProbeFingerprint) > 0 {
+			ssiRecordHashBucketRead(ctx, heapRel.DBOid, o.plan.Index.OID, o.hashProbeFingerprint)
+		} else if o.plan.Table == nil || (!o.plan.Table.Temp && !o.plan.Table.IsMatView) {
+			ssiRecordRelationRead(ctx, heapRel)
+		}
 	}
 
 	// Some key encodings cannot be inverted (interval's key is the lossy
@@ -752,6 +766,7 @@ func (o *indexOnlyScanOp) lookupKeys() ([]byte, bool, error) {
 	if encErr != nil {
 		return nil, false, encErr
 	}
+	o.hashProbeFingerprint = ssiHashProbeFingerprint(o.plan.Index, parts)
 	return probe, true, nil
 }
 
@@ -771,10 +786,14 @@ func (o *indexOnlyScanOp) lookupKey() ([]byte, bool, error) {
 		return nil, false, &ExecError{Code: "XX000", Pos: o.plan.Pos(),
 			Message: fmt.Sprintf("indexed column %q not found", o.plan.Index.Columns[0])}
 	}
-	k, encErr := o.ctx.indexProbeKey(o.plan.Index, []indexProbeKeyPart{{col: col, val: v, pos: o.plan.Key.Pos()}})
+	parts := []indexProbeKeyPart{{col: col, val: v, pos: o.plan.Key.Pos()}}
+	k, encErr := o.ctx.indexProbeKey(o.plan.Index, parts)
 	if encErr != nil {
 		return nil, false, encErr
 	}
+	// The SSI bucket tag is derived from the FINGERPRINT of the same parts, not
+	// from `k` — see ssiHashProbeFingerprint.
+	o.hashProbeFingerprint = ssiHashProbeFingerprint(o.plan.Index, parts)
 	return k, true, nil
 }
 
