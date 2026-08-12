@@ -393,6 +393,169 @@ func ApplyInsertPostingRecordAt(page storage.Page, data []byte, offnum uint16) e
 	return nil
 }
 
+// DedupInterval is upstream's BTDedupInterval (nbtree.h): one run of
+// consecutive page items, starting at physical offset BaseOff, that the
+// primary's deduplication pass merged into a single posting-list tuple.
+// NItems is how many items went into that posting, NOT how many heap TIDs the
+// posting ends up holding — an item in the run may itself already be a posting
+// list contributing several TIDs.
+type DedupInterval struct {
+	BaseOff uint16
+	NItems  uint16
+}
+
+// SizeOfDedupInterval is sizeof(BTDedupInterval): two OffsetNumber-sized
+// fields, no padding.
+const SizeOfDedupInterval = 4
+
+// ReplayDedupPage is upstream's btree_xlog_dedup (nbtxlog.c:463-553): the redo
+// of XLOG_BTREE_DEDUP, the leaf-page deduplication pass that merges runs of
+// equal-key tuples into posting lists to postpone a page split.
+//
+// The record carries only the INTERVALS — {baseoff, nitems} pairs — because the
+// merged tuples are fully determined by the page's own pre-image plus those
+// bounds. Redo therefore rebuilds the whole page rather than editing it: a temp
+// page gets the high key (when the page is not rightmost), then each source item
+// in offset order, with every interval's run collapsed into one posting formed
+// by `_bt_form_posting` over the run's heap TIDs in order (PGBTPostingRaw).
+// Upstream reaches the same result by re-running the dedup state machine
+// (_bt_dedup_start_pending / _bt_dedup_save_htid / _bt_dedup_finish_pending)
+// under the record's interval bounds; the bounds are what make the two
+// formulations identical, and upstream asserts exactly that (`memcmp(state->
+// intervals, intervals, …) == 0`).
+//
+// The page's BTP_HAS_GARBAGE hint is cleared, as upstream does: dedup rewrites
+// every item, so no LP_DEAD line pointer survives the rebuild.
+//
+// M0131-S21b part 2b. goopg's own inserts never deduplicate (they append to an
+// existing posting one TID at a time), so this exists solely for WAL redo of a
+// real PG's crash tail — where, deduplication being on by default, it is
+// ordinary traffic.
+//
+// Idempotency is the caller's (pd_lsn vs the record's end-LSN), as for
+// ApplyInsertRecordAt.
+func ReplayDedupPage(page storage.Page, intervals []DedupInterval) error {
+	op := ReadPGOpaque(page)
+	count, err := storage.PageLinePointerCount(page)
+	if err != nil {
+		return fmt.Errorf("btree: replay dedup: read line pointers: %w", err)
+	}
+	maxoff := uint16(count)
+	minoff := PGFirstDataKey(op)
+	if maxoff < minoff {
+		return fmt.Errorf("btree: replay dedup: page holds %d items, fewer than P_FIRSTDATAKEY %d", maxoff, minoff)
+	}
+
+	// Snapshot every item BEFORE the rebuild: resetPageItems drops the data
+	// area, so the sources have to be copies (PageGetItemRaw copies).
+	src := make([][]byte, maxoff+1) // 1-based, index 0 unused
+	for off := uint16(1); off <= maxoff; off++ {
+		raw, err := storage.PageGetItemRaw(page, off)
+		if err != nil {
+			return fmt.Errorf("btree: replay dedup: read item %d: %w", off, err)
+		}
+		src[off] = raw
+	}
+
+	// `out` holds DATA items only. Upstream's redo copies the high key onto its
+	// temp page first (btree_xlog_dedup's P_RIGHTMOST branch); here
+	// resetPageItems re-installs it for every rewrite path in this package, so
+	// re-adding it would leave the page carrying two separators.
+	out := make([][]byte, 0, int(maxoff))
+	k := 0
+	for off := minoff; off <= maxoff; {
+		if k < len(intervals) && intervals[k].BaseOff == off {
+			n := intervals[k].NItems
+			if n < 2 {
+				// Upstream only ever records an interval when it actually
+				// formed a posting (_bt_dedup_finish_pending increments
+				// nintervals in the nitems > 1 branch alone), so a run of one
+				// is a malformed record, not a no-op to wave through.
+				return fmt.Errorf("btree: replay dedup: interval %d at offset %d merges %d items (want >= 2)", k, off, n)
+			}
+			if int(off)+int(n)-1 > int(maxoff) {
+				return fmt.Errorf("btree: replay dedup: interval %d at offset %d runs %d items past the page's %d",
+					k, off, n, maxoff)
+			}
+			merged, err := dedupMergeRun(src[off : off+n])
+			if err != nil {
+				return fmt.Errorf("btree: replay dedup: interval %d at offset %d: %w", k, off, err)
+			}
+			out = append(out, merged)
+			k++
+			off += n
+			continue
+		}
+		out = append(out, src[off])
+		off++
+	}
+	if k != len(intervals) {
+		// A baseoff that did not fall on a run boundary — the record describes
+		// a page this is not. Refusing beats writing a page whose postings
+		// disagree with what the primary wrote.
+		return fmt.Errorf("btree: replay dedup: %d of %d intervals matched a page offset", k, len(intervals))
+	}
+
+	resetPageItems(page)
+	for i, raw := range out {
+		if _, err := storage.PageAddItemRaw(page, raw); err != nil {
+			return fmt.Errorf("btree: replay dedup: add rebuilt item %d: %w", i, err)
+		}
+	}
+	op.Flags &^= BTPHasGarbage
+	WritePGOpaque(page, op)
+	return nil
+}
+
+// dedupMergeRun collapses one deduplication interval's items into the single
+// posting-list tuple the primary formed for it — upstream's pending-posting
+// state machine reduced to what redo actually needs.
+//
+// The run's FIRST item is the base: upstream's `state->base`, whose key
+// material every merged TID is now filed under. When that base is itself a
+// posting list, the base bytes are its key material only (its own TID array is
+// contributed to the merge instead), which is upstream's `basetupsize =
+// BTreeTupleGetPostingOffset(base)`.
+func dedupMergeRun(run [][]byte) ([]byte, error) {
+	var (
+		base  []byte
+		htids []storage.ItemPointer
+	)
+	for i, raw := range run {
+		if len(raw) < SizeOfIndexTupleData {
+			return nil, fmt.Errorf("item %d is %d bytes, too short for a tuple header", i, len(raw))
+		}
+		if BTreeTupleIsPivot(raw) {
+			// P_HIKEY is excluded by construction (the caller starts at
+			// P_FIRSTDATAKEY) and a leaf page has no other pivot, so this means
+			// the intervals do not describe this page.
+			return nil, fmt.Errorf("item %d is a pivot tuple", i)
+		}
+		if isPostingRaw(raw) {
+			postingOffset, n, err := postingBounds(raw)
+			if err != nil {
+				return nil, fmt.Errorf("item %d: %w", i, err)
+			}
+			for j := 0; j < n; j++ {
+				off := postingOffset + j*SizeOfItemPointerData
+				htids = append(htids, PGItemPointerAt(raw[off:off+SizeOfItemPointerData]))
+			}
+			if i == 0 {
+				base = raw[:postingOffset]
+			}
+			continue
+		}
+		htids = append(htids, PGIndexTupleTID(raw))
+		if i == 0 {
+			base = raw
+		}
+	}
+	if len(htids) > BTPostingMaxTIDs {
+		return nil, fmt.Errorf("%d heap TIDs exceeds BT_OFFSET_MASK %d", len(htids), BTPostingMaxTIDs)
+	}
+	return PGBTPostingRaw(base, htids), nil
+}
+
 // ReplayNewRootPage rebuilds a freshly-allocated root page from
 // scratch using the carried items + level. Mirrors what
 // `updateRootMeta` writes after a split bubbles up + what

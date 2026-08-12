@@ -191,7 +191,7 @@ Two opcodes handled; the other twelve **silently no-op'd** (`recovery.go:2245-22
 | `INSERT_META` | 0x20 | H (S21b part 1) | `btree_xlog_insert(f,t,f)` | ditto, when the fast-root also moves (`nbtinsert.c:1348`) |
 | `SPLIT_L` / `SPLIT_R` | 0x30/0x40 | H `:2470` | `btree_xlog_split` `:251` | page split |
 | `INSERT_POST` | 0x50 | H (S21b part 2a) | `btree_xlog_insert(t,f,t)` | insert splitting a **posting list** on a deduplicated leaf (`nbtinsert.c:1337`) |
-| `DEDUP` | 0x60 | **S** | `btree_xlog_dedup` `:464-556` | leaf deduplication before a split (`nbtdedup.c:265`) |
+| `DEDUP` | 0x60 | H (S21b part 2b) | `btree_xlog_dedup` `:464-556` | leaf deduplication before a split (`nbtdedup.c:265`) |
 | `DELETE` | 0x70 | **S** | `btree_xlog_delete` `:652-716` | LP_DEAD / bottom-up index deletion (`nbtpage.c:1369`) |
 | `UNLINK_PAGE` / `_META` | 0x80/0x90 | H `:2503` | `btree_xlog_unlink_page` `:802` | page deletion |
 | `NEWROOT` | 0xA0 | H `:2461` | `btree_xlog_newroot` `:941` | root split |
@@ -924,7 +924,71 @@ FAILs on a raw slot error from the storage layer.
 
 **Remaining in part 2:** `DEDUP` 0x60 (`btree_xlog_dedup`, `nbtxlog.c:464-556`) — it
 rebuilds the whole leaf from an interval array via `_bt_form_posting`, which
-`PGBTPostingRaw` now supplies.
+`PGBTPostingRaw` now supplies. (Landed as part 2b, below.)
+
+### S21b — implementation notes, part 2b: DEDUP (landed 2026-08-12)
+
+`XLOG_BTREE_DEDUP` (0x60) is the leaf deduplication pass: before letting a full leaf
+split, `_bt_dedup_pass` (`nbtdedup.c:265`) merges runs of equal-key tuples into
+posting lists and reclaims the space. goopg never runs one — its inserts append to
+an existing posting a TID at a time — but deduplication is the default for every
+opclass that allows it, so this is the *most common* PG-only btree opcode in a crash
+tail, and it is the record S16.3 named when it turned the old silent FPI-only
+`default:` arm into a refusal.
+
+**The record carries no tuples at all** — only `xl_btree_dedup{uint16 nintervals}`
+in the main data and an array of `BTDedupInterval{OffsetNumber baseoff; uint16
+nitems}` (4 bytes each) as block 0's data run. Everything the merged postings are
+made of is already on the page being replayed, so this is a page-**rebuild** slice
+rather than an edit: `btree.ReplayDedupPage` snapshots the pre-image's items,
+collapses each interval's run of `nitems` consecutive items into one posting formed
+over the run's heap TIDs in page order (`PGBTPostingRaw` = `_bt_form_posting`, the
+primitive part 2a exported), copies every non-interval item verbatim, and re-adds
+the result. Upstream reaches the same page by re-running its dedup state machine
+(`_bt_dedup_start_pending` / `_bt_dedup_save_htid` / `_bt_dedup_finish_pending`)
+under the record's interval bounds and then asserts the reconstruction matched
+(`memcmp(state->intervals, intervals, …) == 0`); the bounds are what make the two
+formulations identical, which is why redo needs no key comparisons — and therefore
+no catalog — to do it.
+
+Two details decide correctness, and both produce a page with the *right item count*
+when got wrong:
+
+- **`nitems` counts ITEMS, not heap TIDs.** An item inside a run may already be a
+  posting list from an earlier dedup pass, contributing several TIDs. When such an
+  item is the run's *base*, only its key material is the base tuple —
+  upstream's `basetupsize = BTreeTupleGetPostingOffset(base)` — and its TID array
+  joins the merge. Treating it as opaque key bytes yields a posting short by
+  however many TIDs it already held.
+- **The high key is not re-added here.** Upstream copies `P_HIKEY` onto its temp
+  page first (`PageGetTempPageCopySpecial` + the `!P_RIGHTMOST` branch), but
+  `resetPageItems` already re-installs the separator for every rewrite path in
+  this package (split, VACUUM, replay), so `ReplayDedupPage` rebuilds DATA items
+  only. Re-adding it leaves the page carrying two separators — caught by the
+  non-rightmost guard, which is the reason that guard exists.
+
+`BTP_HAS_GARBAGE` is cleared as upstream does: the rebuild rewrites every item, so
+no LP_DEAD line pointer survives it. The FPI branch is the plain one — an image is
+the finished page, so redo restores it and stops rather than merging already-merged
+postings a second time.
+
+Refusals rather than corruption, all before the page is touched: an interval array
+shorter than the record's own `nintervals` (trusting `len(block.Data)` instead would
+replay a *partial* dedup pass and leave the page half-merged), a `baseoff` that does
+not fall on a run boundary, a run of one item (upstream records an interval only in
+`_bt_dedup_finish_pending`'s `nitems > 1` branch), a run overrunning the page, and a
+pivot tuple inside a run.
+
+6 guards in `internal/wal/btree_dedup_pg_test.go` (rightmost two-interval merge,
+non-rightmost page whose base is an existing posting + the `BTP_HAS_GARBAGE` clear +
+untouched `btpo_next`, the FPI shape, and three malformed-record refusals). Proven
+fail-when-broken by 2 scripted reverts: dropping the unmatched-interval check → the
+refusal guard FAILs; not contributing a base posting's existing TIDs → the merge
+guard FAILs on the posting's TID count.
+
+**Remaining in S21b (part 3):** `DELETE` 0x70 (`btree_xlog_delete` `:652-716` with
+`btree_xlog_updates` `:557-597` — an `xl_btree_update` item-array rewrite) and
+`REUSE_PAGE` 0xD0 as a recognised no-op.
 
 ## Guards
 

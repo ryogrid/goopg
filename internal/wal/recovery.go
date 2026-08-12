@@ -2842,6 +2842,19 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 				return false, err
 			}
 			return true, nil
+		case xlogBtreeDedup:
+			// M0131-S21b part 2b: PG-only — the leaf deduplication pass that
+			// merges runs of equal-key tuples into posting lists to postpone a
+			// split (_bt_dedup_pass, nbtdedup.c). goopg never runs one, but a
+			// real PG index built with deduplication on — the default — emits
+			// this opcode routinely, and it is the very record S16.3 named when
+			// it turned the old silent FPI-only `default:` arm into a refusal.
+			// Block 0's data run is an array of BTDedupInterval, and redo
+			// rebuilds the whole page from the pre-image under those bounds.
+			if err := replayDecodedXLogBtreeDedup(mgr, r, xlog); err != nil {
+				return false, err
+			}
+			return true, nil
 		case xlogBtreeInsertUpper:
 			// M0131-S21b part 1: PG-only — goopg's own downlink inserts ride
 			// RecordKindBtreeSplit/NewRoot. An insert into an internal page also
@@ -4152,6 +4165,61 @@ func replayDecodedXLogBtreeInsert(mgr *storage.Manager, r Record, xlog *XLogDeco
 		return nil
 	}
 	return replayDecodedXLogBtreeRestoreMeta(mgr, xlog, endLSN, 2, "btree-insert")
+}
+
+// sizeOfBtreeDedupData is SizeOfBtreeDedup (nbtxlog.h:177): xl_btree_dedup is
+// one uint16 nintervals, with the interval array riding block 0's data run
+// rather than the main data.
+const sizeOfBtreeDedupData = 2
+
+// replayDecodedXLogBtreeDedup applies a PG-format xl_btree_dedup, mirroring
+// upstream btree_xlog_dedup (nbtxlog.c:463-553): rebuild block 0 from its own
+// pre-image, collapsing each carried {baseoff, nitems} run into one posting
+// list (btree.ReplayDedupPage).
+//
+// The record is REBUILD-shaped rather than edit-shaped, which is why the block
+// carries no items: everything the merged tuples are made of is already on the
+// page being replayed. That also makes the FPI branch the plain one — an image
+// is the finished page, so redo restores it and stops.
+//
+// M0131-S21b part 2b. Idempotent via pd_lsn, per replayExistingXLogBlock.
+func replayDecodedXLogBtreeDedup(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
+	endLSN := storage.LSN(r.EndLSN)
+	block, ok := xlogBlockRefByID(xlog, 0)
+	if !ok {
+		return fmt.Errorf("wal: xlog btree-dedup missing block 0")
+	}
+	if block.HasImage && block.ImageApply {
+		if err := restoreDecodedXLogBlockImage(mgr, block, endLSN); err != nil {
+			return fmt.Errorf("wal: xlog btree-dedup image: %w", err)
+		}
+		return nil
+	}
+	if len(xlog.MainData) < sizeOfBtreeDedupData {
+		return fmt.Errorf("wal: xlog btree-dedup: main data len %d (want >= %d)", len(xlog.MainData), sizeOfBtreeDedupData)
+	}
+	nintervals := int(binary.LittleEndian.Uint16(xlog.MainData[0:2]))
+	// nintervals is the record's own count, so a short data run means a
+	// truncated record; trusting len(block.Data) instead would silently replay
+	// a partial dedup pass and leave the page half-merged.
+	if want := nintervals * btree.SizeOfDedupInterval; len(block.Data) < want {
+		return fmt.Errorf("wal: xlog btree-dedup: block 0 data len %d for %d intervals (want >= %d)",
+			len(block.Data), nintervals, want)
+	}
+	intervals := make([]btree.DedupInterval, nintervals)
+	for i := range intervals {
+		off := i * btree.SizeOfDedupInterval
+		intervals[i] = btree.DedupInterval{
+			BaseOff: binary.LittleEndian.Uint16(block.Data[off : off+2]),
+			NItems:  binary.LittleEndian.Uint16(block.Data[off+2 : off+4]),
+		}
+	}
+	if err := replayExistingXLogBlock(mgr, block, endLSN, func(page storage.Page) error {
+		return btree.ReplayDedupPage(page, intervals)
+	}); err != nil {
+		return fmt.Errorf("wal: xlog btree-dedup apply: %w", err)
+	}
+	return nil
 }
 
 // replayDecodedXLogBtreeRestoreMeta is upstream's _bt_restore_meta

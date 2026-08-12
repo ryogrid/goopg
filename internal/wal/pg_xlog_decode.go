@@ -150,6 +150,7 @@ const (
 	xlogBtreeSplitL           uint8 = 0x30 // XLOG_BTREE_SPLIT_L
 	xlogBtreeSplitR           uint8 = 0x40 // XLOG_BTREE_SPLIT_R
 	xlogBtreeInsertPost       uint8 = 0x50 // XLOG_BTREE_INSERT_POST
+	xlogBtreeDedup            uint8 = 0x60 // XLOG_BTREE_DEDUP
 	xlogBtreeUnlinkPage       uint8 = 0x80 // XLOG_BTREE_UNLINK_PAGE
 	xlogBtreeUnlinkPageMeta   uint8 = 0x90 // XLOG_BTREE_UNLINK_PAGE_META
 	xlogBtreeNewRoot          uint8 = 0xA0 // XLOG_BTREE_NEWROOT
