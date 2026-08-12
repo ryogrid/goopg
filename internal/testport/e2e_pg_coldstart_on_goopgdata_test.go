@@ -751,9 +751,10 @@ func assertHostedPGCanCallSQLBuiltins(t *testing.T, pg *pgcluster.Cluster, logPa
 // row ("could not find array type for data type oid") — this probe is what
 // found that, and it is ledgered.
 //
-// Deliberately absent: pg_timezone_abbrevs (12122), whose ORDER BY needs a
-// pg_amop row goopg does not bootstrap ("operator 664 is not a valid ordering
-// operator") — this probe is what found that, and it is ledgered. And
+// (pg_timezone_abbrevs (12122) was absent for the same class of reason — its
+// ORDER BY needed the pg_amop lookup through index 2653, which M0131-S12 later
+// bulk-loaded; M0131-S9.3d re-measures it here and it now evaluates.)
+// Deliberately absent:
 // pg_indexes (12043), S9.2a's fourth candidate, whose 9002 B ev_action is the
 // first to breach the 8000 B inline-tuple budget; it is now the subject of
 // assertNonCorpusSystemViewIsStillAbsent below.
@@ -788,6 +789,17 @@ func assertHostedPGCanCallSQLBuiltins(t *testing.T, pg *pgcluster.Cluster, logPa
 // heap-tuple budget, so the base cannot be seeded and — under guard #4 — its
 // two dependents cannot be pinned ahead of it. Ledgered against the same
 // pg_rewrite TOAST (2838/2839) work as pg_indexes.
+//
+// M0131-S9.3d adds the REMAINDER tranche — eleven views that no earlier tranche
+// had a reason to skip, found by asking the oracle for every pg_catalog view
+// NOT already pinned: pg_available_extensions (12081) and
+// pg_available_extension_versions (12085) (SRF-only, S9.1's shape),
+// pg_timezone_abbrevs (12122) (ceiling #2, re-measured after S12),
+// pg_stat_user_functions (12279) / pg_stat_xact_user_functions (12284), and the
+// five command-progress views 12309/12314/12319/12324/12333 that join
+// pg_stat_get_progress_info() against pg_database and pg_class. That takes the
+// corpus to 71 of upstream's 80 pg_catalog views; the nine still missing are
+// eight behind the pg_rewrite TOAST work and pg_policies behind pg_policy.
 func nailedSystemViewProbeSet() []struct {
 	view string
 	oid  string
@@ -808,12 +820,15 @@ func nailedSystemViewProbeSet() []struct {
 		{"pg_catalog.pg_publication_tables", "12068"},
 		{"pg_catalog.pg_locks", "12073"},
 		{"pg_catalog.pg_cursors", "12077"},
+		{"pg_catalog.pg_available_extensions", "12081"},
+		{"pg_catalog.pg_available_extension_versions", "12085"},
 		{"pg_catalog.pg_prepared_xacts", "12090"},
 		{"pg_catalog.pg_prepared_statements", "12095"},
 		{"pg_catalog.pg_settings", "12104"},
 		{"pg_catalog.pg_file_settings", "12110"},
 		{"pg_catalog.pg_hba_file_rules", "12114"},
 		{"pg_catalog.pg_ident_file_mappings", "12118"},
+		{"pg_catalog.pg_timezone_abbrevs", "12122"},
 		{"pg_catalog.pg_timezone_names", "12126"},
 		{"pg_catalog.pg_config", "12130"},
 		{"pg_catalog.pg_shmem_allocations", "12134"},
@@ -846,14 +861,22 @@ func nailedSystemViewProbeSet() []struct {
 		{"pg_catalog.pg_stat_replication_slots", "12266"},
 		{"pg_catalog.pg_stat_database", "12270"},
 		{"pg_catalog.pg_stat_database_conflicts", "12275"},
+		{"pg_catalog.pg_stat_user_functions", "12279"},
+		{"pg_catalog.pg_stat_xact_user_functions", "12284"},
 		{"pg_catalog.pg_stat_archiver", "12289"},
 		{"pg_catalog.pg_stat_bgwriter", "12293"},
 		{"pg_catalog.pg_stat_checkpointer", "12297"},
 		{"pg_catalog.pg_stat_io", "12301"},
 		{"pg_catalog.pg_stat_wal", "12305"},
+		{"pg_catalog.pg_stat_progress_analyze", "12309"},
+		{"pg_catalog.pg_stat_progress_vacuum", "12314"},
+		{"pg_catalog.pg_stat_progress_cluster", "12319"},
+		{"pg_catalog.pg_stat_progress_create_index", "12324"},
 		{"pg_catalog.pg_stat_progress_basebackup", "12329"},
+		{"pg_catalog.pg_stat_progress_copy", "12333"},
 		{"pg_catalog.pg_user_mappings", "12338"},
 		{"pg_catalog.pg_replication_origin_status", "12343"},
+		{"pg_catalog.pg_stat_subscription_stats", "12347"},
 		{"pg_catalog.pg_wait_events", "12351"},
 		{"pg_catalog.pg_aios", "12355"},
 	}

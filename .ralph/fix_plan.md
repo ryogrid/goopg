@@ -4175,13 +4175,55 @@ Theme C — Real PG hosted on goopg evaluates views (closes "goopg cannot host a
       `format_type(1003) = name[]`, `go build ./...` + `go vet` clean, UNITS
       PASS, pgbench smoke via the hook. Design `0131-0009` §"Implementation
       status — S9.3c" + F16/F17. 2 ledger rows.
-      **Next in S9:** three ceilings left, all initdb-bootstrap gaps. The
+      **S9.3d LANDED 2026-08-12 — the corpus is 71 of upstream's 80
+      `pg_catalog` views and the residual work is a CLOSED list of nine.**
+      This slice was selected by enumerating the COMPLEMENT (ask the oracle
+      for every `pg_catalog` view with a `_RETURN` rule — oid, rule oid,
+      reltype, relnatts, stored `ev_action` size, in-band `:relid` set — and
+      diff against `systemViewOIDPins()`), which returned twenty unpinned
+      views of which **eleven had no blocker at all**: `pg_available_extensions`
+      (12081/12084), `pg_available_extension_versions` (12085/12088),
+      `pg_timezone_abbrevs` (12122/12125), `pg_stat_user_functions`
+      (12279/12282), `pg_stat_xact_user_functions` (12284/12287) and the five
+      command-progress views `pg_stat_progress_{analyze,vacuum,cluster,
+      create_index,copy}` (12309/12314/12319/12324/12333). Pinned, captured in
+      ONE 71-view `scripts/capture-ev-action.sh` run + ONE
+      `cmd/gen-nailed-view-tables` run; the other 60 blobs came back
+      byte-identical and `--verify` re-derives 71/71. A hosted PG 18.3
+      evaluates all eleven, and the probe was proven NON-VACUOUS in the same
+      loop (adding un-seeded `pg_indexes` fails it in the 42P01 direction).
+      **F18 — a ceiling list is not self-maintaining:** ceiling #2
+      (`pg_timezone_abbrevs` behind `pg_amop`) had been discharged by
+      M0131-S12 on 2026-08-11, which bulk-loaded 2653/2654 while fixing "a
+      hosted PG cannot sort" and recorded that the two were the same bug —
+      yet the ceiling was repeated verbatim by S9.2c/S9.2d/S9.3a/S9.3b/S9.3c
+      because nothing re-ran its repro at HEAD. **F19:** organising tranches
+      by subject family (SRF-only / catalog-direct / view-on-view) left a
+      residue of views that matched an already-proven shape and were simply
+      never enumerated — two are S9.1's exact shape and five are siblings of a
+      view S9.1 did adopt (`pg_stat_progress_basebackup`, taken because it has
+      no `FROM`). The complement query is now the recorded first step for
+      S9.4. **Ceilings after S9.3d: two, both initdb-bootstrap gaps, and they
+      account for exactly the nine views between 71 and 80** — `pg_rewrite`
+      TOAST (2838/2839) withholds eight (`pg_indexes` 9002 B, `pg_stats`
+      9316 B, `pg_stats_ext` 12196 B, `pg_stats_ext_exprs` 11481 B,
+      `pg_seclabels` 35379 B, `pg_statio_all_tables` 10475 B + its two
+      dependents) and the missing on-disk `pg_policy` withholds `pg_policies`.
+      Gates: `internal/initdb` PASS (111 s), `TestE2E_PGColdStartOnGoopgDataDir`
+      PASS (+ the deliberate fail-when-broken run), `^TestE2E_` family PASS
+      (96 s), `--verify` PASS (71/71), `go build ./...` + `go vet` clean,
+      UNITS PASS, pgbench smoke via the hook. Design `0131-0009`
+      §"Implementation status — S9.3d" + F18/F19. 2 ledger rows.
+      **Next in S9:** two ceilings left, both initdb-bootstrap gaps. The
       `pg_rewrite` TOAST (2838/2839) slice is the critical path — it gates
-      `pg_indexes` AND the `pg_statio_*_tables` triple AND (per F15) every
-      future base capture. Off that path: `pg_policy` as an on-disk relation
-      (`pg_policies`) and the `pg_amop` text_lt row
-      (`pg_timezone_abbrevs`). Then S9.4 (`information_schema`, expected to
-      defer).
+      EIGHT of the nine remaining views (`pg_indexes`, `pg_stats`,
+      `pg_stats_ext`, `pg_stats_ext_exprs`, `pg_seclabels`,
+      `pg_statio_all_tables` + its two dependents) AND (per F15) every future
+      base capture; `pg_seclabels` at 35379 B makes it multi-chunk work. Off
+      that path: `pg_policy` as an on-disk relation (`pg_policies`, the ninth).
+      The `pg_amop` ceiling is GONE — discharged by M0131-S12, re-measured and
+      adopted by S9.3d (F18). Then S9.4 (`information_schema`, expected to
+      defer); its first step is the complement query S9.3d used (F19).
 
 Theme F — Findings measured by M0131-S4 (filed 2026-08-11; each is locked into `TestE2E_PGColdStartOnGoopgDataDir` in the FAIL-WHEN-FIXED direction, so landing one turns that assertion red until it is inverted):
 - [x] **M0131-S12 — Bulk-load `pg_opclass_am_name_nsp_index` (2686) at initdb** (DONE 2026-08-11; design `docs/design/0131-0018-opclass-amop-index-bulk-load.md`, 2 ledger rows). **A hosted PG can now sort** — but NOT for the reason this item predicted. `lookup_type_cache(TYPECACHE_LT_OPR)` is a THREE-hop index-only walk (2686 `GetDefaultOpClass` → 2687 `get_opclass_family` → **2653** `get_opfamily_member`/AMOPSTRATEGY, then **2654**/AMOPOPID for the planner's `get_ordering_op_properties`), and **fixing 2686 alone left the error message bit-identical** — the pre-existing "`pg_amop` 2653 blocker" ledgered under S9.1 turned out to be the SAME bug, not an adjacent one, so this slice closed all three: `bootstrapPgOpclassAmNameNspIndex`, `bootstrapPgAmopFamStratIndex`, `bootstrapPgAmopOprFamIndex` (+ new `pgBuildIndexTupleOidCharOidKey`; `bootstrapPgAmopTuples` now returns its heap TIDs). S12.5 done: `assertEmptyOpclassIndexStillBlocksSorts` fired as designed and is now `assertHostedPGCanSort`, with `0130-0002` Guard #1 restored to its `ORDER BY c.relname` form. S12.3/S12.4 resolved as NON-actions: the placeholder lists are the sibling-correct pattern (2687/2754/2755 all stay listed and are overwritten by their bootstrapper), and 2687 was already bulk-loaded. Incidental fix: 2754 passed `nkeyatts = 4` for a 3-key index and is multi-leaf, so the wrong `indnkeyatts` was baked into its pivot tuples. Gates: the S4 E2E PASS (24 s), `internal/initdb` PASS (63 s), `^TestE2E_` family PASS (100 s), UNITS + pgbench smoke via the hook. **Follow-ups ledgered:** initdb-time only (existing bench clusters need re-initdb), cross-type `pg_amop` heap rows still out of scope, and a NEW finding — an assert-enabled hosted PG traps in `procarray.c:2857` `TransactionIdIsNormal(latestCompletedXid)` from the bgwriter ~15 s in, which no current E2E runs long enough to see. **NOTE — id collision:** a SECOND, unrelated item below also carries the id `M0131-S12` (goopg stamps `DB_IN_PRODUCTION`, design `0131-0014`); it is untouched by this loop and needs renumbering. (orig est ~1 loop; MEASURED by M0131-S4 F1). A real PG hosted on a goopg directory cannot execute **any** sort, for **any** type: `SELECT x FROM (VALUES (2), (1)) v(x) ORDER BY x` fails *"could not identify an ordering operator for type integer"*. `lookup_type_cache(TYPECACHE_LT_OPR)` → `GetDefaultOpClass` scans `pg_opclass` through `OpclassAmNameNspIndexId` (**2686**) with `indexOK = true` and NO seq-scan fallback (`postgres/src/backend/commands/indexcmds.c:2374-2384`) — the same shape as blockers #7/#8 and M0131-S5. The heap is correct (probed on the hosted PG: 177 rows; `int4_ops` = oid 1978, `opcmethod` 403, `opcdefault` 't'; 38 default btree opclasses) and `pg_index` carries valid 2686/2687 rows; the index is EMPTY. `internal/initdb/initdb.go` writes 2686 as a bare `makeBtreeRootPage()` placeholder (three lists, ~:1902/:2047/:2144) while its sibling `pg_opfamily_am_name_nsp_index` (2754) has a real bulk-load bootstrapper, and `pgBuildIndexTupleOidNameOidKey` (`internal/initdb/btree_index_bootstrap.go:1909`) **already names 2686 in its doc comment** as one of the two indexes it serves — no caller ever builds its tuples. Subtasks: S12.1 add a `bootstrapPgOpclassAmNameNspIndex` on the 2754 bootstrapper's exact pattern (`btree_index_bootstrap.go:1972-2021`), keyed `(opcmethod oid_ops, opcname name_ops, opcnamespace oid_ops)` UNIQUE per `pgIndexInitialEntries` at `internal/initdb/initdb.go:4934`; S12.2 write it into `base/1` AND `base/5` like every sibling; S12.3 remove 2686 from the three empty-root-page lists; S12.4 check 2687 (`pg_opclass_oid_index`) for the same gap — it sits in the same lists and PG's `RelationCacheInitializePhase3` may nail it; S12.5 INVERT `assertEmptyOpclassIndexStillBlocksSorts` in `internal/testport/e2e_pg_coldstart_on_goopgdata_test.go`, restore the `ORDER BY` form of the Guard-#1 query and drop the Go-side sort. **Scope limit to ledger: initdb-time only** — every existing goopg `$PGDATA` (bench clusters 65433/65436/65437, any operator dir) keeps the empty index, re-initdb required.

@@ -111,6 +111,21 @@ attr	pg_cursors	3	is_holdable	16	1	f	f
 attr	pg_cursors	4	is_binary	16	1	f	f
 attr	pg_cursors	5	is_scrollable	16	1	f	f
 attr	pg_cursors	6	creation_time	1184	8	f	f
+rel	pg_available_extensions	12081	12081	12084	12083	2249	v	4
+attr	pg_available_extensions	1	name	19	64	f	f
+attr	pg_available_extensions	2	default_version	25	-1	f	f
+attr	pg_available_extensions	3	installed_version	25	-1	f	f
+attr	pg_available_extensions	4	comment	25	-1	f	f
+rel	pg_available_extension_versions	12085	12085	12088	12087	2249	v	9
+attr	pg_available_extension_versions	1	name	19	64	f	f
+attr	pg_available_extension_versions	2	version	25	-1	f	f
+attr	pg_available_extension_versions	3	installed	16	1	f	f
+attr	pg_available_extension_versions	4	superuser	16	1	f	f
+attr	pg_available_extension_versions	5	trusted	16	1	f	f
+attr	pg_available_extension_versions	6	relocatable	16	1	f	f
+attr	pg_available_extension_versions	7	schema	19	64	f	f
+attr	pg_available_extension_versions	8	requires	1003	-1	f	f
+attr	pg_available_extension_versions	9	comment	25	-1	f	f
 rel	pg_prepared_xacts	12090	12090	12093	12092	2249	v	5
 attr	pg_prepared_xacts	1	transaction	28	4	f	f
 attr	pg_prepared_xacts	2	gid	25	-1	f	f
@@ -172,6 +187,10 @@ attr	pg_ident_file_mappings	4	map_name	25	-1	f	f
 attr	pg_ident_file_mappings	5	sys_name	25	-1	f	f
 attr	pg_ident_file_mappings	6	pg_username	25	-1	f	f
 attr	pg_ident_file_mappings	7	error	25	-1	f	f
+rel	pg_timezone_abbrevs	12122	12122	12125	12124	2249	v	3
+attr	pg_timezone_abbrevs	1	abbrev	25	-1	f	f
+attr	pg_timezone_abbrevs	2	utc_offset	1186	16	f	f
+attr	pg_timezone_abbrevs	3	is_dst	16	1	f	f
 rel	pg_timezone_names	12126	12126	12129	12128	2249	v	4
 attr	pg_timezone_names	1	name	25	-1	f	f
 attr	pg_timezone_names	2	abbrev	25	-1	f	f
@@ -585,6 +604,20 @@ attr	pg_stat_database_conflicts	5	confl_snapshot	20	8	f	f
 attr	pg_stat_database_conflicts	6	confl_bufferpin	20	8	f	f
 attr	pg_stat_database_conflicts	7	confl_deadlock	20	8	f	f
 attr	pg_stat_database_conflicts	8	confl_active_logicalslot	20	8	f	f
+rel	pg_stat_user_functions	12279	12279	12282	12281	2249	v	6
+attr	pg_stat_user_functions	1	funcid	26	4	f	f
+attr	pg_stat_user_functions	2	schemaname	19	64	f	f
+attr	pg_stat_user_functions	3	funcname	19	64	f	f
+attr	pg_stat_user_functions	4	calls	20	8	f	f
+attr	pg_stat_user_functions	5	total_time	701	8	f	f
+attr	pg_stat_user_functions	6	self_time	701	8	f	f
+rel	pg_stat_xact_user_functions	12284	12284	12287	12286	2249	v	6
+attr	pg_stat_xact_user_functions	1	funcid	26	4	f	f
+attr	pg_stat_xact_user_functions	2	schemaname	19	64	f	f
+attr	pg_stat_xact_user_functions	3	funcname	19	64	f	f
+attr	pg_stat_xact_user_functions	4	calls	20	8	f	f
+attr	pg_stat_xact_user_functions	5	total_time	701	8	f	f
+attr	pg_stat_xact_user_functions	6	self_time	701	8	f	f
 rel	pg_stat_archiver	12289	12289	12292	12291	2249	v	7
 attr	pg_stat_archiver	1	archived_count	20	8	f	f
 attr	pg_stat_archiver	2	last_archived_wal	25	-1	f	f
@@ -637,6 +670,66 @@ attr	pg_stat_wal	2	wal_fpi	20	8	f	f
 attr	pg_stat_wal	3	wal_bytes	1700	-1	f	f
 attr	pg_stat_wal	4	wal_buffers_full	20	8	f	f
 attr	pg_stat_wal	5	stats_reset	1184	8	f	f
+rel	pg_stat_progress_analyze	12309	12309	12312	12311	2249	v	13
+attr	pg_stat_progress_analyze	1	pid	23	4	f	f
+attr	pg_stat_progress_analyze	2	datid	26	4	f	f
+attr	pg_stat_progress_analyze	3	datname	19	64	f	f
+attr	pg_stat_progress_analyze	4	relid	26	4	f	f
+attr	pg_stat_progress_analyze	5	phase	25	-1	f	f
+attr	pg_stat_progress_analyze	6	sample_blks_total	20	8	f	f
+attr	pg_stat_progress_analyze	7	sample_blks_scanned	20	8	f	f
+attr	pg_stat_progress_analyze	8	ext_stats_total	20	8	f	f
+attr	pg_stat_progress_analyze	9	ext_stats_computed	20	8	f	f
+attr	pg_stat_progress_analyze	10	child_tables_total	20	8	f	f
+attr	pg_stat_progress_analyze	11	child_tables_done	20	8	f	f
+attr	pg_stat_progress_analyze	12	current_child_table_relid	26	4	f	f
+attr	pg_stat_progress_analyze	13	delay_time	701	8	f	f
+rel	pg_stat_progress_vacuum	12314	12314	12317	12316	2249	v	15
+attr	pg_stat_progress_vacuum	1	pid	23	4	f	f
+attr	pg_stat_progress_vacuum	2	datid	26	4	f	f
+attr	pg_stat_progress_vacuum	3	datname	19	64	f	f
+attr	pg_stat_progress_vacuum	4	relid	26	4	f	f
+attr	pg_stat_progress_vacuum	5	phase	25	-1	f	f
+attr	pg_stat_progress_vacuum	6	heap_blks_total	20	8	f	f
+attr	pg_stat_progress_vacuum	7	heap_blks_scanned	20	8	f	f
+attr	pg_stat_progress_vacuum	8	heap_blks_vacuumed	20	8	f	f
+attr	pg_stat_progress_vacuum	9	index_vacuum_count	20	8	f	f
+attr	pg_stat_progress_vacuum	10	max_dead_tuple_bytes	20	8	f	f
+attr	pg_stat_progress_vacuum	11	dead_tuple_bytes	20	8	f	f
+attr	pg_stat_progress_vacuum	12	num_dead_item_ids	20	8	f	f
+attr	pg_stat_progress_vacuum	13	indexes_total	20	8	f	f
+attr	pg_stat_progress_vacuum	14	indexes_processed	20	8	f	f
+attr	pg_stat_progress_vacuum	15	delay_time	701	8	f	f
+rel	pg_stat_progress_cluster	12319	12319	12322	12321	2249	v	12
+attr	pg_stat_progress_cluster	1	pid	23	4	f	f
+attr	pg_stat_progress_cluster	2	datid	26	4	f	f
+attr	pg_stat_progress_cluster	3	datname	19	64	f	f
+attr	pg_stat_progress_cluster	4	relid	26	4	f	f
+attr	pg_stat_progress_cluster	5	command	25	-1	f	f
+attr	pg_stat_progress_cluster	6	phase	25	-1	f	f
+attr	pg_stat_progress_cluster	7	cluster_index_relid	26	4	f	f
+attr	pg_stat_progress_cluster	8	heap_tuples_scanned	20	8	f	f
+attr	pg_stat_progress_cluster	9	heap_tuples_written	20	8	f	f
+attr	pg_stat_progress_cluster	10	heap_blks_total	20	8	f	f
+attr	pg_stat_progress_cluster	11	heap_blks_scanned	20	8	f	f
+attr	pg_stat_progress_cluster	12	index_rebuild_count	20	8	f	f
+rel	pg_stat_progress_create_index	12324	12324	12327	12326	2249	v	16
+attr	pg_stat_progress_create_index	1	pid	23	4	f	f
+attr	pg_stat_progress_create_index	2	datid	26	4	f	f
+attr	pg_stat_progress_create_index	3	datname	19	64	f	f
+attr	pg_stat_progress_create_index	4	relid	26	4	f	f
+attr	pg_stat_progress_create_index	5	index_relid	26	4	f	f
+attr	pg_stat_progress_create_index	6	command	25	-1	f	f
+attr	pg_stat_progress_create_index	7	phase	25	-1	f	f
+attr	pg_stat_progress_create_index	8	lockers_total	20	8	f	f
+attr	pg_stat_progress_create_index	9	lockers_done	20	8	f	f
+attr	pg_stat_progress_create_index	10	current_locker_pid	20	8	f	f
+attr	pg_stat_progress_create_index	11	blocks_total	20	8	f	f
+attr	pg_stat_progress_create_index	12	blocks_done	20	8	f	f
+attr	pg_stat_progress_create_index	13	tuples_total	20	8	f	f
+attr	pg_stat_progress_create_index	14	tuples_done	20	8	f	f
+attr	pg_stat_progress_create_index	15	partitions_total	20	8	f	f
+attr	pg_stat_progress_create_index	16	partitions_done	20	8	f	f
 rel	pg_stat_progress_basebackup	12329	12329	12332	12331	2249	v	6
 attr	pg_stat_progress_basebackup	1	pid	23	4	f	f
 attr	pg_stat_progress_basebackup	2	phase	25	-1	f	f
@@ -644,6 +737,18 @@ attr	pg_stat_progress_basebackup	3	backup_total	20	8	f	f
 attr	pg_stat_progress_basebackup	4	backup_streamed	20	8	f	f
 attr	pg_stat_progress_basebackup	5	tablespaces_total	20	8	f	f
 attr	pg_stat_progress_basebackup	6	tablespaces_streamed	20	8	f	f
+rel	pg_stat_progress_copy	12333	12333	12336	12335	2249	v	11
+attr	pg_stat_progress_copy	1	pid	23	4	f	f
+attr	pg_stat_progress_copy	2	datid	26	4	f	f
+attr	pg_stat_progress_copy	3	datname	19	64	f	f
+attr	pg_stat_progress_copy	4	relid	26	4	f	f
+attr	pg_stat_progress_copy	5	command	25	-1	f	f
+attr	pg_stat_progress_copy	6	type	25	-1	f	f
+attr	pg_stat_progress_copy	7	bytes_processed	20	8	f	f
+attr	pg_stat_progress_copy	8	bytes_total	20	8	f	f
+attr	pg_stat_progress_copy	9	tuples_processed	20	8	f	f
+attr	pg_stat_progress_copy	10	tuples_excluded	20	8	f	f
+attr	pg_stat_progress_copy	11	tuples_skipped	20	8	f	f
 rel	pg_user_mappings	12338	12338	12341	12340	2249	v	6
 attr	pg_user_mappings	1	umid	26	4	f	f
 attr	pg_user_mappings	2	srvid	26	4	f	f
@@ -656,6 +761,19 @@ attr	pg_replication_origin_status	1	local_id	26	4	f	f
 attr	pg_replication_origin_status	2	external_id	25	-1	f	f
 attr	pg_replication_origin_status	3	remote_lsn	3220	8	f	f
 attr	pg_replication_origin_status	4	local_lsn	3220	8	f	f
+rel	pg_stat_subscription_stats	12347	12347	12350	12349	2249	v	12
+attr	pg_stat_subscription_stats	1	subid	26	4	f	f
+attr	pg_stat_subscription_stats	2	subname	19	64	f	f
+attr	pg_stat_subscription_stats	3	apply_error_count	20	8	f	f
+attr	pg_stat_subscription_stats	4	sync_error_count	20	8	f	f
+attr	pg_stat_subscription_stats	5	confl_insert_exists	20	8	f	f
+attr	pg_stat_subscription_stats	6	confl_update_origin_differs	20	8	f	f
+attr	pg_stat_subscription_stats	7	confl_update_exists	20	8	f	f
+attr	pg_stat_subscription_stats	8	confl_update_missing	20	8	f	f
+attr	pg_stat_subscription_stats	9	confl_delete_origin_differs	20	8	f	f
+attr	pg_stat_subscription_stats	10	confl_delete_missing	20	8	f	f
+attr	pg_stat_subscription_stats	11	confl_multiple_unique_conflicts	20	8	f	f
+attr	pg_stat_subscription_stats	12	stats_reset	1184	8	f	f
 rel	pg_wait_events	12351	12351	12354	12353	2249	v	3
 attr	pg_wait_events	1	type	25	-1	f	f
 attr	pg_wait_events	2	name	25	-1	f	f

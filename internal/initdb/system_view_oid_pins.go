@@ -179,22 +179,50 @@ func systemViewOIDPins() []systemViewOIDPin {
 		{"pg_tables", 12033, 12036, 12035, 8},
 		{"pg_matviews", 12038, 12041, 12040, 7},
 		{"pg_sequences", 12048, 12051, 12050, 11},
+		// NOT pinned, ceiling #1 (pg_rewrite TOAST 2838/2839) — measured
+		// stored ev_action against the 8000 B inline budget, M0131-S9.3d:
+		// pg_stats (12053, 9316 B), pg_stats_ext (12058, 12196 B),
+		// pg_stats_ext_exprs (12063, 11481 B), pg_seclabels (12099, 35379 B).
+		// With pg_indexes (12043, 9002 B) and pg_statio_all_tables (12174,
+		// 10475 B, which withholds its two dependents) that is the COMPLETE
+		// list of views the TOAST slice unblocks: eight of the nine still
+		// missing after this tranche. The ninth is pg_policies — ceiling #4,
+		// a missing base catalog, commented at its OID above.
 		{"pg_publication_tables", 12068, 12071, 12070, 5},
 		{"pg_locks", 12073, 12076, 12075, 16},
 		{"pg_cursors", 12077, 12080, 12079, 6},
+		// M0131-S9.3d (2026-08-12): the REMAINDER tranche. After S9.3b closed
+		// the statistics families the corpus was 60 views, and re-asking the
+		// oracle for every pg_catalog view NOT in this table (oid, rule oid,
+		// stored ev_action size, in-band :relid set) showed twenty left, of
+		// which eleven are under the 8000 B inline budget with no in-band
+		// relid and no known blocker — they were never withheld for a measured
+		// reason, they simply were not in an earlier tranche's subject family.
+		// This tranche takes all eleven in one capture run; the four that stay
+		// out are named at their OID positions below.
+		//
+		// pg_available_extensions / _versions read the pg_available_extension*
+		// SRFs (system_views.sql:672-693), i.e. ordinary S9.1-shaped SRF-only
+		// views that S9.1's "pg_stat_get_* family" subject line skipped over.
+		{"pg_available_extensions", 12081, 12084, 12083, 4},
+		{"pg_available_extension_versions", 12085, 12088, 12087, 9},
 		{"pg_prepared_xacts", 12090, 12093, 12092, 5},
 		{"pg_prepared_statements", 12095, 12098, 12097, 8},
 		{"pg_settings", 12104, 12107, 12106, 17},
 		{"pg_file_settings", 12110, 12113, 12112, 7},
 		{"pg_hba_file_rules", 12114, 12117, 12116, 11},
 		{"pg_ident_file_mappings", 12118, 12121, 12120, 7},
-		// NOT pinned: pg_timezone_abbrevs (12122). Its ev_action is the only
-		// blob in the tranche carrying a SortGroupClause (`ORDER BY abbrev`),
-		// and a hosted PG 18.3 rejects it with "operator 664 is not a valid
-		// ordering operator" — get_ordering_op_properties (lsyscache.c) scans
-		// pg_amop for (664, btree, strategy 1) and goopg's on-disk pg_amop
-		// does not carry text_lt's row. That is a catalog gap, not a capture
-		// gap; ledgered, and the resume point is bootstrapping pg_amop.
+		// M0131-S9.3d: pg_timezone_abbrevs (12122) was S9.1's ceiling #2 — the
+		// only blob in the corpus carrying a SortGroupClause (`ORDER BY
+		// abbrev`), rejected by a hosted PG with "operator 664 is not a valid
+		// ordering operator" because get_ordering_op_properties (lsyscache.c)
+		// looks (664 = text_lt, btree, strategy 1) up through the EMPTY
+		// pg_amop_fam_strat_index (2653). M0131-S12 bulk-loaded 2653 and 2654
+		// (bootstrapPgAmopFamStratIndex / bootstrapPgAmopOprFamIndex) while
+		// fixing the sort blocker one catalog over, and its own note records
+		// that the two were the SAME bug — so this pin is the re-measurement
+		// that ceiling #2 is gone, carried by the hosted-PG probe set.
+		{"pg_timezone_abbrevs", 12122, 12125, 12124, 3},
 		{"pg_timezone_names", 12126, 12129, 12128, 4},
 		{"pg_config", 12130, 12133, 12132, 2},
 		{"pg_shmem_allocations", 12134, 12137, 12136, 4},
@@ -288,6 +316,12 @@ func systemViewOIDPins() []systemViewOIDPin {
 		// exercised.
 		{"pg_stat_database", 12270, 12273, 12272, 30},
 		{"pg_stat_database_conflicts", 12275, 12278, 12277, 8},
+		// M0131-S9.3d, continued: the per-function statistics pair
+		// (system_views.sql:1049-1070), pg_stat_get_function_* SRFs joined
+		// against pg_proc (1255) and pg_namespace (2615) — catalog-direct,
+		// no view-on-view edge, both under 2.5 kB.
+		{"pg_stat_user_functions", 12279, 12282, 12281, 6},
+		{"pg_stat_xact_user_functions", 12284, 12287, 12286, 6},
 		{"pg_stat_archiver", 12289, 12292, 12291, 7},
 		// M0131-S9.1b (2026-08-11): the RTE_RESULT pair. Both views are a bare
 		// `SELECT <srf>() AS …` with NO FROM clause at all (system_views.sql:
@@ -300,9 +334,21 @@ func systemViewOIDPins() []systemViewOIDPin {
 		{"pg_stat_checkpointer", 12297, 12300, 12299, 11},
 		{"pg_stat_io", 12301, 12304, 12303, 20},
 		{"pg_stat_wal", 12305, 12308, 12307, 5},
+		// M0131-S9.3d, continued: the rest of the command-progress family.
+		// pg_stat_progress_basebackup below was pinned by S9.1 because it is
+		// the one member with no catalog join; the other five each join
+		// pg_stat_get_progress_info('<cmd>') against pg_database (1262) and,
+		// for four of them, pg_class (1259) (system_views.sql:1085-1148), so
+		// they belong to the S9.2 shape and were simply never captured.
+		{"pg_stat_progress_analyze", 12309, 12312, 12311, 13},
+		{"pg_stat_progress_vacuum", 12314, 12317, 12316, 15},
+		{"pg_stat_progress_cluster", 12319, 12322, 12321, 12},
+		{"pg_stat_progress_create_index", 12324, 12327, 12326, 16},
 		{"pg_stat_progress_basebackup", 12329, 12332, 12331, 6},
+		{"pg_stat_progress_copy", 12333, 12336, 12335, 11},
 		{"pg_user_mappings", 12338, 12341, 12340, 6},
 		{"pg_replication_origin_status", 12343, 12346, 12345, 4},
+		{"pg_stat_subscription_stats", 12347, 12350, 12349, 12},
 		{"pg_wait_events", 12351, 12354, 12353, 3},
 		{"pg_aios", 12355, 12358, 12357, 15},
 	}

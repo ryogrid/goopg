@@ -977,6 +977,84 @@ PASS (60/60 byte-identical), a throwaway hosted PG 18.3 on a fresh goopg
 `go build ./...` + `go vet` clean, UNITS PASS, pgbench smoke via the commit
 hook.
 
+## Implementation status — S9.3d (2026-08-12)
+
+**The corpus is 71 of upstream's 80 `pg_catalog` views, and the nine that are
+left all have a measured blocker.** This slice is the first that was selected
+by *enumerating the complement* rather than by naming a subject family: the
+oracle was asked for every `pg_catalog` view with a `_RETURN` rule (oid, rule
+oid, reltype, relnatts, `pg_column_size(ev_action)`, in-band `:relid` set) and
+the result was diffed against `systemViewOIDPins()`. Twenty views came back;
+eleven had no blocker at all.
+
+Pinned, captured in ONE 71-view `scripts/capture-ev-action.sh` run and rendered
+by ONE `cmd/gen-nailed-view-tables` run — the other 60 blobs came back
+byte-identical:
+
+| view | oid / rule | stored | why it was never adopted |
+|---|---|---|---|
+| `pg_available_extensions` | 12081 / 12084 | 1658 B | SRF-only; outside S9.1's `pg_stat_get_*` subject line |
+| `pg_available_extension_versions` | 12085 / 12088 | 1990 B | same |
+| `pg_timezone_abbrevs` | 12122 / 12125 | 1757 B | **ceiling #2, and it was already gone** — see F18 |
+| `pg_stat_user_functions` | 12279 / 12282 | 2448 B | catalog-direct; not in S9.2's named heads |
+| `pg_stat_xact_user_functions` | 12284 / 12287 | 2447 B | same |
+| `pg_stat_progress_analyze` | 12309 / 12312 | 3232 B | progress family; only its one FROM-less member (`…_basebackup`) had been adopted, by S9.1 |
+| `pg_stat_progress_vacuum` | 12314 / 12317 | 3416 B | same |
+| `pg_stat_progress_cluster` | 12319 / 12322 | 3457 B | same |
+| `pg_stat_progress_create_index` | 12324 / 12327 | 3832 B | same |
+| `pg_stat_progress_copy` | 12333 / 12336 | 2939 B | same |
+| `pg_stat_subscription_stats` | 12347 / 12350 | 1679 B | same |
+
+A hosted PG 18.3 cold-started on a goopg `$PGDATA` evaluates all eleven
+(`nailedSystemViewProbeSet`, now 71 entries). The probe was proven
+**non-vacuous in the same run**: adding un-seeded `pg_indexes` (12043) to the
+set fails it with the 42P01 half of guard #2, so the eleven passes are the
+corpus's own doing.
+
+### Findings — S9.3d
+
+**F18 — a ceiling list is not self-maintaining, and this one carried a
+discharged entry for two tranches.** Ceiling #2 (`pg_timezone_abbrevs` behind
+the `ORDER BY abbrev` → `get_ordering_op_properties` → `pg_amop` lookup) was
+recorded by S9.1 on 2026-08-11 and repeated verbatim by S9.2c, S9.2d, S9.3a,
+S9.3b and S9.3c — but **M0131-S12 had already fixed it on 2026-08-11**, hours
+later, from the other side: that slice bulk-loaded `pg_amop_fam_strat_index`
+(2653) and `pg_amop_opr_fam_index` (2654) while chasing "a hosted PG cannot
+sort", and its own completion note says the two were the SAME bug. Nothing
+re-ran the `pg_timezone_abbrevs` measurement, so a view that cost nothing sat
+on the blocked list through five tranches. The rule the nightly triage already
+states — *re-run the repro at HEAD before believing the log* — applies to a
+design doc's own ceiling table.
+
+**F19 — organising tranches by subject family leaves a residue that only
+complement-enumeration finds.** Every earlier S9 slice was named for a shape
+(SRF-only, catalog-direct, view-on-view) and adopted the views that shape
+brought to mind; eleven views matched a shape already proven and were simply
+never enumerated. Two of them (`pg_available_extensions*`) are S9.1's exact
+shape, and five are the siblings of a view S9.1 *did* adopt
+(`pg_stat_progress_basebackup`, taken because it has no `FROM`, while the five
+that join `pg_stat_get_progress_info()` against `pg_database`/`pg_class` were
+left). The cheap query — oracle views minus pinned views, with size and
+in-band-relid columns — should have been the FIRST step of every tranche, and
+it is now the recorded selection procedure for S9.4.
+
+**Ceilings after S9.3d: two, both in initdb bootstrap, and the residual work is
+now a closed list.** #1 `pg_rewrite` TOAST (2838/2839) withholds exactly
+eight views — `pg_indexes` (9002 B), `pg_stats` (9316 B), `pg_stats_ext`
+(12196 B), `pg_stats_ext_exprs` (11481 B), `pg_seclabels` (35379 B),
+`pg_statio_all_tables` (10475 B) and, through it under guard #4,
+`pg_statio_sys_tables` and `pg_statio_user_tables`. #4 `pg_policy` is not an
+on-disk relation, withholding `pg_policies` (5439 B). That is 8 + 1 = the nine
+views between 71 and upstream's 80, so **S9's `pg_catalog` population is
+finished except for those two bootstrap gaps**; only S9.4
+(`information_schema`, 65 views, expected to defer) remains beyond them.
+`pg_seclabels` at 35379 B keeps the multi-chunk requirement on the TOAST slice.
+
+Gates: `internal/initdb` PASS (111 s), `TestE2E_PGColdStartOnGoopgDataDir` PASS
+plus its deliberate fail-when-broken run, whole `^TestE2E_` family PASS (96 s),
+`capture-ev-action.sh --verify` PASS (71/71 byte-identical), `go build ./...` +
+`go vet` clean, UNITS PASS, pgbench smoke via the commit hook.
+
 ## References
 
 - M0131 implementation plan §S9, `docs/design/0131-bidirectional-cluster-dir-coldstart-and-system-views.md`
