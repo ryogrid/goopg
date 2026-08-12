@@ -2125,12 +2125,38 @@ func (p *Pool) probeAssertSlotIsMapped(s *Slot, note string) {
 }
 
 func (p *Pool) MarkDirty(s *Slot) {
+	// M0131-S26 pd_lsn completeness guard (GOOPG_PDLSN_ASSERT=1, report-only):
+	// plain MarkDirty advances pd_lsn only as a side effect of the first-touch
+	// FPI, so a caller that emitted a record and came here leaves the page
+	// behind its own record. See pdlsn_assert.go for why "plain MarkDirty in a
+	// WAL-wired runtime" is the observable form of that invariant, and use
+	// MarkDirtyUnlogged for a mutation that deliberately has no record.
+	p.reportUnstampedMarkDirty(s, 0)
+	p.markDirtyCore(s, "markDirty")
+}
+
+// MarkDirtyUnlogged is plain MarkDirty for a mutation that deliberately emits no
+// WAL record — the class-B sites of the M0131-S26 audit
+// (docs/design/0131-0033): MultiXact lock stamps, whose membership is transient
+// in-memory state that a heap-lock record structurally cannot describe, and the
+// in-place shared-catalog writes to pg_database. Semantics are identical to
+// MarkDirty (first-touch image, dirty bit, no pd_lsn stamp of its own); the
+// difference is that naming the reason at the call site both documents the
+// exemption and keeps the pd_lsn guard's report down to the sites that still
+// need classifying. reason is documentation for the reader — the guard does not
+// consume it.
+func (p *Pool) MarkDirtyUnlogged(s *Slot, reason string) {
+	_ = reason
+	p.markDirtyCore(s, "markDirtyUnlogged")
+}
+
+func (p *Pool) markDirtyCore(s *Slot, note string) {
 	// M0131-S30.3 probe (temporary): every page mutation funnels through a
 	// MarkDirty* call, so observing here — with the SLOT's own tag — catches
 	// the line-pointer regression at the mutating call path (stack dumped)
 	// rather than at the later write that merely carries it to disk.
-	PageIdentityObserve(s.tag, s.page, "markDirty")
-	p.probeAssertSlotIsMapped(s, "markDirty")
+	PageIdentityObserve(s.tag, s.page, note)
+	p.probeAssertSlotIsMapped(s, note)
 	p.maybeEmitFPI(s)
 	// Atomically set dirty bit.
 	for {

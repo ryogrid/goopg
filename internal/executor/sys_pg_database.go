@@ -268,7 +268,7 @@ func updatePgDatabaseConnLimitOnPage(ctx *Context, slot *storage.Slot, rel stora
 		if rerr := storage.PageReplaceItemRaw(page, s, raw); rerr != nil {
 			return false, true, rerr
 		}
-		ctx.Pool.MarkDirty(slot)
+		ctx.Pool.MarkDirtyUnlogged(slot, "pg_database in-place update: no WAL record exists for it (M0131-S26 class B)")
 		return true, true, nil
 	}
 	return false, false, nil

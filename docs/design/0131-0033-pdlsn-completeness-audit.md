@@ -1,9 +1,11 @@
 # 0131-0033 — `pd_lsn` completeness on logged change paths (M0131-S26)
 
-**Status:** partially landed (2026-08-12). The audit below is complete for the
-`Pool.MarkDirty*` family; the cross-page heap UPDATE defect it found is fixed
-and covered by regression tests. The debug assertion and the `logXxx`-hook side
-of the audit (`internal/initdb/open.go`) remain open — see *Deferred*.
+**Status:** landed (2026-08-12, completed the same day). The audit is complete
+for both the `Pool.MarkDirty*` family and the `logXxx` hooks; the cross-page
+heap UPDATE defect it found is fixed and covered by regression tests; the debug
+assertion is implemented, mechanised and proven armed in a real server. The
+hook-side audit found a gap on an adjacent axis (the FPI watermark, not
+`pd_lsn`) which is filed as its own item — see *Hook audit* and *Deferred*.
 
 ## Why `pd_lsn` is not bookkeeping
 
@@ -97,22 +99,85 @@ no record was written.
   the call site reports `old page pd_lsn = 1001, still behind the covering
   xl_heap_update at 1002`.
 
-## Deferred (item stays unchecked)
+## The guard (mechanised replacement for the inspection above)
 
-1. **Debug assertion.** No mechanised guard yet distinguishes class A (benign)
-   from class C (defect) at runtime — the audit above is by inspection, so a new
-   call site can reintroduce the bug silently. Intended shape: an env-gated
-   (`GOOPG_PDLSN_ASSERT=1`) report in plain `MarkDirty` when WAL hooks are wired,
-   after splitting class B onto an explicit `MarkDirtyUnlogged(s, reason)` so the
-   deliberate sites stay quiet.
-2. **`logXxx` hook audit.** `internal/initdb/open.go`'s hook bodies were not
-   audited for records that name blocks beyond the one the caller stamps — the
-   same multi-page shape as the defect above, one layer down.
-3. **Unlogged in-place shared-catalog updates** (class B, `pg_database`):
+The audit above is by inspection, so a new call site could reintroduce the
+defect silently. `GOOPG_PDLSN_ASSERT=1` (`internal/storage/pdlsn_assert.go`)
+makes it mechanical. The pool cannot check the invariant directly — plain
+`MarkDirty` is handed a slot and told nothing about whether its caller emitted a
+record — so the guard checks the form that *is* observable at the pool boundary:
+
+> in a runtime whose WAL hooks are wired (`LogPageImage` non-nil), no page
+> mutation should reach the pool through **plain** `MarkDirty`.
+
+Every mutation in such a runtime is either logged (one of the stamping
+variants), deliberately unlogged (`MarkDirtyUnlogged(s, reason)` — new here, and
+the class-B sites of the table above now use it), or a hint (`MarkDirtyHint*`,
+exempt by contract). Plain `MarkDirty` survives only as the class-A hook-nil
+fallback, which is unreachable once the runtime is wired. So the report is
+exactly the set of sites a human must classify, and an **empty report over a
+real workload is evidence rather than a claim**.
+
+Report-only (never panics — this is the hot path of every backend), one line per
+caller PC, gated on an env var read once at package init.
+
+Empirical run (2026-08-12, `tmp/pdlsn-assert` on port 5533, memory-capped):
+`pgbench -i -s 2` + 20 s at 4 clients (12 783 txns) + `VACUUM` + `CREATE INDEX`
++ a wide `UPDATE` over 20 000 rows — **zero reports**. Arming was proven
+separately rather than assumed: a temporary `reportUnstampedMarkDirty` call in
+`MarkDirtyLogicalChange` produced
+`PDLSN-UNSTAMPED rel=0/1/1259 blk=4 … site=…markHeapInsertDirty (operators_storage.go:9387)`
+on a single `INSERT`, so env var → guard → stderr → call-site attribution all
+work inside a real server. Both probes were reverted. Unit coverage:
+`internal/storage/pdlsn_assert_test.go` (fires for plain `MarkDirty` under a
+wired pool; silent for the stamping, unlogged and hint variants; silent when WAL
+is unwired; off by default).
+
+## Hook audit (`internal/initdb/open.go`)
+
+The question was whether any `logXxx` hook emits a record naming blocks beyond
+the one its caller stamps — the multi-page shape of the class-C defect, one
+layer down. Five hooks register more than one block: `logBtreeSplit` (left,
+right, sibling, child), `logBtreeNewRoot` (root, left child, meta),
+`logBtreeUnlinkPage` (target, both siblings, leaf, meta),
+`logBtreeMarkPageHalfDead` (leaf, parent) and `logHeapUpdate` (old, new).
+
+**On the `pd_lsn` axis the answer is clean**: every block a record names is
+stamped with that record's LSN by its caller — `_bt_split`'s four
+`MarkDirtyWithLSNLocked` calls (`internal/access/btree/btree.go`), new-root's
+root+meta, unlink's target/parent/siblings (`btree_vacuum.go`), and, since the
+fix above, both pages of the cross-page heap UPDATE. The one exception is
+new-root's block 1, the left child whose incomplete-split flag redo clears:
+goopg does not mutate that page here, so there is nothing to stamp.
+
+**The audit did find a gap on a different axis.** `MarkDirtyWithLSNLocked` also
+advances `nativeImageLSN`, and `needsImage` is `nativeImageLSN <= redoRecPtr` —
+so stamping a page that way asserts "an image of this page exists in WAL at that
+LSN" and suppresses the page's first-touch FPI for the rest of the checkpoint
+epoch. That assertion is true for a block the record carries as an image or
+rebuilds wholesale (`WILL_INIT`), and false for the blocks upstream registers
+plainly and describes only through main data: btree-split's **sibling (block 2)
+and child (block 3)** carry neither image nor data (`EncodeBtreeSplitPG`), and
+unlink's siblings are the same shape — the code comment there says outright that
+it "skips the per-epoch FPI path". Split's **left page** joins them in the
+incremental form added by M0130-S11.5b-2, which reconstructs the page from the
+*on-disk* pre-page. Upstream PG registers all of these as ordinary buffers, i.e.
+takes an FPI when it is the first modification since the checkpoint. Exposure is
+torn-write-only, but that is precisely what full-page writes exist for.
+`MarkDirtyCoveredByRecordLocked` — introduced by this slice — is the correct
+primitive for all of them (image first, raise `pd_lsn`, leave the watermark
+alone). Filed as **M0131-S26b**, not fixed here: it changes WAL volume on the
+btree split hot path and wants its own gates.
+
+## Deferred (S26 itself is done; these are separate items)
+
+1. **FPI watermark advanced without an image** on multi-page btree records —
+   M0131-S26b, described in *Hook audit* above.
+2. **Unlogged in-place shared-catalog updates** (class B, `pg_database`):
    `datconnlimit` and `datfrozenxid` are written into the heap page with no WAL
    record at all, so they survive a crash only when the epoch's FPI happened to
    capture them. This is a durability gap in its own right, not a `pd_lsn` gap.
-4. **`MarkDirtyHint` is correctly exempt** and stays so: hint bits are
+3. **`MarkDirtyHint` is correctly exempt** and stays so: hint bits are
    recomputable from `pg_xact`, PG does not WAL-log them
    (`MarkBufferDirtyHint`), and stamping `pd_lsn` there would self-invalidate the
    FPI re-verify. The hint path pays for the exemption with `hintFlushBarrier`
