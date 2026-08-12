@@ -100,6 +100,10 @@ func TestPgTypeRowCanonicalTypcollation(t *testing.T) {
 		1042: 100, // bpchar  -> default
 		1043: 100, // varchar -> default
 		1009: 100, // _text   -> default (array inherits element collation)
+		1003: 950, // _name   -> C (element name is 'C'); newly seeded by
+		//            M0131-S9.3c, whose pg_publication_tables pin is the first
+		//            nailed rel with a name[] (attnames) attribute. The value
+		//            matches TestPgTypeArrayCollationMatchesElement's pin.
 	}
 	for _, e := range pgTypeInitialEntries() {
 		row := pgTypeRow(e)
@@ -338,6 +342,79 @@ func TestPgTypeAllEntriesTypalignValid(t *testing.T) {
 		default:
 			t.Errorf("oid=%d (%s): typstorage=%#x (%q) — not in {p,e,x,m}",
 				e.OID, e.Name, e.Storage, e.Storage)
+		}
+	}
+}
+
+// TestPgTypeElemArrayCoversSeededEntries keeps pgTypeElemArray exhaustive over
+// the seeded pg_type set. Both columns were hardcoded 0 until M0131-S9.3c, and
+// a 0 is indistinguishable from "legitimately has no array type" — so without a
+// coverage guard a newly seeded OID would silently reintroduce the two hosted-PG
+// ceilings the population closed (get_array_type → `could not find array type`,
+// get_element_type → `target type is not an array`).
+func TestPgTypeElemArrayCoversSeededEntries(t *testing.T) {
+	for oid, e := range pgTypeBootstrapEntryMap() {
+		_, inGen := pgTypeGeneratedElemArraySubscript[oid]
+		_, inOverlay := pgTypeElemArrayOverlay[oid]
+		if !inGen && !inOverlay {
+			t.Errorf("oid=%d (%s): covered by neither pgTypeGeneratedElemArraySubscript "+
+				"(regenerate with cmd/gen-pg-type-data) nor pgTypeElemArrayOverlay; "+
+				"its heap row would carry typelem/typarray/typsubscript = 0", oid, e.Name)
+		}
+	}
+}
+
+// TestPgTypeRowCanonicalTypelemTyparray pins the encoded bytes at the two
+// offsets a hosted PG reads through get_element_type (typelem, offset 92) and
+// get_array_type (typarray, offset 96). The spot values are the load-bearing
+// ones for M0131-S9.3c's two unblocked views: oid (26) -> _oid (1028) is what
+// pg_group's `ARRAY(SELECT member FROM pg_auth_members …)` resolves, and the
+// array rows' typelem is what pg_publication_tables' ArrayCoerceExpr needs.
+func TestPgTypeRowCanonicalTypelemTyparray(t *testing.T) {
+	cols := pgTypeColDefs()
+	for _, e := range pgTypeInitialEntries() {
+		row := pgTypeRow(e)
+		payload, err := executor.EncodeRowPG(cols, row)
+		if err != nil {
+			t.Fatalf("oid=%d (%s): encode: %v", e.OID, e.Name, err)
+		}
+		if len(payload) < 100 {
+			t.Errorf("oid=%d (%s): fixed part %d bytes < 100", e.OID, e.Name, len(payload))
+			continue
+		}
+		le32 := func(off int) uint32 {
+			return uint32(payload[off]) | uint32(payload[off+1])<<8 |
+				uint32(payload[off+2])<<16 | uint32(payload[off+3])<<24
+		}
+		wantElem, wantArray, wantSubscript := pgTypeElemArraySubscriptForOID(e.OID)
+		if got := int64(le32(88)); got != wantSubscript {
+			t.Errorf("oid=%d (%s): typsubscript at offset 88: want %d, got %d", e.OID, e.Name, wantSubscript, got)
+		}
+		if got := int64(le32(92)); got != wantElem {
+			t.Errorf("oid=%d (%s): typelem at offset 92: want %d, got %d", e.OID, e.Name, wantElem, got)
+		}
+		if got := int64(le32(96)); got != wantArray {
+			t.Errorf("oid=%d (%s): typarray at offset 96: want %d, got %d", e.OID, e.Name, wantArray, got)
+		}
+	}
+	// Spot-pin the pairs the two unblocked views depend on.
+	// 6179 = array_subscript_handler, 6180 = raw_array_subscript_handler
+	// (pg_proc.dat). IsTrueArrayType requires the former AND a non-zero
+	// typelem, which is why the ANY/ALL path needs both columns.
+	for _, tc := range []struct {
+		oid                    uint32
+		elem, array, subscript int64
+	}{
+		{26, 0, 1028, 0},     // oid   -> _oid  (pg_group grolist)
+		{1028, 26, 0, 6179},  // _oid  -> oid, a true array type
+		{19, 18, 1003, 6180}, // name  -> _name (typelem => char, a .dat exception)
+		{1003, 19, 0, 6179},  // _name -> name, a true array type
+		{1009, 25, 0, 6179},  // _text -> text
+	} {
+		elem, array, subscript := pgTypeElemArraySubscriptForOID(tc.oid)
+		if elem != tc.elem || array != tc.array || subscript != tc.subscript {
+			t.Errorf("oid=%d: want {typelem,typarray,typsubscript}={%d,%d,%d}, got {%d,%d,%d}",
+				tc.oid, tc.elem, tc.array, tc.subscript, elem, array, subscript)
 		}
 	}
 }

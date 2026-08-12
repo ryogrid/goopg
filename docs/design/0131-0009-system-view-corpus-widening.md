@@ -885,6 +885,98 @@ includes `TestE2E_PGColdStartOnGoopgDataDir`), `capture-ev-action.sh --verify`
 PASS (58/58 byte-identical), `go build ./...` + `go vet` clean, UNITS PASS,
 pgbench smoke via the commit hook.
 
+## Implementation status — S9.3c (2026-08-12)
+
+**The corpus is 60 views, and this slice added no capture work at all: it
+cleared a *bootstrap* ceiling and the two withheld views followed.** `pg_group`
+(12010/12013) and `pg_publication_tables` (12068/12071) were captured back in
+S9.2c/S9.2d and withheld as ceilings #3 and #5; both were blocked by the same
+`pg_type` bootstrap defect, and pinning them here was a two-line edit once the
+defect was fixed.
+
+| view | OID / rule | stored `ev_action` | ceiling that held it | in-band `:relid` |
+|---|---|---|---|---|
+| `pg_group` | 12010 / 12013 | 1428 B | #3 (`typarray` = 0) | — |
+| `pg_publication_tables` | 12068 / 12071 | 3793 B | #5 (`typelem` = 0) | — |
+
+### What was actually broken
+
+`initdb.pgTypeRow` emitted a literal `0` for columns 13/14/15
+(`typsubscript`/`typelem`/`typarray`) of **every** bootstrapped `pg_type` row —
+193 of them — even though `pg_type_seed_data.go` already carried the array peer
+rows those columns point at. Three separate hosted-PG failures come out of that
+one line group:
+
+| hosted-PG symptom | upstream call | column |
+|---|---|---|
+| `could not find array type for data type oid` | `get_array_type` (lsyscache.c) | `typarray` |
+| `target type is not an array` | `ExecInitExprRec` T_ArrayCoerceExpr (execExpr.c:1684-1688) | `typelem` |
+| `op ANY/ALL (array) requires array on right side` | `make_scalar_array_op` → `get_base_element_type` (parse_oper.c:800) | `typsubscript` |
+
+`cmd/gen-pg-type-data` now derives the whole `{typelem, typarray,
+typsubscript}` triple from `pg_type.dat` the way genbki does — an entry with
+`array_type_oid => A` gets `typarray = A`, and the synthesised array type `A`
+gets `typelem` = the element OID plus `typsubscript =
+array_subscript_handler` (6179) — and emits it as
+`pgTypeGeneratedElemArraySubscript` alongside `pgTypeAllEntries`. The base
+entries' own `typelem`/`typsubscript` (`name => char`, `oidvector => oid`,
+`box => point`, the `raw_array_subscript_handler` 6180 users) come verbatim
+from the .dat file. A three-entry hand-written overlay covers the OIDs
+`pgTypeCanonical` supplies that `pg_type.dat` does not (`_pg_statistic`
+10028), and `TestPgTypeElemArrayCoversSeededEntries` keeps the union
+exhaustive over `pgTypeBootstrapEntryMap()`.
+
+### Findings — S9.3c
+
+**F16 — a half-populated `pg_type` is worse than an unpopulated one, and only a
+hosted PG says so.** Populating `typelem` + `typarray` while leaving
+`typsubscript` at 0 passed every unit test, `--verify`, and the encoded-byte
+pins — and *broke* `TestE2E_PGColdStartOnGoopgDataDir`'s oldest guard, the
+`WHERE n.nspname IN ('public', 's4app')` relname query, with `op ANY/ALL
+(array) requires array on right side`. The mechanism is a fallback that
+silently disappears: with `typarray = 0` the parser cannot find an array type
+for an `IN (…)` list at all, so `transformAExprIn` expands it into an OR-chain
+of equality tests, which works against any catalog. The moment `typarray`
+resolves, the parser upgrades the list to a `ScalarArrayOpExpr` — and then
+`get_base_element_type` applies `IsTrueArrayType`, which requires
+`typsubscript == array_subscript_handler` **and** a non-zero `typelem`. Fixing
+two of the three columns therefore moved every `IN`-list in every hosted-PG
+query off a working path onto a broken one. The general shape — a catalog
+column whose *absence* is handled by a graceful fallback and whose *partial*
+presence is not — is the same trap as the M0106 codec type-set split, and it
+argues for populating a PG catalog column group atomically rather than
+per-symptom.
+
+**F17 — ceilings #3 and #5 were one defect, and so is the fix's blast
+radius.** S9.2d already recorded that the two rejections were the same literal
+row one column apart; what S9.3c adds is that the repair could not be scoped to
+the 45 `pgTypeCanonical` entries either. The heap carries all 193
+`pgTypeAllEntries` rows, so a hand-written table covering only the nailed-attr
+subset would have left `_int8`, `_numeric` and 145 others with `typarray`
+resolvable but `typelem` zero — reproducing F16's broken state for every type
+whose array peer is not nailed. Deriving the triple in the generator is what
+makes the population total.
+
+**Ceilings after S9.3c: three, all in initdb bootstrap.** #1 `pg_rewrite`
+TOAST (`pg_statio_all_tables` 10475 B, `pg_indexes` 9002 B), #2 `pg_amop`
+(`pg_timezone_abbrevs`), #4 `pg_policy` is not an on-disk relation
+(`pg_policies`). #3 and #5 are resolved. The generalisation "every ceiling is a
+gap in what goopg BOOTSTRAPS, not in the capture tooling" now holds at five for
+five with two of them discharged by bootstrap work.
+
+Remaining in S9: the `pg_statio_*_tables` triple and `pg_indexes` behind
+`pg_rewrite` TOAST (2838/2839), `pg_policies` behind an on-disk `pg_policy`,
+`pg_timezone_abbrevs` behind `pg_amop`, and S9.4's 65 `information_schema`
+views (expected to be deferred with a ledger row).
+
+Gates: `internal/initdb` PASS (104 s), whole `^TestE2E_` family PASS (96 s,
+includes `TestE2E_PGColdStartOnGoopgDataDir`), `capture-ev-action.sh --verify`
+PASS (60/60 byte-identical), a throwaway hosted PG 18.3 on a fresh goopg
+`$PGDATA` answering `SELECT count(*) FROM pg_group` (16) and
+`FROM pg_publication_tables` (0) and printing `format_type(1003) = name[]`,
+`go build ./...` + `go vet` clean, UNITS PASS, pgbench smoke via the commit
+hook.
+
 ## References
 
 - M0131 implementation plan §S9, `docs/design/0131-bidirectional-cluster-dir-coldstart-and-system-views.md`

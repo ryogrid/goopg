@@ -134,19 +134,17 @@ func systemViewOIDPins() []systemViewOIDPin {
 		// trusting it, and a hosted PG evaluating pg_user is the acceptance
 		// measurement.
 		//
-		// NOT pinned: pg_group (12010, rule 12013, reltype 12012, 3 atts —
-		// captured and under every ceiling at 1428 B stored). Its
-		// `ARRAY(SELECT member FROM pg_auth_members …)` target entry makes it
-		// the corpus's first blob with an ARRAY(SubLink), and a hosted PG
-		// rejects it with "could not find array type for data type oid":
-		// get_array_type (lsyscache.c) reads pg_type.typarray for OIDOID and
-		// goopg seeds that column as a literal 0 for EVERY row
-		// (pg_type_bootstrap.go:306), even though the _oid row (1028) itself
-		// exists in pg_type_seed_data.go. That is a pg_type bootstrap gap, not
-		// a capture gap — the same class as pg_timezone_abbrevs' missing
-		// pg_amop row. Ledgered; the resume point is populating typarray (and
-		// typelem) from pg_type.dat.
+		// pg_group (12010, rule 12013, reltype 12012, 3 atts) was captured but
+		// withheld by S9.2c as ceiling #3: its `ARRAY(SELECT member FROM
+		// pg_auth_members …)` target entry is the corpus's first ARRAY(SubLink),
+		// and a hosted PG rejected it with "could not find array type for data
+		// type oid" because get_array_type (lsyscache.c) reads pg_type.typarray
+		// for OIDOID and goopg seeded that column as a literal 0 for EVERY row.
+		// M0131-S9.3c populates typelem/typarray from the PG 18.3 catalog
+		// (pg_type_bootstrap.go pgTypeElemArray), so oid (26) now reports
+		// typarray = 1028 and the ceiling is gone.
 		{"pg_shadow", 12005, 12008, 12007, 9},
+		{"pg_group", 12010, 12013, 12012, 3},
 		{"pg_user", 12014, 12017, 12016, 9},
 		// M0131-S9.2d (2026-08-12): the rest of S9.2's catalog-direct,
 		// under-ceiling tranche, captured in one pass. Every S9.2d view is a
@@ -171,19 +169,17 @@ func systemViewOIDPins() []systemViewOIDPin {
 		//   corpus's first `name[]`, which is why 1003 is now canonical in
 		//   pg_type_bootstrap.go.)
 		//
-		//   pg_publication_tables (12068, 12071, reltype 12070, 5 atts). A
-		//   hosted PG fails it with "target type is not an array", raised by
-		//   ExecInitExprRec's T_ArrayCoerceExpr arm (execExpr.c:1684-1688)
-		//   when get_element_type() finds pg_type.typelem = 0. goopg seeds
-		//   typelem as a literal 0 for EVERY row (pg_type_bootstrap.go
-		//   pgTypeRow, column 14) — the exact twin of the typarray gap that
-		//   blocks pg_group (F11), one column over in the same literal row.
-		//   Populating typelem and typarray from pg_type.dat unblocks both.
+		// (pg_publication_tables, ceiling #5, was the twin of pg_group's #3 —
+		// "target type is not an array" from ExecInitExprRec's
+		// T_ArrayCoerceExpr arm (execExpr.c:1684-1688) when get_element_type()
+		// found pg_type.typelem = 0, one column over from the typarray literal.
+		// M0131-S9.3c closed both with one population and pins it below.)
 		{"pg_rules", 12023, 12026, 12025, 4},
 		{"pg_views", 12028, 12031, 12030, 4},
 		{"pg_tables", 12033, 12036, 12035, 8},
 		{"pg_matviews", 12038, 12041, 12040, 7},
 		{"pg_sequences", 12048, 12051, 12050, 11},
+		{"pg_publication_tables", 12068, 12071, 12070, 5},
 		{"pg_locks", 12073, 12076, 12075, 16},
 		{"pg_cursors", 12077, 12080, 12079, 6},
 		{"pg_prepared_xacts", 12090, 12093, 12092, 5},

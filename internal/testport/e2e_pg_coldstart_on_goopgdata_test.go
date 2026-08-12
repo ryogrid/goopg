@@ -773,6 +773,16 @@ func assertHostedPGCanCallSQLBuiltins(t *testing.T, pg *pgcluster.Cluster, logPa
 // view-on-view edges, and makes the two index bases (6826 B / 6799 B stored)
 // the closest any seeded blob sits to the 8000 B inline budget.
 //
+// M0131-S9.3c adds the two views S9.2 captured but had to withhold, and it
+// took no capture work at all to do it: pg_group (12010) and
+// pg_publication_tables (12068) were both blocked by the SAME pg_type
+// bootstrap defect one column apart — typarray = 0 for every row (get_array_type,
+// pg_group's ARRAY(SubLink)) and typelem = 0 for every row (get_element_type,
+// pg_publication_tables' ArrayCoerceExpr). Populating both columns from the
+// PG 18.3 catalog (initdb.pgTypeElemArray) cleared two ceilings at once, so a
+// hosted PG evaluating these two here is what proves the population is real
+// rather than merely well-formed.
+//
 // Deliberately absent: the pg_statio_*_tables triple. Its base
 // pg_statio_all_tables (12174) stores at 10475 B, over the 8000 B inline
 // heap-tuple budget, so the base cannot be seeded and — under guard #4 — its
@@ -788,12 +798,14 @@ func nailedSystemViewProbeSet() []struct {
 	}{
 		{"pg_catalog.pg_roles", "12000"},
 		{"pg_catalog.pg_shadow", "12005"},
+		{"pg_catalog.pg_group", "12010"},
 		{"pg_catalog.pg_user", "12014"},
 		{"pg_catalog.pg_rules", "12023"},
 		{"pg_catalog.pg_views", "12028"},
 		{"pg_catalog.pg_tables", "12033"},
 		{"pg_catalog.pg_matviews", "12038"},
 		{"pg_catalog.pg_sequences", "12048"},
+		{"pg_catalog.pg_publication_tables", "12068"},
 		{"pg_catalog.pg_locks", "12073"},
 		{"pg_catalog.pg_cursors", "12077"},
 		{"pg_catalog.pg_prepared_xacts", "12090"},
