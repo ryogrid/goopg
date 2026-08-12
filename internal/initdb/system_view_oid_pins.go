@@ -202,15 +202,18 @@ func systemViewOIDPins() []systemViewOIDPin {
 		// carry. Ledgered, with the measured numbers in
 		// assertHostedPGSeesPgRewriteToastRelation.)
 		//
-		// TWO of the six over-budget values still stay out, and NEITHER is
-		// blocked by size any more — both toast cleanly and both were measured
-		// against a hosted PG in this slice rather than assumed:
+		// ONE of the six over-budget values still stays out, and it is not
+		// blocked by size — it toasts cleanly, and it was measured against a
+		// hosted PG rather than assumed:
 		//
-		//   pg_seclabels (12099, 35379 B, 18 chunks) reads pg_seclabel (3596)
-		//   and pg_largeobject_metadata (2995), neither of which is an on-disk
+		//   (pg_seclabels (12099, 35379 B, 18 chunks — the corpus's largest
+		//   value by 3×) was the other. It read pg_seclabel (3596) and
+		//   pg_largeobject_metadata (2995), neither of which was an on-disk
 		//   relation in a goopg cluster: "could not open relation with OID
-		//   3596" — the same class of blocker as pg_policies' pg_policy
-		//   (3256), i.e. ceiling #4.
+		//   3596", the same class of blocker as pg_policies' pg_policy (3256).
+		//   M0131-S9.3f bootstraps both as empty nailed heaps
+		//   (relcache_init.go, mappedLocalCatalogPlaceholderOIDs) and pins the
+		//   view below, closing ceiling #4 for good.)
 		//
 		//   pg_stats_ext_exprs (12063, 11481 B) needs pg_type 10029, the
 		//   COMPOSITE rowtype of pg_statistic. goopg seeds the array type
@@ -243,6 +246,7 @@ func systemViewOIDPins() []systemViewOIDPin {
 		{"pg_available_extension_versions", 12085, 12088, 12087, 9},
 		{"pg_prepared_xacts", 12090, 12093, 12092, 5},
 		{"pg_prepared_statements", 12095, 12098, 12097, 8},
+		{"pg_seclabels", 12099, 12102, 12101, 8},
 		{"pg_settings", 12104, 12107, 12106, 17},
 		{"pg_file_settings", 12110, 12113, 12112, 7},
 		{"pg_hba_file_rules", 12114, 12117, 12116, 11},

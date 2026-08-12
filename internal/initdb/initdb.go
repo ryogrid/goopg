@@ -1566,9 +1566,14 @@ func mappedLocalCatalogPlaceholderOIDs() []uint32 {
 		2609, // pg_description
 		2611, // pg_inherits
 		2613, // pg_largeobject
-		2614, // pg_largeobject_metadata
+		2614, // pg_largeobject_metadata (MISLABEL — 2614 is no catalog in PG18;
+		//	  the real LargeObjectMetadataRelationId is 2995, below. Kept because
+		//	  removing a laid-down file is not this slice's business.)
 		2619, // pg_statistic
 		2620, // pg_trigger
+		2995, // pg_largeobject_metadata (M0131-S9.3f — base catalog of the
+		//	  pg_seclabels view's "large object" branch; 3596 below is the
+		//	  other half. Both heaps stay empty.)
 		3256, // pg_policy (M0131-S9.3e — base catalog of the pg_policies view)
 		3381, // pg_statistic_ext
 		3501, // pg_enum (M0106-0010 step 3an)

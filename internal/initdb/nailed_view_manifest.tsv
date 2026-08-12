@@ -190,6 +190,15 @@ attr	pg_prepared_statements	5	result_types	2211	-1	f	f
 attr	pg_prepared_statements	6	from_sql	16	1	f	f
 attr	pg_prepared_statements	7	generic_plans	20	8	f	f
 attr	pg_prepared_statements	8	custom_plans	20	8	f	f
+rel	pg_seclabels	12099	12099	12102	12101	2249	v	8
+attr	pg_seclabels	1	objoid	26	4	f	f
+attr	pg_seclabels	2	classoid	26	4	f	f
+attr	pg_seclabels	3	objsubid	23	4	f	f
+attr	pg_seclabels	4	objtype	25	-1	f	f
+attr	pg_seclabels	5	objnamespace	26	4	f	f
+attr	pg_seclabels	6	objname	25	-1	f	f
+attr	pg_seclabels	7	provider	25	-1	f	f
+attr	pg_seclabels	8	label	25	-1	f	f
 rel	pg_settings	12104	12104	12107	12106	2249	v	17
 attr	pg_settings	1	name	25	-1	f	f
 attr	pg_settings	2	setting	25	-1	f	f

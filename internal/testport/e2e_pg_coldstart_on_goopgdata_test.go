@@ -810,11 +810,14 @@ func assertHostedPGCanCallSQLBuiltins(t *testing.T, pg *pgcluster.Cluster, logPa
 // chain: each of the four external values reaches this probe only through
 // heap_fetch_toast_slice → pg_toast_2618_index → pglz → stringToNode.
 //
-// The three still missing are blocked one layer BELOW the corpus tooling, and
-// none of them by size: pg_policies (pg_policy 3256 is not an on-disk
-// relation), pg_seclabels (pg_seclabel 3596 / pg_largeobject_metadata 2995,
-// same class) and pg_stats_ext_exprs (no pg_type row for 10029, pg_statistic's
-// composite rowtype — ceiling #6).
+// M0131-S9.3e and S9.3f close that class of blocker by bootstrapping the
+// missing base catalogs as EMPTY nailed heaps: pg_policy (3256) for
+// pg_policies (12018), then pg_seclabel (3596) + pg_largeobject_metadata
+// (2995) for pg_seclabels (12099). The corpus is 79 of upstream's 80.
+//
+// ONE is still missing, and it is blocked one layer BELOW the corpus tooling
+// rather than by size: pg_stats_ext_exprs (no pg_type row for 10029,
+// pg_statistic's composite rowtype — ceiling #6).
 func nailedSystemViewProbeSet() []struct {
 	view string
 	oid  string
@@ -846,6 +849,12 @@ func nailedSystemViewProbeSet() []struct {
 		{"pg_catalog.pg_available_extension_versions", "12085"},
 		{"pg_catalog.pg_prepared_xacts", "12090"},
 		{"pg_catalog.pg_prepared_statements", "12095"},
+		// M0131-S9.3f: adopted once pg_seclabel (3596) and
+		// pg_largeobject_metadata (2995) became on-disk nailed heaps. It is
+		// also the corpus's largest ev_action by 3× (203378 B raw, 35379 B
+		// stored over 18 TOAST chunks), so evaluating it here exercises the
+		// S20.2 out-of-line path further than any other member.
+		{"pg_catalog.pg_seclabels", "12099"},
 		{"pg_catalog.pg_settings", "12104"},
 		{"pg_catalog.pg_file_settings", "12110"},
 		{"pg_catalog.pg_hba_file_rules", "12114"},
@@ -991,42 +1000,50 @@ func assertNailedSystemViewsAreEvaluable(t *testing.T, pg *pgcluster.Cluster, go
 // (internal/catalog/catalog.go:335-342, skipped at :7025-7034). Passing both
 // halves is what makes the corpus list, and not something ambient, the cause.
 //
-// pg_policies is the probe, and it is the THIRD view to hold this role. The
-// discipline is fail-when-fixed: each predecessor was chosen because it was
-// blocked for a MEASURED reason, and each was retired by the slice that
-// unblocked it. M0131-S9.2a adopted pg_tables (the original probe); M0131-S20.2b
-// adopted pg_indexes, whose blocker was the 8000 B inline-heap-tuple budget
-// (9002 B stored — design 0131-0009's TOAST ceiling #1), once
-// DECLARE_TOAST(pg_rewrite, 2838, 2839) plus the S20.2a chunk writer made an
-// out-of-line ev_action storable.
+// information_schema.tables is the probe, and it is the FIFTH relation to hold
+// this role. The discipline is fail-when-fixed: each predecessor was chosen
+// because it was blocked for a MEASURED reason, and each was retired by the
+// slice that unblocked it. M0131-S9.2a adopted pg_tables (the original probe);
+// M0131-S20.2b adopted pg_indexes, whose blocker was the 8000 B
+// inline-heap-tuple budget (9002 B stored — design 0131-0009's TOAST ceiling
+// #1), once DECLARE_TOAST(pg_rewrite, 2838, 2839) plus the S20.2a chunk writer
+// made an out-of-line ev_action storable; M0131-S9.3e adopted pg_policies by
+// bootstrapping pg_policy (3256); M0131-S9.3f adopted pg_seclabels by
+// bootstrapping pg_seclabel (3596) and pg_largeobject_metadata (2995).
 //
-// pg_policies' blocker is one layer down and has nothing to do with size (its
-// ev_action is 5439 B, comfortably inline): a hosted PG fails it with "could
-// not open relation with OID 3256" because pg_policy is not an on-disk relation
-// in a goopg cluster at all — ceiling #4. When THAT lands this assertion FAILS;
-// invert it then by moving pg_policies into nailedSystemViewProbeSet() and
-// re-pointing this helper at the next un-adopted view (pg_seclabels 12099,
-// blocked by the same class of gap over pg_seclabel 3596 /
-// pg_largeobject_metadata 2995, is the remaining candidate).
+// S9.3f is where the pg_catalog supply of probes runs out. The corpus is 79 of
+// upstream's 80 and the ONE remaining view, pg_stats_ext_exprs (12063,
+// ceiling #6 — no pg_type row for 10029), is unusable HERE for a reason that
+// has nothing to do with whether it is absent: its failure trips
+// Assert("OidIsValid(typentry->typrelid)") (typcache.c:3082) and takes the
+// backend down with it, and an "is it still absent?" guard must fail QUIETLY.
+//
+// So the probe crosses into the next slice's territory instead (F27). S9.4's
+// subject, `information_schema`, is absent one level lower than any predecessor
+// — not a view goopg failed to seed but a NAMESPACE goopg never bootstraps at
+// all (internal/initdb/initdb.go seeds exactly three: pg_catalog, public,
+// pg_toast). That makes information_schema.tables both a valid non-corpus
+// relation today and the natural fail-when-fixed tripwire for S9.4: the day
+// goopg seeds the information_schema namespace and its 65 views, this
+// assertion fails and whoever lands that slice must retire it.
 func assertNonCorpusSystemViewIsStillAbsent(t *testing.T, pg *pgcluster.Cluster) {
 	t.Helper()
-	// M0131-S9.3e re-pointed this from pg_policies (adopted by that slice,
-	// which bootstrapped pg_policy 3256) to pg_seclabels — one of the two
-	// upstream pg_catalog views still outside the corpus. Its blockers are
-	// pg_seclabel (3596) and pg_largeobject_metadata (2995), neither an
-	// on-disk relation; pg_stats_ext_exprs, the other, is deliberately NOT
-	// used here because its failure mode trips an Assert in typcache.c and
-	// takes the backend (and the rest of this run) down with it.
-	const view = "pg_catalog.pg_seclabels"
+	// M0131-S9.3f re-pointed this from pg_seclabels (adopted by that slice,
+	// which bootstrapped pg_seclabel 3596 and pg_largeobject_metadata 2995)
+	// to information_schema.tables. pg_stats_ext_exprs, the last un-adopted
+	// pg_catalog view, is deliberately NOT used: its failure mode trips an
+	// Assert in typcache.c and takes the backend — and the rest of this run —
+	// down with it.
+	const view = "information_schema.tables"
 	out, err := pgQueryScalarAllowError(pg, "SELECT * FROM "+view+" LIMIT 0")
 	if err == nil {
 		t.Errorf("hosted PG evaluated %s, which is NOT in the on-disk corpus "+
-			"(nailedSystemViewProbeSet) — either pg_seclabel (3596) and "+
-			"pg_largeobject_metadata (2995) are now on-disk relations and "+
-			"pg_seclabels was pinned (then add it to the corpus and re-point "+
-			"this probe at the next un-adopted view), or the "+
-			"evaluability probe above is passing for a "+
-			"reason unrelated to goopg's seeding. Output: %q", view, strings.TrimSpace(out))
+			"(nailedSystemViewProbeSet) — either goopg's initdb now bootstraps "+
+			"the information_schema namespace and its views (M0131-S9.4; then "+
+			"add them to the corpus and re-point this probe at the next "+
+			"un-adopted relation), or the evaluability probe above is passing "+
+			"for a reason unrelated to goopg's seeding. Output: %q",
+			view, strings.TrimSpace(out))
 		return
 	}
 	// 42P01 specifically: "does not exist" is the virtual-relation gap. Any
@@ -1075,11 +1092,11 @@ func assertNonCorpusSystemViewIsStillAbsent(t *testing.T, pg *pgcluster.Cluster)
 //     leave (the writer was inert until this slice's captures landed).
 //
 // The chunk count is asserted against upstream's own, not merely against
-// non-zero: 44 chunks over the six captured out-of-line values (pg_indexes 5,
-// pg_stats 5, pg_statio_all_tables 6, pg_stats_ext_exprs 6, pg_stats_ext 7,
-// pg_seclabels 18 — the last only while pg_seclabels is captured). A drift
-// here means the chunker's split changed, which changes bytes a foreign engine
-// reads.
+// non-zero: 40 chunks over the five externalised values goopg's initdb writes
+// (pg_indexes 5, pg_stats 5, pg_stats_ext 6, pg_statio_all_tables 6, and
+// M0131-S9.3f's pg_seclabels 18 — the corpus's largest value by 3×, and on its
+// own nearly half the TOAST heap). A drift here means the chunker's split
+// changed, which changes bytes a foreign engine reads.
 func assertHostedPGSeesPgRewriteToastRelation(t *testing.T, pg *pgcluster.Cluster) {
 	t.Helper()
 	if got := pgQueryColumn(t, pg, "SELECT reltoastrelid FROM pg_class WHERE oid = 2618"); len(got) != 1 || got[0] != "2838" {
@@ -1111,6 +1128,7 @@ func assertHostedPGSeesPgRewriteToastRelation(t *testing.T, pg *pgcluster.Cluste
 		"12047/5/8674",   // pg_indexes           (upstream: 5 chunks / 9002 B)
 		"12057/5/8985",   // pg_stats             (upstream: 5 / 9316)
 		"12062/6/11743",  // pg_stats_ext         (upstream: 7 / 12196)
+		"12103/18/34093", // pg_seclabels         (upstream: 18 / 35379) — M0131-S9.3f
 		"12178/6/10125",  // pg_statio_all_tables (upstream: 6 / 10475)
 	}
 	gotChunks := pgQueryColumn(t, pg,

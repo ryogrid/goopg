@@ -173,9 +173,11 @@ func TestPgRewriteToastPairIndexRowAndFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Both per-database copies hold the same seeded corpus, so the page counts
-	// are identical: 2838 carries the 22 chunk tuples of the four out-of-line
+	// are identical: 2838 carries the 40 chunk tuples of the five out-of-line
 	// ev_action captures, 2839 the btree over them (metapage + root).
-	wantPages := map[string]int{"2838": 6, "2839": 2}
+	// M0131-S9.3f's pg_seclabels contributes 18 of those 40 chunks on its own,
+	// which is what takes 2838 from 6 pages to 10.
+	wantPages := map[string]int{"2838": 10, "2839": 2}
 	for _, db := range []string{"1", "5"} {
 		for _, oid := range []string{"2838", "2839"} {
 			path := filepath.Join(dir, "base", db, oid)
@@ -190,7 +192,7 @@ func TestPgRewriteToastPairIndexRowAndFiles(t *testing.T) {
 			}
 			if got := len(data) / storage.BlockSize; got != wantPages[oid] {
 				t.Errorf("base/%s/%s: %d pages, want %d — the seeded chunk set "+
-					"changed (M0131-S20.2b captured four out-of-line ev_actions)",
+					"changed (M0131-S20.2b captured four out-of-line ev_actions, S9.3f a fifth)",
 					db, oid, got, wantPages[oid])
 			}
 			for blk := 0; blk < len(data); blk += storage.BlockSize {

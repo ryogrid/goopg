@@ -1131,6 +1131,111 @@ plus two deliberate fail-when-broken runs (nailed rel removed → the original
 `base/1/3256`), whole `^TestE2E_` family PASS (99 s), `go build ./...` + `go
 vet` clean, UNITS PASS, pgbench smoke via the commit hook.
 
+## Implementation status — S9.3f (2026-08-12)
+
+**The corpus is 79 of upstream's 80, and getting the last-but-one view cost a
+catalog-DESCRIPTION repair nobody had asked for.** `pg_seclabels` (12099) is
+the largest and most connected blob the corpus has ever hosted: a 13-branch
+`UNION ALL` over `pg_seclabel` and `pg_shseclabel`, joining pg_class,
+pg_attribute, pg_proc, pg_type, pg_largeobject_metadata, pg_language,
+pg_namespace, pg_event_trigger, pg_publication, pg_subscription, pg_database,
+pg_tablespace and pg_authid — 203378 B raw, 34093 B stored over 18 TOAST
+chunks (upstream: 35379 B / 18).
+
+Landed, in the order the hosted PG demanded it:
+
+1. **The two missing base catalogs** (S9.3e's construction, twice).
+   `pgSecLabelAttrs()` + `{3596, "pg_seclabel", 83, 'r', 5, …}` and
+   `pgLargeObjectMetadataAttrs()` + `{2995, "pg_largeobject_metadata", 83,
+   'r', 3, …}` in `nailedLocalRels`, with `2995` joining
+   `mappedLocalCatalogPlaceholderOIDs()` (3596 was already there, laying down
+   a file no pg_class row named). Both heaps stay EMPTY, which is what
+   upstream's own bootstrap leaves for a cluster that has never labelled
+   anything and owns no large objects. Both were proven load-bearing by
+   scripted revert: dropping either row reproduces `could not open relation
+   with OID 3596` / `… 2995` verbatim.
+   `pg_largeobject` (2613) is deliberately NOT added: the view's reference is
+   `l.classoid = 'pg_catalog.pg_largeobject'::regclass`, which upstream's
+   CREATE VIEW folded to a Const inside the captured ev_action, so nothing
+   resolves that name at run time.
+2. **pg_type 14 → 32 columns** (F27, below) and **pg_language 7 → 9**
+   (F28) — the descriptors, and for pg_language the heap row too.
+3. `{"pg_seclabels", 12099, 12102, 12101, 8}` pinned, the whole 79-view list
+   re-captured with `scripts/capture-ev-action.sh`, `nailed_view_seed_data.go`
+   regenerated. **Every other `.dat` blob came back byte-identical** — the
+   second free re-run of S8b.2's `--verify` over the whole corpus.
+
+### Findings — S9.3f
+
+**F27 — a join RTE resolves EVERY column, and that is what audits a catalog's
+description.** A hosted PG failed `SELECT * FROM pg_seclabels` with `cache
+lookup failed for attribute 15 of relation 1247`. The view selects four
+pg_type columns (oid, typname, typnamespace, typtype — attnums 1/2/3/7, and
+the blob's own `selectedCols` bitmap says exactly that), but `expandRTE` on
+the join RTE walks every joinaliasvar and calls
+`get_rte_attribute_is_dropped` → `SearchSysCache2(ATTNUM)`
+(`parse_relation.c:3414`) for each. Attribute 15 of pg_type is `typarray`.
+
+goopg's on-disk pg_type described **14** columns where PG18 has 32 — and it
+was not merely short. Past attnum 12 the numbering DIVERGED: goopg declared
+`typelem` at 13 and `typarray` at 14, where PG18 has `typsubscript`, `typelem`,
+`typarray` at 13/14/15. The pg_type HEAP has carried all 32 values in
+upstream's order since M0106 (`pgTypeColDefs`/`pgTypeRow`, and
+`internal/catalog/codec.go:730` and `internal/executor/pg18_user_catalog_rows.go`
+both mirror the 32-column shape) — so what was wrong was only the
+pg_attribute/pg_class DESCRIPTION of those bytes. Every consumer that reached
+the heap through the codec was right; the nailed descriptor was the odd one
+out. `pgTypeAttrs()` now carries upstream's 32 with upstream's attnums and the
+nailed rel says `relnatts = 32`.
+
+This is the general lesson, not a pg_type anecdote: **a view that joins a
+catalog audits that catalog's whole description, not the columns it reads.**
+Every earlier corpus member selected columns; none joined a catalog whose
+description was incomplete.
+
+**F28 — pg_language was genuinely short, and the fix had to move the heap
+too.** The next error was `cache lookup failed for attribute 8 of relation
+2612`. Unlike pg_type this was a self-consistent truncation — descriptor AND
+heap stopped at `laninline` (7 columns) — so completing it meant writing the
+two missing columns as well: `lanvalidator` with its real BKI values
+(`fmgr_{internal,c,sql}_validator` = 2246/2247/2248, `pg_language.dat`) and the
+CATALOG_VARLEN `lanacl`, NULL in every bootstrap row exactly as upstream. Both
+halves moved in one commit (`pg_language_bootstrap.go` +
+`pgLanguageAttrs()`/relnatts 9), because a descriptor that promises columns the
+heap does not hold is the strictly worse failure.
+
+The other eleven catalogs `pg_seclabels` joins were checked against a freshly
+initdb'd PG 18.3's own `pg_class.relnatts` and all agreed (pg_class 34,
+pg_attribute 25, pg_proc 30, pg_authid 12, pg_database 18, pg_tablespace 5,
+pg_subscription 18, pg_publication 10, pg_event_trigger 7, pg_shseclabel 4).
+`pg_namespace` is the one remaining disagreement — goopg describes 5 columns
+where PG18 has 4 — and it did not block this view; ledgered.
+
+**F29 — the absence probe leaves pg_catalog.** `assertNonCorpusSystemViewIsStillAbsent`
+has been re-pointed four times, each time by the slice that adopted its
+subject. S9.3f exhausts the supply: the ONE remaining un-adopted view,
+`pg_stats_ext_exprs`, cannot hold the role because its failure trips
+`Assert("OidIsValid(typentry->typrelid)")` (`typcache.c:3082`) and takes the
+backend down, and an absence guard must fail QUIETLY. The probe therefore moves
+to `information_schema.tables` — absent one level LOWER than any predecessor,
+since goopg bootstraps exactly three namespaces and `information_schema` is not
+among them. It is a valid non-corpus relation today and becomes S9.4's own
+fail-when-fixed tripwire tomorrow.
+
+**Ceilings after S9.3f: one, unchanged — #6.** `pg_stats_ext_exprs` (12063)
+needs a real `pg_type` row for **10029**, `pg_statistic`'s composite rowtype.
+Every other pg_catalog view in upstream's 80 is on disk and evaluable by a
+hosted PG. Then S9.4 (`information_schema`, 65 views, expected to defer).
+
+Gates: `internal/initdb` PASS (214 s), `TestE2E_PGColdStartOnGoopgDataDir` PASS
+plus two deliberate fail-when-broken runs (each nailed rel removed in turn →
+`could not open relation with OID 3596` / `2995`), whole `^TestE2E_` family
+PASS (102 s), UNITS PASS, `go build ./...` + `go vet` clean, pgbench smoke via
+the commit hook. Three expectation guards moved with the change and are part of
+the acceptance, not collateral: pg_type's column count (14 → 32,
+`initdb_test.go`), `base/{1,5}/2838`'s page count (6 → 10) and the toasted-rule
+set (four → five, +12102).
+
 ## References
 
 - M0131 implementation plan §S9, `docs/design/0131-bidirectional-cluster-dir-coldstart-and-system-views.md`

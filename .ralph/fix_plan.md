@@ -4377,7 +4377,52 @@ Theme C — Real PG hosted on goopg evaluates views (closes "goopg cannot host a
       `TestE2E_PGColdStartOnGoopgDataDir` PASS (-count=1), UNITS PASS,
       `go build ./...` + `go vet` clean, pgbench smoke via the hook. Design
       `0131-0009` §S9.3e + F25/F26.
-      **Remaining after S9.3e: TWO views, one ceiling.** `pg_seclabels` (12099)
+      **S9.3f LANDED 2026-08-12 — the last instance of ceiling #4 CLOSED,
+      corpus 78 → 79 of 80.** `pg_seclabels` (12099) is on disk and evaluable
+      on a hosted PG. `pg_seclabel` (3596) and `pg_largeobject_metadata` (2995)
+      are now EMPTY on-disk nailed catalogs (`pgSecLabelAttrs()` 5 cols —
+      NO `oid` system column, attnum 1 is objoid — and
+      `pgLargeObjectMetadataAttrs()` 3 cols, both re-verified against a fresh
+      PG 18.3's own pg_attribute; 2995 added to
+      `mappedLocalCatalogPlaceholderOIDs`, 3596 was already there laying down a
+      file no pg_class row named). Each proven load-bearing by scripted revert
+      (`could not open relation with OID 3596` / `… 2995` verbatim).
+      `pg_largeobject` (2613) deliberately NOT added — the view's reference is
+      a `::regclass` Const folded at upstream's CREATE VIEW time.
+      **The slice's real content was two catalog-DESCRIPTION repairs the view
+      forced (F27/F28).** A join RTE makes PG resolve EVERY column of its
+      inputs via `expandRTE` → `get_rte_attribute_is_dropped` →
+      `SearchSysCache2(ATTNUM)` (`parse_relation.c:3414`), not just the
+      selected ones — so `pg_seclabels` audited all thirteen catalogs it joins.
+      **pg_type was 14 columns and MIS-NUMBERED past attnum 12** (typelem at
+      13, typarray at 14, where PG18 has typsubscript/typelem/typarray at
+      13/14/15) while `pgTypeRow` had been writing all 32 values in upstream's
+      order since M0106 — descriptor now 32, matching the tuples, the codec
+      (`internal/catalog/codec.go:730`) and the executor. **pg_language was
+      genuinely short at 7 of 9**, so `lanvalidator` (2246/2247/2248 from
+      `pg_language.dat`) and `lanacl` (NULL) were added to the HEAP and the
+      descriptor in the same commit. `information_schema.tables` is the new
+      absence probe (F29): `pg_stats_ext_exprs` cannot hold the role because
+      its failure trips `Assert("OidIsValid(typentry->typrelid)")` and kills
+      the backend, so the probe crosses into S9.4's territory and becomes that
+      slice's own fail-when-fixed tripwire. Three expectation guards moved with
+      the change and are part of the acceptance: pg_type's column count
+      (`initdb_test.go`, 14 → 32), `base/{1,5}/2838` (6 → 10 pages) and the
+      toasted-rule set (four → five, +12102 at 18 chunks / 34093 B — more than
+      the other four together). 2 ledger rows (companions 3597/3598/3599/2996
+      unbootstrapped, inert while the heaps are empty; and the descriptor audit
+      being VIEW-DRIVEN not exhaustive — `pg_namespace` describes 5 where PG18
+      has 4, and any catalog no corpus view joins may still be wrong). Gates:
+      `internal/initdb` PASS (214 s), `^TestE2E_` family PASS (102 s),
+      `TestE2E_PGColdStartOnGoopgDataDir` PASS + 2 break directions, UNITS
+      PASS, `go build ./...` + `go vet` clean, pgbench smoke via the hook.
+      Design `0131-0009` §S9.3f + F27/F28/F29.
+      **Remaining after S9.3f: ONE view, ONE ceiling — #6.**
+      `pg_stats_ext_exprs` (12063) wants a real pg_type row for 10029
+      (pg_statistic's composite rowtype). Then S9.4 (`information_schema`,
+      65 views, expected to defer); its first step is the complement query
+      S9.3d used (F19).
+      **Superseded — remaining after S9.3e: TWO views, one ceiling.** `pg_seclabels` (12099)
       wants pg_seclabel (3596) + pg_largeobject_metadata (2995) — mechanically
       THIS slice twice over, and its 35379 B value already toasts cleanly; and
       `pg_stats_ext_exprs` (12063), ceiling #6, wants a real pg_type row for
