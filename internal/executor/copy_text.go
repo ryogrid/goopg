@@ -400,7 +400,7 @@ func copyTextToDatum(t catalog.Type, raw []byte) (Datum, error) {
 		}
 		return NewTimeDatum(ts), nil
 	case "timetz":
-		ts, offsetSecs, err := parseTimeTZString(string(raw))
+		ts, offsetSecs, err := parseTimeTZString(string(raw), "")
 		if err != nil {
 			return Datum{}, err
 		}
@@ -606,16 +606,27 @@ func parseTZOffset(s string) (int, bool) {
 //   - "HH:MM:SS.ffffff +HH" / "-HH" / "+HH:MM" explicit offset
 //   - "HH:MM PDT" / "PST" / etc. timezone abbreviations
 //   - "YYYY-MM-DD HH:MM:SS America/New_York" full timestamp with named TZ
-//   - "HH:MM:SS" bare time (offset defaults to +00)
+//   - "HH:MM:SS" bare time (offset defaults to the SESSION zone — see below)
 //
 // Inputs with named timezone in bare time strings (no date) are rejected.
-func parseTimeTZString(s string) (time.Time, int, error) {
+//
+// `zone` is the session TimeZone GUC ("" = the boot default, UTC). M0119-0006:
+// an input with no zone field of its own does not take +00, it takes the
+// session zone's offset — for the date the input itself carries, or for today's
+// date when it carries none (DecodeTimeOnly's `!(fmask & DTK_M(TZ))` arm,
+// datetime.c). Callers that are deciding a TYPE rather than reading a declared
+// timetz pass "" deliberately; see parseTimeTZString's call sites.
+func parseTimeTZString(s string, zone string) (time.Time, int, error) {
 	orig := s
 	// M0125-0007: as in parseTimeString — the date-prefix probe below is a
 	// fixed-offset test (s[4], s[7], s[:10]) that assumes zero-padded fields.
 	s = pgdatetime.NormalizeInput(s)
 
 	offsetSecs := 0
+	// haveOff distinguishes "the input carried a zone field that resolved to +00"
+	// from "the input carried no zone field at all" — only the latter falls back
+	// to the session zone. Before this slice both were spelled `offsetSecs == 0`.
+	haveOff := false
 
 	// Full timestamp with date prefix: "YYYY-MM-DD HH:MM:SS[±HH[:MM]] [TZ]"
 	if len(s) >= 10 && s[4] == '-' && s[7] == '-' {
@@ -652,22 +663,22 @@ func parseTimeTZString(s string) (time.Time, int, error) {
 				}
 				// Named zone but couldn't load → strip to just time, offset = 0
 			} else if off, ok := parseTZOffset(tzStr); ok {
-				offsetSecs = off
+				offsetSecs, haveOff = off, true
 			} else if off, ok := tzAbbrevOffsets[strings.ToUpper(tzStr)]; ok {
-				offsetSecs = off
+				offsetSecs, haveOff = off, true
 			}
 		}
 		// timeStr may have an inline numeric offset like "13:30:25.575401-04" or "13:30:25+05:30"
 		// Extract it before passing to parseTimeString.
-		if offsetSecs == 0 {
+		if !haveOff {
 			if plus := strings.LastIndex(timeStr, "+"); plus > 2 {
 				if off, ok := parseTZOffset(timeStr[plus:]); ok {
-					offsetSecs = off
+					offsetSecs, haveOff = off, true
 					timeStr = timeStr[:plus]
 				}
 			} else if minus := strings.LastIndex(timeStr, "-"); minus > 2 {
 				if off, ok := parseTZOffset(timeStr[minus:]); ok {
-					offsetSecs = off
+					offsetSecs, haveOff = off, true
 					timeStr = timeStr[:minus]
 				}
 			}
@@ -676,6 +687,17 @@ func parseTimeTZString(s string) (time.Time, int, error) {
 		t, err := parseTimeString(timeStr)
 		if err != nil {
 			return time.Time{}, 0, wrapTimeTZError(err, orig)
+		}
+		// No zone field: DecodeTimeOnly resolves the session zone AT THE DATE THE
+		// INPUT CARRIES, not at today's — `'2020-01-05 10:00'::timetz` is
+		// 10:00:00-05 on America/New_York while `'2020-07-05 10:00'::timetz` is
+		// 10:00:00-04. M0119-0006.
+		if !haveOff && zone != "" {
+			if d, e := time.Parse("2006-01-02", dateStr); e == nil {
+				offsetSecs = config.ZoneOffsetForLocalTime(zone,
+					time.Date(d.Year(), d.Month(), d.Day(),
+						t.Hour(), t.Minute(), t.Second(), 0, time.UTC))
+			}
 		}
 		return t, offsetSecs, nil
 	}
@@ -698,13 +720,13 @@ func parseTimeTZString(s string) (time.Time, int, error) {
 		s = strings.TrimSpace(s[:len(s)-3])
 	}
 
-	rest, off, haveOff, err := stripValidatedZoneSuffix(s, false, "time with time zone", orig)
+	rest, off, zoneSeen, err := stripValidatedZoneSuffix(s, false, "time with time zone", orig)
 	if err != nil {
 		return time.Time{}, 0, err
 	}
 	s = rest
-	if haveOff {
-		offsetSecs = off
+	if zoneSeen {
+		offsetSecs, haveOff = off, true
 	}
 
 	// Now parse the bare time portion with its meridiem re-attached.
@@ -713,6 +735,11 @@ func parseTimeTZString(s string) (time.Time, int, error) {
 	t, err := parseTimeString(s)
 	if err != nil {
 		return time.Time{}, 0, wrapTimeTZError(err, orig)
+	}
+	// No zone field and no date: GetCurrentDateTime supplies today's date and the
+	// session zone supplies the offset for it. M0119-0006.
+	if !haveOff && zone != "" {
+		offsetSecs = config.TimeTZSessionOffset(zone, t.Hour(), t.Minute(), t.Second())
 	}
 	return t, offsetSecs, nil
 }

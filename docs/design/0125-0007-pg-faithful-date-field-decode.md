@@ -1249,3 +1249,91 @@ Gates: `go test ./internal/executor/ ./internal/pgdatetime/ ./internal/config/
   GUC-selected file.** `timezone_abbreviations` is not implemented, so an
   abbreviation PG's `Default` file carries and goopg's map does not (e.g. `WITA`,
   `CHAST`) is 22007 here and accepted there.
+
+## 18. The zone a zone-less `timetz` inherits from the session (M0119-0006, 47th slice)
+
+§17 fixed how goopg reads a `timetz`'s trailing zone field. This slice fixes
+what happens when there is **no** zone field at all.
+
+`timetz_in` does not default to `+00`. `DecodeTimeOnly`
+(`postgres/src/backend/utils/adt/datetime.c`) ends with:
+
+```c
+/* timezone not specified? then use session timezone */
+if (tzp != NULL && !(fmask & DTK_M(TZ)))
+{
+    if ((fmask & DTK_DATE_M) == 0)
+        GetCurrentDateTime(tmp);        /* no date in the input → today */
+    else { tmp->tm_year = tm->tm_year; ... }   /* the input's own date */
+    tmp->tm_hour = tm->tm_hour; ...
+    *tzp = DetermineTimeZoneOffset(tmp, session_timezone);
+}
+```
+
+Two consequences goopg did not have:
+
+1. The offset is the **session** `TimeZone`'s, so `'10:00'::timetz` is
+   `10:00:00+09` on Asia/Tokyo and `10:00:00-04` on America/New_York.
+2. It is resolved **at a date**, so it is DST-sensitive: from one
+   America/New_York session, `'2020-01-05 10:00'::timetz` is `-05` and
+   `'2020-07-05 10:00'::timetz` is `-04`.
+
+### 18.1 What landed
+
+- `config.ZoneOffsetForLocalTime(zone, wall)` — the `DetermineTimeZoneOffset`
+  port (Go's `time.Date(..., loc).Zone()`, the same resolution
+  `TimestampToTimestampTZ` already relies on).
+- `config.TimeTZSessionOffset(zone, h, m, s)` — the `GetCurrentDateTime` arm:
+  today's date in the session zone, at the literal's own time of day.
+- `parseTimeTZString` grew a `zone` parameter. Its "no zone field" sentinel was
+  `offsetSecs == 0`, which cannot tell `'10:00 UTC'` from `'10:00'`; it is now
+  an explicit `haveOff` flag, and both the dated and the bare arm consult the
+  session zone only when `haveOff` is false.
+- `evalTypedStringLit` gained a `*Context` so `timetz '10:00'` /
+  `'10:00'::timetz` can reach the GUC. It deliberately does **not** cache that
+  arm's result: `TypedStringLit.CachedTime` is keyed on the planner node, so a
+  cached offset would leak one session's `TimeZone` into another session
+  reusing the plan.
+- `coerceRowForConstraintChecks` (operators_storage.go) gained a `timetz` case.
+  This is the sibling path, and without it the whole fix is invisible to
+  INSERT/UPDATE: a bare `'10:00'` stays a `KindString` all the way to
+  `encodeValuePG`, which has no `*Context` and so stored `+00` regardless of
+  session. `timetz` is the first entry in that switch whose *input function*
+  (not merely its output) depends on a GUC.
+
+### 18.2 Call sites that keep the pre-slice behaviour, on purpose
+
+- `expr.go`'s cross-kind comparison probe passes `""`. That arm decides which
+  *type* an untyped string denotes, and decides it by `offsetSecs != 0` — i.e.
+  by whether a zone was written. Feeding it the session default would make every
+  bare `'10:00'` non-zero on a non-UTC session and mistype it as `timetz`.
+- `encodeValuePG`, `coerceScalarKeyStringDatum`, the COPY TEXT reader and
+  `pg_input_error_info` pass `""` because they have no `*Context`. For the first
+  three that is now unreachable for ordinary DML (the value arrives already
+  typed); for COPY FROM it is a real remaining gap — ledger row below.
+
+### 18.3 Verification
+
+`internal/executor/timetz_session_zone_test.go`: the dated cases are pinned to
+exact offsets (they are stable in time, and the Jan/Jul New York pair is exactly
+the property a fixed fallback cannot have); the bare case recomputes today's
+offset the way upstream does rather than hard-coding one that rots at the next
+transition; one test pins the explicit-`+00` inputs so the replaced sentinel
+cannot come back; one drives `coerceRowForConstraintChecks` directly.
+
+End-to-end on a throwaway capped server (port 5533), a SET/CREATE/INSERT/UPDATE/
+SELECT script under `TimeZone='Asia/Tokyo'` is byte-identical to PG 18.3 on
+65432 — including the sort order, since `timetz` orders by UTC time and the
+three rows interleave.
+
+### 18.4 Deferred (ledger row 2026-08-13)
+
+- **COPY FROM still stores `+00` for a zone-less `timetz` field.**
+  `DecodeCopyTextRow` / `datumsFromCopyFields` / `copyTextToDatum` take no
+  `*Context`, so the session `TimeZone` cannot reach the input function on that
+  path. Resume point: thread the zone (as `copyExec` already does for the
+  *output* direction, copy.go) through those three signatures and their tests.
+- **`bare timetz` under a POSIX-spelled GUC.** `SET TimeZone='+05:30'` resolves
+  through `config.sessionLocation`, which falls back to UTC for spellings Go's
+  `LoadLocation` rejects — the pre-existing limitation recorded for
+  `timestamptz_out`, now inherited here.

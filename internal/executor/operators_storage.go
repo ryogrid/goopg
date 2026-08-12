@@ -2320,6 +2320,13 @@ func coerceRowForConstraintChecks(cols []catalog.Column, row Row, include func(i
 			coerced, cerr = evalCast(row[i], "timestamp", pos, ctx)
 		case "timestamptz":
 			coerced, cerr = evalCast(row[i], "timestamptz", pos, ctx)
+		case "timetz", "time with time zone":
+			// M0119-0006: timetz joins the list because its input function is the
+			// only one here whose answer depends on a GUC that only `ctx` carries
+			// — a zone-less literal takes the SESSION TimeZone's offset. Left as a
+			// KindString the value would reach encodeValuePG, which has no ctx and
+			// so silently stored `10:00:00+00` for every session.
+			coerced, cerr = evalCast(row[i], "timetz", pos, ctx)
 		case "numeric", "decimal":
 			coerced, cerr = evalCast(row[i], "numeric", pos, ctx)
 		default:

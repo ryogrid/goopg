@@ -49,6 +49,45 @@ func sessionLocation(zone string) *time.Location {
 	return loc
 }
 
+// ZoneOffsetForLocalTime ports DetermineTimeZoneOffset (backend/utils/adt/
+// datetime.c): given a LOCAL wall clock and a zone, it answers the zone's UTC
+// offset at that local moment — the quantity upstream stores in a timetz's
+// `zone` field (there as seconds WEST; the sign is flipped at the call site).
+// `wall` is read for its calendar fields only, so callers may pass a UTC-
+// anchored Time carrying local field values (goopg's zone-less convention).
+//
+// Go's time.Date performs the same local→absolute resolution upstream's
+// DetermineTimeZoneOffset does, including the DST-ambiguity preference for the
+// earlier of two candidate offsets; the spring-forward "nonexistent local time"
+// case is not asserted to match, exactly as for TimestampToTimestampTZ above.
+// M0119-0006.
+func ZoneOffsetForLocalTime(zone string, wall time.Time) int {
+	l := time.Date(wall.Year(), wall.Month(), wall.Day(), wall.Hour(), wall.Minute(),
+		wall.Second(), 0, sessionLocation(zone))
+	_, off := l.Zone()
+	return off
+}
+
+// TimeTZSessionOffset ports the "timezone not specified? then use session
+// timezone" arm of DecodeTimeOnly (datetime.c, the `!(fmask & DTK_M(TZ))`
+// block): a TIMETZ literal that carries no zone field does NOT take +00 — it
+// takes the session zone's offset for TODAY's date at the literal's own time of
+// day. Upstream builds that struct pg_tm from GetCurrentDateTime() plus the
+// parsed tm_hour/tm_min/tm_sec and hands it to DetermineTimeZoneOffset, which
+// is why the answer is DST-sensitive: on America/New_York `'10:00'::timetz` is
+// 10:00:00-05 in January and 10:00:00-04 in July.
+//
+// The returned offset is seconds EAST of UTC (goopg's Datum convention).
+// An empty zone — the boot default — yields 0, i.e. the previous behaviour.
+func TimeTZSessionOffset(zone string, hour, min, sec int) int {
+	if zone == "" {
+		return 0
+	}
+	now := time.Now().In(sessionLocation(zone))
+	return ZoneOffsetForLocalTime(zone,
+		time.Date(now.Year(), now.Month(), now.Day(), hour, min, sec, 0, time.UTC))
+}
+
 // TimestampToTimestampTZ ports timestamp2timestamptz (backend/utils/adt/
 // timestamp.c): the plain-`timestamp` wall clock is read AS A LOCAL TIME in the
 // session zone, and the instant it denotes is what a timestamptz stores. `t`

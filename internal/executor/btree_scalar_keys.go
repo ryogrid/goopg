@@ -182,7 +182,7 @@ func coerceScalarKeyStringDatum(v Datum, col *catalog.Column, pos int) (Datum, *
 		}
 		return NewBytesDatum(b), nil
 	case isTimeTzType(col.Type.Name):
-		t, offsetSecs, err := parseTimeTZString(s)
+		t, offsetSecs, err := parseTimeTZString(s, "")
 		if err != nil {
 			if ee, ok := err.(*ExecError); ok {
 				return v, ee

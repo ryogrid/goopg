@@ -428,7 +428,7 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		return buf[:], nil
 	case "timetz":
 		if d.Kind == KindString {
-			ts, offsetSecs, err := parseTimeTZString(d.StringValue())
+			ts, offsetSecs, err := parseTimeTZString(d.StringValue(), "")
 			if err != nil {
 				return nil, err
 			}

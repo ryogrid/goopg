@@ -132,7 +132,7 @@ func TestPlainTimestampCastToTextStaysZoneless(t *testing.T) {
 func TestTimestampTZProducersTagTheSubtype(t *testing.T) {
 	// (1) The typed string literal: TIMESTAMPTZ '…' / '…'::timestamptz.
 	lit := &planner.TypedStringLit{Type: "timestamptz", Value: "2020-01-01 10:00:00+05:30"}
-	d, err := evalTypedStringLit(lit)
+	d, err := evalTypedStringLit(lit, nil)
 	if err != nil {
 		t.Fatalf("typed literal: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestTimestampTZProducersTagTheSubtype(t *testing.T) {
 	}
 	// Its plain-timestamp sibling must NOT be tagged.
 	litTS := &planner.TypedStringLit{Type: "timestamp", Value: "2020-01-01 10:00:00+05:30"}
-	dTS, err := evalTypedStringLit(litTS)
+	dTS, err := evalTypedStringLit(litTS, nil)
 	if err != nil {
 		t.Fatalf("typed literal (timestamp): %v", err)
 	}

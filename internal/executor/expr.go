@@ -433,7 +433,7 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 	case *planner.RowExpr:
 		return evalRowExpr(x, slot, ctx)
 	case *planner.TypedStringLit:
-		return evalTypedStringLit(x)
+		return evalTypedStringLit(x, ctx)
 	case *planner.IntervalLit:
 		return evalIntervalLit(x)
 	case *planner.ExtractExpr:
@@ -2402,7 +2402,13 @@ func tryParseStringAs(target DatumKind, s string) Datum {
 		}
 		// Try timetz first ("HH:MM:SS±HH[:MM]") to preserve the offset.
 		// M0097-0004: strings like '05:06:07-07' must compare as timetz, not plain time.
-		if ts, offsetSecs, err := parseTimeTZString(s); err == nil && offsetSecs != 0 {
+		//
+		// The session zone is deliberately NOT passed here: this arm is deciding
+		// which TYPE an untyped string denotes, and it decides by whether a zone
+		// was written. Feeding it the session default would make every bare
+		// "10:00" arrive with a non-zero offset on a non-UTC session and be
+		// mistyped as timetz. M0119-0006.
+		if ts, offsetSecs, err := parseTimeTZString(s, ""); err == nil && offsetSecs != 0 {
 			return NewTimeTZDatum(ts, offsetSecs)
 		}
 		// Try time-of-day first ("HH:MM:SS") then full timestamp.
@@ -2878,7 +2884,12 @@ func evalOr(a, b Datum) Datum {
 // repeated evaluations in a hot loop (e.g. Q5's date filter
 // applied per orders row) skip the `time.Parse` cost. pprof
 // showed `time.parse` at 10.5 % cumulative CPU pre-cache.
-func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
+//
+// M0119-0006: `ctx` reaches only the timetz arm, whose zone-less default is the
+// SESSION TimeZone. That arm never fills CachedTime — it must not, since the
+// cache is keyed on the planner node alone and would freeze one session's zone
+// into a plan another session reuses.
+func evalTypedStringLit(x *planner.TypedStringLit, ctx *Context) (Datum, error) {
 	if x.CacheValid {
 		return NewTimeDatum(x.CachedTime), nil
 	}
@@ -3023,7 +3034,7 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 		}
 		return NewTimeDatum(ts), nil
 	case "timetz":
-		ts, offsetSecs, err := parseTimeTZString(x.Value)
+		ts, offsetSecs, err := parseTimeTZString(x.Value, timeZoneFromCtx(ctx))
 		if err != nil {
 			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid input syntax for type time with time zone: %q", x.Value)}
 		}
@@ -3756,7 +3767,7 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 	case "timetz":
 		// Cast to timetz: parse strings with timezone offset. M0097-0004.
 		if d.Kind == KindString {
-			ts, offsetSecs, err := parseTimeTZString(d.StringValue())
+			ts, offsetSecs, err := parseTimeTZString(d.StringValue(), timeZoneFromCtx(ctx))
 			if err != nil {
 				return Datum{}, err
 			}

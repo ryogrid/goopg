@@ -112,7 +112,7 @@ func TestParseTimeStringValidatesTrailingZoneField(t *testing.T) {
 func TestParseTimeTZStringValidatesTrailingZoneField(t *testing.T) {
 	for _, tc := range timeZoneTokenCases {
 		t.Run(tc.in, func(t *testing.T) {
-			got, off, err := parseTimeTZString(tc.in)
+			got, off, err := parseTimeTZString(tc.in, "")
 			if tc.wantCode == "" {
 				if err != nil {
 					t.Fatalf("parseTimeTZString(%q) = error %v, want %s (%s)", tc.in, err, tc.wantTime, tc.why)
@@ -164,7 +164,7 @@ func TestParseTimeTZStringZoneOffsets(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.in, func(t *testing.T) {
-			_, off, err := parseTimeTZString(tc.in)
+			_, off, err := parseTimeTZString(tc.in, "")
 			if err != nil {
 				t.Fatalf("parseTimeTZString(%q) = error %v", tc.in, err)
 			}
