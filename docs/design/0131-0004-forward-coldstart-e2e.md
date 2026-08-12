@@ -233,6 +233,52 @@ instead, which is worse. Lock-in:
 postmaster down; the row-content reads use two separate scalars rather than
 `label || '/' || qty`.
 
+> **F2 RESOLVED 2026-08-12 (M0131-S13).** The hosted PG now answers
+> `SELECT 'a'::text || 1` = `a1`, and
+> `SELECT count(*) FROM pg_proc WHERE proconfig IS NOT NULL` = **0**.
+>
+> Root cause, once located, was a **stale sibling**, not a bitmap or `t_hoff`
+> defect as S13.1 hypothesised: goopg has two builders for the 30-column
+> physical `pg_proc` row, and only one was right. The runtime builder
+> `buildPGProcRow` (`internal/executor/sys_pg_proc.go`) already wrote
+> `NullDatum` for every absent nullable varlena, with a comment explaining
+> exactly why ("PG branches on `attisnull` for these"). The initdb seed builder
+> `pgProcRow` (`internal/initdb/initdb.go`) wrote `NewStringDatum("")` for the
+> same columns, which falls through `encodeValuePG` to `emptyArrayTypeBytes` —
+> a **non-NULL zero-dimension `ArrayType`**. `NullBitmapPG` /
+> `writeMultiPageHeapRows` were both already correct and needed no change; they
+> simply had nothing to mark, because no datum was NULL.
+>
+> The fix makes the seed path match the runtime path for the whole trailing
+> nullable group, per S13.2 — `proallargtypes`, `proargmodes`, `proargnames`,
+> `proargdefaults` (when `pronargdefaults = 0`), `protrftypes`, `probin`,
+> `prosqlbody`, `proconfig`, `proacl`. Fixing `proconfig` alone would have left
+> `prosqlbody` as an empty `pg_node_tree` — `stringToNode("")` — one probe away.
+>
+> Guards: `internal/initdb/pg_proc_nullable_varlena_test.go` sweeps all 3397
+> seed entries at the `Row` level **and** re-decodes one physical tuple through
+> `DecodeRowIntoMctxPGTuple`, because the `Row`-level half alone would pass even
+> if the tuple writer dropped the bitmap. Proven fail-when-broken: restoring
+> `NewStringDatum("")` on `proconfig` fails it at `oid=3
+> (heap_tableam_handler)`. The E2E lock-in is INVERTED per S13.4 —
+> `assertHostedPGCanCallSQLBuiltins` asserts the call succeeds *and* the
+> `proconfig IS NOT NULL` count is zero, and the row-content reads are back to
+> the single `label || '/' || qty` form, which is now itself the tripwire
+> (`text || integer` = `textanycat`, oid 2003, LANGUAGE SQL). The probe is no
+> longer destructive, so it runs inline before guard 4 instead of last.
+>
+> **S13.3 partially discharged, and it found one more site.** `pg_attribute`
+> was already correct (Step 3u had fixed `attacl`/`attoptions`/`attfdwoptions`/
+> `attmissingval`/`attstattarget` for the identical reason — an empty varlena
+> read as "attoptions present", ending in an `ERRORDATA_STACK_SIZE` PANIC).
+> `pg_class` is **not**: `pgClassNailedRow` still writes `relacl = '{}'`,
+> `reloptions = '{}'` and `relpartbound = ''` where upstream's initdb leaves all
+> three NULL. It is latent rather than measured — the E2E connects as a
+> superuser, who bypasses `pg_class_aclcheck` entirely, so a non-null EMPTY
+> `relacl` (which grants nobody anything, not even the owner) cannot be seen
+> from this lane. Deferred with a ledger row rather than fixed blind: it needs a
+> non-superuser hosted-PG probe to state what it actually breaks.
+
 **F3 — `ADD COLUMN … DEFAULT` reads NULL on pre-existing rows (→ M0131-S14).**
 goopg reads `'dflt'`; the hosted PG reads NULL for all 15 rows. **The pg_attrdef
 half is entirely correct** — the hosted PG reads

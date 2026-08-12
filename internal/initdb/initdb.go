@@ -2726,9 +2726,13 @@ func pgProcColDefs() []catalog.Column {
 		{Name: "pronargdefaults", Type: catalog.Type{Name: "int2"}},  // 18
 		{Name: "prorettype", Type: catalog.Type{Name: "oid"}},        // 19
 		{Name: "proargtypes", Type: catalog.Type{Name: "oidvector"}}, // 20
-		// CATALOG_VARLEN section: nullable in PG but we emit empty
-		// binary arrays so the relacl-style "raw bytes as ArrayType*"
-		// dereferences in PG do not trip ARR_ELEMTYPE assertions.
+		// CATALOG_VARLEN section: nullable in PG, and goopg now writes a
+		// genuine NULL whenever the value is absent (M0131-S13). The former
+		// "emit an empty ArrayType shell so PG's raw-bytes dereferences see a
+		// well-formed array" convention was backwards: PG branches on
+		// heap_attisnull for every one of these, and a non-NULL empty shell
+		// makes it take the wrong branch (proconfig ⇒ fmgr_security_definer ⇒
+		// TransformGUCArray's ARR_NDIM assert; prosqlbody ⇒ stringToNode("")).
 		{Name: "proallargtypes", Type: catalog.Type{Name: "oid[]"}},        // 21
 		{Name: "proargmodes", Type: catalog.Type{Name: "char[]"}},          // 22
 		{Name: "proargnames", Type: catalog.Type{Name: "text[]"}},          // 23
@@ -2780,19 +2784,29 @@ func pgProcRow(e pgProcEntry) executor.Row {
 		kind = derivePgProcKind(e.HandlerName)
 	}
 	// Step 3dk: emit OUT-arg metadata as binary ArrayType blobs when
-	// supplied. NewStringDatum("") falls through to encodeValuePG's
-	// emptyArrayTypeBytes path; NewBytesDatum lands a KindBytes datum
-	// that the new codec.go passthrough emits verbatim. Behaviour for
-	// all pre-Step-3dk entries is unchanged because their fields are nil.
-	allArgs := executor.NewStringDatum("")
+	// supplied. NewBytesDatum lands a KindBytes datum that codec.go's
+	// passthrough emits verbatim.
+	//
+	// M0131-S13: an ABSENT nullable varlena is a genuine SQL NULL, never an
+	// empty ArrayType shell. NewStringDatum("") used to fall through to
+	// encodeValuePG's emptyArrayTypeBytes path, producing a NON-NULL
+	// zero-dimension array — which is what made a hosted real PG abort on
+	// every LANGUAGE SQL builtin: fmgr_info_cxt_security
+	// (postgres/src/backend/utils/fmgr/fmgr.c:203-211) routes a call through
+	// fmgr_security_definer as soon as `!heap_attisnull(…,
+	// Anum_pg_proc_proconfig, NULL)`, and TransformGUCArray then asserts
+	// ARR_NDIM(array) == 1 on the empty shell (guc.c:6411). The runtime
+	// sibling buildPGProcRow (internal/executor/sys_pg_proc.go) has always
+	// written NullDatum here; this seed path was the stale twin.
+	allArgs := executor.NullDatum
 	if e.AllArgTypes != nil {
 		allArgs = executor.NewBytesDatum(oidArrayBytes(e.AllArgTypes))
 	}
-	argModes := executor.NewStringDatum("")
+	argModes := executor.NullDatum
 	if e.ArgModes != nil {
 		argModes = executor.NewBytesDatum(charArrayBytes(e.ArgModes))
 	}
-	argNames := executor.NewStringDatum("")
+	argNames := executor.NullDatum
 	if e.ArgNames != nil {
 		argNames = executor.NewBytesDatum(textArrayBytes(e.ArgNames))
 	}
@@ -2801,6 +2815,14 @@ func pgProcRow(e pgProcEntry) executor.Row {
 	// file's effect from a table instead — see pg_proc_seed_defaults.go for why
 	// a real PG standby cannot resolve short call forms without it.
 	nargDefaults, argDefaults := pgProcSeedArgDefaults(e.OID)
+	// M0131-S13: no defaults ⇒ proargdefaults is NULL, not an empty
+	// pg_node_tree. PG reads the column only when pronargdefaults > 0, and an
+	// empty text varlena there would send fetch_function_defaults into
+	// stringToNode("") — the same failure shape prosqlbody has.
+	argDefaultsDatum := executor.NullDatum
+	if argDefaults != "" {
+		argDefaultsDatum = executor.NewStringDatum(argDefaults)
+	}
 	return executor.Row{
 		executor.NewIntDatum(int64(e.OID)), // 1  oid
 		executor.NewStringDatum(e.Name),    // 2  proname
@@ -2830,13 +2852,13 @@ func pgProcRow(e pgProcEntry) executor.Row {
 		allArgs,                                // 21 proallargtypes
 		argModes,                               // 22 proargmodes
 		argNames,                               // 23 proargnames
-		executor.NewStringDatum(argDefaults),   // 24 proargdefaults (pg_node_tree)
-		executor.NewStringDatum(""),            // 25 protrftypes
+		argDefaultsDatum,                       // 24 proargdefaults (pg_node_tree)
+		executor.NullDatum,                     // 25 protrftypes
 		executor.NewStringDatum(e.HandlerName), // 26 prosrc — fmgr internal lookup key
-		executor.NewStringDatum(""),            // 27 probin
-		executor.NewStringDatum(""),            // 28 prosqlbody
-		executor.NewStringDatum(""),            // 29 proconfig
-		executor.NewStringDatum(""),            // 30 proacl
+		executor.NullDatum,                     // 27 probin
+		executor.NullDatum,                     // 28 prosqlbody (NULL ⇒ PG executes prosrc)
+		executor.NullDatum,                     // 29 proconfig (NULL ⇒ no fmgr_security_definer)
+		executor.NullDatum,                     // 30 proacl (NULL ⇒ owner + PUBLIC EXECUTE default)
 	}
 }
 

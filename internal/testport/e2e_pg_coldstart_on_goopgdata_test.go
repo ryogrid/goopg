@@ -281,25 +281,26 @@ func TestE2E_PGColdStartOnGoopgDataDir(t *testing.T) {
 	// id=9 was UPDATEd (9 % 3 == 0), id=7 was not. Reading both keeps the
 	// UPDATE gap visible as a row-content mismatch rather than as a count.
 	//
-	// The two columns are read as two separate scalars rather than as
-	// `label || '/' || qty`. That is NOT cosmetic: `text || integer` resolves
-	// to textanycat (oid 2003), a LANGUAGE SQL function, and calling any
-	// non-builtin crashes the hosted backend — see
-	// assertProconfigGapStillCrashesSQLFunctions, the second finding this test
-	// measured. Builtins go through fmgrtab and never read pg_proc, which is
-	// why every other probe here survives.
-	if got := s4Scalar(t, pg, pgLog, "SELECT label FROM public.s4_items WHERE id = 7"); got != wantLabel7 {
-		t.Fatalf("hosted PG row id=7 label = %q, goopg said %q", got, wantLabel7)
+	// The two columns are read as ONE concatenated scalar, and that form is
+	// the assertion (M0131-S13.4). `text || integer` resolves to textanycat
+	// (oid 2003), a LANGUAGE SQL function — NOT an fmgrtab builtin — so this
+	// probe reaches fmgr_info_cxt_security and reads the row's pg_proc tuple.
+	// Until S13 it aborted the backend with `Assert("ARR_NDIM(array) == 1")`
+	// because every seeded proconfig was a non-NULL empty ArrayType shell, and
+	// this test had to split the read into two builtin-only scalars plus a
+	// separate fail-when-fixed helper. The concatenation IS the regression
+	// tripwire now: a SIGABRT here means the seed path went back to writing
+	// empty varlena shells for the nullable pg_proc attributes.
+	if got := s4Scalar(t, pg, pgLog, "SELECT label || '/' || qty FROM public.s4_items WHERE id = 7"); got != wantLabel7+"/"+wantQty7 {
+		t.Fatalf("hosted PG row id=7 label/qty = %q, goopg said %q", got, wantLabel7+"/"+wantQty7)
 	}
-	if got := s4Scalar(t, pg, pgLog, "SELECT qty FROM public.s4_items WHERE id = 7"); got != wantQty7 {
-		t.Fatalf("hosted PG row id=7 qty = %q, goopg said %q", got, wantQty7)
+	if got := s4Scalar(t, pg, pgLog, "SELECT label || '/' || qty FROM public.s4_items WHERE id = 9"); got != wantLabel9+"/"+wantQty9 {
+		t.Fatalf("hosted PG row id=9 (UPDATEd) label/qty = %q, goopg said %q — S4.5, see ledger M0118-0129",
+			got, wantLabel9+"/"+wantQty9)
 	}
-	if got := s4Scalar(t, pg, pgLog, "SELECT label FROM public.s4_items WHERE id = 9"); got != wantLabel9 {
-		t.Fatalf("hosted PG row id=9 (UPDATEd) label = %q, goopg said %q — S4.5, see ledger M0118-0129", got, wantLabel9)
-	}
-	if got := s4Scalar(t, pg, pgLog, "SELECT qty FROM public.s4_items WHERE id = 9"); got != wantQty9 {
-		t.Fatalf("hosted PG row id=9 (UPDATEd) qty = %q, goopg said %q — S4.5, see ledger M0118-0129", got, wantQty9)
-	}
+	// The proconfig gap's own probe, kept as a direct positive assertion now
+	// that it passes: a LANGUAGE SQL builtin must be callable at all.
+	assertHostedPGCanCallSQLBuiltins(t, pg, pgLog)
 
 	// Guard 7 — index behaviour is live, not hypothetical. relhasindex is no
 	// longer hardcoded false (pgClassRelhasindex, with pgIndexTupleKeys = true),
@@ -320,16 +321,17 @@ func TestE2E_PGColdStartOnGoopgDataDir(t *testing.T) {
 	// truncates the log on Start and allocates it as a sibling of the data dir,
 	// so the scan covers exactly this attach and nothing else.
 	//
-	// It runs HERE rather than at the end because the two remaining probes are
-	// destructive by construction: each locks in a measured gap whose current
-	// behaviour is a backend PANIC or abort, which necessarily writes to this
-	// log and takes the postmaster with it. Guard 4 has to see the log before
-	// the known damage, not after.
+	// It runs HERE rather than at the end because the remaining probe is
+	// destructive by construction: it locks in a measured gap whose current
+	// behaviour is a backend PANIC, which necessarily writes to this log and
+	// takes the postmaster with it. Guard 4 has to see the log before the
+	// known damage, not after. (Until M0131-S13 the proconfig probe was a
+	// second destructive one; it is now a plain assertion run above, inside
+	// the row-content reads.)
 	assertNoFatalInPGLog(t, pgLogPathFor(goopgDir))
 
-	// DESTRUCTIVE PROBES — nothing may follow these two.
+	// DESTRUCTIVE PROBE — nothing may follow this.
 	assertGoopgCreatedDatabaseStillUnopenableByPG(t, repo, pg, goopgDir, wantOther)
-	assertProconfigGapStillCrashesSQLFunctions(t, pg, pgLogPathFor(goopgDir))
 }
 
 // pgLogPathFor mirrors pgcluster's default LogPath allocation (a `pg.log`
@@ -557,17 +559,19 @@ func assertFastDefaultGapReadsNullOnHostedPG(t *testing.T, pg *pgcluster.Cluster
 	}
 }
 
-// assertProconfigGapStillCrashesSQLFunctions locks in the second finding, in
-// the same fail-when-fixed direction.
+// assertHostedPGCanCallSQLBuiltins is the S13.4 INVERSION of the former
+// assertProconfigGapStillCrashesSQLFunctions: the second finding this test
+// measured is FIXED (M0131-S13, 2026-08-12), so the probe now asserts success.
 //
-// `SELECT 'a'::text || 1` crashes the hosted backend outright:
+// Before the fix, `SELECT 'a'::text || 1` crashed the hosted backend outright:
 //
 //	TRAP: failed Assert("ARR_NDIM(array) == 1"), File: "guc.c", Line: 6411
 //	  ExceptionalCondition → TransformGUCArray → fmgr_security_definer
 //	client backend (PID …) was terminated by signal 6: Aborted
 //
-// Diagnosis (measured). goopg writes **every one** of its 3397 pg_proc rows
-// with a NON-NULL proconfig — probed directly on the hosted PG:
+// Diagnosis (measured, and the fix follows from it). goopg wrote **every one**
+// of its 3397 pg_proc rows with a NON-NULL proconfig — probed directly on the
+// hosted PG:
 // `SELECT count(*) FROM pg_proc WHERE proconfig IS NOT NULL` returns 3397, the
 // full row count, while upstream's initdb leaves proconfig NULL on all of them
 // (prosecdef is correctly 'f' everywhere, so it is proconfig alone). The bytes
@@ -589,25 +593,30 @@ func assertFastDefaultGapReadsNullOnHostedPG(t *testing.T, pg *pgcluster.Cluster
 // This is an assert-enabled PG build, so the failure is loud. A production
 // build would instead walk a bogus ArrayType — worse, not better.
 //
-// Filed as M0131-S13 with a deferral-ledger row. When S13 lands, this assertion
-// FAILS — invert it then: fold `label || '/' || qty` back into the row-content
-// reads above and delete this helper.
-func assertProconfigGapStillCrashesSQLFunctions(t *testing.T, pg *pgcluster.Cluster, logPath string) {
+// The fix (M0131-S13): initdb's pgProcRow now writes executor.NullDatum for
+// every absent nullable varlena attribute — proconfig, proacl, probin,
+// prosqlbody, protrftypes and the OUT-arg trio — matching the runtime sibling
+// buildPGProcRow, which had used NullDatum all along. Unit tripwire:
+// internal/initdb/pg_proc_nullable_varlena_test.go.
+//
+// Two assertions, because either alone passes vacuously: the call must
+// SUCCEED, and pg_proc must report zero non-NULL proconfig rows (a hosted PG
+// that somehow answered "a1" through a different route would still be broken).
+func assertHostedPGCanCallSQLBuiltins(t *testing.T, pg *pgcluster.Cluster, logPath string) {
 	t.Helper()
 	const probe = "SELECT 'a'::text || 1"
 	out, err := pgQueryScalarAllowError(pg, probe)
-	if err == nil {
-		t.Fatalf("a hosted PG can now call a LANGUAGE SQL builtin (%q returned %q) — "+
-			"M0131-S13 has landed. INVERT this assertion: restore the "+
-			"`label || '/' || qty` form of the row-content reads and delete this helper "+
-			"(docs/design/0131-0004-forward-coldstart-e2e.md §Findings)",
-			probe, strings.TrimSpace(out))
+	if err != nil || strings.TrimSpace(out) != "a1" {
+		logData, _ := os.ReadFile(logPath)
+		t.Fatalf("hosted PG cannot call the LANGUAGE SQL builtin textanycat: %q returned %q (err=%v) — "+
+			"M0131-S13 has REGRESSED (a TransformGUCArray trap in the log below means the "+
+			"pg_proc seed is writing empty varlena shells again)\n--- PG log ---\n%s",
+			probe, strings.TrimSpace(out), err, tailLines(string(logData), 60))
 	}
-	logData, _ := os.ReadFile(logPath)
-	if !strings.Contains(string(logData), "TransformGUCArray") {
-		t.Fatalf("hosted PG failed %q, but NOT through the known pg_proc.proconfig gap "+
-			"(M0131-S13) — this is a different failure:\npsql: %s\n--- PG log ---\n%s",
-			probe, out, tailLines(string(logData), 60))
+	got := s4Scalar(t, pg, logPath, "SELECT count(*) FROM pg_proc WHERE proconfig IS NOT NULL")
+	if got != "0" {
+		t.Fatalf("hosted PG counts %q pg_proc rows with a non-NULL proconfig, want 0 "+
+			"(upstream initdb leaves every one NULL) — M0131-S13", got)
 	}
 }
 
