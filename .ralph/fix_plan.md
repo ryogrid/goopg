@@ -52,6 +52,13 @@ is at the END of this file — document order does NOT reflect priority here; th
 banner does.
 Then M0130's remaining unchecked items, then all remaining unchecked items
 top-to-bottom (M0119, then M0122).
+**M0119 selection rule: pick a M0119 task ONLY when no milestone above M0119 in
+the priority order has a remaining task that should be done** — "should be done"
+= unchecked and not parked or deferred, with prerequisites met. M0119 is a
+backlog-consumption milestone and the terminal drain: it never runs ahead of
+feature/build work. M-NIGHTLY's standing filing obligation is not itself a bar;
+its tasks block M0119 only while selectable per the M-NIGHTLY selection rule
+(after M0131 and M0130 clear). M0122 (below M0119) does not block M0119.
 The banner is the sole ordering authority — `.ralph/working_set.md`'s notes carry
 state, not priority, and do not outrank it.
 
@@ -2077,6 +2084,12 @@ Milestone: `docs/milestones/0119-deferral-ledger-backlog-consumption.md`
 `.ralph/deferral_ledger.md`. Goal: drive every open (`status = -`) ledger row to
 closure — implement the deferred scope, or verify it already landed and mark the
 row `resolved`.
+
+**Selection rule (see the Current Priority banner): pick a M0119 task ONLY when
+no milestone above M0119 in the priority order has a remaining task that should
+be done** (unchecked, not parked or deferred, prerequisites met). M0119 is the
+terminal drain of the deferral ledger — it never runs ahead of feature/build work
+in any higher-priority milestone.
 
 **Per-task rule (applies to every M0119 implementation task):** before
 implementation begins, the picking agent MUST (1) create a design doc at
