@@ -98,9 +98,21 @@ func TestEncodeValuePGAclItemArrayEmitsEmptyArrayType(t *testing.T) {
 // int32; a wrong alignment shifts every subsequent column and breaks
 // nocachegetattr's physical-offset computation.
 func TestPhysicalPGTypeAlignArrayTypes(t *testing.T) {
-	for _, name := range []string{"aclitem[]", "_aclitem", "text[]", "_text", "pg_node_tree", "anyarray"} {
+	for _, name := range []string{"aclitem[]", "_aclitem", "text[]", "_text", "pg_node_tree"} {
 		if got := physicalPGTypeAlign(catalog.Type{Name: name}); got != 4 {
 			t.Errorf("physicalPGTypeAlign(%q) = %d, want 4", name, got)
 		}
+	}
+	// anyarray (OID 2277) is the exception, and this expectation was INVERTED
+	// by M0131-S14.2: upstream declares typalign => 'd'
+	// (postgres/src/include/catalog/pg_type.dat:573), not the 'i' every other
+	// varlena array carries. It had been grouped with them here, which
+	// under-padded pg_attribute.attmissingval and pg_statistic.stavalues1..5 —
+	// inert only while both were always NULL, since a NULL column consumes
+	// neither bytes nor padding. A hosted real PG deforms those tuples with its
+	// own compiled 'd', so the first non-NULL attmissingval would have put every
+	// following byte one word early.
+	if got := physicalPGTypeAlign(catalog.Type{Name: "anyarray"}); got != 8 {
+		t.Errorf("physicalPGTypeAlign(\"anyarray\") = %d, want 8 (typalign='d')", got)
 	}
 }

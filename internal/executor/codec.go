@@ -1062,8 +1062,17 @@ func physicalPGTypeAlign(t catalog.Type) int {
 		// exceed a Datum but carry no field wider than a byte. M0119-0006.
 		"uuid":
 		return 1 // PG 'c' alignment (fixed-size, 1-byte aligned)
-	case "aclitem[]", "_aclitem", "text[]", "_text", "oid[]", "_oid", "int2[]", "_int2", "char[]", "_char", "float4[]", "_float4", "anyarray", "pg_node_tree", "oidvector", "int2vector":
+	case "aclitem[]", "_aclitem", "text[]", "_text", "oid[]", "_oid", "int2[]", "_int2", "char[]", "_char", "float4[]", "_float4", "pg_node_tree", "oidvector", "int2vector":
 		return 4 // PG 'i' alignment for varlena ArrayType / pg_node_tree / oidvector / int2vector
+	case "anyarray":
+		// anyarray (OID 2277) is typalign='d' — 8 bytes, NOT the 'i' every
+		// other varlena array uses (postgres/src/include/catalog/pg_type.dat:573).
+		// Its two catalog users are pg_attribute.attmissingval and
+		// pg_statistic.stavalues1..5; a hosted PG deforms both with its own
+		// compiled descriptor, so 4-byte padding here put every following
+		// byte one word early. Sibling of initdb.pgTypeAlignChar(2277), which
+		// declares the same 'd' in the nailed self-description. M0131-S14.2.
+		return 8
 	default:
 		return 4
 	}

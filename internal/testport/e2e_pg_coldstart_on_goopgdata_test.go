@@ -311,7 +311,7 @@ func TestE2E_PGColdStartOnGoopgDataDir(t *testing.T) {
 
 	// The ADD COLUMN … DEFAULT column: pg_attrdef 2604 + indexes 2656/2657,
 	// previously validated only through the basebackup lane.
-	assertFastDefaultGapReadsNullOnHostedPG(t, pg, pgLog, wantTag)
+	assertFastDefaultMaterialisesOnHostedPG(t, pg, pgLog, wantTag)
 	// The non-public schema exercises pg_namespace reverse mapping.
 	if got := s4Scalar(t, pg, pgLog, "SELECT note FROM s4app.s4_notes WHERE id = 1"); got != wantNote {
 		t.Fatalf("hosted PG read of the non-public schema = %q, goopg said %q", got, wantNote)
@@ -503,23 +503,26 @@ func assertGoopgCreatedDatabaseStillUnopenableByPG(t *testing.T, repo string, pg
 	}
 }
 
-// assertFastDefaultGapReadsNullOnHostedPG locks in the third finding — again
-// fail-when-fixed — while still asserting the part of M0130's pg_attrdef work
-// that DOES survive the handover.
+// assertFastDefaultMaterialisesOnHostedPG is the S14.4 INVERSION of the former
+// assertFastDefaultGapReadsNullOnHostedPG: the third finding this test measured
+// is FIXED (M0131-S14.2, 2026-08-12), so the probe now asserts success.
 //
-// `ALTER TABLE … ADD COLUMN tag text DEFAULT 'dflt'` reads back as 'dflt' on
-// goopg and as NULL on the hosted PG, for all 15 pre-existing rows.
+// `ALTER TABLE … ADD COLUMN tag text DEFAULT 'dflt'` used to read back as
+// 'dflt' on goopg and as NULL on the hosted PG, for all 15 pre-existing rows.
 //
-// Diagnosis (measured). The pg_attrdef side is entirely correct — the hosted PG
+// Diagnosis (measured). The pg_attrdef side was always correct — the hosted PG
 // reads `pg_get_expr(adbin, adrelid)` as `'dflt'::text` for adnum 4 and
 // pg_class.relnatts as 4, which is exactly the M0130 pg_attrdef 2604/2656/2657
-// work being validated outside the basebackup lane for the first time. What is
+// work being validated outside the basebackup lane for the first time. What was
 // missing is PG's **fast-default** mechanism: since PG 11, ADD COLUMN with a
 // non-volatile DEFAULT does not rewrite the heap; it stores the value in
 // pg_attribute.attmissingval with atthasmissing = true, and every physically
-// short tuple materialises the missing value on read. goopg neither rewrites
-// the rows nor records the missing value, so PG sees short tuples with no
-// missing value and yields NULL.
+// short tuple materialises the missing value on read. goopg recorded the value
+// only in its own in-memory catalog.Column.MissingValue, so PG saw short tuples
+// with no missing value and yielded NULL. S14.2 writes the catalog half too —
+// a one-element ArrayType built exactly as StoreAttrMissingVal builds it
+// (postgres/src/backend/catalog/heap.c:2030) — so the hosted PG's own
+// getmissingattr() materialises the value with no heap rewrite on either side.
 //
 // Underneath that sat a second, sharper fact, and THAT half is now FIXED
 // (M0131-S14.1): `SELECT attmissingval FROM pg_attribute` used to error 42703
@@ -541,10 +544,10 @@ func assertGoopgCreatedDatabaseStillUnopenableByPG(t *testing.T, repo string, pg
 // `ALTER COLUMN … SET STATISTICS` writes attstattarget, and a hosted PG would
 // then have read that int2 as attacl. Both halves are asserted positively below.
 //
-// What remains deferred is the fast-default mechanism itself (S14.2/S14.3),
-// still asserted fail-when-fixed. When it lands, that assertion FAILS — invert
-// it then to a direct equality against goopg's own answer.
-func assertFastDefaultGapReadsNullOnHostedPG(t *testing.T, pg *pgcluster.Cluster, logPath, goopgAnswer string) {
+// What remains deferred is S14.3 — goopg's OWN reader still materialises from
+// catalog.Column.MissingValue rather than from the heap's attmissingval, so the
+// two halves are written together but read independently (ledgered).
+func assertFastDefaultMaterialisesOnHostedPG(t *testing.T, pg *pgcluster.Cluster, logPath, goopgAnswer string) {
 	t.Helper()
 	// The half that works, asserted positively: pg_attrdef survived the cold
 	// start with the right expression on the right attnum.
@@ -567,8 +570,14 @@ func assertFastDefaultGapReadsNullOnHostedPG(t *testing.T, pg *pgcluster.Cluster
 	// attmissingval AT ALL is the 42703 regression tripwire; reading the tail's
 	// attnums is the permutation tripwire. Both queries are answered from
 	// goopg's own heap rows for relid 1249.
-	if got := s4Scalar(t, pg, logPath, "SELECT count(*) FROM pg_attribute WHERE attmissingval IS NOT NULL"); got != "0" {
-		t.Fatalf("hosted PG reads %q non-NULL pg_attribute.attmissingval rows, want 0 — "+
+	// Scoped to relid 1249's OWN rows: none of pg_attribute's 25 self-describing
+	// attributes has a fast default, so this count stays 0 forever, while a
+	// 42703 (rather than a number) is the relnatts-went-short signal. It is
+	// deliberately NOT the unscoped count any more — since S14.2 a user table's
+	// ADD COLUMN … DEFAULT legitimately makes that non-zero.
+	if got := s4Scalar(t, pg, logPath,
+		"SELECT count(*) FROM pg_attribute WHERE attrelid = 1249 AND attmissingval IS NOT NULL"); got != "0" {
+		t.Fatalf("hosted PG reads %q non-NULL pg_attribute.attmissingval rows for relid 1249, want 0 — "+
 			"a 42703 here instead means goopg's nailed pg_class relnatts for OID 1249 "+
 			"went short again (M0131-S14.1)", got)
 	}
@@ -581,14 +590,27 @@ func assertFastDefaultGapReadsNullOnHostedPG(t *testing.T, pg *pgcluster.Cluster
 			"sibling column lists have drifted apart again (M0131-S14.1)", got)
 	}
 
-	// The half that does not, asserted in the fail-when-fixed direction.
-	nulls := s4Scalar(t, pg, logPath, "SELECT count(*) FROM public.s4_items WHERE tag IS NULL")
-	if nulls != "15" {
-		t.Fatalf("hosted PG now materialises the ADD COLUMN … DEFAULT value for %s of 15 "+
-			"pre-existing rows (goopg reads %q) — M0131-S14 has landed. INVERT this "+
-			"assertion to a direct equality "+
-			"(docs/design/0131-0004-forward-coldstart-e2e.md §Findings)",
-			"15-"+nulls, goopgAnswer)
+	// S14.2, asserted positively — the catalog half of the fast default.
+	if got := s4Scalar(t, pg, logPath,
+		`SELECT atthasmissing FROM pg_attribute
+		   WHERE attrelid = 'public.s4_items'::regclass AND attname = 'tag'`); got != "t" {
+		t.Fatalf("hosted PG reads atthasmissing = %q for s4_items.tag, want \"t\" — "+
+			"buildUserPGAttributeRow stopped writing the fast default (M0131-S14.2)", got)
+	}
+	// …and the read PG derives from it, with no heap rewrite on either side:
+	// every one of the 15 pre-ALTER rows is physically short, so PG must
+	// materialise the value through getmissingattr().
+	if nulls := s4Scalar(t, pg, logPath,
+		"SELECT count(*) FROM public.s4_items WHERE tag IS NULL"); nulls != "0" {
+		t.Fatalf("hosted PG reads NULL tag on %q of the 15 pre-existing rows (goopg reads %q) — "+
+			"the fast-default value is not reaching PG's getmissingattr (M0131-S14.2)",
+			nulls, goopgAnswer)
+	}
+	if got := s4Scalar(t, pg, logPath,
+		"SELECT count(*) FROM public.s4_items WHERE tag = 'dflt'"); got != "15" {
+		t.Fatalf("hosted PG materialises tag = 'dflt' on %q of the 15 pre-existing rows "+
+			"(goopg reads %q) — the attmissingval element decoded to something else "+
+			"(M0131-S14.2)", got, goopgAnswer)
 	}
 }
 

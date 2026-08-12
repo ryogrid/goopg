@@ -291,10 +291,53 @@ a non-volatile DEFAULT does not rewrite the heap but stores the value in
 materialise it on read. goopg neither rewrites the rows nor records the missing
 value. Underneath sat a sharper fact, and **that half is FIXED (S14.1,
 2026-08-12)**: `attmissingval` did not exist as a column at all on the hosted PG
-(`SELECT attmissingval FROM pg_attribute` → 42703). The remaining fast-default
-gap is S14.2/S14.3. Lock-in: `assertFastDefaultGapReadsNullOnHostedPG`, which
-now asserts the S14.1 half positively and only the fast-default half
-fail-when-fixed.
+(`SELECT attmissingval FROM pg_attribute` → 42703).
+
+**F3 is now CLOSED (S14.2/S14.4, 2026-08-12).** The lock-in was INVERTED: the
+helper is `assertFastDefaultMaterialisesOnHostedPG`, and it asserts positively
+that the hosted PG reads `atthasmissing = 't'` for `s4_items.tag` and
+materialises `tag = 'dflt'` on all 15 physically short pre-ALTER rows — a real
+PG 18.3 running `getmissingattr()` over goopg-authored catalog bytes, with no
+heap rewrite on either side. See *S14.2* below.
+
+*S14.2, as measured and fixed.* Three things had to agree.
+
+1. **The value.** `buildUserPGAttributeRow` now writes `atthasmissing` plus a
+   one-element `ArrayType` built exactly as `StoreAttrMissingVal`
+   (`postgres/src/backend/catalog/heap.c:2030`) builds it via `construct_array`:
+   `ndim=1`, `dataoffset=0` (a NULL default stores nothing at all —
+   `ATExecAddColumn` skips the call when `missingIsNull`), `elemtype` = the
+   COLUMN's own `atttypid` (so an array column's fast default is an
+   array-of-array, as upstream), `dims[0]=lbound[0]=1`, and the element
+   normalised to the 4-byte varlena header form. Source of truth for the value
+   itself is unchanged: `catalog.Column.MissingValue`, set by the existing
+   fast-default backfill in `execAlterTableAddColumn`. An encode failure
+   degrades to the pre-S14.2 shape rather than failing the DDL.
+2. **The type.** `attmissingval` was declared `text` in all three sibling column
+   lists; it is `anyarray` (OID 2277). PG dereferences the datum as
+   `ArrayType *`, so `text` was only survivable while the column was always
+   NULL.
+3. **The alignment.** `anyarray` carries `typalign => 'd'`
+   (`postgres/src/include/catalog/pg_type.dat:573`) — 8 bytes, unlike every
+   other varlena array's `'i'`. Both `initdb.pgTypeAlignChar` (nailed
+   self-description) and `executor.physicalPGTypeAlign` (the wire encoder) had
+   grouped it with the 4-byte varlenas. That mis-padding also covered
+   `pg_statistic.stavalues1..5`, the only other `anyarray` catalog columns; it
+   was invisible for the same reason the S14.1 permutation was — a NULL column
+   consumes neither bytes nor padding — and would have shifted every following
+   byte one word early in the first tuple carrying a real value.
+
+That is the same shape as S14.1 and S13: a value that is always NULL hides
+disagreement among sibling definitions until something finally writes it
+([[pattern_sibling_paths_must_agree]]).
+
+*S14.3, decided and deferred.* goopg's own reader still materialises from the
+in-memory `catalog.Column.MissingValue` (`internal/executor/codec.go`, the
+M0097-0077 short-tuple path), not from the heap's `attmissingval`. The two
+halves are therefore written together but read independently. Making the heap
+the single source of truth is the PG-faithful end state and
+`pgSingletonArrayElement` is the reader it needs, but it is a separate change
+with its own restart/reload surface — ledgered, not smuggled in here.
 
 *S14.1, as measured and fixed.* The 42703 was **not** a missing heap row —
 goopg's rows for relid 1249 always numbered 25, `attmissingval` among them. It

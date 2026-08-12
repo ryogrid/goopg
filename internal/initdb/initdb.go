@@ -6037,7 +6037,15 @@ func pgAttrColDefs() []catalog.Column {
 		{Name: "attacl", Type: catalog.Type{Name: "aclitem[]"}},
 		{Name: "attoptions", Type: catalog.Type{Name: "text"}},
 		{Name: "attfdwoptions", Type: catalog.Type{Name: "text"}},
-		{Name: "attmissingval", Type: catalog.Type{Name: "text"}},
+		// attmissingval is `anyarray` (OID 2277) per
+		// postgres/src/include/catalog/pg_attribute.h:184 — the fast-default
+		// value is a one-element ArrayType (StoreAttrMissingVal, heap.c:2030),
+		// so the column is neither text nor 4-byte aligned: anyarray carries
+		// typalign='d'/typstorage='x' (pg_type.dat:571-574), which
+		// pgTypeAlignChar/pgTypeStorageChar now report for the nailed
+		// self-description and physicalPGTypeAlign matches on the wire.
+		// M0131-S14.2.
+		{Name: "attmissingval", Type: catalog.Type{Name: "anyarray"}},
 	}
 }
 
@@ -6378,9 +6386,20 @@ func pgTypeAlignChar(oid uint32) string {
 		return "c"
 	case 21:
 		return "s"
-	case 23, 26, 700, 194, 1009, 1034, 2277, 24, 325, 269, 30, 22, 1002, 1028, 3361, 3402, 5017:
+	case 23, 26, 700, 194, 1009, 1034, 24, 325, 269, 30, 22, 1002, 1028, 3361, 3402, 5017:
 		return "i"
-	case 20, 701, 10028, 3220:
+	case 20, 701, 10028, 3220,
+		// anyarray (2277) is typalign='d', not 'i'
+		// (postgres/src/include/catalog/pg_type.dat:573). It had been grouped
+		// with the 'i' varlenas above, which under-declared the alignment of
+		// every anyarray catalog column — pg_attribute.attmissingval and
+		// pg_statistic.stavalues1..5. Inert while those were always NULL (a
+		// NULL column consumes no bytes and no padding); the moment
+		// M0131-S14.2 wrote a real attmissingval, a hosted PG deforming the
+		// tuple with its own compiled 'd' would have read 4 bytes of padding
+		// as the start of the ArrayType. physicalPGTypeAlign is the wire-side
+		// sibling of this line and pads to 8 to match. M0131-S14.2.
+		2277:
 		// PG18 runtime pg_type lookup: _pg_statistic (10028) has typalign='d'
 		// because its element rowtype pg_statistic carries int8/float8-aligned
 		// columns (stanullfrac, stadistinct float4 padded to 8-byte; stavalues

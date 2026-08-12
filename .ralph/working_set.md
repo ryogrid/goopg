@@ -1,44 +1,48 @@
 (idle — nothing in flight)
 
-M0131-S13 LANDED (loop #12 of this run), pushed.
+M0131-S14.2 + S14.4 LANDED (loop #15), see commit below; S14 checked off,
+S14.3 deferred with a ledger row.
 
-Files: `internal/initdb/initdb.go` (`pgProcRow` — the nullable-varlena group now
-`executor.NullDatum`; `pgProcColDefs` CATALOG_VARLEN comment rewritten), new
-`internal/initdb/pg_proc_nullable_varlena_test.go`,
-`internal/testport/e2e_pg_coldstart_on_goopgdata_test.go` (S13.4 inversion),
-design `0131-0004` §Findings F2 + README index, fix_plan S13 checked, 1 ledger row.
+Files: `internal/executor/pg18_user_catalog_rows.go` (fast-default write +
+`pgSingletonArrayBytes`/`pgSingletonArrayElement`), `internal/executor/codec.go`
++ `internal/initdb/initdb.go` (`anyarray` typalign 'd'), `internal/catalog/
+codec.go` + the two other column lists (`attmissingval` text→anyarray),
+`internal/testport/e2e_pg_coldstart_on_goopgdata_test.go` (S14.4 inversion),
+new `internal/executor/pg_attribute_missingval_test.go`,
+`internal/executor/codec_empty_array_test.go` (4→8 inversion), design 0131-0004
+§F3 + README, fix_plan S14, 1 ledger row.
+
+NOTE: the four source files were UNCOMMITTED WIP from loop #14 (working_set said
+"idle" — loop #14 was cut off before rewriting the baton). They built clean and
+were correct; this loop finished them (guards, E2E inversion, docs, gates).
 
 Worth carrying:
-- The bug was a STALE SIBLING, not a bitmap/`t_hoff` defect (S13.1's hypothesis
-  was wrong). goopg has TWO builders for the physical 30-col `pg_proc` row:
-  runtime `buildPGProcRow` (`internal/executor/sys_pg_proc.go`) had `NullDatum`
-  all along with a comment explaining why; initdb's `pgProcRow` had
-  `NewStringDatum("")`. That falls through `encodeValuePG` →
-  `emptyArrayTypeBytes` = a NON-NULL zero-dimension ArrayType. `NullBitmapPG` /
-  `writeMultiPageHeapRows` were already correct — nothing was NULL to mark.
-- Generalisable: `NewStringDatum("")` on a nullable varlena catalog column is
-  never a NULL in this codebase; it is an empty-array/empty-varlena shell, and
-  PG branches on `heap_attisnull` for all of them.
-- `pg_attribute` was already fixed for the identical reason (Step 3u,
-  `attoptions` → ERRORDATA_STACK_SIZE PANIC). `pg_class` (`pgClassNailedRow`,
-  ~initdb.go:5986) is STILL WRONG: `relacl='{}'`, `reloptions='{}'`,
-  `relpartbound=''`. Latent only because the hosted-PG E2E connects as a
-  superuser, who bypasses `pg_class_aclcheck`. Ledgered with a non-superuser
-  probe as the resume point — do NOT fix it blind.
+- Fifth sibling-drift bug of this milestone, same shape every time: a column
+  that is ALWAYS NULL hides disagreement among the sibling definitions until
+  something finally writes a value. Here it hid BOTH a wrong type
+  (`attmissingval` declared `text`, PG has `anyarray` 2277) and a wrong
+  alignment (`anyarray` is typalign='d'/8, not the 'i'/4 every other varlena
+  array uses — `pg_type.dat:573`).
+- The 8-byte `anyarray` padding also covers `pg_statistic.stavalues1..5`, so an
+  EXISTING goopg `$PGDATA` with non-NULL stavalues decodes shifted after this —
+  no in-place upgrade, ledgered.
+- The relid-1249 tripwire in the E2E had to be SCOPED (`WHERE attrelid = 1249`):
+  the unscoped `attmissingval IS NOT NULL` count is legitimately non-zero now.
 
-Gates: UNITS precommit PASS, `internal/{initdb,executor}` PASS (76s),
-`TestE2E_PGColdStartOnGoopgDataDir` PASS (the S13 acceptance measurement:
-`'a'::text || 1` = `a1`, `proconfig IS NOT NULL` count 3397 → 0),
-`TestE2E_PGStandbyFullCycle` + `TestE2E_FailoverGoopgToPG` PASS, pgbench smoke
-via the commit hook, `make ralph-state-guard` OK (auto-repaired the stale marker).
-Fail-when-broken proven: restoring `NewStringDatum("")` on proconfig fails the
-new guard at `oid=3 (heap_tableam_handler)`.
+Gates: UNITS precommit PASS, `internal/{executor,catalog,initdb}` PASS,
+`TestE2E_PGColdStartOnGoopgDataDir` PASS (it FAILED first with count=1, which is
+the fix proving itself), whole `^TestE2E_` family PASS (80 s),
+`^TestPort_(Regress|PgDump|Initdb)` PASS (600 s), `scripts/tpch-spotcheck.sh`
+PASS (Q12=2, Q13=35), pgbench smoke via the commit hook,
+`make ralph-state-guard` OK.
 
 Nightly triage: `ci/logs/action-items.md` still run `20260812-005501`; all 4
-`## AI-` items already filed under M-NIGHTLY, nothing new.
+`## AI-` items already filed under M-NIGHTLY, nothing new to file.
 
-Next loop (banner = M-NIGHTLY filing, then M0131): S24 (MultiXact) and S30 are
-the large open ones; S14 (`atthasmissing`/`attmissingval`, est ~2, and F3 is the
-next finding in the same E2E) is the natural successor to this loop.
+Next loop (banner = M-NIGHTLY filing, then M0131): pick the next unchecked M0131
+slice. S14.3 (make the heap's `attmissingval`, not `catalog.Column.MissingValue`,
+goopg's OWN read path — `pgSingletonArrayElement` is the reader it needs) is
+ledgered, not a fix_plan task; S15 (`could not open critical system index 2662`
+on a goopg-CREATE DATABASE-minted database) is the next measured gap.
 
 In-flight: none.

@@ -712,7 +712,12 @@ func PGAttributeColumns() []Column {
 		{Name: "attacl", Type: Type{Name: "aclitem[]"}},
 		{Name: "attoptions", Type: Type{Name: "text"}},
 		{Name: "attfdwoptions", Type: Type{Name: "text"}},
-		{Name: "attmissingval", Type: Type{Name: "text"}},
+		// attmissingval is PG's `anyarray` (OID 2277) — a one-element
+		// ArrayType written by StoreAttrMissingVal, not a text varlena.
+		// Sibling of executor.pgAttributeColumnsPG18 and initdb.pgAttrColDefs;
+		// all three must agree or the fast-default value decodes as garbage.
+		// M0131-S14.2.
+		{Name: "attmissingval", Type: Type{Name: "anyarray"}},
 	}
 	for i := range cols {
 		cols[i].Ordinal = i
