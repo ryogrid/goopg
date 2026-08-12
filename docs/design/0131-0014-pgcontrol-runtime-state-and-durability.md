@@ -512,10 +512,37 @@ pg_control for `DataChecksumVersion` (`internal/initdb/open.go:292`) and later f
   policy so a future change has to argue against a decision. The one violator is
   S29.
 
-### S29 — BASE_BACKUP mutates the source pg_control (rides the plan, not this doc)
+### S29 — BASE_BACKUP mutates the source pg_control — **LANDED 2026-08-12**
 
-Named here because it is the same subsystem; **not** designed here.
-`internal/server/basebackup.go:223` calls `initdb.UpdateControlCheckpoint` on the
+As built, in three edits:
+
+- `control.BuildUpdatedControlImage(dataDir, fn)`
+  (`internal/control/pgcontrol.go`) is `UpdateControlFile`'s
+  read → decode → mutate → encode → CRC half **without the write**, returning
+  the 8192-byte image. `UpdateControlFile` is now a two-liner over it, so the
+  two paths cannot drift in what they encode or how they checksum.
+- `initdb.UpdateControlCheckpoint` **becomes** `initdb.BackupControlImage`
+  (same field mutations, returns the image). Renaming rather than adding an
+  alternative is deliberate: no caller can reach the mutating variant again,
+  because it no longer exists.
+- `emitBaseBackupTar` takes a trailing `pgControlImage []byte`. Non-nil ships in
+  place of the on-disk bytes at the pg_control-last step; nil keeps the historical
+  read-the-file behaviour, which is what happens when there is no checkpoint REDO
+  yet (`redoLSN == 0`) or the control file cannot be read — the pre-S29 code
+  discarded that error too, and an unpatched backup beats a failed one.
+
+The manifest entry records the shipped bytes, not the on-disk ones, because
+`record()` is fed the same buffer that was written to the tar.
+
+**Measured while landing.** The gate's fixture had to seed
+`checkPointCopy.ThisTimeLineID` explicitly: `LoadOrCreateTimelineID` resolves the
+timeline from **pg_control**, not from the `timeline_id` file the fixture also
+writes, so the 0xC0-filled stub yielded TLI `0xC0C0C0C0` in both the shipped
+image and the START_TIMELINE reply. Anything asserting a timeline against this
+fixture needs the same seed.
+
+Original diagnosis (kept for the record):
+`internal/server/basebackup.go:223` called `initdb.UpdateControlCheckpoint` on the
 **live** directory, writing `MinRecoveryPoint = 1`
 (`internal/initdb/pgcontrol.go:158`), `MinRecoveryPointTLI = 1` (`:159`) and
 `BackupEndPoint = redo` (`:162`) — plus S18.3's hardcoded TLI 1 — into the running
@@ -525,6 +552,24 @@ does not contain minimum recovery point %X/%X on timeline %u`
 (`xlogrecovery.c:880-887` — *Theme F cites `:878-886`; the test is `:880-882`, the
 FATAL text `:884`*). Fix: build the backup's control image into the tar stream
 rather than mutating the source.
+
+**S29 guard.** `TestBaseBackupDoesNotMutateLiveControlFile`
+(`internal/server/basebackup_control_test.go`) drives a real BASE_BACKUP over the
+replication protocol and asserts **both halves**, because either alone is
+passable by accident:
+
+1. the live `global/pg_control` is byte-identical across the backup (the fixture
+   pre-zeroes `minRecoveryPoint`, `minRecoveryPointTLI`, `backupEndPoint`,
+   `checkPoint`, so a non-zero reading afterwards can only come from the backup);
+2. the **shipped** image still differs from it, re-verifies its CRC when read
+   back through `control.ReadControlFile`, and carries
+   `minRecoveryPoint != 0` on the live TLI — otherwise half 1 would pass simply
+   by patching nothing.
+
+Proven fail-when-broken in both directions: re-adding an `os.WriteFile` of the
+image onto the live directory fails half 1 (`live minRecoveryPoint=1 tli=1
+backupEndPoint=8191`), and running with no checkpoint REDO (so no patch is built)
+fails half 2 (`shipped pg_control is byte-identical to the live one`).
 
 ## Guards
 

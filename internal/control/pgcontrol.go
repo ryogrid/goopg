@@ -289,13 +289,36 @@ func encodeControlFileData(buf []byte, cd *ControlFileData) {
 // The fn receives the current decoded state; only the fields fn explicitly
 // sets are changed — all other bytes in the buffer are preserved.
 func UpdateControlFile(dataDir string, fn func(*ControlFileData)) error {
+	buf, err := BuildUpdatedControlImage(dataDir, fn)
+	if err != nil {
+		return err
+	}
+	// Write exactly PG_CONTROL_FILE_SIZE bytes, as upstream does. A longer
+	// file (which PG never produces) keeps its tail rather than being
+	// truncated away — O_RDWR overwrite semantics, not O_TRUNC.
+	return writeControlFileDurably(filepath.Join(dataDir, pgControlFilePath), buf)
+}
+
+// BuildUpdatedControlImage is UpdateControlFile's read-decode-mutate-encode
+// half without the write: it returns the 8192-byte pg_control image that
+// UpdateControlFile *would* have stored, leaving the on-disk file untouched.
+//
+// M0131-S29. BASE_BACKUP needs a checkpoint-patched control image for the tar
+// stream it ships, but patching the LIVE cluster's pg_control to get one is a
+// bug: it publishes minRecoveryPoint/backupEndPoint into a running primary,
+// and a crash in the window before the next checkpoint then makes the cluster
+// FATAL "requested timeline %u does not contain minimum recovery point"
+// (xlogrecovery.c:878-886) on a promoted (TLI >= 2) cluster. Upstream never
+// touches the source either — basebackup.c:352-360 sends XLOG_CONTROL_FILE
+// through plain sendFile().
+func BuildUpdatedControlImage(dataDir string, fn func(*ControlFileData)) ([]byte, error) {
 	path := filepath.Join(dataDir, pgControlFilePath)
 	buf, err := os.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("control: read pg_control: %w", err)
+		return nil, fmt.Errorf("control: read pg_control: %w", err)
 	}
 	if len(buf) < pgControlCRCOffset+4 {
-		return fmt.Errorf("control: pg_control too short (%d bytes)", len(buf))
+		return nil, fmt.Errorf("control: pg_control too short (%d bytes)", len(buf))
 	}
 	// Ensure we work on a full-size buffer (upstream always writes 8192 bytes).
 	if len(buf) < pgControlFileSize {
@@ -308,10 +331,7 @@ func UpdateControlFile(dataDir string, fn func(*ControlFileData)) error {
 	encodeControlFileData(buf, cd)
 	crc := crc32.Checksum(buf[:pgControlCRCOffset], pgCRCTable)
 	binary.LittleEndian.PutUint32(buf[pgControlCRCOffset:], crc)
-	// Write exactly PG_CONTROL_FILE_SIZE bytes, as upstream does. A longer
-	// file (which PG never produces) keeps its tail rather than being
-	// truncated away — O_RDWR overwrite semantics, not O_TRUNC.
-	return writeControlFileDurably(path, buf[:pgControlFileSize])
+	return buf[:pgControlFileSize], nil
 }
 
 // writeControlFileDurably overwrites pg_control in place and fsyncs it,

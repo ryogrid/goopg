@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/initdb"
 	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/wal"
@@ -24,6 +25,15 @@ import (
 // the upstream cluster layout: PG_VERSION, postgresql.conf, base/<oid>/<rel>,
 // global/pg_control, plus a couple of empty subdirs.
 func startBaseBackupTestServer(t *testing.T) (string, string, func()) {
+	t.Helper()
+	return startBaseBackupTestServerWithCheckpointer(t, nil)
+}
+
+// startBaseBackupTestServerWithCheckpointer is startBaseBackupTestServer with
+// a caller-supplied Checkpointer, so a test can make BASE_BACKUP see a
+// non-zero checkpoint REDO location (the pg_control-patch path, M0131-S29).
+// Passing nil reproduces the historical fixture exactly.
+func startBaseBackupTestServerWithCheckpointer(t *testing.T, ckpt executor.Checkpointer) (string, string, func()) {
 	t.Helper()
 	dataDir := t.TempDir()
 	// Minimal cluster file set — enough to exercise the walker /
@@ -79,6 +89,7 @@ func startBaseBackupTestServer(t *testing.T) (string, string, func()) {
 		WAL:              walWriter,
 		WALDirPath:       walDir,
 		WALSegmentSize:   4096,
+		Checkpointer:     ckpt,
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)

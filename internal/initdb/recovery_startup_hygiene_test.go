@@ -194,11 +194,14 @@ func TestOpenWithoutControlFileLeavesMultiXactUnseeded(t *testing.T) {
 // over at xlogrecovery.c:878-886 if its timeline disagrees, and it caps
 // consistency at a point goopg made up.
 //
-// The one deliberate divergence is BASE_BACKUP: initdb.UpdateControlCheckpoint
-// writes minRecoveryPoint = 1 so a PG standby restoring the backup passes
-// XLogRecPtrIsInvalid() in CheckRecoveryConsistency. That path is asserted
-// separately and is ledgered (it mutates the LIVE primary's control file, which
-// upstream's basebackup never does — it sends a modified COPY).
+// The one deliberate divergence is BASE_BACKUP: initdb.BackupControlImage
+// sets minRecoveryPoint = 1 so a PG standby restoring the backup passes
+// XLogRecPtrIsInvalid() in CheckRecoveryConsistency. Since M0131-S29 that value
+// exists ONLY in the image shipped inside the tar — the live primary's control
+// file is never rewritten (upstream's basebackup.c:352-360 sends the file
+// through a plain sendFile), which is what keeps this test's invariant and the
+// backup path from contradicting each other. Asserted by
+// TestBaseBackupDoesNotMutateLiveControlFile (internal/server).
 func TestCrashRecoveryLeavesMinRecoveryPointInvalid(t *testing.T) {
 	dir := freshDataDir(t)
 
