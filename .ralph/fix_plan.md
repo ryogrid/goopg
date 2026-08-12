@@ -2997,7 +2997,9 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       — guessing there would be a wrong time, not an error — as ledger rows, each
       with a test pinning the refusal. Design `0125-0007-…` §6 + README row.
       Gates: units, `TestPort_RegressSuite`, tpch-spotcheck (Q12=2/Q13=35) PASS;
-      mutation-checked. `BC` era input remains open.
+      mutation-checked. (This note used to end "`BC` era input remains open" —
+      stale since the 30th slice landed `internal/pgdatetime/era.go`; corrected
+      2026-08-13 after it cost a loop's selection time.)
       **35th slice (2026-08-11) — `ValidateDate()`'s month/day RANGE check is now
       a real port**: `'20201301'`, `'2020-13-01'`, `'2020-01-32'` were flat 22007
       ("invalid input syntax") — DecodeDateTime recognises the shape, only
@@ -3292,6 +3294,49 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       without validating names, and the TEXT path keeping goopg's own
       field-count message while CSV uses upstream's two. Design
       `0119-0006-copy-csv-reader.md` + README row `0119-0006ac`.
+      **46th slice (2026-08-13) — the trailing zone field a `time` accepted
+      WITHOUT LOOKING AT IT.** The §9 ledger row said `'10:00 A.M.'::time` was
+      wrongly accepted; the probe found the whole class — `stripTimeZoneSuffix`
+      peeled EVERY trailing space-separated token that was not `AM`/`PM` and
+      threw it away, so `'10:00 GARBAGE'`, `'10:00 Japan'`, `'10:00 zzz'` and
+      `'10:00 pst pdt'` each stored a guessed `10:00:00` with no diagnostic —
+      and the COPY TEXT reader shares the function, so a corrupt zone field in
+      a load file was absorbed rather than reported. PG has THREE verdicts here
+      and the TOKENIZER, not the decoder, picks between them: letters followed
+      by `.`/`/`/`-` — or by `+`/a digit while the letters name no `datetktbl`
+      keyword — become `DTK_DATE` and reach `pg_tzset()`, so a miss is 22023
+      `time zone "a.m." not recognized` on the LOWERCASED token; a bare word
+      stays `DTK_STRING`, never reaches the zone database at all, and a miss is
+      22007 — hence `'10:00 Japan'` is an ERROR although `Japan` is a real zone
+      name, while `'10:00 Etc/GMT'::time` is ACCEPTED and
+      `'10:00 America/New_York'::time` is not (`pg_get_timezone_offset()`
+      resolves a fixed-offset zone with no date; a DST zone needs one). Two
+      measured corrections: **`datetktbl` holds not one timezone abbreviation**
+      (they live in the GUC-selected `timezone_abbreviations` table), so
+      `'10:00 UTC+5'` is ONE POSIX zone-spec token — `-05`, the POSIX sign being
+      inverted, not UTC-plus-five — and era/meridiem are ordinary fields that may
+      FOLLOW a zone (`'10:00:00 PST BC'`, `'10:00 AM BC'` parse) while two zone
+      fields may not. New leaf `internal/executor/time_zone_token.go`
+      (`classifyZoneToken`, `pgDateTimeKeywords`, `parsePOSIXZoneOffset`,
+      `fixedZoneOffset`, `stripValidatedZoneSuffix`) is SHARED by
+      `parseTimeString` and `parseTimeTZString` — which fixes three `timetz`
+      bugs for free (`'10:00 BC'` rejected, a fixed-offset zone name rejected,
+      22007 where PG says 22023) and picks up the attached `Z` that
+      `NormalizeInput` folds a spaced zulu into, so `'10:00 Z'::time` stops
+      failing as a malformed hour. Gates: 31 oracle-pinned inputs driven through
+      BOTH paths from one shared table in
+      `internal/executor/time_zone_token_test.go` (the sibling-paths rule),
+      mutation-checked twice (collapsing the 22023 arm → 8 red; calling a DST
+      zone fixed → 7 red); `go test ./internal/executor/ ./internal/pgdatetime/
+      ./internal/config/ ./internal/pgarray/ ./internal/pgnodes/`,
+      `TestPort_RegressSuite` (558 s), `RALPH_PRECOMMIT_SCOPE=units`,
+      `scripts/tpch-spotcheck.sh` (Q12=2, Q13=35) all PASS; 14/14 probes
+      byte-identical to PG 18.3 on a live capped server (5533), COPY TEXT
+      included. Three ledger rows: `pg_tzset()`'s POSIX `tzparse()` is not
+      ported (`'10:00 EST.5'`), `fixedZoneOffset` SAMPLES ten instants instead
+      of reading the transition list, and the abbreviation table is still
+      goopg's 40-entry map rather than the GUC-selected file. Design
+      `0125-0007-…` §17 + README row.
 
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).

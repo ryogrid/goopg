@@ -1099,3 +1099,153 @@ either side of the fallback (impossible day, non-leap astronomical year, year
 zero, a real syntax miss, an out-of-range hour, and the untouched non-BC path).
 Mutation-checked: short-circuiting `bcLeapTimestampFallback` to `ok=false`
 turns all seven field assertions red and returns the `22008` case to `22007`.
+
+## 17. Follow-up 2026-08-13 (M0119-0006, 46th slice) — the trailing zone field a `time` accepted without looking at it
+
+### 17.1 The defect
+
+The §9 ledger row (2026-08-11) recorded that `parseTimeString` strips the zone
+suffix of a `time` input *without validating it*, so `'10:00 A.M.'::time` was
+accepted as `10:00:00` where PG raises `time zone "a.m." not recognized`. The
+probe for this slice found the gap is wider than that one spelling: the old
+`stripTimeZoneSuffix` peeled **every** trailing space-separated token that was
+not `AM`/`PM` and threw it away, so
+
+    '10:00 GARBAGE'::time  →  10:00:00
+    '10:00 Japan'::time    →  10:00:00
+    '10:00 zzz'::time      →  10:00:00
+    '10:00 pst pdt'::time  →  10:00:00
+
+all landed a guessed value in the column with no diagnostic. On PG every one of
+them is an error. This is the worse direction of the two failure modes: refusing
+a spelling PG accepts is visible and reported; accepting nonsense silently
+stores a value the user never wrote. The COPY TEXT reader shares the function,
+so a corrupt zone field in a load file was absorbed rather than reported.
+
+`timetz` was only half-affected — `parseTimeTZString` had its own scan that
+*did* reject an unrecognised token — but that scan knew only the abbreviation
+table and the numeric displacement, so it was wrong in three other ways
+(below).
+
+### 17.2 Where PG's three answers come from
+
+The interesting part is that PG has **three** verdicts for a trailing field, and
+the one you get is decided by the *tokenizer*, not the decoder
+(`postgres/src/backend/utils/adt/datetime.c`):
+
+`ParseDateTime()` lowercases the token and classifies it. A leading run of
+letters is `DTK_STRING` — unless the next character is `.`, `/` or `-`, or is
+`+`/a digit while the letters are **not** a `datetktbl` keyword; then the whole
+token becomes `DTK_DATE`, the shape a zone *name* has.
+
+`DecodeTimeOnly()` then routes by that type:
+
+| type | lookup | failure |
+|---|---|---|
+| `DTK_STRING` | `DecodeTimezoneAbbrev()` (the `timezone_abbreviations` table), then `datetktbl` for `am`/`pm`, `bc`/`ad`, `mon`, `january`, `allballs`, `today`, … | `DTERR_BAD_FORMAT` → **22007** |
+| `DTK_DATE` | `pg_tzset()` on the lowercased token, then `pg_get_timezone_offset()` | not a zone → `DTERR_BAD_TIMEZONE` → **22023** `time zone "%s" not recognized`; a DST zone with no date in the input → `DTERR_BAD_FORMAT` → **22007** |
+
+Two consequences that no amount of reasoning about "is this a zone" would
+produce, and both were measured against PG 18.3 before any code was written:
+
+- **`datetktbl` (datetime.c:105) contains no timezone abbreviation at all.**
+  They live in the separately GUC-selected abbreviation table. So the
+  tokenizer's keyword probe fails for `utc`, and `'10:00 UTC+5'` is ONE
+  `DTK_DATE` token read as a POSIX TZ spec — which is why it yields `-05`, the
+  POSIX sign being the opposite of the SQL displacement, and not UTC plus five
+  hours. `'10:00 UTC-5'::timetz` is `10:00:00+05`.
+- **A bare word never reaches `pg_tzset()`.** `'10:00 Japan'` is 22007 even
+  though `Japan` is a real zone name, because without punctuation the token
+  stays `DTK_STRING`. Conversely `'10:00 Etc/GMT'::time` is *accepted* while
+  `'10:00 America/New_York'::time` is 22007 — a fixed-offset zone resolves
+  without a date, a DST zone does not.
+
+Era and meridiem are ordinary fields, not zones, so they may follow a zone:
+`'10:00:00 PST BC'` and `'10:00 AM BC'` both parse. Two *zone* fields do not
+(`'10:00 pst pdt'` is 22007) — `DecodeTimeOnly`'s `fmask` rejects the repeat.
+
+### 17.3 What landed
+
+New leaf `internal/executor/time_zone_token.go`:
+
+- `classifyZoneToken(tok)` reproduces the table above, returning one of
+  meridiem / era / fixed-offset / DST-name-needs-date / not-recognised /
+  bad-format plus the offset. `pgDateTimeKeywords` is `datetktbl`'s
+  wholly-alphabetic token set, present for the tokenizer's `datebsearch` probe
+  and nothing else.
+- `parsePOSIXZoneOffset` reads the `±h[h][:mm[:ss]]` tail of a POSIX spec. It
+  is deliberately *not* `parseTZOffset`: that one requires the two-digit hour of
+  the SQL displacement spelling, while POSIX allows one digit and PG enforces no
+  upper bound here (`'utc-25'::timetz` is `+25` on PG 18.3).
+- `fixedZoneOffset(loc)` answers `pg_get_timezone_offset()`'s question — one
+  offset for all time? — by sampling both solstice sides of 1901/1970/2000/
+  2025/2100, since Go exposes no transition list.
+- `stripValidatedZoneSuffix` replaces `stripTimeZoneSuffix` and is now shared by
+  `parseTimeString` and `parseTimeTZString`, so the two cannot drift again. It
+  peels era fields freely, at most one zone field, stops at the meridiem, and
+  handles the attached `Z` that `pgdatetime.NormalizeInput` folds a spaced or
+  lowercase zulu into — which is why `'10:00 Z'::time` used to fail as a
+  malformed hour and now returns `10:00:00`.
+
+`wrapTimeTZError` gained a 22023 pass-through: that error names the offending
+*zone*, not the input, so re-wrapping it as 22007 would have swapped PG's error
+for a different one.
+
+Three fixes fell out of sharing the classifier with `timetz`: `'10:00 BC'` was
+rejected outright, a fixed-offset zone *name* was rejected, and a name-shaped
+token that names nothing got 22007 instead of 22023.
+
+### 17.4 PG 18.3 answers this slice now reproduces
+
+Captured on port 65432, session `TimeZone` `Asia/Tokyo`.
+
+| input | PG 18.3 |
+|---|---|
+| `'10:00 PST'::time`, `'10:00 UTC'`, `'10:00 Z'`, `'10:00 +05'`, `'10:00+05'` | `10:00:00` |
+| `'10:00 Etc/GMT'::time`, `'10:00 UTC-5'::time` | `10:00:00` |
+| `'10:00 BC'::time`, `'10:00 AD'`, `'10:00:00 PST BC'`, `'10:00 AM BC'` | `10:00:00` |
+| `'12:00 AM'::time` | `00:00:00` |
+| `'10:00 UTC-5'::timetz` / `'10:00 UTC+5'` / `'10:00 GMT+3'` | `+05` / `-05` / `-03` (POSIX sign inverted) |
+| `'10:00 A.M.'::time`, `'10:00 P.M.'`, `'10:00 ABC-DEF'`, `'10:00 Foo.Bar'` | ERROR 22023 `time zone "a.m." not recognized` (lowercased token) |
+| `'10:00 GARBAGE'::time`, `'10:00 zzz'`, `'10:00 Japan'`, `'10:00 EST5EDT'` | ERROR 22007 |
+| `'10:00 allballs'::time`, `'10:00 today'`, `'10:00 Mon'`, `'10:00 January'` | ERROR 22007 (a keyword, but not a zone one) |
+| `'10:00 a_b'::time`, `'10:00 xy:zw'`, `'10:00 12'`, `'10:00 -'`, `'10:00 .'` | ERROR 22007 |
+| `'10:00 pst pdt'::time` | ERROR 22007 (two zone fields) |
+| `'10:00 America/New_York'::time` | ERROR 22007 (DST zone, no date) |
+| `'2003-03-07 15:36:39 America/New_York'::time` | `15:36:39` (the date resolves it) |
+| `'2020-01-01 10:00 A.M.'::time` | ERROR 22023 — the split survives a date prefix |
+
+### 17.5 Verification
+
+`internal/executor/time_zone_token_test.go` drives all 31 oracle-pinned inputs
+through **both** `parseTimeString` and `parseTimeTZString` from one shared table
+(the sibling-paths rule: a green test on one proves nothing about the other),
+plus the offsets `timetz` keeps, the dated/bare DST-zone pair, and
+`fixedZoneOffset`'s fixed-vs-DST separation. Mutation-checked twice: collapsing
+the 22023 arm into bad-format turns 8 subtests red, and calling a DST zone
+fixed turns 7 red.
+
+End-to-end on a throwaway capped server (port 5533), all 14 probes byte-identical
+to PG including the COPY TEXT reader, which now reports
+`'10:00 GARBAGE'` in a `time` column instead of storing `10:00:00`.
+
+Gates: `go test ./internal/executor/ ./internal/pgdatetime/ ./internal/config/
+./internal/pgarray/ ./internal/pgnodes/` PASS, `TestPort_RegressSuite` PASS
+(558 s), `RALPH_PRECOMMIT_SCOPE=units` PASS, `scripts/tpch-spotcheck.sh` PASS
+(Q12=2, Q13=35).
+
+### 17.6 Deferred (ledger rows 2026-08-13)
+
+- **`pg_tzset()`'s POSIX TZ parser is not reproduced.** `'10:00 EST.5'::timetz`
+  is `-05` on PG; goopg raises 22023 because `.5` is not the `±hh` shape and
+  `time.LoadLocation("est.5")` fails. Reaching full parity means porting
+  upstream's `tzparse()`, which is a slice of its own.
+- **`fixedZoneOffset` samples rather than reads the transition list.** A zone
+  whose only transitions fall outside the ten probe instants would be called
+  fixed and would then be accepted on a bare time with one arbitrary offset. No
+  zone in tzdata 2025b behaves that way, but the check is a stand-in for
+  `pg_get_timezone_offset()`, not a port of it.
+- **The abbreviation table is still goopg's 40-entry `tzAbbrevOffsets`, not the
+  GUC-selected file.** `timezone_abbreviations` is not implemented, so an
+  abbreviation PG's `Default` file carries and goopg's map does not (e.g. `WITA`,
+  `CHAST`) is 22007 here and accepted there.

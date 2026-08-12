@@ -447,24 +447,24 @@ func parseTimeString(s string) (time.Time, error) {
 	hadDatePrefix := false
 	if len(s) >= 10 && s[4] == '-' && s[7] == '-' {
 		// Extract time portion after the date (YYYY-MM-DD ); any zone suffix
-		// it carries is dropped by stripTimeZoneSuffix below.
+		// it carries is dropped by stripValidatedZoneSuffix below.
 		hadDatePrefix = true
 		s = strings.TrimSpace(s[10:])
 	}
 
-	// Detect and reject named timezone in bare time strings (e.g. "15:36:39 America/New_York").
-	if !hadDatePrefix {
-		if idx := strings.Index(s, " "); idx >= 0 && strings.Contains(s[idx+1:], "/") {
-			return time.Time{}, &ExecError{Code: "22007",
-				Message: fmt.Sprintf("invalid input syntax for type time: %q", orig)}
-		}
-	}
-
-	// Strip the timezone suffix (e.g. " PST", " EDT", "+05", "+05:30"); a
-	// time-only value has no zone to apply it to. The AM/PM marker is NOT a
-	// zone and must survive — dropping it here is what made
+	// Strip the trailing zone/era fields (" PST", " Etc/GMT", "+05", "+05:30",
+	// " BC"); a time-only value has no zone to apply it to, so the offset is
+	// discarded here — parseTimeTZString is the caller that keeps it. The AM/PM
+	// marker is NOT a zone and must survive: dropping it here is what made
 	// '2020-01-01 12:00 AM'::timestamp lose its meridiem.
-	s = stripTimeZoneSuffix(s)
+	//
+	// M0119-0006: the fields are now VALIDATED rather than assumed to be a
+	// zone, so '10:00 GARBAGE' is 22007 and '10:00 A.M.' is 22023 as on PG —
+	// see classifyZoneToken for how the tokenizer picks between the two.
+	s, _, _, err := stripValidatedZoneSuffix(s, hadDatePrefix, "time", orig)
+	if err != nil {
+		return time.Time{}, err
+	}
 
 	// M0119-0006: field decoding proper is PostgreSQL's, not a layout table's —
 	// see pgdatetime.ParseTimeOfDay for the forms this unlocks ('10:00.5' as
@@ -515,34 +515,6 @@ func parseTimeString(s string) (time.Time, error) {
 	// Anchor to epoch date 1970-01-01 UTC. A whole-day time (24:00:00, 23:59:60)
 	// is stored as next-day midnight, which is how it round-trips as 24:00:00.
 	return time.Date(1970, 1, 1+dayCarry, norm.Hour, norm.Min, norm.Sec, norm.Nsec, time.UTC), nil
-}
-
-// stripTimeZoneSuffix removes the zone part of a time-only input: every
-// space-separated trailing token ("PST", "+05:30", "America/New_York") plus an
-// attached numeric offset ("10:00+05"). A time has no date to resolve a zone
-// against, so PostgreSQL's time_in likewise decodes and then ignores it.
-//
-// The AM/PM marker is explicitly NOT a zone token. It is an ordinary field to
-// PostgreSQL's splitter, and stripping it here was how goopg turned
-// '2020-01-01 12:00 AM' into a parse failure and '12:00 AM' into noon.
-func stripTimeZoneSuffix(s string) string {
-	for {
-		idx := strings.LastIndex(s, " ")
-		if idx < 0 {
-			break
-		}
-		switch strings.ToUpper(strings.TrimSpace(s[idx+1:])) {
-		case "AM", "PM":
-			return s
-		}
-		s = strings.TrimSpace(s[:idx])
-	}
-	if plus := strings.LastIndex(s, "+"); plus > 2 {
-		return s[:plus]
-	} else if minus := strings.LastIndex(s, "-"); minus > 2 {
-		return s[:minus]
-	}
-	return s
 }
 
 // tzAbbrevOffsets maps common timezone abbreviations to their UTC offsets
@@ -708,56 +680,31 @@ func parseTimeTZString(s string) (time.Time, int, error) {
 		return t, offsetSecs, nil
 	}
 
-	// Bare time string — reject named timezones (e.g. "15:36:39 America/New_York")
-	if idx := strings.Index(s, " "); idx >= 0 {
-		tzPart := strings.TrimSpace(s[idx+1:])
-		if strings.Contains(tzPart, "/") {
-			return time.Time{}, 0, &ExecError{Code: "22007",
-				Message: fmt.Sprintf("invalid input syntax for type time with time zone: %q", orig)}
-		}
-	}
-
-	// Detach the AM/PM marker before timezone extraction so the zone scan below
-	// does not mistake it for an abbreviation; it is re-attached verbatim for
-	// parseTimeString, which owns the meridiem rules (hour 12 AM is hour 0).
-	upper := strings.ToUpper(s)
+	// Bare time string — the trailing fields go through the same validating
+	// classifier as `time` (M0119-0006). It replaces this arm's own zone scan,
+	// which knew only the abbreviation table and the numeric displacement: an
+	// era field was rejected outright ('10:00 BC'::timetz is `10:00:00` on PG),
+	// a zone *name* was rejected even when fixed-offset ('10:00 Etc/GMT'), and
+	// a name-shaped token that names nothing got 22007 where PG raises 22023
+	// ('10:00 A.M.' → `time zone "a.m." not recognized`).
+	//
+	// The AM/PM marker is detached first so it reaches parseTimeString, which
+	// owns the meridiem rules (hour 12 AM is hour 0) — stripValidatedZoneSuffix
+	// stops at it, but it must not block the era/zone fields that may FOLLOW it
+	// ('10:00 AM BC' parses on PG).
 	meridiem := ""
-	if strings.HasSuffix(upper, " PM") || strings.HasSuffix(upper, " AM") {
+	if u := strings.ToUpper(s); strings.HasSuffix(u, " PM") || strings.HasSuffix(u, " AM") {
 		meridiem = s[len(s)-3:]
 		s = strings.TrimSpace(s[:len(s)-3])
-		upper = strings.ToUpper(s)
 	}
 
-	// Extract timezone: space-separated abbreviation or explicit offset after time.
-	// Unrecognized suffixes are rejected (PostgreSQL errors on unknown TZ abbreviations).
-	if idx := strings.LastIndex(s, " "); idx >= 0 {
-		tzPart := s[idx+1:]
-		timePart := s[:idx]
-		// Try as abbreviation
-		if off, ok := tzAbbrevOffsets[strings.ToUpper(tzPart)]; ok {
-			offsetSecs = off
-			s = timePart
-		} else if off, ok := parseTZOffset(tzPart); ok {
-			offsetSecs = off
-			s = timePart
-		} else {
-			// Unrecognized abbreviation — reject with error (e.g. "m2", "MSK m2")
-			return time.Time{}, 0, &ExecError{Code: "22007",
-				Message: fmt.Sprintf("invalid input syntax for type time with time zone: %q", orig)}
-		}
-	} else {
-		// No space — check for inline +HH or -HH suffix
-		if plus := strings.LastIndex(s, "+"); plus > 2 {
-			if off, ok := parseTZOffset(s[plus:]); ok {
-				offsetSecs = off
-				s = s[:plus]
-			}
-		} else if minus := strings.LastIndex(s, "-"); minus > 2 {
-			if off, ok := parseTZOffset(s[minus:]); ok {
-				offsetSecs = off
-				s = s[:minus]
-			}
-		}
+	rest, off, haveOff, err := stripValidatedZoneSuffix(s, false, "time with time zone", orig)
+	if err != nil {
+		return time.Time{}, 0, err
+	}
+	s = rest
+	if haveOff {
+		offsetSecs = off
 	}
 
 	// Now parse the bare time portion with its meridiem re-attached.
@@ -777,6 +724,12 @@ func wrapTimeTZError(err error, orig string) error {
 	if ee, ok := err.(*ExecError); ok && ee.Code == "22008" {
 		return &ExecError{Code: "22008",
 			Message: fmt.Sprintf("date/time field value out of range: %q", orig)}
+	}
+	// M0119-0006: an unrecognised zone NAME is 22023 and already names the
+	// offending zone rather than the input, so re-wrapping it as 22007 would
+	// swap PG's error for a different one. It is not a syntax error at all.
+	if ee, ok := err.(*ExecError); ok && ee.Code == "22023" {
+		return ee
 	}
 	return &ExecError{Code: "22007",
 		Message: fmt.Sprintf("invalid input syntax for type time with time zone: %q", orig)}
