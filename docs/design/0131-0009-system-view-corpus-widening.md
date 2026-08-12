@@ -1309,6 +1309,118 @@ the toasted-rule set (five → six, +12066 at 6 chunks), `base/{1,5}/2838`
 (10 → 12 pages) and the hosted-PG chunk list (`12067/6/11089`; upstream stores
 11481 B, the usual 3-4% pglz divergence).
 
+## S9.4 — `information_schema`: MEASURED, then deferred (2026-08-12)
+
+S9.4 is the last item in S9 and the plan always expected it to end in a ledger
+row. That expectation is now **measured rather than asserted**. The measurement
+recipe is the oracle recipe from S9.3g: `initdb` a throwaway PG 18.3 cluster out
+of `postgres/local_install`, start it on a private socket
+(`pg_ctl -o "-p 5539 -k $D -h ''"` — bare `-k` still binds TCP), and query it.
+Everything below is a number that cluster answered, not a reading of
+`information_schema.sql`.
+
+### What the corpus actually is
+
+| catalog | rows S9.4 would have to seed | measured |
+|---|---|---|
+| `pg_namespace` | 1 (`information_schema`, OID **13273**) | `select oid from pg_namespace` |
+| `pg_class` | **69** — 65 views + **4 real tables** | `relnamespace=13273` group by `relkind` |
+| `pg_type` | **148** — 5 domains + 69 relation rowtypes + 74 array peers (one per) | `typnamespace=13273`, OIDs 13286..13621 |
+| `pg_attribute` | **696** user columns | `attnum>0` |
+| `pg_rewrite` | **65** rules, **1.81 MB** of `ev_action` text | max 210 908 B (`columns`) |
+| `pg_proc` | **11** helper functions, OIDs 13274..13285 | `pronamespace=13273` |
+| `pg_constraint` | **2** domain CHECKs (`cardinal_number_domain_check`, `yes_or_no_check`) | `connamespace=13273` |
+| heap rows | **801** — `sql_features` 755, `sql_sizing` 23, `sql_implementation_info` 12, `sql_parts` 11 | `count(*)` per table |
+
+### Five findings that change the shape of the successor slice
+
+**F31 — goopg's `information_schema` namespace OID was wrong, and it is a
+client-visible value.** `internal/catalog/catalog.go` registered `13183` under
+the comment "stock PG18 initdb-assigned OID". Two independent fresh initdbs of
+`postgres/local_install` both answer **13273**; no run of this build produces
+13183. The constant is not inert — it is what the virtual
+`pg_catalog.pg_namespace` reports to every client and what `SchemaNameForOID`
+reverses on the restart path. **Fixed in this slice** (the only code landed by
+S9.4) and pinned by `TestBootstrapNamespaceOIDsMatchPG18`, which also documents
+the measurement recipe so a PG rebase re-measures instead of guessing.
+
+The reason the value cannot be looked up in a `.dat` file is the same reason S9
+had to pin the view OIDs: `information_schema` is created *after* bootstrap, by
+initdb running `information_schema.sql`, so it draws from the post-bootstrap
+counter at `FirstUnpinnedObjectId = 12000`. That counter is one sequence shared
+with S9's own corpus — measured occupancy: **12000..12355** the 80
+`system_views.sql` views (exactly the band S9 pinned, confirming every pin
+against the oracle: `pg_stats_ext_exprs` 12063, `pg_seclabels` 12099),
+**12356..13272** almost entirely the **894 `pg_description`** comment rows for
+them, then **13273..13621** the whole `information_schema` band. S9's pins and
+S9.4's future pins are two ends of one counter.
+
+**F32 — S9.4 has ZERO dependency on S9.1–S9.3.** Measured through `pg_depend`:
+no `information_schema` rewrite rule references any `pg_catalog` **view**
+(count = 0; they go straight to base catalogs). The 14 view-on-view edges that
+made S9.3 order-sensitive have no analogue here, so the successor milestone is
+schedulable independently and in any internal order — it is not blocked on, and
+does not extend, the 80-view corpus.
+
+**F33 — the TOAST ceiling is already discharged, and S9.4 needs it heavily.**
+11 of the 65 rules still exceed the ~8160 B inline limit *after* pglz
+(`columns` 24 201 B, `transforms` 19 659 B, `check_constraints` 16 059 B, …).
+That would have been a hard blocker before M0131-S20.2, but the `pg_rewrite`
+TOAST writer landed there and the pg_catalog corpus already ships **6** toasted
+rules of its own (`pg_seclabels` compresses to 35 379 B — larger than anything
+in `information_schema`). So the biggest-looking ceiling in the original S9 list
+is the one prerequisite S9.4 does **not** need work for.
+
+**F34 — 10 of the 11 helper functions are new-style SQL-body functions, i.e. a
+SECOND node-tree capture surface.** Only `_pg_expandarray` has a `prosrc`
+(51 B); `_pg_index_position`, `_pg_truetypid`, `_pg_truetypmod`,
+`_pg_char_max_length`, `_pg_char_octet_length`, `_pg_numeric_precision`,
+`_pg_numeric_precision_radix`, `_pg_numeric_scale`, `_pg_datetime_precision`
+and `_pg_interval_type` all carry `prosrc = ''` and a non-null **`prosqlbody`**,
+which is a `pg_node_tree` exactly like `ev_action`. The same conclusion as the
+`pgnodes` non-path therefore applies to it: these must be **captured**, not
+generated, and `capture-ev-action.sh` currently has no `prosqlbody` mode.
+
+**F35 — four of the 69 relations are tables with content, which no S9 slice has
+ever produced.** `sql_features` (755 rows), `sql_sizing` (23),
+`sql_implementation_info` (12) and `sql_parts` (11) are ordinary heaps that
+initdb `COPY`s from `sql_features.txt`. Every S9 slice so far seeded *metadata*
+for relations whose rows a hosted PG computes; here the 801 rows are the data.
+That is a distinct mechanism (bulk heap load at initdb time), and it is the
+reason S9.4 cannot be a "just capture 65 more blobs" slice.
+
+### Why it is deferred rather than dribbled
+
+The one thing S9.4 must not do is land a namespace and fill it later. The
+`information_schema` name is already resolvable in goopg's own front end
+(8 virtual relations, `registerInformationSchemaTables`), so an on-disk
+namespace holding 0 of its 69 relations would report a schema that exists and
+is empty — strictly worse for a hosted PG than today's clean absence, and the
+exact anti-pattern that a half-filled `pg_type` produced earlier in this
+milestone (an IN-list that worked at all-zero broke at half-filled). The
+prerequisites are also genuinely serial in a way S9.3's were not: the domains
+must exist before any view's `pg_attribute` types resolve, the 11 functions
+before any view body does, and the 4 tables' data before `sql_features` answers.
+
+So S9.4 lands **only F31** and defers the corpus, with the decomposition below
+as the resume point. Ledger rows filed; the fix_plan item stays unchecked.
+
+### Successor decomposition (the resume point, in dependency order)
+
+1. **S9.4a** — `information_schema` namespace row (13273) **plus** the 5 domains
+   + their 5 array peers + the 2 domain CHECK constraints, atomically.
+2. **S9.4b** — the 11 helper functions; needs a `prosqlbody` capture mode in
+   `capture-ev-action.sh` (F34) for 10 of them.
+3. **S9.4c** — the 4 data tables and their 801 heap rows (F35).
+4. **S9.4d..** — the 65 views in `information_schema.sql` order, reusing the S9
+   capture/pin/regen loop unchanged; 11 of them exercise the TOAST writer (F33).
+
+Ceiling check for the successor: none of the S9 ceilings survive as blockers —
+#1 TOAST is discharged (F33), the OID-collision objection is void for the same
+reason it was in S8 (`FirstUserOID = 16384` floors every minted OID, and the
+13273..13621 band is below it), and the dual-definition hazard is bounded to the
+**8** relations goopg answers virtually rather than all 69.
+
 ## References
 
 - M0131 implementation plan §S9, `docs/design/0131-bidirectional-cluster-dir-coldstart-and-system-views.md`

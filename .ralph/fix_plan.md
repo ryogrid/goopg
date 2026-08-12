@@ -4417,10 +4417,44 @@ Theme C — Real PG hosted on goopg evaluates views (closes "goopg cannot host a
       `TestE2E_PGColdStartOnGoopgDataDir` PASS + 2 scripted break directions,
       UNITS PASS, `go build ./...` + `go vet` clean, pgbench smoke via the hook.
       Design `0131-0009` §S9.3g + F30.
-      **Remaining in S9: no ceilings and no pg_catalog views — only S9.4**
-      (`information_schema`, 65 views, expected to defer), whose
-      fail-when-fixed tripwire (`information_schema.tables`) F29 already
-      installed.
+      **S9.4 MEASURED AND DEFERRED 2026-08-12 — S9 has nothing left to run.**
+      The "expected to defer" verdict is now a measurement, not an assertion:
+      a throwaway PG 18.3 oracle (`initdb` + `pg_ctl -o "-p 5539 -k $D -h ''"`)
+      was queried for the whole corpus — 1 namespace row (OID **13273**),
+      **69** `pg_class` rows (65 views + **4 real tables**), **148** `pg_type`
+      rows (5 domains + 69 rowtypes + 74 array peers), **696** `pg_attribute`
+      rows, **65** `pg_rewrite` rules totalling **1.81 MB** of `ev_action`,
+      **11** `pg_proc` helpers, 2 domain CHECK constraints and **801 heap rows
+      of DATA** (`sql_features` 755, `sql_sizing` 23,
+      `sql_implementation_info` 12, `sql_parts` 11). The slice landed exactly
+      one thing — **F31**: goopg registered `information_schema` at namespace
+      OID **13183** under the comment "stock PG18 initdb-assigned OID", and no
+      run of this build produces that; two independent fresh initdbs both
+      answer **13273**. The constant is client-visible (it feeds the virtual
+      `pg_catalog.pg_namespace` and `SchemaNameForOID`'s restart path), so it
+      is fixed and pinned by `TestBootstrapNamespaceOIDsMatchPG18` together
+      with pg_catalog/pg_toast/public and the measurement recipe. Four more
+      findings reshape the successor: **F32** — `pg_depend` says ZERO
+      `information_schema` rule references any `pg_catalog` *view*, so S9.4 is
+      independent of S9.1–S9.3 and of the 14 view-on-view edges; **F33** — the
+      TOAST ceiling is already discharged by M0131-S20.2 (11 of the 65 rules
+      exceed 8160 B after pglz, but the pg_catalog corpus already ships 6
+      toasted rules and `pg_seclabels` alone is larger than anything in
+      `information_schema`); **F34** — 10 of the 11 helpers are new-style SQL
+      functions whose body is a **`prosqlbody`** `pg_node_tree`, a SECOND
+      capture surface `capture-ev-action.sh` cannot yet emit; **F35** — the 4
+      tables carry real rows loaded from `sql_features.txt`, a mechanism no S9
+      slice has ever produced. Deferred wholesale rather than dribbled: the
+      `information_schema` name already resolves in goopg's front end (8
+      virtual relations), so an on-disk namespace holding 0 of 69 relations
+      would report a schema that exists and is empty — worse than clean
+      absence, and the half-filled-catalog anti-pattern this milestone was
+      already bitten by. Successor decomposition (S9.4a namespace+domains
+      atomically, S9.4b helpers, S9.4c data tables, S9.4d.. the 65 views;
+      OID band 13273..13621) is in design `0131-0009` §S9.4; **2 ledger rows**.
+      Its fail-when-fixed tripwire (`information_schema.tables`) stays as F29
+      installed it. Gates: `internal/catalog` PASS, UNITS PASS,
+      `go build ./...` + `go vet` clean, pgbench smoke via the commit hook.
       **Superseded — S9.3f LANDED 2026-08-12 — the last instance of ceiling #4 CLOSED,
       corpus 78 → 79 of 80.** `pg_seclabels` (12099) is on disk and evaluable
       on a hosted PG. `pg_seclabel` (3596) and `pg_largeobject_metadata` (2995)
