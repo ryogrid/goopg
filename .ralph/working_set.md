@@ -1,67 +1,56 @@
 (idle — nothing in flight)
 
-M0119-0006 56th slice landed — binary `COPY` of `jsonb`, both directions. goopg
-carries `json`/`jsonb` as a `KindString` Datum holding the JSON text, so both
-halves fell through to the default and were wrong by exactly ONE BYTE at each
-end: `jsonb_send` (jsonb.c:124) is `pq_sendint8(1)` + `pq_sendtext(JsonbToCString)`
-— encode omitted the version byte, decode failed to strip it. Decode now also
-runs `jsonb_from_cstring`'s parse (22P02). `json` deliberately has no arm
-(`json_send` IS `textsend`), pinned. Item stays UNCHECKED (standing
-slice-by-slice cluster); 1 ledger item resolved in place, 2 filed; design
-`0119-0006-copy-binary-jsonb.md` + README index row.
+M-NIGHTLY `AI-20260813-005117-008` (`race/internal/wal
+TestCheckpointerVolumeTrigger`) fixed and committed.
 
-Selection note: banner (`## Current Priority`, 2026-08-11) re-verified. M-NIGHTLY
-filing done — `ci/logs/action-items.md` still run `20260812-005501`, all four
-`## AI-` items already filed. M0131's only unchecked items are S9 and S24 (both
-deferred with ledger rows), M0130 has ZERO unchecked items (verified by line
-range 801–2002, not by the `awk /^## M0130/,/^## M0131/` range — those headings
-are 3300 lines apart and the naive range counts M0119's items too), and
-M0132/M0133 remain "FILED, NOT PROMOTED". Fall-through → M0119-0006.
+Selection note: the previous baton claimed "M0131's only unchecked items are
+S9/S24 (both deferred)" — half wrong, and worth re-checking rather than
+inheriting. S24 IS explicitly deferred (design 0131-0016, re-arm trigger is a
+skipped S28 subtest). S9 is NOT deferred as a whole: it ran to 80/80 pg_catalog
+views on 2026-08-12, and only its last sub-slice S9.4 (`information_schema`) was
+deferred — into M0133, which the banner files but deliberately does NOT promote.
+Net effect is the same (M0131 has nothing selectable, M0130 has zero unchecked
+items, so M-NIGHTLY is selectable) but the reasoning differs. Verify milestone
+state from the ledger, not from the previous baton's summary.
 
-**The finding worth carrying: a PASSING `…AgreesWithHeapEncode` pin is not
-always evidence.** The 55th slice's lesson was "clean is evidence, not
-assumption"; this slice qualifies it. The pin passed here because BOTH twins are
-wrong together — goopg's heap `jsonb` is varlena TEXT where upstream's is a
-`JsonbContainer`/`JEntry` tree. The 55th's rule of thumb (expect the adjacent
-defect when the type SHARES another type's heap arm — `jsonb` rides the default
-varlena-text arm) was right about WHERE and wrong only about SIZE: the defect is
-the storage format itself, too large to absorb, so it is ledgered. **When the pin
-passes, ask what upstream's heap image actually IS before calling it agreement.**
+**The finding worth carrying: the fix_plan's own hypothesis was wrong, and the
+item's "confirm before treating it as a checkpointer bug" clause is what caught
+it.** The item was filed as a load-sensitive 2 s-deadline flake, by analogy to
+the already-fixed `internal/mctx TestMultipleChunks`. It is an unsynchronised
+start instead: `Checkpointer.Run` seeds `volumeAnchor` from `WrittenLSN()`
+*inside its own goroutine*, while the test that spawned it immediately appends 16
+records. A late-scheduled `Run` anchors AFTER those appends, so the writer sits
+level with the anchor and the volume trigger can never fire — raising the
+deadline would have done nothing. Filing an item by analogy to a previously-fixed
+item is a hypothesis, not a diagnosis.
 
-Second finding: this defect was SYMMETRIC (encode omits, decode fails to strip),
-so goopg↔goopg round-trips perfectly and only the oracle exposes it. The
-round-trip guards passed at HEAD; the SHAPE guards (`SendShape`,
-`AgreesWithHeapEncode`, `RowFraming`) are what went red. Write shape pins, not
-just round-trip pins.
+Second finding: `-cpu=1` is a cheap, decisive substitute for "a co-loaded nightly
+host". It forced 6/20 failures with the byte-identical nightly message (2.02 s
+each) on the old code, and 20/20 passes on the new. Prove a scheduling flake by
+constraining GOMAXPROCS before reaching for load simulation or repeat counts.
 
-Candidate 57th slice — `bpchar`, the LAST type in this chain, and it should be
-bundled: `bpcharsend` IS `textsend` (bytes accidentally right) but `bpchar_recv`
-applies `bpchar_input`'s BLANK PADDING to the declared typmod, which needs the
-column typmod — the SAME `copyBinaryToDatum` signature widening that the three
-`Adjust{Time,Interval}ForTypmod` rows (49th/51st/55th) are blocked on. Widening
-`copyBinaryToDatum`/`datumToCopyBinary` to take `catalog.Column` collapses FOUR
-ledger rows into one slice. Other candidates: the `reg*`/`cid` family (heap
-stores them as varlena TEXT — fix the HEAP first); heap `jsonb` JEntry tree;
-`jsonb` input canonicalisation; serial-alias canonicalisation; zone-less
-`timestamptz`; POSIX `tzparse()`.
+Third: reordering a lifecycle hook can be the fix. `OnLoopStart` fired as Run's
+first statement, so nothing could wait for the loop to be *armed*. Moving both
+hooks below the volume-ticker arming makes "started" observable and useful,
+with no production change (the only consumer is `initdb.Open`'s
+`activity.SetCurrentGoroutine`).
 
-Worth carrying:
-- `postgres/` here is a real DIRECTORY, not the `../postgres` symlink — psql is
-  at `postgres/local_install/bin` relative to the repo root.
-- goopg's initdb subcommand is `init` (NOT `initdb`), flags `-D -U -N`.
-- Oracle E2E recipe: `PGPASSWORD=postgres` + `\copy` (server-side `COPY … TO
-  '<file>'` is unsupported by goopg), then `cmp` the files. Clean up any `zz_`
-  tables you create on 65432 — it is the TPC-H reference cluster.
-- Fastest fail-at-HEAD proof: `cp` files aside, `git checkout --` them, run,
-  restore.
-- A python3 one-liner that mutates a PG-authored binary COPY file (strip a byte,
-  fix the int32 length) is the cheapest way to prove "a real PG rejects HEAD's
-  stream" without rebuilding goopg at HEAD.
+Ledger row filed: the same seeding pattern survives in PRODUCTION, where
+`NewCheckpointer` (`initdb.Open:1815`) and `Run` (`cmd/goopg/main.go:806`) are far
+apart — WAL appended in between, incl. the end-of-recovery checkpoint, is
+absorbed into the anchor and widens the first `max_wal_size` window. Self-limiting
+(superseded at the first checkpoint), so it was not fixed here.
 
-Gates: `go test` PASS for executor/wal/catalog, `go build ./...` + `go vet`
-clean, `RALPH_PRECOMMIT_SCOPE=units` PASS, `scripts/tpch-spotcheck.sh` PASS
-(Q12=2, Q13=35), oracle E2E on a capped throwaway server (5533) vs PG 18.3
-(65432) byte-identical `COPY … TO … (FORMAT binary)` plus identical cross-ingest
-in BOTH directions, pgbench smoke via the commit hook.
+Next candidates (all M-NIGHTLY, selectable): `TestPort_IsolationEvalPlanQual`
+(REOPENED a 3rd time — two prior fixes did not hold; understand why before a 3rd);
+`TestPort_IsolationInsertConflictDoUpdate4` (its no-`4` sibling PASSES → a
+per-permutation divergence); PredicateHash / ReceiptReport (open since
+2026-08-11, 3 AI-ids each).
+
+Gates: `go build ./...` clean; `go test -race ./internal/wal/` PASS (9.99 s);
+`-race -cpu=1 -count=20` on the target test 20/20 PASS (probe, one-off);
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS (incl. a fresh
+`internal/initdb` 236 s — the hooks' production consumer); pgbench smoke PASS via
+the commit hook; `make ralph-state-guard` OK.
 
 In-flight: none.

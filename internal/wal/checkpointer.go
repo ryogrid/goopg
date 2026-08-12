@@ -481,12 +481,6 @@ func (c *Checkpointer) SetCompletionTarget(t float64) {
 
 // Run starts the periodic checkpoint loop and returns when ctx is canceled.
 func (c *Checkpointer) Run(ctx context.Context) error {
-	if c.cfg.OnLoopStart != nil {
-		c.cfg.OnLoopStart()
-	}
-	if c.cfg.OnLoopEnd != nil {
-		defer c.cfg.OnLoopEnd()
-	}
 	ticker := time.NewTicker(c.cfg.Interval)
 	defer ticker.Stop()
 
@@ -503,6 +497,22 @@ func (c *Checkpointer) Run(ctx context.Context) error {
 		vt := time.NewTicker(c.cfg.VolumeCheckInterval)
 		defer vt.Stop()
 		volumeC = vt.C
+	}
+
+	// The hooks fire only once the loop is fully ARMED — after the
+	// volume anchor is seeded, not before it (AI-20260813-005117-008).
+	// The anchor is read from the writer inside this goroutine while the
+	// caller that spawned Run keeps appending, so "Run has started" is
+	// only an observable, useful fact once the anchor is stored: a waiter
+	// that unblocks earlier can still race its own appends ahead of the
+	// seed and be absorbed into the anchor, which silently widens the
+	// first max_wal_size window. Production semantics are unchanged —
+	// both hooks still bracket the entire timer/volume loop.
+	if c.cfg.OnLoopStart != nil {
+		c.cfg.OnLoopStart()
+	}
+	if c.cfg.OnLoopEnd != nil {
+		defer c.cfg.OnLoopEnd()
 	}
 
 	for {

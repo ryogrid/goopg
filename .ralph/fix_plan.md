@@ -824,15 +824,26 @@ there, not re-filed.
       the summarizer over this very run turns 17 items into 10 regressions + 1
       infra item. Regression test:
       `AnalyzeUnitsClassificationTest.test_build_failed_packages_collapse_into_one_infra_item`.
-- [ ] **race/internal/wal — `TestCheckpointerVolumeTrigger` load-sensitive flake**
-      — AI-20260813-005117-008. This is the ONE race item that genuinely
-      compiled and ran: `checkpointer_test.go:281: volume trigger did not fire
-      within 2s`, under `-race` at `-p=4`/`GOMEMLIMIT=5GiB`/`MemoryMax=8G`. Same
-      shape as the already-fixed `race/internal/mctx TestMultipleChunks` flake
-      (2 s wall-clock deadline on a co-loaded nightly host), so the likely fix is
-      a deadline that scales with load rather than a product change — confirm
-      before treating it as a checkpointer bug. Repro: `go test -race -run
-      '^TestCheckpointerVolumeTrigger$' ./internal/wal/`. PARKED per banner.
+- [x] **race/internal/wal — `TestCheckpointerVolumeTrigger`** — AI-20260813-005117-008.
+      **DONE 2026-08-13.** The ONE race item that genuinely compiled and ran:
+      `checkpointer_test.go:281: volume trigger did not fire within 2s`, under
+      `-race` at `-p=4`/`GOMEMLIMIT=5GiB`/`MemoryMax=8G`. Filed as the same shape
+      as the fixed `race/internal/mctx TestMultipleChunks` deadline flake — and
+      that hypothesis was WRONG, which the "confirm before treating it as a
+      checkpointer bug" instruction is what caught. It is an unsynchronised start,
+      not a tight deadline: `Run` seeds `volumeAnchor` from `WrittenLSN()` inside
+      its own goroutine while the spawning test keeps appending, so a
+      late-scheduled `Run` anchors AFTER the 16 appends and the trigger can never
+      fire — no deadline would have helped. Reproduced deterministically at
+      `-cpu=1` (6/20 failures, exact nightly message, 2.02 s each); 20/20 pass
+      after the fix. `Run` now fires `OnLoopStart`/`OnLoopEnd` after the volume
+      ticker is armed and the anchor stored (both still bracket the whole loop, so
+      `initdb.Open`'s activity tracking is unchanged) and the test waits on that
+      hook before appending. Design: `docs/design/0131-0031-checkpoint-volume-trigger-parity.md`
+      "Follow-up (2026-08-13)". One ledger row: the same seeding pattern survives
+      in production, where `NewCheckpointer` (`initdb.Open`) and `Run`
+      (`cmd/goopg/main.go:806`) are far apart, widening the first `max_wal_size`
+      window until the first checkpoint supersedes the anchor.
 - [x] **testport/{TestPort_IsolationEvalPlanQualTrigger,
       TestPort_IsolationInsertConflictDoUpdate,TestPort_IsolationIntraGrantInplace,
       TestPort_IsolationIntraGrantInplaceDb,TestPort_IsolationLockCommittedKeyupdate}**

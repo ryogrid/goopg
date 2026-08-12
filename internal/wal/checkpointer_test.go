@@ -244,6 +244,13 @@ func TestCheckpointerVolumeTrigger(t *testing.T) {
 	defer w.Close()
 
 	flusher := &fakeFlusher{flushSignalChan: make(chan struct{}, 16)}
+	// armed closes once Run has seeded volumeAnchor. Without this
+	// handshake the test is a race, not a flake: Run reads the writer's
+	// position from its own goroutine, so a late-scheduled Run (seen under
+	// -race at -p=4 on a loaded nightly host, AI-20260813-005117-008)
+	// anchors AFTER the appends below and the trigger can then never fire,
+	// no matter how generous the deadline.
+	armed := make(chan struct{})
 	cp := NewCheckpointer(flusher, w, CheckpointerConfig{
 		Interval:            time.Hour,
 		SegmentSize:         4096,
@@ -251,6 +258,7 @@ func TestCheckpointerVolumeTrigger(t *testing.T) {
 		CompletionTarget:    0,
 		VolumeCheckInterval: 5 * time.Millisecond,
 		Logger:              slog.New(slog.NewTextHandler(nilDiscardWriter{}, nil)),
+		OnLoopStart:         func() { close(armed) },
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -263,6 +271,7 @@ func TestCheckpointerVolumeTrigger(t *testing.T) {
 		cancel()
 		<-done
 	}()
+	<-armed
 
 	// Force the writer past the first segment boundary.
 	payload := bytes.Repeat([]byte("a"), 512)
