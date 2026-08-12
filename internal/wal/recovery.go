@@ -2444,7 +2444,7 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			// M0131-S16.4: everything else is refused rather than silently
 			// skipped. goopg emits no RM_XLOG opcode outside the named arms,
 			// so this cannot fire on goopg's own WAL.
-			return false, fmt.Errorf("%w: %s", ErrUnsupportedRecord, unsupportedDecodedXLogRecord(r))
+			return false, unsupportedDecodedXLogOpcode(r)
 		}
 	case RmgrXact:
 		switch xlog.Header.Info & xlogXactOpMask {
@@ -2493,7 +2493,7 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 				"max_prepared_transactions must be 0 on a cluster goopg starts)",
 				ErrUnsupportedRecord, unsupportedDecodedXLogRecord(r))
 		default:
-			return false, unsupportedDecodedXLogRecord(r)
+			return false, unsupportedDecodedXLogOpcode(r)
 		}
 	case RmgrSeq:
 		switch xlog.Header.Info & XLRRmgrInfoMask {
@@ -2505,7 +2505,7 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			}
 			return true, nil
 		default:
-			return false, unsupportedDecodedXLogRecord(r)
+			return false, unsupportedDecodedXLogOpcode(r)
 		}
 	case RmgrLogicalMessage:
 		switch xlog.Header.Info & XLRRmgrInfoMask {
@@ -2523,7 +2523,7 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			// and the reader called it end-of-WAL).
 			return false, nil
 		default:
-			return false, unsupportedDecodedXLogRecord(r)
+			return false, unsupportedDecodedXLogOpcode(r)
 		}
 	case RmgrReplicationOrigin:
 		switch xlog.Header.Info & XLRRmgrInfoMask {
@@ -2542,14 +2542,14 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			// tail without advancing its origin would re-apply changes.
 			return false, nil
 		default:
-			return false, unsupportedDecodedXLogRecord(r)
+			return false, unsupportedDecodedXLogOpcode(r)
 		}
 	case RmgrGeneric:
 		// M0131-S23. RM_GENERIC_ID has no opcode space: GenericXLogFinish
 		// inserts with info 0 (generic_xlog.c:399) and generic_redo never reads
 		// xl_info, so a non-zero info is a corrupt or future record.
 		if xlog.Header.Info&XLRRmgrInfoMask != xlogGenericInfo {
-			return false, unsupportedDecodedXLogRecord(r)
+			return false, unsupportedDecodedXLogOpcode(r)
 		}
 		if err := replayDecodedXLogGeneric(mgr, r, xlog); err != nil {
 			return false, err
@@ -2577,7 +2577,7 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			}
 			return true, nil
 		default:
-			return false, unsupportedDecodedXLogRecord(r)
+			return false, unsupportedDecodedXLogOpcode(r)
 		}
 	case RmgrStandby:
 		switch xlog.Header.Info & XLRRmgrInfoMask {
@@ -2600,7 +2600,7 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			// STANDBY_LOCK) does not refuse the start.
 			return false, nil
 		default:
-			return false, unsupportedDecodedXLogRecord(r)
+			return false, unsupportedDecodedXLogOpcode(r)
 		}
 	case RmgrStorage:
 		switch xlog.Header.Info & XLRRmgrInfoMask {
@@ -2633,7 +2633,7 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			}
 			return true, nil
 		default:
-			return false, unsupportedDecodedXLogRecord(r)
+			return false, unsupportedDecodedXLogOpcode(r)
 		}
 	case RmgrTblspc:
 		switch xlog.Header.Info & XLRRmgrInfoMask {
@@ -2660,7 +2660,7 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			}
 			return true, nil
 		default:
-			return false, unsupportedDecodedXLogRecord(r)
+			return false, unsupportedDecodedXLogOpcode(r)
 		}
 	case RmgrDbase:
 		switch xlog.Header.Info & XLRRmgrInfoMask {
@@ -2688,7 +2688,7 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			}
 			return true, nil
 		default:
-			return false, unsupportedDecodedXLogRecord(r)
+			return false, unsupportedDecodedXLogOpcode(r)
 		}
 	case RmgrCLOG:
 		switch xlog.Header.Info & XLRRmgrInfoMask {
@@ -2720,7 +2720,7 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			}
 			return true, nil
 		default:
-			return false, unsupportedDecodedXLogRecord(r)
+			return false, unsupportedDecodedXLogOpcode(r)
 		}
 	case RmgrHeap:
 		switch xlog.Header.Info & xlogHeapOpMask {
@@ -2800,7 +2800,7 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			// wal_level=logical (tablecmds.c:2303).
 			return false, nil
 		default:
-			return false, unsupportedDecodedXLogRecord(r)
+			return false, unsupportedDecodedXLogOpcode(r)
 		}
 	case RmgrHeap2:
 		// M0131-S21a: RM_HEAP2 shares RM_HEAP's XLOG_HEAP_OPMASK (0x70), NOT
@@ -2889,7 +2889,7 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 				"this cluster ran VACUUM FULL/CLUSTER on a table with a logical replication slot)",
 				ErrUnsupportedRecord, unsupportedDecodedXLogRecord(r))
 		default:
-			return false, unsupportedDecodedXLogRecord(r)
+			return false, unsupportedDecodedXLogOpcode(r)
 		}
 	case RmgrBtree:
 		switch xlog.Header.Info & XLRRmgrInfoMask {
@@ -3058,7 +3058,7 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			return true, nil
 		}
 	default:
-		return false, unsupportedDecodedXLogRecord(r)
+		return false, unsupportedDecodedXLogOpcode(r)
 	}
 }
 
@@ -3244,7 +3244,7 @@ func replayDecodedXLogCommitTs(mgr *storage.Manager, r Record, xlog *XLogDecoded
 	switch xlog.Header.Info & XLRRmgrInfoMask {
 	case xlogCommitTsZeroPage, xlogCommitTsTruncate:
 	default:
-		return false, unsupportedDecodedXLogRecord(r)
+		return false, unsupportedDecodedXLogOpcode(r)
 	}
 	if commitTimestampsTracked(mgr) {
 		return false, fmt.Errorf("%w: %s (track_commit_timestamp is on in pg_control, but goopg has no "+
@@ -3297,6 +3297,25 @@ func requireFullPageImages(r Record, xlog *XLogDecodedRecord) error {
 			block.HasImage, block.ImageApply)
 	}
 	return nil
+}
+
+// unsupportedDecodedXLogOpcode is what every rmgr's `default:` arm returns: the
+// same text unsupportedDecodedXLogRecord produces, CLASSED with
+// ErrUnsupportedRecord.
+//
+// M0131-S21 closure. The class is a contract, stated at format.go:45-56 — an
+// unsupported record's bytes are intact and durable, categorically unlike a
+// torn tail, so a caller must be able to tell the two apart. Until this slice
+// only RM_XLOG's default arm carried it; the other fourteen returned a bare
+// error that, to any caller that discriminates, is indistinguishable from a
+// decode failure. The drift survived fourteen S21 slices precisely because it
+// changed nothing observable: both of today's ApplyRecord callers
+// (replayRecords, StreamReplayer.run) refuse the start on ANY error. Pinning it
+// here — with TestReplayOpcodeSpaceCoverageForHandledRmgrs's per-rmgr controls
+// asserting the exact shape — is cheaper than discovering it from the first
+// caller that does discriminate.
+func unsupportedDecodedXLogOpcode(r Record) error {
+	return fmt.Errorf("%w: %s", ErrUnsupportedRecord, unsupportedDecodedXLogRecord(r))
 }
 
 func unsupportedDecodedXLogRecord(r Record) error {

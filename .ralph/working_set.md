@@ -1,52 +1,50 @@
 (idle — nothing in flight)
 
-M0131-S9.3g landed: `pg_stats_ext_exprs` (12063) is on disk and evaluable on a
-hosted PG. **Corpus 79 → 80 of upstream's 80. NO pg_catalog ceilings remain.**
+M0131-S21 CLOSED and ticked. **The whole PG-18 opcode space of every handled
+rmgr is now asserted at once, and asserting it found a defect.**
 
-Landed: `pg_type` row for 10029 (pg_statistic's composite rowtype), the new
-`pgTypeRelidOverlay`, `nailedLocalRels{2619}.RelType` 83 → 10029, the pin +
-whole-80 re-capture + `nailed_view_seed_data.go` regen; **plus F30**, which was
-the slice's real content. Design `0131-0009` §S9.3g. 2 ledger rows. New guard
-`TestPgTypeCompositeRowsCarryTyprelid`.
+Landed:
+- `internal/wal/opcode_space_coverage_pg_test.go` (new) —
+  `TestReplayOpcodeSpaceCoverageForHandledRmgrs`: 16 rmgrs with a dispatch arm,
+  **74 opcode probes** cross-checked against every `#define XLOG_*` in
+  `postgres/src/include`, + 14 undefined-value controls. Result: **zero
+  coverage holes** — S21a/S21b were genuinely complete.
+- `internal/wal/recovery.go` — new `unsupportedDecodedXLogOpcode(r)`; all 16
+  rmgr `default:` arms route through it.
+- `docs/design/0131-0015-pg-wal-opcode-coverage.md` §"S21 closure".
 
 Worth carrying:
-- **`typtype='c'` is a PROMISE about `typrelid`, not a label.**
-  `insert_rel_type_cache_if_needed` asserts `OidIsValid(typentry->typrelid)`
-  (typcache.c:3082) — a composite row with typrelid 0 KILLS the backend, it
-  does not error. goopg had FIVE: `_pg_statistic` (10028) typed `'c'` when
-  upstream types an array-of-composite `'b'`, plus BKI_ROWTYPE_OID rows
-  71/75/81/83 seeded with typrelid 0 since M0106 (latent — nothing had yet
-  type-cached a catalog rowtype as a VALUE).
-- The 10028 defect was guarded by a COMMENT scoping its own correctness to one
-  code path ("carries no special meaning for the standby's TupleDescInitEntry
-  path"). Twin of F27: a field is read by every consumer, not the one in mind.
-- Coupling two catalog halves by construction beats coupling by comment:
-  `pgTypeBootstrapEntryMap()` derives part of its OID set from
-  `nailedRel.RelType`, so reverting pg_class deletes the pg_type row too
-  (proven — break 2 reproduced break 1's error).
-- Whole-corpus re-capture is ~6 s and doubles as `--verify`: all 79 incumbent
-  blobs byte-identical. `scripts/capture-ev-action.sh $(view list)` then
-  `go run cmd/gen-nailed-view-tables/main.go > …seed_data.go` (note: `//go:build
-  ignore`, so `go run <path>` not `go run ./cmd/...`).
-- Three expectation guards move with every capture: the toasted-rule set
-  (`pg_rewrite_toast_writer_test.go`), `base/{1,5}/2838` page count, and the
-  hosted-PG chunk list in the S4 E2E.
-- Oracle recipe when no PG is up: `initdb` a temp dir, `pg_ctl -o "-p <port>
-  -k $D -h ''"` (bare `-k` alone still binds TCP and collides).
+- **Only RM_XLOG's `default:` carried `ErrUnsupportedRecord`; the other 13
+  returned a bare error.** Contradicts the contract at `format.go:45-56` (an
+  unsupported record is durable, categorically unlike a torn tail). It survived
+  fourteen slices because nothing observable changed: BOTH `ApplyRecord`
+  callers (`replayRecords`, `StreamReplayer.run`) refuse the start on ANY
+  error. The class only matters to a caller that discriminates — none exists
+  yet. Generalisable: a sentinel-error contract with no discriminating consumer
+  drifts silently; enumerate the space to find it.
+- Probes are header-only on purpose (DISPATCH test): any error but the default
+  arm's own is a PASS. That forces an EXACT message match — `errors.Is(err,
+  ErrUnsupportedRecord)` cannot work, because the deliberate refusals (2PC,
+  `HEAP2_REWRITE`, commit_ts-tracked) carry the same sentinel by design.
+- RM_BTREE's `default:` is NOT a bare refusal — it is S16.3's FPI fallback, so
+  its control expects that wording (`has no block references to restore`).
+- Excluded on purpose: RM_HASH/GIN/GIST/SPGIST/BRIN (refused wholesale by rmgr,
+  S25 — enumerating opcodes there would assert the opposite of S25's decision);
+  RM_MULTIXACT (no arm at all, S24's open work).
 
-Gates: `internal/initdb` PASS (226 s), `^TestE2E_` family PASS (106 s),
-`TestE2E_PGColdStartOnGoopgDataDir` PASS + 2 scripted break directions, UNITS
-PASS, `go build ./...` + `go vet` clean, pgbench smoke via the commit hook.
+Gates: `internal/wal` PASS + `-race` PASS, `internal/initdb` PASS (243 s),
+UNITS PASS (no FAIL/panic), `go build ./...` + `go vet` clean, pgbench smoke via
+the commit hook. Both halves proven fail-when-broken by scripted reverts
+(drop the `XLOG_HEAP_INPLACE` arm → 1 FAIL naming it; drop the class → 13
+control FAILs).
 
 Nightly triage: `ci/logs/action-items.md` still run `20260812-005501`; all four
 `## AI-` items already filed under M-NIGHTLY — nothing new to file.
 
-Next loop (banner = M-NIGHTLY filing, then M0131): S9.4 —
-`information_schema` (65 views), expected to DEFER with a ledger row. Its
-first step is the complement query S9.3d used (F19); its fail-when-fixed
-tripwire (`information_schema.tables`) is already installed by F29. Needs the
-namespace + its domains (`sql_identifier`, `cardinal_number`, …) + helper
-functions on disk first. Off that path: the S9.3g ledger row on the nine
-header-declared `BKI_ROWTYPE_OID` rowtypes goopg never seeds.
+Next loop (banner = M-NIGHTLY filing, then M0131): remaining unchecked M0131
+items are **S24** (MultiXact durable `pg_multixact` SLRU + `multixact_redo` —
+LARGE/RISKY, "decide explicitly": the decision itself is a legitimate loop) and
+the deferred S9.4a.. information_schema successors. S24 is the only genuinely
+unavoidable missing rmgr.
 
 In-flight: none.

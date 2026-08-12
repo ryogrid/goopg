@@ -1498,6 +1498,63 @@ Code: `internal/wal/index_am_refusal.go`, the `RmgrHash/RmgrGin/RmgrGist` ids in
 `internal/wal/xlog_record.go`, the five-rmid arm and the pre-flight call in
 `internal/wal/recovery.go`; guards in `internal/wal/index_am_refusal_pg_test.go`.
 
+### S21 closure — the whole opcode space, asserted at once (landed 2026-08-12)
+
+S21a and S21b landed one opcode (or one small family) per slice, each with its
+own behavioural guard. Fourteen slices later the milestone's own question was
+still unanswerable from the test suite: **is any opcode PG 18 defines, inside an
+rmgr goopg claims to handle, still falling to that rmgr's `default:`?** A
+per-slice guard says "the arm I added works"; nothing says anything about the
+arm nobody added. This slice answers it and pins the answer.
+
+**The enumeration.** `pgHandledRmgrOpcodeSpaces`
+(`internal/wal/opcode_space_coverage_pg_test.go`) lists upstream's opcode space
+for the **16 rmgrs with a dispatch arm** — XLOG, XACT, SMGR, CLOG, DBASE,
+TBLSPC, RELMAP, STANDBY, HEAP2, HEAP, BTREE, SEQ, COMMIT_TS, REPLORIGIN,
+GENERIC, LOGICALMSG — **74 opcode probes** in all, cross-checked against every
+`#define XLOG_*` in `postgres/src/include`. Deliberately out of scope:
+RM_HASH/GIN/GIST/SPGIST/BRIN, refused *wholesale by rmgr* (S25), where
+enumerating opcodes would assert the opposite of what S25 decided; and
+RM_MULTIXACT, which has no arm at all (S24's open work).
+
+**Result: zero holes.** Every one of the 74 reaches a named arm. S21a and S21b
+are complete as specified, and that is now a machine-checked statement rather
+than a reading of the fix_plan.
+
+**How "named arm" is decided.** The probe records are header-only — no blocks,
+no main data — because this is a DISPATCH test. Any error other than the
+`default:` arm's own is a PASS: "missing block 0" proves the opcode reached code
+that knows what the opcode is. Whether that code decodes correctly is each
+slice's guard. Distinguishing the two therefore needs an EXACT match against the
+default arm's message, not `errors.Is(err, ErrUnsupportedRecord)` — the
+deliberate refusals (2PC, `XLOG_HEAP2_REWRITE`, commit_ts-tracked) carry that
+same sentinel on purpose.
+
+**What the controls found.** Each rmgr also probes one value PG 18 leaves
+undefined, which must land on `default:` — the test's own fail-when-broken
+proof. Thirteen of the fourteen controls failed on first run, and none for a
+coverage reason. Twelve of them shared one cause: **only RM_XLOG's `default:` carried `ErrUnsupportedRecord`.** The other
+thirteen returned a bare `unsupportedDecodedXLogRecord(r)`. That contradicts the
+contract stated at `format.go:45-56` — an unsupported record's bytes are intact
+and durable, categorically unlike a torn tail, and a caller must be able to tell
+them apart — and it is the same hazard S21a-2 part 7 named when it gave
+`XLOG_HEAP2_REWRITE` a classed refusal ("its bare error carries no class").
+Nothing observable had changed, which is exactly why it survived fourteen
+slices: both `ApplyRecord` callers (`replayRecords`, `StreamReplayer.run`)
+refuse the start on ANY error. All 16 default arms now route through
+`unsupportedDecodedXLogOpcode` (`recovery.go`), which is that wrap and nothing
+else.
+
+RM_BTREE is the one rmgr whose control expects different wording: its
+`default:` is not a bare refusal but S16.3's full-page-image fallback, which
+replays an unknown btree opcode when every block it touched carries an
+applicable image and refuses — still classed — when one does not. A header-only
+probe has no blocks, so it takes the refusal branch with the fallback's wording.
+
+Guards: `TestReplayOpcodeSpaceCoverageForHandledRmgrs` (74 opcode subtests + 14
+undefined-value controls). Gates: `internal/wal` PASS and `-race` PASS,
+`internal/initdb` PASS, UNITS, pgbench smoke via the commit hook.
+
 ## References
 
 - `docs/design/0131-bidirectional-cluster-dir-coldstart-and-system-views.md`
