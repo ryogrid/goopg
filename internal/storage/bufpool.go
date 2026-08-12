@@ -2195,6 +2195,42 @@ func (p *Pool) markDirtyWithLSNCommon(s *Slot) {
 	}
 }
 
+// MarkDirtyCoveredByRecordLocked is for the SECONDARY page of a multi-page
+// change record: a page this backend mutated, whose mutation is described by a
+// WAL record that another page's MarkDirty* call emitted (M0131-S26). The
+// canonical case is the cross-page heap UPDATE — one xl_heap_update covers the
+// old page's xmax stamp and the new page's tuple insert, but only the new page
+// goes through MarkDirtyLogicalChange.
+//
+// Two invariants make the explicit stamp mandatory rather than cosmetic:
+//
+//   - WAL-before-data. flushSlots flushes WAL only up to max(pd_lsn) over the
+//     batch (see the flushTo computation). A secondary page left at a stale
+//     pd_lsn can therefore reach disk BEFORE the record that explains its
+//     mutation is durable — a crash then exposes a heap page whose xmax stamp
+//     has no WAL behind it.
+//   - Redo skip. PG's redo skips a record for a page whose pd_lsn is already at
+//     or past it (`if (lsn <= PageGetLSN(page)) return BLK_DONE`). A stale
+//     pd_lsn is the safe direction for an idempotent stamp, but it makes the
+//     page's LSN a lie about which records it contains, and any real PG
+//     replaying goopg's stream over this page (M0131-S27's lane) re-applies.
+//
+// Unlike MarkDirtyWithLSNLocked this does NOT advance nativeImageLSN: no image
+// of THIS page was written at lsn, so the FPI watermark must stay where
+// maybeEmitFPI left it, or the page's next first-touch image is suppressed.
+// pd_lsn is raised, never lowered — maybeEmitFPI may have just stamped a
+// larger FPI LSN. Caller holds s.contentMu (the "Locked" suffix).
+func (p *Pool) MarkDirtyCoveredByRecordLocked(s *Slot, lsn LSN) {
+	// First-touch image for THIS page, exactly as plain MarkDirty would.
+	PageIdentityObserve(s.tag, s.page, "markDirtyCovered") // M0131-S30.3 probe
+	p.probeAssertSlotIsMapped(s, "markDirtyCovered")
+	p.maybeEmitFPI(s)
+	if h := MustHeader(s.page); h.LSN() < lsn {
+		h.SetLSN(lsn)
+	}
+	p.markDirtyWithLSNCommon(s)
+}
+
 // MarkDirtyForceFPI emits a fresh full-page image, overriding any stale FPI.
 func (p *Pool) MarkDirtyForceFPI(s *Slot) {
 	if p.logFPI == nil || !p.fullPageWrites.Load() {

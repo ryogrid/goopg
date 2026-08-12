@@ -9296,14 +9296,27 @@ func updateHeapRowCanonicalPG(ctx *Context, rel storage.RelFileNode, cols []cata
 			return newTID, err
 		}
 		var derr error
+		var recLSN storage.LSN
 		if logUpdate == nil {
 			ctx.Pool.MarkDirty(newBuf)
 		} else {
 			derr = ctx.Pool.MarkDirtyLogicalChange(newBuf, func() (storage.LSN, error) {
-				return logUpdate(rel, oldTID.Block, oldTID.Offset, newBlk, newSlot, xmax, tupleBytes)
+				lsn, lerr := logUpdate(rel, oldTID.Block, oldTID.Offset, newBlk, newSlot, xmax, tupleBytes)
+				recLSN = lsn
+				return lsn, lerr
 			})
 		}
-		ctx.Pool.MarkDirty(oldBuf)
+		// The OLD page was mutated too (PageStampUpdatedOldTuple above) and is
+		// described by the SAME record — so it must carry that record's LSN,
+		// not just a dirty bit. A plain MarkDirty here left pd_lsn stale
+		// whenever the page had already been imaged this checkpoint epoch,
+		// which both breaks WAL-before-data for the xmax stamp and makes a
+		// replaying PG re-apply the record over the page (M0131-S26).
+		if recLSN != 0 {
+			ctx.Pool.MarkDirtyCoveredByRecordLocked(oldBuf, recLSN)
+		} else {
+			ctx.Pool.MarkDirty(oldBuf)
+		}
 		if ctx.FSM != nil {
 			ctx.FSM.RecordFreeSpaceForPage(rel, newBlk, newBuf.Page())
 		}
