@@ -494,33 +494,7 @@ func runS28Workload(t *testing.T, pg *pgcluster.Cluster, baseDir string) s28Answ
 // output is fatal.
 func assertCrashTailOpcodes(t *testing.T, binDir, dataDir string) {
 	t.Helper()
-	walDir := filepath.Join(dataDir, "pg_wal")
-	entries, err := os.ReadDir(walDir)
-	if err != nil {
-		t.Fatalf("read pg_wal: %v", err)
-	}
-	first := ""
-	for _, e := range entries {
-		if e.IsDir() || len(e.Name()) != 24 {
-			continue
-		}
-		if first == "" || e.Name() < first {
-			first = e.Name()
-		}
-	}
-	if first == "" {
-		t.Fatalf("no WAL segment in %s", walDir)
-	}
-
-	cmd := exec.Command(filepath.Join(binDir, "pg_waldump"), "-p", walDir, first)
-	cmd.Env = append(os.Environ(), "LD_LIBRARY_PATH="+filepath.Join(filepath.Dir(binDir), "lib"))
-	out, dumpErr := cmd.Output()
-	dump := string(out)
-	if strings.TrimSpace(dump) == "" {
-		t.Fatalf("pg_waldump produced no output over the crash tail (err=%v) — "+
-			"guard 7 cannot verify opcode coverage", dumpErr)
-	}
-
+	dump := dumpCrashTail(t, binDir, dataDir)
 	// rmgr + desc pairs, from the design doc's opcode table as corrected by
 	// this test's first run. Match on the rmgr column AND the desc verb so a
 	// same-named opcode in another resource manager cannot satisfy the wrong
@@ -567,4 +541,42 @@ func assertCrashTailOpcodes(t *testing.T, binDir, dataDir string) {
 			"(docs/design/0131-0017-crash-interchange-e2e.md §S28) — fix the workload, not the table\n"+
 			"pg_waldump tail:\n%s", strings.Join(missing, ", "), tailLines(dump, 15))
 	}
+}
+
+// dumpCrashTail runs upstream pg_waldump over the cluster's OLDEST WAL segment
+// and returns its output. Both S28 variants need it: the main one to prove the
+// workload's opcode coverage (guard 7), the GIN-refusal one to prove RM_GIN
+// records actually reached WAL before goopg was asked to replay them.
+//
+// pg_waldump exits non-zero on a crash tail — it walks into the torn final
+// record and reports it — so the error is expected and only the ABSENCE of
+// output is fatal.
+func dumpCrashTail(t *testing.T, binDir, dataDir string) string {
+	t.Helper()
+	walDir := filepath.Join(dataDir, "pg_wal")
+	entries, err := os.ReadDir(walDir)
+	if err != nil {
+		t.Fatalf("read pg_wal: %v", err)
+	}
+	first := ""
+	for _, e := range entries {
+		if e.IsDir() || len(e.Name()) != 24 {
+			continue
+		}
+		if first == "" || e.Name() < first {
+			first = e.Name()
+		}
+	}
+	if first == "" {
+		t.Fatalf("no WAL segment in %s", walDir)
+	}
+
+	cmd := exec.Command(filepath.Join(binDir, "pg_waldump"), "-p", walDir, first)
+	cmd.Env = append(os.Environ(), "LD_LIBRARY_PATH="+filepath.Join(filepath.Dir(binDir), "lib"))
+	out, dumpErr := cmd.Output()
+	dump := string(out)
+	if strings.TrimSpace(dump) == "" {
+		t.Fatalf("pg_waldump produced no output over the crash tail (err=%v)", dumpErr)
+	}
+	return dump
 }

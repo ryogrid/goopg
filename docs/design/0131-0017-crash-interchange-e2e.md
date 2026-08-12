@@ -351,13 +351,45 @@ Two assertions beyond row equality: the SAVEPOINT rows must be **visible**
 and the `FOR UPDATE` row must be readable and updatable (a mis-replayed
 `XLOG_HEAP_LOCK` leaves a bogus xmax).
 
-**Second variant — the GIN refusal.** Same shape, but `CREATE INDEX … USING gin`
-before the workload. Assert goopg **refuses**: `g.Start()` returns an error, the
-goopg log names the access method and the LSN (S25's specific message, not
+**Second variant — the GIN refusal. LANDED 2026-08-12** as
+`TestE2E_GoopgCrashStartOnPGDataDirGINRefusal`
+(`internal/testport/e2e_goopg_crashstart_gin_refusal_test.go`, 1.7 s). Same
+shape, but `CREATE INDEX … USING gin` before the workload. goopg **refuses**:
+non-zero exit, and S25's specific message rather than
 `wal: unsupported xlog record rmid=13 info=0x…` from
-`unsupportedDecodedXLogRecord`, `internal/wal/recovery.go:2605-2613`), and the
-exit code is non-zero. This is the only test that proves S25's boundary is a
-*boundary* and not a crash.
+`unsupportedDecodedXLogRecord` (`internal/wal/recovery.go`). This is the only
+test that proves S25's boundary is a *boundary* and not a crash.
+
+Four things the implementation settled that the plan above did not say:
+
+- **The index build is not the workload.** `CREATE INDEX … USING gin` logs the
+  finished index with `log_newpage_range`, i.e. rmid 0 `XLOG_FPI` records — no
+  RM_GIN record at all. The GIN records come from writing *through* an existing
+  index, and the test drives both mechanisms: 2000 INSERTs land in the pending
+  list (`fastupdate` defaults on, `ginutil.c` `ginoptions`), then
+  `gin_clean_pending_list()` moves them into the entry tree (`ginfast.c`
+  `ginInsertCleanup`). Measured result: **2011 RM_GIN records** in the crash
+  tail, first at `rel=0/5/16393 blk=2`.
+- **The variant needs no self-arming skip, and must never grow one.** The main
+  variant skips when goopg cannot yet replay some opcode; this one cannot,
+  because `preflightIndexAMRecords` runs *before the first record is applied*
+  (`ReplayRecordsFrom`, `internal/wal/recovery.go`), so the GIN refusal
+  pre-empts every other opcode gap. The ordering guarantee is the thing under
+  test.
+- **Exit status needs a foreground run.** `cluster.Start()` reports only
+  "process exited early" — it does not surface the child's status — so the test
+  runs `go run ./cmd/goopg start` directly and reads `*exec.ExitError`
+  (measured: exit 1). The `cluster` handle is built only for its data dir and
+  free listen address; `Init()` is deliberately not called.
+- **The refusal's promise is asserted, not assumed.** "Nothing has been
+  replayed" is only worth saying if the directory is still one a real PG can
+  finish recovering, so the test then starts upstream PG on the *same* directory
+  (`pgcluster.OpenExisting` — `New` runs initdb and would refuse a non-empty
+  dir), waits for ready, and re-reads both the heap (2000 rows) and the GIN
+  index (`tags @> ARRAY['tag-7']` answers non-zero).
+
+Proven to bite: replacing one asserted message fragment with a string the
+refusal cannot contain turns the test red on the real refusal text.
 
 #### This test decides S24's fate — recommendation: **single-session, defer S24**
 
@@ -399,7 +431,10 @@ trigger for M0131-S24")` — so the trigger is code, not a ledger sentence.
    so a workload that silently stops producing an opcode fails loudly rather than
    passing for the wrong reason.
 8. The GIN variant asserts a **non-zero exit** and a log line naming the access
-   method; a bare `unsupported xlog record rmid=13` fails the guard.
+   method; a bare `unsupported xlog record rmid=13` fails the guard. **DONE** —
+   plus two guards the plan did not have: `pg_waldump` must show `rmgr: Gin` in
+   the tail (otherwise the refusal proves nothing), and upstream PG must still
+   finish recovery on the refused directory.
 9. The concurrency variant exists and is `t.Skip`ped with the S24 re-arm trigger in
    its skip message.
 10. Both tests gate on `testing.Short()` + `pgcluster.Available` and run under the
