@@ -2855,6 +2855,31 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 				return false, err
 			}
 			return true, nil
+		case xlogBtreeDelete:
+			// M0131-S21b part 3: PG-only — the LP_DEAD "simple deletion" pass
+			// (_bt_delitems_delete, nbtpage.c). Every index scan that lands on
+			// a dead heap tuple marks the entry, and the next insert short of
+			// room deletes the marked ones, so this is ordinary crash-tail
+			// traffic even though goopg has no such pass. Block 0's data run is
+			// {deleted offsets, updated offsets, xl_btree_update array} — the
+			// updates being the posting-list tuples that lost SOME of their
+			// TIDs, which is the half goopg refused until this slice.
+			if err := replayDecodedXLogBtreeDelete(mgr, r, xlog); err != nil {
+				return false, err
+			}
+			return true, nil
+		case xlogBtreeReusePage:
+			// M0131-S21b part 3: PG-only and a genuine NO-OP. Upstream's
+			// btree_xlog_reuse_page (nbtxlog.c:1006-1015) has exactly one
+			// statement — `if (InHotStandby) ResolveRecoveryConflictWith
+			// SnapshotFullXid(...)` — and mutates no page: the record exists
+			// only so a standby can cancel queries that might still read the
+			// recycled page. Crash recovery is not hot standby, so upstream
+			// itself does nothing here. It is named rather than left to the
+			// `default:` arm because that arm now REFUSES a record without a
+			// full-page image on every block (S16.3), and this record has no
+			// blocks at all.
+			return true, nil
 		case xlogBtreeInsertUpper:
 			// M0131-S21b part 1: PG-only — goopg's own downlink inserts ride
 			// RecordKindBtreeSplit/NewRoot. An insert into an internal page also
@@ -4629,6 +4654,101 @@ func replayDecodedXLogBtreeSplit(mgr *storage.Manager, r Record, xlog *XLogDecod
 	return nil
 }
 
+// sizeOfXLogBtreeDeleteData is PG's SizeOfBtreeDelete (nbtxlog.h:256):
+// snapshotConflictHorizon(4) + ndeleted(2) + nupdated(2) + isCatalogRel(1).
+// The two conflict-resolution fields are read by hot standby only, which goopg
+// does not implement — crash recovery reads the two counts.
+const sizeOfXLogBtreeDeleteData = 9
+
+// replayDecodedXLogBtreeDelete applies a PG-format xl_btree_delete, mirroring
+// upstream btree_xlog_delete (nbtxlog.c:651-712): rewrite the posting-list
+// tuples that lost some of their TIDs, delete the items that went away whole,
+// and clear the page's garbage hint.
+//
+// Only a real PG primary emits this opcode. goopg has no LP_DEAD simple-deletion
+// pass at all (its index cleanup rides RecordKindBtreeVacuum), but a PG primary
+// runs one whenever an insert is short of room on a page with killed entries —
+// so it is ordinary traffic in the crash tail goopg must replay.
+//
+// M0131-S21b part 3. Idempotent via pd_lsn, per replayExistingXLogBlock.
+func replayDecodedXLogBtreeDelete(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
+	endLSN := storage.LSN(r.EndLSN)
+	block, ok := xlogBlockRefByID(xlog, 0)
+	if !ok {
+		return fmt.Errorf("wal: xlog btree-delete missing block 0")
+	}
+	if block.HasImage && block.ImageApply {
+		if err := restoreDecodedXLogBlockImage(mgr, block, endLSN); err != nil {
+			return fmt.Errorf("wal: xlog btree-delete image: %w", err)
+		}
+		return nil
+	}
+	if len(xlog.MainData) < sizeOfXLogBtreeDeleteData {
+		return fmt.Errorf("wal: xlog btree-delete: main data len %d (want >= %d)", len(xlog.MainData), sizeOfXLogBtreeDeleteData)
+	}
+	ndeleted := int(binary.LittleEndian.Uint16(xlog.MainData[4:6]))
+	nupdated := int(binary.LittleEndian.Uint16(xlog.MainData[6:8]))
+	deleted, updates, err := decodeXLogBtreeDeletePayload(block.Data, ndeleted, nupdated)
+	if err != nil {
+		return fmt.Errorf("wal: xlog btree-delete: %w", err)
+	}
+	if err := replayExistingXLogBlock(mgr, block, endLSN, func(page storage.Page) error {
+		return btree.ReplayDeletePage(page, deleted, updates)
+	}); err != nil {
+		return fmt.Errorf("wal: xlog btree-delete apply: %w", err)
+	}
+	return nil
+}
+
+// decodeXLogBtreeDeletePayload parses block 0's data run, which xl_btree_delete
+// and xl_btree_vacuum share byte for byte (nbtxlog.h:197-237): the deleted
+// offset numbers, then the updated offset numbers, then one variable-length
+// xl_btree_update per updated offset.
+//
+// Every length is checked against the record's OWN counts rather than against
+// what the buffer happens to hold: a truncated run must be refused, not
+// replayed as a shorter deletion that leaves dead entries behind.
+func decodeXLogBtreeDeletePayload(data []byte, ndeleted, nupdated int) ([]uint16, []btree.PostingUpdate, error) {
+	want := 2 * (ndeleted + nupdated)
+	if len(data) < want {
+		return nil, nil, fmt.Errorf("block 0 data len %d (want >= %d for ndeleted=%d nupdated=%d)",
+			len(data), want, ndeleted, nupdated)
+	}
+	deleted := make([]uint16, ndeleted)
+	for i := range deleted {
+		deleted[i] = binary.LittleEndian.Uint16(data[2*i : 2*i+2])
+	}
+	if nupdated == 0 {
+		return deleted, nil, nil
+	}
+	updates := make([]btree.PostingUpdate, nupdated)
+	for i := range updates {
+		off := 2 * (ndeleted + i)
+		updates[i].Offset = binary.LittleEndian.Uint16(data[off : off+2])
+	}
+	// The xl_btree_update array is self-describing (each entry's ndeletedtids
+	// states its own length), so it is walked rather than indexed.
+	pos := want
+	for i := range updates {
+		if len(data)-pos < btree.SizeOfBtreeUpdate {
+			return nil, nil, fmt.Errorf("block 0 data ends inside xl_btree_update %d of %d", i, nupdated)
+		}
+		ndeletedtids := int(binary.LittleEndian.Uint16(data[pos : pos+2]))
+		pos += btree.SizeOfBtreeUpdate
+		if len(data)-pos < 2*ndeletedtids {
+			return nil, nil, fmt.Errorf("block 0 data holds %d bytes for xl_btree_update %d's %d TID offsets",
+				len(data)-pos, i, ndeletedtids)
+		}
+		tids := make([]uint16, ndeletedtids)
+		for j := range tids {
+			tids[j] = binary.LittleEndian.Uint16(data[pos+2*j : pos+2*j+2])
+		}
+		pos += 2 * ndeletedtids
+		updates[i].DeleteTIDs = tids
+	}
+	return deleted, updates, nil
+}
+
 // replayDecodedXLogBtreeVacuum applies a PG-format xl_btree_vacuum, mirroring
 // upstream btree_xlog_vacuum (nbtxlog.c:479-528): delete the named offset
 // numbers from the leaf page, then clear its garbage hint.
@@ -4641,8 +4761,17 @@ func replayDecodedXLogBtreeSplit(mgr *storage.Manager, r Record, xlog *XLogDecod
 //
 // nupdated > 0 is a record only a real PG primary produces: it rewrites posting
 // tuples in place (xl_btree_update) where goopg re-marshals surviving TIDs as
-// separate items. Replaying the deletions while dropping the updates would
-// silently leave dead TIDs on the page, so it is refused instead.
+// separate items. It was refused outright until M0131-S21b part 3, which built
+// that rewrite for XLOG_BTREE_DELETE; the two records share the payload
+// format AND the page work byte for byte (upstream's btree_xlog_vacuum and
+// btree_xlog_delete both call btree_xlog_updates then PageIndexMultiDelete),
+// so this path shares the decoder and btree.ReplayDeletePage with it rather
+// than growing a second, drifting copy.
+//
+// The one upstream difference — vacuum clears btpo_cycleid, delete deliberately
+// does not — is not a difference here: goopg's opaque has no cycle-id field
+// (the vacuum cycle id is a concurrency hint for _bt_vacuum_needs_cleanup,
+// which goopg does not implement).
 func replayDecodedXLogBtreeVacuum(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
 	endLSN := storage.LSN(r.EndLSN)
 	if len(xlog.MainData) < sizeOfXLogBtreeVacuumData {
@@ -4658,18 +4787,12 @@ func replayDecodedXLogBtreeVacuum(mgr *storage.Manager, r Record, xlog *XLogDeco
 	if block.HasImage && block.ImageApply {
 		return restoreDecodedXLogBlockImage(mgr, block, endLSN)
 	}
-	if nupdated != 0 {
-		return fmt.Errorf("wal: xlog btree-vacuum nupdated=%d: PG's posting-list updates (xl_btree_update) are not implemented", nupdated)
-	}
-	if len(block.Data) < 2*ndeleted {
-		return fmt.Errorf("wal: xlog btree-vacuum block data len %d (want >= %d for ndeleted=%d)", len(block.Data), 2*ndeleted, ndeleted)
-	}
-	deleted := make([]uint16, ndeleted)
-	for i := range deleted {
-		deleted[i] = binary.LittleEndian.Uint16(block.Data[2*i : 2*i+2])
+	deleted, updates, err := decodeXLogBtreeDeletePayload(block.Data, ndeleted, nupdated)
+	if err != nil {
+		return fmt.Errorf("wal: xlog btree-vacuum: %w", err)
 	}
 	return replayExistingXLogBlock(mgr, block, endLSN, func(page storage.Page) error {
-		return btree.ReplayVacuumDelete(page, deleted)
+		return btree.ReplayDeletePage(page, deleted, updates)
 	})
 }
 

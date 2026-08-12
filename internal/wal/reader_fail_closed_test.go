@@ -331,15 +331,22 @@ func btreeRecordWithBlocks(info uint8, withImage ...bool) Record {
 
 // TestReplayRefusesBtreeFallbackWithoutFullPageImages is the S16.3 guard.
 //
-// xlogBtreeDedup (0xD0) is a real PG opcode with no named arm in goopg, so it
-// lands on the btree `default:` arm, whose only replay strategy is restoring
-// every mutated page from its FPI. PG emits an FPI only on a page's FIRST
-// touch after a checkpoint — so the second dedup on a page carries block DATA
-// and no image. Before S16.3 that block was `continue`d past and the record
-// reported applied=true: an index mutation silently dropped on a PG crash
-// tail. Every block must carry an applicable image or the record is refused.
+// The btree `default:` arm's only replay strategy is restoring every mutated
+// page from its FPI. PG emits an FPI only on a page's FIRST touch after a
+// checkpoint — so the second dedup on a page carries block DATA and no image.
+// Before S16.3 that block was `continue`d past and the record reported
+// applied=true: an index mutation silently dropped on a PG crash tail. Every
+// block must carry an applicable image or the record is refused.
+//
+// The probe used to be XLOG_BTREE_REUSE_PAGE (0xD0), which was then the last
+// real opcode without a named arm. M0131-S21b part 3 finished RM_BTREE's
+// opcode space — every value nbtxlog.h defines now has one — so the fallback is
+// reachable only via an info value OUTSIDE that space (upstream's own
+// btree_redo answers those with elog(PANIC); goopg refuses, which is the same
+// fail-closed answer). 0xF0 is such a value and stays one as long as PG does
+// not define it.
 func TestReplayRefusesBtreeFallbackWithoutFullPageImages(t *testing.T) {
-	const xlogBtreeDedup = 0xD0 // XLOG_BTREE_DEDUP (nbtxlog.h)
+	const xlogBtreeUndefined = 0xF0 // no XLOG_BTREE_* opcode holds this value
 
 	cases := []struct {
 		name   string
@@ -352,7 +359,7 @@ func TestReplayRefusesBtreeFallbackWithoutFullPageImages(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			rec := btreeRecordWithBlocks(xlogBtreeDedup, tc.blocks...)
+			rec := btreeRecordWithBlocks(xlogBtreeUndefined, tc.blocks...)
 			applied, err := replayDecodedXLogRecord(nil, rec)
 			if err == nil {
 				t.Fatalf("replay err = nil (applied=%v), want refusal", applied)
@@ -370,7 +377,7 @@ func TestReplayRefusesBtreeFallbackWithoutFullPageImages(t *testing.T) {
 	// precondition, so S16.3 does not refuse the case the fallback exists
 	// for. (The apply itself needs a storage manager and is covered by the
 	// btree FPI replay tests.)
-	rec := btreeRecordWithBlocks(xlogBtreeDedup, true, true)
+	rec := btreeRecordWithBlocks(xlogBtreeUndefined, true, true)
 	if err := requireFullPageImages(rec, rec.XLog); err != nil {
 		t.Fatalf("all-image record refused: %v", err)
 	}

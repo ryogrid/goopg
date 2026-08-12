@@ -192,12 +192,12 @@ Two opcodes handled; the other twelve **silently no-op'd** (`recovery.go:2245-22
 | `SPLIT_L` / `SPLIT_R` | 0x30/0x40 | H `:2470` | `btree_xlog_split` `:251` | page split |
 | `INSERT_POST` | 0x50 | H (S21b part 2a) | `btree_xlog_insert(t,f,t)` | insert splitting a **posting list** on a deduplicated leaf (`nbtinsert.c:1337`) |
 | `DEDUP` | 0x60 | H (S21b part 2b) | `btree_xlog_dedup` `:464-556` | leaf deduplication before a split (`nbtdedup.c:265`) |
-| `DELETE` | 0x70 | **S** | `btree_xlog_delete` `:652-716` | LP_DEAD / bottom-up index deletion (`nbtpage.c:1369`) |
+| `DELETE` | 0x70 | H (S21b part 3) | `btree_xlog_delete` `:652-716` | LP_DEAD / bottom-up index deletion (`nbtpage.c:1369`) |
 | `UNLINK_PAGE` / `_META` | 0x80/0x90 | H `:2503` | `btree_xlog_unlink_page` `:802` | page deletion |
 | `NEWROOT` | 0xA0 | H `:2461` | `btree_xlog_newroot` `:941` | root split |
 | `MARK_PAGE_HALFDEAD` | 0xB0 | H `:2494` | `btree_xlog_mark_page_halfdead` `:717` | page deletion, first phase |
 | `VACUUM` | 0xC0 | H `:2486` | `btree_xlog_vacuum` `:598` | `VACUUM` index pass |
-| `REUSE_PAGE` | 0xD0 | **S** | **no-op outside hot standby** `:1006-1015` | recycling a deleted page (`nbtpage.c:933-953`, itself gated on `XLogStandbyInfoActive()`) |
+| `REUSE_PAGE` | 0xD0 | S (S21b part 3, named) | **no-op outside hot standby** `:1006-1015` | recycling a deleted page (`nbtpage.c:933-953`, itself gated on `XLogStandbyInfoActive()`) |
 | `META_CLEANUP` | 0xE0 | H (S21b part 1) | `_bt_restore_meta(record, 0)` `:82` | `VACUUM`'s metapage cleanup-XID update (`nbtpage.c:304`) |
 
 **Correction to the Theme F list: `XLOG_BTREE_REUSE_PAGE` needs no redo.** Its
@@ -986,9 +986,82 @@ fail-when-broken by 2 scripted reverts: dropping the unmatched-interval check �
 refusal guard FAILs; not contributing a base posting's existing TIDs → the merge
 guard FAILs on the posting's TID count.
 
-**Remaining in S21b (part 3):** `DELETE` 0x70 (`btree_xlog_delete` `:652-716` with
-`btree_xlog_updates` `:557-597` — an `xl_btree_update` item-array rewrite) and
-`REUSE_PAGE` 0xD0 as a recognised no-op.
+### S21b part 3 — `DELETE` 0x70 + `REUSE_PAGE` 0xD0 (landed 2026-08-12)
+
+`XLOG_BTREE_DELETE` is the LP_DEAD **simple deletion** pass
+(`_bt_delitems_delete`, `nbtpage.c:1369`): an index scan that lands on a dead heap
+tuple marks the entry, and the next insert short of room on that page deletes the
+marked entries instead of splitting. goopg has no such pass — its index cleanup
+rides `RecordKindBtreeVacuum` — so it never emits the opcode, but a real PG
+primary emits it constantly, and until this slice the record hit RM_BTREE's
+`default:` arm, which since S16.3 refuses a record whose blocks do not all carry a
+full-page image.
+
+The record is `xl_btree_delete{snapshotConflictHorizon, ndeleted, nupdated,
+isCatalogRel}` (`SizeOfBtreeDelete` = 9; the first and last fields are hot-standby
+conflict resolution, which goopg does not implement) plus a block-0 data run of
+**deleted offsets, updated offsets, then one variable-length `xl_btree_update` per
+updated offset**. Redo is upstream's two steps in upstream's order
+(`btree.ReplayDeletePage`):
+
+- **`btree_xlog_updates` (`:556-597`) first.** This is the half that made part 3
+  real work rather than a fourth `PageIndexMultiDelete` caller. A posting-list
+  tuple's TIDs die *one at a time*, so cleanup cannot express the work as "delete
+  these items" alone: the tuple is REWRITTEN without the dead TIDs. Each
+  `xl_btree_update` carries `ndeletedtids` **0-based indexes into the posting's own
+  TID array** (`nbtxlog.h:258-263` says so explicitly — they are not page offset
+  numbers), and `updatePostingRaw` is `_bt_update_posting` (`nbtdedup.c`): more
+  than one survivor re-forms a posting sized exactly as `_bt_form_posting` would,
+  and **exactly one survivor collapses to a PLAIN non-pivot tuple** —
+  `INDEX_ALT_TID_MASK` off, the survivor's heap TID back in `t_tid`, size back to
+  `keysize`. A one-entry "posting" is a tuple no PG ever writes, and every posting
+  reader keys off `BT_IS_POSTING`, so leaving the bit set fails far from this
+  record.
+- **`PageIndexMultiDelete` second** (`ReplayVacuumDelete`, already present), then
+  the `BTP_HAS_GARBAGE` clear.
+
+**The order is not cosmetic.** Both offset arrays are page offset numbers in the
+**pre-deletion** coordinate space, and an update rewrites in place without moving a
+line pointer, so updating first leaves the deletion offsets meaning what the
+primary meant. Deleting first shifts every later offset down and rewrites the wrong
+tuples. (Upstream's one difference between the two records — `VACUUM` clears
+`btpo_cycleid`, `DELETE` deliberately does not — is not a difference here: goopg's
+opaque has no cycle-id field.)
+
+**Sibling path: `xl_btree_vacuum` shares all of it.** Its payload is the same
+bytes and its redo the same two calls, and goopg *refused* its `nupdated > 0` form
+outright (`"posting-list updates (xl_btree_update) are not implemented"`) — so a
+real PG's VACUUM records were refusing the start for the same missing primitive.
+Both opcodes now share `decodeXLogBtreeDeletePayload` and `ReplayDeletePage` rather
+than growing a second, drifting copy.
+
+`REUSE_PAGE` 0xD0 gets a named arm that does **nothing**: upstream's
+`btree_xlog_reuse_page` (`:1006-1015`) is one `if (InHotStandby)` conflict resolve
+and mutates no page, so the record registers no blocks at all — which is precisely
+why it cannot stay on the `default:` arm, whose S16.3 precondition ("every block
+carries an applicable image") a block-less record can never meet. With it,
+**RM_BTREE's opcode space is complete**: every value `nbtxlog.h` defines now has a
+named arm, so the fallback is reachable only via an info value outside that space
+(where upstream `btree_redo` PANICs and goopg refuses). The S16.3 guard's probe
+moved from 0xD0 to 0xF0 accordingly.
+
+Refusals before the page is touched: an update naming a non-posting item, an update
+deleting *every* TID (upstream's `Assert(nhtids > 0)`; the primary deletes the whole
+item instead), a TID index out of range or not strictly ascending (upstream's redo
+loop has a single `d` cursor and would silently keep a TID it claims is dead), a
+block-0 run truncated relative to the record's OWN counts, and a deleted offset
+outside the page's data range.
+
+7 guards in `internal/wal/btree_delete_pg_test.go` (whole-item deletion with the
+hint clear, deletions + posting updates in one record, the single-survivor collapse,
+the vacuum sibling path, the FPI shape, five malformed-record refusals, and the
+0xD0 no-op). Proven fail-when-broken by 3 scripted reverts: applying deletions
+before updates → 2 FAIL; re-forming a posting for a single survivor → 1 FAIL
+(panic); dropping the `xl_btree_update` decode → 4 FAIL.
+
+**S21b is closed.** Still deferred, and recorded in the ledger: goopg emits neither
+`DELETE` nor `DEDUP` (no LP_DEAD deletion pass, no dedup pass), and `REUSE_PAGE`'s
+hot-standby conflict resolution has no counterpart because goopg has no hot standby.
 
 ## Guards
 

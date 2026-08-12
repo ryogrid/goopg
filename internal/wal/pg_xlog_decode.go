@@ -151,6 +151,7 @@ const (
 	xlogBtreeSplitR           uint8 = 0x40 // XLOG_BTREE_SPLIT_R
 	xlogBtreeInsertPost       uint8 = 0x50 // XLOG_BTREE_INSERT_POST
 	xlogBtreeDedup            uint8 = 0x60 // XLOG_BTREE_DEDUP
+	xlogBtreeDelete           uint8 = 0x70 // XLOG_BTREE_DELETE
 	xlogBtreeUnlinkPage       uint8 = 0x80 // XLOG_BTREE_UNLINK_PAGE
 	xlogBtreeUnlinkPageMeta   uint8 = 0x90 // XLOG_BTREE_UNLINK_PAGE_META
 	xlogBtreeNewRoot          uint8 = 0xA0 // XLOG_BTREE_NEWROOT
@@ -162,6 +163,12 @@ const (
 	// is _bt_set_cleanup_info's metapage-only rewrite (nbtpage.c), redone by
 	// _bt_restore_meta(record, 0).
 	xlogBtreeMetaCleanup uint8 = 0xE0 // XLOG_BTREE_META_CLEANUP
+	// M0131-S21b part 3: XLOG_BTREE_DELETE (0x70, above) is the LP_DEAD
+	// "simple deletion" pass (_bt_delitems_delete, nbtpage.c);
+	// XLOG_BTREE_REUSE_PAGE has NO page work at all — its whole redo body is
+	// the hot-standby conflict resolve (nbtxlog.c:1006-1015), so it is
+	// recognised as a no-op rather than left to the refusing default arm.
+	xlogBtreeReusePage uint8 = 0xD0 // XLOG_BTREE_REUSE_PAGE
 
 	// XLOG_SMGR_CREATE (storage_xlog.h:30). Used by recordKindToRmgrInfo
 	// (doc 04 §3.1) to map SmgrCreate onto RM_SMGR_ID.
