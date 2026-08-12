@@ -204,7 +204,12 @@ func pgAttrStorageChar(relOID, typeOID uint32) string {
 // path than on an initialised page. The index gets the standard metapage-only
 // image (btm_root = P_NONE = "index has never had a tuple inserted"), which is
 // exactly right while the heap is empty.
-func bootstrapToastRelationFiles(dataDir string) error {
+// M0131-S20.2 extends it: when the pg_rewrite bootstrap pushed values out of
+// line, the chunks for a pair replace that pair's empty heap page and its
+// metapage-only index with the populated pair. A pair with no chunks keeps the
+// S20.1 empty image byte for byte — which is what upstream's own initdb leaves
+// behind on a cluster whose rules all fit inline.
+func bootstrapToastRelationFiles(dataDir string, chunks []toastChunk) error {
 	pairs := nailedToastPairs()
 	if len(pairs) == 0 {
 		return nil
@@ -229,5 +234,34 @@ func bootstrapToastRelationFiles(dataDir string) error {
 			}
 		}
 	}
+	// Overwrite the empty images for every pair that actually received data.
+	// writeToastChunkHeap targets base/{1,5} itself, so this runs once per
+	// pair rather than once per directory.
+	for _, p := range pairs {
+		mine := toastChunksFor(chunks, p.ToastRel)
+		if len(mine) == 0 {
+			continue
+		}
+		tids, err := writeToastChunkHeap(dataDir, p.ToastRel, mine)
+		if err != nil {
+			return err
+		}
+		if err := bootstrapToastChunkIndex(dataDir, p.ToastIdx, mine, tids); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// toastChunksFor selects the chunks destined for one TOAST relation. goopg
+// bootstraps a single pair today; the filter exists so adding a second
+// DECLARE_TOAST cannot silently write one relation's chunks into another.
+func toastChunksFor(chunks []toastChunk, toastRel uint32) []toastChunk {
+	var out []toastChunk
+	for _, c := range chunks {
+		if c.ToastRel == toastRel {
+			out = append(out, c)
+		}
+	}
+	return out
 }

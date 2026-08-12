@@ -1164,6 +1164,91 @@ func pgBuildIndexTupleOidInt2Key(heapBlk uint32, heapOff uint16, attrelid uint32
 	return out
 }
 
+// pgBuildIndexTupleOidInt4Key builds a 16-byte IndexTuple for a composite
+// (oid, int4) key — the shape of every TOAST relation's
+// `(chunk_id, chunk_seq)` UNIQUE index (oid_ops, int4_ops). Sibling of
+// pgBuildIndexTupleOidInt2Key; the only difference is the second attribute's
+// width, which here fills the slot that one leaves as MAXALIGN padding:
+//
+//	[0..1]   ItemPointerData.ip_blkid.bi_hi (heapBlk>>16, LE uint16)
+//	[2..3]   ItemPointerData.ip_blkid.bi_lo (heapBlk&0xFFFF, LE uint16)
+//	[4..5]   ItemPointerData.ip_posid       (heapOff, LE uint16)
+//	[6..7]   t_info (size in the low 13 bits; no VAR/NULL flags)
+//	[8..11]  chunk_id  (LE uint32, oid_ops compares as unsigned)
+//	[12..15] chunk_seq (LE int32,  int4_ops compares as signed)
+//
+// Total size = MAXALIGN(8 + 4 + 4) = 16.
+func pgBuildIndexTupleOidInt4Key(heapBlk uint32, heapOff uint16, chunkID uint32, chunkSeq int32) []byte {
+	const (
+		hoff = 8
+		size = 16
+	)
+	out := make([]byte, size)
+	le := binary.LittleEndian
+	le.PutUint16(out[0:2], uint16(heapBlk>>16))
+	le.PutUint16(out[2:4], uint16(heapBlk&0xFFFF))
+	le.PutUint16(out[4:6], heapOff)
+	le.PutUint16(out[6:8], uint16(size)&indexSizeMask)
+	le.PutUint32(out[hoff:hoff+4], chunkID)
+	le.PutUint32(out[hoff+4:hoff+8], uint32(chunkSeq))
+	return out
+}
+
+// bootstrapToastChunkIndex overwrites the metapage-only placeholder at
+// base/{1,5}/<toastIdx> with a populated btree over (chunk_id, chunk_seq).
+// The index is the ONLY access path PG has to a chunk: detoasting runs
+// `systable_beginscan_ordered(toastidx, chunk_id = $1)` and reads the chunks
+// back in chunk_seq order (toast_fetch_datum, detoast.c), never a heap scan.
+// A populated heap with an empty index therefore reads as
+// "missing chunk number 0 for toast value …", not as an empty value.
+//
+// tids must be in the same order as chunks (writeToastChunkHeap's return
+// order). Entries are sorted lexicographically on (chunk_id, chunk_seq) —
+// both ascending, matching the oid_ops/int4_ops opclass tuple that
+// pgIndexInitialEntries seeds for 2839 — because btree leaves require
+// monotonic key order across line pointers (PG `_bt_binsrch`).
+func bootstrapToastChunkIndex(dataDir string, toastIdx uint32, chunks []toastChunk, tids []heapTID) error {
+	if len(chunks) != len(tids) {
+		return fmt.Errorf("toast index %d: %d chunks but %d tids", toastIdx, len(chunks), len(tids))
+	}
+	type entry struct {
+		chunkID  uint32
+		chunkSeq int32
+		block    uint32
+		off      uint16
+	}
+	entries := make([]entry, 0, len(chunks))
+	for i, c := range chunks {
+		entries = append(entries, entry{
+			chunkID: c.ChunkID, chunkSeq: c.Seq,
+			block: tids[i].Block, off: tids[i].Offset,
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].chunkID != entries[j].chunkID {
+			return entries[i].chunkID < entries[j].chunkID
+		}
+		return entries[i].chunkSeq < entries[j].chunkSeq
+	})
+	tuples := make([][]byte, len(entries))
+	for i, e := range entries {
+		tuples[i] = pgBuildIndexTupleOidInt4Key(e.block, e.off, e.chunkID, e.chunkSeq)
+	}
+	file, err := pgBuildBtreeBulkLoad(tuples, 2)
+	if err != nil {
+		return fmt.Errorf("toast index %d bulk-load: %w", toastIdx, err)
+	}
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(uint64(toastIdx), 10)), file, 0o600); err != nil {
+			return fmt.Errorf("write toast index %d in %s: %w", toastIdx, dir, err)
+		}
+	}
+	return nil
+}
+
 // bootstrapPgAttributeRelidAttnumIndex overwrites the empty btree
 // placeholders at base/{1,5}/2659 + global/2659 with a 2-block btree file
 // (metapage + populated leaf-root) carrying one IndexTuple per pg_attribute

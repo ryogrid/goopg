@@ -1328,7 +1328,7 @@ func Init(opts Options) error {
 	// ON-SELECT rule via RewriteRelRulenameIndexId. Without a real
 	// Form_pg_rewrite row and the two leaf btrees the next FATAL is
 	// "cache lookup failed for rule" on first open of the view.
-	pgRewriteTIDs, err := bootstrapPgRewriteTuples(abs)
+	pgRewriteTIDs, pgRewriteToastChunks, err := bootstrapPgRewriteTuples(abs)
 	if err != nil {
 		return fmt.Errorf("goopg init: pg_rewrite tuples: %w", err)
 	}
@@ -1344,7 +1344,10 @@ func Init(opts Options) error {
 	// writes the two physical files. pg_class(2618).reltoastrelid now names
 	// 2838, so the relation must exist even while it is still empty —
 	// PG's RelationInitPhysicalAddr runs on relcache load, not on first read.
-	if err := bootstrapToastRelationFiles(abs); err != nil {
+	// M0131-S20.2 fills them: any seeded ev_action too large to live inline was
+	// chunked above and its chunks travel here with their pointers already
+	// written into base/{1,5}/2618.
+	if err := bootstrapToastRelationFiles(abs, pgRewriteToastChunks); err != nil {
 		return fmt.Errorf("goopg init: toast relation files: %w", err)
 	}
 	// M0106-0010 step 3w: write an empty heap page for every mapped local
@@ -6320,13 +6323,27 @@ func writeMultiPageHeap(dataDir, relFile string, cols []catalog.Column, rels []n
 // them may discard the slice. Step 3o uses the TIDs to build composite-key
 // btree index tuples for pg_attribute_relid_attnum_index.
 func writeMultiPageHeapRows(dataDir, relFile string, cols []catalog.Column, rows []executor.Row) ([]heapTID, error) {
+	return writeMultiPageHeapRowsExternal(dataDir, relFile, cols, rows, nil)
+}
+
+// writeMultiPageHeapRowsExternal is writeMultiPageHeapRows plus the
+// HEAP_HASEXTERNAL infomask bit: external[i] marks row i as carrying at least
+// one out-of-line TOAST pointer. Only M0131-S20.2's pg_rewrite.ev_action needs
+// it — the bit cannot be derived from the row here, because a bootstrap
+// external pointer is a KindBytes passthrough on a pg_node_tree column (the
+// same door the inline compressed varlena uses) rather than the runtime
+// engine's KindToastPointer, which executor.pgRowHasExternal keys on.
+// Upstream stamps the bit in heap_fill_tuple whenever a stored attribute is
+// VARATT_IS_EXTERNAL (postgres/src/backend/access/common/heaptuple.c:343); it
+// is what tells heap_delete/heap_update that the tuple owns toast chunks.
+func writeMultiPageHeapRowsExternal(dataDir, relFile string, cols []catalog.Column, rows []executor.Row, external []bool) ([]heapTID, error) {
 	var pages [][]byte
 	page := make(storage.Page, storage.BlockSize)
 	if err := storage.InitPage(page); err != nil {
 		return nil, err
 	}
 	tids := make([]heapTID, 0, len(rows))
-	for _, row := range rows {
+	for i, row := range rows {
 		payload, err := executor.EncodeRowPG(cols, row)
 		if err != nil {
 			return nil, fmt.Errorf("encode %s row: %w", relFile, err)
@@ -6341,6 +6358,9 @@ func writeMultiPageHeapRows(dataDir, relFile string, cols []catalog.Column, rows
 		tuple.Header.SetNatts(len(cols))
 		if hasVarWidthCol(cols) {
 			tuple.Header.Infomask |= storage.HeapHasVarWidth
+		}
+		if i < len(external) && external[i] {
+			tuple.Header.Infomask |= storage.HeapHasExternal
 		}
 		off, err := storage.PageAddHeapTuple(page, tuple)
 		if err != nil {

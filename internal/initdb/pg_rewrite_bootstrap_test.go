@@ -233,7 +233,7 @@ func TestBootstrapPgRewriteTuplesWritesRowToBase1And5(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	tids, err := bootstrapPgRewriteTuples(dir)
+	tids, _, err := bootstrapPgRewriteTuples(dir)
 	if err != nil {
 		t.Fatalf("bootstrapPgRewriteTuples: %v", err)
 	}
@@ -327,7 +327,7 @@ func TestBootstrapPgRewriteLeafIndicesWriteBothFiles(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	tids, err := bootstrapPgRewriteTuples(dir)
+	tids, _, err := bootstrapPgRewriteTuples(dir)
 	if err != nil {
 		t.Fatalf("bootstrapPgRewriteTuples: %v", err)
 	}

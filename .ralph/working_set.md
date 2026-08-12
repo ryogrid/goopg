@@ -1,47 +1,48 @@
 (idle — nothing in flight)
 
-M0131-S20.1 landed and committed. `DECLARE_TOAST(pg_rewrite, 2838, 2839)` — the
-blocker for EIGHT of the nine remaining `pg_catalog` views — now exists on a
-freshly `goopg init`'d directory, and a hosted real PG resolves
-`pg_toast.pg_toast_2618` by name and scans it.
+M0131-S20.2a landed and committed: the out-of-line `pg_rewrite.ev_action`
+writer. An oversize seeded ev_action now becomes an 18-byte VARTAG_ONDISK
+`varatt_external` plus 1996-byte chunks in base/{1,5}/2838, indexed by 2839.
 
-Landed: `internal/initdb/pg_rewrite_toast_bootstrap.go` (declaration as DATA:
-`nailedToastPairs`/`nailedToastRels`), pg_class + pg_attribute rows, the
-pg_index row for 2839, `pg_class(2618).reltoastrelid = 2838`, both physical
-files in base/{1,5}; `bootstrapPgClassRelnameNspIndex` learned the namespace it
-had hardcoded to 11. Design `docs/design/0131-0035-pg-rewrite-toast.md`.
+Landed: `internal/initdb/pg_rewrite_toast_writer.go` (new),
+`pgBuildIndexTupleOidInt4Key` + `bootstrapToastChunkIndex`
+(btree_index_bootstrap.go), `writeMultiPageHeapRowsExternal` (HEAP_HASEXTERNAL),
+`bootstrapToastRelationFiles(dataDir, chunks)`, `pgRewriteRowToasted`, and a
+`pg_node_tree` decode arm in `internal/executor/codec.go`.
+Design `docs/design/0131-0035-pg-rewrite-toast.md` §S20.2a.
 
-Worth carrying:
-- **The pair must NOT join `nailedLocalRels`.** That list also drives
-  `bootstrapPgTypeTuples` (a TOAST relation has NO pg_type row; a defaulted
-  reltype=OID trips PG's `tdtypeid` assertion, relcache.c:4293) and
-  `writeRelcacheInitFile` (PG never opens a TOAST relation in the critical
-  relcache phase). Separate list + explicit wiring at the three sites that DO
-  want it.
-- **Oracle first, always.** Every field came from a throwaway PG 18.3
-  (`initdb` + `pg_ctl -o "-k $D -c listen_addresses=''"` on a unix socket —
-  TCP 5599 was already occupied). Notable: `attstorage='p'`, `reltype 0`,
-  no pg_depend rows, chunk size 1996, and the compressed payload is what gets
-  chunked (`sum(length(chunk_data)) == pg_column_size`).
-- **79 of the oracle's ~160 pg_rewrite rows are toasted**, including views
-  goopg hosts INLINE today. Inline vs external is not a divergence PG can
-  observe — only the eight oversize captures are forced out of line.
-- Adding a pg_index entry breaks `TestPgIndexInitialEntriesIndkeyMatchesPG18`
-  (a pinned count + map) — extend it in the same edit.
-- `go test ./internal/testport/` does NOT invalidate its cache when
-  `internal/initdb` changes (it drives a built binary), so a non-vacuity probe
-  there needs an explicit one-off `-count=1`.
+Worth carrying (all oracle-measured, PG 18.3 throwaway on a unix socket):
+- **The chunked bytes are the compressed varlena MINUS its 4-byte header** —
+  chunk 0 opens with `va_tcinfo` (`08 13 01 00 | 00 28 7b 51`). Off-by-four
+  here decompresses to garbage.
+- `va_rawsize` = UNCOMPRESSED length + 4 in BOTH branches; PG's
+  "is it compressed?" test (extsize < rawsize−4) then needs no flag.
+- `chunk_id == rule OID + 1`, 0 exceptions over 280 oracle chunk rows.
+- Six values are oversize, not eight: `pg_statio_sys_tables` (1756 B) and
+  `pg_statio_user_tables` (1759 B) are blocked only by their base view.
+- The "detoast on reload" sibling is a DECODE arm: `loadViewsFromHeapForDB`
+  discards sub-FirstUserOID rules but decodes every row first, and
+  `decodePhysicalPGVarlena` rejects header 0x01 ("external varlena not
+  supported") — a startup failure on goopg's own directory.
+- A synthetic test payload that repeats one block verbatim compresses ~100:1
+  and never crosses the inline budget — vary the payload or the guard tests
+  nothing.
+- `go test ./internal/testport/` does NOT invalidate its cache on an
+  `internal/initdb` change; use an explicit `-count=1` there.
 
-Gates: `internal/initdb` PASS (113 s), `^TestE2E_` family PASS (96 s),
-`TestE2E_PGColdStartOnGoopgDataDir` PASS + deliberate fail-when-broken run,
-UNITS PASS, `go build ./...` + `go vet` clean, pgbench smoke via the hook.
+Gates: `internal/initdb` PASS (154 s), `internal/executor` PASS,
+`TestE2E_PGColdStartOnGoopgDataDir` PASS (-count=1), 4 break directions proven
+fail-when-broken by scripted revert, UNITS PASS, `go build ./...` + `go vet`
+clean, pgbench smoke via the commit hook.
 
 Nightly triage: `ci/logs/action-items.md` still run `20260812-005501`; all four
 `## AI-` items already filed under M-NIGHTLY — nothing new to file.
 
-Next loop (banner = M-NIGHTLY filing, then M0131): **S20.2** — the chunk writer
-(1996-byte chunks, multi-page heap; `pg_seclabels` is 18 chunks), the
-`loadViewsFromHeap` detoast SIBLING, capture guard #5 → "inline OR toastable",
-then the eight captures and the `pg_indexes` guard inversion.
+Next loop (banner = M-NIGHTLY filing, then M0131): **S20.2b** — relax
+`capture-ev-action.sh` guard #5 to "inline OR toastable", capture the six
+oversize views + the two dependents, regenerate via `cmd/gen-nailed-view-tables`,
+invert `assertNonCorpusSystemViewIsStillAbsent` onto `pg_policies`, and extend
+`assertHostedPGSeesPgRewriteToastRelation` with a real `SELECT * FROM
+pg_indexes` — the acceptance S20.2a had no oversize value to run.
 
 In-flight: none.

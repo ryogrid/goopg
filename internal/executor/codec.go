@@ -1427,6 +1427,45 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 			return Datum{}, 0, fmt.Errorf("decode numeric %q: %w", text, err)
 		}
 		return newNumeric(m, int(s)), n, nil
+	case "pg_node_tree":
+		// Sibling of encodeValuePG's "pg_node_tree" KindBytes passthrough.
+		//
+		// M0131-S20.2: a seeded pg_rewrite.ev_action whose inline form would
+		// not fit a heap tuple is stored out of line, and the column then holds
+		// an 18-byte VARTAG_ONDISK varatt_external pointer (varatt.h:38-48,
+		// :89) into pg_toast.pg_toast_2618. Without this arm the value fell to
+		// the generic `default` varlena branch, whose decodePhysicalPGVarlena
+		// rejects header 0x01 with "external varlena not supported" — which
+		// would have made initdb's pg_rewrite reload fail startup on a
+		// directory goopg itself wrote (loadViewsFromHeapForDB decodes EVERY
+		// pg_rewrite row before its ev_class filter discards the bootstrap
+		// ones).
+		//
+		// The 18 bytes are returned verbatim as KindBytes rather than
+		// resolved: reassembling them needs the TOAST heap and a buffer pool,
+		// neither of which this decoder has, and no goopg reader consumes a
+		// bootstrap ev_action (user rules store re-parsable SQL text and are
+		// never toasted — "pg_node_tree" is not in isToastableType). A future
+		// reader must detoast through the chunk index; see the deferral-ledger
+		// row for M0131-S20.2.
+		//
+		// The 0x01/0x12 pair cannot collide with a data varlena: 0x01 alone is
+		// a zero-length short varlena, which is unrepresentable.
+		if len(data) >= 2 && data[0] == 0x01 && data[1] == 18 {
+			if len(data) < 18 {
+				return Datum{}, 0, fmt.Errorf("truncated on-disk TOAST pointer")
+			}
+			return NewBytesDatum(append([]byte(nil), data[:18]...)), 18, nil
+		}
+		payload, n, err := decodePhysicalPGVarlena(data)
+		if err != nil {
+			return Datum{}, 0, fmt.Errorf("decode pg_node_tree as varlena: %w", err)
+		}
+		if sctx != nil {
+			moff, mlen := sctx.AllocBytes(payload)
+			return newStringArenaDatum(sctx, moff, mlen), n, nil
+		}
+		return NewStringDatum(string(payload)), n, nil
 	case "aclitem[]", "_aclitem":
 		// A heap-backed catalog stores an ACL column (pg_type.typacl —
 		// M0119-0004-ACLHEAP) as a PG-native _aclitem ArrayType varlena whose

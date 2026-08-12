@@ -2,7 +2,7 @@
 
 **Milestone:** M0131 (bidirectional cluster-directory cold-start + real-PG
 system-view hosting) · **Slice:** S20 · **Status:** S20.1 landed 2026-08-12,
-S20.2 open
+S20.2a (the writer) landed 2026-08-12, S20.2b (the captures) open
 
 ## Why this exists
 
@@ -127,29 +127,115 @@ offsets a hosted PG casts — layout, not just Go-side values.
 The TOAST heap is **empty** at S20.1, which is exactly the state upstream's own
 initdb leaves it in before the first oversize datum is inserted.
 
-## S20.2 — the chunk writer and the eight views (open)
+## S20.2a — the chunk writer (landed 2026-08-12)
 
-1. Extend `pglzVarlenaDatum` (or a sibling) with an out-of-line branch: when the
-   compressed payload would push the `pg_rewrite` tuple past the inline budget,
-   split it into 1996-byte chunks, write them into `base/{1,5}/2838` with a
-   fresh `chunk_id` OID, bulk-load `2839` over `(chunk_id, chunk_seq)`, and
-   store an 18-byte `varatt_external` pointer
-   (`va_rawsize`, `va_extsize`, `va_valueid`, `va_toastrelid = 2838`) in the
-   column. `pg_seclabels` (35379 B → 18 chunks) makes multi-chunk mandatory,
-   and 18 chunks × 1996 B still fits one 8 KiB page only 4 at a time, so the
-   heap writer must be multi-page from the start.
-2. **Sibling path (mandatory, same slice):** goopg's own reload
-   (`loadViewsFromHeap` / `catalog_heap_reload.go`) must detoast an external
-   `ev_action` pointer, or goopg will fail to reload the very rules it wrote.
-   The reassembly primitive already exists for user data — reuse it, do not
-   fork a second one.
-3. Capture the eight views with `scripts/capture-ev-action.sh` and relax its
+`internal/initdb/pg_rewrite_toast_writer.go` turns an oversize seeded
+`ev_action` into chunks plus an 18-byte pointer; `bootstrapToastRelationFiles`
+grew a `chunks` parameter and now writes the populated pair instead of the
+empty one when there is anything to write. The path is live but **inert**: no
+corpus view is oversize yet, so a real `goopg init` still produces exactly the
+S20.1 bytes. S20.2b's captures are what light it up.
+
+### Second oracle pass
+
+The first pass (S20.1) measured the *relation*; this one measured the *values*,
+on the same kind of throwaway PG 18.3:
+
+| view | rule oid | `pg_column_size` | raw text | chunks |
+|---|---|---|---|---|
+| `pg_indexes` | 12046 | 9002 | 70408 | 5 |
+| `pg_stats` | 12056 | 9316 | 92367 | 5 |
+| `pg_statio_all_tables` | 12177 | 10475 | 72286 | 6 |
+| `pg_stats_ext_exprs` | 12066 | 11481 | 92109 | 6 |
+| `pg_stats_ext` | 12061 | 12196 | 73811 | 7 |
+| `pg_seclabels` | 12102 | 35379 | 203378 | 18 |
+
+Three findings, each of which the headers alone would have got wrong:
+
+- **F20 — the chunked bytes are the compressed varlena minus its 4-byte
+  header, i.e. they open with `va_tcinfo`.** `toast_save_datum` takes
+  `data_p = VARDATA(dval)` for a compressed datum, and `VARDATA` of a 4B
+  varlena skips only the header — so the tcinfo word rides along into chunk 0
+  and `create_detoast_datum` reconstructs the value by prefixing a fresh 4-byte
+  header to the concatenated chunks. Confirmed byte-wise on the oracle: chunk 0
+  of `pg_indexes`' value is `08 13 01 00 | 00 28 7b 51` — tcinfo 70408 (the
+  uncompressed length), then the pglz control byte and the literals `(`, `{`,
+  `Q` of `({QUERY`. A writer that chunked the whole compressed varlena would be
+  off by exactly four bytes and would decompress to garbage.
+- **F21 — `va_rawsize` is the uncompressed length + `VARHDRSZ` in BOTH
+  branches**, coming from the tcinfo's extsize field when compressed and from
+  `VARSIZE` when not. So one expression covers both, and PG's own
+  "is it compressed?" test (`VARATT_EXTERNAL_IS_COMPRESSED`: extsize <
+  rawsize − 4) falls out for free — goopg stores no flag of its own.
+- **F22 — `chunk_id == rule OID + 1`, universally**, because upstream assigns
+  the value id with `GetNewOidWithIndex` during the very insert that consumed
+  the rule's OID. Verified as an invariant rather than a coincidence: no
+  distinct `chunk_id` among the oracle's 280 chunk rows fails to match some
+  `pg_rewrite.oid + 1`. goopg pins chunk_ids the same way it pins rule OIDs, so
+  its `pg_toast_2618` is OID-identical to upstream's, not merely well-formed.
+
+A fourth measurement corrects this document's own table: **`pg_statio_sys_tables`
+(1756 B) and `pg_statio_user_tables` (1759 B) are NOT oversize.** They were
+listed among the eight as "dependents"; they are blocked only by their base view
+`pg_statio_all_tables`, and once it is captured they enter the corpus inline.
+Six values are forced out of line, not eight.
+
+### The sibling path is a decode arm, not a detoast
+
+The plan called goopg's own reload the mandatory sibling. Reading it settles the
+shape: `loadViewsFromHeapForDB` discards every rule whose `ev_class` is below
+`FirstUserOID`, so it never *consumes* a bootstrap `ev_action` — but it decodes
+**every** `pg_rewrite` row before applying that filter. The old code path took
+an 18-byte on-disk pointer to `decodePhysicalPGVarlena`, which rejects header
+`0x01` with *"external varlena not supported"* — a startup failure on a
+directory goopg itself wrote. The fix is a `pg_node_tree` decode arm (sibling of
+the existing KindBytes encode passthrough) that consumes the pointer verbatim as
+`KindBytes`. It is **not** a detoast: reassembly needs the TOAST heap and a
+buffer pool, neither of which the decoder has, and nothing reads the value.
+User rules are unaffected either way — they store re-parsable SQL text and are
+never toasted (`pg_node_tree` is not in `executor.isToastableType`). Ledgered.
+
+### Guards
+
+`internal/initdb/pg_rewrite_toast_writer_test.go`, all four break directions
+proven fail-when-broken by scripted revert:
+
+| guard | break direction proven |
+|---|---|
+| `TestExternalizeVarlenaPayloadCompressedLayout` | keeping the 4-byte `va_header` in the chunks (F20) → *"chunk 0 opens with tcinfo rawsize 132082, want 200152"*; `va_rawsize` taken from the compressed size (F21) → *"va_rawsize 33020, want 200156"* |
+| `TestExternalizeVarlenaPayloadIncompressibleLayout` | the plain branch must read as NOT compressed |
+| `TestPgRewriteEvActionDatumSwitchesRepresentation` | the corpus stays inline; an oversize value becomes an 18-byte pointer whose `va_valueid` is the rule OID + 1 (F22) |
+| `TestWriteToastChunkHeapAndIndexRoundTrip` | unsorted index leaves → *"chunk_seq 15 after 16 — leaves must be key-ordered"*; also asserts the heap actually spilled past block 0 and that base/1 and base/5 agree |
+| `TestPgRewriteRowExternalPointerSurvivesTheCodec` | removing the decode arm → *"decode pg_node_tree as varlena: external varlena not supported"*, i.e. the exact startup failure |
+
+The test payload is a *varying* synthetic node tree. An earlier version repeated
+one block verbatim, compressed ~100:1, and never crossed the inline budget — the
+guard passed while testing nothing. Real captures compress 6–10:1 and the
+generator now matches that band.
+
+## S20.2b — the captures (open)
+
+Items 1 and 2 landed as S20.2a above. What remains:
+
+1. Capture the eight views with `scripts/capture-ev-action.sh` and relax its
    guard #5 (the 8000 B inline budget) into "inline OR toastable" rather than
    deleting it — the budget still names the boundary at which representation
-   changes.
-4. Invert `assertNonCorpusSystemViewIsStillAbsent` (its subject `pg_indexes` is
+   changes, and `maxInlineEvActionStored` in
+   `internal/initdb/pg_rewrite_toast_writer.go` must keep naming the same
+   number, or a view could pass capture and then produce a page no reader can
+   parse. Six of the eight are oversize (see the table above); the two
+   `pg_statio_*_tables` dependents enter inline.
+2. Invert `assertNonCorpusSystemViewIsStillAbsent` (its subject `pg_indexes` is
    the first of the eight) and re-point it at the ninth view, `pg_policies`,
    whose blocker is unrelated: `pg_policy` (3256) is not an on-disk relation.
+3. **The acceptance that S20.2a could not run**: a real PG cold-started on a
+   goopg `$PGDATA` must `SELECT * FROM pg_indexes` — i.e. resolve the pointer,
+   scan `pg_toast_2618_index` for its `chunk_id`, reassemble, decompress and
+   rewrite the query. Until a capture exists there is no oversize value on
+   disk, so the writer's output is only verifiable against PG's documented
+   struct and goopg's own reader; extend
+   `assertHostedPGSeesPgRewriteToastRelation` with the read the moment the
+   first capture lands.
 
 ## Scope limits (ledgered)
 

@@ -158,7 +158,27 @@ const pgStatWalReceiverViewOID uint32 = 12240
 // stored as PGLZ-compressed varlena bytes, which is the same format PG
 // produces during system_views.sql processing. Small payloads fall back
 // to uncompressed varlena.
+// M0131-S20.2: ev_action is stored out of line when its inline representation
+// would not fit the heap tuple. pgRewriteRowToasted is the full form —
+// pgRewriteRow keeps the inline-only signature for the guards that build a row
+// in isolation, and asserts the entry is one that stays inline.
 func pgRewriteRow(e pgRewriteEntry) executor.Row {
+	row, chunks := pgRewriteRowToasted(e)
+	if len(chunks) > 0 {
+		// Callers of this form have nowhere to put the chunks; the row alone
+		// would carry a pointer into an unwritten TOAST heap.
+		panic(fmt.Sprintf("pg_rewrite rule %d (%s) needs out-of-line ev_action: "+
+			"build it with pgRewriteRowToasted", e.OID, e.RuleName))
+	}
+	return row
+}
+
+// pgRewriteRowToasted builds the 8-column row and any TOAST chunks its
+// ev_action requires. See pg_rewrite_toast_writer.go for the representation
+// rules; a nil chunk slice means the value stayed inline, which is the case
+// for all 71 views in the corpus as of S20.2's landing.
+func pgRewriteRowToasted(e pgRewriteEntry) (executor.Row, []toastChunk) {
+	evAction, chunks := pgRewriteEvActionDatum(e)
 	return executor.Row{
 		executor.NewIntDatum(int64(e.OID)),       // 1 oid
 		executor.NewStringDatum(e.RuleName),      // 2 rulename
@@ -167,8 +187,8 @@ func pgRewriteRow(e pgRewriteEntry) executor.Row {
 		executor.NewIntDatum(int64(e.EvEnabled)), // 5 ev_enabled
 		executor.NewBoolDatum(e.IsInstead),       // 6 is_instead
 		pglzVarlenaDatum(e.EvQual),               // 7 ev_qual    (varlena pg_node_tree)
-		pglzVarlenaDatum(e.EvAction),             // 8 ev_action  (varlena pg_node_tree)
-	}
+		evAction,                                 // 8 ev_action  (inline varlena OR 18-byte varatt_external)
+	}, chunks
 }
 
 // bootstrapPgRewriteTuples writes the seeded Form_pg_rewrite heap
@@ -176,20 +196,30 @@ func pgRewriteRow(e pgRewriteEntry) executor.Row {
 // follow-on btree leaf bootstrappers (2692 oid index, 2693
 // (ev_class, rulename) index) can stamp each IndexTuple's t_tid
 // at the (block, offset) of its heap row.
-func bootstrapPgRewriteTuples(dataDir string) (map[uint32]heapTID, error) {
+// M0131-S20.2: it also returns the TOAST chunks the seeded ev_action values
+// pushed out of line, in (chunk_id, chunk_seq) order. The caller hands them to
+// bootstrapToastRelationFiles, which is the single writer of base/{1,5}/2838 —
+// keeping the chunk bytes and the pointers that name them in one Init step so
+// they cannot be produced without each other.
+func bootstrapPgRewriteTuples(dataDir string) (map[uint32]heapTID, []toastChunk, error) {
 	cols := pgRewriteColDefs()
 	entries := pgRewriteInitialEntries()
 	rows := make([]executor.Row, 0, len(entries))
+	external := make([]bool, 0, len(entries))
+	var chunks []toastChunk
 	for _, e := range entries {
-		rows = append(rows, pgRewriteRow(e))
+		row, rowChunks := pgRewriteRowToasted(e)
+		rows = append(rows, row)
+		external = append(external, len(rowChunks) > 0)
+		chunks = append(chunks, rowChunks...)
 	}
-	tids, err := writeMultiPageHeapRows(dataDir, "2618", cols, rows)
+	tids, err := writeMultiPageHeapRowsExternal(dataDir, "2618", cols, rows, external)
 	if err != nil {
-		return nil, fmt.Errorf("pg_rewrite heap: %w", err)
+		return nil, nil, fmt.Errorf("pg_rewrite heap: %w", err)
 	}
 	m := make(map[uint32]heapTID, len(entries))
 	for i, e := range entries {
 		m[e.OID] = tids[i]
 	}
-	return m, nil
+	return m, chunks, nil
 }
