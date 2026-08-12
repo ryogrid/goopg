@@ -217,3 +217,62 @@ this doc introduces.
   `EndTransactionBlock`, `AbortCurrentTransaction`, and the `TBLOCK_*` states.
   goopg's `connTxState` is the analogue: `active` ≈ `TBLOCK_INPROGRESS`,
   `failed` ≈ `TBLOCK_ABORT`, cleared ≈ `TBLOCK_DEFAULT`.
+
+## 7. S1 verification record (2026-08-13, HEAD `1d648659`)
+
+M0132-S1 executed the three doc-09 corrections as *measurements*, not readings,
+and added the acceptance bar as
+`internal/server/extended_txn_block_test.go`. Results:
+
+| correction | verdict at HEAD | evidence |
+|---|---|---|
+| (a) `connTxState` is already threaded into the extended path | **confirmed** | `dispatch_extended.go:30` takes `connTx *connTxState`; its only reads are `NonSuperuserRole` and statement logging. The first *code* slice is therefore the state machine (S2), not plumbing. |
+| (b) there is no `execCommit` route to adopt | **confirmed** | `dispatch.go:2803-2807` states the bypass in so many words, and the deferred FK/UNIQUE/EXCLUDE sequence is inline at `:2818-2828`. S4 is a proof obligation on S2's extraction, not independent wiring. |
+| (c) `Sync` is already correct | **confirmed** | `server.go`'s `MsgSync` arm clears `syncRequired` and calls `w.ReadyForQuery()`; it touches no transaction state. Pinned by `TestM0132S1_SyncDoesNotEndAnOpenBlock`, which passes today and must keep passing. |
+
+### The bar, and how its redness is proven
+
+The file carries one const, `m0132ExtendedBlocksLanded = false`. Every bar runs
+its scenario unconditionally and then asserts either the PostgreSQL outcome (const
+true) or today's divergence (const false). At HEAD all 8 tests pass; flipping the
+const turns 6 red — the two that stay green are the no-divergence guards
+(`ExtendedCommitPersistsBlockWork`, `SyncDoesNotEndAnOpenBlock`). The arrangement
+is what makes the bar committable before the fix while keeping it a real red
+test: when S2–S5 land, the divergence arms start failing because the divergence
+is gone, so the fix cannot land without flipping the const and the const cannot
+be flipped without the fix.
+
+Measured divergences (const-false arms, i.e. today's behaviour):
+
+- `BEGIN`/`INSERT`×2/`ROLLBACK` entirely over the extended protocol leaves **2
+  rows**; PG leaves 0.
+- `ReadyForQuery` reports `I` after an extended `BEGIN` and after an in-block
+  extended `INSERT`; PG reports `T`.
+- The **mixed** shape (simple `BEGIN` → extended parameterised `INSERT` → simple
+  `ROLLBACK`) leaves **1 row**: the write went to the auto-committing offset-slot
+  transaction, so the `ROLLBACK` discarded an empty one. This is the shape pgx
+  and lib/pq actually emit.
+- An extended `Execute` inside a **failed** block runs and commits; PG raises
+  25P02.
+
+### Two SIMPLE-path gaps discovered while writing the bar
+
+Both are new (they belong to S5's scope, and S5 will inherit them if it copies
+the simple path's placement); both are pinned by tests and carry a ledger row.
+
+1. **A plan-time error does not fail the block.** `connTx.Fail()` has exactly two
+   call sites (`dispatch.go:950`, `:1019`), both on the executor-error path
+   (`errQueryErrorSent`). An error raised *before* execution — e.g. `INSERT INTO
+   <missing table>` — leaves the block live and healthy: goopg answers the next
+   statement normally and reports `T`. PG aborts a block on **any** error inside
+   it (the abort is driven from `postgres.c`'s error handler via
+   `AbortCurrentTransaction`, not from the executor). The `E` a client sees
+   immediately after such an error is produced by the `afterError` argument to
+   `wireStatus`, not by persisted state, which is why the divergence hides:
+   the status byte is right once and wrong from then on.
+   Test: `TestM0132S1_PlanTimeErrorDoesNotFailTheBlock`.
+2. **A constant `SELECT 1` bypasses the 25P02 gate.** The gate at
+   `dispatch.go:638` rejects `SELECT * FROM items` and `INSERT …` in a failed
+   block, but a constant-only select is answered normally. PG rejects everything
+   except `COMMIT`/`ROLLBACK`/`ROLLBACK TO`.
+   Test: `TestM0132S1_ConstantSelectBypassesTheAbortedBlockGate`.
