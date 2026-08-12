@@ -326,6 +326,34 @@ func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone str
 			return "", fmt.Errorf("expected time datum, got kind %d", d.Kind)
 		}
 		return config.FormatTimestampTZ(d.TimeValue(), dateStyle, dateOrder, timeZone), nil
+	case "time":
+		// M0119-0006 (49th slice): previously unhandled — a `time` column fell
+		// through to the default arm, whose Kind switch has no KindTime case, so
+		// `COPY <t> TO STDOUT` on any table with a time column hard-errored
+		// ("kind 5 cannot encode as time in COPY TEXT") and COPY TO → COPY FROM
+		// was not a round trip even though the FROM side has had a "time" arm
+		// all along (copyTextToDatum below). Hard-won Rule #2: the two
+		// directions of one codec must cover the same type-set.
+		//
+		// time_out ignores DateStyle entirely (postgres/src/backend/utils/adt/
+		// date.c: EncodeTimeOnly is called with USE_ISO_DATES unconditionally),
+		// so unlike the date/timestamp arms above this one takes no style
+		// argument.
+		if d.Kind != KindTime {
+			return "", fmt.Errorf("expected time datum for time, got kind %d", d.Kind)
+		}
+		return pgdatetime.FormatTime(copyTimeOfDayMicros(t, d.TimeValue())), nil
+	case "timetz":
+		// Sibling of the "time" arm; timetz_out prints the local time of day
+		// followed by the UTC offset. pgdatetime.FormatTimeTZ takes PG's own
+		// TimeTzADT.zone convention — seconds WEST of UTC — while the Datum
+		// stores seconds EAST (Scale, in minutes), hence the negation, exactly
+		// as the heap encoder does (codec.go's "timetz" arm). M0119-0006.
+		if d.Kind != KindTime {
+			return "", fmt.Errorf("expected time datum for timetz, got kind %d", d.Kind)
+		}
+		return pgdatetime.FormatTimeTZ(copyTimeOfDayMicros(t, d.TimeValue()),
+			int32(-d.TimeTZOffsetSecs())), nil
 	default:
 		switch d.Kind {
 		case KindString:
@@ -345,6 +373,38 @@ func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone str
 			return "", fmt.Errorf("kind %d cannot encode as %s in COPY TEXT", d.Kind, t.Name)
 		}
 	}
+}
+
+// copyTimeOfDayMicros converts the time.Time carrier of a `time`/`timetz`
+// Datum into the microseconds-since-midnight pgdatetime's time_out/timetz_out
+// ports take, applying the column's declared precision.
+//
+// Two details the plain pgTimeMicros() cannot supply:
+//
+//   - `24:00:00` is carried as 1970-01-02 00:00:00 (next-day midnight), which
+//     pgTimeMicros reports as 0 — i.e. "00:00:00". The explicit next-day probe
+//     is the same one internal/server's appendTimeText carries.
+//   - goopg applies no typmod at INPUT (there is no AdjustTimeForTypmod port),
+//     so a `time(2)` column really does hold full microseconds and the declared
+//     precision is applied at OUTPUT. Truncating the micros here and letting
+//     FormatTime strip trailing zeros reproduces appendTimeText's trim-then-
+//     strip byte for byte, which is what keeps `COPY … TO` and `SELECT` in
+//     agreement on the same column (Hard-won Rule #2). Upstream ROUNDS at
+//     input instead; see the M0119-0006 deferral-ledger row.
+func copyTimeOfDayMicros(t catalog.Type, tv time.Time) int64 {
+	u := tv.UTC()
+	micros := pgTimeMicros(u)
+	if micros == 0 && u.Year() == 1970 && u.Month() == time.January && u.Day() == 2 {
+		micros = usecsPerDay
+	}
+	if len(t.Args) > 0 && t.Args[0] >= 0 && t.Args[0] < 6 {
+		scale := int64(1)
+		for i := int64(0); i < 6-t.Args[0]; i++ {
+			scale *= 10
+		}
+		micros = (micros / scale) * scale
+	}
+	return micros
 }
 
 // copyTextToDatum is the inverse of datumToCopyText. raw is the
