@@ -757,6 +757,20 @@ func assertHostedPGCanCallSQLBuiltins(t *testing.T, pg *pgcluster.Cluster, logPa
 // pg_indexes (12043), S9.2a's fourth candidate, whose 9002 B ev_action is the
 // first to breach the 8000 B inline-tuple budget; it is now the subject of
 // assertNonCorpusSystemViewIsStillAbsent below.
+//
+// M0131-S9.3a adds the per-table statistics family — the first tranche where
+// view-on-view edges are the POINT rather than an incident: pg_stat_all_tables
+// (12146) and pg_stat_xact_all_tables (12151) are the bases, and the four
+// pg_stat_{sys,user}_tables / pg_stat_xact_{sys,user}_tables dependents each
+// embed one of those two OIDs in their own ev_action. A hosted PG evaluating
+// all six here is what proves guard #4's base-before-dependent pin ordering
+// holds at more than one edge.
+//
+// Deliberately absent: the pg_statio_*_tables triple. Its base
+// pg_statio_all_tables (12174) stores at 10475 B, over the 8000 B inline
+// heap-tuple budget, so the base cannot be seeded and — under guard #4 — its
+// two dependents cannot be pinned ahead of it. Ledgered against the same
+// pg_rewrite TOAST (2838/2839) work as pg_indexes.
 func nailedSystemViewProbeSet() []struct {
 	view string
 	oid  string
@@ -786,6 +800,12 @@ func nailedSystemViewProbeSet() []struct {
 		{"pg_catalog.pg_shmem_allocations", "12134"},
 		{"pg_catalog.pg_shmem_allocations_numa", "12138"},
 		{"pg_catalog.pg_backend_memory_contexts", "12142"},
+		{"pg_catalog.pg_stat_all_tables", "12146"},
+		{"pg_catalog.pg_stat_xact_all_tables", "12151"},
+		{"pg_catalog.pg_stat_sys_tables", "12156"},
+		{"pg_catalog.pg_stat_xact_sys_tables", "12161"},
+		{"pg_catalog.pg_stat_user_tables", "12165"},
+		{"pg_catalog.pg_stat_xact_user_tables", "12170"},
 		{"pg_catalog.pg_stat_activity", "12226"},
 		{"pg_catalog.pg_stat_replication", "12231"},
 		{"pg_catalog.pg_stat_slru", "12236"},

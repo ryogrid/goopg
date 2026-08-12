@@ -205,6 +205,38 @@ func systemViewOIDPins() []systemViewOIDPin {
 		{"pg_shmem_allocations_numa", 12138, 12141, 12140, 3},
 		{"pg_backend_memory_contexts", 12142, 12145, 12144, 10},
 		// M0131-S9.2b, continued (see the pg_roles comment above).
+		// M0131-S9.3a (2026-08-12): the FIRST view-on-view tranche at scale —
+		// the per-table statistics family. Unlike S9.2c's single pg_shadow →
+		// pg_user edge, this tranche pins two BASES together with their four
+		// dependents in one capture run, so capture guard #4's
+		// base-before-dependent ordering is exercised by four edges at once.
+		// Measured against the oracle before pinning (stored ev_action size /
+		// in-band :relid set):
+		//
+		//   pg_stat_all_tables        12146  5473 B  (no in-band relid)
+		//   pg_stat_sys_tables        12156  2476 B  :relid 12146
+		//   pg_stat_user_tables       12165  2478 B  :relid 12146
+		//   pg_stat_xact_all_tables   12151  5057 B  (no in-band relid)
+		//   pg_stat_xact_sys_tables   12161  1822 B  :relid 12151
+		//   pg_stat_xact_user_tables  12170  1824 B  :relid 12151
+		//
+		// The dependents are an order of magnitude smaller than their bases
+		// because a `FROM pg_stat_all_tables WHERE …` Query stores the base as
+		// one RTE_RELATION reference rather than re-expanding its 30-column
+		// SRF join — which is precisely the property Option-A pinning buys
+		// (0131-0008): the embedded 12146/12151 are already correct.
+		//
+		// NOT pinned in this tranche: the pg_statio_*_tables triple. Its base
+		// pg_statio_all_tables (12174) stores at 10475 B, over the 8000 B
+		// inline budget — ceiling #1 (pg_rewrite TOAST 2838/2839) again, and
+		// under guard #4 a dependent cannot be pinned before its base, so
+		// pg_statio_{sys,user}_tables wait on that same TOAST work. Ledgered.
+		{"pg_stat_all_tables", 12146, 12149, 12148, 30},
+		{"pg_stat_xact_all_tables", 12151, 12154, 12153, 12},
+		{"pg_stat_sys_tables", 12156, 12159, 12158, 30},
+		{"pg_stat_xact_sys_tables", 12161, 12164, 12163, 12},
+		{"pg_stat_user_tables", 12165, 12168, 12167, 30},
+		{"pg_stat_xact_user_tables", 12170, 12173, 12172, 12},
 		{"pg_stat_activity", 12226, 12229, 12228, 22},
 		// The six M0131-S8a views, interleaved by upstream OID.
 		{"pg_stat_replication", 12231, 12234, 12233, 20},

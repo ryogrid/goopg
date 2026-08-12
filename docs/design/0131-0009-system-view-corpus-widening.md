@@ -761,6 +761,71 @@ whole `^TestE2E_` family PASS (91 s), `capture-ev-action.sh --verify` PASS
 (43/43 byte-identical), `go build ./...` + `go vet` clean, UNITS PASS, pgbench
 smoke via the commit hook.
 
+## Implementation status — S9.3a (2026-08-12)
+
+**S9.3 opens: the corpus is 49 views and now carries four view-on-view edges
+over two bases, pinned in a single capture run.** The per-table statistics
+family landed complete except for its I/O triple:
+
+| view | OID / rule | stored `ev_action` | in-band `:relid` |
+|---|---|---|---|
+| `pg_stat_all_tables` | 12146 / 12149 | 5473 B | — |
+| `pg_stat_xact_all_tables` | 12151 / 12154 | 5057 B | — |
+| `pg_stat_sys_tables` | 12156 / 12159 | 2476 B | 12146 |
+| `pg_stat_xact_sys_tables` | 12161 / 12164 | 1822 B | 12151 |
+| `pg_stat_user_tables` | 12165 / 12168 | 2478 B | 12146 |
+| `pg_stat_xact_user_tables` | 12170 / 12173 | 1824 B | 12151 |
+
+Mechanics unchanged from S9.2: one `scripts/capture-ev-action.sh <49 views>`
+run plus one `cmd/gen-nailed-view-tables` run; the other 43 blobs came back
+byte-identical and `--verify` re-derives all 49 against a fresh throwaway
+PG 18.3. No hand-edited blob, table, rule row or `//go:embed` line — S9.0's
+claim now holds at 8.2× the original corpus.
+
+What is new is that the **edges are the subject, not an incident.** S9.2c
+crossed one edge (`pg_user` → `pg_shadow`); this tranche crosses four over two
+distinct bases in one pass, and capture guard #4 (a dependent may not be pinned
+before its base) is what orders the pin table rather than care. Each dependent
+is `SELECT * FROM <base> WHERE …` (`system_views.sql`), so under Option-A
+identity pinning its embedded 12146/12151 is already correct the moment the
+base is pinned above it; a hosted PG evaluating all six in
+`assertNailedSystemViewsAreEvaluable` is the acceptance measurement.
+
+### Findings — S9.3a
+
+**F14 — a dependent costs an order of magnitude less than its base, and that
+is a property of the pin policy, not of the views.** The four dependents store
+at 1822–2478 B against bases of 5057–5473 B, because a rewritten
+`FROM pg_stat_all_tables WHERE …` Query stores the base as one `RTE_RELATION`
+naming OID 12146 instead of re-expanding its 30-column SRF join tree. The
+practical consequence for the rest of S9.3: **dependents are never the thing
+that breaches the inline-tuple ceiling — bases are.** Ceiling #1 therefore
+propagates *downward* through the dependency graph, which is exactly what
+happened to the `pg_statio_*_tables` triple below, and it means the remaining
+S9.3 cost is bounded by six base captures, not by twelve.
+
+**Ceiling #1 claims its first *dependents*.** `pg_statio_all_tables` (12174)
+stores at 10475 B, over the script's 8000 B inline budget, so it cannot be
+seeded — and because guard #4 forbids pinning `pg_statio_sys_tables` (12179) or
+`pg_statio_user_tables` (12183) ahead of their base, one over-ceiling base
+withholds **three** views rather than one. This is the first time a ceiling has
+propagated along an edge, and it re-prices the `pg_rewrite` TOAST
+(2838/2839) work: it now gates `pg_indexes` + this triple. Ledgered.
+
+The S9.2c/S9.2d generalisation still holds at five for five — every ceiling in
+this milestone is a gap in what goopg's initdb bootstraps, never in the capture
+tooling. S9.3a added no new ceiling *kind*; it added reach for an existing one.
+
+Remaining in S9.3 after this slice: three bases (`pg_stat_all_indexes` 12187,
+`pg_statio_all_indexes` 12200, `pg_statio_all_sequences` 12213, all under the
+ceiling at 6826/6799/2431 B) with their six dependents, plus the
+`pg_statio_*_tables` triple behind TOAST.
+
+Gates: `internal/initdb` PASS (96 s), `TestE2E_PGColdStartOnGoopgDataDir` PASS,
+whole `^TestE2E_` family PASS (92 s), `capture-ev-action.sh --verify` PASS
+(49/49 byte-identical), `go build ./...` + `go vet` clean, UNITS PASS, pgbench
+smoke via the commit hook.
+
 ## References
 
 - M0131 implementation plan §S9, `docs/design/0131-bidirectional-cluster-dir-coldstart-and-system-views.md`

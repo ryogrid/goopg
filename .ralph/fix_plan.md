@@ -4086,9 +4086,39 @@ Theme C — Real PG hosted on goopg evaluates views (closes "goopg cannot host a
       (91 s), `--verify` PASS (43/43), `go build ./...` + `go vet` clean,
       UNITS PASS, pgbench smoke via the hook. Design `0131-0009`
       §"Implementation status — S9.2d" + F12/F13. 2 ledger rows.
-      **Next in S9:** S9.2 has no catalog-direct heads left, so the queue is
-      S9.3's twelve view-on-view dependents (mechanism proven by S9.2c;
-      ten of them are reachable today, `pg_statio_*_tables` needs TOAST).
+      **S9.3a LANDED 2026-08-12 — S9.3 opens and the corpus is 49 views with
+      FOUR view-on-view edges over TWO bases.** The per-table statistics
+      family, pinned and seeded in ONE 49-view `scripts/capture-ev-action.sh`
+      run + ONE `cmd/gen-nailed-view-tables` run: bases `pg_stat_all_tables`
+      (12146/12149, 5473 B) and `pg_stat_xact_all_tables` (12151/12154,
+      5057 B) with their dependents `pg_stat_sys_tables` (12156/12159),
+      `pg_stat_xact_sys_tables` (12161/12164), `pg_stat_user_tables`
+      (12165/12168) and `pg_stat_xact_user_tables` (12170/12173). The other
+      43 blobs came back byte-identical; `--verify` re-derives 49/49 against
+      a fresh throwaway PG 18.3; no hand-edited blob, table, rule row or
+      `//go:embed` line. Where S9.2c crossed one edge as an incident, guard
+      #4's base-before-dependent ordering now orders four edges deliberately,
+      and a hosted PG evaluates all six. **F14:** a dependent stores at
+      1822–2478 B against its 5057–5473 B base, because the rewritten Query
+      names the base as ONE `RTE_RELATION` (OID 12146/12151) instead of
+      re-expanding its 30-column SRF join — so dependents can never breach
+      the inline ceiling, only bases can, and ceiling #1 propagates DOWNWARD:
+      `pg_statio_all_tables` (12174, 10475 B) being over budget withholds
+      **three** views (itself + `pg_statio_{sys,user}_tables` 12179/12183),
+      the first time a ceiling travelled along an edge. That re-prices the
+      `pg_rewrite` TOAST (2838/2839) slice, which now gates `pg_indexes` AND
+      that triple. No new ceiling KIND; the five-for-five
+      "every ceiling is an initdb-bootstrap gap" generalisation holds.
+      Gates: `internal/initdb` PASS (96 s),
+      `TestE2E_PGColdStartOnGoopgDataDir` PASS, `^TestE2E_` family PASS
+      (92 s), `--verify` PASS (49/49), `go build ./...` + `go vet` clean,
+      UNITS PASS, pgbench smoke via the hook. Design `0131-0009`
+      §"Implementation status — S9.3a" + F14. 2 ledger rows.
+      **Next in S9:** S9.3b — the three remaining under-ceiling bases
+      (`pg_stat_all_indexes` 12187, `pg_statio_all_indexes` 12200,
+      `pg_statio_all_sequences` 12213) with their six dependents; no blocker
+      is known for any of the nine (all measured against the oracle).
+      Then `pg_statio_*_tables` behind `pg_rewrite` TOAST.
       Off the critical path but cheap and now doubly motivated:
       `pg_type.typelem`/`typarray` population, which converts `pg_group` and
       `pg_publication_tables` from ceilings into ordinary captures.
