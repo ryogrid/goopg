@@ -799,11 +799,27 @@ const (
 // `date` and anything else fall on the discard side, as upstream's input
 // functions do.
 func tsZoneModeForType(typeName string) tsZoneMode {
-	switch strings.ToLower(strings.TrimSpace(typeName)) {
-	case "timestamptz", "timestamp with time zone":
+	if isTimestampTZTypeName(typeName) {
 		return tsApplyZone
 	}
 	return tsDiscardZone
+}
+
+// isTimestampTZTypeName reports whether a SQL type name is one of the two
+// spellings of `timestamp with time zone`. It backs BOTH halves of the split
+// that type makes against plain `timestamp`: the INPUT rule (tsZoneModeForType
+// above — the offset moves the wall clock instead of being discarded) and the
+// OUTPUT rule (M0119-0006's 40th slice — NewTimestampTZDatum tags the datum so
+// timestamptz_out runs instead of timestamp_out). Sharing one predicate is the
+// point: the two rules are the same type distinction, and a producer that
+// applied the zone on the way in while rendering zone-less on the way out would
+// silently relabel the instant — which is exactly the defect that slice fixed.
+func isTimestampTZTypeName(typeName string) bool {
+	switch strings.ToLower(strings.TrimSpace(typeName)) {
+	case "timestamptz", "timestamp with time zone":
+		return true
+	}
+	return false
 }
 
 // applyTSZoneMode turns the time.Parse result into the value the target type

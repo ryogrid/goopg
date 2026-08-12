@@ -49,6 +49,35 @@ func sessionLocation(zone string) *time.Location {
 	return loc
 }
 
+// TimestampToTimestampTZ ports timestamp2timestamptz (backend/utils/adt/
+// timestamp.c): the plain-`timestamp` wall clock is read AS A LOCAL TIME in the
+// session zone, and the instant it denotes is what a timestamptz stores. `t`
+// carries the wall-clock fields in UTC (goopg's KindTime convention for a
+// zone-less timestamp); the result is the corresponding absolute instant, again
+// expressed in UTC.
+//
+// Upstream calls DetermineTimeZoneOffset(tm, session_timezone) for the offset;
+// Go's time.Date(..., loc) performs the same local→absolute resolution. The two
+// agree on the ordinary case and on the DST-ambiguity preference (both take the
+// earlier of two candidate offsets); the spring-forward "nonexistent local time"
+// case is NOT asserted to match — see the deferral ledger. M0119-0006.
+func TimestampToTimestampTZ(t time.Time, zone string) time.Time {
+	u := t.UTC()
+	return time.Date(u.Year(), u.Month(), u.Day(), u.Hour(), u.Minute(), u.Second(),
+		u.Nanosecond(), sessionLocation(zone)).UTC()
+}
+
+// TimestampTZToTimestamp ports timestamptz2timestamp (same file): the stored
+// instant is rendered into the session zone and the resulting wall clock — with
+// the zone thrown away — is what a plain `timestamp` holds. Inverse of
+// TimestampToTimestampTZ; returns the wall-clock fields in UTC, matching the
+// KindTime convention for a zone-less timestamp. M0119-0006.
+func TimestampTZToTimestamp(t time.Time, zone string) time.Time {
+	l := t.In(sessionLocation(zone))
+	return time.Date(l.Year(), l.Month(), l.Day(), l.Hour(), l.Minute(), l.Second(),
+		l.Nanosecond(), time.UTC)
+}
+
 // encodeTimezone ports EncodeTimezone (datetime.c). offsetEast is the zone's
 // offset in seconds EAST of UTC — the sign convention Go's Time.Zone uses.
 // Upstream's `tz` is the negation of that (seconds west), which is why its

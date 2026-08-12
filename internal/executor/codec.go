@@ -1242,7 +1242,17 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 		case math.MinInt64:
 			return NewTimestampInfinity(false), 8, nil
 		}
-		return NewTimeDatum(time.UnixMicro(micros + pgEpochUnixMicros).UTC()), 8, nil
+		// M0119-0006 (40th slice): tag the timestamptz half, exactly as the
+		// "date" case below tags TimeSubDate and for the same reason — a
+		// storage-decoded timestamptz must render identically to a timestamptz
+		// literal in the type-agnostic paths (Datum.Format(), CAST-to-text,
+		// string concat). The wire path re-derives the type from the column and
+		// is unaffected either way.
+		ts := time.UnixMicro(micros + pgEpochUnixMicros).UTC()
+		if isTimestampTZTypeName(t.Name) {
+			return NewTimestampTZDatum(ts), 8, nil
+		}
+		return NewTimeDatum(ts), 8, nil
 	case "date":
 		// encodeValuePG stores 4-byte LE days since the PG epoch. M0111-0004.
 		if len(data) < 4 {

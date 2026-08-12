@@ -2297,6 +2297,36 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       (`dedupConsolidate` only drops exact `(key,tid)` duplicates), so no goopg
       unique index can hold one — ledger row 2026-08-12. Design §Gates in
       `docs/design/0119-0006-checkunique-tier-amcheck.md`.
+      **Slice landed 2026-08-12 (40th) — a `timestamptz` survives the cast to
+      text, and the cast to `timestamp` stops being the identity**: closes the
+      residual the 39th slice filed against ITSELF. That slice fixed the two
+      output paths that know the declared column type but could not fix
+      `formatTimeDatumDateStyle`, which sees a bare Datum — so
+      `('2020-01-01 10:00:00+05:30'::timestamptz)::text` under
+      `TimeZone='Asia/Kolkata'` returned `2020-01-01 10:00:00` while goopg's OWN
+      `SELECT` of the same value returned `2020-01-01 15:30:00+05:30`: text
+      denoting a different instant than the one stored, no diagnostic.
+      `TimeSubTimestampTZ` had been DECLARED since M0127-P5.9-u as "not yet
+      populated by their producers"; it has producers now
+      (`NewTimestampTZDatum`, at the typed literal, the cast, the on-disk decode
+      and the five `prorettype` 1184 functions), and the input rule
+      (`tsZoneModeForType`) and the output rule now share one predicate,
+      `isTimestampTZTypeName`. **What tagging the datum then exposed is bigger
+      than the suffix**: `ts::timestamptz` / `tstz::timestamp` returned the datum
+      UNTOUCHED, which is the identity only while `TimeZone` is UTC — every
+      goopg cluster ships UTC, which is why it hid; upstream
+      `timestamp2timestamptz` reads the wall clock as LOCAL (the instant moves)
+      and `timestamptz2timestamp` keeps the wall clock the instant has in the
+      session zone, so BOTH directions were off by the offset. New
+      `config.TimestampToTimestampTZ`/`TimestampTZToTimestamp`. A 20-probe
+      end-to-end diff of a throwaway goopg against a throwaway PG 18.3 is
+      byte-identical. Gates: `timestamptz_cast_text_test.go` (6 oracle cells, a
+      sibling guard over 4 DateStyles x 4 zones, a no-zone-leak negative, the
+      producers, the cross-cast, ±infinity), 3 mutations verified to fail; units
+      + `TestPort_RegressSuite` (265 s) + `scripts/tpch-spotcheck.sh` (Q12=2,
+      Q13=35). Deferred (2 ledger rows): the spring-forward gap hour, POSIX zone
+      spellings, and the ~40 un-audited `NewTimeDatum` producers. Design:
+      `docs/design/0119-0006-timestamptz-cast-text-rendering.md`.
       **Second slice landed 2026-08-10 — general key decode:** the
       single-int4-key-column restriction is lifted. `btIndexOpClassComparator`
       now walks a composite key column by column (upstream `_bt_compare`'s
