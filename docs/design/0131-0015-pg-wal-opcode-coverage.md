@@ -190,7 +190,7 @@ Two opcodes handled; the other twelve **silently no-op'd** (`recovery.go:2245-22
 | `INSERT_UPPER` | 0x10 | H (S21b part 1) | `btree_xlog_insert(f,f,f)` | downlink insert after a child split (`nbtinsert.c:1342`) |
 | `INSERT_META` | 0x20 | H (S21b part 1) | `btree_xlog_insert(f,t,f)` | ditto, when the fast-root also moves (`nbtinsert.c:1348`) |
 | `SPLIT_L` / `SPLIT_R` | 0x30/0x40 | H `:2470` | `btree_xlog_split` `:251` | page split |
-| `INSERT_POST` | 0x50 | **S** | `btree_xlog_insert(t,f,t)` | insert splitting a **posting list** on a deduplicated leaf (`nbtinsert.c:1337`) |
+| `INSERT_POST` | 0x50 | H (S21b part 2a) | `btree_xlog_insert(t,f,t)` | insert splitting a **posting list** on a deduplicated leaf (`nbtinsert.c:1337`) |
 | `DEDUP` | 0x60 | **S** | `btree_xlog_dedup` `:464-556` | leaf deduplication before a split (`nbtdedup.c:265`) |
 | `DELETE` | 0x70 | **S** | `btree_xlog_delete` `:652-716` | LP_DEAD / bottom-up index deletion (`nbtpage.c:1369`) |
 | `UNLINK_PAGE` / `_META` | 0x80/0x90 | H `:2503` | `btree_xlog_unlink_page` `:802` | page deletion |
@@ -870,6 +870,61 @@ by 4 scripted reverts (dropped child limb → 2 FAIL; early return on a block-0 
 `_bt_swap_posting`/`_bt_form_posting`, the first posting-list *writers* in goopg —
 `internal/access/btree/posting.go` only parses), part 3 `DELETE` 0x70 +
 `META_CLEANUP`'s neighbour `REUSE_PAGE` 0xD0 as a recognised no-op.
+
+### S21b — implementation notes, part 2a: INSERT_POST (landed 2026-08-12)
+
+`XLOG_BTREE_INSERT_POST` (0x50) is the leaf insert whose heap TID fell *inside* an
+existing posting list, so `_bt_insertonpg` had to split that posting to make room
+(`nbtinsert.c:1337`, the `postingoff > 0` path). goopg never emits it — its own
+duplicate-key inserts APPEND to a posting (`appendTIDToPosting`) — but
+**deduplication is on by default in every real PG index whose opclass allows it**,
+so this is ordinary traffic in a crash tail, and PG logs an FPI only on a page's
+first post-checkpoint touch. Before this slice it fell to RM_BTREE's `default:` and,
+since S16.3, refused the start.
+
+**The record does not carry the item that ends up on the page.** Block 0's data run
+is `{uint16 postingoff, orignewitem}` (`nbtinsert.c:1316-1330`) — the new item as it
+looked *before* the split — so redo must re-run `_bt_swap_posting` rather than
+trust the record. That function is the non-obvious part, and nothing about its name
+says so: **nothing grows.** `nposting` keeps `oposting`'s exact byte length and TID
+count; TIDs at `[postingoff, nhtids-1)` shift one slot right, the posting's
+rightmost/max TID **falls off the end**, `newitem`'s original TID fills the gap at
+`postingoff`, and the evicted max TID becomes the *final* new item's `t_tid`. Fixed
+length is what lets the caller overwrite the posting in place (upstream's
+`memcpy(oposting, nposting, …)`; `storage.PageReplaceItemRaw`'s in-place branch
+here), so the page only has to find room for the one new item. Inserting
+`orignewitem` verbatim would leave BOTH the posting and the new item holding the
+wrong TID — an index that *scans wrong* rather than one that fails to start, which
+is why the guard asserts the swapped TIDs and not merely "the page has one more
+item".
+
+Two writers land in `internal/access/btree/posting.go`, goopg's first:
+`SwapPosting` (`_bt_swap_posting`) and the exported `PGBTPostingRaw`
+(`_bt_form_posting`), the latter now the ONE tuple-format posting encoder —
+`marshalPosting` delegates to it for `tupleKeys()`, which is byte-identical to what
+it computed inline (`postingOffsetFor` is `MAXALIGN(len(key))` and `postingSizeFor`
+MAXALIGNs the total for that format), so no on-disk bytes move. Blob format keeps
+its own unaligned encoder unchanged. `ApplyInsertPostingRecordAt`
+(`internal/access/btree/replay.go`) is the page-level redo; the WAL side is one new
+`posting` argument on `replayDecodedXLogBtreeInsert`, matching upstream's
+`btree_xlog_insert(isleaf, ismeta, posting)` — now instantiated all four ways.
+
+Refusals rather than corruption, both before the page is touched: `postingoff` out
+of `(0, nhtids)` (upstream's own `elog(ERROR)` — a 0 would shift the whole array and
+write TIDs that are no longer ascending), a left neighbour that is not a posting
+list (upstream reads it as one unconditionally, its `Assert` compiled out), and an
+`offnum < 2`, which has no predecessor at all and whose unchecked `offnum-1` would
+underflow to 65535.
+
+5 guards in `internal/wal/btree_insert_post_pg_test.go`, including the
+FPI shape (restore the image, do NOT re-run the split on top of it). Proven
+fail-when-broken by 2 scripted reverts: not evicting the max TID → the replay guard
+FAILs on the new item's `t_tid`; dropping the `offnum < 2` check → the refusal guard
+FAILs on a raw slot error from the storage layer.
+
+**Remaining in part 2:** `DEDUP` 0x60 (`btree_xlog_dedup`, `nbtxlog.c:464-556`) — it
+rebuilds the whole leaf from an interval array via `_bt_form_posting`, which
+`PGBTPostingRaw` now supplies.
 
 ## Guards
 

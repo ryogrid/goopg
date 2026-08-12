@@ -2826,7 +2826,19 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			// data, no FPI — replay re-inserts by key. A real-PG leaf insert
 			// carrying a full-page image is restored via the FPI branch inside
 			// replayDecodedXLogBtreeInsert.
-			if err := replayDecodedXLogBtreeInsert(mgr, r, xlog, true, false); err != nil {
+			if err := replayDecodedXLogBtreeInsert(mgr, r, xlog, true, false, false); err != nil {
+				return false, err
+			}
+			return true, nil
+		case xlogBtreeInsertPost:
+			// M0131-S21b part 2: PG-only — a leaf insert whose heap TID landed
+			// inside an existing posting list, so the primary split that
+			// posting (nbtinsert.c:_bt_insertonpg, `postingoff > 0`). goopg's
+			// own inserts never take this path (they append to a posting), but
+			// any real PG index built with deduplication on — the default —
+			// emits this opcode routinely. Block 0's data run is
+			// {uint16 postingoff, orignewitem}, not a bare item.
+			if err := replayDecodedXLogBtreeInsert(mgr, r, xlog, true, false, true); err != nil {
 				return false, err
 			}
 			return true, nil
@@ -2835,7 +2847,7 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			// RecordKindBtreeSplit/NewRoot. An insert into an internal page also
 			// finishes the child's split, so redo clears the child's
 			// BTP_INCOMPLETE_SPLIT flag off block 1 (nbtxlog.c:160-177).
-			if err := replayDecodedXLogBtreeInsert(mgr, r, xlog, false, false); err != nil {
+			if err := replayDecodedXLogBtreeInsert(mgr, r, xlog, false, false, false); err != nil {
 				return false, err
 			}
 			return true, nil
@@ -2843,7 +2855,7 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			// M0131-S21b part 1: INSERT_UPPER plus the metapage rewrite PG folds
 			// in when the internal insert also moved the fast root
 			// (nbtinsert.c:1346-1361).
-			if err := replayDecodedXLogBtreeInsert(mgr, r, xlog, false, true); err != nil {
+			if err := replayDecodedXLogBtreeInsert(mgr, r, xlog, false, true, false); err != nil {
 				return false, err
 			}
 			return true, nil
@@ -4070,9 +4082,10 @@ func replayDecodedXLogHeapUpdate(mgr *storage.Manager, r Record, xlog *XLogDecod
 // pd_lsn.
 //
 // `isleaf` / `ismeta` are upstream's own arguments, set from the opcode:
-// INSERT_LEAF (true,false), INSERT_UPPER (false,false), INSERT_META
-// (false,true). goopg only ever emits INSERT_LEAF; the other two arrive from a
-// real PG crash tail (M0131-S21b part 1) and add two limbs:
+// INSERT_LEAF (true,false,false), INSERT_UPPER (false,false,false),
+// INSERT_META (false,true,false), INSERT_POST (true,false,true). goopg only
+// ever emits INSERT_LEAF; the other three arrive from a real PG crash tail
+// (M0131-S21b parts 1-2) and add three limbs:
 //
 //   - block 1 (!isleaf) — an insert into an INTERNAL page is what finishes the
 //     child's split, so redo clears the child's BTP_INCOMPLETE_SPLIT flag.
@@ -4083,13 +4096,16 @@ func replayDecodedXLogHeapUpdate(mgr *storage.Manager, r Record, xlog *XLogDecod
 //   - block 2 (ismeta) — the metapage, rebuilt from the carried
 //     xl_btree_metadata. Registered WILL_INIT (nbtinsert.c:1359-1360), so it is
 //     re-initialised from scratch rather than read-modify-written.
+//   - block 0 (posting) — the data run is {uint16 postingoff, orignewitem}
+//     instead of a bare item, and redo re-runs the primary's posting-list
+//     split before adding the item (btree.ApplyInsertPostingRecordAt).
 //
 // Each limb carries its own pd_lsn idempotency, matching the per-buffer
 // discipline of upstream's redo (and of replayDecodedXLogBtreeNewRoot): a replay
 // interrupted between limbs resumes correctly. Note the block-0 image branch
 // does NOT return early — upstream's BLK_RESTORED only skips block 0's manual
 // mutation, the metapage limb still runs.
-func replayDecodedXLogBtreeInsert(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord, isleaf, ismeta bool) error {
+func replayDecodedXLogBtreeInsert(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord, isleaf, ismeta, posting bool) error {
 	endLSN := storage.LSN(r.EndLSN)
 
 	if !isleaf {
@@ -4119,9 +4135,15 @@ func replayDecodedXLogBtreeInsert(mgr *storage.Manager, r Record, xlog *XLogDeco
 			return fmt.Errorf("wal: xlog btree-insert: main data len %d (want >= %d)", len(xlog.MainData), sizeOfXLogBtreeInsertData)
 		}
 		offnum := binary.LittleEndian.Uint16(xlog.MainData[0:2])
-		if err := replayExistingXLogBlock(mgr, block, endLSN, func(page storage.Page) error {
+		apply := func(page storage.Page) error {
 			return btree.ApplyInsertRecordAt(page, block.Data, offnum)
-		}); err != nil {
+		}
+		if posting {
+			apply = func(page storage.Page) error {
+				return btree.ApplyInsertPostingRecordAt(page, block.Data, offnum)
+			}
+		}
+		if err := replayExistingXLogBlock(mgr, block, endLSN, apply); err != nil {
 			return fmt.Errorf("wal: xlog btree-insert apply: %w", err)
 		}
 	}

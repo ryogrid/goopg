@@ -149,14 +149,17 @@ const (
 	xlogBtreeInsertMeta       uint8 = 0x20 // XLOG_BTREE_INSERT_META
 	xlogBtreeSplitL           uint8 = 0x30 // XLOG_BTREE_SPLIT_L
 	xlogBtreeSplitR           uint8 = 0x40 // XLOG_BTREE_SPLIT_R
+	xlogBtreeInsertPost       uint8 = 0x50 // XLOG_BTREE_INSERT_POST
 	xlogBtreeUnlinkPage       uint8 = 0x80 // XLOG_BTREE_UNLINK_PAGE
 	xlogBtreeUnlinkPageMeta   uint8 = 0x90 // XLOG_BTREE_UNLINK_PAGE_META
 	xlogBtreeNewRoot          uint8 = 0xA0 // XLOG_BTREE_NEWROOT
 	xlogBtreeMarkPageHalfDead uint8 = 0xB0 // XLOG_BTREE_MARK_PAGE_HALFDEAD
 	xlogBtreeVacuum           uint8 = 0xC0 // XLOG_BTREE_VACUUM
-	// M0131-S21b part 1: PG-only opcodes goopg never emits but must replay
-	// off a real PG crash tail. XLOG_BTREE_META_CLEANUP is _bt_set_cleanup_info's
-	// metapage-only rewrite (nbtpage.c), redone by _bt_restore_meta(record, 0).
+	// M0131-S21b parts 1-2: PG-only opcodes goopg never emits but must replay
+	// off a real PG crash tail. XLOG_BTREE_INSERT_POST (0x50, above) is the
+	// leaf insert that had to split an existing posting list; XLOG_BTREE_META_CLEANUP
+	// is _bt_set_cleanup_info's metapage-only rewrite (nbtpage.c), redone by
+	// _bt_restore_meta(record, 0).
 	xlogBtreeMetaCleanup uint8 = 0xE0 // XLOG_BTREE_META_CLEANUP
 
 	// XLOG_SMGR_CREATE (storage_xlog.h:30). Used by recordKindToRmgrInfo

@@ -6,6 +6,7 @@ package btree
 // paths.
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 
@@ -339,6 +340,55 @@ func ApplyInsertRecordAt(page storage.Page, raw []byte, offnum uint16) error {
 	}
 	if _, err := storage.PageInsertItemRawAt(page, offnum, raw); err != nil {
 		return fmt.Errorf("btree: replay of insert at offnum %d: %w", offnum, err)
+	}
+	return nil
+}
+
+// ApplyInsertPostingRecordAt re-runs the `posting` limb of upstream's
+// btree_xlog_insert (nbtxlog.c:186-224) — the redo of XLOG_BTREE_INSERT_POST,
+// a leaf insert whose heap TID fell INSIDE an existing posting list, so the
+// primary had to split that posting to make room.
+//
+// `data` is block 0's data run in the record's own layout: a uint16 posting
+// offset followed by `orignewitem` — the new item as it looked BEFORE the
+// split. Redo must re-run the split rather than trust the record, because the
+// item actually placed on the primary's page is not the one logged: the split
+// evicts the old posting's rightmost heap TID into the new item (see
+// SwapPosting). Inserting `orignewitem` verbatim would put the wrong TID on the
+// page and leave the posting's TIDs non-ascending.
+//
+// `offnum` is the physical 1-based offset the new item goes at; the posting
+// being split is its immediate predecessor, upstream's
+// OffsetNumberPrev(xlrec->offnum).
+//
+// M0131-S21b part 2. Idempotency is the caller's (pd_lsn vs record end-LSN),
+// as for ApplyInsertRecordAt.
+func ApplyInsertPostingRecordAt(page storage.Page, data []byte, offnum uint16) error {
+	if len(data) < 2 {
+		return fmt.Errorf("btree: replay of posting-split insert: block data len %d (want >= 2)", len(data))
+	}
+	postingoff := int(binary.LittleEndian.Uint16(data[0:2]))
+	orignewitem := data[2:]
+	if offnum < 2 {
+		// P_HIKEY is offset 1, so a posting split can never target offset 1 or
+		// 0: there would be no posting to the left to split.
+		return fmt.Errorf("btree: replay of posting-split insert: offnum %d has no predecessor item", offnum)
+	}
+	oposting, err := storage.PageGetItemRaw(page, offnum-1)
+	if err != nil {
+		return fmt.Errorf("btree: replay of posting-split insert: read posting at offnum %d: %w", offnum-1, err)
+	}
+	nposting, newitem, err := SwapPosting(orignewitem, oposting, postingoff)
+	if err != nil {
+		return fmt.Errorf("btree: replay of posting-split insert at offnum %d: %w", offnum, err)
+	}
+	// Same byte length as oposting by construction, so this is upstream's
+	// in-place memcpy over the existing item and cannot need page space.
+	if err := storage.PageReplaceItemRaw(page, offnum-1, nposting); err != nil {
+		return fmt.Errorf("btree: replay of posting-split insert: rewrite posting at offnum %d: %w", offnum-1, err)
+	}
+	if _, err := storage.PageInsertItemRawAt(page, offnum, newitem); err != nil {
+		return fmt.Errorf("btree: replay of posting-split insert at offnum %d: %w", offnum, err)
 	}
 	return nil
 }
