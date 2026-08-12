@@ -164,19 +164,57 @@ func TestExternalizeVarlenaPayloadIncompressibleLayout(t *testing.T) {
 	}
 }
 
-// TestPgRewriteEvActionDatumSwitchesRepresentation pins the boundary: the
-// corpus's current entries stay inline (byte-identical to what S9 wrote), and
-// a value past the budget becomes an 18-byte pointer plus chunks.
+// TestPgRewriteEvActionDatumSwitchesRepresentation pins the boundary: which
+// corpus entries go out of line is a closed set, everything else stays inline
+// (byte-identical to what S9 wrote), and a value past the budget becomes an
+// 18-byte pointer plus chunks.
+//
+// M0131-S20.2b turned the "no corpus rule is toasted" half of this guard into
+// its inverse. Until this slice the writer was INERT — no seeded ev_action was
+// oversize — and the guard's job was to say so. Now four are, and naming them
+// by rule OID is what makes a FIFTH (or a vanished one) a test failure rather
+// than a silent change in what goopg's initdb writes to base/{1,5}/2838.
 func TestPgRewriteEvActionDatumSwitchesRepresentation(t *testing.T) {
+	// rule OID -> view, for the captures whose ev_action does not fit inline.
+	// Upstream's stored sizes are 9002 / 9316 / 12196 / 10475 B.
+	wantToasted := map[uint32]string{
+		12046: "pg_indexes",
+		12056: "pg_stats",
+		12061: "pg_stats_ext",
+		12177: "pg_statio_all_tables",
+	}
+	gotToasted := map[uint32]bool{}
 	for _, e := range pgRewriteInitialEntries() {
 		d, chunks := pgRewriteEvActionDatum(e)
 		if len(chunks) != 0 {
-			t.Fatalf("corpus rule %d (%s) unexpectedly toasted; if a capture "+
-				"just landed, this guard is the place to record it", e.OID, e.RuleName)
+			if _, ok := wantToasted[e.OID]; !ok {
+				t.Fatalf("corpus rule %d (%s) is toasted but is not in the "+
+					"expected set %v; if a capture just landed, this guard is "+
+					"the place to record it", e.OID, e.RuleName, wantToasted)
+			}
+			gotToasted[e.OID] = true
+			// The out-of-line datum is the 18-byte pointer, not a varlena.
+			if d.Kind != executor.KindBytes || len(d.BytesValue()) != varattExternalPointerSize {
+				t.Fatalf("rule %d: toasted ev_action is not an 18-byte external pointer", e.OID)
+			}
+			for _, c := range chunks {
+				if c.ChunkID != pgRewriteToastValueID(e.OID) {
+					t.Fatalf("rule %d: chunk_id %d, want rule OID+1 = %d",
+						e.OID, c.ChunkID, pgRewriteToastValueID(e.OID))
+				}
+			}
+			continue
 		}
 		want := pglzVarlenaDatum(e.EvAction)
 		if d.Kind != want.Kind {
 			t.Fatalf("rule %d: inline datum kind changed", e.OID)
+		}
+	}
+	for oid, view := range wantToasted {
+		if !gotToasted[oid] {
+			t.Errorf("rule %d (%s) is expected to be stored OUT OF LINE but came "+
+				"back inline — either the capture was dropped from the corpus or "+
+				"the inline budget moved", oid, view)
 		}
 	}
 

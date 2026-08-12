@@ -6227,10 +6227,20 @@ func pgAttributeRow(relOID uint32, a nailedAttr) executor.Row {
 }
 
 // hasVarWidthCol returns true if any column is varlena ("text" type).
+//
+// M0131-S20.2b: "bytea" was missing here, and the omission was not theoretical
+// — the pg_rewrite TOAST heap's chunk_data is bytea, so every chunk tuple
+// S20.2a wrote carried a clear HEAP_HASVARWIDTH. A hosted PG then took
+// nocachegetattr's FAST path for attribute 3 (heaptuple.c:588 — the var-width
+// scan is guarded by HeapTupleHasVarWidth), walked off the end of the
+// fixed-width prefix and died on `Assert("j > attnum")` at heaptuple.c:642,
+// inside heap_fetch_toast_slice. An assert-disabled build would have read a
+// garbage offset instead. Same class of bug as the comment at :1862.
 func hasVarWidthCol(cols []catalog.Column) bool {
 	for _, c := range cols {
 		switch c.Type.Name {
 		case "text", "varchar", "bpchar",
+			"bytea",
 			"pg_node_tree",
 			"text[]", "_text",
 			"aclitem[]", "_aclitem",

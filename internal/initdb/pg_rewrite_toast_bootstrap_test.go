@@ -136,6 +136,14 @@ func TestPgRewriteToastPairAttributes(t *testing.T) {
 // in each per-database directory. pg_class.reltoastrelid is resolved by
 // RelationInitPhysicalAddr on relcache load, so the file must exist from the
 // moment the pg_class row does — even while the heap holds no chunks.
+//
+// M0131-S20.2b: the heap no longer holds no chunks. S20.1 wrote exactly one
+// empty page per file and this guard pinned that; the four out-of-line
+// ev_action captures now fill six pages of 2838 (22 chunk tuples at ~2032 B,
+// four to a page) and two of 2839. The assertion is therefore "a whole number
+// of valid pages, at least one" plus an explicit page-count expectation —
+// checking every page's header, not just block 0, is what the size check was
+// standing in for.
 func TestPgRewriteToastPairIndexRowAndFiles(t *testing.T) {
 	var idx *pgIndexEntry
 	for i, e := range pgIndexInitialEntries() {
@@ -164,6 +172,10 @@ func TestPgRewriteToastPairIndexRowAndFiles(t *testing.T) {
 	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
+	// Both per-database copies hold the same seeded corpus, so the page counts
+	// are identical: 2838 carries the 22 chunk tuples of the four out-of-line
+	// ev_action captures, 2839 the btree over them (metapage + root).
+	wantPages := map[string]int{"2838": 6, "2839": 2}
 	for _, db := range []string{"1", "5"} {
 		for _, oid := range []string{"2838", "2839"} {
 			path := filepath.Join(dir, "base", db, oid)
@@ -171,12 +183,21 @@ func TestPgRewriteToastPairIndexRowAndFiles(t *testing.T) {
 			if err != nil {
 				t.Fatalf("base/%s/%s: %v", db, oid, err)
 			}
-			if len(data) != storage.BlockSize {
-				t.Errorf("base/%s/%s: size %d, want one %d-byte page", db, oid, len(data), storage.BlockSize)
+			if len(data) == 0 || len(data)%storage.BlockSize != 0 {
+				t.Errorf("base/%s/%s: size %d, want a positive multiple of %d",
+					db, oid, len(data), storage.BlockSize)
 				continue
 			}
-			if _, err := storage.Header(storage.Page(data)); err != nil {
-				t.Errorf("base/%s/%s: invalid page header: %v", db, oid, err)
+			if got := len(data) / storage.BlockSize; got != wantPages[oid] {
+				t.Errorf("base/%s/%s: %d pages, want %d — the seeded chunk set "+
+					"changed (M0131-S20.2b captured four out-of-line ev_actions)",
+					db, oid, got, wantPages[oid])
+			}
+			for blk := 0; blk < len(data); blk += storage.BlockSize {
+				if _, err := storage.Header(storage.Page(data[blk : blk+storage.BlockSize])); err != nil {
+					t.Errorf("base/%s/%s: block %d has an invalid page header: %v",
+						db, oid, blk/storage.BlockSize, err)
+				}
 			}
 		}
 	}

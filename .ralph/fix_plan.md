@@ -4293,15 +4293,63 @@ Theme C — Real PG hosted on goopg evaluates views (closes "goopg cannot host a
       does not invalidate its cache on an `internal/initdb` change), UNITS
       PASS, `go build ./...` + `go vet` clean, pgbench smoke via the hook.
       Design `0131-0035` §S20.2a + F20/F21/F22. 2 ledger rows.
-      **Next: S20.2b** — relax `capture-ev-action.sh` guard #5 to "inline OR
-      toastable" (keeping `MAX_EV_ACTION_STORED` and `maxInlineEvActionStored`
-      naming the same number), capture the six oversize views plus the two
-      dependents, regenerate via `cmd/gen-nailed-view-tables`, invert
-      `assertNonCorpusSystemViewIsStillAbsent` (subject `pg_indexes`) onto the
-      ninth view `pg_policies` (whose blocker is unrelated), and extend
-      `assertHostedPGSeesPgRewriteToastRelation` with a real
-      `SELECT * FROM pg_indexes` on the hosted PG — the acceptance S20.2a had
-      no oversize value to run.
+      **S20.2b LANDED 2026-08-12 — the corpus is 77 of upstream's 80 views.**
+      Capture guard #5 is now "inline OR toastable": `MAX_EV_ACTION_STORED`
+      still names the same 8000 B boundary as `maxInlineEvActionStored`, but
+      crossing it is admitted when the tree still carries the out-of-line path
+      (both `{Parent: 2618, ToastRel: 2838, …}` and `externalizeVarlenaPayload`
+      grepped out of the Go tree, as the pins and pg_type set already were)
+      AND the ORACLE stores that value out of line under `chunk_id =
+      rule_oid + 1` with chunk lengths summing to `pg_column_size` — i.e. F20
+      and F22 re-measured per captured view instead of trusted from the S20.2a
+      run. Six views entered (`pg_indexes` 12043, `pg_stats` 12053,
+      `pg_stats_ext` 12058, and the `pg_statio_*_tables` triple whose base
+      12174 goes external while both dependents stay INLINE at 1756/1759 B —
+      F14 again, and the corpus's first external-base/inline-dependent edge).
+      **F23, and the whole reason S20.2a's inertness was a debt: every chunk
+      tuple was written WITHOUT `HEAP_HASVARWIDTH`.** `initdb.hasVarWidthCol`
+      decides the bit from a hardcoded list of type NAMES and had no `bytea`
+      arm, so a hosted PG took `nocachegetattr`'s fixed-width fast path for
+      chunk_data (the var-width scan is guarded by `HeapTupleHasVarWidth`,
+      heaptuple.c:588), ran off the 8-byte prefix and died on
+      `Assert("j > attnum")` (heaptuple.c:642) inside
+      `heap_fetch_toast_slice` — an assert-disabled build would have read a
+      garbage offset instead. **F24: goopg's pglz is BETTER than upstream's** —
+      every externalised value stores 3-4% smaller (9002→8674, 9316→8985,
+      12196→11743, 10475→10125 B), which costs `pg_stats_ext` a whole chunk
+      (6 vs 7), so goopg's `pg_toast_2618` is byte-divergent from upstream's
+      while the detoasted datum is identical (proven end to end). **Two views
+      stayed out and NEITHER for a size reason**, both measured against a
+      hosted PG rather than assumed: `pg_seclabels` (12099, 18 chunks) fails
+      `could not open relation with OID 3596` — pg_seclabel (3596) and
+      pg_largeobject_metadata (2995) are not on-disk relations; and
+      `pg_stats_ext_exprs` (12063) fails `type with OID 10029 does not exist`
+      then trips `Assert("OidIsValid(typentry->typrelid)")` (typcache.c:3082) —
+      **ceiling #6**, the first about a catalog's own COMPOSITE rowtype rather
+      than a missing relation or an unpopulated column (goopg seeds the array
+      type 10028 and points its typelem at 10029, but never 10029 itself).
+      `pg_stats_ext` also forced `_bool` (1000) and `_float8` (1022) into the
+      canonical pg_type table; 1022's typalign is `'d'`, not the `'i'` every
+      other array there carries. Acceptance:
+      `assertNonCorpusSystemViewIsStillAbsent` inverted onto `pg_policies`, and
+      `assertHostedPGSeesPgRewriteToastRelation` now runs `SELECT count(*) FROM
+      pg_indexes` on a hosted PG (pointer → index 2839 → 5 chunks →
+      pglz → stringToNode of the 70408-byte Query) plus a
+      `chunk_id/chunks/bytes` pin over the whole heap. Two S20.1/S20.2a
+      fail-when-fixed locks fired and were inverted
+      (`TestPgRewriteToastPairIndexRowAndFiles` now expects 6/2 pages and
+      checks EVERY page header; `TestPgRewriteEvActionDatumSwitchesRepresentation`
+      now names the four toasted rule OIDs). 3 break directions proven
+      fail-when-broken by scripted revert (drop the `bytea` arm → the hosted-PG
+      TRAP returns; chunk_id+2 → guard #5's F22 arm; writer symbol renamed →
+      the pre-S20.2 hard failure). Gates: `internal/initdb` PASS (181 s),
+      `^TestE2E_` family PASS (100 s), `TestE2E_PGColdStartOnGoopgDataDir` PASS
+      (-count=1), UNITS PASS, `go build ./...` + `go vet` clean, pgbench smoke
+      via the hook. Design `0131-0035` §S20.2b + F23/F24. 4 ledger rows.
+      **Remaining for the corpus: three views** — `pg_policies` (ceiling #4,
+      pg_policy 3256), `pg_seclabels` (3596/2995) and `pg_stats_ext_exprs`
+      (ceiling #6, pg_type 10029). All three are missing-catalog/missing-type
+      slices; the TOAST work is DONE.
       **Next in S9:** two ceilings left, both initdb-bootstrap gaps. The
       `pg_rewrite` TOAST (2838/2839) slice is the critical path — it gates
       EIGHT of the nine remaining views (`pg_indexes`, `pg_stats`,

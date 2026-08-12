@@ -213,29 +213,92 @@ one block verbatim, compressed ~100:1, and never crossed the inline budget — t
 guard passed while testing nothing. Real captures compress 6–10:1 and the
 generator now matches that band.
 
-## S20.2b — the captures (open)
+## S20.2b — the captures (landed 2026-08-12)
 
-Items 1 and 2 landed as S20.2a above. What remains:
+Guard #5 in `scripts/capture-ev-action.sh` is now **"inline OR toastable"**.
+`MAX_EV_ACTION_STORED` still names the same 8000 B boundary as
+`maxInlineEvActionStored` — what changed is that crossing it is no longer
+fatal. An over-budget capture is admitted only when the tree still carries the
+out-of-line path (both `{Parent: 2618, ToastRel: 2838, …}` and
+`externalizeVarlenaPayload` are grepped for out of the Go tree, exactly as the
+pins and the pg_type set already were) **and** the oracle itself stores that
+value out of line under `chunk_id = rule_oid + 1` with the chunk lengths
+summing to `pg_column_size`. That second half re-measures F20 and F22 per
+captured view instead of trusting the S20.2a run, and both halves are proven
+fail-when-broken by scripted revert.
 
-1. Capture the eight views with `scripts/capture-ev-action.sh` and relax its
-   guard #5 (the 8000 B inline budget) into "inline OR toastable" rather than
-   deleting it — the budget still names the boundary at which representation
-   changes, and `maxInlineEvActionStored` in
-   `internal/initdb/pg_rewrite_toast_writer.go` must keep naming the same
-   number, or a view could pass capture and then produce a page no reader can
-   parse. Six of the eight are oversize (see the table above); the two
-   `pg_statio_*_tables` dependents enter inline.
-2. Invert `assertNonCorpusSystemViewIsStillAbsent` (its subject `pg_indexes` is
-   the first of the eight) and re-point it at the ninth view, `pg_policies`,
-   whose blocker is unrelated: `pg_policy` (3256) is not an on-disk relation.
-3. **The acceptance that S20.2a could not run**: a real PG cold-started on a
-   goopg `$PGDATA` must `SELECT * FROM pg_indexes` — i.e. resolve the pointer,
-   scan `pg_toast_2618_index` for its `chunk_id`, reassemble, decompress and
-   rewrite the query. Until a capture exists there is no oversize value on
-   disk, so the writer's output is only verifiable against PG's documented
-   struct and goopg's own reader; extend
-   `assertHostedPGSeesPgRewriteToastRelation` with the read the moment the
-   first capture lands.
+**The corpus goes 71 → 77 views.** Six captures entered: `pg_indexes` (12043),
+`pg_stats` (12053), `pg_stats_ext` (12058), and the `pg_statio_*_tables` triple
+(12174 out of line, its two dependents 12179/12183 inline at 1756/1759 B — F14
+again, and the first place the corpus mixes an external base with inline
+dependents across a view-on-view edge).
+
+### F23 — `HEAP_HASVARWIDTH` was missing on every chunk tuple
+
+The first hosted-PG run did not fail; it **crashed**, with
+`TRAP: failed Assert("j > attnum")` at `heaptuple.c:642` inside
+`nocachegetattr` ← `heap_fetch_toast_slice`. `initdb.hasVarWidthCol` decides
+the infomask bit from a hardcoded list of type NAMES and **`bytea` was not in
+it** — so every chunk tuple S20.2a wrote claimed to have no var-width column.
+PG's `nocachegetattr` guards its entire var-width scan behind
+`HeapTupleHasVarWidth` (heaptuple.c:588), so it took the fixed-width fast path
+for attribute 3, ran off the end of the 8-byte prefix and asserted. An
+assert-disabled build would have read a garbage offset instead of crashing,
+which is the more alarming half.
+
+This is the S20.2a inertness fee coming due: the writer could not be wrong in a
+way anything noticed until a real value existed. The one-word fix is in
+`hasVarWidthCol`; that the list is name-based and still incomplete (json,
+jsonb, numeric, …) is ledgered.
+
+### F24 — goopg's pglz is *better* than upstream's, so the heaps differ
+
+Every externalised value stores 3-4 % smaller than upstream's:
+
+| view | upstream | goopg |
+|---|---|---|
+| `pg_indexes` | 5 chunks / 9002 B | 5 / 8674 |
+| `pg_stats` | 5 / 9316 | 5 / 8985 |
+| `pg_stats_ext` | 7 / 12196 | **6** / 11743 |
+| `pg_statio_all_tables` | 6 / 10475 | 6 / 10125 |
+
+goopg's pglz encoder finds shorter output than PG's for the same input, and for
+`pg_stats_ext` that costs a whole chunk. The DETOASTED value is byte-identical
+— proven end to end by the hosted PG evaluating all six views — so this is a
+divergence in the TOAST heap, not in the datum. Recorded rather than "fixed":
+matching upstream's exact output would mean reproducing its match-search
+heuristics, not its format. Ledgered.
+
+### Two views stayed out, neither for a size reason
+
+Both toast cleanly; both were measured against a hosted PG in this slice.
+
+- **`pg_seclabels`** (12099, 35379 B, 18 chunks) — `could not open relation
+  with OID 3596`. `pg_seclabel` (3596) and `pg_largeobject_metadata` (2995) are
+  not on-disk relations in a goopg cluster. Same class as ceiling #4.
+- **`pg_stats_ext_exprs`** (12063, 11481 B) — `type with OID 10029 does not
+  exist`, then `Assert("OidIsValid(typentry->typrelid)")` (typcache.c:3082)
+  during abort. goopg seeds the ARRAY type 10028 (`_pg_statistic`) and points
+  its `typelem` at 10029, but never seeds a `pg_type` row for the composite
+  rowtype itself. **Ceiling #6** — the first that is about a catalog's own
+  rowtype rather than a missing relation or an unpopulated column.
+
+`pg_stats_ext` also forced two more entries into the canonical pg_type table:
+`_bool` (1000) and `_float8` (1022). 1022's `typalign` is `'d'`, not the `'i'`
+every other array in that table carries — Catalog.pm:469 gives an array type
+`'d'` when its element is, and float8 is.
+
+### Acceptance
+
+`assertNonCorpusSystemViewIsStillAbsent` is inverted onto `pg_policies`
+(`pg_indexes` moved into the corpus), and
+`assertHostedPGSeesPgRewriteToastRelation` now runs the read S20.2a could not:
+`SELECT count(*) FROM pg_catalog.pg_indexes` on a real PG cold-started on a
+goopg `$PGDATA`, which resolves the 18-byte pointer, scans
+`pg_toast_2618_index` for chunk_id 12047, reassembles five chunks,
+pglz-decompresses and `stringToNode`s the 70408-byte Query. It also pins the
+whole heap as `chunk_id/chunks/bytes` triples, so a change to the split is a
+test failure rather than a silent difference in what goopg writes.
 
 ## Scope limits (ledgered)
 

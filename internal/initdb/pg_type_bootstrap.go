@@ -140,6 +140,13 @@ func pgTypeCanonical(oid uint32) (pgTypeEntry, bool) {
 		// inet: variable-length IP-address type; typcategory='I', typstorage='m'.
 		// inet_in=910, inet_out=911, inet_recv=2496, inet_send=2497.
 		return pgTypeEntry{869, "inet", -1, false, 'b', 'I', 'i', 'm', 910, 911, 2496, 2497}, true
+	case 1000:
+		// _bool: the array of bool (16). M0131-S20.2b —
+		// pg_stats_ext.most_common_val_nulls / most_common_base_freqs are the
+		// first nailed-view columns of a boolean array, and capture guard #5's
+		// sibling (the atttypid check) refused pg_stats_ext until the canonical
+		// table carried it. typalign 'i', not bool's own 'c' (Catalog.pm:469).
+		return pgTypeEntry{1000, "_bool", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
 	case 1002:
 		return pgTypeEntry{1002, "_char", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
 	case 1003:
@@ -151,6 +158,15 @@ func pgTypeCanonical(oid uint32) (pgTypeEntry, bool) {
 		return pgTypeEntry{1003, "_name", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
 	case 1021:
 		return pgTypeEntry{1021, "_float4", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
+	case 1022:
+		// _float8: the array of float8 (701). M0131-S20.2b —
+		// pg_stats.most_common_freqs / correlation's siblings and
+		// pg_stats_ext.most_common_freqs. typalign is 'd' here, NOT the 'i'
+		// every other array above carries: Catalog.pm:469 gives an array type
+		// 'd' when its element is 'd', and float8's typalign IS 'd' (measured
+		// on the oracle, pg_type oid 1022). Getting this wrong misaligns every
+		// element a hosted PG deforms out of the column.
+		return pgTypeEntry{1022, "_float8", -1, false, 'b', 'A', 'd', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
 	case 1007:
 		return pgTypeEntry{1007, "_int4", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
 	case 1009:

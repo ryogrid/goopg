@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -756,9 +757,10 @@ func assertHostedPGCanCallSQLBuiltins(t *testing.T, pg *pgcluster.Cluster, logPa
 // ORDER BY needed the pg_amop lookup through index 2653, which M0131-S12 later
 // bulk-loaded; M0131-S9.3d re-measures it here and it now evaluates.)
 // Deliberately absent:
-// pg_indexes (12043), S9.2a's fourth candidate, whose 9002 B ev_action is the
-// first to breach the 8000 B inline-tuple budget; it is now the subject of
-// assertNonCorpusSystemViewIsStillAbsent below.
+// (pg_indexes (12043), S9.2a's fourth candidate, was absent here for the same
+// class of reason — its 9002 B ev_action was the first to breach the 8000 B
+// inline-tuple budget. M0131-S20.2b captures it out of line and it joins the
+// set below; assertNonCorpusSystemViewIsStillAbsent moved on to pg_policies.)
 //
 // M0131-S9.3a adds the per-table statistics family — the first tranche where
 // view-on-view edges are the POINT rather than an incident: pg_stat_all_tables
@@ -785,11 +787,11 @@ func assertHostedPGCanCallSQLBuiltins(t *testing.T, pg *pgcluster.Cluster, logPa
 // hosted PG evaluating these two here is what proves the population is real
 // rather than merely well-formed.
 //
-// Deliberately absent: the pg_statio_*_tables triple. Its base
+// (The pg_statio_*_tables triple was absent for the same reason: its base
 // pg_statio_all_tables (12174) stores at 10475 B, over the 8000 B inline
-// heap-tuple budget, so the base cannot be seeded and — under guard #4 — its
-// two dependents cannot be pinned ahead of it. Ledgered against the same
-// pg_rewrite TOAST (2838/2839) work as pg_indexes.
+// heap-tuple budget, and under guard #4 a dependent cannot be pinned ahead of
+// its base. M0131-S20.2b seeds the base out of line and all three join the set
+// below.)
 //
 // M0131-S9.3d adds the REMAINDER tranche — eleven views that no earlier tranche
 // had a reason to skip, found by asking the oracle for every pg_catalog view
@@ -799,8 +801,20 @@ func assertHostedPGCanCallSQLBuiltins(t *testing.T, pg *pgcluster.Cluster, logPa
 // pg_stat_user_functions (12279) / pg_stat_xact_user_functions (12284), and the
 // five command-progress views 12309/12314/12319/12324/12333 that join
 // pg_stat_get_progress_info() against pg_database and pg_class. That takes the
-// corpus to 71 of upstream's 80 pg_catalog views; the nine still missing are
-// eight behind the pg_rewrite TOAST work and pg_policies behind pg_policy.
+// corpus to 71 of upstream's 80 pg_catalog views.
+//
+// M0131-S20.2b adds the six the pg_rewrite TOAST work was holding — pg_indexes
+// (12043), pg_stats (12053), pg_stats_ext (12058) and the pg_statio_*_tables
+// triple (12174 stored OUT OF LINE, its 12179/12183 dependents inline) — for a
+// corpus of 77. Evaluating them here is the acceptance for the whole S20.2
+// chain: each of the four external values reaches this probe only through
+// heap_fetch_toast_slice → pg_toast_2618_index → pglz → stringToNode.
+//
+// The three still missing are blocked one layer BELOW the corpus tooling, and
+// none of them by size: pg_policies (pg_policy 3256 is not an on-disk
+// relation), pg_seclabels (pg_seclabel 3596 / pg_largeobject_metadata 2995,
+// same class) and pg_stats_ext_exprs (no pg_type row for 10029, pg_statistic's
+// composite rowtype — ceiling #6).
 func nailedSystemViewProbeSet() []struct {
 	view string
 	oid  string
@@ -817,7 +831,10 @@ func nailedSystemViewProbeSet() []struct {
 		{"pg_catalog.pg_views", "12028"},
 		{"pg_catalog.pg_tables", "12033"},
 		{"pg_catalog.pg_matviews", "12038"},
+		{"pg_catalog.pg_indexes", "12043"},
 		{"pg_catalog.pg_sequences", "12048"},
+		{"pg_catalog.pg_stats", "12053"},
+		{"pg_catalog.pg_stats_ext", "12058"},
 		{"pg_catalog.pg_publication_tables", "12068"},
 		{"pg_catalog.pg_locks", "12073"},
 		{"pg_catalog.pg_cursors", "12077"},
@@ -841,6 +858,9 @@ func nailedSystemViewProbeSet() []struct {
 		{"pg_catalog.pg_stat_xact_sys_tables", "12161"},
 		{"pg_catalog.pg_stat_user_tables", "12165"},
 		{"pg_catalog.pg_stat_xact_user_tables", "12170"},
+		{"pg_catalog.pg_statio_all_tables", "12174"},
+		{"pg_catalog.pg_statio_sys_tables", "12179"},
+		{"pg_catalog.pg_statio_user_tables", "12183"},
 		{"pg_catalog.pg_stat_all_indexes", "12187"},
 		{"pg_catalog.pg_stat_sys_indexes", "12192"},
 		{"pg_catalog.pg_stat_user_indexes", "12196"},
@@ -967,29 +987,33 @@ func assertNailedSystemViewsAreEvaluable(t *testing.T, pg *pgcluster.Cluster, go
 // (internal/catalog/catalog.go:335-342, skipped at :7025-7034). Passing both
 // halves is what makes the corpus list, and not something ambient, the cause.
 //
-// pg_indexes is the probe on purpose, and it is the SECOND view to hold this
-// role: M0131-S9.2a adopted pg_tables (the original probe) along with pg_views
-// and pg_matviews, so this helper was re-pointed exactly as its predecessor
-// instructed. pg_indexes is the next un-adopted view of the same tranche and
-// it is blocked for a MEASURED reason rather than an unexamined one — its
-// ev_action is 9002 B stored against the 8000 B inline-heap-tuple budget
-// guard #5 enforces at capture time, i.e. the first breach of design
-// 0131-0009's TOAST ceiling #1, whose prerequisite is
-// DECLARE_TOAST(pg_rewrite, 2838, 2839). When that lands this assertion FAILS
-// — invert it then by moving pg_indexes into nailedSystemViewProbeSet() and
-// re-pointing this helper at the next un-adopted view (pg_roles 12000 or
-// pg_stat_activity 12226 are the remaining S9.2 heads). That is the same
-// fail-when-fixed discipline as the S12/S13 finding locks above.
+// pg_policies is the probe, and it is the THIRD view to hold this role. The
+// discipline is fail-when-fixed: each predecessor was chosen because it was
+// blocked for a MEASURED reason, and each was retired by the slice that
+// unblocked it. M0131-S9.2a adopted pg_tables (the original probe); M0131-S20.2b
+// adopted pg_indexes, whose blocker was the 8000 B inline-heap-tuple budget
+// (9002 B stored — design 0131-0009's TOAST ceiling #1), once
+// DECLARE_TOAST(pg_rewrite, 2838, 2839) plus the S20.2a chunk writer made an
+// out-of-line ev_action storable.
+//
+// pg_policies' blocker is one layer down and has nothing to do with size (its
+// ev_action is 5439 B, comfortably inline): a hosted PG fails it with "could
+// not open relation with OID 3256" because pg_policy is not an on-disk relation
+// in a goopg cluster at all — ceiling #4. When THAT lands this assertion FAILS;
+// invert it then by moving pg_policies into nailedSystemViewProbeSet() and
+// re-pointing this helper at the next un-adopted view (pg_seclabels 12099,
+// blocked by the same class of gap over pg_seclabel 3596 /
+// pg_largeobject_metadata 2995, is the remaining candidate).
 func assertNonCorpusSystemViewIsStillAbsent(t *testing.T, pg *pgcluster.Cluster) {
 	t.Helper()
-	const view = "pg_catalog.pg_indexes"
+	const view = "pg_catalog.pg_policies"
 	out, err := pgQueryScalarAllowError(pg, "SELECT * FROM "+view+" LIMIT 0")
 	if err == nil {
 		t.Errorf("hosted PG evaluated %s, which is NOT in the on-disk corpus "+
-			"(nailedSystemViewProbeSet) — either pg_rewrite TOAST has landed and "+
-			"pg_indexes was captured (then add it to the corpus and re-point this "+
-			"probe at the next un-adopted view), or the evaluability probe above "+
-			"is passing for a "+
+			"(nailedSystemViewProbeSet) — either pg_policy (3256) is now an "+
+			"on-disk relation and pg_policies was captured (then add it to the "+
+			"corpus and re-point this probe at the next un-adopted view), or the "+
+			"evaluability probe above is passing for a "+
 			"reason unrelated to goopg's seeding. Output: %q", view, strings.TrimSpace(out))
 		return
 	}
@@ -1027,9 +1051,23 @@ func assertNonCorpusSystemViewIsStillAbsent(t *testing.T, pg *pgcluster.Cluster)
 //     pg_class_relname_nsp_index, which is what proves relnamespace = 99
 //     (pg_toast) reached both the heap row and the index key.
 //  3. a real read of the TOAST heap, which opens the relation, resolves its
-//     physical file and reads block 0. It is empty by design at S20.1 — the
-//     chunk writer and the eight view captures are S20.2 — and "empty" is
-//     exactly what upstream's initdb produces before the first oversize datum.
+//     physical file and reads block 0.
+//  4. (M0131-S20.2b) the acceptance the first three only set up: a hosted PG
+//     DETOASTING one of these values end to end. `SELECT * FROM pg_indexes`
+//     makes PG read the pg_rewrite tuple, see an 18-byte VARTAG_ONDISK pointer
+//     in ev_action, open 2838, walk index 2839 for chunk_id 12047, reassemble
+//     five 1996-byte chunks, pglz-decompress the result and stringToNode the
+//     70408-byte Query — every byte of which goopg's initdb wrote. Nothing
+//     short of this exercises the writer: reads 1-3 pass against an EMPTY
+//     TOAST heap, which is exactly the state S20.1 left and S20.2a could not
+//     leave (the writer was inert until this slice's captures landed).
+//
+// The chunk count is asserted against upstream's own, not merely against
+// non-zero: 44 chunks over the six captured out-of-line values (pg_indexes 5,
+// pg_stats 5, pg_statio_all_tables 6, pg_stats_ext_exprs 6, pg_stats_ext 7,
+// pg_seclabels 18 — the last only while pg_seclabels is captured). A drift
+// here means the chunker's split changed, which changes bytes a foreign engine
+// reads.
 func assertHostedPGSeesPgRewriteToastRelation(t *testing.T, pg *pgcluster.Cluster) {
 	t.Helper()
 	if got := pgQueryColumn(t, pg, "SELECT reltoastrelid FROM pg_class WHERE oid = 2618"); len(got) != 1 || got[0] != "2838" {
@@ -1043,11 +1081,54 @@ func assertHostedPGSeesPgRewriteToastRelation(t *testing.T, pg *pgcluster.Cluste
 	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
 		t.Errorf("hosted PG reads the pg_rewrite TOAST pair as %v, want %v", got, want)
 	}
-	if out, err := pgQueryScalarAllowError(pg, "SELECT count(*) FROM pg_toast.pg_toast_2618"); err != nil {
-		t.Errorf("hosted PG cannot read pg_toast.pg_toast_2618: %v\n%s", err, strings.TrimSpace(out))
-	} else if strings.TrimSpace(out) != "0" {
-		t.Errorf("pg_toast.pg_toast_2618 holds %q chunks, want 0 — S20.1 seeds the "+
-			"relation pair only; the chunk writer is S20.2", strings.TrimSpace(out))
+	// One row per externalised ev_action, "chunk_id/chunks/stored bytes".
+	// chunk_id is the rule OID + 1 (F22), so this list pins the value ids
+	// against upstream's own — a goopg pg_toast_2618 that is merely
+	// well-formed would still fail here.
+	//
+	// The byte counts are goopg's, and they are 3-4% BELOW upstream's for
+	// every value (measured, in the trailing comments): goopg's pglz encoder
+	// finds shorter output than PG's for the same input, so its TOAST heap is
+	// byte-divergent from upstream's even though the DETOASTED value is
+	// identical — which the pg_indexes read below proves end to end. It also
+	// costs pg_stats_ext one whole chunk (6 where upstream writes 7).
+	// Recorded rather than "fixed": nothing in PG's reader depends on the
+	// split, and matching upstream's exact pglz output would mean reproducing
+	// its match-search heuristics, not its format. Ledgered.
+	wantChunks := []string{
+		"12047/5/8674",   // pg_indexes           (upstream: 5 chunks / 9002 B)
+		"12057/5/8985",   // pg_stats             (upstream: 5 / 9316)
+		"12062/6/11743",  // pg_stats_ext         (upstream: 7 / 12196)
+		"12178/6/10125",  // pg_statio_all_tables (upstream: 6 / 10475)
+	}
+	gotChunks := pgQueryColumn(t, pg,
+		"SELECT chunk_id::text || '/' || count(*)::text || '/' || sum(length(chunk_data))::text "+
+			"FROM pg_toast.pg_toast_2618 "+
+			"GROUP BY chunk_id ORDER BY chunk_id")
+	if strings.Join(gotChunks, " ") != strings.Join(wantChunks, " ") {
+		t.Errorf("hosted PG reads pg_toast_2618 as %v, want %v — each entry is "+
+			"chunk_id/chunk-count for one externalised ev_action, chunk_id being "+
+			"the rule OID + 1 (M0131-S20.2a F22)", gotChunks, wantChunks)
+	}
+
+	// The end-to-end detoast. Everything above is reachable with an EMPTY
+	// TOAST heap; this is not. pg_indexes' rule is stored out of line, so
+	// evaluating it forces PG through heap_fetch_toast_slice → index 2839 →
+	// pglz_decompress → stringToNode on bytes goopg's initdb wrote.
+	out, err := pgQueryScalarAllowError(pg, "SELECT count(*) FROM pg_catalog.pg_indexes")
+	if err != nil {
+		t.Errorf("hosted PG cannot evaluate pg_indexes, whose 9002 B ev_action is "+
+			"stored out of line in pg_toast_2618 under chunk_id 12047: %v\n%s\n"+
+			"A \"missing chunk number N for toast value 12047\" here means the "+
+			"chunk rows or their 2839 index entries are wrong; a stringToNode "+
+			"error means the reassembled bytes are (the S20.2a break directions "+
+			"were a dropped va_tcinfo word and a va_rawsize taken from the "+
+			"compressed size).", err, strings.TrimSpace(out))
+		return
+	}
+	if n, convErr := strconv.Atoi(strings.TrimSpace(out)); convErr != nil || n <= 0 {
+		t.Errorf("hosted PG detoasted pg_indexes but it yielded %q, want a positive "+
+			"row count — a goopg cluster has indexes", strings.TrimSpace(out))
 	}
 }
 

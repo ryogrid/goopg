@@ -109,10 +109,15 @@ func systemViewOIDPins() []systemViewOIDPin {
 		// so the blobs still carry zero in-band `:relid` and the tranche
 		// needed no view-on-view ordering.
 		//
-		// NOT pinned: pg_indexes (12043). Its ev_action is 9002 B as a stored
-		// varlena against the script's 8000 B inline budget — ceiling #1 of
-		// design 0131-0009, and the FIRST view in the corpus to breach it.
-		// The prerequisite is DECLARE_TOAST(pg_rewrite, 2838, 2839); ledgered.
+		// pg_indexes (12043) was ceiling #1 of design 0131-0009 — the FIRST
+		// view in the corpus whose stored ev_action (9002 B) breached the
+		// 8000 B inline-heap-tuple budget. M0131-S20.1 bootstrapped
+		// DECLARE_TOAST(pg_rewrite, 2838, 2839), S20.2a wrote the chunk
+		// writer, and S20.2b (2026-08-12) relaxed capture guard #5 to
+		// "inline OR toastable" and captured it: its value is now five
+		// 1996-byte chunks in base/{1,5}/2838 under chunk_id 12047, behind an
+		// 18-byte VARTAG_ONDISK pointer in the pg_rewrite tuple. Pinned below
+		// at its upstream OID position.
 		// M0131-S9.2b (2026-08-12): the shared-catalog tranche. pg_roles is
 		// `FROM pg_authid` (1260) LEFT JOIN pg_db_role_setting (2964) and
 		// pg_stat_activity joins pg_stat_get_activity(NULL) against pg_authid
@@ -178,16 +183,47 @@ func systemViewOIDPins() []systemViewOIDPin {
 		{"pg_views", 12028, 12031, 12030, 4},
 		{"pg_tables", 12033, 12036, 12035, 8},
 		{"pg_matviews", 12038, 12041, 12040, 7},
+		{"pg_indexes", 12043, 12046, 12045, 5},
 		{"pg_sequences", 12048, 12051, 12050, 11},
-		// NOT pinned, ceiling #1 (pg_rewrite TOAST 2838/2839) — measured
-		// stored ev_action against the 8000 B inline budget, M0131-S9.3d:
-		// pg_stats (12053, 9316 B), pg_stats_ext (12058, 12196 B),
-		// pg_stats_ext_exprs (12063, 11481 B), pg_seclabels (12099, 35379 B).
-		// With pg_indexes (12043, 9002 B) and pg_statio_all_tables (12174,
-		// 10475 B, which withholds its two dependents) that is the COMPLETE
-		// list of views the TOAST slice unblocks: eight of the nine still
-		// missing after this tranche. The ninth is pg_policies — ceiling #4,
-		// a missing base catalog, commented at its OID above.
+		// M0131-S20.2b (2026-08-12): the OUT-OF-LINE tranche — every view
+		// ceiling #1 (pg_rewrite TOAST 2838/2839) had been withholding since
+		// S9.2a. Their ev_action does not fit an inline heap tuple, so each is
+		// seeded as an 18-byte VARTAG_ONDISK pointer plus 1996-byte chunks in
+		// base/{1,5}/2838 (chunk_id = rule OID + 1, F22). Re-measured against
+		// the oracle in this capture run (stored ev_action / chunks):
+		//
+		//   pg_indexes            12043   9002 B   5   (pinned above)
+		//   pg_stats              12053   9316 B   5
+		//   pg_statio_all_tables  12174  10475 B   6   (+ 2 dependents)
+		//   pg_stats_ext          12058  12196 B   7
+		//
+		// (Those are UPSTREAM's chunk counts. goopg's own pglz compresses each
+		// value 3-4% smaller, so its heap holds 5/5/6/6 chunks — a byte
+		// divergence in the TOAST heap that the detoasted value does not
+		// carry. Ledgered, with the measured numbers in
+		// assertHostedPGSeesPgRewriteToastRelation.)
+		//
+		// TWO of the six over-budget values still stay out, and NEITHER is
+		// blocked by size any more — both toast cleanly and both were measured
+		// against a hosted PG in this slice rather than assumed:
+		//
+		//   pg_seclabels (12099, 35379 B, 18 chunks) reads pg_seclabel (3596)
+		//   and pg_largeobject_metadata (2995), neither of which is an on-disk
+		//   relation in a goopg cluster: "could not open relation with OID
+		//   3596" — the same class of blocker as pg_policies' pg_policy
+		//   (3256), i.e. ceiling #4.
+		//
+		//   pg_stats_ext_exprs (12063, 11481 B) needs pg_type 10029, the
+		//   COMPOSITE rowtype of pg_statistic. goopg seeds the array type
+		//   10028 (_pg_statistic) and points its typelem at 10029, but no
+		//   pg_type row for 10029 exists, so a hosted PG fails with "type with
+		//   OID 10029 does not exist" and then trips
+		//   Assert("OidIsValid(typentry->typrelid)") (typcache.c:3082) during
+		//   transaction abort. This is a NEW ceiling — #6 — and the first one
+		//   that is about a catalog's own rowtype rather than a missing
+		//   relation or an unpopulated column. Ledgered.
+		{"pg_stats", 12053, 12056, 12055, 17},
+		{"pg_stats_ext", 12058, 12061, 12060, 15},
 		{"pg_publication_tables", 12068, 12071, 12070, 5},
 		{"pg_locks", 12073, 12076, 12075, 16},
 		{"pg_cursors", 12077, 12080, 12079, 6},
@@ -250,17 +286,25 @@ func systemViewOIDPins() []systemViewOIDPin {
 		// SRF join — which is precisely the property Option-A pinning buys
 		// (0131-0008): the embedded 12146/12151 are already correct.
 		//
-		// NOT pinned in this tranche: the pg_statio_*_tables triple. Its base
+		// NOT pinned in THIS tranche: the pg_statio_*_tables triple. Its base
 		// pg_statio_all_tables (12174) stores at 10475 B, over the 8000 B
 		// inline budget — ceiling #1 (pg_rewrite TOAST 2838/2839) again, and
 		// under guard #4 a dependent cannot be pinned before its base, so
-		// pg_statio_{sys,user}_tables wait on that same TOAST work. Ledgered.
+		// pg_statio_{sys,user}_tables waited on that same TOAST work.
+		// M0131-S20.2b pins all three below: the base goes out of line in six
+		// chunks while its two dependents (1756 B / 1759 B) stay INLINE — F14
+		// again, and the reason the S20.1 filing's "eight oversize values" was
+		// an overcount. It is also the first place the corpus mixes an
+		// external base with inline dependents across one view-on-view edge.
 		{"pg_stat_all_tables", 12146, 12149, 12148, 30},
 		{"pg_stat_xact_all_tables", 12151, 12154, 12153, 12},
 		{"pg_stat_sys_tables", 12156, 12159, 12158, 30},
 		{"pg_stat_xact_sys_tables", 12161, 12164, 12163, 12},
 		{"pg_stat_user_tables", 12165, 12168, 12167, 30},
 		{"pg_stat_xact_user_tables", 12170, 12173, 12172, 12},
+		{"pg_statio_all_tables", 12174, 12177, 12176, 11},
+		{"pg_statio_sys_tables", 12179, 12182, 12181, 11},
+		{"pg_statio_user_tables", 12183, 12186, 12185, 11},
 		// M0131-S9.3b (2026-08-12): the rest of S9.3's reachable population —
 		// the per-index and per-sequence statistics families. Three more
 		// bases with two dependents each, so this tranche adds SIX view-on-

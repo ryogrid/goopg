@@ -70,6 +70,17 @@ MAX_HEAP_TUPLE_SIZE=8160
 TUPLE_OVERHEAD_BUDGET=160
 MAX_EV_ACTION_STORED=$((MAX_HEAP_TUPLE_SIZE - TUPLE_OVERHEAD_BUDGET))
 
+# M0131-S20.2b: guard #5 is now "inline OR toastable", not "inline". The
+# number above still names the same boundary as maxInlineEvActionStored
+# (internal/initdb/pg_rewrite_toast_writer.go) — what changed is that crossing
+# it is no longer fatal, because S20.2a taught goopg's initdb to externalise
+# the value into base/{1,5}/2838. The two files below are the tree's own proof
+# that the out-of-line path exists; if either goes away the guard reverts to
+# the pre-S20.2 hard failure rather than silently seeding a value nothing can
+# store.
+TOAST_BOOTSTRAP_GO="${INITDB_DIR}/pg_rewrite_toast_bootstrap.go"
+TOAST_WRITER_GO="${INITDB_DIR}/pg_rewrite_toast_writer.go"
+
 die()  { echo "capture-ev-action: $*" >&2; exit 2; }
 fail() { echo "capture-ev-action: GUARD FAILED: $*" >&2; exit 1; }
 
@@ -101,6 +112,16 @@ PINS_GO="${INITDB_DIR}/system_view_oid_pins.go"
 TYPES_GO="${INITDB_DIR}/pg_type_bootstrap.go"
 [[ -f "$PINS_GO" ]]  || die "missing ${PINS_GO}"
 [[ -f "$TYPES_GO" ]] || die "missing ${TYPES_GO}"
+
+# TOASTABLE=1 only when the tree can actually store an out-of-line ev_action:
+# the pg_rewrite TOAST pair must be bootstrapped (2838/2839) AND the chunk
+# writer must be present. Parsed out of the Go tree for the same reason the
+# pins and types are — the script must not encode a capability the tree lost.
+TOASTABLE=0
+if grep -q '{Parent: 2618, ToastRel: 2838, ToastIdx: 2839' "$TOAST_BOOTSTRAP_GO" 2>/dev/null \
+   && grep -q 'func externalizeVarlenaPayload' "$TOAST_WRITER_GO" 2>/dev/null; then
+    TOASTABLE=1
+fi
 
 # pinned_view_oid[name] / pinned_rule_oid[name]: the M0131-S8a table. Parsed
 # from the Go literal so the script cannot drift from the tree's own policy.
@@ -246,20 +267,42 @@ for view in "${VIEWS[@]}"; do
     [[ "$(head -c1 "$dat")" == "(" && "$(tail -c1 "$dat")" == ")" ]] \
         || fail "${view}: ev_action is not parenthesis-delimited"
 
-    # Guard #5 (0131-0009 "Guards" §5): the seeded pg_rewrite row must fit an
-    # inline heap tuple. goopg stores ev_action as a PGLZ-compressed varlena
-    # (pgRewriteRow → pglzVarlenaDatum) into base/{1,5}/2618 with NO toaster:
-    # DECLARE_TOAST(pg_rewrite, 2838, 2839) is NOT bootstrapped, so an
-    # overflowing capture would seed a row a hosted PG cannot read. Measure
-    # the compressed size the oracle itself stores (pg_column_size applies the
-    # same pglz), leave headroom for the other seven columns + tuple header,
-    # and fail loudly naming the slice that must land first.
+    # Guard #5 (0131-0009 "Guards" §5, relaxed by M0131-S20.2b to "inline OR
+    # toastable"): the seeded pg_rewrite row must be STORABLE. goopg keeps
+    # ev_action as a PGLZ-compressed varlena (pgRewriteRow → pglzVarlenaDatum)
+    # in base/{1,5}/2618; up to MAX_EV_ACTION_STORED that fits the tuple
+    # inline, and above it S20.2a externalises the value into base/{1,5}/2838
+    # behind an 18-byte VARTAG_ONDISK pointer. Measure the compressed size the
+    # oracle itself stores (pg_column_size applies the same pglz).
+    #
+    # An over-budget capture is accepted only when BOTH hold:
+    #   a) this tree still bootstraps the pair and carries the chunk writer
+    #      (TOASTABLE above) — otherwise the pre-S20.2 hard failure stands; and
+    #   b) the ORACLE stores this very value out of line in pg_toast_2618 under
+    #      chunk_id = rule_oid + 1, with the chunk lengths summing to exactly
+    #      pg_column_size.
+    # (b) is not decoration: it is the same three facts the writer encodes
+    # (F20 chunked bytes = compressed varlena minus its 4-byte header, so the
+    # sum equals pg_column_size; F22 chunk_id = rule OID + 1), re-measured per
+    # captured view against the oracle instead of trusted from the S20.2a run.
+    # A capture that PG chose to keep inline while goopg would externalise it
+    # (or vice versa) is caught here, not in a hosted PG's detoast path.
     stored_len="$(psql_q "SELECT pg_column_size(r.ev_action) FROM pg_rewrite r
                            WHERE r.ev_class = 'pg_catalog.${view}'::regclass
                              AND r.rulename = '_RETURN'")"
     [[ -n "$stored_len" ]] || die "${view}: pg_column_size query returned nothing"
     if [[ "$stored_len" -gt $MAX_EV_ACTION_STORED ]]; then
-        fail "${view}: ev_action stores as ${stored_len} B compressed, over the ${MAX_EV_ACTION_STORED} B inline budget (MaxHeapTupleSize ${MAX_HEAP_TUPLE_SIZE} B minus ${TUPLE_OVERHEAD_BUDGET} B of header + the other pg_rewrite columns) — bootstrapping DECLARE_TOAST(pg_rewrite, 2838, 2839) is the prerequisite slice"
+        [[ $TOASTABLE -eq 1 ]] \
+            || fail "${view}: ev_action stores as ${stored_len} B compressed, over the ${MAX_EV_ACTION_STORED} B inline budget (MaxHeapTupleSize ${MAX_HEAP_TUPLE_SIZE} B minus ${TUPLE_OVERHEAD_BUDGET} B of header + the other pg_rewrite columns) — and this tree no longer carries the out-of-line writer (DECLARE_TOAST(pg_rewrite, 2838, 2839) in ${TOAST_BOOTSTRAP_GO} + externalizeVarlenaPayload in ${TOAST_WRITER_GO})"
+        toast_row="$(psql_q "SELECT count(*), coalesce(sum(length(chunk_data)), 0)
+                               FROM pg_toast.pg_toast_2618
+                              WHERE chunk_id = ${rule_oid} + 1")"
+        IFS=$'\t' read -r toast_chunks toast_bytes <<< "$toast_row"
+        [[ "${toast_chunks:-0}" -gt 0 ]] \
+            || fail "${view}: ev_action stores as ${stored_len} B (over the ${MAX_EV_ACTION_STORED} B inline budget) but the ORACLE holds no pg_toast_2618 chunks under chunk_id ${rule_oid}+1 — F22 (chunk_id == rule OID + 1) does not hold for this capture, so goopg would write the value under an OID upstream did not use"
+        [[ "$toast_bytes" -eq "$stored_len" ]] \
+            || fail "${view}: oracle chunk bytes ${toast_bytes} != pg_column_size ${stored_len} — F20 says the chunked bytes are the compressed varlena MINUS its 4-byte header, which makes these equal; a difference means the writer's off-by-four assumption is wrong for this value"
+        echo "capture-ev-action:   ${view}: ${stored_len} B stored, OUT OF LINE (${toast_chunks} chunks, chunk_id ${rule_oid}+1)"
     fi
 
     # Guard #4: every in-band :relid inside the blob must be an OID this tree
