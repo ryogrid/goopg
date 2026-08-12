@@ -3246,6 +3246,53 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       false-negative harness. Design `0119-0006-copy-error-frame-drain.md` +
       README row `0119-0006ab`.
 
+      **45th slice (2026-08-13) — the CSV reader `COPY … FROM` never had.**
+      Closes the 43rd slice's row: `COPY … FROM` ignored `FORMAT csv`
+      ENTIRELY. `internal/executor/copy_csv.go` had a write side only
+      (`EncodeCopyCsvRow`, M0097-0024), nothing routed to a reader —
+      `PushLine` called `DecodeCopyTextRow` unconditionally and read exactly
+      ONE option (`NULL`) — so a CSV stream was split on TAB and even an
+      unquoted `plain,7` into a two-column table failed `COPY: row has 1
+      fields, expected 2`; a session could not read back what its own
+      `COPY … TO … (FORMAT csv)` had just written. New
+      `parseCopyCsvFields`/`DecodeCopyCsvRow` port `CopyReadAttributesCSV`:
+      quoted sections that may open and close MID-field (`"ab"cd` is one
+      field `abcd`), the escape character (default = quote, hence doubled
+      quotes), NO backslash escapes, and the NULL rule keyed on QUOTING not
+      content — with the default null string `,,` is two NULLs but `"",""`
+      is two empty strings, the one rule that corrupts silently rather than
+      erroring. **The record boundary was the structural call:** upstream
+      splits `CopyReadLineText` (tracks quote state, hands over COMPLETE
+      records) from `CopyReadAttributesCSV`, but goopg's wire layer already
+      splits `CopyData` on `\n` across four call sites, so the re-join lives
+      in the executor (`pushCsvLine` + `csvPartial`, restoring the removed
+      newline) instead of making that splitter CSV-aware. That makes
+      "PushLine returned nil" no longer mean "a row was inserted", so two
+      ends are closed explicitly: `Finish()` (both `CopyDone` sites +
+      `RunCopyFromFile`) reports `unterminated CSV quoted field`, and
+      `InCsvQuotedField()` stops the deprecated `\.` marker being honoured
+      inside a quoted field — DATA there, as the oracle proves by swallowing
+      it into the field. Collateral: `HEADER` on INPUT was never honoured in
+      EITHER format (the skip now sits ahead of the format split, as upstream
+      does it), and the two constructors had diverged BY CONSTRUCTION —
+      `NewCopyFromExecutor` and `RunCopyFromFile` each hand-built the struct
+      reading only `NULL`, so the file endpoint would have kept ignoring CSV;
+      both now share `newCopyFromExecutor` and one `copyToFormat`, the same
+      struct `COPY … TO` reads. Gates: 4 tests / 6 cases in
+      `internal/server/copy_csv_from_test.go` on `startCopyExecServer`, all
+      verified red by deleting the two-line route (each reproducing the filed
+      symptom verbatim), 3 in `internal/executor/copy_csv_read_test.go`;
+      `go test ./internal/executor/ ./internal/server/`,
+      `RALPH_PRECOMMIT_SCOPE=units`, `scripts/tpch-spotcheck.sh` (Q12=2,
+      Q13=35). The full oracle transcript replayed on a live goopg (5533)
+      matches PG 18.3 byte for byte, per-column NULL flags and all three
+      error messages included. Three ledger rows —
+      `FORCE_NOT_NULL`/`FORCE_NULL` (planner-VALIDATED, reader-ignored, each
+      inverting the NULL rule for its columns), `HEADER match` skipping
+      without validating names, and the TEXT path keeping goopg's own
+      field-count message while CSV uses upstream's two. Design
+      `0119-0006-copy-csv-reader.md` + README row `0119-0006ac`.
+
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
 

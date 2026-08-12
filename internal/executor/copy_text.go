@@ -67,6 +67,16 @@ func DecodeCopyTextRow(line []byte, cols []catalog.Column, nullStr string) (Row,
 	if len(fields) != len(cols) {
 		return nil, fmt.Errorf("COPY: row has %d fields, expected %d", len(fields), len(cols))
 	}
+	return datumsFromCopyFields(fields, cols)
+}
+
+// datumsFromCopyFields converts already-split COPY fields into a Row
+// shaped by cols. Shared by the TEXT and CSV readers so the two formats
+// cannot drift in how a field's bytes become a Datum (the field SPLIT
+// differs between the formats; the per-field input-function call does
+// not). Callers check the field count first — the two formats report a
+// mismatch with different messages.
+func datumsFromCopyFields(fields []copyField, cols []catalog.Column) (Row, error) {
 	row := make(Row, len(cols))
 	for i, raw := range fields {
 		if raw.isNull {
