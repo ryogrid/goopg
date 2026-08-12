@@ -3176,6 +3176,45 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `RALPH_PRECOMMIT_SCOPE=units` PASS; `tpch-spotcheck.sh` PASS. Design
       `0119-0006-array-element-output-style.md` + README row `0119-0006z`.
 
+      **43rd slice (2026-08-12) — `COPY` of an array column, both directions.**
+      Closes the row the 42nd slice filed against itself: `COPY … TO` of any
+      NON-TEXT array column failed outright at HEAD (`int4[]` = "expected int
+      datum for int4, got kind 3", `date[]` = "expected time datum for date,
+      got kind 3"), and `COPY … FROM` could not read back its own output
+      (`invalid integer "{1,2}"`). A user array column is
+      `catalog.Type{Name:<ELEMENT>, IsArray:true}`, so both halves of the codec
+      claimed the array under its ELEMENT's name; `text[]` worked only by
+      accident, `text` matching no arm and falling through to the default
+      `KindString` case — which is the correct behaviour for every array type.
+      Upstream has no such table (`CopyOneRowTo` calls the COLUMN's output
+      function, i.e. `array_out`), and goopg arrives at the same place by
+      rendering the array text at HEAP-DECODE time, so the codec's whole job is
+      to pass it through: `datumToCopyText` and `copyTextToDatum` now branch on
+      `t.IsArray` before the type-name switch, the third pair of sites needing
+      that exact guard after `encodeValuePG` (M0118-0002) and `pgoutput`.
+      Escaping/quoting were deliberately NOT special-cased, and that is what
+      reproduces PG byte-for-byte — the array text runs through the ordinary
+      TEXT escaper and CSV field quoter, so `{"has,comma"}` comes out
+      whole-array-quoted with doubled inner quotes. **Binary COPY is refused
+      (`0A000`) rather than attempted, on a silent-corruption finding:** there
+      `int4[]` also mismatched, but `text[]`/`bytea[]` fell through to the
+      raw-bytes arm and SHIPPED the `{a,b}` text where upstream ships
+      `array_send`'s binary shape — a stream no PG client can read, worse than
+      an error. Gates: 5 new tests in
+      `internal/executor/copy_array_test.go`, all verified red by scripted
+      neutering of both guards, pinned to 3 oracle lines (TEXT, CSV, and
+      `DateStyle='German, DMY'`) captured on the 65432 reference cluster and
+      reproduced byte-for-byte on a live goopg;
+      `RALPH_PRECOMMIT_SCOPE=units` + `tpch-spotcheck.sh`. Four ledger rows —
+      `array_send`/`array_recv`, plus three findings NOT introduced here:
+      `COPY … FROM` ignores `FORMAT csv` entirely (`copy_csv.go` is write-side
+      only; no reader exists, so even `plain,7` fails "row has 1 fields"), the
+      `CopyDone` frame after a failed COPY FROM is unhandled (session
+      desync), and COPY FROM does not honour `DateStyle` on INPUT, so a
+      `German, DMY` session cannot COPY back in the `{15.06.2020}` it just
+      COPYed out (measured on both engines). Design
+      `0119-0006-copy-array-columns.md` + README row `0119-0006aa`.
+
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
 

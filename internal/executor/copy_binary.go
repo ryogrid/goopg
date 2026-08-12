@@ -129,6 +129,9 @@ func ParseCopyBinaryRows(data []byte, cols []catalog.Column) (rows []Row, traile
 // --- type-specific binary encoders ---
 
 func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
+	if err := rejectBinaryCopyArray(t); err != nil {
+		return nil, err
+	}
 	switch strings.ToLower(t.Name) {
 	case "int4", "integer", "int":
 		if d.Kind != KindInt {
@@ -190,7 +193,30 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 	}
 }
 
+// rejectBinaryCopyArray refuses an array column in BINARY COPY, loudly and by
+// name. Both halves of binary COPY dispatch on the element type name (an array
+// column is catalog.Type{Name:<ELEMENT>, IsArray:true}), so before this guard an
+// int4[] column reported "expected int, got kind 3" while a text[] or bytea[]
+// column fell through to the default raw-bytes arm and SILENTLY shipped the
+// array's "{a,b}" text where upstream ships array_send's binary shape (ndim,
+// hasnull, elemtype, dims/lbounds, then a 4-byte length + the element's own
+// send format per element — postgres/src/backend/utils/adt/arrayfuncs.c
+// array_send / array_recv). Emitting the text under BINARY produces a stream no
+// real PG client can read, so refusing is the PG-compatible answer until
+// array_send/array_recv are ported (deferral ledger, M0119-0006). The TEXT and
+// CSV formats are unaffected — they legitimately carry array_out's text.
+func rejectBinaryCopyArray(t catalog.Type) error {
+	if !t.IsArray {
+		return nil
+	}
+	return &ExecError{Code: "0A000",
+		Message: fmt.Sprintf("binary COPY of array type %s[] is not supported", t.Name)}
+}
+
 func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
+	if err := rejectBinaryCopyArray(t); err != nil {
+		return Datum{}, err
+	}
 	switch strings.ToLower(t.Name) {
 	case "int4", "integer", "int":
 		if len(payload) != 4 {

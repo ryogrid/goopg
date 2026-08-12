@@ -248,6 +248,28 @@ func appendCopyTextEscaped(dst []byte, s string) []byte {
 // datumToCopyText renders a non-null Datum into the byte string
 // COPY TEXT expects, before per-byte escaping.
 func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone string) (string, error) {
+	// Array columns FIRST. A user array column is
+	// catalog.Type{Name:<ELEMENT type>, IsArray:true}, so every arm of the
+	// switch below would claim the array under its ELEMENT's name and reject
+	// the "{1,2}" KindString datum the heap decode produced — `COPY … TO` of an
+	// int4[] column was a flat "expected int datum for int4, got kind 3", and a
+	// date[] column "expected time datum for date, got kind 3" (only text[]
+	// worked, by falling through to the default arm). Upstream's CopyOneRowTo
+	// (postgres/src/backend/commands/copyto.c) calls the COLUMN's output
+	// function, which for an array column is array_out. goopg renders the array
+	// text at heap-decode time (decodeArrayValuePGStyled, under this session's
+	// DateStyle/TimeZone), so array_out's job is already done and the text is
+	// emitted as-is; the caller's per-byte TEXT escaping and the CSV writer's
+	// quoting then apply to it exactly as they do to any other string, which is
+	// what makes `{"has,comma"}` come out CSV-quoted like upstream. Same
+	// IsArray-before-the-switch guard internal/wal/pgoutput.go and
+	// encodeValuePG carry. M0119-0006.
+	if t.IsArray {
+		if d.Kind != KindString {
+			return "", fmt.Errorf("expected array text datum for %s[], got kind %d", t.Name, d.Kind)
+		}
+		return d.StringValue(), nil
+	}
 	switch t.Name {
 	case "int4", "integer", "int", "int8", "bigint":
 		if d.Kind != KindInt {
@@ -313,6 +335,18 @@ func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone str
 // copyTextToDatum is the inverse of datumToCopyText. raw is the
 // already-unescaped byte representation of one column value.
 func copyTextToDatum(t catalog.Type, raw []byte) (Datum, error) {
+	// Array columns FIRST, the sibling of datumToCopyText's guard above (Rule
+	// #2: the two must agree on the type-set). Without it `COPY t FROM` into an
+	// int4[] column took the int4 arm and failed 'invalid integer "{1,2}"',
+	// while a date[] column pushed the whole array text through
+	// parseCopyTimestampZone. The canonical in-memory array value is its
+	// "{1,2}" text (encodeValuePG's IsArray branch hands exactly that to
+	// encodeArrayValuePG, which parses the elements and builds the ArrayType
+	// blob), so — like the INSERT path — this returns the unescaped text
+	// unchanged and lets the encoder do the element work. M0119-0006.
+	if t.IsArray {
+		return NewStringDatum(string(raw)), nil
+	}
 	switch t.Name {
 	case "int4", "integer", "int", "int8", "bigint":
 		v, err := strconv.ParseInt(string(raw), 10, 64)
