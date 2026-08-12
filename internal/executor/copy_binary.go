@@ -2,7 +2,9 @@ package executor
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"math/big"
 	"strings"
@@ -131,6 +133,28 @@ func ParseCopyBinaryRows(data []byte, cols []catalog.Column) (rows []Row, traile
 // datatype/timestamp.h:143-144) — the sanity bound timetz_recv applies to a
 // received GMT displacement.
 const tzDispLimitSecs = int32(16 * 60 * 60)
+
+// jsonbBinaryVersion is the one-byte format version jsonb_send writes ahead of
+// the JSON text and jsonb_recv insists on — `int version = 1` in both
+// (postgres/src/backend/utils/adt/jsonb.c:93, :128). It is the ONLY structural
+// difference between the `json` and `jsonb` binary wire formats.
+const jsonbBinaryVersion = byte(1)
+
+// isValidJSONText reports whether s is a single well-formed JSON value, which is
+// the check jsonb_from_cstring performs on the text jsonb_recv extracts. The
+// decoder is configured exactly as evalJSONArrow's (UseNumber, so a number never
+// round-trips through float64), and the trailing-token check is what makes
+// `{} {}` invalid — encoding/json's Decode stops at the end of the first value,
+// while PG's parser requires the whole string to be one value.
+func isValidJSONText(s string) bool {
+	dec := json.NewDecoder(strings.NewReader(s))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return false
+	}
+	return !dec.More() && dec.Decode(&v) == io.EOF
+}
 
 // --- type-specific binary encoders ---
 
@@ -339,6 +363,29 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 		binary.BigEndian.PutUint32(b[8:12], uint32(days))
 		binary.BigEndian.PutUint32(b[12:16], uint32(months))
 		return b, nil
+	case "jsonb":
+		// M0119-0006 (56th slice): before this arm a `jsonb` column fell through
+		// to the default's KindString case and shipped the bare JSON text under
+		// FORMAT binary. Upstream jsonb_send
+		// (postgres/src/backend/utils/adt/jsonb.c:124) is pq_sendint8(version=1)
+		// followed by pq_sendtext of JsonbToCString's output — the LEADING
+		// VERSION BYTE is the whole difference, and omitting it makes jsonb_recv
+		// read '{' (0x7b = 123) as the version and raise "unsupported jsonb
+		// version number 123". Note that the jsonb wire format IS text after that
+		// byte: jsonb_send serialises the tree back to a C string rather than
+		// shipping the JsonbContainer, which is why goopg — whose heap holds
+		// jsonb as varlena text, not as a JEntry tree — can be byte-exact here
+		// even though its storage is not (ledgered under M0119-0006).
+		// `json` deliberately has NO arm: json_send IS textsend (json.c), i.e.
+		// bare text with no version byte, which is exactly what the default arm
+		// already emits.
+		s, ok := datumAsString(d)
+		if !ok {
+			return nil, fmt.Errorf("expected string for jsonb, got kind %d", d.Kind)
+		}
+		b := make([]byte, 0, len(s)+1)
+		b = append(b, jsonbBinaryVersion)
+		return append(b, s...), nil
 	case "numeric", "decimal":
 		return encodeNumericBinary(d)
 	default:
@@ -544,6 +591,31 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 		days := int32(binary.BigEndian.Uint32(payload[8:12]))
 		months := int32(binary.BigEndian.Uint32(payload[12:16]))
 		return NewIntervalDatumFull(months, days, micros), nil
+	case "jsonb":
+		// Decode twin of the "jsonb" encode arm. Upstream jsonb_recv
+		// (jsonb.c:89) reads a 1-byte version, rejects anything but 1 with
+		// "unsupported jsonb version number %d", and hands the REMAINING bytes to
+		// jsonb_from_cstring — which parses them and raises 22P02 on malformed
+		// JSON. Both halves matter: without the version check a stream written by
+		// a future jsonb version would be silently stored with its version byte
+		// glued to the front of the text, and without the parse a corrupt or
+		// foreign stream would put non-JSON into a jsonb column, where every
+		// later `->`/`->>` (evalJSONArrow) raises 22P02 at read time instead.
+		// Before this arm the default handed the version byte AND the text back
+		// as one KindString Datum (Hard-won Rule #2).
+		if len(payload) < 1 {
+			return Datum{}, fmt.Errorf("jsonb: expected at least 1 byte, got %d", len(payload))
+		}
+		if payload[0] != jsonbBinaryVersion {
+			return Datum{}, &ExecError{Code: "XX000",
+				Message: fmt.Sprintf("unsupported jsonb version number %d", payload[0])}
+		}
+		s := string(payload[1:])
+		if !isValidJSONText(s) {
+			return Datum{}, &ExecError{Code: "22P02",
+				Message: "invalid input syntax for type json"}
+		}
+		return NewStringDatum(s), nil
 	case "numeric", "decimal":
 		return decodeNumericBinary(payload)
 	default:

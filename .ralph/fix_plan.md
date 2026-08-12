@@ -3398,6 +3398,35 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `0119-0006-copy-binary-interval.md` + README row. Next candidates:
       `jsonb` (leading version byte), `bpchar`.
 
+      **56th slice (2026-08-13): binary `COPY` of `jsonb`, both directions.**
+      goopg carries `json`/`jsonb` as a `KindString` Datum holding the JSON text,
+      so both halves fell through to the default's `KindString` case and were
+      wrong by exactly ONE BYTE at each end: `jsonb_send` (`jsonb.c:124`) is
+      `pq_sendint8(version=1)` + `pq_sendtext(JsonbToCString(...))`, so encode
+      omitted the version byte and decode failed to strip it. **The pair is
+      symmetric, which is why it survived** — goopg↔goopg round-trips perfectly,
+      so only a real PG exposes it; proven on the oracle by stripping the version
+      byte from a PG-authored stream and feeding it back
+      (`ERROR: unsupported jsonb version number 123`, 123 = `0x7b` = `{`), and in
+      the other direction a PG stream landed in a goopg column as `\x01{...}`,
+      text that is no longer valid JSON. The decode arm also runs
+      `jsonb_from_cstring`'s PARSE (22P02) rather than poisoning the column.
+      `json` deliberately gets NO arm — `json_send` IS `textsend` — pinned so a
+      later edit cannot give it the version byte too. **The finding is a LIMIT,
+      not a clean result:** the `…AgreesWithHeapEncode` pin passes only because
+      both twins are wrong together — goopg's heap `jsonb` is varlena TEXT where
+      upstream's is a `JsonbContainer`/`JEntry` tree, so the 55th slice's rule of
+      thumb was right about WHERE the adjacent defect is and wrong only about its
+      SIZE. Item stays UNCHECKED (standing slice-by-slice cluster). 7 guards,
+      5 red at HEAD (the 2 that pass are the round-trip pins — the symmetric-bug
+      signature); oracle E2E byte-identical `TO` plus identical cross-ingest both
+      ways. 1 ledger item resolved in place, 2 filed (heap JEntry-tree storage;
+      `jsonb` input canonicalisation). Design `0119-0006-copy-binary-jsonb.md` +
+      README row. `bpchar` is the last type in this chain, and its remaining gap
+      is `bpchar_recv`'s blank padding to the typmod — so it should land together
+      with the `copyBinaryToDatum` typmod widening the three `Adjust*ForTypmod`
+      rows are blocked on, collapsing four ledger rows into one slice.
+
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
 
