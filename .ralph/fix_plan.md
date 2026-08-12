@@ -851,19 +851,42 @@ there, not re-filed.
       five PASS on re-run (rule §2). They failed in the nightly because the same
       mid-run build break left the testport stage running against a tree that did
       not compile.
-- [ ] **testport/TestPort_IsolationEvalPlanQual — REOPENED (3rd time)**
-      — AI-20260813-005117-009. Re-confirmed FAILing at HEAD `f645621b`
-      (24.58 s) — this is a real result, not a build-break victim. Previously
-      "fixed" twice (2026-08-09 via AI-007, and again under AI-20260808-005620-001);
-      neither fix held. Repro: `go test -v -run '^TestPort_IsolationEvalPlanQual$'
-      ./internal/testport/`. PARKED per banner.
-- [ ] **testport/TestPort_IsolationInsertConflictDoUpdate4** — FAILed
-      (AI-20260813-005117-012, new tonight). Re-confirmed FAILing at HEAD
-      `f645621b` (2.04 s). Note its sibling `…InsertConflictDoUpdate` (no `4`)
-      PASSES at HEAD, so this is a genuine per-permutation divergence, not a
-      whole-fixture break. Repro: `go test -v -run
-      '^TestPort_IsolationInsertConflictDoUpdate4$' ./internal/testport/`. PARKED
-      per banner.
+- [x] **testport/TestPort_IsolationEvalPlanQual — REOPENED (3rd time)**
+      — AI-20260813-005117-009. **DONE 2026-08-13, same root cause as -012
+      below** (one fix closed both). The "3rd reopen" framing was wrong: the two
+      earlier fixes DID hold. `408a3962` (M0131-S32.1, 2026-08-12) added a
+      `TM_SelfModified` guard to both write-phase EPQ loops, and this nightly is
+      the first run after it — a NEW regression wearing the old symptom. Green at
+      24.25 s after the -012 fix. **Lesson: "reopened for the Nth time" is a
+      hypothesis about causation, not evidence of one — date the last change to
+      the code path before assuming an earlier fix rotted.**
+- [x] **testport/TestPort_IsolationInsertConflictDoUpdate4** — FAILed
+      (AI-20260813-005117-012, new tonight). **DONE 2026-08-13.** Permutations 1
+      and 2 lost s2's `UPDATE upsert SET i = i + N WHERE i = 1` entirely (the
+      locked row stayed put); permutation 3 (DELETE) always matched. Root cause is
+      NOT partitioning and NOT ON CONFLICT — both were red herrings the spec's
+      shape suggested. It is the `TM_SelfModified` guard added the previous day by
+      `408a3962` (M0131-S32.1), written as a bare `Xmax == myXID` test. Upstream
+      `HeapTupleSatisfiesUpdate`
+      (`postgres/src/backend/access/heap/heapam_visibility.c`) reaches that
+      comparison only after excluding `HEAP_XMAX_IS_MULTI` (a raw MultiXactId must
+      never be compared against a TransactionId — disjoint id spaces) and
+      `HEAP_XMAX_IS_LOCKED_ONLY` (returns TM_BeingModified: a row this transaction
+      merely LOCKED is still updatable by it). Missing the LOCKED_ONLY arm, any
+      `SELECT ... FOR UPDATE` followed by a **key-column** UPDATE silently
+      reported `UPDATE 0` — no error, nothing written. Narrow only because of the
+      HOT split: a non-key update takes `tryApplyHOTUpdate` and never reaches the
+      guard, so only a HOT-ineligible key change falls through. Reduced repro
+      (any indexed column): `BEGIN; SELECT * FROM t WHERE i=1 FOR UPDATE;
+      UPDATE t SET i=i+10 WHERE i=1;` → UPDATE 0. Fix: both write-phase arms now
+      call one shared `isSelfModifiedWrite(header, myXID)` reproducing upstream's
+      structure, instead of duplicating the inline condition — the guard is a
+      sibling pair and the duplication is what would let one arm be fixed while
+      the other rots. Also closes AI-…-009 above. Design:
+      `docs/design/0131-0026-concurrent-hot-row-lost-updates.md` §9 (+ README
+      index). Unit guard: `TestIsSelfModifiedWrite`
+      (`internal/executor/self_modified_write_test.go`). One ledger row (the
+      guard still ignores upstream's `cmax >= curcid` command-id distinction).
 
 _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
 

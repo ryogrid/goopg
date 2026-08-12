@@ -1,56 +1,54 @@
 (idle — nothing in flight)
 
-M-NIGHTLY `AI-20260813-005117-008` (`race/internal/wal
-TestCheckpointerVolumeTrigger`) fixed and committed.
+M-NIGHTLY `AI-20260813-005117-012` (`TestPort_IsolationInsertConflictDoUpdate4`)
+fixed and committed — and the same one-line-class fix also closed
+`AI-20260813-005117-009` (`TestPort_IsolationEvalPlanQual`).
 
-Selection note: the previous baton claimed "M0131's only unchecked items are
-S9/S24 (both deferred)" — half wrong, and worth re-checking rather than
-inheriting. S24 IS explicitly deferred (design 0131-0016, re-arm trigger is a
-skipped S28 subtest). S9 is NOT deferred as a whole: it ran to 80/80 pg_catalog
-views on 2026-08-12, and only its last sub-slice S9.4 (`information_schema`) was
-deferred — into M0133, which the banner files but deliberately does NOT promote.
-Net effect is the same (M0131 has nothing selectable, M0130 has zero unchecked
-items, so M-NIGHTLY is selectable) but the reasoning differs. Verify milestone
-state from the ledger, not from the previous baton's summary.
+**The finding worth carrying: "REOPENED for the 3rd time" was a false story, and
+believing it would have sent the loop down the wrong path.** The fix_plan framed
+EvalPlanQual as two earlier fixes that "did not hold". They held fine. The
+`TM_SelfModified` guard from `408a3962` (M0131-S32.1) landed 2026-08-12 and this
+nightly is the FIRST run after it — a brand-new regression wearing an old
+symptom. Date the last change to the code path before accepting a reopen
+narrative; `git log -S` on the guard text settled it in one command.
 
-**The finding worth carrying: the fix_plan's own hypothesis was wrong, and the
-item's "confirm before treating it as a checkpointer bug" clause is what caught
-it.** The item was filed as a load-sensitive 2 s-deadline flake, by analogy to
-the already-fixed `internal/mctx TestMultipleChunks`. It is an unsynchronised
-start instead: `Checkpointer.Run` seeds `volumeAnchor` from `WrittenLSN()`
-*inside its own goroutine*, while the test that spawned it immediately appends 16
-records. A late-scheduled `Run` anchors AFTER those appends, so the writer sits
-level with the anchor and the volume trigger can never fire — raising the
-deadline would have done nothing. Filing an item by analogy to a previously-fixed
-item is a hypothesis, not a diagnosis.
+Second finding: the spec's own shape was a decoy. `insert-conflict-do-update-4`
+is the PARTITIONED upsert spec, so partitioning and ON CONFLICT were the two
+obvious suspects — both wrong. Bisecting by SQL shape (partitioned vs plain,
+key vs non-key column, index vs seq scan, FOR UPDATE present vs absent) on a
+throwaway 5533 server reduced it to a repro with neither feature in it:
+`BEGIN; SELECT * FROM t WHERE i=1 FOR UPDATE; UPDATE t SET i=i+10 WHERE i=1;`
+→ `UPDATE 0`. Reduce to the minimal shape before reading the failing test's
+subject matter as a hint.
 
-Second finding: `-cpu=1` is a cheap, decisive substitute for "a co-loaded nightly
-host". It forced 6/20 failures with the byte-identical nightly message (2.02 s
-each) on the old code, and 20/20 passes on the new. Prove a scheduling flake by
-constraining GOMAXPROCS before reaching for load simulation or repeat counts.
+Third: the bug was narrow because of the HOT split — a non-key update takes
+`tryApplyHOTUpdate` and never reaches the guard, so ONLY a HOT-ineligible
+key-column change falls through to it. That is also why a whole class of
+FOR UPDATE tests kept passing while these two failed.
 
-Third: reordering a lifecycle hook can be the fix. `OnLoopStart` fired as Run's
-first statement, so nothing could wait for the loop to be *armed*. Moving both
-hooks below the volume-ticker arming makes "started" observable and useful,
-with no production change (the only consumer is `initdb.Open`'s
-`activity.SetCurrentGoroutine`).
+Root cause: the guard was a bare `Xmax == myXID`. Upstream
+`HeapTupleSatisfiesUpdate` (`heapam_visibility.c`) reaches that comparison only
+after excluding `HEAP_XMAX_IS_MULTI` (raw MultiXactId vs TransactionId are
+disjoint id spaces) and `HEAP_XMAX_IS_LOCKED_ONLY` (returns TM_BeingModified —
+a row you only LOCKED is still yours to update). Both write-phase arms now share
+`isSelfModifiedWrite`; sharing was deliberate, since a duplicated inline guard is
+how one sibling gets fixed while the other rots.
 
-Ledger row filed: the same seeding pattern survives in PRODUCTION, where
-`NewCheckpointer` (`initdb.Open:1815`) and `Run` (`cmd/goopg/main.go:806`) are far
-apart — WAL appended in between, incl. the end-of-recovery checkpoint, is
-absorbed into the anchor and widens the first `max_wal_size` window. Self-limiting
-(superseded at the first checkpoint), so it was not fixed here.
+Ledger row filed: the guard still has no cmax/curcid arm. Probed it rather than
+asserting it — the obvious two-UPDATEs-in-one-txn shape does NOT diverge (the
+second command scans the new version), so no failing shape is in hand.
 
-Next candidates (all M-NIGHTLY, selectable): `TestPort_IsolationEvalPlanQual`
-(REOPENED a 3rd time — two prior fixes did not hold; understand why before a 3rd);
-`TestPort_IsolationInsertConflictDoUpdate4` (its no-`4` sibling PASSES → a
-per-permutation divergence); PredicateHash / ReceiptReport (open since
-2026-08-11, 3 AI-ids each).
+Next candidates (all M-NIGHTLY, selectable): PredicateHash / ReceiptReport (open
+since 2026-08-11, 3 AI-ids each); `TestE2E_FailoverPGtoGoopg` subtest `async`;
+`TestPort_IsolationMultipleCic`; the 11 regress normalization cases. Worth
+re-running the whole testport isolation set first — this fix may have cleared
+more than the two items it was aimed at.
 
-Gates: `go build ./...` clean; `go test -race ./internal/wal/` PASS (9.99 s);
-`-race -cpu=1 -count=20` on the target test 20/20 PASS (probe, one-off);
-`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS (incl. a fresh
-`internal/initdb` 236 s — the hooks' production consumer); pgbench smoke PASS via
-the commit hook; `make ralph-state-guard` OK.
+Gates: `go build ./...` clean; `go test ./internal/executor/` PASS (6.0 s);
+`TestIsSelfModifiedWrite` PASS; 9 neighbouring isolation specs PASS (68 s) incl.
+EvalPlanQual individually (24.25 s); target spec PASS (3.9 s);
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35 canonical); pgbench smoke PASS
+via the commit hook; `make ralph-state-guard` OK.
 
 In-flight: none.

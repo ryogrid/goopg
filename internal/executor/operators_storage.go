@@ -3349,6 +3349,42 @@ func markHeapHotUpdateDirty(
 	})
 }
 
+// isSelfModifiedWrite reports whether the tuple carries a write intent
+// (update/delete) stamped by myXID itself — upstream's TM_SelfModified, which
+// makes ExecUpdate/ExecDelete skip the row instead of writing a second new
+// version (postgres/src/backend/executor/nodeModifyTable.c).
+//
+// It is the sibling-safe form of the M0131-S32.1 guard: both the index-scan and
+// the seq-scan update loops call THIS function, so the two can no longer drift
+// apart. It reproduces the structure of upstream HeapTupleSatisfiesUpdate
+// (postgres/src/backend/access/heap/heapam_visibility.c), which reaches the raw
+// "is this xmax mine?" comparison only after two earlier arms have returned:
+//
+//   - HEAP_XMAX_IS_MULTI has its own branch, so a raw Xmax holding a
+//     MultiXactId is never compared against a TransactionId. The two live in
+//     different id spaces; a numeric collision would skip an unrelated row.
+//   - HEAP_XMAX_IS_LOCKED_ONLY returns TM_BeingModified, *not* TM_SelfModified.
+//     A row this transaction merely LOCKED (SELECT ... FOR UPDATE / FOR NO KEY
+//     UPDATE) is still updatable by it.
+//
+// The missing LOCKED_ONLY arm is what M-NIGHTLY AI-20260813-005117-012 caught:
+// `BEGIN; SELECT ... FOR UPDATE; UPDATE <key column> ...;` silently reported
+// UPDATE 0. Only a key-changing update is HOT-ineligible, so it is the one
+// shape that falls through to this guard — a non-key update takes the HOT path
+// and never reaches it, which is why the bug stayed narrow enough to survive.
+func isSelfModifiedWrite(h storage.HeapTupleHeader, myXID storage.TransactionID) bool {
+	if h.Xmax == storage.InvalidTransactionID {
+		return false
+	}
+	if storage.IsHeapTupleXmaxMulti(h.Infomask) {
+		return false
+	}
+	if storage.IsHeapTupleLockOnly(h.Infomask) {
+		return false
+	}
+	return h.Xmax == myXID
+}
+
 // isConcurrentlyUpdated reports whether the tuple has been updated or
 // deleted by a transaction OTHER than myXID. Used under the page's
 // exclusive Lock by the UPDATE / DELETE / HOT-update paths to detect
@@ -4543,8 +4579,11 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				// Upstream heap_update returns TM_SelfModified for a tuple this
 				// command already updated and ExecUpdate skips the row
 				// (postgres/src/backend/executor/nodeModifyTable.c).
-				if oldGerr == nil && oldTup.Header.Xmax != storage.InvalidTransactionID &&
-					oldTup.Header.Xmax == o.ctx.Tx.XID {
+				//
+				// M-NIGHTLY AI-20260813-005117-012: the IS_MULTI / LOCKED_ONLY
+				// exclusions live in isSelfModifiedWrite so this guard and its
+				// seq-scan twin below cannot drift apart.
+				if oldGerr == nil && isSelfModifiedWrite(oldTup.Header, o.ctx.Tx.XID) {
 					s.Unlock()
 					o.ctx.Pool.Unpin(s)
 					s321Note(s321EPQSelfModified)
@@ -5438,8 +5477,10 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				// Upstream heap_update returns TM_SelfModified for a tuple this
 				// command already updated and ExecUpdate skips the row
 				// (postgres/src/backend/executor/nodeModifyTable.c).
-				if oldGerr == nil && oldTup.Header.Xmax != storage.InvalidTransactionID &&
-					oldTup.Header.Xmax == o.ctx.Tx.XID {
+				//
+				// M-NIGHTLY AI-20260813-005117-012: shares isSelfModifiedWrite
+				// with the index-scan twin above so the pair cannot diverge.
+				if oldGerr == nil && isSelfModifiedWrite(oldTup.Header, o.ctx.Tx.XID) {
 					s.Unlock()
 					o.ctx.Pool.Unpin(s)
 					s321Note(s321EPQSelfModified)

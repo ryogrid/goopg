@@ -257,12 +257,70 @@ Regression guard: `TestEPQChainTailLiveButUnseen`
 classifier at the page level — the retry case and, more importantly, the three
 false cases that keep the retry terminating.
 
-## 9. Files
+## 9. Follow-up (2026-08-13) — the TM_SelfModified guard over-matched a row this transaction had only LOCKED
+
+M-NIGHTLY `AI-20260813-005117-012` (`TestPort_IsolationInsertConflictDoUpdate4`)
+and `AI-20260813-005117-009` (`TestPort_IsolationEvalPlanQual`, "reopened a 3rd
+time") were both caused by §5's guard, which landed the day before in `408a3962`.
+The nightly of 2026-08-13 is the first run after it, so the third "reopen" of
+EvalPlanQual was not two earlier fixes failing to hold — it was a new regression
+wearing the old symptom.
+
+The guard was written as a bare xmax comparison:
+
+```go
+oldTup.Header.Xmax != storage.InvalidTransactionID && oldTup.Header.Xmax == o.ctx.Tx.XID
+```
+
+Upstream reaches the equivalent raw-xmax test only after two earlier arms have
+returned (`postgres/src/backend/access/heap/heapam_visibility.c`,
+`HeapTupleSatisfiesUpdate`):
+
+- `HEAP_XMAX_IS_MULTI` has its own branch, so a raw `Xmax` holding a
+  `MultiXactId` is never compared against a `TransactionId` — the two id spaces
+  are disjoint and a numeric collision would skip an unrelated row.
+- `HEAP_XMAX_IS_LOCKED_ONLY` returns `TM_BeingModified`, **not**
+  `TM_SelfModified`. A row this transaction merely *locked* is still updatable
+  by it.
+
+The missing LOCKED_ONLY arm meant that after `SELECT ... FOR UPDATE` the tuple
+carried our own lock-only xmax, and the next `UPDATE` of a **key column**
+silently reported `UPDATE 0` — no error, no row written. The bug was narrow
+because of the HOT split: a non-key update takes `tryApplyHOTUpdate` and never
+reaches the guard, so only a key-changing update (HOT-ineligible by definition)
+falls through to it. Reduced repro, on any table with an index on the updated
+column:
+
+```sql
+BEGIN;
+SELECT * FROM t WHERE i = 1 FOR UPDATE;
+UPDATE t SET i = i + 10 WHERE i = 1;   -- reported UPDATE 0
+ROLLBACK;
+```
+
+Fix: both write-phase loops now call one shared predicate,
+`isSelfModifiedWrite(header, myXID)`, which reproduces upstream's *structure*
+rather than only its comparison. Sharing it is deliberate — the guard is a
+sibling pair (index-scan arm ≈ line 4546, seq-scan arm ≈ line 5432), and the
+duplicated inline condition is exactly the shape that lets one arm be fixed
+while the other rots.
+
+Verified: `insert-conflict-do-update-4` permutations 1 and 2 (the
+`update2a`/`update2b` cases where s2's concurrent update moves the locked row
+within and across partitions) now match PG byte-for-byte, and
+`eval-plan-qual.spec` is green again at 24.25 s. Unit guard:
+`TestIsSelfModifiedWrite` (`internal/executor/self_modified_write_test.go`),
+which pins the LOCKED_ONLY and IS_MULTI exclusions alongside the true
+self-modified case the guard exists for.
+
+## 10. Files
 
 - `internal/executor/operators_storage.go` — `epqChainPendingWriter`,
   `epqChainTailLiveButUnseen`, `epqRefreshSnapForRetry`, the pending-writer wait
   and the stale-snapshot re-lap in all three EPQ sites, the `TM_SelfModified`
-  guard in both write-phase loops.
+  guard in both write-phase loops (`isSelfModifiedWrite`, §9).
+- `internal/executor/self_modified_write_test.go` — `TestIsSelfModifiedWrite`,
+  the §9 regression guard.
 - `internal/executor/epq_stale_snapshot_test.go` — `TestEPQChainTailLiveButUnseen`,
   the S32.3 regression guard (both directions of the classifier).
 - `internal/executor/s321_probe.go` — env-gated diagnostic counters
