@@ -711,6 +711,7 @@ func checkFKColumnTypeCompatibility(ctx *Context, childTbl *catalog.Table, fk ca
 // line `Key (col)=(val) is not present in table "<parent>".`
 func fkValsForDetail(ctx *Context, vals []Datum) string {
 	style, order := dateStyleFromCtx(ctx)
+	zone := timeZoneFromCtx(ctx)
 	var sb strings.Builder
 	for i, v := range vals {
 		if i > 0 {
@@ -721,7 +722,7 @@ func fkValsForDetail(ctx *Context, vals []Datum) string {
 			continue
 		}
 		if v.Kind == KindTime {
-			sb.WriteString(formatTimeDatumDateStyle(v, style, order))
+			sb.WriteString(formatTimeDatumDateStyle(v, style, order, zone))
 			continue
 		}
 		sb.WriteString(v.Format())

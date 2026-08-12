@@ -75,7 +75,7 @@ func TestParseTimeTZStringPGFieldRoles(t *testing.T) {
 		{"10:00.5", time.Date(1970, 1, 1, 0, 10, 0, 500_000_000, time.UTC), 0},
 		{"allballs", time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC), 0},
 	} {
-		got, off, err := parseTimeTZString(tc.in)
+		got, off, err := parseTimeTZString(tc.in, "")
 		if err != nil {
 			t.Errorf("parseTimeTZString(%q): %v — PG reads this as %v (offset %d)", tc.in, err, tc.want, tc.offset)
 			continue

@@ -216,7 +216,7 @@ func TestEncodeCopyTextRowTimestampFractionalSecondsTrimmed(t *testing.T) {
 // the encode test — exactly what pgbench's COPY data looks like.
 func TestDecodeCopyTextRowPgbenchShape(t *testing.T) {
 	cols := textCols()
-	got, err := DecodeCopyTextRow([]byte("42\t1\t100\thello"), cols, `\N`)
+	got, err := DecodeCopyTextRow([]byte("42\t1\t100\thello"), cols, `\N`, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -239,7 +239,7 @@ func TestDecodeCopyTextRowNull(t *testing.T) {
 		{Name: "a", Type: catalog.Type{Name: "int4"}},
 		{Name: "b", Type: catalog.Type{Name: "text"}},
 	}
-	got, err := DecodeCopyTextRow([]byte("\\N\tx\\Ny"), cols, `\N`)
+	got, err := DecodeCopyTextRow([]byte("\\N\tx\\Ny"), cols, `\N`, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +273,7 @@ func TestDecodeCopyTextRowEscapes(t *testing.T) {
 	}
 	cols := []catalog.Column{{Name: "s", Type: catalog.Type{Name: "text"}}}
 	for _, tc := range cases {
-		got, err := DecodeCopyTextRow([]byte(tc.in), cols, `\N`)
+		got, err := DecodeCopyTextRow([]byte(tc.in), cols, `\N`, "")
 		if err != nil {
 			t.Errorf("%q: %v", tc.in, err)
 			continue
@@ -290,10 +290,10 @@ func TestDecodeCopyTextRowEscapes(t *testing.T) {
 // boundary.
 func TestDecodeCopyTextRowFieldCount(t *testing.T) {
 	cols := textCols()
-	if _, err := DecodeCopyTextRow([]byte("1\t2\t3"), cols, `\N`); err == nil {
+	if _, err := DecodeCopyTextRow([]byte("1\t2\t3"), cols, `\N`, ""); err == nil {
 		t.Errorf("expected error for short row")
 	}
-	if _, err := DecodeCopyTextRow([]byte("1\t2\t3\t4\t5"), cols, `\N`); err == nil {
+	if _, err := DecodeCopyTextRow([]byte("1\t2\t3\t4\t5"), cols, `\N`, ""); err == nil {
 		t.Errorf("expected error for long row")
 	}
 }
@@ -318,7 +318,7 @@ func TestRoundTripBoolAndTimestamp(t *testing.T) {
 	if enc[len(enc)-1] != '\n' {
 		t.Fatal("missing trailing newline")
 	}
-	got, err := DecodeCopyTextRow(enc[:len(enc)-1], cols, `\N`)
+	got, err := DecodeCopyTextRow(enc[:len(enc)-1], cols, `\N`, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -362,4 +362,96 @@ func rowsEqual(a, b Row) bool {
 		}
 	}
 	return true
+}
+
+// TestEncodeCopyTextRowTimeAndTimeTZ pins the 49th M0119-0006 slice: before it,
+// datumToCopyText had no arm for either `time` or `timetz`, so both fell through
+// to the default branch — whose Kind switch has no KindTime case — and
+// `COPY <table> TO STDOUT` hard-errored "kind 5 cannot encode as time in COPY
+// TEXT" for any table carrying one. The FROM side (copyTextToDatum) has had
+// both arms all along, so COPY TO → COPY FROM was not a round trip: the
+// asymmetry is exactly what Hard-won Rule #2 exists to catch.
+//
+// The expected strings are time_out/timetz_out's (postgres/src/backend/utils/
+// adt/date.c): time carries no zone, timetz appends the UTC offset with the
+// minutes field elided when zero. DateStyle is deliberately varied to show it
+// has NO effect — EncodeTimeOnly is called with USE_ISO_DATES unconditionally
+// upstream, unlike the date/timestamp arms.
+func TestEncodeCopyTextRowTimeAndTimeTZ(t *testing.T) {
+	at := func(h, m, s, us int) time.Time {
+		return time.Date(1970, time.January, 1, h, m, s, us*1000, time.UTC)
+	}
+	cases := []struct {
+		name string
+		typ  catalog.Type
+		row  Row
+		want string
+	}{
+		{"time", catalog.Type{Name: "time"}, Row{NewTimeDatum(at(9, 5, 3, 0))}, "09:05:03\n"},
+		{"time frac", catalog.Type{Name: "time"}, Row{NewTimeDatum(at(9, 5, 3, 120000))}, "09:05:03.12\n"},
+		// 24:00:00 is carried as next-day midnight; the naive hour/minute/second
+		// read reports "00:00:00" for it.
+		{"time 24", catalog.Type{Name: "time"},
+			Row{NewTimeDatum(time.Date(1970, time.January, 2, 0, 0, 0, 0, time.UTC))}, "24:00:00\n"},
+		// Declared precision is applied at OUTPUT because goopg applies no
+		// typmod at input; this mirrors internal/server's appendTimeText so
+		// COPY and SELECT agree on the same column.
+		{"time(2)", catalog.Type{Name: "time", Args: []int64{2}},
+			Row{NewTimeDatum(at(9, 5, 3, 123456))}, "09:05:03.12\n"},
+		{"timetz east", catalog.Type{Name: "timetz"},
+			Row{NewTimeTZDatum(at(9, 5, 3, 0), 9*3600)}, "09:05:03+09\n"},
+		{"timetz half-hour", catalog.Type{Name: "timetz"},
+			Row{NewTimeTZDatum(at(12, 0, 0, 0), -3*3600-1800)}, "12:00:00-03:30\n"},
+		{"timetz utc", catalog.Type{Name: "timetz"},
+			Row{NewTimeTZDatum(at(0, 0, 0, 0), 0)}, "00:00:00+00\n"},
+	}
+	for _, tc := range cases {
+		cols := []catalog.Column{{Name: "t", Type: tc.typ}}
+		for _, style := range []string{"ISO", "SQL", "Postgres", "German"} {
+			got, err := EncodeCopyTextRow(nil, tc.row, cols, style, "MDY", "Asia/Tokyo")
+			if err != nil {
+				t.Fatalf("%s (style=%s): %v", tc.name, style, err)
+			}
+			if string(got) != tc.want {
+				t.Errorf("%s (style=%s): got %q, want %q", tc.name, style, got, tc.want)
+			}
+		}
+	}
+}
+
+// TestCopyTextTimeRoundTrip closes the loop the 49th slice opened: what
+// datumToCopyText writes, copyTextToDatum must read back to the same value.
+// The timetz half also pins the 48th slice's session-zone rule — the emitted
+// text always carries an explicit zone, so re-reading it must NOT re-apply the
+// session TimeZone on top.
+func TestCopyTextTimeRoundTrip(t *testing.T) {
+	cases := []struct {
+		typ        catalog.Type
+		tv         time.Time
+		offsetSecs int
+	}{
+		{catalog.Type{Name: "time"}, time.Date(1970, time.January, 1, 23, 59, 59, 999000000, time.UTC), 0},
+		{catalog.Type{Name: "timetz"}, time.Date(1970, time.January, 1, 9, 5, 3, 0, time.UTC), 9 * 3600},
+		{catalog.Type{Name: "timetz"}, time.Date(1970, time.January, 1, 12, 0, 0, 0, time.UTC), -3*3600 - 1800},
+	}
+	for _, tc := range cases {
+		d := NewTimeDatum(tc.tv)
+		if tc.typ.Name == "timetz" {
+			d = NewTimeTZDatum(tc.tv, tc.offsetSecs)
+		}
+		text, err := datumToCopyText(tc.typ, d, "ISO", "MDY", "Asia/Tokyo")
+		if err != nil {
+			t.Fatalf("%s: encode: %v", tc.typ.Name, err)
+		}
+		back, err := copyTextToDatum(tc.typ, []byte(text), "Asia/Tokyo")
+		if err != nil {
+			t.Fatalf("%s %q: decode: %v", tc.typ.Name, text, err)
+		}
+		if !back.TimeValue().Equal(tc.tv) {
+			t.Errorf("%s %q: time %v, want %v", tc.typ.Name, text, back.TimeValue(), tc.tv)
+		}
+		if back.TimeTZOffsetSecs() != tc.offsetSecs {
+			t.Errorf("%s %q: offset %d, want %d", tc.typ.Name, text, back.TimeTZOffsetSecs(), tc.offsetSecs)
+		}
+	}
 }

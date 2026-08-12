@@ -433,7 +433,7 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 	case *planner.RowExpr:
 		return evalRowExpr(x, slot, ctx)
 	case *planner.TypedStringLit:
-		return evalTypedStringLit(x)
+		return evalTypedStringLit(x, ctx)
 	case *planner.IntervalLit:
 		return evalIntervalLit(x)
 	case *planner.ExtractExpr:
@@ -2402,7 +2402,13 @@ func tryParseStringAs(target DatumKind, s string) Datum {
 		}
 		// Try timetz first ("HH:MM:SS±HH[:MM]") to preserve the offset.
 		// M0097-0004: strings like '05:06:07-07' must compare as timetz, not plain time.
-		if ts, offsetSecs, err := parseTimeTZString(s); err == nil && offsetSecs != 0 {
+		//
+		// The session zone is deliberately NOT passed here: this arm is deciding
+		// which TYPE an untyped string denotes, and it decides by whether a zone
+		// was written. Feeding it the session default would make every bare
+		// "10:00" arrive with a non-zero offset on a non-UTC session and be
+		// mistyped as timetz. M0119-0006.
+		if ts, offsetSecs, err := parseTimeTZString(s, ""); err == nil && offsetSecs != 0 {
 			return NewTimeTZDatum(ts, offsetSecs)
 		}
 		// Try time-of-day first ("HH:MM:SS") then full timestamp.
@@ -2878,7 +2884,12 @@ func evalOr(a, b Datum) Datum {
 // repeated evaluations in a hot loop (e.g. Q5's date filter
 // applied per orders row) skip the `time.Parse` cost. pprof
 // showed `time.parse` at 10.5 % cumulative CPU pre-cache.
-func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
+//
+// M0119-0006: `ctx` reaches only the timetz arm, whose zone-less default is the
+// SESSION TimeZone. That arm never fills CachedTime — it must not, since the
+// cache is keyed on the planner node alone and would freeze one session's zone
+// into a plan another session reuses.
+func evalTypedStringLit(x *planner.TypedStringLit, ctx *Context) (Datum, error) {
 	if x.CacheValid {
 		return NewTimeDatum(x.CachedTime), nil
 	}
@@ -3023,7 +3034,7 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 		}
 		return NewTimeDatum(ts), nil
 	case "timetz":
-		ts, offsetSecs, err := parseTimeTZString(x.Value)
+		ts, offsetSecs, err := parseTimeTZString(x.Value, timeZoneFromCtx(ctx))
 		if err != nil {
 			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid input syntax for type time with time zone: %q", x.Value)}
 		}
@@ -3069,6 +3080,13 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 		}
 		x.CachedTime = t
 		x.CacheValid = true
+		// M0119-0006 (40th slice): the literal's own type also decides how the
+		// value is later RENDERED by type-agnostic paths, not just how its zone
+		// was read above — so tag the timestamptz spelling. Same split as
+		// tsZoneModeForType makes on the input side, one type name apart.
+		if isTimestampTZTypeName(x.Type) {
+			return NewTimestampTZDatum(x.CachedTime), nil
+		}
 		return NewTimeDatum(x.CachedTime), nil
 	default:
 		// Unknown type — treat as text literal. Covers enum/domain casts in v0.
@@ -3292,22 +3310,50 @@ func dateStyleFromCtx(ctx *Context) (style, order string) {
 	return style, order
 }
 
+// timeZoneFromCtx resolves the session's TimeZone GUC via ctx.GetSetting,
+// returning "" (which config.FormatTimestampTZ reads as UTC) when ctx is nil,
+// has no GetSetting wired, or the GUC is unset. Mirrors the same lookup
+// dispatch.go's appendTypedCellText and copy_text.go's datumToCopyText perform
+// for the timestamptz arm, so CAST-to-text agrees with SELECT and COPY output
+// on the TimeZone axis too (pattern_sibling_paths_must_agree). M0119-0006.
+func timeZoneFromCtx(ctx *Context) string {
+	if ctx != nil && ctx.GetSetting != nil {
+		if v, ok := ctx.GetSetting("timezone"); ok {
+			return v
+		}
+	}
+	return ""
+}
+
 // formatTimeDatumDateStyle renders a non-time-only KindTime datum as text,
-// honoring the session DateStyle GUC. Mirrors Datum.Format()'s ±infinity and
-// TimeSubDate branching, but dispatches DATE vs TIMESTAMP/TIMESTAMPTZ through
-// config.FormatDate/FormatTimestamp instead of Format()'s hardcoded
-// Postgres-MDY-only / fixed-ISO layouts, so callers (CAST-to-text, FK
-// violation DETAIL messages, ...) agree with SELECT/COPY output on the
-// DateStyle GUC axis.
-func formatTimeDatumDateStyle(d Datum, style, order string) string {
+// honoring the session DateStyle and TimeZone GUCs. Mirrors Datum.Format()'s
+// ±infinity and TimeSub branching, but dispatches DATE / TIMESTAMP /
+// TIMESTAMPTZ through config.FormatDate/FormatTimestamp/FormatTimestampTZ
+// instead of Format()'s hardcoded Postgres-MDY-only / fixed-ISO layouts, so
+// callers (CAST-to-text, FK violation DETAIL messages, ...) agree with
+// SELECT/COPY output.
+//
+// M0119-0006 (40th slice): the TimeSubTimestampTZ arm closes the residual the
+// 39th slice left. That slice fixed the two output paths that know the DECLARED
+// column type (dispatch.go's appendTypedCellText, copy_text.go's
+// datumToCopyText) but could not fix this one, which sees a bare Datum — so
+// `('2020-01-01 10:00:00+05:30'::timestamptz)::text` printed no zone AND never
+// left UTC, disagreeing with goopg's own SELECT output of the same value.
+// Under a non-UTC TimeZone that is a silent relabel of the instant, the exact
+// failure mode the 39th slice removed one path over. The producers now tag the
+// datum (NewTimestampTZDatum), so the discriminator this needs exists.
+func formatTimeDatumDateStyle(d Datum, style, order, zone string) string {
 	if d.Int == math.MaxInt64 {
 		return "infinity"
 	}
 	if d.Int == math.MinInt64 {
 		return "-infinity"
 	}
-	if d.TimeSub == TimeSubDate {
+	switch d.TimeSub {
+	case TimeSubDate:
 		return config.FormatDate(d.TimeValue(), style, order)
+	case TimeSubTimestampTZ:
+		return config.FormatTimestampTZ(d.TimeValue(), style, order, zone)
 	}
 	return config.FormatTimestamp(d.TimeValue(), style, order)
 }
@@ -3322,7 +3368,7 @@ func formatDatumDateStyle(d Datum, ctx *Context) string {
 		return d.Format()
 	}
 	style, order := dateStyleFromCtx(ctx)
-	return formatTimeDatumDateStyle(d, style, order)
+	return formatTimeDatumDateStyle(d, style, order, timeZoneFromCtx(ctx))
 }
 
 // evalCast coerces datum d to the declared SQL type name.
@@ -3523,7 +3569,7 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 				return NewStringDatum(string(appendTimeOnlyValueText(nil, d.TimeValue()))), nil
 			}
 			style, order := dateStyleFromCtx(ctx)
-			return NewStringDatum(formatTimeDatumDateStyle(d, style, order)), nil
+			return NewStringDatum(formatTimeDatumDateStyle(d, style, order, timeZoneFromCtx(ctx))), nil
 		case KindEnum:
 			// Cast enum to text: return the label string (loses sort order). M0097-enum.
 			return NewStringDatum(string(d.Buf)), nil
@@ -3721,7 +3767,7 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 	case "timetz":
 		// Cast to timetz: parse strings with timezone offset. M0097-0004.
 		if d.Kind == KindString {
-			ts, offsetSecs, err := parseTimeTZString(d.StringValue())
+			ts, offsetSecs, err := parseTimeTZString(d.StringValue(), timeZoneFromCtx(ctx))
 			if err != nil {
 				return Datum{}, err
 			}
@@ -3734,7 +3780,8 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 		}
 		return d, nil
 	case "timestamp", "timestamptz":
-		// Cast to timestamp: parse strings, keep KindTime as-is. M0097-0004.
+		// Cast to timestamp: parse strings, retag KindTime. M0097-0004.
+		tz := isTimestampTZTypeName(targetType)
 		if d.Kind == KindString {
 			// 'infinity' / '-infinity' have no finite time.Time (#5(d-iv)).
 			if inf, ok := parseTimestampInfinityLiteral(d.StringValue()); ok {
@@ -3746,7 +3793,36 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			if err != nil {
 				return Datum{}, dateTimeInputError(err, "timestamp", d.StringValue(), pos)
 			}
+			if tz {
+				return NewTimestampTZDatum(ts), nil
+			}
 			return NewTimeDatum(ts), nil
+		}
+		// M0119-0006 (40th slice): a cast BETWEEN the two timestamp types is not
+		// a no-op in either half. Upstream timestamp2timestamptz reads the
+		// zone-less wall clock as a LOCAL time in the session zone (so the
+		// stored instant moves), and timestamptz2timestamp renders the instant
+		// into the session zone and keeps that wall clock; the subtype must move
+		// with it, or `ts_col::timestamptz` renders zone-less and
+		// `tstz_col::timestamp` keeps a zone the target type does not have.
+		// goopg previously returned the datum untouched, which is the identity
+		// only while TimeZone is UTC — under any other zone both directions were
+		// silently off by the offset with no diagnostic.
+		//
+		// The ±infinity sentinels render from Int alone (their wall clock is not
+		// a real instant), so leave them untouched — as are DATE and the two
+		// time-of-day subtypes, whose carriers mean something else (see
+		// NewTimeTZDatum's offset in Datum.Scale).
+		if d.Kind == KindTime &&
+			(d.TimeSub == TimeSubTimestamp || d.TimeSub == TimeSubTimestampTZ) &&
+			d.Int != math.MaxInt64 && d.Int != math.MinInt64 {
+			zone := timeZoneFromCtx(ctx)
+			switch {
+			case tz && d.TimeSub == TimeSubTimestamp:
+				return NewTimestampTZDatum(config.TimestampToTimestampTZ(d.TimeValue(), zone)), nil
+			case !tz && d.TimeSub == TimeSubTimestampTZ:
+				return NewTimeDatum(config.TimestampTZToTimestamp(d.TimeValue(), zone)), nil
+			}
 		}
 		return d, nil
 	case "interval":
@@ -7863,7 +7939,12 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "bt_index_parent_check":
 		return evalBtIndexCheck(x, row, ctx, true)
 	case "current_timestamp", "now", "transaction_timestamp", "statement_timestamp":
-		return NewTimeDatum(ctx.Now), nil
+		// All four are declared `timestamp with time zone` upstream
+		// (pg_proc.dat: now/statement_timestamp/transaction_timestamp prorettype
+		// 1184), so they render through timestamptz_out. `localtimestamp` below
+		// is the plain-`timestamp` sibling and deliberately keeps NewTimeDatum.
+		// M0119-0006 (40th slice).
+		return NewTimestampTZDatum(ctx.Now), nil
 	case "current_date":
 		t := ctx.Now.UTC()
 		return NewTimeDatum(time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)), nil
@@ -11661,7 +11742,8 @@ case "pg_char_to_encoding":
 		}
 		return Datum{Kind: KindInt, Int: 0}, nil
 	case "clock_timestamp":
-		return NewTimeDatum(ctx.Now), nil
+		// prorettype 1184 (timestamptz), like the now() family. M0119-0006.
+		return NewTimestampTZDatum(ctx.Now), nil
 	case "timeofday":
 		return NewStringDatum(ctx.Now.Format("Mon Jan 02 15:04:05.000000 2006 UTC")), nil
 	case "localtime":

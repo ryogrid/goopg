@@ -407,7 +407,8 @@ func (s *Server) runInlineCopyFromStdin(r *protocol.FrameReader, w *protocol.Fra
 				line := lineBuf[:idx]
 				// `\.` end-of-data marker (deprecated in v3 but still sent by
 				// psql before CopyDone): skip it, matching upstream text COPY.
-				if !isCopyTextEOD(line) {
+				// Inside a quoted CSV field it is data, not a marker.
+				if !isCopyTextEOD(line) || from.InCsvQuotedField() {
 					if perr := from.PushLine(line); perr != nil {
 						return s.writeQueryError(w, execErrCode(perr), execErrMsg(perr))
 					}
@@ -416,8 +417,13 @@ func (s *Server) runInlineCopyFromStdin(r *protocol.FrameReader, w *protocol.Fra
 			}
 		case protocol.MsgCopyDone:
 			// Flush any partial trailing line (no terminating newline).
-			if !from.IsBinary() && len(lineBuf) > 0 && !isCopyTextEOD(lineBuf) {
+			if !from.IsBinary() && len(lineBuf) > 0 && (!isCopyTextEOD(lineBuf) || from.InCsvQuotedField()) {
 				if perr := from.PushLine(lineBuf); perr != nil {
+					return s.writeQueryError(w, execErrCode(perr), execErrMsg(perr))
+				}
+			}
+			if !from.IsBinary() {
+				if perr := from.Finish(); perr != nil {
 					return s.writeQueryError(w, execErrCode(perr), execErrMsg(perr))
 				}
 			}
@@ -588,6 +594,26 @@ func (s *Server) handleCopyInFrame(w *protocol.FrameWriter, st *copyInState, f p
 				}
 				st.lineBuf = st.lineBuf[:0]
 			}
+			// End-of-stream conditions the per-line path cannot see —
+			// today a CSV record left inside a quoted field.
+			if err := st.fromExec.Finish(); err != nil {
+				if st.mgr != nil {
+					_ = st.mgr.Rollback(st.tx)
+				}
+				if werr := w.WriteErrorResponse([]protocol.ErrorField{
+					{Code: protocol.FieldSeverity, Value: "ERROR"},
+					{Code: protocol.FieldSeverityNonLocal, Value: "ERROR"},
+					{Code: protocol.FieldSQLState, Value: execErrCodeStr(err)},
+					{Code: protocol.FieldMessage, Value: execErrMsg(err)},
+					{Code: protocol.FieldRoutine, Value: "server.handleCopyInFrame"},
+				}); werr != nil {
+					return true, werr
+				}
+				if werr := w.ReadyForQueryAfterError(); werr != nil {
+					return true, werr
+				}
+				return true, nil
+			}
 			rows := st.fromExec.RowsInserted()
 			if st.mgr != nil {
 				_ = commitCopyTx(st.mgr, st.tx, st.asyncCommit)
@@ -681,7 +707,10 @@ func (st *copyInState) consumeExecCopyData(chunk []byte) error {
 		// uses CopyDone for the actual signal but the literal `\.`
 		// frame still arrives. Match upstream's behaviour and
 		// silently skip it.
-		if isCopyTextEOD(line) {
+		// Inside a quoted CSV field `\.` is data, not an end-of-data
+		// marker (upstream swallows it into the field and then reports
+		// `unterminated CSV quoted field`).
+		if isCopyTextEOD(line) && !st.fromExec.InCsvQuotedField() {
 			st.lineBuf = st.lineBuf[idx+1:]
 			continue
 		}

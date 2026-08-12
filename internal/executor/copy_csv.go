@@ -1,6 +1,8 @@
 package executor
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -137,6 +139,114 @@ func EncodeCopyCsvRow(dst []byte, row Row, cols []catalog.Column, f copyToFormat
 		dst = appendCsvField(dst, s, fq, f.delim, f.quote, f.escape)
 	}
 	return append(dst, '\n'), nil
+}
+
+// errCsvIncompleteRecord reports that the bytes handed to the CSV reader
+// end inside a quoted field, so the record continues on the next physical
+// line. Upstream never surfaces this: CopyReadLineText tracks the quote
+// state itself and only hands a COMPLETE record to CopyReadAttributesCSV
+// (`postgres/src/backend/commands/copyfromparse.c`). goopg's wire layer
+// splits CopyData on '\n' before the executor sees it, so the executor
+// re-joins the pieces instead — see CopyFromExecutor.pushCsvLine.
+var errCsvIncompleteRecord = errors.New("COPY CSV: record continues on the next line")
+
+// DecodeCopyCsvRow parses a single CSV-formatted record (with no trailing
+// newline) into Datums shaped by cols. It is the read-side counterpart of
+// EncodeCopyCsvRow. Returns errCsvIncompleteRecord when the record ends
+// inside a quoted field.
+//
+// timeZone is the session TimeZone GUC ("" = UTC); it reaches the per-field
+// input functions through datumsFromCopyFields, so the CSV and TEXT readers
+// cannot drift on the GUC-dependent types. M0119-0006 (48th slice).
+func DecodeCopyCsvRow(line []byte, cols []catalog.Column, f copyToFormat, timeZone string) (Row, error) {
+	fields, err := parseCopyCsvFields(line, f)
+	if err != nil {
+		return nil, err
+	}
+	// Upstream reports the two field-count mismatches with distinct
+	// messages (copyfromparse.c NextCopyFrom / CopyReadAttributesCSV);
+	// the TEXT reader's own message is left as it was.
+	if len(fields) > len(cols) {
+		return nil, errors.New("extra data after last expected column")
+	}
+	if len(fields) < len(cols) {
+		return nil, fmt.Errorf("missing data for column %q", cols[len(fields)].Name)
+	}
+	return datumsFromCopyFields(fields, cols, timeZone)
+}
+
+// parseCopyCsvFields splits one CSV record into fields, mirroring
+// upstream's CopyReadAttributesCSV. The rules that differ from COPY TEXT
+// and that this reader implements:
+//
+//   - backslash escapes are NOT processed; the only escaping is the
+//     escape character INSIDE a quoted section (escape defaults to the
+//     quote character, which yields the familiar doubled quote);
+//   - a quoted section can be entered and left mid-field, so `"ab"cd`
+//     is the single field `abcd`;
+//   - the NULL rule keys on quoting, not on content: an UNQUOTED field
+//     whose raw text equals the null string is SQL NULL, while a quoted
+//     field is never NULL (so with the CSV default null string, `,,` is
+//     two NULLs but `"",""` is two empty strings).
+func parseCopyCsvFields(line []byte, f copyToFormat) ([]copyField, error) {
+	var out []copyField
+	pos := 0
+	for {
+		var field []byte
+		sawQuote := false
+		foundDelim := false
+		for pos < len(line) {
+			c := line[pos]
+			pos++
+			if c == f.delim {
+				foundDelim = true
+				break
+			}
+			if c != f.quote {
+				field = append(field, c)
+				continue
+			}
+			// Quoted section: runs to the next unescaped quote. Note
+			// escape == quote in the default configuration, so the
+			// escape arm below is what turns "" into a literal quote.
+			sawQuote = true
+			closed := false
+			for pos < len(line) {
+				c = line[pos]
+				pos++
+				if c == f.escape && pos < len(line) {
+					if n := line[pos]; n == f.escape || n == f.quote {
+						field = append(field, n)
+						pos++
+						continue
+					}
+				}
+				if c == f.quote {
+					closed = true
+					break
+				}
+				field = append(field, c)
+			}
+			if !closed {
+				return nil, errCsvIncompleteRecord
+			}
+		}
+		if !sawQuote && string(field) == f.nullStr {
+			out = append(out, copyField{isNull: true})
+		} else {
+			if field == nil {
+				field = []byte{}
+			}
+			out = append(out, copyField{bytes: field})
+		}
+		// A record ending in the delimiter still has one trailing
+		// (empty) field after it, so only a delimiter-less exhaustion
+		// of the line ends the record.
+		if !foundDelim {
+			break
+		}
+	}
+	return out, nil
 }
 
 // appendCsvField writes a single CSV field, quoting it when forced or when

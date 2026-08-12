@@ -3049,13 +3049,33 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 			held.release()
 			return fmt.Errorf("btree: log split: %w", lerr)
 		}
-		bt.pool.MarkDirtyWithLSNLocked(slot, lsn)
+		// M0131-S26b: which stamp is legal per page depends on what the
+		// record carries FOR THAT PAGE. MarkDirtyWithLSNLocked advances the
+		// slot's native-image watermark, i.e. asserts that an image of the
+		// page exists in WAL at this LSN, which suppresses its first-touch
+		// FPI for the rest of the checkpoint epoch. That holds for the RIGHT
+		// page (registered WILL_INIT with the full item list: redo rebuilds
+		// it wholesale from the record, so a torn on-disk copy is irrelevant)
+		// and for the LEFT page only in the image form. The sibling (block 2)
+		// and the incomplete-split child (block 3) are registered as bare
+		// block references — no image, no data, redo re-derives their one
+		// mutation from the page it finds — exactly like upstream's ordinary
+		// buffer registration, which takes an FPI when it is the first
+		// modification since the checkpoint. Those pages therefore still owe
+		// their first-touch image: MarkDirtyCoveredByRecordLocked emits it
+		// when needed, raises pd_lsn to the record, and leaves the watermark
+		// to maybeEmitFPI.
+		if _, incremental := SplitLeftIsIncremental(prePage, slot.Page(), rightSlot.Page(), newItemRaw, op.Level, rightBlk); incremental {
+			bt.pool.MarkDirtyCoveredByRecordLocked(slot, lsn)
+		} else {
+			bt.pool.MarkDirtyWithLSNLocked(slot, lsn)
+		}
 		bt.pool.MarkDirtyWithLSNLocked(rightSlot, lsn)
 		if sibSlot != nil {
-			bt.pool.MarkDirtyWithLSNLocked(sibSlot, lsn)
+			bt.pool.MarkDirtyCoveredByRecordLocked(sibSlot, lsn)
 		}
 		if childSlot != nil {
-			bt.pool.MarkDirtyWithLSNLocked(childSlot, lsn)
+			bt.pool.MarkDirtyCoveredByRecordLocked(childSlot, lsn)
 		}
 	} else {
 		bt.pool.MarkDirty(slot)

@@ -2047,7 +2047,7 @@ func (o *lockRowsOp) stampMultiLock(slot *storage.Slot, ptr storage.ItemPointer,
 	// multixact state is transient — the holders' transactions do not survive a
 	// crash — so losing it on recovery is correct. WAL persistence of multixact
 	// members is deferred (see docs/design/0118-0002). M0118-0003.
-	o.ctx.Pool.MarkDirty(slot)
+	o.ctx.Pool.MarkDirtyUnlogged(slot, "multixact lock stamp: transient in-memory membership, no WAL record (0118-0002)")
 	return ptr, true, nil
 }
 
@@ -2130,7 +2130,7 @@ func (o *lockRowsOp) stampMultiUpdaterLock(slot *storage.Slot, ptr storage.ItemP
 	// process-shared state, marked dirty without a logical heap-lock record (the
 	// record carries a single xid + strength and cannot describe a multi). WAL
 	// persistence of multixact members is deferred (docs/design/0118-0002).
-	o.ctx.Pool.MarkDirty(slot)
+	o.ctx.Pool.MarkDirtyUnlogged(slot, "multixact lock stamp: transient in-memory membership, no WAL record (0118-0002)")
 	return ptr, true, nil
 }
 

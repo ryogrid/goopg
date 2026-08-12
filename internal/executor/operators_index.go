@@ -246,6 +246,11 @@ type indexScanOp struct {
 	// they cannot coarsen into a heap-page lock that would re-introduce the
 	// different-bucket false positive (predicate-hash spec).
 	hashBucketScan bool
+	// hashProbeFingerprint is the blob-format encoding of this scan's probe key
+	// (ssiHashProbeFingerprint), which is what the bucket tag must be derived
+	// from — NOT the tuple-image search key the same probe descends the tree
+	// with. Set by lookupKey/lookupKeys, cleared per Rescan.
+	hashProbeFingerprint []byte
 }
 
 func newIndexScanOp(p *planner.IndexScan) *indexScanOp {
@@ -383,6 +388,7 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	// over a declared-hash index is a bucket probe (design 0118-0099). Mark it so
 	// the gap-lock and per-tuple-read paths use bucket-grain predicate locking.
 	o.hashBucketScan = isFullKeyProbe && o.plan.Index.DeclaredHash
+	o.hashProbeFingerprint = nil
 
 	var loBytes, hiBytes []byte
 	if len(o.plan.Keys) > 0 {
@@ -450,10 +456,19 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	if err := o.tree.RangeScanWithPos(loBytes, hiBytes, scanFn); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
-	if o.hashBucketScan && len(loBytes) > 0 {
-		// Bucket-grain SIREAD on the hash index in place of the relation-grain
-		// gap lock (design 0118-0099). loBytes is the encoded equality key.
-		ssiRecordHashBucketRead(o.ctx, o.heapRel.DBOid, o.plan.Index.OID, loBytes)
+	if o.hashBucketScan {
+		if len(o.hashProbeFingerprint) > 0 {
+			// Bucket-grain SIREAD on the hash index in place of the
+			// relation-grain gap lock (design 0118-0099). The tag comes from the
+			// probe's FINGERPRINT, which is what the INSERT side hashes;
+			// loBytes is the tree search key and is a different encoding.
+			ssiRecordHashBucketRead(o.ctx, o.heapRel.DBOid, o.plan.Index.OID, o.hashProbeFingerprint)
+		} else {
+			// No fingerprint (a key part this encoder cannot render): fall back
+			// to the relation-grain gap lock below rather than silently holding
+			// no predicate lock at all.
+			o.hashBucketScan = false
+		}
 	}
 	o.ssiRecordIndexScanGapLock(isFullKeyProbe)
 	return nil
@@ -716,6 +731,7 @@ func (o *indexScanOp) lookupKeys() ([]byte, bool, error) {
 	if encErr != nil {
 		return nil, false, encErr
 	}
+	o.hashProbeFingerprint = ssiHashProbeFingerprint(o.plan.Index, parts)
 	return probe, true, nil
 }
 
@@ -735,10 +751,14 @@ func (o *indexScanOp) lookupKey() ([]byte, bool, error) {
 	if !ok {
 		return nil, false, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf("indexed column %q not found on table %q", o.plan.Index.Columns[0], o.plan.Table.Name)}
 	}
-	key, encErr := o.ctx.indexProbeKey(o.plan.Index, []indexProbeKeyPart{{col: col, val: v, pos: o.plan.Key.Pos()}})
+	parts := []indexProbeKeyPart{{col: col, val: v, pos: o.plan.Key.Pos()}}
+	key, encErr := o.ctx.indexProbeKey(o.plan.Index, parts)
 	if encErr != nil {
 		return nil, false, encErr
 	}
+	// The SSI bucket tag is derived from the FINGERPRINT of the same parts, not
+	// from `key` — see ssiHashProbeFingerprint.
+	o.hashProbeFingerprint = ssiHashProbeFingerprint(o.plan.Index, parts)
 	return key, true, nil
 }
 

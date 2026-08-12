@@ -99,7 +99,7 @@ func TestTimestampLiteralAndCopyPathsAgree(t *testing.T) {
 			// so comparing the two paths under different rules would assert a
 			// difference the types are supposed to have, not a table drift.
 			copyTS, copyErr := parseCopyTimestampZone(in, tsZoneModeForType(typ))
-			litD, litErr := evalTypedStringLit(&planner.TypedStringLit{Type: typ, Value: in})
+			litD, litErr := evalTypedStringLit(&planner.TypedStringLit{Type: typ, Value: in}, nil)
 			if (copyErr == nil) != (litErr == nil) {
 				t.Errorf("%s %q: COPY path err=%v but literal path err=%v — the two layout tables have drifted apart again",
 					typ, in, copyErr, litErr)

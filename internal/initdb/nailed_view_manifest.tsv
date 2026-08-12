@@ -4,6 +4,156 @@
 #
 # rel  <name> <oracle_oid> <goopg_oid> <rule_oid> <oracle_reltype> <goopg_reltype> <relkind> <relnatts>
 # attr <name> <attnum> <attname> <atttypid> <attlen> <attnotnull> <attisdropped>
+rel	pg_roles	12000	12000	12003	12002	2249	v	13
+attr	pg_roles	1	rolname	19	64	f	f
+attr	pg_roles	2	rolsuper	16	1	f	f
+attr	pg_roles	3	rolinherit	16	1	f	f
+attr	pg_roles	4	rolcreaterole	16	1	f	f
+attr	pg_roles	5	rolcreatedb	16	1	f	f
+attr	pg_roles	6	rolcanlogin	16	1	f	f
+attr	pg_roles	7	rolreplication	16	1	f	f
+attr	pg_roles	8	rolconnlimit	23	4	f	f
+attr	pg_roles	9	rolpassword	25	-1	f	f
+attr	pg_roles	10	rolvaliduntil	1184	8	f	f
+attr	pg_roles	11	rolbypassrls	16	1	f	f
+attr	pg_roles	12	rolconfig	1009	-1	f	f
+attr	pg_roles	13	oid	26	4	f	f
+rel	pg_shadow	12005	12005	12008	12007	2249	v	9
+attr	pg_shadow	1	usename	19	64	f	f
+attr	pg_shadow	2	usesysid	26	4	f	f
+attr	pg_shadow	3	usecreatedb	16	1	f	f
+attr	pg_shadow	4	usesuper	16	1	f	f
+attr	pg_shadow	5	userepl	16	1	f	f
+attr	pg_shadow	6	usebypassrls	16	1	f	f
+attr	pg_shadow	7	passwd	25	-1	f	f
+attr	pg_shadow	8	valuntil	1184	8	f	f
+attr	pg_shadow	9	useconfig	1009	-1	f	f
+rel	pg_group	12010	12010	12013	12012	2249	v	3
+attr	pg_group	1	groname	19	64	f	f
+attr	pg_group	2	grosysid	26	4	f	f
+attr	pg_group	3	grolist	1028	-1	f	f
+rel	pg_user	12014	12014	12017	12016	2249	v	9
+attr	pg_user	1	usename	19	64	f	f
+attr	pg_user	2	usesysid	26	4	f	f
+attr	pg_user	3	usecreatedb	16	1	f	f
+attr	pg_user	4	usesuper	16	1	f	f
+attr	pg_user	5	userepl	16	1	f	f
+attr	pg_user	6	usebypassrls	16	1	f	f
+attr	pg_user	7	passwd	25	-1	f	f
+attr	pg_user	8	valuntil	1184	8	f	f
+attr	pg_user	9	useconfig	1009	-1	f	f
+rel	pg_policies	12018	12018	12021	12020	2249	v	8
+attr	pg_policies	1	schemaname	19	64	f	f
+attr	pg_policies	2	tablename	19	64	f	f
+attr	pg_policies	3	policyname	19	64	f	f
+attr	pg_policies	4	permissive	25	-1	f	f
+attr	pg_policies	5	roles	1003	-1	f	f
+attr	pg_policies	6	cmd	25	-1	f	f
+attr	pg_policies	7	qual	25	-1	f	f
+attr	pg_policies	8	with_check	25	-1	f	f
+rel	pg_rules	12023	12023	12026	12025	2249	v	4
+attr	pg_rules	1	schemaname	19	64	f	f
+attr	pg_rules	2	tablename	19	64	f	f
+attr	pg_rules	3	rulename	19	64	f	f
+attr	pg_rules	4	definition	25	-1	f	f
+rel	pg_views	12028	12028	12031	12030	2249	v	4
+attr	pg_views	1	schemaname	19	64	f	f
+attr	pg_views	2	viewname	19	64	f	f
+attr	pg_views	3	viewowner	19	64	f	f
+attr	pg_views	4	definition	25	-1	f	f
+rel	pg_tables	12033	12033	12036	12035	2249	v	8
+attr	pg_tables	1	schemaname	19	64	f	f
+attr	pg_tables	2	tablename	19	64	f	f
+attr	pg_tables	3	tableowner	19	64	f	f
+attr	pg_tables	4	tablespace	19	64	f	f
+attr	pg_tables	5	hasindexes	16	1	f	f
+attr	pg_tables	6	hasrules	16	1	f	f
+attr	pg_tables	7	hastriggers	16	1	f	f
+attr	pg_tables	8	rowsecurity	16	1	f	f
+rel	pg_matviews	12038	12038	12041	12040	2249	v	7
+attr	pg_matviews	1	schemaname	19	64	f	f
+attr	pg_matviews	2	matviewname	19	64	f	f
+attr	pg_matviews	3	matviewowner	19	64	f	f
+attr	pg_matviews	4	tablespace	19	64	f	f
+attr	pg_matviews	5	hasindexes	16	1	f	f
+attr	pg_matviews	6	ispopulated	16	1	f	f
+attr	pg_matviews	7	definition	25	-1	f	f
+rel	pg_indexes	12043	12043	12046	12045	2249	v	5
+attr	pg_indexes	1	schemaname	19	64	f	f
+attr	pg_indexes	2	tablename	19	64	f	f
+attr	pg_indexes	3	indexname	19	64	f	f
+attr	pg_indexes	4	tablespace	19	64	f	f
+attr	pg_indexes	5	indexdef	25	-1	f	f
+rel	pg_sequences	12048	12048	12051	12050	2249	v	11
+attr	pg_sequences	1	schemaname	19	64	f	f
+attr	pg_sequences	2	sequencename	19	64	f	f
+attr	pg_sequences	3	sequenceowner	19	64	f	f
+attr	pg_sequences	4	data_type	2206	4	f	f
+attr	pg_sequences	5	start_value	20	8	f	f
+attr	pg_sequences	6	min_value	20	8	f	f
+attr	pg_sequences	7	max_value	20	8	f	f
+attr	pg_sequences	8	increment_by	20	8	f	f
+attr	pg_sequences	9	cycle	16	1	f	f
+attr	pg_sequences	10	cache_size	20	8	f	f
+attr	pg_sequences	11	last_value	20	8	f	f
+rel	pg_stats	12053	12053	12056	12055	2249	v	17
+attr	pg_stats	1	schemaname	19	64	f	f
+attr	pg_stats	2	tablename	19	64	f	f
+attr	pg_stats	3	attname	19	64	f	f
+attr	pg_stats	4	inherited	16	1	f	f
+attr	pg_stats	5	null_frac	700	4	f	f
+attr	pg_stats	6	avg_width	23	4	f	f
+attr	pg_stats	7	n_distinct	700	4	f	f
+attr	pg_stats	8	most_common_vals	2277	-1	f	f
+attr	pg_stats	9	most_common_freqs	1021	-1	f	f
+attr	pg_stats	10	histogram_bounds	2277	-1	f	f
+attr	pg_stats	11	correlation	700	4	f	f
+attr	pg_stats	12	most_common_elems	2277	-1	f	f
+attr	pg_stats	13	most_common_elem_freqs	1021	-1	f	f
+attr	pg_stats	14	elem_count_histogram	1021	-1	f	f
+attr	pg_stats	15	range_length_histogram	2277	-1	f	f
+attr	pg_stats	16	range_empty_frac	700	4	f	f
+attr	pg_stats	17	range_bounds_histogram	2277	-1	f	f
+rel	pg_stats_ext	12058	12058	12061	12060	2249	v	15
+attr	pg_stats_ext	1	schemaname	19	64	f	f
+attr	pg_stats_ext	2	tablename	19	64	f	f
+attr	pg_stats_ext	3	statistics_schemaname	19	64	f	f
+attr	pg_stats_ext	4	statistics_name	19	64	f	f
+attr	pg_stats_ext	5	statistics_owner	19	64	f	f
+attr	pg_stats_ext	6	attnames	1003	-1	f	f
+attr	pg_stats_ext	7	exprs	1009	-1	f	f
+attr	pg_stats_ext	8	kinds	1002	-1	f	f
+attr	pg_stats_ext	9	inherited	16	1	f	f
+attr	pg_stats_ext	10	n_distinct	3361	-1	f	f
+attr	pg_stats_ext	11	dependencies	3402	-1	f	f
+attr	pg_stats_ext	12	most_common_vals	1009	-1	f	f
+attr	pg_stats_ext	13	most_common_val_nulls	1000	-1	f	f
+attr	pg_stats_ext	14	most_common_freqs	1022	-1	f	f
+attr	pg_stats_ext	15	most_common_base_freqs	1022	-1	f	f
+rel	pg_stats_ext_exprs	12063	12063	12066	12065	2249	v	17
+attr	pg_stats_ext_exprs	1	schemaname	19	64	f	f
+attr	pg_stats_ext_exprs	2	tablename	19	64	f	f
+attr	pg_stats_ext_exprs	3	statistics_schemaname	19	64	f	f
+attr	pg_stats_ext_exprs	4	statistics_name	19	64	f	f
+attr	pg_stats_ext_exprs	5	statistics_owner	19	64	f	f
+attr	pg_stats_ext_exprs	6	expr	25	-1	f	f
+attr	pg_stats_ext_exprs	7	inherited	16	1	f	f
+attr	pg_stats_ext_exprs	8	null_frac	700	4	f	f
+attr	pg_stats_ext_exprs	9	avg_width	23	4	f	f
+attr	pg_stats_ext_exprs	10	n_distinct	700	4	f	f
+attr	pg_stats_ext_exprs	11	most_common_vals	2277	-1	f	f
+attr	pg_stats_ext_exprs	12	most_common_freqs	1021	-1	f	f
+attr	pg_stats_ext_exprs	13	histogram_bounds	2277	-1	f	f
+attr	pg_stats_ext_exprs	14	correlation	700	4	f	f
+attr	pg_stats_ext_exprs	15	most_common_elems	2277	-1	f	f
+attr	pg_stats_ext_exprs	16	most_common_elem_freqs	1021	-1	f	f
+attr	pg_stats_ext_exprs	17	elem_count_histogram	1021	-1	f	f
+rel	pg_publication_tables	12068	12068	12071	12070	2249	v	5
+attr	pg_publication_tables	1	pubname	19	64	f	f
+attr	pg_publication_tables	2	schemaname	19	64	f	f
+attr	pg_publication_tables	3	tablename	19	64	f	f
+attr	pg_publication_tables	4	attnames	1003	-1	f	f
+attr	pg_publication_tables	5	rowfilter	25	-1	f	f
 rel	pg_locks	12073	12073	12076	12075	2249	v	16
 attr	pg_locks	1	locktype	25	-1	f	f
 attr	pg_locks	2	database	26	4	f	f
@@ -28,6 +178,27 @@ attr	pg_cursors	3	is_holdable	16	1	f	f
 attr	pg_cursors	4	is_binary	16	1	f	f
 attr	pg_cursors	5	is_scrollable	16	1	f	f
 attr	pg_cursors	6	creation_time	1184	8	f	f
+rel	pg_available_extensions	12081	12081	12084	12083	2249	v	4
+attr	pg_available_extensions	1	name	19	64	f	f
+attr	pg_available_extensions	2	default_version	25	-1	f	f
+attr	pg_available_extensions	3	installed_version	25	-1	f	f
+attr	pg_available_extensions	4	comment	25	-1	f	f
+rel	pg_available_extension_versions	12085	12085	12088	12087	2249	v	9
+attr	pg_available_extension_versions	1	name	19	64	f	f
+attr	pg_available_extension_versions	2	version	25	-1	f	f
+attr	pg_available_extension_versions	3	installed	16	1	f	f
+attr	pg_available_extension_versions	4	superuser	16	1	f	f
+attr	pg_available_extension_versions	5	trusted	16	1	f	f
+attr	pg_available_extension_versions	6	relocatable	16	1	f	f
+attr	pg_available_extension_versions	7	schema	19	64	f	f
+attr	pg_available_extension_versions	8	requires	1003	-1	f	f
+attr	pg_available_extension_versions	9	comment	25	-1	f	f
+rel	pg_prepared_xacts	12090	12090	12093	12092	2249	v	5
+attr	pg_prepared_xacts	1	transaction	28	4	f	f
+attr	pg_prepared_xacts	2	gid	25	-1	f	f
+attr	pg_prepared_xacts	3	prepared	1184	8	f	f
+attr	pg_prepared_xacts	4	owner	19	64	f	f
+attr	pg_prepared_xacts	5	database	19	64	f	f
 rel	pg_prepared_statements	12095	12095	12098	12097	2249	v	8
 attr	pg_prepared_statements	1	name	25	-1	f	f
 attr	pg_prepared_statements	2	statement	25	-1	f	f
@@ -37,6 +208,15 @@ attr	pg_prepared_statements	5	result_types	2211	-1	f	f
 attr	pg_prepared_statements	6	from_sql	16	1	f	f
 attr	pg_prepared_statements	7	generic_plans	20	8	f	f
 attr	pg_prepared_statements	8	custom_plans	20	8	f	f
+rel	pg_seclabels	12099	12099	12102	12101	2249	v	8
+attr	pg_seclabels	1	objoid	26	4	f	f
+attr	pg_seclabels	2	classoid	26	4	f	f
+attr	pg_seclabels	3	objsubid	23	4	f	f
+attr	pg_seclabels	4	objtype	25	-1	f	f
+attr	pg_seclabels	5	objnamespace	26	4	f	f
+attr	pg_seclabels	6	objname	25	-1	f	f
+attr	pg_seclabels	7	provider	25	-1	f	f
+attr	pg_seclabels	8	label	25	-1	f	f
 rel	pg_settings	12104	12104	12107	12106	2249	v	17
 attr	pg_settings	1	name	25	-1	f	f
 attr	pg_settings	2	setting	25	-1	f	f
@@ -83,6 +263,10 @@ attr	pg_ident_file_mappings	4	map_name	25	-1	f	f
 attr	pg_ident_file_mappings	5	sys_name	25	-1	f	f
 attr	pg_ident_file_mappings	6	pg_username	25	-1	f	f
 attr	pg_ident_file_mappings	7	error	25	-1	f	f
+rel	pg_timezone_abbrevs	12122	12122	12125	12124	2249	v	3
+attr	pg_timezone_abbrevs	1	abbrev	25	-1	f	f
+attr	pg_timezone_abbrevs	2	utc_offset	1186	16	f	f
+attr	pg_timezone_abbrevs	3	is_dst	16	1	f	f
 rel	pg_timezone_names	12126	12126	12129	12128	2249	v	4
 attr	pg_timezone_names	1	name	25	-1	f	f
 attr	pg_timezone_names	2	abbrev	25	-1	f	f
@@ -111,6 +295,269 @@ attr	pg_backend_memory_contexts	7	total_nblocks	20	8	f	f
 attr	pg_backend_memory_contexts	8	free_bytes	20	8	f	f
 attr	pg_backend_memory_contexts	9	free_chunks	20	8	f	f
 attr	pg_backend_memory_contexts	10	used_bytes	20	8	f	f
+rel	pg_stat_all_tables	12146	12146	12149	12148	2249	v	30
+attr	pg_stat_all_tables	1	relid	26	4	f	f
+attr	pg_stat_all_tables	2	schemaname	19	64	f	f
+attr	pg_stat_all_tables	3	relname	19	64	f	f
+attr	pg_stat_all_tables	4	seq_scan	20	8	f	f
+attr	pg_stat_all_tables	5	last_seq_scan	1184	8	f	f
+attr	pg_stat_all_tables	6	seq_tup_read	20	8	f	f
+attr	pg_stat_all_tables	7	idx_scan	20	8	f	f
+attr	pg_stat_all_tables	8	last_idx_scan	1184	8	f	f
+attr	pg_stat_all_tables	9	idx_tup_fetch	20	8	f	f
+attr	pg_stat_all_tables	10	n_tup_ins	20	8	f	f
+attr	pg_stat_all_tables	11	n_tup_upd	20	8	f	f
+attr	pg_stat_all_tables	12	n_tup_del	20	8	f	f
+attr	pg_stat_all_tables	13	n_tup_hot_upd	20	8	f	f
+attr	pg_stat_all_tables	14	n_tup_newpage_upd	20	8	f	f
+attr	pg_stat_all_tables	15	n_live_tup	20	8	f	f
+attr	pg_stat_all_tables	16	n_dead_tup	20	8	f	f
+attr	pg_stat_all_tables	17	n_mod_since_analyze	20	8	f	f
+attr	pg_stat_all_tables	18	n_ins_since_vacuum	20	8	f	f
+attr	pg_stat_all_tables	19	last_vacuum	1184	8	f	f
+attr	pg_stat_all_tables	20	last_autovacuum	1184	8	f	f
+attr	pg_stat_all_tables	21	last_analyze	1184	8	f	f
+attr	pg_stat_all_tables	22	last_autoanalyze	1184	8	f	f
+attr	pg_stat_all_tables	23	vacuum_count	20	8	f	f
+attr	pg_stat_all_tables	24	autovacuum_count	20	8	f	f
+attr	pg_stat_all_tables	25	analyze_count	20	8	f	f
+attr	pg_stat_all_tables	26	autoanalyze_count	20	8	f	f
+attr	pg_stat_all_tables	27	total_vacuum_time	701	8	f	f
+attr	pg_stat_all_tables	28	total_autovacuum_time	701	8	f	f
+attr	pg_stat_all_tables	29	total_analyze_time	701	8	f	f
+attr	pg_stat_all_tables	30	total_autoanalyze_time	701	8	f	f
+rel	pg_stat_xact_all_tables	12151	12151	12154	12153	2249	v	12
+attr	pg_stat_xact_all_tables	1	relid	26	4	f	f
+attr	pg_stat_xact_all_tables	2	schemaname	19	64	f	f
+attr	pg_stat_xact_all_tables	3	relname	19	64	f	f
+attr	pg_stat_xact_all_tables	4	seq_scan	20	8	f	f
+attr	pg_stat_xact_all_tables	5	seq_tup_read	20	8	f	f
+attr	pg_stat_xact_all_tables	6	idx_scan	20	8	f	f
+attr	pg_stat_xact_all_tables	7	idx_tup_fetch	20	8	f	f
+attr	pg_stat_xact_all_tables	8	n_tup_ins	20	8	f	f
+attr	pg_stat_xact_all_tables	9	n_tup_upd	20	8	f	f
+attr	pg_stat_xact_all_tables	10	n_tup_del	20	8	f	f
+attr	pg_stat_xact_all_tables	11	n_tup_hot_upd	20	8	f	f
+attr	pg_stat_xact_all_tables	12	n_tup_newpage_upd	20	8	f	f
+rel	pg_stat_sys_tables	12156	12156	12159	12158	2249	v	30
+attr	pg_stat_sys_tables	1	relid	26	4	f	f
+attr	pg_stat_sys_tables	2	schemaname	19	64	f	f
+attr	pg_stat_sys_tables	3	relname	19	64	f	f
+attr	pg_stat_sys_tables	4	seq_scan	20	8	f	f
+attr	pg_stat_sys_tables	5	last_seq_scan	1184	8	f	f
+attr	pg_stat_sys_tables	6	seq_tup_read	20	8	f	f
+attr	pg_stat_sys_tables	7	idx_scan	20	8	f	f
+attr	pg_stat_sys_tables	8	last_idx_scan	1184	8	f	f
+attr	pg_stat_sys_tables	9	idx_tup_fetch	20	8	f	f
+attr	pg_stat_sys_tables	10	n_tup_ins	20	8	f	f
+attr	pg_stat_sys_tables	11	n_tup_upd	20	8	f	f
+attr	pg_stat_sys_tables	12	n_tup_del	20	8	f	f
+attr	pg_stat_sys_tables	13	n_tup_hot_upd	20	8	f	f
+attr	pg_stat_sys_tables	14	n_tup_newpage_upd	20	8	f	f
+attr	pg_stat_sys_tables	15	n_live_tup	20	8	f	f
+attr	pg_stat_sys_tables	16	n_dead_tup	20	8	f	f
+attr	pg_stat_sys_tables	17	n_mod_since_analyze	20	8	f	f
+attr	pg_stat_sys_tables	18	n_ins_since_vacuum	20	8	f	f
+attr	pg_stat_sys_tables	19	last_vacuum	1184	8	f	f
+attr	pg_stat_sys_tables	20	last_autovacuum	1184	8	f	f
+attr	pg_stat_sys_tables	21	last_analyze	1184	8	f	f
+attr	pg_stat_sys_tables	22	last_autoanalyze	1184	8	f	f
+attr	pg_stat_sys_tables	23	vacuum_count	20	8	f	f
+attr	pg_stat_sys_tables	24	autovacuum_count	20	8	f	f
+attr	pg_stat_sys_tables	25	analyze_count	20	8	f	f
+attr	pg_stat_sys_tables	26	autoanalyze_count	20	8	f	f
+attr	pg_stat_sys_tables	27	total_vacuum_time	701	8	f	f
+attr	pg_stat_sys_tables	28	total_autovacuum_time	701	8	f	f
+attr	pg_stat_sys_tables	29	total_analyze_time	701	8	f	f
+attr	pg_stat_sys_tables	30	total_autoanalyze_time	701	8	f	f
+rel	pg_stat_xact_sys_tables	12161	12161	12164	12163	2249	v	12
+attr	pg_stat_xact_sys_tables	1	relid	26	4	f	f
+attr	pg_stat_xact_sys_tables	2	schemaname	19	64	f	f
+attr	pg_stat_xact_sys_tables	3	relname	19	64	f	f
+attr	pg_stat_xact_sys_tables	4	seq_scan	20	8	f	f
+attr	pg_stat_xact_sys_tables	5	seq_tup_read	20	8	f	f
+attr	pg_stat_xact_sys_tables	6	idx_scan	20	8	f	f
+attr	pg_stat_xact_sys_tables	7	idx_tup_fetch	20	8	f	f
+attr	pg_stat_xact_sys_tables	8	n_tup_ins	20	8	f	f
+attr	pg_stat_xact_sys_tables	9	n_tup_upd	20	8	f	f
+attr	pg_stat_xact_sys_tables	10	n_tup_del	20	8	f	f
+attr	pg_stat_xact_sys_tables	11	n_tup_hot_upd	20	8	f	f
+attr	pg_stat_xact_sys_tables	12	n_tup_newpage_upd	20	8	f	f
+rel	pg_stat_user_tables	12165	12165	12168	12167	2249	v	30
+attr	pg_stat_user_tables	1	relid	26	4	f	f
+attr	pg_stat_user_tables	2	schemaname	19	64	f	f
+attr	pg_stat_user_tables	3	relname	19	64	f	f
+attr	pg_stat_user_tables	4	seq_scan	20	8	f	f
+attr	pg_stat_user_tables	5	last_seq_scan	1184	8	f	f
+attr	pg_stat_user_tables	6	seq_tup_read	20	8	f	f
+attr	pg_stat_user_tables	7	idx_scan	20	8	f	f
+attr	pg_stat_user_tables	8	last_idx_scan	1184	8	f	f
+attr	pg_stat_user_tables	9	idx_tup_fetch	20	8	f	f
+attr	pg_stat_user_tables	10	n_tup_ins	20	8	f	f
+attr	pg_stat_user_tables	11	n_tup_upd	20	8	f	f
+attr	pg_stat_user_tables	12	n_tup_del	20	8	f	f
+attr	pg_stat_user_tables	13	n_tup_hot_upd	20	8	f	f
+attr	pg_stat_user_tables	14	n_tup_newpage_upd	20	8	f	f
+attr	pg_stat_user_tables	15	n_live_tup	20	8	f	f
+attr	pg_stat_user_tables	16	n_dead_tup	20	8	f	f
+attr	pg_stat_user_tables	17	n_mod_since_analyze	20	8	f	f
+attr	pg_stat_user_tables	18	n_ins_since_vacuum	20	8	f	f
+attr	pg_stat_user_tables	19	last_vacuum	1184	8	f	f
+attr	pg_stat_user_tables	20	last_autovacuum	1184	8	f	f
+attr	pg_stat_user_tables	21	last_analyze	1184	8	f	f
+attr	pg_stat_user_tables	22	last_autoanalyze	1184	8	f	f
+attr	pg_stat_user_tables	23	vacuum_count	20	8	f	f
+attr	pg_stat_user_tables	24	autovacuum_count	20	8	f	f
+attr	pg_stat_user_tables	25	analyze_count	20	8	f	f
+attr	pg_stat_user_tables	26	autoanalyze_count	20	8	f	f
+attr	pg_stat_user_tables	27	total_vacuum_time	701	8	f	f
+attr	pg_stat_user_tables	28	total_autovacuum_time	701	8	f	f
+attr	pg_stat_user_tables	29	total_analyze_time	701	8	f	f
+attr	pg_stat_user_tables	30	total_autoanalyze_time	701	8	f	f
+rel	pg_stat_xact_user_tables	12170	12170	12173	12172	2249	v	12
+attr	pg_stat_xact_user_tables	1	relid	26	4	f	f
+attr	pg_stat_xact_user_tables	2	schemaname	19	64	f	f
+attr	pg_stat_xact_user_tables	3	relname	19	64	f	f
+attr	pg_stat_xact_user_tables	4	seq_scan	20	8	f	f
+attr	pg_stat_xact_user_tables	5	seq_tup_read	20	8	f	f
+attr	pg_stat_xact_user_tables	6	idx_scan	20	8	f	f
+attr	pg_stat_xact_user_tables	7	idx_tup_fetch	20	8	f	f
+attr	pg_stat_xact_user_tables	8	n_tup_ins	20	8	f	f
+attr	pg_stat_xact_user_tables	9	n_tup_upd	20	8	f	f
+attr	pg_stat_xact_user_tables	10	n_tup_del	20	8	f	f
+attr	pg_stat_xact_user_tables	11	n_tup_hot_upd	20	8	f	f
+attr	pg_stat_xact_user_tables	12	n_tup_newpage_upd	20	8	f	f
+rel	pg_statio_all_tables	12174	12174	12177	12176	2249	v	11
+attr	pg_statio_all_tables	1	relid	26	4	f	f
+attr	pg_statio_all_tables	2	schemaname	19	64	f	f
+attr	pg_statio_all_tables	3	relname	19	64	f	f
+attr	pg_statio_all_tables	4	heap_blks_read	20	8	f	f
+attr	pg_statio_all_tables	5	heap_blks_hit	20	8	f	f
+attr	pg_statio_all_tables	6	idx_blks_read	20	8	f	f
+attr	pg_statio_all_tables	7	idx_blks_hit	20	8	f	f
+attr	pg_statio_all_tables	8	toast_blks_read	20	8	f	f
+attr	pg_statio_all_tables	9	toast_blks_hit	20	8	f	f
+attr	pg_statio_all_tables	10	tidx_blks_read	20	8	f	f
+attr	pg_statio_all_tables	11	tidx_blks_hit	20	8	f	f
+rel	pg_statio_sys_tables	12179	12179	12182	12181	2249	v	11
+attr	pg_statio_sys_tables	1	relid	26	4	f	f
+attr	pg_statio_sys_tables	2	schemaname	19	64	f	f
+attr	pg_statio_sys_tables	3	relname	19	64	f	f
+attr	pg_statio_sys_tables	4	heap_blks_read	20	8	f	f
+attr	pg_statio_sys_tables	5	heap_blks_hit	20	8	f	f
+attr	pg_statio_sys_tables	6	idx_blks_read	20	8	f	f
+attr	pg_statio_sys_tables	7	idx_blks_hit	20	8	f	f
+attr	pg_statio_sys_tables	8	toast_blks_read	20	8	f	f
+attr	pg_statio_sys_tables	9	toast_blks_hit	20	8	f	f
+attr	pg_statio_sys_tables	10	tidx_blks_read	20	8	f	f
+attr	pg_statio_sys_tables	11	tidx_blks_hit	20	8	f	f
+rel	pg_statio_user_tables	12183	12183	12186	12185	2249	v	11
+attr	pg_statio_user_tables	1	relid	26	4	f	f
+attr	pg_statio_user_tables	2	schemaname	19	64	f	f
+attr	pg_statio_user_tables	3	relname	19	64	f	f
+attr	pg_statio_user_tables	4	heap_blks_read	20	8	f	f
+attr	pg_statio_user_tables	5	heap_blks_hit	20	8	f	f
+attr	pg_statio_user_tables	6	idx_blks_read	20	8	f	f
+attr	pg_statio_user_tables	7	idx_blks_hit	20	8	f	f
+attr	pg_statio_user_tables	8	toast_blks_read	20	8	f	f
+attr	pg_statio_user_tables	9	toast_blks_hit	20	8	f	f
+attr	pg_statio_user_tables	10	tidx_blks_read	20	8	f	f
+attr	pg_statio_user_tables	11	tidx_blks_hit	20	8	f	f
+rel	pg_stat_all_indexes	12187	12187	12190	12189	2249	v	9
+attr	pg_stat_all_indexes	1	relid	26	4	f	f
+attr	pg_stat_all_indexes	2	indexrelid	26	4	f	f
+attr	pg_stat_all_indexes	3	schemaname	19	64	f	f
+attr	pg_stat_all_indexes	4	relname	19	64	f	f
+attr	pg_stat_all_indexes	5	indexrelname	19	64	f	f
+attr	pg_stat_all_indexes	6	idx_scan	20	8	f	f
+attr	pg_stat_all_indexes	7	last_idx_scan	1184	8	f	f
+attr	pg_stat_all_indexes	8	idx_tup_read	20	8	f	f
+attr	pg_stat_all_indexes	9	idx_tup_fetch	20	8	f	f
+rel	pg_statio_all_indexes	12200	12200	12203	12202	2249	v	7
+attr	pg_statio_all_indexes	1	relid	26	4	f	f
+attr	pg_statio_all_indexes	2	indexrelid	26	4	f	f
+attr	pg_statio_all_indexes	3	schemaname	19	64	f	f
+attr	pg_statio_all_indexes	4	relname	19	64	f	f
+attr	pg_statio_all_indexes	5	indexrelname	19	64	f	f
+attr	pg_statio_all_indexes	6	idx_blks_read	20	8	f	f
+attr	pg_statio_all_indexes	7	idx_blks_hit	20	8	f	f
+rel	pg_statio_all_sequences	12213	12213	12216	12215	2249	v	5
+attr	pg_statio_all_sequences	1	relid	26	4	f	f
+attr	pg_statio_all_sequences	2	schemaname	19	64	f	f
+attr	pg_statio_all_sequences	3	relname	19	64	f	f
+attr	pg_statio_all_sequences	4	blks_read	20	8	f	f
+attr	pg_statio_all_sequences	5	blks_hit	20	8	f	f
+rel	pg_stat_sys_indexes	12192	12192	12195	12194	2249	v	9
+attr	pg_stat_sys_indexes	1	relid	26	4	f	f
+attr	pg_stat_sys_indexes	2	indexrelid	26	4	f	f
+attr	pg_stat_sys_indexes	3	schemaname	19	64	f	f
+attr	pg_stat_sys_indexes	4	relname	19	64	f	f
+attr	pg_stat_sys_indexes	5	indexrelname	19	64	f	f
+attr	pg_stat_sys_indexes	6	idx_scan	20	8	f	f
+attr	pg_stat_sys_indexes	7	last_idx_scan	1184	8	f	f
+attr	pg_stat_sys_indexes	8	idx_tup_read	20	8	f	f
+attr	pg_stat_sys_indexes	9	idx_tup_fetch	20	8	f	f
+rel	pg_stat_user_indexes	12196	12196	12199	12198	2249	v	9
+attr	pg_stat_user_indexes	1	relid	26	4	f	f
+attr	pg_stat_user_indexes	2	indexrelid	26	4	f	f
+attr	pg_stat_user_indexes	3	schemaname	19	64	f	f
+attr	pg_stat_user_indexes	4	relname	19	64	f	f
+attr	pg_stat_user_indexes	5	indexrelname	19	64	f	f
+attr	pg_stat_user_indexes	6	idx_scan	20	8	f	f
+attr	pg_stat_user_indexes	7	last_idx_scan	1184	8	f	f
+attr	pg_stat_user_indexes	8	idx_tup_read	20	8	f	f
+attr	pg_stat_user_indexes	9	idx_tup_fetch	20	8	f	f
+rel	pg_statio_sys_indexes	12205	12205	12208	12207	2249	v	7
+attr	pg_statio_sys_indexes	1	relid	26	4	f	f
+attr	pg_statio_sys_indexes	2	indexrelid	26	4	f	f
+attr	pg_statio_sys_indexes	3	schemaname	19	64	f	f
+attr	pg_statio_sys_indexes	4	relname	19	64	f	f
+attr	pg_statio_sys_indexes	5	indexrelname	19	64	f	f
+attr	pg_statio_sys_indexes	6	idx_blks_read	20	8	f	f
+attr	pg_statio_sys_indexes	7	idx_blks_hit	20	8	f	f
+rel	pg_statio_user_indexes	12209	12209	12212	12211	2249	v	7
+attr	pg_statio_user_indexes	1	relid	26	4	f	f
+attr	pg_statio_user_indexes	2	indexrelid	26	4	f	f
+attr	pg_statio_user_indexes	3	schemaname	19	64	f	f
+attr	pg_statio_user_indexes	4	relname	19	64	f	f
+attr	pg_statio_user_indexes	5	indexrelname	19	64	f	f
+attr	pg_statio_user_indexes	6	idx_blks_read	20	8	f	f
+attr	pg_statio_user_indexes	7	idx_blks_hit	20	8	f	f
+rel	pg_statio_sys_sequences	12218	12218	12221	12220	2249	v	5
+attr	pg_statio_sys_sequences	1	relid	26	4	f	f
+attr	pg_statio_sys_sequences	2	schemaname	19	64	f	f
+attr	pg_statio_sys_sequences	3	relname	19	64	f	f
+attr	pg_statio_sys_sequences	4	blks_read	20	8	f	f
+attr	pg_statio_sys_sequences	5	blks_hit	20	8	f	f
+rel	pg_statio_user_sequences	12222	12222	12225	12224	2249	v	5
+attr	pg_statio_user_sequences	1	relid	26	4	f	f
+attr	pg_statio_user_sequences	2	schemaname	19	64	f	f
+attr	pg_statio_user_sequences	3	relname	19	64	f	f
+attr	pg_statio_user_sequences	4	blks_read	20	8	f	f
+attr	pg_statio_user_sequences	5	blks_hit	20	8	f	f
+rel	pg_stat_activity	12226	12226	12229	12228	2249	v	22
+attr	pg_stat_activity	1	datid	26	4	f	f
+attr	pg_stat_activity	2	datname	19	64	f	f
+attr	pg_stat_activity	3	pid	23	4	f	f
+attr	pg_stat_activity	4	leader_pid	23	4	f	f
+attr	pg_stat_activity	5	usesysid	26	4	f	f
+attr	pg_stat_activity	6	usename	19	64	f	f
+attr	pg_stat_activity	7	application_name	25	-1	f	f
+attr	pg_stat_activity	8	client_addr	869	-1	f	f
+attr	pg_stat_activity	9	client_hostname	25	-1	f	f
+attr	pg_stat_activity	10	client_port	23	4	f	f
+attr	pg_stat_activity	11	backend_start	1184	8	f	f
+attr	pg_stat_activity	12	xact_start	1184	8	f	f
+attr	pg_stat_activity	13	query_start	1184	8	f	f
+attr	pg_stat_activity	14	state_change	1184	8	f	f
+attr	pg_stat_activity	15	wait_event_type	25	-1	f	f
+attr	pg_stat_activity	16	wait_event	25	-1	f	f
+attr	pg_stat_activity	17	state	25	-1	f	f
+attr	pg_stat_activity	18	backend_xid	28	4	f	f
+attr	pg_stat_activity	19	backend_xmin	28	4	f	f
+attr	pg_stat_activity	20	query_id	20	8	f	f
+attr	pg_stat_activity	21	query	25	-1	f	f
+attr	pg_stat_activity	22	backend_type	25	-1	f	f
 rel	pg_stat_replication	12231	12231	12234	12233	2249	v	20
 attr	pg_stat_replication	1	pid	23	4	f	f
 attr	pg_stat_replication	2	usesysid	26	4	f	f
@@ -229,6 +676,60 @@ attr	pg_stat_replication_slots	7	stream_bytes	20	8	f	f
 attr	pg_stat_replication_slots	8	total_txns	20	8	f	f
 attr	pg_stat_replication_slots	9	total_bytes	20	8	f	f
 attr	pg_stat_replication_slots	10	stats_reset	1184	8	f	f
+rel	pg_stat_database	12270	12270	12273	12272	2249	v	30
+attr	pg_stat_database	1	datid	26	4	f	f
+attr	pg_stat_database	2	datname	19	64	f	f
+attr	pg_stat_database	3	numbackends	23	4	f	f
+attr	pg_stat_database	4	xact_commit	20	8	f	f
+attr	pg_stat_database	5	xact_rollback	20	8	f	f
+attr	pg_stat_database	6	blks_read	20	8	f	f
+attr	pg_stat_database	7	blks_hit	20	8	f	f
+attr	pg_stat_database	8	tup_returned	20	8	f	f
+attr	pg_stat_database	9	tup_fetched	20	8	f	f
+attr	pg_stat_database	10	tup_inserted	20	8	f	f
+attr	pg_stat_database	11	tup_updated	20	8	f	f
+attr	pg_stat_database	12	tup_deleted	20	8	f	f
+attr	pg_stat_database	13	conflicts	20	8	f	f
+attr	pg_stat_database	14	temp_files	20	8	f	f
+attr	pg_stat_database	15	temp_bytes	20	8	f	f
+attr	pg_stat_database	16	deadlocks	20	8	f	f
+attr	pg_stat_database	17	checksum_failures	20	8	f	f
+attr	pg_stat_database	18	checksum_last_failure	1184	8	f	f
+attr	pg_stat_database	19	blk_read_time	701	8	f	f
+attr	pg_stat_database	20	blk_write_time	701	8	f	f
+attr	pg_stat_database	21	session_time	701	8	f	f
+attr	pg_stat_database	22	active_time	701	8	f	f
+attr	pg_stat_database	23	idle_in_transaction_time	701	8	f	f
+attr	pg_stat_database	24	sessions	20	8	f	f
+attr	pg_stat_database	25	sessions_abandoned	20	8	f	f
+attr	pg_stat_database	26	sessions_fatal	20	8	f	f
+attr	pg_stat_database	27	sessions_killed	20	8	f	f
+attr	pg_stat_database	28	parallel_workers_to_launch	20	8	f	f
+attr	pg_stat_database	29	parallel_workers_launched	20	8	f	f
+attr	pg_stat_database	30	stats_reset	1184	8	f	f
+rel	pg_stat_database_conflicts	12275	12275	12278	12277	2249	v	8
+attr	pg_stat_database_conflicts	1	datid	26	4	f	f
+attr	pg_stat_database_conflicts	2	datname	19	64	f	f
+attr	pg_stat_database_conflicts	3	confl_tablespace	20	8	f	f
+attr	pg_stat_database_conflicts	4	confl_lock	20	8	f	f
+attr	pg_stat_database_conflicts	5	confl_snapshot	20	8	f	f
+attr	pg_stat_database_conflicts	6	confl_bufferpin	20	8	f	f
+attr	pg_stat_database_conflicts	7	confl_deadlock	20	8	f	f
+attr	pg_stat_database_conflicts	8	confl_active_logicalslot	20	8	f	f
+rel	pg_stat_user_functions	12279	12279	12282	12281	2249	v	6
+attr	pg_stat_user_functions	1	funcid	26	4	f	f
+attr	pg_stat_user_functions	2	schemaname	19	64	f	f
+attr	pg_stat_user_functions	3	funcname	19	64	f	f
+attr	pg_stat_user_functions	4	calls	20	8	f	f
+attr	pg_stat_user_functions	5	total_time	701	8	f	f
+attr	pg_stat_user_functions	6	self_time	701	8	f	f
+rel	pg_stat_xact_user_functions	12284	12284	12287	12286	2249	v	6
+attr	pg_stat_xact_user_functions	1	funcid	26	4	f	f
+attr	pg_stat_xact_user_functions	2	schemaname	19	64	f	f
+attr	pg_stat_xact_user_functions	3	funcname	19	64	f	f
+attr	pg_stat_xact_user_functions	4	calls	20	8	f	f
+attr	pg_stat_xact_user_functions	5	total_time	701	8	f	f
+attr	pg_stat_xact_user_functions	6	self_time	701	8	f	f
 rel	pg_stat_archiver	12289	12289	12292	12291	2249	v	7
 attr	pg_stat_archiver	1	archived_count	20	8	f	f
 attr	pg_stat_archiver	2	last_archived_wal	25	-1	f	f
@@ -281,6 +782,66 @@ attr	pg_stat_wal	2	wal_fpi	20	8	f	f
 attr	pg_stat_wal	3	wal_bytes	1700	-1	f	f
 attr	pg_stat_wal	4	wal_buffers_full	20	8	f	f
 attr	pg_stat_wal	5	stats_reset	1184	8	f	f
+rel	pg_stat_progress_analyze	12309	12309	12312	12311	2249	v	13
+attr	pg_stat_progress_analyze	1	pid	23	4	f	f
+attr	pg_stat_progress_analyze	2	datid	26	4	f	f
+attr	pg_stat_progress_analyze	3	datname	19	64	f	f
+attr	pg_stat_progress_analyze	4	relid	26	4	f	f
+attr	pg_stat_progress_analyze	5	phase	25	-1	f	f
+attr	pg_stat_progress_analyze	6	sample_blks_total	20	8	f	f
+attr	pg_stat_progress_analyze	7	sample_blks_scanned	20	8	f	f
+attr	pg_stat_progress_analyze	8	ext_stats_total	20	8	f	f
+attr	pg_stat_progress_analyze	9	ext_stats_computed	20	8	f	f
+attr	pg_stat_progress_analyze	10	child_tables_total	20	8	f	f
+attr	pg_stat_progress_analyze	11	child_tables_done	20	8	f	f
+attr	pg_stat_progress_analyze	12	current_child_table_relid	26	4	f	f
+attr	pg_stat_progress_analyze	13	delay_time	701	8	f	f
+rel	pg_stat_progress_vacuum	12314	12314	12317	12316	2249	v	15
+attr	pg_stat_progress_vacuum	1	pid	23	4	f	f
+attr	pg_stat_progress_vacuum	2	datid	26	4	f	f
+attr	pg_stat_progress_vacuum	3	datname	19	64	f	f
+attr	pg_stat_progress_vacuum	4	relid	26	4	f	f
+attr	pg_stat_progress_vacuum	5	phase	25	-1	f	f
+attr	pg_stat_progress_vacuum	6	heap_blks_total	20	8	f	f
+attr	pg_stat_progress_vacuum	7	heap_blks_scanned	20	8	f	f
+attr	pg_stat_progress_vacuum	8	heap_blks_vacuumed	20	8	f	f
+attr	pg_stat_progress_vacuum	9	index_vacuum_count	20	8	f	f
+attr	pg_stat_progress_vacuum	10	max_dead_tuple_bytes	20	8	f	f
+attr	pg_stat_progress_vacuum	11	dead_tuple_bytes	20	8	f	f
+attr	pg_stat_progress_vacuum	12	num_dead_item_ids	20	8	f	f
+attr	pg_stat_progress_vacuum	13	indexes_total	20	8	f	f
+attr	pg_stat_progress_vacuum	14	indexes_processed	20	8	f	f
+attr	pg_stat_progress_vacuum	15	delay_time	701	8	f	f
+rel	pg_stat_progress_cluster	12319	12319	12322	12321	2249	v	12
+attr	pg_stat_progress_cluster	1	pid	23	4	f	f
+attr	pg_stat_progress_cluster	2	datid	26	4	f	f
+attr	pg_stat_progress_cluster	3	datname	19	64	f	f
+attr	pg_stat_progress_cluster	4	relid	26	4	f	f
+attr	pg_stat_progress_cluster	5	command	25	-1	f	f
+attr	pg_stat_progress_cluster	6	phase	25	-1	f	f
+attr	pg_stat_progress_cluster	7	cluster_index_relid	26	4	f	f
+attr	pg_stat_progress_cluster	8	heap_tuples_scanned	20	8	f	f
+attr	pg_stat_progress_cluster	9	heap_tuples_written	20	8	f	f
+attr	pg_stat_progress_cluster	10	heap_blks_total	20	8	f	f
+attr	pg_stat_progress_cluster	11	heap_blks_scanned	20	8	f	f
+attr	pg_stat_progress_cluster	12	index_rebuild_count	20	8	f	f
+rel	pg_stat_progress_create_index	12324	12324	12327	12326	2249	v	16
+attr	pg_stat_progress_create_index	1	pid	23	4	f	f
+attr	pg_stat_progress_create_index	2	datid	26	4	f	f
+attr	pg_stat_progress_create_index	3	datname	19	64	f	f
+attr	pg_stat_progress_create_index	4	relid	26	4	f	f
+attr	pg_stat_progress_create_index	5	index_relid	26	4	f	f
+attr	pg_stat_progress_create_index	6	command	25	-1	f	f
+attr	pg_stat_progress_create_index	7	phase	25	-1	f	f
+attr	pg_stat_progress_create_index	8	lockers_total	20	8	f	f
+attr	pg_stat_progress_create_index	9	lockers_done	20	8	f	f
+attr	pg_stat_progress_create_index	10	current_locker_pid	20	8	f	f
+attr	pg_stat_progress_create_index	11	blocks_total	20	8	f	f
+attr	pg_stat_progress_create_index	12	blocks_done	20	8	f	f
+attr	pg_stat_progress_create_index	13	tuples_total	20	8	f	f
+attr	pg_stat_progress_create_index	14	tuples_done	20	8	f	f
+attr	pg_stat_progress_create_index	15	partitions_total	20	8	f	f
+attr	pg_stat_progress_create_index	16	partitions_done	20	8	f	f
 rel	pg_stat_progress_basebackup	12329	12329	12332	12331	2249	v	6
 attr	pg_stat_progress_basebackup	1	pid	23	4	f	f
 attr	pg_stat_progress_basebackup	2	phase	25	-1	f	f
@@ -288,11 +849,43 @@ attr	pg_stat_progress_basebackup	3	backup_total	20	8	f	f
 attr	pg_stat_progress_basebackup	4	backup_streamed	20	8	f	f
 attr	pg_stat_progress_basebackup	5	tablespaces_total	20	8	f	f
 attr	pg_stat_progress_basebackup	6	tablespaces_streamed	20	8	f	f
+rel	pg_stat_progress_copy	12333	12333	12336	12335	2249	v	11
+attr	pg_stat_progress_copy	1	pid	23	4	f	f
+attr	pg_stat_progress_copy	2	datid	26	4	f	f
+attr	pg_stat_progress_copy	3	datname	19	64	f	f
+attr	pg_stat_progress_copy	4	relid	26	4	f	f
+attr	pg_stat_progress_copy	5	command	25	-1	f	f
+attr	pg_stat_progress_copy	6	type	25	-1	f	f
+attr	pg_stat_progress_copy	7	bytes_processed	20	8	f	f
+attr	pg_stat_progress_copy	8	bytes_total	20	8	f	f
+attr	pg_stat_progress_copy	9	tuples_processed	20	8	f	f
+attr	pg_stat_progress_copy	10	tuples_excluded	20	8	f	f
+attr	pg_stat_progress_copy	11	tuples_skipped	20	8	f	f
+rel	pg_user_mappings	12338	12338	12341	12340	2249	v	6
+attr	pg_user_mappings	1	umid	26	4	f	f
+attr	pg_user_mappings	2	srvid	26	4	f	f
+attr	pg_user_mappings	3	srvname	19	64	f	f
+attr	pg_user_mappings	4	umuser	26	4	f	f
+attr	pg_user_mappings	5	usename	19	64	f	f
+attr	pg_user_mappings	6	umoptions	1009	-1	f	f
 rel	pg_replication_origin_status	12343	12343	12346	12345	2249	v	4
 attr	pg_replication_origin_status	1	local_id	26	4	f	f
 attr	pg_replication_origin_status	2	external_id	25	-1	f	f
 attr	pg_replication_origin_status	3	remote_lsn	3220	8	f	f
 attr	pg_replication_origin_status	4	local_lsn	3220	8	f	f
+rel	pg_stat_subscription_stats	12347	12347	12350	12349	2249	v	12
+attr	pg_stat_subscription_stats	1	subid	26	4	f	f
+attr	pg_stat_subscription_stats	2	subname	19	64	f	f
+attr	pg_stat_subscription_stats	3	apply_error_count	20	8	f	f
+attr	pg_stat_subscription_stats	4	sync_error_count	20	8	f	f
+attr	pg_stat_subscription_stats	5	confl_insert_exists	20	8	f	f
+attr	pg_stat_subscription_stats	6	confl_update_origin_differs	20	8	f	f
+attr	pg_stat_subscription_stats	7	confl_update_exists	20	8	f	f
+attr	pg_stat_subscription_stats	8	confl_update_missing	20	8	f	f
+attr	pg_stat_subscription_stats	9	confl_delete_origin_differs	20	8	f	f
+attr	pg_stat_subscription_stats	10	confl_delete_missing	20	8	f	f
+attr	pg_stat_subscription_stats	11	confl_multiple_unique_conflicts	20	8	f	f
+attr	pg_stat_subscription_stats	12	stats_reset	1184	8	f	f
 rel	pg_wait_events	12351	12351	12354	12353	2249	v	3
 attr	pg_wait_events	1	type	25	-1	f	f
 attr	pg_wait_events	2	name	25	-1	f	f

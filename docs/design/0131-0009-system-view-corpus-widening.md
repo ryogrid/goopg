@@ -1,8 +1,11 @@
 # System-view corpus widening — take the six-view island to `system_views.sql` scale
 
-**Status:** in progress (S9.0, S9.1 landed)
-**Date:** 2026-08-11
-**Milestone:** M0131 (S9)
+**Status:** accepted — S9.0/S9.1/S9.1b/S9.2a-d/S9.3a-g LANDED (the `pg_catalog`
+corpus is upstream's **80 of 80** views, all evaluable on a hosted PG 18.3);
+**S9.4 (`information_schema`) MEASURED AND DEFERRED**, ledger rows filed and the
+successor filed as fix_plan milestone **M0133** (filed, NOT promoted).
+**Date:** 2026-08-11 (S9.4 measured + re-verified 2026-08-12)
+**Milestone:** M0131 (S9); successor M0133
 
 ## Problem
 
@@ -483,6 +486,971 @@ virtual definition agrees on all four names, order and types.
 Gates: `internal/initdb` PASS (64 s), whole `^TestE2E_` family PASS (100 s),
 `capture-ev-action.sh --verify` PASS (30/30 byte-identical), UNITS PASS,
 pgbench smoke via the commit hook.
+
+## Implementation status — S9.2a (2026-08-12)
+
+**The corpus is 33 views and the first non-function-only tranche is on disk.**
+`pg_views` (12028/12031), `pg_tables` (12033/12036) and `pg_matviews`
+(12038/12041) were pinned in `internal/initdb/system_view_oid_pins.go`,
+captured in ONE `scripts/capture-ev-action.sh <33 views>` run and rendered by
+ONE `go run cmd/gen-nailed-view-tables/main.go > nailed_view_seed_data.go` —
+again with no hand-edit of `nailedRel`/`nailedAttr`, the `pg_rewrite` seed rows
+or any embed line, which is S9.0's claim holding across a shape change and not
+merely across a bigger count.
+
+**What is new about the shape.** Every previous blob was `FROM <SRF>` or had no
+`FROM` at all. These three are joins: `pg_class` (1259) `LEFT JOIN`
+`pg_namespace` (2615), plus `LEFT JOIN pg_tablespace` (1213) for `pg_tables`
+and `pg_matviews`, so the corpus now exercises `RTE_JOIN` — and a hosted PG
+18.3 evaluates all three (`assertNailedSystemViewsAreEvaluable`). The base
+relations are sub-12000 bootstrap constants, so the blobs still carry zero
+in-band `:relid` and the tranche needed no view-on-view ordering; S9.3 remains
+the first slice that does.
+
+### Findings — S9.2a
+
+**F7 — TOAST ceiling #1 is no longer hypothetical: `pg_indexes` breaches it.**
+`pg_indexes` was the tranche's fourth candidate and is the first view in the
+corpus whose `ev_action` does not fit an inline heap tuple —
+`pg_column_size` **9002 B** against guard #5's 8000 B budget (raw text 70408 B,
+the largest in the corpus by 3.2×). Guard #5 is therefore a guard that has now
+*fired* in anger rather than one that merely exists, and the ceiling's stated
+prerequisite — `DECLARE_TOAST(pg_rewrite, 2838, 2839)` — is promoted from a
+contingency to a named blocker for `pg_indexes` and for any later view of its
+size. It is ledgered, and it is the new subject of guard #2 (below), which
+means the prerequisite landing will announce itself as a test failure.
+
+**Guard #2 re-pointed as its predecessor instructed.**
+`assertNonCorpusSystemViewIsStillAbsent` probed `pg_tables` precisely because
+`pg_tables` was S9.2's named head; adopting it flipped that assertion red, and
+the helper now probes `pg_indexes`. That is a strict improvement in the guard's
+quality: the previous subject was un-adopted only because nobody had got to it
+yet, whereas the new one is un-adopted for a **measured** reason, so the
+fail-when-fixed signal now names a specific prerequisite instead of a queue
+position.
+
+**F8 — the on-disk corpus is now AHEAD of goopg's own virtual corpus.** A
+goopg server was probed directly, as S9.1 did. `pg_tables` still answers from
+its virtual definition (2 rows) and `pg_indexes` answers 0, so seeding on-disk
+rows did not break goopg's own client-visible answers — ceiling #3 did not bite
+in the regression direction. But `pg_views` and `pg_matviews` fail **42P01 on
+goopg** while a PG hosted on goopg's directory evaluates them, i.e. the two
+engines now disagree about which system views exist on the same cluster in the
+*opposite* direction from the one this milestone started with. Ledgered.
+
+**F9 — `pg_tables` is the widest dual definition measured so far.** Sharper
+than F6's count-preserving mismatch: goopg's virtual `pg_tables`
+(`internal/catalog/catalog.go:8552-8566`) has **3** columns
+(`schemaname`, `tablename`, `tableowner`), all `text`, under a synthetic OID
+`1259101`, while the on-disk row upstream pins is **8** columns with
+PG-faithful types under OID 12033. Count, type and OID all diverge. Ledgered,
+not fixed — reconciling the virtual definitions is a slice of its own and it
+changes goopg-client-visible output.
+
+Gates: `internal/initdb` PASS (84 s), `TestE2E_PGColdStartOnGoopgDataDir` PASS,
+whole `^TestE2E_` family PASS (90 s), `capture-ev-action.sh --verify` PASS
+(33/33 byte-identical), `go vet` clean, UNITS PASS, pgbench smoke via the
+commit hook.
+
+## Implementation status — S9.2b (2026-08-12)
+
+**The corpus is 35 views and it now reads SHARED catalogs.** `pg_roles`
+(12000/12003) and `pg_stat_activity` (12226/12229) — S9.2's two remaining
+named heads — were pinned in `internal/initdb/system_view_oid_pins.go`,
+captured in ONE `scripts/capture-ev-action.sh <35 views>` run and rendered by
+ONE `go run cmd/gen-nailed-view-tables/main.go > nailed_view_seed_data.go`.
+The other 33 `.dat` files came back byte-identical from that same run, which is
+a determinism re-measurement the tranche gets for free.
+
+**What is new about the shape.** S9.2a's joins were over *local* catalogs
+(`pg_class` 1259, `pg_namespace` 2615, `pg_tablespace` 1213 — the last is
+shared but nailed). These two read the shared catalogs a hosted PG resolves
+through `base/5`: `pg_roles` is `FROM pg_authid` (1260) `LEFT JOIN
+pg_db_role_setting` (2964), and `pg_stat_activity` joins
+`pg_stat_get_activity(NULL)` against `pg_authid` **and** `pg_database` (1262) —
+the corpus's first blob mixing an SRF with catalog relations in one join tree,
+which is the exact shape S9's filing predicted would need measuring. A hosted
+PG 18.3 evaluates both (`assertNailedSystemViewsAreEvaluable`), so no new RTE
+kind or shared-relation resolution gap fell out. Both base sets are sub-12000
+bootstrap constants, so the blobs still carry zero in-band `:relid` (measured:
+`pg_roles` embeds 1260/2964, `pg_stat_activity` 1260/1262) and S9.3 remains the
+first slice needing view-on-view ordering.
+
+**Guard #5 was checked BEFORE pinning, per S9.2a's own advice**, on a throwaway
+PG 18.3 with `pg_column_size(r.ev_action)`: `pg_roles` 2167 B and
+`pg_stat_activity` 4780 B against the 8000 B inline budget — both comfortable.
+The same probe sized six further S9.2/S9.3 candidates and found a **second**
+TOAST-ceiling breach beyond `pg_indexes` (9002 B): `pg_seclabels` at
+**35379 B** stored (203378 B raw), 4.4× `pg_indexes` and by far the largest
+blob measured. Ledgered — it widens the `DECLARE_TOAST(pg_rewrite, 2838, 2839)`
+blocker from one view to a class, and 35 KB will not fit an inline tuple by any
+amount of header shaving. Under the ceiling and still unadopted:
+`pg_shadow` 2015 B, `pg_group` 1428 B, `pg_user` 1356 B, `pg_rules` 3774 B,
+`pg_policies` 5439 B, `pg_stat_database` 2721 B, `pg_stat_all_tables` 5473 B.
+
+Guard #2 (`assertNonCorpusSystemViewIsStillAbsent`) is UNCHANGED this slice:
+its subject `pg_indexes` is still un-adopted for the measured TOAST reason, so
+unlike S9.2a there was no red assertion to re-point.
+
+### Findings — S9.2b
+
+**F10 — the dual-definition hazard, third measurement, and this time goopg's
+own answers are the ones that survive.** Probed on a live goopg server
+(fresh `init`, port 5533): unlike `pg_views`/`pg_matviews` in F8, both of these
+views DO answer on goopg — `pg_roles` returns 18 rows and `pg_stat_activity`
+4 — so seeding did not disturb the virtual path and the two engines agree that
+the views exist. They disagree about everything else:
+
+| view | goopg virtual | on-disk / upstream |
+|---|---|---|
+| `pg_roles` | OID 1259102, **4** cols (`oid`, `rolname`, `rolsuper`, `rolcanlogin`) | OID 12000, **13** cols, PG-typed |
+| `pg_stat_activity` | OID **16403**, **21** cols (no `query_id`) | OID 12226, **22** cols, PG-typed |
+
+`pg_roles` at 4-vs-13 is the widest column-count gap measured in the milestone
+(F9's `pg_tables` was 3-vs-8). The sharper finding is `pg_stat_activity`'s
+**16403**: that is in the `FirstUserOID = 16384` band, i.e. a *system* view
+whose virtual relation was minted by the runtime user-relation allocator, so
+its OID is not even stable across clusters — a strictly worse divergence than
+the synthetic `1259xxx` values F9 found, and one that would collide with a user
+relation's OID on a cluster that created one first. Ledgered, not fixed:
+reconciling the virtual definitions changes goopg-client-visible output and is
+a slice of its own.
+
+Gates: `internal/initdb` PASS (93 s), `TestE2E_PGColdStartOnGoopgDataDir` PASS,
+whole `^TestE2E_` family PASS (90 s), `capture-ev-action.sh --verify` PASS
+(35/35 byte-identical), `go build ./...` + `go vet` clean, UNITS PASS, pgbench
+smoke via the commit hook.
+
+## Implementation status — S9.2c (2026-08-12)
+
+**The corpus crosses its first view-on-view edge, one slice earlier than S9.3.**
+Pinned and seeded: `pg_shadow` (12005/12008) and `pg_user` (12014/12017),
+taking the on-disk corpus from 35 to **37** views. `pg_shadow` is ordinary
+S9.2 work — `FROM pg_authid` (1260) `LEFT JOIN pg_db_role_setting` (2964),
+the same shared-catalog shape S9.2b proved. `pg_user` is not: it is
+`FROM pg_shadow` (`system_views.sql:60-71`), and its captured blob carries
+**`:relid 12005`** — measured, the **first in-band `:relid` in the entire
+corpus**, after 35 views that carried none.
+
+That single number is the acceptance test for the whole Option-A policy of
+`0131-0008`. Because goopg pins its view OIDs to upstream's own initdb
+assignments, the OID `pg_user`'s blob embeds is *already* the OID goopg's
+`pg_class` heap gives `pg_shadow` — nothing inside the blob is rewritten, and
+the ordering requirement (base pinned before dependent) is enforced
+mechanically by capture guard #4 rather than trusted. The measurement is the
+E2E probe: a hosted PG 18.3 evaluating `SELECT * FROM pg_user` must resolve
+12005 through goopg's `pg_class`, find `pg_shadow`'s `_RETURN` row in goopg's
+`pg_rewrite`, and substitute a second Query — the first probe in this lane
+whose success needs TWO of goopg's rule rows and a relid lookup between them.
+It passes. **S9.3's mechanism is therefore proven; what remains for S9.3 is
+scale and ordering, not feasibility.**
+
+### Findings — S9.2c
+
+**F11 — ceiling #3, and it is a `pg_type` bootstrap gap.** `pg_group` (12010)
+was captured and pinned alongside the other two — it is catalog-direct
+(`pg_authid` + `pg_auth_members` 1261) and at **1428 B** stored it clears every
+size ceiling — but a hosted PG refuses to evaluate it:
+
+```
+ERROR:  could not find array type for data type oid
+STATEMENT:  SELECT * FROM pg_catalog.pg_group LIMIT 0
+```
+
+`pg_group`'s `grolist` column is `ARRAY(SELECT member FROM pg_auth_members …)`,
+making it the corpus's first blob with an `ARRAY(SubLink)` target entry.
+Evaluating it sends PG through `get_array_type`, which reads
+`pg_type.typarray` for `OIDOID`. goopg seeds that column as a **literal 0 for
+every row** (`internal/initdb/pg_type_bootstrap.go:306`), even though the
+`_oid` row (1028) itself is present in `pg_type_seed_data.go` and the
+`typarray` column exists in the tupledesc. So this is a *catalog* gap, not a
+capture gap — the same class as `pg_timezone_abbrevs`' missing `pg_amop` row
+(F5), and the third distinct ceiling the corpus has hit after the TOAST class
+(F6/F7). `pg_group` is therefore NOT pinned; the resume point is populating
+`typarray` (and `typelem`) from `pg_type.dat` across the seeded set. Ledgered.
+
+Worth stating plainly: all three ceilings found so far — `pg_amop`, `pg_type
+.typarray`, `pg_rewrite` TOAST — are gaps in what goopg's initdb *bootstraps*,
+not in the capture mechanism. The capture tooling has not been the limit once.
+
+Gates: `internal/initdb` PASS (87 s), `TestE2E_PGColdStartOnGoopgDataDir` PASS,
+whole `^TestE2E_` family PASS (92 s), `capture-ev-action.sh --verify` PASS
+(37/37 byte-identical), `go build ./...` + `go vet` clean, UNITS PASS, pgbench
+smoke via the commit hook.
+
+## Implementation status — S9.2d (2026-08-12)
+
+**S9.2's catalog-direct tranche is finished: the corpus is 43 views, and the
+two views that did not make it named ceilings #4 and #5.** Pinned and seeded in
+one capture run: `pg_rules` (12023/12026), `pg_sequences` (12048/12051),
+`pg_prepared_xacts` (12090/12093), `pg_stat_database` (12270/12273),
+`pg_stat_database_conflicts` (12275/12278) and `pg_user_mappings`
+(12338/12341) — 37 → **43**. The other 37 blobs and the manifest came back
+byte-identical, and `--verify` re-derives all 43 against a fresh throwaway
+PG 18.3.
+
+Selection was measured rather than guessed. A throwaway oracle was asked, for
+every `pg_catalog` view, for its stored `ev_action` size *and* the set of
+`:relid` values its blob carries inside the 12000..16383 band; the catalog-
+direct set (no in-band relid) under the 8000 B inline budget is exactly the
+population S9.2 owns. That query also fixes S9.3's remaining work as a list:
+twelve views (`pg_stat_sys_tables`/`pg_stat_user_tables` on 12146,
+`pg_stat_xact_*_tables` on 12151, `pg_statio_*_tables` on 12174,
+`pg_stat_*_indexes` on 12187, `pg_statio_*_indexes` on 12200,
+`pg_statio_*_sequences` on 12213), each depending on a single `pg_stat_all_*`
+base that is itself catalog-direct — and five of those six bases are under the
+inline ceiling, the exception being `pg_statio_all_tables` at 10475 B, which
+puts its two dependents behind the `pg_rewrite` TOAST work (F6/F7).
+
+**`pg_stat_database` is the corpus's first blob carrying a set operation.**
+`system_views.sql:1006-1010` selects from
+`(SELECT 0 AS oid, NULL::name AS datname UNION ALL SELECT oid, datname FROM
+pg_database)`, so the Query has an `RTE_SUBQUERY` whose own Query is a
+`SetOperationStmt` — a shape none of the previous 37 blobs exercised, and it
+round-trips through the same verbatim-capture path with no special handling.
+The two "unmeasured `ev_action` shapes" this doc listed (`RTE_RESULT`,
+`LATERAL`) are now one: `RTE_RESULT` was closed by S9.1b, `LATERAL` remains.
+
+### Findings — S9.2d
+
+**F12 — ceiling #4: `pg_policy` (3256) is not an on-disk relation.** `pg_policies`
+(12018, 5439 B stored, well under every size ceiling) captures cleanly and a
+hosted PG then fails it with `could not open relation with OID 3256`. This is
+a new *kind* of ceiling: F5/F11 were missing rows or columns inside catalogs
+goopg does bootstrap, whereas here the blob's base **catalog itself** is
+absent from a goopg cluster. It is the first captured view blocked that way,
+and it says the remaining corpus is gated not only on catalog *content* but on
+which system catalogs goopg materialises at all. Ledgered; the resume point is
+bootstrapping `pg_policy` (and re-pinning `pg_policies`), not touching the
+capture tool.
+
+Incidentally, `pg_policies.roles` is the corpus's first `name[]` column, which
+is why capture guard #5 demanded `_name` (1003) and it is now canonical in
+`pg_type_bootstrap.go` — with `typalign` `'i'`, **not** `name`'s own `'c'`
+(`Catalog.pm:469` gives an array `'d'` only when its element is `'d'`).
+
+**F13 — ceiling #5: `pg_type.typelem` is a literal 0 for every row, the exact
+twin of F11.** `pg_publication_tables` (12068, 3793 B) is rejected by a hosted
+PG with:
+
+```
+ERROR:  target type is not an array
+STATEMENT:  SELECT * FROM pg_catalog.pg_publication_tables LIMIT 0
+```
+
+That message is raised by `ExecInitExprRec`'s `T_ArrayCoerceExpr` arm
+(`postgres/src/backend/executor/execExpr.c:1684-1688`) when
+`get_element_type(resulttype)` returns InvalidOid — i.e. when
+`pg_type.typelem` is 0 for the array type being coerced to. goopg's `pgTypeRow`
+writes `typelem` as a hardcoded 0 (column 14) one line above the hardcoded
+`typarray` 0 (column 15) that F11 found. So ceilings #3 and #5 are **the same
+defect, one column apart**, reached from two different directions
+(`get_array_type` for F11, `get_element_type` here), and one fix — populating
+`typelem`/`typarray` from `pg_type.dat` — closes both and unblocks both
+`pg_group` and `pg_publication_tables`. Ledgered.
+
+The generalisation from S9.2c survives at five for five: **every ceiling this
+milestone has hit is a gap in what goopg's initdb bootstraps** (`pg_amop` rows,
+`pg_type.typarray`, `pg_rewrite` TOAST, the `pg_policy` catalog,
+`pg_type.typelem`). The capture tooling has not been the limit once.
+
+One type-table addition was needed for a view that DID land: `regtype` (2206)
+is `pg_sequences.data_type`, the first nailed-view column of the scalar
+OID-alias type — its array (2211) had been canonical since S9.1. Values taken
+from `pg_type.dat:389-392` and `pg_proc.dat` (2220/2221, 2454/2455).
+
+Gates: `internal/initdb` PASS (96 s), `TestE2E_PGColdStartOnGoopgDataDir` PASS,
+whole `^TestE2E_` family PASS (91 s), `capture-ev-action.sh --verify` PASS
+(43/43 byte-identical), `go build ./...` + `go vet` clean, UNITS PASS, pgbench
+smoke via the commit hook.
+
+## Implementation status — S9.3a (2026-08-12)
+
+**S9.3 opens: the corpus is 49 views and now carries four view-on-view edges
+over two bases, pinned in a single capture run.** The per-table statistics
+family landed complete except for its I/O triple:
+
+| view | OID / rule | stored `ev_action` | in-band `:relid` |
+|---|---|---|---|
+| `pg_stat_all_tables` | 12146 / 12149 | 5473 B | — |
+| `pg_stat_xact_all_tables` | 12151 / 12154 | 5057 B | — |
+| `pg_stat_sys_tables` | 12156 / 12159 | 2476 B | 12146 |
+| `pg_stat_xact_sys_tables` | 12161 / 12164 | 1822 B | 12151 |
+| `pg_stat_user_tables` | 12165 / 12168 | 2478 B | 12146 |
+| `pg_stat_xact_user_tables` | 12170 / 12173 | 1824 B | 12151 |
+
+Mechanics unchanged from S9.2: one `scripts/capture-ev-action.sh <49 views>`
+run plus one `cmd/gen-nailed-view-tables` run; the other 43 blobs came back
+byte-identical and `--verify` re-derives all 49 against a fresh throwaway
+PG 18.3. No hand-edited blob, table, rule row or `//go:embed` line — S9.0's
+claim now holds at 8.2× the original corpus.
+
+What is new is that the **edges are the subject, not an incident.** S9.2c
+crossed one edge (`pg_user` → `pg_shadow`); this tranche crosses four over two
+distinct bases in one pass, and capture guard #4 (a dependent may not be pinned
+before its base) is what orders the pin table rather than care. Each dependent
+is `SELECT * FROM <base> WHERE …` (`system_views.sql`), so under Option-A
+identity pinning its embedded 12146/12151 is already correct the moment the
+base is pinned above it; a hosted PG evaluating all six in
+`assertNailedSystemViewsAreEvaluable` is the acceptance measurement.
+
+### Findings — S9.3a
+
+**F14 — a dependent costs an order of magnitude less than its base, and that
+is a property of the pin policy, not of the views.** The four dependents store
+at 1822–2478 B against bases of 5057–5473 B, because a rewritten
+`FROM pg_stat_all_tables WHERE …` Query stores the base as one `RTE_RELATION`
+naming OID 12146 instead of re-expanding its 30-column SRF join tree. The
+practical consequence for the rest of S9.3: **dependents are never the thing
+that breaches the inline-tuple ceiling — bases are.** Ceiling #1 therefore
+propagates *downward* through the dependency graph, which is exactly what
+happened to the `pg_statio_*_tables` triple below, and it means the remaining
+S9.3 cost is bounded by six base captures, not by twelve.
+
+**Ceiling #1 claims its first *dependents*.** `pg_statio_all_tables` (12174)
+stores at 10475 B, over the script's 8000 B inline budget, so it cannot be
+seeded — and because guard #4 forbids pinning `pg_statio_sys_tables` (12179) or
+`pg_statio_user_tables` (12183) ahead of their base, one over-ceiling base
+withholds **three** views rather than one. This is the first time a ceiling has
+propagated along an edge, and it re-prices the `pg_rewrite` TOAST
+(2838/2839) work: it now gates `pg_indexes` + this triple. Ledgered.
+
+The S9.2c/S9.2d generalisation still holds at five for five — every ceiling in
+this milestone is a gap in what goopg's initdb bootstraps, never in the capture
+tooling. S9.3a added no new ceiling *kind*; it added reach for an existing one.
+
+Remaining in S9.3 after this slice: three bases (`pg_stat_all_indexes` 12187,
+`pg_statio_all_indexes` 12200, `pg_statio_all_sequences` 12213, all under the
+ceiling at 6826/6799/2431 B) with their six dependents, plus the
+`pg_statio_*_tables` triple behind TOAST.
+
+Gates: `internal/initdb` PASS (96 s), `TestE2E_PGColdStartOnGoopgDataDir` PASS,
+whole `^TestE2E_` family PASS (92 s), `capture-ev-action.sh --verify` PASS
+(49/49 byte-identical), `go build ./...` + `go vet` clean, UNITS PASS, pgbench
+smoke via the commit hook.
+
+## Implementation status — S9.3b (2026-08-12)
+
+**S9.3's reachable population is finished: the corpus is 58 views over TEN
+view-on-view edges and five bases.** The per-index and per-sequence statistics
+families landed in one capture run:
+
+| view | OID / rule | stored `ev_action` | in-band `:relid` |
+|---|---|---|---|
+| `pg_stat_all_indexes` | 12187 / 12190 | 6826 B | — |
+| `pg_stat_sys_indexes` | 12192 / 12195 | 1714 B | 12187 |
+| `pg_stat_user_indexes` | 12196 / 12199 | 1716 B | 12187 |
+| `pg_statio_all_indexes` | 12200 / 12203 | 6799 B | — |
+| `pg_statio_sys_indexes` | 12205 / 12208 | 1625 B | 12200 |
+| `pg_statio_user_indexes` | 12209 / 12212 | 1628 B | 12200 |
+| `pg_statio_all_sequences` | 12213 / 12216 | 2431 B | — |
+| `pg_statio_sys_sequences` | 12218 / 12221 | 1559 B | 12213 |
+| `pg_statio_user_sequences` | 12222 / 12225 | 1561 B | 12213 |
+
+Mechanics unchanged and now boring, which is the point: one
+`scripts/capture-ev-action.sh <58 views>` run plus one
+`cmd/gen-nailed-view-tables` run; the other 49 blobs came back byte-identical
+and `--verify` re-derives all 58 against a fresh throwaway PG 18.3. No
+hand-edited blob, table, rule row or `//go:embed` line — S9.0's claim holds at
+9.7× the original corpus, and S9.3a's four-edge exercise of guard #4 scales to
+six more edges without a tooling change.
+
+### Findings — S9.3b
+
+**F15 — F14's dependent/base ratio is a structural constant, not a
+coincidence of the table family.** Across all three new bases, each dependent
+stores at 23–64 % of its base (1714/6826 = 25 %, 1625/6799 = 24 %,
+1559/2431 = 64 %), and the ratio tracks *how much of the base's tree is SRF
+join* rather than anything about the dependent: the two index bases expand a
+9- and 7-column `pg_stat_get_*` join, while `pg_statio_all_sequences` is a
+small 5-column tree whose dependents therefore cannot save as much. The
+prediction from F14 — that only bases can breach the inline ceiling — now holds
+at 5 bases / 10 dependents with no counterexample. The tightest margin measured
+so far is `pg_stat_all_indexes` at 6826 B against the 8000 B budget: 85 % of
+inline capacity, which is a standing argument that the `pg_rewrite` TOAST slice
+is a near-term prerequisite for further base captures, not a distant one.
+
+**No new ceiling.** Every view S9.3 can reach is now seeded; what remains of
+S9.3 is exactly the `pg_statio_*_tables` triple withheld by ceiling #1 (base
+`pg_statio_all_tables` 12174 at 10475 B), unchanged from S9.3a. The
+"every ceiling is an initdb-bootstrap gap" generalisation holds at five for
+five — S9.3b added no ceiling of any kind, and is the first slice in S9 that
+found no new finding class at all.
+
+Remaining in S9: the `pg_statio_*_tables` triple behind `pg_rewrite` TOAST
+(2838/2839), `pg_indexes` behind the same, `pg_group` +
+`pg_publication_tables` behind `pg_type.typelem`/`typarray` population (F13),
+`pg_timezone_abbrevs`, and S9.4's 65 `information_schema` views (expected to be
+deferred with a ledger row).
+
+Gates: `internal/initdb` PASS (103 s), whole `^TestE2E_` family PASS (92 s,
+includes `TestE2E_PGColdStartOnGoopgDataDir`), `capture-ev-action.sh --verify`
+PASS (58/58 byte-identical), `go build ./...` + `go vet` clean, UNITS PASS,
+pgbench smoke via the commit hook.
+
+## Implementation status — S9.3c (2026-08-12)
+
+**The corpus is 60 views, and this slice added no capture work at all: it
+cleared a *bootstrap* ceiling and the two withheld views followed.** `pg_group`
+(12010/12013) and `pg_publication_tables` (12068/12071) were captured back in
+S9.2c/S9.2d and withheld as ceilings #3 and #5; both were blocked by the same
+`pg_type` bootstrap defect, and pinning them here was a two-line edit once the
+defect was fixed.
+
+| view | OID / rule | stored `ev_action` | ceiling that held it | in-band `:relid` |
+|---|---|---|---|---|
+| `pg_group` | 12010 / 12013 | 1428 B | #3 (`typarray` = 0) | — |
+| `pg_publication_tables` | 12068 / 12071 | 3793 B | #5 (`typelem` = 0) | — |
+
+### What was actually broken
+
+`initdb.pgTypeRow` emitted a literal `0` for columns 13/14/15
+(`typsubscript`/`typelem`/`typarray`) of **every** bootstrapped `pg_type` row —
+193 of them — even though `pg_type_seed_data.go` already carried the array peer
+rows those columns point at. Three separate hosted-PG failures come out of that
+one line group:
+
+| hosted-PG symptom | upstream call | column |
+|---|---|---|
+| `could not find array type for data type oid` | `get_array_type` (lsyscache.c) | `typarray` |
+| `target type is not an array` | `ExecInitExprRec` T_ArrayCoerceExpr (execExpr.c:1684-1688) | `typelem` |
+| `op ANY/ALL (array) requires array on right side` | `make_scalar_array_op` → `get_base_element_type` (parse_oper.c:800) | `typsubscript` |
+
+`cmd/gen-pg-type-data` now derives the whole `{typelem, typarray,
+typsubscript}` triple from `pg_type.dat` the way genbki does — an entry with
+`array_type_oid => A` gets `typarray = A`, and the synthesised array type `A`
+gets `typelem` = the element OID plus `typsubscript =
+array_subscript_handler` (6179) — and emits it as
+`pgTypeGeneratedElemArraySubscript` alongside `pgTypeAllEntries`. The base
+entries' own `typelem`/`typsubscript` (`name => char`, `oidvector => oid`,
+`box => point`, the `raw_array_subscript_handler` 6180 users) come verbatim
+from the .dat file. A three-entry hand-written overlay covers the OIDs
+`pgTypeCanonical` supplies that `pg_type.dat` does not (`_pg_statistic`
+10028), and `TestPgTypeElemArrayCoversSeededEntries` keeps the union
+exhaustive over `pgTypeBootstrapEntryMap()`.
+
+### Findings — S9.3c
+
+**F16 — a half-populated `pg_type` is worse than an unpopulated one, and only a
+hosted PG says so.** Populating `typelem` + `typarray` while leaving
+`typsubscript` at 0 passed every unit test, `--verify`, and the encoded-byte
+pins — and *broke* `TestE2E_PGColdStartOnGoopgDataDir`'s oldest guard, the
+`WHERE n.nspname IN ('public', 's4app')` relname query, with `op ANY/ALL
+(array) requires array on right side`. The mechanism is a fallback that
+silently disappears: with `typarray = 0` the parser cannot find an array type
+for an `IN (…)` list at all, so `transformAExprIn` expands it into an OR-chain
+of equality tests, which works against any catalog. The moment `typarray`
+resolves, the parser upgrades the list to a `ScalarArrayOpExpr` — and then
+`get_base_element_type` applies `IsTrueArrayType`, which requires
+`typsubscript == array_subscript_handler` **and** a non-zero `typelem`. Fixing
+two of the three columns therefore moved every `IN`-list in every hosted-PG
+query off a working path onto a broken one. The general shape — a catalog
+column whose *absence* is handled by a graceful fallback and whose *partial*
+presence is not — is the same trap as the M0106 codec type-set split, and it
+argues for populating a PG catalog column group atomically rather than
+per-symptom.
+
+**F17 — ceilings #3 and #5 were one defect, and so is the fix's blast
+radius.** S9.2d already recorded that the two rejections were the same literal
+row one column apart; what S9.3c adds is that the repair could not be scoped to
+the 45 `pgTypeCanonical` entries either. The heap carries all 193
+`pgTypeAllEntries` rows, so a hand-written table covering only the nailed-attr
+subset would have left `_int8`, `_numeric` and 145 others with `typarray`
+resolvable but `typelem` zero — reproducing F16's broken state for every type
+whose array peer is not nailed. Deriving the triple in the generator is what
+makes the population total.
+
+**Ceilings after S9.3c: three, all in initdb bootstrap.** #1 `pg_rewrite`
+TOAST (`pg_statio_all_tables` 10475 B, `pg_indexes` 9002 B), #2 `pg_amop`
+(`pg_timezone_abbrevs`), #4 `pg_policy` is not an on-disk relation
+(`pg_policies`). #3 and #5 are resolved. The generalisation "every ceiling is a
+gap in what goopg BOOTSTRAPS, not in the capture tooling" now holds at five for
+five with two of them discharged by bootstrap work.
+
+Remaining in S9: the `pg_statio_*_tables` triple and `pg_indexes` behind
+`pg_rewrite` TOAST (2838/2839), `pg_policies` behind an on-disk `pg_policy`,
+`pg_timezone_abbrevs` behind `pg_amop`, and S9.4's 65 `information_schema`
+views (expected to be deferred with a ledger row).
+
+Gates: `internal/initdb` PASS (104 s), whole `^TestE2E_` family PASS (96 s,
+includes `TestE2E_PGColdStartOnGoopgDataDir`), `capture-ev-action.sh --verify`
+PASS (60/60 byte-identical), a throwaway hosted PG 18.3 on a fresh goopg
+`$PGDATA` answering `SELECT count(*) FROM pg_group` (16) and
+`FROM pg_publication_tables` (0) and printing `format_type(1003) = name[]`,
+`go build ./...` + `go vet` clean, UNITS PASS, pgbench smoke via the commit
+hook.
+
+## Implementation status — S9.3d (2026-08-12)
+
+**The corpus is 71 of upstream's 80 `pg_catalog` views, and the nine that are
+left all have a measured blocker.** This slice is the first that was selected
+by *enumerating the complement* rather than by naming a subject family: the
+oracle was asked for every `pg_catalog` view with a `_RETURN` rule (oid, rule
+oid, reltype, relnatts, `pg_column_size(ev_action)`, in-band `:relid` set) and
+the result was diffed against `systemViewOIDPins()`. Twenty views came back;
+eleven had no blocker at all.
+
+Pinned, captured in ONE 71-view `scripts/capture-ev-action.sh` run and rendered
+by ONE `cmd/gen-nailed-view-tables` run — the other 60 blobs came back
+byte-identical:
+
+| view | oid / rule | stored | why it was never adopted |
+|---|---|---|---|
+| `pg_available_extensions` | 12081 / 12084 | 1658 B | SRF-only; outside S9.1's `pg_stat_get_*` subject line |
+| `pg_available_extension_versions` | 12085 / 12088 | 1990 B | same |
+| `pg_timezone_abbrevs` | 12122 / 12125 | 1757 B | **ceiling #2, and it was already gone** — see F18 |
+| `pg_stat_user_functions` | 12279 / 12282 | 2448 B | catalog-direct; not in S9.2's named heads |
+| `pg_stat_xact_user_functions` | 12284 / 12287 | 2447 B | same |
+| `pg_stat_progress_analyze` | 12309 / 12312 | 3232 B | progress family; only its one FROM-less member (`…_basebackup`) had been adopted, by S9.1 |
+| `pg_stat_progress_vacuum` | 12314 / 12317 | 3416 B | same |
+| `pg_stat_progress_cluster` | 12319 / 12322 | 3457 B | same |
+| `pg_stat_progress_create_index` | 12324 / 12327 | 3832 B | same |
+| `pg_stat_progress_copy` | 12333 / 12336 | 2939 B | same |
+| `pg_stat_subscription_stats` | 12347 / 12350 | 1679 B | same |
+
+A hosted PG 18.3 cold-started on a goopg `$PGDATA` evaluates all eleven
+(`nailedSystemViewProbeSet`, now 71 entries). The probe was proven
+**non-vacuous in the same run**: adding un-seeded `pg_indexes` (12043) to the
+set fails it with the 42P01 half of guard #2, so the eleven passes are the
+corpus's own doing.
+
+### Findings — S9.3d
+
+**F18 — a ceiling list is not self-maintaining, and this one carried a
+discharged entry for two tranches.** Ceiling #2 (`pg_timezone_abbrevs` behind
+the `ORDER BY abbrev` → `get_ordering_op_properties` → `pg_amop` lookup) was
+recorded by S9.1 on 2026-08-11 and repeated verbatim by S9.2c, S9.2d, S9.3a,
+S9.3b and S9.3c — but **M0131-S12 had already fixed it on 2026-08-11**, hours
+later, from the other side: that slice bulk-loaded `pg_amop_fam_strat_index`
+(2653) and `pg_amop_opr_fam_index` (2654) while chasing "a hosted PG cannot
+sort", and its own completion note says the two were the SAME bug. Nothing
+re-ran the `pg_timezone_abbrevs` measurement, so a view that cost nothing sat
+on the blocked list through five tranches. The rule the nightly triage already
+states — *re-run the repro at HEAD before believing the log* — applies to a
+design doc's own ceiling table.
+
+**F19 — organising tranches by subject family leaves a residue that only
+complement-enumeration finds.** Every earlier S9 slice was named for a shape
+(SRF-only, catalog-direct, view-on-view) and adopted the views that shape
+brought to mind; eleven views matched a shape already proven and were simply
+never enumerated. Two of them (`pg_available_extensions*`) are S9.1's exact
+shape, and five are the siblings of a view S9.1 *did* adopt
+(`pg_stat_progress_basebackup`, taken because it has no `FROM`, while the five
+that join `pg_stat_get_progress_info()` against `pg_database`/`pg_class` were
+left). The cheap query — oracle views minus pinned views, with size and
+in-band-relid columns — should have been the FIRST step of every tranche, and
+it is now the recorded selection procedure for S9.4.
+
+**Ceilings after S9.3d: two, both in initdb bootstrap, and the residual work is
+now a closed list.** #1 `pg_rewrite` TOAST (2838/2839) withholds exactly
+eight views — `pg_indexes` (9002 B), `pg_stats` (9316 B), `pg_stats_ext`
+(12196 B), `pg_stats_ext_exprs` (11481 B), `pg_seclabels` (35379 B),
+`pg_statio_all_tables` (10475 B) and, through it under guard #4,
+`pg_statio_sys_tables` and `pg_statio_user_tables`. #4 `pg_policy` is not an
+on-disk relation, withholding `pg_policies` (5439 B). That is 8 + 1 = the nine
+views between 71 and upstream's 80, so **S9's `pg_catalog` population is
+finished except for those two bootstrap gaps**; only S9.4
+(`information_schema`, 65 views, expected to defer) remains beyond them.
+`pg_seclabels` at 35379 B keeps the multi-chunk requirement on the TOAST slice.
+
+Gates: `internal/initdb` PASS (111 s), `TestE2E_PGColdStartOnGoopgDataDir` PASS
+plus its deliberate fail-when-broken run, whole `^TestE2E_` family PASS (96 s),
+`capture-ev-action.sh --verify` PASS (71/71 byte-identical), `go build ./...` +
+`go vet` clean, UNITS PASS, pgbench smoke via the commit hook.
+
+## Implementation status — S9.3e (2026-08-12)
+
+**Ceiling #4 is closed and it cost one catalog.** `pg_policies` (12018, 5439 B
+— inline, captured by S9.2d and withheld ever since) was the corpus's only view
+blocked by a missing base CATALOG rather than by content inside one: a hosted PG
+failed it with `could not open relation with OID 3256`, because `pg_policy` was
+not an on-disk relation in a goopg cluster at all. goopg has no on-disk
+`CREATE POLICY` path and never will have one for free, so the fix is not to
+populate the catalog — it is to make the EMPTY catalog exist, which is precisely
+what upstream's own bootstrap does for a cluster with no policies.
+
+Landed:
+
+- `pgPolicyAttrs()` + `{3256, "pg_policy", 83, 'r', 8, false, …}` in
+  `nailedLocalRels` (`internal/initdb/relcache_init.go`), transcribed from
+  `postgres/src/include/catalog/pg_policy.h`: five fixed-width NOT NULL columns
+  (oid, polname, polrelid, polcmd, polpermissive) plus `polroles` (`_oid` 1028,
+  BKI_FORCE_NOT_NULL — zero means PUBLIC) and the two nullable `pg_node_tree`
+  quals. All six type OIDs were already canonical in `pg_type_bootstrap.go`, so
+  no pg_type work was needed — the first S9 slice for which that is true.
+- `3256` added to `mappedLocalCatalogPlaceholderOIDs()`
+  (`internal/initdb/initdb.go`), which lays down the empty 8 KiB heap in
+  `base/1` and `base/5`. Both halves are required and neither is sufficient:
+  removing the nailed rel reproduces the original `could not open relation with
+  OID 3256`; removing the placeholder leaves a pg_class row pointing at a file
+  that does not exist.
+- `{"pg_policies", 12018, 12021, 12020, 8}` pinned in
+  `internal/initdb/system_view_oid_pins.go`, the whole 78-view pinned list
+  re-captured with `scripts/capture-ev-action.sh`, and
+  `nailed_view_seed_data.go` regenerated. **Every other `.dat` blob came back
+  byte-identical** — the run is a free re-execution of S8b.2's `--verify`
+  acceptance over the whole corpus, on a freshly initdb'd PG 18.3.
+
+`RelType=83` is safe for the same reason it is for the other ~40 local
+catalogs: `pg_policy` is not formrdesc'd (no `PolicyRelation_Rowtype_Id` in the
+PG18 headers; only pg_database / pg_authid / pg_auth_members / pg_shseclabel /
+pg_subscription are, at `relcache.c:4075-4083`), so the Phase-3
+`rd_att->tdtypeid == relp->reltype` assertion (`relcache.c:4293`) does not fire.
+
+### Findings — S9.3e
+
+**F25 — an empty catalog needs no index.** `pg_policy.h` declares two indexes
+(3257 `pg_policy_oid_index`, 3258 `pg_policy_polrelid_polname_index`) and a
+TOAST pair (4167/4168); none is bootstrapped. The view's scan of an empty heap
+is answered by a seq scan, and nothing in `RelationBuildDesc` demands an index
+that no `pg_index` row claims. This is a real scope limit, not an oversight —
+the moment goopg grows an on-disk `CREATE POLICY`, the indexes become
+mandatory (`CatalogTupleInsert` maintains every index `RelationGetIndexList`
+returns) and so does the TOAST pair for a long `polqual`. Ledgered.
+
+**F26 — the corpus's absence probe had to move, and only one candidate was
+safe.** `assertNonCorpusSystemViewIsStillAbsent` was pointed at `pg_policies`;
+with the view adopted it now reads `pg_seclabels`. `pg_stats_ext_exprs`, the
+only other un-adopted view, is deliberately NOT used: its failure mode trips
+`Assert("OidIsValid(typentry->typrelid)")` in `typcache.c:3082` and takes the
+backend down, which per S20.2b's experience kills the rest of the probe run.
+An "is it still absent?" guard must fail QUIETLY.
+
+**Ceilings after S9.3e: one, and it is ceiling #6.** The on-disk `pg_catalog`
+corpus is **78 of upstream's 80**. What remains is two views and two distinct
+bootstrap gaps, neither about size and neither about the capture tooling:
+`pg_seclabels` (12099) needs `pg_seclabel` (3596) and
+`pg_largeobject_metadata` (2995) as on-disk relations — mechanically the same
+slice as this one, twice over, and its 35379 B value already toasts cleanly
+since S20.2b; `pg_stats_ext_exprs` (12063) needs a real `pg_type` row for
+**10029**, the composite rowtype of `pg_statistic`, which is the only remaining
+ceiling that is about a catalog's own rowtype. Then S9.4
+(`information_schema`, 65 views, expected to defer), whose selection procedure
+is the complement query recorded under S9.3d.
+
+Gates: `internal/initdb` PASS (187 s), `TestE2E_PGColdStartOnGoopgDataDir` PASS
+plus two deliberate fail-when-broken runs (nailed rel removed → the original
+`could not open relation with OID 3256`; placeholder OID removed → no
+`base/1/3256`), whole `^TestE2E_` family PASS (99 s), `go build ./...` + `go
+vet` clean, UNITS PASS, pgbench smoke via the commit hook.
+
+## Implementation status — S9.3f (2026-08-12)
+
+**The corpus is 79 of upstream's 80, and getting the last-but-one view cost a
+catalog-DESCRIPTION repair nobody had asked for.** `pg_seclabels` (12099) is
+the largest and most connected blob the corpus has ever hosted: a 13-branch
+`UNION ALL` over `pg_seclabel` and `pg_shseclabel`, joining pg_class,
+pg_attribute, pg_proc, pg_type, pg_largeobject_metadata, pg_language,
+pg_namespace, pg_event_trigger, pg_publication, pg_subscription, pg_database,
+pg_tablespace and pg_authid — 203378 B raw, 34093 B stored over 18 TOAST
+chunks (upstream: 35379 B / 18).
+
+Landed, in the order the hosted PG demanded it:
+
+1. **The two missing base catalogs** (S9.3e's construction, twice).
+   `pgSecLabelAttrs()` + `{3596, "pg_seclabel", 83, 'r', 5, …}` and
+   `pgLargeObjectMetadataAttrs()` + `{2995, "pg_largeobject_metadata", 83,
+   'r', 3, …}` in `nailedLocalRels`, with `2995` joining
+   `mappedLocalCatalogPlaceholderOIDs()` (3596 was already there, laying down
+   a file no pg_class row named). Both heaps stay EMPTY, which is what
+   upstream's own bootstrap leaves for a cluster that has never labelled
+   anything and owns no large objects. Both were proven load-bearing by
+   scripted revert: dropping either row reproduces `could not open relation
+   with OID 3596` / `… 2995` verbatim.
+   `pg_largeobject` (2613) is deliberately NOT added: the view's reference is
+   `l.classoid = 'pg_catalog.pg_largeobject'::regclass`, which upstream's
+   CREATE VIEW folded to a Const inside the captured ev_action, so nothing
+   resolves that name at run time.
+2. **pg_type 14 → 32 columns** (F27, below) and **pg_language 7 → 9**
+   (F28) — the descriptors, and for pg_language the heap row too.
+3. `{"pg_seclabels", 12099, 12102, 12101, 8}` pinned, the whole 79-view list
+   re-captured with `scripts/capture-ev-action.sh`, `nailed_view_seed_data.go`
+   regenerated. **Every other `.dat` blob came back byte-identical** — the
+   second free re-run of S8b.2's `--verify` over the whole corpus.
+
+### Findings — S9.3f
+
+**F27 — a join RTE resolves EVERY column, and that is what audits a catalog's
+description.** A hosted PG failed `SELECT * FROM pg_seclabels` with `cache
+lookup failed for attribute 15 of relation 1247`. The view selects four
+pg_type columns (oid, typname, typnamespace, typtype — attnums 1/2/3/7, and
+the blob's own `selectedCols` bitmap says exactly that), but `expandRTE` on
+the join RTE walks every joinaliasvar and calls
+`get_rte_attribute_is_dropped` → `SearchSysCache2(ATTNUM)`
+(`parse_relation.c:3414`) for each. Attribute 15 of pg_type is `typarray`.
+
+goopg's on-disk pg_type described **14** columns where PG18 has 32 — and it
+was not merely short. Past attnum 12 the numbering DIVERGED: goopg declared
+`typelem` at 13 and `typarray` at 14, where PG18 has `typsubscript`, `typelem`,
+`typarray` at 13/14/15. The pg_type HEAP has carried all 32 values in
+upstream's order since M0106 (`pgTypeColDefs`/`pgTypeRow`, and
+`internal/catalog/codec.go:730` and `internal/executor/pg18_user_catalog_rows.go`
+both mirror the 32-column shape) — so what was wrong was only the
+pg_attribute/pg_class DESCRIPTION of those bytes. Every consumer that reached
+the heap through the codec was right; the nailed descriptor was the odd one
+out. `pgTypeAttrs()` now carries upstream's 32 with upstream's attnums and the
+nailed rel says `relnatts = 32`.
+
+This is the general lesson, not a pg_type anecdote: **a view that joins a
+catalog audits that catalog's whole description, not the columns it reads.**
+Every earlier corpus member selected columns; none joined a catalog whose
+description was incomplete.
+
+**F28 — pg_language was genuinely short, and the fix had to move the heap
+too.** The next error was `cache lookup failed for attribute 8 of relation
+2612`. Unlike pg_type this was a self-consistent truncation — descriptor AND
+heap stopped at `laninline` (7 columns) — so completing it meant writing the
+two missing columns as well: `lanvalidator` with its real BKI values
+(`fmgr_{internal,c,sql}_validator` = 2246/2247/2248, `pg_language.dat`) and the
+CATALOG_VARLEN `lanacl`, NULL in every bootstrap row exactly as upstream. Both
+halves moved in one commit (`pg_language_bootstrap.go` +
+`pgLanguageAttrs()`/relnatts 9), because a descriptor that promises columns the
+heap does not hold is the strictly worse failure.
+
+The other eleven catalogs `pg_seclabels` joins were checked against a freshly
+initdb'd PG 18.3's own `pg_class.relnatts` and all agreed (pg_class 34,
+pg_attribute 25, pg_proc 30, pg_authid 12, pg_database 18, pg_tablespace 5,
+pg_subscription 18, pg_publication 10, pg_event_trigger 7, pg_shseclabel 4).
+`pg_namespace` is the one remaining disagreement — goopg describes 5 columns
+where PG18 has 4 — and it did not block this view; ledgered.
+
+**F29 — the absence probe leaves pg_catalog.** `assertNonCorpusSystemViewIsStillAbsent`
+has been re-pointed four times, each time by the slice that adopted its
+subject. S9.3f exhausts the supply: the ONE remaining un-adopted view,
+`pg_stats_ext_exprs`, cannot hold the role because its failure trips
+`Assert("OidIsValid(typentry->typrelid)")` (`typcache.c:3082`) and takes the
+backend down, and an absence guard must fail QUIETLY. The probe therefore moves
+to `information_schema.tables` — absent one level LOWER than any predecessor,
+since goopg bootstraps exactly three namespaces and `information_schema` is not
+among them. It is a valid non-corpus relation today and becomes S9.4's own
+fail-when-fixed tripwire tomorrow.
+
+**Ceilings after S9.3f: one, unchanged — #6.** `pg_stats_ext_exprs` (12063)
+needs a real `pg_type` row for **10029**, `pg_statistic`'s composite rowtype.
+Every other pg_catalog view in upstream's 80 is on disk and evaluable by a
+hosted PG. Then S9.4 (`information_schema`, 65 views, expected to defer).
+
+Gates: `internal/initdb` PASS (214 s), `TestE2E_PGColdStartOnGoopgDataDir` PASS
+plus two deliberate fail-when-broken runs (each nailed rel removed in turn →
+`could not open relation with OID 3596` / `2995`), whole `^TestE2E_` family
+PASS (102 s), UNITS PASS, `go build ./...` + `go vet` clean, pgbench smoke via
+the commit hook. Three expectation guards moved with the change and are part of
+the acceptance, not collateral: pg_type's column count (14 → 32,
+`initdb_test.go`), `base/{1,5}/2838`'s page count (6 → 10) and the toasted-rule
+set (four → five, +12102).
+
+## Implementation status — S9.3g (2026-08-12)
+
+**The corpus is upstream's 80 of 80.** `pg_stats_ext_exprs` (12063) is on disk
+and evaluable on a hosted PG, ceiling #6 is closed, and no `pg_catalog` view
+from `system_views.sql` is left out.
+
+Landed:
+
+1. **A real `pg_type` row for 10029**, `pg_statistic`'s composite rowtype:
+   `pgTypeCanonical(10029)` (`'c'`/`'C'`, `'d'`/`'x'`, the record I/O quad
+   2290/2291/2402/2403), `pgTypeElemArrayOverlay[10029] = {0, 10028, 0}` and a
+   new `pgTypeRelidOverlay` — `pgTypeRow` had hardcoded `typrelid = 0` for
+   every row since M0106, which is correct for base/pseudo/array types and
+   fatal for a composite.
+2. **`nailedLocalRels{2619}.RelType` 83 → 10029.** The two halves are coupled
+   by construction rather than by comment: `pgTypeBootstrapEntryMap()` now
+   derives part of its OID set from `nailedRel.RelType`, so reverting the
+   pg_class side deletes the pg_type row with it (measured — break direction 2
+   below reproduces break direction 1's error, not a different one).
+3. `{"pg_stats_ext_exprs", 12063, 12066, 12065, 17}` pinned, the whole 80-view
+   list re-captured, `nailed_view_seed_data.go` regenerated. All 79 incumbent
+   `.dat` blobs came back byte-identical — the third free whole-corpus
+   `--verify`.
+4. **F30 — the crash was not the missing row.**
+
+### Findings — S9.3g
+
+**F30 — `typtype='c'` is a promise about `typrelid`, and goopg had made it five
+times without keeping it.** With the 10029 row seeded, a hosted PG still died on
+`TRAP: failed Assert("OidIsValid(typentry->typrelid)")` — from
+`add_paths_to_joinrel` → `lookup_type_cache`, i.e. type-caching an operand,
+nothing to do with the new row. The culprit was `_pg_statistic` (10028), which
+goopg typed `'c'` with an explicit comment that the value "carries no special
+meaning for the standby's `TupleDescInitEntry` path". True of that path, false
+of every other: an ARRAY of a composite is a BASE type upstream (`typtype='b'`,
+verified against a fresh PG 18.3), and `insert_rel_type_cache_if_needed`
+(`typcache.c:3082`) asserts a valid `typrelid` for anything claiming `'c'`. A
+composite row with `typrelid = 0` does not degrade — it takes the backend down,
+which is why this could never have been the absence probe (F29).
+
+The same audit found **four more** already-shipped instances: the
+`BKI_ROWTYPE_OID` rows 71/75/81/83 (`pg_type`, `pg_attribute`, `pg_proc`,
+`pg_class`), generated out of `pg_type.dat` by `cmd/gen-pg-type-data` since
+M0106 and seeded with `typrelid = 0`. They were latent only because nothing had
+yet type-cached a catalog rowtype as a VALUE rather than reading the catalog.
+All five now resolve through `pgTypeRelidOverlay`, and
+`TestPgTypeCompositeRowsCarryTyprelid` pins the invariant in both directions:
+every seeded `typtype='c'` row has a `typrelid`, that OID names a nailed
+relation, and that relation's `RelType` points back — `pg_class.reltype` and
+`pg_type.typrelid` are mutual inverses.
+
+The generalisable lesson is the twin of F27's. F27: *a view that joins a catalog
+audits that catalog's whole description.* F30: *a field goopg fills in for one
+consumer's benefit is read by every other consumer too* — the 10028 comment
+scoped its own correctness to the one code path the author had in mind, and the
+value stayed wrong for five years' worth of others.
+
+**Ceilings after S9.3g: none.** Every view in `system_views.sql` is on disk and
+evaluable. S9's remaining sub-slice is S9.4 (`information_schema`, 65 views,
+expected to defer), whose fail-when-fixed tripwire —
+`information_schema.tables` in `assertNonCorpusSystemViewIsStillAbsent` — F29
+already put in place.
+
+Gates: `internal/initdb` PASS (226 s), `TestE2E_PGColdStartOnGoopgDataDir` PASS
+plus two scripted break directions (dropping the 10029 row and reverting
+`RelType` both yield `type with OID 10029 does not exist`; the pre-fix 10028
+`typtype` reproduced the `typcache.c:3082` TRAP live), whole `^TestE2E_` family
+PASS (106 s), UNITS PASS, `go build ./...` + `go vet` clean, pgbench smoke via
+the commit hook. Three expectation guards moved with the capture, as always:
+the toasted-rule set (five → six, +12066 at 6 chunks), `base/{1,5}/2838`
+(10 → 12 pages) and the hosted-PG chunk list (`12067/6/11089`; upstream stores
+11481 B, the usual 3-4% pglz divergence).
+
+## S9.4 — `information_schema`: MEASURED, then deferred (2026-08-12)
+
+S9.4 is the last item in S9 and the plan always expected it to end in a ledger
+row. That expectation is now **measured rather than asserted**. The measurement
+recipe is the oracle recipe from S9.3g: `initdb` a throwaway PG 18.3 cluster out
+of `postgres/local_install`, start it on a private socket
+(`pg_ctl -o "-p 5539 -k $D -h ''"` — bare `-k` still binds TCP), and query it.
+Everything below is a number that cluster answered, not a reading of
+`information_schema.sql`.
+
+### What the corpus actually is
+
+| catalog | rows S9.4 would have to seed | measured |
+|---|---|---|
+| `pg_namespace` | 1 (`information_schema`, OID **13273**) | `select oid from pg_namespace` |
+| `pg_class` | **69** — 65 views + **4 real tables** | `relnamespace=13273` group by `relkind` |
+| `pg_type` | **148** — 5 domains + 69 relation rowtypes + 74 array peers (one per) | `typnamespace=13273`, OIDs 13286..13621 |
+| `pg_attribute` | **696** user columns | `attnum>0` |
+| `pg_rewrite` | **65** rules, **1.81 MB** of `ev_action` text | max 210 908 B (`columns`) |
+| `pg_proc` | **11** helper functions, OIDs 13274..13285 | `pronamespace=13273` |
+| `pg_constraint` | **2** domain CHECKs (`cardinal_number_domain_check`, `yes_or_no_check`) | `connamespace=13273` |
+| heap rows | **801** — `sql_features` 755, `sql_sizing` 23, `sql_implementation_info` 12, `sql_parts` 11 | `count(*)` per table |
+
+### Five findings that change the shape of the successor slice
+
+**F31 — goopg's `information_schema` namespace OID was wrong, and it is a
+client-visible value.** `internal/catalog/catalog.go` registered `13183` under
+the comment "stock PG18 initdb-assigned OID". Two independent fresh initdbs of
+`postgres/local_install` both answer **13273**; no run of this build produces
+13183. The constant is not inert — it is what the virtual
+`pg_catalog.pg_namespace` reports to every client and what `SchemaNameForOID`
+reverses on the restart path. **Fixed in this slice** (the only code landed by
+S9.4) and pinned by `TestBootstrapNamespaceOIDsMatchPG18`, which also documents
+the measurement recipe so a PG rebase re-measures instead of guessing.
+
+The reason the value cannot be looked up in a `.dat` file is the same reason S9
+had to pin the view OIDs: `information_schema` is created *after* bootstrap, by
+initdb running `information_schema.sql`, so it draws from the post-bootstrap
+counter at `FirstUnpinnedObjectId = 12000`. That counter is one sequence shared
+with S9's own corpus — measured occupancy: **12000..12355** the 80
+`system_views.sql` views (exactly the band S9 pinned, confirming every pin
+against the oracle: `pg_stats_ext_exprs` 12063, `pg_seclabels` 12099),
+**12356..13272** almost entirely the **894 `pg_description`** comment rows for
+them, then **13273..13621** the whole `information_schema` band. S9's pins and
+S9.4's future pins are two ends of one counter.
+
+**F32 — S9.4 has ZERO dependency on S9.1–S9.3.** Measured through `pg_depend`:
+no `information_schema` rewrite rule references any `pg_catalog` **view**
+(count = 0; they go straight to base catalogs). The 14 view-on-view edges that
+made S9.3 order-sensitive have no analogue here, so the successor milestone is
+schedulable independently and in any internal order — it is not blocked on, and
+does not extend, the 80-view corpus.
+
+**F33 — the TOAST ceiling is already discharged, and S9.4 needs it heavily.**
+11 of the 65 rules still exceed the ~8160 B inline limit *after* pglz
+(`columns` 24 201 B, `transforms` 19 659 B, `check_constraints` 16 059 B, …).
+That would have been a hard blocker before M0131-S20.2, but the `pg_rewrite`
+TOAST writer landed there and the pg_catalog corpus already ships **6** toasted
+rules of its own (`pg_seclabels` compresses to 35 379 B — larger than anything
+in `information_schema`). So the biggest-looking ceiling in the original S9 list
+is the one prerequisite S9.4 does **not** need work for.
+
+**F34 — 10 of the 11 helper functions are new-style SQL-body functions, i.e. a
+SECOND node-tree capture surface.** Only `_pg_expandarray` has a `prosrc`
+(51 B); `_pg_index_position`, `_pg_truetypid`, `_pg_truetypmod`,
+`_pg_char_max_length`, `_pg_char_octet_length`, `_pg_numeric_precision`,
+`_pg_numeric_precision_radix`, `_pg_numeric_scale`, `_pg_datetime_precision`
+and `_pg_interval_type` all carry `prosrc = ''` and a non-null **`prosqlbody`**,
+which is a `pg_node_tree` exactly like `ev_action`. The same conclusion as the
+`pgnodes` non-path therefore applies to it: these must be **captured**, not
+generated, and `capture-ev-action.sh` currently has no `prosqlbody` mode.
+
+**F35 — four of the 69 relations are tables with content, which no S9 slice has
+ever produced.** `sql_features` (755 rows), `sql_sizing` (23),
+`sql_implementation_info` (12) and `sql_parts` (11) are ordinary heaps that
+initdb `COPY`s from `sql_features.txt`. Every S9 slice so far seeded *metadata*
+for relations whose rows a hosted PG computes; here the 801 rows are the data.
+That is a distinct mechanism (bulk heap load at initdb time), and it is the
+reason S9.4 cannot be a "just capture 65 more blobs" slice.
+
+### Why it is deferred rather than dribbled
+
+The one thing S9.4 must not do is land a namespace and fill it later. The
+`information_schema` name is already resolvable in goopg's own front end
+(8 virtual relations, `registerInformationSchemaTables`), so an on-disk
+namespace holding 0 of its 69 relations would report a schema that exists and
+is empty — strictly worse for a hosted PG than today's clean absence, and the
+exact anti-pattern that a half-filled `pg_type` produced earlier in this
+milestone (an IN-list that worked at all-zero broke at half-filled). The
+prerequisites are also genuinely serial in a way S9.3's were not: the domains
+must exist before any view's `pg_attribute` types resolve, the 11 functions
+before any view body does, and the 4 tables' data before `sql_features` answers.
+
+So S9.4 lands **only F31** and defers the corpus, with the decomposition below
+as the resume point. Ledger rows filed; the fix_plan item stays unchecked.
+
+### Successor decomposition (the resume point, in dependency order)
+
+1. **S9.4a** — `information_schema` namespace row (13273) **plus** the 5 domains
+   + their 5 array peers + the 2 domain CHECK constraints, atomically.
+2. **S9.4b** — the 11 helper functions; needs a `prosqlbody` capture mode in
+   `capture-ev-action.sh` (F34) for 10 of them.
+3. **S9.4c** — the 4 data tables and their 801 heap rows (F35).
+4. **S9.4d..** — the 65 views in `information_schema.sql` order, reusing the S9
+   capture/pin/regen loop unchanged; 11 of them exercise the TOAST writer (F33).
+
+Ceiling check for the successor: none of the S9 ceilings survive as blockers —
+#1 TOAST is discharged (F33), the OID-collision objection is void for the same
+reason it was in S8 (`FirstUserOID = 16384` floors every minted OID, and the
+13273..13621 band is below it), and the dual-definition hazard is bounded to the
+**8** relations goopg answers virtually rather than all 69.
+
+### Re-verification of §S9.4 at HEAD (2026-08-12, closure loop)
+
+The S24 closure loop's lesson was that a design doc's own findings are a
+hypothesis until re-measured — its two cited line numbers had drifted and one of
+its four claims was simply wrong. §S9.4 was therefore re-measured *before* its
+numbers were promoted into a milestone filing, against a fresh throwaway PG 18.3
+built the same way (`initdb` out of `postgres/local_install`, started with
+`pg_ctl -o "-p 5539 -k $D -h ''"`). **All thirteen measurements reproduce
+exactly** — namespace 13273; 69 `pg_class` rows as 65 `v` + 4 `r`; 148 `pg_type`
+rows of which 5 are domains, band 13286..13621; 696 `pg_attribute` rows;
+65 `pg_rewrite` rules summing 1 814 056 B with a 210 908 B maximum (`columns`);
+11 `pg_proc` helpers at 13274..13285 of which **10** carry a non-null
+`prosqlbody`; the 2 domain CHECKs by name; the 4 data tables by name; **11**
+rules over the 8160 B inline ceiling; and **0** `pg_depend` edges from an
+`information_schema` rule to a `pg_catalog` view (F32's independence claim).
+
+Two claims were re-checked in-repo rather than against the oracle, because they
+are the ones that would set a wrong resume point: `internal/catalog/catalog.go`
+does register `13273` (F31 landed, and no `13183` survives outside the test's
+explanatory comment), and `scripts/capture-ev-action.sh` still has **no**
+`prosqlbody` mode (F34's blocker for S9.4b is live).
+
+So, unlike S24, this doc's findings promote unchanged. The successor
+decomposition below is filed as **M0133-S1..S4** at the foot of
+`.ralph/fix_plan.md` — a design-doc section is not a schedulable resume point,
+and "closed with a forward reference to a doc" is the failure mode the deferral
+rule exists to prevent.
 
 ## References
 

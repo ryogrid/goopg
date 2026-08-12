@@ -96,6 +96,45 @@ class AnalyzeUnitsClassificationTest(unittest.TestCase):
         self.assertNotIn("units/internal/amcheck", reg_subjects)
         self.assertNotIn("units/cmd/goopg", reg_subjects)
 
+    def test_build_failed_packages_collapse_into_one_infra_item(self):
+        """Run 20260813-005117: one broken file, 8 phantom "regressions".
+
+        `undefined: pgDateTimeKeywords` in internal/executor failed every
+        package that imports it. The units stage had PASSED 53 s earlier on the
+        same sha (dirty=62), so nothing was wrong with the code — the tree was
+        edited mid-run. Packages that never compiled must be ONE infra item,
+        while a package that genuinely ran and failed still reports.
+        """
+        log = (
+            "?   \tgithub.com/goopg/goopg/cmd/diag\t[no test files]\n"
+            "# github.com/goopg/goopg/internal/executor\n"
+            "internal/executor/time_zone_token.go:116:6: undefined: pgDateTimeKeywords\n"
+            "FAIL\tgithub.com/goopg/goopg/cmd/gen-oracle-report [build failed]\n"
+            "FAIL\tgithub.com/goopg/goopg/cmd/goopg [build failed]\n"
+            "FAIL\tgithub.com/goopg/goopg/internal/executor [build failed]\n"
+            "FAIL\tgithub.com/goopg/goopg/internal/initdb [build failed]\n"
+            "ok  \tgithub.com/goopg/goopg/internal/planner\t16.887s\n"
+            "--- FAIL: TestCheckpointerVolumeTrigger (2.02s)\n"
+            "    checkpointer_test.go:281: volume trigger did not fire within 2s\n"
+            "FAIL\tgithub.com/goopg/goopg/internal/wal\t13.478s\n"
+        )
+        it = self._run_analyze(log)
+
+        reg_subjects = {r["subject"] for r in it.regressions}
+        # The package that actually ran and failed is still a real regression.
+        self.assertIn("units/internal/wal", reg_subjects)
+        # The four that never compiled are not.
+        for rel in ("cmd/gen-oracle-report", "cmd/goopg", "internal/executor", "internal/initdb"):
+            self.assertNotIn(f"units/{rel}", reg_subjects)
+
+        self.assertEqual(len(it.build_kills), 1)
+        bk = it.build_kills[0]
+        self.assertEqual(bk["kind"], "infra")
+        self.assertEqual(bk["subject"], "units/build-broke-mid-stage")
+        self.assertIn("4 package(s)", bk["what"])
+        # The compiler's own text must ride along so triage needn't open the log.
+        self.assertIn("undefined: pgDateTimeKeywords", bk["what"])
+
     def test_pure_resource_kill_log_with_no_real_fail(self):
         log = SYNTHETIC_UNITS_LOG.replace(
             "--- FAIL: TestStripeAppendConcurrentDrainConsistency (0.00s)\n"

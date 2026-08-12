@@ -1610,6 +1610,172 @@ func PageApplyHeapLockUpdatedRedo(p Page, slot uint16, xmax TransactionID, infom
 	return nil
 }
 
+// pageSetPrunablePG mirrors upstream's PageSetPrunable (bufpage.h): pd_prune_xid
+// keeps the OLDEST xid that might have made a tuple on the page prunable, so the
+// field is only lowered, never raised. goopg's *producer* helpers
+// (PageStampHotOldTuple and friends) keep the NEWEST instead — a pre-existing
+// divergence that is out of this routine's scope; the redo helpers below take
+// upstream's rule because they mirror heap_xlog_delete / heap_xlog_update, which
+// pass the RECORD's xid (not the stamped xmax — which may be a MultiXactId and
+// therefore not an xid at all).
+//
+// The comparison is plain rather than wraparound-aware, matching every other
+// pd_prune_xid site in this file.
+func pageSetPrunablePG(p Page, xid TransactionID) {
+	if xid == InvalidTransactionID {
+		return
+	}
+	h := MustHeader(p)
+	if cur := TransactionID(h.PruneXID()); cur == InvalidTransactionID || xid < cur {
+		h.SetPruneXID(uint32(xid))
+	}
+}
+
+// PageApplyHeapDeleteRedo re-applies a PostgreSQL XLOG_HEAP_DELETE record's
+// tuple mutation, mirroring heap_xlog_delete (heapam_xlog.c:...) M0131-S21h.
+//
+// It is the redo sibling of PageSetHeapTupleXmax, and deliberately NOT the same
+// function, for the same reason PageApplyHeapLockRedo is not PageSetHeapTuple-
+// LockOnly: the runtime helper stamps a delete goopg is performing right now
+// (always a plain deleter xid), whereas redo must reproduce whatever PG decided.
+// A real PG's xl_heap_delete carries infobits_set, and its xmax is a
+// **MultiXactId** whenever the deleted row was also held by a locker (the FK
+// FOR KEY SHARE case is the commonest). Replaying that as a bare xid — which is
+// what the pre-S21h path did — leaves a page whose xmax is a multi wearing an
+// xid's clothes: mvcc.TupleVisible then judges the delete against an arbitrary
+// transaction id instead of taking its conservative IS_MULTI branch.
+//
+// infomaskBits / infomask2Bits are the OUTPUT of upstream's
+// fix_infomask_from_infobits — the WAL layer, which owns the XLHL_* wire bits,
+// has already translated infobits_set.
+//
+// Order of operations, all from heap_xlog_delete:
+//
+//  1. clear HEAP_XMAX_BITS and HEAP_MOVED in t_infomask, HEAP_KEYS_UPDATED and
+//     HEAP_HOT_UPDATED in t_infomask2, then OR in the record's bits;
+//  2. stamp xmax — unless XLH_DELETE_IS_SUPER, where upstream instead clears
+//     xmin so the speculatively inserted tuple is dead to every snapshot;
+//  3. cmax = FirstCommandId with HEAP_COMBOCID cleared;
+//  4. PageSetPrunable(pruneXID) — the record's xid;
+//  5. t_ctid: the moved-partitions sentinel under XLH_DELETE_IS_PARTITION_MOVE,
+//     else self-pointing at (blk, slot).
+//
+// The page's PD_ALL_VISIBLE bit and the visibility map are NOT touched here;
+// see the caller. Callers hold the page write lock and set pd_lsn themselves.
+func PageApplyHeapDeleteRedo(p Page, slot uint16, xmax TransactionID, infomaskBits, infomask2Bits uint16,
+	blk BlockNumber, pruneXID TransactionID, isSuper, movedPartitions bool,
+) error {
+	off, err := heapRedoTupleOffset(p, slot)
+	if err != nil {
+		return err
+	}
+	infomask2 := binary.LittleEndian.Uint16(p[off+18 : off+20])
+	infomask := binary.LittleEndian.Uint16(p[off+20 : off+22])
+
+	infomask &^= HeapXmaxBits | HeapMoved
+	infomask2 &^= HeapKeysUpdated | HeapHotUpdated
+	infomask |= infomaskBits & (HeapXmaxIsMulti | HeapXmaxLockOnly | HeapXmaxExclLock | HeapXmaxKeyShrLock)
+	infomask2 |= infomask2Bits & HeapKeysUpdated
+
+	if isSuper {
+		binary.LittleEndian.PutUint32(p[off:off+4], uint32(InvalidTransactionID))
+	} else {
+		binary.LittleEndian.PutUint32(p[off+4:off+8], uint32(xmax))
+	}
+	binary.LittleEndian.PutUint32(p[off+8:off+12], uint32(FirstCommandId))
+	infomask &^= HeapComboCID
+
+	if movedPartitions {
+		binary.LittleEndian.PutUint32(p[off+12:off+16], uint32(InvalidBlockNumber))
+		binary.LittleEndian.PutUint16(p[off+16:off+18], MovedPartitionsOffsetNumber)
+	} else {
+		binary.LittleEndian.PutUint32(p[off+12:off+16], uint32(blk))
+		binary.LittleEndian.PutUint16(p[off+16:off+18], slot)
+	}
+
+	binary.LittleEndian.PutUint16(p[off+18:off+20], infomask2)
+	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
+	pageSetPrunablePG(p, pruneXID)
+	return nil
+}
+
+// PageApplyHeapUpdateOldRedo re-applies the OLD-tuple half of a PostgreSQL
+// XLOG_HEAP_UPDATE / XLOG_HEAP_HOT_UPDATE record, mirroring heap_xlog_update's
+// old-version block byte for byte. M0131-S21h.
+//
+// It is the redo sibling of PageStampUpdatedOldTuple / PageStampHotOldTuple and
+// exists for the same reason PageApplyHeapDeleteRedo does: old_infobits_set is
+// the only place a record says the old version's xmax is a MultiXactId (an
+// UPDATE of a row a concurrent xact holds FOR KEY SHARE), and the producer-side
+// helpers cannot express it because goopg's own emit never sets those bits.
+//
+// hot selects upstream's HeapTupleHeaderSetHotUpdated / ClearHotUpdated branch;
+// newBlk/newSlot are the forward chain link (upstream's newtid), which for a HOT
+// update is the same page.
+func PageApplyHeapUpdateOldRedo(p Page, oldSlot uint16, xmax TransactionID, infomaskBits, infomask2Bits uint16,
+	hot bool, newBlk BlockNumber, newSlot uint16, pruneXID TransactionID,
+) error {
+	off, err := heapRedoTupleOffset(p, oldSlot)
+	if err != nil {
+		return err
+	}
+	infomask2 := binary.LittleEndian.Uint16(p[off+18 : off+20])
+	infomask := binary.LittleEndian.Uint16(p[off+20 : off+22])
+
+	infomask &^= HeapXmaxBits | HeapMoved
+	infomask2 &^= HeapKeysUpdated
+	if hot {
+		infomask2 |= HeapHotUpdated
+	} else {
+		infomask2 &^= HeapHotUpdated
+	}
+	infomask |= infomaskBits & (HeapXmaxIsMulti | HeapXmaxLockOnly | HeapXmaxExclLock | HeapXmaxKeyShrLock)
+	infomask2 |= infomask2Bits & HeapKeysUpdated
+
+	binary.LittleEndian.PutUint32(p[off+4:off+8], uint32(xmax))
+	binary.LittleEndian.PutUint32(p[off+8:off+12], uint32(FirstCommandId))
+	infomask &^= HeapComboCID
+
+	binary.LittleEndian.PutUint32(p[off+12:off+16], uint32(newBlk))
+	binary.LittleEndian.PutUint16(p[off+16:off+18], newSlot)
+
+	binary.LittleEndian.PutUint16(p[off+18:off+20], infomask2)
+	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
+	pageSetPrunablePG(p, pruneXID)
+	return nil
+}
+
+// heapRedoTupleOffset resolves a 1-based slot to the tuple's byte offset on the
+// page, with the checks every heap-redo helper repeats: the line pointer must
+// exist and be LP_NORMAL, and the fixed 23-byte header must be in bounds.
+// Upstream elog(PANIC, "invalid lp") here; goopg returns the error so the caller
+// can name the record that carried the bad offset.
+func heapRedoTupleOffset(p Page, slot uint16) (int, error) {
+	if slot == 0 {
+		return 0, ErrInvalidSlot
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return 0, err
+	}
+	idx := int(slot) - 1
+	if idx < 0 || idx >= count {
+		return 0, ErrInvalidSlot
+	}
+	item, err := readItemID(p, idx)
+	if err != nil {
+		return 0, err
+	}
+	if item.Flags != ItemIDNormal {
+		return 0, fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, slot, item.Flags)
+	}
+	off := int(item.Offset)
+	if off+22 > len(p) {
+		return 0, fmt.Errorf("%w: slot=%d off=%d", ErrCorruptTuple, slot, off)
+	}
+	return off, nil
+}
+
 // PageSetHeapTupleXmaxMulti stamps the given heap tuple's xmax with a
 // MultiXactId and the caller-computed hint bits (see internal/multixact.HintBits).
 // It is the multixact sibling of PageSetHeapTupleLockOnly: where that helper

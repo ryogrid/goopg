@@ -140,14 +140,44 @@ func pgTypeCanonical(oid uint32) (pgTypeEntry, bool) {
 		// inet: variable-length IP-address type; typcategory='I', typstorage='m'.
 		// inet_in=910, inet_out=911, inet_recv=2496, inet_send=2497.
 		return pgTypeEntry{869, "inet", -1, false, 'b', 'I', 'i', 'm', 910, 911, 2496, 2497}, true
+	case 1000:
+		// _bool: the array of bool (16). M0131-S20.2b —
+		// pg_stats_ext.most_common_val_nulls / most_common_base_freqs are the
+		// first nailed-view columns of a boolean array, and capture guard #5's
+		// sibling (the atttypid check) refused pg_stats_ext until the canonical
+		// table carried it. typalign 'i', not bool's own 'c' (Catalog.pm:469).
+		return pgTypeEntry{1000, "_bool", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
 	case 1002:
 		return pgTypeEntry{1002, "_char", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
+	case 1003:
+		// _name: the array of name (19). M0131-S9.2d — pg_policies.roles is
+		// `name[]`, the first nailed-view column of this type, and capture
+		// guard #5 refused the view until the canonical table carried it.
+		// typalign is 'i', NOT name's own 'c': Catalog.pm:469 gives an array
+		// type 'd' when its element is 'd' and 'i' otherwise.
+		return pgTypeEntry{1003, "_name", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
 	case 1021:
 		return pgTypeEntry{1021, "_float4", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
+	case 1022:
+		// _float8: the array of float8 (701). M0131-S20.2b —
+		// pg_stats.most_common_freqs / correlation's siblings and
+		// pg_stats_ext.most_common_freqs. typalign is 'd' here, NOT the 'i'
+		// every other array above carries: Catalog.pm:469 gives an array type
+		// 'd' when its element is 'd', and float8's typalign IS 'd' (measured
+		// on the oracle, pg_type oid 1022). Getting this wrong misaligns every
+		// element a hosted PG deforms out of the column.
+		return pgTypeEntry{1022, "_float8", -1, false, 'b', 'A', 'd', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
 	case 1007:
 		return pgTypeEntry{1007, "_int4", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
 	case 1009:
 		return pgTypeEntry{1009, "_text", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
+	case 2206:
+		// regtype: the OID-alias type, pg_type.dat:389-392. M0131-S9.2d —
+		// pg_sequences.data_type is `regtype`, the first nailed-view column
+		// of the SCALAR type; its array (2211) was already canonical below.
+		// typstorage 'p' (fixed 4-byte by-value), regtypein/out 2220/2221,
+		// regtyperecv/send 2454/2455 (pg_proc.dat:7421-7426, 8297-8302).
+		return pgTypeEntry{2206, "regtype", 4, true, 'b', 'N', 'i', 'p', 2220, 2221, 2454, 2455}, true
 	case 2211:
 		// _regtype: the array of regtype (2206), pg_type.dat:389.
 		return pgTypeEntry{2211, "_regtype", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
@@ -190,11 +220,36 @@ func pgTypeCanonical(oid uint32) (pgTypeEntry, bool) {
 	case 5017:
 		return pgTypeEntry{5017, "pg_mcv_list", -1, false, 'b', 'Z', 'i', 'x', 5018, 5019, 5020, 5021}, true
 	case 10028:
-		// rowtype array for pg_statistic — typtype='c' carries no special
-		// meaning for the standby's TupleDescInitEntry path; the load-
-		// bearing fields are typalign='d' + typstorage='x'. Uses the
-		// generic array I/O quad like every other multi-dim array.
-		return pgTypeEntry{10028, "_pg_statistic", -1, false, 'c', 'A', 'd', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
+		// rowtype array for pg_statistic. Uses the generic array I/O quad
+		// like every other array type.
+		//
+		// M0131-S9.3g corrected typtype 'c' → 'b'. The original comment here
+		// said "typtype='c' carries no special meaning for the standby's
+		// TupleDescInitEntry path; the load-bearing fields are typalign='d' +
+		// typstorage='x'" — true of that path, false of every other. An ARRAY
+		// of a composite is a BASE type upstream ('b', verified against a
+		// fresh PG 18.3's own pg_type), and PG treats typtype='c' as a promise
+		// that typrelid is valid: insert_rel_type_cache_if_needed() asserts
+		// exactly that (typcache.c:3082). goopg's row promised a composite
+		// with typrelid = 0, so the first planner path that type-cached 10028
+		// — add_paths_to_joinrel on pg_stats_ext_exprs — killed the backend.
+		return pgTypeEntry{10028, "_pg_statistic", -1, false, 'b', 'A', 'd', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
+	case 10029:
+		// M0131-S9.3g: pg_statistic's own COMPOSITE rowtype — the element
+		// type 10028 above has pointed its typelem here since S9.3c, but no
+		// row described it, so a hosted PG evaluating pg_stats_ext_exprs
+		// (whose `unnest(sd.stxdexpr)` yields pg_statistic values) died with
+		// `type with OID 10029 does not exist` and then tripped
+		// Assert("OidIsValid(typentry->typrelid)") (typcache.c:3082) during
+		// abort. Values verbatim from a fresh PG 18.3's pg_type: composite
+		// rowtypes carry the record I/O quad (record_in/out/recv/send =
+		// 2290/2291/2402/2403), typcategory 'C', typalign 'd',
+		// typstorage 'x', typrelid = 2619 (pgTypeRelidOverlay) and typarray =
+		// 10028 (pgTypeElemArrayOverlay). The OID is initdb-assigned upstream,
+		// not a BKI_ROWTYPE_OID — pg_statistic.h declares none — so it is
+		// pinned here for the same reason S8a pins the view OIDs: goopg
+		// adopts upstream's assignment rather than minting its own.
+		return pgTypeEntry{10029, "pg_statistic", -1, false, 'c', 'C', 'd', 'x', 2290, 2291, 2402, 2403}, true
 	}
 	return pgTypeEntry{}, false
 }
@@ -283,11 +338,84 @@ func pgTypeCollationForOID(oid uint32) int64 {
 	}
 }
 
+// pgTypeElemArrayOverlay carries the {typelem, typarray, typsubscript} triple
+// for the OIDs that pgTypeCanonical() supplies but pg_type.dat does not — the
+// goopg-specific catalog rowtype arrays. Everything else comes from
+// pgTypeGeneratedElemArraySubscript (generated by cmd/gen-pg-type-data straight
+// out of pg_type.dat); TestPgTypeElemArrayCoversSeededEntries keeps the union
+// exhaustive over the bootstrap entry set.
+var pgTypeElemArrayOverlay = map[uint32][3]uint32{
+	// _pg_statistic: element is the pg_statistic composite rowtype, which
+	// initdb assigns 10029 in the same catalog order upstream's genbki does.
+	10028: {10029, 0, 6179},
+	// pg_statistic's rowtype (M0131-S9.3g): the reverse edge of the row
+	// above — typelem 0 (a composite is not an array), typarray 10028,
+	// typsubscript 0. Both directions verified against a fresh PG 18.3.
+	10029: {0, 10028, 0},
+}
+
+// pgTypeRelidOverlay carries typrelid for the bootstrapped pg_type rows that
+// describe a COMPOSITE rowtype of an on-disk catalog. Every other row goopg
+// seeds is a base/pseudo/array type, whose typrelid is legitimately 0 — which
+// is why pgTypeRow hardcoded the column until M0131-S9.3g.
+//
+// typrelid is not decorative here: PG's lookup_type_cache() asserts
+// `OidIsValid(typentry->typrelid)` for a typtype='c' entry (typcache.c:3082)
+// and dereferences it to build the record tupledesc, so a composite row with
+// typrelid = 0 is worse than no row at all — it crashes the backend instead of
+// raising an error.
+// The four BKI_ROWTYPE_OID rowtypes below come out of pg_type.dat via
+// cmd/gen-pg-type-data and had carried typrelid = 0 since M0106 — a latent
+// instance of the same crash, waiting for any query that type-caches
+// pg_class/pg_type/pg_proc/pg_attribute as a VALUE rather than reading the
+// catalog. TestPgTypeCompositeRowsCarryTyprelid keeps the two halves paired.
+var pgTypeRelidOverlay = map[uint32]uint32{
+	71:    1247, // pg_type
+	75:    1249, // pg_attribute
+	81:    1255, // pg_proc
+	83:    1259, // pg_class
+	10029: 2619, // pg_statistic — nailedLocalRels{2619}.RelType must agree
+}
+
+// pgTypeElemArraySubscriptForOID returns the PG18-canonical
+// {typelem, typarray, typsubscript} triple for a bootstrapped pg_type row.
+//
+// All three columns were hardcoded 0 for every row until M0131-S9.3c, and that
+// one defect produced three distinct hosted-PG failures:
+//
+//   - typarray = 0 makes get_array_type() fail, so a view whose target list
+//     holds an `ARRAY(SELECT …)` dies with `could not find array type for data
+//     type oid` (pg_group's grolist, ceiling #3).
+//   - typelem = 0 makes get_element_type() fail, so ExecInitExprRec's
+//     T_ArrayCoerceExpr arm (execExpr.c:1684-1688) dies with `target type is
+//     not an array` (pg_publication_tables, ceiling #5).
+//   - typsubscript = 0 makes IsTrueArrayType() false even when typelem is
+//     right, so `x = ANY(ARRAY[…])` — which is what the parser builds for any
+//     `IN (…)` list once typarray resolves — dies with `op ANY/ALL (array)
+//     requires array on right side` in make_scalar_array_op
+//     (parse_oper.c:800). Populating typelem/typarray WITHOUT typsubscript is
+//     therefore a regression, not a partial fix: it moves IN-lists off the
+//     OR-chain fallback and onto a ScalarArrayOpExpr that then cannot resolve.
+//
+// Unknown OIDs report 0/0/0, which is what every row carried before; the
+// coverage guard keeps that fallback unreachable for the bootstrap set.
+func pgTypeElemArraySubscriptForOID(oid uint32) (typelem, typarray, typsubscript int64) {
+	t, ok := pgTypeGeneratedElemArraySubscript[oid]
+	if !ok {
+		t, ok = pgTypeElemArrayOverlay[oid]
+	}
+	if !ok {
+		return 0, 0, 0
+	}
+	return int64(t[0]), int64(t[1]), int64(t[2])
+}
+
 // pgTypeRow encodes one pgTypeEntry into a 32-column executor.Row matching
 // pgTypeColDefs(). All optional regproc fields and the three CATALOG_VARLEN
 // columns are zero/NULL — only the fixed fields PG18 actually reads on the
 // early-boot TupleDescInitEntry path are populated.
 func pgTypeRow(e pgTypeEntry) executor.Row {
+	typelem, typarray, typsubscript := pgTypeElemArraySubscriptForOID(e.OID)
 	return executor.Row{
 		executor.NewIntDatum(int64(e.OID)),                 // 1 oid
 		executor.NewStringDatum(e.Name),                    // 2 typname
@@ -300,10 +428,10 @@ func pgTypeRow(e pgTypeEntry) executor.Row {
 		executor.NewBoolDatum(false),                       // 9 typispreferred
 		executor.NewBoolDatum(true),                        // 10 typisdefined
 		executor.NewStringDatum(","),                       // 11 typdelim
-		executor.NewIntDatum(0),                            // 12 typrelid
-		executor.NewIntDatum(0),                            // 13 typsubscript
-		executor.NewIntDatum(0),                            // 14 typelem
-		executor.NewIntDatum(0),                            // 15 typarray
+		executor.NewIntDatum(int64(pgTypeRelidOverlay[e.OID])), // 12 typrelid (M0131-S9.3g; 0 for every non-composite)
+		executor.NewIntDatum(typsubscript),                 // 13 typsubscript (M0131-S9.3c)
+		executor.NewIntDatum(typelem),                      // 14 typelem  (M0131-S9.3c)
+		executor.NewIntDatum(typarray),                     // 15 typarray (M0131-S9.3c)
 		executor.NewIntDatum(int64(e.Input)),               // 16 typinput
 		executor.NewIntDatum(int64(e.Output)),              // 17 typoutput
 		executor.NewIntDatum(int64(e.Receive)),             // 18 typreceive
@@ -358,6 +486,26 @@ func pgTypeBootstrapEntryMap() map[uint32]pgTypeEntry {
 			if e, ok := pgTypeCanonical(oid); ok {
 				allMap[e.OID] = e
 			}
+		}
+	}
+	// M0131-S9.3g: a nailed rel's ROWTYPE needs a pg_type row too, not just
+	// its columns' types. The loop above walks nailedAttr.TypeOID, which
+	// never covers nailedRel.RelType — that is how pg_class 2619 could point
+	// at a pg_type row (10029) nothing wrote. Deriving the set from RelType
+	// instead of listing 10029 by hand keeps the two edits from drifting: the
+	// next catalog that swaps its placeholder RelType for a real rowtype gets
+	// its heap row automatically. Rels still carrying the historical
+	// placeholder (83, pg_class's own rowtype) resolve out of pg_type.dat and
+	// are already in allMap, so this adds nothing for them.
+	for _, rel := range append(append([]nailedRel{}, nailedSharedRels...), nailedLocalRels...) {
+		if rel.RelType == 0 {
+			continue
+		}
+		if _, alreadyIn := allMap[rel.RelType]; alreadyIn {
+			continue
+		}
+		if e, ok := pgTypeCanonical(rel.RelType); ok {
+			allMap[e.OID] = e
 		}
 	}
 	return allMap

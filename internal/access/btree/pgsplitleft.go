@@ -202,6 +202,34 @@ func CheckSplitLeft(prePage, leftPage storage.Page, level uint32, rightBlk stora
 	return nil
 }
 
+// SplitLeftIsIncremental answers the single question the ENCODER and the
+// PRIMARY must agree on: does the split record describe the left half
+// incrementally (block 0 carries data, no image), or does it fall back to a
+// full-page image of it?
+//
+// The encoder asks because it decides the record's shape. The primary asks
+// (M0131-S26b) because the answer decides which pd_lsn stamp is legal for the
+// left slot: advancing the slot's native-image watermark asserts "an image of
+// this page exists in WAL at that LSN", which is true only under the image
+// form. Under the incremental form the page owes its first-touch FPI for the
+// epoch and MarkDirtyCoveredByRecordLocked must be used instead.
+//
+// It exists so the two askers cannot drift: both call THIS function rather than
+// each re-deriving the condition. ok=false means "image form" for every reason —
+// a nil pre-page or new item (bulk/pre-runtime callers), a split upstream's
+// record cannot express, or a description that fails to reproduce the page the
+// primary wrote.
+func SplitLeftIsIncremental(prePage, leftPage, rightPage storage.Page, newItem []byte, level uint32, rightBlk storage.BlockNumber) (SplitLeftDescription, bool) {
+	desc, err := DescribeSplitLeft(prePage, leftPage, rightPage, newItem)
+	if err != nil {
+		return SplitLeftDescription{}, false
+	}
+	if CheckSplitLeft(prePage, leftPage, level, rightBlk, desc) != nil {
+		return SplitLeftDescription{}, false
+	}
+	return desc, true
+}
+
 // SplitLeftBlockData builds the block-0 payload upstream registers in
 // `_bt_split` (nbtinsert.c:1990-2010): the new item when it landed on the left
 // half, then the left page's new high key, each padded to MAXALIGN.

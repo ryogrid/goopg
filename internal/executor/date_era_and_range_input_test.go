@@ -160,7 +160,7 @@ func TestDateEraLiteralAndCopyPathsAgree(t *testing.T) {
 	}
 	for _, in := range forms {
 		_, copyErr := parsePGDateText(in)
-		_, litErr := evalTypedStringLit(&planner.TypedStringLit{Type: "date", Value: in})
+		_, litErr := evalTypedStringLit(&planner.TypedStringLit{Type: "date", Value: in}, nil)
 		if (copyErr == nil) != (litErr == nil) {
 			t.Errorf("date %q: shared-entry err=%v but literal path err=%v — the date input paths have drifted apart",
 				in, copyErr, litErr)

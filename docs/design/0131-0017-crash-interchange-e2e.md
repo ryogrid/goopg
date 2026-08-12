@@ -101,12 +101,66 @@ S28 does **not** inherit this. goopg has no `CreateLockFile` equivalent:
 `cmd/goopg/main.go:1177`–`:1426`). A stale PG-authored `postmaster.pid` is
 silently overwritten.
 
-#### Torn contrecord
+#### Torn contrecord — `TestE2E_PGCrashStartOnGoopgTornContrecord` (LANDED 2026-08-12)
 
-Kill during a large `INSERT … SELECT` so the tail ends inside a multi-page
-record. goopg does emit contrecords — `XLPFirstIsContRecord` is stamped at
-`internal/wal/xlog_emit.go:129` and honoured by the reader at
+`internal/testport/e2e_pg_torn_contrecord_test.go`. The tail ends inside a
+multi-page record. goopg does emit contrecords — `XLPFirstIsContRecord` is
+stamped at `internal/wal/xlog_emit.go:129` and honoured by the reader at
 `internal/wal/reader.go:119` — so the shape is reachable.
+
+**The cut is applied by the test, not raced for.** The original plan said this
+variant "needs the kill timed against WAL page boundaries". It does not, and
+timing it would only make the test flaky. goopg's ring drain is **byte**-granular,
+not record-granular: `state.drainBufferBytes` (`internal/wal/writer.go`) writes
+`n` bytes from the ring head to make room, with no record alignment, so a SIGKILL
+legitimately leaves the segment ending at an arbitrary offset — page boundaries
+included. The test therefore performs a **real** `cluster.Kill()` and then applies
+the lost ring remainder deterministically: it scans the goopg-written stream for
+the last valid page carrying `XLP_FIRST_IS_CONTRECORD` and zeroes from that page
+to the end of its segment (plus any later segment in full). Every surviving byte
+was written by goopg, and a zeroed tail page is exactly what goopg's own
+preallocation leaves behind. Page 0 of a segment is never chosen — cutting there
+would take the long header's `sysid`/`seg_size` cross-check with it, which is a
+different upstream failure. In practice the chosen page is the stream's last valid
+page (observed: `0 valid page(s) discarded`), so the loss is one record.
+
+The committed/post-checkpoint rows are captured **before** the filler workload
+that the cut lands in, so "rows missing" can only mean upstream abandoned replay
+*earlier* than the aborted record (the M0131-S30 loss shape), never that the cut
+ate them.
+
+**What is asserted, and why not the `successfully skipped` line.** Upstream's
+`successfully skipped missing contrecord at %X/%X` LOG (`xlogrecovery.c:2115`)
+fires when a recovery pass *replays* the `XLOG_OVERWRITE_CONTRECORD` after having
+read the aborted record. Crash recovery ends with an end-of-recovery checkpoint
+whose redo point is already past that record, so a second crash never re-reads
+the aborted record and the line is unreachable in this lane; it needs an
+archive/PITR replay of the same stream (separate slice — ledger row 2026-08-12).
+The same applies to `there is no contrecord flag at %X/%X`: with the continuation
+page zeroed, upstream fails page-header validation first (`invalid magic number`,
+benign end-of-WAL) and reaches the `assembled` error exit that way. So the test
+asserts the **on-disk consequence** those lines report, which is stronger than
+either of them:
+
+1. recovery ran and completed (`redo starts at` / `redo done at`, no PANIC, the
+   benign end-of-WAL complaint terminal) — the sibling's log contract, reused;
+2. every committed row preceding the cut matches goopg's own pre-crash answers,
+   including post-checkpoint rows that exist only in the replayed tail, and an
+   index-qualified read over a replayed btree;
+3. the page at the missing continuation's address now carries
+   `XLP_FIRST_IS_OVERWRITE_CONTRECORD` and **not** `XLP_FIRST_IS_CONTRECORD`, with
+   `xlp_pageaddr` unchanged from the value goopg stamped — upstream sets that bit
+   only from `CreateOverwriteContrecordRecord`, so its presence proves the
+   aborted-contrecord path was taken over goopg's stream *and* that goopg's page
+   addressing let upstream resume exactly there;
+4. `pg_waldump` reports an `OVERWRITE_CONTRECORD` record at that page — the
+   oracle's own decoder confirming the record, not just the flag.
+
+Assertion 3 is the one that cannot pass vacuously, and it was verified to bite:
+disabling the cut leaves `xlp_info=0x0001` (plain contrecord) and the test fails.
+Result at HEAD: **green** — real PG 18.3 recovers a goopg-authored torn
+contrecord with no loss before the cut, so no defect was found by this variant
+(unlike the main S27 variant, which found two).
 
 Upstream path, verified end to end: `XLogReadRecord` reports `there is no
 contrecord flag at %X/%X` (`postgres/src/backend/access/transam/xlogreader.c:760`)
@@ -119,8 +173,9 @@ structurally unreachable from the standby lane**. `StartupXLOG` then rewinds
 emits the marker via `CreateOverwriteContrecordRecord` (`:6153-6156`, function
 `:7480`, inserted as the first record on the page at `:7521`); replaying it logs
 `successfully skipped missing contrecord at %X/%X, overwritten at %s`
-(`xlogrecovery.c:2115`). Assert the "no contrecord flag" (or "invalid contrecord
-length") line, then the "successfully skipped" line, in that order.
+(`xlogrecovery.c:2115`). The two LOG lines at the ends of that chain are the ones
+the landed test replaces with the on-disk assertions above; the chain itself is
+what makes those assertions meaningful.
 
 #### Honesty note — this test is NOT torn-page coverage
 
@@ -131,6 +186,54 @@ coverage requires a machine-level crash (power loss / VM reset) or a deliberate
 half-page-write fault injector. **This test must never be cited as FPI or
 `full_page_writes` coverage**, and the file carries that sentence as a comment
 so the claim cannot drift.
+
+#### S27 MAIN VARIANT LANDED 2026-08-12 — and it found two defects
+
+`internal/testport/e2e_pg_crashstart_on_goopgdata_test.go` runs green: the
+committed/uncommitted split, the online checkpoint plus a post-checkpoint tail,
+`cluster.Kill()`, the `DB_IN_PRODUCTION` assertion, the stale-`postmaster.pid`
+handover (asserted PRESENT, then removed, so a future goopg-side cleanup fails
+this test instead of silently passing), the `redo starts at` / `redo done at` /
+no-PANIC / benign-end-of-WAL log contract, and row equality against goopg's own
+pre-crash answers.
+
+Two production defects surfaced, both fixed in the same commit — the reason the
+test is worth its runtime:
+
+1. **A ranged `UPDATE` on an indexed column panicked the backend.**
+   `updateOp.Next` routed to `updateViaIndex` for ANY child `*planner.IndexScan`,
+   but that helper probes one equality key (`evalExpr(ix.Key, …)`). A range
+   predicate (`WHERE id BETWEEN 600 AND 650`) plans as an IndexScan with
+   `Key == nil` and `LowKey`/`HighKey` set — as does a composite `Keys` probe —
+   so the deref crashed the connection goroutine (`invalid memory address or nil
+   pointer dereference` in `evalExprSlot`; the client saw `driver: bad
+   connection`). Fix: the fast path now requires `Key != nil` and every other
+   predicate shape falls through to the SeqScan path, which handles all of them.
+   Guard: `internal/executor/update_range_index_scan_test.go`, proven
+   fail-when-broken (the panic returns verbatim when the guard is removed).
+   Teaching `updateViaIndex` to drive a range/composite probe is a performance
+   follow-up, ledgered.
+
+2. **goopg's `xl_heap_prune` omitted `XLHP_CLEANUP_LOCK`, and an
+   assert-enabled PG aborted replaying it.** Upstream derives
+   `lp_truncate_only = (flags & XLHP_CLEANUP_LOCK) == 0`
+   (`heapam_xlog.c:106`), which claims every now-unused slot was ALREADY
+   `LP_DEAD` and carries no storage; goopg's prune reclaims slots that still
+   have storage and redirects chain roots. PG 18.3 TRAPped in the startup
+   process — `failed Assert("ItemIdIsDead(lp) && !ItemIdHasStorage(lp)")`,
+   `pruneheap.c:1677` — and the postmaster shut down, so the cluster was
+   **unstartable**. (A second assert, `heapam_xlog.c:50`, independently forbids
+   redirections without the flag.) An assert-disabled build would have applied a
+   truncate-only prune to live-storage slots instead: silent divergence. Fix:
+   `EncodeHeapPruneOptPG` and `EncodeHeapFreezePG` both set
+   `XLHP_CLEANUP_LOCK`, which is the honest description of goopg's prune — it
+   runs under the page's exclusive buffer lock. This is a **standby-lane blind
+   spot**: the flag only matters when PG replays a prune record it did not
+   write, and `TestE2E_PGStandbyFullCycle` never produced one.
+
+Still deferred out of S27 (ledger, 2026-08-12): the **torn-contrecord variant**
+described below — it needs a kill timed against WAL page boundaries, not just a
+kill during a large statement.
 
 ### S28 — reverse: `TestE2E_GoopgCrashStartOnPGDataDir`
 
@@ -242,19 +345,84 @@ assertions run with nobody having to remember to un-skip anything. The
 `_Concurrent` variant ships alongside as the S24 re-arm trigger, `t.Skip`ped
 with the rmid-6 reason in its message (guard 9).
 
+**S28 COMPLETE — the skip no longer fires, and the last assertion landed
+(2026-08-12).** Two things changed since the paragraph above was written, both
+observed by running the test rather than by reading code:
+
+- **goopg now replays the PG-authored crash tail end to end.** The
+  `XLOG_NEXTOID` refusal is gone (S26/S27-era opcode work), so `g.Start()`
+  succeeds, the self-arming skip is dead code that stays as the tripwire it was
+  designed to be, and all fourteen captured answers are compared for real. That
+  was verified by corrupting one expected answer and watching goopg's own value
+  come back in the failure message — the checks execute, they are not skipped
+  past.
+- **The uncommitted-rows assertion is in.** It was deferred because `pgcluster.
+  Exec` is `psql -c`, whose backend exits — and therefore rolls back — before
+  the helper returns, so no transaction could be left open across the kill. The
+  new `pgcluster.Session` (`internal/testutil/pgcluster/session.go`) pins ONE
+  `database/sql` connection (`sql.Conn`, not `sql.DB`: a pool would run the
+  `INSERT` and the `COMMIT` on different backends) and holds it until the test
+  ends. The workload inserts 100 rows in that session, never commits, and the
+  test asserts through goopg that they are absent after recovery.
+
+  Three things make that assertion non-vacuous, because "recovery discarded the
+  rows" and "the rows were never written" look identical afterwards: the rows are
+  asserted **visible inside their own transaction**; a second session asserts the
+  backend is in **`idle in transaction`** (via `application_name`) so there is a
+  live transaction to kill; and a committed **marker row** is inserted after them,
+  which flushes the single WAL stream up to its own LSN and thereby pins the
+  uncommitted records on disk — SIGKILL loses WAL buffers, not the log. The marker
+  is the positive half of the pair: it must survive, the uncommitted rows must not.
+
+  Guard 13 closes the loop in the bytes: `pg_waldump` must show at least one
+  record for that XID and **no COMMIT** for it. All three of its failure branches
+  were proven to bite.
+
 Two assertions beyond row equality: the SAVEPOINT rows must be **visible**
 (S22's `subxacts[]` gap makes committed subtransactions invisible, and
 `internal/initdb/xact_recovery.go:87-92` stamps an `ASSIGNMENT` record ABORTED),
 and the `FOR UPDATE` row must be readable and updatable (a mis-replayed
 `XLOG_HEAP_LOCK` leaves a bogus xmax).
 
-**Second variant — the GIN refusal.** Same shape, but `CREATE INDEX … USING gin`
-before the workload. Assert goopg **refuses**: `g.Start()` returns an error, the
-goopg log names the access method and the LSN (S25's specific message, not
+**Second variant — the GIN refusal. LANDED 2026-08-12** as
+`TestE2E_GoopgCrashStartOnPGDataDirGINRefusal`
+(`internal/testport/e2e_goopg_crashstart_gin_refusal_test.go`, 1.7 s). Same
+shape, but `CREATE INDEX … USING gin` before the workload. goopg **refuses**:
+non-zero exit, and S25's specific message rather than
 `wal: unsupported xlog record rmid=13 info=0x…` from
-`unsupportedDecodedXLogRecord`, `internal/wal/recovery.go:2605-2613`), and the
-exit code is non-zero. This is the only test that proves S25's boundary is a
-*boundary* and not a crash.
+`unsupportedDecodedXLogRecord` (`internal/wal/recovery.go`). This is the only
+test that proves S25's boundary is a *boundary* and not a crash.
+
+Four things the implementation settled that the plan above did not say:
+
+- **The index build is not the workload.** `CREATE INDEX … USING gin` logs the
+  finished index with `log_newpage_range`, i.e. rmid 0 `XLOG_FPI` records — no
+  RM_GIN record at all. The GIN records come from writing *through* an existing
+  index, and the test drives both mechanisms: 2000 INSERTs land in the pending
+  list (`fastupdate` defaults on, `ginutil.c` `ginoptions`), then
+  `gin_clean_pending_list()` moves them into the entry tree (`ginfast.c`
+  `ginInsertCleanup`). Measured result: **2011 RM_GIN records** in the crash
+  tail, first at `rel=0/5/16393 blk=2`.
+- **The variant needs no self-arming skip, and must never grow one.** The main
+  variant skips when goopg cannot yet replay some opcode; this one cannot,
+  because `preflightIndexAMRecords` runs *before the first record is applied*
+  (`ReplayRecordsFrom`, `internal/wal/recovery.go`), so the GIN refusal
+  pre-empts every other opcode gap. The ordering guarantee is the thing under
+  test.
+- **Exit status needs a foreground run.** `cluster.Start()` reports only
+  "process exited early" — it does not surface the child's status — so the test
+  runs `go run ./cmd/goopg start` directly and reads `*exec.ExitError`
+  (measured: exit 1). The `cluster` handle is built only for its data dir and
+  free listen address; `Init()` is deliberately not called.
+- **The refusal's promise is asserted, not assumed.** "Nothing has been
+  replayed" is only worth saying if the directory is still one a real PG can
+  finish recovering, so the test then starts upstream PG on the *same* directory
+  (`pgcluster.OpenExisting` — `New` runs initdb and would refuse a non-empty
+  dir), waits for ready, and re-reads both the heap (2000 rows) and the GIN
+  index (`tags @> ARRAY['tag-7']` answers non-zero).
+
+Proven to bite: replacing one asserted message fragment with a string the
+refusal cannot contain turns the test red on the real refusal text.
 
 #### This test decides S24's fate — recommendation: **single-session, defer S24**
 
@@ -296,7 +464,10 @@ trigger for M0131-S24")` — so the trigger is code, not a ledger sentence.
    so a workload that silently stops producing an opcode fails loudly rather than
    passing for the wrong reason.
 8. The GIN variant asserts a **non-zero exit** and a log line naming the access
-   method; a bare `unsupported xlog record rmid=13` fails the guard.
+   method; a bare `unsupported xlog record rmid=13` fails the guard. **DONE** —
+   plus two guards the plan did not have: `pg_waldump` must show `rmgr: Gin` in
+   the tail (otherwise the refusal proves nothing), and upstream PG must still
+   finish recovery on the refused directory.
 9. The concurrency variant exists and is `t.Skip`ped with the S24 re-arm trigger in
    its skip message.
 10. Both tests gate on `testing.Short()` + `pgcluster.Available` and run under the
@@ -307,6 +478,12 @@ trigger for M0131-S24")` — so the trigger is code, not a ledger sentence.
 12. UNITS + SMOKE green —
     `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` plus the git
     hook's mandatory pgbench smoke on every commit (never `--no-verify`).
+13. The transaction that was open at kill time left records in the crash tail and
+    **no COMMIT** for its XID (`assertUncommittedXIDInTail`), and its 100 rows are
+    absent through goopg afterwards while the committed marker row inserted after
+    them survives. Without the first half the absence check passes for an engine
+    that replayed nothing, or for a run where the uncommitted records never left
+    the WAL buffers.
 
 ## References
 

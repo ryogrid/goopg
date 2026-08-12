@@ -3781,7 +3781,17 @@ func NewInMemory() *InMemory {
 			"pg_catalog":         11,
 			"public":             2200,
 			"pg_toast":           99,
-			"information_schema": 13183, // stock PG18 initdb-assigned OID
+			// information_schema is NOT a bootstrap namespace: initdb creates it
+			// while running information_schema.sql, so its OID comes from the
+			// post-bootstrap counter (FirstUnpinnedObjectId = 12000) and is fixed
+			// for a given server build rather than declared in pg_namespace.dat.
+			// Measured on PG 18.3 (M0131-S9.4, two independent fresh initdbs of
+			// postgres/local_install, both 13273); the previous value 13183 was
+			// never produced by this build. Recipe: initdb -D d && pg_ctl -o "-p
+			// <port> -k d -h ''" start && psql -c "select oid from pg_namespace
+			// where nspname='information_schema'". Guarded by
+			// TestBootstrapNamespaceOIDsMatchPG18.
+			"information_schema": 13273,
 		},
 		schemaOwners:       make(map[string]uint32),
 		roles:              make(map[string]uint32),

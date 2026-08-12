@@ -22,6 +22,7 @@ import (
 	"github.com/goopg/goopg/internal/multixact"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/pgarray"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -1011,6 +1012,15 @@ type seqScanOp struct {
 	ctx  *Context
 	cols []catalog.Column
 
+	// arrayStyle carries the session DateStyle/TimeZone down into the heap
+	// decode, which is where goopg (unlike upstream, which defers to array_out
+	// at output time) flattens an array column to its "{…}" text. Resolved once
+	// in Open, and only for a relation that actually has an array column —
+	// arrayStyleLive gates the whole thing so a scan of an array-free table
+	// pays nothing. M0119-0006.
+	arrayStyle     pgarray.OutputStyle
+	arrayStyleLive bool
+
 	// ssiGistPred is the spatial WHERE predicate of the Filter directly above
 	// this scan, handed down at build time (Build / buildRec). When the scan runs
 	// under SERIALIZABLE on a table carrying a GiST index on the predicate's point
@@ -1309,6 +1319,18 @@ func (o *seqScanOp) gistRowMatches(row Row) bool {
 // conflict-out by spatial match (design 0118-0137). MUST be called with the page
 // RLock held — tuple.Data views the page bytes. Returns false on decode/eval
 // failure.
+// decodeScanRow decodes a visible tuple into the reusable scan row, routing
+// through the styled decoder only when the relation has an array column (see
+// seqScanOp.arrayStyle). The unstyled call is byte-identical to the styled one
+// under the boot-default GUCs, so the branch is a cost guard, not a behaviour
+// switch.
+func (o *seqScanOp) decodeScanRow(data, bitmap []byte, storedNatts int) error {
+	if o.arrayStyleLive {
+		return DecodeRowIntoMctxPGTupleStyled(o.scanRow, o.cols, data, bitmap, storedNatts, o.sctx, o.arrayStyle)
+	}
+	return DecodeRowIntoMctxPGTuple(o.scanRow, o.cols, data, bitmap, storedNatts, o.sctx)
+}
+
 func (o *seqScanOp) gistTupleMatches(tuple storage.HeapTuple) bool {
 	if o.gistScratch == nil || len(o.gistScratch) != len(o.cols) {
 		o.gistScratch = make(Row, len(o.cols))
@@ -1375,6 +1397,13 @@ func (o *seqScanOp) Open(ctx *Context) error {
 			Hint:    "Use the REFRESH MATERIALIZED VIEW command."}
 	}
 	o.ctx = ctx
+	// Resolve the array element output style once per scan (M0119-0006). Done
+	// after the reopen/rewind branch above so a re-Open under a different
+	// Context — the only way the GUCs can differ mid-operator — re-reads them.
+	o.arrayStyleLive = colsHaveArray(o.cols)
+	if o.arrayStyleLive {
+		o.arrayStyle = arrayOutputStyle(ctx)
+	}
 	// Pre-compute which columns are enum types so Next() can inject KindEnum datums
 	// for correct ORDER BY semantics (M0097-enum).
 	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
@@ -1909,7 +1938,7 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			// the schema. HeapNattsMask = 0x07FF; storedNatts==0 means natts
 			// was not explicitly set (legacy goopg rows without PG format).
 			storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
-			if err := DecodeRowIntoMctxPGTuple(o.scanRow, o.cols, tuple.Data, tuple.Bitmap, storedNatts, o.sctx); err != nil {
+			if err := o.decodeScanRow(tuple.Data, tuple.Bitmap, storedNatts); err != nil {
 				if o.pinned != nil {
 					o.pinned.RUnlock()
 				}
@@ -2291,6 +2320,13 @@ func coerceRowForConstraintChecks(cols []catalog.Column, row Row, include func(i
 			coerced, cerr = evalCast(row[i], "timestamp", pos, ctx)
 		case "timestamptz":
 			coerced, cerr = evalCast(row[i], "timestamptz", pos, ctx)
+		case "timetz", "time with time zone":
+			// M0119-0006: timetz joins the list because its input function is the
+			// only one here whose answer depends on a GUC that only `ctx` carries
+			// — a zone-less literal takes the SESSION TimeZone's offset. Left as a
+			// KindString the value would reach encodeValuePG, which has no ctx and
+			// so silently stored `10:00:00+00` for every session.
+			coerced, cerr = evalCast(row[i], "timetz", pos, ctx)
 		case "numeric", "decimal":
 			coerced, cerr = evalCast(row[i], "numeric", pos, ctx)
 		default:
@@ -3311,6 +3347,42 @@ func markHeapHotUpdateDirty(
 	return pool.MarkDirtyLogicalChange(slot, func() (storage.LSN, error) {
 		return logHot(rel, blk, oldLineSlot, newLineSlot, xmax, tupleBytes)
 	})
+}
+
+// isSelfModifiedWrite reports whether the tuple carries a write intent
+// (update/delete) stamped by myXID itself — upstream's TM_SelfModified, which
+// makes ExecUpdate/ExecDelete skip the row instead of writing a second new
+// version (postgres/src/backend/executor/nodeModifyTable.c).
+//
+// It is the sibling-safe form of the M0131-S32.1 guard: both the index-scan and
+// the seq-scan update loops call THIS function, so the two can no longer drift
+// apart. It reproduces the structure of upstream HeapTupleSatisfiesUpdate
+// (postgres/src/backend/access/heap/heapam_visibility.c), which reaches the raw
+// "is this xmax mine?" comparison only after two earlier arms have returned:
+//
+//   - HEAP_XMAX_IS_MULTI has its own branch, so a raw Xmax holding a
+//     MultiXactId is never compared against a TransactionId. The two live in
+//     different id spaces; a numeric collision would skip an unrelated row.
+//   - HEAP_XMAX_IS_LOCKED_ONLY returns TM_BeingModified, *not* TM_SelfModified.
+//     A row this transaction merely LOCKED (SELECT ... FOR UPDATE / FOR NO KEY
+//     UPDATE) is still updatable by it.
+//
+// The missing LOCKED_ONLY arm is what M-NIGHTLY AI-20260813-005117-012 caught:
+// `BEGIN; SELECT ... FOR UPDATE; UPDATE <key column> ...;` silently reported
+// UPDATE 0. Only a key-changing update is HOT-ineligible, so it is the one
+// shape that falls through to this guard — a non-key update takes the HOT path
+// and never reaches it, which is why the bug stayed narrow enough to survive.
+func isSelfModifiedWrite(h storage.HeapTupleHeader, myXID storage.TransactionID) bool {
+	if h.Xmax == storage.InvalidTransactionID {
+		return false
+	}
+	if storage.IsHeapTupleXmaxMulti(h.Infomask) {
+		return false
+	}
+	if storage.IsHeapTupleLockOnly(h.Infomask) {
+		return false
+	}
+	return h.Xmax == myXID
 }
 
 // isConcurrentlyUpdated reports whether the tuple has been updated or
@@ -4507,8 +4579,11 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				// Upstream heap_update returns TM_SelfModified for a tuple this
 				// command already updated and ExecUpdate skips the row
 				// (postgres/src/backend/executor/nodeModifyTable.c).
-				if oldGerr == nil && oldTup.Header.Xmax != storage.InvalidTransactionID &&
-					oldTup.Header.Xmax == o.ctx.Tx.XID {
+				//
+				// M-NIGHTLY AI-20260813-005117-012: the IS_MULTI / LOCKED_ONLY
+				// exclusions live in isSelfModifiedWrite so this guard and its
+				// seq-scan twin below cannot drift apart.
+				if oldGerr == nil && isSelfModifiedWrite(oldTup.Header, o.ctx.Tx.XID) {
 					s.Unlock()
 					o.ctx.Pool.Unpin(s)
 					s321Note(s321EPQSelfModified)
@@ -4959,7 +5034,20 @@ func (o *updateOp) Next() (TupleSlot, error) {
 	// root-0025 item 5 follow-up — `.ralph/deferral_ledger.md`). With
 	// children present, fall through to the multi-table SeqScan path below,
 	// which already fans out correctly.
-	if o.idxScan != nil && len(updateScanTables) == 1 {
+	//
+	// `Key != nil` is the second precondition, and it is not cosmetic:
+	// updateViaIndex probes ONE equality key (`evalExpr(ix.Key, …)` — the same
+	// shape as indexScanOp.lookupKey's single-key branch). A planner-produced
+	// range scan (`WHERE id BETWEEN a AND b` → LowKey/HighKey, Key nil) and a
+	// composite equality probe (`Keys`, Key nil) both leave Key unset, and
+	// dereferencing it panicked the backend with a nil-pointer deref inside
+	// evalExprSlot — a crashed connection for an ordinary ranged UPDATE
+	// (M0131-S27 discovery: the forward crash E2E's post-checkpoint
+	// `UPDATE … WHERE id BETWEEN 600 AND 650`). The SeqScan path below handles
+	// every predicate shape, so falling through is correct, not a workaround;
+	// teaching updateViaIndex to drive a range/composite probe is the
+	// performance follow-up recorded in the deferral ledger.
+	if o.idxScan != nil && o.idxScan.Key != nil && len(updateScanTables) == 1 {
 		return o.updateViaIndex(rel, cols)
 	}
 
@@ -5389,8 +5477,10 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				// Upstream heap_update returns TM_SelfModified for a tuple this
 				// command already updated and ExecUpdate skips the row
 				// (postgres/src/backend/executor/nodeModifyTable.c).
-				if oldGerr == nil && oldTup.Header.Xmax != storage.InvalidTransactionID &&
-					oldTup.Header.Xmax == o.ctx.Tx.XID {
+				//
+				// M-NIGHTLY AI-20260813-005117-012: shares isSelfModifiedWrite
+				// with the index-scan twin above so the pair cannot diverge.
+				if oldGerr == nil && isSelfModifiedWrite(oldTup.Header, o.ctx.Tx.XID) {
 					s.Unlock()
 					o.ctx.Pool.Unpin(s)
 					s321Note(s321EPQSelfModified)
@@ -9283,14 +9373,27 @@ func updateHeapRowCanonicalPG(ctx *Context, rel storage.RelFileNode, cols []cata
 			return newTID, err
 		}
 		var derr error
+		var recLSN storage.LSN
 		if logUpdate == nil {
 			ctx.Pool.MarkDirty(newBuf)
 		} else {
 			derr = ctx.Pool.MarkDirtyLogicalChange(newBuf, func() (storage.LSN, error) {
-				return logUpdate(rel, oldTID.Block, oldTID.Offset, newBlk, newSlot, xmax, tupleBytes)
+				lsn, lerr := logUpdate(rel, oldTID.Block, oldTID.Offset, newBlk, newSlot, xmax, tupleBytes)
+				recLSN = lsn
+				return lsn, lerr
 			})
 		}
-		ctx.Pool.MarkDirty(oldBuf)
+		// The OLD page was mutated too (PageStampUpdatedOldTuple above) and is
+		// described by the SAME record — so it must carry that record's LSN,
+		// not just a dirty bit. A plain MarkDirty here left pd_lsn stale
+		// whenever the page had already been imaged this checkpoint epoch,
+		// which both breaks WAL-before-data for the xmax stamp and makes a
+		// replaying PG re-apply the record over the page (M0131-S26).
+		if recLSN != 0 {
+			ctx.Pool.MarkDirtyCoveredByRecordLocked(oldBuf, recLSN)
+		} else {
+			ctx.Pool.MarkDirty(oldBuf)
+		}
 		if ctx.FSM != nil {
 			ctx.FSM.RecordFreeSpaceForPage(rel, newBlk, newBuf.Page())
 		}

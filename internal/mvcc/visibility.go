@@ -128,12 +128,23 @@ func TupleVisible(h storage.HeapTupleHeader, snap Snapshot, currentXID storage.T
 			// The bits say an updater exists but we cannot resolve it. Treat
 			// the row as validly updated/deleted (invisible) rather than
 			// mis-reading the MultiXactId as a deleter xid — never expose a
-			// version whose successor may already be committed. (No producer
-			// emits non-lock-only multis yet, so this is unreachable today.)
+			// version whose successor may already be committed.
+			//
+			// M0131-S24: this is NOT unreachable (an earlier revision of this
+			// comment claimed it was). executor.stampUpdaterXmaxNonHOT
+			// (M0118-0004) emits updater-bearing multis, and a hosted PG's
+			// stream carries them via XLHL_XMAX_IS_MULTI. The failure mode is
+			// silent: an unresolvable multi xmax HIDES the row rather than
+			// erroring.
 			return false
 		}
 		members, ok := mxs.Members(multixact.MultiXactId(h.Xmax))
 		if !ok {
+			// Same silent-hiding caveat as the nil-store arm above, and it is
+			// live after a restart: M0131-S20.4 seeds the MultiXactId counter
+			// from pg_control but the member SETS are still process-local and
+			// transient, so every pre-restart multi xmax is unresolvable here.
+			// The durable pg_multixact SLRU that fixes it is M0131-S24.
 			return false
 		}
 		upd, has := multixact.GetUpdateXid(members)

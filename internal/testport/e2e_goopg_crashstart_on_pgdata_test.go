@@ -124,7 +124,9 @@ func TestE2E_GoopgCrashStartOnPGDataDir(t *testing.T) {
 	// producing an opcode (a PG version bump, a planner change that turns the
 	// COPY into single inserts) must fail loudly rather than pass for the
 	// wrong reason.
-	assertCrashTailOpcodes(t, binDir, pgDir)
+	dump := dumpCrashTail(t, binDir, pgDir)
+	assertCrashTailOpcodes(t, dump)
+	assertUncommittedXIDInTail(t, dump, want.uncommittedXID)
 
 	// Step: goopg on the crashed directory. cluster.New only builds a handle;
 	// NOT calling Init() is the point — PG's postgresql.conf is handed over
@@ -336,7 +338,16 @@ type s28Answers struct {
 	// lockedQtyAfterUpdate is the value id=3's qty must hold after goopg's
 	// own post-recovery UPDATE (+1000).
 	lockedQtyAfterUpdate string
+	// uncommittedXID is the XID of the transaction that was still open when
+	// the postmaster was killed. Guard 13 uses it to prove that transaction's
+	// records reached the crash tail with no COMMIT behind them.
+	uncommittedXID string
 }
+
+// s28UncommittedApp is the application_name of the backend that holds the
+// never-committed transaction, so a second session can find it in
+// pg_stat_activity.
+const s28UncommittedApp = "s28-uncommitted"
 
 // runS28Workload drives the S21/S22 opcode set through PG and captures the
 // answers. Every element maps to one WAL opcode; assertCrashTailOpcodes
@@ -356,6 +367,9 @@ func runS28Workload(t *testing.T, pg *pgcluster.Cluster, baseDir string) s28Answ
 	)`)
 	pg.Exec(t, "CREATE INDEX s28_items_label_idx ON public.s28_items (label)")
 	pg.Exec(t, "CREATE TABLE public.s28_sub (id integer PRIMARY KEY, tag text)")
+	// Its own table so the marker row (see the uncommitted-INSERT step) cannot
+	// perturb the s28_items / s28_sub row counts the sanity checks pin.
+	pg.Exec(t, "CREATE TABLE public.s28_marker (id integer PRIMARY KEY, note text)")
 
 	// COPY → Heap2/MULTI_INSERT. Server-side COPY FROM a file: psql's \copy
 	// would need stdin plumbing pgcluster.Exec does not have, and the
@@ -425,16 +439,57 @@ func runS28Workload(t *testing.T, pg *pgcluster.Cluster, baseDir string) s28Answ
 	// folded into a larger one; the row stays committed and unmodified.
 	pg.Exec(t, "BEGIN; SELECT id FROM public.s28_items WHERE id = 3 FOR UPDATE; COMMIT;")
 
-	// An uncommitted INSERT that must NOT survive: the session is killed with
-	// the transaction open, so recovery has to discard it. psql -c ends the
-	// process, which rolls back — so hold the transaction open in a
-	// long-running backend instead, via a second connection that never
-	// commits.
+	// An uncommitted INSERT that must NOT survive: the postmaster is killed
+	// with the transaction still open, so recovery has to discard it. pg.Exec
+	// is `psql -c`, whose backend exits — and therefore rolls back — before the
+	// call returns, so this needs a backend that outlives the statement:
+	// pgcluster.Session (internal/testutil/pgcluster/session.go, added for this
+	// assertion) pins one connection and holds it.
+	sessCtx := context.Background()
+	sess, err := pg.OpenSession(sessCtx, s28UncommittedApp)
+	if err != nil {
+		t.Fatalf("open long-lived session for the uncommitted transaction: %v", err)
+	}
+	// Closed at test END, deliberately not here: the transaction has to still
+	// be open when KillHard lands.
+	t.Cleanup(sess.Close)
+	if err := sess.Exec(sessCtx, "BEGIN"); err != nil {
+		t.Fatalf("BEGIN in the long-lived session: %v", err)
+	}
+	if err := sess.Exec(sessCtx, `INSERT INTO public.s28_items (id, label, qty)
+		SELECT g, 'uncommitted-' || g, g FROM generate_series(999001, 999100) g`); err != nil {
+		t.Fatalf("uncommitted INSERT: %v", err)
+	}
+	uncommittedXID, err := sess.QueryScalar(sessCtx, "SELECT pg_current_xact_id()::text")
+	if err != nil {
+		t.Fatalf("read the uncommitted transaction's XID: %v", err)
+	}
+
+	// Two proofs that the setup is real, because "recovery discarded the rows"
+	// and "the rows were never written" are the same observation afterwards:
 	//
-	// (Deliberately omitted: doing this reliably needs a backend that outlives
-	// the Exec call, which pgcluster.Exec cannot provide. The DELETE above
-	// already proves recovery honours a committed removal; an
-	// aborted-transaction assertion is a separate slice — see the ledger row.)
+	//  1. the rows ARE visible inside their own transaction, and
+	//  2. a DIFFERENT backend sees this one parked in `idle in transaction`
+	//     (a session that had quietly died would leave nothing to kill).
+	if got, err := sess.QueryScalar(sessCtx,
+		"SELECT count(*)::text FROM public.s28_items WHERE id > 999000"); err != nil || got != "100" {
+		t.Fatalf("the uncommitted rows are not visible to their own transaction (got %q, err %v) — "+
+			"the INSERT did not take effect, so the post-recovery assertion would pass vacuously", got, err)
+	}
+	if got := pg.QueryScalar(t, fmt.Sprintf(
+		"SELECT state FROM pg_stat_activity WHERE application_name = '%s'", s28UncommittedApp)); got != "idle in transaction" {
+		t.Fatalf("the long-lived backend is %q, want \"idle in transaction\" — "+
+			"no open transaction would be alive at KillHard time", got)
+	}
+
+	// The uncommitted records must be ON DISK when the kill lands, or the test
+	// asserts nothing: SIGKILL loses whatever is still in the WAL buffers. A
+	// COMMIT flushes the single WAL stream up to its own LSN, i.e. everything
+	// written before it — so one committed marker row after the uncommitted
+	// INSERT durably pins those records. The marker doubles as the positive
+	// half of the assertion pair (it must survive; the uncommitted rows must
+	// not), and guard 13 below proves the records really are in the tail.
+	pg.Exec(t, "INSERT INTO public.s28_marker (id, note) VALUES (1, 'post-uncommitted')")
 
 	// Capture PG's own answers. No CHECKPOINT: the whole point is that goopg
 	// replays from the last automatic checkpoint through the crash tail.
@@ -458,6 +513,13 @@ func runS28Workload(t *testing.T, pg *pgcluster.Cluster, baseDir string) s28Answ
 	add("sub committed", "SELECT count(*) FROM public.s28_sub")
 	add("sub rolled back", "SELECT count(*) FROM public.s28_sub WHERE id = 9001")
 	add("locked row", "SELECT qty FROM public.s28_items WHERE id = 3")
+	// The uncommitted-transaction pair. PG answers 0 here because the rows are
+	// invisible to this (other) session; goopg must answer 0 because recovery
+	// discarded them — same answer, and the marker row is what distinguishes
+	// "recovery worked" from "the tail was never replayed at all".
+	add("uncommitted rows absent", "SELECT count(*) FROM public.s28_items WHERE id > 999000")
+	add("post-uncommitted marker", "SELECT note FROM public.s28_marker WHERE id = 1")
+	answers.uncommittedXID = uncommittedXID
 
 	// Workload sanity — a silently empty workload would make every comparison
 	// above trivially true.
@@ -492,35 +554,8 @@ func runS28Workload(t *testing.T, pg *pgcluster.Cluster, baseDir string) s28Answ
 // pg_waldump exits non-zero on a crash tail — it walks into the torn final
 // record and reports it — so the error is expected and only the absence of
 // output is fatal.
-func assertCrashTailOpcodes(t *testing.T, binDir, dataDir string) {
+func assertCrashTailOpcodes(t *testing.T, dump string) {
 	t.Helper()
-	walDir := filepath.Join(dataDir, "pg_wal")
-	entries, err := os.ReadDir(walDir)
-	if err != nil {
-		t.Fatalf("read pg_wal: %v", err)
-	}
-	first := ""
-	for _, e := range entries {
-		if e.IsDir() || len(e.Name()) != 24 {
-			continue
-		}
-		if first == "" || e.Name() < first {
-			first = e.Name()
-		}
-	}
-	if first == "" {
-		t.Fatalf("no WAL segment in %s", walDir)
-	}
-
-	cmd := exec.Command(filepath.Join(binDir, "pg_waldump"), "-p", walDir, first)
-	cmd.Env = append(os.Environ(), "LD_LIBRARY_PATH="+filepath.Join(filepath.Dir(binDir), "lib"))
-	out, dumpErr := cmd.Output()
-	dump := string(out)
-	if strings.TrimSpace(dump) == "" {
-		t.Fatalf("pg_waldump produced no output over the crash tail (err=%v) — "+
-			"guard 7 cannot verify opcode coverage", dumpErr)
-	}
-
 	// rmgr + desc pairs, from the design doc's opcode table as corrected by
 	// this test's first run. Match on the rmgr column AND the desc verb so a
 	// same-named opcode in another resource manager cannot satisfy the wrong
@@ -567,4 +602,79 @@ func assertCrashTailOpcodes(t *testing.T, binDir, dataDir string) {
 			"(docs/design/0131-0017-crash-interchange-e2e.md §S28) — fix the workload, not the table\n"+
 			"pg_waldump tail:\n%s", strings.Join(missing, ", "), tailLines(dump, 15))
 	}
+}
+
+// assertUncommittedXIDInTail is guard 13: the never-committed transaction must
+// have left records in the crash tail, and must NOT have left a COMMIT behind
+// them.
+//
+// Without it the "uncommitted rows absent" check is vacuous in both directions
+// — an engine that replayed nothing, and a run where the uncommitted records
+// never left the WAL buffers before the SIGKILL, both answer 0. This guard runs
+// against the bytes on disk, so it fails today if either ever becomes true.
+func assertUncommittedXIDInTail(t *testing.T, dump, xid string) {
+	t.Helper()
+	if strings.TrimSpace(xid) == "" {
+		t.Fatalf("no XID captured for the uncommitted transaction — runS28Workload did not run its open-transaction step")
+	}
+	// pg_waldump pads its columns (`tx:        779,`), so compare on
+	// whitespace-collapsed lines rather than the raw text.
+	marker := "tx: " + xid + ","
+	records, commits := 0, 0
+	for _, line := range strings.Split(dump, "\n") {
+		if !strings.Contains(strings.Join(strings.Fields(line), " "), marker) {
+			continue
+		}
+		records++
+		if strings.Contains(line, "desc: COMMIT") {
+			commits++
+		}
+	}
+	if records == 0 {
+		t.Fatalf("crash tail contains no record for xid %s — the uncommitted INSERT never reached disk, "+
+			"so the post-recovery \"uncommitted rows absent\" check would pass for the wrong reason "+
+			"(the marker INSERT after it is what is supposed to flush the stream)", xid)
+	}
+	if commits > 0 {
+		t.Fatalf("crash tail contains a COMMIT for xid %s (%d record(s) total) — the transaction that was "+
+			"supposed to still be open at KillHard time committed, so nothing here tests aborted-transaction recovery", xid, records)
+	}
+}
+
+// dumpCrashTail runs upstream pg_waldump over the cluster's OLDEST WAL segment
+// and returns its output. Both S28 variants need it: the main one to prove the
+// workload's opcode coverage (guard 7), the GIN-refusal one to prove RM_GIN
+// records actually reached WAL before goopg was asked to replay them.
+//
+// pg_waldump exits non-zero on a crash tail — it walks into the torn final
+// record and reports it — so the error is expected and only the ABSENCE of
+// output is fatal.
+func dumpCrashTail(t *testing.T, binDir, dataDir string) string {
+	t.Helper()
+	walDir := filepath.Join(dataDir, "pg_wal")
+	entries, err := os.ReadDir(walDir)
+	if err != nil {
+		t.Fatalf("read pg_wal: %v", err)
+	}
+	first := ""
+	for _, e := range entries {
+		if e.IsDir() || len(e.Name()) != 24 {
+			continue
+		}
+		if first == "" || e.Name() < first {
+			first = e.Name()
+		}
+	}
+	if first == "" {
+		t.Fatalf("no WAL segment in %s", walDir)
+	}
+
+	cmd := exec.Command(filepath.Join(binDir, "pg_waldump"), "-p", walDir, first)
+	cmd.Env = append(os.Environ(), "LD_LIBRARY_PATH="+filepath.Join(filepath.Dir(binDir), "lib"))
+	out, dumpErr := cmd.Output()
+	dump := string(out)
+	if strings.TrimSpace(dump) == "" {
+		t.Fatalf("pg_waldump produced no output over the crash tail (err=%v)", dumpErr)
+	}
+	return dump
 }

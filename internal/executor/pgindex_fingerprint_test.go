@@ -134,20 +134,83 @@ func TestNNDKeyColumnsEqualStillSeesNoChangeUnderTheTupleFormat(t *testing.T) {
 	}
 }
 
-func TestHashIndexIsNeverDescribableSoTheSSIBucketPairingHolds(t *testing.T) {
-	// The SSI hash bucket is computed from the WRITER's fingerprint
-	// (ssiRecordHashIndexInsert) and from the READER's scan search key
-	// (ssiRecordHashBucketRead, handed operators_index.go's loBytes, which comes
-	// from the format-aware scan funnel). Those two agree only while the index
-	// is not describable — otherwise the reader would hash a tuple image and the
-	// writer a blob, and every rw-edge on a hash index would be lost silently.
-	// buildPGIndexKeyDesc's access-method refusal is what guarantees it.
+func TestDeclaredHashIndexIsDescribableSoBothSSIHalvesMustFingerprint(t *testing.T) {
+	// This test replaces `TestHashIndexIsNeverDescribableSoTheSSIBucketPairingHolds`,
+	// which was VACUOUS: it built its fixture with `idx.Method = "hash"`, but
+	// `CREATE INDEX ... USING hash` records `Method == "btree"` with only
+	// `DeclaredHash` set (operators_ddl.go — goopg builds the index on the
+	// B-tree substrate). So the access-method refusal it relied on never fires
+	// for a real hash index, the reader's scan key DID become a tuple image at
+	// the flip while the writer stayed on the blob, and all 18 conflicting
+	// permutations of predicate-hash.spec silently stopped aborting
+	// (M-NIGHTLY AI-20260811-014635-001).
+	//
+	// The invariant that actually holds is the one below: the index IS
+	// describable, so BOTH SSI halves must go through the fingerprint —
+	// `ssiHashProbeFingerprint` for the reader, `indexKeyFingerprint` for the
+	// writer — and neither may hash the search key.
 	withPGIndexTupleKeys(t)
-	ctx, idx, _ := rowKeyCtxAndIndex(t, 463, col("a", "int4"))
-	idx.Method = "hash"
-	idx.DeclaredHash = true
-	if desc := ctx.pgIndexKeyDesc(idx); desc != nil {
-		t.Fatalf("a hash index became describable (%d key attrs); the SSI bucket pairing would split", desc.NKeyAtts())
+	ctx, idx, cols := rowKeyCtxAndIndex(t, 463, col("a", "int4"))
+	idx.DeclaredHash = true // Method stays "btree": what CREATE INDEX USING hash records
+	if ctx.pgIndexKeyDesc(idx) == nil {
+		t.Fatal("fixture hash index is not describable; the test would pass for the wrong reason")
+	}
+
+	v := NewIntDatum(20)
+	parts := []indexProbeKeyPart{{col: &idx.Table.Columns[0], val: v}}
+	reader := ssiHashProbeFingerprint(idx, parts)
+	if len(reader) == 0 {
+		t.Fatal("ssiHashProbeFingerprint returned nothing for an int4 equality probe")
+	}
+	writer, err := indexKeyFingerprint(idx, cols, Row{v}, nil)
+	if err != nil || len(writer) == 0 {
+		t.Fatalf("indexKeyFingerprint = %x, %v", writer, err)
+	}
+	if !bytes.Equal(reader, writer) {
+		t.Fatalf("reader fingerprint %x != writer fingerprint %x: every rw-edge on a hash index would be lost", reader, writer)
+	}
+	if ssiHashBucket(reader) != ssiHashBucket(writer) {
+		t.Fatalf("bucket %d != %d", ssiHashBucket(reader), ssiHashBucket(writer))
+	}
+
+	// Non-vacuity: the search key the SAME probe descends the tree with is a
+	// different encoding. If a later change makes these equal again the test
+	// above stops proving anything, so say so here rather than passing quietly.
+	// (indexProbeKey returns a *ExecError, so it is bound to its own variable —
+	// assigning it into an `error` would make a typed nil compare non-nil.)
+	search, probeErr := ctx.indexProbeKey(idx, parts)
+	if probeErr != nil {
+		t.Fatalf("indexProbeKey: %v", probeErr)
+	}
+	if bytes.Equal(reader, search) {
+		t.Fatalf("search key %x equals the fingerprint; this guard is no longer non-vacuous", search)
+	}
+}
+
+// TestHashBucketReadCallSitesPassTheFingerprint pins the two reader call sites
+// by source. The value test above proves the fingerprint is the right bytes; it
+// cannot prove the operators HAND those bytes over — and handing over `loBytes`
+// instead is exactly how this regressed, with every unit test still green.
+func TestHashBucketReadCallSitesPassTheFingerprint(t *testing.T) {
+	sites := 0
+	for _, f := range []string{"operators_index.go", "operators_indexonly.go"} {
+		src, err := os.ReadFile(filepath.Clean(f))
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		for i, line := range strings.Split(string(src), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "//") || !strings.Contains(line, "ssiRecordHashBucketRead(") {
+				continue
+			}
+			sites++
+			if !strings.Contains(line, "hashProbeFingerprint") {
+				t.Errorf("%s:%d hashes something other than the probe fingerprint: %s", f, i+1, trimmed)
+			}
+		}
+	}
+	if sites != 2 {
+		t.Fatalf("found %d ssiRecordHashBucketRead call sites, want 2 (index scan + index-only scan)", sites)
 	}
 }
 

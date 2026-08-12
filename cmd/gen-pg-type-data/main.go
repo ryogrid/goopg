@@ -321,6 +321,44 @@ func main() {
 		})
 	}
 
+	// Build the {typelem, typarray, typsubscript} triple for every entry.
+	//
+	// M0131-S9.3c: all three columns used to be emitted as a literal 0 by
+	// initdb.pgTypeRow, which is why a hosted PG could not evaluate an
+	// `ARRAY(SELECT …)` (get_array_type → typarray), an ArrayCoerceExpr
+	// (get_element_type → typelem) or ANY/ALL over an array
+	// (IsTrueArrayType, lsyscache.c — which requires typsubscript ==
+	// array_subscript_handler AND typelem != 0, so populating typelem alone
+	// is not enough).
+	//
+	// pg_type.dat never spells the pair out for an array type: an entry with
+	// `array_type_oid => A` gets typarray = A and genbki synthesises A with
+	// typelem = the element OID and typsubscript = array_subscript_handler.
+	// The base entries' own typelem (name => char, oidvector => oid, box =>
+	// point, …) and typsubscript are read verbatim from the .dat file.
+	oidByTypname := map[string]uint32{}
+	for _, re := range rawEntries {
+		if v, err := strconv.ParseUint(re.kv["oid"], 10, 32); err == nil {
+			oidByTypname[re.kv["typname"]] = uint32(v)
+		}
+	}
+	arraySubscript := procOID("array_subscript_handler", procByName)
+	triples := map[uint32][3]uint32{}
+	for _, re := range rawEntries {
+		oidVal, err := strconv.ParseUint(re.kv["oid"], 10, 32)
+		if err != nil {
+			continue
+		}
+		var elem uint32
+		if s, ok := re.kv["typelem"]; ok && s != "" && s != "-" {
+			elem = oidByTypname[s]
+		}
+		triples[uint32(oidVal)] = [3]uint32{elem, re.arrayTypeOID, procOID(re.kv["typsubscript"], procByName)}
+		if re.arrayTypeOID != 0 {
+			triples[re.arrayTypeOID] = [3]uint32{uint32(oidVal), 0, arraySubscript}
+		}
+	}
+
 	// Sort by OID ascending.
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].OID < entries[j].OID
@@ -340,5 +378,17 @@ func main() {
 			e.Input, e.Output, e.Receive, e.Send)
 	}
 	fmt.Printf("\t}\n")
+	fmt.Printf("}\n\n")
+
+	fmt.Printf("// pgTypeGeneratedElemArraySubscript maps a pg_type OID to its\n")
+	fmt.Printf("// {typelem, typarray, typsubscript} triple, derived from pg_type.dat the way\n")
+	fmt.Printf("// genbki derives it (see cmd/gen-pg-type-data). initdb.pgTypeRow reads it for\n")
+	fmt.Printf("// every heap row; OIDs that are not in pg_type.dat at all are covered by the\n")
+	fmt.Printf("// hand-written overlay in pg_type_bootstrap.go.\n")
+	fmt.Printf("var pgTypeGeneratedElemArraySubscript = map[uint32][3]uint32{\n")
+	for _, e := range entries {
+		t := triples[e.OID]
+		fmt.Printf("\t%d: {%d, %d, %d}, // %s\n", e.OID, t[0], t[1], t[2], e.Name)
+	}
 	fmt.Printf("}\n")
 }

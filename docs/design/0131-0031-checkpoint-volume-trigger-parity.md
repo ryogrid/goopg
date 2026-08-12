@@ -107,3 +107,38 @@ condition is noticed (up to `VolumeCheckInterval` late); see the deferral ledger
 - E2E on a throwaway 5534 cluster with `max_wal_size = 48MB`,
   `checkpoint_timeout = 3600s`: checkpoints land ~16 MiB apart, none from the
   timer.
+
+## Follow-up (2026-08-13, AI-20260813-005117-008): the anchor-seeding race
+
+The nightly race lane failed `TestCheckpointerVolumeTrigger` with
+`volume trigger did not fire within 2s`. It was filed as a load-sensitive
+2 s-deadline flake — the shape of the already-fixed `internal/mctx
+TestMultipleChunks` item — but it is not one: no deadline would have saved it.
+
+`Run` seeds `volumeAnchor` from `vr.WrittenLSN()` **inside its own goroutine**,
+while the caller that spawned it keeps appending. The test spawns `Run`, then
+immediately appends 16 records to cross a segment boundary. If `Run` is scheduled
+late — which is what a co-loaded nightly host under `-race` at `-p=4` does — the
+anchor is taken *after* those appends, so the writer is level with the anchor,
+the trigger can never fire, and the test waits out any deadline.
+
+Reproduced deterministically at `-cpu=1`: **6 of 20** runs failed with the exact
+nightly message, each at 2.02 s.
+
+Two changes:
+
+1. `Run` now invokes `OnLoopStart`/`OnLoopEnd` **after** the volume ticker is
+   armed and the anchor stored, rather than as the first statement. "The loop has
+   started" is only a useful observable once the loop is armed; a waiter released
+   earlier can still race its appends ahead of the seed. Both hooks still bracket
+   the whole timer/volume loop, so the production consumer
+   (`initdb.Open` → `activity.SetCurrentGoroutine`) is unaffected.
+2. The test takes the handshake: `OnLoopStart` closes an `armed` channel and the
+   append loop waits on it. Same `-cpu=1` probe after the fix: **20 of 20** pass,
+   1.5 s total against 40 s of timeouts before.
+
+Still deferred (ledger row): in production `NewCheckpointer` runs inside
+`initdb.Open` while `Run` is not started until `cmd/goopg/main.go`, so WAL
+appended in between — including the end-of-recovery checkpoint — is absorbed into
+the anchor and widens the first `max_wal_size` window. It self-corrects at the
+first checkpoint, after which `lastCheckpointRedoLSN` is the anchor.

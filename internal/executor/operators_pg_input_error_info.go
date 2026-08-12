@@ -71,7 +71,7 @@ func (o *pgInputErrorInfoOp) Next() (TupleSlot, error) {
 		}
 	case "timetz":
 		// Validate timetz strings with timezone-aware parser. M0097-0004.
-		_, _, e := parseTimeTZString(v)
+		_, _, e := parseTimeTZString(v, "")
 		if e != nil {
 			if ee, ok := e.(*ExecError); ok {
 				message = ee.Message

@@ -21,7 +21,10 @@ func TestPgClassHeapBootstrapCoverage(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	expectedCount := len(nailedSharedRels) + len(nailedLocalRels)
+	// M0131-S20.1: the pg_rewrite TOAST pair (2838/2839) has pg_class rows
+	// too, and rides in the same heap without being a member of
+	// nailedLocalRels — see nailedToastRels.
+	expectedCount := len(nailedSharedRels) + len(nailedLocalRels) + len(nailedToastRels())
 
 	// Bootstrap writes to both base/1 and base/5.
 	for _, db := range []string{"base/1", "base/5"} {
@@ -89,8 +92,8 @@ func TestPgClassHeapBootstrapCoverage(t *testing.T) {
 		}
 
 		if totalTuples != expectedCount {
-			t.Errorf("%s/1259: %d tuples, want %d (nailedSharedRels=%d + nailedLocalRels=%d)",
-				db, totalTuples, expectedCount, len(nailedSharedRels), len(nailedLocalRels))
+			t.Errorf("%s/1259: %d tuples, want %d (nailedSharedRels=%d + nailedLocalRels=%d + nailedToastRels=%d)",
+				db, totalTuples, expectedCount, len(nailedSharedRels), len(nailedLocalRels), len(nailedToastRels()))
 		} else if totalTuples > 0 {
 			t.Logf("%s/1259: %d tuples (all %d nailed relations accounted for)", db, totalTuples, expectedCount)
 		}

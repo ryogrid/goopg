@@ -1,38 +1,54 @@
 (idle — nothing in flight)
 
-M0131-S30 CLOSED (loop #17). Verification-only loop: NO code changed.
+M-NIGHTLY `AI-20260813-005117-012` (`TestPort_IsolationInsertConflictDoUpdate4`)
+fixed and committed — and the same one-line-class fix also closed
+`AI-20260813-005117-009` (`TestPort_IsolationEvalPlanQual`).
 
-Files: `.ralph/fix_plan.md` (S30 → [x] with the closure evidence),
-`docs/design/0131-0020-crash-recovery-row-loss-confirmed.md` (closure section
-appended), `docs/design/README.md` (index line updated), one ledger row.
+**The finding worth carrying: "REOPENED for the 3rd time" was a false story, and
+believing it would have sent the loop down the wrong path.** The fix_plan framed
+EvalPlanQual as two earlier fixes that "did not hold". They held fine. The
+`TM_SelfModified` guard from `408a3962` (M0131-S32.1) landed 2026-08-12 and this
+nightly is the FIRST run after it — a brand-new regression wearing an old
+symptom. Date the last change to the code path before accepting a reopen
+narrative; `git log -S` on the guard text settled it in one command.
 
-Worth carrying:
-- S30's gate (`RUNS=3 bash analysis/crashprobe30.sh`) went from 3/3 FAIL to
-  6/6 PASS with NO new code. The cause was the previous loop's S32 fix
-  (`const maxChain = 64` in every HOT/CTID chain walker). S32 had been FILED
-  with the prediction that it "plausibly contributes to S30's crash-probe
-  divergences" — so re-running an open item's own gate after a neighbouring
-  fix landed is worth doing BEFORE opening a fresh investigation. This cost
-  ~12 minutes and closed a 4-loop estimate.
-- Reading the probe's output correctly: the per-run `sum(abalance)` values
-  differ wildly and change sign (+71742 … −747056). That is EXPECTED — each
-  run kills pgbench at a different point. The assertion is only that the two
-  sums AGREE. Do not read a large negative sum as a failure.
-- Crash recovery still has NO automated gate; `crashprobe30.sh` is manual and
-  ~6 min for 3 runs. That residual is the ledger row and belongs to the open
-  S27/S28.
+Second finding: the spec's own shape was a decoy. `insert-conflict-do-update-4`
+is the PARTITIONED upsert spec, so partitioning and ON CONFLICT were the two
+obvious suspects — both wrong. Bisecting by SQL shape (partitioned vs plain,
+key vs non-key column, index vs seq scan, FOR UPDATE present vs absent) on a
+throwaway 5533 server reduced it to a repro with neither feature in it:
+`BEGIN; SELECT * FROM t WHERE i=1 FOR UPDATE; UPDATE t SET i=i+10 WHERE i=1;`
+→ `UPDATE 0`. Reduce to the minimal shape before reading the failing test's
+subject matter as a hint.
 
-Gates: `RUNS=3 analysis/crashprobe30.sh` PASS twice (6/6 runs; logs
-`/tmp/cp30_head_fb8affdb.log`, `/tmp/cp30_head_confirm.log`), `go build` clean,
-pgbench smoke via the commit hook, `make ralph-state-guard` OK (auto-repaired
-the stale completed marker, same as last loop).
+Third: the bug was narrow because of the HOT split — a non-key update takes
+`tryApplyHOTUpdate` and never reaches the guard, so ONLY a HOT-ineligible
+key-column change falls through to it. That is also why a whole class of
+FOR UPDATE tests kept passing while these two failed.
 
-Nightly triage: `ci/logs/action-items.md` still run `20260812-005501` (unchanged
-for 3 loops); all 4 `## AI-` items already filed under M-NIGHTLY, nothing new.
+Root cause: the guard was a bare `Xmax == myXID`. Upstream
+`HeapTupleSatisfiesUpdate` (`heapam_visibility.c`) reaches that comparison only
+after excluding `HEAP_XMAX_IS_MULTI` (raw MultiXactId vs TransactionId are
+disjoint id spaces) and `HEAP_XMAX_IS_LOCKED_ONLY` (returns TM_BeingModified —
+a row you only LOCKED is still yours to update). Both write-phase arms now share
+`isSelfModifiedWrite`; sharing was deliberate, since a duplicated inline guard is
+how one sibling gets fixed while the other rots.
 
-Next loop (banner = M-NIGHTLY filing, then M0131): next unchecked M0131 slice.
-Remaining in file order: S9 (LARGE), S8b, S21 (LARGE), S24, S26, S27, S28.
-S27/S28 now carry S30's automation residual, which argues for taking one of
-them next.
+Ledger row filed: the guard still has no cmax/curcid arm. Probed it rather than
+asserting it — the obvious two-UPDATEs-in-one-txn shape does NOT diverge (the
+second command scans the new version), so no failing shape is in hand.
+
+Next candidates (all M-NIGHTLY, selectable): PredicateHash / ReceiptReport (open
+since 2026-08-11, 3 AI-ids each); `TestE2E_FailoverPGtoGoopg` subtest `async`;
+`TestPort_IsolationMultipleCic`; the 11 regress normalization cases. Worth
+re-running the whole testport isolation set first — this fix may have cleared
+more than the two items it was aimed at.
+
+Gates: `go build ./...` clean; `go test ./internal/executor/` PASS (6.0 s);
+`TestIsSelfModifiedWrite` PASS; 9 neighbouring isolation specs PASS (68 s) incl.
+EvalPlanQual individually (24.25 s); target spec PASS (3.9 s);
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35 canonical); pgbench smoke PASS
+via the commit hook; `make ralph-state-guard` OK.
 
 In-flight: none.

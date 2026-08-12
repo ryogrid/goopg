@@ -651,7 +651,12 @@ func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
 		pins.release(bt)
 		return fmt.Errorf("btree: parent retarget on block %d for child %d: %w", parentBlk, leaf.blk, err)
 	}
-	bt.pool.MarkDirtyWithLSNLocked(pins.parent, lsn1)
+	// M0131-S26b: the leaf (block 0) is registered WILL_INIT — redo rebuilds it
+	// from the record — but the PARENT is a bare block reference carrying
+	// neither image nor data, so it still owes its first-touch FPI for the
+	// epoch. MarkDirtyCoveredByRecordLocked emits that image when needed and
+	// raises pd_lsn without advancing the native-image watermark.
+	bt.pool.MarkDirtyCoveredByRecordLocked(pins.parent, lsn1)
 
 	// ---- PHASE 2: xl_btree_unlink_page (M0130-S11.5d-3b-2) ----
 	//
@@ -694,11 +699,17 @@ func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
 	}
 
 	// Apply each mutation on the page we already hold, with the unlink
-	// record's end LSN as pd_lsn. MarkDirtyWithLSNLocked skips the
-	// per-epoch FPI path the FPI fallback would use; we rely on the unlink
-	// record itself to reconstruct each page's state during replay — which
-	// is only sound because the values written here are byte-for-byte the
-	// values the record carries.
+	// record's end LSN as pd_lsn. The TARGET (block 0, and the leaf as block
+	// 3) is registered WILL_INIT: redo rebuilds it wholesale from the record,
+	// so its pd_lsn may advance the native-image watermark — the record IS the
+	// image. The two SIBLINGS (blocks 1 and 2) are bare block references
+	// carrying neither image nor data; redo re-derives their single link
+	// rewrite from the page it finds, which presupposes an untorn page.
+	// M0131-S26b: they therefore keep the per-epoch first-touch FPI that
+	// MarkDirtyCoveredByRecordLocked emits — exactly upstream's ordinary
+	// buffer registration — instead of suppressing it via
+	// MarkDirtyWithLSNLocked. Either way the replayed values are byte-for-byte
+	// the values the record carries, which is what makes the stamp sound.
 	//
 	// Historical note (M-NIGHTLY AI-20260709-010336-082, 3rd pgbench
 	// reopen): this used to re-derive each live neighbour from the block's
@@ -718,14 +729,14 @@ func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
 			pins.release(bt)
 			return fmt.Errorf("btree: unlink left sibling %d: %w", pins.leftBlk, err)
 		}
-		bt.pool.MarkDirtyWithLSNLocked(pins.left, lsn)
+		bt.pool.MarkDirtyCoveredByRecordLocked(pins.left, lsn)
 	}
 	if pins.right != nil {
 		if err := ReplayUnlinkRightSibling(pins.right.Page(), leftsib); err != nil {
 			pins.release(bt)
 			return fmt.Errorf("btree: unlink right sibling %d: %w", pins.rightBlk, err)
 		}
-		bt.pool.MarkDirtyWithLSNLocked(pins.right, lsn)
+		bt.pool.MarkDirtyCoveredByRecordLocked(pins.right, lsn)
 	}
 	// The image the record already carries, byte for byte — not a second,
 	// independently computed rewrite of the same page.

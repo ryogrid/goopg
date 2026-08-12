@@ -1328,7 +1328,7 @@ func Init(opts Options) error {
 	// ON-SELECT rule via RewriteRelRulenameIndexId. Without a real
 	// Form_pg_rewrite row and the two leaf btrees the next FATAL is
 	// "cache lookup failed for rule" on first open of the view.
-	pgRewriteTIDs, err := bootstrapPgRewriteTuples(abs)
+	pgRewriteTIDs, pgRewriteToastChunks, err := bootstrapPgRewriteTuples(abs)
 	if err != nil {
 		return fmt.Errorf("goopg init: pg_rewrite tuples: %w", err)
 	}
@@ -1337,6 +1337,18 @@ func Init(opts Options) error {
 	}
 	if err := bootstrapPgRewriteRelRulenameIndex(abs, pgRewriteTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_rewrite_rel_rulename_index: %w", err)
+	}
+	// M0131-S20.1: DECLARE_TOAST(pg_rewrite, 2838, 2839). The pg_class /
+	// pg_attribute / pg_index rows for the pair are produced by the
+	// bootstrappers above (nailedToastRels / pgIndexInitialEntries); this
+	// writes the two physical files. pg_class(2618).reltoastrelid now names
+	// 2838, so the relation must exist even while it is still empty —
+	// PG's RelationInitPhysicalAddr runs on relcache load, not on first read.
+	// M0131-S20.2 fills them: any seeded ev_action too large to live inline was
+	// chunked above and its chunks travel here with their pointers already
+	// written into base/{1,5}/2618.
+	if err := bootstrapToastRelationFiles(abs, pgRewriteToastChunks); err != nil {
+		return fmt.Errorf("goopg init: toast relation files: %w", err)
 	}
 	// M0106-0010 step 3w: write an empty heap page for every mapped local
 	// catalog that lacks a dedicated bootstrapper (pg_aggregate=2600,
@@ -1554,9 +1566,15 @@ func mappedLocalCatalogPlaceholderOIDs() []uint32 {
 		2609, // pg_description
 		2611, // pg_inherits
 		2613, // pg_largeobject
-		2614, // pg_largeobject_metadata
+		2614, // pg_largeobject_metadata (MISLABEL — 2614 is no catalog in PG18;
+		//	  the real LargeObjectMetadataRelationId is 2995, below. Kept because
+		//	  removing a laid-down file is not this slice's business.)
 		2619, // pg_statistic
 		2620, // pg_trigger
+		2995, // pg_largeobject_metadata (M0131-S9.3f — base catalog of the
+		//	  pg_seclabels view's "large object" branch; 3596 below is the
+		//	  other half. Both heaps stay empty.)
+		3256, // pg_policy (M0131-S9.3e — base catalog of the pg_policies view)
 		3381, // pg_statistic_ext
 		3501, // pg_enum (M0106-0010 step 3an)
 		3596, // pg_seclabel
@@ -2320,6 +2338,10 @@ func bootstrapPgClassTuples(dataDir string) (map[uint32]heapTID, error) {
 	cols := pgClassColDefs()
 	allRels := append([]nailedRel{}, nailedSharedRels...)
 	allRels = append(allRels, nailedLocalRels...)
+	// M0131-S20.1: the TOAST pair rides in the pg_class heap but NOT in
+	// nailedLocalRels — see nailedToastRels for why (no pg_type row, no
+	// pg_internal.init entry).
+	allRels = append(allRels, nailedToastRels()...)
 	tids, err := writeMultiPageHeap(dataDir, "1259", cols, allRels, func(rel nailedRel) executor.Row {
 		return pgClassRow(rel)
 	})
@@ -2350,6 +2372,7 @@ func bootstrapPgAttributeTuples(dataDir string) (map[pgAttrTIDKey]heapTID, error
 	attrCols := pgAttrColDefs()
 	allRels := append([]nailedRel{}, nailedSharedRels...)
 	allRels = append(allRels, nailedLocalRels...)
+	allRels = append(allRels, nailedToastRels()...) // M0131-S20.1
 	type rowKey struct {
 		AttRelID uint32
 		AttNum   int16
@@ -4948,6 +4971,14 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// Single-column oid_ops UNIQUE PRIMARY over pg_rewrite heap OID
 		// 2618. Companion to OID 2693 (ev_class/rulename UNIQUE non-PKEY).
 		entry(2692, 2618, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_rewrite_oid_index
+		// M0131-S20.1: pg_toast_2618_index, the UNIQUE PRIMARY btree over
+		// (chunk_id oid_ops, chunk_seq int4_ops) that every detoast walks
+		// (postgres/src/backend/access/common/toast_internals.c →
+		// systable_beginscan_ordered(toastidx, …)). Declared upstream by
+		// DECLARE_TOAST(pg_rewrite, 2838, 2839) rather than by an explicit
+		// DECLARE_UNIQUE_INDEX, and confirmed against a PG 18.3 oracle:
+		// indrelid 2838, indkey "1 2", indclass "1981 1978", indisprimary t.
+		entry(2839, 2838, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_2618_index
 		// pg_trigger columns (PG18, pg_trigger.h): 1=oid, 2=tgrelid,
 		// 3=tgparentid, 4=tgname. Index = btree(tgrelid, tgname).
 		entry(2701, 2620, []int16{2, 4}, []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true, false), // pg_trigger_tgrelid_tgname_index
@@ -5950,11 +5981,12 @@ func pgClassColDefs() []catalog.Column {
 // pgClassRow builds a 14-col pg_class tuple matching pgClassColDefs order.
 func pgClassRow(rel nailedRel) executor.Row {
 	relType := rel.RelType
-	if relType == 0 {
+	if relType == 0 && !isNailedToastRel(rel) {
 		relType = rel.OID
 	}
 	relAm := int64(0)
-	if rel.RelKind == 'r' {
+	// M0131-S20.1: relkind 't' (TOAST) is heap-AM storage exactly like 'r'.
+	if rel.RelKind == 'r' || rel.RelKind == 't' {
 		relAm = 2
 	} else if rel.RelKind == 'i' {
 		relAm = 403
@@ -5992,7 +6024,9 @@ func pgClassRow(rel nailedRel) executor.Row {
 	return executor.Row{
 		executor.NewIntDatum(int64(rel.OID)), // 0: oid
 		executor.NewStringDatum(rel.RelName), // 4: relname
-		executor.NewIntDatum(11),             // 68: relnamespace
+		// 68: relnamespace — 11 (pg_catalog) for every nailed catalog, 99
+		// (pg_toast) for a bootstrapped TOAST pair (M0131-S20.1).
+		executor.NewIntDatum(int64(pgClassRelnamespaceFor(rel.OID))),
 		executor.NewIntDatum(int64(relType)), // 72: reltype
 		executor.NewIntDatum(0),              // 76: reloftype
 		executor.NewIntDatum(10),             // 80: relowner
@@ -6016,9 +6050,14 @@ func pgClassRow(rel nailedRel) executor.Row {
 		executor.NewIntDatum(0),                            // 96: relpages
 		executor.NewIntDatum(0),                            // 100: reltuples
 		executor.NewIntDatum(0),                            // 104: relallvisible
-		executor.NewIntDatum(0),                            // 108: relallfrozen
-		executor.NewIntDatum(0),                            // 112: reltoastrelid
-		executor.NewBoolDatum(false),                       // 116: relhasindex
+		executor.NewIntDatum(0), // 108: relallfrozen
+		// 112: reltoastrelid — 2838 on pg_rewrite (DECLARE_TOAST), 0 elsewhere.
+		// 116: relhasindex — true on a TOAST heap, whose (chunk_id, chunk_seq)
+		// btree is the only way PG reaches a chunk. Every other nailed heap
+		// keeps the historical false (goopg's index rows live in pg_index and
+		// PG re-derives them; changing that is out of this slice's scope).
+		executor.NewIntDatum(int64(pgClassReltoastrelidFor(rel.OID))),
+		executor.NewBoolDatum(isNailedToastRelOID(rel.OID)), // 116: relhasindex
 		executor.NewBoolDatum(rel.IsShared),                // 117: relisshared
 		executor.NewStringDatum("p"),                       // 118: relpersistence
 		executor.NewStringDatum(string(rune(rel.RelKind))), // 119: relkind
@@ -6163,7 +6202,9 @@ func pgAttributeRow(relOID uint32, a nailedAttr) executor.Row {
 		executor.NewIntDatum(0),  // attndims
 		executor.NewBoolDatum(pgTypeByVal(a.TypeOID)),
 		executor.NewStringDatum(pgTypeAlignChar(a.TypeOID)),
-		executor.NewStringDatum(pgTypeStorageChar(a.TypeOID)),
+		// attstorage: type-derived, except on a TOAST relation's own columns,
+		// which upstream pins to 'p' (M0131-S20.1).
+		executor.NewStringDatum(pgAttrStorageChar(relOID, a.TypeOID)),
 		executor.NewStringDatum(""), // attcompression
 		executor.NewBoolDatum(a.NotNull),
 		executor.NewBoolDatum(false), // atthasdef
@@ -6192,10 +6233,20 @@ func pgAttributeRow(relOID uint32, a nailedAttr) executor.Row {
 }
 
 // hasVarWidthCol returns true if any column is varlena ("text" type).
+//
+// M0131-S20.2b: "bytea" was missing here, and the omission was not theoretical
+// — the pg_rewrite TOAST heap's chunk_data is bytea, so every chunk tuple
+// S20.2a wrote carried a clear HEAP_HASVARWIDTH. A hosted PG then took
+// nocachegetattr's FAST path for attribute 3 (heaptuple.c:588 — the var-width
+// scan is guarded by HeapTupleHasVarWidth), walked off the end of the
+// fixed-width prefix and died on `Assert("j > attnum")` at heaptuple.c:642,
+// inside heap_fetch_toast_slice. An assert-disabled build would have read a
+// garbage offset instead. Same class of bug as the comment at :1862.
 func hasVarWidthCol(cols []catalog.Column) bool {
 	for _, c := range cols {
 		switch c.Type.Name {
 		case "text", "varchar", "bpchar",
+			"bytea",
 			"pg_node_tree",
 			"text[]", "_text",
 			"aclitem[]", "_aclitem",
@@ -6288,13 +6339,27 @@ func writeMultiPageHeap(dataDir, relFile string, cols []catalog.Column, rels []n
 // them may discard the slice. Step 3o uses the TIDs to build composite-key
 // btree index tuples for pg_attribute_relid_attnum_index.
 func writeMultiPageHeapRows(dataDir, relFile string, cols []catalog.Column, rows []executor.Row) ([]heapTID, error) {
+	return writeMultiPageHeapRowsExternal(dataDir, relFile, cols, rows, nil)
+}
+
+// writeMultiPageHeapRowsExternal is writeMultiPageHeapRows plus the
+// HEAP_HASEXTERNAL infomask bit: external[i] marks row i as carrying at least
+// one out-of-line TOAST pointer. Only M0131-S20.2's pg_rewrite.ev_action needs
+// it — the bit cannot be derived from the row here, because a bootstrap
+// external pointer is a KindBytes passthrough on a pg_node_tree column (the
+// same door the inline compressed varlena uses) rather than the runtime
+// engine's KindToastPointer, which executor.pgRowHasExternal keys on.
+// Upstream stamps the bit in heap_fill_tuple whenever a stored attribute is
+// VARATT_IS_EXTERNAL (postgres/src/backend/access/common/heaptuple.c:343); it
+// is what tells heap_delete/heap_update that the tuple owns toast chunks.
+func writeMultiPageHeapRowsExternal(dataDir, relFile string, cols []catalog.Column, rows []executor.Row, external []bool) ([]heapTID, error) {
 	var pages [][]byte
 	page := make(storage.Page, storage.BlockSize)
 	if err := storage.InitPage(page); err != nil {
 		return nil, err
 	}
 	tids := make([]heapTID, 0, len(rows))
-	for _, row := range rows {
+	for i, row := range rows {
 		payload, err := executor.EncodeRowPG(cols, row)
 		if err != nil {
 			return nil, fmt.Errorf("encode %s row: %w", relFile, err)
@@ -6309,6 +6374,9 @@ func writeMultiPageHeapRows(dataDir, relFile string, cols []catalog.Column, rows
 		tuple.Header.SetNatts(len(cols))
 		if hasVarWidthCol(cols) {
 			tuple.Header.Infomask |= storage.HeapHasVarWidth
+		}
+		if i < len(external) && external[i] {
+			tuple.Header.Infomask |= storage.HeapHasExternal
 		}
 		off, err := storage.PageAddHeapTuple(page, tuple)
 		if err != nil {

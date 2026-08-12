@@ -3,6 +3,7 @@ package executor
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -153,7 +154,18 @@ type CopyFromExecutor struct {
 	plan   *planner.Copy
 	cols   []catalog.Column // table's full column list, in declared order
 	rowsIn int64
-	nullStr string // NULL sentinel string, default `\N`
+	// format carries the text/CSV knobs (delimiter, quote, escape, NULL
+	// string, header) parsed from the option list. The same struct drives
+	// COPY TO; input and output MUST read the option list identically or a
+	// session cannot COPY back in what it just COPYed out.
+	format copyToFormat
+
+	// headerPending is set while the first line of the stream is still the
+	// column-name header that HEADER asked us to discard.
+	headerPending bool
+	// csvPartial holds a CSV record whose quoted field was cut in half by
+	// the wire layer's split on '\n'.
+	csvPartial []byte
 
 	// binary path state
 	binaryBuf        []byte
@@ -176,34 +188,115 @@ func NewCopyFromExecutor(ctx *Context, plan *planner.Copy) (*CopyFromExecutor, e
 	if ctx.Pool == nil || ctx.Catalog == nil || ctx.TxnMgr == nil {
 		return nil, &ExecError{Code: "XX000", Pos: plan.Pos(), Message: "COPY FROM requires storage handles in Context"}
 	}
-	nullStr := `\N`
-	for _, opt := range plan.Options {
-		if strings.EqualFold(opt.Name, "null") {
-			nullStr = opt.Value
-		}
-	}
-	return &CopyFromExecutor{
-		ctx:     ctx,
-		plan:    plan,
-		cols:    plan.Table.Columns,
-		nullStr: nullStr,
-	}, nil
+	return newCopyFromExecutor(ctx, plan), nil
 }
 
-// PushLine decodes one COPY TEXT row and inserts it. line must not
-// include a trailing newline.
-func (c *CopyFromExecutor) PushLine(line []byte) error {
-	// The decoder is keyed on the columns the user listed — len(plan.ColumnIndex)
-	// fields per row, in that order. Then we scatter into the table's full
-	// column slice, leaving unlisted columns as NULL.
-	listedCols := make([]catalog.Column, len(c.plan.ColumnIndex))
-	for i, ord := range c.plan.ColumnIndex {
-		listedCols[i] = c.cols[ord]
+// newCopyFromExecutor builds the executor without the endpoint/handle
+// checks, so the file endpoint (RunCopyFromFile) and the STDIN endpoint
+// share one option-interpretation site. They previously diverged by
+// construction: each hand-built the struct and read only the NULL option.
+func newCopyFromExecutor(ctx *Context, plan *planner.Copy) *CopyFromExecutor {
+	format := copyToFormatFromOptions(plan.Options)
+	return &CopyFromExecutor{
+		ctx:           ctx,
+		plan:          plan,
+		cols:          plan.Table.Columns,
+		format:        format,
+		headerPending: format.hasHeader(),
 	}
-	src, err := DecodeCopyTextRow(line, listedCols, c.nullStr)
+}
+
+// PushLine decodes one COPY TEXT or COPY CSV row and inserts it. line
+// must not include a trailing newline. In CSV format a physical line is
+// not necessarily a whole record (a quoted field may contain newlines),
+// so PushLine can legitimately insert nothing and buffer instead; call
+// Finish at end-of-stream to catch a record left unterminated.
+func (c *CopyFromExecutor) PushLine(line []byte) error {
+	if c.headerPending {
+		// HEADER on input discards the first line (copyfromparse.c
+		// NextCopyFrom, cstate->cur_lineno == 1 arm). Applies to TEXT
+		// as well as CSV upstream, so it is handled before the split.
+		c.headerPending = false
+		return nil
+	}
+	if c.format.csv {
+		return c.pushCsvLine(line)
+	}
+	src, err := DecodeCopyTextRow(line, c.listedColumns(), c.format.nullStr, timeZoneFromCtx(c.ctx))
 	if err != nil {
 		return &ExecError{Code: "22P04", Pos: c.plan.Pos(), Message: fmt.Sprintf("COPY: %v", err)}
 	}
+	return c.insertSourceRow(src)
+}
+
+// pushCsvLine feeds one physical line into the CSV reader, re-joining a
+// record whose quoted field the wire layer's split on '\n' cut in half.
+// The embedded newline is restored as the '\n' that was removed; a '\r'
+// that preceded it survives inside the quotes, which is what upstream
+// does too (CopyReadLineText only folds CR/LF when NOT in a quoted
+// field).
+func (c *CopyFromExecutor) pushCsvLine(line []byte) error {
+	if len(c.csvPartial) > 0 {
+		c.csvPartial = append(c.csvPartial, '\n')
+		c.csvPartial = append(c.csvPartial, line...)
+		line = c.csvPartial
+	}
+	src, err := DecodeCopyCsvRow(trimCopyLineCR(line), c.listedColumns(), c.format, timeZoneFromCtx(c.ctx))
+	if errors.Is(err, errCsvIncompleteRecord) {
+		if len(c.csvPartial) == 0 {
+			c.csvPartial = append(c.csvPartial, line...)
+		}
+		return nil
+	}
+	c.csvPartial = c.csvPartial[:0]
+	if err != nil {
+		return &ExecError{Code: "22P04", Pos: c.plan.Pos(), Message: fmt.Sprintf("%v", err)}
+	}
+	return c.insertSourceRow(src)
+}
+
+// Finish reports an end-of-stream condition the per-line path cannot see.
+// Today that is only a CSV record still inside a quoted field, which
+// upstream raises as `unterminated CSV quoted field`.
+func (c *CopyFromExecutor) Finish() error {
+	if len(c.csvPartial) > 0 {
+		c.csvPartial = c.csvPartial[:0]
+		return &ExecError{Code: "22P04", Pos: c.plan.Pos(), Message: "unterminated CSV quoted field"}
+	}
+	return nil
+}
+
+// InCsvQuotedField reports whether the reader is mid-record inside a
+// quoted CSV field. The wire layer consults it before honouring the
+// deprecated `\.` end-of-data marker: inside quotes that line is DATA,
+// as upstream demonstrates by reporting `unterminated CSV quoted field`
+// with the `\.` swallowed into the field.
+func (c *CopyFromExecutor) InCsvQuotedField() bool { return len(c.csvPartial) > 0 }
+
+// trimCopyLineCR drops the CR of a CRLF record terminator. Only the
+// record's own terminator is affected — a CR inside a quoted field is
+// followed by the restored '\n', not by end-of-line.
+func trimCopyLineCR(line []byte) []byte {
+	if n := len(line); n > 0 && line[n-1] == '\r' {
+		return line[:n-1]
+	}
+	return line
+}
+
+// listedColumns returns the columns the user listed, in the order the
+// input rows carry them.
+func (c *CopyFromExecutor) listedColumns() []catalog.Column {
+	listed := make([]catalog.Column, len(c.plan.ColumnIndex))
+	for i, ord := range c.plan.ColumnIndex {
+		listed[i] = c.cols[ord]
+	}
+	return listed
+}
+
+// insertSourceRow scatters a decoded input row into the table's full
+// column slice (unlisted columns stay NULL) and writes it through the
+// heap-write path.
+func (c *CopyFromExecutor) insertSourceRow(src Row) error {
 	row := make(Row, len(c.cols))
 	for i := range c.cols {
 		row[i] = NullDatum
@@ -366,24 +459,13 @@ func RunCopyFromFile(ctx *Context, plan *planner.Copy) (int64, error) {
 	defer f.Close()
 
 	// Build a CopyFromExecutor directly (bypassing rejectFileEndpoint).
-	nullStr := `\N`
-	for _, opt := range plan.Options {
-		if strings.EqualFold(opt.Name, "null") {
-			nullStr = opt.Value
-		}
-	}
-	fe := &CopyFromExecutor{
-		ctx:     ctx,
-		plan:    plan,
-		cols:    plan.Table.Columns,
-		nullStr: nullStr,
-	}
+	fe := newCopyFromExecutor(ctx, plan)
 
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 1<<20), 1<<20)
 	for scanner.Scan() {
 		line := scanner.Bytes()
-		if bytes.Equal(line, []byte(`\.`)) {
+		if bytes.Equal(line, []byte(`\.`)) && !fe.InCsvQuotedField() {
 			break
 		}
 		if err := fe.PushLine(line); err != nil {
@@ -393,6 +475,9 @@ func RunCopyFromFile(ctx *Context, plan *planner.Copy) (int64, error) {
 	if err := scanner.Err(); err != nil {
 		return fe.rowsIn, &ExecError{Code: "58030", Pos: plan.Pos(),
 			Message: fmt.Sprintf("error reading COPY file: %v", err)}
+	}
+	if err := fe.Finish(); err != nil {
+		return fe.rowsIn, err
 	}
 	return fe.rowsIn, nil
 }

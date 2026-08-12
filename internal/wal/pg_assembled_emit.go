@@ -155,6 +155,16 @@ const sizeOfXLogHeapDeleteData = 8
 // (heapam_xlog.h): main data carries the pre-delete tuple after xl_heap_delete.
 const xlhDeleteContainsOldTuple uint8 = 0x02
 
+// xlhDeleteIsSuper / xlhDeleteIsPartitionMove are PG's XLH_DELETE_IS_SUPER and
+// XLH_DELETE_IS_PARTITION_MOVE (heapam_xlog.h:105-106). goopg emits neither —
+// its upsert path locks before inserting rather than speculating, and it has no
+// partitioning — but replay honours both, because a hosted PG's WAL carries
+// them (M0131-S21h).
+const (
+	xlhDeleteIsSuper         uint8 = 0x08
+	xlhDeleteIsPartitionMove uint8 = 0x10
+)
+
 // EncodeHeapDeletePG builds a PostgreSQL xl_heap_delete record for one heap
 // deletion (an xmax stamp on the deleted tuple), framed for the assembled-record
 // Append path. Main data is xl_heap_delete{xmax, offnum, infobits_set, flags};
@@ -450,6 +460,25 @@ func xactCommitCarriesInvals(info uint8, mainData []byte) bool {
 // xl_heap_prune flags (heapam_xlog.h XLHP_*), set in the record's second
 // main-data byte and gating the block-0 sub-records in flag order.
 const (
+	// xlhpCleanupLock — XLHP_CLEANUP_LOCK (heapam_xlog.h:309). "The record was
+	// produced while holding a cleanup lock", which upstream's redo reads as
+	// permission to do a FULL prune: heap_xlog_prune_freeze takes the buffer
+	// with a cleanup lock and passes `lp_truncate_only = (flags &
+	// XLHP_CLEANUP_LOCK) == 0` to heap_page_prune_execute
+	// (heapam_xlog.c:77,106). Without it, upstream asserts that every
+	// now-unused slot was ALREADY LP_DEAD and carries no storage
+	// (`Assert(ItemIdIsDead(lp) && !ItemIdHasStorage(lp))`, pruneheap.c:1677),
+	// and separately that a no-cleanup-lock record carries no redirections and
+	// no dead items at all (heapam_xlog.c:50).
+	//
+	// goopg's prune is a full one — it redirects HOT chain roots and reclaims
+	// live-storage slots under the page's exclusive buffer lock — so the flag
+	// is the honest description of it, and omitting it TRAPped a real PG
+	// replaying a goopg crash tail (M0131-S27 discovery: assert-enabled 18.3
+	// aborted the startup process at pruneheap.c:1677, taking the postmaster
+	// with it; an assert-disabled build would instead have silently applied a
+	// truncate-only prune to slots that still had storage).
+	xlhpCleanupLock        uint8 = 1 << 2 // XLHP_CLEANUP_LOCK
 	xlhpHasConflictHorizon uint8 = 1 << 3 // XLHP_HAS_CONFLICT_HORIZON (snapshot horizon in main data)
 	xlhpHasFreezePlans     uint8 = 1 << 4 // XLHP_HAS_FREEZE_PLANS
 	xlhpHasRedirections    uint8 = 1 << 5 // XLHP_HAS_REDIRECTIONS
@@ -471,7 +500,11 @@ const sizeOfXLogHeapPruneData = 2
 // opcode = XLOG_HEAP2_PRUNE_ON_ACCESS; xl_xid = 0 (pruning is not transactional
 // user-data).
 func EncodeHeapPruneOptPG(rel storage.RelFileNode, blk storage.BlockNumber, redirects [][2]uint16, unused []uint16) ([]byte, error) {
-	var flags uint8
+	// XLHP_CLEANUP_LOCK unconditionally: goopg's prune redirects chain roots
+	// and reclaims slots that still have storage, which is precisely the
+	// full-prune shape upstream refuses to replay without this flag. See the
+	// constant's comment (M0131-S27).
+	flags := xlhpCleanupLock
 	var blockData []byte
 	if len(redirects) > 0 {
 		flags |= xlhpHasRedirections
@@ -522,7 +555,11 @@ func EncodeHeapFreezePG(rel storage.RelFileNode, blk storage.BlockNumber, frozen
 		blockData = binary.LittleEndian.AppendUint16(blockData, s)
 	}
 
-	mainData := []byte{0, xlhpHasFreezePlans} // reason = 0, flags
+	// XLHP_CLEANUP_LOCK for the same reason as the prune encoder above: this
+	// record comes from VACUUM, which holds a cleanup lock on the page, and
+	// upstream's redo derives its buffer-lock mode and its lp_truncate_only
+	// decision from this bit alone (heapam_xlog.c:77,106).
+	mainData := []byte{0, xlhpHasFreezePlans | xlhpCleanupLock} // reason = 0, flags
 	body, err := assembleXLogRecord(mainData, []BlockRef{{ID: 0, Rel: rel, Block: blk, Data: blockData}})
 	if err != nil {
 		return nil, err
@@ -649,8 +686,11 @@ func EncodeBtreeSplitPG(rel storage.RelFileNode, leftBlk, rightBlk storage.Block
 	// The incremental left half, when the split the primary performed is one
 	// upstream's record can describe AND replaying that description reproduces
 	// the page it wrote.
-	if desc, derr := btree.DescribeSplitLeft(prePage, leftPage, rightPage, newItem); derr == nil &&
-		btree.CheckSplitLeft(prePage, leftPage, level, rightBlk, desc) == nil {
+	// The decision lives in btree.SplitLeftIsIncremental so the primary's
+	// pd_lsn stamp can ask the SAME question (M0131-S26b): under this branch
+	// block 0 carries no image, so the left page still owes its first-touch
+	// FPI and must not advance the native-image watermark.
+	if desc, ok := btree.SplitLeftIsIncremental(prePage, leftPage, rightPage, newItem, level, rightBlk); ok {
 		firstRightOff = desc.FirstRightOff
 		newItemOff = desc.NewItemOff
 		if desc.NewItemOnLeft {

@@ -9,6 +9,7 @@ import (
 
 	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/pgarray"
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
@@ -24,6 +25,9 @@ type indexOnlyScanOp struct {
 	ctx  *Context
 	rows []Row
 	idx  int
+	// arrayStyle is the session DateStyle/TimeZone an array element's output
+	// function reads, resolved once in Open. M0119-0006.
+	arrayStyle pgarray.OutputStyle
 	// M0092-0007: embedded slot reused across every Next() call
 	// so we don't allocate a fresh MaterializedSlot per emission.
 	slot MaterializedSlot
@@ -37,6 +41,11 @@ type indexOnlyScanOp struct {
 	// after the scan so a subsequent index-only scan reflects PG's prune-on-read
 	// (horizons.spec, M0118-0009). nil keys are never inserted.
 	touchedBlocks map[storage.BlockNumber]struct{}
+	// hashProbeFingerprint is the blob-format encoding of this scan's probe key
+	// (ssiHashProbeFingerprint) — the bytes the hash-bucket SIREAD tag must be
+	// derived from, as opposed to the tuple-image search key the same probe
+	// descends the tree with. Set by lookupKey/lookupKeys.
+	hashProbeFingerprint []byte
 }
 
 // setHeapFetchCounter implements the heapFetchCounter interface so EXPLAIN
@@ -60,6 +69,11 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 	o.ctx = ctx
 	o.rows = nil
 	o.idx = 0
+	// The array element output style, resolved once per scan (M0119-0006). An
+	// index-only scan renders array elements from the KEY rather than the heap;
+	// it is the seq/bitmap scans' sibling and must agree with them, so it reads
+	// the same session GUCs through the same helper.
+	o.arrayStyle = arrayOutputStyle(ctx)
 
 	heapRel := ctx.Catalog.RelFileNode(o.plan.Table)
 	if err := ctx.acquireRelLock(heapRel, lockmgr.AccessShareLock); err != nil {
@@ -113,6 +127,7 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
 
+	o.hashProbeFingerprint = nil
 	var loBytes, hiBytes []byte
 	switch {
 	case len(o.plan.Keys) > 0:
@@ -159,11 +174,19 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 	}
 
 	// Hash-index equality probe: take the bucket-grain SIREAD on the index
-	// (design 0118-0099) in place of the relation-grain lock skipped above.
-	// loBytes is the encoded probe key (== hiBytes for the single-column
-	// equality a hash index supports). No-op outside SERIALIZABLE.
-	if isHashIdx && len(loBytes) > 0 {
-		ssiRecordHashBucketRead(ctx, heapRel.DBOid, o.plan.Index.OID, loBytes)
+	// (design 0118-0099) in place of the relation-grain lock skipped above. The
+	// tag comes from the probe's FINGERPRINT (ssiHashProbeFingerprint) — the
+	// same encoding ssiRecordHashIndexInsert hashes — NOT from loBytes, which is
+	// the tree search key and, for a describable index, a tuple image. No-op
+	// outside SERIALIZABLE. When no fingerprint could be made (a range probe, or
+	// an unencodable key part) the relation-grain lock skipped above is taken
+	// after all: over-approximating is safe, holding nothing is not.
+	if isHashIdx {
+		if len(o.hashProbeFingerprint) > 0 {
+			ssiRecordHashBucketRead(ctx, heapRel.DBOid, o.plan.Index.OID, o.hashProbeFingerprint)
+		} else if o.plan.Table == nil || (!o.plan.Table.Temp && !o.plan.Table.IsMatView) {
+			ssiRecordRelationRead(ctx, heapRel)
+		}
 	}
 
 	// Some key encodings cannot be inverted (interval's key is the lossy
@@ -407,7 +430,7 @@ func (o *indexOnlyScanOp) decodeRowFromKey(key []byte) (Row, error) {
 		return o.projectCovered(decoded)
 	}
 	if len(o.plan.Index.Columns) == 1 && len(o.plan.Covered) == 1 {
-		d, err := decodeBTreeKeyToDatum(key, o.plan.Covered[0])
+		d, err := decodeBTreeKeyToDatumStyled(key, o.plan.Covered[0], o.arrayStyle)
 		if err != nil {
 			return nil, err
 		}
@@ -421,7 +444,7 @@ func (o *indexOnlyScanOp) decodeRowFromKey(key []byte) (Row, error) {
 		if !ok {
 			return nil, fmt.Errorf("IOS: index column %q not in catalog", colName)
 		}
-		d, n, err := decodeIndexKeyColumn(key[off:], *col)
+		d, n, err := decodeIndexKeyColumnStyled(key[off:], *col, o.arrayStyle)
 		if err != nil {
 			return nil, fmt.Errorf("IOS key col %q: %w", colName, err)
 		}
@@ -458,6 +481,13 @@ func numericDatumFromBig(m *big.Int, scale int16) Datum {
 // decodeIndexKeyColumn decodes one column from a B-tree key slice and returns
 // the Datum plus the number of bytes consumed. Used by the multi-column path.
 func decodeIndexKeyColumn(key []byte, col catalog.Column) (Datum, int, error) {
+	return decodeIndexKeyColumnStyled(key, col, pgarray.DefaultOutputStyle())
+}
+
+// decodeIndexKeyColumnStyled is decodeIndexKeyColumn under an explicit array
+// output style; only an ARRAY key column of a date/timestamp/timestamptz
+// element type reads it (M0119-0006).
+func decodeIndexKeyColumnStyled(key []byte, col catalog.Column, st pgarray.OutputStyle) (Datum, int, error) {
 	typeName := col.Type.Name
 	// Fixed-width branches must slice `key` to the type's exact byte
 	// width before delegating — btree.DecodeInt4 / DecodeInt8 enforce
@@ -468,7 +498,7 @@ func decodeIndexKeyColumn(key []byte, col catalog.Column) (Datum, int, error) {
 	// element's width out of a longer array segment. Route arrays first, the
 	// mirror of encodeBTreeKeyForColumn's own array-first routing. M0119-0006.
 	if col.Type.IsArray {
-		return decodeArrayBTreeKey(key, col)
+		return decodeArrayBTreeKey(key, col, st)
 	}
 	// int2 / oid / bool / bytea / time (btree_scalar_keys.go). Routed BEFORE the
 	// switch below so neither of these types can reach the `default:` arm, which
@@ -502,6 +532,13 @@ func decodeIndexKeyColumn(key []byte, col catalog.Column) (Datum, int, error) {
 		}
 		v, err := btree.DecodeTimestamp(key[:8])
 		ts := pgEpoch.Add(time.Duration(v) * time.Microsecond)
+		// The key form is shared but the TYPE is not: an index-only scan answers
+		// the column from the key, so this datum reaches the user in place of the
+		// heap's, and must carry the same subtype the heap decode assigns
+		// (decodeValuePG, codec.go). M0119-0006 (41st slice).
+		if isTimestamptzType(typeName) {
+			return NewTimestampTZDatum(ts), 8, err
+		}
 		return NewTimeDatum(ts), 8, err
 	case isDateType(typeName):
 		// date is encoded as int4 days since the PG epoch. M0118-0001.
@@ -510,7 +547,7 @@ func decodeIndexKeyColumn(key []byte, col catalog.Column) (Datum, int, error) {
 		}
 		v, err := btree.DecodeInt4(key[:4])
 		ts := pgEpoch.Add(time.Duration(v) * 24 * time.Hour)
-		return NewTimeDatum(ts), 4, err
+		return NewDateDatum(ts), 4, err
 	case isNumericType(typeName):
 		// NUMERIC keys are variable-length but self-delimiting, so the
 		// composite walk can consume exactly this column. Value-preserving,
@@ -578,6 +615,12 @@ func (o *indexOnlyScanOp) decodeRowFromHeap(t storage.HeapTuple) (Row, error) {
 // decodeBTreeKeyToDatum inverts the B-tree key encoding for a single column
 // back to an executor Datum.
 func decodeBTreeKeyToDatum(key []byte, col catalog.Column) (Datum, error) {
+	return decodeBTreeKeyToDatumStyled(key, col, pgarray.DefaultOutputStyle())
+}
+
+// decodeBTreeKeyToDatumStyled is decodeBTreeKeyToDatum under an explicit array
+// output style (M0119-0006).
+func decodeBTreeKeyToDatumStyled(key []byte, col catalog.Column, st pgarray.OutputStyle) (Datum, error) {
 	typeName := col.Type.Name
 	// Sibling of decodeIndexKeyColumn's array routing (same ordering rationale:
 	// an array's Type.Name is its ELEMENT type name, so it must not reach any
@@ -585,7 +628,7 @@ func decodeBTreeKeyToDatum(key []byte, col catalog.Column) (Datum, error) {
 	// key, so bytes trailing the array's end marker mean this is not the
 	// encoding we think it is. M0119-0006.
 	if col.Type.IsArray {
-		d, n, err := decodeArrayBTreeKey(key, col)
+		d, n, err := decodeArrayBTreeKey(key, col, st)
 		if err != nil {
 			return NullDatum, err
 		}
@@ -657,6 +700,12 @@ func decodeBTreeKeyToDatum(key []byte, col catalog.Column) (Datum, error) {
 			return NullDatum, err
 		}
 		ts := pgEpoch.Add(time.Duration(v) * time.Microsecond)
+		// Sibling of decodeIndexKeyColumn's arm above — both must tag, or the
+		// same column decodes one way in a single-column index-only scan and
+		// another way in a composite one. M0119-0006 (41st slice).
+		if isTimestamptzType(typeName) {
+			return NewTimestampTZDatum(ts), nil
+		}
 		return NewTimeDatum(ts), nil
 
 	case isDateType(typeName):
@@ -666,7 +715,7 @@ func decodeBTreeKeyToDatum(key []byte, col catalog.Column) (Datum, error) {
 			return NullDatum, err
 		}
 		ts := pgEpoch.Add(time.Duration(v) * 24 * time.Hour)
-		return NewTimeDatum(ts), nil
+		return NewDateDatum(ts), nil
 
 	default:
 		// Unknown type: attempt float8 decode for user-defined enums. M0097-0022.
@@ -717,6 +766,7 @@ func (o *indexOnlyScanOp) lookupKeys() ([]byte, bool, error) {
 	if encErr != nil {
 		return nil, false, encErr
 	}
+	o.hashProbeFingerprint = ssiHashProbeFingerprint(o.plan.Index, parts)
 	return probe, true, nil
 }
 
@@ -736,10 +786,14 @@ func (o *indexOnlyScanOp) lookupKey() ([]byte, bool, error) {
 		return nil, false, &ExecError{Code: "XX000", Pos: o.plan.Pos(),
 			Message: fmt.Sprintf("indexed column %q not found", o.plan.Index.Columns[0])}
 	}
-	k, encErr := o.ctx.indexProbeKey(o.plan.Index, []indexProbeKeyPart{{col: col, val: v, pos: o.plan.Key.Pos()}})
+	parts := []indexProbeKeyPart{{col: col, val: v, pos: o.plan.Key.Pos()}}
+	k, encErr := o.ctx.indexProbeKey(o.plan.Index, parts)
 	if encErr != nil {
 		return nil, false, encErr
 	}
+	// The SSI bucket tag is derived from the FINGERPRINT of the same parts, not
+	// from `k` — see ssiHashProbeFingerprint.
+	o.hashProbeFingerprint = ssiHashProbeFingerprint(o.plan.Index, parts)
 	return k, true, nil
 }
 

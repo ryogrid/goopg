@@ -59,7 +59,12 @@ func EncodeCopyTextRow(dst []byte, row Row, cols []catalog.Column, dateStyle, da
 // trailing newline) into Datums shaped by cols. Returns an error
 // when the field count doesn't match cols, or a column value can't
 // parse into its declared type.
-func DecodeCopyTextRow(line []byte, cols []catalog.Column, nullStr string) (Row, error) {
+//
+// timeZone is the session TimeZone GUC ("" = the boot default, UTC); it is the
+// read-side counterpart of the timeZone EncodeCopyTextRow already takes, and is
+// consumed by the types whose input function reads the GUC when the text itself
+// carries no zone field (today: timetz). M0119-0006 (48th slice).
+func DecodeCopyTextRow(line []byte, cols []catalog.Column, nullStr string, timeZone string) (Row, error) {
 	fields, err := splitCopyTextFields(line, nullStr)
 	if err != nil {
 		return nil, err
@@ -67,13 +72,23 @@ func DecodeCopyTextRow(line []byte, cols []catalog.Column, nullStr string) (Row,
 	if len(fields) != len(cols) {
 		return nil, fmt.Errorf("COPY: row has %d fields, expected %d", len(fields), len(cols))
 	}
+	return datumsFromCopyFields(fields, cols, timeZone)
+}
+
+// datumsFromCopyFields converts already-split COPY fields into a Row
+// shaped by cols. Shared by the TEXT and CSV readers so the two formats
+// cannot drift in how a field's bytes become a Datum (the field SPLIT
+// differs between the formats; the per-field input-function call does
+// not). Callers check the field count first — the two formats report a
+// mismatch with different messages.
+func datumsFromCopyFields(fields []copyField, cols []catalog.Column, timeZone string) (Row, error) {
 	row := make(Row, len(cols))
 	for i, raw := range fields {
 		if raw.isNull {
 			row[i] = NullDatum
 			continue
 		}
-		d, err := copyTextToDatum(cols[i].Type, raw.bytes)
+		d, err := copyTextToDatum(cols[i].Type, raw.bytes, timeZone)
 		if err != nil {
 			return nil, fmt.Errorf("column %q: %w", cols[i].Name, err)
 		}
@@ -248,6 +263,28 @@ func appendCopyTextEscaped(dst []byte, s string) []byte {
 // datumToCopyText renders a non-null Datum into the byte string
 // COPY TEXT expects, before per-byte escaping.
 func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone string) (string, error) {
+	// Array columns FIRST. A user array column is
+	// catalog.Type{Name:<ELEMENT type>, IsArray:true}, so every arm of the
+	// switch below would claim the array under its ELEMENT's name and reject
+	// the "{1,2}" KindString datum the heap decode produced — `COPY … TO` of an
+	// int4[] column was a flat "expected int datum for int4, got kind 3", and a
+	// date[] column "expected time datum for date, got kind 3" (only text[]
+	// worked, by falling through to the default arm). Upstream's CopyOneRowTo
+	// (postgres/src/backend/commands/copyto.c) calls the COLUMN's output
+	// function, which for an array column is array_out. goopg renders the array
+	// text at heap-decode time (decodeArrayValuePGStyled, under this session's
+	// DateStyle/TimeZone), so array_out's job is already done and the text is
+	// emitted as-is; the caller's per-byte TEXT escaping and the CSV writer's
+	// quoting then apply to it exactly as they do to any other string, which is
+	// what makes `{"has,comma"}` come out CSV-quoted like upstream. Same
+	// IsArray-before-the-switch guard internal/wal/pgoutput.go and
+	// encodeValuePG carry. M0119-0006.
+	if t.IsArray {
+		if d.Kind != KindString {
+			return "", fmt.Errorf("expected array text datum for %s[], got kind %d", t.Name, d.Kind)
+		}
+		return d.StringValue(), nil
+	}
 	switch t.Name {
 	case "int4", "integer", "int", "int8", "bigint":
 		if d.Kind != KindInt {
@@ -289,6 +326,34 @@ func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone str
 			return "", fmt.Errorf("expected time datum, got kind %d", d.Kind)
 		}
 		return config.FormatTimestampTZ(d.TimeValue(), dateStyle, dateOrder, timeZone), nil
+	case "time":
+		// M0119-0006 (49th slice): previously unhandled — a `time` column fell
+		// through to the default arm, whose Kind switch has no KindTime case, so
+		// `COPY <t> TO STDOUT` on any table with a time column hard-errored
+		// ("kind 5 cannot encode as time in COPY TEXT") and COPY TO → COPY FROM
+		// was not a round trip even though the FROM side has had a "time" arm
+		// all along (copyTextToDatum below). Hard-won Rule #2: the two
+		// directions of one codec must cover the same type-set.
+		//
+		// time_out ignores DateStyle entirely (postgres/src/backend/utils/adt/
+		// date.c: EncodeTimeOnly is called with USE_ISO_DATES unconditionally),
+		// so unlike the date/timestamp arms above this one takes no style
+		// argument.
+		if d.Kind != KindTime {
+			return "", fmt.Errorf("expected time datum for time, got kind %d", d.Kind)
+		}
+		return pgdatetime.FormatTime(copyTimeOfDayMicros(t, d.TimeValue())), nil
+	case "timetz":
+		// Sibling of the "time" arm; timetz_out prints the local time of day
+		// followed by the UTC offset. pgdatetime.FormatTimeTZ takes PG's own
+		// TimeTzADT.zone convention — seconds WEST of UTC — while the Datum
+		// stores seconds EAST (Scale, in minutes), hence the negation, exactly
+		// as the heap encoder does (codec.go's "timetz" arm). M0119-0006.
+		if d.Kind != KindTime {
+			return "", fmt.Errorf("expected time datum for timetz, got kind %d", d.Kind)
+		}
+		return pgdatetime.FormatTimeTZ(copyTimeOfDayMicros(t, d.TimeValue()),
+			int32(-d.TimeTZOffsetSecs())), nil
 	default:
 		switch d.Kind {
 		case KindString:
@@ -310,9 +375,51 @@ func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone str
 	}
 }
 
+// copyTimeOfDayMicros converts the time.Time carrier of a `time`/`timetz`
+// Datum into the microseconds-since-midnight pgdatetime's time_out/timetz_out
+// ports take, applying the column's declared precision.
+//
+// The one detail pgTimeMicros() cannot supply:
+//
+//   - goopg applies no typmod at INPUT (there is no AdjustTimeForTypmod port),
+//     so a `time(2)` column really does hold full microseconds and the declared
+//     precision is applied at OUTPUT. Truncating the micros here and letting
+//     FormatTime strip trailing zeros reproduces appendTimeText's trim-then-
+//     strip byte for byte, which is what keeps `COPY … TO` and `SELECT` in
+//     agreement on the same column (Hard-won Rule #2). Upstream ROUNDS at
+//     input instead; see the M0119-0006 deferral-ledger row.
+func copyTimeOfDayMicros(t catalog.Type, tv time.Time) int64 {
+	// M0119-0006 (50th slice): the `24:00:00` next-day probe that used to live
+	// here moved INTO pgTimeMicros, so the heap encode, the btree keys and this
+	// renderer can no longer disagree about it (Hard-won Rule #2).
+	micros := pgTimeMicros(tv)
+	if len(t.Args) > 0 && t.Args[0] >= 0 && t.Args[0] < 6 {
+		scale := int64(1)
+		for i := int64(0); i < 6-t.Args[0]; i++ {
+			scale *= 10
+		}
+		micros = (micros / scale) * scale
+	}
+	return micros
+}
+
 // copyTextToDatum is the inverse of datumToCopyText. raw is the
-// already-unescaped byte representation of one column value.
-func copyTextToDatum(t catalog.Type, raw []byte) (Datum, error) {
+// already-unescaped byte representation of one column value. timeZone is the
+// session TimeZone GUC ("" = UTC), for the types whose input function consults
+// it when the text carries no zone of its own.
+func copyTextToDatum(t catalog.Type, raw []byte, timeZone string) (Datum, error) {
+	// Array columns FIRST, the sibling of datumToCopyText's guard above (Rule
+	// #2: the two must agree on the type-set). Without it `COPY t FROM` into an
+	// int4[] column took the int4 arm and failed 'invalid integer "{1,2}"',
+	// while a date[] column pushed the whole array text through
+	// parseCopyTimestampZone. The canonical in-memory array value is its
+	// "{1,2}" text (encodeValuePG's IsArray branch hands exactly that to
+	// encodeArrayValuePG, which parses the elements and builds the ArrayType
+	// blob), so — like the INSERT path — this returns the unescaped text
+	// unchanged and lets the encoder do the element work. M0119-0006.
+	if t.IsArray {
+		return NewStringDatum(string(raw)), nil
+	}
 	switch t.Name {
 	case "int4", "integer", "int", "int8", "bigint":
 		v, err := strconv.ParseInt(string(raw), 10, 64)
@@ -337,6 +444,17 @@ func copyTextToDatum(t catalog.Type, raw []byte) (Datum, error) {
 		if err != nil {
 			return Datum{}, err
 		}
+		// M0119-0006 (41st slice): the same three-way tag the heap decode applies
+		// (decodeValuePG, codec.go). tsZoneModeForType above already reads t.Name
+		// to decide whether the zone belongs to the VALUE; the subtype records
+		// which type it belonged to, so the type-agnostic renderers agree with
+		// the typed ones. Hard-won Rule #2.
+		switch {
+		case isTimestampTZTypeName(t.Name):
+			return NewTimestampTZDatum(ts), nil
+		case isDateType(t.Name):
+			return NewDateDatum(ts), nil
+		}
 		return NewTimeDatum(ts), nil
 	case "time":
 		ts, err := parseTimeString(string(raw))
@@ -345,7 +463,14 @@ func copyTextToDatum(t catalog.Type, raw []byte) (Datum, error) {
 		}
 		return NewTimeDatum(ts), nil
 	case "timetz":
-		ts, offsetSecs, err := parseTimeTZString(string(raw))
+		// M0119-0006 (48th slice): a COPY field with no zone of its own takes the
+		// SESSION zone, exactly as the literal path does since the 47th slice —
+		// `COPY t FROM STDIN` of "10:00:00" under TimeZone='Asia/Tokyo' is
+		// 10:00:00+09 upstream, not +00 (DecodeTimeOnly's `!(fmask & DTK_M(TZ))`
+		// arm, datetime.c). Hard-won Rule #2: the INSERT and COPY readers of one
+		// type must agree, or a table loaded by COPY differs from the same table
+		// loaded by INSERT under the same GUC.
+		ts, offsetSecs, err := parseTimeTZString(string(raw), timeZone)
 		if err != nil {
 			return Datum{}, err
 		}
@@ -392,24 +517,24 @@ func parseTimeString(s string) (time.Time, error) {
 	hadDatePrefix := false
 	if len(s) >= 10 && s[4] == '-' && s[7] == '-' {
 		// Extract time portion after the date (YYYY-MM-DD ); any zone suffix
-		// it carries is dropped by stripTimeZoneSuffix below.
+		// it carries is dropped by stripValidatedZoneSuffix below.
 		hadDatePrefix = true
 		s = strings.TrimSpace(s[10:])
 	}
 
-	// Detect and reject named timezone in bare time strings (e.g. "15:36:39 America/New_York").
-	if !hadDatePrefix {
-		if idx := strings.Index(s, " "); idx >= 0 && strings.Contains(s[idx+1:], "/") {
-			return time.Time{}, &ExecError{Code: "22007",
-				Message: fmt.Sprintf("invalid input syntax for type time: %q", orig)}
-		}
-	}
-
-	// Strip the timezone suffix (e.g. " PST", " EDT", "+05", "+05:30"); a
-	// time-only value has no zone to apply it to. The AM/PM marker is NOT a
-	// zone and must survive — dropping it here is what made
+	// Strip the trailing zone/era fields (" PST", " Etc/GMT", "+05", "+05:30",
+	// " BC"); a time-only value has no zone to apply it to, so the offset is
+	// discarded here — parseTimeTZString is the caller that keeps it. The AM/PM
+	// marker is NOT a zone and must survive: dropping it here is what made
 	// '2020-01-01 12:00 AM'::timestamp lose its meridiem.
-	s = stripTimeZoneSuffix(s)
+	//
+	// M0119-0006: the fields are now VALIDATED rather than assumed to be a
+	// zone, so '10:00 GARBAGE' is 22007 and '10:00 A.M.' is 22023 as on PG —
+	// see classifyZoneToken for how the tokenizer picks between the two.
+	s, _, _, err := stripValidatedZoneSuffix(s, hadDatePrefix, "time", orig)
+	if err != nil {
+		return time.Time{}, err
+	}
 
 	// M0119-0006: field decoding proper is PostgreSQL's, not a layout table's —
 	// see pgdatetime.ParseTimeOfDay for the forms this unlocks ('10:00.5' as
@@ -460,34 +585,6 @@ func parseTimeString(s string) (time.Time, error) {
 	// Anchor to epoch date 1970-01-01 UTC. A whole-day time (24:00:00, 23:59:60)
 	// is stored as next-day midnight, which is how it round-trips as 24:00:00.
 	return time.Date(1970, 1, 1+dayCarry, norm.Hour, norm.Min, norm.Sec, norm.Nsec, time.UTC), nil
-}
-
-// stripTimeZoneSuffix removes the zone part of a time-only input: every
-// space-separated trailing token ("PST", "+05:30", "America/New_York") plus an
-// attached numeric offset ("10:00+05"). A time has no date to resolve a zone
-// against, so PostgreSQL's time_in likewise decodes and then ignores it.
-//
-// The AM/PM marker is explicitly NOT a zone token. It is an ordinary field to
-// PostgreSQL's splitter, and stripping it here was how goopg turned
-// '2020-01-01 12:00 AM' into a parse failure and '12:00 AM' into noon.
-func stripTimeZoneSuffix(s string) string {
-	for {
-		idx := strings.LastIndex(s, " ")
-		if idx < 0 {
-			break
-		}
-		switch strings.ToUpper(strings.TrimSpace(s[idx+1:])) {
-		case "AM", "PM":
-			return s
-		}
-		s = strings.TrimSpace(s[:idx])
-	}
-	if plus := strings.LastIndex(s, "+"); plus > 2 {
-		return s[:plus]
-	} else if minus := strings.LastIndex(s, "-"); minus > 2 {
-		return s[:minus]
-	}
-	return s
 }
 
 // tzAbbrevOffsets maps common timezone abbreviations to their UTC offsets
@@ -579,16 +676,27 @@ func parseTZOffset(s string) (int, bool) {
 //   - "HH:MM:SS.ffffff +HH" / "-HH" / "+HH:MM" explicit offset
 //   - "HH:MM PDT" / "PST" / etc. timezone abbreviations
 //   - "YYYY-MM-DD HH:MM:SS America/New_York" full timestamp with named TZ
-//   - "HH:MM:SS" bare time (offset defaults to +00)
+//   - "HH:MM:SS" bare time (offset defaults to the SESSION zone — see below)
 //
 // Inputs with named timezone in bare time strings (no date) are rejected.
-func parseTimeTZString(s string) (time.Time, int, error) {
+//
+// `zone` is the session TimeZone GUC ("" = the boot default, UTC). M0119-0006:
+// an input with no zone field of its own does not take +00, it takes the
+// session zone's offset — for the date the input itself carries, or for today's
+// date when it carries none (DecodeTimeOnly's `!(fmask & DTK_M(TZ))` arm,
+// datetime.c). Callers that are deciding a TYPE rather than reading a declared
+// timetz pass "" deliberately; see parseTimeTZString's call sites.
+func parseTimeTZString(s string, zone string) (time.Time, int, error) {
 	orig := s
 	// M0125-0007: as in parseTimeString — the date-prefix probe below is a
 	// fixed-offset test (s[4], s[7], s[:10]) that assumes zero-padded fields.
 	s = pgdatetime.NormalizeInput(s)
 
 	offsetSecs := 0
+	// haveOff distinguishes "the input carried a zone field that resolved to +00"
+	// from "the input carried no zone field at all" — only the latter falls back
+	// to the session zone. Before this slice both were spelled `offsetSecs == 0`.
+	haveOff := false
 
 	// Full timestamp with date prefix: "YYYY-MM-DD HH:MM:SS[±HH[:MM]] [TZ]"
 	if len(s) >= 10 && s[4] == '-' && s[7] == '-' {
@@ -625,22 +733,22 @@ func parseTimeTZString(s string) (time.Time, int, error) {
 				}
 				// Named zone but couldn't load → strip to just time, offset = 0
 			} else if off, ok := parseTZOffset(tzStr); ok {
-				offsetSecs = off
+				offsetSecs, haveOff = off, true
 			} else if off, ok := tzAbbrevOffsets[strings.ToUpper(tzStr)]; ok {
-				offsetSecs = off
+				offsetSecs, haveOff = off, true
 			}
 		}
 		// timeStr may have an inline numeric offset like "13:30:25.575401-04" or "13:30:25+05:30"
 		// Extract it before passing to parseTimeString.
-		if offsetSecs == 0 {
+		if !haveOff {
 			if plus := strings.LastIndex(timeStr, "+"); plus > 2 {
 				if off, ok := parseTZOffset(timeStr[plus:]); ok {
-					offsetSecs = off
+					offsetSecs, haveOff = off, true
 					timeStr = timeStr[:plus]
 				}
 			} else if minus := strings.LastIndex(timeStr, "-"); minus > 2 {
 				if off, ok := parseTZOffset(timeStr[minus:]); ok {
-					offsetSecs = off
+					offsetSecs, haveOff = off, true
 					timeStr = timeStr[:minus]
 				}
 			}
@@ -650,59 +758,45 @@ func parseTimeTZString(s string) (time.Time, int, error) {
 		if err != nil {
 			return time.Time{}, 0, wrapTimeTZError(err, orig)
 		}
+		// No zone field: DecodeTimeOnly resolves the session zone AT THE DATE THE
+		// INPUT CARRIES, not at today's — `'2020-01-05 10:00'::timetz` is
+		// 10:00:00-05 on America/New_York while `'2020-07-05 10:00'::timetz` is
+		// 10:00:00-04. M0119-0006.
+		if !haveOff && zone != "" {
+			if d, e := time.Parse("2006-01-02", dateStr); e == nil {
+				offsetSecs = config.ZoneOffsetForLocalTime(zone,
+					time.Date(d.Year(), d.Month(), d.Day(),
+						t.Hour(), t.Minute(), t.Second(), 0, time.UTC))
+			}
+		}
 		return t, offsetSecs, nil
 	}
 
-	// Bare time string — reject named timezones (e.g. "15:36:39 America/New_York")
-	if idx := strings.Index(s, " "); idx >= 0 {
-		tzPart := strings.TrimSpace(s[idx+1:])
-		if strings.Contains(tzPart, "/") {
-			return time.Time{}, 0, &ExecError{Code: "22007",
-				Message: fmt.Sprintf("invalid input syntax for type time with time zone: %q", orig)}
-		}
-	}
-
-	// Detach the AM/PM marker before timezone extraction so the zone scan below
-	// does not mistake it for an abbreviation; it is re-attached verbatim for
-	// parseTimeString, which owns the meridiem rules (hour 12 AM is hour 0).
-	upper := strings.ToUpper(s)
+	// Bare time string — the trailing fields go through the same validating
+	// classifier as `time` (M0119-0006). It replaces this arm's own zone scan,
+	// which knew only the abbreviation table and the numeric displacement: an
+	// era field was rejected outright ('10:00 BC'::timetz is `10:00:00` on PG),
+	// a zone *name* was rejected even when fixed-offset ('10:00 Etc/GMT'), and
+	// a name-shaped token that names nothing got 22007 where PG raises 22023
+	// ('10:00 A.M.' → `time zone "a.m." not recognized`).
+	//
+	// The AM/PM marker is detached first so it reaches parseTimeString, which
+	// owns the meridiem rules (hour 12 AM is hour 0) — stripValidatedZoneSuffix
+	// stops at it, but it must not block the era/zone fields that may FOLLOW it
+	// ('10:00 AM BC' parses on PG).
 	meridiem := ""
-	if strings.HasSuffix(upper, " PM") || strings.HasSuffix(upper, " AM") {
+	if u := strings.ToUpper(s); strings.HasSuffix(u, " PM") || strings.HasSuffix(u, " AM") {
 		meridiem = s[len(s)-3:]
 		s = strings.TrimSpace(s[:len(s)-3])
-		upper = strings.ToUpper(s)
 	}
 
-	// Extract timezone: space-separated abbreviation or explicit offset after time.
-	// Unrecognized suffixes are rejected (PostgreSQL errors on unknown TZ abbreviations).
-	if idx := strings.LastIndex(s, " "); idx >= 0 {
-		tzPart := s[idx+1:]
-		timePart := s[:idx]
-		// Try as abbreviation
-		if off, ok := tzAbbrevOffsets[strings.ToUpper(tzPart)]; ok {
-			offsetSecs = off
-			s = timePart
-		} else if off, ok := parseTZOffset(tzPart); ok {
-			offsetSecs = off
-			s = timePart
-		} else {
-			// Unrecognized abbreviation — reject with error (e.g. "m2", "MSK m2")
-			return time.Time{}, 0, &ExecError{Code: "22007",
-				Message: fmt.Sprintf("invalid input syntax for type time with time zone: %q", orig)}
-		}
-	} else {
-		// No space — check for inline +HH or -HH suffix
-		if plus := strings.LastIndex(s, "+"); plus > 2 {
-			if off, ok := parseTZOffset(s[plus:]); ok {
-				offsetSecs = off
-				s = s[:plus]
-			}
-		} else if minus := strings.LastIndex(s, "-"); minus > 2 {
-			if off, ok := parseTZOffset(s[minus:]); ok {
-				offsetSecs = off
-				s = s[:minus]
-			}
-		}
+	rest, off, zoneSeen, err := stripValidatedZoneSuffix(s, false, "time with time zone", orig)
+	if err != nil {
+		return time.Time{}, 0, err
+	}
+	s = rest
+	if zoneSeen {
+		offsetSecs, haveOff = off, true
 	}
 
 	// Now parse the bare time portion with its meridiem re-attached.
@@ -711,6 +805,11 @@ func parseTimeTZString(s string) (time.Time, int, error) {
 	t, err := parseTimeString(s)
 	if err != nil {
 		return time.Time{}, 0, wrapTimeTZError(err, orig)
+	}
+	// No zone field and no date: GetCurrentDateTime supplies today's date and the
+	// session zone supplies the offset for it. M0119-0006.
+	if !haveOff && zone != "" {
+		offsetSecs = config.TimeTZSessionOffset(zone, t.Hour(), t.Minute(), t.Second())
 	}
 	return t, offsetSecs, nil
 }
@@ -722,6 +821,12 @@ func wrapTimeTZError(err error, orig string) error {
 	if ee, ok := err.(*ExecError); ok && ee.Code == "22008" {
 		return &ExecError{Code: "22008",
 			Message: fmt.Sprintf("date/time field value out of range: %q", orig)}
+	}
+	// M0119-0006: an unrecognised zone NAME is 22023 and already names the
+	// offending zone rather than the input, so re-wrapping it as 22007 would
+	// swap PG's error for a different one. It is not a syntax error at all.
+	if ee, ok := err.(*ExecError); ok && ee.Code == "22023" {
+		return ee
 	}
 	return &ExecError{Code: "22007",
 		Message: fmt.Sprintf("invalid input syntax for type time with time zone: %q", orig)}
@@ -799,11 +904,27 @@ const (
 // `date` and anything else fall on the discard side, as upstream's input
 // functions do.
 func tsZoneModeForType(typeName string) tsZoneMode {
-	switch strings.ToLower(strings.TrimSpace(typeName)) {
-	case "timestamptz", "timestamp with time zone":
+	if isTimestampTZTypeName(typeName) {
 		return tsApplyZone
 	}
 	return tsDiscardZone
+}
+
+// isTimestampTZTypeName reports whether a SQL type name is one of the two
+// spellings of `timestamp with time zone`. It backs BOTH halves of the split
+// that type makes against plain `timestamp`: the INPUT rule (tsZoneModeForType
+// above — the offset moves the wall clock instead of being discarded) and the
+// OUTPUT rule (M0119-0006's 40th slice — NewTimestampTZDatum tags the datum so
+// timestamptz_out runs instead of timestamp_out). Sharing one predicate is the
+// point: the two rules are the same type distinction, and a producer that
+// applied the zone on the way in while rendering zone-less on the way out would
+// silently relabel the instant — which is exactly the defect that slice fixed.
+func isTimestampTZTypeName(typeName string) bool {
+	switch strings.ToLower(strings.TrimSpace(typeName)) {
+	case "timestamptz", "timestamp with time zone":
+		return true
+	}
+	return false
 }
 
 // applyTSZoneMode turns the time.Parse result into the value the target type

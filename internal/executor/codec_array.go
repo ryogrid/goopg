@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/pgarray"
 	"github.com/goopg/goopg/internal/pgnodes"
@@ -261,7 +262,49 @@ func array4ByteVarlenaBytes(body []byte) []byte {
 // decodeArrayValuePG inverts encodeArrayValuePG: it reads the ArrayType varlena
 // at the head of data and renders the canonical PG array text "{e1,e2,...}",
 // returning it as a KindString datum plus the number of bytes consumed.
+// arrayOutputStyle reads the two session GUCs an array element's output
+// function consults (upstream: array_out → the ELEMENT type's typoutput, so
+// `date_out`/`timestamp_out` see DateStyle and `timestamptz_out` sees both
+// DateStyle and TimeZone). Same GUC spellings and same boot-default fallbacks
+// as RunCopyTo's pair (internal/executor/copy.go), which is its sibling: a
+// COPY … TO and a SELECT of the same array column must print the same text.
+func arrayOutputStyle(ctx *Context) pgarray.OutputStyle {
+	st := pgarray.DefaultOutputStyle()
+	if ctx == nil || ctx.GetSetting == nil {
+		return st
+	}
+	if v, ok := ctx.GetSetting("datestyle"); ok {
+		st.Style, st.Order = config.ParseDateStyleValue(v)
+	}
+	if v, ok := ctx.GetSetting("timezone"); ok {
+		st.Zone = v
+	}
+	return st
+}
+
+// colsHaveArray reports whether any column is an array, so a scan pays the GUC
+// lookup only for the relations that can actually render one.
+func colsHaveArray(cols []catalog.Column) bool {
+	for i := range cols {
+		if cols[i].Type.IsArray {
+			return true
+		}
+	}
+	return false
+}
+
 func decodeArrayValuePG(t catalog.Type, data []byte) (Datum, int, error) {
+	return decodeArrayValuePGStyled(t, data, pgarray.DefaultOutputStyle())
+}
+
+// decodeArrayValuePGStyled is decodeArrayValuePG under an explicit session
+// output style. goopg renders an array to its "{…}" text at DECODE time, while
+// upstream renders it at OUTPUT time via array_out, so the session's
+// DateStyle/TimeZone — which a date/timestamp/timestamptz element's output
+// function reads — has to be carried down here. Decode sites with no session
+// (catalog reload, VACUUM, ANALYZE, DDL rescans) keep passing the default; see
+// pgarray.OutputStyle. M0119-0006.
+func decodeArrayValuePGStyled(t catalog.Type, data []byte, st pgarray.OutputStyle) (Datum, int, error) {
 	payload, consumed, err := decodePhysicalPGVarlena(data)
 	if err != nil {
 		return Datum{}, 0, err
@@ -270,7 +313,7 @@ func decodeArrayValuePG(t catalog.Type, data []byte) (Datum, int, error) {
 	//   [0:4] ndim [4:8] dataoffset [8:12] elemtype [12:16] dims[0] [16:20] lbound[0]
 	// The rendering itself lives in internal/pgarray, shared with the pgoutput
 	// decoder (M0119-0006).
-	text, err := pgarray.RenderText(t.Name, payload)
+	text, err := pgarray.RenderTextStyled(t.Name, payload, st)
 	if err != nil {
 		return Datum{}, 0, err
 	}

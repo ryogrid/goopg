@@ -427,15 +427,24 @@ func TestBootstrappedPGAttributeRowsReadable(t *testing.T) {
 		}
 	}
 
-	// Full PG18 column counts: pg_class=34, pg_attribute=25, pg_type=14.
+	// Full PG18 column counts: pg_class=34, pg_attribute=25, pg_type=32.
 	// These reflect the PG18 physical tuple layout written by bootstrapPg*Tuples
 	// (M0106-0008). The original goopg-only counts (8, 6, 7) are obsolete.
 	// pg_attribute grew 24→25 when attstattarget was appended (DU-002 slice 24)
 	// so pg_dump's getTableAttrs can read a.attstattarget.
+	//
+	// pg_type grew 14→32 in M0131-S9.3f. It is the one entry here where the
+	// number was not merely short: past attnum 12 goopg's DESCRIPTION was
+	// mis-numbered against the tuples it described (typelem at 13, typarray at
+	// 14, where PG18 has typsubscript/typelem/typarray at 13/14/15), while
+	// pgTypeRow had been writing all 32 values in upstream's order all along.
+	// A hosted PG joining pg_type — pg_seclabels does — resolves EVERY column
+	// of the join inputs, not just the selected ones, and failed on attribute
+	// 15 of relation 1247 until the two sides agreed.
 	for relOID, wantCount := range map[uint32]int{
 		catalog.RelationRelationId:  34,
 		catalog.AttributeRelationId: 25,
-		catalog.TypeRelationId:      14,
+		catalog.TypeRelationId:      32,
 	} {
 		cols := byRelID[relOID]
 		if len(cols) != wantCount {

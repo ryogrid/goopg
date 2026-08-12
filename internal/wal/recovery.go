@@ -2444,7 +2444,7 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			// M0131-S16.4: everything else is refused rather than silently
 			// skipped. goopg emits no RM_XLOG opcode outside the named arms,
 			// so this cannot fire on goopg's own WAL.
-			return false, fmt.Errorf("%w: %s", ErrUnsupportedRecord, unsupportedDecodedXLogRecord(r))
+			return false, unsupportedDecodedXLogOpcode(r)
 		}
 	case RmgrXact:
 		switch xlog.Header.Info & xlogXactOpMask {
@@ -2493,7 +2493,7 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 				"max_prepared_transactions must be 0 on a cluster goopg starts)",
 				ErrUnsupportedRecord, unsupportedDecodedXLogRecord(r))
 		default:
-			return false, unsupportedDecodedXLogRecord(r)
+			return false, unsupportedDecodedXLogOpcode(r)
 		}
 	case RmgrSeq:
 		switch xlog.Header.Info & XLRRmgrInfoMask {
@@ -2505,7 +2505,7 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			}
 			return true, nil
 		default:
-			return false, unsupportedDecodedXLogRecord(r)
+			return false, unsupportedDecodedXLogOpcode(r)
 		}
 	case RmgrLogicalMessage:
 		switch xlog.Header.Info & XLRRmgrInfoMask {
@@ -2523,7 +2523,7 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			// and the reader called it end-of-WAL).
 			return false, nil
 		default:
-			return false, unsupportedDecodedXLogRecord(r)
+			return false, unsupportedDecodedXLogOpcode(r)
 		}
 	case RmgrReplicationOrigin:
 		switch xlog.Header.Info & XLRRmgrInfoMask {
@@ -2542,14 +2542,14 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			// tail without advancing its origin would re-apply changes.
 			return false, nil
 		default:
-			return false, unsupportedDecodedXLogRecord(r)
+			return false, unsupportedDecodedXLogOpcode(r)
 		}
 	case RmgrGeneric:
 		// M0131-S23. RM_GENERIC_ID has no opcode space: GenericXLogFinish
 		// inserts with info 0 (generic_xlog.c:399) and generic_redo never reads
 		// xl_info, so a non-zero info is a corrupt or future record.
 		if xlog.Header.Info&XLRRmgrInfoMask != xlogGenericInfo {
-			return false, unsupportedDecodedXLogRecord(r)
+			return false, unsupportedDecodedXLogOpcode(r)
 		}
 		if err := replayDecodedXLogGeneric(mgr, r, xlog); err != nil {
 			return false, err
@@ -2577,7 +2577,7 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			}
 			return true, nil
 		default:
-			return false, unsupportedDecodedXLogRecord(r)
+			return false, unsupportedDecodedXLogOpcode(r)
 		}
 	case RmgrStandby:
 		switch xlog.Header.Info & XLRRmgrInfoMask {
@@ -2600,7 +2600,7 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			// STANDBY_LOCK) does not refuse the start.
 			return false, nil
 		default:
-			return false, unsupportedDecodedXLogRecord(r)
+			return false, unsupportedDecodedXLogOpcode(r)
 		}
 	case RmgrStorage:
 		switch xlog.Header.Info & XLRRmgrInfoMask {
@@ -2633,7 +2633,7 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			}
 			return true, nil
 		default:
-			return false, unsupportedDecodedXLogRecord(r)
+			return false, unsupportedDecodedXLogOpcode(r)
 		}
 	case RmgrTblspc:
 		switch xlog.Header.Info & XLRRmgrInfoMask {
@@ -2660,7 +2660,7 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			}
 			return true, nil
 		default:
-			return false, unsupportedDecodedXLogRecord(r)
+			return false, unsupportedDecodedXLogOpcode(r)
 		}
 	case RmgrDbase:
 		switch xlog.Header.Info & XLRRmgrInfoMask {
@@ -2688,7 +2688,7 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			}
 			return true, nil
 		default:
-			return false, unsupportedDecodedXLogRecord(r)
+			return false, unsupportedDecodedXLogOpcode(r)
 		}
 	case RmgrCLOG:
 		switch xlog.Header.Info & XLRRmgrInfoMask {
@@ -2720,7 +2720,7 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			}
 			return true, nil
 		default:
-			return false, unsupportedDecodedXLogRecord(r)
+			return false, unsupportedDecodedXLogOpcode(r)
 		}
 	case RmgrHeap:
 		switch xlog.Header.Info & xlogHeapOpMask {
@@ -2800,7 +2800,7 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			// wal_level=logical (tablecmds.c:2303).
 			return false, nil
 		default:
-			return false, unsupportedDecodedXLogRecord(r)
+			return false, unsupportedDecodedXLogOpcode(r)
 		}
 	case RmgrHeap2:
 		// M0131-S21a: RM_HEAP2 shares RM_HEAP's XLOG_HEAP_OPMASK (0x70), NOT
@@ -2889,7 +2889,7 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 				"this cluster ran VACUUM FULL/CLUSTER on a table with a logical replication slot)",
 				ErrUnsupportedRecord, unsupportedDecodedXLogRecord(r))
 		default:
-			return false, unsupportedDecodedXLogRecord(r)
+			return false, unsupportedDecodedXLogOpcode(r)
 		}
 	case RmgrBtree:
 		switch xlog.Header.Info & XLRRmgrInfoMask {
@@ -3058,7 +3058,7 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			return true, nil
 		}
 	default:
-		return false, unsupportedDecodedXLogRecord(r)
+		return false, unsupportedDecodedXLogOpcode(r)
 	}
 }
 
@@ -3244,7 +3244,7 @@ func replayDecodedXLogCommitTs(mgr *storage.Manager, r Record, xlog *XLogDecoded
 	switch xlog.Header.Info & XLRRmgrInfoMask {
 	case xlogCommitTsZeroPage, xlogCommitTsTruncate:
 	default:
-		return false, unsupportedDecodedXLogRecord(r)
+		return false, unsupportedDecodedXLogOpcode(r)
 	}
 	if commitTimestampsTracked(mgr) {
 		return false, fmt.Errorf("%w: %s (track_commit_timestamp is on in pg_control, but goopg has no "+
@@ -3297,6 +3297,25 @@ func requireFullPageImages(r Record, xlog *XLogDecodedRecord) error {
 			block.HasImage, block.ImageApply)
 	}
 	return nil
+}
+
+// unsupportedDecodedXLogOpcode is what every rmgr's `default:` arm returns: the
+// same text unsupportedDecodedXLogRecord produces, CLASSED with
+// ErrUnsupportedRecord.
+//
+// M0131-S21 closure. The class is a contract, stated at format.go:45-56 — an
+// unsupported record's bytes are intact and durable, categorically unlike a
+// torn tail, so a caller must be able to tell the two apart. Until this slice
+// only RM_XLOG's default arm carried it; the other fourteen returned a bare
+// error that, to any caller that discriminates, is indistinguishable from a
+// decode failure. The drift survived fourteen S21 slices precisely because it
+// changed nothing observable: both of today's ApplyRecord callers
+// (replayRecords, StreamReplayer.run) refuse the start on ANY error. Pinning it
+// here — with TestReplayOpcodeSpaceCoverageForHandledRmgrs's per-rmgr controls
+// asserting the exact shape — is cheaper than discovering it from the first
+// caller that does discriminate.
+func unsupportedDecodedXLogOpcode(r Record) error {
+	return fmt.Errorf("%w: %s", ErrUnsupportedRecord, unsupportedDecodedXLogRecord(r))
 }
 
 func unsupportedDecodedXLogRecord(r Record) error {
@@ -3746,7 +3765,7 @@ func replayDecodedXLogHeapDelete(mgr *storage.Manager, r Record, xlog *XLogDecod
 	if block.HasImage && block.ImageApply {
 		return restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN))
 	}
-	xmax, offnum, _, _, err := decodeXLogHeapDeleteMainData(xlog.MainData)
+	xmax, offnum, infobits, flags, err := decodeXLogHeapDeleteMainData(xlog.MainData)
 	if err != nil {
 		return err
 	}
@@ -3760,7 +3779,18 @@ func replayDecodedXLogHeapDelete(mgr *storage.Manager, r Record, xlog *XLogDecod
 	if skip {
 		return nil
 	}
-	if err := storage.PageSetHeapTupleXmax(page, offnum, storage.TransactionID(xmax)); err != nil {
+	// M0131-S21h: infobits_set is not decoration. A real PG stamps a
+	// MultiXactId in xl_heap_delete.xmax whenever the deleted row was also held
+	// by a locker (XLHL_XMAX_IS_MULTI) — the FK FOR KEY SHARE case — and this
+	// arm used to drop the byte on the floor, replaying the multi as a plain
+	// xid. PageApplyHeapDeleteRedo mirrors heap_xlog_delete in full (infomask
+	// reset + fix_infomask_from_infobits, IS_SUPER's xmin clear, cmax, prunable
+	// and the t_ctid self/moved-partitions link), where the old call stamped
+	// nothing but xmax.
+	imask, imask2 := xlogHeapLockInfomaskBits(infobits)
+	if err := storage.PageApplyHeapDeleteRedo(page, offnum, storage.TransactionID(xmax), imask, imask2,
+		block.Block, storage.TransactionID(xlog.Header.XID),
+		flags&xlhDeleteIsSuper != 0, flags&xlhDeleteIsPartitionMove != 0); err != nil {
 		return fmt.Errorf("wal: xlog heap-delete apply: %w", err)
 	}
 	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
@@ -4347,7 +4377,7 @@ func replayDecodedXLogHeapUpdate(mgr *storage.Manager, r Record, xlog *XLogDecod
 	if block.HasImage && block.ImageApply {
 		return restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN))
 	}
-	oldXmax, oldOffnum, _, flags, _, newOffnum, err := decodeXLogHeapUpdateMainData(xlog.MainData)
+	oldXmax, oldOffnum, oldInfobits, flags, _, newOffnum, err := decodeXLogHeapUpdateMainData(xlog.MainData)
 	if err != nil {
 		return err
 	}
@@ -4376,11 +4406,17 @@ func replayDecodedXLogHeapUpdate(mgr *storage.Manager, r Record, xlog *XLogDecod
 		return err
 	}
 	samePage := oldBlock.Block == block.Block
+	// M0131-S21h: old_infobits_set is the only place a record says the OLD
+	// version's xmax is a MultiXactId (an UPDATE of a row a concurrent xact
+	// holds FOR KEY SHARE). It used to be discarded, so such a stamp replayed
+	// as a bare xid; PageApplyHeapUpdateOldRedo mirrors heap_xlog_update's
+	// old-tuple block in full (infomask reset + fix_infomask_from_infobits, the
+	// HOT_UPDATED set/clear branch, cmax and prunable) where the PageStamp*
+	// producer helpers could only write xmax + the forward link.
+	oldIMask, oldIMask2 := xlogHeapLockInfomaskBits(oldInfobits)
 	stampOld := func(p storage.Page) error {
-		if hot {
-			return storage.PageStampHotOldTuple(p, oldOffnum, storage.TransactionID(oldXmax), block.Block, newOffnum)
-		}
-		return storage.PageStampUpdatedOldTuple(p, oldOffnum, storage.TransactionID(oldXmax), block.Block, newOffnum)
+		return storage.PageApplyHeapUpdateOldRedo(p, oldOffnum, storage.TransactionID(oldXmax),
+			oldIMask, oldIMask2, hot, block.Block, newOffnum, storage.TransactionID(xlog.Header.XID))
 	}
 	if !skip {
 		// M0131-S21g: the new tuple's bytes are only WHOLE in goopg's own

@@ -427,11 +427,22 @@ func pgoDecodePhysicalValue(t catalog.Type, data []byte) ([]byte, int, error) {
 			return nil, 0, fmt.Errorf("int8: short read")
 		}
 		return []byte(strconv.FormatInt(int64(binary.LittleEndian.Uint64(data[:8])), 10)), 8, nil
-	case "oid", "regproc", "xid", "xid8":
+	case "oid", "regproc", "xid":
 		if len(data) < 4 {
 			return nil, 0, fmt.Errorf("oid: short read")
 		}
 		return []byte(strconv.FormatUint(uint64(binary.LittleEndian.Uint32(data[:4])), 10)), 4, nil
+	case "xid8":
+		// M0119-0006 (54th slice): xid8 rode the 4-byte oid/xid arm here too.
+		// pg_type OID 5069 is typlen 8 (typalign 'd'), so this decoder read half
+		// a FullTransactionId and then handed the next column a 4-byte-short
+		// offset. Third twin of the heap encode/decode pair in
+		// internal/executor/codec.go — Hard-won Rule #2 (encode↔decode, and every
+		// decoder that walks the same physical tuple).
+		if len(data) < 8 {
+			return nil, 0, fmt.Errorf("xid8: short read")
+		}
+		return []byte(strconv.FormatUint(binary.LittleEndian.Uint64(data[:8]), 10)), 8, nil
 	case "float4", "real":
 		// M0111-0002: fixed 4-byte IEEE-754 LE (was varlena text).
 		if len(data) < 4 {

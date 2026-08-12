@@ -288,7 +288,7 @@ var nailedSharedRels = flattenRels([]nailedRel{
 // because that is the manifest's capture order, and because the heap rows must
 // keep their historical positions — flattenRels takes IsShared from heaps[0].
 var nailedLocalRels = flattenRels(append([]nailedRel{
-	{1247, "pg_type", 71, 'r', 14, false, pgTypeAttrs()},
+	{1247, "pg_type", 71, 'r', 32, false, pgTypeAttrs()},
 	// relnatts 25 (was 24 until M0131-S14.1): pg_attribute really has 25
 	// attributes here and in PG18's Natts_pg_attribute alike. The stale 24 is
 	// what truncated attmissingval off a hosted PG's compiled descriptor.
@@ -307,7 +307,7 @@ var nailedLocalRels = flattenRels(append([]nailedRel{
 	{2617, "pg_operator", 83, 'r', 10, false, pgOperatorAttrs()},
 	{3456, "pg_collation", 83, 'r', 8, false, pgCollationAttrs()},
 	{2611, "pg_inherits", 83, 'r', 3, false, pgInheritsAttrs()},
-	{2612, "pg_language", 83, 'r', 7, false, pgLanguageAttrs()},
+	{2612, "pg_language", 83, 'r', 9, false, pgLanguageAttrs()},
 	{2602, "pg_amop", 83, 'r', 9, false, pgAmopAttrs()},
 	{2609, "pg_description", 83, 'r', 5, false, pgDescriptionAttrs()},
 	{2608, "pg_depend", 83, 'r', 8, false, pgDependAttrs()},
@@ -523,8 +523,16 @@ var nailedLocalRels = flattenRels(append([]nailedRel{
 	// once Step 3cd cleared the pg_statistic_ext family. Without a pg_class
 	// row, `RelationBuildDesc(2619) → ScanPgRelation(2619)` returns NULL
 	// and the backend FATALs with `could not open relation with OID 2619`.
-	// RelType=83 is safe because pg_statistic is not formrdesc'd (no
-	// `StatisticRelation_Rowtype_Id` constant in PG18 headers). Schema per
+	// RelType was 83 (the placeholder every non-formrdesc'd rel carries; safe
+	// because pg_statistic has no `StatisticRelation_Rowtype_Id` constant in
+	// PG18 headers) until M0131-S9.3g made it 10029, pg_statistic's REAL
+	// initdb-assigned rowtype. That mattered as soon as a hosted PG had to
+	// treat a pg_statistic value as a composite: pg_stats_ext_exprs unnests
+	// pg_statistic_ext_data.stxdexpr (_pg_statistic, 10028) whose typelem is
+	// 10029, and lookup_type_cache() dereferences that row's typrelid. The
+	// pg_type side is pgTypeCanonical(10029) + pgTypeRelidOverlay; the two
+	// must agree, which pgTypeBootstrapEntryMap now enforces by deriving the
+	// seeded OID set from RelType. Schema per
 	// `postgres/src/include/catalog/pg_statistic.h` (PG18,
 	// StatisticRelationId == 2619). 31 columns total: 3 leading fixed
 	// NOT NULL key columns (starelid oid, staattnum int2, stainherit bool)
@@ -534,7 +542,7 @@ var nailedLocalRels = flattenRels(append([]nailedRel{
 	// (BKI_LOOKUP_OPT) + 5×stanumbers _float4 NULLABLE + 5×stavalues
 	// anyarray NULLABLE. pg_statistic has no `oid` system column —
 	// attnums start at 1 = starelid.
-	{2619, "pg_statistic", 83, 'r', 31, false, pgStatisticAttrs()},
+	{2619, "pg_statistic", 10029, 'r', 31, false, pgStatisticAttrs()},
 	// M0106-0010 step 3cg: pg_subscription_rel is opened during PG-standby
 	// boot once Step 3cf cleared the pg_subscription index pair. Without a
 	// pg_class row, `RelationBuildDesc(6102) → ScanPgRelation(6102)` returns
@@ -668,6 +676,61 @@ var nailedLocalRels = flattenRels(append([]nailedRel{
 	// (text[] 1009, CATALOG_VARLEN — nullable). pg_user_mapping has
 	// an `oid` system column — attnum 1 = oid.
 	{1418, "pg_user_mapping", 83, 'r', 4, false, pgUserMappingAttrs()},
+	// M0131-S9.3e: pg_policy is the first catalog added because a VIEW needs
+	// it, not because a PG-standby boot step opened it. `pg_policies`
+	// (12018) reads pg_policy in its FROM list, so a hosted PG failed the
+	// view with `could not open relation with OID 3256` — ceiling #4 of the
+	// S9 corpus, the first blocked by a missing base CATALOG rather than by
+	// content inside one (system_view_oid_pins.go). Same construction as
+	// every entry above: a pg_class row plus PG-faithful pg_attribute rows
+	// over an empty 8 KiB heap (3256 joins mappedLocalCatalogPlaceholderOIDs
+	// so base/{1,5}/3256 exist). RelType=83 is safe — pg_policy is not
+	// formrdesc'd (no `PolicyRelation_Rowtype_Id` in PG18 headers; only
+	// pg_database/pg_authid/pg_auth_members/pg_shseclabel/pg_subscription
+	// are, at relcache.c:4075-4083), so the Phase3
+	// `rd_att->tdtypeid == relp->reltype` assertion (relcache.c:4293) does
+	// not fire. Schema per `postgres/src/include/catalog/pg_policy.h`
+	// (PG18, PolicyRelationId == 3256). Indexes 3257/3258 and the TOAST
+	// pair 4167/4168 are deliberately NOT bootstrapped: the heap is empty
+	// in every goopg cluster (goopg has no CREATE POLICY on-disk path), so
+	// a seq scan answers the view and nothing ever needs the index —
+	// ledgered, not assumed.
+	{3256, "pg_policy", 83, 'r', 8, false, pgPolicyAttrs()},
+	// M0131-S9.3f: pg_seclabel and pg_largeobject_metadata are S9.3e's
+	// construction repeated, and for the last view that needs it. The
+	// `pg_seclabels` view (12099) is a 13-branch UNION ALL whose local half
+	// reads pg_seclabel in every branch and pg_largeobject_metadata in the
+	// "large object" one; a hosted PG failed it with `could not open relation
+	// with OID 3596`. Both heaps stay EMPTY — goopg has no on-disk SECURITY
+	// LABEL path and no large objects — which is exactly the shape upstream's
+	// own bootstrap leaves for a cluster that has never labelled anything.
+	// Both OIDs join mappedLocalCatalogPlaceholderOIDs so base/{1,5}/3596 and
+	// base/{1,5}/2995 exist (3596 was already there; 2995 was not — the entry
+	// commented "pg_largeobject_metadata" in that list is 2614, which is no
+	// catalog at all in PG18).
+	//
+	// RelType=83 is safe for both: neither is formrdesc'd — pg_shseclabel is
+	// (SharedSecLabelRelation_Rowtype_Id 4066, and it is already nailed at
+	// the top of this file with its true rowtype), pg_seclabel is not, and
+	// there is no LargeObjectMetadataRelation_Rowtype_Id in the PG18 headers
+	// (relcache.c:4075-4083), so the Phase3 `rd_att->tdtypeid ==
+	// relp->reltype` assertion (relcache.c:4293) does not fire.
+	//
+	// pg_largeobject (2613) is deliberately NOT added even though the view
+	// names it: the reference is `l.classoid = 'pg_catalog.pg_largeobject'
+	// ::regclass`, which upstream's CREATE VIEW already folded to a Const 2613
+	// inside the captured ev_action, so nothing resolves the name at run time.
+	// As with pg_policy, the declared companions are not bootstrapped either
+	// — index 3597 / TOAST 3598+3599 for pg_seclabel, index 2996 for
+	// pg_largeobject_metadata — which is inert only while the heaps are empty.
+	// Ledgered, not assumed.
+	//
+	// Schemas per `postgres/src/include/catalog/pg_seclabel.h` (SecLabel
+	// RelationId == 3596) and `pg_largeobject_metadata.h`
+	// (LargeObjectMetadataRelationId == 2995), each re-verified against a
+	// freshly initdb'd PG 18.3's own pg_attribute.
+	{3596, "pg_seclabel", 83, 'r', 5, false, pgSecLabelAttrs()},
+	{2995, "pg_largeobject_metadata", 83, 'r', 3, false, pgLargeObjectMetadataAttrs()},
 	// M0106-0010 Step 3dl: pg_stat_wal_receiver — first relkind='v' (view)
 	// entry seeded into the bootstrap pg_class heap. After Steps 3dj/3dk
 	// landed pg_proc OID 3317 (`pg_stat_get_wal_receiver`) with its 15
@@ -2411,8 +2474,45 @@ func pgTypeAttrs() []nailedAttr {
 		{Name: "typisdefined", TypeOID: 16, Num: 10, Len: 1, NotNull: true},
 		{Name: "typdelim", TypeOID: 18, Num: 11, Len: 1, NotNull: true},
 		{Name: "typrelid", TypeOID: 26, Num: 12, Len: 4, NotNull: true},
-		{Name: "typelem", TypeOID: 26, Num: 13, Len: 4, NotNull: true},
-		{Name: "typarray", TypeOID: 26, Num: 14, Len: 4, NotNull: true},
+		// M0131-S9.3f widened this descriptor from 14 columns to upstream's
+		// full 32. It was not merely short — it was MIS-NUMBERED past
+		// attnum 12: goopg used to declare typelem at 13 and typarray at 14,
+		// where PG18 has typsubscript at 13, typelem at 14 and typarray at 15
+		// (postgres/src/include/catalog/pg_type.h). The pg_type HEAP has
+		// carried all 32 values in upstream's order since long before this
+		// slice (pgTypeColDefs/pgTypeRow in pg_type_bootstrap.go, typsubscript
+		// at index 13 and typacl at 32), so what was truncated was only the
+		// pg_attribute/pg_class DESCRIPTION of those bytes — the classic
+		// half-populated-column-group hazard, and the two sides now agree.
+		//
+		// It surfaced through pg_seclabels (12099): one of its 13 UNION ALL
+		// arms joins pg_type, and expandRTE on a join RTE resolves EVERY
+		// column of both inputs through get_rte_attribute_is_dropped →
+		// SearchSysCache2(ATTNUM) (parse_relation.c:3414), not just the
+		// selected ones. A hosted PG therefore asked for attribute 15 of
+		// relation 1247 — typarray — and got "cache lookup failed". Any view
+		// joining pg_type would have; pg_seclabels is simply the corpus's
+		// first.
+		{Name: "typsubscript", TypeOID: 24, Num: 13, Len: 4, NotNull: true},
+		{Name: "typelem", TypeOID: 26, Num: 14, Len: 4, NotNull: true},
+		{Name: "typarray", TypeOID: 26, Num: 15, Len: 4, NotNull: true},
+		{Name: "typinput", TypeOID: 24, Num: 16, Len: 4, NotNull: true},
+		{Name: "typoutput", TypeOID: 24, Num: 17, Len: 4, NotNull: true},
+		{Name: "typreceive", TypeOID: 24, Num: 18, Len: 4, NotNull: true},
+		{Name: "typsend", TypeOID: 24, Num: 19, Len: 4, NotNull: true},
+		{Name: "typmodin", TypeOID: 24, Num: 20, Len: 4, NotNull: true},
+		{Name: "typmodout", TypeOID: 24, Num: 21, Len: 4, NotNull: true},
+		{Name: "typanalyze", TypeOID: 24, Num: 22, Len: 4, NotNull: true},
+		{Name: "typalign", TypeOID: 18, Num: 23, Len: 1, NotNull: true},
+		{Name: "typstorage", TypeOID: 18, Num: 24, Len: 1, NotNull: true},
+		{Name: "typnotnull", TypeOID: 16, Num: 25, Len: 1, NotNull: true},
+		{Name: "typbasetype", TypeOID: 26, Num: 26, Len: 4, NotNull: true},
+		{Name: "typtypmod", TypeOID: 23, Num: 27, Len: 4, NotNull: true},
+		{Name: "typndims", TypeOID: 23, Num: 28, Len: 4, NotNull: true},
+		{Name: "typcollation", TypeOID: 26, Num: 29, Len: 4, NotNull: true},
+		{Name: "typdefaultbin", TypeOID: 194, Num: 30, Len: -1, NotNull: false}, // pg_node_tree, CATALOG_VARLEN
+		{Name: "typdefault", TypeOID: 25, Num: 31, Len: -1, NotNull: false},     // text, CATALOG_VARLEN
+		{Name: "typacl", TypeOID: 1034, Num: 32, Len: -1, NotNull: false},       // _aclitem, CATALOG_VARLEN
 	}
 }
 
@@ -2726,6 +2826,10 @@ func pgLanguageAttrs() []nailedAttr {
 		{Name: "lanpltrusted", TypeOID: 16, Num: 5, Len: 1, NotNull: true},
 		{Name: "lanplcallfoid", TypeOID: 26, Num: 6, Len: 4, NotNull: true},
 		{Name: "laninline", TypeOID: 26, Num: 7, Len: 4, NotNull: true},
+		// M0131-S9.3f completed the row to PG18's 9 columns; the heap writer
+		// (pg_language_bootstrap.go) grew the same two in the same commit.
+		{Name: "lanvalidator", TypeOID: 26, Num: 8, Len: 4, NotNull: true},
+		{Name: "lanacl", TypeOID: 1034, Num: 9, Len: -1, NotNull: false}, // _aclitem, CATALOG_VARLEN
 	}
 }
 
@@ -3076,6 +3180,66 @@ func pgStatisticExtDataAttrs() []nailedAttr {
 //
 // pg_statistic_ext DOES have an `oid` system column (declared in the CATALOG
 // block as `Oid oid`), so attnum 1 is `oid`. M0106-0010 step 3cd.
+// pgPolicyAttrs returns the 8-column PG18 schema for pg_policy.
+// Source of truth: `postgres/src/include/catalog/pg_policy.h` (PG18,
+// PolicyRelationId == 3256).
+//
+// 5 fixed-width NOT NULL columns (oid, polname, polrelid, polcmd,
+// polpermissive) + 3 CATALOG_VARLEN: polroles (_oid, BKI_FORCE_NOT_NULL —
+// zero means PUBLIC) and the two pg_node_tree quals, both nullable
+// (a policy with no USING/WITH CHECK clause stores NULL there).
+//
+// pg_policy HAS an `oid` system column — attnum 1 is oid.
+// _oid is type OID 1028; pg_node_tree is 194; name 19; char 18; bool 16.
+func pgPolicyAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},             // oid (system column)
+		{Name: "polname", TypeOID: 19, Num: 2, Len: 64, NotNull: true},        // name
+		{Name: "polrelid", TypeOID: 26, Num: 3, Len: 4, NotNull: true},        // oid → pg_class (BKI_LOOKUP)
+		{Name: "polcmd", TypeOID: 18, Num: 4, Len: 1, NotNull: true},          // char (ACL_*_CHR or '*')
+		{Name: "polpermissive", TypeOID: 16, Num: 5, Len: 1, NotNull: true},   // bool
+		{Name: "polroles", TypeOID: 1028, Num: 6, Len: -1, NotNull: true},     // _oid BKI_FORCE_NOT_NULL
+		{Name: "polqual", TypeOID: 194, Num: 7, Len: -1, NotNull: false},      // pg_node_tree
+		{Name: "polwithcheck", TypeOID: 194, Num: 8, Len: -1, NotNull: false}, // pg_node_tree
+	}
+}
+
+// pgSecLabelAttrs returns the 5-column PG18 schema for pg_seclabel.
+// Source of truth: `postgres/src/include/catalog/pg_seclabel.h` (PG18,
+// SecLabelRelationId == 3596), re-verified against a freshly initdb'd
+// PG 18.3's pg_attribute. M0131-S9.3f.
+//
+// pg_seclabel has NO `oid` system column (the CATALOG block declares no
+// `Oid oid` field), so attnum 1 is objoid, not oid — the key difference from
+// pg_policy above. All five columns are attnotnull: the three fixed-width ones
+// by position, and both CATALOG_VARLEN text columns because they carry
+// BKI_FORCE_NOT_NULL.
+func pgSecLabelAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "objoid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},    // oid of the labelled object
+		{Name: "classoid", TypeOID: 26, Num: 2, Len: 4, NotNull: true},  // oid → pg_class (BKI_LOOKUP)
+		{Name: "objsubid", TypeOID: 23, Num: 3, Len: 4, NotNull: true},  // int4 (column number, or 0)
+		{Name: "provider", TypeOID: 25, Num: 4, Len: -1, NotNull: true}, // text BKI_FORCE_NOT_NULL
+		{Name: "label", TypeOID: 25, Num: 5, Len: -1, NotNull: true},    // text BKI_FORCE_NOT_NULL
+	}
+}
+
+// pgLargeObjectMetadataAttrs returns the 3-column PG18 schema for
+// pg_largeobject_metadata. Source of truth:
+// `postgres/src/include/catalog/pg_largeobject_metadata.h` (PG18,
+// LargeObjectMetadataRelationId == 2995). M0131-S9.3f.
+//
+// It DOES have an `oid` system column, so attnum 1 is oid. `lomacl` is
+// aclitem[] (1034) and is the only nullable column — a large object with
+// default privileges stores NULL there.
+func pgLargeObjectMetadataAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},        // oid (system column)
+		{Name: "lomowner", TypeOID: 26, Num: 2, Len: 4, NotNull: true},   // oid → pg_authid (BKI_LOOKUP)
+		{Name: "lomacl", TypeOID: 1034, Num: 3, Len: -1, NotNull: false}, // _aclitem, CATALOG_VARLEN
+	}
+}
+
 func pgStatisticExtAttrs() []nailedAttr {
 	return []nailedAttr{
 		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},           // oid (system column)

@@ -11,6 +11,7 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/pgarray"
 	"github.com/goopg/goopg/internal/pglz"
 	"github.com/goopg/goopg/internal/pgnodes"
 	"github.com/goopg/goopg/internal/storage"
@@ -325,18 +326,9 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		binary.LittleEndian.PutUint64(buf[:], u)
 		return buf[:], nil
 	case "oid", "regproc":
-		var v int64
-		switch d.Kind {
-		case KindInt:
-			v = d.Int
-		case KindString:
-			var err error
-			v, err = coerceStringToInt64(d.StringValue(), "oid")
-			if err != nil {
-				return nil, err
-			}
-		default:
-			return nil, fmt.Errorf("expected int, got kind %d", d.Kind)
+		v, err := pgUnsignedIDFromDatum(d, "oid", 32)
+		if err != nil {
+			return nil, err
 		}
 		var buf [4]byte
 		binary.LittleEndian.PutUint32(buf[:], uint32(v))
@@ -427,7 +419,7 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		return buf[:], nil
 	case "timetz":
 		if d.Kind == KindString {
-			ts, offsetSecs, err := parseTimeTZString(d.StringValue())
+			ts, offsetSecs, err := parseTimeTZString(d.StringValue(), "")
 			if err != nil {
 				return nil, err
 			}
@@ -465,24 +457,9 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		// The ±infinity sentinels need no special case: INTERVAL_NOEND /
 		// INTERVAL_NOBEGIN *are* all-fields-at-their-extreme, so field-wise
 		// storage round-trips them exactly.
-		var months, days int32
-		var micros int64
-		switch d.Kind {
-		case KindInterval:
-			months, days, micros = d.IntervalMonthsValue(), d.IntervalDaysValue(), d.IntervalMicrosValue()
-		case KindString:
-			// A bare quoted literal (`INSERT INTO t(i) VALUES ('1 mon')`) is
-			// `unknown` upstream and reaches the column through interval_in.
-			// parser.ParseIntervalBody is the same tokenizer `'…'::interval`
-			// uses, so the two entry points cannot disagree.
-			var ok bool
-			months, days, micros, ok = parser.ParseIntervalBody(d.StringValue())
-			if !ok {
-				return nil, &ExecError{Code: "22007",
-					Message: fmt.Sprintf("invalid input syntax for type interval: %q", d.StringValue())}
-			}
-		default:
-			return nil, fmt.Errorf("expected interval, got kind %d", d.Kind)
+		months, days, micros, err := pgIntervalFieldsFromDatum(d)
+		if err != nil {
+			return nil, err
 		}
 		var buf [16]byte
 		binary.LittleEndian.PutUint64(buf[:8], uint64(micros))
@@ -545,25 +522,9 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		// column AFTER a float on real-PG reads (SRF pg_proc rows; pg_enum's
 		// "ppy" corruption) — the descriptors said fixed, the bytes said
 		// varlena, and only padding luck hid it.
-		var f float64
-		switch d.Kind {
-		case KindInt:
-			f = float64(d.Int)
-		case KindString, KindNumeric:
-			var raw string
-			if d.Kind == KindNumeric {
-				raw = numericText(d)
-			} else {
-				raw = strings.TrimSpace(d.StringValue())
-			}
-			v, err := strconv.ParseFloat(raw, 32)
-			if err != nil {
-				return nil, &ExecError{Code: "22P02",
-					Message: fmt.Sprintf("invalid input syntax for type real: %q", raw)}
-			}
-			f = v
-		default:
-			return nil, fmt.Errorf("kind %d cannot encode as float4", d.Kind)
+		f, err := pgFloatFromDatum(d, 32)
+		if err != nil {
+			return nil, err
 		}
 		var buf4 [4]byte
 		binary.LittleEndian.PutUint32(buf4[:], math.Float32bits(float32(f)))
@@ -571,40 +532,38 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 	case "float8", "double precision", "double", "float":
 		// M0111-0002 CLOSED: PG-binary float8 (8-byte IEEE-754 LE) — see the
 		// float4 arm above.
-		var f float64
-		switch d.Kind {
-		case KindInt:
-			f = float64(d.Int)
-		case KindString, KindNumeric:
-			var raw string
-			if d.Kind == KindNumeric {
-				raw = numericText(d)
-			} else {
-				raw = strings.TrimSpace(d.StringValue())
-			}
-			v, err := strconv.ParseFloat(raw, 64)
-			if err != nil {
-				return nil, &ExecError{Code: "22P02",
-					Message: fmt.Sprintf("invalid input syntax for type double precision: %q", raw)}
-			}
-			f = v
-		default:
-			return nil, fmt.Errorf("kind %d cannot encode as float8", d.Kind)
+		f, err := pgFloatFromDatum(d, 64)
+		if err != nil {
+			return nil, err
 		}
 		var buf8 [8]byte
 		binary.LittleEndian.PutUint64(buf8[:], math.Float64bits(f))
 		return buf8[:], nil
-	case "xid", "xid8":
-		// PG TransactionId: 4-byte unsigned LE
-		var v uint32
-		switch d.Kind {
-		case KindInt:
-			v = uint32(d.Int)
-		default:
-			return nil, fmt.Errorf("expected int for xid, got kind %d", d.Kind)
+	case "xid":
+		// PG TransactionId: 4-byte unsigned LE (pg_type OID 28, typlen 4).
+		v, err := pgUnsignedIDFromDatum(d, "xid", 32)
+		if err != nil {
+			return nil, err
 		}
 		var buf [4]byte
-		binary.LittleEndian.PutUint32(buf[:], v)
+		binary.LittleEndian.PutUint32(buf[:], uint32(v))
+		return buf[:], nil
+	case "xid8":
+		// M0119-0006 (54th slice): xid8 shared the `xid` arm and was written as
+		// FOUR bytes, silently truncating a FullTransactionId to its low 32
+		// bits. pg_type OID 5069 is typlen **8**, typbyval FLOAT8PASSBYVAL,
+		// typalign 'd' (postgres/src/include/catalog/pg_type.dat) — goopg's own
+		// internal/initdb/pg_type_seed_data.go:190 already seeds Len: 8 — so the
+		// heap disagreed with the catalog it ships by four bytes AND by the
+		// alignment of every column after it, which is exactly what a hosted PG
+		// deforming the tuple with its own descriptor reads. See
+		// physicalPGTypeAlign, whose 'd' arm this slice also gained.
+		v, err := pgUnsignedIDFromDatum(d, "xid8", 64)
+		if err != nil {
+			return nil, err
+		}
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], v)
 		return buf[:], nil
 	case "numeric", "decimal":
 		// M0119-0006: PG's base-10000 NumericData varlena (numeric.c
@@ -854,12 +813,35 @@ func varlenaTextBytes(s string) []byte {
 // the PG timestamp encoding).
 var pgEpochUnixMicros = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC).UnixMicro()
 
+// pgTimeMicros extracts the microseconds-since-midnight that PG's TimeADT holds
+// from the time.Time carrier of a `time`/`timetz` Datum.
+//
+// M0119-0006 (50th slice): the next-day probe is load-bearing, not defensive.
+// `24:00:00` is a real TimeADT value on PG — time_in accepts it and
+// AdjustTimeForTypmod's range check admits exactly USECS_PER_DAY
+// (postgres/src/backend/utils/adt/date.c) — and goopg's parsers carry it as
+// 1970-01-02 00:00:00 rather than as an hour field of 24, because time.Date
+// normalises the hour. Reading only Hour/Minute/Second therefore reports 0 for
+// it, which silently rewrote a STORED `'24:00:00'` to `'00:00:00'` (heap
+// encode, codec.go "time"/"timetz") and sorted it BELOW `00:00:01` in a btree
+// key.
+//
+// The probe belongs HERE rather than in each caller: row encode, the scalar and
+// timetz btree keys (btree_scalar_keys.go — whose comment already states the key
+// must derive from "the same microseconds the heap stores") and the array
+// element renderer (btree_array_key.go) all want the identical USECS_PER_DAY,
+// and copy_text.go's copyTimeOfDayMicros previously had to carry a private copy
+// of it for exactly that reason.
 func pgTimeMicros(t time.Time) int64 {
 	u := t.UTC()
-	return int64(u.Hour())*int64(time.Hour/time.Microsecond) +
+	micros := int64(u.Hour())*int64(time.Hour/time.Microsecond) +
 		int64(u.Minute())*int64(time.Minute/time.Microsecond) +
 		int64(u.Second())*int64(time.Second/time.Microsecond) +
 		int64(u.Nanosecond()/1000)
+	if micros == 0 && u.Year() == 1970 && u.Month() == time.January && u.Day() == 2 {
+		return usecsPerDay
+	}
+	return micros
 }
 
 func pgTimeFromMicros(micros int64) time.Time {
@@ -929,6 +911,22 @@ func DecodeRowIntoMctx(dst Row, cols []catalog.Column, data []byte, sctx *mctx.C
 // distinguishes it from legacy). storedNatts < len(cols) means ALTER TABLE ADD
 // COLUMN — trailing columns decode as NULL.
 func DecodeRowIntoMctxPGTuple(dst Row, cols []catalog.Column, data, bitmap []byte, storedNatts int, sctx *mctx.Context) error {
+	return DecodeRowIntoMctxPGTupleStyled(dst, cols, data, bitmap, storedNatts, sctx, pgarray.DefaultOutputStyle())
+}
+
+// DecodeRowIntoMctxPGTupleStyled is DecodeRowIntoMctxPGTuple carrying the
+// session's array output style. Only ARRAY columns of a date/timestamp/
+// timestamptz element type read it — every other column type's text is
+// GUC-independent at this layer, because the scalar date-time types keep their
+// KindTime carrier and are formatted at OUTPUT time (internal/server's
+// appendTypedCellText, executor's datumToCopyText), where the GUCs already
+// reach. An array is the one type goopg flattens to text during the heap
+// decode, so it is the one type that needs the GUCs here.
+//
+// The plain (unstyled) entry point stays the default for the ~70 session-less
+// decode sites — catalog reload, VACUUM, ANALYZE, DDL rescans — which have no
+// GUCs to read and must not acquire a dependency on any. M0119-0006.
+func DecodeRowIntoMctxPGTupleStyled(dst Row, cols []catalog.Column, data, bitmap []byte, storedNatts int, sctx *mctx.Context, st pgarray.OutputStyle) error {
 	// PG-physical decode with null-bitmap and natts awareness. M0111-0002 S3:
 	// the goopg legacy format has been removed, so there is a single on-disk
 	// format. A PG-physical tuple always records natts; storedNatts==0 means a
@@ -964,7 +962,7 @@ func DecodeRowIntoMctxPGTuple(dst Row, cols []catalog.Column, data, bitmap []byt
 			dst[i] = NullDatum
 			continue
 		}
-		v, consumed, err := decodePhysicalPGValueMctx(c.Type, data[off:], sctx)
+		v, consumed, err := decodePhysicalPGValueMctxStyled(c.Type, data[off:], sctx, st)
 		if err != nil {
 			return fmt.Errorf("DecodePhysicalPGRow: %s: %w", c.Name, err)
 		}
@@ -1055,7 +1053,11 @@ func physicalPGTypeAlign(t catalog.Type) int {
 	case "int8", "bigint", "bigserial", "pg_lsn", "float8", "double precision", "double", "timestamp", "timestamptz", "time", "timetz",
 		// interval is typalign 'd' (pg_type OID 1186) even though its 16 bytes
 		// exceed a Datum — the struct's leading field is an int64.
-		"interval":
+		"interval",
+		// xid8 is typalign 'd' (pg_type OID 5069, typlen 8) — it had been
+		// falling through to the default 4 while its 4-byte encode hid the
+		// consequence. M0119-0006 (54th slice); `xid` (OID 28) stays 'i' above.
+		"xid8":
 		return 8
 	case "name",
 		// uuid is pg_type OID 2950: typlen 16, typalign 'c'. Its 16 bytes
@@ -1160,11 +1162,17 @@ func pgRowHasExternal(cols []catalog.Column, row Row) bool {
 }
 
 func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) (Datum, int, error) {
+	return decodePhysicalPGValueMctxStyled(t, data, sctx, pgarray.DefaultOutputStyle())
+}
+
+func decodePhysicalPGValueMctxStyled(t catalog.Type, data []byte, sctx *mctx.Context, st pgarray.OutputStyle) (Datum, int, error) {
 	// User array column: decode the ArrayType varlena blob back to the
 	// canonical "{1,2}" text (sibling of encodeValuePG's IsArray branch).
-	// M0118-0002.
+	// M0118-0002. The session DateStyle/TimeZone rides along because goopg
+	// renders the element text here, where upstream's array_out would render it
+	// at output time (M0119-0006).
 	if t.IsArray {
-		return decodeArrayValuePG(t, data)
+		return decodeArrayValuePGStyled(t, data, st)
 	}
 	switch strings.ToLower(t.Name) {
 	case "bool", "boolean":
@@ -1203,12 +1211,21 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 			return Datum{}, 0, fmt.Errorf("truncated oid")
 		}
 		return NewIntDatum(int64(binary.LittleEndian.Uint32(data[:4]))), 4, nil
-	case "xid", "xid8":
-		// encodeValuePG writes xid/xid8 as a 4-byte LE TransactionId.
+	case "xid":
+		// encodeValuePG writes xid as a 4-byte LE TransactionId.
 		if len(data) < 4 {
 			return Datum{}, 0, fmt.Errorf("truncated xid")
 		}
 		return NewIntDatum(int64(binary.LittleEndian.Uint32(data[:4]))), 4, nil
+	case "xid8":
+		// Decode twin of the "xid8" encode arm — 8 LE bytes, pg_type 5069's
+		// typlen. Splitting it out of the shared "xid" arm is the decode half of
+		// the 54th slice's truncation fix; leaving it here would have read four
+		// bytes of an eight-byte column and left the next column's offset short.
+		if len(data) < 8 {
+			return Datum{}, 0, fmt.Errorf("truncated xid8")
+		}
+		return NewIntDatum(int64(binary.LittleEndian.Uint64(data[:8]))), 8, nil
 	case "name":
 		// PG NameData: fixed 64 bytes, '\0'-padded (see encodeValuePG).
 		if len(data) < 64 {
@@ -1242,7 +1259,17 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 		case math.MinInt64:
 			return NewTimestampInfinity(false), 8, nil
 		}
-		return NewTimeDatum(time.UnixMicro(micros + pgEpochUnixMicros).UTC()), 8, nil
+		// M0119-0006 (40th slice): tag the timestamptz half, exactly as the
+		// "date" case below tags TimeSubDate and for the same reason — a
+		// storage-decoded timestamptz must render identically to a timestamptz
+		// literal in the type-agnostic paths (Datum.Format(), CAST-to-text,
+		// string concat). The wire path re-derives the type from the column and
+		// is unaffected either way.
+		ts := time.UnixMicro(micros + pgEpochUnixMicros).UTC()
+		if isTimestampTZTypeName(t.Name) {
+			return NewTimestampTZDatum(ts), 8, nil
+		}
+		return NewTimeDatum(ts), 8, nil
 	case "date":
 		// encodeValuePG stores 4-byte LE days since the PG epoch. M0111-0004.
 		if len(data) < 4 {
@@ -1355,7 +1382,14 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 		}
 		f4 := float64(math.Float32frombits(binary.LittleEndian.Uint32(data[:4])))
 		return floatTextDatum(PGFloatOut(f4, 32)), 4, nil
-	case "float8", "double precision", "double":
+	case "float8", "double precision", "double", "float":
+		// M0119-0006 (53rd slice): `float` was in the ENCODE arm's spelling list
+		// but not this one, so a column whose DECLARED name is the bare `float`
+		// (PG: float = float8, postgres/src/backend/parser/gram.y opt_float)
+		// stored 8 fixed bytes and then failed to read them back — the decoder
+		// fell to the varlena default and raised "truncated 4-byte varlena".
+		// Encode and decode are twins (Hard-won Rule #2); the COPY-binary float
+		// arms added this slice accept the same six spellings.
 		if len(data) < 8 {
 			return Datum{}, 0, fmt.Errorf("float8: short read")
 		}
@@ -1427,6 +1461,45 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 			return Datum{}, 0, fmt.Errorf("decode numeric %q: %w", text, err)
 		}
 		return newNumeric(m, int(s)), n, nil
+	case "pg_node_tree":
+		// Sibling of encodeValuePG's "pg_node_tree" KindBytes passthrough.
+		//
+		// M0131-S20.2: a seeded pg_rewrite.ev_action whose inline form would
+		// not fit a heap tuple is stored out of line, and the column then holds
+		// an 18-byte VARTAG_ONDISK varatt_external pointer (varatt.h:38-48,
+		// :89) into pg_toast.pg_toast_2618. Without this arm the value fell to
+		// the generic `default` varlena branch, whose decodePhysicalPGVarlena
+		// rejects header 0x01 with "external varlena not supported" — which
+		// would have made initdb's pg_rewrite reload fail startup on a
+		// directory goopg itself wrote (loadViewsFromHeapForDB decodes EVERY
+		// pg_rewrite row before its ev_class filter discards the bootstrap
+		// ones).
+		//
+		// The 18 bytes are returned verbatim as KindBytes rather than
+		// resolved: reassembling them needs the TOAST heap and a buffer pool,
+		// neither of which this decoder has, and no goopg reader consumes a
+		// bootstrap ev_action (user rules store re-parsable SQL text and are
+		// never toasted — "pg_node_tree" is not in isToastableType). A future
+		// reader must detoast through the chunk index; see the deferral-ledger
+		// row for M0131-S20.2.
+		//
+		// The 0x01/0x12 pair cannot collide with a data varlena: 0x01 alone is
+		// a zero-length short varlena, which is unrepresentable.
+		if len(data) >= 2 && data[0] == 0x01 && data[1] == 18 {
+			if len(data) < 18 {
+				return Datum{}, 0, fmt.Errorf("truncated on-disk TOAST pointer")
+			}
+			return NewBytesDatum(append([]byte(nil), data[:18]...)), 18, nil
+		}
+		payload, n, err := decodePhysicalPGVarlena(data)
+		if err != nil {
+			return Datum{}, 0, fmt.Errorf("decode pg_node_tree as varlena: %w", err)
+		}
+		if sctx != nil {
+			moff, mlen := sctx.AllocBytes(payload)
+			return newStringArenaDatum(sctx, moff, mlen), n, nil
+		}
+		return NewStringDatum(string(payload)), n, nil
 	case "aclitem[]", "_aclitem":
 		// A heap-backed catalog stores an ACL column (pg_type.typacl —
 		// M0119-0004-ACLHEAP) as a PG-native _aclitem ArrayType varlena whose
@@ -1790,9 +1863,124 @@ func encodeVarlen(b []byte) []byte {
 	return out
 }
 
+// pgUnsignedIDFromDatum coerces a Datum to the unsigned integer an
+// oid/regproc/xid/xid8 column stores. All four are PG's "unsigned identifier"
+// family — typbyval, no varlena, and printed by oidout/xidout/xid8out with the
+// UNSIGNED %u/UINT64_FORMAT conversion — while goopg's Datum carries a signed
+// int64, so the whole family shares one coercion and one range rule.
+//
+// bits is 32 for oid/regproc/xid and 64 for xid8. The bound mirrors upstream
+// uint32in_subr (postgres/src/backend/utils/adt/numutils.c, reached from oidin
+// via oid.c:41) and xid8in's uint64in_subr: a value outside the type's range is
+// 22003, never a silent wrap. typeName is the name PG puts in that message.
+//
+// M0119-0006 (54th slice): extracted so the heap arms of encodeValuePG and the
+// binary-COPY arms of datumToCopyBinary (copy_binary.go) cannot drift — the two
+// are twins under Hard-won Rule #2, differing only in byte order. This mirrors
+// the 53rd slice's pgFloatFromDatum extraction.
+func pgUnsignedIDFromDatum(d Datum, typeName string, bits int) (uint64, error) {
+	var v int64
+	switch d.Kind {
+	case KindInt:
+		v = d.Int
+	case KindString:
+		var err error
+		v, err = coerceStringToInt64(d.StringValue(), typeName)
+		if err != nil {
+			return 0, err
+		}
+	default:
+		return 0, fmt.Errorf("expected int for %s, got kind %d", typeName, d.Kind)
+	}
+	if v < 0 || (bits == 32 && v > math.MaxUint32) {
+		return 0, &ExecError{Code: "22003",
+			Message: fmt.Sprintf("value %q is out of range for type %s", strings.TrimSpace(d.Format()), typeName)}
+	}
+	return uint64(v), nil
+}
+
+// pgIntervalFieldsFromDatum coerces a Datum to the three fields PG's Interval
+// struct holds — {TimeOffset time; int32 day; int32 month}
+// (postgres/src/include/datatype/timestamp.h) — returned here as
+// (months, days, micros) in goopg's usual field order.
+//
+// The KindString arm exists because a bare quoted literal
+// (`INSERT INTO t(i) VALUES ('1 mon')`) is `unknown` upstream and reaches an
+// interval column through interval_in; parser.ParseIntervalBody is the same
+// tokenizer `'…'::interval` uses, so the two entry points cannot disagree.
+//
+// M0119-0006 (55th slice): extracted from encodeValuePG's "interval" arm so the
+// heap encoder and the new binary-COPY interval arm (datumToCopyBinary,
+// copy_binary.go) cannot drift — the two are twins under Hard-won Rule #2,
+// differing only in byte order. Same extraction shape as pgFloatFromDatum
+// (53rd) and pgUnsignedIDFromDatum (54th).
+func pgIntervalFieldsFromDatum(d Datum) (months, days int32, micros int64, err error) {
+	switch d.Kind {
+	case KindInterval:
+		return d.IntervalMonthsValue(), d.IntervalDaysValue(), d.IntervalMicrosValue(), nil
+	case KindString:
+		months, days, micros, ok := parser.ParseIntervalBody(d.StringValue())
+		if !ok {
+			return 0, 0, 0, &ExecError{Code: "22007",
+				Message: fmt.Sprintf("invalid input syntax for type interval: %q", d.StringValue())}
+		}
+		return months, days, micros, nil
+	default:
+		return 0, 0, 0, fmt.Errorf("expected interval, got kind %d", d.Kind)
+	}
+}
+
 // floatTextDatum converts a PGFloatOut rendering into the Datum shape the
 // pre-M0111-0002 varlena-text decode produced: KindNumeric for finite
 // values, KindString for NaN/Infinity.
+// pgFloatFromDatum coerces a Datum to the float value a float4/float8 column
+// stores. goopg has no float Datum Kind — PGFloatOut's shortest-round-trip text
+// is parsed back into KindNumeric (floatTextDatum), so every float arrives here
+// as KindNumeric/KindString/KindInt.
+//
+// M0119-0006 (53rd slice): extracted from the "float4"/"float8" arms of
+// encodeValuePG so the heap encoder and the new binary-COPY float arms
+// (datumToCopyBinary, copy_binary.go) cannot drift — the two are twins in the
+// sense of Hard-won Rule #2, differing only in byte order. bits selects the
+// ParseFloat width (and hence the float4 rounding) and the type name PG uses in
+// its own 22P02 text (float.c float4in / float8in).
+func pgFloatFromDatum(d Datum, bits int) (float64, error) {
+	typeName := "double precision"
+	if bits == 32 {
+		typeName = "real"
+	}
+	switch d.Kind {
+	case KindInt:
+		return float64(d.Int), nil
+	case KindString, KindNumeric:
+		raw := strings.TrimSpace(d.StringValue())
+		if d.Kind == KindNumeric {
+			raw = numericText(d)
+		}
+		v, err := strconv.ParseFloat(raw, bits)
+		if err != nil {
+			return 0, &ExecError{Code: "22P02",
+				Message: fmt.Sprintf("invalid input syntax for type %s: %q", typeName, raw)}
+		}
+		if math.IsNaN(v) {
+			// strconv.ParseFloat("NaN", 64) yields Go's NaN, whose payload bit is
+			// SET (0x7ff8000000000001); PG's get_float8_nan() (postgres/src/
+			// include/utils/float.h) yields the canonical quiet NaN
+			// 0x7ff8000000000000. The two are equal as float64 but NOT as bytes,
+			// and both goopg float paths are byte-visible to real PG: the heap
+			// image (a PG standby reading goopg's pages) and float8send's binary
+			// COPY payload. Measured 2026-08-13: a `COPY … (FORMAT binary)` of a
+			// float8 'NaN' differed from PG 18.3's stream in exactly this one bit.
+			// float4 was already identical — the float32 narrowing discards the
+			// payload — so canonicalising here covers both widths.
+			v = math.Float64frombits(0x7ff8000000000000)
+		}
+		return v, nil
+	default:
+		return 0, fmt.Errorf("kind %d cannot encode as float%d", d.Kind, bits/8)
+	}
+}
+
 func floatTextDatum(text string) Datum {
 	if v, scale, ok := parseNumericFast(text); ok {
 		return Datum{Kind: KindNumeric, Int: v, Scale: scale}

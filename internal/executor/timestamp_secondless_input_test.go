@@ -72,7 +72,7 @@ func TestParseTimeStringSecondlessTime(t *testing.T) {
 				c.in, got.Hour(), got.Minute(), got.Second(), c.h, c.m)
 		}
 	}
-	tz, off, err := parseTimeTZString("10:00+05")
+	tz, off, err := parseTimeTZString("10:00+05", "")
 	if err != nil {
 		t.Fatalf("parseTimeTZString(%q): %v", "10:00+05", err)
 	}

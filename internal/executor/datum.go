@@ -109,12 +109,15 @@ const (
 // and every TimeSubtype, so a subtype added here without a matching arm in the
 // spill codec fails a test instead of silently degrading a value.
 //
-// NOTE (deferred, see the ledger row for M0127-P5.9-u): TimeSubTime and
-// TimeSubTimestampTZ are declared but not yet populated by their producers —
-// nothing today branches on them, and the two distinctions that DO have
-// behaviour (date rendering, timetz's UTC-normalised comparison) are carried by
-// TimeSubDate and TimeSubTimeTZ respectively. They are declared now so the
-// round-trip guard covers them the day a producer starts setting them.
+// NOTE (deferred, see the ledger row for M0127-P5.9-u): TimeSubTime is declared
+// but not yet populated by its producers — nothing today branches on it, and the
+// time-of-day distinction that DOES have behaviour (timetz's UTC-normalised
+// comparison) is carried by TimeSubTimeTZ. It is declared now so the round-trip
+// guard covers it the day a producer starts setting it.
+//
+// TimeSubTimestampTZ WAS in that same not-yet-populated state until M0119-0006's
+// 40th slice, which gave it producers (NewTimestampTZDatum) so that the
+// type-agnostic renderers can run timestamptz_out instead of timestamp_out.
 type TimeSubtype uint8
 
 const (
@@ -520,6 +523,31 @@ func NewDateDatum(t time.Time) Datum {
 // testing TimeSub directly: it also pins the Kind, so a stray non-time Datum
 // whose TimeSub byte happens to be set cannot be mistaken for a date.
 func (d Datum) IsDate() bool { return d.Kind == KindTime && d.TimeSub == TimeSubDate }
+
+// NewTimestampTZDatum constructs a KindTime Datum tagged as a
+// `timestamp with time zone` (TimeSub == TimeSubTimestampTZ). The instant is
+// stored in UTC exactly as NewTimeDatum stores it — the subtype is a *display*
+// discriminator, not a different carrier: timestamptz_out converts into the
+// session TimeZone and prints the offset, timestamp_out does neither
+// (postgres/src/backend/utils/adt/timestamp.c, EncodeDateTime's print_tz arg).
+//
+// M0119-0006 (40th slice): use this at every site that KNOWS the value's SQL
+// type is timestamptz — the typed literal, the cast, the on-disk decode and the
+// now()-family functions — so the type-agnostic renderers (CAST-to-text, FK
+// violation DETAIL, string concat) can tell it apart from a plain timestamp.
+// Sites that only have a bare instant with no declared type keep NewTimeDatum;
+// tagging them from a guess is the exact mislabelling this discriminator exists
+// to prevent.
+func NewTimestampTZDatum(t time.Time) Datum {
+	return Datum{Kind: KindTime, Int: t.UTC().UnixNano(), TimeSub: TimeSubTimestampTZ}
+}
+
+// IsTimestampTZ reports whether d is a KindTime Datum carrying a
+// `timestamp with time zone`. Sibling of IsDate; pins the Kind for the same
+// reason.
+func (d Datum) IsTimestampTZ() bool {
+	return d.Kind == KindTime && d.TimeSub == TimeSubTimestampTZ
+}
 
 // NewTimeTZDatum constructs a KindTime Datum for a timetz column.
 // The local time is stored as nanoseconds since 1970-01-01 00:00:00 UTC.

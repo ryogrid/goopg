@@ -2,7 +2,9 @@ package executor
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"math/big"
 	"strings"
@@ -126,10 +128,63 @@ func ParseCopyBinaryRows(data []byte, cols []catalog.Column) (rows []Row, traile
 	return rows, false, pos, nil
 }
 
+// tzDispLimitSecs mirrors upstream TZDISP_LIMIT
+// ((MAX_TZDISP_HOUR + 1) * SECS_PER_HOUR = 16 h, postgres/src/include/
+// datatype/timestamp.h:143-144) — the sanity bound timetz_recv applies to a
+// received GMT displacement.
+const tzDispLimitSecs = int32(16 * 60 * 60)
+
+// jsonbBinaryVersion is the one-byte format version jsonb_send writes ahead of
+// the JSON text and jsonb_recv insists on — `int version = 1` in both
+// (postgres/src/backend/utils/adt/jsonb.c:93, :128). It is the ONLY structural
+// difference between the `json` and `jsonb` binary wire formats.
+const jsonbBinaryVersion = byte(1)
+
+// isValidJSONText reports whether s is a single well-formed JSON value, which is
+// the check jsonb_from_cstring performs on the text jsonb_recv extracts. The
+// decoder is configured exactly as evalJSONArrow's (UseNumber, so a number never
+// round-trips through float64), and the trailing-token check is what makes
+// `{} {}` invalid — encoding/json's Decode stops at the end of the first value,
+// while PG's parser requires the whole string to be one value.
+func isValidJSONText(s string) bool {
+	dec := json.NewDecoder(strings.NewReader(s))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return false
+	}
+	return !dec.More() && dec.Decode(&v) == io.EOF
+}
+
 // --- type-specific binary encoders ---
 
 func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
+	if err := rejectBinaryCopyArray(t); err != nil {
+		return nil, err
+	}
 	switch strings.ToLower(t.Name) {
+	case "int2", "smallint":
+		// M0119-0006 (52nd slice): before this arm `int2` fell through to the
+		// default's KindInt escape and shipped EIGHT big-endian bytes where
+		// upstream int2send (postgres/src/backend/utils/adt/int.c:98 —
+		// pq_sendint16) ships exactly two, so every binary COPY of a smallint
+		// column produced a stream a real PG client rejects with "incorrect
+		// binary data format" (CopyReadBinaryAttribute's pq_getmsgend,
+		// postgres/src/backend/commands/copyfromparse.c). The range check
+		// mirrors the heap int2 encode arm (codec.go) rather than truncating:
+		// PG can never hold an out-of-range int2 Datum, so a value that is out
+		// of range here is goopg-side corruption and deserves 22003, not a
+		// silent wrap.
+		if d.Kind != KindInt {
+			return nil, fmt.Errorf("expected int, got kind %d", d.Kind)
+		}
+		if d.Int < -32768 || d.Int > 32767 {
+			return nil, &ExecError{Code: "22003",
+				Message: fmt.Sprintf("value %q is out of range for type smallint", strings.TrimSpace(d.Format()))}
+		}
+		b := make([]byte, 2)
+		binary.BigEndian.PutUint16(b, uint16(int16(d.Int)))
+		return b, nil
 	case "int4", "integer", "int":
 		if d.Kind != KindInt {
 			return nil, fmt.Errorf("expected int, got kind %d", d.Kind)
@@ -144,6 +199,95 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 		b := make([]byte, 8)
 		binary.BigEndian.PutUint64(b, uint64(d.Int))
 		return b, nil
+	case "float4", "real":
+		// M0119-0006 (53rd slice): before this arm a float column fell through to
+		// the default, which for goopg's float Datum (KindNumeric/KindString —
+		// there is no float Kind, see pgFloatFromDatum) ships the TEXT of the
+		// value under FORMAT binary. Upstream float4send
+		// (postgres/src/backend/utils/adt/float.c:350) is pq_sendfloat4, i.e. the
+		// IEEE-754 bits reinterpreted as a uint32 and sent big-endian
+		// (postgres/src/backend/libpq/pqformat.c:252) — 4 bytes, no text.
+		f, err := pgFloatFromDatum(d, 32)
+		if err != nil {
+			return nil, err
+		}
+		b := make([]byte, 4)
+		binary.BigEndian.PutUint32(b, math.Float32bits(float32(f)))
+		return b, nil
+	case "float8", "double precision", "double", "float":
+		// Sibling of the "float4" arm; float8send is pq_sendfloat8 (float.c:567),
+		// the 8-byte big-endian IEEE-754 image. The accepted spellings match the
+		// heap "float8" encode arm in codec.go, including the bare `float`
+		// (PG's float = float8) that goopg stores verbatim as a declared name.
+		f, err := pgFloatFromDatum(d, 64)
+		if err != nil {
+			return nil, err
+		}
+		b := make([]byte, 8)
+		binary.BigEndian.PutUint64(b, math.Float64bits(f))
+		return b, nil
+	case "oid", "regproc":
+		// M0119-0006 (54th slice): before this arm an `oid` column fell through
+		// to the default's KindInt escape and shipped EIGHT big-endian bytes.
+		// Upstream oidsend (postgres/src/backend/utils/adt/oid.c:71) is
+		// pq_sendint32 — exactly four — so every binary COPY of an oid column
+		// produced a stream a real PG client rejects with "incorrect binary data
+		// format" (CopyReadBinaryAttribute's pq_getmsgend). regproc shares the
+		// arm because regprocsend IS oidsend upstream ("Exactly the same as
+		// oidsend, so share code", regproc.c:208-212) — the same pairing the
+		// heap codec already uses.
+		v, err := pgUnsignedIDFromDatum(d, "oid", 32)
+		if err != nil {
+			return nil, err
+		}
+		b := make([]byte, 4)
+		binary.BigEndian.PutUint32(b, uint32(v))
+		return b, nil
+	case "xid":
+		// xidsend (postgres/src/backend/utils/adt/xid.c:67) is pq_sendint32 over
+		// the 4-byte TransactionId — same width and same default-arm bug as oid.
+		v, err := pgUnsignedIDFromDatum(d, "xid", 32)
+		if err != nil {
+			return nil, err
+		}
+		b := make([]byte, 4)
+		binary.BigEndian.PutUint32(b, uint32(v))
+		return b, nil
+	case "xid8":
+		// xid8send (xid.c:225) is pq_sendint64 over the FullTransactionId. The
+		// default arm happened to ship the right EIGHT bytes for this one type,
+		// which is why the divergence hid here and surfaced on the heap side
+		// instead (see the "xid8" arm of encodeValuePG). Naming it explicitly is
+		// what makes the two twins provably agree rather than coincidentally.
+		v, err := pgUnsignedIDFromDatum(d, "xid8", 64)
+		if err != nil {
+			return nil, err
+		}
+		b := make([]byte, 8)
+		binary.BigEndian.PutUint64(b, v)
+		return b, nil
+	case "uuid":
+		// uuid_send (postgres/src/backend/utils/adt/uuid.c:192) is
+		// pq_sendbytes(uuid->data, UUID_LEN) — the raw 16 bytes, which is
+		// byte-for-byte what the heap already stores since the uuid arm of
+		// encodeValuePG stopped storing text. Before this arm the default shipped
+		// the 36-character canonical TEXT under FORMAT binary; unlike the float
+		// case that is not silent corruption (36 != 16, so uuid_recv's
+		// pq_getmsgbytes fails) but it is still a stream no PG client can read.
+		if d.Kind != KindString {
+			return nil, fmt.Errorf("expected string for uuid, got kind %d", d.Kind)
+		}
+		s := d.StringValue()
+		if !isValidUUIDStr(s) {
+			return nil, &ExecError{Code: "22P02",
+				Message: fmt.Sprintf("invalid input syntax for type uuid: %q", s)}
+		}
+		raw, ok := uuidBytesFromCanonical(normalizeUUIDStr(s))
+		if !ok {
+			return nil, &ExecError{Code: "22P02",
+				Message: fmt.Sprintf("invalid input syntax for type uuid: %q", s)}
+		}
+		return append([]byte(nil), raw[:]...), nil
 	case "bool", "boolean":
 		if d.Kind != KindBool {
 			return nil, fmt.Errorf("expected bool, got kind %d", d.Kind)
@@ -162,6 +306,33 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
 		}
 		return encodeTimestampBinary(d.TimeValue().UTC()), nil
+	case "time", "time without time zone":
+		// M0119-0006 (51st slice): before this arm `time` fell through to the
+		// default and shipped Datum.Format()'s TEXT under FORMAT binary — a
+		// stream no real PG client can read. Upstream time_send
+		// (postgres/src/backend/utils/adt/date.c) is exactly the 8-byte
+		// big-endian TimeADT, i.e. the same microseconds-since-midnight the heap
+		// stores; taking them from pgTimeMicros rather than from Hour/Minute/
+		// Second is what carries the hour-24 rule (50th slice) into COPY.
+		if d.Kind != KindTime {
+			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
+		}
+		b := make([]byte, 8)
+		binary.BigEndian.PutUint64(b, uint64(pgTimeMicros(d.TimeValue())))
+		return b, nil
+	case "timetz", "time with time zone":
+		// Sibling of the "time" arm. Upstream timetz_send is TimeADT then the
+		// int32 zone; the zone's sign convention is PG's (positive = WEST of
+		// UTC) while Datum.Scale keeps minutes EAST, so it negates — identical
+		// to the heap "timetz" arm in codec.go, which is the twin this must
+		// agree with (Hard-won Rule #2).
+		if d.Kind != KindTime {
+			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
+		}
+		b := make([]byte, 12)
+		binary.BigEndian.PutUint64(b[:8], uint64(pgTimeMicros(d.TimeValue())))
+		binary.BigEndian.PutUint32(b[8:], uint32(int32(-d.TimeTZOffsetSecs())))
+		return b, nil
 	case "date":
 		if d.Kind != KindTime {
 			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
@@ -171,6 +342,50 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 		b := make([]byte, 4)
 		binary.BigEndian.PutUint32(b, uint32(days))
 		return b, nil
+	case "interval":
+		// M0119-0006 (55th slice): before this arm an `interval` column fell
+		// through to the default, whose KindInterval Datum matches no Kind case
+		// and so shipped Datum.Format()'s TEXT ('02:00:00') under FORMAT binary —
+		// a stream no real PG client can read. Upstream interval_send
+		// (postgres/src/backend/utils/adt/timestamp.c:1022) is
+		// pq_sendint64(time) + pq_sendint32(day) + pq_sendint32(month): exactly
+		// the {time,day,month} the heap already stores at the same offsets
+		// (encodeValuePG's "interval" arm), differing only in byte order, so the
+		// two twins share pgIntervalFieldsFromDatum rather than re-deriving the
+		// fields. The ±infinity sentinels need no case here either: INTERVAL_NOEND
+		// / INTERVAL_NOBEGIN *are* all-fields-at-their-extreme.
+		months, days, micros, err := pgIntervalFieldsFromDatum(d)
+		if err != nil {
+			return nil, err
+		}
+		b := make([]byte, 16)
+		binary.BigEndian.PutUint64(b[:8], uint64(micros))
+		binary.BigEndian.PutUint32(b[8:12], uint32(days))
+		binary.BigEndian.PutUint32(b[12:16], uint32(months))
+		return b, nil
+	case "jsonb":
+		// M0119-0006 (56th slice): before this arm a `jsonb` column fell through
+		// to the default's KindString case and shipped the bare JSON text under
+		// FORMAT binary. Upstream jsonb_send
+		// (postgres/src/backend/utils/adt/jsonb.c:124) is pq_sendint8(version=1)
+		// followed by pq_sendtext of JsonbToCString's output — the LEADING
+		// VERSION BYTE is the whole difference, and omitting it makes jsonb_recv
+		// read '{' (0x7b = 123) as the version and raise "unsupported jsonb
+		// version number 123". Note that the jsonb wire format IS text after that
+		// byte: jsonb_send serialises the tree back to a C string rather than
+		// shipping the JsonbContainer, which is why goopg — whose heap holds
+		// jsonb as varlena text, not as a JEntry tree — can be byte-exact here
+		// even though its storage is not (ledgered under M0119-0006).
+		// `json` deliberately has NO arm: json_send IS textsend (json.c), i.e.
+		// bare text with no version byte, which is exactly what the default arm
+		// already emits.
+		s, ok := datumAsString(d)
+		if !ok {
+			return nil, fmt.Errorf("expected string for jsonb, got kind %d", d.Kind)
+		}
+		b := make([]byte, 0, len(s)+1)
+		b = append(b, jsonbBinaryVersion)
+		return append(b, s...), nil
 	case "numeric", "decimal":
 		return encodeNumericBinary(d)
 	default:
@@ -190,8 +405,44 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 	}
 }
 
+// rejectBinaryCopyArray refuses an array column in BINARY COPY, loudly and by
+// name. Both halves of binary COPY dispatch on the element type name (an array
+// column is catalog.Type{Name:<ELEMENT>, IsArray:true}), so before this guard an
+// int4[] column reported "expected int, got kind 3" while a text[] or bytea[]
+// column fell through to the default raw-bytes arm and SILENTLY shipped the
+// array's "{a,b}" text where upstream ships array_send's binary shape (ndim,
+// hasnull, elemtype, dims/lbounds, then a 4-byte length + the element's own
+// send format per element — postgres/src/backend/utils/adt/arrayfuncs.c
+// array_send / array_recv). Emitting the text under BINARY produces a stream no
+// real PG client can read, so refusing is the PG-compatible answer until
+// array_send/array_recv are ported (deferral ledger, M0119-0006). The TEXT and
+// CSV formats are unaffected — they legitimately carry array_out's text.
+func rejectBinaryCopyArray(t catalog.Type) error {
+	if !t.IsArray {
+		return nil
+	}
+	return &ExecError{Code: "0A000",
+		Message: fmt.Sprintf("binary COPY of array type %s[] is not supported", t.Name)}
+}
+
 func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
+	if err := rejectBinaryCopyArray(t); err != nil {
+		return Datum{}, err
+	}
 	switch strings.ToLower(t.Name) {
+	case "int2", "smallint":
+		// Decode twin of the "int2" encode arm. Upstream int2recv (int.c:87) is
+		// pq_getmsgint(buf, sizeof(int16)); the length is enforced because the
+		// binary COPY parser runs pq_getmsgend after each attribute, so a field
+		// that is not exactly two bytes is "incorrect binary data format"
+		// upstream and an error here. Before this arm the payload came back
+		// from the default as a STRING Datum — a smallint column silently held
+		// two raw bytes of text (Hard-won Rule #2: encode and decode are twins).
+		if len(payload) != 2 {
+			return Datum{}, fmt.Errorf("int2: expected 2 bytes, got %d", len(payload))
+		}
+		v := int16(binary.BigEndian.Uint16(payload))
+		return Datum{Kind: KindInt, Int: int64(v)}, nil
 	case "int4", "integer", "int":
 		if len(payload) != 4 {
 			return Datum{}, fmt.Errorf("int4: expected 4 bytes, got %d", len(payload))
@@ -204,6 +455,60 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 		}
 		v := int64(binary.BigEndian.Uint64(payload))
 		return Datum{Kind: KindInt, Int: v}, nil
+	case "float4", "real":
+		// Decode twin of the "float4" encode arm: upstream float4recv
+		// (float.c:339) is pq_getmsgfloat4, and the binary COPY parser's
+		// pq_getmsgend makes any other length "incorrect binary data format".
+		// The Datum shape is taken from the heap float4 decode arm
+		// (decodePhysicalPGValueMctx, codec.go) — PGFloatOut's shortest round-trip text fed
+		// through floatTextDatum — so a value that enters through binary COPY is
+		// indistinguishable from the same value entering through INSERT, in
+		// Format(), CAST-to-text and every type-agnostic path. Before this arm
+		// the default handed back the four raw bytes as a STRING Datum.
+		if len(payload) != 4 {
+			return Datum{}, fmt.Errorf("float4: expected 4 bytes, got %d", len(payload))
+		}
+		f4 := float64(math.Float32frombits(binary.BigEndian.Uint32(payload)))
+		return floatTextDatum(PGFloatOut(f4, 32)), nil
+	case "float8", "double precision", "double", "float":
+		if len(payload) != 8 {
+			return Datum{}, fmt.Errorf("float8: expected 8 bytes, got %d", len(payload))
+		}
+		f8 := math.Float64frombits(binary.BigEndian.Uint64(payload))
+		return floatTextDatum(PGFloatOut(f8, 64)), nil
+	case "oid", "regproc":
+		// Decode twin of the "oid"/"regproc" encode arm. Upstream oidrecv
+		// (oid.c:60) is pq_getmsgint(buf, sizeof(Oid)) and regprocrecv IS oidrecv
+		// (regproc.c:198-202); the binary COPY parser's pq_getmsgend makes any
+		// other length "incorrect binary data format". The Datum shape is the
+		// heap decode arm's — NewIntDatum over the UNSIGNED 32-bit value, so an
+		// oid that entered through binary COPY compares and indexes identically
+		// to the same oid entering through INSERT. Before this arm the default
+		// handed back the raw bytes as a STRING Datum (Hard-won Rule #2).
+		if len(payload) != 4 {
+			return Datum{}, fmt.Errorf("oid: expected 4 bytes, got %d", len(payload))
+		}
+		return NewIntDatum(int64(binary.BigEndian.Uint32(payload))), nil
+	case "xid":
+		// xidrecv (xid.c:56) — pq_getmsgint over sizeof(TransactionId).
+		if len(payload) != 4 {
+			return Datum{}, fmt.Errorf("xid: expected 4 bytes, got %d", len(payload))
+		}
+		return NewIntDatum(int64(binary.BigEndian.Uint32(payload))), nil
+	case "xid8":
+		// xid8recv (xid.c:215) — pq_getmsgint64 over the FullTransactionId.
+		if len(payload) != 8 {
+			return Datum{}, fmt.Errorf("xid8: expected 8 bytes, got %d", len(payload))
+		}
+		return NewIntDatum(int64(binary.BigEndian.Uint64(payload))), nil
+	case "uuid":
+		// uuid_recv (uuid.c:181) copies exactly UUID_LEN bytes. The Datum is the
+		// canonical lowercase-with-dashes KindString the heap decode produces —
+		// the engine has no uuid Kind and speaks that text everywhere else.
+		if len(payload) != 16 {
+			return Datum{}, fmt.Errorf("uuid: expected 16 bytes, got %d", len(payload))
+		}
+		return NewStringDatum(uuidCanonicalFromBytes(payload)), nil
 	case "bool", "boolean":
 		if len(payload) != 1 {
 			return Datum{}, fmt.Errorf("bool: expected 1 byte, got %d", len(payload))
@@ -214,14 +519,103 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 			return Datum{}, fmt.Errorf("timestamp: expected 8 bytes, got %d", len(payload))
 		}
 		usec := int64(binary.BigEndian.Uint64(payload))
-		return NewTimeDatum(pgEpoch.Add(time.Duration(usec) * time.Microsecond)), nil
+		ts := pgEpoch.Add(time.Duration(usec) * time.Microsecond)
+		// M0119-0006 (41st slice): the column type is in reach here, so this
+		// decoder owes the same subtype tag the heap decode already applies
+		// (decodePhysicalPGValueMctx, codec.go) — otherwise a value that entered through
+		// binary COPY renders differently from the identical value that entered
+		// through INSERT, in every type-agnostic path (Datum.Format(),
+		// CAST-to-text, string concat, FK-violation DETAIL). Hard-won Rule #2.
+		if isTimestampTZTypeName(t.Name) {
+			return NewTimestampTZDatum(ts), nil
+		}
+		return NewTimeDatum(ts), nil
+	case "time", "time without time zone":
+		// Decode twin of the "time" arm in datumToCopyBinary. Upstream time_recv
+		// range-checks the received TimeADT against [0, USECS_PER_DAY] — the
+		// bound is INCLUSIVE, `24:00:00` being a real TimeADT — and raises
+		// 22008 outside it, which is what a corrupt or foreign stream deserves
+		// instead of a silently out-of-range Datum. (AdjustTimeForTypmod's
+		// rounding is NOT applied here: goopg truncates at display, ledgered
+		// under M0119-0006.)
+		if len(payload) != 8 {
+			return Datum{}, fmt.Errorf("time: expected 8 bytes, got %d", len(payload))
+		}
+		micros := int64(binary.BigEndian.Uint64(payload))
+		if micros < 0 || micros > usecsPerDay {
+			return Datum{}, &ExecError{Code: "22008", Message: "time out of range"}
+		}
+		return NewTimeDatum(pgTimeFromMicros(micros)), nil
+	case "timetz", "time with time zone":
+		// Decode twin of the "timetz" encode arm; upstream timetz_recv reads the
+		// TimeADT then the int32 zone and applies the same TZDISP_LIMIT sanity
+		// check (±16 h, postgres/src/include/datatype/timestamp.h) with its own
+		// 22009 code. Zone sign is flipped back to Datum.Scale's east-of-UTC.
+		if len(payload) != 12 {
+			return Datum{}, fmt.Errorf("timetz: expected 12 bytes, got %d", len(payload))
+		}
+		micros := int64(binary.BigEndian.Uint64(payload[:8]))
+		if micros < 0 || micros > usecsPerDay {
+			return Datum{}, &ExecError{Code: "22008", Message: "time out of range"}
+		}
+		pgOffset := int32(binary.BigEndian.Uint32(payload[8:12]))
+		if pgOffset <= -tzDispLimitSecs || pgOffset >= tzDispLimitSecs {
+			return Datum{}, &ExecError{Code: "22009",
+				Message: "time zone displacement out of range"}
+		}
+		return NewTimeTZDatum(pgTimeFromMicros(micros), int(-pgOffset)), nil
 	case "date":
 		if len(payload) != 4 {
 			return Datum{}, fmt.Errorf("date: expected 4 bytes, got %d", len(payload))
 		}
 		days := int32(binary.BigEndian.Uint32(payload))
-		t := pgEpoch.AddDate(0, 0, int(days))
-		return NewTimeDatum(t), nil
+		d := pgEpoch.AddDate(0, 0, int(days))
+		return NewDateDatum(d), nil
+	case "interval":
+		// Decode twin of the "interval" encode arm. Upstream interval_recv
+		// (timestamp.c:997) is pq_getmsgint64(time) + pq_getmsgint(day) +
+		// pq_getmsgint(month), and the binary COPY parser's pq_getmsgend makes
+		// any other length "incorrect binary data format". The Datum shape is the
+		// heap decode arm's (decodePhysicalPGValueMctx, codec.go) —
+		// NewIntervalDatumFull — so an interval that entered through binary COPY
+		// sorts, compares and prints identically to the same interval entering
+		// through INSERT. Before this arm the default handed the 16 raw bytes back
+		// as a STRING Datum, which then made every runtime interval operation
+		// lexicographic (Hard-won Rule #2). interval_recv's trailing
+		// AdjustIntervalForTypmod is NOT applied here — goopg truncates at display,
+		// ledgered under M0119-0006 alongside AdjustTimeForTypmod.
+		if len(payload) != 16 {
+			return Datum{}, fmt.Errorf("interval: expected 16 bytes, got %d", len(payload))
+		}
+		micros := int64(binary.BigEndian.Uint64(payload[:8]))
+		days := int32(binary.BigEndian.Uint32(payload[8:12]))
+		months := int32(binary.BigEndian.Uint32(payload[12:16]))
+		return NewIntervalDatumFull(months, days, micros), nil
+	case "jsonb":
+		// Decode twin of the "jsonb" encode arm. Upstream jsonb_recv
+		// (jsonb.c:89) reads a 1-byte version, rejects anything but 1 with
+		// "unsupported jsonb version number %d", and hands the REMAINING bytes to
+		// jsonb_from_cstring — which parses them and raises 22P02 on malformed
+		// JSON. Both halves matter: without the version check a stream written by
+		// a future jsonb version would be silently stored with its version byte
+		// glued to the front of the text, and without the parse a corrupt or
+		// foreign stream would put non-JSON into a jsonb column, where every
+		// later `->`/`->>` (evalJSONArrow) raises 22P02 at read time instead.
+		// Before this arm the default handed the version byte AND the text back
+		// as one KindString Datum (Hard-won Rule #2).
+		if len(payload) < 1 {
+			return Datum{}, fmt.Errorf("jsonb: expected at least 1 byte, got %d", len(payload))
+		}
+		if payload[0] != jsonbBinaryVersion {
+			return Datum{}, &ExecError{Code: "XX000",
+				Message: fmt.Sprintf("unsupported jsonb version number %d", payload[0])}
+		}
+		s := string(payload[1:])
+		if !isValidJSONText(s) {
+			return Datum{}, &ExecError{Code: "22P02",
+				Message: "invalid input syntax for type json"}
+		}
+		return NewStringDatum(s), nil
 	case "numeric", "decimal":
 		return decodeNumericBinary(payload)
 	default:
