@@ -761,13 +761,16 @@ CommandCounter on BasicSession and seeding fresh contexts from it.
       (b) the TPC-H cluster (65433, db `tpch`) is still un-REINDEXed, blocked
       on the same per-DB catalog scoping gap the ledger records for ANALYZE.
 - [ ] **testport/TestPort_IsolationPredicateHash** — FAILed
-      (AI-20260811-014635-001; repro: `go test -v -run
+      (AI-20260811-014635-001, AI-20260812-005501-003, AI-20260813-005117-016;
+      repro: `go test -v -run
       '^TestPort_IsolationPredicateHash$' ./internal/testport/`). PARKED per
-      banner (not a gate the priority milestones depend on).
+      banner (not a gate the priority milestones depend on). Re-confirmed FAILing
+      at HEAD `f645621b` on 2026-08-13 (0.81 s).
 - [ ] **testport/TestPort_IsolationReceiptReport** — FAILed
-      (AI-20260811-014635-002; repro: `go test -v -run
+      (AI-20260811-014635-002, AI-20260812-005501-004, AI-20260813-005117-017;
+      repro: `go test -v -run
       '^TestPort_IsolationReceiptReport$' ./internal/testport/`). PARKED per
-      banner.
+      banner. Re-confirmed FAILing at HEAD `f645621b` on 2026-08-13 (2.97 s).
 - [ ] **regress/{delete,enum,functional_deps,index_including,index_including_gist,
       select,tid,truncate,union}** — 11 baseline-pass regress cases diverged with
       "output mismatch; normalization rules need extension"
@@ -793,6 +796,63 @@ New subjects only:
 - [ ] **testport/TestPort_IsolationMultipleCic** — FAILed
       (AI-20260812-005501-002, new tonight; repro: `go test -v -run
       '^TestPort_IsolationMultipleCic$' ./internal/testport/`). PARKED per banner.
+
+### Nightly run 20260813-005117 (sha `fd5539efc925`, dirty=62, 17 items) — filed 2026-08-13
+
+Every one of tonight's 17 items was re-run at HEAD `f645621b` before filing (rule
+§2). Result: **7 phantom, 5 stale, 5 real** — and only 2 of the 5 real ones are
+new subjects. `TestPort_IsolationPredicateHash` / `TestPort_IsolationReceiptReport`
+(AI-…-016/-017) are recurrences of the still-open tasks above and were appended
+there, not re-filed.
+
+- [x] **race/{cmd/gen-isolation-coverage,cmd/gen-oracle-port-status,
+      cmd/gen-oracle-report,cmd/gen-regress-coverage,cmd/goopg,internal/executor,
+      internal/initdb}** — AI-20260813-005117-001..007. **PHANTOM, fixed at the
+      root (2026-08-13).** All seven are one `internal/executor/time_zone_token.go:116:6:
+      undefined: pgDateTimeKeywords`; the symbol is defined at line 153 of that
+      same file and `go build ./...` is clean at HEAD. Decisive evidence: `units`
+      PASSED at 288 s and `race` failed 53 s later on the *same sha* with
+      `dirty=62` — `ci/batch/run-nightly.sh` runs in `REPO_ROOT` (no clone, no
+      worktree), so a concurrent Ralph loop's mid-edit file broke the build
+      between the two stages. **Root cause was the summarizer, not the code:**
+      the testport lane grew a mid-run-build-break collapse on 2026-08-06 (after
+      the same class produced 14 phantom items in run 20260806-011323) but the
+      units/race lane never did — a sibling-path divergence. Fixed in
+      `ci/batch/lib/summarize.py`: `[build failed]` packages now collapse into
+      ONE `kind:"infra"` build-kill carrying the compiler text and the
+      fingerprint-proven drift attribution, instead of N regressions. Re-running
+      the summarizer over this very run turns 17 items into 10 regressions + 1
+      infra item. Regression test:
+      `AnalyzeUnitsClassificationTest.test_build_failed_packages_collapse_into_one_infra_item`.
+- [ ] **race/internal/wal — `TestCheckpointerVolumeTrigger` load-sensitive flake**
+      — AI-20260813-005117-008. This is the ONE race item that genuinely
+      compiled and ran: `checkpointer_test.go:281: volume trigger did not fire
+      within 2s`, under `-race` at `-p=4`/`GOMEMLIMIT=5GiB`/`MemoryMax=8G`. Same
+      shape as the already-fixed `race/internal/mctx TestMultipleChunks` flake
+      (2 s wall-clock deadline on a co-loaded nightly host), so the likely fix is
+      a deadline that scales with load rather than a product change — confirm
+      before treating it as a checkpointer bug. Repro: `go test -race -run
+      '^TestCheckpointerVolumeTrigger$' ./internal/wal/`. PARKED per banner.
+- [x] **testport/{TestPort_IsolationEvalPlanQualTrigger,
+      TestPort_IsolationInsertConflictDoUpdate,TestPort_IsolationIntraGrantInplace,
+      TestPort_IsolationIntraGrantInplaceDb,TestPort_IsolationLockCommittedKeyupdate}**
+      — AI-20260813-005117-010,011,013,014,015. **STALE at HEAD `f645621b`:** all
+      five PASS on re-run (rule §2). They failed in the nightly because the same
+      mid-run build break left the testport stage running against a tree that did
+      not compile.
+- [ ] **testport/TestPort_IsolationEvalPlanQual — REOPENED (3rd time)**
+      — AI-20260813-005117-009. Re-confirmed FAILing at HEAD `f645621b`
+      (24.58 s) — this is a real result, not a build-break victim. Previously
+      "fixed" twice (2026-08-09 via AI-007, and again under AI-20260808-005620-001);
+      neither fix held. Repro: `go test -v -run '^TestPort_IsolationEvalPlanQual$'
+      ./internal/testport/`. PARKED per banner.
+- [ ] **testport/TestPort_IsolationInsertConflictDoUpdate4** — FAILed
+      (AI-20260813-005117-012, new tonight). Re-confirmed FAILing at HEAD
+      `f645621b` (2.04 s). Note its sibling `…InsertConflictDoUpdate` (no `4`)
+      PASSES at HEAD, so this is a genuine per-permutation divergence, not a
+      whole-fixture break. Repro: `go test -v -run
+      '^TestPort_IsolationInsertConflictDoUpdate4$' ./internal/testport/`. PARKED
+      per banner.
 
 _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
 

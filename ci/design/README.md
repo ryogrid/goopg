@@ -49,7 +49,7 @@ local time.
 | [01-architecture.md](01-architecture.md) | Components, stage DAG, entrypoints, `ci/batch/` layout, reuse-vs-consolidate table |
 | [02-test-selection.md](02-test-selection.md) | Exactly what runs / skips; data-driven must-pass; expected-fail handling; promotion workflow; **regress wedge-recovery rule** (recovery must not re-bootstrap the shared fixtures — one wedged case used to file 9 items); **regress wedge-probe rule** (at 60 s a case captures live pg_stat_activity/pg_locks/goroutine-dump/RSS; host-overload and GC-thrash are already refuted by arithmetic) |
 | [03-resources-and-parallelism.md](03-resources-and-parallelism.md) | Memory budget, cgroup units, parallelism policy, `mem_guard.py` interaction, port isolation |
-| [04-logging-and-reporting.md](04-logging-and-reporting.md) | `ci/logs/<ts>/` layout, progress log, summary schema, perf-tolerance policy, §C.1 mid-run build breaks (`build_kills`, source fingerprints), retention |
+| [04-logging-and-reporting.md](04-logging-and-reporting.md) | `ci/logs/<ts>/` layout, progress log, summary schema, perf-tolerance policy, §C.1 mid-run build breaks (`build_kills`, source fingerprints), §C.2 the same collapse on the units/race lanes, retention |
 | [05-tpch-stage.md](05-tpch-stage.md) | The 2-hour-bounded TPC-H sweep: budget algorithm, EXPLAIN capture, comparisons |
 | [06-scheduler.md](06-scheduler.md) | Resident daemon, `flock` single-instance control, the `ralph_loop.sh` hook patch |
 | [07-ralph-feedback.md](07-ralph-feedback.md) | Failures → `ci/logs/action-items.md` → standing top-priority `M-NIGHTLY` milestone in `.ralph/fix_plan.md` |

@@ -175,6 +175,29 @@ def stage_fingerprints(run_dir):
     return out
 
 
+def tree_drift_cause(run_dir, stage):
+    """Why the build broke mid-run, attributed from the stage fingerprints.
+
+    The nightly compiles the LIVE working tree (ci/batch/run-nightly.sh runs in
+    REPO_ROOT — there is no clone or worktree), so a concurrent Ralph loop
+    editing a file between two stages breaks the build under a stage that
+    preflight's `make build` already cleared. run_stage stamps a source
+    fingerprint per stage precisely so this can be proven rather than guessed.
+    """
+    fps = stage_fingerprints(run_dir)
+    try:
+        start_fp = (json.loads(read_file(os.path.join(run_dir, "meta.json")) or "{}")
+                    .get("source_fp") or "").strip()
+    except ValueError:
+        start_fp = ""
+    stage_fp = fps.get(stage, "")
+    if start_fp and stage_fp and stage_fp != start_fp:
+        return (f"the working tree MUTATED mid-run (preflight fp {start_fp}, "
+                f"{stage} fp {stage_fp}) — a concurrent edit/commit, not a code regression")
+    return ("the working tree is built live, so a concurrent edit/commit is the "
+            "likely cause; no stage fingerprints available to confirm")
+
+
 PKG_LINE_RE = re.compile(r"^(ok|FAIL|\?)\s+(\S+)")
 
 
@@ -291,8 +314,20 @@ def analyze(run_dir, repo_root, run_id):
                     ev(f"{stage}/go-test.log"),
                 )
             continue
+        # A package that never COMPILED says nothing about the code, and one
+        # broken file fails every package that imports it — run 20260813-005117
+        # emitted 8 separate "regression" items (5 cmd/*, executor, initdb, wal)
+        # from a single `undefined: pgDateTimeKeywords`, while `units` had
+        # PASSED 53 s earlier on the same sha with dirty=62. The testport lane
+        # grew this collapse on 2026-08-06 (see tp_unattributable below); the
+        # units/race lane never did — a sibling-path divergence, so the same
+        # phantom-item class kept recurring here.
+        build_failed = []
         for pkg, text in fail_blocks[:10]:
             rel = pkg.split("github.com/goopg/goopg/")[-1]
+            if "[build failed]" in text:
+                build_failed.append(rel)
+                continue
             if looks_resource_killed(text) and "--- FAIL" not in text:
                 it.resource_kills.append({"stage": stage, "pkg": rel, "evidence": ev(f"{stage}/go-test.log")})
                 continue
@@ -302,6 +337,28 @@ def analyze(run_dir, repo_root, run_id):
                 repro_tpl.format(pkg=rel),
                 ev(f"{stage}/go-test.log"),
             )
+        if build_failed:
+            # Prefer the compiler's `file.go:L:C: msg` over the `# <pkg>` header
+            # build_error_line() anchors on — the message is what triage needs
+            # to tell a real break from a mid-run edit without opening the log.
+            err = ""
+            boundary = build_error_line(log)
+            if boundary is not None:
+                lines = log.splitlines()
+                err = next((ln.strip() for ln in lines[boundary:boundary + 5]
+                            if GO_COMPILE_ERR_RE.search(ln)), lines[boundary].strip())
+            it.build_kills.append({
+                "kind": "infra",
+                "subject": f"{stage}/build-broke-mid-stage",
+                "what": (f"{len(build_failed)} package(s) in the {stage} stage failed to COMPILE, "
+                         f"so they never ran and are NOT regressions "
+                         f"({', '.join(build_failed[:6])}"
+                         f"{', …' if len(build_failed) > 6 else ''})"
+                         + (f"; first build error: {err}" if err else "")
+                         + f"; {tree_drift_cause(run_dir, stage)}"),
+                "repro": "go build ./... at the run's recorded sha (clean sha ⇒ nothing to fix in the code)",
+                "evidence": ev(f"{stage}/go-test.log"),
+            })
 
     # ---- testport
     tp_log = read_file(os.path.join(run_dir, "testport", "go-test.log"))
@@ -363,19 +420,7 @@ def analyze(run_dir, repo_root, run_id):
         # Attribute the break to a tree change when the stage stamps prove one,
         # rather than inferring it — meta.json has recorded `dirty=<n>` since
         # the batch existed and nothing ever acted on it.
-        fps = stage_fingerprints(run_dir)
-        try:
-            start_fp = (json.loads(read_file(os.path.join(run_dir, "meta.json")) or "{}")
-                        .get("source_fp") or "").strip()
-        except ValueError:
-            start_fp = ""
-        tp_fp = fps.get("testport", "")
-        if start_fp and tp_fp and tp_fp != start_fp:
-            cause = (f"the working tree MUTATED mid-run (preflight fp {start_fp}, "
-                     f"testport fp {tp_fp}) — a concurrent edit/commit, not a code regression")
-        else:
-            cause = ("the working tree is built live, so a concurrent edit/commit is the "
-                     "likely cause; no stage fingerprints available to confirm")
+        cause = tree_drift_cause(run_dir, "testport")
         it.build_kills.append({
             "kind": "infra",
             "subject": "testport/build-broke-mid-stage",

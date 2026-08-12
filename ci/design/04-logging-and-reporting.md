@@ -150,6 +150,52 @@ deferred (see the deferral ledger).
 Guards: `ci/batch/lib/test_summarize.py::MidRunBuildBreakTest` (4 cases),
 verified non-vacuous by forcing `tp_build_boundary = None`.
 
+### C.2 The same collapse on the units/race lanes (added 2026-08-13)
+
+C.1 was implemented **only on the testport lane**, because that is where the
+2026-08-06 break happened to surface. The units/race lane kept its original
+per-package loop, so the identical class recurred — this is the sibling-path
+failure CLAUDE.md warns about, and the guard on one twin proved nothing about
+the other.
+
+Run `20260813-005117` (sha `fd5539efc925`, `dirty=62`): `units` **passed** at
+288 s, then `race` failed 53 s later on the same sha with
+`internal/executor/time_zone_token.go:116:6: undefined: pgDateTimeKeywords` —
+a symbol defined at line 153 of that same file, with `go build ./...` clean at
+HEAD. One mid-edit file failed every package importing it, and because
+`go test` reports those as `FAIL <pkg> [build failed]`, the summarizer emitted
+**7 separate `[regression]` items** (`AI-…-001..-007`) for packages that never
+ran.
+
+The units/race loop now applies the C.1 treatment: a fail block containing
+`[build failed]` is diverted out of `regressions` into a single per-stage
+`kind:"infra"` build-kill, which carries the compiler's own
+`file.go:LINE:COL: msg` (preferred over the `# <import path>` header that
+`build_error_line()` anchors on) plus the fingerprint-proven drift attribution.
+Attribution is now shared: `tree_drift_cause(run_dir, stage)` replaces the
+copy that was inline in the testport branch.
+
+The distinction C.1 calls load-bearing holds here too, and the same run proves
+it: `internal/wal` *did* compile and failed on
+`TestCheckpointerVolumeTrigger`, so it must stay a regression while its seven
+build-failed siblings do not. Re-running the summarizer over the stored run
+turns its 17 items into 10 regressions + 1 infra item.
+
+Note that `[build failed]` is checked, not `build_error_line()`, on this lane:
+the compiler prints its error text once, under the *first* package that failed
+to build, while every other victim gets only the bare `FAIL … [build failed]`
+summary line — a boundary alone would not separate them from real failures that
+happen to sort later in a `-p=4` interleaved log.
+
+Guard:
+`ci/batch/lib/test_summarize.py::AnalyzeUnitsClassificationTest::test_build_failed_packages_collapse_into_one_infra_item`,
+built from this run's log and asserting both directions (the four build-failed
+packages are not regressions; `internal/wal` still is).
+
+The prevention fix — pinning the batch to a `git worktree` snapshot of the
+recorded sha — remains deferred and is now the resume point for two observed
+recurrences rather than one.
+
 ## D. Summary artifacts
 
 `summary.json` (schema, one object per run):
