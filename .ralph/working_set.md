@@ -33,10 +33,11 @@ Carry-forward #4 — the multibyte probe was where the second bug fell out
 a `char(5)` was a spurious 22001). Any width-semantics slice should carry a
 multibyte row.
 
-Selection context for the next loop (re-verify, do not trust): banner still
-names M0131 first; its two unchecked items (S9, S24) are deferred-with-row,
-M0130 has zero unchecked, M0132/M0133 are explicitly FILED-NOT-PROMOTED. That
-leaves M0119 as the selectable drain, M0119-0006 the largest open cluster.
+Selection context for the next loop (re-verify, do not trust): banner now
+names M0132 first after M-NIGHTLY (user directive 2026-08-13), ahead of M0131
+and M0130's remaining items; M0133 is FILED-NOT-PROMOTED. M0132 is the
+selectable milestone after M-NIGHTLY; M0119 remains the terminal drain
+(M0119-0006 the largest open cluster).
 The binary-`COPY` type chain is now EXHAUSTED — `bpchar` was its last named
 type. Next candidates are the three rows this slice filed (`octet_length` off
 the trimmed image; bare `bpchar` treated as `char(1)`; the trimmed heap image
