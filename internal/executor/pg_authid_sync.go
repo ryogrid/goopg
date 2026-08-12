@@ -60,7 +60,10 @@ func buildAuthidUserRow(oid int64, rolname string, super, canLogin, createDB, cr
 	validUntilDatum := NullDatum
 	if validUntil != "" {
 		if t, err := parseCopyTimestamp(validUntil); err == nil {
-			validUntilDatum = NewTimeDatum(t)
+			// rolvaliduntil is declared `timestamptz` by pgAuthidSyncCols above,
+			// so the type is a compile-time constant here and the datum owes the
+			// tag. M0119-0006 (41st slice).
+			validUntilDatum = NewTimestampTZDatum(t)
 		}
 	}
 	return Row{

@@ -2327,6 +2327,27 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       Q13=35). Deferred (2 ledger rows): the spring-forward gap hour, POSIX zone
       spellings, and the ~40 un-audited `NewTimeDatum` producers. Design:
       `docs/design/0119-0006-timestamptz-cast-text-rendering.md`.
+      **Slice landed 2026-08-12 (41st) — the DOORS a `timestamptz` (and a
+      `date`) comes through, not the renderer**: closes the 40th slice's own
+      residual by auditing all 50 non-test `NewTimeDatum(` sites against one
+      question — is the declared SQL type in reach here? Five had it and were
+      not tagging: `copyBinaryToDatum`, `copyTextToDatum`, BOTH index-key
+      decoder siblings (`decodeIndexKeyColumn` / `decodeBTreeKeyToDatum`, which
+      therefore decoded the same column two different ways in a composite vs a
+      single-column index-only scan) and `pg_authid.rolvaliduntil`, whose column
+      type is a compile-time constant. Untagged, those rendered a timestamptz
+      through `timestamp_out`, so `col::text` denoted a different instant than
+      goopg's own SELECT of the same column while the identical value read from
+      the HEAP rendered correctly. The negative half of the guard found a
+      SECOND, unpredicted divergence one type over: `date`'s behavioural
+      `TimeSubDate` (M0097-0063 — date-only `Format()`, `date + integer`
+      dispatch) is set by the heap decode and by none of the four decoders, so a
+      COPY'd or index-answered date printed `2020-01-01 00:00:00`. Fixed in the
+      same arms. Gates: `timestamptz_origin_tag_test.go` (3 tests, verified red
+      at HEAD with 7 failing sub-cases). 3 ledger rows (the `TimeSubTime`
+      producer gap; the target-type-less `expr.go` paths; the pgoutput suspect
+      RETRACTED — no such site at HEAD). Design:
+      `docs/design/0119-0006-timestamptz-datum-origin-tags.md`.
       **Second slice landed 2026-08-10 — general key decode:** the
       single-int4-key-column restriction is lifted. `btIndexOpClassComparator`
       now walks a composite key column by column (upstream `_bt_compare`'s

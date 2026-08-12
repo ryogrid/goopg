@@ -337,6 +337,17 @@ func copyTextToDatum(t catalog.Type, raw []byte) (Datum, error) {
 		if err != nil {
 			return Datum{}, err
 		}
+		// M0119-0006 (41st slice): the same three-way tag the heap decode applies
+		// (decodeValuePG, codec.go). tsZoneModeForType above already reads t.Name
+		// to decide whether the zone belongs to the VALUE; the subtype records
+		// which type it belonged to, so the type-agnostic renderers agree with
+		// the typed ones. Hard-won Rule #2.
+		switch {
+		case isTimestampTZTypeName(t.Name):
+			return NewTimestampTZDatum(ts), nil
+		case isDateType(t.Name):
+			return NewDateDatum(ts), nil
+		}
 		return NewTimeDatum(ts), nil
 	case "time":
 		ts, err := parseTimeString(string(raw))

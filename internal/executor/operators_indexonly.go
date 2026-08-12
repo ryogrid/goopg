@@ -502,6 +502,13 @@ func decodeIndexKeyColumn(key []byte, col catalog.Column) (Datum, int, error) {
 		}
 		v, err := btree.DecodeTimestamp(key[:8])
 		ts := pgEpoch.Add(time.Duration(v) * time.Microsecond)
+		// The key form is shared but the TYPE is not: an index-only scan answers
+		// the column from the key, so this datum reaches the user in place of the
+		// heap's, and must carry the same subtype the heap decode assigns
+		// (decodeValuePG, codec.go). M0119-0006 (41st slice).
+		if isTimestamptzType(typeName) {
+			return NewTimestampTZDatum(ts), 8, err
+		}
 		return NewTimeDatum(ts), 8, err
 	case isDateType(typeName):
 		// date is encoded as int4 days since the PG epoch. M0118-0001.
@@ -510,7 +517,7 @@ func decodeIndexKeyColumn(key []byte, col catalog.Column) (Datum, int, error) {
 		}
 		v, err := btree.DecodeInt4(key[:4])
 		ts := pgEpoch.Add(time.Duration(v) * 24 * time.Hour)
-		return NewTimeDatum(ts), 4, err
+		return NewDateDatum(ts), 4, err
 	case isNumericType(typeName):
 		// NUMERIC keys are variable-length but self-delimiting, so the
 		// composite walk can consume exactly this column. Value-preserving,
@@ -657,6 +664,12 @@ func decodeBTreeKeyToDatum(key []byte, col catalog.Column) (Datum, error) {
 			return NullDatum, err
 		}
 		ts := pgEpoch.Add(time.Duration(v) * time.Microsecond)
+		// Sibling of decodeIndexKeyColumn's arm above — both must tag, or the
+		// same column decodes one way in a single-column index-only scan and
+		// another way in a composite one. M0119-0006 (41st slice).
+		if isTimestamptzType(typeName) {
+			return NewTimestampTZDatum(ts), nil
+		}
 		return NewTimeDatum(ts), nil
 
 	case isDateType(typeName):
@@ -666,7 +679,7 @@ func decodeBTreeKeyToDatum(key []byte, col catalog.Column) (Datum, error) {
 			return NullDatum, err
 		}
 		ts := pgEpoch.Add(time.Duration(v) * 24 * time.Hour)
-		return NewTimeDatum(ts), nil
+		return NewDateDatum(ts), nil
 
 	default:
 		// Unknown type: attempt float8 decode for user-defined enums. M0097-0022.

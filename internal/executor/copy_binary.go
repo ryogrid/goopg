@@ -214,14 +214,24 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 			return Datum{}, fmt.Errorf("timestamp: expected 8 bytes, got %d", len(payload))
 		}
 		usec := int64(binary.BigEndian.Uint64(payload))
-		return NewTimeDatum(pgEpoch.Add(time.Duration(usec) * time.Microsecond)), nil
+		ts := pgEpoch.Add(time.Duration(usec) * time.Microsecond)
+		// M0119-0006 (41st slice): the column type is in reach here, so this
+		// decoder owes the same subtype tag the heap decode already applies
+		// (decodeValuePG, codec.go) — otherwise a value that entered through
+		// binary COPY renders differently from the identical value that entered
+		// through INSERT, in every type-agnostic path (Datum.Format(),
+		// CAST-to-text, string concat, FK-violation DETAIL). Hard-won Rule #2.
+		if isTimestampTZTypeName(t.Name) {
+			return NewTimestampTZDatum(ts), nil
+		}
+		return NewTimeDatum(ts), nil
 	case "date":
 		if len(payload) != 4 {
 			return Datum{}, fmt.Errorf("date: expected 4 bytes, got %d", len(payload))
 		}
 		days := int32(binary.BigEndian.Uint32(payload))
-		t := pgEpoch.AddDate(0, 0, int(days))
-		return NewTimeDatum(t), nil
+		d := pgEpoch.AddDate(0, 0, int(days))
+		return NewDateDatum(d), nil
 	case "numeric", "decimal":
 		return decodeNumericBinary(payload)
 	default:
