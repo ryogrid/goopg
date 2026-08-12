@@ -1569,6 +1569,7 @@ func mappedLocalCatalogPlaceholderOIDs() []uint32 {
 		2614, // pg_largeobject_metadata
 		2619, // pg_statistic
 		2620, // pg_trigger
+		3256, // pg_policy (M0131-S9.3e — base catalog of the pg_policies view)
 		3381, // pg_statistic_ext
 		3501, // pg_enum (M0106-0010 step 3an)
 		3596, // pg_seclabel

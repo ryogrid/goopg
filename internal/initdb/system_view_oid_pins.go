@@ -162,23 +162,22 @@ func systemViewOIDPins() []systemViewOIDPin {
 		// pg_stat_database 12270, pg_stat_database_conflicts 12275 and
 		// pg_user_mappings 12338.
 		//
-		// NOT pinned, both captured and both under every size ceiling —
-		// ceilings #4 and #5, and like #1..#3 both are gaps in what goopg
-		// BOOTSTRAPS, not in the capture tooling:
-		//
-		//   pg_policies (12018, 12021, reltype 12020, 8 atts). A hosted PG
-		//   fails it with "could not open relation with OID 3256" — pg_policy
-		//   is not an on-disk relation in a goopg cluster at all, so this is
-		//   the first captured blob whose base CATALOG is missing rather than
-		//   its type or operator metadata. (Its `roles` column is also the
-		//   corpus's first `name[]`, which is why 1003 is now canonical in
-		//   pg_type_bootstrap.go.)
+		// ceiling #4 is GONE. pg_policies (12018) was captured by S9.2d and
+		// withheld because a hosted PG failed it with "could not open
+		// relation with OID 3256" — pg_policy was not an on-disk relation in
+		// a goopg cluster at all, the corpus's only blob blocked by a missing
+		// base CATALOG rather than by its type or operator metadata.
+		// M0131-S9.3e bootstraps pg_policy as an empty nailed heap
+		// (relcache_init.go, mappedLocalCatalogPlaceholderOIDs) and pins the
+		// view below. (Its `roles` column is also the corpus's first
+		// `name[]`, which is why 1003 is canonical in pg_type_bootstrap.go.)
 		//
 		// (pg_publication_tables, ceiling #5, was the twin of pg_group's #3 —
 		// "target type is not an array" from ExecInitExprRec's
 		// T_ArrayCoerceExpr arm (execExpr.c:1684-1688) when get_element_type()
 		// found pg_type.typelem = 0, one column over from the typarray literal.
 		// M0131-S9.3c closed both with one population and pins it below.)
+		{"pg_policies", 12018, 12021, 12020, 8},
 		{"pg_rules", 12023, 12026, 12025, 4},
 		{"pg_views", 12028, 12031, 12030, 4},
 		{"pg_tables", 12033, 12036, 12035, 8},

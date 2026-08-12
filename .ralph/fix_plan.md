@@ -4350,6 +4350,38 @@ Theme C — Real PG hosted on goopg evaluates views (closes "goopg cannot host a
       pg_policy 3256), `pg_seclabels` (3596/2995) and `pg_stats_ext_exprs`
       (ceiling #6, pg_type 10029). All three are missing-catalog/missing-type
       slices; the TOAST work is DONE.
+      **S9.3e LANDED 2026-08-12 — ceiling #4 CLOSED, corpus 77 → 78 of 80.**
+      `pg_policy` (3256) is now an EMPTY on-disk nailed catalog: an 8-column
+      `pgPolicyAttrs()` transcribed from `postgres/src/include/catalog/pg_policy.h`
+      plus a `nailedLocalRels` row (`relcache_init.go`) and 3256 in
+      `mappedLocalCatalogPlaceholderOIDs` (`initdb.go`) for the empty 8 KiB heap
+      in base/{1,5}. Both halves are load-bearing and each was proven
+      fail-when-broken by scripted revert (nailed rel removed → the original
+      `could not open relation with OID 3256`; placeholder removed → no
+      `base/1/3256`). `pg_policies` (12018) pinned, the whole 78-view list
+      re-captured — **every other `.dat` blob came back byte-identical**, a free
+      re-run of S8b.2's `--verify` over the whole corpus — and
+      `nailed_view_seed_data.go` regenerated. No pg_type work was needed: all six
+      of pg_policy's column types were already canonical, a first for S9. New
+      guards `internal/initdb/pg_policy_nailed_test.go` (header transcription +
+      the bytes on disk: heap file is one empty page, pg_class relnatts/relkind,
+      all 8 pg_attribute attnames, in BOTH base/1 and base/5).
+      `assertNonCorpusSystemViewIsStillAbsent` re-pointed to `pg_seclabels` —
+      NOT `pg_stats_ext_exprs`, whose failure trips
+      `Assert("OidIsValid(typentry->typrelid)")` (typcache.c:3082) and kills the
+      backend, and an absence guard must fail quietly (F26). 2 ledger rows (F25:
+      indexes 3257/3258 and TOAST 4167/4168 unbootstrapped, inert only while the
+      heap is empty; and the initdb-time-only scope limit, restated because this
+      slice adds a RELATION rather than changing a field). Gates: `internal/initdb`
+      PASS (187 s), `^TestE2E_` family PASS (99 s),
+      `TestE2E_PGColdStartOnGoopgDataDir` PASS (-count=1), UNITS PASS,
+      `go build ./...` + `go vet` clean, pgbench smoke via the hook. Design
+      `0131-0009` §S9.3e + F25/F26.
+      **Remaining after S9.3e: TWO views, one ceiling.** `pg_seclabels` (12099)
+      wants pg_seclabel (3596) + pg_largeobject_metadata (2995) — mechanically
+      THIS slice twice over, and its 35379 B value already toasts cleanly; and
+      `pg_stats_ext_exprs` (12063), ceiling #6, wants a real pg_type row for
+      10029 (pg_statistic's composite rowtype).
       **Next in S9:** two ceilings left, both initdb-bootstrap gaps. The
       `pg_rewrite` TOAST (2838/2839) slice is the critical path — it gates
       EIGHT of the nine remaining views (`pg_indexes`, `pg_stats`,

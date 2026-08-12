@@ -668,6 +668,26 @@ var nailedLocalRels = flattenRels(append([]nailedRel{
 	// (text[] 1009, CATALOG_VARLEN — nullable). pg_user_mapping has
 	// an `oid` system column — attnum 1 = oid.
 	{1418, "pg_user_mapping", 83, 'r', 4, false, pgUserMappingAttrs()},
+	// M0131-S9.3e: pg_policy is the first catalog added because a VIEW needs
+	// it, not because a PG-standby boot step opened it. `pg_policies`
+	// (12018) reads pg_policy in its FROM list, so a hosted PG failed the
+	// view with `could not open relation with OID 3256` — ceiling #4 of the
+	// S9 corpus, the first blocked by a missing base CATALOG rather than by
+	// content inside one (system_view_oid_pins.go). Same construction as
+	// every entry above: a pg_class row plus PG-faithful pg_attribute rows
+	// over an empty 8 KiB heap (3256 joins mappedLocalCatalogPlaceholderOIDs
+	// so base/{1,5}/3256 exist). RelType=83 is safe — pg_policy is not
+	// formrdesc'd (no `PolicyRelation_Rowtype_Id` in PG18 headers; only
+	// pg_database/pg_authid/pg_auth_members/pg_shseclabel/pg_subscription
+	// are, at relcache.c:4075-4083), so the Phase3
+	// `rd_att->tdtypeid == relp->reltype` assertion (relcache.c:4293) does
+	// not fire. Schema per `postgres/src/include/catalog/pg_policy.h`
+	// (PG18, PolicyRelationId == 3256). Indexes 3257/3258 and the TOAST
+	// pair 4167/4168 are deliberately NOT bootstrapped: the heap is empty
+	// in every goopg cluster (goopg has no CREATE POLICY on-disk path), so
+	// a seq scan answers the view and nothing ever needs the index —
+	// ledgered, not assumed.
+	{3256, "pg_policy", 83, 'r', 8, false, pgPolicyAttrs()},
 	// M0106-0010 Step 3dl: pg_stat_wal_receiver — first relkind='v' (view)
 	// entry seeded into the bootstrap pg_class heap. After Steps 3dj/3dk
 	// landed pg_proc OID 3317 (`pg_stat_get_wal_receiver`) with its 15
@@ -3076,6 +3096,30 @@ func pgStatisticExtDataAttrs() []nailedAttr {
 //
 // pg_statistic_ext DOES have an `oid` system column (declared in the CATALOG
 // block as `Oid oid`), so attnum 1 is `oid`. M0106-0010 step 3cd.
+// pgPolicyAttrs returns the 8-column PG18 schema for pg_policy.
+// Source of truth: `postgres/src/include/catalog/pg_policy.h` (PG18,
+// PolicyRelationId == 3256).
+//
+// 5 fixed-width NOT NULL columns (oid, polname, polrelid, polcmd,
+// polpermissive) + 3 CATALOG_VARLEN: polroles (_oid, BKI_FORCE_NOT_NULL —
+// zero means PUBLIC) and the two pg_node_tree quals, both nullable
+// (a policy with no USING/WITH CHECK clause stores NULL there).
+//
+// pg_policy HAS an `oid` system column — attnum 1 is oid.
+// _oid is type OID 1028; pg_node_tree is 194; name 19; char 18; bool 16.
+func pgPolicyAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},             // oid (system column)
+		{Name: "polname", TypeOID: 19, Num: 2, Len: 64, NotNull: true},        // name
+		{Name: "polrelid", TypeOID: 26, Num: 3, Len: 4, NotNull: true},        // oid → pg_class (BKI_LOOKUP)
+		{Name: "polcmd", TypeOID: 18, Num: 4, Len: 1, NotNull: true},          // char (ACL_*_CHR or '*')
+		{Name: "polpermissive", TypeOID: 16, Num: 5, Len: 1, NotNull: true},   // bool
+		{Name: "polroles", TypeOID: 1028, Num: 6, Len: -1, NotNull: true},     // _oid BKI_FORCE_NOT_NULL
+		{Name: "polqual", TypeOID: 194, Num: 7, Len: -1, NotNull: false},      // pg_node_tree
+		{Name: "polwithcheck", TypeOID: 194, Num: 8, Len: -1, NotNull: false}, // pg_node_tree
+	}
+}
+
 func pgStatisticExtAttrs() []nailedAttr {
 	return []nailedAttr{
 		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},           // oid (system column)

@@ -827,6 +827,10 @@ func nailedSystemViewProbeSet() []struct {
 		{"pg_catalog.pg_shadow", "12005"},
 		{"pg_catalog.pg_group", "12010"},
 		{"pg_catalog.pg_user", "12014"},
+		// M0131-S9.3e: adopted once pg_policy (3256) became an on-disk
+		// nailed heap — this view's FROM list opens it, and until then a
+		// hosted PG failed with "could not open relation with OID 3256".
+		{"pg_catalog.pg_policies", "12018"},
 		{"pg_catalog.pg_rules", "12023"},
 		{"pg_catalog.pg_views", "12028"},
 		{"pg_catalog.pg_tables", "12033"},
@@ -1006,13 +1010,21 @@ func assertNailedSystemViewsAreEvaluable(t *testing.T, pg *pgcluster.Cluster, go
 // pg_largeobject_metadata 2995, is the remaining candidate).
 func assertNonCorpusSystemViewIsStillAbsent(t *testing.T, pg *pgcluster.Cluster) {
 	t.Helper()
-	const view = "pg_catalog.pg_policies"
+	// M0131-S9.3e re-pointed this from pg_policies (adopted by that slice,
+	// which bootstrapped pg_policy 3256) to pg_seclabels — one of the two
+	// upstream pg_catalog views still outside the corpus. Its blockers are
+	// pg_seclabel (3596) and pg_largeobject_metadata (2995), neither an
+	// on-disk relation; pg_stats_ext_exprs, the other, is deliberately NOT
+	// used here because its failure mode trips an Assert in typcache.c and
+	// takes the backend (and the rest of this run) down with it.
+	const view = "pg_catalog.pg_seclabels"
 	out, err := pgQueryScalarAllowError(pg, "SELECT * FROM "+view+" LIMIT 0")
 	if err == nil {
 		t.Errorf("hosted PG evaluated %s, which is NOT in the on-disk corpus "+
-			"(nailedSystemViewProbeSet) — either pg_policy (3256) is now an "+
-			"on-disk relation and pg_policies was captured (then add it to the "+
-			"corpus and re-point this probe at the next un-adopted view), or the "+
+			"(nailedSystemViewProbeSet) — either pg_seclabel (3596) and "+
+			"pg_largeobject_metadata (2995) are now on-disk relations and "+
+			"pg_seclabels was pinned (then add it to the corpus and re-point "+
+			"this probe at the next un-adopted view), or the "+
 			"evaluability probe above is passing for a "+
 			"reason unrelated to goopg's seeding. Output: %q", view, strings.TrimSpace(out))
 		return

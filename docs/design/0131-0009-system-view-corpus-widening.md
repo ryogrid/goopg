@@ -1055,6 +1055,82 @@ plus its deliberate fail-when-broken run, whole `^TestE2E_` family PASS (96 s),
 `capture-ev-action.sh --verify` PASS (71/71 byte-identical), `go build ./...` +
 `go vet` clean, UNITS PASS, pgbench smoke via the commit hook.
 
+## Implementation status — S9.3e (2026-08-12)
+
+**Ceiling #4 is closed and it cost one catalog.** `pg_policies` (12018, 5439 B
+— inline, captured by S9.2d and withheld ever since) was the corpus's only view
+blocked by a missing base CATALOG rather than by content inside one: a hosted PG
+failed it with `could not open relation with OID 3256`, because `pg_policy` was
+not an on-disk relation in a goopg cluster at all. goopg has no on-disk
+`CREATE POLICY` path and never will have one for free, so the fix is not to
+populate the catalog — it is to make the EMPTY catalog exist, which is precisely
+what upstream's own bootstrap does for a cluster with no policies.
+
+Landed:
+
+- `pgPolicyAttrs()` + `{3256, "pg_policy", 83, 'r', 8, false, …}` in
+  `nailedLocalRels` (`internal/initdb/relcache_init.go`), transcribed from
+  `postgres/src/include/catalog/pg_policy.h`: five fixed-width NOT NULL columns
+  (oid, polname, polrelid, polcmd, polpermissive) plus `polroles` (`_oid` 1028,
+  BKI_FORCE_NOT_NULL — zero means PUBLIC) and the two nullable `pg_node_tree`
+  quals. All six type OIDs were already canonical in `pg_type_bootstrap.go`, so
+  no pg_type work was needed — the first S9 slice for which that is true.
+- `3256` added to `mappedLocalCatalogPlaceholderOIDs()`
+  (`internal/initdb/initdb.go`), which lays down the empty 8 KiB heap in
+  `base/1` and `base/5`. Both halves are required and neither is sufficient:
+  removing the nailed rel reproduces the original `could not open relation with
+  OID 3256`; removing the placeholder leaves a pg_class row pointing at a file
+  that does not exist.
+- `{"pg_policies", 12018, 12021, 12020, 8}` pinned in
+  `internal/initdb/system_view_oid_pins.go`, the whole 78-view pinned list
+  re-captured with `scripts/capture-ev-action.sh`, and
+  `nailed_view_seed_data.go` regenerated. **Every other `.dat` blob came back
+  byte-identical** — the run is a free re-execution of S8b.2's `--verify`
+  acceptance over the whole corpus, on a freshly initdb'd PG 18.3.
+
+`RelType=83` is safe for the same reason it is for the other ~40 local
+catalogs: `pg_policy` is not formrdesc'd (no `PolicyRelation_Rowtype_Id` in the
+PG18 headers; only pg_database / pg_authid / pg_auth_members / pg_shseclabel /
+pg_subscription are, at `relcache.c:4075-4083`), so the Phase-3
+`rd_att->tdtypeid == relp->reltype` assertion (`relcache.c:4293`) does not fire.
+
+### Findings — S9.3e
+
+**F25 — an empty catalog needs no index.** `pg_policy.h` declares two indexes
+(3257 `pg_policy_oid_index`, 3258 `pg_policy_polrelid_polname_index`) and a
+TOAST pair (4167/4168); none is bootstrapped. The view's scan of an empty heap
+is answered by a seq scan, and nothing in `RelationBuildDesc` demands an index
+that no `pg_index` row claims. This is a real scope limit, not an oversight —
+the moment goopg grows an on-disk `CREATE POLICY`, the indexes become
+mandatory (`CatalogTupleInsert` maintains every index `RelationGetIndexList`
+returns) and so does the TOAST pair for a long `polqual`. Ledgered.
+
+**F26 — the corpus's absence probe had to move, and only one candidate was
+safe.** `assertNonCorpusSystemViewIsStillAbsent` was pointed at `pg_policies`;
+with the view adopted it now reads `pg_seclabels`. `pg_stats_ext_exprs`, the
+only other un-adopted view, is deliberately NOT used: its failure mode trips
+`Assert("OidIsValid(typentry->typrelid)")` in `typcache.c:3082` and takes the
+backend down, which per S20.2b's experience kills the rest of the probe run.
+An "is it still absent?" guard must fail QUIETLY.
+
+**Ceilings after S9.3e: one, and it is ceiling #6.** The on-disk `pg_catalog`
+corpus is **78 of upstream's 80**. What remains is two views and two distinct
+bootstrap gaps, neither about size and neither about the capture tooling:
+`pg_seclabels` (12099) needs `pg_seclabel` (3596) and
+`pg_largeobject_metadata` (2995) as on-disk relations — mechanically the same
+slice as this one, twice over, and its 35379 B value already toasts cleanly
+since S20.2b; `pg_stats_ext_exprs` (12063) needs a real `pg_type` row for
+**10029**, the composite rowtype of `pg_statistic`, which is the only remaining
+ceiling that is about a catalog's own rowtype. Then S9.4
+(`information_schema`, 65 views, expected to defer), whose selection procedure
+is the complement query recorded under S9.3d.
+
+Gates: `internal/initdb` PASS (187 s), `TestE2E_PGColdStartOnGoopgDataDir` PASS
+plus two deliberate fail-when-broken runs (nailed rel removed → the original
+`could not open relation with OID 3256`; placeholder OID removed → no
+`base/1/3256`), whole `^TestE2E_` family PASS (99 s), `go build ./...` + `go
+vet` clean, UNITS PASS, pgbench smoke via the commit hook.
+
 ## References
 
 - M0131 implementation plan §S9, `docs/design/0131-bidirectional-cluster-dir-coldstart-and-system-views.md`

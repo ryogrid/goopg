@@ -42,6 +42,15 @@ attr	pg_user	6	usebypassrls	16	1	f	f
 attr	pg_user	7	passwd	25	-1	f	f
 attr	pg_user	8	valuntil	1184	8	f	f
 attr	pg_user	9	useconfig	1009	-1	f	f
+rel	pg_policies	12018	12018	12021	12020	2249	v	8
+attr	pg_policies	1	schemaname	19	64	f	f
+attr	pg_policies	2	tablename	19	64	f	f
+attr	pg_policies	3	policyname	19	64	f	f
+attr	pg_policies	4	permissive	25	-1	f	f
+attr	pg_policies	5	roles	1003	-1	f	f
+attr	pg_policies	6	cmd	25	-1	f	f
+attr	pg_policies	7	qual	25	-1	f	f
+attr	pg_policies	8	with_check	25	-1	f	f
 rel	pg_rules	12023	12023	12026	12025	2249	v	4
 attr	pg_rules	1	schemaname	19	64	f	f
 attr	pg_rules	2	tablename	19	64	f	f
