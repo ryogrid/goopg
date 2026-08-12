@@ -321,17 +321,20 @@ func TestE2E_PGColdStartOnGoopgDataDir(t *testing.T) {
 	// truncates the log on Start and allocates it as a sibling of the data dir,
 	// so the scan covers exactly this attach and nothing else.
 	//
-	// It runs HERE rather than at the end because the remaining probe is
-	// destructive by construction: it locks in a measured gap whose current
-	// behaviour is a backend PANIC, which necessarily writes to this log and
-	// takes the postmaster with it. Guard 4 has to see the log before the
-	// known damage, not after. (Until M0131-S13 the proconfig probe was a
-	// second destructive one; it is now a plain assertion run above, inside
-	// the row-content reads.)
+	// It runs HERE rather than at the end because the remaining probe USED to
+	// be destructive by construction: it locked in a measured gap whose
+	// behaviour was a backend PANIC, which necessarily wrote to this log and
+	// took the postmaster with it. That gap is fixed (M0131-S15), so the last
+	// probe is now an ordinary read — but Guard 4 stays here so that a
+	// REGRESSION of it is reported by the probe's own specific message rather
+	// than as an opaque "FATAL in the log". (Until M0131-S13 the proconfig
+	// probe was a second destructive one; it is now a plain assertion run
+	// above, inside the row-content reads.)
 	assertNoFatalInPGLog(t, pgLogPathFor(goopgDir))
 
-	// DESTRUCTIVE PROBE — nothing may follow this.
-	assertGoopgCreatedDatabaseStillUnopenableByPG(t, repo, pg, goopgDir, wantOther)
+	// A database goopg minted at RUNTIME with CREATE DATABASE — the last of
+	// the four findings this test originally measured (M0131-S15).
+	assertHostedPGReadsGoopgCreatedDatabase(t, repo, pg, goopgDir, wantOther)
 }
 
 // pgLogPathFor mirrors pgcluster's default LogPath allocation (a `pg.log`
@@ -453,31 +456,36 @@ func assertHostedPGCanSort(t *testing.T, pg *pgcluster.Cluster, goopgDir string)
 	}
 }
 
-// assertGoopgCreatedDatabaseStillUnopenableByPG locks in the fourth finding.
+// assertHostedPGReadsGoopgCreatedDatabase is the S15.4 INVERSION of the former
+// assertGoopgCreatedDatabaseStillUnopenableByPG: the fourth finding this test
+// measured is FIXED (M0131-S15, 2026-08-12), so the probe now asserts success.
 //
-// A database goopg minted at RUNTIME with `CREATE DATABASE` cannot be connected
-// to by the hosted PG at all:
+// A database goopg minted at RUNTIME with `CREATE DATABASE` used to be
+// unconnectable by the hosted PG at all:
 //
 //	psql: connection to server … failed: PANIC: could not open critical system index 2662
 //
 // 2662 is pg_class_oid_index. `RelationCacheInitializePhase3`
 // (postgres/src/backend/utils/cache/relcache.c) nails and opens a small set of
 // critical indexes during InitPostgres, and a failure there is a PANIC, not an
-// ERROR — so the whole cluster goes down with the connection attempt.
+// ERROR — so the whole cluster went down with the connection attempt.
 //
-// This is a scope statement about goopg's CREATE DATABASE, not about the cold
-// start: the `postgres` database in the SAME directory serves every assertion
-// above correctly. initdb lays down base/1 and base/5 with real bootstrapped
-// btree content (internal/initdb/btree_index_bootstrap.go writes each index
-// into base/1 AND base/5); the runtime CREATE DATABASE path clones what goopg
-// itself needs, and goopg reads its catalogs without those indexes, so nothing
-// in the goopg-only world notices.
+// Diagnosis (measured). It was never about the runtime path's catalog cloning:
+// CREATE DATABASE copies template0's whole on-disk image
+// (initdb.copyBootstrapCatalogImage), and template0 itself was the stale one.
+// bootstrapPostgresDatabase materialised base/4 EARLY — from a base/1 that the
+// btree bulk-loaders had not yet populated — and then stamped metapage-only
+// placeholders over its index files, so every runtime database inherited a
+// 1-page, leaf-less pg_class_oid_index while base/{1,5} carried the real one.
+// The fix is `initdb.refreshTemplate0Image`, which re-clones base/4 from the
+// finished base/5 at the END of initdb, matching upstream's own ordering
+// (initdb.c make_template0 creates template0 from a fully bootstrapped
+// template1, which is why a real cluster's base/4 == base/1 byte for byte).
 //
-// Filed as M0131-S15 with a deferral-ledger row. When S15 lands, this assertion
-// FAILS — invert it then to a direct equality against goopgAnswer.
-//
-// DESTRUCTIVE: the PANIC terminates the postmaster.
-func assertGoopgCreatedDatabaseStillUnopenableByPG(t *testing.T, repo string, pg *pgcluster.Cluster, dataDir, goopgAnswer string) {
+// Kept as the LAST probe in the test even though it is no longer destructive:
+// its position is what makes Guard 4's "no FATAL in the log" scan meaningful
+// for everything above it.
+func assertHostedPGReadsGoopgCreatedDatabase(t *testing.T, repo string, pg *pgcluster.Cluster, dataDir, goopgAnswer string) {
 	t.Helper()
 	pgOther, err := pgcluster.OpenExisting("m0131-s4-pg-other", pgcluster.Options{
 		RepoRoot: repo,
@@ -490,16 +498,18 @@ func assertGoopgCreatedDatabaseStillUnopenableByPG(t *testing.T, repo string, pg
 		t.Fatalf("pgcluster.OpenExisting (s4other handle): %v", err)
 	}
 	out, err := pgQueryScalarAllowError(pgOther, "SELECT payload FROM public.s4_other_rows WHERE id = 1")
-	if err == nil {
-		t.Fatalf("the hosted PG can now read inside a goopg-CREATE DATABASE-minted database "+
-			"(got %q, goopg said %q) — M0131-S15 has landed. INVERT this assertion to a "+
-			"direct equality and delete this helper "+
-			"(docs/design/0131-0004-forward-coldstart-e2e.md §Findings)",
-			strings.TrimSpace(out), goopgAnswer)
+	if err != nil {
+		if strings.Contains(out, "could not open critical system index") {
+			t.Fatalf("M0131-S15 REGRESSED: the hosted PG PANICs again on a critical system "+
+				"index inside a goopg-CREATE DATABASE-minted database — template0's on-disk "+
+				"image (base/4) is stale again, see initdb.refreshTemplate0Image and its "+
+				"guard TestTemplate0ImageMatchesPostgresDatabase.\n%s", out)
+		}
+		t.Fatalf("hosted PG read inside the goopg-created database s4other failed: %v\n%s", err, out)
 	}
-	if !strings.Contains(out, "could not open critical system index") {
-		t.Fatalf("connecting to the goopg-created database failed, but NOT through the known "+
-			"missing-critical-index gap (M0131-S15) — this is something else:\n%s", out)
+	if got := strings.TrimSpace(out); got != goopgAnswer {
+		t.Fatalf("hosted PG read inside the goopg-created database s4other = %q, goopg said %q",
+			got, goopgAnswer)
 	}
 }
 

@@ -472,6 +472,42 @@ func copyBootstrapCatalogImage(dataDir string, dbOID uint32) error {
 	return nil
 }
 
+// refreshTemplate0Image overwrites base/4 (template0) with the finished
+// base/5 (`postgres`) image, file by file, at the END of initdb — after every
+// heap/btree bootstrapper and the relcache init-file generator have run
+// (M0131-S15).
+//
+// Why base/5 and not base/1: the two are byte-identical for every file they
+// share, but base/5 additionally carries pg_filenode.map and the per-database
+// placeholder files for the shared indexes, which base/4 already has and must
+// keep. Copying the superset therefore leaves no file in base/4 older than its
+// base/5 twin. PG_VERSION is skipped because CreatePerDatabaseScaffolding and
+// bootstrapPostgresDatabase each write it themselves.
+//
+// This runs BEFORE stampClusterChecksums, so a `-k` cluster checksums the
+// refreshed pages rather than the stale ones, and before the trailing fsync.
+func refreshTemplate0Image(dataDir string) error {
+	srcDir := filepath.Join(dataDir, "base", strconv.FormatUint(uint64(catalog.PostgresDBOid), 10))
+	dstDir := filepath.Join(dataDir, "base", strconv.FormatUint(uint64(template0DbOid), 10))
+	entries, err := os.ReadDir(srcDir)
+	if err != nil {
+		return fmt.Errorf("read postgres image: %w", err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || e.Name() == "PG_VERSION" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(srcDir, e.Name()))
+		if err != nil {
+			return fmt.Errorf("read postgres %s: %w", e.Name(), err)
+		}
+		if err := os.WriteFile(filepath.Join(dstDir, e.Name()), data, 0o600); err != nil {
+			return fmt.Errorf("write template0 %s: %w", e.Name(), err)
+		}
+	}
+	return nil
+}
+
 // RemovePerDatabaseScaffolding removes base/<dbOID>/ (the symmetric
 // counterpart to CreatePerDatabaseScaffolding), called by DROP DATABASE
 // (internal/server) and its WAL-replay recovery path once the drop is
@@ -1326,6 +1362,22 @@ func Init(opts Options) error {
 	// can start from a goopg backup without PANIC on critical indexes.
 	if err := bootstrapRelcacheInitFiles(abs); err != nil {
 		return fmt.Errorf("goopg init: relcache init files: %w", err)
+	}
+	// M0131-S15: re-materialise template0 (base/4) from the finished
+	// `postgres` image (base/5) now that every bootstrapper has run.
+	// bootstrapPostgresDatabase built base/4 EARLY — before the populated
+	// btrees existed — and then stamped empty placeholders over its index
+	// files, so template0 carried 1-page metapage-only stubs where base/{1,5}
+	// carry the real bulk-loaded content. Runtime CREATE DATABASE clones
+	// base/4 (copyBootstrapCatalogImage), so every runtime-minted database
+	// inherited those stubs and a hosted PG PANICked with "could not open
+	// critical system index 2662" during InitPostgres. Upstream has the same
+	// ordering: initdb bootstraps template1 in full and only THEN makes
+	// template0 a directory-level clone of it (initdb.c make_template0 →
+	// `CREATE DATABASE template0 … STRATEGY = file_copy`), which is why a real
+	// cluster's base/4 is byte-identical to base/1.
+	if err := refreshTemplate0Image(abs); err != nil {
+		return fmt.Errorf("goopg init: template0 image: %w", err)
 	}
 	// Generate and persist the cluster system identifier (M0101-0001).
 	// Used as xlp_sysid in PG-compatible WAL page headers.
