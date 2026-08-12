@@ -1334,6 +1334,55 @@ Deliberately unchanged: `replayInitedXLogBlock` (WILL_INIT / RBM_ZERO callers �
 they must still extend) and the "invalid lp"-class refusals inside the apply
 callbacks, which are corrupt-record errors, not missing-page ones.
 
+### S23 — implementation notes: the cheap tail (landed 2026-08-12)
+
+The four rmgrs above `RM_SEQ_ID` that goopg will never emit and a real PG can.
+Before S16 the first one of them in a crash tail made every **later** record
+invisible (rmid > the decoder's structural bound → the reader called it
+end-of-WAL); S16 made them decode and be refused, and this slice gives each a
+real arm.
+
+| rmid | arm | why that is the whole correct behaviour |
+|---|---|---|
+| 21 `RM_LOGICALMSG` | no-op | `logicalmsg_redo` (`message.c:83-97`) has an **empty body** — "Redo is basically just noop for logical decoding messages." Byte-exact parity, not an approximation. |
+| 19 `RM_REPLORIGIN` | no-op (SET + DROP) | `replorigin_redo` mutates only the in-shmem `replication_states` array; the durable copy is `pg_logical/replorigin_checkpoint`. goopg has no apply worker, hence no consumer and no checkpoint of its own to keep in step. |
+| 20 `RM_GENERIC` | **ported** `generic_redo` | The only missing rmgr implementable *completely* with zero AM knowledge: the record is an opaque `(offset,length,bytes)` byte diff. |
+| 18 `RM_COMMIT_TS` | conditional | No-op with `track_commit_timestamp` off (the default, and the only value goopg's checkpointer writes); a **loud refusal naming the GUC** when the crashed cluster's `pg_control` has it on. |
+
+Two decisions inside that table are the substance.
+
+**RM_GENERIC's hole.** `applyGenericPageDelta` is upstream's `applyPageRedo`
+plus the `memset(page + pd_lower, 0, pd_upper - pd_lower)` `generic_redo` does
+immediately after it. That memset is easy to read as hygiene and it is not:
+`GenericXLogFinish` diffs a page whose hole is **already** zeroed and therefore
+never logs a byte inside it, so a redo that leaves the pre-image's stale hole
+bytes in place produces a page that differs from the primary's byte for byte —
+invisible to every query, fatal to a checksum or `wal_consistency_checking`.
+The guard asserts it directly by dirtying the hole with `0xAB` first. The port
+also adds the bounds checks upstream can omit because it trusts its own writer
+(goopg's record may come from any PG build): a truncated triple and a chunk
+running past the end of the page are corrupt records, not pages to smash.
+
+**RM_COMMIT_TS is conditional rather than flat.** Neither of its two opcodes
+carries a commit timestamp — the timestamps ride `xact_redo_commit`'s
+`xl_xact_commit` payload. These records only maintain the `pg_commit_ts` SLRU's
+physical extent. With tracking off there is no such SLRU content to be
+inconsistent with and any straggler record from a since-disabled window is moot.
+With tracking **on**, skipping silently would leave a `pg_commit_ts` whose
+segments do not match the XID range the cluster believes is tracked, and a later
+PG start on the same directory would read a page `SimpleLruReadPage` expects to
+exist. A half implementation there is worse than a refusal an operator can act
+on, so the message names the GUC.
+
+Both no-op arms keep the rmgr's `default:` refusal: recognising a resource
+manager must not turn it into a silent sink. `RM_GENERIC` has *no* opcode space
+at all (`XLogInsert(RM_GENERIC_ID, 0)`, `generic_xlog.c:399`, and `generic_redo`
+never reads `xl_info`), so a non-zero info there is a corrupt or future record
+and is refused on the same grounds.
+
+`TestReplayRefusesPGOnlyRmgr` (the S16.1 guard) shrank to SPGist + BRIN
+accordingly; the four rmgrs it used to cover now have to be *accepted*.
+
 ## Guards
 
 1. Per-opcode unit tests over fixtures captured from a real PG 18.3 via
@@ -1378,7 +1427,16 @@ callbacks, which are corrupt-record errors, not missing-page ones.
    `redoExistingHeapPageForBlock`, which fails all three.
 12. The S28 reverse crash E2E (`0131-0017`) with the full opcode workload: COPY,
    VACUUM, `SELECT … FOR UPDATE`, TRUNCATE, SAVEPOINT, index-heavy insert.
-13. UNITS + RACE (`internal/wal`, `internal/initdb`) + SMOKE + SPOT green.
+13. S23: each defined opcode of RM_LOGICALMSG / RM_REPLORIGIN / RM_COMMIT_TS
+   replays as a recognised no-op (`applied=false`, no error) while an
+   **undefined** opcode in the same rmgr still refuses — both halves asserted,
+   since an arm that accepts everything is the failure mode. `RM_GENERIC`
+   applies its delta, ZEROES the pd_lower..pd_upper hole (proven
+   fail-when-broken by deleting the memset, which leaves the `0xAB` bytes the
+   test seeded), skips an absent page per S21f, and refuses an out-of-bounds
+   chunk. `RM_COMMIT_TS` refuses with a message naming `track_commit_timestamp`
+   when `pg_control` has it on.
+14. UNITS + RACE (`internal/wal`, `internal/initdb`) + SMOKE + SPOT green.
 
 ## References
 

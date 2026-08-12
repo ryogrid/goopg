@@ -2495,6 +2495,56 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 		default:
 			return false, unsupportedDecodedXLogRecord(r)
 		}
+	case RmgrLogicalMessage:
+		switch xlog.Header.Info & XLRRmgrInfoMask {
+		case xlogLogicalMessage:
+			// M0131-S23. A recognised no-op here is BYTE-EXACT parity, not an
+			// approximation: upstream's logicalmsg_redo
+			// (postgres/src/backend/replication/logical/message.c:83-97) has an
+			// empty body under the comment "Redo is basically just noop for
+			// logical decoding messages." The payload exists only for a logical
+			// decoder reading the WAL stream; nothing in it reaches a page.
+			//
+			// It matters because a single `pg_logical_emit_message()` in a
+			// crashed PG's tail used to make the whole rest of that tail
+			// invisible (S16: rmid 21 exceeded the decoder's structural bound
+			// and the reader called it end-of-WAL).
+			return false, nil
+		default:
+			return false, unsupportedDecodedXLogRecord(r)
+		}
+	case RmgrReplicationOrigin:
+		switch xlog.Header.Info & XLRRmgrInfoMask {
+		case xlogReplOriginSet, xlogReplOriginDrop:
+			// M0131-S23. replorigin_redo (origin.c) mutates exactly one thing:
+			// the in-shmem `replication_states` array — SET calls
+			// replorigin_advance(..., wal_log=false) and DROP clears the
+			// matching slot. Both are pure memory; the durable copy lives in
+			// pg_logical/replorigin_checkpoint, written at checkpoint time.
+			//
+			// goopg has no logical-replication apply worker, hence no consumer
+			// for that state and no replorigin_checkpoint of its own to keep in
+			// step, so a documented no-op is the whole correct behaviour here
+			// rather than a shortcut. If goopg ever grows an apply worker, this
+			// arm has to grow with it (ledger row) — replaying a subscription's
+			// tail without advancing its origin would re-apply changes.
+			return false, nil
+		default:
+			return false, unsupportedDecodedXLogRecord(r)
+		}
+	case RmgrGeneric:
+		// M0131-S23. RM_GENERIC_ID has no opcode space: GenericXLogFinish
+		// inserts with info 0 (generic_xlog.c:399) and generic_redo never reads
+		// xl_info, so a non-zero info is a corrupt or future record.
+		if xlog.Header.Info&XLRRmgrInfoMask != xlogGenericInfo {
+			return false, unsupportedDecodedXLogRecord(r)
+		}
+		if err := replayDecodedXLogGeneric(mgr, r, xlog); err != nil {
+			return false, err
+		}
+		return true, nil
+	case RmgrCommitTs:
+		return replayDecodedXLogCommitTs(mgr, r, xlog)
 	case RmgrRelMap:
 		switch xlog.Header.Info & XLRRmgrInfoMask {
 		case xlogRelmapUpdate:
@@ -3063,6 +3113,139 @@ func replayXLogParameterChange(mgr *storage.Manager, xlog *XLogDecodedRecord) (b
 		return false, fmt.Errorf("wal: XLOG_PARAMETER_CHANGE: %w", err)
 	}
 	return true, nil
+}
+
+// replayDecodedXLogGeneric applies an RM_GENERIC_ID record, mirroring
+// generic_redo + applyPageRedo (generic_xlog.c:451-533). M0131-S23.
+//
+// RM_GENERIC is the one missing rmgr that can be implemented COMPLETELY with
+// zero access-method knowledge: GenericXLogFinish computes a byte-level diff of
+// the before/after page images and logs it as an opaque run of
+// (offset uint16, length uint16, bytes[length]) triples, so redo is a
+// memcpy loop. Only extensions (contrib/bloom, third-party AMs) emit these
+// records, which is why the arm is cheap rather than urgent — but "cheap and
+// exactly right" beats a refusal that would stop an otherwise-startable
+// cluster.
+//
+// Two details of upstream's loop are load-bearing and easy to drop:
+//
+//   - the "hole" between pd_lower and pd_upper is zeroed AFTER the delta is
+//     applied. GenericXLogFinish diffs the page with the hole already zeroed
+//     (it never logs bytes inside it), so a redo that leaves the pre-image's
+//     stale hole bytes in place produces a page that differs from the primary's
+//     byte for byte — invisible to queries, fatal to a checksum or a
+//     wal_consistency_checking comparison.
+//   - a block carrying a full-page image is RESTORED, not deltaed: upstream's
+//     XLogReadBufferForRedo returns BLK_RESTORED and skips the apply entirely.
+//     Applying a delta computed against the pre-image on top of the restored
+//     post-image page would double-apply it.
+func replayDecodedXLogGeneric(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
+	if len(xlog.Blocks) == 0 {
+		return fmt.Errorf("wal: xlog generic: record has no block references")
+	}
+	for i, block := range xlog.Blocks {
+		if block.HasImage && block.ImageApply {
+			if err := restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN)); err != nil {
+				return fmt.Errorf("wal: xlog generic block %d: %w", i, err)
+			}
+			continue
+		}
+		page, skip, err := redoExistingHeapPageForBlock(mgr, block, storage.LSN(r.EndLSN))
+		if err != nil {
+			return fmt.Errorf("wal: xlog generic block %d: %w", i, err)
+		}
+		if skip {
+			continue
+		}
+		if err := applyGenericPageDelta(page, block.Data); err != nil {
+			return fmt.Errorf("wal: xlog generic block %d: %w", i, err)
+		}
+		storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
+		if err := mgr.WriteBlock(block.Rel, block.Block, page); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// applyGenericPageDelta is upstream's applyPageRedo (generic_xlog.c:451-472)
+// plus the hole-zeroing generic_redo does right after it, and the bounds checks
+// upstream can omit because it trusts its own writer.
+func applyGenericPageDelta(page storage.Page, delta []byte) error {
+	for off := 0; off < len(delta); {
+		if len(delta)-off < 4 {
+			return fmt.Errorf("truncated delta header at byte %d of %d", off, len(delta))
+		}
+		start := int(binary.LittleEndian.Uint16(delta[off:]))
+		length := int(binary.LittleEndian.Uint16(delta[off+2:]))
+		off += 4
+		if len(delta)-off < length {
+			return fmt.Errorf("truncated delta chunk at byte %d: want %d bytes, have %d", off, length, len(delta)-off)
+		}
+		if start+length > len(page) {
+			return fmt.Errorf("delta chunk [%d,%d) is outside the page", start, start+length)
+		}
+		copy(page[start:start+length], delta[off:off+length])
+		off += length
+	}
+	hdr := storage.MustHeader(page)
+	lower, upper := int(hdr.Lower()), int(hdr.Upper())
+	if lower > upper || upper > len(page) {
+		return fmt.Errorf("delta produced an inconsistent page (pd_lower=%d pd_upper=%d)", lower, upper)
+	}
+	for i := lower; i < upper; i++ {
+		page[i] = 0
+	}
+	return nil
+}
+
+// replayDecodedXLogCommitTs handles RM_COMMIT_TS_ID. M0131-S23.
+//
+// The rmgr has exactly two opcodes and NEITHER carries a commit timestamp: the
+// timestamps themselves ride xact_redo_commit's xl_xact_commit payload. These
+// two records only maintain the pg_commit_ts SLRU's physical extent (ZEROPAGE
+// allocates the next page; TRUNCATE drops segments below oldestCommitTsXid) —
+// state goopg does not have, because it neither stores commit timestamps nor
+// even registers the track_commit_timestamp GUC.
+//
+// So the arm is conditional rather than a flat no-op. With tracking OFF — the
+// PG default, and the only configuration goopg's own checkpointer writes into
+// pg_control — a cluster cannot have meaningful pg_commit_ts content, any
+// straggler record from a since-disabled window is moot, and no-oping is
+// correct. With tracking ON in the crashed cluster's pg_control, silently
+// skipping would leave a pg_commit_ts directory whose segments do not match the
+// XID range the cluster believes is tracked; a later PG restart on the same
+// directory would then read a page SimpleLruReadPage expects to exist. Refuse
+// loudly and name the GUC instead — a half implementation here is worse than a
+// refusal an operator can act on.
+func replayDecodedXLogCommitTs(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) (bool, error) {
+	switch xlog.Header.Info & XLRRmgrInfoMask {
+	case xlogCommitTsZeroPage, xlogCommitTsTruncate:
+	default:
+		return false, unsupportedDecodedXLogRecord(r)
+	}
+	if commitTimestampsTracked(mgr) {
+		return false, fmt.Errorf("%w: %s (track_commit_timestamp is on in pg_control, but goopg has no "+
+			"pg_commit_ts SLRU; restart the cluster under PostgreSQL with track_commit_timestamp=off, "+
+			"or start it with PostgreSQL)",
+			ErrUnsupportedRecord, unsupportedDecodedXLogRecord(r))
+	}
+	return false, nil
+}
+
+// commitTimestampsTracked reports whether the cluster being recovered has
+// track_commit_timestamp on, per its pg_control. A manager without a data
+// directory (test stubs) reports false: there is no pg_commit_ts to be
+// inconsistent with.
+func commitTimestampsTracked(mgr *storage.Manager) bool {
+	if mgr == nil || mgr.DataDir() == "" {
+		return false
+	}
+	cd, err := control.ReadControlFile(mgr.DataDir())
+	if err != nil || cd == nil {
+		return false
+	}
+	return cd.TrackCommitTimestamp
 }
 
 // requireFullPageImages reports an ErrUnsupportedRecord unless EVERY block

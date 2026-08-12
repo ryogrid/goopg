@@ -83,8 +83,16 @@ func TestReadAllPageAwareKeepsRecordsAfterPGOnlyRmgr(t *testing.T) {
 // refuses, and that error already rides ReplayRecords → initdb.Open → a
 // non-zero exit (design §"The caller chain, end to end"). Fail-closed: goopg
 // says "I cannot replay this", never "replayed, all good".
+//
+// M0131-S23 narrowed the list to the two INDEX-AM rmgrs. RM_COMMIT_TS (18),
+// RM_REPLORIGIN (19), RM_GENERIC (20) and RM_LOGICALMSG (21) now have real
+// arms — three documented no-ops and one full `generic_redo` port — so
+// refusing them would be the defect, not the guard. Their own coverage
+// (recognised opcodes applied, UNDEFINED opcodes still refused) is in
+// redo_cheap_tail_pg_test.go. SPGist/BRIN stay here until S25 gives them a
+// refusal that names the access method.
 func TestReplayRefusesPGOnlyRmgr(t *testing.T) {
-	for _, rmid := range []Rmgr{RmgrSPGist, RmgrBrin, RmgrCommitTs, RmgrReplicationOrigin, RmgrGeneric, RmgrLogicalMessage} {
+	for _, rmid := range []Rmgr{RmgrSPGist, RmgrBrin} {
 		rec := encodeTestPGRecordRmid(t, rmid, 0x00, []byte{9})
 		decoded, err := decodeRecordXLogDetailed(rec)
 		if err != nil {

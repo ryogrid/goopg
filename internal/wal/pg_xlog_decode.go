@@ -228,6 +228,30 @@ const (
 	// hands out the first XID of a fresh page. M0131-S21a-2 part 5.
 	xlogClogZeroPage uint8 = 0x00
 
+	// M0131-S23 — "the cheap tail": the four rmgrs above RM_SEQ_ID that a real
+	// PG can emit and goopg never will. Named so replayDecodedXLogRecord can
+	// recognise each opcode explicitly and keep refusing anything outside the
+	// list, rather than refusing the whole rmgr.
+
+	// RM_LOGICALMSG_ID (21), replication/message.h:32. Its single opcode;
+	// logicalmsg_redo (message.c:83-97) has an EMPTY body.
+	xlogLogicalMessage uint8 = 0x00
+
+	// RM_REPLORIGIN_ID (19) info codes (replication/origin.h:33-34).
+	// replorigin_redo touches only the in-shmem replication_states array.
+	xlogReplOriginSet  uint8 = 0x00 // XLOG_REPLORIGIN_SET
+	xlogReplOriginDrop uint8 = 0x10 // XLOG_REPLORIGIN_DROP
+
+	// RM_GENERIC_ID (20) has NO opcode space at all: GenericXLogFinish calls
+	// XLogInsert(RM_GENERIC_ID, 0) (generic_xlog.c:400) and generic_redo
+	// (generic_xlog.c:477-533) never reads xl_info. A non-zero info is
+	// therefore a corrupt or future record, not an opcode we do not know.
+	xlogGenericInfo uint8 = 0x00
+
+	// RM_COMMIT_TS_ID (18) info codes (access/commit_ts.h:20-21).
+	xlogCommitTsZeroPage uint8 = 0x00 // COMMIT_TS_ZEROPAGE
+	xlogCommitTsTruncate uint8 = 0x10 // COMMIT_TS_TRUNCATE
+
 	bkpBlockForkMask byte = 0x0F
 	bkpBlockHasImage byte = 0x10
 	bkpBlockHasData  byte = 0x20
