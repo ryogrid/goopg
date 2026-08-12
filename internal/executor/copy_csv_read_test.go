@@ -115,11 +115,11 @@ func TestDecodeCopyCsvRowFieldCount(t *testing.T) {
 		{Name: "a", Type: catalog.Type{Name: "text"}},
 		{Name: "b", Type: catalog.Type{Name: "text"}},
 	}
-	if _, err := DecodeCopyCsvRow([]byte("x,y,z"), cols, csv); err == nil ||
+	if _, err := DecodeCopyCsvRow([]byte("x,y,z"), cols, csv, ""); err == nil ||
 		err.Error() != "extra data after last expected column" {
 		t.Fatalf("extra-column err=%v", err)
 	}
-	if _, err := DecodeCopyCsvRow([]byte("onlyone"), cols, csv); err == nil ||
+	if _, err := DecodeCopyCsvRow([]byte("onlyone"), cols, csv, ""); err == nil ||
 		err.Error() != `missing data for column "b"` {
 		t.Fatalf("missing-column err=%v", err)
 	}

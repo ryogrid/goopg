@@ -102,7 +102,7 @@ func TestCopyTextArrayRoundTripsThroughItsOwnOutput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EncodeCopyTextRow: %v", err)
 	}
-	back, err := DecodeCopyTextRow([]byte(strings.TrimSuffix(string(line), "\n")), cols, `\N`)
+	back, err := DecodeCopyTextRow([]byte(strings.TrimSuffix(string(line), "\n")), cols, `\N`, "")
 	if err != nil {
 		t.Fatalf("DecodeCopyTextRow: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestCopyTextArrayTextReachesTheEncoder(t *testing.T) {
 	for i, c := range cols {
 		// Feed each column back its own oracle text — the literal COPY FROM
 		// would be handed after DecodeCopyTextRow unescaped the field.
-		d, err := copyTextToDatum(c.Type, []byte(row[i].StringValue()))
+		d, err := copyTextToDatum(c.Type, []byte(row[i].StringValue()), "")
 		if err != nil {
 			t.Fatalf("%s[]: copyTextToDatum: %v", c.Type.Name, err)
 		}

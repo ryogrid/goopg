@@ -1337,3 +1337,67 @@ three rows interleave.
   through `config.sessionLocation`, which falls back to UTC for spellings Go's
   `LoadLocation` rejects — the pre-existing limitation recorded for
   `timestamptz_out`, now inherited here.
+
+## 19. The session zone on the COPY FROM load path (M0119-0006, 48th slice)
+
+§18.4's first deferral, closed. `COPY … FROM` of a zone-less `timetz` field
+stored `+00` while `INSERT` of the same literal — fixed one slice earlier —
+stored the session offset, so the SAME table loaded two ways held two different
+values under one `TimeZone`.
+
+### 19.1 What upstream does
+
+Nothing COPY-specific: `CopyFrom` calls the column's input function
+(`InputFunctionCall` on `attin[]`, `copyfromparse.c`), which for `timetz` is the
+same `timetz_in` a literal takes, reading `session_timezone` through
+`DecodeTimeOnly`'s `!(fmask & DTK_M(TZ))` arm. The load path has no zone rule of
+its own — it simply has the session, and goopg's did not.
+
+Oracle (PG 18.3, 127.0.0.1:65432):
+
+```
+SET TimeZone='Asia/Tokyo';
+CREATE TABLE zz_ttz(t timetz);
+COPY zz_ttz FROM STDIN;   -- one field: 10:00:00
+SELECT t FROM zz_ttz;     -- 10:00:00+09
+SET TimeZone='America/New_York';
+SELECT t FROM zz_ttz;     -- still 10:00:00+09
+```
+
+The second SELECT is the load-bearing one: the offset is fixed at INPUT time, so
+this is a stored-value question, not a rendering question.
+
+### 19.2 What landed
+
+The read side now threads the session zone the way the write side already did.
+`RunCopyTo` resolves `timezone` from `ctx.GetSetting` at `copy.go:72` and passes
+it down to `datumToCopyText`; the mirror is a `timeZone string` parameter on
+`DecodeCopyTextRow` / `DecodeCopyCsvRow` / `datumsFromCopyFields` /
+`copyTextToDatum`, fed by `timeZoneFromCtx(c.ctx)` at the two
+`CopyFromExecutor` call sites, and consumed by `copyTextToDatum`'s `timetz` arm
+in place of the `""` it used to hand `parseTimeTZString`.
+
+A parameter rather than a `*Context`: `datumsFromCopyFields` is deliberately the
+one place the TEXT and CSV readers share (only the field SPLIT differs between
+the formats), and a value parameter keeps that seam narrow enough that the two
+formats cannot drift on a GUC — which is what the test asserts.
+
+### 19.3 Verification
+
+`internal/executor/copy_timetz_session_zone_test.go` drives the 4-zone matrix
+(`""`, `UTC`, `Asia/Tokyo`, `America/New_York`) through BOTH readers — the CSV
+case exists to pin the sharing, not to re-test the parser — plus a test that an
+explicitly-zoned field is UNCHANGED by the session zone, so the slice cannot be
+"passed" by stamping the session offset unconditionally.
+
+### 19.4 Deferred (ledger row 2026-08-13)
+
+- **A zone-less `timestamptz` COPY field is still read as a UTC wall clock.**
+  The threaded `timeZone` is not consumed by the `timestamp`/`timestamptz`/
+  `date` arm: `tsZoneMode` only decides whether a zone PRESENT in the text is
+  applied or discarded, and there is no "no zone field at all" arm. Measured at
+  HEAD: `2020-06-15 10:00:00` into `timestamptz` under `TimeZone='Asia/Tokyo'`
+  stores `10:00:00Z`; PG stores `01:00:00Z`. The literal path shares
+  `parseCopyTimestampZone`, so it is one defect with two entry points — and
+  fixing it MOVES stored instants, so it needs its own probe battery across
+  `timestamp` (must not move) and `date` (must not shift a day).

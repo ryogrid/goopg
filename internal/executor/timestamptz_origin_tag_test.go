@@ -85,7 +85,7 @@ func TestTimestampTZOriginsCarryTheSubtypeTag(t *testing.T) {
 			// the text belongs to the value, so this is the same instant.
 			name: "text COPY decode",
 			decode: func(t *testing.T) Datum {
-				d, err := copyTextToDatum(tstzCol.Type, []byte("2020-01-01 10:00:00+05:30"))
+				d, err := copyTextToDatum(tstzCol.Type, []byte("2020-01-01 10:00:00+05:30"), "")
 				if err != nil {
 					t.Fatalf("copyTextToDatum: %v", err)
 				}
@@ -177,10 +177,10 @@ func TestTimestampTZOriginsTagSiblingTypesCorrectly(t *testing.T) {
 			return copyBinaryToDatum(catalog.Type{Name: "date"}, binDate)
 		})},
 		{"text COPY timestamp", mustDatum(t, func() (Datum, error) {
-			return copyTextToDatum(catalog.Type{Name: "timestamp"}, []byte("2020-01-01 04:30:00"))
+			return copyTextToDatum(catalog.Type{Name: "timestamp"}, []byte("2020-01-01 04:30:00"), "")
 		})},
 		{"text COPY date", mustDatum(t, func() (Datum, error) {
-			return copyTextToDatum(catalog.Type{Name: "date"}, []byte("2020-01-01"))
+			return copyTextToDatum(catalog.Type{Name: "date"}, []byte("2020-01-01"), "")
 		})},
 		{"index-key timestamp", mustDatum(t, func() (Datum, error) {
 			d, err := decodeBTreeKeyToDatum(btree.EncodeTimestamp(micros),

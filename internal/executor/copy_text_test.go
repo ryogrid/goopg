@@ -216,7 +216,7 @@ func TestEncodeCopyTextRowTimestampFractionalSecondsTrimmed(t *testing.T) {
 // the encode test — exactly what pgbench's COPY data looks like.
 func TestDecodeCopyTextRowPgbenchShape(t *testing.T) {
 	cols := textCols()
-	got, err := DecodeCopyTextRow([]byte("42\t1\t100\thello"), cols, `\N`)
+	got, err := DecodeCopyTextRow([]byte("42\t1\t100\thello"), cols, `\N`, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -239,7 +239,7 @@ func TestDecodeCopyTextRowNull(t *testing.T) {
 		{Name: "a", Type: catalog.Type{Name: "int4"}},
 		{Name: "b", Type: catalog.Type{Name: "text"}},
 	}
-	got, err := DecodeCopyTextRow([]byte("\\N\tx\\Ny"), cols, `\N`)
+	got, err := DecodeCopyTextRow([]byte("\\N\tx\\Ny"), cols, `\N`, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +273,7 @@ func TestDecodeCopyTextRowEscapes(t *testing.T) {
 	}
 	cols := []catalog.Column{{Name: "s", Type: catalog.Type{Name: "text"}}}
 	for _, tc := range cases {
-		got, err := DecodeCopyTextRow([]byte(tc.in), cols, `\N`)
+		got, err := DecodeCopyTextRow([]byte(tc.in), cols, `\N`, "")
 		if err != nil {
 			t.Errorf("%q: %v", tc.in, err)
 			continue
@@ -290,10 +290,10 @@ func TestDecodeCopyTextRowEscapes(t *testing.T) {
 // boundary.
 func TestDecodeCopyTextRowFieldCount(t *testing.T) {
 	cols := textCols()
-	if _, err := DecodeCopyTextRow([]byte("1\t2\t3"), cols, `\N`); err == nil {
+	if _, err := DecodeCopyTextRow([]byte("1\t2\t3"), cols, `\N`, ""); err == nil {
 		t.Errorf("expected error for short row")
 	}
-	if _, err := DecodeCopyTextRow([]byte("1\t2\t3\t4\t5"), cols, `\N`); err == nil {
+	if _, err := DecodeCopyTextRow([]byte("1\t2\t3\t4\t5"), cols, `\N`, ""); err == nil {
 		t.Errorf("expected error for long row")
 	}
 }
@@ -318,7 +318,7 @@ func TestRoundTripBoolAndTimestamp(t *testing.T) {
 	if enc[len(enc)-1] != '\n' {
 		t.Fatal("missing trailing newline")
 	}
-	got, err := DecodeCopyTextRow(enc[:len(enc)-1], cols, `\N`)
+	got, err := DecodeCopyTextRow(enc[:len(enc)-1], cols, `\N`, "")
 	if err != nil {
 		t.Fatal(err)
 	}

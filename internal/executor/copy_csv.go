@@ -154,7 +154,11 @@ var errCsvIncompleteRecord = errors.New("COPY CSV: record continues on the next 
 // newline) into Datums shaped by cols. It is the read-side counterpart of
 // EncodeCopyCsvRow. Returns errCsvIncompleteRecord when the record ends
 // inside a quoted field.
-func DecodeCopyCsvRow(line []byte, cols []catalog.Column, f copyToFormat) (Row, error) {
+//
+// timeZone is the session TimeZone GUC ("" = UTC); it reaches the per-field
+// input functions through datumsFromCopyFields, so the CSV and TEXT readers
+// cannot drift on the GUC-dependent types. M0119-0006 (48th slice).
+func DecodeCopyCsvRow(line []byte, cols []catalog.Column, f copyToFormat, timeZone string) (Row, error) {
 	fields, err := parseCopyCsvFields(line, f)
 	if err != nil {
 		return nil, err
@@ -168,7 +172,7 @@ func DecodeCopyCsvRow(line []byte, cols []catalog.Column, f copyToFormat) (Row, 
 	if len(fields) < len(cols) {
 		return nil, fmt.Errorf("missing data for column %q", cols[len(fields)].Name)
 	}
-	return datumsFromCopyFields(fields, cols)
+	return datumsFromCopyFields(fields, cols, timeZone)
 }
 
 // parseCopyCsvFields splits one CSV record into fields, mirroring

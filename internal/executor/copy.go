@@ -222,7 +222,7 @@ func (c *CopyFromExecutor) PushLine(line []byte) error {
 	if c.format.csv {
 		return c.pushCsvLine(line)
 	}
-	src, err := DecodeCopyTextRow(line, c.listedColumns(), c.format.nullStr)
+	src, err := DecodeCopyTextRow(line, c.listedColumns(), c.format.nullStr, timeZoneFromCtx(c.ctx))
 	if err != nil {
 		return &ExecError{Code: "22P04", Pos: c.plan.Pos(), Message: fmt.Sprintf("COPY: %v", err)}
 	}
@@ -241,7 +241,7 @@ func (c *CopyFromExecutor) pushCsvLine(line []byte) error {
 		c.csvPartial = append(c.csvPartial, line...)
 		line = c.csvPartial
 	}
-	src, err := DecodeCopyCsvRow(trimCopyLineCR(line), c.listedColumns(), c.format)
+	src, err := DecodeCopyCsvRow(trimCopyLineCR(line), c.listedColumns(), c.format, timeZoneFromCtx(c.ctx))
 	if errors.Is(err, errCsvIncompleteRecord) {
 		if len(c.csvPartial) == 0 {
 			c.csvPartial = append(c.csvPartial, line...)

@@ -59,7 +59,12 @@ func EncodeCopyTextRow(dst []byte, row Row, cols []catalog.Column, dateStyle, da
 // trailing newline) into Datums shaped by cols. Returns an error
 // when the field count doesn't match cols, or a column value can't
 // parse into its declared type.
-func DecodeCopyTextRow(line []byte, cols []catalog.Column, nullStr string) (Row, error) {
+//
+// timeZone is the session TimeZone GUC ("" = the boot default, UTC); it is the
+// read-side counterpart of the timeZone EncodeCopyTextRow already takes, and is
+// consumed by the types whose input function reads the GUC when the text itself
+// carries no zone field (today: timetz). M0119-0006 (48th slice).
+func DecodeCopyTextRow(line []byte, cols []catalog.Column, nullStr string, timeZone string) (Row, error) {
 	fields, err := splitCopyTextFields(line, nullStr)
 	if err != nil {
 		return nil, err
@@ -67,7 +72,7 @@ func DecodeCopyTextRow(line []byte, cols []catalog.Column, nullStr string) (Row,
 	if len(fields) != len(cols) {
 		return nil, fmt.Errorf("COPY: row has %d fields, expected %d", len(fields), len(cols))
 	}
-	return datumsFromCopyFields(fields, cols)
+	return datumsFromCopyFields(fields, cols, timeZone)
 }
 
 // datumsFromCopyFields converts already-split COPY fields into a Row
@@ -76,14 +81,14 @@ func DecodeCopyTextRow(line []byte, cols []catalog.Column, nullStr string) (Row,
 // differs between the formats; the per-field input-function call does
 // not). Callers check the field count first — the two formats report a
 // mismatch with different messages.
-func datumsFromCopyFields(fields []copyField, cols []catalog.Column) (Row, error) {
+func datumsFromCopyFields(fields []copyField, cols []catalog.Column, timeZone string) (Row, error) {
 	row := make(Row, len(cols))
 	for i, raw := range fields {
 		if raw.isNull {
 			row[i] = NullDatum
 			continue
 		}
-		d, err := copyTextToDatum(cols[i].Type, raw.bytes)
+		d, err := copyTextToDatum(cols[i].Type, raw.bytes, timeZone)
 		if err != nil {
 			return nil, fmt.Errorf("column %q: %w", cols[i].Name, err)
 		}
@@ -343,8 +348,10 @@ func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone str
 }
 
 // copyTextToDatum is the inverse of datumToCopyText. raw is the
-// already-unescaped byte representation of one column value.
-func copyTextToDatum(t catalog.Type, raw []byte) (Datum, error) {
+// already-unescaped byte representation of one column value. timeZone is the
+// session TimeZone GUC ("" = UTC), for the types whose input function consults
+// it when the text carries no zone of its own.
+func copyTextToDatum(t catalog.Type, raw []byte, timeZone string) (Datum, error) {
 	// Array columns FIRST, the sibling of datumToCopyText's guard above (Rule
 	// #2: the two must agree on the type-set). Without it `COPY t FROM` into an
 	// int4[] column took the int4 arm and failed 'invalid integer "{1,2}"',
@@ -400,7 +407,14 @@ func copyTextToDatum(t catalog.Type, raw []byte) (Datum, error) {
 		}
 		return NewTimeDatum(ts), nil
 	case "timetz":
-		ts, offsetSecs, err := parseTimeTZString(string(raw), "")
+		// M0119-0006 (48th slice): a COPY field with no zone of its own takes the
+		// SESSION zone, exactly as the literal path does since the 47th slice —
+		// `COPY t FROM STDIN` of "10:00:00" under TimeZone='Asia/Tokyo' is
+		// 10:00:00+09 upstream, not +00 (DecodeTimeOnly's `!(fmask & DTK_M(TZ))`
+		// arm, datetime.c). Hard-won Rule #2: the INSERT and COPY readers of one
+		// type must agree, or a table loaded by COPY differs from the same table
+		// loaded by INSERT under the same GUC.
+		ts, offsetSecs, err := parseTimeTZString(string(raw), timeZone)
 		if err != nil {
 			return Datum{}, err
 		}
