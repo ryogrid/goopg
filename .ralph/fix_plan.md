@@ -3371,6 +3371,33 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `interval`/`jsonb`/`bpchar` arms still missing). Design
       `0119-0006-copy-binary-oid-family.md` + README row.
 
+      **55th slice (2026-08-13): binary `COPY` of `interval`, both directions.**
+      A stored interval is a `KindInterval` Datum matching none of the default's
+      `Kind` cases, so encode shipped the interval's TEXT (21 bytes for `'1 mon
+      2 days 03:00:00'`) where `interval_send` is `pq_sendint64(time)` +
+      `pq_sendint32(day)` + `pq_sendint32(month)` — a fixed 16; decode handed the
+      16 bytes back as a raw-bytes string Datum, putting an interval column back
+      in the lexicographic world the heap codec's own `interval` arm was written
+      to escape. The heap has stored PG's `{time,day,month}` at exactly those
+      offsets all along, so the wire differs ONLY in byte order — and the fields
+      are now taken from a shared `pgIntervalFieldsFromDatum` (third repetition
+      of the `pgFloatFromDatum`/`pgUnsignedIDFromDatum` extraction), carrying the
+      `KindString` bare-literal entry point and its 22007 with it. **The finding
+      is that this time the third twin was already right:** the same
+      `…AgreesWithHeapEncode` pin that caught the 53rd's `float` spelling bug and
+      the 54th's halved `xid8` came back clean here (heap width/offsets,
+      `physicalPGTypeAlign` = 8, `pgoutput.go` already correct) — because
+      `interval` got its fixed-width layout in a dedicated slice that fixed all
+      three twins at once. A clean pin is now EVIDENCE, not an assumption.
+      Item stays UNCHECKED (standing slice-by-slice cluster). 6 fail-when-broken
+      guards, all red at HEAD; oracle E2E byte-identical in both directions
+      (203 bytes, 9 values). 1 ledger item resolved in place, 2 filed
+      (`AdjustIntervalForTypmod` — this arm is its first consumer, same blocker
+      as the `time`/`timetz` rows; plus a NON-defect row recording that
+      `interval_recv` has no range check upstream either). Design
+      `0119-0006-copy-binary-interval.md` + README row. Next candidates:
+      `jsonb` (leading version byte), `bpchar`.
+
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
 

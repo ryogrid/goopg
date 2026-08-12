@@ -318,6 +318,27 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 		b := make([]byte, 4)
 		binary.BigEndian.PutUint32(b, uint32(days))
 		return b, nil
+	case "interval":
+		// M0119-0006 (55th slice): before this arm an `interval` column fell
+		// through to the default, whose KindInterval Datum matches no Kind case
+		// and so shipped Datum.Format()'s TEXT ('02:00:00') under FORMAT binary —
+		// a stream no real PG client can read. Upstream interval_send
+		// (postgres/src/backend/utils/adt/timestamp.c:1022) is
+		// pq_sendint64(time) + pq_sendint32(day) + pq_sendint32(month): exactly
+		// the {time,day,month} the heap already stores at the same offsets
+		// (encodeValuePG's "interval" arm), differing only in byte order, so the
+		// two twins share pgIntervalFieldsFromDatum rather than re-deriving the
+		// fields. The ±infinity sentinels need no case here either: INTERVAL_NOEND
+		// / INTERVAL_NOBEGIN *are* all-fields-at-their-extreme.
+		months, days, micros, err := pgIntervalFieldsFromDatum(d)
+		if err != nil {
+			return nil, err
+		}
+		b := make([]byte, 16)
+		binary.BigEndian.PutUint64(b[:8], uint64(micros))
+		binary.BigEndian.PutUint32(b[8:12], uint32(days))
+		binary.BigEndian.PutUint32(b[12:16], uint32(months))
+		return b, nil
 	case "numeric", "decimal":
 		return encodeNumericBinary(d)
 	default:
@@ -503,6 +524,26 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 		days := int32(binary.BigEndian.Uint32(payload))
 		d := pgEpoch.AddDate(0, 0, int(days))
 		return NewDateDatum(d), nil
+	case "interval":
+		// Decode twin of the "interval" encode arm. Upstream interval_recv
+		// (timestamp.c:997) is pq_getmsgint64(time) + pq_getmsgint(day) +
+		// pq_getmsgint(month), and the binary COPY parser's pq_getmsgend makes
+		// any other length "incorrect binary data format". The Datum shape is the
+		// heap decode arm's (decodePhysicalPGValueMctx, codec.go) —
+		// NewIntervalDatumFull — so an interval that entered through binary COPY
+		// sorts, compares and prints identically to the same interval entering
+		// through INSERT. Before this arm the default handed the 16 raw bytes back
+		// as a STRING Datum, which then made every runtime interval operation
+		// lexicographic (Hard-won Rule #2). interval_recv's trailing
+		// AdjustIntervalForTypmod is NOT applied here — goopg truncates at display,
+		// ledgered under M0119-0006 alongside AdjustTimeForTypmod.
+		if len(payload) != 16 {
+			return Datum{}, fmt.Errorf("interval: expected 16 bytes, got %d", len(payload))
+		}
+		micros := int64(binary.BigEndian.Uint64(payload[:8]))
+		days := int32(binary.BigEndian.Uint32(payload[8:12]))
+		months := int32(binary.BigEndian.Uint32(payload[12:16]))
+		return NewIntervalDatumFull(months, days, micros), nil
 	case "numeric", "decimal":
 		return decodeNumericBinary(payload)
 	default:

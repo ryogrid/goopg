@@ -457,24 +457,9 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		// The ±infinity sentinels need no special case: INTERVAL_NOEND /
 		// INTERVAL_NOBEGIN *are* all-fields-at-their-extreme, so field-wise
 		// storage round-trips them exactly.
-		var months, days int32
-		var micros int64
-		switch d.Kind {
-		case KindInterval:
-			months, days, micros = d.IntervalMonthsValue(), d.IntervalDaysValue(), d.IntervalMicrosValue()
-		case KindString:
-			// A bare quoted literal (`INSERT INTO t(i) VALUES ('1 mon')`) is
-			// `unknown` upstream and reaches the column through interval_in.
-			// parser.ParseIntervalBody is the same tokenizer `'…'::interval`
-			// uses, so the two entry points cannot disagree.
-			var ok bool
-			months, days, micros, ok = parser.ParseIntervalBody(d.StringValue())
-			if !ok {
-				return nil, &ExecError{Code: "22007",
-					Message: fmt.Sprintf("invalid input syntax for type interval: %q", d.StringValue())}
-			}
-		default:
-			return nil, fmt.Errorf("expected interval, got kind %d", d.Kind)
+		months, days, micros, err := pgIntervalFieldsFromDatum(d)
+		if err != nil {
+			return nil, err
 		}
 		var buf [16]byte
 		binary.LittleEndian.PutUint64(buf[:8], uint64(micros))
@@ -1912,6 +1897,37 @@ func pgUnsignedIDFromDatum(d Datum, typeName string, bits int) (uint64, error) {
 			Message: fmt.Sprintf("value %q is out of range for type %s", strings.TrimSpace(d.Format()), typeName)}
 	}
 	return uint64(v), nil
+}
+
+// pgIntervalFieldsFromDatum coerces a Datum to the three fields PG's Interval
+// struct holds — {TimeOffset time; int32 day; int32 month}
+// (postgres/src/include/datatype/timestamp.h) — returned here as
+// (months, days, micros) in goopg's usual field order.
+//
+// The KindString arm exists because a bare quoted literal
+// (`INSERT INTO t(i) VALUES ('1 mon')`) is `unknown` upstream and reaches an
+// interval column through interval_in; parser.ParseIntervalBody is the same
+// tokenizer `'…'::interval` uses, so the two entry points cannot disagree.
+//
+// M0119-0006 (55th slice): extracted from encodeValuePG's "interval" arm so the
+// heap encoder and the new binary-COPY interval arm (datumToCopyBinary,
+// copy_binary.go) cannot drift — the two are twins under Hard-won Rule #2,
+// differing only in byte order. Same extraction shape as pgFloatFromDatum
+// (53rd) and pgUnsignedIDFromDatum (54th).
+func pgIntervalFieldsFromDatum(d Datum) (months, days int32, micros int64, err error) {
+	switch d.Kind {
+	case KindInterval:
+		return d.IntervalMonthsValue(), d.IntervalDaysValue(), d.IntervalMicrosValue(), nil
+	case KindString:
+		months, days, micros, ok := parser.ParseIntervalBody(d.StringValue())
+		if !ok {
+			return 0, 0, 0, &ExecError{Code: "22007",
+				Message: fmt.Sprintf("invalid input syntax for type interval: %q", d.StringValue())}
+		}
+		return months, days, micros, nil
+	default:
+		return 0, 0, 0, fmt.Errorf("expected interval, got kind %d", d.Kind)
+	}
 }
 
 // floatTextDatum converts a PGFloatOut rendering into the Datum shape the
