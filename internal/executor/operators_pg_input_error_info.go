@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/planner"
@@ -216,8 +217,15 @@ func validateTypedLen(v, typStr string) (string, string) {
 			if err != nil || n <= 0 {
 				return "", ""
 			}
-			// PostgreSQL's varcharin checks raw length (no trailing-space strip).
-			if len(v) > n {
+			// PostgreSQL's varcharin checks raw length (no trailing-space strip)
+			// in CHARACTERS, not bytes — varchar_input measures with
+			// pg_mbstrlen_with_len before comparing against maxlen
+			// (postgres/src/backend/utils/adt/varchar.c). Measured on PG 18.3:
+			// `pg_input_error_info('あいうえお','varchar(5)')` is all-NULL
+			// (accepted, 15 bytes), where a byte count raised a spurious 22001.
+			// Sibling of coerceTextLikeDatum's rune count (codec.go) — Hard-won
+			// Rule #2. M0119-0006 (58th slice).
+			if utf8.RuneCountInString(v) > n {
 				return fmt.Sprintf("value too long for type character varying(%d)", n), "22001"
 			}
 			return "", ""
@@ -231,7 +239,7 @@ func validateTypedLen(v, typStr string) (string, string) {
 				return "", ""
 			}
 			stripped := strings.TrimRight(v, " ")
-			if len(stripped) > n {
+			if utf8.RuneCountInString(stripped) > n {
 				return fmt.Sprintf("value too long for type character(%d)", n), "22001"
 			}
 			return "", ""

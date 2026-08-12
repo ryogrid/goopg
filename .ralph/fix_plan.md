@@ -3672,6 +3672,38 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       the trimmed image; bare `bpchar` still treated as `char(1)`; the heap
       image stays trimmed). Design `0119-0006-bpchar-declared-width.md` +
       README row.
+      **58th slice (2026-08-13): a bare `bpchar` is unbounded, and its blanks
+      are data.** Second of the three rows the 57th filed. Where that slice
+      restored a width goopg failed to RENDER, this one removes one goopg
+      INVENTED: `coerceTextLikeDatum`'s `n := 1` default held every `Args`-less
+      char-family type to `character(1)`, so `INSERT INTO t(c bpchar) VALUES
+      ('abc')` was a spurious 22001. The implicit length of 1 belongs to the
+      GRAMMAR, not the type — upstream reduces bare `char`/`character` to bpchar
+      with typmod 1 (which `parseColumnType` already mirrors), while `bpchar`
+      spelled directly carries typmod −1 and `bpchar_input`'s `atttypmod <
+      VARHDRSZ` arm sets `maxlen` to the value's own length. Measured:
+      `atttypmod` −1 / 5 / 5 for `bpchar` / `char` / `character`. The resume
+      point held but was **incomplete**: the same arm also TRIMS, and a
+      width-carrying `bpchar` may be stored trimmed only because the render
+      boundaries re-pad it from `Args[0]`. An unbounded one has no width to
+      re-pad FROM, so trimming destroys the blanks instead of deferring them
+      (PG: `octet_length` 4 for a `bpchar` holding `'ab  '`, 6 for a `char(6)`
+      holding the same) — unbounded values are now stored verbatim, and the
+      trimmed convention is untouched for everything else. The row's stated
+      precondition was MEASURED, not assumed: the heap reload does rename OID
+      1042 to `bpchar`, but `pgTypeArgsFromTypmod` decodes the typmod back into
+      `Args`, so empty `Args` can only mean typmod −1 and the gate is sound.
+      Sibling audit cleared `PadBpchar`, the `expr.go` cast path (guarded by
+      `Typmod > 0`) and the parser, and caught one that was NOT clear:
+      `validateTypedLen`, `pg_input_error_info`'s private copy of the rule,
+      still counted BYTES after the 57th moved the codec path to runes. Item
+      stays UNCHECKED (standing slice-by-slice cluster). 2 guards
+      mutation-checked (4 / 3 failing assertions on the pre-fix source); E2E
+      `COPY` byte-identical to PG 18.3. `TestPort_RegressSuite` PASS (Hard-won
+      Rule #5), UNITS PASS, tpch-spotcheck PASS (Q12=2/Q13=35). 2 ledger rows
+      resolved, 2 filed (`pg_input_error_info` returns 0 rows where PG returns
+      one all-NULL row; `validateTypedLen` matches its type by text prefix).
+      Design `0119-0006-bare-bpchar-unbounded-typmod.md` + README row.
 
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).

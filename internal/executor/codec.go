@@ -169,16 +169,48 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 			s = stripped
 		}
 	} else if tname == "char" || tname == "bpchar" || tname == "character" {
-		n := 1
+		// A typmod-less type carries NO length limit upstream: bpchar_input's
+		// `atttypmod < VARHDRSZ` arm sets maxlen to the value's own length and
+		// neither truncates nor errors (postgres/src/backend/utils/adt/
+		// varchar.c). The implicit length-1 default below belongs to the
+		// GRAMMAR, not the type: `char` and `character` really do mean
+		// `character(1)` (gram.y CHARACTER opt_charset → bpchar with typmod 1,
+		// which parseColumnType mirrors at internal/parser/ddl.go), whereas the
+		// internal name `bpchar` spelled directly takes typmod -1. Measured on
+		// PG 18.3: `CREATE TABLE t(a bpchar)` gives atttypmod -1 / format_type
+		// `bpchar` and accepts 'abc', while `b char` and `c character` both give
+		// atttypmod 5 / `character(1)`. Applying the default to `bpchar` raised
+		// a spurious 22001 on every value longer than one character.
+		//
+		// Empty Args cannot mean "declared bpchar(N) whose N was lost": the heap
+		// reload decodes the typmod back into Args for OID 1042
+		// (pgTypeArgsFromTypmod, internal/initdb/catalog_heap_reload.go:1240)
+		// and CREATE TABLE copies the parsed Args verbatim, so a restored
+		// `char(3)` column arrives as Name "bpchar" with Args [3].
+		// M0119-0006 (58th slice).
+		n := -1
 		if len(t.Args) > 0 {
 			n = int(t.Args[0])
+		} else if tname != "bpchar" {
+			n = 1
 		}
-		stripped := strings.TrimRight(s, " ")
-		if utf8.RuneCountInString(stripped) > n {
-			return "", &ExecError{Code: "22001",
-				Message: fmt.Sprintf("value too long for type character(%d)", n)}
+		if n >= 0 {
+			// goopg stores a WIDTH-CARRYING bpchar trimmed (deliberate and
+			// load-bearing — M0103-0007 rung 24; compareDatum's
+			// padding-insensitive equality and the compact heap image rest on
+			// it) and re-pads to Args[0] at every render boundary via
+			// catalog.PadBpchar. An unbounded bpchar has no width to re-pad
+			// FROM, so trimming it would destroy the trailing blanks instead of
+			// deferring them: measured on PG 18.3, `bpchar` holding 'ab  ' is
+			// octet_length 4 where a char(6) holding the same is 6. Both survive
+			// only if the unbounded value is stored verbatim.
+			stripped := strings.TrimRight(s, " ")
+			if utf8.RuneCountInString(stripped) > n {
+				return "", &ExecError{Code: "22001",
+					Message: fmt.Sprintf("value too long for type character(%d)", n)}
+			}
+			s = stripped
 		}
-		s = stripped
 	}
 	return s, nil
 }
