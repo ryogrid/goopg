@@ -4,6 +4,28 @@
 #
 # rel  <name> <oracle_oid> <goopg_oid> <rule_oid> <oracle_reltype> <goopg_reltype> <relkind> <relnatts>
 # attr <name> <attnum> <attname> <atttypid> <attlen> <attnotnull> <attisdropped>
+rel	pg_views	12028	12028	12031	12030	2249	v	4
+attr	pg_views	1	schemaname	19	64	f	f
+attr	pg_views	2	viewname	19	64	f	f
+attr	pg_views	3	viewowner	19	64	f	f
+attr	pg_views	4	definition	25	-1	f	f
+rel	pg_tables	12033	12033	12036	12035	2249	v	8
+attr	pg_tables	1	schemaname	19	64	f	f
+attr	pg_tables	2	tablename	19	64	f	f
+attr	pg_tables	3	tableowner	19	64	f	f
+attr	pg_tables	4	tablespace	19	64	f	f
+attr	pg_tables	5	hasindexes	16	1	f	f
+attr	pg_tables	6	hasrules	16	1	f	f
+attr	pg_tables	7	hastriggers	16	1	f	f
+attr	pg_tables	8	rowsecurity	16	1	f	f
+rel	pg_matviews	12038	12038	12041	12040	2249	v	7
+attr	pg_matviews	1	schemaname	19	64	f	f
+attr	pg_matviews	2	matviewname	19	64	f	f
+attr	pg_matviews	3	matviewowner	19	64	f	f
+attr	pg_matviews	4	tablespace	19	64	f	f
+attr	pg_matviews	5	hasindexes	16	1	f	f
+attr	pg_matviews	6	ispopulated	16	1	f	f
+attr	pg_matviews	7	definition	25	-1	f	f
 rel	pg_locks	12073	12073	12076	12075	2249	v	16
 attr	pg_locks	1	locktype	25	-1	f	f
 attr	pg_locks	2	database	26	4	f	f

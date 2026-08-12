@@ -484,6 +484,71 @@ Gates: `internal/initdb` PASS (64 s), whole `^TestE2E_` family PASS (100 s),
 `capture-ev-action.sh --verify` PASS (30/30 byte-identical), UNITS PASS,
 pgbench smoke via the commit hook.
 
+## Implementation status — S9.2a (2026-08-12)
+
+**The corpus is 33 views and the first non-function-only tranche is on disk.**
+`pg_views` (12028/12031), `pg_tables` (12033/12036) and `pg_matviews`
+(12038/12041) were pinned in `internal/initdb/system_view_oid_pins.go`,
+captured in ONE `scripts/capture-ev-action.sh <33 views>` run and rendered by
+ONE `go run cmd/gen-nailed-view-tables/main.go > nailed_view_seed_data.go` —
+again with no hand-edit of `nailedRel`/`nailedAttr`, the `pg_rewrite` seed rows
+or any embed line, which is S9.0's claim holding across a shape change and not
+merely across a bigger count.
+
+**What is new about the shape.** Every previous blob was `FROM <SRF>` or had no
+`FROM` at all. These three are joins: `pg_class` (1259) `LEFT JOIN`
+`pg_namespace` (2615), plus `LEFT JOIN pg_tablespace` (1213) for `pg_tables`
+and `pg_matviews`, so the corpus now exercises `RTE_JOIN` — and a hosted PG
+18.3 evaluates all three (`assertNailedSystemViewsAreEvaluable`). The base
+relations are sub-12000 bootstrap constants, so the blobs still carry zero
+in-band `:relid` and the tranche needed no view-on-view ordering; S9.3 remains
+the first slice that does.
+
+### Findings — S9.2a
+
+**F7 — TOAST ceiling #1 is no longer hypothetical: `pg_indexes` breaches it.**
+`pg_indexes` was the tranche's fourth candidate and is the first view in the
+corpus whose `ev_action` does not fit an inline heap tuple —
+`pg_column_size` **9002 B** against guard #5's 8000 B budget (raw text 70408 B,
+the largest in the corpus by 3.2×). Guard #5 is therefore a guard that has now
+*fired* in anger rather than one that merely exists, and the ceiling's stated
+prerequisite — `DECLARE_TOAST(pg_rewrite, 2838, 2839)` — is promoted from a
+contingency to a named blocker for `pg_indexes` and for any later view of its
+size. It is ledgered, and it is the new subject of guard #2 (below), which
+means the prerequisite landing will announce itself as a test failure.
+
+**Guard #2 re-pointed as its predecessor instructed.**
+`assertNonCorpusSystemViewIsStillAbsent` probed `pg_tables` precisely because
+`pg_tables` was S9.2's named head; adopting it flipped that assertion red, and
+the helper now probes `pg_indexes`. That is a strict improvement in the guard's
+quality: the previous subject was un-adopted only because nobody had got to it
+yet, whereas the new one is un-adopted for a **measured** reason, so the
+fail-when-fixed signal now names a specific prerequisite instead of a queue
+position.
+
+**F8 — the on-disk corpus is now AHEAD of goopg's own virtual corpus.** A
+goopg server was probed directly, as S9.1 did. `pg_tables` still answers from
+its virtual definition (2 rows) and `pg_indexes` answers 0, so seeding on-disk
+rows did not break goopg's own client-visible answers — ceiling #3 did not bite
+in the regression direction. But `pg_views` and `pg_matviews` fail **42P01 on
+goopg** while a PG hosted on goopg's directory evaluates them, i.e. the two
+engines now disagree about which system views exist on the same cluster in the
+*opposite* direction from the one this milestone started with. Ledgered.
+
+**F9 — `pg_tables` is the widest dual definition measured so far.** Sharper
+than F6's count-preserving mismatch: goopg's virtual `pg_tables`
+(`internal/catalog/catalog.go:8552-8566`) has **3** columns
+(`schemaname`, `tablename`, `tableowner`), all `text`, under a synthetic OID
+`1259101`, while the on-disk row upstream pins is **8** columns with
+PG-faithful types under OID 12033. Count, type and OID all diverge. Ledgered,
+not fixed — reconciling the virtual definitions is a slice of its own and it
+changes goopg-client-visible output.
+
+Gates: `internal/initdb` PASS (84 s), `TestE2E_PGColdStartOnGoopgDataDir` PASS,
+whole `^TestE2E_` family PASS (90 s), `capture-ev-action.sh --verify` PASS
+(33/33 byte-identical), `go vet` clean, UNITS PASS, pgbench smoke via the
+commit hook.
+
 ## References
 
 - M0131 implementation plan §S9, `docs/design/0131-bidirectional-cluster-dir-coldstart-and-system-views.md`

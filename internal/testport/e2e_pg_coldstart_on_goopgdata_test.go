@@ -722,9 +722,19 @@ func assertHostedPGCanCallSQLBuiltins(t *testing.T, pg *pgcluster.Cluster, logPa
 // THIS list is the measurement. Captured 2026-08-11 from a throwaway
 // `initdb --no-sync`.
 //
+// M0131-S9.2a adds the first three that are NOT function-only: pg_views
+// (12028), pg_tables (12033) and pg_matviews (12038) each join pg_class
+// against pg_namespace (and, for two, pg_tablespace), so their ev_action is
+// the corpus's first to carry RTE_JOIN. Every base OID is a sub-12000
+// bootstrap constant, so these blobs still embed no in-band :relid and the
+// tranche needed no view-on-view ordering.
+//
 // Deliberately absent: pg_timezone_abbrevs (12122), whose ORDER BY needs a
 // pg_amop row goopg does not bootstrap ("operator 664 is not a valid ordering
-// operator") — this probe is what found that, and it is ledgered.
+// operator") — this probe is what found that, and it is ledgered. And
+// pg_indexes (12043), S9.2a's fourth candidate, whose 9002 B ev_action is the
+// first to breach the 8000 B inline-tuple budget; it is now the subject of
+// assertNonCorpusSystemViewIsStillAbsent below.
 func nailedSystemViewProbeSet() []struct {
 	view string
 	oid  string
@@ -733,6 +743,9 @@ func nailedSystemViewProbeSet() []struct {
 		view string
 		oid  string
 	}{
+		{"pg_catalog.pg_views", "12028"},
+		{"pg_catalog.pg_tables", "12033"},
+		{"pg_catalog.pg_matviews", "12038"},
 		{"pg_catalog.pg_locks", "12073"},
 		{"pg_catalog.pg_cursors", "12077"},
 		{"pg_catalog.pg_prepared_statements", "12095"},
@@ -845,20 +858,29 @@ func assertNailedSystemViewsAreEvaluable(t *testing.T, pg *pgcluster.Cluster, go
 // (internal/catalog/catalog.go:335-342, skipped at :7025-7034). Passing both
 // halves is what makes the corpus list, and not something ambient, the cause.
 //
-// pg_tables is the probe on purpose: it is the named head of the M0131-S9.2
-// tranche (views over real catalogs). When S9.2 lands this assertion FAILS —
-// invert it then by moving pg_tables into nailedSystemViewProbeSet() and
-// re-pointing this helper at whatever the next un-adopted view is. That is the
-// same fail-when-fixed discipline as the S12/S13 finding locks above.
+// pg_indexes is the probe on purpose, and it is the SECOND view to hold this
+// role: M0131-S9.2a adopted pg_tables (the original probe) along with pg_views
+// and pg_matviews, so this helper was re-pointed exactly as its predecessor
+// instructed. pg_indexes is the next un-adopted view of the same tranche and
+// it is blocked for a MEASURED reason rather than an unexamined one — its
+// ev_action is 9002 B stored against the 8000 B inline-heap-tuple budget
+// guard #5 enforces at capture time, i.e. the first breach of design
+// 0131-0009's TOAST ceiling #1, whose prerequisite is
+// DECLARE_TOAST(pg_rewrite, 2838, 2839). When that lands this assertion FAILS
+// — invert it then by moving pg_indexes into nailedSystemViewProbeSet() and
+// re-pointing this helper at the next un-adopted view (pg_roles 12000 or
+// pg_stat_activity 12226 are the remaining S9.2 heads). That is the same
+// fail-when-fixed discipline as the S12/S13 finding locks above.
 func assertNonCorpusSystemViewIsStillAbsent(t *testing.T, pg *pgcluster.Cluster) {
 	t.Helper()
-	const view = "pg_catalog.pg_tables"
+	const view = "pg_catalog.pg_indexes"
 	out, err := pgQueryScalarAllowError(pg, "SELECT * FROM "+view+" LIMIT 0")
 	if err == nil {
 		t.Errorf("hosted PG evaluated %s, which is NOT in the on-disk corpus "+
-			"(nailedSystemViewProbeSet) — either M0131-S9.2 has landed (then add "+
-			"pg_tables to the corpus and re-point this probe at the next "+
-			"un-adopted view), or the evaluability probe above is passing for a "+
+			"(nailedSystemViewProbeSet) — either pg_rewrite TOAST has landed and "+
+			"pg_indexes was captured (then add it to the corpus and re-point this "+
+			"probe at the next un-adopted view), or the evaluability probe above "+
+			"is passing for a "+
 			"reason unrelated to goopg's seeding. Output: %q", view, strings.TrimSpace(out))
 		return
 	}

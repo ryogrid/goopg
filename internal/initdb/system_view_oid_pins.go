@@ -100,6 +100,22 @@ func systemViewOIDPins() []systemViewOIDPin {
 		// `:relid` — verified against the oracle before pinning, which is why
 		// the whole tranche could be pinned in one pass without ordering it
 		// by view-on-view edges. Same capture run as the six below.
+		// M0131-S9.2a (2026-08-12): the head of the "views over real
+		// catalogs" tranche — the pg_class family. Unlike everything below,
+		// these are NOT SRF-only: each is a join over `pg_class` (1259) with
+		// `pg_namespace` (2615) and, for two of them, `pg_tablespace` (1213),
+		// so this is the first tranche whose ev_action carries RTE_JOIN.
+		// Those base OIDs are all bootstrap constants BELOW the 12000 band,
+		// so the blobs still carry zero in-band `:relid` and the tranche
+		// needed no view-on-view ordering.
+		//
+		// NOT pinned: pg_indexes (12043). Its ev_action is 9002 B as a stored
+		// varlena against the script's 8000 B inline budget — ceiling #1 of
+		// design 0131-0009, and the FIRST view in the corpus to breach it.
+		// The prerequisite is DECLARE_TOAST(pg_rewrite, 2838, 2839); ledgered.
+		{"pg_views", 12028, 12031, 12030, 4},
+		{"pg_tables", 12033, 12036, 12035, 8},
+		{"pg_matviews", 12038, 12041, 12040, 7},
 		{"pg_locks", 12073, 12076, 12075, 16},
 		{"pg_cursors", 12077, 12080, 12079, 6},
 		{"pg_prepared_statements", 12095, 12098, 12097, 8},
