@@ -1765,6 +1765,17 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 			}
 		case protocol.MsgFlush:
 			// Flush itself carries no payload and no response frame.
+		case protocol.MsgCopyData, protocol.MsgCopyDone, protocol.MsgCopyFail:
+			// Accept but ignore, per protocol spec — upstream
+			// postgres.c:5004-5013 ("we probably got here because a COPY
+			// failed, and the frontend is still sending data"). A COPY FROM
+			// that errors mid-stream reports ErrorResponse + RFQ right away
+			// and clears copyIn, but the client only learns of the failure
+			// after it has finished pushing; its trailing CopyData/CopyDone
+			// frames then land here. Answering them (an ErrorResponse and a
+			// second RFQ, as the default arm did) desynchronises the session
+			// for every later statement, so they are dropped silently — no
+			// ErrorResponse, and deliberately no ReadyForQuery.
 		default:
 			err = w.WriteErrorResponse([]protocol.ErrorField{
 				{Code: protocol.FieldSeverity, Value: "ERROR"},

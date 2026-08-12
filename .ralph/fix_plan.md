@@ -3215,6 +3215,37 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       COPYed out (measured on both engines). Design
       `0119-0006-copy-array-columns.md` + README row `0119-0006aa`.
 
+      **44th slice (2026-08-13) — the COPY stream nobody drained after the
+      COPY had already failed.** Closes the 43rd slice's `CopyDone` row. A
+      `COPY … FROM STDIN` that failed mid-stream left the session PERMANENTLY
+      one `ReadyForQuery` ahead: goopg reports the decode error the instant the
+      bad line is pushed (`handleCopyInFrame`, `copy.go:542-560`) and clears
+      `copyIn`, but the frontend has already pipelined the rest of the file
+      plus `CopyDone`, and those frames then hit the main loop's `default`
+      arm — which answered EACH with `message type 'c' not yet supported`
+      **and a second RFQ**, so every later statement read the wrong frame
+      (`message type 0x5a arrived from server while idle`). Wrong-answer risk
+      zero (the COPY correctly failed); session desync total. Upstream
+      `postgres.c:5004-5013` accepts and ignores all three of
+      `CopyData`/`CopyDone`/`CopyFail` with a bare `break` — no ErrorResponse
+      and, critically, no RFQ — so the fix is ONE deliberately-empty `switch`
+      arm in `internal/server/server.go`, placed after the `copyIn != nil`
+      fast path so a live COPY is untouched. The inline-batch path
+      (`runInlineCopyFromStdin`) had the identical exposure and is covered by
+      the same arm. goopg's skip-until-`Sync` guard already matched upstream's
+      `ignore_till_sync` shape and needed no change. Gates: 2 new tests in
+      `internal/server/copy_error_drain_test.go`, both verified red by
+      deleting the case (each then reports `frames="EZ"`, the live symptom);
+      they had to move OFF `startTestServer`, which is storage-less and whose
+      COPY FROM falls into a row-counting stub that happily reports `COPY 1`
+      for `notanint`. E2E on a capped throwaway goopg (5533) and on the PG
+      18.3 oracle (65432): both engines error, keep the session usable, and
+      leave `count(*) = 0`. Two ledger rows — goopg's COPY error text leaks a
+      raw Go `strconv` error and emits NO `CONTEXT:` line where PG gives
+      `COPY <rel>, line 2, column a`, and the `startTestServer` COPY stub is a
+      false-negative harness. Design `0119-0006-copy-error-frame-drain.md` +
+      README row `0119-0006ab`.
+
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
 
