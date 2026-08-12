@@ -62,6 +62,14 @@ const (
 	RmgrHeap2   Rmgr = 9  // RM_HEAP2_ID   — heap multi-insert / vacuum
 	RmgrHeap    Rmgr = 10 // RM_HEAP_ID    — heap insert / delete / update
 	RmgrBtree   Rmgr = 11 // RM_BTREE_ID   — btree insert / split
+	// M0131-S25: 12..14 are the three index AMs between Btree and Sequence
+	// (rmgrlist.h:41-43). goopg emits none of them and has no redo for any of
+	// them, but a PG-authored pg_wal that indexes anything with USING hash /
+	// gin / gist contains them, so they need names here to be REFUSED by name
+	// rather than as a bare "rmid=13".
+	RmgrHash    Rmgr = 12 // RM_HASH_ID    — hash index
+	RmgrGin     Rmgr = 13 // RM_GIN_ID     — GIN index
+	RmgrGist    Rmgr = 14 // RM_GIST_ID    — GiST index
 	RmgrSeq     Rmgr = 15 // RM_SEQ_ID     — sequence page rewrites (B1.3b)
 	// M0131-S16.1: 16..21 are real PG 18 resource managers
 	// (postgres/src/include/access/rmgrlist.h:28-49). goopg emits none of

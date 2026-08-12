@@ -1436,7 +1436,67 @@ accordingly; the four rmgrs it used to cover now have to be *accepted*.
    test seeded), skips an absent page per S21f, and refuses an out-of-bounds
    chunk. `RM_COMMIT_TS` refuses with a message naming `track_commit_timestamp`
    when `pg_control` has it on.
-14. UNITS + RACE (`internal/wal`, `internal/initdb`) + SMOKE + SPOT green.
+14. S25: each of the five index-AM rmgrs refuses with a message naming the
+   access method, opcode, LSN and relation; a BRIN record carrying
+   `XLOG_BRIN_INIT_PAGE` reports the OPMASK-ed opcode with the flag named
+   separately; a stream with GIN + BRIN records names BOTH in one error and
+   applies NOTHING (asserted against a run of the same prefix alone, which
+   does write a file, so the "nothing written" half is not vacuous). Both
+   break directions proven by scripted revert.
+15. UNITS + RACE (`internal/wal`, `internal/initdb`) + SMOKE + SPOT green.
+
+### S25 — implementation notes: the index-AM boundary (landed 2026-08-12)
+
+Five rmgrs are index access methods goopg has no redo for: `RM_HASH_ID` (12),
+`RM_GIN_ID` (13), `RM_GIST_ID` (14), `RM_SPGIST_ID` (16), `RM_BRIN_ID` (17)
+(`rmgrlist.h:41-46`). This slice does not implement them. It makes the refusal
+worth reading and moves it to a point where it costs nothing.
+
+**Why no FPI shortcut is possible.** `requireFullPageImages` (S16.3) rescues an
+unimplemented BTREE opcode when every block it touched carries an applicable
+image, and the obvious question is why the same trick is not extended here.
+Two independent reasons say it cannot be:
+
+- `REGBUF_WILL_INIT` blocks structurally never carry an FPI — `XLogRecordAssemble`
+  drops the image for a block the redo routine is expected to rebuild. There are
+  **23 `REGBUF_WILL_INIT` call sites across the five AMs** (hashovfl.c 2,
+  hashpage.c 3, gindatapage.c 1, ginfast.c 4, ginutil.c 1, gistxlog.c 1,
+  spgdoinsert.c 7, brin_revmap.c 1, brin.c 1, brin_pageops.c 2), so an
+  image-only replay of those records restores nothing.
+- GiST is worse: an image is not *sufficient* even when present.
+  `gistRedoClearFollowRight` (`gistxlog.c:47-54`) does its page work on
+  `BLK_RESTORED` as well as `BLK_NEEDS_REDO`, under the comment "we still update
+  the page even if it was restored from a full page image, because the updated
+  NSN is not included in the image". Restoring the image and reporting
+  `applied=true` yields a stale NSN and a still-set follow-right flag — a
+  silently wrong index, which is precisely what S16.3 exists to prevent.
+
+**Per-AM opcode masking.** Four of the five use the whole `XLR_RMGR_INFO_MASK`
+nibble pair as the opcode. BRIN does not: `XLOG_BRIN_INIT_PAGE` (0x80,
+`brin_xlog.h:43`) is a **flag**, masked off with `XLOG_BRIN_OPMASK` (0x70,
+`brin_xlog.h:38`) before `brin_redo`'s switch. `indexAMOpcode` reproduces that,
+so the message reports `opcode=0x20 init_page`, not the nonexistent `0xa0`.
+
+**Pre-flight, not per-record.** `preflightIndexAMRecords` scans the replay range
+(`records[startIdx:]`, since records before the redo point are already durable
+in the pages) and returns one error naming every distinct AM with a count and
+first LSN. The per-record arm still exists and still refuses — the scan is about
+two things the arm cannot give: a cluster with a GIN *and* a BRIN index is
+diagnosed in one failed start instead of two, and the refusal happens before the
+apply loop, so the data directory is left byte-identical rather than advanced up
+to the first offending record and then abandoned. That matters here specifically
+because this is the one refusal an operator can hit for a completely legitimate
+reason — their PostgreSQL cluster has a GIN index — and the directory they will
+go back to PostgreSQL with must be untouched.
+
+Sizes of the work being deferred, measured at PG 18.3 (redo file LOC / opcodes):
+hash 1158 / 13, GIN 813 / 9, GiST 695 / 6, SP-GiST 1009 / 8, BRIN 367 / 6. Note
+the plan's estimates were low for GiST in particular (400 vs 695). Per-AM resume
+points are in the deferral ledger.
+
+Code: `internal/wal/index_am_refusal.go`, the `RmgrHash/RmgrGin/RmgrGist` ids in
+`internal/wal/xlog_record.go`, the five-rmid arm and the pre-flight call in
+`internal/wal/recovery.go`; guards in `internal/wal/index_am_refusal_pg_test.go`.
 
 ## References
 

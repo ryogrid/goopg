@@ -48,14 +48,19 @@ func encodeTestPGRecordRmid(t *testing.T, rmid Rmgr, info uint8, main []byte) []
 }
 
 // TestReadAllPageAwareKeepsRecordsAfterPGOnlyRmgr is the S16.1 guard: rmids
-// 16..21 are real PG 18 resource managers (rmgrlist.h:28-49) that goopg never
+// 12..21 are real PG 18 resource managers (rmgrlist.h:28-49) that goopg never
 // emits but a PG-authored pg_wal routinely contains. They must decode — and
 // be refused later by the replay dispatcher — rather than fail header
 // validation, which the reader reads as end-of-WAL.
 //
+// M0131-S25 added the three index AMs below RM_SEQ_ID (12 hash, 13 gin,
+// 14 gist) to this list. They were always inside the decoder's bound, but
+// nothing asserted it, and they are the AMs most likely to appear in a real
+// cluster's WAL.
+//
 // Pre-fix behaviour on this exact stream: 1 record, no error.
 func TestReadAllPageAwareKeepsRecordsAfterPGOnlyRmgr(t *testing.T) {
-	for _, rmid := range []Rmgr{RmgrSPGist, RmgrBrin, RmgrCommitTs, RmgrReplicationOrigin, RmgrGeneric, RmgrLogicalMessage} {
+	for _, rmid := range []Rmgr{RmgrHash, RmgrGin, RmgrGist, RmgrSPGist, RmgrBrin, RmgrCommitTs, RmgrReplicationOrigin, RmgrGeneric, RmgrLogicalMessage} {
 		first, _, _ := encodeTestPGHeapInsertRecord(t)
 		last, _, _ := encodeTestPGHeapInsertRecord(t)
 		middle := encodeTestPGRecordRmid(t, rmid, 0x00, []byte{1, 2, 3, 4})
@@ -89,10 +94,14 @@ func TestReadAllPageAwareKeepsRecordsAfterPGOnlyRmgr(t *testing.T) {
 // arms — three documented no-ops and one full `generic_redo` port — so
 // refusing them would be the defect, not the guard. Their own coverage
 // (recognised opcodes applied, UNDEFINED opcodes still refused) is in
-// redo_cheap_tail_pg_test.go. SPGist/BRIN stay here until S25 gives them a
-// refusal that names the access method.
+// redo_cheap_tail_pg_test.go.
+//
+// M0131-S25 gave the five index AMs a NAMED refusal instead of the dispatcher's
+// bare `default:`. This guard is unchanged in substance — refusal, applied=false
+// — and now covers all five; that the message names the access method is
+// asserted in index_am_refusal_pg_test.go.
 func TestReplayRefusesPGOnlyRmgr(t *testing.T) {
-	for _, rmid := range []Rmgr{RmgrSPGist, RmgrBrin} {
+	for _, rmid := range []Rmgr{RmgrHash, RmgrGin, RmgrGist, RmgrSPGist, RmgrBrin} {
 		rec := encodeTestPGRecordRmid(t, rmid, 0x00, []byte{9})
 		decoded, err := decodeRecordXLogDetailed(rec)
 		if err != nil {

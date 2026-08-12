@@ -2053,6 +2053,18 @@ func ReplayRecordsFrom(mgr *storage.Manager, records []Record, redoLSN uint64) (
 	startIdx, checkpointLSN := replayStartAt(records, redoLSN)
 	stats.CheckpointLSN = checkpointLSN
 
+	// M0131-S25: refuse the whole index-AM boundary up front, before the first
+	// page is written. The per-record arm in replayDecodedXLogRecord would
+	// catch these anyway, but only one at a time and only after the prefix has
+	// already been applied — so a cluster with a GIN and a BRIN index costs two
+	// failed starts to diagnose and leaves a half-advanced data directory
+	// behind each time. Scanning the replay range (not the whole slice: records
+	// before the redo point are already durable in the pages) turns that into
+	// one refusal that names every AM present and mutates nothing.
+	if err := preflightIndexAMRecords(records[startIdx:]); err != nil {
+		return stats, err
+	}
+
 	for i, r := range records[startIdx:] {
 		applied, err := ApplyRecord(mgr, r)
 		if err != nil {
@@ -2545,6 +2557,16 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 		return true, nil
 	case RmgrCommitTs:
 		return replayDecodedXLogCommitTs(mgr, r, xlog)
+	case RmgrHash, RmgrGin, RmgrGist, RmgrSPGist, RmgrBrin:
+		// M0131-S25: the index-AM boundary. These five have no redo in goopg
+		// and no shortcut that could stand in for one (index_am_refusal.go
+		// documents why an FPI-only replay is provably wrong for them — GiST's
+		// NSN is not in the image, and REGBUF_WILL_INIT blocks carry no image
+		// at all). The one thing that CAN improve is the refusal itself: name
+		// the access method, the opcode, the LSN and the relation, so the
+		// message tells an operator which index to drop rather than which
+		// rmgrlist.h line to look up.
+		return false, indexAMUnsupportedError(r, xlog)
 	case RmgrRelMap:
 		switch xlog.Header.Info & XLRRmgrInfoMask {
 		case xlogRelmapUpdate:
