@@ -1,49 +1,58 @@
 (idle — nothing in flight)
 
-M0119-0006 34th slice landed: the numeric index key has no display scale, and
-cannot be given one. Committed and pushed.
+M0119-0006 57th slice landed: a `bpchar` value loses its declared width at
+every render boundary. Committed and pushed.
 
-The finding worth carrying: **a deferral ledger's resume point is a hypothesis,
-not an instruction.** This row's said "carry the display scale in the key — it is
-trailing metadata, so it need not disturb the order-preserving mantissa run".
-Order was never the binding constraint. EQUALITY was: `EncodeNumericKey` strips
-trailing mantissa zeros so `1.0` and `1.00` encode to the same bytes, and that
-byte identity is the entire mechanism by which `UNIQUE` on `numeric` raises
-23505 — which is what PG does, since `numeric_cmp` ignores display scale.
-Byte-identical keys cannot also distinguish two spellings of one number. Ten
-minutes of probing (a throwaway `zz_probe_test.go` printing the two encodings
-plus a live duplicate INSERT) refuted the resume point before any code was
-written; the ledger row now says so and its successor row names the real seam.
+Carry-forward #1 — **the same lesson as loop #69, now with a second data
+point: a deferral resume point is a hypothesis.** The 56th slice's row said
+`bpcharsend` IS `textsend`, so "the bytes are accidentally right", and that the
+remaining decode padding needed a `copyBinaryToDatum` signature widening. Both
+halves fell in ten minutes of measurement. `textsend` ships the STORED image,
+and goopg stores `bpchar` trimmed where PG stores it padded — so the ENCODE
+side, the half the row had cleared, was writing a 2-byte field where PG writes
+10. And `copyBinaryToDatum` has taken a `catalog.Type` all along, whose `Args`
+IS the typmod; `ParseCopyBinaryRows` passes `cols[i].Type`. Three older ledger
+rows were repeating that same false blocker and are corrected in place.
 
-Second point, the shape of the fix: the scan was asking ONE question where there
-are two — "can these bytes be inverted to the right VALUE" (what
-`bt_index_check`'s comparator needs, and `numeric` answers yes) versus "does the
-resulting Datum SPELL the value the way the heap spells it" (what an index-only
-scan needs, and `numeric` answers no). Conflating them is what made the
-containment look expensive in the 27th slice: refusing `numeric` in the DECODER
-would have disabled `bt_index_check` on every numeric index, for a loss that buys
-nothing. Splitting the predicate costs one function.
+Carry-forward #2 — **measure every boundary before scoping to one.** The row
+framed this as a binary-COPY gap. Probing the same `char(10)` column across all
+surfaces found the identical missing padding FOUR times: the `SELECT` DataRow,
+`COPY … TO` text, CSV, binary, and the pgoutput change message. Scoping to COPY
+would have left three-quarters of the defect and a fourth un-synced sibling.
 
-Third: the same defect had two code paths with different exposure. The scalar
-`numeric` arm did NOT reproduce, because that index takes the PG tuple-image key
-path, which carries per-attribute datums and loses no spelling. So the new
-refusal is asked only of the blob key format — and the E2E test carries the
-scalar arm anyway, since which format an index gets is not a property the test
-should depend on.
+Carry-forward #3 — **why it hid for so long is worth more than the fix.** The
+two natural `psql` probes both conceal it: `length()` uses `bcTruelen`, and a
+`||` operand goes through the rtrimming `bpchar`→`text` cast. A pre-existing
+`dispatch.go` comment had drawn exactly that wrong conclusion in writing
+("bpcharout uses bcTruelen which trims"); `bpcharout` is a bare
+`TextDatumGetCString`. When a comment cites an upstream function as its
+authority, read the function.
 
-Selection context for the next loop (re-verify, do not trust): M-NIGHTLY had zero
-open items at this loop's triage (all 17 `AI-20260813-*` filed and closed);
-M0131's two unchecked items (S9, S24) are both deferred-with-ledger-row —
-S9 only because S9.4 became M0133; M0130 has zero unchecked items. That leaves
-M0119 as the selectable drain, where M0119-0006 is the largest open cluster and
-takes one slice per loop off its residual list.
+Carry-forward #4 — the multibyte probe was where the second bug fell out
+(`coerceTextLikeDatum` measured the declared length in BYTES, so `'あい'` into
+a `char(5)` was a spurious 22001). Any width-semantics slice should carry a
+multibyte row.
 
-Gates: `go build ./...` clean; `go vet ./internal/executor/` clean;
-`internal/executor` + `internal/access/btree` PASS; new
-`TestNumericIndexOnlyScanKeepsDisplayScale` PASS and proven fail-when-broken
-(array arm reports `{2.7}` want `{2.70}` with the check removed);
+Selection context for the next loop (re-verify, do not trust): banner still
+names M0131 first; its two unchecked items (S9, S24) are deferred-with-row,
+M0130 has zero unchecked, M0132/M0133 are explicitly FILED-NOT-PROMOTED. That
+leaves M0119 as the selectable drain, M0119-0006 the largest open cluster.
+The binary-`COPY` type chain is now EXHAUSTED — `bpchar` was its last named
+type. Next candidates are the three rows this slice filed (`octet_length` off
+the trimmed image; bare `bpchar` treated as `char(1)`; the trimmed heap image
+itself) or the older 005 residuals (posting-list duplicates, box/int4range/
+int4[] key types).
+
+Gates: `go build ./...` clean; `internal/catalog` + `internal/executor` +
+`internal/wal` + `internal/server` + `internal/pgnodes` PASS;
+`TestPort_RegressSuite` PASS (271 s, `-timeout 40m` — the default 600 s timeout
+KILLS it, see In-flight note below); `RALPH_PRECOMMIT_SCOPE=units` PASS;
 `scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35 canonical); TPC-DS SF0.5 sweep
-PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0, plan shapes identical 99/99; UNITS PASS;
-pgbench smoke PASS via the commit hook.
+PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0, plan shapes identical 99/99; pgbench
+smoke PASS via the commit hook. Mutation-checked 3 ways (30 / 10 / 1 red).
+
+Operational note for the next loop: `go test -run TestPort_RegressSuite
+./internal/testport/` needs an explicit `-timeout 40m`. At the default 600 s it
+panics with a goroutine dump that reads like a hang, not a timeout.
 
 In-flight: none.

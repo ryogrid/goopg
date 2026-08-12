@@ -3639,6 +3639,43 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       with the `copyBinaryToDatum` typmod widening the three `Adjust*ForTypmod`
       rows are blocked on, collapsing four ledger rows into one slice.
 
+      **57th slice (2026-08-13): a `bpchar` value loses its declared width at
+      every render boundary.** The 56th's resume point was refuted in BOTH
+      halves before code was written. It read `bpcharsend` IS `textsend` as
+      "the bytes are accidentally right" — but `textsend` ships the STORED
+      image, and upstream stores a `bpchar` blank-padded where goopg stores it
+      trimmed, so a `char(10)` holding `'ab'` was a **2-byte** binary field
+      where PG writes **10**: the defect was on the ENCODE side the row had
+      cleared. And no `copyBinaryToDatum` signature widening was needed — it
+      already takes a `catalog.Type` whose `Args` IS the typmod, passed from
+      `cols[i].Type` all along (the three `Adjust*ForTypmod` rows are corrected
+      in place: they are blocked on the unported FUNCTIONS, not on plumbing).
+      **The defect was not COPY-local either:** the same missing padding
+      appeared at FOUR boundaries — the `SELECT` DataRow, `COPY … TO` in text,
+      CSV and binary, and the pgoutput change message — now all served by one
+      shared `catalog.PadBpchar`, sited on the package that owns `Type` because
+      `internal/executor` and `internal/wal` both need it and neither may
+      import the other. It survived because the two natural ways to eyeball a
+      `bpchar` in `psql` hide it: `length()` uses `bcTruelen` and a `||`
+      operand goes through the rtrimming `bpchar`→`text` cast — a pre-existing
+      `dispatch.go` comment had drawn exactly that wrong conclusion, since
+      `bpcharout` is a bare `TextDatumGetCString` that trims nothing. The
+      multibyte probe found a SECOND divergence one layer up:
+      `coerceTextLikeDatum` measured the declared length in BYTES, so `'あい'`
+      into a `char(5)` was a spurious 22001 where PG accepts it at 9 bytes.
+      The decode half deliberately gets NO arm (padding there would make one
+      column two widths depending on whether it was `INSERT`ed or `COPY`ed),
+      pinned by a test that says so. Item stays UNCHECKED (standing
+      slice-by-slice cluster). 6 guards mutation-checked three ways (30 / 10 /
+      1 failing sub-tests); 1 pre-existing test corrected because it had
+      encoded the bug; E2E byte-identical to PG 18.3 on all 8 `cmp`
+      comparisons. `TestPort_RegressSuite` PASS (Hard-won Rule #5), UNITS PASS,
+      tpch-spotcheck PASS (Q12=2/Q13=35), TPC-DS SF0.5 PASS=95 MISMATCH=0
+      CKMISMATCH=0. 1 ledger row resolved, 3 filed (`octet_length` still reads
+      the trimmed image; bare `bpchar` still treated as `char(1)`; the heap
+      image stays trimmed). Design `0119-0006-bpchar-declared-width.md` +
+      README row.
+
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
 

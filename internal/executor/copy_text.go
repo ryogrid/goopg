@@ -357,7 +357,13 @@ func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone str
 	default:
 		switch d.Kind {
 		case KindString:
-			return d.StringValue(), nil
+			// catalog.PadBpchar restores the declared width a bpchar column
+			// lost when coerceTextLikeDatum trimmed it on the way in; upstream
+			// CopyOneRowTo calls bpcharout, which trims nothing, so a
+			// `char(10)` holding 'ab' is written as 10 characters (measured
+			// against PG 18.3 in both TEXT and CSV). It is a no-op for every
+			// other type. M0119-0006 (57th slice).
+			return catalog.PadBpchar(t, d.StringValue()), nil
 		case KindBytes:
 			return string(d.BytesValue()), nil
 		case KindInt:

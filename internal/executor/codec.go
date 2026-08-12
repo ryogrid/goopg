@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mctx"
@@ -147,11 +148,21 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 	}
 
 	tname := strings.ToLower(t.Name)
+	// The declared length of a varchar(n)/char(n) counts CHARACTERS, not bytes:
+	// upstream varchar_input and bpchar_input both measure with
+	// pg_mbstrlen_with_len before converting maxlen to a byte length
+	// (postgres/src/backend/utils/adt/varchar.c). Measured on PG 18.3:
+	// `'あいうえお'::varchar(5)` is accepted and occupies 15 bytes, and
+	// `'あい'::char(5)` is 9 bytes / length() 2. Counting bytes here rejected
+	// both with a spurious 22001, and disagreed with the rune-counting
+	// truncation the explicit-cast path already did (expr.go) and with the
+	// rune-counting pad catalog.PadBpchar now applies at every render boundary.
+	// M0119-0006 (57th slice).
 	if tname == "varchar" || tname == "character varying" {
 		if len(t.Args) > 0 {
 			n := int(t.Args[0])
 			stripped := strings.TrimRight(s, " ")
-			if len(stripped) > n {
+			if utf8.RuneCountInString(stripped) > n {
 				return "", &ExecError{Code: "22001",
 					Message: fmt.Sprintf("value too long for type character varying(%d)", n)}
 			}
@@ -163,7 +174,7 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 			n = int(t.Args[0])
 		}
 		stripped := strings.TrimRight(s, " ")
-		if len(stripped) > n {
+		if utf8.RuneCountInString(stripped) > n {
 			return "", &ExecError{Code: "22001",
 				Message: fmt.Sprintf("value too long for type character(%d)", n)}
 		}

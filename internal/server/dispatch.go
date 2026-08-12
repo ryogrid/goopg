@@ -3341,9 +3341,18 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 		// for normal ones. Convert KindNumeric to float64 and use %g. M0097-0003.
 		return appendFloat8Text(dst, d)
 	case "char", "bpchar":
-		// bpcharout (PG) uses bcTruelen which trims trailing spaces before
-		// sending over the wire. Input coercion already strips trailing spaces
-		// (codec.go), so just emit the stored value without re-padding.
+		// The comment this replaces claimed bpcharout trims via bcTruelen; it
+		// does not — bpcharout is a bare TextDatumGetCString
+		// (postgres/src/backend/utils/adt/varchar.c), so PG sends all N
+		// declared characters. Measured on PG 18.3: `SELECT c` from a
+		// `char(10)` holding 'ab' returns 10 bytes, goopg returned 2. Input
+		// coercion stores the value trimmed by design (codec.go's
+		// coerceTextLikeDatum), so the declared width is restored here, by the
+		// same catalog.PadBpchar the COPY and pgoutput renderers call.
+		// M0119-0006 (57th slice).
+		if d.Kind == executor.KindString {
+			return append(dst, catalog.PadBpchar(typ, d.StringValue())...)
+		}
 		return d.AppendValueText(dst)
 	case "date":
 		// Date columns render per the session's DateStyle GUC (style x
