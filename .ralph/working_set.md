@@ -1,42 +1,41 @@
 (idle — nothing in flight)
 
-M0131-S21c LANDED (loop #168) — in-place line-pointer reuse in PG-format heap redo.
+M0131-S21d LANDED (loop #169) — `heap_xlog_update` now acquires its pages the way
+every other heap redo routine does, and **a real PG's crash tail replays END TO
+END**: the S28 E2E starts, finishes recovery and writes goopg's own checkpoint
+over the PG data directory. No replay refusal is left in that stream.
 
-Files: `internal/wal/recovery.go` (new `redoHeapPageAddItemOverwrite`; all three
-call sites rewired), `internal/wal/heap_multi_insert_pg_test.go` (1 test renamed
-+ 2 new), design `docs/design/0131-0015-*` §"S21c" + Guards, `.ralph/fix_plan.md`
-(S21c checked, S21d filed), 1 `.ralph/deferral_ledger.md` row.
+Files: `internal/wal/recovery.go` (`replayDecodedXLogHeapUpdate` — manual
+NBlocks/ReadBlock/IsNew guards replaced), `internal/wal/heap_update_pg_test.go`
+(2 new tests), design `docs/design/0131-0015-*` §"S21d" + Guard 9,
+`.ralph/fix_plan.md` (S21d checked, S21e + S21f filed), 2 ledger rows.
 
-The discovery worth keeping: ONE upstream call —
-`PageAddItemExtended(..., offnum, PAI_OVERWRITE | PAI_IS_HEAP)` — is shared by
-`heap_xlog_insert`, `heap_xlog_multi_insert` AND `heap_xlog_update`, and goopg's
-three copies disagreed three different ways:
-1. multi-insert REFUSED the already-allocated case (the known S21c symptom);
-2. single insert had **no check at all** — `PageInsertItemRawAt` SHIFTED the
-   array, moving the row at the target slot and staling every ctid to it. Silent
-   corruption where upstream PANICs; found only by the sibling-path rule;
-3. update ignored `new_offnum` entirely, APPENDED, then rejected the result as
-   "new-slot drift".
-LP_UNUSED target → fill in place; USED target → hard refusal (upstream WARNING →
-caller PANIC). The in-place case is ordinary traffic: any COPY after a VACUUM.
+The discovery worth keeping: the update record's two block refs are NOT
+symmetric, and the asymmetry is upstream's. Block 0 (new version) is
+`XLogInitBufferForRedo`/`XLogReadBufferForRedo` → `redoHeapPageForBlock`:
+zero-extend past the flushed end, honour `XLOG_HEAP_INIT_PAGE`. Block 1 (old
+version, cross-page only) is RBM_NORMAL → `redoExistingHeapPageForBlock`: an
+absent page is `BLK_NOTFOUND`, skip the stamp, never extend. Only the page
+receiving the new tuple may be created.
 
-S28 gate moved forward, still red: `TestE2E_GoopgCrashStartOnPGDataDir` went
-from refusing at replay record 24720 → 43900, now stopping at
-"xlog heap-update: block 41 is uninitialised". That is a DIFFERENT defect —
-`replayDecodedXLogHeapUpdate` never got S21a-2's `redoHeapPageForBlock`
-(zero-extend past the replay gap + `XLOG_HEAP_INIT_PAGE`) — filed as
-**M0131-S21d** with a ledger row.
+S28 gate stop MOVED OFF WAL entirely: it now fails at
+`relation "s28_items" does not exist` (42P01) — goopg's boot does not build its
+in-memory catalog from the on-disk pg_class/pg_attribute it just replayed. Filed
+as **M0131-S21e** (ledger row). Sibling audit found three PG-format paths still
+refusing where upstream skips (heap-delete, heap-prune, replayExistingXLogBlock)
+— deliberately NOT folded in (they fail loudly, not silently) → **M0131-S21f**.
 
-Gates: `internal/wal` full package PASS, `internal/storage` PASS, `-race` on the
-touched wal tests PASS, UNITS precommit PASS (warm cache; `internal/initdb` 81s
-cold), pgbench smoke via the commit hook, `make ralph-state-guard` OK.
-Fail-when-broken proven by a scripted revert of the reuse branch → both new
-subtests FAIL.
+Gates: `internal/wal` + `internal/storage` PASS, `-race` on the touched wal tests
+PASS, UNITS precommit PASS (warm cache), S28 E2E advanced (still red, new layer),
+pgbench smoke via the commit hook, `make ralph-state-guard` OK (auto-repaired the
+stale completed marker). Fail-when-broken proven by a scripted re-insertion of
+the `block does not exist` guard → the new-page test FAILS.
 
 Nightly triage: `ci/logs/action-items.md` still run `20260812-005501`; all 4
-`## AI-` items already filed under M-NIGHTLY, nothing new to file.
+`## AI-` items already filed under M-NIGHTLY, nothing new.
 
-Next loop (banner = M-NIGHTLY filing, then M0131): **M0131-S21d** — it is the
-S28 gate's current stop and a ~1-loop mechanical fix. Otherwise S23 (cheap tail).
+Next loop (banner = M-NIGHTLY filing, then M0131): **M0131-S21e** — it is the S28
+gate's current stop, though it is a catalog-cold-start task, not WAL. Cheaper
+alternatives if that proves large: S21f (mechanical) or S23 (cheap tail).
 
 In-flight: none.

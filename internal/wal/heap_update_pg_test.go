@@ -165,3 +165,147 @@ func TestApplyRecordReplaysPGHeapUpdateCrossPage(t *testing.T) {
 		t.Fatalf("new tuple data = %q, want %q", newAfter.Data, "new2")
 	}
 }
+
+// TestApplyRecordReplaysPGHeapUpdateExtendsMissingNewPage pins M0131-S21d: the
+// new-tuple page is acquired the way upstream's heap_xlog_update acquires it —
+// XLogReadBufferExtended, which zero-extends the fork when the record names a
+// block past its end (xlogutils.c:479-539) — instead of refusing the whole
+// start with "block N does not exist" / "block N is uninitialised".
+//
+// This is not an exotic shape: a real-PG crash tail routinely references pages
+// past the last flushed one, and an UPDATE that moves a row to a freshly
+// extended page is exactly this record. Before the fix,
+// TestE2E_GoopgCrashStartOnPGDataDir stopped here at replay record 43900.
+func TestApplyRecordReplaysPGHeapUpdateExtendsMissingNewPage(t *testing.T) {
+	dataDir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+	defer mgr.Close()
+
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 911, Fork: storage.MainFork}
+
+	// Only block 0 exists; the update sends the new version to block 2, so
+	// replay must create block 1 (an empty gap page) and block 2.
+	oldTup := storage.NewHeapTuple(42, storage.InvalidTransactionID, []byte("old"))
+	oldTup.Header.CTID = storage.ItemPointer{Block: 0, Offset: 1}
+	oldBytes, err := oldTup.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	insertFramed, err := EncodeHeapInsertPG(rel, 0, 1, oldBytes, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyPGRecord(t, mgr, insertFramed, 100)
+
+	const xmax = storage.TransactionID(88)
+	newTup := storage.NewHeapTuple(xmax, storage.InvalidTransactionID, []byte("moved"))
+	newBytes, err := newTup.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	framed, err := EncodeHeapUpdatePG(rel, 0, 1, 2, 1, xmax, newBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyPGRecord(t, mgr, framed, 200)
+
+	nblocks, err := mgr.NBlocks(rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nblocks != 3 {
+		t.Fatalf("nblocks = %d, want 3 (gap page 1 + target page 2 extended)", nblocks)
+	}
+	gap := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(rel, 1, gap); err != nil {
+		t.Fatal(err)
+	}
+	if !storage.IsNew(gap) {
+		t.Fatalf("gap block 1 must stay empty; a later record fills it")
+	}
+
+	newPage := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(rel, 2, newPage); err != nil {
+		t.Fatal(err)
+	}
+	newAfter, err := storage.PageGetHeapTuple(newPage, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(newAfter.Data) != "moved" {
+		t.Fatalf("new tuple data = %q, want %q", newAfter.Data, "moved")
+	}
+	if newAfter.Header.CTID != (storage.ItemPointer{Block: 2, Offset: 1}) {
+		t.Fatalf("new t_ctid = %+v, want self {2,1}", newAfter.Header.CTID)
+	}
+
+	oldPage := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(rel, 0, oldPage); err != nil {
+		t.Fatal(err)
+	}
+	oldAfter, err := storage.PageGetHeapTuple(oldPage, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldAfter.Header.Xmax != xmax {
+		t.Fatalf("old t_xmax = %d, want %d", oldAfter.Header.Xmax, xmax)
+	}
+	if oldAfter.Header.CTID != (storage.ItemPointer{Block: 2, Offset: 1}) {
+		t.Fatalf("old t_ctid = %+v, want {2,1} (forward link to the extended page)", oldAfter.Header.CTID)
+	}
+}
+
+// TestApplyRecordReplaysPGHeapUpdateSkipsMissingOldPage pins the other half of
+// M0131-S21d's asymmetry: block 1 (the OLD version's page) is upstream's
+// RBM_NORMAL read, so a page that is absent or all-zero yields BLK_NOTFOUND and
+// the stamp is silently skipped — the relation is dropped or truncated later in
+// the same stream. Only the new-tuple page may be extended into existence.
+func TestApplyRecordReplaysPGHeapUpdateSkipsMissingOldPage(t *testing.T) {
+	dataDir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+	defer mgr.Close()
+
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 912, Fork: storage.MainFork}
+
+	seed := storage.NewHeapTuple(42, storage.InvalidTransactionID, []byte("seed"))
+	seed.Header.CTID = storage.ItemPointer{Block: 0, Offset: 1}
+	seedBytes, err := seed.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	insertFramed, err := EncodeHeapInsertPG(rel, 0, 1, seedBytes, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyPGRecord(t, mgr, insertFramed, 100)
+
+	const xmax = storage.TransactionID(66)
+	newTup := storage.NewHeapTuple(xmax, storage.InvalidTransactionID, []byte("kept"))
+	newBytes, err := newTup.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Old version claims block 9, which does not exist.
+	framed, err := EncodeHeapUpdatePG(rel, 9, 1, 0, 2, xmax, newBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyPGRecord(t, mgr, framed, 200)
+
+	page := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(rel, 0, page); err != nil {
+		t.Fatal(err)
+	}
+	newAfter, err := storage.PageGetHeapTuple(page, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(newAfter.Data) != "kept" {
+		t.Fatalf("new tuple data = %q, want %q — the new version must land even though the old page is gone", newAfter.Data, "kept")
+	}
+	if nblocks, err := mgr.NBlocks(rel); err != nil {
+		t.Fatal(err)
+	} else if nblocks != 1 {
+		t.Fatalf("nblocks = %d, want 1 — a missing OLD page must not extend the fork", nblocks)
+	}
+}

@@ -4064,13 +4064,6 @@ func replayDecodedXLogHeapUpdate(mgr *storage.Manager, r Record, xlog *XLogDecod
 	if err != nil {
 		return err
 	}
-	nblocks, err := mgr.NBlocks(block.Rel)
-	if err != nil {
-		return err
-	}
-	if block.Block >= nblocks {
-		return fmt.Errorf("wal: xlog heap-update: block %d does not exist (nblocks=%d)", block.Block, nblocks)
-	}
 	// Old-tuple page: block 1 when the versions live on different pages
 	// (non-HOT cross-page form), else the shared block 0 page.
 	oldBlock := block
@@ -4080,12 +4073,20 @@ func replayDecodedXLogHeapUpdate(mgr *storage.Manager, r Record, xlog *XLogDecod
 		}
 		oldBlock = ob
 	}
-	page := make(storage.Page, storage.BlockSize)
-	if err := mgr.ReadBlock(block.Rel, block.Block, page); err != nil {
+	// M0131-S21d: acquire block 0 the way every other heap redo routine does.
+	// Upstream draws no distinction here — heap_xlog_update takes
+	// XLogInitBufferForRedo + PageInit when XLOG_HEAP_INIT_PAGE is set and
+	// XLogReadBufferForRedo otherwise (heapam_xlog.c:918-931), i.e. the same
+	// XLogReadBufferExtended that zero-extends past the end of the fork
+	// (xlogutils.c:479-539). This path used to read the block itself and refuse
+	// on `block >= nblocks` / `IsNew(page)`, which is why a real-PG crash tail
+	// stopped the start ("block %d is uninitialised"): the tail routinely
+	// references a page past the last flushed one, and an UPDATE that moves a
+	// row to a freshly extended page arrives with INIT_PAGE set and nothing on
+	// disk to read.
+	page, skip, err := redoHeapPageForBlock(mgr, block, storage.LSN(r.EndLSN), xlog.Header.Info&xlogHeapInit != 0)
+	if err != nil {
 		return err
-	}
-	if storage.IsNew(page) {
-		return fmt.Errorf("wal: xlog heap-update: block %d is uninitialised", block.Block)
 	}
 	samePage := oldBlock.Block == block.Block
 	stampOld := func(p storage.Page) error {
@@ -4094,7 +4095,7 @@ func replayDecodedXLogHeapUpdate(mgr *storage.Manager, r Record, xlog *XLogDecod
 		}
 		return storage.PageStampUpdatedOldTuple(p, oldOffnum, storage.TransactionID(oldXmax), block.Block, newOffnum)
 	}
-	if storage.MustHeader(page).LSN() < storage.LSN(r.EndLSN) {
+	if !skip {
 		// M0131-S21c: place the new version AT new_offnum, exactly as
 		// heap_xlog_update's PageAddItemExtended(..., xlrec->new_offnum,
 		// PAI_OVERWRITE | PAI_IS_HEAP) does — the third member of the
@@ -4121,17 +4122,19 @@ func replayDecodedXLogHeapUpdate(mgr *storage.Manager, r Record, xlog *XLogDecod
 	}
 	// Cross-page: stamp the old version on its own page, with its own
 	// pd_lsn idempotency (mirrors PG's per-buffer redo).
-	if oldBlock.Block >= nblocks {
-		return fmt.Errorf("wal: xlog heap-update: old block %d does not exist (nblocks=%d)", oldBlock.Block, nblocks)
-	}
-	oldPage := make(storage.Page, storage.BlockSize)
-	if err := mgr.ReadBlock(block.Rel, oldBlock.Block, oldPage); err != nil {
+	//
+	// M0131-S21d: block 1 is upstream's RBM_NORMAL read — XLogReadBufferForRedo
+	// with no WILL_INIT — so an absent or all-zero page is BLK_NOTFOUND and the
+	// stamp is skipped, not an error (redoExistingHeapPageForBlock, and see its
+	// invalid-page-table deviation note). The new-tuple page above is the one
+	// that may be extended into existence; the page holding the row's OLD
+	// version cannot legitimately be missing unless the relation is dropped or
+	// truncated later in the same stream.
+	oldPage, skipOld, err := redoExistingHeapPageForBlock(mgr, oldBlock, storage.LSN(r.EndLSN))
+	if err != nil {
 		return err
 	}
-	if storage.IsNew(oldPage) {
-		return fmt.Errorf("wal: xlog heap-update: old block %d is uninitialised", oldBlock.Block)
-	}
-	if storage.MustHeader(oldPage).LSN() >= storage.LSN(r.EndLSN) {
+	if skipOld {
 		return nil
 	}
 	if err := stampOld(oldPage); err != nil {

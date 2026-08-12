@@ -1184,6 +1184,57 @@ replay gap + honour `XLOG_HEAP_INIT_PAGE`), which the insert paths already have.
 Filed as **M0131-S21d** with a ledger row; it is a page-acquisition defect, not
 a line-pointer one, so it is not folded in here.
 
+### S21d — implementation notes: `heap_xlog_update` acquires its pages like everyone else (landed 2026-08-12)
+
+S21c's sibling audit was about *where on the page* a tuple lands; S21d is about
+*how the page is obtained*. `replayDecodedXLogHeapUpdate` was the last heap redo
+routine still doing its own `NBlocks` + `ReadBlock` + two hard refusals —
+`"block %d does not exist"` and `"block %d is uninitialised"` — instead of
+S21a-2's `redoHeapPageForBlock`. Upstream draws no such distinction:
+`heap_xlog_update` (`heapam_xlog.c:918-931`) takes `XLogInitBufferForRedo` +
+`PageInit` when `XLOG_HEAP_INIT_PAGE` is set and `XLogReadBufferForRedo`
+otherwise — the same `XLogReadBufferExtended` (`xlogutils.c:479-539`) that
+zero-extends the fork past its flushed end that every other heap redo routine
+uses.
+
+Both refusals fire on ordinary real-PG traffic. A crash tail routinely names a
+block past the last flushed one (the extension itself was never WAL-logged), and
+an UPDATE that moves a row to a freshly extended page arrives with
+`XLOG_HEAP_INIT_PAGE` set and *nothing on disk to read*: the record's offsets are
+relative to an empty page precisely because the primary had just initialised one.
+
+The two block references are deliberately **not** symmetric, and that asymmetry
+is upstream's:
+
+| block | upstream call | goopg helper | page absent ⇒ |
+|---|---|---|---|
+| 0 (new version) | `XLogInitBufferForRedo` / `XLogReadBufferForRedo` | `redoHeapPageForBlock` | zero-extend the gap, init, apply |
+| 1 (old version, cross-page only) | `XLogReadBufferForRedo`, RBM_NORMAL | `redoExistingHeapPageForBlock` | `BLK_NOTFOUND` ⇒ skip the stamp |
+
+Only the page receiving the new tuple may be extended into existence. The page
+holding the row's OLD version cannot legitimately be missing unless the relation
+is dropped or truncated later in the same stream, which is exactly the case
+upstream's `BLK_NOTFOUND` covers (goopg's deviation there — no invalid-page hash
+table, so a genuinely missing page is skipped rather than PANICking at the end of
+recovery — is the one already recorded for `redoExistingHeapPageForBlock`).
+
+**Effect on the S28 gate:** `TestE2E_GoopgCrashStartOnPGDataDir` no longer
+refuses at all — a real PG's crash tail now replays **end to end**, recovery
+completes and goopg writes its own checkpoint over the PG data directory. The
+test still fails, but past replay entirely and on an unrelated layer: the
+PG-created table is not resolvable (`relation "s28_items" does not exist`,
+42P01), i.e. cold-start catalog visibility rather than WAL. Filed as
+**M0131-S21e** with a ledger row.
+
+**Sibling audit (S21c's lesson, applied):** three PG-format redo paths still
+carry the same hand-rolled "must exist and be initialised" guard where upstream
+would skip — `replayDecodedXLogHeapDelete`, `replayDecodedXLogHeapPrune`, and the
+shared `replayExistingXLogBlock` (all btree edit-shaped records). They were left
+alone this loop on purpose: unlike the update path they fail *loudly* rather than
+corrupting, none is the gate's current stop, and converting them flips several
+opcodes from "refuse the start" to "silently skip" at once. Filed as
+**M0131-S21f** with a ledger row rather than folded in.
+
 ## Guards
 
 1. Per-opcode unit tests over fixtures captured from a real PG 18.3 via
@@ -1210,9 +1261,14 @@ a line-pointer one, so it is not folded in here.
    array — asserted on **both** the insert and multi-insert paths, since a green
    test on one proves nothing about the other; and a USED target line pointer is
    refused on both.
-9. The S28 reverse crash E2E (`0131-0017`) with the full opcode workload: COPY,
+9. S21d: an `xl_heap_update` naming a new-tuple block past the end of the fork
+   zero-extends the gap and lands the tuple (instead of `"block N does not
+   exist"`), while a cross-page record whose OLD block is missing still applies
+   the new version and merely skips the stamp — the extend/skip asymmetry
+   asserted on both halves.
+10. The S28 reverse crash E2E (`0131-0017`) with the full opcode workload: COPY,
    VACUUM, `SELECT … FOR UPDATE`, TRUNCATE, SAVEPOINT, index-heavy insert.
-10. UNITS + RACE (`internal/wal`, `internal/initdb`) + SMOKE + SPOT green.
+11. UNITS + RACE (`internal/wal`, `internal/initdb`) + SMOKE + SPOT green.
 
 ## References
 
