@@ -233,6 +233,52 @@ instead, which is worse. Lock-in:
 postmaster down; the row-content reads use two separate scalars rather than
 `label || '/' || qty`.
 
+> **F2 RESOLVED 2026-08-12 (M0131-S13).** The hosted PG now answers
+> `SELECT 'a'::text || 1` = `a1`, and
+> `SELECT count(*) FROM pg_proc WHERE proconfig IS NOT NULL` = **0**.
+>
+> Root cause, once located, was a **stale sibling**, not a bitmap or `t_hoff`
+> defect as S13.1 hypothesised: goopg has two builders for the 30-column
+> physical `pg_proc` row, and only one was right. The runtime builder
+> `buildPGProcRow` (`internal/executor/sys_pg_proc.go`) already wrote
+> `NullDatum` for every absent nullable varlena, with a comment explaining
+> exactly why ("PG branches on `attisnull` for these"). The initdb seed builder
+> `pgProcRow` (`internal/initdb/initdb.go`) wrote `NewStringDatum("")` for the
+> same columns, which falls through `encodeValuePG` to `emptyArrayTypeBytes` —
+> a **non-NULL zero-dimension `ArrayType`**. `NullBitmapPG` /
+> `writeMultiPageHeapRows` were both already correct and needed no change; they
+> simply had nothing to mark, because no datum was NULL.
+>
+> The fix makes the seed path match the runtime path for the whole trailing
+> nullable group, per S13.2 — `proallargtypes`, `proargmodes`, `proargnames`,
+> `proargdefaults` (when `pronargdefaults = 0`), `protrftypes`, `probin`,
+> `prosqlbody`, `proconfig`, `proacl`. Fixing `proconfig` alone would have left
+> `prosqlbody` as an empty `pg_node_tree` — `stringToNode("")` — one probe away.
+>
+> Guards: `internal/initdb/pg_proc_nullable_varlena_test.go` sweeps all 3397
+> seed entries at the `Row` level **and** re-decodes one physical tuple through
+> `DecodeRowIntoMctxPGTuple`, because the `Row`-level half alone would pass even
+> if the tuple writer dropped the bitmap. Proven fail-when-broken: restoring
+> `NewStringDatum("")` on `proconfig` fails it at `oid=3
+> (heap_tableam_handler)`. The E2E lock-in is INVERTED per S13.4 —
+> `assertHostedPGCanCallSQLBuiltins` asserts the call succeeds *and* the
+> `proconfig IS NOT NULL` count is zero, and the row-content reads are back to
+> the single `label || '/' || qty` form, which is now itself the tripwire
+> (`text || integer` = `textanycat`, oid 2003, LANGUAGE SQL). The probe is no
+> longer destructive, so it runs inline before guard 4 instead of last.
+>
+> **S13.3 partially discharged, and it found one more site.** `pg_attribute`
+> was already correct (Step 3u had fixed `attacl`/`attoptions`/`attfdwoptions`/
+> `attmissingval`/`attstattarget` for the identical reason — an empty varlena
+> read as "attoptions present", ending in an `ERRORDATA_STACK_SIZE` PANIC).
+> `pg_class` is **not**: `pgClassNailedRow` still writes `relacl = '{}'`,
+> `reloptions = '{}'` and `relpartbound = ''` where upstream's initdb leaves all
+> three NULL. It is latent rather than measured — the E2E connects as a
+> superuser, who bypasses `pg_class_aclcheck` entirely, so a non-null EMPTY
+> `relacl` (which grants nobody anything, not even the owner) cannot be seen
+> from this lane. Deferred with a ledger row rather than fixed blind: it needs a
+> non-superuser hosted-PG probe to state what it actually breaks.
+
 **F3 — `ADD COLUMN … DEFAULT` reads NULL on pre-existing rows (→ M0131-S14).**
 goopg reads `'dflt'`; the hosted PG reads NULL for all 15 rows. **The pg_attrdef
 half is entirely correct** — the hosted PG reads
@@ -243,11 +289,87 @@ What is missing is PG's **fast-default** mechanism: since PG 11, ADD COLUMN with
 a non-volatile DEFAULT does not rewrite the heap but stores the value in
 `pg_attribute.attmissingval` with `atthasmissing = true`, and short tuples
 materialise it on read. goopg neither rewrites the rows nor records the missing
-value. Underneath sits a sharper fact: `attmissingval` does not exist as a
-column at all on the hosted PG (`SELECT attmissingval FROM pg_attribute` →
-42703), so goopg's `pg_attribute` heap is short of at least one attribute in its
-own self-description (the rows for relid 1249). Lock-in:
-`assertFastDefaultGapReadsNullOnHostedPG`.
+value. Underneath sat a sharper fact, and **that half is FIXED (S14.1,
+2026-08-12)**: `attmissingval` did not exist as a column at all on the hosted PG
+(`SELECT attmissingval FROM pg_attribute` → 42703).
+
+**F3 is now CLOSED (S14.2/S14.4, 2026-08-12).** The lock-in was INVERTED: the
+helper is `assertFastDefaultMaterialisesOnHostedPG`, and it asserts positively
+that the hosted PG reads `atthasmissing = 't'` for `s4_items.tag` and
+materialises `tag = 'dflt'` on all 15 physically short pre-ALTER rows — a real
+PG 18.3 running `getmissingattr()` over goopg-authored catalog bytes, with no
+heap rewrite on either side. See *S14.2* below.
+
+*S14.2, as measured and fixed.* Three things had to agree.
+
+1. **The value.** `buildUserPGAttributeRow` now writes `atthasmissing` plus a
+   one-element `ArrayType` built exactly as `StoreAttrMissingVal`
+   (`postgres/src/backend/catalog/heap.c:2030`) builds it via `construct_array`:
+   `ndim=1`, `dataoffset=0` (a NULL default stores nothing at all —
+   `ATExecAddColumn` skips the call when `missingIsNull`), `elemtype` = the
+   COLUMN's own `atttypid` (so an array column's fast default is an
+   array-of-array, as upstream), `dims[0]=lbound[0]=1`, and the element
+   normalised to the 4-byte varlena header form. Source of truth for the value
+   itself is unchanged: `catalog.Column.MissingValue`, set by the existing
+   fast-default backfill in `execAlterTableAddColumn`. An encode failure
+   degrades to the pre-S14.2 shape rather than failing the DDL.
+2. **The type.** `attmissingval` was declared `text` in all three sibling column
+   lists; it is `anyarray` (OID 2277). PG dereferences the datum as
+   `ArrayType *`, so `text` was only survivable while the column was always
+   NULL.
+3. **The alignment.** `anyarray` carries `typalign => 'd'`
+   (`postgres/src/include/catalog/pg_type.dat:573`) — 8 bytes, unlike every
+   other varlena array's `'i'`. Both `initdb.pgTypeAlignChar` (nailed
+   self-description) and `executor.physicalPGTypeAlign` (the wire encoder) had
+   grouped it with the 4-byte varlenas. That mis-padding also covered
+   `pg_statistic.stavalues1..5`, the only other `anyarray` catalog columns; it
+   was invisible for the same reason the S14.1 permutation was — a NULL column
+   consumes neither bytes nor padding — and would have shifted every following
+   byte one word early in the first tuple carrying a real value.
+
+That is the same shape as S14.1 and S13: a value that is always NULL hides
+disagreement among sibling definitions until something finally writes it
+([[pattern_sibling_paths_must_agree]]).
+
+*S14.3, decided and deferred.* goopg's own reader still materialises from the
+in-memory `catalog.Column.MissingValue` (`internal/executor/codec.go`, the
+M0097-0077 short-tuple path), not from the heap's `attmissingval`. The two
+halves are therefore written together but read independently. Making the heap
+the single source of truth is the PG-faithful end state and
+`pgSingletonArrayElement` is the reader it needs, but it is a separate change
+with its own restart/reload surface — ledgered, not smuggled in here.
+
+*S14.1, as measured and fixed.* The 42703 was **not** a missing heap row —
+goopg's rows for relid 1249 always numbered 25, `attmissingval` among them. It
+was `pg_class.relnatts = 24` on the nailed pg_attribute row. PG unlinks goopg's
+`pg_internal.init` at startup (`xlog.c:5633` `RelationCacheInitFileRemove`) and
+builds `pg_attribute` from its own compiled 25-column `Desc_pg_attribute`, but
+`RelationCacheInitializePhase3` then copies `rd_rel` straight out of goopg's
+`pg_class` tuple — so the short `relnatts` truncated the last column off an
+otherwise correct descriptor. In PG18 order that last column is `attmissingval`.
+
+Correcting `relnatts` exposed a permutation beneath it. goopg ordered the five
+nullable trailing columns
+`attacl/attoptions/attfdwoptions/attmissingval/attstattarget`; PG18 orders them
+`attstattarget/attacl/attoptions/attfdwoptions/attmissingval`. The old code
+appended `attstattarget` last on the stated theory that its canonical position
+was #4 — true through PG16, but PG18 moved it after `attcollation` when it
+became nullable. With all five NULL the two orders are physically
+indistinguishable (identical null bitmap, unchanged `t_hoff`), which is why it
+survived this long; `ALTER COLUMN … SET STATISTICS` writes `attstattarget`, and
+a hosted PG would then have read that `int2` as `attacl`.
+
+goopg described `pg_attribute` in four places and they had drifted apart:
+`initdb.pgAttrColDefs`, `catalog.PGAttributeColumns` and
+`executor.pgAttributeColumnsPG18` shared the wrong tail order, while
+`initdb.pgAttributeAttrs` (the `pg_internal.init` descriptor) was a 24-column
+PG-11-era layout with an `attcacheoff` PG18 no longer has. `pgAttributeAttrs`
+now DERIVES from `pgAttrColDefs` through a shared helper, so that pair cannot
+drift again; the other two are pinned by
+`TestPGAttributeSelfDescriptionIsPG18Canonical` (initdb) and
+`TestPGAttributeColumnsPG18IsCanonical` (executor), which spell out PG18's order
+in full. This is the [[pattern_sibling_paths_must_agree]] failure mode for the
+third time in this milestone (S13's `pg_proc`, Step 3u's `attoptions`, now this).
 
 **F4 — a goopg-`CREATE DATABASE`-minted database is unopenable (→ M0131-S15).**
 Connecting to `s4other` fails with

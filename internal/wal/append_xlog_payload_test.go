@@ -15,7 +15,7 @@ func makeAppendXLogPayloadFixture(t *testing.T, segSize uint64) *stripeWriterCor
 	walBuf := newWALBuffer(1 << 20)
 	walBuf.reset(0)
 	memRing := NewMemRing(1 << 20)
-	return newStripeWriterCore(segSize, 0, 0, walBuf, memRing)
+	return newStripeWriterCore(segSize, 0, 0, walBuf, memRing, padLayout{})
 }
 
 func TestAppendXLogPayloadHappyPathReturnsPredictedSizes(t *testing.T) {
@@ -195,7 +195,7 @@ func TestAppendXLogPayloadCrossSegmentBoundary(t *testing.T) {
 	walBuf := newWALBuffer(1 << 20)
 	walBuf.reset(0)
 	memRing := NewMemRing(1 << 20)
-	c := newStripeWriterCore(segSize, 0, 0, walBuf, memRing)
+	c := newStripeWriterCore(segSize, 0, 0, walBuf, memRing, padLayout{})
 
 	// Burn curr so the next paddedLen-sized reservation crosses the
 	// segment boundary. The first reservation lands at start=0 with

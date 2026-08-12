@@ -472,6 +472,42 @@ func copyBootstrapCatalogImage(dataDir string, dbOID uint32) error {
 	return nil
 }
 
+// refreshTemplate0Image overwrites base/4 (template0) with the finished
+// base/5 (`postgres`) image, file by file, at the END of initdb — after every
+// heap/btree bootstrapper and the relcache init-file generator have run
+// (M0131-S15).
+//
+// Why base/5 and not base/1: the two are byte-identical for every file they
+// share, but base/5 additionally carries pg_filenode.map and the per-database
+// placeholder files for the shared indexes, which base/4 already has and must
+// keep. Copying the superset therefore leaves no file in base/4 older than its
+// base/5 twin. PG_VERSION is skipped because CreatePerDatabaseScaffolding and
+// bootstrapPostgresDatabase each write it themselves.
+//
+// This runs BEFORE stampClusterChecksums, so a `-k` cluster checksums the
+// refreshed pages rather than the stale ones, and before the trailing fsync.
+func refreshTemplate0Image(dataDir string) error {
+	srcDir := filepath.Join(dataDir, "base", strconv.FormatUint(uint64(catalog.PostgresDBOid), 10))
+	dstDir := filepath.Join(dataDir, "base", strconv.FormatUint(uint64(template0DbOid), 10))
+	entries, err := os.ReadDir(srcDir)
+	if err != nil {
+		return fmt.Errorf("read postgres image: %w", err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || e.Name() == "PG_VERSION" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(srcDir, e.Name()))
+		if err != nil {
+			return fmt.Errorf("read postgres %s: %w", e.Name(), err)
+		}
+		if err := os.WriteFile(filepath.Join(dstDir, e.Name()), data, 0o600); err != nil {
+			return fmt.Errorf("write template0 %s: %w", e.Name(), err)
+		}
+	}
+	return nil
+}
+
 // RemovePerDatabaseScaffolding removes base/<dbOID>/ (the symmetric
 // counterpart to CreatePerDatabaseScaffolding), called by DROP DATABASE
 // (internal/server) and its WAL-replay recovery path once the drop is
@@ -1088,8 +1124,22 @@ func Init(opts Options) error {
 	// (queried at planning time via AMOPSTRATEGY/AMOPOPID) and
 	// pg_amproc support function rows (load-bearing — scanned by
 	// LookupOpclassInfo during RelationInitIndexAccessInfo).
-	if err := bootstrapPgAmopTuples(abs); err != nil {
+	pgAmopTIDs, err := bootstrapPgAmopTuples(abs)
+	if err != nil {
 		return fmt.Errorf("goopg init: pg_amop tuples: %w", err)
+	}
+	// M0131-S12: the pg_amop HEAP alone is not reachable by the lookups that
+	// matter. lookup_type_cache(TYPECACHE_LT_OPR) → get_opfamily_member goes
+	// through the AMOPSTRATEGY syscache (index 2653) and the planner's
+	// get_ordering_op_properties through AMOPOPID (index 2654); syscache
+	// lookups are index-only, with no seq-scan fallback. While 2653/2654 were
+	// empty placeholders a hosted PG could not sort ANY type even with a
+	// correct heap and a populated pg_opclass_am_name_nsp_index (2686).
+	if err := bootstrapPgAmopFamStratIndex(abs, pgAmopTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_amop_fam_strat_index: %w", err)
+	}
+	if err := bootstrapPgAmopOprFamIndex(abs, pgAmopTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_amop_opr_fam_index: %w", err)
 	}
 	pgAmprocTIDs, err := bootstrapPgAmprocTuples(abs)
 	if err != nil {
@@ -1145,6 +1195,14 @@ func Init(opts Options) error {
 	// every opclass via pg_opclass_oid_index.
 	if err := bootstrapPgOpclassOidIndex(abs, pgOpclassTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_opclass_oid_index: %w", err)
+	}
+	// M0131-S12 (measured by M0131-S4 finding F1): pg_opclass's OTHER index,
+	// pg_opclass_am_name_nsp_index (2686), stayed an empty placeholder, and
+	// GetDefaultOpClass has no seq-scan fallback — so a real PG hosted on a
+	// goopg $PGDATA could not sort ANY type ("could not identify an ordering
+	// operator for type integer"). Populate it from the same heap TIDs.
+	if err := bootstrapPgOpclassAmNameNspIndex(abs, pgOpclassTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_opclass_am_name_nsp_index: %w", err)
 	}
 	// M0106-0010 batched-19: seed pg_opfamily_oid_index (2755) and
 	// pg_opfamily_am_name_nsp_index (2754) so PG's OPFAMILYOID and
@@ -1304,6 +1362,22 @@ func Init(opts Options) error {
 	// can start from a goopg backup without PANIC on critical indexes.
 	if err := bootstrapRelcacheInitFiles(abs); err != nil {
 		return fmt.Errorf("goopg init: relcache init files: %w", err)
+	}
+	// M0131-S15: re-materialise template0 (base/4) from the finished
+	// `postgres` image (base/5) now that every bootstrapper has run.
+	// bootstrapPostgresDatabase built base/4 EARLY — before the populated
+	// btrees existed — and then stamped empty placeholders over its index
+	// files, so template0 carried 1-page metapage-only stubs where base/{1,5}
+	// carry the real bulk-loaded content. Runtime CREATE DATABASE clones
+	// base/4 (copyBootstrapCatalogImage), so every runtime-minted database
+	// inherited those stubs and a hosted PG PANICked with "could not open
+	// critical system index 2662" during InitPostgres. Upstream has the same
+	// ordering: initdb bootstraps template1 in full and only THEN makes
+	// template0 a directory-level clone of it (initdb.c make_template0 →
+	// `CREATE DATABASE template0 … STRATEGY = file_copy`), which is why a real
+	// cluster's base/4 is byte-identical to base/1.
+	if err := refreshTemplate0Image(abs); err != nil {
+		return fmt.Errorf("goopg init: template0 image: %w", err)
 	}
 	// Generate and persist the cluster system identifier (M0101-0001).
 	// Used as xlp_sysid in PG-compatible WAL page headers.
@@ -1899,7 +1973,7 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 		2670, // pg_conversion_oid_index (Step 3ai)
 		2678, 2679, 2680, 2682,
 		// 2684, 2685: dedicated bootstrappers (bootstrapPgNamespaceNspnameIndex/OidIndex)
-		2686, // pg_opclass_am_name_nsp_index (Step 3ad)
+		2686, // pg_opclass_am_name_nsp_index (Step 3ad) — placeholder only; bootstrapPgOpclassAmNameNspIndex (M0131-S12) overwrites it with the bulk-loaded btree, same as 2687/2754/2755 below
 		2687, 2688,
 		2689,       // pg_operator_oprname_l_r_n_index (Step 3bl)
 		2690, 2691, // pg_proc_oid_index, pg_proc_proname_args_nsp_index
@@ -2044,7 +2118,7 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 		2670, // pg_conversion_oid_index (Step 3ai)
 		2678, 2679, 2680, 2682,
 		// 2684, 2685: dedicated bootstrappers (bootstrapPgNamespaceNspnameIndex/OidIndex)
-		2686, // pg_opclass_am_name_nsp_index (Step 3ad)
+		2686, // pg_opclass_am_name_nsp_index (Step 3ad) — placeholder only; bootstrapPgOpclassAmNameNspIndex (M0131-S12) overwrites it with the bulk-loaded btree, same as 2687/2754/2755 below
 		2687, 2688,
 		2689,       // pg_operator_oprname_l_r_n_index (Step 3bl)
 		2690, 2691, // pg_proc_oid_index, pg_proc_proname_args_nsp_index
@@ -2141,7 +2215,7 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 		2670, // pg_conversion_oid_index (Step 3ai)
 		2678, 2679, 2680, 2682,
 		// 2684, 2685: dedicated bootstrappers (bootstrapPgNamespaceNspnameIndex/OidIndex)
-		2686, // pg_opclass_am_name_nsp_index (Step 3ad)
+		2686, // pg_opclass_am_name_nsp_index (Step 3ad) — placeholder only; bootstrapPgOpclassAmNameNspIndex (M0131-S12) overwrites it with the bulk-loaded btree, same as 2687/2754/2755 below
 		2687, 2688,
 		2689,       // pg_operator_oprname_l_r_n_index (Step 3bl)
 		2690, 2691, // pg_proc_oid_index, pg_proc_proname_args_nsp_index
@@ -2704,9 +2778,13 @@ func pgProcColDefs() []catalog.Column {
 		{Name: "pronargdefaults", Type: catalog.Type{Name: "int2"}},  // 18
 		{Name: "prorettype", Type: catalog.Type{Name: "oid"}},        // 19
 		{Name: "proargtypes", Type: catalog.Type{Name: "oidvector"}}, // 20
-		// CATALOG_VARLEN section: nullable in PG but we emit empty
-		// binary arrays so the relacl-style "raw bytes as ArrayType*"
-		// dereferences in PG do not trip ARR_ELEMTYPE assertions.
+		// CATALOG_VARLEN section: nullable in PG, and goopg now writes a
+		// genuine NULL whenever the value is absent (M0131-S13). The former
+		// "emit an empty ArrayType shell so PG's raw-bytes dereferences see a
+		// well-formed array" convention was backwards: PG branches on
+		// heap_attisnull for every one of these, and a non-NULL empty shell
+		// makes it take the wrong branch (proconfig ⇒ fmgr_security_definer ⇒
+		// TransformGUCArray's ARR_NDIM assert; prosqlbody ⇒ stringToNode("")).
 		{Name: "proallargtypes", Type: catalog.Type{Name: "oid[]"}},        // 21
 		{Name: "proargmodes", Type: catalog.Type{Name: "char[]"}},          // 22
 		{Name: "proargnames", Type: catalog.Type{Name: "text[]"}},          // 23
@@ -2758,19 +2836,29 @@ func pgProcRow(e pgProcEntry) executor.Row {
 		kind = derivePgProcKind(e.HandlerName)
 	}
 	// Step 3dk: emit OUT-arg metadata as binary ArrayType blobs when
-	// supplied. NewStringDatum("") falls through to encodeValuePG's
-	// emptyArrayTypeBytes path; NewBytesDatum lands a KindBytes datum
-	// that the new codec.go passthrough emits verbatim. Behaviour for
-	// all pre-Step-3dk entries is unchanged because their fields are nil.
-	allArgs := executor.NewStringDatum("")
+	// supplied. NewBytesDatum lands a KindBytes datum that codec.go's
+	// passthrough emits verbatim.
+	//
+	// M0131-S13: an ABSENT nullable varlena is a genuine SQL NULL, never an
+	// empty ArrayType shell. NewStringDatum("") used to fall through to
+	// encodeValuePG's emptyArrayTypeBytes path, producing a NON-NULL
+	// zero-dimension array — which is what made a hosted real PG abort on
+	// every LANGUAGE SQL builtin: fmgr_info_cxt_security
+	// (postgres/src/backend/utils/fmgr/fmgr.c:203-211) routes a call through
+	// fmgr_security_definer as soon as `!heap_attisnull(…,
+	// Anum_pg_proc_proconfig, NULL)`, and TransformGUCArray then asserts
+	// ARR_NDIM(array) == 1 on the empty shell (guc.c:6411). The runtime
+	// sibling buildPGProcRow (internal/executor/sys_pg_proc.go) has always
+	// written NullDatum here; this seed path was the stale twin.
+	allArgs := executor.NullDatum
 	if e.AllArgTypes != nil {
 		allArgs = executor.NewBytesDatum(oidArrayBytes(e.AllArgTypes))
 	}
-	argModes := executor.NewStringDatum("")
+	argModes := executor.NullDatum
 	if e.ArgModes != nil {
 		argModes = executor.NewBytesDatum(charArrayBytes(e.ArgModes))
 	}
-	argNames := executor.NewStringDatum("")
+	argNames := executor.NullDatum
 	if e.ArgNames != nil {
 		argNames = executor.NewBytesDatum(textArrayBytes(e.ArgNames))
 	}
@@ -2779,6 +2867,14 @@ func pgProcRow(e pgProcEntry) executor.Row {
 	// file's effect from a table instead — see pg_proc_seed_defaults.go for why
 	// a real PG standby cannot resolve short call forms without it.
 	nargDefaults, argDefaults := pgProcSeedArgDefaults(e.OID)
+	// M0131-S13: no defaults ⇒ proargdefaults is NULL, not an empty
+	// pg_node_tree. PG reads the column only when pronargdefaults > 0, and an
+	// empty text varlena there would send fetch_function_defaults into
+	// stringToNode("") — the same failure shape prosqlbody has.
+	argDefaultsDatum := executor.NullDatum
+	if argDefaults != "" {
+		argDefaultsDatum = executor.NewStringDatum(argDefaults)
+	}
 	return executor.Row{
 		executor.NewIntDatum(int64(e.OID)), // 1  oid
 		executor.NewStringDatum(e.Name),    // 2  proname
@@ -2808,13 +2904,13 @@ func pgProcRow(e pgProcEntry) executor.Row {
 		allArgs,                                // 21 proallargtypes
 		argModes,                               // 22 proargmodes
 		argNames,                               // 23 proargnames
-		executor.NewStringDatum(argDefaults),   // 24 proargdefaults (pg_node_tree)
-		executor.NewStringDatum(""),            // 25 protrftypes
+		argDefaultsDatum,                       // 24 proargdefaults (pg_node_tree)
+		executor.NullDatum,                     // 25 protrftypes
 		executor.NewStringDatum(e.HandlerName), // 26 prosrc — fmgr internal lookup key
-		executor.NewStringDatum(""),            // 27 probin
-		executor.NewStringDatum(""),            // 28 prosqlbody
-		executor.NewStringDatum(""),            // 29 proconfig
-		executor.NewStringDatum(""),            // 30 proacl
+		executor.NullDatum,                     // 27 probin
+		executor.NullDatum,                     // 28 prosqlbody (NULL ⇒ PG executes prosrc)
+		executor.NullDatum,                     // 29 proconfig (NULL ⇒ no fmgr_security_definer)
+		executor.NullDatum,                     // 30 proacl (NULL ⇒ owner + PUBLIC EXECUTE default)
 	}
 }
 
@@ -4459,15 +4555,18 @@ func pgAmopRow(e pgAmopEntry) executor.Row {
 // lookups via the AMOPOPID / AMOPSTRATEGY syscaches), so the
 // rows are not load-bearing for hot-standby boot but ARE required
 // for any non-trivial SELECT against a system view.
-func bootstrapPgAmopTuples(dataDir string) error {
+// It returns the heap TIDs in pgAmopInitialEntries order so
+// bootstrapPgAmopFamStratIndex / bootstrapPgAmopOprFamIndex (M0131-S12) can
+// build 2653/2654 over them; before S12 the TIDs were discarded and both
+// indexes stayed empty placeholders.
+func bootstrapPgAmopTuples(dataDir string) ([]heapTID, error) {
 	cols := pgAmopColDefs()
 	entries := pgAmopInitialEntries()
 	rows := make([]executor.Row, 0, len(entries))
 	for _, e := range entries {
 		rows = append(rows, pgAmopRow(e))
 	}
-	_, err := writeMultiPageHeapRows(dataDir, "2602", cols, rows)
-	return err
+	return writeMultiPageHeapRows(dataDir, "2602", cols, rows)
 }
 
 // pgAmprocEntry mirrors one row of PG18's pg_amproc.dat — see
@@ -5954,10 +6053,11 @@ func pgClassReltablespaceFor(isShared bool) executor.Datum {
 	return executor.NewIntDatum(0)
 }
 
-// pgAttrColDefs returns the 25 pg_attribute column descriptors. attstattarget
-// is appended last (not at its PG18-canonical position #4); see
-// catalog.PGAttributeColumns for the rationale (preserves the fixed-offset
-// physical decoder and keeps t_hoff stable). Always emitted NULL.
+// pgAttrColDefs returns the 25 pg_attribute column descriptors in PG18-canonical
+// order (M0131-S14.1) — attstattarget at #21, between attcollation and attacl,
+// and no attcacheoff, exactly as FormData_pg_attribute declares them. See
+// catalog.PGAttributeColumns for why the tail order matters to a hosted PG even
+// though the five trailing columns are usually all NULL.
 func pgAttrColDefs() []catalog.Column {
 	return []catalog.Column{
 		{Name: "attrelid", Type: catalog.Type{Name: "oid"}},
@@ -5980,6 +6080,7 @@ func pgAttrColDefs() []catalog.Column {
 		{Name: "attislocal", Type: catalog.Type{Name: "bool"}},
 		{Name: "attinhcount", Type: catalog.Type{Name: "int2"}},
 		{Name: "attcollation", Type: catalog.Type{Name: "oid"}},
+		{Name: "attstattarget", Type: catalog.Type{Name: "int2"}},
 		// attacl is a PG-native _aclitem array (OID 1034), not text: a column
 		// GRANT stores it as a binary ArrayType blob and the seqscan/index-scan ACL
 		// hook decodes it to canonical aclitemout text on read. Declaring it text
@@ -5988,8 +6089,15 @@ func pgAttrColDefs() []catalog.Column {
 		{Name: "attacl", Type: catalog.Type{Name: "aclitem[]"}},
 		{Name: "attoptions", Type: catalog.Type{Name: "text"}},
 		{Name: "attfdwoptions", Type: catalog.Type{Name: "text"}},
-		{Name: "attmissingval", Type: catalog.Type{Name: "text"}},
-		{Name: "attstattarget", Type: catalog.Type{Name: "int2"}},
+		// attmissingval is `anyarray` (OID 2277) per
+		// postgres/src/include/catalog/pg_attribute.h:184 — the fast-default
+		// value is a one-element ArrayType (StoreAttrMissingVal, heap.c:2030),
+		// so the column is neither text nor 4-byte aligned: anyarray carries
+		// typalign='d'/typstorage='x' (pg_type.dat:571-574), which
+		// pgTypeAlignChar/pgTypeStorageChar now report for the nailed
+		// self-description and physicalPGTypeAlign matches on the wire.
+		// M0131-S14.2.
+		{Name: "attmissingval", Type: catalog.Type{Name: "anyarray"}},
 	}
 }
 
@@ -6017,20 +6125,30 @@ func pgAttrEntriesForRel(rel nailedRel) []nailedAttr {
 		return attrs
 	}
 	if rel.OID == catalog.AttributeRelationId {
-		cols := pgAttrColDefs()
-		attrs := make([]nailedAttr, len(cols))
-		for i, c := range cols {
-			attrs[i] = nailedAttr{
-				Name:    c.Name,
-				TypeOID: pgCatalogTypeOID(c.Type.Name),
-				Num:     int16(i + 1),
-				Len:     int16(pgCatalogTypeLen(c.Type.Name)),
-				NotNull: pgCatalogTypeLen(c.Type.Name) != -1,
-			}
-		}
-		return attrs
+		return nailedAttrsFromColDefs(pgAttrColDefs())
 	}
 	return rel.Attrs
+}
+
+// nailedAttrsFromColDefs projects a catalog column list onto the nailedAttr
+// shape. pg_attribute's self-description uses it from BOTH sides — the heap
+// rows here and the pg_internal.init descriptor in pgAttributeAttrs — so the
+// two can never drift (M0131-S14.1; they had, by one column and a permutation).
+func nailedAttrsFromColDefs(cols []catalog.Column) []nailedAttr {
+	attrs := make([]nailedAttr, len(cols))
+	for i, c := range cols {
+		attrs[i] = nailedAttr{
+			Name:    c.Name,
+			TypeOID: pgCatalogTypeOID(c.Type.Name),
+			Num:     int16(i + 1),
+			// Varlena columns (attlen=-1) are nullable; fixed-size catalog
+			// columns are NOT NULL. PG's att_addlength_pointer asserts on
+			// attlen=0, so we must not produce that value.
+			Len:     int16(pgCatalogTypeLen(c.Type.Name)),
+			NotNull: pgCatalogTypeLen(c.Type.Name) != -1,
+		}
+	}
+	return attrs
 }
 
 // pgAttributeRow builds one pg_attribute tuple.
@@ -6056,6 +6174,7 @@ func pgAttributeRow(relOID uint32, a nailedAttr) executor.Row {
 		executor.NewBoolDatum(true),  // attislocal
 		executor.NewIntDatum(0),      // attinhcount
 		executor.NewIntDatum(0),      // attcollation
+		executor.NullDatum,           // attstattarget (PG18 BKI_FORCE_NULL default)
 		// Step 3u: Emit NULL (not empty-text varlena) for the four nullable
 		// trailing varlena/array columns. Previously NewStringDatum("") wrote
 		// a 1-byte empty varlena which PG's RelationGetIndexAttOptions →
@@ -6069,7 +6188,6 @@ func pgAttributeRow(relOID uint32, a nailedAttr) executor.Row {
 		executor.NullDatum, // attoptions
 		executor.NullDatum, // attfdwoptions
 		executor.NullDatum, // attmissingval
-		executor.NullDatum, // attstattarget (PG18 BKI_FORCE_NULL default)
 	}
 }
 
@@ -6320,9 +6438,20 @@ func pgTypeAlignChar(oid uint32) string {
 		return "c"
 	case 21:
 		return "s"
-	case 23, 26, 700, 194, 1009, 1034, 2277, 24, 325, 269, 30, 22, 1002, 1028, 3361, 3402, 5017:
+	case 23, 26, 700, 194, 1009, 1034, 24, 325, 269, 30, 22, 1002, 1028, 3361, 3402, 5017:
 		return "i"
-	case 20, 701, 10028, 3220:
+	case 20, 701, 10028, 3220,
+		// anyarray (2277) is typalign='d', not 'i'
+		// (postgres/src/include/catalog/pg_type.dat:573). It had been grouped
+		// with the 'i' varlenas above, which under-declared the alignment of
+		// every anyarray catalog column — pg_attribute.attmissingval and
+		// pg_statistic.stavalues1..5. Inert while those were always NULL (a
+		// NULL column consumes no bytes and no padding); the moment
+		// M0131-S14.2 wrote a real attmissingval, a hosted PG deforming the
+		// tuple with its own compiled 'd' would have read 4 bytes of padding
+		// as the start of the ArrayType. physicalPGTypeAlign is the wire-side
+		// sibling of this line and pads to 8 to match. M0131-S14.2.
+		2277:
 		// PG18 runtime pg_type lookup: _pg_statistic (10028) has typalign='d'
 		// because its element rowtype pg_statistic carries int8/float8-aligned
 		// columns (stanullfrac, stadistinct float4 padded to 8-byte; stavalues

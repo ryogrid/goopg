@@ -36,6 +36,29 @@ const (
 	DBStateInProduction         = uint32(6)
 )
 
+// DBStateName renders a DBState the way pg_controldata does, so goopg's
+// startup log lines are greppable against a real cluster's. The strings are
+// upstream's dbState[] table (postgres/src/bin/pg_controldata/pg_controldata.c),
+// including its "unrecognized status code" fallback. M0131-S20.1.
+func DBStateName(state uint32) string {
+	switch state {
+	case DBStateShutdowned:
+		return "shut down"
+	case DBStateShutdownedInRecovery:
+		return "shut down in recovery"
+	case DBStateShutdowning:
+		return "shutting down"
+	case DBStateInCrashRecovery:
+		return "in crash recovery"
+	case DBStateInArchiveRecovery:
+		return "in archive recovery"
+	case DBStateInProduction:
+		return "in production"
+	default:
+		return "unrecognized status code"
+	}
+}
+
 var pgCRCTable = crc32.MakeTable(crc32.Castagnoli)
 
 // ControlFileData holds the mutable runtime fields of the PostgreSQL
@@ -78,8 +101,40 @@ type ControlFileData struct {
 	// so a crashed cluster can recover the OID counter from pg_control
 	// without relying on pg_catalog.json. M0106-0013.
 	CheckPointCopyNextOid uint32
+	// M0131-S18.2: the remaining checkPointCopy members. Until this slice
+	// they were never decoded, so they survived only by accident of
+	// UpdateControlFile's read-modify-write cycle — any caller that wanted
+	// to *set* one had no way to, and any future writer that assembled a
+	// fresh buffer would have silently zeroed them. PG reads every one of
+	// them at startup (InitWalRecovery / StartupMultiXact /
+	// StartupCommitTs), so a zero here is not benign: oldestXid = 0 makes
+	// SetTransactionIdLimit compute a bogus wrap-around horizon, and
+	// oldestMulti = 0 trips "MultiXactId 0 does not exist".
+	//
+	// offset 76: checkPointCopy.nextMulti (MultiXactId = uint32)
+	CheckPointCopyNextMulti uint32
+	// offset 80: checkPointCopy.nextMultiOffset (MultiXactOffset = uint32)
+	CheckPointCopyNextMultiOffset uint32
+	// offset 84: checkPointCopy.oldestXid (TransactionId = uint32) —
+	// cluster-wide minimum datfrozenxid
+	CheckPointCopyOldestXid uint32
+	// offset 88: checkPointCopy.oldestXidDB (Oid = uint32)
+	CheckPointCopyOldestXidDB uint32
+	// offset 92: checkPointCopy.oldestMulti (MultiXactId = uint32) —
+	// cluster-wide minimum datminmxid
+	CheckPointCopyOldestMulti uint32
+	// offset 96: checkPointCopy.oldestMultiDB (Oid = uint32)
+	CheckPointCopyOldestMultiDB uint32
 	// offset 104: checkPointCopy.time (pg_time_t / int64)
 	CheckPointCopyTime int64
+	// offset 112: checkPointCopy.oldestCommitTsXid (TransactionId = uint32)
+	CheckPointCopyOldestCommitTsXid uint32
+	// offset 116: checkPointCopy.newestCommitTsXid (TransactionId = uint32)
+	CheckPointCopyNewestCommitTsXid uint32
+	// offset 120: checkPointCopy.oldestActiveXid (TransactionId = uint32).
+	// Only meaningful for an ONLINE checkpoint under wal_level >= replica;
+	// upstream stores InvalidTransactionId (0) otherwise (xlog.c:7050).
+	CheckPointCopyOldestActiveXid uint32
 	// offset 128: XLogRecPtr — fake LSN counter for unlogged relations
 	UnloggedLSN uint64
 	// offset 136: XLogRecPtr — minimum recovery point
@@ -134,7 +189,17 @@ func decodeControlFileData(buf []byte) *ControlFileData {
 		CheckPointCopyWalLevel:       le.Uint32(buf[60:]),
 		CheckPointCopyNextXid:        le.Uint64(buf[64:]),
 		CheckPointCopyNextOid:        le.Uint32(buf[72:]),
-		CheckPointCopyTime:           int64(le.Uint64(buf[104:])),
+		// M0131-S18.2: full checkPointCopy coverage.
+		CheckPointCopyNextMulti:         le.Uint32(buf[76:]),
+		CheckPointCopyNextMultiOffset:   le.Uint32(buf[80:]),
+		CheckPointCopyOldestXid:         le.Uint32(buf[84:]),
+		CheckPointCopyOldestXidDB:       le.Uint32(buf[88:]),
+		CheckPointCopyOldestMulti:       le.Uint32(buf[92:]),
+		CheckPointCopyOldestMultiDB:     le.Uint32(buf[96:]),
+		CheckPointCopyTime:              int64(le.Uint64(buf[104:])),
+		CheckPointCopyOldestCommitTsXid: le.Uint32(buf[112:]),
+		CheckPointCopyNewestCommitTsXid: le.Uint32(buf[116:]),
+		CheckPointCopyOldestActiveXid:   le.Uint32(buf[120:]),
 		UnloggedLSN:                  le.Uint64(buf[128:]),
 		MinRecoveryPoint:             le.Uint64(buf[136:]),
 		MinRecoveryPointTLI:          le.Uint32(buf[144:]),
@@ -171,7 +236,20 @@ func encodeControlFileData(buf []byte, cd *ControlFileData) {
 	le.PutUint32(buf[60:], cd.CheckPointCopyWalLevel)
 	le.PutUint64(buf[64:], cd.CheckPointCopyNextXid)
 	le.PutUint32(buf[72:], cd.CheckPointCopyNextOid)
+	// M0131-S18.2: full checkPointCopy coverage. Safe to write
+	// unconditionally because every ControlFileData reaching this function
+	// came out of decodeControlFileData, so an untouched field round-trips
+	// to the same bytes.
+	le.PutUint32(buf[76:], cd.CheckPointCopyNextMulti)
+	le.PutUint32(buf[80:], cd.CheckPointCopyNextMultiOffset)
+	le.PutUint32(buf[84:], cd.CheckPointCopyOldestXid)
+	le.PutUint32(buf[88:], cd.CheckPointCopyOldestXidDB)
+	le.PutUint32(buf[92:], cd.CheckPointCopyOldestMulti)
+	le.PutUint32(buf[96:], cd.CheckPointCopyOldestMultiDB)
 	le.PutUint64(buf[104:], uint64(cd.CheckPointCopyTime))
+	le.PutUint32(buf[112:], cd.CheckPointCopyOldestCommitTsXid)
+	le.PutUint32(buf[116:], cd.CheckPointCopyNewestCommitTsXid)
+	le.PutUint32(buf[120:], cd.CheckPointCopyOldestActiveXid)
 	le.PutUint64(buf[128:], cd.UnloggedLSN)
 	le.PutUint64(buf[136:], cd.MinRecoveryPoint)
 	le.PutUint32(buf[144:], cd.MinRecoveryPointTLI)
@@ -211,13 +289,36 @@ func encodeControlFileData(buf []byte, cd *ControlFileData) {
 // The fn receives the current decoded state; only the fields fn explicitly
 // sets are changed — all other bytes in the buffer are preserved.
 func UpdateControlFile(dataDir string, fn func(*ControlFileData)) error {
+	buf, err := BuildUpdatedControlImage(dataDir, fn)
+	if err != nil {
+		return err
+	}
+	// Write exactly PG_CONTROL_FILE_SIZE bytes, as upstream does. A longer
+	// file (which PG never produces) keeps its tail rather than being
+	// truncated away — O_RDWR overwrite semantics, not O_TRUNC.
+	return writeControlFileDurably(filepath.Join(dataDir, pgControlFilePath), buf)
+}
+
+// BuildUpdatedControlImage is UpdateControlFile's read-decode-mutate-encode
+// half without the write: it returns the 8192-byte pg_control image that
+// UpdateControlFile *would* have stored, leaving the on-disk file untouched.
+//
+// M0131-S29. BASE_BACKUP needs a checkpoint-patched control image for the tar
+// stream it ships, but patching the LIVE cluster's pg_control to get one is a
+// bug: it publishes minRecoveryPoint/backupEndPoint into a running primary,
+// and a crash in the window before the next checkpoint then makes the cluster
+// FATAL "requested timeline %u does not contain minimum recovery point"
+// (xlogrecovery.c:878-886) on a promoted (TLI >= 2) cluster. Upstream never
+// touches the source either — basebackup.c:352-360 sends XLOG_CONTROL_FILE
+// through plain sendFile().
+func BuildUpdatedControlImage(dataDir string, fn func(*ControlFileData)) ([]byte, error) {
 	path := filepath.Join(dataDir, pgControlFilePath)
 	buf, err := os.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("control: read pg_control: %w", err)
+		return nil, fmt.Errorf("control: read pg_control: %w", err)
 	}
 	if len(buf) < pgControlCRCOffset+4 {
-		return fmt.Errorf("control: pg_control too short (%d bytes)", len(buf))
+		return nil, fmt.Errorf("control: pg_control too short (%d bytes)", len(buf))
 	}
 	// Ensure we work on a full-size buffer (upstream always writes 8192 bytes).
 	if len(buf) < pgControlFileSize {
@@ -230,8 +331,49 @@ func UpdateControlFile(dataDir string, fn func(*ControlFileData)) error {
 	encodeControlFileData(buf, cd)
 	crc := crc32.Checksum(buf[:pgControlCRCOffset], pgCRCTable)
 	binary.LittleEndian.PutUint32(buf[pgControlCRCOffset:], crc)
-	if err := os.WriteFile(path, buf, 0o600); err != nil {
+	return buf[:pgControlFileSize], nil
+}
+
+// writeControlFileDurably overwrites pg_control in place and fsyncs it,
+// mirroring upstream update_controlfile() with do_sync = true
+// (src/common/controldata_utils.c:216-281).
+//
+// M0131-S18.1. The previous implementation was os.WriteFile, i.e.
+// O_CREATE|O_WRONLY|O_TRUNC with no fsync. Two defects followed:
+//
+//   - O_TRUNC creates a window in which pg_control is ZERO BYTES long. A
+//     SIGKILL (or host crash) inside it leaves a file PG refuses with
+//     PANIC: could not read file "global/pg_control": read 0 of 296 — an
+//     unrecoverable cluster, from a file whose whole purpose is to survive
+//     crashes. Upstream never truncates: it opens O_RDWR and overwrites the
+//     fixed-size image, so a torn write leaves a CRC mismatch (recoverable
+//     via the operator-visible "incorrect checksum" path) rather than an
+//     empty file.
+//   - No fsync means an acknowledged checkpoint could be lost to the page
+//     cache while the WAL it describes was already flushed, so recovery
+//     would restart from an older redo point than pg_control claims.
+//
+// The write is a single 8192-byte WriteAt at offset 0 (upstream writes
+// PG_CONTROL_FILE_SIZE bytes from a zero-padded buffer); the caller has
+// already grown buf to that size, so no O_TRUNC is needed to keep the file
+// from retaining a longer tail.
+func writeControlFileDurably(path string, buf []byte) error {
+	if len(buf) != pgControlFileSize {
+		return fmt.Errorf("control: refusing to write %d-byte pg_control image (want %d)", len(buf), pgControlFileSize)
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("control: open pg_control for update: %w", err)
+	}
+	defer f.Close()
+	if _, err := f.WriteAt(buf, 0); err != nil {
 		return fmt.Errorf("control: write pg_control: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("control: fsync pg_control: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("control: close pg_control: %w", err)
 	}
 	return nil
 }

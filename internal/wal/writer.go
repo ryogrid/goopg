@@ -604,6 +604,12 @@ func NewWriter(cfg Config) (*Writer, error) {
 		st.prevRecPtr,
 		st.walBuf,
 		st.memRing,
+		padLayout{
+			pageHeaders: st.pageHeaders,
+			segSize:     cfg.SegmentSize,
+			sysID:       st.sysID,
+			tli:         st.tli,
+		},
 	)
 	st.core = w.core // share core pointer so state.append can call AppendXLogPayload
 	st.writeMu = newWALWriteLock()
@@ -1526,7 +1532,22 @@ func scanLastSegmentEnd(walDir string, segNo uint64, tli uint32, segSize int64, 
 	// a fatal "wal: decode at offset N: invalid record header: unknown rmid=31"
 	// on a subsequent crash restart. Upstream skips xlp_rem_len for the same
 	// reason when it picks a page up mid-record (xlogreader.c).
+	// M0131-S19: the sibling of readAllPageAware's validator (Hard-won Rule
+	// #2). This half is the load-bearing one: a PG-recycled segment scans as
+	// non-empty, so without the pageaddr check detectWritePos's phantom-drop
+	// loop breaks on the first stale segment and the resume position lands
+	// tens of MB past the true end of the stream.
+	pv := xlogPageValidator{segSize: cfgSegSize}
+
 	if hsize := pageHeaderSizeAt(streamBase, cfgSegSize); len(data) >= hsize {
+		if !isZeroBytes(data[:hsize]) {
+			if verr := pv.check(data[:hsize], uint64(streamBase)); verr != nil {
+				// Not this segment's own first page — treat the whole
+				// segment as holding nothing, which is what lets the
+				// phantom-drop loop in detectWritePos step over it.
+				return 0, 0, nil
+			}
+		}
 		if hdr, derr := DecodeXLogPageHeader(data[:hsize]); derr == nil && hdr.Info&XLPFirstIsContRecord != 0 {
 			off = hsize + maxAlignXLog(int(hdr.RemLen))
 			if off >= len(data) {
@@ -1543,6 +1564,11 @@ func scanLastSegmentEnd(walDir string, segNo uint64, tli uint32, segSize int64, 
 				return int64(off), lastRecPtr, nil
 			}
 			if isZeroBytes(data[off : off+hsize]) {
+				return int64(off), lastRecPtr, nil
+			}
+			// M0131-S19: stale page from an earlier write cycle — the
+			// records beyond it are not ours. End of stream.
+			if verr := pv.check(data[off:off+hsize], uint64(pos)); verr != nil {
 				return int64(off), lastRecPtr, nil
 			}
 			off += hsize
@@ -1577,6 +1603,12 @@ func scanLastSegmentEnd(walDir string, segNo uint64, tli uint32, segSize int64, 
 		if len(fullBytes) < total {
 			// Truncated tail — treat as EOS so we don't
 			// consume a partially-written record.
+			return int64(off), lastRecPtr, nil
+		}
+		// M0131-S19 (sibling of readAllPageAware's identical call): any page
+		// header swallowed by this record was skipped unvalidated by
+		// extractRecordBytes.
+		if verr := pv.checkSpan(data, off, consumed, uint64(streamBase)); verr != nil {
 			return int64(off), lastRecPtr, nil
 		}
 		decoded, err := decodeRecordXLogDetailed(fullBytes)
@@ -1669,7 +1701,57 @@ func (s *state) appendPGCompat(payload []byte) (uint64, uint64, error) {
 		// the tracker before we acquired Lock are accounted for.
 		trackerCurr, trackerPrev := s.core.Load()
 		writePos := int64(trackerCurr)
-		record, realRecLen, err := encodeRecordXLog(payload, trackerPrev)
+		// M0131-S30.6: apply the SAME segment-boundary rule Path B applies.
+		// This path used to encode at the tracker cursor and emit straight
+		// through emitWithPageHeaders with no crossing check, so it wrote
+		// records that straddle a segment boundary while Path B (stripe,
+		// production) re-lands the record at the boundary and pads the gap
+		// (insertPosTracker.reserveEmittedAndPublish → emitSegmentPad).
+		// goopg's WAL byte layout was therefore writer-path-dependent and every
+		// consumer had to tolerate both shapes; upstream has one rule, since
+		// ReserveXLogInsertLocation reserves in usable-byte space for all
+		// inserters alike (postgres/src/backend/access/transam/xlog.c).
+		gapStart := writePos
+		prevForRecord := trackerPrev
+		var padStream []byte
+		if segSize := s.cfg.SegmentSize; segSize > 0 {
+			boundary := (writePos/segSize + 1) * segSize
+			total, _ := predictEmittedSize(paddedLen, writePos, segSize)
+			// A record whose emission cannot fit in a whole segment gains
+			// nothing from re-landing (it would straddle the NEXT boundary
+			// too), so leave it where it is — same bound Path B asserts with
+			// its "emitted size exceeds segSize" panic.
+			if total > 0 && int64(total) <= segSize && writePos+int64(total) > boundary {
+				gapLen := boundary - writePos
+				// Mirror emitSegmentPad: the gap is a range of STREAM bytes, so
+				// the pad RECORD is the gap minus the page headers the emitter
+				// interleaves into it (M0131-S30.1b). Too few record bytes for
+				// a well-formed XLOG_NOOP (or the 25-byte case the builder
+				// cannot encode) ⇒ zero-fill the gap and leave xl_prev alone,
+				// exactly as the composer does for Path B.
+				recLen := int(gapLen) - pageHeaderBytesIn(writePos, boundary, segSize)
+				if recLen < SizeOfXLogRecord || recLen == SizeOfXLogRecord+1 {
+					padStream = make([]byte, gapLen)
+				} else {
+					pad, perr := buildSegmentPadRecord(recLen, prevForRecord)
+					if perr != nil {
+						return 0, 0, perr
+					}
+					padStream, _ = emitWithPageHeaders(pad, recLen, writePos, segSize, s.sysID, s.tli)
+					if int64(len(padStream)) != gapLen {
+						return 0, 0, fmt.Errorf("wal: appendPGCompat: pad emitted %d bytes for gap [%d,%d) of %d",
+							len(padStream), writePos, boundary, gapLen)
+					}
+					// Path B stamps the re-landed record's xl_prev with the
+					// pad's start LSN (reserveEmittedAndPublish: t.prev =
+					// startCandidate); match it byte for byte, including the
+					// known page-boundary-pad quirk noted there.
+					prevForRecord = uint64(writePos)
+				}
+				writePos = boundary
+			}
+		}
+		record, realRecLen, err := encodeRecordXLog(payload, prevForRecord)
 		if err != nil {
 			return 0, 0, err
 		}
@@ -1677,7 +1759,16 @@ func (s *state) appendPGCompat(payload []byte) (uint64, uint64, error) {
 		start := uint64(writePos) + uint64(leading) + 1
 		end := uint64(writePos) + uint64(len(stream))
 
-		if err := s.writeAt(writePos, stream); err != nil {
+		// The pad and the record are one contiguous stream write at gapStart
+		// so a crash cannot leave the record durable without its pad.
+		out, outPos := stream, writePos
+		if len(padStream) > 0 {
+			out = make([]byte, 0, len(padStream)+len(stream))
+			out = append(out, padStream...)
+			out = append(out, stream...)
+			outPos = gapStart
+		}
+		if err := s.writeAt(outPos, out); err != nil {
 			return 0, 0, err
 		}
 		s.writePos = int64(end)
@@ -1685,7 +1776,7 @@ func (s *state) appendPGCompat(payload []byte) (uint64, uint64, error) {
 		if s.walBuf != nil {
 			s.walBuf.reset(int64(end))
 		}
-		s.memRing.Append(writePos, stream)
+		s.memRing.Append(outPos, out)
 		s.drainedLSN = end
 		s.writeLSN = end
 		if s.writeLSNMirror != nil {

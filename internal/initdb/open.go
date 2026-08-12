@@ -71,6 +71,15 @@ type Runtime struct {
 	// See docs/design/0005-0001-streaming-replication-architecture.md.
 	Standby bool
 
+	// NextMultiXact is pg_control's checkPointCopy.nextMulti as read at
+	// Open time — the MultiXactId the previous run would have handed out
+	// next. cmd/goopg seeds the process-shared multixact.Store from it
+	// (multixact.NewStoreAt) so a restarted cluster does not re-issue
+	// MultiXactIds the pre-restart run already stamped into tuple xmax
+	// fields. 0 when there was no usable control file; NewStoreAt clamps
+	// that up to FirstMultiXactId. M0131-S20.4.
+	NextMultiXact uint32
+
 	// Recovery is true when `<DataDir>/recovery.signal` was present
 	// at Open time. cmd/goopg start uses this to enter archive recovery
 	// (fetch WAL segments via restore_command, replay them, then
@@ -337,6 +346,24 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		mgr.SetAIO(aioEngineAdapter{eng: eng})
 	}
 
+	// M0131-S20.1: ask pg_control whether the previous run shut down
+	// cleanly, and stamp DB_IN_CRASH_RECOVERY if it did not, BEFORE any
+	// record is replayed. Until this slice goopg never read State at all,
+	// so a crashed cluster was indistinguishable from a clean one both to
+	// goopg and to anything reading the control file mid-replay.
+	recov, err := beginRecovery(abs)
+	if err != nil {
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: stamp pg_control DB_IN_CRASH_RECOVERY: %w", err)
+	}
+
+	// M0131-S20.3: sweep every pg_internal.init in the cluster before a
+	// single record is replayed, the way StartupXLOG does
+	// (xlog.c:5633). Unconditional by design — upstream removes them even
+	// after a clean shutdown, and for goopg the file on disk may have been
+	// written by real PostgreSQL against a catalog replay is about to move.
+	clearRelcacheInitFiles(abs)
+
 	// Crash recovery: replay any WAL records past the last
 	// checkpoint into the data files BEFORE the buffer pool comes
 	// online, so the pool always observes a consistent on-disk
@@ -344,7 +371,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// records past the last checkpoint, so this is a no-op for
 	// normal restarts. See M0002 "Crash-recovery test" in
 	// .ralph/fix_plan.md.
-	if _, err := wal.ReplayFromDirWithMgr(mgr, filepath.Join(abs, "pg_wal"), 0); err != nil {
+	//
+	// M0131-S20.2: the replay start comes from pg_control's
+	// checkPointCopy.redo, the way upstream's InitWalRecovery gets it,
+	// instead of being reconstructed by scanning the stream for a record
+	// goopg's own isCheckpointRecord recognises. The scan survives as the
+	// fallback for redo == 0 (fresh cluster / no control file).
+	if _, err := wal.ReplayFromDirWithMgrAt(mgr, filepath.Join(abs, "pg_wal"), 0, recov.redoLSN); err != nil {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: wal replay: %w", err)
 	}
@@ -1002,6 +1035,19 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// that page's highest associated commit-record LSN first — the invariant
 	// synchronous_commit=off relies on instead of an inline per-commit fsync.
 	clog.SetFlushWALHook(walWriter.FlushUpTo)
+	// M0131-S30.7: attach the durable commit log to the transaction manager so
+	// every snapshot it captures can resolve an XID the in-memory
+	// InProgress/Aborted arrays cannot classify. Manager.SetCLog was added by
+	// M0117-0002 with exactly this contract ("called once during startup/recovery
+	// wiring (initdb.Open)") but NO production caller was ever added, so
+	// Snapshot.clog was nil on every live server and the whole durable-abort
+	// fallback in Snapshot.SeesCommittedXID was dead code. The visible symptom:
+	// after crash recovery the in-memory aborted array is empty, so the heap
+	// changes of transactions that were in flight at the crash — correctly
+	// stamped Aborted in pg_xact by the MarkUnknownAsAborted sweep below — read
+	// as committed and broke sum(pgbench_accounts.abalance) ==
+	// sum(pgbench_history.delta).
+	txnMgr.SetCLog(clog)
 	// fsync=off (test harnesses only): skip the CLOG store's per-segment
 	// fsyncs; write-through and ordering (including the FlushWAL barrier
 	// above) are unchanged. See ci/design/test-gate-speedups/02.
@@ -1196,6 +1242,18 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// before any of its incrementals.
 		pool.PublishRedoRecPtr(pgCtrl.CheckPointCopyRedo)
 		cat.AdvanceNextOIDPast(pgCtrl.CheckPointCopyNextOid)
+		// M0131-S21a: pg_control's nextOid is only as fresh as the last
+		// checkpoint. PG WAL-logs every fresh OID block it allocates
+		// (XLOG_NEXTOID) precisely so a crash between checkpoints does not
+		// rewind the counter, so a cluster PG crashed on can carry a higher
+		// nextOid in its WAL tail than in its control file. Without this the
+		// OIDs of catalog rows PG created after its last checkpoint would be
+		// handed out again to new objects.
+		if walNextOID, oerr := replayNextOIDFromWAL(filepath.Join(abs, "pg_wal")); oerr == nil {
+			cat.AdvanceNextOIDPast(walNextOID)
+		} else {
+			slog.Warn("initdb.Open: XLOG_NEXTOID scan failed; OID counter seeded from pg_control only", "err", oerr)
+		}
 		// M0106-0013: also advance txnMgr.NextXID from the checkpoint's
 		// nextXid so snapshots taken after restart have Xmax >= the
 		// last-checkpointed NextXID. The low 32 bits of the FullTransactionId
@@ -1797,6 +1855,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// A crashed cluster can then recover nextOid from pg_control
 		// without depending on pg_catalog.json.
 		NextOIDFn: cat.NextOID,
+		// M0131-S18.3: the LIVE timeline and full_page_writes setting.
+		// Both used to be hardcoded (TLI 1 / always-on) in the checkpoint
+		// record AND in pg_control, so the first checkpoint after a
+		// promotion rewrote pg_control's checkPointCopy back to timeline 1
+		// while pg_wal held segments named for timeline 2 — a real PG then
+		// PANICs "could not locate a valid checkpoint record". The pool is
+		// the right source for full_page_writes because that is where the
+		// runtime GUC lands (cmd/goopg/main.go, Pool.SetFullPageWrites),
+		// mirroring upstream's Insert->fullPageWrites sample.
+		TimelineIDFn:     walWriter.TimelineID,
+		FullPageWritesFn: pool.FullPageWrites,
 		// M0106-0011 follow-up (b): regenerate pg_internal.init after
 		// each checkpoint so PG standbys can always attach. Uses
 		// WithRelCacheInitLock to prevent TOCTOU races with concurrent
@@ -2386,6 +2455,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		DataDir:        abs,
 		Standby:        standby,
 		Recovery:       recovery,
+		NextMultiXact:  recov.nextMulti,
 		FSM:            storage.NewFSM(),
 		VM:             storage.NewVisibilityMap(),
 	}
@@ -2480,7 +2550,67 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		rt.bgwriter.Start()
 	}
 
+	// M0131-S20.1: crash recovery replayed above; make its result durable
+	// with an end-of-recovery checkpoint before the state flips to
+	// DB_IN_PRODUCTION, so pg_control's redo pointer describes the
+	// recovered cluster rather than the pre-crash one. No-op for a clean
+	// start (the common path pays nothing).
+	if recov.crashRecovery {
+		endOfRecoveryCheckpoint(rt.Checkpointer, abs)
+	}
+
+	// M0131-S17: the cluster is now live — say so in pg_control BEFORE the
+	// first client can be admitted, mirroring upstream's end-of-StartupXLOG
+	// stamp (`ControlFile->state = DB_IN_PRODUCTION` then UpdateControlFile,
+	// postgres/src/backend/access/transam/xlog.c:6204-6211).
+	//
+	// Until this landed, NOTHING in the startup path wrote State: initdb
+	// stamps DB_SHUTDOWNED and the only runtime writer is the checkpointer,
+	// whose first tick is one full checkpoint_timeout (PG default 300 s)
+	// after start. A SIGKILL inside that window therefore left pg_control
+	// claiming DB_SHUTDOWNED over a WAL tail full of committed work, and a
+	// real PG opening the directory took neither of the InRecovery arms at
+	// xlogrecovery.c:924-936 — it skipped PerformWalRecovery() entirely and
+	// resumed inserting WAL over goopg's tail, with no PANIC and nothing
+	// alarming logged. Live data loss; see
+	// docs/design/0131-0014-pgcontrol-runtime-state-and-durability.md §S17.
+	if err := stampInProduction(abs); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: %w", err)
+	}
+
 	return rt, nil
+}
+
+// stampInProduction records DB_IN_PRODUCTION plus the current time in
+// pg_control, the way upstream does at the end of StartupXLOG
+// (xlog.c:6204-6211). Called from Open once replay and storage are up and
+// before any client is accepted.
+//
+// A genuinely absent pg_control is tolerated with a warning rather than
+// failing the start: goopg's own `init` always writes one, so this only
+// arises for a hand-assembled directory, where the pre-M0131-S17 behaviour
+// (start anyway) is the less surprising one. Every other failure — an
+// unreadable, short, or unwritable control file — is fatal, because
+// continuing would mean serving a cluster whose crash state can never be
+// advertised. (Upstream PANICs on the same conditions.)
+func stampInProduction(dataDir string) error {
+	err := control.UpdateControlFile(dataDir, func(cd *control.ControlFileData) {
+		cd.State = control.DBStateInProduction
+		cd.Time = time.Now().Unix()
+	})
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		slog.Warn("pg_control absent: cluster state not stamped DB_IN_PRODUCTION",
+			"dataDir", dataDir,
+			"note", "a crash here is indistinguishable from a clean shutdown")
+		return nil
+	}
+	return fmt.Errorf("stamp pg_control DB_IN_PRODUCTION: %w", err)
 }
 
 // aioEngineAdapter bridges *aio.Engine to storage.AIOEngine.
@@ -3190,7 +3320,13 @@ func (r *Runtime) Close() error {
 	if r.Checkpointer != nil && r.immediateShutdown {
 		// Immediate shutdown (`goopg stop -mode immediate`): skip the
 		// final checkpoint entirely so pg_control's State stays at
-		// DB_IN_PRODUCTION. External tools (pg_resetwal/pg_rewind/
+		// DB_IN_PRODUCTION — which Open's own startup stamp
+		// (stampInProduction, M0131-S17) is what establishes. Before
+		// that stamp existed this comment asserted a postcondition the
+		// code did not have: on a cluster younger than
+		// checkpoint_timeout that never crossed max_wal_size, no
+		// checkpoint had ever run and the byte was still initdb's
+		// DB_SHUTDOWNED. External tools (pg_resetwal/pg_rewind/
 		// pg_controldata) then see an unclean cluster that needs
 		// recovery, and goopg's own next start replays WAL. Mirrors
 		// upstream's immediate (SIGQUIT) shutdown. (M0110-0004 / RW-002 b.)

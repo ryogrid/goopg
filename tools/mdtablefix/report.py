@@ -33,6 +33,10 @@ def build_report(filepath: str, fixes: list[Fix]) -> dict:
             "escaped_pipes": sum(1 for f in fixes if f.type == "escaped_pipe"),
             "missing_cells": sum(1 for f in fixes if f.type == "missing_cell"),
             "extra_cells": sum(1 for f in fixes if f.type == "extra_cell"),
+            "blank_lines": sum(1 for f in fixes if f.type == "blank_line"),
+            "missing_outer_pipes": sum(
+                1 for f in fixes if f.type == "missing_outer_pipe"
+            ),
         },
         "details": by_type,
     }

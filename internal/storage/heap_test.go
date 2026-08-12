@@ -104,6 +104,86 @@ func TestPageAddHeapTupleNoSpace(t *testing.T) {
 	}
 }
 
+// TestPageRemoveHeapTupleUndoesAppend pins M0131-S30.5. The orphan-cleanup arm
+// of tryApplyHOTUpdate (internal/executor/operators_storage.go) appends a new
+// HOT version, then removes it again when the old-slot stamp fails — and NEITHER
+// the append nor the removal emits a WAL record. The page therefore has to come
+// back to its last-logged state byte-for-byte over everything replay and an FPI
+// can see (the header, the line-pointer array, and the item region at/above
+// pd_upper); otherwise the buffer that reaches disk disagrees with the page
+// replay rebuilds. Before the fix the removal restored pd_lower but left
+// pd_upper lowered, permanently leaking that item's space out of the page.
+func TestPageRemoveHeapTupleUndoesAppend(t *testing.T) {
+	p := make(Page, BlockSize)
+	if err := InitPage(p); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := PageAddHeapTuple(p, NewHeapTuple(TransactionID(100+i), InvalidTransactionID, []byte("keep"))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := append(Page(nil), p...)
+	beforeHdr := MustHeader(p)
+	lower, upper := beforeHdr.Lower(), beforeHdr.Upper()
+
+	// The orphan append: an odd-length body so the MAXALIGN padding is
+	// exercised too (pd_upper must be given back including the padding).
+	slot, err := PageAddHeapTuple(p, NewHeapTuple(TransactionID(999), InvalidTransactionID, []byte("orphan-body")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := PageRemoveHeapTuple(p, slot); err != nil {
+		t.Fatal(err)
+	}
+
+	h := MustHeader(p)
+	if h.Lower() != lower {
+		t.Fatalf("pd_lower=%d want=%d (line pointer not reclaimed)", h.Lower(), lower)
+	}
+	if h.Upper() != upper {
+		t.Fatalf("pd_upper=%d want=%d (item space leaked out of the page)", h.Upper(), upper)
+	}
+	// Header + line pointers.
+	if string(p[:lower]) != string(before[:lower]) {
+		t.Fatalf("page header / line pointer area changed by add+remove")
+	}
+	// Everything from pd_upper up: the item region an FPI would carry.
+	if string(p[upper:]) != string(before[upper:]) {
+		t.Fatalf("item region changed by add+remove")
+	}
+}
+
+// TestPageRemoveHeapTupleInteriorSlotKeepsUpper guards the other half of the
+// contract: removing a slot that is NOT the last line pointer blanks the
+// pointer in place and must not touch pd_lower/pd_upper (sliding the array
+// would renumber every later slot; that is VacuumHeapPageBySlots' job).
+func TestPageRemoveHeapTupleInteriorSlotKeepsUpper(t *testing.T) {
+	p := make(Page, BlockSize)
+	if err := InitPage(p); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := PageAddHeapTuple(p, NewHeapTuple(TransactionID(100+i), InvalidTransactionID, []byte("row"))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h := MustHeader(p)
+	lower, upper := h.Lower(), h.Upper()
+	if err := PageRemoveHeapTuple(p, 2); err != nil {
+		t.Fatal(err)
+	}
+	if h.Lower() != lower || h.Upper() != upper {
+		t.Fatalf("interior removal moved pd_lower/pd_upper: %d/%d want %d/%d", h.Lower(), h.Upper(), lower, upper)
+	}
+	if _, err := PageGetHeapTuple(p, 2); !errors.Is(err, ErrUnsupportedItem) {
+		t.Fatalf("err=%v want ErrUnsupportedItem", err)
+	}
+	if _, err := PageGetHeapTuple(p, 3); err != nil {
+		t.Fatalf("slot 3 must be unaffected: %v", err)
+	}
+}
+
 func TestPageGetHeapTupleInvalidSlot(t *testing.T) {
 	p := make(Page, BlockSize)
 	if err := InitPage(p); err != nil {
@@ -801,5 +881,18 @@ func TestParseHeapTupleRejectsCorruptInput(t *testing.T) {
 	_, err = ParseHeapTuple(raw)
 	if err == nil {
 		t.Error("expected error for hoff < SizeOfHeapTupleHeaderData")
+	}
+}
+
+// TestMaxHeapTuplesPerPagePGParity pins the constant to PG's macro value for an
+// 8 KiB page (htup_details.h:629 — (8192-24)/(MAXALIGN(23)+4) = 291). It is the
+// bound every HOT/CTID chain walker uses, so a silent drift here would resurrect
+// M0131-S32 (versions past the bound unreachable through the index).
+func TestMaxHeapTuplesPerPagePGParity(t *testing.T) {
+	if BlockSize != 8192 {
+		t.Skipf("PG reference value 291 assumes BLCKSZ=8192, got %d", BlockSize)
+	}
+	if MaxHeapTuplesPerPage != 291 {
+		t.Errorf("MaxHeapTuplesPerPage=%d, want 291 (PG MaxHeapTuplesPerPage for BLCKSZ=8192)", MaxHeapTuplesPerPage)
 	}
 }

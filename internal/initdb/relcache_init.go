@@ -289,7 +289,10 @@ var nailedSharedRels = flattenRels([]nailedRel{
 // keep their historical positions — flattenRels takes IsShared from heaps[0].
 var nailedLocalRels = flattenRels(append([]nailedRel{
 	{1247, "pg_type", 71, 'r', 14, false, pgTypeAttrs()},
-	{1249, "pg_attribute", 75, 'r', 24, false, pgAttributeAttrs()},
+	// relnatts 25 (was 24 until M0131-S14.1): pg_attribute really has 25
+	// attributes here and in PG18's Natts_pg_attribute alike. The stale 24 is
+	// what truncated attmissingval off a hosted PG's compiled descriptor.
+	{1249, "pg_attribute", 75, 'r', 25, false, pgAttributeAttrs()},
 	{1259, "pg_class", 83, 'r', 34, false, pgClassAttrs()},
 	{1255, "pg_proc", 81, 'r', 30, false, pgProcAttrs()},
 	{2610, "pg_index", 75, 'r', 21, false, pgIndexAttrs()},
@@ -2452,33 +2455,30 @@ func pgClassAttrs() []nailedAttr {
 	}
 }
 
+// pgAttributeAttrs describes pg_attribute to ITSELF — the nailed descriptor that
+// goes into pg_internal.init and, through pgAttrEntriesForRel, the heap rows for
+// relid 1249.
+//
+// M0131-S14.1 rewrote it. Until then it was a stale sibling of
+// initdb.pgAttrColDefs / catalog.PGAttributeColumns / executor's
+// pgAttributeColumnsPG18 — 24 attributes in PG-11-era order (attstattarget at
+// #4, an attcacheoff PG18 no longer has, attlen before attnum) against those
+// three's 25 in PG18 order. The disagreement reached a hosted real PostgreSQL
+// through pg_class.relnatts, which flattenRels derives from RelNatts below: PG
+// unlinks goopg's pg_internal.init at startup (xlog.c:5633
+// RelationCacheInitFileRemove) and builds pg_attribute from its OWN compiled
+// Desc_pg_attribute, but RelationCacheInitializePhase3 then overwrites rd_rel
+// from goopg's real pg_class tuple. relnatts=24 against a 25-attribute compiled
+// descriptor truncated the last one, so `SELECT attmissingval FROM pg_attribute`
+// answered 42703 on an otherwise healthy cluster (measured, M0131-S4 finding F3).
+//
+// Rather than restate the 25 columns a fourth time, it now DERIVES them from
+// pgAttrColDefs through the same helper pgAttrEntriesForRel uses for the heap
+// rows, so the init-file descriptor and the rows it describes cannot disagree
+// again. (pgAttrColDefs is an ordinary function, so calling it from this
+// package-level composite literal is safe at init time.)
 func pgAttributeAttrs() []nailedAttr {
-	return []nailedAttr{
-		{Name: "attrelid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
-		{Name: "attname", TypeOID: 19, Num: 2, Len: 64, NotNull: true},
-		{Name: "atttypid", TypeOID: 26, Num: 3, Len: 4, NotNull: true},
-		{Name: "attstattarget", TypeOID: 21, Num: 4, Len: 2},
-		{Name: "attlen", TypeOID: 21, Num: 5, Len: 2, NotNull: true},
-		{Name: "attnum", TypeOID: 21, Num: 6, Len: 2, NotNull: true},
-		{Name: "attndims", TypeOID: 21, Num: 7, Len: 2, NotNull: true},
-		{Name: "attcacheoff", TypeOID: 23, Num: 8, Len: 4, NotNull: true},
-		{Name: "atttypmod", TypeOID: 23, Num: 9, Len: 4, NotNull: true},
-		{Name: "attbyval", TypeOID: 16, Num: 10, Len: 1, NotNull: true},
-		{Name: "attalign", TypeOID: 18, Num: 11, Len: 1, NotNull: true},
-		{Name: "attstorage", TypeOID: 18, Num: 12, Len: 1, NotNull: true},
-		{Name: "attcompression", TypeOID: 18, Num: 13, Len: 1, NotNull: true},
-		{Name: "attnotnull", TypeOID: 16, Num: 14, Len: 1, NotNull: true},
-		{Name: "atthasdef", TypeOID: 16, Num: 15, Len: 1, NotNull: true},
-		{Name: "atthasmissing", TypeOID: 16, Num: 16, Len: 1, NotNull: true},
-		{Name: "attidentity", TypeOID: 18, Num: 17, Len: 1, NotNull: true},
-		{Name: "attgenerated", TypeOID: 18, Num: 18, Len: 1, NotNull: true},
-		{Name: "attisdropped", TypeOID: 16, Num: 19, Len: 1, NotNull: true},
-		{Name: "attislocal", TypeOID: 16, Num: 20, Len: 1, NotNull: true},
-		{Name: "attinhcount", TypeOID: 21, Num: 21, Len: 2, NotNull: true},
-		{Name: "attcollation", TypeOID: 26, Num: 22, Len: 4, NotNull: true},
-		{Name: "attacl", TypeOID: 1034, Num: 23, Len: -1},
-		{Name: "attoptions", TypeOID: 25, Num: 24, Len: -1},
-	}
+	return nailedAttrsFromColDefs(pgAttrColDefs())
 }
 
 func pgProcAttrs() []nailedAttr {

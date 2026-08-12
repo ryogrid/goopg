@@ -340,3 +340,120 @@ func TestPagePruneOptMultiXactXmax(t *testing.T) {
 		}
 	})
 }
+
+// TestPagePruneOptRepointsExistingRedirect is the M0131-S31 regression: a chain
+// root that an EARLIER prune already converted to ItemIDRedirect must be
+// re-pointed when its target dies. Before the fix, pagePruneCore skipped every
+// non-NORMAL line pointer, so the SAME pass marked the redirect's (now dead,
+// heap-only) target unused while the redirect kept addressing it — the index
+// entry on the root resolved to an LP_UNUSED slot and the row disappeared from
+// every index scan while a seq scan still returned it. Two HOT updates of one
+// row on a page that prunes were enough to lose it (`analysis/idxprobe.sh`:
+// 9286 of 20000 ids unreachable).
+func TestPagePruneOptRepointsExistingRedirect(t *testing.T) {
+	page := make(Page, BlockSize)
+	if err := InitPage(page); err != nil {
+		t.Fatal(err)
+	}
+	xid := TransactionID(5)
+	oldestXmin := TransactionID(10)
+
+	// Slot 1: the indexed root, already redirected to slot 2 by a prior prune.
+	root := NewHeapTuple(1, xid, []byte("root"))
+	root.Header.SetHotUpdated()
+	root.Header.CTID = ItemPointer{Block: 0, Offset: 2}
+	if s, err := PageAddHeapTuple(page, root); err != nil || s != 1 {
+		t.Fatalf("add root: slot=%d err=%v", s, err)
+	}
+	// Slot 2: first HOT successor, now dead and HOT-updated to slot 3.
+	mid := NewHeapTuple(xid, xid, []byte("mid."))
+	mid.Header.SetHeapOnly()
+	mid.Header.SetHotUpdated()
+	mid.Header.CTID = ItemPointer{Block: 0, Offset: 3}
+	if s, err := PageAddHeapTuple(page, mid); err != nil || s != 2 {
+		t.Fatalf("add mid: slot=%d err=%v", s, err)
+	}
+	// Slot 3: the live chain tip.
+	tip := NewHeapTuple(xid, InvalidTransactionID, []byte("tip."))
+	tip.Header.SetHeapOnly()
+	if s, err := PageAddHeapTuple(page, tip); err != nil || s != 3 {
+		t.Fatalf("add tip: slot=%d err=%v", s, err)
+	}
+	if err := PageSetItemIDRedirect(page, 1, 2); err != nil {
+		t.Fatal(err)
+	}
+	MustHeader(page).SetPruneXID(uint32(xid))
+
+	result, err := PagePruneOpt(page, oldestXmin)
+	if err != nil {
+		t.Fatalf("PagePruneOpt: %v", err)
+	}
+	if len(result.Redirects) != 1 || result.Redirects[0] != [2]uint16{1, 3} {
+		t.Errorf("expected Redirects=[(1,3)], got %v", result.Redirects)
+	}
+	if len(result.Unused) != 1 || result.Unused[0] != 2 {
+		t.Errorf("expected Unused=[2], got %v", result.Unused)
+	}
+	item, err := readItemID(page, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.Flags != ItemIDRedirect || item.Offset != 3 {
+		t.Fatalf("root must redirect to the live tip 3, got flags=%d target=%d", item.Flags, item.Offset)
+	}
+	got, err := PageGetHeapTuple(page, item.Offset)
+	if err != nil || string(got.Data) != "tip." {
+		t.Errorf("redirect target unreadable or wrong: data=%q err=%v", got.Data, err)
+	}
+}
+
+// TestPagePruneOptStopsAtNonHOTChainEnd guards the other half of the M0131-S31
+// fix: pruneChainTip must not follow t_ctid past a dead tuple that was NOT
+// HOT-updated. Such a tuple's successor lives on a DIFFERENT block, so reading
+// its offset as a slot on THIS page lands on an unrelated tuple — and if that
+// tuple is live, the redirect would resolve the root's index entry to a foreign
+// row (observed as `WHERE id=104` returning two rows).
+func TestPagePruneOptStopsAtNonHOTChainEnd(t *testing.T) {
+	page := make(Page, BlockSize)
+	if err := InitPage(page); err != nil {
+		t.Fatal(err)
+	}
+	xid := TransactionID(5)
+	oldestXmin := TransactionID(10)
+
+	// Slot 1: indexed root, dead, HOT-updated to slot 2.
+	root := NewHeapTuple(1, xid, []byte("root"))
+	root.Header.SetHotUpdated()
+	root.Header.CTID = ItemPointer{Block: 0, Offset: 2}
+	if s, err := PageAddHeapTuple(page, root); err != nil || s != 1 {
+		t.Fatalf("add root: slot=%d err=%v", s, err)
+	}
+	// Slot 2: dead, and updated NON-HOT — its t_ctid names block 7 slot 3, but
+	// the offset alone would point at slot 3 of THIS page.
+	mid := NewHeapTuple(xid, xid, []byte("mid."))
+	mid.Header.SetHeapOnly()
+	mid.Header.CTID = ItemPointer{Block: 7, Offset: 3}
+	if s, err := PageAddHeapTuple(page, mid); err != nil || s != 2 {
+		t.Fatalf("add mid: slot=%d err=%v", s, err)
+	}
+	// Slot 3: an unrelated LIVE row that must never become the redirect target.
+	other := NewHeapTuple(xid, InvalidTransactionID, []byte("othr"))
+	if s, err := PageAddHeapTuple(page, other); err != nil || s != 3 {
+		t.Fatalf("add other: slot=%d err=%v", s, err)
+	}
+	MustHeader(page).SetPruneXID(uint32(xid))
+
+	result, err := PagePruneOpt(page, oldestXmin)
+	if err != nil {
+		t.Fatalf("PagePruneOpt: %v", err)
+	}
+	if len(result.Redirects) != 0 {
+		t.Errorf("chain ends at a non-HOT successor: expected no redirect, got %v", result.Redirects)
+	}
+	if len(result.Unused) != 2 || result.Unused[0] != 1 || result.Unused[1] != 2 {
+		t.Errorf("expected Unused=[1 2], got %v", result.Unused)
+	}
+	if got, err := PageGetHeapTuple(page, 3); err != nil || string(got.Data) != "othr" {
+		t.Errorf("unrelated live row must survive: data=%q err=%v", got.Data, err)
+	}
+}

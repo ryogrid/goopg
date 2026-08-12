@@ -123,7 +123,9 @@ carries `:relid 1260` and `:relid 1262` and belongs in S9.2.
 `pg_stat_checkpointer` (`:1157`) have **no `FROM` clause at all** — a target
 list of bare zero-argument function calls, so their `Query` carries an
 `RTE_RESULT`, a fifth RTE kind. Capture them last in S9.1 so an unexpected node
-tag surfaces against a two-view blast radius.
+tag surfaces against a two-view blast radius. (S9.1b did exactly that, and the
+two-view blast radius earned its keep: the `RTE_RESULT` prediction was **wrong**
+— an empty `:rtable` is what a FROM-less view actually serialises. See F4.)
 
 *Precondition, in better shape than the plan assumes.*
 `internal/initdb/pg_proc_seed_data.go` holds **3397** entries — exactly
@@ -238,7 +240,10 @@ S9.4 as a successor milestone and file the ledger row when S9.3 lands.
    contains either (`rtekind` census over the six: `0`, `2`, `3` only).
    `pg_stat_bgwriter`/`pg_stat_checkpointer` and
    `pg_statio_all_tables`/`pg_stats_ext` are the first instances.
-   Capture-and-see.
+   Capture-and-see. **RESOLVED, half wrongly — see F4 (S9.1b):** the
+   FROM-less pair carries NO `RTE_RESULT` at all (it is a planner construct,
+   absent from a parse tree); their blobs have an EMPTY `:rtable`, which is the
+   shape actually gained. The `LATERAL` half stands unmeasured.
 
 ## Guards
 
@@ -414,6 +419,70 @@ post-capture state but nothing mechanises the 42P01→resolvable transition.
 Gates: `internal/initdb` PASS (64 s), `TestE2E_PGColdStartOnGoopgDataDir` PASS,
 whole `^TestE2E_` family PASS (100 s), `capture-ev-action.sh --verify` PASS
 (28/28 byte-identical), UNITS PASS, pgbench smoke via the commit hook.
+
+## Implementation status — S9.1b (2026-08-11)
+
+**The corpus is 30 views. The `RTE_RESULT` pair is in, and guard #2 is now a
+whole guard.** Landed exactly as S9.0 promised — two rows added to
+`systemViewOIDPins()`, one `scripts/capture-ev-action.sh <30 views>` run, one
+`go run cmd/gen-nailed-view-tables/main.go`, plus the test-side probe entries.
+No hand-edited blob, table or rule row.
+
+The two pins were predicted from the band's own arithmetic before the oracle
+was asked (`view`, `reltype = view+2`, `rule = view+3`, next view `= view+4`)
+and the capture script's identity guard confirmed all four numbers for both
+views — 12293/12295/12296 and 12297/12299/12300 — which is one more
+independent datum for the "PG 18.3 initdb assignment is deterministic" claim
+this policy rests on.
+
+### Findings — S9.1b
+
+**F4 — the `RTE_RESULT` premise was wrong, and the real shape is stronger.**
+This slice existed because §"Two unmeasured `ev_action` shapes" predicted these
+two views would carry an `RTE_RESULT` range-table entry. They do not. The
+captured blob opens
+
+```
+({QUERY :commandType 1 … :cteList <> :rtable <> :rteperminfos <>
+  :jointree {FROMEXPR :fromlist <> :quals <>} …
+```
+
+— the range table is **empty**. `RTE_RESULT` is a *planner* construct
+(`postgres/src/backend/optimizer/plan/planmain.c`, from an empty jointree), not
+a parse-tree one, so it never reaches `pg_rewrite.ev_action`. What the corpus
+actually gained is the zero-RTE Query: every other blob has at least one
+`:rtable` element, and this is the first proof that a hosted PG round-trips a
+Query whose entire `rtable`/`fromlist` is `<>`. Both views evaluate on a hosted
+PG. The prediction in §"Two unmeasured shapes" is corrected here rather than in
+place; its `LATERAL` half (`pg_statio_all_tables`, `pg_stats_ext`) is untouched
+and remains unmeasured.
+
+**F5 — guard #2's before-half is mechanised, and it is a fail-when-fixed
+lock.** `assertNonCorpusSystemViewIsStillAbsent`
+(`internal/testport/e2e_pg_coldstart_on_goopgdata_test.go`) probes
+`pg_catalog.pg_tables` — deliberately the named head of the S9.2 tranche — and
+requires `42P01` *undefined_table*, not merely "an error": a 42809 or a
+tupledesc `elog` would mean the row IS on disk and something downstream
+rejected it, which is a different and interesting failure. With both halves in
+place the evaluability probe now attributes its own cause: views in
+`nailedSystemViewProbeSet()` evaluate, a view outside it does not exist at all.
+When S9.2 lands this assertion fails and must be re-pointed at the next
+un-adopted view.
+
+**F6 — the dual-definition hazard bites `pg_stat_checkpointer`, by name.**
+S9.1 found the hazard inert at scale; it is not inert here. goopg's runtime
+virtual definition (`registerStatCheckpointerView`,
+`internal/initdb/open.go:2625-2646`) has 11 columns — the same *count* as
+upstream — but a different *set*: it omits `num_done` and carries an extra
+`total_time`, and every column is declared `text` where upstream is
+`int8`/`float8`/`timestamptz`. A count-only check would have passed. This is
+ledgered, not fixed: the on-disk row is PG-faithful (it is captured), and
+reconciling goopg's own virtual view is a separate slice. `pg_stat_bgwriter`'s
+virtual definition agrees on all four names, order and types.
+
+Gates: `internal/initdb` PASS (64 s), whole `^TestE2E_` family PASS (100 s),
+`capture-ev-action.sh --verify` PASS (30/30 byte-identical), UNITS PASS,
+pgbench smoke via the commit hook.
 
 ## References
 

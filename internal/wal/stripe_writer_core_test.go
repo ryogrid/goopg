@@ -18,7 +18,7 @@ func TestStripeWriterCoreAppendHappyPath(t *testing.T) {
 	walBuf.reset(0)
 	memRing := NewMemRing(4096)
 
-	core := newStripeWriterCore(1<<20, 0, 0, walBuf, memRing)
+	core := newStripeWriterCore(1<<20, 0, 0, walBuf, memRing, padLayout{})
 
 	record := []byte("hello-stripe-core")
 	start, prev, err := core.Append(0, record)
@@ -88,7 +88,7 @@ func TestStripeWriterCoreNilReceiverGuards(t *testing.T) {
 func TestStripeWriterCoreNilRingsStillProgress(t *testing.T) {
 	t.Run("walBuf_nil", func(t *testing.T) {
 		memRing := NewMemRing(4096)
-		core := newStripeWriterCore(1<<20, 0, 0, nil, memRing)
+		core := newStripeWriterCore(1<<20, 0, 0, nil, memRing, padLayout{})
 		record := []byte("only-memring")
 		start, _, err := core.Append(0, record)
 		if err != nil {
@@ -103,7 +103,7 @@ func TestStripeWriterCoreNilRingsStillProgress(t *testing.T) {
 	t.Run("memRing_nil", func(t *testing.T) {
 		walBuf := newWALBuffer(4096)
 		walBuf.reset(0)
-		core := newStripeWriterCore(1<<20, 0, 0, walBuf, nil)
+		core := newStripeWriterCore(1<<20, 0, 0, walBuf, nil, padLayout{})
 		record := []byte("only-walbuf")
 		start, _, err := core.Append(0, record)
 		if err != nil {
@@ -116,7 +116,7 @@ func TestStripeWriterCoreNilRingsStillProgress(t *testing.T) {
 		}
 	})
 	t.Run("both_nil", func(t *testing.T) {
-		core := newStripeWriterCore(1<<20, 0, 0, nil, nil)
+		core := newStripeWriterCore(1<<20, 0, 0, nil, nil, padLayout{})
 		start, _, err := core.Append(0, []byte("ghost"))
 		if err != nil {
 			t.Fatalf("Append: %v", err)
@@ -139,10 +139,10 @@ func TestStripeWriterCoreNilRingsStillProgress(t *testing.T) {
 func TestStripeWriterCoreRejectsZeroSegSize(t *testing.T) {
 	defer func() {
 		if r := recover(); r == nil {
-			t.Fatal("expected panic from newStripeWriterCore(segSize=0)")
+			t.Fatal("expected panic from newStripeWriterCore(segSize=0, padLayout{})")
 		}
 	}()
-	_ = newStripeWriterCore(0, 0, 0, nil, nil)
+	_ = newStripeWriterCore(0, 0, 0, nil, nil, padLayout{})
 }
 
 // TestStripeWriterCoreRecoveryResume verifies that startCurr /
@@ -160,7 +160,7 @@ func TestStripeWriterCoreRecoveryResume(t *testing.T) {
 	// scenario starts in-window because startCurr=256 < cap=4096.
 	memRing := NewMemRing(4096)
 
-	core := newStripeWriterCore(1<<20, startCurr, startPrev, walBuf, memRing)
+	core := newStripeWriterCore(1<<20, startCurr, startPrev, walBuf, memRing, padLayout{})
 
 	curr, prev := core.Load()
 	if curr != startCurr || prev != startPrev {
@@ -199,7 +199,7 @@ func TestStripeWriterCoreCrossSegmentEmitsPad(t *testing.T) {
 	walBuf.reset(0)
 	memRing := NewMemRing(int64(segSize) * 2)
 
-	core := newStripeWriterCore(segSize, 0, 0, walBuf, memRing)
+	core := newStripeWriterCore(segSize, 0, 0, walBuf, memRing, padLayout{})
 
 	r1 := bytes.Repeat([]byte{0xAA}, 80)
 	r2 := bytes.Repeat([]byte{0xBB}, 80)
@@ -265,7 +265,7 @@ func TestStripeWriterCorePublishUpToCapsAtActiveStripe(t *testing.T) {
 	walBuf := newWALBuffer(4096)
 	walBuf.reset(0)
 	memRing := NewMemRing(4096)
-	core := newStripeWriterCore(1<<20, 0, 0, walBuf, memRing)
+	core := newStripeWriterCore(1<<20, 0, 0, walBuf, memRing, padLayout{})
 
 	// Synthesise an active stripe at LSN 600 (no bytes written —
 	// PublishUpTo only consults the insertion tracker for the cap).
@@ -295,7 +295,7 @@ func TestStripeWriterCorePublishUpToCapsAtActiveStripe(t *testing.T) {
 // (not capped at any upperBound), so callers can introspect the
 // publisher independently of a PublishUpTo call.
 func TestStripeWriterCorePublishedTailReflectsInternalState(t *testing.T) {
-	core := newStripeWriterCore(1<<20, 0, 0, nil, nil)
+	core := newStripeWriterCore(1<<20, 0, 0, nil, nil, padLayout{})
 	if got := core.PublishedTail(); got != 0 {
 		t.Fatalf("fresh PublishedTail: %d, want 0", got)
 	}
@@ -321,7 +321,7 @@ func TestStripeWriterCoreConcurrentAppendsAndPublish(t *testing.T) {
 	walBuf := newWALBuffer(1 << 20)
 	walBuf.reset(0)
 	memRing := NewMemRing(1 << 20)
-	core := newStripeWriterCore(1<<20, 0, 0, walBuf, memRing)
+	core := newStripeWriterCore(1<<20, 0, 0, walBuf, memRing, padLayout{})
 
 	const (
 		writers      = 8
@@ -409,7 +409,7 @@ func TestStripeWriterCoreConcurrentCompletesUnderWatchdog(t *testing.T) {
 // untouched (visible via Load) and the call-site rewrite cannot
 // hide an empty-record bug.
 func TestStripeWriterCoreAppendEmptyRecord(t *testing.T) {
-	core := newStripeWriterCore(1<<20, 0, 0, nil, nil)
+	core := newStripeWriterCore(1<<20, 0, 0, nil, nil, padLayout{})
 	if _, _, err := core.Append(0, nil); !errors.Is(err, errStripeAppendEmptyRecord) {
 		t.Fatalf("Append(nil): err=%v, want errStripeAppendEmptyRecord", err)
 	}

@@ -116,6 +116,12 @@ func TestReadAllDerivesSegmentSizeFromStream(t *testing.T) {
 		if r.StartLSN < minLSN {
 			t.Fatalf("record StartLSN %d precedes the retained range start %d — baseOffset is wrong", r.StartLSN, minLSN)
 		}
+		if r.XLog != nil && r.XLog.Header.Rmid == RmgrXLog && r.XLog.Header.Info == xlogInfoNoop {
+			// Segment-boundary XLOG_NOOP pad — emitted by the writer itself at
+			// a crossing (M0131-S30.6), so it has no entry in the appended
+			// record list.
+			continue
+		}
 		p, ok := byStart[r.StartLSN]
 		if !ok {
 			t.Fatalf("decoded StartLSN %d was never assigned by the writer (baseOffset drift)", r.StartLSN)

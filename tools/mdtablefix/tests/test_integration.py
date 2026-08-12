@@ -82,6 +82,68 @@ class TestIntegrationWithFixtures(unittest.TestCase):
                 )
 
 
+class TestBlankSplitLedger(unittest.TestCase):
+    """End-to-end repair of the deferral-ledger failure mode.
+
+    The real ledger rendered only its first 940 rows on GitHub: a blank
+    line inside the body ended the table, and one row missing its trailing
+    pipe made the detector reject the block entirely — so the tool reported
+    "no issues" on a visibly broken file.
+    """
+
+    def _repaired_document(self, text: str) -> str:
+        doc = parse_document(text)
+        out: list[str] = []
+        for block in doc.blocks:
+            if isinstance(block, Table):
+                out.append(format_table(repair_table(block), compact=True))
+            else:
+                out.append("\n".join(block.lines))
+        return "\n".join(out)
+
+    def test_single_table_with_every_row(self):
+        text = _read_fixture("blank_split_table.md")
+        doc = parse_document(text)
+        tables = [b for b in doc.blocks if isinstance(b, Table)]
+        self.assertEqual(len(tables), 1)
+        self.assertEqual(len(tables[0].data_rows), 6)
+
+    def test_all_defects_are_reported(self):
+        text = _read_fixture("blank_split_table.md")
+        doc = parse_document(text)
+        table = next(b for b in doc.blocks if isinstance(b, Table))
+        fixes = repair_table(table).fixes
+        by_type = {f.type for f in fixes}
+        self.assertIn("blank_line", by_type)
+        self.assertIn("missing_outer_pipe", by_type)
+        self.assertIn("extra_cell", by_type)
+
+    def test_repaired_output_has_no_body_blank_lines(self):
+        text = _read_fixture("blank_split_table.md")
+        repaired = self._repaired_document(text)
+        body = [
+            ln for ln in repaired.split("\n")
+            if ln.startswith("|") or ln.strip() == ""
+        ]
+        # Walk the rendered table: no blank line may sit between two rows.
+        rows = [i for i, ln in enumerate(body) if ln.startswith("|")]
+        for a, b in zip(rows, rows[1:]):
+            self.assertEqual(
+                b, a + 1, f"blank line survived between rows {a} and {b}"
+            )
+
+    def test_repair_is_idempotent(self):
+        text = _read_fixture("blank_split_table.md")
+        once = self._repaired_document(text)
+        twice = self._repaired_document(once)
+        self.assertEqual(once, twice)
+
+    def test_trailing_prose_is_preserved(self):
+        text = _read_fixture("blank_split_table.md")
+        repaired = self._repaired_document(text)
+        self.assertIn("Trailing paragraph", repaired)
+
+
 class TestCLIModes(unittest.TestCase):
     """Tests for the CLI via subprocess."""
 

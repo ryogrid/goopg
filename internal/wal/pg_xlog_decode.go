@@ -23,6 +23,23 @@ const (
 	xlogXactAbort           uint8 = 0x20
 	xlogXactOpMask          uint8 = 0x70
 
+	// M0131-S21a: the RM_HEAP_ID opcode goopg never emits but a real PG
+	// crash tail carries (heapam_xlog.h:36). Recognised — not implemented:
+	// heap_redo's TRUNCATE arm is an explicit no-op upstream ("TRUNCATE is a
+	// no-op because the actions are already logged as SMGR WAL records",
+	// heapam_xlog.c:1201-1208).
+	xlogHeapTruncate uint8 = 0x30 // XLOG_HEAP_TRUNCATE
+
+	// M0131-S21a: RM_XACT_ID's remaining opcodes (xact.h:169-175). ASSIGNMENT
+	// and INVALIDATIONS are recovery-bookkeeping records goopg has no consumer
+	// for; the three two-phase-commit opcodes are refused loudly rather than
+	// dropped (see the RmgrXact arm in recovery.go).
+	xlogXactPrepare        uint8 = 0x10 // XLOG_XACT_PREPARE
+	xlogXactCommitPrepared uint8 = 0x30 // XLOG_XACT_COMMIT_PREPARED
+	xlogXactAbortPrepared  uint8 = 0x40 // XLOG_XACT_ABORT_PREPARED
+	xlogXactAssignment     uint8 = 0x50 // XLOG_XACT_ASSIGNMENT
+	xlogXactInvalidations  uint8 = 0x60 // XLOG_XACT_INVALIDATIONS
+
 	// XlogXactCommit and XlogXactAbort are exported for the crash-recovery
 	// xact-stamp pass in internal/initdb. (M0106-0013)
 	XlogXactCommit = xlogXactCommit
@@ -32,6 +49,12 @@ const (
 	// XlogClogTruncate is exported for the initdb clog-recovery scan (A9).
 	XlogClogTruncate = xlogClogTruncate
 	xlogStandbyRunningXacts uint8 = 0x10
+	// M0131-S21a: RM_STANDBY_ID's other two opcodes (standbydefs.h:34-36).
+	// Both are hot-standby-only upstream — standby_redo returns immediately
+	// when standbyState == STANDBY_DISABLED, which is always true during a
+	// crash-recovery start (standby.c:1170-1172).
+	xlogStandbyLock          uint8 = 0x00 // XLOG_STANDBY_LOCK
+	xlogStandbyInvalidations uint8 = 0x20 // XLOG_INVALIDATIONS
 	// xlogXLogParameterChange is the xl_info opcode for XLOG_PARAMETER_CHANGE
 	// (pg_control.h:74). Emitted by the primary when GUC echo fields change;
 	// replayed on the standby to update pg_control's GUC echo section.
@@ -44,27 +67,118 @@ const (
 	xlogHeap2PruneVacuumScan  uint8 = 0x20 // XLOG_HEAP2_PRUNE_VACUUM_SCAN
 	xlogHeap2PruneVacuumClean uint8 = 0x30 // XLOG_HEAP2_PRUNE_VACUUM_CLEANUP
 
+	// M0131-S21a: the RM_HEAP2_ID opcodes goopg never emits
+	// (heapam_xlog.h:59-66). NEW_CID is logical-decoding-only and a physical
+	// no-op; the rest are real page mutations still awaiting redo (S21a-2).
+	xlogHeap2NewCid      uint8 = 0x70 // XLOG_HEAP2_NEW_CID
+	xlogHeap2MultiInsert uint8 = 0x50 // XLOG_HEAP2_MULTI_INSERT
+
+	// XLOG_HEAP2_REWRITE (M0131-S21a-2 part 7, heapam_xlog.h:59) is emitted by
+	// a VACUUM FULL / CLUSTER of a table whose old row versions a logical
+	// replication slot may still need (rewriteheap.c:894, reached only via
+	// logical_rewrite_log_mapping, i.e. wal_level=logical plus a slot).
+	// Its redo writes no page at all: it (re)writes a tail of a
+	// pg_logical/mappings/ file that maps a pre-rewrite ctid to its
+	// post-rewrite one (rewriteheap.c:1073-1160). goopg refuses it — see the
+	// dispatch arm in replayDecodedXLogRecord.
+	xlogHeap2Rewrite uint8 = 0x00
+
+	// XLOG_HEAP2_VISIBLE (M0131-S21a-2 part 3): every VACUUM that marks a page
+	// all-visible emits one, and so does an INSERT that freezes a page it
+	// filled itself. It is the FIRST record whose redo writes the
+	// visibility-map fork rather than the main fork.
+	xlogHeap2Visible uint8 = 0x40
+
+	// XLOG_HEAP2_LOCK_UPDATED (M0131-S21a-2 part 4, heapam_xlog.h:65): the
+	// near-sibling of XLOG_HEAP_LOCK, emitted when a tuple-lock request
+	// (SELECT ... FOR UPDATE/SHARE, a FK RI check, an UPDATE about to
+	// rewrite a row) discovers the row was already updated by a concurrent
+	// still-live transaction — the locker re-locks the *newest visible
+	// version* of the row via heap_lock_updated_tuple_rec, which is on RM_HEAP2
+	// because it can chain across multiple row versions.
+	xlogHeap2LockUpdated uint8 = 0x60
+
+	// xlogVisibilitymapXLogCatalogRel is VISIBILITYMAP_XLOG_CATALOG_REL
+	// (visibilitymapdefs.h:31): an xl_heap_visible flags bit that exists only
+	// on the wire, telling a hot standby that the relation is catalog-ish when
+	// resolving snapshot conflicts. It must be masked off before the flags
+	// reach the map page (visibilitymapdefs.h:29).
+	xlogVisibilitymapXLogCatalogRel uint8 = 0x04
+
+	// XLH_INSERT_* flag bits carried in xl_heap_insert/xl_heap_multi_insert's
+	// `flags` byte (heapam_xlog.h:72-79). Redo consults only the two
+	// visibility-map bits: ALL_VISIBLE_CLEARED clears PD_ALL_VISIBLE on the
+	// heap page, ALL_FROZEN_SET sets it (heapam_xlog.c, heap_xlog_multi_insert).
+	// The remaining bits (LAST_IN_MULTI, IS_SPECULATIVE, CONTAINS_NEW_TUPLE,
+	// ON_TOAST_RELATION) exist for logical decoding and speculative-insert
+	// bookkeeping and have no physical effect.
+	xlogHeapInsertAllVisibleCleared uint8 = 1 << 0
+	xlogHeapInsertAllFrozenSet      uint8 = 1 << 5
+
 	// XLOG_HEAP_LOCK (heapam_xlog.h:39), shares RM_HEAP_ID's opmask
 	// with xlogHeap{Insert,Delete,Update,HotUpdate,Inplace}. Used by
 	// recordKindToRmgrInfo (doc 04 §3.1) to map HeapLock.
 	xlogHeapLock uint8 = 0x60
+
+	// XLOG_HEAP_CONFIRM (heapam_xlog.h:38) completes a speculative insert
+	// (INSERT .. ON CONFLICT): the inserter first writes the tuple with a
+	// speculative token in t_ctid, then confirms it. goopg never emits one —
+	// its upsert path takes the row lock before inserting — but every PG
+	// ON CONFLICT statement produces one, so a PG tail needs the redo.
+	xlogHeapConfirm uint8 = 0x50
+
+	// XLHL_* are the bits of xl_heap_lock.infobits_set (heapam_xlog.h:386-390),
+	// the wire encoding of the infomask/infomask2 bits redo must restore. The
+	// translation to page bits is upstream's fix_infomask_from_infobits.
+	xlhlXmaxIsMulti    uint8 = 0x01
+	xlhlXmaxLockOnly   uint8 = 0x02
+	xlhlXmaxExclLock   uint8 = 0x04
+	xlhlXmaxKeyShrLock uint8 = 0x08
+	xlhlKeysUpdated    uint8 = 0x10
+
+	// XLH_LOCK_ALL_FROZEN_CLEARED (heapam_xlog.h:393): the locker had to clear
+	// the block's visibility-map ALL_FROZEN bit.
+	xlhLockAllFrozenCleared uint8 = 0x01
 
 	// RM_BTREE_ID (rmid 11) opcodes (nbtxlog.h:27-39). Used by
 	// recordKindToRmgrInfo (doc 04 §3.1) to map
 	// BtreeInsert/BtreeSplit/BtreeVacuum/BtreeUnlinkPage/BtreeNewRoot/
 	// BtreeMarkPageHalfDead onto their real-PG opcodes.
 	xlogBtreeInsertLeaf       uint8 = 0x00 // XLOG_BTREE_INSERT_LEAF
+	xlogBtreeInsertUpper      uint8 = 0x10 // XLOG_BTREE_INSERT_UPPER
+	xlogBtreeInsertMeta       uint8 = 0x20 // XLOG_BTREE_INSERT_META
 	xlogBtreeSplitL           uint8 = 0x30 // XLOG_BTREE_SPLIT_L
 	xlogBtreeSplitR           uint8 = 0x40 // XLOG_BTREE_SPLIT_R
+	xlogBtreeInsertPost       uint8 = 0x50 // XLOG_BTREE_INSERT_POST
+	xlogBtreeDedup            uint8 = 0x60 // XLOG_BTREE_DEDUP
+	xlogBtreeDelete           uint8 = 0x70 // XLOG_BTREE_DELETE
 	xlogBtreeUnlinkPage       uint8 = 0x80 // XLOG_BTREE_UNLINK_PAGE
 	xlogBtreeUnlinkPageMeta   uint8 = 0x90 // XLOG_BTREE_UNLINK_PAGE_META
 	xlogBtreeNewRoot          uint8 = 0xA0 // XLOG_BTREE_NEWROOT
 	xlogBtreeMarkPageHalfDead uint8 = 0xB0 // XLOG_BTREE_MARK_PAGE_HALFDEAD
 	xlogBtreeVacuum           uint8 = 0xC0 // XLOG_BTREE_VACUUM
+	// M0131-S21b parts 1-2: PG-only opcodes goopg never emits but must replay
+	// off a real PG crash tail. XLOG_BTREE_INSERT_POST (0x50, above) is the
+	// leaf insert that had to split an existing posting list; XLOG_BTREE_META_CLEANUP
+	// is _bt_set_cleanup_info's metapage-only rewrite (nbtpage.c), redone by
+	// _bt_restore_meta(record, 0).
+	xlogBtreeMetaCleanup uint8 = 0xE0 // XLOG_BTREE_META_CLEANUP
+	// M0131-S21b part 3: XLOG_BTREE_DELETE (0x70, above) is the LP_DEAD
+	// "simple deletion" pass (_bt_delitems_delete, nbtpage.c);
+	// XLOG_BTREE_REUSE_PAGE has NO page work at all — its whole redo body is
+	// the hot-standby conflict resolve (nbtxlog.c:1006-1015), so it is
+	// recognised as a no-op rather than left to the refusing default arm.
+	xlogBtreeReusePage uint8 = 0xD0 // XLOG_BTREE_REUSE_PAGE
 
 	// XLOG_SMGR_CREATE (storage_xlog.h:30). Used by recordKindToRmgrInfo
 	// (doc 04 §3.1) to map SmgrCreate onto RM_SMGR_ID.
 	xlogSmgrCreate uint8 = 0x10
+
+	// XLOG_SMGR_TRUNCATE (storage_xlog.h:31). M0131-S21a-2 part 6: goopg
+	// never emits this opcode (its own truncate-to-zero rides the native
+	// RecordKindSmgrTruncate), so this arm exists only for a real-PG crash
+	// tail — every TABLE/INDEX TRUNCATE and every VACUUM tail truncation.
+	xlogSmgrTruncate uint8 = 0x20
 
 	// RM_TBLSPC_ID info codes (commands/tablespace.h). B4.1d.
 	xlogTblspcCreate uint8 = 0x00 // XLOG_TBLSPC_CREATE
@@ -79,10 +193,64 @@ const (
 	// Used by recordKindToRmgrInfo (doc 04 §3.1) to map PageImage.
 	xlogXLogFPI uint8 = 0xB0
 
+	// M0131-S16.4: the REST of RM_XLOG_ID's opcode space
+	// (pg_control.h:68-82). Named so replayDecodedXLogRecord can enumerate
+	// the benign no-ops explicitly and refuse anything outside the list,
+	// instead of collapsing the whole space into one silent `default:`.
+	// XLOG_NEXTOID is deliberately absent from the benign set — it carries
+	// real state and is applied by the initdb OID-recovery scan (S21a).
+	xlogXLogCheckpointShutdown  uint8 = 0x00 // XLOG_CHECKPOINT_SHUTDOWN
+	xlogXLogCheckpointOnline    uint8 = 0x10 // XLOG_CHECKPOINT_ONLINE
+	xlogXLogNoop                uint8 = 0x20 // XLOG_NOOP
+	xlogXLogNextOid             uint8 = 0x30 // XLOG_NEXTOID (NOT benign)
+	xlogXLogSwitch              uint8 = 0x40 // XLOG_SWITCH
+	xlogXLogBackupEnd           uint8 = 0x50 // XLOG_BACKUP_END
+	xlogXLogRestorePoint        uint8 = 0x70 // XLOG_RESTORE_POINT
+	xlogXLogFPWChange           uint8 = 0x80 // XLOG_FPW_CHANGE
+	xlogXLogEndOfRecovery       uint8 = 0x90 // XLOG_END_OF_RECOVERY
+	xlogXLogFPIForHint          uint8 = 0xA0 // XLOG_FPI_FOR_HINT
+	xlogXLogOverwriteContrecord uint8 = 0xD0 // XLOG_OVERWRITE_CONTRECORD
+	xlogXLogCheckpointRedo      uint8 = 0xE0 // XLOG_CHECKPOINT_REDO
+
+	// XlogXLogNextOid is exported for the initdb OID-recovery scan (S21a):
+	// the physical replay pass has no catalog handle, so — exactly like
+	// CLOG_TRUNCATE — the record is recognised in replayDecodedXLogRecord and
+	// re-applied by a second pass in internal/initdb.
+	XlogXLogNextOid = xlogXLogNextOid
+
 	// CLOG_TRUNCATE (clog.h:56), RM_CLOG_ID's (only non-zeropage)
 	// opcode. Used by recordKindToRmgrInfo (doc 04 §3.1) to map
 	// ClogTruncate.
 	xlogClogTruncate uint8 = 0x10
+
+	// CLOG_ZEROPAGE (clog.h:55), RM_CLOG_ID's other opcode: WriteZeroPageXlogRec
+	// (clog.c:1073-1078) fires once per 32768 XIDs, right before ExtendCLOG
+	// hands out the first XID of a fresh page. M0131-S21a-2 part 5.
+	xlogClogZeroPage uint8 = 0x00
+
+	// M0131-S23 — "the cheap tail": the four rmgrs above RM_SEQ_ID that a real
+	// PG can emit and goopg never will. Named so replayDecodedXLogRecord can
+	// recognise each opcode explicitly and keep refusing anything outside the
+	// list, rather than refusing the whole rmgr.
+
+	// RM_LOGICALMSG_ID (21), replication/message.h:32. Its single opcode;
+	// logicalmsg_redo (message.c:83-97) has an EMPTY body.
+	xlogLogicalMessage uint8 = 0x00
+
+	// RM_REPLORIGIN_ID (19) info codes (replication/origin.h:33-34).
+	// replorigin_redo touches only the in-shmem replication_states array.
+	xlogReplOriginSet  uint8 = 0x00 // XLOG_REPLORIGIN_SET
+	xlogReplOriginDrop uint8 = 0x10 // XLOG_REPLORIGIN_DROP
+
+	// RM_GENERIC_ID (20) has NO opcode space at all: GenericXLogFinish calls
+	// XLogInsert(RM_GENERIC_ID, 0) (generic_xlog.c:400) and generic_redo
+	// (generic_xlog.c:477-533) never reads xl_info. A non-zero info is
+	// therefore a corrupt or future record, not an opcode we do not know.
+	xlogGenericInfo uint8 = 0x00
+
+	// RM_COMMIT_TS_ID (18) info codes (access/commit_ts.h:20-21).
+	xlogCommitTsZeroPage uint8 = 0x00 // COMMIT_TS_ZEROPAGE
+	xlogCommitTsTruncate uint8 = 0x10 // COMMIT_TS_TRUNCATE
 
 	bkpBlockForkMask byte = 0x0F
 	bkpBlockHasImage byte = 0x10
@@ -100,6 +268,16 @@ const (
 	sizeOfRelFileLocator              = 12
 	sizeOfXLogHeapInsertData          = 3
 	sizeOfXLogHeapHeaderData          = 5
+	// sizeOfXLogHeapMultiInsertData is SizeOfHeapMultiInsert —
+	// offsetof(xl_heap_multi_insert, offsets) (heapam_xlog.h:188). The struct is
+	// {uint8 flags; uint16 ntuples; OffsetNumber offsets[]}, so C's alignment
+	// puts ntuples at byte 2 and the offsets array at byte 4.
+	sizeOfXLogHeapMultiInsertData = 4
+	// sizeOfXLogMultiInsertTuple is SizeOfMultiInsertTuple —
+	// offsetof(xl_multi_insert_tuple, t_hoff) + sizeof(uint8)
+	// (heapam_xlog.h:199): {uint16 datalen; uint16 t_infomask2;
+	// uint16 t_infomask; uint8 t_hoff} = 7 bytes, tuple data following.
+	sizeOfXLogMultiInsertTuple = 7
 
 	pgDefaultTableSpaceOID uint32 = 1663
 	// pgGlobalTableSpaceOID is GLOBALTABLESPACE_OID: the tablespace of the
@@ -346,7 +524,11 @@ func decodeXLogBlockRefHeader(src []byte, lastRel storage.RelFileNode, haveRel b
 			if off+sizeOfXLogRecordBlockCompressHead > len(src) {
 				return xlogBlockMeta{}, 0, storage.RelFileNode{}, false, fmt.Errorf("%w: truncated block image compression header", ErrCorruptRecord)
 			}
-			return xlogBlockMeta{}, 0, storage.RelFileNode{}, false, fmt.Errorf("wal: compressed PostgreSQL backup block images are not supported yet")
+			// M0131-S16.5: wrapped in ErrUnsupportedRecord so the reader
+			// surfaces it to the caller instead of absorbing it as a
+			// clean end-of-WAL — these bytes are a real, durable record.
+			return xlogBlockMeta{}, 0, storage.RelFileNode{}, false, fmt.Errorf(
+				"%w: compressed PostgreSQL backup block images are not supported yet", ErrUnsupportedRecord)
 		}
 	}
 	if forkFlags&bkpBlockSameRel != 0 {
@@ -359,16 +541,27 @@ func decodeXLogBlockRefHeader(src []byte, lastRel storage.RelFileNode, haveRel b
 			return xlogBlockMeta{}, 0, storage.RelFileNode{}, false, fmt.Errorf("%w: truncated relfilelocator", ErrCorruptRecord)
 		}
 		spcOID := binary.LittleEndian.Uint32(src[off : off+4])
-		if spcOID != 0 && spcOID != pgDefaultTableSpaceOID && spcOID != pgGlobalTableSpaceOID {
-			return xlogBlockMeta{}, 0, storage.RelFileNode{}, false, fmt.Errorf(
-				"wal: unsupported PostgreSQL tablespace OID %d locator=%x fork_flags=0x%02x data_len=%d",
-				spcOID, src[off:off+sizeOfRelFileLocator], forkFlags, meta.dataLen)
-		}
-		// spcOID is dropped: the shared-vs-per-DB routing is carried by dbOid
-		// (0 → global/, via sharedOrPerDBRelDir). A shared catalog's locator is
+		// For the two built-in tablespaces spcOID is dropped: the
+		// shared-vs-per-DB routing is carried by dbOid (0 → global/, via
+		// sharedOrPerDBRelDir). A shared catalog's locator is
 		// spcOid=1664/dbOid=0; TblOid stays 0 so relDir resolves to global/.
 		// B4.1a.
+		//
+		// M0131-S16.2: a USER tablespace OID used to be rejected here, and the
+		// reader then reported that rejection as a clean end-of-WAL — so every
+		// record behind the first pg_tblspc-resident relation was dropped on
+		// goopg's OWN restart path (exposed by
+		// TestIndexTablespaceSurvivesRestartViaCatalogHeap the moment the
+		// reader stopped swallowing the error). Carry the OID into TblOid
+		// instead: storage.relDir already routes a non-zero TblOid through
+		// pg_tblspc/<TblOid>/<version dir>/<dbOid> (smgr.go:624-636,
+		// M0122-0007), which is exactly where the emitter put the file.
+		tblOID := spcOID
+		if spcOID == pgDefaultTableSpaceOID || spcOID == pgGlobalTableSpaceOID {
+			tblOID = 0
+		}
 		meta.ref.Rel = storage.RelFileNode{
+			TblOid: tblOID,
 			DBOid:  binary.LittleEndian.Uint32(src[off+4 : off+8]),
 			RelOid: binary.LittleEndian.Uint32(src[off+8 : off+12]),
 		}

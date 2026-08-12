@@ -205,6 +205,23 @@ func (s Snapshot) SeesCommittedXID(xid storage.TransactionID) bool {
 	if s.HasAborted(xid) {
 		return false
 	}
+	// M0131-S30.7: the CLOG consult must precede the below-Xmin shortcut, not
+	// only guard the in-window residual case. After crash recovery every XID
+	// that was in flight at the crash is stamped Aborted by
+	// initdb.Open's MarkUnknownAsAborted sweep, but NextXID is then advanced
+	// past all of them — so the FIRST snapshot a post-restart session takes has
+	// Xmin above the whole aborted range and the shortcut below declared their
+	// replayed heap changes committed. That is how a torn pgbench transaction
+	// (accounts/tellers updates durable, its history INSERT past the WAL cut)
+	// became visible and broke sum(abalance) == sum(history.delta). PostgreSQL
+	// has no such shortcut: HeapTupleSatisfiesMVCC always resolves a non-hinted
+	// xmin through TransactionIdDidCommit → the CLOG, whatever the snapshot's
+	// xmin is (heapam_visibility.c). The hint bits (HeapXminCommitted /
+	// HeapXminInvalid, checked by the caller in visibility.go) are what keep
+	// this off the repeat-scan hot path, exactly as upstream.
+	if !s.clogSaysNotAborted(xid) {
+		return false
+	}
 	if xid < s.Xmin {
 		return true
 	}
@@ -221,19 +238,27 @@ func (s Snapshot) SeesCommittedXID(xid storage.TransactionID) bool {
 	// PostgreSQL's TransactionIdDidAbort consult in HeapTupleSatisfiesMVCC.
 	//
 	// Conservative contract: only a positive TxnStatusAborted overrides the v0
-	// default. TxnStatusUnknown (the steady-state status for runtime-new XIDs,
-	// since goopg's commit path does not write CLOG) and TxnStatusCommitted both
-	// fall through to "committed", so wiring the CLOG cannot regress the live
-	// path — it only hides recovered aborts the in-memory array forgot.
-	if s.clog != nil {
-		// Below the oldest retained CLOG XID, status has been truncated away and
-		// the XID is older than every relfrozenxid (treat as committed/frozen).
-		// Use the wraparound-safe comparison (M0117-0001).
-		if oldest := s.clog.OldestClogXid(); oldest == 0 || !storage.XIDPrecedes(xid, oldest) {
-			if s.clog.GetStatus(xid) == TxnStatusAborted {
-				return false
-			}
-		}
-	}
+	// default (see clogSaysNotAborted, already consulted above).
 	return true
+}
+
+// clogSaysNotAborted reports whether the durable commit log permits treating
+// xid as committed: true unless the CLOG positively says TxnStatusAborted.
+//
+// Conservative contract: only a positive TxnStatusAborted is authoritative here.
+// TxnStatusUnknown (a runtime XID whose CLOG lane has not been stamped yet) and
+// TxnStatusCommitted both read as "not aborted", so consulting the CLOG cannot
+// hide live work — it only hides aborts the in-memory Aborted array forgot,
+// which after a restart is all of them (the array is rebuilt empty).
+func (s Snapshot) clogSaysNotAborted(xid storage.TransactionID) bool {
+	if s.clog == nil {
+		return true
+	}
+	// Below the oldest retained CLOG XID, status has been truncated away and the
+	// XID is older than every relfrozenxid (treat as committed/frozen). Use the
+	// wraparound-safe comparison (M0117-0001).
+	if oldest := s.clog.OldestClogXid(); oldest != 0 && storage.XIDPrecedes(xid, oldest) {
+		return true
+	}
+	return s.clog.GetStatus(xid) != TxnStatusAborted
 }

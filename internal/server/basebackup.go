@@ -211,21 +211,38 @@ func (s *Server) replyBaseBackup(ctx context.Context, w *protocol.FrameWriter, a
 	// and the backup end. M0105-0007.
 	startLSN := redoLSN
 
-	// M0102-0007: after the forced checkpoint, patch pg_control on disk
-	// with the checkpoint REDO location so the resulting backup's
+	// M0102-0007: after the forced checkpoint, build a pg_control image
+	// carrying the checkpoint REDO location so the resulting backup's
 	// global/pg_control carries a valid checkpoint — PostgreSQL
 	// standbys reject pg_control with a zero redo point.
-	baseLSN0 := uint64(0)
-	ckptLSN0 := uint64(0)
-	if redoLSN > 0 {
-		baseLSN0 = redoLSN - 1
-		ckptLSN0 = ckptRecLSN - 1
-		_ = initdb.UpdateControlCheckpoint(s.cfg.DataDir, redoLSN, ckptRecLSN)
-	}
+	// M0131-S29: the image goes into the TAR ONLY. This used to rewrite the
+	// live cluster's pg_control (minRecoveryPoint=1, backupEndPoint=redo),
+	// which upstream never does (basebackup.c:352-360 sends the control file
+	// through a plain sendFile) and which makes a promoted (TLI >= 2) primary
+	// FATAL "requested timeline %u does not contain minimum recovery point"
+	// (xlogrecovery.c:878-886) if it crashes before the next checkpoint
+	// rewrites the field.
+	// M0131-S18.3: the timeline is resolved BEFORE the pg_control patch so
+	// the checkPointCopy TLI matches the one the backup's segment names
+	// and the START_TIMELINE reply carry. It used to be hardcoded to 1,
+	// which only happened to be right on a never-promoted cluster.
 	startTLI, err := initdb.LoadOrCreateTimelineID(s.cfg.DataDir)
 	if err != nil {
 		return s.writeQueryError(w, sqlstate.InternalError,
 			fmt.Sprintf("BASE_BACKUP: timeline: %v", err))
+	}
+	baseLSN0 := uint64(0)
+	ckptLSN0 := uint64(0)
+	// pgControlImage is the patched image shipped in place of the on-disk
+	// file; nil means "ship the file verbatim" (no checkpoint to record, or
+	// the control file could not be read — the pre-S29 code ignored that
+	// error too, and a backup with an unpatched control file is still better
+	// than a failed one).
+	var pgControlImage []byte
+	if redoLSN > 0 {
+		baseLSN0 = redoLSN - 1
+		ckptLSN0 = ckptRecLSN - 1
+		pgControlImage, _ = initdb.BackupControlImage(s.cfg.DataDir, redoLSN, ckptRecLSN, startTLI)
 	}
 
 	// --- result-set 1: start LSN + TLI ---
@@ -297,7 +314,7 @@ func (s *Server) replyBaseBackup(ctx context.Context, w *protocol.FrameWriter, a
 		}
 	}
 
-	entries, err := emitBaseBackupTar(ctx, streamer, s.cfg.DataDir, opts.Label, baseLSN0, ckptLSN0, startTLI, segSize, mck, opts.IncludeWAL, walStartSeg, walEndSeg)
+	entries, err := emitBaseBackupTar(ctx, streamer, s.cfg.DataDir, opts.Label, baseLSN0, ckptLSN0, startTLI, segSize, mck, opts.IncludeWAL, walStartSeg, walEndSeg, pgControlImage)
 	if err != nil {
 		return s.writeStreamingError(w, sqlstate.InternalError,
 			fmt.Sprintf("BASE_BACKUP: tar: %v", err))
@@ -609,7 +626,11 @@ type manifestEntry struct {
 // set (the BASE_BACKUP `WAL` option / `pg_basebackup -X fetch`), the in-range
 // segments [walStartSeg, walEndSeg] are appended to the still-open tar after
 // the data files, mirroring the basebackup.c:408-560 includewal block.
-func emitBaseBackupTar(ctx context.Context, out io.Writer, dataDir, label string, startLSN, ckptLSN uint64, tli uint32, segSize int64, mck manifestChecksumKind, includeWAL bool, walStartSeg, walEndSeg uint64) ([]manifestEntry, error) {
+// `pgControlImage`, when non-nil, is shipped as `global/pg_control` instead of
+// the bytes on disk: BASE_BACKUP patches the checkpoint fields for the backup's
+// consumer only, and must leave the live cluster's control file alone
+// (M0131-S29).
+func emitBaseBackupTar(ctx context.Context, out io.Writer, dataDir, label string, startLSN, ckptLSN uint64, tli uint32, segSize int64, mck manifestChecksumKind, includeWAL bool, walStartSeg, walEndSeg uint64, pgControlImage []byte) ([]manifestEntry, error) {
 	tw := tar.NewWriter(out)
 
 	var manifest []manifestEntry
@@ -733,9 +754,13 @@ func emitBaseBackupTar(ctx context.Context, out io.Writer, dataDir, label string
 
 	// 3. pg_control last (upstream invariant for atomic recovery).
 	if pgControlPath != "" {
-		data, err := os.ReadFile(pgControlPath)
-		if err != nil {
-			return nil, err
+		data := pgControlImage
+		if data == nil {
+			var err error
+			data, err = os.ReadFile(pgControlPath)
+			if err != nil {
+				return nil, err
+			}
 		}
 		pgControlMTime := time.Now()
 		if err := writeTarFileWithMode(tw, filepath.Join("global", "pg_control"), data, pgControlMTime, 0o600); err != nil {

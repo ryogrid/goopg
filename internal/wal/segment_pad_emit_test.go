@@ -7,6 +7,14 @@ import (
 	"testing"
 )
 
+// emitSegmentPadErr drops emitSegmentPad's leading-page-header size so the
+// pre-M0131-S30.1b tests, which only ever asserted on the error, keep their
+// original shape.
+func emitSegmentPadErr(walBuf *walBuffer, memRing *MemRing, gapStart, boundary, gapPrev uint64, lay padLayout) error {
+	_, _, err := emitSegmentPad(walBuf, memRing, gapStart, boundary, gapPrev, lay)
+	return err
+}
+
 // TestEmitSegmentPadWritesIntoBothRings pins the happy-path composer
 // contract: pad bytes land in walBuf at gapStart, mirror into memRing
 // at the same LSN, decode back to a well-formed XLOG_NOOP whose xl_prev
@@ -26,7 +34,7 @@ func TestEmitSegmentPadWritesIntoBothRings(t *testing.T) {
 
 	memRing := NewMemRing(1024)
 
-	if err := emitSegmentPad(walBuf, memRing, gapStart, boundary, gapPrev); err != nil {
+	if err := emitSegmentPadErr(walBuf, memRing, gapStart, boundary, gapPrev, padLayout{}); err != nil {
 		t.Fatalf("emitSegmentPad: %v", err)
 	}
 
@@ -83,7 +91,7 @@ func TestEmitSegmentPadNilWalBufOnlyMemRing(t *testing.T) {
 		boundary uint64 = 24 // smallest legal padLen — header-only branch
 	)
 	memRing := NewMemRing(256)
-	if err := emitSegmentPad(nil, memRing, gapStart, boundary, 0); err != nil {
+	if err := emitSegmentPadErr(nil, memRing, gapStart, boundary, 0, padLayout{}); err != nil {
 		t.Fatalf("emitSegmentPad: %v", err)
 	}
 	memRing.PublishUpTo(int64(boundary))
@@ -106,7 +114,7 @@ func TestEmitSegmentPadNilMemRingOnlyWalBuf(t *testing.T) {
 	)
 	walBuf := newWALBuffer(512)
 	walBuf.reset(int64(gapStart))
-	if err := emitSegmentPad(walBuf, nil, gapStart, boundary, 7); err != nil {
+	if err := emitSegmentPadErr(walBuf, nil, gapStart, boundary, 7, padLayout{}); err != nil {
 		t.Fatalf("emitSegmentPad: %v", err)
 	}
 	walBuf.tail.Store(int64(boundary))
@@ -127,13 +135,16 @@ func TestEmitSegmentPadNilMemRingOnlyWalBuf(t *testing.T) {
 // is built (so a malformed padLen is still caught) but goes nowhere.
 func TestEmitSegmentPadBothNilIsNoop(t *testing.T) {
 	t.Parallel()
-	if err := emitSegmentPad(nil, nil, 0, 24, 0); err != nil {
+	if err := emitSegmentPadErr(nil, nil, 0, 24, 0, padLayout{}); err != nil {
 		t.Fatalf("emitSegmentPad: %v", err)
 	}
-	// Malformed padLen still surfaces even when no ring is wired —
-	// builder error is independent of ring presence.
-	if err := emitSegmentPad(nil, nil, 0, 23, 0); err == nil {
-		t.Fatalf("emitSegmentPad with padLen<24 should error, got nil")
+	// M0131-S30.6: a gap too small for a well-formed record is no longer an
+	// error — it is zero-filled and reported as padded=false, so the caller
+	// leaves the xl_prev chain alone. (Leaving such a gap UNWRITTEN was the
+	// defect: without Config.Preallocate it left the segment file short and
+	// replay stopped at the short read.)
+	if _, padded, err := emitSegmentPad(nil, nil, 0, 23, 0, padLayout{}); err != nil || padded {
+		t.Fatalf("emitSegmentPad(gap 23) = padded=%v err=%v, want padded=false err=nil", padded, err)
 	}
 }
 
@@ -152,7 +163,7 @@ func TestEmitSegmentPadRejectsNonPositiveGap(t *testing.T) {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
-			err := emitSegmentPad(newWALBuffer(1024), NewMemRing(1024), c.gapStart, c.boundary, 0)
+			err := emitSegmentPadErr(newWALBuffer(1024), NewMemRing(1024), c.gapStart, c.boundary, 0, padLayout{})
 			if err == nil {
 				t.Fatalf("expected error for boundary=%d gapStart=%d", c.boundary, c.gapStart)
 			}
@@ -163,18 +174,22 @@ func TestEmitSegmentPadRejectsNonPositiveGap(t *testing.T) {
 	}
 }
 
-// TestEmitSegmentPadPropagatesBuilderErrors pins that builder-level
-// padLen failures surface verbatim to the composer caller.
-func TestEmitSegmentPadPropagatesBuilderErrors(t *testing.T) {
+// TestEmitSegmentPadZeroFillsUnencodableGaps pins the M0131-S30.6 contract for
+// the gap sizes buildSegmentPadRecord cannot encode (below the 24-byte minimum,
+// and the 25-byte case whose 1-byte body cannot carry a chunk header): the
+// composer writes ZEROS over the gap and reports padded=false instead of
+// failing. The bytes must be written — an unwritten gap leaves a hole (a short
+// segment file without Preallocate), which is what stopped replay in the
+// measured failure.
+func TestEmitSegmentPadZeroFillsUnencodableGaps(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		name              string
-		padLen            uint64
-		wantSubstr        string
+		name   string
+		padLen uint64
 	}{
-		{"below_minimum_padLen_8", 8, "below minimum"},
-		{"below_minimum_padLen_23", 23, "below minimum"},
-		{"one_byte_body_padLen_25", 25, "1-byte body"},
+		{"below_minimum_padLen_8", 8},
+		{"below_minimum_padLen_23", 23},
+		{"one_byte_body_padLen_25", 25},
 	}
 	for _, c := range cases {
 		c := c
@@ -182,12 +197,22 @@ func TestEmitSegmentPadPropagatesBuilderErrors(t *testing.T) {
 			t.Parallel()
 			walBuf := newWALBuffer(1024)
 			memRing := NewMemRing(1024)
-			err := emitSegmentPad(walBuf, memRing, 0, c.padLen, 0)
-			if err == nil {
-				t.Fatalf("expected builder error for padLen=%d", c.padLen)
+			_, padded, err := emitSegmentPad(walBuf, memRing, 0, c.padLen, 0, padLayout{})
+			if err != nil {
+				t.Fatalf("emitSegmentPad(gap %d): %v", c.padLen, err)
 			}
-			if !strings.Contains(err.Error(), c.wantSubstr) {
-				t.Fatalf("error %q, want substring %q", err.Error(), c.wantSubstr)
+			if padded {
+				t.Fatalf("gap %d reported as padded; want zero-filled", c.padLen)
+			}
+			walBuf.tail.Store(int64(c.padLen))
+			got := make([]byte, c.padLen)
+			if n := walBuf.readAt(0, got); n != len(got) {
+				t.Fatalf("walBuf.readAt: n=%d, want %d — the gap bytes were not written", n, len(got))
+			}
+			for i, b := range got {
+				if b != 0 {
+					t.Fatalf("gap byte %d = %#x, want 0", i, b)
+				}
 			}
 		})
 	}
@@ -201,7 +226,7 @@ func TestEmitSegmentPadPropagatesWalBufOutOfWindow(t *testing.T) {
 	walBuf := newWALBuffer(64)
 	walBuf.reset(1000)
 	// gapStart below base.
-	err := emitSegmentPad(walBuf, nil, 100, 132, 0)
+	err := emitSegmentPadErr(walBuf, nil, 100, 132, 0, padLayout{})
 	if !errors.Is(err, errWALBufferReservedOutOfRange) {
 		t.Fatalf("err=%v, want errWALBufferReservedOutOfRange", err)
 	}
@@ -213,7 +238,7 @@ func TestEmitSegmentPadPropagatesMemRingOutOfWindow(t *testing.T) {
 	t.Parallel()
 	memRing := NewMemRing(64)
 	memRing.PublishUpTo(2000) // advances head + tail past the gap.
-	err := emitSegmentPad(nil, memRing, 100, 132, 0)
+	err := emitSegmentPadErr(nil, memRing, 100, 132, 0, padLayout{})
 	if !errors.Is(err, errMemRingReservedOutOfRange) {
 		t.Fatalf("err=%v, want errMemRingReservedOutOfRange", err)
 	}
@@ -227,7 +252,7 @@ func TestEmitSegmentPadDoesNotPublishViaWalBuf(t *testing.T) {
 	walBuf := newWALBuffer(1024)
 	walBuf.reset(500)
 	walBuf.tail.Store(500)
-	if err := emitSegmentPad(walBuf, nil, 500, 532, 0); err != nil {
+	if err := emitSegmentPadErr(walBuf, nil, 500, 532, 0, padLayout{}); err != nil {
 		t.Fatalf("emitSegmentPad: %v", err)
 	}
 	if got := walBuf.tail.Load(); got != 500 {
@@ -245,7 +270,7 @@ func TestEmitSegmentPadDoesNotPublishViaWalBuf(t *testing.T) {
 func TestEmitSegmentPadDoesNotPublishViaMemRing(t *testing.T) {
 	t.Parallel()
 	memRing := NewMemRing(1024)
-	if err := emitSegmentPad(nil, memRing, 0, 32, 0); err != nil {
+	if err := emitSegmentPadErr(nil, memRing, 0, 32, 0, padLayout{}); err != nil {
 		t.Fatalf("emitSegmentPad: %v", err)
 	}
 	out := make([]byte, 32)
@@ -279,7 +304,7 @@ func TestEmitSegmentPadAcrossPadLengths(t *testing.T) {
 			walBuf := newWALBuffer(8192)
 			walBuf.reset(int64(gapStart))
 			memRing := NewMemRing(8192)
-			if err := emitSegmentPad(walBuf, memRing, gapStart, boundary, 0xCAFEBABE); err != nil {
+			if err := emitSegmentPadErr(walBuf, memRing, gapStart, boundary, 0xCAFEBABE, padLayout{}); err != nil {
 				t.Fatalf("emitSegmentPad: %v", err)
 			}
 			walBuf.tail.Store(int64(boundary))

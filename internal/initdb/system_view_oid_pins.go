@@ -130,18 +130,21 @@ func systemViewOIDPins() []systemViewOIDPin {
 		{"pg_replication_slots", 12261, 12264, 12263, 21},
 		{"pg_stat_replication_slots", 12266, 12269, 12268, 10},
 		{"pg_stat_archiver", 12289, 12292, 12291, 7},
+		// M0131-S9.1b (2026-08-11): the RTE_RESULT pair. Both views are a bare
+		// `SELECT <srf>() AS …` with NO FROM clause at all (system_views.sql:
+		// 1150-1169), so their Query carries a single RTE_RESULT range-table
+		// entry — the fifth RTE kind, which no other captured blob exercises
+		// (0131-0009 §"Two unmeasured ev_action shapes"). Held back from the
+		// S9.1 tranche precisely so that shape lands with a two-view blast
+		// radius; captured in the same identity-pinned way as everything else.
+		{"pg_stat_bgwriter", 12293, 12296, 12295, 4},
+		{"pg_stat_checkpointer", 12297, 12300, 12299, 11},
 		{"pg_stat_io", 12301, 12304, 12303, 20},
 		{"pg_stat_wal", 12305, 12308, 12307, 5},
 		{"pg_stat_progress_basebackup", 12329, 12332, 12331, 6},
 		{"pg_replication_origin_status", 12343, 12346, 12345, 4},
 		{"pg_wait_events", 12351, 12354, 12353, 3},
 		{"pg_aios", 12355, 12358, 12357, 15},
-		// NOT pinned here on purpose: pg_stat_bgwriter (12293) and
-		// pg_stat_checkpointer (12297). They have no FROM clause at all, so
-		// their Query carries an RTE_RESULT — a fifth RTE kind no captured
-		// blob exercises yet (0131-0009 §"Two unmeasured ev_action shapes").
-		// They are the next slice, deliberately kept to a two-view blast
-		// radius.
 	}
 }
 

@@ -671,8 +671,13 @@ func TestReplayFromDirEndToEndPageHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stats.Records != 3 || stats.Applied != 1 || stats.CheckpointLSN != end2 {
-		t.Fatalf("unexpected stats: %+v (want records=3 applied=1 checkpoint=%d)", stats, end2)
+	// 4 records, not 3: the two 8 KiB page images plus the checkpoint overrun
+	// the 16 KiB segment, and since M0131-S30.6 BOTH append paths re-land the
+	// crossing record at the boundary and fill the gap with an XLOG_NOOP pad —
+	// the pad is the fourth record. (Before S30.6 this path let the record
+	// straddle the boundary instead.)
+	if stats.Records != 4 || stats.Applied != 1 || stats.CheckpointLSN != end2 {
+		t.Fatalf("unexpected stats: %+v (want records=4 applied=1 checkpoint=%d)", stats, end2)
 	}
 
 	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})

@@ -117,10 +117,16 @@ func TestSegmentGapFromInterruptedRetention(t *testing.T) {
 // (the server refuses to start). Observed exactly that way in nightly run
 // 20260725-011243's regress suite.
 //
-// The sweep over payload sizes exists so the straddle actually happens: whether
-// a record lands across the boundary depends on its size. The test asserts that
-// at least one size produced a contrecord segment start, so it cannot quietly
-// stop covering the case.
+// The sweep over payload sizes exists so the boundary case actually happens at
+// several different offsets before it.
+//
+// M0131-S30.6 changed what the writer produces here: BOTH append paths now
+// re-land a crossing record at the segment boundary (and pad or zero-fill the
+// gap), so no segment starts with a continuation record any more and the stream
+// carries one XLOG_NOOP pad per padded crossing. The invariant this test exists
+// for is unchanged and still asserted — a reopened writer must not resume on
+// top of already-durable records — but it is now counted over the PAYLOAD
+// records, with pads excluded.
 func TestReopenAfterSegmentStraddlingRecord(t *testing.T) {
 	const segSize = int64(64 * 1024)
 	sawContRecord := false
@@ -155,12 +161,14 @@ func TestReopenAfterSegmentStraddlingRecord(t *testing.T) {
 				sawContRecord = true
 			}
 
-			before, err := readAllUncached(dir, segSize)
+			beforeAll, err := readAllUncached(dir, segSize)
 			if err != nil {
 				t.Fatalf("readAllUncached: %v", err)
 			}
+			before := withoutSegmentPads(beforeAll)
 			if len(before) != n {
-				t.Fatalf("pre-reopen record count: got %d want %d", len(before), n)
+				t.Fatalf("pre-reopen record count: got %d want %d (pads excluded; %d records total)",
+					len(before), n, len(beforeAll))
 			}
 
 			// Reopen (the crash-restart path) and append one marker record.
@@ -179,10 +187,11 @@ func TestReopenAfterSegmentStraddlingRecord(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			after, err := readAllUncached(dir, segSize)
+			afterAll, err := readAllUncached(dir, segSize)
 			if err != nil {
 				t.Fatalf("readAllUncached after reopen: %v", err)
 			}
+			after := withoutSegmentPads(afterAll)
 			if len(after) != n+1 {
 				t.Fatalf("post-reopen record count: got %d want %d — the reopened writer overwrote %d already-durable records",
 					len(after), n+1, n+1-len(after))
@@ -193,9 +202,27 @@ func TestReopenAfterSegmentStraddlingRecord(t *testing.T) {
 		})
 	}
 
-	if !sawContRecord {
-		t.Fatal("no payload size produced a segment starting with a continuation record — the case this test exists for was not exercised")
+	// M0131-S30.6: sawContRecord is now expected to stay false — neither append
+	// path lets a record straddle a segment boundary. Kept as an observation so
+	// a future writer change that reintroduces the shape is visible in the log
+	// rather than silently unasserted.
+	if sawContRecord {
+		t.Log("a segment still starts with a continuation record — the pre-S30.6 straddling shape")
 	}
+}
+
+// withoutSegmentPads drops the XLOG_NOOP pad records the writer emits over a
+// segment-boundary gap, so record counts stay comparable to the number of
+// payloads appended (M0131-S30.6).
+func withoutSegmentPads(recs []Record) []Record {
+	out := make([]Record, 0, len(recs))
+	for _, r := range recs {
+		if r.XLog != nil && r.XLog.Header.Rmid == RmgrXLog && r.XLog.Header.Info == xlogInfoNoop {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
 }
 
 // segmentStartsWithContRecord reports whether segNo's first page header carries

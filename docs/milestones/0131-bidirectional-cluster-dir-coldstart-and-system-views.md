@@ -119,6 +119,47 @@ next day by `c09d519e` ("step 3cq proper"), whose code comment at
 has since been cargo-culted into two more tests. Deleting it is part of this
 milestone so no future reader re-derives the wrong model.
 
+**Theme F, added 2026-08-11 (user directive).** Themes A and B above scope both
+cold starts to a *cleanly shut down* source — S3 and S4 assert `DB_SHUTDOWNED`
+before the handover, per `0130-0002` §"WAL replay constraint". That makes the
+milestone's own headline half-true: two engines are not interchangeable on a
+directory if the interchange only works when the previous engine exited
+politely. Theme F removes the precondition in both directions.
+
+Its filing investigation found that **each direction already loses committed
+data today** — this is not only a missing capability:
+
+- **Reverse.** `internal/wal/xlog_record.go:218-220` bounds known rmids at 15,
+  but PG 18's real maximum is 21. Rmids **16 SPGist, 17 BRIN, 18 CommitTs,
+  19 ReplicationOrigin, 20 Generic, 21 LogicalMessage** therefore fail *header
+  decode* inside the reader, and `readAllPageAware`
+  (`internal/wal/reader.go:148-165`) treats a header-decode failure as **end of
+  WAL**. Every later record is dropped, replay reports success, and
+  `detectWritePos` then appends over the survivors — the loss becomes permanent
+  on the first write. One `pg_logical_emit_message` in a PG crash tail is
+  enough. (Rmids 6/12/13/14 take the other path and abort startup, which is
+  safe.) A third silent path: the btree `default:` arm
+  (`internal/wal/recovery.go:2516-2523`) discards any PG btree record whose
+  blocks lack an FPI while returning `applied=true` — and PG emits an FPI only
+  on a page's first post-checkpoint touch.
+- **Forward.** goopg writes `pg_control.state` from only two runtime sites,
+  the checkpointer (`internal/wal/checkpointer.go:736-748`), whose first tick is
+  one full `checkpoint_timeout` (default 300 s) after start. **No startup path
+  stamps `DB_IN_PRODUCTION`.** A SIGKILL inside that window leaves
+  `DB_SHUTDOWNED`, so PG falls through all three arms of `xlogrecovery.c:924-937`, leaves
+  `InRecovery` false, **skips `PerformWalRecovery()` entirely**, and resumes
+  inserting WAL over goopg's tail — silently, with no PANIC.
+
+Two findings that usefully *bound* Theme F: WAL segment zeroing is a non-issue
+(goopg zero-fills recycled segments where upstream's `InstallXLogFileSegment`
+does not, so goopg is strictly safer), and `CheckRequiredParameterValues` is a
+no-op in crash recovery (every branch is gated on `ArchiveRecoveryRequested`).
+Conversely the reverse direction is *worse* than the missing-rmgr list suggests:
+the larger cost is opcode gaps **inside** rmgrs goopg already claims to handle —
+`XLOG_HEAP2_MULTI_INSERT` (every COPY), `XLOG_HEAP2_VISIBLE` (every VACUUM),
+`XLOG_HEAP_LOCK` (every `FOR UPDATE`), `XLOG_CLOG_ZEROPAGE` (every 32768 XIDs),
+`XLOG_XACT_ASSIGNMENT` (any subtransaction), and seven btree opcodes.
+
 ## Goals
 
 1. **Reverse cold start** — goopg starts and serves against a `$PGDATA` created
@@ -148,7 +189,21 @@ milestone so no future reader re-derives the wrong model.
 5. **Retire `copyInitFiles`** — the function and its three call sites are
    deleted and the two prose comments that mis-attribute the view gap to the
    copied file are re-attributed.
-6. **Bounded, honest scope for system views** — the six already-captured
+6. **Crash-state interchange, both directions (added 2026-08-11)** — neither
+   cold start may require the *other* engine to have exited politely. goopg
+   starts on a PG `$PGDATA` whose `pg_control` says `DB_IN_PRODUCTION` and whose
+   WAL tail is unreplayed; a real PG crash-recovers a goopg `$PGDATA` in the same
+   state. Themes A and B deliberately scoped this out (`0130-0002`
+   §"WAL replay constraint"); Theme F removes the precondition, because two
+   engines that only interchange after a clean shutdown are not interchangeable.
+7. **Fix the two live data-loss bugs this exposed** — Theme F's filing
+   investigation found that *each direction already loses committed data today*,
+   not merely that it lacks a feature. goopg mistakes an unrecognised WAL record
+   for end-of-WAL and silently truncates (then overwrites) the rest; and goopg
+   never stamps `pg_control.state = DB_IN_PRODUCTION` at startup, so a real PG
+   skips recovery entirely and overwrites the tail. Both are unconditional
+   fixes, independent of whether the rest of Theme F lands.
+8. **Bounded, honest scope for system views** — the six already-captured
    replication views become genuinely queryable; widening to the remaining
    ~74 `system_views.sql` + 65 `information_schema` views is decomposed,
    OID-policy-gated, and explicitly allowed to outlive this milestone provided
@@ -169,6 +224,20 @@ milestone so no future reader re-derives the wrong model.
 | S8b | Manifest-based pinning guards (needs S7's manifest) | C |
 | S9 | Widen the on-disk system-view corpus (LARGE, sub-sliced by view group) | C |
 | S10 | Delete `copyInitFiles` + 3 call sites; correct ledger rows and stale guards | D — hygiene |
+| S16 | **Fail closed: an unrecognised WAL record is not end-of-WAL** (live data-loss fix) | E — crash-state interchange |
+| S17 | **goopg stamps `DB_IN_PRODUCTION` at startup** (live data-loss fix) | F |
+| S18 | pg_control writer durability (`O_RDWR`+fsync) + full checkpoint-struct coverage + live TLI | F |
+| S19 | Validate `xlp_pageaddr`/`xlp_tli` — PG does not zero-fill recycled segments (also fixes S3) | F |
+| S20 | pg_control-driven recovery in goopg: read `DBState`, redo start, startup hygiene | F |
+| S21 | Opcode coverage inside the already-handled rmgrs (21a non-btree, 21b btree) — LARGE | F |
+| S22 | CLOG replay opcode dispatch + commit-record `subxacts[]` parsing | F |
+| S23 | The cheap tail: LogicalMessage / ReplicationOrigin / Generic / CommitTs | F |
+| S24 | MultiXact durable `pg_multixact` SLRU + `multixact_redo` — LARGE/RISKY, deferrable | F |
+| S25 | Index-AM boundary: detect GIN/GiST/SP-GiST/BRIN/hash, refuse specifically, ledger | F |
+| S26 | `pd_lsn` completeness audit on logged change paths | F |
+| S27 | Forward crash E2E (+ stale pidfile, torn contrecord) | F |
+| S28 | Reverse crash E2E | F |
+| S29 | BASE_BACKUP stops mutating the source `pg_control` | F |
 
 **Filing rule (inherited from M0130):** no task is deferred without a strong reason
 recorded in the deferral ledger; every item's subtasks are listed inline in the
@@ -221,6 +290,41 @@ milestone failure.
 8. **Scope honesty for S9:** every system view NOT converted in this milestone is
    covered by one ledger row naming the group, the blocker, and the resume point.
    A partially-converted corpus is acceptable; an undocumented one is not.
+8b. **Crash-state interchange, forward (added 2026-08-11):** an E2E starts goopg,
+   runs a workload with a known committed/uncommitted split, forces one online
+   checkpoint, does more committed work, then `kill -9`s the server by PID file.
+   `pg_control.State` must read `DB_IN_PRODUCTION`. A stock `postgres -D <same
+   dir>` then logs `redo starts at` and `redo done at`, logs no PANIC/FATAL, and
+   every committed row — including the post-checkpoint ones — is visible while
+   the uncommitted ones are not. Any `invalid record length` / `invalid magic
+   number` line must be the *last* WAL complaint (benign end-of-WAL). A second
+   variant kills mid-`INSERT … SELECT` so the tail ends inside a multi-page
+   record, and asserts PG writes its `XLOG_OVERWRITE_CONTRECORD` and logs
+   `successfully skipped missing contrecord` — the one crash-only WAL path the
+   standby lane structurally cannot reach.
+8c. **Crash-state interchange, reverse (added 2026-08-11):** the mirror — real
+   `initdb`, a **single-session** PG workload exercising COPY / VACUUM /
+   `FOR UPDATE` / `TRUNCATE` / an index-heavy insert, SIGKILL the postmaster,
+   then **goopg** serves the directory and its counts and aggregates match values
+   captured before the kill. `pg_waldump` over the crash tail must confirm each
+   asserted opcode is actually present — otherwise a workload that silently stops
+   emitting one passes for the wrong reason. A second variant creates a GIN index
+   first and asserts goopg refuses with a message naming the access method and
+   exits non-zero — a specific refusal, never a silent skip.
+   **Scope, stated so a green 8c is not over-read:** single-session is a
+   deliberate narrowing that defers S24 (MultiXact) out of M0131 — a
+   single-session workload emits no multixact record. A third `_concurrent`
+   variant ships `t.Skip`ped as the executable re-arm trigger. 8c therefore
+   proves crash interchange for single-session workloads, **not** in general.
+8d. **The two live data-loss bugs are fixed unconditionally (added 2026-08-11),
+   each proven by a named test that fails against today's HEAD:** (i) a WAL
+   stream of `valid → rmid-18 → valid` reports a non-tail stop and does not
+   silently truncate, and a PG-shaped `XLOG_BTREE_DEDUP` carrying block data but
+   no FPI errors instead of reporting `applied=true` (S16); (ii) with a long
+   `checkpoint_timeout`, `pg_control.State` reads `DB_IN_PRODUCTION` before any
+   checkpoint could have run, and still does after a SIGKILL (S17). These two are independent of the rest of Theme F and must land even if
+   nothing else in it does. Each carries a regression test that fails against
+   today's HEAD.
 9. **No regressions:** the replication family (`TestE2E_PhysicalReplication`
    + Sync, `TestE2E_FailoverGoopgToPG`, `TestE2E_FailoverPGtoGoopg`,
    `TestE2E_StandbyAttachRetainsUpstreamRowsAfterRestart`,
@@ -249,6 +353,12 @@ milestone failure.
 | `docs/design/0131-0008-system-view-oid-policy.md` | draft — **within M0131 (S8a, before S6 and S7)** | pin-to-upstream vs. rewrite (resolves in favour of pinning), why view-on-view forces the decision early, and the S8a/S8b split that breaks the S7↔S8 cycle |
 | `docs/design/0131-0009-system-view-corpus-widening.md` | draft — **within M0131 (S9, before code)** | the view groups, the ~30 KB TOAST ceiling, the pgnodes non-path |
 | `docs/design/0131-0010-copyinitfiles-retirement.md` | draft — **within M0131 (S10)** | the removal, the evidence, and the record corrections |
+| `docs/design/0131-0012-crash-state-cluster-dir-interchange.md` | draft — **within M0131 (Theme F umbrella, before code)** | the theme-level design: both directions, the failure taxonomy, what is already fine and must not be re-planned |
+| `docs/design/0131-0013-wal-reader-fail-closed.md` | draft — **within M0131 (S16 + S19, before code)** | unknown-record-vs-end-of-WAL, the btree FPI-only arm, `xlp_pageaddr` validation on both sibling paths |
+| `docs/design/0131-0014-pgcontrol-runtime-state-and-durability.md` | draft — **within M0131 (S17 + S18 + S20, before code)** | `DB_IN_PRODUCTION` at startup, the `O_RDWR`+fsync writer, the full checkpoint struct, live TLI, and goopg reading `DBState` |
+| `docs/design/0131-0015-pg-wal-opcode-coverage.md` | draft — **within M0131 (S21a + S21b + S22, before code)** | the per-rmgr opcode matrix goopg must add, and the CLOG/`subxacts[]` replay bug |
+| `docs/design/0131-0016-multixact-durable-slru.md` | draft — **within M0131 (S24, before code)** | durable `pg_multixact` offsets+members SLRU and `multixact_redo`; why this is the only unavoidable missing rmgr |
+| `docs/design/0131-0017-crash-interchange-e2e.md` | draft — **within M0131 (S27 + S28, before code)** | both crash E2Es, the committed/uncommitted split, stale pidfile handover, torn contrecord, and what a `kill -9` provably does NOT cover |
 
 Smaller single-function changes may ride the implementation-plan doc per the repo
 rule (a design doc is required for every *non-trivial subsystem*; single-function

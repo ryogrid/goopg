@@ -412,7 +412,7 @@ func TestStripeWriterCoreAppendBuiltEmittedDelegatesToStripeAppendBuiltEmitted(t
 	walBuf := newWALBuffer(4096)
 	walBuf.reset(0)
 	memRing := NewMemRing(4096)
-	core := newStripeWriterCore(1<<20, 0, 0, walBuf, memRing)
+	core := newStripeWriterCore(1<<20, 0, 0, walBuf, memRing, padLayout{})
 
 	const recordLen = 24
 	start, prev, total, leading, err := core.AppendBuiltEmitted(0, recordLen,

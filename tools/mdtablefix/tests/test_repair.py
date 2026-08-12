@@ -36,6 +36,53 @@ def _make_table(data_cells: list[list[str]], n_cols: int = 3) -> Table:
     )
 
 
+class TestRepairEmptyExcessCells(unittest.TestCase):
+    """An empty excess cell is dropped rather than merged.
+
+    ``| resolved | | 2026-08-11 | … |`` (a doubled separator) shifts every
+    following column right.  Merging the tail would render correctly but
+    scramble the row's meaning; dropping the empty cell is lossless.
+    """
+
+    def test_empty_excess_cell_is_dropped(self):
+        table = _make_table([["resolved", "", "2026-08-11", "note"]], n_cols=3)
+        repaired = repair_table(table)
+        contents = [c.content for c in repaired.data_rows[0].cells]
+        self.assertEqual(contents, ["resolved", "2026-08-11", "note"])
+
+    def test_drop_is_recorded_as_extra_cell(self):
+        table = _make_table([["a", "", "b", "c"]], n_cols=3)
+        repaired = repair_table(table)
+        extra = [f for f in repaired.fixes if f.type == "extra_cell"]
+        self.assertEqual(len(extra), 1)
+        self.assertEqual(extra[0].column, 2)
+
+    def test_content_cells_still_merge_when_no_empty_cell_exists(self):
+        table = _make_table([["a", "b", "c", "d"]], n_cols=3)
+        repaired = repair_table(table)
+        contents = [c.content for c in repaired.data_rows[0].cells]
+        self.assertEqual(contents, ["a", "b", r"c \| d"])
+
+    def test_only_the_excess_empties_are_dropped(self):
+        """A row that is *not* oversplit keeps its intentional empty cell."""
+        table = _make_table([["a", "", "c"]], n_cols=3)
+        repaired = repair_table(table)
+        contents = [c.content for c in repaired.data_rows[0].cells]
+        self.assertEqual(contents, ["a", "", "c"])
+
+    def test_structural_fixes_survive_the_repair_pass(self):
+        """Detector-recorded fixes must not be cleared by repair_table()."""
+        table = _make_table([["a", "b", "c"]], n_cols=3)
+        table.fixes.append(
+            Fix(type="blank_line", line=4, column=1, detail="from detector")
+        )
+        repaired = repair_table(table)
+        self.assertEqual(
+            [f.type for f in repaired.fixes if f.type == "blank_line"],
+            ["blank_line"],
+        )
+
+
 class TestRepairOversplit(unittest.TestCase):
     """Tests for oversplit (too-many-column) repair."""
 

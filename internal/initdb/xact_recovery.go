@@ -61,6 +61,29 @@ func replayCLogFromWAL(walDir string, clog *mvcc.CLog, txnMgr *mvcc.Manager) err
 	// checkpoint's pg_control state.
 	startIdx, _ := wal.ExportedReplayStart(records)
 	for _, r := range records[startIdx:] {
+		// M0131-S30.7: nextXID must be beyond EVERY replayed record's XID,
+		// not only the XIDs that reached a commit/abort record. Upstream does
+		// exactly this, unconditionally, for each record it applies:
+		// AdvanceNextFullTransactionIdPastXid(record->xl_xid) in
+		// ApplyWalRecord (postgres/src/backend/access/transam/xlogrecovery.c:1942).
+		//
+		// Without it goopg's post-crash nextXID was max(committed XID)+1, so
+		// the XIDs of transactions that were IN FLIGHT at the crash — whose
+		// heap records are in the WAL (a concurrent commit flushes them) and
+		// ARE replayed — got handed out again to new transactions. When such a
+		// new transaction committed, it stamped the crashed transaction's XID
+		// Committed and resurrected its replayed half, tearing an atomic
+		// transaction apart. Measured on the preserved crashprobe30 clusters:
+		// WAL tail carried XIDs up to 59985 with the last commit at 59974,
+		// while the restarted server resumed at nextXid 59977.
+		//
+		// Advancing here also tightens the MarkUnknownAsAborted sweep in
+		// initdb.Open, which stamps every still-Unknown XID below nextXID
+		// Aborted — that is what makes an in-flight transaction's replayed
+		// tuples correctly invisible, as upstream's clog-absent XIDs are.
+		if r.XLog != nil && r.XLog.Header.XID != 0 {
+			txnMgr.SetNextXID(storage.TransactionID(r.XLog.Header.XID) + 1)
+		}
 		// --- Native goopg commit/abort records ---
 		if len(r.Payload) >= wal.XactRecordSize {
 			switch r.Payload[0] {
@@ -84,10 +107,43 @@ func replayCLogFromWAL(walDir string, clog *mvcc.CLog, txnMgr *mvcc.Manager) err
 		}
 		// --- Canonical PG-format records (emitted alongside native in
 		//     PageHeaders mode, M0106-0010 batched-46). ---
-		if r.XLog != nil && r.XLog.Header.Rmid == wal.RmgrXact && r.XLog.Header.XID != 0 {
+		if r.XLog != nil && r.XLog.Header.Rmid == wal.RmgrXact {
+			// M0131-S22: dispatch on the OPCODE. This branch used to read
+			// "isCommit := info&OpMask == XLOG_XACT_COMMIT" and stamp
+			// unconditionally, which made every RM_XACT_ID record that is not a
+			// commit — XLOG_XACT_ASSIGNMENT (0x50) and XLOG_XACT_INVALIDATIONS
+			// (0x60), both of which a real PG tail carries for any
+			// savepoint-using or catalog-touching workload — stamp its
+			// (still-running!) XID ABORTED. Upstream's xact_redo (xact.c:6398)
+			// switches on the opcode and touches the clog only for
+			// COMMIT/ABORT (and their two-phase variants, which goopg refuses
+			// in the physical pass).
+			op := r.XLog.Header.Info & wal.XlogXactOpMask
+			if op != wal.XlogXactCommit && op != wal.XlogXactAbort {
+				continue
+			}
+			if r.XLog.Header.XID == 0 {
+				continue
+			}
 			xid := storage.TransactionID(r.XLog.Header.XID)
-			isCommit := (r.XLog.Header.Info & wal.XlogXactOpMask) == wal.XlogXactCommit
+			isCommit := op == wal.XlogXactCommit
 			xactStampAndAdvance(clog, txnMgr, xid, isCommit)
+			// M0131-S22: stamp the whole transaction TREE, as
+			// TransactionIdCommitTree / TransactionIdAbortTree do
+			// (xact.c:6182, 6259). Without this a committed transaction's
+			// subtransaction XIDs stay Unknown and initdb.Open's
+			// MarkUnknownAsAborted sweep stamps them Aborted, so every row
+			// written after a SAVEPOINT disappears from an otherwise-committed
+			// transaction. A body goopg cannot parse leaves the top-level stamp
+			// standing (the pre-S22 behaviour) rather than failing the start:
+			// the reader already CRC-verified these bytes, so a parse error
+			// means an unfamiliar record shape, and the top-level status is
+			// still strictly better than none.
+			if parsed, perr := wal.ParseXactRecord(r.XLog.Header.Info, r.XLog.MainData); perr == nil {
+				for _, sub := range parsed.Subxacts {
+					xactStampAndAdvance(clog, txnMgr, storage.TransactionID(sub), isCommit)
+				}
+			}
 			continue
 		}
 		// A9: PG-format clog truncation (RM_CLOG / CLOG_TRUNCATE). Decode the
@@ -102,6 +158,69 @@ func replayCLogFromWAL(walDir string, clog *mvcc.CLog, txnMgr *mvcc.Manager) err
 		}
 	}
 	return nil
+}
+
+// replayNextOIDFromWAL returns the highest OID published by an XLOG_NEXTOID
+// record in the WAL under walDir, or 0 if the WAL carries none.
+//
+// M0131-S21a. This is the second half of XLOG_NEXTOID's replay: the physical
+// pass (wal.replayDecodedXLogRecord) recognises the record and reports it as a
+// page-level no-op, because the OID counter lives in the in-memory catalog and
+// that pass is handed only a *storage.Manager. The split is the same one
+// CLOG_TRUNCATE already uses.
+//
+// Why the record matters at all: initdb.Open seeds the counter from
+// pg_control's checkPointCopy.nextOid, which is only as fresh as the LAST
+// CHECKPOINT. PG allocates OIDs in blocks of VAR_OID_PREFETCH (8192) and WAL-logs
+// each new block's ceiling exactly so the counter survives a crash between
+// checkpoints (XLogPutNextOid, xlog.c:8114-8138). Without this pass, goopg
+// starting on a PG cluster that crashed after allocating a fresh OID block
+// would re-issue OIDs PG had already handed to real catalog rows.
+//
+// Upstream "believe the record exactly" (xlog.c:8296-8300) is a SET, not a max,
+// because it must survive OID wraparound. goopg's counter has no wraparound
+// path (catalog.InMemory.advanceNextOIDLocked is monotone) and the caller
+// applies this alongside the pg_control seed, so taking the maximum of the two
+// is the faithful behaviour here: both sources are lower bounds on what PG had
+// already allocated, and the counter must clear both.
+func replayNextOIDFromWAL(walDir string) (uint32, error) {
+	if _, err := os.Stat(walDir); err != nil {
+		return 0, nil
+	}
+	records, err := wal.ReadAll(filepath.Clean(walDir), 0)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	// Unlike the clog pass this walks from record ZERO, not from
+	// ExportedReplayStart: a NEXTOID record emitted BEFORE the last checkpoint
+	// is not redundant with pg_control unless that checkpoint actually
+	// refreshed nextOid, and reading one extra (idempotent, monotone) maximum
+	// costs nothing. The records are already decoded by the shared recovery
+	// ReadAll memoization.
+	var maxOID uint32
+	for _, r := range records {
+		if r.XLog == nil || r.XLog.Header.Rmid != wal.RmgrXLog {
+			continue
+		}
+		if (r.XLog.Header.Info & wal.XLRRmgrInfoMask) != wal.XlogXLogNextOid {
+			continue
+		}
+		nextOID, derr := wal.DecodeXLogNextOid(r.XLog.MainData)
+		if derr != nil {
+			// A malformed body is not a reason to refuse the start — the
+			// reader already CRC-verified the bytes, so this can only mean a
+			// record shape goopg does not understand. Skipping it leaves the
+			// counter at the pg_control seed, which is the pre-S21a behaviour.
+			continue
+		}
+		if nextOID > maxOID {
+			maxOID = nextOID
+		}
+	}
+	return maxOID, nil
 }
 
 // replayClogTruncate re-applies a CLOG_TRUNCATE record (G9). Truncation is

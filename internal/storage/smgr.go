@@ -570,6 +570,23 @@ func (m *Manager) TruncateRelation(rel RelFileNode) error {
 	return f.truncateToZero()
 }
 
+// TruncateRelationTo truncates rel's backing file down to exactly n blocks.
+// Idempotent: a no-op if the file already has n or fewer blocks (mirrors
+// TruncateRelation's zero-block idempotency and upstream's
+// XLOG_SMGR_TRUNCATE redo, which can be replayed twice on a crash-restart
+// loop). The caller is responsible for invalidating buffer-pool slots that
+// hold pages of rel at or past n before calling this. M0131-S21a-2 part 6.
+func (m *Manager) TruncateRelationTo(rel RelFileNode, n BlockNumber) error {
+	f, err := m.relFile(rel)
+	if err != nil {
+		return err
+	}
+	if f.nBlocks() <= n {
+		return nil
+	}
+	return f.truncateTo(n)
+}
+
 func (m *Manager) relFile(rel RelFileNode) (*relFile, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -852,6 +869,7 @@ func (r *relFile) readBlock(blk BlockNumber, buf []byte) error {
 		return fmt.Errorf("read %s blk %d: short %d of %d", r.path, blk, n, BlockSize)
 	}
 	recordIOTrace(BufferTag{Rel: r.rel, Block: blk}, "postRead", buf)
+	PageIdentityObserve(BufferTag{Rel: r.rel, Block: blk}, buf, "postRead")
 	return r.verifyOnRead(blk, buf)
 }
 
@@ -873,6 +891,7 @@ func (r *relFile) writeBlock(blk BlockNumber, buf []byte) error {
 		return fmt.Errorf("write %s blk %d: short %d of %d", r.path, blk, n, BlockSize)
 	}
 	recordIOTrace(BufferTag{Rel: r.rel, Block: blk}, "postWrite", written)
+	PageIdentityObserve(BufferTag{Rel: r.rel, Block: blk}, written, "postWrite")
 	return nil
 }
 
@@ -891,6 +910,7 @@ func (r *relFile) extend(buf []byte) (BlockNumber, error) {
 	}
 	r.nblocks++
 	recordIOTrace(BufferTag{Rel: r.rel, Block: blk}, "postExtend", written)
+	PageIdentityExtend(BufferTag{Rel: r.rel, Block: blk})
 	return blk, nil
 }
 
@@ -938,6 +958,7 @@ func (r *relFile) extendBatch(buf []byte, n int) (BlockNumber, error) {
 	r.nblocks += BlockNumber(n)
 	for i := 0; i < n; i++ {
 		recordIOTrace(BufferTag{Rel: r.rel, Block: first + BlockNumber(i)}, "postExtendBatch", big[i*BlockSize:(i+1)*BlockSize])
+		PageIdentityExtend(BufferTag{Rel: r.rel, Block: first + BlockNumber(i)})
 	}
 	return first, nil
 }
@@ -961,6 +982,21 @@ func (r *relFile) truncateToZero() error {
 		return fmt.Errorf("truncate %s: %w", r.path, err)
 	}
 	r.nblocks = 0
+	return nil
+}
+
+// truncateTo shortens the file to exactly n blocks. The caller must already
+// have checked n < r.nblocks (a no-op or growing "truncate" is never valid —
+// mirrors upstream's ftruncate-based mdtruncate, which is never asked to
+// grow a fork). M0131-S21a-2 part 6: the partial-length primitive
+// XLOG_SMGR_TRUNCATE needs and plain truncateToZero cannot express.
+func (r *relFile) truncateTo(n BlockNumber) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.f.Truncate(int64(n) * BlockSize); err != nil {
+		return fmt.Errorf("truncate %s to %d blocks: %w", r.path, n, err)
+	}
+	r.nblocks = n
 	return nil
 }
 

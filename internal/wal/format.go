@@ -42,6 +42,18 @@ var (
 	// segment's zero-fill tail. Callers stop reading on this. See
 	// docs/design/0007-0001-wal-segment-preallocation.md.
 	ErrEOS = errors.New("wal: end of stream")
+	// ErrUnsupportedRecord marks a record whose bytes are INTACT and
+	// well-framed but which goopg cannot decode or apply — a compressed
+	// backup-block image, a non-default tablespace locator, a resource
+	// manager goopg has no redo for. M0131-S16.2: this is categorically
+	// different from ErrCorruptRecord. Corrupt/torn bytes were never
+	// durable, so stopping the walk there loses nothing and IS end-of-WAL;
+	// an unsupported record was durable and means something, so stopping
+	// there silently drops every record after it and lets the next append
+	// overwrite them. The reader propagates this class to the caller (→
+	// initdb.Open → refused start) and treats only the corrupt class as a
+	// tail.
+	ErrUnsupportedRecord = errors.New("wal: unsupported record")
 )
 
 // (isZeroHeader — the legacy 8-byte-frame EOS sentinel — was removed in A9 with

@@ -62,13 +62,39 @@ const (
 	RmgrHeap2   Rmgr = 9  // RM_HEAP2_ID   — heap multi-insert / vacuum
 	RmgrHeap    Rmgr = 10 // RM_HEAP_ID    — heap insert / delete / update
 	RmgrBtree   Rmgr = 11 // RM_BTREE_ID   — btree insert / split
+	// M0131-S25: 12..14 are the three index AMs between Btree and Sequence
+	// (rmgrlist.h:41-43). goopg emits none of them and has no redo for any of
+	// them, but a PG-authored pg_wal that indexes anything with USING hash /
+	// gin / gist contains them, so they need names here to be REFUSED by name
+	// rather than as a bare "rmid=13".
+	RmgrHash    Rmgr = 12 // RM_HASH_ID    — hash index
+	RmgrGin     Rmgr = 13 // RM_GIN_ID     — GIN index
+	RmgrGist    Rmgr = 14 // RM_GIST_ID    — GiST index
 	RmgrSeq     Rmgr = 15 // RM_SEQ_ID     — sequence page rewrites (B1.3b)
+	// M0131-S16.1: 16..21 are real PG 18 resource managers
+	// (postgres/src/include/access/rmgrlist.h:28-49). goopg emits none of
+	// them, but a PG-authored pg_wal routinely contains them — 18 CommitTs,
+	// 19 ReplicationOrigin and 21 LogicalMessage are not index AMs and occur
+	// in ordinary workloads. They must DECODE (and then be refused by the
+	// replay dispatcher) rather than fail header validation, because a
+	// header-decode failure is read as end-of-WAL by readAllPageAware and
+	// would silently drop every following record.
+	RmgrSPGist            Rmgr = 16 // RM_SPGIST_ID
+	RmgrBrin              Rmgr = 17 // RM_BRIN_ID
+	RmgrCommitTs          Rmgr = 18 // RM_COMMIT_TS_ID
+	RmgrReplicationOrigin Rmgr = 19 // RM_REPLORIGIN_ID
+	RmgrGeneric           Rmgr = 20 // RM_GENERIC_ID
+	RmgrLogicalMessage    Rmgr = 21 // RM_LOGICALMSG_ID
 
-	// MaxKnownRmgr bounds the real-PG IDs goopg defines symbolic
-	// names for in this slice. Values in (MaxKnownRmgr, RmgrGoopgCatalog)
-	// are rejected by the decoder as a typed "emitted by a newer
-	// version" branch.
-	MaxKnownRmgr Rmgr = RmgrSeq
+	// MaxKnownRmgr is upstream's RM_MAX_BUILTIN_ID — the largest
+	// built-in resource-manager ID PostgreSQL 18 can emit. Values in
+	// (MaxKnownRmgr, RmgrGoopgCustomBase) are rejected by the decoder as a
+	// typed "emitted by a newer version" branch. It is deliberately the
+	// PROTOCOL bound, not "the IDs goopg can replay" — refusing a record
+	// goopg cannot apply is the replay dispatcher's job (recovery.go), where
+	// the refusal reaches the caller instead of being mistaken for a
+	// torn tail.
+	MaxKnownRmgr Rmgr = RmgrLogicalMessage
 
 	// RmgrGoopgCustomBase is the first ID in PostgreSQL's reserved
 	// custom-rmgr range (RM_MIN_CUSTOM_ID, upstream

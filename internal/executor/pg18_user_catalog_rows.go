@@ -75,8 +75,9 @@ func pgClassColumnsPG18() []catalog.Column {
 }
 
 // pgAttributeColumnsPG18 mirrors initdb.pgAttrColDefs — the goopg pg_attribute
-// row layout (25 columns). attstattarget is appended last (always NULL); see
-// catalog.PGAttributeColumns for why it is not at its PG18-canonical position.
+// row layout (25 columns), in PG18-canonical order since M0131-S14.1 —
+// attstattarget at #21, between attcollation and attacl. See
+// catalog.PGAttributeColumns for why that position is not cosmetic.
 func pgAttributeColumnsPG18() []catalog.Column {
 	return []catalog.Column{
 		{Name: "attrelid", Type: catalog.Type{Name: "oid"}},
@@ -99,11 +100,18 @@ func pgAttributeColumnsPG18() []catalog.Column {
 		{Name: "attislocal", Type: catalog.Type{Name: "bool"}},
 		{Name: "attinhcount", Type: catalog.Type{Name: "int2"}},
 		{Name: "attcollation", Type: catalog.Type{Name: "oid"}},
+		{Name: "attstattarget", Type: catalog.Type{Name: "int2"}},
 		{Name: "attacl", Type: catalog.Type{Name: "aclitem[]"}},
 		{Name: "attoptions", Type: catalog.Type{Name: "text"}},
 		{Name: "attfdwoptions", Type: catalog.Type{Name: "text"}},
-		{Name: "attmissingval", Type: catalog.Type{Name: "text"}},
-		{Name: "attstattarget", Type: catalog.Type{Name: "int2"}},
+		// attmissingval is `anyarray` (OID 2277), NOT text: PG stores the
+		// fast-default value as a one-element ArrayType built by
+		// StoreAttrMissingVal (postgres/src/backend/catalog/heap.c:2030) and
+		// reads it back with deconstruct_array, so a text varlena here would
+		// be dereferenced as ArrayType*. anyarray also carries typalign='d'
+		// (postgres/src/include/catalog/pg_type.dat:573), which is why
+		// physicalPGTypeAlign pads it to 8 rather than 4. M0131-S14.2.
+		{Name: "attmissingval", Type: catalog.Type{Name: "anyarray"}},
 	}
 }
 
@@ -1031,6 +1039,27 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 			}
 		}
 	}
+	// Fast defaults (M0131-S14.2). `ALTER TABLE … ADD COLUMN … DEFAULT
+	// <const>` records the evaluated default on the column as MissingValue
+	// (operators_ddl.go execAlterTableAddColumn) and goopg's heap decoder
+	// materialises it for rows that pre-date the ALTER. PG expresses the same
+	// thing in the catalog — atthasmissing plus a one-element attmissingval
+	// array (StoreAttrMissingVal, postgres/src/backend/catalog/heap.c:2030) —
+	// and that is what a hosted PG reads, so writing only the in-memory half
+	// made every pre-existing row read NULL there while goopg read the
+	// default (measured as gap F3 by M0131-S4).
+	//
+	// An encode failure is not fatal: it degrades to the pre-S14.2 behaviour
+	// (atthasmissing=false / attmissingval NULL) rather than failing the DDL,
+	// exactly as upstream declines to store a missing value it cannot compute.
+	attHasMissing := false
+	attMissingValDatum := NullDatum
+	if mv, ok := col.MissingValue.(Datum); ok && !mv.IsNull() {
+		if blob, err := pgSingletonArrayBytes(typOID, col.Type, mv); err == nil {
+			attHasMissing = true
+			attMissingValDatum = NewBytesDatum(blob)
+		}
+	}
 	return Row{
 		NewIntDatum(int64(tbl.OID)),            // attrelid
 		NewStringDatum(col.Name),               // attname (name)
@@ -1045,7 +1074,7 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 		NewStringDatum(attCompressionStr),      // attcompression ('\0' default; 'p'/'l' override)
 		NewBoolDatum(col.NotNull),              // attnotnull
 		NewBoolDatum(col.DefaultExpr != nil || col.GeneratedExpr != "" || catalog.IsSerialTypeName(col.Type.Name)), // atthasdef (generated cols + SERIAL nextval defaults carry their expr in pg_attrdef too)
-		NewBoolDatum(false),                  // atthasmissing
+		NewBoolDatum(attHasMissing),          // atthasmissing (M0131-S14.2)
 		NewStringDatum(attIdentityFor(col)),  // attidentity
 		NewStringDatum(attGeneratedFor(col)), // attgenerated
 		NewBoolDatum(false),                  // attisdropped
@@ -1057,16 +1086,18 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 			return NewIntDatum(0)
 		}(), // attinhcount
 		NewIntDatum(int64(attCollationOID)), // attcollation (type default; per-column COLLATE override, slice 188)
-		// attacl / attoptions / attfdwoptions / attmissingval are nullable
-		// varlena columns; PG18 stores NULL when unset. NullDatum signals
-		// EncodeRowPG to skip the column and the bitmap helper to clear
-		// its bit. attstattarget (last) is NULL by default but carries the
-		// per-column SET STATISTICS override when one is set (DU-002 slice 184).
+		// attstattarget / attacl / attoptions / attfdwoptions / attmissingval
+		// are the five nullable trailing columns; PG18 stores NULL when unset.
+		// NullDatum signals EncodeRowPG to skip the column and the bitmap
+		// helper to clear its bit. attstattarget leads the group (PG18-canonical
+		// #21, M0131-S14.1) and is the one that is routinely NOT null — it
+		// carries the per-column SET STATISTICS override (DU-002 slice 184),
+		// which is exactly why its position had to be corrected.
+		attStatTargetDatum, // attstattarget (NULL default; integer override)
 		attaclDatum,        // attacl (NULL default; _aclitem blob after a column GRANT)
 		attOptionsDatum,    // attoptions (NULL default; text[] literal when set)
 		attFDWOptionsDatum, // attfdwoptions (NULL default; text[] literal when set)
-		NullDatum,          // attmissingval
-		attStatTargetDatum, // attstattarget (NULL default; integer override)
+		attMissingValDatum, // attmissingval (NULL default; 1-element anyarray after a fast default)
 	}
 }
 
@@ -1586,6 +1617,81 @@ func pgFloat4ArrayBytes(vals []float32) []byte {
 		binary.LittleEndian.PutUint32(buf[hdrSize+4*i:hdrSize+4*i+4], math.Float32bits(v))
 	}
 	return buf
+}
+
+// pgSingletonArrayBytes builds the one-element PG ArrayType blob that
+// StoreAttrMissingVal (postgres/src/backend/catalog/heap.c:2030) stores in
+// pg_attribute.attmissingval:
+//
+//	missingval = PointerGetDatum(construct_array(&missingval, 1,
+//	                 attStruct->atttypid, attStruct->attlen,
+//	                 attStruct->attbyval, attStruct->attalign));
+//
+// so elemtype is the COLUMN's atttypid (an array column's fast default is
+// therefore an array-of-array, exactly as upstream builds it), ndim=1,
+// dims[0]=1, lbound[0]=1 and dataoffset=0 (no null bitmap — a NULL default
+// stores nothing at all; ATExecAddColumn skips StoreAttrMissingVal when
+// missingIsNull, tablecmds.c:7551).
+//
+// No per-element alignment padding is possible with a single element:
+// deconstruct_array reads element 0 straight from ARR_DATA_PTR and only
+// aligns BETWEEN elements. Varlena elements are normalised to the 4-byte
+// header form upstream produces — goopg's on-disk encoder prefers the 1-byte
+// short header (varlenaTextBytes), which PG's VARSIZE_ANY would still read
+// correctly, but matching upstream's bytes keeps the blob comparable against a
+// real PG's. M0131-S14.2.
+func pgSingletonArrayBytes(elemTypeOID uint32, t catalog.Type, d Datum) ([]byte, error) {
+	elem, err := encodeValuePG(t, d)
+	if err != nil {
+		return nil, err
+	}
+	if pgPhysicalTypeIsVarlena(t) {
+		payload, n, derr := decodePhysicalPGVarlena(elem)
+		if derr != nil {
+			return nil, fmt.Errorf("attmissingval element for %q: %w", t.Name, derr)
+		}
+		if n != len(elem) {
+			return nil, fmt.Errorf("attmissingval element for %q: %d of %d bytes consumed", t.Name, n, len(elem))
+		}
+		full := make([]byte, 4+len(payload))
+		binary.LittleEndian.PutUint32(full[0:4], uint32(len(full))<<2)
+		copy(full[4:], payload)
+		elem = full
+	}
+	const hdrSize = 24
+	buf := make([]byte, hdrSize, hdrSize+len(elem))
+	binary.LittleEndian.PutUint32(buf[4:8], 1)             // ndim
+	binary.LittleEndian.PutUint32(buf[8:12], 0)            // dataoffset (0 = no nulls)
+	binary.LittleEndian.PutUint32(buf[12:16], elemTypeOID) // elemtype
+	binary.LittleEndian.PutUint32(buf[16:20], 1)           // dims[0]
+	binary.LittleEndian.PutUint32(buf[20:24], 1)           // lbound[0]
+	buf = append(buf, elem...)
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(len(buf))<<2)
+	return buf, nil
+}
+
+// pgSingletonArrayElement is the inverse of pgSingletonArrayBytes: it decodes
+// the single element back out of an attmissingval blob against the column's
+// declared type. Used by the guards, and by whichever reader eventually makes
+// the heap (rather than the in-memory catalog.Column.MissingValue) the source
+// of truth for goopg's own fast-default reads — see M0131-S14.3. Returns
+// ok=false for anything that is not a well-formed 1-element 1-D array.
+func pgSingletonArrayElement(blob []byte, t catalog.Type) (Datum, bool) {
+	const hdrSize = 24
+	if len(blob) < hdrSize {
+		return Datum{}, false
+	}
+	ndim := binary.LittleEndian.Uint32(blob[4:8])
+	dataoffset := binary.LittleEndian.Uint32(blob[8:12])
+	nelems := binary.LittleEndian.Uint32(blob[16:20])
+	if ndim != 1 || dataoffset != 0 || nelems != 1 {
+		return Datum{}, false
+	}
+	d, _, err := decodePhysicalPGValueMctx(t, blob[hdrSize:], nil)
+	if err != nil {
+		return Datum{}, false
+	}
+	return d, true
 }
 
 // pgTextArrayBytes builds a PG text[] (OID 25) ArrayType blob from a slice of strings.
@@ -2188,11 +2294,11 @@ func buildUserPGAttributeRowForCompositeField(cat catalog.Catalog, ct *catalog.C
 		NewBoolDatum(true),                       // attislocal
 		NewIntDatum(0),                           // attinhcount
 		NewIntDatum(int64(attCollationOID)),      // attcollation (type default; per-field COLLATE override, slice 257)
+		NullDatum,                                // attstattarget
 		NullDatum,                                // attacl
 		NullDatum,                                // attoptions
 		NullDatum,                                // attfdwoptions
 		NullDatum,                                // attmissingval
-		NullDatum,                                // attstattarget
 	}
 }
 

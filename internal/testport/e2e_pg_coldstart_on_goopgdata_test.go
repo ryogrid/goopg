@@ -17,9 +17,9 @@ package testport
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -237,22 +237,27 @@ func TestE2E_PGColdStartOnGoopgDataDir(t *testing.T) {
 	//
 	// Guard 3 / 0130-0002 Guard #1: `SELECT relname FROM pg_class` lists the
 	// user tables. This is the sentence that guard has been waiting for.
-	// NOTE the query carries no ORDER BY, and the sort happens in Go. That is
-	// not a style choice — see assertEmptyOpclassIndexStillBlocksSorts below,
-	// the finding this test measured.
+	// The query carries an ORDER BY and PG does the sorting. It used to sort in
+	// Go instead, because until M0131-S12 populated
+	// pg_opclass_am_name_nsp_index (2686) a hosted PG could not sort at all —
+	// see assertHostedPGCanSort below. Sorting server-side keeps the guard
+	// honest: it now exercises the ordering path over a real goopg catalog scan,
+	// not just over a VALUES list.
+	assertHostedPGCanSort(t, pg, goopgDir)
+
 	relnames := pgQueryColumn(t, pg, `SELECT c.relname
 		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE n.nspname IN ('public', 's4app') AND c.relkind = 'r'`)
-	sort.Strings(relnames)
+		WHERE n.nspname IN ('public', 's4app') AND c.relkind = 'r'
+		ORDER BY c.relname`)
 	if got := strings.Join(relnames, ","); got != "s4_items,s4_notes" {
 		t.Fatalf("hosted PG lists user tables %q, want \"s4_items,s4_notes\" — "+
 			"this is docs/design/0130-0002-pg-class-heap-persistence.md Guard #1", got)
 	}
 
-	assertEmptyOpclassIndexStillBlocksSorts(t, pg)
 	assertSystemViewOIDsArePinnedToUpstream(t, pg)
 
 	assertNailedSystemViewsAreEvaluable(t, pg, goopgDir)
+	assertNonCorpusSystemViewIsStillAbsent(t, pg)
 
 	// Row-level reads over user tables. S4.4 originally carried no view
 	// assertion at all because a hosted PG could not evaluate ANY view on a
@@ -276,25 +281,26 @@ func TestE2E_PGColdStartOnGoopgDataDir(t *testing.T) {
 	// id=9 was UPDATEd (9 % 3 == 0), id=7 was not. Reading both keeps the
 	// UPDATE gap visible as a row-content mismatch rather than as a count.
 	//
-	// The two columns are read as two separate scalars rather than as
-	// `label || '/' || qty`. That is NOT cosmetic: `text || integer` resolves
-	// to textanycat (oid 2003), a LANGUAGE SQL function, and calling any
-	// non-builtin crashes the hosted backend — see
-	// assertProconfigGapStillCrashesSQLFunctions, the second finding this test
-	// measured. Builtins go through fmgrtab and never read pg_proc, which is
-	// why every other probe here survives.
-	if got := s4Scalar(t, pg, pgLog, "SELECT label FROM public.s4_items WHERE id = 7"); got != wantLabel7 {
-		t.Fatalf("hosted PG row id=7 label = %q, goopg said %q", got, wantLabel7)
+	// The two columns are read as ONE concatenated scalar, and that form is
+	// the assertion (M0131-S13.4). `text || integer` resolves to textanycat
+	// (oid 2003), a LANGUAGE SQL function — NOT an fmgrtab builtin — so this
+	// probe reaches fmgr_info_cxt_security and reads the row's pg_proc tuple.
+	// Until S13 it aborted the backend with `Assert("ARR_NDIM(array) == 1")`
+	// because every seeded proconfig was a non-NULL empty ArrayType shell, and
+	// this test had to split the read into two builtin-only scalars plus a
+	// separate fail-when-fixed helper. The concatenation IS the regression
+	// tripwire now: a SIGABRT here means the seed path went back to writing
+	// empty varlena shells for the nullable pg_proc attributes.
+	if got := s4Scalar(t, pg, pgLog, "SELECT label || '/' || qty FROM public.s4_items WHERE id = 7"); got != wantLabel7+"/"+wantQty7 {
+		t.Fatalf("hosted PG row id=7 label/qty = %q, goopg said %q", got, wantLabel7+"/"+wantQty7)
 	}
-	if got := s4Scalar(t, pg, pgLog, "SELECT qty FROM public.s4_items WHERE id = 7"); got != wantQty7 {
-		t.Fatalf("hosted PG row id=7 qty = %q, goopg said %q", got, wantQty7)
+	if got := s4Scalar(t, pg, pgLog, "SELECT label || '/' || qty FROM public.s4_items WHERE id = 9"); got != wantLabel9+"/"+wantQty9 {
+		t.Fatalf("hosted PG row id=9 (UPDATEd) label/qty = %q, goopg said %q — S4.5, see ledger M0118-0129",
+			got, wantLabel9+"/"+wantQty9)
 	}
-	if got := s4Scalar(t, pg, pgLog, "SELECT label FROM public.s4_items WHERE id = 9"); got != wantLabel9 {
-		t.Fatalf("hosted PG row id=9 (UPDATEd) label = %q, goopg said %q — S4.5, see ledger M0118-0129", got, wantLabel9)
-	}
-	if got := s4Scalar(t, pg, pgLog, "SELECT qty FROM public.s4_items WHERE id = 9"); got != wantQty9 {
-		t.Fatalf("hosted PG row id=9 (UPDATEd) qty = %q, goopg said %q — S4.5, see ledger M0118-0129", got, wantQty9)
-	}
+	// The proconfig gap's own probe, kept as a direct positive assertion now
+	// that it passes: a LANGUAGE SQL builtin must be callable at all.
+	assertHostedPGCanCallSQLBuiltins(t, pg, pgLog)
 
 	// Guard 7 — index behaviour is live, not hypothetical. relhasindex is no
 	// longer hardcoded false (pgClassRelhasindex, with pgIndexTupleKeys = true),
@@ -305,7 +311,7 @@ func TestE2E_PGColdStartOnGoopgDataDir(t *testing.T) {
 
 	// The ADD COLUMN … DEFAULT column: pg_attrdef 2604 + indexes 2656/2657,
 	// previously validated only through the basebackup lane.
-	assertFastDefaultGapReadsNullOnHostedPG(t, pg, pgLog, wantTag)
+	assertFastDefaultMaterialisesOnHostedPG(t, pg, pgLog, wantTag)
 	// The non-public schema exercises pg_namespace reverse mapping.
 	if got := s4Scalar(t, pg, pgLog, "SELECT note FROM s4app.s4_notes WHERE id = 1"); got != wantNote {
 		t.Fatalf("hosted PG read of the non-public schema = %q, goopg said %q", got, wantNote)
@@ -315,16 +321,20 @@ func TestE2E_PGColdStartOnGoopgDataDir(t *testing.T) {
 	// truncates the log on Start and allocates it as a sibling of the data dir,
 	// so the scan covers exactly this attach and nothing else.
 	//
-	// It runs HERE rather than at the end because the two remaining probes are
-	// destructive by construction: each locks in a measured gap whose current
-	// behaviour is a backend PANIC or abort, which necessarily writes to this
-	// log and takes the postmaster with it. Guard 4 has to see the log before
-	// the known damage, not after.
+	// It runs HERE rather than at the end because the remaining probe USED to
+	// be destructive by construction: it locked in a measured gap whose
+	// behaviour was a backend PANIC, which necessarily wrote to this log and
+	// took the postmaster with it. That gap is fixed (M0131-S15), so the last
+	// probe is now an ordinary read — but Guard 4 stays here so that a
+	// REGRESSION of it is reported by the probe's own specific message rather
+	// than as an opaque "FATAL in the log". (Until M0131-S13 the proconfig
+	// probe was a second destructive one; it is now a plain assertion run
+	// above, inside the row-content reads.)
 	assertNoFatalInPGLog(t, pgLogPathFor(goopgDir))
 
-	// DESTRUCTIVE PROBES — nothing may follow these two.
-	assertGoopgCreatedDatabaseStillUnopenableByPG(t, repo, pg, goopgDir, wantOther)
-	assertProconfigGapStillCrashesSQLFunctions(t, pg, pgLogPathFor(goopgDir))
+	// A database goopg minted at RUNTIME with CREATE DATABASE — the last of
+	// the four findings this test originally measured (M0131-S15).
+	assertHostedPGReadsGoopgCreatedDatabase(t, repo, pg, goopgDir, wantOther)
 }
 
 // pgLogPathFor mirrors pgcluster's default LogPath allocation (a `pg.log`
@@ -383,14 +393,14 @@ func assertHostedPGIndexReadable(t *testing.T, pg *pgcluster.Cluster) {
 	}
 }
 
-// assertEmptyOpclassIndexStillBlocksSorts locks in the finding this test
-// measured, in the direction that fails loudly the moment the gap closes —
-// the same discipline M0131-S3 used for the HOT-flag finding that became S11.
+// assertHostedPGCanSort is the INVERTED form of what used to be
+// `assertEmptyOpclassIndexStillBlocksSorts` — M0131-S12 landed and the
+// fail-when-fixed assertion fired exactly as designed.
 //
-// A real PG hosted on a goopg-created directory cannot execute ANY sort, for
-// ANY type. `SELECT x FROM (VALUES (2), (1)) v(x) ORDER BY x` fails with
-// "could not identify an ordering operator for type integer" — nothing in the
-// query touches goopg's own tables.
+// The gap it measured: a real PG hosted on a goopg-created directory could not
+// execute ANY sort, for ANY type. `SELECT x FROM (VALUES (2), (1)) v(x) ORDER BY x`
+// failed with "could not identify an ordering operator for type integer" —
+// nothing in that query touches goopg's own tables.
 //
 // Diagnosis (measured, not inferred). The chain is
 // lookup_type_cache(TYPECACHE_LT_OPR) → GetDefaultOpClass, which at
@@ -401,63 +411,81 @@ func assertHostedPGIndexReadable(t *testing.T, pg *pgcluster.Cluster) {
 //	scan = systable_beginscan(rel, OpclassAmNameNspIndexId /* 2686 */, true, …);
 //
 // `indexOK = true` with no seq-scan fallback — the identical shape as blockers
-// #7/#8 and M0131-S5. goopg's pg_opclass HEAP is complete and correct (probed:
-// 177 rows; int4_ops is oid 1978, opcmethod 403, opcdefault 't'; 38 default
-// btree opclasses), and pg_index carries valid rows for 2686/2687. What is
-// missing is the index CONTENT: internal/initdb/initdb.go writes 2686 as a bare
-// `makeBtreeRootPage()` placeholder (the ~2047 list), while its sibling
-// pg_opfamily_am_name_nsp_index (2754) gets a real bulk-load bootstrapper.
-// pgBuildIndexTupleOidNameOidKey (internal/initdb/btree_index_bootstrap.go:1909)
-// even names 2686 in its doc comment as one of the two indexes it serves — no
-// caller ever builds 2686's tuples. So the scan returns zero rows and PG
-// concludes no type has a default btree opclass.
+// #7/#8 and M0131-S5. goopg's pg_opclass HEAP was already complete and correct
+// (177 rows; int4_ops is oid 1978, opcmethod 403, opcdefault 't'; 38 default
+// btree opclasses) and pg_index carried valid rows for 2686/2687. Only the index
+// CONTENT was missing, so the scan returned zero rows and PG concluded that no
+// type has a default btree opclass.
 //
-// Filed as M0131-S12 with a deferral-ledger row. When S12 lands, this assertion
-// FAILS — invert it then: replace it with the direct
-// `ORDER BY`-carrying form of the Guard-#1 query above and drop the Go-side
-// sort.
-func assertEmptyOpclassIndexStillBlocksSorts(t *testing.T, pg *pgcluster.Cluster) {
+// The fix is `bootstrapPgOpclassAmNameNspIndex`
+// (internal/initdb/btree_index_bootstrap.go), which bulk-loads 2686 from the same
+// heap TIDs `bootstrapPgOpclassOidIndex` (2687) uses. This assertion now holds it
+// in the POSITIVE direction: a regression here means 2686 went empty again.
+//
+// Keep the probe FROM-less/table-less on purpose: it isolates the opclass
+// lookup from anything about goopg's own heaps. The ORDER BY over real goopg
+// tables is asserted separately by the Guard #1 query at the call site, which
+// S12 restored to its ORDER BY form.
+func assertHostedPGCanSort(t *testing.T, pg *pgcluster.Cluster, goopgDir string) {
 	t.Helper()
-	const probe = "SELECT x FROM (VALUES (2), (1)) v(x) ORDER BY x"
+	const probe = "SELECT string_agg(x::text, ',' ORDER BY x) FROM (VALUES (2), (1), (3)) v(x)"
 	out, err := pgQueryScalarAllowError(pg, probe)
-	if err == nil {
-		t.Fatalf("a hosted PG can now sort (%q returned %q) — M0131-S12 has landed. "+
-			"INVERT this assertion: restore the ORDER BY form of the Guard #1 query, "+
-			"drop the Go-side sort, and delete this helper "+
-			"(docs/design/0131-0004-forward-coldstart-e2e.md §Findings)",
-			probe, strings.TrimSpace(out))
+	if err != nil {
+		// Report the on-disk size of 2686 in both databases: an 8 KB file is
+		// the bare `makeBtreeRootPage()` placeholder (the pre-S12 state, i.e.
+		// the bootstrapper did not run), while a larger file means the index
+		// was built but PG could not use its content.
+		var sizes []string
+		for _, db := range []string{"1", "5"} {
+			p := filepath.Join(goopgDir, "base", db, "2686")
+			if st, sErr := os.Stat(p); sErr == nil {
+				sizes = append(sizes, fmt.Sprintf("%s=%d bytes", p, st.Size()))
+			} else {
+				sizes = append(sizes, fmt.Sprintf("%s: %v", p, sErr))
+			}
+		}
+		t.Fatalf("a hosted PG can no longer sort (%q): M0131-S12 REGRESSED — "+
+			"pg_opclass_am_name_nsp_index (2686) is empty again, see "+
+			"bootstrapPgOpclassAmNameNspIndex.\non-disk: %s\n%s",
+			probe, strings.Join(sizes, ", "), out)
 	}
-	if !strings.Contains(out, "could not identify an ordering operator") {
-		t.Fatalf("hosted PG sort failed with an UNEXPECTED error — the known gap is the empty "+
-			"pg_opclass_am_name_nsp_index (2686, M0131-S12); this is something else:\n%s", out)
+	if got := strings.TrimSpace(out); got != "1,2,3" {
+		t.Fatalf("hosted PG sorted to %q, want \"1,2,3\" — the 2686 index is populated but "+
+			"produces the wrong order (key layout or sort order in "+
+			"bootstrapPgOpclassAmNameNspIndex)", got)
 	}
 }
 
-// assertGoopgCreatedDatabaseStillUnopenableByPG locks in the fourth finding.
+// assertHostedPGReadsGoopgCreatedDatabase is the S15.4 INVERSION of the former
+// assertGoopgCreatedDatabaseStillUnopenableByPG: the fourth finding this test
+// measured is FIXED (M0131-S15, 2026-08-12), so the probe now asserts success.
 //
-// A database goopg minted at RUNTIME with `CREATE DATABASE` cannot be connected
-// to by the hosted PG at all:
+// A database goopg minted at RUNTIME with `CREATE DATABASE` used to be
+// unconnectable by the hosted PG at all:
 //
 //	psql: connection to server … failed: PANIC: could not open critical system index 2662
 //
 // 2662 is pg_class_oid_index. `RelationCacheInitializePhase3`
 // (postgres/src/backend/utils/cache/relcache.c) nails and opens a small set of
 // critical indexes during InitPostgres, and a failure there is a PANIC, not an
-// ERROR — so the whole cluster goes down with the connection attempt.
+// ERROR — so the whole cluster went down with the connection attempt.
 //
-// This is a scope statement about goopg's CREATE DATABASE, not about the cold
-// start: the `postgres` database in the SAME directory serves every assertion
-// above correctly. initdb lays down base/1 and base/5 with real bootstrapped
-// btree content (internal/initdb/btree_index_bootstrap.go writes each index
-// into base/1 AND base/5); the runtime CREATE DATABASE path clones what goopg
-// itself needs, and goopg reads its catalogs without those indexes, so nothing
-// in the goopg-only world notices.
+// Diagnosis (measured). It was never about the runtime path's catalog cloning:
+// CREATE DATABASE copies template0's whole on-disk image
+// (initdb.copyBootstrapCatalogImage), and template0 itself was the stale one.
+// bootstrapPostgresDatabase materialised base/4 EARLY — from a base/1 that the
+// btree bulk-loaders had not yet populated — and then stamped metapage-only
+// placeholders over its index files, so every runtime database inherited a
+// 1-page, leaf-less pg_class_oid_index while base/{1,5} carried the real one.
+// The fix is `initdb.refreshTemplate0Image`, which re-clones base/4 from the
+// finished base/5 at the END of initdb, matching upstream's own ordering
+// (initdb.c make_template0 creates template0 from a fully bootstrapped
+// template1, which is why a real cluster's base/4 == base/1 byte for byte).
 //
-// Filed as M0131-S15 with a deferral-ledger row. When S15 lands, this assertion
-// FAILS — invert it then to a direct equality against goopgAnswer.
-//
-// DESTRUCTIVE: the PANIC terminates the postmaster.
-func assertGoopgCreatedDatabaseStillUnopenableByPG(t *testing.T, repo string, pg *pgcluster.Cluster, dataDir, goopgAnswer string) {
+// Kept as the LAST probe in the test even though it is no longer destructive:
+// its position is what makes Guard 4's "no FATAL in the log" scan meaningful
+// for everything above it.
+func assertHostedPGReadsGoopgCreatedDatabase(t *testing.T, repo string, pg *pgcluster.Cluster, dataDir, goopgAnswer string) {
 	t.Helper()
 	pgOther, err := pgcluster.OpenExisting("m0131-s4-pg-other", pgcluster.Options{
 		RepoRoot: repo,
@@ -470,47 +498,66 @@ func assertGoopgCreatedDatabaseStillUnopenableByPG(t *testing.T, repo string, pg
 		t.Fatalf("pgcluster.OpenExisting (s4other handle): %v", err)
 	}
 	out, err := pgQueryScalarAllowError(pgOther, "SELECT payload FROM public.s4_other_rows WHERE id = 1")
-	if err == nil {
-		t.Fatalf("the hosted PG can now read inside a goopg-CREATE DATABASE-minted database "+
-			"(got %q, goopg said %q) — M0131-S15 has landed. INVERT this assertion to a "+
-			"direct equality and delete this helper "+
-			"(docs/design/0131-0004-forward-coldstart-e2e.md §Findings)",
-			strings.TrimSpace(out), goopgAnswer)
+	if err != nil {
+		if strings.Contains(out, "could not open critical system index") {
+			t.Fatalf("M0131-S15 REGRESSED: the hosted PG PANICs again on a critical system "+
+				"index inside a goopg-CREATE DATABASE-minted database — template0's on-disk "+
+				"image (base/4) is stale again, see initdb.refreshTemplate0Image and its "+
+				"guard TestTemplate0ImageMatchesPostgresDatabase.\n%s", out)
+		}
+		t.Fatalf("hosted PG read inside the goopg-created database s4other failed: %v\n%s", err, out)
 	}
-	if !strings.Contains(out, "could not open critical system index") {
-		t.Fatalf("connecting to the goopg-created database failed, but NOT through the known "+
-			"missing-critical-index gap (M0131-S15) — this is something else:\n%s", out)
+	if got := strings.TrimSpace(out); got != goopgAnswer {
+		t.Fatalf("hosted PG read inside the goopg-created database s4other = %q, goopg said %q",
+			got, goopgAnswer)
 	}
 }
 
-// assertFastDefaultGapReadsNullOnHostedPG locks in the third finding — again
-// fail-when-fixed — while still asserting the part of M0130's pg_attrdef work
-// that DOES survive the handover.
+// assertFastDefaultMaterialisesOnHostedPG is the S14.4 INVERSION of the former
+// assertFastDefaultGapReadsNullOnHostedPG: the third finding this test measured
+// is FIXED (M0131-S14.2, 2026-08-12), so the probe now asserts success.
 //
-// `ALTER TABLE … ADD COLUMN tag text DEFAULT 'dflt'` reads back as 'dflt' on
-// goopg and as NULL on the hosted PG, for all 15 pre-existing rows.
+// `ALTER TABLE … ADD COLUMN tag text DEFAULT 'dflt'` used to read back as
+// 'dflt' on goopg and as NULL on the hosted PG, for all 15 pre-existing rows.
 //
-// Diagnosis (measured). The pg_attrdef side is entirely correct — the hosted PG
+// Diagnosis (measured). The pg_attrdef side was always correct — the hosted PG
 // reads `pg_get_expr(adbin, adrelid)` as `'dflt'::text` for adnum 4 and
 // pg_class.relnatts as 4, which is exactly the M0130 pg_attrdef 2604/2656/2657
-// work being validated outside the basebackup lane for the first time. What is
+// work being validated outside the basebackup lane for the first time. What was
 // missing is PG's **fast-default** mechanism: since PG 11, ADD COLUMN with a
 // non-volatile DEFAULT does not rewrite the heap; it stores the value in
 // pg_attribute.attmissingval with atthasmissing = true, and every physically
-// short tuple materialises the missing value on read. goopg neither rewrites
-// the rows nor records the missing value, so PG sees short tuples with no
-// missing value and yields NULL.
+// short tuple materialises the missing value on read. goopg recorded the value
+// only in its own in-memory catalog.Column.MissingValue, so PG saw short tuples
+// with no missing value and yielded NULL. S14.2 writes the catalog half too —
+// a one-element ArrayType built exactly as StoreAttrMissingVal builds it
+// (postgres/src/backend/catalog/heap.c:2030) — so the hosted PG's own
+// getmissingattr() materialises the value with no heap rewrite on either side.
 //
-// Underneath that sits a second, sharper fact: `attmissingval` does not exist
-// as a column at all on the hosted PG —
-// `SELECT attmissingval FROM pg_attribute` errors 42703 — so goopg's
-// pg_attribute heap is short of at least one attribute in its own
-// self-description (the rows for relid 1249), not merely unpopulated for
-// s4_items.
+// Underneath that sat a second, sharper fact, and THAT half is now FIXED
+// (M0131-S14.1): `SELECT attmissingval FROM pg_attribute` used to error 42703
+// on the hosted PG. Not because the column was missing from goopg's heap — the
+// rows for relid 1249 always had 25 attributes — but because the nailed
+// pg_class row said relnatts = 24. PG unlinks goopg's pg_internal.init at
+// startup (xlog.c:5633 RelationCacheInitFileRemove) and builds pg_attribute
+// from its own compiled 25-column Desc_pg_attribute, then
+// RelationCacheInitializePhase3 copies rd_rel out of goopg's pg_class tuple —
+// and the short relnatts truncated the last column off the descriptor. In PG18
+// order that last column is attmissingval, hence the 42703.
 //
-// Filed as M0131-S14 with a deferral-ledger row. When S14 lands, this assertion
-// FAILS — invert it then to a direct equality against goopg's own answer.
-func assertFastDefaultGapReadsNullOnHostedPG(t *testing.T, pg *pgcluster.Cluster, logPath, goopgAnswer string) {
+// Fixing relnatts exposed the permutation underneath it: goopg ordered the five
+// nullable trailing columns attacl/attoptions/attfdwoptions/attmissingval/
+// attstattarget, PG18 orders them attstattarget/attacl/attoptions/
+// attfdwoptions/attmissingval (attstattarget moved to #21 when it became
+// nullable; the old code's comment still claimed #4, which was PG16's). All
+// five NULL made the two indistinguishable — same null bitmap — but
+// `ALTER COLUMN … SET STATISTICS` writes attstattarget, and a hosted PG would
+// then have read that int2 as attacl. Both halves are asserted positively below.
+//
+// What remains deferred is S14.3 — goopg's OWN reader still materialises from
+// catalog.Column.MissingValue rather than from the heap's attmissingval, so the
+// two halves are written together but read independently (ledgered).
+func assertFastDefaultMaterialisesOnHostedPG(t *testing.T, pg *pgcluster.Cluster, logPath, goopgAnswer string) {
 	t.Helper()
 	// The half that works, asserted positively: pg_attrdef survived the cold
 	// start with the right expression on the right attnum.
@@ -528,28 +575,68 @@ func assertFastDefaultGapReadsNullOnHostedPG(t *testing.T, pg *pgcluster.Cluster
 			"this is M0130's pg_attrdef 2604/2656/2657 work, and it is NOT the known "+
 			"fast-default gap (M0131-S14)", got)
 	}
-	// The half that does not, asserted in the fail-when-fixed direction.
-	nulls := s4Scalar(t, pg, logPath, "SELECT count(*) FROM public.s4_items WHERE tag IS NULL")
-	if nulls != "15" {
-		t.Fatalf("hosted PG now materialises the ADD COLUMN … DEFAULT value for %s of 15 "+
-			"pre-existing rows (goopg reads %q) — M0131-S14 has landed. INVERT this "+
-			"assertion to a direct equality "+
-			"(docs/design/0131-0004-forward-coldstart-e2e.md §Findings)",
-			"15-"+nulls, goopgAnswer)
+	// S14.1, asserted positively: pg_attribute must describe itself to the
+	// hosted PG with all 25 PG18 attributes, in PG18 order. Reading
+	// attmissingval AT ALL is the 42703 regression tripwire; reading the tail's
+	// attnums is the permutation tripwire. Both queries are answered from
+	// goopg's own heap rows for relid 1249.
+	// Scoped to relid 1249's OWN rows: none of pg_attribute's 25 self-describing
+	// attributes has a fast default, so this count stays 0 forever, while a
+	// 42703 (rather than a number) is the relnatts-went-short signal. It is
+	// deliberately NOT the unscoped count any more — since S14.2 a user table's
+	// ADD COLUMN … DEFAULT legitimately makes that non-zero.
+	if got := s4Scalar(t, pg, logPath,
+		"SELECT count(*) FROM pg_attribute WHERE attrelid = 1249 AND attmissingval IS NOT NULL"); got != "0" {
+		t.Fatalf("hosted PG reads %q non-NULL pg_attribute.attmissingval rows for relid 1249, want 0 — "+
+			"a 42703 here instead means goopg's nailed pg_class relnatts for OID 1249 "+
+			"went short again (M0131-S14.1)", got)
+	}
+	if got := s4Scalar(t, pg, logPath,
+		`SELECT string_agg(attname, ',' ORDER BY attnum)
+		   FROM pg_attribute WHERE attrelid = 1249 AND attnum > 20`); got !=
+		"attstattarget,attacl,attoptions,attfdwoptions,attmissingval" {
+		t.Fatalf("goopg's pg_attribute self-description tail = %q, want PG18's "+
+			"\"attstattarget,attacl,attoptions,attfdwoptions,attmissingval\" — the four "+
+			"sibling column lists have drifted apart again (M0131-S14.1)", got)
+	}
+
+	// S14.2, asserted positively — the catalog half of the fast default.
+	if got := s4Scalar(t, pg, logPath,
+		`SELECT atthasmissing FROM pg_attribute
+		   WHERE attrelid = 'public.s4_items'::regclass AND attname = 'tag'`); got != "t" {
+		t.Fatalf("hosted PG reads atthasmissing = %q for s4_items.tag, want \"t\" — "+
+			"buildUserPGAttributeRow stopped writing the fast default (M0131-S14.2)", got)
+	}
+	// …and the read PG derives from it, with no heap rewrite on either side:
+	// every one of the 15 pre-ALTER rows is physically short, so PG must
+	// materialise the value through getmissingattr().
+	if nulls := s4Scalar(t, pg, logPath,
+		"SELECT count(*) FROM public.s4_items WHERE tag IS NULL"); nulls != "0" {
+		t.Fatalf("hosted PG reads NULL tag on %q of the 15 pre-existing rows (goopg reads %q) — "+
+			"the fast-default value is not reaching PG's getmissingattr (M0131-S14.2)",
+			nulls, goopgAnswer)
+	}
+	if got := s4Scalar(t, pg, logPath,
+		"SELECT count(*) FROM public.s4_items WHERE tag = 'dflt'"); got != "15" {
+		t.Fatalf("hosted PG materialises tag = 'dflt' on %q of the 15 pre-existing rows "+
+			"(goopg reads %q) — the attmissingval element decoded to something else "+
+			"(M0131-S14.2)", got, goopgAnswer)
 	}
 }
 
-// assertProconfigGapStillCrashesSQLFunctions locks in the second finding, in
-// the same fail-when-fixed direction.
+// assertHostedPGCanCallSQLBuiltins is the S13.4 INVERSION of the former
+// assertProconfigGapStillCrashesSQLFunctions: the second finding this test
+// measured is FIXED (M0131-S13, 2026-08-12), so the probe now asserts success.
 //
-// `SELECT 'a'::text || 1` crashes the hosted backend outright:
+// Before the fix, `SELECT 'a'::text || 1` crashed the hosted backend outright:
 //
 //	TRAP: failed Assert("ARR_NDIM(array) == 1"), File: "guc.c", Line: 6411
 //	  ExceptionalCondition → TransformGUCArray → fmgr_security_definer
 //	client backend (PID …) was terminated by signal 6: Aborted
 //
-// Diagnosis (measured). goopg writes **every one** of its 3397 pg_proc rows
-// with a NON-NULL proconfig — probed directly on the hosted PG:
+// Diagnosis (measured, and the fix follows from it). goopg wrote **every one**
+// of its 3397 pg_proc rows with a NON-NULL proconfig — probed directly on the
+// hosted PG:
 // `SELECT count(*) FROM pg_proc WHERE proconfig IS NOT NULL` returns 3397, the
 // full row count, while upstream's initdb leaves proconfig NULL on all of them
 // (prosecdef is correctly 'f' everywhere, so it is proconfig alone). The bytes
@@ -571,25 +658,30 @@ func assertFastDefaultGapReadsNullOnHostedPG(t *testing.T, pg *pgcluster.Cluster
 // This is an assert-enabled PG build, so the failure is loud. A production
 // build would instead walk a bogus ArrayType — worse, not better.
 //
-// Filed as M0131-S13 with a deferral-ledger row. When S13 lands, this assertion
-// FAILS — invert it then: fold `label || '/' || qty` back into the row-content
-// reads above and delete this helper.
-func assertProconfigGapStillCrashesSQLFunctions(t *testing.T, pg *pgcluster.Cluster, logPath string) {
+// The fix (M0131-S13): initdb's pgProcRow now writes executor.NullDatum for
+// every absent nullable varlena attribute — proconfig, proacl, probin,
+// prosqlbody, protrftypes and the OUT-arg trio — matching the runtime sibling
+// buildPGProcRow, which had used NullDatum all along. Unit tripwire:
+// internal/initdb/pg_proc_nullable_varlena_test.go.
+//
+// Two assertions, because either alone passes vacuously: the call must
+// SUCCEED, and pg_proc must report zero non-NULL proconfig rows (a hosted PG
+// that somehow answered "a1" through a different route would still be broken).
+func assertHostedPGCanCallSQLBuiltins(t *testing.T, pg *pgcluster.Cluster, logPath string) {
 	t.Helper()
 	const probe = "SELECT 'a'::text || 1"
 	out, err := pgQueryScalarAllowError(pg, probe)
-	if err == nil {
-		t.Fatalf("a hosted PG can now call a LANGUAGE SQL builtin (%q returned %q) — "+
-			"M0131-S13 has landed. INVERT this assertion: restore the "+
-			"`label || '/' || qty` form of the row-content reads and delete this helper "+
-			"(docs/design/0131-0004-forward-coldstart-e2e.md §Findings)",
-			probe, strings.TrimSpace(out))
+	if err != nil || strings.TrimSpace(out) != "a1" {
+		logData, _ := os.ReadFile(logPath)
+		t.Fatalf("hosted PG cannot call the LANGUAGE SQL builtin textanycat: %q returned %q (err=%v) — "+
+			"M0131-S13 has REGRESSED (a TransformGUCArray trap in the log below means the "+
+			"pg_proc seed is writing empty varlena shells again)\n--- PG log ---\n%s",
+			probe, strings.TrimSpace(out), err, tailLines(string(logData), 60))
 	}
-	logData, _ := os.ReadFile(logPath)
-	if !strings.Contains(string(logData), "TransformGUCArray") {
-		t.Fatalf("hosted PG failed %q, but NOT through the known pg_proc.proconfig gap "+
-			"(M0131-S13) — this is a different failure:\npsql: %s\n--- PG log ---\n%s",
-			probe, out, tailLines(string(logData), 60))
+	got := s4Scalar(t, pg, logPath, "SELECT count(*) FROM pg_proc WHERE proconfig IS NOT NULL")
+	if got != "0" {
+		t.Fatalf("hosted PG counts %q pg_proc rows with a non-NULL proconfig, want 0 "+
+			"(upstream initdb leaves every one NULL) — M0131-S13", got)
 	}
 }
 
@@ -619,17 +711,20 @@ func assertProconfigGapStillCrashesSQLFunctions(t *testing.T, pg *pgcluster.Clus
 // systemViewOIDPins() table (which internal/testport cannot see anyway, and
 // which would make the check circular if it could).
 //
-// The first six are M0131-S8a's replication views; the remaining 23 are
+// The first six are M0131-S8a's replication views; the next 22 are
 // M0131-S9.1's SRF-only tranche — every one `FROM <set-returning function>`
 // with no catalog relation and no view dependency, hence zero in-band :relid
-// in its ev_action. Captured 2026-08-11 from a throwaway `initdb --no-sync`.
+// in its ev_action. M0131-S9.1b adds the last two, pg_stat_bgwriter (12293)
+// and pg_stat_checkpointer (12297): they have no FROM clause AT ALL
+// (system_views.sql:1150-1169), so their Query carries an RTE_RESULT — the
+// fifth RTE kind, which 0131-0009 §"Two unmeasured ev_action shapes" flagged
+// as never having been round-tripped through a hosted PG. Their presence in
+// THIS list is the measurement. Captured 2026-08-11 from a throwaway
+// `initdb --no-sync`.
 //
-// Deliberately absent: pg_stat_bgwriter (12293) and pg_stat_checkpointer
-// (12297), whose FROM-less Query carries an RTE_RESULT that no captured blob
-// exercises yet (0131-0009 §"Two unmeasured ev_action shapes"); and
-// pg_timezone_abbrevs (12122), whose ORDER BY needs a pg_amop row goopg does
-// not bootstrap ("operator 664 is not a valid ordering operator") — this probe
-// is what found that, and it is ledgered.
+// Deliberately absent: pg_timezone_abbrevs (12122), whose ORDER BY needs a
+// pg_amop row goopg does not bootstrap ("operator 664 is not a valid ordering
+// operator") — this probe is what found that, and it is ledgered.
 func nailedSystemViewProbeSet() []struct {
 	view string
 	oid  string
@@ -660,6 +755,8 @@ func nailedSystemViewProbeSet() []struct {
 		{"pg_catalog.pg_replication_slots", "12261"},
 		{"pg_catalog.pg_stat_replication_slots", "12266"},
 		{"pg_catalog.pg_stat_archiver", "12289"},
+		{"pg_catalog.pg_stat_bgwriter", "12293"},
+		{"pg_catalog.pg_stat_checkpointer", "12297"},
 		{"pg_catalog.pg_stat_io", "12301"},
 		{"pg_catalog.pg_stat_wal", "12305"},
 		{"pg_catalog.pg_stat_progress_basebackup", "12329"},
@@ -714,9 +811,10 @@ func assertSystemViewOIDsArePinnedToUpstream(t *testing.T, pg *pgcluster.Cluster
 func assertNailedSystemViewsAreEvaluable(t *testing.T, pg *pgcluster.Cluster, goopgDir string) {
 	t.Helper()
 	// M0131-S9.1 widened this from the six replication views to the whole
-	// on-disk corpus (nailedSystemViewProbeSet). The per-view Errorf is what
-	// makes that affordable: 29 independent blobs, and a bad tupledesc names
-	// its own view instead of forcing a bisect.
+	// on-disk corpus (nailedSystemViewProbeSet), and S9.1b added the
+	// RTE_RESULT pair. The per-view Errorf is what makes that affordable: 30
+	// independent blobs, and a bad tupledesc names its own view instead of
+	// forcing a bisect.
 	for _, tc := range nailedSystemViewProbeSet() {
 		view := tc.view
 		out, err := pgQueryScalarAllowError(pg, "SELECT * FROM "+view+" LIMIT 0")
@@ -731,6 +829,47 @@ func assertNailedSystemViewsAreEvaluable(t *testing.T, pg *pgcluster.Cluster, go
 				"RelationBuildRuleLock rejected it.\n--- PG log ---\n%s",
 				view, err, out, tailLines(string(logTail), 60))
 		}
+	}
+}
+
+// assertNonCorpusSystemViewIsStillAbsent mechanises the BEFORE half of design
+// 0131-0009's guard #2 (M0131-S9.1b).
+//
+// The evaluability probe above proves only an after-state: every view goopg
+// seeds on disk can be evaluated by a hosted PG. On its own that is compatible
+// with a world where PG resolves these names for some reason unrelated to
+// goopg's seeding — so the guard is only half a guard. The missing half is a
+// view that goopg has NOT adopted, which must fail with 42P01
+// (undefined_table), because goopg's ~118 system relations are catalog.Table
+// {Virtual:true} objects that never reach the pg_class heap
+// (internal/catalog/catalog.go:335-342, skipped at :7025-7034). Passing both
+// halves is what makes the corpus list, and not something ambient, the cause.
+//
+// pg_tables is the probe on purpose: it is the named head of the M0131-S9.2
+// tranche (views over real catalogs). When S9.2 lands this assertion FAILS —
+// invert it then by moving pg_tables into nailedSystemViewProbeSet() and
+// re-pointing this helper at whatever the next un-adopted view is. That is the
+// same fail-when-fixed discipline as the S12/S13 finding locks above.
+func assertNonCorpusSystemViewIsStillAbsent(t *testing.T, pg *pgcluster.Cluster) {
+	t.Helper()
+	const view = "pg_catalog.pg_tables"
+	out, err := pgQueryScalarAllowError(pg, "SELECT * FROM "+view+" LIMIT 0")
+	if err == nil {
+		t.Errorf("hosted PG evaluated %s, which is NOT in the on-disk corpus "+
+			"(nailedSystemViewProbeSet) — either M0131-S9.2 has landed (then add "+
+			"pg_tables to the corpus and re-point this probe at the next "+
+			"un-adopted view), or the evaluability probe above is passing for a "+
+			"reason unrelated to goopg's seeding. Output: %q", view, strings.TrimSpace(out))
+		return
+	}
+	// 42P01 specifically: "does not exist" is the virtual-relation gap. Any
+	// other error (42809 no-rules, a crash, a tupledesc elog) would mean the
+	// row IS on disk and something downstream rejected it, which is a
+	// different — and interesting — failure.
+	if !strings.Contains(out, "does not exist") {
+		t.Errorf("hosted PG rejected %s, but NOT with the expected 42P01 "+
+			"undefined_table — a non-corpus view is supposed to be missing from "+
+			"the pg_class heap entirely:\n%s", view, out)
 	}
 }
 

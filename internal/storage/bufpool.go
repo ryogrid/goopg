@@ -1546,6 +1546,7 @@ func (p *Pool) evictVictim(victimIdx int, wasDirty bool, oldTag BufferTag) error
 		p.OnFlushWait()
 	}
 	recordIOTrace(oldTag, "preFlush", s.page)
+	PageIdentityObserve(oldTag, s.page, "preFlush")
 	flushErr := p.flushSlot(oldTag, s.page)
 	if p.OnFlushDone != nil {
 		p.OnFlushDone()
@@ -1748,18 +1749,31 @@ func (p *Pool) pinNewXID(rel RelFileNode, createXID TransactionID) (*Slot, Block
 
 	// Insert into bufmap. Under pinMu, no other goroutine can insert the same tag.
 	if !p.bmInsert(tag, int32(victimIdx), gen) {
-		// Another goroutine published this block while we were in Extend.
-		// Use their slot and release ours.
-		if existingIdx, existingGen := p.bm.Lookup(tag); existingIdx >= 0 {
-			if existing := p.tryPinSlot(existingIdx, existingGen); existing != nil {
-				p.traceSlotEvent(int32(victimIdx), evReleaseVictimSlot, tag, s.state.Load(), 0)
-				s.tag = BufferTag{}
-				s.state.Store(0)
-				p.pinMu.Unlock()
-				return existing, blk, nil
-			}
+		// Another goroutine published this block while we were inside Extend:
+		// the block joins nblocks the instant Extend returns, so a concurrent
+		// Pin misses the bufmap and loads it into a slot of its own.
+		//
+		// We MUST give ours up. Keeping an un-mapped valid+dirty publication
+		// (the pre-M0131-S30.3 "fall through" branch) leaves two live slots for
+		// one block: the un-mapped one is a normal clock-sweep victim, so its
+		// near-empty image is later written back over whatever the mapped slot
+		// accumulated, and every subsequent HOT update on the resurrected page
+		// re-uses line pointers that the WAL already spent (S30.3's
+		// new_off = 2, 3, 4 … signature).
+		//
+		// Un-publish, then re-acquire through the normal Pin path — unlike a
+		// bare tryPinSlot it also waits out the winner's in-flight read instead
+		// of failing on stateIO. The page the winner reads is exactly the
+		// initialized image Extend just wrote to disk, so nothing is lost.
+		p.traceSlotEvent(int32(victimIdx), evReleaseVictimSlot, tag, s.state.Load(), 0)
+		s.tag = BufferTag{}
+		p.releaseVictimSlot(victimIdx)
+		p.pinMu.Unlock()
+		existing, err := p.Pin(tag)
+		if err != nil {
+			return nil, InvalidBlockNumber, err
 		}
-		// Fall through: keep our publication.
+		return existing, blk, nil
 	}
 
 	p.pinMu.Unlock()
@@ -2087,7 +2101,36 @@ func (p *Pool) MarkDirtyHint(s *Slot) {
 	}
 }
 
+// probeAssertSlotIsMapped is the M0131-S30.3 duplicate-buffer check (temporary,
+// GOOPG_PAGEIDENT_PROBE=1). A pinned slot that is about to mutate its page must
+// BE the bufmap's slot for its own tag: if the bufmap points that tag at a
+// different slot, two buffers hold the same block at once and each sees a
+// different version of it — which is exactly the runtime/WAL page divergence
+// S30.3 reports (one slot appends at new_off=2 while the block on disk, grown
+// through the other slot, holds 185 line pointers).
+//
+// Lookup is lock-free (the same read Pin's fast path performs), so this is safe
+// without pinMu; a stale answer can only under-report.
+func (p *Pool) probeAssertSlotIsMapped(s *Slot, note string) {
+	if !PageIdentityProbeEnabled() {
+		return
+	}
+	if s.tag == (BufferTag{}) {
+		return
+	}
+	idx, _ := p.bm.Lookup(s.tag)
+	if idx != s.idx {
+		PageIdentityReportDupSlot(s.tag, s.idx, idx, note)
+	}
+}
+
 func (p *Pool) MarkDirty(s *Slot) {
+	// M0131-S30.3 probe (temporary): every page mutation funnels through a
+	// MarkDirty* call, so observing here — with the SLOT's own tag — catches
+	// the line-pointer regression at the mutating call path (stack dumped)
+	// rather than at the later write that merely carries it to disk.
+	PageIdentityObserve(s.tag, s.page, "markDirty")
+	p.probeAssertSlotIsMapped(s, "markDirty")
 	p.maybeEmitFPI(s)
 	// Atomically set dirty bit.
 	for {
@@ -2205,6 +2248,8 @@ func (p *Pool) MarkDirtyChangeRecord(s *Slot, emitter func() (LSN, error)) error
 	err := func() error {
 		needFPI := p.needsImage(s)
 		tag := s.tag
+		PageIdentityObserve(tag, s.page, "markDirtyRecord") // M0131-S30.3 probe
+		p.probeAssertSlotIsMapped(s, "markDirtyRecord")
 
 		if needFPI {
 			if p.logFPI != nil && p.fullPageWrites.Load() {
@@ -2268,6 +2313,8 @@ func (p *Pool) MarkDirtyLogicalChange(s *Slot, emitter func() (LSN, error)) erro
 	err := func() error {
 		needFPI := p.needsImage(s)
 		tag := s.tag
+		PageIdentityObserve(tag, s.page, "markDirtyRecord") // M0131-S30.3 probe
+		p.probeAssertSlotIsMapped(s, "markDirtyRecord")
 
 		lsn, err := emitter()
 		if err != nil {

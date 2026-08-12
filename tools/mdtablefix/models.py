@@ -8,16 +8,26 @@ from typing import Literal
 
 @dataclasses.dataclass
 class Fix:
-    """A single repair action applied to a table cell.
+    """A single repair action applied to a table cell or to its structure.
 
     Attributes:
-        type: Kind of repair — escaped_pipe, missing_cell, or extra_cell.
+        type: Kind of repair.  Cell-level: escaped_pipe, missing_cell,
+            extra_cell.  Structural (whole-row / whole-table): blank_line
+            (a body-splitting blank line was removed), missing_outer_pipe
+            (a row's leading or trailing ``|`` was restored).
         line: 1-based line number in the original document.
         column: 1-based column index where the repair was applied.
+            Structural fixes use column 1.
         detail: Human-readable explanation of the repair.
     """
 
-    type: Literal["escaped_pipe", "missing_cell", "extra_cell"]
+    type: Literal[
+        "escaped_pipe",
+        "missing_cell",
+        "extra_cell",
+        "blank_line",
+        "missing_outer_pipe",
+    ]
     line: int
     column: int
     detail: str

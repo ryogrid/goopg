@@ -9,6 +9,7 @@ from tools.mdtablefix.detector import (
     _parse_alignment,
     detect_table,
     is_separator_row,
+    normalize_outer_pipes,
 )
 
 
@@ -137,6 +138,96 @@ class TestDetectTable(unittest.TestCase):
             self.assertEqual(table.start_line, 5)
             self.assertEqual(table.header.line_number, 5)
             self.assertEqual(table.data_rows[0].line_number, 7)
+
+
+class TestNormalizeOuterPipes(unittest.TestCase):
+    """Tests for normalize_outer_pipes()."""
+
+    def test_already_normal(self):
+        self.assertEqual(
+            normalize_outer_pipes("| a | b |"), ("| a | b |", False)
+        )
+
+    def test_missing_trailing_pipe(self):
+        self.assertEqual(
+            normalize_outer_pipes("| a | b"), ("| a | b |", True)
+        )
+
+    def test_missing_leading_pipe(self):
+        self.assertEqual(
+            normalize_outer_pipes("a | b |"), ("| a | b |", True)
+        )
+
+    def test_trailing_escaped_pipe_is_not_an_outer_marker(self):
+        """``\\|`` ends a *cell*, so the row still needs its outer marker."""
+        self.assertEqual(
+            normalize_outer_pipes(r"| a | b \|"), (r"| a | b \| |", True)
+        )
+
+
+class TestDetectTableStructuralRepairs(unittest.TestCase):
+    """Blank lines and missing outer pipes are repaired, not fatal.
+
+    Both defects previously made detect_table() reject the whole block, so
+    a document with one bad row was reported as having "no issues" while
+    rendering visibly broken on GitHub.
+    """
+
+    def test_blank_line_in_body_is_absorbed(self):
+        lines = [
+            "| a | b |",
+            "| --- | --- |",
+            "| 1 | 2 |",
+            "",
+            "| 3 | 4 |",
+        ]
+        table = detect_table(lines, start_line=1)
+        self.assertIsNotNone(table)
+        assert table is not None
+        self.assertEqual(len(table.data_rows), 2)
+        blank_fixes = [f for f in table.fixes if f.type == "blank_line"]
+        self.assertEqual(len(blank_fixes), 1)
+        self.assertEqual(blank_fixes[0].line, 4)
+
+    def test_trailing_blank_is_not_reported(self):
+        """A blank after the last row separates blocks; it breaks nothing."""
+        lines = ["| a | b |", "| --- | --- |", "| 1 | 2 |", ""]
+        table = detect_table(lines, start_line=1)
+        self.assertIsNotNone(table)
+        assert table is not None
+        self.assertEqual([f for f in table.fixes if f.type == "blank_line"], [])
+
+    def test_row_missing_trailing_pipe_is_repaired(self):
+        lines = ["| a | b |", "| --- | --- |", "| 1 | 2"]
+        table = detect_table(lines, start_line=1)
+        self.assertIsNotNone(table)
+        assert table is not None
+        self.assertEqual(len(table.data_rows[0].cells), 2)
+        pipe_fixes = [f for f in table.fixes if f.type == "missing_outer_pipe"]
+        self.assertEqual(len(pipe_fixes), 1)
+        self.assertEqual(pipe_fixes[0].line, 3)
+
+    def test_one_bad_row_does_not_disqualify_the_table(self):
+        """The ledger's failure mode: 1 row of 1000 lacked a trailing pipe."""
+        lines = ["| a | b |", "| --- | --- |"]
+        lines += [f"| {i} | x |" for i in range(20)]
+        lines[10] = "| 8 | no trailing pipe"
+        table = detect_table(lines, start_line=1)
+        self.assertIsNotNone(table)
+        assert table is not None
+        self.assertEqual(len(table.data_rows), 20)
+
+    def test_separator_without_outer_pipes(self):
+        lines = ["a | b", "--- | ---", "| 1 | 2 |"]
+        table = detect_table(lines, start_line=1)
+        self.assertIsNotNone(table)
+        assert table is not None
+        self.assertEqual(len(table.header.cells), 2)
+
+    def test_bare_dashes_are_not_a_separator(self):
+        """``---`` alone is a thematic break, not a table delimiter row."""
+        self.assertFalse(is_separator_row("---"))
+        self.assertIsNone(detect_table(["| a | b |", "---", "| 1 | 2 |"], 1))
 
 
 if __name__ == "__main__":

@@ -209,6 +209,17 @@ const sizeOfXLogHeapUpdateData = 14
 // block 0 carries the new tuple's data.
 const xlhUpdateContainsNewTuple uint8 = 0x10
 
+// xlhUpdatePrefixFromOld / xlhUpdateSuffixFromOld are PG's
+// XLH_UPDATE_PREFIX_FROM_OLD / XLH_UPDATE_SUFFIX_FROM_OLD (heapam_xlog.h:91-92).
+// log_heap_update strips the bytes the new tuple shares with the old one from
+// the record and stores only the two lengths, so redo has to splice them back
+// in from the old version (M0131-S21g). goopg never SETS them — its own emit is
+// always the uncompressed form — but a real PG's stream is full of them.
+const (
+	xlhUpdatePrefixFromOld uint8 = 0x20
+	xlhUpdateSuffixFromOld uint8 = 0x40
+)
+
 // EncodeHeapHotUpdatePG builds a PostgreSQL xl_heap_update record for one HOT
 // (same-page) update, framed for the assembled-record Append path. Main data is
 // xl_heap_update{old_xmax, old_offnum, old_infobits_set=0, flags=CONTAINS_NEW_TUPLE,
@@ -326,15 +337,41 @@ const (
 // appended, so standby replay unlinks the relcache init files (the old
 // RecordKindXactCommitInval signal). No block references; opcode = XLOG_XACT_COMMIT.
 func EncodeXactCommitPG(xid storage.TransactionID, hasInvals bool) ([]byte, error) {
+	return EncodeXactCommitPGWithSubxacts(xid, nil, hasInvals)
+}
+
+// EncodeXactCommitPGWithSubxacts is EncodeXactCommitPG with an explicit
+// subtransaction list (M0131-S22). When subxacts is non-empty the body gains
+// XLOG_XACT_HAS_INFO + xinfo{HAS_SUBXACTS} + xl_xact_subxacts{nsubxacts,
+// subxacts[]}, in the chunk order ParseCommitRecord walks (xact.c:5673-5732):
+// xinfo, dbinfo, subxacts, …, invals. That is the shape a real PG writes for
+// any transaction that used a SAVEPOINT, and the shape whose replay
+// (ParseXactRecord + the initdb clog pass) stamps the whole transaction tree
+// instead of only its top-level XID.
+func EncodeXactCommitPGWithSubxacts(xid storage.TransactionID, subxacts []storage.TransactionID, hasInvals bool) ([]byte, error) {
 	info := xlogXactCommit
-	var mainData []byte
+	var xinfo uint32
 	if hasInvals {
+		xinfo |= xactXinfoHasInvals
+	}
+	if len(subxacts) > 0 {
+		xinfo |= xactXinfoHasSubxacts
+	}
+	mainData := make([]byte, minSizeOfXactCommit) // xact_time = 0
+	if xinfo != 0 {
 		info |= xlogXactHasInfo
-		mainData = make([]byte, minSizeOfXactCommit+8) // xact_time(8) + xinfo(4) + nmsgs(4)
-		binary.LittleEndian.PutUint32(mainData[8:12], xactXinfoHasInvals)
-		// mainData[12:16] = nmsgs = 0 (goopg carries no message array).
-	} else {
-		mainData = make([]byte, minSizeOfXactCommit) // xact_time = 0
+		mainData = binary.LittleEndian.AppendUint32(mainData, xinfo)
+	}
+	if len(subxacts) > 0 {
+		mainData = binary.LittleEndian.AppendUint32(mainData, uint32(int32(len(subxacts))))
+		for _, sub := range subxacts {
+			mainData = binary.LittleEndian.AppendUint32(mainData, uint32(sub))
+		}
+	}
+	if hasInvals {
+		// nmsgs = 0 (goopg carries no message array). The invals chunk is last
+		// of the chunks goopg writes, matching upstream's order.
+		mainData = binary.LittleEndian.AppendUint32(mainData, 0)
 	}
 	body, err := assembleXLogRecord(mainData, nil)
 	if err != nil {
@@ -347,12 +384,57 @@ func EncodeXactCommitPG(xid storage.TransactionID, hasInvals bool) ([]byte, erro
 // no chunks). The aborting xid is carried in the header (xl_xid); opcode =
 // XLOG_XACT_ABORT.
 func EncodeXactAbortPG(xid storage.TransactionID) ([]byte, error) {
+	return EncodeXactAbortPGWithSubxacts(xid, nil)
+}
+
+// EncodeXactAbortPGWithSubxacts is EncodeXactAbortPG with an explicit
+// subtransaction list (M0131-S22). xl_xact_abort shares xl_xact_commit's chunk
+// prefix and order (xact.h:334-345), so the encoding is the commit one minus
+// the invals chunk aborts never carry.
+func EncodeXactAbortPGWithSubxacts(xid storage.TransactionID, subxacts []storage.TransactionID) ([]byte, error) {
+	info := xlogXactAbort
 	mainData := make([]byte, minSizeOfXactCommit) // xact_time = 0
+	if len(subxacts) > 0 {
+		info |= xlogXactHasInfo
+		mainData = binary.LittleEndian.AppendUint32(mainData, xactXinfoHasSubxacts)
+		mainData = binary.LittleEndian.AppendUint32(mainData, uint32(int32(len(subxacts))))
+		for _, sub := range subxacts {
+			mainData = binary.LittleEndian.AppendUint32(mainData, uint32(sub))
+		}
+	}
 	body, err := assembleXLogRecord(mainData, nil)
 	if err != nil {
 		return nil, err
 	}
-	return framePGAssembled(RmgrXact, xlogXactAbort, uint32(xid), body), nil
+	return framePGAssembled(RmgrXact, info, uint32(xid), body), nil
+}
+
+// EncodeXactAssignmentPG builds a PostgreSQL xl_xact_assignment record
+// (XLOG_XACT_ASSIGNMENT, xact.h:218-223): the top-level XID a batch of
+// subtransaction XIDs belongs to. goopg does not emit this on its own commit
+// path — it rebuilds its subxact map from the native RecordKindXactAssignment
+// marker — but a real PG tail is full of them (one per
+// PGPROC_MAX_CACHED_SUBXIDS batch), and both replay passes must tolerate them:
+// the physical pass as a page-level no-op, the initdb clog pass by NOT
+// mistaking one for an abort (M0131-S22).
+func EncodeXactAssignmentPG(xtop storage.TransactionID, subxacts []storage.TransactionID) ([]byte, error) {
+	mainData := make([]byte, 0, 8+4*len(subxacts))
+	mainData = binary.LittleEndian.AppendUint32(mainData, uint32(xtop))
+	mainData = binary.LittleEndian.AppendUint32(mainData, uint32(int32(len(subxacts))))
+	for _, sub := range subxacts {
+		mainData = binary.LittleEndian.AppendUint32(mainData, uint32(sub))
+	}
+	body, err := assembleXLogRecord(mainData, nil)
+	if err != nil {
+		return nil, err
+	}
+	// xl_xid is the subtransaction currently assigning (PG logs the record from
+	// the subxact's own context); the last of the batch stands in for it.
+	recXID := xtop
+	if len(subxacts) > 0 {
+		recXID = subxacts[len(subxacts)-1]
+	}
+	return framePGAssembled(RmgrXact, xlogXactAssignment, uint32(recXID), body), nil
 }
 
 // xactCommitCarriesInvals reports whether a decoded xl_xact_commit body signals
@@ -1176,10 +1258,22 @@ func EncodeClogTruncatePG(oldestXid storage.TransactionID, oldestXactDb uint32) 
 // decoded replay path (a recognised no-op; checkpoint consumers are the
 // header-driven isCheckpointRecord/replayStart, not replay).
 func EncodeCheckpointPG(shutdown bool, redoLSN0 uint64, tli uint32, nextXid uint64, nextOid uint32, oldestActiveXid uint32) ([]byte, error) {
-	if nextXid < 3 {
-		nextXid = 3
-	}
-	mainData := encodeCheckPointStruct(redoLSN0, tli, nextXid, nextOid, oldestActiveXid)
+	return EncodeCheckpointPGFields(shutdown, CheckPointFields{
+		RedoLSN0:        redoLSN0,
+		ThisTLI:         tli,
+		NextXid:         nextXid,
+		NextOid:         nextOid,
+		OldestActiveXid: oldestActiveXid,
+	})
+}
+
+// EncodeCheckpointPGFields is EncodeCheckpointPG over the full
+// CheckPointFields set (M0131-S18.4). The runtime checkpointer uses this
+// form so the live timeline, full_page_writes and multixact counters
+// reach the record; EncodeCheckpointPG stays as the narrow constructor
+// for callers that only know the four historical values.
+func EncodeCheckpointPGFields(shutdown bool, f CheckPointFields) ([]byte, error) {
+	mainData := encodeCheckPointStruct(f)
 	body, err := assembleXLogRecord(mainData, nil)
 	if err != nil {
 		return nil, err
@@ -1245,6 +1339,40 @@ func EncodeRunningXactsPG(nextXid, oldestRunning, latestCompleted uint32, xids [
 	return framePGAssembled(RmgrStandby, xlogStandbyRunningXacts, 0, body), nil
 }
 
+// EncodeXLogNextOidPG builds the pre-assembled envelope for an XLOG_NEXTOID
+// record carrying nextOID — the encode sibling of DecodeXLogNextOid.
+//
+// goopg does not emit XLOG_NEXTOID in normal operation: it allocates OIDs one
+// at a time from the in-memory catalog and republishes the counter at every
+// checkpoint, where PG pre-allocates blocks of VAR_OID_PREFETCH and must
+// therefore log each block's ceiling. The encoder exists so the decode/replay
+// path can be exercised against bytes produced by goopg's own real framing
+// rather than a hand-built buffer, keeping the encode↔decode pair honest.
+func EncodeXLogNextOidPG(nextOID uint32) ([]byte, error) {
+	mainData := make([]byte, 4)
+	binary.LittleEndian.PutUint32(mainData, nextOID)
+	body, err := assembleXLogRecord(mainData, nil)
+	if err != nil {
+		return nil, err
+	}
+	return framePGAssembled(RmgrXLog, xlogXLogNextOid, 0, body), nil
+}
+
+// DecodeXLogNextOid parses an XLOG_NEXTOID main-data body — a bare Oid
+// (uint32), which is upstream's whole record: XLogPutNextOid writes
+// `XLogRegisterData(&nextOid, sizeof(Oid))` (xlog.c:8114-8138) and xlog_redo
+// reads it back with a single memcpy (xlog.c:8292-8308).
+//
+// M0131-S21a. Used by the initdb OID-recovery scan, not by the physical replay
+// pass — replayDecodedXLogRecord has a *storage.Manager and no catalog handle,
+// the same split that already routes CLOG_TRUNCATE through DecodeXLogClogTruncate.
+func DecodeXLogNextOid(mainData []byte) (uint32, error) {
+	if len(mainData) < 4 {
+		return 0, fmt.Errorf("wal: XLOG_NEXTOID main-data len %d (want 4)", len(mainData))
+	}
+	return binary.LittleEndian.Uint32(mainData[0:4]), nil
+}
+
 // DecodeXLogClogTruncate parses a PG xl_clog_truncate main-data body into its
 // three fields. Used by the initdb clog-recovery scan to re-apply the truncation.
 func DecodeXLogClogTruncate(mainData []byte) (pageno int64, oldestXact storage.TransactionID, oldestXactDb uint32, err error) {
@@ -1255,5 +1383,20 @@ func DecodeXLogClogTruncate(mainData []byte) (pageno int64, oldestXact storage.T
 	pageno = int64(binary.LittleEndian.Uint64(mainData[0:8]))
 	oldestXact = storage.TransactionID(binary.LittleEndian.Uint32(mainData[8:12]))
 	oldestXactDb = binary.LittleEndian.Uint32(mainData[12:16])
+	return
+}
+
+// DecodeXLogClogZeroPage parses a PG xl_clog_zeropage main-data body: a bare
+// int64 pageno (WriteZeroPageXlogRec, clog.c:1073-1078 — `XLogRegisterData(&pageno,
+// sizeof(pageno))`). Unlike CLOG_TRUNCATE, ZEROPAGE needs no catalog handle to
+// re-apply (it is pure page-zeroing on a fixed segment path), so it is decoded
+// and replayed directly in the physical pass — see
+// replayDecodedXLogClogZeroPage (recovery.go).
+func DecodeXLogClogZeroPage(mainData []byte) (pageno int64, err error) {
+	if len(mainData) < 8 {
+		err = fmt.Errorf("wal: xl_clog_zeropage main-data len %d (want 8)", len(mainData))
+		return
+	}
+	pageno = int64(binary.LittleEndian.Uint64(mainData[0:8]))
 	return
 }

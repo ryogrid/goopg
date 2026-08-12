@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -103,6 +104,36 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 	var records []Record
 	off := 0
 
+	// M0131-S19: every page header this walk crosses is validated against the
+	// address it is stored at (and against the previous page's timeline)
+	// before its bytes are trusted — see xlogPageValidator. `pos` below is
+	// stream-relative, but baseOffset is a whole multiple of segSize, so the
+	// absolute page address is simply baseOffset+off.
+	pv := xlogPageValidator{segSize: segSize}
+
+	// M0131-S30.2: every stop below is a candidate end-of-WAL, but only a stop
+	// with nothing durable behind it is a real one. `stop` logs the WARN as
+	// before and, when durable WAL is still present past the stop point,
+	// records the refusal that readAllPageAware returns to its caller — which
+	// initdb.Open turns into a refused start instead of a silently truncated
+	// cluster. See reader_early_end.go.
+	var early error
+	stop := func(off int, reason string, cause error) {
+		if early == nil {
+			early = earlyEndOfWAL(stream, off, segSize, baseOffset, reason, cause)
+		}
+		endOfWAL(off, baseOffset, reason, cause)
+	}
+	// A page whose header is all zero is the ordinary preallocated tail — the
+	// normal way the walk ends, so it gets no WARN. It is still checked: a
+	// zeroed page with durable pages BEHIND it is a hole, which is the exact
+	// shape the writer defects of this series left behind.
+	stopQuiet := func(off int, reason string, cause error) {
+		if early == nil {
+			early = earlyEndOfWAL(stream, off, segSize, baseOffset, reason, cause)
+		}
+	}
+
 	// root-0032: the stream does not necessarily begin on a record boundary.
 	// It starts at the first segment of the live run, and the record that was
 	// being written when that segment began may have started in a segment that
@@ -116,6 +147,18 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 	// is not replayable and predates the retention keep point, so dropping it is
 	// correct, not lossy.
 	if hsize := pageHeaderSizeAt(0, segSize); len(stream) >= hsize {
+		// M0131-S19: validate before trusting xlp_rem_len. On a recycled
+		// segment the stale header can carry XLP_FIRST_IS_CONTRECORD with a
+		// rem_len from the previous cycle, which would skip an arbitrary
+		// distance into bytes that are not this record's tail.
+		// An all-zero header is the preallocated-tail EOS sentinel, not a
+		// corrupt page — leave it to the main loop's isZeroBytes branch.
+		if !isZeroBytes(stream[:hsize]) {
+			if err := pv.check(stream[:hsize], baseOffset); err != nil {
+				stop(0, "invalid page header", err)
+				return nil, early
+			}
+		}
 		if hdr, err := DecodeXLogPageHeader(stream[:hsize]); err == nil && hdr.Info&XLPFirstIsContRecord != 0 {
 			off = hsize + maxAlignXLog(int(hdr.RemLen))
 			if off > len(stream) {
@@ -132,9 +175,58 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 				break
 			}
 			if isZeroBytes(stream[off : off+hsize]) {
+				stopQuiet(off, "zero page header", errPreallocatedPage)
+				break
+			}
+			// M0131-S19: a page that does not claim the address it is stored
+			// at is not part of this stream — the classic signature of a
+			// recycled segment PostgreSQL renamed into place without
+			// zero-filling. Upstream ends the read here too.
+			if err := pv.check(stream[off:off+hsize], baseOffset+uint64(off)); err != nil {
+				stop(off, "invalid page header", err)
 				break
 			}
 			off += hsize
+			continue
+		}
+		// M0131-S30.1: a segment tail too small to hold a record header may be
+		// unusable space rather than the start of a record — skip it instead
+		// of reading garbage and calling it end-of-WAL.
+		//
+		// The stripe writer (Path B, the production path) never lets a record
+		// straddle a segment boundary: when a reservation would cross one,
+		// insertPosTracker.reserveEmittedAndPublish re-lands the record at the
+		// boundary and fills the gap `[curr, boundary)` with an XLOG_NOOP pad
+		// — except when the gap is smaller than one record header, which
+		// cannot carry a pad and is left untouched (reserve_emitted.go,
+		// `gapLen < xlogMinimumRecordSize`). This walk used to decode those
+		// leftover bytes as a record header; extractRecordBytes completes the
+		// 24 bytes from the NEXT segment's first page, so the assembled
+		// "header" is the gap bytes glued to the head of a real record. The
+		// measured failure was exactly that: `padding bytes nonzero
+		// (0xff 0x07)` at lsn=134217721 — 8 bytes before a segment boundary —
+		// where 0x07ff is the high half of the FOLLOWING record's xl_prev.
+		// Replay called that end-of-WAL and discarded every committed record
+		// behind it (docs/design/0131-0020, docs/design/0131-0022).
+		//
+		// The skip is conditional on the bytes NOT being a valid record,
+		// because goopg's other writer path disagrees about this layout:
+		// state.appendPGCompat's Path A (walBuf disabled / oversized record /
+		// drain) emits at `trackerCurr` through emitWithPageHeaders with no
+		// boundary re-land, so it DOES produce records that begin in the last
+		// few bytes of a segment and continue after the next segment's long
+		// page header. Those are real, CRC-valid records and must still be
+		// replayed — hence recordStartsAt below decides, not the offset alone.
+		// (The writer divergence itself is filed separately; the reader must
+		// read every stream goopg has already written either way.)
+		//
+		// Guarded on segSize >= XLOGBlockSize: a few unit fixtures build
+		// sub-page "segments" whose every offset would otherwise look like an
+		// unusable tail.
+		if segRemain := segSize - pos%segSize; segSize >= XLOGBlockSize &&
+			segRemain < int64(xlogRecordHeaderSize) &&
+			!recordStartsAt(stream, off, pos, segSize) {
+			off += int(segRemain)
 			continue
 		}
 		// Mid-page record. The first 24 bytes are the XLogRecord
@@ -152,15 +244,20 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 		h, err := DecodeXLogRecordHeader(header)
 		if err != nil {
 			// M0088-0001: see ReadAll. Page-aware path uses
-			// "everything from the corrupt header on is zero" OR
-			// "within one segment-size of EOF" as the EOS signal.
+			// "everything from the corrupt header on is zero" as the EOS
+			// signal.
 			if isPreallocatedTail(stream[off:]) {
 				break
 			}
-			if int64(len(stream)-off) <= segSize {
-				break
+			// M0131-S16.2: a header goopg cannot validate is end-of-WAL only
+			// when the bytes were never durable. If the record's own CRC
+			// checks out, these bytes ARE a record — from a producer goopg
+			// does not understand — and stopping here would silently drop it
+			// and everything after it, which the next append then overwrites.
+			if derr := durableUnknownRecord(stream, off, pos, segSize, header, err); derr != nil {
+				return records, fmt.Errorf("wal: lsn %d: %w", baseOffset+uint64(off)+1, derr)
 			}
-			endOfWAL(off, baseOffset, "invalid record header", err)
+			stop(off, "invalid record header", err)
 			break
 		}
 		total := int(h.TotLen)
@@ -168,10 +265,7 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 			if isPreallocatedTail(stream[off:]) {
 				break
 			}
-			if int64(len(stream)-off) <= segSize {
-				break
-			}
-			endOfWAL(off, baseOffset, "bad xlog total length", fmt.Errorf("xl_tot_len=%d", total))
+			stop(off, "bad xlog total length", fmt.Errorf("xl_tot_len=%d", total))
 			break
 		}
 		paddedTotal := maxAlignXLog(total)
@@ -179,8 +273,24 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 		if len(fullBytes) < total {
 			break
 		}
+		// M0131-S19: extractRecordBytes just skipped any page headers this
+		// record straddles without looking at them. Validate them before the
+		// assembled bytes are trusted.
+		if verr := pv.checkSpan(stream, off, consumed, baseOffset); verr != nil {
+			stop(off, "invalid page header", verr)
+			break
+		}
 		decoded, err := decodeRecordXLogDetailed(fullBytes)
 		if err != nil {
+			// M0131-S16.2/S16.5: ErrUnsupportedRecord is only ever raised
+			// AFTER the record CRC has validated (decodeRecordXLogDetailed
+			// verifies the CRC before parsing the body), so these bytes are
+			// durable by construction — a compressed backup-block image or a
+			// non-default tablespace locator, not a torn tail. It must reach
+			// the caller.
+			if errors.Is(err, ErrUnsupportedRecord) {
+				return records, fmt.Errorf("wal: lsn %d: %w", baseOffset+uint64(off)+1, err)
+			}
 			tailStart := off + consumed
 			if tailStart > len(stream) {
 				tailStart = len(stream)
@@ -188,10 +298,7 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 			if isPreallocatedTail(stream[tailStart:]) {
 				break
 			}
-			if int64(len(stream)-off) <= segSize {
-				break
-			}
-			endOfWAL(off, baseOffset, "record failed to decode", err)
+			stop(off, "record failed to decode", err)
 			break
 		}
 		if decoded.Consumed != len(fullBytes) {
@@ -202,10 +309,7 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 			if isPreallocatedTail(stream[tailStart:]) {
 				break
 			}
-			if int64(len(stream)-off) <= segSize {
-				break
-			}
-			endOfWAL(off, baseOffset, "record size mismatch",
+			stop(off, "record size mismatch",
 				fmt.Errorf("decoded %d of %d bytes", decoded.Consumed, len(fullBytes)))
 			break
 		}
@@ -214,11 +318,79 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 		records = append(records, Record{StartLSN: start, EndLSN: end, Payload: decoded.Payload, XLog: decoded.XLog})
 		off += consumed
 	}
-	return records, nil
+	return records, early
 }
 
 // (afterCorruptIsZeroTail was removed in A9 with the legacy ReadAll walk; the
 // PG-frame page-aware walk uses isPreallocatedTail directly.)
+
+// recordStartsAt reports whether stream[off:] really is the first byte of a
+// record: its header decodes AND the record's own CRC checks out over the
+// bytes extractRecordBytes assembles from there (page headers skipped).
+//
+// M0131-S30.1: used to tell a segment's unusable sub-header tail gap (stripe
+// Path B's layout — bytes that belong to no record) apart from a record that
+// legitimately begins there and straddles the boundary (Path A's layout). The
+// CRC is the only evidence that distinguishes them, and it is the same
+// evidence durableUnknownRecord uses for the neighbouring question; a false
+// positive costs a 2^-32 collision on garbage, a false negative would drop a
+// durable record and everything behind it.
+func recordStartsAt(stream []byte, off int, pos, segSize int64) bool {
+	header, _ := extractRecordBytes(stream[off:], pos, segSize, xlogRecordHeaderSize)
+	if len(header) < xlogRecordHeaderSize {
+		return false
+	}
+	if isZeroXLogRecordHeader(header) {
+		return false
+	}
+	total := int(binary.LittleEndian.Uint32(header[0:4]))
+	if total < xlogRecordHeaderSize || total > len(stream)-off {
+		return false
+	}
+	fullBytes, _ := extractRecordBytes(stream[off:], pos, segSize, maxAlignXLog(total))
+	if len(fullBytes) < total {
+		return false
+	}
+	want := binary.LittleEndian.Uint32(header[20:24])
+	return VerifyXLogRecordCRC(fullBytes[:xlogRecordHeaderSize], fullBytes[xlogRecordHeaderSize:total], want) == nil
+}
+
+// durableUnknownRecord decides whether a record whose HEADER failed validation
+// is nevertheless a real, durable record — in which case it returns a non-nil
+// ErrUnsupportedRecord to be surfaced to the caller, and nil when the bytes
+// look like the garbage tail of a crash (the end-of-WAL case).
+//
+// M0131-S16.2. The two cases are distinguished exactly the way upstream's
+// XLogReaderValidatePageHeader/ValidXLogRecord pair does: xl_crc is computed
+// over the whole record, so a header goopg rejects (unknown rmid in
+// (RM_MAX_BUILTIN_ID, 128), nonzero padding, undefined framework bits) whose
+// CRC still checks out cannot be an accident — it was written by a producer
+// this build does not understand. Treating that as end-of-WAL drops it and
+// every record behind it, and detectWritePos then appends over the survivors,
+// making the loss permanent on the first write.
+//
+// The residual false-positive risk is a 2^-32 CRC collision on garbage; the
+// consequence of a false positive is a refused start (loud, recoverable), and
+// of the false NEGATIVE this replaces, silent data loss.
+func durableUnknownRecord(stream []byte, off int, pos, segSize int64, header []byte, cause error) error {
+	if len(header) < xlogRecordHeaderSize {
+		return nil
+	}
+	total := int(binary.LittleEndian.Uint32(header[0:4]))
+	if total < xlogRecordHeaderSize || total > len(stream)-off {
+		return nil
+	}
+	fullBytes, _ := extractRecordBytes(stream[off:], pos, segSize, maxAlignXLog(total))
+	if len(fullBytes) < total {
+		return nil
+	}
+	want := binary.LittleEndian.Uint32(header[20:24])
+	if err := VerifyXLogRecordCRC(fullBytes[:xlogRecordHeaderSize], fullBytes[xlogRecordHeaderSize:total], want); err != nil {
+		return nil
+	}
+	return fmt.Errorf("%w: CRC-valid record goopg cannot decode (rmid=%d xl_info=0x%02x xl_tot_len=%d): %w",
+		ErrUnsupportedRecord, header[17], header[16], total, cause)
+}
 
 // endOfWAL logs where the record walk stopped and why. root-0032: reaching a
 // record that fails validation ENDS recovery, it is not a fatal error — the

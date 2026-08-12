@@ -713,15 +713,116 @@ func EncodeCheckpointCompat(redoLSN0 uint64, tli uint32, nextXid uint64, nextOid
 	if nextXid < 3 {
 		nextXid = 3
 	}
-	return encodeCheckPointStruct(redoLSN0, tli, nextXid, nextOid, uint32(nextXid))
+	return encodeCheckPointStruct(CheckPointFields{
+		RedoLSN0:        redoLSN0,
+		ThisTLI:         tli,
+		NextXid:         nextXid,
+		NextOid:         nextOid,
+		OldestActiveXid: uint32(nextXid),
+	})
 }
 
+// CheckPointFields is the live cluster state stamped into the PG18
+// CheckPoint struct (M0131-S18.4). Before it existed, every member past
+// `redo`/`ThisTimeLineID`/`nextXid`/`nextOid`/`oldestActiveXid` was a
+// literal in the encoder — and two members, PrevTimeLineID and
+// fullPageWrites, were never written AT ALL, so every goopg checkpoint
+// record claimed `PrevTimeLineID = 0` and `full_page_writes = off`
+// (upstream sets PrevTimeLineID = ThisTimeLineID for every checkpoint
+// except an end-of-recovery one, xlog.c:7030-7034, and fullPageWrites
+// from Insert->fullPageWrites, xlog.c:7041).
+//
+// A zero value is NOT a valid CheckPoint: withDefaults applies the same
+// floors upstream's bootstrap does, so callers only fill what they know.
+type CheckPointFields struct {
+	// RedoLSN0 is the 0-based byte position of the checkpoint's redo
+	// point. PG's xlogreader validates it against ReadRecPtr.
+	RedoLSN0 uint64
+	ThisTLI  uint32
+	// PrevTLI defaults to ThisTLI. Only an end-of-recovery checkpoint
+	// differs (it names the timeline forked off from).
+	PrevTLI uint32
+	// FullPageWrites mirrors the full_page_writes GUC as the buffer pool
+	// currently sees it, not the postgresql.conf text: PG samples
+	// Insert->fullPageWrites under the WAL insert lock.
+	FullPageWrites bool
+	WalLevel       uint32
+	NextXid        uint64
+	NextOid        uint32
+	// NextMulti/NextMultiOffset/OldestMulti come from the multixact
+	// allocator. A cluster that has never created a multixact reports
+	// NextMulti = OldestMulti = FirstMultiXactId (1), NextMultiOffset = 0.
+	NextMulti       uint32
+	NextMultiOffset uint32
+	OldestXid       uint32
+	// OldestXidDB / OldestMultiDB name the database holding the horizon.
+	// Upstream's bootstrap seeds both with Template1DbOid; a fresh PG 18
+	// cluster reports 1 for each, so 0 (goopg's old value) was never a
+	// value real PG writes.
+	OldestXidDB   uint32
+	OldestMulti   uint32
+	OldestMultiDB uint32
+	// OldestCommitTsXid / NewestCommitTsXid are InvalidTransactionId (0)
+	// while track_commit_timestamp is off — which is goopg's only mode
+	// today, and what a real PG 18 pg_controldata reports. goopg used to
+	// hardcode 3 here, a value PG never writes with commit ts disabled.
+	OldestCommitTsXid uint32
+	NewestCommitTsXid uint32
+	// OldestActiveXid: PG stamps InvalidTransactionId (0) on shutdown
+	// checkpoints (recovery derives it from PrescanPreparedTransactions)
+	// and GetOldestActiveTransactionId() on online ones.
+	OldestActiveXid uint32
+}
+
+// firstMultiXactId mirrors FirstMultiXactId (multixact.h) — the lowest
+// MultiXactId ever handed out; 0 is InvalidMultiXactId.
+const firstMultiXactId = uint32(1)
+
+// withDefaults applies the floors and mirrors upstream establishes so a
+// partially-filled CheckPointFields still encodes a struct PG accepts.
+func (f CheckPointFields) withDefaults() CheckPointFields {
+	if f.ThisTLI == 0 {
+		f.ThisTLI = 1
+	}
+	if f.PrevTLI == 0 {
+		f.PrevTLI = f.ThisTLI
+	}
+	if f.WalLevel == 0 {
+		f.WalLevel = 1 // replica
+	}
+	if f.NextXid < 3 { // FirstNormalTransactionId
+		f.NextXid = 3
+	}
+	if f.NextOid < firstNormalObjectID {
+		f.NextOid = firstNormalObjectID
+	}
+	if f.NextMulti < firstMultiXactId {
+		f.NextMulti = firstMultiXactId
+	}
+	if f.OldestMulti < firstMultiXactId {
+		f.OldestMulti = firstMultiXactId
+	}
+	if f.OldestXid < 3 {
+		f.OldestXid = 3
+	}
+	if f.OldestXidDB == 0 {
+		f.OldestXidDB = template1DbOid
+	}
+	if f.OldestMultiDB == 0 {
+		f.OldestMultiDB = template1DbOid
+	}
+	return f
+}
+
+// firstNormalObjectID mirrors FirstNormalObjectId (transam.h).
+const firstNormalObjectID = uint32(16384)
+
+// template1DbOid mirrors Template1DbOid (pg_database_d.h) — the database
+// upstream's bootstrap names as the holder of the xid/multi horizons.
+const template1DbOid = uint32(1)
+
 // encodeCheckPointStruct builds the raw 88-byte PG18 CheckPoint struct.
-// oldestActiveXid is parameterised (A9-checkpoint-opcode): PG stamps
-// InvalidTransactionId (0) on shutdown checkpoints and
-// GetOldestActiveTransactionId() on online ones (xlog.c CreateCheckPoint);
-// EncodeCheckpointCompat keeps its historical nextXid mirror.
-func encodeCheckPointStruct(redoLSN0 uint64, tli uint32, nextXid uint64, nextOid uint32, oldestActiveXid uint32) []byte {
+func encodeCheckPointStruct(f CheckPointFields) []byte {
 	// Encode a minimal PG18 CheckPoint struct (sizeof=88).
 	// Offsets verified against compiled PG18 binary (DWARF):
 	//   redo           XLogRecPtr  8  (offset 0)
@@ -763,26 +864,33 @@ func encodeCheckPointStruct(redoLSN0 uint64, tli uint32, nextXid uint64, nextOid
 	// ShmemVariableCache->nextOid from this field so after a crash the
 	// OID counter is restored from the last checkpoint rather than from
 	// the pg_catalog.json snapshot.
+	//
+	// M0131-S18.4: every remaining literal is now a CheckPointFields
+	// member, and offsets 12 (PrevTimeLineID) and 16 (fullPageWrites) are
+	// written for the first time — they were skipped entirely, so a real
+	// PG reading a goopg checkpoint saw PrevTimeLineID = 0 (the pad-zero)
+	// and full_page_writes = off.
 	const checkPointSize = 88
-	if nextXid < 3 {
-		nextXid = 3
-	}
-	const firstNormalOID = uint32(16384) // FirstNormalObjectId
-	if nextOid < firstNormalOID {
-		nextOid = firstNormalOID
-	}
+	f = f.withDefaults()
 	payload := make([]byte, checkPointSize)
 	le := binary.LittleEndian
 	now := time.Now()
 
-	le.PutUint64(payload[0:8], redoLSN0)  // redo
-	le.PutUint32(payload[8:12], tli)      // ThisTimeLineID
-	le.PutUint32(payload[20:24], 1)       // wal_level (replica)
-	le.PutUint64(payload[24:32], nextXid) // nextXid (>= FirstNormalTxnId)
-	le.PutUint32(payload[32:36], nextOid) // nextOid (>= FirstNormalObjectId)
-	le.PutUint32(payload[36:40], 1)       // nextMulti
-	le.PutUint32(payload[44:48], 3)       // oldestXid
-	le.PutUint32(payload[52:56], 1)       // oldestMulti
+	le.PutUint64(payload[0:8], f.RedoLSN0)  // redo
+	le.PutUint32(payload[8:12], f.ThisTLI)  // ThisTimeLineID
+	le.PutUint32(payload[12:16], f.PrevTLI) // PrevTimeLineID
+	if f.FullPageWrites {
+		payload[16] = 1 // fullPageWrites (bool; offsets 17-19 stay pad)
+	}
+	le.PutUint32(payload[20:24], f.WalLevel)        // wal_level
+	le.PutUint64(payload[24:32], f.NextXid)         // nextXid (>= FirstNormalTxnId)
+	le.PutUint32(payload[32:36], f.NextOid)         // nextOid (>= FirstNormalObjectId)
+	le.PutUint32(payload[36:40], f.NextMulti)       // nextMulti
+	le.PutUint32(payload[40:44], f.NextMultiOffset) // nextMultiOffset
+	le.PutUint32(payload[44:48], f.OldestXid)       // oldestXid
+	le.PutUint32(payload[48:52], f.OldestXidDB)     // oldestXidDB
+	le.PutUint32(payload[52:56], f.OldestMulti)     // oldestMulti
+	le.PutUint32(payload[56:60], f.OldestMultiDB)   // oldestMultiDB
 	// time (pg_time_t=int64, 8-byte aligned → starts at offset 64)
 	le.PutUint64(payload[64:72], uint64(now.Unix())) // time
 	// After time (offset 72): oldestCommitTsXid, newestCommitTsXid,
@@ -790,9 +898,9 @@ func encodeCheckPointStruct(redoLSN0 uint64, tli uint32, nextXid uint64, nextOid
 	// NOTE: pg_time_t alignment forces 4-byte pad before time, pushing
 	// offsets: time=64, oldestCommitTsXid=72, newestCommitTsXid=76,
 	// oldestActiveXid=80, sizeof(CheckPoint)=88.
-	le.PutUint32(payload[72:76], 3)               // oldestCommitTsXid
-	le.PutUint32(payload[76:80], 3)               // newestCommitTsXid
-	le.PutUint32(payload[80:84], oldestActiveXid) // oldestActiveXid
+	le.PutUint32(payload[72:76], f.OldestCommitTsXid) // oldestCommitTsXid
+	le.PutUint32(payload[76:80], f.NewestCommitTsXid) // newestCommitTsXid
+	le.PutUint32(payload[80:84], f.OldestActiveXid)   // oldestActiveXid
 
 	return payload
 }
@@ -1916,9 +2024,46 @@ func DecodePageImage(payload []byte) (storage.RelFileNode, storage.BlockNumber, 
 // If no checkpoint record exists, all records are replayed from the
 // start (safe for fresh clusters or WAL without checkpoints).
 func ReplayRecords(mgr *storage.Manager, records []Record) (ReplayStats, error) {
+	return ReplayRecordsFrom(mgr, records, 0)
+}
+
+// ReplayRecordsFrom is ReplayRecords with an explicit redo pointer, which is
+// where upstream actually gets its replay start: InitWalRecovery reads
+// checkPoint.redo out of the control file's checkPointCopy and hands it to
+// PerformWalRecovery, which never searches the stream for a checkpoint
+// (postgres/src/backend/access/transam/xlogrecovery.c:597-707). goopg has
+// always scanned instead, which works only for WAL goopg itself wrote in a
+// shape its own isCheckpointRecord recognises.
+//
+// redoLSN == 0 means "no control-file redo available" and keeps the
+// goopg-authored scan (replayStart) as the fallback: a fresh cluster, a
+// hand-assembled directory with no pg_control, or the standalone
+// ReplayFromDir entry point. M0131-S20.2.
+//
+// The pointer is trusted the way upstream trusts it, and the one way it can
+// be wrong is safe: goopg's checkpointer appends the checkpoint record first
+// and updates pg_control afterwards (checkpointer.go runCheckpoint), so a
+// crash between the two leaves an OLDER redo in pg_control, which replays a
+// superset. Replay is idempotent — pages carry pd_lsn guards and CLOG stamps
+// are terminal-state writes — so replaying too much costs time, never
+// correctness. Replaying too little is the direction that loses data, and
+// pg_control can never point past the WAL it was written from.
+func ReplayRecordsFrom(mgr *storage.Manager, records []Record, redoLSN uint64) (ReplayStats, error) {
 	stats := ReplayStats{Records: len(records)}
-	startIdx, checkpointLSN := replayStart(records)
+	startIdx, checkpointLSN := replayStartAt(records, redoLSN)
 	stats.CheckpointLSN = checkpointLSN
+
+	// M0131-S25: refuse the whole index-AM boundary up front, before the first
+	// page is written. The per-record arm in replayDecodedXLogRecord would
+	// catch these anyway, but only one at a time and only after the prefix has
+	// already been applied — so a cluster with a GIN and a BRIN index costs two
+	// failed starts to diagnose and leaves a half-advanced data directory
+	// behind each time. Scanning the replay range (not the whole slice: records
+	// before the redo point are already durable in the pages) turns that into
+	// one refusal that names every AM present and mutates nothing.
+	if err := preflightIndexAMRecords(records[startIdx:]); err != nil {
+		return stats, err
+	}
 
 	for i, r := range records[startIdx:] {
 		applied, err := ApplyRecord(mgr, r)
@@ -2242,10 +2387,64 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 				return false, err
 			}
 			return true, nil
-		default:
-			// Other RmgrXLog opcodes (checkpoint, noop, switch, …) need no
-			// physical replay action on the standby.
+		case xlogXLogFPIForHint:
+			// M0131-S16.4: upstream xlog_redo handles XLOG_FPI_FOR_HINT on the
+			// SAME arm as XLOG_FPI (xlog.c:8748) — both carry nothing but block
+			// references and are replayed by restoring their images. The only
+			// difference is tolerance: a FOR_HINT block may legitimately carry
+			// no image (the hint bit was already durable via a concurrent FPI),
+			// where a bare XLOG_FPI without one is an ERROR upstream. goopg
+			// never emits FOR_HINT (rmgr_map.go maps PageImage → XLOG_FPI), so
+			// this arm exists purely for a real-PG crash tail; before S16.4 it
+			// fell into the default no-op and the hint-bit page was DROPPED.
+			if err := replayDecodedXLogHeapFPIBlocks(mgr, r, xlog); err != nil {
+				return false, err
+			}
+			return true, nil
+		case xlogXLogCheckpointShutdown, xlogXLogCheckpointOnline,
+			xlogXLogNoop, xlogXLogSwitch, xlogXLogBackupEnd,
+			xlogXLogRestorePoint, xlogXLogFPWChange, xlogXLogEndOfRecovery,
+			xlogXLogOverwriteContrecord, xlogXLogCheckpointRedo,
+			xlogInfoDefault:
+			// M0131-S16.4: the ENUMERATED benign set. Each of these is a
+			// genuine physical no-op for goopg's page-level replay — upstream
+			// xlog_redo either does nothing at all (NOOP, SWITCH,
+			// RESTORE_POINT, CHECKPOINT_REDO) or updates only shared-memory /
+			// recovery bookkeeping goopg does not maintain (the two CHECKPOINT
+			// opcodes, BACKUP_END, END_OF_RECOVERY, FPW_CHANGE,
+			// OVERWRITE_CONTRECORD). Checkpoint contents ARE consumed by goopg,
+			// but through the separate control-file/redo-start path, not here.
+			//
+			// xlogInfoDefault (0xF0) is the odd one out: it is not a PG opcode
+			// at all but goopg's own classifyXLogRecord marker for an
+			// EMPTY-payload record (format.go:151-153). It must stay a no-op
+			// or goopg refuses to replay its own WAL. Keeping it here rather
+			// than in the refused set costs no real-PG coverage, because PG's
+			// opcode space is the high nibble only and it defines nothing at
+			// 0xF0 — a real PG producer can never emit this value.
 			return false, nil
+		case xlogXLogNextOid:
+			// M0131-S21a: XLOG_NEXTOID is the opcode S16.4 refused rather than
+			// dropped, because xlog_redo sets nextOid EXACTLY from it
+			// (xlog.c:8292-8308) and losing one lets goopg re-issue OIDs a
+			// crashed PG had already allocated after the last checkpoint.
+			//
+			// It is now APPLIED — but not here. The OID counter lives in the
+			// in-memory catalog (catalog.InMemory.AdvanceNextOIDPast), which
+			// this pass cannot reach: replayDecodedXLogRecord is handed a
+			// *storage.Manager and nothing else. The record is therefore a
+			// page-level no-op recognised here and re-applied by
+			// replayNextOIDFromWAL in internal/initdb — the same two-pass split
+			// that already routes CLOG_TRUNCATE (see the RmgrCLOG arm below)
+			// and the xact commit/abort stamps. Physical replay stays a pure
+			// page function; the counter recovery rides the initdb scan that
+			// seeds nextOid from pg_control in the first place.
+			return false, nil
+		default:
+			// M0131-S16.4: everything else is refused rather than silently
+			// skipped. goopg emits no RM_XLOG opcode outside the named arms,
+			// so this cannot fire on goopg's own WAL.
+			return false, fmt.Errorf("%w: %s", ErrUnsupportedRecord, unsupportedDecodedXLogRecord(r))
 		}
 	case RmgrXact:
 		switch xlog.Header.Info & xlogXactOpMask {
@@ -2262,6 +2461,37 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			return false, nil
 		case xlogXactAbort:
 			return false, nil
+		case xlogXactAssignment, xlogXactInvalidations:
+			// M0131-S21a: two recovery-bookkeeping records goopg never emits
+			// but that appear in any real-PG tail. Neither touches a page.
+			//
+			// XLOG_XACT_ASSIGNMENT reports a batch of subtransaction→parent
+			// links so a hot standby can populate KnownAssignedXids;
+			// xact_redo's arm calls ProcArrayApplyXidAssignment and nothing
+			// else (xact.c:6429-6435), and goopg rebuilds its own subxact map
+			// from its native subxact markers (RecordKindXactAssignment). A
+			// real-PG assignment record is therefore informational here.
+			//
+			// XLOG_XACT_INVALIDATIONS carries the invalidation messages of a
+			// transaction that has not committed yet, again for standby
+			// relcache maintenance — and upstream's arm ignores it outright
+			// ("what matters are invalidations written into the commit
+			// record", xact.c:6437-6443). goopg's relcache-file
+			// unlink rides the COMMIT record's HAS_INVALS payload instead
+			// (see the xlogXactCommit arm above), which is the message set
+			// that actually became visible.
+			return false, nil
+		case xlogXactPrepare, xlogXactCommitPrepared, xlogXactAbortPrepared:
+			// M0131-S21a: two-phase commit is out of scope — goopg's
+			// max_prepared_transactions BootVal is "0", so it can neither
+			// produce these records nor rebuild the pg_twophase state a
+			// PREPARED transaction needs. Refuse with a message that names
+			// the reason: replaying the COMMIT_PREPARED of a transaction
+			// whose PREPARE we skipped would stamp an XID committed whose
+			// heap changes were never applied.
+			return false, fmt.Errorf("%w: %s (two-phase commit recovery is not supported; "+
+				"max_prepared_transactions must be 0 on a cluster goopg starts)",
+				ErrUnsupportedRecord, unsupportedDecodedXLogRecord(r))
 		default:
 			return false, unsupportedDecodedXLogRecord(r)
 		}
@@ -2277,6 +2507,66 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 		default:
 			return false, unsupportedDecodedXLogRecord(r)
 		}
+	case RmgrLogicalMessage:
+		switch xlog.Header.Info & XLRRmgrInfoMask {
+		case xlogLogicalMessage:
+			// M0131-S23. A recognised no-op here is BYTE-EXACT parity, not an
+			// approximation: upstream's logicalmsg_redo
+			// (postgres/src/backend/replication/logical/message.c:83-97) has an
+			// empty body under the comment "Redo is basically just noop for
+			// logical decoding messages." The payload exists only for a logical
+			// decoder reading the WAL stream; nothing in it reaches a page.
+			//
+			// It matters because a single `pg_logical_emit_message()` in a
+			// crashed PG's tail used to make the whole rest of that tail
+			// invisible (S16: rmid 21 exceeded the decoder's structural bound
+			// and the reader called it end-of-WAL).
+			return false, nil
+		default:
+			return false, unsupportedDecodedXLogRecord(r)
+		}
+	case RmgrReplicationOrigin:
+		switch xlog.Header.Info & XLRRmgrInfoMask {
+		case xlogReplOriginSet, xlogReplOriginDrop:
+			// M0131-S23. replorigin_redo (origin.c) mutates exactly one thing:
+			// the in-shmem `replication_states` array — SET calls
+			// replorigin_advance(..., wal_log=false) and DROP clears the
+			// matching slot. Both are pure memory; the durable copy lives in
+			// pg_logical/replorigin_checkpoint, written at checkpoint time.
+			//
+			// goopg has no logical-replication apply worker, hence no consumer
+			// for that state and no replorigin_checkpoint of its own to keep in
+			// step, so a documented no-op is the whole correct behaviour here
+			// rather than a shortcut. If goopg ever grows an apply worker, this
+			// arm has to grow with it (ledger row) — replaying a subscription's
+			// tail without advancing its origin would re-apply changes.
+			return false, nil
+		default:
+			return false, unsupportedDecodedXLogRecord(r)
+		}
+	case RmgrGeneric:
+		// M0131-S23. RM_GENERIC_ID has no opcode space: GenericXLogFinish
+		// inserts with info 0 (generic_xlog.c:399) and generic_redo never reads
+		// xl_info, so a non-zero info is a corrupt or future record.
+		if xlog.Header.Info&XLRRmgrInfoMask != xlogGenericInfo {
+			return false, unsupportedDecodedXLogRecord(r)
+		}
+		if err := replayDecodedXLogGeneric(mgr, r, xlog); err != nil {
+			return false, err
+		}
+		return true, nil
+	case RmgrCommitTs:
+		return replayDecodedXLogCommitTs(mgr, r, xlog)
+	case RmgrHash, RmgrGin, RmgrGist, RmgrSPGist, RmgrBrin:
+		// M0131-S25: the index-AM boundary. These five have no redo in goopg
+		// and no shortcut that could stand in for one (index_am_refusal.go
+		// documents why an FPI-only replay is provably wrong for them — GiST's
+		// NSN is not in the image, and REGBUF_WILL_INIT blocks carry no image
+		// at all). The one thing that CAN improve is the refusal itself: name
+		// the access method, the opcode, the LSN and the relation, so the
+		// message tells an operator which index to drop rather than which
+		// rmgrlist.h line to look up.
+		return false, indexAMUnsupportedError(r, xlog)
 	case RmgrRelMap:
 		switch xlog.Header.Info & XLRRmgrInfoMask {
 		case xlogRelmapUpdate:
@@ -2297,6 +2587,18 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			// treat the record as a recognised no-op and keep failing closed
 			// on any other Standby opcode.
 			return false, nil
+		case xlogStandbyLock, xlogStandbyInvalidations:
+			// M0131-S21a: the remaining two RM_STANDBY opcodes. Upstream's
+			// standby_redo takes the AccessExclusiveLock / processes the
+			// invalidation messages only to keep a HOT STANDBY's queries
+			// consistent with the primary; every arm is reached through code
+			// that returns immediately when standbyState == STANDBY_DISABLED
+			// (standby.c:1170-1172), which is what a crash-recovery start
+			// always is. goopg runs no concurrent queries during replay and
+			// holds no relcache init files open, so both are genuine no-ops
+			// here — recognised so a real-PG tail (every DDL emits a
+			// STANDBY_LOCK) does not refuse the start.
+			return false, nil
 		default:
 			return false, unsupportedDecodedXLogRecord(r)
 		}
@@ -2311,6 +2613,22 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 				return false, err
 			}
 			if err := applySmgrCreate(mgr, rel); err != nil {
+				return false, err
+			}
+			return true, nil
+		case xlogSmgrTruncate:
+			// M0131-S21a-2 part 6: every TABLE/INDEX TRUNCATE (the physical
+			// half — XLOG_HEAP_TRUNCATE above is the logical-decoding-only
+			// no-op) and every VACUUM tail truncation. goopg emits its own
+			// truncate-to-zero as the native RecordKindSmgrTruncate, so this
+			// arm is reached only by a real-PG record — which, unlike
+			// goopg's, can truncate the main fork to a NON-zero surviving
+			// prefix and independently truncate the vm/fsm forks.
+			rel, blkno, flags, err := decodeXLogSmgrTruncate(xlog.MainData)
+			if err != nil {
+				return false, err
+			}
+			if err := applySmgrTruncate(mgr, rel, blkno, flags); err != nil {
 				return false, err
 			}
 			return true, nil
@@ -2380,6 +2698,27 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			// case); the actual CLOG truncation is re-applied by the initdb
 			// clog-recovery scan (replayCLogFromWAL), which decodes the PG body.
 			return false, nil
+		case xlogClogZeroPage:
+			// M0131-S21a-2 part 5: unlike CLOG_TRUNCATE, ZEROPAGE needs no
+			// catalog/txn-manager handle — it is pure page-zeroing at a fixed
+			// segment offset (WriteZeroPageXlogRec, clog.c:1073-1078; fires
+			// once per 32768 XIDs, right before the first commit/abort into a
+			// fresh page), so it is re-applied HERE in the physical pass
+			// rather than deferred to replayCLogFromWAL. goopg's own
+			// clogBufferPool fault-in already treats a missing/short segment
+			// as all-zero (readPageFromDisk, clog_bufferpool.go:181-202), so
+			// this arm is not needed for goopg's own reads — it is needed
+			// because upstream `SimpleLruReadPage` treats a missing segment
+			// as a hard error (slru.c), not a lenient zero-fill: a real PG
+			// standby cold-starting on this cluster, or any tool that reads
+			// pg_xact/ directly (pg_resetwal, amcheck), expects the segment
+			// file for every XID range that was ever assigned to physically
+			// exist. Without this arm, a crashed PG's post-checkpoint tail
+			// that allocated a fresh CLOG page leaves that segment absent.
+			if err := replayDecodedXLogClogZeroPage(mgr, xlog); err != nil {
+				return false, err
+			}
+			return true, nil
 		default:
 			return false, unsupportedDecodedXLogRecord(r)
 		}
@@ -2432,11 +2771,47 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 				return false, err
 			}
 			return true, nil
+		case xlogHeapLock:
+			// M0131-S21a-2: every SELECT ... FOR UPDATE/SHARE, every foreign-key
+			// check, and the tuple lock an UPDATE takes before rewriting a row.
+			// goopg emits its own row locks as the native RecordKindHeapLock
+			// (payload[0] = 10, replayHeapLock), so this arm is reached only by a
+			// real-PG record — which, unlike goopg's, can carry a multixact xmax
+			// or an updater's key-share lock.
+			if err := replayDecodedXLogHeapLock(mgr, r, xlog); err != nil {
+				return false, err
+			}
+			return true, nil
+		case xlogHeapConfirm:
+			// M0131-S21a-2: the second half of every INSERT ... ON CONFLICT.
+			if err := replayDecodedXLogHeapConfirm(mgr, r, xlog); err != nil {
+				return false, err
+			}
+			return true, nil
+		case xlogHeapTruncate:
+			// M0131-S21a: recognised, deliberately not implemented. Upstream's
+			// heap_redo says it outright — "TRUNCATE is a no-op because the
+			// actions are already logged as SMGR WAL records" (heapam_xlog.c:
+			// 1201-1208): the physical effect of a TRUNCATE arrives as
+			// XLOG_SMGR_TRUNCATE (and, for a table created in the same
+			// transaction, as the new relfilenode's XLOG_SMGR_CREATE). The
+			// xl_heap_truncate body carries only the relation OIDs, for
+			// logical decoding — which is also why PG only emits it at
+			// wal_level=logical (tablecmds.c:2303).
+			return false, nil
 		default:
 			return false, unsupportedDecodedXLogRecord(r)
 		}
 	case RmgrHeap2:
-		switch xlog.Header.Info & XLRRmgrInfoMask {
+		// M0131-S21a: RM_HEAP2 shares RM_HEAP's XLOG_HEAP_OPMASK (0x70), NOT
+		// the generic 0xF0 rmgr-info mask. Upstream ORs XLOG_HEAP_INIT_PAGE
+		// (0x80) into the info byte of a MULTI_INSERT onto a freshly extended
+		// page (heapam.c:2607-2611), so a COPY arrives as info == 0xD0. Masked
+		// with 0xF0 that value matches no case and the record is refused;
+		// masked with 0x70 it is the MULTI_INSERT it actually is. Fixing the
+		// mask BEFORE the multi-insert redo lands (S21a-2) keeps the two
+		// changes from having to be correct simultaneously.
+		switch xlog.Header.Info & xlogHeapOpMask {
 		case xlogHeap2PruneOnAccess, xlogHeap2PruneVacuumScan, xlogHeap2PruneVacuumClean:
 			// A7: goopg's opportunistic prune / VACUUM prune / freeze all emit
 			// xl_heap_prune (block-0 sub-records: redirects, now-unused, freeze
@@ -2446,6 +2821,73 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 				return false, err
 			}
 			return true, nil
+		case xlogHeap2MultiInsert:
+			// M0131-S21a-2: every COPY. heap_multi_insert packs one page's worth
+			// of tuples into a single record, so a PG crash tail taken during a
+			// bulk load is made almost entirely of these. Note this case is
+			// reachable only because the switch masks with xlogHeapOpMask (0x70)
+			// — a COPY onto a freshly extended page arrives as 0xD0, MULTI_INSERT
+			// OR'd with XLOG_HEAP_INIT_PAGE.
+			if err := replayDecodedXLogHeapMultiInsert(mgr, r, xlog); err != nil {
+				return false, err
+			}
+			return true, nil
+		case xlogHeap2Visible:
+			// M0131-S21a-2 part 3: every VACUUM page it marks all-visible, plus
+			// the freeze an INSERT does on a page it filled itself. goopg emits
+			// its own VM updates as the native RecordKindHeapVisible (payload[0]
+			// = 29), whose ApplyRecord arm is a documented no-op, so this arm is
+			// reached only by a real-PG record — and unlike the native one it
+			// really writes the visibility-map fork.
+			if err := replayDecodedXLogHeap2Visible(mgr, r, xlog); err != nil {
+				return false, err
+			}
+			return true, nil
+		case xlogHeap2LockUpdated:
+			// M0131-S21a-2 part 4: XLOG_HEAP_LOCK's near-sibling — a tuple-lock
+			// request (FOR UPDATE/SHARE, an FK RI check) that finds its target
+			// already updated by a concurrent live transaction re-locks the
+			// newest visible version of the chain instead, on RM_HEAP2 because
+			// the chain walk can cross multiple row versions.
+			if err := replayDecodedXLogHeap2LockUpdated(mgr, r, xlog); err != nil {
+				return false, err
+			}
+			return true, nil
+		case xlogHeap2NewCid:
+			// M0131-S21a: XLOG_HEAP2_NEW_CID exists solely so logical decoding
+			// can map a catalog tuple to the command id that produced it;
+			// heap2_redo's arm is empty apart from an Assert that recovery is
+			// not supposed to see it in any consuming form
+			// (heapam_xlog.c:1244-1252 — "Nothing to do on a real replay, only
+			// used during logical decoding"). Recognised so a wal_level=logical
+			// PG tail does not refuse the start.
+			return false, nil
+		case xlogHeap2Rewrite:
+			// M0131-S21a-2 part 7: a loud refusal, deliberately not a redo and
+			// deliberately not a no-op. XLOG_HEAP2_REWRITE is emitted while a
+			// VACUUM FULL / CLUSTER rewrites a table whose pre-rewrite row
+			// versions a logical replication slot may still have to decode
+			// (rewriteheap.c:894 — reachable only at wal_level=logical, and
+			// only for a relation logical decoding can reach). Its redo writes
+			// no relation page: it truncates a pg_logical/mappings/ file to the
+			// record's offset and rewrites the mapping tail from
+			// old-ctid → new-ctid, then fsyncs it (heap_xlog_logical_rewrite,
+			// rewriteheap.c:1073-1160).
+			//
+			// goopg has no pg_logical/mappings consumer, so there is no honest
+			// middle: replaying it would mean maintaining a file nothing reads,
+			// and skipping it silently would leave a slot on the resulting
+			// cluster decoding the rewritten table against mappings that stop
+			// mid-rewrite — the pre-rewrite tuples become undecodable without
+			// anything reporting an error. Refusing names the feature instead,
+			// so the operator sees "goopg cannot start on this $PGDATA because
+			// of a logical-slot table rewrite" rather than a silently divergent
+			// slot. ErrUnsupportedRecord (not the bare error) is what keeps the
+			// reader from mistaking this for end-of-WAL and overwriting every
+			// record after it (format.go, M0131-S16.2).
+			return false, fmt.Errorf("%w: %s (logical-decoding rewrite mappings are not supported; "+
+				"this cluster ran VACUUM FULL/CLUSTER on a table with a logical replication slot)",
+				ErrUnsupportedRecord, unsupportedDecodedXLogRecord(r))
 		default:
 			return false, unsupportedDecodedXLogRecord(r)
 		}
@@ -2456,7 +2898,84 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			// data, no FPI — replay re-inserts by key. A real-PG leaf insert
 			// carrying a full-page image is restored via the FPI branch inside
 			// replayDecodedXLogBtreeInsert.
-			if err := replayDecodedXLogBtreeInsert(mgr, r, xlog); err != nil {
+			if err := replayDecodedXLogBtreeInsert(mgr, r, xlog, true, false, false); err != nil {
+				return false, err
+			}
+			return true, nil
+		case xlogBtreeInsertPost:
+			// M0131-S21b part 2: PG-only — a leaf insert whose heap TID landed
+			// inside an existing posting list, so the primary split that
+			// posting (nbtinsert.c:_bt_insertonpg, `postingoff > 0`). goopg's
+			// own inserts never take this path (they append to a posting), but
+			// any real PG index built with deduplication on — the default —
+			// emits this opcode routinely. Block 0's data run is
+			// {uint16 postingoff, orignewitem}, not a bare item.
+			if err := replayDecodedXLogBtreeInsert(mgr, r, xlog, true, false, true); err != nil {
+				return false, err
+			}
+			return true, nil
+		case xlogBtreeDedup:
+			// M0131-S21b part 2b: PG-only — the leaf deduplication pass that
+			// merges runs of equal-key tuples into posting lists to postpone a
+			// split (_bt_dedup_pass, nbtdedup.c). goopg never runs one, but a
+			// real PG index built with deduplication on — the default — emits
+			// this opcode routinely, and it is the very record S16.3 named when
+			// it turned the old silent FPI-only `default:` arm into a refusal.
+			// Block 0's data run is an array of BTDedupInterval, and redo
+			// rebuilds the whole page from the pre-image under those bounds.
+			if err := replayDecodedXLogBtreeDedup(mgr, r, xlog); err != nil {
+				return false, err
+			}
+			return true, nil
+		case xlogBtreeDelete:
+			// M0131-S21b part 3: PG-only — the LP_DEAD "simple deletion" pass
+			// (_bt_delitems_delete, nbtpage.c). Every index scan that lands on
+			// a dead heap tuple marks the entry, and the next insert short of
+			// room deletes the marked ones, so this is ordinary crash-tail
+			// traffic even though goopg has no such pass. Block 0's data run is
+			// {deleted offsets, updated offsets, xl_btree_update array} — the
+			// updates being the posting-list tuples that lost SOME of their
+			// TIDs, which is the half goopg refused until this slice.
+			if err := replayDecodedXLogBtreeDelete(mgr, r, xlog); err != nil {
+				return false, err
+			}
+			return true, nil
+		case xlogBtreeReusePage:
+			// M0131-S21b part 3: PG-only and a genuine NO-OP. Upstream's
+			// btree_xlog_reuse_page (nbtxlog.c:1006-1015) has exactly one
+			// statement — `if (InHotStandby) ResolveRecoveryConflictWith
+			// SnapshotFullXid(...)` — and mutates no page: the record exists
+			// only so a standby can cancel queries that might still read the
+			// recycled page. Crash recovery is not hot standby, so upstream
+			// itself does nothing here. It is named rather than left to the
+			// `default:` arm because that arm now REFUSES a record without a
+			// full-page image on every block (S16.3), and this record has no
+			// blocks at all.
+			return true, nil
+		case xlogBtreeInsertUpper:
+			// M0131-S21b part 1: PG-only — goopg's own downlink inserts ride
+			// RecordKindBtreeSplit/NewRoot. An insert into an internal page also
+			// finishes the child's split, so redo clears the child's
+			// BTP_INCOMPLETE_SPLIT flag off block 1 (nbtxlog.c:160-177).
+			if err := replayDecodedXLogBtreeInsert(mgr, r, xlog, false, false, false); err != nil {
+				return false, err
+			}
+			return true, nil
+		case xlogBtreeInsertMeta:
+			// M0131-S21b part 1: INSERT_UPPER plus the metapage rewrite PG folds
+			// in when the internal insert also moved the fast root
+			// (nbtinsert.c:1346-1361).
+			if err := replayDecodedXLogBtreeInsert(mgr, r, xlog, false, true, false); err != nil {
+				return false, err
+			}
+			return true, nil
+		case xlogBtreeMetaCleanup:
+			// M0131-S21b part 1: upstream's whole redo for this opcode is
+			// `_bt_restore_meta(record, 0)` (nbtxlog.c) — VACUUM's
+			// _bt_set_cleanup_info stamping btm_last_cleanup_num_delpages on the
+			// metapage, with no other page touched. The metapage is block 0 here,
+			// not block 2 as in the insert/newroot records.
+			if err := replayDecodedXLogBtreeRestoreMeta(mgr, xlog, storage.LSN(r.EndLSN), 0, "btree-meta-cleanup"); err != nil {
 				return false, err
 			}
 			return true, nil
@@ -2514,9 +3033,25 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			}
 			return true, nil
 		default:
-			// Other btree records (dedup / delete / reuse-page / …) are
-			// not flipped yet and are emitted with full-page images; restore
-			// each block from its FPI.
+			// Other btree records (dedup / delete / reuse-page / …) have no
+			// native redo in goopg yet; the only way to apply one is to restore
+			// every block it mutated from a full-page image.
+			//
+			// M0131-S16.3: that is a CONDITION, not an assumption. This arm
+			// used to call replayDecodedXLogHeapFPIBlocks unconditionally,
+			// which silently `continue`s past any block lacking an apply-image
+			// and then reported applied=true. For goopg's own WAL that was
+			// harmless (goopg emits none of these opcodes — every kind
+			// rmgr_map.go maps to RmgrBtree has a named arm above). For a real
+			// PG crash tail it is data loss: PG emits an FPI only on a page's
+			// FIRST touch after a checkpoint, so the second XLOG_BTREE_DEDUP
+			// on a page carries block DATA and no image — and we dropped the
+			// mutation while telling the caller it had been applied. Refuse
+			// instead, so an unreplayable index change stops the start rather
+			// than corrupting the index silently.
+			if err := requireFullPageImages(r, xlog); err != nil {
+				return false, err
+			}
 			if err := replayDecodedXLogHeapFPIBlocks(mgr, r, xlog); err != nil {
 				return false, err
 			}
@@ -2602,6 +3137,168 @@ func replayXLogParameterChange(mgr *storage.Manager, xlog *XLogDecodedRecord) (b
 	return true, nil
 }
 
+// replayDecodedXLogGeneric applies an RM_GENERIC_ID record, mirroring
+// generic_redo + applyPageRedo (generic_xlog.c:451-533). M0131-S23.
+//
+// RM_GENERIC is the one missing rmgr that can be implemented COMPLETELY with
+// zero access-method knowledge: GenericXLogFinish computes a byte-level diff of
+// the before/after page images and logs it as an opaque run of
+// (offset uint16, length uint16, bytes[length]) triples, so redo is a
+// memcpy loop. Only extensions (contrib/bloom, third-party AMs) emit these
+// records, which is why the arm is cheap rather than urgent — but "cheap and
+// exactly right" beats a refusal that would stop an otherwise-startable
+// cluster.
+//
+// Two details of upstream's loop are load-bearing and easy to drop:
+//
+//   - the "hole" between pd_lower and pd_upper is zeroed AFTER the delta is
+//     applied. GenericXLogFinish diffs the page with the hole already zeroed
+//     (it never logs bytes inside it), so a redo that leaves the pre-image's
+//     stale hole bytes in place produces a page that differs from the primary's
+//     byte for byte — invisible to queries, fatal to a checksum or a
+//     wal_consistency_checking comparison.
+//   - a block carrying a full-page image is RESTORED, not deltaed: upstream's
+//     XLogReadBufferForRedo returns BLK_RESTORED and skips the apply entirely.
+//     Applying a delta computed against the pre-image on top of the restored
+//     post-image page would double-apply it.
+func replayDecodedXLogGeneric(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
+	if len(xlog.Blocks) == 0 {
+		return fmt.Errorf("wal: xlog generic: record has no block references")
+	}
+	for i, block := range xlog.Blocks {
+		if block.HasImage && block.ImageApply {
+			if err := restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN)); err != nil {
+				return fmt.Errorf("wal: xlog generic block %d: %w", i, err)
+			}
+			continue
+		}
+		page, skip, err := redoExistingHeapPageForBlock(mgr, block, storage.LSN(r.EndLSN))
+		if err != nil {
+			return fmt.Errorf("wal: xlog generic block %d: %w", i, err)
+		}
+		if skip {
+			continue
+		}
+		if err := applyGenericPageDelta(page, block.Data); err != nil {
+			return fmt.Errorf("wal: xlog generic block %d: %w", i, err)
+		}
+		storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
+		if err := mgr.WriteBlock(block.Rel, block.Block, page); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// applyGenericPageDelta is upstream's applyPageRedo (generic_xlog.c:451-472)
+// plus the hole-zeroing generic_redo does right after it, and the bounds checks
+// upstream can omit because it trusts its own writer.
+func applyGenericPageDelta(page storage.Page, delta []byte) error {
+	for off := 0; off < len(delta); {
+		if len(delta)-off < 4 {
+			return fmt.Errorf("truncated delta header at byte %d of %d", off, len(delta))
+		}
+		start := int(binary.LittleEndian.Uint16(delta[off:]))
+		length := int(binary.LittleEndian.Uint16(delta[off+2:]))
+		off += 4
+		if len(delta)-off < length {
+			return fmt.Errorf("truncated delta chunk at byte %d: want %d bytes, have %d", off, length, len(delta)-off)
+		}
+		if start+length > len(page) {
+			return fmt.Errorf("delta chunk [%d,%d) is outside the page", start, start+length)
+		}
+		copy(page[start:start+length], delta[off:off+length])
+		off += length
+	}
+	hdr := storage.MustHeader(page)
+	lower, upper := int(hdr.Lower()), int(hdr.Upper())
+	if lower > upper || upper > len(page) {
+		return fmt.Errorf("delta produced an inconsistent page (pd_lower=%d pd_upper=%d)", lower, upper)
+	}
+	for i := lower; i < upper; i++ {
+		page[i] = 0
+	}
+	return nil
+}
+
+// replayDecodedXLogCommitTs handles RM_COMMIT_TS_ID. M0131-S23.
+//
+// The rmgr has exactly two opcodes and NEITHER carries a commit timestamp: the
+// timestamps themselves ride xact_redo_commit's xl_xact_commit payload. These
+// two records only maintain the pg_commit_ts SLRU's physical extent (ZEROPAGE
+// allocates the next page; TRUNCATE drops segments below oldestCommitTsXid) —
+// state goopg does not have, because it neither stores commit timestamps nor
+// even registers the track_commit_timestamp GUC.
+//
+// So the arm is conditional rather than a flat no-op. With tracking OFF — the
+// PG default, and the only configuration goopg's own checkpointer writes into
+// pg_control — a cluster cannot have meaningful pg_commit_ts content, any
+// straggler record from a since-disabled window is moot, and no-oping is
+// correct. With tracking ON in the crashed cluster's pg_control, silently
+// skipping would leave a pg_commit_ts directory whose segments do not match the
+// XID range the cluster believes is tracked; a later PG restart on the same
+// directory would then read a page SimpleLruReadPage expects to exist. Refuse
+// loudly and name the GUC instead — a half implementation here is worse than a
+// refusal an operator can act on.
+func replayDecodedXLogCommitTs(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) (bool, error) {
+	switch xlog.Header.Info & XLRRmgrInfoMask {
+	case xlogCommitTsZeroPage, xlogCommitTsTruncate:
+	default:
+		return false, unsupportedDecodedXLogRecord(r)
+	}
+	if commitTimestampsTracked(mgr) {
+		return false, fmt.Errorf("%w: %s (track_commit_timestamp is on in pg_control, but goopg has no "+
+			"pg_commit_ts SLRU; restart the cluster under PostgreSQL with track_commit_timestamp=off, "+
+			"or start it with PostgreSQL)",
+			ErrUnsupportedRecord, unsupportedDecodedXLogRecord(r))
+	}
+	return false, nil
+}
+
+// commitTimestampsTracked reports whether the cluster being recovered has
+// track_commit_timestamp on, per its pg_control. A manager without a data
+// directory (test stubs) reports false: there is no pg_commit_ts to be
+// inconsistent with.
+func commitTimestampsTracked(mgr *storage.Manager) bool {
+	if mgr == nil || mgr.DataDir() == "" {
+		return false
+	}
+	cd, err := control.ReadControlFile(mgr.DataDir())
+	if err != nil || cd == nil {
+		return false
+	}
+	return cd.TrackCommitTimestamp
+}
+
+// requireFullPageImages reports an ErrUnsupportedRecord unless EVERY block
+// reference of the record carries an applicable full-page image — the
+// precondition for replaying a record goopg has no native redo for by simply
+// restoring its pages.
+//
+// M0131-S16.3. A record with zero block references is refused too: an
+// image-only replay of a record that mutated nothing recorded here cannot be
+// the whole truth, and silently succeeding is precisely the failure mode this
+// slice exists to remove. The error names the offending block so a refused
+// start says which record and which page could not be replayed, rather than
+// "recovery failed".
+func requireFullPageImages(r Record, xlog *XLogDecodedRecord) error {
+	if len(xlog.Blocks) == 0 {
+		return fmt.Errorf("%w: rmid=%d info=0x%02x lsn[%d,%d] has no block references to restore",
+			ErrUnsupportedRecord, xlog.Header.Rmid, xlog.Header.Info&XLRRmgrInfoMask,
+			r.StartLSN, r.EndLSN)
+	}
+	for i, block := range xlog.Blocks {
+		if block.HasImage && block.ImageApply {
+			continue
+		}
+		return fmt.Errorf("%w: rmid=%d info=0x%02x lsn[%d,%d] block %d (rel %v blk %d) carries no applicable full-page image (has_image=%t apply=%t) and goopg has no native redo for this opcode",
+			ErrUnsupportedRecord, xlog.Header.Rmid, xlog.Header.Info&XLRRmgrInfoMask,
+			r.StartLSN, r.EndLSN, i, block.Rel, block.Block,
+			block.HasImage, block.ImageApply)
+	}
+	return nil
+}
+
 func unsupportedDecodedXLogRecord(r Record) error {
 	if r.XLog == nil {
 		return errors.New("wal: empty decoded xlog record")
@@ -2633,47 +3330,293 @@ func replayDecodedXLogHeapInsert(mgr *storage.Manager, r Record, xlog *XLogDecod
 	if err != nil {
 		return err
 	}
-	nblocks, err := mgr.NBlocks(block.Rel)
+	page, skip, err := redoHeapPageForBlock(mgr, block, storage.LSN(r.EndLSN), xlog.Header.Info&xlogHeapInit != 0)
 	if err != nil {
-		return err
+		return fmt.Errorf("wal: xlog heap-insert: %w", err)
 	}
-	page := make(storage.Page, storage.BlockSize)
-	switch {
-	case block.Block < nblocks:
-		if err := mgr.ReadBlock(block.Rel, block.Block, page); err != nil {
-			return err
-		}
-		if !storage.IsNew(page) && storage.MustHeader(page).LSN() >= storage.LSN(r.EndLSN) {
-			return nil
-		}
-		if block.WillInit || xlog.Header.Info&xlogHeapInit != 0 || storage.IsNew(page) {
-			if err := storage.InitPage(page); err != nil {
-				return err
-			}
-		}
-	case block.Block == nblocks:
-		if err := storage.InitPage(page); err != nil {
-			return err
-		}
-		got, err := mgr.Extend(block.Rel, page)
-		if err != nil {
-			return err
-		}
-		if got != block.Block {
-			return fmt.Errorf("wal: xlog heap-insert extend returned block %d, want %d", got, block.Block)
-		}
-	default:
-		return fmt.Errorf("wal: xlog heap-insert replay gap block=%d nblocks=%d", block.Block, nblocks)
+	if skip {
+		return nil
 	}
-	got, err := storage.PageInsertItemRawAt(page, offnum, tupleRaw)
-	if err != nil {
-		return fmt.Errorf("wal: xlog heap-insert apply: %w", err)
-	}
-	if got != offnum {
-		return fmt.Errorf("wal: xlog heap-insert replay slot drift: got %d, want %d (block %d)", got, offnum, block.Block)
+	// M0131-S21c sibling: heap_xlog_insert uses the same
+	// PageAddItemExtended(PAI_OVERWRITE) as heap_xlog_multi_insert, so a single
+	// INSERT into a pruned page's LP_UNUSED hole must reuse the pointer in place
+	// too. This path used to call PageInsertItemRawAt directly, which SHIFTED
+	// the array — the same bug the multi-insert path refused loudly.
+	if err := redoHeapPageAddItemOverwrite(page, offnum, tupleRaw); err != nil {
+		return fmt.Errorf("wal: xlog heap-insert apply (block %d): %w", block.Block, err)
 	}
 	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
 	return mgr.WriteBlock(block.Rel, block.Block, page)
+}
+
+// redoHeapPageForBlock acquires the heap page a PG-format redo routine is about
+// to mutate, mirroring upstream XLogReadBufferExtended (xlogutils.c:479-539).
+//
+// M0131-S21a-2. Two behaviours upstream has that goopg's per-opcode replay
+// functions were each open-coding (or getting wrong):
+//
+//   - **The replay gap is not an error.** A crash tail routinely references a
+//     block past the fork's flushed length: the primary extended the relation
+//     in shared buffers and logged the insert, but the extension itself is not
+//     WAL-logged and the dirty page never reached disk. Upstream's answer is to
+//     zero-extend the fork up to the referenced block ("hm, page doesn't exist
+//     in file" → ExtendBufferedRelTo with EB_PERFORMING_RECOVERY) and carry on.
+//     goopg's heap-insert arm instead returned "replay gap block=N nblocks=M",
+//     which refuses the whole start.
+//   - **pd_lsn is the idempotency guard**, checked only for a page that already
+//     exists; a freshly extended page has no LSN to compare against.
+//
+// forceInit is the caller's XLOG_HEAP_INIT_PAGE bit: upstream reinitialises the
+// page unconditionally in that case (XLogInitBufferForRedo + PageInit) rather
+// than reading it, because the record's tuple offsets are relative to an empty
+// page. block.WillInit (BKPBLOCK_WILL_INIT) and an all-zero page get the same
+// treatment.
+//
+// Returns skip=true when the page is already at or past this record's LSN, in
+// which case the returned page must not be written.
+func redoHeapPageForBlock(mgr *storage.Manager, block XLogBlockRef, endLSN storage.LSN, forceInit bool) (storage.Page, bool, error) {
+	nblocks, err := mgr.NBlocks(block.Rel)
+	if err != nil {
+		return nil, false, err
+	}
+	page := make(storage.Page, storage.BlockSize)
+	if block.Block < nblocks {
+		if err := mgr.ReadBlock(block.Rel, block.Block, page); err != nil {
+			return nil, false, err
+		}
+		if !storage.IsNew(page) && storage.MustHeader(page).LSN() >= endLSN {
+			return nil, true, nil
+		}
+		if forceInit || block.WillInit || storage.IsNew(page) {
+			if err := storage.InitPage(page); err != nil {
+				return nil, false, err
+			}
+		}
+		return page, false, nil
+	}
+	// Zero-extend the fork up to (but not including) the target block, exactly
+	// as upstream does — the intervening pages are genuinely empty on the
+	// primary too, and any record that fills them arrives later in the stream.
+	zero := make(storage.Page, storage.BlockSize)
+	for blk := nblocks; blk < block.Block; blk++ {
+		got, err := mgr.Extend(block.Rel, zero)
+		if err != nil {
+			return nil, false, err
+		}
+		if got != blk {
+			return nil, false, fmt.Errorf("zero-extend returned block %d, want %d", got, blk)
+		}
+	}
+	if err := storage.InitPage(page); err != nil {
+		return nil, false, err
+	}
+	got, err := mgr.Extend(block.Rel, page)
+	if err != nil {
+		return nil, false, err
+	}
+	if got != block.Block {
+		return nil, false, fmt.Errorf("extend returned block %d, want %d", got, block.Block)
+	}
+	return page, false, nil
+}
+
+// redoHeapPageAddItemOverwrite places `raw` at the 1-based offset `offnum` on a
+// heap page, mirroring the call every heap redo routine makes:
+// PageAddItemExtended(page, item, size, offnum, PAI_OVERWRITE | PAI_IS_HEAP)
+// (postgres/src/backend/storage/page/bufpage.c:193-330).
+//
+// M0131-S21c. Two distinct cases hide behind that one upstream call, and goopg
+// needs two different primitives for them:
+//
+//   - offnum is past the end of the line-pointer array (the common case): the
+//     pointer is appended. PageInsertItemRawAt does this, and its [1, count+1]
+//     range check is upstream's "invalid max offset number" PANIC.
+//   - offnum is INSIDE the array: upstream takes the PAI_OVERWRITE branch and
+//     fills the existing line pointer IN PLACE, without shifting anything. A
+//     real-PG crash tail reaches this whenever the page was pruned before the
+//     insert (a COPY after a VACUUM leaves LP_UNUSED holes), so it is ordinary
+//     traffic, not an exotic shape. PageInsertItemRawAt is the WRONG primitive
+//     here — it would shift the array right and displace whatever occupies the
+//     following slots — so the in-place pair PageReplaceItemRaw (which allocates
+//     fresh tuple bytes at pd_upper for a zero-length pointer, leaving pd_lower
+//     alone) + PageSetLinePointerNormal (PageReplaceItemRaw deliberately
+//     preserves the old flags) is used instead.
+//
+// Upstream refuses the in-place branch when the target is `ItemIdIsUsed() ||
+// ItemIdHasStorage()` — WARNING "will not overwrite a used ItemId", returning
+// InvalidOffsetNumber, which every heap redo caller turns into a PANIC
+// ("failed to add tuple"). goopg keeps that as a hard refusal too: a used slot
+// means the page on disk disagrees with the record, and writing anyway is
+// silent corruption that surfaces much later as a wrong ctid.
+func redoHeapPageAddItemOverwrite(page storage.Page, offnum uint16, raw []byte) error {
+	count, err := storage.PageLinePointerCount(page)
+	if err != nil {
+		return fmt.Errorf("read line-pointer count: %w", err)
+	}
+	if int(offnum) > count {
+		got, err := storage.PageInsertItemRawAt(page, offnum, raw)
+		if err != nil {
+			return err
+		}
+		if got != offnum {
+			return fmt.Errorf("slot drift: got %d, want %d", got, offnum)
+		}
+		return nil
+	}
+	id, err := storage.PageGetItemID(page, offnum)
+	if err != nil {
+		return fmt.Errorf("read line pointer %d: %w", offnum, err)
+	}
+	if id.Flags != storage.ItemIDUnused || id.Length != 0 {
+		return fmt.Errorf("%w: will not overwrite used line pointer %d (flags=%d len=%d, page has %d) — the page disagrees with the record",
+			ErrUnsupportedRecord, offnum, id.Flags, id.Length, count)
+	}
+	if err := storage.PageReplaceItemRaw(page, offnum, raw); err != nil {
+		return fmt.Errorf("reuse line pointer %d: %w", offnum, err)
+	}
+	return storage.PageSetLinePointerNormal(page, offnum)
+}
+
+// replayDecodedXLogHeapMultiInsert applies a real-PG XLOG_HEAP2_MULTI_INSERT,
+// mirroring heap_xlog_multi_insert (heapam_xlog.c:600-731). This is every COPY:
+// heap_multi_insert batches as many tuples as fit on one page into a single
+// record, so a PG crash tail taken during a bulk load is almost entirely made
+// of these.
+//
+// M0131-S21a-2. Wire format: main data is xl_heap_multi_insert
+// {uint8 flags; uint16 ntuples; OffsetNumber offsets[ntuples]} — and the
+// offsets array is present ONLY when XLOG_HEAP_INIT_PAGE is clear. With the bit
+// set the page is reinitialised and the tuples land at FirstOffsetNumber+i, so
+// upstream saves the array's bytes (heapam.c:2607-2611 sets the bit exactly
+// when the page was freshly extended, which is why the RM_HEAP2 arm must mask
+// with XLOG_HEAP_OPMASK — see the mask note there).
+//
+// Block 0's data run is a sequence of SHORTALIGNed xl_multi_insert_tuple
+// headers, each immediately followed by its `datalen` tuple bytes (everything
+// past the fixed 23-byte heap-tuple header: null bitmap, alignment padding and
+// column data, verbatim).
+func replayDecodedXLogHeapMultiInsert(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
+	block, ok := xlogBlockRefByID(xlog, 0)
+	if !ok {
+		return fmt.Errorf("wal: xlog heap-multi-insert missing block 0")
+	}
+	if block.Rel.Fork != storage.MainFork {
+		return fmt.Errorf("wal: xlog heap-multi-insert fork=%d, want main fork", block.Rel.Fork)
+	}
+	if block.HasImage && block.ImageApply {
+		return restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN))
+	}
+	isInit := xlog.Header.Info&xlogHeapInit != 0
+	flags, offsets, err := decodeXLogHeapMultiInsertMainData(xlog.MainData, isInit)
+	if err != nil {
+		return err
+	}
+	tuples, err := decodeXLogMultiInsertTuples(block.Data, len(offsets))
+	if err != nil {
+		return err
+	}
+	page, skip, err := redoHeapPageForBlock(mgr, block, storage.LSN(r.EndLSN), isInit)
+	if err != nil {
+		return fmt.Errorf("wal: xlog heap-multi-insert: %w", err)
+	}
+	if skip {
+		return nil
+	}
+	for i, offnum := range offsets {
+		tupleRaw := buildTupleFromXLogHeapHeader(tuples[i].header, tuples[i].data,
+			storage.TransactionID(xlog.Header.XID), block.Block, offnum)
+		if err := redoHeapPageAddItemOverwrite(page, offnum, tupleRaw); err != nil {
+			return fmt.Errorf("wal: xlog heap-multi-insert apply entry %d (block %d): %w", i, block.Block, err)
+		}
+	}
+	// The visibility-map bits upstream mirrors onto the heap page itself. The
+	// VM fork update is XLOG_HEAP2_VISIBLE's job (still S21a-2); these two are
+	// the page-header half heap_xlog_multi_insert does inline.
+	hdr := storage.MustHeader(page)
+	if flags&xlogHeapInsertAllVisibleCleared != 0 {
+		hdr.SetFlags(hdr.Flags() &^ storage.PDAllVisible)
+	} else if flags&xlogHeapInsertAllFrozenSet != 0 {
+		hdr.SetFlags(hdr.Flags() | storage.PDAllVisible)
+	}
+	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
+	return mgr.WriteBlock(block.Rel, block.Block, page)
+}
+
+// decodeXLogHeapMultiInsertMainData parses xl_heap_multi_insert. When isInit is
+// set the offsets array is absent and the tuples land at FirstOffsetNumber+i;
+// the returned slice is synthesised for that case so the caller has one shape.
+func decodeXLogHeapMultiInsertMainData(mainData []byte, isInit bool) (flags uint8, offsets []uint16, err error) {
+	if len(mainData) < sizeOfXLogHeapMultiInsertData {
+		return 0, nil, fmt.Errorf("wal: invalid xlog heap-multi-insert main-data len %d (want >= %d)",
+			len(mainData), sizeOfXLogHeapMultiInsertData)
+	}
+	flags = mainData[0]
+	ntuples := int(binary.LittleEndian.Uint16(mainData[2:4]))
+	if ntuples == 0 {
+		return 0, nil, fmt.Errorf("wal: xlog heap-multi-insert carries zero tuples")
+	}
+	offsets = make([]uint16, ntuples)
+	if isInit {
+		// FirstOffsetNumber is 1 in PG and goopg alike (line pointers are
+		// 1-based); heap_xlog_multi_insert lands tuple i at
+		// FirstOffsetNumber + i on a reinitialised page.
+		for i := range offsets {
+			offsets[i] = 1 + uint16(i)
+		}
+		return flags, offsets, nil
+	}
+	want := sizeOfXLogHeapMultiInsertData + 2*ntuples
+	if len(mainData) < want {
+		return 0, nil, fmt.Errorf("wal: xlog heap-multi-insert main-data len %d < %d for %d offsets",
+			len(mainData), want, ntuples)
+	}
+	for i := range offsets {
+		offsets[i] = binary.LittleEndian.Uint16(mainData[sizeOfXLogHeapMultiInsertData+2*i:])
+	}
+	return flags, offsets, nil
+}
+
+// xlogMultiInsertTuple is one (xl_multi_insert_tuple header, tuple data) pair
+// carved out of a multi-insert record's block-0 data run. header is the 5-byte
+// xl_heap_header-shaped slice {t_infomask2, t_infomask, t_hoff} the shared
+// tuple builder consumes.
+type xlogMultiInsertTuple struct {
+	header []byte
+	data   []byte
+}
+
+// decodeXLogMultiInsertTuples splits block 0's data run into ntuples entries.
+// Upstream walks it with `xlhdr = (xl_multi_insert_tuple *) SHORTALIGN(tupdata)`
+// and PANICs at the end if the walk did not consume the run exactly
+// ("total tuple length mismatch") — the same exactness is enforced here, since a
+// short walk means the record was mis-parsed and the extra bytes are a tuple
+// that would be silently dropped.
+func decodeXLogMultiInsertTuples(data []byte, ntuples int) ([]xlogMultiInsertTuple, error) {
+	out := make([]xlogMultiInsertTuple, 0, ntuples)
+	off := 0
+	for i := 0; i < ntuples; i++ {
+		off += off & 1 // SHORTALIGN
+		if off+sizeOfXLogMultiInsertTuple > len(data) {
+			return nil, fmt.Errorf("wal: xlog heap-multi-insert block data truncated at tuple %d (off %d of %d)", i, off, len(data))
+		}
+		hdr := data[off : off+sizeOfXLogMultiInsertTuple]
+		datalen := int(binary.LittleEndian.Uint16(hdr[0:2]))
+		off += sizeOfXLogMultiInsertTuple
+		if off+datalen > len(data) {
+			return nil, fmt.Errorf("wal: xlog heap-multi-insert tuple %d datalen %d overruns block data (off %d of %d)", i, datalen, off, len(data))
+		}
+		out = append(out, xlogMultiInsertTuple{
+			// hdr[2:7] is {t_infomask2, t_infomask, t_hoff} — the same three
+			// fields, in the same order, as xl_heap_header.
+			header: hdr[2:sizeOfXLogMultiInsertTuple],
+			data:   data[off : off+datalen],
+		})
+		off += datalen
+	}
+	if off != len(data) {
+		return nil, fmt.Errorf("wal: xlog heap-multi-insert total tuple length mismatch: consumed %d of %d block-data bytes", off, len(data))
+	}
+	return out, nil
 }
 
 func xlogBlockRefByID(xlog *XLogDecodedRecord, id byte) (XLogBlockRef, bool) {
@@ -2731,17 +3674,30 @@ func decodeXLogHeapInsertTuple(block XLogBlockRef, xid storage.TransactionID, of
 	// verbatim. Verbatim concatenation preserves the null bitmap; the previous
 	// prefix-stripping reconstruction only handled bitmap-less tuples (and
 	// rejected a non-zero bitmap outright).
-	dataPortion := block.Data[sizeOfXLogHeapHeaderData:]
-	out := make([]byte, storage.SizeOfHeapTupleHeaderData+len(dataPortion))
+	return buildTupleFromXLogHeapHeader(block.Data[:sizeOfXLogHeapHeaderData],
+		block.Data[sizeOfXLogHeapHeaderData:], xid, block.Block, offnum), nil
+}
+
+// buildTupleFromXLogHeapHeader rebuilds a marshaled heap tuple from the
+// (t_infomask2, t_infomask, t_hoff) triple a WAL record carries plus the tuple
+// bytes past the fixed 23-byte header. Shared by the xl_heap_insert and
+// xl_heap_multi_insert redo paths (M0131-S21a-2), whose per-tuple headers
+// differ only in the multi-insert's leading `datalen` field — upstream's
+// heap_xlog_insert and heap_xlog_multi_insert rebuild the tuple identically
+// from that point on.
+//
+// header must be exactly the 5 bytes {t_infomask2[2], t_infomask[2], t_hoff[1]}.
+func buildTupleFromXLogHeapHeader(header, data []byte, xid storage.TransactionID, blk storage.BlockNumber, offnum uint16) []byte {
+	out := make([]byte, storage.SizeOfHeapTupleHeaderData+len(data))
 	binary.LittleEndian.PutUint32(out[0:4], uint32(xid))                           // t_xmin
 	binary.LittleEndian.PutUint32(out[4:8], uint32(storage.InvalidTransactionID))  // t_xmax
-	binary.LittleEndian.PutUint32(out[8:12], uint32(storage.InvalidTransactionID)) // t_field3 (xvac)
-	binary.LittleEndian.PutUint32(out[12:16], uint32(block.Block))                 // t_ctid.block (self)
+	binary.LittleEndian.PutUint32(out[8:12], uint32(storage.InvalidTransactionID)) // t_field3 (xvac / cmin)
+	binary.LittleEndian.PutUint32(out[12:16], uint32(blk))                         // t_ctid.block (self)
 	binary.LittleEndian.PutUint16(out[16:18], offnum)                              // t_ctid.offset (self)
-	copy(out[18:22], block.Data[0:4])                                              // t_infomask2 + t_infomask
-	out[22] = block.Data[4]                                                        // t_hoff
-	copy(out[storage.SizeOfHeapTupleHeaderData:], dataPortion)
-	return out, nil
+	copy(out[18:22], header[0:4])                                                  // t_infomask2 + t_infomask
+	out[22] = header[4]                                                            // t_hoff
+	copy(out[storage.SizeOfHeapTupleHeaderData:], data)
+	return out
 }
 
 // decodeXLogHeapDeleteMainData parses the fixed xl_heap_delete struct from a
@@ -2794,28 +3750,478 @@ func replayDecodedXLogHeapDelete(mgr *storage.Manager, r Record, xlog *XLogDecod
 	if err != nil {
 		return err
 	}
-	nblocks, err := mgr.NBlocks(block.Rel)
+	// M0131-S21f: RBM_NORMAL, like upstream's heap_xlog_delete. An absent or
+	// all-zero page is BLK_NOTFOUND and the record does nothing; it used to be
+	// a hard error that refused the whole start.
+	page, skip, err := redoExistingHeapPageForBlock(mgr, block, storage.LSN(r.EndLSN))
 	if err != nil {
-		return err
+		return fmt.Errorf("wal: xlog heap-delete: %w", err)
 	}
-	if block.Block >= nblocks {
-		return fmt.Errorf("wal: xlog heap-delete: block %d does not exist (nblocks=%d)", block.Block, nblocks)
-	}
-	page := make(storage.Page, storage.BlockSize)
-	if err := mgr.ReadBlock(block.Rel, block.Block, page); err != nil {
-		return err
-	}
-	if storage.IsNew(page) {
-		return fmt.Errorf("wal: xlog heap-delete: block %d is uninitialised", block.Block)
-	}
-	if storage.MustHeader(page).LSN() >= storage.LSN(r.EndLSN) {
-		return nil // already applied
+	if skip {
+		return nil
 	}
 	if err := storage.PageSetHeapTupleXmax(page, offnum, storage.TransactionID(xmax)); err != nil {
 		return fmt.Errorf("wal: xlog heap-delete apply: %w", err)
 	}
 	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
 	return mgr.WriteBlock(block.Rel, block.Block, page)
+}
+
+// sizeOfXLogHeapLockData is PG's SizeOfHeapLock: xmax(4) + offnum(2) +
+// infobits_set(1) + flags(1) (heapam_xlog.h:396-404).
+const sizeOfXLogHeapLockData = 8
+
+// sizeOfXLogHeapConfirmData is PG's SizeOfHeapConfirm: offnum(2).
+const sizeOfXLogHeapConfirmData = 2
+
+// decodeXLogHeapLockMainData parses the fixed xl_heap_lock struct from a
+// PG-format heap-lock record's main data.
+func decodeXLogHeapLockMainData(mainData []byte) (xmax uint32, offnum uint16, infobits, flags uint8, err error) {
+	if len(mainData) < sizeOfXLogHeapLockData {
+		return 0, 0, 0, 0, fmt.Errorf("wal: invalid xlog heap-lock main-data len %d (want >= %d)", len(mainData), sizeOfXLogHeapLockData)
+	}
+	xmax = binary.LittleEndian.Uint32(mainData[0:4])
+	offnum = binary.LittleEndian.Uint16(mainData[4:6])
+	infobits = mainData[6]
+	flags = mainData[7]
+	return xmax, offnum, infobits, flags, nil
+}
+
+// xlogHeapLockInfomaskBits is upstream's fix_infomask_from_infobits
+// (heapam_xlog.c): translate xl_heap_lock's infobits_set wire byte into the
+// t_infomask / t_infomask2 bits redo has to restore. Note HEAP_XMAX_SHR_LOCK is
+// deliberately absent — upstream says so in a comment; a share lock arrives as
+// the two component bits.
+func xlogHeapLockInfomaskBits(infobits uint8) (infomask, infomask2 uint16) {
+	if infobits&xlhlXmaxIsMulti != 0 {
+		infomask |= storage.HeapXmaxIsMulti
+	}
+	if infobits&xlhlXmaxLockOnly != 0 {
+		infomask |= storage.HeapXmaxLockOnly
+	}
+	if infobits&xlhlXmaxExclLock != 0 {
+		infomask |= storage.HeapXmaxExclLock
+	}
+	if infobits&xlhlXmaxKeyShrLock != 0 {
+		infomask |= storage.HeapXmaxKeyShrLock
+	}
+	if infobits&xlhlKeysUpdated != 0 {
+		infomask2 |= storage.HeapKeysUpdated
+	}
+	return infomask, infomask2
+}
+
+// redoExistingHeapPageForBlock is redoHeapPageForBlock's RBM_NORMAL sibling:
+// the page must ALREADY exist and be initialised, and when it does not the
+// record is skipped rather than applied to a zero-extended page.
+//
+// M0131-S21a-2. That asymmetry is upstream's, not an approximation. Insert-like
+// records reference a block whose extension was never WAL-logged, so
+// XLogReadBufferExtended is called in an RBM_ZERO/WILL_INIT mode and extends.
+// A record that only STAMPS an existing tuple (lock, confirm) is read with
+// RBM_NORMAL, where a missing or all-zero page returns InvalidBuffer =
+// BLK_NOTFOUND and the redo routine does nothing (xlogutils.c:500-540): the
+// only way the page can be absent is that the relation is dropped or truncated
+// later in the same replay stream, in which case the mutation is moot.
+//
+// Deviation, ledger row: upstream ALSO records the reference in its
+// invalid-page hash and PANICs at the end of recovery if no later record
+// dropped or truncated that relation. goopg keeps no such table, so a genuinely
+// missing page is silently skipped instead of failing the start. It cannot
+// corrupt anything on these two opcodes — a lost row-lock stamp or speculative
+// confirmation is bookkeeping about a transaction that the crash ended anyway —
+// but it does hide a real inconsistency.
+//
+// M0131-S21f widened the caller set from those two opcodes (lock, confirm) to
+// every PG-format record that edits an existing page: heap delete, heap
+// prune/freeze, and — via replayExistingXLogBlock — the btree edit-shaped
+// records. They had each hand-rolled the same NBlocks + ReadBlock sequence but
+// ended it in a hard error, so a stream whose later records drop or truncate
+// the relation refused the whole start. The skip is now shared, and so is the
+// deviation note above: it applies to all of them, and it is wider than the
+// original two, because losing a prune or a btree deletion on a page that DOES
+// survive would be a real divergence. Upstream catches exactly that with the
+// invalid-page table; goopg still cannot.
+//
+// Returns skip=true when there is nothing to do (page absent, uninitialised, or
+// already at/past this record's LSN).
+func redoExistingHeapPageForBlock(mgr *storage.Manager, block XLogBlockRef, endLSN storage.LSN) (storage.Page, bool, error) {
+	nblocks, err := mgr.NBlocks(block.Rel)
+	if err != nil {
+		return nil, false, err
+	}
+	if block.Block >= nblocks {
+		return nil, true, nil
+	}
+	page := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(block.Rel, block.Block, page); err != nil {
+		return nil, false, err
+	}
+	if storage.IsNew(page) {
+		return nil, true, nil
+	}
+	if storage.MustHeader(page).LSN() >= endLSN {
+		return nil, true, nil
+	}
+	return page, false, nil
+}
+
+// replayDecodedXLogHeapLock applies a real-PG XLOG_HEAP_LOCK, mirroring
+// heap_xlog_lock (heapam_xlog.c). M0131-S21a-2.
+//
+// This is one of the most common records in an OLTP tail: every SELECT ... FOR
+// UPDATE/SHARE, every foreign-key row check, and the tuple lock an UPDATE takes
+// on a row it is about to rewrite all emit one. The mutation is confined to a
+// single tuple header — xmax, the xmax-classification infomask bits, cmax, and
+// (for a locked-only result) t_ctid and HEAP_HOT_UPDATED — which is why the
+// work lives in storage.PageApplyHeapLockRedo, the redo sibling of the runtime
+// PageSetHeapTupleLockOnly.
+//
+// Idempotent via pd_lsn. A record carrying a full-page image restores it
+// instead.
+func replayDecodedXLogHeapLock(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
+	block, ok := xlogBlockRefByID(xlog, 0)
+	if !ok {
+		return fmt.Errorf("wal: xlog heap-lock missing block 0")
+	}
+	if block.HasImage && block.ImageApply {
+		return restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN))
+	}
+	xmax, offnum, infobits, flags, err := decodeXLogHeapLockMainData(xlog.MainData)
+	if err != nil {
+		return err
+	}
+	// XLH_LOCK_ALL_FROZEN_CLEARED, the flags byte's only bit: the locker had to
+	// clear the block's visibility-map ALL_FROZEN bit, because a frozen page may
+	// not carry a live locker. Upstream does this BEFORE (and independently of)
+	// the heap page redo, with the comment "the visibility map may need to be
+	// fixed even if the heap page is already up-to-date" (heapam_xlog.c
+	// heap_xlog_lock) — so it deliberately runs even when the pd_lsn interlock
+	// skips the tuple stamp below. M0131-S21a-2 part 3 discharges the part-2
+	// deferral of this bit.
+	if flags&xlhLockAllFrozenCleared != 0 {
+		if err := redoClearVMBitsForHeapBlock(mgr, block.Rel, block.Block, storage.VMAllFrozen); err != nil {
+			return fmt.Errorf("wal: xlog heap-lock vm: %w", err)
+		}
+	}
+	page, skip, err := redoExistingHeapPageForBlock(mgr, block, storage.LSN(r.EndLSN))
+	if err != nil {
+		return fmt.Errorf("wal: xlog heap-lock: %w", err)
+	}
+	if skip {
+		return nil
+	}
+	infomaskBits, infomask2Bits := xlogHeapLockInfomaskBits(infobits)
+	if err := storage.PageApplyHeapLockRedo(page, offnum, storage.TransactionID(xmax), infomaskBits, infomask2Bits, block.Block); err != nil {
+		return fmt.Errorf("wal: xlog heap-lock apply: %w", err)
+	}
+	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
+	return mgr.WriteBlock(block.Rel, block.Block, page)
+}
+
+// replayDecodedXLogHeapConfirm applies a real-PG XLOG_HEAP_CONFIRM, mirroring
+// heap_xlog_confirm (heapam_xlog.c). M0131-S21a-2.
+//
+// It is the second record of every INSERT ... ON CONFLICT. The speculative
+// insert wrote the tuple with a *speculative token* in t_ctid rather than a
+// self-pointer; confirming it means overwriting that token with the tuple's own
+// (block, offset), which is exactly goopg's own fresh-insert convention. Redo
+// therefore has to run: replaying only the insert would leave a tuple whose
+// t_ctid points at a garbage location, and a chain follower would chase it.
+func replayDecodedXLogHeapConfirm(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
+	block, ok := xlogBlockRefByID(xlog, 0)
+	if !ok {
+		return fmt.Errorf("wal: xlog heap-confirm missing block 0")
+	}
+	if block.HasImage && block.ImageApply {
+		return restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN))
+	}
+	if len(xlog.MainData) < sizeOfXLogHeapConfirmData {
+		return fmt.Errorf("wal: invalid xlog heap-confirm main-data len %d (want >= %d)", len(xlog.MainData), sizeOfXLogHeapConfirmData)
+	}
+	offnum := binary.LittleEndian.Uint16(xlog.MainData[0:2])
+	page, skip, err := redoExistingHeapPageForBlock(mgr, block, storage.LSN(r.EndLSN))
+	if err != nil {
+		return fmt.Errorf("wal: xlog heap-confirm: %w", err)
+	}
+	if skip {
+		return nil
+	}
+	if err := storage.PageSetHeapTupleCtid(page, offnum, storage.ItemPointer{Block: block.Block, Offset: offnum}); err != nil {
+		return fmt.Errorf("wal: xlog heap-confirm apply: %w", err)
+	}
+	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
+	return mgr.WriteBlock(block.Rel, block.Block, page)
+}
+
+// replayDecodedXLogHeap2LockUpdated applies a real-PG XLOG_HEAP2_LOCK_UPDATED,
+// mirroring heap_xlog_lock_updated (heapam_xlog.c). M0131-S21a-2 part 4.
+//
+// It is XLOG_HEAP_LOCK's near-sibling on RM_HEAP2: emitted by
+// heap_lock_updated_tuple_rec when a tuple-lock request discovers the row it
+// locked was concurrently updated and re-locks the newest visible version in
+// the update chain instead. The wire struct (xl_heap_lock_updated) is
+// byte-identical to xl_heap_lock's — same decode, same infobits translation —
+// so this reuses decodeXLogHeapLockMainData and xlogHeapLockInfomaskBits; only
+// the tuple mutation differs (storage.PageApplyHeapLockUpdatedRedo omits the
+// locked-only t_ctid/HOT_UPDATED fixup and the cmax stamp — see its doc
+// comment for why).
+func replayDecodedXLogHeap2LockUpdated(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
+	block, ok := xlogBlockRefByID(xlog, 0)
+	if !ok {
+		return fmt.Errorf("wal: xlog heap2-lock-updated missing block 0")
+	}
+	if block.HasImage && block.ImageApply {
+		return restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN))
+	}
+	xmax, offnum, infobits, flags, err := decodeXLogHeapLockMainData(xlog.MainData)
+	if err != nil {
+		return err
+	}
+	// XLH_LOCK_ALL_FROZEN_CLEARED runs BEFORE and independently of the heap
+	// page redo, same as XLOG_HEAP_LOCK (part 3's rationale applies verbatim:
+	// "the visibility map may need to be fixed even if the heap page is
+	// already up-to-date", heapam_xlog.c heap_xlog_lock_updated).
+	if flags&xlhLockAllFrozenCleared != 0 {
+		if err := redoClearVMBitsForHeapBlock(mgr, block.Rel, block.Block, storage.VMAllFrozen); err != nil {
+			return fmt.Errorf("wal: xlog heap2-lock-updated vm: %w", err)
+		}
+	}
+	page, skip, err := redoExistingHeapPageForBlock(mgr, block, storage.LSN(r.EndLSN))
+	if err != nil {
+		return fmt.Errorf("wal: xlog heap2-lock-updated: %w", err)
+	}
+	if skip {
+		return nil
+	}
+	infomaskBits, infomask2Bits := xlogHeapLockInfomaskBits(infobits)
+	if err := storage.PageApplyHeapLockUpdatedRedo(page, offnum, storage.TransactionID(xmax), infomaskBits, infomask2Bits); err != nil {
+		return fmt.Errorf("wal: xlog heap2-lock-updated apply: %w", err)
+	}
+	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
+	return mgr.WriteBlock(block.Rel, block.Block, page)
+}
+
+// sizeOfXLogHeapVisibleData is PG's SizeOfHeapVisible:
+// snapshotConflictHorizon(4) + flags(1) (heapam_xlog.h xl_heap_visible).
+const sizeOfXLogHeapVisibleData = 5
+
+// decodeXLogHeapVisibleMainData parses the fixed xl_heap_visible struct from a
+// PG-format XLOG_HEAP2_VISIBLE record's main data.
+func decodeXLogHeapVisibleMainData(mainData []byte) (snapshotConflictHorizon uint32, flags uint8, err error) {
+	if len(mainData) < sizeOfXLogHeapVisibleData {
+		return 0, 0, fmt.Errorf("wal: invalid xlog heap-visible main-data len %d (want >= %d)", len(mainData), sizeOfXLogHeapVisibleData)
+	}
+	return binary.LittleEndian.Uint32(mainData[0:4]), mainData[4], nil
+}
+
+// replayDecodedXLogHeap2Visible applies a real-PG XLOG_HEAP2_VISIBLE, mirroring
+// heap_xlog_visible (heapam_xlog.c). M0131-S21a-2 part 3.
+//
+// Every VACUUM emits one per page it marks all-visible/all-frozen, and so does
+// an INSERT that freezes a page it filled itself, which makes this the first
+// record a bulk-loaded PG cluster's tail hits after the COPY records. It is
+// also the FIRST record in goopg's redo whose mutation lands on a fork other
+// than `main`: block 0 is the *visibility-map* buffer (fork 2, vm block number),
+// block 1 is the heap block whose bits are being set.
+//
+// Both halves must run and they are independent:
+//
+//   - **Heap page (block 1).** All redo does is set PD_ALL_VISIBLE. Upstream
+//     reads it with XLogReadBufferForRedo, i.e. RBM_NORMAL — a heap file
+//     dropped or truncated later in the stream is simply absent, "we don't need
+//     to update the page, but we'd better still update the visibility map".
+//     That comment is why the block-1 skip must not skip block 0.
+//   - **VM page (block 0).** Read with RBM_ZERO_ON_ERROR: a vm fork that does
+//     not reach this block yet is not an error, it is initialised on the spot.
+//     This is the one place recovery *creates* vm-fork content, and it is what
+//     makes the bits survive into the running server: crash recovery replays
+//     before Runtime.VM is populated from the forks (internal/initdb/open.go),
+//     so a fork page written here is loaded by VMLoadForks a moment later.
+//
+// Upstream additionally (a) resolves hot-standby snapshot conflicts against
+// xlrec->snapshotConflictHorizon and (b) feeds the heap page's free space into
+// the FSM so a promoted standby does not inherit a stale map. goopg does
+// neither — both are deferral-ledger rows, not silent omissions; neither can
+// corrupt the map, and (a) is unreachable while goopg has no hot-standby
+// query traffic during replay.
+func replayDecodedXLogHeap2Visible(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
+	vmRef, ok := xlogBlockRefByID(xlog, 0)
+	if !ok {
+		return fmt.Errorf("wal: xlog heap-visible missing block 0 (visibility map)")
+	}
+	heapRef, ok := xlogBlockRefByID(xlog, 1)
+	if !ok {
+		return fmt.Errorf("wal: xlog heap-visible missing block 1 (heap)")
+	}
+	_, flags, err := decodeXLogHeapVisibleMainData(xlog.MainData)
+	if err != nil {
+		return err
+	}
+	// Upstream asserts the record carries nothing outside
+	// VISIBILITYMAP_XLOG_VALID_BITS; goopg refuses instead of asserting,
+	// because an unknown bit means the record was written by a PG whose map
+	// semantics goopg does not know.
+	if flags&^(storage.VMValidBits|xlogVisibilitymapXLogCatalogRel) != 0 {
+		return fmt.Errorf("%w: xlog heap-visible flags 0x%02x carry unknown bits", ErrUnsupportedRecord, flags)
+	}
+
+	// Half 1: the heap page's PD_ALL_VISIBLE.
+	if heapRef.HasImage && heapRef.ImageApply {
+		if err := restoreDecodedXLogBlockImage(mgr, heapRef, storage.LSN(r.EndLSN)); err != nil {
+			return err
+		}
+	} else {
+		page, skip, err := redoExistingHeapPageForBlock(mgr, heapRef, storage.LSN(r.EndLSN))
+		if err != nil {
+			return fmt.Errorf("wal: xlog heap-visible heap page: %w", err)
+		}
+		if !skip {
+			hdr := storage.MustHeader(page)
+			hdr.SetFlags(hdr.Flags() | storage.PDAllVisible)
+			// Upstream stamps the heap page's LSN only when
+			// XLogHintBitIsNeeded() (checksums or wal_log_hints), since without
+			// those the record carries no FPI for the heap page and a bumped
+			// LSN would lie about what is protected. goopg's redo stamps it
+			// unconditionally: the pd_lsn guard in redoExistingHeapPageForBlock
+			// is what makes every goopg heap redo idempotent, and the stamp is
+			// the conservative direction — it can only cause a later record to
+			// skip a page whose content is already at this LSN.
+			hdr.SetLSN(storage.LSN(r.EndLSN))
+			if err := mgr.WriteBlock(heapRef.Rel, heapRef.Block, page); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Half 2: the visibility-map bits. Runs even when the heap half was
+	// skipped — see the function comment.
+	if vmRef.HasImage && vmRef.ImageApply {
+		return restoreDecodedXLogBlockImage(mgr, vmRef, storage.LSN(r.EndLSN))
+	}
+	vmPage, skip, err := redoVMPageForBlock(mgr, vmRef, storage.LSN(r.EndLSN))
+	if err != nil {
+		return fmt.Errorf("wal: xlog heap-visible vm page: %w", err)
+	}
+	if skip {
+		return nil
+	}
+	if storage.VMBlockForHeapBlock(heapRef.Block) != vmRef.Block {
+		return fmt.Errorf("wal: xlog heap-visible vm block %d does not cover heap block %d (want vm block %d)",
+			vmRef.Block, heapRef.Block, storage.VMBlockForHeapBlock(heapRef.Block))
+	}
+	changed, err := storage.VMPageSetBits(vmPage, heapRef.Block, flags&storage.VMValidBits)
+	if err != nil {
+		return fmt.Errorf("wal: xlog heap-visible vm apply: %w", err)
+	}
+	if !changed {
+		return nil
+	}
+	storage.MustHeader(vmPage).SetLSN(storage.LSN(r.EndLSN))
+	return mgr.WriteBlock(vmRef.Rel, vmRef.Block, vmPage)
+}
+
+// redoVMPageForBlock is the visibility-map counterpart of
+// redoHeapPageForBlock/redoExistingHeapPageForBlock: upstream reads the vm
+// buffer with RBM_ZERO_ON_ERROR and PageInits it when it comes back new
+// (heap_xlog_visible), so a vm fork shorter than the referenced block is not a
+// replay gap — it is the normal state of a fork whose extension was never
+// WAL-logged. Intervening pages are zero-extended and then initialised, the
+// same shape redoHeapPageForBlock uses, because an all-zero vm page and an
+// initialised one mean the same thing (no bits set) and PG's vm_extend writes
+// initialised pages.
+//
+// Returns skip=true when the page is already at or past this record's LSN.
+func redoVMPageForBlock(mgr *storage.Manager, block XLogBlockRef, endLSN storage.LSN) (storage.Page, bool, error) {
+	nblocks, err := mgr.NBlocks(block.Rel)
+	if err != nil {
+		return nil, false, err
+	}
+	page := make(storage.Page, storage.BlockSize)
+	if block.Block < nblocks {
+		if err := mgr.ReadBlock(block.Rel, block.Block, page); err != nil {
+			return nil, false, err
+		}
+		if storage.IsNew(page) || block.WillInit {
+			if err := storage.InitPage(page); err != nil {
+				return nil, false, err
+			}
+			return page, false, nil
+		}
+		if storage.MustHeader(page).LSN() >= endLSN {
+			return nil, true, nil
+		}
+		return page, false, nil
+	}
+	zero := make(storage.Page, storage.BlockSize)
+	if err := storage.InitPage(zero); err != nil {
+		return nil, false, err
+	}
+	for blk := nblocks; blk < block.Block; blk++ {
+		got, err := mgr.Extend(block.Rel, zero)
+		if err != nil {
+			return nil, false, err
+		}
+		if got != blk {
+			return nil, false, fmt.Errorf("vm zero-extend returned block %d, want %d", got, blk)
+		}
+	}
+	if err := storage.InitPage(page); err != nil {
+		return nil, false, err
+	}
+	got, err := mgr.Extend(block.Rel, page)
+	if err != nil {
+		return nil, false, err
+	}
+	if got != block.Block {
+		return nil, false, fmt.Errorf("vm extend returned block %d, want %d", got, block.Block)
+	}
+	return page, false, nil
+}
+
+// redoClearVMBitsForHeapBlock is upstream's visibilitymap_pin +
+// visibilitymap_clear pair as redo uses it (heap_xlog_lock, and every other
+// record that reports having cleared a bit): heapRel names the MAIN fork, the
+// bits live in that relation's visibility-map fork at
+// HEAPBLK_TO_MAPBLOCK(heapBlk).
+//
+// A vm fork that does not reach the covering block is left alone rather than
+// extended. Upstream's visibilitymap_pin does extend it, but only because it
+// must hand visibilitymap_clear a valid buffer; the bits it would then clear
+// are already zero, so the sole difference is whether an all-zero vm page
+// materialises on disk — and materialising one for a *clear* would invent map
+// content that the primary may never have had.
+func redoClearVMBitsForHeapBlock(mgr *storage.Manager, heapRel storage.RelFileNode, heapBlk storage.BlockNumber, bits uint8) error {
+	vmRel := heapRel
+	vmRel.Fork = storage.VisibilityMapFork
+	vmBlk := storage.VMBlockForHeapBlock(heapBlk)
+	nblocks, err := mgr.NBlocks(vmRel)
+	if err != nil {
+		return err
+	}
+	if vmBlk >= nblocks {
+		return nil
+	}
+	page := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(vmRel, vmBlk, page); err != nil {
+		return err
+	}
+	if storage.IsNew(page) {
+		return nil
+	}
+	// No pd_lsn interlock here, deliberately: upstream's visibilitymap_clear
+	// neither checks nor stamps the vm page's LSN (visibilitymap.c). Clearing
+	// is the conservative direction — a cleared bit only costs an extra heap
+	// fetch — so re-running it after the page has moved past this LSN cannot
+	// produce a wrong answer, whereas skipping it can.
+	changed, err := storage.VMPageClearBits(page, heapBlk, bits)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return nil
+	}
+	return mgr.WriteBlock(vmRel, vmBlk, page)
 }
 
 // decodeXLogHeapUpdateMainData parses the fixed xl_heap_update struct from a
@@ -2847,6 +4253,88 @@ func xlogHeapUpdateCarriesTuple(xlog *XLogDecodedRecord) bool {
 	return ok && len(block.Data) > 0 && !(block.HasImage && block.ImageApply)
 }
 
+// decodeXLogHeapUpdateNewTuple rebuilds an xl_heap_update's new tuple from
+// block 0's data, splicing back the prefix/suffix bytes the record left out.
+//
+// M0131-S21g. Upstream's log_heap_update (postgres/src/backend/access/heap/
+// heapam.c:8730-8800) compares the old and new versions byte-for-byte and, when
+// they share a leading and/or trailing run inside the data area, logs only
+// `uint16 prefixlen` / `uint16 suffixlen` in place of those bytes. heap_xlog_update
+// (heapam_xlog.c:933-1005) reverses it: read the two optional lengths, then the
+// xl_heap_header, then assemble
+//
+//	SizeofHeapTupleHeader | bitmap+padding (t_hoff - 23 bytes, from the record)
+//	                      | prefixlen bytes from the OLD tuple's data area
+//	                      | the rest of the record's tuple bytes
+//	                      | suffixlen bytes from the OLD tuple's tail
+//
+// oldTuple is the marshaled old version read off the page (same page — upstream
+// asserts newblk == oldblk whenever either flag is set) and may be nil when
+// neither flag is present, which is the shape goopg's own emit always produces.
+//
+// This is not a rare corner: a catalog UPDATE that flips one flag byte (say
+// pg_class.relhasindex after CREATE INDEX) compresses down to a handful of
+// bytes, and before this landed such a record replayed as a ~4-byte tuple that
+// the pg_class reload could not decode — a real PG's `CREATE TABLE` survived the
+// crash tail as an index and toast row with no table row behind them.
+func decodeXLogHeapUpdateNewTuple(block XLogBlockRef, flags uint8, oldTuple []byte,
+	xid storage.TransactionID, offnum uint16) ([]byte, error) {
+	rec := block.Data
+	var prefixLen, suffixLen int
+	takeLen := func(what string) (int, error) {
+		if len(rec) < 2 {
+			return 0, fmt.Errorf("wal: xlog heap-update block-data too short for %s length", what)
+		}
+		v := int(binary.LittleEndian.Uint16(rec[:2]))
+		rec = rec[2:]
+		return v, nil
+	}
+	var err error
+	if flags&xlhUpdatePrefixFromOld != 0 {
+		if prefixLen, err = takeLen("prefix"); err != nil {
+			return nil, err
+		}
+	}
+	if flags&xlhUpdateSuffixFromOld != 0 {
+		if suffixLen, err = takeLen("suffix"); err != nil {
+			return nil, err
+		}
+	}
+	if len(rec) < sizeOfXLogHeapHeaderData {
+		return nil, fmt.Errorf("wal: invalid xlog heap-update block-data len %d (want >= %d)",
+			len(rec), sizeOfXLogHeapHeaderData)
+	}
+	header, body := rec[:sizeOfXLogHeapHeaderData], rec[sizeOfXLogHeapHeaderData:]
+	if prefixLen == 0 && suffixLen == 0 {
+		// Uncompressed: byte-for-byte the xl_heap_insert shape.
+		return buildTupleFromXLogHeapHeader(header, body, xid, block.Block, offnum), nil
+	}
+	// hoffExtra is upstream's `xlhdr.t_hoff - SizeofHeapTupleHeader`: the null
+	// bitmap plus its alignment padding, which is logged in full and so must be
+	// re-emitted BEFORE the spliced-in prefix.
+	hoffExtra := int(header[4]) - storage.SizeOfHeapTupleHeaderData
+	if hoffExtra < 0 || hoffExtra > len(body) {
+		return nil, fmt.Errorf("wal: xlog heap-update t_hoff %d out of range (block data %d)", header[4], len(body))
+	}
+	if len(oldTuple) < storage.SizeOfHeapTupleHeaderData {
+		return nil, fmt.Errorf("wal: xlog heap-update prefix/suffix splice needs the old tuple (got %d bytes)", len(oldTuple))
+	}
+	oldHoff := int(oldTuple[22]) // t_hoff of the marshaled old version
+	if oldHoff < storage.SizeOfHeapTupleHeaderData || oldHoff > len(oldTuple) {
+		return nil, fmt.Errorf("wal: xlog heap-update old tuple t_hoff %d out of range (len %d)", oldHoff, len(oldTuple))
+	}
+	if prefixLen < 0 || suffixLen < 0 || prefixLen+suffixLen > len(oldTuple)-oldHoff {
+		return nil, fmt.Errorf("wal: xlog heap-update prefix %d + suffix %d exceed the old tuple's %d data bytes",
+			prefixLen, suffixLen, len(oldTuple)-oldHoff)
+	}
+	out := make([]byte, 0, len(body)+prefixLen+suffixLen)
+	out = append(out, body[:hoffExtra]...)
+	out = append(out, oldTuple[oldHoff:oldHoff+prefixLen]...)
+	out = append(out, body[hoffExtra:]...)
+	out = append(out, oldTuple[len(oldTuple)-suffixLen:]...)
+	return buildTupleFromXLogHeapHeader(header, out, xid, block.Block, offnum), nil
+}
+
 // replayDecodedXLogHeapUpdate applies a tuple-carrying xl_heap_update. hot
 // selects the old-tuple stamp: HOT (same-page chain link + HeapHotUpdated)
 // vs plain non-HOT (B0.2 catalog ALTERs — xmax + forward ctid, possibly
@@ -2859,20 +4347,9 @@ func replayDecodedXLogHeapUpdate(mgr *storage.Manager, r Record, xlog *XLogDecod
 	if block.HasImage && block.ImageApply {
 		return restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN))
 	}
-	oldXmax, oldOffnum, _, _, _, newOffnum, err := decodeXLogHeapUpdateMainData(xlog.MainData)
+	oldXmax, oldOffnum, _, flags, _, newOffnum, err := decodeXLogHeapUpdateMainData(xlog.MainData)
 	if err != nil {
 		return err
-	}
-	newTupleBytes, err := decodeXLogHeapInsertTuple(block, storage.TransactionID(xlog.Header.XID), newOffnum)
-	if err != nil {
-		return err
-	}
-	nblocks, err := mgr.NBlocks(block.Rel)
-	if err != nil {
-		return err
-	}
-	if block.Block >= nblocks {
-		return fmt.Errorf("wal: xlog heap-update: block %d does not exist (nblocks=%d)", block.Block, nblocks)
 	}
 	// Old-tuple page: block 1 when the versions live on different pages
 	// (non-HOT cross-page form), else the shared block 0 page.
@@ -2883,12 +4360,20 @@ func replayDecodedXLogHeapUpdate(mgr *storage.Manager, r Record, xlog *XLogDecod
 		}
 		oldBlock = ob
 	}
-	page := make(storage.Page, storage.BlockSize)
-	if err := mgr.ReadBlock(block.Rel, block.Block, page); err != nil {
+	// M0131-S21d: acquire block 0 the way every other heap redo routine does.
+	// Upstream draws no distinction here — heap_xlog_update takes
+	// XLogInitBufferForRedo + PageInit when XLOG_HEAP_INIT_PAGE is set and
+	// XLogReadBufferForRedo otherwise (heapam_xlog.c:918-931), i.e. the same
+	// XLogReadBufferExtended that zero-extends past the end of the fork
+	// (xlogutils.c:479-539). This path used to read the block itself and refuse
+	// on `block >= nblocks` / `IsNew(page)`, which is why a real-PG crash tail
+	// stopped the start ("block %d is uninitialised"): the tail routinely
+	// references a page past the last flushed one, and an UPDATE that moves a
+	// row to a freshly extended page arrives with INIT_PAGE set and nothing on
+	// disk to read.
+	page, skip, err := redoHeapPageForBlock(mgr, block, storage.LSN(r.EndLSN), xlog.Header.Info&xlogHeapInit != 0)
+	if err != nil {
 		return err
-	}
-	if storage.IsNew(page) {
-		return fmt.Errorf("wal: xlog heap-update: block %d is uninitialised", block.Block)
 	}
 	samePage := oldBlock.Block == block.Block
 	stampOld := func(p storage.Page) error {
@@ -2897,17 +4382,40 @@ func replayDecodedXLogHeapUpdate(mgr *storage.Manager, r Record, xlog *XLogDecod
 		}
 		return storage.PageStampUpdatedOldTuple(p, oldOffnum, storage.TransactionID(oldXmax), block.Block, newOffnum)
 	}
-	if storage.MustHeader(page).LSN() < storage.LSN(r.EndLSN) {
-		tup, err := storage.ParseHeapTuple(newTupleBytes)
-		if err != nil {
-			return fmt.Errorf("wal: xlog heap-update parse new tuple: %w", err)
+	if !skip {
+		// M0131-S21g: the new tuple's bytes are only WHOLE in goopg's own
+		// emit. A real PG's log_heap_update (heapam.c:8730-8800) strips the
+		// prefix and suffix the new version shares with the old one and stores
+		// their lengths instead, so redo has to splice them back in from the
+		// old version — which upstream can do because those two flags are only
+		// ever set when both versions are on the SAME page
+		// (heapam_xlog.c:933-945 asserts newblk == oldblk).
+		var oldTuple []byte
+		if flags&(xlhUpdatePrefixFromOld|xlhUpdateSuffixFromOld) != 0 {
+			if oldBlock.Block != block.Block {
+				return fmt.Errorf("wal: xlog heap-update prefix/suffix compression with cross-page old tuple (old blk %d, new blk %d)",
+					oldBlock.Block, block.Block)
+			}
+			oldTuple, err = storage.PageGetItemRaw(page, oldOffnum)
+			if err != nil {
+				return fmt.Errorf("wal: xlog heap-update read old tuple for prefix/suffix splice (slot %d): %w", oldOffnum, err)
+			}
 		}
-		gotSlot, err := storage.PageAddHeapTuple(page, tup)
+		newTupleBytes, err := decodeXLogHeapUpdateNewTuple(block, flags, oldTuple,
+			storage.TransactionID(xlog.Header.XID), newOffnum)
 		if err != nil {
+			return err
+		}
+		// M0131-S21c: place the new version AT new_offnum, exactly as
+		// heap_xlog_update's PageAddItemExtended(..., xlrec->new_offnum,
+		// PAI_OVERWRITE | PAI_IS_HEAP) does — the third member of the
+		// insert/multi-insert/update sibling family. This used to APPEND
+		// (PageAddHeapTuple) and then merely complain when the resulting slot
+		// disagreed with the record ("new-slot drift"), which refused the start
+		// on every real-PG tail that updates into a pruned page's hole: the
+		// append lands at the end of the array while the record says slot N.
+		if err := redoHeapPageAddItemOverwrite(page, newOffnum, newTupleBytes); err != nil {
 			return fmt.Errorf("wal: xlog heap-update add new tuple: %w", err)
-		}
-		if gotSlot != newOffnum {
-			return fmt.Errorf("wal: xlog heap-update new-slot drift: got %d, want %d", gotSlot, newOffnum)
 		}
 		if samePage {
 			if err := stampOld(page); err != nil {
@@ -2924,17 +4432,19 @@ func replayDecodedXLogHeapUpdate(mgr *storage.Manager, r Record, xlog *XLogDecod
 	}
 	// Cross-page: stamp the old version on its own page, with its own
 	// pd_lsn idempotency (mirrors PG's per-buffer redo).
-	if oldBlock.Block >= nblocks {
-		return fmt.Errorf("wal: xlog heap-update: old block %d does not exist (nblocks=%d)", oldBlock.Block, nblocks)
-	}
-	oldPage := make(storage.Page, storage.BlockSize)
-	if err := mgr.ReadBlock(block.Rel, oldBlock.Block, oldPage); err != nil {
+	//
+	// M0131-S21d: block 1 is upstream's RBM_NORMAL read — XLogReadBufferForRedo
+	// with no WILL_INIT — so an absent or all-zero page is BLK_NOTFOUND and the
+	// stamp is skipped, not an error (redoExistingHeapPageForBlock, and see its
+	// invalid-page-table deviation note). The new-tuple page above is the one
+	// that may be extended into existence; the page holding the row's OLD
+	// version cannot legitimately be missing unless the relation is dropped or
+	// truncated later in the same stream.
+	oldPage, skipOld, err := redoExistingHeapPageForBlock(mgr, oldBlock, storage.LSN(r.EndLSN))
+	if err != nil {
 		return err
 	}
-	if storage.IsNew(oldPage) {
-		return fmt.Errorf("wal: xlog heap-update: old block %d is uninitialised", oldBlock.Block)
-	}
-	if storage.MustHeader(oldPage).LSN() >= storage.LSN(r.EndLSN) {
+	if skipOld {
 		return nil
 	}
 	if err := stampOld(oldPage); err != nil {
@@ -2955,44 +4465,169 @@ func replayDecodedXLogHeapUpdate(mgr *storage.Manager, r Record, xlog *XLogDecod
 // That unblocks 3b-2c-ii-B2-c, the flip.)
 
 // replayDecodedXLogBtreeInsert applies a PG-format xl_btree_insert: insert the
-// IndexTuple carried in block 0's data into the leaf page at the offset number
+// IndexTuple carried in block 0's data into the target page at the offset number
 // carried in the record's main data, exactly as upstream btree_xlog_insert
-// does. Mirrors the native replayBtreeInsert, so goopg↔goopg replay is
-// identical; a full-page image is restored instead. Idempotent via pd_lsn.
-func replayDecodedXLogBtreeInsert(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
+// (nbtxlog.c:160-247) does. Mirrors the native replayBtreeInsert, so goopg↔goopg
+// replay is identical; a full-page image is restored instead. Idempotent via
+// pd_lsn.
+//
+// `isleaf` / `ismeta` are upstream's own arguments, set from the opcode:
+// INSERT_LEAF (true,false,false), INSERT_UPPER (false,false,false),
+// INSERT_META (false,true,false), INSERT_POST (true,false,true). goopg only
+// ever emits INSERT_LEAF; the other three arrive from a real PG crash tail
+// (M0131-S21b parts 1-2) and add three limbs:
+//
+//   - block 1 (!isleaf) — an insert into an INTERNAL page is what finishes the
+//     child's split, so redo clears the child's BTP_INCOMPLETE_SPLIT flag.
+//     Upstream does this FIRST, before touching block 0, and unconditionally:
+//     _bt_insertonpg always registers cbuf as block 1 on the !isleaf path
+//     (nbtinsert.c:1342-1343), so a missing block 1 is a malformed record, not
+//     an optional limb.
+//   - block 2 (ismeta) — the metapage, rebuilt from the carried
+//     xl_btree_metadata. Registered WILL_INIT (nbtinsert.c:1359-1360), so it is
+//     re-initialised from scratch rather than read-modify-written.
+//   - block 0 (posting) — the data run is {uint16 postingoff, orignewitem}
+//     instead of a bare item, and redo re-runs the primary's posting-list
+//     split before adding the item (btree.ApplyInsertPostingRecordAt).
+//
+// Each limb carries its own pd_lsn idempotency, matching the per-buffer
+// discipline of upstream's redo (and of replayDecodedXLogBtreeNewRoot): a replay
+// interrupted between limbs resumes correctly. Note the block-0 image branch
+// does NOT return early — upstream's BLK_RESTORED only skips block 0's manual
+// mutation, the metapage limb still runs.
+func replayDecodedXLogBtreeInsert(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord, isleaf, ismeta, posting bool) error {
+	endLSN := storage.LSN(r.EndLSN)
+
+	if !isleaf {
+		child, ok := xlogBlockRefByID(xlog, 1)
+		if !ok {
+			return fmt.Errorf("wal: xlog btree-insert missing block 1 (child of an internal-page insert)")
+		}
+		if child.HasImage && child.ImageApply {
+			if err := restoreDecodedXLogBlockImage(mgr, child, endLSN); err != nil {
+				return fmt.Errorf("wal: xlog btree-insert child image: %w", err)
+			}
+		} else if err := replayExistingXLogBlock(mgr, child, endLSN, btree.ReplayClearIncompleteSplit); err != nil {
+			return fmt.Errorf("wal: xlog btree-insert child apply: %w", err)
+		}
+	}
+
 	block, ok := xlogBlockRefByID(xlog, 0)
 	if !ok {
 		return fmt.Errorf("wal: xlog btree-insert missing block 0")
 	}
 	if block.HasImage && block.ImageApply {
-		return restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN))
+		if err := restoreDecodedXLogBlockImage(mgr, block, endLSN); err != nil {
+			return err
+		}
+	} else {
+		if len(xlog.MainData) < sizeOfXLogBtreeInsertData {
+			return fmt.Errorf("wal: xlog btree-insert: main data len %d (want >= %d)", len(xlog.MainData), sizeOfXLogBtreeInsertData)
+		}
+		offnum := binary.LittleEndian.Uint16(xlog.MainData[0:2])
+		apply := func(page storage.Page) error {
+			return btree.ApplyInsertRecordAt(page, block.Data, offnum)
+		}
+		if posting {
+			apply = func(page storage.Page) error {
+				return btree.ApplyInsertPostingRecordAt(page, block.Data, offnum)
+			}
+		}
+		if err := replayExistingXLogBlock(mgr, block, endLSN, apply); err != nil {
+			return fmt.Errorf("wal: xlog btree-insert apply: %w", err)
+		}
 	}
-	nblocks, err := mgr.NBlocks(block.Rel)
+
+	if !ismeta {
+		return nil
+	}
+	return replayDecodedXLogBtreeRestoreMeta(mgr, xlog, endLSN, 2, "btree-insert")
+}
+
+// sizeOfBtreeDedupData is SizeOfBtreeDedup (nbtxlog.h:177): xl_btree_dedup is
+// one uint16 nintervals, with the interval array riding block 0's data run
+// rather than the main data.
+const sizeOfBtreeDedupData = 2
+
+// replayDecodedXLogBtreeDedup applies a PG-format xl_btree_dedup, mirroring
+// upstream btree_xlog_dedup (nbtxlog.c:463-553): rebuild block 0 from its own
+// pre-image, collapsing each carried {baseoff, nitems} run into one posting
+// list (btree.ReplayDedupPage).
+//
+// The record is REBUILD-shaped rather than edit-shaped, which is why the block
+// carries no items: everything the merged tuples are made of is already on the
+// page being replayed. That also makes the FPI branch the plain one — an image
+// is the finished page, so redo restores it and stops.
+//
+// M0131-S21b part 2b. Idempotent via pd_lsn, per replayExistingXLogBlock.
+func replayDecodedXLogBtreeDedup(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
+	endLSN := storage.LSN(r.EndLSN)
+	block, ok := xlogBlockRefByID(xlog, 0)
+	if !ok {
+		return fmt.Errorf("wal: xlog btree-dedup missing block 0")
+	}
+	if block.HasImage && block.ImageApply {
+		if err := restoreDecodedXLogBlockImage(mgr, block, endLSN); err != nil {
+			return fmt.Errorf("wal: xlog btree-dedup image: %w", err)
+		}
+		return nil
+	}
+	if len(xlog.MainData) < sizeOfBtreeDedupData {
+		return fmt.Errorf("wal: xlog btree-dedup: main data len %d (want >= %d)", len(xlog.MainData), sizeOfBtreeDedupData)
+	}
+	nintervals := int(binary.LittleEndian.Uint16(xlog.MainData[0:2]))
+	// nintervals is the record's own count, so a short data run means a
+	// truncated record; trusting len(block.Data) instead would silently replay
+	// a partial dedup pass and leave the page half-merged.
+	if want := nintervals * btree.SizeOfDedupInterval; len(block.Data) < want {
+		return fmt.Errorf("wal: xlog btree-dedup: block 0 data len %d for %d intervals (want >= %d)",
+			len(block.Data), nintervals, want)
+	}
+	intervals := make([]btree.DedupInterval, nintervals)
+	for i := range intervals {
+		off := i * btree.SizeOfDedupInterval
+		intervals[i] = btree.DedupInterval{
+			BaseOff: binary.LittleEndian.Uint16(block.Data[off : off+2]),
+			NItems:  binary.LittleEndian.Uint16(block.Data[off+2 : off+4]),
+		}
+	}
+	if err := replayExistingXLogBlock(mgr, block, endLSN, func(page storage.Page) error {
+		return btree.ReplayDedupPage(page, intervals)
+	}); err != nil {
+		return fmt.Errorf("wal: xlog btree-dedup apply: %w", err)
+	}
+	return nil
+}
+
+// replayDecodedXLogBtreeRestoreMeta is upstream's _bt_restore_meta
+// (nbtxlog.c:80-127): rebuild the metapage at `blockID` from the carried
+// xl_btree_metadata. The buffer is registered WILL_INIT at every call site, so
+// the block need not exist yet.
+//
+// M0131-S21b part 1. Factored out because two opcodes need it on different
+// block ids — XLOG_BTREE_INSERT_META on block 2 and XLOG_BTREE_META_CLEANUP on
+// block 0 — and XLOG_BTREE_NEWROOT already open-codes the same thing on block 2.
+func replayDecodedXLogBtreeRestoreMeta(mgr *storage.Manager, xlog *XLogDecodedRecord, endLSN storage.LSN, blockID byte, what string) error {
+	meta, ok := xlogBlockRefByID(xlog, blockID)
+	if !ok {
+		return fmt.Errorf("wal: xlog %s missing block %d (metapage)", what, blockID)
+	}
+	if meta.HasImage && meta.ImageApply {
+		if err := restoreDecodedXLogBlockImage(mgr, meta, endLSN); err != nil {
+			return fmt.Errorf("wal: xlog %s meta image: %w", what, err)
+		}
+		return nil
+	}
+	md, err := decodeXLogBtreeMetadata(meta.Data)
 	if err != nil {
-		return err
+		return fmt.Errorf("wal: xlog %s meta: %w", what, err)
 	}
-	if block.Block >= nblocks {
-		return fmt.Errorf("wal: xlog btree-insert: block %d does not exist (nblocks=%d)", block.Block, nblocks)
+	if err := replayInitedXLogBlock(mgr, meta, endLSN, func(page storage.Page) error {
+		return btree.ReplayRestoreMetaPage(page, md)
+	}); err != nil {
+		return fmt.Errorf("wal: xlog %s meta apply: %w", what, err)
 	}
-	page := make(storage.Page, storage.BlockSize)
-	if err := mgr.ReadBlock(block.Rel, block.Block, page); err != nil {
-		return err
-	}
-	if storage.IsNew(page) {
-		return fmt.Errorf("wal: xlog btree-insert: block %d is uninitialised", block.Block)
-	}
-	if storage.MustHeader(page).LSN() >= storage.LSN(r.EndLSN) {
-		return nil // already applied
-	}
-	if len(xlog.MainData) < sizeOfXLogBtreeInsertData {
-		return fmt.Errorf("wal: xlog btree-insert: main data len %d (want >= %d)", len(xlog.MainData), sizeOfXLogBtreeInsertData)
-	}
-	offnum := binary.LittleEndian.Uint16(xlog.MainData[0:2])
-	if err := btree.ApplyInsertRecordAt(page, block.Data, offnum); err != nil {
-		return fmt.Errorf("wal: xlog btree-insert apply: %w", err)
-	}
-	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
-	return mgr.WriteBlock(block.Rel, block.Block, page)
+	return nil
 }
 
 // replayDecodedXLogBtreeNewRoot applies a PG-format xl_btree_newroot, mirroring
@@ -3052,26 +4687,9 @@ func replayDecodedXLogBtreeNewRoot(mgr *storage.Manager, r Record, xlog *XLogDec
 		}
 	}
 
-	meta, ok := xlogBlockRefByID(xlog, 2)
-	if !ok {
-		return fmt.Errorf("wal: xlog btree-newroot missing block 2 (metapage)")
-	}
-	if meta.HasImage && meta.ImageApply {
-		if err := restoreDecodedXLogBlockImage(mgr, meta, endLSN); err != nil {
-			return fmt.Errorf("wal: xlog btree-newroot meta image: %w", err)
-		}
-		return nil
-	}
-	md, err := decodeXLogBtreeMetadata(meta.Data)
-	if err != nil {
-		return fmt.Errorf("wal: xlog btree-newroot meta: %w", err)
-	}
-	if err := replayInitedXLogBlock(mgr, meta, endLSN, func(page storage.Page) error {
-		return btree.ReplayRestoreMetaPage(page, md)
-	}); err != nil {
-		return fmt.Errorf("wal: xlog btree-newroot meta apply: %w", err)
-	}
-	return nil
+	// Shared with XLOG_BTREE_INSERT_META / XLOG_BTREE_META_CLEANUP since
+	// M0131-S21b part 1 — all three limbs are upstream's one _bt_restore_meta.
+	return replayDecodedXLogBtreeRestoreMeta(mgr, xlog, endLSN, 2, "btree-newroot")
 }
 
 // replayDecodedXLogBtreeMarkPageHalfDead applies a PG-format
@@ -3388,6 +5006,101 @@ func replayDecodedXLogBtreeSplit(mgr *storage.Manager, r Record, xlog *XLogDecod
 	return nil
 }
 
+// sizeOfXLogBtreeDeleteData is PG's SizeOfBtreeDelete (nbtxlog.h:256):
+// snapshotConflictHorizon(4) + ndeleted(2) + nupdated(2) + isCatalogRel(1).
+// The two conflict-resolution fields are read by hot standby only, which goopg
+// does not implement — crash recovery reads the two counts.
+const sizeOfXLogBtreeDeleteData = 9
+
+// replayDecodedXLogBtreeDelete applies a PG-format xl_btree_delete, mirroring
+// upstream btree_xlog_delete (nbtxlog.c:651-712): rewrite the posting-list
+// tuples that lost some of their TIDs, delete the items that went away whole,
+// and clear the page's garbage hint.
+//
+// Only a real PG primary emits this opcode. goopg has no LP_DEAD simple-deletion
+// pass at all (its index cleanup rides RecordKindBtreeVacuum), but a PG primary
+// runs one whenever an insert is short of room on a page with killed entries —
+// so it is ordinary traffic in the crash tail goopg must replay.
+//
+// M0131-S21b part 3. Idempotent via pd_lsn, per replayExistingXLogBlock.
+func replayDecodedXLogBtreeDelete(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
+	endLSN := storage.LSN(r.EndLSN)
+	block, ok := xlogBlockRefByID(xlog, 0)
+	if !ok {
+		return fmt.Errorf("wal: xlog btree-delete missing block 0")
+	}
+	if block.HasImage && block.ImageApply {
+		if err := restoreDecodedXLogBlockImage(mgr, block, endLSN); err != nil {
+			return fmt.Errorf("wal: xlog btree-delete image: %w", err)
+		}
+		return nil
+	}
+	if len(xlog.MainData) < sizeOfXLogBtreeDeleteData {
+		return fmt.Errorf("wal: xlog btree-delete: main data len %d (want >= %d)", len(xlog.MainData), sizeOfXLogBtreeDeleteData)
+	}
+	ndeleted := int(binary.LittleEndian.Uint16(xlog.MainData[4:6]))
+	nupdated := int(binary.LittleEndian.Uint16(xlog.MainData[6:8]))
+	deleted, updates, err := decodeXLogBtreeDeletePayload(block.Data, ndeleted, nupdated)
+	if err != nil {
+		return fmt.Errorf("wal: xlog btree-delete: %w", err)
+	}
+	if err := replayExistingXLogBlock(mgr, block, endLSN, func(page storage.Page) error {
+		return btree.ReplayDeletePage(page, deleted, updates)
+	}); err != nil {
+		return fmt.Errorf("wal: xlog btree-delete apply: %w", err)
+	}
+	return nil
+}
+
+// decodeXLogBtreeDeletePayload parses block 0's data run, which xl_btree_delete
+// and xl_btree_vacuum share byte for byte (nbtxlog.h:197-237): the deleted
+// offset numbers, then the updated offset numbers, then one variable-length
+// xl_btree_update per updated offset.
+//
+// Every length is checked against the record's OWN counts rather than against
+// what the buffer happens to hold: a truncated run must be refused, not
+// replayed as a shorter deletion that leaves dead entries behind.
+func decodeXLogBtreeDeletePayload(data []byte, ndeleted, nupdated int) ([]uint16, []btree.PostingUpdate, error) {
+	want := 2 * (ndeleted + nupdated)
+	if len(data) < want {
+		return nil, nil, fmt.Errorf("block 0 data len %d (want >= %d for ndeleted=%d nupdated=%d)",
+			len(data), want, ndeleted, nupdated)
+	}
+	deleted := make([]uint16, ndeleted)
+	for i := range deleted {
+		deleted[i] = binary.LittleEndian.Uint16(data[2*i : 2*i+2])
+	}
+	if nupdated == 0 {
+		return deleted, nil, nil
+	}
+	updates := make([]btree.PostingUpdate, nupdated)
+	for i := range updates {
+		off := 2 * (ndeleted + i)
+		updates[i].Offset = binary.LittleEndian.Uint16(data[off : off+2])
+	}
+	// The xl_btree_update array is self-describing (each entry's ndeletedtids
+	// states its own length), so it is walked rather than indexed.
+	pos := want
+	for i := range updates {
+		if len(data)-pos < btree.SizeOfBtreeUpdate {
+			return nil, nil, fmt.Errorf("block 0 data ends inside xl_btree_update %d of %d", i, nupdated)
+		}
+		ndeletedtids := int(binary.LittleEndian.Uint16(data[pos : pos+2]))
+		pos += btree.SizeOfBtreeUpdate
+		if len(data)-pos < 2*ndeletedtids {
+			return nil, nil, fmt.Errorf("block 0 data holds %d bytes for xl_btree_update %d's %d TID offsets",
+				len(data)-pos, i, ndeletedtids)
+		}
+		tids := make([]uint16, ndeletedtids)
+		for j := range tids {
+			tids[j] = binary.LittleEndian.Uint16(data[pos+2*j : pos+2*j+2])
+		}
+		pos += 2 * ndeletedtids
+		updates[i].DeleteTIDs = tids
+	}
+	return deleted, updates, nil
+}
+
 // replayDecodedXLogBtreeVacuum applies a PG-format xl_btree_vacuum, mirroring
 // upstream btree_xlog_vacuum (nbtxlog.c:479-528): delete the named offset
 // numbers from the leaf page, then clear its garbage hint.
@@ -3400,8 +5113,17 @@ func replayDecodedXLogBtreeSplit(mgr *storage.Manager, r Record, xlog *XLogDecod
 //
 // nupdated > 0 is a record only a real PG primary produces: it rewrites posting
 // tuples in place (xl_btree_update) where goopg re-marshals surviving TIDs as
-// separate items. Replaying the deletions while dropping the updates would
-// silently leave dead TIDs on the page, so it is refused instead.
+// separate items. It was refused outright until M0131-S21b part 3, which built
+// that rewrite for XLOG_BTREE_DELETE; the two records share the payload
+// format AND the page work byte for byte (upstream's btree_xlog_vacuum and
+// btree_xlog_delete both call btree_xlog_updates then PageIndexMultiDelete),
+// so this path shares the decoder and btree.ReplayDeletePage with it rather
+// than growing a second, drifting copy.
+//
+// The one upstream difference — vacuum clears btpo_cycleid, delete deliberately
+// does not — is not a difference here: goopg's opaque has no cycle-id field
+// (the vacuum cycle id is a concurrency hint for _bt_vacuum_needs_cleanup,
+// which goopg does not implement).
 func replayDecodedXLogBtreeVacuum(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
 	endLSN := storage.LSN(r.EndLSN)
 	if len(xlog.MainData) < sizeOfXLogBtreeVacuumData {
@@ -3417,18 +5139,12 @@ func replayDecodedXLogBtreeVacuum(mgr *storage.Manager, r Record, xlog *XLogDeco
 	if block.HasImage && block.ImageApply {
 		return restoreDecodedXLogBlockImage(mgr, block, endLSN)
 	}
-	if nupdated != 0 {
-		return fmt.Errorf("wal: xlog btree-vacuum nupdated=%d: PG's posting-list updates (xl_btree_update) are not implemented", nupdated)
-	}
-	if len(block.Data) < 2*ndeleted {
-		return fmt.Errorf("wal: xlog btree-vacuum block data len %d (want >= %d for ndeleted=%d)", len(block.Data), 2*ndeleted, ndeleted)
-	}
-	deleted := make([]uint16, ndeleted)
-	for i := range deleted {
-		deleted[i] = binary.LittleEndian.Uint16(block.Data[2*i : 2*i+2])
+	deleted, updates, err := decodeXLogBtreeDeletePayload(block.Data, ndeleted, nupdated)
+	if err != nil {
+		return fmt.Errorf("wal: xlog btree-vacuum: %w", err)
 	}
 	return replayExistingXLogBlock(mgr, block, endLSN, func(page storage.Page) error {
-		return btree.ReplayVacuumDelete(page, deleted)
+		return btree.ReplayDeletePage(page, deleted, updates)
 	})
 }
 
@@ -3460,24 +5176,20 @@ func replayInitedXLogBlock(mgr *storage.Manager, block XLogBlockRef, endLSN stor
 
 // replayExistingXLogBlock applies `apply` to a block the record mutates in
 // place. Unlike replayInitedXLogBlock the page must already exist and be
-// initialised: the mutation reads the current contents.
+// initialised: the mutation reads the current contents. When it does not exist,
+// the record is SKIPPED (upstream's BLK_NOTFOUND), not refused — see
+// redoExistingHeapPageForBlock for why, and for the invalid-page-table
+// deviation that skip carries.
 func replayExistingXLogBlock(mgr *storage.Manager, block XLogBlockRef, endLSN storage.LSN, apply func(storage.Page) error) error {
-	nblocks, err := mgr.NBlocks(block.Rel)
+	// M0131-S21f: every edit-shaped btree record upstream reads with
+	// XLogReadBufferForRedo (RBM_NORMAL) — nbtxlog.c's insert-on-existing-page,
+	// delete, vacuum and mark-page-halfdead arms all skip on BLK_NOTFOUND.
+	page, skip, err := redoExistingHeapPageForBlock(mgr, block, endLSN)
 	if err != nil {
 		return err
 	}
-	if block.Block >= nblocks {
-		return fmt.Errorf("wal: block %d does not exist (nblocks=%d)", block.Block, nblocks)
-	}
-	page := make(storage.Page, storage.BlockSize)
-	if err := mgr.ReadBlock(block.Rel, block.Block, page); err != nil {
-		return err
-	}
-	if storage.IsNew(page) {
-		return fmt.Errorf("wal: block %d is uninitialised", block.Block)
-	}
-	if storage.MustHeader(page).LSN() >= endLSN {
-		return nil // already applied
+	if skip {
+		return nil
 	}
 	if err := apply(page); err != nil {
 		return err
@@ -3603,22 +5315,15 @@ func replayDecodedXLogHeapPrune(mgr *storage.Manager, r Record, xlog *XLogDecode
 	if err != nil {
 		return err
 	}
-	nblocks, err := mgr.NBlocks(block.Rel)
+	// M0131-S21f: RBM_NORMAL, like upstream's heap_xlog_prune_freeze. A pruned
+	// page that a later record in this same stream drops or truncates away is
+	// BLK_NOTFOUND, and the prune is moot rather than fatal.
+	page, skip, err := redoExistingHeapPageForBlock(mgr, block, storage.LSN(r.EndLSN))
 	if err != nil {
-		return err
+		return fmt.Errorf("wal: xlog heap-prune: %w", err)
 	}
-	if block.Block >= nblocks {
-		return fmt.Errorf("wal: xlog heap-prune: block %d does not exist (nblocks=%d)", block.Block, nblocks)
-	}
-	page := make(storage.Page, storage.BlockSize)
-	if err := mgr.ReadBlock(block.Rel, block.Block, page); err != nil {
-		return err
-	}
-	if storage.IsNew(page) {
-		return fmt.Errorf("wal: xlog heap-prune: block %d is uninitialised", block.Block)
-	}
-	if storage.MustHeader(page).LSN() >= storage.LSN(r.EndLSN) {
-		return nil // already applied
+	if skip {
+		return nil
 	}
 	if len(frozenSlots) > 0 {
 		if err := storage.PageFreezeBySlots(page, frozenSlots); err != nil {
@@ -3684,6 +5389,13 @@ func ReplayFromDir(dataDir string, segmentSize int64) (ReplayStats, error) {
 // with a non-default segment size compute every record LSN against the wrong
 // base — see readAllUncached for why that silently defeats pd_lsn idempotency.
 func ReplayFromDirWithMgr(mgr *storage.Manager, walDir string, segmentSize int64) (ReplayStats, error) {
+	return ReplayFromDirWithMgrAt(mgr, walDir, segmentSize, 0)
+}
+
+// ReplayFromDirWithMgrAt is ReplayFromDirWithMgr with the control file's redo
+// pointer (M0131-S20.2). initdb.Open passes pg_control's checkPointCopy.redo
+// here; redoLSN == 0 falls back to the stream scan. See ReplayRecordsFrom.
+func ReplayFromDirWithMgrAt(mgr *storage.Manager, walDir string, segmentSize int64, redoLSN uint64) (ReplayStats, error) {
 	records, err := ReadAll(walDir, segmentSize)
 	if err != nil {
 		// Missing pg_wal on a fresh data dir is fine — no records
@@ -3693,7 +5405,7 @@ func ReplayFromDirWithMgr(mgr *storage.Manager, walDir string, segmentSize int64
 		}
 		return ReplayStats{}, err
 	}
-	return ReplayRecords(mgr, records)
+	return ReplayRecordsFrom(mgr, records, redoLSN)
 }
 
 // replayHeapVacuum applies one logical heap-vacuum prune record.
@@ -4405,6 +6117,35 @@ func replayPageImage(mgr *storage.Manager, payload []byte) error {
 //
 // If no checkpoint is found, returns (0, 0) — replay all records
 // from the beginning (correct for fresh clusters or early startup).
+// replayStartAt is replayStart with an authoritative redo pointer from
+// pg_control (M0131-S20.2). With redoLSN != 0 the start index comes from the
+// pointer alone — the stream scan is not consulted for the anchor, because
+// its whole purpose is to reconstruct a redo pointer goopg now has directly,
+// and on PG-authored WAL the reconstruction is the part that fails.
+//
+// The reported CheckpointLSN is still scanned for: it is bookkeeping
+// (ReplayStats, the startup xact-stamp pass) rather than a replay anchor, and
+// leaving it 0 on a pointer-driven replay would make a recovered cluster look
+// checkpoint-less to every caller that reads the stat.
+func replayStartAt(records []Record, redoLSN uint64) (int, uint64) {
+	if redoLSN == 0 {
+		return replayStart(records)
+	}
+	_, checkpointLSN := replayStart(records)
+	// Record LSNs are 1-based absolute positions and redoLSN is a 0-based
+	// XLogRecPtr, so "EndLSN > redoLSN" keeps the record the redo pointer
+	// sits inside rather than skipping it — the same one-record-early bias
+	// replayStart's walk-back has, and idempotent for the same reason.
+	startIdx := len(records)
+	for i, r := range records {
+		if r.EndLSN > redoLSN {
+			startIdx = i
+			break
+		}
+	}
+	return startIdx, checkpointLSN
+}
+
 func replayStart(records []Record) (int, uint64) {
 	ckptIdx := -1
 	var checkpointLSN uint64
@@ -4564,6 +6305,77 @@ func applySmgrCreate(mgr *storage.Manager, rel storage.RelFileNode) error {
 	return err
 }
 
+// SMGR_TRUNCATE_{HEAP,VM,FSM} — flags for xl_smgr_truncate
+// (storage_xlog.h:40-44). M0131-S21a-2 part 6.
+const (
+	smgrTruncateHeap uint32 = 0x0001
+	smgrTruncateVM   uint32 = 0x0002
+	smgrTruncateFSM  uint32 = 0x0004
+)
+
+// decodeXLogSmgrTruncate parses a PG xl_smgr_truncate main-data body
+// (BlockNumber blkno + RelFileLocator{spcOid,dbOid,relNumber} + int flags,
+// 20 bytes, storage_xlog.h:46-51). The decoded RelFileNode carries no Fork —
+// the caller derives it per SMGR_TRUNCATE_* flag, since one record can
+// truncate up to three forks to three different lengths. Mirrors
+// decodeXLogSmgrCreate's tablespace-OID remap. M0131-S21a-2 part 6.
+func decodeXLogSmgrTruncate(mainData []byte) (rel storage.RelFileNode, blkno storage.BlockNumber, flags uint32, err error) {
+	if len(mainData) < 20 {
+		err = fmt.Errorf("wal: xl_smgr_truncate main-data len %d (want 20)", len(mainData))
+		return
+	}
+	blkno = storage.BlockNumber(binary.LittleEndian.Uint32(mainData[0:4]))
+	rel = storage.RelFileNode{
+		TblOid: binary.LittleEndian.Uint32(mainData[4:8]),
+		DBOid:  binary.LittleEndian.Uint32(mainData[8:12]),
+		RelOid: binary.LittleEndian.Uint32(mainData[12:16]),
+	}
+	flags = binary.LittleEndian.Uint32(mainData[16:20])
+	if rel.TblOid == pgDefaultTableSpaceOID || rel.TblOid == pgGlobalTableSpaceOID {
+		rel.TblOid = 0
+	}
+	return rel, blkno, flags, nil
+}
+
+// applySmgrTruncate mirrors smgr_redo's XLOG_SMGR_TRUNCATE arm
+// (storage.c:997-1094): forcibly recreate the main fork (a later-dropped
+// relation still needs its truncate replayed as best-effort, same rationale
+// as applySmgrCreate's own idempotent recreate), then truncate each fork the
+// flags select — MAIN to blkno (a VACUUM tail truncation, or the surviving
+// prefix of a same-transaction TRUNCATE), VM and FSM unconditionally to zero
+// (upstream never partially truncates them: FreeSpaceMapTruncateRel's rounds
+// only pick the summary level, and the vm fork's truncate always drops to
+// zero blocks — visibilitymap.c/freespace.c both re-derive their content
+// from a live heap, never from a partial fork). Idempotent via
+// TruncateRelationTo's own no-op-if-already-shorter check.
+func applySmgrTruncate(mgr *storage.Manager, rel storage.RelFileNode, blkno storage.BlockNumber, flags uint32) error {
+	mainRel := rel
+	mainRel.Fork = storage.MainFork
+	if err := applySmgrCreate(mgr, mainRel); err != nil {
+		return err
+	}
+	if flags&smgrTruncateHeap != 0 {
+		if err := mgr.TruncateRelationTo(mainRel, blkno); err != nil {
+			return fmt.Errorf("wal: smgr-truncate replay main fork: %w", err)
+		}
+	}
+	if flags&smgrTruncateVM != 0 {
+		vmRel := rel
+		vmRel.Fork = storage.VisibilityMapFork
+		if err := mgr.TruncateRelationTo(vmRel, 0); err != nil {
+			return fmt.Errorf("wal: smgr-truncate replay vm fork: %w", err)
+		}
+	}
+	if flags&smgrTruncateFSM != 0 {
+		fsmRel := rel
+		fsmRel.Fork = storage.FSMFork
+		if err := mgr.TruncateRelationTo(fsmRel, 0); err != nil {
+			return fmt.Errorf("wal: smgr-truncate replay fsm fork: %w", err)
+		}
+	}
+	return nil
+}
+
 // decodeXLogTblspcCreate parses a PG xl_tblspc_create_rec main-data body
 // (ts_id Oid + null-terminated ts_path). B4.1d.
 func decodeXLogTblspcCreate(mainData []byte) (oid uint32, path string, err error) {
@@ -4647,6 +6459,50 @@ func applyDbaseDrop(mgr *storage.Manager, dbOID uint32) error {
 	dir := filepath.Join(mgr.DataDir(), "base", strconv.FormatUint(uint64(dbOID), 10))
 	if err := os.RemoveAll(dir); err != nil {
 		return fmt.Errorf("wal: dbase-drop replay RemoveAll %q: %w", dir, err)
+	}
+	return nil
+}
+
+// clogSLRUPagesPerSegment mirrors mvcc's slruPagesPerSegment (clog.go:549) —
+// PG's SLRU_PAGES_PER_SEGMENT for pg_xact: 32 BLCKSZ pages per 256 KiB segment
+// file, named "%04X" of pageno/32. wal cannot import internal/mvcc (mvcc
+// imports wal for the async-commit WAL-flush hook — an import cycle), so the
+// constant and the segment-path arithmetic below are a deliberate small
+// duplication of clogBufferPool.segPathForPage, not a shared helper.
+const clogSLRUPagesPerSegment = 32
+
+// replayDecodedXLogClogZeroPage re-applies a PG CLOG_ZEROPAGE record: it
+// writes a zero-filled BLCKSZ page into the pg_xact/ segment file at pageno's
+// offset, creating the segment (and any zero gap up to the offset) if it does
+// not yet exist. This runs in the physical replay pass, BEFORE internal/initdb
+// opens the live *mvcc.CLog, so it talks to the segment file directly rather
+// than through clogBufferPool — see the case comment at the call site for why
+// this differs from CLOG_TRUNCATE's initdb-second-pass treatment.
+func replayDecodedXLogClogZeroPage(mgr *storage.Manager, xlog *XLogDecodedRecord) error {
+	pageno, err := DecodeXLogClogZeroPage(xlog.MainData)
+	if err != nil {
+		return fmt.Errorf("wal: clog-zeropage replay decode: %w", err)
+	}
+	segNo := pageno / clogSLRUPagesPerSegment
+	pageInSeg := pageno % clogSLRUPagesPerSegment
+	segDir := filepath.Join(mgr.DataDir(), "pg_xact")
+	segPath := filepath.Join(segDir, fmt.Sprintf("%04X", segNo))
+	off := pageInSeg * int64(storage.BlockSize)
+
+	if err := os.MkdirAll(segDir, 0o700); err != nil {
+		return fmt.Errorf("wal: clog-zeropage replay mkdir %q: %w", segDir, err)
+	}
+	f, err := os.OpenFile(segPath, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return fmt.Errorf("wal: clog-zeropage replay open %q: %w", segPath, err)
+	}
+	defer f.Close()
+	zero := make([]byte, storage.BlockSize)
+	if _, err := f.WriteAt(zero, off); err != nil {
+		return fmt.Errorf("wal: clog-zeropage replay write %q@%d: %w", segPath, off, err)
+	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("wal: clog-zeropage replay sync %q: %w", segPath, err)
 	}
 	return nil
 }

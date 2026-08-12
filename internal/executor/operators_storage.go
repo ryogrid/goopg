@@ -495,6 +495,17 @@ func epqSlotMovedToAnotherPartition(ctx *Context, rel storage.RelFileNode,
 	return storage.IsMovedToAnotherPartition(tup.Header.CTID)
 }
 
+// maxCTIDChainWalk bounds the CROSS-page t_ctid chain walks below. Unlike a
+// HOT chain (one page, so storage.MaxHeapTuplesPerPage is the exact bound), a
+// non-HOT update chain spans pages and has no structural length limit — PG's
+// equivalents (heap_get_latest_tid, heap_lock_updated_tuple_rec) loop with no
+// cap at all and rely on the chain being acyclic. This is therefore a pure
+// corruption backstop, deliberately far above any reachable chain length: the
+// arbitrary 64 it replaced (M0131-S32) silently truncated real chains, which
+// is a wrong answer, whereas an over-large backstop costs only time on an
+// already-corrupt page.
+const maxCTIDChainWalk = 1 << 20
+
 // epqChainCheckMovedPartition walks the UPDATE chain starting at (rel, blk,
 // slot) via t_ctid and reports whether any tuple in the chain carries the
 // moved-to-another-partition sentinel.  Unlike `epqSlotMovedToAnotherPartition`
@@ -513,7 +524,7 @@ func epqChainCheckMovedPartition(ctx *Context, rel storage.RelFileNode,
 	// Strategy 1 (fast path): walk the t_ctid chain.  PG always updates the
 	// old tuple's t_ctid to point to the new version on UPDATE; HOT
 	// in-partition updates in goopg do too (PageStampHotOldTuple).
-	const maxChain = 64
+	const maxChain = maxCTIDChainWalk
 	curBlk, curSlot := blk, slot
 	for i := 0; i < maxChain; i++ {
 		s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: curBlk})
@@ -662,7 +673,7 @@ func isChainTailCTID(ctid storage.ItemPointer, curBlk storage.BlockNumber, curSl
 // correlated sub-plans run against the original snapshot (PG EvalPlanQual semantics).
 func epqFollowChainFull(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber,
 	slot uint16, cols []catalog.Column, pred planner.Expr, origSnap *mvcc.Snapshot) (relNode storage.RelFileNode, found epqChainResult, movedPart bool) {
-	const maxChain = 64
+	const maxChain = maxCTIDChainWalk
 	curBlk, curSlot := blk, slot
 	for i := 0; i < maxChain; i++ {
 		s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: curBlk})
@@ -719,6 +730,153 @@ func epqFollowChainFull(ctx *Context, rel storage.RelFileNode, blk storage.Block
 		curSlot = ctid.Offset
 	}
 	return rel, epqChainResult{}, false
+}
+
+// epqChainPendingWriter walks the t_ctid chain from (blk, slot) to its tail and
+// reports the XID of a still-IN-PROGRESS transaction that owns the tail version,
+// i.e. the reason epqFollowHOT/epqFollowChain just failed to produce a live
+// successor.
+//
+// Why this exists (M0131-S32.1). The EvalPlanQual retry loop treats "chain
+// follow found nothing" as "the row is gone" and SKIPS the row — silently, while
+// still reporting `UPDATE 1`. That conflation is wrong whenever the chain tip was
+// written by a transaction that has not committed yet: with N sessions updating
+// one row, session D waits for A, refreshes its snapshot, walks to A's new
+// version — and by then B has already replaced it with a version B has not
+// committed. The tail is invisible, chain-follow reports not-found, and D's
+// increment is DROPPED. At 8 sessions × 200 increments that lost 1112 of 1946
+// write attempts (analysis/concurrent-hotrow.sh).
+//
+// Upstream never skips here: ExecUpdate loops on TM_Updated, and
+// heap_lock_tuple/EvalPlanQualFetch block on the in-progress updater
+// (XactLockTableWait) before re-fetching, so the update is applied to whatever
+// version wins (postgres/src/backend/executor/nodeModifyTable.c ExecUpdate,
+// access/heap/heapam.c heap_lock_tuple). Under READ COMMITTED that wait is
+// unbounded; goopg's caller paces it with epqWait + the maxEPQRetriesRC backstop.
+//
+// Only an in-progress XMIN counts. A tail whose xmin ABORTED, or whose xmax
+// committed (a real DELETE), means there is genuinely nothing to update, and the
+// caller's existing skip is correct.
+func epqChainPendingWriter(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber,
+	slot uint16) (storage.TransactionID, bool) {
+	curBlk, curSlot := blk, slot
+	for i := 0; i < maxCTIDChainWalk; i++ {
+		s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: curBlk})
+		if err != nil {
+			return 0, false
+		}
+		s.RLock()
+		tup, gerr := storage.PageGetHeapTuple(s.Page(), curSlot)
+		s.RUnlock()
+		ctx.Pool.Unpin(s)
+		if gerr != nil {
+			return 0, false
+		}
+		if storage.IsMovedToAnotherPartition(tup.Header.CTID) {
+			return 0, false
+		}
+		if isChainTailCTID(tup.Header.CTID, curBlk, curSlot) {
+			xmin := tup.Header.Xmin
+			if xmin == storage.InvalidTransactionID || xmin == ctx.Tx.XID {
+				return 0, false
+			}
+			// epqXmaxSettled classifies any XID authoritatively via the
+			// transaction manager (not by snapshot membership, which misses a
+			// writer that started after our refresh — 0118-0105).
+			aborted, committed := epqXmaxSettled(ctx, xmin)
+			if aborted || committed {
+				return 0, false
+			}
+			return xmin, true
+		}
+		curBlk, curSlot = tup.Header.CTID.Block, tup.Header.CTID.Offset
+	}
+	return 0, false
+}
+
+// epqChainTailLiveButUnseen reports whether the t_ctid chain from (blk, slot)
+// ends at a version that is LIVE (xmin committed, not deleted) but which our
+// current snapshot cannot see yet.
+//
+// Why this exists (M0131-S32.3). Both chain-follow helpers decide which version
+// is "the latest" by SNAPSHOT visibility — epqFollowHOT passes ctx.Snap to
+// followHOTChain, and epqFollowChainFull calls mvcc.TupleVisible at the tail.
+// That is wrong for an EvalPlanQual re-fetch. The EPQ loop refreshes ctx.Snap,
+// then walks the chain; if the winning writer commits in the window BETWEEN the
+// refresh and the walk, its version is live on the page but outside our
+// snapshot, so both helpers report not-found. epqChainPendingWriter then reports
+// "not pending" (the writer has committed, so it is neither in-flight nor
+// aborted), and the caller takes the silent skip — the statement's write is
+// DROPPED while it still reports `UPDATE 1`. Measured at 6 lost increments in
+// 42487 pgbench transactions on 5 hot rows, matching epq_chain_notfound exactly.
+//
+// Upstream has no such window because EvalPlanQual does not use a snapshot to
+// find the latest version at all: heap_lock_tuple follows t_ctid until it
+// reaches a version whose xmax is invalid or aborted, whatever its xmin commit
+// time (postgres/src/backend/access/heap/heapam.c heap_lock_tuple, and
+// EvalPlanQualFetch in executor/execMain.c). Only the *qual* is re-evaluated
+// against the original snapshot.
+//
+// Returning true tells the caller to refresh its snapshot and take another EPQ
+// lap rather than skip. The predicate is deliberately narrow so it cannot
+// livelock: it is false once the version IS visible (the next lap makes it so),
+// false for a genuinely deleted row, and false for an aborted/in-flight writer
+// (epqChainPendingWriter owns that case).
+func epqChainTailLiveButUnseen(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber,
+	slot uint16) bool {
+	curBlk, curSlot := blk, slot
+	for i := 0; i < maxCTIDChainWalk; i++ {
+		s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: curBlk})
+		if err != nil {
+			return false
+		}
+		s.RLock()
+		tup, gerr := storage.PageGetHeapTuple(s.Page(), curSlot)
+		s.RUnlock()
+		ctx.Pool.Unpin(s)
+		if gerr != nil {
+			return false
+		}
+		if storage.IsMovedToAnotherPartition(tup.Header.CTID) {
+			return false
+		}
+		if !isChainTailCTID(tup.Header.CTID, curBlk, curSlot) {
+			curBlk, curSlot = tup.Header.CTID.Block, tup.Header.CTID.Offset
+			continue
+		}
+		xmin := tup.Header.Xmin
+		if xmin == storage.InvalidTransactionID || xmin == ctx.Tx.XID {
+			return false
+		}
+		// Only a COMMITTED creator qualifies: in-flight is epqChainPendingWriter's
+		// case (wait for it), aborted means there is nothing live here.
+		if aborted, committed := epqXmaxSettled(ctx, xmin); aborted || !committed {
+			return false
+		}
+		// A committed xmax on a chain-tail version is a real DELETE (an UPDATE
+		// would have stamped t_ctid at the successor, so this would not be the
+		// tail) — skipping the row is then correct.
+		if xmax := tup.Header.Xmax; xmax != storage.InvalidTransactionID && xmax != ctx.Tx.XID {
+			if aborted, committed := epqXmaxSettled(ctx, xmax); committed && !aborted {
+				return false
+			}
+		}
+		return !mvcc.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.CmdID,
+			ctx.comboStore(), ctx.MultiXact)
+	}
+	return false
+}
+
+// epqRefreshSnapForRetry refreshes ctx.Snap under READ COMMITTED so the next
+// EvalPlanQual lap sees everything committed since the last refresh. A no-op at
+// RR/Serializable, where the snapshot is frozen for the whole transaction.
+func epqRefreshSnapForRetry(ctx *Context) {
+	if ctx.Tx.Isolation != mvcc.IsolationReadCommitted || ctx.TxnMgr == nil {
+		return
+	}
+	if newSnap, err := ctx.TxnMgr.SnapshotFor(ctx.Tx); err == nil {
+		ctx.Snap = newSnap
+	}
 }
 
 // stampOldCtid updates the t_ctid field of the tuple at (rel, blk, slot)
@@ -3632,6 +3790,7 @@ func tryApplyHOTUpdate(
 		oldItem.Flags != storage.ItemIDNormal {
 		s.Unlock()
 		ctx.Pool.Unpin(s)
+		s321Note(s321HOTSkipItemID)
 		return false, nil
 	}
 
@@ -3666,9 +3825,24 @@ func tryApplyHOTUpdate(
 				Message: "could not serialize access due to concurrent update (deadlock)",
 			}
 		}
+		s321Note(s321HOTSkipConcurrent)
 		return false, nil // fall back to delete+insert; caller re-checks
 	}
-newSlot, addErr := storage.PageAddHeapTuple(s.Page(), tup)
+	// M0131-S30.3 probe (temporary, GOOPG_PAGEIDENT_PROBE=1): this is the exact
+	// site whose WAL record and on-disk page disagree. Under the content lock
+	// the line-pointer count is stable, so a count BELOW the high-water mark
+	// previously seen for {rel, blk} proves the slot's bytes belong to another
+	// block. See internal/storage/pageident_probe.go.
+	storage.PageIdentityObserve(storage.BufferTag{Rel: rel, Block: blk}, s.Page(), "hotUpdate")
+	// Line-pointer count before the (unlogged) append, so the orphan-cleanup
+	// arm below can assert the add/remove pair left the page untouched.
+	lpBeforeAdd := -1
+	if storage.PageIdentityProbeEnabled() {
+		if n, cerr := storage.PageLinePointerCount(s.Page()); cerr == nil {
+			lpBeforeAdd = n
+		}
+	}
+	newSlot, addErr := storage.PageAddHeapTuple(s.Page(), tup)
 	if addErr != nil && errors.Is(addErr, storage.ErrNoSpaceInPage) {
 		// Page full: attempt opportunistic pruning before giving up on HOT.
 		if ctx.EnableOpportunisticPrune && ctx.TxnMgr != nil {
@@ -3687,6 +3861,7 @@ newSlot, addErr := storage.PageAddHeapTuple(s.Page(), tup)
 		s.Unlock()
 		ctx.Pool.Unpin(s)
 		if errors.Is(addErr, storage.ErrNoSpaceInPage) {
+			s321Note(s321HOTNoSpace)
 			return false, nil // caller falls back to normal path
 		}
 		return false, addErr
@@ -3737,10 +3912,21 @@ newSlot, addErr := storage.PageAddHeapTuple(s.Page(), tup)
 		// cleanup the tuple persists as a live HEAP_ONLY_TUPLE
 		// with no CTID link, wasting space and inflating the
 		// line-pointer count. M0118-0131.
+		//
+		// Neither the add nor this removal emits WAL, so the pair MUST
+		// leave the page exactly as the last logged record left it —
+		// otherwise the buffer that reaches disk (it is already dirty
+		// from the logged PagePruneOpt above) disagrees with the page
+		// replay rebuilds. PageAddHeapTuple always appends, so newSlot
+		// is the last line pointer and PageRemoveHeapTuple undoes it
+		// exactly, pd_lower AND pd_upper. M0131-S30.5 / heap.go.
 		if remErr := storage.PageRemoveHeapTuple(s.Page(), newSlot); remErr != nil {
 			// Non-fatal: page is still structurally valid; the
 			// orphan wastes space until the next VACUUM repacks
 			// the page. Do not surface this to the client.
+		} else if lpBeforeAdd >= 0 {
+			// M0131-S30.3 probe: prove the unlogged pair is a page no-op.
+			storage.PageIdentityAssertCount(storage.BufferTag{Rel: rel, Block: blk}, s.Page(), lpBeforeAdd, "hotOrphanClean")
 		}
 		s.Unlock()
 		ctx.Pool.Unpin(s)
@@ -3754,9 +3940,15 @@ newSlot, addErr := storage.PageAddHeapTuple(s.Page(), tup)
 		return false, stampErr
 	}
 
+	// M0131-S30.3 probe step (a): the value about to be written into the record's
+	// new_off must describe THIS page — newSlot == line-pointer count, and never
+	// below the high-water count seen for {rel, blk}. Still under the content
+	// lock, so the counts are stable.
+	storage.PageIdentityAssertEmit(storage.BufferTag{Rel: rel, Block: blk}, s.Page(), newSlot, "hotUpdateEmit")
 	derr := markHeapHotUpdateDirty(ctx.Pool, s, rel, blk, oldSlot, newSlot, effectiveWriterXID(ctx), tupleBytes)
 	s.Unlock()
 	ctx.Pool.Unpin(s)
+	s321Note(s321HOTApplied)
 	return true, derr
 }
 
@@ -4213,6 +4405,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		// (postgres/src/backend/access/heap/heapam.c), it does not re-apply.
 		for i := range pending {
 			if pending[i].blk == ptr.Block && pending[i].slot == actualSlot {
+				s321Note(s321ScanDedup)
 				return true, nil
 			}
 		}
@@ -4305,6 +4498,23 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				// exclusive Lock before our own stamp. Capture old tuple
 				// bytes for WAL logical record (M0094-0002).
 				oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), pu.slot)
+				// M0131-S32.1 TM_SelfModified guard. After an EPQ chain-follow two
+				// pending entries of the SAME statement can converge on one physical
+				// tuple. isConcurrentlyUpdated deliberately ignores our OWN xmax, so
+				// without this the second entry re-stamps a tuple we already killed
+				// and inserts a SECOND new version — leaving two live rows for one
+				// logical row (the pgbench_branches "~10x over-applied" signature).
+				// Upstream heap_update returns TM_SelfModified for a tuple this
+				// command already updated and ExecUpdate skips the row
+				// (postgres/src/backend/executor/nodeModifyTable.c).
+				if oldGerr == nil && oldTup.Header.Xmax != storage.InvalidTransactionID &&
+					oldTup.Header.Xmax == o.ctx.Tx.XID {
+					s.Unlock()
+					o.ctx.Pool.Unpin(s)
+					s321Note(s321EPQSelfModified)
+					epqSkip = true
+					break
+				}
 				// M0100-0005: when epqDoUpdate is set (abort confirmed on previous
 				// iteration), skip the EPQ check and fall through to the update code.
 				if !epqDoUpdate && oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap, o.ctx.MultiXact) {
@@ -4423,6 +4633,45 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 						}
 					}
 					if !chainFound {
+						// M0131-S32.1: not-found does NOT mean the row is gone.
+						// If the chain tip belongs to a transaction still in
+						// flight, PG's ExecUpdate would block on it and re-fetch
+						// (nodeModifyTable.c) — skipping here silently DROPS this
+						// statement's write while still reporting `UPDATE 1`.
+						// Wait for that writer and re-run the EPQ loop; the RC
+						// budget (maxEPQRetriesRC) bounds a pathological lap.
+						if pendXID, pending := epqChainPendingWriter(o.ctx, rel, pu.blk, pu.slot); pending && !s321NoWait &&
+							epqRetry < epqRetryLimit(o.ctx.Tx.Isolation) {
+							s321Note(s321EPQChainPendingWait)
+							if dl, terr := epqWait(o.ctx, pendXID); terr != nil {
+								terr.Pos = o.plan.Pos()
+								return nil, terr
+							} else if dl {
+								return nil, &ExecError{
+									Code:    "40001",
+									Pos:     o.plan.Pos(),
+									Message: "could not serialize access due to concurrent update (deadlock)",
+								}
+							}
+							if o.ctx.Tx.Isolation == mvcc.IsolationReadCommitted && o.ctx.TxnMgr != nil {
+								if newSnap, snapErr := o.ctx.TxnMgr.SnapshotFor(o.ctx.Tx); snapErr == nil {
+									o.ctx.Snap = newSnap
+								}
+							}
+							continue
+						}
+						// M0131-S32.3: same silent drop, one commit-window later.
+						// The tail is LIVE but its writer committed after our
+						// last snapshot refresh, so the snapshot-driven
+						// chain-follow reports not-found while nobody is in
+						// flight for epqChainPendingWriter to wait on.
+						if !s321NoWait && epqRetry < epqRetryLimit(o.ctx.Tx.Isolation) &&
+							epqChainTailLiveButUnseen(o.ctx, rel, pu.blk, pu.slot) {
+							s321Note(s321EPQChainStaleSnap)
+							epqRefreshSnapForRetry(o.ctx)
+							continue
+						}
+						s321Note(s321EPQChainNotFound)
 						epqSkip = true
 						break
 					}
@@ -4442,6 +4691,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 						return nil, err
 					}
 					_ = computeGeneratedColumns(cols, pu.newRow)
+					s321Note(s321EPQChainFollowed)
 					pu.blk = newBlk
 					pu.slot = newSlot
 					continue // re-run loop to stamp xmax on new slot
@@ -4456,6 +4706,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 					// invalidated it after scan-time). Skip.
 					s.Unlock()
 					o.ctx.Pool.Unpin(s)
+					s321Note(s321EPQOldGetFail)
 					epqSkip = true
 					break
 				}
@@ -4840,6 +5091,20 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			oldRow := cloneRow(evalRow)
 			beforeFiredP1 := false
 			if !isInheritChild {
+				// M0131-S32.2: this EPQ loop runs INSIDE the scan callback, and
+				// epqWait refreshes ctx.Snap — the very snapshot scanMatching is
+				// using to decide which tuples to hand us. Leaking the refreshed
+				// snapshot back into the scan lets the rest of the scan see
+				// versions committed after statement start, so the SAME logical
+				// row can be handed to this callback twice (once as the old
+				// version, once as a successor written by another session) and the
+				// statement then writes BOTH — forking one logical row into two
+				// live versions (the over-application signature). Upstream keeps
+				// the scan's snapshot fixed for the whole statement and confines
+				// the EPQ re-fetch to the updating tuple
+				// (postgres/src/backend/executor/execMain.c EvalPlanQual*), so the
+				// refreshed snapshot must not outlive this loop.
+				scanSnap := o.ctx.Snap
 				for epqRetry := 0; ; epqRetry++ {
 					s, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: captureRel, Block: writeBlk})
 					if perr != nil {
@@ -4927,7 +5192,48 @@ func (o *updateOp) Next() (TupleSlot, error) {
 						}
 					}
 					if !found {
-						return nil // row deleted by concurrent tx
+						// M0131-S32.2: the SeqScan arm's scan-phase EPQ loop had
+						// the same defect S32.1 fixed in the write-phase loops —
+						// a failed chain-follow was read as "row deleted by a
+						// concurrent tx" and the row was dropped from `pending`
+						// silently, so the statement reported `UPDATE 0` while a
+						// live successor existed. Under contention the tip is
+						// routinely owned by a writer that has not committed yet
+						// (its xmin is invisible to any snapshot), which is not a
+						// delete. PG blocks on that updater (XactLockTableWait in
+						// heap_lock_tuple, driven by ExecUpdate's TM_Updated loop)
+						// and re-fetches. Do the same: wait, refresh the RC
+						// snapshot, and re-run the loop; epqRetryLimit bounds it.
+						// epqWait already refreshes ctx.Snap on return, so the
+						// retry re-walks the chain under a snapshot that includes
+						// the writer we just waited for.
+						if pendXID, inflight := epqChainPendingWriter(o.ctx, captureRel, writeBlk, writeSlot); inflight && !s322NoWait &&
+							epqRetry < epqRetryLimit(o.ctx.Tx.Isolation) {
+							s321Note(s321ScanEPQPendingWait)
+							if dl, terr := epqWait(o.ctx, pendXID); terr != nil {
+								terr.Pos = o.plan.Pos()
+								return terr
+							} else if dl {
+								return &ExecError{Code: "40001", Pos: o.plan.Pos(),
+									Message: "could not serialize access due to concurrent update (deadlock)"}
+							}
+							continue
+						}
+						// M0131-S32.3: the chain tail may be a LIVE version whose
+						// writer committed after our last snapshot refresh. Both
+						// chain-follow helpers pick "the latest version" by
+						// snapshot visibility, so such a tail reads as not-found
+						// while epqChainPendingWriter (correctly) reports nobody
+						// in flight — and the row is dropped. Refresh and re-lap.
+						if !s322NoWait && epqRetry < epqRetryLimit(o.ctx.Tx.Isolation) &&
+							epqChainTailLiveButUnseen(o.ctx, captureRel, writeBlk, writeSlot) {
+							s321Note(s321ScanEPQStaleSnap)
+							epqRefreshSnapForRetry(o.ctx)
+							continue
+						}
+						s321Note(s321ScanEPQNotFound)
+						o.ctx.Snap = scanSnap
+						return nil // row genuinely deleted by concurrent tx
 					}
 					clear(o.ctx.MultiAssignSubqCache)
 					for i := range captureCols {
@@ -4951,6 +5257,8 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					writeBlk, writeSlot = newBlk, newSlot
 					continue
 				}
+				// Hand the scan back its own snapshot (see scanSnap above).
+				o.ctx.Snap = scanSnap
 				if len(scanTbl.Triggers) > 0 {
 					ret, ok, err := fireTriggers(o.ctx, scanTbl, "before", "update", oldRow, newRow)
 					if err != nil {
@@ -4980,6 +5288,9 @@ func (o *updateOp) Next() (TupleSlot, error) {
 		}); err != nil {
 			return nil, err
 		}
+	}
+	if len(pending) == 0 {
+		s321Note(s321ScanNoRow)
 	}
 	hotEligibleSeq := hotUpdateEligible(o.plan, o.ctx)
 	// M0118-0003 (write-path half): classify this UPDATE for the row-lock wait
@@ -5069,6 +5380,23 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				}
 				s.Lock()
 				oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), pu.slot)
+				// M0131-S32.1 TM_SelfModified guard. After an EPQ chain-follow two
+				// pending entries of the SAME statement can converge on one physical
+				// tuple. isConcurrentlyUpdated deliberately ignores our OWN xmax, so
+				// without this the second entry re-stamps a tuple we already killed
+				// and inserts a SECOND new version — leaving two live rows for one
+				// logical row (the pgbench_branches "~10x over-applied" signature).
+				// Upstream heap_update returns TM_SelfModified for a tuple this
+				// command already updated and ExecUpdate skips the row
+				// (postgres/src/backend/executor/nodeModifyTable.c).
+				if oldGerr == nil && oldTup.Header.Xmax != storage.InvalidTransactionID &&
+					oldTup.Header.Xmax == o.ctx.Tx.XID {
+					s.Unlock()
+					o.ctx.Pool.Unpin(s)
+					s321Note(s321EPQSelfModified)
+					epqSkipSeq = true
+					break
+				}
 				if !epqDoUpdateSeq && oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap, o.ctx.MultiXact) {
 					xmax := concurrentModifierXID(oldTup.Header, o.ctx.MultiXact)
 					s.Unlock()
@@ -5156,6 +5484,43 @@ func (o *updateOp) Next() (TupleSlot, error) {
 						}
 					}
 					if !chainFound {
+						// M0131-S32.1: not-found does NOT mean the row is gone.
+						// If the chain tip belongs to a transaction still in
+						// flight, PG's ExecUpdate would block on it and re-fetch
+						// (nodeModifyTable.c) — skipping here silently DROPS this
+						// statement's write while still reporting `UPDATE 1`.
+						// Wait for that writer and re-run the EPQ loop; the RC
+						// budget (maxEPQRetriesRC) bounds a pathological lap.
+						if pendXID, pending := epqChainPendingWriter(o.ctx, puRel, pu.blk, pu.slot); pending && !s321NoWait &&
+							epqRetry < epqRetryLimit(o.ctx.Tx.Isolation) {
+							s321Note(s321EPQChainPendingWait)
+							if dl, terr := epqWait(o.ctx, pendXID); terr != nil {
+								terr.Pos = o.plan.Pos()
+								return nil, terr
+							} else if dl {
+								return nil, &ExecError{
+									Code:    "40001",
+									Pos:     o.plan.Pos(),
+									Message: "could not serialize access due to concurrent update (deadlock)",
+								}
+							}
+							if o.ctx.Tx.Isolation == mvcc.IsolationReadCommitted && o.ctx.TxnMgr != nil {
+								if newSnap, snapErr := o.ctx.TxnMgr.SnapshotFor(o.ctx.Tx); snapErr == nil {
+									o.ctx.Snap = newSnap
+								}
+							}
+							continue
+						}
+						// M0131-S32.3: see the index-arm site above — a tail that
+						// is live but committed after our last snapshot refresh
+						// must be re-lapped, not skipped.
+						if !s321NoWait && epqRetry < epqRetryLimit(o.ctx.Tx.Isolation) &&
+							epqChainTailLiveButUnseen(o.ctx, puRel, pu.blk, pu.slot) {
+							s321Note(s321EPQChainStaleSnap)
+							epqRefreshSnapForRetry(o.ctx)
+							continue
+						}
+						s321Note(s321EPQChainNotFound)
 						epqSkipSeq = true
 						break
 					}
@@ -5191,6 +5556,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					if pu.retRow != nil && pu.inheritColMap != nil {
 						pu.retRow = remapChildRowToParent(pu.newRow, pu.inheritColMap)
 					}
+					s321Note(s321EPQChainFollowed)
 					pu.blk = newBlk
 					pu.slot = newSlot
 					continue // re-run loop to stamp xmax on new slot
@@ -5240,6 +5606,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 						// RETURN NULL — suppress the row.
 						s.Unlock()
 						o.ctx.Pool.Unpin(s)
+						s321Note(s321EPQOldGetFail)
 						epqSkipSeq = true
 						break
 					}

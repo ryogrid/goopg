@@ -24,7 +24,14 @@ import (
 // root is freed) are followed transparently — the redirect leads to the live
 // chain tip, skipping the freed slots.
 func followHOTChain(page storage.Page, startSlot uint16, snap mvcc.Snapshot, xid storage.TransactionID, mxs *multixact.Store, curcid storage.CommandId, combo *mvcc.ComboCIDStore) (storage.HeapTuple, uint16, bool) {
-	const maxChain = 64
+	// A chain visits distinct slots of ONE page, so MaxHeapTuplesPerPage is
+	// both the tightest correct cycle guard and the only bound PG's
+	// heap_hot_search_buffer implies (it loops until at_chain_end). The
+	// arbitrary 64 used here until M0131-S32 made the 65th version of a
+	// repeatedly-HOT-updated row unreachable through the index while a seq
+	// scan still returned the 64th — a silent wrong answer for one client on
+	// one row (docs/design/0131-0025).
+	const maxChain = storage.MaxHeapTuplesPerPage
 	cur := startSlot
 	for i := 0; i < maxChain; i++ {
 		// Check line-pointer flags before fetching tuple bytes.
@@ -69,7 +76,8 @@ func followHOTChain(page storage.Page, startSlot uint16, snap mvcc.Snapshot, xid
 // content RLock for the lifetime of the returned tuple — the
 // returned tuple.Data aliases the page bytes (M0092-0006).
 func followHOTChainNoCopy(page storage.Page, startSlot uint16, snap mvcc.Snapshot, xid storage.TransactionID, mxs *multixact.Store, curcid storage.CommandId, combo *mvcc.ComboCIDStore) (storage.HeapTuple, uint16, bool) {
-	const maxChain = 64
+	// Same bound as followHOTChain — see the rationale there (M0131-S32).
+	const maxChain = storage.MaxHeapTuplesPerPage
 	cur := startSlot
 	for i := 0; i < maxChain; i++ {
 		item, err := storage.PageGetItemID(page, cur)
@@ -116,7 +124,10 @@ func followHOTChainNoCopy(page storage.Page, startSlot uint16, snap mvcc.Snapsho
 // conservatively NOT dead-to-all: the heap slot may already carry an
 // unrelated tuple.
 func heapChainDeadToAll(page storage.Page, startSlot uint16, oldestXmin storage.TransactionID) bool {
-	const maxChain = 64
+	// Same bound as followHOTChain — see the rationale there (M0131-S32). A
+	// short bound here is not a wrong answer (it vetoes the index kill
+	// conservatively) but it silently disables kills on long chains.
+	const maxChain = storage.MaxHeapTuplesPerPage
 	cur := startSlot
 	for i := 0; i < maxChain; i++ {
 		item, err := storage.PageGetItemID(page, cur)

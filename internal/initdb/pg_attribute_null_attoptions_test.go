@@ -24,12 +24,19 @@ func TestPgAttributeRowEmitsNullForOptionalArrayColumns(t *testing.T) {
 	}
 	// The four trailing nullable varlena columns that
 	// RelationGetIndexAttOptions inspects, plus attstattarget (also NULL).
-	nullable := map[int]string{
-		20: "attacl",
-		21: "attoptions",
-		22: "attfdwoptions",
-		23: "attmissingval",
-		24: "attstattarget",
+	// Resolved by NAME against pgAttrColDefs rather than by hardcoded index:
+	// M0131-S14.1 moved attstattarget from #25 to its PG18-canonical #21 and
+	// this map silently kept asserting the right positions under the wrong
+	// labels, which is the sort of drift the whole slice is about.
+	nullable := map[int]string{}
+	for i, c := range pgAttrColDefs() {
+		switch c.Name {
+		case "attstattarget", "attacl", "attoptions", "attfdwoptions", "attmissingval":
+			nullable[i] = c.Name
+		}
+	}
+	if len(nullable) != 5 {
+		t.Fatalf("pgAttrColDefs: found %d of the 5 nullable trailing columns", len(nullable))
 	}
 	for idx, name := range nullable {
 		if !row[idx].IsNull() {

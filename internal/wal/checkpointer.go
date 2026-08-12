@@ -96,11 +96,12 @@ type CheckpointerConfig struct {
 	// Interval is the period between automatic checkpoints
 	// (mirrors upstream's checkpoint_timeout).
 	Interval time.Duration
-	// MaxWALBytes, when > 0, fires a checkpoint as soon as the
-	// WAL bytes written since the last checkpoint exceed this
-	// threshold (mirrors upstream's max_wal_size). Requires the
-	// underlying writer to satisfy volumeReporter; otherwise the
-	// trigger is a no-op.
+	// MaxWALBytes, when > 0, is upstream's max_wal_size expressed in
+	// bytes. It is NOT the trigger distance: like PG, the distance is
+	// derived from it by CalculateCheckpointSegments — see
+	// checkpointSegments/volumeTriggerFires. Requires the underlying
+	// writer to satisfy volumeReporter; otherwise the trigger is a
+	// no-op.
 	MaxWALBytes uint64
 	// VolumeCheckInterval is how often the loop polls
 	// WrittenLSN to evaluate the volume trigger between timer
@@ -148,6 +149,37 @@ type CheckpointerConfig struct {
 	// cannot recover the OID counter from pg_control alone, requiring
 	// pg_catalog.json. M0106-0013.
 	NextOIDFn func() uint32
+
+	// TimelineIDFn, when non-nil, is invoked at each checkpoint to read
+	// the LIVE timeline the WAL writer is emitting on (M0131-S18.3).
+	// Both the checkpoint record's ThisTimeLineID/PrevTimeLineID and
+	// pg_control's checkPointCopy used to be hardcoded to 1, so the first
+	// checkpoint after a promotion (M0130-S8.5 finalizePromotion) stomped
+	// pg_control back to TLI 1 while the segments on disk were named for
+	// TLI 2 — a real PG then PANICs "could not locate a valid checkpoint
+	// record". Wired to Writer.TimelineID by initdb.Open; nil keeps the
+	// historical TLI 1. PrevTimeLineID mirrors ThisTimeLineID, matching
+	// upstream CreateCheckPoint for every non-end-of-recovery checkpoint
+	// (xlog.c:7030-7034).
+	TimelineIDFn func() uint32
+
+	// FullPageWritesFn, when non-nil, reports the live full_page_writes
+	// setting as the buffer pool sees it — upstream samples
+	// Insert->fullPageWrites under the WAL insert lock (xlog.c:7041), not
+	// the postgresql.conf text, because a runtime ALTER SYSTEM takes
+	// effect only at the next XLOG_FPW_CHANGE. The GUC reaches the pool
+	// (cmd/goopg/main.go, Pool.SetFullPageWrites) but never reached
+	// pg_control or the checkpoint record before M0131-S18.3. nil keeps
+	// the historical unconditional `on`.
+	FullPageWritesFn func() bool
+
+	// NextMultiXactFn, when non-nil, reports the multixact allocator's
+	// next-to-assign MultiXactId, its next member offset, and the oldest
+	// MultiXactId still needed. goopg's store never truncates, so oldest
+	// stays FirstMultiXactId; the seam exists so pg_control stops
+	// claiming nextMulti = 1 on a cluster that has created multixacts
+	// (M0131-S18.4). nil keeps FirstMultiXactId/0/FirstMultiXactId.
+	NextMultiXactFn func() (next, nextOffset, oldest uint32)
 
 	// PostCheckpointFn, when non-nil, is called at the end of each
 	// successful checkpoint (timed, volume-triggered, or on-demand).
@@ -265,6 +297,16 @@ type Checkpointer struct {
 	lastCheckpointLSN      atomic.Uint64
 	lastCheckpointRedoLSN  atomic.Uint64
 	lastCheckpointStartLSN atomic.Uint64
+
+	// volumeAnchor is the fallback RedoRecPtr for the max_wal_size
+	// trigger before this process has completed its first checkpoint:
+	// the writer position observed when Run started. Upstream always has
+	// a RedoRecPtr — recovery seeds it from the checkpoint it started
+	// from — so the elapsed-segment count is measured from "where this
+	// server began writing" rather than from LSN 0. Anchoring at 0 would
+	// make every restart of a cluster whose WAL has already passed
+	// max_wal_size fire a checkpoint on the first poll (M0131-S30.4).
+	volumeAnchor atomic.Uint64
 
 	// distMu guards priorRedoLSN/checkPointDistanceEstimate. Checkpoints
 	// are infrequent (seconds-to-minutes apart) so a plain mutex — rather
@@ -416,6 +458,14 @@ func (c *Checkpointer) SetRetainer(r Retainer) {
 	c.retainer = r
 }
 
+// SetNextMultiXactFn installs the multixact-counter hook (M0131-S18.4).
+// A setter rather than a CheckpointerConfig literal because the
+// process-shared multixact store is created in cmd/goopg after
+// initdb.Open has already built the checkpointer. Call before Run starts.
+func (c *Checkpointer) SetNextMultiXactFn(fn func() (next, nextOffset, oldest uint32)) {
+	c.cfg.NextMultiXactFn = fn
+}
+
 // SetCompletionTarget updates the spread fraction (0 disables
 // spreading, 1 spreads across the full Interval). Out-of-range
 // values are clamped.
@@ -447,6 +497,9 @@ func (c *Checkpointer) Run(ctx context.Context) error {
 	var volumeC <-chan time.Time
 	vr, _ := c.wal.(volumeReporter)
 	if c.cfg.MaxWALBytes > 0 && vr != nil {
+		// Seed the pre-first-checkpoint RedoRecPtr stand-in — see
+		// volumeAnchor's doc comment.
+		c.volumeAnchor.Store(vr.WrittenLSN())
 		vt := time.NewTicker(c.cfg.VolumeCheckInterval)
 		defer vt.Stop()
 		volumeC = vt.C
@@ -474,21 +527,97 @@ func (c *Checkpointer) Run(ctx context.Context) error {
 	}
 }
 
-// volumeTriggerFires reports whether the WAL has accumulated more
-// than MaxWALBytes since the last successful checkpoint. The
-// "since the last checkpoint" anchor uses the current writer
-// position when no checkpoint has run yet, which matches
-// upstream's CheckpointSegments / CheckPointsReqd accounting:
-// the very first window starts from server start.
-func (c *Checkpointer) volumeTriggerFires(vr volumeReporter) bool {
-	written := vr.WrittenLSN()
-	last := c.lastCheckpointLSN.Load()
-	if last == 0 {
-		// No checkpoint yet — anchor on server start (LSN 0)
-		// so MaxWALBytes still gates the very first window.
-		return written >= c.cfg.MaxWALBytes
+// segmentSize reports the WAL segment size this checkpointer reasons in,
+// falling back to the 16 MiB default when the config leaves it unset.
+func (c *Checkpointer) segmentSize() uint64 {
+	if c.cfg.SegmentSize > 0 {
+		return uint64(c.cfg.SegmentSize)
 	}
-	return written > last && (written-last) >= c.cfg.MaxWALBytes
+	return uint64(DefaultSegmentSize)
+}
+
+// checkpointSegments mirrors upstream's CalculateCheckpointSegments
+// (xlog.c:2170-2198): max_wal_size is the ceiling on WAL kept for one
+// checkpoint cycle, and a spread checkpoint itself consumes
+// checkpoint_completion_target more segments while it runs, so the trigger
+// distance is max_wal_size / (1 + checkpoint_completion_target) — NOT
+// max_wal_size itself. Rounded down, floored at 1, exactly like upstream.
+//
+// M0131-S30.4: goopg used the raw byte value, so at the shared PG defaults
+// (max_wal_size = 1 GiB, checkpoint_completion_target = 0.9, 16 MiB
+// segments) it checkpointed every 1024 MiB where PG checkpoints every
+// 32 segments = 512 MiB — half as often as the oracle under identical
+// settings.
+func (c *Checkpointer) checkpointSegments() uint64 {
+	segs := uint64(float64(c.cfg.MaxWALBytes/c.segmentSize()) / (1.0 + c.completionTargetForSegments()))
+	if segs < 1 {
+		segs = 1
+	}
+	return segs
+}
+
+// completionTargetForSegments clamps CompletionTarget into [0,1] for the
+// segment math. SetCompletionTarget already clamps, but the field is also
+// settable directly through a CheckpointerConfig literal.
+func (c *Checkpointer) completionTargetForSegments() float64 {
+	t := c.cfg.CompletionTarget
+	if t < 0 {
+		return 0
+	}
+	if t > 1 {
+		return 1
+	}
+	return t
+}
+
+// volumeTriggerFires reports whether enough WAL segments have elapsed since
+// the last checkpoint's REDO point to warrant a new checkpoint, mirroring
+// upstream's XLogCheckpointNeeded (xlog.c:2279-2289):
+//
+//	new_segno >= old_segno + (CheckPointSegments - 1)
+//
+// with old_segno taken from RedoRecPtr. Two deviations were fixed in
+// M0131-S30.4: the distance is now CheckPointSegments (see
+// checkpointSegments), and the anchor is the checkpoint's redo point rather
+// than the checkpoint RECORD's end LSN. The record trails redo by the whole
+// flush phase plus the running-xacts record, so anchoring on it silently
+// shortened every window after the first by that gap.
+func (c *Checkpointer) volumeTriggerFires(vr volumeReporter) bool {
+	if c.cfg.MaxWALBytes == 0 {
+		return false
+	}
+	written := vr.WrittenLSN()
+	segSize := c.segmentSize()
+	// lastCheckpointRedoLSN is stored 1-based (internal convention);
+	// convert back to the 0-based byte position segment numbers use.
+	anchor := c.volumeAnchor.Load()
+	if redo := c.lastCheckpointRedoLSN.Load(); redo > 0 {
+		anchor = redo - 1
+	}
+	newSegNo := written / segSize
+	oldSegNo := anchor / segSize
+	if newSegNo < oldSegNo {
+		return false
+	}
+	return newSegNo-oldSegNo >= c.elapsedSegmentsNeeded()
+}
+
+// elapsedSegmentsNeeded is XLogCheckpointNeeded's `CheckPointSegments - 1`
+// with a floor of one elapsed segment. The floor exists because of WHERE
+// the two engines evaluate the test: upstream calls XLogCheckpointNeeded
+// from XLogWrite only when it has just opened a NEW segment
+// (xlog.c:2415-2440), so at CheckPointSegments == 1 — any max_wal_size
+// below two segments' worth — it still checkpoints once per segment.
+// goopg instead polls on VolumeCheckInterval, where a bare
+// `elapsed >= 0` is satisfied on every tick: measured on a 48 MB
+// max_wal_size cluster, that produced 42 checkpoints in 40 s of pgbench,
+// most of them against WAL that had not advanced a single segment
+// (M0131-S30.4).
+func (c *Checkpointer) elapsedSegmentsNeeded() uint64 {
+	if segs := c.checkpointSegments(); segs > 1 {
+		return segs - 1
+	}
+	return 1
 }
 
 // CheckpointNow performs a synchronous, IMMEDIATE-speed
@@ -540,6 +669,39 @@ func (c *Checkpointer) runningXacts(nextXid uint64) ([]uint32, uint32, uint32) {
 		nextXid = 3 // FirstNormalTransactionId floor, mirrors EncodeCheckpointPG
 	}
 	return nil, uint32(nextXid), uint32(nextXid - 1)
+}
+
+// timelineID reports the timeline this checkpoint belongs to (M0131-S18.3).
+// Falls back to 1 — the bootstrap timeline — when no hook is wired, which
+// is what every caller got unconditionally before the hook existed.
+func (c *Checkpointer) timelineID() uint32 {
+	if c.cfg.TimelineIDFn == nil {
+		return 1
+	}
+	if tli := c.cfg.TimelineIDFn(); tli != 0 {
+		return tli
+	}
+	return 1
+}
+
+// fullPageWrites reports the live full_page_writes setting (M0131-S18.3).
+// Defaults to true, matching both the GUC's BootVal and the historical
+// hardcoded value.
+func (c *Checkpointer) fullPageWrites() bool {
+	if c.cfg.FullPageWritesFn == nil {
+		return true
+	}
+	return c.cfg.FullPageWritesFn()
+}
+
+// nextMultiXact reports the multixact allocator state for the checkpoint
+// (M0131-S18.4). Without a hook it reports the bootstrap triple, which is
+// what the encoder hardcoded before.
+func (c *Checkpointer) nextMultiXact() (next, nextOffset, oldest uint32) {
+	if c.cfg.NextMultiXactFn == nil {
+		return firstMultiXactId, 0, firstMultiXactId
+	}
+	return c.cfg.NextMultiXactFn()
 }
 
 func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool) error {
@@ -677,6 +839,22 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 	if c.cfg.NextOIDFn != nil {
 		nextOid = c.cfg.NextOIDFn()
 	}
+	// M0131-S18.3/.4: sample the live timeline, full_page_writes and
+	// multixact counters ONCE, before the record is encoded, so the
+	// checkpoint record and the pg_control checkPointCopy written below
+	// cannot disagree — PG cross-checks the two at startup.
+	cpFields := CheckPointFields{
+		ThisTLI:        c.timelineID(),
+		FullPageWrites: c.fullPageWrites(),
+		WalLevel:       uint32(max(c.cfg.GUCParams.WalLevel, 0)),
+		NextXid:        nextXid,
+		NextOid:        nextOid,
+	}
+	cpFields.NextMulti, cpFields.NextMultiOffset, cpFields.OldestMulti = c.nextMultiXact()
+	// Resolve PrevTLI/OldestXidDB/OldestMultiDB and every floor now, so the
+	// pg_control writer below reads the same values the record encodes
+	// rather than re-deriving them.
+	cpFields = cpFields.withDefaults()
 	var checkpointPayload []byte
 	if c.cfg.PGCompatCheckpoints {
 		// A9-checkpoint-opcode: explicit ONLINE/SHUTDOWN opcode via the
@@ -701,7 +879,9 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 			}
 		}
 		var cerr error
-		checkpointPayload, cerr = EncodeCheckpointPG(shutdown, redoLSN0, 1, nextXid, nextOid, oldestActive)
+		cpFields.RedoLSN0 = redoLSN0
+		cpFields.OldestActiveXid = oldestActive
+		checkpointPayload, cerr = EncodeCheckpointPGFields(shutdown, cpFields)
 		if cerr != nil {
 			return fmt.Errorf("encode checkpoint record: %w", cerr)
 		}
@@ -750,9 +930,16 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 			cd.CheckPoint = checkLSN0
 			cd.CheckPointCopyRedo = redoLSN0
 			cd.CheckPointCopyTime = now
-			cd.CheckPointCopyThisTLI = 1
-			cd.CheckPointCopyPrevTLI = 1
-			cd.CheckPointCopyFullPageWrites = true
+			// M0131-S18.3/.4: the same sample the checkpoint record above
+			// carries. These three were hardcoded 1/1/true, which stomped
+			// pg_control back to TLI 1 after a promotion.
+			cd.CheckPointCopyThisTLI = cpFields.ThisTLI
+			cd.CheckPointCopyPrevTLI = cpFields.PrevTLI
+			cd.CheckPointCopyFullPageWrites = cpFields.FullPageWrites
+			cd.CheckPointCopyNextMulti = cpFields.NextMulti
+			cd.CheckPointCopyNextMultiOffset = cpFields.NextMultiOffset
+			cd.CheckPointCopyOldestMulti = cpFields.OldestMulti
+			cd.CheckPointCopyOldestMultiDB = cpFields.OldestMultiDB
 			// M0106-0010 batched-45: refresh checkPointCopy.nextXid so a
 			// PG standby attached after this checkpoint sees the right
 			// snapshot xmax instead of the bootstrap FirstNormalXID=3.

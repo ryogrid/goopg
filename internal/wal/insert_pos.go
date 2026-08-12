@@ -57,11 +57,14 @@ import "sync"
 // pad record's start (i.e. `oldCurr`), preserving the xl_prev chain
 // across the boundary.
 type insertPosTracker struct {
-	posMu          sync.Mutex
-	curr           uint64
-	prev           uint64
-	segSize        uint64
-	onCrossSegment func(start, boundary, prev uint64)
+	posMu   sync.Mutex
+	curr    uint64
+	prev    uint64
+	segSize uint64
+	// onCrossSegment returns true when it wrote a PAD RECORD over the gap and
+	// false when the gap was only zero-filled (too small for a well-formed
+	// record — M0131-S30.6). Only a real pad record advances `prev`.
+	onCrossSegment func(start, boundary, prev uint64) (padded bool)
 }
 
 // newInsertPosTracker initialises a tracker. startCurr is the LSN
@@ -72,7 +75,7 @@ type insertPosTracker struct {
 // fires exactly once per crossing with payload (gapStart, boundary,
 // gapPrev) where the gap covers `[gapStart, boundary)` and gapPrev
 // is the prev pointer to stamp into the pad record.
-func newInsertPosTracker(startCurr, startPrev, segSize uint64, onCross func(start, boundary, prev uint64)) *insertPosTracker {
+func newInsertPosTracker(startCurr, startPrev, segSize uint64, onCross func(start, boundary, prev uint64) (padded bool)) *insertPosTracker {
 	if segSize == 0 {
 		panic("wal: insertPosTracker requires non-zero segSize")
 	}
@@ -150,7 +153,10 @@ func (t *insertPosTracker) reserveLocked(size uint64) (start, prev uint64) {
 	boundary := (oldSeg + 1) * t.segSize
 	gapPrev := t.prev
 	if t.onCrossSegment != nil {
-		t.onCrossSegment(old, boundary, gapPrev)
+		// Legacy (non-emitted) reservation path: `prev` is set to `old`
+		// unconditionally below, so the padded/zero-filled distinction the
+		// emitted path makes does not apply here.
+		_ = t.onCrossSegment(old, boundary, gapPrev)
 	}
 	start = boundary
 	prev = old

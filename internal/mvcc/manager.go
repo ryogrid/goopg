@@ -212,6 +212,17 @@ func (m *Manager) SetCLog(c *CLog) {
 	m.abortedMu.Unlock()
 }
 
+// HasCLog reports whether a durable commit log is installed. Exists so callers
+// outside this package can assert the startup wiring: M0131-S30.7 found that
+// SetCLog had no production caller at all for the whole of M0117..M0131, which
+// made the entire durable-abort visibility fallback dead code on every live
+// server (docs/design/0131-0027).
+func (m *Manager) HasCLog() bool {
+	m.abortedMu.RLock()
+	defer m.abortedMu.RUnlock()
+	return m.clog != nil
+}
+
 // SetCatalogXminSource installs (or, with nil, clears) the hook OldestXmin
 // consults to hold the global pruning/truncation horizon back to the oldest
 // catalog_xmin pinned by any active logical replication slot. The server wires

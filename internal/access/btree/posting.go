@@ -88,26 +88,48 @@ func (f indexFormat) postingSizeFor(key []byte, nhtids int) int {
 // a shorter list is a caller bug and panics rather than silently writing a
 // tuple whose alt-TID bits say "posting" but whose array holds one entry.
 func (f indexFormat) marshalPosting(key []byte, tids []storage.ItemPointer) []byte {
+	if f.tupleKeys() {
+		return PGBTPostingRaw(key, tids)
+	}
 	n := len(tids)
 	postingOffset := f.postingOffsetFor(key)
 	raw := make([]byte, f.postingSizeFor(key, n))
-	if f.tupleKeys() {
-		// The key already carries a header whose flag bits (null bitmap
-		// present, varwidth attributes) are what DEFORMS it — copy the tuple
-		// whole and rewrite only the size half, or the posting becomes
-		// undecodable as a key.
-		copy(raw, key)
-		pgPutIndexTupleSize(raw, len(raw))
-	} else {
-		binary.LittleEndian.PutUint16(raw[6:8], uint16(len(raw)))
-		copy(raw[SizeOfIndexTupleData:], key)
-	}
+	binary.LittleEndian.PutUint16(raw[6:8], uint16(len(raw)))
+	copy(raw[SizeOfIndexTupleData:], key)
 	off := postingOffset
 	for _, tid := range tids {
-		PutPGItemPointer(raw[off:off+6], tid)
-		off += 6
+		PutPGItemPointer(raw[off:off+SizeOfItemPointerData], tid)
+		off += SizeOfItemPointerData
 	}
 	if err := BTreeTupleSetPosting(raw, uint16(n), postingOffset); err != nil {
+		panic(err)
+	}
+	return raw
+}
+
+// PGBTPostingRaw is upstream's `_bt_form_posting` (nbtdedup.c) and the ONE
+// encoder for a tuple-format posting-list item — the same role PGBTItemRaw
+// plays for a plain item, exported for the same reason: out-of-package
+// fixtures and validators must build postings through the engine's encoder
+// rather than transcribe the alt-TID layout a second time.
+//
+// `base` is the plain leaf tuple the posting stands for; it is copied WHOLE
+// (its header's null-bitmap / varwidth flag bits are what deforms it, so
+// rebuilding a header around the key material would make the posting
+// undecodable), and only the size half is restamped. The TID array starts at
+// MAXALIGN(len(base)) and the total is MAXALIGNed, exactly as upstream's
+// `keysize` / `newsize`.
+func PGBTPostingRaw(base []byte, tids []storage.ItemPointer) []byte {
+	postingOffset := MaxAlign(len(base))
+	raw := make([]byte, MaxAlign(postingOffset+len(tids)*SizeOfItemPointerData))
+	copy(raw, base)
+	pgPutIndexTupleSize(raw, len(raw))
+	off := postingOffset
+	for _, tid := range tids {
+		PutPGItemPointer(raw[off:off+SizeOfItemPointerData], tid)
+		off += SizeOfItemPointerData
+	}
+	if err := BTreeTupleSetPosting(raw, uint16(len(tids)), postingOffset); err != nil {
 		panic(err)
 	}
 	return raw
@@ -239,6 +261,63 @@ func (f indexFormat) appendTIDToPosting(raw []byte, tid storage.ItemPointer) ([]
 		return nil, fmt.Errorf("btree posting: %d TIDs exceeds BT_OFFSET_MASK %d", len(tids), BTPostingMaxTIDs)
 	}
 	return f.marshalPosting(key, tids), nil
+}
+
+// SwapPosting is upstream's `_bt_swap_posting` (nbtdedup.c), the posting-list
+// SPLIT: `newitem`'s heap TID belongs in the middle of the existing posting
+// `oposting`, at array index `postingoff`. It returns the rewritten posting and
+// the FINAL form of the new item.
+//
+// The trade is upstream's and is not obvious from the name — nothing grows:
+//
+//   - `nposting` keeps oposting's exact byte length and TID count. TIDs at
+//     [postingoff, nhtids-1) shift one slot right, oposting's rightmost/max TID
+//     falls off the end, and newitem's original TID fills the gap at postingoff.
+//   - the evicted max TID becomes the new item's t_tid, so the item that is
+//     actually inserted on the page is NOT the item the caller passed in.
+//
+// Keeping the length fixed is what lets the caller overwrite oposting in place
+// (`memcpy(oposting, nposting, MAXALIGN(IndexTupleSize(nposting)))` upstream,
+// PageReplaceItemRaw's in-place branch here) — the page only has to find room
+// for the one new item.
+//
+// M0131-S21b part 2. goopg's own insert path never splits a posting list (it
+// appends via appendTIDToPosting), so this exists for WAL redo of a real PG's
+// XLOG_BTREE_INSERT_POST: redo must repeat the primary's split byte for byte,
+// because the record carries `orignewitem`, not the final item.
+//
+// Both inputs are read-only; the returned slices are fresh.
+func SwapPosting(newitem, oposting []byte, postingoff int) (nposting, finalNewitem []byte, err error) {
+	postingOffset, nhtids, err := postingBounds(oposting)
+	if err != nil {
+		return nil, nil, fmt.Errorf("btree swap-posting: %w", err)
+	}
+	if !BTreeTupleIsPosting(oposting) {
+		return nil, nil, fmt.Errorf("btree swap-posting: existing item is not a posting list")
+	}
+	// Upstream's own sanity check: postingoff came from _bt_binsrch_posting and
+	// is 0 only when the leaf page holds a non-pivot tuple identical to newitem
+	// (corruption). Redo must refuse rather than write a posting whose TIDs are
+	// no longer ascending.
+	if postingoff <= 0 || postingoff >= nhtids {
+		return nil, nil, fmt.Errorf("btree swap-posting: posting list tuple with %d items cannot be split at offset %d", nhtids, postingoff)
+	}
+	if len(newitem) < SizeOfIndexTupleData {
+		return nil, nil, fmt.Errorf("btree swap-posting: new item too short (%d bytes)", len(newitem))
+	}
+	if BTreeTupleIsPosting(newitem) || BTreeTupleIsPivot(newitem) {
+		return nil, nil, fmt.Errorf("btree swap-posting: new item is a posting list or pivot tuple")
+	}
+
+	nposting = append([]byte(nil), oposting...)
+	tidAt := func(i int) int { return postingOffset + i*SizeOfItemPointerData }
+	// copy() is memmove semantics in Go, so the overlap is safe.
+	copy(nposting[tidAt(postingoff+1):tidAt(nhtids)], nposting[tidAt(postingoff):tidAt(nhtids-1)])
+	PutPGItemPointer(nposting[tidAt(postingoff):tidAt(postingoff+1)], PGIndexTupleTID(newitem))
+
+	finalNewitem = append([]byte(nil), newitem...)
+	PutPGItemPointer(finalNewitem, PGItemPointerAt(oposting[tidAt(nhtids-1):tidAt(nhtids)]))
+	return nposting, finalNewitem, nil
 }
 
 // promoteSingleToPosting (M0055-0003) builds a 2-TID posting

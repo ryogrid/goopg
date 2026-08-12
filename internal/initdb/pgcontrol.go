@@ -125,13 +125,30 @@ func walLevelInt(reg *config.Registry) uint32 {
 	}
 }
 
-// UpdateControlCheckpoint overwrites the checkpoint-related fields in the
-// on-disk pg_control file. Used by BASE_BACKUP after a forced checkpoint so
-// a PostgreSQL standby booted from the backup sees a valid REDO location.
-// UpdateControlCheckpoint overwrites the checkpoint-related fields in the
-// on-disk pg_control file. Used by BASE_BACKUP after a forced checkpoint so
-// a PostgreSQL standby booted from the backup sees a valid REDO location.
-func UpdateControlCheckpoint(dataDir string, redoLSN, ckptRecordLSN uint64) error {
+// BackupControlImage renders the checkpoint-patched pg_control image that
+// BASE_BACKUP ships inside its tar, WITHOUT touching the source cluster's
+// own pg_control. A PostgreSQL standby booted from the backup needs a valid
+// REDO location, a non-zero minRecoveryPoint and a backupEndPoint; the live
+// primary must have none of them.
+//
+// tli is the LIVE timeline the WAL writer is emitting on (M0131-S18.3);
+// pass 0 when unknown and the bootstrap timeline 1 is assumed. It used to
+// be hardcoded to 1, so a BASE_BACKUP taken from a promoted (TLI >= 2)
+// cluster wrote checkPointCopy.ThisTimeLineID = 1 into a pg_control whose
+// segments were named for TLI 2, and a PG booted from it PANICs "could not
+// locate a valid checkpoint record".
+//
+// M0131-S29: this function used to be UpdateControlCheckpoint, which wrote
+// the same fields into the LIVE data directory. That left a running primary
+// claiming minRecoveryPoint = 1 on its own timeline; a crash inside the
+// BASE_BACKUP -> next-checkpoint window on a promoted cluster then made PG
+// FATAL "requested timeline %u does not contain minimum recovery point"
+// (postgres/src/backend/access/transam/xlogrecovery.c:878-886), and goopg's
+// own crash recovery is required to leave the field invalid
+// (xlog.c:7295-7297, asserted by TestCrashRecoveryLeavesMinRecoveryPointInvalid).
+// Upstream's basebackup.c:352-360 likewise sends XLOG_CONTROL_FILE through a
+// plain sendFile() and never rewrites the source.
+func BackupControlImage(dataDir string, redoLSN, ckptRecordLSN uint64, tli uint32) ([]byte, error) {
 	// goopg uses 1-based LSNs internally; PG expects 0-based.
 	lsn0 := redoLSN - 1
 	// CheckPoint names the checkpoint RECORD's own start — since
@@ -143,20 +160,28 @@ func UpdateControlCheckpoint(dataDir string, redoLSN, ckptRecordLSN uint64) erro
 	if ckptRecordLSN > 0 {
 		ckpt0 = ckptRecordLSN - 1
 	}
+	if tli == 0 {
+		tli = 1
+	}
 	now := time.Now()
-	return control.UpdateControlFile(dataDir, func(cd *control.ControlFileData) {
+	return control.BuildUpdatedControlImage(dataDir, func(cd *control.ControlFileData) {
 		cd.State = control.DBStateInProduction
 		cd.Time = now.Unix()
 		cd.CheckPoint = ckpt0
 		cd.CheckPointCopyRedo = lsn0
 		cd.CheckPointCopyTime = now.Unix()
-		cd.CheckPointCopyThisTLI = 1
-		cd.CheckPointCopyPrevTLI = 1
+		// PrevTimeLineID mirrors ThisTimeLineID for every checkpoint that
+		// is not an end-of-recovery one (xlog.c:7030-7034).
+		cd.CheckPointCopyThisTLI = tli
+		cd.CheckPointCopyPrevTLI = tli
 		cd.CheckPointCopyFullPageWrites = true
 		// minRecoveryPoint must be non-zero so CheckRecoveryConsistency
 		// doesn't bail out immediately (XLogRecPtrIsInvalid(0) returns true).
+		// Its timeline must be the live one too, or PG FATALs "requested
+		// timeline %u does not contain minimum recovery point"
+		// (xlogrecovery.c:878-886).
 		cd.MinRecoveryPoint = 1
-		cd.MinRecoveryPointTLI = 1
+		cd.MinRecoveryPointTLI = tli
 		// backupEndPoint = redo LSN so ReachedEndOfBackup() is satisfied
 		// after the first WAL record (the checkpoint) has been replayed.
 		cd.BackupEndPoint = lsn0
