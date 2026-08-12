@@ -1,6 +1,7 @@
 # Durable MultiXact SLRU + `multixact_redo` — the last unavoidable missing rmgr
 
-**Status:** draft
+**Status:** accepted — **S24 DEFERRED out of M0131** (decision recorded
+2026-08-12, see §Scoping "Decision"); three ledger rows filed under M0131-S24.
 **Date:** 2026-08-11
 **Milestone:** M0131 (Theme F, S24)
 
@@ -141,11 +142,41 @@ the replay driver, not inside a per-record function.
 
 ### Two adjacent defects that need ledger rows regardless
 
-**(a) goopg's emit side stamps a multi xmax with no WAL record at all.** Four
-producer sites write `PageSetHeapTupleXmaxMulti` and then only `MarkDirty`:
-`internal/executor/operators_lockrows.go:2040` (`stampMultiLock`) and `:2126`
-(`stampMultiUpdaterLock`); `internal/executor/operators_storage.go:3468`
-(`carryForwardLockersToNewTuple`) and `:3485` (`stampUpdaterXmaxNonHOT`). The
+**(a) goopg's emit side loses a multi xmax across its own redo.**
+
+> **Correction (2026-08-12, verified at HEAD during the S24 deferral closure).**
+> This section originally said all four producer sites "write
+> `PageSetHeapTupleXmaxMulti` and then only `MarkDirty`". That is true of **two**
+> of them, not four, and the other two fail in a materially different — and worse
+> — way. The corrected statement:
+>
+> - **Row-lock sites** (`operators_lockrows.go:2040` `stampMultiLock`, `:2126`
+>   `stampMultiUpdaterLock`) genuinely emit **no record**: they call
+>   `Pool.MarkDirtyUnlogged` with a named reason. For the lock-only case the
+>   justification below holds.
+> - **UPDATE/DELETE producer sites** (`operators_storage.go:3626`
+>   `carryForwardLockersToNewTuple`, `:3643` `stampUpdaterXmaxNonHOT` — line
+>   numbers drifted from the `:3468`/`:3485` originally cited) **do** ride an
+>   ordinary WAL-logged delete/update. The record simply does not describe the
+>   multi: every `markHeapDeleteDirtyAndClearVM` call site passes
+>   `xmax = effectiveWriterXID(ctx)` (a plain xid), and
+>   `EncodeHeapDeletePG`/`EncodeHeapUpdatePG` hardcode `infobits_set = 0`
+>   (`pg_assembled_emit.go:184`, `:252`, `:284`). Redo therefore reproduces what
+>   the record says: a bare single-xid xmax with `HEAP_XMAX_IS_MULTI` **cleared**,
+>   silently dropping the preserved lockers.
+>
+> The consequence is sharper than "membership is lost": recovery *succeeds*, and
+> the multixact-no-forget property M0118-0009 exists to uphold does not survive a
+> crash. Note S21h taught **redo** to honour `XLHL_XMAX_IS_MULTI` — nothing on the
+> emit side ever sets it. Pinned by
+> `internal/wal/multixact_producer_redo_gap_test.go` (2 tests, both proven
+> fail-when-broken), and ledgered under M0131-S24.
+>
+> The emit fix is **deliberately gated on the SLRU**: emitting a MultiXactId into
+> WAL before the member sets are durable makes recovery worse, because a replayed
+> xmax that resolves to nothing hides rows per defect (b).
+
+The original text, retained for the lock-only half it correctly describes. The
 justifying comment is at `operators_lockrows.go:2044-2051`:
 
 > *"MultiXact membership is process-shared in-memory state, not yet persisted
@@ -204,6 +235,27 @@ and are *not* gated on this choice. **Whichever way it goes, record the decision
 explicitly in the milestone plan — this must not be settled by omission**, because
 "the E2E happened not to be concurrent" is indistinguishable from "multixact is
 handled" in a green test run.
+
+#### Decision (2026-08-12) — DEFERRED, with the recommendation taken verbatim
+
+S28 shipped single-session, so **S24 is deferred out of M0131**. The re-arm
+trigger is executable exactly as recommended above:
+`TestE2E_GoopgCrashStartOnPGDataDir_Concurrent`
+(`internal/testport/e2e_goopg_crashstart_on_pgdata_test.go:221`) carries
+`t.Skip("re-arm trigger for M0131-S24")`; **un-skipping it re-opens S24**. The
+skip's own comment records why the failure would be a refusal to start rather
+than a mis-read: rmid 6 falls through `replayDecodedXLogRecord`'s `default:`.
+
+Defects (a) and (b) were verified at HEAD as part of this closure rather than
+assumed from the draft — which is how the (a) correction above was found. Both
+now carry ledger rows, and (b) additionally carries an in-code correction: the
+stale *"unreachable today"* claim at `internal/mvcc/visibility.go:126` was
+replaced, and the `!ok` arm annotated with the fact that M0131-S20.4 made it
+**live after every restart** (the counter is seeded from `pg_control`; the member
+sets are not).
+
+The fix_plan item stays **unchecked**: a ledger row plus an unchecked item is the
+only permitted form of deferral.
 
 ## Guards
 
