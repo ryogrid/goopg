@@ -824,8 +824,16 @@ CommandCounter on BasicSession and seeding fresh contexts from it.
       target spec FAIL→PASS (6.8 s); `internal/executor` PASS; build+vet clean;
       UNITS PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35). Design:
       `docs/design/0118-0100-sys-btree-split-registry-coverage.md` + README row.
-- [ ] **regress/{delete,enum,functional_deps,index_including,index_including_gist,
-      select,tid,truncate,union}** — 11 baseline-pass regress cases diverged with
+- [x] **regress/{delete,enum,functional_deps,index_including,index_including_gist,
+      select,tid,truncate,union}** — **STALE, closed 2026-08-13.** Re-run at
+      HEAD `c9dfe4da` per selection rule §1: all nine cases PASS
+      (`TestPort_RegressSuite` filtered, 13.7 s; only the separately-tracked
+      `subselect` still SKIPs). Corroborated by the log itself — none of the
+      nine subjects appear in the 20260813-005117 action-items, i.e. the
+      nightly already dropped them (rule §3). Attributable to `f3a3eca6`
+      (LINE/caret normalization restored), which landed after this nightly's
+      sha, exactly as the filing note predicted. No engine change made. Original
+      filing follows: 11 baseline-pass regress cases diverged with
       "output mismatch; normalization rules need extension"
       (AI-20260811-014635-003..011; repro: `go test -v -run
       'TestPort_RegressSuite/<case>' ./internal/testport/`). Likely the same
@@ -841,11 +849,38 @@ Two of tonight's four subjects (`TestPort_IsolationPredicateHash` /
 the still-open 20260811-014635-001/-002 tasks above and are NOT re-filed here.
 New subjects only:
 
-- [ ] **testport/TestE2E_FailoverPGtoGoopg** — FAILed, subtest `async`
-      (AI-20260812-005501-001, new tonight; repro: `go test -v -run
+- [x] **testport/TestE2E_FailoverPGtoGoopg** — FAILed, subtest `async`
+      (AI-20260812-005501-001; repro: `go test -v -run
       '^TestE2E_FailoverPGtoGoopg$' ./internal/testport/`, evidence
-      `ci/logs/20260812-005501/testport/go-test.log`). PARKED per banner (not a
-      gate the priority milestones depend on).
+      `ci/logs/20260812-005501/testport/go-test.log`). **REAL — FIXED
+      2026-08-13.** The evidence line was `promote: drain timed out after 5s
+      (apply_lsn=50347104, target=50347312)` — 208 bytes short after the full
+      wait. Not flakiness: an *unreachable* stop condition that most runs
+      satisfy by luck. `runPromote`'s drain polled `ApplyLSN >= WrittenLSN`,
+      comparing a **record boundary** against a **byte position**. The
+      walreceiver appends the primary's stream verbatim
+      (`walreceiver.go` `appendVerbatim` → `Writer.AppendRaw`) and a walsender
+      cuts that stream at whatever byte offset its buffer lands on, so the
+      received tail is routinely a partially-transmitted record; `ApplyLSN`
+      stops one record short and the gap is permanent. Upstream never asks for
+      byte parity — `xlogrecovery.c` `ReadRecord` treats a short tail as
+      end-of-WAL and recovery finishes at the last complete record; goopg's own
+      `finalizePromotion` already anchored the timeline switch at `ApplyLSN`,
+      so only the drain loop disagreed with itself. Fixed by
+      `RecordIterator.AtEndOfWAL()` (a `parkedAtEnd` flag classified at the
+      block site) + `StreamReplayer.AtEndOfWAL()` + a second break arm in
+      `runPromote`. The classification has to live at the read site: a first
+      attempt gating on `DrainedLSN >= WrittenLSN` never fires on a writer that
+      was never asked to flush, so `errWALBytesUndrained` (wrapping
+      `ErrLSNNotWritten`) marks the transient case instead and buffered bytes
+      can never read as end-of-stream. Gates: new
+      `TestStreamReplayerEndOfWALOnPartialTail` with a non-vacuity assertion
+      that the byte-parity gap is still open, proven fail-when-broken;
+      `internal/wal` + `cmd/goopg` + `internal/server` PASS; `-race` over
+      iterator/replayer PASS; `TestE2E_FailoverPGtoGoopg` all three subtests
+      PASS. Design: `docs/design/0005-0008-promotion-drain-end-of-wal.md` +
+      README row. Deferred: the partial tail is left in place instead of being
+      overwritten with an overwrite-contrecord (ledger row 2026-08-13).
 - [x] **testport/TestPort_IsolationMultipleCic** — **STALE, closed 2026-08-13**
       (AI-20260812-005501-002; repro: `go test -v -run
       '^TestPort_IsolationMultipleCic$' ./internal/testport/`). Re-run at HEAD
