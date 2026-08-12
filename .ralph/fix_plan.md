@@ -14,6 +14,10 @@ priority, and does not outrank it.
 2026-08-12 at the foot of this file and is deliberately NOT promoted** — it sits
 behind M0131 until a user directive edits this banner. It is recorded here only
 so the milestone is discoverable; filing a milestone does not reorder the queue.
+**M0133 (`information_schema` on disk) was filed 2026-08-12 at the foot of this
+file under the same rule** — it is the successor to the measured-and-deferred
+M0131-S9.4, filed so the deferral has a schedulable resume point instead of a
+forward reference into a design doc; also NOT promoted.
 
 ## Notes / rules
 
@@ -4452,6 +4456,18 @@ Theme C — Real PG hosted on goopg evaluates views (closes "goopg cannot host a
       already bitten by. Successor decomposition (S9.4a namespace+domains
       atomically, S9.4b helpers, S9.4c data tables, S9.4d.. the 65 views;
       OID band 13273..13621) is in design `0131-0009` §S9.4; **2 ledger rows**.
+      **S9 CLOSURE 2026-08-12 — the successor is now FILED as milestone M0133
+      (`M0133-S1..S4`, foot of this file, NOT promoted), not left as a forward
+      reference into a design doc.** Before filing it, all thirteen §S9.4
+      measurements were RE-VERIFIED against a second fresh PG 18.3 oracle
+      (namespace 13273; 65 v + 4 r; 148 types / 5 domains / band 13286..13621;
+      696 attributes; 65 rules summing 1 814 056 B, max 210 908 B; 11 helpers
+      13274..13285 with 10 `prosqlbody`; 2 domain CHECKs; 11 rules over the
+      8160 B ceiling; 0 rule→`pg_catalog`-view `pg_depend` edges) — this time
+      the doc's findings promoted unchanged, unlike S24's. `catalog.go` does
+      register 13273 and `capture-ev-action.sh` still has no `prosqlbody` mode,
+      so F31 is landed and F34's blocker is live. S9 itself stays UNCHECKED:
+      ledger rows + an unchecked item is the only permitted deferral form.
       Its fail-when-fixed tripwire (`information_schema.tables`) stays as F29
       installed it. Gates: `internal/catalog` PASS, UNITS PASS,
       `go build ./...` + `go vet` clean, pgbench smoke via the commit hook.
@@ -4610,3 +4626,24 @@ Milestone: `docs/milestones/0132-extended-protocol-explicit-transactions.md`. Au
 **Open questions (answer before the slice that depends on them):** O-1 (doc 09 O-XP-3) — do portals already support an open portal spanning statements inside a block? Answer before S3 closes. O-2 — `executeExtendedQuery`'s pre-parse fast paths return without touching a transaction: the empty-query check (`extended.go:436-438`), the literal `SELECT 1` short-circuit (`:440-453`), and the `SHOW`/`SET` family below them; each needs an explicit ruling, because a fast path that bypasses the block is exactly the shape of bug this milestone exists to fix. O-3 — does the extracted helper change `twophase.go:227`'s `connTx.End()` interaction? S12 owns the answer; S2 must not land assuming it is unaffected.
 
 **Acceptance bar:** the 14 items (1, 2, 2b, 3–13) in `docs/milestones/0132-extended-protocol-explicit-transactions.md`. Headline gates: `ROLLBACK` over the extended protocol leaves the row at its original value (verified from a second connection) **and the same holds for the mixed driver shape (bar 2b)**; a block's `INSERT` is invisible to another connection until `COMMIT`; `ReadyForQuery` reports `T`/`E`/`I` correctly at the frame level; an unrepaired `INITIALLY DEFERRED` FK fails at the `COMMIT`, not at the statement; a client that disconnects mid-block is rolled back exactly once. No regressions: UNITS/SMOKE/SPOT green, `scripts/tpch-spotcheck.sh` canonical Q12=2/Q13=35, `make plan-gate` clean, `make race-gate` clean, `make ralph-state-guard` clean.
+
+## M0133 — `information_schema` on disk (filed 2026-08-12, successor to the deferred M0131-S9.4)
+
+**Priority: FILED, NOT PROMOTED.** The `## Current Priority` banner at the top of this file remains the sole ordering authority; M0133 is queued behind M0131 exactly as M0132 is. Filing the deferred successor makes it schedulable and discoverable — it does NOT reorder the queue. Working it requires a banner edit.
+
+**Source:** M0131-S9.4, deferred 2026-08-12 with 2 ledger rows after being MEASURED rather than assumed (design `docs/design/0131-0009-system-view-corpus-widening.md` §S9.4, findings F31-F35). This section exists because a design-doc section is not a schedulable resume point: the deferral rule forbids closing with a forward reference, and "the successor decomposition is in §S9.4" is one.
+
+**The corpus, measured against a throwaway PG 18.3 (`initdb` out of `postgres/local_install`, `pg_ctl -o "-p 5539 -k $D -h ''"`) and RE-VERIFIED against a second fresh cluster at the filing loop — all thirteen numbers reproduced exactly:** 1 `pg_namespace` row (OID **13273**), **69** `pg_class` rows (**65** views + **4** real tables), **148** `pg_type` rows (5 domains + 69 rowtypes + 74 array peers, band **13286..13621**), **696** `pg_attribute` user columns, **65** `pg_rewrite` rules totalling **1 814 056 B** of `ev_action` (max 210 908 B, `columns`), **11** `pg_proc` helpers (**13274..13285**), **2** domain CHECK constraints (`cardinal_number_domain_check`, `yes_or_no_check`) and **801 heap rows of DATA** (`sql_features` 755, `sql_sizing` 23, `sql_implementation_info` 12, `sql_parts` 11).
+
+**Already landed by M0131-S9.4 (do not redo):** F31 — goopg registered the namespace at OID 13183 under the comment "stock PG18 initdb-assigned OID"; no run of this build produces that value. Corrected to **13273** in `internal/catalog/catalog.go` and pinned, with the measurement recipe, by `TestBootstrapNamespaceOIDsMatchPG18`.
+
+**Three findings that shape the work:** **F32** — `pg_depend` says **zero** `information_schema` rules reference a `pg_catalog` *view*, so M0133 is independent of M0131-S9.1-S9.3 and of the 14 view-on-view edges; it is schedulable on its own. **F33** — the TOAST ceiling is already discharged (M0131-S20.2): 11 of the 65 rules exceed the ~8160 B inline budget after pglz, but the pg_catalog corpus already ships 6 toasted rules and `pg_seclabels` (35 379 B) is larger than anything here. **F34** — 10 of the 11 helpers are new-style SQL-body functions carrying `prosrc = ''` and a non-null **`prosqlbody`** `pg_node_tree`; `scripts/capture-ev-action.sh` has no `prosqlbody` mode, so this is a SECOND capture surface, not a reuse. **F35** — the 4 tables carry real rows `COPY`ed from `sql_features.txt`, a bulk-heap-load mechanism no M0131-S9 slice ever produced.
+
+**LAND-TOGETHER CONSTRAINT (the reason S9.4 was deferred wholesale rather than dribbled):** the `information_schema` name ALREADY resolves in goopg's own front end (8 virtual relations, `registerInformationSchemaTables`, `internal/catalog/catalog.go:11613`). An on-disk namespace holding 0 of its 69 relations reports to a hosted PG a schema that exists and is empty — strictly worse than today's clean absence, and the exact half-filled-catalog anti-pattern that already bit this project (a half-filled `pg_type` broke an `IN`-list that worked at all-zero). The prerequisites are genuinely serial: the domains before any view's `pg_attribute` types resolve, the helpers before any view body does, the tables' data before `sql_features` answers. **S1-S3 may land separately; S4 must not begin before S1-S3 are all on disk, and the namespace row itself lands in S1 with its domains, atomically.**
+
+- [ ] **M0133-S1 — namespace + domains, atomically** (est ~1-2 loops). The `information_schema` `pg_namespace` row (13273) **plus** the 5 domains, their 5 array peers and the 2 domain CHECK constraints in ONE bootstrap step. Nothing may observe a namespace without its domains. Note the OID band is shared with M0131-S9's own pins: one post-bootstrap counter from `FirstUnpinnedObjectId = 12000` runs 12000..12355 (the 80 `system_views.sql` views), 12356..13272 (894 `pg_description` rows) then 13273..13621 (all of `information_schema`); every value is below `catalog.FirstUserOID = 16384`, so the collision objection is void for the same reason it was in M0131-S8. Gates: `internal/catalog` + `internal/initdb`, and a hosted-PG probe that the namespace answers with its domains resolvable.
+- [ ] **M0133-S2 — the 11 helper functions** (est ~1-2 loops). Blocked on a `prosqlbody` capture mode (F34): extend `scripts/capture-ev-action.sh` + `cmd/gen-nailed-view-tables` with a `--prosqlbody <funcoid>` mode emitting the same `.dat` + seed-table shape the view corpus uses. `_pg_expandarray` is the only one with a textual `prosrc` (51 B). The `pgnodes` non-path argument applies unchanged: capture, do not generate. Gates: `internal/initdb`, `--verify` byte-identity.
+- [ ] **M0133-S3 — the 4 data tables and their 801 rows** (est ~1-2 loops; F35). `sql_features` (755), `sql_sizing` (23), `sql_implementation_info` (12), `sql_parts` (11) are ordinary heaps; upstream initdb `COPY`s them from `sql_features.txt`. This is a bulk heap load at initdb time — a mechanism M0131-S9 never produced, so it needs its own design section before code. Gates: a hosted PG reading actual rows out of `sql_features`, not just planning it.
+- [ ] **M0133-S4 — the 65 views** (est ~many loops; runs LAST). In `information_schema.sql` order, reusing the M0131-S9 capture/pin/regen loop unchanged; 11 of them exercise the `pg_rewrite` TOAST writer (F33). The corpus-wide guards from M0131-S9 apply as-is: the identity `--verify` gate, `assertNailedSystemViewsAreEvaluable`, and the fail-when-fixed absence tripwire — which M0131-S9's F29 already pointed at `information_schema.tables`, so THIS milestone is what flips it red and must re-point it.
+
+**Acceptance bar:** a real PG 18.3 hosted on a goopg-initdb'd directory evaluates all 65 `information_schema` views and reads real rows from all 4 tables; `--verify` is byte-identical; the dual-definition hazard is MEASURED (not assumed inert) for the 8 relations goopg also answers virtually, as every M0131-S9 slice measured it.

@@ -1,8 +1,11 @@
 # System-view corpus widening — take the six-view island to `system_views.sql` scale
 
-**Status:** in progress (S9.0, S9.1 landed)
-**Date:** 2026-08-11
-**Milestone:** M0131 (S9)
+**Status:** accepted — S9.0/S9.1/S9.1b/S9.2a-d/S9.3a-g LANDED (the `pg_catalog`
+corpus is upstream's **80 of 80** views, all evaluable on a hosted PG 18.3);
+**S9.4 (`information_schema`) MEASURED AND DEFERRED**, ledger rows filed and the
+successor filed as fix_plan milestone **M0133** (filed, NOT promoted).
+**Date:** 2026-08-11 (S9.4 measured + re-verified 2026-08-12)
+**Milestone:** M0131 (S9); successor M0133
 
 ## Problem
 
@@ -1420,6 +1423,34 @@ Ceiling check for the successor: none of the S9 ceilings survive as blockers —
 reason it was in S8 (`FirstUserOID = 16384` floors every minted OID, and the
 13273..13621 band is below it), and the dual-definition hazard is bounded to the
 **8** relations goopg answers virtually rather than all 69.
+
+### Re-verification of §S9.4 at HEAD (2026-08-12, closure loop)
+
+The S24 closure loop's lesson was that a design doc's own findings are a
+hypothesis until re-measured — its two cited line numbers had drifted and one of
+its four claims was simply wrong. §S9.4 was therefore re-measured *before* its
+numbers were promoted into a milestone filing, against a fresh throwaway PG 18.3
+built the same way (`initdb` out of `postgres/local_install`, started with
+`pg_ctl -o "-p 5539 -k $D -h ''"`). **All thirteen measurements reproduce
+exactly** — namespace 13273; 69 `pg_class` rows as 65 `v` + 4 `r`; 148 `pg_type`
+rows of which 5 are domains, band 13286..13621; 696 `pg_attribute` rows;
+65 `pg_rewrite` rules summing 1 814 056 B with a 210 908 B maximum (`columns`);
+11 `pg_proc` helpers at 13274..13285 of which **10** carry a non-null
+`prosqlbody`; the 2 domain CHECKs by name; the 4 data tables by name; **11**
+rules over the 8160 B inline ceiling; and **0** `pg_depend` edges from an
+`information_schema` rule to a `pg_catalog` view (F32's independence claim).
+
+Two claims were re-checked in-repo rather than against the oracle, because they
+are the ones that would set a wrong resume point: `internal/catalog/catalog.go`
+does register `13273` (F31 landed, and no `13183` survives outside the test's
+explanatory comment), and `scripts/capture-ev-action.sh` still has **no**
+`prosqlbody` mode (F34's blocker for S9.4b is live).
+
+So, unlike S24, this doc's findings promote unchanged. The successor
+decomposition below is filed as **M0133-S1..S4** at the foot of
+`.ralph/fix_plan.md` — a design-doc section is not a schedulable resume point,
+and "closed with a forward reference to a doc" is the failure mode the deferral
+rule exists to prevent.
 
 ## References
 
