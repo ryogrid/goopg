@@ -4959,7 +4959,20 @@ func (o *updateOp) Next() (TupleSlot, error) {
 	// root-0025 item 5 follow-up — `.ralph/deferral_ledger.md`). With
 	// children present, fall through to the multi-table SeqScan path below,
 	// which already fans out correctly.
-	if o.idxScan != nil && len(updateScanTables) == 1 {
+	//
+	// `Key != nil` is the second precondition, and it is not cosmetic:
+	// updateViaIndex probes ONE equality key (`evalExpr(ix.Key, …)` — the same
+	// shape as indexScanOp.lookupKey's single-key branch). A planner-produced
+	// range scan (`WHERE id BETWEEN a AND b` → LowKey/HighKey, Key nil) and a
+	// composite equality probe (`Keys`, Key nil) both leave Key unset, and
+	// dereferencing it panicked the backend with a nil-pointer deref inside
+	// evalExprSlot — a crashed connection for an ordinary ranged UPDATE
+	// (M0131-S27 discovery: the forward crash E2E's post-checkpoint
+	// `UPDATE … WHERE id BETWEEN 600 AND 650`). The SeqScan path below handles
+	// every predicate shape, so falling through is correct, not a workaround;
+	// teaching updateViaIndex to drive a range/composite probe is the
+	// performance follow-up recorded in the deferral ledger.
+	if o.idxScan != nil && o.idxScan.Key != nil && len(updateScanTables) == 1 {
 		return o.updateViaIndex(rel, cols)
 	}
 

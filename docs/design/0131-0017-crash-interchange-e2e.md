@@ -132,6 +132,54 @@ half-page-write fault injector. **This test must never be cited as FPI or
 `full_page_writes` coverage**, and the file carries that sentence as a comment
 so the claim cannot drift.
 
+#### S27 MAIN VARIANT LANDED 2026-08-12 — and it found two defects
+
+`internal/testport/e2e_pg_crashstart_on_goopgdata_test.go` runs green: the
+committed/uncommitted split, the online checkpoint plus a post-checkpoint tail,
+`cluster.Kill()`, the `DB_IN_PRODUCTION` assertion, the stale-`postmaster.pid`
+handover (asserted PRESENT, then removed, so a future goopg-side cleanup fails
+this test instead of silently passing), the `redo starts at` / `redo done at` /
+no-PANIC / benign-end-of-WAL log contract, and row equality against goopg's own
+pre-crash answers.
+
+Two production defects surfaced, both fixed in the same commit — the reason the
+test is worth its runtime:
+
+1. **A ranged `UPDATE` on an indexed column panicked the backend.**
+   `updateOp.Next` routed to `updateViaIndex` for ANY child `*planner.IndexScan`,
+   but that helper probes one equality key (`evalExpr(ix.Key, …)`). A range
+   predicate (`WHERE id BETWEEN 600 AND 650`) plans as an IndexScan with
+   `Key == nil` and `LowKey`/`HighKey` set — as does a composite `Keys` probe —
+   so the deref crashed the connection goroutine (`invalid memory address or nil
+   pointer dereference` in `evalExprSlot`; the client saw `driver: bad
+   connection`). Fix: the fast path now requires `Key != nil` and every other
+   predicate shape falls through to the SeqScan path, which handles all of them.
+   Guard: `internal/executor/update_range_index_scan_test.go`, proven
+   fail-when-broken (the panic returns verbatim when the guard is removed).
+   Teaching `updateViaIndex` to drive a range/composite probe is a performance
+   follow-up, ledgered.
+
+2. **goopg's `xl_heap_prune` omitted `XLHP_CLEANUP_LOCK`, and an
+   assert-enabled PG aborted replaying it.** Upstream derives
+   `lp_truncate_only = (flags & XLHP_CLEANUP_LOCK) == 0`
+   (`heapam_xlog.c:106`), which claims every now-unused slot was ALREADY
+   `LP_DEAD` and carries no storage; goopg's prune reclaims slots that still
+   have storage and redirects chain roots. PG 18.3 TRAPped in the startup
+   process — `failed Assert("ItemIdIsDead(lp) && !ItemIdHasStorage(lp)")`,
+   `pruneheap.c:1677` — and the postmaster shut down, so the cluster was
+   **unstartable**. (A second assert, `heapam_xlog.c:50`, independently forbids
+   redirections without the flag.) An assert-disabled build would have applied a
+   truncate-only prune to live-storage slots instead: silent divergence. Fix:
+   `EncodeHeapPruneOptPG` and `EncodeHeapFreezePG` both set
+   `XLHP_CLEANUP_LOCK`, which is the honest description of goopg's prune — it
+   runs under the page's exclusive buffer lock. This is a **standby-lane blind
+   spot**: the flag only matters when PG replays a prune record it did not
+   write, and `TestE2E_PGStandbyFullCycle` never produced one.
+
+Still deferred out of S27 (ledger, 2026-08-12): the **torn-contrecord variant**
+described below — it needs a kill timed against WAL page boundaries, not just a
+kill during a large statement.
+
 ### S28 — reverse: `TestE2E_GoopgCrashStartOnPGDataDir`
 
 The mirror, in `internal/testport/e2e_goopg_crashstart_on_pgdata_test.go`:
