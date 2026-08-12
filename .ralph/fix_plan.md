@@ -2393,6 +2393,31 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       Found + deferred: an IOS over `numeric`/`numeric[]` prints `1.5` where PG
       and the heap print `1.50` (display scale lost by `EncodeNumericKey`).
       Design: `docs/design/0119-0006-array-key-datetime-renderers.md`.
+      **Slice landed 2026-08-13 (34th) — the numeric index key has no display
+      scale, and cannot be given one**: the 27th slice's deferred divergence,
+      closed the opposite way from its own resume point. An IOS over `numeric[]`
+      printed `{2.7}` where the heap and PG print `{2.70}` — one stored row
+      spelled two ways depending on the plan, silently, with no error. Carrying
+      the scale in the key is unimplementable: `EncodeNumericKey` strips trailing
+      mantissa zeros so `1.0` and `1.00` encode IDENTICALLY, and that byte
+      identity is how `UNIQUE` on `numeric` raises 23505 on the second insert
+      (`numeric_cmp` ignores display scale). Equality, not order, is the binding
+      constraint. So the two questions the scan was asking as one are split:
+      `indexKeyColumnIsDecodable` (value fidelity — `bt_index_check`'s
+      comparator; `numeric` still yes) vs the new
+      `indexKeyColumnRendersHeapText` (text fidelity — `numeric` no), the second
+      asked only of the BLOB key format since the PG tuple-image key carries
+      per-attribute datums and loses no spelling. Refused ⇒ the scan reads the
+      heap, as `interval[]` does; `bt_index_check` on numeric indexes is
+      untouched, which the containment weighed in the 27th slice would have cost.
+      Gates: `TestNumericIndexOnlyScanKeepsDisplayScale` (E2E, scalar + array,
+      mutation-checked), `TestNumericUniqueCollapsesDisplayScale` (holds the
+      other end of the trade down), `TestIndexKeyRenderableIsNarrowerThanDecodable`,
+      and `TestArrayKeyTextMatchesHeapText` with its `scaleLossyType` exception
+      removed. Found + deferred: goopg has no key format that stores the datum
+      and compares type-aware (upstream's model) — the tuple-image key is that
+      seam but does not cover array key columns.
+      Design: `docs/design/0119-0006-numeric-key-display-scale.md`.
       **Slice landed 2026-08-12 (29th) — the ISO 8601 `T` separator and the `Z`
       zone**: `'2020-01-01T10:00:00'` (plain ISO 8601 — what every JSON encoder
       and `date -Is` emits) raised 22007, as did `…t10:00:00`, `2020-01-01

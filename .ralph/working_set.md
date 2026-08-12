@@ -1,54 +1,49 @@
 (idle — nothing in flight)
 
-M-NIGHTLY `AI-20260811-014635-002` (+ `-20260812-005501-004`,
-`-20260813-005117-017`, `TestPort_IsolationReceiptReport`) fixed, committed and
-pushed. `TestPort_IsolationMultipleCic` closed as STALE in the same loop
-(verified NOT attributable to this fix — it passes with the fix stashed out).
+M0119-0006 34th slice landed: the numeric index key has no display scale, and
+cannot be given one. Committed and pushed.
 
-**The finding worth carrying: three nightly items were carried for two days
-under the wrong subsystem because the test's SUBJECT implied one.**
-`receipt-report.spec` is serializable read-only-deferrable, so the baton and the
-fix_plan both carried it as "a genuine SSI failure, likely the richest". It was
-never SSI. It died in *global setup* on a system-catalog btree split. Re-running
-the repro before theorising (selection rule §1) is what surfaced that in one
-command — the failure text named `pg_index_indrelid_index`, nothing SSI.
+The finding worth carrying: **a deferral ledger's resume point is a hypothesis,
+not an instruction.** This row's said "carry the display scale in the key — it is
+trailing metadata, so it need not disturb the order-preserving mantissa run".
+Order was never the binding constraint. EQUALITY was: `EncodeNumericKey` strips
+trailing mantissa zeros so `1.0` and `1.00` encode to the same bytes, and that
+byte identity is the entire mechanism by which `UNIQUE` on `numeric` raises
+23505 — which is what PG does, since `numeric_cmp` ignores display scale.
+Byte-identical keys cannot also distinguish two spellings of one number. Ten
+minutes of probing (a throwaway `zz_probe_test.go` printing the two encodings
+plus a live duplicate INSERT) refuted the resume point before any code was
+written; the ledger row now says so and its successor row names the real seam.
 
-Root cause worth generalising: goopg maintains bootstrapped system btrees in two
-halves that never reference each other. `insertCanonicalSysBtreeLeaf` appends to
-the leaf-root and **never consults** `keyMetaForSysBtree`; only the split and
-multi-level descent read that registry, and only once a leaf-root has filled. So
-an unregistered index is perfect for its first page of entries and then fails
-forever. That is a **latency-shaped** sibling-path divergence: the two halves
-disagree at write time but the disagreement is invisible until a size threshold
-is crossed — `receipt-report` reached it only at permutation 152, which is
-exactly why it read as flakiness. Nine indexes had accumulated in that state
-across M0130/M0131 slices; the spec only ever named one. Registering all nine
-was the point, not fixing 2678.
+Second point, the shape of the fix: the scan was asking ONE question where there
+are two — "can these bytes be inverted to the right VALUE" (what
+`bt_index_check`'s comparator needs, and `numeric` answers yes) versus "does the
+resulting Datum SPELL the value the way the heap spells it" (what an index-only
+scan needs, and `numeric` answers no). Conflating them is what made the
+containment look expensive in the 27th slice: refusing `numeric` in the DECODER
+would have disabled `bt_index_check` on every numeric index, for a loss that buys
+nothing. Splitting the predicate costs one function.
 
-The guard had to be a **source pin** for a reason worth reusing: the defect lives
-in the relationship between two call graphs, so any assertion written against
-either half alone is satisfied by the broken state. Non-vacuity matters doubly
-for source scanners — it carries a resolved-call-site floor (59, fails under 50)
-and fails rather than skips on a non-literal OID argument, so a renamed helper
-cannot turn it into a silent pass. Verified fail-when-broken.
+Third: the same defect had two code paths with different exposure. The scalar
+`numeric` arm did NOT reproduce, because that index takes the PG tuple-image key
+path, which carries per-attribute datums and loses no spelling. So the new
+refusal is asked only of the blob key format — and the E2E test carries the
+scalar arm anyway, since which format an index gets is not a property the test
+should depend on.
 
-Ledger row filed: only 2678 is exercised through a real split; the other eight
-layouts are correct-by-construction from their builders but untested at split
-time — 2693 (oid+name {80,2}) and 3081 (name {72,1}) are the two worth
-distrusting.
+Selection context for the next loop (re-verify, do not trust): M-NIGHTLY had zero
+open items at this loop's triage (all 17 `AI-20260813-*` filed and closed);
+M0131's two unchecked items (S9, S24) are both deferred-with-ledger-row —
+S9 only because S9.4 became M0133; M0130 has zero unchecked items. That leaves
+M0119 as the selectable drain, where M0119-0006 is the largest open cluster and
+takes one slice per loop off its residual list.
 
-Selection context for the next loop: M0131's only two unchecked items (S9, S24)
-are both deferred-with-ledger-row — re-verified this loop against the ledger,
-not taken from the baton — so M-NIGHTLY stays selectable per the banner.
-Remaining open M-NIGHTLY items: `TestE2E_FailoverPGtoGoopg` subtest `async`;
-the 11 regress normalization cases (re-run the repro FIRST — a full
-`TestPort_RegressSuite` ran GREEN two commits after that nightly's sha, so these
-may all be stale).
-
-Gates: `go build ./...` + `go vet` clean; `go test ./internal/executor/` PASS
-(6.1 s); target spec FAIL→PASS (6.8 s); new guard PASS + proven fail-when-broken;
-`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
-`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35 canonical); pgbench smoke PASS
-via the commit hook.
+Gates: `go build ./...` clean; `go vet ./internal/executor/` clean;
+`internal/executor` + `internal/access/btree` PASS; new
+`TestNumericIndexOnlyScanKeepsDisplayScale` PASS and proven fail-when-broken
+(array arm reports `{2.7}` want `{2.70}` with the check removed);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35 canonical); TPC-DS SF0.5 sweep
+PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0, plan shapes identical 99/99; UNITS PASS;
+pgbench smoke PASS via the commit hook.
 
 In-flight: none.

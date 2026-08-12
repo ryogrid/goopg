@@ -58,3 +58,42 @@ func indexKeyColumnIsDecodable(col catalog.Column) bool {
 	// interval: refused by construction — see intervalKeyNotDecodable.
 	return !isIntervalTypeName(name)
 }
+
+// indexKeyColumnRendersHeapText is the SECOND question an index-only scan has to
+// ask, and until the 34th slice goopg asked only the first one. Decodability is
+// about the VALUE: can the key bytes be inverted to a Datum at all (the amcheck
+// comparator's question, and the one indexKeyColumnIsDecodable answers).
+// Renderability is about the SPELLING: does that Datum print the way the same row
+// prints when it is read from the HEAP. A scan that answers a query from the key
+// substitutes one for the other, so it needs both — and they are not the same
+// question for `numeric`.
+//
+// PG's numeric carries its DISPLAY SCALE as part of the value: `1.50` and `1.5`
+// are the same number spelled two ways, and `numeric_out` prints the spelling
+// that was stored. goopg's blob key deliberately throws that away —
+// EncodeNumericKey strips trailing mantissa zeros so that numerically equal
+// values encode to IDENTICAL bytes, which is what makes a UNIQUE index on
+// numeric reject `1.00` after `1.0` (the probe: both encode to
+// [02 80 00 00 00 '1' 00]). That is not a defect to be repaired in the encoder:
+// byte-identical keys cannot also distinguish two spellings of one number, so
+// carrying the display scale in the key and keeping unique-equality are mutually
+// exclusive. The information is simply not in the key, and the heap is where it
+// still lives.
+//
+// So the refusal belongs HERE, not in the decoder — moving it into the decoder
+// (the containment the 2026-08-12 ledger row weighed) would take
+// `bt_index_check` down with it on every numeric index, for a loss that buys
+// nothing: a value-correct decode is all a COMPARATOR ever needed.
+//
+// Strictly narrower than indexKeyColumnIsDecodable by construction, so the two
+// can never disagree about a type the decoder refuses outright; asserted by
+// TestIndexKeyRenderableIsNarrowerThanDecodable.
+func indexKeyColumnRendersHeapText(col catalog.Column) bool {
+	if !indexKeyColumnIsDecodable(col) {
+		return false
+	}
+	// Type.Name is the ELEMENT type name for an array column, so this one test
+	// covers `numeric` and `numeric[]` alike — the element's key is the same
+	// zero-stripped digit run, and array_out prints elements with numeric_out.
+	return !isNumericType(col.Type.Name)
+}
