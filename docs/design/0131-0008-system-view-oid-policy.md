@@ -279,3 +279,41 @@ directory now also disagrees with the committed `ev_action` corpus, so the
 `pg_stat_replication_slots` blob on such a directory still names a
 non-existent 12261. Re-initdb is required. Every M0131 gate initdbs fresh, so
 nothing catches this automatically.
+
+## Findings (implementation, 2026-08-12 — M0131-S8b)
+
+S8b is the half of S8 that had to wait for S7's manifest to exist. Both
+subtasks are discharged; nothing about the policy changed.
+
+**S8b.1 — guard #1 re-anchored to the oracle capture.**
+`TestNailedViewOIDsMatchOracleManifest`
+(`internal/initdb/nailed_view_oid_manifest_guard_test.go`) implements guard #1
+as the design words it: walk `nailedSharedRels` + `nailedLocalRels`, take every
+`RelKind == 'v'` entry, and compare its OID to the **oracle** OID column of
+`nailed_view_manifest.tsv`. Both directions are asserted (a nailed view absent
+from the capture is an unverified in-band assignment, which Option A forbids as
+firmly as a wrong one), and both a zero-manifest and a zero-nailed-view state
+`t.Fatal` rather than passing vacuously. 30 views / 30 nailed rows checked.
+
+Why this is not redundant with `TestNailedViewOIDsMatchUpstreamPins`: that test
+predates the manifest and compares the nailed tables to `systemViewOIDPins()`,
+a **hand-written** Go table; `TestNailedViewManifestMatchesGoTables` separately
+ties that table to the TSV. The chain closes only *transitively*, through the
+one artefact in the set that is not machine-derived from a real PG. The new
+test deletes the intermediary, so a future regeneration of the pin table from
+anything other than a real PG 18.3 `initdb` cannot produce a set of guards that
+agree with each other while disagreeing with upstream. Proven non-vacuous by
+repinning `pg_locks` 12073 → 12099 in `nailed_view_seed_data.go`: the test
+fails naming both OIDs (reverted).
+
+**S8b.2 — S7's `--verify` acceptance guard is green.**
+`scripts/capture-ev-action.sh --verify` was knowingly red between S7 and S8b
+(it re-captures from a throwaway PG 18.3 `initdb --no-sync` and byte-`cmp`s).
+Run at this commit: **PASS — 30 views byte-identical**, plus
+`nailed_view_manifest.tsv` itself byte-identical. This is the strongest
+statement available about the corpus: every committed `ev_action` blob is
+exactly what a real PG 18.3 produces, with the identity OID mapping Option A
+assumes, and no rewriting pass in between.
+
+Consequence for S9: the capture path is now trustworthy end to end, so S9's
+corpus widening may add views by running the tool rather than by transcription.
