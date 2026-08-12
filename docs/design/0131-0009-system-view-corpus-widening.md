@@ -618,6 +618,63 @@ whole `^TestE2E_` family PASS (90 s), `capture-ev-action.sh --verify` PASS
 (35/35 byte-identical), `go build ./...` + `go vet` clean, UNITS PASS, pgbench
 smoke via the commit hook.
 
+## Implementation status — S9.2c (2026-08-12)
+
+**The corpus crosses its first view-on-view edge, one slice earlier than S9.3.**
+Pinned and seeded: `pg_shadow` (12005/12008) and `pg_user` (12014/12017),
+taking the on-disk corpus from 35 to **37** views. `pg_shadow` is ordinary
+S9.2 work — `FROM pg_authid` (1260) `LEFT JOIN pg_db_role_setting` (2964),
+the same shared-catalog shape S9.2b proved. `pg_user` is not: it is
+`FROM pg_shadow` (`system_views.sql:60-71`), and its captured blob carries
+**`:relid 12005`** — measured, the **first in-band `:relid` in the entire
+corpus**, after 35 views that carried none.
+
+That single number is the acceptance test for the whole Option-A policy of
+`0131-0008`. Because goopg pins its view OIDs to upstream's own initdb
+assignments, the OID `pg_user`'s blob embeds is *already* the OID goopg's
+`pg_class` heap gives `pg_shadow` — nothing inside the blob is rewritten, and
+the ordering requirement (base pinned before dependent) is enforced
+mechanically by capture guard #4 rather than trusted. The measurement is the
+E2E probe: a hosted PG 18.3 evaluating `SELECT * FROM pg_user` must resolve
+12005 through goopg's `pg_class`, find `pg_shadow`'s `_RETURN` row in goopg's
+`pg_rewrite`, and substitute a second Query — the first probe in this lane
+whose success needs TWO of goopg's rule rows and a relid lookup between them.
+It passes. **S9.3's mechanism is therefore proven; what remains for S9.3 is
+scale and ordering, not feasibility.**
+
+### Findings — S9.2c
+
+**F11 — ceiling #3, and it is a `pg_type` bootstrap gap.** `pg_group` (12010)
+was captured and pinned alongside the other two — it is catalog-direct
+(`pg_authid` + `pg_auth_members` 1261) and at **1428 B** stored it clears every
+size ceiling — but a hosted PG refuses to evaluate it:
+
+```
+ERROR:  could not find array type for data type oid
+STATEMENT:  SELECT * FROM pg_catalog.pg_group LIMIT 0
+```
+
+`pg_group`'s `grolist` column is `ARRAY(SELECT member FROM pg_auth_members …)`,
+making it the corpus's first blob with an `ARRAY(SubLink)` target entry.
+Evaluating it sends PG through `get_array_type`, which reads
+`pg_type.typarray` for `OIDOID`. goopg seeds that column as a **literal 0 for
+every row** (`internal/initdb/pg_type_bootstrap.go:306`), even though the
+`_oid` row (1028) itself is present in `pg_type_seed_data.go` and the
+`typarray` column exists in the tupledesc. So this is a *catalog* gap, not a
+capture gap — the same class as `pg_timezone_abbrevs`' missing `pg_amop` row
+(F5), and the third distinct ceiling the corpus has hit after the TOAST class
+(F6/F7). `pg_group` is therefore NOT pinned; the resume point is populating
+`typarray` (and `typelem`) from `pg_type.dat` across the seeded set. Ledgered.
+
+Worth stating plainly: all three ceilings found so far — `pg_amop`, `pg_type
+.typarray`, `pg_rewrite` TOAST — are gaps in what goopg's initdb *bootstraps*,
+not in the capture mechanism. The capture tooling has not been the limit once.
+
+Gates: `internal/initdb` PASS (87 s), `TestE2E_PGColdStartOnGoopgDataDir` PASS,
+whole `^TestE2E_` family PASS (92 s), `capture-ev-action.sh --verify` PASS
+(37/37 byte-identical), `go build ./...` + `go vet` clean, UNITS PASS, pgbench
+smoke via the commit hook.
+
 ## References
 
 - M0131 implementation plan §S9, `docs/design/0131-bidirectional-cluster-dir-coldstart-and-system-views.md`

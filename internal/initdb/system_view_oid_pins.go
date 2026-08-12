@@ -122,6 +122,32 @@ func systemViewOIDPins() []systemViewOIDPin {
 		// sub-12000 bootstrap constant, so no in-band `:relid` and no
 		// view-on-view ordering (measured, not assumed).
 		{"pg_roles", 12000, 12003, 12002, 13},
+		// M0131-S9.2c (2026-08-12): the authid family, and with it the corpus's
+		// FIRST view-on-view edge. pg_shadow is catalog-direct (pg_authid 1260
+		// LEFT JOIN pg_db_role_setting 2964), so it belongs to S9.2. pg_user is
+		// `FROM pg_shadow` (system_views.sql:60-71) and its blob carries
+		// `:relid 12005` — measured, the first in-band relid in the whole
+		// corpus. Under the Option-A identity pinning of 0131-0008 that
+		// embedded OID is already correct the moment pg_shadow is pinned above
+		// it, which is exactly the property the policy was chosen for; capture
+		// guard #4 enforces the base-before-dependent ordering rather than
+		// trusting it, and a hosted PG evaluating pg_user is the acceptance
+		// measurement.
+		//
+		// NOT pinned: pg_group (12010, rule 12013, reltype 12012, 3 atts —
+		// captured and under every ceiling at 1428 B stored). Its
+		// `ARRAY(SELECT member FROM pg_auth_members …)` target entry makes it
+		// the corpus's first blob with an ARRAY(SubLink), and a hosted PG
+		// rejects it with "could not find array type for data type oid":
+		// get_array_type (lsyscache.c) reads pg_type.typarray for OIDOID and
+		// goopg seeds that column as a literal 0 for EVERY row
+		// (pg_type_bootstrap.go:306), even though the _oid row (1028) itself
+		// exists in pg_type_seed_data.go. That is a pg_type bootstrap gap, not
+		// a capture gap — the same class as pg_timezone_abbrevs' missing
+		// pg_amop row. Ledgered; the resume point is populating typarray (and
+		// typelem) from pg_type.dat.
+		{"pg_shadow", 12005, 12008, 12007, 9},
+		{"pg_user", 12014, 12017, 12016, 9},
 		{"pg_views", 12028, 12031, 12030, 4},
 		{"pg_tables", 12033, 12036, 12035, 8},
 		{"pg_matviews", 12038, 12041, 12040, 7},

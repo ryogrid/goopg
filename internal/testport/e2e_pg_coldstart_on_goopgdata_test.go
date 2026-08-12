@@ -737,6 +737,20 @@ func assertHostedPGCanCallSQLBuiltins(t *testing.T, pg *pgcluster.Cluster, logPa
 // in one join tree. Both base sets are sub-12000 bootstrap constants, so still
 // no in-band :relid.
 //
+// M0131-S9.2c adds the authid family — and with it the FIRST view-on-view edge
+// the corpus has ever hosted. pg_shadow (12005) is catalog-direct (pg_authid
+// 1260 LEFT JOIN pg_db_role_setting 2964); pg_user (12014) is `FROM pg_shadow`
+// and its blob embeds `:relid 12005`, the corpus's first in-band relid. Under
+// the Option-A identity pinning of 0131-0008 that embedded OID needs no
+// rewriting, and a hosted PG evaluating pg_user HERE is the measurement that
+// proves it: PG resolves 12005 through goopg's own pg_class heap and
+// substitutes pg_shadow's rule in turn.
+//
+// Deliberately absent from this tranche: pg_group (12010), whose ARRAY(SubLink)
+// needs pg_type.typarray for OIDOID and goopg seeds that column as 0 for every
+// row ("could not find array type for data type oid") — this probe is what
+// found that, and it is ledgered.
+//
 // Deliberately absent: pg_timezone_abbrevs (12122), whose ORDER BY needs a
 // pg_amop row goopg does not bootstrap ("operator 664 is not a valid ordering
 // operator") — this probe is what found that, and it is ledgered. And
@@ -752,6 +766,8 @@ func nailedSystemViewProbeSet() []struct {
 		oid  string
 	}{
 		{"pg_catalog.pg_roles", "12000"},
+		{"pg_catalog.pg_shadow", "12005"},
+		{"pg_catalog.pg_user", "12014"},
 		{"pg_catalog.pg_views", "12028"},
 		{"pg_catalog.pg_tables", "12033"},
 		{"pg_catalog.pg_matviews", "12038"},
@@ -835,9 +851,14 @@ func assertNailedSystemViewsAreEvaluable(t *testing.T, pg *pgcluster.Cluster, go
 	t.Helper()
 	// M0131-S9.1 widened this from the six replication views to the whole
 	// on-disk corpus (nailedSystemViewProbeSet), and S9.1b added the
-	// RTE_RESULT pair. The per-view Errorf is what makes that affordable: 35
+	// RTE_RESULT pair. The per-view Errorf is what makes that affordable: 37
 	// independent blobs, and a bad tupledesc names its own view instead of
 	// forcing a bisect.
+	//
+	// S9.2c made one of them NOT independent: pg_user expands to pg_shadow,
+	// so `SELECT * FROM pg_user` is the first probe here whose success needs
+	// TWO of goopg's pg_rewrite rows and a relid lookup BETWEEN them. It is
+	// the acceptance measurement for the Option-A identity pinning.
 	for _, tc := range nailedSystemViewProbeSet() {
 		view := tc.view
 		out, err := pgQueryScalarAllowError(pg, "SELECT * FROM "+view+" LIMIT 0")

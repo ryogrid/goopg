@@ -18,6 +18,26 @@ attr	pg_roles	10	rolvaliduntil	1184	8	f	f
 attr	pg_roles	11	rolbypassrls	16	1	f	f
 attr	pg_roles	12	rolconfig	1009	-1	f	f
 attr	pg_roles	13	oid	26	4	f	f
+rel	pg_shadow	12005	12005	12008	12007	2249	v	9
+attr	pg_shadow	1	usename	19	64	f	f
+attr	pg_shadow	2	usesysid	26	4	f	f
+attr	pg_shadow	3	usecreatedb	16	1	f	f
+attr	pg_shadow	4	usesuper	16	1	f	f
+attr	pg_shadow	5	userepl	16	1	f	f
+attr	pg_shadow	6	usebypassrls	16	1	f	f
+attr	pg_shadow	7	passwd	25	-1	f	f
+attr	pg_shadow	8	valuntil	1184	8	f	f
+attr	pg_shadow	9	useconfig	1009	-1	f	f
+rel	pg_user	12014	12014	12017	12016	2249	v	9
+attr	pg_user	1	usename	19	64	f	f
+attr	pg_user	2	usesysid	26	4	f	f
+attr	pg_user	3	usecreatedb	16	1	f	f
+attr	pg_user	4	usesuper	16	1	f	f
+attr	pg_user	5	userepl	16	1	f	f
+attr	pg_user	6	usebypassrls	16	1	f	f
+attr	pg_user	7	passwd	25	-1	f	f
+attr	pg_user	8	valuntil	1184	8	f	f
+attr	pg_user	9	useconfig	1009	-1	f	f
 rel	pg_views	12028	12028	12031	12030	2249	v	4
 attr	pg_views	1	schemaname	19	64	f	f
 attr	pg_views	2	viewname	19	64	f	f
