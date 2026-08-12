@@ -27,12 +27,13 @@ package testport
 // fault injector. This test must never be cited as FPI or full_page_writes
 // coverage.
 //
-// Deliberately NOT in this slice (deferral ledger 2026-08-12, M0131-S27):
-// the torn-contrecord variant (kill during a large INSERT … SELECT so the tail
-// ends inside a multi-page record, asserting PG's `there is no contrecord flag`
-// → `successfully skipped missing contrecord` pair). That needs a kill timed
-// against WAL page boundaries, which is a separate slice; see
-// docs/design/0131-0017-crash-interchange-e2e.md §"Torn contrecord".
+// The torn-contrecord variant — the tail ending INSIDE a multi-page record,
+// which takes upstream's aborted-contrecord path instead of a plain end-of-WAL —
+// now lives in its own sibling, e2e_pg_torn_contrecord_test.go
+// (TestE2E_PGCrashStartOnGoopgTornContrecord, landed 2026-08-12). See
+// docs/design/0131-0017-crash-interchange-e2e.md §"Torn contrecord" for why the
+// cut is applied deterministically after a real SIGKILL rather than raced for,
+// and which assertions stand in for upstream's two contrecord LOG lines.
 
 import (
 	"context"

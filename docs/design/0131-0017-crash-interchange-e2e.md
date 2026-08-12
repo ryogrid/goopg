@@ -101,12 +101,66 @@ S28 does **not** inherit this. goopg has no `CreateLockFile` equivalent:
 `cmd/goopg/main.go:1177`–`:1426`). A stale PG-authored `postmaster.pid` is
 silently overwritten.
 
-#### Torn contrecord
+#### Torn contrecord — `TestE2E_PGCrashStartOnGoopgTornContrecord` (LANDED 2026-08-12)
 
-Kill during a large `INSERT … SELECT` so the tail ends inside a multi-page
-record. goopg does emit contrecords — `XLPFirstIsContRecord` is stamped at
-`internal/wal/xlog_emit.go:129` and honoured by the reader at
+`internal/testport/e2e_pg_torn_contrecord_test.go`. The tail ends inside a
+multi-page record. goopg does emit contrecords — `XLPFirstIsContRecord` is
+stamped at `internal/wal/xlog_emit.go:129` and honoured by the reader at
 `internal/wal/reader.go:119` — so the shape is reachable.
+
+**The cut is applied by the test, not raced for.** The original plan said this
+variant "needs the kill timed against WAL page boundaries". It does not, and
+timing it would only make the test flaky. goopg's ring drain is **byte**-granular,
+not record-granular: `state.drainBufferBytes` (`internal/wal/writer.go`) writes
+`n` bytes from the ring head to make room, with no record alignment, so a SIGKILL
+legitimately leaves the segment ending at an arbitrary offset — page boundaries
+included. The test therefore performs a **real** `cluster.Kill()` and then applies
+the lost ring remainder deterministically: it scans the goopg-written stream for
+the last valid page carrying `XLP_FIRST_IS_CONTRECORD` and zeroes from that page
+to the end of its segment (plus any later segment in full). Every surviving byte
+was written by goopg, and a zeroed tail page is exactly what goopg's own
+preallocation leaves behind. Page 0 of a segment is never chosen — cutting there
+would take the long header's `sysid`/`seg_size` cross-check with it, which is a
+different upstream failure. In practice the chosen page is the stream's last valid
+page (observed: `0 valid page(s) discarded`), so the loss is one record.
+
+The committed/post-checkpoint rows are captured **before** the filler workload
+that the cut lands in, so "rows missing" can only mean upstream abandoned replay
+*earlier* than the aborted record (the M0131-S30 loss shape), never that the cut
+ate them.
+
+**What is asserted, and why not the `successfully skipped` line.** Upstream's
+`successfully skipped missing contrecord at %X/%X` LOG (`xlogrecovery.c:2115`)
+fires when a recovery pass *replays* the `XLOG_OVERWRITE_CONTRECORD` after having
+read the aborted record. Crash recovery ends with an end-of-recovery checkpoint
+whose redo point is already past that record, so a second crash never re-reads
+the aborted record and the line is unreachable in this lane; it needs an
+archive/PITR replay of the same stream (separate slice — ledger row 2026-08-12).
+The same applies to `there is no contrecord flag at %X/%X`: with the continuation
+page zeroed, upstream fails page-header validation first (`invalid magic number`,
+benign end-of-WAL) and reaches the `assembled` error exit that way. So the test
+asserts the **on-disk consequence** those lines report, which is stronger than
+either of them:
+
+1. recovery ran and completed (`redo starts at` / `redo done at`, no PANIC, the
+   benign end-of-WAL complaint terminal) — the sibling's log contract, reused;
+2. every committed row preceding the cut matches goopg's own pre-crash answers,
+   including post-checkpoint rows that exist only in the replayed tail, and an
+   index-qualified read over a replayed btree;
+3. the page at the missing continuation's address now carries
+   `XLP_FIRST_IS_OVERWRITE_CONTRECORD` and **not** `XLP_FIRST_IS_CONTRECORD`, with
+   `xlp_pageaddr` unchanged from the value goopg stamped — upstream sets that bit
+   only from `CreateOverwriteContrecordRecord`, so its presence proves the
+   aborted-contrecord path was taken over goopg's stream *and* that goopg's page
+   addressing let upstream resume exactly there;
+4. `pg_waldump` reports an `OVERWRITE_CONTRECORD` record at that page — the
+   oracle's own decoder confirming the record, not just the flag.
+
+Assertion 3 is the one that cannot pass vacuously, and it was verified to bite:
+disabling the cut leaves `xlp_info=0x0001` (plain contrecord) and the test fails.
+Result at HEAD: **green** — real PG 18.3 recovers a goopg-authored torn
+contrecord with no loss before the cut, so no defect was found by this variant
+(unlike the main S27 variant, which found two).
 
 Upstream path, verified end to end: `XLogReadRecord` reports `there is no
 contrecord flag at %X/%X` (`postgres/src/backend/access/transam/xlogreader.c:760`)
@@ -119,8 +173,9 @@ structurally unreachable from the standby lane**. `StartupXLOG` then rewinds
 emits the marker via `CreateOverwriteContrecordRecord` (`:6153-6156`, function
 `:7480`, inserted as the first record on the page at `:7521`); replaying it logs
 `successfully skipped missing contrecord at %X/%X, overwritten at %s`
-(`xlogrecovery.c:2115`). Assert the "no contrecord flag" (or "invalid contrecord
-length") line, then the "successfully skipped" line, in that order.
+(`xlogrecovery.c:2115`). The two LOG lines at the ends of that chain are the ones
+the landed test replaces with the on-disk assertions above; the chain itself is
+what makes those assertions meaningful.
 
 #### Honesty note — this test is NOT torn-page coverage
 
