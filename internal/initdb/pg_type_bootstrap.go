@@ -142,12 +142,26 @@ func pgTypeCanonical(oid uint32) (pgTypeEntry, bool) {
 		return pgTypeEntry{869, "inet", -1, false, 'b', 'I', 'i', 'm', 910, 911, 2496, 2497}, true
 	case 1002:
 		return pgTypeEntry{1002, "_char", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
+	case 1003:
+		// _name: the array of name (19). M0131-S9.2d — pg_policies.roles is
+		// `name[]`, the first nailed-view column of this type, and capture
+		// guard #5 refused the view until the canonical table carried it.
+		// typalign is 'i', NOT name's own 'c': Catalog.pm:469 gives an array
+		// type 'd' when its element is 'd' and 'i' otherwise.
+		return pgTypeEntry{1003, "_name", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
 	case 1021:
 		return pgTypeEntry{1021, "_float4", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
 	case 1007:
 		return pgTypeEntry{1007, "_int4", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
 	case 1009:
 		return pgTypeEntry{1009, "_text", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
+	case 2206:
+		// regtype: the OID-alias type, pg_type.dat:389-392. M0131-S9.2d —
+		// pg_sequences.data_type is `regtype`, the first nailed-view column
+		// of the SCALAR type; its array (2211) was already canonical below.
+		// typstorage 'p' (fixed 4-byte by-value), regtypein/out 2220/2221,
+		// regtyperecv/send 2454/2455 (pg_proc.dat:7421-7426, 8297-8302).
+		return pgTypeEntry{2206, "regtype", 4, true, 'b', 'N', 'i', 'p', 2220, 2221, 2454, 2455}, true
 	case 2211:
 		// _regtype: the array of regtype (2206), pg_type.dat:389.
 		return pgTypeEntry{2211, "_regtype", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true

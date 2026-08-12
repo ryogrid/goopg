@@ -38,6 +38,11 @@ attr	pg_user	6	usebypassrls	16	1	f	f
 attr	pg_user	7	passwd	25	-1	f	f
 attr	pg_user	8	valuntil	1184	8	f	f
 attr	pg_user	9	useconfig	1009	-1	f	f
+rel	pg_rules	12023	12023	12026	12025	2249	v	4
+attr	pg_rules	1	schemaname	19	64	f	f
+attr	pg_rules	2	tablename	19	64	f	f
+attr	pg_rules	3	rulename	19	64	f	f
+attr	pg_rules	4	definition	25	-1	f	f
 rel	pg_views	12028	12028	12031	12030	2249	v	4
 attr	pg_views	1	schemaname	19	64	f	f
 attr	pg_views	2	viewname	19	64	f	f
@@ -60,6 +65,18 @@ attr	pg_matviews	4	tablespace	19	64	f	f
 attr	pg_matviews	5	hasindexes	16	1	f	f
 attr	pg_matviews	6	ispopulated	16	1	f	f
 attr	pg_matviews	7	definition	25	-1	f	f
+rel	pg_sequences	12048	12048	12051	12050	2249	v	11
+attr	pg_sequences	1	schemaname	19	64	f	f
+attr	pg_sequences	2	sequencename	19	64	f	f
+attr	pg_sequences	3	sequenceowner	19	64	f	f
+attr	pg_sequences	4	data_type	2206	4	f	f
+attr	pg_sequences	5	start_value	20	8	f	f
+attr	pg_sequences	6	min_value	20	8	f	f
+attr	pg_sequences	7	max_value	20	8	f	f
+attr	pg_sequences	8	increment_by	20	8	f	f
+attr	pg_sequences	9	cycle	16	1	f	f
+attr	pg_sequences	10	cache_size	20	8	f	f
+attr	pg_sequences	11	last_value	20	8	f	f
 rel	pg_locks	12073	12073	12076	12075	2249	v	16
 attr	pg_locks	1	locktype	25	-1	f	f
 attr	pg_locks	2	database	26	4	f	f
@@ -84,6 +101,12 @@ attr	pg_cursors	3	is_holdable	16	1	f	f
 attr	pg_cursors	4	is_binary	16	1	f	f
 attr	pg_cursors	5	is_scrollable	16	1	f	f
 attr	pg_cursors	6	creation_time	1184	8	f	f
+rel	pg_prepared_xacts	12090	12090	12093	12092	2249	v	5
+attr	pg_prepared_xacts	1	transaction	28	4	f	f
+attr	pg_prepared_xacts	2	gid	25	-1	f	f
+attr	pg_prepared_xacts	3	prepared	1184	8	f	f
+attr	pg_prepared_xacts	4	owner	19	64	f	f
+attr	pg_prepared_xacts	5	database	19	64	f	f
 rel	pg_prepared_statements	12095	12095	12098	12097	2249	v	8
 attr	pg_prepared_statements	1	name	25	-1	f	f
 attr	pg_prepared_statements	2	statement	25	-1	f	f
@@ -308,6 +331,46 @@ attr	pg_stat_replication_slots	7	stream_bytes	20	8	f	f
 attr	pg_stat_replication_slots	8	total_txns	20	8	f	f
 attr	pg_stat_replication_slots	9	total_bytes	20	8	f	f
 attr	pg_stat_replication_slots	10	stats_reset	1184	8	f	f
+rel	pg_stat_database	12270	12270	12273	12272	2249	v	30
+attr	pg_stat_database	1	datid	26	4	f	f
+attr	pg_stat_database	2	datname	19	64	f	f
+attr	pg_stat_database	3	numbackends	23	4	f	f
+attr	pg_stat_database	4	xact_commit	20	8	f	f
+attr	pg_stat_database	5	xact_rollback	20	8	f	f
+attr	pg_stat_database	6	blks_read	20	8	f	f
+attr	pg_stat_database	7	blks_hit	20	8	f	f
+attr	pg_stat_database	8	tup_returned	20	8	f	f
+attr	pg_stat_database	9	tup_fetched	20	8	f	f
+attr	pg_stat_database	10	tup_inserted	20	8	f	f
+attr	pg_stat_database	11	tup_updated	20	8	f	f
+attr	pg_stat_database	12	tup_deleted	20	8	f	f
+attr	pg_stat_database	13	conflicts	20	8	f	f
+attr	pg_stat_database	14	temp_files	20	8	f	f
+attr	pg_stat_database	15	temp_bytes	20	8	f	f
+attr	pg_stat_database	16	deadlocks	20	8	f	f
+attr	pg_stat_database	17	checksum_failures	20	8	f	f
+attr	pg_stat_database	18	checksum_last_failure	1184	8	f	f
+attr	pg_stat_database	19	blk_read_time	701	8	f	f
+attr	pg_stat_database	20	blk_write_time	701	8	f	f
+attr	pg_stat_database	21	session_time	701	8	f	f
+attr	pg_stat_database	22	active_time	701	8	f	f
+attr	pg_stat_database	23	idle_in_transaction_time	701	8	f	f
+attr	pg_stat_database	24	sessions	20	8	f	f
+attr	pg_stat_database	25	sessions_abandoned	20	8	f	f
+attr	pg_stat_database	26	sessions_fatal	20	8	f	f
+attr	pg_stat_database	27	sessions_killed	20	8	f	f
+attr	pg_stat_database	28	parallel_workers_to_launch	20	8	f	f
+attr	pg_stat_database	29	parallel_workers_launched	20	8	f	f
+attr	pg_stat_database	30	stats_reset	1184	8	f	f
+rel	pg_stat_database_conflicts	12275	12275	12278	12277	2249	v	8
+attr	pg_stat_database_conflicts	1	datid	26	4	f	f
+attr	pg_stat_database_conflicts	2	datname	19	64	f	f
+attr	pg_stat_database_conflicts	3	confl_tablespace	20	8	f	f
+attr	pg_stat_database_conflicts	4	confl_lock	20	8	f	f
+attr	pg_stat_database_conflicts	5	confl_snapshot	20	8	f	f
+attr	pg_stat_database_conflicts	6	confl_bufferpin	20	8	f	f
+attr	pg_stat_database_conflicts	7	confl_deadlock	20	8	f	f
+attr	pg_stat_database_conflicts	8	confl_active_logicalslot	20	8	f	f
 rel	pg_stat_archiver	12289	12289	12292	12291	2249	v	7
 attr	pg_stat_archiver	1	archived_count	20	8	f	f
 attr	pg_stat_archiver	2	last_archived_wal	25	-1	f	f
@@ -367,6 +430,13 @@ attr	pg_stat_progress_basebackup	3	backup_total	20	8	f	f
 attr	pg_stat_progress_basebackup	4	backup_streamed	20	8	f	f
 attr	pg_stat_progress_basebackup	5	tablespaces_total	20	8	f	f
 attr	pg_stat_progress_basebackup	6	tablespaces_streamed	20	8	f	f
+rel	pg_user_mappings	12338	12338	12341	12340	2249	v	6
+attr	pg_user_mappings	1	umid	26	4	f	f
+attr	pg_user_mappings	2	srvid	26	4	f	f
+attr	pg_user_mappings	3	srvname	19	64	f	f
+attr	pg_user_mappings	4	umuser	26	4	f	f
+attr	pg_user_mappings	5	usename	19	64	f	f
+attr	pg_user_mappings	6	umoptions	1009	-1	f	f
 rel	pg_replication_origin_status	12343	12343	12346	12345	2249	v	4
 attr	pg_replication_origin_status	1	local_id	26	4	f	f
 attr	pg_replication_origin_status	2	external_id	25	-1	f	f

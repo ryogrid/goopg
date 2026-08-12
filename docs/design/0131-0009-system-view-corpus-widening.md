@@ -675,6 +675,92 @@ whole `^TestE2E_` family PASS (92 s), `capture-ev-action.sh --verify` PASS
 (37/37 byte-identical), `go build ./...` + `go vet` clean, UNITS PASS, pgbench
 smoke via the commit hook.
 
+## Implementation status — S9.2d (2026-08-12)
+
+**S9.2's catalog-direct tranche is finished: the corpus is 43 views, and the
+two views that did not make it named ceilings #4 and #5.** Pinned and seeded in
+one capture run: `pg_rules` (12023/12026), `pg_sequences` (12048/12051),
+`pg_prepared_xacts` (12090/12093), `pg_stat_database` (12270/12273),
+`pg_stat_database_conflicts` (12275/12278) and `pg_user_mappings`
+(12338/12341) — 37 → **43**. The other 37 blobs and the manifest came back
+byte-identical, and `--verify` re-derives all 43 against a fresh throwaway
+PG 18.3.
+
+Selection was measured rather than guessed. A throwaway oracle was asked, for
+every `pg_catalog` view, for its stored `ev_action` size *and* the set of
+`:relid` values its blob carries inside the 12000..16383 band; the catalog-
+direct set (no in-band relid) under the 8000 B inline budget is exactly the
+population S9.2 owns. That query also fixes S9.3's remaining work as a list:
+twelve views (`pg_stat_sys_tables`/`pg_stat_user_tables` on 12146,
+`pg_stat_xact_*_tables` on 12151, `pg_statio_*_tables` on 12174,
+`pg_stat_*_indexes` on 12187, `pg_statio_*_indexes` on 12200,
+`pg_statio_*_sequences` on 12213), each depending on a single `pg_stat_all_*`
+base that is itself catalog-direct — and five of those six bases are under the
+inline ceiling, the exception being `pg_statio_all_tables` at 10475 B, which
+puts its two dependents behind the `pg_rewrite` TOAST work (F6/F7).
+
+**`pg_stat_database` is the corpus's first blob carrying a set operation.**
+`system_views.sql:1006-1010` selects from
+`(SELECT 0 AS oid, NULL::name AS datname UNION ALL SELECT oid, datname FROM
+pg_database)`, so the Query has an `RTE_SUBQUERY` whose own Query is a
+`SetOperationStmt` — a shape none of the previous 37 blobs exercised, and it
+round-trips through the same verbatim-capture path with no special handling.
+The two "unmeasured `ev_action` shapes" this doc listed (`RTE_RESULT`,
+`LATERAL`) are now one: `RTE_RESULT` was closed by S9.1b, `LATERAL` remains.
+
+### Findings — S9.2d
+
+**F12 — ceiling #4: `pg_policy` (3256) is not an on-disk relation.** `pg_policies`
+(12018, 5439 B stored, well under every size ceiling) captures cleanly and a
+hosted PG then fails it with `could not open relation with OID 3256`. This is
+a new *kind* of ceiling: F5/F11 were missing rows or columns inside catalogs
+goopg does bootstrap, whereas here the blob's base **catalog itself** is
+absent from a goopg cluster. It is the first captured view blocked that way,
+and it says the remaining corpus is gated not only on catalog *content* but on
+which system catalogs goopg materialises at all. Ledgered; the resume point is
+bootstrapping `pg_policy` (and re-pinning `pg_policies`), not touching the
+capture tool.
+
+Incidentally, `pg_policies.roles` is the corpus's first `name[]` column, which
+is why capture guard #5 demanded `_name` (1003) and it is now canonical in
+`pg_type_bootstrap.go` — with `typalign` `'i'`, **not** `name`'s own `'c'`
+(`Catalog.pm:469` gives an array `'d'` only when its element is `'d'`).
+
+**F13 — ceiling #5: `pg_type.typelem` is a literal 0 for every row, the exact
+twin of F11.** `pg_publication_tables` (12068, 3793 B) is rejected by a hosted
+PG with:
+
+```
+ERROR:  target type is not an array
+STATEMENT:  SELECT * FROM pg_catalog.pg_publication_tables LIMIT 0
+```
+
+That message is raised by `ExecInitExprRec`'s `T_ArrayCoerceExpr` arm
+(`postgres/src/backend/executor/execExpr.c:1684-1688`) when
+`get_element_type(resulttype)` returns InvalidOid — i.e. when
+`pg_type.typelem` is 0 for the array type being coerced to. goopg's `pgTypeRow`
+writes `typelem` as a hardcoded 0 (column 14) one line above the hardcoded
+`typarray` 0 (column 15) that F11 found. So ceilings #3 and #5 are **the same
+defect, one column apart**, reached from two different directions
+(`get_array_type` for F11, `get_element_type` here), and one fix — populating
+`typelem`/`typarray` from `pg_type.dat` — closes both and unblocks both
+`pg_group` and `pg_publication_tables`. Ledgered.
+
+The generalisation from S9.2c survives at five for five: **every ceiling this
+milestone has hit is a gap in what goopg's initdb bootstraps** (`pg_amop` rows,
+`pg_type.typarray`, `pg_rewrite` TOAST, the `pg_policy` catalog,
+`pg_type.typelem`). The capture tooling has not been the limit once.
+
+One type-table addition was needed for a view that DID land: `regtype` (2206)
+is `pg_sequences.data_type`, the first nailed-view column of the scalar
+OID-alias type — its array (2211) had been canonical since S9.1. Values taken
+from `pg_type.dat:389-392` and `pg_proc.dat` (2220/2221, 2454/2455).
+
+Gates: `internal/initdb` PASS (96 s), `TestE2E_PGColdStartOnGoopgDataDir` PASS,
+whole `^TestE2E_` family PASS (91 s), `capture-ev-action.sh --verify` PASS
+(43/43 byte-identical), `go build ./...` + `go vet` clean, UNITS PASS, pgbench
+smoke via the commit hook.
+
 ## References
 
 - M0131 implementation plan §S9, `docs/design/0131-bidirectional-cluster-dir-coldstart-and-system-views.md`

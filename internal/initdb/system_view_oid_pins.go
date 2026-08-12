@@ -148,11 +148,45 @@ func systemViewOIDPins() []systemViewOIDPin {
 		// typelem) from pg_type.dat.
 		{"pg_shadow", 12005, 12008, 12007, 9},
 		{"pg_user", 12014, 12017, 12016, 9},
+		// M0131-S9.2d (2026-08-12): the rest of S9.2's catalog-direct,
+		// under-ceiling tranche, captured in one pass. Every S9.2d view is a
+		// join over ordinary catalogs (and, for the pg_stat_database pair,
+		// over pg_stat_get_db_* SRFs) with NO view-on-view edge — measured
+		// before pinning, not assumed: none of their ev_action blobs carries a
+		// `:relid` in the 12000..16383 band, so capture guard #4 has nothing
+		// to order here. They are interleaved by upstream OID below:
+		// pg_rules 12023, pg_sequences 12048, pg_prepared_xacts 12090,
+		// pg_stat_database 12270, pg_stat_database_conflicts 12275 and
+		// pg_user_mappings 12338.
+		//
+		// NOT pinned, both captured and both under every size ceiling —
+		// ceilings #4 and #5, and like #1..#3 both are gaps in what goopg
+		// BOOTSTRAPS, not in the capture tooling:
+		//
+		//   pg_policies (12018, 12021, reltype 12020, 8 atts). A hosted PG
+		//   fails it with "could not open relation with OID 3256" — pg_policy
+		//   is not an on-disk relation in a goopg cluster at all, so this is
+		//   the first captured blob whose base CATALOG is missing rather than
+		//   its type or operator metadata. (Its `roles` column is also the
+		//   corpus's first `name[]`, which is why 1003 is now canonical in
+		//   pg_type_bootstrap.go.)
+		//
+		//   pg_publication_tables (12068, 12071, reltype 12070, 5 atts). A
+		//   hosted PG fails it with "target type is not an array", raised by
+		//   ExecInitExprRec's T_ArrayCoerceExpr arm (execExpr.c:1684-1688)
+		//   when get_element_type() finds pg_type.typelem = 0. goopg seeds
+		//   typelem as a literal 0 for EVERY row (pg_type_bootstrap.go
+		//   pgTypeRow, column 14) — the exact twin of the typarray gap that
+		//   blocks pg_group (F11), one column over in the same literal row.
+		//   Populating typelem and typarray from pg_type.dat unblocks both.
+		{"pg_rules", 12023, 12026, 12025, 4},
 		{"pg_views", 12028, 12031, 12030, 4},
 		{"pg_tables", 12033, 12036, 12035, 8},
 		{"pg_matviews", 12038, 12041, 12040, 7},
+		{"pg_sequences", 12048, 12051, 12050, 11},
 		{"pg_locks", 12073, 12076, 12075, 16},
 		{"pg_cursors", 12077, 12080, 12079, 6},
+		{"pg_prepared_xacts", 12090, 12093, 12092, 5},
 		{"pg_prepared_statements", 12095, 12098, 12097, 8},
 		{"pg_settings", 12104, 12107, 12106, 17},
 		{"pg_file_settings", 12110, 12113, 12112, 7},
@@ -182,6 +216,14 @@ func systemViewOIDPins() []systemViewOIDPin {
 		{"pg_stat_gssapi", 12257, 12260, 12259, 5},
 		{"pg_replication_slots", 12261, 12264, 12263, 21},
 		{"pg_stat_replication_slots", 12266, 12269, 12268, 10},
+		// S9.2d. pg_stat_database is the corpus's first blob with a set
+		// operation: system_views.sql:1006-1010 selects from
+		// `(SELECT 0 AS oid, NULL::name AS datname UNION ALL SELECT oid,
+		// datname FROM pg_database)`, so its Query carries an RTE_SUBQUERY
+		// whose own Query is a SetOperationStmt — a shape no earlier capture
+		// exercised.
+		{"pg_stat_database", 12270, 12273, 12272, 30},
+		{"pg_stat_database_conflicts", 12275, 12278, 12277, 8},
 		{"pg_stat_archiver", 12289, 12292, 12291, 7},
 		// M0131-S9.1b (2026-08-11): the RTE_RESULT pair. Both views are a bare
 		// `SELECT <srf>() AS …` with NO FROM clause at all (system_views.sql:
@@ -195,6 +237,7 @@ func systemViewOIDPins() []systemViewOIDPin {
 		{"pg_stat_io", 12301, 12304, 12303, 20},
 		{"pg_stat_wal", 12305, 12308, 12307, 5},
 		{"pg_stat_progress_basebackup", 12329, 12332, 12331, 6},
+		{"pg_user_mappings", 12338, 12341, 12340, 6},
 		{"pg_replication_origin_status", 12343, 12346, 12345, 4},
 		{"pg_wait_events", 12351, 12354, 12353, 3},
 		{"pg_aios", 12355, 12358, 12357, 15},
