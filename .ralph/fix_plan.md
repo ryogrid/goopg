@@ -3139,6 +3139,43 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `RALPH_PRECOMMIT_SCOPE=units` PASS; `tpch-spotcheck.sh` PASS. Design
       `0119-0006-textual-month-name-date-input.md` + README row `0119-0006w`.
 
+      **42nd slice (2026-08-12) — array elements render under the session
+      DateStyle/TimeZone.** `array_out` formats nothing itself: it calls the
+      ELEMENT type's output function per element, so a `timestamptz` inside an
+      array honours `TimeZone` and `DateStyle` exactly as a scalar column does.
+      goopg rendered every date-time element ISO/UTC, so a session in any other
+      zone read a correct instant back under the WRONG offset, silently — the
+      2026-08-12 ledger row, now `resolved`. Measuring the oracle found a second
+      divergence the row did not predict: `date[]`/`timestamp[]` elements
+      ignored `DateStyle` too, so the defect was never `timestamptz`-only
+      (`time`/`timetz` ARE style-independent — oracle-checked, not assumed by
+      analogy). **The blocker the row named was wrong**: it said no leaf package
+      had a tzdata-backed zone lookup, but the 39th slice had already put one in
+      `internal/config`, which `go list -deps` shows is a true leaf `pgarray`
+      already depended on. The real, unrecorded blocker is structural — goopg
+      fixes an array's `{…}` text at HEAP-DECODE time where upstream defers to
+      `array_out` at OUTPUT time, and `DecodeRowIntoMctxPGTuple` has ~70 call
+      sites (catalog reload, VACUUM, ANALYZE, DDL rescans) with no session at
+      all. Hence an explicit `pgarray.OutputStyle` with a pinned default rather
+      than an ambient lookup: every plain entry point survives as a
+      default-style wrapper, and `seqScanOp`/`bitmapHeapScanOp`/
+      `indexOnlyScanOp` resolve it ONCE in Open (the heap scans only when
+      `colsHaveArray`, so an array-free relation pays nothing). The element
+      formatters call `internal/config`'s own functions — the ones the SCALAR
+      path calls — so element and column text agree by construction. The
+      index-key sibling moved in the same commit (Rule #2): an index-only scan
+      rebuilds array text from the KEY, so fixing only the heap path would make
+      the same row print differently depending on the chosen plan. Four ledger
+      rows: the fix, the `date`/`timestamp` widening, pgoutput's deliberate
+      default (upstream runs output functions under the WALSENDER's GUCs), and a
+      pre-existing defect found while verifying — `COPY … TO` of ANY non-text
+      array column errors at HEAD (`int4[]` included, hence unrelated to
+      date-time), because `datumToCopyText` ignores `Type.IsArray`. Gates: 33
+      PG-18.3 oracle cells + 4 executor tests (sibling guard verified red by
+      scripted revert); `TestPort_RegressSuite` PASS;
+      `RALPH_PRECOMMIT_SCOPE=units` PASS; `tpch-spotcheck.sh` PASS. Design
+      `0119-0006-array-element-output-style.md` + README row `0119-0006z`.
+
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
 

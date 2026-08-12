@@ -9,6 +9,7 @@ import (
 
 	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/pgarray"
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
@@ -24,6 +25,9 @@ type indexOnlyScanOp struct {
 	ctx  *Context
 	rows []Row
 	idx  int
+	// arrayStyle is the session DateStyle/TimeZone an array element's output
+	// function reads, resolved once in Open. M0119-0006.
+	arrayStyle pgarray.OutputStyle
 	// M0092-0007: embedded slot reused across every Next() call
 	// so we don't allocate a fresh MaterializedSlot per emission.
 	slot MaterializedSlot
@@ -60,6 +64,11 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 	o.ctx = ctx
 	o.rows = nil
 	o.idx = 0
+	// The array element output style, resolved once per scan (M0119-0006). An
+	// index-only scan renders array elements from the KEY rather than the heap;
+	// it is the seq/bitmap scans' sibling and must agree with them, so it reads
+	// the same session GUCs through the same helper.
+	o.arrayStyle = arrayOutputStyle(ctx)
 
 	heapRel := ctx.Catalog.RelFileNode(o.plan.Table)
 	if err := ctx.acquireRelLock(heapRel, lockmgr.AccessShareLock); err != nil {
@@ -407,7 +416,7 @@ func (o *indexOnlyScanOp) decodeRowFromKey(key []byte) (Row, error) {
 		return o.projectCovered(decoded)
 	}
 	if len(o.plan.Index.Columns) == 1 && len(o.plan.Covered) == 1 {
-		d, err := decodeBTreeKeyToDatum(key, o.plan.Covered[0])
+		d, err := decodeBTreeKeyToDatumStyled(key, o.plan.Covered[0], o.arrayStyle)
 		if err != nil {
 			return nil, err
 		}
@@ -421,7 +430,7 @@ func (o *indexOnlyScanOp) decodeRowFromKey(key []byte) (Row, error) {
 		if !ok {
 			return nil, fmt.Errorf("IOS: index column %q not in catalog", colName)
 		}
-		d, n, err := decodeIndexKeyColumn(key[off:], *col)
+		d, n, err := decodeIndexKeyColumnStyled(key[off:], *col, o.arrayStyle)
 		if err != nil {
 			return nil, fmt.Errorf("IOS key col %q: %w", colName, err)
 		}
@@ -458,6 +467,13 @@ func numericDatumFromBig(m *big.Int, scale int16) Datum {
 // decodeIndexKeyColumn decodes one column from a B-tree key slice and returns
 // the Datum plus the number of bytes consumed. Used by the multi-column path.
 func decodeIndexKeyColumn(key []byte, col catalog.Column) (Datum, int, error) {
+	return decodeIndexKeyColumnStyled(key, col, pgarray.DefaultOutputStyle())
+}
+
+// decodeIndexKeyColumnStyled is decodeIndexKeyColumn under an explicit array
+// output style; only an ARRAY key column of a date/timestamp/timestamptz
+// element type reads it (M0119-0006).
+func decodeIndexKeyColumnStyled(key []byte, col catalog.Column, st pgarray.OutputStyle) (Datum, int, error) {
 	typeName := col.Type.Name
 	// Fixed-width branches must slice `key` to the type's exact byte
 	// width before delegating — btree.DecodeInt4 / DecodeInt8 enforce
@@ -468,7 +484,7 @@ func decodeIndexKeyColumn(key []byte, col catalog.Column) (Datum, int, error) {
 	// element's width out of a longer array segment. Route arrays first, the
 	// mirror of encodeBTreeKeyForColumn's own array-first routing. M0119-0006.
 	if col.Type.IsArray {
-		return decodeArrayBTreeKey(key, col)
+		return decodeArrayBTreeKey(key, col, st)
 	}
 	// int2 / oid / bool / bytea / time (btree_scalar_keys.go). Routed BEFORE the
 	// switch below so neither of these types can reach the `default:` arm, which
@@ -585,6 +601,12 @@ func (o *indexOnlyScanOp) decodeRowFromHeap(t storage.HeapTuple) (Row, error) {
 // decodeBTreeKeyToDatum inverts the B-tree key encoding for a single column
 // back to an executor Datum.
 func decodeBTreeKeyToDatum(key []byte, col catalog.Column) (Datum, error) {
+	return decodeBTreeKeyToDatumStyled(key, col, pgarray.DefaultOutputStyle())
+}
+
+// decodeBTreeKeyToDatumStyled is decodeBTreeKeyToDatum under an explicit array
+// output style (M0119-0006).
+func decodeBTreeKeyToDatumStyled(key []byte, col catalog.Column, st pgarray.OutputStyle) (Datum, error) {
 	typeName := col.Type.Name
 	// Sibling of decodeIndexKeyColumn's array routing (same ordering rationale:
 	// an array's Type.Name is its ELEMENT type name, so it must not reach any
@@ -592,7 +614,7 @@ func decodeBTreeKeyToDatum(key []byte, col catalog.Column) (Datum, error) {
 	// key, so bytes trailing the array's end marker mean this is not the
 	// encoding we think it is. M0119-0006.
 	if col.Type.IsArray {
-		d, n, err := decodeArrayBTreeKey(key, col)
+		d, n, err := decodeArrayBTreeKey(key, col, st)
 		if err != nil {
 			return NullDatum, err
 		}

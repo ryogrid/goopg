@@ -5,6 +5,7 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/mctx"
+	"github.com/goopg/goopg/internal/pgarray"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -252,6 +253,14 @@ type bitmapHeapScanOp struct {
 	// cols maps column index → catalog.Column for decode.
 	cols []catalog.Column
 
+	// arrayStyle / arrayStyleLive mirror seqScanOp's: the session
+	// DateStyle/TimeZone an array element's output function needs, resolved
+	// once in Open and only for a relation that has an array column. The two
+	// scans are siblings — a bitmap heap scan and a seq scan of the same array
+	// column must print the same text. M0119-0006.
+	arrayStyle     pgarray.OutputStyle
+	arrayStyleLive bool
+
 	// Stats.
 	exactPages int64
 	lossyPages int64
@@ -290,6 +299,10 @@ func (o *bitmapHeapScanOp) Open(ctx *Context) error {
 		} else {
 			o.cols[i] = *col
 		}
+	}
+	o.arrayStyleLive = colsHaveArray(o.cols)
+	if o.arrayStyleLive {
+		o.arrayStyle = arrayOutputStyle(ctx)
 	}
 
 	// Create mctx for per-page byte arena.
@@ -511,7 +524,7 @@ func (o *bitmapHeapScanOp) fetchOneTuple(_ storage.BlockNumber, offset uint16, r
 	}
 
 	storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
-	if err := DecodeRowIntoMctxPGTuple(o.scanRow, o.cols, tuple.Data, tuple.Bitmap, storedNatts, o.mctx); err != nil {
+	if err := o.decodeScanRow(tuple.Data, tuple.Bitmap, storedNatts); err != nil {
 		return nil, nil // decode failure, skip
 	}
 
@@ -555,7 +568,7 @@ func (o *bitmapHeapScanOp) fetchExact(block storage.BlockNumber, offset uint16, 
 	}
 
 	storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
-	if err := DecodeRowIntoMctxPGTuple(o.scanRow, o.cols, tuple.Data, tuple.Bitmap, storedNatts, o.mctx); err != nil {
+	if err := o.decodeScanRow(tuple.Data, tuple.Bitmap, storedNatts); err != nil {
 		return o.Next() // decode failure, skip
 	}
 
@@ -740,4 +753,15 @@ func (o *bitmapOrOp) buildBitmap(ctx *Context) (*TIDBitmap, error) {
 		tbmUnion(first, other)
 	}
 	return first, nil
+}
+
+// decodeScanRow is bitmapHeapScanOp's sibling of seqScanOp.decodeScanRow: it
+// routes through the styled decoder only when the relation has an array column,
+// so the two scan shapes render the same array text under the same session
+// GUCs. M0119-0006.
+func (o *bitmapHeapScanOp) decodeScanRow(data, bitmap []byte, storedNatts int) error {
+	if o.arrayStyleLive {
+		return DecodeRowIntoMctxPGTupleStyled(o.scanRow, o.cols, data, bitmap, storedNatts, o.mctx, o.arrayStyle)
+	}
+	return DecodeRowIntoMctxPGTuple(o.scanRow, o.cols, data, bitmap, storedNatts, o.mctx)
 }

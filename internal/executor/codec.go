@@ -11,6 +11,7 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/pgarray"
 	"github.com/goopg/goopg/internal/pglz"
 	"github.com/goopg/goopg/internal/pgnodes"
 	"github.com/goopg/goopg/internal/storage"
@@ -929,6 +930,22 @@ func DecodeRowIntoMctx(dst Row, cols []catalog.Column, data []byte, sctx *mctx.C
 // distinguishes it from legacy). storedNatts < len(cols) means ALTER TABLE ADD
 // COLUMN — trailing columns decode as NULL.
 func DecodeRowIntoMctxPGTuple(dst Row, cols []catalog.Column, data, bitmap []byte, storedNatts int, sctx *mctx.Context) error {
+	return DecodeRowIntoMctxPGTupleStyled(dst, cols, data, bitmap, storedNatts, sctx, pgarray.DefaultOutputStyle())
+}
+
+// DecodeRowIntoMctxPGTupleStyled is DecodeRowIntoMctxPGTuple carrying the
+// session's array output style. Only ARRAY columns of a date/timestamp/
+// timestamptz element type read it — every other column type's text is
+// GUC-independent at this layer, because the scalar date-time types keep their
+// KindTime carrier and are formatted at OUTPUT time (internal/server's
+// appendTypedCellText, executor's datumToCopyText), where the GUCs already
+// reach. An array is the one type goopg flattens to text during the heap
+// decode, so it is the one type that needs the GUCs here.
+//
+// The plain (unstyled) entry point stays the default for the ~70 session-less
+// decode sites — catalog reload, VACUUM, ANALYZE, DDL rescans — which have no
+// GUCs to read and must not acquire a dependency on any. M0119-0006.
+func DecodeRowIntoMctxPGTupleStyled(dst Row, cols []catalog.Column, data, bitmap []byte, storedNatts int, sctx *mctx.Context, st pgarray.OutputStyle) error {
 	// PG-physical decode with null-bitmap and natts awareness. M0111-0002 S3:
 	// the goopg legacy format has been removed, so there is a single on-disk
 	// format. A PG-physical tuple always records natts; storedNatts==0 means a
@@ -964,7 +981,7 @@ func DecodeRowIntoMctxPGTuple(dst Row, cols []catalog.Column, data, bitmap []byt
 			dst[i] = NullDatum
 			continue
 		}
-		v, consumed, err := decodePhysicalPGValueMctx(c.Type, data[off:], sctx)
+		v, consumed, err := decodePhysicalPGValueMctxStyled(c.Type, data[off:], sctx, st)
 		if err != nil {
 			return fmt.Errorf("DecodePhysicalPGRow: %s: %w", c.Name, err)
 		}
@@ -1160,11 +1177,17 @@ func pgRowHasExternal(cols []catalog.Column, row Row) bool {
 }
 
 func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) (Datum, int, error) {
+	return decodePhysicalPGValueMctxStyled(t, data, sctx, pgarray.DefaultOutputStyle())
+}
+
+func decodePhysicalPGValueMctxStyled(t catalog.Type, data []byte, sctx *mctx.Context, st pgarray.OutputStyle) (Datum, int, error) {
 	// User array column: decode the ArrayType varlena blob back to the
 	// canonical "{1,2}" text (sibling of encodeValuePG's IsArray branch).
-	// M0118-0002.
+	// M0118-0002. The session DateStyle/TimeZone rides along because goopg
+	// renders the element text here, where upstream's array_out would render it
+	// at output time (M0119-0006).
 	if t.IsArray {
-		return decodeArrayValuePG(t, data)
+		return decodeArrayValuePGStyled(t, data, st)
 	}
 	switch strings.ToLower(t.Name) {
 	case "bool", "boolean":

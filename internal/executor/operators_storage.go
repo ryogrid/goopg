@@ -22,6 +22,7 @@ import (
 	"github.com/goopg/goopg/internal/multixact"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/pgarray"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -1011,6 +1012,15 @@ type seqScanOp struct {
 	ctx  *Context
 	cols []catalog.Column
 
+	// arrayStyle carries the session DateStyle/TimeZone down into the heap
+	// decode, which is where goopg (unlike upstream, which defers to array_out
+	// at output time) flattens an array column to its "{…}" text. Resolved once
+	// in Open, and only for a relation that actually has an array column —
+	// arrayStyleLive gates the whole thing so a scan of an array-free table
+	// pays nothing. M0119-0006.
+	arrayStyle     pgarray.OutputStyle
+	arrayStyleLive bool
+
 	// ssiGistPred is the spatial WHERE predicate of the Filter directly above
 	// this scan, handed down at build time (Build / buildRec). When the scan runs
 	// under SERIALIZABLE on a table carrying a GiST index on the predicate's point
@@ -1309,6 +1319,18 @@ func (o *seqScanOp) gistRowMatches(row Row) bool {
 // conflict-out by spatial match (design 0118-0137). MUST be called with the page
 // RLock held — tuple.Data views the page bytes. Returns false on decode/eval
 // failure.
+// decodeScanRow decodes a visible tuple into the reusable scan row, routing
+// through the styled decoder only when the relation has an array column (see
+// seqScanOp.arrayStyle). The unstyled call is byte-identical to the styled one
+// under the boot-default GUCs, so the branch is a cost guard, not a behaviour
+// switch.
+func (o *seqScanOp) decodeScanRow(data, bitmap []byte, storedNatts int) error {
+	if o.arrayStyleLive {
+		return DecodeRowIntoMctxPGTupleStyled(o.scanRow, o.cols, data, bitmap, storedNatts, o.sctx, o.arrayStyle)
+	}
+	return DecodeRowIntoMctxPGTuple(o.scanRow, o.cols, data, bitmap, storedNatts, o.sctx)
+}
+
 func (o *seqScanOp) gistTupleMatches(tuple storage.HeapTuple) bool {
 	if o.gistScratch == nil || len(o.gistScratch) != len(o.cols) {
 		o.gistScratch = make(Row, len(o.cols))
@@ -1375,6 +1397,13 @@ func (o *seqScanOp) Open(ctx *Context) error {
 			Hint:    "Use the REFRESH MATERIALIZED VIEW command."}
 	}
 	o.ctx = ctx
+	// Resolve the array element output style once per scan (M0119-0006). Done
+	// after the reopen/rewind branch above so a re-Open under a different
+	// Context — the only way the GUCs can differ mid-operator — re-reads them.
+	o.arrayStyleLive = colsHaveArray(o.cols)
+	if o.arrayStyleLive {
+		o.arrayStyle = arrayOutputStyle(ctx)
+	}
 	// Pre-compute which columns are enum types so Next() can inject KindEnum datums
 	// for correct ORDER BY semantics (M0097-enum).
 	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
@@ -1909,7 +1938,7 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			// the schema. HeapNattsMask = 0x07FF; storedNatts==0 means natts
 			// was not explicitly set (legacy goopg rows without PG format).
 			storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
-			if err := DecodeRowIntoMctxPGTuple(o.scanRow, o.cols, tuple.Data, tuple.Bitmap, storedNatts, o.sctx); err != nil {
+			if err := o.decodeScanRow(tuple.Data, tuple.Bitmap, storedNatts); err != nil {
 				if o.pinned != nil {
 					o.pinned.RUnlock()
 				}

@@ -25,11 +25,110 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/pgdatetime"
 	"github.com/goopg/goopg/internal/pgnodes"
 )
+
+// OutputStyle carries the three session GUCs that upstream's array element
+// output functions read. array_out (postgres/src/backend/utils/adt/
+// arrayfuncs.c) does not format anything itself: it calls the ELEMENT type's
+// own output function per element, so `timestamptz_out` inside an array honours
+// `TimeZone` and `DateStyle` exactly as it does for a scalar column, and
+// `date_out`/`timestamp_out` honour `DateStyle`. Verified against PG 18.3:
+//
+//	SET TimeZone='America/Los_Angeles'; SET DateStyle='Postgres, DMY';
+//	SELECT ARRAY['2020-06-15 10:00:00+00']::timestamptz[];
+//	  → {"Mon 15 Jun 03:00:00 2020 PDT"}
+//
+// goopg renders an array to text at HEAP-DECODE time rather than at output
+// time, and most decode sites (catalog reload, VACUUM, ANALYZE, DDL rescans)
+// have no session at all — hence an explicit parameter with a documented
+// default rather than an ambient lookup. The scan operators that DO hold a
+// *executor.Context pass the session's values; everything else passes
+// DefaultOutputStyle. M0119-0006.
+type OutputStyle struct {
+	// Style and Order are the pair config.ParseDateStyleValue returns
+	// ("ISO"/"MDY", "German"/"DMY", …).
+	Style, Order string
+	// Zone is the raw `TimeZone` GUC spelling; "" means the boot default, UTC
+	// (config.FormatTimestampTZ resolves it).
+	Zone string
+}
+
+// DefaultOutputStyle is the boot-default rendering — ISO/MDY dates in UTC —
+// used by every decode site that has no session to read GUCs from. It is what
+// this package did unconditionally before OutputStyle existed, so a caller that
+// passes it gets byte-identical output to the pre-M0119-0006-42nd-slice code.
+func DefaultOutputStyle() OutputStyle { return OutputStyle{Style: "ISO", Order: "MDY"} }
+
+// pgEpochUnixSec is 2000-01-01T00:00:00Z as a Unix timestamp — the origin both
+// the `date` (days) and `timestamp`/`timestamptz` (microseconds) images count
+// from.
+const pgEpochUnixSec = 946684800
+
+// FormatDateElem renders a `date` array element's stored day count the way
+// date_out does under the session DateStyle. The ±infinity sentinels are
+// DateStyle-independent, matching upstream's EncodeSpecialDate.
+//
+// The day count is applied with AddDate, not a Duration: `date` spans
+// 4713 BC .. 5874897 AD and that many days does not fit a time.Duration's
+// nanosecond int64.
+func FormatDateElem(days int32, st OutputStyle) string {
+	switch days {
+	case math.MaxInt32:
+		return "infinity"
+	case math.MinInt32:
+		return "-infinity"
+	}
+	t := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC).AddDate(0, 0, int(days))
+	return config.FormatDate(t, st.Style, st.Order)
+}
+
+// FormatTimestampElem renders a `timestamp` array element under the session
+// DateStyle (timestamp_out; print_tz=false — a zone-less timestamp never grows
+// an offset, whatever TimeZone says).
+func FormatTimestampElem(micros int64, st OutputStyle) string {
+	switch micros {
+	case math.MaxInt64:
+		return "infinity"
+	case math.MinInt64:
+		return "-infinity"
+	}
+	return config.FormatTimestamp(timestampMicrosToTime(micros), st.Style, st.Order)
+}
+
+// FormatTimestampTZElem renders a `timestamptz` array element under BOTH the
+// session TimeZone and DateStyle (timestamptz_out). This is the arm the
+// 2026-08-12 deferral row was filed against: it used to render in UTC
+// unconditionally, so any session with another zone read a correct instant back
+// under the wrong offset.
+func FormatTimestampTZElem(micros int64, st OutputStyle) string {
+	switch micros {
+	case math.MaxInt64:
+		return "infinity"
+	case math.MinInt64:
+		return "-infinity"
+	}
+	return config.FormatTimestampTZ(timestampMicrosToTime(micros), st.Style, st.Order, st.Zone)
+}
+
+// timestampMicrosToTime converts the stored microseconds-since-2000 image to an
+// absolute instant. Seconds and nanoseconds are split rather than multiplied
+// into a Duration for the same reason FormatDateElem uses AddDate: the
+// timestamp range reaches 294276 AD, whose nanosecond count overflows int64.
+func timestampMicrosToTime(micros int64) time.Time {
+	sec := micros / 1_000_000
+	rem := micros % 1_000_000
+	if rem < 0 {
+		rem += 1_000_000
+		sec--
+	}
+	return time.Unix(pgEpochUnixSec+sec, rem*1000).UTC()
+}
 
 // ElemTypeInfo returns the element pg_type OID, fixed byte width (-1 for
 // varlena), and storage alignment for an array element type name. ok is false
@@ -123,6 +222,12 @@ const HeaderSize = 24
 // of an ArrayType varlena — i.e. the bytes AFTER the 4-byte varlena header, so
 // payload starts at ndim. elemName is the catalog element type name.
 func RenderText(elemName string, payload []byte) (string, error) {
+	return RenderTextStyled(elemName, payload, DefaultOutputStyle())
+}
+
+// RenderTextStyled is RenderText with the session's DateStyle/TimeZone, which
+// upstream's array_out reaches through the element output functions it calls.
+func RenderTextStyled(elemName string, payload []byte, st OutputStyle) (string, error) {
 	if len(payload) < 20 {
 		// Empty / 0-dim array (ndim==0) → "{}".
 		return "{}", nil
@@ -158,7 +263,7 @@ func RenderText(elemName string, payload []byte) (string, error) {
 	off := 0
 	for i := 0; i < n; i++ {
 		off += alignPad(off, align)
-		s, adv, err := DecodeElem(elemName, elemData[min(off, len(elemData)):], varlena, size)
+		s, adv, err := DecodeElemStyled(elemName, elemData[min(off, len(elemData)):], varlena, size, st)
 		if err != nil {
 			return "", err
 		}
@@ -174,6 +279,14 @@ func RenderText(elemName string, payload []byte) (string, error) {
 
 // DecodeElem renders one in-array element and reports how many bytes it spans.
 func DecodeElem(elemName string, data []byte, varlena bool, size int) (string, int, error) {
+	return DecodeElemStyled(elemName, data, varlena, size, DefaultOutputStyle())
+}
+
+// DecodeElemStyled is DecodeElem under an explicit session output style; only
+// the date/timestamp/timestamptz arms consult it (upstream's time_out and
+// timetz_out are DateStyle-independent — confirmed against PG 18.3, where
+// `SET DateStyle='German'` leaves a time[] element as 10:00:00).
+func DecodeElemStyled(elemName string, data []byte, varlena bool, size int, st OutputStyle) (string, int, error) {
 	lower := strings.ToLower(elemName)
 	if varlena {
 		if len(data) < 4 {
@@ -245,13 +358,13 @@ func DecodeElem(elemName string, data []byte, varlena bool, size int) (string, i
 	// function verbatim; QuoteTextElem then applies array_out's quoting, which
 	// is not optional for timestamp/timestamptz (their text contains a space).
 	case "date":
-		return QuoteTextElem(pgdatetime.FormatDate(int32(binary.LittleEndian.Uint32(data[:4])))), 4, nil
+		return QuoteTextElem(FormatDateElem(int32(binary.LittleEndian.Uint32(data[:4])), st)), 4, nil
 	case "time":
 		return QuoteTextElem(pgdatetime.FormatTime(int64(binary.LittleEndian.Uint64(data[:8])))), 8, nil
 	case "timestamp":
-		return QuoteTextElem(pgdatetime.FormatTimestamp(int64(binary.LittleEndian.Uint64(data[:8])))), 8, nil
+		return QuoteTextElem(FormatTimestampElem(int64(binary.LittleEndian.Uint64(data[:8])), st)), 8, nil
 	case "timestamptz":
-		return QuoteTextElem(pgdatetime.FormatTimestampTZUTC(int64(binary.LittleEndian.Uint64(data[:8])))), 8, nil
+		return QuoteTextElem(FormatTimestampTZElem(int64(binary.LittleEndian.Uint64(data[:8])), st)), 8, nil
 	case "timetz":
 		micros := int64(binary.LittleEndian.Uint64(data[:8]))
 		zone := int32(binary.LittleEndian.Uint32(data[8:12]))

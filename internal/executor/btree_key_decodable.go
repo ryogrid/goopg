@@ -32,7 +32,10 @@ package executor
 // encodes a value of every indexable type (scalar and array), decodes it, and
 // asserts the predicate agreed with what actually happened.
 
-import "github.com/goopg/goopg/internal/catalog"
+import (
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/pgarray"
+)
 
 // indexKeyColumnIsDecodable reports whether decodeBTreeKeyToDatum /
 // decodeIndexKeyColumn can invert the blob key bytes this column contributes.
@@ -47,7 +50,7 @@ func indexKeyColumnIsDecodable(col catalog.Column) bool {
 		// the recursion decodeArrayBTreeKey performs: an array key is
 		// invertible exactly when its elements are, both as VALUES (the
 		// element's own scalar key) and as TEXT (arrayKeyElemRenderer).
-		if arrayKeyElemRenderer(name) == nil {
+		if arrayKeyElemRenderer(name, pgarray.DefaultOutputStyle()) == nil {
 			return false
 		}
 		return indexKeyColumnIsDecodable(catalog.Column{Name: col.Name, Type: catalog.Type{Name: name}})

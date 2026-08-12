@@ -158,7 +158,7 @@ func encodeArrayBTreeKey(v Datum, col *catalog.Column, pos int) ([]byte, *ExecEr
 // The decode is value-preserving, not byte-preserving, in the same way the
 // scalar decodes are: EncodeNumericKey drops trailing mantissa zeros, so an
 // element 1.50 comes back as 1.5.
-func decodeArrayBTreeKey(key []byte, col catalog.Column) (Datum, int, error) {
+func decodeArrayBTreeKey(key []byte, col catalog.Column, st pgarray.OutputStyle) (Datum, int, error) {
 	// The element column: the array's Name minus its array-ness, so the
 	// per-element decode resolves the ELEMENT type — the mirror of the elemCol
 	// the encoder builds.
@@ -184,7 +184,7 @@ func decodeArrayBTreeKey(key []byte, col catalog.Column) (Datum, int, error) {
 			// The unquoted NULL token, as array_out writes a NULL element.
 			sb.WriteString("NULL")
 		case arrayKeyElemPresent:
-			text, w, err := decodeArrayKeyElemText(key[off:], elemCol)
+			text, w, err := decodeArrayKeyElemText(key[off:], elemCol, st)
 			if err != nil {
 				return NullDatum, 0, err
 			}
@@ -215,13 +215,13 @@ func decodeArrayBTreeKey(key []byte, col catalog.Column) (Datum, int, error) {
 // see arrayKeyElemRenderer, which owns that set and is also what
 // indexKeyColumnIsDecodable consults, so "can this array key be inverted?" is
 // answered by the same table that inverts it.
-func decodeArrayKeyElemText(key []byte, elemCol catalog.Column) (string, int, error) {
+func decodeArrayKeyElemText(key []byte, elemCol catalog.Column, st pgarray.OutputStyle) (string, int, error) {
 	name := elemCol.Type.Name
-	render := arrayKeyElemRenderer(name)
+	render := arrayKeyElemRenderer(name, st)
 	if render == nil {
 		return "", 0, fmt.Errorf("btree: array element type %q has no key decoding", name)
 	}
-	d, w, err := decodeIndexKeyColumn(key, elemCol)
+	d, w, err := decodeIndexKeyColumnStyled(key, elemCol, st)
 	if err != nil {
 		return "", 0, err
 	}
@@ -263,14 +263,14 @@ func decodeArrayKeyElemText(key []byte, elemCol catalog.Column) (string, int, er
 // each is gated on pgarray.ElemTypeInfo actually having the arm, so a type-name
 // spelling the heap table does not know (which the heap encodes through its
 // text fallback) is refused here instead of being rendered canonically.
-func arrayKeyElemRenderer(name string) func(Datum) (string, error) {
+func arrayKeyElemRenderer(name string, st pgarray.OutputStyle) func(Datum) (string, error) {
 	switch {
 	case isDateType(name), isTimeOfDayType(name), isTimestampType(name),
 		isTimestamptzType(name), isByteaType(name):
 		if _, _, _, _, ok := pgarray.ElemTypeInfo(name); !ok {
 			return nil
 		}
-		return arrayKeyElemRendererPGImage(name)
+		return arrayKeyElemRendererPGImage(name, st)
 	case isInt2Type(name), isInt4Type(name), isInt8Type(name), isOidType(name):
 		return func(d Datum) (string, error) { return strconv.FormatInt(d.Int, 10), nil }
 	case isBoolType(name):
@@ -310,7 +310,7 @@ func arrayKeyElemRenderer(name string) func(Datum) (string, error) {
 // decode to a KindTime at pgEpoch + offset (operators_indexonly.go), `time` to
 // a KindTime at the Unix epoch holding the time of day (decodeScalarBTreeKey),
 // and bytea to KindBytes.
-func arrayKeyElemRendererPGImage(name string) func(Datum) (string, error) {
+func arrayKeyElemRendererPGImage(name string, st pgarray.OutputStyle) func(Datum) (string, error) {
 	switch {
 	case isDateType(name):
 		return func(d Datum) (string, error) {
@@ -318,7 +318,7 @@ func arrayKeyElemRendererPGImage(name string) func(Datum) (string, error) {
 			// 5874897 AD range, whose microsecond count overflows int64. The
 			// decode built the time as pgEpoch + n*24h, so the division is exact.
 			days := (d.TimeValue().UTC().Unix() - pgEpochUnixMicros/1_000_000) / 86400
-			return quoteArrayTextElem(pgdatetime.FormatDate(int32(days))), nil
+			return quoteArrayTextElem(pgarray.FormatDateElem(int32(days), st)), nil
 		}
 	case isTimeOfDayType(name):
 		return func(d Datum) (string, error) {
@@ -326,11 +326,11 @@ func arrayKeyElemRendererPGImage(name string) func(Datum) (string, error) {
 		}
 	case isTimestampType(name):
 		return func(d Datum) (string, error) {
-			return quoteArrayTextElem(pgdatetime.FormatTimestamp(pgTimestampMicrosOfDatum(d))), nil
+			return quoteArrayTextElem(pgarray.FormatTimestampElem(pgTimestampMicrosOfDatum(d), st)), nil
 		}
 	case isTimestamptzType(name):
 		return func(d Datum) (string, error) {
-			return quoteArrayTextElem(pgdatetime.FormatTimestampTZUTC(pgTimestampMicrosOfDatum(d))), nil
+			return quoteArrayTextElem(pgarray.FormatTimestampTZElem(pgTimestampMicrosOfDatum(d), st)), nil
 		}
 	case isByteaType(name):
 		return func(d Datum) (string, error) {

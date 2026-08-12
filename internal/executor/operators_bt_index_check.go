@@ -391,6 +391,8 @@ func btIndexOpClassComparator(idx *catalog.Index, im *catalog.InMemory, ctx *Con
 	return func(a, b []byte) int {
 		ao, bo := 0, 0
 		for _, kc := range cols {
+			// A structural index-order check, never user-visible output, so the
+			// boot-default array style (the plain entry point) is right here.
 			ad, an, aerr := decodeIndexKeyColumn(a[ao:], kc.col)
 			bd, bn, berr := decodeIndexKeyColumn(b[bo:], kc.col)
 			if aerr != nil || berr != nil || an <= 0 || bn <= 0 {
