@@ -795,11 +795,35 @@ CommandCounter on BasicSession and seeding fresh contexts from it.
       PASS; `internal/executor` + `internal/mvcc` PASS; UNITS PASS;
       `scripts/tpch-spotcheck.sh` PASS. Design `0118-0099` + README row.
       1 ledger row (NULL-key and range probes still take no bucket lock).
-- [ ] **testport/TestPort_IsolationReceiptReport** — FAILed
+- [x] **testport/TestPort_IsolationReceiptReport** — FIXED 2026-08-13
       (AI-20260811-014635-002, AI-20260812-005501-004, AI-20260813-005117-017;
       repro: `go test -v -run
-      '^TestPort_IsolationReceiptReport$' ./internal/testport/`). PARKED per
-      banner. Re-confirmed FAILing at HEAD `f645621b` on 2026-08-13 (2.97 s).
+      '^TestPort_IsolationReceiptReport$' ./internal/testport/`).
+      **Not an SSI defect** — the three items had been carried as one because
+      the spec is serializable read-only-deferrable, but it died in *global
+      setup*: `split sys btree 2678: split: unsupported system btree OID 2678`.
+      goopg maintains the bootstrapped system btrees through two halves that
+      never reference each other: `insertCanonicalSysBtreeLeaf` appends to the
+      leaf-root and **never consults** `keyMetaForSysBtree`, while the split
+      (`sys_catalog_btree_split.go`) and multi-level descent
+      (`sys_catalog_btree_multilevel.go`) resolve the on-disk key layout
+      through it and refuse an unregistered OID. An index added to the insert
+      path therefore works perfectly until its leaf-root fills and then fails
+      the first split — which is why this only fired at **permutation 152** and
+      read as flakiness. **Nine** indexes had accumulated in that state across
+      M0130/M0131 slices, not just the one the spec hit: `pg_index` 2678/2679,
+      `pg_attrdef` 2657/2656, `pg_rewrite` 2692/2693, `pg_sequence` 5002,
+      `pg_extension` 3080/3081. Layouts read off the builder each site calls
+      (`buildIndexTupleOidKey` {16,1}, `…OidInt2Key` {16,2}, `…NameKey` {72,1},
+      `…OidNameKey` {80,2}), not inferred. Guard is necessarily a **source
+      pin** (`TestEverySysBtreeInsertPathIndexHasSplitKeyMeta`): the defect
+      lives in the relationship between two call graphs, so any assertion
+      against either half alone is satisfied by the broken state; non-vacuity
+      via a resolved-call-site floor (59, fails under 50) plus an explicit
+      failure on a non-literal OID argument. Proven fail-when-broken. Gates:
+      target spec FAIL→PASS (6.8 s); `internal/executor` PASS; build+vet clean;
+      UNITS PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35). Design:
+      `docs/design/0118-0100-sys-btree-split-registry-coverage.md` + README row.
 - [ ] **regress/{delete,enum,functional_deps,index_including,index_including_gist,
       select,tid,truncate,union}** — 11 baseline-pass regress cases diverged with
       "output mismatch; normalization rules need extension"
@@ -822,9 +846,14 @@ New subjects only:
       '^TestE2E_FailoverPGtoGoopg$' ./internal/testport/`, evidence
       `ci/logs/20260812-005501/testport/go-test.log`). PARKED per banner (not a
       gate the priority milestones depend on).
-- [ ] **testport/TestPort_IsolationMultipleCic** — FAILed
-      (AI-20260812-005501-002, new tonight; repro: `go test -v -run
-      '^TestPort_IsolationMultipleCic$' ./internal/testport/`). PARKED per banner.
+- [x] **testport/TestPort_IsolationMultipleCic** — **STALE, closed 2026-08-13**
+      (AI-20260812-005501-002; repro: `go test -v -run
+      '^TestPort_IsolationMultipleCic$' ./internal/testport/`). Re-run at HEAD
+      per M-NIGHTLY selection rule §2: PASSes (2.3 s). Checked whether the
+      sibling ReceiptReport fix above was responsible — CIC does insert
+      `pg_index` rows, so 2678/2679 was a live hypothesis — but it PASSes with
+      that fix stashed out too, so it was already fixed by an earlier commit
+      and is **not** attributable to this loop.
 
 ### Nightly run 20260813-005117 (sha `fd5539efc925`, dirty=62, 17 items) — filed 2026-08-13
 

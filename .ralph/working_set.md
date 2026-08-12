@@ -1,54 +1,54 @@
 (idle — nothing in flight)
 
-M-NIGHTLY `AI-20260813-005117-012` (`TestPort_IsolationInsertConflictDoUpdate4`)
-fixed and committed — and the same one-line-class fix also closed
-`AI-20260813-005117-009` (`TestPort_IsolationEvalPlanQual`).
+M-NIGHTLY `AI-20260811-014635-002` (+ `-20260812-005501-004`,
+`-20260813-005117-017`, `TestPort_IsolationReceiptReport`) fixed, committed and
+pushed. `TestPort_IsolationMultipleCic` closed as STALE in the same loop
+(verified NOT attributable to this fix — it passes with the fix stashed out).
 
-**The finding worth carrying: "REOPENED for the 3rd time" was a false story, and
-believing it would have sent the loop down the wrong path.** The fix_plan framed
-EvalPlanQual as two earlier fixes that "did not hold". They held fine. The
-`TM_SelfModified` guard from `408a3962` (M0131-S32.1) landed 2026-08-12 and this
-nightly is the FIRST run after it — a brand-new regression wearing an old
-symptom. Date the last change to the code path before accepting a reopen
-narrative; `git log -S` on the guard text settled it in one command.
+**The finding worth carrying: three nightly items were carried for two days
+under the wrong subsystem because the test's SUBJECT implied one.**
+`receipt-report.spec` is serializable read-only-deferrable, so the baton and the
+fix_plan both carried it as "a genuine SSI failure, likely the richest". It was
+never SSI. It died in *global setup* on a system-catalog btree split. Re-running
+the repro before theorising (selection rule §1) is what surfaced that in one
+command — the failure text named `pg_index_indrelid_index`, nothing SSI.
 
-Second finding: the spec's own shape was a decoy. `insert-conflict-do-update-4`
-is the PARTITIONED upsert spec, so partitioning and ON CONFLICT were the two
-obvious suspects — both wrong. Bisecting by SQL shape (partitioned vs plain,
-key vs non-key column, index vs seq scan, FOR UPDATE present vs absent) on a
-throwaway 5533 server reduced it to a repro with neither feature in it:
-`BEGIN; SELECT * FROM t WHERE i=1 FOR UPDATE; UPDATE t SET i=i+10 WHERE i=1;`
-→ `UPDATE 0`. Reduce to the minimal shape before reading the failing test's
-subject matter as a hint.
+Root cause worth generalising: goopg maintains bootstrapped system btrees in two
+halves that never reference each other. `insertCanonicalSysBtreeLeaf` appends to
+the leaf-root and **never consults** `keyMetaForSysBtree`; only the split and
+multi-level descent read that registry, and only once a leaf-root has filled. So
+an unregistered index is perfect for its first page of entries and then fails
+forever. That is a **latency-shaped** sibling-path divergence: the two halves
+disagree at write time but the disagreement is invisible until a size threshold
+is crossed — `receipt-report` reached it only at permutation 152, which is
+exactly why it read as flakiness. Nine indexes had accumulated in that state
+across M0130/M0131 slices; the spec only ever named one. Registering all nine
+was the point, not fixing 2678.
 
-Third: the bug was narrow because of the HOT split — a non-key update takes
-`tryApplyHOTUpdate` and never reaches the guard, so ONLY a HOT-ineligible
-key-column change falls through to it. That is also why a whole class of
-FOR UPDATE tests kept passing while these two failed.
+The guard had to be a **source pin** for a reason worth reusing: the defect lives
+in the relationship between two call graphs, so any assertion written against
+either half alone is satisfied by the broken state. Non-vacuity matters doubly
+for source scanners — it carries a resolved-call-site floor (59, fails under 50)
+and fails rather than skips on a non-literal OID argument, so a renamed helper
+cannot turn it into a silent pass. Verified fail-when-broken.
 
-Root cause: the guard was a bare `Xmax == myXID`. Upstream
-`HeapTupleSatisfiesUpdate` (`heapam_visibility.c`) reaches that comparison only
-after excluding `HEAP_XMAX_IS_MULTI` (raw MultiXactId vs TransactionId are
-disjoint id spaces) and `HEAP_XMAX_IS_LOCKED_ONLY` (returns TM_BeingModified —
-a row you only LOCKED is still yours to update). Both write-phase arms now share
-`isSelfModifiedWrite`; sharing was deliberate, since a duplicated inline guard is
-how one sibling gets fixed while the other rots.
+Ledger row filed: only 2678 is exercised through a real split; the other eight
+layouts are correct-by-construction from their builders but untested at split
+time — 2693 (oid+name {80,2}) and 3081 (name {72,1}) are the two worth
+distrusting.
 
-Ledger row filed: the guard still has no cmax/curcid arm. Probed it rather than
-asserting it — the obvious two-UPDATEs-in-one-txn shape does NOT diverge (the
-second command scans the new version), so no failing shape is in hand.
+Selection context for the next loop: M0131's only two unchecked items (S9, S24)
+are both deferred-with-ledger-row — re-verified this loop against the ledger,
+not taken from the baton — so M-NIGHTLY stays selectable per the banner.
+Remaining open M-NIGHTLY items: `TestE2E_FailoverPGtoGoopg` subtest `async`;
+the 11 regress normalization cases (re-run the repro FIRST — a full
+`TestPort_RegressSuite` ran GREEN two commits after that nightly's sha, so these
+may all be stale).
 
-Next candidates (all M-NIGHTLY, selectable): PredicateHash / ReceiptReport (open
-since 2026-08-11, 3 AI-ids each); `TestE2E_FailoverPGtoGoopg` subtest `async`;
-`TestPort_IsolationMultipleCic`; the 11 regress normalization cases. Worth
-re-running the whole testport isolation set first — this fix may have cleared
-more than the two items it was aimed at.
-
-Gates: `go build ./...` clean; `go test ./internal/executor/` PASS (6.0 s);
-`TestIsSelfModifiedWrite` PASS; 9 neighbouring isolation specs PASS (68 s) incl.
-EvalPlanQual individually (24.25 s); target spec PASS (3.9 s);
+Gates: `go build ./...` + `go vet` clean; `go test ./internal/executor/` PASS
+(6.1 s); target spec FAIL→PASS (6.8 s); new guard PASS + proven fail-when-broken;
 `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
 `scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35 canonical); pgbench smoke PASS
-via the commit hook; `make ralph-state-guard` OK.
+via the commit hook.
 
 In-flight: none.
