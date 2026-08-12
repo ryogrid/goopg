@@ -855,12 +855,35 @@ func varlenaTextBytes(s string) []byte {
 // the PG timestamp encoding).
 var pgEpochUnixMicros = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC).UnixMicro()
 
+// pgTimeMicros extracts the microseconds-since-midnight that PG's TimeADT holds
+// from the time.Time carrier of a `time`/`timetz` Datum.
+//
+// M0119-0006 (50th slice): the next-day probe is load-bearing, not defensive.
+// `24:00:00` is a real TimeADT value on PG — time_in accepts it and
+// AdjustTimeForTypmod's range check admits exactly USECS_PER_DAY
+// (postgres/src/backend/utils/adt/date.c) — and goopg's parsers carry it as
+// 1970-01-02 00:00:00 rather than as an hour field of 24, because time.Date
+// normalises the hour. Reading only Hour/Minute/Second therefore reports 0 for
+// it, which silently rewrote a STORED `'24:00:00'` to `'00:00:00'` (heap
+// encode, codec.go "time"/"timetz") and sorted it BELOW `00:00:01` in a btree
+// key.
+//
+// The probe belongs HERE rather than in each caller: row encode, the scalar and
+// timetz btree keys (btree_scalar_keys.go — whose comment already states the key
+// must derive from "the same microseconds the heap stores") and the array
+// element renderer (btree_array_key.go) all want the identical USECS_PER_DAY,
+// and copy_text.go's copyTimeOfDayMicros previously had to carry a private copy
+// of it for exactly that reason.
 func pgTimeMicros(t time.Time) int64 {
 	u := t.UTC()
-	return int64(u.Hour())*int64(time.Hour/time.Microsecond) +
+	micros := int64(u.Hour())*int64(time.Hour/time.Microsecond) +
 		int64(u.Minute())*int64(time.Minute/time.Microsecond) +
 		int64(u.Second())*int64(time.Second/time.Microsecond) +
 		int64(u.Nanosecond()/1000)
+	if micros == 0 && u.Year() == 1970 && u.Month() == time.January && u.Day() == 2 {
+		return usecsPerDay
+	}
+	return micros
 }
 
 func pgTimeFromMicros(micros int64) time.Time {

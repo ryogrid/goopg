@@ -379,11 +379,8 @@ func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone str
 // Datum into the microseconds-since-midnight pgdatetime's time_out/timetz_out
 // ports take, applying the column's declared precision.
 //
-// Two details the plain pgTimeMicros() cannot supply:
+// The one detail pgTimeMicros() cannot supply:
 //
-//   - `24:00:00` is carried as 1970-01-02 00:00:00 (next-day midnight), which
-//     pgTimeMicros reports as 0 — i.e. "00:00:00". The explicit next-day probe
-//     is the same one internal/server's appendTimeText carries.
 //   - goopg applies no typmod at INPUT (there is no AdjustTimeForTypmod port),
 //     so a `time(2)` column really does hold full microseconds and the declared
 //     precision is applied at OUTPUT. Truncating the micros here and letting
@@ -392,11 +389,10 @@ func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone str
 //     agreement on the same column (Hard-won Rule #2). Upstream ROUNDS at
 //     input instead; see the M0119-0006 deferral-ledger row.
 func copyTimeOfDayMicros(t catalog.Type, tv time.Time) int64 {
-	u := tv.UTC()
-	micros := pgTimeMicros(u)
-	if micros == 0 && u.Year() == 1970 && u.Month() == time.January && u.Day() == 2 {
-		micros = usecsPerDay
-	}
+	// M0119-0006 (50th slice): the `24:00:00` next-day probe that used to live
+	// here moved INTO pgTimeMicros, so the heap encode, the btree keys and this
+	// renderer can no longer disagree about it (Hard-won Rule #2).
+	micros := pgTimeMicros(tv)
 	if len(t.Args) > 0 && t.Args[0] >= 0 && t.Args[0] < 6 {
 		scale := int64(1)
 		for i := int64(0); i < 6-t.Args[0]; i++ {
