@@ -175,6 +175,33 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 		b := make([]byte, 8)
 		binary.BigEndian.PutUint64(b, uint64(d.Int))
 		return b, nil
+	case "float4", "real":
+		// M0119-0006 (53rd slice): before this arm a float column fell through to
+		// the default, which for goopg's float Datum (KindNumeric/KindString —
+		// there is no float Kind, see pgFloatFromDatum) ships the TEXT of the
+		// value under FORMAT binary. Upstream float4send
+		// (postgres/src/backend/utils/adt/float.c:350) is pq_sendfloat4, i.e. the
+		// IEEE-754 bits reinterpreted as a uint32 and sent big-endian
+		// (postgres/src/backend/libpq/pqformat.c:252) — 4 bytes, no text.
+		f, err := pgFloatFromDatum(d, 32)
+		if err != nil {
+			return nil, err
+		}
+		b := make([]byte, 4)
+		binary.BigEndian.PutUint32(b, math.Float32bits(float32(f)))
+		return b, nil
+	case "float8", "double precision", "double", "float":
+		// Sibling of the "float4" arm; float8send is pq_sendfloat8 (float.c:567),
+		// the 8-byte big-endian IEEE-754 image. The accepted spellings match the
+		// heap "float8" encode arm in codec.go, including the bare `float`
+		// (PG's float = float8) that goopg stores verbatim as a declared name.
+		f, err := pgFloatFromDatum(d, 64)
+		if err != nil {
+			return nil, err
+		}
+		b := make([]byte, 8)
+		binary.BigEndian.PutUint64(b, math.Float64bits(f))
+		return b, nil
 	case "bool", "boolean":
 		if d.Kind != KindBool {
 			return nil, fmt.Errorf("expected bool, got kind %d", d.Kind)
@@ -298,6 +325,27 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 		}
 		v := int64(binary.BigEndian.Uint64(payload))
 		return Datum{Kind: KindInt, Int: v}, nil
+	case "float4", "real":
+		// Decode twin of the "float4" encode arm: upstream float4recv
+		// (float.c:339) is pq_getmsgfloat4, and the binary COPY parser's
+		// pq_getmsgend makes any other length "incorrect binary data format".
+		// The Datum shape is taken from the heap float4 decode arm
+		// (decodePhysicalPGValueMctx, codec.go) — PGFloatOut's shortest round-trip text fed
+		// through floatTextDatum — so a value that enters through binary COPY is
+		// indistinguishable from the same value entering through INSERT, in
+		// Format(), CAST-to-text and every type-agnostic path. Before this arm
+		// the default handed back the four raw bytes as a STRING Datum.
+		if len(payload) != 4 {
+			return Datum{}, fmt.Errorf("float4: expected 4 bytes, got %d", len(payload))
+		}
+		f4 := float64(math.Float32frombits(binary.BigEndian.Uint32(payload)))
+		return floatTextDatum(PGFloatOut(f4, 32)), nil
+	case "float8", "double precision", "double", "float":
+		if len(payload) != 8 {
+			return Datum{}, fmt.Errorf("float8: expected 8 bytes, got %d", len(payload))
+		}
+		f8 := math.Float64frombits(binary.BigEndian.Uint64(payload))
+		return floatTextDatum(PGFloatOut(f8, 64)), nil
 	case "bool", "boolean":
 		if len(payload) != 1 {
 			return Datum{}, fmt.Errorf("bool: expected 1 byte, got %d", len(payload))
@@ -311,7 +359,7 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 		ts := pgEpoch.Add(time.Duration(usec) * time.Microsecond)
 		// M0119-0006 (41st slice): the column type is in reach here, so this
 		// decoder owes the same subtype tag the heap decode already applies
-		// (decodeValuePG, codec.go) — otherwise a value that entered through
+		// (decodePhysicalPGValueMctx, codec.go) — otherwise a value that entered through
 		// binary COPY renders differently from the identical value that entered
 		// through INSERT, in every type-agnostic path (Datum.Format(),
 		// CAST-to-text, string concat, FK-violation DETAIL). Hard-won Rule #2.

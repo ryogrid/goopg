@@ -546,25 +546,9 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		// column AFTER a float on real-PG reads (SRF pg_proc rows; pg_enum's
 		// "ppy" corruption) — the descriptors said fixed, the bytes said
 		// varlena, and only padding luck hid it.
-		var f float64
-		switch d.Kind {
-		case KindInt:
-			f = float64(d.Int)
-		case KindString, KindNumeric:
-			var raw string
-			if d.Kind == KindNumeric {
-				raw = numericText(d)
-			} else {
-				raw = strings.TrimSpace(d.StringValue())
-			}
-			v, err := strconv.ParseFloat(raw, 32)
-			if err != nil {
-				return nil, &ExecError{Code: "22P02",
-					Message: fmt.Sprintf("invalid input syntax for type real: %q", raw)}
-			}
-			f = v
-		default:
-			return nil, fmt.Errorf("kind %d cannot encode as float4", d.Kind)
+		f, err := pgFloatFromDatum(d, 32)
+		if err != nil {
+			return nil, err
 		}
 		var buf4 [4]byte
 		binary.LittleEndian.PutUint32(buf4[:], math.Float32bits(float32(f)))
@@ -572,25 +556,9 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 	case "float8", "double precision", "double", "float":
 		// M0111-0002 CLOSED: PG-binary float8 (8-byte IEEE-754 LE) — see the
 		// float4 arm above.
-		var f float64
-		switch d.Kind {
-		case KindInt:
-			f = float64(d.Int)
-		case KindString, KindNumeric:
-			var raw string
-			if d.Kind == KindNumeric {
-				raw = numericText(d)
-			} else {
-				raw = strings.TrimSpace(d.StringValue())
-			}
-			v, err := strconv.ParseFloat(raw, 64)
-			if err != nil {
-				return nil, &ExecError{Code: "22P02",
-					Message: fmt.Sprintf("invalid input syntax for type double precision: %q", raw)}
-			}
-			f = v
-		default:
-			return nil, fmt.Errorf("kind %d cannot encode as float8", d.Kind)
+		f, err := pgFloatFromDatum(d, 64)
+		if err != nil {
+			return nil, err
 		}
 		var buf8 [8]byte
 		binary.LittleEndian.PutUint64(buf8[:], math.Float64bits(f))
@@ -1411,7 +1379,14 @@ func decodePhysicalPGValueMctxStyled(t catalog.Type, data []byte, sctx *mctx.Con
 		}
 		f4 := float64(math.Float32frombits(binary.LittleEndian.Uint32(data[:4])))
 		return floatTextDatum(PGFloatOut(f4, 32)), 4, nil
-	case "float8", "double precision", "double":
+	case "float8", "double precision", "double", "float":
+		// M0119-0006 (53rd slice): `float` was in the ENCODE arm's spelling list
+		// but not this one, so a column whose DECLARED name is the bare `float`
+		// (PG: float = float8, postgres/src/backend/parser/gram.y opt_float)
+		// stored 8 fixed bytes and then failed to read them back — the decoder
+		// fell to the varlena default and raised "truncated 4-byte varlena".
+		// Encode and decode are twins (Hard-won Rule #2); the COPY-binary float
+		// arms added this slice accept the same six spellings.
 		if len(data) < 8 {
 			return Datum{}, 0, fmt.Errorf("float8: short read")
 		}
@@ -1888,6 +1863,54 @@ func encodeVarlen(b []byte) []byte {
 // floatTextDatum converts a PGFloatOut rendering into the Datum shape the
 // pre-M0111-0002 varlena-text decode produced: KindNumeric for finite
 // values, KindString for NaN/Infinity.
+// pgFloatFromDatum coerces a Datum to the float value a float4/float8 column
+// stores. goopg has no float Datum Kind — PGFloatOut's shortest-round-trip text
+// is parsed back into KindNumeric (floatTextDatum), so every float arrives here
+// as KindNumeric/KindString/KindInt.
+//
+// M0119-0006 (53rd slice): extracted from the "float4"/"float8" arms of
+// encodeValuePG so the heap encoder and the new binary-COPY float arms
+// (datumToCopyBinary, copy_binary.go) cannot drift — the two are twins in the
+// sense of Hard-won Rule #2, differing only in byte order. bits selects the
+// ParseFloat width (and hence the float4 rounding) and the type name PG uses in
+// its own 22P02 text (float.c float4in / float8in).
+func pgFloatFromDatum(d Datum, bits int) (float64, error) {
+	typeName := "double precision"
+	if bits == 32 {
+		typeName = "real"
+	}
+	switch d.Kind {
+	case KindInt:
+		return float64(d.Int), nil
+	case KindString, KindNumeric:
+		raw := strings.TrimSpace(d.StringValue())
+		if d.Kind == KindNumeric {
+			raw = numericText(d)
+		}
+		v, err := strconv.ParseFloat(raw, bits)
+		if err != nil {
+			return 0, &ExecError{Code: "22P02",
+				Message: fmt.Sprintf("invalid input syntax for type %s: %q", typeName, raw)}
+		}
+		if math.IsNaN(v) {
+			// strconv.ParseFloat("NaN", 64) yields Go's NaN, whose payload bit is
+			// SET (0x7ff8000000000001); PG's get_float8_nan() (postgres/src/
+			// include/utils/float.h) yields the canonical quiet NaN
+			// 0x7ff8000000000000. The two are equal as float64 but NOT as bytes,
+			// and both goopg float paths are byte-visible to real PG: the heap
+			// image (a PG standby reading goopg's pages) and float8send's binary
+			// COPY payload. Measured 2026-08-13: a `COPY … (FORMAT binary)` of a
+			// float8 'NaN' differed from PG 18.3's stream in exactly this one bit.
+			// float4 was already identical — the float32 narrowing discards the
+			// payload — so canonicalising here covers both widths.
+			v = math.Float64frombits(0x7ff8000000000000)
+		}
+		return v, nil
+	default:
+		return 0, fmt.Errorf("kind %d cannot encode as float%d", d.Kind, bits/8)
+	}
+}
+
 func floatTextDatum(text string) Datum {
 	if v, scale, ok := parseNumericFast(text); ok {
 		return Datum{Kind: KindNumeric, Int: v, Scale: scale}
