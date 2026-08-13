@@ -3759,6 +3759,31 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       stays UNCHECKED (standing slice-by-slice cluster). Gates: `go test
       ./internal/executor/` PASS; UNITS pre-commit PASS; `scripts/tpch-spotcheck.sh`
       PASS (Q12=2/Q13=35). 1 ledger row resolved (1292); 0 filed.
+      **62nd slice (2026-08-13): a `time(N)`/`timetz(N)` column ROUNDS at INPUT,
+      not truncates at OUTPUT.** Closes the three `AdjustTimeForTypmod` deferral
+      rows the 49th/51st/55th slices filed. goopg stored full microseconds and
+      TRUNCATED the fractional seconds at three output boundaries in three
+      hand-maintained copies — the `::time(N)`/`::timetz(N)` cast arm (`expr.go`),
+      `copyTimeOfDayMicros` (COPY text/CSV) and `appendTimeText` (SELECT DataRow) —
+      where upstream `time_in`/`timetz_in` ROUND half-away-from-zero at INPUT via
+      `AdjustTimeForTypmod` (date.c:1710). Measured: `'23:59:59.999999'` into
+      `time(2)` is `24:00:00` on PG 18.3 and was `23:59:59.99` on goopg — a stored
+      value, not just display. One `internal/pgdatetime/adjust_typmod.go`
+      `AdjustTimeForTypmod` (literal port of the TimeScales/TimeOffsets tables) +
+      one `roundTimeDatumToPrecision` wrapper (`codec.go`, over the hour-24
+      `pgTimeMicros`/`pgTimeFromMicros` pair the 50th slice established), applied
+      at every input site that holds the precision — the cast arm,
+      `copyTextToDatum`, `copyBinaryToDatum`, and `coerceRowForConstraintChecks`
+      (INSERT/UPDATE, which had NO `time` case so the column precision never
+      reached the value) — plus an `encodeValuePG` storage-choke safety net for
+      the DEFAULT/generated path the `!insertMissing` filter skips (rounding is
+      idempotent). The three output truncators are deleted so the stored value
+      renders verbatim. Gates: `internal/pgdatetime`+`internal/executor`+
+      `internal/server` tests PASS; `go build ./...` clean; UNITS pre-commit
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=35). 2 ledger rows
+      resolved (1286, 1289); 0 filed (the interval-column-typmod and probe-
+      extraction residuals are already-ledgered). Design
+      `0119-0006-time-typmod-rounding.md` + README row.
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
 
 - [x] **M0119-0010 — `char(N)` typmods are not restored per column on catalog

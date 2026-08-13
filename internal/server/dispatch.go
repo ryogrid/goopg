@@ -3351,7 +3351,7 @@ func appendFloat8Text(dst []byte, d executor.Datum) []byte {
 // appendTimeText formats a KindTime datum as a time-of-day string matching PostgreSQL's
 // time output format: HH:MM:SS with optional fractional seconds up to the declared precision.
 // Precision 0 → "HH:MM:SS", precision N → "HH:MM:SS.ffffff" (N digits). M0097-0004.
-func appendTimeText(dst []byte, d executor.Datum, typ catalog.Type) []byte {
+func appendTimeText(dst []byte, d executor.Datum, _ catalog.Type) []byte {
 	if d.IsNull() {
 		return dst
 	}
@@ -3369,24 +3369,19 @@ func appendTimeText(dst []byte, d executor.Datum, typ catalog.Type) []byte {
 		byte('0'+m/10), byte('0'+m%10), ':',
 		byte('0'+s/10), byte('0'+s%10))
 
-	// Fractional seconds — only emit if non-zero or precision requested.
-	prec := 6 // default microseconds
-	if len(typ.Args) > 0 && typ.Args[0] >= 0 {
-		prec = int(typ.Args[0])
-	}
-	if prec > 0 && ns != 0 {
-		// Format up to 6 microsecond digits, then trim to declared precision.
+	// Fractional seconds — only emit when non-zero. The declared precision is
+	// applied at INPUT now (roundTimeDatumToPrecision → AdjustTimeForTypmod), so
+	// the stored value already holds at most its precision's non-zero fractional
+	// digits and the render is verbatim: format the full 6 microsecond digits,
+	// strip trailing zeros. M0119-0006 (62nd slice).
+	if ns != 0 {
 		micro := ns / 1000
 		frac := make([]byte, 6)
 		for i := 5; i >= 0; i-- {
 			frac[i] = byte('0' + micro%10)
 			micro /= 10
 		}
-		// Trim to declared precision.
-		if prec < 6 {
-			frac = frac[:prec]
-		}
-		// Strip trailing zeros after applying precision.
+		// Strip trailing zeros.
 		for len(frac) > 0 && frac[len(frac)-1] == '0' {
 			frac = frac[:len(frac)-1]
 		}

@@ -13,6 +13,7 @@ import (
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/pgarray"
+	"github.com/goopg/goopg/internal/pgdatetime"
 	"github.com/goopg/goopg/internal/pglz"
 	"github.com/goopg/goopg/internal/pgnodes"
 	"github.com/goopg/goopg/internal/storage"
@@ -457,6 +458,14 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		if d.Kind != KindTime {
 			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
 		}
+		// Apply the column's declared precision here too, as the storage-choke
+		// point: the input sites (coerce/copy/cast) already round, and this arm
+		// is the safety net for paths that bypass them — a DEFAULT or generated
+		// column's value is skipped by coerceRowForConstraintChecks's
+		// !insertMissing filter, and reaches here as a KindString. Rounding is
+		// idempotent, so a value already rounded at input is untouched.
+		// M0119-0006 (62nd slice).
+		d = roundTimeDatumToPrecision(d, timeColumnPrecision(t))
 		var buf [8]byte
 		binary.LittleEndian.PutUint64(buf[:], uint64(pgTimeMicros(d.TimeValue())))
 		return buf[:], nil
@@ -471,6 +480,7 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		if d.Kind != KindTime {
 			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
 		}
+		d = roundTimeDatumToPrecision(d, timeColumnPrecision(t))
 		var buf [12]byte
 		binary.LittleEndian.PutUint64(buf[:8], uint64(pgTimeMicros(d.TimeValue())))
 		// PG wire stores timezone offset as int32 seconds, positive = west of UTC.
@@ -889,6 +899,39 @@ func pgTimeMicros(t time.Time) int64 {
 
 func pgTimeFromMicros(micros int64) time.Time {
 	return time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC).Add(time.Duration(micros) * time.Microsecond)
+}
+
+// roundTimeDatumToPrecision rounds a `time`/`timetz` Datum to the declared
+// fractional-second precision (0..6) the way upstream time_in/timetz_in round
+// via AdjustTimeForTypmod (postgres/src/backend/utils/adt/date.c:1710). It is
+// a no-op for a non-time datum or a precision outside [0,6].
+//
+// The round-trip pgTimeMicros → AdjustTimeForTypmod → pgTimeFromMicros is what
+// expresses the carry goopg's former OUTPUT-side truncation could not: at
+// precision 2, `'23:59:59.999999'` becomes 24:00:00 (usecsPerDay), because the
+// hour-24 rule the 50th slice moved into pgTimeMicros/pgTimeFromMicros reads the
+// rounded value back as next-day midnight. The timetz subtype's offset rides in
+// Datum.Scale and is preserved untouched, exactly as AdjustTimeForTypmod leaves
+// the zone half of a TimeTzADT alone. M0119-0006 (62nd slice).
+func roundTimeDatumToPrecision(d Datum, prec int64) Datum {
+	if d.Kind != KindTime || prec < 0 || prec > 6 {
+		return d
+	}
+	micros := pgdatetime.AdjustTimeForTypmod(pgTimeMicros(d.TimeValue()), int32(prec))
+	tv := pgTimeFromMicros(micros)
+	if d.TimeSub == TimeSubTimeTZ {
+		return NewTimeTZDatum(tv, d.TimeTZOffsetSecs())
+	}
+	return NewTimeDatum(tv)
+}
+
+// timeColumnPrecision returns the declared fractional-second precision of a
+// `time`/`timetz` column (t.Args[0]), or -1 when no precision is declared.
+func timeColumnPrecision(t catalog.Type) int64 {
+	if len(t.Args) == 0 {
+		return -1
+	}
+	return t.Args[0]
 }
 
 // DecodeRow inverts EncodeRow.

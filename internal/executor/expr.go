@@ -956,22 +956,14 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			}
 		}
 		// Apply typmod precision for time/timetz casts (e.g., ::timetz(4)).
-		// PostgreSQL truncates fractional seconds to the specified precision.
-		if x.Typmod > 0 && result.Kind == KindTime {
+		// Upstream time_in/timetz_in round the fractional seconds half away from
+		// zero via AdjustTimeForTypmod (date.c:1710), so `'23:59:59.999999'::time(2)`
+		// is 24:00:00, not the truncated 23:59:59.99 the old ns-division here
+		// produced. M0119-0006 (62nd slice).
+		if x.Typmod > 0 {
 			switch x.TargetType {
 			case "time", "timetz", "time with time zone":
-				prec := x.Typmod
-				if prec > 6 {
-					prec = 6 // PostgreSQL max precision for time types
-				}
-				t := result.TimeValue()
-				ns := int64(t.Nanosecond())
-				factor := int64(1)
-				for i := int64(0); i < 6-prec; i++ {
-					factor *= 10
-				}
-				ns = (ns / (factor * 1000)) * (factor * 1000)
-				result = NewTimeDatum(time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), int(ns), t.Location()))
+				result = roundTimeDatumToPrecision(result, x.Typmod)
 			}
 		}
 		return result, nil

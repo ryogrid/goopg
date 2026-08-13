@@ -342,7 +342,7 @@ func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone str
 		if d.Kind != KindTime {
 			return "", fmt.Errorf("expected time datum for time, got kind %d", d.Kind)
 		}
-		return pgdatetime.FormatTime(copyTimeOfDayMicros(t, d.TimeValue())), nil
+		return pgdatetime.FormatTime(pgTimeMicros(d.TimeValue())), nil
 	case "timetz":
 		// Sibling of the "time" arm; timetz_out prints the local time of day
 		// followed by the UTC offset. pgdatetime.FormatTimeTZ takes PG's own
@@ -352,7 +352,7 @@ func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone str
 		if d.Kind != KindTime {
 			return "", fmt.Errorf("expected time datum for timetz, got kind %d", d.Kind)
 		}
-		return pgdatetime.FormatTimeTZ(copyTimeOfDayMicros(t, d.TimeValue()),
+		return pgdatetime.FormatTimeTZ(pgTimeMicros(d.TimeValue()),
 			int32(-d.TimeTZOffsetSecs())), nil
 	default:
 		switch d.Kind {
@@ -379,34 +379,6 @@ func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone str
 			return "", fmt.Errorf("kind %d cannot encode as %s in COPY TEXT", d.Kind, t.Name)
 		}
 	}
-}
-
-// copyTimeOfDayMicros converts the time.Time carrier of a `time`/`timetz`
-// Datum into the microseconds-since-midnight pgdatetime's time_out/timetz_out
-// ports take, applying the column's declared precision.
-//
-// The one detail pgTimeMicros() cannot supply:
-//
-//   - goopg applies no typmod at INPUT (there is no AdjustTimeForTypmod port),
-//     so a `time(2)` column really does hold full microseconds and the declared
-//     precision is applied at OUTPUT. Truncating the micros here and letting
-//     FormatTime strip trailing zeros reproduces appendTimeText's trim-then-
-//     strip byte for byte, which is what keeps `COPY … TO` and `SELECT` in
-//     agreement on the same column (Hard-won Rule #2). Upstream ROUNDS at
-//     input instead; see the M0119-0006 deferral-ledger row.
-func copyTimeOfDayMicros(t catalog.Type, tv time.Time) int64 {
-	// M0119-0006 (50th slice): the `24:00:00` next-day probe that used to live
-	// here moved INTO pgTimeMicros, so the heap encode, the btree keys and this
-	// renderer can no longer disagree about it (Hard-won Rule #2).
-	micros := pgTimeMicros(tv)
-	if len(t.Args) > 0 && t.Args[0] >= 0 && t.Args[0] < 6 {
-		scale := int64(1)
-		for i := int64(0); i < 6-t.Args[0]; i++ {
-			scale *= 10
-		}
-		micros = (micros / scale) * scale
-	}
-	return micros
 }
 
 // copyTextToDatum is the inverse of datumToCopyText. raw is the
@@ -467,7 +439,7 @@ func copyTextToDatum(t catalog.Type, raw []byte, timeZone string) (Datum, error)
 		if err != nil {
 			return Datum{}, err
 		}
-		return NewTimeDatum(ts), nil
+		return roundTimeDatumToPrecision(NewTimeDatum(ts), timeColumnPrecision(t)), nil
 	case "timetz":
 		// M0119-0006 (48th slice): a COPY field with no zone of its own takes the
 		// SESSION zone, exactly as the literal path does since the 47th slice —
@@ -480,7 +452,7 @@ func copyTextToDatum(t catalog.Type, raw []byte, timeZone string) (Datum, error)
 		if err != nil {
 			return Datum{}, err
 		}
-		return NewTimeTZDatum(ts, offsetSecs), nil
+		return roundTimeDatumToPrecision(NewTimeTZDatum(ts, offsetSecs), timeColumnPrecision(t)), nil
 	case "numeric", "decimal":
 		text := string(raw)
 		// M0058-0003: int64 fast path for integer-valued NUMERIC. The

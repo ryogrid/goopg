@@ -552,7 +552,7 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 		if micros < 0 || micros > usecsPerDay {
 			return Datum{}, &ExecError{Code: "22008", Message: "time out of range"}
 		}
-		return NewTimeDatum(pgTimeFromMicros(micros)), nil
+		return roundTimeDatumToPrecision(NewTimeDatum(pgTimeFromMicros(micros)), timeColumnPrecision(t)), nil
 	case "timetz", "time with time zone":
 		// Decode twin of the "timetz" encode arm; upstream timetz_recv reads the
 		// TimeADT then the int32 zone and applies the same TZDISP_LIMIT sanity
@@ -570,7 +570,7 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 			return Datum{}, &ExecError{Code: "22009",
 				Message: "time zone displacement out of range"}
 		}
-		return NewTimeTZDatum(pgTimeFromMicros(micros), int(-pgOffset)), nil
+		return roundTimeDatumToPrecision(NewTimeTZDatum(pgTimeFromMicros(micros), int(-pgOffset)), timeColumnPrecision(t)), nil
 	case "date":
 		if len(payload) != 4 {
 			return Datum{}, fmt.Errorf("date: expected 4 bytes, got %d", len(payload))
