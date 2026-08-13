@@ -76,6 +76,20 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 		return nil, &extendedQueryError{Code: sqlstate.SyntaxError, Message: "extended query may contain only one statement"}
 	}
 	stmt := stmts[0]
+	// LISTEN / NOTIFY / UNLISTEN are handled at the server layer (the planner
+	// has no node for them). The simple path intercepts them before planning
+	// (dispatch.go:2671); the extended path must too, or they fail at
+	// planner.go:289 "unsupported statement type %T". M0132-S12.
+	if tag, handled := s.notifyStmtTag(stmt, connTx); handled {
+		// NOTIFY buffers into connTx and publishes at the transaction's commit.
+		// Out of block this Execute IS the whole transaction, so publish now;
+		// in block the block's COMMIT publishes (applyTransactionVerb →
+		// publishPendingNotify). LISTEN/UNLISTEN are immediate regardless.
+		if tag == "NOTIFY" && (connTx == nil || !connTx.InExplicit()) {
+			s.publishPendingNotify(connTx)
+		}
+		return &extendedQueryResult{CommandTag: tag}, nil
+	}
 	// M0098-0005: cross-session plan cache for extended protocol.
 	// The same parameterized query is shared across all 100 pgbench
 	// connections — one planning call serves them all.
@@ -318,6 +332,13 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 			setIsSuperuserGUC(sess, role == "")
 		}
 		ectx.SetRole = ectx.SetSessionAuthorization
+		// pg_notify(channel, payload) buffers into the connection's transaction
+		// so it publishes to LISTENers at commit, exactly like the NOTIFY
+		// statement. Mirrors dispatch.go's identical wiring (the simple path
+		// sets this, the extended path did not). M0132-S12.
+		ectx.QueueNotify = func(channel, payload string) {
+			connTx.bufferNotify(channel, payload, connTx.BackendPID)
+		}
 	}
 	// Match advisorySessionIDFromContext's preference: the per-connection
 	// AdvisorySessionIdentity (SessionRegistry) is the stable advisory owner, so
@@ -461,6 +482,10 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 			return nil, &extendedQueryError{Code: sqlstate.SystemError, Message: err.Error()}
 		}
 		executor.ReleaseAdvisoryTransactionLocks(advisoryReleaseTarget)
+		// NOTIFY becomes visible to listeners at the notifying transaction's
+		// commit; publish any buffer accumulated by this autocommit Execute
+		// (e.g. by a `SELECT pg_notify(…)`). Mirrors dispatch.go:1108. M0132-S12.
+		s.publishPendingNotify(connTx)
 	}
 	commit = true
 	s.writeBackConnTxState(ectx, connTx)

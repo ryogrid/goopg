@@ -1766,6 +1766,14 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 			}
 		case protocol.MsgSync:
 			extended.syncRequired = false
+			// Deliver queued LISTEN/NOTIFY notifications at this command
+			// boundary, before ReadyForQuery — mirroring the simple path's
+			// deliverNotifications before its ReadyForQuery (dispatch.go:1113).
+			// Without this a session that LISTENs over the extended protocol
+			// would never receive an 'A' NotificationResponse. M0132-S12.
+			if err := s.deliverNotifications(w, connTx); err != nil {
+				return
+			}
 			if err := w.ReadyForQuery(); err != nil {
 				return
 			}
