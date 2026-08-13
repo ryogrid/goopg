@@ -1,0 +1,17 @@
+RUN_ID=m0132s11_prep_317fb002  scale=100 c=50 T=120
+--- goopg_S ---
+latency average = 0.686 ms
+latency stddev = 1.626 ms
+tps = 72857.579469 (without initial connection time)
+--- goopg_N ---
+latency average = 5.693 ms
+latency stddev = 7.802 ms
+tps = 8780.973239 (without initial connection time)
+--- pg_S ---
+latency average = 0.316 ms
+latency stddev = 0.292 ms
+tps = 157741.309956 (without initial connection time)
+--- pg_N ---
+latency average = 4.085 ms
+latency stddev = 1.303 ms
+tps = 12235.141291 (without initial connection time)

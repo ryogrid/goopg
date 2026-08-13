@@ -330,6 +330,17 @@ Per the benchmarking practice card: hold server age constant across the A/B, run
 capped (`scripts/goopg-test-run.sh`, distinct `GOOPG_CG_UNIT`), and record the
 numbers in `analysis/` with the commit hash.
 
+**Measured 2026-08-13 (HEAD `317fb002`)** — see
+`analysis/perf-optimize3/runs/m0132s11_prep_317fb002/S11-RESULTS.md` for the full
+record. Criterion 3 **met** (0.32 fsync/txn, the 2-fsync bug is gone). Criteria 1
+and 2 **not met**: same-day same-HEAD controls show prepared `-N` −13.6% and `-S`
+−22.3% vs simple. The O-XP-1 profile locates the residual in the extended message
+loop — `describeViaPlanner` (re-parse+re-plan per `Describe`) and `parser.Parse`
+(re-parse per `Execute`) — i.e. a **missing prepared-statement cache**, not the
+transaction machinery this milestone changed. The feared `TxnMgr.Begin`/snapshot
+tax is 0.7% flat. The cache is out of M0132's transaction scope and is filed
+under M0132-S13 (ledger row 2026-08-13 M0132-S11).
+
 ### S12 — Simple-path-only server-layer handlers
 
 `PREPARE TRANSACTION` / `COMMIT PREPARED` / `ROLLBACK PREPARED`
