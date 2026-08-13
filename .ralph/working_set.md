@@ -1,21 +1,27 @@
 (idle — nothing in flight)
 
-Completed this loop: **M0119-0006 65th slice** — `octet_length()`/`bit_length()`
-on a `bpchar` answer from the declared width, not the trimmed heap image
-(ledger row 1314 resolved). `declaredBpcharTypmod` + `PadBpchar` for
-octet_length, trimmed-×-8 for bit_length (implicit bpchar→text cast trims),
-`42883` guards. 19 oracle-pinned cells; `expr.go` +
-`bpchar_declared_width_test.go` + design
-`docs/design/0119-0006-bpchar-octet-bit-length.md` + README row + ledger row
-1314 + fix_plan 65th-slice entry all committed.
+Completed this loop: **M0119-0006 66th slice** — the reg* family and `cid`
+store as 4-byte OIDs, and the regtypein 42704 miss-path fires (ledger row
+1300's reg*/cid half resolved). The untracked `reg_identifier.go` WIP the 65th
+slice's gate note named as its only failure is now LANDED: `regclass`/`regtype`/
+`regprocedure`/`cid` moved from varlena TEXT to 4-byte LE OIDs (typalign 'i')
+across all three physical decoders — heap codec (`codec.go`), binary COPY
+(`copy_binary.go`), and the `pgoDecodePhysicalValue` third twin
+(`internal/wal/pgoutput.go`, which was reading the 4-byte image through the
+varlena fall-through = silent garbage) — plus `regIdentifierInput` (new
+`internal/executor/reg_identifier.go`) as the name→OID input half routed from
+`coerceRowForConstraintChecks` (regclassin/regtypein/regprocin semantics,
+42P01/42704/42883 on a miss). The 65th slice's blocker was the
+`TypeNameToOID` OIDText-fallback defeating the `oid != 0` test; the miss test
+is now the established `oid != OIDText || name=="text"` idiom and 42704 fires.
+`regrole`/`regcollation` carry forward in a NEW ledger row (no name→OID seam at
+coerce time). Gates: pre-commit units PASS, regress suite PASS (346 s),
+tpch-spotcheck PASS (Q12=2, Q13=35). Commit `4d8692d4` on `try-cost-optimization`.
+Design `docs/design/0119-0006-reg-identifier-family-storage.md` + README row +
+ledger row 1300 resolved + fix_plan 66th-slice entry.
 
-**Known pre-existing blocker for the next loop:** the untracked
-`internal/executor/reg_identifier.go` + `reg_identifier_test.go` (and the
-modified `codec.go`/`copy_binary.go`/`copy_binary_oid_test.go`/
-`operators_storage.go`) reg_identifier WIP from a prior loop has a genuinely
-failing test — `TestRegIdentifierInputResolvesRegtypeName` expects `regtypein`
-to raise 42704 on `no_such_type`, but `catalog.TypeNameToOID`'s
-`default: return OIDText` fallback resolves it to OID 25 (no 0 sentinel), so
-the miss-path never fires. This makes the pre-commit `units` gate fail (only
-failure in the whole run). Fix requires changing the `TypeNameToOID` contract
-or adding a found-flag lookup — a different subsystem, not this slice's scope.
+**Carry-forward for a later loop:** `regrole`/`regcollation` still store as
+varlena TEXT in the heap (upstream: 4-byte identifiers); fixing them needs a
+role/collation name→OID lookup at coerce time — per-instance initdb-minted OIDs
+mean a static table like `TypeNameToOID` will not do. See the new ledger row
+under 2026-08-14 (66th slice).
