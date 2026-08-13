@@ -130,6 +130,9 @@ The highlights below are a non-exhaustive excerpt of the major subsystems:
 
 goopg is an ongoing experiment; the current state in brief:
 
+- **Concurrency model** — already implemented with thread-level parallelism: a
+  single process running goroutines, rather than PostgreSQL's multi-process
+  backend model.
 - **Direct I/O** — not yet implemented. It proved harder than initially
   expected, so storage still goes through the OS page cache.
 - **Performance** — on OLTP, `pgbench` reaches roughly half of vanilla
