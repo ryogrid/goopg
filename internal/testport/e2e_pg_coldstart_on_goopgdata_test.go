@@ -1182,8 +1182,11 @@ func assertInformationSchemaDataTablesReadable(t *testing.T, pg *pgcluster.Clust
 // reads pg_trigger cols 3/9–19) landed with the descriptor-completion slice.
 // Tranche 2 (2026-08-14) adds the ten catalog-direct TOAST views, whose stored
 // ev_action exceeds the 8000 B inline budget and is externalised into
-// pg_toast_2618 by the M0131-S20.2 writer. The remaining 22 (helper-function,
-// and view-on-view) land in tranches 3–4.
+// pg_toast_2618 by the M0131-S20.2 writer. Tranche 3 (2026-08-14) adds the
+// four helper-function views (key_column_usage, parameters, sequences,
+// triggered_update_columns) — catalog-direct, under the inline budget, and
+// embedding an in-band :funcid to the S2 helpers (13274..13285) but no
+// in-band :relid. The remaining 18 view-on-view views land in tranche 4.
 func informationSchemaViewProbeSet() []struct {
 	view string
 	oid  string
@@ -1211,6 +1214,8 @@ func informationSchemaViewProbeSet() []struct {
 		{"information_schema.domain_udt_usage", "13381"},
 		{"information_schema.domains", "13385"},
 		{"information_schema.enabled_roles", "13390"},
+		{"information_schema.key_column_usage", "13394"},
+		{"information_schema.parameters", "13399"},
 		{"information_schema.referential_constraints", "13404"},
 		{"information_schema.routine_column_usage", "13413"},
 		{"information_schema.routine_privileges", "13418"},
@@ -1219,10 +1224,12 @@ func informationSchemaViewProbeSet() []struct {
 		{"information_schema.routine_table_usage", "13437"},
 		{"information_schema.routines", "13442"},
 		{"information_schema.schemata", "13447"},
+		{"information_schema.sequences", "13451"},
 		{"information_schema.table_constraints", "13476"},
 		{"information_schema.table_privileges", "13481"},
 		{"information_schema.tables", "13490"},
 		{"information_schema.transforms", "13495"},
+		{"information_schema.triggered_update_columns", "13500"},
 		{"information_schema.triggers", "13505"},
 		{"information_schema.udt_privileges", "13510"},
 		{"information_schema.usage_privileges", "13519"},

@@ -212,6 +212,49 @@ attr	domains	26	maximum_cardinality	13287	4	f	f
 attr	domains	27	dtd_identifier	13292	64	f	f
 rel	enabled_roles	13390	13390	13393	13392	2249	v	1
 attr	enabled_roles	1	role_name	13292	64	f	f
+rel	key_column_usage	13394	13394	13397	13396	2249	v	9
+attr	key_column_usage	1	constraint_catalog	13292	64	f	f
+attr	key_column_usage	2	constraint_schema	13292	64	f	f
+attr	key_column_usage	3	constraint_name	13292	64	f	f
+attr	key_column_usage	4	table_catalog	13292	64	f	f
+attr	key_column_usage	5	table_schema	13292	64	f	f
+attr	key_column_usage	6	table_name	13292	64	f	f
+attr	key_column_usage	7	column_name	13292	64	f	f
+attr	key_column_usage	8	ordinal_position	13287	4	f	f
+attr	key_column_usage	9	position_in_unique_constraint	13287	4	f	f
+rel	parameters	13399	13399	13402	13401	2249	v	32
+attr	parameters	1	specific_catalog	13292	64	f	f
+attr	parameters	2	specific_schema	13292	64	f	f
+attr	parameters	3	specific_name	13292	64	f	f
+attr	parameters	4	ordinal_position	13287	4	f	f
+attr	parameters	5	parameter_mode	13290	-1	f	f
+attr	parameters	6	is_result	13300	-1	f	f
+attr	parameters	7	as_locator	13300	-1	f	f
+attr	parameters	8	parameter_name	13292	64	f	f
+attr	parameters	9	data_type	13290	-1	f	f
+attr	parameters	10	character_maximum_length	13287	4	f	f
+attr	parameters	11	character_octet_length	13287	4	f	f
+attr	parameters	12	character_set_catalog	13292	64	f	f
+attr	parameters	13	character_set_schema	13292	64	f	f
+attr	parameters	14	character_set_name	13292	64	f	f
+attr	parameters	15	collation_catalog	13292	64	f	f
+attr	parameters	16	collation_schema	13292	64	f	f
+attr	parameters	17	collation_name	13292	64	f	f
+attr	parameters	18	numeric_precision	13287	4	f	f
+attr	parameters	19	numeric_precision_radix	13287	4	f	f
+attr	parameters	20	numeric_scale	13287	4	f	f
+attr	parameters	21	datetime_precision	13287	4	f	f
+attr	parameters	22	interval_type	13290	-1	f	f
+attr	parameters	23	interval_precision	13287	4	f	f
+attr	parameters	24	udt_catalog	13292	64	f	f
+attr	parameters	25	udt_schema	13292	64	f	f
+attr	parameters	26	udt_name	13292	64	f	f
+attr	parameters	27	scope_catalog	13292	64	f	f
+attr	parameters	28	scope_schema	13292	64	f	f
+attr	parameters	29	scope_name	13292	64	f	f
+attr	parameters	30	maximum_cardinality	13287	4	f	f
+attr	parameters	31	dtd_identifier	13292	64	f	f
+attr	parameters	32	parameter_default	13290	-1	f	f
 rel	referential_constraints	13404	13404	13407	13406	2249	v	9
 attr	referential_constraints	1	constraint_catalog	13292	64	f	f
 attr	referential_constraints	2	constraint_schema	13292	64	f	f
@@ -362,6 +405,19 @@ attr	schemata	4	default_character_set_catalog	13292	64	f	f
 attr	schemata	5	default_character_set_schema	13292	64	f	f
 attr	schemata	6	default_character_set_name	13292	64	f	f
 attr	schemata	7	sql_path	13290	-1	f	f
+rel	sequences	13451	13451	13454	13453	2249	v	12
+attr	sequences	1	sequence_catalog	13292	64	f	f
+attr	sequences	2	sequence_schema	13292	64	f	f
+attr	sequences	3	sequence_name	13292	64	f	f
+attr	sequences	4	data_type	13290	-1	f	f
+attr	sequences	5	numeric_precision	13287	4	f	f
+attr	sequences	6	numeric_precision_radix	13287	4	f	f
+attr	sequences	7	numeric_scale	13287	4	f	f
+attr	sequences	8	start_value	13290	-1	f	f
+attr	sequences	9	minimum_value	13290	-1	f	f
+attr	sequences	10	maximum_value	13290	-1	f	f
+attr	sequences	11	increment	13290	-1	f	f
+attr	sequences	12	cycle_option	13300	-1	f	f
 rel	table_constraints	13476	13476	13479	13478	2249	v	11
 attr	table_constraints	1	constraint_catalog	13292	64	f	f
 attr	table_constraints	2	constraint_schema	13292	64	f	f
@@ -405,6 +461,14 @@ attr	transforms	5	specific_schema	13292	64	f	f
 attr	transforms	6	specific_name	13292	64	f	f
 attr	transforms	7	group_name	13292	64	f	f
 attr	transforms	8	transform_type	13290	-1	f	f
+rel	triggered_update_columns	13500	13500	13503	13502	2249	v	7
+attr	triggered_update_columns	1	trigger_catalog	13292	64	f	f
+attr	triggered_update_columns	2	trigger_schema	13292	64	f	f
+attr	triggered_update_columns	3	trigger_name	13292	64	f	f
+attr	triggered_update_columns	4	event_object_catalog	13292	64	f	f
+attr	triggered_update_columns	5	event_object_schema	13292	64	f	f
+attr	triggered_update_columns	6	event_object_table	13292	64	f	f
+attr	triggered_update_columns	7	event_object_column	13292	64	f	f
 rel	triggers	13505	13505	13508	13507	2249	v	17
 attr	triggers	1	trigger_catalog	13292	64	f	f
 attr	triggers	2	trigger_schema	13292	64	f	f

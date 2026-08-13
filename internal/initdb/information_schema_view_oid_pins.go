@@ -56,6 +56,13 @@ package initdb
 // carry no in-band :relid, so they are capturable now and are NOT tranche-3/4
 // views. element_types — the eleventh over-budget value — is deferred to
 // tranche 4 because it embeds :relid 13553 (data_type_privileges).
+//
+// Tranche 3 (2026-08-14) is the helper-function set — the four views whose
+// ev_action embeds in-band :funcid references to the S2 helpers (13274..13285)
+// but no in-band :relid, and whose stored ev_action stays under the 8000 B
+// inline budget: key_column_usage, parameters, sequences,
+// triggered_update_columns. They are capturable now because S2 landed the
+// helpers those funcids resolve to.
 func informationSchemaViewOIDPins() []systemViewOIDPin {
 	return []systemViewOIDPin{
 		{"information_schema_catalog_name", 13293, 13296, 13295, 1},
@@ -77,6 +84,8 @@ func informationSchemaViewOIDPins() []systemViewOIDPin {
 		{"domain_udt_usage", 13381, 13384, 13383, 6},
 		{"domains", 13385, 13388, 13387, 27},
 		{"enabled_roles", 13390, 13393, 13392, 1},
+		{"key_column_usage", 13394, 13397, 13396, 9},
+		{"parameters", 13399, 13402, 13401, 32},
 		{"referential_constraints", 13404, 13407, 13406, 9},
 		{"routine_column_usage", 13413, 13416, 13415, 10},
 		{"routine_privileges", 13418, 13421, 13420, 10},
@@ -85,10 +94,12 @@ func informationSchemaViewOIDPins() []systemViewOIDPin {
 		{"routine_table_usage", 13437, 13440, 13439, 9},
 		{"routines", 13442, 13445, 13444, 82},
 		{"schemata", 13447, 13450, 13449, 7},
+		{"sequences", 13451, 13454, 13453, 12},
 		{"table_constraints", 13476, 13479, 13478, 11},
 		{"table_privileges", 13481, 13484, 13483, 8},
 		{"tables", 13490, 13493, 13492, 12},
 		{"transforms", 13495, 13498, 13497, 8},
+		{"triggered_update_columns", 13500, 13503, 13502, 7},
 		{"triggers", 13505, 13508, 13507, 17},
 		{"udt_privileges", 13510, 13513, 13512, 7},
 		{"usage_privileges", 13519, 13522, 13521, 8},

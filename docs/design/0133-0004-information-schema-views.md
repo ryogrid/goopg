@@ -1,18 +1,20 @@
-# M0133-S4 — `information_schema` views (65, tranches 1–2 = 43 of 65)
+# M0133-S4 — `information_schema` views (65, tranches 1–3 = 47 of 65)
 
 **Status:** accepted — tranche 1 COMPLETE 2026-08-14 (33 catalog-direct leaves);
-tranche 2 COMPLETE 2026-08-14 (10 TOAST views).
+tranche 2 COMPLETE 2026-08-14 (10 TOAST views); tranche 3 COMPLETE 2026-08-14
+(4 helper-function views).
 **Milestone:** M0133 (`information_schema` on disk), slice S4.
 **Supersedes:** S9.4d in `0131-0009-system-view-corpus-widening.md` §"Successor decomposition".
 
 ## What landed
 
-The first two tranches of the 65 `information_schema` views — **all 33
-catalog-direct leaves plus the 10 catalog-direct TOAST views** — seeded on disk
-so a hosted PG 18.3 cold-started on a goopg `$PGDATA` resolves and
-**evaluates** `SELECT * FROM information_schema.<view>` for each. The slice
-reuses the M0131-S9 capture/pin/regen loop unchanged (Option-A identity
-pinning), with one new generator and two forced fixes (below).
+The first three tranches of the 65 `information_schema` views — **all 33
+catalog-direct leaves plus the 10 catalog-direct TOAST views plus the 4
+helper-function views** — seeded on disk so a hosted PG 18.3 cold-started on a
+goopg `$PGDATA` resolves and **evaluates** `SELECT * FROM
+information_schema.<view>` for each. The slice reuses the M0131-S9
+capture/pin/regen loop unchanged (Option-A identity pinning), with one new
+generator and two forced fixes (below).
 
 Four of the 33 landed one loop later, by a **catalog-descriptor-completion**
 slice (2026-08-14), not a view-capture problem — their ev_action blobs are
@@ -44,7 +46,7 @@ those on disk, the 65 views split cleanly into four tranches by what their
 |---|---|---|
 | **1 (done)** | catalog-direct, no in-band `:relid`, no in-band `:funcid`, stored ≤ 8000 B | 33 (4 landed a loop later by the descriptor-completion slice) |
 | **2 (done)** | catalog-direct, stored > 8000 B (TOAST) | 10 (`attributes`, `check_constraints`, `column_privileges`, `columns`, `constraint_column_usage`, `domains`, `referential_constraints`, `routines`, `transforms`, `usage_privileges`) |
-| 3 | helper-function (`:funcid` 13274..13285), stored ≤ 8000 B | 4 (`key_column_usage`, `parameters`, `sequences`, `triggered_update_columns`) |
+| 3 (done) | helper-function (`:funcid` 13274..13285), stored ≤ 8000 B | 4 (`key_column_usage`, `parameters`, `sequences`, `triggered_update_columns`) |
 | 4 | view-on-view (`:relid` in 13293..13621) | 18 |
 
 The 11 F33 over-budget values split 10/1: ten are catalog-direct (tranche 2) and
@@ -166,12 +168,11 @@ unchanged.
 
 ## Remaining (later tranches)
 
-Tranches 3–4 above. Tranche 2 needed no new mechanism — the ten over-budget
-values externalised through the existing `DECLARE_TOAST(pg_rewrite, 2838, 2839)`
-chunk writer (`pgRewriteRowToasted` already collects chunks), and the capture
-guard #5 verified each against the oracle's `pg_toast_2618` chunks (chunk_id =
-rule OID + 1). Tranche 3 needs the `_pg_*` funcids to resolve (S2's pinned
-helpers, already on disk — the four helper-function views are ≤ 8000 B and carry
-no `:relid`). Tranche 4 is ordered base-before-dependent by capture guard #4; its
-base views (`attributes`, `columns`, `domains`, `enabled_roles`, …) landed in
-tranches 1–2, so each is pinned before its dependents are captured.
+Tranche 4 only (18 view-on-view views). Tranche 3 needed no new mechanism — the
+four helper-function views (`key_column_usage`, `parameters`, `sequences`,
+`triggered_update_columns`) are catalog-direct, stored ≤ 8000 B, and embed an
+in-band `:funcid` to the S2 helpers (13274..13285, already on disk) but no
+in-band `:relid`, so the existing capture loop seeded them verbatim (OIDs 13394,
+13399, 13451, 13500). Tranche 4 is ordered base-before-dependent by capture
+guard #4; its base views (`attributes`, `columns`, `domains`, `enabled_roles`,
+…) landed in tranches 1–3, so each is pinned before its dependents are captured.
