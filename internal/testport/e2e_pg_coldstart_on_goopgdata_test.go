@@ -1141,20 +1141,20 @@ func assertInformationSchemaDataTablesReadable(t *testing.T, pg *pgcluster.Clust
 
 	// Real cell reads, not just counts — the first sql_features row in heap
 	// order (B011 / "Embedded Ada", deterministic: the heap is written in
-	// capture order). Projection + LIMIT only, because a domain-typed
-	// comparison/concatenation over `character_data`/`yes_or_no` trips
-	// "operator is not unique" on a goopg-hosted PG where a real PG 18.3
-	// resolves it to text — goopg's on-disk pg_operator/pg_cast is the
-	// early-boot MINIMAL set and lacks the domain→base→text coercion edges the
-	// full catalog carries. Ledgered under M0133-S3; the cell content itself is
-	// pinned field-for-field by TestInformationSchemaTableRowsMatchCapture.
+	// capture order). The WHERE-clause read below deliberately exercises the
+	// domain-typed comparison `feature_id = 'B011'` (character_data = unknown),
+	// which failed "operator is not unique" until typispreferred was fixed for
+	// the eight PG18 preferred types (text 25 is the preferred type of category
+	// S; func_select_candidate needs it to disambiguate). The cell content itself
+	// is pinned field-for-field by TestInformationSchemaTableRowsMatchCapture.
 	if got := s4Scalar(t, pg, logPath,
 		`SELECT feature_id FROM information_schema.sql_features LIMIT 1`); got != "B011" {
 		t.Errorf("hosted PG sql_features[0] feature_id = %q, want %q", got, "B011")
 	}
 	if got := s4Scalar(t, pg, logPath,
-		`SELECT feature_name FROM information_schema.sql_features LIMIT 1`); got != "Embedded Ada" {
-		t.Errorf("hosted PG sql_features[0] feature_name = %q, want %q", got, "Embedded Ada")
+		`SELECT feature_name FROM information_schema.sql_features WHERE feature_id = 'B011'`); got != "Embedded Ada" {
+		t.Errorf("hosted PG sql_features WHERE feature_id='B011' = %q, want %q (domain-typed "+
+			"comparison must resolve to texteq now that typispreferred is seeded)", got, "Embedded Ada")
 	}
 
 	// The composite rowtype is on disk and is a real composite pointing back at

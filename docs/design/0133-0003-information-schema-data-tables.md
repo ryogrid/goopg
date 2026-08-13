@@ -173,6 +173,15 @@ unaffected; the E2E probe asserts cell content via `LIMIT` on heap order rather
 than a WHERE clause. This blocks S4's views (they filter on `character_data`/
 `yes_or_no`), so it must be triaged before S4's end-to-end view evaluation.
 
+**Update 2026-08-13 — the operator half is RESOLVED.** `WHERE feature_id = 'B011'`
+and `feature_id || '/'` now resolve to `texteq` on a hosted PG: the real cause was
+`typispreferred = false` for every seeded pg_type row, and `func_select_candidate`
+needs text (25) marked the preferred type of category S to disambiguate. Fixed by
+`pgTypePreferredOverlay` (`internal/initdb/pg_type_bootstrap.go`). The `concat()`
+symptom was a *separate* root cause (`provariadic = 0` hardcoded for every pg_proc
+row, `initdb.go:2980`), not domain coercion — ledgered separately; no
+information_schema view calls a variadic function, so it does not gate S4.
+
 ## Guards
 
 - `TestInformationSchemaTableRowsMatchCapture` — the embedded TSV parses to

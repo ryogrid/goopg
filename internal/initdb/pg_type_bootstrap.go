@@ -536,6 +536,28 @@ var pgTypeTypModOverlay = map[uint32]int64{
 	13300: 7, // yes_or_no = varchar(3)
 }
 
+// pgTypePreferredOverlay carries typispreferred for the eight PG18 types that are
+// the preferred type of their category (measured from a fresh PG 18.3: the only
+// rows in pg_type with typispreferred = t). Every other seeded row hardcodes
+// false, which pgTypeRow still emits by default (the map's zero value).
+//
+// This is load-bearing for operator resolution on a hosted PG: func_select_candidate
+// (parse_oper.c) disambiguates a category-ambiguous operator like `character_data
+// = 'x'` by preferring the preferred type (text, category S) — with typispreferred
+// false on every string type the choice is non-unique and the query fails with
+// "operator is not unique" (M0133-S3 F4). goopg's own in-memory type resolution
+// does not read this column, so the change only affects what a hosted PG sees.
+var pgTypePreferredOverlay = map[uint32]bool{
+	16:   true, // bool (category B)
+	25:   true, // text (category S)
+	26:   true, // oid (category N)
+	701:  true, // float8 (category N)
+	869:  true, // inet (category I)
+	1184: true, // timestamptz (category D)
+	1186: true, // interval (category T)
+	1562: true, // varbit (category V)
+}
+
 // pgTypeElemArraySubscriptForOID returns the PG18-canonical
 // {typelem, typarray, typsubscript} triple for a bootstrapped pg_type row.
 //
@@ -599,7 +621,7 @@ func pgTypeRow(e pgTypeEntry) executor.Row {
 		executor.NewBoolDatum(e.ByVal),                     // 6 typbyval
 		executor.NewStringDatum(string(e.Type)),            // 7 typtype
 		executor.NewStringDatum(string(e.Category)),        // 8 typcategory
-		executor.NewBoolDatum(false),                       // 9 typispreferred
+		executor.NewBoolDatum(pgTypePreferredOverlay[e.OID]), // 9 typispreferred
 		executor.NewBoolDatum(true),                        // 10 typisdefined
 		executor.NewStringDatum(","),                       // 11 typdelim
 		executor.NewIntDatum(int64(pgTypeRelidOverlay[e.OID])), // 12 typrelid (M0131-S9.3g; 0 for every non-composite)
