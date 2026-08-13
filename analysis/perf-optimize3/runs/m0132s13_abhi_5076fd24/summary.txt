@@ -1,0 +1,7 @@
+== S_simple ==
+latency average = 0.493 ms
+tps = 101351.130387 (without initial connection time)
+== S_prepared ==
+latency average = 0.499 ms
+tps = 100264.888899 (without initial connection time)
+=== done ===

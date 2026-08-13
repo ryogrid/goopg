@@ -1,0 +1,14 @@
+=== M0132-S13 A/B at HEAD 5076fd24 (uncommitted cache change) ===
+== N_simple ==
+latency average = 3.056 ms
+tps = 654.392085 (without initial connection time)
+== N_prepared ==
+latency average = 3.093 ms
+tps = 646.611737 (without initial connection time)
+== S_simple ==
+latency average = 0.159 ms
+tps = 12579.997079 (without initial connection time)
+== S_prepared ==
+latency average = 0.209 ms
+tps = 9581.303999 (without initial connection time)
+=== done ===

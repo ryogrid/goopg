@@ -37,88 +37,93 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 			return res, qerr
 		}
 	}
-	stmts, err := parser.Parse(query)
-	if err != nil {
-		// CREATE/DROP/ALTER DATABASE and CREATE/DROP/ALTER ROLE are not
-		// parser grammar (same string-prefix wire-dispatch bypass the
-		// simple-query path uses in dispatchSimpleQueryViaExecutor) — try
-		// that bypass here too before surfacing a syntax error. M0119-0004.
-		if res, qerr, handled := s.tryHandleDatabaseOrRoleDDLExtended(query, dbName, connTx.NonSuperuserRole, sess); handled {
-			return res, qerr
+	// M0132-S13: look up the cross-session plan cache BEFORE parsing. The parse
+	// (and with it the syntax-error DDL/noop bypass, the empty/multi-statement
+	// checks, and the LISTEN/NOTIFY/UNLISTEN intercept) runs only on a cache
+	// miss — none of those statement families is ever cacheable (see
+	// planCacheIsCacheable, and notifyStmtTag returns before s.pc.Put), so a
+	// cache hit implies the query already parsed as exactly one non-notify
+	// statement. This removes the per-Execute parser.Parse that was the -N hot
+	// path (S11's O-XP-1 profile: 6.2% cum).
+	connDBOid := resolveConnDBOid(s.cfg.Catalog, dbName)
+	var node planner.Node
+	cacheHit := false
+	if s.pc != nil && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
+		if cached, ok := s.pc.Get(planCacheKey(query, connDBOid)); ok {
+			node = cached
+			cacheHit = true
 		}
-		if res, qerr, handled := s.tryCompatNoopExtended(query); handled {
-			return res, qerr
-		}
-		msg, extra := syntaxErrorMsg(err)
-		qerr := &extendedQueryError{Code: syntaxErrorCode(err), Message: msg}
-		for _, f := range extra {
-			if f.Code == protocol.FieldPosition {
-				if p, _ := strconv.Atoi(f.Value); p > 0 {
-					qerr.Position = p
+	}
+	if !cacheHit {
+		stmts, err := parser.Parse(query)
+		if err != nil {
+			// CREATE/DROP/ALTER DATABASE and CREATE/DROP/ALTER ROLE are not
+			// parser grammar (same string-prefix wire-dispatch bypass the
+			// simple-query path uses in dispatchSimpleQueryViaExecutor) — try
+			// that bypass here too before surfacing a syntax error. M0119-0004.
+			if res, qerr, handled := s.tryHandleDatabaseOrRoleDDLExtended(query, dbName, connTx.NonSuperuserRole, sess); handled {
+				return res, qerr
+			}
+			if res, qerr, handled := s.tryCompatNoopExtended(query); handled {
+				return res, qerr
+			}
+			msg, extra := syntaxErrorMsg(err)
+			qerr := &extendedQueryError{Code: syntaxErrorCode(err), Message: msg}
+			for _, f := range extra {
+				if f.Code == protocol.FieldPosition {
+					if p, _ := strconv.Atoi(f.Value); p > 0 {
+						qerr.Position = p
+					}
 				}
 			}
+			return nil, qerr
 		}
-		return nil, qerr
-	}
-	// Per-statement query logging (GOOPG_LOG_STATEMENT), extended protocol.
-	// Logged at Execute (the portal's source query) rather than Bind, so a
-	// reused portal is not logged per-batch — mirroring PostgreSQL's
-	// log_statement on the extended path. No-op when disabled. root-0023.
-	stmtStart := time.Now()
-	wasLogged := s.logStatement("extended", query, sess, connTx)
-	// `log_min_duration_statement` (check_log_duration, postgres.c): timed
-	// across every return path below via defer. root-0023 follow-up.
-	defer s.logDuration(stmtStart, wasLogged, "extended", query, sess, connTx)
-	if len(stmts) == 0 {
-		return &extendedQueryResult{Empty: true}, nil
-	}
-	if len(stmts) > 1 {
-		return nil, &extendedQueryError{Code: sqlstate.SyntaxError, Message: "extended query may contain only one statement"}
-	}
-	stmt := stmts[0]
-	// LISTEN / NOTIFY / UNLISTEN are handled at the server layer (the planner
-	// has no node for them). The simple path intercepts them before planning
-	// (dispatch.go:2671); the extended path must too, or they fail at
-	// planner.go:289 "unsupported statement type %T". M0132-S12.
-	if tag, handled := s.notifyStmtTag(stmt, connTx); handled {
-		// NOTIFY buffers into connTx and publishes at the transaction's commit.
-		// Out of block this Execute IS the whole transaction, so publish now;
-		// in block the block's COMMIT publishes (applyTransactionVerb →
-		// publishPendingNotify). LISTEN/UNLISTEN are immediate regardless.
-		if tag == "NOTIFY" && (connTx == nil || !connTx.InExplicit()) {
-			s.publishPendingNotify(connTx)
+		// Per-statement query logging (GOOPG_LOG_STATEMENT), extended protocol.
+		// Logged at Execute (the portal's source query) rather than Bind, so a
+		// reused portal is not logged per-batch — mirroring PostgreSQL's
+		// log_statement on the extended path. No-op when disabled. root-0023.
+		stmtStart := time.Now()
+		wasLogged := s.logStatement("extended", query, sess, connTx)
+		// `log_min_duration_statement` (check_log_duration, postgres.c): timed
+		// across every return path below via defer. root-0023 follow-up.
+		defer s.logDuration(stmtStart, wasLogged, "extended", query, sess, connTx)
+		if len(stmts) == 0 {
+			return &extendedQueryResult{Empty: true}, nil
 		}
-		return &extendedQueryResult{CommandTag: tag}, nil
-	}
-	// M0098-0005: cross-session plan cache for extended protocol.
-	// The same parameterized query is shared across all 100 pgbench
-	// connections — one planning call serves them all.
-	var node planner.Node
-	// Resolved directly from dbName (not an executor.Context field) since
-	// ectx doesn't exist yet at this point in the request. M0122-0007 slice 4c.
-	connDBOid := resolveConnDBOid(s.cfg.Catalog, dbName)
-	if s.pc != nil && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
-		key := planCacheKey(query, connDBOid)
-		if cached, ok := s.pc.Get(key); ok {
-			node = cached
-		} else {
-			var perr error
-			node, perr = planner.Plan(stmt, sessionPlanCatalog(sess, s.cfg.Catalog, connDBOid))
-			if perr != nil {
-				code, msg := planErrorFields(perr)
-				return nil, &extendedQueryError{Code: code, Message: msg}
+		if len(stmts) > 1 {
+			return nil, &extendedQueryError{Code: sqlstate.SyntaxError, Message: "extended query may contain only one statement"}
+		}
+		stmt := stmts[0]
+		// LISTEN / NOTIFY / UNLISTEN are handled at the server layer (the planner
+		// has no node for them). The simple path intercepts them before planning
+		// (dispatch.go:2671); the extended path must too, or they fail at
+		// planner.go:289 "unsupported statement type %T". M0132-S12.
+		if tag, handled := s.notifyStmtTag(stmt, connTx); handled {
+			// NOTIFY buffers into connTx and publishes at the transaction's commit.
+			// Out of block this Execute IS the whole transaction, so publish now;
+			// in block the block's COMMIT publishes (applyTransactionVerb →
+			// publishPendingNotify). LISTEN/UNLISTEN are immediate regardless.
+			if tag == "NOTIFY" && (connTx == nil || !connTx.InExplicit()) {
+				s.publishPendingNotify(connTx)
 			}
-			if planCacheIsCacheable(node) {
-				s.pc.Put(key, node)
-			}
+			return &extendedQueryResult{CommandTag: tag}, nil
 		}
-	} else {
 		var perr error
 		node, perr = planner.Plan(stmt, sessionPlanCatalog(sess, s.cfg.Catalog, connDBOid))
 		if perr != nil {
 			code, msg := planErrorFields(perr)
 			return nil, &extendedQueryError{Code: code, Message: msg}
 		}
+		if s.pc != nil && planCacheIsCacheable(node) {
+			s.pc.Put(planCacheKey(query, connDBOid), node)
+		}
+	} else {
+		// Cache hit: the query was already parsed and planned once (it could not
+		// be in the cache otherwise). Log the statement exactly as the miss path
+		// does, then fall through to the executor on the cached node.
+		stmtStart := time.Now()
+		wasLogged := s.logStatement("extended", query, sess, connTx)
+		defer s.logDuration(stmtStart, wasLogged, "extended", query, sess, connTx)
 	}
 
 	// M0132-S2: BEGIN/COMMIT/ROLLBACK are no longer answered with a bare

@@ -242,7 +242,7 @@ func (s *Server) handleBindFrame(state *extendedState, payload []byte) *extended
 	return nil
 }
 
-func (s *Server) handleDescribeFrame(state *extendedState, payload []byte, w *protocol.FrameWriter) (*extendedMessageError, error) {
+func (s *Server) handleDescribeFrame(state *extendedState, payload []byte, w *protocol.FrameWriter, sess *config.SessionRegistry) (*extendedMessageError, error) {
 	pr := payloadReader{buf: payload}
 	kind, err := pr.readByte()
 	if err != nil {
@@ -270,7 +270,7 @@ func (s *Server) handleDescribeFrame(state *extendedState, payload []byte, w *pr
 		if err := w.WriteParameterDescription(oids); err != nil {
 			return nil, err
 		}
-		fields := s.describeExtendedQuery(stmt.Query)
+		fields := s.describeExtendedQuery(stmt.Query, sess, state.DBName)
 		// nil = no result set (write/DDL/txn) → NoData; a non-nil but empty
 		// slice is a zero-column read (`SELECT FROM t`) → RowDescription with
 		// 0 fields, matching PostgreSQL.
@@ -293,7 +293,7 @@ func (s *Server) handleDescribeFrame(state *extendedState, payload []byte, w *pr
 				Routine: "server.handleDescribeFrame",
 			}, nil
 		}
-		fields := s.describeExtendedQuery(portal.Statement.Query)
+		fields := s.describeExtendedQuery(portal.Statement.Query, sess, state.DBName)
 		// nil = no result set (write/DDL/txn) → NoData; a non-nil but empty
 		// slice is a zero-column read (`SELECT FROM t`) → RowDescription with
 		// 0 fields, matching PostgreSQL.
@@ -629,7 +629,7 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *config.SessionR
 	}
 }
 
-func (s *Server) describeExtendedQuery(query string) []protocol.FieldDescription {
+func (s *Server) describeExtendedQuery(query string, sess *config.SessionRegistry, dbName string) []protocol.FieldDescription {
 	_, matchable, upper, empty := normalizeSimpleQuery(query)
 	if empty {
 		return nil
@@ -669,7 +669,7 @@ func (s *Server) describeExtendedQuery(query string) []protocol.FieldDescription
 		// Plan the statement to learn its output schema. Errors here
 		// are non-fatal — we just fall back to NoData and let the
 		// follow-up Execute surface a real error.
-		if fields, ok := s.describeViaPlanner(query); ok {
+		if fields, ok := s.describeViaPlanner(query, sess, dbName); ok {
 			return fields
 		}
 	}
@@ -682,14 +682,45 @@ func (s *Server) describeExtendedQuery(query string) []protocol.FieldDescription
 // empty schema (write-only statement, transaction verb, etc.) is
 // signalled to the wire layer as NoData. Errors return ok=false; the
 // real error will surface during Execute.
-func (s *Server) describeViaPlanner(query string) ([]protocol.FieldDescription, bool) {
-	stmts, err := parser.Parse(query)
-	if err != nil || len(stmts) != 1 {
-		return nil, false
-	}
-	node, err := planner.Plan(stmts[0], s.cfg.Catalog)
-	if err != nil {
-		return nil, false
+func (s *Server) describeViaPlanner(query string, sess *config.SessionRegistry, dbName string) ([]protocol.FieldDescription, bool) {
+	// M0132-S13: read the output schema from the cross-session plan cache when
+	// possible, so a per-iteration Describe (pgbench's PQexecPrepared sends a
+	// Describe Portal per execution) no longer re-parses+re-plans — the -S hot
+	// path (S11's O-XP-1 profile: 13.4% cum). The cache is DDL-invalidated by
+	// the Execute path exactly as it is here. Using sessionPlanCatalog (instead
+	// of the bare s.cfg.Catalog this function used before) makes Describe and
+	// Execute plan on the SAME catalog, so a Describe describes the plan the
+	// following Execute actually runs — the previous divergence meant a session
+	// with search_path/enable_seqscan/temp overrides could see the two disagree.
+	connDBOid := resolveConnDBOid(s.cfg.Catalog, dbName)
+	var node planner.Node
+	if s.pc != nil && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
+		if cached, ok := s.pc.Get(planCacheKey(query, connDBOid)); ok {
+			node = cached
+		} else {
+			stmts, err := parser.Parse(query)
+			if err != nil || len(stmts) != 1 {
+				return nil, false
+			}
+			var perr error
+			node, perr = planner.Plan(stmts[0], sessionPlanCatalog(sess, s.cfg.Catalog, connDBOid))
+			if perr != nil {
+				return nil, false
+			}
+			if planCacheIsCacheable(node) {
+				s.pc.Put(planCacheKey(query, connDBOid), node)
+			}
+		}
+	} else {
+		stmts, err := parser.Parse(query)
+		if err != nil || len(stmts) != 1 {
+			return nil, false
+		}
+		var perr error
+		node, perr = planner.Plan(stmts[0], sessionPlanCatalog(sess, s.cfg.Catalog, connDBOid))
+		if perr != nil {
+			return nil, false
+		}
 	}
 	schema := node.Output()
 	if schema == nil {

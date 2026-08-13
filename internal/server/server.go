@@ -1717,7 +1717,7 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 				return
 			}
 		case protocol.MsgDescribe:
-			em, err := s.handleDescribeFrame(extended, f.Payload, w)
+			em, err := s.handleDescribeFrame(extended, f.Payload, w, sess)
 			if err != nil {
 				return
 			}
