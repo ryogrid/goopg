@@ -3888,6 +3888,22 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			return Datum{}, &ExecError{Code: "22P02", Pos: pos,
 				Message: fmt.Sprintf("cannot cast type %v to numeric", d.Kind)}
 		}
+	case "jsonb":
+		// `::jsonb` canonicalises the text the same way a jsonb column does
+		// (coerceTextLikeDatum's jsonb arm) — the two are the twin input
+		// boundaries for jsonb and must agree (Hard-won Rule #2). `json` is
+		// untouched: it preserves the input spelling. M0119-0006 (64th slice).
+		if s, ok := datumAsString(d); ok {
+			canon, err := canonicalizeJSONB(s)
+			if err != nil {
+				if ee, ok := err.(*ExecError); ok {
+					ee.Pos = pos
+				}
+				return Datum{}, err
+			}
+			return NewStringDatum(canon), nil
+		}
+		return d, nil
 	}
 	return d, nil // pass-through for unknown types
 }

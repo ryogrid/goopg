@@ -149,6 +149,18 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 	}
 
 	tname := strings.ToLower(t.Name)
+
+	// jsonb is canonicalised at the input boundary (M0119-0006, 64th slice):
+	// PG stores a parsed tree and re-emits jsonb_out's canonical form on every
+	// read, so `'{"b":1,"a":2}'::jsonb` renders `{"a": 2, "b": 1}`. goopg stored
+	// the text verbatim; canonicalising here makes a jsonb column hold the same
+	// text PG would show, and adds the 22P02 validation the bare pass-through
+	// was missing. `json` (text) is deliberately untouched — it preserves the
+	// input spelling.
+	if tname == "jsonb" {
+		return canonicalizeJSONB(s)
+	}
+
 	// The declared length of a varchar(n)/char(n) counts CHARACTERS, not bytes:
 	// upstream varchar_input and bpchar_input both measure with
 	// pg_mbstrlen_with_len before converting maxlen to a byte length

@@ -26,17 +26,20 @@ import (
 
 func jsonbCol() catalog.Type { return catalog.Type{Name: "jsonb"} }
 
-// The wire shape upstream sends: version byte 1, then the JSON text verbatim
-// (jsonb_send serialises the tree back to a C string — the jsonb BINARY wire
-// format is textual after that byte, which is why goopg's text-backed storage
-// can be byte-exact here).
+// The wire shape upstream sends: version byte 1, then the JSON text — now the
+// CANONICAL jsonb_out text (jsonb_send serialises the tree back to a C string;
+// the jsonb BINARY wire format is textual after that byte). Every input below is
+// already canonical, so the version-byte-only shape is observable; a
+// non-canonical spelling folds to canonical first (see TestCanonicalizeJSONB,
+// which pins `-1.5e300` → its 302-character numeric_out expansion, measured
+// against PG 18.3).
 func TestCopyBinaryJsonbSendShape(t *testing.T) {
 	for _, s := range []string{
 		`{"a": 1, "b": [1, 2]}`,
 		`[]`,
 		`null`,
 		`"hello"`,
-		`-1.5e300`,
+		`-12345`,
 		`true`,
 		`{"k": "é unicode ünicode"}`,
 	} {
@@ -116,7 +119,10 @@ func TestCopyBinaryJsonbAgreesWithHeapEncode(t *testing.T) {
 		`{"a": 1}`,
 		`[1, 2, 3]`,
 		`"x"`,
-		strings.Repeat(`{"k": [1, 2, 3]}`, 20), // long enough for the 1-byte varlena header to matter
+		// A single long VALUE (not 20 concatenated documents) — long enough for
+		// the 4-byte varlena header to matter, and still valid jsonb so the
+		// canonicalisation added by M0119-0006 (64th slice) accepts it.
+		`{"k": [` + strings.Repeat(`1,`, 100) + `0]}`,
 	} {
 		wire, err := datumToCopyBinary(col, NewStringDatum(s))
 		if err != nil {

@@ -383,6 +383,15 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 		if !ok {
 			return nil, fmt.Errorf("expected string for jsonb, got kind %d", d.Kind)
 		}
+		// jsonb_send ships JsonbToCString's output — the CANONICAL text — not the
+		// input spelling. Canonicalise here so COPY TO agrees with the heap image
+		// (encodeValuePG canonicalises via coerceTextLikeDatum) for a value that
+		// reached this arm without passing through an input boundary. M0119-0006
+		// (64th slice).
+		s, err := canonicalizeJSONB(s)
+		if err != nil {
+			return nil, err
+		}
 		b := make([]byte, 0, len(s)+1)
 		b = append(b, jsonbBinaryVersion)
 		return append(b, s...), nil
