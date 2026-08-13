@@ -147,6 +147,28 @@ func TestRegCopyAndSelectSiblingQualifyAgree(t *testing.T) {
 		t.Errorf("regclass(qmt) qualify=true = %q, want %q", sel, "public.qmt")
 	}
 
+	// A user collation in a NON-public schema must qualify with that schema,
+	// and both renderers must agree (70th slice, deferral row 1339 — the 69th
+	// slice hardcoded "public", which is wrong for any non-public CREATE
+	// COLLATION schema).
+	cat.RegisterSchema("other_schema")
+	if err := createSiblingTable(t, cat, `CREATE COLLATION other_schema.oc (LOCALE = 'C')`); err != nil {
+		t.Fatalf("CREATE COLLATION other_schema.oc: %v", err)
+	}
+	oc := cat.FindCollation("oc", "other_schema")
+	if oc == nil {
+		t.Fatal("other_schema.oc not found")
+	}
+	colTyp := catalog.Type{Name: "regcollation"}
+	sel = string(srv.appendTypedCellText(nil, executor.NewIntDatum(int64(oc.OID)), colTyp, noPublic))
+	copyText = executor.RegOut("regcollation", oc.OID, cat, true)
+	if sel != copyText {
+		t.Errorf("regcollation(other_schema.oc) qualify=true: SELECT=%q COPY=%q — renderers diverged", sel, copyText)
+	}
+	if sel != "other_schema.oc" {
+		t.Errorf("regcollation(other_schema.oc) qualify=true = %q, want %q", sel, "other_schema.oc")
+	}
+
 	// pg_catalog objects are implicitly visible and never qualify even when the
 	// search path is empty — both renderers agree on the bare name.
 	sel = string(srv.appendTypedCellText(nil, executor.NewIntDatum(1259), typ, noPublic))

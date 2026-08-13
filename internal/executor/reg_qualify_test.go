@@ -139,6 +139,63 @@ func TestRegOutQuotesIdentifiers(t *testing.T) {
 	}
 }
 
+// M0119-0006 (70th slice, ledger row 1339): upstream regcollationout
+// schema-qualifies a user collation with its ACTUAL namespace
+// (regproc.c:1123 get_namespace_name(collnamespace)) when the search path does
+// not show it. The 69th slice hardcoded "public" — right for a default-session
+// creation schema, wrong for any non-public CREATE COLLATION schema. The
+// qualifier is now the collation's own namespace, resolved from NamespaceOID.
+func TestRegCollationQualifiesWithActualSchema(t *testing.T) {
+	ctx := regCopyCat(t)
+	im := ctx.Catalog.(*catalog.InMemory)
+	// CREATE SCHEMA other_schema (RegisterSchema is what CREATE SCHEMA's DDL
+	// operator ultimately calls), then a collation living there — not in public.
+	im.RegisterSchema("other_schema")
+	if err := runDDL(t, ctx, `CREATE COLLATION other_schema.othercoll (LOCALE = 'C')`); err != nil {
+		t.Fatalf("CREATE COLLATION other_schema.othercoll: %v", err)
+	}
+	if im.FindCollation("othercoll", "other_schema") == nil {
+		t.Fatal("other_schema.othercoll not found (schema fallback to public?)")
+	}
+	ocOID := im.UserCollationOIDByName("othercoll")
+	if ocOID == 0 {
+		t.Fatal("othercoll OID not found")
+	}
+	// qualify=true treats the collation's schema as off the effective
+	// search_path → the qualifier is the ACTUAL namespace, not the hardcoded
+	// "public" the 69th slice would have emitted.
+	if got := RegOut("regcollation", ocOID, ctx.Catalog, true); got != "other_schema.othercoll" {
+		t.Errorf("regcollation(other_schema.othercoll) qualify=true = %q, want %q", got, "other_schema.othercoll")
+	}
+	// A name that needs quoting is quoted under the non-public qualifier too
+	// (quote_qualified_identifier quotes both; other_schema is unreserved).
+	im.RegisterSchema("quote_schema")
+	if err := runDDL(t, ctx, `CREATE COLLATION quote_schema."My Other Coll" (LOCALE = 'C')`); err != nil {
+		t.Fatalf(`CREATE COLLATION quote_schema."My Other Coll": %v`, err)
+	}
+	qc := im.FindCollation("My Other Coll", "quote_schema")
+	if qc == nil {
+		t.Fatal(`quote_schema."My Other Coll" not found`)
+	}
+	if got := RegOut("regcollation", qc.OID, ctx.Catalog, true); got != `quote_schema."My Other Coll"` {
+		t.Errorf("regcollation(quoted name, non-public schema) qualify=true = %q, want %q", got, `quote_schema."My Other Coll"`)
+	}
+	// qualify=false keeps the bare quote_identifier'd name (the object is
+	// visible), matching the 69th-slice qualify=false behavior.
+	if got := RegOut("regcollation", ocOID, ctx.Catalog, false); got != "othercoll" {
+		t.Errorf("regcollation(other_schema.othercoll) qualify=false = %q, want %q", got, "othercoll")
+	}
+	// The 69th slice's measured common case is unchanged: a user collation in
+	// public still qualifies with `public`.
+	mycollOID := im.UserCollationOIDByName("mycoll")
+	if mycollOID == 0 {
+		t.Fatal("mycoll not found")
+	}
+	if got := RegOut("regcollation", mycollOID, ctx.Catalog, true); got != "public.mycoll" {
+		t.Errorf("regcollation(mycoll) qualify=true = %q, want %q", got, "public.mycoll")
+	}
+}
+
 // A regrole OID not present in the role map is a DANGLING reference: upstream
 // regroleout emits the unquoted %u fallback (regproc.c:1609), never a quoted
 // name — RoleNameAtOID distinguishes a real role (quoted name) from a dangling

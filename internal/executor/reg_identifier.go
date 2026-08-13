@@ -287,19 +287,23 @@ func RegOut(typeName string, oid uint32, cat catalog.Catalog, qualify bool) stri
 	case "regcollation":
 		if hasIM {
 			if n := im.ResolveIndexColumnCollationName(oid); n != "" {
-				if qualify {
-					// A user collation is schema-qualified when the search path
-					// does not show its schema; goopg creates user collations in
-					// the current schema (public for a default session), so
-					// "public" is the qualifier. A builtin collation resolves in
-					// pg_catalog (always visible) and is never qualified — it
-					// falls through to the bare quote_identifier'd name below.
-					for _, uc := range im.ListUserCollations() {
-						if uc.OID == oid {
-							return quoteQualifiedIdentifier("public", n)
-						}
+				for _, uc := range im.ListUserCollations() {
+					if uc.OID == oid {
+						// A user collation: upstream regcollationout qualifies
+						// with the collation's ACTUAL namespace
+						// (regproc.c:1123 get_namespace_name(collnamespace)) when
+						// the search path does not show it. The 69th slice
+						// hardcoded "public" — right for a default-session
+						// creation schema, wrong for any non-public CREATE
+						// COLLATION schema (deferral row 1339). regOutQualified
+						// also keeps the pg_catalog-never-qualifies arm for a
+						// collation created in pg_catalog.
+						return regOutQualified(im.SchemaNameForOID(uc.NamespaceOID), n, qualify)
 					}
 				}
+				// A builtin collation resolves in pg_catalog, which every search
+				// path searches implicitly — never qualified, only the
+				// quote_identifier'd bare name.
 				return pgQuoteIdent(n)
 			}
 		}

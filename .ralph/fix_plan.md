@@ -3997,6 +3997,29 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       signature qualification, regcollation user-schema hardcoded "public",
       mixed-case role-name catalog folding). Design:
       `docs/design/0119-0006-regout-schema-qualification.md` + README row.
+      **70th slice (2026-08-14): regcollation qualifies with the collation's
+      ACTUAL schema — ledger row 1339 resolved.** The regcollation arm had
+      hardcoded `quoteQualifiedIdentifier("public", n)`, right for a
+      default-session (public) creation schema and wrong for any non-public
+      `CREATE COLLATION` schema. It now routes through the family's shared
+      `regOutQualified(im.SchemaNameForOID(uc.NamespaceOID), n, qualify)` —
+      `SchemaNameForOID` is the `get_namespace_name(collnamespace)` port, and
+      `regOutQualified` also closes the pg_catalog edge the literal could not
+      express (a collation created in pg_catalog is always visible → bare name,
+      where the old code emitted `public.<name>`); qualify=false behavior is
+      unchanged. Measured against a throwaway PG 18.3 oracle (port 5599):
+      `search_path=''` renders `ragout70.mycoll` / `ragout70."My Other Coll"`,
+      `search_path=ragout70` renders bare `mycoll`. Tests:
+      `TestRegCollationQualifiesWithActualSchema` (reg_qualify_test.go:
+      non-public plain + quoted-name collations, qualify=false bare, public
+      still `public.mycoll`) + `TestRegCopyAndSelectSiblingQualifyAgree`
+      extended with the non-public collation. Design:
+      `docs/design/0119-0006-regcollation-actual-schema-qualifier.md` + README
+      row (`0119-0006av`). Gates: package suites + pre-commit units +
+      `TestPort_RegressSuite` + `scripts/tpch-spotcheck.sh` (Q12=2, Q13=35)
+      all PASS. Remaining open reg* deferrals: regprocedure `format_procedure`
+      signature qualification (row 1338), mixed-case role-name catalog folding
+      (row 1340).
 
 - [x] **M0119-0010 — `char(N)` typmods are not restored per column on catalog
       reload** (source: M0127-P5.9-f, ledger row 2026-08-05). **FIXED (2026-08-09).**
