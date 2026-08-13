@@ -2371,6 +2371,9 @@ func bootstrapPgClassTuples(dataDir string) (map[uint32]heapTID, error) {
 	// here, and their pg_type composite rows via their RelType, but never
 	// pg_internal.init (see informationSchemaDataTableRels).
 	allRels = append(allRels, informationSchemaDataTableRels()...)
+	// M0133-S4: the information_schema VIEWS (relkind 'v', relnamespace 13273)
+	// likewise ride the pg_class heap but never pg_internal.init.
+	allRels = append(allRels, informationSchemaViewSeedRels()...)
 	tids, err := writeMultiPageHeap(dataDir, "1259", cols, allRels, func(rel nailedRel) executor.Row {
 		return pgClassRow(rel)
 	})
@@ -2403,6 +2406,7 @@ func bootstrapPgAttributeTuples(dataDir string) (map[pgAttrTIDKey]heapTID, error
 	allRels = append(allRels, nailedLocalRels...)
 	allRels = append(allRels, nailedToastRels()...) // M0131-S20.1
 	allRels = append(allRels, informationSchemaDataTableRels()...) // M0133-S3
+	allRels = append(allRels, informationSchemaViewSeedRels()...) // M0133-S4
 	type rowKey struct {
 		AttRelID uint32
 		AttNum   int16

@@ -182,6 +182,14 @@ func pgClassRelnamespaceFor(oid uint32) uint32 {
 			return infoSchemaNamespaceOID
 		}
 	}
+	// M0133-S4: the information_schema VIEWS share namespace 13273 with the data
+	// tables. Same failure mode — a hosted PG resolving information_schema.tables
+	// by name through RELNAMENSP would miss if it were keyed under 11.
+	for _, r := range informationSchemaViewSeedRels() {
+		if r.OID == oid {
+			return infoSchemaNamespaceOID
+		}
+	}
 	return 11
 }
 

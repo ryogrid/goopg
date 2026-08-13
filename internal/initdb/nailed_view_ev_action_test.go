@@ -19,6 +19,12 @@ func TestNailedViewEvActionBlobSetMatchesSeededViews(t *testing.T) {
 	for _, r := range nailedViewSeedRels() {
 		seeded[r.RelName] = true
 	}
+	// M0133-S4: the information_schema views share the same blob glob and are
+	// seeded through a separate list (informationSchemaViewSeedRels), so the set
+	// equality must cover both corpora.
+	for _, r := range informationSchemaViewSeedRels() {
+		seeded[r.RelName] = true
+	}
 	embedded := map[string]bool{}
 	for _, v := range nailedViewEvActionBlobs() {
 		embedded[v] = true

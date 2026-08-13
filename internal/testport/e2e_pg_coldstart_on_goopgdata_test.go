@@ -261,6 +261,7 @@ func TestE2E_PGColdStartOnGoopgDataDir(t *testing.T) {
 	assertNonCorpusSystemViewIsStillAbsent(t, pg)
 	assertInformationSchemaDomainsResolvable(t, pg, goopgDir)
 	assertInformationSchemaDataTablesReadable(t, pg, goopgDir)
+	assertInformationSchemaViewsEvaluable(t, pg, goopgDir)
 	assertHostedPGSeesPgRewriteToastRelation(t, pg)
 
 	// Row-level reads over user tables. S4.4 originally carried no view
@@ -1044,18 +1045,18 @@ func assertNonCorpusSystemViewIsStillAbsent(t *testing.T, pg *pgcluster.Cluster)
 	t.Helper()
 	// M0131-S9.3f re-pointed this from pg_seclabels (adopted by that slice,
 	// which bootstrapped pg_seclabel 3596 and pg_largeobject_metadata 2995)
-	// to information_schema.tables. pg_stats_ext_exprs, the last un-adopted
-	// pg_catalog view, is deliberately NOT used: its failure mode trips an
-	// Assert in typcache.c and takes the backend — and the rest of this run —
-	// down with it.
-	const view = "information_schema.tables"
+	// to information_schema.tables. M0133-S4 adopted tables (its first tranche),
+	// so the probe is re-pointed to information_schema.columns — the largest
+	// remaining view (24201 B stored, over the inline budget) and one that also
+	// depends on the _pg_* helper functions, so it lands in a later tranche and
+	// fails QUIETLY with 42P01 until then.
+	const view = "information_schema.columns"
 	out, err := pgQueryScalarAllowError(pg, "SELECT * FROM "+view+" LIMIT 0")
 	if err == nil {
 		t.Errorf("hosted PG evaluated %s, which is NOT in the on-disk corpus "+
-			"(nailedSystemViewProbeSet) — either goopg's initdb now bootstraps "+
-			"the information_schema namespace and its views (M0131-S9.4; then "+
-			"add them to the corpus and re-point this probe at the next "+
-			"un-adopted relation), or the evaluability probe above is passing "+
+			"(informationSchemaViewProbeSet) — either goopg's initdb now bootstraps "+
+			"it (M0133-S4; then add it to the corpus and re-point this probe at the "+
+			"next un-adopted relation), or the evaluability probe above is passing "+
 			"for a reason unrelated to goopg's seeding. Output: %q",
 			view, strings.TrimSpace(out))
 		return
@@ -1167,6 +1168,86 @@ func assertInformationSchemaDataTablesReadable(t *testing.T, pg *pgcluster.Clust
 	if got := s4Scalar(t, pg, logPath,
 		`SELECT typrelid FROM pg_type WHERE oid = 13458`); got != "13456" {
 		t.Errorf("hosted PG sql_features rowtype typrelid = %q, want %q", got, "13456")
+	}
+}
+
+// informationSchemaViewProbeSet is the M0133-S4 analogue of
+// nailedSystemViewProbeSet: the information_schema views goopg has adopted on
+// disk, with the upstream OID each is pinned to (Option A, see
+// internal/initdb/information_schema_view_oid_pins.go). Tranche 1 is 29 of the
+// 33 catalog-direct, under-inline-budget views — four (character_sets,
+// collations, collation_character_set_applicability, triggers) are withheld on
+// incomplete goopg catalog descriptors (pg_collation/pg_trigger) and land with
+// the descriptor-completion slice. The remaining 32 (TOAST, helper-function,
+// and view-on-view) land in later tranches.
+func informationSchemaViewProbeSet() []struct {
+	view string
+	oid  string
+} {
+	return []struct {
+		view string
+		oid  string
+	}{
+		{"information_schema.information_schema_catalog_name", "13293"},
+		{"information_schema.applicable_roles", "13302"},
+		{"information_schema.check_constraint_routine_usage", "13321"},
+		{"information_schema.column_column_usage", "13341"},
+		{"information_schema.column_domain_usage", "13346"},
+		{"information_schema.column_udt_usage", "13356"},
+		{"information_schema.constraint_table_usage", "13371"},
+		{"information_schema.domain_constraints", "13376"},
+		{"information_schema.domain_udt_usage", "13381"},
+		{"information_schema.enabled_roles", "13390"},
+		{"information_schema.routine_column_usage", "13413"},
+		{"information_schema.routine_privileges", "13418"},
+		{"information_schema.routine_routine_usage", "13427"},
+		{"information_schema.routine_sequence_usage", "13432"},
+		{"information_schema.routine_table_usage", "13437"},
+		{"information_schema.schemata", "13447"},
+		{"information_schema.table_constraints", "13476"},
+		{"information_schema.table_privileges", "13481"},
+		{"information_schema.tables", "13490"},
+		{"information_schema.udt_privileges", "13510"},
+		{"information_schema.user_defined_types", "13528"},
+		{"information_schema.view_column_usage", "13533"},
+		{"information_schema.view_routine_usage", "13538"},
+		{"information_schema.view_table_usage", "13543"},
+		{"information_schema.views", "13548"},
+		{"information_schema._pg_foreign_table_columns", "13563"},
+		{"information_schema._pg_foreign_data_wrappers", "13572"},
+		{"information_schema._pg_foreign_servers", "13584"},
+		{"information_schema._pg_foreign_tables", "13596"},
+	}
+}
+
+// assertInformationSchemaViewsEvaluable is M0133-S4's acceptance probe: a hosted
+// PG 18.3 cold-started on a goopg $PGDATA must (a) resolve each adopted
+// information_schema view to its pinned upstream OID and (b) EVALUATE it via its
+// _RETURN rule. LIMIT 0 keeps the assertion on rule expansion rather than row
+// content — these views read goopg's catalog heaps, and row content is pinned
+// separately by the data-table probe above. Per-view Errorf (not Fatalf) is the
+// same risk control as the pg_catalog probe: 33 independent blobs, and a bad
+// tupledesc names its own view.
+func assertInformationSchemaViewsEvaluable(t *testing.T, pg *pgcluster.Cluster, goopgDir string) {
+	t.Helper()
+	for _, tc := range informationSchemaViewProbeSet() {
+		got, err := pgQueryScalarAllowError(pg, "SELECT '"+tc.view+"'::regclass::oid")
+		if err != nil {
+			t.Errorf("hosted PG cannot resolve %s at all: %v\n%s", tc.view, err, got)
+			continue
+		}
+		if g := strings.TrimSpace(got); g != tc.oid {
+			t.Errorf("hosted PG resolves %s to OID %s, want upstream's %s — "+
+				"information_schema_view_oid_pins.go pins goopg's view OIDs to "+
+				"PG 18.3's initdb assignment", tc.view, g, tc.oid)
+			continue
+		}
+		out, err := pgQueryScalarAllowError(pg, "SELECT * FROM "+tc.view+" LIMIT 0")
+		if err != nil {
+			logTail, _ := os.ReadFile(pgLogPathFor(goopgDir))
+			t.Errorf("hosted PG cannot evaluate %s: %v\n%s\n--- PG log ---\n%s",
+				tc.view, err, out, tailLines(string(logTail), 60))
+		}
 	}
 }
 

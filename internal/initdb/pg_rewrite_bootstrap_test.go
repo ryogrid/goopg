@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/executor"
@@ -55,10 +56,10 @@ func TestPgRewriteInitialEntriesContainsPgStatWalReceiverReturn(t *testing.T) {
 	// with no _RETURN rule is the "cache lookup failed for rule …" FATAL,
 	// and a rule with no view is an ev_class dangling into nothing.
 	// M0131-S9.1: the count is the pinned-view count (29 and growing), not
-	// the original literal 6.
-	if len(entries) != len(systemViewOIDPins()) {
+	// the original literal 6. M0133-S4: plus the information_schema views.
+	if len(entries) != len(systemViewOIDPins())+len(informationSchemaViewOIDPins()) {
 		t.Fatalf("pgRewriteInitialEntries: %d rows, want %d (one per pinned view)",
-			len(entries), len(systemViewOIDPins()))
+			len(entries), len(systemViewOIDPins())+len(informationSchemaViewOIDPins()))
 	}
 	// M0131-S9.0: the rows come from the manifest in capture order, so the
 	// wal_receiver entry is no longer index 0. Look it up by view instead of
@@ -346,8 +347,22 @@ func TestBootstrapPgRewriteLeafIndicesWriteBothFiles(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read %s: %v", path, err)
 		}
-		if len(buf) != 2*storage.BlockSize {
-			t.Errorf("%s size = %d, want %d (metapage + leaf root)", p, len(buf), 2*storage.BlockSize)
+		if len(buf)%storage.BlockSize != 0 {
+			t.Errorf("%s size = %d, not a multiple of BlockSize", p, len(buf))
+		}
+		// M0133-S4: 113 _RETURN rules no longer fit a single leaf for the
+		// 80-byte (ev_class, rulename) index 2693, so it is now multi-page
+		// (metapage + N leaves + root, ≥ 4 blocks); the 16-byte oid index 2692
+		// still fits one leaf-root (metapage + leaf, exactly 2 blocks).
+		switch {
+		case strings.HasSuffix(p, "2692"):
+			if len(buf) != 2*storage.BlockSize {
+				t.Errorf("%s size = %d, want %d (metapage + leaf root)", p, len(buf), 2*storage.BlockSize)
+			}
+		case strings.HasSuffix(p, "2693"):
+			if len(buf) < 4*storage.BlockSize {
+				t.Errorf("%s size = %d, want >= %d (metapage + 2 leaves + root)", p, len(buf), 4*storage.BlockSize)
+			}
 		}
 		// The metapage's magic constant ought to land at bytes [24..28]
 		// inside the first block — but the precise offset depends on

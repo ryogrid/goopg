@@ -115,7 +115,12 @@ type pgRewriteEntry struct {
 // "cache lookup failed for rule …" FATAL) or vice versa. Adding a view to the
 // on-disk corpus is now: capture, regenerate, done.
 func pgRewriteInitialEntries() []pgRewriteEntry {
-	return nailedViewRewriteEntries()
+	entries := nailedViewRewriteEntries()
+	// M0133-S4: the information_schema views' _RETURN rules ride the same
+	// pg_rewrite heap. Appended here so a hosted PG's RULERELNAME syscache probe
+	// for information_schema.<view> resolves, exactly like the pg_catalog corpus.
+	entries = append(entries, informationSchemaViewRewriteEntries()...)
+	return entries
 }
 
 // nailedViewRewriteEntry returns the seeded _RETURN rule for the named system

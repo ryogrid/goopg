@@ -97,6 +97,14 @@ PROCSQLBODY=0
 PROC_MANIFEST="${INITDB_DIR}/information_schema_proc_manifest.tsv"
 PROC_OUT_DIR="${INITDB_DIR}"
 
+# M0133-S4: the information_schema views share the capture pipeline but live in
+# namespace 13273 and are pinned by informationSchemaViewOIDPins() (a separate
+# Go table), so they need a separate manifest and a separate pin file. The
+# flag selects the namespace the pg_class / pg_rewrite / pg_attribute queries
+# resolve against and the pin file the script parses its guard data from.
+INFO_SCHEMA=0
+NSP_NAME="pg_catalog"
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --out-dir)  OUT_DIR="$2"; shift 2 ;;
@@ -104,11 +112,18 @@ while [[ $# -gt 0 ]]; do
         --verify)   VERIFY=1; shift ;;
         --keep)     KEEP=1; shift ;;
         --prosqlbody) PROCSQLBODY=1; shift ;;
+        --information-schema) INFO_SCHEMA=1; shift ;;
         -h|--help)  sed -n '3,40p' "${BASH_SOURCE[0]}"; exit 0 ;;
         -*)         die "unknown option: $1" ;;
         *)          VIEWS+=("$1"); shift ;;
     esac
 done
+
+if [[ $INFO_SCHEMA -eq 1 ]]; then
+    NSP_NAME="information_schema"
+    PINS_GO="${INITDB_DIR}/information_schema_view_oid_pins.go"
+    MANIFEST="${INITDB_DIR}/information_schema_view_manifest.tsv"
+fi
 
 for b in initdb pg_ctl psql; do
     command -v "$b" >/dev/null 2>&1 || die "missing ${b} — expected under ${PG_BIN}"
@@ -117,7 +132,11 @@ done
 # -------------------------------------------------------------------------- #
 # Single sources of truth read out of the Go tree
 # -------------------------------------------------------------------------- #
-PINS_GO="${INITDB_DIR}/system_view_oid_pins.go"
+# PINS_GO is the system_view_oid_pins.go default here; the --information-schema
+# override above re-points it at information_schema_view_oid_pins.go.
+if [[ $INFO_SCHEMA -eq 0 ]]; then
+    PINS_GO="${INITDB_DIR}/system_view_oid_pins.go"
+fi
 # pgTypeCanonical, not pg_type_seed_data.go: the CANONICAL table is what
 # bootstrapPgTypeTuples derives attalign/attbyval from, and it is a strict
 # subset of the seed data. Parsing the wider file made guard #5 vacuous —
@@ -365,18 +384,18 @@ MANIFEST_STAGE="${STAGE_DIR}/nailed_view_manifest.tsv"
 GOOPG_RELTYPE=2249
 
 for view in "${VIEWS[@]}"; do
-    echo "capture-ev-action: capturing pg_catalog.${view}..."
+    echo "capture-ev-action: capturing ${NSP_NAME}.${view}..."
 
     # --- Query 3: the pg_class row (feeds nailedRel) --------------------- #
     rel_row="$(psql_q "SELECT c.oid, c.reltype, c.relkind, c.relnatts
-                         FROM pg_class c WHERE c.oid = 'pg_catalog.${view}'::regclass")" \
+                         FROM pg_class c WHERE c.oid = '${NSP_NAME}.${view}'::regclass")" \
         || die "pg_class query failed for ${view}"
     IFS=$'\t' read -r rel_oid rel_type rel_kind rel_natts <<< "$rel_row"
-    [[ -n "$rel_oid" ]] || die "pg_catalog.${view} does not exist in the oracle"
+    [[ -n "$rel_oid" ]] || die "${NSP_NAME}.${view} does not exist in the oracle"
     [[ "$rel_kind" == "v" ]] || fail "${view}: relkind is '${rel_kind}', not 'v'"
 
     rule_oid="$(psql_q "SELECT r.oid FROM pg_rewrite r
-                         WHERE r.ev_class = 'pg_catalog.${view}'::regclass
+                         WHERE r.ev_class = '${NSP_NAME}.${view}'::regclass
                            AND r.rulename = '_RETURN'")"
     [[ -n "$rule_oid" ]] || fail "${view}: no _RETURN rule in pg_rewrite"
 
@@ -409,7 +428,7 @@ for view in "${VIEWS[@]}"; do
     dat="${STAGE_DIR}/${view}_ev_action.dat"
     psql -X -A -t -q -h "$SOCK_DIR" -d postgres -v ON_ERROR_STOP=1 \
         -c "SELECT r.ev_action FROM pg_rewrite r
-             WHERE r.ev_class = 'pg_catalog.${view}'::regclass
+             WHERE r.ev_class = '${NSP_NAME}.${view}'::regclass
                AND r.rulename = '_RETURN'" > "$raw" \
         || die "ev_action query failed for ${view}"
     [[ -s "$raw" ]] || fail "${view}: empty ev_action"
@@ -442,7 +461,7 @@ for view in "${VIEWS[@]}"; do
     # A capture that PG chose to keep inline while goopg would externalise it
     # (or vice versa) is caught here, not in a hosted PG's detoast path.
     stored_len="$(psql_q "SELECT pg_column_size(r.ev_action) FROM pg_rewrite r
-                           WHERE r.ev_class = 'pg_catalog.${view}'::regclass
+                           WHERE r.ev_class = '${NSP_NAME}.${view}'::regclass
                              AND r.rulename = '_RETURN'")"
     [[ -n "$stored_len" ]] || die "${view}: pg_column_size query returned nothing"
     if [[ "$stored_len" -gt $MAX_EV_ACTION_STORED ]]; then
@@ -493,7 +512,7 @@ for view in "${VIEWS[@]}"; do
     done < <(psql_q "SELECT a.attnum, a.attname, a.atttypid,
                             a.attlen, a.attnotnull, a.attisdropped
                        FROM pg_attribute a
-                      WHERE a.attrelid = 'pg_catalog.${view}'::regclass AND a.attnum > 0
+                      WHERE a.attrelid = '${NSP_NAME}.${view}'::regclass AND a.attnum > 0
                       ORDER BY a.attnum")
     [[ "$attr_count" -eq "$rel_natts" ]] \
         || fail "${view}: captured ${attr_count} attributes but relnatts is ${rel_natts}"

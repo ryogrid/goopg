@@ -77,11 +77,14 @@ func TestPgRewriteRuleOIDsMatchUpstreamPins(t *testing.T) {
 		}
 		seeded[e.EvClass] = e.OID
 	}
-	if len(seeded) != len(systemViewOIDPins()) {
-		t.Fatalf("seeded %d _RETURN rules, pinned table has %d views",
-			len(seeded), len(systemViewOIDPins()))
+	// M0133-S4: the information_schema views seed _RETURN rules through the same
+	// pgRewriteInitialEntries, so the invariant covers both pin tables.
+	allPins := append(append([]systemViewOIDPin{}, systemViewOIDPins()...), informationSchemaViewOIDPins()...)
+	if len(seeded) != len(allPins) {
+		t.Fatalf("seeded %d _RETURN rules, pinned tables have %d views",
+			len(seeded), len(allPins))
 	}
-	for _, pin := range systemViewOIDPins() {
+	for _, pin := range allPins {
 		got, ok := seeded[pin.ViewOID]
 		if !ok {
 			t.Errorf("%s: no seeded _RETURN rule with ev_class=%d",

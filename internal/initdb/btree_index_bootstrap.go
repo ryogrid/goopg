@@ -1090,6 +1090,9 @@ func bootstrapPgClassRelnameNspIndex(dataDir string, tids map[uint32]heapTID) er
 	// index (RELNAMENSP syscache), so their pg_class rows must be reachable here
 	// or a hosted PG's `information_schema.sql_features` lookup misses.
 	allRels = append(allRels, informationSchemaDataTableRels()...)
+	// M0133-S4: the information_schema VIEWS resolve by name through THIS index
+	// too, keyed under namespace 13273 (see pgClassRelnamespaceFor).
+	allRels = append(allRels, informationSchemaViewSeedRels()...)
 
 	entries := make([]entry, 0, len(allRels))
 	for _, rel := range allRels {
@@ -1840,15 +1843,15 @@ func bootstrapPgRewriteRelRulenameIndex(dataDir string, tids map[uint32]heapTID)
 	for i, e := range entries {
 		tuples[i] = pgBuildIndexTupleOidNameKey(e.block, e.off, e.evClass, e.ruleName)
 	}
-	leaf, err := pgBuildBtreeLeafRootPage(tuples)
+	// M0133-S4: this leaf now carries the 80 pg_catalog _RETURN rules PLUS the
+	// 33 information_schema ones (113 tuples), which no longer fits a single
+	// leaf-root page (80-byte oid+name tuples → ~97 per page). Use the sized
+	// bulk load, which spills to multiple leaves + an internal root above that
+	// threshold — the same path pg_class_relname_nsp_index already exercises.
+	file, err := pgBuildBtreeBulkLoadSized(tuples, 80 /* oid+name tuple size */, 2 /* nkeyatts */)
 	if err != nil {
 		return fmt.Errorf("pg_rewrite_rel_rulename_index leaf: %w", err)
 	}
-	meta := pgBuildBtreeMetapageWithRoot(1, 0)
-
-	file := make([]byte, 0, 2*storage.BlockSize)
-	file = append(file, meta...)
-	file = append(file, leaf...)
 
 	for _, dir := range []string{
 		filepath.Join(dataDir, "base", "1"),
