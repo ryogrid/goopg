@@ -1,12 +1,11 @@
 # Milestone 0132 — Explicit transactions across the extended query protocol
 
-**Status:** planned
+**Status:** in-progress
 **Filed:** 2026-08-12 (user directive)
-**Priority placement:** filed, **not promoted**. The `## Current Priority`
-banner in `.ralph/fix_plan.md` remains the sole ordering authority and still
-names M0131 first; M0132 is queued behind it. Working M0132 requires a banner
-edit — the filing directive was to raise the milestone, not to reorder the
-queue.
+**Priority placement:** **promoted** (user directive 2026-08-13) — the
+`## Current Priority` banner in `.ralph/fix_plan.md` names M0132 as the
+next-priority milestone after M-NIGHTLY's nightly regression fixes, ahead of
+M0131 and M0130's remaining items.
 **Reference plan:** `.ralph/fix_plan.md` (M0132 section, at the foot of the file)
 **Implementation plan (authoritative task decomposition):**
 `docs/design/0132-extended-protocol-explicit-transactions.md`
@@ -263,6 +262,7 @@ surface · **D** scope boundary · **E** measurement.
 | S10 | SAVEPOINT / subtransactions over the extended protocol — implement or defer **with a ledger row**, against stated criteria | D |
 | S11 | Perf acceptance: `-N -M prepared` one commit/txn and TPS ≥ simple mode; `-S -M prepared` parse/plan ceiling (with doc 09's O-XP-1 profile as its precondition) | E |
 | S12 | Simple-path-only server-layer handlers (two-phase commit, LISTEN/NOTIFY) over the extended protocol — implement or ledger | D |
+| S13 | Prepared-statement verification + `-M prepared` vs simple A/B (hook conditions); assert prepared > simple | E |
 
 **Filing rule (inherited from M0130/M0131):** no task is deferred without a
 strong reason recorded in the deferral ledger; every item's subtasks are listed
@@ -345,6 +345,12 @@ together or not at all.**
     the resume point. The `defer`/`port` state of any affected oracle test in
     `docs/test-port/postgres-oracle-port-status.csv` is updated in the same loop
     that unblocks it.
+14. **Prepared statements verified and faster:** a `pgbench -M prepared` run
+    completes with correct results under the pre-commit hook's conditions (scale
+    1, `-c 2 -j 2 -T 30`, pinned client, capped server), and — after a plain
+    warmup run — prepared-mode TPS exceeds simple-mode TPS for the same workload
+    (`-S` may instead record the doc-09 O-XP-1 read-path profile). Numbers in
+    `analysis/` with the commit hash.
 
 ## Required design docs
 

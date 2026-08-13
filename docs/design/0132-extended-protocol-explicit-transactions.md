@@ -113,7 +113,7 @@ S5 (aborted-block semantics)           ───┘                        │
                                                              S10 (scope call)
                                                                    │
                                                                    ▼
-                                                             S11 (perf accept)
+                                                             S11 (perf accept) ──► S13 (prepared A/B)
 ```
 
 **The S2+S3+S4+S5 atomicity rule.** Two independent arguments, both of the form
@@ -134,7 +134,8 @@ S5 (aborted-block semantics)           ───┘                        │
 
 The four slices may be developed separately; they land in one commit. S6–S9 and
 S12 are independent and may land in any order after it. S10 is a decision. S11
-is measurement and runs last.
+and S13 are measurement and run last; S13's prepared>simple gate additionally
+requires the S2–S8 set to have landed.
 
 ## 4. Slices
 
@@ -333,6 +334,38 @@ ignored.
 - Gates: `go test ./internal/server/`, plus the two-phase and LISTEN/NOTIFY
   isolation specs if implemented.
 
+### S13 — Prepared-statement verification + `-M prepared` vs simple A/B
+
+Prepared statements are the extended protocol's Parse/Bind/Execute path, so they
+sit inside this milestone's surface whether or not they touch explicit
+transactions. This slice closes the loop on two things S1–S12 leave implicit:
+that the prepared path *works* at all, and that it is *faster* than the simple
+path once the correctness set lands.
+
+1. **Verify.** Run `pgbench -M prepared` against a fresh goopg server and confirm
+   the prepared-statement path (Parse/Bind/Execute/Describe/Sync) returns correct
+   results with no errors. If it is broken, fix it and re-verify — a non-trivial
+   fix lands its own sub-design doc per the repo rule.
+2. **Measure, under the pre-commit hook's conditions.** Scale 1, `-c 2 -j 2 -T
+   30`, the pinned `postgres/local_install/bin/pgbench`, a capped server and
+   `--no-sync` init — the exact Part-2 shape `.githooks/pre-commit` runs
+   (`RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh`). Warm up first
+   with a plain (no `-M`) run, then run the standard / `-N` / `-S` workloads
+   once without `-M` and once with `-M prepared`, recording TPS and latency for
+   both.
+3. **Assert prepared > simple.** Prepared-mode TPS must exceed simple-mode TPS.
+   At HEAD it does not — the per-`Execute` auto-commit makes `-M prepared`
+   slower (doc 09 §"The performance finding": `-N` prepared 6,749 vs simple
+   9,898) — so this gate is satisfiable only after S2–S8; the verification half
+   may run first, the A/B runs after. For the `-S` case only, doc 09's O-XP-1
+   read-path profile is the escape hatch: if prepared `-S` does not beat simple,
+   profile *where* the per-`Execute` overhead lives before judging.
+
+- Gates: `scripts/tpch-spotcheck.sh` (Q12=2/Q13=35), pgbench smoke via the hook.
+  Numbers recorded in `analysis/` with the commit hash (per the benchmarking
+  practice card: hold server age constant across the A/B, run capped with a
+  distinct `GOOPG_CG_UNIT`).
+
 ## 5. Test-impact matrix
 
 | test | file | slice |
@@ -347,6 +380,7 @@ ignored.
 | teardown mid-block (new) | `internal/server/` | S3 (bar 9) |
 | two-phase / LISTEN-NOTIFY over extended | `internal/server/`, D-002 | S12 |
 | pgbench `-M prepared` | `analysis/` run + commit hook | S11 |
+| pgbench `-M prepared` vs simple A/B (hook conditions) | `analysis/` run + commit hook | S13 |
 
 ## 6. Adjacent divergences this milestone records but does not close
 
