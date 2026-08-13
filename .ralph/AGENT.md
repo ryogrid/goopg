@@ -378,9 +378,9 @@ If Go symbol operations fail:
 - One item per loop. Pick the topmost unchecked task in
   `.ralph/fix_plan.md` unless **the `## Current Priority` banner** or a
   dependency forces another order. The banner wins over topmost placement —
-  as of 2026-07-28(b) the M-NIGHTLY milestone sits topmost but is PARKED
-  (filed every loop, not selected) beneath M0124 → M0125 → M0126 (M0126 added
-  2026-07-31), so "topmost unchecked" is NOT the selection rule today. The banner also outranks
+  as of 2026-08-13 it ranks M-NIGHTLY first (standing filing + selection) with
+  M0132 as the next-priority milestone, so "topmost unchecked" is NOT the
+  selection rule today. The banner also outranks
   `.ralph/working_set.md`'s "NEXT LOOP" note, which carries state, not
   priority.
 - Search before assuming something is missing. Prefer reading the spec and

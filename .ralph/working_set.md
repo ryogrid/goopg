@@ -1,58 +1,45 @@
 (idle — nothing in flight)
 
-M0119-0006 57th slice landed: a `bpchar` value loses its declared width at
-every render boundary. Committed and pushed.
+M0132-S1 landed: the acceptance bar for explicit transactions on the extended
+query protocol. Committed and pushed. **Next per banner: M0132-S2 — and S2 lands
+ONLY together with S3+S4+S5 in one commit (non-negotiable land-together rule).**
 
-Carry-forward #1 — **the same lesson as loop #69, now with a second data
-point: a deferral resume point is a hypothesis.** The 56th slice's row said
-`bpcharsend` IS `textsend`, so "the bytes are accidentally right", and that the
-remaining decode padding needed a `copyBinaryToDatum` signature widening. Both
-halves fell in ten minutes of measurement. `textsend` ships the STORED image,
-and goopg stores `bpchar` trimmed where PG stores it padded — so the ENCODE
-side, the half the row had cleared, was writing a 2-byte field where PG writes
-10. And `copyBinaryToDatum` has taken a `catalog.Type` all along, whose `Args`
-IS the typmod; `ParseCopyBinaryRows` passes `cols[i].Type`. Three older ledger
-rows were repeating that same false blocker and are corrected in place.
+Carry-forward #1 — **how to commit a red test.** One const,
+`m0132ExtendedBlocksLanded = false`, in
+`internal/server/extended_txn_block_test.go`. Every bar runs its scenario
+unconditionally, then asserts either the PG outcome (const true) or today's
+divergence (const false). Green at HEAD, 6 of 8 red when flipped (the two
+no-divergence guards stay green). The fix cannot land without flipping the const
+— the divergence arms fail the moment the divergence disappears — and the const
+cannot be flipped without the fix. Reuse this shape for any "test must be red
+first" slice; do NOT relax a failing divergence arm, flip the const.
 
-Carry-forward #2 — **measure every boundary before scoping to one.** The row
-framed this as a binary-COPY gap. Probing the same `char(10)` column across all
-surfaces found the identical missing padding FOUR times: the `SELECT` DataRow,
-`COPY … TO` text, CSV, binary, and the pgoutput change message. Scoping to COPY
-would have left three-quarters of the defect and a fourth un-synced sibling.
+Carry-forward #2 — **the characterisation slice found a bug the milestone had
+not attributed to any slice, on the path it was not looking at.** `connTx.Fail()`
+has exactly two call sites (`dispatch.go:950`, `:1019`), both on the
+executor-error path, so on the SIMPLE path a PLAN-time error (`BEGIN; INSERT INTO
+<missing table>;`) leaves the block live and healthy — next statement runs,
+status reverts to `T`. The `E` a client sees right after the error comes from
+`wireStatus`'s `afterError` argument, not persisted state, which is exactly why
+it hides. Second gap: a constant `SELECT 1` bypasses the 25P02 gate that
+correctly rejects `SELECT * FROM items`. Both filed as ledger rows and pinned by
+tests; **S5 must close both** or it copies the same placement onto the extended
+path. Probing (throwaway `zz_probe_test.go`, deleted) is what found them — the
+first draft of the aborted-block bar passed for the wrong reason.
 
-Carry-forward #3 — **why it hid for so long is worth more than the fix.** The
-two natural `psql` probes both conceal it: `length()` uses `bcTruelen`, and a
-`||` operand goes through the rtrimming `bpchar`→`text` cast. A pre-existing
-`dispatch.go` comment had drawn exactly that wrong conclusion in writing
-("bpcharout uses bcTruelen which trims"); `bpcharout` is a bare
-`TextDatumGetCString`. When a comment cites an upstream function as its
-authority, read the function.
+Corrections (a)/(b)/(c) all confirmed by measurement, recorded in
+`docs/design/0132-0001-…` §7: connTx already threaded (`dispatch_extended.go:30`);
+no `execCommit` route (`dispatch.go:2803-2807`, deferred sequence inline at
+`:2818-2828`); `Sync` already correct and now guarded by a test that must pass
+before AND after the fix.
 
-Carry-forward #4 — the multibyte probe was where the second bug fell out
-(`coerceTextLikeDatum` measured the declared length in BYTES, so `'あい'` into
-a `char(5)` was a spurious 22001). Any width-semantics slice should carry a
-multibyte row.
+Files: `internal/server/extended_txn_block_test.go` (new, test-only),
+`docs/design/0132-0001-extended-protocol-explicit-txn-state-machine.md` (§7),
+`docs/design/README.md`, `.ralph/fix_plan.md`, `.ralph/deferral_ledger.md`.
 
-Selection context for the next loop (re-verify, do not trust): banner still
-names M0131 first; its two unchecked items (S9, S24) are deferred-with-row,
-M0130 has zero unchecked, M0132/M0133 are explicitly FILED-NOT-PROMOTED. That
-leaves M0119 as the selectable drain, M0119-0006 the largest open cluster.
-The binary-`COPY` type chain is now EXHAUSTED — `bpchar` was its last named
-type. Next candidates are the three rows this slice filed (`octet_length` off
-the trimmed image; bare `bpchar` treated as `char(1)`; the trimmed heap image
-itself) or the older 005 residuals (posting-list duplicates, box/int4range/
-int4[] key types).
-
-Gates: `go build ./...` clean; `internal/catalog` + `internal/executor` +
-`internal/wal` + `internal/server` + `internal/pgnodes` PASS;
-`TestPort_RegressSuite` PASS (271 s, `-timeout 40m` — the default 600 s timeout
-KILLS it, see In-flight note below); `RALPH_PRECOMMIT_SCOPE=units` PASS;
-`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35 canonical); TPC-DS SF0.5 sweep
-PASS=95 MISMATCH=0 CKMISMATCH=0 ERROR=0, plan shapes identical 99/99; pgbench
-smoke PASS via the commit hook. Mutation-checked 3 ways (30 / 10 / 1 red).
-
-Operational note for the next loop: `go test -run TestPort_RegressSuite
-./internal/testport/` needs an explicit `-timeout 40m`. At the default 600 s it
-panics with a goroutine dump that reads like a hang, not a timeout.
+Gates: `go build ./...` + `go vet ./internal/server/` clean; `go test
+./internal/server/` PASS (38 s); both const arms exercised and recorded;
+`RALPH_PRECOMMIT_SCOPE=units` PASS; pgbench smoke PASS via the commit hook.
+No executor/planner code changed, so tpch-spotcheck was not required.
 
 In-flight: none.

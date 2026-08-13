@@ -217,3 +217,119 @@ this doc introduces.
   `EndTransactionBlock`, `AbortCurrentTransaction`, and the `TBLOCK_*` states.
   goopg's `connTxState` is the analogue: `active` ≈ `TBLOCK_INPROGRESS`,
   `failed` ≈ `TBLOCK_ABORT`, cleared ≈ `TBLOCK_DEFAULT`.
+
+## 7. S1 verification record (2026-08-13, HEAD `1d648659`)
+
+M0132-S1 executed the three doc-09 corrections as *measurements*, not readings,
+and added the acceptance bar as
+`internal/server/extended_txn_block_test.go`. Results:
+
+| correction | verdict at HEAD | evidence |
+|---|---|---|
+| (a) `connTxState` is already threaded into the extended path | **confirmed** | `dispatch_extended.go:30` takes `connTx *connTxState`; its only reads are `NonSuperuserRole` and statement logging. The first *code* slice is therefore the state machine (S2), not plumbing. |
+| (b) there is no `execCommit` route to adopt | **confirmed** | `dispatch.go:2803-2807` states the bypass in so many words, and the deferred FK/UNIQUE/EXCLUDE sequence is inline at `:2818-2828`. S4 is a proof obligation on S2's extraction, not independent wiring. |
+| (c) `Sync` is already correct | **confirmed** | `server.go`'s `MsgSync` arm clears `syncRequired` and calls `w.ReadyForQuery()`; it touches no transaction state. Pinned by `TestM0132S1_SyncDoesNotEndAnOpenBlock`, which passes today and must keep passing. |
+
+### The bar, and how its redness is proven
+
+The file carries one const, `m0132ExtendedBlocksLanded = false`. Every bar runs
+its scenario unconditionally and then asserts either the PostgreSQL outcome (const
+true) or today's divergence (const false). At HEAD all 8 tests pass; flipping the
+const turns 6 red — the two that stay green are the no-divergence guards
+(`ExtendedCommitPersistsBlockWork`, `SyncDoesNotEndAnOpenBlock`). The arrangement
+is what makes the bar committable before the fix while keeping it a real red
+test: when S2–S5 land, the divergence arms start failing because the divergence
+is gone, so the fix cannot land without flipping the const and the const cannot
+be flipped without the fix.
+
+Measured divergences (const-false arms, i.e. today's behaviour):
+
+- `BEGIN`/`INSERT`×2/`ROLLBACK` entirely over the extended protocol leaves **2
+  rows**; PG leaves 0.
+- `ReadyForQuery` reports `I` after an extended `BEGIN` and after an in-block
+  extended `INSERT`; PG reports `T`.
+- The **mixed** shape (simple `BEGIN` → extended parameterised `INSERT` → simple
+  `ROLLBACK`) leaves **1 row**: the write went to the auto-committing offset-slot
+  transaction, so the `ROLLBACK` discarded an empty one. This is the shape pgx
+  and lib/pq actually emit.
+- An extended `Execute` inside a **failed** block runs and commits; PG raises
+  25P02.
+
+### Two SIMPLE-path gaps discovered while writing the bar
+
+Both are new (they belong to S5's scope, and S5 will inherit them if it copies
+the simple path's placement); both are pinned by tests and carry a ledger row.
+
+1. **A plan-time error does not fail the block.** `connTx.Fail()` has exactly two
+   call sites (`dispatch.go:950`, `:1019`), both on the executor-error path
+   (`errQueryErrorSent`). An error raised *before* execution — e.g. `INSERT INTO
+   <missing table>` — leaves the block live and healthy: goopg answers the next
+   statement normally and reports `T`. PG aborts a block on **any** error inside
+   it (the abort is driven from `postgres.c`'s error handler via
+   `AbortCurrentTransaction`, not from the executor). The `E` a client sees
+   immediately after such an error is produced by the `afterError` argument to
+   `wireStatus`, not by persisted state, which is why the divergence hides:
+   the status byte is right once and wrong from then on.
+   Test: `TestM0132S1_PlanTimeErrorDoesNotFailTheBlock`.
+2. **A constant `SELECT 1` bypasses the 25P02 gate.** The gate at
+   `dispatch.go:638` rejects `SELECT * FROM items` and `INSERT …` in a failed
+   block, but a constant-only select is answered normally. PG rejects everything
+   except `COMMIT`/`ROLLBACK`/`ROLLBACK TO`.
+   Test: `TestM0132S1_ConstantSelectBypassesTheAbortedBlockGate`.
+
+## 8. S2 step 1 record — the extraction landed, behaviour-preserving (2026-08-13, HEAD `49382001`)
+
+S2 is a two-step slice, and this is step 1: **the extraction, with the simple
+path as its only caller.** No extended behaviour is switched on, so the
+land-together rule (S2+S3+S4+S5 in one commit) is not touched — that rule
+governs the moment the extended path starts driving the machine, and D1 above
+explicitly requires the refactor be "proven green **before** S2's new behaviour
+is switched on". A pure extraction landing alone opens no hole: it cannot,
+because it changes nothing observable.
+
+**What landed.** `internal/server/txn_verb.go`. The 289-line arm at
+`dispatch.go:2692-2984` is now 17 lines that render an outcome; the machine is
+`(*Server).applyTransactionVerb(ctx, connTx, txNode, autoCommitPtr)
+txnVerbOutcome`.
+
+**One correction to D1's sketch.** The sketch returned `(tag string, err
+error)`. That signature cannot carry the arm's real outputs, and discovering
+this is what makes the extraction faithful rather than approximate:
+
+- **The 25P01 WARNING is not an error.** `COMMIT`/`ROLLBACK` outside a block
+  emits `WriteNoticeResponse` *and then* a success tag (`:2944-2951`,
+  `:2973-2980`). A `(tag, err)` pair has nowhere to put "succeeded, but notice
+  first", so it would have been dropped or promoted to an error. It is now
+  `txnVerbOutcome.Warn`, rendered by `noTransactionInProgressNotice()`.
+- **The errors carry structured fields, not just text.** The deferred-check
+  failure passes DETAIL and POSITION, and the SSI failure passes DETAIL + HINT
+  with a bare primary message (predicate.c parity) — a plain `error` loses all
+  of it, and the SQLSTATE with it (23503 vs 23505 vs 23P01 vs 40001 comes from
+  the `ExecError`'s own `Code`). It is now `*txnVerbError{Code, Msg, Fields}`.
+- **"Not handled" is a third outcome, distinct from success and failure.**
+  SAVEPOINT / ROLLBACK TO / RELEASE fall *through* to `BuildFastIterator`
+  (M0097-0023). `Handled: false` says so explicitly. This is also the hook S10
+  needs: its ruling ("implement, or `0A000` on the extended path") is a decision
+  about what the extended caller does with `Handled == false`, and having the
+  case named means the extended path cannot silently inherit today's bare-tag
+  bug wearing a different verb.
+
+**One structural change inside the extraction, deliberate.** The five terminal
+paths of the arm each repeated an identical seven-line teardown (enum-DDL undo,
+`connTx.End()`, `EndLocalTransaction`, five pending-queue clears). They are now
+one `(*Server).endExplicitBlock`. This is the only edit that is not a
+mechanical move, and it is the one that makes "all five paths tear down
+identically" checkable by reading rather than by diffing five copies.
+
+**Gates run:** `go build ./...` and `go vet ./internal/server/` clean; `go test
+./internal/server/` PASS (38 s); `go test ./internal/executor/` PASS; `go test
+-run TestPort_Isolation ./internal/testport/` PASS (413 s — the D-002 gate S2
+names, and the one that would catch a dropped SSI or deferred-check path);
+`RALPH_PRECOMMIT_SCOPE=units` and the pgbench smoke via the commit hook.
+
+**Next (step 2, and it is the land-together commit):** switch
+`dispatch_extended.go:110-112` to call `applyTransactionVerb`, make `:134-139` /
+`:361-365` / the `:143-150` rollback defer conditional on `connTx.InExplicit()`
+(S3), assert the deferred sequence arrives on the extended COMMIT (S4), add the
+missing `connTx.Fail()` call site (S5) — and flip
+`m0132ExtendedBlocksLanded` to `true` in the same commit.
