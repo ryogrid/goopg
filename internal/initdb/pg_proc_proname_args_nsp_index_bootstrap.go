@@ -269,10 +269,18 @@ func bootstrapPgProcPronameArgsNspIndex(dataDir string, tids []heapTID) error {
 		if args == nil {
 			args = []uint32{2281}
 		}
+		// M0133-S2: pronamespace is pg_catalog (11) unless the entry opts in —
+		// the information_schema helpers live in namespace 13273. Hardcoding 11
+		// here made FuncnameGetCandidates on the hosted standby miss them the
+		// same way the pg_type_typname_nsp_index gap (0133-0001 F1) did.
+		nsp := e.Namespace
+		if nsp == 0 {
+			nsp = 11
+		}
 		items[i] = indexed{
 			name: e.Name,
 			args: args,
-			nsp:  11, // pg_catalog
+			nsp:  nsp,
 			blk:  tids[i].Block,
 			off:  tids[i].Offset,
 		}

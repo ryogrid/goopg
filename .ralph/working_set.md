@@ -1,15 +1,28 @@
 (idle — nothing in flight)
 
-M0132-S13 DONE this loop (uncommitted as of writing; commit follows). Prepared-
-statement cache landed (`docs/design/0132-0005-...`): Execute skips
-`parser.Parse` on a plan-cache hit (`dispatch_extended.go`), Describe reads the
-plan from `s.pc` on `sessionPlanCatalog` (`extended.go`). Proven: c=50 `-S`
-prepared −22.3% → −1.07% (parity). The "prepared > simple" A/B assertion is
-structurally UNSATISFIABLE — goopg's SIMPLE path also reads `s.pc`
-(M0098-0005), so prepared has no plan advantage to win back (PG simple re-plans
-every time, hence PG prepared +11..24%). Ledger row M0132-S13 carries the
-resume point + why. M0132 is now FULLY CLOSED (S1–S13 all [x]).
+M0133-S2 DONE + committed: the 11 `information_schema` helper functions
+(`pg_proc` OIDs 13274..13279 + 13281..13285; **13280 is a hole**, unassigned).
+10 carry `prosrc=''` + a non-null `prosqlbody` captured verbatim into
+`<name>_prosqlbody.dat`; `_pg_expandarray` is textual (prosrc 51 B, SRF with
+OUT args, prosupport=3996 `array_unnest_support`).
 
-Next per banner: M0131's remaining unchecked items, then M0130's, then M0119
-then M0122 (top-to-bottom). Re-read the `## Current Priority` banner before
-selecting — it is the sole ordering authority.
+New capture surface `scripts/capture-ev-action.sh --prosqlbody [--verify]` +
+generator `cmd/gen-information-schema-procs` (separate from gen-nailed-view-tables:
+disjoint schema, one stdout stream) → `informationSchemaHelperProcs()` +
+`internal/initdb/information_schema_proc_manifest.tsv`.
+
+`pgProcEntry` gained `Namespace/Cost/Rows/Support/SqlBody`; `pgProcRow` emits
+them; `pgProcInitialEntries` 3397→3408. Sibling-path fix forced:
+`bootstrapPgProcPronameArgsNspIndex` hardcoded `nsp=11` (the pg_proc twin of
+S1's `pg_type_typname_nsp_index` gap) → now reads `e.Namespace`.
+
+Design `0133-0002` + README row. Gates: `internal/initdb` PASS (224 s),
+`internal/catalog` PASS, `--prosqlbody --verify` byte-identical (11 procs),
+UNITS PASS, `go build`+`go vet` clean.
+
+Next per banner (M0133, S2 done → S3): **M0133-S3 — the 4 data tables + 801
+rows** (F35). `sql_features` (755) / `sql_sizing` (23) / `sql_implementation_info`
+(12) / `sql_parts` (11) are ordinary heaps; upstream initdb COPYs them from
+`sql_features.txt`. Needs a bulk-heap-load-at-initdb mechanism M0131-S9 never
+produced — write its own design section before code. Gates: a hosted PG reading
+real rows out of `sql_features`, not just planning it.

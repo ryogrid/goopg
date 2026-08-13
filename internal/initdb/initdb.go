@@ -2800,6 +2800,15 @@ type pgProcEntry struct {
 	// shape unless prokind='a'. Explicit non-zero values take precedence
 	// for entries whose handler does not encode the kind in its name.
 	Kind byte
+	// M0133-S2: fields the information_schema helper functions vary but the
+	// pg_proc.dat mirror (pgProcAllEntries) never does. Zero values preserve
+	// the pre-existing hardcoded defaults, so the 3397 .dat entries are
+	// unchanged and only the 11 helpers opt in.
+	Namespace uint32 // pronamespace. 0 → pg_catalog (11).
+	Cost      int64  // procost. 0 → 1 (the pre-existing default).
+	Rows      int64  // prorows. 0 → 0.
+	Support   uint32 // prosupport regproc OID. 0 → 0 (none).
+	SqlBody   string // prosqlbody blob name (prosrc='' for these); "" → NULL.
 }
 
 // pgProcColDefs returns the 30-column PG18 FormData_pg_proc layout.
@@ -2847,14 +2856,15 @@ func pgProcColDefs() []catalog.Column {
 	}
 }
 
-// pgProcInitialEntries returns all pg_proc.dat entries for PG18.
-// This is the full set of 3397 entries generated from
-// postgres/src/include/catalog/pg_proc.dat by cmd/gen-pg-proc-data/main.go.
-// It supersedes the former hand-crafted list of 32 entries (7 AM handlers +
-// 24 I/O regprocs + 1 SRF) that was maintained prior to M0106-0010
-// batched-14.
+// pgProcInitialEntries returns every pg_proc row goopg seeds: the 3397
+// pg_proc.dat entries generated from
+// postgres/src/include/catalog/pg_proc.dat by cmd/gen-pg-proc-data/main.go,
+// plus the 11 information_schema helper functions created by
+// information_schema.sql (M0133-S2). It supersedes the former hand-crafted
+// list of 32 entries (7 AM handlers + 24 I/O regprocs + 1 SRF) that was
+// maintained prior to M0106-0010 batched-14.
 func pgProcInitialEntries() []pgProcEntry {
-	return pgProcAllEntries()
+	return append(pgProcAllEntries(), informationSchemaHelperProcs()...)
 }
 
 // pgProcRow materialises one pgProcEntry as the 30-column row that
@@ -2924,21 +2934,39 @@ func pgProcRow(e pgProcEntry) executor.Row {
 	if argDefaults != "" {
 		argDefaultsDatum = executor.NewStringDatum(argDefaults)
 	}
+	// M0133-S2: a non-empty SqlBody names a captured prosqlbody node-tree blob
+	// (information_schema_proc_sqlbody.go); emit it instead of the SQL NULL
+	// that routes PG through prosrc. These functions carry prosrc='', so a
+	// NULL prosqlbody would make stringToNode("") fail on the hosted standby.
+	sqlBody := executor.NullDatum
+	if e.SqlBody != "" {
+		sqlBody = executor.NewStringDatum(nailedProcSqlBody(e.SqlBody))
+	}
 	return executor.Row{
 		executor.NewIntDatum(int64(e.OID)), // 1  oid
 		executor.NewStringDatum(e.Name),    // 2  proname
-		executor.NewIntDatum(11),           // 3  pronamespace = pg_catalog
-		executor.NewIntDatum(10),           // 4  proowner = BOOTSTRAP_SUPERUSERID
+		executor.NewIntDatum(func() int64 { // 3  pronamespace (pg_catalog unless overridden)
+			if e.Namespace != 0 {
+				return int64(e.Namespace)
+			}
+			return 11
+		}()),
+		executor.NewIntDatum(10), // 4  proowner = BOOTSTRAP_SUPERUSERID
 		executor.NewIntDatum(func() int64 { // 5  prolang
 			if e.Lang != 0 {
 				return int64(e.Lang)
 			}
 			return 12 // INTERNALlanguageId
 		}()),
-		executor.NewIntDatum(1),                          // 6  procost = 1 (float4)
-		executor.NewIntDatum(0),                          // 7  prorows = 0 (float4)
-		executor.NewIntDatum(0),                          // 8  provariadic = 0
-		executor.NewIntDatum(0),                          // 9  prosupport = 0
+		executor.NewIntDatum(func() int64 { // 6  procost (float4)
+			if e.Cost != 0 {
+				return e.Cost
+			}
+			return 1
+		}()),
+		executor.NewIntDatum(e.Rows), // 7  prorows (float4)
+		executor.NewIntDatum(0),      // 8  provariadic = 0
+		executor.NewIntDatum(int64(e.Support)), // 9  prosupport (regproc OID)
 		executor.NewStringDatum(string(kind)),            // 10 prokind
 		executor.NewBoolDatum(false),                     // 11 prosecdef
 		executor.NewBoolDatum(false),                     // 12 proleakproof
@@ -2957,7 +2985,7 @@ func pgProcRow(e pgProcEntry) executor.Row {
 		executor.NullDatum,                     // 25 protrftypes
 		executor.NewStringDatum(e.HandlerName), // 26 prosrc — fmgr internal lookup key
 		executor.NullDatum,                     // 27 probin
-		executor.NullDatum,                     // 28 prosqlbody (NULL ⇒ PG executes prosrc)
+		sqlBody,                                // 28 prosqlbody (NULL ⇒ PG executes prosrc)
 		executor.NullDatum,                     // 29 proconfig (NULL ⇒ no fmgr_security_definer)
 		executor.NullDatum,                     // 30 proacl (NULL ⇒ owner + PUBLIC EXECUTE default)
 	}
