@@ -144,20 +144,17 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	if inBlock {
 		tx = connTx.Tx()
 	} else {
-		// Out of block: this Execute owns its transaction. Use an offset
-		// procNum so an explicit block opened over the OTHER protocol keeps
-		// the connection's own ProcArray slot (the offset mirrors the COPY
-		// transaction strategy in copy.go) — except for a BEGIN, whose
-		// transaction IS about to become the connection's block and must
-		// therefore live on the connection's own slot exactly as the simple
-		// path's does (dispatch.go). M0132-S7 revisits the offset itself.
-		const halfSize = mvcc.ConnSlotCount / 2
-		beginProcNum := (procNum + halfSize) % mvcc.ConnSlotCount
-		if isTxVerb && txNode.Verb == planner.TxBegin {
-			beginProcNum = procNum
-		}
+		// Out of block: this Execute owns its transaction, which lives on the
+		// connection's OWN ProcArray slot — exactly as the simple path does
+		// (dispatch.go). The connection holds that slot exclusively for its
+		// lifetime (connHeld), and out of block nothing else uses it, so the
+		// historical `(procNum + halfSize) % ConnSlotCount` offset was both
+		// unnecessary and unsafe: it deterministically landed the transaction
+		// on a DIFFERENT connection's slot, where `Begin` unconditionally
+		// clobbers whatever is there, producing `mvcc: unknown transaction`
+		// aborts (doc 09 §5 I3). M0132-S7.
 		var err error
-		tx, err = s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted, beginProcNum)
+		tx, err = s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted, procNum)
 		if err != nil {
 			return nil, &extendedQueryError{Code: sqlstate.SystemError, Message: err.Error()}
 		}

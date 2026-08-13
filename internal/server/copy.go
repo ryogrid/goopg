@@ -154,17 +154,24 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameW
 		return nil, nil
 	}
 
-	// Use a dedicated procNum for the COPY-internal transaction so it
-	// does not overwrite the connection's own ProcArray slot. The COPY
-	// always runs in its own auto-commit transaction regardless of
-	// whether the client has opened an explicit BEGIN block.
-	// Offset by half the ProcArray to avoid the typical connection range.
-	var copyProcNum int32
-	if connTx != nil {
-		const halfSize = mvcc.ConnSlotCount / 2
-		copyProcNum = (connTx.ProcNum + halfSize) % mvcc.ConnSlotCount
+	// M0132-S7: out of block, COPY's own auto-commit transaction lives on the
+	// connection's OWN ProcArray slot (connTx.ProcNum) — the connection holds
+	// it exclusively, and out of block nothing else uses it, so this matches
+	// the simple path's discipline. In a block, COPY still runs its own
+	// auto-commit transaction regardless of the open block (a pre-existing
+	// divergence, ledger'd), so it needs a slot that is NOT the block's own
+	// slot; use the manager's auto-assign path (CAS scan for an inTxn==0 slot)
+	// rather than the historical `(procNum + halfSize) % ConnSlotCount`
+	// offset, which deterministically landed on a DIFFERENT connection's slot
+	// and produced `mvcc: unknown transaction` aborts. The connTx==nil path
+	// (no connection state) previously degenerated to slot 0 and now
+	// auto-assigns too.
+	var tx mvcc.Transaction
+	if connTx != nil && !connTx.InExplicit() {
+		tx, err = s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted, connTx.ProcNum)
+	} else {
+		tx, err = s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted)
 	}
-	tx, err := s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted, copyProcNum)
 	if err != nil {
 		if err := s.writeQueryError(w, sqlstate.SystemError, err.Error()); err != nil {
 			return nil, err
