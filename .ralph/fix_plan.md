@@ -35,17 +35,19 @@ forward reference into a design doc; it is NOT promoted.
   `completed_fix_plan_011.md`); they are reference-only, NOT actionable, and must
   not be copied back here.
 
-## Current Priority (per 2026-08-13 — M0132)
+## Current Priority (per 2026-08-13 — M0133)
 
 **M-NIGHTLY is the standing filing obligation (unconditional, highest priority):
 every loop reads `ci/logs/action-items.md` and files each new `## AI-` subject
 under the M-NIGHTLY milestone below.**
 
-**M0132 (Explicit transactions across the extended query protocol) is the
-next-priority milestone after M-NIGHTLY (user directive 2026-08-13).** Work
-M0132 tasks immediately after M-NIGHTLY's regression fixes, ahead of M0131 and
-M0130's remaining items. Its section is at the END of this file — document order
-does NOT reflect priority here; this banner does.
+**M0132 (Explicit transactions across the extended query protocol) is COMPLETE —
+all S1–S13 landed 2026-08-13.** The next-priority milestone after M-NIGHTLY is
+now **M0133 (`information_schema` on disk)**, the successor filed for the
+deferred M0131-S9.4. Work M0133 tasks immediately after M-NIGHTLY's regression
+fixes, ahead of M0131's remaining items (S9's `pg_catalog` half is 80/80 done;
+S24 is deferred) and M0130 (closed). Its section is at the END of this file —
+document order does NOT reflect priority here; this banner does.
 Then M0131's remaining unchecked items, then M0130's remaining unchecked items,
 then all remaining unchecked items top-to-bottom (M0119, then M0122).
 **M0119 selection rule: pick a M0119 task ONLY when no milestone above M0119 in
@@ -5350,7 +5352,7 @@ Milestone: `docs/milestones/0132-extended-protocol-explicit-transactions.md`. Au
 
 ## M0133 — `information_schema` on disk (filed 2026-08-12, successor to the deferred M0131-S9.4)
 
-**Priority: FILED, NOT PROMOTED.** The `## Current Priority` banner at the top of this file remains the sole ordering authority; M0133 is queued behind M0132 (which the 2026-08-13 directive promoted to next-after-M-NIGHTLY), M0131 and M0130. Filing the deferred successor makes it schedulable and discoverable — it does NOT reorder the queue. Working it requires a banner edit.
+**Priority: PROMOTED (2026-08-13) — next after M-NIGHTLY.** M0132 is complete and M0130 is closed, and M0131's only remaining `pg_catalog` work is S9.4, which this milestone IS; the `## Current Priority` banner names M0133 next after M-NIGHTLY's standing filing obligation. Work S1–S4 in order (they are serial: S4 must not begin before S1–S3 are on disk).
 
 **Source:** M0131-S9.4, deferred 2026-08-12 with 2 ledger rows after being MEASURED rather than assumed (design `docs/design/0131-0009-system-view-corpus-widening.md` §S9.4, findings F31-F35). This section exists because a design-doc section is not a schedulable resume point: the deferral rule forbids closing with a forward reference, and "the successor decomposition is in §S9.4" is one.
 
@@ -5362,7 +5364,7 @@ Milestone: `docs/milestones/0132-extended-protocol-explicit-transactions.md`. Au
 
 **LAND-TOGETHER CONSTRAINT (the reason S9.4 was deferred wholesale rather than dribbled):** the `information_schema` name ALREADY resolves in goopg's own front end (8 virtual relations, `registerInformationSchemaTables`, `internal/catalog/catalog.go:11613`). An on-disk namespace holding 0 of its 69 relations reports to a hosted PG a schema that exists and is empty — strictly worse than today's clean absence, and the exact half-filled-catalog anti-pattern that already bit this project (a half-filled `pg_type` broke an `IN`-list that worked at all-zero). The prerequisites are genuinely serial: the domains before any view's `pg_attribute` types resolve, the helpers before any view body does, the tables' data before `sql_features` answers. **S1-S3 may land separately; S4 must not begin before S1-S3 are all on disk, and the namespace row itself lands in S1 with its domains, atomically.**
 
-- [ ] **M0133-S1 — namespace + domains, atomically** (est ~1-2 loops). The `information_schema` `pg_namespace` row (13273) **plus** the 5 domains, their 5 array peers and the 2 domain CHECK constraints in ONE bootstrap step. Nothing may observe a namespace without its domains. Note the OID band is shared with M0131-S9's own pins: one post-bootstrap counter from `FirstUnpinnedObjectId = 12000` runs 12000..12355 (the 80 `system_views.sql` views), 12356..13272 (894 `pg_description` rows) then 13273..13621 (all of `information_schema`); every value is below `catalog.FirstUserOID = 16384`, so the collision objection is void for the same reason it was in M0131-S8. Gates: `internal/catalog` + `internal/initdb`, and a hosted-PG probe that the namespace answers with its domains resolvable.
+- [x] **M0133-S1 — namespace + domains, atomically** (est ~1-2 loops). The `information_schema` `pg_namespace` row (13273) **plus** the 5 domains, their 5 array peers and the 2 domain CHECK constraints in ONE bootstrap step. Nothing may observe a namespace without its domains. Note the OID band is shared with M0131-S9's own pins: one post-bootstrap counter from `FirstUnpinnedObjectId = 12000` runs 12000..12355 (the 80 `system_views.sql` views), 12356..13272 (894 `pg_description` rows) then 13273..13621 (all of `information_schema`); every value is below `catalog.FirstUserOID = 16384`, so the collision objection is void for the same reason it was in M0131-S8. Gates: `internal/catalog` + `internal/initdb`, and a hosted-PG probe that the namespace answers with its domains resolvable. **DONE 2026-08-13.** Namespace 13273 in `pgNamespaceInitialEntries`; the 10 `pg_type` rows (5 domains + 5 array peers) in `pgTypeCanonical` with four overlay maps (namespace/base-type/typmod/elem-array) + 6 collation cases + `pgTypeInformationSchemaDomainOIDs` in the bootstrap map; the 2 CHECK constraints via `bootstrapPgConstraintTuples` (new `pg_constraint_bootstrap.go`) + indexes 2665/2666/2667, with `pgConstraintAttrs` widened 11→28 (past column 6 the numbering diverged: goopg put `convalidated` at 7 where PG18 has `conenforced`). `conbin` is the verbatim nodeToString captured from PG 18.3, not the runtime's raw-text adbin convention, so a hosted PG enforces the checks. **Two fixes the slice forced:** `pg_type_typname_nsp_index` (2704) hardcoded `typnamespace=11` for every type → `LookupTypeName('information_schema.sql_identifier')` was 42P01 (now reads `pgTypeNamespaceOverlay`); `pgTypeCanonical` gained `_int2` (1005) for `conkey`/`confkey`/`confdelsetcols`. All OIDs measured against a fresh PG 18.3 (post-bootstrap counter, not a .dat file). E2E probe `assertInformationSchemaDomainsResolvable` asserts resolve + CHECK enforcement by name. Design `0133-0001` + README row. Gates: `internal/initdb` PASS (224 s), `internal/catalog` PASS, `TestE2E_PGColdStartOnGoopgDataDir` PASS, `go build ./...` + `go vet` clean, UNITS PASS, pgbench smoke via the commit hook.
 - [ ] **M0133-S2 — the 11 helper functions** (est ~1-2 loops). Blocked on a `prosqlbody` capture mode (F34): extend `scripts/capture-ev-action.sh` + `cmd/gen-nailed-view-tables` with a `--prosqlbody <funcoid>` mode emitting the same `.dat` + seed-table shape the view corpus uses. `_pg_expandarray` is the only one with a textual `prosrc` (51 B). The `pgnodes` non-path argument applies unchanged: capture, do not generate. Gates: `internal/initdb`, `--verify` byte-identity.
 - [ ] **M0133-S3 — the 4 data tables and their 801 rows** (est ~1-2 loops; F35). `sql_features` (755), `sql_sizing` (23), `sql_implementation_info` (12), `sql_parts` (11) are ordinary heaps; upstream initdb `COPY`s them from `sql_features.txt`. This is a bulk heap load at initdb time — a mechanism M0131-S9 never produced, so it needs its own design section before code. Gates: a hosted PG reading actual rows out of `sql_features`, not just planning it.
 - [ ] **M0133-S4 — the 65 views** (est ~many loops; runs LAST). In `information_schema.sql` order, reusing the M0131-S9 capture/pin/regen loop unchanged; 11 of them exercise the `pg_rewrite` TOAST writer (F33). The corpus-wide guards from M0131-S9 apply as-is: the identity `--verify` gate, `assertNailedSystemViewsAreEvaluable`, and the fail-when-fixed absence tripwire — which M0131-S9's F29 already pointed at `information_schema.tables`, so THIS milestone is what flips it red and must re-point it.

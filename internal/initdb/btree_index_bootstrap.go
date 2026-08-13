@@ -1017,6 +1017,7 @@ func pgBuildIndexTupleNameOidKey(heapBlk uint32, heapOff uint16, name string, oi
 func bootstrapPgTypeTypnameNspIndex(dataDir string, tids map[uint32]heapTID) error {
 	type entry struct {
 		name string
+		nsp  uint32
 		blk  uint32
 		off  uint16
 	}
@@ -1027,17 +1028,31 @@ func bootstrapPgTypeTypnameNspIndex(dataDir string, tids map[uint32]heapTID) err
 		if !ok {
 			continue
 		}
-		entries = append(entries, entry{name: e.Name, blk: t.Block, off: t.Offset})
+		// M0133-S1: the information_schema domains live in namespace 13273, so
+		// the namespace is no longer a constant 11 — LookupTypeName must find
+		// `information_schema.sql_identifier` via (typname='sql_identifier',
+		// typnamespace=13273), and a hardcoded 11 here makes it 42P01.
+		nsp := uint32(11)
+		if v, ok := pgTypeNamespaceOverlay[oid]; ok {
+			nsp = v
+		}
+		entries = append(entries, entry{name: e.Name, nsp: nsp, blk: t.Block, off: t.Offset})
 	}
-	// Sort by typname (NameData byte comparison); all bootstrap types share
-	// typnamespace=11 (pg_catalog) so the name is the whole live key.
-	sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
+	// Sort by typname (NameData byte comparison), then typnamespace — the index
+	// key is (typname, typnamespace), and the domains are the first rows outside
+	// pg_catalog so the secondary key can now actually decide an ordering.
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].name != entries[j].name {
+			return entries[i].name < entries[j].name
+		}
+		return entries[i].nsp < entries[j].nsp
+	})
 
 	const nameOidTupleSize = 80 // MAXALIGN(8 + 64 + 4)
 	const nkeyatts = 2          // (typname, typnamespace)
 	tuples := make([][]byte, len(entries))
 	for i, e := range entries {
-		tuples[i] = pgBuildIndexTupleNameOidKey(e.blk, e.off, e.name, 11)
+		tuples[i] = pgBuildIndexTupleNameOidKey(e.blk, e.off, e.name, e.nsp)
 	}
 	file, err := pgBuildBtreeBulkLoadSized(tuples, nameOidTupleSize, nkeyatts)
 	if err != nil {
@@ -1686,6 +1701,44 @@ func pgBuildIndexTupleOidNameKey(heapBlk uint32, heapOff uint16, oid uint32, nam
 	}
 	copy(out[hoff+4:hoff+4+n], name[:n])
 	// Bytes [76..79] are MAXALIGN padding — already zero.
+	return out
+}
+
+// pgBuildIndexTupleOidOidNameKey encodes a 3-column composite IndexTuple
+// (oid, oid, name) — the key schema of pg_constraint_conrelid_contypid_conname_index
+// (OID 2665, indkey=[conrelid, contypid, conname]). Used by
+// bootstrapPgConstraintRelidTypidNameIndex (M0133-S1).
+//
+// Layout mirrors pgBuildIndexTupleOidNameKey with one extra leading oid:
+//
+//	[0..7]   t_tid + t_info
+//	[8..11]  conrelid  (oid, LE uint32)
+//	[12..15] contypid  (oid, LE uint32)
+//	[16..79] conname   (NameData, 64 bytes zero-padded)
+//
+// Total = MAXALIGN(8 + 4 + 4 + 64) = MAXALIGN(80) = 80. Both oids align 'i'
+// and the name aligns 'c', so no inter-attribute padding.
+func pgBuildIndexTupleOidOidNameKey(heapBlk uint32, heapOff uint16, oid1, oid2 uint32, name string) []byte {
+	const (
+		nameDataLen = 64
+		hoff        = 8
+		size        = 80 // MAXALIGN(hoff + 4 + 4 + nameDataLen) = 80
+	)
+	out := make([]byte, size)
+	le := binary.LittleEndian
+
+	le.PutUint16(out[0:2], uint16(heapBlk>>16))
+	le.PutUint16(out[2:4], uint16(heapBlk&0xFFFF))
+	le.PutUint16(out[4:6], heapOff)
+	le.PutUint16(out[6:8], uint16(size)&indexSizeMask)
+
+	le.PutUint32(out[hoff:hoff+4], oid1)
+	le.PutUint32(out[hoff+4:hoff+8], oid2)
+	n := len(name)
+	if n > nameDataLen {
+		n = nameDataLen
+	}
+	copy(out[hoff+8:hoff+8+n], name[:n])
 	return out
 }
 

@@ -51,7 +51,17 @@ func TestBootstrapPgTypeTypnameNspIndexWritesPopulatedBtree(t *testing.T) {
 	}
 
 	// Walk every leaf (blocks 1..) collecting data tuples; verify shape,
-	// ascending name order, and that "text" (nsp 11) is present.
+	// ascending name order, and that "text" (nsp 11) is present. The
+	// information_schema domains (M0133-S1) are the first rows outside
+	// pg_catalog, so their typnamespace must be 13273 — not the blanket 11.
+	infoSchema := map[string]bool{
+		"_cardinal_number": true, "cardinal_number": true,
+		"_character_data": true, "character_data": true,
+		"_sql_identifier": true, "sql_identifier": true,
+		"_time_stamp": true, "time_stamp": true,
+		"_yes_or_no": true, "yes_or_no": true,
+	}
+	seenInfoSchema := map[string]bool{}
 	var prevName string
 	sawText := false
 	total := 0
@@ -80,13 +90,24 @@ func TestBootstrapPgTypeTypnameNspIndexWritesPopulatedBtree(t *testing.T) {
 				t.Fatalf("leaf %d slot %d: name %q < previous %q — not sorted", blk, i, name, prevName)
 			}
 			prevName = name
-			if nsp := le.Uint32(page[off+72 : off+76]); nsp != 11 {
-				t.Fatalf("leaf %d slot %d (%q): nsp = %d, want 11", blk, i, name, nsp)
+			nsp := le.Uint32(page[off+72 : off+76])
+			wantNsp := uint32(11)
+			if infoSchema[name] {
+				wantNsp = 13273
+				seenInfoSchema[name] = true
+			}
+			if nsp != wantNsp {
+				t.Fatalf("leaf %d slot %d (%q): nsp = %d, want %d", blk, i, name, nsp, wantNsp)
 			}
 			if name == "text" {
 				sawText = true
 			}
 			total++
+		}
+	}
+	for name := range infoSchema {
+		if !seenInfoSchema[name] {
+			t.Fatalf("no index entry for information_schema type %q (want nsp=13273)", name)
 		}
 	}
 	if !sawText {

@@ -156,6 +156,13 @@ func pgTypeCanonical(oid uint32) (pgTypeEntry, bool) {
 		// typalign is 'i', NOT name's own 'c': Catalog.pm:469 gives an array
 		// type 'd' when its element is 'd' and 'i' otherwise.
 		return pgTypeEntry{1003, "_name", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
+	case 1005:
+		// _int2: the array of int2 (21). Referenced by pg_constraint's conkey/
+		// confkey/confdelsetcols (M0133-S1) — the first nailed-attr columns of
+		// this type. Was absent from the hand-written switch (it is in
+		// pg_type.dat, so the heap already had it via pgTypeAllEntries); the
+		// nailed-attr coverage guard demanded a canonical case.
+		return pgTypeEntry{1005, "_int2", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
 	case 1021:
 		return pgTypeEntry{1021, "_float4", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
 	case 1022:
@@ -250,6 +257,40 @@ func pgTypeCanonical(oid uint32) (pgTypeEntry, bool) {
 		// pinned here for the same reason S8a pins the view OIDs: goopg
 		// adopts upstream's assignment rather than minting its own.
 		return pgTypeEntry{10029, "pg_statistic", -1, false, 'c', 'C', 'd', 'x', 2290, 2291, 2402, 2403}, true
+	// ---- information_schema domains + array peers (M0133-S1) ----
+	//
+	// These OIDs are initdb-assigned by information_schema.sql AFTER bootstrap,
+	// so they come from the same post-bootstrap counter that M0131-S9 pinned for
+	// the 80 system_views.sql views (FirstUnpinnedObjectId = 12000). They are
+	// NOT in pg_type.dat; every value below was measured against a fresh PG 18.3
+	// (M0133-S1's oracle recipe), not read from a .dat file. The five domains
+	// carry PG's domain I/O pair (domain_in = 2597, domain_recv = 2598) as
+	// typinput/typreceive and their BASE type's output/send (a domain renders
+	// through its base's typoutput — getTypeOutputInfo reads the DOMAIN row).
+	// typtype/typcategory/typalign/typstorage follow the base type; the array
+	// peers are the generic array I/O quad with typalign inherited from their
+	// element (Catalog.pm:469 — 'd' only when the element is 'd', hence
+	// _time_stamp's 'd').
+	case 13286:
+		return pgTypeEntry{13286, "_cardinal_number", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
+	case 13287:
+		return pgTypeEntry{13287, "cardinal_number", 4, true, 'd', 'N', 'i', 'p', 2597, 43, 2598, 2407}, true
+	case 13289:
+		return pgTypeEntry{13289, "_character_data", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
+	case 13290:
+		return pgTypeEntry{13290, "character_data", -1, false, 'd', 'S', 'i', 'x', 2597, 1047, 2598, 2433}, true
+	case 13291:
+		return pgTypeEntry{13291, "_sql_identifier", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
+	case 13292:
+		return pgTypeEntry{13292, "sql_identifier", 64, false, 'd', 'S', 'c', 'p', 2597, 35, 2598, 2423}, true
+	case 13297:
+		return pgTypeEntry{13297, "_time_stamp", -1, false, 'b', 'A', 'd', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
+	case 13298:
+		return pgTypeEntry{13298, "time_stamp", 8, true, 'd', 'D', 'd', 'p', 2597, 1151, 2598, 2477}, true
+	case 13299:
+		return pgTypeEntry{13299, "_yes_or_no", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
+	case 13300:
+		return pgTypeEntry{13300, "yes_or_no", -1, false, 'd', 'S', 'i', 'x', 2597, 1047, 2598, 2433}, true
 	}
 	return pgTypeEntry{}, false
 }
@@ -333,6 +374,16 @@ func pgTypeCollationForOID(oid uint32) int64 {
 		return 100
 	case 1015: // _varchar -- varchar array inherits the element's 'default' collation
 		return 100
+	// information_schema domains declared COLLATE "C" and their array peers
+	// (M0133-S1): character_data, sql_identifier and yes_or_no are collatable,
+	// and an array inherits its element's collation. cardinal_number and
+	// time_stamp are not collatable (0, the default).
+	case 13289, 13290: // _character_data, character_data
+		return 950
+	case 13291, 13292: // _sql_identifier, sql_identifier
+		return 950
+	case 13299, 13300: // _yes_or_no, yes_or_no
+		return 950
 	default:
 		return 0
 	}
@@ -352,6 +403,21 @@ var pgTypeElemArrayOverlay = map[uint32][3]uint32{
 	// above — typelem 0 (a composite is not an array), typarray 10028,
 	// typsubscript 0. Both directions verified against a fresh PG 18.3.
 	10029: {0, 10028, 0},
+	// information_schema domains + array peers (M0133-S1). Array peers point
+	// typelem at their domain and carry array_subscript_handler (6179); the
+	// domains point typarray back at the peer. All measured against a fresh
+	// PG 18.3, not read from pg_type.dat (these OIDs are initdb-assigned by
+	// information_schema.sql).
+	13286: {13287, 0, 6179}, // _cardinal_number
+	13287: {0, 13286, 0},    // cardinal_number
+	13289: {13290, 0, 6179}, // _character_data
+	13290: {0, 13289, 0},    // character_data
+	13291: {13292, 0, 6179}, // _sql_identifier
+	13292: {0, 13291, 0},    // sql_identifier
+	13297: {13298, 0, 6179}, // _time_stamp
+	13298: {0, 13297, 0},    // time_stamp
+	13299: {13300, 0, 6179}, // _yes_or_no
+	13300: {0, 13299, 0},    // yes_or_no
 }
 
 // pgTypeRelidOverlay carries typrelid for the bootstrapped pg_type rows that
@@ -375,6 +441,44 @@ var pgTypeRelidOverlay = map[uint32]uint32{
 	81:    1255, // pg_proc
 	83:    1259, // pg_class
 	10029: 2619, // pg_statistic — nailedLocalRels{2619}.RelType must agree
+}
+
+// pgTypeNamespaceOverlay carries typnamespace for the bootstrapped pg_type rows
+// that live OUTSIDE pg_catalog. Every other seeded row is pg_catalog (11),
+// which pgTypeRow still hardcodes; the information_schema domains and their
+// array peers (M0133-S1) are the first rows in namespace 13273.
+var pgTypeNamespaceOverlay = map[uint32]uint32{
+	13286: 13273, // _cardinal_number
+	13287: 13273, // cardinal_number
+	13289: 13273, // _character_data
+	13290: 13273, // character_data
+	13291: 13273, // _sql_identifier
+	13292: 13273, // sql_identifier
+	13297: 13273, // _time_stamp
+	13298: 13273, // time_stamp
+	13299: 13273, // _yes_or_no
+	13300: 13273, // yes_or_no
+}
+
+// pgTypeBaseTypeOverlay carries typbasetype for the information_schema DOMAIN
+// rows (M0133-S1). Every other row is a base/pseudo/array/composite type whose
+// typbasetype is legitimately 0 (still hardcoded in pgTypeRow). A domain's
+// typbasetype is the OID of the base type it is declared over.
+var pgTypeBaseTypeOverlay = map[uint32]uint32{
+	13287: 23,   // cardinal_number over int4
+	13290: 1043, // character_data over varchar
+	13292: 19,   // sql_identifier over name
+	13298: 1184, // time_stamp over timestamptz
+	13300: 1043, // yes_or_no over varchar(3)
+}
+
+// pgTypeTypModOverlay carries typtypmod for the information_schema domains whose
+// base type carries a length/precision (M0133-S1). Every other row keeps
+// pgTypeRow's hardcoded -1 (default typmod). time_stamp is timestamp(2),
+// yes_or_no is varchar(3) → VARHDRSZ + 3 = 7.
+var pgTypeTypModOverlay = map[uint32]int64{
+	13298: 2, // time_stamp = timestamp(2) with time zone
+	13300: 7, // yes_or_no = varchar(3)
 }
 
 // pgTypeElemArraySubscriptForOID returns the PG18-canonical
@@ -416,10 +520,25 @@ func pgTypeElemArraySubscriptForOID(oid uint32) (typelem, typarray, typsubscript
 // early-boot TupleDescInitEntry path are populated.
 func pgTypeRow(e pgTypeEntry) executor.Row {
 	typelem, typarray, typsubscript := pgTypeElemArraySubscriptForOID(e.OID)
+	// Overlays (M0133-S1): the information_schema domains live in namespace
+	// 13273 and carry a real typbasetype/typtypmod; every other seeded row is
+	// pg_catalog (11) with typbasetype 0 and the default -1 typmod.
+	typnamespace := uint32(11)
+	if v, ok := pgTypeNamespaceOverlay[e.OID]; ok {
+		typnamespace = v
+	}
+	typbasetype := uint32(0)
+	if v, ok := pgTypeBaseTypeOverlay[e.OID]; ok {
+		typbasetype = v
+	}
+	typtypmod := int64(-1)
+	if v, ok := pgTypeTypModOverlay[e.OID]; ok {
+		typtypmod = v
+	}
 	return executor.Row{
 		executor.NewIntDatum(int64(e.OID)),                 // 1 oid
 		executor.NewStringDatum(e.Name),                    // 2 typname
-		executor.NewIntDatum(11),                           // 3 typnamespace = pg_catalog
+		executor.NewIntDatum(int64(typnamespace)),          // 3 typnamespace
 		executor.NewIntDatum(10),                           // 4 typowner = BOOTSTRAP_SUPERUSERID
 		executor.NewIntDatum(int64(e.Len)),                 // 5 typlen
 		executor.NewBoolDatum(e.ByVal),                     // 6 typbyval
@@ -442,8 +561,8 @@ func pgTypeRow(e pgTypeEntry) executor.Row {
 		executor.NewStringDatum(string(e.Align)),           // 23 typalign  ← load-bearing
 		executor.NewStringDatum(string(e.Storage)),         // 24 typstorage
 		executor.NewBoolDatum(false),                       // 25 typnotnull
-		executor.NewIntDatum(0),                            // 26 typbasetype
-		executor.NewIntDatum(-1),                           // 27 typtypmod
+		executor.NewIntDatum(int64(typbasetype)),           // 26 typbasetype
+		executor.NewIntDatum(typtypmod),                    // 27 typtypmod
 		executor.NewIntDatum(0),                            // 28 typndims
 		executor.NewIntDatum(pgTypeCollationForOID(e.OID)), // 29 typcollation (PG-canonical; must match attcollation, slice 188)
 		executor.NullDatum,                                 // 30 typdefaultbin
@@ -508,7 +627,37 @@ func pgTypeBootstrapEntryMap() map[uint32]pgTypeEntry {
 			allMap[e.OID] = e
 		}
 	}
+	// M0133-S1: the information_schema domains + their array peers are seeded
+	// into the heap but referenced by NO nailed attr (they are types of the
+	// not-yet-on-disk information_schema views), so the loops above miss them.
+	// They must be in the entry map so the heap writer and both index
+	// bootstrappers cover them; absent this, a hosted PG dies with
+	// `type with OID 13287 does not exist` the first time a domain resolves.
+	for _, oid := range pgTypeInformationSchemaDomainOIDs() {
+		if _, alreadyIn := allMap[oid]; alreadyIn {
+			continue
+		}
+		if e, ok := pgTypeCanonical(oid); ok {
+			allMap[e.OID] = e
+		}
+	}
 	return allMap
+}
+
+// pgTypeInformationSchemaDomainOIDs returns the ten initdb-assigned pg_type
+// OIDs of the information_schema domains and their array peers (M0133-S1),
+// measured against a fresh PG 18.3 (information_schema.sql runs after
+// bootstrap, so these come from the post-bootstrap OID counter, not
+// pg_type.dat). Kept as one list so pgTypeBootstrapEntryMap and any guard over
+// the bootstrap set share the same source.
+func pgTypeInformationSchemaDomainOIDs() []uint32 {
+	return []uint32{
+		13286, 13287, // _cardinal_number, cardinal_number
+		13289, 13290, // _character_data, character_data
+		13291, 13292, // _sql_identifier, sql_identifier
+		13297, 13298, // _time_stamp, time_stamp
+		13299, 13300, // _yes_or_no, yes_or_no
+	}
 }
 
 func bootstrapPgTypeTuples(dataDir string) (map[uint32]heapTID, error) {

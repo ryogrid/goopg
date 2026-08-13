@@ -1350,6 +1350,24 @@ func Init(opts Options) error {
 	if err := bootstrapToastRelationFiles(abs, pgRewriteToastChunks); err != nil {
 		return fmt.Errorf("goopg init: toast relation files: %w", err)
 	}
+	// M0133-S1: seed the two information_schema domain CHECK constraints into
+	// pg_constraint (overwriting the empty heap) and populate its three
+	// indexes (2665/2666/2667). Without these rows a hosted PG validates
+	// cardinal_number/yes_or_no as unconstrained (it reads domain constraints
+	// through pg_constraint_contypid_index 2666, which stayed bootstrap-empty).
+	pgConstraintTIDs, err := bootstrapPgConstraintTuples(abs)
+	if err != nil {
+		return fmt.Errorf("goopg init: pg_constraint tuples: %w", err)
+	}
+	if err := bootstrapPgConstraintOidIndex(abs, pgConstraintTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_constraint_oid_index: %w", err)
+	}
+	if err := bootstrapPgConstraintContypidIndex(abs, pgConstraintTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_constraint_contypid_index: %w", err)
+	}
+	if err := bootstrapPgConstraintRelidTypidNameIndex(abs, pgConstraintTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_constraint_relid_typid_name_index: %w", err)
+	}
 	// M0106-0010 step 3w: write an empty heap page for every mapped local
 	// catalog that lacks a dedicated bootstrapper (pg_aggregate=2600,
 	// pg_type=1247, pg_namespace=2615, …). Without these files PG's
@@ -1547,6 +1565,7 @@ func bootstrapSharedCatalogPlaceholders(dataDir string) error {
 //	2602 pg_amop            (bootstrapPgAmopTuples)
 //	2603 pg_amproc          (bootstrapPgAmprocTuples)
 //	2605 pg_cast            (bootstrapPgCastTuples)
+//	2606 pg_constraint      (bootstrapPgConstraintTuples, M0133-S1)
 //	2610 pg_index           (bootstrapPgIndexTuples)
 //	2612 pg_language        (bootstrapPgLanguageTuples)
 //	2615 pg_namespace       (bootstrapPgNamespaceTuples)
@@ -1561,7 +1580,6 @@ func mappedLocalCatalogPlaceholderOIDs() []uint32 {
 	return []uint32{
 		826,  // pg_default_acl (M0106-0010 step 3ak)
 		2604, // pg_attrdef
-		2606, // pg_constraint
 		2608, // pg_depend
 		2609, // pg_description
 		2611, // pg_inherits
@@ -2480,13 +2498,20 @@ type pgNamespaceEntry struct {
 	NspOwner uint32
 }
 
-// pgNamespaceInitialEntries returns the three namespaces PG18 initdb creates:
-// pg_catalog (11), pg_toast (99), and public (2200).
+// pgNamespaceInitialEntries returns the four namespaces a PG18 initdb produces:
+// the three bootstrap namespaces pg_catalog (11), pg_toast (99), public (2200),
+// plus information_schema (13273), which initdb creates AFTER bootstrap by
+// running information_schema.sql (so its OID comes from the post-bootstrap
+// counter at FirstUnpinnedObjectId = 12000, not a .dat file — measured against
+// a fresh PG 18.3, see catalog/bootstrap_namespace_oid_test.go). M0133-S1 lands
+// it atomically with its domains: a hosted PG must never observe a namespace
+// without its types.
 func pgNamespaceInitialEntries() []pgNamespaceEntry {
 	return []pgNamespaceEntry{
 		{OID: 11, NspName: "pg_catalog", NspOwner: 10},
 		{OID: 99, NspName: "pg_toast", NspOwner: 10},
 		{OID: 2200, NspName: "public", NspOwner: 10},
+		{OID: 13273, NspName: "information_schema", NspOwner: 10},
 	}
 }
 
@@ -2499,8 +2524,9 @@ func pgNamespaceRow(e pgNamespaceEntry) executor.Row {
 	}
 }
 
-// bootstrapPgNamespaceTuples writes pg_catalog(11)/pg_toast(99)/public(2200)
-// rows to base/{1,5}/2615 so PG's NAMESPACENAME and NAMESPACEOID syscache
+// bootstrapPgNamespaceTuples writes pg_catalog(11)/pg_toast(99)/public(2200)/
+// information_schema(13273) rows to base/{1,5}/2615 so PG's NAMESPACENAME and
+// NAMESPACEOID syscache
 // lookups find the namespaces via pg_namespace_nspname_index (2684) and
 // pg_namespace_oid_index (2685). Without these rows, any schema-qualified
 // relation lookup (e.g. SELECT … FROM pg_catalog.pg_stat_wal_receiver) fails

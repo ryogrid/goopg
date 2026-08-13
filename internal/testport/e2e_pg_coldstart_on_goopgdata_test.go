@@ -259,6 +259,7 @@ func TestE2E_PGColdStartOnGoopgDataDir(t *testing.T) {
 
 	assertNailedSystemViewsAreEvaluable(t, pg, goopgDir)
 	assertNonCorpusSystemViewIsStillAbsent(t, pg)
+	assertInformationSchemaDomainsResolvable(t, pg, goopgDir)
 	assertHostedPGSeesPgRewriteToastRelation(t, pg)
 
 	// Row-level reads over user tables. S4.4 originally carried no view
@@ -1029,12 +1030,15 @@ func assertNailedSystemViewsAreEvaluable(t *testing.T, pg *pgcluster.Cluster, go
 //
 // So the probe crosses into the next slice's territory instead (F27). S9.4's
 // subject, `information_schema`, is absent one level lower than any predecessor
-// — not a view goopg failed to seed but a NAMESPACE goopg never bootstraps at
-// all (internal/initdb/initdb.go seeds exactly three: pg_catalog, public,
-// pg_toast). That makes information_schema.tables both a valid non-corpus
-// relation today and the natural fail-when-fixed tripwire for S9.4: the day
-// goopg seeds the information_schema namespace and its 65 views, this
-// assertion fails and whoever lands that slice must retire it.
+// — not a view goopg failed to seed but a NAMESPACE goopg never bootstrapped at
+// all when this probe was first pointed here (internal/initdb/initdb.go seeded
+// exactly three: pg_catalog, public, pg_toast). M0133-S1 changed that — it
+// seeded the information_schema NAMESPACE (13273) plus the five domains and two
+// domain CHECK constraints — but NOT the 65 views, so `information_schema.tables`
+// (a view, M0133-S4's work) still fails 42P01 and this probe stays green. The
+// day S4 seeds `tables` itself, this assertion fails and whoever lands that
+// slice must re-point it (the domains are asserted separately by
+// assertInformationSchemaDomainsResolvable).
 func assertNonCorpusSystemViewIsStillAbsent(t *testing.T, pg *pgcluster.Cluster) {
 	t.Helper()
 	// M0131-S9.3f re-pointed this from pg_seclabels (adopted by that slice,
@@ -1063,6 +1067,52 @@ func assertNonCorpusSystemViewIsStillAbsent(t *testing.T, pg *pgcluster.Cluster)
 		t.Errorf("hosted PG rejected %s, but NOT with the expected 42P01 "+
 			"undefined_table — a non-corpus view is supposed to be missing from "+
 			"the pg_class heap entirely:\n%s", view, out)
+	}
+}
+
+// assertInformationSchemaDomainsResolvable is M0133-S1's acceptance probe: a
+// hosted PG cold-started on a goopg $PGDATA must resolve the information_schema
+// namespace (13273) and its five domains, and the two domain CHECK constraints
+// must actually ENFORCE (not merely exist). goopg seeds the namespace + domains
+// + array peers + the two pg_constraint rows in one bootstrap step; this probe
+// is what distinguishes "seeded" from "a namespace that exists and is empty".
+func assertInformationSchemaDomainsResolvable(t *testing.T, pg *pgcluster.Cluster, goopgDir string) {
+	t.Helper()
+	// Resolvability: cast succeeds and format_type names the domain by OID.
+	for _, tc := range []struct {
+		query string
+		want  string
+	}{
+		{`SELECT 'abc'::information_schema.sql_identifier`, "abc"}, // over name (19), no CHECK
+		{`SELECT 5::information_schema.cardinal_number`, "5"},      // over int4 (23)
+		{`SELECT 'YES'::information_schema.yes_or_no`, "YES"},      // over varchar(3)
+		{`SELECT format_type(13287, NULL)`, "information_schema.cardinal_number"}, // domain on disk, schema-qualified (not in search_path)
+		{`SELECT typtype FROM pg_type WHERE oid = 13287`, "d"},                       // and it is a domain
+	} {
+		got := s4Scalar(t, pg, pgLogPathFor(goopgDir), tc.query)
+		if got != tc.want {
+			t.Errorf("hosted PG %q = %q, want %q", tc.query, got, tc.want)
+		}
+	}
+	// Enforcement: the two CHECKs must reject their violating values. The
+	// failure text names the constraint, proving it was read from pg_constraint
+	// via pg_constraint_contypid_index (2666), not merely absent.
+	for _, tc := range []struct {
+		query string
+		name  string
+	}{
+		{`SELECT (-1)::information_schema.cardinal_number`, "cardinal_number_domain_check"},
+		{`SELECT 'MAYBE'::information_schema.yes_or_no`, "yes_or_no_check"},
+	} {
+		out, err := pgQueryScalarAllowError(pg, tc.query)
+		if err == nil {
+			t.Errorf("hosted PG accepted %s (want a domain CHECK violation)", tc.query)
+			continue
+		}
+		if !strings.Contains(out, "violates check constraint") || !strings.Contains(out, tc.name) {
+			t.Errorf("hosted PG rejected %s, but not with the expected check-constraint "+
+				"violation naming %q:\n%s", tc.query, tc.name, out)
+		}
 	}
 }
 
