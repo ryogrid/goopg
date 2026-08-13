@@ -1,17 +1,18 @@
-# M0133-S4 — `information_schema` views (65, tranche 1 = 33 of 33)
+# M0133-S4 — `information_schema` views (65, tranches 1–2 = 43 of 65)
 
-**Status:** accepted — tranche 1 COMPLETE 2026-08-14 (all 33 catalog-direct leaves).
+**Status:** accepted — tranche 1 COMPLETE 2026-08-14 (33 catalog-direct leaves);
+tranche 2 COMPLETE 2026-08-14 (10 TOAST views).
 **Milestone:** M0133 (`information_schema` on disk), slice S4.
 **Supersedes:** S9.4d in `0131-0009-system-view-corpus-widening.md` §"Successor decomposition".
 
 ## What landed
 
-The first tranche of the 65 `information_schema` views — **all 33
-catalog-direct leaves** — seeded on disk so a hosted PG 18.3 cold-started on a
-goopg `$PGDATA` resolves and **evaluates** `SELECT * FROM
-information_schema.<view>` for each. The slice reuses the M0131-S9
-capture/pin/regen loop unchanged (Option-A identity pinning), with one new
-generator and one forced btree fix (below).
+The first two tranches of the 65 `information_schema` views — **all 33
+catalog-direct leaves plus the 10 catalog-direct TOAST views** — seeded on disk
+so a hosted PG 18.3 cold-started on a goopg `$PGDATA` resolves and
+**evaluates** `SELECT * FROM information_schema.<view>` for each. The slice
+reuses the M0131-S9 capture/pin/regen loop unchanged (Option-A identity
+pinning), with one new generator and two forced fixes (below).
 
 Four of the 33 landed one loop later, by a **catalog-descriptor-completion**
 slice (2026-08-14), not a view-capture problem — their ev_action blobs are
@@ -30,7 +31,7 @@ bootstrap-survival seeds:
   index 2701's pre-existing `indkey={2,4}` (tgname at attnum 4) with the
   descriptor.
 
-## Why 33 and not 65
+## Why 43 and not 65
 
 All three blockers that could have gated S4 were cleared before this slice: S2's
 11 helper functions (the `:funcid` surface), S3's data tables (the bulk-heap-load
@@ -41,10 +42,17 @@ those on disk, the 65 views split cleanly into four tranches by what their
 
 | tranche | criterion | count |
 |---|---|---|
-| **1 (this slice)** | catalog-direct, no in-band `:relid`, no in-band `:funcid`, stored ≤ 8000 B | 33 (4 landed a loop later by the descriptor-completion slice) |
-| 2 | TOAST (stored > 8000 B — the 11 F33 values) | 11 |
-| 3 | helper-function (`:funcid` 13274..13285) | 4 (`key_column_usage`, `parameters`, `sequences`, `triggered_update_columns`) |
-| 4 | view-on-view (`:relid` in 13293..13621) + `element_types`/`data_type_privileges` | 17 |
+| **1 (done)** | catalog-direct, no in-band `:relid`, no in-band `:funcid`, stored ≤ 8000 B | 33 (4 landed a loop later by the descriptor-completion slice) |
+| **2 (done)** | catalog-direct, stored > 8000 B (TOAST) | 10 (`attributes`, `check_constraints`, `column_privileges`, `columns`, `constraint_column_usage`, `domains`, `referential_constraints`, `routines`, `transforms`, `usage_privileges`) |
+| 3 | helper-function (`:funcid` 13274..13285), stored ≤ 8000 B | 4 (`key_column_usage`, `parameters`, `sequences`, `triggered_update_columns`) |
+| 4 | view-on-view (`:relid` in 13293..13621) | 18 |
+
+The 11 F33 over-budget values split 10/1: ten are catalog-direct (tranche 2) and
+`element_types` — the eleventh — is view-on-view (it embeds `:relid` 13553
+`data_type_privileges`), so it belongs to tranche 4. Tranche 4 counts 18, not the
+17 first estimated at filing: the 16 dependency edges plus the `data_type_privileges`
+chain yield 18 dependent views once `_pg_user_mappings` (a base *and* a dependent)
+is counted once.
 
 ## Measured object graph
 
@@ -147,17 +155,23 @@ unchanged.
   `TestPgRewriteInitialEntriesContainsPgStatWalReceiverReturn` /
   `TestBootstrapPgRewriteLeafIndicesWriteBothFiles` — count/coverage checks
   updated for the +33 rows.
-- E2E `assertInformationSchemaViewsEvaluable` — a hosted PG resolves each of the
-  33 to its pinned OID and evaluates `SELECT * FROM … LIMIT 0`. The absence probe
-  `assertNonCorpusSystemViewIsStillAbsent` is re-pointed from `tables` (now
-  adopted) to `columns` (the largest remaining view, tranche 2/3).
+- E2E `assertInformationSchemaViewsEvaluable` — a hosted PG resolves each adopted
+  view to its pinned OID and evaluates `SELECT * FROM … LIMIT 0`. The absence
+  probe `assertNonCorpusSystemViewIsStillAbsent` is re-pointed from `tables`
+  (adopted in tranche 1) to `columns` (tranche 2) to `element_types` (tranche 4).
+- Tranche 2 also extends `TestPgRewriteEvActionDatumSwitchesRepresentation`'s
+  `wantToasted` map (+10 rule OIDs), `TestPgRewriteToastPairIndexRowAndFiles`'s
+  page count (2838: 12 → 31), and E2E `assertHostedPGSeesPgRewriteToastRelation`'s
+  `wantChunks` (+10 `chunk_id/count/bytes` rows).
 
 ## Remaining (later tranches)
 
-Tranches 2–4 above. Tranche 2 (TOAST) needs no new mechanism — the 11 over-budget
-values externalise through the existing `DECLARE_TOAST(pg_rewrite, 2838, 2839)`
-chunk writer (`pgRewriteRowToasted` already collects chunks). Tranche 3 needs the
-`_pg_*` funcids to resolve (S2's pinned helpers). Tranche 4 is ordered
-base-before-dependent by capture guard #4; its base views (`attributes`,
-`columns`, `domains`, `enabled_roles`, …) land in tranches 2–3, so each is pinned
-before its dependents are captured.
+Tranches 3–4 above. Tranche 2 needed no new mechanism — the ten over-budget
+values externalised through the existing `DECLARE_TOAST(pg_rewrite, 2838, 2839)`
+chunk writer (`pgRewriteRowToasted` already collects chunks), and the capture
+guard #5 verified each against the oracle's `pg_toast_2618` chunks (chunk_id =
+rule OID + 1). Tranche 3 needs the `_pg_*` funcids to resolve (S2's pinned
+helpers, already on disk — the four helper-function views are ≤ 8000 B and carry
+no `:relid`). Tranche 4 is ordered base-before-dependent by capture guard #4; its
+base views (`attributes`, `columns`, `domains`, `enabled_roles`, …) landed in
+tranches 1–2, so each is pinned before its dependents are captured.

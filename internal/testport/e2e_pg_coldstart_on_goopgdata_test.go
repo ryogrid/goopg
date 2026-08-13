@@ -1046,11 +1046,12 @@ func assertNonCorpusSystemViewIsStillAbsent(t *testing.T, pg *pgcluster.Cluster)
 	// M0131-S9.3f re-pointed this from pg_seclabels (adopted by that slice,
 	// which bootstrapped pg_seclabel 3596 and pg_largeobject_metadata 2995)
 	// to information_schema.tables. M0133-S4 adopted tables (its first tranche),
-	// so the probe is re-pointed to information_schema.columns — the largest
-	// remaining view (24201 B stored, over the inline budget) and one that also
-	// depends on the _pg_* helper functions, so it lands in a later tranche and
-	// fails QUIETLY with 42P01 until then.
-	const view = "information_schema.columns"
+	// then columns (its second), so the probe is re-pointed to
+	// information_schema.element_types — the largest remaining view (10956 B
+	// stored, over the inline budget), and a tranche-4 view-on-view (it embeds
+	// :relid 13553 data_type_privileges), so it fails QUIETLY with 42P01 until
+	// the last tranche lands.
+	const view = "information_schema.element_types"
 	out, err := pgQueryScalarAllowError(pg, "SELECT * FROM "+view+" LIMIT 0")
 	if err == nil {
 		t.Errorf("hosted PG evaluated %s, which is NOT in the on-disk corpus "+
@@ -1179,8 +1180,10 @@ func assertInformationSchemaDataTablesReadable(t *testing.T, pg *pgcluster.Clust
 // incomplete goopg catalog descriptors (character_sets, collations,
 // collation_character_set_applicability read pg_collation cols 9–12; triggers
 // reads pg_trigger cols 3/9–19) landed with the descriptor-completion slice.
-// The remaining 32 (TOAST, helper-function, and view-on-view) land in later
-// tranches.
+// Tranche 2 (2026-08-14) adds the ten catalog-direct TOAST views, whose stored
+// ev_action exceeds the 8000 B inline budget and is externalised into
+// pg_toast_2618 by the M0131-S20.2 writer. The remaining 22 (helper-function,
+// and view-on-view) land in tranches 3–4.
 func informationSchemaViewProbeSet() []struct {
 	view string
 	oid  string
@@ -1191,28 +1194,38 @@ func informationSchemaViewProbeSet() []struct {
 	}{
 		{"information_schema.information_schema_catalog_name", "13293"},
 		{"information_schema.applicable_roles", "13302"},
+		{"information_schema.attributes", "13311"},
 		{"information_schema.character_sets", "13316"},
 		{"information_schema.check_constraint_routine_usage", "13321"},
+		{"information_schema.check_constraints", "13326"},
 		{"information_schema.collations", "13331"},
 		{"information_schema.collation_character_set_applicability", "13336"},
 		{"information_schema.column_column_usage", "13341"},
 		{"information_schema.column_domain_usage", "13346"},
+		{"information_schema.column_privileges", "13351"},
 		{"information_schema.column_udt_usage", "13356"},
+		{"information_schema.columns", "13361"},
+		{"information_schema.constraint_column_usage", "13366"},
 		{"information_schema.constraint_table_usage", "13371"},
 		{"information_schema.domain_constraints", "13376"},
 		{"information_schema.domain_udt_usage", "13381"},
+		{"information_schema.domains", "13385"},
 		{"information_schema.enabled_roles", "13390"},
+		{"information_schema.referential_constraints", "13404"},
 		{"information_schema.routine_column_usage", "13413"},
 		{"information_schema.routine_privileges", "13418"},
 		{"information_schema.routine_routine_usage", "13427"},
 		{"information_schema.routine_sequence_usage", "13432"},
 		{"information_schema.routine_table_usage", "13437"},
+		{"information_schema.routines", "13442"},
 		{"information_schema.schemata", "13447"},
 		{"information_schema.table_constraints", "13476"},
 		{"information_schema.table_privileges", "13481"},
 		{"information_schema.tables", "13490"},
+		{"information_schema.transforms", "13495"},
 		{"information_schema.triggers", "13505"},
 		{"information_schema.udt_privileges", "13510"},
+		{"information_schema.usage_privileges", "13519"},
 		{"information_schema.user_defined_types", "13528"},
 		{"information_schema.view_column_usage", "13533"},
 		{"information_schema.view_routine_usage", "13538"},
@@ -1330,6 +1343,17 @@ func assertHostedPGSeesPgRewriteToastRelation(t *testing.T, pg *pgcluster.Cluste
 		"12067/6/11089",  // pg_stats_ext_exprs   (upstream: 6 / 11481) — M0131-S9.3g
 		"12103/18/34093", // pg_seclabels         (upstream: 18 / 35379) — M0131-S9.3f
 		"12178/6/10125",  // pg_statio_all_tables (upstream: 6 / 10475)
+		// M0133-S4 tranche 2 — the ten information_schema TOAST views.
+		"13315/7/13160",  // attributes           (upstream: 7 / 13608)
+		"13330/8/15510",  // check_constraints    (upstream: 9 / 16059)
+		"13355/6/10396",  // column_privileges    (upstream: 6 / 10776)
+		"13365/12/23386", // columns              (upstream: 13 / 24201)
+		"13370/5/8502",   // constraint_column_usage (upstream: 5 / 8878)
+		"13389/5/8110",   // domains              (upstream: 5 / 8356)
+		"13408/7/13086",  // referential_constraints (upstream: 7 / 13463)
+		"13446/5/9731",   // routines             (upstream: 6 / 10091)
+		"13499/10/18840", // transforms           (upstream: 10 / 19659)
+		"13523/10/18574", // usage_privileges     (upstream: 10 / 19211)
 	}
 	gotChunks := pgQueryColumn(t, pg,
 		"SELECT chunk_id::text || '/' || count(*)::text || '/' || sum(length(chunk_data))::text "+
