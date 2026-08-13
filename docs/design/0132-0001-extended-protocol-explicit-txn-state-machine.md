@@ -276,3 +276,60 @@ the simple path's placement); both are pinned by tests and carry a ledger row.
    block, but a constant-only select is answered normally. PG rejects everything
    except `COMMIT`/`ROLLBACK`/`ROLLBACK TO`.
    Test: `TestM0132S1_ConstantSelectBypassesTheAbortedBlockGate`.
+
+## 8. S2 step 1 record — the extraction landed, behaviour-preserving (2026-08-13, HEAD `49382001`)
+
+S2 is a two-step slice, and this is step 1: **the extraction, with the simple
+path as its only caller.** No extended behaviour is switched on, so the
+land-together rule (S2+S3+S4+S5 in one commit) is not touched — that rule
+governs the moment the extended path starts driving the machine, and D1 above
+explicitly requires the refactor be "proven green **before** S2's new behaviour
+is switched on". A pure extraction landing alone opens no hole: it cannot,
+because it changes nothing observable.
+
+**What landed.** `internal/server/txn_verb.go`. The 289-line arm at
+`dispatch.go:2692-2984` is now 17 lines that render an outcome; the machine is
+`(*Server).applyTransactionVerb(ctx, connTx, txNode, autoCommitPtr)
+txnVerbOutcome`.
+
+**One correction to D1's sketch.** The sketch returned `(tag string, err
+error)`. That signature cannot carry the arm's real outputs, and discovering
+this is what makes the extraction faithful rather than approximate:
+
+- **The 25P01 WARNING is not an error.** `COMMIT`/`ROLLBACK` outside a block
+  emits `WriteNoticeResponse` *and then* a success tag (`:2944-2951`,
+  `:2973-2980`). A `(tag, err)` pair has nowhere to put "succeeded, but notice
+  first", so it would have been dropped or promoted to an error. It is now
+  `txnVerbOutcome.Warn`, rendered by `noTransactionInProgressNotice()`.
+- **The errors carry structured fields, not just text.** The deferred-check
+  failure passes DETAIL and POSITION, and the SSI failure passes DETAIL + HINT
+  with a bare primary message (predicate.c parity) — a plain `error` loses all
+  of it, and the SQLSTATE with it (23503 vs 23505 vs 23P01 vs 40001 comes from
+  the `ExecError`'s own `Code`). It is now `*txnVerbError{Code, Msg, Fields}`.
+- **"Not handled" is a third outcome, distinct from success and failure.**
+  SAVEPOINT / ROLLBACK TO / RELEASE fall *through* to `BuildFastIterator`
+  (M0097-0023). `Handled: false` says so explicitly. This is also the hook S10
+  needs: its ruling ("implement, or `0A000` on the extended path") is a decision
+  about what the extended caller does with `Handled == false`, and having the
+  case named means the extended path cannot silently inherit today's bare-tag
+  bug wearing a different verb.
+
+**One structural change inside the extraction, deliberate.** The five terminal
+paths of the arm each repeated an identical seven-line teardown (enum-DDL undo,
+`connTx.End()`, `EndLocalTransaction`, five pending-queue clears). They are now
+one `(*Server).endExplicitBlock`. This is the only edit that is not a
+mechanical move, and it is the one that makes "all five paths tear down
+identically" checkable by reading rather than by diffing five copies.
+
+**Gates run:** `go build ./...` and `go vet ./internal/server/` clean; `go test
+./internal/server/` PASS (38 s); `go test ./internal/executor/` PASS; `go test
+-run TestPort_Isolation ./internal/testport/` PASS (413 s — the D-002 gate S2
+names, and the one that would catch a dropped SSI or deferred-check path);
+`RALPH_PRECOMMIT_SCOPE=units` and the pgbench smoke via the commit hook.
+
+**Next (step 2, and it is the land-together commit):** switch
+`dispatch_extended.go:110-112` to call `applyTransactionVerb`, make `:134-139` /
+`:361-365` / the `:143-150` rollback defer conditional on `connTx.InExplicit()`
+(S3), assert the deferred sequence arrives on the extended COMMIT (S4), add the
+missing `connTx.Fail()` call site (S5) — and flip
+`m0132ExtendedBlocksLanded` to `true` in the same commit.
