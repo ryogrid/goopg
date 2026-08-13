@@ -1,0 +1,32 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_begin s1_insert s2_read s1_commit s2_read
+step s1_begin: BEGIN;
+step s1_insert: INSERT INTO mixed_blk VALUES (1);
+step s2_read: SELECT id FROM mixed_blk;
+id
+--
+(0 rows)
+
+step s1_commit: COMMIT;
+step s2_read: SELECT id FROM mixed_blk;
+id
+--
+ 1
+(1 row)
+
+
+starting permutation: s1_begin s1_insert s2_read s1_rollback s2_read
+step s1_begin: BEGIN;
+step s1_insert: INSERT INTO mixed_blk VALUES (1);
+step s2_read: SELECT id FROM mixed_blk;
+id
+--
+(0 rows)
+
+step s1_rollback: ROLLBACK;
+step s2_read: SELECT id FROM mixed_blk;
+id
+--
+(0 rows)
+

@@ -126,6 +126,31 @@ func TestPort_IsolationReadWriteUnique(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/read-write-unique.spec")
 }
 
+// TestPort_IsolationMixedProtocolBlock exercises the M0132-S8 goopg-owned spec
+// (internal/testport/specs/mixed-protocol-block.spec, expected output captured
+// from PG 18.3): a block opened by one session is invisible to a second session
+// until COMMIT and vanishes on ROLLBACK. It is the D-002 half of the S8 gate —
+// the cross-session SEMANTIC contract of the block the mixed driver shape (BEGIN
+// via simple protocol, parameterised DML via extended, COMMIT/ROLLBACK via
+// simple) forms.
+//
+// The spec lives under internal/testport/specs/ (not postgres/src/test/isolation/
+// specs/) because ./postgres is the read-only oracle and DiscoverIsolationSpecs
+// only globs the upstream tree, so a goopg-authored spec cannot be added there.
+// Its steps are argument-less and therefore run down the simple protocol: the
+// isolation runner faithfully reproduces upstream isolationtester's PQexec
+// semantics, and the upstream spec format has no parameterised steps — so the
+// protocol interleaving itself is pinned by the server-level tests
+// (internal/server/extended_txn_mixed_test.go) and the lib/pq driver test
+// (extended_txn_mixed_driver_test.go), not by this spec.
+func TestPort_IsolationMixedProtocolBlock(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_mixed_protocol_block")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "internal/testport/specs/mixed-protocol-block.spec")
+}
+
 // TestPort_IsolationReadWriteUnique2 exercises read-write-unique-2: two SSI
 // transactions both probe for i=42 then INSERT; one must see a 40001 SSI
 // failure (overlapping) or a 23505 unique violation (serialized).
