@@ -7915,6 +7915,71 @@ func compareEq(a, b Datum) (Datum, error) {
 	return NewBoolDatum(false), nil
 }
 
+// stringFuncArgTypeName maps a non-string Datum kind to the type name in PG's
+// 42883 message for the string-length builtins ("function length(integer) does
+// not exist"). The same guard lives in the sibling `length` case. M0119-0006
+// (65th slice).
+func stringFuncArgTypeName(k DatumKind) string {
+	switch k {
+	case KindInt:
+		return "integer"
+	case KindNumeric:
+		return "numeric"
+	case KindBool:
+		return "boolean"
+	case KindTime:
+		return "timestamp"
+	}
+	return "unknown"
+}
+
+// declaredBpcharTypmod returns the declared typmod of a bpchar-family
+// (char/character/bpchar) argument expression, or 0 when the argument is not
+// bpchar-typed. PG's grammar gives bare `char`/`character` an implicit length
+// of 1 (gram.y CHARACTER opt_charset), so a missing typmod normalizes to 1 —
+// the same default synthesizeBareCharTypmod applies to casts and the bare-char
+// column type carries. Used by octet_length, whose PG implementation
+// (bpcharoctetlen) returns the blank-PADDED datum size. M0119-0006 (65th slice).
+func declaredBpcharTypmod(e planner.Expr) int64 {
+	var name string
+	var typmod int64
+	switch n := e.(type) {
+	case *planner.ColumnRef:
+		if n.Type.IsArray {
+			return 0
+		}
+		name = n.Type.Name
+		if len(n.Type.Args) > 0 {
+			typmod = n.Type.Args[0]
+		}
+	case *planner.CastExpr:
+		name = n.TargetType
+		typmod = n.Typmod
+	case *planner.FuncCall:
+		// coalesce/greatest/least/nullif take the first argument's type
+		// (planner.exprType), so octet_length(coalesce(charcol, '')) still sees
+		// the declared width.
+		switch strings.ToLower(n.Name) {
+		case "coalesce", "greatest", "least", "nullif":
+			if len(n.Args) > 0 {
+				return declaredBpcharTypmod(n.Args[0])
+			}
+		}
+		return 0
+	default:
+		return 0
+	}
+	switch strings.ToLower(name) {
+	case "char", "bpchar", "character":
+	default:
+		return 0
+	}
+	if typmod <= 0 {
+		return 1
+	}
+	return typmod
+}
+
 // evalFuncCall resolves a function name against the in-tree registry.
 // v0 is small: current_timestamp / now / current_date are the only
 // no-arg time functions pgbench needs; HammerDB TPC-H also uses
@@ -10227,7 +10292,44 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if s.Kind == KindBytes {
 				return Datum{Kind: KindInt, Int: int64(len(s.BytesValue()))}, nil
 			}
+			if s.Kind != KindString {
+				return Datum{}, &ExecError{Code: "42883",
+					Message: fmt.Sprintf("function octet_length(%s) does not exist", stringFuncArgTypeName(s.Kind)),
+					Hint:    "No function matches the given name and argument types. You might need to add explicit type casts.",
+					Pos:     x.Pos()}
+			}
+			// bpchar: PG's bpcharoctetlen returns the raw datum size, and PG
+			// stores bpchar blank-padded — octet_length('ab'::char(10)) is 10,
+			// not 2. goopg keeps bpchar trimmed in the datum (M0103-0007), so
+			// pad to the declared width first. M0119-0006 (65th slice).
+			if tm := declaredBpcharTypmod(x.Args[0]); tm > 0 {
+				t := catalog.Type{Name: "char", Args: []int64{tm}}
+				return Datum{Kind: KindInt, Int: int64(len(catalog.PadBpchar(t, s.StringValue())))}, nil
+			}
 			return Datum{Kind: KindInt, Int: int64(len(s.StringValue()))}, nil
+		}
+	case "bit_length":
+		// PG 18 defines bit_length as a SQL function, octet_length($1) * 8, for
+		// bytea (oid 1810) and text (oid 1811). There is NO bit_length(bpchar):
+		// it resolves through the implicit bpchar→text cast, which trims
+		// trailing spaces, so bit_length('ab'::char(10)) is 16 (2 bytes × 8),
+		// not 80. goopg's bpchar datum is already trimmed (M0103-0007), so the
+		// plain byte length below is the trimmed length. M0119-0006 (65th slice).
+		if len(x.Args) == 1 {
+			s, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || s.IsNull() {
+				return NullDatum, nil
+			}
+			if s.Kind == KindBytes {
+				return Datum{Kind: KindInt, Int: int64(8 * len(s.BytesValue()))}, nil
+			}
+			if s.Kind != KindString {
+				return Datum{}, &ExecError{Code: "42883",
+					Message: fmt.Sprintf("function bit_length(%s) does not exist", stringFuncArgTypeName(s.Kind)),
+					Hint:    "No function matches the given name and argument types. You might need to add explicit type casts.",
+					Pos:     x.Pos()}
+			}
+			return Datum{Kind: KindInt, Int: int64(8 * len(s.StringValue()))}, nil
 		}
 	case "upper":
 		if len(x.Args) == 1 {

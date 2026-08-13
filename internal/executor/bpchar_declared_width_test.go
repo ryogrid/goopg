@@ -331,3 +331,71 @@ func TestCoerceTextLikeDatumMeasuresCharactersNotBytes(t *testing.T) {
 		}
 	}
 }
+
+// TestOctetBitLengthRespectBpcharDeclaredWidth pins the 65th-slice fix: PG's
+// octet_length(bpchar) is bpcharoctetlen, which returns the blank-PADDED datum
+// size (postgres/src/backend/utils/adt/varchar.c), while bit_length(bpchar)
+// resolves through the implicit bpchar→text cast and therefore sees the TRIMMED
+// value × 8 (system_functions.sql: bit_length(text) = octet_length($1)*8).
+// Measured on PG 18.3: octet_length('ab'::char(10)) = 10 but
+// bit_length('ab'::char(10)) = 16. goopg stores bpchar trimmed (M0103-0007),
+// so octet_length pads up to the declared typmod and bit_length reads the
+// trimmed byte length directly. bit_length raised "function bit_length does not
+// exist" for EVERY argument before this slice.
+func TestOctetBitLengthRespectBpcharDeclaredWidth(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	cases := []struct {
+		sql  string
+		want int64
+	}{
+		// text / bytea baselines (unchanged by the fix).
+		{`select octet_length('abc')`, 3},
+		{`select bit_length('abc')`, 24},
+		{`select bit_length('\x01020304'::bytea)`, 32}, // 4 bytes × 8
+		{`select octet_length('\xaabb'::bytea)`, 2},
+		// bpchar is blank-padded in the datum for octet_length…
+		{`select octet_length('ab'::char(10))`, 10}, // pre-fix: 2 (trimmed)
+		{`select octet_length(''::char(10))`, 10},
+		{`select octet_length(''::char)`, 1},        // bare char is char(1)
+		{`select octet_length('ab'::char(1))`, 1},   // truncates then pads
+		{`select octet_length('あ'::char(5))`, 7},   // 3-byte rune + 4 pad spaces
+		// …but bit_length sees the trimmed value (the implicit bpchar→text cast
+		// that resolves bit_length(bpchar) trims trailing spaces).
+		{`select bit_length('ab'::char(10))`, 16}, // 2 bytes × 8, not 80
+		{`select bit_length('ab'::char(1))`, 8},
+		{`select bit_length(''::char)`, 0},
+		{`select bit_length('あ'::char(5))`, 24},
+		// An explicit bpchar→text cast trims for both.
+		{`select octet_length('ab'::char(10)::text)`, 2},
+		{`select bit_length('ab'::char(10)::text)`, 16},
+		// A bpchar-typed column/subquery column (ColumnRef.Type carries the
+		// declared width and typmod).
+		{`select octet_length(c) from (values ('ab'::char(10))) v(c)`, 10},
+		{`select bit_length(c) from (values ('ab'::char(10))) v(c)`, 16},
+		// coalesce keeps the bpchar type, so the width still applies.
+		{`select octet_length(coalesce(c, '')) from (values ('ab'::char(10))) v(c)`, 10},
+	}
+	for _, tc := range cases {
+		t.Run(tc.sql, func(t *testing.T) {
+			d, _ := byteaExprResult(t, ctx, tc.sql)
+			if d.Kind != KindInt || d.Int != tc.want {
+				t.Errorf("= %v (kind %d), want %d (PG 18.3)", d.Format(), d.Kind, tc.want)
+			}
+		})
+	}
+
+	// PG defines no octet_length/bit_length for non-string types: 42883. The
+	// pre-fix builtins silently answered 0 for these.
+	for _, sql := range []string{
+		`select octet_length(5)`,
+		`select bit_length(5)`,
+	} {
+		t.Run(sql, func(t *testing.T) {
+			if ee := byteaExprErr(t, ctx, sql); ee.Code != "42883" {
+				t.Errorf("%q: code = %q, want 42883", sql, ee.Code)
+			}
+		})
+	}
+}

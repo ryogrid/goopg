@@ -3860,6 +3860,36 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       vet` clean; UNITS pre-commit PASS; `scripts/tpch-spotcheck.sh` PASS
       (Q12=2/Q13=35); pgbench smoke via the hook. 1 ledger row resolved (1302).
       Design `0119-0006-interval-typmod-at-input.md` + README row.
+      **65th slice (2026-08-14): `octet_length()`/`bit_length()` on a `bpchar`
+      answer from the declared width, not the trimmed heap image.** Closes the
+      deferral the 57th slice filed (ledger row 1314). The four render
+      boundaries the 57th closed already held the column's `catalog.Type`, but
+      these two are EXPRESSION evaluations — the argument's declared type isn't
+      threaded to the builtin, so `octet_length('ab'::char(10))` answered 2
+      where PG 18.3 says 10, and `bit_length` had NO case at all (fell to the
+      `evalStoredRoutineFuncCall` fallback → "function does not exist").
+      New `declaredBpcharTypmod(e planner.Expr)` (expr.go) recovers the width
+      from a `ColumnRef`'s `Type.Args[0]` (array guarded), a `CastExpr`'s
+      `Typmod`, or the first arg of `coalesce`/`greatest`/`least`/`nullif`
+      (missing/`<=0` → 1 for bare `char`); `octet_length` then answers
+      `len(catalog.PadBpchar(...))` (upstream `bpcharoctetlen` measures the
+      PADDED stored image — `'あ'::char(5)` = 7). **`bit_length` is the
+      OPPOSITE**: it resolves through the implicit bpchar→text cast, which
+      trims trailing blanks (`bpchartotext`), so `bit_length('ab'::char(10))` =
+      16, NOT 80 — the row's "2 where PG says 10 for both" was wrong for
+      bit_length. New `bit_length` case (bytea = `8*len(Bytes)`, string =
+      `8*len(String)`, else 42883); both functions gain the `length` sibling's
+      non-string `42883` guard with PG-exact messages. 19 oracle-pinned cells
+      (incl. bare `''::char` 1/0, multibyte, `::text` cast-override twins,
+      column + coalesce sources, and both 42883 guards), E2E-verified on a live
+      goopg (5533) vs PG 18.3. Item stays UNCHECKED (standing slice-by-slice
+      cluster). Gates: `go build ./internal/...` clean; UNITS pre-commit run —
+      EVERY package PASS except the pre-existing foreign
+      `TestRegIdentifierInputResolvesRegtypeName` (untracked reg_identifier WIP
+      from a prior loop; `catalog.TypeNameToOID`'s `default: return OIDText`
+      fallback defeats its regtypein 42704 miss-path — unrelated to this slice;
+      the committed tree builds/tests clean without it). 1 ledger row resolved
+      (1314). Design `0119-0006-bpchar-octet-bit-length.md` + README row.
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
 
 - [x] **M0119-0010 — `char(N)` typmods are not restored per column on catalog
