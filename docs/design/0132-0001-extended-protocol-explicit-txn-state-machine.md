@@ -391,3 +391,47 @@ deferred-constraint set PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=35);
 confound, not a regression**: that snapshot predates M0127-P6.2's MHJ deletion
 (`4e08d4b7`), so every MHJ node it records now legitimately renders as a plain
 `Hash Join`, and S2 touches no planner code.
+
+## 10. S6 record — isolation level over the extended protocol (2026-08-13)
+
+D4's two inputs are resolved as follows.
+
+**(1) `BEGIN ISOLATION LEVEL <level>` — landed, and it was almost free.** D1's
+extraction carried the M0104-0008 block (txn_verb.go, "honour
+`txNode.IsolationLevel`") into `applyTransactionVerb`, so the extended BEGIN
+already parsed the level, rolled back the placeholder auto-commit transaction,
+re-began at the requested level, and re-captured the READ COMMITTED snapshot —
+identical to `dispatch.go:2709-2738`. The single missing piece was the
+connection's ProcArray slot: the simple path sets `ectx.ProcNum = connTx.ProcNum`
+(`dispatch.go:513`) but the extended path never did, so `applyTransactionVerb`'s
+re-begin called `TxnMgr.Begin(parsedLvl, ctx.ProcNum)` with `ctx.ProcNum == 0`.
+Two concurrent `BEGIN ISOLATION LEVEL SERIALIZABLE` blocks over this protocol
+therefore both re-began on slot 0 and the second aborted with
+`mvcc: unknown transaction` (C58000) — the same signature S7's proc-slot slice
+records. Fix: `dispatch_extended.go` sets `ectx.ProcNum = procNum` next to
+`ectx.Tx = tx`, the extended sibling of `dispatch.go:513`. Proved load-bearing:
+reverting it to `0` turns the gate below red with exactly that `mvcc: unknown
+transaction`.
+
+**(2) Session-default isolation — ruled OUT OF SCOPE, parity-neutral.** Both
+dispatch paths still hardcode READ COMMITTED when they begin the auto-commit
+transaction (`dispatch.go:236`, `dispatch_extended.go:160`), so a non-default
+`default_transaction_isolation` (or `SET SESSION CHARACTERISTICS …`) is ignored
+by both. `execBegin` (`operators_tx.go:70`) honours `Session.IsolationLevel()`
+and only the executor-routed BEGIN (SAVEPOINT-adjacent) reaches it. PG's own
+default is `read committed`, so goopg is correct for the default; the gap is a
+pre-existing, symmetric engine limitation, not an extended-protocol defect, and
+is left for a future milestone rather than implied-fixed by (1). The
+`dispatch_extended.go:119-123` comment D4 said this retires had already been
+replaced by the S2 refactor (those lines now carry the P6 Gather comment).
+
+**Gate.** `TestM0132S6_ExtendedSerializableBlockAbortsWriteSkew` opens both
+blocks of the canonical simple-write-skew permutation over the **extended**
+protocol and asserts the second committer aborts with 40001;
+`TestM0132S6_ExtendedReadCommittedBlockAllowsWriteSkew` is the READ COMMITTED
+control (same interleaving, no abort). The write-skew helper deliberately leaves
+the block OPEN so the caller interleaves the two COMMITs — a helper that
+committed each side inline would serialise the blocks into the no-overlap
+permutation and the gate would pass for the wrong reason. Gates run: `go test
+./internal/server/` PASS (all 8 S1 bar tests + the S4 deferred-FK probe + both
+S6 tests).

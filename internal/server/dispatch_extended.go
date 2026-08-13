@@ -199,6 +199,13 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	ectx.TxnMgr = s.cfg.TxnMgr
 	ectx.MultiXact = s.cfg.MultiXact
 	ectx.Tx = tx
+	// The connection's ProcArray slot. The simple path sets this from
+	// connTx.ProcNum (dispatch.go); the extended path must too, or
+	// applyTransactionVerb's `BEGIN ISOLATION LEVEL <level>` re-begin
+	// (txn_verb.go) lands the correctly-levelled transaction on slot 0 instead
+	// of the connection's own slot — so two concurrent SERIALIZABLE blocks
+	// opened over this protocol would collide there. M0132-S6.
+	ectx.ProcNum = procNum
 	ectx.Snap = snap
 	ectx.Params = datums
 	ectx.Checkpointer = s.cfg.Checkpointer
