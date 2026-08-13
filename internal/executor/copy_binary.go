@@ -226,22 +226,23 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 		b := make([]byte, 8)
 		binary.BigEndian.PutUint64(b, math.Float64bits(f))
 		return b, nil
-	case "oid", "regproc":
+	case "oid", "regproc", "regprocedure", "regclass", "regtype", "cid":
 		// M0119-0006 (54th slice): before this arm an `oid` column fell through
 		// to the default's KindInt escape and shipped EIGHT big-endian bytes.
 		// Upstream oidsend (postgres/src/backend/utils/adt/oid.c:71) is
 		// pq_sendint32 — exactly four — so every binary COPY of an oid column
 		// produced a stream a real PG client rejects with "incorrect binary data
-		// format" (CopyReadBinaryAttribute's pq_getmsgend). regproc shares the
-		// arm because regprocsend IS oidsend upstream ("Exactly the same as
-		// oidsend, so share code", regproc.c:208-212) — the same pairing the
-		// heap codec already uses.
-		v, err := pgUnsignedIDFromDatum(d, "oid", 32)
+		// format" (CopyReadBinaryAttribute's pq_getmsgend). The reg* family and
+		// cid share the arm because regclasssend/regtypesend/regproceduresend/
+		// regprocsend/cidsend are ALL oidsend upstream — pq_sendint32 over the
+		// 4-byte OID — the same pairing the heap codec already uses (Hard-won
+		// Rule #2). M0119-0006 (reg* family + cid 4-byte storage).
+		v, err := regIdentifierOIDFromDatum(d, strings.ToLower(t.Name))
 		if err != nil {
 			return nil, err
 		}
 		b := make([]byte, 4)
-		binary.BigEndian.PutUint32(b, uint32(v))
+		binary.BigEndian.PutUint32(b, v)
 		return b, nil
 	case "xid":
 		// xidsend (postgres/src/backend/utils/adt/xid.c:67) is pq_sendint32 over
@@ -492,17 +493,18 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 		}
 		f8 := math.Float64frombits(binary.BigEndian.Uint64(payload))
 		return floatTextDatum(PGFloatOut(f8, 64)), nil
-	case "oid", "regproc":
+	case "oid", "regproc", "regprocedure", "regclass", "regtype", "cid":
 		// Decode twin of the "oid"/"regproc" encode arm. Upstream oidrecv
-		// (oid.c:60) is pq_getmsgint(buf, sizeof(Oid)) and regprocrecv IS oidrecv
-		// (regproc.c:198-202); the binary COPY parser's pq_getmsgend makes any
-		// other length "incorrect binary data format". The Datum shape is the
-		// heap decode arm's — NewIntDatum over the UNSIGNED 32-bit value, so an
-		// oid that entered through binary COPY compares and indexes identically
-		// to the same oid entering through INSERT. Before this arm the default
-		// handed back the raw bytes as a STRING Datum (Hard-won Rule #2).
+		// (oid.c:60) is pq_getmsgint(buf, sizeof(Oid)) and every reg* recv and
+		// cidrecv IS oidrecv (regproc.c:198-202 etc.); the binary COPY parser's
+		// pq_getmsgend makes any other length "incorrect binary data format".
+		// The Datum shape is the heap decode arm's — NewIntDatum over the
+		// UNSIGNED 32-bit value, so an identifier that entered through binary
+		// COPY compares and indexes identically to the same one entering through
+		// INSERT. Before this arm the default handed back the raw bytes as a
+		// STRING Datum (Hard-won Rule #2).
 		if len(payload) != 4 {
-			return Datum{}, fmt.Errorf("oid: expected 4 bytes, got %d", len(payload))
+			return Datum{}, fmt.Errorf("%s: expected 4 bytes, got %d", strings.ToLower(t.Name), len(payload))
 		}
 		return NewIntDatum(int64(binary.BigEndian.Uint32(payload))), nil
 	case "xid":

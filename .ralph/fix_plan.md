@@ -3890,6 +3890,28 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       fallback defeats its regtypein 42704 miss-path — unrelated to this slice;
       the committed tree builds/tests clean without it). 1 ledger row resolved
       (1314). Design `0119-0006-bpchar-octet-bit-length.md` + README row.
+      **66th slice (2026-08-14): the reg* family and `cid` store as 4-byte OIDs,
+      and the regtypein 42704 miss-path fires.** Lands the untracked
+      `reg_identifier.go` WIP the 65th slice's gate note names as its only
+      failure (the `TypeNameToOID` OIDText fallback defeated the `oid != 0`
+      test, so `regIdentifierInput("no_such_type", "regtype")` resolved to
+      text's OID 25 instead of raising 42704). The heap codec's `"oid",
+      "regproc"` arms now cover `regprocedure`/`regclass`/`regtype`/`cid` (4-byte
+      LE, typalign 'i' — ledger row 1300's source); binary COPY shares the arm
+      (all their send/recv ARE oidsend/oidrecv upstream); the third physical
+      decoder `pgoDecodePhysicalValue` (internal/wal/pgoutput.go) gains the
+      same arm — before it read the 4-byte image through the varlena fall-through
+      (silent garbage), the sibling-pair gap this slice pins with
+      `pgoutput_reg_identifier_test.go`; and `coerceRowForConstraintChecks`
+      resolves a bare quoted name (`INSERT INTO t(r regclass) VALUES
+      ('mytable')`) to its OID via `regIdentifierInput` (regclassin/regtypein/
+      regprocin semantics, 42P01/42704/42883 on a miss) instead of handing the
+      numeric oid arm a name to misparse. regrole/regcollation stay varlena
+      (no name-resolution seam — see the 54th-slice ledger row). Gates:
+      `RALPH_PRECOMMIT_SCOPE=units` PASS (the regtype blocker is gone),
+      `TestPort_RegressSuite` PASS (346 s), `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2, Q13=35). Design: `docs/design/0119-0006-reg-identifier-family-storage.md`
+      + README row.
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
 
 - [x] **M0119-0010 — `char(N)` typmods are not restored per column on catalog

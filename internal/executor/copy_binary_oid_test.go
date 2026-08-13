@@ -29,7 +29,7 @@ var oidFamilyCols = []struct {
 	name  string
 	width int
 }{
-	{"oid", 4}, {"regproc", 4}, {"xid", 4}, {"xid8", 8},
+	{"oid", 4}, {"regproc", 4}, {"regprocedure", 4}, {"regclass", 4}, {"regtype", 4}, {"cid", 4}, {"xid", 4}, {"xid8", 8},
 }
 
 // Upstream send widths. A binary COPY field of any other length is "incorrect
