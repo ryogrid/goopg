@@ -3720,6 +3720,22 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       PASS. 1 ledger row resolved; 0 filed (the NULL-argument path is left
       unchanged and recorded as UNMEASURED in the resolved row's deferred column,
       not as a new deferral).
+      **60th slice (2026-08-13): `validateTypedLen` resolves its type instead of
+      prefix-matching it.** The deferral the 58th slice filed in its other ledger
+      row's `deferred` column (row 1318): a schema-qualified spelling
+      (`pg_catalog.varchar(5)`), a domain over `varchar(5)`, or whitespace
+      between the name and `(` (`varchar (5)`) silently validated NOTHING. Fixed
+      in `operators_pg_input_error_info.go`: `validateTypedLen` now parses the
+      type text (`parseTypeNameAndTypmod` → `stripTypeSchema` drops the schema,
+      the `(N)` typmod is parsed with whitespace tolerated), resolves it through
+      `catalog.TypeNameToOID` plus a `LookupDomain` follow-to-base
+      (`resolveLengthType`), and drives the width check off the resolved
+      `catalog.Type` through `coerceTextLikeDatum` — the sibling the 57th/58th
+      slices already converted to runes, so the two now share ONE rule (Hard-won
+      Rule #2). The `char`/`character`→`character(1)` and bare-`bpchar`→unbounded
+      grammar defaults are preserved. Item stays UNCHECKED (standing
+      slice-by-slice cluster). Gates: `go test ./internal/executor/` PASS;
+      `go build ./...` clean. 1 ledger row resolved (1318); 0 filed.
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
 
 - [x] **M0119-0010 — `char(N)` typmods are not restored per column on catalog

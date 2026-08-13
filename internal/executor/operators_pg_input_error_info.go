@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/planner"
@@ -171,7 +170,11 @@ func (o *pgInputErrorInfoOp) Next() (TupleSlot, error) {
 		message, sqlCode = validateInt2Vector(v)
 	default:
 		// varchar(N) / character varying(N) / char(N) — length validation. M0097-0003.
-		message, sqlCode = validateTypedLen(v, t)
+		var im *catalog.InMemory
+		if c, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			im = c
+		}
+		message, sqlCode = validateTypedLen(v, t, im, o.ctx.CurrentDatabaseOid)
 		// Check if it's a registered enum type. M0097-0071.
 		if message == "" {
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
@@ -221,43 +224,103 @@ func (o *pgInputErrorInfoOp) Next() (TupleSlot, error) {
 // validateTypedLen validates a string value against a length-constrained type
 // like varchar(N), char(N), character varying(N). Returns (message, code) on
 // error, ("", "") if valid. M0097-0003.
-func validateTypedLen(v, typStr string) (string, string) {
-	for _, pfx := range []string{"character varying(", "varchar("} {
-		if strings.HasPrefix(typStr, pfx) && strings.HasSuffix(typStr, ")") {
-			mid := typStr[len(pfx) : len(typStr)-1]
-			n, err := strconv.Atoi(mid)
-			if err != nil || n <= 0 {
-				return "", ""
-			}
-			// PostgreSQL's varcharin checks raw length (no trailing-space strip)
-			// in CHARACTERS, not bytes — varchar_input measures with
-			// pg_mbstrlen_with_len before comparing against maxlen
-			// (postgres/src/backend/utils/adt/varchar.c). Measured on PG 18.3:
-			// `pg_input_error_info('あいうえお','varchar(5)')` is all-NULL
-			// (accepted, 15 bytes), where a byte count raised a spurious 22001.
-			// Sibling of coerceTextLikeDatum's rune count (codec.go) — Hard-won
-			// Rule #2. M0119-0006 (58th slice).
-			if utf8.RuneCountInString(v) > n {
-				return fmt.Sprintf("value too long for type character varying(%d)", n), "22001"
-			}
-			return "", ""
-		}
+//
+// The type text is RESOLVED rather than prefix-matched: the name is parsed the
+// way a `::`-cast resolves it (schema qualification dropped, a `(N)` typmod
+// parsed with whitespace tolerated, user domains followed to their base type),
+// then the width check is driven off the resolved catalog.Type so it shares
+// coerceTextLikeDatum's rule outright (Hard-won Rule #2). M0119-0006 60th slice.
+func validateTypedLen(v, typStr string, im *catalog.InMemory, dbOid uint32) (string, string) {
+	name, typmod, hasTypmod := parseTypeNameAndTypmod(typStr)
+	if name == "" {
+		return "", ""
 	}
-	for _, pfx := range []string{"character(", "char(", "bpchar("} {
-		if strings.HasPrefix(typStr, pfx) && strings.HasSuffix(typStr, ")") {
-			mid := typStr[len(pfx) : len(typStr)-1]
-			n, err := strconv.Atoi(mid)
-			if err != nil || n <= 0 {
-				return "", ""
-			}
-			stripped := strings.TrimRight(v, " ")
-			if utf8.RuneCountInString(stripped) > n {
-				return fmt.Sprintf("value too long for type character(%d)", n), "22001"
-			}
-			return "", ""
+	typ, ok := resolveLengthType(name, im, dbOid, typmod, hasTypmod)
+	if !ok {
+		return "", ""
+	}
+	if _, err := coerceTextLikeDatum(typ, NewStringDatum(v)); err != nil {
+		if ee, ok := err.(*ExecError); ok {
+			return ee.Message, ee.Code
 		}
+		return err.Error(), "22001"
 	}
 	return "", ""
+}
+
+// parseTypeNameAndTypmod splits a (lowercased, trimmed) type string into its
+// bare name and an optional `(N)` length typmod. It tolerates the spellings the
+// old prefix match missed: a schema qualification (`pg_catalog.varchar(5)`) and
+// whitespace between the name and `(` (`varchar (5)`). A multi-argument typmod
+// (`numeric(10,2)`) or a non-positive/absent length leaves hasTypmod false and
+// the name untouched. M0119-0006.
+func parseTypeNameAndTypmod(typStr string) (name string, typmod int, hasTypmod bool) {
+	s := typStr
+	if strings.HasSuffix(s, ")") {
+		if i := strings.LastIndex(s, "("); i > 0 {
+			mid := strings.TrimSpace(s[i+1 : len(s)-1])
+			if n, err := strconv.Atoi(mid); err == nil && n > 0 {
+				return stripTypeSchema(strings.TrimSpace(s[:i])), n, true
+			}
+		}
+	}
+	return stripTypeSchema(s), 0, false
+}
+
+// stripTypeSchema drops a leading schema qualification (`pg_catalog.varchar`,
+// `public.mydomain`) down to the bare type/domain name. Built-in type names and
+// domain identifiers never contain a dot, so "after the last dot" is exact.
+func stripTypeSchema(name string) string {
+	if i := strings.LastIndex(name, "."); i >= 0 {
+		return name[i+1:]
+	}
+	return name
+}
+
+// resolveLengthType maps a resolved (bare, lowercased) type name to the
+// catalog.Type coerceTextLikeDatum checks, applying the grammar's implicit
+// length defaults the same way the cast/column-type path does: bare
+// `char`/`character` are character(1), bare `bpchar` and `varchar` are
+// unbounded. A user domain overrides the built-in name (its Base already
+// carries the resolved type and its own typmod). ok is false for any type that
+// is not length-constrained text. M0119-0006.
+func resolveLengthType(name string, im *catalog.InMemory, dbOid uint32, typmod int, hasTypmod bool) (catalog.Type, bool) {
+	if im != nil {
+		if dom, isDomain := im.LookupDomain(name, dbOid); isDomain {
+			// The base type already carries its declared length; a domain name
+			// has no further typmod of its own.
+			return dom.Base, true
+		}
+	}
+	oid := catalog.TypeNameToOID(name)
+	switch oid {
+	case catalog.OIDVarChar:
+		t := catalog.Type{Name: "varchar"}
+		if hasTypmod {
+			t.Args = []int64{int64(typmod)}
+		}
+		return t, true
+	case catalog.OIDBpChar:
+		// `char`/`character` are grammar-synthesized to bpchar with typmod 1
+		// (which is why coerceTextLikeDatum defaults them to 1 when Args is
+		// empty); bare `bpchar` spelled directly is typmod -1 (unbounded).
+		if name == "char" || name == "character" {
+			t := catalog.Type{Name: "char"}
+			if hasTypmod {
+				t.Args = []int64{int64(typmod)}
+			} else {
+				t.Args = []int64{1}
+			}
+			return t, true
+		}
+		t := catalog.Type{Name: "bpchar"}
+		if hasTypmod {
+			t.Args = []int64{int64(typmod)}
+		}
+		return t, true
+	default:
+		return catalog.Type{}, false
+	}
 }
 
 // (what "end" points to) in error messages, matching PG's exact output.

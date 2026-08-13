@@ -136,7 +136,7 @@ func TestValidateTypedLenMeasuresCharactersNotBytes(t *testing.T) {
 		{"ab   ", "char(2)"},
 	}
 	for _, tc := range accept {
-		if msg, code := validateTypedLen(tc.v, tc.typ); msg != "" || code != "" {
+		if msg, code := validateTypedLen(tc.v, tc.typ, nil, 0); msg != "" || code != "" {
 			t.Errorf("validateTypedLen(%q, %q) = (%q, %q), want it accepted", tc.v, tc.typ, msg, code)
 		}
 	}
@@ -148,13 +148,62 @@ func TestValidateTypedLenMeasuresCharactersNotBytes(t *testing.T) {
 		{"abcdef", "bpchar(5)", "character(5)"},
 	}
 	for _, tc := range reject {
-		msg, code := validateTypedLen(tc.v, tc.typ)
+		msg, code := validateTypedLen(tc.v, tc.typ, nil, 0)
 		if code != "22001" {
 			t.Errorf("validateTypedLen(%q, %q) code = %q, want 22001", tc.v, tc.typ, code)
 			continue
 		}
 		if !strings.Contains(msg, tc.want) {
 			t.Errorf("validateTypedLen(%q, %q) message %q, want it to name %q", tc.v, tc.typ, msg, tc.want)
+		}
+	}
+}
+
+// TestValidateTypedLenResolvesTypeText pins the 59th-slice fix: the type text
+// is RESOLVED (schema qualification, whitespace, domains) rather than
+// prefix-matched. Before the fix, every row below silently validated NOTHING
+// and reported the input as valid, where PG raises 22001.
+func TestValidateTypedLenResolvesTypeText(t *testing.T) {
+	cat := catalog.NewInMemory()
+	// A domain over varchar(3): its Base already carries Name+Args. Registered
+	// under dbOid 0 so the dbOid-0 LookupDomain below finds it (domains are
+	// keyed by (dbOid, name)).
+	if _, err := cat.RegisterDomain("nickname", catalog.Type{Name: "varchar", Args: []int64{3}}, false, 0); err != nil {
+		t.Fatalf("RegisterDomain: %v", err)
+	}
+
+	// Schema-qualified / whitespace-padded / domain spellings must all resolve
+	// to varchar(3) (or char(2)) and reject an over-long value.
+	reject := []struct{ v, typ, want string }{
+		{"abcd", "pg_catalog.varchar(3)", "character varying(3)"},
+		{"abcd", "public.varchar(3)", "character varying(3)"},
+		{"abcd", "varchar (3)", "character varying(3)"},
+		{"abcd", "character varying(3)", "character varying(3)"},
+		{"abcd", "nickname", "character varying(3)"}, // domain over varchar(3)
+		{"abc", "pg_catalog.char(2)", "character(2)"},
+	}
+	for _, tc := range reject {
+		msg, code := validateTypedLen(tc.v, tc.typ, cat, 0)
+		if code != "22001" {
+			t.Errorf("validateTypedLen(%q, %q) code = %q, want 22001", tc.v, tc.typ, code)
+			continue
+		}
+		if !strings.Contains(msg, tc.want) {
+			t.Errorf("validateTypedLen(%q, %q) message %q, want it to name %q", tc.v, tc.typ, msg, tc.want)
+		}
+	}
+
+	// The same spellings accept an in-range value, and a schema-qualified or
+	// whitespace-padded bare type still resolves (no length to check).
+	accept := []struct{ v, typ string }{
+		{"abc", "pg_catalog.varchar(3)"},
+		{"abc", "varchar (3)"},
+		{"abc", "nickname"}, // domain over varchar(3)
+		{"abcdef", "pg_catalog.text"},
+	}
+	for _, tc := range accept {
+		if msg, code := validateTypedLen(tc.v, tc.typ, cat, 0); msg != "" || code != "" {
+			t.Errorf("validateTypedLen(%q, %q) = (%q, %q), want it accepted", tc.v, tc.typ, msg, code)
 		}
 	}
 }
