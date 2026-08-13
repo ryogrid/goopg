@@ -1247,6 +1247,13 @@ func pgTypeArgsFromTypmod(baseOID uint32, typmod int64) []int64 {
 			return nil
 		}
 		return []int64{typmod}
+	case 1186: // interval: the packed INTERVAL_TYPMOD, stored raw. -1 (no
+		// modifier) yields nil; otherwise Args[0] is the packed value so the
+		// reloaded catalog rebuilds the column typmod the input sites read.
+		if typmod < 0 {
+			return nil
+		}
+		return []int64{typmod}
 	}
 	return nil
 }

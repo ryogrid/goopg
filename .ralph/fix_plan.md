@@ -3784,6 +3784,30 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       resolved (1286, 1289); 0 filed (the interval-column-typmod and probe-
       extraction residuals are already-ledgered). Design
       `0119-0006-time-typmod-rounding.md` + README row.
+      **63rd slice (2026-08-13): an `interval(N)` / `interval <field> [TO <lo>]
+      [(p)]` column ROUNDS/zeroes at INPUT via `AdjustIntervalForTypmod`.**
+      Closes the `AdjustIntervalForTypmod` column-typmod deferral row the 55th
+      slice filed. The interval typmod is a packed range+precision value
+      (`INTERVAL_TYPMOD`), so it had to become reachable before it could be
+      applied: `parseColumnType` did not parse `interval year to month` at all,
+      and the `interval(N)` it did parse was dropped to `atttypmod = -1` on disk.
+      Landed: `internal/pgdatetime/interval_typmod.go` `AdjustIntervalForTypmod`
+      (literal port of the `INTERVAL_MASK(field)` range switch + `IntervalScales`/
+      `IntervalOffsets` rounding + ±infinity no-op); `parseIntervalColumnQualifier`
+      parses the column-position qualifier carrying the FULL range mask (`year to
+      month` keeps `YEAR|MONTH`, unlike the low-field collapse the internal-only
+      cast path uses); `pgAttTypmod`/`pgTypeArgsFromTypmod` (1186) round-trip the
+      typmod through the catalog; `formatTypeOID` (via new `formatIntervalTypmod`)
+      renders `interval year to month`/`interval second(2)`/`interval(2)` so
+      pg_dump keeps the spelling; and a `roundIntervalDatumToTypmod` wrapper
+      (parsing via the shared `pgIntervalFieldsFromDatum`/`ParseIntervalBody`
+      tokenizer, NOT `evalCast`'s limited `<n> <unit>` arm) wired into
+      `coerceRowForConstraintChecks`, `copyTextToDatum`, `copyBinaryToDatum` and
+      `encodeValuePG`. Gates: `internal/pgdatetime`+`internal/parser`+
+      `internal/executor`+`internal/initdb` tests PASS; `go build ./...` + `go
+      vet` clean; UNITS pre-commit PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=35); pgbench smoke via the hook. 1 ledger row resolved (1302).
+      Design `0119-0006-interval-typmod-at-input.md` + README row.
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
 
 - [x] **M0119-0010 — `char(N)` typmods are not restored per column on catalog

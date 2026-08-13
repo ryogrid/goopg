@@ -2341,6 +2341,15 @@ func coerceRowForConstraintChecks(cols []catalog.Column, row Row, include func(i
 			if cerr == nil {
 				coerced = roundTimeDatumToPrecision(coerced, timeColumnPrecision(col.Type))
 			}
+		case "interval":
+			// M0119-0006 (63rd slice): `interval` joins the list so its declared
+			// typmod reaches the value — before this, an interval column's value
+			// stayed KindString until encodeValuePG parsed it, so the column's
+			// `interval(N)` / range qualifier was never applied anywhere on the
+			// INSERT path. Parse through the SAME ParseIntervalBody tokenizer
+			// encodeValuePG uses (not evalCast's limited `<n> <unit>` arm), then
+			// apply AdjustIntervalForTypmod exactly as interval_in does at input.
+			coerced, cerr = roundIntervalDatumToTypmod(row[i], intervalColumnTypmod(col.Type))
 		case "numeric", "decimal":
 			coerced, cerr = evalCast(row[i], "numeric", pos, ctx)
 		default:

@@ -3393,6 +3393,115 @@ func packIntervalCastTypmod(lowField string, prec int) int64 {
 	return (int64(rangeMask) << 16) | int64(p)
 }
 
+// packIntervalColumnTypmod packs an interval COLUMN typmod the way PG's
+// intervaltypmodin does (timestamp.c:1047): the full range bitmask (not the
+// low-field collapse the cast path uses) in the high 16 bits and the precision
+// in the low 16. Unlike the cast typmod — which is internal-only and may
+// collapse `year to month` to `month` because the truncation is identical —
+// the column typmod is stored in pg_attribute.atttypmod and a hosted PG /
+// pg_dump must see the declared spelling, so `year to month` keeps YEAR|MONTH.
+func packIntervalColumnTypmod(rangeMask int, prec int) int64 {
+	p := intervalFullPrecision
+	if prec >= 0 {
+		p = prec
+	}
+	return (int64(rangeMask) << 16) | int64(p)
+}
+
+// intervalRangeMask returns the full INTERVAL_MASK OR for a `hi [TO lo]`
+// interval range — the exact bitmask intervaltypmodin stores for that range
+// (INTERVAL_MASK(YEAR)|INTERVAL_MASK(MONTH), etc.). hi and lo are the singular
+// field keywords and the pair has already been validated by
+// intervalRangeLowField, so only the legal combinations are enumerated.
+func intervalRangeMask(hi, lo string) int {
+	bit := func(f string) int { return 1 << intervalFieldTypmodBit[f] }
+	switch hi {
+	case "year":
+		if lo == "month" {
+			return bit("year") | bit("month")
+		}
+		return bit("year")
+	case "month":
+		return bit("month")
+	case "day":
+		switch lo {
+		case "hour":
+			return bit("day") | bit("hour")
+		case "minute":
+			return bit("day") | bit("hour") | bit("minute")
+		case "second":
+			return bit("day") | bit("hour") | bit("minute") | bit("second")
+		default:
+			return bit("day")
+		}
+	case "hour":
+		switch lo {
+		case "minute":
+			return bit("hour") | bit("minute")
+		case "second":
+			return bit("hour") | bit("minute") | bit("second")
+		default:
+			return bit("hour")
+		}
+	case "minute":
+		if lo == "second" {
+			return bit("minute") | bit("second")
+		}
+		return bit("minute")
+	case "second":
+		return bit("second")
+	}
+	return intervalFullRange
+}
+
+// parseIntervalColumnQualifier parses the interval typmod qualifier in the
+// COLUMN-definition / type-name position (`c interval year to month`,
+// `c interval second(2)`, `c interval(2)`), after the `interval` keyword has
+// been consumed. It is the column twin of parseIntervalCastQualifier: the same
+// token grammar, but it returns the FULL range mask (see intervalRangeMask)
+// instead of collapsing to the low field, because the column typmod is written
+// to pg_attribute.atttypmod and must round-trip the declared spelling.
+func (p *parser) parseIntervalColumnQualifier() (typmod int64, matched bool, err error) {
+	// Precision-only `interval(p)`.
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+		prec, ok := p.tryConsumeIntervalPrecParen()
+		if !ok {
+			return 0, false, nil
+		}
+		return packIntervalColumnTypmod(intervalFullRange, prec), true, nil
+	}
+	f1 := p.cur()
+	if f1.Kind != TokenIdent {
+		return 0, false, nil
+	}
+	hi := strings.ToLower(identText(f1))
+	if !intervalTypmodField[hi] {
+		return 0, false, nil
+	}
+	p.advance() // high field
+	lo := hi
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwTo {
+		p.advance() // TO
+		f2 := p.cur()
+		if f2.Kind != TokenIdent {
+			return 0, false, p.errAtCur("expected interval field after TO")
+		}
+		loName := strings.ToLower(identText(f2))
+		if _, ok := intervalRangeLowField(hi, loName); !ok {
+			return 0, false, p.errAtCur("invalid interval field combination")
+		}
+		p.advance() // low field
+		lo = loName
+	}
+	prec := -1
+	if lo == "second" && p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+		if pp, ok := p.tryConsumeIntervalPrecParen(); ok {
+			prec = pp
+		}
+	}
+	return packIntervalColumnTypmod(intervalRangeMask(hi, lo), prec), true, nil
+}
+
 // DecodeIntervalCastTypmod unpacks a typmod produced by packIntervalCastTypmod
 // back into the executor-facing (lowField, hasPrec, prec). A typmod of 0 (a
 // bare interval with no qualifier) yields ("", false, 0).

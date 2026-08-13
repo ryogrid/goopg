@@ -4616,6 +4616,19 @@ func (p *parser) parseColumnType() (ColumnType, error) {
 	} else {
 		ct.Name = p.parseMultiWordTypeName(ct.Name)
 	}
+	// Interval carries a field/precision typmod qualifier in the column
+	// position (`c interval year to month`, `c interval second(2)`,
+	// `c interval(2)`) rather than a generic `(N[,M])` typmod list. The packed
+	// INTERVAL_TYPMOD is stored in Args[0]; it keeps the FULL range mask so
+	// pg_attribute.atttypmod round-trips the declared spelling.
+	// unimplemented_feat #5(d-iv).
+	if ct.Schema == "" && strings.EqualFold(ct.Name, "interval") {
+		if tm, matched, terr := p.parseIntervalColumnQualifier(); terr != nil {
+			return ColumnType{}, terr
+		} else if matched {
+			ct.Args = []int64{tm}
+		}
+	}
 	if p.acceptSymbol("(") {
 		for {
 			t := p.cur()

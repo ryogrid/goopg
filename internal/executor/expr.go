@@ -13895,6 +13895,56 @@ func RegtypeName(cat catalog.Catalog, oid uint32, qualify bool) string {
 	return strconv.FormatUint(uint64(oid), 10)
 }
 
+// formatIntervalTypmod renders the suffix intervaltypmodout produces for a
+// packed INTERVAL_TYPMOD (timestamp.c:1065): the range spelling with a leading
+// space (" year to month", " second") plus the precision "(p)" when a SECOND(p)
+// precision is declared, or "" for a bare/full-range interval. The field bit
+// positions are datetime.h's MONTH=1, YEAR=2, DAY=3, HOUR=10, MINUTE=11,
+// SECOND=12 — the same values pgdatetime.AdjustIntervalForTypmod and the
+// parser's intervalFieldTypmodBit use. M0119-0006 (63rd slice).
+func formatIntervalTypmod(typmod int64) string {
+	if typmod < 0 {
+		return ""
+	}
+	fields := int((typmod >> 16) & 0x7FFF)
+	precision := int(typmod & 0xFFFF)
+	fieldstr := ""
+	switch fields {
+	case 1 << 2:
+		fieldstr = " year"
+	case 1 << 1:
+		fieldstr = " month"
+	case 1 << 3:
+		fieldstr = " day"
+	case 1 << 10:
+		fieldstr = " hour"
+	case 1 << 11:
+		fieldstr = " minute"
+	case 1 << 12:
+		fieldstr = " second"
+	case (1 << 2) | (1 << 1):
+		fieldstr = " year to month"
+	case (1 << 3) | (1 << 10):
+		fieldstr = " day to hour"
+	case (1 << 3) | (1 << 10) | (1 << 11):
+		fieldstr = " day to minute"
+	case (1 << 3) | (1 << 10) | (1 << 11) | (1 << 12):
+		fieldstr = " day to second"
+	case (1 << 10) | (1 << 11):
+		fieldstr = " hour to minute"
+	case (1 << 10) | (1 << 11) | (1 << 12):
+		fieldstr = " hour to second"
+	case (1 << 11) | (1 << 12):
+		fieldstr = " minute to second"
+	case 0x7FFF:
+		fieldstr = ""
+	}
+	if precision != 0xFFFF {
+		return fmt.Sprintf("%s(%d)", fieldstr, precision)
+	}
+	return fieldstr
+}
+
 // formatTypeOID implements PostgreSQL's format_type(oid, typemod) built-in.
 // Maps well-known system type OIDs to their SQL display names. Unknown OIDs
 // return "???". Used by psql \d+ meta-commands. M0097-0023.
@@ -14137,7 +14187,10 @@ func formatTypeOID(typeOID, typmod int64) string {
 	case 1184:
 		return "timestamp with time zone"
 	case 1186:
-		return "interval"
+		// interval: atttypmod is the packed INTERVAL_TYPMOD. A bare interval
+		// (typmod -1) is just "interval"; otherwise append the range/precision
+		// qualifier intervaltypmodout renders. M0119-0006 (63rd slice).
+		return "interval" + formatIntervalTypmod(typmod)
 	case 1187:
 		// _interval: a bare interval[] column has typmod -1, so this is the
 		// bare element name with the [] suffix. DU-002 slice 70.

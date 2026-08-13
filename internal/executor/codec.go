@@ -510,6 +510,17 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		// The ±infinity sentinels need no special case: INTERVAL_NOEND /
 		// INTERVAL_NOBEGIN *are* all-fields-at-their-extreme, so field-wise
 		// storage round-trips them exactly.
+		// Apply the column's declared typmod here too, as the storage-choke
+		// point: the input sites (coerce/copy) already round, and this arm is
+		// the safety net for paths that bypass them — a DEFAULT or generated
+		// column's value is skipped by coerceRowForConstraintChecks's
+		// !insertMissing filter and reaches here as a KindString. Rounding is
+		// idempotent, so a value already rounded at input is untouched.
+		// M0119-0006 (63rd slice).
+		d, err := roundIntervalDatumToTypmod(d, intervalColumnTypmod(t))
+		if err != nil {
+			return nil, err
+		}
 		months, days, micros, err := pgIntervalFieldsFromDatum(d)
 		if err != nil {
 			return nil, err
@@ -932,6 +943,39 @@ func timeColumnPrecision(t catalog.Type) int64 {
 		return -1
 	}
 	return t.Args[0]
+}
+
+// intervalColumnTypmod returns the declared interval typmod of an interval
+// column (t.Args[0], the packed INTERVAL_TYPMOD the parser stores for
+// `interval(N)` / `interval <field> [TO <lo>] [(p)]`), or -1 when the column
+// is a bare `interval` with no modifier.
+func intervalColumnTypmod(t catalog.Type) int64 {
+	if len(t.Args) == 0 {
+		return -1
+	}
+	return t.Args[0]
+}
+
+// roundIntervalDatumToTypmod applies an interval column's declared typmod to a
+// Datum the way upstream interval_in/interval_recv do at INPUT via
+// AdjustIntervalForTypmod (timestamp.c:1355): it parses a KindString body
+// through the SAME pgIntervalFieldsFromDatum tokenizer encodeValuePG uses
+// (parser.ParseIntervalBody, the full grammar — not evalCast's limited
+// `<n> <unit>` arm), zeroes the range fields outside the declared span, and
+// rounds the sub-second field to the declared SECOND(p) precision. A null
+// datum, an absent typmod (typmod < 0) and the ±infinity sentinel are all
+// returned unchanged — the last because AdjustIntervalForTypmod no-ops on it,
+// exactly as upstream. M0119-0006 (63rd slice).
+func roundIntervalDatumToTypmod(d Datum, typmod int64) (Datum, error) {
+	if d.IsNull() || typmod < 0 {
+		return d, nil
+	}
+	months, days, micros, err := pgIntervalFieldsFromDatum(d)
+	if err != nil {
+		return Datum{}, err
+	}
+	months, days, micros = pgdatetime.AdjustIntervalForTypmod(months, days, micros, int32(typmod))
+	return NewIntervalDatumFull(months, days, micros), nil
 }
 
 // DecodeRow inverts EncodeRow.

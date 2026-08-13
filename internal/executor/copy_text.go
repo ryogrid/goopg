@@ -470,6 +470,19 @@ func copyTextToDatum(t catalog.Type, raw []byte, timeZone string) (Datum, error)
 			return Datum{}, fmt.Errorf("invalid numeric %q: %w", text, err)
 		}
 		return newNumeric(m, int(s)), nil
+	case "interval":
+		// M0119-0006 (63rd slice): the text-COPY sibling of the interval
+		// binary-COPY arm. Parse the field through the SAME
+		// parser.ParseIntervalBody tokenizer encodeValuePG and INSERT use (not
+		// evalCast's limited `<n> <unit>` arm), then apply the column typmod the
+		// way interval_in/AdjustIntervalForTypmod do at input. Before this arm
+		// the default handed the raw text back as a KindString and the column
+		// typmod was never applied on the load path.
+		d, err := roundIntervalDatumToTypmod(NewStringDatum(string(raw)), intervalColumnTypmod(t))
+		if err != nil {
+			return Datum{}, err
+		}
+		return d, nil
 	default:
 		// text / varchar / char / unknown — keep as String.
 		return NewStringDatum(string(raw)), nil

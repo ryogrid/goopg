@@ -588,16 +588,18 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 		// sorts, compares and prints identically to the same interval entering
 		// through INSERT. Before this arm the default handed the 16 raw bytes back
 		// as a STRING Datum, which then made every runtime interval operation
-		// lexicographic (Hard-won Rule #2). interval_recv's trailing
-		// AdjustIntervalForTypmod is NOT applied here — goopg truncates at display,
-		// ledgered under M0119-0006 alongside AdjustTimeForTypmod.
+		// lexicographic (Hard-won Rule #2).
 		if len(payload) != 16 {
 			return Datum{}, fmt.Errorf("interval: expected 16 bytes, got %d", len(payload))
 		}
 		micros := int64(binary.BigEndian.Uint64(payload[:8]))
 		days := int32(binary.BigEndian.Uint32(payload[8:12]))
 		months := int32(binary.BigEndian.Uint32(payload[12:16]))
-		return NewIntervalDatumFull(months, days, micros), nil
+		// interval_recv's trailing AdjustIntervalForTypmod (timestamp.c:1013):
+		// zero the range fields outside the column's declared span and round the
+		// sub-second field to the declared SECOND(p) precision at INPUT, instead
+		// of storing the received value whole. M0119-0006 (63rd slice).
+		return roundIntervalDatumToTypmod(NewIntervalDatumFull(months, days, micros), intervalColumnTypmod(t))
 	case "jsonb":
 		// Decode twin of the "jsonb" encode arm. Upstream jsonb_recv
 		// (jsonb.c:89) reads a 1-byte version, rejects anything but 1 with
