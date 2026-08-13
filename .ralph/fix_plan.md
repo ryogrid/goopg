@@ -2384,10 +2384,21 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       gaps found by the same test run: `NULLS NOT DISTINCT` after UNIQUE and
       `DEFERRABLE` after PRIMARY KEY in ALTER TABLE ADD CONSTRAINT path.
       Parser test: `TestParseAlterTableAddExclude` (8 cases).
-- [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002). `002_save_fullpage`
-      (WD-003) + live `pg_waldump --rmgr=Heap2` round-trip DONE. **Still open:** only
-      `001_basic.pl`'s server-dependent tier (per-rmgr/relation/block filtering) —
-      needs hash/gin/gist/spgist/brin index AMs.
+- [x] **M0119-0005 — pg_waldump server tier** (source: M0110-0002). **COMPLETE
+      (2026-08-14).** `001_basic.pl`'s server-dependent tier ported as
+      `TestPort_PgWaldump001BasicServerTier` (`internal/testport/pgwaldump_server_tier_test.go`,
+      CSV WD-002 → `port`) against a REDUCED heap/btree workload — goopg implements
+      none of the hash/gin/gist/spgist/brin AMs the full upstream workload
+      exercises, and no filtering assertion targets those rmgrs (the only
+      rmgr-specific one is `--rmgr Btree`). Covers per-rmgr/per-relation/per-block
+      filtering + `--limit`/`--fullpage`/`--stats` + the full WAL-range argument
+      handling. Dropped `--fork init` (goopg emits no init-fork block-ref WAL —
+      ledger). Also fixed a real server bug the workload exposed: a statement
+      after an explicit block's COMMIT/ROLLBACK in one simple-query message ran
+      against the finalized transaction ("mvcc: unknown transaction"); re-arm fix
+      in `internal/server/dispatch.go` +
+      `TestSimpleQueryBatchStatementAfterBlockEndRunsInFreshTransaction`. Design:
+      `docs/design/0119-0005-pg-waldump-server-tier-reduced-workload.md`.
 - [ ] **M0119-0006 — pg_amcheck server tier** (source: M0110-0003). `002_nonesuch`
       … `005_opclass_damage`; `CREATE EXTENSION amcheck` + `verify_heapam()` SRF on
       top of `internal/amcheck` + opclass catalog parity. Largest open cluster

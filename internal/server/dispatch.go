@@ -1042,6 +1042,35 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 			}
 			return err
 		}
+		// An explicit transaction block (BEGIN/START TRANSACTION … COMMIT/ROLLBACK)
+		// ended mid-batch. The message-level transaction `tx` was finalized by the
+		// verb (committed or rolled back) and is now dead, and *autoCommitPtr was
+		// left false so the trailing auto-commit wouldn't double-commit it — but any
+		// REMAINING statement in this message would then run against the finalized
+		// transaction and fail with "mvcc: unknown transaction". PG starts a fresh
+		// autocommit transaction for each statement that follows an ended block, so
+		// re-arm here: begin a fresh RC transaction and re-mark the message as
+		// auto-committing, exactly like the PLpgSQLCommitChain closure above.
+		if !autoCommit && connTx != nil && !connTx.InExplicit() {
+			var chainPN int32
+			if connTx != nil {
+				chainPN = connTx.ProcNum
+			}
+			newTx, berr := s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted, chainPN)
+			if berr != nil {
+				return s.writeQueryError(w, sqlstate.SystemError, berr.Error())
+			}
+			newSnap, serr := s.cfg.TxnMgr.SnapshotFor(newTx)
+			if serr != nil {
+				_ = s.cfg.TxnMgr.Rollback(newTx)
+				return s.writeQueryError(w, sqlstate.SystemError, serr.Error())
+			}
+			tx = newTx
+			snap = newSnap
+			ectx.Tx = newTx
+			ectx.Snap = newSnap
+			autoCommit = true
+		}
 		// Write back the temp-table shadow map so it persists across statements. M0097-0003.
 		if connTx != nil && ectx.TempTableShadows != nil {
 			connTx.TempTableShadows = ectx.TempTableShadows
