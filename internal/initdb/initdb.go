@@ -1350,6 +1350,12 @@ func Init(opts Options) error {
 	if err := bootstrapToastRelationFiles(abs, pgRewriteToastChunks); err != nil {
 		return fmt.Errorf("goopg init: toast relation files: %w", err)
 	}
+	// M0133-S3: write the four information_schema data heaps (sql_features et al,
+	// 801 rows) into base/{1,5}. Their pg_class / pg_attribute / pg_type / toast
+	// rows were produced by the bootstrappers above; this is the data itself.
+	if err := bootstrapInformationSchemaDataTables(abs); err != nil {
+		return fmt.Errorf("goopg init: information_schema data tables: %w", err)
+	}
 	// M0133-S1: seed the two information_schema domain CHECK constraints into
 	// pg_constraint (overwriting the empty heap) and populate its three
 	// indexes (2665/2666/2667). Without these rows a hosted PG validates
@@ -2360,6 +2366,11 @@ func bootstrapPgClassTuples(dataDir string) (map[uint32]heapTID, error) {
 	// nailedLocalRels — see nailedToastRels for why (no pg_type row, no
 	// pg_internal.init entry).
 	allRels = append(allRels, nailedToastRels()...)
+	// M0133-S3: the four information_schema data tables carry pg_class rows
+	// (relkind 'r', relnamespace 13273) but are NOT nailed — they ride the heap
+	// here, and their pg_type composite rows via their RelType, but never
+	// pg_internal.init (see informationSchemaDataTableRels).
+	allRels = append(allRels, informationSchemaDataTableRels()...)
 	tids, err := writeMultiPageHeap(dataDir, "1259", cols, allRels, func(rel nailedRel) executor.Row {
 		return pgClassRow(rel)
 	})
@@ -2391,6 +2402,7 @@ func bootstrapPgAttributeTuples(dataDir string) (map[pgAttrTIDKey]heapTID, error
 	allRels := append([]nailedRel{}, nailedSharedRels...)
 	allRels = append(allRels, nailedLocalRels...)
 	allRels = append(allRels, nailedToastRels()...) // M0131-S20.1
+	allRels = append(allRels, informationSchemaDataTableRels()...) // M0133-S3
 	type rowKey struct {
 		AttRelID uint32
 		AttNum   int16
@@ -5033,6 +5045,12 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// DECLARE_UNIQUE_INDEX, and confirmed against a PG 18.3 oracle:
 		// indrelid 2838, indkey "1 2", indclass "1981 1978", indisprimary t.
 		entry(2839, 2838, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_2618_index
+		// M0133-S3: the four information_schema data tables' TOAST indexes, each
+		// the same (chunk_id oid_ops, chunk_seq int4_ops) UNIQUE PRIMARY shape.
+		entry(13460, 13459, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_13456_index
+		entry(13465, 13464, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_13461_index
+		entry(13470, 13469, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_13466_index
+		entry(13475, 13474, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_13471_index
 		// pg_trigger columns (PG18, pg_trigger.h): 1=oid, 2=tgrelid,
 		// 3=tgparentid, 4=tgname. Index = btree(tgrelid, tgname).
 		entry(2701, 2620, []int16{2, 4}, []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true, false), // pg_trigger_tgrelid_tgname_index
@@ -6268,7 +6286,7 @@ func pgAttributeRow(relOID uint32, a nailedAttr) executor.Row {
 		executor.NewBoolDatum(false), // attisdropped
 		executor.NewBoolDatum(true),  // attislocal
 		executor.NewIntDatum(0),      // attinhcount
-		executor.NewIntDatum(0),      // attcollation
+		executor.NewIntDatum(int64(a.Collation)), // attcollation (M0133-S3: C collation on non-nailed info_schema columns)
 		executor.NullDatum,           // attstattarget (PG18 BKI_FORCE_NULL default)
 		// Step 3u: Emit NULL (not empty-text varlena) for the four nullable
 		// trailing varlena/array columns. Previously NewStringDatum("") wrote
@@ -6537,6 +6555,10 @@ func pgTypeByVal(oid uint32) bool {
 	switch oid {
 	case 16, 18, 21, 23, 26, 700, 20, 701, 24, 325, 269:
 		return true
+	case 13287:
+		// cardinal_number (M0133-S1): a domain over int4, so by-value exactly
+		// like its base type (M0133-S3 column metadata).
+		return true
 	case 3220:
 		// M0106-0010 Step 3cg: pg_lsn typbyval = FLOAT8PASSBYVAL (true on
 		// 64-bit). pg_subscription_rel.srsublsn and pg_subscription.subskiplsn
@@ -6587,7 +6609,10 @@ func pgTypeAlignChar(oid uint32) string {
 
 func pgTypeStorageChar(oid uint32) string {
 	switch oid {
-	case 25, 1043, 1042, 194, 1009, 1034, 2277, 1002, 1028, 3361, 3402, 5017, 10028:
+	case 25, 1043, 1042, 194, 1009, 1034, 2277, 1002, 1028, 3361, 3402, 5017, 10028,
+		// M0133-S3: the information_schema varlena domains (character_data 13290,
+		// yes_or_no 13300) are extended storage exactly like their varchar base.
+		13290, 13300:
 		// M0106-0010 Step 3cc: pg_ndistinct (3361) / pg_dependencies (3402) /
 		// pg_mcv_list (5017) / _pg_statistic (10028) all carry typstorage='x'
 		// (EXTENDED) per PG18 runtime pg_type lookup. Without this entry the

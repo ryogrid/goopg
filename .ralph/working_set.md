@@ -1,28 +1,21 @@
 (idle — nothing in flight)
 
-M0133-S2 DONE + committed: the 11 `information_schema` helper functions
-(`pg_proc` OIDs 13274..13279 + 13281..13285; **13280 is a hole**, unassigned).
-10 carry `prosrc=''` + a non-null `prosqlbody` captured verbatim into
-`<name>_prosqlbody.dat`; `_pg_expandarray` is textual (prosrc 51 B, SRF with
-OUT args, prosupport=3996 `array_unnest_support`).
+M0133-S3 DONE + committed: the 4 `information_schema` data tables — `sql_features`
+(755) / `sql_sizing` (23) / `sql_implementation_info` (12) / `sql_parts` (11), 801
+rows — seeded as ordinary heaps, each a five-OID object graph (table T / array
+T+1 / composite T+2 / toast heap T+3 / toast index T+4; 13456..13475). First
+bulk-heap-load-at-initdb mechanism: `informationSchemaDataTableRels()` (a THIRD rel
+list — in pg_class/pg_attribute/pg_type content, never pg_internal.init) +
+`nailedToastPairs()` reuse for the empty TOAST pairs + 8 `pgTypeCanonical` cases +
+`//go:embed`-ed TSV data through `writeMultiPageHeapRows`. Columns are the S1
+domains; heap encoder uses base type names (`text`/`int4`) while pg_attribute
+carries the domain OIDs (load-bearing split, F3). Design `0133-0003`.
 
-New capture surface `scripts/capture-ev-action.sh --prosqlbody [--verify]` +
-generator `cmd/gen-information-schema-procs` (separate from gen-nailed-view-tables:
-disjoint schema, one stdout stream) → `informationSchemaHelperProcs()` +
-`internal/initdb/information_schema_proc_manifest.tsv`.
+Ledgered F4 (blocks S4): domain-typed expressions (`feature_id = 'x'`, `||`,
+`concat`) fail `operator is not unique: information_schema.character_data = unknown`
+on a hosted PG though operators/casts/typbasetype are all on disk — PG's own
+`oper()` domain→base reduction diverges; triage before S4's WHERE-clause views.
 
-`pgProcEntry` gained `Namespace/Cost/Rows/Support/SqlBody`; `pgProcRow` emits
-them; `pgProcInitialEntries` 3397→3408. Sibling-path fix forced:
-`bootstrapPgProcPronameArgsNspIndex` hardcoded `nsp=11` (the pg_proc twin of
-S1's `pg_type_typname_nsp_index` gap) → now reads `e.Namespace`.
-
-Design `0133-0002` + README row. Gates: `internal/initdb` PASS (224 s),
-`internal/catalog` PASS, `--prosqlbody --verify` byte-identical (11 procs),
-UNITS PASS, `go build`+`go vet` clean.
-
-Next per banner (M0133, S2 done → S3): **M0133-S3 — the 4 data tables + 801
-rows** (F35). `sql_features` (755) / `sql_sizing` (23) / `sql_implementation_info`
-(12) / `sql_parts` (11) are ordinary heaps; upstream initdb COPYs them from
-`sql_features.txt`. Needs a bulk-heap-load-at-initdb mechanism M0131-S9 never
-produced — write its own design section before code. Gates: a hosted PG reading
-real rows out of `sql_features`, not just planning it.
+Next per banner (M0133, S3 done → S4): **M0133-S4 — the 65 views** (runs LAST),
+reusing the M0131-S9 capture/pin/regen loop; re-point `assertNonCorpusSystemViewIsStillAbsent`
+(the `information_schema.tables` tripwire flips red).

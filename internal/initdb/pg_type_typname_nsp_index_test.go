@@ -60,6 +60,11 @@ func TestBootstrapPgTypeTypnameNspIndexWritesPopulatedBtree(t *testing.T) {
 		"_sql_identifier": true, "sql_identifier": true,
 		"_time_stamp": true, "time_stamp": true,
 		"_yes_or_no": true, "yes_or_no": true,
+		// M0133-S3: the four data tables' composite rowtypes + array peers.
+		"_sql_features": true, "sql_features": true,
+		"_sql_implementation_info": true, "sql_implementation_info": true,
+		"_sql_parts": true, "sql_parts": true,
+		"_sql_sizing": true, "sql_sizing": true,
 	}
 	seenInfoSchema := map[string]bool{}
 	var prevName string

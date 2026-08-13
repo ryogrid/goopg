@@ -22,7 +22,11 @@ import "testing"
 // pgTypeRelidOverlay and another in nailedSharedRels / nailedLocalRels.
 func TestPgTypeCompositeRowsCarryTyprelid(t *testing.T) {
 	relTypeOf := map[uint32]uint32{} // rel OID -> declared RelType
-	for _, rel := range append(append([]nailedRel{}, nailedSharedRels...), nailedLocalRels...) {
+	// M0133-S3: the information_schema data tables are a third rel source (not
+	// nailed, but they DO have pg_class + pg_attribute rows on disk), so their
+	// composite rowtypes' typrelid round-trips through here too.
+	allRels := append(append(append([]nailedRel{}, nailedSharedRels...), nailedLocalRels...), informationSchemaDataTableRels()...)
+	for _, rel := range allRels {
 		relTypeOf[rel.OID] = rel.RelType
 	}
 

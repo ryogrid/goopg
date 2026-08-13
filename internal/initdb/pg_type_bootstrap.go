@@ -86,12 +86,18 @@ type pgTypeEntry struct {
 // cannot regress the FATAL silently.
 func pgTypeCanonical(oid uint32) (pgTypeEntry, bool) {
 	// Array types share the generic array_in/out/recv/send quad
-	// (pg_proc.dat OIDs 750/751/2400/2401).
+	// (pg_proc.dat OIDs 750/751/2400/2401); composite rowtypes share the
+	// record_in/out/recv/send quad (2290/2291/2402/2403, M0133-S3).
 	const (
 		arrayIn   uint32 = 750
 		arrayOut  uint32 = 751
 		arrayRecv uint32 = 2400
 		arraySend uint32 = 2401
+
+		recordIn   uint32 = 2290
+		recordOut  uint32 = 2291
+		recordRecv uint32 = 2402
+		recordSend uint32 = 2403
 	)
 	switch oid {
 	case 16:
@@ -291,6 +297,27 @@ func pgTypeCanonical(oid uint32) (pgTypeEntry, bool) {
 		return pgTypeEntry{13299, "_yes_or_no", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
 	case 13300:
 		return pgTypeEntry{13300, "yes_or_no", -1, false, 'd', 'S', 'i', 'x', 2597, 1047, 2598, 2433}, true
+	// information_schema data tables' rowtypes (M0133-S3): each ordinary table
+	// gets a composite rowtype (typtype 'c', record_in/out/recv/send) plus its
+	// array peer (typtype 'b', array_in/out/recv/send). typalign is 'd' for both
+	// — a composite aligns to double, and an array aligns to its element. OIDs
+	// measured against a fresh PG 18.3 (information_schema.sql runs post-bootstrap).
+	case 13457:
+		return pgTypeEntry{13457, "_sql_features", -1, false, 'b', 'A', 'd', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
+	case 13458:
+		return pgTypeEntry{13458, "sql_features", -1, false, 'c', 'C', 'd', 'x', recordIn, recordOut, recordRecv, recordSend}, true
+	case 13462:
+		return pgTypeEntry{13462, "_sql_implementation_info", -1, false, 'b', 'A', 'd', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
+	case 13463:
+		return pgTypeEntry{13463, "sql_implementation_info", -1, false, 'c', 'C', 'd', 'x', recordIn, recordOut, recordRecv, recordSend}, true
+	case 13467:
+		return pgTypeEntry{13467, "_sql_parts", -1, false, 'b', 'A', 'd', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
+	case 13468:
+		return pgTypeEntry{13468, "sql_parts", -1, false, 'c', 'C', 'd', 'x', recordIn, recordOut, recordRecv, recordSend}, true
+	case 13472:
+		return pgTypeEntry{13472, "_sql_sizing", -1, false, 'b', 'A', 'd', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
+	case 13473:
+		return pgTypeEntry{13473, "sql_sizing", -1, false, 'c', 'C', 'd', 'x', recordIn, recordOut, recordRecv, recordSend}, true
 	}
 	return pgTypeEntry{}, false
 }
@@ -305,6 +332,7 @@ func pgTypeOIDsUsedByNailedAttrs() []uint32 {
 	seen := make(map[uint32]struct{})
 	allRels := append([]nailedRel{}, nailedSharedRels...)
 	allRels = append(allRels, nailedLocalRels...)
+	allRels = append(allRels, informationSchemaDataTableRels()...) // M0133-S3
 	for _, rel := range allRels {
 		for _, a := range pgAttrEntriesForRel(rel) {
 			if a.TypeOID == 0 {
@@ -418,6 +446,17 @@ var pgTypeElemArrayOverlay = map[uint32][3]uint32{
 	13298: {0, 13297, 0},    // time_stamp
 	13299: {13300, 0, 6179}, // _yes_or_no
 	13300: {0, 13299, 0},    // yes_or_no
+	// information_schema data tables (M0133-S3): the same composite↔array
+	// edge — the array points typelem at the composite and carries
+	// array_subscript_handler (6179); the composite points typarray back.
+	13457: {13458, 0, 6179}, // _sql_features
+	13458: {0, 13457, 0},    // sql_features
+	13462: {13463, 0, 6179}, // _sql_implementation_info
+	13463: {0, 13462, 0},    // sql_implementation_info
+	13467: {13468, 0, 6179}, // _sql_parts
+	13468: {0, 13467, 0},    // sql_parts
+	13472: {13473, 0, 6179}, // _sql_sizing
+	13473: {0, 13472, 0},    // sql_sizing
 }
 
 // pgTypeRelidOverlay carries typrelid for the bootstrapped pg_type rows that
@@ -441,6 +480,13 @@ var pgTypeRelidOverlay = map[uint32]uint32{
 	81:    1255, // pg_proc
 	83:    1259, // pg_class
 	10029: 2619, // pg_statistic — nailedLocalRels{2619}.RelType must agree
+	// information_schema data tables' composite rowtypes (M0133-S3): a
+	// typtype='c' row must carry a valid typrelid (lookup_type_cache asserts
+	// OidIsValid(typrelid)).
+	13458: 13456, // sql_features
+	13463: 13461, // sql_implementation_info
+	13468: 13466, // sql_parts
+	13473: 13471, // sql_sizing
 }
 
 // pgTypeNamespaceOverlay carries typnamespace for the bootstrapped pg_type rows
@@ -458,6 +504,15 @@ var pgTypeNamespaceOverlay = map[uint32]uint32{
 	13298: 13273, // time_stamp
 	13299: 13273, // _yes_or_no
 	13300: 13273, // yes_or_no
+	// information_schema data tables' rowtypes + array peers (M0133-S3).
+	13457: 13273, // _sql_features
+	13458: 13273, // sql_features
+	13462: 13273, // _sql_implementation_info
+	13463: 13273, // sql_implementation_info
+	13467: 13273, // _sql_parts
+	13468: 13273, // sql_parts
+	13472: 13273, // _sql_sizing
+	13473: 13273, // sql_sizing
 }
 
 // pgTypeBaseTypeOverlay carries typbasetype for the information_schema DOMAIN
@@ -616,7 +671,7 @@ func pgTypeBootstrapEntryMap() map[uint32]pgTypeEntry {
 	// its heap row automatically. Rels still carrying the historical
 	// placeholder (83, pg_class's own rowtype) resolve out of pg_type.dat and
 	// are already in allMap, so this adds nothing for them.
-	for _, rel := range append(append([]nailedRel{}, nailedSharedRels...), nailedLocalRels...) {
+	for _, rel := range append(append(append([]nailedRel{}, nailedSharedRels...), nailedLocalRels...), informationSchemaDataTableRels()...) {
 		if rel.RelType == 0 {
 			continue
 		}
@@ -641,6 +696,19 @@ func pgTypeBootstrapEntryMap() map[uint32]pgTypeEntry {
 			allMap[e.OID] = e
 		}
 	}
+	// M0133-S3: the four data tables' ARRAY peers (13457 _sql_features, …) are
+	// referenced by no nailed attr and are not a RelType — the composite (13458
+	// etc.) enters via the RelType loop above, but the array peer does not. It
+	// must be in the entry map so the heap writer + both index bootstrappers
+	// cover it; absent this, get_array_type() on the rowtype fails.
+	for _, oid := range pgTypeInformationSchemaTableTypeOIDs() {
+		if _, alreadyIn := allMap[oid]; alreadyIn {
+			continue
+		}
+		if e, ok := pgTypeCanonical(oid); ok {
+			allMap[e.OID] = e
+		}
+	}
 	return allMap
 }
 
@@ -657,6 +725,20 @@ func pgTypeInformationSchemaDomainOIDs() []uint32 {
 		13291, 13292, // _sql_identifier, sql_identifier
 		13297, 13298, // _time_stamp, time_stamp
 		13299, 13300, // _yes_or_no, yes_or_no
+	}
+}
+
+// pgTypeInformationSchemaTableTypeOIDs returns the eight initdb-assigned
+// pg_type OIDs of the information_schema data tables' rowtypes + array peers
+// (M0133-S3). The composite (T+2) also enters the entry map via the RelType
+// loop; the array peer (T+1) does not, so both are listed here (the entry-map
+// loop dedups). Measured against a fresh PG 18.3, not pg_type.dat.
+func pgTypeInformationSchemaTableTypeOIDs() []uint32 {
+	return []uint32{
+		13457, 13458, // _sql_features, sql_features
+		13462, 13463, // _sql_implementation_info, sql_implementation_info
+		13467, 13468, // _sql_parts, sql_parts
+		13472, 13473, // _sql_sizing, sql_sizing
 	}
 }
 

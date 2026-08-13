@@ -23,8 +23,10 @@ func TestPgClassHeapBootstrapCoverage(t *testing.T) {
 
 	// M0131-S20.1: the pg_rewrite TOAST pair (2838/2839) has pg_class rows
 	// too, and rides in the same heap without being a member of
-	// nailedLocalRels — see nailedToastRels.
-	expectedCount := len(nailedSharedRels) + len(nailedLocalRels) + len(nailedToastRels())
+	// nailedLocalRels — see nailedToastRels. M0133-S3: so do the four
+	// information_schema data tables (and their TOAST pairs, folded into
+	// nailedToastRels) — see informationSchemaDataTableRels.
+	expectedCount := len(nailedSharedRels) + len(nailedLocalRels) + len(nailedToastRels()) + len(informationSchemaDataTableRels())
 
 	// Bootstrap writes to both base/1 and base/5.
 	for _, db := range []string{"base/1", "base/5"} {
@@ -92,8 +94,8 @@ func TestPgClassHeapBootstrapCoverage(t *testing.T) {
 		}
 
 		if totalTuples != expectedCount {
-			t.Errorf("%s/1259: %d tuples, want %d (nailedSharedRels=%d + nailedLocalRels=%d + nailedToastRels=%d)",
-				db, totalTuples, expectedCount, len(nailedSharedRels), len(nailedLocalRels), len(nailedToastRels()))
+			t.Errorf("%s/1259: %d tuples, want %d (nailedSharedRels=%d + nailedLocalRels=%d + nailedToastRels=%d + infoSchemaDataTables=%d)",
+				db, totalTuples, expectedCount, len(nailedSharedRels), len(nailedLocalRels), len(nailedToastRels()), len(informationSchemaDataTableRels()))
 		} else if totalTuples > 0 {
 			t.Logf("%s/1259: %d tuples (all %d nailed relations accounted for)", db, totalTuples, expectedCount)
 		}

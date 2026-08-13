@@ -104,6 +104,16 @@ func TestPgTypeRowCanonicalTypcollation(t *testing.T) {
 		//            M0131-S9.3c, whose pg_publication_tables pin is the first
 		//            nailed rel with a name[] (attnames) attribute. The value
 		//            matches TestPgTypeArrayCollationMatchesElement's pin.
+		// information_schema domains declared COLLATE "C" (M0133-S1): the
+		// collatable three plus their array peers. They enter pgTypeInitialEntries
+		// once a nailed attr references them — character_data/yes_or_no do so
+		// through the M0133-S3 data tables' columns; sql_identifier via S4.
+		13289: 950, // _character_data
+		13290: 950, // character_data
+		13291: 950, // _sql_identifier
+		13292: 950, // sql_identifier
+		13299: 950, // _yes_or_no
+		13300: 950, // yes_or_no
 	}
 	for _, e := range pgTypeInitialEntries() {
 		row := pgTypeRow(e)

@@ -69,6 +69,12 @@ type nailedAttr struct {
 	Len       int16
 	NotNull   bool
 	IsDropped bool
+	// Collation is the attcollation a non-nailed column carries (M0133-S3).
+	// Nailed catalogs keep the historical 0 — PG loads their descriptors from
+	// pg_internal.init — but the information_schema data tables are non-nailed,
+	// so their heap pg_attribute is the sole source and must carry the domain's
+	// C collation (950) for ORDER BY / comparisons to work. 0 otherwise.
+	Collation uint32
 }
 
 // nailedSharedRels lists all shared nailed relations (heaps + indexes flattened).

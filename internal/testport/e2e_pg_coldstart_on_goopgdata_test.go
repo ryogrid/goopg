@@ -260,6 +260,7 @@ func TestE2E_PGColdStartOnGoopgDataDir(t *testing.T) {
 	assertNailedSystemViewsAreEvaluable(t, pg, goopgDir)
 	assertNonCorpusSystemViewIsStillAbsent(t, pg)
 	assertInformationSchemaDomainsResolvable(t, pg, goopgDir)
+	assertInformationSchemaDataTablesReadable(t, pg, goopgDir)
 	assertHostedPGSeesPgRewriteToastRelation(t, pg)
 
 	// Row-level reads over user tables. S4.4 originally carried no view
@@ -1113,6 +1114,59 @@ func assertInformationSchemaDomainsResolvable(t *testing.T, pg *pgcluster.Cluste
 			t.Errorf("hosted PG rejected %s, but not with the expected check-constraint "+
 				"violation naming %q:\n%s", tc.query, tc.name, out)
 		}
+	}
+}
+
+// assertInformationSchemaDataTablesReadable is M0133-S3's acceptance probe: a
+// hosted PG cold-started on a goopg $PGDATA must READ REAL ROWS out of the four
+// information_schema data tables, not merely plan a query over them. This is
+// the first bulk data load goopg's initdb performs — the four tables are
+// ordinary heaps (relkind 'r') whose 801 rows upstream COPYs/INSERTs from
+// sql_features.txt, and whose columns are the S1 domains.
+func assertInformationSchemaDataTablesReadable(t *testing.T, pg *pgcluster.Cluster, goopgDir string) {
+	t.Helper()
+	logPath := pgLogPathFor(goopgDir)
+
+	// Row counts — the tables answer with their full captured data set.
+	for _, tc := range []struct{ query, want string }{
+		{`SELECT count(*) FROM information_schema.sql_features`, "755"},
+		{`SELECT count(*) FROM information_schema.sql_sizing`, "23"},
+		{`SELECT count(*) FROM information_schema.sql_implementation_info`, "12"},
+		{`SELECT count(*) FROM information_schema.sql_parts`, "11"},
+	} {
+		if got := s4Scalar(t, pg, logPath, tc.query); got != tc.want {
+			t.Errorf("hosted PG %q = %q, want %q", tc.query, got, tc.want)
+		}
+	}
+
+	// Real cell reads, not just counts — the first sql_features row in heap
+	// order (B011 / "Embedded Ada", deterministic: the heap is written in
+	// capture order). Projection + LIMIT only, because a domain-typed
+	// comparison/concatenation over `character_data`/`yes_or_no` trips
+	// "operator is not unique" on a goopg-hosted PG where a real PG 18.3
+	// resolves it to text — goopg's on-disk pg_operator/pg_cast is the
+	// early-boot MINIMAL set and lacks the domain→base→text coercion edges the
+	// full catalog carries. Ledgered under M0133-S3; the cell content itself is
+	// pinned field-for-field by TestInformationSchemaTableRowsMatchCapture.
+	if got := s4Scalar(t, pg, logPath,
+		`SELECT feature_id FROM information_schema.sql_features LIMIT 1`); got != "B011" {
+		t.Errorf("hosted PG sql_features[0] feature_id = %q, want %q", got, "B011")
+	}
+	if got := s4Scalar(t, pg, logPath,
+		`SELECT feature_name FROM information_schema.sql_features LIMIT 1`); got != "Embedded Ada" {
+		t.Errorf("hosted PG sql_features[0] feature_name = %q, want %q", got, "Embedded Ada")
+	}
+
+	// The composite rowtype is on disk and is a real composite pointing back at
+	// the table (typrelid = table OID). oid equality is bootstrapped, so `=`
+	// on pg_type.oid is fine here.
+	if got := s4Scalar(t, pg, logPath,
+		`SELECT typtype FROM pg_type WHERE oid = 13458`); got != "c" {
+		t.Errorf("hosted PG sql_features rowtype typtype = %q, want %q", got, "c")
+	}
+	if got := s4Scalar(t, pg, logPath,
+		`SELECT typrelid FROM pg_type WHERE oid = 13458`); got != "13456" {
+		t.Errorf("hosted PG sql_features rowtype typrelid = %q, want %q", got, "13456")
 	}
 }
 

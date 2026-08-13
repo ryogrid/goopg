@@ -1,0 +1,11 @@
+1	Framework (SQL/Framework)	NO	\N	
+2	Foundation (SQL/Foundation)	NO	\N	
+3	Call-Level Interface (SQL/CLI)	NO	\N	
+4	Persistent Stored Modules (SQL/PSM)	NO	\N	
+9	Management of External Data (SQL/MED)	NO	\N	
+10	Object Language Bindings (SQL/OLB)	NO	\N	
+11	Information and Definition Schema (SQL/Schemata)	NO	\N	
+13	Routines and Types Using the Java Programming Language (SQL/JRT)	NO	\N	
+14	XML-Related Specifications (SQL/XML)	NO	\N	
+15	Multi-Dimensional Arrays (SQL/MDA)	NO	\N	
+16	Property Graph Queries (SQL/PGQ)	NO	\N	

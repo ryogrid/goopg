@@ -1086,6 +1086,10 @@ func bootstrapPgClassRelnameNspIndex(dataDir string, tids map[uint32]heapTID) er
 	// (RELNAMENSP syscache). Omitting them here would leave the heap row
 	// unreachable by name.
 	allRels = append(allRels, nailedToastRels()...)
+	// M0133-S3: the information_schema data tables resolve by name through THIS
+	// index (RELNAMENSP syscache), so their pg_class rows must be reachable here
+	// or a hosted PG's `information_schema.sql_features` lookup misses.
+	allRels = append(allRels, informationSchemaDataTableRels()...)
 
 	entries := make([]entry, 0, len(allRels))
 	for _, rel := range allRels {
