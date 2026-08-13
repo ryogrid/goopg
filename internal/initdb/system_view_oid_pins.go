@@ -419,11 +419,19 @@ func systemViewOIDPinByName(name string) (systemViewOIDPin, bool) {
 // pinnedSystemViewOIDs returns the set of every OID this policy pins — view
 // OIDs and rule OIDs together. Used by the blob invariant guard: any
 // in-band `:relid` inside a committed *_ev_action.dat must be a member.
+//
+// M0133-S4: it also covers the information_schema views, which share the same
+// initdb-assigned band and whose own view-on-view edges embed each other's
+// OIDs the same way.
 func pinnedSystemViewOIDs() map[uint32]string {
-	out := make(map[uint32]string, 2*len(systemViewOIDPins()))
+	out := make(map[uint32]string, 2*len(systemViewOIDPins())+2*len(informationSchemaViewOIDPins()))
 	for _, p := range systemViewOIDPins() {
 		out[p.ViewOID] = p.ViewName
 		out[p.RuleOID] = p.ViewName + "._RETURN"
+	}
+	for _, p := range informationSchemaViewOIDPins() {
+		out[p.ViewOID] = "information_schema." + p.ViewName
+		out[p.RuleOID] = "information_schema." + p.ViewName + "._RETURN"
 	}
 	return out
 }

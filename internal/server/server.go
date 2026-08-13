@@ -1690,6 +1690,10 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 		case protocol.MsgParse:
 			em := s.handleParseFrame(extended, f.Payload)
 			if em != nil {
+				// M0132-S5: PostgreSQL aborts an open block from its top-level
+				// error handler, so a Parse/Bind/Describe error inside a block
+				// aborts it just as an Execute error does.
+				failExplicitBlock(connTx)
 				if err := s.writeExtendedMessageError(w, em); err != nil {
 					return
 				}
@@ -1702,6 +1706,7 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 		case protocol.MsgBind:
 			em := s.handleBindFrame(extended, f.Payload)
 			if em != nil {
+				failExplicitBlock(connTx) // M0132-S5, see MsgParse above
 				if err := s.writeExtendedMessageError(w, em); err != nil {
 					return
 				}
@@ -1712,11 +1717,12 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 				return
 			}
 		case protocol.MsgDescribe:
-			em, err := s.handleDescribeFrame(extended, f.Payload, w)
+			em, err := s.handleDescribeFrame(extended, f.Payload, w, sess)
 			if err != nil {
 				return
 			}
 			if em != nil {
+				failExplicitBlock(connTx) // M0132-S5, see MsgParse above
 				if err := s.writeExtendedMessageError(w, em); err != nil {
 					return
 				}
@@ -1760,6 +1766,14 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 			}
 		case protocol.MsgSync:
 			extended.syncRequired = false
+			// Deliver queued LISTEN/NOTIFY notifications at this command
+			// boundary, before ReadyForQuery — mirroring the simple path's
+			// deliverNotifications before its ReadyForQuery (dispatch.go:1113).
+			// Without this a session that LISTENs over the extended protocol
+			// would never receive an 'A' NotificationResponse. M0132-S12.
+			if err := s.deliverNotifications(w, connTx); err != nil {
+				return
+			}
 			if err := w.ReadyForQuery(); err != nil {
 				return
 			}

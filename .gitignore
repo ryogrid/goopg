@@ -126,3 +126,9 @@ ci/logs/*
 !ci/logs/history.jsonl
 
 analysis/tpcds-sf1-all-queries.md
+
+# goopg-authored isolation specs + their PG-captured expected output. The
+# oracle's own .spec/.out live under /postgres/ (a gitignored reference clone);
+# these are goopg's committed fixtures. The *.out rule above would otherwise
+# swallow the expected files, so re-include them here.
+!internal/testport/expected/*.out

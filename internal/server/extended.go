@@ -45,6 +45,7 @@ type extendedMessageError struct {
 	Code     sqlstate.Code
 	Message  string
 	Detail   string // errdetail text; "" = omit FieldDetail
+	Hint     string // errhint text; "" = omit FieldHint
 	Routine  string
 	Position int // 1-based byte offset; 0 = omit FieldPosition
 }
@@ -55,13 +56,19 @@ type extendedQueryResult struct {
 	CommandTag string
 	Empty      bool
 	Notice     string // NoticeResponse text to emit before CommandComplete; "" = none
+	// WarnFields is a fully-formed NoticeResponse field set to emit before
+	// CommandComplete — the shape PG's "there is no transaction in progress"
+	// WARNING needs (severity WARNING + SQLSTATE 25P01), which the plain
+	// Notice string above cannot express. M0132-S2.
+	WarnFields []protocol.ErrorField
 }
 
 type extendedQueryError struct {
 	Code     sqlstate.Code
 	Message  string
 	Detail   string // errdetail text; "" = omit FieldDetail
-	Position int // 1-based byte offset; 0 = omit FieldPosition
+	Hint     string // errhint text; "" = omit FieldHint
+	Position int    // 1-based byte offset; 0 = omit FieldPosition
 }
 
 func newExtendedState() *extendedState {
@@ -88,6 +95,9 @@ func (s *Server) writeExtendedMessageError(w *protocol.FrameWriter, em *extended
 	}
 	if em.Detail != "" {
 		fields = append(fields, protocol.ErrorField{Code: protocol.FieldDetail, Value: em.Detail})
+	}
+	if em.Hint != "" {
+		fields = append(fields, protocol.ErrorField{Code: protocol.FieldHint, Value: em.Hint})
 	}
 	return w.WriteErrorResponse(fields)
 }
@@ -232,7 +242,7 @@ func (s *Server) handleBindFrame(state *extendedState, payload []byte) *extended
 	return nil
 }
 
-func (s *Server) handleDescribeFrame(state *extendedState, payload []byte, w *protocol.FrameWriter) (*extendedMessageError, error) {
+func (s *Server) handleDescribeFrame(state *extendedState, payload []byte, w *protocol.FrameWriter, sess *config.SessionRegistry) (*extendedMessageError, error) {
 	pr := payloadReader{buf: payload}
 	kind, err := pr.readByte()
 	if err != nil {
@@ -260,7 +270,7 @@ func (s *Server) handleDescribeFrame(state *extendedState, payload []byte, w *pr
 		if err := w.WriteParameterDescription(oids); err != nil {
 			return nil, err
 		}
-		fields := s.describeExtendedQuery(stmt.Query)
+		fields := s.describeExtendedQuery(stmt.Query, sess, state.DBName)
 		// nil = no result set (write/DDL/txn) → NoData; a non-nil but empty
 		// slice is a zero-column read (`SELECT FROM t`) → RowDescription with
 		// 0 fields, matching PostgreSQL.
@@ -283,7 +293,7 @@ func (s *Server) handleDescribeFrame(state *extendedState, payload []byte, w *pr
 				Routine: "server.handleDescribeFrame",
 			}, nil
 		}
-		fields := s.describeExtendedQuery(portal.Statement.Query)
+		fields := s.describeExtendedQuery(portal.Statement.Query, sess, state.DBName)
 		// nil = no result set (write/DDL/txn) → NoData; a non-nil but empty
 		// slice is a zero-column read (`SELECT FROM t`) → RowDescription with
 		// 0 fields, matching PostgreSQL.
@@ -328,7 +338,18 @@ func (s *Server) handleExecuteFrame(ctx context.Context, state *extendedState, p
 	if portal.Result == nil {
 		res, qerr := s.executeExtendedQuery(ctx, sess, portal.Statement.Query, portal.Params, state.ProcNum, state.DBName, connTx)
 		if qerr != nil {
-			return &extendedMessageError{Code: qerr.Code, Message: qerr.Message, Detail: qerr.Detail, Position: qerr.Position, Routine: "server.handleExecuteFrame"}, nil
+			// M0132-S5: the extended message loop had no connTx.Fail() call
+			// site at all — its only 'Z' write is the plain ReadyForQuery, so
+			// the ReadyForQueryAfterError escape hatch that makes the simple
+			// path report 'E' is unavailable here. Marking the block failed is
+			// what makes both the status byte and the 25P02 gate work.
+			failExplicitBlock(connTx)
+			return &extendedMessageError{Code: qerr.Code, Message: qerr.Message, Detail: qerr.Detail, Hint: qerr.Hint, Position: qerr.Position, Routine: "server.handleExecuteFrame"}, nil
+		}
+		if len(res.WarnFields) > 0 {
+			if err := w.WriteNoticeResponse(res.WarnFields); err != nil {
+				return nil, err
+			}
 		}
 		if res.Notice != "" {
 			if err := w.WriteNoticeResponse([]protocol.ErrorField{
@@ -435,6 +456,21 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *config.SessionR
 	trimmed, matchable, upper, empty := normalizeSimpleQuery(query)
 	if empty {
 		return &extendedQueryResult{Empty: true}, nil
+	}
+
+	// M0132-S5: the aborted-block gate, ahead of every fast path below —
+	// a failed block rejects `SELECT 1` / `SHOW` / `SET` too, and those never
+	// reach the executor. The simple path gates identically in handleQuery.
+	if connTx != nil && connTx.IsFailed() {
+		if !allowedInAbortedBlock(upper) {
+			return nil, &extendedQueryError{Code: "25P02", Message: abortedBlockMessage}
+		}
+		// ROLLBACK TO SAVEPOINT unwinds the failure instead of ending the
+		// block, so the block becomes usable again (dispatch.go's gate does
+		// the same for the simple path).
+		if strings.HasPrefix(upper, "ROLLBACK TO") {
+			connTx.ClearFailed()
+		}
 	}
 
 	if strings.EqualFold(matchable, "SELECT 1") {
@@ -593,7 +629,7 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *config.SessionR
 	}
 }
 
-func (s *Server) describeExtendedQuery(query string) []protocol.FieldDescription {
+func (s *Server) describeExtendedQuery(query string, sess *config.SessionRegistry, dbName string) []protocol.FieldDescription {
 	_, matchable, upper, empty := normalizeSimpleQuery(query)
 	if empty {
 		return nil
@@ -633,7 +669,7 @@ func (s *Server) describeExtendedQuery(query string) []protocol.FieldDescription
 		// Plan the statement to learn its output schema. Errors here
 		// are non-fatal — we just fall back to NoData and let the
 		// follow-up Execute surface a real error.
-		if fields, ok := s.describeViaPlanner(query); ok {
+		if fields, ok := s.describeViaPlanner(query, sess, dbName); ok {
 			return fields
 		}
 	}
@@ -646,14 +682,45 @@ func (s *Server) describeExtendedQuery(query string) []protocol.FieldDescription
 // empty schema (write-only statement, transaction verb, etc.) is
 // signalled to the wire layer as NoData. Errors return ok=false; the
 // real error will surface during Execute.
-func (s *Server) describeViaPlanner(query string) ([]protocol.FieldDescription, bool) {
-	stmts, err := parser.Parse(query)
-	if err != nil || len(stmts) != 1 {
-		return nil, false
-	}
-	node, err := planner.Plan(stmts[0], s.cfg.Catalog)
-	if err != nil {
-		return nil, false
+func (s *Server) describeViaPlanner(query string, sess *config.SessionRegistry, dbName string) ([]protocol.FieldDescription, bool) {
+	// M0132-S13: read the output schema from the cross-session plan cache when
+	// possible, so a per-iteration Describe (pgbench's PQexecPrepared sends a
+	// Describe Portal per execution) no longer re-parses+re-plans — the -S hot
+	// path (S11's O-XP-1 profile: 13.4% cum). The cache is DDL-invalidated by
+	// the Execute path exactly as it is here. Using sessionPlanCatalog (instead
+	// of the bare s.cfg.Catalog this function used before) makes Describe and
+	// Execute plan on the SAME catalog, so a Describe describes the plan the
+	// following Execute actually runs — the previous divergence meant a session
+	// with search_path/enable_seqscan/temp overrides could see the two disagree.
+	connDBOid := resolveConnDBOid(s.cfg.Catalog, dbName)
+	var node planner.Node
+	if s.pc != nil && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
+		if cached, ok := s.pc.Get(planCacheKey(query, connDBOid)); ok {
+			node = cached
+		} else {
+			stmts, err := parser.Parse(query)
+			if err != nil || len(stmts) != 1 {
+				return nil, false
+			}
+			var perr error
+			node, perr = planner.Plan(stmts[0], sessionPlanCatalog(sess, s.cfg.Catalog, connDBOid))
+			if perr != nil {
+				return nil, false
+			}
+			if planCacheIsCacheable(node) {
+				s.pc.Put(planCacheKey(query, connDBOid), node)
+			}
+		}
+	} else {
+		stmts, err := parser.Parse(query)
+		if err != nil || len(stmts) != 1 {
+			return nil, false
+		}
+		var perr error
+		node, perr = planner.Plan(stmts[0], sessionPlanCatalog(sess, s.cfg.Catalog, connDBOid))
+		if perr != nil {
+			return nil, false
+		}
 	}
 	schema := node.Output()
 	if schema == nil {

@@ -1214,6 +1214,12 @@ func pgAttTypmod(typOID uint32, args []int64) int64 {
 		if len(args) >= 1 {
 			return args[0]
 		}
+	case 1186: // interval: the packed INTERVAL_TYPMOD, stored raw (no VARHDRSZ
+		// offset, unlike numeric/char — intervaltypmodin returns the packed value
+		// directly). Args[0] IS the packed typmod the parser produced.
+		if len(args) >= 1 {
+			return args[0]
+		}
 	}
 	return -1
 }

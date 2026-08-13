@@ -1017,6 +1017,7 @@ func pgBuildIndexTupleNameOidKey(heapBlk uint32, heapOff uint16, name string, oi
 func bootstrapPgTypeTypnameNspIndex(dataDir string, tids map[uint32]heapTID) error {
 	type entry struct {
 		name string
+		nsp  uint32
 		blk  uint32
 		off  uint16
 	}
@@ -1027,17 +1028,31 @@ func bootstrapPgTypeTypnameNspIndex(dataDir string, tids map[uint32]heapTID) err
 		if !ok {
 			continue
 		}
-		entries = append(entries, entry{name: e.Name, blk: t.Block, off: t.Offset})
+		// M0133-S1: the information_schema domains live in namespace 13273, so
+		// the namespace is no longer a constant 11 — LookupTypeName must find
+		// `information_schema.sql_identifier` via (typname='sql_identifier',
+		// typnamespace=13273), and a hardcoded 11 here makes it 42P01.
+		nsp := uint32(11)
+		if v, ok := pgTypeNamespaceOverlay[oid]; ok {
+			nsp = v
+		}
+		entries = append(entries, entry{name: e.Name, nsp: nsp, blk: t.Block, off: t.Offset})
 	}
-	// Sort by typname (NameData byte comparison); all bootstrap types share
-	// typnamespace=11 (pg_catalog) so the name is the whole live key.
-	sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
+	// Sort by typname (NameData byte comparison), then typnamespace — the index
+	// key is (typname, typnamespace), and the domains are the first rows outside
+	// pg_catalog so the secondary key can now actually decide an ordering.
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].name != entries[j].name {
+			return entries[i].name < entries[j].name
+		}
+		return entries[i].nsp < entries[j].nsp
+	})
 
 	const nameOidTupleSize = 80 // MAXALIGN(8 + 64 + 4)
 	const nkeyatts = 2          // (typname, typnamespace)
 	tuples := make([][]byte, len(entries))
 	for i, e := range entries {
-		tuples[i] = pgBuildIndexTupleNameOidKey(e.blk, e.off, e.name, 11)
+		tuples[i] = pgBuildIndexTupleNameOidKey(e.blk, e.off, e.name, e.nsp)
 	}
 	file, err := pgBuildBtreeBulkLoadSized(tuples, nameOidTupleSize, nkeyatts)
 	if err != nil {
@@ -1071,6 +1086,13 @@ func bootstrapPgClassRelnameNspIndex(dataDir string, tids map[uint32]heapTID) er
 	// (RELNAMENSP syscache). Omitting them here would leave the heap row
 	// unreachable by name.
 	allRels = append(allRels, nailedToastRels()...)
+	// M0133-S3: the information_schema data tables resolve by name through THIS
+	// index (RELNAMENSP syscache), so their pg_class rows must be reachable here
+	// or a hosted PG's `information_schema.sql_features` lookup misses.
+	allRels = append(allRels, informationSchemaDataTableRels()...)
+	// M0133-S4: the information_schema VIEWS resolve by name through THIS index
+	// too, keyed under namespace 13273 (see pgClassRelnamespaceFor).
+	allRels = append(allRels, informationSchemaViewSeedRels()...)
 
 	entries := make([]entry, 0, len(allRels))
 	for _, rel := range allRels {
@@ -1689,6 +1711,44 @@ func pgBuildIndexTupleOidNameKey(heapBlk uint32, heapOff uint16, oid uint32, nam
 	return out
 }
 
+// pgBuildIndexTupleOidOidNameKey encodes a 3-column composite IndexTuple
+// (oid, oid, name) — the key schema of pg_constraint_conrelid_contypid_conname_index
+// (OID 2665, indkey=[conrelid, contypid, conname]). Used by
+// bootstrapPgConstraintRelidTypidNameIndex (M0133-S1).
+//
+// Layout mirrors pgBuildIndexTupleOidNameKey with one extra leading oid:
+//
+//	[0..7]   t_tid + t_info
+//	[8..11]  conrelid  (oid, LE uint32)
+//	[12..15] contypid  (oid, LE uint32)
+//	[16..79] conname   (NameData, 64 bytes zero-padded)
+//
+// Total = MAXALIGN(8 + 4 + 4 + 64) = MAXALIGN(80) = 80. Both oids align 'i'
+// and the name aligns 'c', so no inter-attribute padding.
+func pgBuildIndexTupleOidOidNameKey(heapBlk uint32, heapOff uint16, oid1, oid2 uint32, name string) []byte {
+	const (
+		nameDataLen = 64
+		hoff        = 8
+		size        = 80 // MAXALIGN(hoff + 4 + 4 + nameDataLen) = 80
+	)
+	out := make([]byte, size)
+	le := binary.LittleEndian
+
+	le.PutUint16(out[0:2], uint16(heapBlk>>16))
+	le.PutUint16(out[2:4], uint16(heapBlk&0xFFFF))
+	le.PutUint16(out[4:6], heapOff)
+	le.PutUint16(out[6:8], uint16(size)&indexSizeMask)
+
+	le.PutUint32(out[hoff:hoff+4], oid1)
+	le.PutUint32(out[hoff+4:hoff+8], oid2)
+	n := len(name)
+	if n > nameDataLen {
+		n = nameDataLen
+	}
+	copy(out[hoff+8:hoff+8+n], name[:n])
+	return out
+}
+
 // bootstrapPgRewriteOidIndex overwrites base/{1,5}/2692 with a populated
 // 2-block btree (metapage + leaf-root) carrying one oid-keyed
 // IndexTuple per Form_pg_rewrite heap row. M0106-0010 Step 3dm phase B.
@@ -1783,15 +1843,15 @@ func bootstrapPgRewriteRelRulenameIndex(dataDir string, tids map[uint32]heapTID)
 	for i, e := range entries {
 		tuples[i] = pgBuildIndexTupleOidNameKey(e.block, e.off, e.evClass, e.ruleName)
 	}
-	leaf, err := pgBuildBtreeLeafRootPage(tuples)
+	// M0133-S4: this leaf now carries the 80 pg_catalog _RETURN rules PLUS the
+	// 33 information_schema ones (113 tuples), which no longer fits a single
+	// leaf-root page (80-byte oid+name tuples → ~97 per page). Use the sized
+	// bulk load, which spills to multiple leaves + an internal root above that
+	// threshold — the same path pg_class_relname_nsp_index already exercises.
+	file, err := pgBuildBtreeBulkLoadSized(tuples, 80 /* oid+name tuple size */, 2 /* nkeyatts */)
 	if err != nil {
 		return fmt.Errorf("pg_rewrite_rel_rulename_index leaf: %w", err)
 	}
-	meta := pgBuildBtreeMetapageWithRoot(1, 0)
-
-	file := make([]byte, 0, 2*storage.BlockSize)
-	file = append(file, meta...)
-	file = append(file, leaf...)
 
 	for _, dir := range []string{
 		filepath.Join(dataDir, "base", "1"),

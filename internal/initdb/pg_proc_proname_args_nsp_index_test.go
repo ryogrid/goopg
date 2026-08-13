@@ -71,6 +71,58 @@ func TestBootstrapPgProcPronameArgsNspIndexWritesPopulatedBtree(t *testing.T) {
 	}
 }
 
+// TestBootstrapPgProcPronameArgsNspIndexNamesInfoSchemaNamespace pins the
+// M0133-S2 fix: the information_schema helpers are indexed under namespace
+// 13273, not the pg_catalog hardcode of 11. A hosted PG's FuncnameGetCandidates
+// for `information_schema._pg_char_max_length(23, -1)` binary-searches
+// PROCNAMEARGSNSP keyed on (proname, proargtypes, 13273); an 11 here made the
+// lookup miss exactly the way the pg_type_typname_nsp_index gap did
+// (0133-0001 F1).
+func TestBootstrapPgProcPronameArgsNspIndexNamesInfoSchemaNamespace(t *testing.T) {
+	dir := t.TempDir()
+	for _, d := range []string{"base/1", "base/5", "global"} {
+		if err := os.MkdirAll(filepath.Join(dir, d), 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
+	tids, err := bootstrapPgProcTuples(dir)
+	if err != nil {
+		t.Fatalf("bootstrapPgProcTuples: %v", err)
+	}
+	if err := bootstrapPgProcPronameArgsNspIndex(dir, tids); err != nil {
+		t.Fatalf("bootstrapPgProcPronameArgsNspIndex: %v", err)
+	}
+	buf, err := os.ReadFile(filepath.Join(dir, "base", "1", "2691"))
+	if err != nil {
+		t.Fatalf("read index: %v", err)
+	}
+
+	// The (proname, proargtypes, pronamespace) key for
+	// _pg_char_max_length (OID 13278, argtypes {26, 23}, namespace 13273),
+	// byte-for-byte as pgBuildIndexTupleProcKey lays it out.
+	nameData := make([]byte, 64)
+	copy(nameData, "_pg_char_max_length")
+	want := append([]byte(nil), nameData...)
+	want = append(want, pgEncodeOidvectorForIndex([]uint32{26, 23})...)
+	ns := make([]byte, 4)
+	binary.LittleEndian.PutUint32(ns, 13273)
+	want = append(want, ns...)
+	if !bytes.Contains(buf, want) {
+		t.Errorf("index lacks _pg_char_max_length keyed under namespace 13273")
+	}
+
+	// The pre-M0133-S2 hardcode would have written namespace 11; assert that
+	// key is absent, so the fix is not silently reverted to the stale twin.
+	bad := append([]byte(nil), nameData...)
+	bad = append(bad, pgEncodeOidvectorForIndex([]uint32{26, 23})...)
+	badNS := make([]byte, 4)
+	binary.LittleEndian.PutUint32(badNS, 11)
+	bad = append(bad, badNS...)
+	if bytes.Contains(buf, bad) {
+		t.Errorf("index keys _pg_char_max_length under pg_catalog (11) — the namespace hardcode is back")
+	}
+}
+
 // TestPgBuildIndexTupleProcKeyLayout pins the byte layout of the
 // IndexTuple for count(*) (OID 2803): empty proargtypes, pronamespace=11.
 // Tuple size = 8 (header) + 64 (NameData) + 24 (empty oidvector) + 4

@@ -179,8 +179,15 @@ func TestPgRewriteEvActionDatumSwitchesRepresentation(t *testing.T) {
 	// Upstream's stored sizes are 9002 / 9316 / 12196 / 11481 / 35379 / 10475 B.
 	// M0131-S9.3f added the largest: pg_seclabels' 203378 B raw value
 	// compresses to 34093 B over 18 chunks, more than the other four together.
-	// M0131-S9.3g added the sixth and LAST — pg_stats_ext_exprs (rule 12066),
-	// 92109 B raw over 6 chunks, which completes upstream's 80-view corpus.
+	// M0131-S9.3g added the sixth — pg_stats_ext_exprs (rule 12066), 92109 B
+	// raw over 6 chunks, which completes upstream's 80-view pg_catalog corpus.
+	//
+	// M0133-S4 tranche 2 added the ten information_schema TOAST views: the
+	// catalog-direct views whose stored ev_action exceeds the 8000 B inline
+	// budget (F33). element_types is NOT here — it is over budget too, but it
+	// embeds :relid 13553 (data_type_privileges) and is a tranche-4 view.
+	// M0133-S4 tranche 4 added element_types (rule 13561), the eleventh F33
+	// value — the view-on-view whose stored ev_action exceeds the inline budget.
 	wantToasted := map[uint32]string{
 		12046: "pg_indexes",
 		12056: "pg_stats",
@@ -188,6 +195,17 @@ func TestPgRewriteEvActionDatumSwitchesRepresentation(t *testing.T) {
 		12066: "pg_stats_ext_exprs",
 		12102: "pg_seclabels",
 		12177: "pg_statio_all_tables",
+		13314: "attributes",
+		13329: "check_constraints",
+		13354: "column_privileges",
+		13364: "columns",
+		13369: "constraint_column_usage",
+		13388: "domains",
+		13407: "referential_constraints",
+		13445: "routines",
+		13498: "transforms",
+		13522: "usage_privileges",
+		13561: "element_types",
 	}
 	gotToasted := map[uint32]bool{}
 	for _, e := range pgRewriteInitialEntries() {

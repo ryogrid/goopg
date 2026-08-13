@@ -1,0 +1,21 @@
+pgbench (18.3)
+starting vacuum...end.
+progress: 30.0 s, 69908.4 tps, lat 0.715 ms stddev 1.527, 0 failed
+progress: 60.0 s, 73185.5 tps, lat 0.683 ms stddev 1.632, 0 failed
+progress: 90.0 s, 74475.2 tps, lat 0.671 ms stddev 1.651, 0 failed
+transaction type: <builtin: select only>
+scaling factor: 100
+query mode: prepared
+number of clients: 50
+number of threads: 50
+maximum number of tries: 1
+duration: 120 s
+number of transactions actually processed: 8742569
+number of failed transactions: 0 (0.000%)
+latency average = 0.686 ms
+latency stddev = 1.626 ms
+initial connection time = 6.323 ms
+tps = 72857.579469 (without initial connection time)
+statement latencies in milliseconds and failures:
+         0.001           0 \set aid random(1, 100000 * :scale)
+         0.695           0 SELECT abalance FROM pgbench_accounts WHERE aid = :aid;

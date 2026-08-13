@@ -84,17 +84,46 @@ TOAST_WRITER_GO="${INITDB_DIR}/pg_rewrite_toast_writer.go"
 die()  { echo "capture-ev-action: $*" >&2; exit 2; }
 fail() { echo "capture-ev-action: GUARD FAILED: $*" >&2; exit 1; }
 
+# -------------------------------------------------------------------------- #
+# --prosqlbody mode (M0133-S2): capture the information_schema helper
+# functions' pg_proc rows. The view corpus (above) captures pg_rewrite
+# ev_action blobs; these 11 functions carry a SECOND node-tree surface — the
+# new-style SQL-standard function body in pg_proc.prosqlbody (a pg_node_tree
+# exactly like ev_action). 10 of the 11 helpers set prosrc='' and a non-null
+# prosqlbody; only _pg_expandarray has a textual prosrc and prosqlbody=NULL.
+# The `pgnodes` non-path argument applies unchanged: capture, do not generate.
+# -------------------------------------------------------------------------- #
+PROCSQLBODY=0
+PROC_MANIFEST="${INITDB_DIR}/information_schema_proc_manifest.tsv"
+PROC_OUT_DIR="${INITDB_DIR}"
+
+# M0133-S4: the information_schema views share the capture pipeline but live in
+# namespace 13273 and are pinned by informationSchemaViewOIDPins() (a separate
+# Go table), so they need a separate manifest and a separate pin file. The
+# flag selects the namespace the pg_class / pg_rewrite / pg_attribute queries
+# resolve against and the pin file the script parses its guard data from.
+INFO_SCHEMA=0
+NSP_NAME="pg_catalog"
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --out-dir)  OUT_DIR="$2"; shift 2 ;;
         --manifest) MANIFEST="$2"; shift 2 ;;
         --verify)   VERIFY=1; shift ;;
         --keep)     KEEP=1; shift ;;
+        --prosqlbody) PROCSQLBODY=1; shift ;;
+        --information-schema) INFO_SCHEMA=1; shift ;;
         -h|--help)  sed -n '3,40p' "${BASH_SOURCE[0]}"; exit 0 ;;
         -*)         die "unknown option: $1" ;;
         *)          VIEWS+=("$1"); shift ;;
     esac
 done
+
+if [[ $INFO_SCHEMA -eq 1 ]]; then
+    NSP_NAME="information_schema"
+    PINS_GO="${INITDB_DIR}/information_schema_view_oid_pins.go"
+    MANIFEST="${INITDB_DIR}/information_schema_view_manifest.tsv"
+fi
 
 for b in initdb pg_ctl psql; do
     command -v "$b" >/dev/null 2>&1 || die "missing ${b} — expected under ${PG_BIN}"
@@ -103,7 +132,11 @@ done
 # -------------------------------------------------------------------------- #
 # Single sources of truth read out of the Go tree
 # -------------------------------------------------------------------------- #
-PINS_GO="${INITDB_DIR}/system_view_oid_pins.go"
+# PINS_GO is the system_view_oid_pins.go default here; the --information-schema
+# override above re-points it at information_schema_view_oid_pins.go.
+if [[ $INFO_SCHEMA -eq 0 ]]; then
+    PINS_GO="${INITDB_DIR}/system_view_oid_pins.go"
+fi
 # pgTypeCanonical, not pg_type_seed_data.go: the CANONICAL table is what
 # bootstrapPgTypeTuples derives attalign/attbyval from, and it is a strict
 # subset of the seed data. Parsing the wider file made guard #5 vacuous —
@@ -147,11 +180,13 @@ while read -r oid; do known_type["$oid"]=1; done \
     < <(sed -n 's/^[[:space:]]*return pgTypeEntry{\([0-9]*\),.*/\1/p' "$TYPES_GO")
 [[ ${#known_type[@]} -gt 0 ]] || die "parsed zero pg_type entries out of ${TYPES_GO}"
 
-if [[ $VERIFY -eq 1 ]]; then
-    [[ ${#VIEWS[@]} -eq 0 ]] || die "--verify takes no view arguments"
-    VIEWS=("${PINNED_ORDER[@]}")
+if [[ $PROCSQLBODY -eq 0 ]]; then
+    if [[ $VERIFY -eq 1 ]]; then
+        [[ ${#VIEWS[@]} -eq 0 ]] || die "--verify takes no view arguments"
+        VIEWS=("${PINNED_ORDER[@]}")
+    fi
+    [[ ${#VIEWS[@]} -gt 0 ]] || die "no views named (try --verify)"
 fi
-[[ ${#VIEWS[@]} -gt 0 ]] || die "no views named (try --verify)"
 
 # -------------------------------------------------------------------------- #
 # Throwaway oracle cluster
@@ -191,6 +226,144 @@ ORACLE_VERSION="$(psql_q "SELECT current_setting('server_version')")"
 ORACLE_CATVERSION="$(pg_controldata -D "$PGDATA_DIR" | sed -n 's/^Catalog version number:[[:space:]]*//p')"
 
 # -------------------------------------------------------------------------- #
+# --prosqlbody mode (M0133-S2): capture the information_schema helper
+# functions' pg_proc rows + prosqlbody node-tree blobs.
+# -------------------------------------------------------------------------- #
+if [[ $PROCSQLBODY -eq 1 ]]; then
+    if [[ $VERIFY -eq 1 ]]; then
+        [[ ${#VIEWS[@]} -eq 0 ]] || die "--prosqlbody --verify takes no OID arguments"
+        # Re-derive the committed function set from the manifest's proc rows.
+        VIEWS=()
+        while IFS=$'\t' read -r kind name oid _; do
+            [[ "$kind" == "proc" ]] && VIEWS+=("$oid")
+        done < <(grep -v '^#' "$PROC_MANIFEST" 2>/dev/null || true)
+        [[ ${#VIEWS[@]} -gt 0 ]] || die "--prosqlbody --verify: no committed proc rows in ${PROC_MANIFEST}"
+    fi
+    [[ ${#VIEWS[@]} -gt 0 ]] || die "--prosqlbody needs at least one function OID (or --verify)"
+
+    PROC_MANIFEST_STAGE="${STAGE_DIR}/information_schema_proc_manifest.tsv"
+    {
+        echo "# Code generated by scripts/capture-ev-action.sh --prosqlbody; DO NOT EDIT."
+        echo "# Oracle: PostgreSQL ${ORACLE_VERSION}, catalog version ${ORACLE_CATVERSION}."
+        echo "# Captured from a throwaway 'initdb --no-sync' cluster (M0133-S2)."
+        echo "#"
+        echo "# proc <name> <oid> <pronamespace> <procost> <prorows> <prosupport> <prokind> <provolatile> <proparallel> <proisstrict> <proretset> <prolang> <prorettype> <proargtypes> <proallargtypes> <proargmodes> <proargnames> <prosrc> <prosqlbody>"
+        echo "# <proargtypes> is space-separated oidvector text; <proallargtypes>/<proargmodes>/<proargnames> are PG array ::text or '-' for NULL; <prosqlbody> is '-' (NULL) or the blob's text length."
+    } > "$PROC_MANIFEST_STAGE"
+
+    for oid in "${VIEWS[@]}"; do
+        echo "capture-ev-action: capturing prosqlbody for pg_proc OID ${oid}..."
+
+        # Structural guard: every column this manifest does NOT carry must be the
+        # value the seed path hardcodes (prosecdef/proleakproof false, owner 10,
+        # no variadic, no arg defaults, no trftypes/probin/proconfig/proacl).
+        # A helper that broke the assumption would silently seed a wrong row.
+        guard_row="$(psql_q "SELECT (p.prosecdef OR p.proleakproof), (p.proowner <> 10), (p.provariadic <> 0), (p.pronargdefaults <> 0), (p.protrftypes IS NOT NULL), (p.probin IS NOT NULL), (p.proconfig IS NOT NULL), (p.proacl IS NOT NULL) FROM pg_proc p WHERE p.oid = ${oid}")" \
+            || die "pg_proc guard query failed for OID ${oid}"
+        IFS=$'\t' read -r g_secdef g_owner g_variadic g_nargdef g_trftypes g_probin g_proconfig g_proacl <<< "$guard_row"
+        for bad in "$g_secdef" "$g_owner" "$g_variadic" "$g_nargdef" "$g_trftypes" "$g_probin" "$g_proconfig" "$g_proacl"; do
+            [[ "$bad" == "f" ]] || fail "OID ${oid}: an unmodeled pg_proc column is non-default (guard row: ${guard_row})"
+        done
+
+        row="$(psql_q "SELECT p.proname, p.oid, p.pronamespace, p.procost, p.prorows,
+                              p.prosupport::oid, p.prokind, p.provolatile, p.proparallel,
+                              p.proisstrict, p.proretset, p.prolang, p.prorettype,
+                              p.proargtypes::text,
+                              coalesce(p.proallargtypes::text, '-'),
+                              coalesce(p.proargmodes::text, '-'),
+                              coalesce(p.proargnames::text, '-'),
+                              CASE WHEN p.prosrc = '' THEN '<empty>' ELSE p.prosrc END,
+                              CASE WHEN p.prosqlbody IS NULL THEN '-' ELSE length(p.prosqlbody::text)::text END
+                         FROM pg_proc p WHERE p.oid = ${oid}")" \
+            || die "pg_proc row query failed for OID ${oid}"
+        IFS=$'\t' read -r p_name p_oid p_nsp p_cost p_rows p_support p_kind p_vol p_par \
+            p_strict p_retset p_lang p_rettype p_argtypes p_allargs p_argmodes p_argnames \
+            p_prosrc p_sqlbody <<< "$row"
+        # '<empty>' is the capture-time sentinel for a zero-length prosrc: bash's
+        # IFS whitespace collapsing would otherwise swallow an empty field that
+        # sits between two tabs, shifting p_sqlbody into p_prosrc's slot.
+        [[ "$p_prosrc" == "<empty>" ]] && p_prosrc=""
+        [[ "$p_oid" == "$oid" ]] || fail "OID ${oid}: queried row carries oid ${p_oid}"
+        [[ "$p_name" != "" ]] || fail "OID ${oid}: empty proname"
+        # prosrc must not contain a tab or newline, or the TSV column splits.
+        [[ "$p_prosrc" == "${p_prosrc//$'\t'/}" && "$p_prosrc" == "${p_prosrc//$'\n'/}" ]] \
+            || fail "OID ${oid} (${p_name}): prosrc contains a tab/newline — the TSV manifest cannot carry it"
+
+        # --- the prosqlbody blob (the node tree, captured verbatim) --------- #
+        # Stored as PG's pg_proc.prosqlbody holds it: one line, no trailing
+        # newline. First/last byte is NOT asserted as '('..')' the way
+        # ev_action is — a single-statement SQL body nodeToString's to
+        # '{QUERY ...}' while a BEGIN ATOMIC body is a parenthesised List.
+        if [[ "$p_sqlbody" != "-" ]]; then
+            raw="${STAGE_DIR}/${p_name}_prosqlbody.raw"
+            dat="${STAGE_DIR}/${p_name}_prosqlbody.dat"
+            psql -X -A -t -q -h "$SOCK_DIR" -d postgres -v ON_ERROR_STOP=1 \
+                -c "SELECT prosqlbody FROM pg_proc WHERE oid = ${oid}" > "$raw" \
+                || die "prosqlbody query failed for ${p_name}"
+            [[ -s "$raw" ]] || fail "${p_name}: empty prosqlbody (declared length ${p_sqlbody})"
+            [[ "$(tail -c1 "$raw" | od -An -tx1 | tr -d ' ')" == "0a" ]] \
+                || fail "${p_name}: psql output did not end in a newline"
+            head -c -1 "$raw" > "$dat"
+            [[ "$(wc -l < "$dat")" -eq 0 ]] \
+                || fail "${p_name}: prosqlbody spans multiple lines"
+            [[ "$(wc -c < "$dat")" -eq "$p_sqlbody" ]] \
+                || fail "${p_name}: prosqlbody captured $(wc -c < "$dat") B but the oracle stores ${p_sqlbody} B"
+        fi
+
+        printf 'proc\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$p_name" "$p_oid" "$p_nsp" "$p_cost" "$p_rows" "$p_support" "$p_kind" "$p_vol" "$p_par" \
+            "$p_strict" "$p_retset" "$p_lang" "$p_rettype" "$p_argtypes" "$p_allargs" "$p_argmodes" "$p_argnames" \
+            "$p_prosrc" "$p_sqlbody" >> "$PROC_MANIFEST_STAGE"
+    done
+
+    if [[ $VERIFY -eq 1 ]]; then
+        echo "capture-ev-action: --prosqlbody --verify: comparing against the committed tree..."
+        rc=0
+        for oid in "${VIEWS[@]}"; do
+            info="$(grep -v '^#' "$PROC_MANIFEST_STAGE" | awk -F$'\t' -v o="$oid" '$1=="proc" && $3==o {print $2, $20}')"
+            name="${info%% *}"; hasbody="${info##* }"
+            [[ -n "$name" ]] || { echo "  MISSING  manifest row for OID ${oid}" >&2; rc=1; continue; }
+            if [[ "$hasbody" == "-" ]]; then
+                echo "  ok       ${name} (no prosqlbody — textual prosrc)"
+                continue
+            fi
+            committed="${INITDB_DIR}/${name}_prosqlbody.dat"
+            if [[ ! -f "$committed" ]]; then
+                echo "  MISSING  ${committed}" >&2; rc=1; continue
+            fi
+            if cmp -s "${STAGE_DIR}/${name}_prosqlbody.dat" "$committed"; then
+                echo "  ok       ${name}_prosqlbody.dat"
+            else
+                echo "  DRIFT    ${name}_prosqlbody.dat differs from the oracle" >&2
+                rc=1
+            fi
+        done
+        if diff <(grep -v '^#' "$PROC_MANIFEST_STAGE") <(grep -v '^#' "$PROC_MANIFEST") >/dev/null; then
+            echo "  ok       $(basename "$PROC_MANIFEST")"
+        else
+            echo "  DRIFT    $(basename "$PROC_MANIFEST") differs from the oracle" >&2
+            diff <(grep -v '^#' "$PROC_MANIFEST") <(grep -v '^#' "$PROC_MANIFEST_STAGE") >&2 || true
+            rc=1
+        fi
+        [[ $rc -eq 0 ]] && echo "capture-ev-action: --prosqlbody --verify PASS (${#VIEWS[@]} procs byte-identical)"
+        exit $rc
+    fi
+
+    mkdir -p "$PROC_OUT_DIR"
+    for oid in "${VIEWS[@]}"; do
+        name="$(grep -v '^#' "$PROC_MANIFEST_STAGE" | awk -F$'\t' -v o="$oid" '$1=="proc" && $3==o {print $2}')"
+        if [[ -f "${STAGE_DIR}/${name}_prosqlbody.dat" ]]; then
+            cp "${STAGE_DIR}/${name}_prosqlbody.dat" "${PROC_OUT_DIR}/${name}_prosqlbody.dat"
+            echo "capture-ev-action: wrote ${PROC_OUT_DIR}/${name}_prosqlbody.dat"
+        fi
+    done
+    cp "$PROC_MANIFEST_STAGE" "$PROC_MANIFEST"
+    echo "capture-ev-action: wrote ${PROC_MANIFEST}"
+    echo "capture-ev-action: --prosqlbody done (${#VIEWS[@]} procs)"
+    exit 0
+fi
+
+# -------------------------------------------------------------------------- #
 # Capture
 # -------------------------------------------------------------------------- #
 MANIFEST_STAGE="${STAGE_DIR}/nailed_view_manifest.tsv"
@@ -211,18 +384,18 @@ MANIFEST_STAGE="${STAGE_DIR}/nailed_view_manifest.tsv"
 GOOPG_RELTYPE=2249
 
 for view in "${VIEWS[@]}"; do
-    echo "capture-ev-action: capturing pg_catalog.${view}..."
+    echo "capture-ev-action: capturing ${NSP_NAME}.${view}..."
 
     # --- Query 3: the pg_class row (feeds nailedRel) --------------------- #
     rel_row="$(psql_q "SELECT c.oid, c.reltype, c.relkind, c.relnatts
-                         FROM pg_class c WHERE c.oid = 'pg_catalog.${view}'::regclass")" \
+                         FROM pg_class c WHERE c.oid = '${NSP_NAME}.${view}'::regclass")" \
         || die "pg_class query failed for ${view}"
     IFS=$'\t' read -r rel_oid rel_type rel_kind rel_natts <<< "$rel_row"
-    [[ -n "$rel_oid" ]] || die "pg_catalog.${view} does not exist in the oracle"
+    [[ -n "$rel_oid" ]] || die "${NSP_NAME}.${view} does not exist in the oracle"
     [[ "$rel_kind" == "v" ]] || fail "${view}: relkind is '${rel_kind}', not 'v'"
 
     rule_oid="$(psql_q "SELECT r.oid FROM pg_rewrite r
-                         WHERE r.ev_class = 'pg_catalog.${view}'::regclass
+                         WHERE r.ev_class = '${NSP_NAME}.${view}'::regclass
                            AND r.rulename = '_RETURN'")"
     [[ -n "$rule_oid" ]] || fail "${view}: no _RETURN rule in pg_rewrite"
 
@@ -255,7 +428,7 @@ for view in "${VIEWS[@]}"; do
     dat="${STAGE_DIR}/${view}_ev_action.dat"
     psql -X -A -t -q -h "$SOCK_DIR" -d postgres -v ON_ERROR_STOP=1 \
         -c "SELECT r.ev_action FROM pg_rewrite r
-             WHERE r.ev_class = 'pg_catalog.${view}'::regclass
+             WHERE r.ev_class = '${NSP_NAME}.${view}'::regclass
                AND r.rulename = '_RETURN'" > "$raw" \
         || die "ev_action query failed for ${view}"
     [[ -s "$raw" ]] || fail "${view}: empty ev_action"
@@ -288,7 +461,7 @@ for view in "${VIEWS[@]}"; do
     # A capture that PG chose to keep inline while goopg would externalise it
     # (or vice versa) is caught here, not in a hosted PG's detoast path.
     stored_len="$(psql_q "SELECT pg_column_size(r.ev_action) FROM pg_rewrite r
-                           WHERE r.ev_class = 'pg_catalog.${view}'::regclass
+                           WHERE r.ev_class = '${NSP_NAME}.${view}'::regclass
                              AND r.rulename = '_RETURN'")"
     [[ -n "$stored_len" ]] || die "${view}: pg_column_size query returned nothing"
     if [[ "$stored_len" -gt $MAX_EV_ACTION_STORED ]]; then
@@ -339,7 +512,7 @@ for view in "${VIEWS[@]}"; do
     done < <(psql_q "SELECT a.attnum, a.attname, a.atttypid,
                             a.attlen, a.attnotnull, a.attisdropped
                        FROM pg_attribute a
-                      WHERE a.attrelid = 'pg_catalog.${view}'::regclass AND a.attnum > 0
+                      WHERE a.attrelid = '${NSP_NAME}.${view}'::regclass AND a.attnum > 0
                       ORDER BY a.attnum")
     [[ "$attr_count" -eq "$rel_natts" ]] \
         || fail "${view}: captured ${attr_count} attributes but relnatts is ${rel_natts}"

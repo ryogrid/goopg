@@ -41,7 +41,7 @@ func TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages(t *testing.T) {
 		1418, // pg_user_mapping (M0106-0010 step 3cp)
 		2224, // pg_sequence (M0106-0010 step 3cb)
 		2328, // pg_foreign_data_wrapper (M0106-0010 step 3bb)
-		2604, 2606, 2608, 2609, 2611,
+		2604, 2608, 2609, 2611,
 		2613, 2614,
 		2619, 2620,
 		3079, // pg_extension (M0106-0010 step 3aw)
@@ -85,7 +85,7 @@ func TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages(t *testing.T) {
 	// by bootstrapMappedLocalCatalogHeaps; their files should not be
 	// created by this call. The dedicated bootstrapper is responsible.
 	for _, db := range []string{"base/1", "base/5"} {
-		for _, oid := range []uint32{2600, 2605, 2607, 2617, 2753, 3541} {
+		for _, oid := range []uint32{2600, 2605, 2606, 2607, 2617, 2753, 3541} {
 			path := filepath.Join(dir, db, strconv.FormatUint(uint64(oid), 10))
 			if _, err := os.Stat(path); err == nil {
 				t.Errorf("OID %d in %s exists after bootstrapMappedLocalCatalogHeaps — must be omitted (clobbers dedicated bootstrapper)", oid, db)

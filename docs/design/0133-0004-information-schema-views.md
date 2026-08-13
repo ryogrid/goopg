@@ -1,0 +1,191 @@
+# M0133-S4 — `information_schema` views (65, all four tranches COMPLETE)
+
+**Status:** accepted — tranche 1 COMPLETE 2026-08-14 (33 catalog-direct leaves);
+tranche 2 COMPLETE 2026-08-14 (10 TOAST views); tranche 3 COMPLETE 2026-08-14
+(4 helper-function views); tranche 4 COMPLETE 2026-08-14 (18 view-on-view).
+**Milestone:** M0133 (`information_schema` on disk), slice S4.
+**Supersedes:** S9.4d in `0131-0009-system-view-corpus-widening.md` §"Successor decomposition".
+
+## What landed
+
+All 65 `information_schema` views — **the 33 catalog-direct leaves, the 10
+catalog-direct TOAST views, the 4 helper-function views, and (tranche 4) the 18
+view-on-view views** — seeded on disk so a hosted PG 18.3 cold-started on a
+goopg `$PGDATA` resolves and **evaluates** `SELECT * FROM
+information_schema.<view>` for each. The slice reuses the M0131-S9
+capture/pin/regen loop unchanged (Option-A identity pinning), with one new
+generator and two forced fixes (below).
+
+Tranche 4 (2026-08-14) is the view-on-view set: the 18 views whose `ev_action`
+embeds in-band `:relid` references to OTHER information_schema views, whose bases
+all landed in tranches 1–3. `element_types` (13558) is the eleventh F33 value —
+its 10956 B stored `ev_action` exceeds the 8000 B inline budget and is the sole
+tranche-4 view externalised through the pg_rewrite TOAST writer (rule 13561, 6
+chunks / 10541 B goopg-encoded). The other 17 store inline.
+
+Four of the 33 landed one loop later, by a **catalog-descriptor-completion**
+slice (2026-08-14), not a view-capture problem — their ev_action blobs are
+verbatim PG 18.3, but the catalogs they read were still goopg's 8-column
+bootstrap-survival seeds:
+
+- `character_sets` / `collations` / `collation_character_set_applicability`
+  read `pg_collation` (3456) columns 9–12 — goopg seeded 8 columns with
+  `collcollate` as `name` (19/64) where PG18 has `text` (25/-1). Fixed by
+  widening `pgCollationAttrs()` to the 12-column schema and re-seeding the 7
+  heap rows in `bootstrapPgCollationTuples` (values mirror the runtime
+  `PGCollationRowsForDBOid`).
+- `triggers` reads `pg_trigger` (2620) columns 3 and 9–19 — goopg seeded 8
+  columns. Fixed by widening `pgTriggerAttrs()` to the 19-column schema (the
+  heap is empty, so the descriptor is the whole fix), which also reconciles
+  index 2701's pre-existing `indkey={2,4}` (tgname at attnum 4) with the
+  descriptor.
+
+## Why four tranches
+
+All three blockers that could have gated S4 were cleared before this slice: S2's
+11 helper functions (the `:funcid` surface), S3's data tables (the bulk-heap-load
+mechanism), and the F4 fix (`typispreferred` for the eight PG18 preferred types,
+so the views' `character_data = 'x'` / `||` WHERE-clause operators resolve). With
+those on disk, the 65 views split cleanly into four tranches by what their
+`ev_action` references — measured against a fresh PG 18.3, not assumed:
+
+| tranche | criterion | count |
+|---|---|---|
+| **1 (done)** | catalog-direct, no in-band `:relid`, no in-band `:funcid`, stored ≤ 8000 B | 33 (4 landed a loop later by the descriptor-completion slice) |
+| **2 (done)** | catalog-direct, stored > 8000 B (TOAST) | 10 (`attributes`, `check_constraints`, `column_privileges`, `columns`, `constraint_column_usage`, `domains`, `referential_constraints`, `routines`, `transforms`, `usage_privileges`) |
+| **3 (done)** | helper-function (`:funcid` 13274..13285), stored ≤ 8000 B | 4 (`key_column_usage`, `parameters`, `sequences`, `triggered_update_columns`) |
+| **4 (done)** | view-on-view (`:relid` in 13293..13621) | 18 |
+
+The 11 F33 over-budget values split 10/1: ten are catalog-direct (tranche 2) and
+`element_types` — the eleventh — is view-on-view (it embeds `:relid` 13553
+`data_type_privileges`), so it belongs to tranche 4. Tranche 4 counts 18, not the
+17 first estimated at filing: the 16 dependency edges plus the `data_type_privileges`
+chain yield 18 dependent views once `_pg_user_mappings` (a base *and* a dependent)
+is counted once.
+
+## Measured object graph
+
+The `information_schema` band shares the single post-bootstrap counter with the
+pg_catalog corpus, and is **not dense** — objects interleave by
+`information_schema.sql` creation order:
+
+```
+13273          the information_schema namespace                     [S1]
+13274..13285   the 11 helper functions (13280 is a hole)           [S2]
+13286..13300   the 5 domains + 5 array peers                       [S1]
+13293..13621   the 65 views (interleaved with the domains)
+13456..13475   the 4 data tables (5 OIDs each)                     [S3]
+```
+
+Every view's reltype is `oid+2` (composite rowtype) and its `_RETURN` rule is
+`oid+3`, verified for all 65 (`reltype = oid+2 AND rule = oid+3` holds across the
+whole band). goopg keeps the M0131-S6.5 divergence: `RelType 2249` (RECORDOID),
+not the composite.
+
+### The 16 view-on-view edges (tranche 4, already measured)
+
+`applicable_roles → administrable_role_authorizations`;
+`enabled_roles → role_{column,routine,table,udt,usage}_grants`;
+`column_privileges → role_column_grants`, `routine_privileges → role_routine_grants`,
+`table_privileges → role_table_grants`, `udt_privileges → role_udt_grants`,
+`usage_privileges → role_usage_grants`;
+`{attributes,columns,domains,parameters,routines} → data_type_privileges →
+element_types`;
+`_pg_foreign_table_columns → column_options`;
+`_pg_foreign_data_wrappers → foreign_data_wrapper_options, foreign_data_wrappers`;
+`_pg_foreign_servers → foreign_server_options, foreign_servers, _pg_user_mappings`;
+`_pg_foreign_tables → foreign_table_options, foreign_tables`;
+`_pg_user_mappings → user_mapping_options, user_mappings`.
+
+All 16 are edges among the information_schema views themselves — F32 already
+established that **no** information_schema rule references a pg_catalog *view*
+(they reference pg_catalog *catalogs*, which are sub-12000 bootstrap constants),
+so M0133 is independent of the M0131-S9 view-on-view work.
+
+## Wiring
+
+The 65 views must reach the on-disk catalogs **without** entering
+`pg_internal.init` — upstream never nails information_schema relations. They ride
+a **third list**, `informationSchemaViewSeedRels()`, exactly like the data tables'
+`informationSchemaDataTableRels()`, wired at five sites plus the pg_rewrite heap:
+
+1. `bootstrapPgClassTuples` — pg_class rows (relkind `'v'`, relhasrules true via
+   `pgClassRow`'s existing view arm).
+2. `bootstrapPgAttributeTuples` — pg_attribute descriptors (the domain-typed
+   columns: `atttypid` 13292/13290/13300/… from the capture, `attlen` 64/-1).
+3. `pgRewriteInitialEntries` — the `_RETURN` rules, appended to
+   `nailedViewRewriteEntries()` so the 2692/2693 indexes cover them.
+4. `bootstrapPgClassRelnameNspIndex` — the (relname, relnamespace) index, keyed
+   under 13273 via `pgClassRelnamespaceFor` (extended to the view OIDs).
+5. `pgClassRelnamespaceFor` — routes the 33 view OIDs to `infoSchemaNamespaceOID`
+   (13273), the same path the data tables use.
+
+The pg_type bootstrap needs no change: the views carry `RelType 2249`, already in
+the entry map, so no composite rowtype is minted (the M0131-S6.5 divergence).
+
+New artefacts:
+
+- `internal/initdb/information_schema_view_oid_pins.go` — the Option-A pin table
+  (`informationSchemaViewOIDPins()`, reusing `systemViewOIDPin`), captured from
+  the same PG 18.3 oracle.
+- `cmd/gen-information-schema-views/main.go` — renders
+  `information_schema_view_manifest.tsv` into
+  `internal/initdb/information_schema_view_seed_data.go`
+  (`informationSchemaViewSeedRels()` + `informationSchemaViewRewriteEntries()`).
+  A separate generator for the same reason `gen-information-schema-procs` is
+  separate: disjoint namespace + list, one stdout stream each.
+- `scripts/capture-ev-action.sh --information-schema` — captures
+  `information_schema.<view>::regclass` into
+  `information_schema_view_manifest.tsv` + `<view>_ev_action.dat`, parsing the
+  new pin file. The `pg_catalog.${view}` literal became `${NSP_NAME}.${view}`.
+
+## The forced fix: pg_rewrite_rel_rulename_index goes multi-page
+
+The 2693 index (`pg_rewrite_rel_rulename_index`, `(ev_class, rulename)`) was
+bulk-loaded with `pgBuildBtreeLeafRootPage` — a **single** leaf-root page. 80
+pg_catalog rules fit (80×80 B ≈ 6400 B < 8152 B); adding 33 information_schema
+rules pushed it to 113 tuples and overflowed the page at tuple 97. Switched to
+`pgBuildBtreeBulkLoadSized(tuples, 80, 2)`, the same multi-page path
+`pg_class_relname_nsp_index` already uses (metapage + N leaves + internal root).
+The oid index 2692 (16-byte tuples) still fits one leaf-root (113 < 407) and is
+unchanged.
+
+## Guards
+
+- `information_schema_view_oid_pins_test.go` — pin↔seed-row OID/RelNatts
+  agreement, rule-OID agreement, band disjointness against `systemViewOIDPins`,
+  and the RelType 2249 divergence (mirrors the S8a guards).
+- `pinnedSystemViewOIDs()` extended to the information_schema pins, so the blob
+  invariant guard (`TestEvActionBlobsCarryNoUnmappedInBandRelid`) covers the new
+  corpus.
+- `TestNailedViewEvActionBlobSetMatchesSeededViews` and
+  `TestPgRewriteRuleOIDsMatchUpstreamPins` widened to the second pin table.
+- `TestPgClassHeapBootstrapCoverage` / `TestBootstrappedViewsCarryRelhasrules` /
+  `TestPgRewriteInitialEntriesContainsPgStatWalReceiverReturn` /
+  `TestBootstrapPgRewriteLeafIndicesWriteBothFiles` — count/coverage checks
+  updated for the +33 rows.
+- E2E `assertInformationSchemaViewsEvaluable` — a hosted PG resolves each adopted
+  view to its pinned OID and evaluates `SELECT * FROM … LIMIT 0`. The absence
+  probe `assertNonCorpusSystemViewIsStillAbsent` walked `tables` → `columns` →
+  `element_types` as each tranche adopted its subject, and tranche 4 — which
+  adopts the last view — re-points it out of `information_schema` entirely:
+  the VIEW supply is now exhausted (all 80 pg_catalog + all 65 information_schema
+  views on disk), so the probe moves to `pg_catalog.pg_largeobject` (2613), the
+  one pg_catalog catalog goopg deliberately never bootstraps (`relcache_init.go`
+  nailedLocalRels: `pg_seclabels` references it only via a folded `::regclass`
+  Const). Its absence is permanent, so the tripwire now guards the evaluability
+  probe's non-vacuity rather than any future adoption.
+- Tranche 2 extended `TestPgRewriteEvActionDatumSwitchesRepresentation`'s
+  `wantToasted` map (+10 rule OIDs), `TestPgRewriteToastPairIndexRowAndFiles`'s
+  page count (2838: 12 → 31), and E2E `assertHostedPGSeesPgRewriteToastRelation`'s
+  `wantChunks` (+10 `chunk_id/count/bytes` rows). Tranche 4 adds the eleventh of
+  each: `wantToasted` +13561, page count 31 → 32, `wantChunks` + `13562/6/10541`.
+
+## Remaining
+
+Nothing view-capture-related: all 65 views are on disk and evaluable. The one
+open item is the **dual-definition hazard** — goopg's front end still answers 6
+information_schema relations virtually (`routines` 7 cols vs 82 on disk,
+`parameters` 8 vs 32, four `routine_*_usage` stubs with count/type drift),
+measured and ledgered under M0133-S4 rather than fixed in this slice (it changes
+goopg-client-visible output; the F6/F9 discipline).

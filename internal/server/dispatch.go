@@ -970,6 +970,18 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 				// Cache miss: plan now so we can store it.
 				freshNode, perr := planner.Plan(stmt, sessionPlanCatalog(sess, s.cfg.Catalog, ectx.CurrentDatabaseOid))
 				if perr != nil {
+					// M0132-S5 (S1 finding (i)): a PLAN-time error must abort
+					// the block too. Every other error path reaches
+					// connTx.Fail() via errQueryErrorSent below, but this
+					// cache-miss planning site returns straight out of the
+					// dispatch loop, so the block used to stay live and
+					// healthy after `BEGIN; INSERT INTO <missing table>;`.
+					// PostgreSQL aborts on ANY error inside the block
+					// (postgres.c's error handler, not the executor).
+					if !autoCommit && connTx != nil && connTx.InExplicit() {
+						connTx.Fail()
+						connTx.ReleasePinnedSnapshotOnFail(ectx.TxnMgr)
+					}
 					code, msg := planErrorFields(perr)
 					return s.writeQueryError(w, code, msg, planErrorHintFields(perr)...)
 				}
@@ -1029,6 +1041,35 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 				return nil
 			}
 			return err
+		}
+		// An explicit transaction block (BEGIN/START TRANSACTION … COMMIT/ROLLBACK)
+		// ended mid-batch. The message-level transaction `tx` was finalized by the
+		// verb (committed or rolled back) and is now dead, and *autoCommitPtr was
+		// left false so the trailing auto-commit wouldn't double-commit it — but any
+		// REMAINING statement in this message would then run against the finalized
+		// transaction and fail with "mvcc: unknown transaction". PG starts a fresh
+		// autocommit transaction for each statement that follows an ended block, so
+		// re-arm here: begin a fresh RC transaction and re-mark the message as
+		// auto-committing, exactly like the PLpgSQLCommitChain closure above.
+		if !autoCommit && connTx != nil && !connTx.InExplicit() {
+			var chainPN int32
+			if connTx != nil {
+				chainPN = connTx.ProcNum
+			}
+			newTx, berr := s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted, chainPN)
+			if berr != nil {
+				return s.writeQueryError(w, sqlstate.SystemError, berr.Error())
+			}
+			newSnap, serr := s.cfg.TxnMgr.SnapshotFor(newTx)
+			if serr != nil {
+				_ = s.cfg.TxnMgr.Rollback(newTx)
+				return s.writeQueryError(w, sqlstate.SystemError, serr.Error())
+			}
+			tx = newTx
+			snap = newSnap
+			ectx.Tx = newTx
+			ectx.Snap = newSnap
+			autoCommit = true
 		}
 		// Write back the temp-table shadow map so it persists across statements. M0097-0003.
 		if connTx != nil && ectx.TempTableShadows != nil {
@@ -3339,7 +3380,7 @@ func appendFloat8Text(dst []byte, d executor.Datum) []byte {
 // appendTimeText formats a KindTime datum as a time-of-day string matching PostgreSQL's
 // time output format: HH:MM:SS with optional fractional seconds up to the declared precision.
 // Precision 0 → "HH:MM:SS", precision N → "HH:MM:SS.ffffff" (N digits). M0097-0004.
-func appendTimeText(dst []byte, d executor.Datum, typ catalog.Type) []byte {
+func appendTimeText(dst []byte, d executor.Datum, _ catalog.Type) []byte {
 	if d.IsNull() {
 		return dst
 	}
@@ -3357,24 +3398,19 @@ func appendTimeText(dst []byte, d executor.Datum, typ catalog.Type) []byte {
 		byte('0'+m/10), byte('0'+m%10), ':',
 		byte('0'+s/10), byte('0'+s%10))
 
-	// Fractional seconds — only emit if non-zero or precision requested.
-	prec := 6 // default microseconds
-	if len(typ.Args) > 0 && typ.Args[0] >= 0 {
-		prec = int(typ.Args[0])
-	}
-	if prec > 0 && ns != 0 {
-		// Format up to 6 microsecond digits, then trim to declared precision.
+	// Fractional seconds — only emit when non-zero. The declared precision is
+	// applied at INPUT now (roundTimeDatumToPrecision → AdjustTimeForTypmod), so
+	// the stored value already holds at most its precision's non-zero fractional
+	// digits and the render is verbatim: format the full 6 microsecond digits,
+	// strip trailing zeros. M0119-0006 (62nd slice).
+	if ns != 0 {
 		micro := ns / 1000
 		frac := make([]byte, 6)
 		for i := 5; i >= 0; i-- {
 			frac[i] = byte('0' + micro%10)
 			micro /= 10
 		}
-		// Trim to declared precision.
-		if prec < 6 {
-			frac = frac[:prec]
-		}
-		// Strip trailing zeros after applying precision.
+		// Strip trailing zeros.
 		for len(frac) > 0 && frac[len(frac)-1] == '0' {
 			frac = frac[:len(frac)-1]
 		}

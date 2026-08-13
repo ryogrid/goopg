@@ -90,6 +90,15 @@ type toastRelPair struct {
 func nailedToastPairs() []toastRelPair {
 	return []toastRelPair{
 		{Parent: 2618, ToastRel: 2838, ToastIdx: 2839, RelName: "pg_toast_2618"},
+		// M0133-S3: the four information_schema data tables declare a TOAST
+		// pair (character_data is varlena) that upstream's CREATE TABLE makes
+		// automatically. No datum ever exceeds the inline budget (max column is
+		// sub_feature_name at 120 B), so these stay byte-for-byte empty — the
+		// same image a fresh PG's initdb leaves behind.
+		{Parent: 13456, ToastRel: 13459, ToastIdx: 13460, RelName: "pg_toast_13456"}, // sql_features
+		{Parent: 13461, ToastRel: 13464, ToastIdx: 13465, RelName: "pg_toast_13461"}, // sql_implementation_info
+		{Parent: 13466, ToastRel: 13469, ToastIdx: 13470, RelName: "pg_toast_13466"}, // sql_parts
+		{Parent: 13471, ToastRel: 13474, ToastIdx: 13475, RelName: "pg_toast_13471"}, // sql_sizing
 	}
 }
 
@@ -162,6 +171,23 @@ func pgClassRelnamespaceFor(oid uint32) uint32 {
 	for _, p := range nailedToastPairs() {
 		if p.ToastRel == oid || p.ToastIdx == oid {
 			return pgToastNamespaceOID
+		}
+	}
+	// M0133-S3: the four information_schema data tables live in namespace 13273.
+	// A wrong namespace here is as fatal as for the TOAST pairs — the
+	// pg_class_relname_nsp_index is keyed on it, so a hosted PG's RELNAMENSP
+	// probe for information_schema.sql_features would miss.
+	for _, t := range infoSchemaTables() {
+		if t.oid == oid {
+			return infoSchemaNamespaceOID
+		}
+	}
+	// M0133-S4: the information_schema VIEWS share namespace 13273 with the data
+	// tables. Same failure mode — a hosted PG resolving information_schema.tables
+	// by name through RELNAMENSP would miss if it were keyed under 11.
+	for _, r := range informationSchemaViewSeedRels() {
+		if r.OID == oid {
+			return infoSchemaNamespaceOID
 		}
 	}
 	return 11

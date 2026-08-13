@@ -13,6 +13,7 @@ import (
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/pgarray"
+	"github.com/goopg/goopg/internal/pgdatetime"
 	"github.com/goopg/goopg/internal/pglz"
 	"github.com/goopg/goopg/internal/pgnodes"
 	"github.com/goopg/goopg/internal/storage"
@@ -148,6 +149,18 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 	}
 
 	tname := strings.ToLower(t.Name)
+
+	// jsonb is canonicalised at the input boundary (M0119-0006, 64th slice):
+	// PG stores a parsed tree and re-emits jsonb_out's canonical form on every
+	// read, so `'{"b":1,"a":2}'::jsonb` renders `{"a": 2, "b": 1}`. goopg stored
+	// the text verbatim; canonicalising here makes a jsonb column hold the same
+	// text PG would show, and adds the 22P02 validation the bare pass-through
+	// was missing. `json` (text) is deliberately untouched — it preserves the
+	// input spelling.
+	if tname == "jsonb" {
+		return canonicalizeJSONB(s)
+	}
+
 	// The declared length of a varchar(n)/char(n) counts CHARACTERS, not bytes:
 	// upstream varchar_input and bpchar_input both measure with
 	// pg_mbstrlen_with_len before converting maxlen to a byte length
@@ -269,7 +282,7 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 			return []byte{1}, nil
 		}
 		return []byte{0}, nil
-	case "int2", "smallint":
+	case "int2", "smallint", "smallserial", "serial2":
 		var v int64
 		switch d.Kind {
 		case KindInt:
@@ -301,7 +314,7 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		var buf [2]byte
 		binary.LittleEndian.PutUint16(buf[:], uint16(int16(v)))
 		return buf[:], nil
-	case "int4", "integer", "int", "serial":
+	case "int4", "integer", "int", "serial", "serial4":
 		var v int64
 		switch d.Kind {
 		case KindInt:
@@ -328,7 +341,7 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		var buf [4]byte
 		binary.LittleEndian.PutUint32(buf[:], uint32(int32(v)))
 		return buf[:], nil
-	case "int8", "bigint", "bigserial":
+	case "int8", "bigint", "bigserial", "serial8":
 		var v int64
 		switch d.Kind {
 		case KindInt:
@@ -457,6 +470,14 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		if d.Kind != KindTime {
 			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
 		}
+		// Apply the column's declared precision here too, as the storage-choke
+		// point: the input sites (coerce/copy/cast) already round, and this arm
+		// is the safety net for paths that bypass them — a DEFAULT or generated
+		// column's value is skipped by coerceRowForConstraintChecks's
+		// !insertMissing filter, and reaches here as a KindString. Rounding is
+		// idempotent, so a value already rounded at input is untouched.
+		// M0119-0006 (62nd slice).
+		d = roundTimeDatumToPrecision(d, timeColumnPrecision(t))
 		var buf [8]byte
 		binary.LittleEndian.PutUint64(buf[:], uint64(pgTimeMicros(d.TimeValue())))
 		return buf[:], nil
@@ -471,6 +492,7 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		if d.Kind != KindTime {
 			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
 		}
+		d = roundTimeDatumToPrecision(d, timeColumnPrecision(t))
 		var buf [12]byte
 		binary.LittleEndian.PutUint64(buf[:8], uint64(pgTimeMicros(d.TimeValue())))
 		// PG wire stores timezone offset as int32 seconds, positive = west of UTC.
@@ -500,6 +522,17 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		// The ±infinity sentinels need no special case: INTERVAL_NOEND /
 		// INTERVAL_NOBEGIN *are* all-fields-at-their-extreme, so field-wise
 		// storage round-trips them exactly.
+		// Apply the column's declared typmod here too, as the storage-choke
+		// point: the input sites (coerce/copy) already round, and this arm is
+		// the safety net for paths that bypass them — a DEFAULT or generated
+		// column's value is skipped by coerceRowForConstraintChecks's
+		// !insertMissing filter and reaches here as a KindString. Rounding is
+		// idempotent, so a value already rounded at input is untouched.
+		// M0119-0006 (63rd slice).
+		d, err := roundIntervalDatumToTypmod(d, intervalColumnTypmod(t))
+		if err != nil {
+			return nil, err
+		}
 		months, days, micros, err := pgIntervalFieldsFromDatum(d)
 		if err != nil {
 			return nil, err
@@ -891,6 +924,72 @@ func pgTimeFromMicros(micros int64) time.Time {
 	return time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC).Add(time.Duration(micros) * time.Microsecond)
 }
 
+// roundTimeDatumToPrecision rounds a `time`/`timetz` Datum to the declared
+// fractional-second precision (0..6) the way upstream time_in/timetz_in round
+// via AdjustTimeForTypmod (postgres/src/backend/utils/adt/date.c:1710). It is
+// a no-op for a non-time datum or a precision outside [0,6].
+//
+// The round-trip pgTimeMicros → AdjustTimeForTypmod → pgTimeFromMicros is what
+// expresses the carry goopg's former OUTPUT-side truncation could not: at
+// precision 2, `'23:59:59.999999'` becomes 24:00:00 (usecsPerDay), because the
+// hour-24 rule the 50th slice moved into pgTimeMicros/pgTimeFromMicros reads the
+// rounded value back as next-day midnight. The timetz subtype's offset rides in
+// Datum.Scale and is preserved untouched, exactly as AdjustTimeForTypmod leaves
+// the zone half of a TimeTzADT alone. M0119-0006 (62nd slice).
+func roundTimeDatumToPrecision(d Datum, prec int64) Datum {
+	if d.Kind != KindTime || prec < 0 || prec > 6 {
+		return d
+	}
+	micros := pgdatetime.AdjustTimeForTypmod(pgTimeMicros(d.TimeValue()), int32(prec))
+	tv := pgTimeFromMicros(micros)
+	if d.TimeSub == TimeSubTimeTZ {
+		return NewTimeTZDatum(tv, d.TimeTZOffsetSecs())
+	}
+	return NewTimeDatum(tv)
+}
+
+// timeColumnPrecision returns the declared fractional-second precision of a
+// `time`/`timetz` column (t.Args[0]), or -1 when no precision is declared.
+func timeColumnPrecision(t catalog.Type) int64 {
+	if len(t.Args) == 0 {
+		return -1
+	}
+	return t.Args[0]
+}
+
+// intervalColumnTypmod returns the declared interval typmod of an interval
+// column (t.Args[0], the packed INTERVAL_TYPMOD the parser stores for
+// `interval(N)` / `interval <field> [TO <lo>] [(p)]`), or -1 when the column
+// is a bare `interval` with no modifier.
+func intervalColumnTypmod(t catalog.Type) int64 {
+	if len(t.Args) == 0 {
+		return -1
+	}
+	return t.Args[0]
+}
+
+// roundIntervalDatumToTypmod applies an interval column's declared typmod to a
+// Datum the way upstream interval_in/interval_recv do at INPUT via
+// AdjustIntervalForTypmod (timestamp.c:1355): it parses a KindString body
+// through the SAME pgIntervalFieldsFromDatum tokenizer encodeValuePG uses
+// (parser.ParseIntervalBody, the full grammar — not evalCast's limited
+// `<n> <unit>` arm), zeroes the range fields outside the declared span, and
+// rounds the sub-second field to the declared SECOND(p) precision. A null
+// datum, an absent typmod (typmod < 0) and the ±infinity sentinel are all
+// returned unchanged — the last because AdjustIntervalForTypmod no-ops on it,
+// exactly as upstream. M0119-0006 (63rd slice).
+func roundIntervalDatumToTypmod(d Datum, typmod int64) (Datum, error) {
+	if d.IsNull() || typmod < 0 {
+		return d, nil
+	}
+	months, days, micros, err := pgIntervalFieldsFromDatum(d)
+	if err != nil {
+		return Datum{}, err
+	}
+	months, days, micros = pgdatetime.AdjustIntervalForTypmod(months, days, micros, int32(typmod))
+	return NewIntervalDatumFull(months, days, micros), nil
+}
+
 // DecodeRow inverts EncodeRow.
 func DecodeRow(cols []catalog.Column, data []byte) (Row, error) {
 	row := make(Row, len(cols))
@@ -1089,11 +1188,11 @@ func physicalPGTypeAlign(t catalog.Type) int {
 			return 1
 		}
 		return 4
-	case "int2", "smallint":
+	case "int2", "smallint", "smallserial", "serial2":
 		return 2
-	case "int4", "integer", "int", "serial", "oid", "regproc", "float4", "real", "date", "xid":
+	case "int4", "integer", "int", "serial", "serial4", "oid", "regproc", "float4", "real", "date", "xid":
 		return 4
-	case "int8", "bigint", "bigserial", "pg_lsn", "float8", "double precision", "double", "timestamp", "timestamptz", "time", "timetz",
+	case "int8", "bigint", "bigserial", "serial8", "pg_lsn", "float8", "double precision", "double", "timestamp", "timestamptz", "time", "timetz",
 		// interval is typalign 'd' (pg_type OID 1186) even though its 16 bytes
 		// exceed a Datum — the struct's leading field is an int64.
 		"interval",
@@ -1138,9 +1237,9 @@ func pgPhysicalTypeIsVarlena(t catalog.Type) bool {
 		// char(N) with length modifier = bpchar (varlena).
 		return len(t.Args) > 0
 	case "bool", "boolean",
-		"int2", "smallint",
-		"int4", "integer", "int", "serial",
-		"int8", "bigint", "bigserial",
+		"int2", "smallint", "smallserial", "serial2",
+		"int4", "integer", "int", "serial", "serial4",
+		"int8", "bigint", "bigserial", "serial8",
 		"pg_lsn",
 		"oid", "regproc",
 		"timestamp", "timestamptz", "date", "time", "timetz",
@@ -1223,17 +1322,17 @@ func decodePhysicalPGValueMctxStyled(t catalog.Type, data []byte, sctx *mctx.Con
 			return Datum{}, 0, fmt.Errorf("truncated bool")
 		}
 		return NewBoolDatum(data[0] != 0), 1, nil
-	case "int2", "smallint":
+	case "int2", "smallint", "smallserial", "serial2":
 		if len(data) < 2 {
 			return Datum{}, 0, fmt.Errorf("truncated int2")
 		}
 		return NewIntDatum(int64(int16(binary.LittleEndian.Uint16(data[:2])))), 2, nil
-	case "int4", "integer", "int", "serial":
+	case "int4", "integer", "int", "serial", "serial4":
 		if len(data) < 4 {
 			return Datum{}, 0, fmt.Errorf("truncated int4")
 		}
 		return NewIntDatum(int64(int32(binary.LittleEndian.Uint32(data[:4])))), 4, nil
-	case "int8", "bigint", "bigserial":
+	case "int8", "bigint", "bigserial", "serial8":
 		// Mirror encodeValuePG's 8-byte LE int8 encoding. Without this
 		// case, any int8/bigint value (including count(*)/sum() results
 		// stored via CTAS, and plain INSERTs into bigint columns) fell
@@ -1914,8 +2013,14 @@ func encodeVarlen(b []byte) []byte {
 //
 // bits is 32 for oid/regproc/xid and 64 for xid8. The bound mirrors upstream
 // uint32in_subr (postgres/src/backend/utils/adt/numutils.c, reached from oidin
-// via oid.c:41) and xid8in's uint64in_subr: a value outside the type's range is
-// 22003, never a silent wrap. typeName is the name PG puts in that message.
+// via oid.c:41) and xid8in's uint64in_subr. A value outside the type's range is
+// 22003, but a value with a leading '-' is NOT out of range: strtoul/strtoull
+// parse the sign and wrap, and uint32in_subr's PG_UINT32_MAX != ULONG_MAX block
+// admits the result if it matches after signed OR unsigned extension. The
+// accepted 32-bit range is therefore the union of int32 and uint32
+// ([MinInt32, MaxUint32]); "-1040" stores 4294966256, exactly as the oid
+// regress case (INSERT '-1040') expects. typeName is the name PG puts in the
+// 22003 message.
 //
 // M0119-0006 (54th slice): extracted so the heap arms of encodeValuePG and the
 // binary-COPY arms of datumToCopyBinary (copy_binary.go) cannot drift — the two
@@ -1935,10 +2040,19 @@ func pgUnsignedIDFromDatum(d Datum, typeName string, bits int) (uint64, error) {
 	default:
 		return 0, fmt.Errorf("expected int for %s, got kind %d", typeName, d.Kind)
 	}
-	if v < 0 || (bits == 32 && v > math.MaxUint32) {
-		return 0, &ExecError{Code: "22003",
-			Message: fmt.Sprintf("value %q is out of range for type %s", strings.TrimSpace(d.Format()), typeName)}
+	if bits == 32 {
+		// uint32in_subr accepts a value in the union of the signed-32 and
+		// unsigned-32 ranges (see the comment above): negatives wrap via
+		// uint32(v), only values outside [-2^31, 2^32-1] are 22003.
+		// M-NIGHTLY AI-20260814-011711-002.
+		if v < math.MinInt32 || v > math.MaxUint32 {
+			return 0, &ExecError{Code: "22003",
+				Message: fmt.Sprintf("value %q is out of range for type %s", strings.TrimSpace(d.Format()), typeName)}
+		}
+		return uint64(uint32(v)), nil
 	}
+	// bits == 64 (xid8): uint64in_subr wraps a negative through strtoull, so a
+	// negative int64 is its two's-complement uint64 image — no 22003.
 	return uint64(v), nil
 }
 

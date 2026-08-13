@@ -2,6 +2,7 @@ package server
 
 import (
 	"strconv"
+	"strings"
 
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/mvcc"
@@ -80,12 +81,25 @@ func noTransactionInProgressNotice() []protocol.ErrorField {
 }
 
 // endExplicitBlock performs the teardown every terminal path of the arm
-// shares: undo enum DDL, release the per-connection explicit state, fire the
-// EndLocalTransaction hook and clear the pending type-DDL queues. The inline
-// arm repeated this block five times; keeping it one function is what makes
-// the five paths verifiably identical.
-func (s *Server) endExplicitBlock(ctx *executor.Context, connTx *connTxState) {
-	undoEnumDDLForRollback(connTx, s.cfg.Catalog, ctx.CurrentDatabaseOid)
+// shares: optionally undo enum DDL, release the per-connection explicit state,
+// fire the EndLocalTransaction hook and clear the pending type-DDL queues. The
+// inline arm repeated this block five times; keeping it one function is what
+// makes the five paths verifiably identical.
+//
+// undoEnumDDL is true on every path that ends in a ROLLBACK (an explicit
+// ROLLBACK, a COMMIT in a failed block, a deferred-constraint or SSI abort, or
+// a CommitTransaction error) and false only on a successful COMMIT — a
+// committed ALTER TYPE … ADD VALUE must persist, not be reversed. M0132-S2's
+// extraction collapsed the original five inline teardown blocks into this one
+// helper and dropped that asymmetry: the pre-extraction COMMIT-success block
+// (dispatch.go's "Transaction verbs" arm) called connTx.End() + cleared the
+// queues WITHOUT undoEnumDDLForRollback. The M-NIGHTLY regress/enum regression
+// (AI-20260814-011711-001) is the direct consequence — after COMMIT, the newly
+// added enum label had been removed from the in-memory catalog.
+func (s *Server) endExplicitBlock(ctx *executor.Context, connTx *connTxState, undoEnumDDL bool) {
+	if undoEnumDDL {
+		undoEnumDDLForRollback(connTx, s.cfg.Catalog, ctx.CurrentDatabaseOid)
+	}
 	connTx.End()
 	if ctx.EndLocalTransaction != nil {
 		ctx.EndLocalTransaction()
@@ -95,6 +109,102 @@ func (s *Server) endExplicitBlock(ctx *executor.Context, connTx *connTxState) {
 	ctx.PendingCreatedEnums = nil
 	ctx.PendingCreatedComposites = nil
 	ctx.PendingCreatedRangeTypes = nil
+}
+
+// abortedBlockMessage is the 25P02 text PostgreSQL raises for any statement
+// issued while the current transaction block is aborted.
+const abortedBlockMessage = "current transaction is aborted, commands ignored until end of transaction block"
+
+// allowedInAbortedBlock reports whether a statement may run while the block is
+// in the failed (25P02) state. PostgreSQL rejects EVERYTHING except the verbs
+// that end (or unwind) the block — a constant `SELECT 1`, a `SHOW`, and a
+// `SET` included; see xact.c's AbortCurrentTransaction / postgres.c's
+// TBLOCK_ABORT handling.
+//
+// upper is the whitespace-normalised, upper-cased statement text (the form
+// both protocols' fast-path switches already compute). Matching on text rather
+// than on a parsed node is what lets the gate sit AHEAD of the fast paths that
+// answer `SELECT 1` / `SHOW` / `SET` without ever parsing — the hole
+// M0132-S1 found on the simple path and pinned in
+// TestM0132S1_ConstantSelectBypassesTheAbortedBlockGate.
+//
+// The two-phase verbs are allowed for the reason dispatch.go's per-statement
+// gate allows them: PG's PREPARE TRANSACTION on an aborted block silently
+// rolls back, and COMMIT/ROLLBACK PREPARED of an unknown gid reports "does not
+// exist" rather than 25P02.
+func allowedInAbortedBlock(upper string) bool {
+	for _, p := range []string{"COMMIT", "ROLLBACK", "ABORT", "END", "PREPARE TRANSACTION"} {
+		if upper == p || strings.HasPrefix(upper, p+" ") || strings.HasPrefix(upper, p+";") {
+			return true
+		}
+	}
+	return false
+}
+
+// failExplicitBlock marks an open explicit block aborted after an error.
+// PostgreSQL aborts the block from its top-level error handler (postgres.c),
+// so ANY error inside a block aborts it — parse and plan errors included, not
+// only executor errors. M0132-S5.
+func failExplicitBlock(connTx *connTxState) {
+	if connTx != nil && connTx.InExplicit() {
+		connTx.Fail()
+	}
+}
+
+// verbWarnFields renders the state machine's Warn flag as the NoticeResponse
+// field set the extended protocol carries on extendedQueryResult. Nil when
+// the outcome carries no warning.
+func verbWarnFields(out txnVerbOutcome) []protocol.ErrorField {
+	if !out.Warn {
+		return nil
+	}
+	return noTransactionInProgressNotice()
+}
+
+// extendedQueryErrorFromVerb renders a txnVerbError in the extended
+// protocol's error shape. The structured DETAIL/HINT/POSITION fields the
+// deferred-constraint and SSI failures carry would otherwise be dropped —
+// they are the whole reason the state machine returns a typed error instead
+// of a bare `error`.
+func extendedQueryErrorFromVerb(ve *txnVerbError) *extendedQueryError {
+	qerr := &extendedQueryError{Code: ve.Code, Message: ve.Msg}
+	for _, f := range ve.Fields {
+		switch f.Code {
+		case protocol.FieldDetail:
+			qerr.Detail = f.Value
+		case protocol.FieldHint:
+			qerr.Hint = f.Value
+		case protocol.FieldPosition:
+			if p, err := strconv.Atoi(f.Value); err == nil && p > 0 {
+				qerr.Position = p
+			}
+		}
+	}
+	return qerr
+}
+
+// writeBackConnTxState persists the per-connection state a statement may have
+// mutated back onto the connection, so it survives to the next message. The
+// simple path does exactly this at the foot of its per-statement loop
+// (dispatch.go); before M0132-S2 the extended path had no explicit block to
+// carry state across, so it did not need to.
+func (s *Server) writeBackConnTxState(ctx *executor.Context, connTx *connTxState) {
+	if connTx == nil {
+		return
+	}
+	if ctx.TempTableShadows != nil {
+		connTx.TempTableShadows = ctx.TempTableShadows
+	}
+	// Pending type-DDL undo state is written back ONLY while an explicit
+	// transaction is open — see dispatch.go's identical guard for why an
+	// autocommit statement must not leak its pending set onto the connection.
+	if connTx.InExplicit() {
+		connTx.PendingEnumValues = ctx.PendingEnumValues
+		connTx.PendingEnumRenames = ctx.PendingEnumRenames
+		connTx.PendingCreatedEnums = ctx.PendingCreatedEnums
+		connTx.PendingCreatedComposites = ctx.PendingCreatedComposites
+		connTx.PendingCreatedRangeTypes = ctx.PendingCreatedRangeTypes
+	}
 }
 
 // applyTransactionVerb drives the per-connection explicit transaction state
@@ -193,7 +303,7 @@ func (s *Server) applyTransactionVerb(ctx *executor.Context, connTx *connTxState
 			if connTx.IsFailed() {
 				// COMMIT in a failed transaction block → ROLLBACK (PG semantics).
 				_ = s.cfg.TxnMgr.Rollback(connTx.Tx())
-				s.endExplicitBlock(ctx, connTx)
+				s.endExplicitBlock(ctx, connTx, true)
 				return txnVerbOutcome{Handled: true, Tag: "ROLLBACK"}
 			}
 			explicitTx := connTx.Tx()
@@ -225,7 +335,7 @@ func (s *Server) applyTransactionVerb(ctx *executor.Context, connTx *connTxState
 				}
 				if deferErr != nil {
 					_ = s.cfg.TxnMgr.Rollback(explicitTx)
-					s.endExplicitBlock(ctx, connTx)
+					s.endExplicitBlock(ctx, connTx, true)
 					code := sqlstate.ForeignKeyViolation
 					var fields []protocol.ErrorField
 					if ee, ok := deferErr.(*executor.ExecError); ok {
@@ -255,7 +365,7 @@ func (s *Server) applyTransactionVerb(ctx *executor.Context, connTx *connTxState
 				if ssiErr := s.cfg.TxnMgr.PreCommitCheckForSerializationFailure(explicitTx.Handle); ssiErr != nil {
 					// SSI failure: rollback.
 					_ = s.cfg.TxnMgr.Rollback(explicitTx)
-					s.endExplicitBlock(ctx, connTx)
+					s.endExplicitBlock(ctx, connTx, true)
 					// Primary message is the bare upstream errmsg; the reason
 					// code rides in DETAIL (predicate.c parity). isolationtester
 					// and psql print only the errmsg line.
@@ -293,7 +403,7 @@ func (s *Server) applyTransactionVerb(ctx *executor.Context, connTx *connTxState
 				executor.ApplyDeferredRoutineDrops(ctx, sess)
 			}
 			if err := ctx.CommitTransaction(explicitTx); err != nil {
-				s.endExplicitBlock(ctx, connTx)
+				s.endExplicitBlock(ctx, connTx, true)
 				return txnVerbOutcome{Handled: true, Err: &txnVerbError{Code: sqlstate.SystemError, Msg: err.Error()}}
 			}
 			// Publish NOTIFYs buffered by this explicit transaction now that it
@@ -301,7 +411,7 @@ func (s *Server) applyTransactionVerb(ctx *executor.Context, connTx *connTxState
 			// to this session happens at the trailing ReadyForQuery via
 			// deliverNotifications. M0118-0009 (async-notify).
 			s.publishPendingNotify(connTx)
-			s.endExplicitBlock(ctx, connTx)
+			s.endExplicitBlock(ctx, connTx, false)
 			maybeForceGCAfterCommit()
 			// Leave *autoCommitPtr = false so the caller does NOT attempt
 			// a second TxnMgr.Commit on the already-committed transaction.
@@ -317,7 +427,7 @@ func (s *Server) applyTransactionVerb(ctx *executor.Context, connTx *connTxState
 				executor.ProcessRollbackUndos(ctx, sess)
 			}
 			_ = s.cfg.TxnMgr.Rollback(connTx.Tx())
-			s.endExplicitBlock(ctx, connTx)
+			s.endExplicitBlock(ctx, connTx, true)
 			// Leave *autoCommitPtr = false to avoid a second rollback attempt.
 			return txnVerbOutcome{Handled: true, Tag: transactionTag(txNode.Verb)}
 		}

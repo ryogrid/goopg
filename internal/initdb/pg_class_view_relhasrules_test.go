@@ -118,7 +118,9 @@ func TestBootstrappedViewsCarryRelhasrules(t *testing.T) {
 // views and climbing toward system_views.sql's 80, re-typing the list is the
 // error, not the guard.
 func nailedViewOIDs() []uint32 {
-	pins := systemViewOIDPins()
+	// M0133-S4: the information_schema views seed relkind='v' pg_class rows too,
+	// so the count check must cover both pin tables.
+	pins := append(append([]systemViewOIDPin{}, systemViewOIDPins()...), informationSchemaViewOIDPins()...)
 	out := make([]uint32, 0, len(pins))
 	for _, p := range pins {
 		out = append(out, p.ViewOID)

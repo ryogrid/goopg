@@ -119,6 +119,49 @@ func TestSimpleQueryBatchExplicitBeginUndoesEarlierAutocommitCreateTable(t *test
 	}
 }
 
+// TestSimpleQueryBatchStatementAfterBlockEndRunsInFreshTransaction pins the
+// re-arm fix in dispatch.go: a statement AFTER an explicit block's
+// COMMIT/ROLLBACK in the same simple-query message must run in a FRESH
+// autocommit transaction (PG commits each post-block statement individually),
+// not against the finalized message transaction. Before the fix, the
+// post-block statement ran against the already-committed/rolled-back
+// transaction and failed with "mvcc: unknown transaction".
+func TestSimpleQueryBatchStatementAfterBlockEndRunsInFreshTransaction(t *testing.T) {
+	addr, cat, stop := startCopyExecServer(t)
+	defer stop()
+	im, ok := cat.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("catalog is not *catalog.InMemory")
+	}
+
+	conn := dialAndComplete(t, addr)
+	defer conn.Close()
+
+	// ROLLBACK ends the block; the following CREATE TABLE must survive.
+	const rollbackInner = "zz_post_rollback_inner"
+	const rollbackOuter = "zz_post_rollback_outer"
+	writeQuery(t, conn, "BEGIN; CREATE TABLE "+rollbackInner+" (a int4); ROLLBACK; CREATE TABLE "+rollbackOuter+" (b int4);")
+	readUntilReady(t, conn)
+	if _, found := im.LookupTable(parser.ObjectName{Name: rollbackInner}); found {
+		t.Fatalf("table %q (inside the block) survived the ROLLBACK", rollbackInner)
+	}
+	if _, found := im.LookupTable(parser.ObjectName{Name: rollbackOuter}); !found {
+		t.Fatalf("table %q (after the ROLLBACK) was not created in a fresh transaction", rollbackOuter)
+	}
+
+	// COMMIT ends the block; the following CREATE TABLE must survive.
+	const commitInner = "zz_post_commit_inner"
+	const commitOuter = "zz_post_commit_outer"
+	writeQuery(t, conn, "BEGIN; CREATE TABLE "+commitInner+" (a int4); COMMIT; CREATE TABLE "+commitOuter+" (b int4);")
+	readUntilReady(t, conn)
+	if _, found := im.LookupTable(parser.ObjectName{Name: commitInner}); !found {
+		t.Fatalf("table %q (inside the block) was not committed", commitInner)
+	}
+	if _, found := im.LookupTable(parser.ObjectName{Name: commitOuter}); !found {
+		t.Fatalf("table %q (after the COMMIT) was not created in a fresh transaction", commitOuter)
+	}
+}
+
 // TestSimpleQueryBatchAbortUndoesEarlierCreateType pins root-0024's first
 // documented residual (M0110-0001): enum/composite-type creation was not
 // undo-tracked for a message-scoped autocommit batch, the same bug class
@@ -286,6 +329,47 @@ func TestSimpleQueryMidBatchBeginUndoesEarlierAutocommitAddValue(t *testing.T) {
 			t.Fatalf("enum value 'happy' survived autocommit-ADD-VALUE-then-mid-batch-BEGIN-ROLLBACK; frames=%+v", frames)
 		}
 	}
+}
+
+// TestSimpleQueryCommitPersistsEnumAddValue pins M-NIGHTLY AI-20260814-011711-001
+// (regress/enum). M0132-S2's extraction of the transaction-verb state machine
+// (txn_verb.go applyTransactionVerb) collapsed the terminal teardown of all
+// five block-ending paths into endExplicitBlock, which unconditionally called
+// undoEnumDDLForRollback. That undoes an ALTER TYPE … ADD VALUE on ROLLBACK —
+// correct — but it also ran on a SUCCESSFUL COMMIT, so the newly-added label
+// was silently removed from the in-memory catalog the moment the block ended.
+// The regress enum case caught it as `invalid input value for enum bogus:
+// "new"` on the post-COMMIT `SELECT 'new'::bogus`, and `pg_enum` reporting only
+// the pre-existing label. The fix gates the undo behind a flag that is true on
+// every rollback/abort path and false only on a successful COMMIT.
+func TestSimpleQueryCommitPersistsEnumAddValue(t *testing.T) {
+	addr, cat, stop := startCopyExecServer(t)
+	defer stop()
+	im, ok := cat.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("catalog is not *catalog.InMemory")
+	}
+
+	conn := dialAndComplete(t, addr)
+	defer conn.Close()
+
+	const typeName = "zz_batch_atomicity_commit_addvalue"
+	writeQuery(t, conn, "CREATE TYPE "+typeName+" AS ENUM ('sad','ok');")
+	readUntilReady(t, conn)
+
+	writeQuery(t, conn, "BEGIN; ALTER TYPE "+typeName+" ADD VALUE 'happy'; COMMIT;")
+	readUntilReady(t, conn)
+
+	et, found := im.LookupEnum(typeName)
+	if !found {
+		t.Fatalf("enum type %q vanished entirely", typeName)
+	}
+	for _, v := range et.Values {
+		if v.Label == "happy" {
+			return // committed ADD VALUE survived — the bug is fixed
+		}
+	}
+	t.Fatalf("enum value 'happy' did not survive BEGIN-ADD VALUE-COMMIT; values=%+v", et.Values)
 }
 
 // TestSimpleQueryBatchAbortUndoesEarlierTruncate closes root-0024's first

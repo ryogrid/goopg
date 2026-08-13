@@ -100,7 +100,8 @@ func TestPgInputErrorInfoEnum(t *testing.T) {
 		t.Errorf("second Next should be EOF, got err=%v", err2)
 	}
 
-	// Valid enum value → 0 rows.
+	// Valid enum value → one row whose four columns are all NULL (upstream
+	// misc.c:731-733), not zero rows. M0119-0006.
 	pgPlan2 := &planner.PgInputErrorInfo{
 		Value: &planner.StringConst{Value: "red"},
 		Type:  &planner.StringConst{Value: "rainbow"},
@@ -109,8 +110,24 @@ func TestPgInputErrorInfoEnum(t *testing.T) {
 	if err := op2.Open(ctx); err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	_, err3 := op2.Next()
-	if err3 != EOF {
-		t.Errorf("Next for valid enum should be EOF immediately, got %v", err3)
+	slot2, err3 := op2.Next()
+	if err3 != nil {
+		t.Fatalf("Next for valid enum: %v", err3)
+	}
+	if slot2 == nil {
+		t.Fatal("Next returned nil slot for valid enum value — expected 1 all-NULL row")
+	}
+	row2 := slot2.Row()
+	if len(row2) != 4 {
+		t.Fatalf("valid-enum row has %d columns, want 4", len(row2))
+	}
+	for i, d := range row2 {
+		if !d.IsNull() {
+			t.Errorf("valid-enum column %d = %v, want NULL", i, d)
+		}
+	}
+	// Second call should return EOF.
+	if _, err4 := op2.Next(); err4 != EOF {
+		t.Errorf("second Next for valid enum should be EOF, got %v", err4)
 	}
 }

@@ -1,0 +1,28 @@
+pgbench (18.3)
+starting vacuum...end.
+progress: 30.0 s, 8427.5 tps, lat 5.932 ms stddev 13.004, 0 failed
+progress: 60.0 s, 10939.6 tps, lat 4.570 ms stddev 4.629, 0 failed
+progress: 90.0 s, 10532.3 tps, lat 4.747 ms stddev 6.050, 0 failed
+transaction type: <builtin: simple update>
+scaling factor: 100
+query mode: simple
+number of clients: 50
+number of threads: 50
+maximum number of tries: 1
+duration: 120 s
+number of transactions actually processed: 1218952
+number of failed transactions: 0 (0.000%)
+latency average = 4.922 ms
+latency stddev = 7.518 ms
+initial connection time = 6.350 ms
+tps = 10158.089175 (without initial connection time)
+statement latencies in milliseconds and failures:
+         0.001           0 \set aid random(1, 100000 * :scale)
+         0.000           0 \set bid random(1, 1 * :scale)
+         0.000           0 \set tid random(1, 10 * :scale)
+         0.000           0 \set delta random(-5000, 5000)
+         0.243           0 BEGIN;
+         0.518           0 UPDATE pgbench_accounts SET abalance = abalance + :delta WHERE aid = :aid;
+         0.329           0 SELECT abalance FROM pgbench_accounts WHERE aid = :aid;
+         0.295           0 INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES (:tid, :bid, :aid, :delta, CURRENT_TIMESTAMP);
+         3.542           0 END;

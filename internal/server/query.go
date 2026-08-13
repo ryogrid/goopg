@@ -83,11 +83,24 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 		return s.dispatchSimpleQueryViaExecutor(ctx, r, w, sess, trimmed, connTx, prepStmts)
 	}
 
+	upper := strings.ToUpper(matchable)
+
+	// M0132-S5: the aborted-block gate must sit AHEAD of the string-match fast
+	// paths below, not only inside dispatchSimpleQueryViaExecutor's
+	// per-statement loop. A constant `SELECT 1` (and `SHOW`/`SET`/`RESET`)
+	// never reaches that loop, so a failed block answered them normally while
+	// PostgreSQL rejects every statement except the block-ending verbs
+	// (M0132-S1 finding (ii), pinned by
+	// TestM0132S1_ConstantSelectBypassesTheAbortedBlockGate). The loop's own
+	// gate stays: it is the one that covers each statement of a multi-statement
+	// message, which this single-statement gate deliberately does not touch.
+	if connTx != nil && connTx.IsFailed() && !allowedInAbortedBlock(upper) {
+		return s.writeQueryError(w, "25P02", abortedBlockMessage)
+	}
+
 	if strings.EqualFold(matchable, "SELECT 1") {
 		return s.respondSelectOne(w)
 	}
-
-	upper := strings.ToUpper(matchable)
 
 	// A GRANT/REVOKE … ON TYPE|DOMAIN … changes pg_type.typacl, which is
 	// heap-backed (PG18-standby basebackup parity, M0097-0022) — unlike the

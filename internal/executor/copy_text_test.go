@@ -393,11 +393,14 @@ func TestEncodeCopyTextRowTimeAndTimeTZ(t *testing.T) {
 		// read reports "00:00:00" for it.
 		{"time 24", catalog.Type{Name: "time"},
 			Row{NewTimeDatum(time.Date(1970, time.January, 2, 0, 0, 0, 0, time.UTC))}, "24:00:00\n"},
-		// Declared precision is applied at OUTPUT because goopg applies no
-		// typmod at input; this mirrors internal/server's appendTimeText so
-		// COPY and SELECT agree on the same column.
-		{"time(2)", catalog.Type{Name: "time", Args: []int64{2}},
-			Row{NewTimeDatum(at(9, 5, 3, 123456))}, "09:05:03.12\n"},
+		// Declared precision is applied at INPUT now (roundTimeDatumToPrecision
+		// → AdjustTimeForTypmod), so the OUTPUT renders the stored value
+		// verbatim — the encoder no longer truncates to Args[0]. A full-micros
+		// datum handed straight to the encoder therefore renders full micros;
+		// a value rounded on the way in renders at its precision. M0119-0006
+		// (62nd slice).
+		{"time(2) verbatim", catalog.Type{Name: "time", Args: []int64{2}},
+			Row{NewTimeDatum(at(9, 5, 3, 123456))}, "09:05:03.123456\n"},
 		{"timetz east", catalog.Type{Name: "timetz"},
 			Row{NewTimeTZDatum(at(9, 5, 3, 0), 9*3600)}, "09:05:03+09\n"},
 		{"timetz half-hour", catalog.Type{Name: "timetz"},

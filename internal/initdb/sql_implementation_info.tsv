@@ -1,0 +1,12 @@
+10003	CATALOG NAME	\N	Y	\N
+10004	COLLATING SEQUENCE	\N	C	\N
+23	CURSOR COMMIT BEHAVIOR	1	\N	close cursors and retain prepared statements
+2	DATA SOURCE NAME	\N		\N
+17	DBMS NAME	\N	PostgreSQL	\N
+26	DEFAULT TRANSACTION ISOLATION	2	\N	READ COMMITTED; user-settable
+28	IDENTIFIER CASE	3	\N	stored in mixed case - case sensitive
+85	NULL COLLATION	0	\N	nulls higher than non-nulls
+13	SERVER NAME	\N		\N
+94	SPECIAL CHARACTERS	\N		all non-ASCII characters allowed
+46	TRANSACTION CAPABLE	2	\N	both DML and DDL
+18	DBMS VERSION	\N	18.03.0000	\N

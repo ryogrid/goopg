@@ -163,7 +163,7 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 		return nil, err
 	}
 	switch strings.ToLower(t.Name) {
-	case "int2", "smallint":
+	case "int2", "smallint", "smallserial", "serial2":
 		// M0119-0006 (52nd slice): before this arm `int2` fell through to the
 		// default's KindInt escape and shipped EIGHT big-endian bytes where
 		// upstream int2send (postgres/src/backend/utils/adt/int.c:98 —
@@ -185,14 +185,14 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 		b := make([]byte, 2)
 		binary.BigEndian.PutUint16(b, uint16(int16(d.Int)))
 		return b, nil
-	case "int4", "integer", "int":
+	case "int4", "integer", "int", "serial", "serial4":
 		if d.Kind != KindInt {
 			return nil, fmt.Errorf("expected int, got kind %d", d.Kind)
 		}
 		b := make([]byte, 4)
 		binary.BigEndian.PutUint32(b, uint32(int32(d.Int)))
 		return b, nil
-	case "int8", "bigint":
+	case "int8", "bigint", "bigserial", "serial8":
 		if d.Kind != KindInt {
 			return nil, fmt.Errorf("expected int, got kind %d", d.Kind)
 		}
@@ -383,6 +383,15 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 		if !ok {
 			return nil, fmt.Errorf("expected string for jsonb, got kind %d", d.Kind)
 		}
+		// jsonb_send ships JsonbToCString's output — the CANONICAL text — not the
+		// input spelling. Canonicalise here so COPY TO agrees with the heap image
+		// (encodeValuePG canonicalises via coerceTextLikeDatum) for a value that
+		// reached this arm without passing through an input boundary. M0119-0006
+		// (64th slice).
+		s, err := canonicalizeJSONB(s)
+		if err != nil {
+			return nil, err
+		}
 		b := make([]byte, 0, len(s)+1)
 		b = append(b, jsonbBinaryVersion)
 		return append(b, s...), nil
@@ -437,7 +446,7 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 		return Datum{}, err
 	}
 	switch strings.ToLower(t.Name) {
-	case "int2", "smallint":
+	case "int2", "smallint", "smallserial", "serial2":
 		// Decode twin of the "int2" encode arm. Upstream int2recv (int.c:87) is
 		// pq_getmsgint(buf, sizeof(int16)); the length is enforced because the
 		// binary COPY parser runs pq_getmsgend after each attribute, so a field
@@ -450,13 +459,13 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 		}
 		v := int16(binary.BigEndian.Uint16(payload))
 		return Datum{Kind: KindInt, Int: int64(v)}, nil
-	case "int4", "integer", "int":
+	case "int4", "integer", "int", "serial", "serial4":
 		if len(payload) != 4 {
 			return Datum{}, fmt.Errorf("int4: expected 4 bytes, got %d", len(payload))
 		}
 		v := int32(binary.BigEndian.Uint32(payload))
 		return Datum{Kind: KindInt, Int: int64(v)}, nil
-	case "int8", "bigint":
+	case "int8", "bigint", "bigserial", "serial8":
 		if len(payload) != 8 {
 			return Datum{}, fmt.Errorf("int8: expected 8 bytes, got %d", len(payload))
 		}
@@ -552,7 +561,7 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 		if micros < 0 || micros > usecsPerDay {
 			return Datum{}, &ExecError{Code: "22008", Message: "time out of range"}
 		}
-		return NewTimeDatum(pgTimeFromMicros(micros)), nil
+		return roundTimeDatumToPrecision(NewTimeDatum(pgTimeFromMicros(micros)), timeColumnPrecision(t)), nil
 	case "timetz", "time with time zone":
 		// Decode twin of the "timetz" encode arm; upstream timetz_recv reads the
 		// TimeADT then the int32 zone and applies the same TZDISP_LIMIT sanity
@@ -570,7 +579,7 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 			return Datum{}, &ExecError{Code: "22009",
 				Message: "time zone displacement out of range"}
 		}
-		return NewTimeTZDatum(pgTimeFromMicros(micros), int(-pgOffset)), nil
+		return roundTimeDatumToPrecision(NewTimeTZDatum(pgTimeFromMicros(micros), int(-pgOffset)), timeColumnPrecision(t)), nil
 	case "date":
 		if len(payload) != 4 {
 			return Datum{}, fmt.Errorf("date: expected 4 bytes, got %d", len(payload))
@@ -588,16 +597,18 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 		// sorts, compares and prints identically to the same interval entering
 		// through INSERT. Before this arm the default handed the 16 raw bytes back
 		// as a STRING Datum, which then made every runtime interval operation
-		// lexicographic (Hard-won Rule #2). interval_recv's trailing
-		// AdjustIntervalForTypmod is NOT applied here — goopg truncates at display,
-		// ledgered under M0119-0006 alongside AdjustTimeForTypmod.
+		// lexicographic (Hard-won Rule #2).
 		if len(payload) != 16 {
 			return Datum{}, fmt.Errorf("interval: expected 16 bytes, got %d", len(payload))
 		}
 		micros := int64(binary.BigEndian.Uint64(payload[:8]))
 		days := int32(binary.BigEndian.Uint32(payload[8:12]))
 		months := int32(binary.BigEndian.Uint32(payload[12:16]))
-		return NewIntervalDatumFull(months, days, micros), nil
+		// interval_recv's trailing AdjustIntervalForTypmod (timestamp.c:1013):
+		// zero the range fields outside the column's declared span and round the
+		// sub-second field to the declared SECOND(p) precision at INPUT, instead
+		// of storing the received value whole. M0119-0006 (63rd slice).
+		return roundIntervalDatumToTypmod(NewIntervalDatumFull(months, days, micros), intervalColumnTypmod(t))
 	case "jsonb":
 		// Decode twin of the "jsonb" encode arm. Upstream jsonb_recv
 		// (jsonb.c:89) reads a 1-byte version, rejects anything but 1 with

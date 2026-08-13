@@ -173,12 +173,18 @@ func TestPgRewriteToastPairIndexRowAndFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Both per-database copies hold the same seeded corpus, so the page counts
-	// are identical: 2838 carries the 46 chunk tuples of the six out-of-line
-	// ev_action captures, 2839 the btree over them (metapage + root).
-	// M0131-S9.3f's pg_seclabels contributes 18 of those 46 chunks on its own,
-	// which is what took 2838 from 6 pages to 10; M0131-S9.3g's
-	// pg_stats_ext_exprs adds the last 6 and takes it to 12.
-	wantPages := map[string]int{"2838": 12, "2839": 2}
+	// are identical: 2838 carries the chunk tuples of the out-of-line ev_action
+	// captures, 2839 the btree over them (metapage + root). M0131-S9.3f's
+	// pg_seclabels contributed 18 of the original 46 chunks on its own, which
+	// is what took 2838 from 6 pages to 10; M0131-S9.3g's pg_stats_ext_exprs
+	// added the last 6 and took it to 12. M0133-S4 tranche 2 adds the ten
+	// information_schema TOAST views (75 more chunks), taking 2838 to 31 pages
+	// (121 chunks at ~2032 B, four to a page → ceil(121/4) = 31); the index
+	// still fits metapage + one leaf (121 × 16 B ≪ one btree page), so 2839
+	// stays at 2. M0133-S4 tranche 4 adds element_types (6 more chunks),
+	// taking 2838 to 32 pages (127 chunks at ~2032 B, four to a page →
+	// ceil(127/4) = 32).
+	wantPages := map[string]int{"2838": 32, "2839": 2}
 	for _, db := range []string{"1", "5"} {
 		for _, oid := range []string{"2838", "2839"} {
 			path := filepath.Join(dir, "base", db, oid)
@@ -193,7 +199,8 @@ func TestPgRewriteToastPairIndexRowAndFiles(t *testing.T) {
 			}
 			if got := len(data) / storage.BlockSize; got != wantPages[oid] {
 				t.Errorf("base/%s/%s: %d pages, want %d — the seeded chunk set "+
-					"changed (M0131-S20.2b captured four out-of-line ev_actions, S9.3f a fifth)",
+					"changed (M0131-S20.2b captured the pg_catalog out-of-line "+
+					"ev_actions, M0133-S4 tranche 2 the information_schema TOAST views)",
 					db, oid, got, wantPages[oid])
 			}
 			for blk := 0; blk < len(data); blk += storage.BlockSize {

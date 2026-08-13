@@ -228,7 +228,7 @@ and added the acceptance bar as
 |---|---|---|
 | (a) `connTxState` is already threaded into the extended path | **confirmed** | `dispatch_extended.go:30` takes `connTx *connTxState`; its only reads are `NonSuperuserRole` and statement logging. The first *code* slice is therefore the state machine (S2), not plumbing. |
 | (b) there is no `execCommit` route to adopt | **confirmed** | `dispatch.go:2803-2807` states the bypass in so many words, and the deferred FK/UNIQUE/EXCLUDE sequence is inline at `:2818-2828`. S4 is a proof obligation on S2's extraction, not independent wiring. |
-| (c) `Sync` is already correct | **confirmed** | `server.go`'s `MsgSync` arm clears `syncRequired` and calls `w.ReadyForQuery()`; it touches no transaction state. Pinned by `TestM0132S1_SyncDoesNotEndAnOpenBlock`, which passes today and must keep passing. |
+| (c) `Sync` is already correct | **confirmed** | `server.go`'s `MsgSync` arm clears `syncRequired` and calls `w.ReadyForQuery()`; it touches no transaction state. Pinned by `TestM0132S1_SyncDoesNotEndAnOpenBlock`, which passes today and must keep passing. **Extended post-S2 (M0132-S9, 2026-08-13):** `TestM0132S9_SyncBetweenExecutesLeavesBlockOpen` drives a full extended block and places a bare `Sync` *between* two in-block `Execute`s, asserting both the `'T'` status byte after the mid-block `Sync` and that the second `Execute`'s writes still roll back on `ROLLBACK` — the "Sync ends the transaction" misreading fails the rollback half even if it kept the status byte green. |
 
 ### The bar, and how its redness is proven
 
@@ -333,3 +333,105 @@ names, and the one that would catch a dropped SSI or deferred-check path);
 (S3), assert the deferred sequence arrives on the extended COMMIT (S4), add the
 missing `connTx.Fail()` call site (S5) — and flip
 `m0132ExtendedBlocksLanded` to `true` in the same commit.
+
+## 9. S2 step 2 record — the land-together commit (2026-08-13)
+
+Step 2 is where the extended path starts driving the machine, so S2+S3+S4+S5
+landed as one commit. Each slice is a *verification* of the extraction more than
+a fresh change — D1's whole point was that the extended caller gets the deferred
+sequence, the SSI check, enum-DDL undo and the `Begin/EndLocalTransaction` hooks
+for free by calling the same function the simple path calls.
+
+**S2 (wiring).** `dispatch_extended.go` replaces the bare command-tag
+short-circuit with `applyTransactionVerb`. The extended caller differs from the
+simple one in one respect D1 anticipated: the simple path *promotes* an
+already-begun transaction, while the extended path reaches the verb before
+beginning anything — so the extended path begins the `TxBegin` transaction
+itself (on the connection's own slot, `beginProcNum = procNum`) and passes
+`autoCommit = ownTx` so the shared deferred-rollback respects the promotion.
+`txnVerbOutcome` renders through the extended protocol's shapes:
+`Warn` → `verbWarnFields` (`NoticeResponse`, 25P01), `*txnVerbError` →
+`extendedQueryErrorFromVerb` (carrying DETAIL/HINT/POSITION and the error's own
+SQLSTATE), `Handled == false` → fall through to the executor (SAVEPOINT/RELEASE/
+ROLLBACK TO, where S10's ruling attaches).
+
+**S3 (in-block reuse).** `inBlock := connTx != nil && connTx.InExplicit()`;
+the begin, the `ownTx` commit at the foot, and the rollback defer all key off
+it, and the in-block statement runs against `connTx.Tx()` (the accessor) plus
+`connTx.Session()` so a second Execute self-sees the first's writes.
+
+**S4 (deferred sequence).** No code change was needed — the extraction was
+faithful, so the deferred FK/UNIQUE/EXCLUDE check and the SSI pre-commit check
+arrive on the extended COMMIT by construction. Pinned by
+`TestM0132S4_ExtendedCommitRunsDeferredFKChecks` (a `DEFERRABLE INITIALLY
+DEFERRED` FK violation raises 23503 at the extended COMMIT and leaves the block
+status `I`) and discharged by the FK isolation specs plus the
+`internal/testport/` deferred-constraint set. The promised
+`0132-0002` design doc was not needed: S4 is a proof obligation on S2, not an
+independent wiring slice, and the proof came out clean.
+
+**S5 (aborted-block semantics).** `failExplicitBlock` (`txn_verb.go`) marks the
+block failed and now fires on **every** extended error path — Execute
+(`handleExecuteFrame`), Parse, Bind and Describe (`runPostStartupLoop`) — where
+the extended loop's only `'Z'` write was the plain `ReadyForQuery()` and the
+`ReadyForQueryAfterError` escape hatch is unavailable. The two SIMPLE-path gaps
+S1 filed are closed in the same commit: a plan-time error now fails the block
+(`dispatch.go`, the cache-miss planning site that had returned straight out of
+the loop), and a constant `SELECT 1` / `SHOW` / `SET` is gated ahead of the
+fast paths (`query.go` simple path, `extended.go` extended path) via
+`allowedInAbortedBlock`/`abortedBlockMessage` — matching PG's reject-everything-
+except-block-ending-verbs rule.
+
+**Gates.** `go build ./...` + `go vet ./internal/server/` clean; `go test
+./internal/server/` PASS (38 s, all 8 bar tests green with the const flipped);
+`go test ./internal/executor/` PASS; `go test -run TestPort_Isolation
+./internal/testport/` PASS (413 s — D-002); the `internal/testport/`
+deferred-constraint set PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=35);
+`make plan-gate` diffed 22/22 against `warm-stats-base.txt` — a **stale-baseline
+confound, not a regression**: that snapshot predates M0127-P6.2's MHJ deletion
+(`4e08d4b7`), so every MHJ node it records now legitimately renders as a plain
+`Hash Join`, and S2 touches no planner code.
+
+## 10. S6 record — isolation level over the extended protocol (2026-08-13)
+
+D4's two inputs are resolved as follows.
+
+**(1) `BEGIN ISOLATION LEVEL <level>` — landed, and it was almost free.** D1's
+extraction carried the M0104-0008 block (txn_verb.go, "honour
+`txNode.IsolationLevel`") into `applyTransactionVerb`, so the extended BEGIN
+already parsed the level, rolled back the placeholder auto-commit transaction,
+re-began at the requested level, and re-captured the READ COMMITTED snapshot —
+identical to `dispatch.go:2709-2738`. The single missing piece was the
+connection's ProcArray slot: the simple path sets `ectx.ProcNum = connTx.ProcNum`
+(`dispatch.go:513`) but the extended path never did, so `applyTransactionVerb`'s
+re-begin called `TxnMgr.Begin(parsedLvl, ctx.ProcNum)` with `ctx.ProcNum == 0`.
+Two concurrent `BEGIN ISOLATION LEVEL SERIALIZABLE` blocks over this protocol
+therefore both re-began on slot 0 and the second aborted with
+`mvcc: unknown transaction` (C58000) — the same signature S7's proc-slot slice
+records. Fix: `dispatch_extended.go` sets `ectx.ProcNum = procNum` next to
+`ectx.Tx = tx`, the extended sibling of `dispatch.go:513`. Proved load-bearing:
+reverting it to `0` turns the gate below red with exactly that `mvcc: unknown
+transaction`.
+
+**(2) Session-default isolation — ruled OUT OF SCOPE, parity-neutral.** Both
+dispatch paths still hardcode READ COMMITTED when they begin the auto-commit
+transaction (`dispatch.go:236`, `dispatch_extended.go:160`), so a non-default
+`default_transaction_isolation` (or `SET SESSION CHARACTERISTICS …`) is ignored
+by both. `execBegin` (`operators_tx.go:70`) honours `Session.IsolationLevel()`
+and only the executor-routed BEGIN (SAVEPOINT-adjacent) reaches it. PG's own
+default is `read committed`, so goopg is correct for the default; the gap is a
+pre-existing, symmetric engine limitation, not an extended-protocol defect, and
+is left for a future milestone rather than implied-fixed by (1). The
+`dispatch_extended.go:119-123` comment D4 said this retires had already been
+replaced by the S2 refactor (those lines now carry the P6 Gather comment).
+
+**Gate.** `TestM0132S6_ExtendedSerializableBlockAbortsWriteSkew` opens both
+blocks of the canonical simple-write-skew permutation over the **extended**
+protocol and asserts the second committer aborts with 40001;
+`TestM0132S6_ExtendedReadCommittedBlockAllowsWriteSkew` is the READ COMMITTED
+control (same interleaving, no abort). The write-skew helper deliberately leaves
+the block OPEN so the caller interleaves the two COMMITs — a helper that
+committed each side inline would serialise the blocks into the no-overlap
+permutation and the gate would pass for the wrong reason. Gates run: `go test
+./internal/server/` PASS (all 8 S1 bar tests + the S4 deferred-FK probe + both
+S6 tests).

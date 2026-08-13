@@ -201,17 +201,30 @@ func stmtTakesSnapshot(stmt parser.Stmt) bool {
 // LISTEN registration is a deferred refinement). NOTIFY buffers into connTx for
 // publication at commit. M0118-0009 (async-notify).
 func (s *Server) execNotifyStmt(w *protocol.FrameWriter, stmt parser.Stmt, connTx *connTxState) (bool, error) {
+	if tag, handled := s.notifyStmtTag(stmt, connTx); handled {
+		return true, w.WriteCommandComplete(tag)
+	}
+	return false, nil
+}
+
+// notifyStmtTag performs the LISTEN/NOTIFY/UNLISTEN server-layer work and
+// returns the CommandComplete tag for the statement. handled=false for any
+// other statement, leaving it for the normal planner path. It is the
+// protocol-agnostic core of execNotifyStmt: the simple path renders the tag as
+// a CommandComplete frame (execNotifyStmt), the extended path carries it in an
+// extendedQueryResult (dispatch_extended.go). M0132-S12.
+func (s *Server) notifyStmtTag(stmt parser.Stmt, connTx *connTxState) (string, bool) {
 	switch n := stmt.(type) {
 	case *parser.ListenStmt:
 		if connTx != nil {
 			s.notify.Listen(connTx.NotifySession, n.Channel)
 		}
-		return true, w.WriteCommandComplete("LISTEN")
+		return "LISTEN", true
 	case *parser.NotifyStmt:
 		if connTx != nil {
 			connTx.bufferNotify(n.Channel, n.Payload, connTx.BackendPID)
 		}
-		return true, w.WriteCommandComplete("NOTIFY")
+		return "NOTIFY", true
 	case *parser.UnlistenStmt:
 		if connTx != nil {
 			if n.All {
@@ -220,9 +233,9 @@ func (s *Server) execNotifyStmt(w *protocol.FrameWriter, stmt parser.Stmt, connT
 				s.notify.Unlisten(connTx.NotifySession, n.Channel)
 			}
 		}
-		return true, w.WriteCommandComplete("UNLISTEN")
+		return "UNLISTEN", true
 	}
-	return false, nil
+	return "", false
 }
 
 // publishPendingNotify publishes the NOTIFYs buffered by the just-committed

@@ -269,6 +269,21 @@ Concrete scope (this slice is not "write a spec and see"):
 
 - Gates: D-002 isolation spec + the driver-level test.
 
+**DONE 2026-08-13 (pure verification; the engine landed in S2–S7).** The mixed
+shape holds end-to-end with no behaviour change. Tests landed: (a)
+`TestM0132S8_MixedInBlockExecuteLeavesOffsetSlotAlone` + the invisibility half of
+`TestM0132S8_MixedBlockOneTransactionRollback`; (b) `TestM0132S8_MixedRollbackMirror`
++ `TestM0132S8_MixedCommitBothDirections`; (c) `TestM0132S8_StatusByteCoherentAcrossSwitch`;
+(d) `TestM0132S8_InBlockErrorAbortsOtherProtocol` — all in
+`internal/server/extended_txn_mixed_test.go`. The driver test
+(`internal/server/extended_txn_mixed_driver_test.go`, lib/pq, two connections)
+proves the real-world shape and cross-session invisibility. The D-002 spec
+`internal/testport/specs/mixed-protocol-block.spec` (expected captured from PG
+18.3) pins the block's cross-session SEMANTIC contract via
+`TestPort_IsolationMixedProtocolBlock`. **Discovery (ledger'd):** the extended
+protocol rejects binary result formats (0A000), so a lib/pq parameterised SELECT
+fails; the observer stays argument-less and the gap is filed under S13.
+
 ### S9 — `Sync` guard
 
 A test that keeps C3 true: a `Sync` between two in-block `Execute`s leaves the
@@ -314,6 +329,17 @@ means.
 Per the benchmarking practice card: hold server age constant across the A/B, run
 capped (`scripts/goopg-test-run.sh`, distinct `GOOPG_CG_UNIT`), and record the
 numbers in `analysis/` with the commit hash.
+
+**Measured 2026-08-13 (HEAD `317fb002`)** — see
+`analysis/perf-optimize3/runs/m0132s11_prep_317fb002/S11-RESULTS.md` for the full
+record. Criterion 3 **met** (0.32 fsync/txn, the 2-fsync bug is gone). Criteria 1
+and 2 **not met**: same-day same-HEAD controls show prepared `-N` −13.6% and `-S`
+−22.3% vs simple. The O-XP-1 profile locates the residual in the extended message
+loop — `describeViaPlanner` (re-parse+re-plan per `Describe`) and `parser.Parse`
+(re-parse per `Execute`) — i.e. a **missing prepared-statement cache**, not the
+transaction machinery this milestone changed. The feared `TxnMgr.Begin`/snapshot
+tax is 0.7% flat. The cache is out of M0132's transaction scope and is filed
+under M0132-S13 (ledger row 2026-08-13 M0132-S11).
 
 ### S12 — Simple-path-only server-layer handlers
 

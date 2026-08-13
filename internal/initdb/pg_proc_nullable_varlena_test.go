@@ -40,20 +40,29 @@ func TestPgProcSeedLeavesAbsentVarlenaAttrsNull(t *testing.T) {
 	if len(entries) == 0 {
 		t.Fatal("pg_proc seed data is empty")
 	}
-	// Every row's proconfig/proacl/probin/prosqlbody/protrftypes is absent for
-	// ALL seed entries (goopg seeds no per-function GUCs, grants, C-language
-	// binaries, SQL bodies or transforms), so those four are unconditional.
-	// The remaining four are absent only when the entry carries no value.
+	// proconfig/proacl/probin/protrftypes are absent for ALL seed entries
+	// (goopg seeds no per-function GUCs, grants, C-language binaries or
+	// transforms), so those four are unconditional. prosqlbody is absent for
+	// every seed row EXCEPT the 10 information_schema helpers that carry a
+	// captured SQL body (M0133-S2) — and for those it must be a genuine node
+	// tree (nailedProcSqlBody), never an empty shell.
 	for _, e := range entries {
 		row := pgProcRow(e)
 		if len(row) != 30 {
 			t.Fatalf("oid=%d: pgProcRow len=%d, want 30", e.OID, len(row))
 		}
-		for _, idx := range []int{24, 26, 27, 28, 29} {
+		for _, idx := range []int{24, 26, 28, 29} {
 			if !row[idx].IsNull() {
 				t.Fatalf("oid=%d (%s): %s is NOT NULL — an empty varlena shell here "+
 					"aborts a hosted PG (M0131-S13)", e.OID, e.Name, nullable[idx])
 			}
+		}
+		if e.SqlBody == "" && !row[27].IsNull() {
+			t.Fatalf("oid=%d (%s): prosqlbody is NOT NULL without a SqlBody name — "+
+				"an empty varlena shell here aborts a hosted PG (M0131-S13)", e.OID, e.Name)
+		}
+		if e.SqlBody != "" && row[27].IsNull() {
+			t.Fatalf("oid=%d (%s): SqlBody %q named but prosqlbody is NULL", e.OID, e.Name, e.SqlBody)
 		}
 		if e.AllArgTypes == nil && !row[20].IsNull() {
 			t.Fatalf("oid=%d: proallargtypes is NOT NULL with no OUT-arg metadata", e.OID)

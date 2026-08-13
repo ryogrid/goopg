@@ -956,22 +956,14 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			}
 		}
 		// Apply typmod precision for time/timetz casts (e.g., ::timetz(4)).
-		// PostgreSQL truncates fractional seconds to the specified precision.
-		if x.Typmod > 0 && result.Kind == KindTime {
+		// Upstream time_in/timetz_in round the fractional seconds half away from
+		// zero via AdjustTimeForTypmod (date.c:1710), so `'23:59:59.999999'::time(2)`
+		// is 24:00:00, not the truncated 23:59:59.99 the old ns-division here
+		// produced. M0119-0006 (62nd slice).
+		if x.Typmod > 0 {
 			switch x.TargetType {
 			case "time", "timetz", "time with time zone":
-				prec := x.Typmod
-				if prec > 6 {
-					prec = 6 // PostgreSQL max precision for time types
-				}
-				t := result.TimeValue()
-				ns := int64(t.Nanosecond())
-				factor := int64(1)
-				for i := int64(0); i < 6-prec; i++ {
-					factor *= 10
-				}
-				ns = (ns / (factor * 1000)) * (factor * 1000)
-				result = NewTimeDatum(time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), int(ns), t.Location()))
+				result = roundTimeDatumToPrecision(result, x.Typmod)
 			}
 		}
 		return result, nil
@@ -3896,6 +3888,22 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			return Datum{}, &ExecError{Code: "22P02", Pos: pos,
 				Message: fmt.Sprintf("cannot cast type %v to numeric", d.Kind)}
 		}
+	case "jsonb":
+		// `::jsonb` canonicalises the text the same way a jsonb column does
+		// (coerceTextLikeDatum's jsonb arm) — the two are the twin input
+		// boundaries for jsonb and must agree (Hard-won Rule #2). `json` is
+		// untouched: it preserves the input spelling. M0119-0006 (64th slice).
+		if s, ok := datumAsString(d); ok {
+			canon, err := canonicalizeJSONB(s)
+			if err != nil {
+				if ee, ok := err.(*ExecError); ok {
+					ee.Pos = pos
+				}
+				return Datum{}, err
+			}
+			return NewStringDatum(canon), nil
+		}
+		return d, nil
 	}
 	return d, nil // pass-through for unknown types
 }
@@ -13903,6 +13911,56 @@ func RegtypeName(cat catalog.Catalog, oid uint32, qualify bool) string {
 	return strconv.FormatUint(uint64(oid), 10)
 }
 
+// formatIntervalTypmod renders the suffix intervaltypmodout produces for a
+// packed INTERVAL_TYPMOD (timestamp.c:1065): the range spelling with a leading
+// space (" year to month", " second") plus the precision "(p)" when a SECOND(p)
+// precision is declared, or "" for a bare/full-range interval. The field bit
+// positions are datetime.h's MONTH=1, YEAR=2, DAY=3, HOUR=10, MINUTE=11,
+// SECOND=12 — the same values pgdatetime.AdjustIntervalForTypmod and the
+// parser's intervalFieldTypmodBit use. M0119-0006 (63rd slice).
+func formatIntervalTypmod(typmod int64) string {
+	if typmod < 0 {
+		return ""
+	}
+	fields := int((typmod >> 16) & 0x7FFF)
+	precision := int(typmod & 0xFFFF)
+	fieldstr := ""
+	switch fields {
+	case 1 << 2:
+		fieldstr = " year"
+	case 1 << 1:
+		fieldstr = " month"
+	case 1 << 3:
+		fieldstr = " day"
+	case 1 << 10:
+		fieldstr = " hour"
+	case 1 << 11:
+		fieldstr = " minute"
+	case 1 << 12:
+		fieldstr = " second"
+	case (1 << 2) | (1 << 1):
+		fieldstr = " year to month"
+	case (1 << 3) | (1 << 10):
+		fieldstr = " day to hour"
+	case (1 << 3) | (1 << 10) | (1 << 11):
+		fieldstr = " day to minute"
+	case (1 << 3) | (1 << 10) | (1 << 11) | (1 << 12):
+		fieldstr = " day to second"
+	case (1 << 10) | (1 << 11):
+		fieldstr = " hour to minute"
+	case (1 << 10) | (1 << 11) | (1 << 12):
+		fieldstr = " hour to second"
+	case (1 << 11) | (1 << 12):
+		fieldstr = " minute to second"
+	case 0x7FFF:
+		fieldstr = ""
+	}
+	if precision != 0xFFFF {
+		return fmt.Sprintf("%s(%d)", fieldstr, precision)
+	}
+	return fieldstr
+}
+
 // formatTypeOID implements PostgreSQL's format_type(oid, typemod) built-in.
 // Maps well-known system type OIDs to their SQL display names. Unknown OIDs
 // return "???". Used by psql \d+ meta-commands. M0097-0023.
@@ -14145,7 +14203,10 @@ func formatTypeOID(typeOID, typmod int64) string {
 	case 1184:
 		return "timestamp with time zone"
 	case 1186:
-		return "interval"
+		// interval: atttypmod is the packed INTERVAL_TYPMOD. A bare interval
+		// (typmod -1) is just "interval"; otherwise append the range/precision
+		// qualifier intervaltypmodout renders. M0119-0006 (63rd slice).
+		return "interval" + formatIntervalTypmod(typmod)
 	case 1187:
 		// _interval: a bare interval[] column has typmod -1, so this is the
 		// bare element name with the [] suffix. DU-002 slice 70.

@@ -116,8 +116,9 @@ func TestDatumToCopyTextTimeHour24(t *testing.T) {
 		want string
 	}{
 		{catalog.Type{Name: "time"}, "24:00:00"},
-		// Declared precision is applied at OUTPUT (no AdjustTimeForTypmod port
-		// yet); truncating USECS_PER_DAY at any scale leaves it unchanged.
+		// Declared precision is applied at INPUT (AdjustTimeForTypmod); rounding
+		// USECS_PER_DAY at any scale leaves it unchanged, so 24:00:00 survives
+		// a time(2) column unchanged. M0119-0006 (62nd slice).
 		{catalog.Type{Name: "time", Args: []int64{2}}, "24:00:00"},
 	} {
 		got, err := datumToCopyText(tc.typ, d, "ISO", "MDY", "")

@@ -126,6 +126,10 @@ func TestPgIndexInitialEntriesIndkeyMatchesPG18(t *testing.T) {
 		175:  {2, 3},      // pg_user_mapping_user_server_index : btree(umuser oid_ops, umserver oid_ops) UNIQUE ← Step 3cp
 		2965: {1, 2},      // pg_db_role_setting_databaseid_rol_index : btree(setdatabase oid_ops, setrole oid_ops) UNIQUE PRIMARY (SHARED) ← Step 3cu
 		2839: {1, 2},      // pg_toast_2618_index : btree(chunk_id oid_ops, chunk_seq int4_ops) UNIQUE PRIMARY ← M0131-S20.1, DECLARE_TOAST(pg_rewrite, 2838, 2839)
+		13460: {1, 2},     // pg_toast_13456_index : btree(chunk_id oid_ops, chunk_seq int4_ops) UNIQUE PRIMARY ← M0133-S3 (sql_features)
+		13465: {1, 2},     // pg_toast_13461_index : btree(chunk_id oid_ops, chunk_seq int4_ops) UNIQUE PRIMARY ← M0133-S3 (sql_implementation_info)
+		13470: {1, 2},     // pg_toast_13466_index : btree(chunk_id oid_ops, chunk_seq int4_ops) UNIQUE PRIMARY ← M0133-S3 (sql_parts)
+		13475: {1, 2},     // pg_toast_13471_index : btree(chunk_id oid_ops, chunk_seq int4_ops) UNIQUE PRIMARY ← M0133-S3 (sql_sizing)
 	}
 	got := make(map[uint32][]int16, len(want))
 	for _, e := range pgIndexInitialEntries() {

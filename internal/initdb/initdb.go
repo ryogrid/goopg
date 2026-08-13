@@ -1350,6 +1350,30 @@ func Init(opts Options) error {
 	if err := bootstrapToastRelationFiles(abs, pgRewriteToastChunks); err != nil {
 		return fmt.Errorf("goopg init: toast relation files: %w", err)
 	}
+	// M0133-S3: write the four information_schema data heaps (sql_features et al,
+	// 801 rows) into base/{1,5}. Their pg_class / pg_attribute / pg_type / toast
+	// rows were produced by the bootstrappers above; this is the data itself.
+	if err := bootstrapInformationSchemaDataTables(abs); err != nil {
+		return fmt.Errorf("goopg init: information_schema data tables: %w", err)
+	}
+	// M0133-S1: seed the two information_schema domain CHECK constraints into
+	// pg_constraint (overwriting the empty heap) and populate its three
+	// indexes (2665/2666/2667). Without these rows a hosted PG validates
+	// cardinal_number/yes_or_no as unconstrained (it reads domain constraints
+	// through pg_constraint_contypid_index 2666, which stayed bootstrap-empty).
+	pgConstraintTIDs, err := bootstrapPgConstraintTuples(abs)
+	if err != nil {
+		return fmt.Errorf("goopg init: pg_constraint tuples: %w", err)
+	}
+	if err := bootstrapPgConstraintOidIndex(abs, pgConstraintTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_constraint_oid_index: %w", err)
+	}
+	if err := bootstrapPgConstraintContypidIndex(abs, pgConstraintTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_constraint_contypid_index: %w", err)
+	}
+	if err := bootstrapPgConstraintRelidTypidNameIndex(abs, pgConstraintTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_constraint_relid_typid_name_index: %w", err)
+	}
 	// M0106-0010 step 3w: write an empty heap page for every mapped local
 	// catalog that lacks a dedicated bootstrapper (pg_aggregate=2600,
 	// pg_type=1247, pg_namespace=2615, …). Without these files PG's
@@ -1547,6 +1571,7 @@ func bootstrapSharedCatalogPlaceholders(dataDir string) error {
 //	2602 pg_amop            (bootstrapPgAmopTuples)
 //	2603 pg_amproc          (bootstrapPgAmprocTuples)
 //	2605 pg_cast            (bootstrapPgCastTuples)
+//	2606 pg_constraint      (bootstrapPgConstraintTuples, M0133-S1)
 //	2610 pg_index           (bootstrapPgIndexTuples)
 //	2612 pg_language        (bootstrapPgLanguageTuples)
 //	2615 pg_namespace       (bootstrapPgNamespaceTuples)
@@ -1561,7 +1586,6 @@ func mappedLocalCatalogPlaceholderOIDs() []uint32 {
 	return []uint32{
 		826,  // pg_default_acl (M0106-0010 step 3ak)
 		2604, // pg_attrdef
-		2606, // pg_constraint
 		2608, // pg_depend
 		2609, // pg_description
 		2611, // pg_inherits
@@ -2342,6 +2366,14 @@ func bootstrapPgClassTuples(dataDir string) (map[uint32]heapTID, error) {
 	// nailedLocalRels — see nailedToastRels for why (no pg_type row, no
 	// pg_internal.init entry).
 	allRels = append(allRels, nailedToastRels()...)
+	// M0133-S3: the four information_schema data tables carry pg_class rows
+	// (relkind 'r', relnamespace 13273) but are NOT nailed — they ride the heap
+	// here, and their pg_type composite rows via their RelType, but never
+	// pg_internal.init (see informationSchemaDataTableRels).
+	allRels = append(allRels, informationSchemaDataTableRels()...)
+	// M0133-S4: the information_schema VIEWS (relkind 'v', relnamespace 13273)
+	// likewise ride the pg_class heap but never pg_internal.init.
+	allRels = append(allRels, informationSchemaViewSeedRels()...)
 	tids, err := writeMultiPageHeap(dataDir, "1259", cols, allRels, func(rel nailedRel) executor.Row {
 		return pgClassRow(rel)
 	})
@@ -2373,6 +2405,8 @@ func bootstrapPgAttributeTuples(dataDir string) (map[pgAttrTIDKey]heapTID, error
 	allRels := append([]nailedRel{}, nailedSharedRels...)
 	allRels = append(allRels, nailedLocalRels...)
 	allRels = append(allRels, nailedToastRels()...) // M0131-S20.1
+	allRels = append(allRels, informationSchemaDataTableRels()...) // M0133-S3
+	allRels = append(allRels, informationSchemaViewSeedRels()...) // M0133-S4
 	type rowKey struct {
 		AttRelID uint32
 		AttNum   int16
@@ -2480,13 +2514,20 @@ type pgNamespaceEntry struct {
 	NspOwner uint32
 }
 
-// pgNamespaceInitialEntries returns the three namespaces PG18 initdb creates:
-// pg_catalog (11), pg_toast (99), and public (2200).
+// pgNamespaceInitialEntries returns the four namespaces a PG18 initdb produces:
+// the three bootstrap namespaces pg_catalog (11), pg_toast (99), public (2200),
+// plus information_schema (13273), which initdb creates AFTER bootstrap by
+// running information_schema.sql (so its OID comes from the post-bootstrap
+// counter at FirstUnpinnedObjectId = 12000, not a .dat file — measured against
+// a fresh PG 18.3, see catalog/bootstrap_namespace_oid_test.go). M0133-S1 lands
+// it atomically with its domains: a hosted PG must never observe a namespace
+// without its types.
 func pgNamespaceInitialEntries() []pgNamespaceEntry {
 	return []pgNamespaceEntry{
 		{OID: 11, NspName: "pg_catalog", NspOwner: 10},
 		{OID: 99, NspName: "pg_toast", NspOwner: 10},
 		{OID: 2200, NspName: "public", NspOwner: 10},
+		{OID: 13273, NspName: "information_schema", NspOwner: 10},
 	}
 }
 
@@ -2499,8 +2540,9 @@ func pgNamespaceRow(e pgNamespaceEntry) executor.Row {
 	}
 }
 
-// bootstrapPgNamespaceTuples writes pg_catalog(11)/pg_toast(99)/public(2200)
-// rows to base/{1,5}/2615 so PG's NAMESPACENAME and NAMESPACEOID syscache
+// bootstrapPgNamespaceTuples writes pg_catalog(11)/pg_toast(99)/public(2200)/
+// information_schema(13273) rows to base/{1,5}/2615 so PG's NAMESPACENAME and
+// NAMESPACEOID syscache
 // lookups find the namespaces via pg_namespace_nspname_index (2684) and
 // pg_namespace_oid_index (2685). Without these rows, any schema-qualified
 // relation lookup (e.g. SELECT … FROM pg_catalog.pg_stat_wal_receiver) fails
@@ -2774,6 +2816,15 @@ type pgProcEntry struct {
 	// shape unless prokind='a'. Explicit non-zero values take precedence
 	// for entries whose handler does not encode the kind in its name.
 	Kind byte
+	// M0133-S2: fields the information_schema helper functions vary but the
+	// pg_proc.dat mirror (pgProcAllEntries) never does. Zero values preserve
+	// the pre-existing hardcoded defaults, so the 3397 .dat entries are
+	// unchanged and only the 11 helpers opt in.
+	Namespace uint32 // pronamespace. 0 → pg_catalog (11).
+	Cost      int64  // procost. 0 → 1 (the pre-existing default).
+	Rows      int64  // prorows. 0 → 0.
+	Support   uint32 // prosupport regproc OID. 0 → 0 (none).
+	SqlBody   string // prosqlbody blob name (prosrc='' for these); "" → NULL.
 }
 
 // pgProcColDefs returns the 30-column PG18 FormData_pg_proc layout.
@@ -2821,14 +2872,15 @@ func pgProcColDefs() []catalog.Column {
 	}
 }
 
-// pgProcInitialEntries returns all pg_proc.dat entries for PG18.
-// This is the full set of 3397 entries generated from
-// postgres/src/include/catalog/pg_proc.dat by cmd/gen-pg-proc-data/main.go.
-// It supersedes the former hand-crafted list of 32 entries (7 AM handlers +
-// 24 I/O regprocs + 1 SRF) that was maintained prior to M0106-0010
-// batched-14.
+// pgProcInitialEntries returns every pg_proc row goopg seeds: the 3397
+// pg_proc.dat entries generated from
+// postgres/src/include/catalog/pg_proc.dat by cmd/gen-pg-proc-data/main.go,
+// plus the 11 information_schema helper functions created by
+// information_schema.sql (M0133-S2). It supersedes the former hand-crafted
+// list of 32 entries (7 AM handlers + 24 I/O regprocs + 1 SRF) that was
+// maintained prior to M0106-0010 batched-14.
 func pgProcInitialEntries() []pgProcEntry {
-	return pgProcAllEntries()
+	return append(pgProcAllEntries(), informationSchemaHelperProcs()...)
 }
 
 // pgProcRow materialises one pgProcEntry as the 30-column row that
@@ -2898,21 +2950,39 @@ func pgProcRow(e pgProcEntry) executor.Row {
 	if argDefaults != "" {
 		argDefaultsDatum = executor.NewStringDatum(argDefaults)
 	}
+	// M0133-S2: a non-empty SqlBody names a captured prosqlbody node-tree blob
+	// (information_schema_proc_sqlbody.go); emit it instead of the SQL NULL
+	// that routes PG through prosrc. These functions carry prosrc='', so a
+	// NULL prosqlbody would make stringToNode("") fail on the hosted standby.
+	sqlBody := executor.NullDatum
+	if e.SqlBody != "" {
+		sqlBody = executor.NewStringDatum(nailedProcSqlBody(e.SqlBody))
+	}
 	return executor.Row{
 		executor.NewIntDatum(int64(e.OID)), // 1  oid
 		executor.NewStringDatum(e.Name),    // 2  proname
-		executor.NewIntDatum(11),           // 3  pronamespace = pg_catalog
-		executor.NewIntDatum(10),           // 4  proowner = BOOTSTRAP_SUPERUSERID
+		executor.NewIntDatum(func() int64 { // 3  pronamespace (pg_catalog unless overridden)
+			if e.Namespace != 0 {
+				return int64(e.Namespace)
+			}
+			return 11
+		}()),
+		executor.NewIntDatum(10), // 4  proowner = BOOTSTRAP_SUPERUSERID
 		executor.NewIntDatum(func() int64 { // 5  prolang
 			if e.Lang != 0 {
 				return int64(e.Lang)
 			}
 			return 12 // INTERNALlanguageId
 		}()),
-		executor.NewIntDatum(1),                          // 6  procost = 1 (float4)
-		executor.NewIntDatum(0),                          // 7  prorows = 0 (float4)
-		executor.NewIntDatum(0),                          // 8  provariadic = 0
-		executor.NewIntDatum(0),                          // 9  prosupport = 0
+		executor.NewIntDatum(func() int64 { // 6  procost (float4)
+			if e.Cost != 0 {
+				return e.Cost
+			}
+			return 1
+		}()),
+		executor.NewIntDatum(e.Rows), // 7  prorows (float4)
+		executor.NewIntDatum(0),      // 8  provariadic = 0
+		executor.NewIntDatum(int64(e.Support)), // 9  prosupport (regproc OID)
 		executor.NewStringDatum(string(kind)),            // 10 prokind
 		executor.NewBoolDatum(false),                     // 11 prosecdef
 		executor.NewBoolDatum(false),                     // 12 proleakproof
@@ -2931,7 +3001,7 @@ func pgProcRow(e pgProcEntry) executor.Row {
 		executor.NullDatum,                     // 25 protrftypes
 		executor.NewStringDatum(e.HandlerName), // 26 prosrc — fmgr internal lookup key
 		executor.NullDatum,                     // 27 probin
-		executor.NullDatum,                     // 28 prosqlbody (NULL ⇒ PG executes prosrc)
+		sqlBody,                                // 28 prosqlbody (NULL ⇒ PG executes prosrc)
 		executor.NullDatum,                     // 29 proconfig (NULL ⇒ no fmgr_security_definer)
 		executor.NullDatum,                     // 30 proacl (NULL ⇒ owner + PUBLIC EXECUTE default)
 	}
@@ -4979,6 +5049,12 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// DECLARE_UNIQUE_INDEX, and confirmed against a PG 18.3 oracle:
 		// indrelid 2838, indkey "1 2", indclass "1981 1978", indisprimary t.
 		entry(2839, 2838, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_2618_index
+		// M0133-S3: the four information_schema data tables' TOAST indexes, each
+		// the same (chunk_id oid_ops, chunk_seq int4_ops) UNIQUE PRIMARY shape.
+		entry(13460, 13459, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_13456_index
+		entry(13465, 13464, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_13461_index
+		entry(13470, 13469, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_13466_index
+		entry(13475, 13474, []int16{1, 2}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true), // pg_toast_13471_index
 		// pg_trigger columns (PG18, pg_trigger.h): 1=oid, 2=tgrelid,
 		// 3=tgparentid, 4=tgname. Index = btree(tgrelid, tgname).
 		entry(2701, 2620, []int16{2, 4}, []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true, false), // pg_trigger_tgrelid_tgname_index
@@ -6214,7 +6290,7 @@ func pgAttributeRow(relOID uint32, a nailedAttr) executor.Row {
 		executor.NewBoolDatum(false), // attisdropped
 		executor.NewBoolDatum(true),  // attislocal
 		executor.NewIntDatum(0),      // attinhcount
-		executor.NewIntDatum(0),      // attcollation
+		executor.NewIntDatum(int64(a.Collation)), // attcollation (M0133-S3: C collation on non-nailed info_schema columns)
 		executor.NullDatum,           // attstattarget (PG18 BKI_FORCE_NULL default)
 		// Step 3u: Emit NULL (not empty-text varlena) for the four nullable
 		// trailing varlena/array columns. Previously NewStringDatum("") wrote
@@ -6483,6 +6559,10 @@ func pgTypeByVal(oid uint32) bool {
 	switch oid {
 	case 16, 18, 21, 23, 26, 700, 20, 701, 24, 325, 269:
 		return true
+	case 13287:
+		// cardinal_number (M0133-S1): a domain over int4, so by-value exactly
+		// like its base type (M0133-S3 column metadata).
+		return true
 	case 3220:
 		// M0106-0010 Step 3cg: pg_lsn typbyval = FLOAT8PASSBYVAL (true on
 		// 64-bit). pg_subscription_rel.srsublsn and pg_subscription.subskiplsn
@@ -6533,7 +6613,10 @@ func pgTypeAlignChar(oid uint32) string {
 
 func pgTypeStorageChar(oid uint32) string {
 	switch oid {
-	case 25, 1043, 1042, 194, 1009, 1034, 2277, 1002, 1028, 3361, 3402, 5017, 10028:
+	case 25, 1043, 1042, 194, 1009, 1034, 2277, 1002, 1028, 3361, 3402, 5017, 10028,
+		// M0133-S3: the information_schema varlena domains (character_data 13290,
+		// yes_or_no 13300) are extended storage exactly like their varchar base.
+		13290, 13300:
 		// M0106-0010 Step 3cc: pg_ndistinct (3361) / pg_dependencies (3402) /
 		// pg_mcv_list (5017) / _pg_statistic (10028) all carry typstorage='x'
 		// (EXTENDED) per PG18 runtime pg_type lookup. Without this entry the

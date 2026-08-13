@@ -104,6 +104,16 @@ func TestPgTypeRowCanonicalTypcollation(t *testing.T) {
 		//            M0131-S9.3c, whose pg_publication_tables pin is the first
 		//            nailed rel with a name[] (attnames) attribute. The value
 		//            matches TestPgTypeArrayCollationMatchesElement's pin.
+		// information_schema domains declared COLLATE "C" (M0133-S1): the
+		// collatable three plus their array peers. They enter pgTypeInitialEntries
+		// once a nailed attr references them — character_data/yes_or_no do so
+		// through the M0133-S3 data tables' columns; sql_identifier via S4.
+		13289: 950, // _character_data
+		13290: 950, // character_data
+		13291: 950, // _sql_identifier
+		13292: 950, // sql_identifier
+		13299: 950, // _yes_or_no
+		13300: 950, // yes_or_no
 	}
 	for _, e := range pgTypeInitialEntries() {
 		row := pgTypeRow(e)
@@ -120,6 +130,46 @@ func TestPgTypeRowCanonicalTypcollation(t *testing.T) {
 		if got != want[e.OID] { // want[oid] is 0 for any OID not in the map
 			t.Errorf("oid=%d (%s): typcollation at offset 144: want %d, got %d",
 				e.OID, e.Name, want[e.OID], got)
+		}
+	}
+}
+
+// TestPgTypeRowCanonicalTypispreferred pins pg_type.typispreferred (FormData
+// offset 81, 1 byte) for every bootstrapped row: the eight PG18 preferred types
+// (measured: the only rows with typispreferred = t) must carry 1, every other row
+// 0. This is load-bearing for a hosted PG's operator resolution — with
+// typispreferred false on every string type, func_select_candidate cannot pick
+// text as the preferred type of category S and `character_data = 'x'` fails with
+// "operator is not unique" where a real PG resolves it to texteq (M0133-S3 F4).
+func TestPgTypeRowCanonicalTypispreferred(t *testing.T) {
+	cols := pgTypeColDefs()
+	preferred := []uint32{16, 25, 26, 701, 869, 1184, 1186, 1562}
+	seen := map[uint32]bool{}
+	for _, e := range pgTypeBootstrapEntryMap() {
+		if pgTypePreferredOverlay[e.OID] {
+			seen[e.OID] = true
+		}
+		row := pgTypeRow(e)
+		payload, err := executor.EncodeRowPG(cols, row)
+		if err != nil {
+			t.Fatalf("oid=%d (%s): encode: %v", e.OID, e.Name, err)
+		}
+		if len(payload) < 82 {
+			t.Errorf("oid=%d (%s): fixed part %d bytes < 82", e.OID, e.Name, len(payload))
+			continue
+		}
+		want := byte(0)
+		if pgTypePreferredOverlay[e.OID] {
+			want = 1
+		}
+		if payload[81] != want {
+			t.Errorf("oid=%d (%s): typispreferred at offset 81: want %d, got %d",
+				e.OID, e.Name, want, payload[81])
+		}
+	}
+	for _, oid := range preferred {
+		if !seen[oid] {
+			t.Errorf("preferred type oid=%d not present in pgTypeInitialEntries(); the guard cannot cover it", oid)
 		}
 	}
 }

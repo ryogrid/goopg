@@ -2320,6 +2320,17 @@ func coerceRowForConstraintChecks(cols []catalog.Column, row Row, include func(i
 			coerced, cerr = evalCast(row[i], "timestamp", pos, ctx)
 		case "timestamptz":
 			coerced, cerr = evalCast(row[i], "timestamptz", pos, ctx)
+		case "time", "time without time zone":
+			// M0119-0006 (62nd slice): `time` joins the list so its declared
+			// precision reaches the value — before this, a `time(2)` column's value
+			// stayed KindString until encodeValuePG parsed it, so the typmod was
+			// never applied anywhere on the INSERT path. evalCast parses the string;
+			// the typmod round below is what upstream time_in does via
+			// AdjustTimeForTypmod.
+			coerced, cerr = evalCast(row[i], "time", pos, ctx)
+			if cerr == nil {
+				coerced = roundTimeDatumToPrecision(coerced, timeColumnPrecision(col.Type))
+			}
 		case "timetz", "time with time zone":
 			// M0119-0006: timetz joins the list because its input function is the
 			// only one here whose answer depends on a GUC that only `ctx` carries
@@ -2327,6 +2338,18 @@ func coerceRowForConstraintChecks(cols []catalog.Column, row Row, include func(i
 			// KindString the value would reach encodeValuePG, which has no ctx and
 			// so silently stored `10:00:00+00` for every session.
 			coerced, cerr = evalCast(row[i], "timetz", pos, ctx)
+			if cerr == nil {
+				coerced = roundTimeDatumToPrecision(coerced, timeColumnPrecision(col.Type))
+			}
+		case "interval":
+			// M0119-0006 (63rd slice): `interval` joins the list so its declared
+			// typmod reaches the value — before this, an interval column's value
+			// stayed KindString until encodeValuePG parsed it, so the column's
+			// `interval(N)` / range qualifier was never applied anywhere on the
+			// INSERT path. Parse through the SAME ParseIntervalBody tokenizer
+			// encodeValuePG uses (not evalCast's limited `<n> <unit>` arm), then
+			// apply AdjustIntervalForTypmod exactly as interval_in does at input.
+			coerced, cerr = roundIntervalDatumToTypmod(row[i], intervalColumnTypmod(col.Type))
 		case "numeric", "decimal":
 			coerced, cerr = evalCast(row[i], "numeric", pos, ctx)
 		default:

@@ -44,13 +44,14 @@ func TestNailedCompositeNameIndexesAutoDerivedFromHeap(t *testing.T) {
 		{2691, "pg_proc_proname_args_nsp_index", 1, "proname"},
 		{2704, "pg_type_typname_nsp_index", 1, "typname"},
 		{2693, "pg_rewrite_rel_rulename_index", 2, "rulename"},
-		// NOTE: 2701 (pg_trigger_tgrelid_tgname_index) is intentionally NOT
-		// covered here. pgIndexInitialEntries says indkey={2, 4} matching
-		// PG18's 23-column pg_trigger, but goopg's pgTriggerAttrs() uses an
-		// 8-column reduced schema where tgname is at attnum 3 (attnum 4 is
-		// tgfoid). Auto-derivation correctly resolves heap attnum 4 →
-		// tgfoid, exposing this pre-existing PG18-vs-goopg schema mismatch
-		// (separate from the loop-7 auto-derivation scope).
+		// 2701 was historically NOT covered: pgIndexInitialEntries seeds
+		// indkey={2, 4} (tgrelid, tgname) matching PG18's 19-column pg_trigger,
+		// but goopg's pgTriggerAttrs() used an 8-column reduced schema where
+		// tgname sat at attnum 3 (attnum 4 = tgfoid), so auto-derivation
+		// resolved attnum 4 → tgfoid. M0133-S4 widened pgTriggerAttrs() to the
+		// full 19-column layout (tgname at attnum 4), so the derivation is now
+		// correct and 2701 is covered like every other name-keyed index.
+		{2701, "pg_trigger_tgrelid_tgname_index", 2, "tgname"},
 		{2686, "pg_opclass_am_name_nsp_index", 2, "opcname"},
 		{2754, "pg_opfamily_am_name_nsp_index", 2, "opfname"},
 		{2689, "pg_operator_oprname_l_r_n_index", 1, "oprname"},

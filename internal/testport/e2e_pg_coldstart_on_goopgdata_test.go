@@ -259,6 +259,9 @@ func TestE2E_PGColdStartOnGoopgDataDir(t *testing.T) {
 
 	assertNailedSystemViewsAreEvaluable(t, pg, goopgDir)
 	assertNonCorpusSystemViewIsStillAbsent(t, pg)
+	assertInformationSchemaDomainsResolvable(t, pg, goopgDir)
+	assertInformationSchemaDataTablesReadable(t, pg, goopgDir)
+	assertInformationSchemaViewsEvaluable(t, pg, goopgDir)
 	assertHostedPGSeesPgRewriteToastRelation(t, pg)
 
 	// Row-level reads over user tables. S4.4 originally carried no view
@@ -1009,48 +1012,43 @@ func assertNailedSystemViewsAreEvaluable(t *testing.T, pg *pgcluster.Cluster, go
 // (internal/catalog/catalog.go:335-342, skipped at :7025-7034). Passing both
 // halves is what makes the corpus list, and not something ambient, the cause.
 //
-// information_schema.tables is the probe, and it is the FIFTH relation to hold
-// this role. The discipline is fail-when-fixed: each predecessor was chosen
-// because it was blocked for a MEASURED reason, and each was retired by the
-// slice that unblocked it. M0131-S9.2a adopted pg_tables (the original probe);
-// M0131-S20.2b adopted pg_indexes, whose blocker was the 8000 B
-// inline-heap-tuple budget (9002 B stored — design 0131-0009's TOAST ceiling
-// #1), once DECLARE_TOAST(pg_rewrite, 2838, 2839) plus the S20.2a chunk writer
-// made an out-of-line ev_action storable; M0131-S9.3e adopted pg_policies by
-// bootstrapping pg_policy (3256); M0131-S9.3f adopted pg_seclabels by
-// bootstrapping pg_seclabel (3596) and pg_largeobject_metadata (2995).
+// information_schema.element_types was the sixth relation to hold this role,
+// and M0133-S4 tranche 4 (the last view-on-view tranche) is what adopted it.
+// The discipline is fail-when-fixed: each predecessor was chosen because it was
+// blocked for a MEASURED reason, and each was retired by the slice that
+// unblocked it. M0131-S9.2a adopted pg_tables (the original probe); M0131-S20.2b
+// adopted pg_indexes, whose blocker was the 8000 B inline-heap-tuple budget
+// (9002 B stored — design 0131-0009's TOAST ceiling #1); M0131-S9.3e adopted
+// pg_policies; M0131-S9.3f adopted pg_seclabels. S9.3f is also where the
+// pg_catalog VIEW supply ran out (all 80 adopted once S9.3g closed ceiling #6),
+// so F27 pointed the probe into `information_schema`, one level lower: M0133-S1
+// seeded the namespace + domains, and M0133-S4 adopted the 65 views one tranche
+// at a time (tables → columns → element_types).
 //
-// S9.3f is where the pg_catalog supply of probes runs out. The corpus is 79 of
-// upstream's 80 and the ONE remaining view, pg_stats_ext_exprs (12063,
-// ceiling #6 — no pg_type row for 10029), is unusable HERE for a reason that
-// has nothing to do with whether it is absent: its failure trips
-// Assert("OidIsValid(typentry->typrelid)") (typcache.c:3082) and takes the
-// backend down with it, and an "is it still absent?" guard must fail QUIETLY.
-//
-// So the probe crosses into the next slice's territory instead (F27). S9.4's
-// subject, `information_schema`, is absent one level lower than any predecessor
-// — not a view goopg failed to seed but a NAMESPACE goopg never bootstraps at
-// all (internal/initdb/initdb.go seeds exactly three: pg_catalog, public,
-// pg_toast). That makes information_schema.tables both a valid non-corpus
-// relation today and the natural fail-when-fixed tripwire for S9.4: the day
-// goopg seeds the information_schema namespace and its 65 views, this
-// assertion fails and whoever lands that slice must retire it.
+// That exhausts the VIEW supply entirely — goopg now seeds all 80 pg_catalog
+// system views AND all 65 information_schema views, upstream's complete view
+// inventory, so there is no "next un-adopted view" left to trip on. The probe
+// therefore re-points to a different class of genuinely-absent relation: the
+// `pg_largeobject` catalog (2613), which goopg DELIBERATELY does not bootstrap
+// (relcache_init.go's nailedLocalRels comment: the pg_seclabels view references
+// it only via a folded ::regclass Const, so nothing resolves the name at run
+// time, and goopg has no large-object subsystem). It is a real PG catalog, so
+// it still distinguishes "goopg seeded it" from "a hosted PG resolves it
+// ambiently", and its absence is permanent — the tripwire now guards the
+// evaluability probe's non-vacuity rather than any future adoption.
 func assertNonCorpusSystemViewIsStillAbsent(t *testing.T, pg *pgcluster.Cluster) {
 	t.Helper()
-	// M0131-S9.3f re-pointed this from pg_seclabels (adopted by that slice,
-	// which bootstrapped pg_seclabel 3596 and pg_largeobject_metadata 2995)
-	// to information_schema.tables. pg_stats_ext_exprs, the last un-adopted
-	// pg_catalog view, is deliberately NOT used: its failure mode trips an
-	// Assert in typcache.c and takes the backend — and the rest of this run —
-	// down with it.
-	const view = "information_schema.tables"
+	// Re-pointed from information_schema.element_types (adopted by M0133-S4
+	// tranche 4) to pg_catalog.pg_largeobject (2613) — the one pg_catalog
+	// catalog goopg deliberately never bootstraps. No pg_class row is seeded
+	// for 2613, so it must fail QUIETLY with 42P01 "does not exist".
+	const view = "pg_catalog.pg_largeobject"
 	out, err := pgQueryScalarAllowError(pg, "SELECT * FROM "+view+" LIMIT 0")
 	if err == nil {
 		t.Errorf("hosted PG evaluated %s, which is NOT in the on-disk corpus "+
-			"(nailedSystemViewProbeSet) — either goopg's initdb now bootstraps "+
-			"the information_schema namespace and its views (M0131-S9.4; then "+
-			"add them to the corpus and re-point this probe at the next "+
-			"un-adopted relation), or the evaluability probe above is passing "+
+			"(informationSchemaViewProbeSet) — either goopg's initdb now bootstraps "+
+			"it (M0133-S4; then add it to the corpus and re-point this probe at the "+
+			"next un-adopted relation), or the evaluability probe above is passing "+
 			"for a reason unrelated to goopg's seeding. Output: %q",
 			view, strings.TrimSpace(out))
 		return
@@ -1063,6 +1061,229 @@ func assertNonCorpusSystemViewIsStillAbsent(t *testing.T, pg *pgcluster.Cluster)
 		t.Errorf("hosted PG rejected %s, but NOT with the expected 42P01 "+
 			"undefined_table — a non-corpus view is supposed to be missing from "+
 			"the pg_class heap entirely:\n%s", view, out)
+	}
+}
+
+// assertInformationSchemaDomainsResolvable is M0133-S1's acceptance probe: a
+// hosted PG cold-started on a goopg $PGDATA must resolve the information_schema
+// namespace (13273) and its five domains, and the two domain CHECK constraints
+// must actually ENFORCE (not merely exist). goopg seeds the namespace + domains
+// + array peers + the two pg_constraint rows in one bootstrap step; this probe
+// is what distinguishes "seeded" from "a namespace that exists and is empty".
+func assertInformationSchemaDomainsResolvable(t *testing.T, pg *pgcluster.Cluster, goopgDir string) {
+	t.Helper()
+	// Resolvability: cast succeeds and format_type names the domain by OID.
+	for _, tc := range []struct {
+		query string
+		want  string
+	}{
+		{`SELECT 'abc'::information_schema.sql_identifier`, "abc"}, // over name (19), no CHECK
+		{`SELECT 5::information_schema.cardinal_number`, "5"},      // over int4 (23)
+		{`SELECT 'YES'::information_schema.yes_or_no`, "YES"},      // over varchar(3)
+		{`SELECT format_type(13287, NULL)`, "information_schema.cardinal_number"}, // domain on disk, schema-qualified (not in search_path)
+		{`SELECT typtype FROM pg_type WHERE oid = 13287`, "d"},                       // and it is a domain
+	} {
+		got := s4Scalar(t, pg, pgLogPathFor(goopgDir), tc.query)
+		if got != tc.want {
+			t.Errorf("hosted PG %q = %q, want %q", tc.query, got, tc.want)
+		}
+	}
+	// Enforcement: the two CHECKs must reject their violating values. The
+	// failure text names the constraint, proving it was read from pg_constraint
+	// via pg_constraint_contypid_index (2666), not merely absent.
+	for _, tc := range []struct {
+		query string
+		name  string
+	}{
+		{`SELECT (-1)::information_schema.cardinal_number`, "cardinal_number_domain_check"},
+		{`SELECT 'MAYBE'::information_schema.yes_or_no`, "yes_or_no_check"},
+	} {
+		out, err := pgQueryScalarAllowError(pg, tc.query)
+		if err == nil {
+			t.Errorf("hosted PG accepted %s (want a domain CHECK violation)", tc.query)
+			continue
+		}
+		if !strings.Contains(out, "violates check constraint") || !strings.Contains(out, tc.name) {
+			t.Errorf("hosted PG rejected %s, but not with the expected check-constraint "+
+				"violation naming %q:\n%s", tc.query, tc.name, out)
+		}
+	}
+}
+
+// assertInformationSchemaDataTablesReadable is M0133-S3's acceptance probe: a
+// hosted PG cold-started on a goopg $PGDATA must READ REAL ROWS out of the four
+// information_schema data tables, not merely plan a query over them. This is
+// the first bulk data load goopg's initdb performs — the four tables are
+// ordinary heaps (relkind 'r') whose 801 rows upstream COPYs/INSERTs from
+// sql_features.txt, and whose columns are the S1 domains.
+func assertInformationSchemaDataTablesReadable(t *testing.T, pg *pgcluster.Cluster, goopgDir string) {
+	t.Helper()
+	logPath := pgLogPathFor(goopgDir)
+
+	// Row counts — the tables answer with their full captured data set.
+	for _, tc := range []struct{ query, want string }{
+		{`SELECT count(*) FROM information_schema.sql_features`, "755"},
+		{`SELECT count(*) FROM information_schema.sql_sizing`, "23"},
+		{`SELECT count(*) FROM information_schema.sql_implementation_info`, "12"},
+		{`SELECT count(*) FROM information_schema.sql_parts`, "11"},
+	} {
+		if got := s4Scalar(t, pg, logPath, tc.query); got != tc.want {
+			t.Errorf("hosted PG %q = %q, want %q", tc.query, got, tc.want)
+		}
+	}
+
+	// Real cell reads, not just counts — the first sql_features row in heap
+	// order (B011 / "Embedded Ada", deterministic: the heap is written in
+	// capture order). The WHERE-clause read below deliberately exercises the
+	// domain-typed comparison `feature_id = 'B011'` (character_data = unknown),
+	// which failed "operator is not unique" until typispreferred was fixed for
+	// the eight PG18 preferred types (text 25 is the preferred type of category
+	// S; func_select_candidate needs it to disambiguate). The cell content itself
+	// is pinned field-for-field by TestInformationSchemaTableRowsMatchCapture.
+	if got := s4Scalar(t, pg, logPath,
+		`SELECT feature_id FROM information_schema.sql_features LIMIT 1`); got != "B011" {
+		t.Errorf("hosted PG sql_features[0] feature_id = %q, want %q", got, "B011")
+	}
+	if got := s4Scalar(t, pg, logPath,
+		`SELECT feature_name FROM information_schema.sql_features WHERE feature_id = 'B011'`); got != "Embedded Ada" {
+		t.Errorf("hosted PG sql_features WHERE feature_id='B011' = %q, want %q (domain-typed "+
+			"comparison must resolve to texteq now that typispreferred is seeded)", got, "Embedded Ada")
+	}
+
+	// The composite rowtype is on disk and is a real composite pointing back at
+	// the table (typrelid = table OID). oid equality is bootstrapped, so `=`
+	// on pg_type.oid is fine here.
+	if got := s4Scalar(t, pg, logPath,
+		`SELECT typtype FROM pg_type WHERE oid = 13458`); got != "c" {
+		t.Errorf("hosted PG sql_features rowtype typtype = %q, want %q", got, "c")
+	}
+	if got := s4Scalar(t, pg, logPath,
+		`SELECT typrelid FROM pg_type WHERE oid = 13458`); got != "13456" {
+		t.Errorf("hosted PG sql_features rowtype typrelid = %q, want %q", got, "13456")
+	}
+}
+
+// informationSchemaViewProbeSet is the M0133-S4 analogue of
+// nailedSystemViewProbeSet: the information_schema views goopg has adopted on
+// disk, with the upstream OID each is pinned to (Option A, see
+// internal/initdb/information_schema_view_oid_pins.go). Tranche 1 is all 33
+// catalog-direct, under-inline-budget views — the four formerly withheld on
+// incomplete goopg catalog descriptors (character_sets, collations,
+// collation_character_set_applicability read pg_collation cols 9–12; triggers
+// reads pg_trigger cols 3/9–19) landed with the descriptor-completion slice.
+// Tranche 2 (2026-08-14) adds the ten catalog-direct TOAST views, whose stored
+// ev_action exceeds the 8000 B inline budget and is externalised into
+// pg_toast_2618 by the M0131-S20.2 writer. Tranche 3 (2026-08-14) adds the
+// four helper-function views (key_column_usage, parameters, sequences,
+// triggered_update_columns) — catalog-direct, under the inline budget, and
+// embedding an in-band :funcid to the S2 helpers (13274..13285) but no
+// in-band :relid. Tranche 4 (2026-08-14) adds the remaining 18 view-on-view
+// views — their ev_action embeds in-band :relid references to other
+// information_schema views, whose bases landed in tranches 1–3.
+func informationSchemaViewProbeSet() []struct {
+	view string
+	oid  string
+} {
+	return []struct {
+		view string
+		oid  string
+	}{
+		{"information_schema.information_schema_catalog_name", "13293"},
+		{"information_schema.applicable_roles", "13302"},
+		{"information_schema.administrable_role_authorizations", "13307"},
+		{"information_schema.attributes", "13311"},
+		{"information_schema.character_sets", "13316"},
+		{"information_schema.check_constraint_routine_usage", "13321"},
+		{"information_schema.check_constraints", "13326"},
+		{"information_schema.collations", "13331"},
+		{"information_schema.collation_character_set_applicability", "13336"},
+		{"information_schema.column_column_usage", "13341"},
+		{"information_schema.column_domain_usage", "13346"},
+		{"information_schema.column_privileges", "13351"},
+		{"information_schema.column_udt_usage", "13356"},
+		{"information_schema.columns", "13361"},
+		{"information_schema.constraint_column_usage", "13366"},
+		{"information_schema.constraint_table_usage", "13371"},
+		{"information_schema.domain_constraints", "13376"},
+		{"information_schema.domain_udt_usage", "13381"},
+		{"information_schema.domains", "13385"},
+		{"information_schema.enabled_roles", "13390"},
+		{"information_schema.key_column_usage", "13394"},
+		{"information_schema.parameters", "13399"},
+		{"information_schema.referential_constraints", "13404"},
+		{"information_schema.role_column_grants", "13409"},
+		{"information_schema.routine_column_usage", "13413"},
+		{"information_schema.routine_privileges", "13418"},
+		{"information_schema.role_routine_grants", "13423"},
+		{"information_schema.routine_routine_usage", "13427"},
+		{"information_schema.routine_sequence_usage", "13432"},
+		{"information_schema.routine_table_usage", "13437"},
+		{"information_schema.routines", "13442"},
+		{"information_schema.schemata", "13447"},
+		{"information_schema.sequences", "13451"},
+		{"information_schema.table_constraints", "13476"},
+		{"information_schema.table_privileges", "13481"},
+		{"information_schema.role_table_grants", "13486"},
+		{"information_schema.tables", "13490"},
+		{"information_schema.transforms", "13495"},
+		{"information_schema.triggered_update_columns", "13500"},
+		{"information_schema.triggers", "13505"},
+		{"information_schema.udt_privileges", "13510"},
+		{"information_schema.role_udt_grants", "13515"},
+		{"information_schema.usage_privileges", "13519"},
+		{"information_schema.role_usage_grants", "13524"},
+		{"information_schema.user_defined_types", "13528"},
+		{"information_schema.view_column_usage", "13533"},
+		{"information_schema.view_routine_usage", "13538"},
+		{"information_schema.view_table_usage", "13543"},
+		{"information_schema.views", "13548"},
+		{"information_schema.data_type_privileges", "13553"},
+		{"information_schema.element_types", "13558"},
+		{"information_schema._pg_foreign_table_columns", "13563"},
+		{"information_schema.column_options", "13568"},
+		{"information_schema._pg_foreign_data_wrappers", "13572"},
+		{"information_schema.foreign_data_wrapper_options", "13576"},
+		{"information_schema.foreign_data_wrappers", "13580"},
+		{"information_schema._pg_foreign_servers", "13584"},
+		{"information_schema.foreign_server_options", "13588"},
+		{"information_schema.foreign_servers", "13592"},
+		{"information_schema._pg_foreign_tables", "13596"},
+		{"information_schema.foreign_table_options", "13601"},
+		{"information_schema.foreign_tables", "13605"},
+		{"information_schema._pg_user_mappings", "13609"},
+		{"information_schema.user_mapping_options", "13614"},
+		{"information_schema.user_mappings", "13619"},
+	}
+}
+
+// assertInformationSchemaViewsEvaluable is M0133-S4's acceptance probe: a hosted
+// PG 18.3 cold-started on a goopg $PGDATA must (a) resolve each adopted
+// information_schema view to its pinned upstream OID and (b) EVALUATE it via its
+// _RETURN rule. LIMIT 0 keeps the assertion on rule expansion rather than row
+// content — these views read goopg's catalog heaps, and row content is pinned
+// separately by the data-table probe above. Per-view Errorf (not Fatalf) is the
+// same risk control as the pg_catalog probe: 33 independent blobs, and a bad
+// tupledesc names its own view.
+func assertInformationSchemaViewsEvaluable(t *testing.T, pg *pgcluster.Cluster, goopgDir string) {
+	t.Helper()
+	for _, tc := range informationSchemaViewProbeSet() {
+		got, err := pgQueryScalarAllowError(pg, "SELECT '"+tc.view+"'::regclass::oid")
+		if err != nil {
+			t.Errorf("hosted PG cannot resolve %s at all: %v\n%s", tc.view, err, got)
+			continue
+		}
+		if g := strings.TrimSpace(got); g != tc.oid {
+			t.Errorf("hosted PG resolves %s to OID %s, want upstream's %s — "+
+				"information_schema_view_oid_pins.go pins goopg's view OIDs to "+
+				"PG 18.3's initdb assignment", tc.view, g, tc.oid)
+			continue
+		}
+		out, err := pgQueryScalarAllowError(pg, "SELECT * FROM "+tc.view+" LIMIT 0")
+		if err != nil {
+			logTail, _ := os.ReadFile(pgLogPathFor(goopgDir))
+			t.Errorf("hosted PG cannot evaluate %s: %v\n%s\n--- PG log ---\n%s",
+				tc.view, err, out, tailLines(string(logTail), 60))
+		}
 	}
 }
 
@@ -1140,6 +1361,19 @@ func assertHostedPGSeesPgRewriteToastRelation(t *testing.T, pg *pgcluster.Cluste
 		"12067/6/11089",  // pg_stats_ext_exprs   (upstream: 6 / 11481) — M0131-S9.3g
 		"12103/18/34093", // pg_seclabels         (upstream: 18 / 35379) — M0131-S9.3f
 		"12178/6/10125",  // pg_statio_all_tables (upstream: 6 / 10475)
+		// M0133-S4 tranche 2 — the ten information_schema TOAST views.
+		"13315/7/13160",  // attributes           (upstream: 7 / 13608)
+		"13330/8/15510",  // check_constraints    (upstream: 9 / 16059)
+		"13355/6/10396",  // column_privileges    (upstream: 6 / 10776)
+		"13365/12/23386", // columns              (upstream: 13 / 24201)
+		"13370/5/8502",   // constraint_column_usage (upstream: 5 / 8878)
+		"13389/5/8110",   // domains              (upstream: 5 / 8356)
+		"13408/7/13086",  // referential_constraints (upstream: 7 / 13463)
+		"13446/5/9731",   // routines             (upstream: 6 / 10091)
+		"13499/10/18840", // transforms           (upstream: 10 / 19659)
+		"13523/10/18574", // usage_privileges     (upstream: 10 / 19211)
+		// M0133-S4 tranche 4 — the view-on-view element_types (eleventh F33).
+		"13562/6/10541", // element_types         (upstream: 6 / 10956)
 	}
 	gotChunks := pgQueryColumn(t, pg,
 		"SELECT chunk_id::text || '/' || count(*)::text || '/' || sum(length(chunk_data))::text "+
