@@ -198,22 +198,51 @@ func TestHeapXid8IsEightBytesAtEightByteAlignment(t *testing.T) {
 	}
 }
 
-// oid/regproc/xid are unsigned 32-bit and xid8 unsigned 64-bit; upstream's
-// uint32in_subr / uint64in_subr raise 22003 outside that range rather than
-// wrapping (postgres/src/backend/utils/adt/oid.c:41 via numutils.c). The check
-// lives in the SHARED coercion so the heap and the COPY wire cannot disagree
-// about which values exist.
-func TestOidFamilyRangeIsCheckedNotWrapped(t *testing.T) {
-	for _, tc := range []struct {
+// oid/regproc/xid are unsigned 32-bit and xid8 unsigned 64-bit. Upstream's
+// uint32in_subr / uint64in_subr (postgres/src/backend/utils/adt/numutils.c,
+// reached from oid.c:41) wrap a leading '-' through strtoul/strtoull and admit
+// the result after signed OR unsigned extension, so a negative value whose
+// magnitude fits the signed width is ACCEPTED and stores its two's-complement
+// image ("-1040" → 4294966256). Only magnitude overflow — positive above the
+// unsigned max, or negative below the signed min — is 22003. The check lives in
+// the SHARED coercion so the heap and the COPY wire cannot disagree about which
+// values exist.
+//
+// M-NIGHTLY AI-20260814-011711-002: the prior reading ("raise 22003 rather than
+// wrapping") was wrong for a leading sign, and this test pinned it — the
+// regress oid case (INSERT '-1040' expects 4294966256) caught the divergence.
+func TestOidFamilyRangeWrapNegativesRejectMagnitudeOverflow(t *testing.T) {
+	accepted := []struct {
+		typ  string
+		val  int64
+		want uint64
+	}{
+		{"oid", -1, 4294967295},
+		{"oid", -1040, 4294966256},
+		{"regproc", -5, 4294967291},
+		{"xid", -2147483648, 2147483648}, // MinInt32 wraps to 2^31
+		{"xid8", -1, 18446744073709551615},
+	}
+	for _, tc := range accepted {
+		col := catalog.Type{Name: tc.typ}
+		if _, err := encodeValuePG(col, NewIntDatum(tc.val)); err != nil {
+			t.Fatalf("encodeValuePG(%s, %d) rejected an in-range value: %v", tc.typ, tc.val, err)
+		}
+		if _, err := datumToCopyBinary(col, NewIntDatum(tc.val)); err != nil {
+			t.Fatalf("datumToCopyBinary(%s, %d) rejected an in-range value: %v", tc.typ, tc.val, err)
+		}
+	}
+	rejected := []struct {
 		typ string
 		val int64
 	}{
-		{"oid", -1},
-		{"oid", 4294967296},
-		{"regproc", -5},
+		{"oid", 4294967296},  // 2^32, positive overflow
+		{"oid", -2147483649}, // below MinInt32, negative overflow
+		{"regproc", 4294967296},
 		{"xid", 4294967296},
-		{"xid8", -1},
-	} {
+		{"xid", -2147483649},
+	}
+	for _, tc := range rejected {
 		col := catalog.Type{Name: tc.typ}
 		if _, err := encodeValuePG(col, NewIntDatum(tc.val)); err == nil {
 			t.Fatalf("encodeValuePG(%s, %d) accepted an out-of-range value", tc.typ, tc.val)

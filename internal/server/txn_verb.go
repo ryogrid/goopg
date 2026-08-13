@@ -81,12 +81,25 @@ func noTransactionInProgressNotice() []protocol.ErrorField {
 }
 
 // endExplicitBlock performs the teardown every terminal path of the arm
-// shares: undo enum DDL, release the per-connection explicit state, fire the
-// EndLocalTransaction hook and clear the pending type-DDL queues. The inline
-// arm repeated this block five times; keeping it one function is what makes
-// the five paths verifiably identical.
-func (s *Server) endExplicitBlock(ctx *executor.Context, connTx *connTxState) {
-	undoEnumDDLForRollback(connTx, s.cfg.Catalog, ctx.CurrentDatabaseOid)
+// shares: optionally undo enum DDL, release the per-connection explicit state,
+// fire the EndLocalTransaction hook and clear the pending type-DDL queues. The
+// inline arm repeated this block five times; keeping it one function is what
+// makes the five paths verifiably identical.
+//
+// undoEnumDDL is true on every path that ends in a ROLLBACK (an explicit
+// ROLLBACK, a COMMIT in a failed block, a deferred-constraint or SSI abort, or
+// a CommitTransaction error) and false only on a successful COMMIT — a
+// committed ALTER TYPE … ADD VALUE must persist, not be reversed. M0132-S2's
+// extraction collapsed the original five inline teardown blocks into this one
+// helper and dropped that asymmetry: the pre-extraction COMMIT-success block
+// (dispatch.go's "Transaction verbs" arm) called connTx.End() + cleared the
+// queues WITHOUT undoEnumDDLForRollback. The M-NIGHTLY regress/enum regression
+// (AI-20260814-011711-001) is the direct consequence — after COMMIT, the newly
+// added enum label had been removed from the in-memory catalog.
+func (s *Server) endExplicitBlock(ctx *executor.Context, connTx *connTxState, undoEnumDDL bool) {
+	if undoEnumDDL {
+		undoEnumDDLForRollback(connTx, s.cfg.Catalog, ctx.CurrentDatabaseOid)
+	}
 	connTx.End()
 	if ctx.EndLocalTransaction != nil {
 		ctx.EndLocalTransaction()
@@ -290,7 +303,7 @@ func (s *Server) applyTransactionVerb(ctx *executor.Context, connTx *connTxState
 			if connTx.IsFailed() {
 				// COMMIT in a failed transaction block → ROLLBACK (PG semantics).
 				_ = s.cfg.TxnMgr.Rollback(connTx.Tx())
-				s.endExplicitBlock(ctx, connTx)
+				s.endExplicitBlock(ctx, connTx, true)
 				return txnVerbOutcome{Handled: true, Tag: "ROLLBACK"}
 			}
 			explicitTx := connTx.Tx()
@@ -322,7 +335,7 @@ func (s *Server) applyTransactionVerb(ctx *executor.Context, connTx *connTxState
 				}
 				if deferErr != nil {
 					_ = s.cfg.TxnMgr.Rollback(explicitTx)
-					s.endExplicitBlock(ctx, connTx)
+					s.endExplicitBlock(ctx, connTx, true)
 					code := sqlstate.ForeignKeyViolation
 					var fields []protocol.ErrorField
 					if ee, ok := deferErr.(*executor.ExecError); ok {
@@ -352,7 +365,7 @@ func (s *Server) applyTransactionVerb(ctx *executor.Context, connTx *connTxState
 				if ssiErr := s.cfg.TxnMgr.PreCommitCheckForSerializationFailure(explicitTx.Handle); ssiErr != nil {
 					// SSI failure: rollback.
 					_ = s.cfg.TxnMgr.Rollback(explicitTx)
-					s.endExplicitBlock(ctx, connTx)
+					s.endExplicitBlock(ctx, connTx, true)
 					// Primary message is the bare upstream errmsg; the reason
 					// code rides in DETAIL (predicate.c parity). isolationtester
 					// and psql print only the errmsg line.
@@ -390,7 +403,7 @@ func (s *Server) applyTransactionVerb(ctx *executor.Context, connTx *connTxState
 				executor.ApplyDeferredRoutineDrops(ctx, sess)
 			}
 			if err := ctx.CommitTransaction(explicitTx); err != nil {
-				s.endExplicitBlock(ctx, connTx)
+				s.endExplicitBlock(ctx, connTx, true)
 				return txnVerbOutcome{Handled: true, Err: &txnVerbError{Code: sqlstate.SystemError, Msg: err.Error()}}
 			}
 			// Publish NOTIFYs buffered by this explicit transaction now that it
@@ -398,7 +411,7 @@ func (s *Server) applyTransactionVerb(ctx *executor.Context, connTx *connTxState
 			// to this session happens at the trailing ReadyForQuery via
 			// deliverNotifications. M0118-0009 (async-notify).
 			s.publishPendingNotify(connTx)
-			s.endExplicitBlock(ctx, connTx)
+			s.endExplicitBlock(ctx, connTx, false)
 			maybeForceGCAfterCommit()
 			// Leave *autoCommitPtr = false so the caller does NOT attempt
 			// a second TxnMgr.Commit on the already-committed transaction.
@@ -414,7 +427,7 @@ func (s *Server) applyTransactionVerb(ctx *executor.Context, connTx *connTxState
 				executor.ProcessRollbackUndos(ctx, sess)
 			}
 			_ = s.cfg.TxnMgr.Rollback(connTx.Tx())
-			s.endExplicitBlock(ctx, connTx)
+			s.endExplicitBlock(ctx, connTx, true)
 			// Leave *autoCommitPtr = false to avoid a second rollback attempt.
 			return txnVerbOutcome{Handled: true, Tag: transactionTag(txNode.Verb)}
 		}

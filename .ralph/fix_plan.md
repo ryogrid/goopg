@@ -984,6 +984,43 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
 
 _(completed `[x]` milestones archived → `completed_milestones/completed_fix_plan_011.md`)_
 
+### Nightly run 20260814-011711 (sha `cfc4f7e3`, 2 items) — filed 2026-08-14
+
+Both re-run at HEAD `0cb52c7d` before filing (rule §2): both REAL, two distinct
+root causes, both fixed this loop.
+
+- [x] **regress/enum (AI-20260814-011711-001)** — **FIXED (2026-08-14).**
+      M0132-S2 (`e00f4f5b`) extracted the transaction-verb state machine into
+      `txn_verb.go` and collapsed the teardown of all five block-ending paths
+      into `endExplicitBlock`, which unconditionally called
+      `undoEnumDDLForRollback`. That undo is correct on ROLLBACK but was ALSO
+      running on a successful COMMIT — the pre-extraction inline COMMIT-success
+      block called `connTx.End()` + cleared the pending queues WITHOUT the enum
+      undo, and the consolidation dropped that asymmetry. Result: a committed
+      `ALTER TYPE … ADD VALUE` had its new label removed from the in-memory
+      catalog the moment the block ended, so the post-COMMIT
+      `SELECT 'new'::bogus` failed `invalid input value for enum bogus: "new"`
+      and `pg_enum` reported only the pre-existing label. Fix: `endExplicitBlock`
+      gained an `undoEnumDDL bool` — true on every rollback/abort path
+      (COMMIT-in-failed-block, deferred-constraint/SSI abort, CommitTransaction
+      error, ROLLBACK), false only on successful COMMIT. Test:
+      `TestSimpleQueryCommitPersistsEnumAddValue`
+      (`internal/server/dispatch_batch_atomicity_test.go`).
+- [x] **regress/oid (AI-20260814-011711-002)** — **FIXED (2026-08-14).**
+      M0119-0006 54th slice (`a30ab155`) extracted `pgUnsignedIDFromDatum` with
+      a `v < 0` rejection on the theory that `uint32in_subr` "raises 22003
+      outside the type's range, never a silent wrap". Wrong for a leading sign:
+      `strtoul` parses the '-' and wraps, and `uint32in_subr`'s
+      `PG_UINT32_MAX != ULONG_MAX` block (numutils.c) then admits the value after
+      signed OR unsigned extension — the accepted 32-bit range is
+      `[MinInt32, MaxUint32]` and `-1040` stores `4294966256`. Symptom:
+      `INSERT INTO OID_TBL VALUES ('-1040')` → `value "-1040" is out of range
+      for type oid` where PG stores `4294966256`. Fix: `pgUnsignedIDFromDatum`
+      now accepts negatives in the signed-32 range (wrapping via `uint32(v)`) and
+      negatives for xid8 (wrapping via `uint64(v)`). Test:
+      `TestPgUnsignedIDFromDatumNegativeWrap`
+      (`internal/executor/pg_unsigned_id_wrap_test.go`).
+
 ## M0130 — Cluster-directory compat with PG 18.3 + PG physical replication (filed 2026-08-09)
 
 **Milestone doc:** `docs/milestones/0130-cluster-dir-compat-and-pg-physical-replication.md`

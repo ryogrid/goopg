@@ -2013,8 +2013,14 @@ func encodeVarlen(b []byte) []byte {
 //
 // bits is 32 for oid/regproc/xid and 64 for xid8. The bound mirrors upstream
 // uint32in_subr (postgres/src/backend/utils/adt/numutils.c, reached from oidin
-// via oid.c:41) and xid8in's uint64in_subr: a value outside the type's range is
-// 22003, never a silent wrap. typeName is the name PG puts in that message.
+// via oid.c:41) and xid8in's uint64in_subr. A value outside the type's range is
+// 22003, but a value with a leading '-' is NOT out of range: strtoul/strtoull
+// parse the sign and wrap, and uint32in_subr's PG_UINT32_MAX != ULONG_MAX block
+// admits the result if it matches after signed OR unsigned extension. The
+// accepted 32-bit range is therefore the union of int32 and uint32
+// ([MinInt32, MaxUint32]); "-1040" stores 4294966256, exactly as the oid
+// regress case (INSERT '-1040') expects. typeName is the name PG puts in the
+// 22003 message.
 //
 // M0119-0006 (54th slice): extracted so the heap arms of encodeValuePG and the
 // binary-COPY arms of datumToCopyBinary (copy_binary.go) cannot drift — the two
@@ -2034,10 +2040,19 @@ func pgUnsignedIDFromDatum(d Datum, typeName string, bits int) (uint64, error) {
 	default:
 		return 0, fmt.Errorf("expected int for %s, got kind %d", typeName, d.Kind)
 	}
-	if v < 0 || (bits == 32 && v > math.MaxUint32) {
-		return 0, &ExecError{Code: "22003",
-			Message: fmt.Sprintf("value %q is out of range for type %s", strings.TrimSpace(d.Format()), typeName)}
+	if bits == 32 {
+		// uint32in_subr accepts a value in the union of the signed-32 and
+		// unsigned-32 ranges (see the comment above): negatives wrap via
+		// uint32(v), only values outside [-2^31, 2^32-1] are 22003.
+		// M-NIGHTLY AI-20260814-011711-002.
+		if v < math.MinInt32 || v > math.MaxUint32 {
+			return 0, &ExecError{Code: "22003",
+				Message: fmt.Sprintf("value %q is out of range for type %s", strings.TrimSpace(d.Format()), typeName)}
+		}
+		return uint64(uint32(v)), nil
 	}
+	// bits == 64 (xid8): uint64in_subr wraps a negative through strtoull, so a
+	// negative int64 is its two's-complement uint64 image — no 22003.
 	return uint64(v), nil
 }
 
