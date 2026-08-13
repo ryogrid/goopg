@@ -537,3 +537,56 @@ func TestM0132S1_SyncDoesNotEndAnOpenBlock(t *testing.T) {
 		t.Fatalf("simple ROLLBACK errored: %+v", f)
 	}
 }
+
+// TestM0132S9_SyncBetweenExecutesLeavesBlockOpen is M0132-S9, the post-S2
+// extension of finding (c) that S1's bar above only sketches. It drives a full
+// block over the extended protocol and places a bare Sync BETWEEN two in-block
+// Executes, then asserts two things the "end the transaction at Sync" edit
+// would break:
+//
+//   1. the ReadyForQuery after that mid-block Sync reports 'T' — the block is
+//      still open, so the next Execute must not silently start a fresh
+//      auto-commit transaction;
+//   2. the work done by the Execute AFTER the Sync is still rolled back by a
+//      later ROLLBACK — i.e. both Executes joined the one block, not an
+//      auto-commit transaction that the ROLLBACK discards nothing of.
+//
+// Unlike TestM0132S1_SyncDoesNotEndAnOpenBlock (which only checks the status
+// byte, with the block open over the simple path), this one also checks the
+// second Execute's writes, and opens the block over the extended path — so a
+// future reader cannot "fix" Sync into ending the block and still pass this.
+func TestM0132S9_SyncBetweenExecutesLeavesBlockOpen(t *testing.T) {
+	addr, _, stop := startCopyExecServer(t)
+	defer stop()
+	conn := dialAndComplete(t, addr)
+	defer conn.Close()
+	r := extendedReader(t, conn)
+
+	if f := extendedStmt(t, conn, r, "s9_begin", "BEGIN"); hasError(f) {
+		t.Fatalf("extended BEGIN errored: %+v", f)
+	}
+
+	// Execute #1 — INSERT, then a bare Sync in the middle of the block.
+	writeFrontendFrame(t, conn, protocol.MsgParse, parsePayload("s9_i1", "INSERT INTO items VALUES (1, 'a')", nil))
+	writeFrontendFrame(t, conn, protocol.MsgBind, bindPayload("", "s9_i1", nil, nil, nil))
+	writeFrontendFrame(t, conn, protocol.MsgExecute, executePayload("", 0))
+	writeFrontendFrame(t, conn, protocol.MsgSync, nil)
+	if st := readyStatus(t, drainToReady(t, r)); st != byte(protocol.TxStatusInTransaction) {
+		t.Fatalf("status after Sync between two in-block Executes = %q, want 'T' "+
+			"(Sync must not end the block)", st)
+	}
+
+	// Execute #2 — this work must land in the SAME block the Sync just left open.
+	if f := extendedStmt(t, conn, r, "s9_i2", "INSERT INTO items VALUES (2, 'b')"); hasError(f) {
+		t.Fatalf("extended INSERT #2 errored: %+v", f)
+	}
+
+	if f := extendedStmt(t, conn, r, "s9_rb", "ROLLBACK"); hasError(f) {
+		t.Fatalf("extended ROLLBACK errored: %+v", f)
+	}
+
+	if got := countItems(t, conn, r); got != 0 {
+		t.Errorf("after BEGIN / Execute / Sync / Execute / ROLLBACK: %d rows, want 0 "+
+			"(both Executes joined the one block, so the ROLLBACK discards both)", got)
+	}
+}

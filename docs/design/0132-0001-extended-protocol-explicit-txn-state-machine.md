@@ -228,7 +228,7 @@ and added the acceptance bar as
 |---|---|---|
 | (a) `connTxState` is already threaded into the extended path | **confirmed** | `dispatch_extended.go:30` takes `connTx *connTxState`; its only reads are `NonSuperuserRole` and statement logging. The first *code* slice is therefore the state machine (S2), not plumbing. |
 | (b) there is no `execCommit` route to adopt | **confirmed** | `dispatch.go:2803-2807` states the bypass in so many words, and the deferred FK/UNIQUE/EXCLUDE sequence is inline at `:2818-2828`. S4 is a proof obligation on S2's extraction, not independent wiring. |
-| (c) `Sync` is already correct | **confirmed** | `server.go`'s `MsgSync` arm clears `syncRequired` and calls `w.ReadyForQuery()`; it touches no transaction state. Pinned by `TestM0132S1_SyncDoesNotEndAnOpenBlock`, which passes today and must keep passing. |
+| (c) `Sync` is already correct | **confirmed** | `server.go`'s `MsgSync` arm clears `syncRequired` and calls `w.ReadyForQuery()`; it touches no transaction state. Pinned by `TestM0132S1_SyncDoesNotEndAnOpenBlock`, which passes today and must keep passing. **Extended post-S2 (M0132-S9, 2026-08-13):** `TestM0132S9_SyncBetweenExecutesLeavesBlockOpen` drives a full extended block and places a bare `Sync` *between* two in-block `Execute`s, asserting both the `'T'` status byte after the mid-block `Sync` and that the second `Execute`'s writes still roll back on `ROLLBACK` — the "Sync ends the transaction" misreading fails the rollback half even if it kept the status byte green. |
 
 ### The bar, and how its redness is proven
 
