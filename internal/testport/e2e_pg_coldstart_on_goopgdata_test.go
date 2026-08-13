@@ -1174,12 +1174,13 @@ func assertInformationSchemaDataTablesReadable(t *testing.T, pg *pgcluster.Clust
 // informationSchemaViewProbeSet is the M0133-S4 analogue of
 // nailedSystemViewProbeSet: the information_schema views goopg has adopted on
 // disk, with the upstream OID each is pinned to (Option A, see
-// internal/initdb/information_schema_view_oid_pins.go). Tranche 1 is 29 of the
-// 33 catalog-direct, under-inline-budget views — four (character_sets,
-// collations, collation_character_set_applicability, triggers) are withheld on
-// incomplete goopg catalog descriptors (pg_collation/pg_trigger) and land with
-// the descriptor-completion slice. The remaining 32 (TOAST, helper-function,
-// and view-on-view) land in later tranches.
+// internal/initdb/information_schema_view_oid_pins.go). Tranche 1 is all 33
+// catalog-direct, under-inline-budget views — the four formerly withheld on
+// incomplete goopg catalog descriptors (character_sets, collations,
+// collation_character_set_applicability read pg_collation cols 9–12; triggers
+// reads pg_trigger cols 3/9–19) landed with the descriptor-completion slice.
+// The remaining 32 (TOAST, helper-function, and view-on-view) land in later
+// tranches.
 func informationSchemaViewProbeSet() []struct {
 	view string
 	oid  string
@@ -1190,7 +1191,10 @@ func informationSchemaViewProbeSet() []struct {
 	}{
 		{"information_schema.information_schema_catalog_name", "13293"},
 		{"information_schema.applicable_roles", "13302"},
+		{"information_schema.character_sets", "13316"},
 		{"information_schema.check_constraint_routine_usage", "13321"},
+		{"information_schema.collations", "13331"},
+		{"information_schema.collation_character_set_applicability", "13336"},
 		{"information_schema.column_column_usage", "13341"},
 		{"information_schema.column_domain_usage", "13346"},
 		{"information_schema.column_udt_usage", "13356"},
@@ -1207,6 +1211,7 @@ func informationSchemaViewProbeSet() []struct {
 		{"information_schema.table_constraints", "13476"},
 		{"information_schema.table_privileges", "13481"},
 		{"information_schema.tables", "13490"},
+		{"information_schema.triggers", "13505"},
 		{"information_schema.udt_privileges", "13510"},
 		{"information_schema.user_defined_types", "13528"},
 		{"information_schema.view_column_usage", "13533"},

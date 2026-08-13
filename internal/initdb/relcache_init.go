@@ -305,13 +305,13 @@ var nailedLocalRels = flattenRels(append([]nailedRel{
 	{2616, "pg_opclass", 83, 'r', 9, false, pgOpclassAttrs()},
 	{2603, "pg_amproc", 83, 'r', 6, false, pgAmprocAttrs()},
 	{2618, "pg_rewrite", 83, 'r', 8, false, pgRewriteAttrs()},
-	{2620, "pg_trigger", 83, 'r', 8, false, pgTriggerAttrs()},
+	{2620, "pg_trigger", 83, 'r', 19, false, pgTriggerAttrs()},
 	{2615, "pg_namespace", 83, 'r', 5, false, pgNamespaceAttrs()},
 	{2604, "pg_attrdef", 83, 'r', 4, false, pgAttrdefAttrs()},
 	{2606, "pg_constraint", 83, 'r', 28, false, pgConstraintAttrs()},
 	{2601, "pg_am", 83, 'r', 4, false, pgAmAttrs()},
 	{2617, "pg_operator", 83, 'r', 10, false, pgOperatorAttrs()},
-	{3456, "pg_collation", 83, 'r', 8, false, pgCollationAttrs()},
+	{3456, "pg_collation", 83, 'r', 12, false, pgCollationAttrs()},
 	{2611, "pg_inherits", 83, 'r', 3, false, pgInheritsAttrs()},
 	{2612, "pg_language", 83, 'r', 9, false, pgLanguageAttrs()},
 	{2602, "pg_amop", 83, 'r', 9, false, pgAmopAttrs()},
@@ -2745,15 +2745,35 @@ func nailedViewSeedAttrs(relName string) []nailedAttr {
 }
 
 func pgTriggerAttrs() []nailedAttr {
+	// Full PG18 FormData_pg_trigger (postgres/src/include/catalog/pg_trigger.h),
+	// Natts_pg_trigger == 19. The pre-M0133-S4 seed was an 8-column reduced
+	// schema (tgname at attnum 3, tgconstrrelid at 8) that served bootstrap
+	// survival but left tgparentid and tgconstrindid..tgnewtable absent, so a
+	// hosted PG's initsplan.c SIGABRTs when information_schema.triggers reads
+	// attnums 3 and 9–19. The pg_trigger heap is empty (descriptor-only), so
+	// this widened descriptor is the whole fix. Note the pre-existing index 2701
+	// (pg_trigger_tgrelid_tgname_index) was already seeded with indkey={2,4} —
+	// correct against this layout, and wrong against the old 8-column one.
 	return []nailedAttr{
 		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
 		{Name: "tgrelid", TypeOID: 26, Num: 2, Len: 4, NotNull: true},
-		{Name: "tgname", TypeOID: 19, Num: 3, Len: 64, NotNull: true},
-		{Name: "tgfoid", TypeOID: 26, Num: 4, Len: 4, NotNull: true},
-		{Name: "tgtype", TypeOID: 21, Num: 5, Len: 2, NotNull: true},
-		{Name: "tgenabled", TypeOID: 18, Num: 6, Len: 1, NotNull: true},
-		{Name: "tgisinternal", TypeOID: 16, Num: 7, Len: 1, NotNull: true},
-		{Name: "tgconstrrelid", TypeOID: 26, Num: 8, Len: 4, NotNull: true},
+		{Name: "tgparentid", TypeOID: 26, Num: 3, Len: 4, NotNull: true},
+		{Name: "tgname", TypeOID: 19, Num: 4, Len: 64, NotNull: true},
+		{Name: "tgfoid", TypeOID: 26, Num: 5, Len: 4, NotNull: true},
+		{Name: "tgtype", TypeOID: 21, Num: 6, Len: 2, NotNull: true},
+		{Name: "tgenabled", TypeOID: 18, Num: 7, Len: 1, NotNull: true},
+		{Name: "tgisinternal", TypeOID: 16, Num: 8, Len: 1, NotNull: true},
+		{Name: "tgconstrrelid", TypeOID: 26, Num: 9, Len: 4, NotNull: true},
+		{Name: "tgconstrindid", TypeOID: 26, Num: 10, Len: 4, NotNull: true},
+		{Name: "tgconstraint", TypeOID: 26, Num: 11, Len: 4, NotNull: true},
+		{Name: "tgdeferrable", TypeOID: 16, Num: 12, Len: 1, NotNull: true},
+		{Name: "tginitdeferred", TypeOID: 16, Num: 13, Len: 1, NotNull: true},
+		{Name: "tgnargs", TypeOID: 21, Num: 14, Len: 2, NotNull: true},
+		{Name: "tgattr", TypeOID: 22, Num: 15, Len: -1, NotNull: true},    // int2vector, BKI_FORCE_NOT_NULL
+		{Name: "tgargs", TypeOID: 17, Num: 16, Len: -1, NotNull: true},    // bytea, BKI_FORCE_NOT_NULL
+		{Name: "tgqual", TypeOID: 194, Num: 17, Len: -1, NotNull: false},  // pg_node_tree (WHEN, or NULL)
+		{Name: "tgoldtable", TypeOID: 19, Num: 18, Len: 64, NotNull: false},
+		{Name: "tgnewtable", TypeOID: 19, Num: 19, Len: 64, NotNull: false},
 	}
 }
 
@@ -2811,6 +2831,15 @@ func pgAmopAttrs() []nailedAttr {
 }
 
 func pgCollationAttrs() []nailedAttr {
+	// Full PG18 FormData_pg_collation
+	// (postgres/src/include/catalog/pg_collation.h), Natts_pg_collation == 12.
+	// The pre-M0133-S4 seed was 8 fixed-size columns with collcollate as name
+	// (19/64); PG18 declares collcollate text (25/-1) and appends collctype,
+	// colllocale, collicurules and collversion (all text, all BKI_DEFAULT(_null_)).
+	// information_schema.{character_sets,collations,collation_character_set_applicability}
+	// read columns 9–12, so the old descriptor made a hosted PG fail with
+	// "cache lookup failed for attribute 9 of relation 3456". The heap rows
+	// (pg_collation_bootstrap.go) carry the same 12 columns in the same commit.
 	return []nailedAttr{
 		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
 		{Name: "collname", TypeOID: 19, Num: 2, Len: 64, NotNull: true},
@@ -2819,7 +2848,11 @@ func pgCollationAttrs() []nailedAttr {
 		{Name: "collprovider", TypeOID: 18, Num: 5, Len: 1, NotNull: true},
 		{Name: "collisdeterministic", TypeOID: 16, Num: 6, Len: 1, NotNull: true},
 		{Name: "collencoding", TypeOID: 23, Num: 7, Len: 4, NotNull: true},
-		{Name: "collcollate", TypeOID: 19, Num: 8, Len: 64, NotNull: true},
+		{Name: "collcollate", TypeOID: 25, Num: 8, Len: -1, NotNull: false}, // text (was name)
+		{Name: "collctype", TypeOID: 25, Num: 9, Len: -1, NotNull: false},
+		{Name: "colllocale", TypeOID: 25, Num: 10, Len: -1, NotNull: false},
+		{Name: "collicurules", TypeOID: 25, Num: 11, Len: -1, NotNull: false},
+		{Name: "collversion", TypeOID: 25, Num: 12, Len: -1, NotNull: false},
 	}
 }
 

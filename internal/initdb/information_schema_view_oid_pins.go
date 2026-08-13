@@ -38,18 +38,22 @@ package initdb
 // a fresh PG 18.3 (the same oracle the pg_catalog table was captured from);
 // every reltype/rule OID follows the oid+2/oid+3 law verified for all 65.
 //
-// FOUR of the 33 are withheld from this tranche, each blocked on an incomplete
-// goopg catalog descriptor the view reads (ledgered): character_sets,
+// Four of the 33 were initially withheld on incomplete goopg catalog
+// descriptors, then landed by the descriptor-completion slice: character_sets,
 // collations and collation_character_set_applicability read pg_collation
-// (3456), which goopg seeds with 8 columns where PG18 has 12 (and collcollate
-// as name where PG18 has text); triggers reads pg_trigger (2620), which goopg
-// seeds with 8 columns where PG18 has 19 (tgparentid + tgconstrindid..tgqual +
-// tgoldtable/tgnewtable). They land with the descriptor-completion slice.
+// (3456) columns 9–12, which goopg seeded with 8 columns where PG18 has 12
+// (and collcollate as name where PG18 has text); triggers reads pg_trigger
+// (2620) columns 3 and 9–19, which goopg seeded with 8 columns where PG18 has
+// 19. pgCollationAttrs/pgTriggerAttrs are now the full PG18 schemas, so the
+// four evaluate on a hosted PG like the other 29.
 func informationSchemaViewOIDPins() []systemViewOIDPin {
 	return []systemViewOIDPin{
 		{"information_schema_catalog_name", 13293, 13296, 13295, 1},
 		{"applicable_roles", 13302, 13305, 13304, 3},
+		{"character_sets", 13316, 13319, 13318, 8},
 		{"check_constraint_routine_usage", 13321, 13324, 13323, 6},
+		{"collations", 13331, 13334, 13333, 4},
+		{"collation_character_set_applicability", 13336, 13339, 13338, 6},
 		{"column_column_usage", 13341, 13344, 13343, 5},
 		{"column_domain_usage", 13346, 13349, 13348, 7},
 		{"column_udt_usage", 13356, 13359, 13358, 7},
@@ -66,6 +70,7 @@ func informationSchemaViewOIDPins() []systemViewOIDPin {
 		{"table_constraints", 13476, 13479, 13478, 11},
 		{"table_privileges", 13481, 13484, 13483, 8},
 		{"tables", 13490, 13493, 13492, 12},
+		{"triggers", 13505, 13508, 13507, 17},
 		{"udt_privileges", 13510, 13513, 13512, 7},
 		{"user_defined_types", 13528, 13531, 13530, 29},
 		{"view_column_usage", 13533, 13536, 13535, 7},

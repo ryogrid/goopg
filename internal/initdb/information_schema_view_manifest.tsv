@@ -10,6 +10,15 @@ rel	applicable_roles	13302	13302	13305	13304	2249	v	3
 attr	applicable_roles	1	grantee	13292	64	f	f
 attr	applicable_roles	2	role_name	13292	64	f	f
 attr	applicable_roles	3	is_grantable	13300	-1	f	f
+rel	character_sets	13316	13316	13319	13318	2249	v	8
+attr	character_sets	1	character_set_catalog	13292	64	f	f
+attr	character_sets	2	character_set_schema	13292	64	f	f
+attr	character_sets	3	character_set_name	13292	64	f	f
+attr	character_sets	4	character_repertoire	13292	64	f	f
+attr	character_sets	5	form_of_use	13292	64	f	f
+attr	character_sets	6	default_collate_catalog	13292	64	f	f
+attr	character_sets	7	default_collate_schema	13292	64	f	f
+attr	character_sets	8	default_collate_name	13292	64	f	f
 rel	check_constraint_routine_usage	13321	13321	13324	13323	2249	v	6
 attr	check_constraint_routine_usage	1	constraint_catalog	13292	64	f	f
 attr	check_constraint_routine_usage	2	constraint_schema	13292	64	f	f
@@ -17,6 +26,18 @@ attr	check_constraint_routine_usage	3	constraint_name	13292	64	f	f
 attr	check_constraint_routine_usage	4	specific_catalog	13292	64	f	f
 attr	check_constraint_routine_usage	5	specific_schema	13292	64	f	f
 attr	check_constraint_routine_usage	6	specific_name	13292	64	f	f
+rel	collations	13331	13331	13334	13333	2249	v	4
+attr	collations	1	collation_catalog	13292	64	f	f
+attr	collations	2	collation_schema	13292	64	f	f
+attr	collations	3	collation_name	13292	64	f	f
+attr	collations	4	pad_attribute	13290	-1	f	f
+rel	collation_character_set_applicability	13336	13336	13339	13338	2249	v	6
+attr	collation_character_set_applicability	1	collation_catalog	13292	64	f	f
+attr	collation_character_set_applicability	2	collation_schema	13292	64	f	f
+attr	collation_character_set_applicability	3	collation_name	13292	64	f	f
+attr	collation_character_set_applicability	4	character_set_catalog	13292	64	f	f
+attr	collation_character_set_applicability	5	character_set_schema	13292	64	f	f
+attr	collation_character_set_applicability	6	character_set_name	13292	64	f	f
 rel	column_column_usage	13341	13341	13344	13343	2249	v	5
 attr	column_column_usage	1	table_catalog	13292	64	f	f
 attr	column_column_usage	2	table_schema	13292	64	f	f
@@ -155,6 +176,24 @@ attr	tables	9	user_defined_type_name	13292	64	f	f
 attr	tables	10	is_insertable_into	13300	-1	f	f
 attr	tables	11	is_typed	13300	-1	f	f
 attr	tables	12	commit_action	13290	-1	f	f
+rel	triggers	13505	13505	13508	13507	2249	v	17
+attr	triggers	1	trigger_catalog	13292	64	f	f
+attr	triggers	2	trigger_schema	13292	64	f	f
+attr	triggers	3	trigger_name	13292	64	f	f
+attr	triggers	4	event_manipulation	13290	-1	f	f
+attr	triggers	5	event_object_catalog	13292	64	f	f
+attr	triggers	6	event_object_schema	13292	64	f	f
+attr	triggers	7	event_object_table	13292	64	f	f
+attr	triggers	8	action_order	13287	4	f	f
+attr	triggers	9	action_condition	13290	-1	f	f
+attr	triggers	10	action_statement	13290	-1	f	f
+attr	triggers	11	action_orientation	13290	-1	f	f
+attr	triggers	12	action_timing	13290	-1	f	f
+attr	triggers	13	action_reference_old_table	13292	64	f	f
+attr	triggers	14	action_reference_new_table	13292	64	f	f
+attr	triggers	15	action_reference_old_row	13292	64	f	f
+attr	triggers	16	action_reference_new_row	13292	64	f	f
+attr	triggers	17	created	13298	8	f	f
 rel	udt_privileges	13510	13510	13513	13512	2249	v	7
 attr	udt_privileges	1	grantor	13292	64	f	f
 attr	udt_privileges	2	grantee	13292	64	f	f

@@ -1,25 +1,34 @@
-# M0133-S4 — `information_schema` views (65, tranche 1 = 29 of 33)
+# M0133-S4 — `information_schema` views (65, tranche 1 = 33 of 33)
 
-**Status:** accepted — tranche 1 landed 2026-08-13.
+**Status:** accepted — tranche 1 COMPLETE 2026-08-14 (all 33 catalog-direct leaves).
 **Milestone:** M0133 (`information_schema` on disk), slice S4.
 **Supersedes:** S9.4d in `0131-0009-system-view-corpus-widening.md` §"Successor decomposition".
 
 ## What landed
 
-The first tranche of the 65 `information_schema` views — **29 of the 33
+The first tranche of the 65 `information_schema` views — **all 33
 catalog-direct leaves** — seeded on disk so a hosted PG 18.3 cold-started on a
 goopg `$PGDATA` resolves and **evaluates** `SELECT * FROM
 information_schema.<view>` for each. The slice reuses the M0131-S9
 capture/pin/regen loop unchanged (Option-A identity pinning), with one new
 generator and one forced btree fix (below).
 
-Four of the 33 are **withheld** on incomplete goopg catalog descriptors
-(ledgered): `character_sets` / `collations` / `collation_character_set_applicability`
-read `pg_collation` (3456), which goopg seeds with 8 columns where PG18 has 12
-(and `collcollate` as `name` where PG18 has `text`); `triggers` reads `pg_trigger`
-(2620), which goopg seeds with 8 columns where PG18 has 19. Both are a
-**catalog-descriptor-completion** slice, not a view-capture problem — the
-ev_action blobs are verbatim PG 18.3.
+Four of the 33 landed one loop later, by a **catalog-descriptor-completion**
+slice (2026-08-14), not a view-capture problem — their ev_action blobs are
+verbatim PG 18.3, but the catalogs they read were still goopg's 8-column
+bootstrap-survival seeds:
+
+- `character_sets` / `collations` / `collation_character_set_applicability`
+  read `pg_collation` (3456) columns 9–12 — goopg seeded 8 columns with
+  `collcollate` as `name` (19/64) where PG18 has `text` (25/-1). Fixed by
+  widening `pgCollationAttrs()` to the 12-column schema and re-seeding the 7
+  heap rows in `bootstrapPgCollationTuples` (values mirror the runtime
+  `PGCollationRowsForDBOid`).
+- `triggers` reads `pg_trigger` (2620) columns 3 and 9–19 — goopg seeded 8
+  columns. Fixed by widening `pgTriggerAttrs()` to the 19-column schema (the
+  heap is empty, so the descriptor is the whole fix), which also reconciles
+  index 2701's pre-existing `indkey={2,4}` (tgname at attnum 4) with the
+  descriptor.
 
 ## Why 33 and not 65
 
@@ -32,7 +41,7 @@ those on disk, the 65 views split cleanly into four tranches by what their
 
 | tranche | criterion | count |
 |---|---|---|
-| **1 (this slice)** | catalog-direct, no in-band `:relid`, no in-band `:funcid`, stored ≤ 8000 B | 29 (+ 4 withheld on descriptor gaps) |
+| **1 (this slice)** | catalog-direct, no in-band `:relid`, no in-band `:funcid`, stored ≤ 8000 B | 33 (4 landed a loop later by the descriptor-completion slice) |
 | 2 | TOAST (stored > 8000 B — the 11 F33 values) | 11 |
 | 3 | helper-function (`:funcid` 13274..13285) | 4 (`key_column_usage`, `parameters`, `sequences`, `triggered_update_columns`) |
 | 4 | view-on-view (`:relid` in 13293..13621) + `element_types`/`data_type_privileges` | 17 |
