@@ -14580,6 +14580,23 @@ func (c *InMemory) UserCollationOIDByName(name string) uint32 {
 	return 0
 }
 
+// CollationOIDByName resolves a bare collation name to its OID, built-in
+// first then user-created — the same order and shape as the collation half of
+// resolveRangeCollation (catalog.go:22158-22163), lifted to an exported method
+// the executor can call for regcollationin's name→OID input half. It REUSES
+// builtinCollationOIDByName (case-sensitive, PG-identifier semantics — `"C"`
+// requires the exact case, as in real PostgreSQL) and UserCollationOIDByName
+// (case-insensitive), so no third copy of the 7-BKI-builtin table is made
+// (the executor's catalog-less collationNameToOID in pg18_user_catalog_rows.go
+// is a separate concern). Returns 0 when neither matches. M0119-0006 (67th
+// slice — regcollation 4-byte storage).
+func (c *InMemory) CollationOIDByName(name string) uint32 {
+	if oid, ok := builtinCollationOIDByName(name); ok {
+		return oid
+	}
+	return c.UserCollationOIDByName(name)
+}
+
 // ListUserCollations returns the user-created collations in creation order.
 // Mirrors ListUserConversions. M0119-0004.
 func (c *InMemory) ListUserCollations() []*UserCollation {

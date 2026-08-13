@@ -2352,11 +2352,12 @@ func coerceRowForConstraintChecks(cols []catalog.Column, row Row, include func(i
 			coerced, cerr = roundIntervalDatumToTypmod(row[i], intervalColumnTypmod(col.Type))
 		case "numeric", "decimal":
 			coerced, cerr = evalCast(row[i], "numeric", pos, ctx)
-		case "regproc", "regprocedure", "regclass", "regtype":
+		case "regproc", "regprocedure", "regclass", "regtype", "regrole", "regcollation":
 			// M0119-0006 (reg* + cid 4-byte storage): resolve a bare quoted name
 			// literal to its OID before the heap arm stores it — a reg* name must
-			// be a catalog lookup (regclassin/regtypein/regprocin), not the
-			// numeric parse encodeValuePG's oid arm would otherwise run on it.
+			// be a catalog lookup (regclassin/regtypein/regprocin/regrolein/
+			// regcollationin), not the numeric parse encodeValuePG's oid arm would
+			// otherwise run on it. (67th slice: regrole/regcollation joined.)
 			coerced, cerr = regIdentifierInput(row[i], col.Type.Name, ctx, pos)
 		default:
 			continue

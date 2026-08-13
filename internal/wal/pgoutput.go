@@ -427,14 +427,15 @@ func pgoDecodePhysicalValue(t catalog.Type, data []byte) ([]byte, int, error) {
 			return nil, 0, fmt.Errorf("int8: short read")
 		}
 		return []byte(strconv.FormatInt(int64(binary.LittleEndian.Uint64(data[:8])), 10)), 8, nil
-	case "oid", "regproc", "regprocedure", "regclass", "regtype", "cid", "xid":
+	case "oid", "regproc", "regprocedure", "regclass", "regtype", "regrole", "regcollation", "cid", "xid":
 		// Sibling of executor.encodeValuePG's oid arm: regclasssend/regtypesend/
-		// regproceduresend/regprocsend/cidsend are ALL oidsend upstream —
-		// pq_sendint32 over the 4-byte OID (regproc.c, oid.c). Before the
-		// M0119-0006 (reg* + cid 4-byte storage) heap change these columns were
-		// varlena text and the fall-through below returned the stored text; the
-		// heap image is now 4 fixed bytes, so that fall-through would read a
-		// varlena header off the OID and emit garbage. Hard-won Rule #2.
+		// regproceduresend/regprocsend/regrolesend/regcollationsend/cidsend are
+		// ALL oidsend upstream — pq_sendint32 over the 4-byte OID (regproc.c,
+		// oid.c). Before the M0119-0006 (reg* + cid 4-byte storage) heap change
+		// these columns were varlena text and the fall-through below returned the
+		// stored text; the heap image is now 4 fixed bytes, so that fall-through
+		// would read a varlena header off the OID and emit garbage. Hard-won Rule
+		// #2. (67th slice: regrole/regcollation joined the arm.)
 		if len(data) < 4 {
 			return nil, 0, fmt.Errorf("oid: short read")
 		}

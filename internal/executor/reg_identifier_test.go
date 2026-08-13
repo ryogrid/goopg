@@ -17,7 +17,7 @@ import (
 // the name→OID input resolution.
 
 func TestRegIdentifierColumnStoresFourBytesNotText(t *testing.T) {
-	for _, name := range []string{"regclass", "regtype", "regprocedure", "cid"} {
+	for _, name := range []string{"regclass", "regtype", "regprocedure", "regrole", "regcollation", "cid"} {
 		col := catalog.Type{Name: name}
 		heap, err := encodeValuePG(col, NewIntDatum(16422))
 		if err != nil {
@@ -105,6 +105,140 @@ func TestRegIdentifierInputResolvesRegtypeName(t *testing.T) {
 	}
 }
 
+// M0119-0006 (67th slice — regrole/regcollation 4-byte storage). regrolein
+// (regproc.c:1541) resolves a single-identifier role name through get_role_oid;
+// a qualified name (list_length != 1) is 42602 invalid name syntax, and a miss
+// is 42704 `role "%s" does not exist`.
+func TestRegIdentifierInputResolvesRegroleName(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	// Register a user role directly (CREATE ROLE is outside this parser path);
+	// 7777 is a stand-in for an initdb/nextOID-minted OID.
+	im := ctx.Catalog.(*catalog.InMemory)
+	im.RegisterRoleWithOID("alice", 7777)
+
+	// The bootstrap superuser resolves to OID 10 (BOOTSTRAP_SUPERUSERID).
+	got, err := regIdentifierInput(NewStringDatum("postgres"), "regrole", ctx, 0)
+	if err != nil {
+		t.Fatalf("regIdentifierInput(postgres): %v", err)
+	}
+	if got.Kind != KindInt || got.Int != 10 {
+		t.Fatalf("regIdentifierInput(postgres) = %v, want int 10", got)
+	}
+
+	// A user-created role resolves through the live role map.
+	aliceOID, ok := im.RoleOID("alice")
+	if !ok {
+		t.Fatal("alice not found via RoleOID")
+	}
+	got, err = regIdentifierInput(NewStringDatum("alice"), "regrole", ctx, 0)
+	if err != nil {
+		t.Fatalf("regIdentifierInput(alice): %v", err)
+	}
+	if got.Kind != KindInt || got.Int != int64(aliceOID) {
+		t.Fatalf("regIdentifierInput(alice) = %v, want int %d", got, aliceOID)
+	}
+
+	// A miss raises the regrolein undefined-object error (42704).
+	if _, err := regIdentifierInput(NewStringDatum("no_such_role"), "regrole", ctx, 0); err == nil {
+		t.Fatal("regIdentifierInput(no_such_role) should raise 42704")
+	} else if ee, ok := err.(*ExecError); !ok || ee.Code != "42704" {
+		t.Fatalf("regIdentifierInput(no_such_role) err = %v, want 42704", err)
+	}
+
+	// A qualified role name is 42602 — roles are never schema-qualified.
+	if _, err := regIdentifierInput(NewStringDatum("public.alice"), "regrole", ctx, 0); err == nil {
+		t.Fatal("regIdentifierInput(public.alice) should raise 42602")
+	} else if ee, ok := err.(*ExecError); !ok || ee.Code != "42602" {
+		t.Fatalf("regIdentifierInput(public.alice) err = %v, want 42602", err)
+	}
+}
+
+// regcollationin (regproc.c:1026) resolves a (possibly qualified) collation
+// name through get_collation_oid; a miss is 42704
+// `collation "%s" for encoding "%s" does not exist` (goopg is UTF-8 only).
+func TestRegIdentifierInputResolvesRegcollationName(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	if err := runDDL(t, ctx, `CREATE COLLATION mycoll (LOCALE = 'C')`); err != nil {
+		t.Fatalf("CREATE COLLATION: %v", err)
+	}
+
+	// Builtin collations resolve through the BKI-pinned table (builtin-then-user
+	// order in CollationOIDByName).
+	for _, tc := range []struct {
+		name string
+		want uint32
+	}{
+		{"C", 950},
+		{"default", 100},
+		{"POSIX", 951},
+	} {
+		got, err := regIdentifierInput(NewStringDatum(tc.name), "regcollation", ctx, 0)
+		if err != nil {
+			t.Fatalf("regIdentifierInput(%s): %v", tc.name, err)
+		}
+		if got.Kind != KindInt || got.Int != int64(tc.want) {
+			t.Fatalf("regIdentifierInput(%s) = %v, want int %d", tc.name, got, tc.want)
+		}
+	}
+
+	// A user-created collation resolves through the live registry.
+	im := ctx.Catalog.(*catalog.InMemory)
+	mycollOID := im.UserCollationOIDByName("mycoll")
+	if mycollOID == 0 {
+		t.Fatal("mycoll not found via UserCollationOIDByName")
+	}
+	got, err := regIdentifierInput(NewStringDatum("mycoll"), "regcollation", ctx, 0)
+	if err != nil {
+		t.Fatalf("regIdentifierInput(mycoll): %v", err)
+	}
+	if got.Kind != KindInt || got.Int != int64(mycollOID) {
+		t.Fatalf("regIdentifierInput(mycoll) = %v, want int %d", got, mycollOID)
+	}
+
+	// A miss raises the regcollationin undefined-object error (42704).
+	if _, err := regIdentifierInput(NewStringDatum("no_such_coll"), "regcollation", ctx, 0); err == nil {
+		t.Fatal("regIdentifierInput(no_such_coll) should raise 42704")
+	} else if ee, ok := err.(*ExecError); !ok || ee.Code != "42704" {
+		t.Fatalf("regIdentifierInput(no_such_coll) err = %v, want 42704", err)
+	}
+}
+
+// parseDashOrOid (regproc.c) runs before ANY name resolution for every reg*
+// type — the family-wide latent gap the 66th slice left: '-' is InvalidOid (0)
+// and a pure-digit string is a numeric OID via oidin (never a name).
+func TestRegIdentifierInputAcceptsDashAndNumericOid(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+
+	for _, name := range []string{"regclass", "regtype", "regproc", "regrole", "regcollation"} {
+		got, err := regIdentifierInput(NewStringDatum("-"), name, ctx, 0)
+		if err != nil {
+			t.Fatalf("regIdentifierInput(-) %s: %v", name, err)
+		}
+		if got.Kind != KindInt || got.Int != 0 {
+			t.Fatalf("regIdentifierInput(-) %s = %v, want int 0 (InvalidOid)", name, got)
+		}
+	}
+
+	got, err := regIdentifierInput(NewStringDatum("16422"), "regrole", ctx, 0)
+	if err != nil {
+		t.Fatalf("regIdentifierInput(16422): %v", err)
+	}
+	if got.Kind != KindInt || got.Int != 16422 {
+		t.Fatalf("regIdentifierInput(16422) = %v, want int 16422", got)
+	}
+
+	// A pure-digit string beyond uint32 raises oidin's 22003 (parseDashOrOid →
+	// oidin_cstr), never falling through to name resolution.
+	if _, err := regIdentifierInput(NewStringDatum("99999999999999"), "regrole", ctx, 0); err == nil {
+		t.Fatal("regIdentifierInput(overflow) should raise 22003")
+	} else if ee, ok := err.(*ExecError); !ok || ee.Code != "22003" {
+		t.Fatalf("regIdentifierInput(overflow) err = %v, want 22003", err)
+	}
+}
+
 // INSERT: coerceRowForConstraintChecks is the single coercion point every new
 // row passes through; a reg* column must resolve a bare quoted name literal to
 // its OID there (regclassin/regtypein), so the heap arm stores the 4-byte
@@ -146,5 +280,55 @@ func TestCoerceRowForConstraintChecksResolvesRegIdentifier(t *testing.T) {
 		t.Fatal("coerceRowForConstraintChecks(no_such_table) should raise 42P01")
 	} else if ee, ok := err.(*ExecError); !ok || ee.Code != "42P01" {
 		t.Fatalf("coerceRowForConstraintChecks(no_such_table) err = %v, want 42P01", err)
+	}
+}
+
+// M0119-0006 (67th slice): the same choke point resolves 'postgres'/'C' for
+// regrole/regcollation columns, and the coerced OIDs encode to 4 bytes. A miss
+// raises the type's own 42704 instead of a silent text store.
+func TestCoerceRowForConstraintChecksResolvesRegRoleAndCollation(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+
+	roleCols := []catalog.Column{{Name: "r", Type: catalog.Type{Name: "regrole"}}}
+	roleRow := Row{NewStringDatum("postgres")}
+	if err := coerceRowForConstraintChecks(roleCols, roleRow, func(int) bool { return true }, ctx, 0); err != nil {
+		t.Fatalf("coerceRowForConstraintChecks(regrole): %v", err)
+	}
+	if roleRow[0].Kind != KindInt || roleRow[0].Int != 10 {
+		t.Fatalf("regrole column coerced to kind %d %v, want int 10 (postgres)", roleRow[0].Kind, roleRow[0].Int)
+	}
+	heap, err := encodeValuePG(catalog.Type{Name: "regrole"}, roleRow[0])
+	if err != nil {
+		t.Fatalf("encodeValuePG(regrole OID): %v", err)
+	}
+	if len(heap) != 4 || binary.LittleEndian.Uint32(heap) != 10 {
+		t.Fatalf("regrole heap = %x (%d bytes), want 4-byte OID 10", heap, len(heap))
+	}
+	if err := coerceRowForConstraintChecks(roleCols, Row{NewStringDatum("no_such_role")}, func(int) bool { return true }, ctx, 0); err == nil {
+		t.Fatal("coerceRowForConstraintChecks(no_such_role) should raise 42704")
+	} else if ee, ok := err.(*ExecError); !ok || ee.Code != "42704" {
+		t.Fatalf("coerceRowForConstraintChecks(no_such_role) err = %v, want 42704", err)
+	}
+
+	collCols := []catalog.Column{{Name: "c", Type: catalog.Type{Name: "regcollation"}}}
+	collRow := Row{NewStringDatum("C")}
+	if err := coerceRowForConstraintChecks(collCols, collRow, func(int) bool { return true }, ctx, 0); err != nil {
+		t.Fatalf("coerceRowForConstraintChecks(regcollation): %v", err)
+	}
+	if collRow[0].Kind != KindInt || collRow[0].Int != 950 {
+		t.Fatalf("regcollation column coerced to kind %d %v, want int 950 (C)", collRow[0].Kind, collRow[0].Int)
+	}
+	heap, err = encodeValuePG(catalog.Type{Name: "regcollation"}, collRow[0])
+	if err != nil {
+		t.Fatalf("encodeValuePG(regcollation OID): %v", err)
+	}
+	if len(heap) != 4 || binary.LittleEndian.Uint32(heap) != 950 {
+		t.Fatalf("regcollation heap = %x (%d bytes), want 4-byte OID 950", heap, len(heap))
+	}
+	if err := coerceRowForConstraintChecks(collCols, Row{NewStringDatum("no_such_coll")}, func(int) bool { return true }, ctx, 0); err == nil {
+		t.Fatal("coerceRowForConstraintChecks(no_such_coll) should raise 42704")
+	} else if ee, ok := err.(*ExecError); !ok || ee.Code != "42704" {
+		t.Fatalf("coerceRowForConstraintChecks(no_such_coll) err = %v, want 42704", err)
 	}
 }

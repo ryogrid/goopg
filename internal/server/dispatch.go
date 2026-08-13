@@ -3263,6 +3263,44 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 			return append(dst, executor.RegtypeName(s.cfg.Catalog, uint32(d.Int), !publicSchemaVisible(getSetting))...)
 		}
 		return d.AppendValueText(dst)
+	case "regrole":
+		// OID values with type regrole display as role names (regroleout),
+		// matching a direct SELECT of e.g. pg_authid.rolname or an
+		// <oid>::regrole cast. InvalidOid (0) renders "-" like the regproc case;
+		// RoleNameForOID already renders a dangling OID numerically (a
+		// since-dropped role), matching regroleout. M0119-0006 (67th slice).
+		if d.Kind == executor.KindInt {
+			oid := uint32(d.Int)
+			if oid == 0 {
+				return append(dst, '-')
+			}
+			if im, ok := s.cfg.Catalog.(*catalog.InMemory); ok {
+				if n := im.RoleNameForOID(oid); n != "" {
+					return append(dst, n...)
+				}
+			}
+		}
+		return d.AppendValueText(dst)
+	case "regcollation":
+		// OID values with type regcollation display as collation names
+		// (regcollationout). InvalidOid (0) renders "-"; a dangling nonzero OID
+		// falls through to AppendValueText (the numeric form) since
+		// ResolveIndexColumnCollationName returns "" for it — matching
+		// regcollationout. Schema-qualification of a collation name not visible
+		// in the search_path is not ported (bare name only). M0119-0006 (67th
+		// slice).
+		if d.Kind == executor.KindInt {
+			oid := uint32(d.Int)
+			if oid == 0 {
+				return append(dst, '-')
+			}
+			if im, ok := s.cfg.Catalog.(*catalog.InMemory); ok {
+				if n := im.ResolveIndexColumnCollationName(oid); n != "" {
+					return append(dst, n...)
+				}
+			}
+		}
+		return d.AppendValueText(dst)
 	default:
 		return d.AppendValueText(dst)
 	}

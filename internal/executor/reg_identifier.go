@@ -3,6 +3,7 @@ package executor
 import (
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -27,6 +28,8 @@ import (
 //	regprocedure(regprocedurein)                        — function name → OID
 //	regclass    (regclassin, regproc.c)                 — relation/index name → OID
 //	regtype     (regtypein,  regproc.c)                 — type name → OID
+//	regrole     (regrolein,  regproc.c)                 — role name → OID
+//	regcollation(regcollationin, regproc.c)             — collation name → OID
 //	cid         (cidin/cidout, oid.c/command.c)         — numeric input only
 //
 // The name→OID half is the reg* family's INPUT function, distinct from the
@@ -34,10 +37,12 @@ import (
 // numeric `KindInt` datum is already an OID and passes through; a `KindString`
 // is resolved as a NAME (matching upstream `reg*in`, which does a catalog lookup
 // and never a numeric parse) and raises the type's own undefined-object error on
-// a miss. regrole/regcollation/regoper/regoperator/regnamespace/regconfig/
-// regdictionary are deliberately NOT in this file: they have no name-resolution
-// seam yet, so keeping them on the varlena default is less wrong than storing a
-// numeric parse of a name (see the ledger row's deferred column).
+// a miss. `regrole`/`regcollation` resolve against pg_roles/pg_collation via
+// InMemory.RoleOID / CollationOIDByName (the 67th slice). regoper/
+// regoperator/regnamespace/regconfig/regdictionary are deliberately NOT in this
+// file: they have no name-resolution seam yet, so keeping them on the varlena
+// default is less wrong than storing a numeric parse of a name (see the ledger
+// row's deferred column).
 
 // regIdentifierInput resolves a Datum to the 32-bit OID a reg* column stores —
 // the input half of the reg* family's name↔OID contract, used by
@@ -47,8 +52,9 @@ import (
 //
 // A KindInt datum is already an OID and returns unchanged (the heap arm's
 // pgUnsignedIDFromDatum range-checks it). A KindString is resolved as a NAME:
-// regclass against tables+indexes, regtype against builtin+user types, and
-// regproc/regprocedure against routines+builtin procs, each with the undefined-
+// regclass against tables+indexes, regtype against builtin+user types,
+// regproc/regprocedure against routines+builtin procs, regrole against roles,
+// and regcollation against builtin+user collations, each with the undefined-
 // object error upstream's reg*in raises. `oid` and `cid` are numeric and need no
 // name resolution — they are not routed here.
 func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum, error) {
@@ -57,6 +63,18 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 		return v, nil
 	}
 	name := strings.TrimSpace(v.StringValue())
+	// parseDashOrOid first, for every reg* type — upstream reg*in (regproc.c)
+	// runs it before ANY name resolution: a literal "-" is OID 0 (InvalidOid)
+	// and a pure-digit string is a numeric OID via oidin (IsOidString), never a
+	// name to resolve. This closes the family-wide latent gap the 66th slice
+	// left (its four types went straight to name resolution on a KindString).
+	// M0119-0006 (67th slice).
+	if oid, ok, err := parseRegDashOrOid(name); ok {
+		if err != nil {
+			return NullDatum, err
+		}
+		return NewIntDatum(int64(oid)), nil
+	}
 	if ctx == nil || ctx.Catalog == nil {
 		return v, nil
 	}
@@ -102,8 +120,71 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 		}
 		return NullDatum, &ExecError{Code: "42883", Pos: pos,
 			Message: fmt.Sprintf("function %q does not exist", name)}
+	case "regrole":
+		// regrolein (regproc.c:1541): a role name is a single identifier — a
+		// qualified name (stringToQualifiedNameList list_length != 1) is 42602
+		// "invalid name syntax", roles are never schema-qualified.
+		if strings.Contains(name, ".") {
+			return NullDatum, &ExecError{Code: "42602", Pos: pos,
+				Message: "invalid name syntax"}
+		}
+		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+			if oid, found := im.RoleOID(name); found {
+				return NewIntDatum(int64(oid)), nil
+			}
+		}
+		return NullDatum, &ExecError{Code: "42704", Pos: pos,
+			Message: fmt.Sprintf("role %q does not exist", name)}
+	case "regcollation":
+		// regcollationin (regproc.c:1026): possibly schema-qualified; a bare
+		// name resolves builtin-then-user through the search path
+		// (CollationOIDByName), a qualified name against FindCollation in that
+		// schema. Miss → 42704 with the encoding name — goopg is UTF-8 only, so
+		// GetDatabaseEncodingName() is the constant "UTF8".
+		var oid uint32
+		if schema, coll := splitQualifiedTable(name); schema != "" {
+			if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+				if uc := im.FindCollation(coll, schema, ctx.CurrentDatabaseOid); uc != nil {
+					oid = uc.OID
+				}
+			}
+		} else if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+			oid = im.CollationOIDByName(coll)
+		}
+		if oid != 0 {
+			return NewIntDatum(int64(oid)), nil
+		}
+		return NullDatum, &ExecError{Code: "42704", Pos: pos,
+			Message: fmt.Sprintf("collation %q for encoding %q does not exist", name, "UTF8")}
 	}
 	return v, nil
+}
+
+// parseRegDashOrOid mirrors upstream parseDashOrOid (regproc.c:1865-1882): a
+// literal "-" is OID 0 (InvalidOid), and a pure-digit string is a numeric OID
+// parsed like oidin (IsOidString). ok=false means the string is neither — the
+// caller falls through to NAME resolution. A pure-digit string that overflows
+// uint32 returns ok=true with the 22003 error oidin raises, so it never falls
+// through to name resolution (and the message names "oid" exactly as PG's
+// oidin_cstr does, even for a regrole/regcollation column).
+func parseRegDashOrOid(s string) (uint32, bool, error) {
+	if s == "-" {
+		return 0, true, nil
+	}
+	if s == "" {
+		return 0, false, nil
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, false, nil
+		}
+	}
+	n, err := strconv.ParseUint(s, 10, 32)
+	if err != nil {
+		return 0, true, &ExecError{Code: "22003",
+			Message: fmt.Sprintf("value %q is out of range for type oid", s)}
+	}
+	return uint32(n), true, nil
 }
 
 // regIdentifierOIDFromDatum mirrors pgUnsignedIDFromDatum but is scoped to the

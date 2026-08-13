@@ -28,6 +28,8 @@ func TestPgoDecodeRegFamilyMatchesPGNativeLayout(t *testing.T) {
 		{"regtype", 2206},         // regtype itself
 		{"regprocedure", 2202},    // regprocedure itself
 		{"regproc", 1289},         // pg_type.typoutput's value domain
+		{"regrole", 4096},         // regrole itself
+		{"regcollation", 4191},    // regcollation itself
 		{"cid", 5677},             // a command id
 		{"oid", 1007},             // the base type
 		{"regclass", 0},           // InvalidOid
@@ -58,7 +60,7 @@ func TestPgoDecodeRegFamilyMatchesPGNativeLayout(t *testing.T) {
 // here would decode the identifier correctly and shift every following column
 // of the replicated row, so it cannot be caught by the value test above.
 func TestPgoPhysicalAlignRegFamily(t *testing.T) {
-	for _, name := range []string{"regclass", "regtype", "regprocedure", "regproc", "cid"} {
+	for _, name := range []string{"regclass", "regtype", "regprocedure", "regproc", "regrole", "regcollation", "cid"} {
 		typ := catalog.Type{Name: name}
 		for _, off := range []int{1, 3, 5, 17} {
 			if got := pgoPhysicalAlign(off, typ); got != ((off + 3) &^ 3) {

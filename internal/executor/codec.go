@@ -381,7 +381,7 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		var buf [8]byte
 		binary.LittleEndian.PutUint64(buf[:], u)
 		return buf[:], nil
-	case "oid", "regproc", "regprocedure", "regclass", "regtype", "cid":
+	case "oid", "regproc", "regprocedure", "regclass", "regtype", "regrole", "regcollation", "cid":
 		v, err := regIdentifierOIDFromDatum(d, strings.ToLower(t.Name))
 		if err != nil {
 			return nil, err
@@ -1190,7 +1190,7 @@ func physicalPGTypeAlign(t catalog.Type) int {
 		return 4
 	case "int2", "smallint", "smallserial", "serial2":
 		return 2
-	case "int4", "integer", "int", "serial", "serial4", "oid", "regproc", "regprocedure", "regclass", "regtype", "cid", "float4", "real", "date", "xid":
+	case "int4", "integer", "int", "serial", "serial4", "oid", "regproc", "regprocedure", "regclass", "regtype", "regrole", "regcollation", "cid", "float4", "real", "date", "xid":
 		return 4
 	case "int8", "bigint", "bigserial", "serial8", "pg_lsn", "float8", "double precision", "double", "timestamp", "timestamptz", "time", "timetz",
 		// interval is typalign 'd' (pg_type OID 1186) even though its 16 bytes
@@ -1241,7 +1241,7 @@ func pgPhysicalTypeIsVarlena(t catalog.Type) bool {
 		"int4", "integer", "int", "serial", "serial4",
 		"int8", "bigint", "bigserial", "serial8",
 		"pg_lsn",
-		"oid", "regproc", "regprocedure", "regclass", "regtype", "cid",
+		"oid", "regproc", "regprocedure", "regclass", "regtype", "regrole", "regcollation", "cid",
 		"timestamp", "timestamptz", "date", "time", "timetz",
 		"interval", // typlen 16, not varlena
 		"uuid",     // typlen 16, typalign 'c', typstorage 'p' — not varlena
@@ -1348,7 +1348,7 @@ func decodePhysicalPGValueMctxStyled(t catalog.Type, data []byte, sctx *mctx.Con
 			return Datum{}, 0, fmt.Errorf("truncated pg_lsn")
 		}
 		return NewStringDatum(formatPgLSN(binary.LittleEndian.Uint64(data[:8]))), 8, nil
-	case "oid", "regproc", "regprocedure", "regclass", "regtype", "cid":
+	case "oid", "regproc", "regprocedure", "regclass", "regtype", "regrole", "regcollation", "cid":
 		if len(data) < 4 {
 			return Datum{}, 0, fmt.Errorf("truncated oid")
 		}

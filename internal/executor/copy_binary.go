@@ -226,7 +226,7 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 		b := make([]byte, 8)
 		binary.BigEndian.PutUint64(b, math.Float64bits(f))
 		return b, nil
-	case "oid", "regproc", "regprocedure", "regclass", "regtype", "cid":
+	case "oid", "regproc", "regprocedure", "regclass", "regtype", "regrole", "regcollation", "cid":
 		// M0119-0006 (54th slice): before this arm an `oid` column fell through
 		// to the default's KindInt escape and shipped EIGHT big-endian bytes.
 		// Upstream oidsend (postgres/src/backend/utils/adt/oid.c:71) is
@@ -234,9 +234,10 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 		// produced a stream a real PG client rejects with "incorrect binary data
 		// format" (CopyReadBinaryAttribute's pq_getmsgend). The reg* family and
 		// cid share the arm because regclasssend/regtypesend/regproceduresend/
-		// regprocsend/cidsend are ALL oidsend upstream — pq_sendint32 over the
-		// 4-byte OID — the same pairing the heap codec already uses (Hard-won
-		// Rule #2). M0119-0006 (reg* family + cid 4-byte storage).
+		// regprocsend/regrolesend/regcollationsend/cidsend are ALL oidsend
+		// upstream — pq_sendint32 over the 4-byte OID — the same pairing the heap
+		// codec already uses (Hard-won Rule #2). M0119-0006 (reg* family + cid
+		// 4-byte storage, 67th slice regrole/regcollation).
 		v, err := regIdentifierOIDFromDatum(d, strings.ToLower(t.Name))
 		if err != nil {
 			return nil, err
@@ -493,7 +494,7 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 		}
 		f8 := math.Float64frombits(binary.BigEndian.Uint64(payload))
 		return floatTextDatum(PGFloatOut(f8, 64)), nil
-	case "oid", "regproc", "regprocedure", "regclass", "regtype", "cid":
+	case "oid", "regproc", "regprocedure", "regclass", "regtype", "regrole", "regcollation", "cid":
 		// Decode twin of the "oid"/"regproc" encode arm. Upstream oidrecv
 		// (oid.c:60) is pq_getmsgint(buf, sizeof(Oid)) and every reg* recv and
 		// cidrecv IS oidrecv (regproc.c:198-202 etc.); the binary COPY parser's

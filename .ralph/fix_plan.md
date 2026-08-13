@@ -3912,6 +3912,30 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `TestPort_RegressSuite` PASS (346 s), `scripts/tpch-spotcheck.sh` PASS
       (Q12=2, Q13=35). Design: `docs/design/0119-0006-reg-identifier-family-storage.md`
       + README row.
+      **67th slice (2026-08-14): `regrole`/`regcollation` store as 4-byte OIDs —
+      the object-identifier family is now complete.** The two members the 66th
+      slice excluded for lack of a role/collation name→OID seam now have one:
+      `regIdentifierInput` gains `regrole` (via `InMemory.RoleOID`; a qualified
+      name is 42602 invalid name syntax, a miss 42704 `role "%s" does not
+      exist`) and `regcollation` (via the new exported `InMemory.CollationOIDByName`,
+      builtin-then-user REUSING `builtinCollationOIDByName` + `UserCollationOIDByName`
+      — no third map copy; qualified names via `FindCollation`; a miss 42704
+      `collation "%s" for encoding "UTF8" does not exist`), routed from
+      `coerceRowForConstraintChecks`. All four physical-codec twins move to the
+      4-byte layout — heap codec (`codec.go`), binary COPY (`copy_binary.go`),
+      `pgoDecodePhysicalValue` (`internal/wal/pgoutput.go`). Also closed the
+      family-wide `parseDashOrOid` latent gap the 66th slice left (`'-'` →
+      InvalidOid 0, pure-digit → numeric OID, uint32 overflow → 22003), and
+      `appendTypedCellText` renders regrole/regcollation as names
+      (regroleout/regcollationout; OID 0 → "-", dangling → numeric) so SELECT
+      output stays `postgres`/`C` instead of regressing to raw OIDs. Ledger row
+      1302 resolved; a new row filed for the pre-existing family-wide TEXT/CSV
+      COPY numeric-OID gap (the 66th slice shipped the same for the other four
+      members — lossless cross-engine, a catalog-threading refactor). Gates:
+      `go build ./internal/...` clean; package suites PASS; pre-commit units
+      PASS; `TestPort_RegressSuite` PASS (245 s); `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2, Q13=35). Design:
+      `docs/design/0119-0006-regrole-regcollation-4byte-storage.md` + README row.
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
 
 - [x] **M0119-0010 — `char(N)` typmods are not restored per column on catalog
