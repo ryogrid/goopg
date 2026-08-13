@@ -292,6 +292,16 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 		// lock) taken by an in-block statement must be held for the block,
 		// not for the statement. dispatch.go keeps the same invariant.
 		ectx.TxnLockBackendID = connTx.LockBackendID
+	} else {
+		// Out of block: wire a throwaway autocommit session exactly as the
+		// simple path does (dispatch.go). Without it transactionOp.Open fails
+		// on `ctx.Session == nil`, so a SAVEPOINT / RELEASE / ROLLBACK TO
+		// issued with no explicit block reports XX000 "transaction statements
+		// require Session in Context" instead of PostgreSQL's 25P01 "SAVEPOINT
+		// can only be used in transaction blocks". InExplicitTransaction()
+		// stays false on this throwaway, so the executor's own 25P01 guard is
+		// what fires. M0132-S10.
+		ectx.Session = executor.NewAutocommitUndoSession()
 	}
 	// Wire session-authorization/role tracking so a SET SESSION AUTHORIZATION
 	// or SET ROLE that reaches the executor (rather than the fast-path
@@ -368,8 +378,11 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 		}
 		// Handled == false: SAVEPOINT / RELEASE / ROLLBACK TO are not owned by
 		// the state machine; they fall through to the executor exactly as they
-		// do on the simple path (M0097-0023). M0132-S10 rules on whether that
-		// is correct over this protocol.
+		// do on the simple path (M0097-0023). M0132-S10 ruled this correct:
+		// transactionOp's execSavepoint/execRelease/execRollbackTo drive the
+		// sub-transaction stack off the block's session (wired above), and the
+		// out-of-block case reaches their 25P01 guard via the autocommit
+		// throwaway session rather than XX000 "requires Session in Context".
 	}
 
 	op, err := executor.Build(node)

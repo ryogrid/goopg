@@ -360,7 +360,7 @@ together or not at all.**
 | `docs/design/0132-0001-extended-protocol-explicit-txn-state-machine.md` | draft — created at filing | the core design: block state machine over Parse/Bind/Execute/Sync, the three edit sites, the extraction decision, PG's `TBLOCK_*` mapping, and the invariants |
 | `docs/design/0132-0002-extended-commit-deferred-constraints.md` | draft — **within M0132 (S4, before code)** | proving the extracted helper carries `dispatch.go:2818-2828`'s inline deferred sequence onto the extended `COMMIT`; why a partial land is a regression |
 | `docs/design/0132-0003-extended-txn-proc-slot-discipline.md` | draft — **within M0132 (S7, before code)** | retiring the `(procNum + halfSize)` offset for in-block statements, the two-live-transactions-per-connection case, the `mvcc: unknown transaction` reproduction, and the copy.go ruling |
-| `docs/design/0132-0004-extended-protocol-savepoints.md` | draft — **within M0132 (S10) or a ledger row** | SAVEPOINT/subtransactions over the extended protocol (doc 09 O-XP-2); may resolve as an explicit deferral against the plan doc's stated criteria |
+| `docs/design/0132-0004-extended-protocol-savepoints.md` | draft — **resolved as IMPLEMENT (S10, 2026-08-13)** | SAVEPOINT/subtransactions over the extended protocol (doc 09 O-XP-2); ruled implement, not defer — the executor fall-through already routed the verbs, one out-of-block `25P01` vs `XX000` gap fixed |
 
 Smaller single-function changes may ride the implementation-plan doc per the
 repo rule (a design doc is required for every *non-trivial subsystem*;
