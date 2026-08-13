@@ -3736,6 +3736,29 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       grammar defaults are preserved. Item stays UNCHECKED (standing
       slice-by-slice cluster). Gates: `go test ./internal/executor/` PASS;
       `go build ./...` clean. 1 ledger row resolved (1318); 0 filed.
+      **61st slice (2026-08-13): the serial-family spellings store the
+      fixed-width int image, not varlena text.** The deferral the 52nd slice
+      filed (ledger row 1292): `smallserial`/`serial2`/`serial4`/`serial8` are
+      the sequence-backed spellings of int2/int4/int8, but `codec.go`'s heap
+      arms listed only `serial`/`bigserial`, so those four spellings fell
+      through to the varlena default and stored their value as TEXT where PG
+      stores the 2/4/8-byte int image (feedback_pg_faithful_binary_over_text,
+      inverted). Added the missing spellings to the FOUR codec.go dispatch
+      sites that must agree with each other (Hard-won Rule #2): `encodeValuePG`
+      (heap encode), `decodePhysicalPGValueMctx` (heap decode),
+      `physicalPGTypeAlign`, and — the one a first pass missed —
+      `pgPhysicalTypeIsVarlena`, whose own comment warns the PG18 nocachegetattr
+      attcacheoff walker trips if it disagrees with encodeValuePG. `copy_binary.go`'s
+      int2/int4/int8 arms (both directions) gained the WHOLE serial family: it
+      was missing `serial`/`bigserial` too, so a `serial` column shipped TEXT
+      under FORMAT binary. The text-COPY path needed no edit — its KindString
+      default already hands the int arms a string datum they coerce, the same
+      route `int2`/`smallint` take. New `internal/executor/codec_serial_spellings_test.go`
+      (6 tests: fixed-width encode == canonical spelling, KindString coercion,
+      align, not-varlena, heap round-trip, binary-COPY twin + round-trip). Item
+      stays UNCHECKED (standing slice-by-slice cluster). Gates: `go test
+      ./internal/executor/` PASS; UNITS pre-commit PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=35). 1 ledger row resolved (1292); 0 filed.
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
 
 - [x] **M0119-0010 — `char(N)` typmods are not restored per column on catalog

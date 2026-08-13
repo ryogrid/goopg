@@ -269,7 +269,7 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 			return []byte{1}, nil
 		}
 		return []byte{0}, nil
-	case "int2", "smallint":
+	case "int2", "smallint", "smallserial", "serial2":
 		var v int64
 		switch d.Kind {
 		case KindInt:
@@ -301,7 +301,7 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		var buf [2]byte
 		binary.LittleEndian.PutUint16(buf[:], uint16(int16(v)))
 		return buf[:], nil
-	case "int4", "integer", "int", "serial":
+	case "int4", "integer", "int", "serial", "serial4":
 		var v int64
 		switch d.Kind {
 		case KindInt:
@@ -328,7 +328,7 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		var buf [4]byte
 		binary.LittleEndian.PutUint32(buf[:], uint32(int32(v)))
 		return buf[:], nil
-	case "int8", "bigint", "bigserial":
+	case "int8", "bigint", "bigserial", "serial8":
 		var v int64
 		switch d.Kind {
 		case KindInt:
@@ -1089,11 +1089,11 @@ func physicalPGTypeAlign(t catalog.Type) int {
 			return 1
 		}
 		return 4
-	case "int2", "smallint":
+	case "int2", "smallint", "smallserial", "serial2":
 		return 2
-	case "int4", "integer", "int", "serial", "oid", "regproc", "float4", "real", "date", "xid":
+	case "int4", "integer", "int", "serial", "serial4", "oid", "regproc", "float4", "real", "date", "xid":
 		return 4
-	case "int8", "bigint", "bigserial", "pg_lsn", "float8", "double precision", "double", "timestamp", "timestamptz", "time", "timetz",
+	case "int8", "bigint", "bigserial", "serial8", "pg_lsn", "float8", "double precision", "double", "timestamp", "timestamptz", "time", "timetz",
 		// interval is typalign 'd' (pg_type OID 1186) even though its 16 bytes
 		// exceed a Datum — the struct's leading field is an int64.
 		"interval",
@@ -1138,9 +1138,9 @@ func pgPhysicalTypeIsVarlena(t catalog.Type) bool {
 		// char(N) with length modifier = bpchar (varlena).
 		return len(t.Args) > 0
 	case "bool", "boolean",
-		"int2", "smallint",
-		"int4", "integer", "int", "serial",
-		"int8", "bigint", "bigserial",
+		"int2", "smallint", "smallserial", "serial2",
+		"int4", "integer", "int", "serial", "serial4",
+		"int8", "bigint", "bigserial", "serial8",
 		"pg_lsn",
 		"oid", "regproc",
 		"timestamp", "timestamptz", "date", "time", "timetz",
@@ -1223,17 +1223,17 @@ func decodePhysicalPGValueMctxStyled(t catalog.Type, data []byte, sctx *mctx.Con
 			return Datum{}, 0, fmt.Errorf("truncated bool")
 		}
 		return NewBoolDatum(data[0] != 0), 1, nil
-	case "int2", "smallint":
+	case "int2", "smallint", "smallserial", "serial2":
 		if len(data) < 2 {
 			return Datum{}, 0, fmt.Errorf("truncated int2")
 		}
 		return NewIntDatum(int64(int16(binary.LittleEndian.Uint16(data[:2])))), 2, nil
-	case "int4", "integer", "int", "serial":
+	case "int4", "integer", "int", "serial", "serial4":
 		if len(data) < 4 {
 			return Datum{}, 0, fmt.Errorf("truncated int4")
 		}
 		return NewIntDatum(int64(int32(binary.LittleEndian.Uint32(data[:4])))), 4, nil
-	case "int8", "bigint", "bigserial":
+	case "int8", "bigint", "bigserial", "serial8":
 		// Mirror encodeValuePG's 8-byte LE int8 encoding. Without this
 		// case, any int8/bigint value (including count(*)/sum() results
 		// stored via CTAS, and plain INSERTs into bigint columns) fell
