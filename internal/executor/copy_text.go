@@ -32,7 +32,7 @@ import (
 // column rendering (PostgreSQL's DateStyle GUC style/order components,
 // e.g. "ISO"/"MDY" — see config.ParseDateStyleValue); pass "ISO", "MDY"
 // for the boot default.
-func EncodeCopyTextRow(dst []byte, row Row, cols []catalog.Column, dateStyle, dateOrder, timeZone string) ([]byte, error) {
+func EncodeCopyTextRow(dst []byte, row Row, cols []catalog.Column, dateStyle, dateOrder, timeZone string, cat catalog.Catalog, qualify bool) ([]byte, error) {
 	if len(row) != len(cols) {
 		return nil, fmt.Errorf("EncodeCopyTextRow: %d cols vs %d datums", len(cols), len(row))
 	}
@@ -45,7 +45,7 @@ func EncodeCopyTextRow(dst []byte, row Row, cols []catalog.Column, dateStyle, da
 			dst = append(dst, '\\', 'N')
 			continue
 		}
-		s, err := datumToCopyText(c.Type, d, dateStyle, dateOrder, timeZone)
+		s, err := datumToCopyText(c.Type, d, dateStyle, dateOrder, timeZone, cat, qualify)
 		if err != nil {
 			return nil, err
 		}
@@ -262,7 +262,13 @@ func appendCopyTextEscaped(dst []byte, s string) []byte {
 
 // datumToCopyText renders a non-null Datum into the byte string
 // COPY TEXT expects, before per-byte escaping.
-func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone string) (string, error) {
+//
+// cat/qualify are M0119-0006 (68th slice): the catalog + search-path-qualify
+// flag the reg* arms need to render an OID as its name (RegOut), threaded as
+// value parameters rather than a *Context so the TEXT and CSV renderers share
+// exactly the narrow seam they already did. A nil cat preserves the pre-68th
+// numeric rendering.
+func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone string, cat catalog.Catalog, qualify bool) (string, error) {
 	// Array columns FIRST. A user array column is
 	// catalog.Type{Name:<ELEMENT type>, IsArray:true}, so every arm of the
 	// switch below would claim the array under its ELEMENT's name and reject
@@ -284,6 +290,17 @@ func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone str
 			return "", fmt.Errorf("expected array text datum for %s[], got kind %d", t.Name, d.Kind)
 		}
 		return d.StringValue(), nil
+	}
+	// M0119-0006 (68th slice): reg* columns render through RegOut — the SAME
+	// OID→name renderer the SELECT wire path (appendTypedCellText) uses — so
+	// COPY TO cannot drift from SELECT. A non-KindInt datum (a KindString
+	// already rendered by a `::reg*` cast feeding `COPY (SELECT …) TO`) falls
+	// through to the Kind switch below, exactly as the SELECT path's
+	// fall-through does. This must sit BEFORE the type-name switch: the switch
+	// has no reg* case, so a regrole OID would otherwise hit the default arm
+	// and render numerically.
+	if isRegIdentifierTypeName(t.Name) && d.Kind == KindInt {
+		return RegOut(t.Name, uint32(d.Int), cat, qualify), nil
 	}
 	switch t.Name {
 	case "int4", "integer", "int", "int8", "bigint":

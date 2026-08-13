@@ -3937,6 +3937,39 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       PASS (Q12=2, Q13=35). Design:
       `docs/design/0119-0006-regrole-regcollation-4byte-storage.md` + README row.
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
+      **68th slice (2026-08-14): TEXT/CSV COPY of a `reg*` column renders its
+      NAME, not its numeric OID — the family-wide gap ledger row 1303 named.**
+      `datumToCopyText` (shared by TEXT `EncodeCopyTextRow` and CSV
+      `EncodeCopyCsvRow`) gains a reg* guard routing any
+      `regproc`/`regprocedure`/`regclass`/`regtype`/`regrole`/`regcollation`
+      KindInt datum through the new exported `executor.RegOut` — the SAME
+      OID→name renderer `appendTypedCellText`'s six reg* cases now collapse
+      onto (one call; no duplication, Hard-won Rule #2), so COPY TO cannot
+      drift from SELECT and OID 0 → "-" for every family (fixing the pre-68th
+      SELECT regclass case that matched an OID-0 information_schema virtual
+      table for a nondeterministic name). The renderers gain `(cat
+      catalog.Catalog, qualify bool)`, threaded from `RunCopyTo` with `qualify
+      = !regObjectSchemaVisible(ctx, "public")` (the server's
+      `!publicSchemaVisible(getSetting)`). COPY FROM routes the decoded row
+      through `coerceRowForConstraintChecks` at `insertSourceRow` with a
+      reg*-only include filter (`isRegIdentifierTypeName` — the exact 6-name
+      family, numeric-only `oid`/`cid` excluded so the wider encode/align
+      lists are untouched), so a name field resolves to its OID via the 67th
+      slice's choke point with the family's OWN SQLSTATE unwrapped (42P01
+      regclass / 42704 regrole+collation — NOT the 22P04 wrap `copyTextToDatum`
+      would add), and `-`/pure-digit fields stay numeric OIDs via the 66th
+      slice's `parseDashOrOid`. New tests: `internal/executor/reg_copy_test.go`
+      (TO renders names across TEXT+CSV for all six incl. pg_class 1259 / role
+      alice / collation mycoll; OID 0 → "-"; KindString passthrough; FROM
+      resolves name/-/numeric; the include filter leaves a non-reg* column
+      untouched; the family predicate) + `internal/server/reg_copy_sibling_test.go`
+      (SELECT vs COPY byte-agreement at qualify false AND true). Ledger row
+      1303 resolved; 4 new rows filed (reg*out schema-qualification + quoting,
+      regclassout TOAST-relation name, array-of-reg* COPY FROM, the general
+      COPY-FROM 22P04 wrap). Gates: package suites PASS; pre-commit units
+      PASS; `TestPort_RegressSuite` PASS (340 s); `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2, Q13=35). Design:
+      `docs/design/0119-0006-reg-copy-text-name-rendering.md` + README row.
 
 - [x] **M0119-0010 — `char(N)` typmods are not restored per column on catalog
       reload** (source: M0127-P5.9-f, ledger row 2026-08-05). **FIXED (2026-08-09).**

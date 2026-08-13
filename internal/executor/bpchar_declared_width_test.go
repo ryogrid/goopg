@@ -43,7 +43,7 @@ var bpcharWidthCases = []bpcharWidthCase{
 func TestCopyTextBpcharCarriesDeclaredWidth(t *testing.T) {
 	for _, tc := range bpcharWidthCases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := datumToCopyText(tc.typ, NewStringDatum(tc.in), "ISO", "MDY", "")
+			got, err := datumToCopyText(tc.typ, NewStringDatum(tc.in), "ISO", "MDY", "", nil, false)
 			if err != nil {
 				t.Fatalf("datumToCopyText: %v", err)
 			}

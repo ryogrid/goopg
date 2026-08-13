@@ -73,6 +73,18 @@ func RunCopyTo(ctx *Context, plan *planner.Copy, emit func([]byte) error) (count
 			timeZone = v
 		}
 	}
+	// M0119-0006 (68th slice): the catalog + search-path-qualify flag the reg*
+	// renderer needs. qualify is the negation of regObjectSchemaVisible — a
+	// regtype name is schema-qualified only when "public" is NOT on the
+	// session's effective search_path, the same rule the SELECT path applies
+	// via internal/server's publicSchemaVisible. A nil ctx keeps both nil/false
+	// (numeric rendering), matching the pre-68th callers.
+	var cat catalog.Catalog
+	qualify := false
+	if ctx != nil {
+		cat = ctx.Catalog
+		qualify = !regObjectSchemaVisible(ctx, "public")
+	}
 
 	src, cols, projection, buildErr := buildCopySource(plan)
 	if buildErr != nil {
@@ -119,9 +131,9 @@ func RunCopyTo(ctx *Context, plan *planner.Copy, emit func([]byte) error) (count
 		case binary:
 			buf, encErr = AppendCopyBinaryRow(buf, row, cols)
 		case format.csv:
-			buf, encErr = EncodeCopyCsvRow(buf, row, cols, format, dateStyle, dateOrder, timeZone)
+			buf, encErr = EncodeCopyCsvRow(buf, row, cols, format, dateStyle, dateOrder, timeZone, cat, qualify)
 		default:
-			buf, encErr = EncodeCopyTextRow(buf, row, cols, dateStyle, dateOrder, timeZone)
+			buf, encErr = EncodeCopyTextRow(buf, row, cols, dateStyle, dateOrder, timeZone, cat, qualify)
 		}
 		if encErr != nil {
 			return count, binary, encErr
@@ -303,6 +315,20 @@ func (c *CopyFromExecutor) insertSourceRow(src Row) error {
 	}
 	for srcIdx, tgtOrd := range c.plan.ColumnIndex {
 		row[tgtOrd] = src[srcIdx]
+	}
+	// M0119-0006 (68th slice): route reg* columns through the SAME
+	// coerceRowForConstraintChecks the INSERT path uses, so a name field
+	// resolves like regclassin/regrolein ("-" → OID 0, pure-digit → numeric OID,
+	// miss → 42P01/42704/42883/42602) instead of encodeValuePG's numeric parse
+	// on the KindString copyTextToDatum left behind. Only the reg* family is
+	// admitted — every other column is already typed by copyTextToDatum, and
+	// re-coercing it would risk drift. The error propagates unwrapped (PushLine
+	// returns insertSourceRow's error as-is), so reg*in's own SQLSTATE reaches
+	// the wire rather than the 22P04 the decode path wraps.
+	if err := coerceRowForConstraintChecks(c.cols, row, func(i int) bool {
+		return isRegIdentifierTypeName(c.cols[i].Type.Name)
+	}, c.ctx, c.plan.Pos()); err != nil {
+		return err
 	}
 	rel := c.ctx.Catalog.RelFileNode(c.plan.Table)
 	ptr, err := writeHeapRowReturning(c.ctx, rel, c.cols, row)

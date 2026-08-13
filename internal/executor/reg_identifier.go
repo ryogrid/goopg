@@ -212,3 +212,89 @@ func regIdentifierOIDFromDatum(d Datum, typeName string) (uint32, error) {
 	}
 	return uint32(v), nil
 }
+
+// RegOut renders a reg* OID as its object's name — the OUTPUT half of the reg*
+// family's name↔OID contract, one switch implementing every reg*out in
+// postgres/src/backend/utils/adt/regproc.c. It is the SINGLE OID→name renderer
+// shared by the SELECT wire path (internal/server.appendTypedCellText) and the
+// COPY TEXT/CSV TO path (datumToCopyText), so the two cannot drift apart again
+// (Hard-won Rule #2, pattern_sibling_paths_must_agree). M0119-0006 (68th slice).
+//
+// Every reg*out has the same three-verdict shape: OID 0 (InvalidOid) renders
+// "-"; a catalog hit renders the object's name (regtype schema-qualified when
+// qualify is set — the search-path-visibility rule, see RegtypeName); anything
+// else renders the numeric OID. A nil cat (or a failed *InMemory assertion)
+// skips the lookups and falls through to the numeric form, preserving the
+// no-catalog behavior of every call site that predates the catalog threading.
+func RegOut(typeName string, oid uint32, cat catalog.Catalog, qualify bool) string {
+	if oid == 0 {
+		return "-"
+	}
+	im, hasIM := cat.(*catalog.InMemory)
+	switch strings.ToLower(typeName) {
+	case "regclass":
+		if hasIM {
+			if tbl, ok := im.LookupTableByOID(oid); ok {
+				return tbl.Name
+			}
+			if idx, ok := im.LookupIndexByOID(oid); ok {
+				return idx.Name
+			}
+		}
+	case "regproc":
+		if name, ok := catalog.RegprocName(oid); ok {
+			return name
+		}
+		if cat != nil {
+			if rs := cat.Routines(); rs != nil {
+				if r := rs.LookupByOID(oid); r != nil {
+					return r.Name
+				}
+			}
+		}
+	case "regprocedure":
+		// RegprocedureName is nil-safe for routines; mirror appendTypedCellText,
+		// which passes nil when the catalog is nil.
+		var routines *catalog.Routines
+		if cat != nil {
+			routines = cat.Routines()
+		}
+		if sig, ok := catalog.RegprocedureName(oid, routines); ok {
+			return sig
+		}
+	case "regtype":
+		return RegtypeName(cat, oid, qualify)
+	case "regrole":
+		if hasIM {
+			// RoleNameForOID already renders a dangling role numerically
+			// (catalog.go:15948-15961 — only OID 0 returns ""), so "render when
+			// non-empty" covers both the name and the numeric fallback, matching
+			// regroleout.
+			if n := im.RoleNameForOID(oid); n != "" {
+				return n
+			}
+		}
+	case "regcollation":
+		if hasIM {
+			if n := im.ResolveIndexColumnCollationName(oid); n != "" {
+				return n
+			}
+		}
+	}
+	return strconv.FormatUint(uint64(oid), 10)
+}
+
+// isRegIdentifierTypeName reports whether name is one of the six reg* types
+// with a name→OID seam (regproc/regprocedure/regclass/regtype/regrole/
+// regcollation). `oid` and `cid` are numeric-only and deliberately excluded.
+// Shared by the COPY FROM coerce filter and the COPY TO renderer guard so the
+// two COPY directions agree on the family; the encode/align arms (codec.go)
+// keep their own WIDER list because they also cover oid/cid. M0119-0006 (68th
+// slice).
+func isRegIdentifierTypeName(name string) bool {
+	switch strings.ToLower(name) {
+	case "regproc", "regprocedure", "regclass", "regtype", "regrole", "regcollation":
+		return true
+	}
+	return false
+}
