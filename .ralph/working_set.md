@@ -1,51 +1,41 @@
 (idle — nothing in flight)
 
-Completed this loop: **M0119-0006 69th slice** — `RegOut` schema-qualifies and
-quotes the object names the reg*out family emits (ledger row 1304 resolved).
-`executor.RegOut` — the single OID→name renderer shared by SELECT
-(`appendTypedCellText`) and TEXT/CSV COPY (`datumToCopyText`) since the 68th
-slice — now runs the regclass/regproc/regrole/regcollation arms through the new
-shared `regOutQualified`: a name whose schema is NOT on the session's effective
-search_path renders `schema.name` via `quoteQualifiedIdentifier` (the
-ruleutils.c `quote_qualified_identifier` port, `expr.go`), with every
-identifier passed through `pgQuoteIdent`'s
-`internal/sqlkeywords.IsReservedForQuoting` guard. Qualification rules measured
-against PG 18.3: pg_catalog objects NEVER qualify (implicitly searched — 1259
-stays `pg_class` even at qualify=true), a builtin proc never qualifies, a user
-table in public at qualify=true renders `public.mytable` with the `public`
-qualifier itself UNQUOTED (unreserved keyword) and a `"My Table"` name quoted
-(`public."My Table"`), regrole quote_identifiers the role name but a DANGLING
-role OID falls to the unquoted `%u` (new `InMemory.RoleNameAtOID` in
-`internal/catalog` distinguishes real roles from dangling ones — `RoleNameForOID`
-renders both numerically), and regcollation quote_identifiers every name
-(`C` → `"C"`, `default` → `"default"`) with user collations qualified. The
-qualify flag is unchanged: COPY computes `!regObjectSchemaVisible(ctx, "public")`,
-SELECT `!publicSchemaVisible(getSetting)` — and the strengthened
-`TestRegCopyAndSelectSiblingQualifyAgree` now exercises a REAL user table
-(created through the planner→Build pipeline), which the pre-69th 1259-only
-version could not catch diverging with. New tests:
-`internal/executor/reg_qualify_test.go` (qualify=true schema-qualification for
-table/collation/user-routine, pg_catalog-never-qualifies, identifier quoting
-incl. `"My Table"`/`public."My Coll"`/keyword role `"select"`, dangling-role
-numeric) + pins in `reg_copy_test.go` + the sibling tests. Gates: package
-suites PASS; pre-commit units PASS; `TestPort_RegressSuite` PASS (248 s);
-`scripts/tpch-spotcheck.sh` PASS. Design
-`docs/design/0119-0006-regout-schema-qualification.md` + README row (`0119-0006au`)
-+ ledger row 1304 resolved + 3 new ledger rows filed + fix_plan 69th-slice entry.
+Completed this loop: **M0119-0006 70th slice** — `RegOut`'s regcollation arm
+qualifies a user collation with its ACTUAL schema, not the hardcoded `"public"`
+(ledger row 1339 resolved). The arm now iterates `ListUserCollations`
+UNCONDITIONALLY and, on an OID match, returns
+`regOutQualified(im.SchemaNameForOID(uc.NamespaceOID), n, qualify)` —
+`SchemaNameForOID` is the `get_namespace_name(collnamespace)` port, and
+`regOutQualified` applies the family's shared rule that also closes the
+pg_catalog edge the literal could not express (a collation created in
+pg_catalog is always visible → qualify=false → bare quoted name, where the old
+code emitted `public.<name>`). qualify=false reaches the same bare name through
+`regOutQualified`'s `!qualify` arm, so behavior is unchanged there. The qualify
+flag semantics are untouched (COPY `!regObjectSchemaVisible(ctx,"public")`,
+SELECT `!publicSchemaVisible(getSetting)`) — the per-object proxy imprecision is
+out of scope, same as every 69th-slice family member. Measured against a
+throwaway PG 18.3 oracle (port 5599): `search_path=''` renders `ragout70.mycoll`
+/ `ragout70."My Other Coll"`, `search_path=ragout70` renders bare `mycoll` — the
+unit pins match all three. Tests: new `TestRegCollationQualifiesWithActualSchema`
+(`internal/executor/reg_qualify_test.go`: non-public plain + quoted-name
+collations, qualify=false bare, public still `public.mycoll`) + sibling
+`TestRegCopyAndSelectSiblingQualifyAgree` extended with the non-public collation
+(both renderers must emit `other_schema.oc`). Gates: package suites PASS;
+pre-commit units PASS; `TestPort_RegressSuite` PASS (239.7 s);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35); pgbench pre-commit smoke PASS
+(TPC-B 339, simple-update 628, select-only 12485 tps) on commit `ebfb5601`.
+Design `docs/design/0119-0006-regcollation-actual-schema-qualifier.md` + README
+row (`0119-0006av`) + ledger row 1339 resolved + fix_plan 70th-slice entry.
 
-**Carry-forward for a later loop (three new deferral rows under 2026-08-14, 69th
-slice):** (1) `RegOut`'s regprocedure arm still returns the BARE signature
-(`int4out(integer)` via `catalog.RegprocedureName`) where upstream
+**Carry-forward for a later loop (two remaining reg* deferrals under 2026-08-14,
+69th/70th slices):** (1) `RegOut`'s regprocedure arm still returns the BARE
+signature (`int4out(integer)` via `catalog.RegprocedureName`) where upstream
 `regprocedureout` → `format_procedure` schema-qualifies an off-path routine name
 (`public.my_udf()`), qualifying only the NAME — the `qualify` flag is already
-plumbed into the arm's caller; (2) the regcollation qualify path hardcodes
-`"public"` as the user-collation qualifier where upstream qualifies with the
-collation's ACTUAL schema — `InMemory.FindCollation` already returns the
-namespace, so the fix is to use `uc.Schema` instead of the literal and pin with
-a non-public `CREATE COLLATION`; (3) goopg's role store folds every role name to
-lowercase on registration, so `regroleout` can never receive a case-preserved
-role name to quote (`CREATE ROLE "Alice"` renders `alice`, PG renders `"Alice"`)
-— the quoting code is correct, the limitation is the catalog's missing
-case-preserving display-name field (like `roleACLDisplay` but set at
-role-creation time). See the ledger rows for the design docs and gate
-requirements.
+plumbed into the arm's caller (ledger row 1338); (2) goopg's role store folds
+every role name to lowercase on registration, so `regroleout` can never receive
+a case-preserved role name to quote (`CREATE ROLE "Alice"` renders `alice`, PG
+renders `"Alice"`) — the quoting code is correct, the limitation is the
+catalog's missing case-preserving display-name field (like `roleACLDisplay` but
+set at role-creation time) (ledger row 1340). See the ledger rows for the design
+docs and gate requirements.
