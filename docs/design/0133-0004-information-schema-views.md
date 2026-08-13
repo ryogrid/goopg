@@ -1,20 +1,27 @@
-# M0133-S4 — `information_schema` views (65, tranches 1–3 = 47 of 65)
+# M0133-S4 — `information_schema` views (65, all four tranches COMPLETE)
 
 **Status:** accepted — tranche 1 COMPLETE 2026-08-14 (33 catalog-direct leaves);
 tranche 2 COMPLETE 2026-08-14 (10 TOAST views); tranche 3 COMPLETE 2026-08-14
-(4 helper-function views).
+(4 helper-function views); tranche 4 COMPLETE 2026-08-14 (18 view-on-view).
 **Milestone:** M0133 (`information_schema` on disk), slice S4.
 **Supersedes:** S9.4d in `0131-0009-system-view-corpus-widening.md` §"Successor decomposition".
 
 ## What landed
 
-The first three tranches of the 65 `information_schema` views — **all 33
-catalog-direct leaves plus the 10 catalog-direct TOAST views plus the 4
-helper-function views** — seeded on disk so a hosted PG 18.3 cold-started on a
+All 65 `information_schema` views — **the 33 catalog-direct leaves, the 10
+catalog-direct TOAST views, the 4 helper-function views, and (tranche 4) the 18
+view-on-view views** — seeded on disk so a hosted PG 18.3 cold-started on a
 goopg `$PGDATA` resolves and **evaluates** `SELECT * FROM
 information_schema.<view>` for each. The slice reuses the M0131-S9
 capture/pin/regen loop unchanged (Option-A identity pinning), with one new
 generator and two forced fixes (below).
+
+Tranche 4 (2026-08-14) is the view-on-view set: the 18 views whose `ev_action`
+embeds in-band `:relid` references to OTHER information_schema views, whose bases
+all landed in tranches 1–3. `element_types` (13558) is the eleventh F33 value —
+its 10956 B stored `ev_action` exceeds the 8000 B inline budget and is the sole
+tranche-4 view externalised through the pg_rewrite TOAST writer (rule 13561, 6
+chunks / 10541 B goopg-encoded). The other 17 store inline.
 
 Four of the 33 landed one loop later, by a **catalog-descriptor-completion**
 slice (2026-08-14), not a view-capture problem — their ev_action blobs are
@@ -33,7 +40,7 @@ bootstrap-survival seeds:
   index 2701's pre-existing `indkey={2,4}` (tgname at attnum 4) with the
   descriptor.
 
-## Why 43 and not 65
+## Why four tranches
 
 All three blockers that could have gated S4 were cleared before this slice: S2's
 11 helper functions (the `:funcid` surface), S3's data tables (the bulk-heap-load
@@ -46,8 +53,8 @@ those on disk, the 65 views split cleanly into four tranches by what their
 |---|---|---|
 | **1 (done)** | catalog-direct, no in-band `:relid`, no in-band `:funcid`, stored ≤ 8000 B | 33 (4 landed a loop later by the descriptor-completion slice) |
 | **2 (done)** | catalog-direct, stored > 8000 B (TOAST) | 10 (`attributes`, `check_constraints`, `column_privileges`, `columns`, `constraint_column_usage`, `domains`, `referential_constraints`, `routines`, `transforms`, `usage_privileges`) |
-| 3 (done) | helper-function (`:funcid` 13274..13285), stored ≤ 8000 B | 4 (`key_column_usage`, `parameters`, `sequences`, `triggered_update_columns`) |
-| 4 | view-on-view (`:relid` in 13293..13621) | 18 |
+| **3 (done)** | helper-function (`:funcid` 13274..13285), stored ≤ 8000 B | 4 (`key_column_usage`, `parameters`, `sequences`, `triggered_update_columns`) |
+| **4 (done)** | view-on-view (`:relid` in 13293..13621) | 18 |
 
 The 11 F33 over-budget values split 10/1: ten are catalog-direct (tranche 2) and
 `element_types` — the eleventh — is view-on-view (it embeds `:relid` 13553
@@ -97,7 +104,7 @@ so M0133 is independent of the M0131-S9 view-on-view work.
 
 ## Wiring
 
-The 65 (33 today) views must reach the on-disk catalogs **without** entering
+The 65 views must reach the on-disk catalogs **without** entering
 `pg_internal.init` — upstream never nails information_schema relations. They ride
 a **third list**, `informationSchemaViewSeedRels()`, exactly like the data tables'
 `informationSchemaDataTableRels()`, wired at five sites plus the pg_rewrite heap:
@@ -159,20 +166,26 @@ unchanged.
   updated for the +33 rows.
 - E2E `assertInformationSchemaViewsEvaluable` — a hosted PG resolves each adopted
   view to its pinned OID and evaluates `SELECT * FROM … LIMIT 0`. The absence
-  probe `assertNonCorpusSystemViewIsStillAbsent` is re-pointed from `tables`
-  (adopted in tranche 1) to `columns` (tranche 2) to `element_types` (tranche 4).
-- Tranche 2 also extends `TestPgRewriteEvActionDatumSwitchesRepresentation`'s
+  probe `assertNonCorpusSystemViewIsStillAbsent` walked `tables` → `columns` →
+  `element_types` as each tranche adopted its subject, and tranche 4 — which
+  adopts the last view — re-points it out of `information_schema` entirely:
+  the VIEW supply is now exhausted (all 80 pg_catalog + all 65 information_schema
+  views on disk), so the probe moves to `pg_catalog.pg_largeobject` (2613), the
+  one pg_catalog catalog goopg deliberately never bootstraps (`relcache_init.go`
+  nailedLocalRels: `pg_seclabels` references it only via a folded `::regclass`
+  Const). Its absence is permanent, so the tripwire now guards the evaluability
+  probe's non-vacuity rather than any future adoption.
+- Tranche 2 extended `TestPgRewriteEvActionDatumSwitchesRepresentation`'s
   `wantToasted` map (+10 rule OIDs), `TestPgRewriteToastPairIndexRowAndFiles`'s
   page count (2838: 12 → 31), and E2E `assertHostedPGSeesPgRewriteToastRelation`'s
-  `wantChunks` (+10 `chunk_id/count/bytes` rows).
+  `wantChunks` (+10 `chunk_id/count/bytes` rows). Tranche 4 adds the eleventh of
+  each: `wantToasted` +13561, page count 31 → 32, `wantChunks` + `13562/6/10541`.
 
-## Remaining (later tranches)
+## Remaining
 
-Tranche 4 only (18 view-on-view views). Tranche 3 needed no new mechanism — the
-four helper-function views (`key_column_usage`, `parameters`, `sequences`,
-`triggered_update_columns`) are catalog-direct, stored ≤ 8000 B, and embed an
-in-band `:funcid` to the S2 helpers (13274..13285, already on disk) but no
-in-band `:relid`, so the existing capture loop seeded them verbatim (OIDs 13394,
-13399, 13451, 13500). Tranche 4 is ordered base-before-dependent by capture
-guard #4; its base views (`attributes`, `columns`, `domains`, `enabled_roles`,
-…) landed in tranches 1–3, so each is pinned before its dependents are captured.
+Nothing view-capture-related: all 65 views are on disk and evaluable. The one
+open item is the **dual-definition hazard** — goopg's front end still answers 6
+information_schema relations virtually (`routines` 7 cols vs 82 on disk,
+`parameters` 8 vs 32, four `routine_*_usage` stubs with count/type drift),
+measured and ledgered under M0133-S4 rather than fixed in this slice (it changes
+goopg-client-visible output; the F6/F9 discipline).

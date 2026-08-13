@@ -1012,46 +1012,37 @@ func assertNailedSystemViewsAreEvaluable(t *testing.T, pg *pgcluster.Cluster, go
 // (internal/catalog/catalog.go:335-342, skipped at :7025-7034). Passing both
 // halves is what makes the corpus list, and not something ambient, the cause.
 //
-// information_schema.tables is the probe, and it is the FIFTH relation to hold
-// this role. The discipline is fail-when-fixed: each predecessor was chosen
-// because it was blocked for a MEASURED reason, and each was retired by the
-// slice that unblocked it. M0131-S9.2a adopted pg_tables (the original probe);
-// M0131-S20.2b adopted pg_indexes, whose blocker was the 8000 B
-// inline-heap-tuple budget (9002 B stored — design 0131-0009's TOAST ceiling
-// #1), once DECLARE_TOAST(pg_rewrite, 2838, 2839) plus the S20.2a chunk writer
-// made an out-of-line ev_action storable; M0131-S9.3e adopted pg_policies by
-// bootstrapping pg_policy (3256); M0131-S9.3f adopted pg_seclabels by
-// bootstrapping pg_seclabel (3596) and pg_largeobject_metadata (2995).
+// information_schema.element_types was the sixth relation to hold this role,
+// and M0133-S4 tranche 4 (the last view-on-view tranche) is what adopted it.
+// The discipline is fail-when-fixed: each predecessor was chosen because it was
+// blocked for a MEASURED reason, and each was retired by the slice that
+// unblocked it. M0131-S9.2a adopted pg_tables (the original probe); M0131-S20.2b
+// adopted pg_indexes, whose blocker was the 8000 B inline-heap-tuple budget
+// (9002 B stored — design 0131-0009's TOAST ceiling #1); M0131-S9.3e adopted
+// pg_policies; M0131-S9.3f adopted pg_seclabels. S9.3f is also where the
+// pg_catalog VIEW supply ran out (all 80 adopted once S9.3g closed ceiling #6),
+// so F27 pointed the probe into `information_schema`, one level lower: M0133-S1
+// seeded the namespace + domains, and M0133-S4 adopted the 65 views one tranche
+// at a time (tables → columns → element_types).
 //
-// S9.3f is where the pg_catalog supply of probes runs out. The corpus is 79 of
-// upstream's 80 and the ONE remaining view, pg_stats_ext_exprs (12063,
-// ceiling #6 — no pg_type row for 10029), is unusable HERE for a reason that
-// has nothing to do with whether it is absent: its failure trips
-// Assert("OidIsValid(typentry->typrelid)") (typcache.c:3082) and takes the
-// backend down with it, and an "is it still absent?" guard must fail QUIETLY.
-//
-// So the probe crosses into the next slice's territory instead (F27). S9.4's
-// subject, `information_schema`, is absent one level lower than any predecessor
-// — not a view goopg failed to seed but a NAMESPACE goopg never bootstrapped at
-// all when this probe was first pointed here (internal/initdb/initdb.go seeded
-// exactly three: pg_catalog, public, pg_toast). M0133-S1 changed that — it
-// seeded the information_schema NAMESPACE (13273) plus the five domains and two
-// domain CHECK constraints — but NOT the 65 views, so `information_schema.tables`
-// (a view, M0133-S4's work) still fails 42P01 and this probe stays green. The
-// day S4 seeds `tables` itself, this assertion fails and whoever lands that
-// slice must re-point it (the domains are asserted separately by
-// assertInformationSchemaDomainsResolvable).
+// That exhausts the VIEW supply entirely — goopg now seeds all 80 pg_catalog
+// system views AND all 65 information_schema views, upstream's complete view
+// inventory, so there is no "next un-adopted view" left to trip on. The probe
+// therefore re-points to a different class of genuinely-absent relation: the
+// `pg_largeobject` catalog (2613), which goopg DELIBERATELY does not bootstrap
+// (relcache_init.go's nailedLocalRels comment: the pg_seclabels view references
+// it only via a folded ::regclass Const, so nothing resolves the name at run
+// time, and goopg has no large-object subsystem). It is a real PG catalog, so
+// it still distinguishes "goopg seeded it" from "a hosted PG resolves it
+// ambiently", and its absence is permanent — the tripwire now guards the
+// evaluability probe's non-vacuity rather than any future adoption.
 func assertNonCorpusSystemViewIsStillAbsent(t *testing.T, pg *pgcluster.Cluster) {
 	t.Helper()
-	// M0131-S9.3f re-pointed this from pg_seclabels (adopted by that slice,
-	// which bootstrapped pg_seclabel 3596 and pg_largeobject_metadata 2995)
-	// to information_schema.tables. M0133-S4 adopted tables (its first tranche),
-	// then columns (its second), so the probe is re-pointed to
-	// information_schema.element_types — the largest remaining view (10956 B
-	// stored, over the inline budget), and a tranche-4 view-on-view (it embeds
-	// :relid 13553 data_type_privileges), so it fails QUIETLY with 42P01 until
-	// the last tranche lands.
-	const view = "information_schema.element_types"
+	// Re-pointed from information_schema.element_types (adopted by M0133-S4
+	// tranche 4) to pg_catalog.pg_largeobject (2613) — the one pg_catalog
+	// catalog goopg deliberately never bootstraps. No pg_class row is seeded
+	// for 2613, so it must fail QUIETLY with 42P01 "does not exist".
+	const view = "pg_catalog.pg_largeobject"
 	out, err := pgQueryScalarAllowError(pg, "SELECT * FROM "+view+" LIMIT 0")
 	if err == nil {
 		t.Errorf("hosted PG evaluated %s, which is NOT in the on-disk corpus "+
@@ -1186,7 +1177,9 @@ func assertInformationSchemaDataTablesReadable(t *testing.T, pg *pgcluster.Clust
 // four helper-function views (key_column_usage, parameters, sequences,
 // triggered_update_columns) — catalog-direct, under the inline budget, and
 // embedding an in-band :funcid to the S2 helpers (13274..13285) but no
-// in-band :relid. The remaining 18 view-on-view views land in tranche 4.
+// in-band :relid. Tranche 4 (2026-08-14) adds the remaining 18 view-on-view
+// views — their ev_action embeds in-band :relid references to other
+// information_schema views, whose bases landed in tranches 1–3.
 func informationSchemaViewProbeSet() []struct {
 	view string
 	oid  string
@@ -1197,6 +1190,7 @@ func informationSchemaViewProbeSet() []struct {
 	}{
 		{"information_schema.information_schema_catalog_name", "13293"},
 		{"information_schema.applicable_roles", "13302"},
+		{"information_schema.administrable_role_authorizations", "13307"},
 		{"information_schema.attributes", "13311"},
 		{"information_schema.character_sets", "13316"},
 		{"information_schema.check_constraint_routine_usage", "13321"},
@@ -1217,8 +1211,10 @@ func informationSchemaViewProbeSet() []struct {
 		{"information_schema.key_column_usage", "13394"},
 		{"information_schema.parameters", "13399"},
 		{"information_schema.referential_constraints", "13404"},
+		{"information_schema.role_column_grants", "13409"},
 		{"information_schema.routine_column_usage", "13413"},
 		{"information_schema.routine_privileges", "13418"},
+		{"information_schema.role_routine_grants", "13423"},
 		{"information_schema.routine_routine_usage", "13427"},
 		{"information_schema.routine_sequence_usage", "13432"},
 		{"information_schema.routine_table_usage", "13437"},
@@ -1227,21 +1223,36 @@ func informationSchemaViewProbeSet() []struct {
 		{"information_schema.sequences", "13451"},
 		{"information_schema.table_constraints", "13476"},
 		{"information_schema.table_privileges", "13481"},
+		{"information_schema.role_table_grants", "13486"},
 		{"information_schema.tables", "13490"},
 		{"information_schema.transforms", "13495"},
 		{"information_schema.triggered_update_columns", "13500"},
 		{"information_schema.triggers", "13505"},
 		{"information_schema.udt_privileges", "13510"},
+		{"information_schema.role_udt_grants", "13515"},
 		{"information_schema.usage_privileges", "13519"},
+		{"information_schema.role_usage_grants", "13524"},
 		{"information_schema.user_defined_types", "13528"},
 		{"information_schema.view_column_usage", "13533"},
 		{"information_schema.view_routine_usage", "13538"},
 		{"information_schema.view_table_usage", "13543"},
 		{"information_schema.views", "13548"},
+		{"information_schema.data_type_privileges", "13553"},
+		{"information_schema.element_types", "13558"},
 		{"information_schema._pg_foreign_table_columns", "13563"},
+		{"information_schema.column_options", "13568"},
 		{"information_schema._pg_foreign_data_wrappers", "13572"},
+		{"information_schema.foreign_data_wrapper_options", "13576"},
+		{"information_schema.foreign_data_wrappers", "13580"},
 		{"information_schema._pg_foreign_servers", "13584"},
+		{"information_schema.foreign_server_options", "13588"},
+		{"information_schema.foreign_servers", "13592"},
 		{"information_schema._pg_foreign_tables", "13596"},
+		{"information_schema.foreign_table_options", "13601"},
+		{"information_schema.foreign_tables", "13605"},
+		{"information_schema._pg_user_mappings", "13609"},
+		{"information_schema.user_mapping_options", "13614"},
+		{"information_schema.user_mappings", "13619"},
 	}
 }
 
@@ -1361,6 +1372,8 @@ func assertHostedPGSeesPgRewriteToastRelation(t *testing.T, pg *pgcluster.Cluste
 		"13446/5/9731",   // routines             (upstream: 6 / 10091)
 		"13499/10/18840", // transforms           (upstream: 10 / 19659)
 		"13523/10/18574", // usage_privileges     (upstream: 10 / 19211)
+		// M0133-S4 tranche 4 — the view-on-view element_types (eleventh F33).
+		"13562/6/10541", // element_types         (upstream: 6 / 10956)
 	}
 	gotChunks := pgQueryColumn(t, pg,
 		"SELECT chunk_id::text || '/' || count(*)::text || '/' || sum(length(chunk_data))::text "+

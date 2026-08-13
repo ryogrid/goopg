@@ -10,6 +10,10 @@ rel	applicable_roles	13302	13302	13305	13304	2249	v	3
 attr	applicable_roles	1	grantee	13292	64	f	f
 attr	applicable_roles	2	role_name	13292	64	f	f
 attr	applicable_roles	3	is_grantable	13300	-1	f	f
+rel	administrable_role_authorizations	13307	13307	13310	13309	2249	v	3
+attr	administrable_role_authorizations	1	grantee	13292	64	f	f
+attr	administrable_role_authorizations	2	role_name	13292	64	f	f
+attr	administrable_role_authorizations	3	is_grantable	13300	-1	f	f
 rel	attributes	13311	13311	13314	13313	2249	v	31
 attr	attributes	1	udt_catalog	13292	64	f	f
 attr	attributes	2	udt_schema	13292	64	f	f
@@ -265,6 +269,15 @@ attr	referential_constraints	6	unique_constraint_name	13292	64	f	f
 attr	referential_constraints	7	match_option	13290	-1	f	f
 attr	referential_constraints	8	update_rule	13290	-1	f	f
 attr	referential_constraints	9	delete_rule	13290	-1	f	f
+rel	role_column_grants	13409	13409	13412	13411	2249	v	8
+attr	role_column_grants	1	grantor	13292	64	f	f
+attr	role_column_grants	2	grantee	13292	64	f	f
+attr	role_column_grants	3	table_catalog	13292	64	f	f
+attr	role_column_grants	4	table_schema	13292	64	f	f
+attr	role_column_grants	5	table_name	13292	64	f	f
+attr	role_column_grants	6	column_name	13292	64	f	f
+attr	role_column_grants	7	privilege_type	13290	-1	f	f
+attr	role_column_grants	8	is_grantable	13300	-1	f	f
 rel	routine_column_usage	13413	13413	13416	13415	2249	v	10
 attr	routine_column_usage	1	specific_catalog	13292	64	f	f
 attr	routine_column_usage	2	specific_schema	13292	64	f	f
@@ -287,6 +300,17 @@ attr	routine_privileges	7	routine_schema	13292	64	f	f
 attr	routine_privileges	8	routine_name	13292	64	f	f
 attr	routine_privileges	9	privilege_type	13290	-1	f	f
 attr	routine_privileges	10	is_grantable	13300	-1	f	f
+rel	role_routine_grants	13423	13423	13426	13425	2249	v	10
+attr	role_routine_grants	1	grantor	13292	64	f	f
+attr	role_routine_grants	2	grantee	13292	64	f	f
+attr	role_routine_grants	3	specific_catalog	13292	64	f	f
+attr	role_routine_grants	4	specific_schema	13292	64	f	f
+attr	role_routine_grants	5	specific_name	13292	64	f	f
+attr	role_routine_grants	6	routine_catalog	13292	64	f	f
+attr	role_routine_grants	7	routine_schema	13292	64	f	f
+attr	role_routine_grants	8	routine_name	13292	64	f	f
+attr	role_routine_grants	9	privilege_type	13290	-1	f	f
+attr	role_routine_grants	10	is_grantable	13300	-1	f	f
 rel	routine_routine_usage	13427	13427	13430	13429	2249	v	6
 attr	routine_routine_usage	1	specific_catalog	13292	64	f	f
 attr	routine_routine_usage	2	specific_schema	13292	64	f	f
@@ -439,6 +463,15 @@ attr	table_privileges	5	table_name	13292	64	f	f
 attr	table_privileges	6	privilege_type	13290	-1	f	f
 attr	table_privileges	7	is_grantable	13300	-1	f	f
 attr	table_privileges	8	with_hierarchy	13300	-1	f	f
+rel	role_table_grants	13486	13486	13489	13488	2249	v	8
+attr	role_table_grants	1	grantor	13292	64	f	f
+attr	role_table_grants	2	grantee	13292	64	f	f
+attr	role_table_grants	3	table_catalog	13292	64	f	f
+attr	role_table_grants	4	table_schema	13292	64	f	f
+attr	role_table_grants	5	table_name	13292	64	f	f
+attr	role_table_grants	6	privilege_type	13290	-1	f	f
+attr	role_table_grants	7	is_grantable	13300	-1	f	f
+attr	role_table_grants	8	with_hierarchy	13300	-1	f	f
 rel	tables	13490	13490	13493	13492	2249	v	12
 attr	tables	1	table_catalog	13292	64	f	f
 attr	tables	2	table_schema	13292	64	f	f
@@ -495,6 +528,14 @@ attr	udt_privileges	4	udt_schema	13292	64	f	f
 attr	udt_privileges	5	udt_name	13292	64	f	f
 attr	udt_privileges	6	privilege_type	13290	-1	f	f
 attr	udt_privileges	7	is_grantable	13300	-1	f	f
+rel	role_udt_grants	13515	13515	13518	13517	2249	v	7
+attr	role_udt_grants	1	grantor	13292	64	f	f
+attr	role_udt_grants	2	grantee	13292	64	f	f
+attr	role_udt_grants	3	udt_catalog	13292	64	f	f
+attr	role_udt_grants	4	udt_schema	13292	64	f	f
+attr	role_udt_grants	5	udt_name	13292	64	f	f
+attr	role_udt_grants	6	privilege_type	13290	-1	f	f
+attr	role_udt_grants	7	is_grantable	13300	-1	f	f
 rel	usage_privileges	13519	13519	13522	13521	2249	v	8
 attr	usage_privileges	1	grantor	13292	64	f	f
 attr	usage_privileges	2	grantee	13292	64	f	f
@@ -504,6 +545,15 @@ attr	usage_privileges	5	object_name	13292	64	f	f
 attr	usage_privileges	6	object_type	13290	-1	f	f
 attr	usage_privileges	7	privilege_type	13290	-1	f	f
 attr	usage_privileges	8	is_grantable	13300	-1	f	f
+rel	role_usage_grants	13524	13524	13527	13526	2249	v	8
+attr	role_usage_grants	1	grantor	13292	64	f	f
+attr	role_usage_grants	2	grantee	13292	64	f	f
+attr	role_usage_grants	3	object_catalog	13292	64	f	f
+attr	role_usage_grants	4	object_schema	13292	64	f	f
+attr	role_usage_grants	5	object_name	13292	64	f	f
+attr	role_usage_grants	6	object_type	13290	-1	f	f
+attr	role_usage_grants	7	privilege_type	13290	-1	f	f
+attr	role_usage_grants	8	is_grantable	13300	-1	f	f
 rel	user_defined_types	13528	13528	13531	13530	2249	v	29
 attr	user_defined_types	1	user_defined_type_catalog	13292	64	f	f
 attr	user_defined_types	2	user_defined_type_schema	13292	64	f	f
@@ -567,11 +617,53 @@ attr	views	7	is_insertable_into	13300	-1	f	f
 attr	views	8	is_trigger_updatable	13300	-1	f	f
 attr	views	9	is_trigger_deletable	13300	-1	f	f
 attr	views	10	is_trigger_insertable_into	13300	-1	f	f
+rel	data_type_privileges	13553	13553	13556	13555	2249	v	5
+attr	data_type_privileges	1	object_catalog	13292	64	f	f
+attr	data_type_privileges	2	object_schema	13292	64	f	f
+attr	data_type_privileges	3	object_name	13292	64	f	f
+attr	data_type_privileges	4	object_type	13290	-1	f	f
+attr	data_type_privileges	5	dtd_identifier	13292	64	f	f
+rel	element_types	13558	13558	13561	13560	2249	v	28
+attr	element_types	1	object_catalog	13292	64	f	f
+attr	element_types	2	object_schema	13292	64	f	f
+attr	element_types	3	object_name	13292	64	f	f
+attr	element_types	4	object_type	13290	-1	f	f
+attr	element_types	5	collection_type_identifier	13292	64	f	f
+attr	element_types	6	data_type	13290	-1	f	f
+attr	element_types	7	character_maximum_length	13287	4	f	f
+attr	element_types	8	character_octet_length	13287	4	f	f
+attr	element_types	9	character_set_catalog	13292	64	f	f
+attr	element_types	10	character_set_schema	13292	64	f	f
+attr	element_types	11	character_set_name	13292	64	f	f
+attr	element_types	12	collation_catalog	13292	64	f	f
+attr	element_types	13	collation_schema	13292	64	f	f
+attr	element_types	14	collation_name	13292	64	f	f
+attr	element_types	15	numeric_precision	13287	4	f	f
+attr	element_types	16	numeric_precision_radix	13287	4	f	f
+attr	element_types	17	numeric_scale	13287	4	f	f
+attr	element_types	18	datetime_precision	13287	4	f	f
+attr	element_types	19	interval_type	13290	-1	f	f
+attr	element_types	20	interval_precision	13287	4	f	f
+attr	element_types	21	udt_catalog	13292	64	f	f
+attr	element_types	22	udt_schema	13292	64	f	f
+attr	element_types	23	udt_name	13292	64	f	f
+attr	element_types	24	scope_catalog	13292	64	f	f
+attr	element_types	25	scope_schema	13292	64	f	f
+attr	element_types	26	scope_name	13292	64	f	f
+attr	element_types	27	maximum_cardinality	13287	4	f	f
+attr	element_types	28	dtd_identifier	13292	64	f	f
 rel	_pg_foreign_table_columns	13563	13563	13566	13565	2249	v	4
 attr	_pg_foreign_table_columns	1	nspname	19	64	f	f
 attr	_pg_foreign_table_columns	2	relname	19	64	f	f
 attr	_pg_foreign_table_columns	3	attname	19	64	f	f
 attr	_pg_foreign_table_columns	4	attfdwoptions	1009	-1	f	f
+rel	column_options	13568	13568	13571	13570	2249	v	6
+attr	column_options	1	table_catalog	13292	64	f	f
+attr	column_options	2	table_schema	13292	64	f	f
+attr	column_options	3	table_name	13292	64	f	f
+attr	column_options	4	column_name	13292	64	f	f
+attr	column_options	5	option_name	13292	64	f	f
+attr	column_options	6	option_value	13290	-1	f	f
 rel	_pg_foreign_data_wrappers	13572	13572	13575	13574	2249	v	7
 attr	_pg_foreign_data_wrappers	1	oid	26	4	f	f
 attr	_pg_foreign_data_wrappers	2	fdwowner	26	4	f	f
@@ -580,6 +672,17 @@ attr	_pg_foreign_data_wrappers	4	foreign_data_wrapper_catalog	13292	64	f	f
 attr	_pg_foreign_data_wrappers	5	foreign_data_wrapper_name	13292	64	f	f
 attr	_pg_foreign_data_wrappers	6	authorization_identifier	13292	64	f	f
 attr	_pg_foreign_data_wrappers	7	foreign_data_wrapper_language	13290	-1	f	f
+rel	foreign_data_wrapper_options	13576	13576	13579	13578	2249	v	4
+attr	foreign_data_wrapper_options	1	foreign_data_wrapper_catalog	13292	64	f	f
+attr	foreign_data_wrapper_options	2	foreign_data_wrapper_name	13292	64	f	f
+attr	foreign_data_wrapper_options	3	option_name	13292	64	f	f
+attr	foreign_data_wrapper_options	4	option_value	13290	-1	f	f
+rel	foreign_data_wrappers	13580	13580	13583	13582	2249	v	5
+attr	foreign_data_wrappers	1	foreign_data_wrapper_catalog	13292	64	f	f
+attr	foreign_data_wrappers	2	foreign_data_wrapper_name	13292	64	f	f
+attr	foreign_data_wrappers	3	authorization_identifier	13292	64	f	f
+attr	foreign_data_wrappers	4	library_name	13290	-1	f	f
+attr	foreign_data_wrappers	5	foreign_data_wrapper_language	13290	-1	f	f
 rel	_pg_foreign_servers	13584	13584	13587	13586	2249	v	9
 attr	_pg_foreign_servers	1	oid	26	4	f	f
 attr	_pg_foreign_servers	2	srvoptions	1009	-1	f	f
@@ -590,6 +693,19 @@ attr	_pg_foreign_servers	6	foreign_data_wrapper_name	13292	64	f	f
 attr	_pg_foreign_servers	7	foreign_server_type	13290	-1	f	f
 attr	_pg_foreign_servers	8	foreign_server_version	13290	-1	f	f
 attr	_pg_foreign_servers	9	authorization_identifier	13292	64	f	f
+rel	foreign_server_options	13588	13588	13591	13590	2249	v	4
+attr	foreign_server_options	1	foreign_server_catalog	13292	64	f	f
+attr	foreign_server_options	2	foreign_server_name	13292	64	f	f
+attr	foreign_server_options	3	option_name	13292	64	f	f
+attr	foreign_server_options	4	option_value	13290	-1	f	f
+rel	foreign_servers	13592	13592	13595	13594	2249	v	7
+attr	foreign_servers	1	foreign_server_catalog	13292	64	f	f
+attr	foreign_servers	2	foreign_server_name	13292	64	f	f
+attr	foreign_servers	3	foreign_data_wrapper_catalog	13292	64	f	f
+attr	foreign_servers	4	foreign_data_wrapper_name	13292	64	f	f
+attr	foreign_servers	5	foreign_server_type	13290	-1	f	f
+attr	foreign_servers	6	foreign_server_version	13290	-1	f	f
+attr	foreign_servers	7	authorization_identifier	13292	64	f	f
 rel	_pg_foreign_tables	13596	13596	13599	13598	2249	v	7
 attr	_pg_foreign_tables	1	foreign_table_catalog	13292	64	f	f
 attr	_pg_foreign_tables	2	foreign_table_schema	13292	64	f	f
@@ -598,3 +714,33 @@ attr	_pg_foreign_tables	4	ftoptions	1009	-1	f	f
 attr	_pg_foreign_tables	5	foreign_server_catalog	13292	64	f	f
 attr	_pg_foreign_tables	6	foreign_server_name	13292	64	f	f
 attr	_pg_foreign_tables	7	authorization_identifier	13292	64	f	f
+rel	foreign_table_options	13601	13601	13604	13603	2249	v	5
+attr	foreign_table_options	1	foreign_table_catalog	13292	64	f	f
+attr	foreign_table_options	2	foreign_table_schema	13292	64	f	f
+attr	foreign_table_options	3	foreign_table_name	13292	64	f	f
+attr	foreign_table_options	4	option_name	13292	64	f	f
+attr	foreign_table_options	5	option_value	13290	-1	f	f
+rel	foreign_tables	13605	13605	13608	13607	2249	v	5
+attr	foreign_tables	1	foreign_table_catalog	13292	64	f	f
+attr	foreign_tables	2	foreign_table_schema	13292	64	f	f
+attr	foreign_tables	3	foreign_table_name	13292	64	f	f
+attr	foreign_tables	4	foreign_server_catalog	13292	64	f	f
+attr	foreign_tables	5	foreign_server_name	13292	64	f	f
+rel	_pg_user_mappings	13609	13609	13612	13611	2249	v	7
+attr	_pg_user_mappings	1	oid	26	4	f	f
+attr	_pg_user_mappings	2	umoptions	1009	-1	f	f
+attr	_pg_user_mappings	3	umuser	26	4	f	f
+attr	_pg_user_mappings	4	authorization_identifier	13292	64	f	f
+attr	_pg_user_mappings	5	foreign_server_catalog	13292	64	f	f
+attr	_pg_user_mappings	6	foreign_server_name	13292	64	f	f
+attr	_pg_user_mappings	7	srvowner	13292	64	f	f
+rel	user_mapping_options	13614	13614	13617	13616	2249	v	5
+attr	user_mapping_options	1	authorization_identifier	13292	64	f	f
+attr	user_mapping_options	2	foreign_server_catalog	13292	64	f	f
+attr	user_mapping_options	3	foreign_server_name	13292	64	f	f
+attr	user_mapping_options	4	option_name	13292	64	f	f
+attr	user_mapping_options	5	option_value	13290	-1	f	f
+rel	user_mappings	13619	13619	13622	13621	2249	v	3
+attr	user_mappings	1	authorization_identifier	13292	64	f	f
+attr	user_mappings	2	foreign_server_catalog	13292	64	f	f
+attr	user_mappings	3	foreign_server_name	13292	64	f	f

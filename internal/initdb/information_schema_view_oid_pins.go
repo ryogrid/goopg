@@ -63,10 +63,21 @@ package initdb
 // inline budget: key_column_usage, parameters, sequences,
 // triggered_update_columns. They are capturable now because S2 landed the
 // helpers those funcids resolve to.
+//
+// Tranche 4 (2026-08-14) is the view-on-view set — the 18 views whose ev_action
+// embeds in-band :relid references to OTHER information_schema views (the
+// "16 view-on-view edges" of design 0133-0004). Their bases — applicable_roles,
+// enabled_roles, the column/routine/table/udt/usage_privileges family, the
+// attributes/columns/domains/parameters/routines family, and the _pg_foreign_*
+// leaf set — all landed in tranches 1–3, so every embedded :relid resolves once
+// these 18 are themselves pinned. One of them (element_types, 10956 B stored)
+// exceeds the 8000 B inline budget and is the eleventh F33 value; the other 17
+// store inline.
 func informationSchemaViewOIDPins() []systemViewOIDPin {
 	return []systemViewOIDPin{
 		{"information_schema_catalog_name", 13293, 13296, 13295, 1},
 		{"applicable_roles", 13302, 13305, 13304, 3},
+		{"administrable_role_authorizations", 13307, 13310, 13309, 3},
 		{"attributes", 13311, 13314, 13313, 31},
 		{"character_sets", 13316, 13319, 13318, 8},
 		{"check_constraint_routine_usage", 13321, 13324, 13323, 6},
@@ -87,8 +98,10 @@ func informationSchemaViewOIDPins() []systemViewOIDPin {
 		{"key_column_usage", 13394, 13397, 13396, 9},
 		{"parameters", 13399, 13402, 13401, 32},
 		{"referential_constraints", 13404, 13407, 13406, 9},
+		{"role_column_grants", 13409, 13412, 13411, 8},
 		{"routine_column_usage", 13413, 13416, 13415, 10},
 		{"routine_privileges", 13418, 13421, 13420, 10},
+		{"role_routine_grants", 13423, 13426, 13425, 10},
 		{"routine_routine_usage", 13427, 13430, 13429, 6},
 		{"routine_sequence_usage", 13432, 13435, 13434, 9},
 		{"routine_table_usage", 13437, 13440, 13439, 9},
@@ -97,20 +110,35 @@ func informationSchemaViewOIDPins() []systemViewOIDPin {
 		{"sequences", 13451, 13454, 13453, 12},
 		{"table_constraints", 13476, 13479, 13478, 11},
 		{"table_privileges", 13481, 13484, 13483, 8},
+		{"role_table_grants", 13486, 13489, 13488, 8},
 		{"tables", 13490, 13493, 13492, 12},
 		{"transforms", 13495, 13498, 13497, 8},
 		{"triggered_update_columns", 13500, 13503, 13502, 7},
 		{"triggers", 13505, 13508, 13507, 17},
 		{"udt_privileges", 13510, 13513, 13512, 7},
+		{"role_udt_grants", 13515, 13518, 13517, 7},
 		{"usage_privileges", 13519, 13522, 13521, 8},
+		{"role_usage_grants", 13524, 13527, 13526, 8},
 		{"user_defined_types", 13528, 13531, 13530, 29},
 		{"view_column_usage", 13533, 13536, 13535, 7},
 		{"view_routine_usage", 13538, 13541, 13540, 6},
 		{"view_table_usage", 13543, 13546, 13545, 6},
 		{"views", 13548, 13551, 13550, 10},
+		{"data_type_privileges", 13553, 13556, 13555, 5},
+		{"element_types", 13558, 13561, 13560, 28},
 		{"_pg_foreign_table_columns", 13563, 13566, 13565, 4},
+		{"column_options", 13568, 13571, 13570, 6},
 		{"_pg_foreign_data_wrappers", 13572, 13575, 13574, 7},
+		{"foreign_data_wrapper_options", 13576, 13579, 13578, 4},
+		{"foreign_data_wrappers", 13580, 13583, 13582, 5},
 		{"_pg_foreign_servers", 13584, 13587, 13586, 9},
+		{"foreign_server_options", 13588, 13591, 13590, 4},
+		{"foreign_servers", 13592, 13595, 13594, 7},
 		{"_pg_foreign_tables", 13596, 13599, 13598, 7},
+		{"foreign_table_options", 13601, 13604, 13603, 5},
+		{"foreign_tables", 13605, 13608, 13607, 5},
+		{"_pg_user_mappings", 13609, 13612, 13611, 7},
+		{"user_mapping_options", 13614, 13617, 13616, 5},
+		{"user_mappings", 13619, 13622, 13621, 3},
 	}
 }

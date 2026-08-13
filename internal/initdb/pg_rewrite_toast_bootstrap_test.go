@@ -181,8 +181,10 @@ func TestPgRewriteToastPairIndexRowAndFiles(t *testing.T) {
 	// information_schema TOAST views (75 more chunks), taking 2838 to 31 pages
 	// (121 chunks at ~2032 B, four to a page → ceil(121/4) = 31); the index
 	// still fits metapage + one leaf (121 × 16 B ≪ one btree page), so 2839
-	// stays at 2.
-	wantPages := map[string]int{"2838": 31, "2839": 2}
+	// stays at 2. M0133-S4 tranche 4 adds element_types (6 more chunks),
+	// taking 2838 to 32 pages (127 chunks at ~2032 B, four to a page →
+	// ceil(127/4) = 32).
+	wantPages := map[string]int{"2838": 32, "2839": 2}
 	for _, db := range []string{"1", "5"} {
 		for _, oid := range []string{"2838", "2839"} {
 			path := filepath.Join(dir, "base", db, oid)

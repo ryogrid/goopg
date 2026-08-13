@@ -186,6 +186,8 @@ func TestPgRewriteEvActionDatumSwitchesRepresentation(t *testing.T) {
 	// catalog-direct views whose stored ev_action exceeds the 8000 B inline
 	// budget (F33). element_types is NOT here — it is over budget too, but it
 	// embeds :relid 13553 (data_type_privileges) and is a tranche-4 view.
+	// M0133-S4 tranche 4 added element_types (rule 13561), the eleventh F33
+	// value — the view-on-view whose stored ev_action exceeds the inline budget.
 	wantToasted := map[uint32]string{
 		12046: "pg_indexes",
 		12056: "pg_stats",
@@ -203,6 +205,7 @@ func TestPgRewriteEvActionDatumSwitchesRepresentation(t *testing.T) {
 		13445: "routines",
 		13498: "transforms",
 		13522: "usage_privileges",
+		13561: "element_types",
 	}
 	gotToasted := map[uint32]bool{}
 	for _, e := range pgRewriteInitialEntries() {
