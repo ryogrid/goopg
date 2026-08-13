@@ -221,11 +221,16 @@ func regIdentifierOIDFromDatum(d Datum, typeName string) (uint32, error) {
 // (Hard-won Rule #2, pattern_sibling_paths_must_agree). M0119-0006 (68th slice).
 //
 // Every reg*out has the same three-verdict shape: OID 0 (InvalidOid) renders
-// "-"; a catalog hit renders the object's name (regtype schema-qualified when
-// qualify is set — the search-path-visibility rule, see RegtypeName); anything
-// else renders the numeric OID. A nil cat (or a failed *InMemory assertion)
-// skips the lookups and falls through to the numeric form, preserving the
-// no-catalog behavior of every call site that predates the catalog threading.
+// "-"; a catalog hit renders the object's name — ALWAYS quote_identifier'd, and
+// schema-qualified (quote_qualified_identifier, ruleutils.c) when qualify is
+// set, i.e. the object's schema is not on the session's effective search_path
+// (pg_catalog objects are implicitly visible and so never qualify; regtype keeps
+// its own RegtypeName/format_type_be path, regprocedure the format_procedure
+// path); anything else renders the numeric OID. A nil cat (or a failed
+// *InMemory assertion) skips the lookups and falls through to the numeric form,
+// preserving the no-catalog behavior of every call site that predates the
+// catalog threading. M0119-0006 (69th slice) added the quoting + qualification
+// to the regclass/regproc/regrole/regcollation arms.
 func RegOut(typeName string, oid uint32, cat catalog.Catalog, qualify bool) string {
 	if oid == 0 {
 		return "-"
@@ -235,26 +240,31 @@ func RegOut(typeName string, oid uint32, cat catalog.Catalog, qualify bool) stri
 	case "regclass":
 		if hasIM {
 			if tbl, ok := im.LookupTableByOID(oid); ok {
-				return tbl.Name
+				return regOutQualified(tbl.Schema, tbl.Name, qualify)
 			}
 			if idx, ok := im.LookupIndexByOID(oid); ok {
-				return idx.Name
+				return regOutQualified(idx.Schema, idx.Name, qualify)
 			}
 		}
 	case "regproc":
 		if name, ok := catalog.RegprocName(oid); ok {
-			return name
+			// A builtin proc lives in pg_catalog, which the search path always
+			// searches implicitly, so it is never schema-qualified — only the
+			// name is quote_identifier'd, as regprocout does for every name.
+			return pgQuoteIdent(name)
 		}
 		if cat != nil {
 			if rs := cat.Routines(); rs != nil {
 				if r := rs.LookupByOID(oid); r != nil {
-					return r.Name
+					return regOutQualified(r.Schema, r.Name, qualify)
 				}
 			}
 		}
 	case "regprocedure":
 		// RegprocedureName is nil-safe for routines; mirror appendTypedCellText,
-		// which passes nil when the catalog is nil.
+		// which passes nil when the catalog is nil. format_procedure's signature
+		// qualification (public.myfunc() when the proc is off the search path) is
+		// a separate machinery — see the deferral ledger row (69th slice).
 		var routines *catalog.Routines
 		if cat != nil {
 			routines = cat.Routines()
@@ -266,22 +276,61 @@ func RegOut(typeName string, oid uint32, cat catalog.Catalog, qualify bool) stri
 		return RegtypeName(cat, oid, qualify)
 	case "regrole":
 		if hasIM {
-			// RoleNameForOID already renders a dangling role numerically
-			// (catalog.go:15948-15961 — only OID 0 returns ""), so "render when
-			// non-empty" covers both the name and the numeric fallback, matching
-			// regroleout.
-			if n := im.RoleNameForOID(oid); n != "" {
-				return n
+			// regroleout (regproc.c:1609) quote_identifiers the REAL role name
+			// (roles are never schema-qualified) but emits a dangling OID as the
+			// unquoted %u fallback — RoleNameAtOID distinguishes the two, since
+			// RoleNameForOID renders a dangling role numerically too.
+			if n, ok := im.RoleNameAtOID(oid); ok {
+				return pgQuoteIdent(n)
 			}
 		}
 	case "regcollation":
 		if hasIM {
 			if n := im.ResolveIndexColumnCollationName(oid); n != "" {
-				return n
+				if qualify {
+					// A user collation is schema-qualified when the search path
+					// does not show its schema; goopg creates user collations in
+					// the current schema (public for a default session), so
+					// "public" is the qualifier. A builtin collation resolves in
+					// pg_catalog (always visible) and is never qualified — it
+					// falls through to the bare quote_identifier'd name below.
+					for _, uc := range im.ListUserCollations() {
+						if uc.OID == oid {
+							return quoteQualifiedIdentifier("public", n)
+						}
+					}
+				}
+				return pgQuoteIdent(n)
 			}
 		}
 	}
 	return strconv.FormatUint(uint64(oid), 10)
+}
+
+// regOutQualified applies the reg*out family's schema-qualification and quoting
+// rule to a resolved object name. Every reg*out runs the name through
+// quote_qualified_identifier (regproc.c: regclassout→989, regprocout→184), so
+// the name is ALWAYS quote_identifier'd even when it is not schema-qualified;
+// quoteQualifiedIdentifier does exactly that (bare identifier when the qualifier
+// is empty). qualify is true when the object's schema is NOT on the session's
+// effective search_path — the flag the COPY/SELECT paths compute from the
+// search_path GUC (regObjectSchemaVisible / publicSchemaVisible). pg_catalog is
+// implicitly searched by every search_path, so an object there is never
+// qualified (mirroring RelationIsVisible/CollationIsVisible's implicit
+// pg_catalog arm). An empty schema (a catalog that never set it) defaults to
+// "public", matching userTypeNameForOID's hardcoded prefix. M0119-0006 (69th
+// slice).
+func regOutQualified(schema, name string, qualify bool) string {
+	if schema == "" {
+		schema = "public"
+	}
+	if schema == "pg_catalog" {
+		qualify = false
+	}
+	if !qualify {
+		return pgQuoteIdent(name)
+	}
+	return quoteQualifiedIdentifier(schema, name)
 }
 
 // isRegIdentifierTypeName reports whether name is one of the six reg* types

@@ -53,26 +53,34 @@ func TestRegCopyToRendersName(t *testing.T) {
 		typ  string
 		oid  int64
 		want string
+		// wantCsv overrides want for the CSV format when the TEXT rendering
+		// contains characters the CSV writer escapes (e.g. the quotes
+		// regcollationout adds around "C" — TEXT `"C"`, CSV `"""C"""`).
+		wantCsv string
 	}{
-		{"regrole", 10, "postgres"},
-		{"regrole", int64(aliceOID), "alice"},
+		{"regrole", 10, "postgres", ""},
+		{"regrole", int64(aliceOID), "alice", ""},
 		// pg_class is OID 1259 — the one system-catalog regclass resolution a
 		// bare InMemory catalog can serve (pg_class comes from the VIRTUAL
 		// builder; the heap-backed catalogs like pg_type are not loaded into
-		// the OID→table map without initdb).
-		{"regclass", 1259, "pg_class"},
-		{"regclass", int64(mytable.OID), "mytable"},
-		{"regtype", int64(catalog.OIDInt4), "integer"},
-		{"regtype", int64(catalog.OIDText), "text"},
+		// the OID→table map without initdb). pg_class lives in pg_catalog,
+		// which the search path always searches, so even qualify=true leaves it
+		// bare (the 69th slice's pg_catalog-never-qualifies rule).
+		{"regclass", 1259, "pg_class", ""},
+		{"regclass", int64(mytable.OID), "mytable", ""},
+		{"regtype", int64(catalog.OIDInt4), "integer", ""},
+		{"regtype", int64(catalog.OIDText), "text", ""},
 		// The same hardcoded pg_proc OIDs the server sibling test uses (regproc
 		// Output, OID 43 = int4out, 42 = int4in): the hand-curated
 		// builtinProcsByName set does not hold the operator functions, but
 		// RegprocName/RegprocedureName resolve against the live InMemory proc
 		// registry that initdb's BKI populates.
-		{"regproc", 43, "int4out"},
-		{"regprocedure", 43, "int4out(integer)"},
-		{"regcollation", 950, "C"},
-		{"regcollation", int64(mycollOID), "mycoll"},
+		{"regproc", 43, "int4out", ""},
+		{"regprocedure", 43, "int4out(integer)", ""},
+		// regcollationout quote_identifiers every name (regproc.c:1625); "C" is
+		// uppercase so PG 18.3 renders `"C"` (measured) — this slice's fix.
+		{"regcollation", 950, `"C"`, `"""C"""`},
+		{"regcollation", int64(mycollOID), "mycoll", ""},
 	}
 	csvFmt := copyToFormatFromOptions([]parser.CopyOption{{Name: "format", Value: "csv"}})
 	for _, tc := range cases {
@@ -85,11 +93,15 @@ func TestRegCopyToRendersName(t *testing.T) {
 		if want := tc.want + "\n"; string(text) != want {
 			t.Errorf("TEXT %s(oid %d) = %q, want %q", tc.typ, tc.oid, text, want)
 		}
+		wantCsv := tc.want
+		if tc.wantCsv != "" {
+			wantCsv = tc.wantCsv
+		}
 		csv, err := EncodeCopyCsvRow(nil, row, cols, csvFmt, "ISO", "MDY", "", ctx.Catalog, false)
 		if err != nil {
 			t.Fatalf("CSV %s: %v", tc.typ, err)
 		}
-		if want := tc.want + "\n"; string(csv) != want {
+		if want := wantCsv + "\n"; string(csv) != want {
 			t.Errorf("CSV %s(oid %d) = %q, want %q", tc.typ, tc.oid, csv, want)
 		}
 	}

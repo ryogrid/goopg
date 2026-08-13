@@ -3970,6 +3970,33 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       PASS; `TestPort_RegressSuite` PASS (340 s); `scripts/tpch-spotcheck.sh`
       PASS (Q12=2, Q13=35). Design:
       `docs/design/0119-0006-reg-copy-text-name-rendering.md` + README row.
+      **69th slice (2026-08-14): `RegOut` schema-qualifies and quotes the names
+      the reg*out family emits — ledger row 1304 resolved.** New
+      `quoteQualifiedIdentifier` (expr.go, the ruleutils.c
+      `quote_qualified_identifier` port over the shared `pgQuoteIdent` guard)
+      + `regOutQualified` (reg_identifier.go) + `InMemory.RoleNameAtOID`
+      (catalog.go; distinguishes a real role from a dangling OID, since
+      `RoleNameForOID` renders both numerically). The RegOut
+      regclass/regproc/regrole/regcollation arms run resolved names through
+      the shared rule: a name NOT visible on the session's effective
+      search_path renders `schema.name`, always quote_identifier'd; pg_catalog
+      NEVER qualifies (implicitly visible); a builtin proc never qualifies;
+      regrole quote_identifiers the role name but a dangling OID falls to the
+      unquoted `%u`; regcollation quote_identifiers every name (`C` →
+      `"C"`, `default` → `"default"`). Measured against PG 18.3: `public`
+      itself is UNQUOTED (`public."My Table"`), 1259 stays `pg_class` at
+      qualify=true. COPY computes qualify as
+      `!regObjectSchemaVisible(ctx, "public")`, SELECT as
+      `!publicSchemaVisible(getSetting)`; `TestRegCopyAndSelectSiblingQualifyAgree`
+      strengthened to exercise a REAL user table so a disagreement between the
+      two computations is observable. regtype keeps its own format_type_be
+      path; regprocedure keeps its bare signature (deferred). New tests:
+      `internal/executor/reg_qualify_test.go` (qualify=true qualification,
+      pg_catalog-never-qualifies, identifier quoting, dangling-role numeric).
+      Ledger: row 1304 resolved; 3 new rows filed (regprocedure format_procedure
+      signature qualification, regcollation user-schema hardcoded "public",
+      mixed-case role-name catalog folding). Design:
+      `docs/design/0119-0006-regout-schema-qualification.md` + README row.
 
 - [x] **M0119-0010 — `char(N)` typmods are not restored per column on catalog
       reload** (source: M0127-P5.9-f, ledger row 2026-08-05). **FIXED (2026-08-09).**

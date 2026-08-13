@@ -7,7 +7,37 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/executor"
+	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/planner"
 )
+
+// createSiblingTable creates a user table in the catalog through the same
+// planner→Build pipeline the executor package's runDDL test helper uses, so a
+// sibling renderer test can exercise a real user object without a server.
+func createSiblingTable(t *testing.T, cat *catalog.InMemory, sql string) error {
+	t.Helper()
+	ctx := executor.NewContext()
+	ctx.Catalog = cat
+	stmts, err := parser.Parse(sql)
+	if err != nil {
+		return err
+	}
+	plan, err := planner.Plan(stmts[0], cat)
+	if err != nil {
+		return err
+	}
+	op, err := executor.Build(plan)
+	if err != nil {
+		return err
+	}
+	if err := op.Open(ctx); err != nil {
+		return err
+	}
+	if _, err := op.Next(); err != executor.EOF {
+		return err
+	}
+	return op.Close()
+}
 
 // M0119-0006 (68th slice): the TEXT/CSV COPY renderer and the SELECT wire
 // renderer must agree on a reg* column (Hard-won Rule #2). Both now dispatch
@@ -47,8 +77,10 @@ func TestRegCopyAndSelectSiblingRenderersAgree(t *testing.T) {
 		{"regrole", 10, "postgres"},
 		{"regrole", 7777, "alice"},
 		{"regrole", 0, "-"},
-		{"regcollation", 950, "C"},
-		{"regcollation", 100, "default"},
+		// regcollationout quote_identifiers every name, so "C" and "default"
+		// (uppercase / reserved keyword) render with the quotes PG adds.
+		{"regcollation", 950, `"C"`},
+		{"regcollation", 100, `"default"`},
 		{"regcollation", 0, "-"},
 		// An OID unresolvable by either source falls back to the raw numeric
 		// text in both renderers.
@@ -73,9 +105,12 @@ func TestRegCopyAndSelectSiblingRenderersAgree(t *testing.T) {
 // agree between the two renderers. appendTypedCellText derives qualify from the
 // search_path GUC, so a search_path that excludes public makes it render
 // schema-qualified names; RegOut takes the same flag as an explicit parameter.
-// goopg has no pg_class entry for a schema-qualified system catalog OID that a
-// bare InMemory catalog can serve, so this uses the user table pattern that
-// survives a search_path without public.
+// The pre-69th version of this test only exercised 1259 (pg_catalog), which
+// NEVER qualifies — so a disagreement between the SELECT path's
+// publicSchemaVisible and the COPY path's regObjectSchemaVisible would have
+// gone undetected. A user table in public (created through the same
+// planner→Build pipeline the executor's own tests use) makes the qualify flag
+// observable: both renderers must emit `public.qmt`, and both must agree.
 func TestRegCopyAndSelectSiblingQualifyAgree(t *testing.T) {
 	cat := catalog.NewInMemory()
 
@@ -84,16 +119,42 @@ func TestRegCopyAndSelectSiblingQualifyAgree(t *testing.T) {
 		Catalog: cat,
 	})
 
-	// A search_path that names no public schema (e.g. the --search_path of a
-	// pg_dump restore) must make both renderers qualify. 1259 is pg_class,
-	// which goopg renders schema-qualified when public is not visible; assert
-	// only that the two agree, since the exact qualification of a system
-	// catalog is a separate concern.
-	noPublic := func(name string) (string, bool) { return `"$user"`, true }
+	// A search_path that names no public schema (e.g. pg_dump's search_path='')
+	// must make both renderers qualify. The empty effective path makes
+	// publicSchemaVisible and searchPathSchemas agree (neither sees public).
+	noPublic := func(name string) (string, bool) { return "", true }
+
+	// A user table in public — the one object that qualifies when public is off
+	// the path.
+	if err := createSiblingTable(t, cat, `CREATE TABLE qmt (id int)`); err != nil {
+		t.Fatalf("CREATE TABLE qmt: %v", err)
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "qmt"},
+		catalog.NamespaceDBOid(0))
+	if !ok {
+		t.Fatal("qmt not found")
+	}
+
 	typ := catalog.Type{Name: "regclass"}
-	sel := string(srv.appendTypedCellText(nil, executor.NewIntDatum(1259), typ, noPublic))
-	copyText := executor.RegOut("regclass", 1259, cat, true)
+	sel := string(srv.appendTypedCellText(nil, executor.NewIntDatum(int64(tbl.OID)), typ, noPublic))
+	copyText := executor.RegOut("regclass", tbl.OID, cat, true)
+	if sel != copyText {
+		t.Errorf("regclass(qmt) qualify=true: SELECT=%q COPY=%q — renderers diverged", sel, copyText)
+	}
+	// And the value is the schema-qualified, quoted name PG emits (regproc.c's
+	// quote_qualified_identifier through the 69th slice).
+	if sel != "public.qmt" {
+		t.Errorf("regclass(qmt) qualify=true = %q, want %q", sel, "public.qmt")
+	}
+
+	// pg_catalog objects are implicitly visible and never qualify even when the
+	// search path is empty — both renderers agree on the bare name.
+	sel = string(srv.appendTypedCellText(nil, executor.NewIntDatum(1259), typ, noPublic))
+	copyText = executor.RegOut("regclass", 1259, cat, true)
 	if sel != copyText {
 		t.Errorf("regclass(1259) qualify=true: SELECT=%q COPY=%q — renderers diverged", sel, copyText)
+	}
+	if sel != "pg_class" {
+		t.Errorf("regclass(1259) qualify=true = %q, want %q", sel, "pg_class")
 	}
 }

@@ -15960,6 +15960,24 @@ func (c *InMemory) RoleNameForOID(oid uint32) string {
 	return strconv.FormatUint(uint64(oid), 10)
 }
 
+// RoleNameAtOID reports whether oid names a real role (registered or
+// predefined) and returns its display name. Distinct from RoleNameForOID, which
+// falls back to the numeric OID text for a dangling role: regroleout (regproc.c)
+// quote_identifiers the real name but emits a dangling OID through the unquoted
+// %u fallback, so the caller must be able to tell the two apart. M0119-0006
+// (69th slice).
+func (c *InMemory) RoleNameAtOID(oid uint32) (string, bool) {
+	if oid == 0 {
+		return "", false
+	}
+	if oid == 10 {
+		return "postgres", true
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.roleNameForOIDLocked(oid)
+}
+
 // RoleNameForOIDOrUnknown mirrors ruleutils.c's pg_get_userbyid SQL builtin
 // exactly: it resolves oid to its role name, or PG's literal fallback string
 // "unknown (OID=n)" when no such role exists. This differs from

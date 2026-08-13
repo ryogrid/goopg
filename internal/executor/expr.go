@@ -13546,6 +13546,20 @@ func pgQuoteIdent(s string) string {
 	return `"` + escaped + `"`
 }
 
+// quoteQualifiedIdentifier mirrors PostgreSQL's quote_qualified_identifier
+// (postgres/src/backend/utils/adt/ruleutils.c): qualifier.ident with each
+// component run through quote_identifier, or just quote_identifier(ident) when
+// qualifier is empty. The reg*out family (regproc.c) uses it to render a
+// resolved object name — the name is ALWAYS identifier-quoted even when it is
+// not schema-qualified, and the qualifier (the object's namespace) is quoted
+// too. M0119-0006 (69th slice).
+func quoteQualifiedIdentifier(qualifier, ident string) string {
+	if qualifier == "" {
+		return pgQuoteIdent(ident)
+	}
+	return pgQuoteIdent(qualifier) + "." + pgQuoteIdent(ident)
+}
+
 // isArrayLiteralText reports whether s is a PostgreSQL array literal of the
 // canonical `{...}` form. Used to route the @>/<@/&& operators to anyarray
 // set semantics rather than geometric box semantics (design 0118-0139).
