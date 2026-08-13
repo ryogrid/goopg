@@ -1,10 +1,13 @@
 package executor
 
 // operators_pg_input_error_info.go — pg_input_error_info(value, type) SRF.
-// Returns 0 rows if the input is valid for the type, or 1 row with
-// (message, detail, hint, sql_error_code) if the input is invalid.
-// Used by the pg_regress int2 test and other type validation tests.
-// M0097-0003.
+// Returns 1 row in every case: all four columns NULL if the input is valid for
+// the type, or (message, detail, hint, sql_error_code) if it is invalid.
+// Upstream pg_input_error_info (postgres/src/backend/utils/adt/misc.c:715) sets
+// every isnull[i] true on the valid path and heap_forms one tuple regardless, so
+// it never returns zero rows — the caller must test `message IS NULL`, not count
+// rows. Used by the pg_regress int2 test and other type validation tests.
+// M0097-0003, M0119-0006.
 
 import (
 	"fmt"
@@ -190,8 +193,17 @@ func (o *pgInputErrorInfoOp) Next() (TupleSlot, error) {
 	}
 
 	if message == "" {
-		// Valid input — return 0 rows.
-		return nil, EOF
+		// Valid input — return one row whose four columns are all NULL, exactly
+		// as upstream's misc.c:731-733 memsets isnull[0..3] before heap_forming
+		// the single tuple. A caller that counts rows (rather than testing
+		// `message IS NULL`) would otherwise see the opposite answer from PG.
+		row := Row{
+			NullDatum, // message
+			NullDatum, // detail
+			NullDatum, // hint
+			NullDatum, // sql_error_code
+		}
+		return SlotFromRow(nil, row), nil
 	}
 
 	// Return 1 row with the error info.

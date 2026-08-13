@@ -3704,8 +3704,22 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       resolved, 2 filed (`pg_input_error_info` returns 0 rows where PG returns
       one all-NULL row; `validateTypedLen` matches its type by text prefix).
       Design `0119-0006-bare-bpchar-unbounded-typmod.md` + README row.
-
-- [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
+      **59th slice (2026-08-13): `pg_input_error_info` returns ONE all-NULL row
+      for valid input, not zero.** The deferral the 58th slice filed in its own
+      ledger row's `deferred` column. `Next()` returned `nil, EOF` on the valid
+      path where upstream `pg_input_error_info` (`misc.c:731-733`) memsets
+      `isnull[0..3]` true and `heap_form_tuple`s one tuple unconditionally — the
+      SRF never returns zero rows, so any caller that counts rows rather than
+      testing `message IS NULL` saw the opposite answer from PG. Fixed in
+      `operators_pg_input_error_info.go` (the `if message == ""` branch now emits
+      the 4-NULL row); the `enum_validation_test.go` "valid → 0 rows" arm was
+      rewritten to assert the row. The pg_regress int2/int4/varchar consumers are
+      unaffected — each of their `SELECT * FROM pg_input_error_info(...)` calls
+      uses an INVALID input, so no expected file changed. Item stays UNCHECKED
+      (standing slice-by-slice cluster). Gates: `go test ./internal/executor/`
+      PASS. 1 ledger row resolved; 0 filed (the NULL-argument path is left
+      unchanged and recorded as UNMEASURED in the resolved row's deferred column,
+      not as a new deferral).
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
 
 - [x] **M0119-0010 — `char(N)` typmods are not restored per column on catalog
