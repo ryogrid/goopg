@@ -38,7 +38,11 @@ import (
 //     the const, and the const cannot be flipped without the fix.
 //
 // Do not "fix" a failing divergence arm by relaxing it — flip the const.
-const m0132ExtendedBlocksLanded = false
+// Flipped to true by M0132-S2..S5 (2026-08-13): the extended path now drives
+// the shared transaction-verb state machine, joins an open block instead of
+// beginning its own transaction, marks the block failed on error, and gates
+// aborted blocks ahead of the constant-answer fast paths on BOTH protocols.
+const m0132ExtendedBlocksLanded = true
 
 // --- helpers -------------------------------------------------------------
 
@@ -438,6 +442,57 @@ func TestM0132S1_ConstantSelectBypassesTheAbortedBlockGate(t *testing.T) {
 	if hasError(konst) {
 		t.Errorf("divergence arm: `SELECT 1` in a failed block was rejected (%+v); today it is "+
 			"answered normally. If the gate now covers it, flip m0132ExtendedBlocksLanded", konst)
+	}
+}
+
+// --- bar 4 (M0132-S4): the deferred sequence reaches the extended COMMIT ---
+
+// TestM0132S4_ExtendedCommitRunsDeferredFKChecks is M0132-S4's direct probe:
+// a constraint DEFERRABLE INITIALLY DEFERRED is checked at COMMIT, and that
+// check lives in the simple path's inline verb arm — the arm S2 extracted into
+// applyTransactionVerb precisely so the extended COMMIT would inherit it
+// rather than re-derive it. If the extraction were unfaithful, the block below
+// would commit a dangling child row instead of raising 23503.
+//
+// It complements, rather than replaces, S4's stated gates (the FK isolation
+// specs and internal/testport's deferred-constraint tests), which exercise the
+// same sequence through the real client stack.
+func TestM0132S4_ExtendedCommitRunsDeferredFKChecks(t *testing.T) {
+	addr, _, stop := startCopyExecServer(t)
+	defer stop()
+	conn := dialAndComplete(t, addr)
+	defer conn.Close()
+	r := extendedReader(t, conn)
+
+	for _, ddl := range []string{
+		"CREATE TABLE m0132_parent (id int4 PRIMARY KEY)",
+		"CREATE TABLE m0132_child (id int4, pid int4 REFERENCES m0132_parent(id) DEFERRABLE INITIALLY DEFERRED)",
+	} {
+		if f := simpleStmt(t, conn, r, ddl); hasError(f) {
+			t.Fatalf("%s errored: %+v", ddl, f)
+		}
+	}
+
+	if f := extendedStmt(t, conn, r, "d_begin", "BEGIN"); hasError(f) {
+		t.Fatalf("extended BEGIN errored: %+v", f)
+	}
+	// The violation is invisible until COMMIT: the FK is deferred.
+	if f := extendedStmt(t, conn, r, "d_ins", "INSERT INTO m0132_child VALUES (1, 99)"); hasError(f) {
+		t.Fatalf("deferred FK violated at INSERT time (it must not be checked until COMMIT): %+v", f)
+	}
+	commitFrames := extendedStmt(t, conn, r, "d_commit", "COMMIT")
+	if !errorContains(commitFrames, "23503") {
+		t.Fatalf("extended COMMIT of a deferred FK violation: want 23503, got %+v", commitFrames)
+	}
+	if st := readyStatus(t, commitFrames); st != byte(protocol.TxStatusIdle) {
+		t.Errorf("status after a failed extended COMMIT = %q, want 'I' (the block is over)", st)
+	}
+
+	rows := simpleStmt(t, conn, r, "SELECT * FROM m0132_child")
+	for _, f := range rows {
+		if f.Type == protocol.MsgDataRow {
+			t.Fatal("the rolled-back child row survived the failed deferred-FK COMMIT")
+		}
 	}
 }
 

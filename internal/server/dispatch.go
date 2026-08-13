@@ -970,6 +970,18 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 				// Cache miss: plan now so we can store it.
 				freshNode, perr := planner.Plan(stmt, sessionPlanCatalog(sess, s.cfg.Catalog, ectx.CurrentDatabaseOid))
 				if perr != nil {
+					// M0132-S5 (S1 finding (i)): a PLAN-time error must abort
+					// the block too. Every other error path reaches
+					// connTx.Fail() via errQueryErrorSent below, but this
+					// cache-miss planning site returns straight out of the
+					// dispatch loop, so the block used to stay live and
+					// healthy after `BEGIN; INSERT INTO <missing table>;`.
+					// PostgreSQL aborts on ANY error inside the block
+					// (postgres.c's error handler, not the executor).
+					if !autoCommit && connTx != nil && connTx.InExplicit() {
+						connTx.Fail()
+						connTx.ReleasePinnedSnapshotOnFail(ectx.TxnMgr)
+					}
 					code, msg := planErrorFields(perr)
 					return s.writeQueryError(w, code, msg, planErrorHintFields(perr)...)
 				}

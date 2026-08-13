@@ -107,43 +107,69 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 		}
 	}
 
-	if tx, ok := node.(*planner.Transaction); ok {
-		return &extendedQueryResult{CommandTag: transactionTag(tx.Verb)}, nil
+	// M0132-S2: BEGIN/COMMIT/ROLLBACK are no longer answered with a bare
+	// command tag. They drive the SAME state machine the simple path drives
+	// (applyTransactionVerb, txn_verb.go) — but only once the executor context
+	// below exists, because the machine needs ctx.Tx, ctx.Session, the
+	// Begin/EndLocalTransaction hooks and the pending type-DDL queues.
+	txNode, isTxVerb := node.(*planner.Transaction)
+
+	if !isTxVerb {
+		// P6: wrap AFTER the plan-cache read/write above, so the cache holds the
+		// SERIAL plan and the Gather is chosen per statement from this session's
+		// GUCs. See applyParallelPostPass in dispatch.go for why the placement
+		// matters.
+		//
+		// Note this path reads the GUCs from `sess` directly rather than from an
+		// executor context: on the extended protocol, planning happens ~40 lines
+		// before ectx exists.
+		node = planner.MaybeAddGather(node, planner.ParallelSettings{
+			MaxWorkersPerGather: sessionMaxParallelWorkersPerGather(sess),
+			MinTableScanBlocks:  sessionMinParallelTableScanSize(sess),
+			LeaderParticipates:  sessionParallelLeaderParticipation(sess),
+			DebugParallelQuery:  sessionDebugParallelQuery(sess),
+			// The size lookup needs only the pool and catalog, both available on
+			// the server here — unlike ectx, which does not exist yet on this path.
+			BlocksForTable: parallelBlocksForTableFrom(s.cfg.Pool, s.cfg.Catalog),
+		})
 	}
 
-	// P6: wrap AFTER the plan-cache read/write above, so the cache holds the
-	// SERIAL plan and the Gather is chosen per statement from this session's
-	// GUCs. See applyParallelPostPass in dispatch.go for why the placement
-	// matters.
-	//
-	// Note this path reads the GUCs from `sess` directly rather than from an
-	// executor context: on the extended protocol, planning happens ~40 lines
-	// before ectx exists. The isolation level is likewise not yet known here,
-	// and the extended path always begins a fresh READ COMMITTED transaction
-	// below, so SERIALIZABLE cannot apply.
-	node = planner.MaybeAddGather(node, planner.ParallelSettings{
-		MaxWorkersPerGather: sessionMaxParallelWorkersPerGather(sess),
-		MinTableScanBlocks:  sessionMinParallelTableScanSize(sess),
-		LeaderParticipates:  sessionParallelLeaderParticipation(sess),
-		DebugParallelQuery:  sessionDebugParallelQuery(sess),
-		// The size lookup needs only the pool and catalog, both available on
-		// the server here — unlike ectx, which does not exist yet on this path.
-		BlocksForTable: parallelBlocksForTableFrom(s.cfg.Pool, s.cfg.Catalog),
-	})
-
-	// Use an offset procNum to avoid overwriting the connection's own
-	// ProcArray slot when an explicit transaction is active. The offset
-	// mirrors the COPY transaction strategy in copy.go.
-	const halfSize = mvcc.ConnSlotCount / 2
-	autoCommitProcNum := (procNum + halfSize) % mvcc.ConnSlotCount
-	tx, err := s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted, autoCommitProcNum)
-	if err != nil {
-		return nil, &extendedQueryError{Code: sqlstate.SystemError, Message: err.Error()}
+	// M0132-S3: an Execute that arrives inside an explicit block joins the
+	// block's transaction (connTx.Tx(), the accessor — it returns the session's
+	// current transaction once an XID has been materialised, M0100-0002, so a
+	// statement self-sees the block's earlier writes) instead of beginning and
+	// committing one of its own. Mirrors dispatch.go's identical branch.
+	inBlock := connTx != nil && connTx.InExplicit()
+	var tx mvcc.Transaction
+	if inBlock {
+		tx = connTx.Tx()
+	} else {
+		// Out of block: this Execute owns its transaction. Use an offset
+		// procNum so an explicit block opened over the OTHER protocol keeps
+		// the connection's own ProcArray slot (the offset mirrors the COPY
+		// transaction strategy in copy.go) — except for a BEGIN, whose
+		// transaction IS about to become the connection's block and must
+		// therefore live on the connection's own slot exactly as the simple
+		// path's does (dispatch.go). M0132-S7 revisits the offset itself.
+		const halfSize = mvcc.ConnSlotCount / 2
+		beginProcNum := (procNum + halfSize) % mvcc.ConnSlotCount
+		if isTxVerb && txNode.Verb == planner.TxBegin {
+			beginProcNum = procNum
+		}
+		var err error
+		tx, err = s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted, beginProcNum)
+		if err != nil {
+			return nil, &extendedQueryError{Code: sqlstate.SystemError, Message: err.Error()}
+		}
 	}
+	ownTx := !inBlock
 	commit := false
 	var advisoryReleaseTarget any
 	defer func() {
-		if !commit {
+		// Only a transaction this Execute began is finalised here; a block's
+		// transaction outlives the Execute and is finalised by its COMMIT /
+		// ROLLBACK (or by connection teardown).
+		if ownTx && !commit {
 			_ = s.cfg.TxnMgr.Rollback(tx)
 			executor.ReleaseAdvisoryTransactionLocks(advisoryReleaseTarget)
 		}
@@ -240,6 +266,29 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 			}
 		}
 	}
+	// M0132-S2/S3: inside an explicit block the statement runs against the
+	// block's session, not against a fresh throwaway one — the same wiring
+	// dispatch.go performs. Without it an in-block Execute would neither see
+	// the block's savepoint/DDL-undo state nor advance the block's command
+	// counter, so a second Execute could not see the first one's writes.
+	if inBlock {
+		if bs := connTx.Session(); bs != nil {
+			ectx.Session = bs
+			ectx.SetCmdCounter(bs.CmdCounter())
+			ectx.CommandCounterIncrement()
+			ectx.CmdID = ectx.GetCurrentCommandId(true)
+		}
+		ectx.TempTableShadows = connTx.TempTableShadows
+		ectx.PendingEnumValues = connTx.PendingEnumValues
+		ectx.PendingEnumRenames = connTx.PendingEnumRenames
+		ectx.PendingCreatedEnums = connTx.PendingCreatedEnums
+		ectx.PendingCreatedComposites = connTx.PendingCreatedComposites
+		ectx.PendingCreatedRangeTypes = connTx.PendingCreatedRangeTypes
+		// Transaction-scoped lock identity: a LOCK TABLE (or a maintenance
+		// lock) taken by an in-block statement must be held for the block,
+		// not for the statement. dispatch.go keeps the same invariant.
+		ectx.TxnLockBackendID = connTx.LockBackendID
+	}
 	// Wire session-authorization/role tracking so a SET SESSION AUTHORIZATION
 	// or SET ROLE that reaches the executor (rather than the fast-path
 	// switch in executeExtendedQuery) still updates connTx.NonSuperuserRole
@@ -288,6 +337,35 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 			return false
 		}
 		return s.cancelReg.terminateByPID(uint32(pid))
+	}
+
+	// M0132-S2/S4: BEGIN/COMMIT/ROLLBACK run the shared state machine here,
+	// with the executor context fully wired. Because it is the SAME function
+	// the simple path calls, the extended COMMIT inherits the whole
+	// finalisation sequence (deferred FK/UNIQUE/EXCLUDE checks, the SSI
+	// pre-commit check, the deferred DROP INDEX / ATTACH PARTITION / INHERIT /
+	// DROP TABLE / DROP FUNCTION appliers, enum-DDL undo, the NOTIFY publish)
+	// rather than a hand-written re-derivation of it.
+	if isTxVerb {
+		// autoCommit means the same thing it does on the simple path: "this
+		// dispatch still owns the transaction". applyTransactionVerb clears it
+		// when BEGIN promotes the transaction into the block, which is exactly
+		// the signal that the deferred rollback above must not fire.
+		autoCommit := ownTx
+		if out := s.applyTransactionVerb(ectx, connTx, txNode, &autoCommit); out.Handled {
+			if !autoCommit {
+				commit = true
+			}
+			s.writeBackConnTxState(ectx, connTx)
+			if out.Err != nil {
+				return nil, extendedQueryErrorFromVerb(out.Err)
+			}
+			return &extendedQueryResult{CommandTag: out.Tag, WarnFields: verbWarnFields(out)}, nil
+		}
+		// Handled == false: SAVEPOINT / RELEASE / ROLLBACK TO are not owned by
+		// the state machine; they fall through to the executor exactly as they
+		// do on the simple path (M0097-0023). M0132-S10 rules on whether that
+		// is correct over this protocol.
 	}
 
 	op, err := executor.Build(node)
@@ -358,11 +436,17 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	if err := op.Close(); err != nil {
 		return nil, newExtendedQueryError(err)
 	}
-	if err := ectx.CommitTransaction(tx); err != nil {
-		return nil, &extendedQueryError{Code: sqlstate.SystemError, Message: err.Error()}
+	// M0132-S3: only an Execute that began its own transaction commits one.
+	// In a block the work stays uncommitted until the client's COMMIT, and the
+	// transaction-scoped advisory locks stay held for the block.
+	if ownTx {
+		if err := ectx.CommitTransaction(tx); err != nil {
+			return nil, &extendedQueryError{Code: sqlstate.SystemError, Message: err.Error()}
+		}
+		executor.ReleaseAdvisoryTransactionLocks(advisoryReleaseTarget)
 	}
-	executor.ReleaseAdvisoryTransactionLocks(advisoryReleaseTarget)
 	commit = true
+	s.writeBackConnTxState(ectx, connTx)
 
 	res.CommandTag = commandTagFor(node, op, rowCount)
 	if res.CommandTag == "" {

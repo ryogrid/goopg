@@ -45,6 +45,7 @@ type extendedMessageError struct {
 	Code     sqlstate.Code
 	Message  string
 	Detail   string // errdetail text; "" = omit FieldDetail
+	Hint     string // errhint text; "" = omit FieldHint
 	Routine  string
 	Position int // 1-based byte offset; 0 = omit FieldPosition
 }
@@ -55,13 +56,19 @@ type extendedQueryResult struct {
 	CommandTag string
 	Empty      bool
 	Notice     string // NoticeResponse text to emit before CommandComplete; "" = none
+	// WarnFields is a fully-formed NoticeResponse field set to emit before
+	// CommandComplete — the shape PG's "there is no transaction in progress"
+	// WARNING needs (severity WARNING + SQLSTATE 25P01), which the plain
+	// Notice string above cannot express. M0132-S2.
+	WarnFields []protocol.ErrorField
 }
 
 type extendedQueryError struct {
 	Code     sqlstate.Code
 	Message  string
 	Detail   string // errdetail text; "" = omit FieldDetail
-	Position int // 1-based byte offset; 0 = omit FieldPosition
+	Hint     string // errhint text; "" = omit FieldHint
+	Position int    // 1-based byte offset; 0 = omit FieldPosition
 }
 
 func newExtendedState() *extendedState {
@@ -88,6 +95,9 @@ func (s *Server) writeExtendedMessageError(w *protocol.FrameWriter, em *extended
 	}
 	if em.Detail != "" {
 		fields = append(fields, protocol.ErrorField{Code: protocol.FieldDetail, Value: em.Detail})
+	}
+	if em.Hint != "" {
+		fields = append(fields, protocol.ErrorField{Code: protocol.FieldHint, Value: em.Hint})
 	}
 	return w.WriteErrorResponse(fields)
 }
@@ -328,7 +338,18 @@ func (s *Server) handleExecuteFrame(ctx context.Context, state *extendedState, p
 	if portal.Result == nil {
 		res, qerr := s.executeExtendedQuery(ctx, sess, portal.Statement.Query, portal.Params, state.ProcNum, state.DBName, connTx)
 		if qerr != nil {
-			return &extendedMessageError{Code: qerr.Code, Message: qerr.Message, Detail: qerr.Detail, Position: qerr.Position, Routine: "server.handleExecuteFrame"}, nil
+			// M0132-S5: the extended message loop had no connTx.Fail() call
+			// site at all — its only 'Z' write is the plain ReadyForQuery, so
+			// the ReadyForQueryAfterError escape hatch that makes the simple
+			// path report 'E' is unavailable here. Marking the block failed is
+			// what makes both the status byte and the 25P02 gate work.
+			failExplicitBlock(connTx)
+			return &extendedMessageError{Code: qerr.Code, Message: qerr.Message, Detail: qerr.Detail, Hint: qerr.Hint, Position: qerr.Position, Routine: "server.handleExecuteFrame"}, nil
+		}
+		if len(res.WarnFields) > 0 {
+			if err := w.WriteNoticeResponse(res.WarnFields); err != nil {
+				return nil, err
+			}
 		}
 		if res.Notice != "" {
 			if err := w.WriteNoticeResponse([]protocol.ErrorField{
@@ -435,6 +456,21 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *config.SessionR
 	trimmed, matchable, upper, empty := normalizeSimpleQuery(query)
 	if empty {
 		return &extendedQueryResult{Empty: true}, nil
+	}
+
+	// M0132-S5: the aborted-block gate, ahead of every fast path below —
+	// a failed block rejects `SELECT 1` / `SHOW` / `SET` too, and those never
+	// reach the executor. The simple path gates identically in handleQuery.
+	if connTx != nil && connTx.IsFailed() {
+		if !allowedInAbortedBlock(upper) {
+			return nil, &extendedQueryError{Code: "25P02", Message: abortedBlockMessage}
+		}
+		// ROLLBACK TO SAVEPOINT unwinds the failure instead of ending the
+		// block, so the block becomes usable again (dispatch.go's gate does
+		// the same for the simple path).
+		if strings.HasPrefix(upper, "ROLLBACK TO") {
+			connTx.ClearFailed()
+		}
 	}
 
 	if strings.EqualFold(matchable, "SELECT 1") {

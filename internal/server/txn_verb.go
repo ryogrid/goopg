@@ -2,6 +2,7 @@ package server
 
 import (
 	"strconv"
+	"strings"
 
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/mvcc"
@@ -95,6 +96,102 @@ func (s *Server) endExplicitBlock(ctx *executor.Context, connTx *connTxState) {
 	ctx.PendingCreatedEnums = nil
 	ctx.PendingCreatedComposites = nil
 	ctx.PendingCreatedRangeTypes = nil
+}
+
+// abortedBlockMessage is the 25P02 text PostgreSQL raises for any statement
+// issued while the current transaction block is aborted.
+const abortedBlockMessage = "current transaction is aborted, commands ignored until end of transaction block"
+
+// allowedInAbortedBlock reports whether a statement may run while the block is
+// in the failed (25P02) state. PostgreSQL rejects EVERYTHING except the verbs
+// that end (or unwind) the block — a constant `SELECT 1`, a `SHOW`, and a
+// `SET` included; see xact.c's AbortCurrentTransaction / postgres.c's
+// TBLOCK_ABORT handling.
+//
+// upper is the whitespace-normalised, upper-cased statement text (the form
+// both protocols' fast-path switches already compute). Matching on text rather
+// than on a parsed node is what lets the gate sit AHEAD of the fast paths that
+// answer `SELECT 1` / `SHOW` / `SET` without ever parsing — the hole
+// M0132-S1 found on the simple path and pinned in
+// TestM0132S1_ConstantSelectBypassesTheAbortedBlockGate.
+//
+// The two-phase verbs are allowed for the reason dispatch.go's per-statement
+// gate allows them: PG's PREPARE TRANSACTION on an aborted block silently
+// rolls back, and COMMIT/ROLLBACK PREPARED of an unknown gid reports "does not
+// exist" rather than 25P02.
+func allowedInAbortedBlock(upper string) bool {
+	for _, p := range []string{"COMMIT", "ROLLBACK", "ABORT", "END", "PREPARE TRANSACTION"} {
+		if upper == p || strings.HasPrefix(upper, p+" ") || strings.HasPrefix(upper, p+";") {
+			return true
+		}
+	}
+	return false
+}
+
+// failExplicitBlock marks an open explicit block aborted after an error.
+// PostgreSQL aborts the block from its top-level error handler (postgres.c),
+// so ANY error inside a block aborts it — parse and plan errors included, not
+// only executor errors. M0132-S5.
+func failExplicitBlock(connTx *connTxState) {
+	if connTx != nil && connTx.InExplicit() {
+		connTx.Fail()
+	}
+}
+
+// verbWarnFields renders the state machine's Warn flag as the NoticeResponse
+// field set the extended protocol carries on extendedQueryResult. Nil when
+// the outcome carries no warning.
+func verbWarnFields(out txnVerbOutcome) []protocol.ErrorField {
+	if !out.Warn {
+		return nil
+	}
+	return noTransactionInProgressNotice()
+}
+
+// extendedQueryErrorFromVerb renders a txnVerbError in the extended
+// protocol's error shape. The structured DETAIL/HINT/POSITION fields the
+// deferred-constraint and SSI failures carry would otherwise be dropped —
+// they are the whole reason the state machine returns a typed error instead
+// of a bare `error`.
+func extendedQueryErrorFromVerb(ve *txnVerbError) *extendedQueryError {
+	qerr := &extendedQueryError{Code: ve.Code, Message: ve.Msg}
+	for _, f := range ve.Fields {
+		switch f.Code {
+		case protocol.FieldDetail:
+			qerr.Detail = f.Value
+		case protocol.FieldHint:
+			qerr.Hint = f.Value
+		case protocol.FieldPosition:
+			if p, err := strconv.Atoi(f.Value); err == nil && p > 0 {
+				qerr.Position = p
+			}
+		}
+	}
+	return qerr
+}
+
+// writeBackConnTxState persists the per-connection state a statement may have
+// mutated back onto the connection, so it survives to the next message. The
+// simple path does exactly this at the foot of its per-statement loop
+// (dispatch.go); before M0132-S2 the extended path had no explicit block to
+// carry state across, so it did not need to.
+func (s *Server) writeBackConnTxState(ctx *executor.Context, connTx *connTxState) {
+	if connTx == nil {
+		return
+	}
+	if ctx.TempTableShadows != nil {
+		connTx.TempTableShadows = ctx.TempTableShadows
+	}
+	// Pending type-DDL undo state is written back ONLY while an explicit
+	// transaction is open — see dispatch.go's identical guard for why an
+	// autocommit statement must not leak its pending set onto the connection.
+	if connTx.InExplicit() {
+		connTx.PendingEnumValues = ctx.PendingEnumValues
+		connTx.PendingEnumRenames = ctx.PendingEnumRenames
+		connTx.PendingCreatedEnums = ctx.PendingCreatedEnums
+		connTx.PendingCreatedComposites = ctx.PendingCreatedComposites
+		connTx.PendingCreatedRangeTypes = ctx.PendingCreatedRangeTypes
+	}
 }
 
 // applyTransactionVerb drives the per-connection explicit transaction state

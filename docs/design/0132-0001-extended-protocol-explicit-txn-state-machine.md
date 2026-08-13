@@ -333,3 +333,61 @@ names, and the one that would catch a dropped SSI or deferred-check path);
 (S3), assert the deferred sequence arrives on the extended COMMIT (S4), add the
 missing `connTx.Fail()` call site (S5) — and flip
 `m0132ExtendedBlocksLanded` to `true` in the same commit.
+
+## 9. S2 step 2 record — the land-together commit (2026-08-13)
+
+Step 2 is where the extended path starts driving the machine, so S2+S3+S4+S5
+landed as one commit. Each slice is a *verification* of the extraction more than
+a fresh change — D1's whole point was that the extended caller gets the deferred
+sequence, the SSI check, enum-DDL undo and the `Begin/EndLocalTransaction` hooks
+for free by calling the same function the simple path calls.
+
+**S2 (wiring).** `dispatch_extended.go` replaces the bare command-tag
+short-circuit with `applyTransactionVerb`. The extended caller differs from the
+simple one in one respect D1 anticipated: the simple path *promotes* an
+already-begun transaction, while the extended path reaches the verb before
+beginning anything — so the extended path begins the `TxBegin` transaction
+itself (on the connection's own slot, `beginProcNum = procNum`) and passes
+`autoCommit = ownTx` so the shared deferred-rollback respects the promotion.
+`txnVerbOutcome` renders through the extended protocol's shapes:
+`Warn` → `verbWarnFields` (`NoticeResponse`, 25P01), `*txnVerbError` →
+`extendedQueryErrorFromVerb` (carrying DETAIL/HINT/POSITION and the error's own
+SQLSTATE), `Handled == false` → fall through to the executor (SAVEPOINT/RELEASE/
+ROLLBACK TO, where S10's ruling attaches).
+
+**S3 (in-block reuse).** `inBlock := connTx != nil && connTx.InExplicit()`;
+the begin, the `ownTx` commit at the foot, and the rollback defer all key off
+it, and the in-block statement runs against `connTx.Tx()` (the accessor) plus
+`connTx.Session()` so a second Execute self-sees the first's writes.
+
+**S4 (deferred sequence).** No code change was needed — the extraction was
+faithful, so the deferred FK/UNIQUE/EXCLUDE check and the SSI pre-commit check
+arrive on the extended COMMIT by construction. Pinned by
+`TestM0132S4_ExtendedCommitRunsDeferredFKChecks` (a `DEFERRABLE INITIALLY
+DEFERRED` FK violation raises 23503 at the extended COMMIT and leaves the block
+status `I`) and discharged by the FK isolation specs plus the
+`internal/testport/` deferred-constraint set. The promised
+`0132-0002` design doc was not needed: S4 is a proof obligation on S2, not an
+independent wiring slice, and the proof came out clean.
+
+**S5 (aborted-block semantics).** `failExplicitBlock` (`txn_verb.go`) marks the
+block failed and now fires on **every** extended error path — Execute
+(`handleExecuteFrame`), Parse, Bind and Describe (`runPostStartupLoop`) — where
+the extended loop's only `'Z'` write was the plain `ReadyForQuery()` and the
+`ReadyForQueryAfterError` escape hatch is unavailable. The two SIMPLE-path gaps
+S1 filed are closed in the same commit: a plan-time error now fails the block
+(`dispatch.go`, the cache-miss planning site that had returned straight out of
+the loop), and a constant `SELECT 1` / `SHOW` / `SET` is gated ahead of the
+fast paths (`query.go` simple path, `extended.go` extended path) via
+`allowedInAbortedBlock`/`abortedBlockMessage` — matching PG's reject-everything-
+except-block-ending-verbs rule.
+
+**Gates.** `go build ./...` + `go vet ./internal/server/` clean; `go test
+./internal/server/` PASS (38 s, all 8 bar tests green with the const flipped);
+`go test ./internal/executor/` PASS; `go test -run TestPort_Isolation
+./internal/testport/` PASS (413 s — D-002); the `internal/testport/`
+deferred-constraint set PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=35);
+`make plan-gate` diffed 22/22 against `warm-stats-base.txt` — a **stale-baseline
+confound, not a regression**: that snapshot predates M0127-P6.2's MHJ deletion
+(`4e08d4b7`), so every MHJ node it records now legitimately renders as a plain
+`Hash Join`, and S2 touches no planner code.

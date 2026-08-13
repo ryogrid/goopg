@@ -1690,6 +1690,10 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 		case protocol.MsgParse:
 			em := s.handleParseFrame(extended, f.Payload)
 			if em != nil {
+				// M0132-S5: PostgreSQL aborts an open block from its top-level
+				// error handler, so a Parse/Bind/Describe error inside a block
+				// aborts it just as an Execute error does.
+				failExplicitBlock(connTx)
 				if err := s.writeExtendedMessageError(w, em); err != nil {
 					return
 				}
@@ -1702,6 +1706,7 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 		case protocol.MsgBind:
 			em := s.handleBindFrame(extended, f.Payload)
 			if em != nil {
+				failExplicitBlock(connTx) // M0132-S5, see MsgParse above
 				if err := s.writeExtendedMessageError(w, em); err != nil {
 					return
 				}
@@ -1717,6 +1722,7 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 				return
 			}
 			if em != nil {
+				failExplicitBlock(connTx) // M0132-S5, see MsgParse above
 				if err := s.writeExtendedMessageError(w, em); err != nil {
 					return
 				}
