@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"slices"
 	"testing"
 	"time"
 
@@ -562,5 +563,24 @@ func TestBuildPublicationFilterResolvesCrossDB(t *testing.T) {
 	fDefault := buildPublicationFilter(ps, []string{"p_db2"})
 	if fDefault.Allows(items, wal.ChangeInsert) {
 		t.Errorf("DB-2 publication leaked into the default (DB-1) filter")
+	}
+}
+
+// TestWalsenderCatalogDBOidVar pins the M-NIGHTLY
+// AI-20260815-011722-003 fix (regression of 92d99a25): the walsender's
+// catalog-snapshot and publication-filter dbOid must be the namespace oid
+// (DefaultDBOid for "postgres" — goopg persists postgres-routed
+// tables/publications under DefaultDBOid, not the raw physical PostgresDBOid
+// 5), or PgOutput.Change silently drops every DML. The fixture mimics the live
+// server, where detectCatalogDBOID reads PostgresDBOid (5) back from the
+// physical global/1262 heap and stamps it on the catalog.
+func TestWalsenderCatalogDBOidVar(t *testing.T) {
+	im := catalog.NewInMemory()
+	im.SetDBOID(catalog.PostgresDBOid)
+	if got, want := walsenderCatalogDBOidVar(im, "postgres"), []uint32{catalog.DefaultDBOid}; !slices.Equal(got, want) {
+		t.Fatalf("postgres → %v, want %v", got, want)
+	}
+	if got, want := walsenderCatalogDBOidVar(im, ""), []uint32{catalog.DefaultDBOid}; !slices.Equal(got, want) {
+		t.Fatalf("empty dbName → %v, want %v", got, want)
 	}
 }

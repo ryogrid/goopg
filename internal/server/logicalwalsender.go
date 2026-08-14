@@ -46,19 +46,12 @@ func (s *Server) runLogicalWalsender(ctx context.Context, r *protocol.FrameReade
 	}
 	// M0119-0006 (deferral row 1354 claim 2): every catalog lookup on this
 	// path — the reg* renderer, the slot-creation snapshot scope, and the
-	// publication filter — must resolve against the connection's database, not
-	// the DefaultDBOid fallback (DB 1). Upstream acquires a logical slot only
-	// when the slot's database matches MyDatabaseId (slot.c:1760;
-	// walsender.c:1447-1518), so the conn DB and slot DB are the same in PG.
-	// resolveConnDBOid returns 0 on empty/unknown dbName; a zero keeps the
-	// DefaultDBOid fallback by leaving the variadic slice empty (resolveDBOid
-	// defaults an empty slice to DefaultDBOid, catalog.go:3694-3699) — passing
-	// []uint32{0} would instead select namespace 0 (empty), which is wrong.
-	dbOid := resolveConnDBOid(im, dbName)
-	var dbOidVar []uint32
-	if dbOid != 0 {
-		dbOidVar = []uint32{dbOid}
-	}
+	// publication filter — must resolve against the connection's database.
+	// walsenderCatalogDBOidVar translates the physical oid through
+	// catalog.NamespaceDBOid; empty/unknown dbName resolves to DefaultDBOid
+	// via NamespaceDBOid(0)→1 (the downstream resolveDBOid empty-slice
+	// fallback at catalog.go:3694-3699 is no longer what carries it).
+	dbOidVar := walsenderCatalogDBOidVar(im, dbName)
 	walDir := s.cfg.WALDirPath
 	if walDir == "" {
 		return s.writeStreamingError(w, sqlstate.FeatureNotSupported,
@@ -311,6 +304,22 @@ func (f *publicationFilter) Allows(rel *wal.RelationDef, kind wal.ChangeKind) bo
 		return true
 	}
 	return false
+}
+
+// walsenderCatalogDBOidVar resolves the connection's database name to the
+// namespace dbOid the walsender's catalog lookups (snapshot + publication
+// filter) must key off. M0119-0006 (deferral row 1354 claim 2): every catalog
+// lookup on this path must resolve against the connection's database — upstream
+// acquires a logical slot only when the slot's database matches MyDatabaseId
+// (slot.c:1760; walsender.c:1447-1518). The physical oid resolveConnDBOid
+// returns must be translated through catalog.NamespaceDBOid like every other
+// catalog path: goopg persists "postgres"-routed tables/publications under
+// DefaultDBOid (1), so a raw PostgresDBOid (5) reads an empty namespace and
+// drops every DML (M-NIGHTLY AI-20260815-011722-003, regression of 92d99a25).
+// NamespaceDBOid maps 0 and 5 → 1 and passes genuine CREATE DATABASE oids
+// through unchanged (catalog.go:23539-23544).
+func walsenderCatalogDBOidVar(im *catalog.InMemory, dbName string) []uint32 {
+	return []uint32{catalog.NamespaceDBOid(resolveConnDBOid(im, dbName))}
 }
 
 // buildPublicationFilter materialises the membership rules from

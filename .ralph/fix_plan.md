@@ -1027,26 +1027,31 @@ later testport results to that mid-run build break. AI-002/003/004 are
 genuinely-attributed FAILs (distinct from the unattributable set), so they are
 filed as real until a HEAD re-run (rule §2) says otherwise.
 
-- [ ] **race/internal/initdb (AI-20260815-011722-001)** — race suite failed in
-      `internal/initdb`; new tonight. Repro:
-      `go test -race -timeout 15m ./internal/initdb/`.
-- [ ] **testport/TestPort_IsolationEvalPlanQual — REOPENED (4th time)
-      (AI-20260815-011722-002)** — FAILed again. Prior three closures were each
-      a distinct root cause (stale; TM_SelfModified missing CmdID; TM_SelfModified
-      LOCKED_ONLY arm). Re-run at HEAD first (rule §2) before attributing a 4th
-      cause. Repro:
-      `go test -v -run '^TestPort_IsolationEvalPlanQual$' ./internal/testport/`.
-- [ ] **testport/TestPort_PgoutputInteropGoopgToPG (AI-20260815-011722-003)** —
-      FAILed, new tonight. Repro:
-      `go test -v -run '^TestPort_PgoutputInteropGoopgToPG$' ./internal/testport/`.
-- [ ] **testport/TestPort_PgoutputInteropPGToGoopgBatchDML
-      (AI-20260815-011722-004)** — FAILed, new tonight. Repro:
-      `go test -v -run '^TestPort_PgoutputInteropPGToGoopgBatchDML$' ./internal/testport/`.
-- [ ] **testport/build-broke-mid-stage (AI-20260815-011722-005)** — infra: the
-      goopg build broke DURING the testport stage; 9 tests after the break are
-      UNATTRIBUTABLE. Likely the concurrent Loop #22 WIP (working tree built
-      live). Repro: `go build ./...` at the recorded sha (clean sha ⇒ nothing to
-      fix in code).
+- [ ] **race/internal/initdb (AI-20260815-011722-001)** — race suite FAIL (triage
+      2026-08-15 @HEAD `ecd80d4c`): NOT a `DATA RACE` — package-wide race-run
+      **time-budget exhaustion**; initdb under `-race` exceeds even the nightly's
+      45m budget (`RACE_TIMEOUT=45m` → 2700s timeout). In-flight goroutine was
+      `[runnable]` (progressing inside `pglz.Compress`), steady ~25-30s/test
+      cadence (many server-booting tests). Gate-sizing/infra, not a code bug.
+      Repro: `go test -race -timeout 15m ./internal/initdb/`.
+- [x] **testport/TestPort_IsolationEvalPlanQual — REOPENED (4th time)
+      (AI-20260815-011722-002)** — **stale — already fixed at HEAD** (triage
+      2026-08-15: PASS 27.7s @ `ecd80d4c`).
+- [x] **testport/TestPort_PgoutputInteropGoopgToPG (AI-20260815-011722-003)** —
+      **FIXED (2026-08-15):** commit `92d99a25` threaded the raw physical
+      PostgresDBOid (5) into the walsender snapshot + publication filter; goopg
+      stores `postgres` tables under DefaultDBOid (1), so `PgOutput.Change` dropped
+      all DML. Fix: new `walsenderCatalogDBOidVar` wraps `resolveConnDBOid` in
+      `catalog.NamespaceDBOid` (`internal/server/logicalwalsender.go`). Gates: unit
+      pin FAIL-pre/PASS-post, `TestPort_PgoutputInteropGoopgToPG` PASS (6.9s),
+      `TestPort_PgoutputInteropPGToGoopgBatchDML` PASS (no collateral). Follow-up
+      (deferral ledger row): non-HOT `xlogHeapUpdate` still unclassified → dropped.
+- [x] **testport/TestPort_PgoutputInteropPGToGoopgBatchDML
+      (AI-20260815-011722-004)** — **stale — already fixed at HEAD** (triage
+      2026-08-15: PASS 7.0s @ `ecd80d4c`).
+- [x] **testport/build-broke-mid-stage (AI-20260815-011722-005)** — **stale — build
+      clean at HEAD** (triage 2026-08-15: `go build ./...` exit 0; the nightly
+      mid-run compile error came from concurrent Loop #22 WIP, now gone).
 
 ## M0130 — Cluster-directory compat with PG 18.3 + PG physical replication (filed 2026-08-09)
 
