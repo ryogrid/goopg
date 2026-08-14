@@ -1,86 +1,86 @@
 id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-sql,regress,postgres/src/test/regress/sql/advisory_lock.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/aggregates.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/alter_generic.sql,excluded,no,-,ALTER on generic objects; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/alter_operator.sql,excluded,no,-,ALTER OPERATOR; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/alter_generic.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/alter_operator.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/alter_table.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/amutils.sql,excluded,no,-,Access method utilities; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/amutils.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/arrays.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/async.sql,excluded,no,-,LISTEN/NOTIFY async; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/bit.sql,excluded,no,-,Bit string type; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/bitmapops.sql,excluded,no,-,Bitmap operations; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/async.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/bit.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/bitmapops.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/boolean.sql,pass,yes,-,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
-,regress-sql,regress,postgres/src/test/regress/sql/box.sql,excluded,no,-,Geometric type; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/brin.sql,excluded,no,-,BRIN index; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/brin_bloom.sql,excluded,no,-,BRIN bloom index; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/brin_multi.sql,excluded,no,-,BRIN multi-range index; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/box.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/brin.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/brin_bloom.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/brin_multi.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/btree_index.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/case.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/char.sql,pass,yes,-,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
-,regress-sql,regress,postgres/src/test/regress/sql/circle.sql,excluded,no,-,Geometric type; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/circle.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/cluster.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/collate.icu.utf8.sql,excluded,no,-,ICU collation; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/collate.linux.utf8.sql,excluded,no,-,Linux collation; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/collate.sql,excluded,no,-,Collation; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/collate.utf8.sql,excluded,no,-,UTF-8 collation; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/collate.windows.win1252.sql,excluded,no,-,Windows collation; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/combocid.sql,excluded,no,-,Combo CID; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/collate.icu.utf8.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/collate.linux.utf8.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/collate.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/collate.utf8.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/collate.windows.win1252.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/combocid.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/comments.sql,pass,yes,-,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
-,regress-sql,regress,postgres/src/test/regress/sql/compression.sql,excluded,no,-,Table compression; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/compression.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/constraints.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/conversion.sql,excluded,no,-,Encoding conversion; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/conversion.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/copy.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/copy2.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/copydml.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/copyencoding.sql,excluded,no,-,COPY encoding; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/copyencoding.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/copyselect.sql,pass,yes,-,Passes via TestPort_RegressSuite/copyselect (M0097-0024)
-,regress-sql,regress,postgres/src/test/regress/sql/create_aggregate.sql,excluded,no,-,CREATE AGGREGATE; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/create_am.sql,excluded,no,-,CREATE ACCESS METHOD; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/create_cast.sql,excluded,no,-,CREATE CAST; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/create_function_c.sql,excluded,no,-,C-language functions; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/create_aggregate.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/create_am.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/create_cast.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/create_function_c.sql,excluded,no,-,"C-language functions load a C shared library via the fmgr ABI; impossible without CGo, which goopg avoids by design."
 ,regress-sql,regress,postgres/src/test/regress/sql/create_function_sql.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/create_index.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/create_index_spgist.sql,excluded,no,-,SP-GiST index; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/create_misc.sql,excluded,no,-,CREATE miscellaneous; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/create_operator.sql,excluded,no,-,CREATE OPERATOR; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/create_index_spgist.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/create_misc.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/create_operator.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/create_procedure.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/create_role.sql,excluded,no,-,CREATE ROLE; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/create_schema.sql,excluded,no,-,CREATE SCHEMA; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/create_role.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/create_schema.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/create_table.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/create_table_like.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/create_type.sql,excluded,no,-,CREATE TYPE; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/create_type.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/create_view.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/database.sql,excluded,no,-,DATABASE DDL; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/database.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/date.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/dbsize.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/delete.sql,pass,yes,-,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
-,regress-sql,regress,postgres/src/test/regress/sql/dependency.sql,excluded,no,-,Object dependency tracking; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/dependency.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/domain.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/drop_if_exists.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/drop_operator.sql,excluded,no,-,DROP OPERATOR; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/encoding.sql,excluded,no,-,Server encoding; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/drop_operator.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/encoding.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/enum.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/equivclass.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/errors.sql,pass,yes,-,Passes via TestPort_RegressSuite/errors; 0 diff lines
-,regress-sql,regress,postgres/src/test/regress/sql/euc_kr.sql,excluded,no,-,EUC-KR encoding; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/event_trigger.sql,excluded,no,-,Event triggers; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/event_trigger_login.sql,excluded,no,-,Login event trigger; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/euc_kr.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/event_trigger.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/event_trigger_login.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/explain.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/expressions.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/fast_default.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/float4.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/float8.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/foreign_data.sql,excluded,no,-,Foreign data wrapper; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/foreign_data.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/foreign_key.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/functional_deps.sql,pass,yes,-,Passes via TestPort_RegressSuite/functional_deps (M0097-0036d)
 ,regress-sql,regress,postgres/src/test/regress/sql/generated_stored.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/generated_virtual.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/geometry.sql,excluded,no,-,Geometric type; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/gin.sql,excluded,no,-,GIN index; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/gist.sql,excluded,no,-,GiST index; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/geometry.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/gin.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/gist.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/groupingsets.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/guc.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/hash_func.sql,excluded,no,-,Hash function catalog; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/hash_func.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/hash_index.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/hash_part.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/horology.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
@@ -89,11 +89,11 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-sql,regress,postgres/src/test/regress/sql/index_including.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/index_including_gist.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/indexing.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/indirect_toast.sql,excluded,no,-,Indirect TOAST; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/inet.sql,excluded,no,-,Network address types; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/infinite_recurse.sql,excluded,no,-,Stack-depth exceeded error; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/indirect_toast.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/inet.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/infinite_recurse.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/inherit.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/init_privs.sql,excluded,no,-,Initial privileges; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/init_privs.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/insert.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/insert_conflict.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/int2.sql,pass,yes,-,Recovered 2026-05-24 by M0111-0005: encodeValuePG int2 arm emitted the bare 'smallint out of range' (int2pl arithmetic wording) on storage-encode of an out-of-range string literal; now mirrors int4 sibling and PostgreSQL int2in with the value-N-is-out-of-range-for-type-smallint wording
@@ -103,100 +103,100 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-sql,regress,postgres/src/test/regress/sql/join.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/join_hash.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/json.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/json_encoding.sql,excluded,no,-,JSON encoding; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/json_encoding.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/jsonb.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/jsonb_jsonpath.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/jsonpath.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/jsonpath_encoding.sql,excluded,no,-,JSONPath encoding; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/largeobject.sql,excluded,no,-,Large object; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/jsonpath_encoding.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/largeobject.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/limit.sql,pass,yes,-,PASS via TestPort_RegressSuite — lateral OFFSET outer-ref fix (M0097-0126)
-,regress-sql,regress,postgres/src/test/regress/sql/line.sql,excluded,no,-,Geometric type; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/line.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/lock.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/lseg.sql,excluded,no,-,Geometric type; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/macaddr.sql,excluded,no,-,MAC address type; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/macaddr8.sql,excluded,no,-,MAC address (EUI-64) type; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/maintain_every.sql,excluded,no,-,Background maintenance; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/lseg.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/macaddr.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/macaddr8.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/maintain_every.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/matview.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/md5.sql,pass,yes,-,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
-,regress-sql,regress,postgres/src/test/regress/sql/memoize.sql,excluded,no,-,Memoize node; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/memoize.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/merge.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/misc.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/misc_functions.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/misc_sanity.sql,excluded,no,-,Catalog sanity; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/money.sql,excluded,no,-,Money type; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/misc_sanity.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/money.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/multirangetypes.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/mvcc.sql,failed,no,-,"Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13) [baseline says fail; inventory had pass — possible regression, verify]"
 ,regress-sql,regress,postgres/src/test/regress/sql/name.sql,pass,yes,-,Recovered 2026-05-24 by M0111-0007: encodeValuePG name arm copied the full string into the 64-byte NameData buffer without the NAMEDATALEN-1=63 truncation that storage-encode and PostgreSQL namein() apply; a 64-char input filled all 64 bytes (no NUL terminator) and decoded back as 64 chars; this widened name columns by one and corrupted WHERE row counts; now truncates to 63 before copy
-,regress-sql,regress,postgres/src/test/regress/sql/namespace.sql,excluded,no,-,pg_namespace catalog; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/numa.sql,excluded,no,-,NUMA topology; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/namespace.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/numa.sql,excluded,no,-,NUMA-aware memory placement; not controllable from the Go runtime.
 ,regress-sql,regress,postgres/src/test/regress/sql/numeric.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/numeric_big.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/numerology.sql,pass,yes,-,Recovered 2026-05-24 by M0111-0006: decodePhysicalPGValueMctx returned float4/float8 as KindString so float columns sorted lexicographically (TEMP_FLOAT ORDER BY); now parses the varlena-text payload back to KindNumeric (NaN/Inf string fallback) mirroring the legacy decoders; regression of the M0097-0003 KindNumeric decode lost in the M0111-0002 float-to-text switch
-,regress-sql,regress,postgres/src/test/regress/sql/object_address.sql,excluded,no,-,Object address; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/object_address.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/oid.sql,pass,yes,-,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
-,regress-sql,regress,postgres/src/test/regress/sql/oidjoins.sql,excluded,no,-,OID join sanity; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/opr_sanity.sql,excluded,no,-,Operator sanity; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/oidjoins.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/opr_sanity.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/partition_aggregate.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/partition_info.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/partition_join.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/partition_prune.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/password.sql,excluded,no,-,Password authentication; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/path.sql,excluded,no,-,Geometric type; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/password.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/path.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/pg_lsn.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/plancache.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/plpgsql.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/point.sql,excluded,no,-,Geometric type; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/polygon.sql,excluded,no,-,Geometric type; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/polymorphism.sql,excluded,no,-,Polymorphic functions; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/point.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/polygon.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/polymorphism.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/portals.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/portals_p2.sql,pass,yes,-,Recovered 2026-05-24 by M0111-0004 int8 PG-physical decode fix (count(*) results were silently dropped); back to pass after the M0106-0010 regression
-,regress-sql,regress,postgres/src/test/regress/sql/predicate.sql,excluded,no,-,Predicate locking / serializable; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/predicate.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/prepare.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/prepared_xacts.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/privileges.sql,excluded,no,-,Access privileges; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/psql.sql,excluded,no,-,psql client; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/psql_crosstab.sql,excluded,no,-,psql crosstab; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/psql_pipeline.sql,excluded,no,-,psql pipeline; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/publication.sql,excluded,no,-,Publication; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/privileges.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/psql.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/psql_crosstab.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/psql_pipeline.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/publication.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/random.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/rangefuncs.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/rangetypes.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/regex.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/regproc.sql,excluded,no,-,Procedural catalog; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/regproc.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/reindex_catalog.sql,failed,no,-,"Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13) [baseline says fail; inventory had pass — possible regression, verify]"
-,regress-sql,regress,postgres/src/test/regress/sql/reloptions.sql,excluded,no,-,Table/index reloptions; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/replica_identity.sql,excluded,no,-,Replica identity; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/reloptions.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/replica_identity.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/returning.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/roleattributes.sql,excluded,no,-,Role attributes; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/rowsecurity.sql,excluded,no,-,Row security; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/roleattributes.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/rowsecurity.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/rowtypes.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/rules.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/sanity_check.sql,excluded,no,-,Catalog sanity check; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/security_label.sql,excluded,no,-,Security labels; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/sanity_check.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/security_label.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/select.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/select_distinct.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/select_distinct_on.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/select_having.sql,failed,no,-,"Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13) [baseline says fail; inventory had pass — possible regression, verify]"
 ,regress-sql,regress,postgres/src/test/regress/sql/select_implicit.sql,failed,no,-,"Recovered 2026-05-24 by M0111-0004 int8 PG-physical decode fix (CTAS count(*) GROUP BY results were silently dropped); back to pass after the M0106-0010 regression [baseline says fail; inventory had pass — possible regression, verify]"
 ,regress-sql,regress,postgres/src/test/regress/sql/select_into.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/select_parallel.sql,excluded,no,-,Parallel query; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/select_parallel.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/select_views.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/sequence.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/spgist.sql,excluded,no,-,SP-GiST index; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/sqljson.sql,excluded,no,-,SQL/JSON; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/sqljson_jsontable.sql,excluded,no,-,SQL/JSON JSON_TABLE; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/sqljson_queryfuncs.sql,excluded,no,-,SQL/JSON query functions; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/stats.sql,excluded,no,-,Extended statistics; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/stats_ext.sql,excluded,no,-,Extended statistics expressions; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/stats_import.sql,excluded,no,-,pg_restore statistics; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/spgist.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/sqljson.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/sqljson_jsontable.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/sqljson_queryfuncs.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/stats.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/stats_ext.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/stats_import.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/strings.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/subscription.sql,excluded,no,-,Subscription; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/subscription.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/subselect.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/sysviews.sql,pass,yes,-,Passes via TestPort_RegressSuite/sysviews (M0097-0032)
-,regress-sql,regress,postgres/src/test/regress/sql/tablesample.sql,excluded,no,-,TABLESAMPLE; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/tablespace.sql,excluded,no,-,Tablespace; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/tablesample.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/tablespace.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/temp.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/test_setup.sql,excluded,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+,regress-sql,regress,postgres/src/test/regress/sql/test_setup.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/text.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/tid.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/tidrangescan.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
@@ -208,122 +208,122 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-sql,regress,postgres/src/test/regress/sql/transactions.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/triggers.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/truncate.sql,pass,yes,-,M0097-0023-loop44: transactional TRUNCATE rollback + sequence OWNED BY cascade + partition FK scan + SETOF record OUT param expansion
-,regress-sql,regress,postgres/src/test/regress/sql/tsdicts.sql,excluded,no,-,Full-text search dictionaries; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/tsearch.sql,excluded,no,-,Full-text search; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/tsrf.sql,excluded,no,-,Full-text search returning-functions; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/tstypes.sql,excluded,no,-,Full-text search types; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/tsdicts.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/tsearch.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/tsrf.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/tstypes.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/tuplesort.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/txid.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/type_sanity.sql,excluded,no,-,Type sanity; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/typed_table.sql,excluded,no,-,Typed tables (OF type); out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/unicode.sql,excluded,no,-,Unicode semantics; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/type_sanity.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/typed_table.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/unicode.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/union.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/updatable_views.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/update.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/uuid.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/vacuum.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/vacuum_parallel.sql,excluded,no,-,Parallel VACUUM; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/vacuum_parallel.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/varchar.sql,pass,yes,-,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
 ,regress-sql,regress,postgres/src/test/regress/sql/window.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/with.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/without_overlaps.sql,excluded,no,-,WITHOUT OVERLAPS temporal key; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/write_parallel.sql,excluded,no,-,Parallel write; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/without_overlaps.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/write_parallel.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/xid.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/xml.sql,excluded,no,-,XML type; out of scope for goopg v0.
-,regress-sql,regress,postgres/src/test/regress/sql/xmlmap.sql,excluded,no,-,XML mapping; out of scope for goopg v0.
+,regress-sql,regress,postgres/src/test/regress/sql/xml.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/xmlmap.sql,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/advisory_lock.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/aggregates.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/alter_generic.out,excluded,no,-,ALTER on generic objects; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/alter_operator.out,excluded,no,-,ALTER OPERATOR; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/alter_generic.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/alter_operator.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/alter_table.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/amutils.out,excluded,no,-,Access method utilities; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/amutils.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/arrays.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/async.out,excluded,no,-,LISTEN/NOTIFY async; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/bit.out,excluded,no,-,Bit string type; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/bitmapops.out,excluded,no,-,Bitmap operations; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/async.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/bit.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/bitmapops.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/boolean.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/box.out,excluded,no,-,Geometric type; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/brin.out,excluded,no,-,BRIN index; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/brin_bloom.out,excluded,no,-,BRIN bloom index; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/brin_multi.out,excluded,no,-,BRIN multi-range index; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/box.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/brin.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/brin_bloom.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/brin_multi.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/btree_index.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/case.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/char.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/char_1.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/char_2.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/circle.out,excluded,no,-,Geometric type; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/circle.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/cluster.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/collate.icu.utf8.out,excluded,no,-,ICU collation; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/collate.icu.utf8.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/collate.icu.utf8_1.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/collate.linux.utf8.out,excluded,no,-,Linux collation; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/collate.linux.utf8.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/collate.linux.utf8_1.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/collate.out,excluded,no,-,Collation; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/collate.utf8.out,excluded,no,-,UTF-8 collation; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/collate.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/collate.utf8.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/collate.utf8_1.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/collate.windows.win1252.out,excluded,no,-,Windows collation; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/collate.windows.win1252.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/collate.windows.win1252_1.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/combocid.out,excluded,no,-,Combo CID; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/combocid.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/comments.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/compression.out,excluded,no,-,Table compression; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/compression.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/compression_1.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/constraints.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/conversion.out,excluded,no,-,Encoding conversion; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/conversion.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/copy.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/copy2.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/copydml.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/copyencoding.out,excluded,no,-,COPY encoding; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/copyencoding.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/copyencoding_1.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/copyselect.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/create_aggregate.out,excluded,no,-,CREATE AGGREGATE; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/create_am.out,excluded,no,-,CREATE ACCESS METHOD; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/create_cast.out,excluded,no,-,CREATE CAST; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/create_function_c.out,excluded,no,-,C-language functions; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/create_aggregate.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/create_am.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/create_cast.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/create_function_c.out,excluded,no,-,"C-language functions load a C shared library via the fmgr ABI; impossible without CGo, which goopg avoids by design."
 ,regress-expected,regress,postgres/src/test/regress/expected/create_function_sql.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/create_index.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/create_index_spgist.out,excluded,no,-,SP-GiST index; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/create_misc.out,excluded,no,-,CREATE miscellaneous; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/create_operator.out,excluded,no,-,CREATE OPERATOR; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/create_index_spgist.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/create_misc.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/create_operator.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/create_procedure.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/create_role.out,excluded,no,-,CREATE ROLE; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/create_schema.out,excluded,no,-,CREATE SCHEMA; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/create_role.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/create_schema.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/create_table.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/create_table_like.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/create_type.out,excluded,no,-,CREATE TYPE; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/create_type.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/create_view.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/database.out,excluded,no,-,DATABASE DDL; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/database.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/date.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/dbsize.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/delete.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/dependency.out,excluded,no,-,Object dependency tracking; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/dependency.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/domain.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/drop_if_exists.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/drop_operator.out,excluded,no,-,DROP OPERATOR; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/encoding.out,excluded,no,-,Server encoding; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/drop_operator.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/encoding.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/encoding_1.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/enum.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/equivclass.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/errors.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/euc_kr.out,excluded,no,-,EUC-KR encoding; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/euc_kr.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/euc_kr_1.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/event_trigger.out,excluded,no,-,Event triggers; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/event_trigger_login.out,excluded,no,-,Login event trigger; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/event_trigger.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/event_trigger_login.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/explain.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/expressions.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/fast_default.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/float4-misrounded-input.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/float4.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/float8.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/foreign_data.out,excluded,no,-,Foreign data wrapper; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/foreign_data.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/foreign_key.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/functional_deps.out,pass,yes,-,Passes via TestPort_RegressSuite/functional_deps (M0097-0036d)
 ,regress-expected,regress,postgres/src/test/regress/expected/generated_stored.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/generated_virtual.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/geometry.out,excluded,no,-,Geometric type; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/gin.out,excluded,no,-,GIN index; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/gist.out,excluded,no,-,GiST index; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/geometry.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/gin.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/gist.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/groupingsets.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/guc.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/hash_func.out,excluded,no,-,Hash function catalog; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/hash_func.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/hash_index.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/hash_part.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/horology.out,not-tried,no,-,
@@ -332,12 +332,12 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-expected,regress,postgres/src/test/regress/expected/index_including.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/index_including_gist.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/indexing.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/indirect_toast.out,excluded,no,-,Indirect TOAST; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/inet.out,excluded,no,-,Network address types; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/infinite_recurse.out,excluded,no,-,Stack-depth exceeded error; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/indirect_toast.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/inet.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/infinite_recurse.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/infinite_recurse_1.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/inherit.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/init_privs.out,excluded,no,-,Initial privileges; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/init_privs.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/insert.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/insert_conflict.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/int2.out,not-tried,no,-,
@@ -347,87 +347,87 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-expected,regress,postgres/src/test/regress/expected/join.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/join_hash.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/json.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/json_encoding.out,excluded,no,-,JSON encoding; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/json_encoding.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/json_encoding_1.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/json_encoding_2.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/jsonb.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/jsonb_jsonpath.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/jsonpath.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/jsonpath_encoding.out,excluded,no,-,JSONPath encoding; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/jsonpath_encoding.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/jsonpath_encoding_1.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/jsonpath_encoding_2.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/largeobject.out,excluded,no,-,Large object; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/largeobject.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/largeobject_1.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/limit.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/line.out,excluded,no,-,Geometric type; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/line.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/lock.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/lseg.out,excluded,no,-,Geometric type; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/macaddr.out,excluded,no,-,MAC address type; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/macaddr8.out,excluded,no,-,MAC address (EUI-64) type; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/maintain_every.out,excluded,no,-,Background maintenance; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/lseg.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/macaddr.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/macaddr8.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/maintain_every.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/matview.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/md5.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/md5_1.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/md5_2.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/memoize.out,excluded,no,-,Memoize node; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/memoize.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/merge.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/misc.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/misc_functions.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/misc_sanity.out,excluded,no,-,Catalog sanity; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/money.out,excluded,no,-,Money type; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/misc_sanity.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/money.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/multirangetypes.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/mvcc.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/name.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/namespace.out,excluded,no,-,pg_namespace catalog; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/numa.out,excluded,no,-,NUMA topology; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/namespace.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/numa.out,excluded,no,-,NUMA-aware memory placement; not controllable from the Go runtime.
 ,regress-expected,regress,postgres/src/test/regress/expected/numa_1.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/numeric.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/numeric_big.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/numerology.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/object_address.out,excluded,no,-,Object address; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/object_address.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/oid.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/oidjoins.out,excluded,no,-,OID join sanity; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/opr_sanity.out,excluded,no,-,Operator sanity; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/oidjoins.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/opr_sanity.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/partition_aggregate.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/partition_info.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/partition_join.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/partition_prune.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/password.out,excluded,no,-,Password authentication; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/password.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/password_1.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/password_2.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/path.out,excluded,no,-,Geometric type; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/path.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/pg_lsn.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/plancache.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/plpgsql.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/point.out,excluded,no,-,Geometric type; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/polygon.out,excluded,no,-,Geometric type; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/polymorphism.out,excluded,no,-,Polymorphic functions; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/point.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/polygon.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/polymorphism.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/portals.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/portals_p2.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/predicate.out,excluded,no,-,Predicate locking / serializable; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/predicate.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/prepare.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/prepared_xacts.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/prepared_xacts_1.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/privileges.out,excluded,no,-,Access privileges; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/psql.out,excluded,no,-,psql client; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/psql_crosstab.out,excluded,no,-,psql crosstab; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/psql_pipeline.out,excluded,no,-,psql pipeline; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/publication.out,excluded,no,-,Publication; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/privileges.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/psql.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/psql_crosstab.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/psql_pipeline.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/publication.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/random.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/rangefuncs.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/rangetypes.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/regex.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/regproc.out,excluded,no,-,Procedural catalog; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/regproc.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/reindex_catalog.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/reloptions.out,excluded,no,-,Table/index reloptions; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/replica_identity.out,excluded,no,-,Replica identity; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/reloptions.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/replica_identity.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/returning.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/roleattributes.out,excluded,no,-,Role attributes; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/rowsecurity.out,excluded,no,-,Row security; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/roleattributes.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/rowsecurity.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/rowtypes.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/rules.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/sanity_check.out,excluded,no,-,Catalog sanity check; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/security_label.out,excluded,no,-,Security labels; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/sanity_check.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/security_label.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/select.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/select_distinct.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/select_distinct_on.out,not-tried,no,-,
@@ -438,22 +438,22 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-expected,regress,postgres/src/test/regress/expected/select_implicit_1.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/select_implicit_2.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/select_into.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/select_parallel.out,excluded,no,-,Parallel query; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/select_parallel.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/select_views.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/sequence.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/spgist.out,excluded,no,-,SP-GiST index; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/sqljson.out,excluded,no,-,SQL/JSON; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/sqljson_jsontable.out,excluded,no,-,SQL/JSON JSON_TABLE; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/sqljson_queryfuncs.out,excluded,no,-,SQL/JSON query functions; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/stats.out,excluded,no,-,Extended statistics; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/stats_ext.out,excluded,no,-,Extended statistics expressions; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/stats_import.out,excluded,no,-,pg_restore statistics; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/spgist.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/sqljson.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/sqljson_jsontable.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/sqljson_queryfuncs.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/stats.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/stats_ext.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/stats_import.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/strings.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/subscription.out,excluded,no,-,Subscription; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/subscription.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/subselect.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/sysviews.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/tablesample.out,excluded,no,-,TABLESAMPLE; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/tablespace.out,excluded,no,-,Tablespace; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/tablesample.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/tablespace.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/temp.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/test_setup.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/text.out,not-tried,no,-,
@@ -467,34 +467,34 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-expected,regress,postgres/src/test/regress/expected/transactions.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/triggers.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/truncate.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/tsdicts.out,excluded,no,-,Full-text search dictionaries; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/tsearch.out,excluded,no,-,Full-text search; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/tsrf.out,excluded,no,-,Full-text search returning-functions; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/tstypes.out,excluded,no,-,Full-text search types; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/tsdicts.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/tsearch.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/tsrf.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/tstypes.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/tuplesort.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/txid.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/type_sanity.out,excluded,no,-,Type sanity; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/typed_table.out,excluded,no,-,Typed tables (OF type); out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/unicode.out,excluded,no,-,Unicode semantics; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/type_sanity.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/typed_table.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/unicode.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/unicode_1.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/union.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/updatable_views.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/update.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/uuid.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/vacuum.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/vacuum_parallel.out,excluded,no,-,Parallel VACUUM; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/vacuum_parallel.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/varchar.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/varchar_1.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/varchar_2.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/window.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/with.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/without_overlaps.out,excluded,no,-,WITHOUT OVERLAPS temporal key; out of scope for goopg v0.
-,regress-expected,regress,postgres/src/test/regress/expected/write_parallel.out,excluded,no,-,Parallel write; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/without_overlaps.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/write_parallel.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/xid.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/xml.out,excluded,no,-,XML type; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/xml.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/xml_1.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/xml_2.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/xmlmap.out,excluded,no,-,XML mapping; out of scope for goopg v0.
+,regress-expected,regress,postgres/src/test/regress/expected/xmlmap.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/xmlmap_1.out,not-tried,no,-,
 ,isolation-specs,isolation,postgres/src/test/isolation/specs/aborted-keyrevoke.spec,pass,yes,-,TestPort_IsolationAbortedKeyrevoke PASS (strict) — all permutations byte-for-byte vs PG 18.3. A SAVEPOINT-issued key UPDATE (KEY REVOKE) rolled back via ROLLBACK TO must not leave a phantom conflicting lock; s2 FOR KEY SHARE stays compatible. M0118-0009 design 0118-0014: SAVEPOINT eagerly materialises the top-level XID before AllocateSubXid so the subxid->parent link is non-zero from birth (parent=0 previously made the subxact writes cross-session-visible and defeated the row-lock wait); sub-XID-scoped NEW-tuple xmin + HEAP_KEYS_UPDATED on the single-xid old-tuple xmax stamp; descendant-direction subxact self-visibility in isCurrentTxXID.
 ,isolation-specs,isolation,postgres/src/test/isolation/specs/alter-table-1.spec,pass,yes,-,Promoted to pass-required via runIsoSpecStrict TestPort_IsolationAlterTable1 (internal/testport/isolation_port_test.go); matches PG 18.3 byte-for-byte across all generated permutations. M0118.
@@ -703,10 +703,10 @@ S-026,subscription-tap,tap,postgres/src/test/subscription/t/026_stats.pl,port,ye
 P-001,client-tools-tap,tap,postgres/src/bin/initdb/t/001_initdb.pl,port,yes,-,Ported to go test as TestPort_Initdb001 in internal/testport/tap_port_test.go
 AC-001,client-tools-tap,tap,postgres/src/bin/pg_amcheck/t/001_basic.pl,port,yes,-,Ported as TestPort_PgAmcheck001Basic in internal/testport/pgamcheck_port_test.go (M0110-0003); the pure CLI option-handling tier (program_help_ok/program_version_ok/program_options_handling_ok) — decided by the upstream binary's arg parser before any server connection. Runs the bundled pg_amcheck with LD_LIBRARY_PATH at postgres/local_install/lib (it links PQcancelBlocking which the host libpq may lack). The server-dependent tests are deferred under AC-002.
 AC-002,client-tools-tap,tap,postgres/src/bin/pg_amcheck/t/002_nonesuch.pl,port,yes,-,Ported as TestPort_PgAmcheck002Nonesuch in internal/testport/pgamcheck002_port_test.go (M0110-0003): drives the bundled pg_amcheck against a live goopg cluster with CREATE EXTENSION amcheck and the full faithful command_checks_all assertion set (non-existent database/role rejection; unresolvable and substring/superstring --database pattern errors; per-database amcheck-installed skip warnings; ungrammatical dotted-name rejection). Promotion required closing a sequence of general SQL/engine gaps surfaced empirically by pg_amcheck's bootstrap queries: `index` as a CTE name (parser); VALUES-list-as-CTE column derivation (analyzer); non-existent-database connect rejection 3D000 plus template1/template0 registration; fewer-column CTE alias lists; correlated LATERAL c.oid resolution into a FROM-clause SRF; row-valued IS [NOT] NULL semantics for the database-name pattern filter; non-existent-role connection rejection 28000; and per-database pg_extension scoping so amcheck installed in one database is invisible in another (gap #7c). 002_nonesuch needs no verify_heapam() — it is pattern-resolution only. The port also covers the later sections: the big --no-strict-names multi-pattern case (per-argument-kind warnings — no-heap-tables/no-btree-indexes/no-relations/no-connectable-databases — anchored by the existent postgres.pg_catalog.pg_class so exit stays 0) and the cross-database existent-objects-in-the-wrong-database case (template1/another_db/no_such_database). The port now also covers the final --exclude-schema sections (.pl :377-418): both --all --exclude-schema cases (exit 1 no-relations-to-check) — whose exclude-CTE anti-join previously panicked the backend with a build-side column-index out-of-range in the toast sub-CTE — now run to completion after the LEFT JOIN inner-only pushdown shift/classify completion fix (commit 36a085dc M0110-0003 residual #2: shiftColumnRefsBy + walkColumnRefs now enumerate every sub-expr-bearing Expr kind so the inner IS NULL ref is rebased to the build slot width). The final residual — the datconnlimit=-2 invalid-database filter — is now also ported: catalog.InMemory gained a runtime datconnlimit override (SetDatabaseConnLimit/DatabaseConnLimit) plus a dedicated pg_database Virtual-table UPDATE path (updateOp.nextVirtualPgDatabase — since pg_database has no physical heap for the generic UPDATE machinery to rewrite) so `UPDATE pg_database SET datconnlimit = -2 WHERE datname = ...` persists and pg_amcheck's own datconnlimit != -2 filter excludes the invalid database. 002_nonesuch.pl is now fully ported with no remaining residuals (M-NIGHTLY AI-20260707-000712-004 follow-up).
-,client-tools-tap,tap,postgres/src/bin/pg_amcheck/t/003_check.pl,excluded,no,-,Upstream binary 'pg_amcheck' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_amcheck/t/004_verify_heapam.pl,excluded,no,-,Upstream binary 'pg_amcheck' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_amcheck/t/005_opclass_damage.pl,excluded,no,-,Upstream binary 'pg_amcheck' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_archivecleanup/t/010_pg_archivecleanup.pl,excluded,no,-,Upstream binary 'pg_archivecleanup' is outside goopg's current server-focused scope.
+,client-tools-tap,tap,postgres/src/bin/pg_amcheck/t/003_check.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_amcheck/t/004_verify_heapam.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_amcheck/t/005_opclass_damage.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_archivecleanup/t/010_pg_archivecleanup.pl,not-tried,no,-,
 BB-010,client-tools-tap,tap,postgres/src/bin/pg_basebackup/t/010_pg_basebackup.pl,port,yes,-,Adapted as TestPort_PgBasebackup010 + TestPort_PgBasebackup010BackupExecution + TestPort_PgBasebackup010StreamWAL + TestPort_PgBasebackup010FetchWAL in internal/testport/pgbasebackup_port_test.go; CLI + option-validation sub-cases pass; backup execution (-X none --no-manifest) drives a live cluster end-to-end through BASE_BACKUP and verifies extracted backup_label + global/pg_control + PG_VERSION; -X stream backup drives the START_REPLICATION walsender loop through pg_basebackup's walreceiver and verifies >=1 streamed WAL segment lands in the backup pg_wal/; -X fetch backup (TestPort_PgBasebackup010FetchWAL) sends the BASE_BACKUP WAL option and the server appends the in-range pg_wal segments to the data tar with no walsender and asserts the backup_label START segment is present among the fetched pg_wal/ segments; default-manifest backup (TestPort_PgBasebackup010Manifest) emits a PG-v2 backup_manifest (CRC32C default) and the upstream pg_verifybackup -n oracle accepts the extracted backup; SHA-family manifest checksums (TestPort_PgBasebackup010ManifestChecksums) drive --manifest-checksums=SHA224/SHA256/SHA384/SHA512 and verify each per-file checksum + the SHA-256 Manifest-Checksum by independent recomputation and via pg_verifybackup -n.
 BB-011,client-tools-tap,tap,postgres/src/bin/pg_basebackup/t/011_in_place_tablespace.pl,port,yes,-,Adapted as TestPort_PgBasebackup011InPlaceTablespace in internal/testport/pgbasebackup_port_test.go (M0095-0003); runs the full upstream scenario against a live goopg cluster — SET allow_in_place_tablespaces=on + CREATE TABLESPACE inplace LOCATION '' (via a single psql -c so the GUC carries into the CREATE) then pg_basebackup --format=tar --wal-method=none and asserts base.tar plus exactly one numeric <oid>.tar tablespace archive. Required three pieces all now landed: the allow_in_place_tablespaces GUC; CREATE TABLESPACE ... LOCATION '' DDL creating pg_tblspc/<oid>/PG_<major>_<catversion>; and BASE_BACKUP emitting one <oid>.tar per in-place tablespace plus a tablespace-list row (collectInPlaceTablespaces/emitTablespaceTar/writeTablespaceList in internal/server/basebackup.go).
 BB-020,client-tools-tap,tap,postgres/src/bin/pg_basebackup/t/020_pg_receivewal.pl,port,yes,-,Adapted as TestPort_PgReceivewal020 in internal/testport/pgbasebackup_port_test.go; CLI + option-validation sub-cases pass; slot create -> WAL stream -> drop tier passes against a live goopg cluster (READ_REPLICATION_SLOT added to walsender); compression/synchronous sub-cases remain out of scope.
@@ -714,59 +714,59 @@ BB-030,client-tools-tap,tap,postgres/src/bin/pg_basebackup/t/030_pg_recvlogical.
 BB-040,client-tools-tap,tap,postgres/src/bin/pg_basebackup/t/040_pg_createsubscriber.pl,port,yes,-,Adapted as TestPort_PgCreatesubscriber040 in internal/testport/pgbasebackup_port_test.go; CLI + mandatory-option sub-cases pass; subscriber setup deferred pending streaming + logical replication.
 C-001,client-tools-tap,tap,postgres/src/bin/pg_checksums/t/001_basic.pl,port,yes,-,Ported as TestPort_PgChecksums001Basic in internal/testport/client_tools_port_test.go
 C-002,client-tools-tap,tap,postgres/src/bin/pg_checksums/t/002_actions.pl,port,yes,-,Adapted as TestPort_PgChecksums002Actions in internal/testport/client_tools_port_test.go; option-validation sub-cases pass; checksum enable/disable/check still deferred (goopg writes pg_control via M0095-0001 but page-level checksums are not yet implemented).
-,client-tools-tap,tap,postgres/src/bin/pg_combinebackup/t/001_basic.pl,excluded,no,-,Upstream binary 'pg_combinebackup' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_combinebackup/t/002_compare_backups.pl,excluded,no,-,Upstream binary 'pg_combinebackup' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_combinebackup/t/003_timeline.pl,excluded,no,-,Upstream binary 'pg_combinebackup' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_combinebackup/t/004_manifest.pl,excluded,no,-,Upstream binary 'pg_combinebackup' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_combinebackup/t/005_integrity.pl,excluded,no,-,Upstream binary 'pg_combinebackup' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_combinebackup/t/006_db_file_copy.pl,excluded,no,-,Upstream binary 'pg_combinebackup' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_combinebackup/t/007_wal_level_minimal.pl,excluded,no,-,Upstream binary 'pg_combinebackup' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_combinebackup/t/008_promote.pl,excluded,no,-,Upstream binary 'pg_combinebackup' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_combinebackup/t/009_no_full_file.pl,excluded,no,-,Upstream binary 'pg_combinebackup' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_combinebackup/t/010_hardlink.pl,excluded,no,-,Upstream binary 'pg_combinebackup' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_combinebackup/t/011_ib_truncation.pl,excluded,no,-,Upstream binary 'pg_combinebackup' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_config/t/001_pg_config.pl,excluded,no,-,Upstream binary 'pg_config' is outside goopg's current server-focused scope.
+,client-tools-tap,tap,postgres/src/bin/pg_combinebackup/t/001_basic.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_combinebackup/t/002_compare_backups.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_combinebackup/t/003_timeline.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_combinebackup/t/004_manifest.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_combinebackup/t/005_integrity.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_combinebackup/t/006_db_file_copy.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_combinebackup/t/007_wal_level_minimal.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_combinebackup/t/008_promote.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_combinebackup/t/009_no_full_file.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_combinebackup/t/010_hardlink.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_combinebackup/t/011_ib_truncation.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_config/t/001_pg_config.pl,excluded,no,-,Pure client build-configuration report; no backend interaction and no cluster files.
 CD-001,client-tools-tap,tap,postgres/src/bin/pg_controldata/t/001_pg_controldata.pl,port,yes,-,Adapted as TestPort_PgControldata001 in internal/testport/client_tools_port_test.go; full data-dir check asserts pg_controldata exits 0 with 'checkpoint' output (M0095-0001 wrote global/pg_control); CRC-corruption sub-case deferred (pg_controldata only warns on bad CRC).
 P-002,client-tools-tap,tap,postgres/src/bin/pg_ctl/t/001_start_stop.pl,port,yes,-,Ported to go test as TestPort_PgCtl001StartStop
 P-003,client-tools-tap,tap,postgres/src/bin/pg_ctl/t/002_status.pl,port,yes,-,Ported to go test as TestPort_PgCtl002Status
 P-004,client-tools-tap,tap,postgres/src/bin/pg_ctl/t/003_promote.pl,port,yes,-,Adapted and ported as TestPort_PgCtl003PromoteAdapted
 P-005,client-tools-tap,tap,postgres/src/bin/pg_ctl/t/004_logrotate.pl,port,yes,-,Adapted and ported as TestPort_PgCtl004LogrotateAdapted
 DU-001,client-tools-tap,tap,postgres/src/bin/pg_dump/t/001_basic.pl,port,yes,-,Ported as TestPort_PgDump001Basic in internal/testport/pgdump_port_test.go (M0110-0001); pure CLI option-handling test (help/version/options + invalid-option and disallowed-combination cases for pg_dump/pg_restore/pg_dumpall) — requires no server connection.
-,client-tools-tap,tap,postgres/src/bin/pg_dump/t/002_pg_dump.pl,excluded,no,-,pg_dump utility; out of scope for goopg v0 server-focused testing (E-002).
-,client-tools-tap,tap,postgres/src/bin/pg_dump/t/003_pg_dump_with_server.pl,excluded,no,-,pg_dump utility; out of scope for goopg v0 server-focused testing (E-002).
-,client-tools-tap,tap,postgres/src/bin/pg_dump/t/004_pg_dump_parallel.pl,excluded,no,-,pg_dump utility; out of scope for goopg v0 server-focused testing (E-002).
-,client-tools-tap,tap,postgres/src/bin/pg_dump/t/005_pg_dump_filterfile.pl,excluded,no,-,pg_dump utility; out of scope for goopg v0 server-focused testing (E-002).
-,client-tools-tap,tap,postgres/src/bin/pg_dump/t/010_dump_connstr.pl,excluded,no,-,pg_dump utility; out of scope for goopg v0 server-focused testing (E-002).
+,client-tools-tap,tap,postgres/src/bin/pg_dump/t/002_pg_dump.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_dump/t/003_pg_dump_with_server.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_dump/t/004_pg_dump_parallel.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_dump/t/005_pg_dump_filterfile.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_dump/t/010_dump_connstr.pl,not-tried,no,-,
 RW-001;RW-003,client-tools-tap,tap,postgres/src/bin/pg_resetwal/t/001_basic.pl,port,yes,-,"Ported as TestPort_PgResetwal001Basic in internal/testport/pgresetwal_port_test.go (M0110-0004); the CLI-only tier (program_help_ok/program_version_ok/program_options_handling_ok + too-many-args/no-data-directory/nonexistent-directory + the option-argument validation cases for -c/-e/-l/-m/-o/-O/-u/-x/--wal-segsize/--char-signedness) — all decided in getopt before pg_resetwal opens the data directory so it needs no server. The server-dependent tier (init/start/--force reset + SLRU-derived control-override options) is deferred under RW-002. || Ported as TestPort_PgResetwal001BasicServer in internal/testport/pgresetwal_port_test.go (M0110-0004): the pg_control read/write round-trip half of the server tier — PGDATA 0700/0600 permissions, pg_resetwal -n prints the checkpoint dump, pg_resetwal refuses while the server runs (postmaster.pid lock), pg_resetwal --pgdata succeeds after a CLEAN shutdown WITHOUT --force (enabled by wal.Checkpointer.CheckpointShutdown stamping pg_control State=DB_SHUTDOWNED via Runtime.Close), server SELECT 1 works after the reset, and control overrides are applied + spot-checked. Override coverage (loop #47) is the full upstream l.184-242 set: a supported-override restart tier (--epoch/--next-oid/--multixact-ids/--multixact-offset/--commit-timestamp-ids — goopg round-trips AND restarts) plus a maximal SLRU-derived round-trip that reads the cluster's real pg_commit_ts/pg_multixact/pg_xact segments and derives --commit-timestamp-ids/--multixact-ids/--multixact-offset/--oldest-transaction-id/--next-transaction-id with the upstream block-size multipliers, applied with --epoch/--next-wal-file/--next-oid/--wal-segsize. Only the final restart after the maximal override (advanced --next-transaction-id) and the unclean-shutdown/--force pair remain under RW-002."
 RW-004,client-tools-tap,tap,postgres/src/bin/pg_resetwal/t/002_corrupted.pl,port,yes,-,"Ported as TestPort_PgResetwal002Corrupted in internal/testport/pgresetwal_port_test.go (M0110-0004, loop #48): pg_resetwal handling of a corrupted global/pg_control. Inits a goopg cluster (never started) and corrupts pg_control two ways — (1) all zeroes: pg_resetwal warns ""pg_control exists but is broken or wrong version; ignoring it"", guesses values, and prints the dump under --dry-run (exit 0); (2) the saved 16-byte header restored with the body zeroed: pg_control_version matches PG_CONTROL_VERSION so the CRC-fail code path is taken, warning ""pg_control specifies invalid WAL segment size (0 bytes); proceed with caution"" (exit 0); (3) a plain run refuses on guessed values (""not proceeding because control file values were guessed"", exit 1); (4) --force rewrites the control file (exit 0). Generic pg_resetwal logic; the single goopg dependency is the pg_control header compatibility proven by RW-003. No server started, so independent of the deferred CLOG-startup restart."
-,client-tools-tap,tap,postgres/src/bin/pg_rewind/t/001_basic.pl,excluded,no,-,Upstream binary 'pg_rewind' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_rewind/t/002_databases.pl,excluded,no,-,Upstream binary 'pg_rewind' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_rewind/t/003_extrafiles.pl,excluded,no,-,Upstream binary 'pg_rewind' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_rewind/t/004_pg_xlog_symlink.pl,excluded,no,-,Upstream binary 'pg_rewind' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_rewind/t/005_same_timeline.pl,excluded,no,-,Upstream binary 'pg_rewind' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_rewind/t/006_options.pl,excluded,no,-,Upstream binary 'pg_rewind' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_rewind/t/007_standby_source.pl,excluded,no,-,Upstream binary 'pg_rewind' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_rewind/t/008_min_recovery_point.pl,excluded,no,-,Upstream binary 'pg_rewind' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_rewind/t/009_growing_files.pl,excluded,no,-,Upstream binary 'pg_rewind' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_rewind/t/010_keep_recycled_wals.pl,excluded,no,-,Upstream binary 'pg_rewind' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_test_fsync/t/001_basic.pl,excluded,no,-,Upstream binary 'pg_test_fsync' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_test_timing/t/001_basic.pl,excluded,no,-,Upstream binary 'pg_test_timing' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_upgrade/t/001_basic.pl,excluded,no,-,Upstream binary 'pg_upgrade' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_upgrade/t/002_pg_upgrade.pl,excluded,no,-,Upstream binary 'pg_upgrade' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_upgrade/t/003_logical_slots.pl,excluded,no,-,Upstream binary 'pg_upgrade' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_upgrade/t/004_subscription.pl,excluded,no,-,Upstream binary 'pg_upgrade' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_upgrade/t/005_char_signedness.pl,excluded,no,-,Upstream binary 'pg_upgrade' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_upgrade/t/006_transfer_modes.pl,excluded,no,-,Upstream binary 'pg_upgrade' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_verifybackup/t/001_basic.pl,excluded,no,-,Upstream binary 'pg_verifybackup' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_verifybackup/t/002_algorithm.pl,excluded,no,-,Upstream binary 'pg_verifybackup' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_verifybackup/t/003_corruption.pl,excluded,no,-,Upstream binary 'pg_verifybackup' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_verifybackup/t/004_options.pl,excluded,no,-,Upstream binary 'pg_verifybackup' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_verifybackup/t/005_bad_manifest.pl,excluded,no,-,Upstream binary 'pg_verifybackup' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_verifybackup/t/006_encoding.pl,excluded,no,-,Upstream binary 'pg_verifybackup' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_verifybackup/t/007_wal.pl,excluded,no,-,Upstream binary 'pg_verifybackup' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_verifybackup/t/008_untar.pl,excluded,no,-,Upstream binary 'pg_verifybackup' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_verifybackup/t/009_extract.pl,excluded,no,-,Upstream binary 'pg_verifybackup' is outside goopg's current server-focused scope.
-,client-tools-tap,tap,postgres/src/bin/pg_verifybackup/t/010_client_untar.pl,excluded,no,-,Upstream binary 'pg_verifybackup' is outside goopg's current server-focused scope.
+,client-tools-tap,tap,postgres/src/bin/pg_rewind/t/001_basic.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_rewind/t/002_databases.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_rewind/t/003_extrafiles.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_rewind/t/004_pg_xlog_symlink.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_rewind/t/005_same_timeline.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_rewind/t/006_options.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_rewind/t/007_standby_source.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_rewind/t/008_min_recovery_point.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_rewind/t/009_growing_files.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_rewind/t/010_keep_recycled_wals.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_test_fsync/t/001_basic.pl,excluded,no,-,Pure client filesystem fsync benchmark; no backend interaction and no cluster files.
+,client-tools-tap,tap,postgres/src/bin/pg_test_timing/t/001_basic.pl,excluded,no,-,Pure client timer-overhead benchmark; no backend interaction and no cluster files.
+,client-tools-tap,tap,postgres/src/bin/pg_upgrade/t/001_basic.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_upgrade/t/002_pg_upgrade.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_upgrade/t/003_logical_slots.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_upgrade/t/004_subscription.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_upgrade/t/005_char_signedness.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_upgrade/t/006_transfer_modes.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_verifybackup/t/001_basic.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_verifybackup/t/002_algorithm.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_verifybackup/t/003_corruption.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_verifybackup/t/004_options.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_verifybackup/t/005_bad_manifest.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_verifybackup/t/006_encoding.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_verifybackup/t/007_wal.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_verifybackup/t/008_untar.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_verifybackup/t/009_extract.pl,not-tried,no,-,
+,client-tools-tap,tap,postgres/src/bin/pg_verifybackup/t/010_client_untar.pl,not-tried,no,-,
 WD-001;WD-002,client-tools-tap,tap,postgres/src/bin/pg_waldump/t/001_basic.pl,port,yes,-,Ported as TestPort_PgWaldump001Basic in internal/testport/pgwaldump_port_test.go (M0110-0002); the pure CLI option-handling tier (help/version/options + no-args/too-many-args + invalid --block/--fork/--limit/--relation/--rmgr/--start/--end + --rmgr=list) — needs no server. The server-dependent tier of 001_basic.pl is deferred under WD-002. || Ported as TestPort_PgWaldump001BasicServerTier in internal/testport/pgwaldump_server_tier_test.go (M0119-0005); the server-dependent tier (per-rmgr/per-relation/per-block filtering + --limit/--fullpage/--stats + WAL-range argument handling). Driven against a REDUCED heap/btree workload because goopg implements none of the hash/gin/gist/spgist/brin access methods the full upstream workload exercises; none of the filtering assertions target those rmgrs (the only rmgr-specific assertion is --rmgr Btree). The --fork init assertion is dropped (goopg emits no init-fork block-ref WAL). See docs/design/0119-0005-pg-waldump-server-tier-reduced-workload.md.
 WD-003,client-tools-tap,tap,postgres/src/bin/pg_waldump/t/002_save_fullpage.pl,defer,no,perf-optimize3-dash resume (GOOPG_WAL_CANONICAL=on + perf-optimize3/05-improvement-designs/01 C1),DEFERRED by perf-optimize3-dash S4 (native-only WAL default; canonical emission off): assert-skips unless GOOPG_WAL_CANONICAL=on. Ported as TestPort_PgWaldump002SaveFullpage in internal/testport/pgwaldump_savefullpage_test.go (M0119-0005). Was blocked on two issues (xl_prev 1-based on-disk LSN + HOT updates never emitting a PG-canonical FPI); both fixed. Drives --save-fullpage --relation over a CHECKPOINT+UPDATE workload and asserts the upstream filename format + page-LSN ordering.
 WS-001,client-tools-tap,tap,postgres/src/bin/pg_walsummary/t/001_basic.pl,port,yes,-,Ported as TestPort_PgWalsummary001Basic in internal/testport/client_tools_port_test.go
@@ -833,7 +833,7 @@ D-005l,client-tools-tap,tap,postgres/src/bin/scripts/t/200_connstr.pl,defer,no,M
 ,modules-suites,mixed,postgres/src/test/modules/test_slru,defer,no,M0060-0005,
 ,modules-suites,mixed,postgres/src/test/modules/test_tidstore,defer,no,M0060-0005,
 ,modules-suites,mixed,postgres/src/test/modules/typcache,defer,no,M0060-0005,
-E-001,modules-suites,mixed,postgres/src/test/modules/unsafe_tests,excluded,no,-,Explicit unsafe suite is outside compatibility scope by policy.
+E-001,modules-suites,mixed,postgres/src/test/modules/unsafe_tests,excluded,no,-,Explicitly unsafe test module; excluded by policy.
 ,modules-suites,mixed,postgres/src/test/modules/worker_spi,defer,no,M0060-0005,
 ,modules-suites,mixed,postgres/src/test/modules/xid_wraparound,defer,no,M0060-0005,
 ,contrib-suites,mixed,postgres/contrib/Makefile,defer,no,M0060-0005,
@@ -899,7 +899,7 @@ E-001,modules-suites,mixed,postgres/src/test/modules/unsafe_tests,excluded,no,-,
 ,contrib-suites,mixed,postgres/contrib/uuid-ossp,defer,no,M0060-0005,
 ,contrib-suites,mixed,postgres/contrib/vacuumlo,defer,no,M0060-0005,
 ,contrib-suites,mixed,postgres/contrib/xml2,defer,no,M0060-0005,
-E-002,client-tools-tap,tap,postgres/src/bin/pg_dump/t,excluded,no,-,Directory umbrella for the pg_dump TAP suite. 001_basic.pl ported separately as DU-001; 002-010 stay excluded pending broad catalog-view parity (pg_class/pg_attribute/pg_type/pg_proc/pg_depend/pg_extension) and a dump+restore round-trip against a live goopg server (M0110-0001).
+E-002,client-tools-tap,tap,postgres/src/bin/pg_dump/t,not-tried,no,-,
 W-001,client-tools-tap,tap,postgres/src/bin/pg_waldump,defer,no,wal-native-pg-format content rewrite (docs 01/03),DEFERRED by canonical-removal (docs/design/wal-native-pg-format/04): goopg now emits real PG (xl_rmid/xl_info) headers over still-native record BODIES — so pg_waldump attempts to decode a goopg body as a PG record and errors — structural parity is intentionally broken until the native->PG content rewrite (docs 01/03). TestPort_WALPgWaldumpCompat (internal/testport/wal_pg_waldump_test.go) now unconditionally t.Skip. Frame parity (page headers 0xD118 / xl_prev 0-based) is unchanged.
 WD-004,client-tools-tap,tap,postgres/src/bin/pg_waldump,defer,no,perf-optimize3-dash resume (GOOPG_WAL_CANONICAL=on + perf-optimize3/05-improvement-designs/01 C1),DEFERRED by perf-optimize3-dash S4 (native-only WAL default; canonical emission off): assert-skips unless GOOPG_WAL_CANONICAL=on. Ported as TestPort_PgWaldumpVacuumPruneRoundtrip in internal/testport/pgwaldump_vacuum_prune_test.go (M0119-0005). Closes the live pg_waldump --rmgr=Heap2 round-trip gap left open by the prune/VACUUM canonical-WAL fix: DELETE+VACUUM a table and assert the upstream binary decodes the resulting XLOG_HEAP2_PRUNE_VACUUM_SCAN record for the correct relation locator with no structural error.
 AC-003,client-tools-tap,tap,postgres/src/bin/pg_amcheck/t,defer,no,M0110-0003,Deferred remainder of the pg_amcheck TAP suite: 003_check.pl 004_verify_heapam.pl 005_opclass_damage.pl. These run actual heap/btree corruption checks against a live server and need verify_heapam()/bt_index_check() with real on-disk corruption injection plus operator-class catalog parity (005). 002_nonesuch.pl is promoted under AC-002. PARTIAL: the page-structural heap tier of 004_verify_heapam.pl is now ported as TestPort_PgAmcheck004VerifyHeapam (internal/testport/pgamcheck004_port_test.go) — it inits a live goopg cluster with --no-data-checksums (mirroring upstream no_data_checksums=>1) runs CREATE EXTENSION amcheck inserts rows stops cleanly overwrites the first line pointer length on block 0 of the heap file (the upstream stop->seek/overwrite->restart mechanism) restarts and asserts pg_amcheck exits 2 and reports the upstream-verbatim line-pointer-ends-beyond-maximum-page-offset report. The MVCC/attribute and TOAST tiers of 004 corrupt PG on-disk varatt_external layout which goopg diverges from (chunk-relation TOAST) so they are not faithfully portable. Blocker #2 (bt_index_check schema-qualified dispatch) is now FIXED: pg_amcheck calls the amcheck builtins qualified by the install schema (public.bt_index_check) not pg_catalog; evalFuncCall now strips a user-schema qualifier for the amcheck scalar builtins so a scoped run checks a relation's dependent btree indexes — proven end-to-end by TestPort_PgAmcheckBtreeIndexCheck (a healthy indexed user table checks clean through the real binary) and unit-gated by TestBtIndexCheck_SchemaQualifiedDispatch. The whole-database relation-enumeration + per-relation dispatch tier (003_check.pl clean-db path) is now covered by TestPort_PgAmcheckAllTables (internal/testport/pgamcheck_alltables_port_test.go): a database mixing the goopg-supported relkinds 003_check builds (heap table several btree indexes incl. UNIQUE a sequence a view and a materialized view) checks clean through both a --schema-scoped run AND the unscoped whole-database run (exit 0 empty output). This empirically REFUTES the prior blocker #3 hypothesis (system-catalog heap resolution): the default whole-db run that would reach pg_catalog.* is itself clean because goopg never feeds its system catalogs to pg_amcheck heap-check dispatch — there is no verify_heapam-on-catalog gap to close. The index file-removal corruption tier of 003_check.pl is now ported as TestPort_PgAmcheck003MissingIndexFork (internal/testport/pgamcheck003_missingfork_test.go): it builds a goopg-supported heap+btree fixture stops cleanly removes the index main fork file on disk (the upstream plan_to_remove_relation_file stop->unlink->restart mechanism) restarts and asserts pg_amcheck exits 2 and reports the upstream-verbatim index-lacks-a-main-relation-fork message. goopg now mirrors bt_index_check_callback's smgrexists(MAIN_FORKNUM) guard (verify_nbtree.c:318) via a stat-only Pool.Exists check in evalBtIndexCheck run before NBlocks (whose O_CREATE open would otherwise silently recreate the removed fork as an empty clean index) — unit-gated by TestBtIndexCheck_DetectsMissingRelationFork. The heap-table file-removal corruption tier of 003_check.pl is now ported as TestPort_PgAmcheck003MissingHeapFile (internal/testport/pgamcheck003_missingheap_test.go): it builds a plain goopg heap table stops cleanly removes the heap main fork file on disk (the upstream plan_to_remove_relation_file on an ordinary table stop->unlink->restart mechanism) restarts and asserts pg_amcheck exits 2 and reports the upstream-verbatim could-not-open-file No-such-file-or-directory message. goopg now mirrors verify_heapam opening the relation's main fork (RelationGetNumberOfBlocks -> mdnblocks fails for a removed file) via a stat-only Pool.Exists check in verifyHeapamOp.Open run before NBlocks (whose O_CREATE open would otherwise silently recreate the removed fork as an empty clean heap) building the data-dir-relative relpath through Pool.RelPath and raising 58030 (ERRCODE_IO_ERROR what errcode_for_file_access yields for ENOENT) — unit-gated by TestVerifyHeapam_DetectsMissingRelationFile. The CENTRAL combined-corruption assertion of 003_check.pl (its main check :347-365) is now ported as TestPort_PgAmcheck003CombinedCorruption (internal/testport/pgamcheck003_combined_test.go): it injects THREE distinct corruption classes — a removed btree index fork a removed heap file and an overwritten heap line pointer — across three relations in a SINGLE stop->corrupt->restart cycle (mirroring perform_all_corruptions) then asserts one scoped pg_amcheck run reports ALL THREE upstream-verbatim regexes together (index-lacks-a-main-relation-fork + line-pointer + could-not-open-file) with exit 2 and empty stderr. This is the integration property no isolated surrogate proves: pg_amcheck's per-relation dispatch does not abort on the first corrupt relation (the removed-file case raises 58030) but continues enumerating and reports every distinct corruption class in one invocation. Scoped with one --table per relation in the public schema (its value is the multi-relation single-pass property orthogonal to schema scoping). The genuinely schema-scoped tier of 003_check.pl (upstream builds its fixture in user schemas s1/s2 and scopes runs with --schema) is now ported as TestPort_PgAmcheck003SchemaScoped (internal/testport/pgamcheck003_schemascoped_test.go): it creates s1.t003sc removes its heap main fork across a stop->corrupt->restart cycle and asserts a --schema s1 scoped pg_amcheck run reports the missing file (exit 2) — proving the user schema AND the table reloaded in it both survived the restart with the correct schema association end-to-end through the real binary's schema resolution. This closes the historical public-only workaround: CREATE SCHEMA durability landed via WAL replay (loop #20) and user-schema TABLE durability via the pg_class.relnamespace OID round-trip (loop #21 — namespaceOIDForSchema now stamps the real schema OID and loadUserTablesFromHeap/loadUserIndexesFromHeap reverse-map it via SchemaNameForOID after replaySchemaDDLRecords restores the registry). Remaining 003_check blockers are purely feature/corruption: the hash/gist/gin/brin/spgist index AMs goopg lacks the box/int4range/int4[] column types STORAGE EXTERNAL TOAST corruption multi-database orchestration and the page-overwrite mechanics for those unsupported relkinds. 005_opclass_damage.pl is now FULLY ported as TestPort_PgAmcheck005OpclassDamage (internal/testport/pgamcheck005_opclass_test.go): it builds upstream's fixture verbatim in shape (two user operator classes over int4 each naming its own FUNCTION 1 comparator an ordinary index under one and a UNIQUE index WITH (deduplicate_items = off) under the other over generate_series(1 to 1000)) then runs the real pg_amcheck binary through all four upstream phases against ONE unchanging set of index pages: clean -> repoint int4_fickle_ops FUNCTION 1 at a descending comparator via UPDATE pg_catalog.pg_amproc and assert exit 2 with the upstream-verbatim item order invariant violated for index fickleidx -> repair the amproc row and assert a --checkunique run is clean again -> repoint int4_unique_ops FUNCTION 1 at a comparator declaring 768 and 769 equal and assert exit 2 with index uniqueness is violated for index bttest_unique_idx. No byte on disk is ever corrupted: every verdict is decided by what pg_amproc currently says the operator class comparator is which is the property 005 exists to prove. Engine support is the M0119-0006 operator-class comparator dispatch (executor.btIndexOpClassComparator resolving FUNCTION 1 live via catalog.InMemory.LookupOpClassSupportProcOID and amcheck.VerifyBtreeItemOrderCmp comparing under it) plus the checkunique tier amcheck.VerifyBtreeUnique (upstream bt_entry_unique_check) which pg_amcheck reaches only because goopg reports amcheck extension version 1.4 (pg_amcheck.c:607-631 silently drops --checkunique below that). Runs are scoped with --table public.int4tbl (same whole-db scoping adaptation as the 003/004 ports). Remaining deferred in this row: only the 003_check.pl / 004_verify_heapam.pl tiers named above (unsupported index AMs box/int4range/int4[] column types STORAGE EXTERNAL TOAST corruption and multi-database orchestration).

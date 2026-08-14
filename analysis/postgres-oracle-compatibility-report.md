@@ -1,6 +1,6 @@
 # PostgreSQL Oracle Compatibility Report (M0060)
 
-Generated at: 2026-08-14T18:54:55+09:00
+Generated at: 2026-08-14T19:30:26+09:00
 
 Single authority: `docs/test-port/postgres-oracle-target-inventory.csv`.
 ## Inventory Snapshot
@@ -20,13 +20,13 @@ Single authority: `docs/test-port/postgres-oracle-target-inventory.csv`.
 
 | suite_id | pass | failed | not-tried | excluded | port | defer |
 | -------- | ---: | -----: | --------: | -------: | ---: | ----: |
-| client-tools-tap | 0 | 0 | 0 | 50 | 39 | 5 |
+| client-tools-tap | 0 | 0 | 47 | 3 | 39 | 5 |
 | contrib-suites | 0 | 0 | 0 | 0 | 0 | 63 |
 | isolation-specs | 119 | 1 | 0 | 0 | 0 | 1 |
 | modules-suites | 0 | 0 | 0 | 1 | 0 | 46 |
 | recovery-tap | 0 | 0 | 0 | 0 | 8 | 43 |
-| regress-expected | 1 | 0 | 161 | 103 | 0 | 0 |
-| regress-sql | 41 | 87 | 0 | 104 | 0 | 0 |
+| regress-expected | 1 | 0 | 262 | 2 | 0 | 0 |
+| regress-sql | 41 | 87 | 102 | 2 | 0 | 0 |
 | subscription-tap | 0 | 0 | 0 | 0 | 7 | 33 |
 
 ## Deferred Blockers
