@@ -623,20 +623,25 @@ func (p *parser) rejectStageBModes(pos int) error {
 func (p *parser) parseArgNameAndType(pos int, arg FunctionArg) (FunctionArg, error) {
 	// Distinguish `arg_name TYPE` from `TYPE` (positional only):
 	// Look at the next two non-comma tokens. If we see
-	// `ident <type-start>` where <type-start> is another ident or
-	// keyword, treat the first ident as the name. If we see
+	// `ident <type-start>` where <type-start> is another ident,
+	// quoted ident, or keyword, treat the first ident as the name. If we see
 	// `ident )` or `ident ,` or `ident DEFAULT`, treat ident as
 	// the type with no name.
-	if p.cur().Kind == TokenIdent {
+	if p.cur().Kind == TokenIdent || p.cur().Kind == TokenQuotedIdent {
 		save := p.idx
 		nameTok := p.cur()
 		p.advance()
-		if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+		if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword || p.cur().Kind == TokenQuotedIdent {
 			// Looks like `name type` — but only if the next
 			// token isn't itself a separator.
 			next := p.cur()
-			if next.Kind == TokenIdent || (next.Kind == TokenKeyword && !isSeparatorKeyword(next.Keyword)) {
-				if isMultiWordTypeStart(nameTok.Value, next) {
+			if next.Kind == TokenIdent || next.Kind == TokenQuotedIdent ||
+				(next.Kind == TokenKeyword && !isSeparatorKeyword(next.Keyword)) {
+				// A quoted name can never be a multi-word type leader
+				// (`"char" int` is name="char" type=int, not a multi-word
+				// type), so skip the rewind for TokenQuotedIdent — mirroring
+				// the first.Kind != TokenQuotedIdent idiom at ddl.go:4666.
+				if nameTok.Kind != TokenQuotedIdent && isMultiWordTypeStart(nameTok.Value, next) {
 					// `bit varying` / `double precision` / `timestamp with
 					// time zone` … is ONE type, not `arg_name type`. Rewind
 					// so parseColumnType consumes the whole multi-word
