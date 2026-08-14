@@ -62,6 +62,15 @@ REGRESS_EXP="${REPO_ROOT}/postgres/src/test/regress/expected"
 export PATH="${PG_BIN}:${PATH}"
 export LD_LIBRARY_PATH="${PG_LIB}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
+# Export the same env vars pg_regress does for the C-language helper libs and
+# data files (postgres/src/test/regress/pg_regress.c:734
+# setenv("PG_ABS_SRCDIR", inputdir, 1)). test_setup.sql:6-8 imports them via
+# \getenv and builds \set filename / \set regresslib from them; without these
+# every COPY ... FROM :'filename' fails and the base tables stay empty.
+export PG_ABS_SRCDIR="${REGRESS_SQL%/*}"   # postgres/src/test/regress (holds data/ and regress.so)
+export PG_LIBDIR="${REGRESS_SQL%/*}"
+export PG_DLSUFFIX=".so"
+
 # -------------------------------------------------------------------------- #
 # Defaults
 # -------------------------------------------------------------------------- #
@@ -209,12 +218,21 @@ PSQL=(psql -h 127.0.0.1 -p "${PORT}" -U postgres -d postgres --no-psqlrc -X -a -
 # -------------------------------------------------------------------------- #
 if [[ "$RUN_SETUP" -eq 1 ]]; then
     echo "pg-regress-runner: running test_setup.sql (errors are expected for unimplemented features)..."
-    # Strip \getenv and \set meta-commands (load external variables) which
-    # are specific to pg_regress and not standard psql.
-    SETUP_TMP="$(mktemp /tmp/regress-setup-XXXXXX.sql)"
-    grep -vE '^\s*\\(getenv|set\s|setenv)' "${REGRESS_SQL}/test_setup.sql" > "${SETUP_TMP}" || true
-    "${PSQL[@]}" -f "${SETUP_TMP}" >/dev/null 2>&1 || true
-    rm -f "${SETUP_TMP}"
+    # Run the file un-stripped: \getenv/\set are standard psql meta-commands
+    # (the vars come from PG_ABS_SRCDIR/PG_LIBDIR/PG_DLSUFFIX exported above),
+    # and test_setup.sql has no \setenv. Best-effort: the C-language regresslib
+    # CREATE FUNCTIONs cannot load in goopg, so tolerate their failures.
+    "${PSQL[@]}" -f "${REGRESS_SQL}/test_setup.sql" >/dev/null 2>&1 || true
+    echo "pg-regress-runner: running create_aggregate.sql (user-defined aggregates for aggregates.sql)..."
+    # create_aggregate.sql defines the user-defined aggregates that
+    # aggregates.sql references (newavg/newsum/newcnt/oldcnt/aggfstr/aggfns/
+    # sum2/least_agg/cleast_agg/test_rank/test_percentile_disc). Upstream runs
+    # it as a first-group prerequisite before aggregates
+    # (postgres/src/test/regress/parallel_schedule:51). Best-effort like
+    # test_setup.sql: goopg may not support every CREATE AGGREGATE form, but
+    # the ones it does support must persist so the separate psql -f of
+    # aggregates.sql sees them in the same 'postgres' DB.
+    "${PSQL[@]}" -f "${REGRESS_SQL}/create_aggregate.sql" >/dev/null 2>&1 || true
     echo "pg-regress-runner: setup done."
 fi
 
@@ -261,8 +279,16 @@ run_test() {
     actual_norm="$(mktemp)"
     expected_norm="$(mktemp)"
 
-    # Run the .sql file; capture combined stdout+stderr
-    "${PSQL[@]}" -f "${sql_file}" >"${actual_raw}" 2>&1 || true
+    # Run the .sql file; capture combined stdout+stderr.
+    # Use a stdin redirect (<) rather than -f, mirroring pg_regress
+    # (postgres/src/test/regress/pg_regress_main.c:74-75): with -f, psql sets
+    # pset.inputfile and prepends a "psql:<abs-path>:<line>:" locus prefix to
+    # every server error line (psql command.c setFile / startup.c
+    # log_locus_callback), while a stdin redirect leaves pset.inputfile NULL so
+    # errors come out bare, matching the expected .out files byte-for-byte.
+    # The -a echo-all flag is preserved (it lives in the PSQL array above), so
+    # the echoed SQL still matches the expected output.
+    "${PSQL[@]}" < "${sql_file}" >"${actual_raw}" 2>&1 || true
 
     normalise_output < "${actual_raw}" > "${actual_norm}"
     normalise_output < "${exp_file}"   > "${expected_norm}"

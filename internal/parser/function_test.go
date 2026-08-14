@@ -280,6 +280,82 @@ func TestParseCreateFunctionCharFamilyArgTypes(t *testing.T) {
 	}
 }
 
+// TestParseFunctionQuotedTypeArgs pins acceptance of a quoted-identifier
+// TYPE in a CREATE FUNCTION / CREATE PROCEDURE argument list (M0119-0006,
+// deferral row 1362). PG's func_arg grammar (gram.y:8507-8563) accepts
+// `[argmode] [param_name] func_type` where func_type's TypeName may be a
+// quoted identifier, so `x "char"` names the CHAROID type (OID 18) —
+// distinct from bare `char` (bpchar, OID 1042). The quoted/bare distinction
+// is preserved because parseColumnType skips the implicit length-1 typmod
+// stamp when the type's first token is TokenQuotedIdent (ddl.go:4666): the
+// quoted form carries Args=nil, the bare form Args=[1].
+func TestParseFunctionQuotedTypeArgs(t *testing.T) {
+	cases := []struct {
+		src      string
+		name     string
+		typeName string
+		quoted   bool // quoted type must carry NO implicit typmod (Args nil)
+	}{
+		// (a) named arg + quoted built-in type `x "char"` — OIDChar, not bpchar.
+		{`CREATE FUNCTION g(x "char") RETURNS int LANGUAGE sql AS $$ SELECT 1 $$`, "x", "char", true},
+		// (b) named arg + quoted user type.
+		{`CREATE FUNCTION g(x "MyType") RETURNS int LANGUAGE sql AS $$ SELECT 1 $$`, "x", "MyType", true},
+		// (c) quoted ARGNAME + bare type — the isMultiWordTypeStart rewind is
+		//     skipped for quoted names, so "character" is the name, not a
+		//     multi-word-type leader.
+		{`CREATE FUNCTION g("character" int) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$`, "character", "int", true},
+		// Bare named arg still parses (no regress).
+		{`CREATE FUNCTION g(x int) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$`, "x", "int", false},
+		// Named + multi-word type still parses (no regress).
+		{`CREATE FUNCTION g(x double precision) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$`, "x", "float8", false},
+		// Bare named char pins the implicit length-1 typmod — contrast with
+		// the quoted form above.
+		{`CREATE FUNCTION g(x char) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$`, "x", "char", false},
+		// Sibling path: CREATE PROCEDURE shares parseArgNameAndType.
+		{`CREATE PROCEDURE p(x "char") LANGUAGE sql AS $$ SELECT 1 $$`, "x", "char", true},
+		// (d) mode branches still route quoted types: mode-first + name-mode.
+		{`CREATE FUNCTION g(IN x "char") RETURNS int LANGUAGE sql AS $$ SELECT 1 $$`, "x", "char", true},
+		{`CREATE FUNCTION g(x IN "char") RETURNS int LANGUAGE sql AS $$ SELECT 1 $$`, "x", "char", true},
+		// (d) bare mode forms still parse (guard the widening against breaking
+		//     the mode branches).
+		{`CREATE FUNCTION g(IN x int) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$`, "x", "int", false},
+		{`CREATE FUNCTION g(x IN int) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$`, "x", "int", false},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.src)
+		if err != nil {
+			t.Errorf("parse %q: %v", tc.src, err)
+			continue
+		}
+		var args []FunctionArg
+		switch s := stmts[0].(type) {
+		case *CreateFunctionStmt:
+			args = s.Args
+		case *CreateProcedureStmt:
+			args = s.Args
+		default:
+			t.Errorf("%q: got %T, want CreateFunctionStmt/CreateProcedureStmt", tc.src, stmts[0])
+			continue
+		}
+		if len(args) != 1 {
+			t.Errorf("%q: Args len = %d, want 1", tc.src, len(args))
+			continue
+		}
+		if args[0].Name != tc.name {
+			t.Errorf("%q: arg Name = %q, want %q", tc.src, args[0].Name, tc.name)
+		}
+		if args[0].Type.Name != tc.typeName {
+			t.Errorf("%q: type Name = %q, want %q", tc.src, args[0].Type.Name, tc.typeName)
+		}
+		if tc.quoted && len(args[0].Type.Args) != 0 {
+			t.Errorf("%q: quoted type must not carry an implicit typmod, got Args=%v", tc.src, args[0].Type.Args)
+		}
+		if !tc.quoted && args[0].Type.Name == "char" && len(args[0].Type.Args) != 1 {
+			t.Errorf("%q: bare char wants the implicit length-1 typmod, got Args=%v", tc.src, args[0].Type.Args)
+		}
+	}
+}
+
 // TestParseCreateFunctionRejectsOutInout guards Stage A's scope: OUT / INOUT
 // are not yet supported. VARIADIC is now accepted (M0097-0117).
 func TestParseCreateFunctionAcceptsOutInoutVariadic(t *testing.T) {

@@ -1,46 +1,51 @@
-(83rd slice landed and committed — M0119-0006 continues)
+(row 1355 closed — M0119-0006 continues)
 
-**This loop (2026-08-14):** closed the expression-key btree type-validation gap
-(commit `8210f676`). `CREATE INDEX ON t ((box_col))` / `((int4range_col))`
-silently built a varchar-ordered index before; now `createBTreeIndex`'s
-expression-key branch applies the SAME `isSupportedBTreeKeyType` + enum check as
-the named-column branch, rejecting both with 0A000. Resolves the expr type via
-`planner.ResolveIndexPredicate` + `planner.ExprResultType` (the build path's own
-pair); gates only when both resolve, so float/enum/text expression indexes are
-untouched. Tests: `TestExpressionIndexKeyRejectsBoxAndInt4Range` +
-`TestExpressionIndexKeyStillAllowsFloatEnumText` (mutation-witnessed).
+**This loop (2026-08-14):** closed deferral-ledger row 1355 (regtype schema-gap)
+in two slices. Slice A (`f4d594d3`, 88th) added `NamespaceOID` to the four
+user-type registries (enum/domain/composite/range), populated at CREATE
+TYPE/DOMAIN (CREATE AGGREGATE schema-with-public-fallback pattern) and at
+WAL/startup reload (pg_type typnamespace col 2, previously dropped). Slice B
+(`3a03e18e`, 89th) made `userTypeNameForOID`/`RegtypeName` take a per-schema
+`qualify func(schema) bool` (was fixed bool), added `Catalog.SchemaNameForOID`,
+and made all ten user-type arms render `regOutQualified(schema, name,
+qualify(schema))` with `"[]"`/multirange kept outside quoting; `regOutShared`
+dropped `regtypeQualify`. The `::regtype` cast / `format_type()` / walsender /
+RAISE now render an off-path non-public type as `schema.name` + quoted.
 
-**Reframe discovered (important for the next loop):** the prior "box/int4range
-key encodings" remaining-scope was a MISATTRIBUTION. box has NO btree opclass in
-PG 18.3 (`pg_opclass.dat`: gist/spgist/brin only, no `box_cmp`) — goopg's
-rejection is correct; no box btree encoder should ever be added. int4range IS
-btree-legal in PG (`range_ops` default, binary-coercible-to-anyrange) but goopg
-has NO range value model (no KindRange, no `range_in`, constructor returns NULL),
-so an order-faithful key is blocked on that multi-slice subsystem. The
-"005_opclass_damage's wider fixtures use box/int4range/int4[]" line in ledger rows
-958/960/961/962 is actually 003_check.pl (box=GiST, int4range=SPGiST, int4[]=GIN,
-never btree). `int4[]` was already closed by the array-key-decode row. All recorded
-in a new 2026-08-14 ledger row.
+**Key symbols:** `userTypeNameForOID`/`RegtypeName`/`regOutQualifySchema`
+(expr.go), `regOutShared`/`RegOut`/`RegOutArgVisible`/`RegOutRendererVisible`
+(reg_identifier.go), `Catalog.SchemaNameForOID` + `NamespaceOID` on
+EnumType/Domain/CompositeType/RangeType (catalog.go), reloadUser*FromHeap
+(catalog_heap_reload.go). Tests: `regtype_actual_schema_test.go`,
+`TestCreateTypeDomainRecordsNamespaceOID`.
 
-**Remaining M0119-0006:** only the whole-database (unscoped) pg_amcheck run —
-blocked on unrelated feature work (index AMs hash/gist/gin/spgist/brin, STORAGE
-EXTERNAL TOAST corruption, box/int4range/int4[] column types as HEAP types in
-003_check.pl, multi-DB orchestration). Plus the reg* broad rows (1307, 1340, 1343,
-1344, 1347, 1351, + off-path/dbOid) which are catalog-representation/session-state
-changes, not narrow rendering fixes.
+**Residual (filed):** new ledger row — the SELECT wire / COPY TO / `reg*`→text
+cast / array-element paths still pass a constant `!publicSchemaVisible` predicate
+(dispatch.go:3227, copy.go:90, expr.go:3381 regCastQualify, codec_array.go:335),
+so an off-path non-public type renders BARE there under the default search_path,
+now divergent from the corrected cast path. Row-1339 family; thread a per-schema
+predicate through those four sites.
 
-**Next step:** the narrow M0119-0006 scope is now drained — both remaining items
-are blocked on big feature work. Pick ONE of: (a) investigate the reg* rows for a
-genuinely narrow one (the off-path/dbOid row's resume is
-`internal/server/logicalwalsender.go:69` — thread the slot search_path + dbOid);
-(b) tackle the whole-db amcheck's first blocker (verify_heapam round-tripping
-goopg's system-catalog relkinds — the narrowest sub-block, before index AMs);
-(c) re-read the banner: M0119 is still top priority (M0132/133/131/130 done), M0122
-is below.
+**Remaining M0119-0006 (rough order of narrowness):**
+1. row 1351 — bare-`char` arg OID: arglist carries only arg Name; carry resolved
+   OID per arg (catalog-representation change).
+2. rows 1340/1344 — mixed-case role folding / arg-type case (case-folding family).
+3. whole-db (unscoped) pg_amcheck — blocked on index AMs, STORAGE EXTERNAL
+   TOAST, box/int4range/int4[] HEAP types, multi-DB orchestration.
 
-**Gates run:** executor/planner/btree package tests PASS; pre-commit units suite
-PASS; `scripts/tpch-spotcheck.sh` Q12=2/Q13=35 PASS; pre-commit pgbench smoke PASS
-(0 failed, 3 workloads).
+**Next step:** row 1351 (bare-`char` arg OID) — delegate a `researcher` to scope
+it first: which arglist carriers need the resolved OID, where each is populated,
+and the exact regprocedure-arglist render sites. Banner ranks M0119 first
+(M-NIGHTLY has no open items; the 2 regress/enum+oid nightly items were already
+filed+fixed by an earlier slice this loop).
 
-**NIGHTLY:** nothing new to file (no `## AI-` subjects without an open task; last
-checked this loop via the prior loop's confirmation).
+**Gates run:** go build PASS; executor/server/wal/catalog/plpgsql suites PASS;
+5 targeted regtype tests PASS (uncached); tpch-spotcheck PASS (Q12=2/Q13=35);
+pre-commit units PASS; pre-commit pgbench smoke PASS (hook); full
+TestPort_RegressSuite PASS (47 PASS/185 SKIP/0 FAIL, all 41 must-pass green).
+
+**Delegation:** implementer (slice B) + tester (package gates, long gates,
+regress) + reviewer (adversarial) all DONE. Handoff:
+`tmp/ralph-handoffs/0119-0006-regtype-schema-qualify/`.
+
+**In-flight:** none.

@@ -9,10 +9,13 @@ package executor
 // emits no DEFAULT clauses (upstream's only difference is print_defaults=false).
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 )
 
@@ -268,5 +271,122 @@ func TestPgGetFunctionResultReturnsTableNoArgs(t *testing.T) {
 	}
 	if got, want := result.StringValue(), "TABLE(a integer)"; got != want {
 		t.Errorf("result = %q, want %q", got, want)
+	}
+}
+
+// TestPgGetFunctionArgsQuotedCharRendersQuoted — M0119-0006 (92nd slice, deferral
+// row 1358). canonicalTypeName now threads Routine.ArgTypeOIDs (captured by CREATE
+// FUNCTION) into the pg_get_function_* renderers, so a quoted `"char"` arg
+// (CHAROID 18) renders `"char"` while a bare `char` arg (BPCHAROID 1042) keeps
+// rendering `character`. Mirrors PG's format_type_extended: BPCHAROID → "character"
+// and there is no CHAROID case, so the default quote_qualified_identifier path
+// yields `"char"` (postgres/src/backend/utils/adt/format_type.c:207-220,303-322).
+// Sibling of the landed regprocedureArglist char arm, but with the OID-0 baseline
+// kept as "character" here (canonicalTypeName's historical OID-less render for
+// routineOrAggregateArgs / pre-90th routines). Arg DDL uses the unnamed form
+// (`("char")` / `(char)`) — the same idiom as TestCreateFunctionCapturesCharArgOID,
+// since the CREATE FUNCTION parser does not accept a `name "char"` argument.
+func TestPgGetFunctionArgsQuotedCharRendersQuoted(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	cases := []struct {
+		name     string
+		ddl      string
+		wantOID  uint32
+		wantType string // canonical type name the arg must render as
+		other    string // the mutually-exclusive spelling that must NOT appear
+	}{
+		{"g_qchar", `CREATE FUNCTION g_qchar("char") RETURNS int4 LANGUAGE sql AS $$ SELECT 1 $$`, catalog.OIDChar, `"char"`, "character"},
+		{"g_bpchar", `CREATE FUNCTION g_bpchar(char) RETURNS int4 LANGUAGE sql AS $$ SELECT 1 $$`, catalog.OIDBpChar, "character", `"char"`},
+		// Row 1364: the array forms capture the ARRAY OIDs (1002/1014) and must
+		// render through the same char-arm disambiguation: `"char"[]` keeps its
+		// quotes, bare `char[]` renders `character[]`.
+		{"g_qcarr", `CREATE FUNCTION g_qcarr("char"[]) RETURNS int4 LANGUAGE sql AS $$ SELECT 1 $$`, catalog.OIDArrayChar, `"char"[]`, "character[]"},
+		{"g_bcarr", `CREATE FUNCTION g_bcarr(char[]) RETURNS int4 LANGUAGE sql AS $$ SELECT 1 $$`, catalog.OIDArrayBpChar, "character[]", `"char"[]`},
+	}
+	for _, tc := range cases {
+		if err := runDDL(t, ctx, tc.ddl); err != nil {
+			t.Fatalf("create function %s: %v", tc.name, err)
+		}
+		cands := ctx.Catalog.Routines().LookupByName(parser.ObjectName{Name: tc.name})
+		if len(cands) != 1 {
+			t.Fatalf("expected 1 %s routine, got %d", tc.name, len(cands))
+		}
+		r := cands[0]
+		// Sanity: CREATE FUNCTION captured the intended arg OID (18 vs 1042).
+		if len(r.ArgTypeOIDs) != 1 || r.ArgTypeOIDs[0] != tc.wantOID {
+			t.Errorf("%s: ArgTypeOIDs = %v, want [%d]", tc.name, r.ArgTypeOIDs, tc.wantOID)
+		}
+		for _, builtin := range []string{"pg_get_function_arguments", "pg_get_function_identity_arguments", "pg_get_functiondef"} {
+			rows := runQuery(t, ctx, fmt.Sprintf("SELECT %s(%d)", builtin, r.OID))
+			if len(rows) != 1 {
+				t.Fatalf("%s(%d): rows = %d, want 1", builtin, r.OID, len(rows))
+			}
+			got := rows[0][0].StringValue()
+			if !strings.Contains(got, tc.wantType) {
+				t.Errorf("%s: %s(%d) = %q, want it to contain %q", tc.name, builtin, r.OID, got, tc.wantType)
+			}
+			if strings.Contains(got, tc.other) {
+				t.Errorf("%s: %s(%d) = %q, must not contain %q", tc.name, builtin, r.OID, got, tc.other)
+			}
+		}
+	}
+}
+
+func TestPgGetFunctionResultQuotedCharRendersQuoted(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	cases := []struct {
+		name     string
+		ddl      string
+		wantOID  uint32
+		wantType string // canonical type name the RETURN type must render as
+		other    string // the mutually-exclusive spelling that must NOT appear
+	}{
+		{"g_qchar_ret", `CREATE FUNCTION g_qchar_ret() RETURNS "char" LANGUAGE sql AS $$ SELECT 1 $$`, catalog.OIDChar, `"char"`, "character"},
+		{"g_bpchar_ret", `CREATE FUNCTION g_bpchar_ret() RETURNS char LANGUAGE sql AS $$ SELECT 1 $$`, catalog.OIDBpChar, "character", `"char"`},
+		{"g_int_ret", `CREATE FUNCTION g_int_ret() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$`, 0, "integer", `"char"`},
+		// Row 1364: array RETURN forms capture the ARRAY OIDs (1002/1014) and
+		// pg_get_function_result / pg_get_functiondef must render the canonical
+		// spelling (`"char"[]` vs `character[]`).
+		{"g_qcarr_ret", `CREATE FUNCTION g_qcarr_ret() RETURNS "char"[] LANGUAGE sql AS $$ SELECT 1 $$`, catalog.OIDArrayChar, `"char"[]`, "character[]"},
+		{"g_bcarr_ret", `CREATE FUNCTION g_bcarr_ret() RETURNS char[] LANGUAGE sql AS $$ SELECT 1 $$`, catalog.OIDArrayBpChar, "character[]", `"char"[]`},
+	}
+	for _, tc := range cases {
+		if err := runDDL(t, ctx, tc.ddl); err != nil {
+			t.Fatalf("create function %s: %v", tc.name, err)
+		}
+		cands := ctx.Catalog.Routines().LookupByName(parser.ObjectName{Name: tc.name})
+		if len(cands) != 1 {
+			t.Fatalf("expected 1 %s routine, got %d", tc.name, len(cands))
+		}
+		r := cands[0]
+		// Sanity: CREATE FUNCTION captured the intended return-type OID (18 vs 1042 vs 0).
+		if r.ReturnTypeOID != tc.wantOID {
+			t.Errorf("%s: ReturnTypeOID = %d, want %d", tc.name, r.ReturnTypeOID, tc.wantOID)
+		}
+		// pg_get_function_result returns exactly the rendered return type.
+		rows := runQuery(t, ctx, fmt.Sprintf("SELECT pg_get_function_result(%d)", r.OID))
+		if len(rows) != 1 {
+			t.Fatalf("pg_get_function_result(%d): rows = %d, want 1", r.OID, len(rows))
+		}
+		got := rows[0][0].StringValue()
+		if got != tc.wantType {
+			t.Errorf("%s: pg_get_function_result(%d) = %q, want %q", tc.name, r.OID, got, tc.wantType)
+		}
+		// pg_get_functiondef's RETURNS clause renders the same canonical type.
+		rows = runQuery(t, ctx, fmt.Sprintf("SELECT pg_get_functiondef(%d)", r.OID))
+		if len(rows) != 1 {
+			t.Fatalf("pg_get_functiondef(%d): rows = %d, want 1", r.OID, len(rows))
+		}
+		got = rows[0][0].StringValue()
+		if !strings.Contains(got, tc.wantType) {
+			t.Errorf("%s: pg_get_functiondef(%d) = %q, want it to contain %q", tc.name, r.OID, got, tc.wantType)
+		}
+		if strings.Contains(got, tc.other) {
+			t.Errorf("%s: pg_get_functiondef(%d) = %q, must not contain %q", tc.name, r.OID, got, tc.other)
+		}
 	}
 }

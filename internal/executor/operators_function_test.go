@@ -67,6 +67,40 @@ func TestExecCreateFunctionRegistersInCatalog(t *testing.T) {
 	}
 }
 
+func TestCreateFunctionCapturesArgTypeCase(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if err := runRoutineDDL(t,
+		`CREATE FUNCTION f_captured(offpath."MyType") RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$`,
+		cat); err != nil {
+		t.Fatalf("CREATE FUNCTION: %v", err)
+	}
+	// M0119-0006 (deferral row 1344): a quoted arg type keeps its case at
+	// capture (routineArgTypeName no longer folds ToLower). Signature()
+	// (routines.go) re-lowercases each part, so both the mixed-case and the
+	// lowercase lookups below still resolve — case-insensitive matching is
+	// NOT regressed.
+	r, ok := cat.Routines().Lookup(parser.ObjectName{Name: "f_captured"}, []catalog.Type{{Name: "MyType"}})
+	if !ok {
+		t.Fatalf("Lookup(\"f_captured\"(MyType)) did not find registered routine")
+	}
+	if len(r.ArgTypes) != 1 {
+		t.Fatalf("ArgTypes = %v, want 1 entry", r.ArgTypes)
+	}
+	if r.ArgTypes[0].Name != "MyType" {
+		t.Errorf("ArgTypes[0].Name = %q, want %q (quoted-ident case preserved)", r.ArgTypes[0].Name, "MyType")
+	}
+	if len(r.ArgTypeSchemas) != 1 || r.ArgTypeSchemas[0] != "offpath" {
+		t.Errorf("ArgTypeSchemas[0] = %q, want %q", r.ArgTypeSchemas[0], "offpath")
+	}
+	// Lowercase DROP still resolves the "MyType" routine (Signature() re-folds).
+	if err := runRoutineDDL(t, `DROP FUNCTION f_captured(mytype)`, cat); err != nil {
+		t.Fatalf("DROP FUNCTION f_captured(mytype): %v", err)
+	}
+	if _, ok := cat.Routines().Lookup(parser.ObjectName{Name: "f_captured"}, []catalog.Type{{Name: "MyType"}}); ok {
+		t.Error("Lookup after lowercase DROP must miss")
+	}
+}
+
 // TestExecCreateFunctionDuplicateRejected pins the SQLSTATE 42723
 // path for duplicate-without-OR-REPLACE.
 func TestExecCreateFunctionDuplicateRejected(t *testing.T) {

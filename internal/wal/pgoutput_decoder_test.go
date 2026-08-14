@@ -69,7 +69,7 @@ func TestPgoutputDecoderRoundTripRelationAndInsert(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	snap := BuildCatalogSnapshot(c)
+	snap := BuildCatalogSnapshot(c, nil)
 
 	var buf bytes.Buffer
 	po := NewPgOutput(snap, &buf)
@@ -127,7 +127,7 @@ func TestPgoutputDecoderRoundTripDelete(t *testing.T) {
 	tbl, _ := c.CreateTable(parser.ObjectName{Name: "items"}, []catalog.Column{
 		{Name: "id", Type: catalog.Type{Name: "int4"}, Ordinal: 0},
 	})
-	snap := BuildCatalogSnapshot(c)
+	snap := BuildCatalogSnapshot(c, nil)
 
 	var buf bytes.Buffer
 	po := NewPgOutput(snap, &buf)

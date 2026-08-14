@@ -288,7 +288,7 @@ func subMakePub(t *testing.T, tableName string, cols []catalog.Column) (catalog.
 	if err != nil {
 		t.Fatal(err)
 	}
-	return cat, cat.RelFileNode(tbl), wal.BuildCatalogSnapshot(cat)
+	return cat, cat.RelFileNode(tbl), wal.BuildCatalogSnapshot(cat, nil)
 }
 
 // subDrive applies a batch of changes as one transaction to the apply worker.

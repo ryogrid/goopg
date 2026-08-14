@@ -10,8 +10,8 @@ import (
 // TestUserTypeNameForOIDAllKinds pins userTypeNameForOID (the resolver shared
 // by format_type's built-in-fallback path, the ::regtype cast, and
 // RegtypeName, see expr.go) across all four user-type kinds plus their
-// auto-generated array/multirange forms, in both its qualify=true and
-// qualify=false forms. Before this helper existed, ::regtype only ever
+// auto-generated array/multirange forms, in both its always-qualify and
+// never-qualify predicate forms. Before this helper existed, ::regtype only ever
 // consulted oidToBuiltinTypeName and rendered the bare numeric OID for any
 // dynamically-allocated user-type OID (discovered live for a range-typed
 // table column: `atttypid::regtype` printed "16422" instead of "myrange"
@@ -21,7 +21,8 @@ import (
 // follow-up) closes a later-discovered gap: userTypeNameForOID used to
 // unconditionally prefix "public." regardless of whether "public" was
 // actually visible on the effective search_path, diverging from real
-// PostgreSQL's regtypeout/format_type.
+// PostgreSQL's regtypeout/format_type. The qualify-predicate form
+// (M0119-0006 slice B) renders a type's ACTUAL schema via its NamespaceOID.
 func TestUserTypeNameForOIDAllKinds(t *testing.T) {
 	cat := catalog.NewInMemory()
 
@@ -60,14 +61,14 @@ func TestUserTypeNameForOIDAllKinds(t *testing.T) {
 		{"unknown oid", 999999, "", false},
 	}
 	for _, tc := range cases {
-		got, ok := userTypeNameForOID(cat, tc.oid, true)
+		got, ok := userTypeNameForOID(cat, tc.oid, func(s string) bool { return true })
 		if ok != tc.wantOK || got != tc.want {
-			t.Errorf("%s: userTypeNameForOID(%d, qualify=true) = (%q, %v), want (%q, %v)", tc.name, tc.oid, got, ok, tc.want, tc.wantOK)
+			t.Errorf("%s: userTypeNameForOID(%d, qualify=always) = (%q, %v), want (%q, %v)", tc.name, tc.oid, got, ok, tc.want, tc.wantOK)
 		}
 		wantUnqualified := strings.TrimPrefix(tc.want, "public.")
-		got, ok = userTypeNameForOID(cat, tc.oid, false)
+		got, ok = userTypeNameForOID(cat, tc.oid, func(s string) bool { return false })
 		if ok != tc.wantOK || got != wantUnqualified {
-			t.Errorf("%s: userTypeNameForOID(%d, qualify=false) = (%q, %v), want (%q, %v)", tc.name, tc.oid, got, ok, wantUnqualified, tc.wantOK)
+			t.Errorf("%s: userTypeNameForOID(%d, qualify=never) = (%q, %v), want (%q, %v)", tc.name, tc.oid, got, ok, wantUnqualified, tc.wantOK)
 		}
 	}
 }

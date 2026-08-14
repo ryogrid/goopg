@@ -1966,6 +1966,12 @@ type Catalog interface {
 	// syncTableToCatalogHeap to stamp a user table's pg_class.relnamespace with
 	// the real schema OID so the schema survives a restart (M0110-0003).
 	SchemaOID(name string) uint32
+	// SchemaNameForOID returns the registered schema name for the given namespace
+	// OID ("" if no schema carries that OID). It is the reverse of SchemaOID and
+	// is needed by the regtype/regcollation renderers to resolve a user type's /
+	// collation's ACTUAL schema from its NamespaceOID (deferral row 1355,
+	// M0119-0006 slice B). *InMemory is the sole implementer.
+	SchemaNameForOID(oid uint32) string
 	// RegisterSchema records a user-created schema. M0097-drop_if_exists.
 	RegisterSchema(name string)
 	// UnregisterSchema removes a schema from the registry. M0097-drop_if_exists.
@@ -3027,6 +3033,10 @@ type EnumType struct {
 	// a same-named enum without colliding. Mirrors Domain.DBOid. M0122-0007
 	// 4e follow-up.
 	DBOid uint32
+	// NamespaceOID is the pg_type typnamespace (schema OID) this enum was
+	// created in, mirroring UserCollation.NamespaceOID. M0119-0006 (deferral
+	// ledger row 1355).
+	NamespaceOID uint32
 }
 
 // OwnerOrDefault returns et.Owner, falling back to the bootstrap superuser OID
@@ -3083,6 +3093,10 @@ type Domain struct {
 	// deferral ledger row). M0122-0007 4e follow-up (DU-002 round-trip probe
 	// unblock).
 	DBOid uint32
+	// NamespaceOID is the pg_type typnamespace (schema OID) this domain was
+	// created in, mirroring UserCollation.NamespaceOID. M0119-0006 (deferral
+	// ledger row 1355).
+	NamespaceOID uint32
 }
 
 // OwnerOrDefault returns d.Owner, falling back to the bootstrap superuser OID
@@ -3181,6 +3195,10 @@ type CompositeType struct {
 	// same-named composite type without colliding. Mirrors EnumType.DBOid/
 	// Domain.DBOid. M0122-0007 4e follow-up.
 	DBOid uint32
+	// NamespaceOID is the pg_type typnamespace (schema OID) this composite
+	// type was created in, mirroring UserCollation.NamespaceOID. M0119-0006
+	// (deferral ledger row 1355).
+	NamespaceOID uint32
 }
 
 // OwnerOrDefault returns ct.Owner, falling back to the bootstrap superuser OID
@@ -3223,6 +3241,10 @@ type RangeType struct {
 	// EnumType.DBOid / CompositeType.DBOid / Domain.DBOid. M0122-0007 4e
 	// follow-up.
 	DBOid uint32
+	// NamespaceOID is the pg_type typnamespace (schema OID) this range type
+	// was created in, mirroring UserCollation.NamespaceOID. M0119-0006
+	// (deferral ledger row 1355).
+	NamespaceOID uint32
 }
 
 // OwnerOrDefault returns rt.Owner, falling back to the bootstrap superuser OID
@@ -19884,10 +19906,14 @@ func RegprocedureNameAndSchema(oid uint32, routines *Routines) (schema, sig stri
 // The per-arg schema-qualify decision is the renderers' job: it is
 // session-dependent (format_type_be's TypeIsVisible against the current
 // search_path, deferral row 1342), so this struct carries the resolved
-// (name, schema) pair and leaves visibility to the caller.
+// (name, schema) pair and leaves visibility to the caller. OID is the resolved
+// pg_type OID, NON-ZERO only for the one ambiguous `char` spelling (bare
+// → OIDBpChar 1042, quoted → OIDChar 18 — deferral row 1351); 0 for every
+// other arg, whose name-based ArgTypeDisplayAlias is already faithful.
 type RegprocArg struct {
 	Name   string
 	Schema string
+	OID    uint32
 }
 
 // RegprocedureNameParts resolves a pg_proc OID to the (schema, NAME, ARGTYPES)
@@ -19923,7 +19949,11 @@ func RegprocedureNameParts(oid uint32, routines *Routines) (schema, name string,
 				if i < len(r.ArgTypeSchemas) {
 					sch = r.ArgTypeSchemas[i]
 				}
-				args = append(args, RegprocArg{Name: t.Name, Schema: sch})
+				oid := uint32(0)
+				if i < len(r.ArgTypeOIDs) {
+					oid = r.ArgTypeOIDs[i]
+				}
+				args = append(args, RegprocArg{Name: t.Name, Schema: sch, OID: oid})
 			}
 			schema := r.Schema
 			if schema == "" {
@@ -19946,7 +19976,7 @@ func RegprocedureNameParts(oid uint32, routines *Routines) (schema, name string,
 func formatProcedureArglist(argTypes []RegprocArg) string {
 	args := make([]string, len(argTypes))
 	for i, a := range argTypes {
-		args[i] = argListTypeDisplay(a.Name)
+		args[i] = argListTypeDisplay(a.Name, a.OID)
 	}
 	return strings.Join(args, ",")
 }
@@ -19956,11 +19986,28 @@ func formatProcedureArglist(argTypes []RegprocArg) string {
 // ELEMENT through ArgTypeDisplayAlias (so `int[]` → `integer[]`, `char[]` →
 // `"char"[]`), and re-append the suffix. Mirrors executor splitArraySuffix —
 // the two sibling renderers must agree (Hard-won Rule #2, deferral row 1345).
-func argListTypeDisplay(name string) string {
-	if strings.HasSuffix(name, "[]") {
-		return ArgTypeDisplayAlias(name[:len(name)-2]) + "[]"
+// oid disambiguates the `char` arm (deferral row 1351): a bare `char` carried
+// OIDBpChar renders `character` (format_type_be's BPCHAROID switch case), while
+// OIDChar 18 or 0 (builtin / pre-change routine) falls through to
+// ArgTypeDisplayAlias's `"char"` — exactly upstream quote_qualified_identifier.
+func argListTypeDisplay(name string, oid uint32) string {
+	base := name
+	isArray := strings.HasSuffix(name, "[]")
+	if isArray {
+		base = name[:len(name)-2]
 	}
-	return ArgTypeDisplayAlias(name)
+	// Row 1364: the CREATE-time capture stores the ARRAY OIDs for char arrays
+	// (char[] → OIDArrayBpChar 1014, "char"[] → OIDArrayChar 1002), so the
+	// bare-char arm accepts both the scalar and array bpchar OIDs — keeping
+	// `char[]` rendering `character[]` while OIDArrayChar falls through to
+	// ArgTypeDisplayAlias's `"char"` + "[]" (`"char"[]`).
+	if base == "char" && (oid == OIDBpChar || oid == OIDArrayBpChar) { // bare char → bpchar
+		base = "character"
+	}
+	if isArray {
+		return ArgTypeDisplayAlias(base) + "[]"
+	}
+	return ArgTypeDisplayAlias(base)
 }
 
 // RegoperatorName resolves an operator OID to PG's "opr_name(lefttype,

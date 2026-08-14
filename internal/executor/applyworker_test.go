@@ -28,7 +28,7 @@ func TestApplyWorkerInsertsRowFromPgoutputStream(t *testing.T) {
 	// Publisher: encode B → R → I → C through the existing
 	// PgOutput plugin against a snapshot of the publisher's
 	// schema.
-	snap := wal.BuildCatalogSnapshot(pubCat.(*catalog.InMemory))
+	snap := wal.BuildCatalogSnapshot(pubCat.(*catalog.InMemory), nil)
 	var buf bytes.Buffer
 	po := wal.NewPgOutput(snap, &buf)
 	if err := po.Begin(42, 0xCAFE); err != nil {
@@ -135,7 +135,7 @@ func TestApplyWorkerAppliesInsertUnderDistinctSubscriptionDBOid(t *testing.T) {
 	defer pubCleanup()
 	pubTbl, _ := pubCat.LookupTable(parser.ObjectName{Name: "items"})
 
-	snap := wal.BuildCatalogSnapshot(pubCat.(*catalog.InMemory))
+	snap := wal.BuildCatalogSnapshot(pubCat.(*catalog.InMemory), nil)
 	var buf bytes.Buffer
 	po := wal.NewPgOutput(snap, &buf)
 	if err := po.Begin(42, 0xCAFE); err != nil {
@@ -1023,7 +1023,7 @@ func TestApplyWorkerSkipsChangesForRelInTablesync(t *testing.T) {
 	_, pubCat, pubCleanup := newStorageFixture(t)
 	defer pubCleanup()
 	pubTbl, _ := pubCat.LookupTable(parser.ObjectName{Name: "items"})
-	snap := wal.BuildCatalogSnapshot(pubCat.(*catalog.InMemory))
+	snap := wal.BuildCatalogSnapshot(pubCat.(*catalog.InMemory), nil)
 	rel := pubCat.RelFileNode(pubTbl)
 
 	subCtx, subCat, subCleanup := newStorageFixture(t)
@@ -1094,7 +1094,7 @@ func TestApplyWorkerPromotesSyncDoneToReadyOnCommit(t *testing.T) {
 	_, pubCat, pubCleanup := newStorageFixture(t)
 	defer pubCleanup()
 	pubTbl, _ := pubCat.LookupTable(parser.ObjectName{Name: "items"})
-	snap := wal.BuildCatalogSnapshot(pubCat.(*catalog.InMemory))
+	snap := wal.BuildCatalogSnapshot(pubCat.(*catalog.InMemory), nil)
 	rel := pubCat.RelFileNode(pubTbl)
 
 	subCtx, subCat, subCleanup := newStorageFixture(t)
@@ -1176,7 +1176,7 @@ func TestApplyWorkerLogsCommitAndPromotion(t *testing.T) {
 	_, pubCat, pubCleanup := newStorageFixture(t)
 	defer pubCleanup()
 	pubTbl, _ := pubCat.LookupTable(parser.ObjectName{Name: "items"})
-	snap := wal.BuildCatalogSnapshot(pubCat.(*catalog.InMemory))
+	snap := wal.BuildCatalogSnapshot(pubCat.(*catalog.InMemory), nil)
 	rel := pubCat.RelFileNode(pubTbl)
 
 	subCtx, subCat, subCleanup := newStorageFixture(t)
@@ -1241,7 +1241,7 @@ func TestApplyWorkerStatHandleAdvancesOnCommit(t *testing.T) {
 	_, pubCat, pubCleanup := newStorageFixture(t)
 	defer pubCleanup()
 	pubTbl, _ := pubCat.LookupTable(parser.ObjectName{Name: "items"})
-	snap := wal.BuildCatalogSnapshot(pubCat.(*catalog.InMemory))
+	snap := wal.BuildCatalogSnapshot(pubCat.(*catalog.InMemory), nil)
 	rel := pubCat.RelFileNode(pubTbl)
 
 	subCtx, subCat, subCleanup := newStorageFixture(t)
@@ -1288,7 +1288,7 @@ func TestApplyWorkerCommitWithoutPromotionLeavesUncrossedRelAtS(t *testing.T) {
 	_, pubCat, pubCleanup := newStorageFixture(t)
 	defer pubCleanup()
 	pubTbl, _ := pubCat.LookupTable(parser.ObjectName{Name: "items"})
-	snap := wal.BuildCatalogSnapshot(pubCat.(*catalog.InMemory))
+	snap := wal.BuildCatalogSnapshot(pubCat.(*catalog.InMemory), nil)
 	rel := pubCat.RelFileNode(pubTbl)
 
 	subCtx, subCat, subCleanup := newStorageFixture(t)

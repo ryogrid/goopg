@@ -143,7 +143,23 @@ func buildPGProcRow(cat catalog.Catalog, r *catalog.Routine) Row {
 	}
 	argOIDs := make([]uint32, len(r.ArgTypes))
 	for i, t := range r.ArgTypes {
-		argOIDs[i] = catalog.TypeNameToOID(t.Name)
+		// Deferral row 1351: prefer the CREATE-time resolved OID for a `char`
+		// arg (ArgTypeOIDs is char-only non-zero), so a quoted `"char"` writes
+		// CHAROID(18) into proargtypes instead of TypeNameToOID's unconditional
+		// BPCHAROID(1042). The i<len guard is OOB-safe for pre-change routines.
+		if i < len(r.ArgTypeOIDs) && r.ArgTypeOIDs[i] != 0 {
+			argOIDs[i] = r.ArgTypeOIDs[i]
+		} else {
+			argOIDs[i] = catalog.TypeNameToOID(t.Name)
+		}
+	}
+	// Deferral row 1361: prefer the CREATE-time resolved RETURN-type OID
+	// (ReturnTypeOID is char-only non-zero), so a `RETURNS "char"` writes
+	// CHAROID(18) into prorettype instead of TypeNameToOID's unconditional
+	// BPCHAROID(1042) — sibling of the proargtypes handling above.
+	retTypeOID := catalog.TypeNameToOID(r.ReturnType.Name)
+	if r.ReturnTypeOID != 0 {
+		retTypeOID = r.ReturnTypeOID
 	}
 	nargDefaults := 0
 	for _, d := range r.ArgDefaults {
@@ -175,26 +191,26 @@ func buildPGProcRow(cat catalog.Catalog, r *catalog.Routine) Row {
 		proconfig = NewBytesDatum(pgTextArrayBytes(r.Config))
 	}
 	return Row{
-		NewIntDatum(int64(r.OID)),                                    // 1  oid
-		NewStringDatum(r.Name),                                       // 2  proname
-		NewIntDatum(int64(namespaceOIDForSchema(cat, r.Schema))),     // 3  pronamespace
-		NewIntDatum(int64(r.OwnerOrDefault())),                       // 4  proowner
-		NewIntDatum(pgProcLangOID(r.Language)),                       // 5  prolang
-		NewIntDatum(cost),                                            // 6  procost
-		NewIntDatum(rows),                                            // 7  prorows
-		NewIntDatum(0),                                               // 8  provariadic
-		NewIntDatum(0),                                               // 9  prosupport
-		NewStringDatum(kind),                                         // 10 prokind
-		NewBoolDatum(r.SecurityDefiner),                              // 11 prosecdef
-		NewBoolDatum(r.Leakproof),                                    // 12 proleakproof
-		NewBoolDatum(r.Strict),                                       // 13 proisstrict
-		NewBoolDatum(r.ReturnsSet),                                   // 14 proretset
-		NewStringDatum(vol),                                          // 15 provolatile
-		NewStringDatum(par),                                          // 16 proparallel
-		NewIntDatum(int64(len(r.ArgTypes))),                          // 17 pronargs
-		NewIntDatum(int64(nargDefaults)),                             // 18 pronargdefaults
-		NewIntDatum(int64(catalog.TypeNameToOID(r.ReturnType.Name))), // 19 prorettype
-		NewBytesDatum(pgProcOidVectorBytes(argOIDs)),                 // 20 proargtypes
+		NewIntDatum(int64(r.OID)),                                // 1  oid
+		NewStringDatum(r.Name),                                   // 2  proname
+		NewIntDatum(int64(namespaceOIDForSchema(cat, r.Schema))), // 3  pronamespace
+		NewIntDatum(int64(r.OwnerOrDefault())),                   // 4  proowner
+		NewIntDatum(pgProcLangOID(r.Language)),                   // 5  prolang
+		NewIntDatum(cost),                                        // 6  procost
+		NewIntDatum(rows),                                        // 7  prorows
+		NewIntDatum(0),                                           // 8  provariadic
+		NewIntDatum(0),                                           // 9  prosupport
+		NewStringDatum(kind),                                     // 10 prokind
+		NewBoolDatum(r.SecurityDefiner),                          // 11 prosecdef
+		NewBoolDatum(r.Leakproof),                                // 12 proleakproof
+		NewBoolDatum(r.Strict),                                   // 13 proisstrict
+		NewBoolDatum(r.ReturnsSet),                               // 14 proretset
+		NewStringDatum(vol),                                      // 15 provolatile
+		NewStringDatum(par),                                      // 16 proparallel
+		NewIntDatum(int64(len(r.ArgTypes))),                      // 17 pronargs
+		NewIntDatum(int64(nargDefaults)),                         // 18 pronargdefaults
+		NewIntDatum(int64(retTypeOID)),                           // 19 prorettype
+		NewBytesDatum(pgProcOidVectorBytes(argOIDs)),             // 20 proargtypes
 		NullDatum,              // 21 proallargtypes (OUT-arg metadata: follow-up)
 		NullDatum,              // 22 proargmodes (follow-up with 21)
 		argNames,               // 23 proargnames
@@ -308,7 +324,14 @@ func insertPgProcIndexEntries(ctx *Context, r *catalog.Routine, tid storage.Item
 	}
 	argOIDs := make([]uint32, len(r.ArgTypes))
 	for i, t := range r.ArgTypes {
-		argOIDs[i] = catalog.TypeNameToOID(t.Name)
+		// Sibling of buildPGProcRow's argOIDs (deferral row 1351): prefer the
+		// stored char OID so the (proname, proargtypes, pronamespace) index key
+		// matches the heap row's proargtypes (quoted `"char"` → 18, not 1042).
+		if i < len(r.ArgTypeOIDs) && r.ArgTypeOIDs[i] != 0 {
+			argOIDs[i] = r.ArgTypeOIDs[i]
+		} else {
+			argOIDs[i] = catalog.TypeNameToOID(t.Name)
+		}
 	}
 	nsp := namespaceOIDForSchema(ctx.Catalog, r.Schema)
 	if err := insertPgProcPronameArgsNspIndexEntry(ctx, r.Name, argOIDs, nsp, tid); err != nil {

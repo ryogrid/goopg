@@ -1733,6 +1733,58 @@ func TypeNameToOID(typName string) uint32 {
 		return OIDName
 	case "aclitem":
 		return OIDAclitem
+	// Array types — ported VERBATIM from initdb/pg_proc_view.go:typeNameToOIDStr
+	// (the initdb view builder is the reference table for baked `[]` names; it
+	// was already array-correct). Each spelling maps to the canonical _typename
+	// array OID, matching the pg_type.typarray column. Deferral row 1364: before
+	// this block a `RETURNS int4[]` or `int4[]` arg name fell through to the
+	// OIDText(25) default, writing the ELEMENT-text OID into proargtypes/
+	// prorettype where PG writes the ARRAY OID. The char spellings mirror
+	// typeNameToOIDStr exactly: BOTH `char[]` and `"char"[]` → _char (1002) — the
+	// scalar `"char"`/`character`→1042 arm above must not leak a 1014 out of the
+	// array path.
+	case "bool[]", "boolean[]":
+		return OIDArrayBool
+	case "bytea[]":
+		return OIDArrayBytea
+	case "char[]", "\"char\"[]":
+		return OIDArrayChar
+	case "name[]":
+		return OIDArrayName
+	case "int8[]", "bigint[]":
+		return OIDArrayInt8
+	case "int2[]", "smallint[]":
+		return OIDArrayInt2
+	case "int4[]", "int[]", "integer[]":
+		return OIDArrayInt4
+	case "text[]":
+		return OIDArrayText
+	case "oid[]":
+		return OIDArrayOID
+	case "float4[]", "real[]":
+		return OIDArrayFloat4
+	case "float8[]", "float[]", "double precision[]":
+		return OIDArrayFloat8
+	case "varchar[]", "character varying[]":
+		return OIDArrayVarChar
+	case "date[]":
+		return OIDArrayDate
+	case "timestamp[]", "timestamp without time zone[]":
+		return OIDArrayTimestamp
+	case "timestamptz[]", "timestamp with time zone[]":
+		return OIDArrayTimestampTZ
+	case "interval[]":
+		return OIDArrayInterval
+	case "numeric[]", "decimal[]":
+		return OIDArrayNumeric
+	case "uuid[]":
+		return OIDArrayUUID
+	case "record[]":
+		// _record (array of pseudo-type record). Same family as record (2249);
+		// no catalog.OIDArrayRecord constant exists, so the literal mirrors
+		// typeNameToOIDStr's "2287" arm. Unknown elements (e.g. a user type
+		// `foo[]`) keep the OIDText(25) fallback — no OID is fabricated.
+		return 2287
 	default:
 		return OIDText // safe fallback
 	}

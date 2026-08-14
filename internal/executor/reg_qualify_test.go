@@ -489,6 +489,102 @@ func TestRegprocedureArglistCatalogAndExecutorAgree(t *testing.T) {
 	if got := regprocedureArglist(argParts, func(s string) bool { return true }); got != wantArglist {
 		t.Errorf("executor regprocedureArglist = %q, want %q", got, wantArglist)
 	}
+
+	// M0119-0006 (77th slice, deferral row 1351): the regprocedure arglist now
+	// carries the resolved arg-type OID (Routine.ArgTypeOIDs → RegprocArg.OID)
+	// to disambiguate the ONE ambiguous spelling `char`: a BARE char
+	// (OIDBpChar 1042) renders `character` (format_type_be's BPCHAROID switch
+	// case), a quoted `"char"` (OIDChar 18) and OID 0 (builtin / pre-change
+	// routine) render `"char"`. The array suffix is re-appended AFTER the arm,
+	// so `char[]` → `character[]` and `"char"[]` → `"char"[]`. Sibling pin:
+	// the catalog bare builder and the executor renderer must agree.
+	table := []struct {
+		name        string
+		argTypes    []catalog.Type
+		argTypeOIDs []uint32
+		wantArglist string
+	}{
+		{"f_bare_char", []catalog.Type{{Name: "char"}}, []uint32{catalog.OIDBpChar}, "character"},
+		{"f_quoted_char", []catalog.Type{{Name: "char"}}, []uint32{catalog.OIDChar}, `"char"`},
+		{"f_zeroid_char", []catalog.Type{{Name: "char"}}, nil, `"char"`},
+		{"f_bare_char_arr", []catalog.Type{{Name: "char[]"}}, []uint32{catalog.OIDBpChar}, "character[]"},
+		{"f_quoted_char_arr", []catalog.Type{{Name: "char[]"}}, []uint32{catalog.OIDChar}, `"char"[]`},
+		// Row 1364: a real CREATE FUNCTION now captures the ARRAY OIDs for the
+		// char arrays (char[] → 1014, "char"[] → 1002); the renderers must treat
+		// them exactly like the scalar OIDs (1042/18) so the sibling builders
+		// stay in agreement on the live capture path too.
+		{"f_bare_char_arr_arrOID", []catalog.Type{{Name: "char[]"}}, []uint32{catalog.OIDArrayBpChar}, "character[]"},
+		{"f_quoted_char_arr_arrOID", []catalog.Type{{Name: "char[]"}}, []uint32{catalog.OIDArrayChar}, `"char"[]`},
+	}
+	for _, tc := range table {
+		r, err := rs.Create(&catalog.Routine{
+			Name:           tc.name,
+			Schema:         "public",
+			ArgTypes:       tc.argTypes,
+			ArgModes:       []string{"i"},
+			ArgTypeSchemas: []string{"pg_catalog"},
+			ArgTypeOIDs:    tc.argTypeOIDs,
+			ReturnType:     catalog.Type{Name: "int4"},
+		}, false)
+		if err != nil {
+			t.Fatalf("Routines().Create(%s): %v", tc.name, err)
+		}
+		catSig, ok := catalog.RegprocedureName(r.OID, rs)
+		if !ok {
+			t.Fatalf("RegprocedureName(%s) not ok", tc.name)
+		}
+		if want := tc.name + "(" + tc.wantArglist + ")"; catSig != want {
+			t.Errorf("catalog bare builder (%s) = %q, want %q", tc.name, catSig, want)
+		}
+		_, _, tcParts, ok := catalog.RegprocedureNameParts(r.OID, rs)
+		if !ok {
+			t.Fatalf("RegprocedureNameParts(%s) not ok", tc.name)
+		}
+		if got := regprocedureArglist(tcParts, func(s string) bool { return true }); got != tc.wantArglist {
+			t.Errorf("executor regprocedureArglist (%s) = %q, want %q", tc.name, got, tc.wantArglist)
+		}
+	}
+}
+
+func TestRegprocedureArglistQuotesMixedCaseUserType(t *testing.T) {
+	ctx := regCopyCat(t)
+	allVisible := func(s string) bool { return true }
+	offpathHidden := func(s string) bool { return s != "offpath" }
+
+	cases := []struct {
+		name       string
+		argTypes   []catalog.Type
+		argSchemas []string
+		visible    func(string) bool
+		want       string
+	}{
+		// Off-path mixed-case user type: both parts quote (quoteQualifiedIdentifier).
+		{"f_offpath_mixed", []catalog.Type{{Name: "MyType"}}, []string{"offpath"}, offpathHidden, `public.f_offpath_mixed(offpath."MyType")`},
+		// On-path (visible) mixed-case user type: bare name quotes.
+		{"f_visible_mixed", []catalog.Type{{Name: "MyType"}}, []string{"offpath"}, allVisible, `public.f_visible_mixed("MyType")`},
+		// Lowercase user type stays bare even on-path (quote_identifier no-op).
+		{"f_visible_lower", []catalog.Type{{Name: "mytype"}}, []string{"offpath"}, allVisible, "public.f_visible_lower(mytype)"},
+		// Builtin unaffected (pg_catalog arm maps to the SQL alias).
+		{"f_builtin", []catalog.Type{{Name: "int4"}}, []string{"pg_catalog"}, allVisible, "public.f_builtin(integer)"},
+		// Mixed-case user type in a builtin-schema arm is untouched by the quote.
+		{"f_offpath_mixed_arr", []catalog.Type{{Name: "MyType[]"}}, []string{"offpath"}, allVisible, `public.f_offpath_mixed_arr("MyType"[])`},
+	}
+	for _, tc := range cases {
+		r, err := ctx.Catalog.Routines().Create(&catalog.Routine{
+			Name:           tc.name,
+			Schema:         "public",
+			ArgTypes:       tc.argTypes,
+			ArgModes:       []string{"i"},
+			ArgTypeSchemas: tc.argSchemas,
+			ReturnType:     catalog.Type{Name: "int4"},
+		}, false)
+		if err != nil {
+			t.Fatalf("Routines().Create(%s): %v", tc.name, err)
+		}
+		if got := RegOutArgVisible("regprocedure", r.OID, ctx.Catalog, true, tc.visible); got != tc.want {
+			t.Errorf("regprocedure(%s) = %q, want %q", tc.name, got, tc.want)
+		}
+	}
 }
 
 // M0119-0006 (deferral row L1305): a synthetic TOAST relation OID (parent OID +
@@ -526,5 +622,58 @@ func TestRegOutToastRelnameRendersSchemaQualified(t *testing.T) {
 	}
 	if got := RegOut("regclass", wide.OID+idxOffset, ctx.Catalog, false); got != wantIdx {
 		t.Errorf("regclass(toast index OID) = %q, want %q", got, wantIdx)
+	}
+}
+
+// M0119-0006 (deferral row 1347): searchPathSchemas used LookupTable as a
+// schema-existence proxy, so a REGISTERED-BUT-EMPTY user schema never appeared
+// on the effective search_path — SET search_path = public, offpath with offpath
+// empty rendered f_offarg(offpath.mytype) instead of PG's bare f_offarg(mytype).
+// The proxy is now the schema registry (SchemaExists, which sees empty schemas
+// registered at CREATE SCHEMA), mirroring fetch_search_path's inclusion of empty
+// namespaces (postgres/src/backend/catalog/namespace.c:4822-4849) with name→OID
+// resolution via get_namespace_oid (namespace.c:3537-3550). This test registers
+// an EMPTY offpath (no tables/objects) and asserts RegObjectSchemaVisible sees it
+// and the regprocedure arglist renders the offpath arg BARE.
+func TestRegObjectSchemaVisibleSeesEmptySchema(t *testing.T) {
+	ctx := regCopyCat(t)
+	im := ctx.Catalog.(*catalog.InMemory)
+	// An EMPTY schema: registered (as CREATE SCHEMA does), but holding no
+	// tables/objects — the case the old LookupTable existence proxy could never
+	// see (a table literally named "offpath" would have to exist for it to
+	// succeed).
+	im.RegisterSchema("offpath")
+
+	// The session's effective search_path puts the empty offpath on the path.
+	ctx.GetSetting = func(name string) (string, bool) {
+		if name == "search_path" {
+			return "public, offpath", true
+		}
+		return "", false
+	}
+
+	// The empty schema is now visible on the path even though it holds no tables.
+	if got := RegObjectSchemaVisible(ctx, "offpath"); !got {
+		t.Errorf("RegObjectSchemaVisible(empty offpath on path) = false, want true")
+	}
+
+	// A routine in public whose arg type is the offpath composite mytype: with
+	// offpath visible, format_type_be renders the arg BARE (f_offarg(mytype)),
+	// not qualified (f_offarg(offpath.mytype)) — the 73rd-slice design doc's §1
+	// oracle row `SET search_path = public, offpath; f_offarg → f_offarg(mytype)`.
+	offArg, err := ctx.Catalog.Routines().Create(&catalog.Routine{
+		Name:           "f_offarg",
+		Schema:         "public",
+		ArgTypes:       []catalog.Type{{Name: "mytype"}},
+		ArgModes:       []string{"i"},
+		ArgTypeSchemas: []string{"offpath"},
+		ReturnType:     catalog.Type{Name: "int4"},
+	}, false)
+	if err != nil {
+		t.Fatalf("Routines().Create(f_offarg): %v", err)
+	}
+	visible := func(s string) bool { return RegObjectSchemaVisible(ctx, s) }
+	if got := RegOutArgVisible("regprocedure", offArg.OID, ctx.Catalog, true, visible); got != "public.f_offarg(mytype)" {
+		t.Errorf("regprocedure(f_offarg) empty offpath on path = %q, want %q", got, "public.f_offarg(mytype)")
 	}
 }

@@ -530,3 +530,37 @@ func TestLogicalSyncRepDispatchEmptyAppNameIsNoop(t *testing.T) {
 			write, flush, apply)
 	}
 }
+
+// TestBuildPublicationFilterResolvesCrossDB pins M0119-0006 (deferral row 1354
+// claim 2): the PubSub registry is keyed per-database
+// (pubMapKey(dbOid, name), catalog/pubsub.go), so buildPublicationFilter must
+// resolve a publication under the slot's database. The pre-fix hardcode
+// (LookupPublication(name, DefaultDBOid)) missed a DB-2 publication entirely,
+// leaving the filter non-nil but empty — publicationFilter.Allows then
+// returned false for every change and the stream silently dropped all of it.
+func TestBuildPublicationFilterResolvesCrossDB(t *testing.T) {
+	im := catalog.NewInMemory()
+	db2Oid, err := im.CreateDatabase("db2", catalog.BootstrapSuperuserOID)
+	if err != nil {
+		t.Fatalf("CreateDatabase(db2): %v", err)
+	}
+	ps := catalog.NewPubSub()
+	if _, err := ps.CreatePublication("p_db2", []string{"public.items"}, catalog.DefaultPublicationOptions(), db2Oid); err != nil {
+		t.Fatal(err)
+	}
+
+	items := &wal.RelationDef{Schema: "public", Name: "items"}
+
+	// With DB-2 oid: the DB-2 publication resolves → the filter admits items.
+	f2 := buildPublicationFilter(ps, []string{"p_db2"}, db2Oid)
+	if !f2.Allows(items, wal.ChangeInsert) {
+		t.Errorf("DB-2 publication not resolved with dbOid=%d: items insert blocked", db2Oid)
+	}
+
+	// With empty dbOid (default DB-1): the DB-2 publication is not found and
+	// silently skipped — same behaviour as the pre-fix hardcode.
+	fDefault := buildPublicationFilter(ps, []string{"p_db2"})
+	if fDefault.Allows(items, wal.ChangeInsert) {
+		t.Errorf("DB-2 publication leaked into the default (DB-1) filter")
+	}
+}

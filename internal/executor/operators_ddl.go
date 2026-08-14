@@ -10341,7 +10341,7 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 								_, isEnum = im.LookupEnum(typ.Name)
 							}
 							if !isEnum {
-								return &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 only supports int4 / numeric keys, got %q", typ.Name)}
+								return btreeKeyTypeRejectionError(typ.Name, pos)
 							}
 						}
 					}
@@ -10360,7 +10360,7 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 				_, isEnum = im.LookupEnum(col.Type.Name)
 			}
 			if !isEnum {
-				return &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 only supports int4 / numeric keys, got %q", col.Type.Name)}
+				return btreeKeyTypeRejectionError(col.Type.Name, pos)
 			}
 		}
 		cols[i] = col
@@ -11331,6 +11331,25 @@ func isSupportedBTreeKeyType(name string) bool {
 		strings.ToLower(name) == "uuid"
 }
 
+// btreeKeyTypeRejectionError returns the PG-faithful rejection for a type goopg
+// cannot use as a B-tree key. box has NO btree opclass in PG (pg_opclass.dat
+// carries gist/spgist/brin only), so PG raises 42704 "data type box has no
+// default operator class for access method \"btree\"" with a HINT (indexcmds.c
+// ResolveOpClass -> GetDefaultOpClass -> InvalidOid, ~2270-2277). Every other
+// type goopg rejects here is one PG *can* btree-index (int4range via range_ops)
+// or one the v0 encoder has not implemented yet — those keep the honest 0A000.
+func btreeKeyTypeRejectionError(typName string, pos int) *ExecError {
+	if typName == "box" {
+		return &ExecError{
+			Code:    "42704",
+			Pos:     pos,
+			Message: fmt.Sprintf("data type %s has no default operator class for access method \"btree\"", typName),
+			Hint:    "You must specify an operator class for the index or define a default operator class for the data type.",
+		}
+	}
+	return &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 only supports int4 / numeric keys, got %q", typName)}
+}
+
 // truncateTableEntry is the per-table state in execTruncate's BFS loop.
 type truncateTableEntry struct {
 	tbl  *catalog.Table
@@ -11814,6 +11833,52 @@ func (o *ddlOp) walLogDropRoutine(oid uint32) error {
 	return nil
 }
 
+// argTypeOID returns a NON-ZERO pg_type OID only for the one ambiguous arg-type
+// spelling, `char` (and its array forms): a BARE char (bpchar, the gram.y
+// CharacterWithoutLength stamp gives Args=[1]) is OIDBpChar(1042), a quoted
+// "char" (CHAROID, no stamp, Args nil) is OIDChar(18) — deferral row 1351 —
+// and the array forms resolve to the ARRAY OIDs (deferral row 1364): bare
+// `char[]` → OIDArrayBpChar(1014), quoted `"char"[]` → OIDArrayChar(1002).
+// Every other spelling returns 0: its name-based ArgTypeDisplayAlias is already
+// a faithful format_type_be port, so carrying a name-derived OID would only add
+// wrong array-element OIDs and risk a proargtypes shift. Key on the RAW element
+// name (a.Name, BEFORE routineArgTypeName bakes the `[]` suffix), so `char[]`
+// and `"char"[]` land here too.
+// charTypeOID resolves the `char` spelling to its pg_type OID: a quoted `"char"`
+// (no typmod args) is CHAROID(18), a bare `char` (implicit length-1 typmod,
+// Args=[1]) is BPCHAROID(1042), and every other type is 0. ARRAY spellings are
+// intercepted FIRST (IsArray): quoted `"char"[]` → OIDArrayChar(1002), bare
+// `char[]` → OIDArrayBpChar(1014) — the array arms are keyed the same way as
+// the scalar ones and non-char arrays return 0 so the TypeNameToOID fallback
+// resolves them (row 1364). Shared by the argument and RETURN-type paths so the
+// spellings cannot drift (deferral rows 1351/1361/1364).
+func charTypeOID(a parser.ColumnType) uint32 {
+	if a.IsArray {
+		if a.Name == "char" {
+			if len(a.Args) == 0 {
+				return catalog.OIDArrayChar // "char"[] → 1002 (quoted, no typmod)
+			}
+			return catalog.OIDArrayBpChar // char[] → 1014 (bare, Args=[1])
+		}
+		// Non-char arrays (int4[], date[], …): leave to the TypeNameToOID
+		// fallback in buildPGProcRow, which now resolves the baked `[]` name.
+		return 0
+	}
+	if a.Name == "char" {
+		if len(a.Args) == 0 {
+			return catalog.OIDChar // quoted "char"
+		}
+		return catalog.OIDBpChar // bare char (Args=[1])
+	}
+	return 0
+}
+
+// argTypeOID resolves an argument type's OID for the ArgTypeOIDs capture.
+// charTypeOID is the shared implementation (the RETURN-type path reuses it).
+func argTypeOID(a parser.ColumnType) uint32 {
+	return charTypeOID(a)
+}
+
 // execCreateFunction registers a routine in the catalog's
 // Routines() registry (M0015 Stage A step 3). Body is stored
 // verbatim — the PL/pgSQL parser/interpreter that executes it
@@ -11842,12 +11907,20 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 	argModes := make([]string, len(s.Args))
 	argDefaults := make([]string, len(s.Args))
 	argTypeSchemas := make([]string, len(s.Args))
+	argTypeOIDs := make([]uint32, len(s.Args))
 	for i, a := range s.Args {
 		argTypes[i] = catalog.Type{
 			Name: routineArgTypeName(a.Type),
 			Args: append([]int64(nil), a.Type.Args...),
 		}
-		argTypeSchemas[i] = argTypeSchema(a.Type)
+		// Pass the RAW connection dbOid (not NamespaceDBOid-normalized): the
+		// user-type registries are keyed by the exact value RegisterEnum/
+		// RegisterDomain/RegisterCompositeTypeWithFields/RegisterRangeType
+		// received (o.ctx.CurrentDatabaseOid), unlike the routine registry which
+		// normalizes via NamespaceDBOid — so a bare-name probe must use the same
+		// raw key the type was registered under (M0119-0006, deferral row 1343).
+		argTypeSchemas[i] = argTypeSchema(a.Type, o.ctx.Catalog, o.ctx.CurrentDatabaseOid)
+		argTypeOIDs[i] = argTypeOID(a.Type)
 		argNames[i] = a.Name
 		switch a.Mode {
 		case parser.FuncArgIn:
@@ -11896,6 +11969,10 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 	if s.ReturnType.IsArray {
 		retTypeName += "[]"
 	}
+	// Resolve the ambiguous `char` RETURN spelling to its pg_type OID (quoted
+	// `"char"` → 18, bare `char` → 1042, else 0) via the shared charTypeOID,
+	// sibling of the ArgTypeOIDs capture above (deferral row 1361).
+	retTypeOID := charTypeOID(s.ReturnType)
 	r := &catalog.Routine{
 		DBOid:          catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid),
 		Schema:         schema,
@@ -11903,6 +11980,7 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 		ArgNames:       argNames,
 		ArgTypes:       argTypes,
 		ArgTypeSchemas: argTypeSchemas,
+		ArgTypeOIDs:    argTypeOIDs,
 		ArgModes:       argModes,
 		ArgDefaults:    argDefaults,
 		ReturnType: catalog.Type{
@@ -11916,6 +11994,7 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 			Name: retTypeName,
 			Args: append([]int64(nil), s.ReturnType.Args...),
 		},
+		ReturnTypeOID:   retTypeOID,
 		ReturnsSet:      s.ReturnsSet,
 		ReturnsTable:    s.ReturnsTable,
 		Language:        lang,
@@ -12582,6 +12661,7 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 	argModes := make([]string, len(s.Args))
 	argDefaults := make([]string, len(s.Args))
 	argTypeSchemas := make([]string, len(s.Args))
+	argTypeOIDs := make([]uint32, len(s.Args))
 	// Validate: VARIADIC must be last; OUT can't follow default IN.
 	variadicSeen := false
 	defaultSeen := false
@@ -12606,7 +12686,14 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 			Name: routineArgTypeName(a.Type),
 			Args: append([]int64(nil), a.Type.Args...),
 		}
-		argTypeSchemas[i] = argTypeSchema(a.Type)
+		// Pass the RAW connection dbOid (not NamespaceDBOid-normalized): the
+		// user-type registries are keyed by the exact value RegisterEnum/
+		// RegisterDomain/RegisterCompositeTypeWithFields/RegisterRangeType
+		// received (o.ctx.CurrentDatabaseOid), unlike the routine registry which
+		// normalizes via NamespaceDBOid — so a bare-name probe must use the same
+		// raw key the type was registered under (M0119-0006, deferral row 1343).
+		argTypeSchemas[i] = argTypeSchema(a.Type, o.ctx.Catalog, o.ctx.CurrentDatabaseOid)
+		argTypeOIDs[i] = argTypeOID(a.Type)
 		argNames[i] = a.Name
 		switch a.Mode {
 		case parser.FuncArgIn:
@@ -12676,6 +12763,7 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 		ArgNames:        argNames,
 		ArgTypes:        argTypes,
 		ArgTypeSchemas:  argTypeSchemas,
+		ArgTypeOIDs:     argTypeOIDs,
 		ArgModes:        argModes,
 		ArgDefaults:     argDefaults,
 		Language:        lang,
@@ -19389,6 +19477,19 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 				return &ExecError{Code: code, Pos: s.Pos(), Message: err.Error()}
 			}
 			rt.Owner = o.currentDDLOwnerOID()
+			// Resolve the type's schema to a namespace OID so pg_type
+			// typnamespace is recorded faithfully (mirrors execCreateAggregate's
+			// schema-with-public-fallback resolution). M0119-0006 (deferral
+			// ledger row 1355).
+			schema := s.Schema
+			if schema == "" {
+				schema = "public"
+			}
+			nsOID := o.ctx.Catalog.SchemaOID(schema)
+			if nsOID == 0 {
+				nsOID = o.ctx.Catalog.SchemaOID("public")
+			}
+			rt.NamespaceOID = nsOID
 			syncRangeTypeToCatalogHeap(o.ctx, rt)
 			// Track range type creation so ROLLBACK can drop it (mirrors the
 			// composite-type branch above; range types previously had no
@@ -19421,6 +19522,19 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 			}
 			ct := cat.RegisterCompositeTypeWithFields(s.Name, fields, o.ctx.CurrentDatabaseOid)
 			ct.Owner = o.currentDDLOwnerOID()
+			// Resolve the type's schema to a namespace OID so pg_type
+			// typnamespace is recorded faithfully (mirrors execCreateAggregate's
+			// schema-with-public-fallback resolution). M0119-0006 (deferral
+			// ledger row 1355).
+			schema := s.Schema
+			if schema == "" {
+				schema = "public"
+			}
+			nsOID := o.ctx.Catalog.SchemaOID(schema)
+			if nsOID == 0 {
+				nsOID = o.ctx.Catalog.SchemaOID("public")
+			}
+			ct.NamespaceOID = nsOID
 			// Write pg_type heap rows (typtype='c' + its `_name` array) so the
 			// composite type is visible to pg_dump's getTypes and catalog
 			// queries. DU-002 slice 242.
@@ -19442,6 +19556,19 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 			cat.RegisterCompositeType(s.Name, o.ctx.CurrentDatabaseOid)
 			if ct := cat.LookupCompositeType(s.Name, o.ctx.CurrentDatabaseOid); ct != nil {
 				ct.Owner = o.currentDDLOwnerOID()
+				// Resolve the type's schema to a namespace OID so pg_type
+				// typnamespace is recorded faithfully (mirrors
+				// execCreateAggregate's schema-with-public-fallback resolution).
+				// M0119-0006 (deferral ledger row 1355).
+				schema := s.Schema
+				if schema == "" {
+					schema = "public"
+				}
+				nsOID := o.ctx.Catalog.SchemaOID(schema)
+				if nsOID == 0 {
+					nsOID = o.ctx.Catalog.SchemaOID("public")
+				}
+				ct.NamespaceOID = nsOID
 			}
 		}
 		return nil
@@ -19451,6 +19578,19 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
 	et.Owner = o.currentDDLOwnerOID()
+	// Resolve the type's schema to a namespace OID so pg_type typnamespace is
+	// recorded faithfully (mirrors execCreateAggregate's
+	// schema-with-public-fallback resolution). M0119-0006 (deferral ledger
+	// row 1355).
+	schema := s.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	nsOID := o.ctx.Catalog.SchemaOID(schema)
+	if nsOID == 0 {
+		nsOID = o.ctx.Catalog.SchemaOID("public")
+	}
+	et.NamespaceOID = nsOID
 	// Write a pg_type heap row so `SELECT 1 FROM pg_type WHERE oid = enumtypid`
 	// returns a match for the new type. M0097-0022.
 	syncEnumTypeToCatalogHeap(o.ctx, et)
@@ -19992,6 +20132,19 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 	// "Creator becomes owner" convention, mirroring execCreateType's range
 	// branch. M0122-0005 (domain follow-up).
 	d.Owner = o.currentDDLOwnerOID()
+	// Resolve the domain's schema to a namespace OID so pg_type typnamespace
+	// is recorded faithfully (mirrors execCreateAggregate's
+	// schema-with-public-fallback resolution). M0119-0006 (deferral ledger
+	// row 1355).
+	schema := s.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	nsOID := o.ctx.Catalog.SchemaOID(schema)
+	if nsOID == 0 {
+		nsOID = o.ctx.Catalog.SchemaOID("public")
+	}
+	d.NamespaceOID = nsOID
 	// Resolve a user-defined enum base type's dynamically-allocated OID and
 	// record it on the domain. TypeNameToOID falls back to text for enum names,
 	// so without this the pg_type row would carry typbasetype=text and pg_dump

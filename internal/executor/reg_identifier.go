@@ -445,7 +445,7 @@ func regIdentifierOIDFromDatum(d Datum, typeName string) (uint32, error) {
 // same connDBOid scoping the `oid::regclass` CastExpr arm threads (expr.go,
 // M0122-0007 4e follow-up 33).
 func RegOut(typeName string, oid uint32, cat catalog.Catalog, qualify bool, dbOid ...uint32) string {
-	return regOutShared(typeName, oid, cat, func(s string) bool { return qualify }, qualify, nil, dbOid...)
+	return regOutShared(typeName, oid, cat, func(s string) bool { return qualify }, nil, dbOid...)
 }
 
 // RegOutArgVisible is RegOut with an extra per-arg-type visibility predicate
@@ -456,7 +456,7 @@ func RegOut(typeName string, oid uint32, cat catalog.Catalog, qualify bool, dbOi
 // the routine NAME is schema-qualified (quote_qualified_identifier), exactly
 // as format_procedure's FunctionIsVisible arm.
 func RegOutArgVisible(typeName string, oid uint32, cat catalog.Catalog, qualify bool, argVisible func(schema string) bool, dbOid ...uint32) string {
-	return regOutShared(typeName, oid, cat, func(s string) bool { return qualify }, qualify, argVisible, dbOid...)
+	return regOutShared(typeName, oid, cat, func(s string) bool { return qualify }, argVisible, dbOid...)
 }
 
 // RegOutRenderer returns a closure over RegOut bound to a fixed catalog and
@@ -485,12 +485,13 @@ func RegOutRenderer(cat catalog.Catalog, qualify bool, dbOid ...uint32) func(typ
 // with the default-search_path predicate `{"", pg_catalog, public}` since the
 // publisher side never SETs search_path; pg_catalog is implicitly visible to
 // every path and regOutQualified force-disables its qualification anyway. The
-// regtype arm keeps its fixed bool (false here): userTypeNameForOID hardcodes a
-// "public." prefix and tracks no real schema (a separate pre-existing defect,
-// not covered by deferral row 1354's two claims). M0119-0006 (84th slice).
+// regtype arm uses the same per-schema `qualify` predicate: RegtypeName
+// resolves the type's ACTUAL schema from its NamespaceOID (slice A) and
+// schema-qualifies when it is off the search_path (deferral row 1355).
+// M0119-0006 (84th slice).
 func RegOutRendererVisible(cat catalog.Catalog, visible func(schema string) bool, dbOid ...uint32) func(typeName string, oid uint32) string {
 	return func(typeName string, oid uint32) string {
-		return regOutShared(typeName, oid, cat, func(s string) bool { return !visible(s) }, false, nil, dbOid...)
+		return regOutShared(typeName, oid, cat, func(s string) bool { return !visible(s) }, nil, dbOid...)
 	}
 }
 
@@ -502,13 +503,15 @@ func RegOutRendererVisible(cat catalog.Catalog, visible func(schema string) bool
 // RegOut/RegOutArgVisible wrappers pass the constant predicate
 // `func(string) bool { return qualify }` (the fixed flag those callers
 // precompute), RegOutRendererVisible passes `func(s string) bool {
-// return !visible(s) }`. regtypeQualify is the SEPARATE fixed flag for the
-// regtype arm only (the walsender renderer keeps it false; userTypeNameForOID
-// hardcodes a "public." prefix and tracks no real schema). argVisible threads
+// return !visible(s) }`. The regtype arm uses the same `qualify` predicate —
+// RegtypeName resolves the type's ACTUAL schema from its NamespaceOID (slice A)
+// and renders via regOutQualified, so an off-search_path user type is qualified
+// with its real schema (deferral row 1355; the slice-A NamespaceOID field
+// removed the need for a separate regtypeQualify flag). argVisible threads
 // the per-arg visibility predicate to the regprocedure arm only (nil ⇒ bare
 // arglist, the base-RegOut behavior). dbOid scopes the database-local relation
 // lookups (see RegOut).
-func regOutShared(typeName string, oid uint32, cat catalog.Catalog, qualify func(schema string) bool, regtypeQualify bool, argVisible func(schema string) bool, dbOid ...uint32) string {
+func regOutShared(typeName string, oid uint32, cat catalog.Catalog, qualify func(schema string) bool, argVisible func(schema string) bool, dbOid ...uint32) string {
 	if oid == 0 {
 		return "-"
 	}
@@ -578,7 +581,7 @@ func regOutShared(typeName string, oid uint32, cat catalog.Catalog, qualify func
 			return regOutQualified(schema, name, qualify(schema)) + "(" + regprocedureArglist(argTypes, argVisible) + ")"
 		}
 	case "regtype":
-		return RegtypeName(cat, oid, regtypeQualify)
+		return RegtypeName(cat, oid, qualify)
 	case "regrole":
 		if hasIM {
 			// regroleout (regproc.c:1609) quote_identifiers the REAL role name
@@ -658,12 +661,31 @@ func regprocedureArglist(argTypes []catalog.RegprocArg, visible func(schema stri
 	args := make([]string, len(argTypes))
 	for i, a := range argTypes {
 		base, isArray := splitArraySuffix(a.Name)
+		// Deferral row 1351: a BARE `char` arg (stored OIDBpChar 1042 at CREATE)
+		// renders `character` (format_type_be's BPCHAROID switch case); OIDChar 18
+		// (quoted `"char"`) or 0 (builtin / pre-change routine) falls through to
+		// ArgTypeDisplayAlias's `"char"`. Row 1364 adds the array forms: the
+		// CREATE-time capture now stores the ARRAY OIDs (char[] → OIDArrayBpChar
+		// 1014, "char"[] → OIDArrayChar 1002), so the bare-char arm must accept
+		// both scalar and array bpchar OIDs to keep `char[]` rendering
+		// `character[]`. Mirrors the catalog argListTypeDisplay arm.
+		if base == "char" && (a.OID == catalog.OIDBpChar || a.OID == catalog.OIDArrayBpChar) {
+			base = "character"
+		}
 		name := base
 		if a.Schema == "" || a.Schema == "pg_catalog" {
 			name = catalog.ArgTypeDisplayAlias(base)
 		}
 		if a.Schema != "" && a.Schema != "pg_catalog" && visible != nil && !visible(a.Schema) {
 			name = quoteQualifiedIdentifier(a.Schema, name)
+		}
+		// Deferral row 1344: a user type whose schema is ON the effective
+		// search_path renders through quote_identifier — mixed-case and keyword
+		// names quote, lowercase safe names stay bare — mirroring
+		// format_type_be's default path (format_type.c:303-326 → quote_identifier).
+		// A nil visible predicate (base RegOut, bare arglist) keeps name = base.
+		if a.Schema != "" && a.Schema != "pg_catalog" && visible != nil && visible(a.Schema) {
+			name = pgQuoteIdent(base)
 		}
 		if isArray {
 			name += "[]"

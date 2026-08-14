@@ -359,3 +359,71 @@ func TestTypeNameToOIDUnknownFallsBackToText(t *testing.T) {
 		t.Errorf("unknown type OID = %d, want %d (OIDText)", got, OIDText)
 	}
 }
+
+// TestTypeNameToOIDArrayNames pins the `[]` array arms added for deferral row
+// 1364 — every array spelling maps to its canonical _typename ARRAY OID,
+// mirroring initdb/pg_proc_view.go:typeNameToOIDStr (the reference table this
+// block was ported from). The char spellings are the tricky pair: BOTH `char[]`
+// and `"char"[]` → _char (1002), so the scalar `"char"`/`character`→1042 arm
+// must never leak a 1014 (_bpchar) into the array path. PG oracle (18.3):
+// 'int4[]'::regtype::oid=1007, '"char"[]'=1002, 'char[]'=1014 (bare), 'date[]'
+// =1182. Unknown elements (a user type `foo[]`) keep the OIDText(25) fallback.
+func TestTypeNameToOIDArrayNames(t *testing.T) {
+	cases := []struct {
+		name    string
+		wantOID uint32
+	}{
+		{"bool[]", OIDArrayBool},
+		{"boolean[]", OIDArrayBool},
+		{"bytea[]", OIDArrayBytea},
+		{"char[]", OIDArrayChar},
+		{`"char"[]`, OIDArrayChar},
+		{"name[]", OIDArrayName},
+		{"int8[]", OIDArrayInt8},
+		{"bigint[]", OIDArrayInt8},
+		{"int2[]", OIDArrayInt2},
+		{"smallint[]", OIDArrayInt2},
+		{"int4[]", OIDArrayInt4},
+		{"int[]", OIDArrayInt4},
+		{"integer[]", OIDArrayInt4},
+		{"text[]", OIDArrayText},
+		{"oid[]", OIDArrayOID},
+		{"float4[]", OIDArrayFloat4},
+		{"real[]", OIDArrayFloat4},
+		{"float8[]", OIDArrayFloat8},
+		{"float[]", OIDArrayFloat8},
+		{"double precision[]", OIDArrayFloat8},
+		{"varchar[]", OIDArrayVarChar},
+		{"character varying[]", OIDArrayVarChar},
+		{"date[]", OIDArrayDate},
+		{"timestamp[]", OIDArrayTimestamp},
+		{"timestamp without time zone[]", OIDArrayTimestamp},
+		{"timestamptz[]", OIDArrayTimestampTZ},
+		{"timestamp with time zone[]", OIDArrayTimestampTZ},
+		{"interval[]", OIDArrayInterval},
+		{"numeric[]", OIDArrayNumeric},
+		{"decimal[]", OIDArrayNumeric},
+		{"uuid[]", OIDArrayUUID},
+		{"record[]", 2287}, // _record; no catalog.OIDArrayRecord constant exists
+	}
+	for _, tc := range cases {
+		if got := TypeNameToOID(tc.name); got != tc.wantOID {
+			t.Errorf("TypeNameToOID(%q) = %d, want %d", tc.name, got, tc.wantOID)
+		}
+	}
+	// Unknown element: no fabricated OID — keeps the OIDText(25) safe default.
+	for _, name := range []string{"foo[]", `"mytype"[]`, "int4[][]"} {
+		if got := TypeNameToOID(name); got != OIDText {
+			t.Errorf("TypeNameToOID(%q) = %d, want %d (OIDText)", name, got, OIDText)
+		}
+	}
+	// Scalar spellings are unchanged: `char` (bare, bpchar) stays 1042 and the
+	// quoted `"char"` scalar (not an array) has NO arm — it falls to OIDText(25)
+	// exactly as before the array block.
+	if got := TypeNameToOID("char"); got != OIDBpChar {
+		t.Errorf("TypeNameToOID(\"char\") = %d, want %d (OIDBpChar)", got, OIDBpChar)
+	}
+	if got := TypeNameToOID(`"char"`); got != OIDText {
+		t.Errorf("TypeNameToOID(%q) = %d, want %d (OIDText)", `"char"`, got, OIDText)
+	}
+}

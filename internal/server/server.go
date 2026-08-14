@@ -1629,7 +1629,11 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 			// falls back to the normal handler so utility commands
 			// like SHOW still work for diagnostics.
 			if isReplication {
-				handled, err := s.handleReplicationCommand(ctx, r, w, f.Payload, appName)
+				// M0119-0006 (deferral row 1354 claim 2): thread the
+				// connection's dbName down so the logical walsender can scope
+				// every catalog lookup to the slot's database instead of the
+				// DefaultDBOid fallback (DB 1).
+				handled, err := s.handleReplicationCommand(ctx, r, w, f.Payload, appName, dbName)
 				if err != nil {
 					entry.clearQueryCancel()
 					queryCancel()
