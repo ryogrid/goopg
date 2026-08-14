@@ -1019,6 +1019,35 @@ root causes, both fixed this loop.
       `TestPgUnsignedIDFromDatumNegativeWrap`
       (`internal/executor/pg_unsigned_id_wrap_test.go`).
 
+### Nightly run 20260815-011722 (sha `6126dd2e09d8`, 5 items) — filed 2026-08-15
+
+Concurrent-loop caveat: Loop #22 was active in this tree during the nightly (it
+committed `b1cefd5d` mid-run), and AI-005 (build-broke-mid-stage) attributes 9
+later testport results to that mid-run build break. AI-002/003/004 are
+genuinely-attributed FAILs (distinct from the unattributable set), so they are
+filed as real until a HEAD re-run (rule §2) says otherwise.
+
+- [ ] **race/internal/initdb (AI-20260815-011722-001)** — race suite failed in
+      `internal/initdb`; new tonight. Repro:
+      `go test -race -timeout 15m ./internal/initdb/`.
+- [ ] **testport/TestPort_IsolationEvalPlanQual — REOPENED (4th time)
+      (AI-20260815-011722-002)** — FAILed again. Prior three closures were each
+      a distinct root cause (stale; TM_SelfModified missing CmdID; TM_SelfModified
+      LOCKED_ONLY arm). Re-run at HEAD first (rule §2) before attributing a 4th
+      cause. Repro:
+      `go test -v -run '^TestPort_IsolationEvalPlanQual$' ./internal/testport/`.
+- [ ] **testport/TestPort_PgoutputInteropGoopgToPG (AI-20260815-011722-003)** —
+      FAILed, new tonight. Repro:
+      `go test -v -run '^TestPort_PgoutputInteropGoopgToPG$' ./internal/testport/`.
+- [ ] **testport/TestPort_PgoutputInteropPGToGoopgBatchDML
+      (AI-20260815-011722-004)** — FAILed, new tonight. Repro:
+      `go test -v -run '^TestPort_PgoutputInteropPGToGoopgBatchDML$' ./internal/testport/`.
+- [ ] **testport/build-broke-mid-stage (AI-20260815-011722-005)** — infra: the
+      goopg build broke DURING the testport stage; 9 tests after the break are
+      UNATTRIBUTABLE. Likely the concurrent Loop #22 WIP (working tree built
+      live). Repro: `go build ./...` at the recorded sha (clean sha ⇒ nothing to
+      fix in code).
+
 ## M0130 — Cluster-directory compat with PG 18.3 + PG physical replication (filed 2026-08-09)
 
 **Milestone doc:** `docs/milestones/0130-cluster-dir-compat-and-pg-physical-replication.md`
