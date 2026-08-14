@@ -95,3 +95,85 @@ Both halves understate it:
 - **Cross-DB regclass resolution**: the renderer binds no dbOid, so a regclass OID
   resolves against `DefaultDBOid`; a logical slot is per-database and the walsender
   carries no slot dbOid to scope the lookup.
+
+## Off-path schema qualification (84th slice — ledger row 1354 claim 1)
+
+Resolves the FIRST claim of deferral-row 1354: the walsender now
+schema-qualifies an off-path reg* object instead of rendering its bare name.
+
+**The oracle.** `regclassout` does NOT "always qualify non-public schemas". It
+qualifies iff the object's schema is NOT visible in the session's effective
+`search_path`, and emits the bare name otherwise:
+
+```c
+/* regproc.c:973-981 */
+if (RelationIsVisible(classid))
+    nspname = NULL;
+else
+    nspname = get_namespace_name(classform->relnamespace);
+result = quote_qualified_identifier(nspname, classname);
+```
+
+`RelationIsVisible` (`postgres/src/backend/catalog/namespace.c:925`) is true
+when the relation's namespace is a member of the path — with `pg_catalog`
+implicitly always a member. PG's publisher walsender never SETs `search_path`
+(`postgres/src/backend/replication/` has zero `search_path` writes on the
+publisher side), so it inherits the default `"$user", public` — for the
+walsender the visible set is effectively `{pg_catalog, public}` (`pg_catalog`
+always searched implicitly; `public` in the default path).
+
+**The fix shape — a per-object predicate, not a flipped flag.** goopg's
+existing `qualify bool` already encodes "true = this object's schema is NOT on
+the session's search_path" (the doc comment at
+`internal/executor/reg_identifier.go`). The bug was purely the walsender
+hardcoding `false`. `regOut`'s switch body was refactored into a shared
+`regOutShared(...)` that takes `qualify func(schema string) bool` — "should
+this schema be qualified?" — in place of the bool, plus a SEPARATE fixed
+`regtypeQualify bool` for the regtype arm only:
+
+- `RegOut` / `RegOutArgVisible` are thin wrappers passing the constant
+  predicate `func(string) bool { return qualify }` and `regtypeQualify =
+  qualify` — byte-identical output for every existing caller (proven by the
+  untouched existing executor reg* tests).
+- `RegOutRendererVisible(cat catalog.Catalog, visible func(schema string)
+  bool, dbOid ...uint32)` mirrors `RegOutRenderer` but captures `visible`
+  ("is this schema on the effective search_path?") and calls `regOutShared`
+  with predicate `func(s string) bool { return !visible(s) }` and
+  `regtypeQualify = false`.
+- The walsender (`internal/server/logicalwalsender.go`) binds
+  `RegOutRendererVisible(im, func(s string) bool { return s == "" ||
+  s == "pg_catalog" || s == "public" })`. The five changed `regOutQualified`
+  call sites pass `qualify(<schema>)`: regclass table/index, regproc user
+  routine, regprocedure, and regcollation user (its ACTUAL namespace via
+  `SchemaNameForOID`). `regOutQualified`'s existing `""`→`public` and
+  `pg_catalog`→bare arms stay unchanged (the predicate treats both as visible).
+  regrole, the TOAST-relation arm, and the regtype arm are untouched.
+
+**Scope boundaries.**
+
+- **regtype stays on its fixed bool.** `RegtypeName` → `userTypeNameForOID`
+  hardcodes a `"public."` prefix and tracks no real schema — a separate
+  pre-existing defect, out of scope here (the renderer keeps `regtypeQualify =
+  false`). Deferred.
+- **Cross-DB `dbOid` stays deferred** as ledger row 1354 claim 2 — no threading
+  in this slice.
+- **`$user`-schema-visible is an approximation.** A walsender connection has no
+  session user schema in goopg's binding, so a table created in the `$user`
+  schema (e.g. `alice.tbl` for user `alice`) renders qualified even though the
+  default path would show it. Documented deviation; PG's own walsender would
+  render it bare.
+
+**Tests.**
+
+- `internal/executor/reg_identifier_test.go` —
+  `TestRegOutRendererVisibleOffPathQualifies`: a catalog with `other_schema.tbl`
+  and `public.tbl`; the default predicate qualifies the off-path OID
+  (`other_schema.tbl`), leaves public bare (`tbl`), leaves `pg_class` (1259)
+  bare, and a predicate accepting the non-public schema yields the bare name.
+- `internal/server/pgoutput_reg_names_test.go` —
+  `TestPgoutputSnapshotRegOutRendererVisibleOffPathQualifies`: the snapshot
+  built through the new walsender binding qualifies `other_schema.tbl`, keeps
+  `pg_class` bare, and a dangling OID stays numeric.
+
+**Gates.** `go test ./internal/executor/ ./internal/server/ ./internal/wal/`;
+pre-commit units; `scripts/tpch-spotcheck.sh` (Q12=2, Q13=35). All PASS.

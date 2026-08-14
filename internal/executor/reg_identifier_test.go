@@ -219,6 +219,99 @@ func TestRegIdentifierInputResolvesRegcollationName(t *testing.T) {
 	}
 }
 
+// M0119-0006 (84th slice, deferral row 1354 claim 1): RegOutRendererVisible is
+// the pgoutput reg* renderer with a PER-SCHEMA visibility predicate in place of
+// the fixed qualify flag. regclassout schema-qualifies an object whose schema is
+// NOT visible on the effective search_path (RelationIsVisible, regproc.c:973-981)
+// and emits the bare name otherwise. The walsender binds the synthesized default
+// search_path {pg_catalog, public} (pg_catalog always implicitly searched; public
+// in the default path); this pins the renderer against exactly that binding.
+func TestRegOutRendererVisibleOffPathQualifies(t *testing.T) {
+	ctx := regCopyCat(t) // mytable in public, mycoll, alice
+	im := ctx.Catalog.(*catalog.InMemory)
+	im.RegisterSchema("other_schema")
+	if err := runDDL(t, ctx, `CREATE TABLE other_schema.tbl (id int)`); err != nil {
+		t.Fatalf("CREATE TABLE other_schema.tbl: %v", err)
+	}
+	// A user routine and a user collation in the SAME off-path schema, so the
+	// renderer's regproc/regprocedure/regcollation arms are pinned against the
+	// predicate too (acceptance criterion #2 lists all five changed arms).
+	offRoutine, err := ctx.Catalog.Routines().Create(&catalog.Routine{
+		Name:       "off_udf",
+		Schema:     "other_schema",
+		ReturnType: catalog.Type{Name: "int4"},
+	}, false)
+	if err != nil {
+		t.Fatalf("Routines().Create(off_udf): %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE COLLATION other_schema.othercoll (LOCALE = 'C')`); err != nil {
+		t.Fatalf("CREATE COLLATION other_schema.othercoll: %v", err)
+	}
+	offCollOID := im.UserCollationOIDByName("othercoll")
+	if offCollOID == 0 {
+		t.Fatal("othercoll not found")
+	}
+	connDBOid := catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)
+	mytable, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: "mytable"}, connDBOid)
+	if !ok {
+		t.Fatal("mytable not found")
+	}
+	other, ok := ctx.Catalog.LookupTable(parser.ObjectName{Schema: "other_schema", Name: "tbl"}, connDBOid)
+	if !ok {
+		t.Fatal("other_schema.tbl not found")
+	}
+	if other.Schema != "other_schema" {
+		t.Fatalf("other_schema.tbl stored schema = %q, want %q", other.Schema, "other_schema")
+	}
+
+	// The walsender's synthesized default search_path: {pg_catalog, public}
+	// (publisher never SETs search_path; $user-schema edge approximated away).
+	defaultVisible := func(s string) bool {
+		return s == "" || s == "pg_catalog" || s == "public"
+	}
+	renderer := RegOutRendererVisible(ctx.Catalog, defaultVisible)
+
+	// Off-path schema → schema-qualified (the fix: the old fixed qualify=false
+	// renderer would have emitted the bare `tbl`).
+	if got := renderer("regclass", other.OID); got != "other_schema.tbl" {
+		t.Errorf("renderer(other_schema.tbl) = %q, want %q", got, "other_schema.tbl")
+	}
+	// The regproc/regprocedure/regcollation arms schema-qualify an off-path
+	// routine/collation the same way (the 84th slice changed all five
+	// regOutQualified call sites; a fixed qualify=false renderer would have
+	// emitted the bare `off_udf` / `othercoll`).
+	if got := renderer("regproc", offRoutine.OID); got != "other_schema.off_udf" {
+		t.Errorf("renderer(regproc other_schema.off_udf) = %q, want %q", got, "other_schema.off_udf")
+	}
+	if got := renderer("regprocedure", offRoutine.OID); got != "other_schema.off_udf()" {
+		t.Errorf("renderer(regprocedure other_schema.off_udf) = %q, want %q", got, "other_schema.off_udf()")
+	}
+	if got := renderer("regcollation", offCollOID); got != "other_schema.othercoll" {
+		t.Errorf("renderer(regcollation other_schema.othercoll) = %q, want %q", got, "other_schema.othercoll")
+	}
+	// On-path public schema → bare name.
+	if got := renderer("regclass", mytable.OID); got != "mytable" {
+		t.Errorf("renderer(public.mytable) = %q, want %q", got, "mytable")
+	}
+	// pg_catalog is implicitly visible to every search_path → bare, never
+	// qualified (regclassout's RelationIsVisible pg_catalog arm).
+	if got := renderer("regclass", 1259); got != "pg_class" {
+		t.Errorf("renderer(pg_class 1259) = %q, want %q", got, "pg_class")
+	}
+	// A visible predicate that accepts a non-public schema yields the bare name.
+	everythingVisible := func(s string) bool { return true }
+	allVisibleRenderer := RegOutRendererVisible(ctx.Catalog, everythingVisible)
+	if got := allVisibleRenderer("regclass", other.OID); got != "tbl" {
+		t.Errorf("allVisible renderer(other_schema.tbl) = %q, want %q", got, "tbl")
+	}
+	if got := allVisibleRenderer("regproc", offRoutine.OID); got != "off_udf" {
+		t.Errorf("allVisible renderer(regproc off_udf) = %q, want %q", got, "off_udf")
+	}
+	if got := allVisibleRenderer("regcollation", offCollOID); got != "othercoll" {
+		t.Errorf("allVisible renderer(regcollation othercoll) = %q, want %q", got, "othercoll")
+	}
+}
+
 // parseDashOrOid (regproc.c) runs before ANY name resolution for every reg*
 // type — the family-wide latent gap the 66th slice left: '-' is InvalidOid (0)
 // and a pure-digit string is a numeric OID via oidin (never a name).

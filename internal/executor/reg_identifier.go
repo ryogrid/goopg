@@ -445,7 +445,7 @@ func regIdentifierOIDFromDatum(d Datum, typeName string) (uint32, error) {
 // same connDBOid scoping the `oid::regclass` CastExpr arm threads (expr.go,
 // M0122-0007 4e follow-up 33).
 func RegOut(typeName string, oid uint32, cat catalog.Catalog, qualify bool, dbOid ...uint32) string {
-	return regOut(typeName, oid, cat, qualify, nil, dbOid...)
+	return regOutShared(typeName, oid, cat, func(s string) bool { return qualify }, qualify, nil, dbOid...)
 }
 
 // RegOutArgVisible is RegOut with an extra per-arg-type visibility predicate
@@ -456,7 +456,7 @@ func RegOut(typeName string, oid uint32, cat catalog.Catalog, qualify bool, dbOi
 // the routine NAME is schema-qualified (quote_qualified_identifier), exactly
 // as format_procedure's FunctionIsVisible arm.
 func RegOutArgVisible(typeName string, oid uint32, cat catalog.Catalog, qualify bool, argVisible func(schema string) bool, dbOid ...uint32) string {
-	return regOut(typeName, oid, cat, qualify, argVisible, dbOid...)
+	return regOutShared(typeName, oid, cat, func(s string) bool { return qualify }, qualify, argVisible, dbOid...)
 }
 
 // RegOutRenderer returns a closure over RegOut bound to a fixed catalog and
@@ -475,11 +475,40 @@ func RegOutRenderer(cat catalog.Catalog, qualify bool, dbOid ...uint32) func(typ
 	}
 }
 
-// regOut is the shared RegOut/RegOutArgVisible body; argVisible threads the
-// per-arg visibility predicate to the regprocedure arm only (nil ⇒ bare
+// RegOutRendererVisible is RegOutRenderer with a per-schema VISIBILITY
+// predicate in place of the fixed qualify flag: a resolved regclass/regproc/
+// regprocedure/regcollation name is schema-qualified iff its schema is NOT
+// visible per `visible`, exactly as regclassout/regprocout/regcollationout
+// qualify via RelationIsVisible & friends (regproc.c:973-981,
+// postgres/src/backend/catalog/namespace.c) — the object's schema off the
+// session's effective search_path. The logical-replication walsender binds this
+// with the default-search_path predicate `{"", pg_catalog, public}` since the
+// publisher side never SETs search_path; pg_catalog is implicitly visible to
+// every path and regOutQualified force-disables its qualification anyway. The
+// regtype arm keeps its fixed bool (false here): userTypeNameForOID hardcodes a
+// "public." prefix and tracks no real schema (a separate pre-existing defect,
+// not covered by deferral row 1354's two claims). M0119-0006 (84th slice).
+func RegOutRendererVisible(cat catalog.Catalog, visible func(schema string) bool, dbOid ...uint32) func(typeName string, oid uint32) string {
+	return func(typeName string, oid uint32) string {
+		return regOutShared(typeName, oid, cat, func(s string) bool { return !visible(s) }, false, nil, dbOid...)
+	}
+}
+
+// regOutShared is the shared RegOut/RegOutArgVisible/RegOutRendererVisible
+// body. qualify is a PER-OBJECT predicate "should this object's schema be
+// schema-qualified?" — regclassout/regprocout/regprocedure/regcollationout
+// qualify iff the schema is NOT on the session's effective search_path
+// (RelationIsVisible & friends, postgres/src/backend/catalog/namespace.c). The
+// RegOut/RegOutArgVisible wrappers pass the constant predicate
+// `func(string) bool { return qualify }` (the fixed flag those callers
+// precompute), RegOutRendererVisible passes `func(s string) bool {
+// return !visible(s) }`. regtypeQualify is the SEPARATE fixed flag for the
+// regtype arm only (the walsender renderer keeps it false; userTypeNameForOID
+// hardcodes a "public." prefix and tracks no real schema). argVisible threads
+// the per-arg visibility predicate to the regprocedure arm only (nil ⇒ bare
 // arglist, the base-RegOut behavior). dbOid scopes the database-local relation
 // lookups (see RegOut).
-func regOut(typeName string, oid uint32, cat catalog.Catalog, qualify bool, argVisible func(schema string) bool, dbOid ...uint32) string {
+func regOutShared(typeName string, oid uint32, cat catalog.Catalog, qualify func(schema string) bool, regtypeQualify bool, argVisible func(schema string) bool, dbOid ...uint32) string {
 	if oid == 0 {
 		return "-"
 	}
@@ -494,10 +523,10 @@ func regOut(typeName string, oid uint32, cat catalog.Catalog, qualify bool, argV
 			// 33). Empty dbOid keeps the DefaultDBOid default for the SELECT/COPY
 			// siblings, whose callers predate the scoping.
 			if tbl, ok := im.LookupTableByOID(oid, dbOid...); ok {
-				return regOutQualified(tbl.Schema, tbl.Name, qualify)
+				return regOutQualified(tbl.Schema, tbl.Name, qualify(tbl.Schema))
 			}
 			if idx, ok := im.LookupIndexByOID(oid, dbOid...); ok {
-				return regOutQualified(idx.Schema, idx.Name, qualify)
+				return regOutQualified(idx.Schema, idx.Name, qualify(idx.Schema))
 			}
 			// A synthetic TOAST relation OID (parent OID + 100M) or TOAST index
 			// OID (+200M) lives only in the virtual pg_class builder, not
@@ -520,7 +549,7 @@ func regOut(typeName string, oid uint32, cat catalog.Catalog, qualify bool, argV
 		if cat != nil {
 			if rs := cat.Routines(); rs != nil {
 				if r := rs.LookupByOID(oid); r != nil {
-					return regOutQualified(r.Schema, r.Name, qualify)
+					return regOutQualified(r.Schema, r.Name, qualify(r.Schema))
 				}
 			}
 		}
@@ -546,10 +575,10 @@ func regOut(typeName string, oid uint32, cat catalog.Catalog, qualify bool, argV
 			// whose namespace is off the session's effective search_path —
 			// regprocedureArglist implements that per-arg rule (deferral row
 			// 1342). Base RegOut passes a nil predicate (bare arglist).
-			return regOutQualified(schema, name, qualify) + "(" + regprocedureArglist(argTypes, argVisible) + ")"
+			return regOutQualified(schema, name, qualify(schema)) + "(" + regprocedureArglist(argTypes, argVisible) + ")"
 		}
 	case "regtype":
-		return RegtypeName(cat, oid, qualify)
+		return RegtypeName(cat, oid, regtypeQualify)
 	case "regrole":
 		if hasIM {
 			// regroleout (regproc.c:1609) quote_identifiers the REAL role name
@@ -574,7 +603,8 @@ func regOut(typeName string, oid uint32, cat catalog.Catalog, qualify bool, argV
 						// COLLATION schema (deferral row 1339). regOutQualified
 						// also keeps the pg_catalog-never-qualifies arm for a
 						// collation created in pg_catalog.
-						return regOutQualified(im.SchemaNameForOID(uc.NamespaceOID), n, qualify)
+						collSchema := im.SchemaNameForOID(uc.NamespaceOID)
+						return regOutQualified(collSchema, n, qualify(collSchema))
 					}
 				}
 				// A builtin collation resolves in pg_catalog, which every search

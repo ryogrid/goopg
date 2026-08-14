@@ -4469,6 +4469,31 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       remaining-scope note below; box is NOT a valid key target (no PG btree opclass)
       and int4range is blocked on the range value model (see the 2026-08-14 ledger
       row).
+      **84th slice (2026-08-14): pgoutput renders an off-path reg* value
+      schema-qualified — deferral row 1354 claim 1 resolved.** The publisher
+      walsender bound the pgoutput reg* renderer with a fixed `qualify=false`
+      (`logicalwalsender.go:75`), so a regclass in a non-public schema rendered its
+      BARE name where PG 18.3's `regclassout` schema-qualifies via `RelationIsVisible`
+      (regproc.c:973-981 → namespace.c) — the object's schema is qualified iff NOT on
+      the effective search_path (a TERNARY visibility rule, not "always qualify
+      non-public"). The fix threads a per-schema visibility predicate instead of the
+      fixed flag: `regOut`'s switch body moved to `regOutShared(..., qualify
+      func(schema string) bool, regtypeQualify bool, argVisible, dbOid...)`, with
+      `RegOut`/`RegOutArgVisible` as byte-identical wrappers (constant predicate) so
+      the SELECT/COPY/cast siblings are provably unchanged; new
+      `RegOutRendererVisible(cat, visible, dbOid...)` drives the five
+      `regOutQualified` call sites (regclass table/index, regproc user, regprocedure,
+      regcollation user) with `qualify(schema)`. The walsender binds
+      `RegOutRendererVisible(im, func(s){s==""||s=="pg_catalog"||s=="public"})` —
+      the publisher never SETs search_path (`postgres/src/backend/replication/` has
+      zero publisher-side writes), so the visible set is the default `{pg_catalog,
+      public}` ($user-schema edge approximated away, documented). regrole/TOAST stay
+      untouched; the regtype arm keeps its fixed bool (a separate catalog-schema gap,
+      new ledger row). Gates: `go test ./internal/executor/ ./internal/server/
+      ./internal/wal/`, pre-commit units, tpch-spotcheck (Q12=2, Q13=35) PASS. Tests:
+      `TestRegOutRendererVisibleOffPathQualifies` +
+      `TestPgoutputSnapshotRegOutRendererVisibleOffPathQualifies`. Design:
+      `docs/design/0119-0006-pgoutput-reg-names.md` §"Off-path schema qualification".
 
 - [x] **M0119-0010 — `char(N)` typmods are not restored per column on catalog
       reload** (source: M0127-P5.9-f, ledger row 2026-08-05). **FIXED (2026-08-09).**
