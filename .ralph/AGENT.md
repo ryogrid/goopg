@@ -5,6 +5,23 @@
 target platform is x86_64 Linux only. See `.ralph/specs/GOAL_AND_REQUIREMENTS.md`
 for the authoritative goals; pick work from `.ralph/fix_plan.md`.
 
+## Subagent execution model (coordinator edition)
+
+The Ralph loop runs a **coordinator** session (strong model tier) that delegates
+all investigation, implementation, and gate execution to subagents defined in
+`.claude/agents/` (`researcher`, `implementer`, `tester`, `reviewer`).
+
+This file is the build/run/gate authority for **both** the coordinator and every
+subagent; each worker is directed to read it on its first round of a slice. The
+agent definitions additionally restate the safety-critical rules (cgroup memory
+cap, foreground-only gates, no `-count=1`, never `pkill -f`), and a brief from the
+coordinator narrows scope — it never relaxes these rules.
+
+Delegation artifacts (briefs and worker reports) live under
+`tmp/ralph-handoffs/<brief-id>/` — ephemeral scratch, never the system of record.
+Durable outcomes are the commit message, the design doc, the deferral ledger, and
+`.ralph/working_set.md`, all maintained by the coordinator.
+
 ## At Start of Session
 
 You MUST execute the following commands at the start of every session.
