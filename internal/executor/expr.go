@@ -577,11 +577,19 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 					if ctx != nil && ctx.Catalog != nil {
 						routines = ctx.Catalog.Routines()
 					}
-					if schema, sig, ok := catalog.RegprocedureNameAndSchema(uint32(oid), routines); ok {
-						if !regObjectSchemaVisible(ctx, schema) {
-							return NewStringDatum(schema + "." + sig), nil
-						}
-						return NewStringDatum(sig), nil
+					// format_procedure (regproc.c:326) qualifies only the NAME —
+					// quote_qualified_identifier(schema,name)(arglist) when the
+					// routine's schema is off the effective search_path, else
+					// quote_identifier(name)(arglist). Rendered through the SAME
+					// regOutQualified rule RegOut's regprocedure arm uses, so the
+					// ::regprocedure cast and a regprocedure-typed column cannot
+					// drift apart (Hard-won Rule #2). Previously this prefixed the
+					// WHOLE signature (`schema + "." + sig`), which skipped the
+					// quote_identifier on a mixed-case/quoted routine name.
+					// M0119-0006 (71st slice, deferral row 1338).
+					if schema, name, arglist, ok := catalog.RegprocedureNameParts(uint32(oid), routines); ok {
+						qualify := !regObjectSchemaVisible(ctx, schema)
+						return NewStringDatum(regOutQualified(schema, name, qualify) + "(" + arglist + ")"), nil
 					}
 					return v, nil
 				}

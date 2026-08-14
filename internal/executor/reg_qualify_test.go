@@ -196,6 +196,93 @@ func TestRegCollationQualifiesWithActualSchema(t *testing.T) {
 	}
 }
 
+// M0119-0006 (71st slice, deferral row 1338): format_procedure (regproc.c:326)
+// schema-qualifies ONLY the routine NAME — quote_qualified_identifier
+// (schema,name) when the routine is off the effective search_path, plain
+// quote_identifier(name) when visible — and appends the UNQUOTED format_type_be
+// arglist. The 69th slice left RegOut's regprocedure arm returning the bare
+// signature (`my_udf()` via catalog.RegprocedureName); this closes the gap on
+// the shared renderer. The parens must stay unquoted (pgQuoteIdent on
+// "int4out(integer)" would wrongly quote them).
+func TestRegOutRegprocedureQualifiesNameOnly(t *testing.T) {
+	ctx := regCopyCat(t)
+	im := ctx.Catalog.(*catalog.InMemory)
+	userFunc, err := ctx.Catalog.Routines().Create(&catalog.Routine{
+		Name:       "my_udf",
+		Schema:     "public",
+		ReturnType: catalog.Type{Name: "int4"},
+	}, false)
+	if err != nil {
+		t.Fatalf("Routines().Create: %v", err)
+	}
+	// qualify=true (the routine's schema off the effective search_path) prefixes
+	// the NAME with the schema; the empty arglist is appended unquoted.
+	if got := RegOut("regprocedure", userFunc.OID, ctx.Catalog, true); got != "public.my_udf()" {
+		t.Errorf("regprocedure(user routine) qualify=true = %q, want %q", got, "public.my_udf()")
+	}
+	// qualify=false (visible) keeps the bare name.
+	if got := RegOut("regprocedure", userFunc.OID, ctx.Catalog, false); got != "my_udf()" {
+		t.Errorf("regprocedure(user routine) qualify=false = %q, want %q", got, "my_udf()")
+	}
+
+	// With input args, the arglist is the format_type_be display list, still
+	// unqualified and unquoted.
+	userAdd, err := ctx.Catalog.Routines().Create(&catalog.Routine{
+		Name:       "my_add",
+		Schema:     "public",
+		ArgTypes:   []catalog.Type{{Name: "int4"}, {Name: "int4"}},
+		ArgModes:   []string{"i", "i"},
+		ReturnType: catalog.Type{Name: "int4"},
+	}, false)
+	if err != nil {
+		t.Fatalf("Routines().Create(my_add): %v", err)
+	}
+	if got := RegOut("regprocedure", userAdd.OID, ctx.Catalog, true); got != "public.my_add(integer,integer)" {
+		t.Errorf("regprocedure(my_add) qualify=true = %q, want %q", got, "public.my_add(integer,integer)")
+	}
+
+	// A mixed-case routine name is quote_identifier'd in BOTH arms — the
+	// on-path arm quotes it bare, the off-path arm under the schema.
+	quoted, err := ctx.Catalog.Routines().Create(&catalog.Routine{
+		Name:       "MyFunc",
+		Schema:     "public",
+		ArgTypes:   []catalog.Type{{Name: "int4"}},
+		ReturnType: catalog.Type{Name: "int4"},
+	}, false)
+	if err != nil {
+		t.Fatalf("Routines().Create(MyFunc): %v", err)
+	}
+	if got := RegOut("regprocedure", quoted.OID, ctx.Catalog, false); got != `"MyFunc"(integer)` {
+		t.Errorf("regprocedure(MyFunc) qualify=false = %q, want %q", got, `"MyFunc"(integer)`)
+	}
+	if got := RegOut("regprocedure", quoted.OID, ctx.Catalog, true); got != `public."MyFunc"(integer)` {
+		t.Errorf("regprocedure(MyFunc) qualify=true = %q, want %q", got, `public."MyFunc"(integer)`)
+	}
+
+	// A routine in a NON-public schema qualifies with that ACTUAL schema.
+	im.RegisterSchema("other_schema")
+	other, err := ctx.Catalog.Routines().Create(&catalog.Routine{
+		Name:       "other_func",
+		Schema:     "other_schema",
+		ReturnType: catalog.Type{Name: "int4"},
+	}, false)
+	if err != nil {
+		t.Fatalf("Routines().Create(other_func): %v", err)
+	}
+	if got := RegOut("regprocedure", other.OID, ctx.Catalog, true); got != "other_schema.other_func()" {
+		t.Errorf("regprocedure(other_schema.other_func) qualify=true = %q, want %q", got, "other_schema.other_func()")
+	}
+
+	// A builtin resolves in pg_catalog, which every search_path searches
+	// implicitly — never qualified, only the bare quoted name.
+	if got := RegOut("regprocedure", 43, ctx.Catalog, true); got != "int4out(integer)" {
+		t.Errorf("regprocedure(43) qualify=true = %q, want %q", got, "int4out(integer)")
+	}
+	if got := RegOut("regprocedure", 43, ctx.Catalog, false); got != "int4out(integer)" {
+		t.Errorf("regprocedure(43) qualify=false = %q, want %q", got, "int4out(integer)")
+	}
+}
+
 // A regrole OID not present in the role map is a DANGLING reference: upstream
 // regroleout emits the unquoted %u fallback (regproc.c:1609), never a quoted
 // name — RoleNameAtOID distinguishes a real role (quoted name) from a dangling

@@ -19831,16 +19831,23 @@ func pgArgTypeDisplayAlias(name string) string {
 // which (unlike regproc's bare name) also renders the INPUT argument-type
 // list so an overloaded name is disambiguated. pg_dump relies on this: e.g.
 // dumpOpclass/dumpOpfamily cast a pg_amproc.amproc OID to ::regprocedure.
-// Tries the generated pg_proc.dat OID index first (built-ins), then the live
-// routine registry (routines may be nil if the caller has none to hand — the
-// InMemory carries its own via Routines()). OUT-only routine parameters are
-// skipped (pg_proc.proargtypes itself only ever lists IN/INOUT/VARIADIC
-// args, so a built-in row never needs this filter). ok=false means oid
-// resolves to neither source; the caller falls back to the raw OID, matching
+// The NAME half is returned UNQUOTED and never schema-qualified here —
+// format_procedure's quote_identifier/quote_qualified_identifier rendering is
+// the renderers' job (RegOut/expr.go apply it from the qualify flag), since
+// the same parts serve both the visible and off-path arms. Tries the
+// generated pg_proc.dat OID index first (built-ins), then the live routine
+// registry (routines may be nil if the caller has none to hand — the InMemory
+// carries its own via Routines()). OUT-only routine parameters are skipped
+// (pg_proc.proargtypes itself only ever lists IN/INOUT/VARIADIC args, so a
+// built-in row never needs this filter). ok=false means oid resolves to
+// neither source; the caller falls back to the raw OID, matching
 // format_procedure's own numeric fallback for an unknown OID.
 func RegprocedureName(oid uint32, routines *Routines) (string, bool) {
-	_, sig, ok := RegprocedureNameAndSchema(oid, routines)
-	return sig, ok
+	_, name, arglist, ok := RegprocedureNameParts(oid, routines)
+	if !ok {
+		return "", false
+	}
+	return name + "(" + arglist + ")", true
 }
 
 // RegprocedureNameAndSchema is RegprocedureName plus the resolved schema, for
@@ -19849,9 +19856,28 @@ func RegprocedureName(oid uint32, routines *Routines) (string, bool) {
 // resolves to its declared schema, defaulting to "public" like every other
 // unset-namespace field in this file). DU-002 (M0119-0004) slice 412.
 func RegprocedureNameAndSchema(oid uint32, routines *Routines) (schema, sig string, ok bool) {
-	if argNames, ok := pgProcArgTypeNamesByOID[oid]; ok {
-		if name, nameOK := pgProcNamesByOID[oid]; nameOK {
-			return "pg_catalog", formatProcedureSignature(name, argNames), true
+	schema, name, arglist, ok := RegprocedureNameParts(oid, routines)
+	if !ok {
+		return "", "", false
+	}
+	return schema, name + "(" + arglist + ")", true
+}
+
+// RegprocedureNameParts resolves a pg_proc OID to the (schema, NAME, ARGLIST)
+// halves of its regprocedure display form `name(argtype1,argtype2)` —
+// format_procedure/regprocedureout (regproc.c). It exists so a renderer can
+// schema-qualify ONLY the NAME (quote_qualified_identifier on the routine,
+// format_procedure_internal's ruleutils.c logic) without re-quoting the
+// parens; the ARGLIST is the format_type_be display list (already run through
+// pgArgTypeDisplayAlias), returned unqualified exactly as format_procedure
+// renders it when not forced. A builtin always resolves to "pg_catalog"; a
+// CREATE FUNCTION-defined routine to its declared schema, defaulting to
+// "public" like every other unset-namespace field in this file.
+// M0119-0006 (71st slice, deferral row 1338).
+func RegprocedureNameParts(oid uint32, routines *Routines) (schema, name, arglist string, ok bool) {
+	if argNames, found := pgProcArgTypeNamesByOID[oid]; found {
+		if nm, nameOK := pgProcNamesByOID[oid]; nameOK {
+			return "pg_catalog", nm, formatProcedureArglist(argNames), true
 		}
 	}
 	if routines != nil {
@@ -19867,18 +19893,20 @@ func RegprocedureNameAndSchema(oid uint32, routines *Routines) (schema, sig stri
 			if schema == "" {
 				schema = "public"
 			}
-			return schema, formatProcedureSignature(r.Name, argNames), true
+			return schema, r.Name, formatProcedureArglist(argNames), true
 		}
 	}
-	return "", "", false
+	return "", "", "", false
 }
 
-func formatProcedureSignature(name string, argTypeNames []string) string {
+// formatProcedureArglist renders the INPUT argument-type display list — the
+// format_type_be (unqualified) half of format_procedure's `name(arglist)`.
+func formatProcedureArglist(argTypeNames []string) string {
 	args := make([]string, len(argTypeNames))
 	for i, a := range argTypeNames {
 		args[i] = pgArgTypeDisplayAlias(a)
 	}
-	return name + "(" + strings.Join(args, ",") + ")"
+	return strings.Join(args, ",")
 }
 
 // RegoperatorName resolves an operator OID to PG's "opr_name(lefttype,

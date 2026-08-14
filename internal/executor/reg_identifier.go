@@ -261,16 +261,23 @@ func RegOut(typeName string, oid uint32, cat catalog.Catalog, qualify bool) stri
 			}
 		}
 	case "regprocedure":
-		// RegprocedureName is nil-safe for routines; mirror appendTypedCellText,
-		// which passes nil when the catalog is nil. format_procedure's signature
-		// qualification (public.myfunc() when the proc is off the search path) is
-		// a separate machinery — see the deferral ledger row (69th slice).
+		// format_procedure (regproc.c:326): the routine NAME is ALWAYS
+		// quote_identifier'd, and schema-qualified via
+		// quote_qualified_identifier when the routine is NOT visible on the
+		// session's effective search_path (FunctionIsVisible) — the `qualify`
+		// flag the COPY/SELECT paths compute. The argument list (format_type_be)
+		// is appended UNQUOTED — qualifying only the NAME, never the parens
+		// (the 69th slice left them unquoted deliberately; pgQuoteIdent on
+		// "int4out(integer)" would wrongly quote them). A builtin resolves in
+		// pg_catalog, which every search_path searches implicitly, so it is
+		// never qualified — only the bare quoted name. M0119-0006 (71st slice,
+		// deferral row 1338).
 		var routines *catalog.Routines
 		if cat != nil {
 			routines = cat.Routines()
 		}
-		if sig, ok := catalog.RegprocedureName(oid, routines); ok {
-			return sig
+		if schema, name, arglist, ok := catalog.RegprocedureNameParts(oid, routines); ok {
+			return regOutQualified(schema, name, qualify) + "(" + arglist + ")"
 		}
 	case "regtype":
 		return RegtypeName(cat, oid, qualify)

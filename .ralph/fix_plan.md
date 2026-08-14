@@ -4017,9 +4017,39 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `docs/design/0119-0006-regcollation-actual-schema-qualifier.md` + README
       row (`0119-0006av`). Gates: package suites + pre-commit units +
       `TestPort_RegressSuite` + `scripts/tpch-spotcheck.sh` (Q12=2, Q13=35)
-      all PASS. Remaining open reg* deferrals: regprocedure `format_procedure`
-      signature qualification (row 1338), mixed-case role-name catalog folding
-      (row 1340).
+      all PASS.
+      **71st slice (2026-08-14): regprocedure qualifies only the routine NAME —
+      ledger row 1338 resolved.** The regprocedure arm returned the BARE
+      signature (`my_udf()` via `catalog.RegprocedureName`) where upstream
+      `regprocedureout` → `format_procedure_extended` (regproc.c:326)
+      schema-qualifies the routine NAME when it is off the session's effective
+      search_path and quote_identifiers the name in BOTH arms; the `format_type_be`
+      arglist is appended UNQUOTED. New `catalog.RegprocedureNameParts` resolves
+      an OID to the `(schema, name, arglist)` halves (refactored out of
+      `RegprocedureNameAndSchema`); the RegOut regprocedure arm routes them
+      through the family's shared `regOutQualified(schema, name, qualify)` and
+      appends the unquoted arglist. The `::regprocedure` cast path (expr.go) —
+      the sibling renderer — switched from the old `schema + "." + sig`
+      whole-signature prefix to the same form, fixing the on-path mixed-case
+      case too (`"MyFunc"(integer)` not `MyFunc(integer)`) and keeping the two
+      renderers byte-identical. Measured against a throwaway PG 18.3 oracle
+      (port 5599): default path renders `udf71(integer,text)` /
+      `"MyFunc71"(integer)` / `ragout71.other_func()` / `ragout71."Quoted
+      Other"(integer)`, `search_path=''` renders `public.udf71(integer,text)` /
+      `public."MyFunc71"(integer)`, `search_path=ragout71` renders bare
+      `other_func()` / `"Quoted Other"(integer)`, builtin `int4out(integer)`
+      never qualifies. Tests: `TestRegOutRegprocedureQualifiesNameOnly`,
+      `TestRegprocedureCastQuotesRoutineName`, sibling
+      `TestRegCopyAndSelectSiblingQualifyAgree` extended with a user routine.
+      Ledger: row 1338 resolved; 2 NEW rows filed (regprocin's name→OID input
+      still ToLower's quoted identifiers; the arglist's `format_type_be` does
+      not schema-qualify non-visible arg types). Design:
+      `docs/design/0119-0006-regprocedure-qualified-name.md` + README row
+      (`0119-0006aw`). Gates: package suites + pre-commit units +
+      `TestPort_RegressSuite` (242.3 s) + `scripts/tpch-spotcheck.sh`
+      (Q12=2, Q13=35) all PASS. Remaining open reg* deferrals: mixed-case
+      role-name catalog folding (row 1340), regprocin quoted-identifier input,
+      format_type_be arglist qualification.
 
 - [x] **M0119-0010 — `char(N)` typmods are not restored per column on catalog
       reload** (source: M0127-P5.9-f, ledger row 2026-08-05). **FIXED (2026-08-09).**

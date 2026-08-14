@@ -169,6 +169,27 @@ func TestRegCopyAndSelectSiblingQualifyAgree(t *testing.T) {
 		t.Errorf("regcollation(other_schema.oc) qualify=true = %q, want %q", sel, "other_schema.oc")
 	}
 
+	// A user routine in public, off a search_path that excludes it, must
+	// qualify its NAME (format_procedure qualifies only the name; the arglist
+	// stays unquoted) in both renderers (71st slice, deferral row 1338).
+	routine, err := cat.Routines().Create(&catalog.Routine{
+		Name:       "regproc_sibling_udf",
+		Schema:     "public",
+		ReturnType: catalog.Type{Name: "int4"},
+	}, false)
+	if err != nil {
+		t.Fatalf("Routines().Create: %v", err)
+	}
+	procTyp := catalog.Type{Name: "regprocedure"}
+	sel = string(srv.appendTypedCellText(nil, executor.NewIntDatum(int64(routine.OID)), procTyp, noPublic))
+	copyText = executor.RegOut("regprocedure", routine.OID, cat, true)
+	if sel != copyText {
+		t.Errorf("regprocedure(routine) qualify=true: SELECT=%q COPY=%q — renderers diverged", sel, copyText)
+	}
+	if sel != "public.regproc_sibling_udf()" {
+		t.Errorf("regprocedure(routine) qualify=true = %q, want %q", sel, "public.regproc_sibling_udf()")
+	}
+
 	// pg_catalog objects are implicitly visible and never qualify even when the
 	// search path is empty — both renderers agree on the bare name.
 	sel = string(srv.appendTypedCellText(nil, executor.NewIntDatum(1259), typ, noPublic))
