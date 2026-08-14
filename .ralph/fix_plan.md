@@ -4370,6 +4370,35 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       packages PASS; `scripts/tpch-spotcheck.sh` (Q12=2, Q13=35) +
       `TestPort_RegressSuite` (0 FAIL) PASS.
 
+      **80th slice (2026-08-14): array-of-`reg*` columns store 4-byte OID
+      elements, not text — deferral row 1306 resolved.** A `regclass[]` (and
+      `regtype[]`/`regprocedure[]`/`regrole[]`/`regcollation[]`/`regproc[]`) column
+      stored its elements as varlena text (`elemtype=25` in the array blob header)
+      where PG stores a 4-byte OID per element resolved through the element type's
+      input function (`array_in` → `ReadArrayStr` → `InputFunctionCallSafe`,
+      arrayfuncs.c) — the descriptor-vs-blob disagreement the scalar reg* family
+      (66th–68th slices) fixed for non-array columns. Two seams:
+      `coerceRowForConstraintChecks` skips `col.Type.IsArray`
+      (`operators_storage.go:2305`), so the 68th-slice name→OID route never ran;
+      and `pgarray.ElemTypeInfo` had no reg* arms, so `encodeArrayValuePG` fell to
+      text-element storage. Sibling-triplet fix: `ElemTypeInfo` gains the six
+      `isRegIdentifierTypeName` members (fixed 4-byte, align 'i', varlena=false);
+      `encodeArrayElem` gains a reg* case resolving name→OID via the shared
+      `regIdentifierInput` (ctx+pos threaded through the new `EncodeRowPGCtx`/
+      `encodeValuePGCtx`/`encodeArrayValuePGCtx` ctx-carrying siblings; the no-ctx
+      wrappers stay for non-writer callers and error on a name, never silently
+      store it); and `DecodeElemStyled` renders OID→name via the executor-threaded
+      `OutputStyle.RegOut` value (pgarray stays leaf — a value param, not an
+      import). Correction to row 1306's premise: the non-indexed defect was silent
+      TEXT storage, not a numeric-parse error — the "errors" symptom was the
+      INDEXED path only (filed below). Tests: `internal/pgarray/reg_elem_test.go` +
+      `internal/executor/reg_array_elem_test.go` (elemtype/size/align, name→OID
+      SQLSTATEs, OID 0 → `-`, sibling agreement), mutation-checked. Gates:
+      pgarray+executor packages, pre-commit units, `scripts/tpch-spotcheck.sh`
+      (Q12=2, Q13=35), `TestPort_RegressSuite` all PASS. Two new deferral rows:
+      btree array-key 0A000 (indexed `regclass[]`), WAL pgoutput reg*[] numeric
+      rendering. Design `0119-0006-reg-array-element-fidelity.md`.
+
 - [x] **M0119-0010 — `char(N)` typmods are not restored per column on catalog
       reload** (source: M0127-P5.9-f, ledger row 2026-08-05). **FIXED (2026-08-09).**
       Root cause: `DecodePGAttributePhysicalRow` never decoded `atttypmod`

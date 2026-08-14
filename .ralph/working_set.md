@@ -1,21 +1,42 @@
-(79th slice landed and committed — M0119-0006 continues)
+(80th slice landed and committed — M0119-0006 continues)
 
-**This loop (2026-08-14):** resolved deferral row 1305. `RegOut`'s regclass arm
-(`internal/executor/reg_identifier.go`) now falls through to
-`InMemory.ToastRelName` after the table/index lookups miss, so SELECT / COPY /
-reg*→text render a synthetic TOAST relation/index OID as
-`pg_toast.pg_toast_<oid>[_index]`, byte-identical to the `oid::regclass` CastExpr
-arm (`expr.go:826-828`). Commit `1e1afb5c`. Gates PASS: `scripts/tpch-spotcheck.sh`
-(Q12=2/Q13=35) + `TestPort_RegressSuite` (0 FAIL). Tests mutation-checked.
+**This loop (2026-08-14):** resolved deferral row 1306. Array-of-`reg*` columns
+(`regclass[]`/`regtype[]`/`regprocedure[]`/`regrole[]`/`regcollation[]`/`regproc[]`)
+now store **4-byte OID elements** (resolved name→OID on input, rendered OID→name on
+output) instead of the prior silent varlena-text elements — the descriptor-vs-blob
+disagreement (`elemtype=25` vs `_regclass`) the scalar reg* family (66th–68th) fixed
+for non-array columns. Sibling triplet: `pgarray.ElemTypeInfo` arms, `encodeArrayElem`
+name→OID via `regIdentifierInput` (ctx+pos threaded through `EncodeRowPGCtx`/
+`encodeValuePGCtx`/`encodeArrayValuePGCtx`), `DecodeElemStyled` OID→name via the
+executor-threaded `OutputStyle.RegOut` value (pgarray stays leaf). Commit `23c43a88`.
+Design `docs/design/0119-0006-reg-array-element-fidelity.md` (+README `0119-0006be`).
+Gates PASS: pgarray+executor units, pre-commit units, tpch-spotcheck (Q12=2/Q13=35),
+`TestPort_RegressSuite` (233 s). Mutation-checked.
 
-**Concurrency (do NOT re-block):** the SessionStart guard fired a FALSE POSITIVE.
-Exactly ONE independent ralph loop (mine, `400006`); the second `ralph_loop.sh`
-(`533756`) is its pipeline subshell (PPID = the real loop); the `kimi` session
-`365596` is an idle interactive monitor, not a writer (no `.go` edits in 5 min,
-no `.git/index.lock`, `epoll_wait`). Proceed solo.
+**Concurrency (do NOT re-block):** the SessionStart guard is a FALSE POSITIVE — one
+master `ralph_loop.sh` (`400006`) plus its per-iteration child (`550360`, the wrapper
+for this session). No second writer; no `.git/index.lock`.
 
-**Next step:** continue M0119-0006 (pg_amcheck server tier) per the banner. Open
-2026-08-14 reg* follow-up rows in `.ralph/deferral_ledger.md`: row 1306
-(array-of-reg* COPY FROM), row 1307 (22P04 unwrap for non-reg* COPY errors), and
-rows 1340/1343/1344/1347/1351 (role/user-type case-preservation + namespace
-catalog-representation). Pick ONE, brief a researcher → implementer as this loop did.
+**Two new deferral rows filed this loop (at ledger tail):**
+- btree array-key 0A000 — an indexed `regclass[]` column still errors on ANY insert
+  (`encodeArrayBTreeKey` → scalar element encoder has no reg* arm). Pre-existing,
+  unchanged by this slice, but now heap=4-byte vs index=error.
+- WAL `pgoutput` reg*[] renders numeric (`{1259}`) vs local SELECT names
+  (`{pg_class}`) — NEW sibling divergence (nil `OutputStyle.RegOut` in
+  `pgoDecodePhysicalValue`). Wire-text cosmetic; needs catalog threading into wal.
+
+**Next step:** continue M0119-0006 (pg_amcheck server tier) per the banner. Pick ONE
+of the open deferral rows and brief a researcher → implementer as this loop did:
+- Natural successors to this slice: the btree array-key 0A000 row (indexed reg*[]
+  columns error outright) or the WAL pgoutput reg*[] render row (both newly filed).
+- Older open reg* rows: 1307 (22P04 unwrap for non-reg* COPY errors — broad),
+  1340 (role case-preservation — blocked on catalog change), 1343 (user-type
+  namespace field), 1344 (routineArgTypeName case-fold), 1347 (empty-schema
+  visibility proxy), 1351 (OID-per-arg capture).
+- Or pivot to the original M0119-0006 scope: `box`/`int4range` key encodings and the
+  whole-database (unscoped) pg_amcheck run (ledger rows 2026-08-10).
+
+**NIGHTLY:** `ci/logs/action-items.md` run `20260814-011711` (enum, oid) is already
+filed AND both fixed this morning — nothing new to file. Two stray untracked test
+files predate this loop (`internal/pgnodes/int2_cast_test.go` M0123-S4,
+`internal/testport/datconnlimit_durability_test.go` M0122-0006) — leave alone.
