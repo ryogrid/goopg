@@ -636,7 +636,15 @@ func (p *parser) parseArgNameAndType(pos int, arg FunctionArg) (FunctionArg, err
 			// token isn't itself a separator.
 			next := p.cur()
 			if next.Kind == TokenIdent || (next.Kind == TokenKeyword && !isSeparatorKeyword(next.Keyword)) {
-				arg.Name = identText(nameTok)
+				if isMultiWordTypeStart(nameTok.Value, next) {
+					// `bit varying` / `double precision` / `timestamp with
+					// time zone` … is ONE type, not `arg_name type`. Rewind
+					// so parseColumnType consumes the whole multi-word
+					// spelling (M0119-0006, deferral 74th slice).
+					p.idx = save
+				} else {
+					arg.Name = identText(nameTok)
+				}
 			} else {
 				// Rewind: treat nameTok as the type name.
 				p.idx = save
@@ -683,6 +691,36 @@ func isSeparatorKeyword(k Keyword) bool {
 	switch k {
 	case KwDefault:
 		return true
+	}
+	return false
+}
+
+// isMultiWordTypeStart reports whether the identifier nameTok followed by the
+// lookahead token `next` opens a multi-word built-in type name that
+// parseColumnType consumes as ONE type. parseArgNameAndType uses it to
+// disambiguate `arg_name type` from a bare multi-word type in a function
+// argument list: in `f(bit varying)` the tokens are `bit` then `varying`,
+// which the generic `ident ident` heuristic would read as an argument named
+// "bit" of type "varying" — but PostgreSQL (gram.y func_type → Typename)
+// parses the pair as the single type `bit varying`. The set mirrors the
+// multi-word spellings parseColumnType/parseMultiWordTypeName/
+// parseIntervalColumnQualifier actually consume, so a rewind is always
+// followed by a successful full-type parse (M0119-0006, deferral 74th slice).
+func isMultiWordTypeStart(nameTok string, next Token) bool {
+	switch strings.ToLower(nameTok) {
+	case "double":
+		return next.Kind == TokenIdent && strings.EqualFold(next.Value, "precision")
+	case "character":
+		return next.Kind == TokenIdent && strings.EqualFold(next.Value, "varying")
+	case "bit":
+		return next.Kind == TokenIdent && strings.EqualFold(next.Value, "varying")
+	case "timestamp", "time":
+		// "with" is the KwWith keyword; "without" is an ordinary identifier
+		// (parseMultiWordTypeName accepts it via acceptIdentKeyword).
+		return (next.Kind == TokenKeyword && next.Keyword == KwWith) ||
+			(next.Kind == TokenIdent && strings.EqualFold(next.Value, "without"))
+	case "interval":
+		return next.Kind == TokenIdent && intervalTypmodField[strings.ToLower(next.Value)]
 	}
 	return false
 }

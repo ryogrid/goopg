@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -151,6 +152,58 @@ func TestParseCreateFunctionExplicitIN(t *testing.T) {
 	cf := stmts[0].(*CreateFunctionStmt)
 	if len(cf.Args) != 1 || cf.Args[0].Name != "x" {
 		t.Fatalf("Args = %+v, want one arg named x", cf.Args)
+	}
+}
+
+// TestParseCreateFunctionMultiWordArgTypes pins that a multi-word built-in
+// type in a function argument is consumed as ONE type, not misread as
+// `arg_name type`. Regression for M0119-0006 (74th slice deferral): the
+// generic `ident ident` heuristic in parseArgNameAndType read `bit varying`
+// as an argument named "bit" of type "varying" (and `double precision` →
+// name "double" type "precision"), while `timestamp with time zone` — whose
+// continuation is the KwWith keyword — was a syntax error. PostgreSQL's
+// grammar (gram.y func_type → Typename) parses the whole spelling as the
+// single type. The `name type` form with a real arg name is unaffected.
+func TestParseCreateFunctionMultiWordArgTypes(t *testing.T) {
+	cases := []struct {
+		src      string
+		name     string
+		typeName string
+		args     []int64
+	}{
+		{`CREATE FUNCTION f(bit varying) RETURNS void LANGUAGE sql AS $$ SELECT 1 $$`, "", "varbit", nil},
+		{`CREATE FUNCTION f(character varying) RETURNS void LANGUAGE sql AS $$ SELECT 1 $$`, "", "varchar", nil},
+		{`CREATE FUNCTION f(double precision) RETURNS void LANGUAGE sql AS $$ SELECT 1 $$`, "", "float8", nil},
+		{`CREATE FUNCTION f(timestamp with time zone) RETURNS void LANGUAGE sql AS $$ SELECT 1 $$`, "", "timestamptz", nil},
+		{`CREATE FUNCTION f(time with time zone) RETURNS void LANGUAGE sql AS $$ SELECT 1 $$`, "", "timetz", nil},
+		// Interval field qualifier is a multi-word type, not `name type`;
+		// the packed INTERVAL_TYPMOD rides in Args (YEAR TO MONTH, full prec).
+		{`CREATE FUNCTION f(interval year to month) RETURNS void LANGUAGE sql AS $$ SELECT 1 $$`, "", "interval", []int64{(6 << 16) | 0xFFFF}},
+		// The `name type` form still wins when the name is present.
+		{`CREATE FUNCTION f(a bit) RETURNS void LANGUAGE sql AS $$ SELECT 1 $$`, "a", "bit", nil},
+		{`CREATE FUNCTION f(a double precision) RETURNS void LANGUAGE sql AS $$ SELECT 1 $$`, "a", "float8", nil},
+		{`CREATE FUNCTION f(b timestamp with time zone) RETURNS void LANGUAGE sql AS $$ SELECT 1 $$`, "b", "timestamptz", nil},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.src)
+		if err != nil {
+			t.Errorf("parse %q: %v", tc.src, err)
+			continue
+		}
+		cf := stmts[0].(*CreateFunctionStmt)
+		if len(cf.Args) != 1 {
+			t.Errorf("%q: Args len = %d, want 1", tc.src, len(cf.Args))
+			continue
+		}
+		if cf.Args[0].Name != tc.name {
+			t.Errorf("%q: arg Name = %q, want %q", tc.src, cf.Args[0].Name, tc.name)
+		}
+		if cf.Args[0].Type.Name != tc.typeName {
+			t.Errorf("%q: type Name = %q, want %q", tc.src, cf.Args[0].Type.Name, tc.typeName)
+		}
+		if !reflect.DeepEqual(cf.Args[0].Type.Args, tc.args) {
+			t.Errorf("%q: type Args = %v, want %v", tc.src, cf.Args[0].Type.Args, tc.args)
+		}
 	}
 }
 

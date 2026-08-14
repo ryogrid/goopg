@@ -4224,6 +4224,44 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `0119-0006ba`. Gates: package suites + pre-commit units +
       `TestPort_RegressSuite` + `scripts/tpch-spotcheck.sh` (Q12=2, Q13=35) all
       PASS.
+      **76th slice (2026-08-14): multi-word built-in type names in CREATE
+      FUNCTION args are captured faithfully — deferral row 1349 (first half)
+      resolved.** `parseArgNameAndType`'s `ident ident` heuristic read the FIRST
+      word of a multi-word built-in type as an ARG NAME: `f(bit varying)` stored
+      arg name="bit" type="varying" (regprocedure arglist rendered `f(varying)`
+      where PG 18.3 renders `f(bit varying)`), `double precision`→`f(precision)`,
+      and `timestamp with time zone` — whose continuation `with` is the KwWith
+      keyword — was a SYNTAX ERROR in CREATE FUNCTION args. Fix: new
+      `isMultiWordTypeStart(nameTok, next Token)` (internal/parser/function.go)
+      recognizes a multi-word-type leader (double→precision, character→varying,
+      bit→varying, timestamp/time→with|without time zone,
+      interval→year|month|day|hour|minute|second) by its NEXT token and rewinds
+      `p.idx = save` so `parseColumnType` consumes the whole spelling — the same
+      canonical collapse CREATE TABLE columns already used (`bit varying`→`varbit`,
+      `double precision`→`float8`, `timestamp with time zone`→`timestamptz`,
+      `time with time zone`→`timetz`, `interval year to month`→`interval`+packed
+      typmod); the arg gets `Name=""` (bare, unnamed) exactly as if the canonical
+      single-word name had been written. Output side needed NO change: the
+      executor's `regprocedureArglist` renders the canonical name through the
+      shared `catalog.ArgTypeDisplayAlias` (74th slice), mapping varbit→bit
+      varying / float8→double precision / timestamptz→timestamp with time zone /
+      timetz→time with time zone, so the stored canonical name round-trips to
+      the user's SQL spelling byte-identically. Verified live vs a throwaway PG
+      18.3 oracle (5534): all seven multi-word CREATE FUNCTIONs succeed and
+      `oid::regprocedure` renders byte-identical signatures (`f_vchar(bit
+      varying)`, `f_cvarchar(character varying)`, `f_dp(double precision)`,
+      `f_ts(timestamp with time zone)`, `f_t(time with time zone)`,
+      `f_int(interval year to month)`, named `f_named(a bit, b double
+      precision)`); the created functions are callable with matching arg types
+      and DROP FUNCTION by the multi-word signature works on both engines.
+      Test: `TestParseCreateFunctionMultiWordArgTypes` (parser). Design:
+      `docs/design/0119-0006-multiword-arg-type-capture.md` + README row
+      `0119-0006bb`. Gates: package suites + pre-commit units +
+      `TestPort_RegressSuite` + `scripts/tpch-spotcheck.sh` (Q12=2, Q13=35) all
+      PASS. Re-filed as row 1351: the arglist still carries only the arg's NAME,
+      so a bare `char` arg is indistinguishable from OID-18 `"char"`, and char
+      varying/nchar/national character [varying] are not yet accepted as bare
+      types.
 
 - [x] **M0119-0010 — `char(N)` typmods are not restored per column on catalog
       reload** (source: M0127-P5.9-f, ledger row 2026-08-05). **FIXED (2026-08-09).**
