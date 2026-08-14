@@ -62,6 +62,15 @@ REGRESS_EXP="${REPO_ROOT}/postgres/src/test/regress/expected"
 export PATH="${PG_BIN}:${PATH}"
 export LD_LIBRARY_PATH="${PG_LIB}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
+# Export the same env vars pg_regress does for the C-language helper libs and
+# data files (postgres/src/test/regress/pg_regress.c:734
+# setenv("PG_ABS_SRCDIR", inputdir, 1)). test_setup.sql:6-8 imports them via
+# \getenv and builds \set filename / \set regresslib from them; without these
+# every COPY ... FROM :'filename' fails and the base tables stay empty.
+export PG_ABS_SRCDIR="${REGRESS_SQL%/*}"   # postgres/src/test/regress (holds data/ and regress.so)
+export PG_LIBDIR="${REGRESS_SQL%/*}"
+export PG_DLSUFFIX=".so"
+
 # -------------------------------------------------------------------------- #
 # Defaults
 # -------------------------------------------------------------------------- #
@@ -209,12 +218,11 @@ PSQL=(psql -h 127.0.0.1 -p "${PORT}" -U postgres -d postgres --no-psqlrc -X -a -
 # -------------------------------------------------------------------------- #
 if [[ "$RUN_SETUP" -eq 1 ]]; then
     echo "pg-regress-runner: running test_setup.sql (errors are expected for unimplemented features)..."
-    # Strip \getenv and \set meta-commands (load external variables) which
-    # are specific to pg_regress and not standard psql.
-    SETUP_TMP="$(mktemp /tmp/regress-setup-XXXXXX.sql)"
-    grep -vE '^\s*\\(getenv|set\s|setenv)' "${REGRESS_SQL}/test_setup.sql" > "${SETUP_TMP}" || true
-    "${PSQL[@]}" -f "${SETUP_TMP}" >/dev/null 2>&1 || true
-    rm -f "${SETUP_TMP}"
+    # Run the file un-stripped: \getenv/\set are standard psql meta-commands
+    # (the vars come from PG_ABS_SRCDIR/PG_LIBDIR/PG_DLSUFFIX exported above),
+    # and test_setup.sql has no \setenv. Best-effort: the C-language regresslib
+    # CREATE FUNCTIONs cannot load in goopg, so tolerate their failures.
+    "${PSQL[@]}" -f "${REGRESS_SQL}/test_setup.sql" >/dev/null 2>&1 || true
     echo "pg-regress-runner: setup done."
 fi
 
