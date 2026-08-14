@@ -101,6 +101,55 @@ Planner-behavior slices (own efforts, larger):
 S7 → S10a (correctness) → S4 (small, independent, anytime). S8/S9 are cost-model
 line work.
 
+## S2 design (class 3) — resolved 2026-08-15
+
+**PG rules (oracle `explain.c`):** plain output is `Function Scan on <funcname>
+[<refname>]`, where `<refname>` (the FROM-item alias) is printed **only when it
+differs from `<funcname>`** (`explain.c:4490-4500`); verbose additionally
+qualifies the schema (`Function Scan on pg_catalog.generate_series s1`). The
+`Function Call: <deparse>` line is **verbose-only** (`explain.c:2067-2083`),
+emitted before Filter. `ProjectSet` renders a bare `ProjectSet` label (no `on`,
+no Function Call) and exposes its child (`explain.c:1382-1384`).
+
+**Correction to the working-set note:** PG never auto-generates `s1`/`s2` — the
+`s1`/`s2` in the diff are **user-written aliases**; the default alias (no `AS`)
+is the function name itself, which is exactly the case where the alias is
+omitted from the label (`refname == objectname`).
+
+**Design (minimal planner stamp + executor render):**
+
+- **Planner** (`internal/planner/plan.go` + `planner.go`): add an `Alias string`
+  field to the four FROM-SRF nodes (`GenerateSeries`, `GenerateSubscripts`,
+  `FromUnnest`, `UserSrfScan`) — NOT `ProjectSet` (bare label). Stamp
+  `Alias: alias` at each construction site, where `alias` is already computed as
+  `rv.Alias` or the default lowercased funcname (`planner.go:4590-4593`
+  generate_series, `4793-4796` generate_subscripts, `4470-4473` user SRF).
+  Backward-compatible (execution ignores the field).
+- **Executor** (`internal/executor/operators_explain.go`): add `describePlan`
+  cases before the `%T` fallback (~1758) — `GenerateSeries`→`generate_series`,
+  `GenerateSubscripts`→`generate_subscripts`, `FromUnnest`→`unnest`,
+  `UserSrfScan`→`Routine.QualifiedName()`, `ProjectSet`→`ProjectSet` — via a
+  helper that appends ` <alias>` iff `alias != "" && alias != funcName`.
+  Add `describePlanVerbose` cases (~1533) for the schema-qualified label. Add
+  `planChildren` case for `ProjectSet`→`[Child]` (~1851). Add the verbose-only
+  `Function Call:` line (build a synthetic `planner.FuncCall{Name, Args}` and
+  render via the existing `formatExprQual` `FuncCall` case, ~1022).
+
+**Out of scope (separate slices, noted not lost):** class 10 `Output:`
+qualification (`s1` vs `s1.s1`) — needs SRF cases in `explainRelBaseName`
+(`explain_names.go:211`) so `qualify()` prefixes the rel name; SRF alias
+disambiguation (`_1`/`_2` suffixes) is not wired because `explainNames` is built
+from the plan tree with no SRF cases; SQL-function inlining (`Subquery Scan on f`
+for inlinable user SRFs, `window.sql`) is a planner-behavior gap. Three further
+residuals confirmed live by S2 (deferral-ledger rows): (a) sibling SRF nodes
+(`RowsFrom`, `ScalarFuncScan`, `PgPartitionTree`, etc.) still render via `%T` —
+PG shows a `Function Scan on <refname>` label with objectname NULL for a
+multi-function ROWS FROM (`explain.c:4427`); (b) `Function Call:` arg deparse of
+an array constructor renders `array_construct(...)` where PG renders
+`ARRAY[...]`; (c) verbose detail ordering — goopg emits `Function Call:` before
+`Output:` (emitNodeDetailLines runs before the verbose Output block) where PG
+emits `Output:` first (`explain.c:1933` before `2067`), a class-10 sub-item.
+
 ## Cross-case relevance
 
 Every M0134 regress case whose `.sql` emits `EXPLAIN` inherits the formatter

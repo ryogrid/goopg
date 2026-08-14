@@ -1389,6 +1389,9 @@ type GenerateSeries struct {
 	Start  Expr
 	Stop   Expr
 	Step   Expr // nil means step=1
+	// Alias is the FROM-clause alias; defaults to the function name when
+	// not specified. Consumed by the EXPLAIN Function Scan label.
+	Alias  string
 	schema Schema
 }
 
@@ -1398,6 +1401,9 @@ type UserSrfScan struct {
 	pos     int
 	Routine *catalog.Routine
 	Args    []Expr
+	// Alias is the FROM-clause alias; defaults to the lowercased function
+	// name when not specified. Consumed by the EXPLAIN Function Scan label.
+	Alias   string
 	schema  Schema
 }
 
@@ -1414,6 +1420,9 @@ type GenerateSubscripts struct {
 	ArrExpr  Expr
 	Dim      Expr
 	Reversed Expr // optional; nil = false
+	// Alias is the FROM-clause alias; defaults to the function name when
+	// not specified. Consumed by the EXPLAIN Function Scan label.
+	Alias    string
 	schema   Schema
 }
 
@@ -1432,6 +1441,9 @@ type FromUnnest struct {
 	pos      int
 	ArrExpr  Expr   // single-arg form (len(ArrExprs)==0)
 	ArrExprs []Expr // multi-arg form (len>=2)
+	// Alias is the FROM-clause alias; defaults to "unnest" when not
+	// specified. Consumed by the EXPLAIN Function Scan label.
+	Alias    string
 	schema   Schema
 }
 

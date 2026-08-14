@@ -485,7 +485,7 @@ func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.Explai
 	// label plus 2 spaces, mirroring PG's `Sort Key:` / `Index
 	// Cond:` / `Filter:` indent convention.
 	detailIndent := strings.Repeat(" ", len(prefix)+2)
-	emitNodeDetailLines(n, detailIndent, rows, attachedFilter, reg)
+	emitNodeDetailLines(n, detailIndent, opts.Verbose, rows, attachedFilter, reg)
 
 	if opts.Verbose {
 		if cols := schemaColumnNames(n); len(cols) > 0 {
@@ -570,7 +570,7 @@ func emitSubPlanSubtrees(rows *[]Row, detailIndent string, opts parser.ExplainOp
 // belong under n (Sort Key / Index Cond / Filter). attachedFilter
 // is a Filter.Predicate from a Filter wrapper above n that was
 // skipped — it surfaces as `Filter:` when n is a scan-like node.
-func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFilter planner.Expr, reg *subPlanReg) {
+func emitNodeDetailLines(n planner.Node, indent string, verbose bool, rows *[]Row, attachedFilter planner.Expr, reg *subPlanReg) {
 	// M0125-0039: whether this node's detail lines print qualified column
 	// references. Upstream splits the decision by node kind — show_scan_qual
 	// deparses a scan's `Filter:`/`Index Cond:` with varprefix=false, while
@@ -683,6 +683,22 @@ func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFil
 			*rows = append(*rows, Row{NewStringDatum(indent + "Cache Key: " + strings.Join(parts, ", "))})
 		}
 	case *planner.SeqScan:
+		if attachedFilter != nil {
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+		}
+	case *planner.GenerateSeries, *planner.GenerateSubscripts, *planner.FromUnnest, *planner.UserSrfScan:
+		// M0134-0001 P2 S2: the verbose-only `Function Call:` deparse
+		// (explain.c T_FunctionScan 2067-2083), emitted before any
+		// Filter. Built from a synthetic FuncCall and rendered through
+		// the existing FuncCall case so `generate_series(1, 3)` is
+		// byte-identical to PG. Not emitted for ProjectSet (no case
+		// here).
+		if verbose {
+			if name, args := srfFunctionCallArgs(n); name != "" {
+				fc := &planner.FuncCall{Name: name, Args: args}
+				*rows = append(*rows, Row{NewStringDatum(indent + "Function Call: " + formatExprQual(fc, reg, qualify))})
+			}
+		}
 		if attachedFilter != nil {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
 		}
@@ -1259,7 +1275,7 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 	*rows = append(*rows, Row{NewStringDatum(label)})
 
 	detailIndent := strings.Repeat(" ", len(prefix)+2)
-	emitNodeDetailLines(n, detailIndent, rows, attachedFilter, reg)
+	emitNodeDetailLines(n, detailIndent, opts.Verbose, rows, attachedFilter, reg)
 
 	// IndexOnlyScan emits a "Heap Fetches: N" detail line under ANALYZE,
 		// matching upstream's text format (design 0118-0102).
@@ -1529,6 +1545,61 @@ func schemaQualify(name string) string {
 	return "public." + name
 }
 
+// srfFunctionScanLabel builds the plain EXPLAIN label for a set-returning
+// function scan node. PG prints the FROM-item alias (refname) only when it
+// differs from the function name (explain.c:4498); the default alias — no
+// AS clause — IS the function name, so it is omitted.
+func srfFunctionScanLabel(funcName, alias string) string {
+	if alias != "" && alias != funcName {
+		return "Function Scan on " + funcName + " " + alias
+	}
+	return "Function Scan on " + funcName
+}
+
+// srfFunctionScanLabelQualified is the verbose counterpart of
+// srfFunctionScanLabel: the schema is qualified in the label (explain.c
+// 4493-4495), but the alias is still omitted only when it equals the BARE
+// function name — PG compares refname against get_func_name(objectname),
+// never the namespace-qualified spelling (explain.c:4498).
+func srfFunctionScanLabelQualified(qualified, bareFuncName, alias string) string {
+	label := "Function Scan on " + qualified
+	if alias != "" && alias != bareFuncName {
+		label += " " + alias
+	}
+	return label
+}
+
+// srfFunctionCallArgs returns the synthetic FuncCall name and argument list
+// for an SRF scan node's verbose-only `Function Call:` detail line (PG
+// explain.c T_FunctionScan 2067-2083). Returns ("", nil) for node kinds that
+// carry no function call (e.g. ProjectSet). UserSrfScan uses the BARE
+// routine name: PG deparses rtfunc->funcexpr, whose FuncExpr name is
+// unqualified — the schema is carried only by the label above.
+func srfFunctionCallArgs(n planner.Node) (string, []planner.Expr) {
+	switch p := n.(type) {
+	case *planner.GenerateSeries:
+		args := []planner.Expr{p.Start, p.Stop}
+		if p.Step != nil {
+			args = append(args, p.Step)
+		}
+		return "generate_series", args
+	case *planner.GenerateSubscripts:
+		args := []planner.Expr{p.ArrExpr, p.Dim}
+		if p.Reversed != nil {
+			args = append(args, p.Reversed)
+		}
+		return "generate_subscripts", args
+	case *planner.FromUnnest:
+		if p.ArrExpr != nil {
+			return "unnest", []planner.Expr{p.ArrExpr}
+		}
+		return "unnest", p.ArrExprs
+	case *planner.UserSrfScan:
+		return p.Routine.Name, p.Args
+	}
+	return "", nil
+}
+
 // describePlanVerbose returns the plan-node description; verbose=true adds schema qualification.
 func describePlanVerbose(n planner.Node, verbose bool, nm *explainNames) string {
 	if !verbose {
@@ -1568,6 +1639,16 @@ func describePlanVerbose(n planner.Node, verbose bool, nm *explainNames) string 
 		return "Update on " + schemaQualify(p.Table.QualifiedName())
 	case *planner.Delete:
 		return "Delete on " + schemaQualify(p.Table.QualifiedName())
+	case *planner.GenerateSeries:
+		// M0134-0001 P2 S2: verbose Function Scan label qualifies the
+		// schema (explain.c:4493-4495); builtin SRFs live in pg_catalog.
+		return srfFunctionScanLabelQualified("pg_catalog.generate_series", "generate_series", p.Alias)
+	case *planner.GenerateSubscripts:
+		return srfFunctionScanLabelQualified("pg_catalog.generate_subscripts", "generate_subscripts", p.Alias)
+	case *planner.FromUnnest:
+		return srfFunctionScanLabelQualified("pg_catalog.unnest", "unnest", p.Alias)
+	case *planner.UserSrfScan:
+		return srfFunctionScanLabelQualified(p.Routine.QualifiedName(), p.Routine.Name, p.Alias)
 	}
 	return describePlan(n, nm)
 }
@@ -1754,6 +1835,26 @@ func describePlan(n planner.Node, nm *explainNames) string {
 		// two-node HashAggregate/Append shape PG uses there is a
 		// deferral-ledger row, not a silent divergence.
 		return setOpNodeName(p)
+	case *planner.GenerateSeries:
+		// M0134-0001 P2 S2: SRF FROM-clause scans render as PG's
+		// `Function Scan on <func> [<alias>]` (explain.c T_FunctionScan
+		// 1465-1466) instead of leaking the Go type via the %T fallback.
+		return srfFunctionScanLabel("generate_series", p.Alias)
+	case *planner.GenerateSubscripts:
+		return srfFunctionScanLabel("generate_subscripts", p.Alias)
+	case *planner.FromUnnest:
+		return srfFunctionScanLabel("unnest", p.Alias)
+	case *planner.UserSrfScan:
+		// PG's get_func_name returns the BARE function name in both plain
+		// and verbose modes; the schema is prepended only under VERBOSE
+		// (explain.c:4490-4500: plain emits ` <objectname>`, verbose emits
+		// ` <namespace>.<objectname>`). So plain output must not qualify.
+		return srfFunctionScanLabel(p.Routine.Name, p.Alias)
+	case *planner.ProjectSet:
+		// PG renders a SELECT-list SRF as a bare `ProjectSet` label
+		// (explain.c T_ProjectSet 1382-1384): no `on <funcname>`, no
+		// Function Call detail. Its child renders beneath it.
+		return "ProjectSet"
 	}
 	return fmt.Sprintf("%T", n)
 }
@@ -1916,6 +2017,12 @@ func planChildren(n planner.Node) []planner.Node {
 			return setOpAppendBranches(p, nil)
 		}
 		return []planner.Node{p.Left, p.Right}
+	case *planner.ProjectSet:
+		// M0134-0001 P2 S2: a SELECT-list SRF's child plan renders
+		// beneath the bare `ProjectSet` label (mirrors PG, which walks
+		// ProjectSet's single child). Without this case the whole subtree
+		// was invisible after the label.
+		return []planner.Node{p.Child}
 	}
 	return nil
 }

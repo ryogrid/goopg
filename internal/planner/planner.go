@@ -4543,7 +4543,7 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 							schema = Schema{SchemaColumn{Name: colName, Type: catalog.Type{Name: retTypeName}, SourceTableIdx: sourceIdx}}
 						}
 					}
-					node := &UserSrfScan{pos: tf.Pos(), Routine: r, Args: resolvedArgs, schema: schema}
+					node := &UserSrfScan{pos: tf.Pos(), Routine: r, Args: resolvedArgs, Alias: alias, schema: schema}
 					b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 					if tf.WithOrdinality {
 						node2, b2 := wrapOrdinality(node, b, rv, sourceIdx)
@@ -4614,7 +4614,7 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 		},
 	}
 	schema := Schema{SchemaColumn{Name: colName, Type: catalog.Type{Name: seriesType}, SourceTableIdx: sourceIdx}}
-	node := &GenerateSeries{pos: tf.Pos(), Start: start, Stop: stop, Step: step, schema: schema}
+	node := &GenerateSeries{pos: tf.Pos(), Start: start, Stop: stop, Step: step, Alias: alias, schema: schema}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	if tf.WithOrdinality {
 		node2, b2 := wrapOrdinality(node, b, rv, sourceIdx)
@@ -4805,7 +4805,7 @@ func planGenerateSubscripts(rv parser.RangeVar, sourceIdx int16, lateralCtx *res
 		},
 	}
 	schema := Schema{SchemaColumn{Name: colName, Type: catalog.Type{Name: "int4"}, SourceTableIdx: sourceIdx}}
-	node := &GenerateSubscripts{pos: tf.Pos(), ArrExpr: arrExpr, Dim: dimExpr, Reversed: revExpr, schema: schema}
+	node := &GenerateSubscripts{pos: tf.Pos(), ArrExpr: arrExpr, Dim: dimExpr, Reversed: revExpr, Alias: alias, schema: schema}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	return node, b, nil
 }
@@ -4928,7 +4928,7 @@ func planFromUnnest(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveCont
 			},
 		}
 		schema := Schema{SchemaColumn{Name: colName, Type: elemType, SourceTableIdx: sourceIdx}}
-		node := &FromUnnest{pos: tf.Pos(), ArrExpr: arrExpr, schema: schema}
+		node := &FromUnnest{pos: tf.Pos(), ArrExpr: arrExpr, Alias: alias, schema: schema}
 		b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 		if tf.WithOrdinality {
 			node2, b2 := wrapOrdinality(node, b, rv, sourceIdx)
@@ -4969,7 +4969,7 @@ func planFromUnnest(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveCont
 		schema = append(schema, SchemaColumn{Name: colName, Type: elemType, SourceTableIdx: sourceIdx})
 	}
 	tbl := &catalog.Table{Name: alias, Columns: tableCols}
-	node := &FromUnnest{pos: tf.Pos(), ArrExprs: arrExprs, schema: schema}
+	node := &FromUnnest{pos: tf.Pos(), ArrExprs: arrExprs, Alias: alias, schema: schema}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	if tf.WithOrdinality {
 		node2, b2 := wrapOrdinality(node, b, rv, sourceIdx)
