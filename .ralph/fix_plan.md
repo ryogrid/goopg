@@ -4099,8 +4099,59 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       (vs 242.3 s last slice), and the regproc regress case PASSes standalone
       in 6.2 s. Bundle preserved at tmp/regress-wedge/returning/ (goroutine
       dump, pg_stat_activity, server-log-tail). Remaining open reg* deferrals:
-      mixed-case role-name catalog folding (row 1340), the arglist's
-      `format_type_be` schema qualification.
+      mixed-case role-name catalog folding (row 1340) plus the six the 73rd
+      slice filed below (bare arg-type schema resolution, quoted-name case loss,
+      catalog builtin-array alias gap, ArgTypeDisplayAlias switch gaps,
+      empty-schema visibility proxy, regproc/regprocedure INPUT DB-scoping bug).
+
+      **73rd slice (2026-08-14): regprocedure arglist schema-qualifies
+      non-visible arg types — ledger row 1342 resolved.** The arglist now
+      reproduces `format_type_be`'s per-arg qualification:
+      `format_procedure_extended` (regproc.c:326) passes each arg type through
+      `format_type_be` (format_type.c:314), which emits `schema.typename` when
+      the type's namespace is off the session's effective search_path and the
+      bare alias otherwise. goopg captured the missing half at CREATE — new
+      `Routine.ArgTypeSchemas` (parallel to `ArgTypes`,
+      internal/catalog/routines.go) records each arg type's EXPLICIT schema via
+      `argTypeSchema` returning the parser's `ColumnType.Schema` verbatim
+      (operators_ddl.go, both CREATE FUNCTION and CREATE PROCEDURE), and rides
+      the existing proargdefaults JSON round-trip so pre-73rd data dirs reload
+      with nil → "" → bare (backward compatible). The render half:
+      `catalog.RegprocedureNameParts` now returns `[]RegprocArg{Name, Schema}`
+      per arg (builtin path stamps `pg_catalog`; user path reads
+      `ArgTypeSchemas[i]` nil-defensively), and the executor-side
+      `regprocedureArglist` (reg_identifier.go) aliases builtin/pg_catalog args
+      through the exported `catalog.ArgTypeDisplayAlias`, schema-qualifies a
+      non-visible user arg via `quoteQualifiedIdentifier` with the `[]` array
+      suffix split/re-appended (`offpath."mytype[]"` never happens; a user-path
+      builtin array aliases `integer[]`), and leaves a BARE-name user arg bare
+      (owner schema unresolvable — deferral). The session visibility predicate
+      threads as a variadic `visible` param through `RegOutArgVisible` /
+      `appendTypedCellText` (SELECT simple-query) / `EncodeCopyTextRow` /
+      `EncodeCopyCsvRow` (COPY TO) and the `::regprocedure` cast sibling in
+      expr.go — all four paths agree (Hard-won Rule #2). Measured against a
+      fresh goopg cluster + PG 18.3 oracle: `f_offarg(offpath.mytype)` (was
+      `f_offarg(mytype)`), `f_offarr(offpath.mytype[])`, `f_offrow(offpath.ct)`,
+      `f_onarg(onpath.mytype)` (name + off-path arg both qualify),
+      `f_builtin(integer)` stays bare, a user type NAMED `int` quotes like PG
+      (`offpath."int"`), and the cast path additionally qualifies the NAME
+      (`offpath.f_offboth(offpath.mytype)`) where the wire path's name stays bare
+      via the documented 69th-slice proxy. One measured limitation filed as a
+      deferral: `SET search_path = public, offpath` cannot make the `offpath`
+      arg render bare yet (searchPathSchemas' LookupTable existence proxy never
+      sees an empty schema). Tests:
+      `TestRegOutRegprocedureQualifiesArgTypes` (reg_qualify_test.go),
+      `TestRegprocedureCastArgTypesQualify` +
+      `TestCreateFunctionCapturesArgTypeSchemas` (regoperator_schema_qualify_test.go),
+      sibling `TestRegCopyAndSelectSiblingArgQualifyAgree`
+      (reg_copy_sibling_test.go). Ledger: row 1342 resolved; 6 NEW rows filed
+      (bare-name arg-type schema resolution, quoted-name case loss at CREATE,
+      catalog builtin-array alias gap, ArgTypeDisplayAlias switch gaps,
+      empty-schema visibility proxy, regproc/regprocedure INPUT DB-scoping bug).
+      Design: `docs/design/0119-0006-regprocedure-argtype-schema-qualify.md` +
+      README row. Gates: package suites + pre-commit units +
+      `TestPort_RegressSuite` (239.7 s) + `scripts/tpch-spotcheck.sh`
+      (Q12=2, Q13=35) all PASS.
 
 - [x] **M0119-0010 — `char(N)` typmods are not restored per column on catalog
       reload** (source: M0127-P5.9-f, ledger row 2026-08-05). **FIXED (2026-08-09).**

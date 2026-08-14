@@ -11768,11 +11768,13 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 	argNames := make([]string, len(s.Args))
 	argModes := make([]string, len(s.Args))
 	argDefaults := make([]string, len(s.Args))
+	argTypeSchemas := make([]string, len(s.Args))
 	for i, a := range s.Args {
 		argTypes[i] = catalog.Type{
 			Name: routineArgTypeName(a.Type),
 			Args: append([]int64(nil), a.Type.Args...),
 		}
+		argTypeSchemas[i] = argTypeSchema(a.Type)
 		argNames[i] = a.Name
 		switch a.Mode {
 		case parser.FuncArgIn:
@@ -11822,13 +11824,14 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 		retTypeName += "[]"
 	}
 	r := &catalog.Routine{
-		DBOid:       catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid),
-		Schema:      schema,
-		Name:        s.Name.Name,
-		ArgNames:    argNames,
-		ArgTypes:    argTypes,
-		ArgModes:    argModes,
-		ArgDefaults: argDefaults,
+		DBOid:          catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid),
+		Schema:         schema,
+		Name:           s.Name.Name,
+		ArgNames:       argNames,
+		ArgTypes:       argTypes,
+		ArgTypeSchemas: argTypeSchemas,
+		ArgModes:       argModes,
+		ArgDefaults:    argDefaults,
 		ReturnType: catalog.Type{
 			// Mirror the argument-type path above: the parser stores an array
 			// return type as the base name (e.g. "integer") with IsArray set,
@@ -12505,6 +12508,7 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 	argNames := make([]string, len(s.Args))
 	argModes := make([]string, len(s.Args))
 	argDefaults := make([]string, len(s.Args))
+	argTypeSchemas := make([]string, len(s.Args))
 	// Validate: VARIADIC must be last; OUT can't follow default IN.
 	variadicSeen := false
 	defaultSeen := false
@@ -12529,6 +12533,7 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 			Name: routineArgTypeName(a.Type),
 			Args: append([]int64(nil), a.Type.Args...),
 		}
+		argTypeSchemas[i] = argTypeSchema(a.Type)
 		argNames[i] = a.Name
 		switch a.Mode {
 		case parser.FuncArgIn:
@@ -12597,6 +12602,7 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 		Name:            s.Name.Name,
 		ArgNames:        argNames,
 		ArgTypes:        argTypes,
+		ArgTypeSchemas:  argTypeSchemas,
 		ArgModes:        argModes,
 		ArgDefaults:     argDefaults,
 		Language:        lang,

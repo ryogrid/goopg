@@ -74,16 +74,21 @@ func RunCopyTo(ctx *Context, plan *planner.Copy, emit func([]byte) error) (count
 		}
 	}
 	// M0119-0006 (68th slice): the catalog + search-path-qualify flag the reg*
-	// renderer needs. qualify is the negation of regObjectSchemaVisible — a
+	// renderer needs. qualify is the negation of RegObjectSchemaVisible — a
 	// regtype name is schema-qualified only when "public" is NOT on the
 	// session's effective search_path, the same rule the SELECT path applies
-	// via internal/server's publicSchemaVisible. A nil ctx keeps both nil/false
-	// (numeric rendering), matching the pre-68th callers.
+	// via internal/server's publicSchemaVisible. argVisible is the regprocedure
+	// ARGLIST's per-arg-type visibility predicate (73rd slice, deferral row
+	// 1342) — RegObjectSchemaVisible per schema, exactly what the SELECT wire
+	// path passes. A nil ctx keeps all nil/false (numeric rendering), matching
+	// the pre-68th callers.
 	var cat catalog.Catalog
 	qualify := false
+	var argVisible func(s string) bool
 	if ctx != nil {
 		cat = ctx.Catalog
-		qualify = !regObjectSchemaVisible(ctx, "public")
+		qualify = !RegObjectSchemaVisible(ctx, "public")
+		argVisible = func(s string) bool { return RegObjectSchemaVisible(ctx, s) }
 	}
 
 	src, cols, projection, buildErr := buildCopySource(plan)
@@ -131,9 +136,9 @@ func RunCopyTo(ctx *Context, plan *planner.Copy, emit func([]byte) error) (count
 		case binary:
 			buf, encErr = AppendCopyBinaryRow(buf, row, cols)
 		case format.csv:
-			buf, encErr = EncodeCopyCsvRow(buf, row, cols, format, dateStyle, dateOrder, timeZone, cat, qualify)
+			buf, encErr = EncodeCopyCsvRow(buf, row, cols, format, dateStyle, dateOrder, timeZone, cat, qualify, argVisible)
 		default:
-			buf, encErr = EncodeCopyTextRow(buf, row, cols, dateStyle, dateOrder, timeZone, cat, qualify)
+			buf, encErr = EncodeCopyTextRow(buf, row, cols, dateStyle, dateOrder, timeZone, cat, qualify, argVisible)
 		}
 		if encErr != nil {
 			return count, binary, encErr

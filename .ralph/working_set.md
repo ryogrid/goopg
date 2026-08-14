@@ -1,59 +1,74 @@
 (idle — nothing in flight)
 
-Completed this loop: **M0119-0006 72nd slice** — the reg* name→OID **input**
-half now honors double-quoted identifiers exactly like upstream
-`stringToQualifiedNameList` → `SplitIdentifierString` (varlena.c:3581), closing
-ledger row 1341. Before, every reg* input arm ran the whole candidate through
-`strings.ToLower` + a dumb first-dot `splitQualifiedTable`, so `'"MyFunc"'::regproc`
-reached `LookupByName` with literal quotes → 42883 (PG 18.3 resolves it), and a
-quoted segment's case was mangled / `.` inside quotes was split / a quoted role
-with `.` was false-flagged as qualified. New shared parser in reg_identifier.go:
-`splitRegIdentifiers` (full SplitIdentifierString port: quoted segment keeps case
-with `""`→`"` collapse, unquoted segment downcased, whitespace skipped, syntax
-error → 42602) and `splitRegQualifiedName` (first segment = schema, rest joined
-with `.`). Every arm of `regIdentifierInput` (regclass/regtype/regproc/
-regprocedure/regrole/regcollation) feeds through it, AND the expr.go sibling
-sites — `::regproc`/`::regprocedure` cast, `::regclass` cast, `regclass()`
-function-call, `pg_get_functiondef` name fallback — the input counterpart of the
-69th/70th/71st slices' quote-EMISSION (sibling renderers must agree). Two
-faithful addenda: `regprocedureNamePart` strips the `(…)` arg list first
-(parseNameAndArgTypes' leading scan) so `'"MyFunc"(integer)'::regprocedure` does
-not regress to 42602; and the parser's downcasting now makes `'C'::regcollation`
-FAIL with 42704 exactly like PG 18.3 (only `'"C"'` resolves to 950 — the
-collation store is the one case-sensitive name store), updating the old divergent
-test. Miss messages match PG: regclass/regrole/regcollation/regtype print the
-STRIPPED parsed name, regproc/regprocedure keep the RAW input (incl. parens for
-regprocedure). Measured against a throwaway PG 18.3 oracle (port 5599): quoted
-mixed-case routine, dotted quoted schema (`"my.schema".fn`), quote-quote collapse
-(`"Weird""Quote"`), whitespace tolerance, and the 42602 cases all resolve/error
-identically. Tests: new `internal/executor/reg_input_quoted_test.go` (quoted
-mixed-case routine on both cast paths, dotted quoted schema, quote-quote
-collapse, family siblings, 42602 on both paths, coercion route,
-stripped-vs-raw miss messages); updated `reg_identifier_test.go` collation test to
-the PG-faithful shape. Gates: package suites PASS; pre-commit units PASS;
-`TestPort_RegressSuite` PASS (237.3 s on the confirming run — the FIRST attempt
-FAILed at its 600 s timeout when the known intermittent "suite wedge"
-(regress_wedge_probe_test.go) hit the `returning` case: CREATE FUNCTION parked on
-the buffer-pool RWMutex while the WAL checkpointer waited on the same pool's RLock,
-so no checkpoint ran, WAL grew to 7.4 GB, and crash recovery could not finish
-inside the 20 s restart timeout — a storage/WAL-path cascade disjoint from this
-slice; bundle preserved at tmp/regress-wedge/returning/, clean re-run PASS);
-`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35). Design
-`docs/design/0119-0006-reg-input-quoted-identifiers.md` + README row
-(`0119-0006ax`) + ledger row 1341 resolved + fix_plan 72nd-slice entry.
+Completed this loop: **M0119-0006 73rd slice** — the regprocedure **arglist** now
+schema-qualifies non-visible arg types exactly like upstream `format_type_be`
+(format_type.c:314), closing ledger row 1342 (the 71st slice's carry-forward).
+Before, `formatProcedureArglist` rendered every input arg type through
+`pgArgTypeDisplayAlias` only (`integer`, `text`), so a routine whose signature
+references an off-path USER arg type rendered `f_offarg(mytype)` where PG 18.3
+emits `f_offarg(offpath.mytype)` (an on-path/builtin arg correctly stays bare).
+The fix has a capture half and a render half. **Capture:** new
+`Routine.ArgTypeSchemas []string` (parallel to `ArgTypes`,
+internal/catalog/routines.go) records each arg type's EXPLICIT schema at CREATE
+FUNCTION/PROCEDURE (operators_ddl.go) via `argTypeSchema` returning the parser's
+`ColumnType.Schema` VERBATIM (unquoted names already case-folded, quoted names
+case-preserved); bare names stay `""`. It rides the existing proargdefaults JSON
+round-trip (`pgProcArgMetaJSON`/`DecodePGProcArgMeta`) automatically, so pre-73rd
+data dirs reload with nil → `""` → bare (backward compatible). **Render:**
+`catalog.RegprocedureNameParts` now returns `[]RegprocArg{Name, Schema}` per arg
+(builtin path stamps `pg_catalog`; user path reads `ArgTypeSchemas[i]`
+nil-defensively); the executor-side `regprocedureArglist` (reg_identifier.go)
+aliases builtin/pg_catalog args through the exported `catalog.ArgTypeDisplayAlias`
+(renamed from `pgArgTypeDisplayAlias`), schema-qualifies a NON-visible user arg
+via `quoteQualifiedIdentifier` with the `[]` array suffix split/re-appended
+(`offpath."mytype[]"` never happens; a user-path builtin array aliases
+`integer[]`), and leaves a BARE-name user arg bare (its owner schema is
+unresolvable — deferral below). The session visibility predicate threads as a
+variadic `visible ...func(schema string) bool` value through `RegOutArgVisible` /
+`appendTypedCellText` (SELECT simple-query) / `EncodeCopyTextRow` /
+`EncodeCopyCsvRow` (COPY TO) and the `::regprocedure` cast sibling in expr.go —
+all four paths agree (Hard-won Rule #2). Measured against a fresh goopg cluster
++ PG 18.3 oracle (throwaway ports): `'f_offarg(offpath.mytype)'::regprocedure` →
+`f_offarg(offpath.mytype)` (was `f_offarg(mytype)`), array `f_offarr(offpath.mytype[])`,
+rowtype arg `f_offrow(offpath.ct)`, `f_onarg(onpath.mytype)` (name + off-path arg
+both qualify), builtin `f_builtin(integer)` stays bare, a user type NAMED `int`
+quotes like PG (`offpath."int"`), and the `::regprocedure` cast path additionally
+qualifies the NAME (`offpath.f_offboth(offpath.mytype)`) where the wire path's
+name stays bare via the documented 69th-slice proxy. One measured limitation
+filed as a deferral: `SET search_path = public, offpath` cannot make the
+`offpath.mytype` arg render bare yet — `searchPathSchemas` proves schema
+existence only via `LookupTable(parser.ObjectName{Name: s})`, which never sees an
+EMPTY schema (pre-existing proxy, surfaced on the arglist arm by this slice).
+Tests: `TestRegOutRegprocedureQualifiesArgTypes` (reg_qualify_test.go),
+`TestRegprocedureCastArgTypesQualify` + `TestCreateFunctionCapturesArgTypeSchemas`
+(regoperator_schema_qualify_test.go), sibling
+`TestRegCopyAndSelectSiblingArgQualifyAgree` (reg_copy_sibling_test.go). Gates:
+package suites (internal/catalog 0.068 s, internal/executor 6.143 s,
+internal/server 55.165 s) PASS; pre-commit units PASS; `TestPort_RegressSuite`
+PASS (239.7 s); `scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35). Design
+`docs/design/0119-0006-regprocedure-argtype-schema-qualify.md` + README row
+(`0119-0006ay`) + ledger row 1342 resolved + 6 new deferral rows (1343-1348) +
+fix_plan 73rd-slice entry.
 
-**Carry-forward for a later loop (two remaining reg* deferrals under 2026-08-14,
-69th/71st/72nd slices):** (1) goopg's role store folds every role name to
+**Carry-forward for a later loop (seven remaining reg* deferrals under
+2026-08-14, 69th-73rd slices):** (1) goopg's role store folds every role name to
 lowercase on registration, so `regroleout` can never receive a case-preserved
 role name to quote (`CREATE ROLE "Alice"` renders `alice`, PG renders `"Alice"`)
 — the quoting code is correct, the limitation is the catalog's missing
-case-preserving display-name field (like `roleACLDisplay` but set at
-role-creation time) (ledger row 1340); (2) the regprocedure arglist's
-`format_type_be` does not schema-qualify non-visible arg types (an off-path
-arg-type namespace renders `public.foo(integer)` where PG emits
-`public.foo(public.mytype)`), invisible until a user-defined arg type + off-path
-namespace is measured. Both are bounded/measure-first items; the input-direction
-work this slice did NOT add the missing `::regrole`/`::regcollation` CAST arms in
-expr.go (those two name→OID inputs resolve only through the `regIdentifierInput`
-coercion path — pre-existing, scope-excluded in the design doc). See the ledger
-rows for the design docs and gate requirements.
+case-preserving display-name field (ledger row 1340); (2) a BARE user-defined
+arg type cannot be schema-resolved — the user-type store (enum/composite/domain/
+range) has no namespace field, so `CREATE FUNCTION g(mytype)` for an off-public
+type renders bare where PG qualifies it (row 1343); (3) quoted user type NAMES
+lose case at CREATE (`routineArgTypeName` lowercases → `offpath."MyType"` renders
+`offpath.mytype`, PG emits `offpath."MyType"` — same family as row 1340) (row
+1344); (4) the catalog's bare `formatProcedureArglist` does not alias builtin
+ARRAYS (`int[]` vs `integer[]`) (row 1345); (5) `ArgTypeDisplayAlias` is not a
+faithful `format_type_be` port (no `varbit → bit varying`, no keyword-quoting
+path for `char`) (row 1346); (6) the empty-schema visibility proxy blocks
+`SET search_path = …, offpath` from rendering an `offpath` arg bare (row 1347);
+(7) the pre-existing regproc/regprocedure INPUT DB-scoping bug
+(`regIdentifierInput` passes no dbOid to `LookupByName`, so a live-created
+routine does not resolve by name in some contexts — confirmed live during this
+slice's validation: `'g_offarg'::regprocedure` failed on a stale cluster while
+the reloaded `'f_offarg'` resolved) (row 1348). See the ledger rows for the
+design docs and gate requirements.

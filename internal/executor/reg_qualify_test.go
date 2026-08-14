@@ -283,6 +283,120 @@ func TestRegOutRegprocedureQualifiesNameOnly(t *testing.T) {
 	}
 }
 
+// M0119-0006 (73rd slice, deferral row 1342): format_procedure_extended passes
+// each INPUT arg type through format_type_be (regproc.c:326), which
+// schema-qualifies a type whose namespace is off the session's effective
+// search_path (`offpath.mytype`), renders a builtin bare via the SQL alias
+// (`integer`), and splits/re-appends the array suffix (`offpath.mytype[]`, never
+// `offpath."mytype[]"`). regprocedureArglist implements that per-arg rule;
+// RegOutArgVisible threads the session's per-schema visibility predicate (the
+// base RegOut passes nil → all visible → bare arglist, unchanged for its ~30
+// callers). Expected strings are pinned to the §1 oracle table of the 73rd-slice
+// design doc.
+func TestRegOutRegprocedureQualifiesArgTypes(t *testing.T) {
+	ctx := regCopyCat(t)
+	// visible is RegObjectSchemaVisible's per-schema rule with offpath NOT on the
+	// effective search_path.
+	offpathHidden := func(s string) bool { return s != "offpath" }
+
+	// f_offarg(offpath.mytype): the arg's schema is off the path → qualified.
+	offArg, err := ctx.Catalog.Routines().Create(&catalog.Routine{
+		Name:           "f_offarg",
+		Schema:         "public",
+		ArgTypes:       []catalog.Type{{Name: "mytype"}},
+		ArgModes:       []string{"i"},
+		ArgTypeSchemas: []string{"offpath"},
+		ReturnType:     catalog.Type{Name: "int4"},
+	}, false)
+	if err != nil {
+		t.Fatalf("Routines().Create(f_offarg): %v", err)
+	}
+	if got := RegOutArgVisible("regprocedure", offArg.OID, ctx.Catalog, true, offpathHidden); got != "public.f_offarg(offpath.mytype)" {
+		t.Errorf("regprocedure(f_offarg) offpath hidden = %q, want %q", got, "public.f_offarg(offpath.mytype)")
+	}
+	// offpath ON the path → bare, like a builtin (the §1 oracle's search_path row).
+	onPath := func(s string) bool { return true }
+	if got := RegOutArgVisible("regprocedure", offArg.OID, ctx.Catalog, true, onPath); got != "public.f_offarg(mytype)" {
+		t.Errorf("regprocedure(f_offarg) offpath visible = %q, want %q", got, "public.f_offarg(mytype)")
+	}
+
+	// f_offarr(offpath.mytype[]): the array suffix is split before quoting and
+	// re-appended after — the ELEMENT is quoted, `[]` stays unquoted (reviewer
+	// BLOCKER 1).
+	offArr, err := ctx.Catalog.Routines().Create(&catalog.Routine{
+		Name:           "f_offarr",
+		Schema:         "public",
+		ArgTypes:       []catalog.Type{{Name: "mytype[]"}},
+		ArgModes:       []string{"i"},
+		ArgTypeSchemas: []string{"offpath"},
+		ReturnType:     catalog.Type{Name: "int4"},
+	}, false)
+	if err != nil {
+		t.Fatalf("Routines().Create(f_offarr): %v", err)
+	}
+	if got := RegOutArgVisible("regprocedure", offArr.OID, ctx.Catalog, true, offpathHidden); got != "public.f_offarr(offpath.mytype[])" {
+		t.Errorf("regprocedure(f_offarr) offpath hidden = %q, want %q", got, "public.f_offarr(offpath.mytype[])")
+	}
+
+	// f_builtin(integer): a builtin (pg_catalog) arg renders the bare SQL alias,
+	// never qualified, regardless of visibility.
+	bi, err := ctx.Catalog.Routines().Create(&catalog.Routine{
+		Name:           "f_builtin",
+		Schema:         "public",
+		ArgTypes:       []catalog.Type{{Name: "int4"}},
+		ArgModes:       []string{"i"},
+		ArgTypeSchemas: []string{"pg_catalog"},
+		ReturnType:     catalog.Type{Name: "int4"},
+	}, false)
+	if err != nil {
+		t.Fatalf("Routines().Create(f_builtin): %v", err)
+	}
+	if got := RegOutArgVisible("regprocedure", bi.OID, ctx.Catalog, true, offpathHidden); got != "public.f_builtin(integer)" {
+		t.Errorf("regprocedure(f_builtin) = %q, want %q", got, "public.f_builtin(integer)")
+	}
+	// Builtin ARRAY arg: `int[]` → `integer[]` (alias applied to the element).
+	biArr, err := ctx.Catalog.Routines().Create(&catalog.Routine{
+		Name:           "f_builtin_arr",
+		Schema:         "public",
+		ArgTypes:       []catalog.Type{{Name: "int[]"}},
+		ArgModes:       []string{"i"},
+		ArgTypeSchemas: []string{"pg_catalog"},
+		ReturnType:     catalog.Type{Name: "int4"},
+	}, false)
+	if err != nil {
+		t.Fatalf("Routines().Create(f_builtin_arr): %v", err)
+	}
+	if got := RegOutArgVisible("regprocedure", biArr.OID, ctx.Catalog, true, offpathHidden); got != "public.f_builtin_arr(integer[])" {
+		t.Errorf("regprocedure(f_builtin_arr) = %q, want %q", got, "public.f_builtin_arr(integer[])")
+	}
+
+	// A USER type in a non-pg_catalog schema does NOT get the builtin alias — a
+	// user composite named `int` must render `offpath."int"`, never
+	// `offpath.integer` (format_type_be's builtin switch applies only to builtin
+	// OIDs). PG 18.3 measured: `f_kwint(offpath2."int")` — quote_identifier
+	// quotes the keyword `int` inside the qualified name.
+	userInt, err := ctx.Catalog.Routines().Create(&catalog.Routine{
+		Name:           "f_userint",
+		Schema:         "public",
+		ArgTypes:       []catalog.Type{{Name: "int"}},
+		ArgModes:       []string{"i"},
+		ArgTypeSchemas: []string{"offpath"},
+		ReturnType:     catalog.Type{Name: "int4"},
+	}, false)
+	if err != nil {
+		t.Fatalf("Routines().Create(f_userint): %v", err)
+	}
+	if got := RegOutArgVisible("regprocedure", userInt.OID, ctx.Catalog, true, offpathHidden); got != `public.f_userint(offpath."int")` {
+		t.Errorf("regprocedure(f_userint) = %q, want %q", got, `public.f_userint(offpath."int")`)
+	}
+
+	// Base RegOut (nil predicate) keeps the BARE arglist even for an off-path arg
+	// schema — the ~30 existing callers' backward-compatible behavior.
+	if got := RegOut("regprocedure", offArg.OID, ctx.Catalog, true); got != "public.f_offarg(mytype)" {
+		t.Errorf("regprocedure(f_offarg) base RegOut = %q, want %q", got, "public.f_offarg(mytype)")
+	}
+}
+
 // A regrole OID not present in the role map is a DANGLING reference: upstream
 // regroleout emits the unquoted %u fallback (regproc.c:1609), never a quoted
 // name — RoleNameAtOID distinguishes a real role (quoted name) from a dangling

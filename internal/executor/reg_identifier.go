@@ -430,6 +430,24 @@ func regIdentifierOIDFromDatum(d Datum, typeName string) (uint32, error) {
 // catalog threading. M0119-0006 (69th slice) added the quoting + qualification
 // to the regclass/regproc/regrole/regcollation arms.
 func RegOut(typeName string, oid uint32, cat catalog.Catalog, qualify bool) string {
+	return regOut(typeName, oid, cat, qualify, nil)
+}
+
+// RegOutArgVisible is RegOut with an extra per-arg-type visibility predicate
+// for the regprocedure ARGLIST (deferral row 1342). The production SELECT/COPY/
+// cast paths pass a closure over the session's search_path
+// (executor.RegObjectSchemaVisible); nil keeps RegOut's bare-arglist behavior.
+// Name qualification is unchanged — the `qualify` flag still decides whether
+// the routine NAME is schema-qualified (quote_qualified_identifier), exactly
+// as format_procedure's FunctionIsVisible arm.
+func RegOutArgVisible(typeName string, oid uint32, cat catalog.Catalog, qualify bool, argVisible func(schema string) bool) string {
+	return regOut(typeName, oid, cat, qualify, argVisible)
+}
+
+// regOut is the shared RegOut/RegOutArgVisible body; argVisible threads the
+// per-arg visibility predicate to the regprocedure arm only (nil ⇒ bare
+// arglist, the base-RegOut behavior).
+func regOut(typeName string, oid uint32, cat catalog.Catalog, qualify bool, argVisible func(schema string) bool) string {
 	if oid == 0 {
 		return "-"
 	}
@@ -474,8 +492,13 @@ func RegOut(typeName string, oid uint32, cat catalog.Catalog, qualify bool) stri
 		if cat != nil {
 			routines = cat.Routines()
 		}
-		if schema, name, arglist, ok := catalog.RegprocedureNameParts(oid, routines); ok {
-			return regOutQualified(schema, name, qualify) + "(" + arglist + ")"
+		if schema, name, argTypes, ok := catalog.RegprocedureNameParts(oid, routines); ok {
+			// format_procedure_extended appends each input arg type through
+			// format_type_be (regproc.c:326), which schema-qualifies a type
+			// whose namespace is off the session's effective search_path —
+			// regprocedureArglist implements that per-arg rule (deferral row
+			// 1342). Base RegOut passes a nil predicate (bare arglist).
+			return regOutQualified(schema, name, qualify) + "(" + regprocedureArglist(argTypes, argVisible) + ")"
 		}
 	case "regtype":
 		return RegtypeName(cat, oid, qualify)
@@ -540,6 +563,47 @@ func regOutQualified(schema, name string, qualify bool) string {
 		return pgQuoteIdent(name)
 	}
 	return quoteQualifiedIdentifier(schema, name)
+}
+
+// regprocedureArglist renders format_type_be for each INPUT arg type
+// (regproc.c format_procedure_extended), schema-qualifying per-arg via the
+// session's search_path (deferral row 1342). pg_catalog (builtin) and
+// unknown-"" arg types render the bare SQL alias (format_type_be's builtin
+// switch — ArgTypeDisplayAlias); a user type whose schema is NOT visible
+// renders quote_qualified_identifier(schema, name), the same quote rule the
+// family's name path uses (regOutQualified). nil visible ⇒ every schema is
+// treated as visible (bare arglist), preserving the base RegOut callers. The
+// array suffix is split off BEFORE aliasing/quoting and re-appended after, so
+// `offpath."mytype[]"` never happens — the ELEMENT is quoted, `[]` follows
+// unquoted, exactly like format_type_be's array arm.
+func regprocedureArglist(argTypes []catalog.RegprocArg, visible func(schema string) bool) string {
+	args := make([]string, len(argTypes))
+	for i, a := range argTypes {
+		base, isArray := splitArraySuffix(a.Name)
+		name := base
+		if a.Schema == "" || a.Schema == "pg_catalog" {
+			name = catalog.ArgTypeDisplayAlias(base)
+		}
+		if a.Schema != "" && a.Schema != "pg_catalog" && visible != nil && !visible(a.Schema) {
+			name = quoteQualifiedIdentifier(a.Schema, name)
+		}
+		if isArray {
+			name += "[]"
+		}
+		args[i] = name
+	}
+	return strings.Join(args, ",")
+}
+
+// splitArraySuffix reports whether name carries the baked-in array suffix
+// routineArgTypeName appends ("mytype[]") and returns the element name without
+// it. Only ONE trailing "[]" is ever present (the parser stores a single
+// IsArray; the suffix is appended once), so a plain HasSuffix check suffices.
+func splitArraySuffix(name string) (base string, isArray bool) {
+	if strings.HasSuffix(name, "[]") {
+		return name[:len(name)-2], true
+	}
+	return name, false
 }
 
 // isRegIdentifierTypeName reports whether name is one of the six reg* types

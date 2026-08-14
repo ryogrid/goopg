@@ -19786,15 +19786,17 @@ func IsStrictProc(oid uint32) bool {
 	return pgProcIsStrictByOID[oid]
 }
 
-// pgArgTypeDisplayAlias converts an internal base-type spelling (a pg_type.dat
+// ArgTypeDisplayAlias converts an internal base-type spelling (a pg_type.dat
 // typname, or a user Routine's stored Type.Name) to PG's format_type_be
 // display alias — the handful of base types whose internal name differs from
 // its SQL display spelling (int4 -> integer, bool -> boolean, etc). Mirrors
 // executor's pgFormatTypeName; duplicated here (not imported) because
 // internal/executor imports internal/catalog, not the reverse. Types with no
 // alias (composite/domain/array names, "text", "uuid", ...) pass through
-// unchanged.
-func pgArgTypeDisplayAlias(name string) string {
+// unchanged. Exported so the executor's regprocedure arglist renderer
+// (regprocedureArglist) shares ONE alias table with the catalog's bare
+// builder — no second alias source to drift (deferral row 1342).
+func ArgTypeDisplayAlias(name string) string {
 	switch strings.ToLower(name) {
 	case "int4", "int":
 		return "integer"
@@ -19843,11 +19845,11 @@ func pgArgTypeDisplayAlias(name string) string {
 // neither source; the caller falls back to the raw OID, matching
 // format_procedure's own numeric fallback for an unknown OID.
 func RegprocedureName(oid uint32, routines *Routines) (string, bool) {
-	_, name, arglist, ok := RegprocedureNameParts(oid, routines)
+	_, name, argTypes, ok := RegprocedureNameParts(oid, routines)
 	if !ok {
 		return "", false
 	}
-	return name + "(" + arglist + ")", true
+	return name + "(" + formatProcedureArglist(argTypes) + ")", true
 }
 
 // RegprocedureNameAndSchema is RegprocedureName plus the resolved schema, for
@@ -19856,55 +19858,82 @@ func RegprocedureName(oid uint32, routines *Routines) (string, bool) {
 // resolves to its declared schema, defaulting to "public" like every other
 // unset-namespace field in this file). DU-002 (M0119-0004) slice 412.
 func RegprocedureNameAndSchema(oid uint32, routines *Routines) (schema, sig string, ok bool) {
-	schema, name, arglist, ok := RegprocedureNameParts(oid, routines)
+	schema, name, argTypes, ok := RegprocedureNameParts(oid, routines)
 	if !ok {
 		return "", "", false
 	}
-	return schema, name + "(" + arglist + ")", true
+	return schema, name + "(" + formatProcedureArglist(argTypes) + ")", true
 }
 
-// RegprocedureNameParts resolves a pg_proc OID to the (schema, NAME, ARGLIST)
+// RegprocArg is one INPUT argument type of a pg_proc signature: the stored
+// name (array suffix baked in, exactly as Routine.ArgTypes[i].Name carries it)
+// plus the namespace it was created in ("" when unknown — a bare type name).
+// The per-arg schema-qualify decision is the renderers' job: it is
+// session-dependent (format_type_be's TypeIsVisible against the current
+// search_path, deferral row 1342), so this struct carries the resolved
+// (name, schema) pair and leaves visibility to the caller.
+type RegprocArg struct {
+	Name   string
+	Schema string
+}
+
+// RegprocedureNameParts resolves a pg_proc OID to the (schema, NAME, ARGTYPES)
 // halves of its regprocedure display form `name(argtype1,argtype2)` —
 // format_procedure/regprocedureout (regproc.c). It exists so a renderer can
 // schema-qualify ONLY the NAME (quote_qualified_identifier on the routine,
 // format_procedure_internal's ruleutils.c logic) without re-quoting the
-// parens; the ARGLIST is the format_type_be display list (already run through
-// pgArgTypeDisplayAlias), returned unqualified exactly as format_procedure
-// renders it when not forced. A builtin always resolves to "pg_catalog"; a
-// CREATE FUNCTION-defined routine to its declared schema, defaulting to
-// "public" like every other unset-namespace field in this file.
-// M0119-0006 (71st slice, deferral row 1338).
-func RegprocedureNameParts(oid uint32, routines *Routines) (schema, name, arglist string, ok bool) {
+// parens; the ARGTYPES slice carries each input arg type's stored name +
+// creation schema (builtins: "pg_catalog"; a user routine: its ArgTypeSchemas
+// entry, "" when unknown), which format_type_be would render schema-qualified
+// when the type is not visible on the session's search_path. A builtin always
+// resolves to "pg_catalog"; a CREATE FUNCTION-defined routine to its declared
+// schema, defaulting to "public" like every other unset-namespace field in
+// this file. M0119-0006 (71st slice, deferral row 1338; 73rd slice, row 1342).
+func RegprocedureNameParts(oid uint32, routines *Routines) (schema, name string, argTypes []RegprocArg, ok bool) {
 	if argNames, found := pgProcArgTypeNamesByOID[oid]; found {
 		if nm, nameOK := pgProcNamesByOID[oid]; nameOK {
-			return "pg_catalog", nm, formatProcedureArglist(argNames), true
+			args := make([]RegprocArg, len(argNames))
+			for i, n := range argNames {
+				args[i] = RegprocArg{Name: n, Schema: "pg_catalog"}
+			}
+			return "pg_catalog", nm, args, true
 		}
 	}
 	if routines != nil {
 		if r := routines.LookupByOID(oid); r != nil {
-			var argNames []string
+			var args []RegprocArg
 			for i, t := range r.ArgTypes {
 				if i < len(r.ArgModes) && r.ArgModes[i] == "o" {
 					continue
 				}
-				argNames = append(argNames, t.Name)
+				sch := ""
+				if i < len(r.ArgTypeSchemas) {
+					sch = r.ArgTypeSchemas[i]
+				}
+				args = append(args, RegprocArg{Name: t.Name, Schema: sch})
 			}
 			schema := r.Schema
 			if schema == "" {
 				schema = "public"
 			}
-			return schema, r.Name, formatProcedureArglist(argNames), true
+			return schema, r.Name, args, true
 		}
 	}
-	return "", "", "", false
+	return "", "", nil, false
 }
 
-// formatProcedureArglist renders the INPUT argument-type display list — the
-// format_type_be (unqualified) half of format_procedure's `name(arglist)`.
-func formatProcedureArglist(argTypeNames []string) string {
-	args := make([]string, len(argTypeNames))
-	for i, a := range argTypeNames {
-		args[i] = pgArgTypeDisplayAlias(a)
+// formatProcedureArglist renders the UNQUALIFIED INPUT argument-type display
+// list — the alias-only format_type_be half of format_procedure's
+// `name(arglist)`, the shape RegprocedureName/RegprocedureNameAndSchema expose
+// to callers that never need per-arg qualification. The pg-faithful
+// qualify-by-visibility renderer is executor/regprocedureArglist (regproc.c's
+// format_type_be with per-arg TypeIsVisible), which the SELECT/COPY/cast wire
+// paths use; this bare builder must stay in step with it on the ALIAS
+// (both call catalog.ArgTypeDisplayAlias — one shared alias table).
+func formatProcedureArglist(argTypes []RegprocArg) string {
+	args := make([]string, len(argTypes))
+	for i, a := range argTypes {
+		args[i] = ArgTypeDisplayAlias(a.Name)
 	}
 	return strings.Join(args, ",")
 }
@@ -19934,10 +19963,10 @@ func (c *InMemory) RegoperatorNameAndSchema(oid uint32) (schema, sig string, ok 
 		if bop, found := LookupBuiltinOperatorByOID(oid); found {
 			left, right := "NONE", "NONE"
 			if bop.LeftType != "" {
-				left = pgArgTypeDisplayAlias(bop.LeftType)
+				left = ArgTypeDisplayAlias(bop.LeftType)
 			}
 			if bop.RightType != "" {
-				right = pgArgTypeDisplayAlias(bop.RightType)
+				right = ArgTypeDisplayAlias(bop.RightType)
 			}
 			return "pg_catalog", bop.Name + "(" + left + "," + right + ")", true
 		}
@@ -19945,10 +19974,10 @@ func (c *InMemory) RegoperatorNameAndSchema(oid uint32) (schema, sig string, ok 
 	}
 	left, right := "NONE", "NONE"
 	if op.LeftType != "" {
-		left = pgArgTypeDisplayAlias(op.LeftType)
+		left = ArgTypeDisplayAlias(op.LeftType)
 	}
 	if op.RightType != "" {
-		right = pgArgTypeDisplayAlias(op.RightType)
+		right = ArgTypeDisplayAlias(op.RightType)
 	}
 	nsOID := op.NamespaceOIDOrDefault()
 	if nsOID == PublicNamespaceOID {

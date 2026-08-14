@@ -601,9 +601,15 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 					// WHOLE signature (`schema + "." + sig`), which skipped the
 					// quote_identifier on a mixed-case/quoted routine name.
 					// M0119-0006 (71st slice, deferral row 1338).
-					if schema, name, arglist, ok := catalog.RegprocedureNameParts(uint32(oid), routines); ok {
-						qualify := !regObjectSchemaVisible(ctx, schema)
-						return NewStringDatum(regOutQualified(schema, name, qualify) + "(" + arglist + ")"), nil
+					if schema, name, argTypes, ok := catalog.RegprocedureNameParts(uint32(oid), routines); ok {
+						// format_procedure_extended's format_type_be per-arg
+						// qualification (deferral row 1342): an input arg type
+						// whose namespace is off the session's search_path renders
+						// schema-qualified. Same regprocedureArglist the column/
+						// COPY renderers use, so the cast cannot drift from them.
+						qualify := !RegObjectSchemaVisible(ctx, schema)
+						argVisible := func(s string) bool { return RegObjectSchemaVisible(ctx, s) }
+						return NewStringDatum(regOutQualified(schema, name, qualify) + "(" + regprocedureArglist(argTypes, argVisible) + ")"), nil
 					}
 					return v, nil
 				}
@@ -629,7 +635,7 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 						// (dumpEventTrigger emits `public.et_func()`, not
 						// `et_func()`, for a public-schema trigger function).
 						// DU-002 (M0119-0004).
-						if !regObjectSchemaVisible(ctx, r.Schema) {
+						if !RegObjectSchemaVisible(ctx, r.Schema) {
 							return NewStringDatum(r.Schema + "." + r.Name), nil
 						}
 						return NewStringDatum(r.Name), nil
@@ -658,7 +664,7 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 					if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
 						if strings.EqualFold(x.TargetType, "regoperator") {
 							if schema, sig, found := im.RegoperatorNameAndSchema(uint32(oid)); found {
-								if !regObjectSchemaVisible(ctx, schema) {
+								if !RegObjectSchemaVisible(ctx, schema) {
 									return NewStringDatum(schema + "." + sig), nil
 								}
 								return NewStringDatum(sig), nil
@@ -712,7 +718,7 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 					if name := oidToBuiltinTypeName(uint32(oid)); name != "" {
 						return NewStringDatum(name), nil
 					}
-					if uname, ok := userTypeNameForOID(ctx.Catalog, uint32(oid), !regObjectSchemaVisible(ctx, "public")); ok {
+					if uname, ok := userTypeNameForOID(ctx.Catalog, uint32(oid), !RegObjectSchemaVisible(ctx, "public")); ok {
 						return NewStringDatum(uname), nil
 					}
 					return NewStringDatum(typName), nil
@@ -741,9 +747,9 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 				// "myrange"), diverging from PG's regtypeout (regproc.c). The
 				// name is only schema-qualified when "public" is not visible
 				// on the effective search_path (matches regproc/regoperator's
-				// own regObjectSchemaVisible check above). DU-002 (M0110-0001)
+				// own RegObjectSchemaVisible check above). DU-002 (M0110-0001)
 				// regtype/format_type unification follow-up.
-				if uname, ok := userTypeNameForOID(ctx.Catalog, uint32(v.Int), !regObjectSchemaVisible(ctx, "public")); ok {
+				if uname, ok := userTypeNameForOID(ctx.Catalog, uint32(v.Int), !RegObjectSchemaVisible(ctx, "public")); ok {
 					return NewStringDatum(uname), nil
 				}
 				return NewStringDatum(fmt.Sprintf("%d", v.Int)), nil
@@ -11842,7 +11848,7 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				// non-visible, forcing the public. prefix, while a plain
 				// session's default search_path leaves it unqualified.
 				// DU-002 slices 88-90/249-251/(M0110-0001).
-				if uname, ok := userTypeNameForOID(ctx.Catalog, uint32(typeOID), !regObjectSchemaVisible(ctx, "public")); ok {
+				if uname, ok := userTypeNameForOID(ctx.Catalog, uint32(typeOID), !RegObjectSchemaVisible(ctx, "public")); ok {
 					name = uname
 				}
 			}
@@ -13787,7 +13793,7 @@ func searchPathSchemas(ctx *Context) []string {
 	return out
 }
 
-// regObjectSchemaVisible reports whether schema is visible for reg*-cast
+// RegObjectSchemaVisible reports whether schema is visible for reg*-cast
 // qualification purposes (format_operator/format_procedure's own
 // OperatorIsVisible/ProcedureIsVisible check, regproc.c): pg_catalog is
 // always implicitly searched regardless of search_path content, and every
@@ -13796,8 +13802,10 @@ func searchPathSchemas(ctx *Context) []string {
 // this is what makes dumpOpclass/dumpOpfamily's own
 // amopopr::pg_catalog.regoperator / amproc::pg_catalog.regprocedure casts
 // come back schema-qualified for a user-defined operator/function but bare
-// for a builtin one. DU-002 (M0119-0004) slice 412.
-func regObjectSchemaVisible(ctx *Context, schema string) bool {
+// for a builtin one. Exported (73rd slice) so the server's SELECT/COPY wire
+// paths can pass it as the regprocedure arglist's per-arg visibility
+// predicate (deferral row 1342). DU-002 (M0119-0004) slice 412.
+func RegObjectSchemaVisible(ctx *Context, schema string) bool {
 	if schema == "" || schema == "pg_catalog" {
 		return true
 	}
@@ -13932,7 +13940,7 @@ func pgFormatTypeName(t string) string {
 // RegtypeName, since all three need the identical resolution across all four
 // user-type kinds. goopg enums/domains/composites/ranges all live in public;
 // qualify controls whether the "public." prefix is added, mirroring
-// regObjectSchemaVisible's role for the regproc/regoperator casts — callers
+// RegObjectSchemaVisible's role for the regproc/regoperator casts — callers
 // pass qualify=true only when "public" is NOT visible on the effective
 // search_path (e.g. pg_dump's search_path=''), matching real PostgreSQL's
 // regtypeout/format_type, which only schema-qualifies when necessary rather

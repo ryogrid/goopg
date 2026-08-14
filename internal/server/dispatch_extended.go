@@ -467,7 +467,11 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 				// fallback. M0119-0004 (dispatch_extended vs dispatch
 				// type-switch divergence).
 				if i < len(schema) {
-					cells[i] = s.appendTypedCellText(nil, d, schema[i].Type, ectx.GetSetting)
+					// Same per-arg-type predicate the simple-query path passes
+					// (73rd slice, deferral row 1342), so the extended protocol
+					// cannot drift from simple-query on arg-type qualification.
+					cells[i] = s.appendTypedCellText(nil, d, schema[i].Type, ectx.GetSetting,
+						func(s string) bool { return executor.RegObjectSchemaVisible(ectx, s) })
 					continue
 				}
 				cells[i] = d.AppendValueText(nil)

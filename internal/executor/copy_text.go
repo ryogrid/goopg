@@ -32,7 +32,7 @@ import (
 // column rendering (PostgreSQL's DateStyle GUC style/order components,
 // e.g. "ISO"/"MDY" — see config.ParseDateStyleValue); pass "ISO", "MDY"
 // for the boot default.
-func EncodeCopyTextRow(dst []byte, row Row, cols []catalog.Column, dateStyle, dateOrder, timeZone string, cat catalog.Catalog, qualify bool) ([]byte, error) {
+func EncodeCopyTextRow(dst []byte, row Row, cols []catalog.Column, dateStyle, dateOrder, timeZone string, cat catalog.Catalog, qualify bool, visible ...func(schema string) bool) ([]byte, error) {
 	if len(row) != len(cols) {
 		return nil, fmt.Errorf("EncodeCopyTextRow: %d cols vs %d datums", len(cols), len(row))
 	}
@@ -45,7 +45,7 @@ func EncodeCopyTextRow(dst []byte, row Row, cols []catalog.Column, dateStyle, da
 			dst = append(dst, '\\', 'N')
 			continue
 		}
-		s, err := datumToCopyText(c.Type, d, dateStyle, dateOrder, timeZone, cat, qualify)
+		s, err := datumToCopyText(c.Type, d, dateStyle, dateOrder, timeZone, cat, qualify, visible...)
 		if err != nil {
 			return nil, err
 		}
@@ -268,7 +268,7 @@ func appendCopyTextEscaped(dst []byte, s string) []byte {
 // value parameters rather than a *Context so the TEXT and CSV renderers share
 // exactly the narrow seam they already did. A nil cat preserves the pre-68th
 // numeric rendering.
-func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone string, cat catalog.Catalog, qualify bool) (string, error) {
+func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone string, cat catalog.Catalog, qualify bool, visible ...func(schema string) bool) (string, error) {
 	// Array columns FIRST. A user array column is
 	// catalog.Type{Name:<ELEMENT type>, IsArray:true}, so every arm of the
 	// switch below would claim the array under its ELEMENT's name and reject
@@ -300,7 +300,15 @@ func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone str
 	// has no reg* case, so a regrole OID would otherwise hit the default arm
 	// and render numerically.
 	if isRegIdentifierTypeName(t.Name) && d.Kind == KindInt {
-		return RegOut(t.Name, uint32(d.Int), cat, qualify), nil
+		// visible is the regprocedure arglist's per-arg visibility predicate
+		// (73rd slice, deferral row 1342); an empty variadic keeps RegOut's
+		// bare-arglist behavior (RegOut == RegOutArgVisible with a nil
+		// predicate).
+		var argVisible func(s string) bool
+		if len(visible) > 0 {
+			argVisible = visible[0]
+		}
+		return RegOutArgVisible(t.Name, uint32(d.Int), cat, qualify, argVisible), nil
 	}
 	switch t.Name {
 	case "int4", "integer", "int", "int8", "bigint":

@@ -201,3 +201,68 @@ func TestRegCopyAndSelectSiblingQualifyAgree(t *testing.T) {
 		t.Errorf("regclass(1259) qualify=true = %q, want %q", sel, "pg_class")
 	}
 }
+
+// M0119-0006 (73rd slice, deferral row 1342): a raw regprocedure-typed column
+// whose OID is a routine with an OFF-PATH arg type renders the arglist
+// schema-qualified on BOTH wire paths — the SELECT simple-query renderer
+// (appendTypedCellText with the per-arg RegObjectSchemaVisible predicate) and
+// the COPY TO renderer (RegOutArgVisible through datumToCopyText). The pre-73rd
+// renderers would both have emitted the bare `mytype`, so the sibling agreement
+// is the point (Hard-won Rule #2) and the qualified string the pin.
+func TestRegCopyAndSelectSiblingArgQualifyAgree(t *testing.T) {
+	cat := catalog.NewInMemory()
+	srv := New(Config{
+		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Catalog: cat,
+	})
+
+	// A search_path that shows neither public nor offpath (e.g. pg_dump's
+	// search_path=''): the NAME qualifies (public off the path) AND each arg
+	// type whose schema is off the path qualifies.
+	emptyPath := func(name string) (string, bool) { return "", true }
+	// The production SELECT/COPY predicate: RegObjectSchemaVisible with offpath
+	// not on the effective path.
+	argVisible := func(s string) bool { return s != "offpath" }
+
+	routine, err := cat.Routines().Create(&catalog.Routine{
+		Name:           "argqual_sibling_udf",
+		Schema:         "public",
+		ArgTypes:       []catalog.Type{{Name: "mytype"}},
+		ArgModes:       []string{"i"},
+		ArgTypeSchemas: []string{"offpath"},
+		ReturnType:     catalog.Type{Name: "int4"},
+	}, false)
+	if err != nil {
+		t.Fatalf("Routines().Create: %v", err)
+	}
+	procTyp := catalog.Type{Name: "regprocedure"}
+	sel := string(srv.appendTypedCellText(nil, executor.NewIntDatum(int64(routine.OID)), procTyp, emptyPath, argVisible))
+	copyText := executor.RegOutArgVisible("regprocedure", routine.OID, cat, true, argVisible)
+	if sel != copyText {
+		t.Errorf("regprocedure(argqual_sibling_udf) arg-qualify: SELECT=%q COPY=%q — renderers diverged", sel, copyText)
+	}
+	if sel != "public.argqual_sibling_udf(offpath.mytype)" {
+		t.Errorf("regprocedure(argqual_sibling_udf) = %q, want %q", sel, "public.argqual_sibling_udf(offpath.mytype)")
+	}
+
+	// Array variant: `offpath.mytype[]` — element quoted, suffix re-appended.
+	arrRoutine, err := cat.Routines().Create(&catalog.Routine{
+		Name:           "argqual_sibling_arr",
+		Schema:         "public",
+		ArgTypes:       []catalog.Type{{Name: "mytype[]"}},
+		ArgModes:       []string{"i"},
+		ArgTypeSchemas: []string{"offpath"},
+		ReturnType:     catalog.Type{Name: "int4"},
+	}, false)
+	if err != nil {
+		t.Fatalf("Routines().Create(arr): %v", err)
+	}
+	sel = string(srv.appendTypedCellText(nil, executor.NewIntDatum(int64(arrRoutine.OID)), procTyp, emptyPath, argVisible))
+	copyText = executor.RegOutArgVisible("regprocedure", arrRoutine.OID, cat, true, argVisible)
+	if sel != copyText {
+		t.Errorf("regprocedure(argqual_sibling_arr) arg-qualify: SELECT=%q COPY=%q — renderers diverged", sel, copyText)
+	}
+	if sel != "public.argqual_sibling_arr(offpath.mytype[])" {
+		t.Errorf("regprocedure(argqual_sibling_arr) = %q, want %q", sel, "public.argqual_sibling_arr(offpath.mytype[])")
+	}
+}
