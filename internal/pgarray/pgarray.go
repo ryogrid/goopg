@@ -57,6 +57,14 @@ type OutputStyle struct {
 	// Zone is the raw `TimeZone` GUC spelling; "" means the boot default, UTC
 	// (config.FormatTimestampTZ resolves it).
 	Zone string
+	// RegOut renders a reg* array element's 4-byte OID as its name —
+	// executor.RegOut's contract (OID 0 → "-", an unresolvable OID → the
+	// numeric spelling). internal/pgarray is a leaf and cannot import the
+	// executor, so the executor threads the renderer in as a value from
+	// arrayOutputStyle; a nil renderer (the pgoutput decoder and pure-codec
+	// callers have no catalog) falls back to "-"/numeric. M0119-0006 reg*
+	// element slice.
+	RegOut func(typeName string, oid uint32) string
 }
 
 // DefaultOutputStyle is the boot-default rendering — ISO/MDY dates in UTC —
@@ -203,6 +211,27 @@ func ElemTypeInfo(elemName string) (oid uint32, size, align int, varlena, ok boo
 		return 1266, 12, 8, false, true
 	case "bytea":
 		return 17, -1, 4, true, true
+	// M0119-0006 reg* array-element slice (deferral 1306). The scalar reg*
+	// family (66th–68th slices) stores each value as a 4-byte LE OID; these six
+	// members' ARRAYS were left behind and fell to the unknown-element fallback
+	// (elemtype 25, text bodies) while pg_attribute.atttypid says
+	// _regproc/_regprocedure/_regclass/_regtype/_regrole/_regcollation — the
+	// descriptor-vs-blob disagreement this slice closes. All six are pg_type
+	// typlen 4, typalign 'i', exactly the scalar family's image. cid (29) and
+	// numeric-only oid (26) stay excluded: no name form, and the encode/align
+	// arms deliberately exclude them today.
+	case "regproc":
+		return 24, 4, 4, false, true
+	case "regprocedure":
+		return 2202, 4, 4, false, true
+	case "regclass":
+		return 2205, 4, 4, false, true
+	case "regtype":
+		return 2206, 4, 4, false, true
+	case "regrole":
+		return 4096, 4, 4, false, true
+	case "regcollation":
+		return 4191, 4, 4, false, true
 	default:
 		return 0, 0, 0, false, false
 	}
@@ -369,6 +398,24 @@ func DecodeElemStyled(elemName string, data []byte, varlena bool, size int, st O
 		micros := int64(binary.LittleEndian.Uint64(data[:8]))
 		zone := int32(binary.LittleEndian.Uint32(data[8:12]))
 		return QuoteTextElem(pgdatetime.FormatTimeTZ(micros, zone)), 12, nil
+	case "regproc", "regprocedure", "regclass", "regtype", "regrole", "regcollation":
+		// Sibling of encodeArrayElem's reg* arm (M0119-0006, deferral 1306):
+		// the stored element is the same 4-byte LE OID the scalar family
+		// stores, rendered through st.RegOut — the executor-threaded
+		// executor.RegOut, so the array element prints byte-identical to the
+		// scalar SELECT/COPY paths (OID 0 → "-", dangling → numeric). A nil
+		// renderer (pgoutput decoder, pure-codec callers with no catalog)
+		// falls back to the same contract minus the name lookup. QuoteTextElem
+		// applies array_out's quoting, which is not optional for regcollation
+		// ("C" → element `"""C"""`) or a name containing spaces/commas.
+		oid := binary.LittleEndian.Uint32(data[:4])
+		if oid == 0 {
+			return "-", 4, nil
+		}
+		if st.RegOut != nil {
+			return QuoteTextElem(st.RegOut(lower, oid)), 4, nil
+		}
+		return strconv.FormatUint(uint64(oid), 10), 4, nil
 	default:
 		return "", 0, fmt.Errorf("unsupported fixed array element type %q", elemName)
 	}

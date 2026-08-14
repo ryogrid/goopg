@@ -50,6 +50,15 @@ func arrayElemTypeInfo(elemName string) (oid uint32, size, align int, varlena, o
 // ArrayType varlena blob. A pre-built blob (KindBytes) passes through verbatim
 // — that is how catalog seeders inject ready-made arrays.
 func encodeArrayValuePG(t catalog.Type, d Datum) ([]byte, error) {
+	return encodeArrayValuePGCtx(t, d, nil, 0)
+}
+
+// encodeArrayValuePGCtx is the ctx+pos-carrying sibling of encodeArrayValuePG:
+// a reg* element resolves its name→OID through the session catalog
+// (regIdentifierInput), so the heap-write paths thread their Context in; the
+// no-ctx wrapper (nil ctx, pos 0) is what the test/codec callers that never
+// write a user reg*[] column use. M0119-0006 reg* element slice.
+func encodeArrayValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]byte, error) {
 	if d.Kind == KindBytes {
 		return d.BytesValue(), nil
 	}
@@ -74,7 +83,7 @@ func encodeArrayValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		if pad := alignPad(len(body), align); pad > 0 {
 			body = append(body, make([]byte, pad)...)
 		}
-		eb, err := encodeArrayElem(t.Name, e, varlena)
+		eb, err := encodeArrayElem(t.Name, e, varlena, ctx, pos)
 		if err != nil {
 			return nil, err
 		}
@@ -115,7 +124,7 @@ func alignPad(off, align int) int {
 // encodeArrayElem encodes one array element to its PG in-array representation.
 // Fixed-length elements are stored raw (no per-element length header); varlena
 // elements use a 4-byte varlena header (the form decodeTextArray expects).
-func encodeArrayElem(elemName, e string, varlena bool) ([]byte, error) {
+func encodeArrayElem(elemName, e string, varlena bool, ctx *Context, pos int) ([]byte, error) {
 	lower := strings.ToLower(elemName)
 	if varlena {
 		// numeric is the one varlena element whose body is NOT the text the
@@ -237,6 +246,29 @@ func encodeArrayElem(elemName, e string, varlena bool) ([]byte, error) {
 		default:
 			return []byte{0}, nil
 		}
+	case "regproc", "regprocedure", "regclass", "regtype", "regrole", "regcollation":
+		// Sibling of the scalar reg* arm in encodeValuePG (66th–68th slices,
+		// deferral 1306): an array element arrives as the text inside the array
+		// literal, so it resolves through the SAME regIdentifierInput the
+		// scalar path uses (parseDashOrOid "-"/numeric first, then the per-type
+		// catalog lookup), which yields the family's own miss SQLSTATEs (42P01
+		// regclass, 42704 regtype/regrole/regcollation, 42883 regproc/
+		// regprocedure, 42602 invalid-name-syntax) rather than a 22P02 wrap.
+		// The stored body is the resolved 4-byte LE OID (typlen 4, align 'i'),
+		// exactly the scalar family's image. A nil ctx (no-catalog writers such
+		// as the toast/index-key paths that never carry a user reg*[] name)
+		// resolves "-"/numeric and errors on a name, never silently storing it.
+		d, err := regIdentifierInput(NewStringDatum(e), elemName, ctx, pos)
+		if err != nil {
+			return nil, err
+		}
+		oid, err := regIdentifierOIDFromDatum(d, strings.ToLower(elemName))
+		if err != nil {
+			return nil, err
+		}
+		var b [4]byte
+		binary.LittleEndian.PutUint32(b[:], oid)
+		return b[:], nil
 	default:
 		return array4ByteVarlena(e), nil
 	}
@@ -270,6 +302,15 @@ func array4ByteVarlenaBytes(body []byte) []byte {
 // COPY … TO and a SELECT of the same array column must print the same text.
 func arrayOutputStyle(ctx *Context) pgarray.OutputStyle {
 	st := pgarray.DefaultOutputStyle()
+	// Reg* element renderer, bound FIRST so a catalog-carrying ctx gets it even
+	// when the style GUCs are unreadable (nil GetSetting): an array of
+	// regclass/regtype/… is flattened to text at heap-decode time, so the
+	// OID→name renderer must be bound here, where the session catalog +
+	// search-path qualify + connection dbOid reach. It is the SAME renderer
+	// the scalar SELECT/COPY paths use, which is what keeps the array and
+	// scalar forms byte-identical — and SELECT and COPY TO (both consume the
+	// decoded text) agreeing with each other.
+	st.RegOut = arrayRegOutRenderer(ctx)
 	if ctx == nil || ctx.GetSetting == nil {
 		return st
 	}
@@ -280,6 +321,22 @@ func arrayOutputStyle(ctx *Context) pgarray.OutputStyle {
 		st.Zone = v
 	}
 	return st
+}
+
+// arrayRegOutRenderer closes the executor's RegOut over the session catalog,
+// the search-path qualify rule COPY TO uses (!RegObjectSchemaVisible — the
+// sibling of the server package's publicSchemaVisible) and the connection's
+// dbOid (the 75th-slice per-DB scoping). Nil when no catalog is reachable
+// (pure-codec/pgoutput callers) — pgarray then falls back to "-"/numeric.
+func arrayRegOutRenderer(ctx *Context) func(typeName string, oid uint32) string {
+	if ctx == nil || ctx.Catalog == nil {
+		return nil
+	}
+	qualify := !RegObjectSchemaVisible(ctx, "public")
+	connDBOid := catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)
+	return func(typeName string, oid uint32) string {
+		return RegOut(typeName, oid, ctx.Catalog, qualify, connDBOid)
+	}
 }
 
 // colsHaveArray reports whether any column is an array, so a scan pays the GUC

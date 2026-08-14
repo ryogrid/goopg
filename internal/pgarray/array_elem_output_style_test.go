@@ -43,25 +43,25 @@ func TestFormatTimestampTZElemAgainstPG18Oracle(t *testing.T) {
 		want              string
 	}{
 		// The regression this slice exists for: same instant, three zones.
-		{"iso utc summer", OutputStyle{"ISO", "MDY", "UTC"}, ttzSummer, "2020-06-15 10:00:00+00"},
-		{"iso kolkata summer", OutputStyle{"ISO", "MDY", "Asia/Kolkata"}, ttzSummer, "2020-06-15 15:30:00+05:30"},
-		{"iso kathmandu summer", OutputStyle{"ISO", "MDY", "Asia/Kathmandu"}, ttzSummer, "2020-06-15 15:45:00+05:45"},
+		{"iso utc summer", OutputStyle{Style: "ISO", Order: "MDY", Zone: "UTC"}, ttzSummer, "2020-06-15 10:00:00+00"},
+		{"iso kolkata summer", OutputStyle{Style: "ISO", Order: "MDY", Zone: "Asia/Kolkata"}, ttzSummer, "2020-06-15 15:30:00+05:30"},
+		{"iso kathmandu summer", OutputStyle{Style: "ISO", Order: "MDY", Zone: "Asia/Kathmandu"}, ttzSummer, "2020-06-15 15:45:00+05:45"},
 		// DST moves both the clock and the offset width.
-		{"iso kolkata winter", OutputStyle{"ISO", "MDY", "Asia/Kolkata"}, ttzWinter, "2020-01-15 15:30:00+05:30"},
+		{"iso kolkata winter", OutputStyle{Style: "ISO", Order: "MDY", Zone: "Asia/Kolkata"}, ttzWinter, "2020-01-15 15:30:00+05:30"},
 		// An HH:MM:SS offset — Local Mean Time, reachable only pre-1906.
-		{"iso kolkata BC", OutputStyle{"ISO", "MDY", "Asia/Kolkata"}, ttzBC, "0001-02-28 15:53:28+05:53:28 BC"},
-		{"iso kathmandu BC", OutputStyle{"ISO", "MDY", "Asia/Kathmandu"}, ttzBC, "0001-02-28 15:41:16+05:41:16 BC"},
+		{"iso kolkata BC", OutputStyle{Style: "ISO", Order: "MDY", Zone: "Asia/Kolkata"}, ttzBC, "0001-02-28 15:53:28+05:53:28 BC"},
+		{"iso kathmandu BC", OutputStyle{Style: "ISO", Order: "MDY", Zone: "Asia/Kathmandu"}, ttzBC, "0001-02-28 15:41:16+05:41:16 BC"},
 		// The abbreviation styles print the tzdata abbreviation, not the offset.
-		{"german utc", OutputStyle{"German", "DMY", "UTC"}, ttzSummer, "15.06.2020 10:00:00 UTC"},
-		{"sql dmy LA summer", OutputStyle{"SQL", "DMY", "America/Los_Angeles"}, ttzSummer, "15/06/2020 03:00:00 PDT"},
-		{"sql dmy LA winter", OutputStyle{"SQL", "DMY", "America/Los_Angeles"}, ttzWinter, "15/01/2020 02:00:00 PST"},
-		{"postgres mdy LA summer", OutputStyle{"Postgres", "MDY", "America/Los_Angeles"}, ttzSummer, "Mon Jun 15 03:00:00 2020 PDT"},
-		{"postgres mdy LA winter", OutputStyle{"Postgres", "MDY", "America/Los_Angeles"}, ttzWinter, "Wed Jan 15 02:00:00 2020 PST"},
+		{"german utc", OutputStyle{Style: "German", Order: "DMY", Zone: "UTC"}, ttzSummer, "15.06.2020 10:00:00 UTC"},
+		{"sql dmy LA summer", OutputStyle{Style: "SQL", Order: "DMY", Zone: "America/Los_Angeles"}, ttzSummer, "15/06/2020 03:00:00 PDT"},
+		{"sql dmy LA winter", OutputStyle{Style: "SQL", Order: "DMY", Zone: "America/Los_Angeles"}, ttzWinter, "15/01/2020 02:00:00 PST"},
+		{"postgres mdy LA summer", OutputStyle{Style: "Postgres", Order: "MDY", Zone: "America/Los_Angeles"}, ttzSummer, "Mon Jun 15 03:00:00 2020 PDT"},
+		{"postgres mdy LA winter", OutputStyle{Style: "Postgres", Order: "MDY", Zone: "America/Los_Angeles"}, ttzWinter, "Wed Jan 15 02:00:00 2020 PST"},
 		// The era marker trails the ZONE, not the seconds.
-		{"postgres mdy LA BC", OutputStyle{"Postgres", "MDY", "America/Los_Angeles"}, ttzBC, "Mon Feb 28 02:07:02 0001 LMT BC"},
+		{"postgres mdy LA BC", OutputStyle{Style: "Postgres", Order: "MDY", Zone: "America/Los_Angeles"}, ttzBC, "Mon Feb 28 02:07:02 0001 LMT BC"},
 		// Sentinels are style- and zone-independent (EncodeSpecialTimestamp).
-		{"infinity", OutputStyle{"German", "DMY", "Asia/Kolkata"}, maxInt64, "infinity"},
-		{"-infinity", OutputStyle{"German", "DMY", "Asia/Kolkata"}, minInt64, "-infinity"},
+		{"infinity", OutputStyle{Style: "German", Order: "DMY", Zone: "Asia/Kolkata"}, maxInt64, "infinity"},
+		{"-infinity", OutputStyle{Style: "German", Order: "DMY", Zone: "Asia/Kolkata"}, minInt64, "-infinity"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -82,18 +82,18 @@ func TestFormatTimestampElemAgainstPG18Oracle(t *testing.T) {
 		micros int64
 		want   string
 	}{
-		{"iso", OutputStyle{"ISO", "MDY", "UTC"}, tsPlain, "2020-06-15 10:00:00"},
-		{"iso under a non-UTC session zone", OutputStyle{"ISO", "MDY", "Asia/Kolkata"}, tsPlain, "2020-06-15 10:00:00"},
-		{"german", OutputStyle{"German", "DMY", "UTC"}, tsPlain, "15.06.2020 10:00:00"},
-		{"postgres mdy", OutputStyle{"Postgres", "MDY", "America/Los_Angeles"}, tsPlain, "Mon Jun 15 10:00:00 2020"},
-		{"iso BC", OutputStyle{"ISO", "MDY", "UTC"}, tsBC, "0001-02-28 10:00:00 BC"},
-		{"german BC", OutputStyle{"German", "DMY", "UTC"}, tsBC, "28.02.0001 10:00:00 BC"},
-		{"postgres BC keeps the true weekday", OutputStyle{"Postgres", "MDY", "UTC"}, tsBC, "Mon Feb 28 10:00:00 0001 BC"},
+		{"iso", OutputStyle{Style: "ISO", Order: "MDY", Zone: "UTC"}, tsPlain, "2020-06-15 10:00:00"},
+		{"iso under a non-UTC session zone", OutputStyle{Style: "ISO", Order: "MDY", Zone: "Asia/Kolkata"}, tsPlain, "2020-06-15 10:00:00"},
+		{"german", OutputStyle{Style: "German", Order: "DMY", Zone: "UTC"}, tsPlain, "15.06.2020 10:00:00"},
+		{"postgres mdy", OutputStyle{Style: "Postgres", Order: "MDY", Zone: "America/Los_Angeles"}, tsPlain, "Mon Jun 15 10:00:00 2020"},
+		{"iso BC", OutputStyle{Style: "ISO", Order: "MDY", Zone: "UTC"}, tsBC, "0001-02-28 10:00:00 BC"},
+		{"german BC", OutputStyle{Style: "German", Order: "DMY", Zone: "UTC"}, tsBC, "28.02.0001 10:00:00 BC"},
+		{"postgres BC keeps the true weekday", OutputStyle{Style: "Postgres", Order: "MDY", Zone: "UTC"}, tsBC, "Mon Feb 28 10:00:00 0001 BC"},
 		// Fractional seconds carry no trailing zeros (AppendSeconds).
-		{"fractional", OutputStyle{"ISO", "MDY", "UTC"}, tsFrac, "2020-03-01 12:34:56.1"},
-		{"fractional postgres", OutputStyle{"Postgres", "MDY", "UTC"}, tsFrac, "Sun Mar 01 12:34:56.1 2020"},
-		{"infinity", OutputStyle{"German", "DMY", "UTC"}, maxInt64, "infinity"},
-		{"-infinity", OutputStyle{"German", "DMY", "UTC"}, minInt64, "-infinity"},
+		{"fractional", OutputStyle{Style: "ISO", Order: "MDY", Zone: "UTC"}, tsFrac, "2020-03-01 12:34:56.1"},
+		{"fractional postgres", OutputStyle{Style: "Postgres", Order: "MDY", Zone: "UTC"}, tsFrac, "Sun Mar 01 12:34:56.1 2020"},
+		{"infinity", OutputStyle{Style: "German", Order: "DMY", Zone: "UTC"}, maxInt64, "infinity"},
+		{"-infinity", OutputStyle{Style: "German", Order: "DMY", Zone: "UTC"}, minInt64, "-infinity"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -111,14 +111,14 @@ func TestFormatDateElemAgainstPG18Oracle(t *testing.T) {
 		days int32
 		want string
 	}{
-		{"iso", OutputStyle{"ISO", "MDY", "UTC"}, dPlain, "2020-06-15"},
-		{"iso ignores the session zone", OutputStyle{"ISO", "MDY", "Asia/Kolkata"}, dPlain, "2020-06-15"},
-		{"german", OutputStyle{"German", "DMY", "UTC"}, dPlain, "15.06.2020"},
-		{"sql dmy", OutputStyle{"SQL", "DMY", "UTC"}, dPlain, "15/06/2020"},
-		{"iso BC", OutputStyle{"ISO", "MDY", "UTC"}, dBC, "0001-02-28 BC"},
-		{"german BC", OutputStyle{"German", "DMY", "UTC"}, dBC, "28.02.0001 BC"},
-		{"infinity", OutputStyle{"German", "DMY", "UTC"}, maxInt32, "infinity"},
-		{"-infinity", OutputStyle{"German", "DMY", "UTC"}, minInt32, "-infinity"},
+		{"iso", OutputStyle{Style: "ISO", Order: "MDY", Zone: "UTC"}, dPlain, "2020-06-15"},
+		{"iso ignores the session zone", OutputStyle{Style: "ISO", Order: "MDY", Zone: "Asia/Kolkata"}, dPlain, "2020-06-15"},
+		{"german", OutputStyle{Style: "German", Order: "DMY", Zone: "UTC"}, dPlain, "15.06.2020"},
+		{"sql dmy", OutputStyle{Style: "SQL", Order: "DMY", Zone: "UTC"}, dPlain, "15/06/2020"},
+		{"iso BC", OutputStyle{Style: "ISO", Order: "MDY", Zone: "UTC"}, dBC, "0001-02-28 BC"},
+		{"german BC", OutputStyle{Style: "German", Order: "DMY", Zone: "UTC"}, dBC, "28.02.0001 BC"},
+		{"infinity", OutputStyle{Style: "German", Order: "DMY", Zone: "UTC"}, maxInt32, "infinity"},
+		{"-infinity", OutputStyle{Style: "German", Order: "DMY", Zone: "UTC"}, minInt32, "-infinity"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

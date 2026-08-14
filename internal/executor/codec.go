@@ -39,10 +39,19 @@ func PGFloatOut(f float64, bitSize int) string { return catalog.PGFloatOut(f, bi
 // Most goopg code should continue using EncodeRow (goopg-internal
 // format) for backward compatibility.
 func EncodeRowPG(cols []catalog.Column, row Row) ([]byte, error) {
+	return EncodeRowPGCtx(cols, row, nil, 0)
+}
+
+// EncodeRowPGCtx is the ctx+pos-carrying sibling of EncodeRowPG: a reg*[]
+// column resolves its element names through the session catalog
+// (regIdentifierInput), so the heap-write paths thread their Context in; the
+// no-ctx wrapper is what the test/toast/index-key callers that never write a
+// user reg*[] name use. M0119-0006 reg* element slice.
+func EncodeRowPGCtx(cols []catalog.Column, row Row, ctx *Context, pos int) ([]byte, error) {
 	if len(cols) != len(row) {
 		return nil, fmt.Errorf("EncodeRowPG: %d cols vs %d datums", len(cols), len(row))
 	}
-	return encodeRowPG(cols, row)
+	return encodeRowPGCtx(cols, row, ctx, pos)
 }
 
 // NullBitmapPG returns the PG-convention null bitmap for the row, or
@@ -77,7 +86,7 @@ func NullBitmapPG(row Row) []byte {
 // tuple format. NULL columns are skipped (they consume no data bytes
 // in PG's heap tuple); see NullBitmapPG for the null bitmap that must
 // accompany the result whenever the row contains NULL.
-func encodeRowPG(cols []catalog.Column, row Row) ([]byte, error) {
+func encodeRowPGCtx(cols []catalog.Column, row Row, ctx *Context, pos int) ([]byte, error) {
 	out := make([]byte, 0, 256)
 	off := 0
 	for i, c := range cols {
@@ -107,7 +116,7 @@ func encodeRowPG(cols []catalog.Column, row Row) ([]byte, error) {
 		}
 		align := physicalPGTypeAlign(c.Type)
 		off = alignPhysicalPGOffset(off, align)
-		buf, err := encodeValuePG(c.Type, d)
+		buf, err := encodeValuePGCtx(c.Type, d, ctx, pos)
 		if err != nil {
 			return nil, err
 		}
@@ -250,12 +259,21 @@ func pgBoolIn(s string) (bool, bool) {
 
 // encodeValuePG encodes a single datum in PG-native format.
 func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
+	return encodeValuePGCtx(t, d, nil, 0)
+}
+
+// encodeValuePGCtx is the ctx+pos-carrying sibling of encodeValuePG (see
+// EncodeRowPGCtx for why): a reg*[] element resolves its name→OID through the
+// session catalog (regIdentifierInput). The no-ctx wrapper (nil ctx, pos 0) is
+// what the non-writer callers (tests, toast chunk rows, index keys, catalog
+// heap tuples) use. M0119-0006 reg* element slice.
+func encodeValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]byte, error) {
 	// A user array column (e.g. `p int4[]`) carries Type.Name="int4" plus
 	// Type.IsArray=true; its value is the array text "{1,2}". Encode it as a
 	// PG-native ArrayType varlena blob BEFORE the element-type switch (which
 	// would otherwise try to parse "{1,2}" as a scalar int4). M0118-0002.
 	if t.IsArray {
-		return encodeArrayValuePG(t, d)
+		return encodeArrayValuePGCtx(t, d, ctx, pos)
 	}
 	switch strings.ToLower(t.Name) {
 	case "bool", "boolean":

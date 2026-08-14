@@ -3831,7 +3831,7 @@ func tryApplyHOTUpdate(
 	// Always encode in PG-native physical format (M0111-0002): one on-disk
 	// heap-tuple format for HOT and non-HOT updates alike. goopg reads it back
 	// by selecting the decoder from the tuple header (natts/bitmap).
-	body, encErr := EncodeRowPG(cols, newRow)
+	body, encErr := EncodeRowPGCtx(cols, newRow, ctx, 0)
 	if encErr != nil {
 		var ee *ExecError
 		if errors.As(encErr, &ee) {
@@ -8791,7 +8791,7 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 	// on-disk heap-tuple format, byte-valid for a PG standby's
 	// heap_deform_tuple. goopg reads it back by selecting the decoder from the
 	// tuple header (natts/bitmap) in DecodeRowIntoMctxPGTuple.
-	body, encErr := EncodeRowPG(cols, row)
+	body, encErr := EncodeRowPGCtx(cols, row, ctx, 0)
 	if encErr != nil {
 		// Preserve ExecError (e.g. 22P02 invalid input, 22003 out of range)
 		// so the SQLSTATE and message reach the client unchanged.
