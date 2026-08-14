@@ -279,8 +279,16 @@ run_test() {
     actual_norm="$(mktemp)"
     expected_norm="$(mktemp)"
 
-    # Run the .sql file; capture combined stdout+stderr
-    "${PSQL[@]}" -f "${sql_file}" >"${actual_raw}" 2>&1 || true
+    # Run the .sql file; capture combined stdout+stderr.
+    # Use a stdin redirect (<) rather than -f, mirroring pg_regress
+    # (postgres/src/test/regress/pg_regress_main.c:74-75): with -f, psql sets
+    # pset.inputfile and prepends a "psql:<abs-path>:<line>:" locus prefix to
+    # every server error line (psql command.c setFile / startup.c
+    # log_locus_callback), while a stdin redirect leaves pset.inputfile NULL so
+    # errors come out bare, matching the expected .out files byte-for-byte.
+    # The -a echo-all flag is preserved (it lives in the PSQL array above), so
+    # the echoed SQL still matches the expected output.
+    "${PSQL[@]}" < "${sql_file}" >"${actual_raw}" 2>&1 || true
 
     normalise_output < "${actual_raw}" > "${actual_norm}"
     normalise_output < "${exp_file}"   > "${expected_norm}"

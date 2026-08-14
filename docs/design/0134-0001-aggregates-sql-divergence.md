@@ -22,13 +22,13 @@ error cases. It depends on two things the runner does not provide:
 2. **`create_aggregate.sql`** — the user-defined aggregates (`newavg`, `my_avg`,
    `my_sum`, …) it references are created there, not in `aggregates.sql`.
 
-## Divergence map (fresh re-run @ HEAD 2026-08-15 — 2759-line diff; P1 harness-fixed → 2204, P4 harness-fixed → 1935)
+## Divergence map (fresh re-run @ HEAD 2026-08-15 — 2759-line diff; P1 harness-fixed → 2204, P4 harness-fixed → 1935, P3a harness-fixed → 1786)
 
 | # | share | pattern | class |
 |---|-------|---------|-------|
 | P1 | 64.2% | every base table empty ⇒ `avg`/`count`/group-by return NULL/0/`(0 rows)` | **harness** — `PG_ABS_SRCDIR` never exported, so `\getenv abs_srcdir` leaves it unset and every `COPY … FROM :'filename'` fails |
 | P2 | 20.4% | `EXPLAIN` text diverges: `(stats)`, `HashAggregate (N keys)`, `*planner.GenerateSeries`, missing min/max→InitPlan+IndexOnlyScan + GROUP-BY functional-dep removal + presorted aggregation | engine, broad |
-| P3 | 7.5% | `psql:file:line:` prefix (harness: `-f` vs stdin redirect) + missing `LINE n:`/`^` position context in parse-analysis errors (engine) | mixed |
+| P3 | 7.5% | `psql:file:line:` prefix (harness: `-f` vs stdin redirect — **RESOLVED 2026-08-15**, 56→0 lines) + missing `LINE n:`/`^` position context in parse-analysis errors (engine — **open**, 27 lines) | mixed |
 | P4 | 5.2% | `function … does not exist` for user-defined aggregates | **harness** — `create_aggregate.sql` prerequisite never run — **RESOLVED 2026-08-15** (runner runs it best-effort) |
 | P5 | 1.3% | `string_agg` over `bytea` drops the delimiter (text `','` fails the `KindBytes` gate) | ~~engine, narrow~~ **non-issue** — the bytea section already matches PG (verified: `grep bytea tmp/regress-diffs/aggregates.diff` → empty) |
 | P6 | 1.1% | `pg_get_viewdef` deparse lowercase/unqualified | engine |
@@ -70,14 +70,17 @@ error cases. It depends on two things the runner does not provide:
    `create_aggregate.sql` best-effort after `test_setup.sql` in the runner's
    setup phase. Self-contained (defines its own `sum3`/`aggf_trans`/`least_accum`/
    `cleast_accum` inline; built-in transitions for the rest). Removes P4 (5.2%).
-3. **P3 error-position context** — add `LINE n:`/`^` to parse-analysis errors
-   (engine) + drop the `psql:file:line:` prefix (harness: `-f` vs stdin redirect).
+3. **P3 error-position context** — **(a) harness half LANDED 2026-08-15:** drop the
+   `psql:file:line:` prefix by feeding each `.sql` via stdin redirect (`< file`)
+   instead of `-f`, mirroring `pg_regress_main.c:74-75` (56 prefix lines → 0).
+   **(b) engine half open:** add `LINE n:`/`^` to parse-analysis errors (27 lines) —
+   a shared gap across cases, likely warrants a cross-case design note.
 4. **P2 `EXPLAIN` format** — broadest remaining engine gap; separate milestone-sized effort.
 5. **P6/P7/P8** — deparse, collation, residual expr errors.
 6. ~~P5 bytea string_agg delimiter~~ — reclassified non-issue (see map above).
 
-After slices 1–2 the case stands at 1935 diff lines (P3+P2 are the long poles;
-P6/P7/P8 are tail).
+After slices 1–3a the case stands at 1786 diff lines (P3 engine half + P2 are the
+long poles; P6/P7/P8 are tail).
 
 ## PG oracle citations
 
