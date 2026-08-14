@@ -632,7 +632,7 @@ func routineArgListStr(argTypes []catalog.Type) string {
 	}
 	parts := make([]string, len(argTypes))
 	for i, t := range argTypes {
-		parts[i] = canonicalTypeName(t.Name)
+		parts[i] = canonicalTypeName(t.Name, 0)
 	}
 	return "(" + strings.Join(parts, ", ") + ")"
 }

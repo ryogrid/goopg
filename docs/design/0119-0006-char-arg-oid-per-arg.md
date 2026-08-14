@@ -220,8 +220,16 @@ Gates: package suites (`internal/executor`, `internal/server`,
   quoted `"char"` (CHAROID 18) renders `character` where PG's `format_type_be`
   renders `"char"` — a pre-existing divergence, a SEPARATE renderer family from
   the regprocedure output path (row 1351 names only the regprocedure arglist),
-  and its fix (threading the OID into `buildFunctionArguments`/`canonicalTypeName`)
-  is its own slice. Recorded, not widened here.
+  **RESOLVED 2026-08-15 (92nd slice):** `canonicalTypeName` re-signed to
+  `canonicalTypeName(name string, oid uint32)`; its `char` arm emits `"char"`
+  for OIDChar(18) and `character` for 1042/0 (0 keeps the no-OID baseline for
+  aggregates + pre-90th routines). All 7 call sites updated: the three per-arg
+  loops (`buildFunctionArguments`/`buildTableResult`/`buildFunctionDef` arg-arms)
+  read `r.ArgTypeOIDs[i]` under a nil/len guard; `buildFunctionDef` RETURNS-clause,
+  `pg_get_function_result` scalar, and `routineArgListStr` pass 0. Test
+  `TestPgGetFunctionArgsQuotedCharRendersQuoted`. Residuals (rows 1361/1362):
+  `RETURNS "char"` is still OID-less (no `ReturnTypeOID` on `Routine`), and the
+  arg-list parser rejects a named `g(x "char")`.
 - **Quoted `"char"(N)` with an explicit typmod** (`Args=[N]`) is
   indistinguishable from bare `char(N)` by the `len(Args)` heuristic →
   misclassified as bpchar. The realistic oracle probes (`"char"`, `"char"[]`,

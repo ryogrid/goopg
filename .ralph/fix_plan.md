@@ -3357,6 +3357,24 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       cannot quote a mixed-case user type without also quoting builtin display
       strings that pass `ArgTypeDisplayAlias` unchanged; OID-keying is blocked on
       row 1343's namespace/OID work.
+      **92nd slice (2026-08-15): the pg_get_function_* `char` arg now renders
+      OID-accurately (deferral row 1358).** `canonicalTypeName` (expr.go) was
+      name-keyed and rendered `char`→`character` unconditionally, so a quoted
+      `"char"` arg (CHAROID 18) rendered `character` where PG's `format_type_be`
+      renders `"char"` — a pg_dump signature-rebuild divergence. Re-signed to
+      `canonicalTypeName(name string, oid uint32)`; its `char` arm emits `"char"`
+      for OIDChar(18) and `character` for 1042/0 (0 = no-OID baseline, aggregates +
+      pre-90th routines — deliberately NOT the sibling regprocedure arm's 0→`"char"`).
+      All 7 call sites threaded: `buildFunctionArguments`/`buildTableResult`/
+      `buildFunctionDef` arg-arms read `r.ArgTypeOIDs[i]` under a nil/len guard;
+      `buildFunctionDef` RETURNS-clause, `pg_get_function_result` scalar, and
+      `routineArgListStr` pass 0. Test `TestPgGetFunctionArgsQuotedCharRendersQuoted`.
+      Gates: go build + executor package suite + pre-commit units + tpch-spotcheck
+      (Q12=2/Q13=35) + `TestPort_RegressSuite` (31 PASS/0 FAIL) all PASS. Deferred
+      (2 new rows 1361/1362): the return-type path (`RETURNS "char"`) is still
+      OID-less (no `ReturnTypeOID` on `Routine`), and the arg-list parser rejects a
+      named arg `g(x "char")` where PG accepts `argname argtype`. Design updated in
+      `0119-0006-char-arg-oid-per-arg.md` §6 (open item marked resolved).
       **28th slice (2026-08-12): the `HH:MM` half of that inherited input gap is
       closed.** A time-of-day with no seconds field is ordinary PG input
       (`DecodeTime` reads seconds only `if (*cp == ':')`, leaving `tm_sec = 0`),

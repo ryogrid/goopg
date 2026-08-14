@@ -10279,7 +10279,7 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 						// (ruleutils.c). pg_dump uses this verbatim for the
 						// RETURNS clause, so dropping SETOF would silently
 						// downgrade an SRF to a scalar function on dump.
-						ret := canonicalTypeName(r.ReturnType.Name)
+						ret := canonicalTypeName(r.ReturnType.Name, 0)
 						if r.ReturnsSet {
 							ret = "SETOF " + ret
 						}
@@ -15042,7 +15042,11 @@ func buildFunctionArguments(r *catalog.Routine, printDefaults bool) string {
 			part.WriteString(r.ArgNames[i])
 			part.WriteByte(' ')
 		}
-		part.WriteString(canonicalTypeName(argType.Name))
+		oid := uint32(0)
+		if r.ArgTypeOIDs != nil && i < len(r.ArgTypeOIDs) {
+			oid = r.ArgTypeOIDs[i]
+		}
+		part.WriteString(canonicalTypeName(argType.Name, oid))
 		// DEFAULT clause. PG's print_function_arguments appends ` DEFAULT <expr>`
 		// only when print_defaults is set AND the argument is an input arg
 		// (IN/INOUT/VARIADIC) — output args never carry a default. goopg stores the
@@ -15075,7 +15079,11 @@ func buildTableResult(r *catalog.Routine) string {
 		if part != "" {
 			part += " "
 		}
-		part += canonicalTypeName(r.ArgTypes[i].Name)
+		oid := uint32(0)
+		if r.ArgTypeOIDs != nil && i < len(r.ArgTypeOIDs) {
+			oid = r.ArgTypeOIDs[i]
+		}
+		part += canonicalTypeName(r.ArgTypes[i].Name, oid)
 		cols = append(cols, part)
 	}
 	if len(cols) == 0 {
@@ -15152,7 +15160,11 @@ func buildFunctionDef(r *catalog.Routine) string {
 			sb.WriteString(r.ArgNames[i])
 			sb.WriteByte(' ')
 		}
-		sb.WriteString(canonicalTypeName(argType.Name))
+		oid := uint32(0)
+		if r.ArgTypeOIDs != nil && i < len(r.ArgTypeOIDs) {
+			oid = r.ArgTypeOIDs[i]
+		}
+		sb.WriteString(canonicalTypeName(argType.Name, oid))
 		// DEFAULT clause: pg_get_functiondef calls print_function_arguments with
 		// print_defaults=true, so input args carry their ` DEFAULT <expr>` (sibling
 		// of buildFunctionArguments; output args never have a default).
@@ -15173,7 +15185,7 @@ func buildFunctionDef(r *catalog.Routine) string {
 			if r.ReturnsSet {
 				sb.WriteString("SETOF ")
 			}
-			sb.WriteString(canonicalTypeName(r.ReturnType.Name))
+			sb.WriteString(canonicalTypeName(r.ReturnType.Name, 0))
 		}
 		sb.WriteByte('\n')
 	}
@@ -15338,10 +15350,10 @@ func pgTypeofNameFromPlanType(name string) string {
 	}
 }
 
-func canonicalTypeName(name string) string {
+func canonicalTypeName(name string, oid uint32) string {
 	// Handle array types (e.g. "text[]") by canonicalizing the base type.
 	if strings.HasSuffix(name, "[]") {
-		base := canonicalTypeName(name[:len(name)-2])
+		base := canonicalTypeName(name[:len(name)-2], oid)
 		return base + "[]"
 	}
 	switch strings.ToLower(name) {
@@ -15360,7 +15372,16 @@ func canonicalTypeName(name string) string {
 	case "varchar":
 		return "character varying"
 	case "char":
-		return "character"
+		// CHAROID (18) renders as the quoted pseudo-name "char" to match PG's
+		// format_type_extended: BPCHAROID maps to "character", and there is no
+		// CHAROID case, so the default quote_qualified_identifier path yields
+		// `"char"` (postgres/src/backend/utils/adt/format_type.c:207-220,303-322).
+		// OID 0 (no-OID baseline: aggregates, pre-90th routines, error-text path)
+		// and 1042 (bpchar) both render "character".
+		if oid == catalog.OIDChar { // 18
+			return `"char"`
+		}
+		return "character" // 1042 (bpchar) AND 0 (no-OID baseline, aggregates/pre-90th)
 	}
 	return name
 }
