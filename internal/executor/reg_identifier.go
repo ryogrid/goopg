@@ -675,6 +675,14 @@ func regprocedureArglist(argTypes []catalog.RegprocArg, visible func(schema stri
 		if a.Schema != "" && a.Schema != "pg_catalog" && visible != nil && !visible(a.Schema) {
 			name = quoteQualifiedIdentifier(a.Schema, name)
 		}
+		// Deferral row 1344: a user type whose schema is ON the effective
+		// search_path renders through quote_identifier — mixed-case and keyword
+		// names quote, lowercase safe names stay bare — mirroring
+		// format_type_be's default path (format_type.c:303-326 → quote_identifier).
+		// A nil visible predicate (base RegOut, bare arglist) keeps name = base.
+		if a.Schema != "" && a.Schema != "pg_catalog" && visible != nil && visible(a.Schema) {
+			name = pgQuoteIdent(base)
+		}
 		if isArray {
 			name += "[]"
 		}

@@ -540,6 +540,47 @@ func TestRegprocedureArglistCatalogAndExecutorAgree(t *testing.T) {
 	}
 }
 
+func TestRegprocedureArglistQuotesMixedCaseUserType(t *testing.T) {
+	ctx := regCopyCat(t)
+	allVisible := func(s string) bool { return true }
+	offpathHidden := func(s string) bool { return s != "offpath" }
+
+	cases := []struct {
+		name       string
+		argTypes   []catalog.Type
+		argSchemas []string
+		visible    func(string) bool
+		want       string
+	}{
+		// Off-path mixed-case user type: both parts quote (quoteQualifiedIdentifier).
+		{"f_offpath_mixed", []catalog.Type{{Name: "MyType"}}, []string{"offpath"}, offpathHidden, `public.f_offpath_mixed(offpath."MyType")`},
+		// On-path (visible) mixed-case user type: bare name quotes.
+		{"f_visible_mixed", []catalog.Type{{Name: "MyType"}}, []string{"offpath"}, allVisible, `public.f_visible_mixed("MyType")`},
+		// Lowercase user type stays bare even on-path (quote_identifier no-op).
+		{"f_visible_lower", []catalog.Type{{Name: "mytype"}}, []string{"offpath"}, allVisible, "public.f_visible_lower(mytype)"},
+		// Builtin unaffected (pg_catalog arm maps to the SQL alias).
+		{"f_builtin", []catalog.Type{{Name: "int4"}}, []string{"pg_catalog"}, allVisible, "public.f_builtin(integer)"},
+		// Mixed-case user type in a builtin-schema arm is untouched by the quote.
+		{"f_offpath_mixed_arr", []catalog.Type{{Name: "MyType[]"}}, []string{"offpath"}, allVisible, `public.f_offpath_mixed_arr("MyType"[])`},
+	}
+	for _, tc := range cases {
+		r, err := ctx.Catalog.Routines().Create(&catalog.Routine{
+			Name:           tc.name,
+			Schema:         "public",
+			ArgTypes:       tc.argTypes,
+			ArgModes:       []string{"i"},
+			ArgTypeSchemas: tc.argSchemas,
+			ReturnType:     catalog.Type{Name: "int4"},
+		}, false)
+		if err != nil {
+			t.Fatalf("Routines().Create(%s): %v", tc.name, err)
+		}
+		if got := RegOutArgVisible("regprocedure", r.OID, ctx.Catalog, true, tc.visible); got != tc.want {
+			t.Errorf("regprocedure(%s) = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
 // M0119-0006 (deferral row L1305): a synthetic TOAST relation OID (parent OID +
 // 100M) or TOAST index OID (+200M) — which live only in the virtual pg_class
 // builder, never c.tables/c.indexes — must render the schema-qualified

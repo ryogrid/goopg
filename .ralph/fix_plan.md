@@ -3337,6 +3337,26 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       all PASS. Deferred (2 new rows): the pg_get_function_* `canonicalTypeName`
       renders `char`→`character` unconditionally (pg_dump signature-rebuild path);
       quoted `"char"(N)` misclassified by the `len(Args)` heuristic.
+      **91st slice (2026-08-15): arg-type name case preservation (ledger row
+      1344).** `routineArgTypeName` (operators_call.go:671) folded a quoted arg
+      type's name with `strings.ToLower`, so `CREATE FUNCTION f(offpath."MyType")`
+      stored `ArgTypes[0].Name="mytype"` and rendered `offpath.mytype` where PG's
+      `format_type_be` emits `offpath."MyType"`. Fix: drop the fold (the parser
+      already lowercases unquoted `TokenIdent` and preserves `TokenQuotedIdent`;
+      `Signature()`/`TypeNameToOID`/`ArgTypeDisplayAlias` all resolve
+      case-insensitively, so DROP/ALTER/COMMENT matching is unchanged) and teach
+      the executor `regprocedureArglist` visible arm (schema non-empty,
+      non-pg_catalog, on-path) to render `pgQuoteIdent(base)` — the
+      `format_type_be` default path — so an on-path `"MyType"` renders `"MyType"`
+      not `MyType`. Design: `docs/design/0119-0006-arg-type-case-preservation.md`.
+      Tests: `TestCreateFunctionCapturesArgTypeCase`,
+      `TestRegprocedureArglistQuotesMixedCaseUserType`. Gates: catalog+executor
+      package suites + pre-commit units + `TestPort_RegressSuite` (31 PASS/0 FAIL,
+      `-timeout 55m`) + tpch-spotcheck (Q12=2/Q13=35) all PASS. Deferred (1 new
+      row): the catalog sibling `argListTypeDisplay` is left bare — name-only, it
+      cannot quote a mixed-case user type without also quoting builtin display
+      strings that pass `ArgTypeDisplayAlias` unchanged; OID-keying is blocked on
+      row 1343's namespace/OID work.
       **28th slice (2026-08-12): the `HH:MM` half of that inherited input gap is
       closed.** A time-of-day with no seconds field is ordinary PG input
       (`DecodeTime` reads seconds only `if (*cp == ':')`, leaving `tm_sec = 0`),

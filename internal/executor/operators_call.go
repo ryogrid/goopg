@@ -669,7 +669,15 @@ func funcArgModes(args []parser.FunctionArg) []string {
 // it does not consult catalog.Type.IsArray), so an ALTER/DROP/COMMENT lookup
 // must reproduce that exact string to match a stored array-typed signature.
 func routineArgTypeName(t parser.ColumnType) string {
-	name := strings.ToLower(t.Name)
+	// M0119-0006 (deferral row 1344): the parser already lowercases unquoted
+	// TokenIdent (identText) and preserves TokenQuotedIdent verbatim, so the
+	// old strings.ToLower here was a no-op for unquoted names and destructive
+	// for quoted ones — it folded `CREATE FUNCTION f(offpath."MyType")` to
+	// "mytype". Drop the fold: every downstream consumer (Signature(),
+	// TypeNameToOID, ArgTypeDisplayAlias) resolves case-insensitively, and
+	// format_type_be (postgres/src/backend/utils/adt/format_type.c:343) emits
+	// pg_type.typname verbatim through quote_identifier.
+	name := t.Name
 	if t.IsArray {
 		name += "[]"
 	}
