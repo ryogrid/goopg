@@ -724,7 +724,7 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 					if name := oidToBuiltinTypeName(uint32(oid)); name != "" {
 						return NewStringDatum(name), nil
 					}
-					if uname, ok := userTypeNameForOID(ctx.Catalog, uint32(oid), !RegObjectSchemaVisible(ctx, "public")); ok {
+					if uname, ok := userTypeNameForOID(ctx.Catalog, uint32(oid), func(s string) bool { return !RegObjectSchemaVisible(ctx, s) }); ok {
 						return NewStringDatum(uname), nil
 					}
 					return NewStringDatum(typName), nil
@@ -751,11 +751,12 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 				// this rendered the bare numeric OID (e.g. `atttypid::regtype`
 				// for a range-typed column showed "16422" instead of
 				// "myrange"), diverging from PG's regtypeout (regproc.c). The
-				// name is only schema-qualified when "public" is not visible
-				// on the effective search_path (matches regproc/regoperator's
-				// own RegObjectSchemaVisible check above). DU-002 (M0110-0001)
-				// regtype/format_type unification follow-up.
-				if uname, ok := userTypeNameForOID(ctx.Catalog, uint32(v.Int), !RegObjectSchemaVisible(ctx, "public")); ok {
+				// name is schema-qualified (with the type's ACTUAL schema) when
+				// that schema is not visible on the effective search_path — a
+				// per-schema predicate, unlike the fixed-"public" check the
+				// regproc/regoperator casts still use. DU-002 (M0110-0001)
+				// regtype/format_type unification follow-up; M0119-0006 slice B.
+				if uname, ok := userTypeNameForOID(ctx.Catalog, uint32(v.Int), func(s string) bool { return !RegObjectSchemaVisible(ctx, s) }); ok {
 					return NewStringDatum(uname), nil
 				}
 				return NewStringDatum(fmt.Sprintf("%d", v.Int)), nil
@@ -11898,14 +11899,15 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				// so formatTypeOID (built-ins only) returns the unknown
 				// sentinel; resolve it via the shared enum/domain/composite/
 				// range/multirange lookup (also used by the ::regtype cast).
-				// format_type only schema-qualifies when the type's schema
-				// (always public, for goopg's user types) is not visible on
-				// the effective search_path — e.g. pg_dump's search_path=''
-				// (ALWAYS_SECURE_SEARCH_PATH_SQL) makes public always
-				// non-visible, forcing the public. prefix, while a plain
-				// session's default search_path leaves it unqualified.
-				// DU-002 slices 88-90/249-251/(M0110-0001).
-				if uname, ok := userTypeNameForOID(ctx.Catalog, uint32(typeOID), !RegObjectSchemaVisible(ctx, "public")); ok {
+				// format_type only schema-qualifies when the type's ACTUAL
+				// schema (from its NamespaceOID, slice A) is not visible on
+				// the effective search_path — a per-schema predicate — and
+				// renders via regOutQualified (quote_qualified_identifier),
+				// matching format_type_extended (format_type.c:303-326).
+				// e.g. pg_dump's search_path='' (ALWAYS_SECURE_SEARCH_PATH_SQL)
+				// makes every schema non-visible, forcing the qualified form.
+				// DU-002 slices 88-90/249-251/(M0110-0001); M0119-0006 slice B.
+				if uname, ok := userTypeNameForOID(ctx.Catalog, uint32(typeOID), func(s string) bool { return !RegObjectSchemaVisible(ctx, s) }); ok {
 					name = uname
 				}
 			}
@@ -13995,52 +13997,80 @@ func pgFormatTypeName(t string) string {
 // type, or one of their auto-generated array types) to its name. Shared by
 // format_type's built-in-fallback path, the `::regtype` cast, and
 // RegtypeName, since all three need the identical resolution across all four
-// user-type kinds. goopg enums/domains/composites/ranges all live in public;
-// qualify controls whether the "public." prefix is added, mirroring
+// user-type kinds. Each arm resolves the type's ACTUAL schema from its
+// NamespaceOID (slice A field) via SchemaNameForOID and renders through
+// regOutQualified, so an off-search_path type is schema-qualified with its real
+// schema AND quote_identifier'd — exactly PG's regtypeout → format_type_be →
+// format_type_extended (format_type.c:303-326: quote_qualified_identifier
+// when !TypeIsVisible), not a hardcoded "public." prefix. qualify is the
+// per-object predicate "should this type's schema be qualified?" mirroring
 // RegObjectSchemaVisible's role for the regproc/regoperator casts — callers
-// pass qualify=true only when "public" is NOT visible on the effective
+// pass a closure only when the schema is NOT visible on the effective
 // search_path (e.g. pg_dump's search_path=''), matching real PostgreSQL's
 // regtypeout/format_type, which only schema-qualifies when necessary rather
-// than unconditionally. Returns ("", false) if oid does not match any user
-// type. DU-002 (M0110-0001) regtype/format_type unification follow-up;
-// qualify param added as the M0122-0005 pg_typeof()::oid follow-up's
-// schema-visibility fix.
-func userTypeNameForOID(cat catalog.Catalog, oid uint32, qualify bool) (string, bool) {
-	prefix := ""
-	if qualify {
-		prefix = "public."
-	}
+// than unconditionally. The array/multirange "[]"/MultirangeName suffix is
+// split off BEFORE quoting and re-appended after, so the ELEMENT is quoted and
+// `[]` follows unquoted (the 73rd-slice split/re-append convention).
+// Returns ("", false) if oid does not match any user type. DU-002 (M0110-0001)
+// regtype/format_type unification follow-up; qualify func added as the
+// M0119-0006 slice B (deferral row 1355) schema-qualification fix.
+func userTypeNameForOID(cat catalog.Catalog, oid uint32, qualify func(schema string) bool) (string, bool) {
 	if et, ok := cat.LookupEnumByOID(oid); ok {
-		return prefix + et.Name, true
+		schema := cat.SchemaNameForOID(et.NamespaceOID)
+		return regOutQualified(schema, et.Name, regOutQualifySchema(schema, qualify)), true
 	}
 	if et, ok := cat.LookupEnumByArrayOID(oid); ok {
-		return prefix + et.Name + "[]", true
+		schema := cat.SchemaNameForOID(et.NamespaceOID)
+		return regOutQualified(schema, et.Name, regOutQualifySchema(schema, qualify)) + "[]", true
 	}
 	if dom, ok := cat.LookupDomainByOID(oid); ok {
-		return prefix + dom.Name, true
+		schema := cat.SchemaNameForOID(dom.NamespaceOID)
+		return regOutQualified(schema, dom.Name, regOutQualifySchema(schema, qualify)), true
 	}
 	if dom, ok := cat.LookupDomainByArrayOID(oid); ok {
-		return prefix + dom.Name + "[]", true
+		schema := cat.SchemaNameForOID(dom.NamespaceOID)
+		return regOutQualified(schema, dom.Name, regOutQualifySchema(schema, qualify)) + "[]", true
 	}
 	if ct, ok := cat.LookupCompositeTypeByOID(oid); ok {
-		return prefix + ct.Name, true
+		schema := cat.SchemaNameForOID(ct.NamespaceOID)
+		return regOutQualified(schema, ct.Name, regOutQualifySchema(schema, qualify)), true
 	}
 	if ct, ok := cat.LookupCompositeTypeByArrayOID(oid); ok {
-		return prefix + ct.Name + "[]", true
+		schema := cat.SchemaNameForOID(ct.NamespaceOID)
+		return regOutQualified(schema, ct.Name, regOutQualifySchema(schema, qualify)) + "[]", true
 	}
 	if rt, ok := cat.LookupRangeTypeByOID(oid); ok {
-		return prefix + rt.Name, true
+		schema := cat.SchemaNameForOID(rt.NamespaceOID)
+		return regOutQualified(schema, rt.Name, regOutQualifySchema(schema, qualify)), true
 	}
 	if rt, ok := cat.LookupRangeTypeByMultirangeOID(oid); ok {
-		return prefix + rt.MultirangeName, true
+		schema := cat.SchemaNameForOID(rt.NamespaceOID)
+		return regOutQualified(schema, rt.MultirangeName, regOutQualifySchema(schema, qualify)), true
 	}
 	if rt, ok := cat.LookupRangeTypeByArrayOID(oid); ok {
-		return prefix + rt.Name + "[]", true
+		schema := cat.SchemaNameForOID(rt.NamespaceOID)
+		return regOutQualified(schema, rt.Name, regOutQualifySchema(schema, qualify)) + "[]", true
 	}
 	if rt, ok := cat.LookupRangeTypeByMultirangeArrayOID(oid); ok {
-		return prefix + rt.MultirangeName + "[]", true
+		schema := cat.SchemaNameForOID(rt.NamespaceOID)
+		return regOutQualified(schema, rt.MultirangeName, regOutQualifySchema(schema, qualify)) + "[]", true
 	}
 	return "", false
+}
+
+// regOutQualifySchema evaluates the per-schema qualify predicate on the schema
+// regOutQualified will ACTUALLY render with: an empty schema (a user type with
+// no recorded NamespaceOID — slice A treats that as public, and regOutQualified
+// defaults ""→"public") is defaulted to "public" FIRST, so a NamespaceOID=0
+// type behaves exactly like a public type. Evaluating qualify("") directly
+// would return true (RegObjectSchemaVisible treats "" as always-visible) and
+// wrongly leave the name bare even under search_path='', where PG renders a
+// public type qualified ("public.mood") because TypeIsVisible is false.
+func regOutQualifySchema(schema string, qualify func(schema string) bool) bool {
+	if schema == "" {
+		schema = "public"
+	}
+	return qualify(schema)
 }
 
 // userTypeOIDForName resolves a user-defined type name to its pg_type OID,
@@ -14110,12 +14140,16 @@ func pgTypeofOIDForName(cat catalog.Catalog, name string) uint32 {
 // regtype-typed result column, e.g. pg_typeof()'s result or an
 // `<oid>::regtype` cast — mirrors RegprocName/RegprocedureName's role for
 // regproc/regprocedure. InvalidOid (0) renders "-", matching regtypeout.
-// qualify controls whether a resolved user-defined type name is prefixed
-// with "public." — the caller determines this from the session's effective
-// search_path (see internal/server/dispatch.go's publicSchemaVisible),
-// mirroring userTypeNameForOID's own schema-visibility contract.
-// M0122-0005 pg_typeof()::oid follow-up.
-func RegtypeName(cat catalog.Catalog, oid uint32, qualify bool) string {
+// qualify is the per-object predicate "should this type's ACTUAL schema be
+// qualified?" — passed through to userTypeNameForOID, which resolves the
+// schema from the type's NamespaceOID and renders via regOutQualified
+// (deferral row 1355). The caller determines the predicate from the session's
+// effective search_path (see internal/server/dispatch.go's publicSchemaVisible),
+// mirroring userTypeNameForOID's own schema-visibility contract. Builtin types
+// (oidToBuiltinTypeName) are never qualified — they live in pg_catalog, which
+// every search_path searches implicitly.
+// M0122-0005 pg_typeof()::oid follow-up; M0119-0006 slice B qualify→predicate.
+func RegtypeName(cat catalog.Catalog, oid uint32, qualify func(schema string) bool) string {
 	if oid == 0 {
 		return "-"
 	}

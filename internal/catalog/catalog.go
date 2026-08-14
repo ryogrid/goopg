@@ -1966,6 +1966,12 @@ type Catalog interface {
 	// syncTableToCatalogHeap to stamp a user table's pg_class.relnamespace with
 	// the real schema OID so the schema survives a restart (M0110-0003).
 	SchemaOID(name string) uint32
+	// SchemaNameForOID returns the registered schema name for the given namespace
+	// OID ("" if no schema carries that OID). It is the reverse of SchemaOID and
+	// is needed by the regtype/regcollation renderers to resolve a user type's /
+	// collation's ACTUAL schema from its NamespaceOID (deferral row 1355,
+	// M0119-0006 slice B). *InMemory is the sole implementer.
+	SchemaNameForOID(oid uint32) string
 	// RegisterSchema records a user-created schema. M0097-drop_if_exists.
 	RegisterSchema(name string)
 	// UnregisterSchema removes a schema from the registry. M0097-drop_if_exists.
