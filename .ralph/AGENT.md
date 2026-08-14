@@ -151,9 +151,9 @@ go test -v -run TestPort_Psql001Basic ./internal/testport/
 go test -v -tags integration ./internal/testport/
 ```
 
-The current ported-test inventory and deferral status is in
-`docs/test-port/postgres-oracle-port-status.csv` and
-`docs/test-port/postgres-oracle-port-status.md`.
+The current ported-test inventory and deferral status is in the consolidated
+authority CSV `docs/test-port/postgres-oracle-target-inventory.csv` (see
+`docs/test-port/README.md` for the schema and promotion workflow).
 
 Deferred suites (`status=defer` in the CSV) must NOT be run as part of
 `go test ./...` — they are either expected to have failures or depend on

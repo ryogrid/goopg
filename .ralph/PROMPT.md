@@ -316,15 +316,23 @@ When performing cleanup, refactoring, or restructuring tasks:
 
 ## 🔬 PostgreSQL Oracle Test Porting
 
-`docs/test-port/postgres-oracle-port-status.csv` is the authoritative source for which
-upstream tests must pass, are deferred, or are excluded by policy.
+`docs/test-port/postgres-oracle-target-inventory.csv` is the authoritative source
+for which upstream tests must pass, are deferred, or are excluded by policy. See
+`docs/test-port/README.md` for the schema and promotion workflow.
 
-### Status meanings
+### Status vocabulary
+
+The single CSV carries both the governance decision (`port`/`defer`/`excluded`)
+and the per-case outcome (`pass`/`failed`/`not-tried`); `pass_required` marks the
+must-pass set.
 
 | status | pass_required | meaning |
 |--------|--------------|---------|
-| `port` | yes | Ported to Go; must always pass. Run on every relevant change. |
-| `defer` | no | In scope, not yet pass-required. Promote to `port` when the prerequisite lands. |
+| `port` | yes | Ported TAP test; must always pass (rationale names its `TestPort_*`). |
+| `pass` | yes | regress/isolation case passing; must stay passing. |
+| `failed` | no | in-scope case, currently diverging. |
+| `not-tried` | no | in-scope, not yet executed. |
+| `defer` | no | In scope, not yet pass-required. Promote when the prerequisite lands. |
 | `excluded` | no | Out of scope by policy. Do not port. |
 
 ### Running oracle tests (NOT part of `go test ./...`)
@@ -339,13 +347,13 @@ go test -v -run TestPort_Psql001Basic ./internal/testport/  # one specific test
 
 ### When to port a deferred test
 
-When a task satisfies a `defer` entry's stated blocker, the same loop MUST:
+When a task satisfies a `defer`/`failed` entry's stated blocker, the same loop MUST:
 
 1. Port the test to Go in `internal/testport/` (delegate the porting to a worker).
-2. Update `docs/test-port/postgres-oracle-port-status.csv` (you — bookkeeping):
-   - `status` → `port`, `pass_required` → `yes`
+2. Update `docs/test-port/postgres-oracle-target-inventory.csv` (you — bookkeeping):
+   - `status` → `port` (TAP) or `pass` (regress/isolation), `pass_required` → `yes`
    - Fill in the `rationale` with the Go test function name, clear the `deferred_to` field.
-3. Regenerate `docs/test-port/postgres-oracle-port-status.md` via `go run ./cmd/gen-oracle-port-status`.
+3. Regenerate the derived docs: `make regen-testport`.
 4. Verify the ported test passes: `go test -v -run <TestFuncName> ./internal/testport/`.
 
 ### Deferred suite unlock conditions
@@ -360,8 +368,10 @@ When a task satisfies a `defer` entry's stated blocker, the same loop MUST:
 | D-006 | `postgres/src/test/modules` | extension framework (M0060-0005) |
 | D-007 | `postgres/contrib` | extension framework (M0060-0005) |
 
-The target inventory (test counts per suite) is in
-`docs/test-port/postgres-oracle-target-inventory.csv`.
+The target inventory (test counts per suite) is in that same CSV; the per-suite
+roll-up (`docs/test-port/postgres-oracle-target-inventory.md`) and the
+`upstream-*-coverage.md` docs are regenerated from it by `make regen-testport`.
+`make check-testport-inventory` validates the on-disk CSV before commit.
 
 ## Execution Guidelines
 - Before task breakdown: delegate investigation to `researcher` — never bulk-read
