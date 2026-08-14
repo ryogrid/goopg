@@ -1545,9 +1545,6 @@ func describePlanVerbose(n planner.Node, verbose bool, nm *explainNames) string 
 		// relation scanned twice without an alias prints two
 		// distinguishable labels (e.g. "nation" / "nation_1").
 		if dname := nm.disambiguatedName(n); dname != "" {
-			if p.Table.Stats != nil {
-				return fmt.Sprintf("Seq Scan on %s (stats)", dname)
-			}
 			return "Seq Scan on " + dname
 		}
 		tname := schemaQualify(p.Table.QualifiedName())
@@ -1662,24 +1659,8 @@ func describePlan(n planner.Node, nm *explainNames) string {
 	case *planner.WindowAgg:
 		return fmt.Sprintf("WindowAgg (%d funcs)", len(p.Funcs))
 	case *planner.SeqScan:
-		// `(stats)` flags scans whose Table.Stats has been
-		// populated by ANALYZE — the planner's cost-driven
-		// decisions (Filter selectivity from MCV / histogram,
-		// INNER-join algorithm choice) are only active for
-		// these. M0006 / 0006-0004 surfaces this so an operator
-		// inspecting EXPLAIN can verify which scans feed the
-		// cost model.
 		if dname := nm.disambiguatedName(n); dname != "" {
-			if p.Table != nil && p.Table.Stats != nil {
-				return fmt.Sprintf("Seq Scan on %s (stats)", dname)
-			}
 			return "Seq Scan on " + dname
-		}
-		if p.Table != nil && p.Table.Stats != nil {
-			if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
-				return fmt.Sprintf("Seq Scan on %s %s (stats)", p.Table.QualifiedName(), p.Alias)
-			}
-			return fmt.Sprintf("Seq Scan on %s (stats)", p.Table.QualifiedName())
 		}
 		if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
 			return fmt.Sprintf("Seq Scan on %s %s", p.Table.QualifiedName(), p.Alias)
