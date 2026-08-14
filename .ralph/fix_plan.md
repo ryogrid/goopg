@@ -3314,6 +3314,29 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       + tpch-spotcheck (Q12=2/Q13=35) + pre-commit units all PASS. Residual: the
       wire/COPY/`reg*`→text/array paths still pass a constant-public predicate (row
       1339 family) — ledgered as a follow-up row.
+      **90th slice (2026-08-14): regprocedure arglist carries the resolved
+      arg-type OID (ledger row 1351 second half).** A BARE `char` arg (bpchar,
+      parser `Args=[1]`) was indistinguishable from OID-18 `"char"` in the
+      regprocedure arglist — both rendered `"char"`, where PG's `format_type_be`
+      renders `character` for the bare form. New `Routine.ArgTypeOIDs []uint32`
+      (parallel to ArgTypes/ArgTypeSchemas, `json:",omitempty"`), captured at
+      CREATE FUNCTION/PROCEDURE by `argTypeOID` keyed on the raw element name
+      (`a.Name=="char"`, BEFORE `routineArgTypeName` bakes `[]`; `len(Args)==0 →
+      OIDChar(18)` else `OIDBpChar(1042)`, 0 elsewhere); `RegprocArg.OID` threads
+      it to BOTH sibling renderers (`regprocedureArglist` executor /
+      `argListTypeDisplay` catalog, re-signed `(name, oid)`), whose `char` arm
+      renders OIDBpChar→`character` and OIDChar/0→`"char"` (0 = builtin/pre-change,
+      backward-compat free). `buildPGProcRow` AND its index-key sibling
+      `insertPgProcIndexEntries` prefer the stored OID (guarded `!=0`), fixing
+      proargtypes for a quoted `"char"` (18 not 1042). Design:
+      `docs/design/0119-0006-char-arg-oid-per-arg.md`. Tests:
+      `TestRegprocedureArglistCatalogAndExecutorAgree` char scalar+array cases,
+      `TestCreateFunctionCapturesCharArgOID`,
+      `TestRegprocedureCharArgCastAndWireAgree`. Gates: package suites +
+      pre-commit units + `TestPort_RegressSuite` + tpch-spotcheck (Q12=2/Q13=35)
+      all PASS. Deferred (2 new rows): the pg_get_function_* `canonicalTypeName`
+      renders `char`→`character` unconditionally (pg_dump signature-rebuild path);
+      quoted `"char"(N)` misclassified by the `len(Args)` heuristic.
       **28th slice (2026-08-12): the `HH:MM` half of that inherited input gap is
       closed.** A time-of-day with no seconds field is ordinary PG input
       (`DecodeTime` reads seconds only `if (*cp == ':')`, leaving `tm_sec = 0`),

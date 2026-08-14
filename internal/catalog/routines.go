@@ -45,6 +45,15 @@ type Routine struct {
 	// row 1342): Signature() compares ArgTypes[i].Name only, so overload
 	// resolution / ALTER/DROP lookups are unaffected.
 	ArgTypeSchemas   []string
+	// ArgTypeOIDs is parallel to ArgTypes: the resolved pg_type OID for each
+	// argument type, NON-ZERO only for the one ambiguous spelling `char` (a bare
+	// `char` → OIDBpChar 1042, a quoted `"char"` → OIDChar 18 — deferral row
+	// 1351). Every other spelling is 0: its name-based ArgTypeDisplayAlias is
+	// already a faithful format_type_be port, so carrying a name-derived OID
+	// would only add wrong array-element OIDs and risk a proargtypes shift.
+	// Consulted ONLY by the regprocedure output path; Signature() and overload
+	// resolution are unaffected.
+	ArgTypeOIDs      []uint32 `json:",omitempty"`
 	ArgModes        []string // parallel to ArgTypes; "i"=IN, "o"=OUT, "b"=INOUT, "v"=VARIADIC; nil=all IN
 	ArgDefaults     []string // parallel to ArgTypes; raw SQL expression for DEFAULT, "" = no default
 	ReturnType      Type

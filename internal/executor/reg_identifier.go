@@ -661,6 +661,13 @@ func regprocedureArglist(argTypes []catalog.RegprocArg, visible func(schema stri
 	args := make([]string, len(argTypes))
 	for i, a := range argTypes {
 		base, isArray := splitArraySuffix(a.Name)
+		// Deferral row 1351: a BARE `char` arg (stored OIDBpChar 1042 at CREATE)
+		// renders `character` (format_type_be's BPCHAROID switch case); OIDChar 18
+		// (quoted `"char"`) or 0 (builtin / pre-change routine) falls through to
+		// ArgTypeDisplayAlias's `"char"`. Mirrors the catalog argListTypeDisplay arm.
+		if base == "char" && a.OID == catalog.OIDBpChar {
+			base = "character"
+		}
 		name := base
 		if a.Schema == "" || a.Schema == "pg_catalog" {
 			name = catalog.ArgTypeDisplayAlias(base)

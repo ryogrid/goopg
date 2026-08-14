@@ -2,8 +2,10 @@ package executor
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -222,6 +224,110 @@ func TestCreateFunctionCapturesArgTypeSchemas(t *testing.T) {
 	for i := range want {
 		if r.ArgTypeSchemas[i] != want[i] {
 			t.Errorf("ArgTypeSchemas[%d] = %q, want %q (full %v)", i, r.ArgTypeSchemas[i], want[i], r.ArgTypeSchemas)
+		}
+	}
+}
+
+// M0119-0006 (77th slice, deferral row 1351): execCreateFunction/
+// execCreateProcedure capture each arg type's RESOLVED OID at CREATE time
+// (ArgTypeOIDs, parallel to ArgTypes/ArgTypeSchemas) — NON-ZERO only for the
+// one ambiguous `char` spelling: a BARE char (bpchar, parser stamp Args=[1])
+// stores OIDBpChar(1042), a quoted `"char"` (CHAROID, no stamp, Args nil)
+// stores OIDChar(18). Array forms ride the same arm (`char[]` → 1042,
+// `"char"[]` → 18); every other arg stays 0. `oid::regprocedure` then renders
+// the disambiguated arglist (bare → `character`, quoted → `"char"`).
+func TestCreateFunctionCapturesCharArgOID(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	cases := []struct {
+		name       string
+		ddl        string
+		want       []uint32
+		wantRender string
+	}{
+		{"f_capchar_bare", `CREATE FUNCTION f_capchar_bare(char) RETURNS int4 LANGUAGE sql AS $$ SELECT 1 $$`, []uint32{catalog.OIDBpChar}, "f_capchar_bare(character)"},
+		{"f_capchar_quoted", `CREATE FUNCTION f_capchar_quoted("char") RETURNS int4 LANGUAGE sql AS $$ SELECT 1 $$`, []uint32{catalog.OIDChar}, `f_capchar_quoted("char")`},
+		{"f_capchar_arr_bare", `CREATE FUNCTION f_capchar_arr_bare(char[]) RETURNS int4 LANGUAGE sql AS $$ SELECT 1 $$`, []uint32{catalog.OIDBpChar}, "f_capchar_arr_bare(character[])"},
+		{"f_capchar_arr_quoted", `CREATE FUNCTION f_capchar_arr_quoted("char"[]) RETURNS int4 LANGUAGE sql AS $$ SELECT 1 $$`, []uint32{catalog.OIDChar}, `f_capchar_arr_quoted("char"[])`},
+	}
+	for _, tc := range cases {
+		if err := runDDL(t, ctx, tc.ddl); err != nil {
+			t.Fatalf("create function: %v", err)
+		}
+		cands := ctx.Catalog.Routines().LookupByName(parser.ObjectName{Name: tc.name})
+		if len(cands) != 1 {
+			t.Fatalf("expected 1 %s routine, got %d", tc.name, len(cands))
+		}
+		r := cands[0]
+		if len(r.ArgTypeOIDs) != len(tc.want) {
+			t.Errorf("%s: ArgTypeOIDs = %v (len %d), want %v (len %d)", tc.name, r.ArgTypeOIDs, len(r.ArgTypeOIDs), tc.want, len(tc.want))
+			continue
+		}
+		for i := range tc.want {
+			if r.ArgTypeOIDs[i] != tc.want[i] {
+				t.Errorf("%s: ArgTypeOIDs[%d] = %d, want %d (full %v)", tc.name, i, r.ArgTypeOIDs[i], tc.want[i], r.ArgTypeOIDs)
+			}
+		}
+		// oid::regprocedure renders the disambiguated arglist (the cast sibling).
+		rows := runQuery(t, ctx, fmt.Sprintf(`SELECT %d::regprocedure::text`, r.OID))
+		if len(rows) != 1 || rows[0][0].StringValue() != tc.wantRender {
+			t.Errorf("%s: %d::regprocedure::text = %v, want %q", tc.name, r.OID, rows, tc.wantRender)
+		}
+	}
+}
+
+// M0119-0006 (77th slice, deferral row 1351, sibling audit): the
+// ::regprocedure CAST sibling, the SELECT wire (RegOutArgVisible — what
+// appendTypedCellText calls for a regprocedure-typed column), and COPY TO
+// (EncodeCopyTextRow → datumToCopyText) must agree on `character` vs `"char"`
+// for the same two routines. Under the default session search_path both
+// routines live in "public" (visible), so qualify=false on every path.
+func TestRegprocedureCharArgCastAndWireAgree(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE FUNCTION f_char_bare(char) RETURNS int4 LANGUAGE sql AS $$ SELECT 1 $$`); err != nil {
+		t.Fatalf("create f_char_bare: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE FUNCTION f_char_quoted("char") RETURNS int4 LANGUAGE sql AS $$ SELECT 1 $$`); err != nil {
+		t.Fatalf("create f_char_quoted: %v", err)
+	}
+	for _, tc := range []struct{ name, want string }{
+		{"f_char_bare", "f_char_bare(character)"},
+		{"f_char_quoted", `f_char_quoted("char")`},
+	} {
+		cands := ctx.Catalog.Routines().LookupByName(parser.ObjectName{Name: tc.name})
+		if len(cands) != 1 {
+			t.Fatalf("expected 1 %s routine, got %d", tc.name, len(cands))
+		}
+		oid := cands[0].OID
+
+		// ::regprocedure cast sibling.
+		cast := runQuery(t, ctx, fmt.Sprintf("SELECT %d::regprocedure::text", oid))
+		if len(cast) != 1 {
+			t.Fatalf("%s: %d::regprocedure::text = %v", tc.name, oid, cast)
+		}
+		if got := cast[0][0].StringValue(); got != tc.want {
+			t.Errorf("%s cast = %q, want %q", tc.name, got, tc.want)
+		}
+
+		// SELECT wire: appendTypedCellText → RegOutArgVisible (qualify=false
+		// mirrors the default-path visibility: public is on the search_path).
+		if got := RegOutArgVisible("regprocedure", oid, ctx.Catalog, false, nil); got != tc.want {
+			t.Errorf("%s SELECT wire = %q, want %q", tc.name, got, tc.want)
+		}
+
+		// COPY TO: EncodeCopyTextRow → datumToCopyText → RegOutArgVisible with
+		// the same qualify flag.
+		copyRow, err := EncodeCopyTextRow(nil, Row{NewIntDatum(int64(oid))},
+			[]catalog.Column{{Name: "r", Type: catalog.Type{Name: "regprocedure"}}},
+			"ISO", "MDY", "", ctx.Catalog, false)
+		if err != nil {
+			t.Fatalf("%s COPY TO: %v", tc.name, err)
+		}
+		if got := strings.TrimSuffix(string(copyRow), "\n"); got != tc.want {
+			t.Errorf("%s COPY TO = %q, want %q", tc.name, got, tc.want)
 		}
 	}
 }

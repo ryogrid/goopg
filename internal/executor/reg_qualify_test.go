@@ -489,6 +489,55 @@ func TestRegprocedureArglistCatalogAndExecutorAgree(t *testing.T) {
 	if got := regprocedureArglist(argParts, func(s string) bool { return true }); got != wantArglist {
 		t.Errorf("executor regprocedureArglist = %q, want %q", got, wantArglist)
 	}
+
+	// M0119-0006 (77th slice, deferral row 1351): the regprocedure arglist now
+	// carries the resolved arg-type OID (Routine.ArgTypeOIDs → RegprocArg.OID)
+	// to disambiguate the ONE ambiguous spelling `char`: a BARE char
+	// (OIDBpChar 1042) renders `character` (format_type_be's BPCHAROID switch
+	// case), a quoted `"char"` (OIDChar 18) and OID 0 (builtin / pre-change
+	// routine) render `"char"`. The array suffix is re-appended AFTER the arm,
+	// so `char[]` → `character[]` and `"char"[]` → `"char"[]`. Sibling pin:
+	// the catalog bare builder and the executor renderer must agree.
+	table := []struct {
+		name        string
+		argTypes    []catalog.Type
+		argTypeOIDs []uint32
+		wantArglist string
+	}{
+		{"f_bare_char", []catalog.Type{{Name: "char"}}, []uint32{catalog.OIDBpChar}, "character"},
+		{"f_quoted_char", []catalog.Type{{Name: "char"}}, []uint32{catalog.OIDChar}, `"char"`},
+		{"f_zeroid_char", []catalog.Type{{Name: "char"}}, nil, `"char"`},
+		{"f_bare_char_arr", []catalog.Type{{Name: "char[]"}}, []uint32{catalog.OIDBpChar}, "character[]"},
+		{"f_quoted_char_arr", []catalog.Type{{Name: "char[]"}}, []uint32{catalog.OIDChar}, `"char"[]`},
+	}
+	for _, tc := range table {
+		r, err := rs.Create(&catalog.Routine{
+			Name:           tc.name,
+			Schema:         "public",
+			ArgTypes:       tc.argTypes,
+			ArgModes:       []string{"i"},
+			ArgTypeSchemas: []string{"pg_catalog"},
+			ArgTypeOIDs:    tc.argTypeOIDs,
+			ReturnType:     catalog.Type{Name: "int4"},
+		}, false)
+		if err != nil {
+			t.Fatalf("Routines().Create(%s): %v", tc.name, err)
+		}
+		catSig, ok := catalog.RegprocedureName(r.OID, rs)
+		if !ok {
+			t.Fatalf("RegprocedureName(%s) not ok", tc.name)
+		}
+		if want := tc.name + "(" + tc.wantArglist + ")"; catSig != want {
+			t.Errorf("catalog bare builder (%s) = %q, want %q", tc.name, catSig, want)
+		}
+		_, _, tcParts, ok := catalog.RegprocedureNameParts(r.OID, rs)
+		if !ok {
+			t.Fatalf("RegprocedureNameParts(%s) not ok", tc.name)
+		}
+		if got := regprocedureArglist(tcParts, func(s string) bool { return true }); got != tc.wantArglist {
+			t.Errorf("executor regprocedureArglist (%s) = %q, want %q", tc.name, got, tc.wantArglist)
+		}
+	}
 }
 
 // M0119-0006 (deferral row L1305): a synthetic TOAST relation OID (parent OID +

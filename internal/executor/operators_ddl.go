@@ -11833,6 +11833,25 @@ func (o *ddlOp) walLogDropRoutine(oid uint32) error {
 	return nil
 }
 
+// argTypeOID returns a NON-ZERO pg_type OID only for the one ambiguous arg-type
+// spelling, `char`: a BARE char (bpchar, the gram.y CharacterWithoutLength
+// stamp gives Args=[1]) is OIDBpChar(1042), a quoted "char" (CHAROID, no stamp,
+// Args nil) is OIDChar(18) — deferral row 1351. Every other spelling returns 0:
+// its name-based ArgTypeDisplayAlias is already a faithful format_type_be port,
+// so carrying a name-derived OID would only add wrong array-element OIDs and
+// risk a proargtypes shift. Key on the RAW element name (a.Name, BEFORE
+// routineArgTypeName bakes the `[]` suffix), so `char[]` and `"char"[]` land
+// here too.
+func argTypeOID(a parser.ColumnType) uint32 {
+	if a.Name == "char" {
+		if len(a.Args) == 0 {
+			return catalog.OIDChar // quoted "char" / "char"[]
+		}
+		return catalog.OIDBpChar // bare char / char[] (Args=[1])
+	}
+	return 0
+}
+
 // execCreateFunction registers a routine in the catalog's
 // Routines() registry (M0015 Stage A step 3). Body is stored
 // verbatim — the PL/pgSQL parser/interpreter that executes it
@@ -11861,12 +11880,14 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 	argModes := make([]string, len(s.Args))
 	argDefaults := make([]string, len(s.Args))
 	argTypeSchemas := make([]string, len(s.Args))
+	argTypeOIDs := make([]uint32, len(s.Args))
 	for i, a := range s.Args {
 		argTypes[i] = catalog.Type{
 			Name: routineArgTypeName(a.Type),
 			Args: append([]int64(nil), a.Type.Args...),
 		}
 		argTypeSchemas[i] = argTypeSchema(a.Type)
+		argTypeOIDs[i] = argTypeOID(a.Type)
 		argNames[i] = a.Name
 		switch a.Mode {
 		case parser.FuncArgIn:
@@ -11922,6 +11943,7 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 		ArgNames:       argNames,
 		ArgTypes:       argTypes,
 		ArgTypeSchemas: argTypeSchemas,
+		ArgTypeOIDs:    argTypeOIDs,
 		ArgModes:       argModes,
 		ArgDefaults:    argDefaults,
 		ReturnType: catalog.Type{
@@ -12601,6 +12623,7 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 	argModes := make([]string, len(s.Args))
 	argDefaults := make([]string, len(s.Args))
 	argTypeSchemas := make([]string, len(s.Args))
+	argTypeOIDs := make([]uint32, len(s.Args))
 	// Validate: VARIADIC must be last; OUT can't follow default IN.
 	variadicSeen := false
 	defaultSeen := false
@@ -12626,6 +12649,7 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 			Args: append([]int64(nil), a.Type.Args...),
 		}
 		argTypeSchemas[i] = argTypeSchema(a.Type)
+		argTypeOIDs[i] = argTypeOID(a.Type)
 		argNames[i] = a.Name
 		switch a.Mode {
 		case parser.FuncArgIn:
@@ -12695,6 +12719,7 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 		ArgNames:        argNames,
 		ArgTypes:        argTypes,
 		ArgTypeSchemas:  argTypeSchemas,
+		ArgTypeOIDs:     argTypeOIDs,
 		ArgModes:        argModes,
 		ArgDefaults:     argDefaults,
 		Language:        lang,

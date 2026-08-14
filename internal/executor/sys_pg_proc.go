@@ -143,7 +143,15 @@ func buildPGProcRow(cat catalog.Catalog, r *catalog.Routine) Row {
 	}
 	argOIDs := make([]uint32, len(r.ArgTypes))
 	for i, t := range r.ArgTypes {
-		argOIDs[i] = catalog.TypeNameToOID(t.Name)
+		// Deferral row 1351: prefer the CREATE-time resolved OID for a `char`
+		// arg (ArgTypeOIDs is char-only non-zero), so a quoted `"char"` writes
+		// CHAROID(18) into proargtypes instead of TypeNameToOID's unconditional
+		// BPCHAROID(1042). The i<len guard is OOB-safe for pre-change routines.
+		if i < len(r.ArgTypeOIDs) && r.ArgTypeOIDs[i] != 0 {
+			argOIDs[i] = r.ArgTypeOIDs[i]
+		} else {
+			argOIDs[i] = catalog.TypeNameToOID(t.Name)
+		}
 	}
 	nargDefaults := 0
 	for _, d := range r.ArgDefaults {
@@ -308,7 +316,14 @@ func insertPgProcIndexEntries(ctx *Context, r *catalog.Routine, tid storage.Item
 	}
 	argOIDs := make([]uint32, len(r.ArgTypes))
 	for i, t := range r.ArgTypes {
-		argOIDs[i] = catalog.TypeNameToOID(t.Name)
+		// Sibling of buildPGProcRow's argOIDs (deferral row 1351): prefer the
+		// stored char OID so the (proname, proargtypes, pronamespace) index key
+		// matches the heap row's proargtypes (quoted `"char"` → 18, not 1042).
+		if i < len(r.ArgTypeOIDs) && r.ArgTypeOIDs[i] != 0 {
+			argOIDs[i] = r.ArgTypeOIDs[i]
+		} else {
+			argOIDs[i] = catalog.TypeNameToOID(t.Name)
+		}
 	}
 	nsp := namespaceOIDForSchema(ctx.Catalog, r.Schema)
 	if err := insertPgProcPronameArgsNspIndexEntry(ctx, r.Name, argOIDs, nsp, tid); err != nil {

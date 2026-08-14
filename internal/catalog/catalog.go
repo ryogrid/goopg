@@ -19906,10 +19906,14 @@ func RegprocedureNameAndSchema(oid uint32, routines *Routines) (schema, sig stri
 // The per-arg schema-qualify decision is the renderers' job: it is
 // session-dependent (format_type_be's TypeIsVisible against the current
 // search_path, deferral row 1342), so this struct carries the resolved
-// (name, schema) pair and leaves visibility to the caller.
+// (name, schema) pair and leaves visibility to the caller. OID is the resolved
+// pg_type OID, NON-ZERO only for the one ambiguous `char` spelling (bare
+// → OIDBpChar 1042, quoted → OIDChar 18 — deferral row 1351); 0 for every
+// other arg, whose name-based ArgTypeDisplayAlias is already faithful.
 type RegprocArg struct {
 	Name   string
 	Schema string
+	OID    uint32
 }
 
 // RegprocedureNameParts resolves a pg_proc OID to the (schema, NAME, ARGTYPES)
@@ -19945,7 +19949,11 @@ func RegprocedureNameParts(oid uint32, routines *Routines) (schema, name string,
 				if i < len(r.ArgTypeSchemas) {
 					sch = r.ArgTypeSchemas[i]
 				}
-				args = append(args, RegprocArg{Name: t.Name, Schema: sch})
+				oid := uint32(0)
+				if i < len(r.ArgTypeOIDs) {
+					oid = r.ArgTypeOIDs[i]
+				}
+				args = append(args, RegprocArg{Name: t.Name, Schema: sch, OID: oid})
 			}
 			schema := r.Schema
 			if schema == "" {
@@ -19968,7 +19976,7 @@ func RegprocedureNameParts(oid uint32, routines *Routines) (schema, name string,
 func formatProcedureArglist(argTypes []RegprocArg) string {
 	args := make([]string, len(argTypes))
 	for i, a := range argTypes {
-		args[i] = argListTypeDisplay(a.Name)
+		args[i] = argListTypeDisplay(a.Name, a.OID)
 	}
 	return strings.Join(args, ",")
 }
@@ -19978,11 +19986,23 @@ func formatProcedureArglist(argTypes []RegprocArg) string {
 // ELEMENT through ArgTypeDisplayAlias (so `int[]` → `integer[]`, `char[]` →
 // `"char"[]`), and re-append the suffix. Mirrors executor splitArraySuffix —
 // the two sibling renderers must agree (Hard-won Rule #2, deferral row 1345).
-func argListTypeDisplay(name string) string {
-	if strings.HasSuffix(name, "[]") {
-		return ArgTypeDisplayAlias(name[:len(name)-2]) + "[]"
+// oid disambiguates the `char` arm (deferral row 1351): a bare `char` carried
+// OIDBpChar renders `character` (format_type_be's BPCHAROID switch case), while
+// OIDChar 18 or 0 (builtin / pre-change routine) falls through to
+// ArgTypeDisplayAlias's `"char"` — exactly upstream quote_qualified_identifier.
+func argListTypeDisplay(name string, oid uint32) string {
+	base := name
+	isArray := strings.HasSuffix(name, "[]")
+	if isArray {
+		base = name[:len(name)-2]
 	}
-	return ArgTypeDisplayAlias(name)
+	if base == "char" && oid == OIDBpChar { // bare char → bpchar
+		base = "character"
+	}
+	if isArray {
+		return ArgTypeDisplayAlias(base) + "[]"
+	}
+	return ArgTypeDisplayAlias(base)
 }
 
 // RegoperatorName resolves an operator OID to PG's "opr_name(lefttype,
