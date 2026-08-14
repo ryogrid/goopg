@@ -10314,6 +10314,39 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 			// Expression column (e.g. lower(col)) — no catalog column to look up.
 			// cols[i] remains nil; bulkBuildBTree skips expression columns when
 			// there are no existing rows.
+			//
+			// M0119-0006: apply the SAME btree-key type gate the named-column
+			// branch below applies. Before this, an expression key like
+			// `CREATE INDEX ON t ((box_col))` bypassed isSupportedBTreeKeyType and
+			// silently built a B-tree index encoding the value's TEXT in varchar
+			// byte order (encodeArbiterExprKey's KindString arm). PG 18.3 rejects
+			// a btree index on a box expression with 42704 because box has no
+			// btree opclass (indexcmds.c ResolveOpClass → GetDefaultOpClass →
+			// InvalidOid); int4range PG *accepts* via range_ops (pg_opclass.dat,
+			// the binary-coercible-to-anyrange path), but goopg has no range value
+			// model, so it must reject honestly. Both are rejected with the same
+			// 0A000 the named-column path uses (the 42704 polish for box is a
+			// separate deferred slice).
+			if i < len(colExprs) && colExprs[i] != nil {
+				// Resolve exactly as the build path does (resolveIndexKeyExprs,
+				// encodeExprIndexKey): ResolveIndexPredicate populates the
+				// ColumnRef Type that ExprResultType then reports.
+				planExpr, err := planner.ResolveIndexPredicate(colExprs[i], tbl)
+				if err == nil && planExpr != nil {
+					if typ, ok := planner.ExprResultType(planExpr); ok {
+						if !isSupportedBTreeKeyType(typ.Name) {
+							// Also accept user-defined enum types. M0097-0022.
+							isEnum := false
+							if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+								_, isEnum = im.LookupEnum(typ.Name)
+							}
+							if !isEnum {
+								return &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 only supports int4 / numeric keys, got %q", typ.Name)}
+							}
+						}
+					}
+				}
+			}
 			continue
 		}
 		col, ok := o.ctx.Catalog.LookupColumn(tbl, name)
