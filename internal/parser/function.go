@@ -710,8 +710,22 @@ func isMultiWordTypeStart(nameTok string, next Token) bool {
 	switch strings.ToLower(nameTok) {
 	case "double":
 		return next.Kind == TokenIdent && strings.EqualFold(next.Value, "precision")
-	case "character":
-		return next.Kind == TokenIdent && strings.EqualFold(next.Value, "varying")
+	case "character", "char", "nchar":
+		// character/char/nchar — the plain and SQL national aliases of the
+		// bpchar/varchar family (gram.y `character: CHARACTER|CHAR_P|NCHAR
+		// opt_varying`). A following `varying` continues the multi-word type
+		// name; a following OTHER identifier PG rejects as a syntax error
+		// (`CREATE FUNCTION f(char int)`), because these keywords can never
+		// start an arg name — return true so we rewind and let
+		// parseColumnType consume the leading word, and the dangling ident
+		// then errors out the same way.
+		return next.Kind == TokenIdent
+	case "national":
+		// `national character [varying]` / `national char [varying]`
+		// (gram.y `character: NATIONAL CHARACTER|NATIONAL CHAR opt_varying`).
+		// Like the plain aliases above, `national` can never start an arg
+		// name (`f(national int)` is a PG syntax error).
+		return next.Kind == TokenIdent
 	case "bit":
 		return next.Kind == TokenIdent && strings.EqualFold(next.Value, "varying")
 	case "timestamp", "time":

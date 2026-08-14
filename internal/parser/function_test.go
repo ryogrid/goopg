@@ -207,6 +207,79 @@ func TestParseCreateFunctionMultiWordArgTypes(t *testing.T) {
 	}
 }
 
+// TestParseCreateFunctionCharFamilyArgTypes pins the SQL national-character
+// aliases (M0119-0006, deferral row 1351 first half): `char varying`,
+// `nchar [varying]`, `national character|char [varying]` are all accepted as
+// bare types in function args and collapse to the SAME canonical names as
+// their plain equivalents (`character varying`→varchar, `character`→bpchar
+// spelled as "character"). Verified against PG 18.3: every spelling below
+// creates a function whose oid::regprocedure renders byte-identically to the
+// canonical spelling (`f_nchar` ≡ `f_character` ≡ `f(character)`).
+func TestParseCreateFunctionCharFamilyArgTypes(t *testing.T) {
+	cases := []struct {
+		src      string
+		name     string
+		typeName string
+		args     []int64
+	}{
+		// char varying ≡ character varying (varchar).
+		{`CREATE FUNCTION f(char varying) RETURNS void LANGUAGE sql AS $$ SELECT 1 $$`, "", "varchar", nil},
+		{`CREATE FUNCTION f(char varying(10)) RETURNS void LANGUAGE sql AS $$ SELECT 1 $$`, "", "varchar", []int64{10}},
+		// nchar ≡ character (bpchar); nchar varying ≡ character varying.
+		// A bare national character defaults to an implicit length of 1,
+		// exactly like bare `char`/`character` (gram.y CharacterWithoutLength).
+		{`CREATE FUNCTION f(nchar) RETURNS void LANGUAGE sql AS $$ SELECT 1 $$`, "", "character", []int64{1}},
+		{`CREATE FUNCTION f(nchar(5)) RETURNS void LANGUAGE sql AS $$ SELECT 1 $$`, "", "character", []int64{5}},
+		{`CREATE FUNCTION f(nchar varying) RETURNS void LANGUAGE sql AS $$ SELECT 1 $$`, "", "varchar", nil},
+		// national character|char ≡ character; ... varying ≡ character varying.
+		{`CREATE FUNCTION f(national character) RETURNS void LANGUAGE sql AS $$ SELECT 1 $$`, "", "character", []int64{1}},
+		{`CREATE FUNCTION f(national character varying) RETURNS void LANGUAGE sql AS $$ SELECT 1 $$`, "", "varchar", nil},
+		{`CREATE FUNCTION f(national char) RETURNS void LANGUAGE sql AS $$ SELECT 1 $$`, "", "character", []int64{1}},
+		{`CREATE FUNCTION f(national char varying) RETURNS void LANGUAGE sql AS $$ SELECT 1 $$`, "", "varchar", nil},
+		// The `name type` form still wins when a name precedes the alias.
+		{`CREATE FUNCTION f(a nchar) RETURNS void LANGUAGE sql AS $$ SELECT 1 $$`, "a", "character", []int64{1}},
+		{`CREATE FUNCTION f(b national character varying) RETURNS void LANGUAGE sql AS $$ SELECT 1 $$`, "b", "varchar", nil},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.src)
+		if err != nil {
+			t.Errorf("parse %q: %v", tc.src, err)
+			continue
+		}
+		cf := stmts[0].(*CreateFunctionStmt)
+		if len(cf.Args) != 1 {
+			t.Errorf("%q: Args len = %d, want 1", tc.src, len(cf.Args))
+			continue
+		}
+		if cf.Args[0].Name != tc.name {
+			t.Errorf("%q: arg Name = %q, want %q", tc.src, cf.Args[0].Name, tc.name)
+		}
+		if cf.Args[0].Type.Name != tc.typeName {
+			t.Errorf("%q: type Name = %q, want %q", tc.src, cf.Args[0].Type.Name, tc.typeName)
+		}
+		if !reflect.DeepEqual(cf.Args[0].Type.Args, tc.args) {
+			t.Errorf("%q: type Args = %v, want %v", tc.src, cf.Args[0].Type.Args, tc.args)
+		}
+	}
+
+	// These spellings can never start an arg name upstream — `f(char int)`,
+	// `f(nchar int)`, `f(national int)` are syntax errors in PG 18.3 (the
+	// leading word is always the start of a (multi-word) type). goopg must
+	// rewind and let parseColumnType consume the leading word so the dangling
+	// identifier errors instead of being captured as an arg name.
+	errCases := []string{
+		`CREATE FUNCTION f(char int) RETURNS void LANGUAGE sql AS $$ SELECT 1 $$`,
+		`CREATE FUNCTION f(character int) RETURNS void LANGUAGE sql AS $$ SELECT 1 $$`,
+		`CREATE FUNCTION f(nchar int) RETURNS void LANGUAGE sql AS $$ SELECT 1 $$`,
+		`CREATE FUNCTION f(national int) RETURNS void LANGUAGE sql AS $$ SELECT 1 $$`,
+	}
+	for _, src := range errCases {
+		if _, err := Parse(src); err == nil {
+			t.Errorf("parse %q: expected error, got none", src)
+		}
+	}
+}
+
 // TestParseCreateFunctionRejectsOutInout guards Stage A's scope: OUT / INOUT
 // are not yet supported. VARIADIC is now accepted (M0097-0117).
 func TestParseCreateFunctionAcceptsOutInoutVariadic(t *testing.T) {

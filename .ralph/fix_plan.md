@@ -4263,6 +4263,56 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       varying/nchar/national character [varying] are not yet accepted as bare
       types.
 
+      **77th slice (2026-08-14): SQL national-char aliases in CREATE FUNCTION
+      args + bare-`character` column typmod — deferral row 1351 (first half)
+      resolved.** `char varying` / `nchar [varying]` / `national character
+      [varying]` / `national char [varying]` — PG's aliases of `character` /
+      `character varying` (gram.y `character` nonterminal: `CHARACTER|CHAR_P|NCHAR
+      opt_varying`) — are now accepted as bare types in CREATE FUNCTION args.
+      `isMultiWordTypeStart` (internal/parser/function.go) treats
+      `character`/`char`/`nchar`/`national` as multi-word-type leaders whenever
+      the NEXT token is an identifier (a following `varying` continues the type;
+      a following OTHER identifier is PG's syntax-error shape `f(char int)` — we
+      still rewind and let `parseColumnType` consume the leading word, and the
+      dangling ident errors out exactly as on PG). `parseMultiWordTypeName`
+      (internal/parser/ddl.go) collapses every spelling to the canonical
+      `character`/`varchar` (`nchar`→`character`, `national character
+      [varying]`→`character [varying]`, `char varying`→`varchar`), so the
+      executor's `regprocedureArglist` renders through the shared
+      `catalog.ArgTypeDisplayAlias` byte-identically to PG — the output side
+      needs NO change. Along the way it fixes a pre-existing goopg divergence
+      surfaced by the same family: `parseColumnType`'s grammar-default length-1
+      stamp (gram.y `CharacterWithoutLength` → bpchar typmod 1) covered only bare
+      `char`, so a bare `character`/`nchar`/`national character` COLUMN was
+      `character(-1)` where PG 18.3 makes it `character(1)` — the stamp now fires
+      for `character` too (`bpchar` spelled directly and the cast path are
+      deliberately untouched; the live `'cd'::nchar(3)` → `[cd]` padding probe
+      agrees on both engines). Verified live vs a throwaway PG 18.3 oracle
+      (5534): `CREATE TABLE t (c char, d character, e nchar, f char varying,
+      g national character, h nchar(5), i national character varying(10))` →
+      `format_type` yields `character(1)/character(1)/character(1)/character
+      varying/character(1)/character(5)/character varying(10)` on BOTH engines;
+      and all ten alias-spelling CREATE FUNCTIONs render byte-identical
+      `oid::regprocedure` output (`f_charvar(character varying)`,
+      `f_nchar(character)`, `f_ncharvar(character varying)`, `f_nchar5(character)`,
+      `f_natchar(character)`, `f_natchar2(character)`,
+      `f_natcharvar(character varying)`, `f_natcharvar2(character varying)`,
+      `f_charvar_named(character varying,character varying)`,
+      `f_named(character,character varying)`). Test:
+      `TestParseCreateFunctionCharFamilyArgTypes` (parser; 11 success + 4
+      syntax-error cases). Design:
+      `docs/design/0119-0006-char-family-arg-aliases.md` + README row
+      `0119-0006bc`. Ledger row 1351 updated: first half resolved, OID-per-arg
+      half re-filed. Gates: package suites + pre-commit units +
+      `scripts/tpch-spotcheck.sh` (Q12=2, Q13=35) all PASS. STILL OPEN (row 1351
+      second half): the arglist carries only the arg's NAME, so a bare `char`
+      arg remains indistinguishable from OID-18 `"char"` and renders `"char"`
+      where PG renders `character` — an OID-per-arg catalog-representation
+      change. Unrelated pre-existing note observed during probing (not
+      introduced here): `CREATE OR REPLACE FUNCTION` of a pre-existing routine
+      can hit "catalog update: freshly extended page did not accept tuple" when
+      the pg_proc heap page is full — a pg_proc heap-page-extension limitation.
+
 - [x] **M0119-0010 — `char(N)` typmods are not restored per column on catalog
       reload** (source: M0127-P5.9-f, ledger row 2026-08-05). **FIXED (2026-08-09).**
       Root cause: `DecodePGAttributePhysicalRow` never decoded `atttypmod`

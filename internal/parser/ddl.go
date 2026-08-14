@@ -4655,7 +4655,16 @@ func (p *parser) parseColumnType() (ColumnType, error) {
 	if len(ct.Args) > 0 {
 		ct.Name = p.parseTimeZoneQualifierAfterArgs(ct.Name)
 	}
-	if first.Kind != TokenQuotedIdent && strings.EqualFold(ct.Name, "char") && len(ct.Args) == 0 {
+	// Bare `char`/`character` (and the SQL national aliases `nchar` /
+	// `national character`, which parseMultiWordTypeName collapses to
+	// "character") default to an implicit length of 1 upstream (gram.y
+	// CharacterWithoutLength → bpchar with typmod 1). `bpchar` spelled
+	// directly takes typmod -1 (unbounded) and is deliberately NOT stamped.
+	// M0119-0006 (77th slice): `character` was missing from this default, so
+	// a bare `character`/`nchar` column was character(-1) where PG 18.3
+	// makes it character(1).
+	if first.Kind != TokenQuotedIdent && len(ct.Args) == 0 &&
+		(strings.EqualFold(ct.Name, "char") || strings.EqualFold(ct.Name, "character")) {
 		ct.Args = []int64{1}
 	}
 	// FLOAT [ (precision) ] → float4/float8 (gram.y opt_float). A quoted
@@ -4744,9 +4753,26 @@ func (p *parser) parseMultiWordTypeName(leading string) string {
 		if p.acceptIdentKeyword("precision") {
 			return "float8"
 		}
-	case "character":
+	case "character", "char":
 		if p.acceptIdentKeyword("varying") {
 			return "varchar"
+		}
+	case "nchar":
+		if p.acceptIdentKeyword("varying") {
+			return "varchar"
+		}
+		// Bare `nchar` is the SQL national-character alias of `character`
+		// (bpchar): `f(nchar)` ≡ `f(character)` (gram.y character: NCHAR
+		// opt_varying). `character`/`char` bare are NOT collapsed here —
+		// they keep their display names (parseColumnType stamps the bare
+		// `char` typmod separately, and the CHAROID `"char"` is quoted).
+		return "character"
+	case "national":
+		if p.acceptIdentKeyword("character", "char") {
+			if p.acceptIdentKeyword("varying") {
+				return "varchar"
+			}
+			return "character"
 		}
 	case "bit":
 		if p.acceptIdentKeyword("varying") {
