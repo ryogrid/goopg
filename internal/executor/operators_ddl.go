@@ -10341,7 +10341,7 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 								_, isEnum = im.LookupEnum(typ.Name)
 							}
 							if !isEnum {
-								return &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 only supports int4 / numeric keys, got %q", typ.Name)}
+								return btreeKeyTypeRejectionError(typ.Name, pos)
 							}
 						}
 					}
@@ -10360,7 +10360,7 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 				_, isEnum = im.LookupEnum(col.Type.Name)
 			}
 			if !isEnum {
-				return &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 only supports int4 / numeric keys, got %q", col.Type.Name)}
+				return btreeKeyTypeRejectionError(col.Type.Name, pos)
 			}
 		}
 		cols[i] = col
@@ -11329,6 +11329,25 @@ func isSupportedBTreeKeyType(name string) bool {
 		// (btree_interval_key.go).
 		isIntervalTypeName(name) ||
 		strings.ToLower(name) == "uuid"
+}
+
+// btreeKeyTypeRejectionError returns the PG-faithful rejection for a type goopg
+// cannot use as a B-tree key. box has NO btree opclass in PG (pg_opclass.dat
+// carries gist/spgist/brin only), so PG raises 42704 "data type box has no
+// default operator class for access method \"btree\"" with a HINT (indexcmds.c
+// ResolveOpClass -> GetDefaultOpClass -> InvalidOid, ~2270-2277). Every other
+// type goopg rejects here is one PG *can* btree-index (int4range via range_ops)
+// or one the v0 encoder has not implemented yet — those keep the honest 0A000.
+func btreeKeyTypeRejectionError(typName string, pos int) *ExecError {
+	if typName == "box" {
+		return &ExecError{
+			Code:    "42704",
+			Pos:     pos,
+			Message: fmt.Sprintf("data type %s has no default operator class for access method \"btree\"", typName),
+			Hint:    "You must specify an operator class for the index or define a default operator class for the data type.",
+		}
+	}
+	return &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 only supports int4 / numeric keys, got %q", typName)}
 }
 
 // truncateTableEntry is the per-table state in execTruncate's BFS loop.

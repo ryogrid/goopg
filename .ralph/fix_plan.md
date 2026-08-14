@@ -3260,6 +3260,15 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       "`box`/`int4range` key encodings" half was a misattribution — box has no PG
       btree opclass at all, and int4range is blocked on the range value model;
       the expression-key gate for both is now landed.)
+      **86th slice (2026-08-14): box rejection SQLSTATE polish (ledger row 1356
+      item 2).** `btreeKeyTypeRejectionError` emits PG's exact `42704 "data type
+      box has no default operator class for access method \"btree\""` + HINT
+      (indexcmds.c:2270-2277) for a `box` key on BOTH the named-column and
+      expression branches, instead of goopg's internal `0A000`; every other
+      unsupported key type (int4range, …) keeps `0A000`. Gate:
+      `TestExpressionIndexKeyRejectsBoxAndInt4Range` (split expectations) +
+      `TestNamedColumnIndexRejectsBoxWith42704` + units + tpch-spotcheck
+      (Q12=2/Q13=35).
       **28th slice (2026-08-12): the `HH:MM` half of that inherited input gap is
       closed.** A time-of-day with no seconds field is ordinary PG input
       (`DecodeTime` reads seconds only `if (*cp == ':')`, leaving `tm_sec = 0`),
