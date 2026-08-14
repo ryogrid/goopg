@@ -30,7 +30,10 @@ CLAUDE_OUTPUT_FORMAT="json"
 # source/references over the read-only ./postgres oracle tree) are registered at
 # user scope but were permission-denied inside the loop, forcing slower
 # grep/global exploration of PG internals.
-ALLOWED_TOOLS="Write,Read,Edit,Grep,Bash(grep *),Bash(*),Bash(git add *),Bash(git commit *),Bash(git diff *),Bash(git log *),Bash(git status),Bash(git status *),Bash(git push *),Bash(git pull *),Bash(git fetch *),Bash(git branch *),Bash(git tag *),Bash(go *),Bash(make *),Bash(gofmt *),Bash(rg *),Bash(psql *),Bash(pgbench *),Bash(npm *),Bash(pytest),ToolSearch,TodoWrite,TaskCreate,TaskUpdate,TaskGet,TaskList,Glob,Agent,Monitor,ScheduleWakeup,mcp__serena__*,mcp__any-script__*"
+# cost-optimization (2026-08-14): added SendMessage,ListAgents — the coordinator
+# edition PROMPT.md drives multi-round worker conversations via SendMessage; a
+# denial would silently break the delegation protocol (same failure class as H3).
+ALLOWED_TOOLS="Write,Read,Edit,Grep,Bash(grep *),Bash(*),Bash(git add *),Bash(git commit *),Bash(git diff *),Bash(git log *),Bash(git status),Bash(git status *),Bash(git push *),Bash(git pull *),Bash(git fetch *),Bash(git branch *),Bash(git tag *),Bash(go *),Bash(make *),Bash(gofmt *),Bash(rg *),Bash(psql *),Bash(pgbench *),Bash(npm *),Bash(pytest),ToolSearch,TodoWrite,TaskCreate,TaskUpdate,TaskGet,TaskList,Glob,Agent,SendMessage,ListAgents,Monitor,ScheduleWakeup,mcp__serena__*,mcp__any-script__*"
 
 # Session management
 SESSION_CONTINUITY=true

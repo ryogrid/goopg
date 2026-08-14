@@ -59,7 +59,7 @@ func sqlLiteralForKeyType(lit string) string {
 }
 
 func scalarKeyCases() []scalarKeyCase {
-	return []scalarKeyCase{
+	cases := []scalarKeyCase{
 		{
 			name:   "int2",
 			typ:    "smallint",
@@ -110,6 +110,23 @@ func scalarKeyCases() []scalarKeyCase {
 				"12:00:00+00", "11:00:00-01", "00:00:00-12", "23:59:59.999999-12"},
 		},
 	}
+	// The six reg* types all default to oid_ops, so their key ordering is
+	// identical to the oid row's — the point of these rows is that each type name
+	// must ROUTE through the reg* arm (isRegType in encodeBTreeKeyForColumn /
+	// decodeScalarBTreeKey) rather than fall to the numeric-only oid arm or the
+	// 0A000 fallback, and that a numeric literal probe (nil ctx →
+	// parseRegDashOrOid numeric passthrough) matches the stored numeric-OID
+	// datum. 2147483648 sits above 2147483647 to pin the unsigned oidcmp order
+	// for reg* exactly as the oid row does. M0119-0006-0006.
+	for _, rt := range []string{"regproc", "regprocedure", "regclass", "regtype", "regrole", "regcollation"} {
+		cases = append(cases, scalarKeyCase{
+			name:   rt,
+			typ:    rt,
+			values: []Datum{NewIntDatum(0), NewIntDatum(1), NewIntDatum(1247), NewIntDatum(2147483648), NewIntDatum(4294967295)},
+			lits:   []string{"0", "1", "1247", "2147483648", "4294967295"},
+		})
+	}
+	return cases
 }
 
 // TestEncodeScalarBTreeKeyMatchesPGOrder asserts the encoded keys sort in the
@@ -122,7 +139,7 @@ func TestEncodeScalarBTreeKeyMatchesPGOrder(t *testing.T) {
 			col := &catalog.Column{Name: "k", Type: catalog.Type{Name: tc.typ}}
 			var prev []byte
 			for i, v := range tc.values {
-				k, err := encodeBTreeKeyForColumn(v, col, 0)
+				k, err := encodeBTreeKeyForColumn(nil, v, col, 0)
 				if err != nil {
 					t.Fatalf("encode %s: %v", tc.lits[i], err)
 				}
@@ -151,11 +168,11 @@ func TestScalarBTreeKeyProbeMatchesStoredKey(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			col := &catalog.Column{Name: "k", Type: catalog.Type{Name: tc.typ}}
 			for i, v := range tc.values {
-				stored, err := encodeBTreeKeyForColumn(v, col, 0)
+				stored, err := encodeBTreeKeyForColumn(nil, v, col, 0)
 				if err != nil {
 					t.Fatalf("encode stored %s: %v", tc.lits[i], err)
 				}
-				probe, err := encodeBTreeKeyForColumn(NewStringDatum(tc.lits[i]), col, 0)
+				probe, err := encodeBTreeKeyForColumn(nil, NewStringDatum(tc.lits[i]), col, 0)
 				if err != nil {
 					t.Fatalf("encode probe %s: %v", tc.lits[i], err)
 				}
@@ -181,13 +198,13 @@ func TestScalarBTreeKeyDecodeSiblingParity(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			col := catalog.Column{Name: "k", Type: catalog.Type{Name: tc.typ}}
 			for i, v := range tc.values {
-				key, err := encodeBTreeKeyForColumn(v, &col, 0)
+				key, err := encodeBTreeKeyForColumn(nil, v, &col, 0)
 				if err != nil {
 					t.Fatalf("encode %s: %v", tc.lits[i], err)
 				}
 				// Composite walk: append a trailing int4 column so the decoder
 				// sees a key that does NOT end at this column's boundary.
-				tail, err := encodeBTreeKeyForColumn(NewIntDatum(7),
+				tail, err := encodeBTreeKeyForColumn(nil, NewIntDatum(7),
 					&catalog.Column{Name: "t", Type: catalog.Type{Name: "int4"}}, 0)
 				if err != nil {
 					t.Fatalf("encode tail: %v", err)
@@ -210,7 +227,7 @@ func TestScalarBTreeKeyDecodeSiblingParity(t *testing.T) {
 					}
 					// Re-encoding the decoded datum must reproduce the key —
 					// the value-level identity that matters for both callers.
-					re, err := encodeBTreeKeyForColumn(got, &col, 0)
+					re, err := encodeBTreeKeyForColumn(nil, got, &col, 0)
 					if err != nil {
 						t.Fatalf("%s %s: re-encode: %v", tc.lits[i], label, err)
 					}
@@ -267,7 +284,7 @@ func TestScalarIndexBuildAndMaintainKeys(t *testing.T) {
 			col := &catalog.Column{Name: "k", Type: catalog.Type{Name: tc.typ}}
 			want := make([][]byte, len(tc.values))
 			for i, v := range tc.values {
-				k, err := encodeBTreeKeyForColumn(v, col, 0)
+				k, err := encodeBTreeKeyForColumn(nil, v, col, 0)
 				if err != nil {
 					t.Fatalf("encode %s: %v", tc.lits[i], err)
 				}
@@ -299,11 +316,11 @@ func TestByteaIndexKeyIsSelfDelimiting(t *testing.T) {
 	bcol := &catalog.Column{Name: "b", Type: catalog.Type{Name: "bytea"}}
 	icol := &catalog.Column{Name: "i", Type: catalog.Type{Name: "int4"}}
 	compose := func(b []byte, i int64) []byte {
-		bk, err := encodeBTreeKeyForColumn(NewBytesDatum(b), bcol, 0)
+		bk, err := encodeBTreeKeyForColumn(nil, NewBytesDatum(b), bcol, 0)
 		if err != nil {
 			t.Fatalf("encode %x: %v", b, err)
 		}
-		ik, err := encodeBTreeKeyForColumn(NewIntDatum(i), icol, 0)
+		ik, err := encodeBTreeKeyForColumn(nil, NewIntDatum(i), icol, 0)
 		if err != nil {
 			t.Fatalf("encode %d: %v", i, err)
 		}
@@ -350,7 +367,7 @@ func TestTimeTzIndexKeyIsTwoPart(t *testing.T) {
 	}
 	var prev []byte
 	for i, c := range sameInstant {
-		k, err := encodeBTreeKeyForColumn(c.d, col, 0)
+		k, err := encodeBTreeKeyForColumn(nil, c.d, col, 0)
 		if err != nil {
 			t.Fatalf("encode %s: %v", c.lit, err)
 		}
@@ -380,11 +397,11 @@ func TestTimeTzCompositeKeyIsSelfDelimiting(t *testing.T) {
 	tcol := &catalog.Column{Name: "k", Type: catalog.Type{Name: "timetz"}}
 	icol := &catalog.Column{Name: "i", Type: catalog.Type{Name: "int4"}}
 	compose := func(d Datum, i int64) []byte {
-		tk, err := encodeBTreeKeyForColumn(d, tcol, 0)
+		tk, err := encodeBTreeKeyForColumn(nil, d, tcol, 0)
 		if err != nil {
 			t.Fatalf("encode timetz: %v", err)
 		}
-		ik, err := encodeBTreeKeyForColumn(NewIntDatum(i), icol, 0)
+		ik, err := encodeBTreeKeyForColumn(nil, NewIntDatum(i), icol, 0)
 		if err != nil {
 			t.Fatalf("encode int4: %v", err)
 		}
@@ -411,7 +428,7 @@ func TestTimeTzCompositeKeyIsSelfDelimiting(t *testing.T) {
 	if n != 12 {
 		t.Fatalf("composite walk consumed %d bytes of the timetz column, want 12", n)
 	}
-	if re, rErr := encodeBTreeKeyForColumn(d, tcol, 0); rErr != nil {
+	if re, rErr := encodeBTreeKeyForColumn(nil, d, tcol, 0); rErr != nil {
 		t.Fatalf("re-encode decoded timetz: %v", rErr)
 	} else if !bytes.Equal(re, key[:12]) {
 		t.Errorf("re-encoded timetz %x != %x", re, key[:12])
@@ -423,5 +440,49 @@ func TestTimeTzCompositeKeyIsSelfDelimiting(t *testing.T) {
 	if tn != 4 || tail.Kind != KindInt || tail.Int != -9999 {
 		t.Errorf("trailing int4 decoded as (kind %d, %d) over %d bytes, want (KindInt, -9999) over 4",
 			tail.Kind, tail.Int, tn)
+	}
+}
+
+// TestScalarRegIndexDDLMaintains is the DDL acceptance test for the scalar reg*
+// side of the btree-key slice (deferral row 1352): CREATE INDEX on a scalar
+// regclass column must succeed (the createBTreeIndex gate now admits the reg*
+// family), INSERT must maintain the index (the maintain path threads ctx so a
+// NAME resolves through regIdentifierInput), and a WHERE equality on the
+// column must answer through the index.
+//
+// Mutation it catches: dropping the reg* arm from encodeBTreeKeyForColumn (or
+// failing to thread ctx to it) turns the INSERT maintain into a silently-empty
+// index. The row set alone would stay green (the planner falls back to a heap
+// scan), which is why the plan is asserted to be an IndexScan — that assertion
+// is the mutation probe.
+func TestScalarRegIndexDDLMaintains(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	// `pg_class` (a system relation) and `reg_idx` (this test's own table) both
+	// resolve through regIdentifierInput's regclass arm in the in-memory
+	// catalog, so the INSERT maintain path stores two distinct OID keys. The
+	// rendered value of a SCALAR regclass column is the raw OID (scalar output
+	// rendering is a separate concern; this test is about the KEY), so the
+	// row-count + index-plan assertions below are the load-bearing ones.
+	runComposite(t, ctx,
+		"CREATE TABLE reg_idx (r regclass)",
+		"CREATE INDEX reg_idx_r ON reg_idx (r)",
+		"INSERT INTO reg_idx VALUES ('pg_class')",
+		"INSERT INTO reg_idx VALUES ('reg_idx')",
+	)
+	rows := runQuery(t, ctx, "SELECT r FROM reg_idx WHERE r = 'reg_idx'")
+	if len(rows) != 1 {
+		t.Fatalf("rows=%d want 1 (%v) — the INSERT maintain path likely "+
+			"swallowed the key-encode error and left the index empty", len(rows), rows)
+	}
+	// The plan must answer through the index. A scalar regclass index-only scan
+	// is legal (the element renders as the OID, which the key round-trips), so
+	// either index node counts; the point is that the maintain path WROTE the
+	// entries the planner is willing to probe.
+	plan := planOne(t, "SELECT r FROM reg_idx WHERE r = 'reg_idx'", ctx.Catalog)
+	if findIndexScan(plan) == nil && findIndexOnlyScan(plan) == nil {
+		t.Fatal("planner did not use the index for the regclass equality — the " +
+			"maintain path likely swallowed the key-encode error and left the index empty")
 	}
 }

@@ -31,7 +31,7 @@ func TestEncodeArrayBTreeKeyMatchesArrayCmpOrder(t *testing.T) {
 	col := &catalog.Column{Name: "a", Type: catalog.Type{Name: "int4", IsArray: true}}
 	keys := make([][]byte, len(arrayKeyOracleOrder))
 	for i, lit := range arrayKeyOracleOrder {
-		k, err := encodeBTreeKeyForColumn(NewStringDatum(lit), col, 0)
+		k, err := encodeBTreeKeyForColumn(nil, NewStringDatum(lit), col, 0)
 		if err != nil {
 			t.Fatalf("encode %s: %v", lit, err)
 		}
@@ -59,7 +59,7 @@ func TestEncodeArrayBTreeKeyTextElements(t *testing.T) {
 	order := []string{"{}", "{a}", "{a,b}", "{ab}", "{b}"}
 	var prev []byte
 	for i, lit := range order {
-		k, err := encodeBTreeKeyForColumn(NewStringDatum(lit), col, 0)
+		k, err := encodeBTreeKeyForColumn(nil, NewStringDatum(lit), col, 0)
 		if err != nil {
 			t.Fatalf("encode %s: %v", lit, err)
 		}
@@ -76,7 +76,7 @@ func TestEncodeArrayBTreeKeyTextElements(t *testing.T) {
 // than flattened into a key that claims an order it does not have.
 func TestEncodeArrayBTreeKeyDeclinesMultidim(t *testing.T) {
 	col := &catalog.Column{Name: "a", Type: catalog.Type{Name: "int4", IsArray: true}}
-	if _, err := encodeBTreeKeyForColumn(NewStringDatum("{{1,2},{3,4}}"), col, 0); err == nil {
+	if _, err := encodeBTreeKeyForColumn(nil, NewStringDatum("{{1,2},{3,4}}"), col, 0); err == nil {
 		t.Fatal("multidimensional array literal was accepted as a B-tree key")
 	} else if err.Code != "0A000" {
 		t.Errorf("multidim array key error code = %s, want 0A000", err.Code)
@@ -141,11 +141,11 @@ func TestArrayIndexCompositeKeyIsSelfDelimiting(t *testing.T) {
 	acol := &catalog.Column{Name: "a", Type: catalog.Type{Name: "int4", IsArray: true}}
 	bcol := &catalog.Column{Name: "b", Type: catalog.Type{Name: "int4"}}
 	compose := func(arr string, b int64) []byte {
-		ak, err := encodeBTreeKeyForColumn(NewStringDatum(arr), acol, 0)
+		ak, err := encodeBTreeKeyForColumn(nil, NewStringDatum(arr), acol, 0)
 		if err != nil {
 			t.Fatalf("encode %s: %v", arr, err)
 		}
-		bk, err := encodeBTreeKeyForColumn(NewIntDatum(b), bcol, 0)
+		bk, err := encodeBTreeKeyForColumn(nil, NewIntDatum(b), bcol, 0)
 		if err != nil {
 			t.Fatalf("encode %d: %v", b, err)
 		}
@@ -185,7 +185,7 @@ func assertArrayKeysEqualLiterals(t *testing.T, path string, got [][]byte, wantL
 		return // the count mismatch is already reported by the caller
 	}
 	for i, lit := range wantLits {
-		want, err := encodeBTreeKeyForColumn(NewStringDatum(lit), col, 0)
+		want, err := encodeBTreeKeyForColumn(nil, NewStringDatum(lit), col, 0)
 		if err != nil {
 			t.Fatalf("encode %s: %v", lit, err)
 		}

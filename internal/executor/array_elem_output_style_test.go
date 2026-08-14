@@ -74,7 +74,7 @@ func TestArrayKeyTextMatchesHeapTextUnderSessionStyle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("heap encode: %v", err)
 	}
-	key, encErr := encodeBTreeKeyForColumn(NewStringDatum(lit), &col, 0)
+	key, encErr := encodeBTreeKeyForColumn(nil, NewStringDatum(lit), &col, 0)
 	if encErr != nil {
 		t.Fatalf("key encode: %s", encErr.Message)
 	}
@@ -104,9 +104,20 @@ func TestArrayKeyTextMatchesHeapTextUnderSessionStyle(t *testing.T) {
 // COPY … TO and a SELECT of the same array column must print the same text, so
 // the two must not disagree about which GUC names they read.
 func TestArrayOutputStyleReadsTheSameGUCs(t *testing.T) {
-	if got := arrayOutputStyle(nil); got != pgarray.DefaultOutputStyle() {
-		t.Errorf("nil ctx = %+v, want the boot default %+v", got, pgarray.DefaultOutputStyle())
+	// OutputStyle now carries a func field (the reg* OID→name renderer), so
+	// the struct is not comparable — compare the GUC fields and renderer
+	// nil-ness individually. M0119-0006 reg* element slice.
+	assertStyle := func(name string, got, want pgarray.OutputStyle, wantRegOutNil bool) {
+		t.Helper()
+		if got.Style != want.Style || got.Order != want.Order || got.Zone != want.Zone {
+			t.Errorf("%s = {Style:%q Order:%q Zone:%q}, want {Style:%q Order:%q Zone:%q}",
+				name, got.Style, got.Order, got.Zone, want.Style, want.Order, want.Zone)
+		}
+		if (got.RegOut == nil) != wantRegOutNil {
+			t.Errorf("%s RegOut nil = %v, want %v", name, got.RegOut == nil, wantRegOutNil)
+		}
 	}
+	assertStyle("nil ctx", arrayOutputStyle(nil), pgarray.DefaultOutputStyle(), true)
 	ctx := &Context{GetSetting: func(name string) (string, bool) {
 		switch name {
 		case "datestyle":
@@ -116,17 +127,18 @@ func TestArrayOutputStyleReadsTheSameGUCs(t *testing.T) {
 		}
 		return "", false
 	}}
-	got := arrayOutputStyle(ctx)
-	want := pgarray.OutputStyle{Style: "German", Order: "DMY", Zone: "Asia/Kolkata"}
-	if got != want {
-		t.Errorf("arrayOutputStyle = %+v, want %+v", got, want)
-	}
+	// The GUC-only ctx has no catalog, so the renderer stays nil.
+	assertStyle("GUC ctx", arrayOutputStyle(ctx),
+		pgarray.OutputStyle{Style: "German", Order: "DMY", Zone: "Asia/Kolkata"}, true)
 	// A session that has set neither GUC must land on the boot default, not on
 	// a zero-valued style (whose empty Style would still format as ISO but
 	// whose empty Order would be a silent behaviour change for SQL/Postgres).
 	bare := &Context{GetSetting: func(string) (string, bool) { return "", false }}
-	if got := arrayOutputStyle(bare); got != pgarray.DefaultOutputStyle() {
-		t.Errorf("unset GUCs = %+v, want %+v", got, pgarray.DefaultOutputStyle())
+	assertStyle("unset GUCs", arrayOutputStyle(bare), pgarray.DefaultOutputStyle(), true)
+	// A catalog-carrying session binds the reg* renderer (nil → non-nil).
+	ctxCat := regCopyCat(t)
+	if got := arrayOutputStyle(ctxCat); got.RegOut == nil {
+		t.Error("arrayOutputStyle with a catalog left RegOut nil, want the reg* renderer bound")
 	}
 }
 

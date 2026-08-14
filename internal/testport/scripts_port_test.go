@@ -2,7 +2,7 @@ package testport
 
 // Ports of postgres/src/bin/scripts/t/*.pl into Go tests.
 //
-// Upstream suite: D-005 in docs/test-port/postgres-oracle-port-status.csv
+// Upstream suite: D-005 in docs/test-port/postgres-oracle-target-inventory.csv
 // Milestone doc: docs/milestones/0060-postgres-oracle-test-port.md
 //
 // Each test corresponds to one upstream .pl file. Tests that require SQL

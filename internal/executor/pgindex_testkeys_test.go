@@ -56,7 +56,7 @@ func indexProbeForTest(t *testing.T, ctx *Context, idx *catalog.Index, val Datum
 		if !ok {
 			t.Fatalf("index %q: leading key column %q not in catalog", idx.Name, idx.Columns[0])
 		}
-		key, encErr := encodeBTreeKeyForColumn(val, col, 0)
+		key, encErr := encodeBTreeKeyForColumn(nil, val, col, 0)
 		if encErr != nil {
 			t.Fatalf("encodeBTreeKeyForColumn(%s): %v", idx.Name, encErr)
 		}

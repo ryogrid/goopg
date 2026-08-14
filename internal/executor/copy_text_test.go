@@ -28,7 +28,7 @@ func TestEncodeCopyTextRowPgbenchShape(t *testing.T) {
 		{Kind: KindInt, Int: 0},
 		NewStringDatum(""),
 	}
-	got, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY", "UTC")
+	got, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY", "UTC", nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +44,7 @@ func TestEncodeCopyTextRowPgbenchShape(t *testing.T) {
 func TestEncodeCopyTextRowEscaping(t *testing.T) {
 	cols := []catalog.Column{{Name: "s", Type: catalog.Type{Name: "text"}}}
 	row := Row{NewStringDatum("a\\b\nc\rd\te")}
-	got, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY", "UTC")
+	got, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY", "UTC", nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +62,7 @@ func TestEncodeCopyTextRowNullSentinel(t *testing.T) {
 		{Name: "b", Type: catalog.Type{Name: "text"}},
 	}
 	row := Row{NullDatum, NewStringDatum("x")}
-	got, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY", "UTC")
+	got, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY", "UTC", nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +94,7 @@ func TestEncodeCopyTextRowDate(t *testing.T) {
 		{"German", "DMY", "14.07.2026\n"},
 	}
 	for _, tc := range cases {
-		got, err := EncodeCopyTextRow(nil, row, cols, tc.style, tc.order, "UTC")
+		got, err := EncodeCopyTextRow(nil, row, cols, tc.style, tc.order, "UTC", nil, false)
 		if err != nil {
 			t.Fatalf("style=%s order=%s: %v", tc.style, tc.order, err)
 		}
@@ -130,7 +130,7 @@ func TestEncodeCopyTextRowTimestamp(t *testing.T) {
 		{"German", "DMY", "14.07.2026 09:05:03\n"},
 	}
 	for _, tc := range cases {
-		got, err := EncodeCopyTextRow(nil, row, cols, tc.style, tc.order, "UTC")
+		got, err := EncodeCopyTextRow(nil, row, cols, tc.style, tc.order, "UTC", nil, false)
 		if err != nil {
 			t.Fatalf("style=%s order=%s: %v", tc.style, tc.order, err)
 		}
@@ -164,7 +164,7 @@ func TestEncodeCopyTextRowTimestampTZ(t *testing.T) {
 		{"German", "DMY", "Asia/Kolkata", "15.06.2020 15:30:00 IST\n"},
 	}
 	for _, tc := range cases {
-		got, err := EncodeCopyTextRow(nil, row, cols, tc.style, tc.order, tc.zone)
+		got, err := EncodeCopyTextRow(nil, row, cols, tc.style, tc.order, tc.zone, nil, false)
 		if err != nil {
 			t.Fatalf("style=%s order=%s zone=%s: %v", tc.style, tc.order, tc.zone, err)
 		}
@@ -175,7 +175,7 @@ func TestEncodeCopyTextRowTimestampTZ(t *testing.T) {
 
 	// The plain-timestamp column in the same row set must NOT move.
 	plain := []catalog.Column{{Name: "ts", Type: catalog.Type{Name: "timestamp"}}}
-	got, err := EncodeCopyTextRow(nil, row, plain, "ISO", "MDY", "Asia/Kolkata")
+	got, err := EncodeCopyTextRow(nil, row, plain, "ISO", "MDY", "Asia/Kolkata", nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +202,7 @@ func TestEncodeCopyTextRowTimestampFractionalSecondsTrimmed(t *testing.T) {
 	for _, tc := range cases {
 		when := time.Date(2026, time.July, 14, 9, 5, 3, tc.ns, time.UTC)
 		row := Row{NewTimeDatum(when)}
-		got, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY", "UTC")
+		got, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY", "UTC", nil, false)
 		if err != nil {
 			t.Fatalf("%s: %v", tc.name, err)
 		}
@@ -310,7 +310,7 @@ func TestRoundTripBoolAndTimestamp(t *testing.T) {
 		NewBoolDatum(true),
 		NewTimeDatum(now),
 	}
-	enc, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY", "UTC")
+	enc, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY", "UTC", nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -411,7 +411,7 @@ func TestEncodeCopyTextRowTimeAndTimeTZ(t *testing.T) {
 	for _, tc := range cases {
 		cols := []catalog.Column{{Name: "t", Type: tc.typ}}
 		for _, style := range []string{"ISO", "SQL", "Postgres", "German"} {
-			got, err := EncodeCopyTextRow(nil, tc.row, cols, style, "MDY", "Asia/Tokyo")
+			got, err := EncodeCopyTextRow(nil, tc.row, cols, style, "MDY", "Asia/Tokyo", nil, false)
 			if err != nil {
 				t.Fatalf("%s (style=%s): %v", tc.name, style, err)
 			}
@@ -442,7 +442,7 @@ func TestCopyTextTimeRoundTrip(t *testing.T) {
 		if tc.typ.Name == "timetz" {
 			d = NewTimeTZDatum(tc.tv, tc.offsetSecs)
 		}
-		text, err := datumToCopyText(tc.typ, d, "ISO", "MDY", "Asia/Tokyo")
+		text, err := datumToCopyText(tc.typ, d, "ISO", "MDY", "Asia/Tokyo", nil, false)
 		if err != nil {
 			t.Fatalf("%s: encode: %v", tc.typ.Name, err)
 		}

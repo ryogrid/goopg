@@ -220,7 +220,7 @@ func (p *PgOutput) writeRelation(rel *RelationDef) error {
 }
 
 func (p *PgOutput) writeInsert(rel *RelationDef, tuple []byte) error {
-	body, err := encodePgoTuple(rel.Columns, tuple)
+	body, err := encodePgoTuple(rel.Columns, tuple, p.snap.RegOut)
 	if err != nil {
 		return fmt.Errorf("pgoutput: encode insert tuple for %q: %w", rel.Name, err)
 	}
@@ -238,7 +238,7 @@ func (p *PgOutput) writeDelete(rel *RelationDef, oldTuple []byte) error {
 	buf = append(buf, pgoDelete)
 	buf = appendUint32(buf, rel.OID)
 	if len(oldTuple) > 0 {
-		body, err := encodePgoTuple(rel.Columns, oldTuple)
+		body, err := encodePgoTuple(rel.Columns, oldTuple, p.snap.RegOut)
 		if err != nil {
 			return fmt.Errorf("pgoutput: encode delete old-tuple for %q: %w", rel.Name, err)
 		}
@@ -265,7 +265,7 @@ func (p *PgOutput) writeUpdate(rel *RelationDef, oldTuple, newTuple []byte) erro
 	// one (the goopg pre-2026-05-14 behaviour) was rejected by libpq
 	// subscribers as malformed since natts=0 violates the relation's
 	// declared column count.
-	newBody, err := encodePgoTuple(rel.Columns, newTuple)
+	newBody, err := encodePgoTuple(rel.Columns, newTuple, p.snap.RegOut)
 	if err != nil {
 		return fmt.Errorf("pgoutput: encode update new-tuple for %q: %w", rel.Name, err)
 	}
@@ -273,7 +273,7 @@ func (p *PgOutput) writeUpdate(rel *RelationDef, oldTuple, newTuple []byte) erro
 	buf = append(buf, pgoUpdate)
 	buf = appendUint32(buf, rel.OID)
 	if len(oldTuple) > 0 {
-		oldBody, err := encodePgoTuple(rel.Columns, oldTuple)
+		oldBody, err := encodePgoTuple(rel.Columns, oldTuple, p.snap.RegOut)
 		if err != nil {
 			return fmt.Errorf("pgoutput: encode update old-tuple for %q: %w", rel.Name, err)
 		}
@@ -295,19 +295,19 @@ func (p *PgOutput) writeUpdate(rel *RelationDef, oldTuple, newTuple []byte) erro
 // M0111-0002: goopg has a single on-disk heap-tuple format (PG-physical); the
 // legacy [flag][value] walk was removed. Decode uses the tuple header (natts +
 // null bitmap).
-func encodePgoTuple(cols []ColumnDef, raw []byte) ([]byte, error) {
+func encodePgoTuple(cols []ColumnDef, raw []byte, regOut func(string, uint32) string) ([]byte, error) {
 	tup, err := storage.ParseHeapTuple(raw)
 	if err != nil {
 		return nil, err
 	}
 	natts := int(tup.Header.Infomask2 & storage.HeapNattsMask)
-	return encodePgoTuplePhysical(cols, tup.Data, tup.Bitmap, natts)
+	return encodePgoTuplePhysical(cols, tup.Data, tup.Bitmap, natts, regOut)
 }
 
 // encodePgoTuplePhysical walks a PG-physical body using the null bitmap and
 // per-type alignment, re-emitting each column as the canonical pgoutput text
 // the subscriber's apply worker parses. M0111-0002.
-func encodePgoTuplePhysical(cols []ColumnDef, body, bitmap []byte, storedNatts int) ([]byte, error) {
+func encodePgoTuplePhysical(cols []ColumnDef, body, bitmap []byte, storedNatts int, regOut func(string, uint32) string) ([]byte, error) {
 	out := make([]byte, 0, 2+len(cols)*8)
 	out = appendUint16(out, uint16(len(cols)))
 
@@ -328,7 +328,7 @@ func encodePgoTuplePhysical(cols []ColumnDef, body, bitmap []byte, storedNatts i
 			out = append(out, pgoColNull)
 			continue
 		}
-		val, n, derr := pgoDecodePhysicalValue(col.Type, body[off:])
+		val, n, derr := pgoDecodePhysicalValue(col.Type, body[off:], regOut)
 		if derr != nil {
 			return nil, fmt.Errorf("col %q: %w", col.Name, derr)
 		}
@@ -383,21 +383,24 @@ func pgoPhysicalAlign(off int, t catalog.Type) int {
 // pgoutput text form. Mirrors executor.decodePhysicalPGValueMctx, producing the
 // same text pgoDecodeValue would for the same logical value so the subscriber's
 // apply worker parses it identically. M0111-0002.
-func pgoDecodePhysicalValue(t catalog.Type, data []byte) ([]byte, int, error) {
+func pgoDecodePhysicalValue(t catalog.Type, data []byte, regOut func(string, uint32) string) ([]byte, int, error) {
 	// Array columns FIRST, for the reason spelled out in pgoPhysicalAlign: Name
 	// holds the ELEMENT type, so the switch below would decode a `uuid[]`
 	// column's ArrayType blob as a bare 16-byte pg_uuid_t — emitting garbage to
 	// the subscriber AND mis-advancing the offset of every following column in
 	// the tuple. The blob is a varlena; the text rendering is the very same
-	// internal/pgarray.RenderText the heap decoder
+	// internal/pgarray.RenderTextStyled the heap decoder
 	// (executor.decodeArrayValuePG) uses, so a replicated array reaches the
-	// subscriber spelled exactly as a local SELECT spells it. M0119-0006.
+	// subscriber spelled exactly as a local SELECT spells it. regOut threads the
+	// reg* element name renderer (PG's text-mode pgoutput emits a reg* element
+	// as its typoutput name, proto.c:848); nil keeps the numeric-OID fallback.
+	// M0119-0006.
 	if t.IsArray {
 		payload, n, err := pgoDecodePhysicalVarlena(data)
 		if err != nil {
 			return nil, 0, err
 		}
-		text, err := pgarray.RenderText(t.Name, payload)
+		text, err := pgarray.RenderTextStyled(t.Name, payload, pgarray.OutputStyle{RegOut: regOut})
 		if err != nil {
 			return nil, 0, err
 		}
@@ -427,11 +430,38 @@ func pgoDecodePhysicalValue(t catalog.Type, data []byte) ([]byte, int, error) {
 			return nil, 0, fmt.Errorf("int8: short read")
 		}
 		return []byte(strconv.FormatInt(int64(binary.LittleEndian.Uint64(data[:8])), 10)), 8, nil
-	case "oid", "regproc", "xid":
+	case "oid", "cid", "xid":
+		// Sibling of executor.encodeValuePG's oid arm: cidsend is oidsend
+		// upstream — pq_sendint32 over the 4-byte OID (oid.c, command.c), and
+		// oid/cid/xid have no name form in TEXT-mode pgoutput either, so these
+		// three stay numeric even when a regOut renderer is present. Before the
+		// M0119-0006 (reg* + cid 4-byte storage) heap change these columns were
+		// varlena text and the fall-through below returned the stored text; the
+		// heap image is now 4 fixed bytes, so that fall-through would read a
+		// varlena header off the OID and emit garbage. Hard-won Rule #2.
 		if len(data) < 4 {
 			return nil, 0, fmt.Errorf("oid: short read")
 		}
 		return []byte(strconv.FormatUint(uint64(binary.LittleEndian.Uint32(data[:4])), 10)), 4, nil
+	case "regproc", "regprocedure", "regclass", "regtype", "regrole", "regcollation":
+		// Sibling of executor.encodeValuePG's reg* arm. regclasssend/regtypesend/
+		// regproceduresend/regprocsend/regrolesend/regcollationsend are ALL
+		// oidsend upstream (regproc.c) — pq_sendint32 over the 4-byte OID — which
+		// is the BINARY-mode image. TEXT-mode pgoutput serializes a reg* column
+		// through its typoutput (OidOutputFunctionCall, proto.c:848), and
+		// regclassout/regprocout/... convert the OID to a NAME (regproc.c:940).
+		// regOut — threaded from p.snap.RegOut, which the walsender binds to
+		// executor.RegOutRenderer — reproduces that name rendering; nil (tests,
+		// callers with no catalog) keeps the numeric fallback. M0119-0006
+		// (deferral row 1353).
+		if len(data) < 4 {
+			return nil, 0, fmt.Errorf("reg*: short read")
+		}
+		oid := binary.LittleEndian.Uint32(data[:4])
+		if regOut != nil {
+			return []byte(regOut(t.Name, oid)), 4, nil
+		}
+		return []byte(strconv.FormatUint(uint64(oid), 10)), 4, nil
 	case "xid8":
 		// M0119-0006 (54th slice): xid8 rode the 4-byte oid/xid arm here too.
 		// pg_type OID 5069 is typlen 8 (typalign 'd'), so this decoder read half

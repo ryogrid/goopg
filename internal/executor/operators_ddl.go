@@ -10314,6 +10314,39 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 			// Expression column (e.g. lower(col)) — no catalog column to look up.
 			// cols[i] remains nil; bulkBuildBTree skips expression columns when
 			// there are no existing rows.
+			//
+			// M0119-0006: apply the SAME btree-key type gate the named-column
+			// branch below applies. Before this, an expression key like
+			// `CREATE INDEX ON t ((box_col))` bypassed isSupportedBTreeKeyType and
+			// silently built a B-tree index encoding the value's TEXT in varchar
+			// byte order (encodeArbiterExprKey's KindString arm). PG 18.3 rejects
+			// a btree index on a box expression with 42704 because box has no
+			// btree opclass (indexcmds.c ResolveOpClass → GetDefaultOpClass →
+			// InvalidOid); int4range PG *accepts* via range_ops (pg_opclass.dat,
+			// the binary-coercible-to-anyrange path), but goopg has no range value
+			// model, so it must reject honestly. Both are rejected with the same
+			// 0A000 the named-column path uses (the 42704 polish for box is a
+			// separate deferred slice).
+			if i < len(colExprs) && colExprs[i] != nil {
+				// Resolve exactly as the build path does (resolveIndexKeyExprs,
+				// encodeExprIndexKey): ResolveIndexPredicate populates the
+				// ColumnRef Type that ExprResultType then reports.
+				planExpr, err := planner.ResolveIndexPredicate(colExprs[i], tbl)
+				if err == nil && planExpr != nil {
+					if typ, ok := planner.ExprResultType(planExpr); ok {
+						if !isSupportedBTreeKeyType(typ.Name) {
+							// Also accept user-defined enum types. M0097-0022.
+							isEnum := false
+							if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+								_, isEnum = im.LookupEnum(typ.Name)
+							}
+							if !isEnum {
+								return &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 only supports int4 / numeric keys, got %q", typ.Name)}
+							}
+						}
+					}
+				}
+			}
 			continue
 		}
 		col, ok := o.ctx.Catalog.LookupColumn(tbl, name)
@@ -10547,7 +10580,7 @@ func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols
 				// duplicate NULL pattern (PG rejects building such an index over
 				// pre-existing duplicate-NULL data). Design 0119-0004 sub (b).
 				if unique && nullsNotDistinct {
-					ndk, nerr := nndNullKeyDedupKey(row, cols, pos)
+					ndk, nerr := nndNullKeyDedupKey(o.ctx, row, cols, pos)
 					if nerr != nil {
 						o.ctx.Pool.Unpin(slot)
 						return nil, nerr
@@ -10674,7 +10707,7 @@ func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*cat
 				// NULL value key column: not stored (no null bitmap). Skip for a
 				// default index; dedup null-bearing rows for NULLS NOT DISTINCT.
 				if unique && nullsNotDistinct {
-					ndk, nerr := nndNullKeyDedupKey(row, cols, pos)
+					ndk, nerr := nndNullKeyDedupKey(o.ctx, row, cols, pos)
 					if nerr != nil {
 						o.ctx.Pool.Unpin(slot)
 						return nerr
@@ -10835,7 +10868,7 @@ func encodeCompositeBTreeKeyWithExprs(ctx *Context, row Row, cols []*catalog.Col
 			// btree key (no null bitmap). Signal it; do not store a key.
 			return nil, true, nil
 		}
-		k, encErr := encodeBTreeKeyForColumn(v, col, pos)
+		k, encErr := encodeBTreeKeyForColumn(ctx, v, col, pos)
 		if encErr != nil {
 			return nil, false, encErr
 		}
@@ -10879,7 +10912,7 @@ func resolveIndexKeyExprs(tbl *catalog.Table, idx *catalog.Index) []planner.Expr
 // among themselves at build time, so sentinel aliasing against real btree
 // encodings is irrelevant (design 0119-0004 §2 "avoid key encoding entirely"
 // applies to stored keys; this key is build-local).
-func nndNullKeyDedupKey(row Row, cols []*catalog.Column, pos int) ([]byte, *ExecError) {
+func nndNullKeyDedupKey(ctx *Context, row Row, cols []*catalog.Column, pos int) ([]byte, *ExecError) {
 	var out []byte
 	for _, col := range cols {
 		if col == nil {
@@ -10891,7 +10924,7 @@ func nndNullKeyDedupKey(row Row, cols []*catalog.Column, pos int) ([]byte, *Exec
 			continue
 		}
 		out = append(out, 0x01)
-		k, encErr := encodeBTreeKeyForColumn(v, col, pos)
+		k, encErr := encodeBTreeKeyForColumn(ctx, v, col, pos)
 		if encErr != nil {
 			return nil, encErr
 		}
@@ -10912,13 +10945,37 @@ func nndNullKeyDedupKey(row Row, cols []*catalog.Column, pos int) ([]byte, *Exec
 // passes (mantissa, scale) straight through. Anything else surfaces
 // 42804 — the analyzer should have caught it but the runtime guard
 // makes the failure mode crisp.
-func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *ExecError) {
+func encodeBTreeKeyForColumn(ctx *Context, v Datum, col *catalog.Column, pos int) ([]byte, *ExecError) {
 	// ARRAY column: catalog.Type carries the ELEMENT type in Name plus
 	// IsArray=true (codec_array.go), so every type predicate below would answer
 	// for the element and mis-claim the array. Route arrays to the array_ops
 	// (array_cmp) encoding BEFORE the scalar switch. M0119-0006.
 	if col.Type.IsArray {
-		return encodeArrayBTreeKey(v, col, pos)
+		return encodeArrayBTreeKey(ctx, v, col, pos)
+	}
+	// reg* family: the heap stores a 4-byte OID, but the KEY is the 8-byte
+	// unsigned oidcmp form (btree.EncodeInt8), identical to the oid arm
+	// (Decision 1 — the default opclass for every reg* type is oid_ops, and
+	// array_cmp compares reg* elements with oidcmp, arrayfuncs.c:3991). A name
+	// (probe literal, backfilled text) is resolved through the SAME
+	// regIdentifierInput the heap element path uses (codec_array.go:249-271,
+	// mirroring regproc.c parseDashOrOid then regclassin/regtypein/…): "-" → OID
+	// 0, pure-digit → numeric OID via oidin (never name resolution), else the
+	// per-type catalog lookup yielding the family's own miss SQLSTATEs (42P01
+	// regclass, 42704 regtype/regrole/regcollation, 42883 regproc/regprocedure,
+	// 42602 invalid-name-syntax). A nil ctx (fingerprint, pure-codec callers)
+	// resolves "-"/numeric and errors on a name rather than silently storing it
+	// — the encodeArrayElem nil-ctx contract (codec_array.go:263-265).
+	if isRegType(col.Type.Name) {
+		d, rerr := regIdentifierInput(v, col.Type.Name, ctx, pos)
+		if rerr != nil {
+			return nil, keyExecError(rerr, pos)
+		}
+		oid, rerr := regIdentifierOIDFromDatum(d, strings.ToLower(col.Type.Name))
+		if rerr != nil {
+			return nil, keyExecError(rerr, pos)
+		}
+		return btree.EncodeInt8(int64(oid)), nil
 	}
 	// Unknown-literal coercion (sibling of the seq-scan promoteCrossKind path):
 	// a probe key built from a quoted literal (`WHERE id = '1'`) arrives as
@@ -11056,6 +11113,18 @@ func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *Ex
 		return btree.EncodeFloat8(v.EnumSortOrder()), nil
 	}
 	return nil, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 cannot index column %q of type %q", col.Name, col.Type.Name)}
+}
+
+// keyExecError adapts the plain-error returns of regIdentifierInput /
+// regIdentifierOIDFromDatum (the wrong-kind datum case) to the *ExecError the
+// btree-key encoders return; an already-*ExecError miss (42P01 regclass miss,
+// 42704 regtype/regrole/regcollation miss, 42883 regproc/regprocedure miss,
+// 22003 out-of-range OID, 42602 invalid-name-syntax) keeps its SQLSTATE.
+func keyExecError(err error, pos int) *ExecError {
+	if ee, ok := err.(*ExecError); ok {
+		return ee
+	}
+	return &ExecError{Code: "42804", Pos: pos, Message: err.Error()}
 }
 
 // pgDeduplicateColNames replicates PostgreSQL's ChooseIndexColumnNames logic:
@@ -11250,6 +11319,10 @@ func isSupportedBTreeKeyType(name string) bool {
 		// int2 / oid / bool / bytea / time — M0119-0006 (btree_scalar_keys.go).
 		isInt2Type(name) || isOidType(name) || isBoolType(name) ||
 		isByteaType(name) || isTimeOfDayType(name) ||
+		// reg* family — M0119-0006 (reg* arm of encodeBTreeKeyForColumn): all six
+		// default to oid_ops, so their key is the same 8-byte unsigned oidcmp
+		// form, with NAME→OID resolved through regIdentifierInput on encode.
+		isRegType(name) ||
 		// timetz — M0119-0006, the two-part key (btree_scalar_keys.go).
 		isTimeTzType(name) ||
 		// interval — M0119-0006, the lossy 128-bit comparison span
@@ -11768,11 +11841,13 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 	argNames := make([]string, len(s.Args))
 	argModes := make([]string, len(s.Args))
 	argDefaults := make([]string, len(s.Args))
+	argTypeSchemas := make([]string, len(s.Args))
 	for i, a := range s.Args {
 		argTypes[i] = catalog.Type{
 			Name: routineArgTypeName(a.Type),
 			Args: append([]int64(nil), a.Type.Args...),
 		}
+		argTypeSchemas[i] = argTypeSchema(a.Type)
 		argNames[i] = a.Name
 		switch a.Mode {
 		case parser.FuncArgIn:
@@ -11822,13 +11897,14 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 		retTypeName += "[]"
 	}
 	r := &catalog.Routine{
-		DBOid:       catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid),
-		Schema:      schema,
-		Name:        s.Name.Name,
-		ArgNames:    argNames,
-		ArgTypes:    argTypes,
-		ArgModes:    argModes,
-		ArgDefaults: argDefaults,
+		DBOid:          catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid),
+		Schema:         schema,
+		Name:           s.Name.Name,
+		ArgNames:       argNames,
+		ArgTypes:       argTypes,
+		ArgTypeSchemas: argTypeSchemas,
+		ArgModes:       argModes,
+		ArgDefaults:    argDefaults,
 		ReturnType: catalog.Type{
 			// Mirror the argument-type path above: the parser stores an array
 			// return type as the base name (e.g. "integer") with IsArray set,
@@ -12505,6 +12581,7 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 	argNames := make([]string, len(s.Args))
 	argModes := make([]string, len(s.Args))
 	argDefaults := make([]string, len(s.Args))
+	argTypeSchemas := make([]string, len(s.Args))
 	// Validate: VARIADIC must be last; OUT can't follow default IN.
 	variadicSeen := false
 	defaultSeen := false
@@ -12529,6 +12606,7 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 			Name: routineArgTypeName(a.Type),
 			Args: append([]int64(nil), a.Type.Args...),
 		}
+		argTypeSchemas[i] = argTypeSchema(a.Type)
 		argNames[i] = a.Name
 		switch a.Mode {
 		case parser.FuncArgIn:
@@ -12597,6 +12675,7 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 		Name:            s.Name.Name,
 		ArgNames:        argNames,
 		ArgTypes:        argTypes,
+		ArgTypeSchemas:  argTypeSchemas,
 		ArgModes:        argModes,
 		ArgDefaults:     argDefaults,
 		Language:        lang,

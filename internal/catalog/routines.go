@@ -37,6 +37,14 @@ type Routine struct {
 	Name            string
 	ArgNames        []string // parallel to ArgTypes; empty string for positional-only args
 	ArgTypes        []Type
+	// ArgTypeSchemas is parallel to ArgTypes: the namespace each argument type
+	// was declared in at CREATE FUNCTION/PROCEDURE ("" when unknown — a BARE
+	// type name, whose owner schema goopg's user-type store cannot resolve, or a
+	// pre-73rd reloaded routine that predates this field). Consulted ONLY by the
+	// regprocedure output path (format_type_be arg-type qualification, deferral
+	// row 1342): Signature() compares ArgTypes[i].Name only, so overload
+	// resolution / ALTER/DROP lookups are unaffected.
+	ArgTypeSchemas   []string
 	ArgModes        []string // parallel to ArgTypes; "i"=IN, "o"=OUT, "b"=INOUT, "v"=VARIADIC; nil=all IN
 	ArgDefaults     []string // parallel to ArgTypes; raw SQL expression for DEFAULT, "" = no default
 	ReturnType      Type

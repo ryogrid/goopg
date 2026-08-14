@@ -3255,8 +3255,11 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       PG accepts (pre-existing in the scalar column, now inherited by arrays),
       and `decodeArrayKeyElemText` still refuses these element types although the
       "no heap image to agree with" half of that refusal is now gone.
-      Remaining for M0119-0006: `box`/`int4range` key encodings and
-      the whole-database (unscoped) pg_amcheck run — ledger rows 2026-08-10.
+      Remaining for M0119-0006: the whole-database (unscoped) pg_amcheck run —
+      ledger row 2026-08-10. (Corrected 2026-08-14 by the 83rd slice: the
+      "`box`/`int4range` key encodings" half was a misattribution — box has no PG
+      btree opclass at all, and int4range is blocked on the range value model;
+      the expression-key gate for both is now landed.)
       **28th slice (2026-08-12): the `HH:MM` half of that inherited input gap is
       closed.** A time-of-day with no seconds field is ordinary PG input
       (`DecodeTime` reads seconds only `if (*cp == ':')`, leaving `tm_sec = 0`),
@@ -3860,7 +3863,637 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       vet` clean; UNITS pre-commit PASS; `scripts/tpch-spotcheck.sh` PASS
       (Q12=2/Q13=35); pgbench smoke via the hook. 1 ledger row resolved (1302).
       Design `0119-0006-interval-typmod-at-input.md` + README row.
+      **65th slice (2026-08-14): `octet_length()`/`bit_length()` on a `bpchar`
+      answer from the declared width, not the trimmed heap image.** Closes the
+      deferral the 57th slice filed (ledger row 1314). The four render
+      boundaries the 57th closed already held the column's `catalog.Type`, but
+      these two are EXPRESSION evaluations — the argument's declared type isn't
+      threaded to the builtin, so `octet_length('ab'::char(10))` answered 2
+      where PG 18.3 says 10, and `bit_length` had NO case at all (fell to the
+      `evalStoredRoutineFuncCall` fallback → "function does not exist").
+      New `declaredBpcharTypmod(e planner.Expr)` (expr.go) recovers the width
+      from a `ColumnRef`'s `Type.Args[0]` (array guarded), a `CastExpr`'s
+      `Typmod`, or the first arg of `coalesce`/`greatest`/`least`/`nullif`
+      (missing/`<=0` → 1 for bare `char`); `octet_length` then answers
+      `len(catalog.PadBpchar(...))` (upstream `bpcharoctetlen` measures the
+      PADDED stored image — `'あ'::char(5)` = 7). **`bit_length` is the
+      OPPOSITE**: it resolves through the implicit bpchar→text cast, which
+      trims trailing blanks (`bpchartotext`), so `bit_length('ab'::char(10))` =
+      16, NOT 80 — the row's "2 where PG says 10 for both" was wrong for
+      bit_length. New `bit_length` case (bytea = `8*len(Bytes)`, string =
+      `8*len(String)`, else 42883); both functions gain the `length` sibling's
+      non-string `42883` guard with PG-exact messages. 19 oracle-pinned cells
+      (incl. bare `''::char` 1/0, multibyte, `::text` cast-override twins,
+      column + coalesce sources, and both 42883 guards), E2E-verified on a live
+      goopg (5533) vs PG 18.3. Item stays UNCHECKED (standing slice-by-slice
+      cluster). Gates: `go build ./internal/...` clean; UNITS pre-commit run —
+      EVERY package PASS except the pre-existing foreign
+      `TestRegIdentifierInputResolvesRegtypeName` (untracked reg_identifier WIP
+      from a prior loop; `catalog.TypeNameToOID`'s `default: return OIDText`
+      fallback defeats its regtypein 42704 miss-path — unrelated to this slice;
+      the committed tree builds/tests clean without it). 1 ledger row resolved
+      (1314). Design `0119-0006-bpchar-octet-bit-length.md` + README row.
+      **66th slice (2026-08-14): the reg* family and `cid` store as 4-byte OIDs,
+      and the regtypein 42704 miss-path fires.** Lands the untracked
+      `reg_identifier.go` WIP the 65th slice's gate note names as its only
+      failure (the `TypeNameToOID` OIDText fallback defeated the `oid != 0`
+      test, so `regIdentifierInput("no_such_type", "regtype")` resolved to
+      text's OID 25 instead of raising 42704). The heap codec's `"oid",
+      "regproc"` arms now cover `regprocedure`/`regclass`/`regtype`/`cid` (4-byte
+      LE, typalign 'i' — ledger row 1300's source); binary COPY shares the arm
+      (all their send/recv ARE oidsend/oidrecv upstream); the third physical
+      decoder `pgoDecodePhysicalValue` (internal/wal/pgoutput.go) gains the
+      same arm — before it read the 4-byte image through the varlena fall-through
+      (silent garbage), the sibling-pair gap this slice pins with
+      `pgoutput_reg_identifier_test.go`; and `coerceRowForConstraintChecks`
+      resolves a bare quoted name (`INSERT INTO t(r regclass) VALUES
+      ('mytable')`) to its OID via `regIdentifierInput` (regclassin/regtypein/
+      regprocin semantics, 42P01/42704/42883 on a miss) instead of handing the
+      numeric oid arm a name to misparse. regrole/regcollation stay varlena
+      (no name-resolution seam — see the 54th-slice ledger row). Gates:
+      `RALPH_PRECOMMIT_SCOPE=units` PASS (the regtype blocker is gone),
+      `TestPort_RegressSuite` PASS (346 s), `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2, Q13=35). Design: `docs/design/0119-0006-reg-identifier-family-storage.md`
+      + README row.
+      **67th slice (2026-08-14): `regrole`/`regcollation` store as 4-byte OIDs —
+      the object-identifier family is now complete.** The two members the 66th
+      slice excluded for lack of a role/collation name→OID seam now have one:
+      `regIdentifierInput` gains `regrole` (via `InMemory.RoleOID`; a qualified
+      name is 42602 invalid name syntax, a miss 42704 `role "%s" does not
+      exist`) and `regcollation` (via the new exported `InMemory.CollationOIDByName`,
+      builtin-then-user REUSING `builtinCollationOIDByName` + `UserCollationOIDByName`
+      — no third map copy; qualified names via `FindCollation`; a miss 42704
+      `collation "%s" for encoding "UTF8" does not exist`), routed from
+      `coerceRowForConstraintChecks`. All four physical-codec twins move to the
+      4-byte layout — heap codec (`codec.go`), binary COPY (`copy_binary.go`),
+      `pgoDecodePhysicalValue` (`internal/wal/pgoutput.go`). Also closed the
+      family-wide `parseDashOrOid` latent gap the 66th slice left (`'-'` →
+      InvalidOid 0, pure-digit → numeric OID, uint32 overflow → 22003), and
+      `appendTypedCellText` renders regrole/regcollation as names
+      (regroleout/regcollationout; OID 0 → "-", dangling → numeric) so SELECT
+      output stays `postgres`/`C` instead of regressing to raw OIDs. Ledger row
+      1302 resolved; a new row filed for the pre-existing family-wide TEXT/CSV
+      COPY numeric-OID gap (the 66th slice shipped the same for the other four
+      members — lossless cross-engine, a catalog-threading refactor). Gates:
+      `go build ./internal/...` clean; package suites PASS; pre-commit units
+      PASS; `TestPort_RegressSuite` PASS (245 s); `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2, Q13=35). Design:
+      `docs/design/0119-0006-regrole-regcollation-4byte-storage.md` + README row.
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
+      **68th slice (2026-08-14): TEXT/CSV COPY of a `reg*` column renders its
+      NAME, not its numeric OID — the family-wide gap ledger row 1303 named.**
+      `datumToCopyText` (shared by TEXT `EncodeCopyTextRow` and CSV
+      `EncodeCopyCsvRow`) gains a reg* guard routing any
+      `regproc`/`regprocedure`/`regclass`/`regtype`/`regrole`/`regcollation`
+      KindInt datum through the new exported `executor.RegOut` — the SAME
+      OID→name renderer `appendTypedCellText`'s six reg* cases now collapse
+      onto (one call; no duplication, Hard-won Rule #2), so COPY TO cannot
+      drift from SELECT and OID 0 → "-" for every family (fixing the pre-68th
+      SELECT regclass case that matched an OID-0 information_schema virtual
+      table for a nondeterministic name). The renderers gain `(cat
+      catalog.Catalog, qualify bool)`, threaded from `RunCopyTo` with `qualify
+      = !regObjectSchemaVisible(ctx, "public")` (the server's
+      `!publicSchemaVisible(getSetting)`). COPY FROM routes the decoded row
+      through `coerceRowForConstraintChecks` at `insertSourceRow` with a
+      reg*-only include filter (`isRegIdentifierTypeName` — the exact 6-name
+      family, numeric-only `oid`/`cid` excluded so the wider encode/align
+      lists are untouched), so a name field resolves to its OID via the 67th
+      slice's choke point with the family's OWN SQLSTATE unwrapped (42P01
+      regclass / 42704 regrole+collation — NOT the 22P04 wrap `copyTextToDatum`
+      would add), and `-`/pure-digit fields stay numeric OIDs via the 66th
+      slice's `parseDashOrOid`. New tests: `internal/executor/reg_copy_test.go`
+      (TO renders names across TEXT+CSV for all six incl. pg_class 1259 / role
+      alice / collation mycoll; OID 0 → "-"; KindString passthrough; FROM
+      resolves name/-/numeric; the include filter leaves a non-reg* column
+      untouched; the family predicate) + `internal/server/reg_copy_sibling_test.go`
+      (SELECT vs COPY byte-agreement at qualify false AND true). Ledger row
+      1303 resolved; 4 new rows filed (reg*out schema-qualification + quoting,
+      regclassout TOAST-relation name, array-of-reg* COPY FROM, the general
+      COPY-FROM 22P04 wrap). Gates: package suites PASS; pre-commit units
+      PASS; `TestPort_RegressSuite` PASS (340 s); `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2, Q13=35). Design:
+      `docs/design/0119-0006-reg-copy-text-name-rendering.md` + README row.
+      **69th slice (2026-08-14): `RegOut` schema-qualifies and quotes the names
+      the reg*out family emits — ledger row 1304 resolved.** New
+      `quoteQualifiedIdentifier` (expr.go, the ruleutils.c
+      `quote_qualified_identifier` port over the shared `pgQuoteIdent` guard)
+      + `regOutQualified` (reg_identifier.go) + `InMemory.RoleNameAtOID`
+      (catalog.go; distinguishes a real role from a dangling OID, since
+      `RoleNameForOID` renders both numerically). The RegOut
+      regclass/regproc/regrole/regcollation arms run resolved names through
+      the shared rule: a name NOT visible on the session's effective
+      search_path renders `schema.name`, always quote_identifier'd; pg_catalog
+      NEVER qualifies (implicitly visible); a builtin proc never qualifies;
+      regrole quote_identifiers the role name but a dangling OID falls to the
+      unquoted `%u`; regcollation quote_identifiers every name (`C` →
+      `"C"`, `default` → `"default"`). Measured against PG 18.3: `public`
+      itself is UNQUOTED (`public."My Table"`), 1259 stays `pg_class` at
+      qualify=true. COPY computes qualify as
+      `!regObjectSchemaVisible(ctx, "public")`, SELECT as
+      `!publicSchemaVisible(getSetting)`; `TestRegCopyAndSelectSiblingQualifyAgree`
+      strengthened to exercise a REAL user table so a disagreement between the
+      two computations is observable. regtype keeps its own format_type_be
+      path; regprocedure keeps its bare signature (deferred). New tests:
+      `internal/executor/reg_qualify_test.go` (qualify=true qualification,
+      pg_catalog-never-qualifies, identifier quoting, dangling-role numeric).
+      Ledger: row 1304 resolved; 3 new rows filed (regprocedure format_procedure
+      signature qualification, regcollation user-schema hardcoded "public",
+      mixed-case role-name catalog folding). Design:
+      `docs/design/0119-0006-regout-schema-qualification.md` + README row.
+      **70th slice (2026-08-14): regcollation qualifies with the collation's
+      ACTUAL schema — ledger row 1339 resolved.** The regcollation arm had
+      hardcoded `quoteQualifiedIdentifier("public", n)`, right for a
+      default-session (public) creation schema and wrong for any non-public
+      `CREATE COLLATION` schema. It now routes through the family's shared
+      `regOutQualified(im.SchemaNameForOID(uc.NamespaceOID), n, qualify)` —
+      `SchemaNameForOID` is the `get_namespace_name(collnamespace)` port, and
+      `regOutQualified` also closes the pg_catalog edge the literal could not
+      express (a collation created in pg_catalog is always visible → bare name,
+      where the old code emitted `public.<name>`); qualify=false behavior is
+      unchanged. Measured against a throwaway PG 18.3 oracle (port 5599):
+      `search_path=''` renders `ragout70.mycoll` / `ragout70."My Other Coll"`,
+      `search_path=ragout70` renders bare `mycoll`. Tests:
+      `TestRegCollationQualifiesWithActualSchema` (reg_qualify_test.go:
+      non-public plain + quoted-name collations, qualify=false bare, public
+      still `public.mycoll`) + `TestRegCopyAndSelectSiblingQualifyAgree`
+      extended with the non-public collation. Design:
+      `docs/design/0119-0006-regcollation-actual-schema-qualifier.md` + README
+      row (`0119-0006av`). Gates: package suites + pre-commit units +
+      `TestPort_RegressSuite` + `scripts/tpch-spotcheck.sh` (Q12=2, Q13=35)
+      all PASS.
+      **71st slice (2026-08-14): regprocedure qualifies only the routine NAME —
+      ledger row 1338 resolved.** The regprocedure arm returned the BARE
+      signature (`my_udf()` via `catalog.RegprocedureName`) where upstream
+      `regprocedureout` → `format_procedure_extended` (regproc.c:326)
+      schema-qualifies the routine NAME when it is off the session's effective
+      search_path and quote_identifiers the name in BOTH arms; the `format_type_be`
+      arglist is appended UNQUOTED. New `catalog.RegprocedureNameParts` resolves
+      an OID to the `(schema, name, arglist)` halves (refactored out of
+      `RegprocedureNameAndSchema`); the RegOut regprocedure arm routes them
+      through the family's shared `regOutQualified(schema, name, qualify)` and
+      appends the unquoted arglist. The `::regprocedure` cast path (expr.go) —
+      the sibling renderer — switched from the old `schema + "." + sig`
+      whole-signature prefix to the same form, fixing the on-path mixed-case
+      case too (`"MyFunc"(integer)` not `MyFunc(integer)`) and keeping the two
+      renderers byte-identical. Measured against a throwaway PG 18.3 oracle
+      (port 5599): default path renders `udf71(integer,text)` /
+      `"MyFunc71"(integer)` / `ragout71.other_func()` / `ragout71."Quoted
+      Other"(integer)`, `search_path=''` renders `public.udf71(integer,text)` /
+      `public."MyFunc71"(integer)`, `search_path=ragout71` renders bare
+      `other_func()` / `"Quoted Other"(integer)`, builtin `int4out(integer)`
+      never qualifies. Tests: `TestRegOutRegprocedureQualifiesNameOnly`,
+      `TestRegprocedureCastQuotesRoutineName`, sibling
+      `TestRegCopyAndSelectSiblingQualifyAgree` extended with a user routine.
+      Ledger: row 1338 resolved; 2 NEW rows filed (regprocin's name→OID input
+      still ToLower's quoted identifiers; the arglist's `format_type_be` does
+      not schema-qualify non-visible arg types). Design:
+      `docs/design/0119-0006-regprocedure-qualified-name.md` + README row
+      (`0119-0006aw`). Gates: package suites + pre-commit units +
+      `TestPort_RegressSuite` (242.3 s) + `scripts/tpch-spotcheck.sh`
+      (Q12=2, Q13=35) all PASS. Remaining open reg* deferrals: mixed-case
+      role-name catalog folding (row 1340), regprocin quoted-identifier input,
+      format_type_be arglist qualification.
+
+      **72nd slice (2026-08-14): regprocin quoted-identifier INPUT — ledger
+      row 1341 resolved.** The reg* name→OID input half now honors
+      double-quoted identifiers exactly as upstream
+      `stringToQualifiedNameList` → `SplitIdentifierString` (varlena.c:3581)
+      does: a `"…"` segment keeps its case with `""`→`"` collapse, an unquoted
+      segment is downcased, whitespace around segments is skipped, `.` inside
+      quotes is not a separator, and a syntax error (mismatched quote, empty
+      segment) raises 42602. Before, every reg* input arm ran the whole
+      candidate through `strings.ToLower` + a dumb first-dot
+      `splitQualifiedTable`, so `'"MyFunc"'::regproc` reached LookupByName with
+      literal quotes → 42883 (PG 18.3 resolves it). New shared parser
+      `splitRegIdentifiers`/`splitRegQualifiedName` in reg_identifier.go feeds
+      every arm of `regIdentifierInput` (regclass/regtype/regproc/regrole/
+      regcollation) AND the expr.go siblings — `::regproc`/`::regprocedure`
+      cast, `::regclass` cast, `regclass()` function-call, `pg_get_functiondef`
+      name fallback — the input counterpart of the 69th/70th/71st slices'
+      quote-emission (sibling renderers must agree). Two faithful addenda found
+      while implementing: `regprocedureNamePart` strips the `(…)` arg list
+      (parseNameAndArgTypes' leading scan) so `'"MyFunc"(integer)'::regprocedure`
+      does not regress to 42602; and the parser's downcasting now makes
+      `'C'::regcollation` FAIL with 42704 exactly like PG 18.3 (only `'"C"'`
+      resolves to 950 — the collation store is case-sensitive), updating the
+      old divergent test. Miss messages match PG: regclass/regrole/regcollation/
+      regtype print the STRIPPED parsed name (NameListToString), regproc/
+      regprocedure keep the RAW input. Tests: new
+      `internal/executor/reg_input_quoted_test.go` (quoted mixed-case routine
+      on both cast paths, dotted quoted schema, quote-quote collapse,
+      family siblings, 42602 syntax errors on both paths, coercion route,
+      stripped-vs-raw miss messages). Ledger: row 1341 resolved. Design:
+      `docs/design/0119-0006-reg-input-quoted-identifiers.md` + README row
+      (`0119-0006ax`). Gates: package suites + pre-commit units +
+      `TestPort_RegressSuite` (237.3 s on the confirming run) +
+      `scripts/tpch-spotcheck.sh` (Q12=2, Q13=35). Gate note: the FIRST
+      TestPort_RegressSuite attempt FAILed at its 600 s timeout — the known
+      intermittent "suite wedge" (documented in regress_wedge_probe_test.go's
+      header) hit the `returning` case: `CREATE FUNCTION … BEGIN ATOMIC
+      RETURNING` parked in `walLogCreateRoutine → syncRoutineToCatalogHeap →
+      mirrorProcCatalogFiles → … → (*Pool).Pin → pinLoad` waiting on the buffer
+      pool RWMutex write lock while the WAL checkpointer waited on the same
+      pool's RLock in `flushBatch` (FlushAllPaced) — so NO checkpoint could
+      run, WAL accumulated to 7.4 GB, and the subsequent cluster-restart's
+      crash recovery could not finish inside the 20 s start timeout, turning
+      one wedged case into a whole-suite FAIL. Completely disjoint from this
+      slice (storage/WAL buffer-pool lock path; the slice touched only reg*
+      input arms). Confirmed environmental: the clean re-run PASSed in 237.3 s
+      (vs 242.3 s last slice), and the regproc regress case PASSes standalone
+      in 6.2 s. Bundle preserved at tmp/regress-wedge/returning/ (goroutine
+      dump, pg_stat_activity, server-log-tail). Remaining open reg* deferrals:
+      mixed-case role-name catalog folding (row 1340) plus the six the 73rd
+      slice filed below (bare arg-type schema resolution, quoted-name case loss,
+      catalog builtin-array alias gap, ArgTypeDisplayAlias switch gaps,
+      empty-schema visibility proxy, regproc/regprocedure INPUT DB-scoping bug).
+
+      **73rd slice (2026-08-14): regprocedure arglist schema-qualifies
+      non-visible arg types — ledger row 1342 resolved.** The arglist now
+      reproduces `format_type_be`'s per-arg qualification:
+      `format_procedure_extended` (regproc.c:326) passes each arg type through
+      `format_type_be` (format_type.c:314), which emits `schema.typename` when
+      the type's namespace is off the session's effective search_path and the
+      bare alias otherwise. goopg captured the missing half at CREATE — new
+      `Routine.ArgTypeSchemas` (parallel to `ArgTypes`,
+      internal/catalog/routines.go) records each arg type's EXPLICIT schema via
+      `argTypeSchema` returning the parser's `ColumnType.Schema` verbatim
+      (operators_ddl.go, both CREATE FUNCTION and CREATE PROCEDURE), and rides
+      the existing proargdefaults JSON round-trip so pre-73rd data dirs reload
+      with nil → "" → bare (backward compatible). The render half:
+      `catalog.RegprocedureNameParts` now returns `[]RegprocArg{Name, Schema}`
+      per arg (builtin path stamps `pg_catalog`; user path reads
+      `ArgTypeSchemas[i]` nil-defensively), and the executor-side
+      `regprocedureArglist` (reg_identifier.go) aliases builtin/pg_catalog args
+      through the exported `catalog.ArgTypeDisplayAlias`, schema-qualifies a
+      non-visible user arg via `quoteQualifiedIdentifier` with the `[]` array
+      suffix split/re-appended (`offpath."mytype[]"` never happens; a user-path
+      builtin array aliases `integer[]`), and leaves a BARE-name user arg bare
+      (owner schema unresolvable — deferral). The session visibility predicate
+      threads as a variadic `visible` param through `RegOutArgVisible` /
+      `appendTypedCellText` (SELECT simple-query) / `EncodeCopyTextRow` /
+      `EncodeCopyCsvRow` (COPY TO) and the `::regprocedure` cast sibling in
+      expr.go — all four paths agree (Hard-won Rule #2). Measured against a
+      fresh goopg cluster + PG 18.3 oracle: `f_offarg(offpath.mytype)` (was
+      `f_offarg(mytype)`), `f_offarr(offpath.mytype[])`, `f_offrow(offpath.ct)`,
+      `f_onarg(onpath.mytype)` (name + off-path arg both qualify),
+      `f_builtin(integer)` stays bare, a user type NAMED `int` quotes like PG
+      (`offpath."int"`), and the cast path additionally qualifies the NAME
+      (`offpath.f_offboth(offpath.mytype)`) where the wire path's name stays bare
+      via the documented 69th-slice proxy. One measured limitation filed as a
+      deferral: `SET search_path = public, offpath` cannot make the `offpath`
+      arg render bare yet (searchPathSchemas' LookupTable existence proxy never
+      sees an empty schema). Tests:
+      `TestRegOutRegprocedureQualifiesArgTypes` (reg_qualify_test.go),
+      `TestRegprocedureCastArgTypesQualify` +
+      `TestCreateFunctionCapturesArgTypeSchemas` (regoperator_schema_qualify_test.go),
+      sibling `TestRegCopyAndSelectSiblingArgQualifyAgree`
+      (reg_copy_sibling_test.go). Ledger: row 1342 resolved; 6 NEW rows filed
+      (bare-name arg-type schema resolution, quoted-name case loss at CREATE,
+      catalog builtin-array alias gap, ArgTypeDisplayAlias switch gaps,
+      empty-schema visibility proxy, regproc/regprocedure INPUT DB-scoping bug).
+      Design: `docs/design/0119-0006-regprocedure-argtype-schema-qualify.md` +
+      README row. Gates: package suites + pre-commit units +
+      `TestPort_RegressSuite` (239.7 s) + `scripts/tpch-spotcheck.sh`
+      (Q12=2, Q13=35) all PASS.
+      **74th slice (2026-08-14): `ArgTypeDisplayAlias` becomes a faithful
+      `format_type_be` port + the catalog bare arglist builder aliases builtin
+      arrays — ledger rows 1345 + 1346 resolved.** Two siblings diverged from
+      PG 18.3 on the regprocedure arglist. (a) The shared alias table had no
+      `varbit → bit varying` arm (the one missing VARBITOID special-case switch
+      entry — `bit`/`interval`/`json`/`numeric` are identities, every other
+      case was already present) and no keyword-quoting path at all, so the
+      single-byte `char` (CHAROID, distinct from bpchar/1042) rendered bare
+      `char` where `format_type_be`'s DEFAULT path runs
+      `quote_qualified_identifier` and `quote_identifier` wraps the lexer
+      keyword → `"char"`. (b) The catalog BARE builder `formatProcedureArglist`
+      (behind `RegprocedureName`/`RegprocedureNameAndSchema`) passed the WHOLE
+      stored name — baked-in `[]` array suffix included — to the alias, so
+      `int[]` found no switch case and rendered `f(int[])` where the executor's
+      pg-faithful `regprocedureArglist` already emitted `f(integer[])`: the two
+      sibling renderers diverged on a builtin array arg (Hard-won Rule #2).
+      Fix: two new arms in `catalog.ArgTypeDisplayAlias` (`varbit → bit
+      varying`, `char → "char"`) and a package-local `argListTypeDisplay`
+      helper (catalog cannot import executor) that splits a `[]` suffix, aliases
+      the ELEMENT, re-appends — mirroring executor's `splitArraySuffix`. The
+      executor renderer needed NO change; it picks up the new arms via the
+      shared alias. Measured vs a throwaway PG 18.3 oracle (port 5533) on the
+      wire path (`oid::regprocedure`): `f_varbit(bit varying)`, `f_char("char")`,
+      `f_chararr("char"[])`, `f_intarr(integer[])` now byte-identical; the two
+      siblings agree on `integer[],bit varying,"char","char"[],double
+      precision[],text`. Two FRESH deferrals filed (rows 1349/1350, out of
+      scope): multi-word type names in CREATE FUNCTION args store the LAST word
+      (`bit varying`→`varying`, `timestamp with time zone` is a syntax error) —
+      so `f_vchar(bit varying)` renders `f_vchar(varying)` where PG keeps
+      `bit varying` — and a reg* → text/name/varchar cast on a STRING-LITERAL
+      source renders the raw OID (`'f_varbit(varbit)'::regprocedure::text` →
+      `131072`); regtype/regrole/regcollation and non-literal sources are
+      unaffected. Tests: `TestArgTypeDisplayAliasFormatTypeBePort` +
+      `TestRegprocedureName` array/varbit/char cases (catalog),
+      `TestRegOutRegprocedureArgTypesVarbitChar` +
+      `TestRegprocedureArglistCatalogAndExecutorAgree` (executor).
+      Design: `docs/design/0119-0006-argtype-alias-format-type-be-port.md` +
+      README row `0119-0006az`. Gates: package suites (catalog 0.063s,
+      executor 6.103s, server 55.151s) + pre-commit units +
+      `TestPort_RegressSuite` + `scripts/tpch-spotcheck.sh` (Q12=2, Q13=35) all
+      PASS.
+      **75th slice (2026-08-14): regproc/regprocedure NAME→OID INPUT is scoped
+      to the connection's database — deferral row 1348 resolved.** The reg*
+      INPUT half resolved every routine name through `Routines.LookupByName` with
+      NO dbOid, so it always resolved `DefaultDBOid`. The 4e-series routine
+      registry (M0122-0007 slice 4e) keys routines by `(dbOid, schema, name)`;
+      a LIVE-created routine (registered under its real dbOid) was invisible by
+      name from a distinct-dbOid connection — and worse, a same-named routine in
+      ANOTHER database resolved THAT routine's OID: a silent cross-dbOid leak
+      (`'shared_fn'::regproc` from db2 returned DefaultDBOid's 131072 instead of
+      its own 131073). An initdb-reloaded routine (DefaultDBOid) still resolved,
+      which hid the bug on default-database connections. Fix: both sibling paths
+      (Hard-won Rule #2) thread `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)`
+      into `LookupByName` — `regIdentifierInput`'s regproc/regprocedure arm
+      (internal/executor/reg_identifier.go, feeds COPY FROM coercion + constraint
+      checks) and expr.go's `::regproc`/`::regprocedure` cast arm (feeds
+      `'name'::regproc` in expressions) — mirroring the regclass arm's existing
+      connDBOid. Builtins still resolve via the global `LookupBuiltinProc`
+      pg_proc index (pg_catalog implicitly visible in every database, matching
+      PG). Tests: `TestRegProcInputScopedToConnectionDBOid`,
+      `TestRegProcInputSchemaQualifiedScopedToConnectionDBOid`,
+      `TestRegProcInputDistinctDBOidMissIsNotDefaultLeak`
+      (internal/executor/reg_identifier_dbid_scoping_test.go) — all FAIL pre-fix
+      (the first two leaked the wrong OID, the third resolved instead of raising
+      42883) and PASS post-fix. Live E2E on a throwaway goopg (5533) +
+      byte-identical PG 18.3 oracle (5534): db2's `'shared_fn'::regproc` → 42883
+      before its own routine exists, then each database resolves its own OID
+      (131072 vs 131073). Design:
+      `docs/design/0119-0006-regproc-input-dbid-scoping.md` + README row
+      `0119-0006ba`. Gates: package suites + pre-commit units +
+      `TestPort_RegressSuite` + `scripts/tpch-spotcheck.sh` (Q12=2, Q13=35) all
+      PASS.
+      **76th slice (2026-08-14): multi-word built-in type names in CREATE
+      FUNCTION args are captured faithfully — deferral row 1349 (first half)
+      resolved.** `parseArgNameAndType`'s `ident ident` heuristic read the FIRST
+      word of a multi-word built-in type as an ARG NAME: `f(bit varying)` stored
+      arg name="bit" type="varying" (regprocedure arglist rendered `f(varying)`
+      where PG 18.3 renders `f(bit varying)`), `double precision`→`f(precision)`,
+      and `timestamp with time zone` — whose continuation `with` is the KwWith
+      keyword — was a SYNTAX ERROR in CREATE FUNCTION args. Fix: new
+      `isMultiWordTypeStart(nameTok, next Token)` (internal/parser/function.go)
+      recognizes a multi-word-type leader (double→precision, character→varying,
+      bit→varying, timestamp/time→with|without time zone,
+      interval→year|month|day|hour|minute|second) by its NEXT token and rewinds
+      `p.idx = save` so `parseColumnType` consumes the whole spelling — the same
+      canonical collapse CREATE TABLE columns already used (`bit varying`→`varbit`,
+      `double precision`→`float8`, `timestamp with time zone`→`timestamptz`,
+      `time with time zone`→`timetz`, `interval year to month`→`interval`+packed
+      typmod); the arg gets `Name=""` (bare, unnamed) exactly as if the canonical
+      single-word name had been written. Output side needed NO change: the
+      executor's `regprocedureArglist` renders the canonical name through the
+      shared `catalog.ArgTypeDisplayAlias` (74th slice), mapping varbit→bit
+      varying / float8→double precision / timestamptz→timestamp with time zone /
+      timetz→time with time zone, so the stored canonical name round-trips to
+      the user's SQL spelling byte-identically. Verified live vs a throwaway PG
+      18.3 oracle (5534): all seven multi-word CREATE FUNCTIONs succeed and
+      `oid::regprocedure` renders byte-identical signatures (`f_vchar(bit
+      varying)`, `f_cvarchar(character varying)`, `f_dp(double precision)`,
+      `f_ts(timestamp with time zone)`, `f_t(time with time zone)`,
+      `f_int(interval year to month)`, named `f_named(a bit, b double
+      precision)`); the created functions are callable with matching arg types
+      and DROP FUNCTION by the multi-word signature works on both engines.
+      Test: `TestParseCreateFunctionMultiWordArgTypes` (parser). Design:
+      `docs/design/0119-0006-multiword-arg-type-capture.md` + README row
+      `0119-0006bb`. Gates: package suites + pre-commit units +
+      `TestPort_RegressSuite` + `scripts/tpch-spotcheck.sh` (Q12=2, Q13=35) all
+      PASS. Re-filed as row 1351: the arglist still carries only the arg's NAME,
+      so a bare `char` arg is indistinguishable from OID-18 `"char"`, and char
+      varying/nchar/national character [varying] are not yet accepted as bare
+      types.
+
+      **77th slice (2026-08-14): SQL national-char aliases in CREATE FUNCTION
+      args + bare-`character` column typmod — deferral row 1351 (first half)
+      resolved.** `char varying` / `nchar [varying]` / `national character
+      [varying]` / `national char [varying]` — PG's aliases of `character` /
+      `character varying` (gram.y `character` nonterminal: `CHARACTER|CHAR_P|NCHAR
+      opt_varying`) — are now accepted as bare types in CREATE FUNCTION args.
+      `isMultiWordTypeStart` (internal/parser/function.go) treats
+      `character`/`char`/`nchar`/`national` as multi-word-type leaders whenever
+      the NEXT token is an identifier (a following `varying` continues the type;
+      a following OTHER identifier is PG's syntax-error shape `f(char int)` — we
+      still rewind and let `parseColumnType` consume the leading word, and the
+      dangling ident errors out exactly as on PG). `parseMultiWordTypeName`
+      (internal/parser/ddl.go) collapses every spelling to the canonical
+      `character`/`varchar` (`nchar`→`character`, `national character
+      [varying]`→`character [varying]`, `char varying`→`varchar`), so the
+      executor's `regprocedureArglist` renders through the shared
+      `catalog.ArgTypeDisplayAlias` byte-identically to PG — the output side
+      needs NO change. Along the way it fixes a pre-existing goopg divergence
+      surfaced by the same family: `parseColumnType`'s grammar-default length-1
+      stamp (gram.y `CharacterWithoutLength` → bpchar typmod 1) covered only bare
+      `char`, so a bare `character`/`nchar`/`national character` COLUMN was
+      `character(-1)` where PG 18.3 makes it `character(1)` — the stamp now fires
+      for `character` too (`bpchar` spelled directly and the cast path are
+      deliberately untouched; the live `'cd'::nchar(3)` → `[cd]` padding probe
+      agrees on both engines). Verified live vs a throwaway PG 18.3 oracle
+      (5534): `CREATE TABLE t (c char, d character, e nchar, f char varying,
+      g national character, h nchar(5), i national character varying(10))` →
+      `format_type` yields `character(1)/character(1)/character(1)/character
+      varying/character(1)/character(5)/character varying(10)` on BOTH engines;
+      and all ten alias-spelling CREATE FUNCTIONs render byte-identical
+      `oid::regprocedure` output (`f_charvar(character varying)`,
+      `f_nchar(character)`, `f_ncharvar(character varying)`, `f_nchar5(character)`,
+      `f_natchar(character)`, `f_natchar2(character)`,
+      `f_natcharvar(character varying)`, `f_natcharvar2(character varying)`,
+      `f_charvar_named(character varying,character varying)`,
+      `f_named(character,character varying)`). Test:
+      `TestParseCreateFunctionCharFamilyArgTypes` (parser; 11 success + 4
+      syntax-error cases). Design:
+      `docs/design/0119-0006-char-family-arg-aliases.md` + README row
+      `0119-0006bc`. Ledger row 1351 updated: first half resolved, OID-per-arg
+      half re-filed. Gates: package suites + pre-commit units +
+      `scripts/tpch-spotcheck.sh` (Q12=2, Q13=35) all PASS. STILL OPEN (row 1351
+      second half): the arglist carries only the arg's NAME, so a bare `char`
+      arg remains indistinguishable from OID-18 `"char"` and renders `"char"`
+      where PG renders `character` — an OID-per-arg catalog-representation
+      change. Unrelated pre-existing note observed during probing (not
+      introduced here): `CREATE OR REPLACE FUNCTION` of a pre-existing routine
+      can hit "catalog update: freshly extended page did not accept tuple" when
+      the pg_proc heap page is full — a pg_proc heap-page-extension limitation.
+
+      **78th slice (2026-08-14): reg* → text/varchar/name/bpchar cast renders
+      the name — deferral row 1350 resolved.** A reg* datum is a plain KindInt
+      holding the object OID, so casting one to a string type rendered the raw
+      OID, not the name: `'pg_type'::regclass::text` → `1247` (PG `pg_type`),
+      `'f_varbit(varbit)'::regprocedure::text` → `131072` (PG `f_varbit(bit
+      varying)`), `'f_varbit'::regproc::text` → `131072` (PG `f_varbit`), and
+      `'pg_type'::regclass::name` passed the KindInt through unchanged. The
+      `::reg*` INPUT half resolved correctly; only the downstream string cast
+      rendered the numeric datum. `evalCastTyped` (internal/executor/expr.go) —
+      which has the source-type name + `*Context` that `evalCast`'s frozen
+      signature lacks — now guards: when sourceType ∈ {regclass,regproc,
+      regprocedure,regtype,regrole,regcollation} and targetType ∈ {text,varchar,
+      name,bpchar} and d.Kind==KindInt, it returns `RegOut(sourceType, oid,
+      ctx.Catalog, qualify)` — the 68th slice's shared SELECT+COPY renderer, so
+      the cast is the missing third sibling (pattern_sibling_paths_must_agree) —
+      `qualify` mirroring the SELECT path's `!publicSchemaVisible` (no per-schema
+      qualification, row 1347 stays open); `char` (CHAROID) is excluded
+      (charin/charout first-byte semantics). Because the planner stamps
+      `CastExpr.SourceType` from the operand type, this also fixes the unprobed
+      `regcol::text` column shape. The regclass arm of `regOut` gained dbOid
+      scoping (a `dbOid ...uint32` variadic through `RegOut`/`RegOutArgVisible`/
+      `regOut` → `LookupTableByOID`/`LookupIndexByOID`) so a regclass cast never
+      renders ANOTHER database's relation name — the connDBOid scoping the
+      `oid::regclass` CastExpr arm already threads (M0122-0007 4e follow-up 33);
+      existing SELECT/COPY callers pass no dbOid and keep DefaultDBOid. Tests
+      `internal/executor/reg_cast_to_text_test.go` (SQL battery over six sources
+      × 4 targets, a 24-cell direct KindInt matrix, the `regcol::text` shape,
+      OID-0→`-`/dangling→numeric, and a cast==SELECT sibling-agreement test),
+      mutation-checked. Design `docs/design/0119-0006-reg-cast-to-text-name-rendering.md`
+      + README row `0119-0006bd`. Gates: executor package + pre-commit units +
+      `scripts/tpch-spotcheck.sh` (Q12=2, Q13=35) + `TestPort_RegressSuite/oid`
+      PASS.
+
+      **79th slice (2026-08-14): toast-relation OIDs render their `pg_toast`
+      name through the shared `RegOut` — deferral row 1305 resolved.** The
+      `regclass` arm of `regOut` (`internal/executor/reg_identifier.go`) resolved
+      ordinary relations/indexes by OID but fell through to the numeric fallback
+      for a synthetic TOAST relation/index OID (parent OID + 100M / +200M),
+      which live only in the virtual pg_class builder, never
+      `c.tables`/`c.indexes`. The `oid::regclass` CastExpr arm (`expr.go:826-828`)
+      already resolved them via `InMemory.ToastRelName`; SELECT
+      (`appendTypedCellText`) and COPY (`datumToCopyText`) — and the 78th slice's
+      `reg*→text` cast — did not, so a toast OID rendered its `pg_toast` name in
+      the cast but its numeric OID in SELECT/COPY. Fix: the regclass arm now
+      falls through to `im.ToastRelName(oid, dbOid...)` after both real lookups
+      miss, returning the already-schema-qualified `pg_toast.pg_toast_<oid>[_index]`
+      name verbatim (never routed through `regOutQualified` — `pg_toast` is off
+      every search_path, so qualification is irrelevant), byte-identical to the
+      cast arm. Because the fix sits inside shared `RegOut`, all three callers
+      inherit it (pattern_sibling_paths_must_agree). Tests:
+      `TestRegOutToastrelnameRendersSchemaQualified` (`reg_qualify_test.go`),
+      toast rows in `TestRegCopyAndSelectSiblingRenderersAgree`
+      (`reg_copy_sibling_test.go`), and `TestRegCastToTextDirectKindIntMatrix`
+      (`reg_cast_to_text_test.go`), all mutation-checked. Gates: executor+server
+      packages PASS; `scripts/tpch-spotcheck.sh` (Q12=2, Q13=35) +
+      `TestPort_RegressSuite` (0 FAIL) PASS.
+
+      **80th slice (2026-08-14): array-of-`reg*` columns store 4-byte OID
+      elements, not text — deferral row 1306 resolved.** A `regclass[]` (and
+      `regtype[]`/`regprocedure[]`/`regrole[]`/`regcollation[]`/`regproc[]`) column
+      stored its elements as varlena text (`elemtype=25` in the array blob header)
+      where PG stores a 4-byte OID per element resolved through the element type's
+      input function (`array_in` → `ReadArrayStr` → `InputFunctionCallSafe`,
+      arrayfuncs.c) — the descriptor-vs-blob disagreement the scalar reg* family
+      (66th–68th slices) fixed for non-array columns. Two seams:
+      `coerceRowForConstraintChecks` skips `col.Type.IsArray`
+      (`operators_storage.go:2305`), so the 68th-slice name→OID route never ran;
+      and `pgarray.ElemTypeInfo` had no reg* arms, so `encodeArrayValuePG` fell to
+      text-element storage. Sibling-triplet fix: `ElemTypeInfo` gains the six
+      `isRegIdentifierTypeName` members (fixed 4-byte, align 'i', varlena=false);
+      `encodeArrayElem` gains a reg* case resolving name→OID via the shared
+      `regIdentifierInput` (ctx+pos threaded through the new `EncodeRowPGCtx`/
+      `encodeValuePGCtx`/`encodeArrayValuePGCtx` ctx-carrying siblings; the no-ctx
+      wrappers stay for non-writer callers and error on a name, never silently
+      store it); and `DecodeElemStyled` renders OID→name via the executor-threaded
+      `OutputStyle.RegOut` value (pgarray stays leaf — a value param, not an
+      import). Correction to row 1306's premise: the non-indexed defect was silent
+      TEXT storage, not a numeric-parse error — the "errors" symptom was the
+      INDEXED path only (filed below). Tests: `internal/pgarray/reg_elem_test.go` +
+      `internal/executor/reg_array_elem_test.go` (elemtype/size/align, name→OID
+      SQLSTATEs, OID 0 → `-`, sibling agreement), mutation-checked. Gates:
+      pgarray+executor packages, pre-commit units, `scripts/tpch-spotcheck.sh`
+      (Q12=2, Q13=35), `TestPort_RegressSuite` all PASS. Two new deferral rows:
+      btree array-key 0A000 (indexed `regclass[]`), WAL pgoutput reg*[] numeric
+      rendering. Design `0119-0006-reg-array-element-fidelity.md`.
+      **81st slice (2026-08-14): btree `reg*[]` (and scalar `reg*`) keys encode as
+      8-byte oidcmp — deferral row 1352 resolved.** `CREATE INDEX` over a `reg*[]`
+      column (and over a scalar `reg*` column — the row's "scalar arm already
+      exists" premise was wrong; the 66th slice was heap-only, so scalar regclass/
+      regtype/regprocedure/regrole/regcollation indexed columns ALSO 0A000'd today)
+      raised `0A000` because `encodeBTreeKeyForColumn` had no reg* arm. Two
+      corrections drive the design: the KEY is the **8-byte unsigned oidcmp** form
+      (`btree.EncodeInt8`), NOT 4 bytes — every reg* type's default opclass is
+      `oid_ops` and `array_cmp` compares elements with unsigned `oidcmp`
+      (arrayfuncs.c:3991); and `regproc` joins the reg* family (`isRegType`, six
+      members) leaving `isOidType` oid-only, so a regproc name element resolves
+      instead of 22P02. Name→OID via `regIdentifierInput` (`parseDashOrOid` first,
+      then per-type catalog miss SQLSTATEs 42P01/42704/42883/42602/22003 preserved
+      via `keyExecError`), `ctx`+`pos` threaded through `encodeBTreeKeyForColumn`/
+      `encodeArrayBTreeKey` with a nil-ctx numeric-passthrough contract for the
+      fingerprint path. Decode twin lands together: `arrayKeyElemRenderer` reg* arm
+      (OID→name via `st.RegOut`, mirroring `DecodeElemStyled`), which makes reg*[]
+      decodable automatically (no `btree_key_decodable.go` edit) so index-only scans
+      activate. `isSupportedBTreeKeyType` admits `isRegType` (the CREATE INDEX gate
+      that actually fired the 0A000). Tests: six reg* rows in `scalarKeyCases`/
+      `indexKeyTypeCases`/`arrayKeyDecodeCases` + reg*[] name-literal IOS cases +
+      `TestScalarRegIndexDDLMaintains` (E2E build+maintain), mutation-checked.
+      Gates: pre-commit units + `scripts/tpch-spotcheck.sh` (Q12=2, Q13=35) PASS.
+      Design `0119-0006-btree-reg-array-key-oidcmp.md`.
+      **82nd slice (2026-08-14): pgoutput renders reg* column values as names,
+      not numeric OIDs — deferral row 1353 resolved.** The logical-replication
+      `pgoutput` decoder emitted a reg* value as its numeric OID (`1259` /
+      `{1259}`) where PG 18.3's TEXT-mode pgoutput emits the NAME (`pg_class` /
+      `{pg_class}`). Root cause was a send/out conflation: `logicalrep_write_typ`
+      (proto.c:848) serializes text mode via `OidOutputFunctionCall(typclass->typoutput, …)`
+      = `regclassout` → name (regproc.c:940); the 4-byte-OID form is BINARY mode's
+      `typsend`. goopg's text-only `pgoDecodePhysicalValue` had shipped the binary
+      image — and its SCALAR arm too (the six reg* types rode the oid/cid/xid arm,
+      justified by a `regclasssend` comment), not just the array arm the row named.
+      Fix threads `executor.RegOut` (the existing reg*out port, single source of
+      truth) into the wal layer as a leaf closure — `CatalogSnapshot.RegOut
+      func(typeName, oid) string` (nil = numeric fallback), bound by the publisher
+      walsender via new exported `executor.RegOutRenderer(im, false)` (server→
+      executor→wal; wal→executor is a CYCLE so the renderer is a value, not an
+      import). `oid`/`cid`/`xid` stay numeric (no name form). Both twins: scalar
+      reg* arm split out of the oid arm, array arm `RenderText`→`RenderTextStyled(…,
+      OutputStyle{RegOut})`. Tests reworked + new (`TestPgoutputSnapshotRegOutRendererWired`
+      vs a real catalog); mutation-checked. Gates: `go test ./internal/wal/
+      ./internal/server/`, pre-commit units, `scripts/tpch-spotcheck.sh` (Q12=2,
+      Q13=35) PASS. New deferral row: off-path schema qualification (qualify=false
+      renders a bare non-public-schema regclass) + cross-DB regclass resolution (no
+      dbOid bound). Design `0119-0006-pgoutput-reg-names.md`.
+      **83rd slice (2026-08-14): expression-key btree type gate — box/int4range
+      expressions no longer silently build.** `CREATE INDEX ON t ((box_col))` /
+      `((int4range_col))` bypassed the named-column `isSupportedBTreeKeyType` gate
+      (`createBTreeIndex` skipped `name == ""` columns) and silently built a B-tree
+      index encoding the value's TEXT in varchar order (`encodeArbiterExprKey`'s
+      KindString arm, operators_upsert.go:1649). PG 18.3 rejects a btree index on a
+      box expression with 42704 (box has no btree opclass — `GetDefaultOpClass`→
+      InvalidOid, indexcmds.c:2270-2277); int4range PG accepts via `range_ops`
+      (binary-coercible-to-anyrange, pg_opclass.dat:230) but goopg has no range
+      value model, so it must reject honestly. The expression-key branch now applies
+      the SAME `isSupportedBTreeKeyType` + enum check as the named-column branch,
+      returning the SAME 0A000 (the 42704 polish for box is deferred). Resolves via
+      `planner.ResolveIndexPredicate` + `planner.ExprResultType` (the build path's
+      own pair); gates only when both resolve, so float/enum/text expression indexes
+      are untouched. Gates: `TestExpressionIndexKeyRejectsBoxAndInt4Range` +
+      `TestExpressionIndexKeyStillAllowsFloatEnumText` (mutation-witnessed);
+      executor/planner/btree packages, pre-commit units, tpch-spotcheck (Q12=2,
+      Q13=35) PASS. This closes the "box/int4range key encodings" half of the
+      remaining-scope note below; box is NOT a valid key target (no PG btree opclass)
+      and int4range is blocked on the range value model (see the 2026-08-14 ledger
+      row).
+      **84th slice (2026-08-14): pgoutput renders an off-path reg* value
+      schema-qualified — deferral row 1354 claim 1 resolved.** The publisher
+      walsender bound the pgoutput reg* renderer with a fixed `qualify=false`
+      (`logicalwalsender.go:75`), so a regclass in a non-public schema rendered its
+      BARE name where PG 18.3's `regclassout` schema-qualifies via `RelationIsVisible`
+      (regproc.c:973-981 → namespace.c) — the object's schema is qualified iff NOT on
+      the effective search_path (a TERNARY visibility rule, not "always qualify
+      non-public"). The fix threads a per-schema visibility predicate instead of the
+      fixed flag: `regOut`'s switch body moved to `regOutShared(..., qualify
+      func(schema string) bool, regtypeQualify bool, argVisible, dbOid...)`, with
+      `RegOut`/`RegOutArgVisible` as byte-identical wrappers (constant predicate) so
+      the SELECT/COPY/cast siblings are provably unchanged; new
+      `RegOutRendererVisible(cat, visible, dbOid...)` drives the five
+      `regOutQualified` call sites (regclass table/index, regproc user, regprocedure,
+      regcollation user) with `qualify(schema)`. The walsender binds
+      `RegOutRendererVisible(im, func(s){s==""||s=="pg_catalog"||s=="public"})` —
+      the publisher never SETs search_path (`postgres/src/backend/replication/` has
+      zero publisher-side writes), so the visible set is the default `{pg_catalog,
+      public}` ($user-schema edge approximated away, documented). regrole/TOAST stay
+      untouched; the regtype arm keeps its fixed bool (a separate catalog-schema gap,
+      new ledger row). Gates: `go test ./internal/executor/ ./internal/server/
+      ./internal/wal/`, pre-commit units, tpch-spotcheck (Q12=2, Q13=35) PASS. Tests:
+      `TestRegOutRendererVisibleOffPathQualifies` +
+      `TestPgoutputSnapshotRegOutRendererVisibleOffPathQualifies`. Design:
+      `docs/design/0119-0006-pgoutput-reg-names.md` §"Off-path schema qualification".
 
 - [x] **M0119-0010 — `char(N)` typmods are not restored per column on catalog
       reload** (source: M0127-P5.9-f, ledger row 2026-08-05). **FIXED (2026-08-09).**

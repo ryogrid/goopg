@@ -2988,7 +2988,7 @@ func evalRaiseMsg(rawMsg string, frame *plpgsqlFrame, ctx *Context) string {
 			if ctx != nil {
 				cat = ctx.Catalog
 			}
-			argVals = append(argVals, RegtypeName(cat, uint32(val.Int), !regObjectSchemaVisible(ctx, "public")))
+			argVals = append(argVals, RegtypeName(cat, uint32(val.Int), !RegObjectSchemaVisible(ctx, "public")))
 		} else {
 			// DATE/TIMESTAMP/TIMESTAMPTZ args must render per the session's
 			// datestyle GUC (M-NIGHTLY DateStyle follow-up), matching every

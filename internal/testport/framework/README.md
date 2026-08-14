@@ -179,7 +179,8 @@ individual cases without treating them as failures.
 
 ## Status/inventory tracking
 
-`IsolationSpecResult`, the CSV-backed `PortStatus`, and the suite inventory are
+`IsolationSpecResult`, the CSV-backed `StatusRow`, and the suite inventory are
 used by the `cmd/gen-oracle-*` tools and the CI oracle report.  See
-`docs/test-port/postgres-oracle-port-status.csv` for the canonical defer/excluded
-list and `docs/milestones/0060-postgres-oracle-test-port.md` for policy.
+`docs/test-port/postgres-oracle-target-inventory.csv` for the canonical
+pass/defer/excluded list and `docs/milestones/0060-postgres-oracle-test-port.md`
+for policy.

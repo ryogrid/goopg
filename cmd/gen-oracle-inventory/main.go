@@ -23,7 +23,8 @@ type suiteAgg struct {
 	failed   int
 	notTried int
 	excluded int
-	other    int
+	port     int
+	defer_   int
 	example  string
 }
 
@@ -96,8 +97,10 @@ func loadInventory(csvPath string) ([]*suiteAgg, error) {
 			agg.notTried++
 		case "excluded":
 			agg.excluded++
-		default:
-			agg.other++
+		case "port":
+			agg.port++
+		case "defer":
+			agg.defer_++
 		}
 	}
 	return order, nil
@@ -132,14 +135,17 @@ func main() {
 	}
 	defer md.Close()
 
-	var grandTotal, gPass, gFailed, gNotTried, gExcluded, gOther int
+	var g struct {
+		total, pass, failed, notTried, excluded, port, defer_ int
+	}
 	for _, s := range suites {
-		grandTotal += s.total
-		gPass += s.pass
-		gFailed += s.failed
-		gNotTried += s.notTried
-		gExcluded += s.excluded
-		gOther += s.other
+		g.total += s.total
+		g.pass += s.pass
+		g.failed += s.failed
+		g.notTried += s.notTried
+		g.excluded += s.excluded
+		g.port += s.port
+		g.defer_ += s.defer_
 	}
 
 	fmt.Fprintln(md, "# PostgreSQL Oracle Migration Target Inventory")
@@ -150,14 +156,14 @@ func main() {
 	fmt.Fprintln(md, "Per-suite status counts are derived from `docs/test-port/postgres-oracle-target-inventory.csv`")
 	fmt.Fprintln(md, "(the authoritative per-spec inventory); this tool only renders that CSV and never rewrites it.")
 	fmt.Fprintln(md)
-	fmt.Fprintln(md, "| suite_id | kind | total | pass | failed | not-tried | excluded | other | example |")
-	fmt.Fprintln(md, "| -------- | ---- | ----: | ---: | -----: | --------: | -------: | ----: | ------- |")
+	fmt.Fprintln(md, "| suite_id | kind | total | pass | failed | not-tried | excluded | port | defer | example |")
+	fmt.Fprintln(md, "| -------- | ---- | ----: | ---: | -----: | --------: | -------: | ---: | ----: | ------- |")
 	for _, s := range suites {
-		fmt.Fprintf(md, "| %s | %s | %d | %d | %d | %d | %d | %d | `%s` |\n",
-			s.suiteID, s.kind, s.total, s.pass, s.failed, s.notTried, s.excluded, s.other, s.example)
+		fmt.Fprintf(md, "| %s | %s | %d | %d | %d | %d | %d | %d | %d | `%s` |\n",
+			s.suiteID, s.kind, s.total, s.pass, s.failed, s.notTried, s.excluded, s.port, s.defer_, s.example)
 	}
-	fmt.Fprintf(md, "| **total** | | **%d** | **%d** | **%d** | **%d** | **%d** | **%d** | |\n",
-		grandTotal, gPass, gFailed, gNotTried, gExcluded, gOther)
+	fmt.Fprintf(md, "| **total** | | **%d** | **%d** | **%d** | **%d** | **%d** | **%d** | **%d** | |\n",
+		g.total, g.pass, g.failed, g.notTried, g.excluded, g.port, g.defer_)
 }
 
 // resolve returns path unchanged when absolute, otherwise joins it onto root.

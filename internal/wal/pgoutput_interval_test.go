@@ -42,7 +42,7 @@ func TestPgoDecodeIntervalMatchesPGNativeLayout(t *testing.T) {
 	typ := catalog.Type{Name: "interval"}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, n, err := pgoDecodePhysicalValue(typ, enc(tc.months, tc.days, tc.micros))
+			got, n, err := pgoDecodePhysicalValue(typ, enc(tc.months, tc.days, tc.micros), nil)
 			if err != nil {
 				t.Fatalf("pgoDecodePhysicalValue(interval): %v", err)
 			}

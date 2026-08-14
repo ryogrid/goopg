@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
 	"github.com/goopg/goopg/internal/storage"
@@ -65,7 +66,21 @@ func (s *Server) runLogicalWalsender(ctx context.Context, r *protocol.FrameReade
 	// Snapshot the catalog at session start so the pgoutput
 	// stream resolves relations against a stable shape; mirrors
 	// what the apply worker expects.
-	snap := wal.BuildCatalogSnapshot(im)
+	// Bind a real reg* name renderer so TEXT-mode pgoutput emits a reg*
+	// column's NAME (regclassout/regprocout/..., proto.c:848), not the numeric
+	// OID that belongs to BINARY mode's typsend. The publisher side never SETs
+	// search_path (postgres/src/backend/replication/ has zero search_path writes
+	// on the publisher side), so the session inherits the default `"$user",
+	// public` — for the walsender the visible set is effectively
+	// {pg_catalog, public} (pg_catalog is always searched implicitly; public is
+	// in the default path). RegOutRendererVisible schema-qualifies an off-path
+	// regclass/regproc/regprocedure/regcollation (other_schema.tbl) and leaves
+	// public/pg_catalog bare, matching regclassout's RelationIsVisible arm
+	// (regproc.c:973-981). The $user-schema-visible edge is a documented
+	// approximation (the walsender binds no session user). M0119-0006 (84th
+	// slice, deferral row 1354 claim 1).
+	snap := wal.BuildCatalogSnapshot(im, executor.RegOutRendererVisible(im,
+		func(schema string) bool { return schema == "" || schema == "pg_catalog" || schema == "public" }))
 
 	// Adapter wraps each pgoutput message in a `'w'` CopyData
 	// frame so it lands on the wire in the shape the subscriber's

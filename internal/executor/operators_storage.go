@@ -2352,6 +2352,13 @@ func coerceRowForConstraintChecks(cols []catalog.Column, row Row, include func(i
 			coerced, cerr = roundIntervalDatumToTypmod(row[i], intervalColumnTypmod(col.Type))
 		case "numeric", "decimal":
 			coerced, cerr = evalCast(row[i], "numeric", pos, ctx)
+		case "regproc", "regprocedure", "regclass", "regtype", "regrole", "regcollation":
+			// M0119-0006 (reg* + cid 4-byte storage): resolve a bare quoted name
+			// literal to its OID before the heap arm stores it — a reg* name must
+			// be a catalog lookup (regclassin/regtypein/regprocin/regrolein/
+			// regcollationin), not the numeric parse encodeValuePG's oid arm would
+			// otherwise run on it. (67th slice: regrole/regcollation joined.)
+			coerced, cerr = regIdentifierInput(row[i], col.Type.Name, ctx, pos)
 		default:
 			continue
 		}
@@ -3824,7 +3831,7 @@ func tryApplyHOTUpdate(
 	// Always encode in PG-native physical format (M0111-0002): one on-disk
 	// heap-tuple format for HOT and non-HOT updates alike. goopg reads it back
 	// by selecting the decoder from the tuple header (natts/bitmap).
-	body, encErr := EncodeRowPG(cols, newRow)
+	body, encErr := EncodeRowPGCtx(cols, newRow, ctx, 0)
 	if encErr != nil {
 		var ee *ExecError
 		if errors.As(encErr, &ee) {
@@ -7626,14 +7633,14 @@ func waitForConflictingRowLock(ctx *Context, rel storage.RelFileNode, blk storag
 // in unique constraints) or when the column is not found. M0100-0005.
 // cat is optional (may be nil): when provided, KindString values on enum-typed
 // columns are converted to KindEnum so encoding is consistent with the probe path.
-func encodeIndexKeyFromCols(idx *catalog.Index, cols []catalog.Column, row Row, cat ...catalog.Catalog) ([]byte, error) {
+func encodeIndexKeyFromCols(ctx *Context, idx *catalog.Index, cols []catalog.Column, row Row, cat ...catalog.Catalog) ([]byte, error) {
 	keyCols, vals, ok := indexRowKeyValues(idx, cols, row, cat...)
 	if !ok {
 		return nil, nil
 	}
 	var out []byte
 	for i, v := range vals {
-		keyPart, err := encodeBTreeKeyForColumn(v, keyCols[i], 0)
+		keyPart, err := encodeBTreeKeyForColumn(ctx, v, keyCols[i], 0)
 		if err != nil {
 			return nil, err
 		}
@@ -7788,7 +7795,7 @@ func encodeExprIndexKey(ctx *Context, idx *catalog.Index, tbl *catalog.Table, ro
 			if v.IsNull() {
 				return nil
 			}
-			keyPart, err := encodeBTreeKeyForColumn(v, col, 0)
+			keyPart, err := encodeBTreeKeyForColumn(ctx, v, col, 0)
 			if err != nil {
 				return nil
 			}
@@ -8784,7 +8791,7 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 	// on-disk heap-tuple format, byte-valid for a PG standby's
 	// heap_deform_tuple. goopg reads it back by selecting the decoder from the
 	// tuple header (natts/bitmap) in DecodeRowIntoMctxPGTuple.
-	body, encErr := EncodeRowPG(cols, row)
+	body, encErr := EncodeRowPGCtx(cols, row, ctx, 0)
 	if encErr != nil {
 		// Preserve ExecError (e.g. 22P02 invalid input, 22003 out of range)
 		// so the SQLSTATE and message reach the client unchanged.

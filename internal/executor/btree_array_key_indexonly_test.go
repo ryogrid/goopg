@@ -162,6 +162,19 @@ func TestArrayIndexOnlyScanAnswersFromKey(t *testing.T) {
 		// array_out escapes the backslash inside the quoted element, so PG prints
 		// the two-character run `\\` before the hex: {"\\x0304"}.
 		{"bytea", "bytea[]", `{\x0102}`, `{\x0304}`, `{"\\x0304"}`},
+		// reg* family: the element's key is the 8-byte unsigned OID, and the
+		// NAME literal is resolved to that OID on encode through the SAME
+		// regIdentifierInput the heap element path uses. The `want` is the name
+		// array_out prints — pg_catalog relations render unqualified, regtype
+		// prints the SQL alias (int8 → bigint), regproc the quoted routine name,
+		// regprocedure the name with its arg list, regrole/regcollation the
+		// quoted role/collation name. M0119-0006-0006.
+		{"regclass", "regclass[]", "{pg_class}", "{arr_iosk}", "{arr_iosk}"},
+		{"regtype", "regtype[]", "{int4}", "{int8}", "{bigint}"},
+		{"regproc", "regproc[]", "{age}", "{int4eq}", "{int4eq}"},
+		{"regprocedure", "regprocedure[]", "{age(timestamptz)}", "{int4recv(internal)}", "{int4recv(internal)}"},
+		{"regrole", "regrole[]", "{pg_monitor}", "{pg_signal_backend}", "{pg_signal_backend}"},
+		{"regcollation", "regcollation[]", "{default}", "{ucs_basic}", "{ucs_basic}"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

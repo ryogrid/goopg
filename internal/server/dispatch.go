@@ -2822,7 +2822,11 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				}
 				start := len(valueBuf)
 				if i < len(schema) {
-					valueBuf = s.appendTypedCellText(valueBuf, d, schema[i].Type, ctx.GetSetting)
+					// Per-arg-type visibility for the regprocedure arglist (73rd
+					// slice): the same RegObjectSchemaVisible the COPY path uses,
+					// so SELECT and COPY cannot drift on arg-type qualification.
+					valueBuf = s.appendTypedCellText(valueBuf, d, schema[i].Type, ctx.GetSetting,
+						func(s string) bool { return executor.RegObjectSchemaVisible(ctx, s) })
 				} else {
 					valueBuf = d.AppendValueText(valueBuf)
 				}
@@ -3094,7 +3098,10 @@ func rowsAffected(op executor.Operator) int64 {
 // type identically — the extended path previously only special-cased
 // float4/float8 and fell back to AppendValueText for everything else,
 // diverging from simple-query on date/time/timetz/bytea/regclass columns.
-func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.Type, getSetting func(name string) (string, bool)) []byte {
+// visible is the regprocedure arglist's per-arg-type visibility predicate
+// (73rd slice, deferral row 1342); an empty variadic keeps RegOut's
+// bare-arglist behavior, so the ~30 direct-call test callers need no edit.
+func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.Type, getSetting func(name string) (string, bool), visible ...func(schema string) bool) []byte {
 	switch strings.ToLower(typ.Name) {
 	case "float4", "real":
 		// float4/real uses float32 precision (~7 significant digits).
@@ -3196,71 +3203,28 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 			return dst
 		}
 		return d.AppendValueText(dst)
-	case "regclass":
-		// OID values with type regclass display as relation names. M0097-0023.
+	case "regclass", "regproc", "regprocedure", "regtype", "regrole", "regcollation":
+		// OID values of the reg* family display as the object's name
+		// (regclassout/regprocout/regprocedureout/regtypeout/regroleout/
+		// regcollationout) — a direct SELECT of a reg* column, pg_authid.rolname,
+		// pg_type.typinput, pg_typeof(...), an <oid>::reg* cast, etc. Rendered
+		// through the SAME executor.RegOut the COPY TO path (datumToCopyText)
+		// uses, so SELECT and COPY cannot drift apart again (Hard-won Rule #2,
+		// pattern_sibling_paths_must_agree; M0119-0006 68th slice). RegOut
+		// implements each reg*out's three-verdict shape: OID 0 (InvalidOid) →
+		// "-" (matching the ::reg* CastExpr special-cases in executor/expr.go),
+		// a catalog hit → the name (regtype schema-qualified when "public" is
+		// NOT visible on the session's effective search_path — e.g. pg_dump's
+		// search_path='' — matching real regtypeout; M0122-0005 pg_typeof()::oid
+		// follow-up), a dangling OID → numeric (RoleNameForOID/regroleout
+		// already render the numeral for a since-dropped role).
 		if d.Kind == executor.KindInt {
-			oid := uint32(d.Int)
-			if im, ok := s.cfg.Catalog.(*catalog.InMemory); ok {
-				if tbl, ok := im.LookupTableByOID(oid); ok {
-					return append(dst, tbl.Name...)
-				}
-				if idx, ok := im.LookupIndexByOID(oid); ok {
-					return append(dst, idx.Name...)
-				}
+			var argVisible func(s string) bool
+			if len(visible) > 0 {
+				argVisible = visible[0]
 			}
-		}
-		return d.AppendValueText(dst)
-	case "regproc":
-		// OID values with type regproc display as function names
-		// (regprocout), matching a direct SELECT of e.g.
-		// pg_type.typinput/typoutput, pg_operator.oprcode/oprrest/oprjoin,
-		// or pg_am.amproc — previously these all fell through to
-		// AppendValueText and rendered the raw numeric OID. InvalidOid (0)
-		// renders "-" (mirrors the ::regproc CastExpr special-case,
-		// executor/expr.go, and the regclass case above).
-		if d.Kind == executor.KindInt {
-			oid := uint32(d.Int)
-			if oid == 0 {
-				return append(dst, '-')
-			}
-			if name, ok := catalog.RegprocName(oid); ok {
-				return append(dst, name...)
-			}
-			if r := s.cfg.Catalog.Routines().LookupByOID(oid); r != nil {
-				return append(dst, r.Name...)
-			}
-		}
-		return d.AppendValueText(dst)
-	case "regprocedure":
-		// regprocedure additionally renders the INPUT argument-type list
-		// ("name(argtype1,argtype2)", format_procedure/regprocedureout) —
-		// see catalog.RegprocedureName and its executor/expr.go CastExpr
-		// counterpart. DU-002 (M0119-0004).
-		if d.Kind == executor.KindInt {
-			oid := uint32(d.Int)
-			if oid == 0 {
-				return append(dst, '-')
-			}
-			var routines *catalog.Routines
-			if s.cfg.Catalog != nil {
-				routines = s.cfg.Catalog.Routines()
-			}
-			if sig, ok := catalog.RegprocedureName(oid, routines); ok {
-				return append(dst, sig...)
-			}
-		}
-		return d.AppendValueText(dst)
-	case "regtype":
-		// OID values with type regtype display as type names (regtypeout),
-		// matching a direct SELECT of pg_typeof(...) or an <oid>::regtype
-		// cast. Mirrors the regclass/regproc cases above. A resolved
-		// user-defined type name is only schema-qualified when "public" is
-		// not visible on the session's effective search_path (e.g. pg_dump's
-		// search_path=''), matching real PostgreSQL's regtypeout instead of
-		// unconditionally prefixing "public.". M0122-0005 pg_typeof()::oid
-		// follow-up.
-		if d.Kind == executor.KindInt {
-			return append(dst, executor.RegtypeName(s.cfg.Catalog, uint32(d.Int), !publicSchemaVisible(getSetting))...)
+			return append(dst, executor.RegOutArgVisible(typ.Name, uint32(d.Int),
+				s.cfg.Catalog, !publicSchemaVisible(getSetting), argVisible)...)
 		}
 		return d.AppendValueText(dst)
 	default:

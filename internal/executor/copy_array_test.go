@@ -64,7 +64,7 @@ func arrayCopyRow() Row {
 // of array columns is byte-identical to PG 18.3's. Before the fix this returned
 // an error on the very first (int4[]) column.
 func TestCopyTextRowEmitsArrayColumns(t *testing.T) {
-	got, err := EncodeCopyTextRow(nil, arrayCopyRow(), arrayCopyCols(), "ISO", "MDY", "")
+	got, err := EncodeCopyTextRow(nil, arrayCopyRow(), arrayCopyCols(), "ISO", "MDY", "", nil, false)
 	if err != nil {
 		t.Fatalf("EncodeCopyTextRow: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestCopyTextRowEmitsArrayColumns(t *testing.T) {
 // happen if the array arm did its own quoting.
 func TestCopyCsvRowQuotesArrayColumns(t *testing.T) {
 	f := copyToFormatFromOptions([]parser.CopyOption{{Name: "format", Value: "csv"}})
-	got, err := EncodeCopyCsvRow(nil, arrayCopyRow(), arrayCopyCols(), f, "ISO", "MDY", "")
+	got, err := EncodeCopyCsvRow(nil, arrayCopyRow(), arrayCopyCols(), f, "ISO", "MDY", "", nil, false)
 	if err != nil {
 		t.Fatalf("EncodeCopyCsvRow: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestCopyCsvRowQuotesArrayColumns(t *testing.T) {
 // feeds encodeArrayValuePG), so it must come back spelled as it went out.
 func TestCopyTextArrayRoundTripsThroughItsOwnOutput(t *testing.T) {
 	cols, row := arrayCopyCols(), arrayCopyRow()
-	line, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY", "")
+	line, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY", "", nil, false)
 	if err != nil {
 		t.Fatalf("EncodeCopyTextRow: %v", err)
 	}

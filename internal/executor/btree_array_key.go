@@ -87,7 +87,7 @@ const (
 //
 // col is the ARRAY column: col.Type.Name is the element type name, which is
 // what the per-element scalar encoding is resolved against.
-func encodeArrayBTreeKey(v Datum, col *catalog.Column, pos int) ([]byte, *ExecError) {
+func encodeArrayBTreeKey(ctx *Context, v Datum, col *catalog.Column, pos int) ([]byte, *ExecError) {
 	if v.Kind != KindString {
 		// A pre-built ArrayType blob (KindBytes, the catalog-seeder form) carries
 		// no text to re-parse; nothing indexes those, and guessing would risk an
@@ -124,7 +124,7 @@ func encodeArrayBTreeKey(v Datum, col *catalog.Column, pos int) ([]byte, *ExecEr
 			out = append(out, arrayKeyElemNull)
 			continue
 		}
-		eb, encErr := encodeBTreeKeyForColumn(NewStringDatum(e), &elemCol, pos)
+		eb, encErr := encodeBTreeKeyForColumn(ctx, NewStringDatum(e), &elemCol, pos)
 		if encErr != nil {
 			return nil, encErr
 		}
@@ -271,6 +271,23 @@ func arrayKeyElemRenderer(name string, st pgarray.OutputStyle) func(Datum) (stri
 			return nil
 		}
 		return arrayKeyElemRendererPGImage(name, st)
+	// reg* family: the heap element image is a 4-byte OID, rendered through
+	// st.RegOut (executor.RegOut — OID 0 → "-", dangling → numeric, else the
+	// per-type name) exactly like DecodeElemStyled's reg* arm (pgarray.go:427-444).
+	// This is what makes a reg*[] key render the SAME text the heap renders, so
+	// index-only scans stay honest. With a nil st.RegOut (DefaultOutputStyle) the
+	// numeric OID is printed, matching the heap decode's nil-RegOut fallback.
+	case isRegType(name):
+		return func(d Datum) (string, error) {
+			oid := uint32(d.Int)
+			if oid == 0 {
+				return "-", nil
+			}
+			if st.RegOut != nil {
+				return quoteArrayTextElem(st.RegOut(strings.ToLower(name), oid)), nil
+			}
+			return strconv.FormatUint(uint64(oid), 10), nil
+		}
 	case isInt2Type(name), isInt4Type(name), isInt8Type(name), isOidType(name):
 		return func(d Datum) (string, error) { return strconv.FormatInt(d.Int, 10), nil }
 	case isBoolType(name):

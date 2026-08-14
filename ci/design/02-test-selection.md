@@ -55,29 +55,27 @@ silently skip them while reporting green. Running the whole package also
 picks up the in-package SSI/durability e2e tests. This single invocation
 covers:
 
-- the **60 `port/yes` rows** of
-  `docs/test-port/postgres-oracle-port-status.csv` — each row's `rationale`
-  names the pinning Go function (56× `TestPort_*`, 4× `TestE2E_Failover*`);
+- the **`port` rows (`pass_required=yes`)** of
+  `docs/test-port/postgres-oracle-target-inventory.csv` — each row's
+  `rationale` names the pinning Go function (`TestPort_*`/`TestE2E_Failover*`);
 - **`TestPort_RegressSuite`** — 232 upstream regress cases as subtests
-  (`port→run`, `excluded→Skip`, `defer→Skip`, per the framework) — **but see
-  the regress gating rule below: a mismatch surfaces as SKIP, not FAIL**;
+  (`port→run`, `excluded→Skip`, `defer→Skip`, per the framework) — a must-pass
+  case (`status=pass`) that diverges now **FAILs** (see the regress gating rule);
 - **`TestPort_IsolationSuite`** + **120 per-spec strict
   `TestPort_Isolation*` functions** (no per-spec function exists for the one
   known-fail spec, `deadlock-parallel`);
 - the TAP-port families (initdb, pg_ctl, pg_dump, pg_amcheck, pg_waldump,
   recovery, subscription, pgbench, psql …).
 
-**Regress gating rule (closes a real hole):** the regress framework maps an
-output mismatch to status `defer` (`framework/regress.go`) and
-`TestPort_RegressSuite` turns every non-`port` status into `t.Skip` — a
-diverging regress case therefore **never fails the Go test**; it appears as
-`--- SKIP ... deferred: output mismatch`. Nothing else in the repo consumes
-`docs/test-port/regress-diff-baseline.csv` programmatically. So the batch's
-result parser MUST join the suite's skip lines against the baseline CSV:
-any case listed `status=pass` in `regress-diff-baseline.csv` (127 cases)
-that reports an output-mismatch skip is classified a **regression**, exactly
-as if it had failed. Isolation has no such hole — the 120 strict per-spec
-functions fail hard on divergence.
+**Regress gating rule:** the regress framework maps an output mismatch to status
+`defer` (`framework/regress.go`); `TestPort_RegressSuite` turns a must-pass case
+(`status=pass` in the consolidated inventory CSV) that reports `output mismatch`
+into a **FAIL**, while `excluded`/`defer` cases and infra deferrals (timeout,
+missing expected) stay `t.Skip`. The batch's result parser additionally joins
+skip lines against the consolidated inventory CSV's regress-sql rows as
+defense-in-depth: a `status=pass` case that still reports an output-mismatch
+skip (an infra edge) is classified a **regression**. Isolation has no such
+hole — the 120 strict per-spec functions fail hard on divergence.
 
 **Wedge-recovery rule (added 2026-08-06): recovery must not re-bootstrap the
 shared fixtures.** The gating rule above has a companion hazard, and until this
@@ -227,16 +225,15 @@ Time is informational.
 ## B. Result classification (per test / per case)
 
 Parsed from `go test -v` output (`--- PASS/FAIL/SKIP`) plus stage exit codes,
-joined against three data sources **at run time** (never hard-coded):
+joined against two data sources **at run time** (never hard-coded):
 
-1. `docs/test-port/postgres-oracle-port-status.csv` — via the same semantics
-   as `internal/testport/framework/status.go` (`status` ∈ port/defer/excluded,
-   `pass_required` ∈ yes/no).
-2. `docs/test-port/regress-diff-baseline.csv` — the 127 `status=pass` rows
-   gate the regress subtests via the mismatch-skip join described in §A.
-   (Aside for readers: `docs/test-port/upstream-regress-coverage.md` is a
-   stale 2026-06-09 render; the baseline CSV is the authority.)
-3. `ci/batch/expected-failures.csv` — batch-local, per-case expected failures.
+1. `docs/test-port/postgres-oracle-target-inventory.csv` — the consolidated
+   authority (formerly port-status + inventory + regress baseline). Via the
+   same semantics as `internal/testport/framework/status.go`: `status` ∈
+   pass/failed/not-tried/excluded/port/defer, `pass_required` ∈ yes/no. The
+   must-pass set is `pass_required == yes`; the regress join keys on
+   `suite_id == "regress-sql"` (name = item_path basename minus `.sql`).
+2. `ci/batch/expected-failures.csv` — batch-local, per-case expected failures.
    Schema: `case_id,scope,reason,since,tracking`. Seeded with:
 
    ```csv
@@ -245,9 +242,8 @@ joined against three data sources **at run time** (never hard-coded):
    ```
 
    Regress-case expectations are NOT duplicated here — the regress framework
-   already skips `excluded`/`defer` cases itself, and
-   `docs/test-port/regress-diff-baseline.csv` (127 pass / 1 excluded) remains
-   the per-case diff baseline of record.
+   already skips `excluded`/`defer` cases itself, and the consolidated
+   inventory CSV's regress-sql rows are the per-case baseline of record.
 
 | Observation | Classification | Effect on exit code |
 |-------------|----------------|---------------------|
@@ -265,11 +261,10 @@ loop's standing top-priority triage milestone — doc 07.
 
 ## C. What is deliberately NOT run nightly
 
-- The 8 `defer` rows of port-status.csv (recovery/subscription remainders
-  D-003/D-004, regress remainder D-001, connstr scripts D-005l, modules D-006,
-  contrib D-007, WD-002, AC-003) — each keyed to a
-  `deferred_to` milestone; their Go entry points either don't exist yet or
-  Skip via the framework. They enter the batch automatically once promoted.
+- The `defer` rows of the consolidated inventory CSV (recovery/subscription
+  remainders, modules/contrib, etc.) — each keyed to a `deferred_to`
+  milestone; their Go entry points either don't exist yet or Skip via the
+  framework. They enter the batch automatically once promoted.
 - `scripts/pg-regress-runner.sh --all` and `scripts/pg-oracle-diff.sh` —
   vanilla-PG comparison lanes; out of nightly scope (and redundant with the
   testport suite per the dedup rule).
@@ -288,13 +283,10 @@ Unchanged from the established process; the batch is a pure consumer:
 
 1. A previously failing case passes (often first noticed via the batch's
    **promotable** notice).
-2. Human/agent flips the authority CSV(s): `status`→`port`/`pass`,
-   `pass_required`→`yes`, `rationale` names the `TestPort_*` func, clear
-   `deferred_to`. Both CSVs where applicable (port-status roll-up AND
-   target-inventory per-spec — the two-CSV rule).
-3. Regenerate rendered docs via the matching `cmd/gen-*` tool
-   (`gen-oracle-port-status`, `gen-oracle-inventory`, `gen-regress-coverage`,
-   `gen-isolation-coverage`, `gen-tap-coverage`).
+2. Human/agent flips the authority CSV row (the one-CSV rule — see
+   `docs/test-port/README.md`): `status`→`port`/`pass`, `pass_required`→`yes`,
+   `rationale` names the `TestPort_*` func, clear `deferred_to`.
+3. Regenerate rendered docs: `make regen-testport` (runs all `cmd/gen-*`).
 4. If the case was in `ci/batch/expected-failures.csv`, delete its row.
 5. Next nightly run picks the new must-pass set up automatically — **no batch
    code change**.

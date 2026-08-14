@@ -535,10 +535,30 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			isProcedure := strings.EqualFold(x.TargetType, "regprocedure")
 			if v.Kind == KindString && ctx != nil && ctx.Catalog != nil {
 				funcName := strings.TrimSpace(v.StringValue())
-				// SQL identifiers are case-folded to lowercase when parsed; match that.
-				schema, name := splitQualifiedTable(strings.ToLower(funcName))
+				raw := funcName
+				// regprocedurein (regproc.c:244) splits the arg list off the name
+				// (parseNameAndArgTypes) before parsing; regprocin does not. Both
+				// feed the name through stringToQualifiedNameList, so a quoted
+				// routine name must be unquoted before the lookups, and the 42883
+				// keeps the RAW input (regprocin/regprocedurein's errmsg). This is
+				// the input half of RegOut's quote-emission (the 71st slice) — the
+				// two casts are sibling renderers and must agree (Hard-won Rule
+				// #2). M0119-0006 (72nd slice, deferral row 1341).
+				if isProcedure {
+					funcName = regprocedureNamePart(funcName)
+				}
+				schema, name, nameOK := splitRegQualifiedName(funcName)
+				if !nameOK {
+					return NullDatum, &ExecError{Code: "42602", Pos: x.Pos(), Message: "invalid name syntax"}
+				}
 				if rs := ctx.Catalog.Routines(); rs != nil {
-					candidates := rs.LookupByName(parser.ObjectName{Schema: schema, Name: name})
+					// Thread the connection's dbOid like regIdentifierInput's
+					// regproc/regprocedure arm does — an unscoped LookupByName
+					// resolves DefaultDBOid and leaks another database's
+					// same-named routine (deferral row 1348). Builtins fall
+					// through to the global pg_proc index below (pg_catalog is
+					// implicitly visible everywhere).
+					candidates := rs.LookupByName(parser.ObjectName{Schema: schema, Name: name}, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 					if len(candidates) > 0 {
 						return NewIntDatum(int64(candidates[0].OID)), nil
 					}
@@ -552,7 +572,7 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 				if bp, found := catalog.LookupBuiltinProc(name); found {
 					return NewIntDatum(int64(bp.OID)), nil
 				}
-				return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("function %q does not exist", funcName)}
+				return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("function %q does not exist", raw)}
 			}
 			// An OID input (oid→regproc/regprocedure) renders via
 			// regprocout/regprocedureout: InvalidOid (0) becomes "-", matching
@@ -577,11 +597,25 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 					if ctx != nil && ctx.Catalog != nil {
 						routines = ctx.Catalog.Routines()
 					}
-					if schema, sig, ok := catalog.RegprocedureNameAndSchema(uint32(oid), routines); ok {
-						if !regObjectSchemaVisible(ctx, schema) {
-							return NewStringDatum(schema + "." + sig), nil
-						}
-						return NewStringDatum(sig), nil
+					// format_procedure (regproc.c:326) qualifies only the NAME —
+					// quote_qualified_identifier(schema,name)(arglist) when the
+					// routine's schema is off the effective search_path, else
+					// quote_identifier(name)(arglist). Rendered through the SAME
+					// regOutQualified rule RegOut's regprocedure arm uses, so the
+					// ::regprocedure cast and a regprocedure-typed column cannot
+					// drift apart (Hard-won Rule #2). Previously this prefixed the
+					// WHOLE signature (`schema + "." + sig`), which skipped the
+					// quote_identifier on a mixed-case/quoted routine name.
+					// M0119-0006 (71st slice, deferral row 1338).
+					if schema, name, argTypes, ok := catalog.RegprocedureNameParts(uint32(oid), routines); ok {
+						// format_procedure_extended's format_type_be per-arg
+						// qualification (deferral row 1342): an input arg type
+						// whose namespace is off the session's search_path renders
+						// schema-qualified. Same regprocedureArglist the column/
+						// COPY renderers use, so the cast cannot drift from them.
+						qualify := !RegObjectSchemaVisible(ctx, schema)
+						argVisible := func(s string) bool { return RegObjectSchemaVisible(ctx, s) }
+						return NewStringDatum(regOutQualified(schema, name, qualify) + "(" + regprocedureArglist(argTypes, argVisible) + ")"), nil
 					}
 					return v, nil
 				}
@@ -607,7 +641,7 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 						// (dumpEventTrigger emits `public.et_func()`, not
 						// `et_func()`, for a public-schema trigger function).
 						// DU-002 (M0119-0004).
-						if !regObjectSchemaVisible(ctx, r.Schema) {
+						if !RegObjectSchemaVisible(ctx, r.Schema) {
 							return NewStringDatum(r.Schema + "." + r.Name), nil
 						}
 						return NewStringDatum(r.Name), nil
@@ -636,7 +670,7 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 					if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
 						if strings.EqualFold(x.TargetType, "regoperator") {
 							if schema, sig, found := im.RegoperatorNameAndSchema(uint32(oid)); found {
-								if !regObjectSchemaVisible(ctx, schema) {
+								if !RegObjectSchemaVisible(ctx, schema) {
 									return NewStringDatum(schema + "." + sig), nil
 								}
 								return NewStringDatum(sig), nil
@@ -690,7 +724,7 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 					if name := oidToBuiltinTypeName(uint32(oid)); name != "" {
 						return NewStringDatum(name), nil
 					}
-					if uname, ok := userTypeNameForOID(ctx.Catalog, uint32(oid), !regObjectSchemaVisible(ctx, "public")); ok {
+					if uname, ok := userTypeNameForOID(ctx.Catalog, uint32(oid), !RegObjectSchemaVisible(ctx, "public")); ok {
 						return NewStringDatum(uname), nil
 					}
 					return NewStringDatum(typName), nil
@@ -719,9 +753,9 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 				// "myrange"), diverging from PG's regtypeout (regproc.c). The
 				// name is only schema-qualified when "public" is not visible
 				// on the effective search_path (matches regproc/regoperator's
-				// own regObjectSchemaVisible check above). DU-002 (M0110-0001)
+				// own RegObjectSchemaVisible check above). DU-002 (M0110-0001)
 				// regtype/format_type unification follow-up.
-				if uname, ok := userTypeNameForOID(ctx.Catalog, uint32(v.Int), !regObjectSchemaVisible(ctx, "public")); ok {
+				if uname, ok := userTypeNameForOID(ctx.Catalog, uint32(v.Int), !RegObjectSchemaVisible(ctx, "public")); ok {
 					return NewStringDatum(uname), nil
 				}
 				return NewStringDatum(fmt.Sprintf("%d", v.Int)), nil
@@ -800,7 +834,15 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 					}
 				}
 			case KindString:
-				schema, rel := splitQualifiedTable(v.StringValue())
+				// Shared SplitIdentifierString port: a quoted relation name
+				// (`'"My Table"'::regclass`) must be unquoted before the catalog
+				// lookup, and a syntax error raises regclassin's 42602.
+				// M0119-0006 (72nd slice, deferral row 1341) — the input half of
+				// RegOut's quote-emission; sibling of regIdentifierInput.
+				schema, rel, nameOK := splitRegQualifiedName(v.StringValue())
+				if !nameOK {
+					return NullDatum, &ExecError{Code: "42602", Pos: x.Pos(), Message: "invalid name syntax"}
+				}
 				objName := parser.ObjectName{Schema: schema, Name: rel}
 				if tbl, found := ctx.Catalog.LookupTable(objName, connDBOid); found && tbl != nil {
 					return NewIntDatum(int64(tbl.OID)), nil
@@ -3245,6 +3287,32 @@ func evalCastTyped(d Datum, targetType, sourceType string, pos int, ctx *Context
 	if sourceType == "" {
 		return evalCast(d, targetType, pos, ctx)
 	}
+	// M0119-0006 (deferral row 1350): a reg* datum is a plain KindInt holding an
+	// object OID, so casting one to a string type must render its OBJECT NAME via
+	// the same RegOut the SELECT (internal/server/dispatch.go appendTypedCellText)
+	// and COPY (datumToCopyText) wire paths use — not the raw numeric OID. This
+	// guard is the cast path's third sibling of those renderers
+	// (pattern_sibling_paths_must_agree); the reg*out family
+	// (regclassout/regprocout/regprocedureout/regtypeout/regroleout/
+	// regcollationout, postgres/src/backend/utils/adt/regproc.c) all render the
+	// resolved name. regOut degrades to "-" for OID 0 and to the numeric OID for a
+	// dangling/nil-catalog object, unchanged. `char` (CHAROID) is deliberately
+	// excluded from the targets (charin/charout first-byte semantics).
+	if isRegIdentifierTypeName(sourceType) && isStringTargetType(targetType) && d.Kind == KindInt {
+		var cat catalog.Catalog
+		var connDBOid []uint32
+		if ctx != nil {
+			cat = ctx.Catalog
+			// Scope the relation lookup to the connection's own database
+			// namespace (mirroring the `oid::regclass` CastExpr arm's connDBOid,
+			// M0122-0007 4e follow-up 33) so an OID owned by ANOTHER database
+			// never renders that database's relation name from this connection
+			// (TestRegclassCastScopedToConnectionDBOid). Nil ctx keeps the empty
+			// variadic → DefaultDBOid default, byte-identical to pre-scoping.
+			connDBOid = []uint32{catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)}
+		}
+		return NewStringDatum(RegOut(sourceType, uint32(d.Int), cat, regCastQualify(ctx), connDBOid...)), nil
+	}
 	// For float8/float4 → integer casts, override the default (away-from-zero)
 	// rounding inside evalCast to use banker's rounding instead.
 	// Also handle KindString datums produced by the float8 arithmetic path
@@ -3285,6 +3353,31 @@ func evalCastTyped(d Datum, targetType, sourceType string, pos int, ctx *Context
 		}
 	}
 	return evalCast(d, targetType, pos, ctx)
+}
+
+// isStringTargetType reports whether targetType is one of the string types a
+// reg* value renders its object name as (deferral row 1350). `char` (CHAROID)
+// is deliberately excluded — it keeps charin/charout first-byte semantics and
+// is not named in the row.
+func isStringTargetType(targetType string) bool {
+	switch strings.ToLower(targetType) {
+	case "text", "varchar", "name", "bpchar":
+		return true
+	}
+	return false
+}
+
+// regCastQualify reports whether a reg*→string cast must schema-qualify object
+// names, mirroring the SELECT wire path's publicSchemaVisible exactly
+// (internal/server/dispatch.go): true when the `public` schema is not on the
+// session's effective search_path (including pg_dump's search_path='').
+// Nil ctx ⇒ false, matching the SELECT path's nil-getSetting behavior. Per-object
+// qualification (deferral row 1347) stays out of scope.
+func regCastQualify(ctx *Context) bool {
+	if ctx == nil {
+		return false
+	}
+	return !RegObjectSchemaVisible(ctx, "public")
 }
 
 // dateStyleFromCtx resolves the session's DateStyle GUC (style, order) via
@@ -7915,6 +8008,71 @@ func compareEq(a, b Datum) (Datum, error) {
 	return NewBoolDatum(false), nil
 }
 
+// stringFuncArgTypeName maps a non-string Datum kind to the type name in PG's
+// 42883 message for the string-length builtins ("function length(integer) does
+// not exist"). The same guard lives in the sibling `length` case. M0119-0006
+// (65th slice).
+func stringFuncArgTypeName(k DatumKind) string {
+	switch k {
+	case KindInt:
+		return "integer"
+	case KindNumeric:
+		return "numeric"
+	case KindBool:
+		return "boolean"
+	case KindTime:
+		return "timestamp"
+	}
+	return "unknown"
+}
+
+// declaredBpcharTypmod returns the declared typmod of a bpchar-family
+// (char/character/bpchar) argument expression, or 0 when the argument is not
+// bpchar-typed. PG's grammar gives bare `char`/`character` an implicit length
+// of 1 (gram.y CHARACTER opt_charset), so a missing typmod normalizes to 1 —
+// the same default synthesizeBareCharTypmod applies to casts and the bare-char
+// column type carries. Used by octet_length, whose PG implementation
+// (bpcharoctetlen) returns the blank-PADDED datum size. M0119-0006 (65th slice).
+func declaredBpcharTypmod(e planner.Expr) int64 {
+	var name string
+	var typmod int64
+	switch n := e.(type) {
+	case *planner.ColumnRef:
+		if n.Type.IsArray {
+			return 0
+		}
+		name = n.Type.Name
+		if len(n.Type.Args) > 0 {
+			typmod = n.Type.Args[0]
+		}
+	case *planner.CastExpr:
+		name = n.TargetType
+		typmod = n.Typmod
+	case *planner.FuncCall:
+		// coalesce/greatest/least/nullif take the first argument's type
+		// (planner.exprType), so octet_length(coalesce(charcol, '')) still sees
+		// the declared width.
+		switch strings.ToLower(n.Name) {
+		case "coalesce", "greatest", "least", "nullif":
+			if len(n.Args) > 0 {
+				return declaredBpcharTypmod(n.Args[0])
+			}
+		}
+		return 0
+	default:
+		return 0
+	}
+	switch strings.ToLower(name) {
+	case "char", "bpchar", "character":
+	default:
+		return 0
+	}
+	if typmod <= 0 {
+		return 1
+	}
+	return typmod
+}
+
 // evalFuncCall resolves a function name against the in-tree registry.
 // v0 is small: current_timestamp / now / current_date are the only
 // no-arg time functions pgbench needs; HammerDB TPC-H also uses
@@ -10048,8 +10206,12 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if oidArg.Kind == KindInt {
 				r = rs.LookupByOID(uint32(oidArg.Int))
 			} else {
-				// Fall back to name lookup for string arguments.
-				schema, nm := splitQualifiedTable(strings.ToLower(strings.TrimSpace(oidArg.StringValue())))
+				// Fall back to name lookup for string arguments. The parser
+				// unquotes a quoted name (the lookup is case-insensitive), so
+				// `pg_get_functiondef('"MyFunc"')` resolves. A syntax error
+				// yields an empty best-effort lookup (this path returns NULL on a
+				// miss anyway). M0119-0006 (72nd slice).
+				schema, nm, _ := splitRegQualifiedName(strings.TrimSpace(oidArg.StringValue()))
 				candidates := rs.LookupByName(parser.ObjectName{Schema: schema, Name: nm})
 				if len(candidates) > 0 {
 					r = candidates[0]
@@ -10151,7 +10313,14 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 		if name == "regclass" && v.Kind == KindString && ctx != nil && ctx.Catalog != nil {
 			s := v.StringValue()
-			schema, rel := splitQualifiedTable(s)
+			// Shared SplitIdentifierString port (sibling of the CastExpr arm and
+			// regIdentifierInput): a quoted relation name unquotes before the
+			// lookup, a syntax error raises regclassin's 42602. M0119-0006
+			// (72nd slice).
+			schema, rel, nameOK := splitRegQualifiedName(s)
+			if !nameOK {
+				return NullDatum, &ExecError{Code: "42602", Pos: x.Pos(), Message: "invalid name syntax"}
+			}
 			// Scoped to the connection's own dbOid — see the CastExpr
 			// regclass arm's identical fix (M0122-0007 4e follow-up 33).
 			tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Schema: schema, Name: rel}, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
@@ -10227,7 +10396,44 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if s.Kind == KindBytes {
 				return Datum{Kind: KindInt, Int: int64(len(s.BytesValue()))}, nil
 			}
+			if s.Kind != KindString {
+				return Datum{}, &ExecError{Code: "42883",
+					Message: fmt.Sprintf("function octet_length(%s) does not exist", stringFuncArgTypeName(s.Kind)),
+					Hint:    "No function matches the given name and argument types. You might need to add explicit type casts.",
+					Pos:     x.Pos()}
+			}
+			// bpchar: PG's bpcharoctetlen returns the raw datum size, and PG
+			// stores bpchar blank-padded — octet_length('ab'::char(10)) is 10,
+			// not 2. goopg keeps bpchar trimmed in the datum (M0103-0007), so
+			// pad to the declared width first. M0119-0006 (65th slice).
+			if tm := declaredBpcharTypmod(x.Args[0]); tm > 0 {
+				t := catalog.Type{Name: "char", Args: []int64{tm}}
+				return Datum{Kind: KindInt, Int: int64(len(catalog.PadBpchar(t, s.StringValue())))}, nil
+			}
 			return Datum{Kind: KindInt, Int: int64(len(s.StringValue()))}, nil
+		}
+	case "bit_length":
+		// PG 18 defines bit_length as a SQL function, octet_length($1) * 8, for
+		// bytea (oid 1810) and text (oid 1811). There is NO bit_length(bpchar):
+		// it resolves through the implicit bpchar→text cast, which trims
+		// trailing spaces, so bit_length('ab'::char(10)) is 16 (2 bytes × 8),
+		// not 80. goopg's bpchar datum is already trimmed (M0103-0007), so the
+		// plain byte length below is the trimmed length. M0119-0006 (65th slice).
+		if len(x.Args) == 1 {
+			s, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || s.IsNull() {
+				return NullDatum, nil
+			}
+			if s.Kind == KindBytes {
+				return Datum{Kind: KindInt, Int: int64(8 * len(s.BytesValue()))}, nil
+			}
+			if s.Kind != KindString {
+				return Datum{}, &ExecError{Code: "42883",
+					Message: fmt.Sprintf("function bit_length(%s) does not exist", stringFuncArgTypeName(s.Kind)),
+					Hint:    "No function matches the given name and argument types. You might need to add explicit type casts.",
+					Pos:     x.Pos()}
+			}
+			return Datum{Kind: KindInt, Int: int64(8 * len(s.StringValue()))}, nil
 		}
 	case "upper":
 		if len(x.Args) == 1 {
@@ -11699,7 +11905,7 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				// non-visible, forcing the public. prefix, while a plain
 				// session's default search_path leaves it unqualified.
 				// DU-002 slices 88-90/249-251/(M0110-0001).
-				if uname, ok := userTypeNameForOID(ctx.Catalog, uint32(typeOID), !regObjectSchemaVisible(ctx, "public")); ok {
+				if uname, ok := userTypeNameForOID(ctx.Catalog, uint32(typeOID), !RegObjectSchemaVisible(ctx, "public")); ok {
 					name = uname
 				}
 			}
@@ -13444,6 +13650,20 @@ func pgQuoteIdent(s string) string {
 	return `"` + escaped + `"`
 }
 
+// quoteQualifiedIdentifier mirrors PostgreSQL's quote_qualified_identifier
+// (postgres/src/backend/utils/adt/ruleutils.c): qualifier.ident with each
+// component run through quote_identifier, or just quote_identifier(ident) when
+// qualifier is empty. The reg*out family (regproc.c) uses it to render a
+// resolved object name — the name is ALWAYS identifier-quoted even when it is
+// not schema-qualified, and the qualifier (the object's namespace) is quoted
+// too. M0119-0006 (69th slice).
+func quoteQualifiedIdentifier(qualifier, ident string) string {
+	if qualifier == "" {
+		return pgQuoteIdent(ident)
+	}
+	return pgQuoteIdent(qualifier) + "." + pgQuoteIdent(ident)
+}
+
 // isArrayLiteralText reports whether s is a PostgreSQL array literal of the
 // canonical `{...}` form. Used to route the @>/<@/&& operators to anyarray
 // set semantics rather than geometric box semantics (design 0118-0139).
@@ -13630,7 +13850,7 @@ func searchPathSchemas(ctx *Context) []string {
 	return out
 }
 
-// regObjectSchemaVisible reports whether schema is visible for reg*-cast
+// RegObjectSchemaVisible reports whether schema is visible for reg*-cast
 // qualification purposes (format_operator/format_procedure's own
 // OperatorIsVisible/ProcedureIsVisible check, regproc.c): pg_catalog is
 // always implicitly searched regardless of search_path content, and every
@@ -13639,8 +13859,10 @@ func searchPathSchemas(ctx *Context) []string {
 // this is what makes dumpOpclass/dumpOpfamily's own
 // amopopr::pg_catalog.regoperator / amproc::pg_catalog.regprocedure casts
 // come back schema-qualified for a user-defined operator/function but bare
-// for a builtin one. DU-002 (M0119-0004) slice 412.
-func regObjectSchemaVisible(ctx *Context, schema string) bool {
+// for a builtin one. Exported (73rd slice) so the server's SELECT/COPY wire
+// paths can pass it as the regprocedure arglist's per-arg visibility
+// predicate (deferral row 1342). DU-002 (M0119-0004) slice 412.
+func RegObjectSchemaVisible(ctx *Context, schema string) bool {
 	if schema == "" || schema == "pg_catalog" {
 		return true
 	}
@@ -13775,7 +13997,7 @@ func pgFormatTypeName(t string) string {
 // RegtypeName, since all three need the identical resolution across all four
 // user-type kinds. goopg enums/domains/composites/ranges all live in public;
 // qualify controls whether the "public." prefix is added, mirroring
-// regObjectSchemaVisible's role for the regproc/regoperator casts — callers
+// RegObjectSchemaVisible's role for the regproc/regoperator casts — callers
 // pass qualify=true only when "public" is NOT visible on the effective
 // search_path (e.g. pg_dump's search_path=''), matching real PostgreSQL's
 // regtypeout/format_type, which only schema-qualifies when necessary rather

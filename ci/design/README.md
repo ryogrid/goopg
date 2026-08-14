@@ -17,9 +17,8 @@ The test landscape this design draws from was surveyed in
 [`analysis/tests-overview-260706/`](../../analysis/tests-overview-260706/README.md)
 (inventory, scripts, constraints, baselines, dedup policy). Authority inputs:
 
-- `docs/test-port/postgres-oracle-port-status.csv` — the must-pass roll-up
-  (60 `port/yes` rows; 8 promotable `defer` rows).
-- `docs/test-port/regress-diff-baseline.csv` — per-regress-case baseline.
+- `docs/test-port/postgres-oracle-target-inventory.csv` — the consolidated
+  authority (must-pass roll-up + per-case inventory + regress baseline, one file).
 - `bench/tpch/spotcheck_expected.env` — TPC-H Q12/Q13 row-count tripwire.
 - `bench/tpch/logs/tpch_power_test_20260526.md` — 22-query time baseline.
 

@@ -59,17 +59,26 @@ type ColumnDef struct {
 // stable identifier across schema renames.
 type CatalogSnapshot struct {
 	rels map[uint32]*RelationDef
+	// RegOut renders a reg* column value's 4-byte OID as its NAME (PG's text-mode
+	// pgoutput serializes a reg* value through its typoutput — regclassout etc. —
+	// via OidOutputFunctionCall, proto.c:848; the numeric OID is BINARY mode's
+	// typsend). nil (the default; no catalog at hand) keeps the numeric fallback.
+	// M0119-0006 (deferral row 1353).
+	RegOut func(typeName string, oid uint32) string
 }
 
 // BuildCatalogSnapshot captures the current catalog state. The
 // returned snapshot is safe to share across goroutines and never
 // changes after construction.
-func BuildCatalogSnapshot(c *catalog.InMemory) *CatalogSnapshot {
+func BuildCatalogSnapshot(c *catalog.InMemory, regOut ...func(string, uint32) string) *CatalogSnapshot {
 	if c == nil {
 		return &CatalogSnapshot{rels: map[uint32]*RelationDef{}}
 	}
 	tables := c.AllTables()
 	out := &CatalogSnapshot{rels: make(map[uint32]*RelationDef, len(tables))}
+	if len(regOut) > 0 {
+		out.RegOut = regOut[0]
+	}
 	for _, t := range tables {
 		def := &RelationDef{
 			Schema:  t.Schema,

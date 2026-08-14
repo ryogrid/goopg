@@ -676,6 +676,21 @@ func routineArgTypeName(t parser.ColumnType) string {
 	return name
 }
 
+// argTypeSchema returns the namespace an argument type belongs to, for the
+// regprocedure output path's format_type_be arg-type qualification (deferral
+// row 1342). Only an EXPLICITLY qualified name (ColumnType.Schema) yields a
+// schema — goopg's user-type store has no namespace field, so a BARE type name
+// cannot be mapped to its owner schema (bounded limitation, documented in the
+// 73rd-slice design doc §3.5). A pg_catalog-qualified name yields "pg_catalog"
+// so the renderer's builtin-alias + never-qualify arms apply. A bare BUILTIN
+// name keeps "" (equivalent rendering: the renderer treats "" and "pg_catalog"
+// identically). The parser already case-folded an UNQUOTED qualifier (identText
+// lowercases) but PRESERVED case for a quoted `"OffPath".mytype`, so the value
+// must be returned verbatim — never re-lowered.
+func argTypeSchema(t parser.ColumnType) string {
+	return t.Schema
+}
+
 // isKnownBuiltinFunction returns true if name is a known built-in SQL function
 // (not a user-defined routine). Used to detect "random() is not a procedure"
 // cases where the function exists in the built-in registry but not in the

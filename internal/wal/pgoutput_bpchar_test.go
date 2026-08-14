@@ -37,7 +37,7 @@ func TestPgoDecodeBpcharCarriesDeclaredWidth(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			raw := shortVarlena([]byte(tc.heap))
-			got, n, err := pgoDecodePhysicalValue(tc.typ, raw)
+			got, n, err := pgoDecodePhysicalValue(tc.typ, raw, nil)
 			if err != nil {
 				t.Fatalf("pgoDecodePhysicalValue: %v", err)
 			}

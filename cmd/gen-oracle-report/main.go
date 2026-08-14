@@ -1,29 +1,20 @@
 package main
 
 import (
-	"encoding/csv"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"time"
 
 	"github.com/goopg/goopg/internal/testport/framework"
 )
 
-type invRow struct {
-	SuiteID string
-	Kind    string
-	Count   int
-}
-
 func main() {
 	var (
 		repoRoot = flag.String("repo-root", ".", "path to repository root")
 		invCSV   = flag.String("inventory-csv", "docs/test-port/postgres-oracle-target-inventory.csv", "inventory csv")
-		status   = flag.String("status-csv", "docs/test-port/postgres-oracle-port-status.csv", "status csv")
 		outPath  = flag.String("out", "analysis/postgres-oracle-compatibility-report.md", "output report path")
 	)
 	flag.Parse()
@@ -32,19 +23,13 @@ func main() {
 	if err != nil {
 		fail("resolve repo root", err)
 	}
-	invRows, err := loadInventoryCSV(filepath.Join(root, filepath.FromSlash(*invCSV)))
+	rows, err := framework.LoadStatusCSV(filepath.Join(root, filepath.FromSlash(*invCSV)))
 	if err != nil {
 		fail("load inventory", err)
 	}
-	statusRows, err := framework.LoadStatusCSV(filepath.Join(root, filepath.FromSlash(*status)))
-	if err != nil {
-		fail("load status", err)
+	if err := framework.ValidateStatusRows(rows); err != nil {
+		fail("validate inventory", err)
 	}
-	if err := framework.ValidateStatusRows(statusRows); err != nil {
-		fail("validate status", err)
-	}
-	summary := framework.SummarizeBySuite(statusRows)
-	keys := framework.SuiteKeys(summary)
 
 	fullOut := filepath.Join(root, filepath.FromSlash(*outPath))
 	if err := os.MkdirAll(filepath.Dir(fullOut), 0o755); err != nil {
@@ -59,81 +44,83 @@ func main() {
 	fmt.Fprintln(f, "# PostgreSQL Oracle Compatibility Report (M0060)")
 	fmt.Fprintln(f)
 	fmt.Fprintf(f, "Generated at: %s\n\n", time.Now().Format(time.RFC3339))
+	fmt.Fprintln(f, "Single authority: `docs/test-port/postgres-oracle-target-inventory.csv`.")
+
+	// Inventory snapshot: suite_id -> kind -> count.
+	type suiteAgg struct {
+		kind  string
+		count int
+	}
+	bySuite := map[string]*suiteAgg{}
+	var suiteOrder []string
+	for _, r := range rows {
+		a, ok := bySuite[r.SuiteID]
+		if !ok {
+			a = &suiteAgg{kind: r.Kind}
+			bySuite[r.SuiteID] = a
+			suiteOrder = append(suiteOrder, r.SuiteID)
+		}
+		a.count++
+	}
+	sort.Strings(suiteOrder)
+
 	fmt.Fprintln(f, "## Inventory Snapshot")
 	fmt.Fprintln(f)
 	fmt.Fprintln(f, "| suite_id | kind | discovered_cases |")
 	fmt.Fprintln(f, "| -------- | ---- | ---------------: |")
-	for _, r := range invRows {
-		fmt.Fprintf(f, "| %s | %s | %d |\n", r.SuiteID, r.Kind, r.Count)
+	for _, sid := range suiteOrder {
+		a := bySuite[sid]
+		fmt.Fprintf(f, "| %s | %s | %d |\n", sid, a.kind, a.count)
 	}
 	fmt.Fprintln(f)
 
+	// Status summary: full per-status breakdown, no "other" collapse.
+	type statusAgg struct {
+		pass, failed, notTried, excluded, port, defer_ int
+	}
+	byStatus := map[string]*statusAgg{}
+	for _, sid := range suiteOrder {
+		byStatus[sid] = &statusAgg{}
+	}
+	for _, r := range rows {
+		a := byStatus[r.SuiteID]
+		switch r.Status {
+		case "pass":
+			a.pass++
+		case "failed":
+			a.failed++
+		case "not-tried":
+			a.notTried++
+		case "excluded":
+			a.excluded++
+		case "port":
+			a.port++
+		case "defer":
+			a.defer_++
+		}
+	}
 	fmt.Fprintln(f, "## Status Summary")
 	fmt.Fprintln(f)
-	fmt.Fprintln(f, "| suite_type | port | defer | excluded |")
-	fmt.Fprintln(f, "| ---------- | ----:| -----:| --------:|")
-	for _, k := range keys {
-		c := summary[k]
-		fmt.Fprintf(f, "| %s | %d | %d | %d |\n", k, c.Port, c.Defer, c.Excluded)
+	fmt.Fprintln(f, "| suite_id | pass | failed | not-tried | excluded | port | defer |")
+	fmt.Fprintln(f, "| -------- | ---: | -----: | --------: | -------: | ---: | ----: |")
+	for _, sid := range suiteOrder {
+		a := byStatus[sid]
+		fmt.Fprintf(f, "| %s | %d | %d | %d | %d | %d | %d |\n",
+			sid, a.pass, a.failed, a.notTried, a.excluded, a.port, a.defer_)
 	}
 	fmt.Fprintln(f)
 
+	// Deferred blockers: defer rows carry a milestone reference.
 	fmt.Fprintln(f, "## Deferred Blockers")
 	fmt.Fprintln(f)
-	fmt.Fprintln(f, "| id | upstream_path | suite_type | deferred_to | rationale |")
-	fmt.Fprintln(f, "|----|---------------|------------|-------------|-----------|")
-	for _, r := range statusRows {
+	fmt.Fprintln(f, "| id | item_path | deferred_to | rationale |")
+	fmt.Fprintln(f, "|----|-----------|-------------|-----------|")
+	for _, r := range rows {
 		if r.Status != "defer" {
 			continue
 		}
-		fmt.Fprintf(f, "| %s | `%s` | %s | `%s` | %s |\n", r.ID, r.UpstreamPath, r.SuiteType, r.DeferredTo, r.Rationale)
+		fmt.Fprintf(f, "| %s | `%s` | `%s` | %s |\n", r.ID, r.ItemPath, r.DeferredTo, r.Rationale)
 	}
-}
-
-func loadInventoryCSV(path string) ([]invRow, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	r := csv.NewReader(f)
-	recs, err := r.ReadAll()
-	if err != nil {
-		return nil, err
-	}
-	if len(recs) <= 1 {
-		return nil, fmt.Errorf("inventory csv %q has no data rows", path)
-	}
-	idxSuite := -1
-	idxKind := -1
-	idxCount := -1
-	for i, col := range recs[0] {
-		switch col {
-		case "suite_id":
-			idxSuite = i
-		case "kind":
-			idxKind = i
-		case "count":
-			idxCount = i
-		}
-	}
-	if idxSuite < 0 || idxKind < 0 || idxCount < 0 {
-		return nil, fmt.Errorf("inventory csv %q missing required columns", path)
-	}
-	out := make([]invRow, 0, len(recs)-1)
-	for _, rec := range recs[1:] {
-		if len(rec) <= idxCount {
-			continue
-		}
-		n, err := strconv.Atoi(rec[idxCount])
-		if err != nil {
-			continue
-		}
-		out = append(out, invRow{SuiteID: rec[idxSuite], Kind: rec[idxKind], Count: n})
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].SuiteID < out[j].SuiteID })
-	return out, nil
 }
 
 func fail(where string, err error) {
