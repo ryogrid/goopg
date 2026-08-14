@@ -552,7 +552,13 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 					return NullDatum, &ExecError{Code: "42602", Pos: x.Pos(), Message: "invalid name syntax"}
 				}
 				if rs := ctx.Catalog.Routines(); rs != nil {
-					candidates := rs.LookupByName(parser.ObjectName{Schema: schema, Name: name})
+					// Thread the connection's dbOid like regIdentifierInput's
+					// regproc/regprocedure arm does — an unscoped LookupByName
+					// resolves DefaultDBOid and leaks another database's
+					// same-named routine (deferral row 1348). Builtins fall
+					// through to the global pg_proc index below (pg_catalog is
+					// implicitly visible everywhere).
+					candidates := rs.LookupByName(parser.ObjectName{Schema: schema, Name: name}, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 					if len(candidates) > 0 {
 						return NewIntDatum(int64(candidates[0].OID)), nil
 					}

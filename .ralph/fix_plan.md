@@ -4193,6 +4193,37 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       executor 6.103s, server 55.151s) + pre-commit units +
       `TestPort_RegressSuite` + `scripts/tpch-spotcheck.sh` (Q12=2, Q13=35) all
       PASS.
+      **75th slice (2026-08-14): regproc/regprocedure NAME→OID INPUT is scoped
+      to the connection's database — deferral row 1348 resolved.** The reg*
+      INPUT half resolved every routine name through `Routines.LookupByName` with
+      NO dbOid, so it always resolved `DefaultDBOid`. The 4e-series routine
+      registry (M0122-0007 slice 4e) keys routines by `(dbOid, schema, name)`;
+      a LIVE-created routine (registered under its real dbOid) was invisible by
+      name from a distinct-dbOid connection — and worse, a same-named routine in
+      ANOTHER database resolved THAT routine's OID: a silent cross-dbOid leak
+      (`'shared_fn'::regproc` from db2 returned DefaultDBOid's 131072 instead of
+      its own 131073). An initdb-reloaded routine (DefaultDBOid) still resolved,
+      which hid the bug on default-database connections. Fix: both sibling paths
+      (Hard-won Rule #2) thread `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)`
+      into `LookupByName` — `regIdentifierInput`'s regproc/regprocedure arm
+      (internal/executor/reg_identifier.go, feeds COPY FROM coercion + constraint
+      checks) and expr.go's `::regproc`/`::regprocedure` cast arm (feeds
+      `'name'::regproc` in expressions) — mirroring the regclass arm's existing
+      connDBOid. Builtins still resolve via the global `LookupBuiltinProc`
+      pg_proc index (pg_catalog implicitly visible in every database, matching
+      PG). Tests: `TestRegProcInputScopedToConnectionDBOid`,
+      `TestRegProcInputSchemaQualifiedScopedToConnectionDBOid`,
+      `TestRegProcInputDistinctDBOidMissIsNotDefaultLeak`
+      (internal/executor/reg_identifier_dbid_scoping_test.go) — all FAIL pre-fix
+      (the first two leaked the wrong OID, the third resolved instead of raising
+      42883) and PASS post-fix. Live E2E on a throwaway goopg (5533) +
+      byte-identical PG 18.3 oracle (5534): db2's `'shared_fn'::regproc` → 42883
+      before its own routine exists, then each database resolves its own OID
+      (131072 vs 131073). Design:
+      `docs/design/0119-0006-regproc-input-dbid-scoping.md` + README row
+      `0119-0006ba`. Gates: package suites + pre-commit units +
+      `TestPort_RegressSuite` + `scripts/tpch-spotcheck.sh` (Q12=2, Q13=35) all
+      PASS.
 
 - [x] **M0119-0010 — `char(N)` typmods are not restored per column on catalog
       reload** (source: M0127-P5.9-f, ledger row 2026-08-05). **FIXED (2026-08-09).**

@@ -295,8 +295,17 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 		if !nameOK {
 			return NullDatum, &ExecError{Code: "42602", Pos: pos, Message: "invalid name syntax"}
 		}
+		// Thread the connection's dbOid into the routine lookup — the 4e-series
+		// routine registry keys routines by (dbOid, schema, name), so an
+		// unscoped LookupByName resolves DefaultDBOid and a LIVE-created routine
+		// (registered under its real dbOid) either misses or — worse — resolves
+		// the same-named routine of ANOTHER database (cross-dbOid leak; deferral
+		// row 1348). Mirrors the regclass arm's connDBOid threading directly
+		// above. Builtins resolve through the global pg_proc index below, which
+		// is not dbOid-scoped (pg_catalog is implicitly visible everywhere).
+		connDBOid := catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)
 		if rs := ctx.Catalog.Routines(); rs != nil {
-			candidates := rs.LookupByName(parser.ObjectName{Schema: schema, Name: fn})
+			candidates := rs.LookupByName(parser.ObjectName{Schema: schema, Name: fn}, connDBOid)
 			if len(candidates) > 0 {
 				return NewIntDatum(int64(candidates[0].OID)), nil
 			}

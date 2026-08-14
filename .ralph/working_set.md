@@ -1,47 +1,39 @@
 (idle — nothing in flight)
 
-Completed this loop: **M0119-0006 74th slice** — the regprocedure arglist's
-`ArgTypeDisplayAlias` became a faithful `format_type_be` port AND the catalog
-bare arglist builder aliases builtin arrays, closing ledger rows 1345 + 1346
-(the 73rd slice's carry-forwards). Two divergences from PG 18.3: (a) the shared
-alias table had no `varbit → bit varying` arm (the one missing VARBITOID
-special-case switch entry — `bit`/`interval`/`json`/`numeric` are identities,
-every other case was already present) and no keyword-quoting path at all, so
-the single-byte `char` (CHAROID, distinct from bpchar/1042) rendered bare
-`char` where `format_type_be`'s DEFAULT path runs
-`quote_qualified_identifier` and `quote_identifier` wraps the lexer keyword →
-`"char"`; (b) the catalog BARE builder `formatProcedureArglist` (behind
-`RegprocedureName`/`RegprocedureNameAndSchema`) passed the WHOLE stored name —
-baked-in `[]` array suffix included — to the alias, so `int[]` found no switch
-case and rendered `f(int[])` where the executor's pg-faithful
-`regprocedureArglist` already emitted `f(integer[])`: the two sibling renderers
-diverged on a builtin array arg (Hard-won Rule #2). **Fix:** two new arms in
-`catalog.ArgTypeDisplayAlias` (`varbit → bit varying`, `char → "char"`,
-internal/catalog/catalog.go) and a package-local `argListTypeDisplay` helper
-(catalog cannot import executor) that splits a `[]` suffix, aliases the ELEMENT,
-re-appends — mirroring executor's `splitArraySuffix` (reg_identifier.go). The
-executor renderer needed NO change; it picks up the new arms via the shared
-alias. Measured vs a throwaway PG 18.3 oracle (port 5533) on the wire path
-(`oid::regprocedure`): `f_varbit(bit varying)`, `f_char("char")`,
-`f_chararr("char"[])`, `f_intarr(integer[])` now byte-identical; the two
-siblings agree on `integer[],bit varying,"char","char"[],double
-precision[],text` (pinned by `TestRegprocedureArglistCatalogAndExecutorAgree`).
-Tests: `TestArgTypeDisplayAliasFormatTypeBePort` +
-`TestRegprocedureName` array/varbit/char cases (internal/catalog/
-regproc_name_test.go), `TestRegOutRegprocedureArgTypesVarbitChar` +
-`TestRegprocedureArglistCatalogAndExecutorAgree` (internal/executor/
-reg_qualify_test.go). Gates: package suites (internal/catalog 0.063s,
-internal/executor 6.103s, internal/server 55.151s) PASS; pre-commit units PASS;
-`TestPort_RegressSuite` PASS (237.459s — a first CONCURRENT run hit the Go
-default 600s `-test.timeout` while the pre-commit units were hammering the
-machine, leaking a spinning goopg orphan at ~25GB RSS which was SIGKILLed; the
-re-run alone passed, matching the 73rd slice's 239.7s); `scripts/tpch-spotcheck.sh`
-PASS (Q12=2, Q13=35, query phase 21.4s). Design
-`docs/design/0119-0006-argtype-alias-format-type-be-port.md` + README row
-`0119-0006az` + ledger rows 1345/1346 resolved + 2 NEW deferral rows (1349,
-1350) + fix_plan 74th-slice entry.
+Completed this loop: **M0119-0006 75th slice** — the regproc/regprocedure
+NAME→OID **input** half is now scoped to the connection's database, closing
+deferral row 1348 (the 73rd slice's carry-forward). The 4e-series routine
+registry (M0122-0007 slice 4e) keys routines by `(dbOid, schema, name)`, but
+`regIdentifierInput` and the expr.go `::regproc`/`::regprocedure` cast sibling
+called `Routines.LookupByName` with NO dbOid, so they always resolved
+`DefaultDBOid`: a LIVE-created routine (registered under its real dbOid) was
+invisible by name from a distinct-dbOid connection — and worse, a same-named
+routine in ANOTHER database resolved THAT routine's OID (a silent cross-dbOid
+leak: `'shared_fn'::regproc` from db2 returned DefaultDBOid's 131072 instead of
+its own 131073). An initdb-reloaded routine (DefaultDBOid) still resolved,
+which hid the bug on default-database connections. **Fix:** both sibling paths
+(Hard-won Rule #2) thread `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)` into
+`LookupByName` — `regIdentifierInput`'s regproc/regprocedure arm
+(internal/executor/reg_identifier.go, feeds COPY FROM coercion + constraint
+checks) and expr.go's `::regproc`/`::regprocedure` cast arm (feeds
+`'name'::regproc` in expressions) — mirroring the regclass arm's existing
+connDBOid. Builtins still resolve via the global `LookupBuiltinProc` pg_proc
+index (pg_catalog implicitly visible in every database, matching PG). Tests:
+`TestRegProcInputScopedToConnectionDBOid`,
+`TestRegProcInputSchemaQualifiedScopedToConnectionDBOid`,
+`TestRegProcInputDistinctDBOidMissIsNotDefaultLeak`
+(internal/executor/reg_identifier_dbid_scoping_test.go) — all FAIL pre-fix (the
+first two leaked the wrong OID, the third resolved instead of raising 42883) and
+PASS post-fix. Live E2E on a throwaway goopg (5533) + byte-identical PG 18.3
+oracle (5534): db2's `'shared_fn'::regproc` → 42883 before its own routine
+exists, then each database resolves its own OID (131072 vs 131073). Gates:
+package suites (internal/executor 5.965s) PASS; pre-commit units PASS (initdb
+426.485s re-ran cold); `TestPort_RegressSuite` PASS (236.314s);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35, query phase 23.3s). Design
+`docs/design/0119-0006-regproc-input-dbid-scoping.md` + README row `0119-0006ba`
++ ledger row 1348 resolved + fix_plan 75th-slice entry.
 
-**Carry-forward for a later loop (nine remaining reg* deferrals under
+**Carry-forward for a later loop (six remaining reg* deferrals under
 2026-08-14, 69th-74th slices):** (1) goopg's role store folds every role name to
 lowercase on registration, so `regroleout` can never receive a case-preserved
 role name to quote (`CREATE ROLE "Alice"` renders `alice`, PG renders `"Alice"`)
@@ -54,21 +46,19 @@ lose case at CREATE (`routineArgTypeName` lowercases → `offpath."MyType"` rend
 `offpath.mytype`, PG emits `offpath."MyType"` — same family as row 1340) (row
 1344); (4) the empty-schema visibility proxy blocks
 `SET search_path = …, offpath` from rendering an `offpath` arg bare (row 1347);
-(5) the pre-existing regproc/regprocedure INPUT DB-scoping bug
-(`regIdentifierInput` passes no dbOid to `LookupByName`, so a live-created
-routine does not resolve by name in some contexts) (row 1348); (6) **NEW** —
-MULTI-WORD type names in CREATE FUNCTION args store the LAST word: the parser's
-collapsed `ColumnType.Name` is used verbatim, so `bit varying` → `varying`,
-`character varying` → `varying`, `double precision` → `precision`, and
-`timestamp with time zone` is a syntax error in CREATE FUNCTION args; measured
-live: `CREATE FUNCTION f_vchar(bit varying)` renders `f_vchar(varying)` (PG:
-`f_vchar(bit varying)`). Separately the arglist carries only `Name` (dropping
-Args/OID), so a BARE `char` arg — parser-stamped bpchar-like, `Args=[1]`, like
-PG — is indistinguishable from OID-18 `"char"` and renders `"char"` where PG
-renders `character` (row 1349); (7) **NEW** — a reg* → text/varchar/name cast on
-a STRING-LITERAL source renders the raw OID: `'f_varbit(varbit)'::regprocedure::text`
-→ `131072` (PG: `f_varbit(bit varying)`), `'f_varbit'::regproc::text` →
-`131072`, `'pg_type'::regclass::text` → `1247`; the `::regprocedure` INPUT half
-resolves correctly, only the downstream cast to text/name/varchar renders the
-numeric datum. regtype/regrole/regcollation and non-literal sources unaffected
-(row 1350). See the ledger rows for the design docs and gate requirements.
+(5) **NEW** — MULTI-WORD type names in CREATE FUNCTION args store the LAST word:
+the parser's collapsed `ColumnType.Name` is used verbatim, so `bit varying` →
+`varying`, `character varying` → `varying`, `double precision` → `precision`,
+and `timestamp with time zone` is a syntax error in CREATE FUNCTION args;
+measured live: `CREATE FUNCTION f_vchar(bit varying)` renders `f_vchar(varying)`
+(PG: `f_vchar(bit varying)`). Separately the arglist carries only `Name`
+(dropping Args/OID), so a BARE `char` arg — parser-stamped bpchar-like,
+`Args=[1]`, like PG — is indistinguishable from OID-18 `"char"` and renders
+`"char"` where PG renders `character` (row 1349); (6) **NEW** — a reg* →
+text/varchar/name cast on a STRING-LITERAL source renders the raw OID:
+`'f_varbit(varbit)'::regprocedure::text` → `131072` (PG: `f_varbit(bit
+varying)`), `'f_varbit'::regproc::text` → `131072`, `'pg_type'::regclass::text`
+→ `1247`; the `::regprocedure` INPUT half resolves correctly, only the
+downstream cast to text/name/varchar renders the numeric datum.
+regtype/regrole/regcollation and non-literal sources unaffected (row 1350). See
+the ledger rows for the design docs and gate requirements.
