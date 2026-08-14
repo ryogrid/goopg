@@ -163,3 +163,8 @@
 2026-08-14T01:17:21+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
 2026-08-14T02:01:32+09:00 [RUN]	S1 barrier reached
 2026-08-14T02:39:21+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-08-14T02:41:01+09:00 [RUN]	log-push: committed + pushed batch logs to origin/make-db-cluster-compat
+2026-08-15T01:17:23+09:00 [RUN]	start run_id=20260815-011722 sha=6126dd2e dirty=63 src_fp=a306b29bac4ad329 stages=preflight,units,race,testport,pgbench,tpch,tpcds,summary
+2026-08-15T01:17:31+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
+2026-08-15T03:52:44+09:00 [RUN]	S1 barrier reached
+2026-08-15T04:30:54+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
