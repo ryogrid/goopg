@@ -19408,6 +19408,19 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 				return &ExecError{Code: code, Pos: s.Pos(), Message: err.Error()}
 			}
 			rt.Owner = o.currentDDLOwnerOID()
+			// Resolve the type's schema to a namespace OID so pg_type
+			// typnamespace is recorded faithfully (mirrors execCreateAggregate's
+			// schema-with-public-fallback resolution). M0119-0006 (deferral
+			// ledger row 1355).
+			schema := s.Schema
+			if schema == "" {
+				schema = "public"
+			}
+			nsOID := o.ctx.Catalog.SchemaOID(schema)
+			if nsOID == 0 {
+				nsOID = o.ctx.Catalog.SchemaOID("public")
+			}
+			rt.NamespaceOID = nsOID
 			syncRangeTypeToCatalogHeap(o.ctx, rt)
 			// Track range type creation so ROLLBACK can drop it (mirrors the
 			// composite-type branch above; range types previously had no
@@ -19440,6 +19453,19 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 			}
 			ct := cat.RegisterCompositeTypeWithFields(s.Name, fields, o.ctx.CurrentDatabaseOid)
 			ct.Owner = o.currentDDLOwnerOID()
+			// Resolve the type's schema to a namespace OID so pg_type
+			// typnamespace is recorded faithfully (mirrors execCreateAggregate's
+			// schema-with-public-fallback resolution). M0119-0006 (deferral
+			// ledger row 1355).
+			schema := s.Schema
+			if schema == "" {
+				schema = "public"
+			}
+			nsOID := o.ctx.Catalog.SchemaOID(schema)
+			if nsOID == 0 {
+				nsOID = o.ctx.Catalog.SchemaOID("public")
+			}
+			ct.NamespaceOID = nsOID
 			// Write pg_type heap rows (typtype='c' + its `_name` array) so the
 			// composite type is visible to pg_dump's getTypes and catalog
 			// queries. DU-002 slice 242.
@@ -19461,6 +19487,19 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 			cat.RegisterCompositeType(s.Name, o.ctx.CurrentDatabaseOid)
 			if ct := cat.LookupCompositeType(s.Name, o.ctx.CurrentDatabaseOid); ct != nil {
 				ct.Owner = o.currentDDLOwnerOID()
+				// Resolve the type's schema to a namespace OID so pg_type
+				// typnamespace is recorded faithfully (mirrors
+				// execCreateAggregate's schema-with-public-fallback resolution).
+				// M0119-0006 (deferral ledger row 1355).
+				schema := s.Schema
+				if schema == "" {
+					schema = "public"
+				}
+				nsOID := o.ctx.Catalog.SchemaOID(schema)
+				if nsOID == 0 {
+					nsOID = o.ctx.Catalog.SchemaOID("public")
+				}
+				ct.NamespaceOID = nsOID
 			}
 		}
 		return nil
@@ -19470,6 +19509,19 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
 	et.Owner = o.currentDDLOwnerOID()
+	// Resolve the type's schema to a namespace OID so pg_type typnamespace is
+	// recorded faithfully (mirrors execCreateAggregate's
+	// schema-with-public-fallback resolution). M0119-0006 (deferral ledger
+	// row 1355).
+	schema := s.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	nsOID := o.ctx.Catalog.SchemaOID(schema)
+	if nsOID == 0 {
+		nsOID = o.ctx.Catalog.SchemaOID("public")
+	}
+	et.NamespaceOID = nsOID
 	// Write a pg_type heap row so `SELECT 1 FROM pg_type WHERE oid = enumtypid`
 	// returns a match for the new type. M0097-0022.
 	syncEnumTypeToCatalogHeap(o.ctx, et)
@@ -20011,6 +20063,19 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 	// "Creator becomes owner" convention, mirroring execCreateType's range
 	// branch. M0122-0005 (domain follow-up).
 	d.Owner = o.currentDDLOwnerOID()
+	// Resolve the domain's schema to a namespace OID so pg_type typnamespace
+	// is recorded faithfully (mirrors execCreateAggregate's
+	// schema-with-public-fallback resolution). M0119-0006 (deferral ledger
+	// row 1355).
+	schema := s.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	nsOID := o.ctx.Catalog.SchemaOID(schema)
+	if nsOID == 0 {
+		nsOID = o.ctx.Catalog.SchemaOID("public")
+	}
+	d.NamespaceOID = nsOID
 	// Resolve a user-defined enum base type's dynamically-allocated OID and
 	// record it on the domain. TypeNameToOID falls back to text for enum names,
 	// so without this the pg_type row would carry typbasetype=text and pg_dump

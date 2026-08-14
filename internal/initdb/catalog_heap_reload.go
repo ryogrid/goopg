@@ -1385,6 +1385,10 @@ func reloadUserDomainsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog
 		dom := &catalog.Domain{
 			Name: d[1].StringValue(),
 			OID:  oid,
+			// typnamespace (pg_type col 2), captured so a reloaded domain
+			// keeps the schema it was created in. M0119-0006 (deferral ledger
+			// row 1355).
+			NamespaceOID: uint32(d[2].Int),
 			// Key under the scanned DB's OID — the OID a live session
 			// resolves for LookupDomain (see RegisterDomainDuringRecovery).
 			DBOid:    cat.DBOID(),
@@ -1452,9 +1456,10 @@ func reloadUserRangeTypesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, c
 	// (names, array peers, owner).
 	typeCols := executor.PGTypeColumnsPG18()
 	type typeInfo struct {
-		name     string
-		arrayOID uint32
-		owner    uint32
+		name      string
+		namespace uint32 // typnamespace (pg_type col 2)
+		arrayOID  uint32
+		owner     uint32
 	}
 	typeRel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: catalog.TypeRelationId, Fork: storage.MainFork}
 	typeRows, err := scanCatalogHeapRows(mgr, typeRel, clog, "pg_type",
@@ -1469,9 +1474,10 @@ func reloadUserRangeTypesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, c
 				return nil, false, errSkipBuiltinRow
 			}
 			return [2]any{oid, typeInfo{
-				name:     decoded[1].StringValue(),
-				arrayOID: uint32(decoded[14].Int),
-				owner:    uint32(decoded[3].Int),
+				name:      decoded[1].StringValue(),
+				namespace: uint32(decoded[2].Int),
+				arrayOID:  uint32(decoded[14].Int),
+				owner:     uint32(decoded[3].Int),
 			}}, false, nil
 		})
 	if err != nil {
@@ -1506,6 +1512,10 @@ func reloadUserRangeTypesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, c
 			MultirangeArrayOID: multiT.arrayOID,
 			MultirangeName:     multiT.name,
 			Owner:              rangeT.owner,
+			// typnamespace (pg_type col 2), captured so a reloaded range keeps
+			// the schema it was created in. M0119-0006 (deferral ledger row
+			// 1355).
+			NamespaceOID: rangeT.namespace,
 		})
 	}
 	return nil
@@ -1565,13 +1575,13 @@ func reloadUserEnumsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 			if oid < catalog.FirstUserOID || decoded[6].StringValue() != "e" {
 				return nil, false, errSkipBuiltinRow
 			}
-			return [4]any{oid, decoded[1].StringValue(), uint32(decoded[14].Int), uint32(decoded[3].Int)}, false, nil
+			return [5]any{oid, decoded[1].StringValue(), uint32(decoded[2].Int), uint32(decoded[14].Int), uint32(decoded[3].Int)}, false, nil
 		})
 	if err != nil {
 		return err
 	}
 	for _, raw := range typeRows {
-		tr := raw.([4]any)
+		tr := raw.([5]any)
 		oid := tr[0].(uint32)
 		lrs := byType[oid]
 		if len(lrs) == 0 {
@@ -1585,10 +1595,14 @@ func reloadUserEnumsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 		cat.RegisterEnumDuringRecovery(&catalog.EnumType{
 			Name:     tr[1].(string),
 			OID:      oid,
-			ArrayOID: tr[2].(uint32),
+			ArrayOID: tr[3].(uint32),
 			Values:   values,
-			Owner:    tr[3].(uint32),
+			Owner:    tr[4].(uint32),
 			DBOid:    cat.DBOID(),
+			// typnamespace (pg_type col 2), captured so a reloaded enum keeps
+			// the schema it was created in. M0119-0006 (deferral ledger row
+			// 1355).
+			NamespaceOID: tr[2].(uint32),
 		})
 	}
 	return nil

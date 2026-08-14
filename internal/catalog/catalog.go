@@ -3027,6 +3027,10 @@ type EnumType struct {
 	// a same-named enum without colliding. Mirrors Domain.DBOid. M0122-0007
 	// 4e follow-up.
 	DBOid uint32
+	// NamespaceOID is the pg_type typnamespace (schema OID) this enum was
+	// created in, mirroring UserCollation.NamespaceOID. M0119-0006 (deferral
+	// ledger row 1355).
+	NamespaceOID uint32
 }
 
 // OwnerOrDefault returns et.Owner, falling back to the bootstrap superuser OID
@@ -3083,6 +3087,10 @@ type Domain struct {
 	// deferral ledger row). M0122-0007 4e follow-up (DU-002 round-trip probe
 	// unblock).
 	DBOid uint32
+	// NamespaceOID is the pg_type typnamespace (schema OID) this domain was
+	// created in, mirroring UserCollation.NamespaceOID. M0119-0006 (deferral
+	// ledger row 1355).
+	NamespaceOID uint32
 }
 
 // OwnerOrDefault returns d.Owner, falling back to the bootstrap superuser OID
@@ -3181,6 +3189,10 @@ type CompositeType struct {
 	// same-named composite type without colliding. Mirrors EnumType.DBOid/
 	// Domain.DBOid. M0122-0007 4e follow-up.
 	DBOid uint32
+	// NamespaceOID is the pg_type typnamespace (schema OID) this composite
+	// type was created in, mirroring UserCollation.NamespaceOID. M0119-0006
+	// (deferral ledger row 1355).
+	NamespaceOID uint32
 }
 
 // OwnerOrDefault returns ct.Owner, falling back to the bootstrap superuser OID
@@ -3223,6 +3235,10 @@ type RangeType struct {
 	// EnumType.DBOid / CompositeType.DBOid / Domain.DBOid. M0122-0007 4e
 	// follow-up.
 	DBOid uint32
+	// NamespaceOID is the pg_type typnamespace (schema OID) this range type
+	// was created in, mirroring UserCollation.NamespaceOID. M0119-0006
+	// (deferral ledger row 1355).
+	NamespaceOID uint32
 }
 
 // OwnerOrDefault returns rt.Owner, falling back to the bootstrap superuser OID
