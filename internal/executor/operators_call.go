@@ -686,17 +686,45 @@ func routineArgTypeName(t parser.ColumnType) string {
 
 // argTypeSchema returns the namespace an argument type belongs to, for the
 // regprocedure output path's format_type_be arg-type qualification (deferral
-// row 1342). Only an EXPLICITLY qualified name (ColumnType.Schema) yields a
-// schema — goopg's user-type store has no namespace field, so a BARE type name
-// cannot be mapped to its owner schema (bounded limitation, documented in the
-// 73rd-slice design doc §3.5). A pg_catalog-qualified name yields "pg_catalog"
-// so the renderer's builtin-alias + never-qualify arms apply. A bare BUILTIN
-// name keeps "" (equivalent rendering: the renderer treats "" and "pg_catalog"
-// identically). The parser already case-folded an UNQUOTED qualifier (identText
-// lowercases) but PRESERVED case for a quoted `"OffPath".mytype`, so the value
-// must be returned verbatim — never re-lowered.
-func argTypeSchema(t parser.ColumnType) string {
-	return t.Schema
+// row 1342). An EXPLICITLY qualified name (ColumnType.Schema) is returned
+// verbatim — never re-lowered: the parser case-folded an UNQUOTED qualifier
+// (identText lowercases) but PRESERVED case for a quoted `"OffPath".mytype`.
+// A BARE name is resolved against the user-type registries at capture time
+// (deferral row 1343): the element type's NamespaceOID — populated at CREATE
+// TYPE/DOMAIN and at startup reload — maps to its owner schema, mirroring PG's
+// format_type.c:318 get_namespace_name_or_temp(typeform->typnamespace). The
+// probe order (enum → domain → composite → range → multirange) matches
+// userTypeOIDForName (expr.go); a bare BUILTIN name hits no registry and keeps
+// "" (equivalent rendering: the renderer treats "" and "pg_catalog"
+// identically). A pg_catalog-qualified name yields "pg_catalog" so the
+// renderer's builtin-alias + never-qualify arms apply.
+func argTypeSchema(t parser.ColumnType, cat catalog.Catalog, dbOid uint32) string {
+	if t.Schema != "" {
+		return t.Schema
+	}
+	// Bare name: probe the ELEMENT type's owner schema. Key on the raw element
+	// name (before routineArgTypeName bakes the "[]"); strip a trailing "[]"
+	// if one is present — the schema is the element type's.
+	name := t.Name
+	if base, isArray := splitArraySuffix(name); isArray {
+		name = base
+	}
+	if et, ok := cat.LookupEnum(name, dbOid); ok {
+		return cat.SchemaNameForOID(et.NamespaceOID)
+	}
+	if dom, ok := cat.LookupDomain(name, dbOid); ok {
+		return cat.SchemaNameForOID(dom.NamespaceOID)
+	}
+	if ct := cat.LookupCompositeType(name, dbOid); ct != nil {
+		return cat.SchemaNameForOID(ct.NamespaceOID)
+	}
+	if rt, ok := cat.LookupRangeType(name, dbOid); ok {
+		return cat.SchemaNameForOID(rt.NamespaceOID)
+	}
+	if rt, ok := cat.LookupRangeTypeByMultirangeName(name); ok {
+		return cat.SchemaNameForOID(rt.NamespaceOID)
+	}
+	return ""
 }
 
 // isKnownBuiltinFunction returns true if name is a known built-in SQL function

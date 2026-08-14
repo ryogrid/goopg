@@ -11886,7 +11886,13 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 			Name: routineArgTypeName(a.Type),
 			Args: append([]int64(nil), a.Type.Args...),
 		}
-		argTypeSchemas[i] = argTypeSchema(a.Type)
+		// Pass the RAW connection dbOid (not NamespaceDBOid-normalized): the
+		// user-type registries are keyed by the exact value RegisterEnum/
+		// RegisterDomain/RegisterCompositeTypeWithFields/RegisterRangeType
+		// received (o.ctx.CurrentDatabaseOid), unlike the routine registry which
+		// normalizes via NamespaceDBOid — so a bare-name probe must use the same
+		// raw key the type was registered under (M0119-0006, deferral row 1343).
+		argTypeSchemas[i] = argTypeSchema(a.Type, o.ctx.Catalog, o.ctx.CurrentDatabaseOid)
 		argTypeOIDs[i] = argTypeOID(a.Type)
 		argNames[i] = a.Name
 		switch a.Mode {
@@ -12648,7 +12654,13 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 			Name: routineArgTypeName(a.Type),
 			Args: append([]int64(nil), a.Type.Args...),
 		}
-		argTypeSchemas[i] = argTypeSchema(a.Type)
+		// Pass the RAW connection dbOid (not NamespaceDBOid-normalized): the
+		// user-type registries are keyed by the exact value RegisterEnum/
+		// RegisterDomain/RegisterCompositeTypeWithFields/RegisterRangeType
+		// received (o.ctx.CurrentDatabaseOid), unlike the routine registry which
+		// normalizes via NamespaceDBOid — so a bare-name probe must use the same
+		// raw key the type was registered under (M0119-0006, deferral row 1343).
+		argTypeSchemas[i] = argTypeSchema(a.Type, o.ctx.Catalog, o.ctx.CurrentDatabaseOid)
 		argTypeOIDs[i] = argTypeOID(a.Type)
 		argNames[i] = a.Name
 		switch a.Mode {

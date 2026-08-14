@@ -228,6 +228,117 @@ func TestCreateFunctionCapturesArgTypeSchemas(t *testing.T) {
 	}
 }
 
+// M0119-0006 (93rd slice, deferral row 1343): a BARE user-defined arg type in
+// CREATE FUNCTION/PROCEDURE must store its owner schema in ArgTypeSchemas[i] so
+// the regprocedure arglist renders `g(offpath.myenum)` — PG 18.3 resolves the
+// bare name to its pg_type tuple at routine creation (parse_type.c:291
+// typenameTypeId → LookupTypeNameExtended, name→namespace) and format_type_be
+// then schema-qualifies when !TypeIsVisible (format_type.c:315/318/322,
+// get_namespace_name_or_temp(typeform->typnamespace)). goopg's capture half
+// mirrors that by probing the user-type registries (enum → domain → composite →
+// range → multirange, the userTypeOIDForName order) and storing the element
+// type's ACTUAL owner schema from its NamespaceOID — NOT the explicit qualifier
+// (there is none) and NOT the visibility predicate's output. A bare BUILTIN arg
+// hits no registry and keeps "".
+func TestCreateFunctionCapturesBareArgTypeSchema(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	im, ok := cat.(*catalog.InMemory)
+	if !ok {
+		t.Fatal("catalog is not *InMemory")
+	}
+	im.RegisterSchema("offpath")
+
+	// One user type of each kind in a non-public schema.
+	if err := runDDL(t, ctx, `CREATE TYPE offpath.myenum AS ENUM ('a', 'b')`); err != nil {
+		t.Fatalf("CREATE TYPE offpath.myenum: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TYPE offpath.mycomp AS (a int4, b text)`); err != nil {
+		t.Fatalf("CREATE TYPE offpath.mycomp: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TYPE offpath.myrange AS RANGE (subtype = int4)`); err != nil {
+		t.Fatalf("CREATE TYPE offpath.myrange: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE DOMAIN offpath.mydom AS int4`); err != nil {
+		t.Fatalf("CREATE DOMAIN offpath.mydom: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE FUNCTION g_bare(myenum, mycomp, myrange, mydom, integer) RETURNS int4 LANGUAGE sql AS $$ SELECT 1 $$`); err != nil {
+		t.Fatalf("create function: %v", err)
+	}
+
+	cands := ctx.Catalog.Routines().LookupByName(parser.ObjectName{Name: "g_bare"})
+	if len(cands) != 1 {
+		t.Fatalf("expected 1 g_bare routine, got %d", len(cands))
+	}
+	r := cands[0]
+	want := []string{"offpath", "offpath", "offpath", "offpath", ""}
+	if len(r.ArgTypeSchemas) != len(want) {
+		t.Fatalf("ArgTypeSchemas = %v (len %d), want %v (len %d)", r.ArgTypeSchemas, len(r.ArgTypeSchemas), want, len(want))
+	}
+	for i := range want {
+		if r.ArgTypeSchemas[i] != want[i] {
+			t.Errorf("ArgTypeSchemas[%d] = %q, want %q (full %v)", i, r.ArgTypeSchemas[i], want[i], r.ArgTypeSchemas)
+		}
+	}
+
+	// Default session search_path ("$user", public): offpath is off the path,
+	// so the BARE arg types render schema-qualified; the bare builtin stays bare.
+	if got := runQuery(t, ctx, fmt.Sprintf(`SELECT %d::regprocedure::text`, r.OID))[0][0].StringValue(); got != "g_bare(offpath.myenum,offpath.mycomp,offpath.myrange,offpath.mydom,integer)" {
+		t.Errorf("%d::regprocedure::text = %q, want %q", r.OID, got, "g_bare(offpath.myenum,offpath.mycomp,offpath.myrange,offpath.mydom,integer)")
+	}
+
+	// When the type's schema IS on the effective search_path, the renderer
+	// emits the bare name (TypeIsVisible → no qualification). The capture
+	// stores the ACTUAL owner schema; the visibility predicate decides at
+	// render time (regprocedureArglist), so this arm exercises the visible
+	// path against the same captured schemas.
+	ctx.GetSetting = func(name string) (string, bool) {
+		if name == "search_path" {
+			return "offpath, public", true
+		}
+		return "", false
+	}
+	if got := runQuery(t, ctx, fmt.Sprintf(`SELECT %d::regprocedure::text`, r.OID))[0][0].StringValue(); got != "g_bare(myenum,mycomp,myrange,mydom,integer)" {
+		t.Errorf("on-path %d::regprocedure::text = %q, want %q", r.OID, got, "g_bare(myenum,mycomp,myrange,mydom,integer)")
+	}
+
+	// Array form: the schema is the ELEMENT type's, so a bare `myenum[]` arg
+	// must also resolve to offpath (the [] is stripped before probing).
+	ctx.GetSetting = nil
+	if err := runDDL(t, ctx, `CREATE FUNCTION g_bare_arr(myenum[]) RETURNS int4 LANGUAGE sql AS $$ SELECT 1 $$`); err != nil {
+		t.Fatalf("create function (array arg): %v", err)
+	}
+	acands := ctx.Catalog.Routines().LookupByName(parser.ObjectName{Name: "g_bare_arr"})
+	if len(acands) != 1 {
+		t.Fatalf("expected 1 g_bare_arr routine, got %d", len(acands))
+	}
+	ar := acands[0]
+	if len(ar.ArgTypeSchemas) != 1 || ar.ArgTypeSchemas[0] != "offpath" {
+		t.Errorf("g_bare_arr ArgTypeSchemas = %v, want [offpath]", ar.ArgTypeSchemas)
+	}
+	if got := runQuery(t, ctx, fmt.Sprintf(`SELECT %d::regprocedure::text`, ar.OID))[0][0].StringValue(); got != "g_bare_arr(offpath.myenum[])" {
+		t.Errorf("%d::regprocedure::text = %q, want %q", ar.OID, got, "g_bare_arr(offpath.myenum[])")
+	}
+
+	// Sibling capture path: execCreateProcedure must record the bare arg's
+	// owner schema identically (Hard-won Rule #2 — change both, test both).
+	if err := runDDL(t, ctx, `CREATE PROCEDURE p_bare(myenum) LANGUAGE sql AS $$ SELECT 1 $$`); err != nil {
+		t.Fatalf("create procedure: %v", err)
+	}
+	pcands := ctx.Catalog.Routines().LookupByName(parser.ObjectName{Name: "p_bare"})
+	if len(pcands) != 1 {
+		t.Fatalf("expected 1 p_bare routine, got %d", len(pcands))
+	}
+	pr := pcands[0]
+	if len(pr.ArgTypeSchemas) != 1 || pr.ArgTypeSchemas[0] != "offpath" {
+		t.Errorf("p_bare ArgTypeSchemas = %v, want [offpath]", pr.ArgTypeSchemas)
+	}
+	if got := runQuery(t, ctx, fmt.Sprintf(`SELECT %d::regprocedure::text`, pr.OID))[0][0].StringValue(); got != "p_bare(offpath.myenum)" {
+		t.Errorf("%d::regprocedure::text = %q, want %q", pr.OID, got, "p_bare(offpath.myenum)")
+	}
+}
+
 // M0119-0006 (77th slice, deferral row 1351): execCreateFunction/
 // execCreateProcedure capture each arg type's RESOLVED OID at CREATE time
 // (ArgTypeOIDs, parallel to ArgTypes/ArgTypeSchemas) — NON-ZERO only for the
