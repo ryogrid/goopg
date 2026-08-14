@@ -78,7 +78,9 @@ error cases. It depends on two things the runner does not provide:
    raw-verify 23/23 common carets byte-match PG. Cross-case note:
    `docs/design/0134-0001-p3b-error-position-context.md`. Two deferrals remain
    (22P02 type-coercion location; byte-vs-char multibyte index).
-4. **P2 `EXPLAIN` format** — broadest remaining engine gap; separate milestone-sized effort.
+4. **P2 `EXPLAIN` format** — broadest remaining engine gap; separate milestone-sized effort
+   (mapped + decomposed 2026-08-15 → `docs/design/0134-0001-p2-explain-format.md`,
+   slices S1–S10; note the diff-direction correction `-`=PG/`+`=goopg).
 5. **P6/P7/P8** — deparse, collation, residual expr errors.
 6. ~~P5 bytea string_agg delimiter~~ — reclassified non-issue (see map above).
 
