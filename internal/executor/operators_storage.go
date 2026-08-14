@@ -7633,14 +7633,14 @@ func waitForConflictingRowLock(ctx *Context, rel storage.RelFileNode, blk storag
 // in unique constraints) or when the column is not found. M0100-0005.
 // cat is optional (may be nil): when provided, KindString values on enum-typed
 // columns are converted to KindEnum so encoding is consistent with the probe path.
-func encodeIndexKeyFromCols(idx *catalog.Index, cols []catalog.Column, row Row, cat ...catalog.Catalog) ([]byte, error) {
+func encodeIndexKeyFromCols(ctx *Context, idx *catalog.Index, cols []catalog.Column, row Row, cat ...catalog.Catalog) ([]byte, error) {
 	keyCols, vals, ok := indexRowKeyValues(idx, cols, row, cat...)
 	if !ok {
 		return nil, nil
 	}
 	var out []byte
 	for i, v := range vals {
-		keyPart, err := encodeBTreeKeyForColumn(v, keyCols[i], 0)
+		keyPart, err := encodeBTreeKeyForColumn(ctx, v, keyCols[i], 0)
 		if err != nil {
 			return nil, err
 		}
@@ -7795,7 +7795,7 @@ func encodeExprIndexKey(ctx *Context, idx *catalog.Index, tbl *catalog.Table, ro
 			if v.IsNull() {
 				return nil
 			}
-			keyPart, err := encodeBTreeKeyForColumn(v, col, 0)
+			keyPart, err := encodeBTreeKeyForColumn(ctx, v, col, 0)
 			if err != nil {
 				return nil
 			}

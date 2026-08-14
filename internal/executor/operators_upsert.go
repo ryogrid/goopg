@@ -1558,7 +1558,7 @@ func encodeArbiterKey(ctx *Context, oc *planner.OnConflictPlan, tbl *catalog.Tab
 			return nil, nil
 		}
 		col := &tbl.Columns[ord]
-		k, ee := encodeBTreeKeyForColumn(v, col, pos)
+		k, ee := encodeBTreeKeyForColumn(ctx, v, col, pos)
 		if ee != nil {
 			return nil, ee
 		}

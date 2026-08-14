@@ -46,8 +46,8 @@ func TestIndexProbeKeyBlobIsTheConcatenation(t *testing.T) {
 	if encErr != nil {
 		t.Fatalf("indexProbeKey: %v", encErr)
 	}
-	ka, e1 := encodeBTreeKeyForColumn(a, &idx.Table.Columns[0], 0)
-	kb, e2 := encodeBTreeKeyForColumn(b, &idx.Table.Columns[1], 0)
+	ka, e1 := encodeBTreeKeyForColumn(nil, a, &idx.Table.Columns[0], 0)
+	kb, e2 := encodeBTreeKeyForColumn(nil, b, &idx.Table.Columns[1], 0)
 	if e1 != nil || e2 != nil {
 		t.Fatalf("fixture encode failed: %v %v", e1, e2)
 	}
@@ -129,7 +129,7 @@ func TestIndexProbeKeyUndescribableIndexKeepsBlob(t *testing.T) {
 	if encErr != nil {
 		t.Fatalf("indexProbeKey: %v", encErr)
 	}
-	want, e := encodeBTreeKeyForColumn(a, &idx.Table.Columns[0], 0)
+	want, e := encodeBTreeKeyForColumn(nil, a, &idx.Table.Columns[0], 0)
 	if e != nil {
 		t.Fatalf("fixture encode failed: %v", e)
 	}

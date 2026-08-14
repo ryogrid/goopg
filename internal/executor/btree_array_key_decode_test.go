@@ -32,6 +32,16 @@ var arrayKeyDecodeCases = []struct {
 	// oid keys widen to the int8 key form (oidcmp is unsigned) — the decode has
 	// to invert that width, not int4's.
 	{"oid", "{0,4294967295}", "{0,4294967295}"},
+	// reg* family: elements encode as 8-byte unsigned oidcmp keys and decode
+	// back to the OID, rendered numerically under DefaultOutputStyle (st.RegOut
+	// nil) — "-" for OID 0, exactly DecodeElemStyled's fallback
+	// (pgarray.go:427-444). M0119-0006-0006.
+	{"regproc", "{24,0}", "{24,-}"},
+	{"regprocedure", "{1259,0}", "{1259,-}"},
+	{"regclass", "{1259,0}", "{1259,-}"},
+	{"regtype", "{23,4294967295}", "{23,4294967295}"},
+	{"regrole", "{4200,0}", "{4200,-}"},
+	{"regcollation", "{100,0}", "{100,-}"},
 	{"bool", "{t,f}", "{t,f}"},
 	{"float8", "{1.5,2,-0.25}", "{1.5,2,-0.25}"},
 	{"numeric", "{1.50,-3}", "{1.5,-3}"},
@@ -49,7 +59,7 @@ var arrayKeyDecodeCases = []struct {
 func TestDecodeArrayBTreeKeyRoundTrip(t *testing.T) {
 	for _, tc := range arrayKeyDecodeCases {
 		col := catalog.Column{Name: "a", Type: catalog.Type{Name: tc.elemType, IsArray: true}}
-		key, encErr := encodeBTreeKeyForColumn(NewStringDatum(tc.lit), &col, 0)
+		key, encErr := encodeBTreeKeyForColumn(nil, NewStringDatum(tc.lit), &col, 0)
 		if encErr != nil {
 			t.Fatalf("%s[] encode %s: %v", tc.elemType, tc.lit, encErr)
 		}
@@ -80,7 +90,7 @@ func TestDecodeArrayBTreeKeyRoundTrip(t *testing.T) {
 func TestArrayBTreeKeyDecodeSiblingParity(t *testing.T) {
 	for _, tc := range arrayKeyDecodeCases {
 		col := catalog.Column{Name: "a", Type: catalog.Type{Name: tc.elemType, IsArray: true}}
-		key, encErr := encodeBTreeKeyForColumn(NewStringDatum(tc.lit), &col, 0)
+		key, encErr := encodeBTreeKeyForColumn(nil, NewStringDatum(tc.lit), &col, 0)
 		if encErr != nil {
 			t.Fatalf("%s[] encode %s: %v", tc.elemType, tc.lit, encErr)
 		}
@@ -111,11 +121,11 @@ func TestDecodeArrayBTreeKeyCompositeWalk(t *testing.T) {
 	acol := catalog.Column{Name: "a", Type: catalog.Type{Name: "int4", IsArray: true}}
 	bcol := catalog.Column{Name: "b", Type: catalog.Type{Name: "int4"}}
 	for _, arr := range []string{"{}", "{1}", "{1,2}", "{1,NULL}", "{10,20,30}"} {
-		ak, encErr := encodeBTreeKeyForColumn(NewStringDatum(arr), &acol, 0)
+		ak, encErr := encodeBTreeKeyForColumn(nil, NewStringDatum(arr), &acol, 0)
 		if encErr != nil {
 			t.Fatalf("encode %s: %v", arr, encErr)
 		}
-		bk, encErr := encodeBTreeKeyForColumn(NewIntDatum(7), &bcol, 0)
+		bk, encErr := encodeBTreeKeyForColumn(nil, NewIntDatum(7), &bcol, 0)
 		if encErr != nil {
 			t.Fatalf("encode b: %v", encErr)
 		}
@@ -171,7 +181,7 @@ func TestDecodeArrayBTreeKeyRejectsMalformed(t *testing.T) {
 	// A well-formed array followed by trailing bytes is fine for the composite
 	// walk (that is the next column) but not for a single-column key, where the
 	// key IS the one column.
-	key, encErr := encodeBTreeKeyForColumn(NewStringDatum("{1}"), &col, 0)
+	key, encErr := encodeBTreeKeyForColumn(nil, NewStringDatum("{1}"), &col, 0)
 	if encErr != nil {
 		t.Fatalf("encode {1}: %v", encErr)
 	}
@@ -265,7 +275,7 @@ func TestArrayKeyTextMatchesHeapText(t *testing.T) {
 			continue
 		}
 		lit := "{" + c.lit + "}"
-		key, encErr := encodeBTreeKeyForColumn(NewStringDatum(lit), &col, 0)
+		key, encErr := encodeBTreeKeyForColumn(nil, NewStringDatum(lit), &col, 0)
 		if encErr != nil {
 			t.Fatalf("%s[]: key encode %q: %s", c.typ, lit, encErr.Message)
 		}

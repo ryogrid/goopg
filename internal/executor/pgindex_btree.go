@@ -172,7 +172,7 @@ func (ctx *Context) indexProbeKey(idx *catalog.Index, parts []indexProbeKeyPart)
 	if desc == nil {
 		var probe []byte
 		for _, p := range parts {
-			segment, encErr := encodeBTreeKeyForColumn(p.val, p.col, p.pos)
+			segment, encErr := encodeBTreeKeyForColumn(ctx, p.val, p.col, p.pos)
 			if encErr != nil {
 				return nil, encErr
 			}
@@ -273,7 +273,7 @@ func (ctx *Context) indexRowProbeKey(idx *catalog.Index, cols []catalog.Column, 
 func (ctx *Context) indexRowKey(idx *catalog.Index, cols []catalog.Column, row Row, tid storage.ItemPointer) ([]byte, error) {
 	desc := ctx.pgIndexKeyDesc(idx)
 	if desc == nil {
-		return encodeIndexKeyFromCols(idx, cols, row, ctx.Catalog)
+		return encodeIndexKeyFromCols(ctx, idx, cols, row, ctx.Catalog)
 	}
 	keyCols, vals, ok := indexRowKeyValues(idx, cols, row, ctx.Catalog)
 	if !ok {

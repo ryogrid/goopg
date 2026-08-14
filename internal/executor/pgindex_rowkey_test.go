@@ -41,7 +41,7 @@ func TestIndexRowKeyBlobEntryAndProbeAreIdentical(t *testing.T) {
 	ctx, idx, cols := rowKeyCtxAndIndex(t, 400, col("a", "int4"), col("b", "text"))
 	row := Row{NewIntDatum(42), NewStringDatum("xyz")}
 
-	want, err := encodeIndexKeyFromCols(idx, cols, row, nil)
+	want, err := encodeIndexKeyFromCols(nil, idx, cols, row, nil)
 	if err != nil || want == nil {
 		t.Fatalf("fixture encodeIndexKeyFromCols = %x, %v", want, err)
 	}
@@ -151,7 +151,7 @@ func TestIndexRowKeyUndescribableIndexKeepsBlob(t *testing.T) {
 	}
 	row := Row{NewIntDatum(42)}
 
-	want, err := encodeIndexKeyFromCols(idx, cols, row, nil)
+	want, err := encodeIndexKeyFromCols(nil, idx, cols, row, nil)
 	if err != nil {
 		t.Fatalf("fixture: %v", err)
 	}

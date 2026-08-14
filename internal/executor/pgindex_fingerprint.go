@@ -72,7 +72,7 @@ import "github.com/goopg/goopg/internal/catalog"
 // (`indexKeyColumnsChanged` falls back to the NULL-pattern comparison under
 // NULLS NOT DISTINCT; `ssiRecordHashIndexInsert` skips the index).
 func indexKeyFingerprint(idx *catalog.Index, cols []catalog.Column, row Row, cat catalog.Catalog) ([]byte, error) {
-	return encodeIndexKeyFromCols(idx, cols, row, cat)
+	return encodeIndexKeyFromCols(nil, idx, cols, row, cat)
 }
 
 // indexColumnFingerprint encodes ONE key column's value the way that column
@@ -85,5 +85,9 @@ func indexKeyFingerprint(idx *catalog.Index, cols []catalog.Column, row Row, cat
 // encode failure as "structurally undecidable" and falls back), so it is fixed
 // at 0 here rather than threaded.
 func indexColumnFingerprint(v Datum, col *catalog.Column) ([]byte, *ExecError) {
-	return encodeBTreeKeyForColumn(v, col, 0)
+	// No ctx: fingerprint runs from a heap-decoded numeric-OID string, which
+	// regIdentifierInput's numeric passthrough resolves (see the reg* arm's
+	// nil-ctx contract). A name reaching this path errors rather than being
+	// silently stored.
+	return encodeBTreeKeyForColumn(nil, v, col, 0)
 }

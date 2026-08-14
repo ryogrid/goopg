@@ -50,7 +50,7 @@ func TestEncodeIntervalBTreeKeyMatchesPGOrder(t *testing.T) {
 	col := intervalCol()
 	var prev []byte
 	for i, lit := range intervalKeyOrder {
-		k, err := encodeBTreeKeyForColumn(NewStringDatum(lit), col, 0)
+		k, err := encodeBTreeKeyForColumn(nil, NewStringDatum(lit), col, 0)
 		if err != nil {
 			t.Fatalf("encode %q: %v", lit, err)
 		}
@@ -80,11 +80,11 @@ func TestIntervalKeyIsTheComparisonSpan(t *testing.T) {
 		{"1 day", "24:00:00"},
 	}
 	for _, p := range equalPairs {
-		a, err := encodeBTreeKeyForColumn(NewStringDatum(p[0]), col, 0)
+		a, err := encodeBTreeKeyForColumn(nil, NewStringDatum(p[0]), col, 0)
 		if err != nil {
 			t.Fatalf("encode %q: %v", p[0], err)
 		}
-		b, err := encodeBTreeKeyForColumn(NewStringDatum(p[1]), col, 0)
+		b, err := encodeBTreeKeyForColumn(nil, NewStringDatum(p[1]), col, 0)
 		if err != nil {
 			t.Fatalf("encode %q: %v", p[1], err)
 		}
@@ -113,11 +113,11 @@ func TestIntervalKeyStringAndIntervalDatumAgree(t *testing.T) {
 		{"-00:00:00.000001", 0, 0, -1},
 	}
 	for _, c := range cases {
-		fromText, err := encodeBTreeKeyForColumn(NewStringDatum(c.lit), col, 0)
+		fromText, err := encodeBTreeKeyForColumn(nil, NewStringDatum(c.lit), col, 0)
 		if err != nil {
 			t.Fatalf("encode text %q: %v", c.lit, err)
 		}
-		fromDatum, err := encodeBTreeKeyForColumn(
+		fromDatum, err := encodeBTreeKeyForColumn(nil, 
 			NewIntervalDatumFull(c.months, c.days, c.micros), col, 0)
 		if err != nil {
 			t.Fatalf("encode datum %q: %v", c.lit, err)
@@ -133,7 +133,7 @@ func TestIntervalKeyStringAndIntervalDatumAgree(t *testing.T) {
 // bulk build surfaces the error; the runtime maintain path swallows it, which
 // is exactly why it must not be a silent success.
 func TestIntervalKeyRejectsUnparseableText(t *testing.T) {
-	_, err := encodeBTreeKeyForColumn(NewStringDatum("not an interval"), intervalCol(), 0)
+	_, err := encodeBTreeKeyForColumn(nil, NewStringDatum("not an interval"), intervalCol(), 0)
 	if err == nil {
 		t.Fatalf("encoding %q succeeded; want 22007", "not an interval")
 	}
@@ -151,7 +151,7 @@ func TestIntervalKeyRejectsUnparseableText(t *testing.T) {
 // composite walk by half the key.
 func TestIntervalKeyDecodeIsRefused(t *testing.T) {
 	col := *intervalCol()
-	key, encErr := encodeBTreeKeyForColumn(NewStringDatum("1 mon"), &col, 0)
+	key, encErr := encodeBTreeKeyForColumn(nil, NewStringDatum("1 mon"), &col, 0)
 	if encErr != nil {
 		t.Fatalf("encode: %v", encErr)
 	}
@@ -201,7 +201,7 @@ func TestIntervalIndexBuildAndMaintainKeys(t *testing.T) {
 	col := intervalCol()
 	want := make([][]byte, len(intervalKeyOrder))
 	for i, lit := range intervalKeyOrder {
-		k, err := encodeBTreeKeyForColumn(NewStringDatum(lit), col, 0)
+		k, err := encodeBTreeKeyForColumn(nil, NewStringDatum(lit), col, 0)
 		if err != nil {
 			t.Fatalf("encode %q: %v", lit, err)
 		}
@@ -231,14 +231,14 @@ func TestIntervalCompositeKeyIsSelfDelimiting(t *testing.T) {
 	icol := intervalCol()
 	kcol := &catalog.Column{Name: "k", Type: catalog.Type{Name: "int4"}}
 	build := func(lit string, k int64) []byte {
-		iv, err := encodeBTreeKeyForColumn(NewStringDatum(lit), icol, 0)
+		iv, err := encodeBTreeKeyForColumn(nil, NewStringDatum(lit), icol, 0)
 		if err != nil {
 			t.Fatalf("encode %q: %v", lit, err)
 		}
 		if len(iv) != 16 {
 			t.Fatalf("interval key for %q is %d bytes, want a fixed 16", lit, len(iv))
 		}
-		tail, err := encodeBTreeKeyForColumn(NewIntDatum(k), kcol, 0)
+		tail, err := encodeBTreeKeyForColumn(nil, NewIntDatum(k), kcol, 0)
 		if err != nil {
 			t.Fatalf("encode tail %d: %v", k, err)
 		}

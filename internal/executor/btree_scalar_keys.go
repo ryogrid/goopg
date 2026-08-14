@@ -62,11 +62,31 @@ func isInt2Type(name string) bool {
 	}
 }
 
-// isOidType returns true for the object-identifier type. `regproc` shares oid's
-// physical form in the codec (codec.go), and therefore its key encoding.
+// isOidType returns true for the object-identifier type. NUMERIC-ONLY: oid has
+// no name form, so a KindString oid probe is coerced as an integer
+// (coerceScalarKeyStringDatum). `regproc` was removed from this arm by
+// M0119-0006-0006 — it is now a member of the reg* family (isRegType), which
+// resolves NAME→OID on encode through regIdentifierInput exactly like its five
+// siblings, rather than failing a name probe with 22P02.
 func isOidType(name string) bool {
 	switch strings.ToLower(name) {
-	case "oid", "regproc":
+	case "oid":
+		return true
+	default:
+		return false
+	}
+}
+
+// isRegType returns true for the six reg* types (regproc, regprocedure,
+// regclass, regtype, regrole, regcollation). Their DEFAULT btree opclass is
+// oid_ops, so the KEY is the same 8-byte unsigned oidcmp form the oid arm
+// produces — but unlike oid they must resolve NAME→OID on encode
+// (regIdentifierInput, regproc.c:882 regclassin et al.) and render OID→name on
+// decode, which is why they get their own arm in encodeBTreeKeyForColumn /
+// arrayKeyElemRenderer rather than riding the numeric-only oid arm.
+func isRegType(name string) bool {
+	switch strings.ToLower(name) {
+	case "regproc", "regprocedure", "regclass", "regtype", "regrole", "regcollation":
 		return true
 	default:
 		return false
@@ -287,7 +307,12 @@ func decodeScalarBTreeKey(key []byte, typeName string) (d Datum, n int, handled 
 		}
 		v, derr := btree.DecodeInt4(key[:4])
 		return Datum{Kind: KindInt, Int: int64(v)}, 4, true, derr
-	case isOidType(typeName):
+	// reg* types share oid's 8-byte unsigned key form (their default opclass is
+	// oid_ops → oidcmp, the same EncodeInt8 the oid arm uses), so this single
+	// case inverts all seven. The datum is the raw OID; the RENDER-side
+	// OID→name is arrayKeyElemRenderer's job (array elements) — a scalar IOS
+	// emits the OID datum, whose KindInt round-trips the key byte-for-byte.
+	case isOidType(typeName) || isRegType(typeName):
 		if len(key) < 8 {
 			return NullDatum, 0, true, fmt.Errorf("btree: oid key truncated, got %d bytes", len(key))
 		}

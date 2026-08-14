@@ -74,7 +74,7 @@ func TestArrayKeyTextMatchesHeapTextUnderSessionStyle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("heap encode: %v", err)
 	}
-	key, encErr := encodeBTreeKeyForColumn(NewStringDatum(lit), &col, 0)
+	key, encErr := encodeBTreeKeyForColumn(nil, NewStringDatum(lit), &col, 0)
 	if encErr != nil {
 		t.Fatalf("key encode: %s", encErr.Message)
 	}

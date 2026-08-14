@@ -4398,6 +4398,30 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       (Q12=2, Q13=35), `TestPort_RegressSuite` all PASS. Two new deferral rows:
       btree array-key 0A000 (indexed `regclass[]`), WAL pgoutput reg*[] numeric
       rendering. Design `0119-0006-reg-array-element-fidelity.md`.
+      **81st slice (2026-08-14): btree `reg*[]` (and scalar `reg*`) keys encode as
+      8-byte oidcmp — deferral row 1352 resolved.** `CREATE INDEX` over a `reg*[]`
+      column (and over a scalar `reg*` column — the row's "scalar arm already
+      exists" premise was wrong; the 66th slice was heap-only, so scalar regclass/
+      regtype/regprocedure/regrole/regcollation indexed columns ALSO 0A000'd today)
+      raised `0A000` because `encodeBTreeKeyForColumn` had no reg* arm. Two
+      corrections drive the design: the KEY is the **8-byte unsigned oidcmp** form
+      (`btree.EncodeInt8`), NOT 4 bytes — every reg* type's default opclass is
+      `oid_ops` and `array_cmp` compares elements with unsigned `oidcmp`
+      (arrayfuncs.c:3991); and `regproc` joins the reg* family (`isRegType`, six
+      members) leaving `isOidType` oid-only, so a regproc name element resolves
+      instead of 22P02. Name→OID via `regIdentifierInput` (`parseDashOrOid` first,
+      then per-type catalog miss SQLSTATEs 42P01/42704/42883/42602/22003 preserved
+      via `keyExecError`), `ctx`+`pos` threaded through `encodeBTreeKeyForColumn`/
+      `encodeArrayBTreeKey` with a nil-ctx numeric-passthrough contract for the
+      fingerprint path. Decode twin lands together: `arrayKeyElemRenderer` reg* arm
+      (OID→name via `st.RegOut`, mirroring `DecodeElemStyled`), which makes reg*[]
+      decodable automatically (no `btree_key_decodable.go` edit) so index-only scans
+      activate. `isSupportedBTreeKeyType` admits `isRegType` (the CREATE INDEX gate
+      that actually fired the 0A000). Tests: six reg* rows in `scalarKeyCases`/
+      `indexKeyTypeCases`/`arrayKeyDecodeCases` + reg*[] name-literal IOS cases +
+      `TestScalarRegIndexDDLMaintains` (E2E build+maintain), mutation-checked.
+      Gates: pre-commit units + `scripts/tpch-spotcheck.sh` (Q12=2, Q13=35) PASS.
+      Design `0119-0006-btree-reg-array-key-oidcmp.md`.
 
 - [x] **M0119-0010 — `char(N)` typmods are not restored per column on catalog
       reload** (source: M0127-P5.9-f, ledger row 2026-08-05). **FIXED (2026-08-09).**

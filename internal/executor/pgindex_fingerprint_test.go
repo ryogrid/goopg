@@ -33,7 +33,7 @@ func TestIndexKeyFingerprintIgnoresTheTupleFormat(t *testing.T) {
 	}
 	row := Row{NewIntDatum(42), NewStringDatum("xyz")}
 
-	blob, err := encodeIndexKeyFromCols(idx, cols, row, nil)
+	blob, err := encodeIndexKeyFromCols(nil, idx, cols, row, nil)
 	if err != nil || blob == nil {
 		t.Fatalf("fixture encodeIndexKeyFromCols = %x, %v", blob, err)
 	}
@@ -89,7 +89,7 @@ func TestIndexColumnFingerprintMatchesTheColumnEncoderAndIgnoresTheGate(t *testi
 	tbl := keyDescTable(col("a", "int4"))
 	c := &tbl.Columns[0]
 
-	want, eerr := encodeBTreeKeyForColumn(NewIntDatum(42), c, 0)
+	want, eerr := encodeBTreeKeyForColumn(nil, NewIntDatum(42), c, 0)
 	if eerr != nil {
 		t.Fatalf("fixture encodeBTreeKeyForColumn: %v", eerr)
 	}

@@ -16,6 +16,12 @@ import (
 func indexKeyTypeCases() []struct{ typ, lit string } {
 	return []struct{ typ, lit string }{
 		{"int2", "3"}, {"int4", "3"}, {"int8", "3"}, {"oid", "3"},
+		// reg* family: default oid_ops, so a numeric OID literal routes through
+		// the reg* arm (isRegType) and the nil-ctx numeric passthrough; a NAME
+		// literal is exercised by the VM-backed IOS tests instead, which can
+		// resolve it. M0119-0006-0006.
+		{"regproc", "3"}, {"regprocedure", "3"}, {"regclass", "3"},
+		{"regtype", "3"}, {"regrole", "3"}, {"regcollation", "3"},
 		{"bool", "true"}, {"float4", "1.5"}, {"float8", "1.5"},
 		{"numeric", "1.50"}, {"text", "ab"}, {"varchar", "ab"},
 		{"bpchar", "ab"}, {"name", "ab"},
@@ -41,7 +47,7 @@ func TestIndexKeyDecodableMatchesDecoder(t *testing.T) {
 			if isArray {
 				lit = "{" + c.lit + "}"
 			}
-			key, encErr := encodeBTreeKeyForColumn(NewStringDatum(lit), &col, 0)
+			key, encErr := encodeBTreeKeyForColumn(nil, NewStringDatum(lit), &col, 0)
 			if encErr != nil {
 				t.Fatalf("%s(array=%v): encode %q: %s", c.typ, isArray, lit, encErr.Message)
 			}
@@ -90,7 +96,7 @@ func TestIndexKeyDecodeSiblingsAgree(t *testing.T) {
 			if isArray {
 				lit = "{" + c.lit + "}"
 			}
-			key, encErr := encodeBTreeKeyForColumn(NewStringDatum(lit), &col, 0)
+			key, encErr := encodeBTreeKeyForColumn(nil, NewStringDatum(lit), &col, 0)
 			if encErr != nil {
 				t.Fatalf("%s(array=%v): encode %q: %s", c.typ, isArray, lit, encErr.Message)
 			}
