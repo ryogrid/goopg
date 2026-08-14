@@ -223,6 +223,16 @@ if [[ "$RUN_SETUP" -eq 1 ]]; then
     # and test_setup.sql has no \setenv. Best-effort: the C-language regresslib
     # CREATE FUNCTIONs cannot load in goopg, so tolerate their failures.
     "${PSQL[@]}" -f "${REGRESS_SQL}/test_setup.sql" >/dev/null 2>&1 || true
+    echo "pg-regress-runner: running create_aggregate.sql (user-defined aggregates for aggregates.sql)..."
+    # create_aggregate.sql defines the user-defined aggregates that
+    # aggregates.sql references (newavg/newsum/newcnt/oldcnt/aggfstr/aggfns/
+    # sum2/least_agg/cleast_agg/test_rank/test_percentile_disc). Upstream runs
+    # it as a first-group prerequisite before aggregates
+    # (postgres/src/test/regress/parallel_schedule:51). Best-effort like
+    # test_setup.sql: goopg may not support every CREATE AGGREGATE form, but
+    # the ones it does support must persist so the separate psql -f of
+    # aggregates.sql sees them in the same 'postgres' DB.
+    "${PSQL[@]}" -f "${REGRESS_SQL}/create_aggregate.sql" >/dev/null 2>&1 || true
     echo "pg-regress-runner: setup done."
 fi
 
