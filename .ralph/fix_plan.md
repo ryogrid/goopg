@@ -3255,8 +3255,11 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       PG accepts (pre-existing in the scalar column, now inherited by arrays),
       and `decodeArrayKeyElemText` still refuses these element types although the
       "no heap image to agree with" half of that refusal is now gone.
-      Remaining for M0119-0006: `box`/`int4range` key encodings and
-      the whole-database (unscoped) pg_amcheck run — ledger rows 2026-08-10.
+      Remaining for M0119-0006: the whole-database (unscoped) pg_amcheck run —
+      ledger row 2026-08-10. (Corrected 2026-08-14 by the 83rd slice: the
+      "`box`/`int4range` key encodings" half was a misattribution — box has no PG
+      btree opclass at all, and int4range is blocked on the range value model;
+      the expression-key gate for both is now landed.)
       **28th slice (2026-08-12): the `HH:MM` half of that inherited input gap is
       closed.** A time-of-day with no seconds field is ordinary PG input
       (`DecodeTime` reads seconds only `if (*cp == ':')`, leaving `tm_sec = 0`),
@@ -4445,6 +4448,27 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       Q13=35) PASS. New deferral row: off-path schema qualification (qualify=false
       renders a bare non-public-schema regclass) + cross-DB regclass resolution (no
       dbOid bound). Design `0119-0006-pgoutput-reg-names.md`.
+      **83rd slice (2026-08-14): expression-key btree type gate — box/int4range
+      expressions no longer silently build.** `CREATE INDEX ON t ((box_col))` /
+      `((int4range_col))` bypassed the named-column `isSupportedBTreeKeyType` gate
+      (`createBTreeIndex` skipped `name == ""` columns) and silently built a B-tree
+      index encoding the value's TEXT in varchar order (`encodeArbiterExprKey`'s
+      KindString arm, operators_upsert.go:1649). PG 18.3 rejects a btree index on a
+      box expression with 42704 (box has no btree opclass — `GetDefaultOpClass`→
+      InvalidOid, indexcmds.c:2270-2277); int4range PG accepts via `range_ops`
+      (binary-coercible-to-anyrange, pg_opclass.dat:230) but goopg has no range
+      value model, so it must reject honestly. The expression-key branch now applies
+      the SAME `isSupportedBTreeKeyType` + enum check as the named-column branch,
+      returning the SAME 0A000 (the 42704 polish for box is deferred). Resolves via
+      `planner.ResolveIndexPredicate` + `planner.ExprResultType` (the build path's
+      own pair); gates only when both resolve, so float/enum/text expression indexes
+      are untouched. Gates: `TestExpressionIndexKeyRejectsBoxAndInt4Range` +
+      `TestExpressionIndexKeyStillAllowsFloatEnumText` (mutation-witnessed);
+      executor/planner/btree packages, pre-commit units, tpch-spotcheck (Q12=2,
+      Q13=35) PASS. This closes the "box/int4range key encodings" half of the
+      remaining-scope note below; box is NOT a valid key target (no PG btree opclass)
+      and int4range is blocked on the range value model (see the 2026-08-14 ledger
+      row).
 
 - [x] **M0119-0010 — `char(N)` typmods are not restored per column on catalog
       reload** (source: M0127-P5.9-f, ledger row 2026-08-05). **FIXED (2026-08-09).**
