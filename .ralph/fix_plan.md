@@ -4051,6 +4051,57 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       role-name catalog folding (row 1340), regprocin quoted-identifier input,
       format_type_be arglist qualification.
 
+      **72nd slice (2026-08-14): regprocin quoted-identifier INPUT — ledger
+      row 1341 resolved.** The reg* name→OID input half now honors
+      double-quoted identifiers exactly as upstream
+      `stringToQualifiedNameList` → `SplitIdentifierString` (varlena.c:3581)
+      does: a `"…"` segment keeps its case with `""`→`"` collapse, an unquoted
+      segment is downcased, whitespace around segments is skipped, `.` inside
+      quotes is not a separator, and a syntax error (mismatched quote, empty
+      segment) raises 42602. Before, every reg* input arm ran the whole
+      candidate through `strings.ToLower` + a dumb first-dot
+      `splitQualifiedTable`, so `'"MyFunc"'::regproc` reached LookupByName with
+      literal quotes → 42883 (PG 18.3 resolves it). New shared parser
+      `splitRegIdentifiers`/`splitRegQualifiedName` in reg_identifier.go feeds
+      every arm of `regIdentifierInput` (regclass/regtype/regproc/regrole/
+      regcollation) AND the expr.go siblings — `::regproc`/`::regprocedure`
+      cast, `::regclass` cast, `regclass()` function-call, `pg_get_functiondef`
+      name fallback — the input counterpart of the 69th/70th/71st slices'
+      quote-emission (sibling renderers must agree). Two faithful addenda found
+      while implementing: `regprocedureNamePart` strips the `(…)` arg list
+      (parseNameAndArgTypes' leading scan) so `'"MyFunc"(integer)'::regprocedure`
+      does not regress to 42602; and the parser's downcasting now makes
+      `'C'::regcollation` FAIL with 42704 exactly like PG 18.3 (only `'"C"'`
+      resolves to 950 — the collation store is case-sensitive), updating the
+      old divergent test. Miss messages match PG: regclass/regrole/regcollation/
+      regtype print the STRIPPED parsed name (NameListToString), regproc/
+      regprocedure keep the RAW input. Tests: new
+      `internal/executor/reg_input_quoted_test.go` (quoted mixed-case routine
+      on both cast paths, dotted quoted schema, quote-quote collapse,
+      family siblings, 42602 syntax errors on both paths, coercion route,
+      stripped-vs-raw miss messages). Ledger: row 1341 resolved. Design:
+      `docs/design/0119-0006-reg-input-quoted-identifiers.md` + README row
+      (`0119-0006ax`). Gates: package suites + pre-commit units +
+      `TestPort_RegressSuite` (237.3 s on the confirming run) +
+      `scripts/tpch-spotcheck.sh` (Q12=2, Q13=35). Gate note: the FIRST
+      TestPort_RegressSuite attempt FAILed at its 600 s timeout — the known
+      intermittent "suite wedge" (documented in regress_wedge_probe_test.go's
+      header) hit the `returning` case: `CREATE FUNCTION … BEGIN ATOMIC
+      RETURNING` parked in `walLogCreateRoutine → syncRoutineToCatalogHeap →
+      mirrorProcCatalogFiles → … → (*Pool).Pin → pinLoad` waiting on the buffer
+      pool RWMutex write lock while the WAL checkpointer waited on the same
+      pool's RLock in `flushBatch` (FlushAllPaced) — so NO checkpoint could
+      run, WAL accumulated to 7.4 GB, and the subsequent cluster-restart's
+      crash recovery could not finish inside the 20 s start timeout, turning
+      one wedged case into a whole-suite FAIL. Completely disjoint from this
+      slice (storage/WAL buffer-pool lock path; the slice touched only reg*
+      input arms). Confirmed environmental: the clean re-run PASSed in 237.3 s
+      (vs 242.3 s last slice), and the regproc regress case PASSes standalone
+      in 6.2 s. Bundle preserved at tmp/regress-wedge/returning/ (goroutine
+      dump, pg_stat_activity, server-log-tail). Remaining open reg* deferrals:
+      mixed-case role-name catalog folding (row 1340), the arglist's
+      `format_type_be` schema qualification.
+
 - [x] **M0119-0010 — `char(N)` typmods are not restored per column on catalog
       reload** (source: M0127-P5.9-f, ledger row 2026-08-05). **FIXED (2026-08-09).**
       Root cause: `DecodePGAttributePhysicalRow` never decoded `atttypmod`

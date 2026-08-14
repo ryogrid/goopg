@@ -535,8 +535,22 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			isProcedure := strings.EqualFold(x.TargetType, "regprocedure")
 			if v.Kind == KindString && ctx != nil && ctx.Catalog != nil {
 				funcName := strings.TrimSpace(v.StringValue())
-				// SQL identifiers are case-folded to lowercase when parsed; match that.
-				schema, name := splitQualifiedTable(strings.ToLower(funcName))
+				raw := funcName
+				// regprocedurein (regproc.c:244) splits the arg list off the name
+				// (parseNameAndArgTypes) before parsing; regprocin does not. Both
+				// feed the name through stringToQualifiedNameList, so a quoted
+				// routine name must be unquoted before the lookups, and the 42883
+				// keeps the RAW input (regprocin/regprocedurein's errmsg). This is
+				// the input half of RegOut's quote-emission (the 71st slice) — the
+				// two casts are sibling renderers and must agree (Hard-won Rule
+				// #2). M0119-0006 (72nd slice, deferral row 1341).
+				if isProcedure {
+					funcName = regprocedureNamePart(funcName)
+				}
+				schema, name, nameOK := splitRegQualifiedName(funcName)
+				if !nameOK {
+					return NullDatum, &ExecError{Code: "42602", Pos: x.Pos(), Message: "invalid name syntax"}
+				}
 				if rs := ctx.Catalog.Routines(); rs != nil {
 					candidates := rs.LookupByName(parser.ObjectName{Schema: schema, Name: name})
 					if len(candidates) > 0 {
@@ -552,7 +566,7 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 				if bp, found := catalog.LookupBuiltinProc(name); found {
 					return NewIntDatum(int64(bp.OID)), nil
 				}
-				return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("function %q does not exist", funcName)}
+				return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("function %q does not exist", raw)}
 			}
 			// An OID input (oid→regproc/regprocedure) renders via
 			// regprocout/regprocedureout: InvalidOid (0) becomes "-", matching
@@ -808,7 +822,15 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 					}
 				}
 			case KindString:
-				schema, rel := splitQualifiedTable(v.StringValue())
+				// Shared SplitIdentifierString port: a quoted relation name
+				// (`'"My Table"'::regclass`) must be unquoted before the catalog
+				// lookup, and a syntax error raises regclassin's 42602.
+				// M0119-0006 (72nd slice, deferral row 1341) — the input half of
+				// RegOut's quote-emission; sibling of regIdentifierInput.
+				schema, rel, nameOK := splitRegQualifiedName(v.StringValue())
+				if !nameOK {
+					return NullDatum, &ExecError{Code: "42602", Pos: x.Pos(), Message: "invalid name syntax"}
+				}
 				objName := parser.ObjectName{Schema: schema, Name: rel}
 				if tbl, found := ctx.Catalog.LookupTable(objName, connDBOid); found && tbl != nil {
 					return NewIntDatum(int64(tbl.OID)), nil
@@ -10121,8 +10143,12 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if oidArg.Kind == KindInt {
 				r = rs.LookupByOID(uint32(oidArg.Int))
 			} else {
-				// Fall back to name lookup for string arguments.
-				schema, nm := splitQualifiedTable(strings.ToLower(strings.TrimSpace(oidArg.StringValue())))
+				// Fall back to name lookup for string arguments. The parser
+				// unquotes a quoted name (the lookup is case-insensitive), so
+				// `pg_get_functiondef('"MyFunc"')` resolves. A syntax error
+				// yields an empty best-effort lookup (this path returns NULL on a
+				// miss anyway). M0119-0006 (72nd slice).
+				schema, nm, _ := splitRegQualifiedName(strings.TrimSpace(oidArg.StringValue()))
 				candidates := rs.LookupByName(parser.ObjectName{Schema: schema, Name: nm})
 				if len(candidates) > 0 {
 					r = candidates[0]
@@ -10224,7 +10250,14 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 		if name == "regclass" && v.Kind == KindString && ctx != nil && ctx.Catalog != nil {
 			s := v.StringValue()
-			schema, rel := splitQualifiedTable(s)
+			// Shared SplitIdentifierString port (sibling of the CastExpr arm and
+			// regIdentifierInput): a quoted relation name unquotes before the
+			// lookup, a syntax error raises regclassin's 42602. M0119-0006
+			// (72nd slice).
+			schema, rel, nameOK := splitRegQualifiedName(s)
+			if !nameOK {
+				return NullDatum, &ExecError{Code: "42602", Pos: x.Pos(), Message: "invalid name syntax"}
+			}
 			// Scoped to the connection's own dbOid — see the CastExpr
 			// regclass arm's identical fix (M0122-0007 4e follow-up 33).
 			tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Schema: schema, Name: rel}, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))

@@ -57,6 +57,163 @@ import (
 // and regcollation against builtin+user collations, each with the undefined-
 // object error upstream's reg*in raises. `oid` and `cid` are numeric and need no
 // name resolution — they are not routed here.
+
+// ── reg* name parsing (M0119-0006, 72nd slice) ─────────────────────────────
+//
+// Upstream feeds every reg* INPUT string through stringToQualifiedNameList →
+// SplitIdentifierString (varlena.c:3581): a `"…"` segment keeps its exact case
+// with adjacent `""` collapsed to a literal `"`, an unquoted segment is
+// downcased, whitespace around segments is skipped, and `.` separates segments
+// but is not special inside quotes. A syntax error (empty string, empty
+// segment, mismatched quotes) returns false → the caller raises 42602
+// "invalid name syntax". The 71st slice made RegOut quote names
+// PG-faithfully; this is the input half of the same contract — without it,
+// `'"MyFunc"'::regproc` reaches LookupByName with the literal quotes and fails
+// 42883 (deferral ledger row 1341).
+
+// isRegIdentSpace is C isspace() restricted to single-byte chars — the
+// scanner_isspace macro SplitIdentifierString uses.
+func isRegIdentSpace(c byte) bool {
+	switch c {
+	case ' ', '\t', '\n', '\v', '\f', '\r':
+		return true
+	}
+	return false
+}
+
+// splitRegIdentifiers ports SplitIdentifierString into a list of parsed
+// segments. ok=false on any syntax error (empty input, an empty segment,
+// mismatched quotes, or two segments run together without a separator).
+func splitRegIdentifiers(s string) ([]string, bool) {
+	var segs []string
+	i := 0
+	// Skip leading whitespace (SplitIdentifierString returns false on an
+	// empty/all-whitespace string).
+	for i < len(s) && isRegIdentSpace(s[i]) {
+		i++
+	}
+	if i >= len(s) {
+		return nil, false
+	}
+	for {
+		var seg string
+		if s[i] == '"' {
+			// Quoted segment: preserve case, collapse "" → ", end at the first
+			// closing quote not followed by another quote.
+			i++ // opening quote
+			var b strings.Builder
+			closed := false
+			for i < len(s) {
+				if s[i] != '"' {
+					b.WriteByte(s[i])
+					i++
+					continue
+				}
+				if i+1 < len(s) && s[i+1] == '"' {
+					// Adjacent quote pair collapses to a literal quote.
+					b.WriteByte('"')
+					i += 2
+					continue
+				}
+				i++ // closing quote
+				closed = true
+				break
+			}
+			if !closed {
+				return nil, false // mismatched quotes
+			}
+			seg = b.String()
+		} else {
+			// Unquoted segment: extends to the separator or whitespace, then
+			// downcased (the truncate_identifier NAMEDATALEN cap is irrelevant
+			// in goopg).
+			start := i
+			for i < len(s) && s[i] != '.' && !isRegIdentSpace(s[i]) {
+				i++
+			}
+			seg = strings.ToLower(s[start:i])
+		}
+		if seg == "" {
+			return nil, false // empty segment — stringToQualifiedNameList rejects
+		}
+		segs = append(segs, seg)
+		// Drop whitespace before the separator (or the end of input).
+		for i < len(s) && isRegIdentSpace(s[i]) {
+			i++
+		}
+		if i >= len(s) {
+			break
+		}
+		if s[i] != '.' {
+			return nil, false // expected separator, got garbage
+		}
+		i++ // the separator
+		// Skip whitespace after the separator; a trailing separator leaves an
+		// empty segment.
+		for i < len(s) && isRegIdentSpace(s[i]) {
+			i++
+		}
+		if i >= len(s) {
+			return nil, false
+		}
+	}
+	return segs, true
+}
+
+// splitRegQualifiedName reduces splitRegIdentifiers to the 2-level
+// (schema, name) contract every goopg catalog lookup uses: the first segment
+// is the schema and the rest are joined with '.', so a quoted schema holding a
+// dot (`"my.schema".fn`) and a 3-part regclass name (`pg_catalog.pg_class`)
+// both stay resolvable (the latter measures 1259 on PG 18.3). ok=false on any
+// syntax error.
+func splitRegQualifiedName(s string) (schema, name string, ok bool) {
+	segs, ok := splitRegIdentifiers(s)
+	if !ok {
+		return "", "", false
+	}
+	if len(segs) == 1 {
+		return "", segs[0], true
+	}
+	return segs[0], strings.Join(segs[1:], "."), true
+}
+
+// regDisplayName renders the parsed (schema, name) pair the way upstream
+// NameListToString joins the parsed segments — the form reg*in miss messages
+// print with the quotes stripped (`relation "No Such Table" does not exist`,
+// not the raw `"\"No Such Table\""`). regprocin/regprocedurein are the
+// exception: their 42883 keeps the RAW input (errmsg "function \"%s\" does
+// not exist", regproc.c:112).
+func regDisplayName(schema, name string) string {
+	if schema == "" {
+		return name
+	}
+	return schema + "." + name
+}
+
+// regprocedureNamePart strips the argument list off a regprocedurein input,
+// mirroring parseNameAndArgTypes' leading scan (regproc.c:1899): everything
+// before the first LEFT PAREN that is not inside double quotes. The arg list
+// itself is NOT parsed — goopg resolves regprocedure names by NAME only (a
+// recorded gap, see the design doc's scope exclusions) — so the `(…)` group
+// is simply dropped and the name part resolves like regproc. A bare name with
+// no left paren is returned unchanged: upstream raises "expected a left
+// parenthesis" (22P02) there, but goopg has never enforced it and a bare name
+// resolving is a pre-existing leniency, not a regression.
+func regprocedureNamePart(s string) string {
+	inQuote := false
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '"':
+			inQuote = !inQuote
+		case '(':
+			if !inQuote {
+				return s[:i]
+			}
+		}
+	}
+	return s
+}
+
 func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum, error) {
 	if v.Kind != KindString {
 		// numeric literal / already-OID datum — the heap arm range-checks.
@@ -81,7 +238,10 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 	switch strings.ToLower(typeName) {
 	case "regclass":
 		connDBOid := catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)
-		schema, rel := splitQualifiedTable(name)
+		schema, rel, nameOK := splitRegQualifiedName(name)
+		if !nameOK {
+			return NullDatum, &ExecError{Code: "42602", Pos: pos, Message: "invalid name syntax"}
+		}
 		objName := parser.ObjectName{Schema: schema, Name: rel}
 		if tbl, found := ctx.Catalog.LookupTable(objName, connDBOid); found && tbl != nil {
 			return NewIntDatum(int64(tbl.OID)), nil
@@ -91,24 +251,50 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 				return NewIntDatum(int64(idx.OID)), nil
 			}
 		}
+		// Miss message uses the STRIPPED parsed name — regclassin's
+		// `relation "%s" does not exist` takes NameListToString(names), so a
+		// quoted miss renders `relation "No Such Table"` not the raw quotes.
 		return NullDatum, &ExecError{Code: "42P01", Pos: pos,
-			Message: fmt.Sprintf("relation %q does not exist", name)}
+			Message: fmt.Sprintf("relation %q does not exist", regDisplayName(schema, rel))}
 	case "regtype":
 		// TypeNameToOID falls back to OIDText for any name it does not know, so
 		// `oid != 0` never fires on a miss — an unknown name would resolve to
 		// text's OID and the 42704 miss-path below would be dead. The established
 		// idiom (castKeyTypeName, pgTypeofOIDForName) treats the fallback as a
 		// miss unless the name really is `text`.
-		if oid := catalog.TypeNameToOID(name); oid != catalog.OIDText || strings.EqualFold(name, "text") {
+		schema, typeName, nameOK := splitRegQualifiedName(name)
+		if !nameOK {
+			return NullDatum, &ExecError{Code: "42602", Pos: pos, Message: "invalid name syntax"}
+		}
+		// regtypein (regproc.c:1176) runs parseTypeString on the raw text, so a
+		// double-quoted name must be unquoted first; splitting also hands
+		// userTypeOIDForName a bare name, letting a schema-qualified user type
+		// resolve instead of dying as `schema.type` in a bare-name lookup.
+		if oid := catalog.TypeNameToOID(typeName); oid != catalog.OIDText || strings.EqualFold(typeName, "text") {
 			return NewIntDatum(int64(oid)), nil
 		}
-		if oid, ok := userTypeOIDForName(ctx.Catalog, name); ok {
+		if oid, ok := userTypeOIDForName(ctx.Catalog, typeName); ok {
 			return NewIntDatum(int64(oid)), nil
 		}
 		return NullDatum, &ExecError{Code: "42704", Pos: pos,
-			Message: fmt.Sprintf("type %q does not exist", name)}
+			Message: fmt.Sprintf("type %q does not exist", regDisplayName(schema, typeName))}
 	case "regproc", "regprocedure":
-		schema, fn := splitQualifiedTable(strings.ToLower(name))
+		// regprocin resolves the WHOLE input as a name; regprocedurein first
+		// splits off the arg list (parseNameAndArgTypes, regproc.c:1899) and
+		// resolves only the name part. Both feed the name through
+		// stringToQualifiedNameList, so a quoted routine name must be unquoted
+		// before the lookups. The 42883 keeps the RAW input — regprocin/
+		// regprocedurein's errmsg is `function "%s" does not exist` with the
+		// original string, parens and quotes included (regproc.c:112, regproc.c
+		// :279) — so the message below uses `raw`, not the parsed form.
+		raw := name
+		if strings.EqualFold(typeName, "regprocedure") {
+			name = regprocedureNamePart(name)
+		}
+		schema, fn, nameOK := splitRegQualifiedName(name)
+		if !nameOK {
+			return NullDatum, &ExecError{Code: "42602", Pos: pos, Message: "invalid name syntax"}
+		}
 		if rs := ctx.Catalog.Routines(); rs != nil {
 			candidates := rs.LookupByName(parser.ObjectName{Schema: schema, Name: fn})
 			if len(candidates) > 0 {
@@ -119,30 +305,42 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 			return NewIntDatum(int64(bp.OID)), nil
 		}
 		return NullDatum, &ExecError{Code: "42883", Pos: pos,
-			Message: fmt.Sprintf("function %q does not exist", name)}
+			Message: fmt.Sprintf("function %q does not exist", raw)}
 	case "regrole":
 		// regrolein (regproc.c:1541): a role name is a single identifier — a
 		// qualified name (stringToQualifiedNameList list_length != 1) is 42602
-		// "invalid name syntax", roles are never schema-qualified.
-		if strings.Contains(name, ".") {
+		// "invalid name syntax", roles are never schema-qualified. The check is
+		// on the PARSED segment count, not the raw string: a quoted role like
+		// `"Alice.Bob"` keeps its dot (inside quotes it is not a separator) and
+		// is a valid single-identifier role name.
+		segs, nameOK := splitRegIdentifiers(name)
+		if !nameOK || len(segs) != 1 {
 			return NullDatum, &ExecError{Code: "42602", Pos: pos,
 				Message: "invalid name syntax"}
 		}
+		roleName := segs[0]
 		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
-			if oid, found := im.RoleOID(name); found {
+			if oid, found := im.RoleOID(roleName); found {
 				return NewIntDatum(int64(oid)), nil
 			}
 		}
 		return NullDatum, &ExecError{Code: "42704", Pos: pos,
-			Message: fmt.Sprintf("role %q does not exist", name)}
+			Message: fmt.Sprintf("role %q does not exist", roleName)}
 	case "regcollation":
 		// regcollationin (regproc.c:1026): possibly schema-qualified; a bare
 		// name resolves builtin-then-user through the search path
 		// (CollationOIDByName), a qualified name against FindCollation in that
 		// schema. Miss → 42704 with the encoding name — goopg is UTF-8 only, so
-		// GetDatabaseEncodingName() is the constant "UTF8".
+		// GetDatabaseEncodingName() is the constant "UTF8". The name is parsed
+		// through the shared SplitIdentifierString port, so a collation like
+		// `"My Coll"` unquotes before the lookups and the miss message shows the
+		// STRIPPED form (regcollationin uses NameListToString).
+		schema, coll, nameOK := splitRegQualifiedName(name)
+		if !nameOK {
+			return NullDatum, &ExecError{Code: "42602", Pos: pos, Message: "invalid name syntax"}
+		}
 		var oid uint32
-		if schema, coll := splitQualifiedTable(name); schema != "" {
+		if schema != "" {
 			if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
 				if uc := im.FindCollation(coll, schema, ctx.CurrentDatabaseOid); uc != nil {
 					oid = uc.OID
@@ -155,7 +353,7 @@ func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum,
 			return NewIntDatum(int64(oid)), nil
 		}
 		return NullDatum, &ExecError{Code: "42704", Pos: pos,
-			Message: fmt.Sprintf("collation %q for encoding %q does not exist", name, "UTF8")}
+			Message: fmt.Sprintf("collation %q for encoding %q does not exist", regDisplayName(schema, coll), "UTF8")}
 	}
 	return v, nil
 }

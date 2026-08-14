@@ -165,14 +165,19 @@ func TestRegIdentifierInputResolvesRegcollationName(t *testing.T) {
 	}
 
 	// Builtin collations resolve through the BKI-pinned table (builtin-then-user
-	// order in CollationOIDByName).
+	// order in CollationOIDByName). The store is case-sensitive with
+	// PG-identifier semantics, so an UNQUOTED `C`/`POSIX` downcasts to
+	// `c`/`posix` and MISSES (PG 18.3: `'C'::regcollation` → 42704; only the
+	// quoted `'"C"'` resolves to 950) — the 72nd slice made the input path
+	// follow SplitIdentifierString's downcasing, closing the old leniency.
 	for _, tc := range []struct {
 		name string
 		want uint32
 	}{
-		{"C", 950},
 		{"default", 100},
-		{"POSIX", 951},
+		{"DEFAULT", 100}, // downcast to "default"
+		{`"C"`, 950},     // quoted — keeps the exact case
+		{`"POSIX"`, 951}, // quoted — keeps the exact case
 	} {
 		got, err := regIdentifierInput(NewStringDatum(tc.name), "regcollation", ctx, 0)
 		if err != nil {
@@ -181,6 +186,15 @@ func TestRegIdentifierInputResolvesRegcollationName(t *testing.T) {
 		if got.Kind != KindInt || got.Int != int64(tc.want) {
 			t.Fatalf("regIdentifierInput(%s) = %v, want int %d", tc.name, got, tc.want)
 		}
+	}
+
+	// An unquoted mixed-case builtin collation name downcasts and misses exactly
+	// like PG 18.3 (`'C'::regcollation` → 42704 "collation "c" ... does not
+	// exist").
+	if _, err := regIdentifierInput(NewStringDatum("C"), "regcollation", ctx, 0); err == nil {
+		t.Fatal("regIdentifierInput(C) should raise 42704 (downcast to c, PG-faithful)")
+	} else if ee, ok := err.(*ExecError); !ok || ee.Code != "42704" {
+		t.Fatalf("regIdentifierInput(C) err = %v, want 42704", err)
 	}
 
 	// A user-created collation resolves through the live registry.
@@ -312,12 +326,12 @@ func TestCoerceRowForConstraintChecksResolvesRegRoleAndCollation(t *testing.T) {
 	}
 
 	collCols := []catalog.Column{{Name: "c", Type: catalog.Type{Name: "regcollation"}}}
-	collRow := Row{NewStringDatum("C")}
+	collRow := Row{NewStringDatum(`"C"`)} // quoted — the unquoted `C` downcasts to `c` and misses (PG-faithful)
 	if err := coerceRowForConstraintChecks(collCols, collRow, func(int) bool { return true }, ctx, 0); err != nil {
 		t.Fatalf("coerceRowForConstraintChecks(regcollation): %v", err)
 	}
 	if collRow[0].Kind != KindInt || collRow[0].Int != 950 {
-		t.Fatalf("regcollation column coerced to kind %d %v, want int 950 (C)", collRow[0].Kind, collRow[0].Int)
+		t.Fatalf("regcollation column coerced to kind %d %v, want int 950 (quoted \"C\")", collRow[0].Kind, collRow[0].Int)
 	}
 	heap, err = encodeValuePG(catalog.Type{Name: "regcollation"}, collRow[0])
 	if err != nil {

@@ -83,9 +83,10 @@ func TestRegprocedureCastQuotesRoutineName(t *testing.T) {
 		t.Fatalf("create quoted-name function: %v", err)
 	}
 	// The OID is fetched from the live routine registry (mixed case preserved
-	// by the parser), NOT via `'"MyFunc"'::regproc` — regprocin's name→OID
-	// direction still ToLower's quoted identifiers (a separate input-side gap,
-	// see the deferral ledger); this test pins the OUTPUT rendering only.
+	// by the parser). Since the 72nd slice, `'"MyFunc"'::regproc` resolves
+	// quoted names too (see reg_input_quoted_test.go); the registry fetch is
+	// kept so this test pins the OUTPUT rendering only, independent of the
+	// input path.
 	cands := ctx.Catalog.Routines().LookupByName(parser.ObjectName{Name: "MyFunc"})
 	if len(cands) == 0 {
 		t.Fatal(`"MyFunc" routine not found`)
