@@ -43,7 +43,7 @@ PSQL_USER     ?= postgres
 # Wrap shell invocations with the in-tree PostgreSQL paths.
 ENV_PREFIX = PATH="$(PG_BIN_DIR):$$PATH" LD_LIBRARY_PATH="$(PG_LIB_DIR):$$LD_LIBRARY_PATH"
 
-.PHONY: help build init start goopg-test-server stop restart psql status clean clean-data print-env install-hooks ralph-state-check ralph-state-repair ralph-state-guard ralph-metrics bench-build bench-build-optimized pgo-profile pgbench-compare pgbench-compare-matrix pgbench-compare-report plan-snapshot-build plan-snapshot-capture plan-diff plan-gate runtimeshim-matrix race-gate parity-dashboard nightly-batch
+.PHONY: help build init start goopg-test-server stop restart psql status clean clean-data print-env install-hooks ralph-state-check ralph-state-repair ralph-state-guard ralph-metrics check-testport-inventory regen-testport bench-build bench-build-optimized pgo-profile pgbench-compare pgbench-compare-matrix pgbench-compare-report plan-snapshot-build plan-snapshot-capture plan-diff plan-gate runtimeshim-matrix race-gate parity-dashboard nightly-batch
 
 help:
 	@echo "goopg lifecycle targets:"
@@ -188,6 +188,22 @@ ralph-state-guard:
 		go run ./cmd/validate-ralph-state -status .ralph/status.json -progress .ralph/progress.json -fix; \
 		go run ./cmd/validate-ralph-state -status .ralph/status.json -progress .ralph/progress.json; \
 	fi
+
+# Validate the on-disk consolidated test-port inventory CSV (well-formedness +
+# status/pass_required vocabulary + id uniqueness + port-row func contract).
+# Regenerating any gen-* doc runs the same validation, so a broken CSV fails here
+# and in the nightly testport stage (which runs internal/testport/...).
+check-testport-inventory:
+	go test -run TestOnDiskInventoryCSVValidates ./internal/testport/framework/
+
+# Regenerate every derived doc from the consolidated inventory CSV. Run in the
+# same commit that edits the CSV so the renders never drift from the authority.
+regen-testport:
+	go run ./cmd/gen-oracle-inventory
+	go run ./cmd/gen-regress-coverage
+	go run ./cmd/gen-isolation-coverage
+	go run ./cmd/gen-tap-coverage
+	go run ./cmd/gen-oracle-report
 
 # Loop-health metrics (kaizen T1): free pipeline pass over the loop history.
 # Prints success rate, cost, cache-read, status-block coverage, permission

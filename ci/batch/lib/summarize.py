@@ -51,6 +51,21 @@ def read_csv(path):
         return []
 
 
+def regress_baseline(repo_root):
+    """Map regress case name -> status from the consolidated inventory CSV.
+
+    `name` is the item_path basename minus the .sql/.out extension
+    (postgres/src/test/regress/sql/boolean.sql -> "boolean"). Keeping the
+    extension would make every `baseline.get(case) == "pass"` lookup return
+    None and silently disable the regress divergence gate.
+    """
+    return {
+        os.path.splitext(os.path.basename(r["item_path"]))[0]: r["status"]
+        for r in read_csv(os.path.join(repo_root, "docs/test-port/postgres-oracle-target-inventory.csv"))
+        if r.get("suite_id") == "regress-sql" and r.get("item_path")
+    }
+
+
 def read_stage_statuses(run_dir):
     out = {}
     d = os.path.join(run_dir, "stages")
@@ -433,12 +448,9 @@ def analyze(run_dir, repo_root, run_id):
         })
 
     # regress mismatch-skip join (design 02 §A): a diverging regress case is a
-    # t.Skip("deferred: output mismatch...") — join against the baseline CSV.
-    baseline = {
-        r["name"]: r["status"]
-        for r in read_csv(os.path.join(repo_root, "docs/test-port/regress-diff-baseline.csv"))
-        if r.get("name")
-    }
+    # t.Skip("deferred: output mismatch...") — join against the consolidated
+    # inventory CSV's regress-sql rows.
+    baseline = regress_baseline(repo_root)
     # A case whose psql was killed by the per-case deadline reports
     # "deferred: execution timeout: ..." (internal/testport/framework:
     # RationaleExecTimeout). Its output is truncated, so it says nothing about
@@ -677,7 +689,7 @@ def analyze(run_dir, repo_root, run_id):
     # partial run (NIGHTLY_STAGES subset / early abort) doesn't flood notices.
     if tp_results:
         missing = []
-        for r in read_csv(os.path.join(repo_root, "docs/test-port/postgres-oracle-port-status.csv")):
+        for r in read_csv(os.path.join(repo_root, "docs/test-port/postgres-oracle-target-inventory.csv")):
             if r.get("status") == "port" and r.get("pass_required") == "yes":
                 funcs = re.findall(r"Test(?:Port|E2E)_\w+", r.get("rationale", ""))
                 if funcs and not any(f in tp_results for f in funcs):

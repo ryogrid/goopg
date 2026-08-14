@@ -4,7 +4,7 @@
 # tests against goopg and report parity %.
 #
 # D-001 infrastructure: this script is the prerequisite for unlocking the
-# deferred D-001 suite in docs/test-port/postgres-oracle-port-status.csv.
+# deferred D-001 suite in docs/test-port/postgres-oracle-target-inventory.csv.
 # As more of goopg's SQL surface area is implemented, the pass rate reported
 # here will climb toward 100%.
 #

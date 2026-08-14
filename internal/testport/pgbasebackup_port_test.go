@@ -3,7 +3,7 @@ package testport
 // Ports of postgres/src/bin/pg_basebackup/t/*.pl tests into Go.
 //
 // Upstream suites: BB-010, BB-011, BB-020, BB-030, BB-040 in
-//   docs/test-port/postgres-oracle-port-status.csv.
+//   docs/test-port/postgres-oracle-target-inventory.csv.
 // Milestone doc: docs/milestones/0095-client-tools-tap-test-porting.md
 //
 // Each test covers:

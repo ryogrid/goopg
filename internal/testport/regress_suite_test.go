@@ -16,7 +16,9 @@ package testport
 //   3. For each discovered case, use framework.RunRegressSubset to execute
 //      the SQL via ClusterRegressExecutor (psql -X -q -a -f <tmpfile>) and
 //      compare normalised output with the expected .out file.
-//   4. "port" → pass, "excluded" → t.Skip, "defer" → t.Skip with rationale.
+//   4. "port" → pass, "excluded" → t.Skip, "defer" → t.Skip with rationale —
+//      except a must-pass case (consolidated inventory status "pass") that
+//      reports an output mismatch, which is a regression and FAILs the suite.
 
 import (
 	"context"
@@ -92,6 +94,12 @@ func TestPort_RegressSuite(t *testing.T) {
 	// run sequentially (no t.Parallel), so a plain bool is sufficient.
 	clusterPoisoned := false
 
+	// mustPass is the set of regress-sql cases the consolidated inventory CSV
+	// marks "pass" — the former regress-diff-baseline.csv must-pass set. A
+	// divergence on one of these is a regression, surfaced here as a FAIL
+	// rather than the deferred skip the framework otherwise reports.
+	mustPass := regressMustPass(t, root)
+
 	for _, rc := range cases {
 		rc := rc
 		t.Run(rc.Name, func(t *testing.T) {
@@ -158,10 +166,38 @@ func TestPort_RegressSuite(t *testing.T) {
 			case "excluded":
 				t.Skip("excluded by policy")
 			default:
+				// A must-pass regress case that reports an output mismatch is a
+				// regression, not a deferred skip. Timeouts / missing-expected /
+				// capability-gate deferrals stay skips (infra, not divergence).
+				if mustPass[rc.Name] && strings.HasPrefix(r.Rationale, "output mismatch") {
+					t.Errorf("regress case %s (must-pass) diverged: %s", rc.Name, r.Rationale)
+					return
+				}
 				t.Skipf("deferred: %s", r.Rationale)
 			}
 		})
 	}
+}
+
+// regressMustPass loads the consolidated inventory CSV and returns the set of
+// regress-sql cases whose status is "pass" (the former regress-diff-baseline.csv
+// must-pass set, keyed by case name without the .sql extension). A nil map on a
+// load error degrades to "no must-pass set" so the suite keeps its pre-Phase-D
+// skip-only behaviour rather than failing every case.
+func regressMustPass(t *testing.T, root string) map[string]bool {
+	t.Helper()
+	rows, err := framework.LoadStatusCSV(filepath.Join(root, "docs", "test-port", "postgres-oracle-target-inventory.csv"))
+	if err != nil {
+		t.Logf("cannot load inventory CSV for must-pass set: %v", err)
+		return nil
+	}
+	must := map[string]bool{}
+	for _, r := range rows {
+		if r.SuiteID == "regress-sql" && r.Status == "pass" {
+			must[strings.TrimSuffix(filepath.Base(r.ItemPath), filepath.Ext(r.ItemPath))] = true
+		}
+	}
+	return must
 }
 
 // restoreRegressFixtures brings the shared test_setup.sql fixture tables back

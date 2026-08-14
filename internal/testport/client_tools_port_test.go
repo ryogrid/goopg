@@ -4,7 +4,7 @@ package testport
 //
 // Tools covered: pg_checksums, pg_controldata, pg_walsummary.
 // Upstream suites: C-001/002, CD-001, WS-001/002 in
-//   docs/test-port/postgres-oracle-port-status.csv.
+//   docs/test-port/postgres-oracle-target-inventory.csv.
 // Milestone doc: docs/milestones/0095-client-tools-tap-test-porting.md
 //
 // Binary discovery: PATH first, then postgres/local_install/bin as fallback.

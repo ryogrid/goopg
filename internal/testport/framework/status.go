@@ -3,30 +3,46 @@ package framework
 import (
 	"encoding/csv"
 	"fmt"
-	"io"
 	"os"
-	"sort"
+	"regexp"
 	"strings"
 )
 
-// StatusRow is a machine-readable row in postgres-oracle-port-status.csv.
+// StatusRow is a machine-readable row in the single authority inventory CSV,
+// `docs/test-port/postgres-oracle-target-inventory.csv`. It is the consolidated
+// successor to the former `postgres-oracle-port-status.csv` (governance) and
+// `regress-diff-baseline.csv` (regress baseline), merged per
+// `tmp/porting-info-improvement-plan.md`.
 type StatusRow struct {
 	ID           string
-	UpstreamPath string
-	SuiteType    string
+	SuiteID      string
+	Kind         string
+	ItemPath     string
 	Status       string
 	PassRequired string
-	Rationale    string
 	DeferredTo   string
+	Rationale    string
 }
 
-// StatusCounts summarizes status totals for a suite type.
-type StatusCounts struct {
-	Port     int
-	Defer    int
-	Excluded int
+// validStatus is the unified status vocabulary. `pass`/`failed`/`not-tried`
+// describe per-case execution outcome; `port`/`defer`/`excluded` describe the
+// governance decision. must-pass is expressed by pass_required == "yes".
+var validStatus = map[string]bool{
+	"pass":      true,
+	"failed":    true,
+	"not-tried": true,
+	"excluded":  true,
+	"port":      true,
+	"defer":     true,
 }
 
+// testFuncRe matches a Go test function name. `port` rows (the TAP must-pass
+// set that ci/batch/lib/summarize.py presence-checks) must name one in their
+// rationale, so this is also the presence-warning extraction contract.
+var testFuncRe = regexp.MustCompile(`Test(?:Port|E2E)_\w+`)
+
+// LoadStatusCSV parses the inventory CSV, resolving columns by header name so
+// extra columns are ignored and column order is irrelevant.
 func LoadStatusCSV(path string) ([]StatusRow, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -49,7 +65,7 @@ func LoadStatusCSV(path string) ([]StatusRow, error) {
 	for i, h := range head {
 		idx[strings.TrimSpace(strings.ToLower(h))] = i
 	}
-	required := []string{"id", "upstream_path", "suite_type", "status", "pass_required", "rationale", "deferred_to"}
+	required := []string{"id", "suite_id", "kind", "item_path", "status", "pass_required", "deferred_to", "rationale"}
 	for _, k := range required {
 		if _, ok := idx[k]; !ok {
 			return nil, fmt.Errorf("csv %q missing required column %q", path, k)
@@ -71,21 +87,27 @@ func LoadStatusCSV(path string) ([]StatusRow, error) {
 		}
 		row := StatusRow{
 			ID:           val("id"),
-			UpstreamPath: val("upstream_path"),
-			SuiteType:    val("suite_type"),
+			SuiteID:      val("suite_id"),
+			Kind:         val("kind"),
+			ItemPath:     val("item_path"),
 			Status:       strings.ToLower(val("status")),
 			PassRequired: strings.ToLower(val("pass_required")),
-			Rationale:    val("rationale"),
 			DeferredTo:   val("deferred_to"),
+			Rationale:    val("rationale"),
 		}
-		if row.ID == "" {
-			return nil, fmt.Errorf("csv %q row %d: id is empty", path, rowNum)
+		if row.ItemPath == "" {
+			return nil, fmt.Errorf("csv %q row %d: item_path is empty", path, rowNum)
 		}
 		out = append(out, row)
 	}
 	return out, nil
 }
 
+// ValidateStatusRows checks the on-disk inventory CSV for the breakage classes
+// that historically broke the toolchain: malformed status/pass_required
+// vocabulary, an `excluded` row marked must-pass, a `defer` row with no
+// deferred_to, a `port` row whose rationale does not name its pinning test
+// func (the presence-warning contract), and duplicate non-empty ids.
 func ValidateStatusRows(rows []StatusRow) error {
 	if len(rows) == 0 {
 		return fmt.Errorf("status rows are empty")
@@ -93,111 +115,34 @@ func ValidateStatusRows(rows []StatusRow) error {
 	seenID := map[string]struct{}{}
 	for i, r := range rows {
 		rowNum := i + 1
-		if _, ok := seenID[r.ID]; ok {
-			return fmt.Errorf("duplicate id %q", r.ID)
+		label := r.ID
+		if label == "" {
+			label = r.ItemPath
 		}
-		seenID[r.ID] = struct{}{}
-
-		if r.UpstreamPath == "" || !strings.HasPrefix(r.UpstreamPath, "postgres/") {
-			return fmt.Errorf("row %d (%s): invalid upstream_path %q", rowNum, r.ID, r.UpstreamPath)
+		if r.ID != "" {
+			if _, ok := seenID[r.ID]; ok {
+				return fmt.Errorf("duplicate id %q", r.ID)
+			}
+			seenID[r.ID] = struct{}{}
 		}
-		switch r.Status {
-		case "port", "defer", "excluded":
-		default:
-			return fmt.Errorf("row %d (%s): unsupported status %q", rowNum, r.ID, r.Status)
+		if !strings.HasPrefix(r.ItemPath, "postgres/") {
+			return fmt.Errorf("row %d (%s): invalid item_path %q", rowNum, label, r.ItemPath)
+		}
+		if !validStatus[r.Status] {
+			return fmt.Errorf("row %d (%s): unsupported status %q", rowNum, label, r.Status)
 		}
 		if r.PassRequired != "yes" && r.PassRequired != "no" {
-			return fmt.Errorf("row %d (%s): pass_required must be yes/no", rowNum, r.ID)
+			return fmt.Errorf("row %d (%s): pass_required must be yes/no", rowNum, label)
 		}
-		if r.Rationale == "" {
-			return fmt.Errorf("row %d (%s): rationale is required", rowNum, r.ID)
+		if r.Status == "excluded" && r.PassRequired == "yes" {
+			return fmt.Errorf("row %d (%s): excluded cannot be pass_required=yes", rowNum, label)
 		}
 		if r.Status == "defer" && r.DeferredTo == "" {
-			return fmt.Errorf("row %d (%s): defer requires deferred_to", rowNum, r.ID)
+			return fmt.Errorf("row %d (%s): defer requires deferred_to", rowNum, label)
 		}
-		if r.Status == "excluded" && r.DeferredTo != "" && r.DeferredTo != "-" {
-			return fmt.Errorf("row %d (%s): excluded must use deferred_to '-' or empty", rowNum, r.ID)
+		if r.Status == "port" && !testFuncRe.MatchString(r.Rationale) {
+			return fmt.Errorf("row %d (%s): port rationale must name a TestPort_*/TestE2E_* func", rowNum, label)
 		}
 	}
-	return nil
-}
-
-func SummarizeBySuite(rows []StatusRow) map[string]StatusCounts {
-	out := map[string]StatusCounts{}
-	for _, r := range rows {
-		c := out[r.SuiteType]
-		switch r.Status {
-		case "port":
-			c.Port++
-		case "defer":
-			c.Defer++
-		case "excluded":
-			c.Excluded++
-		}
-		out[r.SuiteType] = c
-	}
-	return out
-}
-
-func SuiteKeys(summary map[string]StatusCounts) []string {
-	keys := make([]string, 0, len(summary))
-	for k := range summary {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
-}
-
-func WriteStatusMarkdown(w io.Writer, rows []StatusRow) error {
-	if err := ValidateStatusRows(rows); err != nil {
-		return err
-	}
-	summary := SummarizeBySuite(rows)
-	keys := SuiteKeys(summary)
-
-	_, _ = fmt.Fprintln(w, "# PostgreSQL Oracle Test-Port Status")
-	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintln(w, "Generated from `docs/test-port/postgres-oracle-port-status.csv`.")
-	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintln(w, "Status meanings:")
-	_, _ = fmt.Fprintln(w, "- `port`: migrated and pass-required.")
-	_, _ = fmt.Fprintln(w, "- `defer`: in scope, not yet pass-required.")
-	_, _ = fmt.Fprintln(w, "- `excluded`: explicitly out of scope by policy.")
-	_, _ = fmt.Fprintln(w)
-
-	_, _ = fmt.Fprintln(w, "## Suite Summary")
-	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintln(w, "| suite_type | port | defer | excluded |")
-	_, _ = fmt.Fprintln(w, "| ---------- | ----:| -----:| --------:|")
-	for _, k := range keys {
-		c := summary[k]
-		_, _ = fmt.Fprintf(w, "| %s | %d | %d | %d |\n", k, c.Port, c.Defer, c.Excluded)
-	}
-	_, _ = fmt.Fprintln(w)
-
-	_, _ = fmt.Fprintln(w, "## Entries")
-	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintln(w, "| id | upstream_path | suite_type | status | pass_required | rationale | deferred_to |")
-	_, _ = fmt.Fprintln(w, "|----|---------------|------------|--------|---------------|-----------|-------------|")
-	for _, r := range rows {
-		deferredTo := r.DeferredTo
-		if deferredTo == "" {
-			deferredTo = "-"
-		}
-		_, _ = fmt.Fprintf(w, "| %s | `%s` | %s | %s | %s | %s | `%s` |\n",
-			r.ID,
-			r.UpstreamPath,
-			r.SuiteType,
-			r.Status,
-			r.PassRequired,
-			r.Rationale,
-			deferredTo,
-		)
-	}
-	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintln(w, "## Notes")
-	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintln(w, "- Every non-passing target must be present here as `defer` or `excluded`.")
-	_, _ = fmt.Fprintln(w, "- `defer` entries must reference a follow-up milestone task.")
 	return nil
 }

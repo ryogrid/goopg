@@ -24,7 +24,7 @@ package testport
 // The remaining pg_amcheck suite (002_nonesuch, 003_check, 004_verify_heapam,
 // 005_opclass_damage) needs the verify_heapam() SRF and operator-class catalog
 // parity against a live goopg server; those stay deferred (rows AC-002..AC-005
-// in docs/test-port/postgres-oracle-port-status.csv).
+// in docs/test-port/postgres-oracle-target-inventory.csv).
 //
 // Design doc: docs/design/0110-0003-pg-amcheck-tap-port.md (M0110-0003).
 // CSV row: AC-001.

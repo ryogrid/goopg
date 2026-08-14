@@ -243,5 +243,34 @@ class MidRunBuildBreakTest(unittest.TestCase):
         )
 
 
+class RegressBaselineTest(unittest.TestCase):
+    def _write_inventory(self, tmp, rows):
+        import csv
+        d = os.path.join(tmp, "docs", "test-port")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "postgres-oracle-target-inventory.csv"), "w", newline="") as f:
+            w = csv.writer(f, lineterminator="\n")
+            w.writerow(["id", "suite_id", "kind", "item_path", "status", "pass_required", "deferred_to", "rationale"])
+            for r in rows:
+                w.writerow(r)
+
+    def test_basename_stripped_and_regress_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_inventory(tmp, [
+                ["", "regress-sql", "regress", "postgres/src/test/regress/sql/boolean.sql", "pass", "yes", "-", "Confirmed pass"],
+                ["", "regress-sql", "regress", "postgres/src/test/regress/sql/mvcc.sql", "failed", "no", "-", "diverges"],
+                ["P-001", "client-tools-tap", "tap", "postgres/src/bin/pg_ctl/t/001_start_stop.pl", "port", "yes", "-", "TestPort_PgCtl001StartStop"],
+            ])
+            baseline = summarize.regress_baseline(tmp)
+            self.assertEqual(baseline["boolean"], "pass")
+            self.assertEqual(baseline["mvcc"], "failed")
+            self.assertNotIn("001_start_stop", baseline)  # tap row excluded
+            self.assertNotIn("boolean.sql", baseline)      # extension stripped
+
+    def test_missing_csv_is_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(summarize.regress_baseline(tmp), {})
+
+
 if __name__ == "__main__":
     unittest.main()

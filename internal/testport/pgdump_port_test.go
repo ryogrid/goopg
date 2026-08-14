@@ -14,7 +14,7 @@ package testport
 //
 // The remaining pg_dump suite (002–010) requires broad catalog-view parity and
 // a dump/restore round-trip against a live goopg server; those stay deferred
-// (rows DU-002..DU-010 in docs/test-port/postgres-oracle-port-status.csv).
+// (rows DU-002..DU-010 in docs/test-port/postgres-oracle-target-inventory.csv).
 //
 // Design doc: docs/design/0110-0001-pg-dump-tap-port.md (M0110-0001).
 // CSV row: DU-001.
