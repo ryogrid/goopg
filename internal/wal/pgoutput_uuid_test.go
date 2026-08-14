@@ -43,7 +43,7 @@ func TestPgoDecodeUUIDMatchesPGNativeLayout(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, n, err := pgoDecodePhysicalValue(typ, tc.raw)
+			got, n, err := pgoDecodePhysicalValue(typ, tc.raw, nil)
 			if err != nil {
 				t.Fatalf("pgoDecodePhysicalValue(uuid): %v", err)
 			}

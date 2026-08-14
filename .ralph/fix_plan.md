@@ -4422,6 +4422,29 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `TestScalarRegIndexDDLMaintains` (E2E build+maintain), mutation-checked.
       Gates: pre-commit units + `scripts/tpch-spotcheck.sh` (Q12=2, Q13=35) PASS.
       Design `0119-0006-btree-reg-array-key-oidcmp.md`.
+      **82nd slice (2026-08-14): pgoutput renders reg* column values as names,
+      not numeric OIDs — deferral row 1353 resolved.** The logical-replication
+      `pgoutput` decoder emitted a reg* value as its numeric OID (`1259` /
+      `{1259}`) where PG 18.3's TEXT-mode pgoutput emits the NAME (`pg_class` /
+      `{pg_class}`). Root cause was a send/out conflation: `logicalrep_write_typ`
+      (proto.c:848) serializes text mode via `OidOutputFunctionCall(typclass->typoutput, …)`
+      = `regclassout` → name (regproc.c:940); the 4-byte-OID form is BINARY mode's
+      `typsend`. goopg's text-only `pgoDecodePhysicalValue` had shipped the binary
+      image — and its SCALAR arm too (the six reg* types rode the oid/cid/xid arm,
+      justified by a `regclasssend` comment), not just the array arm the row named.
+      Fix threads `executor.RegOut` (the existing reg*out port, single source of
+      truth) into the wal layer as a leaf closure — `CatalogSnapshot.RegOut
+      func(typeName, oid) string` (nil = numeric fallback), bound by the publisher
+      walsender via new exported `executor.RegOutRenderer(im, false)` (server→
+      executor→wal; wal→executor is a CYCLE so the renderer is a value, not an
+      import). `oid`/`cid`/`xid` stay numeric (no name form). Both twins: scalar
+      reg* arm split out of the oid arm, array arm `RenderText`→`RenderTextStyled(…,
+      OutputStyle{RegOut})`. Tests reworked + new (`TestPgoutputSnapshotRegOutRendererWired`
+      vs a real catalog); mutation-checked. Gates: `go test ./internal/wal/
+      ./internal/server/`, pre-commit units, `scripts/tpch-spotcheck.sh` (Q12=2,
+      Q13=35) PASS. New deferral row: off-path schema qualification (qualify=false
+      renders a bare non-public-schema regclass) + cross-DB regclass resolution (no
+      dbOid bound). Design `0119-0006-pgoutput-reg-names.md`.
 
 - [x] **M0119-0010 — `char(N)` typmods are not restored per column on catalog
       reload** (source: M0127-P5.9-f, ledger row 2026-08-05). **FIXED (2026-08-09).**

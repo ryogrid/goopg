@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
 	"github.com/goopg/goopg/internal/storage"
@@ -65,7 +66,13 @@ func (s *Server) runLogicalWalsender(ctx context.Context, r *protocol.FrameReade
 	// Snapshot the catalog at session start so the pgoutput
 	// stream resolves relations against a stable shape; mirrors
 	// what the apply worker expects.
-	snap := wal.BuildCatalogSnapshot(im)
+	// Bind a real reg* name renderer so TEXT-mode pgoutput emits a reg*
+	// column's NAME (regclassout/regprocout/..., proto.c:848), not the numeric
+	// OID that belongs to BINARY mode's typsend. qualify=false: the walsender
+	// has no session search_path to compute schema qualification against, so a
+	// regclass in a non-public schema renders its bare name (PG's own walsender
+	// schema-qualifies via the subscriber's search_path state). M0119-0006.
+	snap := wal.BuildCatalogSnapshot(im, executor.RegOutRenderer(im, false))
 
 	// Adapter wraps each pgoutput message in a `'w'` CopyData
 	// frame so it lands on the wire in the shape the subscriber's

@@ -459,6 +459,22 @@ func RegOutArgVisible(typeName string, oid uint32, cat catalog.Catalog, qualify 
 	return regOut(typeName, oid, cat, qualify, argVisible, dbOid...)
 }
 
+// RegOutRenderer returns a closure over RegOut bound to a fixed catalog and
+// qualification flag, so a caller that has no catalog/qualify at hand (the
+// logical-replication pgoutput decoder in internal/wal) can still render a reg*
+// value's NAME. This mirrors upstream's text-mode pgoutput column serialization:
+// logicalrep_write_typ calls OidOutputFunctionCall(typclass->typoutput, ...)
+// (postgres/src/backend/replication/logical/proto.c:848) and a reg* type's
+// typoutput is regclassout/regprocout/... which converts the OID to a name
+// (regproc.c:940) — the 4-byte-OID form belongs to BINARY mode's typsend. The
+// closure keeps RegOut the single source of truth for the name resolution.
+// M0119-0006 (deferral row 1353).
+func RegOutRenderer(cat catalog.Catalog, qualify bool, dbOid ...uint32) func(typeName string, oid uint32) string {
+	return func(typeName string, oid uint32) string {
+		return RegOut(typeName, oid, cat, qualify, dbOid...)
+	}
+}
+
 // regOut is the shared RegOut/RegOutArgVisible body; argVisible threads the
 // per-arg visibility predicate to the regprocedure arm only (nil ⇒ bare
 // arglist, the base-RegOut behavior). dbOid scopes the database-local relation

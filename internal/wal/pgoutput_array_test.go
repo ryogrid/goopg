@@ -3,6 +3,7 @@ package wal
 import (
 	"bytes"
 	"encoding/binary"
+	"strconv"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -83,10 +84,11 @@ func TestPgoDecodeArrayColumns(t *testing.T) {
 	}
 
 	cases := []struct {
-		name string
-		typ  catalog.Type
-		blob []byte
-		want string
+		name   string
+		typ    catalog.Type
+		blob   []byte
+		want   string
+		regOut func(string, uint32) string
 	}{
 		{
 			name: "int4[]",
@@ -158,10 +160,34 @@ func TestPgoDecodeArrayColumns(t *testing.T) {
 			}(),
 			want: "{}",
 		},
+		// reg*[] element name rendering (M0119-0006, deferral row 1353). The
+		// stored element is the same 4-byte LE OID as the scalar family; TEXT-mode
+		// pgoutput emits a reg* element as its typoutput NAME (proto.c:848), so a
+		// threaded renderer yields {name,...} and a nil renderer (no catalog)
+		// yields the numeric-OID {oid,...}. The synthetic closure stands in for
+		// executor.RegOutRenderer — internal/wal cannot import the executor.
+		{
+			name: "regclass[] with renderer renders names",
+			typ:  catalog.Type{Name: "regclass", IsArray: true},
+			blob: arrayBlob(2205, 2, append(le32(1259), le32(1259)...)),
+			want: "{pg_class,pg_class}",
+			regOut: func(_ string, oid uint32) string {
+				if oid == 1259 {
+					return "pg_class"
+				}
+				return strconv.FormatUint(uint64(oid), 10)
+			},
+		},
+		{
+			name: "regclass[] nil renderer stays numeric",
+			typ:  catalog.Type{Name: "regclass", IsArray: true},
+			blob: arrayBlob(2205, 2, append(le32(1259), le32(1259)...)),
+			want: "{1259,1259}",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, n, err := pgoDecodePhysicalValue(tc.typ, tc.blob)
+			got, n, err := pgoDecodePhysicalValue(tc.typ, tc.blob, tc.regOut)
 			if err != nil {
 				t.Fatalf("pgoDecodePhysicalValue: %v", err)
 			}
@@ -201,7 +227,7 @@ func TestEncodePgoTuplePhysicalArrayDoesNotShiftFollowingColumn(t *testing.T) {
 		{Name: "a", Type: catalog.Type{Name: "int4", IsArray: true}},
 		{Name: "b", Type: catalog.Type{Name: "int4"}},
 	}
-	out, err := encodePgoTuplePhysical(cols, body, []byte{0x03}, 2)
+	out, err := encodePgoTuplePhysical(cols, body, []byte{0x03}, 2, nil)
 	if err != nil {
 		t.Fatalf("encodePgoTuplePhysical: %v", err)
 	}

@@ -38,7 +38,7 @@ func TestEncodePgoTuplePhysical(t *testing.T) {
 		t.Fatalf("MarshalBinary: %v", err)
 	}
 
-	out, err := encodePgoTuple(cols, raw)
+	out, err := encodePgoTuple(cols, raw, nil)
 	if err != nil {
 		t.Fatalf("encodePgoTuple: %v", err)
 	}

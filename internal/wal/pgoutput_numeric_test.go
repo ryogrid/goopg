@@ -28,7 +28,7 @@ func TestPgoDecodeNumericMatchesPGNativeLayout(t *testing.T) {
 				t.Fatalf("NumericBodyFromText(%q): %v", text, err)
 			}
 			raw := shortVarlena(body)
-			got, n, err := pgoDecodePhysicalValue(typ, raw)
+			got, n, err := pgoDecodePhysicalValue(typ, raw, nil)
 			if err != nil {
 				t.Fatalf("pgoDecodePhysicalValue(numeric): %v", err)
 			}
@@ -54,7 +54,7 @@ func TestPgoDecodeNumericMatchesPGNativeLayout(t *testing.T) {
 func TestPgoDecodeNumericAcceptsLegacyTextPayload(t *testing.T) {
 	typ := catalog.Type{Name: "numeric"}
 	for _, text := range []string{"0", "1234.5", "-1234.5", "1.00"} {
-		got, _, err := pgoDecodePhysicalValue(typ, shortVarlena([]byte(text)))
+		got, _, err := pgoDecodePhysicalValue(typ, shortVarlena([]byte(text)), nil)
 		if err != nil {
 			t.Fatalf("legacy %q: %v", text, err)
 		}
