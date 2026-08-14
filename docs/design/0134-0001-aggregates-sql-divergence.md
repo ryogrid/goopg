@@ -73,8 +73,11 @@ error cases. It depends on two things the runner does not provide:
 3. **P3 error-position context** — **(a) harness half LANDED 2026-08-15:** drop the
    `psql:file:line:` prefix by feeding each `.sql` via stdin redirect (`< file`)
    instead of `-f`, mirroring `pg_regress_main.c:74-75` (56 prefix lines → 0).
-   **(b) engine half open:** add `LINE n:`/`^` to parse-analysis errors (27 lines) —
-   a shared gap across cases, likely warrants a cross-case design note.
+   **(b) engine half LANDED 2026-08-15** — emit the `P` field for planner errors on
+   both protocol paths + re-point 7 raise sites to the offending subexpression;
+   raw-verify 23/23 common carets byte-match PG. Cross-case note:
+   `docs/design/0134-0001-p3b-error-position-context.md`. Two deferrals remain
+   (22P02 type-coercion location; byte-vs-char multibyte index).
 4. **P2 `EXPLAIN` format** — broadest remaining engine gap; separate milestone-sized effort.
 5. **P6/P7/P8** — deparse, collation, residual expr errors.
 6. ~~P5 bytea string_agg delimiter~~ — reclassified non-issue (see map above).

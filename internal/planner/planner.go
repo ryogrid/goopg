@@ -1086,7 +1086,7 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		// tables NOT in the current FROM clause) are allowed — PG permits
 		// `WHERE sum(outer.col) = inner.col` inside EXISTS subqueries. M0097-0035.
 		if exprHasAggregate(s.Where) && !exprAllAggregatesAreOuterRef(s.Where, ctx) {
-			return nil, &PlanError{Pos: s.Where.Pos(), Code: "42803",
+			return nil, &PlanError{Pos: firstAggregatePos(s.Where), Code: "42803",
 				Message: "aggregate functions are not allowed in WHERE"}
 		}
 		// M0127-P5.6-g-iv: PG's `canonicalize_qual` (prepqual.c), which
@@ -6404,7 +6404,9 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 						}
 					}
 					return nil, nil, nil, nil, &PlanError{
-						Pos:     fc.Pos(),
+						// PG points at the ungrouped direct-arg Var, not the
+						// aggregate funcall head (rank(x) → `x`). M0134-0001 P3b.
+						Pos:     cr.Pos(),
 						Code:    "42803",
 						Message: fmt.Sprintf(`column "%s" must appear in the GROUP BY clause or be used in an aggregate function`, qualName),
 						Detail:  "Direct arguments of an ordered-set aggregate must use only grouped columns.",
@@ -7448,6 +7450,59 @@ func exprHasAggregate(e parser.Expr) bool {
 	return found
 }
 
+// firstAggregatePos returns the Pos (0-based byte offset) of the first
+// aggregate function call found in e via pre-order walkExpr traversal, or -1
+// if none. Mirrors PG's check_agglevels_walker
+// (postgres/src/backend/parser/parse_agg.c), which reports the first Aggref at
+// an illegal level via parser_errposition(pstate, agg->location) — the caret
+// points at the offending aggregate, not the clause root that contains it.
+func firstAggregatePos(e parser.Expr) int {
+	pos := -1
+	_ = walkExpr(e, func(fc *parser.FuncCall) error {
+		if pos < 0 && isAggregateFunc(fc) {
+			pos = fc.Pos()
+		}
+		return nil
+	})
+	return pos
+}
+
+// exprLocationPos returns the leftmost token location of a raw parse
+// expression, mirroring PG's exprLocation (postgres/src/backend/nodes/
+// nodeFuncs.c:1384). For a binary op PG returns the leftmost of the operator
+// location and the left operand's location; for a cast the leftmost of the
+// operand and the cast separator; in practice that is the leftmost leaf token
+// (the left operand, which always precedes the operator/separator). Used where
+// the caret must point at the expression's start, e.g. "in an aggregate with
+// DISTINCT, ORDER BY expressions must appear in argument list" (parse_clause.c:
+// parser_errposition(pstate, exprLocation(tle->expr))). M0134-0001 P3b.
+func exprLocationPos(e parser.Expr) int {
+	switch x := e.(type) {
+	case *parser.BinaryOp:
+		if lp := exprLocationPos(x.Left); lp >= 0 {
+			return lp
+		}
+		return x.Pos()
+	case *parser.UnaryOp:
+		if lp := exprLocationPos(x.Operand); lp >= 0 {
+			return lp
+		}
+		return x.Pos()
+	case *parser.CastExpr:
+		if lp := exprLocationPos(x.Operand); lp >= 0 {
+			return lp
+		}
+		return x.Pos()
+	case *parser.CollateExpr:
+		if lp := exprLocationPos(x.Operand); lp >= 0 {
+			return lp
+		}
+		return x.Pos()
+	default:
+		return e.Pos()
+	}
+}
+
 // exprAllAggregatesAreOuterRef returns true if every aggregate function call in e
 // has ALL of its column references pointing to tables NOT in the current scope
 // (i.e., they are outer-query correlated references). In that case, the aggregate
@@ -7640,7 +7695,7 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 			if inputCtx != nil && inputCtx.parent != nil {
 				msg = "aggregate function calls cannot be nested"
 			}
-			return AggregateCall{}, &PlanError{Pos: fc.Filter.Pos(), Code: "42803", Message: msg}
+			return AggregateCall{}, &PlanError{Pos: firstAggregatePos(fc.Filter), Code: "42803", Message: msg}
 		}
 		var ferr error
 		filterExpr, ferr = resolveExpr(fc.Filter, inputCtx)
@@ -7679,7 +7734,10 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 		}
 		for _, ob := range fc.OrderBy {
 			if !argKeys[parserExprKey(ob.Expr)] {
-				return AggregateCall{}, &PlanError{Pos: ob.Expr.Pos(), Code: "42P10",
+				// PG points at the ORDER BY expression's START (exprLocation),
+				// not the operator/separator of a compound expr (`b+1` → `b`,
+				// `f1::text` → `f1`). M0134-0001 P3b.
+				return AggregateCall{}, &PlanError{Pos: exprLocationPos(ob.Expr), Code: "42P10",
 					Message: "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list"}
 			}
 		}
@@ -7770,8 +7828,14 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 			}
 		}
 		// Validate: WITHIN GROUP conflicts with ORDER BY inside the call args.
+		// PG's caret points at the `within` keyword (gram.y func_expr:
+		// parser_errposition(@2)), not the funcall head. M0134-0001 P3b.
 		if len(fc.OrderBy) > 0 {
-			return AggregateCall{}, &PlanError{Pos: fc.Pos(), Code: "42P13",
+			pos := fc.Pos()
+			if fc.WithinGroupPos > 0 {
+				pos = fc.WithinGroupPos
+			}
+			return AggregateCall{}, &PlanError{Pos: pos, Code: "42P13",
 				Message: "cannot use multiple ORDER BY clauses with WITHIN GROUP"}
 		}
 		for _, sb := range fc.WithinGroup {
@@ -7782,9 +7846,19 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 			// Validate: WITHIN GROUP ORDER BY cannot reference outer-scope columns.
 			// PostgreSQL error: "outer-level aggregate cannot contain a lower-level variable
 			// in its direct arguments". M0097-0127.
+			// PG points at the offending direct-arg Var (locate_var_of_level on the
+			// direct args), not the funcall head. M0134-0001 P3b.
+			directPos := -1
+			if argExpr != nil {
+				directPos = argExpr.Pos()
+			}
 			walkExprTree(e, func(inner Expr) {
 				if _, isOuter := inner.(*OuterColumnRef); isOuter {
-					serr = &PlanError{Pos: fc.Pos(), Code: "0A000",
+					pos := directPos
+					if pos < 0 {
+						pos = fc.Pos()
+					}
+					serr = &PlanError{Pos: pos, Code: "0A000",
 						Message: "outer-level aggregate cannot contain a lower-level variable in its direct arguments"}
 				}
 			})
@@ -7800,8 +7874,10 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 			for _, wk := range withinGroupKeys {
 				if wc, ok2 := wk.Expr.(*CollateExpr); ok2 {
 					if !strings.EqualFold(ac.CollationName, wc.CollationName) {
+						// PG's caret points at the offending WITHIN GROUP ORDER BY
+						// key's CollateExpr (x collate "POSIX"), not the funcall head.
 						return AggregateCall{}, &PlanError{
-							Pos:  fc.Pos(),
+							Pos:  wc.Pos(),
 							Code: "42P21",
 							Message: fmt.Sprintf(
 								"collation mismatch between explicit collations %q and %q",

@@ -184,6 +184,10 @@ var keyInsensitiveFields = map[string]string{
 	// resolving both to the same Var.
 	"parser.ColumnRef.Schema": "qualifier deliberately ignored (M0097-0003)",
 	"parser.ColumnRef.Table":  "qualifier deliberately ignored (M0097-0003)",
+	// M0134-0001 P3b: source offset of the `within` keyword, used only for the
+	// error-position caret. Same exclusion as the unexported `pos` field: two
+	// aggregate calls differing only in offset must key equal.
+	"parser.FuncCall.WithinGroupPos": "source offset, error-position only (M0134-0001 P3b)",
 }
 
 func TestExprTypeRegistryIsExhaustive(t *testing.T) {

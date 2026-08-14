@@ -111,8 +111,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 		var perr error
 		node, perr = planner.Plan(stmt, sessionPlanCatalog(sess, s.cfg.Catalog, connDBOid))
 		if perr != nil {
-			code, msg := planErrorFields(perr)
-			return nil, &extendedQueryError{Code: code, Message: msg}
+			return nil, newPlannerExtendedQueryError(perr)
 		}
 		if s.pc != nil && planCacheIsCacheable(node) {
 			s.pc.Put(planCacheKey(query, connDBOid), node)

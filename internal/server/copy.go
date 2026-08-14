@@ -811,6 +811,10 @@ func planErrorHintFields(err error) []protocol.ErrorField {
 	if pe.Hint != "" {
 		fields = append(fields, protocol.ErrorField{Code: protocol.FieldHint, Value: pe.Hint})
 	}
+	// PlanError.Pos is 0-based (0 = unset); wire protocol FieldPosition is 1-based.
+	if pe.Pos > 0 {
+		fields = append(fields, protocol.ErrorField{Code: protocol.FieldPosition, Value: strconv.Itoa(pe.Pos + 1)})
+	}
 	return fields
 }
 
@@ -873,4 +877,22 @@ func newExtendedQueryError(err error) *extendedQueryError {
 		}
 	}
 	return &extendedQueryError{Code: execErrCode(err), Message: execErrMsg(err)}
+}
+
+func newPlannerExtendedQueryError(err error) *extendedQueryError {
+	var pe *planner.PlanError
+	if errors.As(err, &pe) {
+		pos := 0
+		if pe.Pos > 0 {
+			pos = pe.Pos + 1 // 0-based → 1-based
+		}
+		return &extendedQueryError{
+			Code:     sqlstate.Code(pe.Code),
+			Message:  pe.Message,
+			Detail:   pe.Detail,
+			Hint:     pe.Hint,
+			Position: pos,
+		}
+	}
+	return &extendedQueryError{Code: sqlstate.FeatureNotSupported, Message: err.Error()}
 }

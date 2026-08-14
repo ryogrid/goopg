@@ -4348,7 +4348,15 @@ func (p *parser) parseFuncCallTail(pos int, name ObjectName) (Expr, error) {
 func (p *parser) maybeWindowTail(fc *FuncCall) (Expr, error) {
 	// WITHIN GROUP (ORDER BY sortlist) — ordered-set aggregate.
 	// `within` is an identifier (not a reserved keyword), so use acceptIdentKeyword.
+	// Record the `within` token's offset: PG's "cannot use multiple ORDER BY
+	// clauses with WITHIN GROUP" caret points at this keyword (gram.y
+	// func_expr: parser_errposition(@2)). M0134-0001 P3b.
+	withinPos := 0
+	if t := p.cur(); t.Kind == TokenIdent && strings.EqualFold(t.Value, "within") {
+		withinPos = t.Pos
+	}
 	if p.acceptIdentKeyword("within") {
+		fc.WithinGroupPos = withinPos
 		if !p.acceptKeyword(KwGroup) {
 			return nil, p.errAtCur("expected GROUP after WITHIN")
 		}
