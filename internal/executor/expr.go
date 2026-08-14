@@ -3287,6 +3287,32 @@ func evalCastTyped(d Datum, targetType, sourceType string, pos int, ctx *Context
 	if sourceType == "" {
 		return evalCast(d, targetType, pos, ctx)
 	}
+	// M0119-0006 (deferral row 1350): a reg* datum is a plain KindInt holding an
+	// object OID, so casting one to a string type must render its OBJECT NAME via
+	// the same RegOut the SELECT (internal/server/dispatch.go appendTypedCellText)
+	// and COPY (datumToCopyText) wire paths use — not the raw numeric OID. This
+	// guard is the cast path's third sibling of those renderers
+	// (pattern_sibling_paths_must_agree); the reg*out family
+	// (regclassout/regprocout/regprocedureout/regtypeout/regroleout/
+	// regcollationout, postgres/src/backend/utils/adt/regproc.c) all render the
+	// resolved name. regOut degrades to "-" for OID 0 and to the numeric OID for a
+	// dangling/nil-catalog object, unchanged. `char` (CHAROID) is deliberately
+	// excluded from the targets (charin/charout first-byte semantics).
+	if isRegIdentifierTypeName(sourceType) && isStringTargetType(targetType) && d.Kind == KindInt {
+		var cat catalog.Catalog
+		var connDBOid []uint32
+		if ctx != nil {
+			cat = ctx.Catalog
+			// Scope the relation lookup to the connection's own database
+			// namespace (mirroring the `oid::regclass` CastExpr arm's connDBOid,
+			// M0122-0007 4e follow-up 33) so an OID owned by ANOTHER database
+			// never renders that database's relation name from this connection
+			// (TestRegclassCastScopedToConnectionDBOid). Nil ctx keeps the empty
+			// variadic → DefaultDBOid default, byte-identical to pre-scoping.
+			connDBOid = []uint32{catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)}
+		}
+		return NewStringDatum(RegOut(sourceType, uint32(d.Int), cat, regCastQualify(ctx), connDBOid...)), nil
+	}
 	// For float8/float4 → integer casts, override the default (away-from-zero)
 	// rounding inside evalCast to use banker's rounding instead.
 	// Also handle KindString datums produced by the float8 arithmetic path
@@ -3327,6 +3353,31 @@ func evalCastTyped(d Datum, targetType, sourceType string, pos int, ctx *Context
 		}
 	}
 	return evalCast(d, targetType, pos, ctx)
+}
+
+// isStringTargetType reports whether targetType is one of the string types a
+// reg* value renders its object name as (deferral row 1350). `char` (CHAROID)
+// is deliberately excluded — it keeps charin/charout first-byte semantics and
+// is not named in the row.
+func isStringTargetType(targetType string) bool {
+	switch strings.ToLower(targetType) {
+	case "text", "varchar", "name", "bpchar":
+		return true
+	}
+	return false
+}
+
+// regCastQualify reports whether a reg*→string cast must schema-qualify object
+// names, mirroring the SELECT wire path's publicSchemaVisible exactly
+// (internal/server/dispatch.go): true when the `public` schema is not on the
+// session's effective search_path (including pg_dump's search_path='').
+// Nil ctx ⇒ false, matching the SELECT path's nil-getSetting behavior. Per-object
+// qualification (deferral row 1347) stays out of scope.
+func regCastQualify(ctx *Context) bool {
+	if ctx == nil {
+		return false
+	}
+	return !RegObjectSchemaVisible(ctx, "public")
 }
 
 // dateStyleFromCtx resolves the session's DateStyle GUC (style, order) via

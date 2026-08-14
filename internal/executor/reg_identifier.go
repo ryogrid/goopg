@@ -437,9 +437,15 @@ func regIdentifierOIDFromDatum(d Datum, typeName string) (uint32, error) {
 // *InMemory assertion) skips the lookups and falls through to the numeric form,
 // preserving the no-catalog behavior of every call site that predates the
 // catalog threading. M0119-0006 (69th slice) added the quoting + qualification
-// to the regclass/regproc/regrole/regcollation arms.
-func RegOut(typeName string, oid uint32, cat catalog.Catalog, qualify bool) string {
-	return regOut(typeName, oid, cat, qualify, nil)
+// to the regclass/regproc/regrole/regcollation arms. dbOid scopes the
+// database-local relation lookups (pg_class) to a specific database namespace;
+// empty keeps the DefaultDBOid default. The reg* cast path (evalCastTyped's
+// M0119-0006 guard) passes the connection's real database OID so an OID that
+// belongs to another database never renders that database's relation name — the
+// same connDBOid scoping the `oid::regclass` CastExpr arm threads (expr.go,
+// M0122-0007 4e follow-up 33).
+func RegOut(typeName string, oid uint32, cat catalog.Catalog, qualify bool, dbOid ...uint32) string {
+	return regOut(typeName, oid, cat, qualify, nil, dbOid...)
 }
 
 // RegOutArgVisible is RegOut with an extra per-arg-type visibility predicate
@@ -449,14 +455,15 @@ func RegOut(typeName string, oid uint32, cat catalog.Catalog, qualify bool) stri
 // Name qualification is unchanged — the `qualify` flag still decides whether
 // the routine NAME is schema-qualified (quote_qualified_identifier), exactly
 // as format_procedure's FunctionIsVisible arm.
-func RegOutArgVisible(typeName string, oid uint32, cat catalog.Catalog, qualify bool, argVisible func(schema string) bool) string {
-	return regOut(typeName, oid, cat, qualify, argVisible)
+func RegOutArgVisible(typeName string, oid uint32, cat catalog.Catalog, qualify bool, argVisible func(schema string) bool, dbOid ...uint32) string {
+	return regOut(typeName, oid, cat, qualify, argVisible, dbOid...)
 }
 
 // regOut is the shared RegOut/RegOutArgVisible body; argVisible threads the
 // per-arg visibility predicate to the regprocedure arm only (nil ⇒ bare
-// arglist, the base-RegOut behavior).
-func regOut(typeName string, oid uint32, cat catalog.Catalog, qualify bool, argVisible func(schema string) bool) string {
+// arglist, the base-RegOut behavior). dbOid scopes the database-local relation
+// lookups (see RegOut).
+func regOut(typeName string, oid uint32, cat catalog.Catalog, qualify bool, argVisible func(schema string) bool, dbOid ...uint32) string {
 	if oid == 0 {
 		return "-"
 	}
@@ -464,10 +471,16 @@ func regOut(typeName string, oid uint32, cat catalog.Catalog, qualify bool, argV
 	switch strings.ToLower(typeName) {
 	case "regclass":
 		if hasIM {
-			if tbl, ok := im.LookupTableByOID(oid); ok {
+			// dbOid-scope the pg_class lookup so a relation owned by ANOTHER
+			// database's namespace never renders its name from this connection
+			// (TestRegclassCastScopedToConnectionDBOid; mirror of the
+			// `oid::regclass` CastExpr arm's connDBOid, M0122-0007 4e follow-up
+			// 33). Empty dbOid keeps the DefaultDBOid default for the SELECT/COPY
+			// siblings, whose callers predate the scoping.
+			if tbl, ok := im.LookupTableByOID(oid, dbOid...); ok {
 				return regOutQualified(tbl.Schema, tbl.Name, qualify)
 			}
-			if idx, ok := im.LookupIndexByOID(oid); ok {
+			if idx, ok := im.LookupIndexByOID(oid, dbOid...); ok {
 				return regOutQualified(idx.Schema, idx.Name, qualify)
 			}
 		}

@@ -4313,6 +4313,39 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       can hit "catalog update: freshly extended page did not accept tuple" when
       the pg_proc heap page is full — a pg_proc heap-page-extension limitation.
 
+      **78th slice (2026-08-14): reg* → text/varchar/name/bpchar cast renders
+      the name — deferral row 1350 resolved.** A reg* datum is a plain KindInt
+      holding the object OID, so casting one to a string type rendered the raw
+      OID, not the name: `'pg_type'::regclass::text` → `1247` (PG `pg_type`),
+      `'f_varbit(varbit)'::regprocedure::text` → `131072` (PG `f_varbit(bit
+      varying)`), `'f_varbit'::regproc::text` → `131072` (PG `f_varbit`), and
+      `'pg_type'::regclass::name` passed the KindInt through unchanged. The
+      `::reg*` INPUT half resolved correctly; only the downstream string cast
+      rendered the numeric datum. `evalCastTyped` (internal/executor/expr.go) —
+      which has the source-type name + `*Context` that `evalCast`'s frozen
+      signature lacks — now guards: when sourceType ∈ {regclass,regproc,
+      regprocedure,regtype,regrole,regcollation} and targetType ∈ {text,varchar,
+      name,bpchar} and d.Kind==KindInt, it returns `RegOut(sourceType, oid,
+      ctx.Catalog, qualify)` — the 68th slice's shared SELECT+COPY renderer, so
+      the cast is the missing third sibling (pattern_sibling_paths_must_agree) —
+      `qualify` mirroring the SELECT path's `!publicSchemaVisible` (no per-schema
+      qualification, row 1347 stays open); `char` (CHAROID) is excluded
+      (charin/charout first-byte semantics). Because the planner stamps
+      `CastExpr.SourceType` from the operand type, this also fixes the unprobed
+      `regcol::text` column shape. The regclass arm of `regOut` gained dbOid
+      scoping (a `dbOid ...uint32` variadic through `RegOut`/`RegOutArgVisible`/
+      `regOut` → `LookupTableByOID`/`LookupIndexByOID`) so a regclass cast never
+      renders ANOTHER database's relation name — the connDBOid scoping the
+      `oid::regclass` CastExpr arm already threads (M0122-0007 4e follow-up 33);
+      existing SELECT/COPY callers pass no dbOid and keep DefaultDBOid. Tests
+      `internal/executor/reg_cast_to_text_test.go` (SQL battery over six sources
+      × 4 targets, a 24-cell direct KindInt matrix, the `regcol::text` shape,
+      OID-0→`-`/dangling→numeric, and a cast==SELECT sibling-agreement test),
+      mutation-checked. Design `docs/design/0119-0006-reg-cast-to-text-name-rendering.md`
+      + README row `0119-0006bd`. Gates: executor package + pre-commit units +
+      `scripts/tpch-spotcheck.sh` (Q12=2, Q13=35) + `TestPort_RegressSuite/oid`
+      PASS.
+
 - [x] **M0119-0010 — `char(N)` typmods are not restored per column on catalog
       reload** (source: M0127-P5.9-f, ledger row 2026-08-05). **FIXED (2026-08-09).**
       Root cause: `DecodePGAttributePhysicalRow` never decoded `atttypmod`
