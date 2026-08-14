@@ -150,6 +150,60 @@ an array constructor renders `array_construct(...)` where PG renders
 `Output:` (emitNodeDetailLines runs before the verbose Output block) where PG
 emits `Output:` first (`explain.c:1933` before `2067`), a class-10 sub-item.
 
+## S5 design (classes 2+5 rendering half) — resolved 2026-08-15
+
+**Label (class 2 suffix).** `ExplainNode` labels AGG_PLAIN→`Aggregate`,
+AGG_SORTED→`GroupAggregate`, AGG_HASHED→`HashAggregate`, AGG_MIXED→`MixedAggregate`
+(`explain.c:1531-1553`). goopg's executor is hash-only (`groups :=
+map[string]*groupRuntime{}`, `operators_join_agg.go:1967`) — no AGG_SORTED
+streaming variant — so the grouped label must stay `HashAggregate`; the ungrouped
+`Aggregate` label is already faithful. Change **only** the `describePlan`
+Aggregate case (~line 1739): `HashAggregate (%d keys)` → `HashAggregate`. Leave
+the grouping-sets branch (~1707-1717) unchanged — it is the separate M0125-0048
+single-node path and out of S5 scope.
+
+**Detail line (class 2 missing `Group Key:`).** The crux resolves decisively: for
+a non-grouping-sets grouped aggregate PG's `show_agg_keys` ALWAYS calls
+`show_sort_group_keys(..., "Group Key", ...)` regardless of strategy — even
+AGG_HASHED (`explain.c:2616-2636`). There is **no** `Hash Key:` line for a plain
+hash aggregate; `show_hashagg_info` emits only partition/batch/memory/disk stats
+(`explain.c:3716-3830`). The literal `"Hash Key"` exists solely in the
+grouping-sets path (`show_grouping_set_keys`, `explain.c:2683-2692`), which S5 does
+not touch. So the detail line is always `Group Key: <exprs>`.
+
+**Emit site.** Add a `case *planner.Aggregate:` to `emitNodeDetailLines`
+(`operators_explain.go:572-715`), before the `default:` arm: when
+`len(p.GroupExprs) > 0 && p.GroupingSets == nil`, deparse each entry with
+`formatExprQual(g, reg, qualify)` (same as the Sort key and Memoize Cache Key
+cases) and append `"Group Key: " + strings.Join(parts, ", ")`. Then render the
+attachedFilter (HAVING) as `Filter:` — PG order is `Group Key:` → `Filter:`
+(`explain.c:2196-2197`). `qualify` is already computed at line 583 and is correct
+for Aggregate (not a scan node → `reg.names().qualify()` = PG's `rtable_size > 1`).
+
+**Inherited gaps (NOT fixed by S5, format-only):**
+- **Cast deparse** — goopg's `formatExprQual` drops top-level casts (`CastExpr`
+  returns only the operand, `operators_explain.go:1021-1022`) where PG shows them
+  (`showTopLevelCast=true`); `qualify` also omits the `|| es->verbose` term
+  (deferral, comment at 580-582). The Group Key line inherits both.
+- **VERBOSE ordering** — goopg emits `emitNodeDetailLines` before the verbose
+  `Output:` block, so in VERBOSE `Group Key:` renders before `Output:` where PG
+  emits `Output:` first (`explain.c:1933` before `2196`). Same pre-existing
+  divergence as Sort Key / Function Call (class-10 sub-item, ledgered by S2).
+- **Expr list length** — `GroupExprs` is the FULL group-by (no functional-dep
+  pruning at plan build; that is class 5 / `remove_useless_groupby_columns`, S7).
+  S5 renders the full list; the count/expr divergence vs PG is by design until S7.
+
+**Measured residuals (2026-08-15 `aggregates.diff`, 1583→1534 lines):** 16 bare
+`HashAggregate` labels + 23 `Group Key:` lines, every same-shape block byte-matching
+(`Group Key: c1.w, c1.z`, `Group Key: ten`, …). The still-diverging grouped-agg
+blocks are all attributable to four non-S5 classes — (i) key-list length (S7),
+(ii) key ORDER (PG emits the access-path/sort order; goopg the written order — a
+consequence of the S8 strategy gap, always coincident with PG `GroupAggregate`-over-
+Sort vs goopg `HashAggregate`-over-SeqScan), (iii) Group Key *expression*
+qualification/paren spelling (pre-existing `formatExprQual` style, identical to
+Sort Key/Output/Filter lines throughout the diff), (iv) plan shape (S6/S9/S10).
+No S5-introduced format regression.
+
 ## Cross-case relevance
 
 Every M0134 regress case whose `.sql` emits `EXPLAIN` inherits the formatter

@@ -702,6 +702,25 @@ func emitNodeDetailLines(n planner.Node, indent string, verbose bool, rows *[]Ro
 		if attachedFilter != nil {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
 		}
+	case *planner.Aggregate:
+		// S5 (0134-0001 P2): PG's show_agg_keys prints a `Group Key:` line
+		// for ANY grouped aggregate, regardless of strategy — AGG_HASHED
+		// included (explain.c:2616-2636); show_hashagg_info emits no key
+		// line of its own (explain.c:3716-3830). The grouping-sets path is
+		// out of S5 scope (its per-set lines are a separate M0125-0048
+		// shape; the suffix on the label carries the set count).
+		if len(p.GroupExprs) > 0 && p.GroupingSets == nil {
+			parts := make([]string, 0, len(p.GroupExprs))
+			for _, g := range p.GroupExprs {
+				parts = append(parts, formatExprQual(g, reg, qualify))
+			}
+			*rows = append(*rows, Row{NewStringDatum(indent + "Group Key: " + strings.Join(parts, ", "))})
+		}
+		// PG order (explain.c:2196-2197): Group Key first, then the HAVING
+		// qual as `Filter:` (show_upper_qual plan->qual).
+		if attachedFilter != nil {
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+		}
 	default:
 		// Non-scan nodes keep an attached Filter alive — render it
 		// here so the predicate is not silently dropped when our
@@ -1733,10 +1752,11 @@ func describePlan(n planner.Node, nm *explainNames) string {
 		// with "Partial "/"Finalize " for parallel aggregation, which would
 		// otherwise cement "Partial GroupAggregate" onto a hash node.
 		//
-		// The "(%d keys)" suffix is goopg's own; PG emits a separate
-		// "Group Key: <exprs>" detail line instead. Kept as-is to hold this
-		// stage to the rename — see the TODO's follow-up note.
-		return fmt.Sprintf("%sHashAggregate (%d keys)", prefix, len(p.GroupExprs))
+		// S5 (0134-0001 P2): the "(%d keys)" suffix is gone — PG's AGG_HASHED
+		// label is a bare "HashAggregate" (explain.c:1549). The grouping
+		// expressions render as a separate "Group Key: <exprs>" detail line
+		// (emitNodeDetailLines; show_agg_keys, explain.c:2616-2636).
+		return prefix + "HashAggregate"
 	case *planner.WindowAgg:
 		return fmt.Sprintf("WindowAgg (%d funcs)", len(p.Funcs))
 	case *planner.SeqScan:

@@ -18,7 +18,7 @@ const goopgQ18Shaped = `Sort  (cost=0.00..0.00 rows=100 width=0) (actual time=1.
       ->  Hash Join (INNER)  (cost=0.00..0.00 rows=5997241 width=0) (actual time=0.3..0.4 rows=6001215.00 loops=1)
         ->  Seq Scan on public.orders (stats)  (cost=0.00..0.00 rows=1500000 width=0) (actual time=0.1..0.2 rows=1500000.00 loops=1)
         ->  Seq Scan on public.lineitem (stats)  (cost=0.00..0.00 rows=5997241 width=0) (actual time=0.1..0.2 rows=5997241.00 loops=1)
-    ->  HashAggregate (1 keys)  (cost=0.00..0.00 rows=1210559 width=0) (actual time=0.1..0.2 rows=57.00 loops=1)
+    ->  HashAggregate  (cost=0.00..0.00 rows=1210559 width=0) (actual time=0.1..0.2 rows=57.00 loops=1)
       ->  Seq Scan on public.lineitem (stats)  (cost=0.00..0.00 rows=5997241 width=0) (actual time=0.1..0.2 rows=5997241.00 loops=1)`
 
 // pgQ18Shaped is the SAME query as PG 18.3 plans it, in upstream's rendering:
@@ -82,7 +82,7 @@ func TestLeafRelNormalisesBothRenderings(t *testing.T) {
 		{"Bitmap Heap Scan on lineitem", "lineitem", true},
 		{"Bitmap Index Scan on lineitem_l_orderkey_idx", "", false}, // an INDEX, not a rel
 		{"Hash Join (INNER)", "", false},
-		{"HashAggregate (1 keys)", "", false},
+		{"HashAggregate", "", false},
 		{"Hash", "", false},
 	}
 	for _, c := range cases {
@@ -257,7 +257,7 @@ func TestQ21FinalBarIsAParityBarNotAMute(t *testing.T) {
 	// rows=1 too (neqjoinsel returns 1-nullfrac for JOIN_ANTI by design), so
 	// holding it to the absolute tripwire would demand a divergence from PG.
 	q21 := func(est int) string {
-		return `HashAggregate (1 keys)  (cost=0.00..0.00 rows=10000 width=0) (actual rows=405.00 loops=1)
+		return `HashAggregate  (cost=0.00..0.00 rows=10000 width=0) (actual rows=405.00 loops=1)
   ->  Hash Join (ANTI)  (cost=0.00..0.00 rows=` + strconv.Itoa(est) + ` width=0) (actual rows=4003.00 loops=1)
     ->  Seq Scan on public.lineitem l1 (stats)  (cost=0.00..0.00 rows=5997241 width=0) (actual rows=5997241.00 loops=1)
     ->  Seq Scan on public.lineitem l3 (stats)  (cost=0.00..0.00 rows=5997241 width=0) (actual rows=5997241.00 loops=1)`

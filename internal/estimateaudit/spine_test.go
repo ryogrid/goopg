@@ -36,7 +36,7 @@ const pgQ7Bushy = `GroupAggregate  (cost=1.0..2.0 rows=1 width=0) (actual time=1
 // distinction between "the query's chosen spine contains a bushy join" and
 // "the query's top partition is the one PG chose".
 const goopgQ7 = `Sort  (cost=0.00..0.00 rows=12163 width=0) (actual time=1.0..1.1 rows=4.00 loops=1)
-  ->  HashAggregate (3 keys)  (cost=0.00..0.00 rows=12163 width=0) (actual time=1.0..1.1 rows=4.00 loops=1)
+  ->  HashAggregate  (cost=0.00..0.00 rows=12163 width=0) (actual time=1.0..1.1 rows=4.00 loops=1)
     ->  Hash Join (INNER)  (cost=0.00..0.00 rows=12163 width=0) (actual time=1.0..1.1 rows=5869.00 loops=1)
       ->  Hash Join (INNER)  (cost=0.00..0.00 rows=304087 width=0) (actual time=1.0..1.1 rows=147791.00 loops=1)
         ->  Hash Join (INNER)  (cost=0.00..0.00 rows=2534062 width=0) (actual time=1.0..1.1 rows=1820702.00 loops=1)

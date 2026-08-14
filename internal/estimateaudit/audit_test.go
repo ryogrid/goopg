@@ -17,7 +17,7 @@ import (
 // mis-identify the final joinrel.
 const planQ9Shaped = `Sort  (cost=0.00..0.00 rows=175 width=0) (actual time=0.100..0.200 rows=175.00 loops=1)
     Sort Key: nation, o_year DESC
-  ->  HashAggregate (2 keys)  (cost=0.00..0.00 rows=175 width=0) (actual time=0.090..0.190 rows=175.00 loops=1)
+  ->  HashAggregate  (cost=0.00..0.00 rows=175 width=0) (actual time=0.090..0.190 rows=175.00 loops=1)
     ->  Hash Join (INNER)  (cost=0.00..0.00 rows=1 width=0) (actual time=0.010..0.080 rows=319404.00 loops=1)
           Hash Cond: (lineitem.l_orderkey = orders.o_orderkey)
       ->  Hash Join (INNER, build=left)  (cost=0.00..0.00 rows=2500 width=0) (actual time=0.005..0.050 rows=319404.00 loops=1)
@@ -42,8 +42,8 @@ func TestParseSeparatesNodesFromDetailLines(t *testing.T) {
 	if nodes[0].Label != "Sort" || nodes[0].Depth != 0 {
 		t.Errorf("root node = %q depth %d, want \"Sort\" depth 0", nodes[0].Label, nodes[0].Depth)
 	}
-	if nodes[1].Label != "HashAggregate (2 keys)" || nodes[1].Depth != 1 {
-		t.Errorf("node[1] = %q depth %d, want \"HashAggregate (2 keys)\" depth 1", nodes[1].Label, nodes[1].Depth)
+	if nodes[1].Label != "HashAggregate" || nodes[1].Depth != 1 {
+		t.Errorf("node[1] = %q depth %d, want \"HashAggregate\" depth 1", nodes[1].Label, nodes[1].Depth)
 	}
 }
 
