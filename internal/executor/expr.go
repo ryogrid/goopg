@@ -15377,11 +15377,15 @@ func canonicalTypeName(name string, oid uint32) string {
 		// CHAROID case, so the default quote_qualified_identifier path yields
 		// `"char"` (postgres/src/backend/utils/adt/format_type.c:207-220,303-322).
 		// OID 0 (no-OID baseline: aggregates, pre-90th routines, error-text path)
-		// and 1042 (bpchar) both render "character".
-		if oid == catalog.OIDChar { // 18
+		// and 1042 (bpchar) both render "character". Row 1364: the array OIDs
+		// (quoted `"char"[]` → OIDArrayChar 1002, bare `char[]` → OIDArrayBpChar
+		// 1014) flow through this same arm via the recursive array-suffix split
+		// above, so the quoted arm must accept OIDArrayChar too — otherwise
+		// `"char"[]` degrades to `character[]`.
+		if oid == catalog.OIDChar || oid == catalog.OIDArrayChar { // 18 / 1002
 			return `"char"`
 		}
-		return "character" // 1042 (bpchar) AND 0 (no-OID baseline, aggregates/pre-90th)
+		return "character" // 1042 (bpchar), 1014 (char[]), AND 0 (no-OID baseline)
 	}
 	return name
 }

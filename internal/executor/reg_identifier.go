@@ -664,8 +664,12 @@ func regprocedureArglist(argTypes []catalog.RegprocArg, visible func(schema stri
 		// Deferral row 1351: a BARE `char` arg (stored OIDBpChar 1042 at CREATE)
 		// renders `character` (format_type_be's BPCHAROID switch case); OIDChar 18
 		// (quoted `"char"`) or 0 (builtin / pre-change routine) falls through to
-		// ArgTypeDisplayAlias's `"char"`. Mirrors the catalog argListTypeDisplay arm.
-		if base == "char" && a.OID == catalog.OIDBpChar {
+		// ArgTypeDisplayAlias's `"char"`. Row 1364 adds the array forms: the
+		// CREATE-time capture now stores the ARRAY OIDs (char[] → OIDArrayBpChar
+		// 1014, "char"[] → OIDArrayChar 1002), so the bare-char arm must accept
+		// both scalar and array bpchar OIDs to keep `char[]` rendering
+		// `character[]`. Mirrors the catalog argListTypeDisplay arm.
+		if base == "char" && (a.OID == catalog.OIDBpChar || a.OID == catalog.OIDArrayBpChar) {
 			base = "character"
 		}
 		name := base

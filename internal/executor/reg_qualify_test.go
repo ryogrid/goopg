@@ -509,6 +509,12 @@ func TestRegprocedureArglistCatalogAndExecutorAgree(t *testing.T) {
 		{"f_zeroid_char", []catalog.Type{{Name: "char"}}, nil, `"char"`},
 		{"f_bare_char_arr", []catalog.Type{{Name: "char[]"}}, []uint32{catalog.OIDBpChar}, "character[]"},
 		{"f_quoted_char_arr", []catalog.Type{{Name: "char[]"}}, []uint32{catalog.OIDChar}, `"char"[]`},
+		// Row 1364: a real CREATE FUNCTION now captures the ARRAY OIDs for the
+		// char arrays (char[] → 1014, "char"[] → 1002); the renderers must treat
+		// them exactly like the scalar OIDs (1042/18) so the sibling builders
+		// stay in agreement on the live capture path too.
+		{"f_bare_char_arr_arrOID", []catalog.Type{{Name: "char[]"}}, []uint32{catalog.OIDArrayBpChar}, "character[]"},
+		{"f_quoted_char_arr_arrOID", []catalog.Type{{Name: "char[]"}}, []uint32{catalog.OIDArrayChar}, `"char"[]`},
 	}
 	for _, tc := range table {
 		r, err := rs.Create(&catalog.Routine{

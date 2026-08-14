@@ -299,6 +299,11 @@ func TestPgGetFunctionArgsQuotedCharRendersQuoted(t *testing.T) {
 	}{
 		{"g_qchar", `CREATE FUNCTION g_qchar("char") RETURNS int4 LANGUAGE sql AS $$ SELECT 1 $$`, catalog.OIDChar, `"char"`, "character"},
 		{"g_bpchar", `CREATE FUNCTION g_bpchar(char) RETURNS int4 LANGUAGE sql AS $$ SELECT 1 $$`, catalog.OIDBpChar, "character", `"char"`},
+		// Row 1364: the array forms capture the ARRAY OIDs (1002/1014) and must
+		// render through the same char-arm disambiguation: `"char"[]` keeps its
+		// quotes, bare `char[]` renders `character[]`.
+		{"g_qcarr", `CREATE FUNCTION g_qcarr("char"[]) RETURNS int4 LANGUAGE sql AS $$ SELECT 1 $$`, catalog.OIDArrayChar, `"char"[]`, "character[]"},
+		{"g_bcarr", `CREATE FUNCTION g_bcarr(char[]) RETURNS int4 LANGUAGE sql AS $$ SELECT 1 $$`, catalog.OIDArrayBpChar, "character[]", `"char"[]`},
 	}
 	for _, tc := range cases {
 		if err := runDDL(t, ctx, tc.ddl); err != nil {
@@ -343,6 +348,11 @@ func TestPgGetFunctionResultQuotedCharRendersQuoted(t *testing.T) {
 		{"g_qchar_ret", `CREATE FUNCTION g_qchar_ret() RETURNS "char" LANGUAGE sql AS $$ SELECT 1 $$`, catalog.OIDChar, `"char"`, "character"},
 		{"g_bpchar_ret", `CREATE FUNCTION g_bpchar_ret() RETURNS char LANGUAGE sql AS $$ SELECT 1 $$`, catalog.OIDBpChar, "character", `"char"`},
 		{"g_int_ret", `CREATE FUNCTION g_int_ret() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$`, 0, "integer", `"char"`},
+		// Row 1364: array RETURN forms capture the ARRAY OIDs (1002/1014) and
+		// pg_get_function_result / pg_get_functiondef must render the canonical
+		// spelling (`"char"[]` vs `character[]`).
+		{"g_qcarr_ret", `CREATE FUNCTION g_qcarr_ret() RETURNS "char"[] LANGUAGE sql AS $$ SELECT 1 $$`, catalog.OIDArrayChar, `"char"[]`, "character[]"},
+		{"g_bcarr_ret", `CREATE FUNCTION g_bcarr_ret() RETURNS char[] LANGUAGE sql AS $$ SELECT 1 $$`, catalog.OIDArrayBpChar, "character[]", `"char"[]`},
 	}
 	for _, tc := range cases {
 		if err := runDDL(t, ctx, tc.ddl); err != nil {

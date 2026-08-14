@@ -11834,25 +11834,41 @@ func (o *ddlOp) walLogDropRoutine(oid uint32) error {
 }
 
 // argTypeOID returns a NON-ZERO pg_type OID only for the one ambiguous arg-type
-// spelling, `char`: a BARE char (bpchar, the gram.y CharacterWithoutLength
-// stamp gives Args=[1]) is OIDBpChar(1042), a quoted "char" (CHAROID, no stamp,
-// Args nil) is OIDChar(18) — deferral row 1351. Every other spelling returns 0:
-// its name-based ArgTypeDisplayAlias is already a faithful format_type_be port,
-// so carrying a name-derived OID would only add wrong array-element OIDs and
-// risk a proargtypes shift. Key on the RAW element name (a.Name, BEFORE
-// routineArgTypeName bakes the `[]` suffix), so `char[]` and `"char"[]` land
-// here too.
-// charTypeOID resolves the one ambiguous `char` spelling to its pg_type OID:
-// a quoted `"char"` (no typmod args) is CHAROID(18), a bare `char` (implicit
-// length-1 typmod, Args=[1]) is BPCHAROID(1042), and every other type is 0.
-// Shared by the argument and RETURN-type paths so the two spellings cannot
-// drift (deferral rows 1351/1361).
+// spelling, `char` (and its array forms): a BARE char (bpchar, the gram.y
+// CharacterWithoutLength stamp gives Args=[1]) is OIDBpChar(1042), a quoted
+// "char" (CHAROID, no stamp, Args nil) is OIDChar(18) — deferral row 1351 —
+// and the array forms resolve to the ARRAY OIDs (deferral row 1364): bare
+// `char[]` → OIDArrayBpChar(1014), quoted `"char"[]` → OIDArrayChar(1002).
+// Every other spelling returns 0: its name-based ArgTypeDisplayAlias is already
+// a faithful format_type_be port, so carrying a name-derived OID would only add
+// wrong array-element OIDs and risk a proargtypes shift. Key on the RAW element
+// name (a.Name, BEFORE routineArgTypeName bakes the `[]` suffix), so `char[]`
+// and `"char"[]` land here too.
+// charTypeOID resolves the `char` spelling to its pg_type OID: a quoted `"char"`
+// (no typmod args) is CHAROID(18), a bare `char` (implicit length-1 typmod,
+// Args=[1]) is BPCHAROID(1042), and every other type is 0. ARRAY spellings are
+// intercepted FIRST (IsArray): quoted `"char"[]` → OIDArrayChar(1002), bare
+// `char[]` → OIDArrayBpChar(1014) — the array arms are keyed the same way as
+// the scalar ones and non-char arrays return 0 so the TypeNameToOID fallback
+// resolves them (row 1364). Shared by the argument and RETURN-type paths so the
+// spellings cannot drift (deferral rows 1351/1361/1364).
 func charTypeOID(a parser.ColumnType) uint32 {
+	if a.IsArray {
+		if a.Name == "char" {
+			if len(a.Args) == 0 {
+				return catalog.OIDArrayChar // "char"[] → 1002 (quoted, no typmod)
+			}
+			return catalog.OIDArrayBpChar // char[] → 1014 (bare, Args=[1])
+		}
+		// Non-char arrays (int4[], date[], …): leave to the TypeNameToOID
+		// fallback in buildPGProcRow, which now resolves the baked `[]` name.
+		return 0
+	}
 	if a.Name == "char" {
 		if len(a.Args) == 0 {
-			return catalog.OIDChar // quoted "char" / "char"[]
+			return catalog.OIDChar // quoted "char"
 		}
-		return catalog.OIDBpChar // bare char / char[] (Args=[1])
+		return catalog.OIDBpChar // bare char (Args=[1])
 	}
 	return 0
 }

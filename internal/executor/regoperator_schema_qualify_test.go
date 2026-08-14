@@ -342,11 +342,13 @@ func TestCreateFunctionCapturesBareArgTypeSchema(t *testing.T) {
 // M0119-0006 (77th slice, deferral row 1351): execCreateFunction/
 // execCreateProcedure capture each arg type's RESOLVED OID at CREATE time
 // (ArgTypeOIDs, parallel to ArgTypes/ArgTypeSchemas) — NON-ZERO only for the
-// one ambiguous `char` spelling: a BARE char (bpchar, parser stamp Args=[1])
-// stores OIDBpChar(1042), a quoted `"char"` (CHAROID, no stamp, Args nil)
-// stores OIDChar(18). Array forms ride the same arm (`char[]` → 1042,
-// `"char"[]` → 18); every other arg stays 0. `oid::regprocedure` then renders
-// the disambiguated arglist (bare → `character`, quoted → `"char"`).
+// one ambiguous `char` spelling AND its array forms: a BARE char (bpchar,
+// parser stamp Args=[1]) stores OIDBpChar(1042), a quoted `"char"` (CHAROID,
+// no stamp, Args nil) stores OIDChar(18). Array forms ride the SAME arms but
+// resolve to the ARRAY OIDs (row 1364): `char[]` → OIDArrayBpChar(1014),
+// `"char"[]` → OIDArrayChar(1002); every other arg stays 0. `oid::regprocedure`
+// then renders the disambiguated arglist (bare → `character`, quoted → `"char"`,
+// both with the re-appended `[]` for arrays).
 func TestCreateFunctionCapturesCharArgOID(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
@@ -359,8 +361,8 @@ func TestCreateFunctionCapturesCharArgOID(t *testing.T) {
 	}{
 		{"f_capchar_bare", `CREATE FUNCTION f_capchar_bare(char) RETURNS int4 LANGUAGE sql AS $$ SELECT 1 $$`, []uint32{catalog.OIDBpChar}, "f_capchar_bare(character)"},
 		{"f_capchar_quoted", `CREATE FUNCTION f_capchar_quoted("char") RETURNS int4 LANGUAGE sql AS $$ SELECT 1 $$`, []uint32{catalog.OIDChar}, `f_capchar_quoted("char")`},
-		{"f_capchar_arr_bare", `CREATE FUNCTION f_capchar_arr_bare(char[]) RETURNS int4 LANGUAGE sql AS $$ SELECT 1 $$`, []uint32{catalog.OIDBpChar}, "f_capchar_arr_bare(character[])"},
-		{"f_capchar_arr_quoted", `CREATE FUNCTION f_capchar_arr_quoted("char"[]) RETURNS int4 LANGUAGE sql AS $$ SELECT 1 $$`, []uint32{catalog.OIDChar}, `f_capchar_arr_quoted("char"[])`},
+		{"f_capchar_arr_bare", `CREATE FUNCTION f_capchar_arr_bare(char[]) RETURNS int4 LANGUAGE sql AS $$ SELECT 1 $$`, []uint32{catalog.OIDArrayBpChar}, "f_capchar_arr_bare(character[])"},
+		{"f_capchar_arr_quoted", `CREATE FUNCTION f_capchar_arr_quoted("char"[]) RETURNS int4 LANGUAGE sql AS $$ SELECT 1 $$`, []uint32{catalog.OIDArrayChar}, `f_capchar_arr_quoted("char"[])`},
 	}
 	for _, tc := range cases {
 		if err := runDDL(t, ctx, tc.ddl); err != nil {
@@ -384,6 +386,44 @@ func TestCreateFunctionCapturesCharArgOID(t *testing.T) {
 		rows := runQuery(t, ctx, fmt.Sprintf(`SELECT %d::regprocedure::text`, r.OID))
 		if len(rows) != 1 || rows[0][0].StringValue() != tc.wantRender {
 			t.Errorf("%s: %d::regprocedure::text = %v, want %q", tc.name, r.OID, rows, tc.wantRender)
+		}
+	}
+}
+
+// M0119-0006 (deferral row 1364): array-typed CREATE FUNCTION args and RETURNS
+// capture the ARRAY OIDs — quoted `"char"[]` → OIDArrayChar(1002), bare `char[]`
+// → OIDArrayBpChar(1014) — for BOTH the per-arg ArgTypeOIDs and the
+// ReturnTypeOID. PG oracle (PG 18.3, immutable pg_type OIDs): _char=1002,
+// _bpchar=1014 — verify: SELECT 'char[]'::regtype::oid (1014),
+// '"char"[]'::regtype::oid (1002). The renderers then disambiguate the char
+// element on OID exactly like the scalar rows 1351/1361 do.
+func TestCreateFunctionCapturesCharArrayArgOID(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	cases := []struct {
+		name       string
+		ddl        string
+		wantArgOID uint32
+		wantRetOID uint32
+	}{
+		{"g_carr", `CREATE FUNCTION g_carr("char"[]) RETURNS "char"[] LANGUAGE sql AS $$ SELECT 1 $$`, catalog.OIDArrayChar, catalog.OIDArrayChar},
+		{"g_bcarr", `CREATE FUNCTION g_bcarr(char[]) RETURNS char[] LANGUAGE sql AS $$ SELECT 1 $$`, catalog.OIDArrayBpChar, catalog.OIDArrayBpChar},
+	}
+	for _, tc := range cases {
+		if err := runDDL(t, ctx, tc.ddl); err != nil {
+			t.Fatalf("create function %s: %v", tc.name, err)
+		}
+		cands := ctx.Catalog.Routines().LookupByName(parser.ObjectName{Name: tc.name})
+		if len(cands) != 1 {
+			t.Fatalf("expected 1 %s routine, got %d", tc.name, len(cands))
+		}
+		r := cands[0]
+		if len(r.ArgTypeOIDs) != 1 || r.ArgTypeOIDs[0] != tc.wantArgOID {
+			t.Errorf("%s: ArgTypeOIDs = %v, want [%d]", tc.name, r.ArgTypeOIDs, tc.wantArgOID)
+		}
+		if r.ReturnTypeOID != tc.wantRetOID {
+			t.Errorf("%s: ReturnTypeOID = %d, want %d", tc.name, r.ReturnTypeOID, tc.wantRetOID)
 		}
 	}
 }

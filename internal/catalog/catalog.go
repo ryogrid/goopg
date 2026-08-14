@@ -19996,7 +19996,12 @@ func argListTypeDisplay(name string, oid uint32) string {
 	if isArray {
 		base = name[:len(name)-2]
 	}
-	if base == "char" && oid == OIDBpChar { // bare char → bpchar
+	// Row 1364: the CREATE-time capture stores the ARRAY OIDs for char arrays
+	// (char[] → OIDArrayBpChar 1014, "char"[] → OIDArrayChar 1002), so the
+	// bare-char arm accepts both the scalar and array bpchar OIDs — keeping
+	// `char[]` rendering `character[]` while OIDArrayChar falls through to
+	// ArgTypeDisplayAlias's `"char"` + "[]" (`"char"[]`).
+	if base == "char" && (oid == OIDBpChar || oid == OIDArrayBpChar) { // bare char → bpchar
 		base = "character"
 	}
 	if isArray {

@@ -232,9 +232,9 @@ Gates: package suites (`internal/executor`, `internal/server`,
   slice):** `ReturnTypeOID uint32` added; `argTypeOID`'s body extracted as shared
   `charTypeOID` and reused for the RETURN path; `pg_get_function_result` /
   `buildFunctionDef` RETURNS-clause / prorettype all thread it (row 1361).
-  Remaining: the arg-list parser rejects a named `g(x "char")` (row 1362), and
-  ARRAY-typed args/returns still write the ELEMENT OID into
-  proargtypes/prorettype where PG writes the ARRAY OID (row 1364).
+  Remaining: the arg-list parser rejects a named `g(x "char")` (row 1362).
+  ARRAY-typed args/returns write the ELEMENT OID into proargtypes/prorettype
+  where PG writes the ARRAY OID — **RESOLVED 2026-08-15 (row 1364, see §7).**
 - **Quoted `"char"(N)` with an explicit typmod** (`Args=[N]`) is
   indistinguishable from bare `char(N)` by the `len(Args)` heuristic →
   misclassified as bpchar. The realistic oracle probes (`"char"`, `"char"[]`,
@@ -247,3 +247,24 @@ Gates: package suites (`internal/executor`, `internal/server`,
 - The bare builtin-array alias gap in the catalog `formatProcedureArglist`
   (§6 of the 73rd design doc) is unchanged; this slice touches only the `char`
   element.
+
+## 7. Array half of the scalar slice (deferral row 1364)
+
+The array arms of the `char` capture + the `TypeNameToOID` name fallback:
+
+1. **Capture-time** — `charTypeOID` (operators_ddl.go) intercepts `IsArray`
+   FIRST: quoted `"char"[]` (Args nil) → `OIDArrayChar`(1002), bare `char[]`
+   (Args=[1]) → `OIDArrayBpChar`(1014), any non-char array → 0. Both
+   `ArgTypeOIDs[i]` and `ReturnTypeOID` inherit it (the scalar rows 1351/1361
+   arms).
+2. **Render/fallback-time** — `TypeNameToOID` (codec.go) gained the `[]` array
+   block ported VERBATIM from `initdb/pg_proc_view.go:typeNameToOIDStr` (the
+   view builder was already array-correct), so `buildPGProcRow`/index keys
+   resolve baked names like `int4[]`→1007 and `date[]`→1182 instead of falling
+   to OIDText(25). Both char spellings map to 1002 (never 1014 via the scalar
+   arm). The three renderer siblings that disambiguate the `char` element on OID
+   (`regprocedureArglist`, `argListTypeDisplay`, `canonicalTypeName`) accept the
+   ARRAY OIDs alongside the scalar ones so `"char"[]` keeps its quotes and bare
+   `char[]` renders `character[]`. Non-char arrays stay 0 at capture and resolve
+   via the fixed fallback; user-type elements still fall back to OIDText (the
+   §6 "Q2" user-type gap, separate ledger item).
