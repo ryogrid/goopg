@@ -6216,9 +6216,10 @@ M0119 and M0122's remaining items. Milestone doc:
    the PG-oracle citation; index it in `docs/design/README.md`.
 2. **Update the inventory CSV when status changes.** When a task's
    implementation changes a case's `status`, update the row in
-   `docs/test-port/postgres-oracle-target-inventory.csv` in the same commit
-   (`status → pass`, `pass_required → yes`, rationale names the verification);
-   run `make check-testport-inventory`.
+   `docs/test-port/postgres-oracle-target-inventory.csv` in the same commit:
+   **if the status changes to `pass`, the `pass_required` column must also be
+   set to `yes`** (in addition to `status → pass`, `rationale` naming the
+   verification). Run `make check-testport-inventory`.
 3. The four `failed` cases flagged "possible regression, verify" (`mvcc`,
    `reindex_catalog`, `select_having`, `select_implicit`) are re-run at HEAD
    first; a stale pass is flipped to `pass` with a note, not implemented against.
