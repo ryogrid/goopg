@@ -11842,7 +11842,12 @@ func (o *ddlOp) walLogDropRoutine(oid uint32) error {
 // risk a proargtypes shift. Key on the RAW element name (a.Name, BEFORE
 // routineArgTypeName bakes the `[]` suffix), so `char[]` and `"char"[]` land
 // here too.
-func argTypeOID(a parser.ColumnType) uint32 {
+// charTypeOID resolves the one ambiguous `char` spelling to its pg_type OID:
+// a quoted `"char"` (no typmod args) is CHAROID(18), a bare `char` (implicit
+// length-1 typmod, Args=[1]) is BPCHAROID(1042), and every other type is 0.
+// Shared by the argument and RETURN-type paths so the two spellings cannot
+// drift (deferral rows 1351/1361).
+func charTypeOID(a parser.ColumnType) uint32 {
 	if a.Name == "char" {
 		if len(a.Args) == 0 {
 			return catalog.OIDChar // quoted "char" / "char"[]
@@ -11850,6 +11855,12 @@ func argTypeOID(a parser.ColumnType) uint32 {
 		return catalog.OIDBpChar // bare char / char[] (Args=[1])
 	}
 	return 0
+}
+
+// argTypeOID resolves an argument type's OID for the ArgTypeOIDs capture.
+// charTypeOID is the shared implementation (the RETURN-type path reuses it).
+func argTypeOID(a parser.ColumnType) uint32 {
+	return charTypeOID(a)
 }
 
 // execCreateFunction registers a routine in the catalog's
@@ -11942,6 +11953,10 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 	if s.ReturnType.IsArray {
 		retTypeName += "[]"
 	}
+	// Resolve the ambiguous `char` RETURN spelling to its pg_type OID (quoted
+	// `"char"` → 18, bare `char` → 1042, else 0) via the shared charTypeOID,
+	// sibling of the ArgTypeOIDs capture above (deferral row 1361).
+	retTypeOID := charTypeOID(s.ReturnType)
 	r := &catalog.Routine{
 		DBOid:          catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid),
 		Schema:         schema,
@@ -11963,6 +11978,7 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 			Name: retTypeName,
 			Args: append([]int64(nil), s.ReturnType.Args...),
 		},
+		ReturnTypeOID:   retTypeOID,
 		ReturnsSet:      s.ReturnsSet,
 		ReturnsTable:    s.ReturnsTable,
 		Language:        lang,

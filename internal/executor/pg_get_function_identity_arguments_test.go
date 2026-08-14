@@ -328,3 +328,55 @@ func TestPgGetFunctionArgsQuotedCharRendersQuoted(t *testing.T) {
 		}
 	}
 }
+
+func TestPgGetFunctionResultQuotedCharRendersQuoted(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	cases := []struct {
+		name     string
+		ddl      string
+		wantOID  uint32
+		wantType string // canonical type name the RETURN type must render as
+		other    string // the mutually-exclusive spelling that must NOT appear
+	}{
+		{"g_qchar_ret", `CREATE FUNCTION g_qchar_ret() RETURNS "char" LANGUAGE sql AS $$ SELECT 1 $$`, catalog.OIDChar, `"char"`, "character"},
+		{"g_bpchar_ret", `CREATE FUNCTION g_bpchar_ret() RETURNS char LANGUAGE sql AS $$ SELECT 1 $$`, catalog.OIDBpChar, "character", `"char"`},
+		{"g_int_ret", `CREATE FUNCTION g_int_ret() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$`, 0, "integer", `"char"`},
+	}
+	for _, tc := range cases {
+		if err := runDDL(t, ctx, tc.ddl); err != nil {
+			t.Fatalf("create function %s: %v", tc.name, err)
+		}
+		cands := ctx.Catalog.Routines().LookupByName(parser.ObjectName{Name: tc.name})
+		if len(cands) != 1 {
+			t.Fatalf("expected 1 %s routine, got %d", tc.name, len(cands))
+		}
+		r := cands[0]
+		// Sanity: CREATE FUNCTION captured the intended return-type OID (18 vs 1042 vs 0).
+		if r.ReturnTypeOID != tc.wantOID {
+			t.Errorf("%s: ReturnTypeOID = %d, want %d", tc.name, r.ReturnTypeOID, tc.wantOID)
+		}
+		// pg_get_function_result returns exactly the rendered return type.
+		rows := runQuery(t, ctx, fmt.Sprintf("SELECT pg_get_function_result(%d)", r.OID))
+		if len(rows) != 1 {
+			t.Fatalf("pg_get_function_result(%d): rows = %d, want 1", r.OID, len(rows))
+		}
+		got := rows[0][0].StringValue()
+		if got != tc.wantType {
+			t.Errorf("%s: pg_get_function_result(%d) = %q, want %q", tc.name, r.OID, got, tc.wantType)
+		}
+		// pg_get_functiondef's RETURNS clause renders the same canonical type.
+		rows = runQuery(t, ctx, fmt.Sprintf("SELECT pg_get_functiondef(%d)", r.OID))
+		if len(rows) != 1 {
+			t.Fatalf("pg_get_functiondef(%d): rows = %d, want 1", r.OID, len(rows))
+		}
+		got = rows[0][0].StringValue()
+		if !strings.Contains(got, tc.wantType) {
+			t.Errorf("%s: pg_get_functiondef(%d) = %q, want it to contain %q", tc.name, r.OID, got, tc.wantType)
+		}
+		if strings.Contains(got, tc.other) {
+			t.Errorf("%s: pg_get_functiondef(%d) = %q, must not contain %q", tc.name, r.OID, got, tc.other)
+		}
+	}
+}

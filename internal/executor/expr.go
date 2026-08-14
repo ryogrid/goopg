@@ -10279,7 +10279,7 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 						// (ruleutils.c). pg_dump uses this verbatim for the
 						// RETURNS clause, so dropping SETOF would silently
 						// downgrade an SRF to a scalar function on dump.
-						ret := canonicalTypeName(r.ReturnType.Name, 0)
+						ret := canonicalTypeName(r.ReturnType.Name, r.ReturnTypeOID)
 						if r.ReturnsSet {
 							ret = "SETOF " + ret
 						}
@@ -15185,7 +15185,7 @@ func buildFunctionDef(r *catalog.Routine) string {
 			if r.ReturnsSet {
 				sb.WriteString("SETOF ")
 			}
-			sb.WriteString(canonicalTypeName(r.ReturnType.Name, 0))
+			sb.WriteString(canonicalTypeName(r.ReturnType.Name, r.ReturnTypeOID))
 		}
 		sb.WriteByte('\n')
 	}

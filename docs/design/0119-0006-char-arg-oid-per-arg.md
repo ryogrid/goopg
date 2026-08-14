@@ -227,9 +227,14 @@ Gates: package suites (`internal/executor`, `internal/server`,
   loops (`buildFunctionArguments`/`buildTableResult`/`buildFunctionDef` arg-arms)
   read `r.ArgTypeOIDs[i]` under a nil/len guard; `buildFunctionDef` RETURNS-clause,
   `pg_get_function_result` scalar, and `routineArgListStr` pass 0. Test
-  `TestPgGetFunctionArgsQuotedCharRendersQuoted`. Residuals (rows 1361/1362):
-  `RETURNS "char"` is still OID-less (no `ReturnTypeOID` on `Routine`), and the
-  arg-list parser rejects a named `g(x "char")`.
+  `TestPgGetFunctionArgsQuotedCharRendersQuoted`. Residuals: `RETURNS "char"`
+  was OID-less (no `ReturnTypeOID` on `Routine`) — **RESOLVED 2026-08-15 (94th
+  slice):** `ReturnTypeOID uint32` added; `argTypeOID`'s body extracted as shared
+  `charTypeOID` and reused for the RETURN path; `pg_get_function_result` /
+  `buildFunctionDef` RETURNS-clause / prorettype all thread it (row 1361).
+  Remaining: the arg-list parser rejects a named `g(x "char")` (row 1362), and
+  ARRAY-typed args/returns still write the ELEMENT OID into
+  proargtypes/prorettype where PG writes the ARRAY OID (row 1364).
 - **Quoted `"char"(N)` with an explicit typmod** (`Args=[N]`) is
   indistinguishable from bare `char(N)` by the `len(Args)` heuristic →
   misclassified as bpchar. The realistic oracle probes (`"char"`, `"char"[]`,

@@ -3375,6 +3375,38 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       OID-less (no `ReturnTypeOID` on `Routine`), and the arg-list parser rejects a
       named arg `g(x "char")` where PG accepts `argname argtype`. Design updated in
       `0119-0006-char-arg-oid-per-arg.md` §6 (open item marked resolved).
+      **93rd slice (2026-08-15): a bare user-type arg name resolves its owner
+      schema (ledger row 1343).** `argTypeSchema(t, cat, dbOid)` (operators_call.go)
+      probes `LookupEnum`→`LookupDomain`→`LookupCompositeType`→`LookupRangeType`→
+      `LookupRangeTypeByMultirangeName` on the ELEMENT name (`[]` stripped) and
+      returns `SchemaNameForOID(hit.NamespaceOID)`, so `CREATE FUNCTION
+      g(offpath.mytype)` captures the owner schema at CREATE time for LIVE-created
+      types; both capture sites (execCreateFunction/execCreateProcedure,
+      operators_ddl.go:11889/12651) pass the RAW `o.ctx.CurrentDatabaseOid` (type
+      registries are raw-keyed). Test `TestCreateFunctionCapturesBareArgTypeSchema`.
+      Gates: go build + executor/catalog suites + pre-commit units + tpch-spotcheck
+      (Q12=2/Q13=35) + `TestPort_RegressSuite` (45 PASS/0 FAIL) all PASS. Deferred
+      (row 1363): type-registry dbOid keying mismatch (live DDL raw vs recovery
+      `DefaultDBOid`) — a bare type in a non-default DB after restart may miss the
+      probe.
+      **94th slice (2026-08-15): the pg_get_function_* RETURN type renders
+      OID-accurately for the `"char"` spelling (deferral row 1361).** `RETURNS
+      "char"` rendered `character` because `catalog.Routine` had no return-type OID.
+      Added `ReturnTypeOID uint32` (catalog/routines.go); `argTypeOID`'s body is
+      extracted as shared `charTypeOID(parser.ColumnType)` (quoted `"char"`→OIDChar
+      18, bare `char`→OIDBpChar 1042, else 0) so the argument and RETURN paths
+      cannot drift, and `execCreateFunction` stores `charTypeOID(s.ReturnType)`
+      (procedures have no RETURNS). Both render sites — `pg_get_function_result`
+      (expr.go:10282) and `buildFunctionDef` RETURNS-clause (expr.go:15188) — pass
+      `r.ReturnTypeOID` instead of 0, and `buildPGProcRow` (sys_pg_proc.go) prefers
+      it for prorettype (sibling of proargtypes). Test
+      `TestPgGetFunctionResultQuotedCharRendersQuoted`. Gates: go build +
+      executor/catalog suites + pre-commit units + tpch-spotcheck (Q12=2/Q13=35) +
+      `TestPort_RegressSuite` (47 PASS/0 FAIL) all PASS. Deferred (row 1364):
+      ARRAY-typed args/returns write the ELEMENT OID (or a name-only fallback) into
+      proargtypes/prorettype where PG writes the ARRAY OID — `charTypeOID`/`argTypeOID`
+      key on the element name and `TypeNameToOID` has no `[]` arm; the same latent
+      gap exists on the arg side from the 90th slice.
       **28th slice (2026-08-12): the `HH:MM` half of that inherited input gap is
       closed.** A time-of-day with no seconds field is ordinary PG input
       (`DecodeTime` reads seconds only `if (*cp == ':')`, leaving `tm_sec = 0`),

@@ -57,6 +57,15 @@ type Routine struct {
 	ArgModes        []string // parallel to ArgTypes; "i"=IN, "o"=OUT, "b"=INOUT, "v"=VARIADIC; nil=all IN
 	ArgDefaults     []string // parallel to ArgTypes; raw SQL expression for DEFAULT, "" = no default
 	ReturnType      Type
+	// ReturnTypeOID is the resolved pg_type OID for the RETURN type, NON-ZERO
+	// only for the one ambiguous spelling `char` (a bare `char` → OIDBpChar
+	// 1042, a quoted `"char"` → OIDChar 18 — deferral row 1361, sibling of
+	// ArgTypeOIDs/row 1351). Every other spelling is 0: TypeNameToOID's
+	// name-based map is already a faithful fallback, so a name-derived OID
+	// would add nothing. Consulted ONLY by the pg_get_function_result /
+	// pg_get_functiondef renderers and the pg_proc prorettype column;
+	// signature/overload semantics are unaffected.
+	ReturnTypeOID   uint32
 	ReturnsSet      bool   // RETURNS SETOF ... M0097-0020
 	ReturnsTable    bool   // RETURNS TABLE (...) — table cols stored as trailing OUT args
 	Language        string // lower-cased
