@@ -42,7 +42,7 @@ import (
 // take it. Errors are write errors on the wire (the connection is
 // likely dead); SQLSTATE-level command failures are reported via
 // ErrorResponse and still return (true, nil).
-func (s *Server) handleReplicationCommand(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, payload []byte, appName string) (bool, error) {
+func (s *Server) handleReplicationCommand(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, payload []byte, appName, dbName string) (bool, error) {
 	q, err := extractCString(payload)
 	if err != nil {
 		return false, nil // let the regular handler emit the error
@@ -59,7 +59,7 @@ func (s *Server) handleReplicationCommand(ctx context.Context, r *protocol.Frame
 	case strings.HasPrefix(upper, "READ_REPLICATION_SLOT "):
 		return true, s.replyReadReplicationSlot(w, trimmed[len("READ_REPLICATION_SLOT "):])
 	case strings.HasPrefix(upper, "START_REPLICATION"):
-		return true, s.replyStartReplication(ctx, r, w, trimmed, appName)
+		return true, s.replyStartReplication(ctx, r, w, trimmed, appName, dbName)
 	case strings.HasPrefix(upper, "TIMELINE_HISTORY "):
 		return true, s.replyTimelineHistory(w, trimmed[len("TIMELINE_HISTORY "):])
 	case upper == "BASE_BACKUP" || strings.HasPrefix(upper, "BASE_BACKUP "):
@@ -411,7 +411,7 @@ func (s *Server) replyReadReplicationSlot(w *protocol.FrameWriter, args string) 
 // arrive. When absent the walsender streams without slot-backed WAL
 // retention — fine for one-shot test traffic, dangerous in
 // production. Upstream behaves identically.
-func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, raw string, appName string) error {
+func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, raw string, appName, dbName string) error {
 	if s.cfg.WAL == nil {
 		return s.writeQueryError(w, sqlstate.FeatureNotSupported,
 			"START_REPLICATION requires a configured WAL writer")
@@ -466,7 +466,7 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 	// pgoutput messages through `'w'` CopyData frames. See
 	// docs/design/0008-0004-apply-worker-and-tablesync.md.
 	if args.Mode == "LOGICAL" {
-		return s.runLogicalWalsender(ctx, r, w, args, appName)
+		return s.runLogicalWalsender(ctx, r, w, args, appName, dbName)
 	}
 
 	walDir := s.cfg.WALDirPath

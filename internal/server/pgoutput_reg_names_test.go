@@ -1,6 +1,7 @@
 package server
 
 import (
+	"strconv"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -69,5 +70,47 @@ func TestPgoutputSnapshotRegOutRendererVisibleOffPathQualifies(t *testing.T) {
 	// An unresolvable OID keeps the numeric fallback.
 	if got := snap.RegOut("regclass", 125999999); got != "125999999" {
 		t.Errorf("dangling regclass OID rendered %q, want numeric fallback %q", got, "125999999")
+	}
+}
+
+// TestRegOutRendererCrossDB pins M0119-0006 (deferral row 1354 claim 2)
+// acceptance criterion #4 through the walsender's exact binding shape: the
+// renderer AND the snapshot are scoped to the connection's dbOid, so a
+// regclass in a non-default database resolves to its NAME instead of falling
+// to the numeric OID fallback (regproc.c:943-987) that a DB-1-scoped
+// resolution produced for the same dangling-in-DB-1 OID.
+func TestRegOutRendererCrossDB(t *testing.T) {
+	im := catalog.NewInMemory()
+	db2Oid, err := im.CreateDatabase("db2", catalog.BootstrapSuperuserOID)
+	if err != nil {
+		t.Fatalf("CreateDatabase(db2): %v", err)
+	}
+	if _, err := im.CreateTable(parser.ObjectName{Name: "tbl"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}},
+	}, db2Oid); err != nil {
+		t.Fatalf("CREATE TABLE db2.tbl: %v", err)
+	}
+	tbl2, ok := im.LookupTable(parser.ObjectName{Name: "tbl"}, db2Oid)
+	if !ok {
+		t.Fatal("DB-2 tbl not found")
+	}
+
+	// The walsender's binding (logicalwalsender.go): visible set {pg_catalog,
+	// public}, renderer + snapshot scoped to the connection dbOid.
+	visible := func(s string) bool { return s == "" || s == "pg_catalog" || s == "public" }
+	snap := wal.BuildCatalogSnapshot(im, executor.RegOutRendererVisible(im, visible, db2Oid), db2Oid)
+	if snap.RegOut == nil {
+		t.Fatal("snap.RegOut is nil — the walsender wiring did not bind the renderer")
+	}
+	if got := snap.RegOut("regclass", tbl2.OID); got != "tbl" {
+		t.Errorf("regclass(DB-2 tbl) with dbOid=%d rendered %q, want %q", db2Oid, got, "tbl")
+	}
+
+	// Without a dbOid the renderer resolves against DB 1's namespace: the
+	// DB-2 relation is a dangling OID there → numeric fallback.
+	snapDefault := wal.BuildCatalogSnapshot(im, executor.RegOutRendererVisible(im, visible))
+	wantNumeric := strconv.FormatUint(uint64(tbl2.OID), 10)
+	if got := snapDefault.RegOut("regclass", tbl2.OID); got != wantNumeric {
+		t.Errorf("regclass(DB-2 tbl) with default dbOid rendered %q, want numeric fallback %q", got, wantNumeric)
 	}
 }

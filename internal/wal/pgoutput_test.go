@@ -18,7 +18,7 @@ func snapshotForRel(t *testing.T, name string, cols []catalog.Column) (*CatalogS
 	if err != nil {
 		t.Fatal(err)
 	}
-	return BuildCatalogSnapshot(c), c.RelFileNode(tbl)
+	return BuildCatalogSnapshot(c, nil), c.RelFileNode(tbl)
 }
 
 // encodeBodyV0 mirrors the executor codec's null-flag-then-value
@@ -508,5 +508,56 @@ func TestPgoutputUpdateWithoutOldTupleGoesDirectlyToN(t *testing.T) {
 	}
 	if string(msg.NewTuple[1].Bytes) != "after" {
 		t.Errorf("NewTuple[1] val=%q want 'after'", msg.NewTuple[1].Bytes)
+	}
+}
+
+// TestPgOutputEmitsChangeForNonDefaultDB pins M0119-0006 (deferral row 1354
+// claim 2) end-to-end at the plugin level — the "was silently nothing" proof.
+// A snapshot scoped to a non-default DB makes PgOutput emit a change for a
+// DB-2 relation; the pre-fix DB-1-default snapshot silently skipped it
+// (snap.Lookup miss ⇒ zero bytes, TestPgOutputSkipsUnknownRelation). Mirrors
+// upstream: a logical slot lives in the slot's database (slot.c:1760;
+// walsender.c:1447-1518) and pgoutput resolves relations in MyDatabaseId.
+func TestPgOutputEmitsChangeForNonDefaultDB(t *testing.T) {
+	c := catalog.NewInMemory()
+	db2Oid, err := c.CreateDatabase("db2", catalog.BootstrapSuperuserOID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tbl, err := c.CreateTable(parser.ObjectName{Name: "items"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, Ordinal: 0},
+	}, db2Oid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel := c.RelFileNode(tbl)
+	body := encodeBodyV0([]any{1}, []string{"int4"})
+	tuple := wrapAsHeapTuple(t, body, 1)
+
+	// DB-2-scoped snapshot: the change must emit (R + I).
+	var buf2 bytes.Buffer
+	po2 := NewPgOutput(BuildCatalogSnapshot(c, nil, db2Oid), &buf2)
+	if err := po2.Change(Change{Kind: ChangeInsert, Rel: rel, NewTuple: tuple}); err != nil {
+		t.Fatal(err)
+	}
+	if buf2.Len() == 0 {
+		t.Fatal("DB-2 change produced no output with a DB-2-scoped snapshot")
+	}
+	if buf2.Bytes()[0] != 'R' {
+		t.Errorf("first byte=%q want R (relation emitted before insert)", buf2.Bytes()[0])
+	}
+	if !bytes.Contains(buf2.Bytes(), []byte{'I'}) {
+		t.Errorf("missing I message after R: %x", buf2.Bytes())
+	}
+
+	// Default (DB-1) snapshot: the same DB-2 relation is unknown ⇒ nothing —
+	// this is the silent-drop the fix removes.
+	var buf1 bytes.Buffer
+	po1 := NewPgOutput(BuildCatalogSnapshot(c, nil), &buf1)
+	if err := po1.Change(Change{Kind: ChangeInsert, Rel: rel, NewTuple: tuple}); err != nil {
+		t.Fatal(err)
+	}
+	if buf1.Len() != 0 {
+		t.Errorf("DB-2 change leaked into the default snapshot: %x", buf1.Bytes())
 	}
 }

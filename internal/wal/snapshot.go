@@ -70,15 +70,20 @@ type CatalogSnapshot struct {
 // BuildCatalogSnapshot captures the current catalog state. The
 // returned snapshot is safe to share across goroutines and never
 // changes after construction.
-func BuildCatalogSnapshot(c *catalog.InMemory, regOut ...func(string, uint32) string) *CatalogSnapshot {
+//
+// regOut is nil (no renderer; numeric reg* fallback) or a real reg* name
+// renderer. dbOid optionally scopes the snapshot to a specific database's
+// namespace; empty keeps the DefaultDBOid (DB-1) scoping — byte-identical to
+// today's default path. M0119-0006 (deferral row 1354 claim 2): a logical
+// slot on a non-default database must freeze that database's schema, or
+// PgOutput skips every change (snap.Lookup misses before any value renders).
+func BuildCatalogSnapshot(c *catalog.InMemory, regOut func(string, uint32) string, dbOid ...uint32) *CatalogSnapshot {
 	if c == nil {
 		return &CatalogSnapshot{rels: map[uint32]*RelationDef{}}
 	}
-	tables := c.AllTables()
+	tables := c.AllTables(dbOid...)
 	out := &CatalogSnapshot{rels: make(map[uint32]*RelationDef, len(tables))}
-	if len(regOut) > 0 {
-		out.RegOut = regOut[0]
-	}
+	out.RegOut = regOut
 	for _, t := range tables {
 		def := &RelationDef{
 			Schema:  t.Schema,

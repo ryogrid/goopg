@@ -82,7 +82,7 @@ func TestLogicalReceiverHandleCopyDataAppliesPgoutputAndAdvancesLSN(t *testing.T
 		{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true},
 		{Name: "label", Type: catalog.Type{Name: "text"}},
 	})
-	snap := wal.BuildCatalogSnapshot(pubCat)
+	snap := wal.BuildCatalogSnapshot(pubCat, nil)
 
 	body := encodeBodyV0([]any{42, "alpha"}, []string{"int4", "text"})
 	tuple := wrapAsHeapTuple(t, body)

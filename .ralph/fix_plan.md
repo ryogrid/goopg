@@ -3269,6 +3269,20 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `TestExpressionIndexKeyRejectsBoxAndInt4Range` (split expectations) +
       `TestNamedColumnIndexRejectsBoxWith42704` + units + tpch-spotcheck
       (Q12=2/Q13=35).
+      **87th slice (2026-08-14): logical walsender cross-DB dbOid threading
+      (ledger row 1354 claim 2).** The walsender resolved every catalog lookup
+      against `DefaultDBOid` (DB 1), so a logical slot on a non-default database
+      decoded NOTHING — the DB-1-scoped snapshot dropped every change at
+      `snap.Lookup` — and rendered wrong/numeric `reg*` names. Three consumers
+      in `runLogicalWalsender` (reg* renderer, catalog snapshot, publication
+      filter) all now receive the threaded dbOid under the ≠0 guard (a
+      renderer-only fix is dead code). `BuildCatalogSnapshot`'s `regOut` became
+      a nil-able single param so `dbOid ...uint32` could be the variadic (Go
+      forbids two variadics). Tests: `TestBuildCatalogSnapshotScopesToDBOid`,
+      `TestPgOutputEmitsChangeForNonDefaultDB` (the "was silently nothing"
+      proof), `TestBuildPublicationFilterResolvesCrossDB`,
+      `TestRegOutRendererCrossDB`. Design:
+      `docs/design/0119-0006-walsender-cross-db-dboid-threading.md`.
       **28th slice (2026-08-12): the `HH:MM` half of that inherited input gap is
       closed.** A time-of-day with no seconds field is ordinary PG input
       (`DecodeTime` reads seconds only `if (*cp == ':')`, leaving `tm_sec = 0`),

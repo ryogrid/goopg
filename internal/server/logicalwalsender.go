@@ -30,7 +30,7 @@ import (
 // builds a SlotDecoder over the slot, plumbs its OutputPlugin into
 // a PgOutput writing through `walsenderPgoutputAdapter`, and runs
 // until the standby disconnects or ctx is cancelled.
-func (s *Server) runLogicalWalsender(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, args startReplicationArgs, appName string) error {
+func (s *Server) runLogicalWalsender(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, args startReplicationArgs, appName, dbName string) error {
 	if s.cfg.WAL == nil {
 		return s.writeStreamingError(w, sqlstate.FeatureNotSupported,
 			"START_REPLICATION LOGICAL requires a configured WAL writer")
@@ -43,6 +43,21 @@ func (s *Server) runLogicalWalsender(ctx context.Context, r *protocol.FrameReade
 	if !ok {
 		return s.writeStreamingError(w, sqlstate.FeatureNotSupported,
 			"START_REPLICATION LOGICAL requires *catalog.InMemory backing")
+	}
+	// M0119-0006 (deferral row 1354 claim 2): every catalog lookup on this
+	// path — the reg* renderer, the slot-creation snapshot scope, and the
+	// publication filter — must resolve against the connection's database, not
+	// the DefaultDBOid fallback (DB 1). Upstream acquires a logical slot only
+	// when the slot's database matches MyDatabaseId (slot.c:1760;
+	// walsender.c:1447-1518), so the conn DB and slot DB are the same in PG.
+	// resolveConnDBOid returns 0 on empty/unknown dbName; a zero keeps the
+	// DefaultDBOid fallback by leaving the variadic slice empty (resolveDBOid
+	// defaults an empty slice to DefaultDBOid, catalog.go:3694-3699) — passing
+	// []uint32{0} would instead select namespace 0 (empty), which is wrong.
+	dbOid := resolveConnDBOid(im, dbName)
+	var dbOidVar []uint32
+	if dbOid != 0 {
+		dbOidVar = []uint32{dbOid}
 	}
 	walDir := s.cfg.WALDirPath
 	if walDir == "" {
@@ -80,7 +95,8 @@ func (s *Server) runLogicalWalsender(ctx context.Context, r *protocol.FrameReade
 	// approximation (the walsender binds no session user). M0119-0006 (84th
 	// slice, deferral row 1354 claim 1).
 	snap := wal.BuildCatalogSnapshot(im, executor.RegOutRendererVisible(im,
-		func(schema string) bool { return schema == "" || schema == "pg_catalog" || schema == "public" }))
+		func(schema string) bool { return schema == "" || schema == "pg_catalog" || schema == "public" },
+		dbOidVar...), dbOidVar...)
 
 	// Adapter wraps each pgoutput message in a `'w'` CopyData
 	// frame so it lands on the wire in the shape the subscriber's
@@ -98,7 +114,7 @@ func (s *Server) runLogicalWalsender(ctx context.Context, r *protocol.FrameReade
 	// snapshot, matching the v0 pre-filter behaviour. See
 	// docs/design/0008-0003-publication-subscription-ddl.md.
 	if pubNames := splitPublicationNames(args.Options["publication_names"]); len(pubNames) > 0 && s.cfg.PubSub != nil {
-		plugin.SetFilter(buildPublicationFilter(s.cfg.PubSub, pubNames))
+		plugin.SetFilter(buildPublicationFilter(s.cfg.PubSub, pubNames, dbOidVar...))
 	}
 
 	dec, err := wal.NewSlotDecoderWithSnapshot(s.cfg.Slots, args.SlotName, s.cfg.WAL, walDir, segSize, plugin, wal.SlotSnapshot{Catalog: snap})
@@ -302,12 +318,17 @@ func (f *publicationFilter) Allows(rel *wal.RelationDef, kind wal.ChangeKind) bo
 // skipped — upstream rejects them at CREATE SUBSCRIPTION time
 // rather than at slot start; v0 follows the lenient path so
 // startup doesn't fail when a publication has been dropped.
-func buildPublicationFilter(ps *catalog.PubSub, names []string) *publicationFilter {
+func buildPublicationFilter(ps *catalog.PubSub, names []string, dbOid ...uint32) *publicationFilter {
 	out := &publicationFilter{
 		byTable: map[string]allowFlags{},
 	}
 	for _, name := range names {
-		pub, ok := ps.LookupPublication(name, catalog.DefaultDBOid)
+		// The PubSub registry is keyed per-database (pubMapKey(dbOid, name),
+		// catalog/pubsub.go); an empty dbOid resolves to DefaultDBOid inside
+		// LookupPublication via resolveDBOid. M0119-0006 (deferral row 1354
+		// claim 2): a non-default dbOid must find publications registered under
+		// that database, or the empty filter silently drops every change.
+		pub, ok := ps.LookupPublication(name, dbOid...)
 		if !ok {
 			continue
 		}

@@ -98,7 +98,7 @@ func TestE2E_LogicalReplication(t *testing.T) {
 		t.Fatal(err)
 	}
 	pubRel := pubCat.RelFileNode(pubTbl)
-	snap := wal.BuildCatalogSnapshot(pubCat)
+	snap := wal.BuildCatalogSnapshot(pubCat, nil)
 
 	// Subscriber catalog + storage + transaction manager + apply worker.
 	subDir := t.TempDir()

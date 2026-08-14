@@ -57,7 +57,7 @@ func TestLogicalReceiverReconnect(t *testing.T) {
 		{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true},
 		{Name: "label", Type: catalog.Type{Name: "text"}},
 	})
-	snap := wal.BuildCatalogSnapshot(pubCat)
+	snap := wal.BuildCatalogSnapshot(pubCat, nil)
 	pubRel := pubCat.RelFileNode(pubTbl)
 
 	sessionLSNs := []uint64{0x1000, 0x2000, 0x3000}
