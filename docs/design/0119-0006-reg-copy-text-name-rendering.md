@@ -207,9 +207,12 @@ cleanup, not this slice).
   applies to `regprocout`/`regcollationout`/`regroleout`, which upstream also
   schema-qualify and quote via `quote_qualified_identifier` — all inherited
   SELECT-path gaps this slice does not widen.)
-- **`regclassout`'s TOAST-relation name** (`ToastRelName`, `expr.go:788-794`)
-  exists only in the `::regclass` cast path, not in `appendTypedCellText`, so
-  `RegOut` does not reproduce it either. Inherited SELECT-path gap, recorded.
+- **`regclassout`'s TOAST-relation name** (`ToastRelName`, `expr.go:826-828`) —
+  RESOLVED by the 79th slice: `RegOut`'s regclass arm now falls through to
+  `InMemory.ToastRelName` after the table/index lookups miss, so SELECT/COPY/
+  reg*→text render a toast relation/index OID identically to the cast path.
+  (Recorded here at filing as an inherited SELECT-path gap; the original
+  `expr.go:788-794` line ref was stale and is corrected above.)
 - **Array elements of reg*** (`regclass[]`) COPY FROM still numeric-parse a name
   element (`coerceRowForConstraintChecks` skips `IsArray` columns; the array
   encoder has no per-element reg* resolver). Pre-existing, out of scope.

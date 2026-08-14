@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"strconv"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -487,5 +488,43 @@ func TestRegprocedureArglistCatalogAndExecutorAgree(t *testing.T) {
 	}
 	if got := regprocedureArglist(argParts, func(s string) bool { return true }); got != wantArglist {
 		t.Errorf("executor regprocedureArglist = %q, want %q", got, wantArglist)
+	}
+}
+
+// M0119-0006 (deferral row L1305): a synthetic TOAST relation OID (parent OID +
+// 100M) or TOAST index OID (+200M) — which live only in the virtual pg_class
+// builder, never c.tables/c.indexes — must render the schema-qualified
+// pg_toast.pg_toast_<parentOID>[_index] name PG's regclassout emits, matching
+// the `oid::regclass` CastExpr arm (expr.go:826-828). ToastRelName returns the
+// name verbatim (the pg_toast namespace is never on a search_path, so the
+// qualify flag is irrelevant — regclassout always schema-qualifies it).
+func TestRegOutToastRelnameRendersSchemaQualified(t *testing.T) {
+	ctx := regCopyCat(t)
+	// No PRIMARY KEY here: regCopyCat's context carries no storage Pool, so an
+	// index build would nil-deref; ToastRelName only needs the toastable column.
+	if err := runDDL(t, ctx, `CREATE TABLE wide_toast (id int, data text)`); err != nil {
+		t.Fatalf("CREATE TABLE wide_toast: %v", err)
+	}
+	wide, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: "wide_toast"},
+		catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
+	if !ok {
+		t.Fatal("wide_toast not found")
+	}
+	const (
+		relOffset = 100_000_000
+		idxOffset = 200_000_000
+	)
+	wantRel := "pg_toast.pg_toast_" + strconv.Itoa(int(wide.OID))
+	wantIdx := wantRel + "_index"
+	if got := RegOut("regclass", wide.OID+relOffset, ctx.Catalog, false); got != wantRel {
+		t.Errorf("regclass(toast relation OID) qualify=false = %q, want %q", got, wantRel)
+	}
+	// qualify=true (pg_dump-style empty search_path) changes nothing: pg_toast
+	// is off every search_path, so the name is always schema-qualified.
+	if got := RegOut("regclass", wide.OID+relOffset, ctx.Catalog, true); got != wantRel {
+		t.Errorf("regclass(toast relation OID) qualify=true = %q, want %q", got, wantRel)
+	}
+	if got := RegOut("regclass", wide.OID+idxOffset, ctx.Catalog, false); got != wantIdx {
+		t.Errorf("regclass(toast index OID) = %q, want %q", got, wantIdx)
 	}
 }

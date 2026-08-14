@@ -483,6 +483,16 @@ func regOut(typeName string, oid uint32, cat catalog.Catalog, qualify bool, argV
 			if idx, ok := im.LookupIndexByOID(oid, dbOid...); ok {
 				return regOutQualified(idx.Schema, idx.Name, qualify)
 			}
+			// A synthetic TOAST relation OID (parent OID + 100M) or TOAST index
+			// OID (+200M) lives only in the virtual pg_class builder, not
+			// c.tables/c.indexes, so resolve it like the `oid::regclass` CastExpr
+			// arm does (expr.go:826-828): ToastRelName returns the already
+			// schema-qualified pg_toast.pg_toast_<oid>[_index] name, which we
+			// return verbatim (never routed through regOutQualified) to keep the
+			// two paths byte-identical. M0119-0006 (deferral row L1305).
+			if name, found := im.ToastRelName(oid, dbOid...); found {
+				return name
+			}
 		}
 	case "regproc":
 		if name, ok := catalog.RegprocName(oid); ok {

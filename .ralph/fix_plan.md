@@ -4346,6 +4346,30 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `scripts/tpch-spotcheck.sh` (Q12=2, Q13=35) + `TestPort_RegressSuite/oid`
       PASS.
 
+      **79th slice (2026-08-14): toast-relation OIDs render their `pg_toast`
+      name through the shared `RegOut` — deferral row 1305 resolved.** The
+      `regclass` arm of `regOut` (`internal/executor/reg_identifier.go`) resolved
+      ordinary relations/indexes by OID but fell through to the numeric fallback
+      for a synthetic TOAST relation/index OID (parent OID + 100M / +200M),
+      which live only in the virtual pg_class builder, never
+      `c.tables`/`c.indexes`. The `oid::regclass` CastExpr arm (`expr.go:826-828`)
+      already resolved them via `InMemory.ToastRelName`; SELECT
+      (`appendTypedCellText`) and COPY (`datumToCopyText`) — and the 78th slice's
+      `reg*→text` cast — did not, so a toast OID rendered its `pg_toast` name in
+      the cast but its numeric OID in SELECT/COPY. Fix: the regclass arm now
+      falls through to `im.ToastRelName(oid, dbOid...)` after both real lookups
+      miss, returning the already-schema-qualified `pg_toast.pg_toast_<oid>[_index]`
+      name verbatim (never routed through `regOutQualified` — `pg_toast` is off
+      every search_path, so qualification is irrelevant), byte-identical to the
+      cast arm. Because the fix sits inside shared `RegOut`, all three callers
+      inherit it (pattern_sibling_paths_must_agree). Tests:
+      `TestRegOutToastrelnameRendersSchemaQualified` (`reg_qualify_test.go`),
+      toast rows in `TestRegCopyAndSelectSiblingRenderersAgree`
+      (`reg_copy_sibling_test.go`), and `TestRegCastToTextDirectKindIntMatrix`
+      (`reg_cast_to_text_test.go`), all mutation-checked. Gates: executor+server
+      packages PASS; `scripts/tpch-spotcheck.sh` (Q12=2, Q13=35) +
+      `TestPort_RegressSuite` (0 FAIL) PASS.
+
 - [x] **M0119-0010 — `char(N)` typmods are not restored per column on catalog
       reload** (source: M0127-P5.9-f, ledger row 2026-08-05). **FIXED (2026-08-09).**
       Root cause: `DecodePGAttributePhysicalRow` never decoded `atttypmod`

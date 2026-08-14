@@ -125,6 +125,21 @@ func TestRegCastToTextDirectKindIntMatrix(t *testing.T) {
 		t.Fatal("f_varbit not found")
 	}
 
+	// A toast-bearing table so the matrix can pin synthetic TOAST relation/index
+	// OIDs (parent + 100M / +200M) through the cast guard — M0119-0006 deferral
+	// row L1305, matching the SELECT/COPY renderers and the ::regclass CastExpr
+	// arm (expr.go:826-828).
+	// No PRIMARY KEY here: regCastTextCat's context carries no storage Pool, so
+	// an index build would nil-deref; ToastRelName only needs the toastable column.
+	if err := runDDL(t, ctx, `CREATE TABLE wide_toast (id int, data text)`); err != nil {
+		t.Fatalf("CREATE TABLE wide_toast: %v", err)
+	}
+	wtoast, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: "wide_toast"},
+		catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
+	if !ok {
+		t.Fatal("wide_toast not found")
+	}
+
 	type cell struct {
 		source string
 		oid    int64
@@ -132,6 +147,10 @@ func TestRegCastToTextDirectKindIntMatrix(t *testing.T) {
 	}
 	sources := []cell{
 		{"regclass", int64(qmt.OID), "qmt"},
+		{"regclass", int64(wtoast.OID) + 100_000_000,
+			"pg_toast.pg_toast_" + strconv.Itoa(int(wtoast.OID))},
+		{"regclass", int64(wtoast.OID) + 200_000_000,
+			"pg_toast.pg_toast_" + strconv.Itoa(int(wtoast.OID)) + "_index"},
 		{"regproc", int64(fvb[0].OID), "f_varbit"},
 		{"regprocedure", int64(fvb[0].OID), "f_varbit(bit varying)"},
 		{"regtype", 23, "integer"},

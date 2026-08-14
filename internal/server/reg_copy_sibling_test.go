@@ -3,6 +3,7 @@ package server
 import (
 	"io"
 	"log/slog"
+	"strconv"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -56,6 +57,18 @@ func TestRegCopyAndSelectSiblingRenderersAgree(t *testing.T) {
 	cat := catalog.NewInMemory()
 	cat.RegisterRoleWithOID("alice", 7777)
 
+	// A toast-bearing table so the harness can pin synthetic TOAST relation/index
+	// OIDs (parent + 100M / +200M), which live only in the virtual pg_class
+	// builder and resolve through InMemory.ToastRelName — not c.tables/indexes.
+	// M0119-0006 (deferral row L1305).
+	if err := createSiblingTable(t, cat, `CREATE TABLE wide_toast (id int, data text)`); err != nil {
+		t.Fatalf("CREATE TABLE wide_toast: %v", err)
+	}
+	wideTbl, ok := cat.LookupTable(parser.ObjectName{Name: "wide_toast"})
+	if !ok {
+		t.Fatal("wide_toast not found")
+	}
+
 	srv := New(Config{
 		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Catalog: cat,
@@ -82,6 +95,16 @@ func TestRegCopyAndSelectSiblingRenderersAgree(t *testing.T) {
 		{"regcollation", 950, `"C"`},
 		{"regcollation", 100, `"default"`},
 		{"regcollation", 0, "-"},
+		// A synthetic TOAST relation/index OID (parent + 100M / +200M) renders
+		// the schema-qualified pg_toast.pg_toast_<parentOID>[_index] name in
+		// BOTH renderers via InMemory.ToastRelName (M0119-0006, deferral row
+		// L1305) — identical to the `oid::regclass` CastExpr arm's output. The
+		// pg_toast namespace is never on a search_path, so qualify=false still
+		// yields the qualified name.
+		{"regclass", int64(wideTbl.OID) + 100_000_000,
+			"pg_toast.pg_toast_" + strconv.Itoa(int(wideTbl.OID))},
+		{"regclass", int64(wideTbl.OID) + 200_000_000,
+			"pg_toast.pg_toast_" + strconv.Itoa(int(wideTbl.OID)) + "_index"},
 		// An OID unresolvable by either source falls back to the raw numeric
 		// text in both renderers.
 		{"regtype", 999999999, "999999999"},
