@@ -4152,6 +4152,47 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       README row. Gates: package suites + pre-commit units +
       `TestPort_RegressSuite` (239.7 s) + `scripts/tpch-spotcheck.sh`
       (Q12=2, Q13=35) all PASS.
+      **74th slice (2026-08-14): `ArgTypeDisplayAlias` becomes a faithful
+      `format_type_be` port + the catalog bare arglist builder aliases builtin
+      arrays — ledger rows 1345 + 1346 resolved.** Two siblings diverged from
+      PG 18.3 on the regprocedure arglist. (a) The shared alias table had no
+      `varbit → bit varying` arm (the one missing VARBITOID special-case switch
+      entry — `bit`/`interval`/`json`/`numeric` are identities, every other
+      case was already present) and no keyword-quoting path at all, so the
+      single-byte `char` (CHAROID, distinct from bpchar/1042) rendered bare
+      `char` where `format_type_be`'s DEFAULT path runs
+      `quote_qualified_identifier` and `quote_identifier` wraps the lexer
+      keyword → `"char"`. (b) The catalog BARE builder `formatProcedureArglist`
+      (behind `RegprocedureName`/`RegprocedureNameAndSchema`) passed the WHOLE
+      stored name — baked-in `[]` array suffix included — to the alias, so
+      `int[]` found no switch case and rendered `f(int[])` where the executor's
+      pg-faithful `regprocedureArglist` already emitted `f(integer[])`: the two
+      sibling renderers diverged on a builtin array arg (Hard-won Rule #2).
+      Fix: two new arms in `catalog.ArgTypeDisplayAlias` (`varbit → bit
+      varying`, `char → "char"`) and a package-local `argListTypeDisplay`
+      helper (catalog cannot import executor) that splits a `[]` suffix, aliases
+      the ELEMENT, re-appends — mirroring executor's `splitArraySuffix`. The
+      executor renderer needed NO change; it picks up the new arms via the
+      shared alias. Measured vs a throwaway PG 18.3 oracle (port 5533) on the
+      wire path (`oid::regprocedure`): `f_varbit(bit varying)`, `f_char("char")`,
+      `f_chararr("char"[])`, `f_intarr(integer[])` now byte-identical; the two
+      siblings agree on `integer[],bit varying,"char","char"[],double
+      precision[],text`. Two FRESH deferrals filed (rows 1349/1350, out of
+      scope): multi-word type names in CREATE FUNCTION args store the LAST word
+      (`bit varying`→`varying`, `timestamp with time zone` is a syntax error) —
+      so `f_vchar(bit varying)` renders `f_vchar(varying)` where PG keeps
+      `bit varying` — and a reg* → text/name/varchar cast on a STRING-LITERAL
+      source renders the raw OID (`'f_varbit(varbit)'::regprocedure::text` →
+      `131072`); regtype/regrole/regcollation and non-literal sources are
+      unaffected. Tests: `TestArgTypeDisplayAliasFormatTypeBePort` +
+      `TestRegprocedureName` array/varbit/char cases (catalog),
+      `TestRegOutRegprocedureArgTypesVarbitChar` +
+      `TestRegprocedureArglistCatalogAndExecutorAgree` (executor).
+      Design: `docs/design/0119-0006-argtype-alias-format-type-be-port.md` +
+      README row `0119-0006az`. Gates: package suites (catalog 0.063s,
+      executor 6.103s, server 55.151s) + pre-commit units +
+      `TestPort_RegressSuite` + `scripts/tpch-spotcheck.sh` (Q12=2, Q13=35) all
+      PASS.
 
 - [x] **M0119-0010 — `char(N)` typmods are not restored per column on catalog
       reload** (source: M0127-P5.9-f, ledger row 2026-08-05). **FIXED (2026-08-09).**

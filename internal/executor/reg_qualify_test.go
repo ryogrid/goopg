@@ -410,3 +410,82 @@ func TestRegOutDanglingRoleUnquotedNumeric(t *testing.T) {
 		t.Errorf("regrole(dangling) qualify=true = %q, want %q", got, "999999")
 	}
 }
+
+// M0119-0006 (74th slice, deferral rows 1345/1346): ArgTypeDisplayAlias now
+// carries format_type_be's varbit→bit varying case and char→"char" default-path
+// keyword-quoting (format_type.c: the single-byte char is NOT in the special-case
+// switch, so quote_identifier wraps it). The executor's regprocedureArglist
+// already split a baked-in [] array suffix before aliasing, so a builtin ARRAY of
+// these types must render the element alias re-appended (`"char"[]`,
+// `bit varying[]`). Pinned here on the SELECT wire renderer (RegOutArgVisible).
+func TestRegOutRegprocedureArgTypesVarbitChar(t *testing.T) {
+	ctx := regCopyCat(t)
+	allVisible := func(s string) bool { return true }
+	cases := []struct {
+		name string
+		args []catalog.Type
+		want string
+	}{
+		{"f_varbit", []catalog.Type{{Name: "varbit"}}, "public.f_varbit(bit varying)"},
+		{"f_char", []catalog.Type{{Name: "char"}}, `public.f_char("char")`},
+		{"f_chararr", []catalog.Type{{Name: "char[]"}}, `public.f_chararr("char"[])`},
+		{"f_intarr", []catalog.Type{{Name: "int[]"}}, "public.f_intarr(integer[])"},
+		{"f_varbitarr", []catalog.Type{{Name: "varbit[]"}}, "public.f_varbitarr(bit varying[])"},
+	}
+	for _, tc := range cases {
+		r, err := ctx.Catalog.Routines().Create(&catalog.Routine{
+			Name:           tc.name,
+			Schema:         "public",
+			ArgTypes:       tc.args,
+			ArgModes:       []string{"i"},
+			ArgTypeSchemas: []string{"pg_catalog"},
+			ReturnType:     catalog.Type{Name: "int4"},
+		}, false)
+		if err != nil {
+			t.Fatalf("Routines().Create(%s): %v", tc.name, err)
+		}
+		if got := RegOutArgVisible("regprocedure", r.OID, ctx.Catalog, true, allVisible); got != tc.want {
+			t.Errorf("regprocedure(%s) = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// M0119-0006 (74th slice, rows 1345/1346): the catalog BARE builder
+// (RegprocedureName → formatProcedureArglist) and the executor's pg-faithful
+// renderer (regprocedureArglist) must emit byte-identical arglists for the same
+// []RegprocArg — both split the array suffix and both alias through the shared
+// ArgTypeDisplayAlias (Hard-won Rule #2). The name half legitimately differs
+// (the bare builder never qualifies it), so this pins the parenthesized arglist
+// from each side.
+func TestRegprocedureArglistCatalogAndExecutorAgree(t *testing.T) {
+	ctx := regCopyCat(t)
+	rs := ctx.Catalog.Routines()
+	f, err := rs.Create(&catalog.Routine{
+		Name:           "f_multi",
+		Schema:         "public",
+		ArgTypes:       []catalog.Type{{Name: "int[]"}, {Name: "varbit"}, {Name: "char"}, {Name: "char[]"}, {Name: "float8[]"}, {Name: "text"}},
+		ArgModes:       []string{"i", "i", "i", "i", "i", "i"},
+		ArgTypeSchemas: []string{"pg_catalog", "pg_catalog", "pg_catalog", "pg_catalog", "pg_catalog", "pg_catalog"},
+		ReturnType:     catalog.Type{Name: "int4"},
+	}, false)
+	if err != nil {
+		t.Fatalf("Routines().Create(f_multi): %v", err)
+	}
+	wantArglist := `integer[],bit varying,"char","char"[],double precision[],text`
+
+	catSig, ok := catalog.RegprocedureName(f.OID, rs)
+	if !ok {
+		t.Fatalf("RegprocedureName(%d) not ok", f.OID)
+	}
+	if want := "f_multi(" + wantArglist + ")"; catSig != want {
+		t.Errorf("catalog bare builder = %q, want %q", catSig, want)
+	}
+
+	_, _, argParts, ok := catalog.RegprocedureNameParts(f.OID, rs)
+	if !ok {
+		t.Fatalf("RegprocedureNameParts(%d) not ok", f.OID)
+	}
+	if got := regprocedureArglist(argParts, func(s string) bool { return true }); got != wantArglist {
+		t.Errorf("executor regprocedureArglist = %q, want %q", got, wantArglist)
+	}
+}

@@ -1,57 +1,48 @@
 (idle — nothing in flight)
 
-Completed this loop: **M0119-0006 73rd slice** — the regprocedure **arglist** now
-schema-qualifies non-visible arg types exactly like upstream `format_type_be`
-(format_type.c:314), closing ledger row 1342 (the 71st slice's carry-forward).
-Before, `formatProcedureArglist` rendered every input arg type through
-`pgArgTypeDisplayAlias` only (`integer`, `text`), so a routine whose signature
-references an off-path USER arg type rendered `f_offarg(mytype)` where PG 18.3
-emits `f_offarg(offpath.mytype)` (an on-path/builtin arg correctly stays bare).
-The fix has a capture half and a render half. **Capture:** new
-`Routine.ArgTypeSchemas []string` (parallel to `ArgTypes`,
-internal/catalog/routines.go) records each arg type's EXPLICIT schema at CREATE
-FUNCTION/PROCEDURE (operators_ddl.go) via `argTypeSchema` returning the parser's
-`ColumnType.Schema` VERBATIM (unquoted names already case-folded, quoted names
-case-preserved); bare names stay `""`. It rides the existing proargdefaults JSON
-round-trip (`pgProcArgMetaJSON`/`DecodePGProcArgMeta`) automatically, so pre-73rd
-data dirs reload with nil → `""` → bare (backward compatible). **Render:**
-`catalog.RegprocedureNameParts` now returns `[]RegprocArg{Name, Schema}` per arg
-(builtin path stamps `pg_catalog`; user path reads `ArgTypeSchemas[i]`
-nil-defensively); the executor-side `regprocedureArglist` (reg_identifier.go)
-aliases builtin/pg_catalog args through the exported `catalog.ArgTypeDisplayAlias`
-(renamed from `pgArgTypeDisplayAlias`), schema-qualifies a NON-visible user arg
-via `quoteQualifiedIdentifier` with the `[]` array suffix split/re-appended
-(`offpath."mytype[]"` never happens; a user-path builtin array aliases
-`integer[]`), and leaves a BARE-name user arg bare (its owner schema is
-unresolvable — deferral below). The session visibility predicate threads as a
-variadic `visible ...func(schema string) bool` value through `RegOutArgVisible` /
-`appendTypedCellText` (SELECT simple-query) / `EncodeCopyTextRow` /
-`EncodeCopyCsvRow` (COPY TO) and the `::regprocedure` cast sibling in expr.go —
-all four paths agree (Hard-won Rule #2). Measured against a fresh goopg cluster
-+ PG 18.3 oracle (throwaway ports): `'f_offarg(offpath.mytype)'::regprocedure` →
-`f_offarg(offpath.mytype)` (was `f_offarg(mytype)`), array `f_offarr(offpath.mytype[])`,
-rowtype arg `f_offrow(offpath.ct)`, `f_onarg(onpath.mytype)` (name + off-path arg
-both qualify), builtin `f_builtin(integer)` stays bare, a user type NAMED `int`
-quotes like PG (`offpath."int"`), and the `::regprocedure` cast path additionally
-qualifies the NAME (`offpath.f_offboth(offpath.mytype)`) where the wire path's
-name stays bare via the documented 69th-slice proxy. One measured limitation
-filed as a deferral: `SET search_path = public, offpath` cannot make the
-`offpath.mytype` arg render bare yet — `searchPathSchemas` proves schema
-existence only via `LookupTable(parser.ObjectName{Name: s})`, which never sees an
-EMPTY schema (pre-existing proxy, surfaced on the arglist arm by this slice).
-Tests: `TestRegOutRegprocedureQualifiesArgTypes` (reg_qualify_test.go),
-`TestRegprocedureCastArgTypesQualify` + `TestCreateFunctionCapturesArgTypeSchemas`
-(regoperator_schema_qualify_test.go), sibling
-`TestRegCopyAndSelectSiblingArgQualifyAgree` (reg_copy_sibling_test.go). Gates:
-package suites (internal/catalog 0.068 s, internal/executor 6.143 s,
-internal/server 55.165 s) PASS; pre-commit units PASS; `TestPort_RegressSuite`
-PASS (239.7 s); `scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35). Design
-`docs/design/0119-0006-regprocedure-argtype-schema-qualify.md` + README row
-(`0119-0006ay`) + ledger row 1342 resolved + 6 new deferral rows (1343-1348) +
-fix_plan 73rd-slice entry.
+Completed this loop: **M0119-0006 74th slice** — the regprocedure arglist's
+`ArgTypeDisplayAlias` became a faithful `format_type_be` port AND the catalog
+bare arglist builder aliases builtin arrays, closing ledger rows 1345 + 1346
+(the 73rd slice's carry-forwards). Two divergences from PG 18.3: (a) the shared
+alias table had no `varbit → bit varying` arm (the one missing VARBITOID
+special-case switch entry — `bit`/`interval`/`json`/`numeric` are identities,
+every other case was already present) and no keyword-quoting path at all, so
+the single-byte `char` (CHAROID, distinct from bpchar/1042) rendered bare
+`char` where `format_type_be`'s DEFAULT path runs
+`quote_qualified_identifier` and `quote_identifier` wraps the lexer keyword →
+`"char"`; (b) the catalog BARE builder `formatProcedureArglist` (behind
+`RegprocedureName`/`RegprocedureNameAndSchema`) passed the WHOLE stored name —
+baked-in `[]` array suffix included — to the alias, so `int[]` found no switch
+case and rendered `f(int[])` where the executor's pg-faithful
+`regprocedureArglist` already emitted `f(integer[])`: the two sibling renderers
+diverged on a builtin array arg (Hard-won Rule #2). **Fix:** two new arms in
+`catalog.ArgTypeDisplayAlias` (`varbit → bit varying`, `char → "char"`,
+internal/catalog/catalog.go) and a package-local `argListTypeDisplay` helper
+(catalog cannot import executor) that splits a `[]` suffix, aliases the ELEMENT,
+re-appends — mirroring executor's `splitArraySuffix` (reg_identifier.go). The
+executor renderer needed NO change; it picks up the new arms via the shared
+alias. Measured vs a throwaway PG 18.3 oracle (port 5533) on the wire path
+(`oid::regprocedure`): `f_varbit(bit varying)`, `f_char("char")`,
+`f_chararr("char"[])`, `f_intarr(integer[])` now byte-identical; the two
+siblings agree on `integer[],bit varying,"char","char"[],double
+precision[],text` (pinned by `TestRegprocedureArglistCatalogAndExecutorAgree`).
+Tests: `TestArgTypeDisplayAliasFormatTypeBePort` +
+`TestRegprocedureName` array/varbit/char cases (internal/catalog/
+regproc_name_test.go), `TestRegOutRegprocedureArgTypesVarbitChar` +
+`TestRegprocedureArglistCatalogAndExecutorAgree` (internal/executor/
+reg_qualify_test.go). Gates: package suites (internal/catalog 0.063s,
+internal/executor 6.103s, internal/server 55.151s) PASS; pre-commit units PASS;
+`TestPort_RegressSuite` PASS (237.459s — a first CONCURRENT run hit the Go
+default 600s `-test.timeout` while the pre-commit units were hammering the
+machine, leaking a spinning goopg orphan at ~25GB RSS which was SIGKILLed; the
+re-run alone passed, matching the 73rd slice's 239.7s); `scripts/tpch-spotcheck.sh`
+PASS (Q12=2, Q13=35, query phase 21.4s). Design
+`docs/design/0119-0006-argtype-alias-format-type-be-port.md` + README row
+`0119-0006az` + ledger rows 1345/1346 resolved + 2 NEW deferral rows (1349,
+1350) + fix_plan 74th-slice entry.
 
-**Carry-forward for a later loop (seven remaining reg* deferrals under
-2026-08-14, 69th-73rd slices):** (1) goopg's role store folds every role name to
+**Carry-forward for a later loop (nine remaining reg* deferrals under
+2026-08-14, 69th-74th slices):** (1) goopg's role store folds every role name to
 lowercase on registration, so `regroleout` can never receive a case-preserved
 role name to quote (`CREATE ROLE "Alice"` renders `alice`, PG renders `"Alice"`)
 — the quoting code is correct, the limitation is the catalog's missing
@@ -61,14 +52,23 @@ range) has no namespace field, so `CREATE FUNCTION g(mytype)` for an off-public
 type renders bare where PG qualifies it (row 1343); (3) quoted user type NAMES
 lose case at CREATE (`routineArgTypeName` lowercases → `offpath."MyType"` renders
 `offpath.mytype`, PG emits `offpath."MyType"` — same family as row 1340) (row
-1344); (4) the catalog's bare `formatProcedureArglist` does not alias builtin
-ARRAYS (`int[]` vs `integer[]`) (row 1345); (5) `ArgTypeDisplayAlias` is not a
-faithful `format_type_be` port (no `varbit → bit varying`, no keyword-quoting
-path for `char`) (row 1346); (6) the empty-schema visibility proxy blocks
+1344); (4) the empty-schema visibility proxy blocks
 `SET search_path = …, offpath` from rendering an `offpath` arg bare (row 1347);
-(7) the pre-existing regproc/regprocedure INPUT DB-scoping bug
+(5) the pre-existing regproc/regprocedure INPUT DB-scoping bug
 (`regIdentifierInput` passes no dbOid to `LookupByName`, so a live-created
-routine does not resolve by name in some contexts — confirmed live during this
-slice's validation: `'g_offarg'::regprocedure` failed on a stale cluster while
-the reloaded `'f_offarg'` resolved) (row 1348). See the ledger rows for the
-design docs and gate requirements.
+routine does not resolve by name in some contexts) (row 1348); (6) **NEW** —
+MULTI-WORD type names in CREATE FUNCTION args store the LAST word: the parser's
+collapsed `ColumnType.Name` is used verbatim, so `bit varying` → `varying`,
+`character varying` → `varying`, `double precision` → `precision`, and
+`timestamp with time zone` is a syntax error in CREATE FUNCTION args; measured
+live: `CREATE FUNCTION f_vchar(bit varying)` renders `f_vchar(varying)` (PG:
+`f_vchar(bit varying)`). Separately the arglist carries only `Name` (dropping
+Args/OID), so a BARE `char` arg — parser-stamped bpchar-like, `Args=[1]`, like
+PG — is indistinguishable from OID-18 `"char"` and renders `"char"` where PG
+renders `character` (row 1349); (7) **NEW** — a reg* → text/varchar/name cast on
+a STRING-LITERAL source renders the raw OID: `'f_varbit(varbit)'::regprocedure::text`
+→ `131072` (PG: `f_varbit(bit varying)`), `'f_varbit'::regproc::text` →
+`131072`, `'pg_type'::regclass::text` → `1247`; the `::regprocedure` INPUT half
+resolves correctly, only the downstream cast to text/name/varchar renders the
+numeric datum. regtype/regrole/regcollation and non-literal sources unaffected
+(row 1350). See the ledger rows for the design docs and gate requirements.

@@ -19789,11 +19789,15 @@ func IsStrictProc(oid uint32) bool {
 // ArgTypeDisplayAlias converts an internal base-type spelling (a pg_type.dat
 // typname, or a user Routine's stored Type.Name) to PG's format_type_be
 // display alias — the handful of base types whose internal name differs from
-// its SQL display spelling (int4 -> integer, bool -> boolean, etc). Mirrors
-// executor's pgFormatTypeName; duplicated here (not imported) because
-// internal/executor imports internal/catalog, not the reverse. Types with no
-// alias (composite/domain/array names, "text", "uuid", ...) pass through
-// unchanged. Exported so the executor's regprocedure arglist renderer
+// its SQL display spelling (int4 -> integer, bool -> boolean, varbit -> bit
+// varying, etc), plus char, which format_type_be renders through its default
+// path as the keyword-quoted `"char"` (74th slice, row 1346). Conceptually the
+// executor's pgFormatTypeName mirror; duplicated here (not imported) because
+// internal/executor imports internal/catalog, not the reverse — note the two
+// deliberately diverge on char (pgFormatTypeName folds it to "character" for
+// its own bpchar-ish display callers). Types with no alias
+// (composite/domain/array names, "text", "uuid", ...) pass through unchanged.
+// Exported so the executor's regprocedure arglist renderer
 // (regprocedureArglist) shares ONE alias table with the catalog's bare
 // builder — no second alias source to drift (deferral row 1342).
 func ArgTypeDisplayAlias(name string) string {
@@ -19824,6 +19828,15 @@ func ArgTypeDisplayAlias(name string) string {
 		return "time without time zone"
 	case "decimal":
 		return "numeric"
+	case "varbit":
+		return "bit varying"
+	case "char":
+		// format_type_be's default path (format_type.c): char (CHAROID, the
+		// single-byte type) is NOT in the special-case switch, so it renders
+		// through quote_qualified_identifier — and "char" is a lexer keyword,
+		// so quote_identifier wraps it: `"char"`. Distinct from bpchar (1042),
+		// which stays "character". M0119-0006 (74th slice, row 1346).
+		return `"char"`
 	}
 	return name
 }
@@ -19933,9 +19946,21 @@ func RegprocedureNameParts(oid uint32, routines *Routines) (schema, name string,
 func formatProcedureArglist(argTypes []RegprocArg) string {
 	args := make([]string, len(argTypes))
 	for i, a := range argTypes {
-		args[i] = ArgTypeDisplayAlias(a.Name)
+		args[i] = argListTypeDisplay(a.Name)
 	}
 	return strings.Join(args, ",")
+}
+
+// argListTypeDisplay renders ONE arg type the way the executor's pg-faithful
+// regprocedureArglist does: split a baked-in "[]" array suffix, alias the
+// ELEMENT through ArgTypeDisplayAlias (so `int[]` → `integer[]`, `char[]` →
+// `"char"[]`), and re-append the suffix. Mirrors executor splitArraySuffix —
+// the two sibling renderers must agree (Hard-won Rule #2, deferral row 1345).
+func argListTypeDisplay(name string) string {
+	if strings.HasSuffix(name, "[]") {
+		return ArgTypeDisplayAlias(name[:len(name)-2]) + "[]"
+	}
+	return ArgTypeDisplayAlias(name)
 }
 
 // RegoperatorName resolves an operator OID to PG's "opr_name(lefttype,
