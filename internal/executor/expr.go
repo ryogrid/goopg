@@ -13815,7 +13815,7 @@ func charTypeDisplayForm(b byte) string {
 // actually exist, in search-path order. Shared by current_schema (scalar,
 // first entry) and current_schemas (array). $user expands to the connection
 // user; built-in schemas (pg_catalog/information_schema/public) always exist,
-// user schemas are confirmed via the catalog.
+// user schemas are confirmed via the schema registry (empty schemas included).
 func searchPathSchemas(ctx *Context) []string {
 	searchPath := `"$user", public` // default
 	if ctx != nil && ctx.GetSetting != nil {
@@ -13840,9 +13840,9 @@ func searchPathSchemas(ctx *Context) []string {
 			out = append(out, lc)
 			continue
 		}
-		// User-created schemas: check if a table with this schema prefix exists.
+		// User-created schemas: present if registered, even when empty.
 		if ctx != nil && ctx.Catalog != nil {
-			if _, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: s}); ok {
+			if ctx.Catalog.SchemaExists(s) {
 				out = append(out, s)
 			}
 		}

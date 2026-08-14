@@ -274,7 +274,14 @@ and copy.go). Then:
   enum/composite/domain/range types is a store-wide change that also
   unblocks the pg_proc proargtypes OID column and pg_dump type-qualification.
   The explicit-qualification case (the row-1342 repro, every probe above) is
-  fully fixed.
+  fully fixed. **Note (85th slice):** the §1 search_path row (line 42) held only
+  because the probe put a TABLE in `offpath` — `searchPathSchemas` proved a user
+  schema's existence via `LookupTable`, which cannot see an EMPTY schema. With
+  `offpath` empty, `SET search_path = public, offpath` rendered
+  `f_offarg(offpath.mytype)` (deferral row 1347). The 85th slice swapped the
+  proxy to `Catalog.SchemaExists` (empty schemas registered at CREATE SCHEMA), so
+  the empty-offpath case now renders bare too; pinned by
+  `TestRegObjectSchemaVisibleSeesEmptySchema`.
 - **Literal-Const vs column-cast qualify imprecision** (the 69th slice's
   public-proxy vs per-schema flag) is unchanged this slice: the NAME qualify
   still comes from the caller's proxy flag on the SELECT/COPY paths and the

@@ -528,3 +528,56 @@ func TestRegOutToastRelnameRendersSchemaQualified(t *testing.T) {
 		t.Errorf("regclass(toast index OID) = %q, want %q", got, wantIdx)
 	}
 }
+
+// M0119-0006 (deferral row 1347): searchPathSchemas used LookupTable as a
+// schema-existence proxy, so a REGISTERED-BUT-EMPTY user schema never appeared
+// on the effective search_path — SET search_path = public, offpath with offpath
+// empty rendered f_offarg(offpath.mytype) instead of PG's bare f_offarg(mytype).
+// The proxy is now the schema registry (SchemaExists, which sees empty schemas
+// registered at CREATE SCHEMA), mirroring fetch_search_path's inclusion of empty
+// namespaces (postgres/src/backend/catalog/namespace.c:4822-4849) with name→OID
+// resolution via get_namespace_oid (namespace.c:3537-3550). This test registers
+// an EMPTY offpath (no tables/objects) and asserts RegObjectSchemaVisible sees it
+// and the regprocedure arglist renders the offpath arg BARE.
+func TestRegObjectSchemaVisibleSeesEmptySchema(t *testing.T) {
+	ctx := regCopyCat(t)
+	im := ctx.Catalog.(*catalog.InMemory)
+	// An EMPTY schema: registered (as CREATE SCHEMA does), but holding no
+	// tables/objects — the case the old LookupTable existence proxy could never
+	// see (a table literally named "offpath" would have to exist for it to
+	// succeed).
+	im.RegisterSchema("offpath")
+
+	// The session's effective search_path puts the empty offpath on the path.
+	ctx.GetSetting = func(name string) (string, bool) {
+		if name == "search_path" {
+			return "public, offpath", true
+		}
+		return "", false
+	}
+
+	// The empty schema is now visible on the path even though it holds no tables.
+	if got := RegObjectSchemaVisible(ctx, "offpath"); !got {
+		t.Errorf("RegObjectSchemaVisible(empty offpath on path) = false, want true")
+	}
+
+	// A routine in public whose arg type is the offpath composite mytype: with
+	// offpath visible, format_type_be renders the arg BARE (f_offarg(mytype)),
+	// not qualified (f_offarg(offpath.mytype)) — the 73rd-slice design doc's §1
+	// oracle row `SET search_path = public, offpath; f_offarg → f_offarg(mytype)`.
+	offArg, err := ctx.Catalog.Routines().Create(&catalog.Routine{
+		Name:           "f_offarg",
+		Schema:         "public",
+		ArgTypes:       []catalog.Type{{Name: "mytype"}},
+		ArgModes:       []string{"i"},
+		ArgTypeSchemas: []string{"offpath"},
+		ReturnType:     catalog.Type{Name: "int4"},
+	}, false)
+	if err != nil {
+		t.Fatalf("Routines().Create(f_offarg): %v", err)
+	}
+	visible := func(s string) bool { return RegObjectSchemaVisible(ctx, s) }
+	if got := RegOutArgVisible("regprocedure", offArg.OID, ctx.Catalog, true, visible); got != "public.f_offarg(mytype)" {
+		t.Errorf("regprocedure(f_offarg) empty offpath on path = %q, want %q", got, "public.f_offarg(mytype)")
+	}
+}
