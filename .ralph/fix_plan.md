@@ -3283,6 +3283,37 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       proof), `TestBuildPublicationFilterResolvesCrossDB`,
       `TestRegOutRendererCrossDB`. Design:
       `docs/design/0119-0006-walsender-cross-db-dboid-threading.md`.
+      **88th slice (2026-08-14): regtype catalog-representation — NamespaceOID on
+      the four user-type registries (ledger row 1355 slice A).** The
+      enum/domain/composite/range registries (`EnumType`/`Domain`/`CompositeType`/
+      `RangeType` in `internal/catalog/catalog.go`) tracked no schema, so the
+      regtype renderer could not know a user type's real namespace. Added
+      `NamespaceOID uint32` to all four structs (mirroring `UserCollation`),
+      populated at CREATE TYPE (all four branches in `execCreateType`) and CREATE
+      DOMAIN (`execCreateDomain`) via the CREATE AGGREGATE schema-with-public-
+      fallback pattern, and at WAL/startup reload (`reloadUserEnumsFromHeap`/
+      `reloadUserDomainsFromHeap`/`reloadUserRangeTypesFromHeap` now capture
+      pg_type typnamespace col 2, previously dropped). ALTER TYPE needs no change
+      (it re-registers through `RegisterCompositeTypeWithFields`, reusing the same
+      struct pointer). Test: `TestCreateTypeDomainRecordsNamespaceOID`. No
+      renderer touched here — slice B consumes the field.
+      **89th slice (2026-08-14): regtype renders a user type's ACTUAL schema +
+      quote_identifier (ledger row 1355 slice B).** `userTypeNameForOID`/`RegtypeName`
+      (`internal/executor/expr.go`) take a per-schema `qualify func(schema string) bool`
+      instead of a fixed bool; all ten user-type arms capture `NamespaceOID`, resolve
+      via the new `Catalog.SchemaNameForOID`, and render `regOutQualified(schema, name,
+      qualify(schema))` with the `"[]"`/multirange suffix kept outside quoting. New
+      `regOutQualifySchema` defaults ""→"public" before evaluating the predicate so a
+      NamespaceOID==0 type behaves like public. `regOutShared` drops the separate
+      `regtypeQualify` bool (regtype arm now uses the same `qualify` as regclass/
+      regcollation/regprocedure); the `::regtype` cast / `format_type()` / walsender /
+      RAISE now render an off-path non-public type as `schema.name`. Design:
+      `docs/design/0119-0006-regtype-actual-schema-qualifier.md`. Tests:
+      `regtype_actual_schema_test.go` (off-path actual schema, mixed-case quoting,
+      sibling agreement). Gates: go build + executor/server/wal/catalog/plpgsql suites
+      + tpch-spotcheck (Q12=2/Q13=35) + pre-commit units all PASS. Residual: the
+      wire/COPY/`reg*`→text/array paths still pass a constant-public predicate (row
+      1339 family) — ledgered as a follow-up row.
       **28th slice (2026-08-12): the `HH:MM` half of that inherited input gap is
       closed.** A time-of-day with no seconds field is ordinary PG input
       (`DecodeTime` reads seconds only `if (*cp == ':')`, leaving `tm_sec = 0`),
