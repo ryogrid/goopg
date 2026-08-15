@@ -84,7 +84,11 @@ func (o *vacuumOp) Next() (TupleSlot, error) {
 	if vs.Full {
 		lmMode = lockmgr.AccessExclusiveLock
 	}
-	targets, parents := o.expandVacuumTargets(vs)
+	targets, parents, terr := o.expandVacuumTargets(vs)
+	if terr != nil {
+		// A bad column list aborts the whole VACUUM ANALYZE (not suppressed).
+		return nil, terr
+	}
 	for _, vt := range targets {
 		tbl := vt.tbl
 		rel := o.ctx.Catalog.RelFileNode(tbl)
@@ -225,7 +229,7 @@ type vacuumTarget struct {
 // partitions (the parent itself has no storage). It returns the flat target
 // list plus the partitioned parents encountered, which the caller uses to drive
 // the inheritance-statistics AccessShare scan when ANALYZE is requested.
-func (o *vacuumOp) expandVacuumTargets(vs *parser.VacuumStmt) ([]vacuumTarget, []*catalog.Table) {
+func (o *vacuumOp) expandVacuumTargets(vs *parser.VacuumStmt) ([]vacuumTarget, []*catalog.Table, *ExecError) {
 	// Named targets resolve through ctxPlanCatalog — the per-connection,
 	// DB-scoped catalog SELECT plans against — mirroring expandAnalyzeTargets
 	// (sibling paths change together): a raw ctx.Catalog.LookupTable keys off
@@ -254,10 +258,20 @@ func (o *vacuumOp) expandVacuumTargets(vs *parser.VacuumStmt) ([]vacuumTarget, [
 		out = append(out, vacuumTarget{tbl: tbl, explicit: explicit})
 	}
 	if len(vs.Targets) > 0 {
-		for _, name := range vs.Targets {
+		for i, name := range vs.Targets {
 			tbl, ok := cat.LookupTable(name)
 			if !ok {
 				continue
+			}
+			// VACUUM ANALYZE with a per-relation column list (VACUUM ANALYZE
+			// tab (col, ...)): validate the names — PG aborts the whole
+			// statement on a bad column (42703/42701, analyze.c:372-400).
+			// Plain VACUUM ignores va_cols (analyze_rel is never reached), so
+			// only the ANALYZE verb validates.
+			if vs.Analyze && i < len(vs.TargetCols) && vs.TargetCols[i] != nil {
+				if cerr := resolveAnalyzeColumns(tbl, vs.TargetCols[i], vs.Pos()); cerr != nil {
+					return nil, nil, cerr
+				}
 			}
 			// Maintenance-privilege check (vacuum_is_permitted_to_vacuum). A
 			// non-superuser session (SET ROLE) may only vacuum a relation it owns
@@ -272,7 +286,7 @@ func (o *vacuumOp) expandVacuumTargets(vs *parser.VacuumStmt) ([]vacuumTarget, [
 			}
 			add(tbl, true)
 		}
-		return out, parents
+		return out, parents, nil
 	}
 	// Database-wide VACUUM: every user table, none "explicitly" named, so a
 	// SKIP_LOCKED skip is silent (matches PG's autovacuum-style log suppression).
@@ -283,7 +297,7 @@ func (o *vacuumOp) expandVacuumTargets(vs *parser.VacuumStmt) ([]vacuumTarget, [
 			}
 		}
 	}
-	return out, parents
+	return out, parents, nil
 }
 
 // analyzeInheritanceWait reproduces the AccessShareLock that ANALYZE of a

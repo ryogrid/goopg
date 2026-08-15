@@ -127,6 +127,9 @@ type VacuumStmt struct {
 	ParallelWorkers     int          // -1 = not specified
 	BufferUsageLimit    string       // "" = not specified
 	Targets             []ObjectName // empty -> all relations
+	// TargetCols is parallel to Targets; TargetCols[i] is nil when
+	// Targets[i] carries no column list.
+	TargetCols [][]string
 }
 
 func (s *VacuumStmt) Pos() int  { return s.pos }
@@ -138,6 +141,9 @@ type AnalyzeStmt struct {
 	Verbose    bool
 	SkipLocked bool
 	Targets    []ObjectName
+	// TargetCols is parallel to Targets; TargetCols[i] is nil when
+	// Targets[i] carries no column list.
+	TargetCols [][]string
 }
 
 func (s *AnalyzeStmt) Pos() int  { return s.pos }

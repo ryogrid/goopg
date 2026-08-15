@@ -130,6 +130,35 @@ func (o *analyzeOp) Next() (TupleSlot, error) {
 // tables, so `ANALYZE lineitem` in db tpch raised 42P01 while
 // `SELECT ... FROM lineitem` worked (ledger `bench-reorg ANALYZE-scope`).
 // M0125-0028.
+// resolveAnalyzeColumns validates an ANALYZE / VACUUM ANALYZE per-relation
+// column list, reproducing PG's attnameAttNum + analyze_rel duplicate check
+// (postgres/src/backend/parser/parse_relation.c:3589-3609,
+// postgres/src/backend/commands/analyze.c:372-400): a case-sensitive lookup
+// that skips dropped columns; the first unresolved name is 42703 and a repeat
+// (same resolved column Ordinal twice) is 42701. Validation only — the
+// per-column stats restriction is deferred. NOT InMemory.LookupColumn, which is
+// case-insensitive and ignores Dropped.
+func resolveAnalyzeColumns(tbl *catalog.Table, cols []string, pos int) *ExecError {
+	seen := make(map[int]bool)
+	for _, name := range cols {
+		var col *catalog.Column
+		for i := range tbl.Columns {
+			if tbl.Columns[i].Name == name && !tbl.Columns[i].Dropped {
+				col = &tbl.Columns[i]
+				break
+			}
+		}
+		if col == nil {
+			return &ExecError{Code: "42703", Pos: pos, Message: fmt.Sprintf("column %q of relation %q does not exist", name, tbl.Name)}
+		}
+		if seen[col.Ordinal] {
+			return &ExecError{Code: "42701", Pos: pos, Message: fmt.Sprintf("column %q of relation %q appears more than once", name, tbl.Name)}
+		}
+		seen[col.Ordinal] = true
+	}
+	return nil
+}
+
 func (o *analyzeOp) expandAnalyzeTargets() ([]vacuumTarget, []*catalog.Table, *ExecError) {
 	cat := ctxPlanCatalog(o.ctx)
 	// Partition-child expansion needs the concrete InMemory catalog; peel it
@@ -186,10 +215,19 @@ func (o *analyzeOp) expandAnalyzeTargets() ([]vacuumTarget, []*catalog.Table, *E
 		}
 		return out, parents, nil
 	}
-	for _, name := range o.stmt.Targets {
+	for i, name := range o.stmt.Targets {
 		tbl, ok := cat.LookupTable(name)
 		if !ok {
 			return nil, nil, &ExecError{Code: "42P01", Pos: o.stmt.Pos(), Message: fmt.Sprintf("relation %q does not exist", name.String())}
+		}
+		// Per-relation column list (ANALYZE tab (col, ...)): validate the names
+		// before the permission check. PG resolves va_cols in analyze_rel
+		// (analyze.c:372-400) and aborts the statement on a bad column
+		// (42703/42701). No per-column stats restriction yet (deferred).
+		if i < len(o.stmt.TargetCols) && o.stmt.TargetCols[i] != nil {
+			if cerr := resolveAnalyzeColumns(tbl, o.stmt.TargetCols[i], o.stmt.Pos()); cerr != nil {
+				return nil, nil, cerr
+			}
 		}
 		// Maintenance-privilege check (vacuum_is_permitted_to_vacuum, analyze
 		// verb). A non-superuser session may only analyze a relation it owns (or

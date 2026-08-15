@@ -1897,11 +1897,12 @@ targets:
 	if p.cur().Kind == TokenEOF || (p.cur().Kind == TokenSymbol && p.cur().Value == ";") {
 		return v, nil
 	}
-	tgts, err := p.parseObjectList()
+	tgts, cols, err := p.parseVacuumTargets()
 	if err != nil {
 		return nil, err
 	}
 	v.Targets = tgts
+	v.TargetCols = cols
 	return v, nil
 }
 
@@ -2055,11 +2056,12 @@ func (p *parser) parseAnalyze() (Stmt, error) {
 	if p.cur().Kind == TokenEOF || (p.cur().Kind == TokenSymbol && p.cur().Value == ";") {
 		return a, nil
 	}
-	tgts, err := p.parseObjectList()
+	tgts, cols, err := p.parseVacuumTargets()
 	if err != nil {
 		return nil, err
 	}
 	a.Targets = tgts
+	a.TargetCols = cols
 	return a, nil
 }
 
@@ -2079,6 +2081,45 @@ func (p *parser) parseObjectList() ([]ObjectName, error) {
 		out = append(out, o)
 	}
 	return out, nil
+}
+
+// parseVacuumTargets parses the VACUUM/ANALYZE relation list, where each
+// relation may carry an optional parenthesised column list (PG grammar
+// vacuum_relation: relation_expr opt_name_list, gram.y:12021-12026). Returns
+// parallel slices: cols[i] pairs with names[i], and is nil when names[i] has no
+// column list. ANALYZE tab (a, b) and VACUUM ANALYZE tab (a) both go through
+// here.
+func (p *parser) parseVacuumTargets() ([]ObjectName, [][]string, error) {
+	var names []ObjectName
+	var cols [][]string
+	for {
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, nil, err
+		}
+		names = append(names, name)
+		var colList []string
+		if p.acceptSymbol("(") {
+			for {
+				ident, err := p.parseIdent()
+				if err != nil {
+					return nil, nil, err
+				}
+				colList = append(colList, identText(ident))
+				if !p.acceptSymbol(",") {
+					break
+				}
+			}
+			if !p.acceptSymbol(")") {
+				return nil, nil, p.errAtCur("expected ')'")
+			}
+		}
+		cols = append(cols, colList)
+		if !p.acceptSymbol(",") {
+			break
+		}
+	}
+	return names, cols, nil
 }
 
 // parseOperatorName parses a PostgreSQL operator name for DROP OPERATOR.

@@ -134,6 +134,67 @@ func TestParseAnalyze(t *testing.T) {
 	}
 }
 
+// TestParseVacuumTargetCols locks down the optional per-relation column list
+// on VACUUM/ANALYZE targets (gram.y vacuum_relation: relation_expr
+// opt_name_list): ANALYZE t(a, b), VACUUM ANALYZE t(a) and a bare ANALYZE t
+// (nil column list) all produce parallel Targets + TargetCols.
+func TestParseVacuumTargetCols(t *testing.T) {
+	cases := []struct {
+		in   string
+		stmt string // "analyze" or "vacuum"
+		name string
+		cols []string // nil for no column list
+	}{
+		{"analyze t(a, b)", "analyze", "t", []string{"a", "b"}},
+		{"vacuum analyze t(a)", "vacuum", "t", []string{"a"}},
+		{"ANALYZE t", "analyze", "t", nil},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		if len(stmts) != 1 {
+			t.Fatalf("Parse(%q): %d stmts, want 1", c.in, len(stmts))
+		}
+		var targets []ObjectName
+		var cols [][]string
+		switch s := stmts[0].(type) {
+		case *AnalyzeStmt:
+			targets, cols = s.Targets, s.TargetCols
+		case *VacuumStmt:
+			targets, cols = s.Targets, s.TargetCols
+		default:
+			t.Fatalf("Parse(%q): unexpected node %T", c.in, stmts[0])
+		}
+		if len(targets) != 1 || targets[0].Name != c.name {
+			t.Errorf("Parse(%q): targets=%v want [%q]", c.in, targets, c.name)
+		}
+		if c.cols == nil {
+			if len(cols) != 1 || cols[0] != nil {
+				t.Errorf("Parse(%q): TargetCols=%v want [nil]", c.in, cols)
+			}
+		} else {
+			if len(cols) != 1 || len(cols[0]) != len(c.cols) {
+				t.Errorf("Parse(%q): TargetCols=%v want %v", c.in, cols, c.cols)
+			}
+			for i := range c.cols {
+				if cols[0][i] != c.cols[i] {
+					t.Errorf("Parse(%q): TargetCols[0][%d]=%q want %q", c.in, i, cols[0][i], c.cols[i])
+				}
+			}
+		}
+	}
+}
+
+// TestParseVacuumTargetColsMissingParen locks the missing-closing-paren error
+// on a column list (p.errAtCur("expected ')'")).
+func TestParseVacuumTargetColsMissingParen(t *testing.T) {
+	if _, err := Parse("analyze t(a, b"); err == nil {
+		t.Fatal("Parse(\"analyze t(a, b\") succeeded, want syntax error")
+	}
+}
+
 // TestParseCheckpoint locks the bare CHECKPOINT verb. Upstream
 // only accepts CHECKPOINT (no parenthesised options) — see
 // postgres/src/backend/parser/gram.y CheckPointStmt rule.

@@ -311,6 +311,43 @@ statement gap, not ALTER TABLE. C2 is otherwise complete; the 3-line
 `only renameColumn add column x` / `column "x" already exists` divergence
 (sql:1205/1208) is the C9 inheritance class, tracked separately.
 
+**Thirteenth slice landed (2026-08-16): `ANALYZE tab(col)` / `VACUUM ANALYZE
+tab(col)` column-list** — the final C2-adjacent gap, re-routed to the ANALYZE/VACUUM
+statement parser. PG grammar: `AnalyzeStmt`/`VacuumStmt` →
+`opt_vacuum_relation_list` → `vacuum_relation: relation_expr opt_name_list` with
+`opt_name_list: '(' name_list ')'` (gram.y:11940/11952, :12021-12026,
+:12016-12019) — each target carries its own `va_cols`. goopg's `parseObjectList`
+(parser.go:2067) has no column-list arm, so `analyze atacc1(a)` stops at the `(`
+and the trailing-token check emits `syntax error at or near "expected ';' or end
+of input (got ()"`. All 4 alter_table sites (alter_table.sql:1056-1059) name
+DROPPED columns of `atacc1`, so this case needs only the 42703 error path; the
+valid-column stats *restriction* is deferred (ledger row) to vacuum.sql (M0134-0084).
+
+Design — three coordinated changes in one slice (parser+AST+executor, so the
+gate passes atomically):
+
+1. **Parser** — new `parseVacuumTargets() ([]ObjectName, [][]string, error)`
+   helper: each `parseObjectName()` then an optional `'(' parseIdent (','
+   parseIdent)* ')'` column list, returning parallel `[]ObjectName` + `[][]string`
+   (nil entry = no list). Do NOT modify `parseObjectList` (4 callers incl.
+   ddl.go:2225/:6699). Wire into `parseVacuum` (parser.go:1900) and `parseAnalyze`
+   (:2058); each column name uses `parseIdent`+`identText` (ColId semantics, the
+   same reader `parseObjectName` uses).
+2. **AST** — add `TargetCols [][]string` to `VacuumStmt` (ast.go:110) and
+   `AnalyzeStmt` (ast.go:136), parallel to `Targets`.
+3. **Executor** — new `resolveAnalyzeColumns(tbl *catalog.Table, cols []string,
+   pos int) *ExecError`: a case-sensitive, dropped-skipping lookup reproducing PG
+   `attnameAttNum` (parse_relation.c:3589-3609, `namestrcmp` + `!attisdropped` —
+   NOT the case-insensitive `InMemory.LookupColumn`), returning 42703
+   `column "%s" of relation "%s" does not exist` on the first unresolved name and
+   42701 `column "%s" of relation "%s" appears more than once` on a repeat (dedup
+   on the resolved column Ordinal, analyze.c:372-400). Call it from
+   `expandAnalyzeTargets` (operators_analyze.go:189 loop, switch to `for i, name :=
+   range o.stmt.Targets`) and from `expandVacuumTargets` (operators_vacuum.go:257
+   loop, only when `vs.Analyze` is set — plain VACUUM ignores `va_cols`); both
+   surface the error to their `Next`. The error message mirrors the existing
+   `column %q of relation %q does not exist` at analyzer.go:733.
+
 ## Secondary finding (corrects deferral-ledger row 1385)
 
 The EXPLAIN `QUERY PLAN` underline width is **not** a goopg fixed-width

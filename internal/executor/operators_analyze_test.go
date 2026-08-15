@@ -515,3 +515,43 @@ func TestAnalyzePopulatesAvgWidth(t *testing.T) {
 		t.Errorf("empty sample: AvgWidth=%v, want 0", emptyStats.AvgWidth)
 	}
 }
+
+// TestResolveAnalyzeColumns pins the ANALYZE/VACUUM ANALYZE per-relation
+// column-list validator (analyze.c:372-400 + attnameAttNum,
+// parse_relation.c:3589-3609): case-sensitive, dropped-skipping lookup, 42703
+// on the first unresolved name, 42701 on a duplicate mention, nil when every
+// listed column resolves.
+func TestResolveAnalyzeColumns(t *testing.T) {
+	_, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"}) // id, label
+
+	// Two valid columns -> nil.
+	if err := resolveAnalyzeColumns(tbl, []string{"id", "label"}, 0); err != nil {
+		t.Errorf("resolveAnalyzeColumns(id, label) = %v, want nil", err)
+	}
+
+	// Duplicate mention of the same column -> 42701.
+	dup := resolveAnalyzeColumns(tbl, []string{"id", "label", "id"}, 0)
+	if dup == nil || dup.Code != "42701" {
+		t.Errorf("duplicate column: got %v, want 42701", dup)
+	}
+	if dup != nil && dup.Message != `column "id" of relation "items" appears more than once` {
+		t.Errorf("duplicate message = %q", dup.Message)
+	}
+
+	// Case-sensitive: "ID" does not match "id" -> 42703.
+	if err := resolveAnalyzeColumns(tbl, []string{"ID"}, 0); err == nil || err.Code != "42703" {
+		t.Errorf("case-sensitive lookup: got %v, want 42703", err)
+	}
+
+	// Dropped columns are invisible to the lookup -> 42703.
+	tbl.Columns[0].Dropped = true
+	drop := resolveAnalyzeColumns(tbl, []string{"id"}, 0)
+	if drop == nil || drop.Code != "42703" {
+		t.Errorf("dropped column: got %v, want 42703", drop)
+	}
+	if drop != nil && drop.Message != `column "id" of relation "items" does not exist` {
+		t.Errorf("dropped message = %q", drop.Message)
+	}
+}
