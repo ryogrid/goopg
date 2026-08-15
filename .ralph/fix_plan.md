@@ -1027,7 +1027,7 @@ later testport results to that mid-run build break. AI-002/003/004 are
 genuinely-attributed FAILs (distinct from the unattributable set), so they are
 filed as real until a HEAD re-run (rule §2) says otherwise.
 
-- [ ] **race/internal/initdb (AI-20260815-011722-001)** — race suite FAIL (triage
+- [ ] **race/internal/initdb (AI-20260815-011722-001, AI-20260816-005117-001)** — race suite FAIL (triage
       2026-08-15 @HEAD `ecd80d4c`): NOT a `DATA RACE` — package-wide race-run
       **time-budget exhaustion**; initdb under `-race` exceeds even the nightly's
       45m budget (`RACE_TIMEOUT=45m` → 2700s timeout). In-flight goroutine was
@@ -1052,6 +1052,20 @@ filed as real until a HEAD re-run (rule §2) says otherwise.
 - [x] **testport/build-broke-mid-stage (AI-20260815-011722-005)** — **stale — build
       clean at HEAD** (triage 2026-08-15: `go build ./...` exit 0; the nightly
       mid-run compile error came from concurrent Loop #22 WIP, now gone).
+
+### Nightly run 20260816-005117 (sha `cf1c548faa8b`, 3 items) — filed 2026-08-16
+
+- [ ] **testport/TestPort_FunctionSurvivesRestart (AI-20260816-005117-002)** —
+      testport FAIL, first-seen tonight. Repro:
+      `go test -v -run '^TestPort_FunctionSurvivesRestart$' ./internal/testport/`.
+      Evidence: `ci/logs/20260816-005117/testport/go-test.log`.
+- [ ] **testport/build-broke-mid-stage (AI-20260816-005117-003) — REOPENED** — the
+      goopg build broke DURING the testport stage; 9 test(s) after the break are
+      UNATTRIBUTABLE (not regressions). The working tree is built live, so a
+      concurrent edit/commit is the likely cause; no stage fingerprints to
+      confirm. Repro: `go build ./...` at the run's recorded sha (clean sha ⇒
+      nothing to fix in the code). Evidence:
+      `ci/logs/20260816-005117/testport/go-test.log`.
 
 ## M0130 — Cluster-directory compat with PG 18.3 + PG physical replication (filed 2026-08-09)
 
@@ -6276,6 +6290,7 @@ M0119 and M0122's remaining items. Milestone doc:
   - **C2 fourth slice landed 2026-08-16 — DROP INDEX constraint-guard** — `execDropIndex` now raises 2BP01 `cannot drop index %s because constraint %s on table %s requires it` + HINT `You can drop constraint %s on table %s instead.` (unquoted names, PG `getObjectDescription` / `dependency.c:780-795`) when the target index backs a live UNIQUE/PK/EXCLUDE constraint (`idx.IsConstraint || idx.IsExclusion`); a bare `CREATE UNIQUE INDEX` (no constraint) still drops cleanly. Closes the onek :294-296 `DROP INDEX`→`RENAME CONSTRAINT`→`DROP INDEX <new>` sequence (0 occurrences of `onek_unique1_constraint` in the diff). Remaining C2 sub-gaps: TYPE…USING (C10-entangled), comma multi-action (structural), RENAME `<col>` TO bare, ANALYZE tab(col), NOT VALID, STORAGE, OF/NOT OF, DROP COLUMN IF EXISTS, DROP CONSTRAINT IF EXISTS, SET WITHOUT OIDS, ENFORCED dup.
   - **C2 fifth slice landed 2026-08-16 — TYPE…USING** — parser captures the optional USING expression (`UsingExpr` on `AlterTableAction`, `p.parseExpr()` after `parseColumnType()`, mirrors the SET DEFAULT arm); new `planner.ResolveAlterColumnTypeUsing` resolves it against the OLD column schema (`resolveExpr` + `singleBindingContext`, so ColumnRefs stay positional); `execAlterColumnType` evaluates it per-row (`evalExpr`) and coerces via `evalCast`, propagating a PG-exact 42804 error (two variants + hints, tablecmds.c:14495-14511) BEFORE the Phase-3 truncation so a failed rewrite leaves the table intact (C10 root), plus a slot RUnlock/Unpin leak fix on the error path. Closes the 11 `syntax error at or near (got using)` sites (`got using` → 0 in the diff). Deferral ledger rows appended for: evalCast's permissive coercion set (int→bool succeeds / int8→int4 narrowing not enforced — the `anothertab` cascade), the whole-row / generated-column / `SET DATA TYPE` edge rejections, and DEFAULT revalidation + typmod/`format_type_be` rendering. Remaining C2 sub-gaps: comma multi-action (structural), RENAME `<col>` TO bare, ANALYZE tab(col), NOT VALID, STORAGE, OF/NOT OF, DROP COLUMN IF EXISTS, DROP CONSTRAINT IF EXISTS, SET WITHOUT OIDS, ENFORCED dup.
   - **C2 sixth slice landed 2026-08-16 — comma multi-action** — the ALTER COLUMN block moved out of `parseAlter`'s early-return path (`ddl.go:8778-8985`) into a new `parseAlterColumnAction() (AlterTableAction, error)` helper, dispatched from the top of `parseAlterTableAction` on the bare `ALTER` token, so the pre-existing comma loop (`first := parseAlterTableAction()` then `for p.acceptSymbol(",")`) now builds a multi-action list. Every arm converted append+`return stmt`→`return AlterTableAction{…}`; the no-op tail breaks on `,` as well as `;` and returns `AlterTableNoOp` (already ignored at `operators_ddl.go:7730`). No AST field / executor change needed (`AlterTableStmt.Actions` is a slice; `execAlterTable` already ranges it, mutating one shared `tbl`). Closes the 7 `(got ,)` + 3 `expected ADD or DROP (got alter)` sites (both → 0). Deferral ledger row for the sequential-apply gap (goopg mutates `tbl` per action; PG's `ATController` preps all first). Remaining C2 sub-gaps: RENAME `<col>` TO bare, ANALYZE tab(col), NOT VALID, STORAGE, OF/NOT OF, DROP COLUMN IF EXISTS, DROP CONSTRAINT IF EXISTS, SET WITHOUT OIDS, ENFORCED dup.
+  - **C2 seventh slice landed 2026-08-16 — DROP COLUMN/CONSTRAINT IF EXISTS** — both arms of `parseAlterTableAction` now consume `IF EXISTS` via `acceptKeyword(KwIf)`/`acceptKeyword(KwExists)` and set the existing `AlterTableAction.IfExists` flag (the DROP COLUMN arm had never actually consumed it — its old `acceptIdentKeyword` call only matched `TokenIdent`, never the `KwIf`/`KwExists` keyword tokens, so `DROP COLUMN IF EXISTS` was a syntax error; the slice-1 comment at `ddl.go:9701` already documented this trap). `execAlterDropColumn` (`operators_ddl.go:21278`) and `execAlterTableDropConstraint` (`:10011`) emit PG's NOTICE and `return nil` when the object is missing: `column %q of relation %q does not exist, skipping` / `constraint %q of relation %q does not exist, skipping` — byte-exact (ATExecDropColumn tablecmds.c:9326-9328; ATExecDropConstraint :14060-14062). The drop-constraint skip fires only at the `pkIdx == nil` fall-through (after all five kinds miss), never at a single-kind miss, so a real constraint of another kind is not falsely skipped. Closes the `drop column if exists non_existing` + `drop constraint IF EXISTS anothertab_chk` divergence lines (8 → 0). Remaining C2 sub-gaps: RENAME `<col>` TO bare, ANALYZE tab(col), NOT VALID, STORAGE, OF/NOT OF, SET WITHOUT OIDS, ENFORCED dup.
 - [ ] **M0134-0003 — arrays.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
 - [ ] **M0134-0004 — cluster.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
 - [ ] **M0134-0005 — constraints.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
