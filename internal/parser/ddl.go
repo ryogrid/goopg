@@ -9627,6 +9627,20 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 			return AlterTableAction{pos: pos, Kind: AlterTableNoOp}, nil
 		}
 		_ = p.acceptKeyword(KwColumn)
+		// Optional `IF NOT EXISTS` (gram.y opt_if_not_exists:
+		// IF_P NOT EXISTS). Match it with acceptKeyword — NOT acceptIdentKeyword,
+		// which only matches TokenIdent and would silently drop the KwIf keyword
+		// (same trap as the DROP COLUMN arm at ddl.go:9096). Mirrors the CREATE
+		// TABLE IF NOT EXISTS pattern in parseCreateTableTail. M0134-0002 C2.
+		if p.acceptKeyword(KwIf) {
+			if !p.acceptKeyword(KwNot) {
+				return AlterTableAction{}, p.errAtCur("expected NOT after IF")
+			}
+			if _, err := p.expectKeyword(KwExists); err != nil {
+				return AlterTableAction{}, err
+			}
+			act.IfExists = true
+		}
 		col, err := p.parseColumnDef()
 		if err != nil {
 			return AlterTableAction{}, err

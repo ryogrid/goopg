@@ -9251,6 +9251,18 @@ func (o *ddlOp) execAlterTableAddColumn(stmt *parser.AlterTableStmt, tbl *catalo
 		return &ExecError{Code: "42701", Pos: 0,
 			Message: fmt.Sprintf("column name %q conflicts with a system column name", col.Name)}
 	}
+	// M0134-0002 C2: `ADD COLUMN IF NOT EXISTS` on an existing column emits
+	// PG's NOTICE and skips instead of raising 42701. Mirrors
+	// check_for_column_name_collision's if_not_exists branch
+	// (postgres/src/backend/commands/tablecmds.c:7677-7684): the system-column
+	// collision check above still errors first (attnum <= 0 test), exactly as
+	// PG does even with if_not_exists set.
+	if act.IfExists {
+		if _, exists := o.ctx.Catalog.LookupColumn(tbl, col.Name); exists {
+			o.ctx.AddNotice(fmt.Sprintf("column %q of relation %q already exists, skipping", col.Name, tbl.Name))
+			return nil
+		}
+	}
 	if col.NotNull {
 		rel := o.ctx.Catalog.RelFileNode(tbl)
 		n, err := o.ctx.Pool.NBlocks(rel)

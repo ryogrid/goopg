@@ -128,6 +128,48 @@ func TestParseAlterTableAddColumn(t *testing.T) {
 	}
 }
 
+// TestParseAlterTableAddColumnIfNotExists covers `ADD COLUMN [IF NOT EXISTS]
+// coldef` (M0134-0002 C2). The IF NOT EXISTS form must set IfExists=true so the
+// executor emits PG's "already exists, skipping" NOTICE instead of 42701; the
+// WITHOUT-clause form must leave IfExists=false.
+func TestParseAlterTableAddColumnIfNotExists(t *testing.T) {
+	cases := []struct {
+		sql        string
+		wantName   string
+		wantExists bool
+		wantN      int
+	}{
+		{"ALTER TABLE t ADD COLUMN IF NOT EXISTS c integer", "c", true, 1},
+		{"ALTER TABLE t ADD IF NOT EXISTS c integer", "c", true, 1}, // opt_column omitted
+		{"ALTER TABLE t ADD COLUMN c integer", "c", false, 1},
+		{"ALTER TABLE t ADD COLUMN IF NOT EXISTS c2 integer, ADD COLUMN IF NOT EXISTS c3 integer", "c2", true, 2},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T", tc.sql, stmts[0])
+		}
+		if len(at.Actions) != tc.wantN {
+			t.Fatalf("Parse(%q): actions=%+v want %d", tc.sql, at.Actions, tc.wantN)
+		}
+		for i, act := range at.Actions {
+			if act.Kind != AlterTableAddColumn {
+				t.Errorf("Parse(%q): actions[%d].Kind=%v want AlterTableAddColumn", tc.sql, i, act.Kind)
+			}
+		}
+		if at.Actions[0].Column.Name != tc.wantName {
+			t.Errorf("Parse(%q): Column.Name=%q want %q", tc.sql, at.Actions[0].Column.Name, tc.wantName)
+		}
+		if at.Actions[0].IfExists != tc.wantExists {
+			t.Errorf("Parse(%q): IfExists=%v want %v", tc.sql, at.Actions[0].IfExists, tc.wantExists)
+		}
+	}
+}
+
 // TestParseAlterTableSyntaxErrors pins SyntaxError for canonical
 // missing-piece cases.
 func TestParseAlterTableSyntaxErrors(t *testing.T) {

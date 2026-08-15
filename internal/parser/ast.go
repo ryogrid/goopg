@@ -3287,6 +3287,12 @@ type AlterTableAction struct {
 	// NoInherit is set for AlterTableAddNotNull when the constraint carries a
 	// `NO INHERIT` trailer (contype='n', connoinherit='t'). DU-002 slice 271.
 	NoInherit bool
+	// IfExists is set for `ADD COLUMN IF NOT EXISTS ...` (gram.y opt_if_not_exists,
+	// postgres/src/backend/parser/gram.y:6661). When the column already exists,
+	// PG emits NOTICE `column "c" of relation "r" already exists, skipping` and
+	// skips instead of raising 42701 (check_for_column_name_collision,
+	// postgres/src/backend/commands/tablecmds.c:7677-7684). M0134-0002 C2.
+	IfExists bool
 	// ChildIndexName is populated for AlterIndexAttachPartition and holds
 	// the name of the child index to attach. M0097-0023.
 	ChildIndexName string
