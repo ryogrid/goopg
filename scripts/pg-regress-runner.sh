@@ -223,6 +223,17 @@ if [[ "$RUN_SETUP" -eq 1 ]]; then
     # and test_setup.sql has no \setenv. Best-effort: the C-language regresslib
     # CREATE FUNCTIONs cannot load in goopg, so tolerate their failures.
     "${PSQL[@]}" -f "${REGRESS_SQL}/test_setup.sql" >/dev/null 2>&1 || true
+    echo "pg-regress-runner: running create_index.sql (btree indexes for aggregates.sql)..."
+    # create_index.sql creates the btree indexes (tenk1_unique1/unique2/
+    # hundred/thous_tenthous, tenk2_unique1/unique2, onek_*) that the S6
+    # min/max rewrite needs so aggregates.sql's min/max blocks plan as
+    # Index Only Scan [Backward] instead of falling back to Seq Scan
+    # (postgres/src/test/regress/sql/create_index.sql:24-34). Upstream runs it
+    # as a first-group prerequisite before aggregates
+    # (postgres/src/test/regress/parallel_schedule). Best-effort like the
+    # siblings: the btree CREATE INDEXes at create_index.sql:12-34 come first,
+    # so an early timeout 300 still leaves tenk1/tenk2/onek indexed.
+    timeout 300 "${PSQL[@]}" -f "${REGRESS_SQL}/create_index.sql" >/dev/null 2>&1 || true
     echo "pg-regress-runner: running create_aggregate.sql (user-defined aggregates for aggregates.sql)..."
     # create_aggregate.sql defines the user-defined aggregates that
     # aggregates.sql references (newavg/newsum/newcnt/oldcnt/aggfstr/aggfns/
