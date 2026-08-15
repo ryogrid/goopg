@@ -835,6 +835,39 @@ duplicate-expression), ported in `internal/planner/pathkeys.go`
 deliberately narrower than `isConstantExpr`: `random()` must survive to the
 greedy's volatility check instead of being dropped as "row-constant".
 
+## S8 Slice 2b landed (enable_hashagg bridge, 0134-0001-s8-s2b)
+
+`enable_hashagg` was already registered as a GUC (`internal/config/defaults.go:1035`)
+but had no effect. This slice reproduces the cost-model *outcome* of
+`SET enable_hashagg = off` directly (goopg has no cost model to disable the
+AGG_HASHED arm as `cost_agg` does — `postgres/src/backend/optimizer/path/costsize.c:2755-2756`).
+
+`applyEnableHashAggRule` (`internal/planner/groupagg_hashagg.go`, new) mirrors the
+Slice 2a bridge one-to-one: `hashAggEnabled atomic.Bool` (init true) +
+`SetHashAggEnabled` test toggle, an `enable_hashagg` OnChange bridge in
+`cmd/goopg/main.go` next to `enable_presorted_aggregate`, and a call in
+`planner.go:1290` immediately after `applyPresortedAggregateRule`. When the GUC is
+off, a plain grouped aggregate (still `AggStrategyHashed`, no grouping sets,
+`len(GroupExprs) > 0`, `Mode == AggModeSimple`) is wrapped in an ascending `Sort`
+(one key per `GroupExprs`) and switched to `AggStrategySorted` — the
+`aggregates.out:3457` shape (`GroupAggregate` → `Sort` → `Seq Scan`).
+
+The five gate conditions mirror the executor's `openSorted` routing gate exactly
+(`operators_join_agg.go:1979-1980`), so the `GroupAggregate` EXPLAIN label never
+lies about the execution path. Correctness of the sort placement is traceable:
+the rule runs before Gather insertion (`applyParallelPostPass`), and `drivingScan`
+(`parallel.go:344-369`) does not descend through a `*Sort`, so a wrapped child can
+never be split into Partial/Final — it is either a full serial `Sort` or a parallel
+`Gather Merge → Sort` whose per-worker sort + identical-key merge deliver a globally
+group-key-sorted stream to `openSorted`.
+
+Residual divergences (recorded in the deferral ledger): Rule 3 (index-ordered
+input — skip the redundant `Sort` and reorder `GroupExprs`, the `btg`/
+`group_agg_pk`/`agg_sort_order` shapes) is still unimplemented, and
+`enable_seqscan = off` is not honored; a parallel-eligible table adds a
+`Gather Merge` layer PG suppresses by cost (correctness-safe, EXPLAIN-shape only);
+and a redundant-outer-parens rendering gap (`(g % 10000)` vs `((g % 10000))`).
+
 ## Cross-case relevance
 
 Every M0134 regress case whose `.sql` emits `EXPLAIN` inherits the formatter

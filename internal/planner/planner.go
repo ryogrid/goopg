@@ -1279,6 +1279,15 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		// child-output coordinate space. Gated on enable_presorted_aggregate
 		// (default on); the gate is read inside the rule.
 		applyPresortedAggregateRule(agg.node)
+		// S8 Slice 2b (0134-0001 P2) enable_hashagg bridge: with
+		// `SET enable_hashagg = off`, reproduce PG's cost-model outcome
+		// (costsize.c:2755-2756 — the AGG_HASHED arm is disabled, so the sorted
+		// path wins) by forcing a plain grouped aggregate to AggStrategySorted
+		// over an ascending Sort on the group keys. Runs AFTER the presorted
+		// rule so a query that already gained a Sorted strategy (internal ORDER
+		// BY / DISTINCT) is never double-wrapped; the gate is read inside the
+		// rule.
+		applyEnableHashAggRule(agg.node)
 	} else if s.Having != nil {
 		return nil, &PlanError{
 			Pos:     s.Having.Pos(),

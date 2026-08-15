@@ -410,6 +410,14 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	registry.OnChange("enable_presorted_aggregate", func(value string) {
 		planner.SetPresortedAggEnabled(value == "on" || value == "true" || value == "1")
 	})
+	// S8 Slice 2b: same bridge for `SET enable_hashagg` — when off, the
+	// hashed-aggregate strategy is disabled at cost time in PG
+	// (costsize.c:2755-2756 cost_agg), so the sorted path wins. goopg has no
+	// cost model, so the bridge gates the direct sorted-strategy rule
+	// (applyEnableHashAggRule) instead.
+	registry.OnChange("enable_hashagg", func(value string) {
+		planner.SetHashAggEnabled(value == "on" || value == "true" || value == "1")
+	})
 	if *confPath != "" {
 		entries, err := config.ParseConfigFile(*confPath)
 		if err != nil {
