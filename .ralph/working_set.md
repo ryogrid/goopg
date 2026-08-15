@@ -1,50 +1,55 @@
-# Working set — M0134-0002 alter_table.sql (C5 btree-inet LANDED)
+# Working set — M0134-0002 alter_table.sql (C2 grammar cluster, first slice landed)
 
-**Task:** M0134-0002 alter_table.sql regress-sql digestion. This loop landed **C5**
-— accept inet/cidr btree keys. The rejection was a hardcoded Go allow-list, not an
-opclass lookup: the full btree/inet_ops catalog stack was already seeded.
-`isSupportedBTreeKeyType` now accepts `"inet"`/`"cidr"`, plus a new order-preserving
-encoder/decoder arm `encodeInetBTreeKey`/`decodeInetBTreeKey` (fixed-width
-`[family][masked-network-addr][bits][full-addr]` key reproducing PG
-`network_cmp_internal` byte-wise). cidr shares inet_ops via binary coercion; the
-expression-key gate routes through the same allow-list.
+**Task:** M0134-0002 alter_table.sql regress-sql digestion. This loop landed the
+**C2 first slice — `ADD COLUMN IF NOT EXISTS`** (commit `8afe5bf7`). C2 is the
+"ALTER-TABLE grammar cluster", the largest remaining class (~60 of 88 syntax-error
+lines). A researcher decomposition split it into 14 sub-gaps (11 doc-listed + 3
+new: ADD COLUMN IF NOT EXISTS, DROP CONSTRAINT IF EXISTS, ALTER TABLE OF/NOT OF).
 
-**Status:** COMPLETE + committed (code `df3ee98b`, bookkeeping `df3be9a4`,
-state-guard `9ec00e12`).
+**Status:** C2 slice 1 COMPLETE + committed (code `8afe5bf7`, bookkeeping
+`1e1013d9`). C2 as a whole remains OPEN (13 sub-gaps left).
 
-**Findings:** diff 4664→4645 (−19), `got "inet"` 1→0. The C5 PKTABLE block
-(alter_table.sql:512-513) no longer emits the btree rejection; hunk count unchanged
-(84 — the block shares a hunk with the out-of-scope C4 FKTABLE lines). PG oracle:
-`network.c:402-420` network_cmp_internal + `inet_net_pton.c` classful cidr mask
-(note PG's quirky class-D `/8`→`/4` only for first==224, faithfully ported).
+**Findings:** parser `parseAlterTableAction` ADD COLUMN arm now consumes
+`IF NOT EXISTS` via `acceptKeyword(KwIf)` (NOT `acceptIdentKeyword`, which
+silently drops KwIf) + `AlterTableAction.IfExists` flag (field is in `ast.go`,
+not ddl.go). `execAlterTableAddColumn` (`operators_ddl.go:9244`) emits PG's
+NOTICE `column "c" of relation "r" already exists, skipping` via `ctx.AddNotice`
+and skips. Diff 4645→4602, `expected identifier (got not)` 8→0 (syntax-error
+total 88→80); NOTICE byte-exact. Deferral row appended: `ctx.AddNotice` carries
+no SQLSTATE (PG attaches 42701) + non-IF-NOT-EXISTS 42701 message-text gap
+(classes C13/C12).
 
-**Files:** `internal/executor/operators_ddl.go` (+`encodeInetBTreeKey`,
-`parseInetKeyText`, `parseInetV4Octets`, `cidrDefaultV4Mask`, `maskInetAddr`,
-`isInetType`/`isCidrType`, allow-list entry); `internal/executor/btree_scalar_keys.go`
-(+`decodeInetBTreeKey`, `formatInetKeyText`); new
-`operators_ddl_inet_btree_test.go` (5 tests incl. 32-literal corpus);
-`docs/design/0134-0002-alter-table-sql-divergence.md` (C5 row → LANDED);
-`.ralph/deferral_ledger.md` (new row); `.ralph/fix_plan.md` (C5 progress note).
+**Files:** `internal/parser/ast.go` (+IfExists), `internal/parser/ddl.go`
+(+IF NOT EXISTS consumption), `internal/parser/alter_test.go`
+(+TestParseAlterTableAddColumnIfNotExists), `internal/executor/operators_ddl.go`
+(+skip-NOTICE), new `internal/executor/alter_table_add_column_if_not_exists_test.go`;
+`docs/design/0134-0002-alter-table-sql-divergence.md` (C2 decomposition note);
+`.ralph/deferral_ledger.md` (new row); `.ralph/fix_plan.md` (C2 progress note).
 
-**Key symbols:** `encodeInetBTreeKey`/`decodeInetBTreeKey`, `parseInetKeyText`,
-`isInetType`/`isCidrType` (operators_ddl.go), `isSupportedBTreeKeyType`,
-`decodeScalarBTreeKey` (btree_scalar_keys.go).
+**Key symbols:** `parseAlterTableAction` (ddl.go), `AlterTableAction.IfExists`
+(ast.go), `execAlterTableAddColumn` (operators_ddl.go), `ctx.AddNotice`,
+`Catalog.LookupColumn`.
 
-**Deferral (recorded):** network_* comparison-operator Go bodies still missing —
-btree scans work (byte-wise key compare) but predicate eval `WHERE inet_col = '...'`
-+ FK checks on inet/cidr still fail (class C4); no inet binary codec. Ledger row
-appended (resume: `network.c` network_cmp/network_lt/…).
+**Remaining C2 sub-gaps (ranked by error-site count ÷ risk):** NO INHERIT trailer
+(7), TYPE…USING (11, C10-entangled), RENAME CONSTRAINT (11, C7-partial), comma
+multi-action (7, structural), RENAME `<col>` TO bare (3), ANALYZE tab(col) (4,
+re-route — ANALYZE/VACUUM statement gap), NOT VALID (2), STORAGE (2), OF/NOT OF
+(3), DROP COLUMN IF EXISTS (1, one-line), DROP CONSTRAINT IF EXISTS (1), SET
+WITHOUT OIDS (1), ENFORCED dup (1, C9-masked).
 
-**Next step:** C2 (ALTER-TABLE grammar cluster — largest remaining class) needs a
-researcher decomposition pass before implementing; then C3/C4/C9/C10/C11
-correctness, C6 catalog, C7/C12/C13/C14 formatter.
+**Next step:** implement C2 slice 2 = **NO INHERIT trailer** (7 sites, additive
+parser trailer at the ALTER ADD CHECK arm `ddl.go:9495-9522` + executor
+`AddCheckFull(..., false /*noInherit*/, ...)` pass `act.NoInherit`; partitioned
+error message after). Researcher report
+`tmp/ralph-handoffs/0134-0002-c2-grammar-research/report.md` §5 has the full row.
 
-**Gates run (this loop):** `go test ./internal/executor/ -p 4` PASS (5 new tests);
-`go test ./internal/catalog/ ./internal/planner/` PASS; `go build ./...` clean;
-`scripts/pg-regress-runner.sh alter_table` diff 4664→4645; pre-commit pgbench smoke
-PASS (×3); `make ralph-state-guard` OK (repaired progress.json → in_progress).
+**Gates run (this loop):** `go build ./...` PASS; `go test ./internal/parser/ -p 4`
+PASS; `go test ./internal/executor/ -p 4` PASS; `scripts/pg-regress-runner.sh
+alter_table` diff 4645→4602 (8 sites gone); pre-commit pgbench smoke PASS (×2);
+`make ralph-state-guard` OK (repaired progress.json → in_progress).
 
-**Delegation:** researcher `0134-0002-c5-btree-inet-research` DONE (verdict A);
-implementer `0134-0002-c5-btree-inet-impl` DONE (PASS).
+**Delegation:** researcher `0134-0002-c2-grammar-research` DONE (14 sub-gaps,
+named ADD COLUMN IF NOT EXISTS first); implementer
+`0134-0002-c2-addcol-ifnotexists-impl` DONE (PASS).
 
 **In-flight:** none.
