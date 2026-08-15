@@ -87,6 +87,30 @@ func TestExprResultTypeResolves(t *testing.T) {
 	}
 }
 
+// TestExprTypeArrayConcat pins the planner exprType OpConcat arm's array
+// result: `||` over array operands is array_cat / array_append /
+// array_prepend and advertises the array side's type, so the wire layer sends
+// a text[] TypeOID (psql \d+ reloptions). Twin of analyzer analyzeExpr's
+// OpConcat arm — both must detect arrays the same way and return the same
+// result type. M0134-0002 C1.
+func TestExprTypeArrayConcat(t *testing.T) {
+	for _, tc := range []struct {
+		sql  string
+		want string
+	}{
+		{"'{a,b}'::text[] || '{c,d}'::text[]", "text[]"}, // array_cat
+		{"'{a,b}'::text[] || 'c'::text", "text[]"},       // array_append
+		{"'c'::text || '{a,b}'::text[]", "text[]"},       // array_prepend
+	} {
+		t.Run(tc.sql, func(t *testing.T) {
+			got := exprType(resolveForTest(t, tc.sql))
+			if got.Name != tc.want {
+				t.Errorf("exprType(%q) = %q, want %q", tc.sql, got.Name, tc.want)
+			}
+		})
+	}
+}
+
 // TestExprResultTypeDeclinesUnknown is the half that protects callers: a key
 // decoder handed a confidently wrong type misreads key bytes, so anything not
 // resolvable through the seed must come back ok=false instead of defaulting to

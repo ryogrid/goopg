@@ -1432,6 +1432,22 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			}
 			return rightTyp, nil
 		case parser.OpConcat:
+			// Array operands: `||` over arrays is array_cat / array_append /
+			// array_prepend (PG pg_operator OIDs 375/349/374), NOT the string
+			// concat operator. Both array spellings exist: pg_class.reloptions
+			// is catalog.Type{Name:"text[]"} while a user array COLUMN is
+			// catalog.Type{Name:"text",IsArray:true}. Return the array side's
+			// type so the executor merges; psql \d+'s
+			// `c.reloptions || array(select …)` needs this. M0134-0002 C1.
+			// Upstream: postgres/src/backend/utils/adt/arrayfuncs.c
+			// (array_cat / array_append / array_prepend).
+			isArr := func(t catalog.Type) bool { return t.IsArray || strings.HasSuffix(t.Name, "[]") }
+			if isArr(leftTyp) {
+				return leftTyp, nil
+			}
+			if isArr(rightTyp) {
+				return rightTyp, nil
+			}
 			// Require at least one string-like (or unknown) operand.
 			// When one side is non-string but the other is string-like,
 			// PostgreSQL implicitly casts the non-string side to text

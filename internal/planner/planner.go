@@ -11525,12 +11525,24 @@ func exprType(e Expr) catalog.Type {
 			}
 			return catalog.Type{Name: "unknown"}
 		case parser.OpConcat:
+			lt := exprType(x.Left)
+			rt := exprType(x.Right)
+			// Array operands: `||` over arrays is array_cat / array_append /
+			// array_prepend and the result keeps the array side's type, so the
+			// wire layer advertises a text[] TypeOID (psql \d+ reloptions).
+			// Twin of analyzer analyzeExpr's OpConcat arm — both must detect
+			// arrays the same way and return the same result type. M0134-0002 C1.
+			if lt.IsArray || strings.HasSuffix(lt.Name, "[]") {
+				return lt
+			}
+			if rt.IsArray || strings.HasSuffix(rt.Name, "[]") {
+				return rt
+			}
 			// byteacat: bytea || bytea is bytea. The executor's OpConcat arm
 			// returns a KindBytes datum for that shape, so advertising text
 			// here would make the wire layer print the raw payload instead of
 			// the `\x…` hex form. M0125-0021.
-			if strings.EqualFold(exprType(x.Left).Name, "bytea") ||
-				strings.EqualFold(exprType(x.Right).Name, "bytea") {
+			if strings.EqualFold(lt.Name, "bytea") || strings.EqualFold(rt.Name, "bytea") {
 				return catalog.Type{Name: "bytea"}
 			}
 			return catalog.Type{Name: "text"}

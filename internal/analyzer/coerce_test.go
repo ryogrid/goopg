@@ -1,6 +1,7 @@
 package analyzer
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -216,6 +217,54 @@ func TestStringConcatMixedTypes(t *testing.T) {
 			t.Errorf("string concat %q: unexpected error: %v", sql, err)
 		}
 	}
+}
+
+// TestConcatArrayOperands verifies that `||` over array operands binds at
+// analysis time — array_cat / array_append / array_prepend (PG pg_operator
+// OIDs 375/349/374) — returning the array side's type instead of raising
+// 42883 "operator does not exist: text[] || text[]". The gate is psql \d+'s
+// reloptions query `c.reloptions || array(select …)` (describe.c
+// describeOneTableDetails). Both array catalog spellings are covered: the
+// name-suffixed `text[]` and the IsArray-flag user-column form. M0134-0002 C1.
+func TestConcatArrayOperands(t *testing.T) {
+	cat := newTestCatalog(t, "t", []catalog.Column{
+		{Name: "a", Type: catalog.Type{Name: "text", IsArray: true}}, // user array column
+		{Name: "b", Type: catalog.Type{Name: "text"}},
+		{Name: "c", Type: catalog.Type{Name: "text[]"}}, // name-suffixed spelling
+		{Name: "i", Type: catalog.Type{Name: "int4"}},
+	})
+	cases := []struct {
+		name     string
+		sql      string
+		wantName string // exact result type name when non-empty
+	}{
+		{"array cat constructor", "SELECT ARRAY['a','b'] || ARRAY['c','d'] FROM t", "text[]"},
+		{"array cat suffixed columns", "SELECT c || c FROM t", "text[]"},
+		{"array append", "SELECT a || b FROM t", ""},
+		{"array prepend", "SELECT b || a FROM t", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sel := parseOne(t, tc.sql).(*parser.SelectStmt)
+			rels, err := buildSelectScope(sel, cat)
+			if err != nil {
+				t.Fatalf("buildSelectScope(%q): %v", tc.sql, err)
+			}
+			typ, err := analyzeExpr(sel.Targets[0].Expr, &scope{rels: rels, cat: cat})
+			if err != nil {
+				t.Fatalf("analyzeExpr(%q): %v", tc.sql, err)
+			}
+			if !typ.IsArray && !strings.HasSuffix(typ.Name, "[]") {
+				t.Errorf("analyzeExpr(%q) = type %+v, want an array type", tc.sql, typ)
+			}
+			if tc.wantName != "" && typ.Name != tc.wantName {
+				t.Errorf("analyzeExpr(%q) = type name %q, want %q", tc.sql, typ.Name, tc.wantName)
+			}
+		})
+	}
+	// The array branch must not over-broaden: non-array, non-string operands
+	// (int4 || int4) still raise 42883, not text.
+	expectAnalyzeCode(t, cat, "SELECT i || i FROM t", "42883")
 }
 
 // TestSerialPseudotypeIntegerTypeCheck verifies that SERIAL / BIGSERIAL /
