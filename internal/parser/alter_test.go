@@ -240,6 +240,54 @@ func TestParseAlterTableDropConstraint(t *testing.T) {
 	}
 }
 
+// TestParseAlterTableDropIfExists covers `DROP COLUMN [IF EXISTS] c` and
+// `DROP CONSTRAINT [IF EXISTS] c` (M0134-0002 C2 slice 7). The IF EXISTS form
+// must set IfExists=true so the executor emits PG's "does not exist, skipping"
+// NOTICE instead of 42703/42704; the bare form must leave IfExists=false.
+func TestParseAlterTableDropIfExists(t *testing.T) {
+	cases := []struct {
+		sql        string
+		wantKind   AlterTableActionKind
+		wantName   string
+		wantExists bool
+	}{
+		{"ALTER TABLE t DROP COLUMN IF EXISTS c", AlterTableDropColumn, "c", true},
+		{"ALTER TABLE t DROP COLUMN c", AlterTableDropColumn, "c", false},
+		{"ALTER TABLE t DROP CONSTRAINT IF EXISTS c", AlterTableDropConstraint, "c", true},
+		{"ALTER TABLE t DROP CONSTRAINT c", AlterTableDropConstraint, "c", false},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T", tc.sql, stmts[0])
+		}
+		if len(at.Actions) != 1 {
+			t.Fatalf("Parse(%q): actions=%+v want 1", tc.sql, at.Actions)
+		}
+		act := at.Actions[0]
+		if act.Kind != tc.wantKind {
+			t.Errorf("Parse(%q): Kind=%v want %v", tc.sql, act.Kind, tc.wantKind)
+		}
+		switch tc.wantKind {
+		case AlterTableDropColumn:
+			if act.ColumnName != tc.wantName {
+				t.Errorf("Parse(%q): ColumnName=%q want %q", tc.sql, act.ColumnName, tc.wantName)
+			}
+		case AlterTableDropConstraint:
+			if act.ConstraintName != tc.wantName {
+				t.Errorf("Parse(%q): ConstraintName=%q want %q", tc.sql, act.ConstraintName, tc.wantName)
+			}
+		}
+		if act.IfExists != tc.wantExists {
+			t.Errorf("Parse(%q): IfExists=%v want %v", tc.sql, act.IfExists, tc.wantExists)
+		}
+	}
+}
+
 // TestParseAlterTableSetCompression covers `ALTER TABLE ... ALTER COLUMN c SET
 // COMPRESSION <method>` (DU-002 slice 183). The method normalizes to pglz/lz4;
 // `default` (and any unknown token) normalizes to "" so no SET COMPRESSION is

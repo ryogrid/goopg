@@ -10098,7 +10098,17 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 			break
 		}
 	}
+	// M0134-0002 C2: `DROP CONSTRAINT IF EXISTS` on a missing constraint emits
+	// PG's NOTICE and skips instead of raising 42704 — but only at this
+	// fall-through after all five kinds (NamedChecks/FKs/UNIQUE/EXCLUDE/PK)
+	// missed. Mirrors ATExecDropConstraint's if_exists branch
+	// (postgres/src/backend/commands/tablecmds.c:14060-14062). A real constraint
+	// of any kind is handled above and must never be skipped.
 	if pkIdx == nil {
+		if act.IfExists {
+			o.ctx.AddNotice(fmt.Sprintf("constraint %q of relation %q does not exist, skipping", act.ConstraintName, tbl.Name))
+			return nil
+		}
 		return &ExecError{
 			Code:    "42704",
 			Pos:     act.Pos(),
@@ -21273,6 +21283,13 @@ func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAct
 			dropIdx = i
 			break
 		}
+	}
+	// M0134-0002 C2: `DROP COLUMN IF EXISTS` on a missing column emits PG's
+	// NOTICE and skips instead of raising 42703. Mirrors ATExecDropColumn's
+	// if_exists branch (postgres/src/backend/commands/tablecmds.c:9326-9328).
+	if act.IfExists && dropIdx < 0 {
+		o.ctx.AddNotice(fmt.Sprintf("column %q of relation %q does not exist, skipping", act.ColumnName, tbl.Name))
+		return nil
 	}
 	if dropIdx < 0 {
 		return &ExecError{Code: "42703", Pos: act.Pos(), Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}

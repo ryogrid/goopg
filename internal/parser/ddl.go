@@ -9299,6 +9299,17 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 	// work correctly. M0097-0028.
 	if p.acceptKeyword(KwDrop) {
 		if p.acceptKeyword(KwConstraint) {
+			// DROP CONSTRAINT [IF EXISTS] name (gram.y opt_if_exists:
+			// IF_P EXISTS). Match with acceptKeyword — NOT acceptIdentKeyword,
+			// which only matches TokenIdent and would silently drop the
+			// KwIf/KwExists keyword tokens. M0134-0002 C2.
+			ifExists := false
+			if p.acceptKeyword(KwIf) {
+				if !p.acceptKeyword(KwExists) {
+					return AlterTableAction{}, p.errAtCur("expected EXISTS after IF")
+				}
+				ifExists = true
+			}
 			nameTok, err := p.parseIdent()
 			if err != nil {
 				return AlterTableAction{}, err
@@ -9314,11 +9325,22 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 				Kind:           AlterTableDropConstraint,
 				ConstraintName: identText(nameTok),
 				Restrict:       restrict,
+				IfExists:       ifExists,
 			}, nil
 		}
 		// DROP COLUMN [IF EXISTS] col_name [RESTRICT|CASCADE]
 		_ = p.acceptKeyword(KwColumn)
-		_ = p.acceptIdentKeyword("if") && p.acceptIdentKeyword("exists")
+		// Optional `IF EXISTS` (gram.y opt_if_exists: IF_P EXISTS). Match it
+		// with acceptKeyword — NOT acceptIdentKeyword, which only matches
+		// TokenIdent and would silently drop the KwIf/KwExists keyword tokens
+		// (same trap the ADD COLUMN arm documents at ddl.go:9701). M0134-0002 C2.
+		ifExists := false
+		if p.acceptKeyword(KwIf) {
+			if !p.acceptKeyword(KwExists) {
+				return AlterTableAction{}, p.errAtCur("expected EXISTS after IF")
+			}
+			ifExists = true
+		}
 		colTok := p.cur()
 		if colTok.Kind == TokenIdent || colTok.Kind == TokenQuotedIdent {
 			p.advance()
@@ -9327,6 +9349,7 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 				pos:        colTok.Pos,
 				Kind:       AlterTableDropColumn,
 				ColumnName: identText(colTok),
+				IfExists:   ifExists,
 			}, nil
 		}
 		return AlterTableAction{}, p.errAtCur("expected column or constraint name after DROP")
