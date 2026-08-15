@@ -165,11 +165,10 @@ func validatePartitionKey(s *parser.CreateTableStmt, cols []catalog.Column, ctx 
 		colsByName[strings.ToLower(c.Name)] = c
 	}
 
-	systemCols := map[string]bool{
-		"tableoid": true, "xmin": true, "cmin": true,
-		"xmax": true, "cmax": true, "ctid": true,
-	}
-
+	// System-column name set: single source of truth is isSystemColumn in
+	// operators_ddl.go (M0134-0002 C8). The partition-key check case-folds
+	// first (the parser has already folded unquoted identifiers; `lower` keeps
+	// the pre-existing behavior for quoted mixed-case names unchanged).
 	for i := 0; i < nKeyCols; i++ {
 		colName := pb.KeyCols[i]
 		opClass := ""
@@ -201,7 +200,7 @@ func validatePartitionKey(s *parser.CreateTableStmt, cols []catalog.Column, ctx 
 		}
 
 		// System column check.
-		if systemCols[lower] {
+		if isSystemColumn(lower) {
 			return &ExecError{Code: "42P16", Pos: pos,
 				Message: fmt.Sprintf("cannot use system column %q in partition key", lower)}
 		}

@@ -3106,6 +3106,16 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	}
 	// Validate DEFAULT expressions (no column refs, aggregates, subqueries, SRFs).
 	for _, c := range s.Columns {
+		// M0134-0002 C8: PG rejects a user column whose name collides with a
+		// system column (CheckAttributeNamesTypes, postgres/src/backend/catalog/
+		// heap.c:478-483 — SystemAttributeByName). Exact, case-sensitive; the
+		// parser has already folded unquoted identifiers to lowercase, so only a
+		// genuinely system-named column reaches this branch. Pos 0: the PG
+		// ereport carries no errposition (psql renders no LINE 1).
+		if isSystemColumn(c.Name) {
+			return &ExecError{Code: "42701", Pos: 0,
+				Message: fmt.Sprintf("column name %q conflicts with a system column name", c.Name)}
+		}
 		if strings.EqualFold(c.Type.Name, "unknown") {
 			return &ExecError{Code: "42P16", Pos: s.Pos(),
 				Message: fmt.Sprintf("column %q has pseudo-type unknown", c.Name)}
@@ -4146,6 +4156,19 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 		}
 		cols[i] = catalog.Column{
 			Name: colName, Type: catalog.Type{Name: strings.ToLower(typeName)},
+		}
+	}
+	// M0134-0002 C8: PG validates CTAS column names — both the SELECT's output
+	// names and any column-alias list — through DefineRelation →
+	// heap_create_with_catalog → CheckAttributeNamesTypes (heap.c:478-483),
+	// which rejects a system-column name (createas.c:166-188 builds the
+	// ColumnDefs from tlist + colNames, createas.c:114 → DefineRelation).
+	// So `CREATE TABLE t (xmin) AS SELECT ...` and even `CREATE TABLE t AS
+	// SELECT xmin FROM ...` must both fail with 42701.
+	for _, c := range cols {
+		if isSystemColumn(c.Name) {
+			return &ExecError{Code: "42701", Pos: 0,
+				Message: fmt.Sprintf("column name %q conflicts with a system column name", c.Name)}
 		}
 	}
 	tablespaceOID, err := resolveTablespaceClause(o.ctx, s.Pos(), s.Tablespace)
@@ -8192,12 +8215,14 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				return &ExecError{Code: "42703", Pos: act.Pos(), Message: fmt.Sprintf("column %q does not exist", oldColName)}
 			}
 
-			// Check new name is not a system column name.
-			sysColumns := []string{"ctid", "tableoid", "xmin", "cmin", "xmax", "cmax", "oid"}
-			for _, sc := range sysColumns {
-				if strings.EqualFold(newColName, sc) {
-					return &ExecError{Code: "42P20", Pos: act.Pos(), Message: fmt.Sprintf("column name %q conflicts with a system column name", newColName)}
-				}
+			// Check new name is not a system column name. M0134-0002 C8: PG
+			// rejects via check_for_column_name_collision (tablecmds.c:7670-7674),
+			// SQLSTATE 42701 (not 42P20), using SystemAttributeByName — an exact,
+			// case-sensitive strcmp match (heap.c:248), so "oid" is legal since
+			// PG 12 and quoted "XMIN" is accepted. Pos 0: the PG ereport carries
+			// no errposition.
+			if isSystemColumn(newColName) {
+				return &ExecError{Code: "42701", Pos: 0, Message: fmt.Sprintf("column name %q conflicts with a system column name", newColName)}
 			}
 
 			// Check inheritance children for name conflict.
@@ -9217,6 +9242,14 @@ func (o *ddlOp) execAlterTableResetReloptions(tbl *catalog.Table, act parser.Alt
 
 func (o *ddlOp) execAlterTableAddColumn(stmt *parser.AlterTableStmt, tbl *catalog.Table, act parser.AlterTableAction) error {
 	col := act.Column
+	// M0134-0002 C8: PG rejects ADD COLUMN whose name collides with a system
+	// column (check_for_column_name_collision, postgres/src/backend/commands/
+	// tablecmds.c:7670-7674 — attnum <= 0 test). Exact, case-sensitive. Pos is
+	// left 0: the PG ereport carries no errposition, so psql renders no LINE 1.
+	if isSystemColumn(col.Name) {
+		return &ExecError{Code: "42701", Pos: 0,
+			Message: fmt.Sprintf("column name %q conflicts with a system column name", col.Name)}
+	}
 	if col.NotNull {
 		rel := o.ctx.Catalog.RelFileNode(tbl)
 		n, err := o.ctx.Pool.NBlocks(rel)
@@ -11125,6 +11158,25 @@ func keyExecError(err error, pos int) *ExecError {
 		return ee
 	}
 	return &ExecError{Code: "42804", Pos: pos, Message: err.Error()}
+}
+
+// isSystemColumn reports whether name is one of the six PostgreSQL system
+// column names (ctid, xmin, cmin, xmax, cmax, tableoid). Matching is exact and
+// case-sensitive — PG's SystemAttributeByName compares with strcmp
+// (postgres/src/backend/catalog/heap.c:248) over SysAtt[]
+// (postgres/src/backend/catalog/heap.c:144-228). The caller must pass the
+// parsed identifier as-is: an unquoted name is already lower-cased by the
+// parser, so it matches; a quoted mixed-case name like "XMIN" stays mixed-case
+// and correctly does not match. "oid" is deliberately NOT in the list — it has
+// been an ordinary user column since PG 12. This helper is the single source of
+// truth for the name list; the partition-key check in
+// validatePartitionKey (operators_ddl_partition.go) calls it too.
+func isSystemColumn(name string) bool {
+	switch name {
+	case "ctid", "xmin", "cmin", "xmax", "cmax", "tableoid":
+		return true
+	}
+	return false
 }
 
 // pgDeduplicateColNames replicates PostgreSQL's ChooseIndexColumnNames logic:
