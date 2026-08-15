@@ -1,45 +1,52 @@
-# Working set — M0134-0002 alter_table.sql (C15 `col_description` LANDED)
+# Working set — M0134-0002 alter_table.sql (C8 system-column rejection LANDED)
 
-**Task:** M0134-0002 alter_table.sql regress-sql digestion. This loop landed **C15**
-— the `pg_catalog.col_description(oid,int4)` builtin: a `case "col_description":`
-beside `obj_description` in the executor function-name switch
-(`internal/executor/expr.go` :9840), reading `GetComment(1259, objoid, attnum)`
-(STRICT, NULL on no-match). pg_description catalog + COMMENT ON already existed;
-only dispatch was missing (pg_proc seed OID 1216 pre-present).
+**Task:** M0134-0002 alter_table.sql regress-sql digestion. This loop landed **C8**
+— reject PostgreSQL system-column names for user columns. New case-sensitive
+`isSystemColumn(name)` helper (ctid/xmin/cmin/xmax/cmax/tableoid; NO `oid`, legal
+since PG 12) applied at four entry points: `execCreateTable`, `execCreateTableAs`,
+`execAlterTableAddColumn`, and the RENAME COLUMN arm (`internal/executor/
+operators_ddl.go`); `validatePartitionKey` (`operators_ddl_partition.go`) now reuses
+the one helper. The pre-existing RENAME check was also corrected: SQLSTATE
+42P20→42701, dropped `oid`, case-sensitive (was `strings.EqualFold`).
 
-**Status:** COMPLETE + committed (code `044057b9`, bookkeeping commit follows).
+**Status:** COMPLETE + committed (code `0f6945bc`, bookkeeping `b7bdfb18`,
+state-guard `1d725540`).
 
-**Findings:** C15 was the second (and last) of the two `\d+` describe blockers
-(C1 array `||` + C15 col_description). 12 `col_description does not exist` errors
-→ 0 (519→507 ERROR lines); no new class; diff 4673→4677 lines (+4 — the
-previously-masked describe output now renders, same "advance reveals more" pattern
-as C1). Both `\d+` blockers cleared; the describe pipeline now runs to completion.
+**Findings:** diff 4677→4664 (−13) — the sole C8 statement
+(`ALTER TABLE attmp ADD COLUMN xmin integer;`) now matches PG (42701 + exact
+message, no LINE 1). PG oracle: `tablecmds.c:7673` check_for_column_name_collision
+(ADD/RENAME) + `heap.c:481` CheckAttributeNamesTypes (CREATE/CTAS); SysAtt[]
+`heap.c:144-228`. Pos left 0 — the PG ereport carries no errposition.
 
-**Files:** `internal/executor/expr.go` (+case); new test
-`internal/executor/operators_ddl_col_description_test.go` (returns-comment,
-no-match→NULL objsubid 0/2 + unknown OID, STRICT NULL-arg);
-`docs/design/0134-0002-alter-table-sql-divergence.md` (C15 row → LANDED);
-`.ralph/deferral_ledger.md` row 1390 → `resolved`; `.ralph/fix_plan.md` M0134-0002.
+**Files:** `internal/executor/operators_ddl.go` (+helper, 4 sites, RENAME fix);
+`operators_ddl_partition.go` (reuse helper); new
+`operators_ddl_system_column_test.go` (7 table-driven tests);
+`docs/design/0134-0002-alter-table-sql-divergence.md` (C8 row → LANDED);
+`.ralph/deferral_ledger.md` (new row: DROP/ALTER-on-system-column gap, 0A000);
+`.ralph/fix_plan.md` (M0134-0002 C8 progress note).
 
-**Key symbols:** `evalFuncCall` switch (`expr.go`), `im.GetComment(1259, objOID,
-attnum)` (`catalog.go`), `obj_description` sibling arm (:9815-9838).
+**Key symbols:** `isSystemColumn` (operators_ddl.go ~:11163), `execCreateTable`
+(:3106 loop), `execCreateTableAs` (:4158), `execAlterTableAddColumn` (:9242),
+`execAlterTable` RENAME arm (:8215), `validatePartitionKey` (partition file :168).
 
-**Next step:** C2 — the ALTER-TABLE grammar cluster (largest remaining class:
-`RENAME CONSTRAINT`/`RENAME <col> TO`/`TYPE … USING`/comma multi-action/`NO
-INHERIT`/`NOT VALID`/`DROP COLUMN IF EXISTS`/`SET WITHOUT OIDS`/`STORAGE`/
-`ANALYZE tab(col)`/ENFORCED dup; `internal/parser/ddl.go`
-`parseAlterTableAction`/`parseOneAttrCmd`/`consumeAttrCmdTrailer`). Needs a fresh
-researcher pass to decompose the grammar gaps into per-rule slices before
-implementing. Alternatively pick a smaller correctness class (C5 btree-inet, C8
-system-columns) for a single-loop win.
+**Deferral (recorded):** DROP COLUMN / ALTER COLUMN on a system column still
+diverge — PG raises `cannot drop/alter system column "xmin"` (0A000), goopg says
+`column "xmin" does not exist` (DROP) or silently accepts (ALTER TYPE). Needs a
+system-column model or per-path guards; ledger row appended (resume: tablecmds.c
+ATExecDropColumn:9338 / ATExecAlterColumnType:7777).
 
-**Gates run (this loop):** `go test ./internal/executor/` PASS (3 new tests);
-`go build ./...` clean; `scripts/pg-regress-runner.sh alter_table` — 0
-col_description errors, 507 total ERROR lines (was 519), no new class;
-`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=35); pre-commit pgbench smoke PASS.
+**Next step:** C5 (btree-inet rejected — `btreeKeyTypeRejectionError`) is the next
+single-loop correctness win; needs a researcher pass first to scope whether inet
+comparison ops + btree opclass already exist (opclass registration only) or the
+comparators must be implemented. C2 (ALTER-TABLE grammar cluster) is the largest
+remaining class and needs a researcher decomposition pass before implementing.
 
-**Delegation:** researcher `0134-0002-c15-coldescription-research` DONE (verdict
-builtin-only); implementer `0134-0002-c15-coldescription-impl` DONE; tester
-`0134-0002-c15-coldescription-gates` DONE.
+**Gates run (this loop):** `go test ./internal/executor/` PASS (7 new tests);
+`scripts/pg-regress-runner.sh alter_table` diff 4677→4664; `scripts/tpch-spotcheck.sh`
+PASS (Q12=2/Q13=35); `go build ./...` clean; pre-commit pgbench smoke PASS (×2);
+`make ralph-state-guard` OK (repaired progress.json, then clean).
+
+**Delegation:** researcher `0134-0002-c8-system-columns-research` DONE; implementer
+`0134-0002-c8-system-columns-impl` DONE; tester `0134-0002-s1-tpch` DONE (PASS).
 
 **In-flight:** none.
