@@ -242,11 +242,29 @@ so `int`/`int4` render "integer"). Closes the 2 `got storage` sites
 (diff:2032/2066) → 0. Residuals ledgered: `has_toast_table` (TOAST-modeling,
 `reltoastrelid` hardcoded 0) and the `STORAGE DEFAULT`/invalid-mode grammar forms.
 
+**Tenth slice landed (2026-08-16): `NOT VALID`** — two sites, both byte-matching
+PG. (a) CREATE TABLE table-level CHECK: both arms (`parseTableConstraintElement`
+anonymous + the `CONSTRAINT name CHECK` twin) consume-and-drop a trailing
+`NOT VALID` after `NO INHERIT` — PG auto-validates NOT VALID at CREATE TABLE
+(`transformCheckConstraints` parse_utilcmd.c:2946 sets `skip_validation=true`,
+`initially_valid=is_enforced`, `heap.c:2584-2587` writes `convalidated` from
+`initially_valid`), so a fresh empty table's CHECK is created validated (no
+`convalidated='f'`). (b) ALTER ADD [CONSTRAINT] NOT NULL: the arm consumes
+`NOT VALID` order-independently (before OR after `NO INHERIT`, per gram.y
+`ConstraintAttributeSpec` gram.y:6213-6252) onto the existing
+`AlterTableAction.NotValid`, threaded through a new `notValid` param on
+`AddNotNull` onto `NamedNotNullConstraint.NotValid`, written to pg_constraint
+contype='n' convalidated `row[6]='f'`, and flipped back to 't' by a new
+`NotNullConstraints` name-match loop in the VALIDATE CONSTRAINT arm (PG excludes
+CONSTR_NOTNULL from the Phase-3 pre-scan, tablecmds.c:9956 — the flip is the whole
+behavior). Closes `nv_parent` (diff:534) + `atnnparted` (diff:1075) → 0; `\d+`
+renders `"dummy_constr" NOT NULL "id" NOT VALID`, then without the suffix after
+VALIDATE. Residual ledgered: order-dependent CREATE TABLE trailer loop (a bare
+`CHECK (...) NOT VALID` still fails).
+
 Remaining C2 sub-gaps, ranked by error-site count ÷ risk: ANALYZE tab(col) (4,
 re-route — it is an ANALYZE/VACUUM statement gap, not ALTER TABLE), OF/NOT OF (3),
-NOT VALID trailer (2 — splits into a trivial parser-only CREATE TABLE consume-and-drop
-site + a parser/executor/catalog ALTER ADD NOT NULL bundle), SET WITHOUT OIDS (1),
-ENFORCED dup (1, C9-masked).
+SET WITHOUT OIDS (1), ENFORCED dup (1, C9-masked).
 
 ## Secondary finding (corrects deferral-ledger row 1385)
 

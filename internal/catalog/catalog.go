@@ -242,6 +242,7 @@ type NamedNotNullConstraint struct {
 	ColName   string // column this constraint applies to
 	OID       uint32 // synthetic OID for pg_constraint virtual table
 	NoInherit bool   // PG18: NOT NULL NO INHERIT
+	NotValid  bool   // convalidated='f': added NOT VALID, not yet VALIDATE'd
 	IsLocal   bool   // conislocal: true if locally declared
 	InhCount  int    // coninhcount: how many parents (plain-INHERITS or partition) enforce this NOT NULL
 }
@@ -250,9 +251,9 @@ type NamedNotNullConstraint struct {
 // isLocal=true means the constraint is locally declared (attislocal or explicitly
 // re-declared); inhCount counts enforcing parents — 0 for a purely local
 // constraint, 1 for one inheriting/partition parent that also enforces it.
-func (t *Table) AddNotNull(name, colName string, oid uint32, noInherit bool, isLocal bool, inhCount int) {
+func (t *Table) AddNotNull(name, colName string, oid uint32, noInherit, notValid bool, isLocal bool, inhCount int) {
 	t.NotNullConstraints = append(t.NotNullConstraints, NamedNotNullConstraint{
-		Name: name, ColName: colName, OID: oid, NoInherit: noInherit,
+		Name: name, ColName: colName, OID: oid, NoInherit: noInherit, NotValid: notValid,
 		IsLocal: isLocal, InhCount: inhCount,
 	})
 }
@@ -6696,7 +6697,11 @@ func (c *InMemory) PGConstraintRowsForDBOid(dbOid uint32) [][]string {
 			row[3] = "n" // contype = not null
 			row[4] = "f"
 			row[5] = "f"
-			row[6] = "t"
+			if nc.NotValid {
+				row[6] = "f" // convalidated — added NOT VALID, not yet validated
+			} else {
+				row[6] = "t" // convalidated
+			}
 			row[7] = fmt.Sprintf("%d", tbl.OID)
 			row[8] = "0"
 			row[9] = "0"

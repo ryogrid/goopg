@@ -3957,7 +3957,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 					noInherit = true
 				}
 			}
-			tbl.AddNotNull(name, col.Name, im.AllocOID(), noInherit, isLocal, inhCount)
+			tbl.AddNotNull(name, col.Name, im.AllocOID(), noInherit, false, isLocal, inhCount)
 		}
 	}
 	// Copy pg_description comments from LIKE INCLUDING COMMENTS sources:
@@ -4711,11 +4711,11 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 					inhCount = 1
 				}
 				constraintName := strings.ToLower(tbl.Name) + "_" + colKey + "_not_null"
-				tbl.AddNotNull(constraintName, col.Name, im2.AllocOID(), false, true, inhCount)
+				tbl.AddNotNull(constraintName, col.Name, im2.AllocOID(), false, false, true, inhCount)
 				continue
 			}
 			if parentNC != nil {
-				tbl.AddNotNull(parentNC.Name, col.Name, im2.AllocOID(), parentNC.NoInherit, false, 1)
+				tbl.AddNotNull(parentNC.Name, col.Name, im2.AllocOID(), parentNC.NoInherit, parentNC.NotValid, false, 1)
 			}
 		}
 	}
@@ -7774,6 +7774,22 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					}
 				}
 			}
+			// Named NOT NULL constraints (contype='n') are validatable too. PG
+			// excludes CONSTR_NOTNULL from the Phase-3 pre-scan
+			// (ATExecValidateConstraint, tablecmds.c:9956) — there are no
+			// existing rows to scan, so the convalidated 'f'→'t' flip is the
+			// whole behavior. pg_constraint is virtual, so flipping the
+			// in-memory struct is what makes psql's \d+ re-render without the
+			// ` NOT VALID` suffix. M0134-0002 C2 slice 10.
+			if !found {
+				for i := range tbl.NotNullConstraints {
+					if strings.EqualFold(tbl.NotNullConstraints[i].Name, act.ConstraintName) {
+						tbl.NotNullConstraints[i].NotValid = false
+						found = true
+						break
+					}
+				}
+			}
 			if !found {
 				return &ExecError{Code: "42704", Pos: act.Pos(), Message: fmt.Sprintf("constraint %q of relation %q does not exist", act.ConstraintName, tbl.Name)}
 			}
@@ -9218,7 +9234,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if !hasNN {
 				if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 					name := strings.ToLower(tbl.Name) + "_" + strings.ToLower(act.ColumnName) + "_not_null"
-					tbl.AddNotNull(name, act.ColumnName, im.AllocOID(), false, true, 0)
+					tbl.AddNotNull(name, act.ColumnName, im.AllocOID(), false, false, true, 0)
 				}
 			}
 			if catalogHeapSyncAvailable(o.ctx) {
@@ -9303,7 +9319,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					if name == "" {
 						name = strings.ToLower(tbl.Name) + "_" + strings.ToLower(act.ColumnName) + "_not_null"
 					}
-					tbl.AddNotNull(name, act.ColumnName, im.AllocOID(), act.NoInherit, true, 0)
+					tbl.AddNotNull(name, act.ColumnName, im.AllocOID(), act.NoInherit, act.NotValid, true, 0)
 				}
 			}
 			if catalogHeapSyncAvailable(o.ctx) {
@@ -9826,7 +9842,7 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 		}
 		if !hasConstraint {
 			nnName := strings.ToLower(tbl.Name) + "_" + strings.ToLower(col.Name) + "_not_null"
-			tbl.AddNotNull(nnName, col.Name, im.AllocOID(), false, true, 0)
+			tbl.AddNotNull(nnName, col.Name, im.AllocOID(), false, false, true, 0)
 		}
 	}
 	return nil

@@ -400,6 +400,76 @@ func TestAlterTableAddNotNullNamed(t *testing.T) {
 	}
 }
 
+// TestAlterTableAddNotNullNotValid verifies the PG18 `ADD CONSTRAINT name NOT
+// NULL col NOT VALID` trailer (alter_table.sql:915 `ALTER TABLE atnnparted ADD
+// CONSTRAINT dummy_constr NOT NULL id NOT VALID`): the constraint is recorded
+// with convalidated='f' in pg_constraint (psql renders the trailing ` NOT
+// VALID`), and `VALIDATE CONSTRAINT name` flips it back to 't' (re-renders
+// without ` NOT VALID`). PG excludes CONSTR_NOTNULL from the Phase-3 pre-scan
+// (ATExecValidateConstraint, tablecmds.c:9956), so the flip is the whole
+// behavior — no row scan. M0134-0002 C2 slice 10.
+func TestAlterTableAddNotNullNotValid(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE atnnparted (id int, col1 int)`); err != nil {
+		t.Fatalf("CREATE TABLE atnnparted: %v", err)
+	}
+	if err := runDDL(t, ctx, `ALTER TABLE atnnparted ADD CONSTRAINT dummy_constr NOT NULL id NOT VALID`); err != nil {
+		t.Fatalf("ADD CONSTRAINT dummy_constr NOT NULL id NOT VALID: %v", err)
+	}
+
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "atnnparted"})
+	if !ok {
+		t.Fatal("atnnparted table not found")
+	}
+	if len(tbl.NotNullConstraints) != 1 || tbl.NotNullConstraints[0].Name != "dummy_constr" {
+		t.Fatalf("expected 1 NOT NULL constraint dummy_constr, got %+v", tbl.NotNullConstraints)
+	}
+	if !tbl.NotNullConstraints[0].NotValid {
+		t.Fatalf("expected NotNullConstraints[0].NotValid=true, got %+v", tbl.NotNullConstraints[0])
+	}
+
+	pgcon, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_constraint"})
+	if !ok || pgcon.VirtualRows == nil {
+		t.Fatal("pg_constraint virtual table not found")
+	}
+	// PGConstraintRowsForDBOid re-reads the live in-memory catalog on every
+	// call, so re-invoking VirtualRows after VALIDATE observes the flip.
+	convalidated := func() string {
+		for _, r := range pgcon.VirtualRows() {
+			if r[3] == "n" && r[1] == "dummy_constr" {
+				return r[6]
+			}
+		}
+		return ""
+	}
+	if got := convalidated(); got != "f" {
+		t.Errorf("convalidated after ADD ... NOT VALID = %q, want f", got)
+	}
+
+	// VALIDATE CONSTRAINT flips convalidated back to 't'; psql's \d+ then
+	// re-renders the constraint without the ` NOT VALID` suffix (alter_table.sql:922).
+	if err := runDDL(t, ctx, `ALTER TABLE atnnparted VALIDATE CONSTRAINT dummy_constr`); err != nil {
+		t.Fatalf("ALTER TABLE atnnparted VALIDATE CONSTRAINT dummy_constr: %v", err)
+	}
+	if tbl.NotNullConstraints[0].NotValid {
+		t.Errorf("NotValid still true after VALIDATE CONSTRAINT")
+	}
+	if got := convalidated(); got != "t" {
+		t.Errorf("convalidated after VALIDATE = %q, want t", got)
+	}
+
+	// An unknown name still raises 42704.
+	err := runDDL(t, ctx, `ALTER TABLE atnnparted VALIDATE CONSTRAINT no_such_constraint`)
+	if err == nil {
+		t.Fatal("VALIDATE CONSTRAINT on a missing name should error")
+	}
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42704" {
+		t.Errorf("missing constraint: err=%v want SQLSTATE 42704", err)
+	}
+}
+
 // TestCheckViolationReportsNameAndDetail verifies that a CHECK constraint
 // violation reports the constraint name and a "Failing row contains (…)"
 // DETAIL line, matching PostgreSQL (SQLSTATE 23514). M0097-0023.

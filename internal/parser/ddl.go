@@ -3762,6 +3762,15 @@ func (p *parser) parseTableConstraintElement(stmt *CreateTableStmt) (bool, error
 			stmt.TableHasNoInheritCheck = true
 			noInherit = true
 		}
+		// Accept optional NOT VALID trailer, consumed-and-dropped. PG
+		// auto-validates NOT VALID at CREATE TABLE — transformCheckConstraints
+		// (parse_utilcmd.c:2946) overrides it (skip_validation=true,
+		// initially_valid=is_enforced) and heap.c:2584-2587 writes convalidated
+		// from initially_valid, so a fresh table's constraint is created
+		// validated (no convalidated='f' recorded here). M0134-0002 C2 slice 10.
+		if p.acceptKeyword(KwNot) {
+			_ = p.acceptIdentKeyword("valid")
+		}
 		stmt.TableCheckNoInherit = append(stmt.TableCheckNoInherit, noInherit)
 		stmt.TableCheckNotEnforced = append(stmt.TableCheckNotEnforced, notEnforced)
 	} else if p.acceptIdentKeyword("exclude") {
@@ -3923,6 +3932,12 @@ func (p *parser) parseTableConstraintElement(stmt *CreateTableStmt) (bool, error
 				_ = p.acceptIdentKeyword("inherit")
 				stmt.TableHasNoInheritCheck = true
 				noInherit = true
+			}
+			// Accept optional NOT VALID trailer, consumed-and-dropped (same
+			// reason as the anonymous arm: PG auto-validates at CREATE TABLE,
+			// parse_utilcmd.c:2946 + heap.c:2584-2587). M0134-0002 C2 slice 10.
+			if p.acceptKeyword(KwNot) {
+				_ = p.acceptIdentKeyword("valid")
 			}
 			// Keep TableCheckNoInherit/TableCheckNotEnforced parallel to
 			// TableChecks: only the anonymous branch appended an expr.
@@ -9722,6 +9737,19 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		}
 		act.ColumnName = identText(colTok)
 		// Optional `NO INHERIT` trailer (connoinherit='t').
+		if p.acceptIdentKeyword("no") {
+			_ = p.acceptIdentKeyword("inherit")
+			act.NoInherit = true
+		}
+		// Optional `NOT VALID` trailer (convalidated='f'), accepted before OR
+		// after NO INHERIT — PG's ConstraintAttributeSpec is order-independent
+		// (gram.y:6213-6252). M0134-0002 C2 slice 10.
+		if p.acceptKeyword(KwNot) {
+			if !p.acceptIdentKeyword("valid") {
+				return AlterTableAction{}, p.errAtCur("expected VALID after NOT")
+			}
+			act.NotValid = true
+		}
 		if p.acceptIdentKeyword("no") {
 			_ = p.acceptIdentKeyword("inherit")
 			act.NoInherit = true

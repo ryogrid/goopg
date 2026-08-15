@@ -136,3 +136,49 @@ func TestParseCheckNotEnforced(t *testing.T) {
 		}
 	})
 }
+
+// TestParseCreateTableCheckNotValid covers the `CREATE TABLE ... CHECK (...)
+// [NO INHERIT] NOT VALID` trailer (alter_table.sql:450 `create table nv_parent
+// (d date, check (false) no inherit not valid)`). Unlike ALTER TABLE, PG
+// auto-validates NOT VALID at CREATE TABLE (transformCheckConstraints,
+// parse_utilcmd.c:2946; convalidated written from initially_valid in
+// heap.c:2584-2587), so the trailer is consumed-and-dropped — the parse must
+// succeed with no leftover tokens and record NO convalidated='f'. M0134-0002
+// C2 slice 10.
+func TestParseCreateTableCheckNotValid(t *testing.T) {
+	// Anonymous table-level CHECK with NO INHERIT NOT VALID (the
+	// alter_table.sql nv_parent shape).
+	stmts, err := Parse("CREATE TABLE nv_parent (d date, CHECK (false) NO INHERIT NOT VALID)")
+	if err != nil {
+		t.Fatalf("anonymous CHECK NO INHERIT NOT VALID: %v", err)
+	}
+	ct, ok := stmts[0].(*CreateTableStmt)
+	if !ok {
+		t.Fatalf("got %T, want *CreateTableStmt", stmts[0])
+	}
+	if len(ct.TableChecks) != 1 || ct.TableChecks[0] != "false" {
+		t.Errorf("TableChecks=%v, want [false]", ct.TableChecks)
+	}
+	if len(ct.TableCheckNoInherit) != 1 || !ct.TableCheckNoInherit[0] {
+		t.Errorf("TableCheckNoInherit=%v, want [true]", ct.TableCheckNoInherit)
+	}
+
+	// Named table-level CONSTRAINT ... CHECK NO INHERIT NOT VALID.
+	stmts, err = Parse("CREATE TABLE t (a integer, CONSTRAINT c CHECK (a > 0) NO INHERIT NOT VALID)")
+	if err != nil {
+		t.Fatalf("named CHECK NO INHERIT NOT VALID: %v", err)
+	}
+	ct, ok = stmts[0].(*CreateTableStmt)
+	if !ok {
+		t.Fatalf("got %T, want *CreateTableStmt", stmts[0])
+	}
+	if len(ct.TableNamedChecks) != 1 || !ct.TableNamedChecks[0].NoInherit {
+		t.Errorf("TableNamedChecks=%+v, want 1 named check with NoInherit=true", ct.TableNamedChecks)
+	}
+
+	// Regression guard: the shared trailer must still accept NOT ENFORCED.
+	stmts, err = Parse("CREATE TABLE t (a integer, CHECK (a > 0) NOT ENFORCED)")
+	if err != nil {
+		t.Fatalf("CHECK NOT ENFORCED: %v", err)
+	}
+}

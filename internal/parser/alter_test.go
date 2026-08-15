@@ -582,6 +582,43 @@ func TestParseAlterTableAddNotNull(t *testing.T) {
 	}
 }
 
+// TestParseAlterTableAddNotNullNotValid covers the `ALTER TABLE ... ADD
+// [CONSTRAINT name] NOT NULL col NOT VALID` trailer (alter_table.sql:915,
+// `ADD CONSTRAINT dummy_constr NOT NULL id NOT VALID`). PG's
+// ConstraintAttributeSpec is order-independent, so NOT VALID may precede or
+// follow NO INHERIT. M0134-0002 C2 slice 10.
+func TestParseAlterTableAddNotNullNotValid(t *testing.T) {
+	for _, tc := range []struct {
+		sql           string
+		wantNotValid  bool
+		wantNoInherit bool
+	}{
+		{"ALTER TABLE t ADD CONSTRAINT c NOT NULL col NOT VALID", true, false},
+		{"ALTER TABLE t ADD CONSTRAINT c NOT NULL col NOT VALID NO INHERIT", true, true},
+		{"ALTER TABLE t ADD CONSTRAINT c NOT NULL col NO INHERIT NOT VALID", true, true},
+		{"ALTER TABLE t ADD CONSTRAINT c NOT NULL col", false, false},
+	} {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T", tc.sql, stmts[0])
+		}
+		if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableAddNotNull {
+			t.Fatalf("Parse(%q): actions=%+v", tc.sql, at.Actions)
+		}
+		a := at.Actions[0]
+		if a.NotValid != tc.wantNotValid {
+			t.Errorf("Parse(%q): NotValid=%v want %v", tc.sql, a.NotValid, tc.wantNotValid)
+		}
+		if a.NoInherit != tc.wantNoInherit {
+			t.Errorf("Parse(%q): NoInherit=%v want %v", tc.sql, a.NoInherit, tc.wantNoInherit)
+		}
+	}
+}
+
 // TestParseAlterTableAddCheckNoInherit covers the `ALTER TABLE ... ADD
 // [CONSTRAINT name] CHECK (expr) [NO INHERIT]` trailer (connoinherit='t').
 // PG's ConstraintAttributeSpec is order-independent, so NO INHERIT may precede
