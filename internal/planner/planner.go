@@ -8555,10 +8555,41 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 		colType = col.Type
 	}
 
+	// Resolve the WHERE qual once, up-front, and reject correlation before
+	// choosing the scan shape. Hoisted above the branch: a correlated qual
+	// (block 8's `unique1 > f1` — a class-8 outer-subplan rendering gap) must
+	// reject the whole rewrite regardless of index availability, because the
+	// non-correlated SubqueryExpr cannot carry a parameterised inner plan.
+	var wherePred Expr
+	if s.Where != nil {
+		wherePred, err = resolveExpr(s.Where, ctx)
+		if err != nil {
+			return nil, false, err
+		}
+		hasOuter := false
+		walkExprTree(wherePred, func(e Expr) {
+			if _, ok := e.(*OuterColumnRef); ok {
+				hasOuter = true
+			}
+		})
+		if hasOuter {
+			return nil, false, nil
+		}
+	}
+
 	// `<col> IS NOT NULL`, prepended to the subquery's quals (build_minmax_path).
 	// The executor treats it as a residual filter; functionally redundant at
 	// runtime (ASC NULLS LAST reads the first non-null first) but required for
-	// the EXPLAIN Index Cond / Filter line to match PG.
+	// the EXPLAIN Index Cond / Filter line to match PG. TWO instances are built
+	// because the two scan shapes expose different row widths, and the executor
+	// resolves *ColumnRef by Index only (internal/executor/expr.go): the IOS
+	// output is 1-wide (Covered: [agg col] at Index 0), while the SeqScan decodes
+	// the FULL table row (agg col at argCR.Index). Sharing one instance across
+	// both would be the S6 filtered-cond latent bug: an IOS Cond ref at the table
+	// position is out-of-range on the 1-wide row unless the agg column happens to
+	// be table index 0.
+	//
+	// isNotNull: full-table position — for the SeqScan fallback's Filter.
 	isNotNull := &IsNullExpr{pos: pos, Operand: &ColumnRef{
 		// SourceTableIdx 1: the fresh inner scan is a new single-relation plan
 		// whose own source is source index 1 (tableSchemaWithSource(tbl, 1)),
@@ -8566,58 +8597,65 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 		pos: pos, Index: argCR.Index, Name: argCR.Name, Type: argCR.Type,
 		SourceTableIdx: 1,
 	}, Negated: true}
+	// isNotNullIOS: covered-row position (Index 0) — for the IOS Cond.
+	isNotNullIOS := &IsNullExpr{pos: pos, Operand: &ColumnRef{
+		pos: pos, Index: 0, Name: argCR.Name, Type: argCR.Type,
+		SourceTableIdx: 1,
+	}, Negated: true}
 
 	var inner Node
-	if s.Where == nil {
-		// Cheap path: no qual → the forward sorted path is a plain full-range
-		// IndexOnlyScan on a btree index whose leading column is the agg column
-		// (build_minmax_path's cheapest-path-for-pathkeys; the index's natural
-		// ASC order IS min's pathkey). findBTreeIndexForColumn declines partial
-		// indexes — correct, their predicate is unproven here.
-		if idx := findBTreeIndexForColumn(cat, tbl, argCR.Name); idx != nil {
-			covered, ok := cat.LookupColumn(tbl, argCR.Name)
-			if !ok {
-				return nil, false, nil
-			}
-			ios := &IndexOnlyScan{
-				pos:      pos,
-				Table:    tbl,
-				Index:    idx,
-				Covered:  []catalog.Column{*covered},
-				Cond:     isNotNull,
-				Backward: isMax,
-				schema: Schema{{Name: argCR.Name, Type: colType,
-					SourceTableIdx: 1}},
-			}
-			inner = &Limit{pos: pos, Child: ios, Limit: &IntegerConst{pos: pos, Value: 1}}
+	// A btree index whose leading column is the agg column supplies the sorted
+	// path for free (build_minmax_path's cheapest-path-for-pathkeys; the index's
+	// natural ASC order IS min's pathkey). findBTreeIndexForColumn declines
+	// partial indexes — correct, their predicate is unproven here. A WHERE qual
+	// may ride on the IOS Cond ONLY when it references no column other than the
+	// agg column (the IOS decodes just the covered column; any other ref would be
+	// out-of-range on the 1-wide row — e.g. `min(unique1) WHERE ten = 3` stays on
+	// the SeqScan fallback, as PG would leave it a heap-fetch residual).
+	if idx := findBTreeIndexForColumn(cat, tbl, argCR.Name); idx != nil &&
+		(wherePred == nil || wherePredSafeForIOS(wherePred, argCR)) {
+		covered, ok := cat.LookupColumn(tbl, argCR.Name)
+		if !ok {
+			return nil, false, nil
 		}
+		cond := Expr(isNotNullIOS)
+		if wherePred != nil {
+			// The safe-push check above guarantees every ColumnRef in wherePred is
+			// the agg column, so remapping agg refs argCR.Index -> 0 against the
+			// resolver schema is exact (remapColumnRefsToSchema silently maps a
+			// name missing from newIndex to 0 — the reason the check must run
+			// first). Copy-on-write is fine: wherePred is freshly resolved and not
+			// shared with any other plan fragment.
+			wherePredIOS := remapColumnRefsToSchema(wherePred, ctx.schema,
+				map[string]int{argCR.Name: 0})
+			// andExpr(isNotNullIOS, wherePredIOS): IS NOT NULL is the LEFT
+			// conjunct (planagg.c:385-396 lcons-prepends it; indxpath.c:2764 makes
+			// it a real btree index qual), so formatExprQual renders it in strict
+			// left-then-right tree order as
+			// `((unique1 IS NOT NULL) AND (unique1 < 42))`. The reverse order —
+			// used by the SeqScan Filter's andExpr(pos, wherePred, isNotNull) — is
+			// wrong for the Index Cond line.
+			cond = andExpr(pos, isNotNullIOS, wherePredIOS)
+		}
+		ios := &IndexOnlyScan{
+			pos:      pos,
+			Table:    tbl,
+			Index:    idx,
+			Covered:  []catalog.Column{*covered},
+			Cond:     cond,
+			Backward: isMax,
+			schema: Schema{{Name: argCR.Name, Type: colType,
+				SourceTableIdx: 1}},
+		}
+		inner = &Limit{pos: pos, Child: ios, Limit: &IntegerConst{pos: pos, Value: 1}}
 	}
 
 	if inner == nil {
 		// SeqScan fallback: no qualifying index (findBTreeIndexForColumn only
 		// matches a LEADING column, so block 7's `min(tenthous) WHERE
 		// thousand=33` cannot use thous_tenthous — that composite-prefix probe is
-		// Slice 3), or a WHERE qual present. Build the full sorted plan.
-		var wherePred Expr
-		if s.Where != nil {
-			wherePred, err = resolveExpr(s.Where, ctx)
-			if err != nil {
-				return nil, false, err
-			}
-			// Reject correlation: an outer Var in the qual means the inner plan
-			// is parameterised by the outer query, which the non-correlated
-			// SubqueryExpr cannot carry (block 8's `unique1 > f1` — a class-8
-			// outer-subplan rendering gap — stays on the Aggregate path).
-			hasOuter := false
-			walkExprTree(wherePred, func(e Expr) {
-				if _, ok := e.(*OuterColumnRef); ok {
-					hasOuter = true
-				}
-			})
-			if hasOuter {
-				return nil, false, nil
-			}
-		}
+		// Slice 3), or a WHERE qual referencing a non-covered column. Build the
+		// full sorted plan.
 		seqSchema := tableSchemaWithSource(tbl, 1)
 		seq := &SeqScan{pos: pos, Table: tbl, schema: seqSchema}
 		f := &Filter{pos: pos, Child: seq, Predicate: andExpr(pos, wherePred, isNotNull)}
@@ -8661,6 +8699,65 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 	}
 	return &Result{pos: pos, Targets: []Expr{init},
 		schema: Schema{{Name: label, Type: colType}}}, true, nil
+}
+
+// wherePredSafeForIOS reports whether the resolved WHERE qual can be pushed into
+// the IOS Cond. The IOS output row is 1-wide (Covered: [agg col] at Index 0) and
+// the executor resolves *ColumnRef by Index only, so a pushed qual must be a
+// pure expression over the agg column:
+//
+//   - every same-scope *ColumnRef must reference the agg column — same Index,
+//     same SourceTableIdx, same Name — so that after remapping to Index 0 it
+//     reads the covered column and nothing else (the IOS decodes ONLY the
+//     Covered columns; any other ref is out-of-range XX000 or silently reads the
+//     wrong column);
+//   - no *OuterColumnRef (correlation — hasOuter already rejects these before
+//     this check runs, but stay fail-closed);
+//   - no subquery construct (any slotInnerPlan / slotSubqRow child, e.g.
+//     *SubqueryExpr.Plan / *ExistsExpr.Plan / *InExpr.Plan /
+//     *ArraySubqueryExpr.Plan / *MultiAssignSubqRow.Plan). A subplan's inner
+//     refs live in a DIFFERENT coordinate space (its own schema), and a
+//     correlated subplan that references the agg query's own row — e.g. the
+//     subselect.sql `max(unique1) WHERE exists (select 1 ... where
+//     b.thousand = a.unique2)` — would be out-of-range on the 1-wide IOS row.
+//     walkExprTree does NOT descend into subqueries, so a walkExprTree-based
+//     check silently misses these;
+//   - no node type unknown to exprChildSlots (ok == false) — fail-closed, so an
+//     unenumerated 33rd Expr type cannot slip through.
+//
+// Built on exprChildSlots (exprwalk.go:109), the one enumerator that covers
+// every Expr child — including InExpr's Operand/List, which walkExprTree skips
+// (the silent-wrong-index class for `WHERE col IN (other_col)`).
+func wherePredSafeForIOS(wherePred Expr, argCR *ColumnRef) bool {
+	var check func(e Expr) bool
+	check = func(e Expr) bool {
+		// Leaf classification via type ASSERTION (not a switch) — the
+		// exprwalk-inventory census counts `case *T:` arms, and this dispatch is
+		// the surviving-two-arm pattern the converted walkers use.
+		if cr, ok := e.(*ColumnRef); ok {
+			return cr.Name == argCR.Name && cr.Index == argCR.Index &&
+				cr.SourceTableIdx == argCR.SourceTableIdx
+		}
+		if _, ok := e.(*OuterColumnRef); ok {
+			return false
+		}
+		slots, ok := exprChildSlots(e)
+		if !ok {
+			return false
+		}
+		for _, s := range slots {
+			switch s.kind {
+			case slotSameScope:
+				if !check(*s.expr) {
+					return false
+				}
+			default: // slotInnerPlan / slotSubqRow — a subquery's own row
+				return false
+			}
+		}
+		return true
+	}
+	return check(wherePred)
 }
 
 // findBTreeIndexForColumn locates a B-tree index whose leading column

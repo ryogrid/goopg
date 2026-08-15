@@ -291,3 +291,183 @@ func TestRewriteMinMaxAggExpressionArgNotRewritten(t *testing.T) {
 	}
 }
 
+// TestRewriteMinMaxAggFilteredMaxIOS — S6 Slice 3b acceptance (a): a filtered
+// `SELECT max(x) FROM t WHERE x < 42` must push the qual into the IOS Cond as
+// `((x IS NOT NULL) AND (x < 42))` — IS NOT NULL first (planagg.c:385-396
+// lcons-prepends; formatExprQual renders strict left-then-right) — with every
+// agg-column ref at Index 0 (the 1-wide covered-row position), on a Backward IOS.
+func TestRewriteMinMaxAggFilteredMaxIOS(t *testing.T) {
+	cat, tbl := minmaxRewriteCatalog(t)
+	plan, err := Plan(parseOne(t, "SELECT max(x) FROM t WHERE x < 42"), cat)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	_, _, _, child := digMinMaxInner(t, plan)
+	ios, ok := child.(*IndexOnlyScan)
+	if !ok {
+		t.Fatalf("Limit child is %T, want *IndexOnlyScan", child)
+	}
+	if !ios.Backward {
+		t.Fatalf("IOS.Backward = false, want true (max → Backward)")
+	}
+	if ios.Table != tbl {
+		t.Fatalf("IOS Table = %v, want %v", ios.Table, tbl)
+	}
+	cond, ok := ios.Cond.(*BinaryOp)
+	if !ok || cond.Op != parser.OpAnd {
+		t.Fatalf("IOS Cond = %#v, want AND of is-null + qual", ios.Cond)
+	}
+	// LEFT conjunct must be `x IS NOT NULL` (planagg.c lcons-prepend).
+	ln, ok := cond.Left.(*IsNullExpr)
+	if !ok || !ln.Negated {
+		t.Fatalf("Cond left = %#v, want `x IS NOT NULL`", cond.Left)
+	}
+	if cr, ok := ln.Operand.(*ColumnRef); !ok || cr.Name != "x" || cr.Index != 0 {
+		t.Fatalf("Cond left operand = %#v, want ColumnRef(x) at index 0", ln.Operand)
+	}
+	// RIGHT conjunct must be the pushed `x < 42` with its agg ref at Index 0.
+	lt, ok := cond.Right.(*BinaryOp)
+	if !ok || lt.Op != parser.OpLt {
+		t.Fatalf("Cond right = %#v, want `x < 42`", cond.Right)
+	}
+	if cr, ok := lt.Left.(*ColumnRef); !ok || cr.Name != "x" || cr.Index != 0 {
+		t.Fatalf("Cond right operand = %#v, want ColumnRef(x) at index 0", lt.Left)
+	}
+}
+
+// TestRewriteMinMaxAggFilteredMinIOS — S6 Slice 3b acceptance (b): the forward
+// (min) filtered case mirrors the max shape on a non-Backward IOS.
+func TestRewriteMinMaxAggFilteredMinIOS(t *testing.T) {
+	cat, _ := minmaxRewriteCatalog(t)
+	plan, err := Plan(parseOne(t, "SELECT min(x) FROM t WHERE x < 42"), cat)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	_, _, _, child := digMinMaxInner(t, plan)
+	ios, ok := child.(*IndexOnlyScan)
+	if !ok {
+		t.Fatalf("Limit child is %T, want *IndexOnlyScan", child)
+	}
+	if ios.Backward {
+		t.Fatalf("IOS.Backward = true, want false (min → forward)")
+	}
+	cond, ok := ios.Cond.(*BinaryOp)
+	if !ok || cond.Op != parser.OpAnd {
+		t.Fatalf("IOS Cond = %#v, want AND of is-null + qual", ios.Cond)
+	}
+	if ln, ok := cond.Left.(*IsNullExpr); !ok || !ln.Negated {
+		t.Fatalf("Cond left = %#v, want `x IS NOT NULL`", cond.Left)
+	}
+	lt, ok := cond.Right.(*BinaryOp)
+	if !ok || lt.Op != parser.OpLt {
+		t.Fatalf("Cond right = %#v, want `x < 42`", cond.Right)
+	}
+	if cr, ok := lt.Left.(*ColumnRef); !ok || cr.Name != "x" || cr.Index != 0 {
+		t.Fatalf("Cond right operand = %#v, want ColumnRef(x) at index 0", lt.Left)
+	}
+}
+
+// TestRewriteMinMaxAggFilteredNonCoveredFallback — S6 Slice 3b acceptance (c):
+// `min(x) WHERE y = 3` references a NON-covered column, so the qual MUST NOT be
+// pushed into the IOS Cond; the rewrite stays on the SeqScan fallback, where the
+// wherePred refs keep their full-table positions.
+func TestRewriteMinMaxAggFilteredNonCoveredFallback(t *testing.T) {
+	cat, _ := minmaxRewriteCatalog(t)
+	plan, err := Plan(parseOne(t, "SELECT min(x) FROM t WHERE y = 3"), cat)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	_, _, _, child := digMinMaxInner(t, plan)
+	if _, ok := child.(*IndexOnlyScan); ok {
+		t.Fatalf("qual on non-covered column y rewrote to IndexOnlyScan; must stay SeqScan fallback")
+	}
+	proj, ok := child.(*Project)
+	if !ok {
+		t.Fatalf("Limit child is %T, want *Project (SeqScan fallback)", child)
+	}
+	sort, ok := proj.Child.(*Sort)
+	if !ok {
+		t.Fatalf("Project child is %T, want *Sort", proj.Child)
+	}
+	f, ok := sort.Child.(*Filter)
+	if !ok {
+		t.Fatalf("Sort child is %T, want *Filter", sort.Child)
+	}
+	if _, ok := f.Child.(*SeqScan); !ok {
+		t.Fatalf("Filter child is %T, want *SeqScan", f.Child)
+	}
+	// Predicate = andExpr(wherePred, isNotNull): left is `y = 3` with y at its
+	// TABLE position (Index 1); right is `x IS NOT NULL` at x's table position
+	// (Index 0).
+	pred, ok := f.Predicate.(*BinaryOp)
+	if !ok || pred.Op != parser.OpAnd {
+		t.Fatalf("Filter predicate = %#v, want AND of qual + is-null", f.Predicate)
+	}
+	eq, ok := pred.Left.(*BinaryOp)
+	if !ok || eq.Op != parser.OpEq {
+		t.Fatalf("Filter predicate left = %#v, want `y = 3`", pred.Left)
+	}
+	if cr, ok := eq.Left.(*ColumnRef); !ok || cr.Name != "y" || cr.Index != 1 {
+		t.Fatalf("Filter predicate left operand = %#v, want ColumnRef(y) at table index 1", eq.Left)
+	}
+	rn, ok := pred.Right.(*IsNullExpr)
+	if !ok || !rn.Negated {
+		t.Fatalf("Filter predicate right = %#v, want `x IS NOT NULL`", pred.Right)
+	}
+	if cr, ok := rn.Operand.(*ColumnRef); !ok || cr.Name != "x" || cr.Index != 0 {
+		t.Fatalf("Filter predicate right operand = %#v, want ColumnRef(x) at table index 0", rn.Operand)
+	}
+}
+
+// TestRewriteMinMaxAggFilteredNonLeadingColumnIOS — S6 Slice 3b acceptance (d):
+// an agg column at table position != 0 (index on `y`) with a WHERE qual must
+// still rewrite to IOS, and EVERY agg-column ref in the Cond (is-not-null AND
+// pushed qual) must be at Index 0 — the 1-wide covered-row position, NOT
+// argCR.Index. This regresses the latent bug where the shared isNotNull used the
+// table position on the IOS (correct only for a position-0 agg column).
+func TestRewriteMinMaxAggFilteredNonLeadingColumnIOS(t *testing.T) {
+	c := catalog.NewInMemory()
+	tbl, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "x", Type: catalog.Type{Name: "int4"}},
+		{Name: "y", Type: catalog.Type{Name: "int4"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.CreateIndex(parser.ObjectName{Name: "t_y_idx"}, tbl, []string{"y"}, false, "btree", false); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := Plan(parseOne(t, "SELECT min(y) FROM t WHERE y < 42"), c)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	_, _, _, child := digMinMaxInner(t, plan)
+	ios, ok := child.(*IndexOnlyScan)
+	if !ok {
+		t.Fatalf("Limit child is %T, want *IndexOnlyScan", child)
+	}
+	if ios.Index == nil || len(ios.Index.Columns) != 1 || ios.Index.Columns[0] != "y" {
+		t.Fatalf("IOS index = %+v, want single-column btree on y", ios.Index)
+	}
+	if len(ios.Covered) != 1 || ios.Covered[0].Name != "y" {
+		t.Fatalf("IOS covered = %v, want [y]", ios.Covered)
+	}
+	cond, ok := ios.Cond.(*BinaryOp)
+	if !ok || cond.Op != parser.OpAnd {
+		t.Fatalf("IOS Cond = %#v, want AND of is-null + qual", ios.Cond)
+	}
+	ln, ok := cond.Left.(*IsNullExpr)
+	if !ok || !ln.Negated {
+		t.Fatalf("Cond left = %#v, want `y IS NOT NULL`", cond.Left)
+	}
+	if cr, ok := ln.Operand.(*ColumnRef); !ok || cr.Name != "y" || cr.Index != 0 {
+		t.Fatalf("Cond left operand = %#v, want ColumnRef(y) at index 0 (covered row)", ln.Operand)
+	}
+	lt, ok := cond.Right.(*BinaryOp)
+	if !ok || lt.Op != parser.OpLt {
+		t.Fatalf("Cond right = %#v, want `y < 42`", cond.Right)
+	}
+	if cr, ok := lt.Left.(*ColumnRef); !ok || cr.Name != "y" || cr.Index != 0 {
+		t.Fatalf("Cond right operand = %#v, want ColumnRef(y) at index 0 (covered row)", lt.Left)
+	}
+}
