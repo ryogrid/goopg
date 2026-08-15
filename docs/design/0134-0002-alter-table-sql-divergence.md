@@ -151,8 +151,32 @@ bare `CREATE UNIQUE INDEX` (no constraint) still drops. Closes the `onek`
 :294-296 `DROP INDEX`→`RENAME CONSTRAINT`→`DROP INDEX <new>` sequence (zero
 `onek_unique1_constraint` occurrences in the diff).
 
-Remaining C2 sub-gaps, ranked by error-site count ÷ risk: TYPE…USING (11,
-C10-entangled), comma multi-action (7,
+**Fifth slice (2026-08-16, in progress): `TYPE … USING`** — researcher pass
+(`tmp/ralph-handoffs/0134-0002-c2-typeusing-research/report.md`) mapped the full
+path and verdicted it **bounded, not C10-sized**. Parser: the TYPE arm
+(`internal/parser/ddl.go:8947-8959`) consumes `TYPE <typename>` then returns,
+leaving `USING` unconsumed → the 11 `syntax error at or near (got using)` sites.
+Fix mirrors the SET DEFAULT arm (`ddl.go:8875-8887`): a new `UsingExpr parser.Expr`
+field on `AlterTableAction` (ast.go, beside `DefaultExpr`), parsed with
+`p.parseExpr()` after `parseColumnType()`. Executor: `execAlterColumnType`
+(`operators_ddl.go:21438`) already does a full per-row rebuild (Phase 1 decode →
+Phase 3 truncate → Phase 4 re-encode) with a per-row `evalCast` hook at :21516
+whose error is silently swallowed — the C10 data-loss root. USING rides the same
+loop: resolve the expr against the OLD column schema via a new exported
+`planner.ResolveAlterColumnTypeUsing` (wrapping `resolveExpr` +
+`singleBindingContext`, planner.go:12396/519), evaluate per-row with
+`evalExpr(plannedUsing, row, o.ctx)` (expr.go:330), coerce the result to the
+target type via the existing `evalCast`, and **propagate** the coercion error
+pre-rewrite instead of swallowing it. Two PG parity messages
+(tablecmds.c:14495-14511): WITH-USING `result of USING clause for column "x"
+cannot be cast automatically to type y` + HINT `You might need to add an explicit
+cast.`; WITHOUT `column "x" cannot be cast automatically to type y` + HINT `You
+might need to specify "USING x::y".` Bypass the name-unchanged no-op
+(:21451-21453) when USING is present. Deferred to ledger: `SET DATA TYPE` spelling
+(silent no-op), whole-row-reference rejection, generated-column rejection, typmod
+threading.
+
+Remaining C2 sub-gaps, ranked by error-site count ÷ risk: comma multi-action (7,
 structural), RENAME `<col>` TO bare (3), ANALYZE tab(col) (4, re-route — it is
 an ANALYZE/VACUUM statement gap, not ALTER TABLE), NOT VALID trailer (2), STORAGE
 (2), OF/NOT OF (3), DROP COLUMN IF EXISTS (1, one-line `acceptKeyword(KwIf)`),

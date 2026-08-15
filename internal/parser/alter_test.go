@@ -980,3 +980,46 @@ func TestParseAlterTableSetAccessMethod(t *testing.T) {
 		}
 	}
 }
+
+// TestParseAlterTableTypeUsing covers `ALTER TABLE ... ALTER [COLUMN] c TYPE
+// t [USING expr]` (M0134-0002 C2 slice 5). The TYPE arm previously consumed
+// exactly `TYPE <typename>` and left an optional USING trailer unconsumed,
+// which bubbled to the statement loop as `syntax error at or near ... (got
+// using)`. Now the USING expression is parsed onto UsingExpr.
+func TestParseAlterTableTypeUsing(t *testing.T) {
+	cases := []struct {
+		name     string
+		sql      string
+		wantType string
+		wantExpr bool // whether a UsingExpr is expected
+	}{
+		{"no-using", "ALTER TABLE t ALTER COLUMN c TYPE integer", "integer", false},
+		{"using-literal", "ALTER TABLE t ALTER c TYPE integer USING 0", "integer", true},
+		{"using-cast", "ALTER TABLE t ALTER COLUMN c TYPE numeric USING b::numeric", "numeric", true},
+		{"using-case-multiline", "ALTER TABLE t ALTER COLUMN c TYPE text\n" +
+			"  using case when c is true then 'IT WAS TRUE'\n" +
+			"  when c is false then 'IT WAS FALSE'\n" +
+			"  else 'IT WAS NULL!' end", "text", true},
+		{"using-bool-target", "alter table anothertab alter column atcol1 type boolean using atcol1::int", "boolean", true},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("%s: Parse(%q): %v", tc.name, tc.sql, err)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("%s: got %T", tc.name, stmts[0])
+		}
+		if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableAlterColumnType {
+			t.Fatalf("%s: actions=%+v", tc.name, at.Actions)
+		}
+		act := at.Actions[0]
+		if act.NewType.Name != tc.wantType {
+			t.Errorf("%s: NewType.Name=%q want %q", tc.name, act.NewType.Name, tc.wantType)
+		}
+		if (act.UsingExpr != nil) != tc.wantExpr {
+			t.Errorf("%s: UsingExpr present=%v want %v (expr=%+v)", tc.name, act.UsingExpr != nil, tc.wantExpr, act.UsingExpr)
+		}
+	}
+}

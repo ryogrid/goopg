@@ -525,6 +525,17 @@ func singleBindingContext(table *catalog.Table, alias string) *resolveContext {
 	return newResolveContext([]rangeBinding{b}, tableSchemaWithSource(table, 1))
 }
 
+// ResolveAlterColumnTypeUsing resolves a USING expression from
+// `ALTER COLUMN name TYPE t USING expr` against the table's ORIGINAL column
+// list, so ColumnRefs resolve to old-column positions. PostgreSQL parses the
+// USING expr against the original table row type before the column type is
+// changed (ATPrepAlterColumnType — postgres/src/backend/commands/
+// tablecmds.c:14373), and the executor then evaluates it per old tuple
+// (ATRewriteTable, tablecmds.c:6126). M0134-0002 C2 slice 5.
+func ResolveAlterColumnTypeUsing(table *catalog.Table, e parser.Expr) (Expr, error) {
+	return resolveExpr(e, singleBindingContext(table, ""))
+}
+
 func appendSchema(left, right Schema) Schema {
 	out := make(Schema, 0, len(left)+len(right))
 	out = append(out, left...)

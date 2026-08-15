@@ -21450,8 +21450,23 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 	oldCatalogType := tbl.Columns[colIdx].Type
 	newCatalogType := catalog.Type{Name: strings.ToLower(act.NewType.Name), Args: append([]int64(nil), act.NewType.Args...)}
 
-	// No-op when the type name is unchanged.
-	if strings.EqualFold(oldCatalogType.Name, newCatalogType.Name) {
+	// Resolve the USING expression against the OLD column schema BEFORE any
+	// mutation, so ColumnRefs still resolve to old-column positions (PG
+	// parses the USING expr against the original row type —
+	// tablecmds.c:14373 ATPrepAlterColumnType). M0134-0002 C2 slice 5.
+	var plannedUsing planner.Expr
+	if act.UsingExpr != nil {
+		var rerr error
+		plannedUsing, rerr = planner.ResolveAlterColumnTypeUsing(tbl, act.UsingExpr)
+		if rerr != nil {
+			return rerr
+		}
+	}
+
+	// No-op when the type name is unchanged — unless a USING clause is
+	// present, in which case PG still rewrites the column (the USING expr
+	// result must still be coerced to the target type).
+	if strings.EqualFold(oldCatalogType.Name, newCatalogType.Name) && act.UsingExpr == nil {
 		return nil
 	}
 
@@ -21480,6 +21495,12 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 	// oldCols[colIdx] already has the old type.
 
 	var allRows []Row
+	// A per-row conversion failure must be reported AFTER the current page's
+	// slot is RUnlock()ed and Unpin()ed — returning from inside the blk loop
+	// would leak the slot's read lock + pin (a leaked reader then deadlocks
+	// the next writeHeapRow against the checkpointer's flushBatch). Captured
+	// here and returned after both loops unwind. M0134-0002 C2 slice 5.
+	var convErr error
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
 		bufSlot, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if perr != nil {
@@ -21511,11 +21532,41 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 			if decErr := DecodeRowIntoMctxPGTuple(row, oldCols, tuple.Data, tuple.Bitmap, storedNatts, nil); decErr != nil {
 				continue
 			}
-			// Convert the changed column to the new type.
+			// Convert the changed column to the new type. With USING, evaluate
+			// the USING expression against the OLD row and coerce its result
+			// to the target type; without, coerce the old datum directly.
+			// PG's ATRewriteTable evaluates ex->expr per old tuple with the
+			// old slot as scantuple (tablecmds.c:6126). M0134-0002 C2 slice 5.
 			if colIdx < len(row) {
-				if converted, cErr := evalCast(row[colIdx], newCatalogType.Name, act.Pos(), o.ctx); cErr == nil {
-					row[colIdx] = converted
+				src := row[colIdx]
+				if act.UsingExpr != nil {
+					val, verr := evalExpr(plannedUsing, row, o.ctx)
+					if verr != nil {
+						// Expression evaluation error (e.g. div-by-zero, a bad
+						// inner cast): propagate as-is, NOT as a coercion error.
+						convErr = verr
+						break
+					}
+					src = val
 				}
+				converted, cErr := evalCast(src, newCatalogType.Name, act.Pos(), o.ctx)
+				if cErr != nil {
+					// Coercion failure: propagate deterministically BEFORE
+					// Phase 2 (catalog mutation) / Phase 3 (heap truncation)
+					// run, so the table stays intact. Map to PG's
+					// ATPrepAlterColumnType message (tablecmds.c:14495-14511).
+					if act.UsingExpr != nil {
+						convErr = &ExecError{Code: "42804", Pos: act.Pos(),
+							Message: fmt.Sprintf("result of USING clause for column %q cannot be cast automatically to type %s", act.ColumnName, newCatalogType.Name),
+							Hint:    "You might need to add an explicit cast."}
+					} else {
+						convErr = &ExecError{Code: "42804", Pos: act.Pos(),
+							Message: fmt.Sprintf("column %q cannot be cast automatically to type %s", act.ColumnName, newCatalogType.Name),
+							Hint:    fmt.Sprintf("You might need to specify \"USING %s::%s\".", act.ColumnName, newCatalogType.Name)}
+					}
+					break
+				}
+				row[colIdx] = converted
 			}
 			// Deep-copy the row so arena-backed string Datums survive
 			// beyond the page pin (cloneRowOwned allocates fresh backing).
@@ -21524,6 +21575,12 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 		}
 		bufSlot.RUnlock()
 		o.ctx.Pool.Unpin(bufSlot)
+		if convErr != nil {
+			break
+		}
+	}
+	if convErr != nil {
+		return convErr
 	}
 
 	// Phase 2: update the catalog column type.

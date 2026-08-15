@@ -8950,10 +8950,27 @@ func (p *parser) parseAlter() (Stmt, error) {
 			if err != nil {
 				return nil, err
 			}
+			// TYPE newtype [USING expr] — consume an optional USING
+			// expression (gram.y alter_using). Before this slice the
+			// trailer was left unconsumed and bubbled to the statement
+			// loop as `syntax error at or near ... (got using)`; PG
+			// carries it in AlterTableCmd->def->raw_default
+			// (postgres/src/backend/parser/gram.y:3028) and evaluates it
+			// per-row against the original row type. Mirrors the SET
+			// DEFAULT arm above (which stores its parsed expr on
+			// DefaultExpr). M0134-0002 C2 slice 5.
+			var usingExpr Expr
+			if p.acceptKeyword(KwUsing) {
+				usingExpr, err = p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+			}
 			stmt.Actions = append(stmt.Actions, AlterTableAction{
 				Kind:       AlterTableAlterColumnType,
 				ColumnName: colName,
 				NewType:    newType,
+				UsingExpr:  usingExpr,
 			})
 			return stmt, nil
 		}

@@ -3283,6 +3283,11 @@ type AlterTableAction struct {
 	// (`ALTER COLUMN name SET DEFAULT expr`). Nil for AlterTableDropDefault.
 	// DU-002 slice 269.
 	DefaultExpr Expr
+	// UsingExpr is the parsed USING expression for AlterTableAlterColumnType
+	// (`ALTER COLUMN name TYPE t USING expr`); nil when no USING clause is
+	// present. The executor evaluates it per-row against the OLD row and
+	// coerces the result to the target type. M0134-0002 C2 slice 5.
+	UsingExpr Expr
 	// SetOptions holds the per-column attribute options captured from
 	// `ALTER COLUMN name SET (opt=value, …)` for AlterTableAlterColumnSet, each
 	// entry normalized to PG's stored `name=value` form (e.g. "n_distinct=0.5").
