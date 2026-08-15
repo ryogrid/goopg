@@ -401,6 +401,86 @@ fallback (`min(x) WHERE y=3`), and the non-leading-column latent-bug regression.
 **Residual (ledger row 1374):** multi-clause AND nesting vs PG flat, and no-dedup of a
 user-written `col IS NOT NULL` — both cosmetic, recorded not widened.
 
+## S6 Slice 3c — spec (composite-prefix probing, ledger row 1371)
+
+**Target (block 6):** `min(tenthous) WHERE thousand = 33` must use the composite
+btree `tenk1_thous_tenthous` (leading `thousand` bound by the WHERE equality, `tenthous`
+as the agg pathkey). `findBTreeIndexForColumn` matches only a LEADING column == the agg
+column, so it declines (`idx.Columns[0]=thousand != tenthous`) and the block falls back
+to `Sort → Seq Scan`.
+
+**Oracle (`aggregates.out:1052-1057`, PG 18.3):**
+```
+ Result
+   InitPlan 1
+     ->  Limit
+           ->  Index Only Scan using tenk1_thous_tenthous on tenk1
+                 Index Cond: ((thousand = 33) AND (tenthous IS NOT NULL))
+```
+Two divergences from the single-column filtered case (Slice 3b): the prefix equality
+qual is the **LEFT** conjunct (by index-column order, `planagg.c:385-396` folding the
+bound prefix into the indexqual and lcons-ing the `IS NOT NULL`), and the agg-col
+`IS NOT NULL` **IS present** in the Index Cond at the agg column's position.
+
+**PG mechanism (18.3):** `build_minmax_path` (`planagg.c:316`) is generic — it builds
+`SELECT tenthous FROM tenk1 WHERE tenthous IS NOT NULL AND thousand=33 ORDER BY tenthous
+LIMIT 1` and hands it to `query_planner`. Index choice is `get_cheapest_fractional_path_for_pathkeys`
+(`planagg.c:442`); the prefix equality `thousand=33` makes the `thousand` pathkey
+`EC_MUST_BE_REDUNDANT` (its EC contains a const, `pathkeys.c:158-178`, `pathnodes.h:1473`),
+so the ORDER-BY pathkeys begin at `tenthous` — the composite index's second column. This
+is why a non-leading agg column works when a WHERE equality binds the leading prefix.
+
+**goopg design (bounded, no new executor capability):** the executor already decodes an
+IOS `Covered` row and filters it by `Cond` (Slice 3b), so the only new work is a planner
+index-choice helper plus a wider `Covered` + a slice-down `Project`. Specifically:
+- `findCompositePrefixIndexForColumn(cat, tbl, aggCol, wherePred)` — AND-walks `wherePred`
+  into `col = const` equality conjuncts (column on EITHER side of `OpEq`, constant other
+  side, `isConstantExpr`), then accepts a non-partial btree whose longest equality-bound
+  prefix of `idx.Columns` is non-empty (`k ≥ 1`), whose next column is the agg col
+  (`idx.Columns[k] == aggCol`), and — first-cut bound — where the agg col is the LAST
+  column (`k+1 == len(idx.Columns)`; trailing columns fall back to SeqScan, safe).
+- In `rewriteMinMaxAggregates`, a NEW branch between the existing leading-column IOS
+  branch and the SeqScan fallback: `Covered = idx.Columns[:k+1]` (prefix + agg col),
+  `Cond = andExpr(prefixQuals remapped) AND isNotNullIOS@k` (prefix LEFT, `IS NOT NULL`
+  RIGHT — the reverse of Slice 3b's single-col order), remap `{prefixCol_i: i, aggCol: k}`,
+  and a `Project` ABOVE the IOS (BELOW the `Limit`) slicing the k+1-wide row to the agg
+  column (mirrors the SeqScan fallback's invisible Project, `planner.go:8678-8681`).
+  `Backward: isMax` unchanged.
+- **Safety gate (fail-closed):** every `wherePred` conjunct must be a `prefixCol = const`
+  equality (no range/agg-col/non-prefix conjunct may remain — it would read a column the
+  IOS does not decode), else the SeqScan fallback. A NEW `isNotNullIOS` instance at
+  `Index: k` (the covered position of the agg col), NOT the Slice 3b hardcoded Index-0 one.
+
+**Acceptance:** block 6 emits the oracle shape above; `scripts/pg-regress-runner.sh aggregates`
+closes it with zero regressions; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=35).
+
+## S6 Slice 3c — landed 2026-08-15 (composite-prefix index choice, commit `be4ee556`)
+
+Shipped exactly per the spec above: `collectEqualityConjuncts` (AND-walks the RESOLVED
+WHERE into per-column `col = const` equalities, fail-closed on non-equality / out-of-prefix
+/ duplicate same-column equalities) + `findCompositePrefixIndexForColumn` (non-partial
+btree whose equality-bound prefix `k ≥ 1` is followed by the agg column as the LAST index
+column) + a composite branch in `rewriteMinMaxAggregates` (Covered = prefix+agg in index
+order, Cond = remapped prefix quals LEFT + agg-col `IS NOT NULL`@k RIGHT, slice-down
+`Project` above the IOS / below the `Limit`). 5 unit tests in `minmax_rewrite_test.go`.
+
+**Measured result (`scripts/pg-regress-runner.sh aggregates`, 1499→1481 lines, zero
+regressions):** block 6 (`min/max(tenthous) WHERE thousand = 33`) now emits
+`Index Only Scan [Backward] using tenk1_thous_tenthous` + `Index Cond: ((thousand = 33)
+AND (tenthous IS NOT NULL))`, result values match PG (`9033`). The exhaustive
+audit of every `aggregates.sql` min/max query against `create_index.sql` indexes confirms
+the branch fires only for block 6. `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=35).
+
+**One residual recorded (ledger row 1375):** a duplicate same-column equality
+(`thousand = 33 AND thousand = 44`) — PG pushes both as separate index quals and returns
+NULL (contradiction); goopg declines to the SeqScan fallback (which also returns NULL, via
+full-qual evaluation) rather than collapse under map last-write-wins. Correct result,
+divergent plan shape; degenerate, not in the corpus.
+
+**Remaining S6 edge cases (unchanged, in dependency order):** (c) constant `max(100)`
+(block 14); (d) scalar-subquery nesting (blocks 8/17, class-8); (e) inheritance/MergeAppend
+(blocks 15/16 + partial-index bug).
+
 ## Cross-case relevance
 
 Every M0134 regress case whose `.sql` emits `EXPLAIN` inherits the formatter
