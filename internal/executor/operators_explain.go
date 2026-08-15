@@ -1752,25 +1752,22 @@ func describePlan(n planner.Node, nm *explainNames) string {
 	case *planner.Values:
 		return fmt.Sprintf("Values (%d rows)", len(p.Rows))
 	case *planner.Join:
+		// S3 (0134-0001 P2, class 7a): PG interpolates the join type
+		// into the node name (explain.c jointype switch 1712-1763, text
+		// rule 1754-1758). Base words are explain.c's pname: T_NestLoop
+		// 1421 "Nested Loop", T_MergeJoin 1424 "Merge", T_HashJoin 1428
+		// "Hash" — "Join" is appended by the jointype rule. NullAware and
+		// BuildLeft remain planner fields the executor consumes; only the
+		// label rendering changed (no more "(TYPE)", "NULL-AWARE" or
+		// "build=left" annotations).
 		algo := "Nested Loop"
 		if p.Algo == planner.JoinAlgoHash {
-			algo = "Hash Join"
+			algo = "Hash"
 		}
 		if p.Algo == planner.JoinAlgoMerge {
-			algo = "Merge Join"
+			algo = "Merge"
 		}
-		// A NullAware anti join (from unnesting a non-correlated
-		// NOT IN, M0122-0011) carries three-valued-NULL semantics
-		// the join type alone does not convey; surface it so plan
-		// diffs can tell the two anti joins apart.
-		jt := joinTypeName(p.Type)
-		if p.Type == planner.JoinTypeAnti && p.NullAware {
-			jt += " NULL-AWARE"
-		}
-		if p.Algo == planner.JoinAlgoHash && p.BuildLeft {
-			return fmt.Sprintf("%s (%s, build=left)", algo, jt)
-		}
-		return fmt.Sprintf("%s (%s)", algo, jt)
+		return joinLabel(algo, p.Type)
 	case *planner.Gather:
 		return "Gather"
 	case *planner.GatherMerge:
@@ -1893,11 +1890,11 @@ func describePlan(n planner.Node, nm *explainNames) string {
 		// the aggregate-above-join shape).
 		return "Ordinality"
 	case *planner.NestedLoopIndexJoin:
-		// M0054-0006: render `Nested Loop` matching upstream's
-		// EXPLAIN output for a nested-loop join with an inner
-		// IndexScan side. The inner IndexScan node renders its
-		// own label (`Index Scan using <idx> on <table>`) below.
-		return fmt.Sprintf("Nested Loop (%s)", joinTypeName(p.Type))
+		// M0054-0006: this node is always a nested loop; S3
+		// (0134-0001 P2) applies the same PG label rule as the
+		// parameterised Join above. The inner IndexScan node renders
+		// its own label (`Index Scan using <idx> on <table>`) below.
+		return joinLabel("Nested Loop", p.Type)
 	case *planner.Memoize:
 		return "Memoize"
 	case *planner.Merge:
@@ -2008,27 +2005,32 @@ func setOpAppendBranches(p *planner.SetOp, out []planner.Node) []planner.Node {
 	return out
 }
 
-func joinTypeName(t planner.JoinType) string {
+// joinLabel renders PG's EXPLAIN node name for a join, mirroring the
+// jointype switch at postgres/src/backend/commands/explain.c:1712-1763
+// (word: Left/Right/Full/Semi/Anti; Inner and Cross are never spelled)
+// and the text-format rule at 1754-1758: a non-INNER jointype appends
+// " <Type> Join"; an INNER appends " Join" unless the node is a
+// NestLoop. CROSS JOIN is folded to JOIN_INNER during parse transform
+// (parse_clause.c), so it renders through the Inner path — a bare
+// "Nested Loop" for a nested-loop cross join. algo is the base node
+// word ("Nested Loop" / "Hash" / "Merge").
+func joinLabel(algo string, t planner.JoinType) string {
 	switch t {
-	case planner.JoinTypeInner:
-		return "INNER"
+	case planner.JoinTypeInner, planner.JoinTypeCross:
+		if algo == "Nested Loop" {
+			return algo
+		}
+		return algo + " Join"
 	case planner.JoinTypeLeft:
-		return "LEFT"
+		return algo + " Left Join"
 	case planner.JoinTypeRight:
-		return "RIGHT"
+		return algo + " Right Join"
 	case planner.JoinTypeFull:
-		return "FULL"
-	case planner.JoinTypeCross:
-		return "CROSS"
+		return algo + " Full Join"
 	case planner.JoinTypeSemi:
-		// Produced by EXISTS / IN unnesting (M0061-0001). Rendered
-		// inside goopg's `<algo> (<type>)` label rather than
-		// upstream's `Hash Semi Join` node spelling — switching to
-		// PG's spelling would churn every existing plan line and is
-		// tracked separately.
-		return "SEMI"
+		return algo + " Semi Join"
 	case planner.JoinTypeAnti:
-		return "ANTI"
+		return algo + " Anti Join"
 	}
 	return "?"
 }

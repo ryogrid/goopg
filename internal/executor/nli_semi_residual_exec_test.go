@@ -110,7 +110,7 @@ func TestNLISemiResidualExecution(t *testing.T) {
 
 	sql := "SELECT o_key FROM ord WHERE EXISTS (SELECT 1 FROM line WHERE l_key = o_key AND l_c < l_r) ORDER BY o_key"
 	plan := nliResidualExplain(t, ctx, sql)
-	if !strings.Contains(plan, "Nested Loop (SEMI)") {
+	if !strings.Contains(plan, "Nested Loop Semi Join") {
 		t.Fatalf("expected the NLI semi path to serve this query; plan:\n%s", plan)
 	}
 	got := nliResidualRows(t, ctx, sql)
@@ -128,7 +128,7 @@ func TestNLIAntiResidualExecution(t *testing.T) {
 
 	sql := "SELECT o_key FROM ord WHERE NOT EXISTS (SELECT 1 FROM line WHERE l_key = o_key AND l_c < l_r) ORDER BY o_key"
 	plan := nliResidualExplain(t, ctx, sql)
-	if !strings.Contains(plan, "Nested Loop (ANTI)") {
+	if !strings.Contains(plan, "Nested Loop Anti Join") {
 		t.Fatalf("expected the NLI anti path to serve this query; plan:\n%s", plan)
 	}
 	got := nliResidualRows(t, ctx, sql)

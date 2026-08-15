@@ -61,12 +61,14 @@ var actualRe = regexp.MustCompile(`\(actual (?:time=[0-9.]+\.\.[0-9.]+ )?rows=([
 // while it survives it is a joinrel like any other and its estimate is as
 // auditable as a two-way join's.
 //
-// goopg spells the join type in a parenthetical ("Hash Join (ANTI)") while
-// upstream spells it in the label itself ("Hash Anti Join", "Merge Left
-// Join", "Nested Loop Semi Join" — explain.c's `ExplainNode`). Both must
-// classify, because §4's parity gate audits a PG 18.3 plan through this same
-// parser: a reference plan whose joins did not classify would read as a query
-// PG estimated perfectly.
+// goopg spells the join type in the label itself, matching upstream
+// ("Hash Anti Join", "Merge Left Join", "Nested Loop Semi Join" —
+// explain.c's `ExplainNode`; see joinLabel in operators_explain.go). The
+// legacy parenthetical spelling ("Hash Join (ANTI)") must still classify,
+// because the committed leftdeep-joins plan captures predate the S3
+// relabel, and §4's parity gate audits a PG 18.3 plan through this same
+// parser: a reference plan whose joins did not classify would read as a
+// query PG estimated perfectly.
 var joinLabels = []string{
 	"Nested Loop",
 	"Hash Join",

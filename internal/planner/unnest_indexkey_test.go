@@ -89,7 +89,7 @@ func indexedCorrCatalogNoIndex(t *testing.T) catalog.Catalog {
 // hasSemiOrAntiOfType reports whether the plan contains a semi/anti join
 // of the wanted type, as EITHER a *Join or a *NestedLoopIndexJoin — a
 // clean index-probe semi/anti is rewritten to NLI (rendered "Nested Loop
-// (SEMI)"), so a test that only looked for *Join would miss it.
+// Semi Join"), so a test that only looked for *Join would miss it.
 func hasSemiOrAntiOfType(node Node, want JoinType) bool {
 	found := false
 	var walk func(Node)

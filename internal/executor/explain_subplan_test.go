@@ -256,8 +256,8 @@ func TestExplainSemiAntiJoinLabels(t *testing.T) {
 	if strings.Contains(semi, "(?)") {
 		t.Errorf("join type rendered as `(?)`:\n%s", semi)
 	}
-	if !strings.Contains(semi, "SEMI") {
-		t.Errorf("correlated IN did not produce a SEMI join label:\n%s", semi)
+	if !strings.Contains(semi, "Semi Join") {
+		t.Errorf("correlated IN did not produce a Semi Join label:\n%s", semi)
 	}
 
 	// A non-correlated NOT IN unnests to a null-aware anti join, and
@@ -268,20 +268,37 @@ func TestExplainSemiAntiJoinLabels(t *testing.T) {
 	if strings.Contains(anti, "(?)") {
 		t.Errorf("join type rendered as `(?)`:\n%s", anti)
 	}
-	if !strings.Contains(anti, "ANTI") {
-		t.Errorf("non-correlated NOT IN did not produce an ANTI join label:\n%s", anti)
+	if !strings.Contains(anti, "Anti Join") {
+		t.Errorf("non-correlated NOT IN did not produce an Anti Join label:\n%s", anti)
 	}
 	assertNoOpaqueExpr(t, anti)
 }
 
 // TestJoinTypeNameSemiAnti pins the label strings directly, so the
 // mapping survives even if no planner path currently produces them.
-func TestJoinTypeNameSemiAnti(t *testing.T) {
-	if got := joinTypeName(planner.JoinTypeSemi); got != "SEMI" {
-		t.Errorf("JoinTypeSemi label = %q, want SEMI", got)
+// TestJoinLabelPinsPGLabels pins the label mapping directly, so the
+// rule survives even if no planner path currently produces a given
+// (algo, join type) pair. Spellings match PG 18.3 explain.c:1712-1763.
+func TestJoinLabelPinsPGLabels(t *testing.T) {
+	cases := []struct {
+		algo string
+		typ  planner.JoinType
+		want string
+	}{
+		{"Nested Loop", planner.JoinTypeInner, "Nested Loop"},
+		{"Hash", planner.JoinTypeInner, "Hash Join"},
+		{"Merge", planner.JoinTypeInner, "Merge Join"},
+		{"Nested Loop", planner.JoinTypeCross, "Nested Loop"},
+		{"Hash", planner.JoinTypeLeft, "Hash Left Join"},
+		{"Merge", planner.JoinTypeRight, "Merge Right Join"},
+		{"Nested Loop", planner.JoinTypeFull, "Nested Loop Full Join"},
+		{"Nested Loop", planner.JoinTypeSemi, "Nested Loop Semi Join"},
+		{"Hash", planner.JoinTypeAnti, "Hash Anti Join"},
 	}
-	if got := joinTypeName(planner.JoinTypeAnti); got != "ANTI" {
-		t.Errorf("JoinTypeAnti label = %q, want ANTI", got)
+	for _, c := range cases {
+		if got := joinLabel(c.algo, c.typ); got != c.want {
+			t.Errorf("joinLabel(%q, %v) = %q, want %q", c.algo, c.typ, got, c.want)
+		}
 	}
 }
 
@@ -303,11 +320,11 @@ func TestNLIResidualPredicateRendered(t *testing.T) {
 	}
 	out, _ := joinedPlan(t, ctx,
 		"EXPLAIN SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a AND t2.b < t1.b)")
-	if strings.Contains(out, "Nested Loop (SEMI)") {
+	if strings.Contains(out, "Nested Loop Semi Join") {
 		if !strings.Contains(out, "b < ") && !strings.Contains(out, "< b") {
 			t.Errorf("NLI semi residual predicate not rendered:\n%s", out)
 		}
-	} else if strings.Contains(out, "(SEMI)") {
+	} else if strings.Contains(out, "Semi Join") {
 		// Hash semi carries the residual on the join predicate — the
 		// display concern is NLI-specific; nothing to assert here.
 		t.Logf("shape took hash semi, NLI residual display not exercised:\n%s", out)

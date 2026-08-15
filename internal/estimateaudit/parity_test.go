@@ -11,11 +11,11 @@ import (
 // analysis/leftdeep-joins/2026-08-05-p56g.plans.txt), trimmed to the join
 // spine: the SEMI lands on the 0.5 punt, est 2 998 620 against an actual 70.
 const goopgQ18Shaped = `Sort  (cost=0.00..0.00 rows=100 width=0) (actual time=1.0..1.1 rows=70.00 loops=1)
-  ->  Hash Join (SEMI)  (cost=0.00..0.00 rows=2998620 width=0) (actual time=0.9..1.0 rows=70.00 loops=1)
+  ->  Hash Semi Join  (cost=0.00..0.00 rows=2998620 width=0) (actual time=0.9..1.0 rows=70.00 loops=1)
         Hash Cond: (orders.o_orderkey = l_orderkey)
-    ->  Hash Join (INNER)  (cost=0.00..0.00 rows=5997241 width=0) (actual time=0.5..0.8 rows=6001215.00 loops=1)
+    ->  Hash Join  (cost=0.00..0.00 rows=5997241 width=0) (actual time=0.5..0.8 rows=6001215.00 loops=1)
       ->  Seq Scan on public.customer (stats)  (cost=0.00..0.00 rows=150000 width=0) (actual time=0.1..0.2 rows=150000.00 loops=1)
-      ->  Hash Join (INNER)  (cost=0.00..0.00 rows=5997241 width=0) (actual time=0.3..0.4 rows=6001215.00 loops=1)
+      ->  Hash Join  (cost=0.00..0.00 rows=5997241 width=0) (actual time=0.3..0.4 rows=6001215.00 loops=1)
         ->  Seq Scan on public.orders (stats)  (cost=0.00..0.00 rows=1500000 width=0) (actual time=0.1..0.2 rows=1500000.00 loops=1)
         ->  Seq Scan on public.lineitem (stats)  (cost=0.00..0.00 rows=5997241 width=0) (actual time=0.1..0.2 rows=5997241.00 loops=1)
     ->  HashAggregate  (cost=0.00..0.00 rows=1210559 width=0) (actual time=0.1..0.2 rows=57.00 loops=1)
@@ -48,7 +48,7 @@ func TestJoinLabelsCoverUpstreamSpelling(t *testing.T) {
 		"Merge Left Join":        true,
 		"Nested Loop Anti Join":  true,
 		"Nested Loop Left Join":  true,
-		"Hash Join (ANTI)":       true, // goopg's own spelling
+		"Hash Join (ANTI)":       true, // legacy parenthetical spelling, still classified
 		"Hash":                   false,
 		"HashAggregate":          false,
 		"Merge Append":           false,
@@ -128,8 +128,8 @@ func TestParityMatchesJoinrelsAcrossDifferentJoinOrders(t *testing.T) {
 	// {a,b,c} on one side matches {a,b,c} on the other however each engine
 	// got there. Here goopg builds (a⋈b)⋈c and the reference builds
 	// (a⋈c)⋈b — only the final joinrel is shared, and it must match.
-	goopgPlan := `Hash Join (INNER)  (cost=0.00..0.00 rows=100 width=0) (actual rows=1000.00 loops=1)
-  ->  Hash Join (INNER)  (cost=0.00..0.00 rows=50 width=0) (actual rows=500.00 loops=1)
+	goopgPlan := `Hash Join  (cost=0.00..0.00 rows=100 width=0) (actual rows=1000.00 loops=1)
+  ->  Hash Join  (cost=0.00..0.00 rows=50 width=0) (actual rows=500.00 loops=1)
     ->  Seq Scan on public.a  (cost=0.00..0.00 rows=10 width=0) (actual rows=10.00 loops=1)
     ->  Seq Scan on public.b  (cost=0.00..0.00 rows=10 width=0) (actual rows=10.00 loops=1)
   ->  Seq Scan on public.c  (cost=0.00..0.00 rows=10 width=0) (actual rows=10.00 loops=1)`
@@ -210,7 +210,7 @@ func TestParityFloorKeepsAccurateJoinrelsOutOfTheRatchet(t *testing.T) {
 	// PG exact, goopg 20x off: 20x the reference's factor, but 20x absolute
 	// is not what §4's ratchet is for. Without the floor every joinrel PG
 	// happens to nail would enter the ratchet.
-	goopgPlan := `Hash Join (INNER)  (cost=0.00..0.00 rows=50 width=0) (actual rows=1000.00 loops=1)
+	goopgPlan := `Hash Join  (cost=0.00..0.00 rows=50 width=0) (actual rows=1000.00 loops=1)
   ->  Seq Scan on public.a  (cost=0.00..0.00 rows=10 width=0) (actual rows=10.00 loops=1)
   ->  Seq Scan on public.b  (cost=0.00..0.00 rows=10 width=0) (actual rows=10.00 loops=1)`
 	refPlan := `Hash Join  (cost=1.0..2.0 rows=1000 width=0) (actual rows=1000.00 loops=1)
@@ -237,7 +237,7 @@ func TestParityCreditsGoopgWhenItBeatsTheReference(t *testing.T) {
 	// goopg 2x off where PG is 1 000x off: excess 0.002. A gate that only
 	// looked at absolute factors would say nothing here; the parity column
 	// has to be able to say "better than PG".
-	goopgPlan := `Hash Join (INNER)  (cost=0.00..0.00 rows=500 width=0) (actual rows=1000.00 loops=1)
+	goopgPlan := `Hash Join  (cost=0.00..0.00 rows=500 width=0) (actual rows=1000.00 loops=1)
   ->  Seq Scan on public.a  (cost=0.00..0.00 rows=10 width=0) (actual rows=10.00 loops=1)
   ->  Seq Scan on public.b  (cost=0.00..0.00 rows=10 width=0) (actual rows=10.00 loops=1)`
 	refPlan := `Hash Join  (cost=1.0..2.0 rows=1 width=0) (actual rows=1000.00 loops=1)
@@ -258,7 +258,7 @@ func TestQ21FinalBarIsAParityBarNotAMute(t *testing.T) {
 	// holding it to the absolute tripwire would demand a divergence from PG.
 	q21 := func(est int) string {
 		return `HashAggregate  (cost=0.00..0.00 rows=10000 width=0) (actual rows=405.00 loops=1)
-  ->  Hash Join (ANTI)  (cost=0.00..0.00 rows=` + strconv.Itoa(est) + ` width=0) (actual rows=4003.00 loops=1)
+  ->  Hash Anti Join  (cost=0.00..0.00 rows=` + strconv.Itoa(est) + ` width=0) (actual rows=4003.00 loops=1)
     ->  Seq Scan on public.lineitem l1 (stats)  (cost=0.00..0.00 rows=5997241 width=0) (actual rows=5997241.00 loops=1)
     ->  Seq Scan on public.lineitem l3 (stats)  (cost=0.00..0.00 rows=5997241 width=0) (actual rows=5997241.00 loops=1)`
 	}
@@ -282,8 +282,8 @@ func TestQ21SelfJoinAliasesKeepJoinrelsDistinct(t *testing.T) {
 	// Q21 scans lineitem three times. Without the alias every leaf keys to
 	// "lineitem" and the SEMI, the ANTI and the base scan collapse into one
 	// joinrel identity.
-	plan := `Hash Join (ANTI)  (cost=0.00..0.00 rows=1 width=0) (actual rows=4003.00 loops=1)
-  ->  Hash Join (SEMI)  (cost=0.00..0.00 rows=248 width=0) (actual rows=71824.00 loops=1)
+	plan := `Hash Anti Join  (cost=0.00..0.00 rows=1 width=0) (actual rows=4003.00 loops=1)
+  ->  Hash Semi Join  (cost=0.00..0.00 rows=248 width=0) (actual rows=71824.00 loops=1)
     ->  Seq Scan on public.lineitem l1 (stats)  (cost=0.00..0.00 rows=5997241 width=0) (actual rows=5997241.00 loops=1)
     ->  Seq Scan on public.lineitem l2 (stats)  (cost=0.00..0.00 rows=5997241 width=0) (actual rows=5997241.00 loops=1)
   ->  Seq Scan on public.lineitem l3 (stats)  (cost=0.00..0.00 rows=5997241 width=0) (actual rows=5997241.00 loops=1)`

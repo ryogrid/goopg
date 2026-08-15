@@ -188,7 +188,7 @@ func TestInnerJoinQualPushDeclinesOnUnpreservedJoin(t *testing.T) {
 // residual Filter above would have discarded.
 //
 // TPC-DS Q78 is the witness for why it matters: `ss_sold_year = 1998`
-// sits above two stacked `Hash Join (LEFT)` whose preserved spine leads
+// sits above two stacked `Hash Left Join` whose preserved spine leads
 // to the `ss` channel, and the pass declined at the first one.
 func TestInnerJoinQualPushReachesPreservedOuterSide(t *testing.T) {
 	curr, prev := ijCTEScan("curr_yr"), ijCTEScan("prev_yr")

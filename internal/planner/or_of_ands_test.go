@@ -10,8 +10,9 @@ import (
 
 // TestPlanOrOfAndsExtractsJoinKey verifies that a Q19-shaped WHERE
 // clause `(t1.k=t2.k AND ...) OR (t1.k=t2.k AND ...) OR ...`
-// produces a Hash Join on `t1.k = t2.k` instead of `Nested Loop
-// (CROSS)`. (M0058-0004.)
+// produces a Hash Join on `t1.k = t2.k` instead of a Cartesian
+// `Nested Loop` (a CROSS join, which PG folds to JOIN_INNER).
+// (M0058-0004.)
 func TestPlanOrOfAndsExtractsJoinKey(t *testing.T) {
 	// M0127-P5.9: a legacy-rule assertion; see useLegacyEnumerator.
 	useLegacyEnumerator(t)

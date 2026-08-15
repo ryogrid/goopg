@@ -18,9 +18,9 @@ import (
 const planQ9Shaped = `Sort  (cost=0.00..0.00 rows=175 width=0) (actual time=0.100..0.200 rows=175.00 loops=1)
     Sort Key: nation, o_year DESC
   ->  HashAggregate  (cost=0.00..0.00 rows=175 width=0) (actual time=0.090..0.190 rows=175.00 loops=1)
-    ->  Hash Join (INNER)  (cost=0.00..0.00 rows=1 width=0) (actual time=0.010..0.080 rows=319404.00 loops=1)
+    ->  Hash Join  (cost=0.00..0.00 rows=1 width=0) (actual time=0.010..0.080 rows=319404.00 loops=1)
           Hash Cond: (lineitem.l_orderkey = orders.o_orderkey)
-      ->  Hash Join (INNER, build=left)  (cost=0.00..0.00 rows=2500 width=0) (actual time=0.005..0.050 rows=319404.00 loops=1)
+      ->  Hash Join  (cost=0.00..0.00 rows=2500 width=0) (actual time=0.005..0.050 rows=319404.00 loops=1)
         ->  Seq Scan on public.lineitem  (cost=0.00..0.00 rows=6001215 width=0) (actual time=0.001..0.030 rows=6001215.00 loops=1)
         ->  Hash  (cost=0.00..0.00 rows=8000 width=0) (actual time=0.001..0.002 rows=8000.00 loops=1)
               Buckets: 8192
@@ -49,10 +49,10 @@ func TestParseSeparatesNodesFromDetailLines(t *testing.T) {
 
 func TestParseClassifiesJoinLabels(t *testing.T) {
 	cases := map[string]bool{
-		"Hash Join (inner)":              true,
-		"Hash Join (left, build=left)":   true,
-		"Nested Loop (semi)":             true,
-		"Merge Join (inner)":             true,
+		"Hash Join":                      true,
+		"Hash Left Join":                 true,
+		"Nested Loop Semi Join":          true,
+		"Merge Join":                     true,
 		"Multi-Way Hash Join (4 tables)": true,
 		"Seq Scan on lineitem":           false,
 		"Hash":                           false,
