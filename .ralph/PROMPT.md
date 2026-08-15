@@ -166,6 +166,7 @@ wasted turns).
   written by a loop that ran before the banner changed. Select per the banner and
   rewrite the baton to match, instead of following the stale suggestion. (Resuming a
   genuinely `In-flight:` task is unaffected: finish it, then re-read the banner.)
+- When you pass the baton to the next loop, update Design Doc according to knowledge gained from the current loop.
 - At loop END (immediately before the status block), REWRITE it (≤40 lines) with:
   - `Task:` the fix_plan item being worked (id + one line)
   - `Files:` files touched/being edited (paths, brief why)
