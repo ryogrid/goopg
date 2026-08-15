@@ -1,55 +1,46 @@
-# Working set — M0134-0001 aggregates.sql (S8 Slice 1 sorted-agg executor LANDED)
+# Working set — M0134-0002 alter_table.sql (Slice 1 crash-fix LANDED)
 
-**Task:** M0134-0001 aggregates.sql EXPLAIN-format digestion (P2). This loop
-landed **S8 Slice 1 (class 6 executor half)** — the sorted/GroupAggregate
-(AGG_SORTED) execution capability, planner-inert.
+**Task:** M0134-0002 alter_table.sql regress-sql digestion. This loop landed
+**Slice 1** — the server-crash fix: `viewColumnMap`'s bare-`*` arm
+(`internal/planner/view_dml.go`) now maps POSITIONALLY over the view's frozen
+column count (`len(view.Columns)`), not `len(b.Columns)`. `update v2 set
+q1=q1+1 where q1=123` (bug #17811) executes (2 rows flip 123→124) instead of
+panicking `index out of range [1] with length 1` in `viewProxyTable`.
 
-**Status:** S8 Slice 1 COMPLETE + committed (`c6bea890`). `Aggregate.Strategy`
-(`AggStrategyHashed`/`AggStrategySorted`, zero value = Hashed), `openSorted`
-run-collapsing walk + `sameGroupKey`, shared `finalizeGroup` emit, EXPLAIN
-`GroupAggregate` label. **Planner-inert: nothing sets `Strategy`**, so every
-existing query keeps the hash path byte-identically.
+**Status:** Slice 1 COMPLETE + committed + pushed (`dc8c0b9d`). Design note
+`docs/design/0134-0002-alter-table-sql-divergence.md` (draft) + index; 2 ledger
+rows (rules subsystem, read-path/top-level-* freeze); row 1385 corrected
+(underline = psql symptom of subplan-subtree indent depth, not a fixed-width
+renderer).
 
-**Files:** `internal/planner/plan.go` (AggStrategy type + `Aggregate.Strategy`);
-`internal/executor/operators_join_agg.go` (`openSorted`, `sameGroupKey`,
-`finalizeGroup`, `groupRuntime`→package-level); `internal/executor/
-operators_explain.go` (GroupAggregate/HashAggregate branch);
-`internal/executor/operators_join_agg_sorted_test.go` (5 tests);
-`docs/design/0134-0001-p2-explain-format.md` (S8 Slice 1 landed note).
+**Files:** `internal/planner/view_dml.go` (positional star map),
+`internal/executor/view_dml_test.go` (2 tests: frozen-growth + column-list
+rename); `docs/design/0134-0002-alter-table-sql-divergence.md` + README index.
 
-**Key symbols:** `openSorted` (gated `Strategy==Sorted && GroupingSets==nil &&
-len(GroupExprs)>0 && Mode==AggModeSimple`), `sameGroupKey` (element-wise parts
-compare), `finalizeGroup` (shared emit), `planner.AggStrategy`.
+**Key symbols:** `viewColumnMap` (new `view *catalog.Table` param, positional
+star arm), `viewAutoUpdatableChain`, `viewProxyTable`.
 
-**Findings (this loop):**
-- `evalGroupExprs` allocates a fresh `parts` slice per call (operators_join_agg.go
-  ~2242) — safe to retain `curParts = parts` in `openSorted` (no aliasing).
-- Hash path's `setGroupKey` string-join of `datumKey` (`"s:"+value` / `"x:"+value`,
-  no escaping, `|` separator) can COLLIDE distinct text/bytea groups whose keys
-  contain `|s:`/`|x:` — a latent pre-existing hash bug. Sorted's element-wise
-  `sameGroupKey` is collision-free → hash-vs-sorted would diverge once the planner
-  picks strategy. **Deferral-ledger row appended.**
-- Prior loop's "aggregates.diff = 746" is STALE: current clean-HEAD baseline is
-  1369 lines (tester verified at `85d59ce2`); S8 adds zero new hunks.
+**Findings:** alter_table.sql = 4668-line diff (was 44 hunks), crash lost ~45%
+of the tail; post-fix 4671 lines / 81 hunks (tail populated, bug-#17811 UPDATE
+matches PG). 14 divergence classes: C1 `text[]||text[]` op missing (unblocks all
+13 `\d+`); C2 ALTER-TABLE grammar cluster (largest — RENAME CONSTRAINT, RENAME
+col TO, TYPE USING, comma multi-action, NO INHERIT/NOT VALID, DROP COLUMN IF
+EXISTS, SET WITHOUT OIDS, STORAGE); C3/C4/C8/C9/C10/C11 correctness (C10 =
+data-loss on failed ALTER TYPE; C11 = rules + read-path + freeze); C5 btree-inet;
+C6 catalog gaps; C7/C12/C13/C14 formatter.
 
-**Next step:** brief + delegate **S8 Slice 2 (class 6 planner half)** — group-key
-pathkeys (`pathkeysForSortKeys`/`pathkeysContainedIn` over the existing `PathKey`
-model in `internal/planner/pathkeys.go`), `Sort` emission when the child isn't
-presorted, the hash-vs-sort strategy choice (PG `add_paths_to_grouping_rel` +
-`cost_agg` AGG_SORTED/AGG_HASHED arms), and reorder `GroupExprs` into sort/pathkey
-order (moves EXPLAIN `Group Key:` + output order together). Load the
-`executor-planner-change` + `perf/TPC-H` practice cards; BOUND it per the
-M0072-0002 hang trap (incremental, verify each step). `cost_agg` is
-`cost_funcs.go:452` (currently AGG_HASHED-only, no production caller). Decide
-local choice inside `buildAggregateStage` (bounded) vs promoting grouping into the
-Path/add_path search (large) — prefer the local choice.
+**Next step:** C1 (`text[] || text[]` operator — self-contained, `array_cat`
+already exists at `expr.go:11543`, unblocks every `\d+` describe block) or C2
+(the parser grammar cluster — largest single class). Recommend C1 first (small,
+independent) then C2.
 
-**Gates run (this loop):** `go test ./internal/executor/ ./internal/planner/`
-PASS; `scripts/pg-regress-runner.sh aggregates` byte-identical to clean HEAD (no
-new hunks); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=35); pre-commit pgbench
-smoke PASS (0 failed txns).
+**Gates run (this loop):** `go test ./internal/planner/ ./internal/executor/`
+PASS (2 new tests); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=35);
+`scripts/pg-regress-runner.sh alter_table` no-crash (4671 lines, tail populated);
+pre-commit pgbench smoke PASS (0 failed txns).
 
-**Delegation:** implementer `0134-0001-s8-sorted-agg` DONE (round 1); tester
-(long gates) DONE. Both reports inline (handoff-dir Write sandbox-blocked).
+**Delegation:** researcher `0134-0002-alter-table-research` DONE (crash + 14
+classes + underline correction); implementer `0134-0002-s1-view-crash` DONE
+(2 rounds — by-name → positional refinement); tester tpch-spotcheck DONE.
 
 **In-flight:** none.
