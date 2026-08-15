@@ -9454,6 +9454,28 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		}
 		return AlterTableAction{pos: pos, Kind: kind, With: opts}, nil
 	}
+	// OF type_name — make the table a typed table of the composite type
+	// (PG gram.y `OF any_name` → AT_AddOf). `OF` is a distinct keyword token
+	// (KwOf, token.go:169). All type resolution + column validation happens at
+	// EXECUTE time (ATExecAddOf, tablecmds.c:18216); here we only capture the
+	// name, mirroring the INHERIT arm above. M0134-0002 C2 slice 11.
+	if p.acceptKeyword(KwOf) {
+		tn, err := p.parseObjectName()
+		if err != nil {
+			return AlterTableAction{}, err
+		}
+		return AlterTableAction{pos: p.cur().Pos, Kind: AlterTableAddOf, OfType: tn}, nil
+	}
+	// NOT OF — detach a typed table from its originating type
+	// (PG gram.y `NOT OF` → AT_DropOf). `NOT` matches KwNot (token.go:81) — do
+	// NOT confuse with the acceptIdentKeyword("no") NO INHERIT path above.
+	// M0134-0002 C2 slice 11.
+	if p.acceptKeyword(KwNot) {
+		if !p.acceptKeyword(KwOf) {
+			return AlterTableAction{}, p.errAtCur("expected OF after NOT")
+		}
+		return AlterTableAction{pos: p.cur().Pos, Kind: AlterTableDropOf}, nil
+	}
 	if !p.acceptKeyword(KwAdd) {
 		return AlterTableAction{}, p.errAtCur("expected ADD or DROP")
 	}

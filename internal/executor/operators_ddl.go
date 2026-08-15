@@ -9341,10 +9341,130 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if err := o.execAlterDropColumn(tbl, act); err != nil {
 				return err
 			}
+		case parser.AlterTableAddOf:
+			if err := o.execAlterTableAddOf(tbl, act); err != nil {
+				return err
+			}
+		case parser.AlterTableDropOf:
+			if err := o.execAlterTableDropOf(tbl, act); err != nil {
+				return err
+			}
 		default:
 			return &ExecError{Code: "0A000", Pos: act.Pos(), Message: "ALTER TABLE action is not supported in v0"}
 		}
 	}
+	return nil
+}
+
+// typeArgsEqual reports whether two column-type typmod argument slices are
+// equal element-for-element (empty == nil). Used by execAlterTableAddOf's
+// strict type match, which mirrors PG's atttypmod comparison
+// (postgres/src/backend/commands/tablecmds.c:18296-18298).
+func typeArgsEqual(a, b []int64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// execAlterTableAddOf implements `ALTER TABLE … OF type_name` (PG AT_AddOf,
+// postgres/src/backend/commands/tablecmds.c:18216-18349), re-tagging an
+// existing table as a typed table of the named composite type. Validation is
+// order-strict and position-by-position, mirroring ATExecAddOf: the composite
+// type's (compacted) fields pair with the table's non-dropped columns in order
+// — attnotnull need not match — and any leftover non-dropped table column is an
+// error. The 42804/42809 messages and SQLSTATEs are byte-exact against PG 18.3.
+// Success (re)stamps pg_class.reloftype via tbl.OfTypeOID; goopg tracks no
+// table↔type dependency, so overwriting the OID is all that's needed, and the
+// virtual pg_class builder (catalog.go:7217) surfaces it to pg_dump / \d with
+// no heap re-sync (SET RELOPTIONS precedent, operators_ddl.go:8926-8937).
+// M0134-0002 C2 slice 11.
+func (o *ddlOp) execAlterTableAddOf(tbl *catalog.Table, act parser.AlterTableAction) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return &ExecError{Code: "0A000", Pos: act.Pos(), Message: "typed tables are not supported on this catalog"}
+	}
+	ct := im.LookupCompositeType(act.OfType.Name)
+	if ct == nil {
+		// Same message the CREATE TABLE … OF arm emits (execCreateTable,
+		// operators_ddl.go:1747-1751) — do not invent a new one.
+		return &ExecError{Code: "42704", Pos: act.Pos(),
+			Message: fmt.Sprintf("type %q does not exist", act.OfType.String())}
+	}
+	// Fail if the table has any inheritance parents (pg_inherits scan,
+	// tablecmds.c:18240-18253).
+	if len(tbl.InheritsParentOIDs) > 0 || tbl.PartitionParentOID != 0 {
+		return &ExecError{Code: "42809", Pos: act.Pos(), Message: "typed tables cannot inherit"}
+	}
+	// Check the tuple descriptors for compatibility. Unlike inheritance, we
+	// require that the order also match. However, attnotnull need not match.
+	// tablecmds.c:18255-18317.
+	colIdx := 0
+	for _, f := range ct.Fields {
+		// Get the next non-dropped table attribute.
+		var col *catalog.Column
+		for {
+			if colIdx >= len(tbl.Columns) {
+				return &ExecError{Code: "42804", Pos: act.Pos(),
+					Message: fmt.Sprintf("table is missing column %q", f.Name)}
+			}
+			c := &tbl.Columns[colIdx]
+			colIdx++
+			if !c.Dropped {
+				col = c
+				break
+			}
+		}
+		// Compare name.
+		if !strings.EqualFold(col.Name, f.Name) {
+			return &ExecError{Code: "42804", Pos: act.Pos(),
+				Message: fmt.Sprintf("table has column %q where type requires %q", col.Name, f.Name)}
+		}
+		// Compare type (atttypid, atttypmod, attcollation). Derive the expected
+		// canonical catalog.Type exactly as the CREATE path's addCol does
+		// (operators_ddl.go:1917-1961): split the field's ColType string via
+		// compositeFieldColumnType and resolve any domain to its base type.
+		ctt := compositeFieldColumnType(f.ColType)
+		typeName := strings.ToLower(ctt.Name)
+		if resolved := im.ResolveColumnType(typeName); resolved != typeName {
+			typeName = resolved
+		}
+		expected := catalog.Type{Name: typeName, Args: append([]int64(nil), ctt.Args...), IsArray: ctt.IsArray}
+		if expected.Name != col.Type.Name || expected.IsArray != col.Type.IsArray ||
+			!typeArgsEqual(expected.Args, col.Type.Args) || f.Collation != col.Collation {
+			return &ExecError{Code: "42804", Pos: act.Pos(),
+				Message: fmt.Sprintf("table %q has different type for column %q", tbl.Name, f.Name)}
+		}
+	}
+	// Any remaining columns at the end of the table had better be dropped
+	// (tablecmds.c:18306-18317).
+	for ; colIdx < len(tbl.Columns); colIdx++ {
+		c := tbl.Columns[colIdx]
+		if !c.Dropped {
+			return &ExecError{Code: "42804", Pos: act.Pos(),
+				Message: fmt.Sprintf("table has extra column %q", c.Name)}
+		}
+	}
+	tbl.OfTypeOID = ct.OID
+	return nil
+}
+
+// execAlterTableDropOf implements `ALTER TABLE … NOT OF` (PG AT_DropOf,
+// postgres/src/backend/commands/tablecmds.c:18358-18390): clear reloftype. If
+// the table was never a typed table, raise 42809 `"%s" is not a typed table`
+// (relname). No column changes are made — tbl.OfTypeOID is the sole "is typed"
+// signal, so clearing it is all that's required. M0134-0002 C2 slice 11.
+func (o *ddlOp) execAlterTableDropOf(tbl *catalog.Table, act parser.AlterTableAction) error {
+	if tbl.OfTypeOID == 0 {
+		return &ExecError{Code: "42809", Pos: act.Pos(),
+			Message: fmt.Sprintf("%q is not a typed table", tbl.Name)}
+	}
+	tbl.OfTypeOID = 0
 	return nil
 }
 

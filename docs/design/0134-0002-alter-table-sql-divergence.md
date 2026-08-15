@@ -262,8 +262,28 @@ renders `"dummy_constr" NOT NULL "id" NOT VALID`, then without the suffix after
 VALIDATE. Residual ledgered: order-dependent CREATE TABLE trailer loop (a bare
 `CHECK (...) NOT VALID` still fails).
 
+**Eleventh slice landed (2026-08-16): `OF` / `NOT OF`** — two new executor
+methods close the typed-table reassignment forms. Parser arms (ddl.go:9461-9481)
+capture `OF type_name` → `AlterTableAddOf` (with `OfType`) and `NOT OF` →
+`AlterTableDropOf` onto the new AST kinds (ast.go:3180-3189); `execAlterTableAddOf`
+(operators_ddl.go:9387) resolves the composite type, rejects an inheritance parent
+(42809 `typed tables cannot inherit`), then order-strictly zips the composite's
+(compacted) fields against the table's non-dropped columns, emitting the four
+42804 messages in PG's exact order (`table has column "%s" where type requires
+"%s"`, `table "%s" has different type for column "%s"`, `table is missing column
+"%s"`, `table has extra column "%s"`) — the type match derives the expected
+canonical `catalog.Type` exactly as CREATE's `addCol` does, so `numeric(9,2)` vs
+`numeric(8,2)` (typmod) and `bigint` vs `numeric` (base) both fail while `NOT
+NULL` is ignored (PG: attnotnull need not match). Success stamps
+`tbl.OfTypeOID = ct.OID`; `execAlterTableDropOf` (operators_ddl.go:9462) clears it
+(42809 `"%s" is not a typed table` when it was never typed). Closes the 3
+OF/NOT OF syntax-error sites + all 6 validation errors byte-exact; the `\d tt7`
+reassign+`NOT OF` sequence renders x/y with `q` dropped. Residuals ledgered:
+check_of_type 42809 parity (non-composite vs rowtype vs 42704), reloftype
+restart-durability, and the missing table↔type dependency edge.
+
 Remaining C2 sub-gaps, ranked by error-site count ÷ risk: ANALYZE tab(col) (4,
-re-route — it is an ANALYZE/VACUUM statement gap, not ALTER TABLE), OF/NOT OF (3),
+re-route — it is an ANALYZE/VACUUM statement gap, not ALTER TABLE),
 SET WITHOUT OIDS (1), ENFORCED dup (1, C9-masked).
 
 ## Secondary finding (corrects deferral-ledger row 1385)

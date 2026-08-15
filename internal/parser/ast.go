@@ -3177,6 +3177,16 @@ const (
 	// RenameRelationInternal, tablecmds.c:4129-4134). OldConstraintName holds the
 	// old name; NewName the new one. M0134-0002 C2.
 	AlterTableRenameConstraint
+	// AlterTableAddOf — `ALTER TABLE t OF type_name` (PG AT_AddOf). Re-tags an
+	// existing table as a typed table of the named composite type after
+	// validating the column layout order-strictly. OfType holds the composite
+	// type name. Mirrors CREATE TABLE ... OF (gram.y's `OF any_name`);
+	// M0134-0002 C2 slice 11.
+	AlterTableAddOf
+	// AlterTableDropOf — `ALTER TABLE t NOT OF` (PG AT_DropOf). Detaches a
+	// typed table from its originating composite type by clearing
+	// pg_class.reloftype. PG grammar gram.y's `NOT OF`; M0134-0002 C2 slice 11.
+	AlterTableDropOf
 )
 
 // FDWOptionVerb tags one entry of an `ALTER FOREIGN TABLE ... OPTIONS (...)`
@@ -3252,6 +3262,10 @@ type AlterTableAction struct {
 	// InheritParent is populated for AlterTableInherit and AlterTableNoInherit.
 	// Holds the parent table name. M0097-0048.
 	InheritParent ObjectName
+	// OfType is populated for AlterTableAddOf (`ALTER TABLE t OF type_name`)
+	// and holds the composite type name. Value type, mirrors InheritParent;
+	// empty for AlterTableDropOf. M0134-0002 C2 slice 11.
+	OfType ObjectName
 
 	// CheckExpr is the raw SQL expression for AlterTableAddCheck.
 	CheckExpr string
