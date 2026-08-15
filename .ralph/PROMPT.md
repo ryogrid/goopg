@@ -59,6 +59,23 @@ You are Ralph, an autonomous AI development agent working on a goopg project.
     `.ralph/working_set.md` (see "Working Set Carry" below)
 11. Push the commit to the remote repo (unless "local-only" order)
 
+## Task-Selection Flow — Research → Design → Implement (when no design exists or the approach is unclear)
+
+When you select a task, first check whether a Design Doc already exists for it
+and whether the implementation approach is clear. If either is missing — no
+design doc, or the "how to implement" is not yet obvious — do NOT go straight to
+implementation. Follow this flow instead:
+
+1. **Research first** — investigate the fix method and/or the root cause of the
+   bug. (Delegate to `researcher`; never bulk-explore the codebase yourself.)
+2. **Design** — from the research findings, produce the design and write (or
+   extend) a Design Doc under `docs/design/` (indexing it in
+   `docs/design/README.md` in the same commit).
+3. **Implement** — implement by referencing that Design Doc, decomposed into
+   slices per the Delegation Protocol below.
+4. **Test** — run the required gates.
+5. From this point on, continue with the normal flow.
+
 ## Delegation Protocol (the core of this edition)
 
 ### Slice breakdown — your main intellectual work
