@@ -714,6 +714,38 @@ cases in `explainRelBaseName`" was therefore under-scoped — SRF cases alone cl
 only the same-level multi-SRF shape (two SRFs in one FROM clause), which no
 `aggregates.sql` query exercises.
 
+## S3 — landed 2026-08-15 (class 7a: PG-interpolated join labels)
+
+**What changed.** goopg spelled the join type in a parenthetical —
+`Hash Join (INNER)`, `Nested Loop (SEMI)`, `Nested Loop (CROSS)`, `Hash Join
+(INNER, build=left)`, `Hash Join (ANTI NULL-AWARE)` — while PG interpolates it
+into the node name. Rewrote `describePlan`'s `case *planner.Join` and
+`case *planner.NestedLoopIndexJoin` to call one `joinLabel(algo, joinType)`
+helper (`operators_explain.go`) that mirrors `explain.c` exactly: base words are
+`Nested Loop`/`Hash`/`Merge` (pname, 1421-1430); a non-INNER jointype appends
+` <Type> Join` and an INNER appends ` Join` unless NestLoop (1754-1758); CROSS
+folds to INNER (`parse_clause.c`) so a cross join renders as bare `Nested Loop`.
+The `build=left` and `NULL-AWARE` label annotations are dropped — PG never
+emits them; the `BuildLeft`/`NullAware` planner fields remain (executor
+consumes them). `joinTypeName` is deleted; the old `(SEMI)` "tracked separately"
+comment is retired.
+
+**Twin paths covered in the same slice.** `estimateaudit`'s `isJoinLabel` parser
+already classified both spellings (`joinLabels` + `upstreamJoinPrefixes`), so no
+parser code changed — only its comment (audit.go:64) and the golden fixtures in
+`audit_test.go`/`parity_test.go`/`spine_test.go`. The legacy parenthetical
+spelling stays a classified input by design (committed leftdeep-joins plan
+captures predate the relabel).
+
+**Measured result (`scripts/pg-regress-runner.sh aggregates`, 764→746 lines):**
+zero label-spelling hunks remain; the surviving join hunks are join-ALGORITHM
+choice (class 7b / S9, cost-model line) plus column-qualification.
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=35); units PASS; `TestJoinLabelPinsPGLabels`
+pins all nine (algo, type) spellings against the explain.c rule.
+
+**Out of scope by design:** join-algorithm choice is S9 (class 7b), a cost-model
+slice, untouched here.
+
 ## Cross-case relevance
 
 Every M0134 regress case whose `.sql` emits `EXPLAIN` inherits the formatter
