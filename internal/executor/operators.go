@@ -396,17 +396,23 @@ func (o *projectOp) Next() (TupleSlot, error) {
 // materialisation in the hot path. Matching slots are forwarded
 // to the parent unchanged, so filter never owns Row buffers and
 // no borrow contract is needed.
-// resultOp implements PostgreSQL's childless T_Result (nodeResult.c): it
-// evaluates Targets exactly once against an EMPTY input and emits exactly one
-// row, then EOF. The min/max rewrite (S6, rewriteMinMaxAggregates) uses it as
-// the top node whose sole target is a non-correlated SubqueryExpr feeding the
-// rewritten aggregate value (the InitPlan). A childless Result never calls a
-// child Open/Next/Close.
+// resultOp implements PostgreSQL's T_Result (nodeResult.c). In its childless
+// shape it evaluates Targets exactly once against an EMPTY input and emits
+// exactly one row, then EOF — the S6 min/max rewrite top node whose sole target
+// is a non-correlated SubqueryExpr feeding the rewritten aggregate value (the
+// InitPlan). With a Child (S6 Slice 3d const-arg rewrite) it emits one projected
+// row per child row, exactly PG's `outerPlan(plan)` variant.
 //
-// M0071-0015 Stage E note: the returned slot ALIASES o.out, which is
-// overwritten only if Next() were called again — it isn't, because the first
-// Next() sets o.emitted and the second returns EOF. Consumers holding the slot
-// after the single Next() are safe.
+// OneTimeFilter is PG's resconstantqual (nodeResult.c rs_checkqual latch): when
+// non-nil it is evaluated ONCE at Open against a nil slot, and a NULL/false
+// result short-circuits the node to emit no rows at all (the child is never
+// even opened).
+//
+// M0071-0015 Stage E note: the returned slot ALIASES o.out. Childless that is
+// safe — the first Next() sets o.emitted and the second returns EOF. With a
+// child, o.out is overwritten per Next() under the standard operator contract
+// (the parent must consume the slot before pulling again); the const-arg
+// rewrite sits under a LIMIT 1 which pulls exactly once.
 type resultOp struct {
 	targets []planner.Expr
 	schema  planner.Schema
@@ -414,15 +420,42 @@ type resultOp struct {
 	out     Row
 	emitted bool
 	slot    MaterializedSlot
+	// child is nil for the childless single-emit Result (the S6 InitPlan top
+	// node); set for the const-arg rewrite's inner Result (SeqScan child).
+	child Operator
+	// qual is the optional One-Time Filter (resconstantqual); nil = none.
+	qual planner.Expr
+	// qualFailed is set at Open when the one-time filter evaluated NULL/false:
+	// Next then returns EOF immediately and the child is never opened.
+	qualFailed bool
 }
 
-func newResultOp(plan *planner.Result) *resultOp {
-	return &resultOp{targets: plan.Targets, schema: plan.Output()}
+func newResultOp(plan *planner.Result, child Operator) *resultOp {
+	return &resultOp{targets: plan.Targets, schema: plan.Output(),
+		child: child, qual: plan.OneTimeFilter}
 }
 
 func (o *resultOp) Open(ctx *Context) error {
 	o.ctx = ctx
 	o.emitted = false
+	o.qualFailed = false
+	if o.qual != nil {
+		// One-Time Filter: evaluate ONCE with a nil slot (the const qual reads
+		// no input row). A NULL/false result short-circuits the node — no rows,
+		// child never opened (nodeResult.c ExecResult: resconstantqual false →
+		// return NULL).
+		v, err := evalExpr(o.qual, nil, ctx)
+		if err != nil {
+			return err
+		}
+		if v.IsNull() || v.Kind != KindBool || !v.BoolValue() {
+			o.qualFailed = true
+			return nil
+		}
+	}
+	if o.child != nil {
+		return o.child.Open(ctx)
+	}
 	if cap(o.out) < len(o.targets) {
 		o.out = acquireRow(len(o.targets))
 	} else {
@@ -434,12 +467,47 @@ func (o *resultOp) Open(ctx *Context) error {
 func (o *resultOp) Schema() planner.Schema { return o.schema }
 
 func (o *resultOp) Close() error {
+	if o.child != nil {
+		if err := o.child.Close(); err != nil {
+			return err
+		}
+	}
 	releaseRow(o.out)
 	o.out = nil
 	return nil
 }
 
 func (o *resultOp) Next() (TupleSlot, error) {
+	if o.qualFailed {
+		return nil, EOF
+	}
+	if o.child != nil {
+		// Result-with-child: one projected row per child row (PG's
+		// `outerPlan(plan)` ExecResult variant). The parent Limit stops after
+		// the first row; we never latch a single-emit flag here.
+		childSlot, err := o.child.Next()
+		if err != nil {
+			return nil, err
+		}
+		if childSlot == nil {
+			return nil, EOF
+		}
+		if cap(o.out) < len(o.targets) {
+			o.out = acquireRow(len(o.targets))
+		} else {
+			o.out = o.out[:len(o.targets)]
+		}
+		for i, t := range o.targets {
+			v, err := evalExprSlot(t, childSlot, o.ctx)
+			if err != nil {
+				return nil, err
+			}
+			o.out[i] = v
+		}
+		o.slot.schema = o.schema
+		o.slot.row = o.out
+		return &o.slot, nil
+	}
 	if o.emitted {
 		return nil, EOF
 	}

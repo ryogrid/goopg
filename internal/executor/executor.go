@@ -205,9 +205,18 @@ func buildNode(plan planner.Node) (Operator, error) {
 	case *planner.IndexOnlyScan:
 		return maybeInstrument(p, newIndexOnlyScanOp(p)), nil
 	case *planner.Result:
+		if p.Child != nil {
+			// Result-with-child (S6 Slice 3d const-arg rewrite): build the inner
+			// scan so the One-Time Filter can stream projected rows through it.
+			child, err := Build(p.Child)
+			if err != nil {
+				return nil, err
+			}
+			return maybeInstrument(p, newResultOp(p, child)), nil
+		}
 		// Childless Result (S6 min/max rewrite top node): resultOp evaluates
 		// Targets once and emits exactly one row. No child to Build.
-		return maybeInstrument(p, newResultOp(p)), nil
+		return maybeInstrument(p, newResultOp(p, nil)), nil
 	case *planner.LockRows:
 		child, err := Build(p.Child)
 		if err != nil {

@@ -8533,26 +8533,33 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 		fc.Filter != nil || len(fc.OrderBy) > 0 || len(fc.WithinGroup) > 0 {
 		return nil, false, nil
 	}
-	// The arg must be a plain column Var — no expression / Const.
-	if _, ok := fc.Args[0].(*parser.ColumnRef); !ok {
-		return nil, false, nil
-	}
 	pos := s.Pos()
 
-	// Resolve the agg column against the ORIGINAL context. For the simple
-	// single-table FROM its Index is in table-column order, which is exactly
-	// the coordinate space of the fresh inner scan schemas below.
+	// Resolve the agg arg against the ORIGINAL context. For a column arg the
+	// resolved Index is in table-column order — exactly the coordinate space of
+	// the fresh inner scan schemas below. For a constant arg (S6 Slice 3d) the
+	// resolved value IS the target (`SELECT 100 …`, planagg.c build_minmax_path).
 	argExpr, err := resolveExpr(fc.Args[0], ctx)
 	if err != nil {
 		return nil, false, err
 	}
-	argCR, ok := argExpr.(*ColumnRef)
-	if !ok {
+	// S6 Slice 3d: the arg may be a plain column Var or a constant expression
+	// (`max(100)`, aggregates.sql block 14). Anything else — e.g. an expression
+	// over a column like min(x + 1) — keeps the ordinary Aggregate path.
+	argCR, isColumn := argExpr.(*ColumnRef)
+	if !isColumn && !isConstantExpr(argExpr) {
 		return nil, false, nil
 	}
-	colType := argCR.Type
-	if col, ok := cat.LookupColumn(tbl, argCR.Name); ok {
-		colType = col.Type
+	// Hoisted so the column and constant branches (below) can both assign them
+	// and the shared top-level wrap can read them.
+	var inner Node
+	var colType catalog.Type
+	label := "min"
+	if isMax {
+		label = "max"
+	}
+	if t.Alias != "" {
+		label = t.Alias
 	}
 
 	// Resolve the WHERE qual once, up-front, and reject correlation before
@@ -8577,194 +8584,225 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 		}
 	}
 
-	// `<col> IS NOT NULL`, prepended to the subquery's quals (build_minmax_path).
-	// The executor treats it as a residual filter; functionally redundant at
-	// runtime (ASC NULLS LAST reads the first non-null first) but required for
-	// the EXPLAIN Index Cond / Filter line to match PG. TWO instances are built
-	// because the two scan shapes expose different row widths, and the executor
-	// resolves *ColumnRef by Index only (internal/executor/expr.go): the IOS
-	// output is 1-wide (Covered: [agg col] at Index 0), while the SeqScan decodes
-	// the FULL table row (agg col at argCR.Index). Sharing one instance across
-	// both would be the S6 filtered-cond latent bug: an IOS Cond ref at the table
-	// position is out-of-range on the 1-wide row unless the agg column happens to
-	// be table index 0.
-	//
-	// isNotNull: full-table position — for the SeqScan fallback's Filter.
-	isNotNull := &IsNullExpr{pos: pos, Operand: &ColumnRef{
-		// SourceTableIdx 1: the fresh inner scan is a new single-relation plan
-		// whose own source is source index 1 (tableSchemaWithSource(tbl, 1)),
-		// NOT the outer query's binding.
-		pos: pos, Index: argCR.Index, Name: argCR.Name, Type: argCR.Type,
-		SourceTableIdx: 1,
-	}, Negated: true}
-	// isNotNullIOS: covered-row position (Index 0) — for the IOS Cond.
-	isNotNullIOS := &IsNullExpr{pos: pos, Operand: &ColumnRef{
-		pos: pos, Index: 0, Name: argCR.Name, Type: argCR.Type,
-		SourceTableIdx: 1,
-	}, Negated: true}
+	if isColumn {
+		// Column-arg branch (min/max over a column): the index-driven scan
+		// shapes. The const-arg else-branch below needs no index at all.
+		colType = argCR.Type
+		if col, ok := cat.LookupColumn(tbl, argCR.Name); ok {
+			colType = col.Type
+		}
 
-	var inner Node
-	// A btree index whose leading column is the agg column supplies the sorted
-	// path for free (build_minmax_path's cheapest-path-for-pathkeys; the index's
-	// natural ASC order IS min's pathkey). findBTreeIndexForColumn declines
-	// partial indexes — correct, their predicate is unproven here. A WHERE qual
-	// may ride on the IOS Cond ONLY when it references no column other than the
-	// agg column (the IOS decodes just the covered column; any other ref would be
-	// out-of-range on the 1-wide row — e.g. `min(unique1) WHERE ten = 3` stays on
-	// the SeqScan fallback, as PG would leave it a heap-fetch residual).
-	if idx := findBTreeIndexForColumn(cat, tbl, argCR.Name); idx != nil &&
-		(wherePred == nil || wherePredSafeForIOS(wherePred, argCR)) {
-		covered, ok := cat.LookupColumn(tbl, argCR.Name)
-		if !ok {
-			return nil, false, nil
-		}
-		cond := Expr(isNotNullIOS)
-		if wherePred != nil {
-			// The safe-push check above guarantees every ColumnRef in wherePred is
-			// the agg column, so remapping agg refs argCR.Index -> 0 against the
-			// resolver schema is exact (remapColumnRefsToSchema silently maps a
-			// name missing from newIndex to 0 — the reason the check must run
-			// first). Copy-on-write is fine: wherePred is freshly resolved and not
-			// shared with any other plan fragment.
-			wherePredIOS := remapColumnRefsToSchema(wherePred, ctx.schema,
-				map[string]int{argCR.Name: 0})
-			// andExpr(isNotNullIOS, wherePredIOS): IS NOT NULL is the LEFT
-			// conjunct (planagg.c:385-396 lcons-prepends it; indxpath.c:2764 makes
-			// it a real btree index qual), so formatExprQual renders it in strict
-			// left-then-right tree order as
-			// `((unique1 IS NOT NULL) AND (unique1 < 42))`. The reverse order —
-			// used by the SeqScan Filter's andExpr(pos, wherePred, isNotNull) — is
-			// wrong for the Index Cond line.
-			cond = andExpr(pos, isNotNullIOS, wherePredIOS)
-		}
-		ios := &IndexOnlyScan{
-			pos:      pos,
-			Table:    tbl,
-			Index:    idx,
-			Covered:  []catalog.Column{*covered},
-			Cond:     cond,
-			Backward: isMax,
-			schema: Schema{{Name: argCR.Name, Type: colType,
-				SourceTableIdx: 1}},
-		}
-		inner = &Limit{pos: pos, Child: ios, Limit: &IntegerConst{pos: pos, Value: 1}}
-	}
+		// `<col> IS NOT NULL`, prepended to the subquery's quals (build_minmax_path).
+		// The executor treats it as a residual filter; functionally redundant at
+		// runtime (ASC NULLS LAST reads the first non-null first) but required for
+		// the EXPLAIN Index Cond / Filter line to match PG. TWO instances are built
+		// because the two scan shapes expose different row widths, and the executor
+		// resolves *ColumnRef by Index only (internal/executor/expr.go): the IOS
+		// output is 1-wide (Covered: [agg col] at Index 0), while the SeqScan decodes
+		// the FULL table row (agg col at argCR.Index). Sharing one instance across
+		// both would be the S6 filtered-cond latent bug: an IOS Cond ref at the table
+		// position is out-of-range on the 1-wide row unless the agg column happens to
+		// be table index 0.
+		//
+		// isNotNull: full-table position — for the SeqScan fallback's Filter.
+		isNotNull := &IsNullExpr{pos: pos, Operand: &ColumnRef{
+			// SourceTableIdx 1: the fresh inner scan is a new single-relation plan
+			// whose own source is source index 1 (tableSchemaWithSource(tbl, 1)),
+			// NOT the outer query's binding.
+			pos: pos, Index: argCR.Index, Name: argCR.Name, Type: argCR.Type,
+			SourceTableIdx: 1,
+		}, Negated: true}
+		// isNotNullIOS: covered-row position (Index 0) — for the IOS Cond.
+		isNotNullIOS := &IsNullExpr{pos: pos, Operand: &ColumnRef{
+			pos: pos, Index: 0, Name: argCR.Name, Type: argCR.Type,
+			SourceTableIdx: 1,
+		}, Negated: true}
 
-	// Composite-prefix branch (S6 Slice 3c, ledger row 1371): a btree index
-	// whose FIRST columns are bound by WHERE `col = const` equalities and whose
-	// NEXT column is the agg column supplies the sorted path for free —
-	// `min(tenthous) WHERE thousand = 33` over tenk1_thous_tenthous (block 6).
-	// build_minmax_path (planagg.c:316) is generic: the prefix equality makes
-	// the leading pathkey EC_MUST_BE_REDUNDANT (pathkeys.c:158-178,
-	// pathnodes.h:1473), so the ORDER BY pathkeys begin at the agg column — a
-	// non-leading agg column works exactly when a WHERE equality binds the
-	// leading prefix.
-	if inner == nil {
-		if idx, prefixQuals, k, ok := findCompositePrefixIndexForColumn(cat, tbl, argCR.Name, wherePred); ok {
-			// Covered + ios.schema in index-column order idx.Columns[0..k] —
-			// the prefix columns then the agg column, each at SourceTableIdx 1
-			// (the fresh inner scan's own single source). The agg column's type
-			// is the already-computed colType; prefix types come from the catalog.
-			coveredCols := make([]catalog.Column, 0, k+1)
-			iosSchema := make(Schema, 0, k+1)
-			remap := make(map[string]int, k+1)
-			for i := 0; i <= k; i++ {
-				name := idx.Columns[i]
-				colTypeForName := colType
-				if name != argCR.Name {
-					col, ok := cat.LookupColumn(tbl, name)
-					if !ok {
-						return nil, false, nil
-					}
-					colTypeForName = col.Type
-				}
-				coveredCols = append(coveredCols, catalog.Column{Name: name, Type: colTypeForName})
-				iosSchema = append(iosSchema, SchemaColumn{Name: name, Type: colTypeForName, SourceTableIdx: 1})
-				remap[name] = i
+		// A btree index whose leading column is the agg column supplies the sorted
+		// path for free (build_minmax_path's cheapest-path-for-pathkeys; the index's
+		// natural ASC order IS min's pathkey). findBTreeIndexForColumn declines
+		// partial indexes — correct, their predicate is unproven here. A WHERE qual
+		// may ride on the IOS Cond ONLY when it references no column other than the
+		// agg column (the IOS decodes just the covered column; any other ref would be
+		// out-of-range on the 1-wide row — e.g. `min(unique1) WHERE ten = 3` stays on
+		// the SeqScan fallback, as PG would leave it a heap-fetch residual).
+		if idx := findBTreeIndexForColumn(cat, tbl, argCR.Name); idx != nil &&
+			(wherePred == nil || wherePredSafeForIOS(wherePred, argCR)) {
+			covered, ok := cat.LookupColumn(tbl, argCR.Name)
+			if !ok {
+				return nil, false, nil
 			}
-			// isNotNullIOSAtK: the agg col's `IS NOT NULL` at its covered
-			// position k — NOT the Slice 3b Index-0 isNotNullIOS (the prefix
-			// columns now occupy covered positions 0..k-1).
-			isNotNullIOSAtK := &IsNullExpr{pos: pos, Operand: &ColumnRef{
-				pos: pos, Index: k, Name: argCR.Name, Type: argCR.Type,
-				SourceTableIdx: 1,
-			}, Negated: true}
-			// Remap each prefix qual's ColumnRefs from the resolver-schema
-			// (table-column) positions to the covered-row positions 0..k-1.
-			// findCompositePrefixIndexForColumn's allEq + len(eqs)==k gates
-			// prove every ref is a prefix column, so remapColumnRefsToSchema's
-			// silent-Index-0 fallback (a name missing from the remap) is never
-			// hit.
-			remapped := make([]Expr, len(prefixQuals))
-			for i, q := range prefixQuals {
-				remapped[i] = remapColumnRefsToSchema(q, ctx.schema, remap)
-			}
-			// Conjunct order: prefix quals LEFT, `IS NOT NULL` RIGHT — the
-			// reverse of Slice 3b's single-col order (isNotNull LEFT), matching
-			// the oracle's `Index Cond: ((thousand = 33) AND (tenthous IS NOT
-			// NULL))` (aggregates.out:1052-1057).
-			var cond Expr
-			if k == 1 {
-				cond = andExpr(pos, remapped[0], isNotNullIOSAtK)
-			} else {
-				combined := remapped[0]
-				for _, q := range remapped[1:] {
-					combined = andExpr(pos, combined, q)
-				}
-				cond = andExpr(pos, combined, isNotNullIOSAtK)
+			cond := Expr(isNotNullIOS)
+			if wherePred != nil {
+				// The safe-push check above guarantees every ColumnRef in wherePred is
+				// the agg column, so remapping agg refs argCR.Index -> 0 against the
+				// resolver schema is exact (remapColumnRefsToSchema silently maps a
+				// name missing from newIndex to 0 — the reason the check must run
+				// first). Copy-on-write is fine: wherePred is freshly resolved and not
+				// shared with any other plan fragment.
+				wherePredIOS := remapColumnRefsToSchema(wherePred, ctx.schema,
+					map[string]int{argCR.Name: 0})
+				// andExpr(isNotNullIOS, wherePredIOS): IS NOT NULL is the LEFT
+				// conjunct (planagg.c:385-396 lcons-prepends it; indxpath.c:2764 makes
+				// it a real btree index qual), so formatExprQual renders it in strict
+				// left-then-right tree order as
+				// `((unique1 IS NOT NULL) AND (unique1 < 42))`. The reverse order —
+				// used by the SeqScan Filter's andExpr(pos, wherePred, isNotNull) — is
+				// wrong for the Index Cond line.
+				cond = andExpr(pos, isNotNullIOS, wherePredIOS)
 			}
 			ios := &IndexOnlyScan{
 				pos:      pos,
 				Table:    tbl,
 				Index:    idx,
-				Covered:  coveredCols,
+				Covered:  []catalog.Column{*covered},
 				Cond:     cond,
 				Backward: isMax,
-				schema:   iosSchema,
+				schema: Schema{{Name: argCR.Name, Type: colType,
+					SourceTableIdx: 1}},
 			}
-			// The k+1-wide covered row must be sliced down to the agg column so
-			// the InitPlan emits exactly one column. The Project sits ABOVE the
-			// IOS and BELOW the Limit, mirroring the SeqScan fallback's
-			// invisible Project (walkPlanFiltered skips Project wrappers), so
-			// the rendered shape stays `Limit -> Index Only Scan` as upstream.
-			proj := &Project{pos: pos, Child: ios,
-				Targets: []Expr{&ColumnRef{pos: pos, Index: k, Name: argCR.Name,
+			inner = &Limit{pos: pos, Child: ios, Limit: &IntegerConst{pos: pos, Value: 1}}
+		}
+
+		// Composite-prefix branch (S6 Slice 3c, ledger row 1371): a btree index
+		// whose FIRST columns are bound by WHERE `col = const` equalities and whose
+		// NEXT column is the agg column supplies the sorted path for free —
+		// `min(tenthous) WHERE thousand = 33` over tenk1_thous_tenthous (block 6).
+		// build_minmax_path (planagg.c:316) is generic: the prefix equality makes
+		// the leading pathkey EC_MUST_BE_REDUNDANT (pathkeys.c:158-178,
+		// pathnodes.h:1473), so the ORDER BY pathkeys begin at the agg column — a
+		// non-leading agg column works exactly when a WHERE equality binds the
+		// leading prefix.
+		if inner == nil {
+			if idx, prefixQuals, k, ok := findCompositePrefixIndexForColumn(cat, tbl, argCR.Name, wherePred); ok {
+				// Covered + ios.schema in index-column order idx.Columns[0..k] —
+				// the prefix columns then the agg column, each at SourceTableIdx 1
+				// (the fresh inner scan's own single source). The agg column's type
+				// is the already-computed colType; prefix types come from the catalog.
+				coveredCols := make([]catalog.Column, 0, k+1)
+				iosSchema := make(Schema, 0, k+1)
+				remap := make(map[string]int, k+1)
+				for i := 0; i <= k; i++ {
+					name := idx.Columns[i]
+					colTypeForName := colType
+					if name != argCR.Name {
+						col, ok := cat.LookupColumn(tbl, name)
+						if !ok {
+							return nil, false, nil
+						}
+						colTypeForName = col.Type
+					}
+					coveredCols = append(coveredCols, catalog.Column{Name: name, Type: colTypeForName})
+					iosSchema = append(iosSchema, SchemaColumn{Name: name, Type: colTypeForName, SourceTableIdx: 1})
+					remap[name] = i
+				}
+				// isNotNullIOSAtK: the agg col's `IS NOT NULL` at its covered
+				// position k — NOT the Slice 3b Index-0 isNotNullIOS (the prefix
+				// columns now occupy covered positions 0..k-1).
+				isNotNullIOSAtK := &IsNullExpr{pos: pos, Operand: &ColumnRef{
+					pos: pos, Index: k, Name: argCR.Name, Type: argCR.Type,
+					SourceTableIdx: 1,
+				}, Negated: true}
+				// Remap each prefix qual's ColumnRefs from the resolver-schema
+				// (table-column) positions to the covered-row positions 0..k-1.
+				// findCompositePrefixIndexForColumn's allEq + len(eqs)==k gates
+				// prove every ref is a prefix column, so remapColumnRefsToSchema's
+				// silent-Index-0 fallback (a name missing from the remap) is never
+				// hit.
+				remapped := make([]Expr, len(prefixQuals))
+				for i, q := range prefixQuals {
+					remapped[i] = remapColumnRefsToSchema(q, ctx.schema, remap)
+				}
+				// Conjunct order: prefix quals LEFT, `IS NOT NULL` RIGHT — the
+				// reverse of Slice 3b's single-col order (isNotNull LEFT), matching
+				// the oracle's `Index Cond: ((thousand = 33) AND (tenthous IS NOT
+				// NULL))` (aggregates.out:1052-1057).
+				var cond Expr
+				if k == 1 {
+					cond = andExpr(pos, remapped[0], isNotNullIOSAtK)
+				} else {
+					combined := remapped[0]
+					for _, q := range remapped[1:] {
+						combined = andExpr(pos, combined, q)
+					}
+					cond = andExpr(pos, combined, isNotNullIOSAtK)
+				}
+				ios := &IndexOnlyScan{
+					pos:      pos,
+					Table:    tbl,
+					Index:    idx,
+					Covered:  coveredCols,
+					Cond:     cond,
+					Backward: isMax,
+					schema:   iosSchema,
+				}
+				// The k+1-wide covered row must be sliced down to the agg column so
+				// the InitPlan emits exactly one column. The Project sits ABOVE the
+				// IOS and BELOW the Limit, mirroring the SeqScan fallback's
+				// invisible Project (walkPlanFiltered skips Project wrappers), so
+				// the rendered shape stays `Limit -> Index Only Scan` as upstream.
+				proj := &Project{pos: pos, Child: ios,
+					Targets: []Expr{&ColumnRef{pos: pos, Index: k, Name: argCR.Name,
+						Type: argCR.Type, SourceTableIdx: 1}},
+					schema: Schema{{Name: argCR.Name, Type: colType, SourceTableIdx: 1}}}
+				inner = &Limit{pos: pos, Child: proj, Limit: &IntegerConst{pos: pos, Value: 1}}
+			}
+		}
+
+		if inner == nil {
+			// SeqScan fallback: no qualifying index — neither the leading-column
+			// findBTreeIndexForColumn (which matches only when idx.Columns[0] is the
+			// agg column) nor the composite findCompositePrefixIndexForColumn
+			// matched — or a WHERE qual referencing a non-covered column. Build the
+			// full sorted plan.
+			seqSchema := tableSchemaWithSource(tbl, 1)
+			seq := &SeqScan{pos: pos, Table: tbl, schema: seqSchema}
+			f := &Filter{pos: pos, Child: seq, Predicate: andExpr(pos, wherePred, isNotNull)}
+			sortKey := &ColumnRef{pos: pos, Index: argCR.Index, Name: argCR.Name,
+				Type: argCR.Type, SourceTableIdx: 1}
+			// sortClause: min is ASC NULLS LAST, max is DESC NULLS FIRST
+			// (fetch_agg_sort_op `<` / `>`, nulls_first=false / true —
+			// planagg.c:163-179).
+			sort := &Sort{pos: pos, Child: f,
+				Keys: []SortKey{{Expr: sortKey, Desc: isMax, NullsFirst: isMax}}}
+			// PG's build_minmax_path subquery targetlist is JUST the min column
+			// (single-TLE tlist), so the InitPlan must emit exactly one column. The
+			// IOS path achieves that by decoding only the covered column; goopg's
+			// SeqScan always decodes the FULL table row (cols = table.Columns), so a
+			// Project slices it down to the target column. The Project sits ABOVE the
+			// Sort (whose key indexes the full row, untouched). It is invisible in
+			// EXPLAIN — walkPlanFiltered skips Project wrappers ("PG has no
+			// Projection plan node", operators_explain.go) — so the rendered shape
+			// stays `Limit -> Sort -> SeqScan` exactly as upstream produces.
+			proj := &Project{pos: pos, Child: sort,
+				Targets: []Expr{&ColumnRef{pos: pos, Index: argCR.Index, Name: argCR.Name,
 					Type: argCR.Type, SourceTableIdx: 1}},
 				schema: Schema{{Name: argCR.Name, Type: colType, SourceTableIdx: 1}}}
 			inner = &Limit{pos: pos, Child: proj, Limit: &IntegerConst{pos: pos, Value: 1}}
 		}
-	}
-
-	if inner == nil {
-		// SeqScan fallback: no qualifying index — neither the leading-column
-		// findBTreeIndexForColumn (which matches only when idx.Columns[0] is the
-		// agg column) nor the composite findCompositePrefixIndexForColumn
-		// matched — or a WHERE qual referencing a non-covered column. Build the
-		// full sorted plan.
-		seqSchema := tableSchemaWithSource(tbl, 1)
-		seq := &SeqScan{pos: pos, Table: tbl, schema: seqSchema}
-		f := &Filter{pos: pos, Child: seq, Predicate: andExpr(pos, wherePred, isNotNull)}
-		sortKey := &ColumnRef{pos: pos, Index: argCR.Index, Name: argCR.Name,
-			Type: argCR.Type, SourceTableIdx: 1}
-		// sortClause: min is ASC NULLS LAST, max is DESC NULLS FIRST
-		// (fetch_agg_sort_op `<` / `>`, nulls_first=false / true —
-		// planagg.c:163-179).
-		sort := &Sort{pos: pos, Child: f,
-			Keys: []SortKey{{Expr: sortKey, Desc: isMax, NullsFirst: isMax}}}
-		// PG's build_minmax_path subquery targetlist is JUST the min column
-		// (single-TLE tlist), so the InitPlan must emit exactly one column. The
-		// IOS path achieves that by decoding only the covered column; goopg's
-		// SeqScan always decodes the FULL table row (cols = table.Columns), so a
-		// Project slices it down to the target column. The Project sits ABOVE the
-		// Sort (whose key indexes the full row, untouched). It is invisible in
-		// EXPLAIN — walkPlanFiltered skips Project wrappers ("PG has no
-		// Projection plan node", operators_explain.go) — so the rendered shape
-		// stays `Limit -> Sort -> SeqScan` exactly as upstream produces.
-		proj := &Project{pos: pos, Child: sort,
-			Targets: []Expr{&ColumnRef{pos: pos, Index: argCR.Index, Name: argCR.Name,
-				Type: argCR.Type, SourceTableIdx: 1}},
-			schema: Schema{{Name: argCR.Name, Type: colType, SourceTableIdx: 1}}}
-		inner = &Limit{pos: pos, Child: proj, Limit: &IntegerConst{pos: pos, Value: 1}}
+	} else {
+		// Constant-arg branch (S6 Slice 3d): max(100) has no column to index.
+		// build_minmax_path builds `SELECT 100 … WHERE 100 IS NOT NULL LIMIT 1`;
+		// the const qual becomes a one-time filter on a Result node (nodeResult.c
+		// resconstantqual), no Sort (ORDER BY a const is dropped) and no per-row
+		// Filter. Fail-closed: only when there is no WHERE (a WHERE with a const
+		// arg would need a Filter above the scan — out of scope, stays on the
+		// Aggregate path) and the constant has a resolvable type.
+		if wherePred != nil {
+			return nil, false, nil
+		}
+		ct, ok := ExprResultType(argExpr)
+		if !ok {
+			return nil, false, nil // untyped constant (e.g. NULL literal)
+		}
+		colType = ct
+		otf := &IsNullExpr{pos: pos, Operand: argExpr, Negated: true}
+		seq := &SeqScan{pos: pos, Table: tbl, schema: tableSchemaWithSource(tbl, 1)}
+		innerRes := &Result{pos: pos, Targets: []Expr{argExpr},
+			OneTimeFilter: otf, Child: seq,
+			schema: Schema{{Name: label, Type: colType, SourceTableIdx: 1}}}
+		inner = &Limit{pos: pos, Child: innerRes,
+			Limit: &IntegerConst{pos: pos, Value: 1}}
 	}
 
 	// The InitPlan: a non-correlated scalar SubqueryExpr whose inner plan emits
@@ -8775,13 +8813,6 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 
 	// The childless Result top node (T_Result, nodeResult.c): one row whose
 	// single target is the InitPlan value.
-	label := "min"
-	if isMax {
-		label = "max"
-	}
-	if t.Alias != "" {
-		label = t.Alias
-	}
 	return &Result{pos: pos, Targets: []Expr{init},
 		schema: Schema{{Name: label, Type: colType}}}, true, nil
 }

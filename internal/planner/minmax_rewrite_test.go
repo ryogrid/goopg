@@ -291,6 +291,79 @@ func TestRewriteMinMaxAggExpressionArgNotRewritten(t *testing.T) {
 	}
 }
 
+// TestRewriteMinMaxAggConstArg — S6 Slice 3d acceptance: `SELECT max(100) FROM t`
+// (aggregates.sql block 14) must rewrite to the const-arg shape:
+// Result → SubqueryExpr(InitPlan) → Limit →
+// Result{OneTimeFilter: (100 IS NOT NULL), Child: SeqScan, Targets: [100]}.
+// The inner Result is goopg's first Result-with-child (nodeResult.c
+// outerPlan(plan) variant); its schema type is int4 — ExprResultType's
+// make_const answer — NOT the int8 the normal aggregate path would type a
+// bare integer literal.
+func TestRewriteMinMaxAggConstArg(t *testing.T) {
+	cat, tbl := minmaxRewriteCatalog(t)
+
+	// max(100): the Limit's inner is a *Result carrying the constant target,
+	// the one-time filter, and the SeqScan child.
+	plan, err := Plan(parseOne(t, "SELECT max(100) FROM t"), cat)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	res, _, _, child := digMinMaxInner(t, plan)
+	if len(res.schema) != 1 || res.schema[0].Name != "max" {
+		t.Fatalf("Result schema = %+v, want single column named max", res.schema)
+	}
+	if res.schema[0].Type.Name != "int4" {
+		t.Fatalf("Result schema type = %+v, want int4 (make_const small-literal typing)", res.schema[0].Type)
+	}
+	inner, ok := child.(*Result)
+	if !ok {
+		t.Fatalf("Limit child is %T, want *Result (const-arg inner)", child)
+	}
+	if inner.Child == nil {
+		t.Fatalf("inner Result has nil Child, want *SeqScan")
+	}
+	seq, ok := inner.Child.(*SeqScan)
+	if !ok {
+		t.Fatalf("inner Result Child is %T, want *SeqScan", inner.Child)
+	}
+	if seq.Table != tbl {
+		t.Fatalf("inner SeqScan Table = %v, want %v", seq.Table, tbl)
+	}
+	otf, ok := inner.OneTimeFilter.(*IsNullExpr)
+	if !ok || !otf.Negated {
+		t.Fatalf("inner OneTimeFilter = %#v, want `100 IS NOT NULL`", inner.OneTimeFilter)
+	}
+	if ic, ok := otf.Operand.(*IntegerConst); !ok || ic.Value != 100 {
+		t.Fatalf("inner OneTimeFilter operand = %#v, want IntegerConst(100)", otf.Operand)
+	}
+	if len(inner.Targets) != 1 {
+		t.Fatalf("inner Result has %d targets, want 1", len(inner.Targets))
+	}
+	if ic, ok := inner.Targets[0].(*IntegerConst); !ok || ic.Value != 100 {
+		t.Fatalf("inner Result target = %#v, want IntegerConst(100)", inner.Targets[0])
+	}
+
+	// min(100): same const-arg shape, forward label min.
+	plan, err = Plan(parseOne(t, "SELECT min(100) FROM t"), cat)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	res, _, _, child = digMinMaxInner(t, plan)
+	if len(res.schema) != 1 || res.schema[0].Name != "min" {
+		t.Fatalf("Result schema = %+v, want single column named min", res.schema)
+	}
+	inner, ok = child.(*Result)
+	if !ok {
+		t.Fatalf("Limit child is %T, want *Result (const-arg inner)", child)
+	}
+	if _, ok := inner.OneTimeFilter.(*IsNullExpr); !ok {
+		t.Fatalf("inner OneTimeFilter = %#v, want *IsNullExpr", inner.OneTimeFilter)
+	}
+	if _, ok := inner.Child.(*SeqScan); !ok {
+		t.Fatalf("inner Result Child is %T, want *SeqScan", inner.Child)
+	}
+}
+
 // TestRewriteMinMaxAggFilteredMaxIOS — S6 Slice 3b acceptance (a): a filtered
 // `SELECT max(x) FROM t WHERE x < 42` must push the qual into the IOS Cond as
 // `((x IS NOT NULL) AND (x < 42))` — IS NOT NULL first (planagg.c:385-396

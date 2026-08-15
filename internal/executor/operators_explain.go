@@ -604,6 +604,15 @@ func emitNodeDetailLines(n planner.Node, indent string, verbose bool, rows *[]Ro
 		for _, t := range p.Targets {
 			formatExprQual(t, reg, qualify)
 		}
+		// S6 Slice 3d: the const-arg inner Result carries a resconstantqual
+		// that PG prints as `One-Time Filter:` (explain.c:2234-2240
+		// show_upper_qual, "One-Time Filter" label) — same indent/paren shape
+		// as the scan `Filter:` line. formatExprQual's IsNullExpr arm renders
+		// `(100 IS NOT NULL)` with its parens already built in, and wrapParen
+		// does not double-wrap a single paren group.
+		if p.OneTimeFilter != nil {
+			*rows = append(*rows, Row{NewStringDatum(indent + "One-Time Filter: " + wrapParen(formatExprQual(p.OneTimeFilter, reg, qualify)))})
+		}
 	case *planner.Gather:
 		// PG emits `Workers Planned:` in PLAIN EXPLAIN — it is a plan-time
 		// property. `Workers Launched:` is execution-time and belongs to the
@@ -2032,7 +2041,13 @@ func planChildren(n planner.Node) []planner.Node {
 		return []planner.Node{p.Child}
 	case *planner.Result:
 		// Childless Result (S6): the InitPlan hangs off the SubqueryExpr
-		// target, not a child scan, so the node renders no children.
+		// target, not a child scan, so the node renders no children. A
+		// Result-with-child (S6 Slice 3d const-arg rewrite) renders its inner
+		// scan beneath it — the oracle's `-> Result / One-Time Filter: / ->
+		// Seq Scan on tenk1` (aggregates.out:1198-1200).
+		if p.Child != nil {
+			return []planner.Node{p.Child}
+		}
 		return nil
 	case *planner.Filter:
 		return []planner.Node{p.Child}

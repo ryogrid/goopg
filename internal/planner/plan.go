@@ -1200,20 +1200,29 @@ func (n *Filter) Pos() int       { return n.pos }
 func (n *Filter) Output() Schema { return n.Child.Output() }
 
 // Project — evaluates the target list against its child's rows.
-// Result is a childless projection node: it emits exactly ONE row by
-// evaluating Targets against an empty input. It is the goopg analog of
-// PostgreSQL's T_Result (nodeResult.c), which S6's min/max rewrite uses as the
-// top node above an InitPlan carrying the rewritten scalar aggregate.
+// Result is the goopg analog of PostgreSQL's T_Result (nodeResult.c). In its
+// childless shape it emits exactly ONE row by evaluating Targets against an
+// empty input — the S6 min/max rewrite top node above an InitPlan carrying the
+// rewritten scalar aggregate. With a Child it emits one projected row per child
+// row, exactly PG's `outerPlan(plan)` variant (nodeResult.c ExecResult).
 //
-// There is deliberately no Child: PG's Result may have one, but the only shape
-// goopg constructs is the childless one (the min/max InitPlan hangs off a
-// SubqueryExpr target, not a child scan — see rewriteMinMaxAggregates). Keep it
-// that way until a child-bearing construction site appears.
+// OneTimeFilter is the optional resconstantqual: evaluated ONCE at Open, and a
+// NULL/false result short-circuits the node to emit no rows at all (PG's
+// rs_checkqual latch). Both Child and OneTimeFilter are nil for the plain
+// childless Result (the min/max InitPlan hangs off a SubqueryExpr target, not a
+// child scan — see rewriteMinMaxAggregates); the const-arg rewrite
+// (`SELECT max(100) FROM t`) sets both.
 type Result struct {
 	searchedTree
-	pos     int
+	pos int
+	// Targets: evaluated once per emitted row (childless) or once per child
+	// row (child). The S6 InitPlan SubqueryExpr target hangs here.
 	Targets []Expr
-	schema  Schema
+	// OneTimeFilter: PG's resconstantqual, evaluated once at Open (nil = none).
+	OneTimeFilter Expr
+	// Child: nil = childless single-emit Result; set = one row per child row.
+	Child  Node
+	schema Schema
 }
 
 func (n *Result) Pos() int       { return n.pos }
