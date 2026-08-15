@@ -107,10 +107,14 @@ func TestAlterTableRenameConstraint(t *testing.T) {
 				if _, still := im.LookupIndex(parser.ObjectName{Name: "onek_unique1"}); still {
 					t.Errorf("old index name onek_unique1 still present")
 				}
-				// DROP INDEX by the new name must succeed — the backing index is
-				// really there under the new name.
-				if err := runDDL(t, ctx, "DROP INDEX onek_unique1_new"); err != nil {
-					t.Errorf("DROP INDEX onek_unique1_new: %v", err)
+				// DROP INDEX by the new name must raise 2BP01 (M0134-0002 C2
+				// constraint-guard) — proving the renamed backing index is really
+				// there AND still constraint-backed under the new name.
+				err := runDDL(t, ctx, "DROP INDEX onek_unique1_new")
+				if err == nil {
+					t.Errorf("DROP INDEX onek_unique1_new: expected 2BP01 dependency error")
+				} else if ee, ok := err.(*ExecError); !ok || ee.Code != "2BP01" {
+					t.Errorf("DROP INDEX onek_unique1_new: err = %v, want *ExecError{Code: 2BP01}", err)
 				}
 			},
 		},

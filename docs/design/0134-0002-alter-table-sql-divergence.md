@@ -140,9 +140,19 @@ silently drops a constraint-backed index where PG raises 2BP01 `cannot drop
 index %q because constraint %q on table %q requires it` (deferral-ledger row
 appended; next slice candidate).
 
+**Fourth slice landed (2026-08-16): `DROP INDEX` constraint-guard** —
+`execDropIndex` (`operators_ddl.go:6786`) now raises 2BP01 when the target index
+backs a live UNIQUE / PRIMARY KEY / EXCLUDE constraint (`idx.IsConstraint ||
+idx.IsExclusion`), with the byte-exact PG message `cannot drop index %s because
+constraint %s on table %s requires it` + HINT `You can drop constraint %s on
+table %s instead.` (unquoted names, `getObjectDescription`,
+`dependency.c:780-795`; constraint name == index name for all three kinds). A
+bare `CREATE UNIQUE INDEX` (no constraint) still drops. Closes the `onek`
+:294-296 `DROP INDEX`→`RENAME CONSTRAINT`→`DROP INDEX <new>` sequence (zero
+`onek_unique1_constraint` occurrences in the diff).
+
 Remaining C2 sub-gaps, ranked by error-site count ÷ risk: TYPE…USING (11,
-C10-entangled), DROP INDEX constraint-guard (unblocks the onek RENAME-CONSTRAINT
-site — 2BP01, follow-up slice), comma multi-action (7,
+C10-entangled), comma multi-action (7,
 structural), RENAME `<col>` TO bare (3), ANALYZE tab(col) (4, re-route — it is
 an ANALYZE/VACUUM statement gap, not ALTER TABLE), NOT VALID trailer (2), STORAGE
 (2), OF/NOT OF (3), DROP COLUMN IF EXISTS (1, one-line `acceptKeyword(KwIf)`),

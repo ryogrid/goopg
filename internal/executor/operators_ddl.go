@@ -6836,6 +6836,20 @@ func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 			}
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("index %q does not exist", name.String())}
 		}
+		// M0134-0002 C2: DROP INDEX on an index that backs a UNIQUE / PRIMARY KEY
+		// / EXCLUDE constraint raises 2BP01 instead of silently dropping the
+		// backing index (PG dependency.c:780-795, performDeletion — the constraint
+		// still depends on the index). The constraint name == index name for all
+		// three kinds (goopg invariant). Fires for plain and CONCURRENTLY drops
+		// alike (both reach this loop).
+		if idx.IsConstraint || idx.IsExclusion {
+			return &ExecError{
+				Code:    "2BP01",
+				Pos:     s.Pos(),
+				Message: fmt.Sprintf("cannot drop index %s because constraint %s on table %s requires it", idx.Name, idx.Name, idx.Table.Name),
+				Hint:    fmt.Sprintf("You can drop constraint %s on table %s instead.", idx.Name, idx.Table.Name),
+			}
+		}
 		// DROP INDEX (non-CONCURRENTLY) takes an AccessExclusiveLock on the
 		// index relation itself, then descends the index's table tree, then locks
 		// the descendant child indexes — mirroring PostgreSQL's
