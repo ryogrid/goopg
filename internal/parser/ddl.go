@@ -8525,29 +8525,14 @@ func (p *parser) parseAlter() (Stmt, error) {
 		}
 		return stmt, nil
 	}
-	// RENAME COLUMN old TO new  |  RENAME TO new_name  |  RENAME VALUE 'old' TO 'new'.
+	// RENAME CONSTRAINT old TO new | RENAME VALUE 'old' TO 'new' | RENAME TO
+	// new_name | RENAME [COLUMN] old_name TO new_name. M0134-0002 C2 slice 8:
+	// COLUMN is optional in PG's grammar (opt_column: COLUMN | /*EMPTY*/,
+	// gram.y:9974; the RENAME opt_column name TO name production at gram.y:9720),
+	// so the bare form `RENAME a TO b` must reach the column path via the
+	// fallthrough below. RENAME TO is checked before that fallthrough because TO
+	// is a RESERVED keyword that parseIdent cannot consume.
 	if p.acceptIdentKeyword("rename") {
-		// RENAME COLUMN old_name TO new_name
-		if p.acceptKeyword(KwColumn) {
-			oldNameTok, err := p.parseIdent()
-			if err != nil {
-				return nil, err
-			}
-			if _, err := p.expectKeyword(KwTo); err != nil {
-				return nil, err
-			}
-			newNameTok, err := p.parseIdent()
-			if err != nil {
-				return nil, err
-			}
-			stmt.Actions = append(stmt.Actions, AlterTableAction{
-				pos:           oldNameTok.Pos,
-				Kind:          AlterTableRenameColumn,
-				OldColumnName: identText(oldNameTok),
-				NewName:       identText(newNameTok),
-			})
-			return stmt, nil
-		}
 		// RENAME CONSTRAINT old TO new — mirrors the ALTER DOMAIN RENAME
 		// CONSTRAINT arm (ddl.go:8215-8228). Renames an existing table
 		// constraint (CHECK/FK/UNIQUE/PK/EXCLUDE) in place. M0134-0002 C2.
@@ -8581,7 +8566,29 @@ func (p *parser) parseAlter() (Stmt, error) {
 			}
 			return stmt, nil
 		}
-		// RENAME TO new_name
+		// RENAME TO new_name — must precede the bare-column fallthrough below:
+		// TO is a RESERVED keyword that parseIdent cannot consume, so a table
+		// rename would otherwise misparse as a column rename.
+		if p.acceptKeyword(KwTo) {
+			newNameTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Actions = append(stmt.Actions, AlterTableAction{
+				pos:     newNameTok.Pos,
+				Kind:    AlterTableRenameTable,
+				NewName: identText(newNameTok),
+			})
+			return stmt, nil
+		}
+		// RENAME [COLUMN] old_name TO new_name — COLUMN is optional in PG's
+		// grammar, so the bare form `RENAME a TO b` flows into the existing
+		// AlterTableRenameColumn executor path. M0134-0002 C2 slice 8.
+		_ = p.acceptKeyword(KwColumn)
+		oldNameTok, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
 		if _, err := p.expectKeyword(KwTo); err != nil {
 			return nil, err
 		}
@@ -8590,9 +8597,10 @@ func (p *parser) parseAlter() (Stmt, error) {
 			return nil, err
 		}
 		stmt.Actions = append(stmt.Actions, AlterTableAction{
-			pos:     newNameTok.Pos,
-			Kind:    AlterTableRenameTable,
-			NewName: identText(newNameTok),
+			pos:           oldNameTok.Pos,
+			Kind:          AlterTableRenameColumn,
+			OldColumnName: identText(oldNameTok),
+			NewName:       identText(newNameTok),
 		})
 		return stmt, nil
 	}

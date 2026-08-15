@@ -194,11 +194,41 @@ unmasked: `SET WITH OIDS`/`SET WITHOUT OIDS` and the `OF`/`NOT OF` typed-table
 arms (`AT_OfType`/`AT_NotOf`) have no arm in `parseAlterTableAction` (already on
 the remaining list).
 
-Remaining C2 sub-gaps, ranked by error-site count ÷ risk: RENAME `<col>` TO bare
-(3), ANALYZE tab(col) (4, re-route — it is an ANALYZE/VACUUM statement gap, not
-ALTER TABLE), OF/NOT OF (3), NOT VALID trailer (2), STORAGE (2), DROP COLUMN IF
-EXISTS (1, one-line `acceptKeyword(KwIf)`), DROP CONSTRAINT IF EXISTS (1), SET
-WITHOUT OIDS (1), ENFORCED dup (1, C9-masked).
+**Seventh slice landed (2026-08-16, commit `e4395f7d`): `DROP COLUMN`/`DROP
+CONSTRAINT` IF EXISTS** — both arms of `parseAlterTableAction` now consume `IF
+EXISTS` via `acceptKeyword(KwIf)`/`acceptKeyword(KwExists)` and set the existing
+`AlterTableAction.IfExists` flag (the DROP COLUMN arm had never actually consumed
+it — its old `acceptIdentKeyword` call only matched `TokenIdent`, never the
+`KwIf`/`KwExists` keyword tokens, so `DROP COLUMN IF EXISTS` was a syntax error;
+the slice-1 comment at `ddl.go:9701` already documented this trap).
+`execAlterDropColumn` (`operators_ddl.go:21278`) and `execAlterTableDropConstraint`
+(`:10011`) emit PG's NOTICE and `return nil` when the object is missing (`column
+%q of relation %q does not exist, skipping` / `constraint %q of relation %q does
+not exist, skipping`, byte-exact; ATExecDropColumn tablecmds.c:9326-9328 /
+ATExecDropConstraint :14060-14062). The drop-constraint skip fires only at the
+`pkIdx == nil` fall-through (after all five kinds miss), never at a single-kind
+miss. Closes the `drop column if exists non_existing` + `drop constraint IF EXISTS
+anothertab_chk` divergence lines (8 → 0).
+
+**Eighth slice landed (2026-08-16): `RENAME <col> TO` bare form** — the parser's
+RENAME arm required `acceptKeyword(KwColumn)` (mandatory), so the bare `RENAME a
+TO b` form fell through to `expectKeyword(KwTo)` and errored `expected keyword to
+(got a)` (gram.y:9974 `opt_column: COLUMN | /*EMPTY*/` proves COLUMN optional).
+Reordered the arm: RENAME CONSTRAINT (unchanged) → RENAME VALUE no-op (unchanged)
+→ `RENAME TO` table rename moved UP as `acceptKeyword(KwTo)` (must precede the
+fallthrough — TO is a RESERVED keyword `parseIdent` cannot consume) →
+column-rename fallthrough `_ = p.acceptKeyword(KwColumn)` +
+`parseIdent`/`expectKeyword(KwTo)`/`parseIdent` (mirrors the ALTER VIEW RENAME arm,
+`ddl.go:7751-7777`). Parser-only — the existing `AlterTableRenameColumn` executor
+already emits 42703 `column "…" does not exist`. Closes the 3 bare-form sites
+(`rename test2 to testx`, `rename a to x`, `rename
+"........pg.dropped.1........" to x`) — `expected keyword to (got …)` → 0 in the
+diff; sites 2/3 now reach the executor and emit PG's 42703.
+
+Remaining C2 sub-gaps, ranked by error-site count ÷ risk: ANALYZE tab(col) (4,
+re-route — it is an ANALYZE/VACUUM statement gap, not ALTER TABLE), OF/NOT OF (3),
+NOT VALID trailer (2), STORAGE (2), SET WITHOUT OIDS (1), ENFORCED dup (1,
+C9-masked).
 
 ## Secondary finding (corrects deferral-ledger row 1385)
 

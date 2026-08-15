@@ -663,6 +663,63 @@ func TestParseAlterTableRenameConstraint(t *testing.T) {
 	}
 }
 
+// TestParseAlterTableRenameColumn covers the ALTER TABLE RENAME [COLUMN] form.
+// COLUMN is optional in PG's grammar (opt_column: COLUMN | /*EMPTY*/,
+// gram.y:9974; the RENAME opt_column name TO name production at gram.y:9720),
+// so the bare form `RENAME a TO b` must parse identically to `RENAME COLUMN a
+// TO b`. Also guards the sibling forms in the same arm: RENAME TO (table) and
+// RENAME CONSTRAINT (slice 3). M0134-0002 C2 slice 8.
+func TestParseAlterTableRenameColumn(t *testing.T) {
+	for _, tc := range []struct {
+		sql         string
+		wantOK      bool
+		wantKind    AlterTableActionKind
+		wantOldName string
+		wantNewName string
+	}{
+		// Bare form — COLUMN omitted, the slice-8 feature.
+		{"ALTER TABLE t RENAME a TO b", true, AlterTableRenameColumn, "a", "b"},
+		{"ALTER TABLE t RENAME COLUMN a TO b", true, AlterTableRenameColumn, "a", "b"},
+		// Regression guards: table rename and constraint rename in the same arm.
+		{"ALTER TABLE t RENAME TO t2", true, AlterTableRenameTable, "", "t2"},
+		{"ALTER TABLE t RENAME CONSTRAINT c1 TO c2", true, AlterTableRenameConstraint, "c1", "c2"},
+		// Not a valid RENAME form: missing TO (old column only).
+		{"ALTER TABLE t RENAME a", false, 0, "", ""},
+	} {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			if tc.wantOK {
+				t.Fatalf("Parse(%q): %v", tc.sql, err)
+			}
+			continue
+		}
+		if !tc.wantOK {
+			t.Fatalf("Parse(%q): expected error, got %+v", tc.sql, stmts)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T", tc.sql, stmts[0])
+		}
+		if len(at.Actions) != 1 || at.Actions[0].Kind != tc.wantKind {
+			t.Fatalf("Parse(%q): actions=%+v", tc.sql, at.Actions)
+		}
+		a := at.Actions[0]
+		switch tc.wantKind {
+		case AlterTableRenameColumn:
+			if a.OldColumnName != tc.wantOldName {
+				t.Errorf("Parse(%q): OldColumnName=%q want %q", tc.sql, a.OldColumnName, tc.wantOldName)
+			}
+		case AlterTableRenameConstraint:
+			if a.OldConstraintName != tc.wantOldName {
+				t.Errorf("Parse(%q): OldConstraintName=%q want %q", tc.sql, a.OldConstraintName, tc.wantOldName)
+			}
+		}
+		if a.NewName != tc.wantNewName {
+			t.Errorf("Parse(%q): NewName=%q want %q", tc.sql, a.NewName, tc.wantNewName)
+		}
+	}
+}
+
 // TestParseCreateTableColumnCompression covers the inline `COMPRESSION <method>`
 // clause in a CREATE TABLE column definition (`a text COMPRESSION lz4`), which
 // threads the method onto ColumnDef.Compression. DU-002 slice 183.
