@@ -1269,6 +1269,16 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		if len(savedBindings) > 0 {
 			remapAggExprsWithBindings(node, savedBindings)
 		}
+		// S8 Slice 2a (0134-0001 P2) presorted aggregates: port
+		// adjust_group_pathkeys_for_groupagg (planner.c:3229). When ≥1
+		// aggregate carries an internal ORDER BY / DISTINCT clause, choose the
+		// covering set of pathkeys, wrap the Aggregate's child in a Sort, and
+		// (grouped queries only) switch Strategy to AggStrategySorted so EXPLAIN
+		// shows GroupAggregate instead of HashAggregate. Runs AFTER the remap so
+		// the pathkey expressions (which include GroupExprs) are already in
+		// child-output coordinate space. Gated on enable_presorted_aggregate
+		// (default on); the gate is read inside the rule.
+		applyPresortedAggregateRule(agg.node)
 	} else if s.Having != nil {
 		return nil, &PlanError{
 			Pos:     s.Having.Pos(),

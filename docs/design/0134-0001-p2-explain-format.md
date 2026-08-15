@@ -804,6 +804,37 @@ EXPLAIN `Group Key:` line and the output order together). Load the
 `executor-planner-change` + `perf/TPC-H` practice cards; bound it per the
 M0072-0002 hang trap.
 
+## S8 Slice 2a landed (presorted aggregates, 0134-0001-s8-s2a)
+
+The presorted-aggregate planner rule (`adjust_group_pathkeys_for_groupagg`,
+planner.c:3229) landed in `internal/planner/groupagg_presorted.go`: when an
+aggregate has an internal ORDER BY / DISTINCT clause, the planner now picks the
+covering set of pathkeys (greedy "most aggregates, tiebreak by position"),
+wraps the Aggregate child in a `Sort`, and flips grouped queries to
+`AggStrategySorted` (EXPLAIN shows `GroupAggregate`). Gated on the
+`enable_presorted_aggregate` GUC (default on). The executor half (Slice 1,
+`openSorted`/`applyAgg` per-group sort) predated it and is planner-inert; the
+per-group sort means presorted input changes only the plan shape, never the
+values.
+
+This closes the aggregates.sql EXPLAIN hunks for the non-grouped
+`four`/`two`/`four`/`ten` sorts, the grouped `ten, two, four` and
+`ten, four, two` sorts (volatile `random()` ORDER BY aggregates excluded via a
+`has_volatile_pathkey` port), the `SET enable_presorted_aggregate to off` no-sort
+case, the FILTER `two`/`f1` presorts (with the `f1::varchar(2)` explicit-cast
+no-presort kept distinct via a RelabelType-only strip), and the
+`group_agg_pk` / `agg_sort_order` Sort Key lines. Residual diffs at last
+measurement: the goopg EXPLAIN `QUERY PLAN` underline width (pre-existing,
+cosmetic, affects every plan), the `group_agg_pk` join shape (Merge vs Hash —
+out of scope), and the deferred Rule-3 GroupExprs reordering + parallel-aggregate
+gap (`btg`, `v_pagg_test` — partial closures only).
+
+Pathkey redundancy uses PG's two cases (constant via a plain-literal test, and
+duplicate-expression), ported in `internal/planner/pathkeys.go`
+(`appendPathKeys`/`makeCandidatePathkeys`/`isPlainConst`). The constant test is
+deliberately narrower than `isConstantExpr`: `random()` must survive to the
+greedy's volatility check instead of being dropped as "row-constant".
+
 ## Cross-case relevance
 
 Every M0134 regress case whose `.sql` emits `EXPLAIN` inherits the formatter

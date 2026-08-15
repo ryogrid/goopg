@@ -89,3 +89,97 @@ func pathkeysForSortKeys(keys []SortKey) []PathKey {
 	}
 	return pks
 }
+
+// pathkeyRedundantIn reports whether pk can be dropped from a pathkey list —
+// the two cases of PG's pathkey_is_redundant (pathkeys.c:159).
+//
+//   - Case 1: the pathkey's expression is a constant. PG detects this when
+//     the pathkey's EquivalenceClass contains a constant (EC_MUST_BE_REDUNDANT);
+//     goopg's pathkeys are syntactic, so the direct test is isConstantExpr.
+//     This is what makes `string_agg(distinct f1, ',')` presort by f1 alone:
+//     the delimiter is a constant sort key and is dropped (the acceptance
+//     case `Sort Key: f1`, not `f1, ','`).
+//   - Case 2: the same expression already appears in the list. PG compares
+//     EquivalenceClasses; the sort direction is deliberately ignored (a
+//     lower-order column with the same expr cannot distinguish rows the first
+//     one already ordered, pathkeys.c:141-147).
+func pathkeyRedundantIn(pk PathKey, list []PathKey) bool {
+	// Case 1 must be a PLAIN literal, not row-constancy (isConstantExpr): a
+	// zero-arg volatile function like `random()` is row-independent but its
+	// value changes every evaluation, so presorting by it is meaningless and —
+	// critically — PG keeps it in the pathkey list here so that the greedy
+	// pass's has_volatile_pathkey (planner.c:3351) can drop the whole
+	// aggregate. EC_MUST_BE_REDUNDANT is set only for real Const members;
+	// random() is an EC member, not a Const.
+	if isPlainConst(stripPureRelabel(pk.Expr)) {
+		return true
+	}
+	for _, existing := range list {
+		if exprEqual(pk.Expr, existing.Expr) {
+			return true
+		}
+	}
+	return false
+}
+
+// appendPathKeys appends every non-redundant PathKey of source onto target and
+// returns the updated list — PG's append_pathkeys (pathkeys.c:107). Used by
+// adjust_group_pathkeys_for_groupagg to prefix an aggregate's pathkeys with
+// the GROUP BY pathkeys, dropping any aggregate key the group keys already
+// guarantee (e.g. `GROUP BY ten` plus an aggregate `ORDER BY ten, two` sorts
+// by `ten, two`).
+//
+// The caller must not share target's backing array with a slice it reuses:
+// appendPathKeys may grow it in place.
+func appendPathKeys(target, source []PathKey) []PathKey {
+	for _, pk := range source {
+		if pathkeyRedundantIn(pk, target) {
+			continue
+		}
+		target = append(target, pk)
+	}
+	return target
+}
+
+// makeCandidatePathkeys builds the pathkeys an aggregate's DISTINCT/ORDER BY
+// sortlist requires, dropping constants and duplicate expressions along the
+// way — PG's make_pathkeys_for_sortclauses (pathkeys.c:1381), which appends a
+// key only when !pathkey_is_redundant. The dedup is load-bearing: the
+// delimiter in `string_agg(distinct f1, ',')` is a constant sort key and must
+// not survive into the plan's Sort (pathkey_is_redundant case 1).
+func makeCandidatePathkeys(sortlist []SortKey) []PathKey {
+	var pks []PathKey
+	for _, k := range sortlist {
+		// isPlainConst, NOT isConstantExpr: see pathkeyRedundantIn — a
+		// volatile zero-arg function must survive here so has_volatile_pathkey
+		// can reject the aggregate later.
+		if isPlainConst(stripPureRelabel(k.Expr)) {
+			continue
+		}
+		pk := PathKey{Expr: k.Expr, SortAsc: !k.Desc, NullsFirst: k.NullsFirst}
+		if pathkeyRedundantIn(pk, pks) {
+			continue
+		}
+		pks = append(pks, pk)
+	}
+	return pks
+}
+
+// isPlainConst reports whether e is a literal value or parameter — goopg's
+// analogue of PostgreSQL's Const for the pathkey-redundancy test
+// (EC_MUST_BE_REDUNDANT). Deliberately narrower than isConstantExpr: it does
+// NOT descend into FuncCall (a zero-arg volatile call like random() is
+// row-independent but not constant across evaluations) nor into CastExpr /
+// BinaryOp wrapping a literal. stripPureRelabel is applied by the callers so a
+// relabeled literal still reads as a constant, matching PG's EC normalisation.
+//
+// Implemented as type assertions (isPlainConstantBound + a NullConst test) so
+// the walker census does not count it as a new Expr switch site — it decides
+// about the node in front of it and never descends.
+func isPlainConst(e Expr) bool {
+	if isPlainConstantBound(e) {
+		return true
+	}
+	_, isNull := e.(*NullConst)
+	return isNull
+}

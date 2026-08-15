@@ -403,6 +403,13 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	registry.OnChange("enable_memoize", func(value string) {
 		planner.SetMemoizeEnabled(value == "on" || value == "true" || value == "1")
 	})
+	// S8 Slice 2a: same bridge for `SET enable_presorted_aggregate` — the
+	// upstream planner-method GUC now gates the presorted-aggregate rule
+	// (adjust_group_pathkeys_for_groupagg port) instead of being a
+	// registration-only no-op.
+	registry.OnChange("enable_presorted_aggregate", func(value string) {
+		planner.SetPresortedAggEnabled(value == "on" || value == "true" || value == "1")
+	})
 	if *confPath != "" {
 		entries, err := config.ParseConfigFile(*confPath)
 		if err != nil {
