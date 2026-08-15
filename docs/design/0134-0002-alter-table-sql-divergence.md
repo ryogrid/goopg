@@ -122,8 +122,27 @@ partitioned ERROR byte-matches PG. Unmasked two C3-class gaps (ADD CONSTRAINT
 CHECK without NOT VALID does not validate existing rows; INSERT/UPDATE does not
 enforce CHECK at runtime) — recorded in the deferral ledger, not closed here.
 
+**Third slice landed (2026-08-16): `RENAME CONSTRAINT`** — new parser kind
+`AlterTableRenameConstraint` + `OldConstraintName` field (reusing `NewName`;
+`ConstraintName` stays "ADD CONSTRAINT name") + a RENAME CONSTRAINT arm in the
+RENAME branch (mirrors the ALTER DOMAIN arm); the executor `case
+AlterTableRenameConstraint` renames CHECK (in-place, OID-stable, partition-child
+cascade), FK (slice mutation, OID-stable), and UNIQUE/PK/EXCLUDE via
+`InMemory.RenameIndex` (constraint name == index name, so the backing index
+re-keys in one call) + `resyncIndexClassHeapRow` for restart durability. Error
+codes byte-match PG: 42704 `constraint "%s" for table "%s" does not exist`
+(pg_constraint.c:1234), 42710 `constraint "%s" for relation "%s" already exists`
+for CHECK/FK (pg_constraint.c:1025), 42P07 for the index-backed path
+(RenameRelationInternal, tablecmds.c:4303-4307). Closes the con2/con3/cache-pkey
+rename sites + `\d` renders `"con3foo" PRIMARY KEY, btree (a)`. The `onek` block
+(:294-296) stays open on a pre-existing `DROP INDEX` gap — goopg's `execDropIndex`
+silently drops a constraint-backed index where PG raises 2BP01 `cannot drop
+index %q because constraint %q on table %q requires it` (deferral-ledger row
+appended; next slice candidate).
+
 Remaining C2 sub-gaps, ranked by error-site count ÷ risk: TYPE…USING (11,
-C10-entangled), RENAME CONSTRAINT (11, C7-partial), comma multi-action (7,
+C10-entangled), DROP INDEX constraint-guard (unblocks the onek RENAME-CONSTRAINT
+site — 2BP01, follow-up slice), comma multi-action (7,
 structural), RENAME `<col>` TO bare (3), ANALYZE tab(col) (4, re-route — it is
 an ANALYZE/VACUUM statement gap, not ALTER TABLE), NOT VALID trailer (2), STORAGE
 (2), OF/NOT OF (3), DROP COLUMN IF EXISTS (1, one-line `acceptKeyword(KwIf)`),
