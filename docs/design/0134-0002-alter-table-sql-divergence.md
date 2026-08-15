@@ -92,6 +92,30 @@ entry points), then C2 grammar
 cluster (largest), then the correctness classes C3/C4/C9/C10/C11 each with
 their own deferral rows.
 
+## C2 decomposition + first slice (2026-08-16)
+
+Researcher decomposition (`tmp/ralph-handoffs/0134-0002-c2-grammar-research/report.md`)
+split C2 into **14 sub-gaps** (11 doc-listed + 3 found new: `ADD COLUMN IF NOT
+EXISTS`, `DROP CONSTRAINT IF EXISTS`, `ALTER TABLE ... OF/NOT OF` typed-table
+forms), accounting for ~60 of the 88 `syntax error at or near` lines in the
+diff. Root cause is structural: `parseAlterTableAction` is branch-and-`return`,
+so the ALTER COLUMN / RENAME / SET-* arms return before the comma loop, and
+several arms drop trailers or misuse `acceptIdentKeyword` on reserved `KwIf`.
+
+**First slice landed (commit `8afe5bf7`): `ADD COLUMN IF NOT EXISTS`** — the
+parser's ADD COLUMN arm now consumes `IF NOT EXISTS` via `acceptKeyword(KwIf)`
+(mirroring the correct DROP-ATTRIBUTE pattern, NOT `acceptIdentKeyword`) and
+sets `AlterTableAction.IfExists`; `execAlterTableAddColumn` emits PG's NOTICE
+`column "c" of relation "r" already exists, skipping` and skips instead of
+raising 42701. 8 syntax-error sites closed (88→80), NOTICE byte-exact, diff
+4645→4602. Remaining C2 sub-gaps, ranked by error-site count ÷ risk: NO INHERIT
+trailer (7), TYPE…USING (11, C10-entangled), RENAME CONSTRAINT (11, C7-partial),
+comma multi-action (7, structural), RENAME `<col>` TO bare (3), ANALYZE tab(col)
+(4, re-route — it is an ANALYZE/VACUUM statement gap, not ALTER TABLE), NOT
+VALID trailer (2), STORAGE (2), OF/NOT OF (3), DROP COLUMN IF EXISTS (1, one-line
+`acceptKeyword(KwIf)`), DROP CONSTRAINT IF EXISTS (1), SET WITHOUT OIDS (1),
+ENFORCED dup (1, C9-masked).
+
 ## Secondary finding (corrects deferral-ledger row 1385)
 
 The EXPLAIN `QUERY PLAN` underline width is **not** a goopg fixed-width
