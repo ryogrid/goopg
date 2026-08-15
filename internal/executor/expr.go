@@ -9837,6 +9837,45 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 		return NullDatum, nil
 
+	case "col_description":
+		// col_description(table_oid oid, column_number int4) → text
+		// Returns the comment for a table column from pg_description, keyed by
+		// (classoid=pg_class, objoid, objsubid=attnum). Mirrors PG's SQL body
+		// verbatim (postgres/src/backend/catalog/system_functions.sql:322-327):
+		// a bare SELECT with no matching pg_description row yields NULL, and the
+		// function is declared STRICT (system_functions.sql:325) so any NULL arg
+		// → NULL. psql's describe.c column-comments query calls
+		// pg_catalog.col_description(a.attrelid, a.attnum)
+		// (postgres/src/bin/psql/describe.c:1986); objsubid 0 returns the
+		// table's own comment. M0134-0002 C15.
+		if len(x.Args) >= 2 {
+			oidDatum, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			var objOID uint32
+			switch oidDatum.Kind {
+			case KindInt:
+				objOID = uint32(oidDatum.Int)
+			case KindString:
+				n, _ := strconv.ParseUint(oidDatum.StringValue(), 10, 32)
+				objOID = uint32(n)
+			}
+			attnumDatum, err := evalExpr(x.Args[1], row, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			// STRICT: a NULL table OID (objOID stays 0) or NULL/NOT-INT attnum
+			// arg returns NULL without touching the catalog.
+			if im, ok := ctx.Catalog.(*catalog.InMemory); ok && objOID != 0 && attnumDatum.Kind == KindInt {
+				// classoid 1259 = pg_class; objsubid = the column attnum.
+				if desc, found := im.GetComment(1259, objOID, int32(attnumDatum.Int)); found {
+					return NewStringDatum(desc), nil
+				}
+			}
+		}
+		return NullDatum, nil
+
 	case "shobj_description":
 		// shobj_description(object_oid, catalog_name) → text
 		// Returns the description for a SHARED (cluster-wide) database object
