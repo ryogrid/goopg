@@ -364,6 +364,91 @@ func TestLateralJoinDoesNotLeakCorrelationContext(t *testing.T) {
 	}
 }
 
+// runQueryFast executes sql through BuildFastIterator (the OpNode fast-iterator
+// path the server uses for simple-protocol queries) and returns the result rows
+// as independent copies. Distinct from runQuery, which uses the legacy Build
+// path — only the fast path wraps a Join's children in opNodeOperator, and it
+// is that wrapper (which implements lateralBindable unconditionally) that
+// reproduces the M0134-0001 lateral-aggregate bug.
+func runQueryFast(t *testing.T, ctx *Context, sql string) ([]Row, error) {
+	t.Helper()
+	stmts, err := parser.Parse(sql)
+	if err != nil {
+		return nil, err
+	}
+	plan, err := planner.Plan(stmts[0], ctx.Catalog)
+	if err != nil {
+		return nil, err
+	}
+	it, err := BuildFastIterator(plan)
+	if err != nil {
+		return nil, err
+	}
+	if err := it.Open(ctx); err != nil {
+		return nil, err
+	}
+	defer it.Close()
+	var rows []Row
+	for {
+		slot, err := it.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		if slot == nil {
+			break
+		}
+		// it.dst's Cells are reused across Next calls; snapshot independently.
+		rows = append(rows, append(Row(nil), slotRow(slot)...))
+	}
+	return rows, nil
+}
+
+// TestLateralAggregateOuterRef — M0134-0001 result-correctness regression.
+//
+// A CROSS-joined LATERAL aggregate whose aggregate expression references the
+// outer row must return one row per (s1, s2) pair with sm == s1+s2
+// (aggregates.out:735-760). On the server's BuildFast path the Join's right
+// child is wrapped in opNodeOperator, which implements lateralBindable
+// unconditionally — so a right child that is a HashAggregate over
+// generate_series (NOT a bare SRF) set m.bindable, and bindOuter early-returned
+// without pushing ctx.OuterRows. The aggregate's sum(s1+s2) then resolved the
+// OuterColumnRef s1/level=1 against an empty ctx.OuterRows, raising
+// `outer column ref s1/level=1 out of range (depth=0)`.
+//
+// The legacy Build path builds raw operator children (no opNodeOperator
+// wrapper), so `right.(lateralBindable)` is false there and the general
+// ctx.OuterRows path already works — this test MUST drive the query through
+// BuildFastIterator to reproduce the bug.
+func TestLateralAggregateOuterRef(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	rows, err := runQueryFast(t, ctx, `
+		SELECT s1, s2, sm
+		FROM generate_series(1, 3) s1,
+		  LATERAL (SELECT s2, sum(s1 + s2) sm
+		  FROM generate_series(1, 3) s2 GROUP BY s2) ss
+		ORDER BY 1, 2`)
+	if err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	if len(rows) != 9 {
+		t.Fatalf("row count = %d, want 9 (rows=%v)", len(rows), rows)
+	}
+	for i, r := range rows {
+		if len(r) != 3 {
+			t.Fatalf("row %d width = %d, want 3 (row=%v)", i, len(r), r)
+		}
+		s1, s2, sm := r[0].Int, r[1].Int, r[2].Int
+		if sm != s1+s2 {
+			t.Fatalf("row %d: sm=%d, want s1+s2=%d (row=%v)", i, sm, s1+s2, r)
+		}
+	}
+}
+
 func assertLateralRows(t *testing.T, got, want []string) {
 	t.Helper()
 	if len(got) != len(want) {
