@@ -33,7 +33,7 @@ error cases. It depends on two things the runner does not provide:
 | P5 | 1.3% | `string_agg` over `bytea` drops the delimiter (text `','` fails the `KindBytes` gate) | ~~engine, narrow~~ **non-issue** — the bytea section already matches PG (verified: `grep bytea tmp/regress-diffs/aggregates.diff` → empty) |
 | P6 | 1.1% | `pg_get_viewdef` deparse lowercase/unqualified | engine |
 | P7 | 0.2% | collation propagation (`"POSIX"` → `default`) | engine |
-| P8 | <1% | `column ref f1/0 on nil slot` (partial-index DDL), `outer column ref s1/level=1 out of range` (lateral+agg), missing GROUP-BY-via-USING error | engine |
+| P8 | <1% | ~~`column ref f1/0 on nil slot` (partial-index DDL)~~ — **RESOLVED** (S6 Slice 3e `walkExprTree` `*IsNullExpr` arm); ~~`outer column ref s1/level=1 out of range` (lateral+agg)~~ — **RESOLVED** (Q3, commit `6b9abfb8`: `bindOuter`/`unbindOuter` install the slot bind + `ctx.OuterRows` push orthogonally); missing GROUP-BY-via-USING error (still open — deferral-ledger row) | engine |
 
 ## Root causes (top two)
 
