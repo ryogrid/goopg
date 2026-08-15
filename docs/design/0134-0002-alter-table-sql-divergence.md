@@ -225,10 +225,28 @@ already emits 42703 `column "…" does not exist`. Closes the 3 bare-form sites
 "........pg.dropped.1........" to x`) — `expected keyword to (got …)` → 0 in the
 diff; sites 2/3 now reach the executor and emit PG's 42703.
 
+**Ninth slice landed (2026-08-16): `STORAGE` column clause** — the failing arm was
+the CREATE TABLE column-definition `storage` clause (`col type STORAGE
+{plain|external|extended|main}`), NOT the ALTER `SET STORAGE` arm (that one already
+parses at ddl.go:8918-8930 and executes at operators_ddl.go:8573-8604).
+`parseColumnConstraintList` had a `COMPRESSION` case but no `STORAGE` case, so
+`storage` fell to the switch default → `expected ',' or ')'`. Added a `STORAGE`
+case mirroring COMPRESSION (`acceptIdentKeyword("storage")` then one of the four
+mode keywords) onto a new `ColumnDef.Storage` field (ast.go); `execCreateTable`
+threads it onto `catalog.Column.Storage` on both the BodyOrder `addCol` path and
+the fallback no-BodyOrder path, and a new `validateColumnStorage` enforces PG's
+`GetAttributeStorage` datatype-vs-mode rule (tablecmds.c:22082-22112): a non-plain
+mode on a plain-storage type (`typstorage=='p'`, e.g. int) raises 0A000 `column
+data type integer can only have storage PLAIN` (type name via `pgFormatTypeName`,
+so `int`/`int4` render "integer"). Closes the 2 `got storage` sites
+(diff:2032/2066) → 0. Residuals ledgered: `has_toast_table` (TOAST-modeling,
+`reltoastrelid` hardcoded 0) and the `STORAGE DEFAULT`/invalid-mode grammar forms.
+
 Remaining C2 sub-gaps, ranked by error-site count ÷ risk: ANALYZE tab(col) (4,
 re-route — it is an ANALYZE/VACUUM statement gap, not ALTER TABLE), OF/NOT OF (3),
-NOT VALID trailer (2), STORAGE (2), SET WITHOUT OIDS (1), ENFORCED dup (1,
-C9-masked).
+NOT VALID trailer (2 — splits into a trivial parser-only CREATE TABLE consume-and-drop
+site + a parser/executor/catalog ALTER ADD NOT NULL bundle), SET WITHOUT OIDS (1),
+ENFORCED dup (1, C9-masked).
 
 ## Secondary finding (corrects deferral-ledger row 1385)
 

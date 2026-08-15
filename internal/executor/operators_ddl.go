@@ -1593,6 +1593,73 @@ func compositeFieldColumnType(colType string) parser.ColumnType {
 	return parser.ColumnType{Name: base, Args: args, IsArray: isArray}
 }
 
+// validateColumnStorage enforces PG's GetAttributeStorage rule at CREATE TABLE
+// time: a column whose type is not TOAST-aware (pg_type.typstorage == 'p' —
+// plain, e.g. int/integer/oid) may only be declared `STORAGE plain`. Any other
+// declared mode raises ERRCODE_FEATURE_NOT_SUPPORTED (0A000), mirroring
+// GetAttributeStorage (postgres/src/backend/commands/tablecmds.c:22082-22112,
+// errmsg :22109). The type name in the message renders via pgFormatTypeName
+// (goopg's format_type_be port), so `int`/`int4`/`integer` all print
+// "integer" exactly as format_type_be(int4oid) does. Returns nil when no
+// STORAGE clause was written, the requested mode is plain, or the type is
+// TOAST-aware. M0134-0002 C2 slice 9.
+func validateColumnStorage(cat catalog.Catalog, col catalog.Column) *ExecError {
+	if col.Storage == "" || strings.EqualFold(col.Storage, "plain") {
+		return nil
+	}
+	if columnTypeStorageCode(cat, col) != 'p' {
+		return nil
+	}
+	return &ExecError{
+		Code:    "0A000",
+		Message: fmt.Sprintf("column data type %s can only have storage PLAIN", pgFormatTypeName(col.Type.Name)),
+	}
+}
+
+// columnTypeStorageCode returns the intrinsic pg_type typstorage character for
+// a freshly-declared column — the attstorage PG assumes before any per-column
+// STORAGE clause. Mirrors buildUserPGAttributeRow's typOID resolution
+// (pg18_user_catalog_rows.go): serial spellings remap to their integer base, a
+// quoted "char" maps to the single-byte OID 18, an array column is always
+// extended ('x'), a domain column's Type.Name was already resolved to its base
+// by execCreateTable's ResolveColumnType, and a user-defined enum reports plain
+// ('p', pg_type.dat) while composite/range/multirange and unknown types report
+// extended (userTypeAttrsForOID's fallback). M0134-0002 C2 slice 9.
+func columnTypeStorageCode(cat catalog.Catalog, col catalog.Column) byte {
+	typOID := catalog.TypeNameToOID(col.Type.Name)
+	// Disambiguate the single-byte "char" (OID 18) from bpchar (1042): both
+	// arrive as catalog type name "char", but only the bpchar-equivalent
+	// unquoted `char` carries a length arg ([1]). Mirrors the atttypid remap in
+	// buildUserPGAttributeRow (DU-002 slice 87).
+	if typOID == catalog.OIDBpChar && col.Type.Name == "char" && len(col.Type.Args) == 0 {
+		typOID = catalog.OIDChar
+	}
+	switch strings.ToLower(col.Type.Name) {
+	case "serial", "serial4":
+		typOID = catalog.OIDInt4
+	case "bigserial", "serial8":
+		typOID = catalog.OIDInt8
+	case "smallserial", "serial2":
+		typOID = catalog.OIDInt2
+	}
+	if col.Type.IsArray {
+		return 'x' // every array type is TOAST-aware (pg_type.dat typstorage 'x')
+	}
+	if typOID == catalog.OIDText {
+		// TypeNameToOID falls back to text for names it does not know — text
+		// itself AND user-defined enum/composite/range/multirange types. Only
+		// an enum deviates from the extended default: pg_type.dat enum
+		// typstorage 'p' (a 4-byte by-value value, like oid).
+		if im, ok := cat.(*catalog.InMemory); ok {
+			if _, isEnum := im.LookupEnum(col.Type.Name); isEnum {
+				return 'p'
+			}
+		}
+		return 'x'
+	}
+	return userTypeAttrsForOID(typOID).TypStorage
+}
+
 func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// Temporary tables may only be created in the temp schema (pg_temp),
 	// not in a permanent schema like public.
@@ -1847,7 +1914,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				}
 			}
 		}
-		addCol := func(c parser.ColumnDef) {
+		addCol := func(c parser.ColumnDef) error {
 			typeName := strings.ToLower(c.Type.Name)
 			declaredTypeName := "" // non-empty only when a domain is resolved
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
@@ -1860,7 +1927,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			isSerialCol := serialTyp == "serial" || serialTyp == "serial4" ||
 				serialTyp == "bigserial" || serialTyp == "serial8" ||
 				serialTyp == "smallserial" || serialTyp == "serial2"
-			cols = append(cols, catalog.Column{
+			col := catalog.Column{
 				Name:              c.Name,
 				Type:              catalog.Type{Name: typeName, Args: append([]int64(nil), c.Type.Args...), IsArray: c.Type.IsArray},
 				DeclaredTypeName:  declaredTypeName,
@@ -1880,7 +1947,17 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				Compression:       c.Compression,
 				Collation:         c.Collation,
 				FDWOptions:        c.FDWOptions,
-			})
+				Storage:           c.Storage,
+			}
+			// A declared STORAGE mode must be compatible with the column type's
+			// intrinsic storage: a non-plain mode on a plain-storage type (e.g.
+			// int) is 0A000 — GetAttributeStorage (tablecmds.c:22082-22112).
+			// M0134-0002 C2 slice 9.
+			if verr := validateColumnStorage(o.ctx.Catalog, col); verr != nil {
+				return verr
+			}
+			cols = append(cols, col)
+			return nil
 		}
 		for _, item := range s.BodyOrder {
 			if strings.HasPrefix(item, "@@LIKE:") {
@@ -2061,7 +2138,9 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 							}
 						}
 					} else {
-						addCol(c)
+						if err := addCol(c); err != nil {
+							return err
+						}
 					}
 				}
 			}
@@ -2090,6 +2169,18 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 					typeName = resolved
 				}
 			}
+			// A declared STORAGE mode must be compatible with the column type's
+			// intrinsic storage (GetAttributeStorage, tablecmds.c:22082-22112) —
+			// same rule addCol enforces on the BodyOrder path. M0134-0002 C2
+			// slice 9.
+			if c.Storage != "" {
+				if verr := validateColumnStorage(o.ctx.Catalog, catalog.Column{
+					Type:    catalog.Type{Name: typeName, Args: c.Type.Args, IsArray: c.Type.IsArray},
+					Storage: c.Storage,
+				}); verr != nil {
+					return verr
+				}
+			}
 			cols = append(cols, catalog.Column{
 				Name:             c.Name,
 				Type:             catalog.Type{Name: typeName, Args: append([]int64(nil), c.Type.Args...)},
@@ -2101,6 +2192,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				Compression:      c.Compression,
 				Collation:        c.Collation,
 				FDWOptions:       c.FDWOptions,
+				Storage:          c.Storage,
 			})
 		}
 	}

@@ -1256,6 +1256,16 @@ type ColumnDef struct {
 	// Compression purely so the column round-trips through pg_dump (goopg does
 	// not actually TOAST/compress). DU-002 slice 183.
 	Compression string
+	// Storage is the per-column storage mode from an inline `STORAGE <mode>`
+	// clause (`col text STORAGE plain`) — "plain", "external", "extended", or
+	// "main". Empty when no clause was written. Threaded onto
+	// catalog.Column.Storage so the synthesized pg_attribute row reports
+	// attstorage and pg_dump re-emits a SET STORAGE clause when it differs
+	// from the type default (goopg does not actually TOAST). The requested
+	// mode is validated against the type's intrinsic storage at CREATE TABLE
+	// time (GetAttributeStorage, tablecmds.c:22082-22112). M0134-0002 C2
+	// slice 9.
+	Storage string
 	// Collation is the collation name from an inline `COLLATE <name>` clause
 	// (`col text COLLATE "C"`). Empty when none was written. Stored as the bare
 	// (last-component, unquoted) collation name — e.g. "C", "POSIX", "ucs_basic".

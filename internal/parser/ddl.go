@@ -4282,6 +4282,28 @@ func (p *parser) parseColumnConstraintList(col *ColumnDef) error {
 		case p.acceptIdentKeyword("compression"):
 			method, _ := p.parseIdent() // consume method name (pglz, lz4, default, etc.)
 			col.Compression = normalizeCompressionMethod(method.Value)
+		// STORAGE mode — column-level storage strategy, PG gram.y column_storage
+		// (gram.y:3888-3896): `col type STORAGE {PLAIN|EXTERNAL|EXTENDED|MAIN}`.
+		// `storage` and the four mode names lex as TokenIdent (unreserved words).
+		// goopg does not actually TOAST, but records the mode so the synthesized
+		// pg_attribute row reports attstorage and pg_dump re-emits a SET STORAGE
+		// clause when it differs from the type default; the executor enforces
+		// GetAttributeStorage's datatype-vs-mode rule (tablecmds.c:22082-22112)
+		// when the CREATE TABLE runs. Mirrors the COMPRESSION arm's structure.
+		// M0134-0002 C2 slice 9.
+		case p.acceptIdentKeyword("storage"):
+			switch {
+			case p.acceptIdentKeyword("plain"):
+				col.Storage = "plain"
+			case p.acceptIdentKeyword("external"):
+				col.Storage = "external"
+			case p.acceptIdentKeyword("extended"):
+				col.Storage = "extended"
+			case p.acceptIdentKeyword("main"):
+				col.Storage = "main"
+			default:
+				return p.errAtCur("expected plain, external, extended, or main after STORAGE")
+			}
 		// OPTIONS ( name 'value', … ) — per-column FOREIGN TABLE options
 		// (`c1 int OPTIONS (column_name 'col1')`). Captured onto
 		// catalog.Column.FDWOptions so pg_attribute.attfdwoptions round-trips
