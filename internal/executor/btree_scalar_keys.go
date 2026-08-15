@@ -2,6 +2,7 @@ package executor
 
 import (
 	"fmt"
+	"net"
 	"strings"
 
 	"github.com/goopg/goopg/internal/access/btree"
@@ -363,6 +364,66 @@ func decodeScalarBTreeKey(key []byte, typeName string) (d Datum, n int, handled 
 			return NullDatum, 0, true, derr
 		}
 		return NewTimeDatum(pgTimeFromMicros(v)), 8, true, nil
+	case isInetType(typeName), isCidrType(typeName):
+		// M0134-0002 C5: inverts encodeInetBTreeKey. The key is fixed-width
+		// and self-describing (the family byte selects the address width), so
+		// a composite walk consumes exactly this column. The reconstructed
+		// text is the canonical network_out form (mask printed only when it is
+		// not the family default for inet, always for cidr).
+		d, n, derr := decodeInetBTreeKey(key, isCidrType(typeName))
+		return d, n, true, derr
 	}
 	return NullDatum, 0, false, nil
+}
+
+// decodeInetBTreeKey inverts encodeInetBTreeKey (operators_ddl.go): reads the
+// fixed-width [family][masked-network-addr][bits][full-addr] key back into the
+// canonical inet/cidr text. The family byte selects the address width (2 →
+// 4-byte IPv4, 3 → 16-byte IPv6), so the consumed length is deterministic:
+// 1+4+1+4 = 10 bytes for IPv4, 1+16+1+16 = 34 bytes for IPv6. The OUTPUT text
+// uses the full (host-bit-carrying) address — the same network_in keeps for
+// inet — so re-encoding the decoded text reproduces the key byte-for-byte.
+func decodeInetBTreeKey(key []byte, isCidr bool) (Datum, int, error) {
+	if len(key) < 2 {
+		return NullDatum, 0, fmt.Errorf("btree: inet key truncated, got %d bytes", len(key))
+	}
+	var width int
+	switch key[0] {
+	case 2: // PGSQL_AF_INET
+		width = 4
+	case 3: // PGSQL_AF_INET6
+		width = 16
+	default:
+		return NullDatum, 0, fmt.Errorf("btree: inet key has invalid family byte %d", key[0])
+	}
+	n := 1 + width + 1 + width
+	if len(key) < n {
+		return NullDatum, 0, fmt.Errorf("btree: inet key truncated, got %d bytes", len(key))
+	}
+	// Masked network addr: key[1 : 1+width] (not needed for output; the full
+	// address below is the value network_in stores).
+	bits := int(key[1+width])
+	fullAddr := key[1+width+1 : n]
+	return NewStringDatum(formatInetKeyText(key[0], fullAddr, bits, isCidr)), n, nil
+}
+
+// formatInetKeyText renders an inet/cidr address in PG's canonical network_out
+// form (network.c:140-162 + inet_net_ntop_ipv4 / inet_net_ntop_ipv6,
+// port/inet_net_ntop.c): dotted quad for IPv4, colon-hex (Go's canonical IPv6
+// form, which matches PG's ::-run compression and lowercase hex for the
+// practical cases) for IPv6. The /bits suffix is printed when bits is not the
+// family default (32/128) for INET, and ALWAYS for CIDR — cidr_out appends
+// /n whenever inet_net_ntop's rendering lacks it (network.c:155-159). The
+// always-on cidr mask is what keeps a cidr round-trip lossless: '10.0.0.1/32'
+//::cidr outputs '10.0.0.1/32', not the classful-reparse '10.0.0.1'.
+func formatInetKeyText(family byte, addr []byte, bits int, isCidr bool) string {
+	maxBits := 32
+	if family != 2 {
+		maxBits = 128
+	}
+	s := net.IP(addr).String()
+	if isCidr || bits != maxBits {
+		return fmt.Sprintf("%s/%d", s, bits)
+	}
+	return s
 }

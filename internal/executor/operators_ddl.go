@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"math/big"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -11138,6 +11139,12 @@ func encodeBTreeKeyForColumn(ctx *Context, v Datum, col *catalog.Column, pos int
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not float at runtime (kind %d)", col.Name, v.Kind)}
 		}
 		return btree.EncodeFloat8(f), nil
+	case isInetType(col.Type.Name), isCidrType(col.Type.Name):
+		// inet/cidr share the btree/inet_ops opclass (cidr binary-coerces to
+		// it), so both encode through the same order-preserving network key
+		// that reproduces network_cmp_internal's total order byte-wise
+		// (postgres/src/backend/utils/adt/network.c:402-420). M0134-0002 C5.
+		return encodeInetBTreeKey(v, col, pos)
 	}
 	// Enum types: encode sort order as float64. M0097-0022.
 	// The caller (collectBTreeEntries) pre-converts KindString enum labels to KindEnum
@@ -11146,6 +11153,195 @@ func encodeBTreeKeyForColumn(ctx *Context, v Datum, col *catalog.Column, pos int
 		return btree.EncodeFloat8(v.EnumSortOrder()), nil
 	}
 	return nil, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 cannot index column %q of type %q", col.Name, col.Type.Name)}
+}
+
+// encodeInetBTreeKey encodes an inet/cidr value into a fixed-width, self-
+// delimiting B-tree key whose byte-wise lexicographic order reproduces PG's
+// network_cmp_internal total order (postgres/src/backend/utils/adt/network.c:
+// 402-420).
+//
+// Layout (width = 4 for AF_INET, 16 for AF_INET6):
+//
+//	[0]             family byte: PGSQL_AF_INET (2) or PGSQL_AF_INET6 (3).
+//	                PGSQL_AF_INET6 is AF_INET+1 (utils/inet.h:39-40), NOT the
+//	                OS AF_INET6 value — network_cmp_internal's cross-family
+//	                branch is ip_family(a1)-ip_family(a2), so 2<3 orders
+//	                IPv4 before IPv6.
+//	[1..width]      the address MASKED to `bits` (host bits zeroed)
+//	[width+1]       the netmask length `bits` (0..32 / 0..128, unsigned byte)
+//	[width+2..]     the FULL (unmasked) address — the final tiebreak
+//
+// Order-preserving: the masked-network component compares the common prefix
+// first (bitncmp(ip_addr, ip_addr, Min(bits1,bits2))), and when the common
+// prefix is equal a value with the LONGER mask that has a bit set beyond the
+// shorter mask sorts LATER by this component — exactly the mask-length
+// tiebreak PG applies next, so the byte order never contradicts the operator
+// order. Equal masked networks compare `bits` ascending, then the full
+// address (bitncmp over ip_maxbits), which carries inet's host bits (network_in
+// does NOT mask inet input — inet_net_pton_ipv4, inet_net_pton.c:259-336; cidr
+// input is masked, so its full component is the network itself). The RAW
+// address in the prefix position would be wrong: 10.0.0.1/8 must sort before
+// 10.0.0.0/32 (equal 8-bit prefix, then 8<32).
+func encodeInetBTreeKey(v Datum, col *catalog.Column, pos int) ([]byte, *ExecError) {
+	if v.Kind != KindString {
+		return nil, &ExecError{Code: "42804", Pos: pos,
+			Message: fmt.Sprintf("column %q is not inet at runtime", col.Name)}
+	}
+	typName := "inet"
+	if isCidrType(col.Type.Name) {
+		typName = "cidr"
+	}
+	family, addr, bits, err := parseInetKeyText(v.StringValue(), isCidrType(col.Type.Name))
+	if err != nil {
+		return nil, &ExecError{Code: "22P02", Pos: pos,
+			Message: fmt.Sprintf("invalid input syntax for type %s: %q", typName, v.StringValue())}
+	}
+	width := len(addr)
+	key := make([]byte, 1+width+1+width)
+	key[0] = family
+	copy(key[1:1+width], maskInetAddr(addr, bits))
+	key[1+width] = byte(bits)
+	copy(key[2+width:], addr)
+	return key, nil
+}
+
+// parseInetKeyText parses an inet/cidr text form into (family, address bytes,
+// netmask bits). `isCidr` selects cidr's classful default mask when no /n is
+// present (inet defaults to /32 or /128). Mirrors the address+bits extraction
+// of pg_inet_net_pton (postgres/src/backend/utils/adt/inet_net_pton.c):
+// inet_net_pton_ipv4/ipv6 (inet path, no masking) and inet_cidr_pton_ipv4/ipv6
+// (cidr path, classful defaults). The family is decided exactly as network_in
+// does — a ':' anywhere means IPv6 — so a v4-mapped text like "::ffff:1.2.3.4"
+// stays a 16-byte IPv6 value.
+func parseInetKeyText(s string, isCidr bool) (family byte, addr []byte, bits int, err error) {
+	addrPart := s
+	bits = -1
+	if i := strings.IndexByte(s, '/'); i >= 0 {
+		addrPart = s[:i]
+		rest := s[i+1:]
+		if rest == "" {
+			return 0, nil, 0, fmt.Errorf("bad mask")
+		}
+		for j := 0; j < len(rest); j++ {
+			if rest[j] < '0' || rest[j] > '9' {
+				return 0, nil, 0, fmt.Errorf("bad mask")
+			}
+		}
+		n, convErr := strconv.Atoi(rest)
+		if convErr != nil || n > 128 {
+			return 0, nil, 0, fmt.Errorf("bad mask")
+		}
+		bits = n
+	}
+	if strings.Contains(addrPart, ":") {
+		// IPv6 (network_in: a ':' anywhere selects PGSQL_AF_INET6). Go parses
+		// the full 16-byte form, including embedded-v4 spellings.
+		ip := net.ParseIP(addrPart)
+		if ip == nil {
+			return 0, nil, 0, fmt.Errorf("bad address")
+		}
+		family = 3 // PGSQL_AF_INET6
+		addr = ip
+		if bits == -1 {
+			// inet_net_pton_ipv6 / inet_cidr_pton_ipv6 both default to /128.
+			bits = 128
+		}
+		if bits < 0 || bits > 128 {
+			return 0, nil, 0, fmt.Errorf("bad mask")
+		}
+		return family, addr, bits, nil
+	}
+	// IPv4.
+	var v4 [4]byte
+	var nOctets int
+	if !parseInetV4Octets(addrPart, &v4) {
+		return 0, nil, 0, fmt.Errorf("bad address")
+	}
+	nOctets = len(strings.Split(addrPart, "."))
+	family = 2 // PGSQL_AF_INET
+	addr = v4[:]
+	if bits == -1 {
+		if !isCidr {
+			if nOctets != 4 {
+				// inet_net_pton_ipv4: no mask and not all four octets → enoent.
+				return 0, nil, 0, fmt.Errorf("bad address")
+			}
+			bits = 32
+		} else {
+			bits = cidrDefaultV4Mask(v4[0], nOctets)
+		}
+	} else if bits > nOctets*8 {
+		// "If prefix length overspecifies mantissa, life is bad." (enoent)
+		return 0, nil, 0, fmt.Errorf("bad mask")
+	}
+	if bits < 0 || bits > 32 {
+		return 0, nil, 0, fmt.Errorf("bad mask")
+	}
+	return family, addr, bits, nil
+}
+
+// parseInetV4Octets parses a dotted IPv4 mantissa of 1..4 decimal octets into
+// the zero-padded 4-byte address (inet_net_pton_ipv4 / inet_cidr_pton_ipv4,
+// inet_net_pton.c:95-336).
+func parseInetV4Octets(s string, out *[4]byte) bool {
+	octets := strings.Split(s, ".")
+	if len(octets) < 1 || len(octets) > 4 {
+		return false
+	}
+	for i, o := range octets {
+		if o == "" || o[0] < '0' || o[0] > '9' {
+			return false
+		}
+		v, err := strconv.Atoi(o)
+		if err != nil || v < 0 || v > 255 {
+			return false
+		}
+		out[i] = byte(v)
+	}
+	return true
+}
+
+// cidrDefaultV4Mask returns the classful netmask length cidr input infers when
+// no /n is present (inet_cidr_pton_ipv4, inet_net_pton.c:199-222): Class A /8,
+// B /16, C /24, D /8 (224 → /4), E /32, widened to cover the octets actually
+// written.
+func cidrDefaultV4Mask(first byte, nOctets int) int {
+	var bits int
+	switch {
+	case first >= 240: // Class E
+		bits = 32
+	case first >= 224: // Class D
+		bits = 8
+	case first >= 192: // Class C
+		bits = 24
+	case first >= 128: // Class B
+		bits = 16
+	default: // Class A
+		bits = 8
+	}
+	if octets := nOctets * 8; bits < octets {
+		bits = octets
+	}
+	if bits == 8 && first == 224 {
+		bits = 4
+	}
+	return bits
+}
+
+// maskInetAddr zeroes the host bits of `addr` to the right of `bits`, yielding
+// the network-prefix component of the inet key.
+func maskInetAddr(addr []byte, bits int) []byte {
+	out := append([]byte(nil), addr...)
+	full := bits / 8
+	rem := bits % 8
+	if rem != 0 {
+		out[full] &= byte(0xFF << uint(8-rem))
+		full++
+	}
+	for i := full; i < len(out); i++ {
+		out[i] = 0
+	}
+	return out
 }
 
 // keyExecError adapts the plain-error returns of regIdentifierInput /
@@ -11357,6 +11553,21 @@ func isNameType(name string) bool {
 	return strings.ToLower(name) == "name"
 }
 
+// isInetType returns true for the inet network-address type. inet is the base
+// type of the btree/inet_ops opfamily (IntypeOID OIDInet, catalog.go:21907);
+// cidr binary-coerces to the same opclass.
+func isInetType(name string) bool {
+	return strings.ToLower(name) == "inet"
+}
+
+// isCidrType returns true for the cidr network-address type. cidr's default
+// btree opclass is inet_ops via binary coercion (catalog.go:21908), so it uses
+// the same order-preserving key as inet — only the no-/mask input default
+// differs (cidr's classful mask).
+func isCidrType(name string) bool {
+	return strings.ToLower(name) == "cidr"
+}
+
 // isSupportedBTreeKeyType lists the column types accepted by
 // createSingleColumnBTreeIndex. int4 is the original v0 path; int8
 // and numeric landed for HammerDB TPC-H compatibility. varchar landed
@@ -11380,7 +11591,11 @@ func isSupportedBTreeKeyType(name string) bool {
 		// interval — M0119-0006, the lossy 128-bit comparison span
 		// (btree_interval_key.go).
 		isIntervalTypeName(name) ||
-		strings.ToLower(name) == "uuid"
+		strings.ToLower(name) == "uuid" ||
+		// inet / cidr — M0134-0002 C5, the order-preserving network key
+		// (encodeInetBTreeKey / decodeScalarBTreeKey). Both share the
+		// btree/inet_ops opclass (cidr binary-coerces to it).
+		isInetType(name) || isCidrType(name)
 }
 
 // btreeKeyTypeRejectionError returns the PG-faithful rejection for a type goopg
