@@ -367,10 +367,39 @@ This is a distinct rewrite-shape gap from the composite-prefix case (block 6, le
 under this prerequisite; the projection was wrong: blocks 3-5 need Index-Cond push, block 6
 needs composite-prefix probing.
 
-**Remaining S6 edge cases (unchanged, in dependency order):** (a) filtered single-column
-min/max Index Cond push (blocks 3-5, new ledger row); (b) composite-prefix probing (block 6,
+**Remaining S6 edge cases (unchanged, in dependency order):** (b) composite-prefix probing (block 6,
 ledger row 1371); (c) constant `max(100)` (block 14); (d) scalar-subquery nesting (blocks
 8/17, class-8); (e) inheritance/MergeAppend (blocks 15/16 + partial-index bug).
+
+## S6 Slice 3b — landed 2026-08-15 (filtered single-column min/max Index Cond push)
+
+Shipped (`commit be5dcf7f`): `rewriteMinMaxAggregates` now resolves the WHERE qual once
+up-front and, when a btree index whose leading column is the agg column exists AND the qual
+references only that column (`wherePredSafeForIOS`, fail-closed on subplans/`InExpr`/non-agg
+refs via `exprChildSlots` — the `walkExprTree`-based first attempt missed subplans and
+regressed `subselect.sql` with an out-of-range outer ref), builds the IOS with
+`Cond = (col IS NOT NULL) AND <where-qual>` — the IS NOT NULL as the LEFT conjunct, matching
+PG's `Index Cond: ((unique1 IS NOT NULL) AND (unique1 < 42))` (`planagg.c:385-396` `lcons`).
+
+**Two Index spaces, one latent bug fixed:** the executor resolves `*ColumnRef` by `Index` only
+against the scan row (`slot.Get(cref.Index)`), and the IOS row is 1-wide (`Covered: [agg col]`
+at position 0) while the SeqScan row is full-width. The old code shared a single `isNotNull`
+(`Index: argCR.Index`) across both — correct for the SeqScan fallback but wrong on the IOS for a
+non-leading agg column. The slice splits it: `isNotNullIOS` (Index 0) for the IOS Cond, the
+table-position `isNotNull` for the fallback; the pushed qual's agg refs are remapped
+`argCR.Index → 0` via `remapColumnRefsToSchema` after the safe check.
+
+**Measured result (`scripts/pg-regress-runner.sh aggregates`, 1527→1499 lines, zero
+regressions):** blocks 3-5 now emit `-> Index Only Scan Backward using tenk1_unique1` +
+`Index Cond: ((unique1 IS NOT NULL) AND (unique1 <op> <const>))`, with the `Sort`/`Seq Scan`/
+`Filter` lines gone; the `QUERY PLAN` rule-line width on these blocks is the only remaining
+delta (formatter class, out of scope). RESULT values unchanged (41 / `>42`→9999 / `>42000`→
+NULL). `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=35). 4 unit tests added
+(`internal/planner/minmax_rewrite_test.go`): filtered max/min IOS shape, non-covered-column
+fallback (`min(x) WHERE y=3`), and the non-leading-column latent-bug regression.
+
+**Residual (ledger row 1374):** multi-clause AND nesting vs PG flat, and no-dedup of a
+user-written `col IS NOT NULL` — both cosmetic, recorded not widened.
 
 ## Cross-case relevance
 
