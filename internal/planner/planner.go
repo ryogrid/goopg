@@ -5665,6 +5665,21 @@ type aggregateSurface struct {
 	// funcDepCols maps input column index → output schema index for columns
 	// that are functionally determined by the GROUP BY key. M0097-0003.
 	funcDepCols map[int]int
+	// originalGroupInputCols records the input-column indices of every plain
+	// ColumnRef in the ORIGINAL GROUP BY (before remove_useless_groupby_columns
+	// pruning). isColumnFunctionallyDetermined consults this instead of the
+	// post-prune groupByInputCol, because PG's check_functional_grouping
+	// (src/backend/parser/parse_agg.c) validates the target list against the
+	// FULL group clause BEFORE initsplan.c:412 prunes it — a key column that
+	// pruning dropped still proves the dependency. M0134-0001 S7.
+	originalGroupInputCols map[int]bool
+	// prunedInputCols records input-column indices that
+	// remove_useless_groupby_columns pruned from the group keys.
+	// resolveExprAfterAggregate / resolveTargetsAfterAggregate accept these
+	// columns as functionally-determined passthroughs WITHOUT re-running the
+	// dependency proof: PG's parse analysis already accepted them against the
+	// full GROUP BY, so pruning cannot invalidate them. M0134-0001 S7.
+	prunedInputCols map[int]bool
 	// cat is the catalog, used to look up user-defined aggregates.
 	cat catalog.Catalog
 }
@@ -6270,6 +6285,174 @@ func walkExprForWindows(e parser.Expr, fn func(*parser.FuncCall) error) error {
 	return nil
 }
 
+// pruneUselessGroupByColumns implements the single-relation arm of PostgreSQL's
+// remove_useless_groupby_columns
+// (postgres/src/backend/optimizer/plan/initsplan.c:412).
+//
+// When a GROUP BY lists two or more columns of ONE base relation and some
+// non-deferrable unique/PK index on that relation has a key that is a proper
+// subset of those columns, the surplus group columns are functionally
+// determined by the key and PG drops them, grouping on the minimal set. The
+// pruned columns remain addressable as functionally-determined passthroughs
+// because parse analysis validated them against the FULL group clause before
+// pruning ran (see aggregateSurface.prunedInputCols).
+//
+// Returns keep[i] == false for each group expression to drop, plus the
+// input-schema indices of the pruned ColumnRefs. Returns (nil, nil) unless
+// EVERY eligibility guard holds — fail-closed, matching PG's "skip" paths.
+func pruneUselessGroupByColumns(groupExprs []Expr, inputCtx *resolveContext, cat catalog.Catalog) ([]bool, map[int]bool) {
+	// Guard: at least two GROUP BY items (initsplan.c:422).
+	if len(groupExprs) < 2 {
+		return nil, nil
+	}
+	// Guard: exactly one base relation (RTE_RELATION; initsplan.c:494). PG
+	// processes each rtable relation independently, but this slice implements
+	// only the single-relation arm; a multi-relation FROM is left untouched.
+	var base *rangeBinding
+	for i := range inputCtx.bindings {
+		b := &inputCtx.bindings[i]
+		if b.table == nil {
+			continue // subquery/CTE/function-scan bindings carry no catalog table
+		}
+		if base != nil {
+			return nil, nil
+		}
+		base = b
+	}
+	if base == nil {
+		return nil, nil
+	}
+	tbl := base.table
+	// Guard: an inheritance parent may produce duplicate rows from its child
+	// rels, which would not collapse under GROUP BY; partitioned tables are
+	// exempt because their children partition disjoint row sets (initsplan.c:502).
+	if base.tableOidColIdx > 0 && len(tbl.PartitionKey) == 0 {
+		return nil, nil
+	}
+	// Collect the GROUP BY items that are plain ColumnRefs of this relation,
+	// keyed by column name (a base-relation name maps 1:1 to an attno).
+	groupColByName := map[string]bool{}
+	for _, g := range groupExprs {
+		cr, ok := g.(*ColumnRef)
+		if !ok || cr.SourceTableIdx != base.sourceIdx {
+			continue
+		}
+		groupColByName[cr.Name] = true
+	}
+	// Guard: at least two DISTINCT columns of this relation must be grouped
+	// (initsplan.c:507, bms_membership(relattnos) == BMS_MULTIPLE) — one column
+	// cannot make a redundant pair.
+	if len(groupColByName) < 2 {
+		return nil, nil
+	}
+	// Scan the relation's indexes for a qualifying unique key with the fewest
+	// columns (initsplan.c:578) — the fewer the key columns, the more surplus
+	// columns can be dropped from the GROUP BY.
+	notNullByName := map[string]bool{}
+	for _, c := range tbl.Columns {
+		notNullByName[c.Name] = c.NotNull
+	}
+	var bestKey []string
+	bestN := int(^uint(0) >> 1)
+	for _, idx := range cat.IndexesOnTable(tbl) {
+		// Non-unique, deferrable, partial, or expression indexes cannot prove
+		// a functional dependency (initsplan.c:527-532).
+		if !idx.Unique || idx.Deferrable || idx.InitiallyDeferred || idx.HasPredicate {
+			continue
+		}
+		hasExprCol := false
+		for _, c := range idx.Columns {
+			if c == "" {
+				hasExprCol = true
+				break
+			}
+		}
+		if hasExprCol {
+			continue
+		}
+		// Every key column must be NOT NULL — duplicate NULLs would otherwise
+		// collapse under GROUP BY — unless the index declares NULLS NOT
+		// DISTINCT, which permits exactly one NULL row (initsplan.c:546-552).
+		if !idx.NullsNotDistinct {
+			notNullOK := true
+			for _, c := range idx.Columns {
+				if !notNullByName[c] {
+					notNullOK = false
+					break
+				}
+			}
+			if !notNullOK {
+				continue
+			}
+		}
+		// The index key must be a PROPER subset of the group columns
+		// (initsplan.c:567, bms_subset_compare == BMS_SUBSET1). A key equal to
+		// the whole group leaves nothing to remove.
+		properSubset := true
+		for _, c := range idx.Columns {
+			if !groupColByName[c] {
+				properSubset = false
+				break
+			}
+		}
+		if properSubset && len(idx.Columns) >= len(groupColByName) {
+			properSubset = false
+		}
+		if !properSubset {
+			continue
+		}
+		if len(idx.Columns) < bestN {
+			bestN = len(idx.Columns)
+			bestKey = idx.Columns
+		}
+	}
+	if bestKey == nil {
+		return nil, nil
+	}
+	// Guard: a partitioned table's unique index is only a safe key if it covers
+	// the ENTIRE partition key. PG enforces this at index creation — "unique
+	// constraint on partitioned table must include all partitioning columns",
+	// SQLSTATE 0A000 (postgres/src/backend/commands/indexcmds.c:1093) — so PG
+	// never sees a partitioned unique index missing a partitioning column. goopg
+	// lacks that DDL enforcement, so a PG-legal-but-goopg-accepted index like
+	// UNIQUE(b) on PARTITION BY LIST(a) would otherwise let pruning collapse two
+	// rows with equal b in different partitions into one. Fail closed instead:
+	// if any partition-key column is absent from the winning key, do not prune.
+	// No-op for all PG-legal DDL, where the partition key is necessarily a prefix
+	// of every unique key (p_t1's PK(a,b) covers partition key a, so the S7
+	// prune there is preserved).
+	if len(tbl.PartitionKey) > 0 {
+		inKey := map[string]bool{}
+		for _, c := range bestKey {
+			inKey[c] = true
+		}
+		for _, c := range tbl.PartitionKey {
+			if !inKey[c] {
+				return nil, nil
+			}
+		}
+	}
+	// Mark surplus: this relation's group ColumnRefs whose column is not in the
+	// winning key. PG keeps the original group order with the surplus removed
+	// and always keeps non-Var / outer-Var items (initsplan.c:610-625).
+	keep := make([]bool, len(groupExprs))
+	prunedInputCols := map[int]bool{}
+	inKey := map[string]bool{}
+	for _, c := range bestKey {
+		inKey[c] = true
+	}
+	for i, g := range groupExprs {
+		cr, ok := g.(*ColumnRef)
+		if ok && cr.SourceTableIdx == base.sourceIdx && !inKey[cr.Name] {
+			keep[i] = false
+			prunedInputCols[cr.Index] = true
+		} else {
+			keep[i] = true
+		}
+	}
+	return keep, prunedInputCols
+}
+
 func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext, cat catalog.Catalog) (Node, *resolveContext, *aggregateSurface, Expr, error) {
 	groupExprs := make([]Expr, 0, len(s.GroupBy))
 	groupByExpr := map[string]int{}
@@ -6341,6 +6524,81 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		}
 		groupExprs = append(groupExprs, r)
 		outputSchema = append(outputSchema, SchemaColumn{Name: groupExprName(r), Type: exprType(r)})
+	}
+
+	// M0134-0001 S7: single-relation arm of PG's remove_useless_groupby_columns
+	// (initsplan.c:412). If a unique/PK index makes part of the GROUP BY
+	// redundant, drop the surplus columns from the group keys so the executor
+	// groups on the minimal key. The pruned columns are still addressable as
+	// functionally-determined passthroughs: parse analysis validated them
+	// against the FULL group clause, so resolveExprAfterAggregate /
+	// resolveTargetsAfterAggregate accept them via prunedInputCols without a
+	// fresh dependency proof.
+	//
+	// originalGroupInputCols is the input-index set of the WHOLE pre-prune
+	// group clause. isColumnFunctionallyDetermined consults it (instead of the
+	// post-prune groupByInputCol) because PG's check_functional_grouping
+	// (src/backend/parser/parse_agg.c) validates the target list before this
+	// pruning runs — a key column that pruning dropped still proves the
+	// dependency.
+	originalGroupInputCols := map[int]bool{}
+	for inputIdx := range groupByInputCol {
+		originalGroupInputCols[inputIdx] = true
+	}
+	prunedInputCols := map[int]bool{}
+	// GROUPING(...) calls and grouping sets both depend on the full column set,
+	// so neither can coexist with pruning (initsplan.c:426).
+	if s.GroupingSets == nil && len(collectGroupingCalls(s)) == 0 {
+		keep, pruned := pruneUselessGroupByColumns(groupExprs, inputCtx, cat)
+		if keep != nil {
+			// Remap slot indices: kept item i moves to slot oldToNew[i]. PG
+			// keeps the ORIGINAL group order with the surplus removed
+			// (initsplan.c:610-625). Aggregate and grouping-mask output columns
+			// are appended AFTER the group columns, so compacting the prefix
+			// shifts their indices automatically.
+			oldToNew := make([]int, len(groupExprs))
+			newIdx := 0
+			for i := range groupExprs {
+				if keep[i] {
+					oldToNew[i] = newIdx
+					newIdx++
+				} else {
+					oldToNew[i] = -1
+				}
+			}
+			newGroupExprs := make([]Expr, 0, newIdx)
+			newSchema := make(Schema, 0, newIdx)
+			for i := range groupExprs {
+				if keep[i] {
+					newGroupExprs = append(newGroupExprs, groupExprs[i])
+					newSchema = append(newSchema, outputSchema[i])
+				}
+			}
+			groupExprs = newGroupExprs
+			outputSchema = newSchema
+			for key, old := range groupByExpr {
+				if old >= 0 && old < len(oldToNew) && oldToNew[old] >= 0 {
+					groupByExpr[key] = oldToNew[old]
+				} else {
+					delete(groupByExpr, key)
+				}
+			}
+			for key, old := range groupByExprQual {
+				if old >= 0 && old < len(oldToNew) && oldToNew[old] >= 0 {
+					groupByExprQual[key] = oldToNew[old]
+				} else {
+					delete(groupByExprQual, key)
+				}
+			}
+			for inputIdx, old := range groupByInputCol {
+				if old >= 0 && old < len(oldToNew) && oldToNew[old] >= 0 {
+					groupByInputCol[inputIdx] = oldToNew[old]
+				} else {
+					delete(groupByInputCol, inputIdx)
+				}
+			}
+			prunedInputCols = pruned
+		}
 	}
 
 	aggCalls, err := collectAggregateCalls(s, cat)
@@ -6580,9 +6838,11 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		aggregateByKeyQual:  aggByKeyQual,
 		groupingCallCol:     groupingCallCol,
 		groupCommonSlots:    groupCommonSlots,
-		node:                aggNode,
-		funcDepCols:         map[int]int{},
-		cat:                 cat,
+		node:                    aggNode,
+		funcDepCols:             map[int]int{},
+		originalGroupInputCols: originalGroupInputCols,
+		prunedInputCols:         prunedInputCols,
+		cat:                     cat,
 	}
 
 	var having Expr
@@ -6907,7 +7167,13 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 			if outIdx, alreadyAdded := agg.funcDepCols[col.Index]; alreadyAdded {
 				return &ColumnRef{pos: x.Pos(), Index: outIdx, Name: agg.output.schema[outIdx].Name, Type: agg.output.schema[outIdx].Type}, nil
 			}
-			if isColumnFunctionallyDetermined(col, agg) {
+			// prunedInputCols short-circuits the proof for columns
+			// remove_useless_groupby_columns dropped from the keys: parse analysis
+			// already accepted them against the FULL group clause (PG's
+			// check_functional_grouping), so pruning cannot invalidate them — and
+			// the unique-index case proves nothing via the PK-only
+			// isColumnFunctionallyDetermined. M0134-0001 S7.
+			if agg.prunedInputCols[col.Index] || isColumnFunctionallyDetermined(col, agg) {
 				// Lazily add this column as a passthrough in the Aggregate node.
 				// The executor evaluates Passthrough expressions from the first row
 				// of each group and appends them to the output row.
@@ -7068,7 +7334,7 @@ func resolveTargetsAfterAggregate(targets []parser.ResTarget, agg *aggregateSurf
 					outExpr = &ColumnRef{pos: cr.pos, Index: outIdx, Name: agg.output.schema[outIdx].Name, Type: agg.output.schema[outIdx].Type}
 				} else if outIdx, already := agg.funcDepCols[cr.Index]; already {
 					outExpr = &ColumnRef{pos: cr.pos, Index: outIdx, Name: agg.output.schema[outIdx].Name, Type: agg.output.schema[outIdx].Type}
-				} else if isColumnFunctionallyDetermined(cr, agg) {
+				} else if agg.prunedInputCols[cr.Index] || isColumnFunctionallyDetermined(cr, agg) {
 					outIdx := len(agg.node.schema)
 					sc := SchemaColumn{Name: cr.Name, Type: cr.Type, SourceTableIdx: cr.SourceTableIdx}
 					agg.node.schema = append(agg.node.schema, sc)
@@ -13193,7 +13459,13 @@ func isColumnFunctionallyDetermined(col *ColumnRef, agg *aggregateSurface) bool 
 		if !idx.Primary {
 			continue
 		}
-		// Verify that all index columns are in the GROUP BY.
+		// Verify that all index columns are in the GROUP BY. Coverage is judged
+		// against originalGroupInputCols — the FULL pre-prune clause — because
+		// remove_useless_groupby_columns (initsplan.c:412) may have dropped some
+		// of this index's key columns from the group keys: PG's
+		// check_functional_grouping validates the target list against the group
+		// clause BEFORE pruning runs, so a key column that pruning dropped still
+		// proves the dependency. M0134-0001 S7.
 		allCovered := true
 		for _, idxCol := range idx.Columns {
 			inputIdx, found := colByName[idxCol]
@@ -13201,10 +13473,18 @@ func isColumnFunctionallyDetermined(col *ColumnRef, agg *aggregateSurface) bool 
 				allCovered = false
 				break
 			}
-			slot, inGroupBy := agg.groupByInputCol[inputIdx]
-			if !inGroupBy {
-				allCovered = false
-				break
+			if agg.originalGroupInputCols != nil {
+				if !agg.originalGroupInputCols[inputIdx] {
+					allCovered = false
+					break
+				}
+			} else {
+				// Surface built without pruning tracking (defensive): fall back
+				// to the groupByInputCol membership test.
+				if _, inGroupBy := agg.groupByInputCol[inputIdx]; !inGroupBy {
+					allCovered = false
+					break
+				}
 			}
 			// M0125-0048: under grouping sets only the columns present in
 			// EVERY set can prove a functional dependency. PostgreSQL builds
@@ -13215,9 +13495,14 @@ func isColumnFunctionallyDetermined(col *ColumnRef, agg *aggregateSurface) bool 
 			// ROLLUP(id)` is an error even with id a primary key: the
 			// grand-total level groups by nothing, and one grand-total row
 			// cannot carry one name.
-			if agg.groupCommonSlots != nil && !agg.groupCommonSlots[slot] {
-				allCovered = false
-				break
+			if agg.groupCommonSlots != nil {
+				// Pruning never runs alongside grouping sets (initsplan.c:426),
+				// so groupByInputCol still holds the original slot mapping here.
+				slot, inGroupBy := agg.groupByInputCol[inputIdx]
+				if !inGroupBy || !agg.groupCommonSlots[slot] {
+					allCovered = false
+					break
+				}
 			}
 		}
 		if allCovered {
