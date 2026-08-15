@@ -151,7 +151,7 @@ bare `CREATE UNIQUE INDEX` (no constraint) still drops. Closes the `onek`
 :294-296 `DROP INDEX`→`RENAME CONSTRAINT`→`DROP INDEX <new>` sequence (zero
 `onek_unique1_constraint` occurrences in the diff).
 
-**Fifth slice (2026-08-16, in progress): `TYPE … USING`** — researcher pass
+**Fifth slice landed (2026-08-16, commit `fec178bd`): `TYPE … USING`** — researcher pass
 (`tmp/ralph-handoffs/0134-0002-c2-typeusing-research/report.md`) mapped the full
 path and verdicted it **bounded, not C10-sized**. Parser: the TYPE arm
 (`internal/parser/ddl.go:8947-8959`) consumes `TYPE <typename>` then returns,
@@ -176,11 +176,29 @@ might need to specify "USING x::y".` Bypass the name-unchanged no-op
 (silent no-op), whole-row-reference rejection, generated-column rejection, typmod
 threading.
 
-Remaining C2 sub-gaps, ranked by error-site count ÷ risk: comma multi-action (7,
-structural), RENAME `<col>` TO bare (3), ANALYZE tab(col) (4, re-route — it is
-an ANALYZE/VACUUM statement gap, not ALTER TABLE), NOT VALID trailer (2), STORAGE
-(2), OF/NOT OF (3), DROP COLUMN IF EXISTS (1, one-line `acceptKeyword(KwIf)`),
-DROP CONSTRAINT IF EXISTS (1), SET WITHOUT OIDS (1), ENFORCED dup (1, C9-masked).
+**Sixth slice landed (2026-08-16): comma multi-action** — the ALTER COLUMN block
+was moved out of `parseAlter`'s early-return path (`ddl.go:8778-8985`) into a new
+`parseAlterColumnAction() (AlterTableAction, error)` helper, dispatched from the
+top of `parseAlterTableAction` on the bare `ALTER` token, so the pre-existing
+comma loop (`first := parseAlterTableAction()` then `for p.acceptSymbol(",")`)
+now builds a multi-action list. Every arm converted from append+`return stmt` to
+`return AlterTableAction{…}`; the no-op tail now breaks on `,` as well as `;` and
+returns `AlterTableNoOp` (already ignored by `execAlterTable` at
+`operators_ddl.go:7730`). No AST field and no executor change were needed —
+`AlterTableStmt.Actions` is already a slice and `execAlterTable` already `for
+range`s it (mutating one shared `tbl`). Closes the 7 `(got ,)` + 3
+`expected ADD or DROP (got alter)` sites (both → 0). Deferral ledger row for the
+sequential-apply gap (goopg mutates `tbl` per action; PG's `ATController` preps
+all commands before any catalog write, so a mid-list error rolls back). Also
+unmasked: `SET WITH OIDS`/`SET WITHOUT OIDS` and the `OF`/`NOT OF` typed-table
+arms (`AT_OfType`/`AT_NotOf`) have no arm in `parseAlterTableAction` (already on
+the remaining list).
+
+Remaining C2 sub-gaps, ranked by error-site count ÷ risk: RENAME `<col>` TO bare
+(3), ANALYZE tab(col) (4, re-route — it is an ANALYZE/VACUUM statement gap, not
+ALTER TABLE), OF/NOT OF (3), NOT VALID trailer (2), STORAGE (2), DROP COLUMN IF
+EXISTS (1, one-line `acceptKeyword(KwIf)`), DROP CONSTRAINT IF EXISTS (1), SET
+WITHOUT OIDS (1), ENFORCED dup (1, C9-masked).
 
 ## Secondary finding (corrects deferral-ledger row 1385)
 

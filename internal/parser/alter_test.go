@@ -1023,3 +1023,60 @@ func TestParseAlterTableTypeUsing(t *testing.T) {
 		}
 	}
 }
+
+// TestParseAlterTableAlterColumnMultiAction covers comma-separated
+// `ALTER TABLE ... ALTER COLUMN ...` action lists (M0134-0002 C2 slice 6): each
+// ALTER COLUMN sub-command becomes its own AlterTableAction instead of the old
+// parseAlter early-return that left the comma unconsumed (syntax error
+// "(got ,)"). This is the alter_table.sql regress shape.
+func TestParseAlterTableAlterColumnMultiAction(t *testing.T) {
+	cases := []struct {
+		sql       string
+		wantKinds []AlterTableActionKind
+		wantCols  []string
+	}{
+		{
+			"ALTER TABLE t ALTER COLUMN a SET NOT NULL, ALTER COLUMN b DROP NOT NULL",
+			[]AlterTableActionKind{AlterTableSetNotNull, AlterTableDropNotNull},
+			[]string{"a", "b"},
+		},
+		{
+			"ALTER TABLE t ALTER COLUMN a TYPE bigint, ALTER COLUMN b SET DEFAULT 1",
+			[]AlterTableActionKind{AlterTableAlterColumnType, AlterTableSetDefault},
+			[]string{"a", "b"},
+		},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T", tc.sql, stmts[0])
+		}
+		if len(at.Actions) != len(tc.wantKinds) {
+			t.Fatalf("Parse(%q): actions=%+v want %d", tc.sql, at.Actions, len(tc.wantKinds))
+		}
+		for i, wantKind := range tc.wantKinds {
+			act := at.Actions[i]
+			if act.Kind != wantKind {
+				t.Errorf("Parse(%q): actions[%d].Kind=%v want %v", tc.sql, i, act.Kind, wantKind)
+			}
+			if act.ColumnName != tc.wantCols[i] {
+				t.Errorf("Parse(%q): actions[%d].ColumnName=%q want %q", tc.sql, i, act.ColumnName, tc.wantCols[i])
+			}
+		}
+		// TYPE arm carries the target type; SET DEFAULT arm carries the expression.
+		if tc.wantKinds[0] == AlterTableAlterColumnType {
+			if got := at.Actions[0].NewType.Name; got != "bigint" {
+				t.Errorf("Parse(%q): NewType.Name=%q want %q", tc.sql, got, "bigint")
+			}
+		}
+		if tc.wantKinds[1] == AlterTableSetDefault {
+			if at.Actions[1].DefaultExpr == nil {
+				t.Errorf("Parse(%q): SET DEFAULT DefaultExpr is nil", tc.sql)
+			}
+		}
+	}
+}
