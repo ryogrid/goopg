@@ -1,52 +1,50 @@
-# Working set — M0134-0002 alter_table.sql (C8 system-column rejection LANDED)
+# Working set — M0134-0002 alter_table.sql (C5 btree-inet LANDED)
 
-**Task:** M0134-0002 alter_table.sql regress-sql digestion. This loop landed **C8**
-— reject PostgreSQL system-column names for user columns. New case-sensitive
-`isSystemColumn(name)` helper (ctid/xmin/cmin/xmax/cmax/tableoid; NO `oid`, legal
-since PG 12) applied at four entry points: `execCreateTable`, `execCreateTableAs`,
-`execAlterTableAddColumn`, and the RENAME COLUMN arm (`internal/executor/
-operators_ddl.go`); `validatePartitionKey` (`operators_ddl_partition.go`) now reuses
-the one helper. The pre-existing RENAME check was also corrected: SQLSTATE
-42P20→42701, dropped `oid`, case-sensitive (was `strings.EqualFold`).
+**Task:** M0134-0002 alter_table.sql regress-sql digestion. This loop landed **C5**
+— accept inet/cidr btree keys. The rejection was a hardcoded Go allow-list, not an
+opclass lookup: the full btree/inet_ops catalog stack was already seeded.
+`isSupportedBTreeKeyType` now accepts `"inet"`/`"cidr"`, plus a new order-preserving
+encoder/decoder arm `encodeInetBTreeKey`/`decodeInetBTreeKey` (fixed-width
+`[family][masked-network-addr][bits][full-addr]` key reproducing PG
+`network_cmp_internal` byte-wise). cidr shares inet_ops via binary coercion; the
+expression-key gate routes through the same allow-list.
 
-**Status:** COMPLETE + committed (code `0f6945bc`, bookkeeping `b7bdfb18`,
-state-guard `1d725540`).
+**Status:** COMPLETE + committed (code `df3ee98b`, bookkeeping `df3be9a4`,
+state-guard `9ec00e12`).
 
-**Findings:** diff 4677→4664 (−13) — the sole C8 statement
-(`ALTER TABLE attmp ADD COLUMN xmin integer;`) now matches PG (42701 + exact
-message, no LINE 1). PG oracle: `tablecmds.c:7673` check_for_column_name_collision
-(ADD/RENAME) + `heap.c:481` CheckAttributeNamesTypes (CREATE/CTAS); SysAtt[]
-`heap.c:144-228`. Pos left 0 — the PG ereport carries no errposition.
+**Findings:** diff 4664→4645 (−19), `got "inet"` 1→0. The C5 PKTABLE block
+(alter_table.sql:512-513) no longer emits the btree rejection; hunk count unchanged
+(84 — the block shares a hunk with the out-of-scope C4 FKTABLE lines). PG oracle:
+`network.c:402-420` network_cmp_internal + `inet_net_pton.c` classful cidr mask
+(note PG's quirky class-D `/8`→`/4` only for first==224, faithfully ported).
 
-**Files:** `internal/executor/operators_ddl.go` (+helper, 4 sites, RENAME fix);
-`operators_ddl_partition.go` (reuse helper); new
-`operators_ddl_system_column_test.go` (7 table-driven tests);
-`docs/design/0134-0002-alter-table-sql-divergence.md` (C8 row → LANDED);
-`.ralph/deferral_ledger.md` (new row: DROP/ALTER-on-system-column gap, 0A000);
-`.ralph/fix_plan.md` (M0134-0002 C8 progress note).
+**Files:** `internal/executor/operators_ddl.go` (+`encodeInetBTreeKey`,
+`parseInetKeyText`, `parseInetV4Octets`, `cidrDefaultV4Mask`, `maskInetAddr`,
+`isInetType`/`isCidrType`, allow-list entry); `internal/executor/btree_scalar_keys.go`
+(+`decodeInetBTreeKey`, `formatInetKeyText`); new
+`operators_ddl_inet_btree_test.go` (5 tests incl. 32-literal corpus);
+`docs/design/0134-0002-alter-table-sql-divergence.md` (C5 row → LANDED);
+`.ralph/deferral_ledger.md` (new row); `.ralph/fix_plan.md` (C5 progress note).
 
-**Key symbols:** `isSystemColumn` (operators_ddl.go ~:11163), `execCreateTable`
-(:3106 loop), `execCreateTableAs` (:4158), `execAlterTableAddColumn` (:9242),
-`execAlterTable` RENAME arm (:8215), `validatePartitionKey` (partition file :168).
+**Key symbols:** `encodeInetBTreeKey`/`decodeInetBTreeKey`, `parseInetKeyText`,
+`isInetType`/`isCidrType` (operators_ddl.go), `isSupportedBTreeKeyType`,
+`decodeScalarBTreeKey` (btree_scalar_keys.go).
 
-**Deferral (recorded):** DROP COLUMN / ALTER COLUMN on a system column still
-diverge — PG raises `cannot drop/alter system column "xmin"` (0A000), goopg says
-`column "xmin" does not exist` (DROP) or silently accepts (ALTER TYPE). Needs a
-system-column model or per-path guards; ledger row appended (resume: tablecmds.c
-ATExecDropColumn:9338 / ATExecAlterColumnType:7777).
+**Deferral (recorded):** network_* comparison-operator Go bodies still missing —
+btree scans work (byte-wise key compare) but predicate eval `WHERE inet_col = '...'`
++ FK checks on inet/cidr still fail (class C4); no inet binary codec. Ledger row
+appended (resume: `network.c` network_cmp/network_lt/…).
 
-**Next step:** C5 (btree-inet rejected — `btreeKeyTypeRejectionError`) is the next
-single-loop correctness win; needs a researcher pass first to scope whether inet
-comparison ops + btree opclass already exist (opclass registration only) or the
-comparators must be implemented. C2 (ALTER-TABLE grammar cluster) is the largest
-remaining class and needs a researcher decomposition pass before implementing.
+**Next step:** C2 (ALTER-TABLE grammar cluster — largest remaining class) needs a
+researcher decomposition pass before implementing; then C3/C4/C9/C10/C11
+correctness, C6 catalog, C7/C12/C13/C14 formatter.
 
-**Gates run (this loop):** `go test ./internal/executor/` PASS (7 new tests);
-`scripts/pg-regress-runner.sh alter_table` diff 4677→4664; `scripts/tpch-spotcheck.sh`
-PASS (Q12=2/Q13=35); `go build ./...` clean; pre-commit pgbench smoke PASS (×2);
-`make ralph-state-guard` OK (repaired progress.json, then clean).
+**Gates run (this loop):** `go test ./internal/executor/ -p 4` PASS (5 new tests);
+`go test ./internal/catalog/ ./internal/planner/` PASS; `go build ./...` clean;
+`scripts/pg-regress-runner.sh alter_table` diff 4664→4645; pre-commit pgbench smoke
+PASS (×3); `make ralph-state-guard` OK (repaired progress.json → in_progress).
 
-**Delegation:** researcher `0134-0002-c8-system-columns-research` DONE; implementer
-`0134-0002-c8-system-columns-impl` DONE; tester `0134-0002-s1-tpch` DONE (PASS).
+**Delegation:** researcher `0134-0002-c5-btree-inet-research` DONE (verdict A);
+implementer `0134-0002-c5-btree-inet-impl` DONE (PASS).
 
 **In-flight:** none.
