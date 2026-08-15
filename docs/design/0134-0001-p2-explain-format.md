@@ -695,6 +695,25 @@ from a range scan renders neither Index Cond nor Filter and cannot express exclu
 (Option A scope); (2) multi-conjunct/composite WHERE keeps the redundant range
 conjunct in the Filter (PG trims it via `is_redundant_with_indexclauses`).
 
+## class 10 (VERBOSE `Output:` qualification) — blocked by the varno deferral (2026-08-15)
+
+The class-10 qualification gap is NOT a self-contained formatter fix. A slice
+adding SRF cases to `explainRelBaseName` + qualifying the VERBOSE `Output:` line
+was implemented, verified correct, and then REVERTED with zero gate impact
+(`aggregates.diff` 1370→1370) because the `aggregates.sql` SRF hunks are all
+LATERAL/subquery shapes: the inner subquery's `SourceTableIdx` restarts at 1 per
+query level (`planner.go` `nextSourceIdx`), so `generate_series s2` collides with
+the outer `s1` and `explainNames.collect`'s `seen` guard registers only one —
+`qualify()` stays false and every column stays bare. Sort/Join additionally zero
+`SourceTableIdx` on columns crossing the subquery boundary. This is the
+M0125-0039 deferral (ledger row 615 "`SourceTableIdx` is not a range-table id";
+row 616 (b) `schemaColumnNames` never reaches the expression printer). Closing
+class 10 needs the planner-level per-statement `nextSourceIdx` promotion (ledger
+615 resume point), not formatter work. The S2 "Out of scope" note's "needs SRF
+cases in `explainRelBaseName`" was therefore under-scoped — SRF cases alone close
+only the same-level multi-SRF shape (two SRFs in one FROM clause), which no
+`aggregates.sql` query exercises.
+
 ## Cross-case relevance
 
 Every M0134 regress case whose `.sql` emits `EXPLAIN` inherits the formatter
