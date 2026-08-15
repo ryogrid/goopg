@@ -67,7 +67,7 @@ func viewAutoUpdatableChain(tbl *catalog.Table, cat catalog.Catalog) (chain []*c
 	if !found || (b.Virtual && b.View == nil) || b.IsMatView {
 		return nil, nil, nil, false
 	}
-	ownMap, mapOK := viewColumnMap(v.Targets, rv, b)
+	ownMap, mapOK := viewColumnMap(v.Targets, rv, b, tbl)
 	if !mapOK {
 		return nil, nil, nil, false
 	}
@@ -90,18 +90,34 @@ func viewAutoUpdatableChain(tbl *catalog.Table, cat catalog.Catalog) (chain []*c
 // entry is a bare column reference to a column of b (either `SELECT *` or
 // an explicit list of plain column references — no expressions), and if so
 // returns the per-entry mapping from target-list ordinal to b's column
-// ordinal. Unlike PostgreSQL's full per-column attribute map, goopg requires
-// EVERY entry to be a plain column reference (mixed expression/plain-column
-// views stay entirely read-only) — but within that restriction, a subset of
+// ordinal. view is the view's own catalog.Table; its frozen Columns (fixed
+// at CREATE VIEW time) drive the bare-* arm — see below. Unlike PostgreSQL's
+// full per-column attribute map, goopg requires EVERY entry to be a plain
+// column reference (mixed expression/plain-column views stay entirely
+// read-only) — but within that restriction, a subset of
 // b's columns, a reordering, and/or a rename (via column alias or an
 // explicit `CREATE VIEW v (a, b)` column list — both are already folded
 // into the view's own catalog.Table.Columns names by CreateView, so this
 // function only needs to match against the SOURCE column referenced, not
 // whatever the view calls it) are all fine — root-0025 deferred item 1.
-func viewColumnMap(targets []parser.ResTarget, rv parser.RangeVar, b *catalog.Table) ([]int, bool) {
+func viewColumnMap(targets []parser.ResTarget, rv parser.RangeVar, b *catalog.Table, view *catalog.Table) ([]int, bool) {
 	if len(targets) == 1 {
 		if star, isStar := targets[0].Expr.(*parser.StarExpr); isStar && star.Table == "" && star.Schema == "" && targets[0].Alias == "" {
-			m := make([]int, len(b.Columns))
+			// Bare `SELECT *`: a star maps POSITIONALLY by definition — the
+			// view's i-th frozen output column is the FROM relation's i-th
+			// column, whatever the view calls it (an explicit `CREATE VIEW v
+			// (a, b)` column list renames the output, never reorders or
+			// subsets the frozen expansion; and CREATE OR REPLACE VIEW may
+			// only APPEND columns at the end, never reorder or rename the
+			// existing prefix — so the frozen prefix's positional identity is
+			// stable). goopg stores the star UNEXPANDED
+			// (v.View.Targets = [StarExpr]), so the map is an identity over
+			// the view's FROZEN column count (view.Columns) — NOT over
+			// len(b.Columns), which CREATE OR REPLACE VIEW can have grown past
+			// the frozen count, leaving colMap longer than viewColumnNames(tbl)
+			// and indexing out of range in viewProxyTable (M0134-0002 slice 1,
+			// bug #17811).
+			m := make([]int, len(view.Columns))
 			for i := range m {
 				m[i] = i
 			}
