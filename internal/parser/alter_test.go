@@ -1,6 +1,10 @@
 package parser
 
-import "testing"
+import (
+	"errors"
+	"strings"
+	"testing"
+)
 
 // TestParseAlterTablePgbenchPrimaryKey: pgbench's exact strings for
 // installing primary keys after the data load. This is the
@@ -319,6 +323,111 @@ func TestParseAlterTableSetCompression(t *testing.T) {
 		}
 		if at.Actions[0].CompressionType != tc.wantMeth {
 			t.Errorf("Parse(%q): CompressionType=%q want %q", tc.sql, at.Actions[0].CompressionType, tc.wantMeth)
+		}
+	}
+}
+
+// TestParseAlterTableSetWithoutOids covers `ALTER TABLE ... SET WITHOUT OIDS`
+// (M0134-0002 C2 slice 12; alter_table.sql:1041). PG gram.y:2731-2738 maps it
+// to AT_DropOids, whose ATExecCmd is a SILENT no-op (tablecmds.c:5528-5530) —
+// goopg must parse it into the existing AlterTableNoOp action (also silent in
+// execAlterTable), not die with `expected CLUSTER after SET WITHOUT`.
+func TestParseAlterTableSetWithoutOids(t *testing.T) {
+	stmts, err := Parse("ALTER TABLE atacc1 SET WITHOUT OIDS")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	at, ok := stmts[0].(*AlterTableStmt)
+	if !ok {
+		t.Fatalf("got %T", stmts[0])
+	}
+	if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableNoOp {
+		t.Fatalf("actions=%+v want one AlterTableNoOp", at.Actions)
+	}
+
+	// SET WITHOUT CLUSTER must still parse as its own kind, not be shadowed.
+	stmts, err = Parse("ALTER TABLE t SET WITHOUT CLUSTER")
+	if err != nil {
+		t.Fatalf("Parse SET WITHOUT CLUSTER: %v", err)
+	}
+	at, _ = stmts[0].(*AlterTableStmt)
+	if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableSetWithoutCluster {
+		t.Fatalf("SET WITHOUT CLUSTER: actions=%+v", at.Actions)
+	}
+}
+
+// TestParseAlterTableSetWithOids covers `ALTER TABLE ... SET WITH OIDS`
+// (M0134-0002 C2 slice 12; alter_table.sql:1044). PG's gram.y has no
+// alter_table_cmd production for it, so the generic bison error points at the
+// WITH keyword (scanner_yyerror echoes the raw source token, scan.l:1234-1241)
+// — uppercase in the regress input. goopg must emit `syntax error at or near
+// "WITH"`, not `expected ADD or DROP (got set)`.
+func TestParseAlterTableSetWithOids(t *testing.T) {
+	_, err := Parse("ALTER TABLE atacc1 SET WITH OIDS")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), `"WITH"`) {
+		t.Errorf("error %q does not contain %q", err.Error(), `"WITH"`)
+	}
+	var se *SyntaxError
+	if !errors.As(err, &se) {
+		t.Fatalf("err type=%T want *SyntaxError", err)
+	}
+	if se.Message != "WITH" {
+		t.Errorf("SyntaxError.Message=%q want %q", se.Message, "WITH")
+	}
+}
+
+// TestParseColumnConstraintDuplicateEnforced covers the duplicate `[NOT]
+// ENFORCED` column-constraint path (M0134-0002 C2 slice 12; alter_table.sql:1211
+// `add column y int check (x > 0) not enforced enforced`). PG's
+// transformConstraintAttrs (parse_utilcmd.c:3999-4027) rejects any second
+// ENFORCED-ish attribute with the bare `multiple ENFORCED/NOT ENFORCED clauses
+// not allowed` (42601) — a DIFFERENT message from the table-level
+// `conflicting constraint properties` (gram.y:6234) — so the goopg error must
+// be a Raw SyntaxError carrying exactly that text.
+func TestParseColumnConstraintDuplicateEnforced(t *testing.T) {
+	cases := []struct {
+		sql string
+	}{
+		{"alter table renameColumn add column y int check (x > 0) not enforced enforced"},
+		{"alter table t add column y int check (x > 0) enforced enforced"},
+		{"alter table t add column y int check (x > 0) enforced not enforced"},
+		{"alter table t add column y int check (x > 0) not enforced not enforced"},
+		{"alter table t add column y int constraint c check (x > 0) not enforced enforced"},
+	}
+	for _, tc := range cases {
+		_, err := Parse(tc.sql)
+		if err == nil {
+			t.Errorf("Parse(%q): expected error", tc.sql)
+			continue
+		}
+		if !strings.Contains(err.Error(), "multiple ENFORCED/NOT ENFORCED clauses not allowed") {
+			t.Errorf("Parse(%q): error %q does not contain %q", tc.sql, err.Error(), "multiple ENFORCED/NOT ENFORCED clauses not allowed")
+			continue
+		}
+		var se *SyntaxError
+		if !errors.As(err, &se) {
+			t.Errorf("Parse(%q): err type=%T want *SyntaxError", tc.sql, err)
+			continue
+		}
+		if !se.Raw {
+			t.Errorf("Parse(%q): SyntaxError.Raw=false, want true (bare PG message)", tc.sql)
+		}
+	}
+
+	// A single [NOT] ENFORCED must NOT be flagged, and a trailing NOT NULL /
+	// NOT VALID must not false-positive the dup check (NOT VALID is only a
+	// valid trailer on ALTER TABLE ADD CHECK, not on an ADD COLUMN constraint).
+	for _, ok := range []string{
+		"alter table t add column y int check (x > 0) not enforced",
+		"alter table t add column y int check (x > 0) enforced",
+		"alter table t add column y int check (x > 0) not enforced not null",
+		"alter table t add column y int check (x > 0) not null",
+	} {
+		if _, err := Parse(ok); err != nil {
+			t.Errorf("Parse(%q): unexpected error %v", ok, err)
 		}
 	}
 }

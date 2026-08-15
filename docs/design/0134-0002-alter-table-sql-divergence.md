@@ -282,9 +282,34 @@ reassign+`NOT OF` sequence renders x/y with `q` dropped. Residuals ledgered:
 check_of_type 42809 parity (non-composite vs rowtype vs 42704), reloftype
 restart-durability, and the missing table↔type dependency edge.
 
-Remaining C2 sub-gaps, ranked by error-site count ÷ risk: ANALYZE tab(col) (4,
-re-route — it is an ANALYZE/VACUUM statement gap, not ALTER TABLE),
-SET WITHOUT OIDS (1), ENFORCED dup (1, C9-masked).
+**Twelfth slice landed (2026-08-16): `SET WITHOUT OIDS`/`SET WITH OIDS` +
+duplicate `[NOT] ENFORCED`** — the last two tiny C2 grammar sub-gaps, both
+parser-only. (a) `SET WITHOUT OIDS`: the `SET WITHOUT CLUSTER` arm
+(ddl.go:9332-9341) now also accepts `SET WITHOUT OIDS` and returns the existing
+`AlterTableNoOp` — PG maps it to `AT_DropOids` whose exec is a silent no-op
+(gram.y:2731-2738, tablecmds.c:5528-5530, `alter_table.out:1503` empty), so no
+diagnostic is emitted. (b) `SET WITH OIDS`: a new guard before the `expected ADD
+or DROP` fallthrough emits `syntax error at or near "WITH"` at the `with` token —
+PG's gram.y has no `SET WITH` production, and scanner_yyerror echoes the raw
+(uppercase) source token (scan.l:1234-1241); goopg's lexer lowercases keyword
+Values, so the message re-uppercases the targeted token. (c) duplicate `[NOT]
+ENFORCED`: a new `rejectDuplicateEnforced` helper (built on `isEnforcedAttr`,
+which peeks bare `enforced` or `not`+`enforced` without false-positiving `NOT
+NULL`/`NOT VALID`) emits a Raw `multiple ENFORCED/NOT ENFORCED clauses not
+allowed` (PG `transformConstraintAttrs`, parse_utilcmd.c:3999-4027) after the
+single-shot `[NOT] ENFORCED` consume at the 5 CHECK sites (inline + named column
+CHECK, anonymous + named table CHECK, ALTER ADD CHECK) plus a `sawEnforced`
+top-of-loop check inside `parseFKConstraintAttrs` (threaded through its 3 callers
+via a new error return). Closes the SET WITHOUT OIDS / SET WITH OIDS /
+ENFORCED-dup sites (diff → shared lines); the researcher's "ENFORCED dup is
+C9-masked" was reclassified: the duplicate-ENFORCED error is a pure grammar gap,
+distinct from the genuinely-C9 `only renameColumn add column x` block that
+remains (sql:1205/1208).
+
+Remaining C2 sub-gaps: ANALYZE tab(col) (4) — re-route: it is an ANALYZE/VACUUM
+statement gap, not ALTER TABLE. C2 is otherwise complete; the 3-line
+`only renameColumn add column x` / `column "x" already exists` divergence
+(sql:1205/1208) is the C9 inheritance class, tracked separately.
 
 ## Secondary finding (corrects deferral-ledger row 1385)
 

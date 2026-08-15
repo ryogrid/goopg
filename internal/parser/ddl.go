@@ -2815,6 +2815,39 @@ func (p *parser) parseConstraintDeferrable(deferrable, initiallyDeferred *bool) 
 	}
 }
 
+// isEnforcedAttr reports whether the token stream at cur begins a `[NOT]
+// ENFORCED` attribute (bare ENFORCED, or NOT immediately followed by
+// ENFORCED). Used to detect a duplicate after a single-shot consume;
+// deliberately does NOT match NOT NULL / NOT VALID (the peek must be ENFORCED).
+// M0134-0002 C2 slice 12.
+func (p *parser) isEnforcedAttr() bool {
+	t := p.cur()
+	if t.Kind == TokenIdent && strings.EqualFold(t.Value, "enforced") {
+		return true
+	}
+	return t.Kind == TokenKeyword && t.Keyword == KwNot &&
+		p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "enforced")
+}
+
+// rejectDuplicateEnforced returns PG's "multiple ENFORCED/NOT ENFORCED clauses
+// not allowed" when the current token begins a second `[NOT] ENFORCED`
+// attribute. PG's transformConstraintAttrs (parse_utilcmd.c:3999-4027)
+// rejects any second ENFORCED-ish ConstraintAttr with exactly this message
+// (42601) — DIFFERENT from the table-level ConstraintAttributeSpec's
+// "conflicting constraint properties" (gram.y:6234). Raw suppresses the
+// "syntax error at or near" wrapper so the bare message matches PG verbatim.
+// M0134-0002 C2 slice 12.
+func (p *parser) rejectDuplicateEnforced() error {
+	if p.isEnforcedAttr() {
+		return &SyntaxError{
+			Pos:     p.cur().Pos,
+			Message: "multiple ENFORCED/NOT ENFORCED clauses not allowed",
+			Raw:     true,
+		}
+	}
+	return nil
+}
+
 // parseFKConstraintAttrs consumes the `[NOT] DEFERRABLE [INITIALLY DEFERRED |
 // INITIALLY IMMEDIATE]`, `NOT VALID`, and `[NOT] ENFORCED` trailer that can
 // follow a FOREIGN KEY constraint's REFERENCES/ON DELETE/ON UPDATE clauses, in
@@ -2824,15 +2857,24 @@ func (p *parser) parseConstraintDeferrable(deferrable, initiallyDeferred *bool) 
 // FOREIGN KEY so all three stay in lockstep — NOT VALID/NOT ENFORCED
 // previously only round-tripped through the ALTER TABLE form (DU-002 slice
 // 431); this extends the same trailer to CREATE TABLE-time FK constraints
-// (DU-002 slice 432).
-func (p *parser) parseFKConstraintAttrs() (deferrable, initiallyDeferred, notValid, notEnforced bool) {
+// (DU-002 slice 432). A second [NOT] ENFORCED is rejected like the CHECK
+// forms (saw_enforced in transformConstraintAttrs) rather than silently
+// overwriting the flag. M0134-0002 C2 slice 12.
+func (p *parser) parseFKConstraintAttrs() (deferrable, initiallyDeferred, notValid, notEnforced bool, err error) {
+	sawEnforced := false
 	for {
+		// Check for a duplicate before the consume so the caret lands on the
+		// 2nd attribute's first token (its location in transformConstraintAttrs).
+		if sawEnforced && p.isEnforcedAttr() {
+			return deferrable, initiallyDeferred, notValid, notEnforced, p.rejectDuplicateEnforced()
+		}
 		if p.acceptKeyword(KwNot) {
 			if p.acceptIdentKeyword("valid") {
 				notValid = true
 				continue
 			}
 			if p.acceptIdentKeyword("enforced") {
+				sawEnforced = true
 				notEnforced = true
 				continue
 			}
@@ -2859,6 +2901,7 @@ func (p *parser) parseFKConstraintAttrs() (deferrable, initiallyDeferred, notVal
 			continue
 		}
 		if p.acceptIdentKeyword("enforced") { // bare ENFORCED — already the default
+			sawEnforced = true
 			continue
 		}
 		break
@@ -3754,6 +3797,11 @@ func (p *parser) parseTableConstraintElement(stmt *CreateTableStmt) (bool, error
 		} else {
 			_ = p.acceptIdentKeyword("enforced")
 		}
+		// A second [NOT] ENFORCED is a PG error (transformConstraintAttrs,
+		// parse_utilcmd.c:3999-4027). M0134-0002 C2 slice 12.
+		if err := p.rejectDuplicateEnforced(); err != nil {
+			return false, err
+		}
 		// Accept optional NO INHERIT, recording it per-check so the suffix
 		// round-trips through the dump. DU-002 slice 128.
 		noInherit := false
@@ -3925,6 +3973,11 @@ func (p *parser) parseTableConstraintElement(stmt *CreateTableStmt) (bool, error
 				}
 			} else {
 				_ = p.acceptIdentKeyword("enforced")
+			}
+			// A second [NOT] ENFORCED is a PG error (transformConstraintAttrs,
+			// parse_utilcmd.c:3999-4027). M0134-0002 C2 slice 12.
+			if err := p.rejectDuplicateEnforced(); err != nil {
+				return false, err
 			}
 			// Accept optional NO INHERIT (CONSTRAINT name CHECK NO INHERIT).
 			noInherit := false
@@ -4496,7 +4549,11 @@ func (p *parser) parseColumnConstraintList(col *ColumnDef) error {
 			// NOT VALID, and [NOT] ENFORCED, in any order (PG18 for the latter
 			// two). DU-002 slice 432 — extends slice 431's ALTER TABLE-only fix
 			// to the inline column REFERENCES form.
-			col.FKDeferrable, col.FKInitiallyDeferred, col.FKNotValid, col.FKNotEnforced = p.parseFKConstraintAttrs()
+			var fkErr error
+			col.FKDeferrable, col.FKInitiallyDeferred, col.FKNotValid, col.FKNotEnforced, fkErr = p.parseFKConstraintAttrs()
+			if fkErr != nil {
+				return fkErr
+			}
 		// UNIQUE constraint on column
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
 			p.advance()
@@ -4534,6 +4591,12 @@ func (p *parser) parseColumnConstraintList(col *ColumnDef) error {
 			} else {
 				_ = p.acceptIdentKeyword("enforced")
 			}
+			// A second [NOT] ENFORCED is a PG error (transformConstraintAttrs,
+			// parse_utilcmd.c:3999-4027), not an unconsumed trailing token.
+			// M0134-0002 C2 slice 12.
+			if err := p.rejectDuplicateEnforced(); err != nil {
+				return err
+			}
 			// Accept optional NO INHERIT — PG18 column-level CHECK NO INHERIT.
 			if p.acceptIdentKeyword("no") {
 				_ = p.acceptIdentKeyword("inherit")
@@ -4557,6 +4620,11 @@ func (p *parser) parseColumnConstraintList(col *ColumnDef) error {
 					}
 				} else {
 					_ = p.acceptIdentKeyword("enforced")
+				}
+				// A second [NOT] ENFORCED is a PG error (transformConstraintAttrs,
+				// parse_utilcmd.c:3999-4027). M0134-0002 C2 slice 12.
+				if err := p.rejectDuplicateEnforced(); err != nil {
+					return err
 				}
 				// Accept optional NO INHERIT (CONSTRAINT name CHECK NO INHERIT).
 				if p.acceptIdentKeyword("no") {
@@ -5955,7 +6023,11 @@ func (p *parser) parseTableForeignKey(name string) (TableForeignKeyDef, error) {
 	// and [NOT] ENFORCED, in any order (PG18 for the latter two). DU-002 slice
 	// 432 — extends slice 431's ALTER TABLE-only fix to the table-level
 	// FOREIGN KEY form.
-	fk.Deferrable, fk.InitiallyDeferred, fk.NotValid, fk.NotEnforced = p.parseFKConstraintAttrs()
+	var fkErr error
+	fk.Deferrable, fk.InitiallyDeferred, fk.NotValid, fk.NotEnforced, fkErr = p.parseFKConstraintAttrs()
+	if fkErr != nil {
+		return TableForeignKeyDef{}, fkErr
+	}
 	return fk, nil
 }
 
@@ -9329,11 +9401,20 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 	// SET WITHOUT CLUSTER — clear the table's clustering selection (every index's
 	// pg_index.indisclustered → false). Distinct from `SET (reloptions)` below,
 	// which is the parenthesized form. DU-002 slice 321.
+	// SET WITHOUT OIDS — same arm: PG gram.y:2731-2738 maps `SET WITHOUT OIDS` to
+	// AT_DropOids, whose ATExecCmd is a silent no-op ("nothing to do here, oid
+	// columns don't exist anymore", tablecmds.c:5528-5530; alter_table.out:1503
+	// is empty). goopg returns the existing AlterTableNoOp (a silent no-op in
+	// execAlterTable) for the same result. M0134-0002 C2 slice 12.
 	if cur := p.cur(); (cur.Kind == TokenKeyword && cur.Keyword == KwSet) &&
 		p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "without") {
 		pos := cur.Pos
 		p.advance() // SET
 		p.advance() // WITHOUT
+		if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "oids") {
+			p.advance() // OIDS
+			return AlterTableAction{pos: pos, Kind: AlterTableNoOp}, nil
+		}
 		if !p.acceptKeyword(KwCluster) {
 			return AlterTableAction{}, p.errAtCur("expected CLUSTER after SET WITHOUT")
 		}
@@ -9476,6 +9557,17 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		}
 		return AlterTableAction{pos: p.cur().Pos, Kind: AlterTableDropOf}, nil
 	}
+	// SET WITH … — no production in PG's gram.y alter_table_cmd (no SET WITH
+	// arm), so the generic bison error points at the WITH keyword. PG's
+	// scanner_yyerror echoes the raw source token (scan.l:1234-1241), which for
+	// the regress input `SET WITH OIDS` (alter_table.sql:1044) is uppercase;
+	// goopg's lexer lowercases keyword Values, so re-uppercase it. M0134-0002
+	// C2 slice 12.
+	if cur := p.cur(); cur.Kind == TokenKeyword && cur.Keyword == KwSet &&
+		p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwWith {
+		withTok := p.peek(1)
+		return AlterTableAction{}, &SyntaxError{Pos: withTok.Pos, Message: strings.ToUpper(withTok.Value)}
+	}
 	if !p.acceptKeyword(KwAdd) {
 		return AlterTableAction{}, p.errAtCur("expected ADD or DROP")
 	}
@@ -9612,7 +9704,10 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		// parseFKConstraintAttrs so all three stay in lockstep (DU-002 slice
 		// 432); AlterTableAction has no InitiallyDeferred field to populate, so
 		// that return value is discarded here.
-		deferrable, _, notValid, notEnforced := p.parseFKConstraintAttrs()
+		deferrable, _, notValid, notEnforced, fkErr := p.parseFKConstraintAttrs()
+		if fkErr != nil {
+			return AlterTableAction{}, fkErr
+		}
 		act.Kind = AlterTableAddForeignKey
 		act.Columns = cols
 		act.RefTable = refTable
@@ -9670,6 +9765,11 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 			}
 		} else {
 			_ = p.acceptIdentKeyword("enforced") // bare ENFORCED
+		}
+		// A second [NOT] ENFORCED is a PG error (transformConstraintAttrs,
+		// parse_utilcmd.c:3999-4027). M0134-0002 C2 slice 12.
+		if err := p.rejectDuplicateEnforced(); err != nil {
+			return AlterTableAction{}, err
 		}
 		// NO INHERIT may also trail the NOT VALID/[NOT] ENFORCED block.
 		if p.acceptIdentKeyword("no") {
