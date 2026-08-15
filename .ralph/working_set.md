@@ -1,55 +1,51 @@
-# Working set — M0134-0002 alter_table.sql (C2 grammar cluster, first slice landed)
+# Working set — M0134-0002 alter_table.sql (C2 grammar cluster, slice 2 landed)
 
-**Task:** M0134-0002 alter_table.sql regress-sql digestion. This loop landed the
-**C2 first slice — `ADD COLUMN IF NOT EXISTS`** (commit `8afe5bf7`). C2 is the
-"ALTER-TABLE grammar cluster", the largest remaining class (~60 of 88 syntax-error
-lines). A researcher decomposition split it into 14 sub-gaps (11 doc-listed + 3
-new: ADD COLUMN IF NOT EXISTS, DROP CONSTRAINT IF EXISTS, ALTER TABLE OF/NOT OF).
+**Task:** M0134-0002 alter_table.sql regress-sql digestion. C2 is the
+"ALTER-TABLE grammar cluster" (~60 of 88 syntax-error lines). This loop landed
+**C2 slice 2 — `ADD [CONSTRAINT] CHECK ... NO INHERIT`** (commit `a39b75ad`).
 
-**Status:** C2 slice 1 COMPLETE + committed (code `8afe5bf7`, bookkeeping
-`1e1013d9`). C2 as a whole remains OPEN (13 sub-gaps left).
+**Status:** C2 slice 2 COMPLETE + committed. C2 remains OPEN (12 sub-gaps left).
 
-**Findings:** parser `parseAlterTableAction` ADD COLUMN arm now consumes
-`IF NOT EXISTS` via `acceptKeyword(KwIf)` (NOT `acceptIdentKeyword`, which
-silently drops KwIf) + `AlterTableAction.IfExists` flag (field is in `ast.go`,
-not ddl.go). `execAlterTableAddColumn` (`operators_ddl.go:9244`) emits PG's
-NOTICE `column "c" of relation "r" already exists, skipping` via `ctx.AddNotice`
-and skips. Diff 4645→4602, `expected identifier (got not)` 8→0 (syntax-error
-total 88→80); NOTICE byte-exact. Deferral row appended: `ctx.AddNotice` carries
-no SQLSTATE (PG attaches 42701) + non-IF-NOT-EXISTS 42701 message-text gap
-(classes C13/C12).
+**Findings:** parser `parseAlterTableAction` ADD CHECK arm now consumes `NO INHERIT`
+at BOTH orderings (`acceptIdentKeyword("no")`/`"inherit"`; PG ConstraintAttributeSpec
+is order-independent — `check (a=2) no inherit not valid` + trailing) + sets
+`AlterTableAction.NoInherit`. Executor `execAlterTable` ADD CHECK arm threads
+`act.NoInherit` into `AddCheckFull` and raises 42P16 `cannot add NO INHERIT
+constraint to partitioned table %q` on a partitioned target (mirrors CREATE TABLE
+sibling :2111). 7 `(got no)` syntax sites closed (80→73); partitioned ERROR
+byte-matches PG. Unmasked 2 C3-class gaps (ADD CHECK w/o NOT VALID doesn't
+validate existing rows; INSERT/UPDATE doesn't enforce CHECK) → 2 deferral rows.
 
-**Files:** `internal/parser/ast.go` (+IfExists), `internal/parser/ddl.go`
-(+IF NOT EXISTS consumption), `internal/parser/alter_test.go`
-(+TestParseAlterTableAddColumnIfNotExists), `internal/executor/operators_ddl.go`
-(+skip-NOTICE), new `internal/executor/alter_table_add_column_if_not_exists_test.go`;
-`docs/design/0134-0002-alter-table-sql-divergence.md` (C2 decomposition note);
-`.ralph/deferral_ledger.md` (new row); `.ralph/fix_plan.md` (C2 progress note).
+**Files:** `internal/parser/ddl.go`, `internal/parser/alter_test.go`
+(+TestParseAlterTableAddCheckNoInherit), `internal/executor/operators_ddl.go`,
+`internal/executor/operators_ddl_check_notenforced_test.go`
+(+TestCheckConstraintNoInheritAlterTable); `docs/design/0134-0002-alter-table-sql-divergence.md`
+(2nd-slice note); `.ralph/deferral_ledger.md` (2 rows); `.ralph/fix_plan.md` (C2 progress).
 
-**Key symbols:** `parseAlterTableAction` (ddl.go), `AlterTableAction.IfExists`
-(ast.go), `execAlterTableAddColumn` (operators_ddl.go), `ctx.AddNotice`,
-`Catalog.LookupColumn`.
+**Key symbols:** `parseAlterTableAction` (ddl.go), `AlterTableAction.NoInherit`,
+`execAlterTable` ADD CHECK arm (operators_ddl.go:7674), `AddCheckFull`,
+`tbl.PartitionKey` (partitioned-table test).
 
-**Remaining C2 sub-gaps (ranked by error-site count ÷ risk):** NO INHERIT trailer
-(7), TYPE…USING (11, C10-entangled), RENAME CONSTRAINT (11, C7-partial), comma
-multi-action (7, structural), RENAME `<col>` TO bare (3), ANALYZE tab(col) (4,
-re-route — ANALYZE/VACUUM statement gap), NOT VALID (2), STORAGE (2), OF/NOT OF
-(3), DROP COLUMN IF EXISTS (1, one-line), DROP CONSTRAINT IF EXISTS (1), SET
-WITHOUT OIDS (1), ENFORCED dup (1, C9-masked).
+**Remaining C2 sub-gaps (ranked count÷risk):** TYPE…USING (11, C10-entangled —
+must THREAD USING, never parse-and-ignore), RENAME CONSTRAINT (11, new kind +
+executor RenameConstraint, partial C7), comma multi-action (7, structural), RENAME
+`<col>` TO bare (3, one-line), ANALYZE tab(col) (4, re-route — ANALYZE/VACUUM gap),
+NOT VALID (2), STORAGE (2), OF/NOT OF (3), DROP COLUMN IF EXISTS (1), DROP
+CONSTRAINT IF EXISTS (1), SET WITHOUT OIDS (1), ENFORCED dup (1, C9-masked).
 
-**Next step:** implement C2 slice 2 = **NO INHERIT trailer** (7 sites, additive
-parser trailer at the ALTER ADD CHECK arm `ddl.go:9495-9522` + executor
-`AddCheckFull(..., false /*noInherit*/, ...)` pass `act.NoInherit`; partitioned
-error message after). Researcher report
-`tmp/ralph-handoffs/0134-0002-c2-grammar-research/report.md` §5 has the full row.
+**Next step:** implement C2 slice 3 = **RENAME CONSTRAINT** (11 sites, additive:
+new `AlterTableRenameConstraint` kind + parser arm at the RENAME branch
+(ddl.go:8529-8575) + executor `RenameConstraint` that also renames the backing
+unique index; the `onek` block closes C7-independently). Researcher report
+`tmp/ralph-handoffs/0134-0002-c2-grammar-research/report.md` §1 has the full row.
+Alternative quick sweep (if a lighter slice is preferred): RENAME `<col>` TO bare +
+DROP COLUMN/DROP CONSTRAINT IF EXISTS + SET WITHOUT OIDS (6 sites, all one-line).
 
 **Gates run (this loop):** `go build ./...` PASS; `go test ./internal/parser/ -p 4`
 PASS; `go test ./internal/executor/ -p 4` PASS; `scripts/pg-regress-runner.sh
-alter_table` diff 4645→4602 (8 sites gone); pre-commit pgbench smoke PASS (×2);
-`make ralph-state-guard` OK (repaired progress.json → in_progress).
+alter_table` 7 sites closed; pre-commit pgbench smoke PASS; `make ralph-state-guard`
+OK (repaired progress.json).
 
-**Delegation:** researcher `0134-0002-c2-grammar-research` DONE (14 sub-gaps,
-named ADD COLUMN IF NOT EXISTS first); implementer
-`0134-0002-c2-addcol-ifnotexists-impl` DONE (PASS).
+**Delegation:** implementer `0134-0002-c2-noinherit-impl` DONE (PASS, one round).
 
 **In-flight:** none.
