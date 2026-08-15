@@ -543,6 +543,74 @@ const-fold guard. Not exercised by `aggregates.sql`; recorded, not widened.
 class-8); (e.2) inheritance/MergeAppend (blocks 15/16 — now unblocked by the e.1
 prerequisite).
 
+## S6 Slice 3f — (d)-render attempted, REVERTED (net-negative) — 2026-08-15
+
+The "pure EXPLAIN rendering gap" hypothesis for (d) was **empirically refuted**.
+A Slice 3f implementer run registered the skipped `*planner.Project`'s target-list
+sublinks in `walkPlanFiltered` (mirroring the childless-`Result` loop at
+`operators_explain.go:604-606`), so blocks 8/17 would render their subplan instead
+of dropping it. `go test` + `tpch-spotcheck` PASS, but
+`scripts/pg-regress-runner.sh aggregates` diff grew **1462 → 1474** — the subplan
+now emits MORE non-matching lines, not fewer, and the edit was reverted.
+
+**Why the prediction was wrong:** the divergence is NOT a rendering gap — it is the
+**correlated-subquery representation model**:
+- goopg executes a correlated subquery as a per-row parameterized scan and renders
+  the outer ref as an `ExecParamRef` → `$0` (`operators_explain.go:1128-1132`),
+  i.e. `Index Cond: (unique1 >= $0)` / `Filter: (unique1 > $0)`.
+- PG keeps the outer ref as a `Var` (`varlevelsup>0`) and deparses it against the
+  outer relation — `unique1 > int4_tbl.f1` (`get_rule_expr` T_Var/T_Param).
+
+So even after d-render, blocks 8/17 stay open (inner `Aggregate → Index Scan` vs
+`Result → InitPlan 1 → Limit → Index Only Scan`; `SubPlan 1` vs `SubPlan 2`; `$0`
+vs `int4_tbl.f1`). Closing them needs a **d-rewrite** slice, not a render tweak:
+(1) relax the correlation gate at `planner.go:8576-8584` to build PG's
+parameterized min/max InitPlan (`planagg.c:316 build_minmax_path` + PARAM_EXEC);
+(2) teach the deparser to map a correlated `ExecParamRef` back to the outer column
+(`int4_tbl.f1`, not `$0`); (3) number the outer sublink AFTER the inner InitPlan
+(`SubPlan 2`, not 1). All three are coupled; treat (d) as a hard multi-part slice
+and do NOT re-attempt the standalone d-render.
+
+## S7 Slice 1 — landed 2026-08-15 (single-relation GROUP BY pruning)
+
+**Design:** the single-relation arm of PG `remove_useless_groupby_columns`
+(`postgres/src/backend/optimizer/plan/initsplan.c:412`). `buildAggregateStage`
+(`internal/planner/planner.go`) now drops `GROUP BY` columns redundant under a
+PK/unique index. New `pruneUselessGroupByColumns` helper (fail-closed `(nil,nil)`
+unless every guard holds): ≥2 group items (:422), no grouping sets (:426), exactly
+one `RTE_RELATION` base rel (:494), inheritance-parent skip unless
+`RELKIND_PARTITIONED_TABLE` (:502), unique + non-deferrable + no-predicate +
+non-expression index (:527-532), key cols NOT NULL-or-`NULLS NOT DISTINCT`
+(:546-552), proper subset of the group (:567), fewest-columns key wins (:578);
+surplus columns dropped (:597,610-625). Pruned columns are accepted as passthrough
+via a new `prunedInputCols` set — **not** by extending `isColumnFunctionallyDetermined`
+to unique indexes, which would flip `functional_deps`' pinned 42803 (PG's
+`check_functional_grouping`, `pg_constraint.c:1740`, is PK-only by design; reviewer
+CONFIRMED). `isColumnFunctionallyDetermined` now judges coverage against
+`originalGroupInputCols` (the full pre-prune clause).
+
+**Measured result (`scripts/pg-regress-runner.sh aggregates`, 1474→1390 lines):**
+hunks d447 (`t1 group by a,b,c,d` → `Group Key: a, b`), d554 (unique-index `z`),
+d588 (NULLS NOT DISTINCT) all CLOSED; d538 (p_t1 partitioned) SHRUNK; d508 (t1c
+inheritance, must-NOT) unchanged. Must-NOT guards verified fail-closed (deferrable
+PK t3, nullable-z, partial index, expression index, grouping sets, <2 items).
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=35); units PASS; plan-gate SKIP (no
+server on 65433).
+
+**Reviewer finding (fixed):** a partitioned parent whose unique key omits a partition
+column is NOT globally unique (goopg lacks PG's `indexcmds.c:1093` 0A000 DDL
+enforcement). `pruneUselessGroupByColumns` now fails closed when `len(PartitionKey)>0`
+and any partition column is absent from `bestKey` — no-op for PG-legal DDL, guards the
+goopg-legal-but-PG-illegal case (behavioral-probe CASE A: `UNIQUE(b)` on
+`PARTITION BY LIST(a)` returns 2 rows, no collapse). The DDL gap is recorded in the
+deferral ledger (partitioned-unique-index enforcement).
+
+**Residuals (next-slice candidates, not this slice):** the multi-relation arm of
+`initsplan.c:412` (d463/d1234 — iterate every RTE_RELATION); a stricter-than-PG
+`GROUPING()` guard (misses a prune for `GROUPING()` under plain GROUP BY — fail-closed,
+unexercised); index tie-break iterates name-sorted `IndexesOnTable` vs PG's OID order
+(plan-shape-only).
+
 ## Cross-case relevance
 
 Every M0134 regress case whose `.sql` emits `EXPLAIN` inherits the formatter
