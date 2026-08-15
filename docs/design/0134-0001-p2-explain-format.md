@@ -653,6 +653,48 @@ because `combineAggRuntime` has no user-transition-state datum path. Re-enabling
 requires storing each user aggregate's transition state as a datum and invoking
 `UserAgg.CombineFunc` in `combineAggRuntime` — S10b.
 
+## S4 — landed 2026-08-15 (class 8: preserve the index range comparison op)
+
+**Scope correction (research refuted the "drop the redundant Filter" premise).** The
+class map's S4 line ("drop the redundant Filter") is WRONG: goopg's btree
+`rangeScanPos` is inclusive at both ends, so for `WHERE c2 < 100` the scan emits the
+`c2 = 100` row and only the Filter drops it — the Filter is executor-necessary, not
+render-redundant. The faithful fix is four coupled parts: store the original op, make
+the btree scan stop at an EXCLUSIVE bound, render the original op, and drop the Filter
+only where the exclusive scan now fully covers the WHERE. (The class map's line refs
+are stale: the range builder is `tryRangeIndexScan` `planner.go:9379-9510`, not
+"8657-8689" (that is the equality builder); `formatIndexCond` is
+`operators_explain.go:851-886`, not "777-812".)
+
+**Shipped:**
+- `IndexScan.LowOp`/`HighOp` (`plan.go`) — the original comparison op in canonical
+  col-op-key form (zero value = inclusive, backward-compatible).
+- `tryRangeIndexScan` captures `LowOp`/`HighOp` and drops the Filter only when the
+  WHERE is a single conjunct equal to the folded range conjunct AND the index is
+  single-column (`len(chosenIdx.Columns) == 1`) AND the bound is a plain
+  literal/param (`isPlainConstantBound` — no volatile FuncCall). This conservative
+  subset provably preserves row counts; a volatile bound (`c2 < random()`) and a
+  composite index (`btg_y_x_w_idx`) both keep the per-row Filter.
+- `rangeScanPos` (`btree.go:3873-3992`) stops at `compareHigh(key, hi) >= 0` for an
+  exclusive hi and skips `key <= lo` for an exclusive lo; every other caller
+  (bitmap/lpdead) defaults inclusive.
+- `formatIndexCond` renders the stored op (`>`/`>=`/`<`/`<=`) instead of the hardcoded
+  `>=`/`<=`.
+- `tryPromoteIndexOnlyScan` refuses IOS promotion for exclusive-bound scans (Option B:
+  `indexOnlyScanOp` is inclusive-only, so a promoted IOS would leak the boundary row).
+
+**Measured result (`scripts/pg-regress-runner.sh aggregates`, 1387→1385 lines, zero
+regressions):** the single-column hunk (`agg_sort_order_c2_idx`, `c2 < 100`) now emits
+`Index Cond: (c2 < 100)` with no Filter, byte-matching PG; the composite hunk
+(`btg_y_x_w_idx`, `y < 0`) keeps its Filter (conservative) but the op is corrected
+`<=`→`<`. `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=35); units PASS; 4 new
+row-parity tests (exclusive hi/lo, composite-keeps-filter, volatile-keeps-filter).
+
+**Deferrals (ledger rows):** (1) `indexOnlyScanOp` is inclusive-only — an IOS promoted
+from a range scan renders neither Index Cond nor Filter and cannot express exclusivity
+(Option A scope); (2) multi-conjunct/composite WHERE keeps the redundant range
+conjunct in the Filter (PG trims it via `is_redundant_with_indexclauses`).
+
 ## Cross-case relevance
 
 Every M0134 regress case whose `.sql` emits `EXPLAIN` inherits the formatter

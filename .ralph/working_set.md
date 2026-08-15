@@ -1,54 +1,57 @@
-# Working set — M0134-0001 P2 S7 (single-relation GROUP BY pruning)
+# Working set — M0134-0001 P2 S4 (class 8: index range comparison op)
 
-**Task:** M0134-0001 aggregates.sql — `remove_useless_groupby_columns` single-rel arm
-landed: `buildAggregateStage` drops `GROUP BY` cols redundant under a PK/unique index.
+**Task:** M0134-0001 aggregates.sql — S4 (class 8) LANDED. goopg rendered
+`Index Cond: (c2 <= 100)` + redundant `Filter: (c2 < 100)` where PG renders only
+`Index Cond: (c2 < 100)`. Fixed via: store original op + exclusive btree scan +
+render original op + conservative Filter-drop.
 
-**Status:** LANDED + committed + pushed. Code commit (planner.go) + docs/ledger commit.
-Aggregates.diff **1474→1390**; hunks d447/d554/d588 CLOSED, d538 (p_t1) SHRUNK, d508
-(t1c) must-NOT unchanged. Q12=2/Q13=35 PASS.
+**Status:** LANDED + committed + pushed. Code commit `aa40caa6`, docs/ledger commit
+(following). aggregates.diff **1387→1385**, zero PASS→FAIL.
 
-**Files (this loop):** `internal/planner/planner.go` (`pruneUselessGroupByColumns`
-helper + `aggregateSurface.originalGroupInputCols`/`prunedInputCols` +
-`buildAggregateStage` prune/remap + `resolveExprAfterAggregate`/
-`resolveTargetsAfterAggregate` passthrough + `isColumnFunctionallyDetermined`
-coverage), `docs/design/0134-0001-p2-explain-format.md` (S7 Slice 1 + S6 Slice 3f
-d-render-reverted note), `.ralph/deferral_ledger.md` (partitioned-unique-index DDL gap).
+**Files (this loop):** `internal/planner/plan.go` (`IndexScan.LowOp/HighOp`),
+`internal/planner/planner.go` (`tryRangeIndexScan` op capture + `isPlainConstantBound`
++ Filter-drop gate; `tryPromoteIndexOnlyScan` exclusive-bound guard),
+`internal/access/btree/btree.go` (`rangeScanPos` exclusive lo/hi stop),
+`internal/executor/operators_index.go` (thread lo/hiExclusive),
+`internal/executor/operators_explain.go` (`formatIndexCond` renders stored op),
+`internal/executor/operators_bitmap.go` + lpdead tests (default-inclusive callers),
+tests (`range_exclusive_index_scan_test.go` new + 2 `range_index_scan_test.go` +
+`exprwalk_inventory_test.go` pin), `docs/design/0134-0001-p2-explain-format.md`,
+`.ralph/deferral_ledger.md` (2 rows).
 
-**Key symbols:** `pruneUselessGroupByColumns` (planner.go), `buildAggregateStage`
-(~6273), `isColumnFunctionallyDetermined` (~13436), `resolveExprAfterAggregate`
-(~6896), `resolveTargetsAfterAggregate` (~7314); `catalog.Index.Unique/Primary/
-NullsNotDistinct/Deferrable/HasPredicate/ColExprs`.
+**Key symbols:** `tryRangeIndexScan` (planner.go:9379-9510), `rangeScanPos`
+(btree.go:3873-3992), `formatIndexCond` (operators_explain.go:851-886),
+`tryPromoteIndexOnlyScan` (planner.go:12951), `isPlainConstantBound` (planner.go).
 
-**Findings:**
-- **S6 (d) scalar-subquery is a DEAD END standalone (design-doc §S6 Slice 3f):** a
-  d-render attempt (register skipped-Project target-list sublinks) grew the diff
-  1462→1474 — the divergence is architectural (goopg `ExecParamRef`→`$0` vs PG outer-Var
-  `int4_tbl.f1`; `Aggregate→IndexScan` vs `InitPlan→Limit→IOC`; numbering), not a
-  render gap. REVERTED. Closing blocks 8/17 needs a coupled d-rewrite (correlation gate
-  + deparse + numbering) — do NOT retry d-render alone.
-- **S7 prune is PG-faithful via `prunedInputCols`, NOT a unique-index func-dep
-  extension** (reviewer CONFIRMED: `check_functional_grouping` pg_constraint.c:1740 is
-  PK-only; extending would flip functional_deps 42803).
-- **Reviewer finding-1 fixed:** partitioned parent whose unique key omits a partition
-  col is not globally unique (goopg lacks indexcmds.c:1093 0A000) → prune fails closed
-  when `len(PartitionKey)>0` and any partition col ∉ bestKey. DDL gap → ledger.
+**Hypothesis/Findings:**
+- **Design-doc correction landed:** the class map's "drop the redundant Filter"
+  premise was WRONG — goopg's btree is inclusive-only, so the Filter was
+  executor-necessary. The faithful fix = exclusive scan (not a render-only lie).
+- **Filter-drop is deliberately conservative:** drops only when WHERE is a single
+  conjunct == the folded range conjunct AND index is single-column AND the bound is
+  a plain literal/param (no volatile FuncCall). Composite index (`btg_y_x_w_idx`) and
+  volatile bound (`random()`) keep the Filter — 4 row-parity tests pin this.
+- **Option B over A for IOS:** `indexOnlyScanOp` is inclusive-only AND renders no
+  Index Cond/Filter, so a promoted IOS would leak the boundary row AND still be
+  EXPLAIN-divergent. Refuse promotion for exclusive bounds (ledger row 1); making IOS
+  exclusive-aware is Option A scope (deferred).
+- Reviewer (APPROVE-WITH-NITS) caught the volatile + composite-blob leak; both fixed
+  in round 3.
 
-**Next step — S7 residuals (in order):** (1) multi-relation arm of initsplan.c:412
-(d463/d1234 — iterate every RTE_RELATION; the EC/pathkey pass); then (2) S7 GROUPING()
-guard is stricter than PG (fail-closed miss, unexercised — low priority); (3) index
-tie-break name-sorted vs PG OID order (plan-shape nit). After S7: S10a balk ERROR
-(d1323 `no combine rule for aggregate "balk"`, parallel_agg_combine.go:145 — bounded
-3-line correctness fix + test re-pin), then S4 op-preserve Index Cond, S8/S9 cost-model.
+**Next step — M0134-0001 remaining slices (in order):** (1) **S6 e.2** inheritance/
+MergeAppend (blocks 15/16, now unblocked by e.1 partial-index fix); (2) the hard **(d)**
+scalar-subquery d-rewrite (correlation gate + deparse + numbering — coupled, do NOT
+re-attempt standalone d-render); (3) **S8/S9** cost-model (presorted agg + join shape);
+(4) **S3** join-label `(INNER)`/`(CROSS)` (7 lines, formatter). S7 residuals
+(GROUPING() guard + index tie-break) low priority.
 
-**Gates run (this loop):** `go test ./internal/planner/ ./internal/executor/` PASS;
-`scripts/pg-regress-runner.sh aggregates` 1474→1390; `scripts/tpch-spotcheck.sh` PASS
-(Q12=2/Q13=35); `make plan-diff` SKIP (no goopg on 65433); pre-commit pgbench smoke on
-commit (0 failed). Behavioral probe (CASE A/B/C) confirmed partition guard + p_t1 prune.
+**Gates run (this loop):** `go test ./internal/{planner,executor,access/btree}` PASS;
+`scripts/pg-regress-runner.sh aggregates` 1387→1385 (zero PASS→FAIL);
+`scripts/tpch-spotcheck.sh` PASS ×2 (Q12=2/Q13=35, round-2 + final round-4);
+`RALPH_PRECOMMIT_SCOPE=units` PASS; pre-commit pgbench smoke PASS (0 failed).
 
-**Delegation:** researcher `0134-0001-s6-next-slice-inventory` DONE (recommended S7
-single-rel prune). implementer `0134-0001-s7-groupby-pruning` DONE (2 rounds: initial +
-reviewer finding-1 fix). reviewer `0134-0001-s7-groupby-pruning` DONE (REQUEST-CHANGES
-→ finding 1 fixed; deviation CONFIRMED correct). implementer
-`0134-0001-s6-s3f-scalar-subquery-render` DONE but REVERTED (d-render net-negative).
+**Delegation:** implementer `0134-0001-s4-class8-indexcond` DONE (3 rounds: core →
+Option-B decision → reviewer tightenings). researcher
+`0134-0001-s4-class8-indexcond-research` DONE. reviewer + tester DONE.
 
 **In-flight:** none.
