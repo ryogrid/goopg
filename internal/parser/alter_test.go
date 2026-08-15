@@ -572,6 +572,49 @@ func TestParseAlterTableAddCheckNoInherit(t *testing.T) {
 	}
 }
 
+// TestParseAlterTableRenameConstraint guards the `ALTER TABLE name RENAME
+// CONSTRAINT old TO new` grammar (M0134-0002 C2): `ALTER TABLE t RENAME
+// CONSTRAINT c1 TO c2` parses into a single AlterTableRenameConstraint action
+// carrying OldConstraintName=c1 and NewName=c2. Mirrors the ALTER DOMAIN RENAME
+// CONSTRAINT arm's shape (ddl.go RENAME branch).
+func TestParseAlterTableRenameConstraint(t *testing.T) {
+	for _, tc := range []struct {
+		sql    string
+		wantOK bool
+	}{
+		{"ALTER TABLE t RENAME CONSTRAINT c1 TO c2", true},
+		{"ALTER TABLE t rename constraint c1 to c2", true},
+		{"ALTER TABLE ONLY t RENAME CONSTRAINT c1 TO c2", true},
+		// Not a valid RENAME form: missing TO (old constraint only).
+		{"ALTER TABLE t RENAME CONSTRAINT c1", false},
+	} {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			if tc.wantOK {
+				t.Fatalf("Parse(%q): %v", tc.sql, err)
+			}
+			continue
+		}
+		if !tc.wantOK {
+			t.Fatalf("Parse(%q): expected error, got %+v", tc.sql, stmts)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T", tc.sql, stmts[0])
+		}
+		if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableRenameConstraint {
+			t.Fatalf("Parse(%q): actions=%+v", tc.sql, at.Actions)
+		}
+		a := at.Actions[0]
+		if a.OldConstraintName != "c1" {
+			t.Errorf("Parse(%q): OldConstraintName=%q want %q", tc.sql, a.OldConstraintName, "c1")
+		}
+		if a.NewName != "c2" {
+			t.Errorf("Parse(%q): NewName=%q want %q", tc.sql, a.NewName, "c2")
+		}
+	}
+}
+
 // TestParseCreateTableColumnCompression covers the inline `COMPRESSION <method>`
 // clause in a CREATE TABLE column definition (`a text COMPRESSION lz4`), which
 // threads the method onto ColumnDef.Compression. DU-002 slice 183.

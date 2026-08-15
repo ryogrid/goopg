@@ -8314,6 +8314,150 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					return fmt.Errorf("DDL catalog sync: %w", syncErr)
 				}
 			}
+		case parser.AlterTableRenameConstraint:
+			// ALTER TABLE name RENAME CONSTRAINT old TO new. Renames an existing
+			// constraint in place with its OID stable, mirroring PG's
+			// rename_constraint_internal (tablecmds.c:4047). The constraint is
+			// found by name across the same four stores as the drop path
+			// (execAlterTableDropConstraint): CHECK → FK → UNIQUE → EXCLUDE → PK.
+			// For UNIQUE/PK/EXCLUDE the constraint name IS the backing index name
+			// (pg_constraint.conindid), so the rename re-keys the index via
+			// InMemory.RenameIndex — PG does the same (RenameRelationInternal on
+			// conindid, tablecmds.c:4129-4134).
+			//
+			// Error codes match PG: 42704
+			// `constraint "%s" for table "%s" does not exist`
+			// (get_relation_constraint_oid, pg_constraint.c:1234) when nothing
+			// carries the old name; 42710
+			// `constraint "%s" for relation "%s" already exists`
+			// (RenameConstraintById, pg_constraint.c:1025) for a CHECK/FK name
+			// collision; 42P07 `relation "%s" already exists`
+			// (RenameRelationInternal, tablecmds.c:4303-4307) for the
+			// index-backed path. M0134-0002 C2.
+			oldName := act.OldConstraintName
+			newName := act.NewName
+			dbOidRC := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+
+			// constraintNameInUse mirrors PG's ConstraintNameIsUsed(CONSTRAINT_RELATION,
+			// conrelid, newname): a collision with ANY constraint kind on the
+			// relation blocks a CHECK/FK rename (pg_constraint.c:1019-1026). The
+			// constraint being renamed still carries oldName at this point, so a
+			// self-rename (old == new) is caught exactly as PG catches it.
+			constraintNameInUse := func(name string) bool {
+				for _, nc := range tbl.NamedChecks {
+					if strings.EqualFold(nc.Name, name) {
+						return true
+					}
+				}
+				for _, fk := range tbl.ForeignKeys {
+					if strings.EqualFold(fk.Name, name) {
+						return true
+					}
+				}
+				for _, nn := range tbl.NotNullConstraints {
+					if strings.EqualFold(nn.Name, name) {
+						return true
+					}
+				}
+				for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl, dbOidRC) {
+					if (idx.Unique && idx.IsConstraint) || idx.Primary || idx.IsExclusion {
+						if strings.EqualFold(idx.Name, name) {
+							return true
+						}
+					}
+				}
+				return false
+			}
+
+			// 1. CHECK constraints — checked before PK so an inherited check
+			// takes priority, mirroring the drop path.
+			for i, nc := range tbl.NamedChecks {
+				if !strings.EqualFold(nc.Name, oldName) {
+					continue
+				}
+				if constraintNameInUse(newName) {
+					return &ExecError{Code: "42710", Pos: act.Pos(), Message: fmt.Sprintf("constraint %q for relation %q already exists", newName, tbl.Name)}
+				}
+				tbl.NamedChecks[i].Name = newName
+				// Cascade to partition children: rename the inherited copy in
+				// each child, mirroring the drop cascade at :9873-9883.
+				if imRC, okRC := o.ctx.Catalog.(*catalog.InMemory); okRC {
+					for _, childTbl := range imRC.PartitionChildren(tbl.OID) {
+						for j := range childTbl.NamedChecks {
+							if strings.EqualFold(childTbl.NamedChecks[j].Name, oldName) {
+								childTbl.NamedChecks[j].Name = newName
+								break
+							}
+						}
+					}
+				}
+				return nil
+			}
+
+			// 2. FOREIGN KEY constraints.
+			for i, fk := range tbl.ForeignKeys {
+				if !strings.EqualFold(fk.Name, oldName) {
+					continue
+				}
+				if constraintNameInUse(newName) {
+					return &ExecError{Code: "42710", Pos: act.Pos(), Message: fmt.Sprintf("constraint %q for relation %q already exists", newName, tbl.Name)}
+				}
+				tbl.ForeignKeys[i].Name = newName
+				return nil
+			}
+
+			// 3. UNIQUE constraints — index-backed (constraint name == index
+			// name), so the rename re-keys the index.
+			var renameIdx *catalog.Index
+			for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl, dbOidRC) {
+				if !idx.Primary && idx.Unique && idx.IsConstraint && strings.EqualFold(idx.Name, oldName) {
+					renameIdx = idx
+					break
+				}
+			}
+			// 3.5. EXCLUDE constraints.
+			if renameIdx == nil {
+				for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl, dbOidRC) {
+					if idx.IsExclusion && strings.EqualFold(idx.Name, oldName) {
+						renameIdx = idx
+						break
+					}
+				}
+			}
+			// 4. PRIMARY KEY constraints.
+			if renameIdx == nil {
+				for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl, dbOidRC) {
+					if idx.Primary && strings.EqualFold(idx.Name, oldName) {
+						renameIdx = idx
+						break
+					}
+				}
+			}
+			if renameIdx == nil {
+				return &ExecError{Code: "42704", Pos: act.Pos(), Message: fmt.Sprintf("constraint %q for table %q does not exist", oldName, tbl.Name)}
+			}
+			imRC, okRC := o.ctx.Catalog.(*catalog.InMemory)
+			if !okRC {
+				return &ExecError{Code: "XX000", Pos: act.Pos(), Message: "catalog does not support index rename"}
+			}
+			oldObjName := parser.ObjectName{Schema: renameIdx.Schema, Name: oldName}
+			newObjName := parser.ObjectName{Schema: renameIdx.Schema, Name: newName}
+			// RenameIndex renames index AND constraint in one call (constraint
+			// name == index name), wrapping any name collision as 42P07 exactly
+			// as ALTER INDEX RENAME does.
+			if err := imRC.RenameIndex(oldObjName, newObjName, dbOidRC); err != nil {
+				return &ExecError{Code: "42P07", Pos: act.Pos(), Message: err.Error()}
+			}
+			// The index name lives in pg_class.relname (not pg_index), so
+			// rewrite the index's pg_class heap row with the new name for
+			// restart durability (loadUserIndexesFromHeap), mirroring ALTER
+			// INDEX RENAME's resyncIndexClassHeapRow step.
+			if catalogHeapSyncAvailable(o.ctx) {
+				if syncErr := resyncIndexClassHeapRow(o.ctx, renameIdx); syncErr != nil {
+					return syncErr
+				}
+			}
+			return nil
 		case parser.AlterTableInherit:
 			// INHERIT parent_table — register the named table as a parent of tbl
 			// so that scanning the parent includes tbl's rows (M0097-0048).

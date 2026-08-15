@@ -8548,6 +8548,29 @@ func (p *parser) parseAlter() (Stmt, error) {
 			})
 			return stmt, nil
 		}
+		// RENAME CONSTRAINT old TO new — mirrors the ALTER DOMAIN RENAME
+		// CONSTRAINT arm (ddl.go:8215-8228). Renames an existing table
+		// constraint (CHECK/FK/UNIQUE/PK/EXCLUDE) in place. M0134-0002 C2.
+		if p.acceptKeyword(KwConstraint) {
+			oldNameTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			newNameTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Actions = append(stmt.Actions, AlterTableAction{
+				pos:               oldNameTok.Pos,
+				Kind:              AlterTableRenameConstraint,
+				OldConstraintName: identText(oldNameTok),
+				NewName:           identText(newNameTok),
+			})
+			return stmt, nil
+		}
 		// RENAME VALUE 'old' TO 'new' (enum) — no-op: consume rest.
 		if p.acceptIdentKeyword("value") {
 			for p.cur().Kind != TokenEOF {

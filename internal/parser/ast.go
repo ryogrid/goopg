@@ -3160,6 +3160,13 @@ const (
 	// AccessMethodName holds the target AM name. DU-002: pg_dump emits this for
 	// partitioned tables whose relam differs from the default.
 	AlterTableSetAccessMethod
+	// AlterTableRenameConstraint — `ALTER TABLE name RENAME CONSTRAINT old TO new`.
+	// Renames an existing table constraint in place, keeping its OID. For
+	// UNIQUE/PK/EXCLUDE the constraint name IS the backing index name, so the
+	// rename re-keys the index too (rename_constraint_internal →
+	// RenameRelationInternal, tablecmds.c:4129-4134). OldConstraintName holds the
+	// old name; NewName the new one. M0134-0002 C2.
+	AlterTableRenameConstraint
 )
 
 // FDWOptionVerb tags one entry of an `ALTER FOREIGN TABLE ... OPTIONS (...)`
@@ -3227,6 +3234,10 @@ type AlterTableAction struct {
 	// OldColumnName is populated for AlterTableRenameColumn and holds the
 	// existing column name to be renamed. M0097-regress.
 	OldColumnName string
+	// OldConstraintName is populated for AlterTableRenameConstraint and holds
+	// the existing constraint name to be renamed (ConstraintName is reserved for
+	// "ADD CONSTRAINT name"). M0134-0002 C2.
+	OldConstraintName string
 
 	// InheritParent is populated for AlterTableInherit and AlterTableNoInherit.
 	// Holds the parent table name. M0097-0048.
