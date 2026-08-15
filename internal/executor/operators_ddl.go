@@ -8333,15 +8333,23 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			oldColName := act.OldColumnName
 			newColName := act.NewName
 
+			// M0134-0002 C9: `ONLY` on a parent that has children is refused
+			// BEFORE the column-existence lookup, mirroring renameatt_internal's
+			// not-recursing branch (postgres/src/backend/commands/tablecmds.c:3912-3917).
+			// PG emits no errposition here, so Pos is 0. 42P16.
+			if s.Only && o.hasInheritanceChildren(tbl) {
+				return &ExecError{Code: "42P16", Pos: 0, Message: fmt.Sprintf("inherited column %q must be renamed in child tables too", oldColName)}
+			}
+
 			// Check old column exists.
-			colExists := false
-			for _, col := range tbl.Columns {
+			colIdx := -1
+			for i, col := range tbl.Columns {
 				if strings.EqualFold(col.Name, oldColName) {
-					colExists = true
+					colIdx = i
 					break
 				}
 			}
-			if !colExists {
+			if colIdx < 0 {
 				return &ExecError{Code: "42703", Pos: act.Pos(), Message: fmt.Sprintf("column %q does not exist", oldColName)}
 			}
 
@@ -8353,6 +8361,18 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// no errposition.
 			if isSystemColumn(newColName) {
 				return &ExecError{Code: "42701", Pos: 0, Message: fmt.Sprintf("column name %q conflicts with a system column name", newColName)}
+			}
+
+			// M0134-0002 C9: an inherited column cannot be renamed unless the
+			// recursion is coming from its parent (attinhcount > expected_parents,
+			// renameatt_internal, tablecmds.c:3960-3964). goopg does not yet recurse
+			// RENAME COLUMN into children, so the plain guard is correct. The
+			// colStillInherited live-hierarchy check keeps the guard off stale
+			// Inherited flags (a parent-side DROP COLUMN leaves the child flag set;
+			// NO INHERIT clears it in the catalog but the flag lingers until then).
+			// PG emits no errposition here, so Pos is 0. 42P16.
+			if tbl.Columns[colIdx].Inherited && o.colStillInherited(tbl, oldColName) {
+				return &ExecError{Code: "42P16", Pos: 0, Message: fmt.Sprintf("cannot rename inherited column %q", oldColName)}
 			}
 
 			// Check inheritance children for name conflict.
@@ -8496,6 +8516,20 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			for i, nc := range tbl.NamedChecks {
 				if !strings.EqualFold(nc.Name, oldName) {
 					continue
+				}
+				// M0134-0002 C9: inherited-constraint guards, mirroring
+				// rename_constraint_internal (tablecmds.c:4112-4126). PG gates the
+				// whole block on `contype == CHECK || NOTNULL && !con->connoinherit`
+				// (tablecmds.c:4086-4089): a NO INHERIT constraint is exempt from
+				// both refusals. The ONLY-with-children refusal comes first (else
+				// branch, fired before the coninhcount test); then a constraint
+				// inherited from a parent outside the processed hierarchy is
+				// refused outright. Both 42P16; PG emits no errposition, so Pos 0.
+				if s.Only && o.hasInheritanceChildren(tbl) && !nc.NoInherit {
+					return &ExecError{Code: "42P16", Pos: 0, Message: fmt.Sprintf("inherited constraint %q must be renamed in child tables too", oldName)}
+				}
+				if nc.InhCount > 0 && !nc.NoInherit {
+					return &ExecError{Code: "42P16", Pos: 0, Message: fmt.Sprintf("cannot rename inherited constraint %q", oldName)}
 				}
 				if constraintNameInUse(newName) {
 					return &ExecError{Code: "42710", Pos: act.Pos(), Message: fmt.Sprintf("constraint %q for relation %q already exists", newName, tbl.Name)}
@@ -8676,6 +8710,24 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					im.MarkInheritanceChangePending()
 				} else {
 					im.UnregisterInheritanceChild(parentTbl.OID, tbl.OID)
+				}
+			}
+			// M0134-0002 C9: clear the Inherited flag on the columns that came from
+			// this parent (PG decrements attinhcount per parent, ATExecDropInherit
+			// tablecmds.c ~17000). Without this the C9 inherited-DDL guards would
+			// keep firing on a now-local column after NO INHERIT (the atacc3 regress
+			// case), refusing renames/drops PG allows. A column shared with another
+			// surviving parent stays flagged — only single-parent columns flip here;
+			// per-parent attinhcount is the follow-up bookkeeping slice.
+			for i := range tbl.Columns {
+				if !tbl.Columns[i].Inherited {
+					continue
+				}
+				for _, pc := range parentTbl.Columns {
+					if strings.EqualFold(pc.Name, tbl.Columns[i].Name) {
+						tbl.Columns[i].Inherited = false
+						break
+					}
 				}
 			}
 		case parser.AlterTableSetStorage:
@@ -9656,6 +9708,15 @@ func (o *ddlOp) execAlterTableAddColumn(stmt *parser.AlterTableStmt, tbl *catalo
 			return nil
 		}
 	}
+	// M0134-0002 C9: `ADD COLUMN ... ONLY` on a parent that has children is
+	// refused — the addition would put the children out of step. Mirrors
+	// ATExecAddColumn's `children && !recurse` refusal
+	// (postgres/src/backend/commands/tablecmds.c:7596-7603); children covers
+	// both INHERITS children and PARTITION OF partitions (pg_inherits). PG emits
+	// no errposition here, so Pos is 0. 42P16.
+	if stmt.Only && o.hasInheritanceChildren(tbl) {
+		return &ExecError{Code: "42P16", Pos: 0, Message: "column must be added to child tables too"}
+	}
 	if col.NotNull {
 		rel := o.ctx.Catalog.RelFileNode(tbl)
 		n, err := o.ctx.Pool.NBlocks(rel)
@@ -10244,11 +10305,15 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 		if !strings.EqualFold(nc.Name, act.ConstraintName) {
 			continue
 		}
-		// Cannot drop an inherited constraint (coninhcount > 0).
+		// Cannot drop an inherited constraint (coninhcount > 0, not recursing).
+		// Mirrors dropconstraint_internal
+		// (postgres/src/backend/commands/tablecmds.c:14102-14107), SQLSTATE
+		// 42P16 (ERRCODE_INVALID_TABLE_DEFINITION). PG emits no errposition, so
+		// Pos is 0. M0134-0002 C9.
 		if nc.InhCount > 0 {
 			return &ExecError{
-				Code:    "42704",
-				Pos:     act.Pos(),
+				Code:    "42P16",
+				Pos:     0,
 				Message: fmt.Sprintf("cannot drop inherited constraint %q of relation %q", act.ConstraintName, tbl.Name),
 			}
 		}
@@ -11786,6 +11851,85 @@ func isSystemColumn(name string) bool {
 	switch name {
 	case "ctid", "xmin", "cmin", "xmax", "cmax", "tableoid":
 		return true
+	}
+	return false
+}
+
+// hasInheritanceChildren reports whether tbl has any inheritance or partition
+// children. PG's find_inheritance_children scans pg_inherits (pg_inherits.c:81-121),
+// which holds BOTH `INHERITS` children and `PARTITION OF` partitions, so both
+// goopg maps must be consulted. Used by the C9 ONLY-guards (RENAME/DROP
+// COLUMN, ADD COLUMN, RENAME/DROP CONSTRAINT): PG refuses ONLY on a parent
+// with children via this exact child set (tablecmds.c:3912-3917, 7600-7603,
+// 4114-4119).
+func (o *ddlOp) hasInheritanceChildren(tbl *catalog.Table) bool {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return false
+	}
+	return len(im.InheritanceChildren(tbl.OID)) > 0 || len(im.PartitionChildren(tbl.OID)) > 0
+}
+
+// colStillInherited reports whether colName is still inherited in the LIVE
+// hierarchy: a direct parent (INHERITS or PARTITION OF) whose edge to tbl is
+// still registered still carries a column of that name.
+//
+// The catalog.Column.Inherited flag alone is insufficient. goopg does not yet
+// maintain PG's per-parent attinhcount bookkeeping (the M0134-0002 C9
+// follow-up), so the flag goes stale: a parent-side DROP COLUMN removes the
+// column from the parent but leaves the child's flag set, and NO INHERIT /
+// DETACH unregister the edge without clearing it. PG's guards key off attinhcount
+// in the live state (ATExecDropColumn tablecmds.c:9350, renameatt_internal
+// :3960), so the C9 guards must too. M0134-0002 C9.
+func (o *ddlOp) colStillInherited(tbl *catalog.Table, colName string) bool {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return false
+	}
+	for _, parentOID := range tbl.InheritsParentOIDs {
+		if o.parentStillHasColumn(im, parentOID, tbl.OID, colName) {
+			return true
+		}
+	}
+	if tbl.PartitionParentOID != 0 && o.parentStillHasColumn(im, tbl.PartitionParentOID, tbl.OID, colName) {
+		return true
+	}
+	return false
+}
+
+// parentStillHasColumn reports whether parentOID's inheritance/partition edge to
+// childOID is still registered AND the parent currently carries colName. The
+// edge check mirrors find_inheritance_children (pg_inherits.c:81-121): pg_inherits
+// holds both INHERITS children and PARTITION OF partitions, and NO INHERIT /
+// DETACH delete the row, so a child whose edge was unregistered no longer counts
+// regardless of any lingering column flag.
+func (o *ddlOp) parentStillHasColumn(im *catalog.InMemory, parentOID, childOID uint32, colName string) bool {
+	live := false
+	for _, child := range im.InheritanceChildren(parentOID) {
+		if child.OID == childOID {
+			live = true
+			break
+		}
+	}
+	if !live {
+		for _, child := range im.PartitionChildren(parentOID) {
+			if child.OID == childOID {
+				live = true
+				break
+			}
+		}
+	}
+	if !live {
+		return false
+	}
+	parent, ok := im.LookupTableByOID(parentOID)
+	if !ok {
+		return false
+	}
+	for _, pc := range parent.Columns {
+		if strings.EqualFold(pc.Name, colName) {
+			return true
+		}
 	}
 	return false
 }
@@ -21521,6 +21665,18 @@ func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAct
 	}
 	if dropIdx < 0 {
 		return &ExecError{Code: "42703", Pos: act.Pos(), Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
+	}
+
+	// Cannot drop an inherited column (attinhcount > 0) unless recursing from a
+	// parent drop. Mirrors ATExecDropColumn's refusal
+	// (postgres/src/backend/commands/tablecmds.c:9343-9351). goopg does not yet
+	// recurse DROP COLUMN into inheritance/partition children, so the plain
+	// guard (no `recursing` skip) is correct for now. The colStillInherited
+	// live-hierarchy check keeps the guard off stale Inherited flags (a
+	// parent-side DROP COLUMN leaves the child flag set). PG emits no errposition
+	// here, so Pos is 0. 42P16.
+	if tbl.Columns[dropIdx].Inherited && o.colStillInherited(tbl, act.ColumnName) {
+		return &ExecError{Code: "42P16", Pos: 0, Message: fmt.Sprintf("cannot drop inherited column %q", act.ColumnName)}
 	}
 
 	// Cannot drop a column that is part of the partition key.

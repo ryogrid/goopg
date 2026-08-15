@@ -3405,6 +3405,12 @@ type AlterTableStmt struct {
 	IfExists bool
 	Name     ObjectName
 	Actions  []AlterTableAction
+	// Only is true for `ALTER TABLE [IF EXISTS] ONLY name` (inheritance
+	// exclusion, gram.y opt_only). PG threads it as recurse=false into the
+	// ATExec* routines, which refuse ONLY on a parent that has children
+	// ("column/constraint must be added/renamed in child tables too").
+	// M0134-0002 C9.
+	Only bool
 	// SetSchema holds the target schema name for ALTER TABLE/VIEW/MATERIALIZED VIEW
 	// ... SET SCHEMA <newschema>. Empty means no SET SCHEMA action. M0097-0025.
 	SetSchema string

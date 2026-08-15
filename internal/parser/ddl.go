@@ -8597,8 +8597,10 @@ func (p *parser) parseAlter() (Stmt, error) {
 		}
 		stmt.IfExists = true
 	}
-	// Optional ONLY modifier (inheritance exclusion) — accept and discard.
-	_ = p.acceptIdentKeyword("only")
+	// Optional ONLY modifier (inheritance exclusion) — recorded on the stmt so
+	// the executor can refuse ONLY on a parent that has children (M0134-0002
+	// C9). Previously accepted and discarded.
+	stmt.Only = p.acceptIdentKeyword("only")
 	name, err := p.parseObjectName()
 	if err != nil {
 		return nil, err

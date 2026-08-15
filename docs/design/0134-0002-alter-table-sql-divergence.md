@@ -348,6 +348,47 @@ gate passes atomically):
    surface the error to their `Next`. The error message mirrors the existing
    `column %q of relation %q does not exist` at analyzer.go:733.
 
+## C9 first slice — inherited column/constraint DDL guards (2026-08-16)
+
+After C2 landed, the researcher reassessed the diff
+(`tmp/ralph-handoffs/0134-0002-c3-reassess-research/report.md`): **4349-line diff,
+104 hunks, 746 `+` / 849 `-`**. C9 inheritance is the largest remaining
+correctness class (553 lines). This slice lands only the *guards* — the bounded,
+low-risk portion — and defers InhCount bookkeeping to a follow-up.
+
+**The defect.** goopg silently *mutates* inherited state where PG refuses. Three
+ALTER arms read `col.Inherited` (bool, set at CREATE TABLE INHERITS / PARTITION OF /
+ADD COLUMN-to-parent, operators_ddl.go:3226/4385) but never guard on it:
+
+| goopg arm | today | PG oracle | fix |
+|---|---|---|---|
+| `execAlterDropColumn` (operators_ddl.go:21505) | silently rewrites the heap and deletes an inherited column | `ATExecDropColumn` tablecmds.c:9350 → 42P16 `cannot drop inherited column "%s"` | guard `col.Inherited` |
+| RENAME COLUMN dispatcher arm (operators_ddl.go:8332) | renames without child propagation | `renameatt_internal` tablecmds.c:3916/3963 → `inherited column "%s" must be renamed in child tables too` / `cannot rename inherited column "%s"` | guard |
+| `execAlterTableAddColumn` (operators_ddl.go:9637) | `ONLY`-with-children accepted | `ATExecAddColumn` tablecmds.c:7603 → `column must be added to child tables too` | guard |
+| `execAlterTableDropConstraint` (operators_ddl.go:10239; InhCount guard at :10248 exists) | drops an inherited constraint | `ATExecDropConstraint` tablecmds.c:14106 → `cannot drop inherited constraint` | guard |
+| inherited-constraint RENAME arm | renames | `rename_constraint_internal` tablecmds.c:4118 → `inherited constraint "%s" must be renamed in child tables too` | guard |
+
+**Deferred (follow-up slice):** `Column.InhCount int` (multi-parent) for the
+pg_attribute VALUES rows (hunks 1512/1525, `c1` attinhcount 2 vs 1) and the
+depth0/merge NOTICEs. The bool guard passes multi-inheritance but the catalog rows
+stay wrong until the int count lands.
+
+**Landed (2026-08-16).** Diff 4349→4298 (−51), zero new divergence. The five guards
+reproduce the oracle message + SQLSTATE byte-exact (42P16 throughout, `Pos: 0` — PG
+emits no errposition on these refusals). The `ONLY` guards key off
+`hasInheritanceChildren` (INHERITS ∪ PARTITION children, pg_inherits), which matches
+PG's `expected_parents == 0 && find_inheritance_children(...) != NIL` exactly; the
+inherited-column/constraint guards key off `col.Inherited`/`nc.InhCount > 0` with a
+`colStillInherited`/`parentStillHasColumn` live-hierarchy narrowing so a stale flag
+(after parent-side DROP or NO INHERIT) does not false-fire, and the NO INHERIT arm
+clears the child's `Inherited` flag (PG decrements attinhcount). A parser change
+records `AlterTableStmt.Only` (was accepted-and-discarded).
+
+The projected 100-120 close was 51: the residual is pre-existing and un-closable by
+the guards — `Column.InhCount int` multi-parent bookkeeping (attinhcount 1-vs-2),
+LIKE+ATTACH-PARTITION `Inherited`, INHERIT child-validation, and INHERITS merge
+NOTICEs, each ledgered (3 rows).
+
 ## Secondary finding (corrects deferral-ledger row 1385)
 
 The EXPLAIN `QUERY PLAN` underline width is **not** a goopg fixed-width
