@@ -46,7 +46,7 @@ func newTestTreeWAL(t *testing.T) (*BTree, *storage.Pool, func()) {
 func scanPositions(t *testing.T, bt *BTree) map[int32]KillItem {
 	t.Helper()
 	out := map[int32]KillItem{}
-	if err := bt.RangeScanWithPos(nil, nil, func(key []byte, ptr storage.ItemPointer, pos ScanPos) (bool, error) {
+	if err := bt.RangeScanWithPos(nil, nil, false, false, func(key []byte, ptr storage.ItemPointer, pos ScanPos) (bool, error) {
 		v, err := DecodeInt4(key)
 		if err != nil {
 			return false, err
@@ -241,7 +241,7 @@ func TestNoSpaceRewritePurgesDeadItems(t *testing.T) {
 	// Mark one mid-page entry dead, then insert one more (no space →
 	// recovery rewrite fires).
 	kills := map[int32]KillItem{}
-	if err := bt.RangeScanWithPos(nil, nil, func(key []byte, ptr storage.ItemPointer, pos ScanPos) (bool, error) {
+	if err := bt.RangeScanWithPos(nil, nil, false, false, func(key []byte, ptr storage.ItemPointer, pos ScanPos) (bool, error) {
 		v, _ := DecodeInt4(key[:4])
 		kills[v] = KillItem{Pos: pos, Ptr: ptr}
 		return true, nil

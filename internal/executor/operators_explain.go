@@ -873,10 +873,18 @@ func formatIndexCond(p *planner.IndexScan, reg *subPlanReg) string {
 		col := cols[0]
 		var parts []string
 		if p.LowKey != nil {
-			parts = append(parts, col+" >= "+formatExprPGReg(p.LowKey, reg))
+			loOp := ">="
+			if p.LowOp == parser.OpGt {
+				loOp = ">"
+			}
+			parts = append(parts, col+" "+loOp+" "+formatExprPGReg(p.LowKey, reg))
 		}
 		if p.HighKey != nil {
-			parts = append(parts, col+" <= "+formatExprPGReg(p.HighKey, reg))
+			hiOp := "<="
+			if p.HighOp == parser.OpLt {
+				hiOp = "<"
+			}
+			parts = append(parts, col+" "+hiOp+" "+formatExprPGReg(p.HighKey, reg))
 		}
 		if len(parts) > 0 {
 			return wrapParen(strings.Join(parts, " AND "))

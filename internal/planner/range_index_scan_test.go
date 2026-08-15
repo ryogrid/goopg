@@ -54,13 +54,12 @@ func TestPlanRangeScanSingleLowerBound(t *testing.T) {
 	if !ok {
 		t.Fatalf("root=%T want *Project", node)
 	}
-	f, ok := proj.Child.(*Filter)
+	// M0134-0001 S4: a single-conjunct range WHERE is fully and exactly
+	// implemented by the (now exclusive-capable) index scan, so no redundant
+	// Filter wraps it.
+	idx, ok := proj.Child.(*IndexScan)
 	if !ok {
-		t.Fatalf("child=%T want *Filter(IndexScan)", proj.Child)
-	}
-	idx, ok := f.Child.(*IndexScan)
-	if !ok {
-		t.Fatalf("Filter.Child=%T want *IndexScan", f.Child)
+		t.Fatalf("child=%T want *IndexScan without Filter for a single range conjunct", proj.Child)
 	}
 	if idx.Key != nil {
 		t.Fatalf("IndexScan.Key should be nil for range scan, got %T", idx.Key)
@@ -70,6 +69,9 @@ func TestPlanRangeScanSingleLowerBound(t *testing.T) {
 	}
 	if idx.HighKey != nil {
 		t.Fatalf("IndexScan.HighKey should be nil for single lower bound, got %T", idx.HighKey)
+	}
+	if idx.LowOp != parser.OpGe {
+		t.Fatalf("IndexScan.LowOp should preserve the original >= op, got %v", idx.LowOp)
 	}
 }
 
@@ -147,13 +149,10 @@ func TestPlanRangeScanVarchar(t *testing.T) {
 	if !ok {
 		t.Fatalf("root=%T want *Project", node)
 	}
-	f, ok := proj.Child.(*Filter)
+	// M0134-0001 S4: single-conjunct range WHERE → no redundant Filter.
+	idx, ok := proj.Child.(*IndexScan)
 	if !ok {
-		t.Fatalf("child=%T want *Filter(IndexScan)", proj.Child)
-	}
-	idx, ok := f.Child.(*IndexScan)
-	if !ok {
-		t.Fatalf("Filter.Child=%T want *IndexScan", f.Child)
+		t.Fatalf("child=%T want *IndexScan without Filter for a single range conjunct", proj.Child)
 	}
 	if idx.Key != nil {
 		t.Fatalf("IndexScan.Key should be nil for range scan, got %T", idx.Key)
@@ -163,5 +162,76 @@ func TestPlanRangeScanVarchar(t *testing.T) {
 	}
 	if idx.HighKey != nil {
 		t.Fatalf("IndexScan.HighKey should be nil for single lower bound, got %T", idx.HighKey)
+	}
+	if idx.LowOp != parser.OpGt {
+		t.Fatalf("IndexScan.LowOp should preserve the original > op, got %v", idx.LowOp)
+	}
+}
+
+func TestPlanRangeScanRecordsStrictOpAndDropsSingleFilter(t *testing.T) {
+	cat := catalog.NewInMemory()
+	tbl, err := cat.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "c1", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "c2", Type: catalog.Type{Name: "int4"}, NotNull: false},
+		{Name: "c3", Type: catalog.Type{Name: "varchar"}, NotNull: false},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.CreateIndex(parser.ObjectName{Name: "t_c2"}, tbl, []string{"c2"}, false, "btree", false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Single strict conjunct: HighOp=OpLt recorded, redundant Filter dropped.
+	stmt := parseOne(t, "SELECT c1 FROM t WHERE c2 < 100")
+	node, err := Plan(stmt, cat)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	proj, ok := node.(*Project)
+	if !ok {
+		t.Fatalf("root=%T want *Project", node)
+	}
+	idx, ok := proj.Child.(*IndexScan)
+	if !ok {
+		t.Fatalf("child=%T want *IndexScan without Filter for a single range conjunct", proj.Child)
+	}
+	if idx.HighKey == nil {
+		t.Fatal("IndexScan.HighKey should be non-nil for c2 < 100")
+	}
+	if idx.LowKey != nil {
+		t.Fatalf("IndexScan.LowKey should be nil for a single high bound, got %T", idx.LowKey)
+	}
+	if idx.HighOp != parser.OpLt {
+		t.Fatalf("IndexScan.HighOp should preserve the original < op, got %v", idx.HighOp)
+	}
+	if idx.LowOp != parser.OpUnknown {
+		t.Fatalf("IndexScan.LowOp should stay zero (inclusive) with no low bound, got %v", idx.LowOp)
+	}
+
+	// Multi-conjunct WHERE: the range conjunct is absorbed but the Filter MUST
+	// stay — it still re-checks the non-range conjunct (c3 = 'x').
+	stmt2 := parseOne(t, "SELECT c1 FROM t WHERE c2 < 100 AND c3 = 'x'")
+	node2, err := Plan(stmt2, cat)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	proj2, ok := node2.(*Project)
+	if !ok {
+		t.Fatalf("root=%T want *Project", node2)
+	}
+	f2, ok := proj2.Child.(*Filter)
+	if !ok {
+		t.Fatalf("child=%T want *Filter(IndexScan) for a multi-conjunct WHERE", proj2.Child)
+	}
+	idx2, ok := f2.Child.(*IndexScan)
+	if !ok {
+		t.Fatalf("Filter.Child=%T want *IndexScan", f2.Child)
+	}
+	if idx2.HighOp != parser.OpLt {
+		t.Fatalf("IndexScan.HighOp should preserve < in the multi-conjunct case too, got %v", idx2.HighOp)
+	}
+	if idx2.HighKey == nil {
+		t.Fatal("IndexScan.HighKey should be non-nil for c2 < 100 AND ...")
 	}
 }

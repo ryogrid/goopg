@@ -696,7 +696,15 @@ type IndexScan struct {
 	// to keep the executor probe path purely equality-shaped.
 	LowKey  Expr // inclusive lower bound for range scan; nil = no lower bound
 	HighKey Expr // inclusive upper bound for range scan; nil = no upper bound
-	schema  Schema
+	// LowOp / HighOp preserve the ORIGINAL comparison operator in its canonical
+	// col-op-key form (see tryRangeIndexScan / flipRangeOp) for the low/high
+	// bound. The zero value (OpUnknown) means INCLUSIVE — the historical
+	// behavior, and what every caller that does not set the fields gets.
+	// OpGt on LowOp / OpLt on HighOp make the executor stop at an EXCLUSIVE
+	// bound (M0134-0001 S4 class 8) so the redundant Filter can be dropped.
+	LowOp  parser.OpCode
+	HighOp parser.OpCode
+	schema Schema
 	// PrivilegeCheckRole / PrivilegeCheckRoleSet — see SeqScan's field of the
 	// same name. M0122-0008 (view-owner privilege gap).
 	PrivilegeCheckRole    string

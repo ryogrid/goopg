@@ -8,6 +8,7 @@ import (
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/multixact"
 	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -439,8 +440,20 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 		}
 		loBytes = lo
 		hiBytes = hiB
-		if len(o.plan.Index.Columns) > 1 && hiBytes != nil {
-			hiBytes = o.ctx.compositeUpperBound(o.plan.Index, hiBytes)
+		// M0134-0001 S4: strict bound ops make the scan stop EXCLUSIVE.
+		// Composite padding must follow the bound's strictness: an inclusive hi
+		// needs trailing +infinity to cover every key with the same leading
+		// columns; an EXCLUSIVE hi must stay a bare prefix so keys equal to the
+		// bound compare >= it. The lo side is symmetric: pad only when
+		// EXCLUSIVE so the whole equal-key group is skipped. (Tuple-format
+		// compositeUpperBound is a no-op; this matters for blob-format indexes.)
+		if len(o.plan.Index.Columns) > 1 {
+			if loBytes != nil && o.plan.LowOp == parser.OpGt {
+				loBytes = o.ctx.compositeUpperBound(o.plan.Index, loBytes)
+			}
+			if hiBytes != nil && o.plan.HighOp != parser.OpLt {
+				hiBytes = o.ctx.compositeUpperBound(o.plan.Index, hiBytes)
+			}
 		}
 	}
 
@@ -453,7 +466,7 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 		return true, nil
 	}
 
-	if err := o.tree.RangeScanWithPos(loBytes, hiBytes, scanFn); err != nil {
+	if err := o.tree.RangeScanWithPos(loBytes, hiBytes, o.plan.LowOp == parser.OpGt, o.plan.HighOp == parser.OpLt, scanFn); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
 	if o.hashBucketScan {

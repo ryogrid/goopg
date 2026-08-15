@@ -3829,12 +3829,14 @@ type ScanPos struct {
 // RangeScanWithPos is RangeScan carrying a ScanPos per callback (C3-S2,
 // additive — the plain RangeScan signature and its callers are untouched;
 // both share one implementation).
-func (bt *BTree) RangeScanWithPos(lo, hi []byte, fn func(key []byte, ptr storage.ItemPointer, pos ScanPos) (bool, error)) error {
-	return bt.rangeScanPos(lo, hi, fn)
+func (bt *BTree) RangeScanWithPos(lo, hi []byte, loExclusive, hiExclusive bool, fn func(key []byte, ptr storage.ItemPointer, pos ScanPos) (bool, error)) error {
+	return bt.rangeScanPos(lo, hi, loExclusive, hiExclusive, fn)
 }
 
 func (bt *BTree) RangeScan(lo, hi []byte, fn func(key []byte, ptr storage.ItemPointer) (bool, error)) error {
-	return bt.rangeScanPos(lo, hi, func(key []byte, ptr storage.ItemPointer, _ ScanPos) (bool, error) {
+	// Inclusive at both ends: the historical behavior, and what every
+	// RangeScan caller (probe/unique/exclusion/IO-scan paths) relies on.
+	return bt.rangeScanPos(lo, hi, false, false, func(key []byte, ptr storage.ItemPointer, _ ScanPos) (bool, error) {
 		return fn(key, ptr)
 	})
 }
@@ -3870,7 +3872,7 @@ func (bt *BTree) RangeScan(lo, hi []byte, fn func(key []byte, ptr storage.ItemPo
 // buffer pool's per-slot shared content latch. The first leaf is
 // reached via descendToLeaf (which already handles right-link
 // recovery); subsequent leaves are walked rightward via op.Next.
-func (bt *BTree) rangeScanPos(lo, hi []byte, fn func(key []byte, ptr storage.ItemPointer, pos ScanPos) (bool, error)) error {
+func (bt *BTree) rangeScanPos(lo, hi []byte, loExclusive, hiExclusive bool, fn func(key []byte, ptr storage.ItemPointer, pos ScanPos) (bool, error)) error {
 	cur, _, err := bt.descendToLeaf(lo)
 	if err != nil {
 		return err
@@ -3928,16 +3930,36 @@ func (bt *BTree) rangeScanPos(lo, hi []byte, fn func(key []byte, ptr storage.Ite
 					if perr != nil {
 						continue
 					}
-					if lo != nil && bt.format().compare(key, lo) < 0 {
-						continue
+					if lo != nil {
+						// Exclusive lower bound: skip the whole equal-key group,
+						// so compare attribute-only (compareHigh) — the zero-TID
+						// probe bound is PLUS infinity among its duplicates under
+						// `compare`, which would keep the boundary group. The
+						// inclusive form keeps `compare`: it starts at the first
+						// duplicate. M0134-0001 S4.
+						if loExclusive {
+							if bt.format().compareHigh(key, lo) <= 0 {
+								continue
+							}
+						} else if bt.format().compare(key, lo) < 0 {
+							continue
+						}
 					}
 					// compareHigh, not compare: a bound naming only a prefix of
 					// the key attributes is PLUS infinity beyond them (see
 					// pgkeycmp.go, slice 3b-2c-ii-B2-c-i). Identical to compare
-					// for the blob format.
-					if hi != nil && bt.format().compareHigh(key, hi) > 0 {
-						stop = true
-						break slotLoop
+					// for the blob format. An EXCLUSIVE upper bound stops at the
+					// boundary key itself (>= 0). M0134-0001 S4.
+					if hi != nil {
+						if hiExclusive {
+							if bt.format().compareHigh(key, hi) >= 0 {
+								stop = true
+								break slotLoop
+							}
+						} else if bt.format().compareHigh(key, hi) > 0 {
+							stop = true
+							break slotLoop
+						}
 					}
 					for _, tid := range tids {
 						ok, ferr := fn(key, tid, ScanPos{Blk: cur, Slot: s, PageLSN: pageLSN})
@@ -3958,13 +3980,28 @@ func (bt *BTree) rangeScanPos(lo, hi []byte, fn func(key []byte, ptr storage.Ite
 					if perr != nil {
 						continue
 					}
-					if lo != nil && bt.format().compare(it.key, lo) < 0 {
-						continue
+					if lo != nil {
+						// Exclusive lower bound: see the posting branch above.
+						if loExclusive {
+							if bt.format().compareHigh(it.key, lo) <= 0 {
+								continue
+							}
+						} else if bt.format().compare(it.key, lo) < 0 {
+							continue
+						}
 					}
-					// compareHigh: see the posting branch above.
-					if hi != nil && bt.format().compareHigh(it.key, hi) > 0 {
-						stop = true
-						break slotLoop
+					// compareHigh: see the posting branch above. An EXCLUSIVE
+					// upper bound stops at the boundary key itself.
+					if hi != nil {
+						if hiExclusive {
+							if bt.format().compareHigh(it.key, hi) >= 0 {
+								stop = true
+								break slotLoop
+							}
+						} else if bt.format().compareHigh(it.key, hi) > 0 {
+							stop = true
+							break slotLoop
+						}
 					}
 					ok, ferr := fn(it.key, it.ptr, ScanPos{Blk: cur, Slot: s, PageLSN: pageLSN})
 					if ferr != nil {

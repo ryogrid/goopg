@@ -281,7 +281,7 @@ func TestRangeScanWithPosCoordinates(t *testing.T) {
 	}
 	var entries []seen
 	blks := map[storage.BlockNumber]bool{}
-	if err := bt.RangeScanWithPos(nil, nil, func(key []byte, ptr storage.ItemPointer, pos ScanPos) (bool, error) {
+	if err := bt.RangeScanWithPos(nil, nil, false, false, func(key []byte, ptr storage.ItemPointer, pos ScanPos) (bool, error) {
 		entries = append(entries, seen{ptr: ptr, pos: pos})
 		blks[pos.Blk] = true
 		return true, nil

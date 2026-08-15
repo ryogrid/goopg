@@ -118,7 +118,7 @@ func (o *bitmapIndexScanOp) buildBitmap(ctx *Context) (*TIDBitmap, error) {
 		tbmAddTuples(tbm, []storage.ItemPointer{ptr}, recheck)
 		return true, nil
 	}
-	if err := o.tree.RangeScanWithPos(loBytes, hiBytes, scanFn); err != nil {
+	if err := o.tree.RangeScanWithPos(loBytes, hiBytes, false, false, scanFn); err != nil {
 		return nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
 

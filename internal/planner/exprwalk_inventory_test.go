@@ -230,6 +230,11 @@ var exprSwitchInventory = map[string]walkerRole{
 	"planner.go:inferExprType":                   nonRecursiveClassifier,
 	"planner.go:isConstantExpr":                  walkerPending, // 25 of 32 arms
 	"planner.go:isConstantPlanExpr":              walkerPending, // 12 of 32 arms
+	// Added by M0134-0001 S4 (class 8): top-level "plain literal/param?"
+	// classifier for the single-conjunct Filter drop — decide-and-return, no
+	// descent, deliberate default=false (keep Filter). Same shape as
+	// selectivity.go:isConstExpr.
+	"planner.go:isPlainConstantBound":            nonRecursiveClassifier,
 	"planner.go:planHasEscapingOuterRef":         walkerPending, // 6 of 32 arms
 	"planner.go:planIndexScanFromWhere":          nonRecursiveClassifier,
 	"planner.go:remapColumnRefsToSchema":         walkerPending, // 13 of 32 arms

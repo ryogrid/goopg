@@ -9356,6 +9356,26 @@ func isConstantExpr(e Expr) bool {
 	}
 }
 
+// isPlainConstantBound reports whether e is a plain constant literal or a
+// parameter reference — i.e. it contains NO function call and NO other
+// composite expression. Used by tryRangeIndexScan's single-conjunct Filter
+// drop (M0134-0001 S4, reviewer finding 1): the range scan evaluates its
+// bound ONCE, so a volatile bound like `c2 < random()` must keep the per-row
+// Filter (random() re-evaluated per row, pre-S4 behavior). goopg has no
+// contain_volatile_functions walker (postgres/src/backend/optimizer/util/
+// clauses.c), so gate conservatively: literal ConstantExpr / ParamRef only,
+// NOT a FuncCall. NullConst is excluded too (a NULL bound is degenerate and
+// the old Filter path handled it). Returns false for anything else.
+func isPlainConstantBound(e Expr) bool {
+	switch e.(type) {
+	case *IntegerConst, *StringConst, *NumericConst,
+		*TypedStringLit, *IntervalLit, *BooleanConst, *ParamRef:
+		return true
+	default:
+		return false // FuncCall, CastExpr, BinaryOp, NullConst, ... keep the Filter
+	}
+}
+
 // flipRangeOp flips a comparison operator for the "key op col" → "col flippedOp key"
 // canonical form (column on the left).
 func flipRangeOp(op parser.OpCode) parser.OpCode {
@@ -9387,6 +9407,10 @@ func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContex
 	var chosenIdx *catalog.Index
 	var loKey Expr // inclusive lower bound
 	var hiKey Expr // inclusive upper bound
+	// Original low/high bound operator in canonical col-op-key form
+	// (zero OpCode = inclusive). M0134-0001 S4.
+	var loOp parser.OpCode
+	var hiOp parser.OpCode
 
 	for _, conj := range conjuncts {
 		b, ok := conj.(*parser.BinaryOp)
@@ -9473,15 +9497,19 @@ func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContex
 			}
 		}
 
-		// Assign bounds based on canonical operator
+		// Assign bounds based on canonical operator. Record the ORIGINAL op so
+		// the executor can stop at an EXCLUSIVE bound for strict ops
+		// (M0134-0001 S4 class 8) and the EXPLAIN renderer can print it.
 		switch canonOp {
 		case parser.OpGt, parser.OpGe:
 			if loKey == nil {
 				loKey = resolvedKey
+				loOp = canonOp
 			}
 		case parser.OpLt, parser.OpLe:
 			if hiKey == nil {
 				hiKey = resolvedKey
+				hiOp = canonOp
 			}
 		}
 	}
@@ -9502,9 +9530,39 @@ func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContex
 		Index:      chosenIdx,
 		LowKey:     loKey,
 		HighKey:    hiKey,
+		LowOp:      loOp,
+		HighOp:     hiOp,
 		schema:     ctx.schema,
 		SmallDim:   smallDimensionTag(cat, tbl),
 		UniqueKeys: uniqueKeyColumnSets(cat, tbl),
+	}
+	// M0134-0001 S4 (class 8): the range scan now implements its bound with the
+	// ORIGINAL operator — strict bounds stop EXCLUSIVELY (see btree
+	// rangeScanPos) — so when the whole WHERE is exactly this single range
+	// conjunct the scan fully and exactly implements it and the Filter is
+	// redundant. Drop it, mirroring PG's create_indexscan_plan qpqual =
+	// scan_clauses minus is_redundant_with_indexclauses
+	// (postgres/src/backend/optimizer/plan/createplan.c:3068-3088,
+	// postgres/src/backend/optimizer/path/equivclass.c:3577-3605). Every
+	// multi-conjunct WHERE, and any non-range conjunct that remains, keeps the
+	// Filter unchanged (it may still drop the strict boundary / NULL rows).
+	//
+	// The drop is additionally gated on reviewer findings (M0134-0001 S4,
+	// 2026-08-15):
+	//  1. The bound must be a plain non-volatile literal/param — a volatile
+	//     bound like `c2 < random()` keeps the Filter so random() is still
+	//     re-evaluated per row (the scan evaluates its bound once).
+	//  2. The index must be single-column — a composite index's trailing
+	//     columns can leak on an exclusive-lo blob-padded bound, so its
+	//     Filter is kept as the second guard.
+	if len(conjuncts) == 1 && len(chosenIdx.Columns) == 1 {
+		bound := loKey
+		if bound == nil {
+			bound = hiKey
+		}
+		if isPlainConstantBound(bound) {
+			return scan, true, nil
+		}
 	}
 	return &Filter{pos: where.Pos(), Child: scan, Predicate: fullPred}, true, nil
 }
@@ -12961,6 +13019,16 @@ func tryPromoteIndexOnlyScan(proj *Project) Node {
 	}
 	idxScan, ok := child.(*IndexScan)
 	if !ok {
+		return proj
+	}
+	// M0134-0001 S4 (class 8): a range scan with an EXCLUSIVE bound cannot be
+	// promoted to an IndexOnlyScan. indexOnlyScanOp calls the inclusive
+	// RangeScan and copies no LowOp/HighOp, so with the part-5 Filter drop the
+	// boundary value would leak (c2 < 100 returns the c2=100 row). Refuse
+	// promotion; the exclusive IndexScan stays. Inclusive bounds (<= / >=)
+	// still promote as before. Decision: S4 Option B (coordinator, 2026-08-15);
+	// executor-side IOS exclusivity is deferral-ledger work, out of scope.
+	if idxScan.LowOp == parser.OpGt || idxScan.HighOp == parser.OpLt {
 		return proj
 	}
 	// Check that every projected column is in the index key.
