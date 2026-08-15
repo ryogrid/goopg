@@ -82,17 +82,12 @@ func TestAggregateIsDecomposableWhitelist(t *testing.T) {
 		{"percentile_cont (WITHIN GROUP)", planner.AggregateCall{Name: "percentile_cont"}},
 		{"user aggregate without COMBINEFUNC", planner.AggregateCall{
 			Name: "myagg", UserAgg: &catalog.UserAggregate{SFunc: "f"}}},
+		{"user aggregate declaring COMBINEFUNC (no combine rule for user aggs)",
+			planner.AggregateCall{Name: "myagg", UserAgg: &catalog.UserAggregate{SFunc: "f", CombineFunc: "c"}}},
 	} {
 		if aggregateIsDecomposable(tc.call) {
 			t.Errorf("%s must NOT be decomposable", tc.what)
 		}
-	}
-
-	// A user aggregate WITH a combine function is decomposable — that is what
-	// COMBINEFUNC is for, and goopg already parses and stores it.
-	if !aggregateIsDecomposable(planner.AggregateCall{
-		Name: "myagg", UserAgg: &catalog.UserAggregate{SFunc: "f", CombineFunc: "c"}}) {
-		t.Error("a user aggregate declaring COMBINEFUNC should be decomposable")
 	}
 
 	// The whitelist must refuse anything it does not know. applyAgg's default

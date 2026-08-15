@@ -39,10 +39,14 @@ func AggregateIsDecomposable(call AggregateCall) bool {
 		return false
 	}
 	if call.UserAgg != nil {
-		// A user aggregate is decomposable exactly when it declares a combine
-		// function — which is what COMBINEFUNC is for, and which goopg already
-		// parses and stores.
-		return call.UserAgg.CombineFunc != ""
+		// Never decomposable. goopg's combineAggRuntime has no rule to invoke
+		// a user combinefunc — it deep-merges the typed aggRuntime fields
+		// (count, intResult, floatSx, ...), not transition-state datums — so a
+		// user aggregate that declared COMBINEFUNC would still hit the
+		// combineAggRuntime default arm and error at combine time. Refuse
+		// fail-closed (M0134-0001 S10a); invoking the user combinefunc is a
+		// separate, deferred slice.
+		return false
 	}
 
 	switch normalizeAggName(call.Name) {
