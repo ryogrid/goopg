@@ -481,6 +481,33 @@ divergent plan shape; degenerate, not in the corpus.
 (block 14); (d) scalar-subquery nesting (blocks 8/17, class-8); (e) inheritance/MergeAppend
 (blocks 15/16 + partial-index bug).
 
+## S6 Slice 3d — landed 2026-08-15 (constant-arg min/max rewrite)
+
+Shipped: `rewriteMinMaxAggregates` now accepts a CONSTANT arg (`max(100)`, block 14),
+closing the last pure-rewrite-hook edge case. `Result` gained a `Child Node` +
+`OneTimeFilter Expr` (PG `nodeResult.c` `resconstantqual`); `resultOp` implements the
+`outerPlan(plan)` variant (eval the one-time qual ONCE at Open with a nil slot — NULL/false
+→ emit no rows, child never opened — else project `Targets` per child row); EXPLAIN renders
+`One-Time Filter:` (explain.c:2234-2240 `show_upper_qual`) and `planChildren` descends into
+the child. The const branch builds `Limit(1) → Result{Targets:[arg], OneTimeFilter: <arg>
+IS NOT NULL, Child: SeqScan}` (no Sort — ORDER BY a const is dropped — and no per-row
+Filter), typed int4 via `ExprResultType` (the `make_const` small-literal answer, NOT the
+normal path's `exprType` int8).
+
+**Measured result (`scripts/pg-regress-runner.sh aggregates`, 1481→1472 lines, zero
+regressions):** block 14 (`select max(100) from tenk1`) now byte-matches the oracle
+(`aggregates.out:1191-1201`) — `Result`/`InitPlan 1`/`-> Limit`/`-> Result`/`One-Time
+Filter: (100 IS NOT NULL)`/`-> Seq Scan on tenk1` — with only the pre-existing
+rule-line-width delta. Result value stays `100`. `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=35); `go test ./internal/planner/ ./internal/executor/` PASS.
+
+**Residual (ledger row 1376):** const-arg min/max WITH a WHERE qual and non-IntegerConst
+constants decline to the Aggregate path (fail-closed, correct result); the normal path's
+bare-integer-literal int8-vs-PG-int4 typing is a separate latent divergence flagged there.
+
+**Remaining S6 edge cases (unchanged):** (d) scalar-subquery nesting (blocks 8/17,
+class-8); (e) inheritance/MergeAppend (blocks 15/16 + partial-index bug).
+
 ## Cross-case relevance
 
 Every M0134 regress case whose `.sql` emits `EXPLAIN` inherits the formatter
