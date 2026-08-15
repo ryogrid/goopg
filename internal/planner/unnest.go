@@ -1192,6 +1192,14 @@ func walkExprTree(e Expr, visit func(Expr)) {
 		walkExprTree(x.Else, visit)
 	case *ExtractExpr:
 		walkExprTree(x.Source, visit)
+	case *IsNullExpr:
+		// IS [NOT] NULL wraps a single operand (plan.go IsNullExpr,
+		// mirroring parser.IsNullExpr). Without this arm the walker
+		// visited the IsNullExpr node but never descended into the
+		// *ColumnRef under Operand, so ExprContainsColumnRef reported
+		// false for `col IS NOT NULL` and CREATE INDEX const-folded a
+		// column predicate onto a nil slot (aggregates regress ERROR).
+		walkExprTree(x.Operand, visit)
 	case *RowExpr:
 		for _, elem := range x.Elems {
 			walkExprTree(elem, visit)

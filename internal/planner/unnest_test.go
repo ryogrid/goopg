@@ -531,3 +531,28 @@ func TestScalarTwoKeyCorrelationStripsTautology(t *testing.T) {
 			tautology, planString(node))
 	}
 }
+
+// TestExprContainsColumnRefIsNullOperand pins the walkExprTree IsNullExpr arm
+// (M0134-0001 S6 S3e). ExprContainsColumnRef drives CREATE INDEX partial-index
+// const-folding (executor/operators_ddl.go); without the arm a `f1 IS NOT NULL`
+// predicate was reported column-free and folded onto a nil slot — the aggregates
+// regress `ERROR: column ref f1/0 on nil slot`. The walker must descend through
+// the IsNullExpr into its *ColumnRef Operand for both polarities, and still
+// report false for a bare constant.
+func TestExprContainsColumnRefIsNullOperand(t *testing.T) {
+	col := &ColumnRef{pos: 0, Index: 0, Name: "f1", Type: catalog.Type{Name: "int4"}}
+
+	for _, tc := range []struct {
+		name string
+		expr Expr
+		want bool
+	}{
+		{name: "is null over col", expr: &IsNullExpr{pos: 0, Operand: col}, want: true},
+		{name: "is not null over col", expr: &IsNullExpr{pos: 0, Operand: col, Negated: true}, want: true},
+		{name: "bare constant", expr: &BooleanConst{pos: 0, Value: true}, want: false},
+	} {
+		if got := ExprContainsColumnRef(tc.expr); got != tc.want {
+			t.Errorf("%s: ExprContainsColumnRef(%T) = %v, want %v", tc.name, tc.expr, got, tc.want)
+		}
+	}
+}
