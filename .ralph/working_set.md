@@ -1,46 +1,45 @@
-# Working set — M0134-0002 alter_table.sql (Slice 1 crash-fix LANDED)
+# Working set — M0134-0002 alter_table.sql (C15 `col_description` LANDED)
 
-**Task:** M0134-0002 alter_table.sql regress-sql digestion. This loop landed
-**Slice 1** — the server-crash fix: `viewColumnMap`'s bare-`*` arm
-(`internal/planner/view_dml.go`) now maps POSITIONALLY over the view's frozen
-column count (`len(view.Columns)`), not `len(b.Columns)`. `update v2 set
-q1=q1+1 where q1=123` (bug #17811) executes (2 rows flip 123→124) instead of
-panicking `index out of range [1] with length 1` in `viewProxyTable`.
+**Task:** M0134-0002 alter_table.sql regress-sql digestion. This loop landed **C15**
+— the `pg_catalog.col_description(oid,int4)` builtin: a `case "col_description":`
+beside `obj_description` in the executor function-name switch
+(`internal/executor/expr.go` :9840), reading `GetComment(1259, objoid, attnum)`
+(STRICT, NULL on no-match). pg_description catalog + COMMENT ON already existed;
+only dispatch was missing (pg_proc seed OID 1216 pre-present).
 
-**Status:** Slice 1 COMPLETE + committed + pushed (`dc8c0b9d`). Design note
-`docs/design/0134-0002-alter-table-sql-divergence.md` (draft) + index; 2 ledger
-rows (rules subsystem, read-path/top-level-* freeze); row 1385 corrected
-(underline = psql symptom of subplan-subtree indent depth, not a fixed-width
-renderer).
+**Status:** COMPLETE + committed (code `044057b9`, bookkeeping commit follows).
 
-**Files:** `internal/planner/view_dml.go` (positional star map),
-`internal/executor/view_dml_test.go` (2 tests: frozen-growth + column-list
-rename); `docs/design/0134-0002-alter-table-sql-divergence.md` + README index.
+**Findings:** C15 was the second (and last) of the two `\d+` describe blockers
+(C1 array `||` + C15 col_description). 12 `col_description does not exist` errors
+→ 0 (519→507 ERROR lines); no new class; diff 4673→4677 lines (+4 — the
+previously-masked describe output now renders, same "advance reveals more" pattern
+as C1). Both `\d+` blockers cleared; the describe pipeline now runs to completion.
 
-**Key symbols:** `viewColumnMap` (new `view *catalog.Table` param, positional
-star arm), `viewAutoUpdatableChain`, `viewProxyTable`.
+**Files:** `internal/executor/expr.go` (+case); new test
+`internal/executor/operators_ddl_col_description_test.go` (returns-comment,
+no-match→NULL objsubid 0/2 + unknown OID, STRICT NULL-arg);
+`docs/design/0134-0002-alter-table-sql-divergence.md` (C15 row → LANDED);
+`.ralph/deferral_ledger.md` row 1390 → `resolved`; `.ralph/fix_plan.md` M0134-0002.
 
-**Findings:** alter_table.sql = 4668-line diff (was 44 hunks), crash lost ~45%
-of the tail; post-fix 4671 lines / 81 hunks (tail populated, bug-#17811 UPDATE
-matches PG). 14 divergence classes: C1 `text[]||text[]` op missing (unblocks all
-13 `\d+`); C2 ALTER-TABLE grammar cluster (largest — RENAME CONSTRAINT, RENAME
-col TO, TYPE USING, comma multi-action, NO INHERIT/NOT VALID, DROP COLUMN IF
-EXISTS, SET WITHOUT OIDS, STORAGE); C3/C4/C8/C9/C10/C11 correctness (C10 =
-data-loss on failed ALTER TYPE; C11 = rules + read-path + freeze); C5 btree-inet;
-C6 catalog gaps; C7/C12/C13/C14 formatter.
+**Key symbols:** `evalFuncCall` switch (`expr.go`), `im.GetComment(1259, objOID,
+attnum)` (`catalog.go`), `obj_description` sibling arm (:9815-9838).
 
-**Next step:** C1 (`text[] || text[]` operator — self-contained, `array_cat`
-already exists at `expr.go:11543`, unblocks every `\d+` describe block) or C2
-(the parser grammar cluster — largest single class). Recommend C1 first (small,
-independent) then C2.
+**Next step:** C2 — the ALTER-TABLE grammar cluster (largest remaining class:
+`RENAME CONSTRAINT`/`RENAME <col> TO`/`TYPE … USING`/comma multi-action/`NO
+INHERIT`/`NOT VALID`/`DROP COLUMN IF EXISTS`/`SET WITHOUT OIDS`/`STORAGE`/
+`ANALYZE tab(col)`/ENFORCED dup; `internal/parser/ddl.go`
+`parseAlterTableAction`/`parseOneAttrCmd`/`consumeAttrCmdTrailer`). Needs a fresh
+researcher pass to decompose the grammar gaps into per-rule slices before
+implementing. Alternatively pick a smaller correctness class (C5 btree-inet, C8
+system-columns) for a single-loop win.
 
-**Gates run (this loop):** `go test ./internal/planner/ ./internal/executor/`
-PASS (2 new tests); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=35);
-`scripts/pg-regress-runner.sh alter_table` no-crash (4671 lines, tail populated);
-pre-commit pgbench smoke PASS (0 failed txns).
+**Gates run (this loop):** `go test ./internal/executor/` PASS (3 new tests);
+`go build ./...` clean; `scripts/pg-regress-runner.sh alter_table` — 0
+col_description errors, 507 total ERROR lines (was 519), no new class;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=35); pre-commit pgbench smoke PASS.
 
-**Delegation:** researcher `0134-0002-alter-table-research` DONE (crash + 14
-classes + underline correction); implementer `0134-0002-s1-view-crash` DONE
-(2 rounds — by-name → positional refinement); tester tpch-spotcheck DONE.
+**Delegation:** researcher `0134-0002-c15-coldescription-research` DONE (verdict
+builtin-only); implementer `0134-0002-c15-coldescription-impl` DONE; tester
+`0134-0002-c15-coldescription-gates` DONE.
 
 **In-flight:** none.

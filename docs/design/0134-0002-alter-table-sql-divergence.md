@@ -63,7 +63,7 @@ reorder robustness; deferred, see the ledger.)
 | # | class | goopg side | PG oracle | kind |
 |---|-------|-----------|-----------|------|
 | C1 | ~~`text[] \|\| text[]` operator missing~~ **LANDED** — the analyzer/planner `OpConcat` type-check rejected array operands (not a catalog gap) | `analyzeExpr` (`analyzer.go` OpConcat arm) + `exprType` (`planner.go` OpConcat arm) now accept array operands (both spellings `Name:"text[]"` and `IsArray:true`) and return the array side's type; the executor merge (`evalBinary` OpConcat) and the pg_operator seed rows (OID 349/374/375) already existed | `arrayfuncs.c` (`array_cat`/`array_append`/`array_prepend`) | executor/binding — first of two `\d+` describe blockers |
-| C15 | `pg_catalog.col_description(oid,int4)` builtin missing | executor function-name switch lacks `col_description` (`internal/executor/expr.go`, beside `array_to_string` :9679) | `objdescription.c` (`col_description`) | executor — second `\d+` describe blocker, surfaces once C1 is fixed |
+| C15 | ~~`pg_catalog.col_description(oid,int4)` builtin missing~~ **LANDED** — the executor function-name switch now has a `case "col_description":` beside `obj_description` (`internal/executor/expr.go` :9840) reading `GetComment(1259, objoid, attnum)` | `system_functions.sql:322-327` (`col_description` SQL body) + `describe.c:1986` (psql caller) | executor — second `\d+` describe blocker; 12 errors → 0, no new class, diff 4673→4677 |
 | C2 | `ALTER TABLE` grammar gaps (`RENAME CONSTRAINT`, `RENAME <col> TO`, `TYPE … USING`, comma multi-action, `NO INHERIT`/`NOT VALID`, `DROP COLUMN IF EXISTS`, `SET WITHOUT OIDS`, `STORAGE`, `ANALYZE tab(col)`, ENFORCED dup) | `internal/parser/ddl.go` `parseAlterTableAction`/`parseOneAttrCmd`/`consumeAttrCmdTrailer` | `gram.y`/`tablecmds.c` | parser |
 | C3 | constraint validation scans absent (ADD CHECK/PK/SET NOT NULL/VALIDATE silently accept invalid rows) | DDL path | `tablecmds.c` `ATExecAddConstraint` | correctness |
 | C4 | FK semantics | DDL | `tablecmds.c` | correctness |
@@ -84,7 +84,9 @@ The crash fix (above) is the first slice — a server panic on valid SQL, and it
 unblocks measuring the tail ~45% of the diff. Subsequent slices, in rough
 dependency order: C1 (`||` operator — **LANDED 2026-08-15**, the array-op type
 check), then C15 (`col_description` builtin — the second `\d+` blocker that
-surfaced once C1 was fixed, ledger row 2026-08-15 M0134-0002), then C2 grammar
+surfaced once C1 was fixed, **LANDED 2026-08-15**, commit `044057b9`; the 12
+`col_description` errors are gone and the previously-masked describe output now
+renders), then C2 grammar
 cluster (largest), then the correctness classes C3/C4/C8/C9/C10/C11 each with
 their own deferral rows.
 
