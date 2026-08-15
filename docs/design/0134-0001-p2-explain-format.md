@@ -746,6 +746,64 @@ pins all nine (algo, type) spellings against the explain.c rule.
 **Out of scope by design:** join-algorithm choice is S9 (class 7b), a cost-model
 slice, untouched here.
 
+## S8 Slice 1 — landed 2026-08-15 (sorted/GroupAggregate executor capability)
+
+**Design.** class 6's executor half: goopg's grouped aggregate is hash-only
+(`aggregateOp.Open` builds `groups := map[string]*groupRuntime{}`), so it can
+never emit PG's `GroupAggregate` (AGG_SORTED). This slice lands the sorted
+capability but is **planner-inert** — nothing sets `Strategy`, so every
+existing query keeps the hash path byte-identically. The planner/pathkey
+strategy choice is Slice 2.
+
+**Shipped (`operators_join_agg.go`, `plan.go`, `operators_explain.go`):**
+- `Aggregate.Strategy` (`internal/planner/plan.go`): `AggStrategy` type with
+  `AggStrategyHashed` (iota, zero value) and `AggStrategySorted`. The zero
+  value is Hashed, so every existing construction site and test fixture is
+  untouched.
+- `openSorted` (`operators_join_agg.go`): a materialised run-collapsing walk
+  gated on `Strategy == Sorted && GroupingSets == nil && len(GroupExprs) > 0 &&
+  Mode == AggModeSimple`. It drains the child (as the hash path does), then
+  collapses runs of equal keys — group identity is `sameGroupKey`, an
+  element-wise comparison of the per-column `datumKey` vector — finalising and
+  emitting one row per key run in input order. It reuses `evalGroupExprs`,
+  `applyAgg`, and the shared finalize step.
+- `finalizeGroup`: the hash path's emit-loop body (shared-state follower sync,
+  `finishAgg`, GROUPING masks, passthrough) extracted verbatim into one method
+  used by BOTH paths, so the two strategies cannot diverge on those semantics.
+  `groupRuntime` moved package-level for the signature.
+- EXPLAIN `describePlan` Aggregate else-branch now returns
+  `prefix + "GroupAggregate"` when `Strategy == AggStrategySorted`, else
+  `prefix + "HashAggregate"` (explain.c:1531-1553 AGG_SORTED→GroupAggregate).
+  Grouping-sets / ungrouped branches unchanged.
+
+**Tests (`operators_join_agg_sorted_test.go`):** `TestAggSortedGrouping`
+(multi-column key, adjacent equal keys, output order = key order),
+`TestAggSortedNullKey` (NULL keys collapse), `TestAggSortedHashParity` (sorted
+== hash on the same input, identical rows in identical order — the M0097-0117
+hash pre-sort makes them agree), `TestAggSortedEmptyInput` (0 rows, no panic),
+`TestExplainAggregateStrategyLabel` (GroupAggregate/HashAggregate/Aggregate).
+
+**Measured result:** `scripts/pg-regress-runner.sh aggregates` — aggregates.diff
+byte-identical to clean-HEAD pre-S8 (no new hunks; the prior loop's "746" was a
+stale measurement, the current baseline is larger and unchanged by S8).
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=35). `go test ./internal/executor/
+./internal/planner/` PASS.
+
+**Discovery (deferral-ledger row):** the hash path's `setGroupKey` string-join
+of `datumKey` outputs can collide for text/bytea GROUP BY keys containing the
+`|s:`/`|x:` boundary (two distinct groups merge). The sorted path's element-wise
+`sameGroupKey` is collision-free, so hash-vs-sorted would diverge on such keys
+once the planner chooses strategy — recorded for Slice 2.
+
+**Remaining for S8 (Slice 2):** the planner half — group-key pathkeys
+(`pathkeysForSortKeys`/`pathkeysContainedIn` over the existing `PathKey` model),
+`Sort` emission when the child isn't presorted, the hash-vs-sort strategy choice
+(PG `add_paths_to_grouping_rel` + `cost_agg` AGG_SORTED/AGG_HASHED arms), and
+reordering `GroupExprs` into the sort/pathkey order (which moves both the
+EXPLAIN `Group Key:` line and the output order together). Load the
+`executor-planner-change` + `perf/TPC-H` practice cards; bound it per the
+M0072-0002 hang trap.
+
 ## Cross-case relevance
 
 Every M0134 regress case whose `.sql` emits `EXPLAIN` inherits the formatter

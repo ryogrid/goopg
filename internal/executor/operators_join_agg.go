@@ -1821,6 +1821,20 @@ type aggregateOp struct {
 	currentRowVersion      int64   // incremented per input row
 }
 
+// groupRuntime is one accumulated output group: the GROUP BY key values, the
+// functionally-determined passthrough columns, and one aggRuntime per
+// AggregateCall. It used to be declared inside Open; it is package-level now
+// (M0134-0001 S8) so the hash path and the sorted path can share the
+// finalizeGroup emit step. groupValues[i] holds the value of GroupExprs[i] for
+// this group (NULL for a column rolled up away at this grouping set level);
+// setIdx identifies the grouping set that produced it.
+type groupRuntime struct {
+	setIdx          int // which grouping set produced this group
+	groupValues     Row
+	passthroughVals Row // values of functionally-determined passthrough columns
+	aggs            []aggRuntime
+}
+
 // floatSpecialKind encodes the IEEE 754 special-value state for
 // sum/avg when float4/float8 inputs contain NaN or Infinity.
 type floatSpecialKind int8
@@ -1957,11 +1971,13 @@ func (o *aggregateOp) Open(ctx *Context) error {
 	o.sharedUserStateVersion = make([]int64, nSlots)
 	o.currentRowVersion = 0
 
-	type groupRuntime struct {
-		setIdx          int // which grouping set produced this group
-		groupValues     Row
-		passthroughVals Row // values of functionally-determined passthrough columns
-		aggs            []aggRuntime
+	// Sorted aggregation (M0134-0001 S8): when the node is marked
+	// AggStrategySorted the child is expected to deliver rows already ordered
+	// by the GROUP BY keys, so openSorted collapses runs of equal keys instead
+	// of building the groups hash map. Grouping sets, ungrouped
+	// (len(GroupExprs)==0) and parallel split nodes always keep the hash path.
+	if o.plan.Strategy == planner.AggStrategySorted && o.plan.GroupingSets == nil && len(o.plan.GroupExprs) > 0 && o.plan.Mode == planner.AggModeSimple {
+		return o.openSorted(ctx)
 	}
 
 	groups := map[string]*groupRuntime{}
@@ -2160,128 +2176,10 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		if gr == nil {
 			continue
 		}
-		out := make(Row, 0, len(gr.groupValues)+len(o.plan.Aggs)+len(gr.passthroughVals))
-		out = append(out, gr.groupValues...)
-		// Sync follower aggregates from their leader before finishAgg. M0097-0035.
-		// For DISTINCT aggregates with actual followers (multiple aggs sharing the
-		// same slot), compute the leader's sfunc state once and inject it into
-		// followers so they skip sfunc calls (avoiding duplicate NOTICE/side-
-		// effects) and only apply their own finalfunc. M0097-0155.
-		//
-		// First, count how many aggregates exist per SharedStateSlot to detect
-		// actual sharing (a slot with only one agg is not shared).
-		slotCount := map[int]int{}
-		for _, call := range o.plan.Aggs {
-			if call.SharedStateSlot >= 0 && call.UserAgg != nil {
-				slotCount[call.SharedStateSlot]++
-			}
+		out, ferr := o.finalizeGroup(gr)
+		if ferr != nil {
+			return ferr
 		}
-		type slotState struct {
-			state    Datum
-			computed bool
-		}
-		distinctSlotStates := map[int]slotState{}
-		for i, call := range o.plan.Aggs {
-			if call.SharedStateSlot < 0 || call.UserAgg == nil {
-				continue
-			}
-			if !(call.Distinct || len(call.OrderBy) > 0) {
-				// Non-DISTINCT sync: copy userState as before.
-				if i == 0 {
-					continue
-				}
-				for j := 0; j < i; j++ {
-					if o.plan.Aggs[j].SharedStateSlot == call.SharedStateSlot {
-						gr.aggs[i].userState = gr.aggs[j].userState
-						gr.aggs[i].userStateSet = gr.aggs[j].userStateSet
-						gr.aggs[i].hasValue = gr.aggs[j].hasValue
-						break
-					}
-				}
-				continue
-			}
-			// DISTINCT path: pre-compute leader's sfunc state once only when
-			// there are actual followers (slot count > 1). Solo aggregates run
-			// finishAgg normally to preserve ORDER BY sort behaviour.
-			if slotCount[call.SharedStateSlot] <= 1 {
-				continue
-			}
-			ss, alreadyComputed := distinctSlotStates[call.SharedStateSlot]
-			if !alreadyComputed {
-				// This is the leader: compute dedup+sort+sfunc state.
-				ua := call.UserAgg
-				st := gr.aggs[i]
-				nSortKeys := len(call.OrderBy)
-				var deduped [][]Datum
-				if call.Distinct && len(st.distinctUserAggRows) > 0 {
-					seen := map[string]struct{}{}
-					for _, row := range st.distinctUserAggRows {
-						argSlice := row[nSortKeys:]
-						var keyParts []string
-						for _, d := range argSlice {
-							keyParts = append(keyParts, datumKey(d))
-						}
-						k := strings.Join(keyParts, "\t")
-						if _, ok := seen[k]; ok {
-							continue
-						}
-						seen[k] = struct{}{}
-						deduped = append(deduped, row)
-					}
-				} else {
-					deduped = st.distinctUserAggRows
-				}
-				state := userAggInitState(ua)
-				for _, row := range deduped {
-					argSlice := row[nSortKeys:]
-					sfuncArgs := make([]Datum, 0, 1+len(argSlice))
-					sfuncArgs = append(sfuncArgs, state)
-					sfuncArgs = append(sfuncArgs, argSlice...)
-					newState, serr := executeSFuncCall(ua.SFunc, sfuncArgs, o.ctx)
-					if sfuncRaised(serr) {
-						return serr
-					}
-					if serr == nil {
-						state = newState
-					}
-				}
-				ss = slotState{state: state, computed: true}
-				distinctSlotStates[call.SharedStateSlot] = ss
-				// Replace leader's rows with the pre-computed state so finishAgg
-				// skips sfunc and applies only the leader's finalfunc.
-				gr.aggs[i].userState = state
-				gr.aggs[i].userStateSet = true
-				gr.aggs[i].hasValue = true
-				gr.aggs[i].distinctUserAggRows = nil
-			} else {
-				// Follower: inject leader's sfunc state; clear rows so finishAgg
-				// skips sfunc and applies only the follower's finalfunc.
-				gr.aggs[i].userState = ss.state
-				gr.aggs[i].userStateSet = true
-				gr.aggs[i].hasValue = true
-				gr.aggs[i].distinctUserAggRows = nil
-			}
-		}
-		for i, call := range o.plan.Aggs {
-			d, ferr := o.finishAgg(gr.aggs[i], call)
-			if ferr != nil {
-				return ferr
-			}
-			out = append(out, d)
-		}
-		// GROUPING(...) columns: the bitmask depends only on which grouping
-		// set produced this row, so it is materialised here rather than
-		// evaluated per row above the node. Emitted between the aggregates
-		// and the passthrough columns, matching the output schema
-		// buildAggregateStage laid out. M0125-0048.
-		for _, masks := range o.plan.GroupingMasks {
-			if gr.setIdx < len(masks) {
-				out = append(out, NewIntDatum(masks[gr.setIdx]))
-			} else {
-				out = append(out, NewIntDatum(0))
-			}
-		}
-		out = append(out, gr.passthroughVals...)
 		o.rows = append(o.rows, out)
 		emitted = append(emitted, gr.setIdx)
 	}
@@ -2379,6 +2277,264 @@ func (o *aggregateOp) setGroupKey(si int, set []int, allKeys []string, multiSet 
 		b.WriteString(allKeys[ci])
 	}
 	return b.String()
+}
+
+// finalizeGroup finalizes one group's aggregates and builds its single output
+// Row: GROUP BY key values, then per-aggregate finished values, then
+// GROUPING(...) masks, then passthrough columns. Shared verbatim by the hash
+// path (Open's emit loop) and the sorted path (openSorted), so the two
+// strategies can never diverge on shared-state sync, finishAgg, GROUPING mask
+// or passthrough semantics. M0134-0001 S8.
+func (o *aggregateOp) finalizeGroup(gr *groupRuntime) (Row, error) {
+	out := make(Row, 0, len(gr.groupValues)+len(o.plan.Aggs)+len(gr.passthroughVals))
+	out = append(out, gr.groupValues...)
+	// Sync follower aggregates from their leader before finishAgg. M0097-0035.
+	// For DISTINCT aggregates with actual followers (multiple aggs sharing the
+	// same slot), compute the leader's sfunc state once and inject it into
+	// followers so they skip sfunc calls (avoiding duplicate NOTICE/side-
+	// effects) and only apply their own finalfunc. M0097-0155.
+	//
+	// First, count how many aggregates exist per SharedStateSlot to detect
+	// actual sharing (a slot with only one agg is not shared).
+	slotCount := map[int]int{}
+	for _, call := range o.plan.Aggs {
+		if call.SharedStateSlot >= 0 && call.UserAgg != nil {
+			slotCount[call.SharedStateSlot]++
+		}
+	}
+	type slotState struct {
+		state    Datum
+		computed bool
+	}
+	distinctSlotStates := map[int]slotState{}
+	for i, call := range o.plan.Aggs {
+		if call.SharedStateSlot < 0 || call.UserAgg == nil {
+			continue
+		}
+		if !(call.Distinct || len(call.OrderBy) > 0) {
+			// Non-DISTINCT sync: copy userState as before.
+			if i == 0 {
+				continue
+			}
+			for j := 0; j < i; j++ {
+				if o.plan.Aggs[j].SharedStateSlot == call.SharedStateSlot {
+					gr.aggs[i].userState = gr.aggs[j].userState
+					gr.aggs[i].userStateSet = gr.aggs[j].userStateSet
+					gr.aggs[i].hasValue = gr.aggs[j].hasValue
+					break
+				}
+			}
+			continue
+		}
+		// DISTINCT path: pre-compute leader's sfunc state once only when
+		// there are actual followers (slot count > 1). Solo aggregates run
+		// finishAgg normally to preserve ORDER BY sort behaviour.
+		if slotCount[call.SharedStateSlot] <= 1 {
+			continue
+		}
+		ss, alreadyComputed := distinctSlotStates[call.SharedStateSlot]
+		if !alreadyComputed {
+			// This is the leader: compute dedup+sort+sfunc state.
+			ua := call.UserAgg
+			st := gr.aggs[i]
+			nSortKeys := len(call.OrderBy)
+			var deduped [][]Datum
+			if call.Distinct && len(st.distinctUserAggRows) > 0 {
+				seen := map[string]struct{}{}
+				for _, row := range st.distinctUserAggRows {
+					argSlice := row[nSortKeys:]
+					var keyParts []string
+					for _, d := range argSlice {
+						keyParts = append(keyParts, datumKey(d))
+					}
+					k := strings.Join(keyParts, "\t")
+					if _, ok := seen[k]; ok {
+						continue
+					}
+					seen[k] = struct{}{}
+					deduped = append(deduped, row)
+				}
+			} else {
+				deduped = st.distinctUserAggRows
+			}
+			state := userAggInitState(ua)
+			for _, row := range deduped {
+				argSlice := row[nSortKeys:]
+				sfuncArgs := make([]Datum, 0, 1+len(argSlice))
+				sfuncArgs = append(sfuncArgs, state)
+				sfuncArgs = append(sfuncArgs, argSlice...)
+				newState, serr := executeSFuncCall(ua.SFunc, sfuncArgs, o.ctx)
+				if sfuncRaised(serr) {
+					return nil, serr
+				}
+				if serr == nil {
+					state = newState
+				}
+			}
+			ss = slotState{state: state, computed: true}
+			distinctSlotStates[call.SharedStateSlot] = ss
+			// Replace leader's rows with the pre-computed state so finishAgg
+			// skips sfunc and applies only the leader's finalfunc.
+			gr.aggs[i].userState = state
+			gr.aggs[i].userStateSet = true
+			gr.aggs[i].hasValue = true
+			gr.aggs[i].distinctUserAggRows = nil
+		} else {
+			// Follower: inject leader's sfunc state; clear rows so finishAgg
+			// skips sfunc and applies only the follower's finalfunc.
+			gr.aggs[i].userState = ss.state
+			gr.aggs[i].userStateSet = true
+			gr.aggs[i].hasValue = true
+			gr.aggs[i].distinctUserAggRows = nil
+		}
+	}
+	for i, call := range o.plan.Aggs {
+		d, ferr := o.finishAgg(gr.aggs[i], call)
+		if ferr != nil {
+			return nil, ferr
+		}
+		out = append(out, d)
+	}
+	// GROUPING(...) columns: the bitmask depends only on which grouping
+	// set produced this row, so it is materialised here rather than
+	// evaluated per row above the node. Emitted between the aggregates
+	// and the passthrough columns, matching the output schema
+	// buildAggregateStage laid out. M0125-0048.
+	for _, masks := range o.plan.GroupingMasks {
+		if gr.setIdx < len(masks) {
+			out = append(out, NewIntDatum(masks[gr.setIdx]))
+		} else {
+			out = append(out, NewIntDatum(0))
+		}
+	}
+	out = append(out, gr.passthroughVals...)
+	return out, nil
+}
+
+// openSorted implements the sorted (AGG_SORTED) grouping strategy: the child
+// is assumed to deliver rows in GROUP BY key order, so groups are collapsed by
+// comparing each incoming key run against the current group's key rather than
+// hashing (nodeAgg.c agg_retrieve_direct, postgres/src/backend/executor/
+// nodeAgg.c:2280-2619). Like the hash path it is materialized — the child is
+// drained to EOF first — but unlike the hash path it emits one row per key
+// RUN in input order and never runs the emit-time key sort (the child is
+// already sorted, so input order IS key order). The finalize/emit step is
+// shared with the hash path via finalizeGroup, so the two strategies can never
+// diverge on shared-state sync, finishAgg, GROUPING mask or passthrough
+// semantics. M0134-0001 S8.
+//
+// Invariant: the caller (Open) only routes here when GroupingSets == nil,
+// len(GroupExprs) > 0 and Mode == AggModeSimple, so there is exactly one
+// implicit grouping set holding every group column and setIdx is always 0.
+func (o *aggregateOp) openSorted(ctx *Context) error {
+	nGroupCols := len(o.plan.GroupExprs)
+
+	// The current group is always the group of the previous row: the input is
+	// sorted, so a key change is a group boundary. aggs is a fresh slice per
+	// group, mirroring the hash path's per-group make([]aggRuntime, nAggs).
+	var curParts []string
+	var cur *groupRuntime
+
+	flush := func() error {
+		if cur == nil {
+			return nil
+		}
+		out, err := o.finalizeGroup(cur)
+		if err != nil {
+			return err
+		}
+		o.rows = append(o.rows, out)
+		cur = nil
+		return nil
+	}
+
+	for {
+		slot, err := o.child.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if ctx.Ctx != nil {
+			if cerr := ctx.Ctx.Err(); cerr != nil {
+				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+			}
+		}
+		allVals, parts, err := o.evalGroupExprs(slot)
+		if err != nil {
+			return err
+		}
+		if cur == nil || !sameGroupKey(curParts, parts) {
+			// Group boundary: finalize and emit the previous group, then start
+			// a fresh one from this row.
+			if err := flush(); err != nil {
+				return err
+			}
+			// Evaluate passthrough (functionally-determined) columns from the
+			// first row of the group — identical to the hash path's group
+			// creation.
+			var ptVals Row
+			if len(o.plan.Passthrough) > 0 {
+				ptVals = make(Row, len(o.plan.Passthrough))
+				for i, expr := range o.plan.Passthrough {
+					v, err := evalExprSlot(expr, slot, o.ctx)
+					if err != nil {
+						ptVals[i] = NullDatum
+					} else {
+						ptVals[i] = v
+					}
+				}
+			}
+			var gv Row
+			if nGroupCols > 0 {
+				gv = make(Row, nGroupCols)
+				copy(gv, allVals)
+			}
+			cur = &groupRuntime{setIdx: 0, groupValues: gv, passthroughVals: ptVals, aggs: make([]aggRuntime, len(o.plan.Aggs))}
+			curParts = parts
+		}
+		o.currentRowVersion++
+		for i, call := range o.plan.Aggs {
+			// For user-defined aggregates with shared transition state, only the
+			// "leader" (first call with this SharedStateSlot) calls sfunc. Followers
+			// skip applyAgg — they will be synced from the leader's final state just
+			// before finishAgg. M0097-0035.
+			if call.SharedStateSlot >= 0 && call.UserAgg != nil && i > 0 {
+				isFollower := false
+				for j := 0; j < i; j++ {
+					if o.plan.Aggs[j].SharedStateSlot == call.SharedStateSlot {
+						isFollower = true
+						break
+					}
+				}
+				if isFollower {
+					continue
+				}
+			}
+			if err := o.applyAgg(&cur.aggs[i], call, slot); err != nil {
+				return err
+			}
+		}
+	}
+	return flush()
+}
+
+// sameGroupKey reports whether two per-column key vectors denote the same
+// group. The hash path builds its map key by joining these same parts with a
+// literal separator (setGroupKey, single-set case), so element-wise equality
+// makes the EXACT same grouping decision — including NULL keys, which
+// datumKey renders identically for both paths. M0134-0001 S8.
+func sameGroupKey(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot TupleSlot) error {

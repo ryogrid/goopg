@@ -1820,6 +1820,14 @@ func describePlan(n planner.Node, nm *explainNames) string {
 		// label is a bare "HashAggregate" (explain.c:1549). The grouping
 		// expressions render as a separate "Group Key: <exprs>" detail line
 		// (emitNodeDetailLines; show_agg_keys, explain.c:2616-2636).
+		//
+		// S8 (M0134-0001): the Strategy field now discriminates. PG labels
+		// AGG_SORTED "GroupAggregate" and AGG_HASHED "HashAggregate"
+		// (explain.c:1531-1553). The planner does not set Strategy yet, so a
+		// hand-built node is the only way this renders GroupAggregate today.
+		if p.Strategy == planner.AggStrategySorted {
+			return prefix + "GroupAggregate"
+		}
 		return prefix + "HashAggregate"
 	case *planner.WindowAgg:
 		return fmt.Sprintf("WindowAgg (%d funcs)", len(p.Funcs))

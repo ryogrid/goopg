@@ -1074,6 +1074,14 @@ type Aggregate struct {
 	// determined column discovered during target resolution never displaces
 	// a grouping column. M0125-0048.
 	GroupingMasks [][]int64
+
+	// Strategy selects hashed vs sorted aggregation. The zero value is
+	// AggStrategyHashed, so every existing construction site and test
+	// fixture keeps today's hash-only behavior without being touched.
+	// The planner does not set it yet (M0134-0001 S8 lands the executor
+	// capability first); sorted mode is reachable only via direct node
+	// construction until the pathkey slice wires the choice in.
+	Strategy AggStrategy
 }
 
 // GroupingMaskColOffset is the index of the first GROUPING(...) output
@@ -1082,6 +1090,21 @@ type Aggregate struct {
 func (n *Aggregate) GroupingMaskColOffset() int {
 	return len(n.GroupExprs) + len(n.Aggs)
 }
+
+// AggStrategy is an aggregate node's grouping strategy. The zero value is
+// AggStrategyHashed, mirroring the pre-S8 engine where every grouped
+// aggregate was a hash aggregate (aggregateOp.Open builds a groups map).
+type AggStrategy int
+
+const (
+	// AggStrategyHashed groups input rows by hashing the GROUP BY key.
+	AggStrategyHashed AggStrategy = iota
+	// AggStrategySorted (PostgreSQL's AGG_SORTED) groups a child that already
+	// arrives in GROUP BY key order, collapsing runs of equal keys instead of
+	// hashing (nodeAgg.c agg_retrieve_direct, postgres/src/backend/executor/
+	// nodeAgg.c:2280-2619).
+	AggStrategySorted
+)
 
 // AggMode is an aggregate node's role in a parallel split.
 type AggMode int8
