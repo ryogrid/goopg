@@ -298,6 +298,14 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
 
+	// S6 max rewrite: a Backward IOS emits the materialised rows in reverse.
+	// o.rows is only complete once RangeScan has run (Open materialises the
+	// whole index range before Next ever runs), so the start index is derived
+	// here — not at the top of Open, where o.rows is still nil.
+	if o.plan.Backward {
+		o.idx = len(o.rows) - 1
+	}
+
 	// Prune-on-read for TEMPORARY relations (horizons.spec, M0118-0009). PG
 	// opportunistically prunes a heap page whenever a scan visits it; for a temp
 	// relation that prune uses the session-local horizon (GlobalVisTempRels), so
@@ -366,9 +374,17 @@ func (o *indexOnlyScanOp) Next() (TupleSlot, error) {
 	// Cond that could not be pushed into the btree probe (planagg.c pushes it as
 	// an index qual; goopg's probe is equality/range-shaped). Skip rows that do
 	// not satisfy it. Nil Cond means no filtering.
-	for o.idx < len(o.rows) {
+	//
+	// The max (Backward) rewrite steps the materialised rows in reverse — and
+	// MUST keep this same Cond check: emitting o.rows[len-1] without it leaks a
+	// NULL for a table that contains NULLs (the NULL-trap rule).
+	step := 1
+	if o.plan.Backward {
+		step = -1
+	}
+	for o.idx >= 0 && o.idx < len(o.rows) {
 		r := o.rows[o.idx]
-		o.idx++
+		o.idx += step
 		if o.plan.Cond != nil {
 			d, err := evalExpr(o.plan.Cond, r, o.ctx)
 			if err != nil {

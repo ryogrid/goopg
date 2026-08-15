@@ -1,51 +1,40 @@
-(row 1355 closed — M0119-0006 continues)
+# Working set — M0134-0001 P2 S6 Slice 2 (Backward max rewrite)
 
-**This loop (2026-08-14):** closed deferral-ledger row 1355 (regtype schema-gap)
-in two slices. Slice A (`f4d594d3`, 88th) added `NamespaceOID` to the four
-user-type registries (enum/domain/composite/range), populated at CREATE
-TYPE/DOMAIN (CREATE AGGREGATE schema-with-public-fallback pattern) and at
-WAL/startup reload (pg_type typnamespace col 2, previously dropped). Slice B
-(`3a03e18e`, 89th) made `userTypeNameForOID`/`RegtypeName` take a per-schema
-`qualify func(schema) bool` (was fixed bool), added `Catalog.SchemaNameForOID`,
-and made all ten user-type arms render `regOutQualified(schema, name,
-qualify(schema))` with `"[]"`/multirange kept outside quoting; `regOutShared`
-dropped `regtypeQualify`. The `::regtype` cast / `format_type()` / walsender /
-RAISE now render an off-path non-public type as `schema.name` + quoted.
+**Task:** M0134-0001 aggregates.sql — S6 Slice 2 (port the Backward half of
+`preprocess_minmax_aggregates`: `max(<col>)` → `Result → InitPlan 1 → Limit →
+Index Only Scan Backward`).
 
-**Key symbols:** `userTypeNameForOID`/`RegtypeName`/`regOutQualifySchema`
-(expr.go), `regOutShared`/`RegOut`/`RegOutArgVisible`/`RegOutRendererVisible`
-(reg_identifier.go), `Catalog.SchemaNameForOID` + `NamespaceOID` on
-EnumType/Domain/CompositeType/RangeType (catalog.go), reloadUser*FromHeap
-(catalog_heap_reload.go). Tests: `regtype_actual_schema_test.go`,
-`TestCreateTypeDomainRecordsNamespaceOID`.
+**Status:** Slice 2 LANDED + committed this loop. `max()` now rewrites via
+**materialised-slice-reverse** (`IndexOnlyScan.Backward` + reverse iteration of the
+already-materialised `o.rows`), NOT a true backward btree walk (deferred — ledger row).
 
-**Residual (filed):** new ledger row — the SELECT wire / COPY TO / `reg*`→text
-cast / array-element paths still pass a constant `!publicSchemaVisible` predicate
-(dispatch.go:3227, copy.go:90, expr.go:3381 regCastQualify, codec_array.go:335),
-so an off-path non-public type renders BARE there under the default search_path,
-now divergent from the corrected cast path. Row-1339 family; thread a per-schema
-predicate through those four sites.
+**Files (this loop):** `internal/planner/plan.go` (`IndexOnlyScan.Backward`),
+`internal/planner/planner.go` (`rewriteMinMaxAggregates` accepts max / `Backward:isMax` /
+`Sort{DESC NULLS FIRST}`), `internal/executor/operators_indexonly.go` (reverse `o.idx`
+step, Cond kept verbatim), `internal/executor/operators_explain.go` (`" Backward"` token),
+`internal/planner/minmax_rewrite_test.go` (+4 max tests), `internal/executor/subplan_stats_test.go`
+(now 2 instrumented sublinks), `docs/design/0134-0001-p2-explain-format.md` (Slice 2
+landed + divergence note), `.ralph/deferral_ledger.md` (true-backward-walk deferral).
 
-**Remaining M0119-0006 (rough order of narrowness):**
-1. row 1351 — bare-`char` arg OID: arglist carries only arg Name; carry resolved
-   OID per arg (catalog-representation change).
-2. rows 1340/1344 — mixed-case role folding / arg-type case (case-folding family).
-3. whole-db (unscoped) pg_amcheck — blocked on index AMs, STORAGE EXTERNAL
-   TOAST, box/int4range/int4[] HEAP types, multi-DB orchestration.
+**Key symbols:** `rewriteMinMaxAggregates`, `indexOnlyScanOp.Next`/`Open`,
+`IndexOnlyScan.Backward`, `describePlan`/`describePlanVerbose`.
 
-**Next step:** row 1351 (bare-`char` arg OID) — delegate a `researcher` to scope
-it first: which arglist carriers need the resolved OID, where each is populated,
-and the exact regprocedure-arglist render sites. Banner ranks M0119 first
-(M-NIGHTLY has no open items; the 2 regress/enum+oid nightly items were already
-filed+fixed by an earlier slice this loop).
+**Findings:** materialise-reverse is byte-correct because goopg's IOS materialises the
+whole range in `Open` (`operators_indexonly.go:297`); the one correctness trap (NULL leak)
+is guarded by keeping the `Cond` (`col IS NOT NULL`) check in the reverse loop.
 
-**Gates run:** go build PASS; executor/server/wal/catalog/plpgsql suites PASS;
-5 targeted regtype tests PASS (uncached); tpch-spotcheck PASS (Q12=2/Q13=35);
-pre-commit units PASS; pre-commit pgbench smoke PASS (hook); full
-TestPort_RegressSuite PASS (47 PASS/185 SKIP/0 FAIL, all 41 must-pass green).
+**Next step — S6 Slice 3 (edge cases):** constant `max(100)` (block 14), composite-prefix
+index probing (block 7), inheritance/MergeAppend (blocks 15/16 + partial-index bug),
+scalar-subquery nesting class-8 (blocks 8/17). Plus the `create_index.sql` prerequisite
+for the regress runner (S1 deferral row) so the `Index Only Scan Backward` + `Index Cond`
+text is verified end-to-end.
 
-**Delegation:** implementer (slice B) + tester (package gates, long gates,
-regress) + reviewer (adversarial) all DONE. Handoff:
-`tmp/ralph-handoffs/0119-0006-regtype-schema-qualify/`.
+**Gates run (this loop):** `go test ./internal/planner/` PASS (8 minmax tests);
+`go test ./internal/executor/` PASS; `scripts/pg-regress-runner.sh aggregates` 1537→1543
+(5 max blocks now emit Result/InitPlan 1/Limit; scan line stays SeqScan fallback —
+expected, no create_index.sql); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=35).
+
+**Delegation:** researcher S6-S2 research DONE (materialise-reverse verdict);
+implementer S6 Slice 2 DONE. Handoffs: `tmp/ralph-handoffs/0134-0001-p2-s6-s2-{research,s2}/`.
 
 **In-flight:** none.

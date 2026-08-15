@@ -305,10 +305,45 @@ matches only a LEADING column, so `min(tenthous) WHERE thousand=33` declines the
 composite `thous_tenthous`. Backward blocks 2-6/9-17 (max) and correlated block 8 are
 unchanged (Slice 2/3). `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=35).
 
-**Remaining for S6:** Slice 2 (backward index scan — new capability, closes 18 lines),
-Slice 3 (constant `max(100)`, composite-prefix probing, inheritance MergeAppend +
-partial-index bug, class-8 outer-subplan rendering). Deferral-ledger row appended for
-composite-prefix probing.
+**Remaining for S6:** Slice 3 (constant `max(100)`, composite-prefix probing, inheritance
+MergeAppend + partial-index bug, class-8 outer-subplan rendering) + a future **true**
+backward btree walk (deferred — Slice 2 landed the materialise-reverse shortcut instead,
+see the Slice 2 landed note below). Deferral-ledger rows appended for composite-prefix
+probing + the `create_index.sql` prerequisite (S1) and the true-backward-walk deferral (S2).
+
+## S6 Slice 2 — landed 2026-08-15 (backward/max rewrite)
+
+Shipped: `IndexOnlyScan.Backward bool` (`plan.go`); max acceptance in
+`rewriteMinMaxAggregates` (`planner.go`: `isMax` → `Backward: isMax` on the IOS,
+`Sort{Desc: isMax, NullsFirst: isMax}` on the SeqScan fallback, `label` branch); the
+direction-aware reverse iteration in `indexOnlyScanOp` (`operators_indexonly.go`: `o.idx`
+starts at `len(o.rows)-1` and steps −1 when Backward, with the `Cond` (`col IS NOT NULL`)
+residual kept verbatim in BOTH directions — the NULL-trap rule); and the `" Backward"`
+token in `describePlan`/`describePlanVerbose` (`operators_explain.go`). Tests:
+`internal/planner/minmax_rewrite_test.go` (bare-max-rewrites, bare-max-IOS-Backward,
+bare-max-SeqScan-fallback, max-NULL-trap plan-shape) + `subplan_stats_test.go` updated to
+expect 2 instrumented sublinks (outer scalar sublink + inner InitPlan — planagg.c's
+SubPlan+InitPlan shape).
+
+**Divergence from the Slice 2 spec above (deliberate):** the spec planned a "btree
+backward range scan" (a true reverse leaf walk). The implementation instead uses
+**materialised-slice-reverse**: goopg's `indexOnlyScanOp` already materialises the entire
+index range into `o.rows` in `Open` (`operators_indexonly.go:297`), so Backward is just
+iterating that slice from the end — zero extra memory/btree work and byte-identical
+results. A true backward btree walk is a separate btree-engine capability (reverse leaf
+traversal + high-key descent + split recovery + page-latch handling; `rangeScanPos`
+`btree.go:3873` is forward-only) that only matters for a streaming
+`ORDER BY col DESC LIMIT n` on huge tables — **deferred** (ledger row), not needed for
+min/max correctness.
+
+**Measured result (`scripts/pg-regress-runner.sh aggregates`, 1537→1543 lines, zero
+regressions):** the 5 max blocks (2-6) now emit `Result`/`InitPlan 1`/`-> Limit` matching
+PG; the scan line stays `Sort → SeqScan` fallback (the regress runner still doesn't run
+`create_index.sql`, so `tenk1_unique1` is absent — the same env gap as Slice 1's block 1).
+The `Index Only Scan Backward` text path is therefore exercised by unit tests only
+(plan-shape + `Backward: true`), not end-to-end — the `create_index.sql` prerequisite slice
+closes that (already in the S1 deferral row). `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=35).
 
 ## Cross-case relevance
 

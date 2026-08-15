@@ -804,8 +804,11 @@ type IndexOnlyScan struct {
 	// (Key/Keys/LowKey/HighKey) is equality/range-shaped; this general
 	// expression cannot be pushed into the btree probe, so the executor
 	// applies it as a residual predicate. When nil, no extra filtering.
-	Cond    Expr
-	schema  Schema
+	Cond Expr
+	// Backward emits the materialised rows in reverse (S6 max rewrite: PG's
+	// `Index Only Scan Backward` over an ASC index delivers DESC NULLS FIRST).
+	Backward bool
+	schema   Schema
 	// PrivilegeCheckRole / PrivilegeCheckRoleSet — see SeqScan's field of the
 	// same name. M0122-0008 (view-owner privilege gap).
 	PrivilegeCheckRole    string

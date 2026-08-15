@@ -1,7 +1,6 @@
 package planner
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -142,25 +141,119 @@ func TestRewriteMinMaxAggBareMinSeqScanFallback(t *testing.T) {
 	_ = lim
 }
 
-// TestRewriteMinMaxAggMaxNotRewritten: `max(x)` (the Backward/Slice 2
-// direction) must stay on the ordinary Aggregate path — a Project over an
-// Aggregate with one aggregate slot.
-func TestRewriteMinMaxAggMaxNotRewritten(t *testing.T) {
+// TestRewriteMinMaxAggBareMaxRewrites: bare `max(x)` (Slice 2's Backward
+// direction) MUST now rewrite — the plan root is the Result/InitPlan shape, not
+// the pre-Slice-2 Project-over-Aggregate, and the Result's output column is
+// named after the function.
+func TestRewriteMinMaxAggBareMaxRewrites(t *testing.T) {
 	cat, _ := minmaxRewriteCatalog(t)
 	plan, err := Plan(parseOne(t, "SELECT max(x) FROM t"), cat)
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
-	proj, ok := plan.(*Project)
-	if !ok {
-		t.Fatalf("plan root is %T, want *Project (Aggregate path)", plan)
+	// digMinMaxInner walks Result → SubqueryExpr(InitPlan) → Limit and fatals on
+	// any other shape (e.g. the old Aggregate path's Project → Aggregate).
+	res, _, _, _ := digMinMaxInner(t, plan)
+	if len(res.schema) != 1 || res.schema[0].Name != "max" {
+		t.Fatalf("Result schema = %+v, want single column named max", res.schema)
 	}
-	agg, ok := proj.Child.(*Aggregate)
-	if !ok {
-		t.Fatalf("Project child is %T, want *Aggregate", proj.Child)
+}
+
+// TestRewriteMinMaxAggBareMaxIndexOnlyScan: a bare `SELECT max(x) FROM t` over a
+// btree index on x rewrites to Result → SubqueryExpr(InitPlan) → Limit →
+// IndexOnlyScan carrying Backward: true (PG's `Index Only Scan Backward` — the
+// ASC index read in reverse delivers DESC NULLS FIRST = the max).
+func TestRewriteMinMaxAggBareMaxIndexOnlyScan(t *testing.T) {
+	cat, tbl := minmaxRewriteCatalog(t)
+	plan, err := Plan(parseOne(t, "SELECT max(x) FROM t"), cat)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
 	}
-	if len(agg.Aggs) != 1 || !strings.EqualFold(agg.Aggs[0].Name, "max") {
-		t.Fatalf("Aggregate slots = %+v, want one max()", agg.Aggs)
+	_, _, _, child := digMinMaxInner(t, plan)
+	ios, ok := child.(*IndexOnlyScan)
+	if !ok {
+		t.Fatalf("Limit child is %T, want *IndexOnlyScan", child)
+	}
+	if !ios.Backward {
+		t.Fatalf("IOS.Backward = false, want true (max → Backward)")
+	}
+	if ios.Index == nil || len(ios.Index.Columns) != 1 || ios.Index.Columns[0] != "x" {
+		t.Fatalf("IOS index = %+v, want single-column btree on x", ios.Index)
+	}
+	if len(ios.Covered) != 1 || ios.Covered[0].Name != "x" {
+		t.Fatalf("IOS covered = %v, want [x]", ios.Covered)
+	}
+	if ios.Table != tbl {
+		t.Fatalf("IOS Table = %v, want %v", ios.Table, tbl)
+	}
+}
+
+// TestRewriteMinMaxAggBareMaxSeqScanFallback: no index on x → the max rewrite
+// still fires via the SeqScan fallback, with the Sort reversed to DESC NULLS
+// FIRST (max's reverse sort clause — fetch_agg_sort_op `>`, planagg.c:163-179).
+func TestRewriteMinMaxAggBareMaxSeqScanFallback(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "x", Type: catalog.Type{Name: "int4"}},
+		{Name: "y", Type: catalog.Type{Name: "int4"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := Plan(parseOne(t, "SELECT max(x) FROM t"), c)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	_, _, lim, child := digMinMaxInner(t, plan)
+	// The SeqScan fallback needs a Project between the Limit and the Sort so the
+	// InitPlan emits exactly one column (SeqScan always decodes the full table
+	// row); the Project is invisible to EXPLAIN.
+	proj, ok := child.(*Project)
+	if !ok {
+		t.Fatalf("Limit child is %T, want *Project", child)
+	}
+	sort, ok := proj.Child.(*Sort)
+	if !ok {
+		t.Fatalf("Project child is %T, want *Sort", proj.Child)
+	}
+	if len(sort.Keys) != 1 || !sort.Keys[0].Desc || !sort.Keys[0].NullsFirst {
+		t.Fatalf("Sort keys = %+v, want [x DESC NULLS FIRST]", sort.Keys)
+	}
+	f, ok := sort.Child.(*Filter)
+	if !ok {
+		t.Fatalf("Sort child is %T, want *Filter", f)
+	}
+	if _, ok := f.Child.(*SeqScan); !ok {
+		t.Fatalf("Filter child is %T, want *SeqScan", f.Child)
+	}
+	_ = lim
+}
+
+// TestRewriteMinMaxAggMaxNullTrap: a table whose max column contains NULLs must
+// still return the max NON-NULL. The executor's reverse loop emits rows[len-1]
+// first, so the `x IS NOT NULL` Cond MUST ride on the Backward IOS — dropping it
+// would leak a NULL for a NULL-containing table (the NULL-trap rule). The
+// plan-level guard is asserted here; the executor keeps the Cond check verbatim
+// in both directions (operators_indexonly.go Next).
+func TestRewriteMinMaxAggMaxNullTrap(t *testing.T) {
+	cat, _ := minmaxRewriteCatalog(t)
+	plan, err := Plan(parseOne(t, "SELECT max(x) FROM t"), cat)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	_, _, _, child := digMinMaxInner(t, plan)
+	ios, ok := child.(*IndexOnlyScan)
+	if !ok {
+		t.Fatalf("Limit child is %T, want *IndexOnlyScan", child)
+	}
+	if !ios.Backward {
+		t.Fatalf("IOS.Backward = false, want true")
+	}
+	cond, ok := ios.Cond.(*IsNullExpr)
+	if !ok || !cond.Negated {
+		t.Fatalf("IOS Cond = %#v, want `x IS NOT NULL` on the Backward IOS", ios.Cond)
+	}
+	if cr, ok := cond.Operand.(*ColumnRef); !ok || cr.Name != "x" || cr.Index != 0 {
+		t.Fatalf("IOS Cond operand = %#v, want ColumnRef(x) at index 0", cond.Operand)
 	}
 }
 

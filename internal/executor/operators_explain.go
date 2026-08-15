@@ -1688,10 +1688,16 @@ func describePlanVerbose(n planner.Node, verbose bool, nm *explainNames) string 
 		}
 		return fmt.Sprintf("Index Scan using %s on %s", p.Index.QualifiedName(), schemaQualify(p.Table.QualifiedName()))
 	case *planner.IndexOnlyScan:
-		if dname := nm.disambiguatedName(n); dname != "" {
-			return fmt.Sprintf("Index Only Scan using %s on %s", p.Index.QualifiedName(), dname)
+		// S6 max rewrite: PG's ExplainIndexScanDetails (explain.c:4330-4336)
+		// puts " Backward" between the scan name and " using".
+		dir := ""
+		if p.Backward {
+			dir = " Backward"
 		}
-		return fmt.Sprintf("Index Only Scan using %s on %s", p.Index.QualifiedName(), schemaQualify(p.Table.QualifiedName()))
+		if dname := nm.disambiguatedName(n); dname != "" {
+			return fmt.Sprintf("Index Only Scan%s using %s on %s", dir, p.Index.QualifiedName(), dname)
+		}
+		return fmt.Sprintf("Index Only Scan%s using %s on %s", dir, p.Index.QualifiedName(), schemaQualify(p.Table.QualifiedName()))
 	case *planner.Insert:
 		return "Insert on " + schemaQualify(p.Table.QualifiedName())
 	case *planner.Update:
@@ -1820,10 +1826,17 @@ func describePlan(n planner.Node, nm *explainNames) string {
 		// M0118-0009 (design 0118-0102): horizons.spec inspects the IOS
 		// label via `EXPLAIN (COSTS OFF)` (pruner_query_plan) — mirror
 		// upstream's "Index Only Scan using <idx> on <table>".
-		if dname := nm.disambiguatedName(n); dname != "" {
-			return fmt.Sprintf("Index Only Scan using %s on %s", p.Index.QualifiedName(), dname)
+		// S6 max rewrite: PG puts " Backward" between the scan name and
+		// " using" for a backward index scan (ExplainIndexScanDetails,
+		// explain.c:4330-4336).
+		dir := ""
+		if p.Backward {
+			dir = " Backward"
 		}
-		return fmt.Sprintf("Index Only Scan using %s on %s", p.Index.QualifiedName(), p.Table.QualifiedName())
+		if dname := nm.disambiguatedName(n); dname != "" {
+			return fmt.Sprintf("Index Only Scan%s using %s on %s", dir, p.Index.QualifiedName(), dname)
+		}
+		return fmt.Sprintf("Index Only Scan%s using %s on %s", dir, p.Index.QualifiedName(), p.Table.QualifiedName())
 	case *planner.Insert:
 		return fmt.Sprintf("Insert on %s", p.Table.QualifiedName())
 	case *planner.Update:

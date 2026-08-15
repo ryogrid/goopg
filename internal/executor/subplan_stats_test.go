@@ -61,6 +61,28 @@ func onlyStat(t *testing.T, ctx *Context) *SubPlanSiteStats {
 	return nil
 }
 
+// onlyOuterStat returns the OUTER scalar sublink's counters among the (now
+// possibly two) instrumented sublinks. A non-correlated scalar min/max subquery
+// nests the S6 rewrite's own InitPlan as a second, inner sublink (0134-0001
+// P2): the outer sublink's SubqueryExpr.Plan is the whole rewritten subquery
+// (a Result), while the inner InitPlan's Plan is a Limit (Result → InitPlan →
+// Limit → IOS/Sort), which is what distinguishes the two.
+func onlyOuterStat(t *testing.T, ctx *Context) *SubPlanSiteStats {
+	t.Helper()
+	for e, s := range ctx.SubPlanStats {
+		sq, ok := e.(*planner.SubqueryExpr)
+		if !ok {
+			continue
+		}
+		if _, isLimit := sq.Plan.(*planner.Limit); isLimit {
+			continue // the inner min/max InitPlan
+		}
+		return s
+	}
+	t.Fatalf("no outer scalar sublink in SubPlanStats; entries: %#v", ctx.SubPlanStats)
+	return nil
+}
+
 // TestSubPlanStatsCorrelatedExistsRescans pins the Stage-9 (S2c) fix
 // of the pathology this test originally documented: correlated EXISTS
 // used to Build+Open+Close its inner plan per outer row; the SubPlan
@@ -126,7 +148,19 @@ func TestSubPlanStatsNonCorrelatedCachesAfterFirst(t *testing.T) {
 	runQuery(t, ctx,
 		"SELECT * FROM t1 WHERE t1.a = -999 OR t1.b > (SELECT max(t2.b) FROM t2)")
 
-	s := onlyStat(t, ctx)
+	// 0134-0001 P2 S6 (min/max rewrite): the scalar subquery's `max(t2.b)` now
+	// nests the rewrite's own InitPlan as a second, inner sublink (Result →
+	// SubqueryExpr{InitPlan} → Limit → …), mirroring PG's planagg.c
+	// SubPlan+InitPlan shape. So exactly TWO sublinks are instrumented: the
+	// OUTER scalar sublink (Calls=3, one per t1 row) and the inner InitPlan
+	// (Calls=1, evaluated once because the outer's constant-key cache
+	// short-circuits after the first row). The cache assertions below apply to
+	// the outer sublink.
+	if len(ctx.SubPlanStats) != 2 {
+		t.Fatalf("want exactly 2 instrumented sublinks (outer scalar sublink + inner min/max InitPlan), got %d",
+			len(ctx.SubPlanStats))
+	}
+	s := onlyOuterStat(t, ctx)
 	if s.Calls != 3 {
 		t.Fatalf("Calls = %d, want 3", s.Calls)
 	}

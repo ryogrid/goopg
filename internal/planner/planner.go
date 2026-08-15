@@ -8517,8 +8517,14 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 	if !ok {
 		return nil, false, nil
 	}
-	// Only the forward/min direction. max() → Slice 2 (Backward).
-	if fc.Name.Schema != "" || !strings.EqualFold(fc.Name.Name, "min") {
+	// min → forward IOS (isMax=false); max → Backward IOS (isMax=true).
+	if fc.Name.Schema != "" {
+		return nil, false, nil
+	}
+	isMax := false
+	if strings.EqualFold(fc.Name.Name, "max") {
+		isMax = true
+	} else if !strings.EqualFold(fc.Name.Name, "min") {
 		return nil, false, nil
 	}
 	// Per-agg reject (can_minmax_aggs, planagg.c:236-306): arg count,
@@ -8574,11 +8580,12 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 				return nil, false, nil
 			}
 			ios := &IndexOnlyScan{
-				pos:     pos,
-				Table:   tbl,
-				Index:   idx,
-				Covered: []catalog.Column{*covered},
-				Cond:    isNotNull,
+				pos:      pos,
+				Table:    tbl,
+				Index:    idx,
+				Covered:  []catalog.Column{*covered},
+				Cond:     isNotNull,
+				Backward: isMax,
 				schema: Schema{{Name: argCR.Name, Type: colType,
 					SourceTableIdx: 1}},
 			}
@@ -8616,10 +8623,11 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 		f := &Filter{pos: pos, Child: seq, Predicate: andExpr(pos, wherePred, isNotNull)}
 		sortKey := &ColumnRef{pos: pos, Index: argCR.Index, Name: argCR.Name,
 			Type: argCR.Type, SourceTableIdx: 1}
-		// min's sortClause: ASC NULLS LAST (fetch_agg_sort_op `<`,
-		// nulls_first=false — planagg.c:163-179).
+		// sortClause: min is ASC NULLS LAST, max is DESC NULLS FIRST
+		// (fetch_agg_sort_op `<` / `>`, nulls_first=false / true —
+		// planagg.c:163-179).
 		sort := &Sort{pos: pos, Child: f,
-			Keys: []SortKey{{Expr: sortKey, Desc: false, NullsFirst: false}}}
+			Keys: []SortKey{{Expr: sortKey, Desc: isMax, NullsFirst: isMax}}}
 		// PG's build_minmax_path subquery targetlist is JUST the min column
 		// (single-TLE tlist), so the InitPlan must emit exactly one column. The
 		// IOS path achieves that by decoding only the covered column; goopg's
@@ -8645,6 +8653,9 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 	// The childless Result top node (T_Result, nodeResult.c): one row whose
 	// single target is the InitPlan value.
 	label := "min"
+	if isMax {
+		label = "max"
+	}
 	if t.Alias != "" {
 		label = t.Alias
 	}
