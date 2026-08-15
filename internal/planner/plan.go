@@ -799,6 +799,12 @@ type IndexOnlyScan struct {
 	// Covered is the slice of catalog.Column entries that the output schema
 	// contains (a subset of Index.Columns, in projection order).
 	Covered []catalog.Column
+	// Cond is an additional filter evaluated per index row (S6 min/max
+	// rewrite: the `col IS NOT NULL` qual). IndexOnlyScan's primary probe
+	// (Key/Keys/LowKey/HighKey) is equality/range-shaped; this general
+	// expression cannot be pushed into the btree probe, so the executor
+	// applies it as a residual predicate. When nil, no extra filtering.
+	Cond    Expr
 	schema  Schema
 	// PrivilegeCheckRole / PrivilegeCheckRoleSet — see SeqScan's field of the
 	// same name. M0122-0008 (view-owner privilege gap).
@@ -1191,6 +1197,25 @@ func (n *Filter) Pos() int       { return n.pos }
 func (n *Filter) Output() Schema { return n.Child.Output() }
 
 // Project — evaluates the target list against its child's rows.
+// Result is a childless projection node: it emits exactly ONE row by
+// evaluating Targets against an empty input. It is the goopg analog of
+// PostgreSQL's T_Result (nodeResult.c), which S6's min/max rewrite uses as the
+// top node above an InitPlan carrying the rewritten scalar aggregate.
+//
+// There is deliberately no Child: PG's Result may have one, but the only shape
+// goopg constructs is the childless one (the min/max InitPlan hangs off a
+// SubqueryExpr target, not a child scan — see rewriteMinMaxAggregates). Keep it
+// that way until a child-bearing construction site appears.
+type Result struct {
+	searchedTree
+	pos     int
+	Targets []Expr
+	schema  Schema
+}
+
+func (n *Result) Pos() int       { return n.pos }
+func (n *Result) Output() Schema { return n.schema }
+
 type Project struct {
 	// searchedTree: the boundary node P5.5-f-i emits is a *Project, and it is
 	// the node the legacy posmap family must most carefully not walk into

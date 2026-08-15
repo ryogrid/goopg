@@ -1236,6 +1236,20 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		}
 	}
 
+	// S6 (0134-0001 P2) min/max rewrite, forward half: port
+	// preprocess_minmax_aggregates (planagg.c:73) so a bare `min(<col>)`
+	// aggregate becomes `Result → InitPlan → Limit → IndexOnlyScan|SeqScan`,
+	// matching PG's EXPLAIN (costs off) for the forward min blocks. Runs BEFORE
+	// buildAggregateStage (upstream calls it from grouping_planner right before
+	// query_planner — planner.c:1617). On a rewrite the Result is returned
+	// directly (same early-return pattern as tryPromoteAggSublink above); on a
+	// rejection we fall through to the ordinary Aggregate path untouched.
+	if rewritten, ok, err := rewriteMinMaxAggregates(s, ctx, cat); err != nil {
+		return nil, err
+	} else if ok {
+		return rewritten, nil
+	}
+
 	var agg *aggregateSurface
 	savedBindings := ctx.bindings
 	if needsAggregateStage(s, cat) {
@@ -8428,6 +8442,214 @@ func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.
 		SmallDim:   smallDimensionTag(cat, tbl),
 		UniqueKeys: uniqueKeyColumnSets(cat, tbl),
 	}, true, nil
+}
+
+// rewriteMinMaxAggregates ports the FORWARD half of PostgreSQL's
+// preprocess_minmax_aggregates (postgres/src/backend/optimizer/plan/planagg.c:73)
+// into goopg: a bare `min(<col>)` aggregate — one target, single plain-column
+// argument, no GROUP BY / HAVING / window / DISTINCT / ORDER BY / LIMIT, single
+// relation FROM — is rewritten into PG's plan shape
+//
+//	Result
+//	  InitPlan 1            (a non-correlated SubqueryExpr, once-per-statement)
+//	    ->  Limit
+//	          ->  Index Only Scan | Seq Scan
+//	                Index Cond / Filter: (<col> IS NOT NULL [AND <where>])
+//
+// The subquery is `SELECT <col> FROM t WHERE <col> IS NOT NULL [AND <where>]
+// ORDER BY <col> ASC NULLS LAST LIMIT 1` (build_minmax_path, planagg.c:362-420:
+// single-TLE tlist, the `target IS NOT NULL` NullTest prepended to the jointree
+// quals, ORDER BY from fetch_agg_sort_op — `<` for min, nulls_first=false — and
+// LIMIT 1). The InitPlan supplies the min value to the childless Result's single
+// target. Empty table / all-NULL column → the InitPlan yields NULL → Result
+// emits NULL, identical to the Aggregate path: the rewrite is shape-only.
+//
+// Returns (nil, false, nil) on any rejection — the conservative gate
+// ("when unsure, do NOT rewrite", brief invariant) — leaving the ordinary
+// Aggregate path byte-identical. Only min() (ASC sortop) is rewritten; max()
+// (the DESC/Backward half) is Slice 2 and explicitly rejected.
+func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat catalog.Catalog) (Node, bool, error) {
+	// Gating, mirroring planagg.c:87-137. Also reject ORDER BY / LIMIT /
+	// OFFSET / DISTINCT because planSelect applies those ABOVE the point this
+	// hook early-returns; a rewritten Result would silently skip them.
+	if s.With != nil || len(s.GroupBy) > 0 || s.GroupingSets != nil ||
+		s.Having != nil || len(s.WindowClause) > 0 || s.Distinct ||
+		s.Limit != nil || s.Offset != nil || len(s.OrderBy) > 0 {
+		return nil, false, nil
+	}
+	if len(s.Targets) != 1 {
+		return nil, false, nil
+	}
+	// planagg.c:121-137: the jointree must collapse to ONE RTE_RELATION. The
+	// FROM must therefore be a single plain relation — NOT a subquery, table
+	// function, CTE, VALUES, view or inheritance/partition parent. The rewrite
+	// builds a FRESH inner scan over the catalog table, so a derived/CTE source
+	// (whose binding's catalog.Table is synthetic — e.g. planSubqueryRangeVar's
+	// `catalog.Table{Name: rv.Alias}`) would be mislabelled as a heap relation
+	// and scanned as an empty/incorrect table.
+	if len(s.From) != 1 || s.From[0].Subquery != nil || s.From[0].TableFunc != nil {
+		return nil, false, nil
+	}
+	rv := s.From[0]
+	if rv.Schema == "" {
+		if ce := lookupPlannedCTE(rv.Name); ce != nil {
+			return nil, false, nil
+		}
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name})
+	if !ok || tbl.View != nil || tbl.IsMatView {
+		return nil, false, nil
+	}
+	// Partitioned parents store no rows (planIndexScanFromWhere:8316) and a
+	// plain `FROM parent` scans the inheritance tree, not the leaf — both
+	// would make the single-leaf inner scan wrong.
+	if len(tbl.PartitionKey) > 0 {
+		return nil, false, nil
+	}
+	if im := inMemoryCat(cat); im != nil {
+		if len(catalog.AccessibleInheritanceChildren(im.InheritanceChildren(tbl.OID), currentTempOwner(cat))) > 0 {
+			return nil, false, nil
+		}
+	}
+
+	t := s.Targets[0]
+	fc, ok := t.Expr.(*parser.FuncCall)
+	if !ok {
+		return nil, false, nil
+	}
+	// Only the forward/min direction. max() → Slice 2 (Backward).
+	if fc.Name.Schema != "" || !strings.EqualFold(fc.Name.Name, "min") {
+		return nil, false, nil
+	}
+	// Per-agg reject (can_minmax_aggs, planagg.c:236-306): arg count,
+	// DISTINCT, ORDER BY, FILTER, window, WITHIN GROUP, star.
+	if len(fc.Args) != 1 || fc.Star || fc.Distinct || fc.Over != nil ||
+		fc.Filter != nil || len(fc.OrderBy) > 0 || len(fc.WithinGroup) > 0 {
+		return nil, false, nil
+	}
+	// The arg must be a plain column Var — no expression / Const.
+	if _, ok := fc.Args[0].(*parser.ColumnRef); !ok {
+		return nil, false, nil
+	}
+	pos := s.Pos()
+
+	// Resolve the agg column against the ORIGINAL context. For the simple
+	// single-table FROM its Index is in table-column order, which is exactly
+	// the coordinate space of the fresh inner scan schemas below.
+	argExpr, err := resolveExpr(fc.Args[0], ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	argCR, ok := argExpr.(*ColumnRef)
+	if !ok {
+		return nil, false, nil
+	}
+	colType := argCR.Type
+	if col, ok := cat.LookupColumn(tbl, argCR.Name); ok {
+		colType = col.Type
+	}
+
+	// `<col> IS NOT NULL`, prepended to the subquery's quals (build_minmax_path).
+	// The executor treats it as a residual filter; functionally redundant at
+	// runtime (ASC NULLS LAST reads the first non-null first) but required for
+	// the EXPLAIN Index Cond / Filter line to match PG.
+	isNotNull := &IsNullExpr{pos: pos, Operand: &ColumnRef{
+		// SourceTableIdx 1: the fresh inner scan is a new single-relation plan
+		// whose own source is source index 1 (tableSchemaWithSource(tbl, 1)),
+		// NOT the outer query's binding.
+		pos: pos, Index: argCR.Index, Name: argCR.Name, Type: argCR.Type,
+		SourceTableIdx: 1,
+	}, Negated: true}
+
+	var inner Node
+	if s.Where == nil {
+		// Cheap path: no qual → the forward sorted path is a plain full-range
+		// IndexOnlyScan on a btree index whose leading column is the agg column
+		// (build_minmax_path's cheapest-path-for-pathkeys; the index's natural
+		// ASC order IS min's pathkey). findBTreeIndexForColumn declines partial
+		// indexes — correct, their predicate is unproven here.
+		if idx := findBTreeIndexForColumn(cat, tbl, argCR.Name); idx != nil {
+			covered, ok := cat.LookupColumn(tbl, argCR.Name)
+			if !ok {
+				return nil, false, nil
+			}
+			ios := &IndexOnlyScan{
+				pos:     pos,
+				Table:   tbl,
+				Index:   idx,
+				Covered: []catalog.Column{*covered},
+				Cond:    isNotNull,
+				schema: Schema{{Name: argCR.Name, Type: colType,
+					SourceTableIdx: 1}},
+			}
+			inner = &Limit{pos: pos, Child: ios, Limit: &IntegerConst{pos: pos, Value: 1}}
+		}
+	}
+
+	if inner == nil {
+		// SeqScan fallback: no qualifying index (findBTreeIndexForColumn only
+		// matches a LEADING column, so block 7's `min(tenthous) WHERE
+		// thousand=33` cannot use thous_tenthous — that composite-prefix probe is
+		// Slice 3), or a WHERE qual present. Build the full sorted plan.
+		var wherePred Expr
+		if s.Where != nil {
+			wherePred, err = resolveExpr(s.Where, ctx)
+			if err != nil {
+				return nil, false, err
+			}
+			// Reject correlation: an outer Var in the qual means the inner plan
+			// is parameterised by the outer query, which the non-correlated
+			// SubqueryExpr cannot carry (block 8's `unique1 > f1` — a class-8
+			// outer-subplan rendering gap — stays on the Aggregate path).
+			hasOuter := false
+			walkExprTree(wherePred, func(e Expr) {
+				if _, ok := e.(*OuterColumnRef); ok {
+					hasOuter = true
+				}
+			})
+			if hasOuter {
+				return nil, false, nil
+			}
+		}
+		seqSchema := tableSchemaWithSource(tbl, 1)
+		seq := &SeqScan{pos: pos, Table: tbl, schema: seqSchema}
+		f := &Filter{pos: pos, Child: seq, Predicate: andExpr(pos, wherePred, isNotNull)}
+		sortKey := &ColumnRef{pos: pos, Index: argCR.Index, Name: argCR.Name,
+			Type: argCR.Type, SourceTableIdx: 1}
+		// min's sortClause: ASC NULLS LAST (fetch_agg_sort_op `<`,
+		// nulls_first=false — planagg.c:163-179).
+		sort := &Sort{pos: pos, Child: f,
+			Keys: []SortKey{{Expr: sortKey, Desc: false, NullsFirst: false}}}
+		// PG's build_minmax_path subquery targetlist is JUST the min column
+		// (single-TLE tlist), so the InitPlan must emit exactly one column. The
+		// IOS path achieves that by decoding only the covered column; goopg's
+		// SeqScan always decodes the FULL table row (cols = table.Columns), so a
+		// Project slices it down to the target column. The Project sits ABOVE the
+		// Sort (whose key indexes the full row, untouched). It is invisible in
+		// EXPLAIN — walkPlanFiltered skips Project wrappers ("PG has no
+		// Projection plan node", operators_explain.go) — so the rendered shape
+		// stays `Limit -> Sort -> SeqScan` exactly as upstream produces.
+		proj := &Project{pos: pos, Child: sort,
+			Targets: []Expr{&ColumnRef{pos: pos, Index: argCR.Index, Name: argCR.Name,
+				Type: argCR.Type, SourceTableIdx: 1}},
+			schema: Schema{{Name: argCR.Name, Type: colType, SourceTableIdx: 1}}}
+		inner = &Limit{pos: pos, Child: proj, Limit: &IntegerConst{pos: pos, Value: 1}}
+	}
+
+	// The InitPlan: a non-correlated scalar SubqueryExpr whose inner plan emits
+	// exactly one column (the min) and at most one row. evalSubquery's
+	// constant-key cache IS upstream's InitPlan-once-per-statement semantics
+	// (executor/expr.go evalSubquery; subplan.go header).
+	init := &SubqueryExpr{pos: pos, Plan: inner, IsNonCorrelated: true}
+
+	// The childless Result top node (T_Result, nodeResult.c): one row whose
+	// single target is the InitPlan value.
+	label := "min"
+	if t.Alias != "" {
+		label = t.Alias
+	}
+	return &Result{pos: pos, Targets: []Expr{init},
+		schema: Schema{{Name: label, Type: colType}}}, true, nil
 }
 
 // findBTreeIndexForColumn locates a B-tree index whose leading column

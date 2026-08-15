@@ -204,6 +204,10 @@ func buildNode(plan planner.Node) (Operator, error) {
 		return maybeInstrument(p, newIndexScanOp(p)), nil
 	case *planner.IndexOnlyScan:
 		return maybeInstrument(p, newIndexOnlyScanOp(p)), nil
+	case *planner.Result:
+		// Childless Result (S6 min/max rewrite top node): resultOp evaluates
+		// Targets once and emits exactly one row. No child to Build.
+		return maybeInstrument(p, newResultOp(p)), nil
 	case *planner.LockRows:
 		child, err := Build(p.Child)
 		if err != nil {

@@ -396,6 +396,66 @@ func (o *projectOp) Next() (TupleSlot, error) {
 // materialisation in the hot path. Matching slots are forwarded
 // to the parent unchanged, so filter never owns Row buffers and
 // no borrow contract is needed.
+// resultOp implements PostgreSQL's childless T_Result (nodeResult.c): it
+// evaluates Targets exactly once against an EMPTY input and emits exactly one
+// row, then EOF. The min/max rewrite (S6, rewriteMinMaxAggregates) uses it as
+// the top node whose sole target is a non-correlated SubqueryExpr feeding the
+// rewritten aggregate value (the InitPlan). A childless Result never calls a
+// child Open/Next/Close.
+//
+// M0071-0015 Stage E note: the returned slot ALIASES o.out, which is
+// overwritten only if Next() were called again — it isn't, because the first
+// Next() sets o.emitted and the second returns EOF. Consumers holding the slot
+// after the single Next() are safe.
+type resultOp struct {
+	targets []planner.Expr
+	schema  planner.Schema
+	ctx     *Context
+	out     Row
+	emitted bool
+	slot    MaterializedSlot
+}
+
+func newResultOp(plan *planner.Result) *resultOp {
+	return &resultOp{targets: plan.Targets, schema: plan.Output()}
+}
+
+func (o *resultOp) Open(ctx *Context) error {
+	o.ctx = ctx
+	o.emitted = false
+	if cap(o.out) < len(o.targets) {
+		o.out = acquireRow(len(o.targets))
+	} else {
+		o.out = o.out[:len(o.targets)]
+	}
+	return nil
+}
+
+func (o *resultOp) Schema() planner.Schema { return o.schema }
+
+func (o *resultOp) Close() error {
+	releaseRow(o.out)
+	o.out = nil
+	return nil
+}
+
+func (o *resultOp) Next() (TupleSlot, error) {
+	if o.emitted {
+		return nil, EOF
+	}
+	o.emitted = true
+	for i, t := range o.targets {
+		v, err := evalExpr(t, nil, o.ctx)
+		if err != nil {
+			return nil, err
+		}
+		o.out[i] = v
+	}
+	o.slot.schema = o.schema
+	o.slot.row = o.out
+	return &o.slot, nil
+}
+
 type filterOp struct {
 	child         Operator
 	pred          planner.Expr

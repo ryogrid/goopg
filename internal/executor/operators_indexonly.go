@@ -362,15 +362,28 @@ func (o *indexOnlyScanOp) pruneTouchedTempPages(ctx *Context, heapRel storage.Re
 }
 
 func (o *indexOnlyScanOp) Next() (TupleSlot, error) {
-	if o.idx >= len(o.rows) {
-		return nil, EOF
+	// S6 min/max rewrite: the IOS carries a residual `col IS NOT NULL` qual in
+	// Cond that could not be pushed into the btree probe (planagg.c pushes it as
+	// an index qual; goopg's probe is equality/range-shaped). Skip rows that do
+	// not satisfy it. Nil Cond means no filtering.
+	for o.idx < len(o.rows) {
+		r := o.rows[o.idx]
+		o.idx++
+		if o.plan.Cond != nil {
+			d, err := evalExpr(o.plan.Cond, r, o.ctx)
+			if err != nil {
+				return nil, err
+			}
+			if d.IsNull() || d.Kind != KindBool || !d.BoolValue() {
+				continue
+			}
+		}
+		// M0092-0007: stack-aliased slot reused across Next() calls.
+		o.slot.schema = o.Schema()
+		o.slot.row = r
+		return &o.slot, nil
 	}
-	r := o.rows[o.idx]
-	o.idx++
-	// M0092-0007: stack-aliased slot reused across Next() calls.
-	o.slot.schema = o.Schema()
-	o.slot.row = r
-	return &o.slot, nil
+	return nil, EOF
 }
 
 func (o *indexOnlyScanOp) Close() error {

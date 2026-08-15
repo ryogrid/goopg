@@ -538,7 +538,15 @@ func emitSubPlanSubtrees(rows *[]Row, detailIndent string, opts parser.ExplainOp
 			return
 		}
 		for _, sp := range pending {
-			line := detailIndent + fmt.Sprintf("SubPlan %d", sp.n)
+			// A non-correlated scalar SubqueryExpr is an InitPlan (upstream
+			// plan_name "InitPlan %d", rendered bare — see subPlanName); the
+			// rest keep the `SubPlan N` label. Same discriminator as
+			// subPlanName so the number and its subtree agree.
+			kind := "SubPlan"
+			if sq, ok := sp.expr.(*planner.SubqueryExpr); ok && sq.IsNonCorrelated {
+				kind = "InitPlan"
+			}
+			line := detailIndent + fmt.Sprintf("%s %d", kind, sp.n)
 			if s := spStats[sp.expr]; s != nil {
 				line += fmt.Sprintf(" (calls=%d rebuilds=%d rescans=%d hits=%d misses=%d)",
 					s.Calls, s.Rebuilds, s.Rescans, s.CacheHits, s.CacheMisses)
@@ -582,6 +590,20 @@ func emitNodeDetailLines(n planner.Node, indent string, verbose bool, rows *[]Ro
 	// (VERBOSE does not force prefixing here yet — see the deferral row.)
 	qualify := reg.names().qualify() && !explainIsScanNode(n)
 	switch p := n.(type) {
+	case *planner.Result:
+		// A childless Result's targets carry sublinks (the S6 min/max
+		// InitPlan). Non-verbose EXPLAIN prints no Output line for Result,
+		// but a target-only sublink must still be ASSIGNED here so
+		// emitSubPlanSubtrees (run right after this walker in
+		// walkPlanFiltered) prints its `InitPlan N` subtree under the
+		// Result label — the targets are the one place a sublink can live
+		// without a detail line, so nothing else would ever number it. The
+		// rendered text is discarded; only the assignment side effect
+		// (subPlanName → assign) is wanted. PG does the same structural
+		// walk through SS_process_sublinks/ExplainSubPlans.
+		for _, t := range p.Targets {
+			formatExprQual(t, reg, qualify)
+		}
 	case *planner.Gather:
 		// PG emits `Workers Planned:` in PLAIN EXPLAIN — it is a plan-time
 		// property. `Workers Launched:` is execution-time and belongs to the
@@ -620,6 +642,14 @@ func emitNodeDetailLines(n planner.Node, indent string, verbose bool, rows *[]Ro
 		}
 		if attachedFilter != nil {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+		}
+	case *planner.IndexOnlyScan:
+		// S6 min/max rewrite: the IOS's residual `col IS NOT NULL` qual is
+		// stored in Cond (it cannot be pushed into the btree probe) and
+		// rendered as an Index Cond, matching upstream's build_minmax_path
+		// which carries it as an index qual (planagg.c build_minmax_path).
+		if p.Cond != nil {
+			*rows = append(*rows, Row{NewStringDatum(indent + "Index Cond: " + wrapParen(formatExprQual(p.Cond, reg, qualify)))})
 		}
 	case *planner.Join:
 		// M0127-P2.1: render the join's equi-key list, upstream's
@@ -966,12 +996,22 @@ func (r *subPlanReg) takePending() []subPlanEntry {
 	return out
 }
 
-// subPlanName renders the `SubPlan N` token for e, matching
-// upstream's SubPlan.plan_name. Without a registry the number is
-// unknown, so the bare kind is printed instead of a wrong number.
+// subPlanName renders the plan-name token for e, matching upstream's
+// SubPlan.plan_name: a non-correlated scalar SubqueryExpr is an
+// InitPlan (`InitPlan %d` — subselect.c:3154 psprintf("InitPlan %d",
+// node->plan_id), rendered bare by ExplainSubPlans), everything else a
+// SubPlan (`SubPlan %d`). PG 18.3 emits the bare `InitPlan 1` with NO
+// `(returns $0)` suffix in every EXPLAIN mode; verified against the
+// committed expected/aggregates.out and a live PG 18.3 on 2026-08-15.
+// Without a registry the number is unknown, so the bare kind is
+// printed instead of a wrong number.
 func subPlanName(r *subPlanReg, e planner.Expr, plan planner.Node) string {
 	if n := r.assign(e, plan); n > 0 {
-		return fmt.Sprintf("SubPlan %d", n)
+		kind := "SubPlan"
+		if sq, ok := e.(*planner.SubqueryExpr); ok && sq.IsNonCorrelated {
+			kind = "InitPlan"
+		}
+		return fmt.Sprintf("%s %d", kind, n)
 	}
 	return "SubPlan"
 }
@@ -1682,6 +1722,10 @@ func describePlan(n planner.Node, nm *explainNames) string {
 		return "Sort"
 	case *planner.Limit:
 		return "Limit"
+	case *planner.Result:
+		// Childless projection (S6 min/max rewrite top node). PG's T_Result
+		// emits a bare `Result` label (explain.c, T_Result arm).
+		return "Result"
 	case *planner.Values:
 		return fmt.Sprintf("Values (%d rows)", len(p.Rows))
 	case *planner.Join:
@@ -1973,6 +2017,10 @@ func planChildren(n planner.Node) []planner.Node {
 	switch p := n.(type) {
 	case *planner.Project:
 		return []planner.Node{p.Child}
+	case *planner.Result:
+		// Childless Result (S6): the InitPlan hangs off the SubqueryExpr
+		// target, not a child scan, so the node renders no children.
+		return nil
 	case *planner.Filter:
 		return []planner.Node{p.Child}
 	case *planner.Sort:

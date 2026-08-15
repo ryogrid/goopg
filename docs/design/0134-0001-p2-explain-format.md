@@ -204,6 +204,112 @@ qualification/paren spelling (pre-existing `formatExprQual` style, identical to
 Sort Key/Output/Filter lines throughout the diff), (iv) plan shape (S6/S9/S10).
 No S5-introduced format regression.
 
+## S6 design (class 4) — resolved 2026-08-15 (research) + Slice 1 spec
+
+**Corrected measurements** (fresh `aggregates.diff`, 1534 lines): 17 min/max EXPLAIN
+blocks (region lines 86-502) = **19 `InitPlan` + 29 `Index Only Scan`** (18 Backward +
+11 forward), not the parent note's stale "25 + 32". Two further IOC lines (btg) and
+one Parallel-IOC are not min/max. Blocks 15/16 (MergeAppend of 4 IOCs each) are
+additionally blocked by an unrelated partial-index creation bug
+(`minmaxtest3i ... where f1 is not null` → "column ref f1/0 on nil slot").
+
+**Go/no-go (research verdict):** GO for the **forward (min) half** on existing infra
+plus two additions; **NO for the Backward (max) half** until a backward-scan
+capability is built. goopg's `SubqueryExpr{IsNonCorrelated}` already gives InitPlan
+once-per-statement runtime semantics (`subplan.go:21-25`, `expr.go:7455`), but there
+is **no plan-node InitPlan, no `Result` node, and no backward index scan**.
+
+**Three missing pieces (all new work):**
+1. **`Result` node** — PG's top is a childless `Result`; goopg has none. Needs a
+   `Result{Targets, schema}` plan node + a `resultOp` (emit exactly one row).
+2. **bare `InitPlan N` EXPLAIN** — PG 18.3 renders `sp->plan_name` with NO
+   `(returns $N)` suffix (`explain.c` has no `returns` string at all;
+   `ExplainNode(..., sp->plan_name, ...)` at `explain.c:4807`). `subPlanName`/
+   `emitSubPlanSubtrees` hardcode `SubPlan %d` (`operators_explain.go:541,972`);
+   subplans are only assigned from detail lines, so a target-only `SubqueryExpr`
+   is never rendered.
+3. **Backward index scan** — 18/29 IOC lines need it; no direction field on scan
+   nodes and a forward-only btree (`pathindexcarrier.go:60-61` "only direction goopg
+   emits").
+
+**Decomposition (3 slices):**
+- **Slice 1 — gating + forward shape** (this loop): `Result` node + `resultOp` +
+  `Result`/InitPlan EXPLAIN + `rewriteMinMaxAggregates` hook. Closes the 11 forward
+  lines (blocks 1, 7, 8, forward children of 15/16).
+- **Slice 2 — Backward:** btree backward range scan + scan-node direction field +
+  `Index Only Scan Backward` render. Closes the 18 Backward lines.
+- **Slice 3 — edge cases:** constant `max(100)` (block 14), inheritance/MergeAppend
+  (blocks 15/16 + partial-index bug), scalar-subquery nesting (blocks 8/17, class-8),
+  ORDER BY/distinct above InitPlan.
+
+**Slice 1 design (forward half):**
+
+- **Plan node** (`internal/planner/plan.go`): `Result{Targets []Expr, schema Schema,
+  pos}` — childless. Executor `resultOp` (`internal/executor/operators.go`): one row,
+  eval `Targets` into the projected schema.
+- **Rewrite hook** (`internal/planner/planner.go`, `planSelect` ~1241-1244, before
+  `needsAggregateStage`): `rewriteMinMaxAggregates` mirroring `planagg.c:73`
+  gating — no GROUP BY / no HAVING / no window / single RangeTblRef RTE; per-agg
+  `can_minmax_aggs` (1 arg, no ORDER BY, no FILTER, no DISTINCT, non-mutable arg,
+  `fetch_agg_sort_op` valid). **Slice 1 fires only for the ASC (min) direction** —
+  the DESC (max) direction needs Backward (Slice 2), so max targets stay on the
+  existing `Aggregate` path for now.
+- **Shape per min agg:** `SubqueryExpr{IsNonCorrelated:true}` wrapping
+  `Limit{Limit:IntegerConst(1)}` → cheapest `IndexOnlyScan` (via
+  `findBTreeIndexForColumn`, `planner.go:8444`) or `SeqScan` fallback, with the
+  original WHERE qual and a `col IS NOT NULL` conjunct; subquery tlist = the raw
+  arg column. Top = `Result{Targets:[ExecParamRef]}` fed by the InitPlan Param.
+- **EXPLAIN** (`operators_explain.go`): `describePlan` case `Result`; bare
+  `InitPlan %d` label; assign subplans from the Result's targets (a target-only
+  `SubqueryExpr` must get an ID and a subtree, not be dropped).
+
+**Correctness invariants (Slice 1 must preserve):** empty/all-NULL input → InitPlan
+returns NULL → `Result` emits NULL (identical to the current `Aggregate` path);
+WHERE quals propagate verbatim into the subquery; the rewrite is a **shape-only**
+transform — it must never change a result row or value, only the plan text. Gate the
+rewrite to fire only when the chosen path is a forward-ordered IndexOnlyScan/SeqScan,
+leaving every other case on the existing `Aggregate` path untouched.
+
+**Slice 1 acceptance:** `scripts/pg-regress-runner.sh aggregates` closes blocks 1/7/8
+(forward IOC + SeqScan-fallback min/max); blocks 2-6/9-17 unchanged (Backward/edge —
+Slice 2/3). `scripts/tpch-spotcheck.sh` PASS (planner change). Units + pre-commit
+pgbench smoke PASS.
+
+## S6 Slice 1 — landed 2026-08-15 (forward/min rewrite)
+
+Shipped: `Result` node (`plan.go`) + `resultOp` (`operators.go`) + `Result`/bare
+`InitPlan N` EXPLAIN (`operators_explain.go`) + `IndexOnlyScan.Cond` residual
+(`operators_indexonly.go`) + `rewriteMinMaxAggregates` hook (`planner.go:planSelect`,
+before `needsAggregateStage`). Gating mirrors `planagg.c:73` (rejects GROUP
+BY / HAVING / window / DISTINCT / ORDER BY / LIMIT / multi-agg / expression-arg /
+non-plain-relation / WHERE-correlation; `max` stays on Aggregate → Slice 2). 5 unit
+tests (`internal/planner/minmax_rewrite_test.go`).
+
+**Two spec corrections (both verified against the oracle):**
+1. **Bare `InitPlan 1`, not `InitPlan 1 (returns $0)`** — PG 18.3 `explain.c` has no
+   `returns` suffix; `ExplainNode(..., sp->plan_name, ...)` at `explain.c:4807`
+   renders the bare name, and the committed `aggregates.out` shows `InitPlan 1`
+   (lines 943/960/977/994/…). The researcher's `(returns $0)` was wrong.
+2. **`Result.Targets = [SubqueryExpr]`, not `[ExecParamRef]`** — goopg's non-correlated
+   `SubqueryExpr` + `evalSubquery` constant-key cache already implements
+   InitPlan-once semantics (`expr.go` evalSubquery; `subplan.go` header); an
+   `ExecParamRef` indirection would be a needless deeper refactor. `resultOp`
+   evaluates the SubqueryExpr target directly.
+
+**Measured result (`scripts/pg-regress-runner.sh aggregates`, 1534→1537 lines, zero
+regressions):** blocks 1/7 now emit `Result`/`InitPlan 1`/`-> Limit` matching PG, but
+the scan line diverges (`Sort → SeqScan` + `Filter` vs `Index Only Scan`) because
+(a) the goopg regress runner does **not** run `create_index.sql`, so `tenk1` has no
+btree index (SeqScan fallback is the correct behavior), and (b) `findBTreeIndexForColumn`
+matches only a LEADING column, so `min(tenthous) WHERE thousand=33` declines the
+composite `thous_tenthous`. Backward blocks 2-6/9-17 (max) and correlated block 8 are
+unchanged (Slice 2/3). `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=35).
+
+**Remaining for S6:** Slice 2 (backward index scan — new capability, closes 18 lines),
+Slice 3 (constant `max(100)`, composite-prefix probing, inheritance MergeAppend +
+partial-index bug, class-8 outer-subplan rendering). Deferral-ledger row appended for
+composite-prefix probing.
+
 ## Cross-case relevance
 
 Every M0134 regress case whose `.sql` emits `EXPLAIN` inherits the formatter
