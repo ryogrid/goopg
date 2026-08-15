@@ -605,11 +605,53 @@ goopg-legal-but-PG-illegal case (behavioral-probe CASE A: `UNIQUE(b)` on
 `PARTITION BY LIST(a)` returns 2 rows, no collapse). The DDL gap is recorded in the
 deferral ledger (partitioned-unique-index enforcement).
 
-**Residuals (next-slice candidates, not this slice):** the multi-relation arm of
-`initsplan.c:412` (d463/d1234 — iterate every RTE_RELATION); a stricter-than-PG
+**Residuals (next-slice candidates, not this slice):** a stricter-than-PG
 `GROUPING()` guard (misses a prune for `GROUPING()` under plain GROUP BY — fail-closed,
 unexercised); index tie-break iterates name-sorted `IndexesOnTable` vs PG's OID order
-(plan-shape-only).
+(plan-shape-only). **The "multi-relation arm of initsplan.c:412" is NOT a closing
+residual for aggregates.sql — scoping verified 2026-08-15.** Every remaining
+multi-relation GROUP BY divergence (`btg t1 JOIN btg t2 … GROUP BY t1.w,t1.z,t1.x`;
+`group_agg_pk c1 JOIN c2 … GROUP BY c1.y,c1.x,c2.x` and its sibling) is over tables
+with NO qualifying unique index (`btg`'s indexes are non-unique, `group_agg_pk` is a
+`CREATE TABLE AS`). PG closes them via equivalence-class redundancy (dropping the
+join-equal `c2.x`) plus pathkey reordering (`Group Key:` emitted in access-path order)
+plus `GroupAggregate`-over-Sort — i.e. class 6/9 strategy (S8), not the unique-index
+prune. Generalising `pruneUselessGroupByColumns` to iterate every RTE would therefore
+close ZERO aggregates.diff hunks; it is correct PG-faithful behaviour but lands with no
+observable delta in this case, so it is parked until a case that exercises it (a
+multi-relation GROUP BY over a PK'd relation) appears.
+
+## S10a — landed 2026-08-15 (refuse to split user aggregates)
+
+**Design (class 9a correctness bug):** `AggregateIsDecomposable`
+(`internal/planner/parallel_agg.go:28`) accepted any user aggregate declaring a
+COMBINEFUNC (`call.UserAgg.CombineFunc != ""`), but the executor's
+`combineAggRuntime` (`internal/executor/parallel_agg_combine.go:53`) has combine rules
+for builtin names only — its `default:` arm errors
+`no combine rule for aggregate "balk"`. The `balk` aggregate (`COMBINEFUNC=balkifnull`
++ `PARALLEL=SAFE`, aggregates.sql:1392) therefore split in the planner and errored in
+the executor where PG returns one row. Fix: `AggregateIsDecomposable` now returns
+`false` for `call.UserAgg != nil` (fail-closed), because `combineAggRuntime` deep-merges
+the typed `aggRuntime` fields, not transition-state datums, so there is no rule to invoke
+a user combinefunc. Re-pinned `TestAggregateIsDecomposableWhitelist` (the
+"user aggregate declaring COMBINEFUNC" case moves from decomposable to refused).
+
+**Measured result (`scripts/pg-regress-runner.sh aggregates`, 1390→1387 lines):** the
+`+ERROR: internal error: no combine rule for aggregate "balk"` block is gone;
+`SELECT balk(hundred) FROM tenk1` returns NULL, byte-matching PG
+(`aggregates.out:2928-2932`). `EXPLAIN … balk` now emits a serial `Aggregate → Gather →
+Seq Scan` where PG emits `Finalize → Gather → Partial Aggregate → Parallel Index Only
+Scan` — the expected out-of-scope plan-shape divergence (S10b user-combinefunc + the
+parallel-index-scan gap). Baseline-diff proof: the ONLY content change vs pre-change HEAD
+is the balk hunk (error→matching result, parallel→serial plan); no PASS→FAIL regression.
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=35 — no-op for builtins);
+`go test ./internal/planner/ ./internal/executor/` PASS.
+
+**Deferral (ledger row):** PG splits parallel-safe user aggregates and combines by
+INVOKING the user combinefunc (`nodeAgg.c` advance_combine_function); goopg refuses
+because `combineAggRuntime` has no user-transition-state datum path. Re-enabling
+requires storing each user aggregate's transition state as a datum and invoking
+`UserAgg.CombineFunc` in `combineAggRuntime` — S10b.
 
 ## Cross-case relevance
 
