@@ -70,7 +70,7 @@ reorder robustness; deferred, see the ledger.)
 | C5 | btree-inet rejected | `btreeKeyTypeRejectionError` | `nbtree`/`amcheck` | executor |
 | C6 | catalog gaps (pg_type array rows, pg_trigger FK rows, pg_locks) | catalog build | `pg_*.dat` | catalog |
 | C7 | constraint naming/rendering (`con1` ignored, `CHECK ((a>10.2))` double-parens, partition-child index `_0_key` vs `_0_id_name_key`) | `operators_ddl.go`/explain | `tablecmds.c`/`ruleutils.c` | formatter |
-| C8 | system columns unmodeled (`ADD COLUMN xmin` accepted) | DDL | `tablecmds.c` | correctness |
+| C8 | ~~system columns unmodeled (`ADD COLUMN xmin` accepted)~~ **LANDED** — a case-sensitive `isSystemColumn` helper (ctid/xmin/cmin/xmax/cmax/tableoid, no `oid`) rejects at all four entry points with 42701 + the PG-exact message | `execCreateTable`/`execCreateTableAs`/`execAlterTableAddColumn` + the RENAME arm (`operators_ddl.go`); `validatePartitionKey` reuses the helper (one name-list source). RENAME check corrected: 42P20→42701, `oid` dropped, case-sensitive | `tablecmds.c:7673` `check_for_column_name_collision` (ADD/RENAME) + `heap.c:481` `CheckAttributeNamesTypes` (CREATE/CTAS); `SysAtt[]` `heap.c:144-228` | correctness |
 | C9 | inheritance semantics (inherited CHECK/NOT-NULL not enforced on children, `attinhcount` diverges) | DDL | `tablecmds.c` | correctness |
 | C10 | ALTER TYPE (**data loss**: failed int8→int4 leaves table EMPTY, `internal error: expected int, got kind 1`) | `ATExecAlterColumnType` path | `tablecmds.c` | correctness |
 | C11 | view-DML (`to_json` missing, `CREATE OR REPLACE VIEW` not propagating to dependents, ALTER-on-view accepted) | view_dml.go | `rewriteHandler.c` | correctness |
@@ -86,8 +86,10 @@ dependency order: C1 (`||` operator — **LANDED 2026-08-15**, the array-op type
 check), then C15 (`col_description` builtin — the second `\d+` blocker that
 surfaced once C1 was fixed, **LANDED 2026-08-15**, commit `044057b9`; the 12
 `col_description` errors are gone and the previously-masked describe output now
-renders), then C2 grammar
-cluster (largest), then the correctness classes C3/C4/C8/C9/C10/C11 each with
+renders), then C8 (system-column name rejection — **LANDED 2026-08-15**, commit
+`0f6945bc`: the case-sensitive `isSystemColumn` helper applied at all four
+entry points), then C2 grammar
+cluster (largest), then the correctness classes C3/C4/C9/C10/C11 each with
 their own deferral rows.
 
 ## Secondary finding (corrects deferral-ledger row 1385)
