@@ -534,6 +534,44 @@ func TestParseAlterTableAddNotNull(t *testing.T) {
 	}
 }
 
+// TestParseAlterTableAddCheckNoInherit covers the `ALTER TABLE ... ADD
+// [CONSTRAINT name] CHECK (expr) [NO INHERIT]` trailer (connoinherit='t').
+// PG's ConstraintAttributeSpec is order-independent, so NO INHERIT may precede
+// or follow the NOT VALID/[NOT] ENFORCED block — alter_table.sql:420 has
+// `check (a = 2) no inherit not valid` and :309/663/670/1582 trail a bare
+// ` NO INHERIT`. M0134-0002 C2.
+func TestParseAlterTableAddCheckNoInherit(t *testing.T) {
+	for _, tc := range []struct {
+		sql           string
+		wantNoInherit bool
+		wantNotValid  bool
+	}{
+		{"ALTER TABLE t ADD CONSTRAINT c CHECK (x > 0) NO INHERIT", true, false},
+		{"ALTER TABLE t ADD CONSTRAINT c CHECK (x > 0)", false, false},
+		{"ALTER TABLE t ADD CONSTRAINT c CHECK (a = 2) NO INHERIT NOT VALID", true, true},
+		{"ALTER TABLE t ADD CONSTRAINT c CHECK (a = 2) NOT VALID NO INHERIT", true, true},
+	} {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T", tc.sql, stmts[0])
+		}
+		if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableAddCheck {
+			t.Fatalf("Parse(%q): actions=%+v", tc.sql, at.Actions)
+		}
+		a := at.Actions[0]
+		if a.NoInherit != tc.wantNoInherit {
+			t.Errorf("Parse(%q): NoInherit=%v want %v", tc.sql, a.NoInherit, tc.wantNoInherit)
+		}
+		if a.NotValid != tc.wantNotValid {
+			t.Errorf("Parse(%q): NotValid=%v want %v", tc.sql, a.NotValid, tc.wantNotValid)
+		}
+	}
+}
+
 // TestParseCreateTableColumnCompression covers the inline `COMPRESSION <method>`
 // clause in a CREATE TABLE column definition (`a text COMPRESSION lz4`), which
 // threads the method onto ColumnDef.Compression. DU-002 slice 183.

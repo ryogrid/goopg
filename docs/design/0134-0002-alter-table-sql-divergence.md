@@ -108,13 +108,26 @@ parser's ADD COLUMN arm now consumes `IF NOT EXISTS` via `acceptKeyword(KwIf)`
 sets `AlterTableAction.IfExists`; `execAlterTableAddColumn` emits PG's NOTICE
 `column "c" of relation "r" already exists, skipping` and skips instead of
 raising 42701. 8 syntax-error sites closed (88→80), NOTICE byte-exact, diff
-4645→4602. Remaining C2 sub-gaps, ranked by error-site count ÷ risk: NO INHERIT
-trailer (7), TYPE…USING (11, C10-entangled), RENAME CONSTRAINT (11, C7-partial),
-comma multi-action (7, structural), RENAME `<col>` TO bare (3), ANALYZE tab(col)
-(4, re-route — it is an ANALYZE/VACUUM statement gap, not ALTER TABLE), NOT
-VALID trailer (2), STORAGE (2), OF/NOT OF (3), DROP COLUMN IF EXISTS (1, one-line
-`acceptKeyword(KwIf)`), DROP CONSTRAINT IF EXISTS (1), SET WITHOUT OIDS (1),
-ENFORCED dup (1, C9-masked).
+4645→4602.
+
+**Second slice landed (2026-08-16): `NO INHERIT` trailer** — the parser's ADD
+[CONSTRAINT] CHECK arm now consumes `NO INHERIT` at both orderings (PG's
+ConstraintAttributeSpec is order-independent: `check (a=2) no inherit not valid`
+and trailing `NO INHERIT`) via `acceptIdentKeyword("no")`/`"inherit"` (the
+column/table/NOT-NULL sibling pattern), setting `AlterTableAction.NoInherit`;
+`execAlterTable` threads `act.NoInherit` into `AddCheckFull` and raises 42P16
+`cannot add NO INHERIT constraint to partitioned table %q` on a partitioned
+target (mirrors the CREATE TABLE sibling). 7 syntax-error sites closed (80→73);
+partitioned ERROR byte-matches PG. Unmasked two C3-class gaps (ADD CONSTRAINT
+CHECK without NOT VALID does not validate existing rows; INSERT/UPDATE does not
+enforce CHECK at runtime) — recorded in the deferral ledger, not closed here.
+
+Remaining C2 sub-gaps, ranked by error-site count ÷ risk: TYPE…USING (11,
+C10-entangled), RENAME CONSTRAINT (11, C7-partial), comma multi-action (7,
+structural), RENAME `<col>` TO bare (3), ANALYZE tab(col) (4, re-route — it is
+an ANALYZE/VACUUM statement gap, not ALTER TABLE), NOT VALID trailer (2), STORAGE
+(2), OF/NOT OF (3), DROP COLUMN IF EXISTS (1, one-line `acceptKeyword(KwIf)`),
+DROP CONSTRAINT IF EXISTS (1), SET WITHOUT OIDS (1), ENFORCED dup (1, C9-masked).
 
 ## Secondary finding (corrects deferral-ledger row 1385)
 

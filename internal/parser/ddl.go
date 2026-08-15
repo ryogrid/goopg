@@ -9502,6 +9502,16 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		// over NOT VALID in the rendered text). DU-002 slice 430.
 		notValid := false
 		notEnforced := false
+		noInherit := false
+		// Accept optional NO INHERIT trailer (connoinherit='t'). PG's
+		// ConstraintAttributeSpec (gram.y) is order-independent, so NO INHERIT
+		// may precede OR follow the NOT VALID/[NOT] ENFORCED block — consume at
+		// both points. alter_table.sql has `check (a = 2) no inherit not valid`
+		// (:420) and trailing ` NO INHERIT` (:309/663/670/1582). M0134-0002 C2.
+		if p.acceptIdentKeyword("no") {
+			_ = p.acceptIdentKeyword("inherit")
+			noInherit = true
+		}
 		if p.acceptKeyword(KwNot) {
 			if !p.acceptIdentKeyword("valid") {
 				if p.acceptIdentKeyword("enforced") { // NOT ENFORCED
@@ -9521,10 +9531,16 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		} else {
 			_ = p.acceptIdentKeyword("enforced") // bare ENFORCED
 		}
+		// NO INHERIT may also trail the NOT VALID/[NOT] ENFORCED block.
+		if p.acceptIdentKeyword("no") {
+			_ = p.acceptIdentKeyword("inherit")
+			noInherit = true
+		}
 		act.Kind = AlterTableAddCheck
 		act.CheckExpr = expr
 		act.NotValid = notValid
 		act.CheckNotEnforced = notEnforced
+		act.NoInherit = noInherit
 		return act, nil
 	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
 		// ADD [CONSTRAINT name] UNIQUE (cols) [INCLUDE (incl)] — create a unique index.

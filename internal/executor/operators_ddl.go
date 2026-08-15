@@ -7678,12 +7678,19 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// (the latent virtual-table join crash was fixed in
 			// M0097-0023-loop34). M0097-0023.
 			if act.CheckExpr != "" {
+				// PG18: NO INHERIT constraints cannot be added to partitioned
+				// tables — ATAddCheckConstraint raises 42P16
+				// (tablecmds.c). Mirrors the CREATE TABLE sibling above
+				// (same Code 42P16, same message, same %q). M0134-0002 C2.
+				if act.NoInherit && tbl.PartitionKey != nil {
+					return &ExecError{Code: "42P16", Pos: act.Pos(), Message: fmt.Sprintf("cannot add NO INHERIT constraint to partitioned table %q", tbl.Name)}
+				}
 				// act.CheckNotEnforced carries an `ADD CONSTRAINT ... CHECK
 				// (...) NOT ENFORCED` (PG18) so the dumped constraintdef
 				// re-emits the ` NOT ENFORCED` suffix (taking precedence over
 				// NOT VALID) and pg_constraint reports conenforced=false.
 				// DU-002 slice 430.
-				tbl.AddCheckFull(act.ConstraintName, act.CheckExpr, o.allocConstraintOID(act.ConstraintName), act.NotValid, false, act.CheckNotEnforced)
+				tbl.AddCheckFull(act.ConstraintName, act.CheckExpr, o.allocConstraintOID(act.ConstraintName), act.NotValid, act.NoInherit, act.CheckNotEnforced)
 				// Propagate to partition children: merge if child already has the
 				// same constraint (locally defined), otherwise inherit it. M0097-0023.
 				if im3, ok3 := o.ctx.Catalog.(*catalog.InMemory); ok3 {

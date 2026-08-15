@@ -160,3 +160,76 @@ func TestCheckConstraintPlainNotValidStillRendersNotValid(t *testing.T) {
 		t.Errorf("pg_get_constraintdef = %q, must not print NOT ENFORCED for a plain NOT VALID constraint", def)
 	}
 }
+
+// TestCheckConstraintNoInheritAlterTable verifies M0134-0002 C2: an `ALTER
+// TABLE ... ADD [CONSTRAINT name] CHECK (...) NO INHERIT` is threaded onto
+// catalog.NamedCheckConstraint.NoInherit (AddCheckFull already stores the
+// flag, so no new catalog field), surfaces as pg_constraint.connoinherit='t'
+// and a pg_get_constraintdef ` NO INHERIT` tail, and is rejected on a
+// partitioned table with PG's exact 42P16 error ("cannot add NO INHERIT
+// constraint to partitioned table", tablecmds.c ATAddCheckConstraint).
+func TestCheckConstraintNoInheritAlterTable(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	// (a) Non-partitioned target: NO INHERIT succeeds and is recorded.
+	if err := runDDL(t, ctx, `CREATE TABLE ni_t (id integer, val integer)`); err != nil {
+		t.Fatalf("CREATE TABLE ni_t: %v", err)
+	}
+	if err := runDDL(t, ctx, `ALTER TABLE ni_t ADD CONSTRAINT ni_chk CHECK (val > 0) NO INHERIT`); err != nil {
+		t.Fatalf("ALTER TABLE ni_t ADD CONSTRAINT: %v", err)
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "ni_t"})
+	if !ok {
+		t.Fatal("ni_t table not found")
+	}
+	if len(tbl.NamedChecks) != 1 || tbl.NamedChecks[0].Name != "ni_chk" {
+		t.Fatalf("expected 1 named check ni_chk, got %+v", tbl.NamedChecks)
+	}
+	if !tbl.NamedChecks[0].NoInherit {
+		t.Fatalf("expected NamedChecks[0].NoInherit=true, got %+v", tbl.NamedChecks[0])
+	}
+
+	pgcon, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_constraint"})
+	if !ok || pgcon.VirtualRows == nil {
+		t.Fatal("pg_constraint virtual table not found")
+	}
+	var oid string
+	for _, r := range pgcon.VirtualRows() {
+		if r[3] == "c" && r[1] == "ni_chk" {
+			oid = r[0]
+			if r[17] != "t" {
+				t.Errorf("connoinherit = %q, want t", r[17])
+			}
+		}
+	}
+	if oid == "" {
+		t.Fatal("no pg_constraint row for ni_chk")
+	}
+	rows := runQuery(t, ctx, `SELECT pg_get_constraintdef(`+oid+`::oid)`)
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row from pg_get_constraintdef, got %d", len(rows))
+	}
+	if def := rows[0][0].StringValue(); !strings.Contains(def, "NO INHERIT") {
+		t.Errorf("pg_get_constraintdef = %q, want it to contain NO INHERIT", def)
+	}
+
+	// (b) Partitioned target: rejected with PG's exact 42P16 error.
+	if err := runDDL(t, ctx, `CREATE TABLE ni_pt (id integer, val integer) PARTITION BY RANGE (id)`); err != nil {
+		t.Fatalf("CREATE TABLE ni_pt: %v", err)
+	}
+	err := runDDL(t, ctx, `ALTER TABLE ni_pt ADD CONSTRAINT ni_pt_chk CHECK (val > 0) NO INHERIT`)
+	if err == nil {
+		t.Fatal("NO INHERIT CHECK on a partitioned table should fail")
+	}
+	ee, ok := err.(*ExecError)
+	if !ok {
+		t.Fatalf("expected *ExecError, got %T: %v", err, err)
+	}
+	if ee.Code != "42P16" {
+		t.Errorf("Code = %q, want 42P16", ee.Code)
+	}
+	if want := `cannot add NO INHERIT constraint to partitioned table "ni_pt"`; ee.Message != want {
+		t.Errorf("Message = %q, want %q", ee.Message, want)
+	}
+}
