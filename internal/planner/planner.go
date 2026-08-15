@@ -8650,11 +8650,96 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 		inner = &Limit{pos: pos, Child: ios, Limit: &IntegerConst{pos: pos, Value: 1}}
 	}
 
+	// Composite-prefix branch (S6 Slice 3c, ledger row 1371): a btree index
+	// whose FIRST columns are bound by WHERE `col = const` equalities and whose
+	// NEXT column is the agg column supplies the sorted path for free —
+	// `min(tenthous) WHERE thousand = 33` over tenk1_thous_tenthous (block 6).
+	// build_minmax_path (planagg.c:316) is generic: the prefix equality makes
+	// the leading pathkey EC_MUST_BE_REDUNDANT (pathkeys.c:158-178,
+	// pathnodes.h:1473), so the ORDER BY pathkeys begin at the agg column — a
+	// non-leading agg column works exactly when a WHERE equality binds the
+	// leading prefix.
 	if inner == nil {
-		// SeqScan fallback: no qualifying index (findBTreeIndexForColumn only
-		// matches a LEADING column, so block 7's `min(tenthous) WHERE
-		// thousand=33` cannot use thous_tenthous — that composite-prefix probe is
-		// Slice 3), or a WHERE qual referencing a non-covered column. Build the
+		if idx, prefixQuals, k, ok := findCompositePrefixIndexForColumn(cat, tbl, argCR.Name, wherePred); ok {
+			// Covered + ios.schema in index-column order idx.Columns[0..k] —
+			// the prefix columns then the agg column, each at SourceTableIdx 1
+			// (the fresh inner scan's own single source). The agg column's type
+			// is the already-computed colType; prefix types come from the catalog.
+			coveredCols := make([]catalog.Column, 0, k+1)
+			iosSchema := make(Schema, 0, k+1)
+			remap := make(map[string]int, k+1)
+			for i := 0; i <= k; i++ {
+				name := idx.Columns[i]
+				colTypeForName := colType
+				if name != argCR.Name {
+					col, ok := cat.LookupColumn(tbl, name)
+					if !ok {
+						return nil, false, nil
+					}
+					colTypeForName = col.Type
+				}
+				coveredCols = append(coveredCols, catalog.Column{Name: name, Type: colTypeForName})
+				iosSchema = append(iosSchema, SchemaColumn{Name: name, Type: colTypeForName, SourceTableIdx: 1})
+				remap[name] = i
+			}
+			// isNotNullIOSAtK: the agg col's `IS NOT NULL` at its covered
+			// position k — NOT the Slice 3b Index-0 isNotNullIOS (the prefix
+			// columns now occupy covered positions 0..k-1).
+			isNotNullIOSAtK := &IsNullExpr{pos: pos, Operand: &ColumnRef{
+				pos: pos, Index: k, Name: argCR.Name, Type: argCR.Type,
+				SourceTableIdx: 1,
+			}, Negated: true}
+			// Remap each prefix qual's ColumnRefs from the resolver-schema
+			// (table-column) positions to the covered-row positions 0..k-1.
+			// findCompositePrefixIndexForColumn's allEq + len(eqs)==k gates
+			// prove every ref is a prefix column, so remapColumnRefsToSchema's
+			// silent-Index-0 fallback (a name missing from the remap) is never
+			// hit.
+			remapped := make([]Expr, len(prefixQuals))
+			for i, q := range prefixQuals {
+				remapped[i] = remapColumnRefsToSchema(q, ctx.schema, remap)
+			}
+			// Conjunct order: prefix quals LEFT, `IS NOT NULL` RIGHT — the
+			// reverse of Slice 3b's single-col order (isNotNull LEFT), matching
+			// the oracle's `Index Cond: ((thousand = 33) AND (tenthous IS NOT
+			// NULL))` (aggregates.out:1052-1057).
+			var cond Expr
+			if k == 1 {
+				cond = andExpr(pos, remapped[0], isNotNullIOSAtK)
+			} else {
+				combined := remapped[0]
+				for _, q := range remapped[1:] {
+					combined = andExpr(pos, combined, q)
+				}
+				cond = andExpr(pos, combined, isNotNullIOSAtK)
+			}
+			ios := &IndexOnlyScan{
+				pos:      pos,
+				Table:    tbl,
+				Index:    idx,
+				Covered:  coveredCols,
+				Cond:     cond,
+				Backward: isMax,
+				schema:   iosSchema,
+			}
+			// The k+1-wide covered row must be sliced down to the agg column so
+			// the InitPlan emits exactly one column. The Project sits ABOVE the
+			// IOS and BELOW the Limit, mirroring the SeqScan fallback's
+			// invisible Project (walkPlanFiltered skips Project wrappers), so
+			// the rendered shape stays `Limit -> Index Only Scan` as upstream.
+			proj := &Project{pos: pos, Child: ios,
+				Targets: []Expr{&ColumnRef{pos: pos, Index: k, Name: argCR.Name,
+					Type: argCR.Type, SourceTableIdx: 1}},
+				schema: Schema{{Name: argCR.Name, Type: colType, SourceTableIdx: 1}}}
+			inner = &Limit{pos: pos, Child: proj, Limit: &IntegerConst{pos: pos, Value: 1}}
+		}
+	}
+
+	if inner == nil {
+		// SeqScan fallback: no qualifying index — neither the leading-column
+		// findBTreeIndexForColumn (which matches only when idx.Columns[0] is the
+		// agg column) nor the composite findCompositePrefixIndexForColumn
+		// matched — or a WHERE qual referencing a non-covered column. Build the
 		// full sorted plan.
 		seqSchema := tableSchemaWithSource(tbl, 1)
 		seq := &SeqScan{pos: pos, Table: tbl, schema: seqSchema}
@@ -8805,6 +8890,114 @@ func findBTreeIndexForColumn(cat catalog.Catalog, tbl *catalog.Table, col string
 		}
 	}
 	return composite
+}
+
+// collectEqualityConjuncts AND-walks a RESOLVED (planner.Expr) WHERE qual and
+// returns, per bound column NAME, the `col = const` (or `const = col`) BinaryOp
+// conjunct. allEq is true only when EVERY conjunct in the AND-chain has that
+// shape — the S6 Slice 3c safety gate: a non-equality conjunct (a range, an
+// `IS NOT NULL`, a multi-column compare) would reference a column the composite
+// Index Only Scan does not decode, so the rewrite must decline rather than
+// silently drop it. A nil qual is vacuously all-equal (an empty map) — the
+// caller then sees k=0 and declines anyway (the leading-column branch already
+// handled the no-WHERE case).
+func collectEqualityConjuncts(e Expr) (map[string]Expr, bool) {
+	eqs := make(map[string]Expr)
+	if e == nil {
+		return eqs, true
+	}
+	var walk func(e Expr) bool
+	walk = func(e Expr) bool {
+		if b, ok := e.(*BinaryOp); ok && b.Op == parser.OpAnd {
+			return walk(b.Left) && walk(b.Right)
+		}
+		b, ok := e.(*BinaryOp)
+		if !ok || b.Op != parser.OpEq {
+			return false
+		}
+		var cr *ColumnRef
+		var constSide Expr
+		if c, ok := b.Left.(*ColumnRef); ok {
+			cr, constSide = c, b.Right
+		} else if c, ok := b.Right.(*ColumnRef); ok {
+			cr, constSide = c, b.Left
+		} else {
+			return false
+		}
+		if !isConstantExpr(constSide) {
+			return false
+		}
+		// A second `col = const` on the same column (`x = 33 AND x = 44`) would
+		// silently collapse under last-write-wins map semantics and drop one
+		// conjunct — the rewrite would then return the min over the surviving
+		// bound where PG's full-qual evaluation returns NULL (contradiction).
+		// Declining (allEq=false) sends the query to the SeqScan fallback, which
+		// evaluates the full qual verbatim. Conservatively declines the harmless
+		// `x = 33 AND x = 33` duplicate too.
+		if _, dup := eqs[cr.Name]; dup {
+			return false
+		}
+		eqs[cr.Name] = b
+		return true
+	}
+	return eqs, walk(e)
+}
+
+// findCompositePrefixIndexForColumn accepts a btree index whose FIRST k columns
+// are each equality-bound by the WHERE qual and whose NEXT column is the agg
+// column — `min(tenthous) WHERE thousand = 33` over tenk1_thous_tenthous. This
+// is build_minmax_path's non-leading agg column case: the prefix equality makes
+// the leading pathkey EC_MUST_BE_REDUNDANT (pathkeys.c:158-178,
+// pathnodes.h:1473), so the index's sort order begins at the agg column. The
+// agg column must be the LAST column (k+1 == len(idx.Columns)); trailing-column
+// indexes are out of scope and fall back to the SeqScan, safe. Mirrors
+// findBTreeIndexForColumn's declensions: non-btree and partial (unproven
+// predicate) indexes are skipped. Returns the index, the prefix quals in
+// index-column order, the prefix length k, and ok.
+func findCompositePrefixIndexForColumn(cat catalog.Catalog, tbl *catalog.Table, aggCol string, wherePred Expr) (*catalog.Index, []Expr, int, bool) {
+	if wherePred == nil {
+		return nil, nil, 0, false
+	}
+	eqs, allEq := collectEqualityConjuncts(wherePred)
+	// allEq=false: a non-equality conjunct references a column the IOS does not
+	// decode. len(eqs)!=k (checked per-index below): an equality on a column
+	// OUTSIDE the bound prefix would be silently dropped from the Cond. Both
+	// decline to the SeqScan fallback (safe).
+	if !allEq {
+		return nil, nil, 0, false
+	}
+	for _, idx := range cat.IndexesOnTable(tbl) {
+		if strings.ToLower(idx.Method) != "btree" {
+			continue
+		}
+		if idx.HasPredicate {
+			continue
+		}
+		k := 0
+		for k < len(idx.Columns) && eqs[idx.Columns[k]] != nil {
+			k++
+		}
+		if k < 1 || k >= len(idx.Columns) || idx.Columns[k] != aggCol {
+			continue
+		}
+		// The agg column must be the LAST index column (k+1 == len); a
+		// trailing-column index would decode a column the plan never reads.
+		if k+1 != len(idx.Columns) {
+			continue
+		}
+		// Every conjunct must be a prefix-col = const equality: len(eqs) > k
+		// means an equality on a column outside the bound prefix (a non-index
+		// column or the agg column) whose rows the Cond would not filter.
+		if len(eqs) != k {
+			continue
+		}
+		prefixQuals := make([]Expr, 0, k)
+		for j := 0; j < k; j++ {
+			prefixQuals = append(prefixQuals, eqs[idx.Columns[j]])
+		}
+		return idx, prefixQuals, k, true
+	}
+	return nil, nil, 0, false
 }
 
 // collectAndConjuncts walks an AND chain and returns the leaf conjuncts.

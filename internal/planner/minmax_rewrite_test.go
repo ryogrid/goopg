@@ -471,3 +471,266 @@ func TestRewriteMinMaxAggFilteredNonLeadingColumnIOS(t *testing.T) {
 		t.Fatalf("Cond right operand = %#v, want ColumnRef(y) at index 0 (covered row)", lt.Left)
 	}
 }
+
+// minmaxCompositeCatalog builds a single table `t(x int4, y int4, z int4)` with
+// a composite btree index on [x, y] — the tenk1_thous_tenthous shape that lets
+// the S6 Slice 3c composite-prefix rewrite fire (prefix col x bound by a WHERE
+// equality, agg col y next-and-last). z is the non-index column for the
+// fallback probes.
+func minmaxCompositeCatalog(t *testing.T) (catalog.Catalog, *catalog.Table) {
+	t.Helper()
+	c := catalog.NewInMemory()
+	tbl, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "x", Type: catalog.Type{Name: "int4"}},
+		{Name: "y", Type: catalog.Type{Name: "int4"}},
+		{Name: "z", Type: catalog.Type{Name: "int4"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.CreateIndex(parser.ObjectName{Name: "t_xy_idx"}, tbl, []string{"x", "y"}, false, "btree", false); err != nil {
+		t.Fatal(err)
+	}
+	return c, tbl
+}
+
+// digCompositeIos asserts the Limit child is the slice-down Project above the
+// composite IndexOnlyScan (S6 Slice 3c shape) and returns the IOS.
+func digCompositeIos(t *testing.T, child Node) *IndexOnlyScan {
+	t.Helper()
+	proj, ok := child.(*Project)
+	if !ok {
+		t.Fatalf("Limit child is %T, want *Project (composite IOS needs a slice-down)", child)
+	}
+	ios, ok := proj.Child.(*IndexOnlyScan)
+	if !ok {
+		t.Fatalf("Project child is %T, want *IndexOnlyScan", proj.Child)
+	}
+	if len(proj.Targets) != 1 {
+		t.Fatalf("Project has %d targets, want 1", len(proj.Targets))
+	}
+	if cr, ok := proj.Targets[0].(*ColumnRef); !ok || cr.Name != "y" || cr.Index != 1 {
+		t.Fatalf("Project target = %#v, want ColumnRef(y) at covered index 1", proj.Targets[0])
+	}
+	if len(proj.schema) != 1 || proj.schema[0].Name != "y" {
+		t.Fatalf("Project schema = %+v, want single column y", proj.schema)
+	}
+	return ios
+}
+
+// TestRewriteMinMaxAggCompositePrefixMinIOS — S6 Slice 3c acceptance (a): a
+// `SELECT min(y) FROM t WHERE x = 33` over a composite btree [x, y] (the
+// tenk1_thous_tenthous shape) must rewrite to Result → SubqueryExpr(InitPlan) →
+// Limit → Project → IndexOnlyScan with Covered = [x, y], Backward = false, and
+// Cond = `((x = 33) AND (y IS NOT NULL))` — prefix qual LEFT, the agg col's
+// IS NOT NULL at its covered position 1 RIGHT (the reverse of Slice 3b's
+// single-col order), matching `aggregates.out:1052-1057`.
+func TestRewriteMinMaxAggCompositePrefixMinIOS(t *testing.T) {
+	cat, tbl := minmaxCompositeCatalog(t)
+	plan, err := Plan(parseOne(t, "SELECT min(y) FROM t WHERE x = 33"), cat)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	_, _, _, child := digMinMaxInner(t, plan)
+	ios := digCompositeIos(t, child)
+	if ios.Index == nil || ios.Index.Name != "t_xy_idx" ||
+		len(ios.Index.Columns) != 2 || ios.Index.Columns[0] != "x" || ios.Index.Columns[1] != "y" {
+		t.Fatalf("IOS index = %+v, want composite btree [x, y]", ios.Index)
+	}
+	if ios.Backward {
+		t.Fatalf("IOS.Backward = true, want false (min → forward)")
+	}
+	if len(ios.Covered) != 2 || ios.Covered[0].Name != "x" || ios.Covered[1].Name != "y" {
+		t.Fatalf("IOS covered = %v, want [x, y] in index order", ios.Covered)
+	}
+	if len(ios.schema) != 2 || ios.schema[0].Name != "x" || ios.schema[1].Name != "y" {
+		t.Fatalf("IOS schema = %+v, want [x, y] in index order", ios.schema)
+	}
+	if ios.Table != tbl {
+		t.Fatalf("IOS Table = %v, want %v", ios.Table, tbl)
+	}
+	cond, ok := ios.Cond.(*BinaryOp)
+	if !ok || cond.Op != parser.OpAnd {
+		t.Fatalf("IOS Cond = %#v, want AND of prefix qual + is-not-null", ios.Cond)
+	}
+	// LEFT conjunct must be the remapped `x = 33` with x at covered position 0.
+	eq, ok := cond.Left.(*BinaryOp)
+	if !ok || eq.Op != parser.OpEq {
+		t.Fatalf("Cond left = %#v, want `x = 33`", cond.Left)
+	}
+	if cr, ok := eq.Left.(*ColumnRef); !ok || cr.Name != "x" || cr.Index != 0 {
+		t.Fatalf("Cond left operand = %#v, want ColumnRef(x) at index 0", eq.Left)
+	}
+	// RIGHT conjunct must be `y IS NOT NULL` with y at its covered position 1.
+	rn, ok := cond.Right.(*IsNullExpr)
+	if !ok || !rn.Negated {
+		t.Fatalf("Cond right = %#v, want `y IS NOT NULL`", cond.Right)
+	}
+	if cr, ok := rn.Operand.(*ColumnRef); !ok || cr.Name != "y" || cr.Index != 1 {
+		t.Fatalf("Cond right operand = %#v, want ColumnRef(y) at index 1", rn.Operand)
+	}
+}
+
+// TestRewriteMinMaxAggCompositePrefixMaxIOS — S6 Slice 3c acceptance (b): the
+// max twin — same shape but Backward = true (PG's `Index Only Scan Backward`).
+func TestRewriteMinMaxAggCompositePrefixMaxIOS(t *testing.T) {
+	cat, _ := minmaxCompositeCatalog(t)
+	plan, err := Plan(parseOne(t, "SELECT max(y) FROM t WHERE x = 33"), cat)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	_, _, _, child := digMinMaxInner(t, plan)
+	ios := digCompositeIos(t, child)
+	if !ios.Backward {
+		t.Fatalf("IOS.Backward = false, want true (max → Backward)")
+	}
+	if len(ios.Covered) != 2 || ios.Covered[0].Name != "x" || ios.Covered[1].Name != "y" {
+		t.Fatalf("IOS covered = %v, want [x, y] in index order", ios.Covered)
+	}
+	cond, ok := ios.Cond.(*BinaryOp)
+	if !ok || cond.Op != parser.OpAnd {
+		t.Fatalf("IOS Cond = %#v, want AND of prefix qual + is-not-null", ios.Cond)
+	}
+	if eq, ok := cond.Left.(*BinaryOp); !ok || eq.Op != parser.OpEq {
+		t.Fatalf("Cond left = %#v, want `x = 33`", cond.Left)
+	}
+	if rn, ok := cond.Right.(*IsNullExpr); !ok || !rn.Negated {
+		t.Fatalf("Cond right = %#v, want `y IS NOT NULL`", cond.Right)
+	}
+}
+
+// TestRewriteMinMaxAggCompositePrefixNonPrefixQualFallback — S6 Slice 3c
+// acceptance (c) first half: `min(y) WHERE z = 5` puts the equality on a
+// NON-prefix column, so neither the leading-column nor the composite branch can
+// fire and the rewrite stays on the SeqScan fallback (no IOS).
+func TestRewriteMinMaxAggCompositePrefixNonPrefixQualFallback(t *testing.T) {
+	cat, _ := minmaxCompositeCatalog(t)
+	plan, err := Plan(parseOne(t, "SELECT min(y) FROM t WHERE z = 5"), cat)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	_, _, _, child := digMinMaxInner(t, plan)
+	if _, ok := child.(*IndexOnlyScan); ok {
+		t.Fatalf("qual on non-prefix column z rewrote to IndexOnlyScan; must stay SeqScan fallback")
+	}
+	proj, ok := child.(*Project)
+	if !ok {
+		t.Fatalf("Limit child is %T, want *Project (SeqScan fallback)", child)
+	}
+	if _, ok := proj.Child.(*IndexOnlyScan); ok {
+		t.Fatalf("Project child is *IndexOnlyScan; must stay SeqScan fallback")
+	}
+	sort, ok := proj.Child.(*Sort)
+	if !ok {
+		t.Fatalf("Project child is %T, want *Sort (SeqScan fallback)", proj.Child)
+	}
+	if _, ok := sort.Child.(*Filter); !ok {
+		t.Fatalf("Sort child is %T, want *Filter", sort.Child)
+	}
+}
+
+// TestRewriteMinMaxAggCompositePrefixNoWhereFallback — S6 Slice 3c acceptance
+// (c) second half: `min(y)` with NO WHERE over only the composite [x, y] index
+// stays on the SeqScan fallback — the composite branch needs a WHERE equality
+// to bind the leading prefix, and no single-column index on y exists for the
+// leading-column branch.
+func TestRewriteMinMaxAggCompositePrefixNoWhereFallback(t *testing.T) {
+	cat, _ := minmaxCompositeCatalog(t)
+	plan, err := Plan(parseOne(t, "SELECT min(y) FROM t"), cat)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	_, _, _, child := digMinMaxInner(t, plan)
+	proj, ok := child.(*Project)
+	if !ok {
+		t.Fatalf("Limit child is %T, want *Project (SeqScan fallback)", child)
+	}
+	if _, ok := proj.Child.(*IndexOnlyScan); ok {
+		t.Fatalf("no-WHERE min(y) rewrote to IndexOnlyScan over the composite index; must stay SeqScan fallback (no leading-column index on y)")
+	}
+	if _, ok := proj.Child.(*Sort); !ok {
+		t.Fatalf("Project child is %T, want *Sort (SeqScan fallback)", proj.Child)
+	}
+}
+
+// TestRewriteMinMaxAggCompositePrefixRangeReject — S6 Slice 3c acceptance (d):
+// `min(y) WHERE x = 33 AND y < 500` mixes a bound prefix equality with a range
+// conjunct on the agg column — a non-equality conjunct, so allEq is false and
+// the composite branch declines to the SeqScan fallback (the Cond cannot be
+// pushed without reading a column in a non-covered shape).
+func TestRewriteMinMaxAggCompositePrefixRangeReject(t *testing.T) {
+	cat, _ := minmaxCompositeCatalog(t)
+	plan, err := Plan(parseOne(t, "SELECT min(y) FROM t WHERE x = 33 AND y < 500"), cat)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	_, _, _, child := digMinMaxInner(t, plan)
+	proj, ok := child.(*Project)
+	if !ok {
+		t.Fatalf("Limit child is %T, want *Project (SeqScan fallback)", child)
+	}
+	if _, ok := proj.Child.(*IndexOnlyScan); ok {
+		t.Fatalf("range conjunct `y < 500` rewrote to IndexOnlyScan; must stay SeqScan fallback")
+	}
+	sort, ok := proj.Child.(*Sort)
+	if !ok {
+		t.Fatalf("Project child is %T, want *Sort (SeqScan fallback)", proj.Child)
+	}
+	f, ok := sort.Child.(*Filter)
+	if !ok {
+		t.Fatalf("Sort child is %T, want *Filter", sort.Child)
+	}
+	if _, ok := f.Child.(*SeqScan); !ok {
+		t.Fatalf("Filter child is %T, want *SeqScan", f.Child)
+	}
+}
+
+// TestRewriteMinMaxAggCompositePrefixDuplicateEqualityFallback — S6 Slice 3c
+// safety: `min(y) WHERE x = 33 AND x = 44` puts TWO equality conjuncts on the
+// same prefix column. Under last-write-wins map semantics one would be silently
+// dropped (returning min(y) over x=44 where PG's full-qual evaluation returns
+// NULL for the contradiction), so collectEqualityConjuncts must set allEq=false
+// and the composite branch must decline to the SeqScan fallback, which evaluates
+// the full `x = 33 AND x = 44` qual verbatim.
+func TestRewriteMinMaxAggCompositePrefixDuplicateEqualityFallback(t *testing.T) {
+	cat, _ := minmaxCompositeCatalog(t)
+	plan, err := Plan(parseOne(t, "SELECT min(y) FROM t WHERE x = 33 AND x = 44"), cat)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	_, _, _, child := digMinMaxInner(t, plan)
+	proj, ok := child.(*Project)
+	if !ok {
+		t.Fatalf("Limit child is %T, want *Project (SeqScan fallback)", child)
+	}
+	if _, ok := proj.Child.(*IndexOnlyScan); ok {
+		t.Fatalf("duplicate same-column equality rewrote to IndexOnlyScan; must stay SeqScan fallback")
+	}
+	sort, ok := proj.Child.(*Sort)
+	if !ok {
+		t.Fatalf("Project child is %T, want *Sort (SeqScan fallback)", proj.Child)
+	}
+	f, ok := sort.Child.(*Filter)
+	if !ok {
+		t.Fatalf("Sort child is %T, want *Filter", sort.Child)
+	}
+	if _, ok := f.Child.(*SeqScan); !ok {
+		t.Fatalf("Filter child is %T, want *SeqScan", f.Child)
+	}
+	// The fallback's Filter predicate must carry BOTH equality conjuncts
+	// (andExpr(wherePred, isNotNull): left is the AND of x=33 AND x=44).
+	pred, ok := f.Predicate.(*BinaryOp)
+	if !ok || pred.Op != parser.OpAnd {
+		t.Fatalf("Filter predicate = %#v, want AND of full qual + is-null", f.Predicate)
+	}
+	both, ok := pred.Left.(*BinaryOp)
+	if !ok || both.Op != parser.OpAnd {
+		t.Fatalf("Filter predicate left = %#v, want `x = 33 AND x = 44`", pred.Left)
+	}
+	if eq, ok := both.Left.(*BinaryOp); !ok || eq.Op != parser.OpEq {
+		t.Fatalf("Filter predicate left-left = %#v, want `x = 33`", both.Left)
+	}
+	if eq, ok := both.Right.(*BinaryOp); !ok || eq.Op != parser.OpEq {
+		t.Fatalf("Filter predicate left-right = %#v, want `x = 44`", both.Right)
+	}
+}
