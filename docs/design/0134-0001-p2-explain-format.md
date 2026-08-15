@@ -508,6 +508,41 @@ bare-integer-literal int8-vs-PG-int4 typing is a separate latent divergence flag
 **Remaining S6 edge cases (unchanged):** (d) scalar-subquery nesting (blocks 8/17,
 class-8); (e) inheritance/MergeAppend (blocks 15/16 + partial-index bug).
 
+## S6 Slice 3e — landed 2026-08-15 (partial-index predicate walker fix — e.1)
+
+**Shipped:** one missing-case arm in `walkExprTree` (`internal/planner/unnest.go`):
+`case *IsNullExpr: walkExprTree(x.Operand, visit)`. `IsNullExpr` (`plan.go:283-287`)
+wraps a single `Operand`; the walker visited the node but never descended into it,
+so `ExprContainsColumnRef` (`planner.go:2476-2492`) reported `false` for
+`f1 IS NOT NULL`, the CREATE INDEX const-fold guard
+(`operators_ddl.go:6483` `!ExprContainsColumnRef(resolvedPred)`) passed, and
+`evalExpr(resolvedPred, nil, …)` (`:6484`) hit the nil-slot raise
+(`executor/expr.go:356-358`) — the `aggregates` regress
+`ERROR: column ref f1/0 on nil slot` at `create index minmaxtest3i … where f1 is not null`.
+One regression test (`TestExprContainsColumnRefIsNullOperand`, `unnest_test.go`):
+`IS NULL`/`IS NOT NULL` over a ColumnRef → true, bare constant → false.
+
+**Sibling paths (both consume `walkExprTree`, both strictly more correct now):**
+`ExprContainsColumnRef` (the DDL guard) and the min/max rewrite's correlated-qual
+check (`planner.go:8576-8584`) — a correlated `col IS NULL`/`IS NOT NULL` qual is
+now detected and the rewrite correctly declines to the Aggregate path. No existing
+min/max unit test flipped.
+
+**Measured result (`scripts/pg-regress-runner.sh aggregates`, 1472→1462 lines, zero
+regressions):** the `+ERROR`/`LINE`/`^` block is gone and `create index minmaxtest3i`
+succeeds; `minmaxtest3i` now appears only on the `-` (PG) side of blocks 15/16
+(which remain open — the e.2 MergeAppend shape gap). `scripts/tpch-spotcheck.sh`
+PASS (Q12=2/Q13=35); `go test ./internal/planner/ ./internal/executor/` PASS.
+
+**Deferral (ledger row appended):** `walkExprTree` still lacks arms for
+`IsBoolExpr`, `IsDistinctFromExpr`, `CollateExpr`, and `InExpr` — each can hold a
+`*ColumnRef` operand and under-reports the same way in the CREATE INDEX
+const-fold guard. Not exercised by `aggregates.sql`; recorded, not widened.
+
+**Remaining S6 edge cases (unchanged):** (d) scalar-subquery nesting (blocks 8/17,
+class-8); (e.2) inheritance/MergeAppend (blocks 15/16 — now unblocked by the e.1
+prerequisite).
+
 ## Cross-case relevance
 
 Every M0134 regress case whose `.sql` emits `EXPLAIN` inherits the formatter
