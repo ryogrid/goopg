@@ -345,6 +345,33 @@ The `Index Only Scan Backward` text path is therefore exercised by unit tests on
 closes that (already in the S1 deferral row). `scripts/tpch-spotcheck.sh` PASS
 (Q12=2/Q13=35).
 
+## S6 Slice 3a — landed 2026-08-15 (create_index.sql prerequisite)
+
+Shipped: `create_index.sql` added to the regress runner's setup phase
+(`scripts/pg-regress-runner.sh`, best-effort `timeout 300`, before
+`create_aggregate.sql`), so the `tenk1`/`tenk2`/`onek` btree indexes exist and the
+already-landed S6 rewrite is exercised end-to-end instead of unit-test-only.
+
+**Measured result (`scripts/pg-regress-runner.sh aggregates`, 1543→1527 lines):** blocks 1
+(`min(unique1)`) and 2 (`max(unique1)`) now emit `Index Only Scan using tenk1_unique1` /
+`Index Only Scan Backward using tenk1_unique1` matching PG — the first end-to-end proof of
+the S6 Slice 1+2 rewrite (the `Backward` token included). Full quick set: no PASS→FAIL
+regression, no hang (probe: create_index.sql completes ~2:01 wall; btree/gist/gin/hash AMs
+all accepted, no wedge).
+
+**New gap surfaced (blocks 3-5, ledgered):** `max(unique1) WHERE unique1 < 42` (and `>42`,
+`>42000`) STILL falls back to `Sort → Seq Scan` even with the index — the rewrite does not
+push the WHERE qual into the IOS `Index Cond` (`((unique1 IS NOT NULL) AND (unique1 < 42))`).
+This is a distinct rewrite-shape gap from the composite-prefix case (block 6, ledger row 1371
+— a non-leading column). The design doc's Slice 2 note had projected blocks 2-6 would close
+under this prerequisite; the projection was wrong: blocks 3-5 need Index-Cond push, block 6
+needs composite-prefix probing.
+
+**Remaining S6 edge cases (unchanged, in dependency order):** (a) filtered single-column
+min/max Index Cond push (blocks 3-5, new ledger row); (b) composite-prefix probing (block 6,
+ledger row 1371); (c) constant `max(100)` (block 14); (d) scalar-subquery nesting (blocks
+8/17, class-8); (e) inheritance/MergeAppend (blocks 15/16 + partial-index bug).
+
 ## Cross-case relevance
 
 Every M0134 regress case whose `.sql` emits `EXPLAIN` inherits the formatter
