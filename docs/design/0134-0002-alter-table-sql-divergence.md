@@ -594,6 +594,66 @@ refusals, all blocked by the pre-existing ATTACH-PARTITION `Inherited`-marking g
 (ledger row 1410 (a)) — plus the cyclic-ATTACH 42P17 gap the `visited` set guards
 against rather than fixes.
 
+## C9 final — partition-child DDL refusals + circular ATTACH (2026-08-17)
+
+The four residuals left by the previous slice close as one bundle, because S2 is
+the root cause the other three sit on: goopg's `ALTER TABLE … ATTACH PARTITION`
+never marked the child's columns inherited, so every inherited-DDL refusal was
+latent on an ATTACHed child (the regress `part_2`).
+
+1. **S1 — ADD COLUMN on a partition.** `ATExecAddColumn` refuses with
+   ERRCODE_WRONG_OBJECT_TYPE **42809** `cannot add column to a partition` (no
+   detail/hint, `Pos: 0`) as its FIRST check, gated on `relispartition &&
+   !recursing` — before the system-column collision check and before the
+   IF NOT EXISTS notice (`postgres/src/backend/commands/tablecmds.c:7247-7250`).
+   goopg's guard is therefore also first in `execAlterTableAddColumn`, and gates
+   on `im.IsPartitionChild(tbl.OID)` — **not** `Table.PartitionParentOID`, which
+   is populated only by `CREATE TABLE … PARTITION OF` and stays 0 for an ATTACHed
+   child.
+2. **S2 — `Inherited` marking at ATTACH, cleared at DETACH.** PG's
+   `MergeAttributesIntoExisting` (`tablecmds.c:17500`), reached via
+   `CreateInheritance`, bumps `attinhcount` and clears `attislocal` on the child's
+   same-named columns; `RemoveInheritance` (`:18009-18014`) reverses it on DETACH.
+   goopg mirrors this with `markAttachedColumnsInherited` /
+   `clearAttachedColumnsInherited`. **Both ATTACH arms** must call the marker —
+   the immediate arm and `ApplyPendingPartitionAttaches` (the COMMIT-deferred
+   arm) — and **both DETACH arms** (plain and CONCURRENTLY-finalize) must call
+   the clearer; the DETACH side is required for `part_3_4`'s attislocal
+   assertions (`alter_table.out:4416-4422`) to stay byte-green.
+3. **S3 — `colStillInherited` live-map fallback.** The guard predicate consulted
+   `tbl.PartitionParentOID` only, so it stayed false on an ATTACHed child even
+   after S2. It now falls back to `im.PartitionParentOf(tbl.OID)` when the field
+   is 0; the field branch still wins when set, so PARTITION-OF behaviour is
+   unchanged.
+4. **S4 — circular ATTACH.** `ATExecAttachPartition` tests the prospective parent
+   for membership in `find_all_inheritors(attachrel)` and raises
+   **42P07 ERRCODE_DUPLICATE_TABLE** `circular inheritance not allowed` with
+   errdetail `"%s" is already a child of "%s".` — **parent named first, child
+   second**, no hint, `Pos: 0` (`tablecmds.c:20338-20362`). The 42P17 written in
+   the previous slice's design note and ledger row was a placeholder and is not a
+   real SQLSTATE. goopg reuses `allDescendants(im, childTbl, 0)` (BFS over
+   `InheritanceChildren ∪ PartitionChildren`, so ATTACH edges count) plus the
+   self-attach case; the parent's own descendants are not walked. The `visited`
+   set from the previous slice is retained as defence in depth.
+
+**Unmasked by S4: `DROP CONSTRAINT` ignored ONLY.** With the cycle rejected, the
+regress reached `ALTER TABLE ONLY list_parted2 DROP CONSTRAINT check_b`, which
+goopg cascaded to children. PG's `dropconstraint_internal` with `recurse=false`
+removes the constraint from the parent only and leaves each child's inherited
+copy (`tablecmds.c:14025-14110`, oracle `alter_table.out:4541-4542`), so
+`execAlterTableDropConstraint` now takes an `only bool` (threaded from `s.Only`)
+and skips the child cascade when set.
+
+**Landed (2026-08-17).** Diff 4102→4073 (−29 lines); `:2848-2858` and the
+cyclic-ATTACH statements are byte-green. Tests:
+`operators_ddl_c9_residuals_final_test.go` (S1/S2/S4 + DROP-CONSTRAINT-ONLY) and
+the extended `TestAlterTableDescendantWalkCycleSafe`. Still open in this block
+(ledgered 2026-08-17): ADD CONSTRAINT duplicate-name merge accounting (double
+`check_b` ⇒ extra `merging constraint` NOTICEs), the already-a-partition 42809
+re-ATTACH guard (`alter_table.sql:2697`), the ONLY-guards for SET NOT NULL /
+ADD CONSTRAINT (ledger row 1423), and the pre-existing constraint-deparse
+rendering gap (`((b <> 'zz'))` vs `(b <> 'zz'::bpchar)`).
+
 ## C4 — ADD FOREIGN KEY validation semantics (2026-08-16)
 
 **Class: FK semantics (`tablecmds.c`, correctness).** The ADD-FK executor arm

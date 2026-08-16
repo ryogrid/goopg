@@ -7109,6 +7109,13 @@ func ApplyPendingPartitionAttaches(ctx *Context, sess *BasicSession) {
 			childTbl.PartitionBounds = a.Bounds
 		}
 		im.RegisterPartitionChild(a.ParentOID, a.ChildOID)
+		// M0134-0002 C9 residual (S2): same column-merge as the immediate ATTACH
+		// arm (MergeAttributesIntoExisting, tablecmds.c:17500) — an ATTACH that
+		// was deferred to COMMIT must also mark the child's same-named columns
+		// Inherited, else the inherited-DDL guards stay off on the ATTACHed child.
+		if parentTbl, ok := im.LookupTableByOID(a.ParentOID); ok {
+			markAttachedColumnsInherited(parentTbl, childTbl)
+		}
 		// fk-partitioned-1 (design 0118-0120): the partition is now registered
 		// (IsPartitionChild true), so a concurrent DELETE that was waiting on
 		// this attach can resolve via the normal committed-clone path; drop the
@@ -7959,7 +7966,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 		case parser.AlterTableNoOp:
 			// Unknown ADD CONSTRAINT type — no-op.
 		case parser.AlterTableDropConstraint:
-			if err := o.execAlterTableDropConstraint(tbl, act); err != nil {
+			if err := o.execAlterTableDropConstraint(tbl, act, s.Only); err != nil {
 				return err
 			}
 		case parser.AlterTableAlterConstraint:
@@ -8002,6 +8009,35 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			childTbl, ok := o.ctx.Catalog.LookupTable(poc.Parent, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			if !ok {
 				break // child doesn't exist yet, skip
+			}
+			// M0134-0002 C9 residual (S4): reject a circular attach — the table
+			// being attached (attachrel) is the ALTER target (the prospective
+			// parent) itself, or the target is one of the child's OWN descendants.
+			// Mirrors ATExecAttachPartition's find_all_inheritors(attachrel)
+			// membership test (postgres/src/backend/commands/tablecmds.c:20338-20362),
+			// which catches both self-attach and a back-edge with
+			// ERRCODE_DUPLICATE_TABLE 42P07 — NOT 42P17 (the design-doc/ledger
+			// placeholder is not a real SQLSTATE). allDescendants walks the CHILD's
+			// descendants (BFS over InheritanceChildren ∪ PartitionChildren, so
+			// ATTACH links are covered) and looks for the PARENT; the parent's own
+			// descendants are NOT walked. errdetail names parent then child — the
+			// exact PG argument order (RelationGetRelationName(rel) then
+			// RelationGetRelationName(attachrel)). No errhint, Pos 0.
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				isCycle := childTbl.OID == tbl.OID
+				if !isCycle {
+					for _, d := range allDescendants(im, childTbl, 0) {
+						if d.OID == tbl.OID {
+							isCycle = true
+							break
+						}
+					}
+				}
+				if isCycle {
+					return &ExecError{Code: "42P07", Pos: 0,
+						Message: "circular inheritance not allowed",
+						Detail:  fmt.Sprintf("%q is already a child of %q.", tbl.Name, childTbl.Name)}
+				}
 			}
 			// Lock the parent's existing DEFAULT partition AccessExclusive for the
 			// attaching transaction — PG ATExecAttachPartition locks it first
@@ -8120,6 +8156,11 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				}
 				if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 					im.RegisterPartitionChild(tbl.OID, childTbl.OID)
+					// M0134-0002 C9 residual (S2): mark the child's same-named
+					// columns Inherited so the inherited-DDL guards (DROP / RENAME /
+					// ALTER TYPE) fire on an ATTACHed partition. Mirrors PG's
+					// MergeAttributesIntoExisting (tablecmds.c:17500).
+					markAttachedColumnsInherited(tbl, childTbl)
 				}
 			}
 			// Propagate parent unique/PK indexes to the newly attached child
@@ -8327,6 +8368,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				}
 				// Phase 2: finalize the detach.
 				im.UnregisterPartitionChild(tbl.OID, childTbl.OID)
+				clearAttachedColumnsInherited(tbl, childTbl)
 				childTbl.PartitionParentOID = 0
 				childTbl.PartitionBounds = nil
 				im.ClearPartitionDetachPending(childTbl.OID)
@@ -8359,6 +8401,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					return werr
 				}
 				im.UnregisterPartitionChild(tbl.OID, childTbl.OID)
+				clearAttachedColumnsInherited(tbl, childTbl)
 				childTbl.PartitionParentOID = 0
 				childTbl.PartitionBounds = nil
 				im.ClearPartitionDetachPending(childTbl.OID)
@@ -9844,6 +9887,18 @@ func (o *ddlOp) execAlterTableResetReloptions(tbl *catalog.Table, act parser.Alt
 
 func (o *ddlOp) execAlterTableAddColumn(stmt *parser.AlterTableStmt, tbl *catalog.Table, act parser.AlterTableAction) error {
 	col := act.Column
+	// M0134-0002 C9 residual (S1): PG refuses ADD COLUMN on a partition child
+	// with 42809 ERRCODE_WRONG_OBJECT_TYPE, no errdetail, no errhint, Pos 0.
+	// This is the FIRST check in ATExecAddColumn — before the system-column
+	// collision check and before the if-not-exists NOTICE — gated on
+	// `relispartition && !recursing` (postgres/src/backend/commands/
+	// tablecmds.c:7247-7250). IsPartitionChild consults the live
+	// partitionChildren map, so it covers BOTH CREATE TABLE … PARTITION OF and
+	// ALTER TABLE … ATTACH PARTITION — Table.PartitionParentOID is 0 for the
+	// latter (the regress part_2 is ATTACHed), so that field must not gate this.
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && im.IsPartitionChild(tbl.OID) {
+		return &ExecError{Code: "42809", Pos: 0, Message: "cannot add column to a partition"}
+	}
 	// M0134-0002 C8: PG rejects ADD COLUMN whose name collides with a system
 	// column (check_for_column_name_collision, postgres/src/backend/commands/
 	// tablecmds.c:7670-7674 — attnum <= 0 test). Exact, case-sensitive. Pos is
@@ -10482,7 +10537,13 @@ func (o *ddlOp) execAlterTableAddExclude(tbl *catalog.Table, act parser.AlterTab
 // added DU-002 slice 433 follow-up (previously misreported 42704 for a real
 // constraint of either kind — see deferral ledger).
 // M0097-0036 / functional_deps / M0097-0023.
-func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.AlterTableAction) error {
+// execAlterTableDropConstraint handles `ALTER TABLE t DROP CONSTRAINT name
+// [RESTRICT|CASCADE]`. `only` is true for `ALTER TABLE ONLY` (recurse=false):
+// with ONLY the constraint is removed from the parent only and the children's
+// inherited copies are left intact (dropconstraint_internal,
+// postgres/src/backend/commands/tablecmds.c:14025-14110), so the child cascade
+// below is skipped.
+func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.AlterTableAction, only bool) error {
 	im, isIM := o.ctx.Catalog.(*catalog.InMemory)
 
 	// 1. Check constraints: handle before PK so inherited check takes priority.
@@ -10506,7 +10567,10 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 		tbl.CheckConstraints = append(tbl.CheckConstraints[:i], tbl.CheckConstraints[i+1:]...)
 		tbl.NamedChecks = append(tbl.NamedChecks[:i], tbl.NamedChecks[i+1:]...)
 		// Cascade to partition children: drop the inherited copy from each child.
-		if isIM {
+		// ONLY (recurse=false) must NOT propagate — PG's dropconstraint_internal
+		// removes the constraint from the parent only, leaving each child's
+		// inherited copy (coninhcount) intact (tablecmds.c:14025-14110).
+		if isIM && !only {
 			for _, childTbl := range im.PartitionChildren(tbl.OID) {
 				for j, cnc := range childTbl.NamedChecks {
 					if strings.EqualFold(cnc.Name, act.ConstraintName) {
@@ -12240,6 +12304,56 @@ func (o *ddlOp) hasInheritanceChildren(tbl *catalog.Table) bool {
 	return len(im.InheritanceChildren(tbl.OID)) > 0 || len(im.PartitionChildren(tbl.OID)) > 0
 }
 
+// markAttachedColumnsInherited marks every non-dropped CHILD column that has a
+// same-named (case-sensitive Name match) PARENT column as Inherited
+// (attislocal=false, attinhcount=1). Mirrors PG's MergeAttributesIntoExisting
+// (postgres/src/backend/commands/tablecmds.c:17500), which ALTER TABLE …
+// ATTACH PARTITION runs via CreateInheritance to bump attinhcount and clear
+// attislocal on the child's matching columns. Child columns with no same-named
+// parent column stay local (they are the child's own); a missing child column
+// is NOT an error here — the 42804 column-validation gap is a separate
+// ledgered item. M0134-0002 C9 residual (S2).
+func markAttachedColumnsInherited(parent, child *catalog.Table) {
+	for _, pc := range parent.Columns {
+		if pc.Dropped {
+			continue
+		}
+		for i := range child.Columns {
+			if child.Columns[i].Name == pc.Name {
+				child.Columns[i].Inherited = true
+				break
+			}
+		}
+	}
+}
+
+// clearAttachedColumnsInherited is the S2 sibling (inverse of
+// markAttachedColumnsInherited): on ALTER TABLE … DETACH PARTITION, PG's
+// RemoveInheritance decrements attinhcount on every child column that has a
+// same-named parent column and sets attislocal=true when the count reaches 0
+// (postgres/src/backend/commands/tablecmds.c:18009-18014). Without this the
+// Inherited flag set at ATTACH would linger after DETACH and goopg's
+// pg_attribute would report attinhcount=1/attislocal=false on a detached
+// partition, diverging from PG (the alter_table regress asserts the reset at
+// alter_table.out:4416-4422). M0134-0002 C9 residual (S2 sibling).
+func clearAttachedColumnsInherited(parent, child *catalog.Table) {
+	for i := range child.Columns {
+		col := &child.Columns[i]
+		if !col.Inherited {
+			continue
+		}
+		for _, pc := range parent.Columns {
+			if pc.Dropped {
+				continue
+			}
+			if col.Name == pc.Name {
+				col.Inherited = false
+				break
+			}
+		}
+	}
+}
+
 // colStillInherited reports whether colName is still inherited in the LIVE
 // hierarchy: a direct parent (INHERITS or PARTITION OF) whose edge to tbl is
 // still registered still carries a column of that name.
@@ -12261,7 +12375,20 @@ func (o *ddlOp) colStillInherited(tbl *catalog.Table, colName string) bool {
 			return true
 		}
 	}
-	if tbl.PartitionParentOID != 0 && o.parentStillHasColumn(im, tbl.PartitionParentOID, tbl.OID, colName) {
+	// M0134-0002 C9 residual (S3): Table.PartitionParentOID is only populated on
+	// the CREATE TABLE … PARTITION OF path — an ALTER TABLE … ATTACH PARTITION
+	// child (the regress part_2) leaves it 0 and registers only the live
+	// partitionChildren map, so without a map fallback the inherited-DDL guards
+	// never fire on an ATTACHed child even after S2 sets Column.Inherited.
+	// PartitionParentOf is true for both child shapes, so PARTITION-OF behavior
+	// is preserved (the field branch above still wins when set).
+	parentOID := tbl.PartitionParentOID
+	if parentOID == 0 {
+		if poid, isChild := im.PartitionParentOf(tbl.OID); isChild {
+			parentOID = poid
+		}
+	}
+	if parentOID != 0 && o.parentStillHasColumn(im, parentOID, tbl.OID, colName) {
 		return true
 	}
 	return false

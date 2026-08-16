@@ -135,11 +135,14 @@ func TestAlterTablePartitionDescendantRecursion(t *testing.T) {
 }
 
 // TestAlterTableDescendantWalkCycleSafe guards the shared descendant walker
-// (allDescendants) against the cyclic inheritance/partition graph that goopg's
-// ATTACH validation gap can leave in the catalog. The alter_table regress test
-// constructs exactly this cycle (SQL lines 2667-2668): PG rejects it with
-// "circular inheritance not allowed", but goopg silently accepts both ATTACH
-// statements. Before the visited-set fix, the descendant walk for
+// (allDescendants) against the cyclic inheritance/partition graph. The
+// alter_table regress test constructs exactly this cycle (SQL lines 2699-2701):
+// PG rejects it with "circular inheritance not allowed". Since the M0134-0002
+// C9 residual S4 landed, goopg's ATTACH arm rejects the back-edge and the
+// self-attach with 42P07 (tablecmds.c:20338-20362), so the catalog can no
+// longer become cyclic through ATTACH; the visited-set protection in
+// allDescendants stays as defense-in-depth for any other path that might one
+// day leak a cycle. Before that fix, the descendant walk for
 // "ALTER TABLE list_parted2 DROP COLUMN b" BFS'd the list_parted2 <-> part_5
 // cycle forever, growing memory to 21-22GB until the cgroup OOM-killed the
 // server (two observed runs) and the regress output truncated mid-statement.
@@ -149,23 +152,35 @@ func TestAlterTableDescendantWalkCycleSafe(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
 
-	// Mirror alter_table.sql:2593-2611 + 2667-2668: part_5 partitioned on b is
-	// attached to list_parted2, then a back-edge makes the graph cyclic.
+	// Mirror alter_table.sql:2626-2638 + 2699-2701: part_5 partitioned on b is
+	// attached to list_parted2 (the acyclic half of the old fixture).
 	for _, s := range []string{
 		"CREATE TABLE list_parted2 (a int, b int, c int) PARTITION BY LIST (a)",
 		"CREATE TABLE part_5 (LIKE list_parted2) PARTITION BY LIST (b)",
 		"ALTER TABLE list_parted2 ATTACH PARTITION part_5 FOR VALUES IN (5)",
-		"ALTER TABLE part_5 ATTACH PARTITION list_parted2 FOR VALUES IN ('b')",
-		"ALTER TABLE list_parted2 ATTACH PARTITION list_parted2 FOR VALUES IN (0)",
 	} {
 		if err := runDDL(t, ctx, s); err != nil {
 			t.Fatalf("setup %q: %v", s, err)
 		}
 	}
 
+	// S4: the back-edge (part_5 is a descendant of list_parted2, so attaching
+	// list_parted2 as part_5's child cycles) and the self-attach are now
+	// rejected — errdetail names parent then child, the PG argument order.
+	err := runDDL(t, ctx, "ALTER TABLE part_5 ATTACH PARTITION list_parted2 FOR VALUES IN ('b')")
+	wantExecError(t, err, "42P07", "circular inheritance not allowed")
+	if ee := err.(*ExecError); ee.Detail != `"part_5" is already a child of "list_parted2".` {
+		t.Errorf("Detail = %q, want %q", ee.Detail, `"part_5" is already a child of "list_parted2".`)
+	}
+	err = runDDL(t, ctx, "ALTER TABLE list_parted2 ATTACH PARTITION list_parted2 FOR VALUES IN (0)")
+	wantExecError(t, err, "42P07", "circular inheritance not allowed")
+	if ee := err.(*ExecError); ee.Detail != `"list_parted2" is already a child of "list_parted2".` {
+		t.Errorf("Detail = %q, want %q", ee.Detail, `"list_parted2" is already a child of "list_parted2".`)
+	}
+
 	// The walk must terminate (visited set) and name the first key-owning
 	// descendant reached. The key assertion is that this returns without
 	// hanging — a regression of the walker hangs the whole test binary.
-	err := runDDL(t, ctx, "ALTER TABLE list_parted2 DROP COLUMN b")
+	err = runDDL(t, ctx, "ALTER TABLE list_parted2 DROP COLUMN b")
 	wantExecError(t, err, "42P16", `cannot drop column "b" because it is part of the partition key of relation "part_5"`)
 }
