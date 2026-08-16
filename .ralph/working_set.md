@@ -1,52 +1,49 @@
-# Working set — M0134-0002 alter_table.sql (ALTER-TYPE partition-key guard landed)
+# Working set — M0134-0002 alter_table.sql (C4 ADD-FK validation landed)
 
-**Task:** M0134-0002 alter_table.sql regress-sql digestion. This loop landed the
-**ALTER-TYPE partition-key guard** — the sibling of the DROP COLUMN guard from
-commit `1b8d3825`. Commit `3e81aef1`.
+**Task:** M0134-0002 alter_table.sql regress-sql digestion. This loop landed
+**C4 — ADD FOREIGN KEY validation semantics** (commit `0518b4a4`).
 
-**Findings:** `execAlterColumnType` (operators_ddl.go:22137) now raises 42P16
-`cannot alter column %q because it is part of the partition key of relation %q`
-before any rewrite, walking `tbl.PartitionKey` (bare key) + `tbl.PartitionKeyExprs`
-(via `partitionKeyExprUsesColumn`). Key difference from DROP COLUMN: PG's
-`ATExecAlterColumnType` carries `parser_errposition(pstate, def->location)`
-(tablecmds.c:14450) while `ATExecDropColumn` does not, so this raise uses
-`Pos: act.Pos()` (not `Pos: 0`). That required threading `colPos` (the
-column-name token location) into `AlterTableAction.pos` via `parseAlterColumnAction`
-(internal/parser/ddl.go). The two 42804 coercion-failure arms (evaluation-time,
-no source location) were corrected `Pos: act.Pos()`→`Pos: 0`. Diff 4153→4145 (−8);
-errposition verified byte-exact via raw psql (no off-by-one).
+**Findings:** the ADD FK arm (`case parser.AlterTableAddForeignKey`,
+operators_ddl.go:7731-7789) only checked referenced-table 42P01 then appended to
+`tbl.ForeignKeys`. So alter_table.sql:355/358/361 (all `add constraint
+attmpconstr foreign key ...`) silently succeeded where PG rejects (42703/42703/23503),
+piling up four same-name entries that shadowed the later `VALIDATE CONSTRAINT`
+scan (first stale `NotValid=false` match) — masking out:499-500. Fix adds, in PG
+order: 42710 dup-name guard (cross-kind, explicit name only), 42703 source then
+42703 ref column check (`fkColumnExists`, case-sensitive dropped-skipping), 23503
+existing-row scan (`!NotValid`, reuse C3 `validateFKConstraintExistingRows`),
+plus VALIDATE FK 23503 Pos-suppression (`ri_ReportViolation` no errposition).
+Diff 4145→4113 (−32), FK block byte-green; 5 tests.
 
-**Files:** internal/executor/operators_ddl.go (guard + 42804 Pos-0),
-internal/parser/ddl.go (colPos threading), operators_ddl_partition_key_test.go
-(TestAlterTablePartitionKeyGuardAlterType, 4 subtests);
-docs/design/0134-0002-alter-table-sql-divergence.md (§"partition-key DROP COLUMN
-guard" sibling note now "landed"); .ralph/deferral_ledger.md (row 1418 → resolved;
-NEW row for descendant-partition recursion); fix_plan.md progress note.
+**Files:** internal/executor/operators_ddl.go (ADD-FK arm + 2 helpers +
+VALIDATE Pos-suppression), internal/executor/operators_ddl_fk_add_validation_test.go
+(5 tests); docs/design/0134-0002-alter-table-sql-divergence.md (§C4);
+.ralph/deferral_ledger.md (row 1413 → resolved; NEW row for 42804/42830/42908/
+0A000 residuals); fix_plan.md progress note.
 
-**Key symbols:** `execAlterColumnType`, `partitionKeyExprUsesColumn` (walker),
-`parseAlterColumnAction` (colPos), `evalCast` (42804 arms).
+**Key symbols:** `fkColumnExists`, `fkConstraintNameInUse` (new helpers),
+`execAlterTableAddForeignKey` (ADD FK arm), `validateFKConstraintExistingRows`
+(reused scan), `assertParentExists` (23503 source), VALIDATE arm `:7838`.
 
-**Deferred (1 new ledger row):** descendant-partition recursion — PG recurses into
-descendant partitions on ALTER/DROP COLUMN of a partitioned parent, so
-`ALTER TABLE ONLY list_parted2 DROP COLUMN b` reports `… of relation "part_5"`
-(descendant key) where goopg reports 42703. Diff :3929 (DROP) + :3934 (ALTER TYPE),
-pre-existing. Resume: recurse into descendants + per-descendant key guard.
+**Deferred (1 new ledger row):** 42804 FK type-compat (`findFkeyCast`
+tablecmds.c:10435), 42830 no-unique-constraint (`transformFkeyCheckAttrs`
+:13657), 42908 column-count, 0A000 system-column; + EqualFold-vs-strcmp in the
+42710 guard (quoted mixed-case only).
 
-**Next step:** C4 — the ADD-FK duplicate-name guard (ledger row 1413:
-`execAlterTableAddForeignKey` ~:7718 add a dup-name guard so VALIDATE CONSTRAINT
-finds the newest `NotValid` FK entry; unblocks the FK VALIDATE regress anchor
-alter_table.sql:378 → out:499-500). Alternatively C10 (evalCast coercion matrix,
-row 1398) or C11 (rules-subsystem, all ledgered). Remaining alter_table work:
-C9 residuals, C4/C10/C11.
+**Next step:** C10 — ALTER TYPE data-loss (failed int8→int4 rewrite leaves the
+table EMPTY, `internal error: expected int, got kind 1`; evalCast coercion
+matrix, ledger row 1398). Alternatively C11 (rules-subsystem) or C9 residuals
+(descendant-partition recursion, ONLY-on-partitioned DROP COLUMN). Remaining
+alter_table work: C9 residuals, C10/C11.
 
-**Gates run (this loop):** `go build ./...` PASS; targeted tests 17/17 + 4/4 PASS;
-`go test ./internal/executor/` PASS (cache warm); `scripts/pg-regress-runner.sh
-alter_table` 4153→4145 (−8), slice lines dropped, errposition byte-matches PG;
-pre-commit pgbench smoke PASS (12910 tps select-only, 0 failed). tpch-spotcheck
-NOT re-run — DDL-only change, no query/planner/codec path touched (Q12=2/Q13=35
-was confirmed last loop on this same branch).
+**Gates run (this loop):** `go build ./...` PASS; `go test ./internal/executor/`
+PASS (cache warm); `scripts/pg-regress-runner.sh alter_table` 4145→4113 (−32),
+FK block byte-green (verified vs HEAD worktree baseline); pre-commit pgbench
+smoke PASS (12828 tps select-only, 0 failed). tpch-spotcheck NOT re-run —
+DDL-only FK-path change, no query/planner/codec path touched.
 
-**Delegation:** tester `0134-0002-altertype-partition-guard` gate-run DONE (report
-returned as text; env blocked writing report.md to tmp).
+**Delegation:** researcher `0134-0002-c4-fk-dup-name-research` DONE (root cause
+(C): stale pile-up predates DROP; fix = 42710+42703+23503, not 42710 alone);
+implementer `0134-0002-c4-fk-add-validation` DONE (diff −32).
 
 **In-flight:** none.
