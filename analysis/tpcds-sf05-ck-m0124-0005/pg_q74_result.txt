@@ -1,0 +1,11 @@
+   customer_id    | customer_first_name  |       customer_last_name       
+------------------+----------------------+--------------------------------
+ AAAAAAAABFOMAAAA | Robert               | Pickard                       
+ AAAAAAAAEAGOAAAA | Gregory              | Cornell                       
+ AAAAAAAAGKMGAAAA | Harriet              | Springer                      
+ AAAAAAAAHEHEAAAA | Stephen              | Barbour                       
+ AAAAAAAAJBAHBAAA | Renea                | Dean                          
+ AAAAAAAALDOABAAA | Charles              | Atkins                        
+ AAAAAAAAPJCHBAAA | Robbie               | Jones                         
+(7 rows)
+

@@ -1,0 +1,35 @@
+ d_year | brand_id |                       brand                        | sum_agg 
+--------+----------+----------------------------------------------------+---------
+   1998 |  7013003 | exportinameless #3                                 |  404.78
+   1998 |  4004001 | edu packedu pack #1                                |  332.63
+   1998 |  3003001 | exportiexporti #1                                  |  167.42
+   1998 | 10003014 | exportiunivamalg #14                               |  142.90
+   1998 |  4003002 | exportiedu pack #2                                 |   80.58
+   1998 |  7014008 | edu packnameless #8                                |   71.91
+   1998 |  8011005 | amalgmaxi #5                                       |   16.60
+   1999 | 10003014 | exportiunivamalg #14                               |  556.68
+   1999 |  8011005 | amalgmaxi #5                                       |  220.32
+   1999 |  3003001 | exportiexporti #1                                  |  198.56
+   1999 |  7014008 | edu packnameless #8                                |  197.63
+   1999 |  7013003 | exportinameless #3                                 |  163.57
+   1999 |  4004001 | edu packedu pack #1                                |  104.96
+   1999 |  4003002 | exportiedu pack #2                                 |   27.39
+   2000 | 10003014 | exportiunivamalg #14                               |  315.55
+   2000 |  1002002 | importoamalg #2                                    |  211.71
+   2000 |  4003002 | exportiedu pack #2                                 |  209.44
+   2000 |  3003001 | exportiexporti #1                                  |  148.13
+   2000 |  7014008 | edu packnameless #8                                |   47.92
+   2000 |  4004001 | edu packedu pack #1                                |   32.49
+   2001 |  6011006 | amalgbrand #6                                      |  306.13
+   2001 |  7014008 | edu packnameless #8                                |  304.48
+   2001 |  1002002 | importoamalg #2                                    |  202.00
+   2001 | 10003014 | exportiunivamalg #14                               |  114.01
+   2001 |  4003002 | exportiedu pack #2                                 |   56.97
+   2002 |  1004001 | edu packamalg #1                                   |  391.47
+   2002 |  8012002 | amalgedu pack #1                                   |  291.15
+   2002 |  6011006 | amalgbrand #6                                      |  212.24
+   2002 | 10003014 | exportiunivamalg #14                               |   69.15
+   2002 |  7014008 | edu packnameless #8                                |   50.97
+   2002 |  4003002 | exportiedu pack #2                                 |   36.94
+(31 rows)
+

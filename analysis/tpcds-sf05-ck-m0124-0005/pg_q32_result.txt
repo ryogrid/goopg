@@ -1,0 +1,5 @@
+ excess discount amount 
+------------------------
+                2444.35
+(1 row)
+

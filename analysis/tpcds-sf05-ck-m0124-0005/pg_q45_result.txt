@@ -1,0 +1,11 @@
+   ca_zip   |   ca_city    |  sum  
+------------+--------------+-------
+ 04698      | Woodlawn     | 45.37
+ 32924      | Belleville   | 35.08
+ 41521      | Newport      | 11.59
+ 48482      | Mount Vernon | 25.35
+ 68252      | Maple Grove  | 55.18
+ 76614      | Providence   | 75.83
+ 79303      | Springfield  |  5.84
+(7 rows)
+

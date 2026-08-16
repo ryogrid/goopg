@@ -1,0 +1,14 @@
+pgbench (18.3)
+starting vacuum...end.
+transaction type: /home/ryo/work/goopg/goopg/analysis/perf-optimize3/runs/s5c3_s1_hotkey_ab/hotkey.sql
+scaling factor: 1
+query mode: prepared
+number of clients: 1
+number of threads: 1
+maximum number of tries: 1
+duration: 120 s
+number of transactions actually processed: 72628
+number of failed transactions: 0 (0.000%)
+latency average = 1.652 ms
+initial connection time = 0.403 ms
+tps = 605.232854 (without initial connection time)

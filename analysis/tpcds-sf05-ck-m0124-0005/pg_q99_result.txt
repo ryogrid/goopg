@@ -1,0 +1,94 @@
+        substr        |            sm_type             |    cc_name    | 30 days | 31-INTERVAL '60 days' | 61-INTERVAL '90 days' | 91-INTERVAL '120 days' | >120 days 
+----------------------+--------------------------------+---------------+---------+-----------------------+-----------------------+------------------------+-----------
+ Bad cards must make. | EXPRESS                        | Mid Atlantic  |     613 |                   633 |                   637 |                      0 |         0
+ Bad cards must make. | EXPRESS                        | NY Metro      |     632 |                   631 |                   642 |                      0 |         0
+ Bad cards must make. | EXPRESS                        | North Midwest |     662 |                   640 |                   610 |                      0 |         0
+ Bad cards must make. | LIBRARY                        | Mid Atlantic  |     463 |                   515 |                   496 |                      0 |         0
+ Bad cards must make. | LIBRARY                        | NY Metro      |     495 |                   495 |                   485 |                      0 |         0
+ Bad cards must make. | LIBRARY                        | North Midwest |     469 |                   490 |                   464 |                      0 |         0
+ Bad cards must make. | NEXT DAY                       | Mid Atlantic  |     599 |                   630 |                   621 |                      0 |         0
+ Bad cards must make. | NEXT DAY                       | NY Metro      |     641 |                   641 |                   641 |                      0 |         0
+ Bad cards must make. | NEXT DAY                       | North Midwest |     642 |                   655 |                   661 |                      0 |         0
+ Bad cards must make. | OVERNIGHT                      | Mid Atlantic  |     463 |                   443 |                   508 |                      0 |         0
+ Bad cards must make. | OVERNIGHT                      | NY Metro      |     488 |                   465 |                   519 |                      0 |         0
+ Bad cards must make. | OVERNIGHT                      | North Midwest |     465 |                   494 |                   490 |                      0 |         0
+ Bad cards must make. | REGULAR                        | Mid Atlantic  |     452 |                   483 |                   450 |                      0 |         0
+ Bad cards must make. | REGULAR                        | NY Metro      |     479 |                   512 |                   498 |                      0 |         0
+ Bad cards must make. | REGULAR                        | North Midwest |     443 |                   437 |                   478 |                      0 |         0
+ Bad cards must make. | TWO DAY                        | Mid Atlantic  |     472 |                   474 |                   498 |                      0 |         0
+ Bad cards must make. | TWO DAY                        | NY Metro      |     445 |                   496 |                   511 |                      0 |         0
+ Bad cards must make. | TWO DAY                        | North Midwest |     459 |                   449 |                   476 |                      0 |         0
+ Conventional childr  | EXPRESS                        | Mid Atlantic  |     593 |                   571 |                   634 |                      0 |         0
+ Conventional childr  | EXPRESS                        | NY Metro      |     572 |                   651 |                   663 |                      0 |         0
+ Conventional childr  | EXPRESS                        | North Midwest |     603 |                   662 |                   609 |                      0 |         0
+ Conventional childr  | LIBRARY                        | Mid Atlantic  |     482 |                   482 |                   446 |                      0 |         0
+ Conventional childr  | LIBRARY                        | NY Metro      |     459 |                   478 |                   476 |                      0 |         0
+ Conventional childr  | LIBRARY                        | North Midwest |     471 |                   455 |                   508 |                      0 |         0
+ Conventional childr  | NEXT DAY                       | Mid Atlantic  |     653 |                   630 |                   616 |                      0 |         0
+ Conventional childr  | NEXT DAY                       | NY Metro      |     627 |                   623 |                   666 |                      0 |         0
+ Conventional childr  | NEXT DAY                       | North Midwest |     603 |                   682 |                   643 |                      0 |         0
+ Conventional childr  | OVERNIGHT                      | Mid Atlantic  |     490 |                   478 |                   492 |                      0 |         0
+ Conventional childr  | OVERNIGHT                      | NY Metro      |     466 |                   504 |                   479 |                      0 |         0
+ Conventional childr  | OVERNIGHT                      | North Midwest |     457 |                   457 |                   468 |                      0 |         0
+ Conventional childr  | REGULAR                        | Mid Atlantic  |     454 |                   463 |                   449 |                      0 |         0
+ Conventional childr  | REGULAR                        | NY Metro      |     487 |                   496 |                   488 |                      0 |         0
+ Conventional childr  | REGULAR                        | North Midwest |     472 |                   505 |                   490 |                      0 |         0
+ Conventional childr  | TWO DAY                        | Mid Atlantic  |     467 |                   464 |                   528 |                      0 |         0
+ Conventional childr  | TWO DAY                        | NY Metro      |     451 |                   504 |                   486 |                      0 |         0
+ Conventional childr  | TWO DAY                        | North Midwest |     495 |                   504 |                   486 |                      0 |         0
+ Doors canno          | EXPRESS                        | Mid Atlantic  |     611 |                   628 |                   627 |                      0 |         0
+ Doors canno          | EXPRESS                        | NY Metro      |     617 |                   669 |                   648 |                      0 |         0
+ Doors canno          | EXPRESS                        | North Midwest |     585 |                   616 |                   688 |                      0 |         0
+ Doors canno          | LIBRARY                        | Mid Atlantic  |     460 |                   508 |                   487 |                      0 |         0
+ Doors canno          | LIBRARY                        | NY Metro      |     447 |                   467 |                   502 |                      0 |         0
+ Doors canno          | LIBRARY                        | North Midwest |     477 |                   456 |                   504 |                      0 |         0
+ Doors canno          | NEXT DAY                       | Mid Atlantic  |     624 |                   615 |                   615 |                      0 |         0
+ Doors canno          | NEXT DAY                       | NY Metro      |     606 |                   612 |                   639 |                      0 |         0
+ Doors canno          | NEXT DAY                       | North Midwest |     634 |                   646 |                   625 |                      0 |         0
+ Doors canno          | OVERNIGHT                      | Mid Atlantic  |     443 |                   444 |                   492 |                      0 |         0
+ Doors canno          | OVERNIGHT                      | NY Metro      |     478 |                   511 |                   496 |                      0 |         0
+ Doors canno          | OVERNIGHT                      | North Midwest |     452 |                   483 |                   465 |                      0 |         0
+ Doors canno          | REGULAR                        | Mid Atlantic  |     446 |                   488 |                   453 |                      0 |         0
+ Doors canno          | REGULAR                        | NY Metro      |     451 |                   481 |                   472 |                      0 |         0
+ Doors canno          | REGULAR                        | North Midwest |     452 |                   501 |                   457 |                      0 |         0
+ Doors canno          | TWO DAY                        | Mid Atlantic  |     484 |                   473 |                   487 |                      0 |         0
+ Doors canno          | TWO DAY                        | NY Metro      |     446 |                   482 |                   525 |                      0 |         0
+ Doors canno          | TWO DAY                        | North Midwest |     451 |                   501 |                   457 |                      0 |         0
+ Important issues liv | EXPRESS                        | Mid Atlantic  |     650 |                   645 |                   644 |                      0 |         0
+ Important issues liv | EXPRESS                        | NY Metro      |     639 |                   676 |                   620 |                      0 |         0
+ Important issues liv | EXPRESS                        | North Midwest |     586 |                   639 |                   659 |                      0 |         0
+ Important issues liv | LIBRARY                        | Mid Atlantic  |     467 |                   505 |                   443 |                      0 |         0
+ Important issues liv | LIBRARY                        | NY Metro      |     469 |                   481 |                   478 |                      0 |         0
+ Important issues liv | LIBRARY                        | North Midwest |     478 |                   508 |                   495 |                      0 |         0
+ Important issues liv | NEXT DAY                       | Mid Atlantic  |     608 |                   622 |                   628 |                      0 |         0
+ Important issues liv | NEXT DAY                       | NY Metro      |     623 |                   663 |                   606 |                      0 |         0
+ Important issues liv | NEXT DAY                       | North Midwest |     618 |                   633 |                   660 |                      0 |         0
+ Important issues liv | OVERNIGHT                      | Mid Atlantic  |     455 |                   509 |                   508 |                      0 |         0
+ Important issues liv | OVERNIGHT                      | NY Metro      |     434 |                   473 |                   489 |                      0 |         0
+ Important issues liv | OVERNIGHT                      | North Midwest |     457 |                   473 |                   493 |                      0 |         0
+ Important issues liv | REGULAR                        | Mid Atlantic  |     482 |                   485 |                   496 |                      0 |         0
+ Important issues liv | REGULAR                        | NY Metro      |     489 |                   466 |                   488 |                      0 |         0
+ Important issues liv | REGULAR                        | North Midwest |     408 |                   487 |                   501 |                      0 |         0
+ Important issues liv | TWO DAY                        | Mid Atlantic  |     494 |                   467 |                   484 |                      0 |         0
+ Important issues liv | TWO DAY                        | NY Metro      |     467 |                   507 |                   503 |                      0 |         0
+ Important issues liv | TWO DAY                        | North Midwest |     487 |                   471 |                   485 |                      0 |         0
+                      | EXPRESS                        | Mid Atlantic  |     575 |                   630 |                   632 |                      0 |         0
+                      | EXPRESS                        | NY Metro      |     649 |                   632 |                   689 |                      0 |         0
+                      | EXPRESS                        | North Midwest |     602 |                   723 |                   621 |                      0 |         0
+                      | LIBRARY                        | Mid Atlantic  |     458 |                   484 |                   462 |                      0 |         0
+                      | LIBRARY                        | NY Metro      |     483 |                   506 |                   465 |                      0 |         0
+                      | LIBRARY                        | North Midwest |     489 |                   487 |                   487 |                      0 |         0
+                      | NEXT DAY                       | Mid Atlantic  |     589 |                   623 |                   635 |                      0 |         0
+                      | NEXT DAY                       | NY Metro      |     626 |                   613 |                   690 |                      0 |         0
+                      | NEXT DAY                       | North Midwest |     606 |                   633 |                   614 |                      0 |         0
+                      | OVERNIGHT                      | Mid Atlantic  |     483 |                   475 |                   452 |                      0 |         0
+                      | OVERNIGHT                      | NY Metro      |     471 |                   495 |                   532 |                      0 |         0
+                      | OVERNIGHT                      | North Midwest |     499 |                   513 |                   482 |                      0 |         0
+                      | REGULAR                        | Mid Atlantic  |     504 |                   503 |                   444 |                      0 |         0
+                      | REGULAR                        | NY Metro      |     515 |                   457 |                   493 |                      0 |         0
+                      | REGULAR                        | North Midwest |     442 |                   467 |                   500 |                      0 |         0
+                      | TWO DAY                        | Mid Atlantic  |     472 |                   477 |                   482 |                      0 |         0
+                      | TWO DAY                        | NY Metro      |     478 |                   488 |                   481 |                      0 |         0
+                      | TWO DAY                        | North Midwest |     455 |                   454 |                   483 |                      0 |         0
+(90 rows)
+

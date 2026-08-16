@@ -1,8 +1,0 @@
-# arm=p59g-on GOOPG_PGSHAPED_DP=1 GOOPG_PGSHAPED_COLLAPSE=0
-# started 2026-08-05T19:19:34+09:00
-# engine-id: eacc2854bf53b7f67112362250f01c5f75a6d538 9b06b5433a2c1807361b57dcf6f4cecceb222f7d  diff=a53bfad6787a
-# engine-binary: on-disk=c8fe0d352d75b67e (tmp/goopg-acceptance-bin)
-# per-query cap 600s, serial, digest=1, queries=2
-# host: load1.71 1.04 1.01
-Q2: OK elapsed=3.36s colsig=98559dc0378d935e ordered=1c0f630719e8c7bf unordered=ad503517a304eacf rows=455
-# finished 2026-08-05T19:19:39+09:00

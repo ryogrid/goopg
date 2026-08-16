@@ -1,0 +1,104 @@
+          c_last_name           |     c_first_name     |     ca_city     |   bought_city   | ss_ticket_number | extended_price | extended_tax | list_price 
+--------------------------------+----------------------+-----------------+-----------------+------------------+----------------+--------------+------------
+ Abbott                         | Phillip              | Clinton         | Woodville       |            47272 |       49610.47 |      1241.65 |   74192.73
+ Acevedo                        | Frank                | Lakeview        | Glenwood        |           215146 |       13225.53 |       717.33 |   18839.40
+ Acker                          | Mattie               | Springdale      | Harmony         |            78972 |       44099.05 |      2720.74 |   80434.44
+ Acosta                         | Tammy                | White Oak       | Ashland         |           199216 |       32887.43 |      1011.86 |   56479.94
+ Adair                          | Martin               | Highland        | Bayside         |           142446 |       13961.40 |       391.12 |   29551.75
+ Adams                          | Betty                | Lakewood        | Newtown         |            83966 |       16276.87 |       591.29 |   33501.11
+ Adams                          | Isidro               | Glenwood        | Red Hill        |           183176 |       10630.29 |       372.02 |   23558.82
+ Adams                          | Joyce                | Highland        | Cedar Grove     |           195114 |       20891.36 |       711.11 |   38680.73
+ Adamson                        | Martin               | Riverview       | Shady Grove     |            41342 |       18424.92 |       552.17 |   35103.54
+ Agnew                          | Elizabeth            | Pine Grove      | Brownsville     |           148802 |       19134.40 |       873.45 |   46277.05
+ Ahrens                         | Mario                | Willis          | Murray          |            51932 |       15886.59 |       584.21 |   27543.96
+ Aldridge                       | Angela               | Royal           | Plainview       |             3344 |       10415.32 |       306.33 |   30421.61
+ Alexander                      | Annie                | Lebanon         | Union Hill      |            72228 |       16580.34 |      1018.88 |   33696.04
+ Allen                          | Dwayne               | Waterloo        | Plainview       |           161994 |       15557.75 |       461.34 |   38173.68
+ Alves                          | Sam                  | Mount Olive     | Union Hill      |           129660 |       22050.59 |       820.80 |   42100.03
+ Ambrose                        | Robert               | Concord         | Fairfield       |           125246 |       35253.72 |       957.24 |   50809.46
+ Amundson                       | Bruce                | Shady Grove     | Newtown         |            86398 |       27968.36 |      1124.39 |   42111.77
+ Anderson                       | Sean                 | Mount Olive     | Raymond         |           109916 |       17292.16 |       682.27 |   35566.96
+ Anderson                       | Jeremy               | Woodlawn        | Midway          |           237752 |       21371.29 |      1105.83 |   36031.69
+ Appleton                       | Antonio              | Rolling Hills   | Pleasant Valley |            48732 |       21710.16 |      1195.48 |   53466.79
+ Appleton                       | Ivan                 | Summit          | Mount Vernon    |            74586 |       36305.98 |      1631.85 |   72330.28
+ Armstrong                      | Steven               | Florence        | Jamestown       |            40698 |       26319.63 |      1128.36 |   40715.19
+ Arnold                         | Jane                 | Vance           | Shiloh          |           168172 |       38423.41 |      1230.88 |   52422.66
+ Ashmore                        | Karen                | Cedar Grove     | Sulphur Springs |            35216 |       23105.58 |      1288.00 |   42468.01
+ Atkinson                       | Vance                | Valley View     | Marion          |           121448 |       33313.04 |      1351.04 |   71288.66
+ Austin                         | Joseph               | Enterprise      | Ashland         |           139200 |       18890.28 |       666.12 |   29821.57
+ Baca                           | Sharon               | Oak Hill        | Antioch         |           110126 |       14681.86 |       369.43 |   30584.63
+ Baca                           | Daniel               | Winslow         | Mount Olive     |           214810 |       21722.75 |      1152.00 |   39746.08
+ Baer                           | Alexandria           | Lakewood        | Union           |           171992 |       24255.01 |      1322.93 |   42176.49
+ Bailey                         | Victoria             | Pleasant Grove  | Hopewell        |            66382 |        9775.11 |       475.37 |   27294.58
+ Bailey                         | William              | Sulphur Springs | Oakdale         |           100572 |        9877.70 |       218.13 |   28736.29
+ Baird                          | Antonia              | Farmington      | Millbrook       |           101772 |       15613.42 |       767.34 |   43360.27
+ Baird                          | Catherine            | Five Points     | Springdale      |           216828 |       21067.21 |      1051.96 |   68653.28
+ Baker                          | Jose                 | Sulphur Springs | Woodbury        |            33432 |       20752.47 |      1305.18 |   34207.21
+ Baldwin                        | Belen                | Maple Grove     | Highland Park   |           116304 |       20681.58 |       675.58 |   64022.57
+ Baldwin                        | Leroy                | Shiloh          | King            |           189166 |        9946.76 |       480.11 |   38117.76
+ Baldwin                        | Thomas               | Johnsonville    | Shannon         |           212512 |       20558.90 |       699.91 |   34479.46
+ Ball                           | Lionel               | Union           | Waterloo        |            35808 |       16691.93 |       726.90 |   40589.67
+ Baptiste                       | Allen                | Lakewood        | Spring Hill     |            85386 |       23063.37 |      1163.22 |   36503.87
+ Barnes                         | Jose                 | Five Points     | Marion          |             7910 |        5663.85 |       208.43 |   22064.01
+ Barnes                         | Arthur               | Flint           | Stringtown      |            71708 |       13512.86 |       711.46 |   32063.72
+ Barnes                         | Charles              | Spring Hill     | Franklin        |            79586 |       35911.85 |       759.04 |   61893.18
+ Barney                         | Meredith             | Harmony         | Riverview       |            32056 |       21525.53 |      1067.00 |   42716.02
+ Barnhart                       | James                | Fairfield       | Mount Vernon    |           213978 |       34729.28 |      1316.45 |   59727.09
+ Bates                          | Eleanor              | Spring Valley   | Oak Hill        |             5306 |       36389.82 |      1999.64 |   66806.45
+ Bates                          | Billy                | Walnut Grove    | Calhoun         |           205252 |       12009.25 |       430.19 |   17398.12
+ Battle                         | Mariam               | Oak Hill        | Warwick         |           130050 |       26034.67 |      1050.88 |   45960.28
+ Battles                        | Leon                 | Glenwood        | Milo            |           117390 |       30957.18 |      1188.86 |   48011.23
+ Beard                          | Stephanie            | Greenfield      | Sunnyside       |           200178 |       27764.06 |       779.13 |   83751.17
+ Beattie                        | Clinton              | Dewey           | Macedonia       |           122806 |       14749.26 |      1062.28 |   22915.11
+ Beaulieu                       | Kristen              | Birmingham      | New Hope        |           142196 |       24640.46 |      1024.03 |   52514.01
+ Beck                           | Lyle                 | Lakewood        | Greenville      |           124000 |       13794.61 |       558.91 |   32119.93
+ Belanger                       |                      | Royal           | Lakewood        |             4188 |       28253.89 |      1314.35 |   65407.02
+ Belcher                        | Jacob                | Springdale      | Salem           |           199042 |       27490.05 |      1429.05 |   57632.47
+ Bell                           | Andrea               | Bridgeport      | Sulphur Springs |           113016 |       22799.95 |       892.48 |   44743.07
+ Bell                           | Sean                 | Unionville      | Ellisville      |           161754 |       23519.18 |      1353.13 |   32257.93
+ Beltran                        | Bonnie               | Woodville       | Belleville      |            36262 |       18631.23 |      1101.79 |   27232.08
+ Benavides                      | Gene                 | Arlington       | Hopewell        |           132044 |       41242.04 |       978.67 |   68240.55
+ Bender                         | David                | Deerfield       | Siloam          |            52642 |       20074.97 |       630.72 |   50817.89
+ Benitez                        | Kristin              | Mount Zion      | Florence        |            40134 |       26103.68 |      1008.47 |   45109.91
+ Berger                         | Jeff                 | Concord         | Bunker Hill     |           139392 |       26153.74 |       484.61 |   44739.83
+ Berrios                        | Diane                | Highland Park   | Union           |           130842 |       19022.88 |       662.02 |   38467.51
+ Bilodeau                       | Angela               | Waterloo        | Woodville       |           140268 |       13353.70 |       591.96 |   32359.96
+ Black                          | Angela               | Oakdale         | Ferguson        |           124288 |       45793.85 |      1131.57 |   68012.93
+ Black                          | Marcy                | Newtown         | Frenchtown      |           174668 |       23022.19 |       725.72 |   52641.57
+ Blair                          | Anderson             | Wildwood        | Adrian          |           131278 |        9428.51 |       231.36 |   22500.53
+ Blodgett                       | Milton               | Stewart         | Belmont         |           164974 |       33895.35 |      1709.94 |   48030.84
+ Bonner                         | Sandra               | New Salem       | Doyle           |           116460 |       24848.22 |      1325.53 |   35246.81
+ Booker                         | Mark                 | Ridgeville      | Mountain View   |            84604 |       22012.48 |       928.91 |   46584.31
+ Borrego                        | Arleen               | Bethel          | Antioch         |            78362 |       16922.30 |       710.98 |   32699.46
+ Boswell                        | Marc                 | Pine Grove      | Edgewood        |           229676 |       14126.48 |       602.93 |   32699.15
+ Bourgeois                      | Betty                | Highland Park   | Carthage        |           183642 |       37127.21 |       879.44 |   76586.09
+ Bowen                          | William              | Waterloo        | Concord         |            23126 |       24860.45 |       843.22 |   53292.00
+ Bowen                          | Fannie               | Belmont         | Friendship      |           105966 |       10263.58 |       255.21 |   23132.69
+ Bowers                         | Misty                | Maple Grove     | Waterloo        |           155358 |       17647.90 |       681.36 |   36219.43
+ Bowler                         | Jimmy                | Clifton         | Springfield     |            49948 |       31317.77 |      1345.10 |   60726.99
+ Bowser                         | Raymond              | Frogtown        | Bethel          |            77052 |       24901.73 |      1328.28 |   44501.09
+ Boyle                          | Benjamin             | Crossroads      | Five Points     |           183558 |       16266.25 |       849.19 |   25290.69
+ Boynton                        | Elvira               | Pleasant Hill   | Wilson          |            21688 |       26646.07 |       840.12 |   47559.78
+ Brackett                       | Shelley              | Buena Vista     | Valley View     |           101140 |       24782.02 |       984.55 |   55333.28
+ Bradley                        | Orlando              | Forest Hills    | Bethel          |            46224 |       14341.47 |       748.81 |   35325.65
+ Bradley                        | Eric                 | Five Points     | Union           |           190270 |       31392.97 |      2017.89 |   49093.28
+ Brady                          | George               | Florence        | Hopewell        |            87960 |        9266.71 |       317.64 |   25303.91
+ Bragg                          | Daniel               | Oak Hill        | Franklin        |           161342 |       15607.96 |       236.57 |   33214.24
+ Bragg                          | Daniel               | Oak Hill        | Bethel          |           174622 |       27947.22 |      1039.46 |   50047.47
+ Branch                         | Victoria             | Providence      | Stringtown      |            59596 |       22280.02 |       462.84 |   51643.83
+ Breen                          | Donald               | Summit          | Oak Hill        |            89734 |       10368.20 |       206.82 |   30042.46
+ Briggs                         | Anita                | Ashland         | Pine Grove      |           108894 |       15618.75 |       382.52 |   24161.98
+ Brigham                        | Bob                  | Lakeview        | Highland Park   |             6452 |       29967.77 |       838.63 |   47493.75
+ Brill                          | Michael              | Woodlawn        | Oak Ridge       |           143288 |       15234.45 |       659.89 |   35981.15
+ Britton                        | Opal                 | Maple Grove     | Valley View     |           114680 |       19378.55 |       524.82 |   30309.84
+ Britton                        | Opal                 | Maple Grove     | Plainview       |           226790 |        9666.76 |       293.25 |   24007.62
+ Brock                          | Mark                 | Howell          | Brownsville     |           222986 |       33727.07 |      1699.87 |   58342.39
+ Brooks                         | Donna                | Lenox           | Ashland         |            70606 |       23975.39 |      1417.35 |   27968.31
+ Brothers                       | Frank                | Pleasant Hill   | Mount Vernon    |            24266 |       17766.24 |      1352.64 |   29995.73
+ Brothers                       | Johnnie              | Riverview       | Providence      |           115448 |        7246.79 |       312.83 |   29933.26
+ Brothers                       | Deborah              | Oakwood         | Bridgeport      |           170408 |       16003.05 |       577.76 |   25640.86
+ Brothers                       | Barbara              | Red Hill        | Antioch         |           238104 |        9398.68 |       476.82 |   21444.86
+ Brower                         | Ricky                | Glendale        | Lakewood        |            60242 |       14753.42 |       158.13 |   29646.50
+ Brown                          | Linsey               | Jamestown       | Woodlawn        |             4118 |       36297.48 |      1032.13 |   47973.81
+(100 rows)
+

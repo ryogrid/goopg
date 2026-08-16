@@ -117,6 +117,7 @@ bench/tpcds/runtime_goopg/*.log
 # Nightly CI batch run outputs (ci/design/04)
 ci/logs/
 /__pycache__/
+*.pyc
 
 !ci/logs
 ci/logs/*
@@ -126,6 +127,7 @@ ci/logs/*
 !ci/logs/history.jsonl
 
 analysis/tpcds-sf1-all-queries.md
+*.pb.gz
 
 # goopg-authored isolation specs + their PG-captured expected output. The
 # oracle's own .spec/.out live under /postgres/ (a gitignored reference clone);

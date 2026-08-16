@@ -1,0 +1,12 @@
+   customer_id    | customer_first_name  |       customer_last_name       |               customer_email_address               
+------------------+----------------------+--------------------------------+----------------------------------------------------
+ AAAAAAAAFAJDBAAA | Geneva               | Trapp                          | Geneva.Trapp@OfMqrcpKx4SQ9ur.com                  
+ AAAAAAAAFKGIAAAA | Robert               | Freedman                       | Robert.Freedman@JltAdxuFZNC3o3.edu                
+ AAAAAAAAGCPPAAAA | Fairy                | Guidry                         | Fairy.Guidry@ENOrn661brYsJMkG.com                 
+ AAAAAAAAHDLHBAAA | Andrew               | Price                          | Andrew.Price@N7C06F.com                           
+ AAAAAAAAKAGNAAAA | Teresa               | James                          | Teresa.James@pB4Oat44i7C.com                      
+ AAAAAAAAKDAEBAAA | Dean                 | Taggart                        | Dean.Taggart@Hm5pXtPMOYFtXtgL.com                 
+ AAAAAAAANDKGAAAA | Sarah                | Bernier                        | Sarah.Bernier@iio4OLx.com                         
+ AAAAAAAAPBGHBAAA | Jonathan             | Gill                           | Jonathan.Gill@pgChIL5CBvYB.edu                    
+(8 rows)
+
