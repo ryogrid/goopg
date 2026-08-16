@@ -389,6 +389,55 @@ the guards — `Column.InhCount int` multi-parent bookkeeping (attinhcount 1-vs-
 LIKE+ATTACH-PARTITION `Inherited`, INHERIT child-validation, and INHERITS merge
 NOTICEs, each ledgered (3 rows).
 
+## C3 first slice — constraint row-validation scans (ADD CHECK / SET NOT NULL / VALIDATE CHECK)
+
+C3 is "constraint validation scans absent": four ALTER arms register a constraint
+without scanning existing rows, so goopg silently accepts data PG refuses. A
+research pass (`tmp/ralph-handoffs/0134-0002-c3-constraint-scan-research/report.md`)
+confirmed the exact PG behavior and split C3 into **two slices**:
+
+- **Slice 1 (this section): the three non-index scans** — ADD CHECK, SET NOT NULL,
+  VALIDATE CHECK. Each mirrors the existing FK scan twin
+  `validateFKConstraintExistingRows` (operators_ddl.go:10548) — a page-Pin loop over
+  live rows — factored into one shared `forEachLiveRow` helper.
+- **Slice 2 (deferred, ledger row): the index-build path** — the ADD PK/UNIQUE
+  23505 `DETAIL: Key (...) is duplicated.` (needs per-entry value capture in
+  `btree.BulkEntry`, which today carries only `Key []byte + Ptr`), the ADD-PK-over-
+  NULL 23502 scan, and `Pos=0` on the 23505 error (goopg emits a spurious `LINE 1`
+  caret PG does not). Separately, the VALIDATE-FK anchor (sql:378) stays masked by
+  a C4-class ADD-FK duplicate-name shadowing artifact (not this slice).
+
+PG scan mechanics (the brief's `setRelNotNull`/`validateCheckConstraint` names do
+not exist in PG 18.3 — the scans run in `ATRewriteTable`, tablecmds.c:6125, the
+phase-3 work queue):
+
+- **ADD CHECK** (`ATAddCheckNNConstraint` tablecmds.c:9911 → `ATRewriteTable`
+  :6492-6498): when `!skip_validation` (grammar sets it for `NOT VALID`/`NOT
+  ENFORCED`), per row `ExecCheck(con->qualstate)`; on FALSE → 23514 `check
+  constraint "%s" of relation "%s" is violated by some row`. SQL 3-valued logic:
+  only a definite FALSE violates; NULL/UNKNOWN passes. goopg gate:
+  `!act.NotValid && !act.CheckNotEnforced`.
+- **SET NOT NULL** (`ATExecSetNotNull` tablecmds.c:7913 → `set_attnotnull` →
+  `ATRewriteTable` :6450-6463): first NULL row → 23502 `column "%s" of relation "%s"
+  contains null values` (single message, aborts at first NULL). Distinct from the
+  INSERT/UPDATE runtime message `null value in column %q ... violates not-null
+  constraint` (operators_fk.go:1831) — do not conflate.
+- **VALIDATE CHECK** (`ATExecValidateConstraint` tablecmds.c:12908 →
+  `QueueCheckConstraintValidation` :13116 re-reads conbin): same 23514 scan; on
+  success flips `convalidated` 'f'→'t'. NOT NULL VALIDATE already correct (C2 slice
+  10); FK VALIDATE already wired (:7757).
+
+Row-scan helper: there is no shared primitive today — the identical page-Pin loop
+is duplicated in `validateFKConstraintExistingRows` (:10557-10596) and
+`collectBTreeEntries` (:11013). Slice 1 adds `forEachLiveRow(tbl, func(*catalog.Row)
+error) error` as a copy of that loop and uses it for the three new scans; the
+existing FK/btree callers are NOT refactored onto it this slice (minimize blast
+radius on the already-working FK scan). CHECK evaluation uses
+`planner.ResolveIndexPredicate(expr, tbl)` once (planner.go:74) then
+`evalExpr(planned, row, o.ctx)` per row — NOT the per-row mini-query rebuild in
+`checkConstraints` (O(N·parse+plan)). All three scan errors set `Pos=0` (PG emits
+no errposition on these refusals).
+
 ## Secondary finding (corrects deferral-ledger row 1385)
 
 The EXPLAIN `QUERY PLAN` underline width is **not** a goopg fixed-width

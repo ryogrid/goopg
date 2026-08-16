@@ -7769,6 +7769,24 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if !found {
 				for i := range tbl.NamedChecks {
 					if strings.EqualFold(tbl.NamedChecks[i].Name, act.ConstraintName) {
+						// PG's ATExecValidateConstraint refuses NOT ENFORCED for
+						// every constraint type before the convalidated check
+						// (tablecmds.c:12955-12958, 55000). No errposition (Pos 0).
+						if tbl.NamedChecks[i].NotEnforced {
+							return &ExecError{Code: "55000", Pos: 0, Message: "cannot validate NOT ENFORCED constraint"}
+						}
+						// Only an unvalidated constraint is re-scanned
+						// (ATExecValidateConstraint gates on !convalidated,
+						// tablecmds.c:12960); an already-valid CHECK is a no-op.
+						// QueueCheckConstraintValidation re-reads conbin and runs
+						// the SAME 23514 scan as ADD CHECK (tablecmds.c:13116);
+						// on success convalidated 'f'→'t'. M0134-0002 C3 slice 1.
+						if tbl.NamedChecks[i].NotValid {
+							if err := o.validateCheckConstraintRows(tbl, act.ConstraintName, tbl.NamedChecks[i].Expr); err != nil {
+								return err
+							}
+							tbl.NamedChecks[i].NotValid = false
+						}
 						found = true
 						break
 					}
@@ -7806,6 +7824,24 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				// (same Code 42P16, same message, same %q). M0134-0002 C2.
 				if act.NoInherit && tbl.PartitionKey != nil {
 					return &ExecError{Code: "42P16", Pos: act.Pos(), Message: fmt.Sprintf("cannot add NO INHERIT constraint to partitioned table %q", tbl.Name)}
+				}
+				// Scan existing rows when the constraint is validating
+				// (not NOT VALID / not NOT ENFORCED). PG queues the constraint
+				// for ATRewriteTable's phase-3 scan when !skip_validation
+				// (ATAddCheckNNConstraint, tablecmds.c:9956) and raises 23514
+				// on a definite FALSE (tablecmds.c:6493-6498). The scan runs
+				// BEFORE registration so a failed statement leaves no in-memory
+				// constraint behind (mirrors PG, where the whole statement
+				// rolls back). An anonymous constraint uses the auto-generated
+				// name so the message matches PG's. M0134-0002 C3 slice 1.
+				if !act.NotValid && !act.CheckNotEnforced {
+					conName := act.ConstraintName
+					if conName == "" {
+						conName = o.autoCheckName(tbl, act.CheckExpr)
+					}
+					if err := o.validateCheckConstraintRows(tbl, conName, act.CheckExpr); err != nil {
+						return err
+					}
 				}
 				// act.CheckNotEnforced carries an `ADD CONSTRAINT ... CHECK
 				// (...) NOT ENFORCED` (PG18) so the dumped constraintdef
@@ -9263,9 +9299,10 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// populated at CREATE TABLE, so the change is flushed via
 			// delete-old-rows + re-sync. DU-002 slice 270.
 			found := false
+			colIdx := -1
 			for i := range tbl.Columns {
 				if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
-					tbl.Columns[i].NotNull = true
+					colIdx = i
 					found = true
 					break
 				}
@@ -9274,6 +9311,24 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				return &ExecError{Code: "42703", Pos: act.Pos(),
 					Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
 			}
+			// Scan existing rows for NULLs BEFORE mutating in-memory state so a
+			// failed statement (23502) leaves no trace. PG's ATExecSetNotNull
+			// queues a phase-3 verify_new_notnull scan (tablecmds.c:8057 →
+			// ATRewriteTable :6450-6463) that aborts at the FIRST NULL with a
+			// single 23502 — distinct from the INSERT/UPDATE runtime wording
+			// (`null value in column %q ... violates not-null constraint`,
+			// operators_fk.go:1831). No errposition, so Pos stays 0.
+			// M0134-0002 C3 slice 1.
+			if err := o.forEachLiveRow(tbl, func(row Row) error {
+				if row[colIdx].IsNull() {
+					return &ExecError{Code: "23502", Pos: 0,
+						Message: fmt.Sprintf("column %q of relation %q contains null values", act.ColumnName, tbl.Name)}
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+			tbl.Columns[colIdx].NotNull = true
 			// Add a named NOT NULL constraint unless one already exists for the
 			// column (SET NOT NULL is idempotent in PG — no duplicate row).
 			hasNN := false
@@ -9345,9 +9400,10 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// pg_attribute.attnotnull flush goes through the same delete-old-rows
 			// + syncTableToCatalogHeap path as SET NOT NULL. DU-002 slice 271.
 			found := false
+			colIdx := -1
 			for i := range tbl.Columns {
 				if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
-					tbl.Columns[i].NotNull = true
+					colIdx = i
 					found = true
 					break
 				}
@@ -9356,6 +9412,21 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				return &ExecError{Code: "42703", Pos: act.Pos(),
 					Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
 			}
+			// Scan existing rows for NULLs BEFORE mutating in-memory state (same
+			// 23502 scan as SET NOT NULL; NOT VALID defers validation, mirroring
+			// PG's skip_validation). M0134-0002 C3 slice 1.
+			if !act.NotValid {
+				if err := o.forEachLiveRow(tbl, func(row Row) error {
+					if row[colIdx].IsNull() {
+						return &ExecError{Code: "23502", Pos: 0,
+							Message: fmt.Sprintf("column %q of relation %q contains null values", act.ColumnName, tbl.Name)}
+					}
+					return nil
+				}); err != nil {
+					return err
+				}
+			}
+			tbl.Columns[colIdx].NotNull = true
 			// Idempotent: a column already carrying a NOT NULL constraint is left
 			// as-is (PG raises no error and adds no duplicate row).
 			hasNN := false
@@ -10527,6 +10598,133 @@ func (o *ddlOp) nonFKConstraintExists(tbl *catalog.Table, name string) bool {
 		}
 	}
 	return false
+}
+
+// forEachLiveRow invokes fn for every live heap row of tbl. The row passed to
+// fn is a reused decode buffer and is only valid for the duration of the call.
+// Iterates with the same page-Pin loop as validateFKConstraintExistingRows and
+// collectBTreeEntries: the simplified "Xmin valid, Xmax invalid" liveness check
+// (no snapshot MVCC visibility), the established pattern for DDL-time
+// existing-row scans. Aborts on the first fn error, unpinning the current page.
+// M0134-0002 C3 slice 1 (shared by the ADD CHECK / SET NOT NULL / VALIDATE
+// CHECK scans).
+func (o *ddlOp) forEachLiveRow(tbl *catalog.Table, fn func(row Row) error) error {
+	rel := o.ctx.Catalog.RelFileNode(tbl)
+	nBlocks, err := o.ctx.Pool.NBlocks(rel)
+	if err != nil {
+		return &ExecError{Code: "XX000", Message: err.Error()}
+	}
+	sctx := mctx.Acquire(o.ctx.Mctx, mctx.KindExpr)
+	defer sctx.Release()
+	var scanRow Row
+	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
+		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+		if err != nil {
+			return &ExecError{Code: "XX000", Message: err.Error()}
+		}
+		page := slot.Page()
+		if storage.IsNew(page) {
+			o.ctx.Pool.Unpin(slot)
+			continue
+		}
+		count, err := storage.PageLinePointerCount(page)
+		if err != nil {
+			o.ctx.Pool.Unpin(slot)
+			return &ExecError{Code: "XX000", Message: err.Error()}
+		}
+		for i := uint16(1); i <= uint16(count); i++ {
+			tuple, terr := storage.PageGetHeapTuple(page, i)
+			if terr != nil {
+				continue
+			}
+			if tuple.Header.Xmin == storage.InvalidTransactionID || tuple.Header.Xmax != storage.InvalidTransactionID {
+				continue
+			}
+			if scanRow == nil || len(scanRow) != len(tbl.Columns) {
+				scanRow = make(Row, len(tbl.Columns))
+			}
+			if decErr := DecodeHeapTupleRowInto(scanRow, tbl.Columns, tuple, sctx); decErr != nil {
+				continue
+			}
+			if fnErr := fn(scanRow); fnErr != nil {
+				o.ctx.Pool.Unpin(slot)
+				return fnErr
+			}
+		}
+		o.ctx.Pool.Unpin(slot)
+	}
+	return nil
+}
+
+// validateCheckConstraintRows scans tbl's existing rows against a CHECK
+// constraint expression and raises 23514 on the first row where the expression
+// evaluates to a definite boolean FALSE. SQL 3-valued logic: NULL/UNKNOWN
+// passes (ExecCheck in ATRewriteTable, tablecmds.c:6492-6498). The expression
+// is parsed and resolved against the table schema ONCE (planner
+// ResolveIndexPredicate — the same preparation the CREATE INDEX bulk-build
+// path uses for partial-index predicates, planner.go:74), then evaluated per
+// row via evalExpr — NOT the per-row mini-query rebuild in checkConstraints
+// (O(N·parse+plan)). PG emits no errposition on this refusal, so the error
+// carries Pos 0. Used by ADD CHECK and VALIDATE CHECK (CHECK), M0134-0002 C3
+// slice 1. conName is used verbatim; for an anonymous ADD CHECK callers pass
+// the auto-generated name so the message matches PG's.
+func (o *ddlOp) validateCheckConstraintRows(tbl *catalog.Table, conName, exprSQL string) error {
+	if exprSQL == "" {
+		return nil
+	}
+	expr, err := parser.ParseExpr(exprSQL)
+	if err != nil {
+		// Surface parse failures as a normal ExecError (syntax_error 42601
+		// unless the parser assigned a different code) rather than letting the
+		// raw *parser.SyntaxError string — which carries a "(byte <pos>)"
+		// suffix goopg's psql path otherwise renders via LINE/caret — leak.
+		// For a *parser.SyntaxError, rebuild the standard "syntax error at or
+		// near %q" wording from its clean fields (Message is the offending
+		// token/description; Raw errors carry their own full wording), so the
+		// message has no byte-position artifact. Pos is forwarded as-is.
+		if se, ok := err.(*parser.SyntaxError); ok {
+			code := se.Code
+			if code == "" {
+				code = "42601"
+			}
+			msg := se.Message
+			if !se.Raw {
+				msg = fmt.Sprintf("syntax error at or near %q", se.Message)
+			}
+			return &ExecError{Code: code, Pos: se.Pos, Message: msg}
+		}
+		return &ExecError{Code: "42601", Pos: 0, Message: err.Error()}
+	}
+	planned, err := planner.ResolveIndexPredicate(expr, tbl)
+	if err != nil {
+		// Convert *planner.PlanError so the wire layer renders a clean
+		// "ERROR:  <message>" line — returning the raw PlanError would let its
+		// Error() string ("<code>: <message> (byte <pos>)") leak into the
+		// message field (same rationale as the CREATE VIEW validation at
+		// operators_ddl.go:5261-5268). PG emits no errposition for a
+		// column-not-found in a CHECK predicate, so the PlanError's Pos (0 for
+		// these) is forwarded as-is.
+		if pe, ok := err.(*planner.PlanError); ok {
+			return &ExecError{Code: pe.Code, Message: pe.Message, Hint: pe.Hint, Pos: pe.Pos}
+		}
+		return err
+	}
+	return o.forEachLiveRow(tbl, func(row Row) error {
+		pv, pErr := evalExpr(planned, row, o.ctx)
+		if pErr != nil {
+			return pErr
+		}
+		// Only a definite boolean FALSE violates. NULL/UNKNOWN and a
+		// non-boolean result pass (ExecCheck's 3-valued logic).
+		if pv.IsNull() || pv.Kind != KindBool {
+			return nil
+		}
+		if pv.BoolValue() {
+			return nil
+		}
+		return &ExecError{Code: "23514", Pos: 0,
+			Message: fmt.Sprintf("check constraint %q of relation %q is violated by some row", conName, tbl.Name)}
+	})
 }
 
 // validateFKConstraintExistingRows scans every live row of fkOwnerTbl and, for
