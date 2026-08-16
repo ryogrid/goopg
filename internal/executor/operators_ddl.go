@@ -10062,6 +10062,35 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 	if err := o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, true, true, false, nil, nil); err != nil {
 		return err
 	}
+	// M0134-0002 C3 slice 2: PG's ATRewriteTable verify scan
+	// (tablecmds.c:6456-6462) raises 23502 on the first NULL in any PK
+	// column. The index build above (AT_PASS_ADD_INDEX, pass 3) runs
+	// FIRST, so a table with BOTH a duplicate and a NULL reports the
+	// 23505 from createBTreeIndex and only a NULL-only table reaches
+	// this scan — matching PG's pass ordering (dup at index build, null
+	// at phase-2 verify). ADD UNIQUE deliberately does not run this scan
+	// (NULLs are distinct by default). No errposition — Pos stays 0.
+	pkv := make([]int, 0, len(act.Columns))
+	for _, pkCol := range act.Columns {
+		col, ok := o.ctx.Catalog.LookupColumn(tbl, pkCol)
+		if !ok {
+			continue
+		}
+		pkv = append(pkv, col.Ordinal)
+	}
+	if len(pkv) > 0 {
+		if err := o.forEachLiveRow(tbl, func(row Row) error {
+			for _, ci := range pkv {
+				if row[ci].IsNull() {
+					return &ExecError{Code: "23502", Pos: 0,
+						Message: fmt.Sprintf("column %q of relation %q contains null values", tbl.Columns[ci].Name, tbl.Name)}
+				}
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
 	if idx, ok := o.ctx.Catalog.LookupIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok {
 		idx.IsConstraint = true
 		idx.IncludeColumns = act.IncludeColumns
@@ -11189,6 +11218,44 @@ func (o *ddlOp) bulkBuildBTreeFull(idx *catalog.Index, idxRel storage.RelFileNod
 // this loop encodes, and the order + duplicate test it then applies to them,
 // are properties of THAT index's key format, not of the column list: see
 // `indexBuildEntryKey` and `sortBuildEntriesFindDuplicate`.
+// btreeBuildKeyDescription renders the "Key (cols)=(vals)" prefix of PG's
+// duplicate-key DETAIL (BuildIndexValueDescription,
+// postgres/src/backend/access/index/genam.c:178-276) for the bulk index-build
+// 23505 raise. Key column names are comma-space separated
+// (pg_get_indexdef_columns, ruleutils.c:1235) and each value via the Datum's
+// output rendering. When nullAsLiteral is set (NULLS NOT DISTINCT build) a NULL
+// key column renders as the literal lowercase "null" (genam.c:246-247); the
+// default path never sees a NULL key value (such rows are dropped from the
+// entry list). The caller appends the suffix (" is duplicated.").
+func btreeBuildKeyDescription(idx *catalog.Index, cols []*catalog.Column, row Row, nullAsLiteral bool) string {
+	colNames := make([]string, 0, len(idx.Columns))
+	colVals := make([]string, 0, len(idx.Columns))
+	// cols is parallel to idx.Columns (key columns in declared order, nil for
+	// expression columns) — the same shape buildUniqueConstraintDetail relies
+	// on (operators_storage.go:8605).
+	for i, idxCol := range idx.Columns {
+		colNames = append(colNames, idxCol)
+		val := ""
+		if i < len(cols) && cols[i] != nil && cols[i].Ordinal >= 0 && cols[i].Ordinal < len(row) {
+			d := row[cols[i].Ordinal]
+			if d.IsNull() {
+				if nullAsLiteral {
+					val = "null"
+				}
+			} else {
+				val = d.Format()
+			}
+		}
+		colVals = append(colVals, val)
+	}
+	return fmt.Sprintf("Key (%s)=(%s)", strings.Join(colNames, ", "), strings.Join(colVals, ", "))
+}
+
+// collectBTreeEntries walks every live row of tbl, encodes the btree key, and
+// returns the BulkEntry list for bulk index creation. For a unique index it
+// also performs PG's duplicate-key check (23505, comparetup_index_btree
+// tuplesortvariants.c:1686-1693) over the sorted entries.
+
 func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols []*catalog.Column, keyExprs []planner.Expr, unique, nullsNotDistinct bool, indexName string, pos int, predExpr planner.Expr) ([]btree.BulkEntry, error) {
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 	nBlocks, err := o.ctx.Pool.NBlocks(rel)
@@ -11302,8 +11369,13 @@ func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols
 					}
 					if _, dup := seenNull[string(ndk)]; dup {
 						o.ctx.Pool.Unpin(slot)
-						return nil, &ExecError{Code: "23505", Pos: pos,
-							Message: fmt.Sprintf("could not create unique index %q", indexName)}
+						// NULLS NOT DISTINCT: render the offending key inline from
+						// the still-in-scope row (NULL key columns as the literal
+						// "null", genam.c:246-247). No errposition — Pos stays 0.
+						// M0134-0002 C3 slice 2.
+						return nil, &ExecError{Code: "23505", Pos: 0,
+							Message: fmt.Sprintf("could not create unique index %q", indexName),
+							Detail:  btreeBuildKeyDescription(idx, cols, row, true) + " is duplicated."}
 					}
 					seenNull[string(ndk)] = struct{}{}
 				}
@@ -11317,7 +11389,16 @@ func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols
 				// during bulk build while expression evaluation is unsupported.
 				continue
 			}
-			entries = append(entries, btree.BulkEntry{Key: append([]byte(nil), key...), Ptr: storage.ItemPointer{Block: blk, Offset: i}})
+			entry := btree.BulkEntry{Key: append([]byte(nil), key...), Ptr: storage.ItemPointer{Block: blk, Offset: i}}
+			if unique {
+				// Capture the rendered "Key (cols)=(vals)" description now —
+				// after the post-sort duplicate walk below the source row is
+				// gone, and only the entry list survives. Non-unique builds
+				// never read KeyDesc, so skip the per-row string allocation.
+				// M0134-0002 C3 slice 2.
+				entry.KeyDesc = btreeBuildKeyDescription(idx, cols, row, false)
+			}
+			entries = append(entries, entry)
 		}
 		// M0074-0004 / M0107-0001: page boundary — reset sctx. All
 		// Datums from this page were consumed by encodeBTreeKeyForColumn
@@ -11333,9 +11414,15 @@ func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols
 	// (matching its convention) and walk adjacencies for the
 	// unique check.
 	if unique && len(entries) > 1 {
-		if sortBuildEntriesFindDuplicate(o.ctx.pgIndexKeyDesc(idx), entries) {
-			return nil, &ExecError{Code: "23505", Pos: pos,
-				Message: fmt.Sprintf("could not create unique index %q", indexName)}
+		// di is the index of the second entry of the first adjacent duplicate
+		// pair; both carry the same rendered key description, so either renders
+		// PG's `Key (…)=(…) is duplicated.` DETAIL (comparetup_index_btree,
+		// tuplesortvariants.c:1686-1693). No errposition — Pos stays 0.
+		// M0134-0002 C3 slice 2.
+		if di := sortBuildEntriesFindDuplicate(o.ctx.pgIndexKeyDesc(idx), entries); di >= 0 {
+			return nil, &ExecError{Code: "23505", Pos: 0,
+				Message: fmt.Sprintf("could not create unique index %q", indexName),
+				Detail:  entries[di].KeyDesc + " is duplicated."}
 		}
 	}
 	return entries, nil
@@ -16242,7 +16329,9 @@ func (o *ddlOp) execRefreshMatView(s *parser.RefreshMatViewStmt) error {
 				return &ExecError{Code: "55000", Pos: s.Pos(),
 					Message: fmt.Sprintf("new data for materialized view %q contains duplicate rows without any null columns", s.Name.String())}
 			}
-			// Non-concurrent REFRESH → "could not create unique index 'name'".
+			// Non-concurrent REFRESH → "could not create unique index 'name'",
+			// carrying the inner build's DETAIL ("Key (…)=(…) is duplicated.")
+			// and no errposition (Pos stays 0). M0134-0002 C3 slice 2.
 			idxName := ""
 			if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
 				for _, idx := range im.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
@@ -16252,8 +16341,9 @@ func (o *ddlOp) execRefreshMatView(s *parser.RefreshMatViewStmt) error {
 					}
 				}
 			}
-			return &ExecError{Code: "23505", Pos: s.Pos(),
-				Message: fmt.Sprintf("could not create unique index %q", idxName)}
+			return &ExecError{Code: "23505", Pos: 0,
+				Message: fmt.Sprintf("could not create unique index %q", idxName),
+				Detail:  ee.Detail}
 		}
 		return err
 	}

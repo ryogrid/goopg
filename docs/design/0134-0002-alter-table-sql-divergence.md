@@ -438,6 +438,52 @@ radius on the already-working FK scan). CHECK evaluation uses
 `checkConstraints` (O(N·parse+plan)). All three scan errors set `Pos=0` (PG emits
 no errposition on these refusals).
 
+## C3 slice 2 — the index-build path (ADD PK/UNIQUE duplicate + ADD-PK-over-NULL)
+
+A research pass (`tmp/ralph-handoffs/0134-0002-c3-slice2-research/report.md`)
+corrected the slice-1 "deferred" note: **duplicate detection already exists**, it
+is just mis-formatted (missing DETAIL + spurious `LINE 1`), and the 23502
+ADD-PK-over-NULL scan is the only genuinely-absent scan. Three deliverables:
+
+1. **23505 DETAIL + `Pos=0` (two existing raises).** `collectBTreeEntries`
+   already rejects duplicates at operators_ddl.go:11335-11340 (non-NULL, via
+   `sortBuildEntriesFindDuplicate` pgindex_btree.go:493) and :11294-11309
+   (NULLS-NOT-DISTINCT). Both raise `23505 "could not create unique index %q"`
+   with no DETAIL and `Pos: pos` (a spurious `LINE 1`). PG emits the DETAIL from
+   `comparetup_index_btree` (tuplesortvariants.c:1686-1693) via
+   `BuildIndexValueDescription` (genam.c:178-276):
+   `DETAIL: Key (a)=(2) is duplicated.` — cols = comma-space list, each value via
+   the opclass type's output function, NULL rendered `null`; **no errposition**.
+2. **23502 ADD-PK-over-NULL scan (new).** `execAlterTableAddPrimaryKey`
+   (operators_ddl.go:10031) sets `col.NotNull=true` but never scans existing
+   rows. PG's `ATRewriteTable` verify scan (tablecmds.c:6456-6462) raises
+   `23502 column "%s" of relation "%s" contains null values` for the first NULL.
+   Ordering: dup check (23505) runs BEFORE the null scan (index build is pass 3,
+   verify is phase 2) — a dup-and-NULL table yields 23505, NULL-only yields 23502.
+   ADD UNIQUE must NOT null-scan (NULLs are distinct by default).
+3. **Sibling: REFRESH MATVIEW non-concurrent unique build** (operators_ddl.go
+   :16245-16256) re-wraps the 23505 from `materializeView` into a fresh 23505,
+   dropping the DETAIL and restoring `Pos: s.Pos()` — propagate `ee.Detail` and
+   `Pos=0`.
+
+**Mechanics (value capture).** After sort, `collectBTreeEntries` holds only
+`[]btree.BulkEntry` (bulkload.go:58-61: `Key []byte + Ptr`), not the source row,
+so the DETAIL must be captured at entry-construction time. Add a `KeyDesc string`
+field to `BulkEntry` filled at :11320 with the rendered `Key (cols)=(vals)`
+description (mirror `buildUniqueConstraintDetail`/`nndDetail`, operators_storage.go
+:8606-8623/:7894-7912, suffix `is duplicated.`); change
+`sortBuildEntriesFindDuplicate` to return the dup index (currently `bool`); render
+`entries[i].KeyDesc + " is duplicated."` at :11338. The NND raise at :11306 renders
+inline (its `row` is still in scope). The 23502 scan reuses slice-1's
+`forEachLiveRow` (mirror the SET NOT NULL 23502 at :9322-9330).
+
+**Deferred/known:** (a) `Datum.Format()` has no float kind — float4/float8 key
+values would render empty; ledgered (the alter_table PK/UNIQUE keys are int/text).
+(b) multi-column PK null reporting is attnum-order in PG vs declared-key-order in
+the naive scan — only observable with 2+ NULL PK cols. (c) PG prints
+`Duplicate keys exist.` when the user lacks SELECT on key cols — goopg has no ACL
+check here.
+
 ## Secondary finding (corrects deferral-ledger row 1385)
 
 The EXPLAIN `QUERY PLAN` underline width is **not** a goopg fixed-width

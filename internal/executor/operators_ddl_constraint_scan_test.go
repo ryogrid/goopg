@@ -295,3 +295,165 @@ func TestAlterTableValidateCheckNotEnforced(t *testing.T) {
 		t.Errorf("convalidated after failed VALIDATE = %q, want still f", got)
 	}
 }
+
+// ---- C3 slice 2: ADD PK / UNIQUE index-build path ----
+// PG raises the duplicate-key 23505 from the tuplesort compare callback
+// (comparetup_index_btree, tuplesortvariants.c:1686-1693) with a DETAIL built
+// by BuildIndexValueDescription (genam.c:178-276): "Key (a, b)=(1, 2) is
+// duplicated." and NO errposition (Pos stays 0 — psql prints no LINE 1 caret).
+
+// TestAlterTableAddPrimaryKeyDuplicateKeyDetail verifies the single-column
+// ADD PRIMARY KEY 23505 carries PG's exact DETAIL + Pos=0.
+func TestAlterTableAddPrimaryKeyDuplicateKeyDetail(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE pk_dup (a int)`); err != nil {
+		t.Fatalf("CREATE TABLE pk_dup: %v", err)
+	}
+	if err := runDDL(t, ctx, `INSERT INTO pk_dup VALUES (1), (1)`); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+
+	ee := requireExecError(t, runDDL(t, ctx, `ALTER TABLE pk_dup ADD PRIMARY KEY (a)`),
+		"23505", `could not create unique index "pk_dup_pkey"`)
+	if ee.Pos != 0 {
+		t.Errorf("Pos = %d, want 0 (PG emits no errposition on this refusal)", ee.Pos)
+	}
+	if ee.Detail != "Key (a)=(1) is duplicated." {
+		t.Errorf("Detail = %q, want %q", ee.Detail, "Key (a)=(1) is duplicated.")
+	}
+}
+
+// TestAlterTableAddPrimaryKeyMultiColumnDuplicateDetail verifies the
+// multi-column rendering "Key (a, b)=(1, 2)" (comma-space separated names and
+// values, ruleutils.c:1235).
+func TestAlterTableAddPrimaryKeyMultiColumnDuplicateDetail(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE pk_dup2 (a int, b int)`); err != nil {
+		t.Fatalf("CREATE TABLE pk_dup2: %v", err)
+	}
+	if err := runDDL(t, ctx, `INSERT INTO pk_dup2 VALUES (1, 2), (1, 2)`); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+
+	ee := requireExecError(t, runDDL(t, ctx, `ALTER TABLE pk_dup2 ADD PRIMARY KEY (a, b)`),
+		"23505", `could not create unique index "pk_dup2_pkey"`)
+	if ee.Pos != 0 {
+		t.Errorf("Pos = %d, want 0", ee.Pos)
+	}
+	if ee.Detail != "Key (a, b)=(1, 2) is duplicated." {
+		t.Errorf("Detail = %q, want %q", ee.Detail, "Key (a, b)=(1, 2) is duplicated.")
+	}
+}
+
+// TestAlterTableAddPrimaryKeyNullScan verifies the genuinely-missing 23502
+// ADD-PK-over-NULL scan (ATRewriteTable verify_new_notnull, tablecmds.c:6456-6462):
+// the FIRST NULL in a PK column raises `column "%s" of relation "%s" contains
+// null values`, Pos=0.
+func TestAlterTableAddPrimaryKeyNullScan(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE pk_null (a int)`); err != nil {
+		t.Fatalf("CREATE TABLE pk_null: %v", err)
+	}
+	if err := runDDL(t, ctx, `INSERT INTO pk_null VALUES (1), (NULL)`); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+
+	ee := requireExecError(t, runDDL(t, ctx, `ALTER TABLE pk_null ADD PRIMARY KEY (a)`),
+		"23502", `column "a" of relation "pk_null" contains null values`)
+	if ee.Pos != 0 {
+		t.Errorf("Pos = %d, want 0", ee.Pos)
+	}
+}
+
+// TestAlterTableAddPrimaryKeyDuplicateWinsOverNull verifies PG's pass ordering:
+// the index build (AT_PASS_ADD_INDEX, pass 3 — the 23505 dup check) runs BEFORE
+// the phase-2 verify scan, so a table with BOTH a duplicate and a NULL reports
+// the 23505, never the 23502.
+func TestAlterTableAddPrimaryKeyDuplicateWinsOverNull(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE pk_both (a int)`); err != nil {
+		t.Fatalf("CREATE TABLE pk_both: %v", err)
+	}
+	if err := runDDL(t, ctx, `INSERT INTO pk_both VALUES (1), (1), (NULL)`); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+
+	ee := requireExecError(t, runDDL(t, ctx, `ALTER TABLE pk_both ADD PRIMARY KEY (a)`),
+		"23505", `could not create unique index "pk_both_pkey"`)
+	if ee.Pos != 0 {
+		t.Errorf("Pos = %d, want 0", ee.Pos)
+	}
+}
+
+// TestAlterTableAddUniqueDuplicateDetail verifies the ADD UNIQUE twin raises the
+// same 23505 + DETAIL over a duplicate.
+func TestAlterTableAddUniqueDuplicateDetail(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE uq_dup (a int)`); err != nil {
+		t.Fatalf("CREATE TABLE uq_dup: %v", err)
+	}
+	if err := runDDL(t, ctx, `INSERT INTO uq_dup VALUES (1), (1)`); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+
+	ee := requireExecError(t, runDDL(t, ctx, `ALTER TABLE uq_dup ADD UNIQUE (a)`),
+		"23505", `could not create unique index`)
+	if ee.Pos != 0 {
+		t.Errorf("Pos = %d, want 0", ee.Pos)
+	}
+	if ee.Detail != "Key (a)=(1) is duplicated." {
+		t.Errorf("Detail = %q, want %q", ee.Detail, "Key (a)=(1) is duplicated.")
+	}
+}
+
+// TestAlterTableAddUniqueNullsAllowed verifies ADD UNIQUE does NOT run the 23502
+// null scan: NULLs are distinct by default (NULLS DISTINCT), so duplicate NULL
+// rows build fine — and unlike ADD PRIMARY KEY, no verify scan follows.
+func TestAlterTableAddUniqueNullsAllowed(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE uq_null (a int)`); err != nil {
+		t.Fatalf("CREATE TABLE uq_null: %v", err)
+	}
+	if err := runDDL(t, ctx, `INSERT INTO uq_null VALUES (NULL), (NULL)`); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	if err := runDDL(t, ctx, `ALTER TABLE uq_null ADD UNIQUE (a)`); err != nil {
+		t.Fatalf("ADD UNIQUE over NULLs should succeed (NULLS DISTINCT default): %v", err)
+	}
+}
+
+// TestCreateUniqueIndexNullsNotDistinctDuplicateDetail verifies the NULLS NOT
+// DISTINCT build's duplicate-NULL 23505 renders the key with NULL as the literal
+// "null" (genam.c:246-247) and Pos=0.
+func TestCreateUniqueIndexNullsNotDistinctDuplicateDetail(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE nnd_dup (a int)`); err != nil {
+		t.Fatalf("CREATE TABLE nnd_dup: %v", err)
+	}
+	if err := runDDL(t, ctx, `INSERT INTO nnd_dup VALUES (NULL), (NULL)`); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+
+	ee := requireExecError(t, runDDL(t, ctx, `CREATE UNIQUE INDEX nnd_dup_a ON nnd_dup (a) NULLS NOT DISTINCT`),
+		"23505", `could not create unique index "nnd_dup_a"`)
+	if ee.Pos != 0 {
+		t.Errorf("Pos = %d, want 0", ee.Pos)
+	}
+	if ee.Detail != "Key (a)=(null) is duplicated." {
+		t.Errorf("Detail = %q, want %q", ee.Detail, "Key (a)=(null) is duplicated.")
+	}
+}

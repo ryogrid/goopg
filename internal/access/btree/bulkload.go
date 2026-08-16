@@ -58,6 +58,13 @@ func (f indexFormat) pageHasSpaceForBulk(p storage.Page, it item, sep []byte) bo
 type BulkEntry struct {
 	Key []byte
 	Ptr storage.ItemPointer
+	// KeyDesc is the rendered "Key (cols)=(vals)" description for this
+	// entry's key values, captured at entry-construction time so the
+	// executor's post-sort duplicate walk can build PG's
+	// `Key (…)=(…) is duplicated.` DETAIL (BuildIndexValueDescription,
+	// postgres/src/backend/access/index/genam.c:178-276) without the
+	// source heap row. Empty for non-unique builds (never read).
+	KeyDesc string
 }
 
 // BulkCreate builds a new B-tree index on rel using sort-then-build

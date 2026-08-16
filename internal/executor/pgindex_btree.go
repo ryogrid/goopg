@@ -490,7 +490,12 @@ func (ctx *Context) arbiterKey(oc *planner.OnConflictPlan, tbl *catalog.Table, r
 //
 // For the blob format both reduce to what M0055-0006 Phase E shipped, byte for
 // byte: `CompareKeys` IS bytes.Compare, and equality under it IS bytesEqual.
-func sortBuildEntriesFindDuplicate(desc *btree.PGIndexKeyDesc, entries []btree.BulkEntry) bool {
+// sortBuildEntriesFindDuplicate sorts entries in place (matching BulkBuild's
+// convention) and returns the index of the SECOND entry of the first adjacent
+// duplicate pair (entries[i] duplicates entries[i-1]), or -1 when the entries
+// are all distinct. The caller can use entries[result].KeyDesc to render PG's
+// "Key (…)=(…) is duplicated." DETAIL. M0134-0002 C3 slice 2.
+func sortBuildEntriesFindDuplicate(desc *btree.PGIndexKeyDesc, entries []btree.BulkEntry) int {
 	cmp := func(a, b []byte) int { return btree.CompareKeys(a, b) }
 	dup := func(a, b []byte) bool { return btree.CompareKeys(a, b) == 0 }
 	if desc != nil {
@@ -515,10 +520,10 @@ func sortBuildEntriesFindDuplicate(desc *btree.PGIndexKeyDesc, entries []btree.B
 	sort.SliceStable(entries, func(i, j int) bool { return cmp(entries[i].Key, entries[j].Key) < 0 })
 	for i := 1; i < len(entries); i++ {
 		if dup(entries[i].Key, entries[i-1].Key) {
-			return true
+			return i
 		}
 	}
-	return false
+	return -1
 }
 
 func columnNameOrEmpty(c *catalog.Column) string {

@@ -171,7 +171,7 @@ func TestSortBuildEntriesFindDuplicateBlobUnchanged(t *testing.T) {
 		return btree.BulkEntry{Key: key, Ptr: storage.ItemPointer{Block: blk, Offset: 1}}
 	}
 	entries := []btree.BulkEntry{mk(256, 1), mk(1, 2), mk(3, 3)}
-	if sortBuildEntriesFindDuplicate(nil, entries) {
+	if sortBuildEntriesFindDuplicate(nil, entries) >= 0 {
 		t.Fatal("distinct blob keys reported as duplicates")
 	}
 	if !sort.SliceIsSorted(entries, func(i, j int) bool {
@@ -182,7 +182,7 @@ func TestSortBuildEntriesFindDuplicateBlobUnchanged(t *testing.T) {
 	// Two rows with the same value: distinct heap TIDs, but the blob key is
 	// TID-free, so they ARE the same key.
 	dups := []btree.BulkEntry{mk(5, 1), mk(5, 2)}
-	if !sortBuildEntriesFindDuplicate(nil, dups) {
+	if sortBuildEntriesFindDuplicate(nil, dups) < 0 {
 		t.Fatal("equal blob keys not reported as duplicates")
 	}
 }
@@ -216,7 +216,7 @@ func TestSortBuildEntriesFindDuplicateTupleOrdersByAttributeAndIgnoresTheTID(t *
 	if !(string(entries[0].Key) < string(entries[1].Key)) {
 		t.Fatal("fixture pair is bytewise-ordered the same way as the index order; it cannot tell the two sorts apart")
 	}
-	if sortBuildEntriesFindDuplicate(desc, entries) {
+	if sortBuildEntriesFindDuplicate(desc, entries) >= 0 {
 		t.Fatal("distinct tuple keys reported as duplicates")
 	}
 	first, _, err := btree.DeformPGIndexTuple(entries[0].Key, desc.Physical(), 1)
@@ -234,7 +234,7 @@ func TestSortBuildEntriesFindDuplicateTupleOrdersByAttributeAndIgnoresTheTID(t *
 	if bytes.Equal(dups[0].Key, dups[1].Key) {
 		t.Fatal("fixture duplicates have identical keys; the test would pass for the wrong reason")
 	}
-	if !sortBuildEntriesFindDuplicate(desc, dups) {
+	if sortBuildEntriesFindDuplicate(desc, dups) < 0 {
 		t.Fatal("duplicate key values not reported: a unique index build would admit them")
 	}
 }
