@@ -7337,6 +7337,50 @@ func (o *ddlOp) lockDefaultPartitionForAttach(parent *catalog.Table) error {
 	return nil
 }
 
+// fkColumnExists reports whether tbl has a live (non-dropped) column named
+// col — a case-sensitive match, mirroring PG's SearchSysCacheAttName lookup in
+// transformColumnNameList (tablecmds.c:13327-13346) and NOT the
+// case-insensitive InMemory.LookupColumn. The scan is the same dropped-skipping
+// pattern resolveAnalyzeColumns uses (operators_analyze.go:141-146).
+// M0134-0002 C4 (ADD FOREIGN KEY column validation).
+func fkColumnExists(tbl *catalog.Table, col string) bool {
+	for i := range tbl.Columns {
+		if tbl.Columns[i].Name == col && !tbl.Columns[i].Dropped {
+			return true
+		}
+	}
+	return false
+}
+
+// fkConstraintNameInUse reports whether name is already a constraint on tbl
+// across every kind execAlterTableDropConstraint enumerates: FK + CHECK +
+// PK/UNIQUE/EXCLUDE index + named NOT NULL. Mirrors PG's ConstraintNameIsUsed
+// (pg_constraint.c:412) — a scan over pg_constraint for any constraint sharing
+// the name on the same relation. M0134-0002 C4 (42710 duplicate-name guard).
+func (o *ddlOp) fkConstraintNameInUse(tbl *catalog.Table, name string) bool {
+	for i := range tbl.ForeignKeys {
+		if strings.EqualFold(tbl.ForeignKeys[i].Name, name) {
+			return true
+		}
+	}
+	for i := range tbl.NamedChecks {
+		if strings.EqualFold(tbl.NamedChecks[i].Name, name) {
+			return true
+		}
+	}
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
+		if (idx.IsConstraint || idx.IsExclusion) && strings.EqualFold(idx.Name, name) {
+			return true
+		}
+	}
+	for i := range tbl.NotNullConstraints {
+		if strings.EqualFold(tbl.NotNullConstraints[i].Name, name) {
+			return true
+		}
+	}
+	return false
+}
+
 func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 	// Handle SET LOGGED / SET UNLOGGED.
 	if s.SetLogged != "" {
@@ -7687,8 +7731,38 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				}
 				return err
 			}
-			if _, ok := o.ctx.Catalog.LookupTable(act.RefTable, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); !ok {
+			refTbl, ok := o.ctx.Catalog.LookupTable(act.RefTable, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+			if !ok {
 				return &ExecError{Code: "42P01", Pos: act.Pos(), Message: fmt.Sprintf("relation %q does not exist", act.RefTable.String())}
+			}
+			// 42710 duplicate-name guard: an explicit CONSTRAINT name must not
+			// collide with a constraint of any kind already on the table (FK +
+			// CHECK + PK/UNIQUE/EXCLUDE index + NOT NULL). PG raises this only for
+			// an explicit conname — ATExecAddConstraint CONSTR_FOREIGN,
+			// tablecmds.c:9824-9833 → ConstraintNameIsUsed, pg_constraint.c:412;
+			// auto-named constraints skip the check via the ChooseConstraintName
+			// branch. No errposition. M0134-0002 C4.
+			if act.ConstraintName != "" && o.fkConstraintNameInUse(tbl, act.ConstraintName) {
+				return &ExecError{Code: "42710", Pos: 0, Message: fmt.Sprintf("constraint %q for relation %q already exists", act.ConstraintName, tbl.Name)}
+			}
+			// 42703 source-column check: each local column must exist on the
+			// altered table (case-sensitive, dropped-skipping — transformColumnNameList,
+			// tablecmds.c:13327-13346). No errposition. M0134-0002 C4.
+			for _, c := range act.Columns {
+				if !fkColumnExists(tbl, c) {
+					return &ExecError{Code: "42703", Pos: 0, Message: fmt.Sprintf("column %q referenced in foreign key constraint does not exist", c)}
+				}
+			}
+			// 42703 ref-column check: same scan against the referenced table,
+			// skipped entirely when no ref columns are named (PG infers the PK —
+			// transformFkeyGetPrimaryKey, tablecmds.c:13382; goopg's scan infers
+			// via pkColumns). Source columns resolve before ref columns
+			// (ATAddForeignKeyConstraint :10166 then :10192/10205). No errposition.
+			// M0134-0002 C4.
+			for _, c := range act.RefColumns {
+				if !fkColumnExists(refTbl, c) {
+					return &ExecError{Code: "42703", Pos: 0, Message: fmt.Sprintf("column %q referenced in foreign key constraint does not exist", c)}
+				}
 			}
 			// Surface the FK in pg_constraint (contype='f') so pg_dump can
 			// re-emit it: honour an explicit CONSTRAINT name, else PG's
@@ -7714,6 +7788,16 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				NotValid:        act.NotValid,
 				MatchFull:       act.MatchFull,
 				NotEnforced:     act.FKNotEnforced,
+			}
+			// 23503 existing-row scan: unless NOT VALID, ADD FOREIGN KEY validates
+			// existing rows before registering (validateForeignKeyConstraint,
+			// tablecmds.c:13694). The scan emits the byte-exact error + DETAIL
+			// with Pos 0 (assertParentExists, operators_fk.go:608) — propagate
+			// unchanged, do NOT re-wrap Pos. M0134-0002 C4.
+			if !act.NotValid {
+				if err := o.validateFKConstraintExistingRows(tbl, fk); err != nil {
+					return err
+				}
 			}
 			tbl.ForeignKeys = append(tbl.ForeignKeys, fk)
 		case parser.AlterTableValidateConstraint:
@@ -7754,10 +7838,11 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 						// Real phase-3 dangling-reference scan (validateForeignKeyConstraint,
 						// tablecmds.c), gated exactly like PG's `if (!con->convalidated)`
 						// in ATExecValidateConstraint — an already-valid FK is a no-op.
+						// PG's FK-violation ereports carry no errposition
+						// (ri_ReportViolation, ri_triggers.c:2778), so the scan's
+						// 23503 stays Pos 0 — do NOT wrap it with act.Pos().
+						// M0134-0002 C4.
 						if err := o.validateFKConstraintExistingRows(tbl, tbl.ForeignKeys[i]); err != nil {
-							if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
-								ee.Pos = act.Pos()
-							}
 							return err
 						}
 						tbl.ForeignKeys[i].NotValid = false

@@ -542,6 +542,71 @@ the regress `LINE 1 … ^` caret points at the column name, byte-matching PG
 coercion-failure 42804 arms (evaluation-time, no source location) use `Pos: 0`,
 not `act.Pos()`.
 
+## C4 — ADD FOREIGN KEY validation semantics (2026-08-16)
+
+**Class: FK semantics (`tablecmds.c`, correctness).** The ADD-FK executor arm
+(`case parser.AlterTableAddForeignKey`, `operators_ddl.go:7665-7718`) appends to
+`tbl.ForeignKeys` with **no duplicate-name guard, no column-existence validation,
+and no existing-row scan** — only a referenced-table-existence 42P01 check
+(`:7690`). The regress FK block (alter_table.sql:355-383) therefore diverges four
+ways before the C4 anchor:
+
+- `:355 foreign key(c) …` — PG 42703 `column "c" referenced in foreign key
+  constraint does not exist`; goopg silently appends.
+- `:358 references attmp2(b) …` — PG 42703 (ref column `b`); goopg appends.
+- `:361` valid columns, dangling row `(5,50)` — PG 23503; goopg appends.
+- `:367` (valid, post-DELETE) — PG succeeds; goopg appends a *fourth* same-name
+  entry.
+
+Those four same-name `attmpconstr` entries pile up in `tbl.ForeignKeys` (goopg
+never rejects the adds, PG rejects all three failing ones so the name stays
+free), so the later `VALIDATE CONSTRAINT attmpconstr` (`:372`) breaks on the first
+(stale, `NotValid=false`) match and skips the scan — masking out:499-500's 23503.
+The statement-time DROP (`:368`) removes only the first matching entry
+(`DropForeignKeyConstraint`, catalog.go:20769), so it cannot clear the pile-up.
+
+**Fix — make the ADD arm PG-faithful, in PG's exact order** (all `Pos: 0` unless
+noted):
+
+1. **42710 duplicate-name guard** — when the ADD carries an explicit
+   `CONSTRAINT name`, reject if that name already exists on the table across all
+   constraint kinds (FK + CHECK + PK/UNIQUE/EXCLUDE index + NOT NULL — the same
+   enumeration `execAlterTableDropConstraint` already walks). PG raises this only
+   for an explicit `conname` (`ATExecAddConstraint` CONSTR_FOREIGN,
+   tablecmds.c:9824-9833 → `ConstraintNameIsUsed`, pg_constraint.c:412;
+   auto-named constraints skip the check via `ChooseConstraintName`). Message
+   byte-exact: `constraint "%s" for relation "%s" already exists`
+   (ERRCODE_DUPLICATE_OBJECT, conname + relation name).
+2. **42703 source-column check** — for each `act.Columns[i]`, a case-sensitive
+   match over `tbl.Columns` (`c.Name == col`, skipping dropped) — NOT
+   `InMemory.LookupColumn` (case-insensitive). `transformColumnNameList`
+   tablecmds.c:13327-13346 via `SearchSysCacheAttName` (case-sensitive).
+   Message `column "%s" referenced in foreign key constraint does not exist`
+   (ERRCODE_UNDEFINED_COLUMN).
+3. **42703 ref-column check** — same loop over `act.RefColumns` against the
+   referenced table; skip when `len(act.RefColumns)==0` (PG infers the PK in that
+   case — `transformFkeyGetPrimaryKey` tablecmds.c:13382 — and goopg's scan
+   already infers via `pkColumns`). `ATAddForeignKeyConstraint` resolves source
+   cols (tablecmds.c:10166) before ref cols (:10192/10205), so source 42703
+   precedes ref 42703.
+4. **23503 existing-row scan** — when `!act.NotValid`, after building `fk`, call
+   the existing `validateFKConstraintExistingRows(tbl, fk)` (operators_ddl.go:10775,
+   landed C3 slice 1) and propagate its error unchanged (it already emits the
+   byte-exact `insert or update on table … violates foreign key constraint …` +
+   `Key (…) is not present in table …` with `Pos: 0`, via `assertParentExists`
+   operators_fk.go:608). PG `validateForeignKeyConstraint` tablecmds.c:13694.
+5. **Pos suppression on VALIDATE FK 23503** — the VALIDATE arm currently wraps the
+   23503 with `ee.Pos = act.Pos()` (`operators_ddl.go:7757-7761`), but PG's
+   FK-violation ereports carry no errposition (`ri_triggers.c` `ri_ReportViolation`
+   :2778 has no `errposition`), so the expected `.out` has no `LINE 1:` caret.
+   Drop that wrap so the anchor is byte-exact.
+
+**Deferred (ledger):** FK type-compatibility 42804 (`transformFkeyCheckAttrs` →
+`findFkeyCast` tablecmds.c:10435), 42830 `there is no unique constraint matching
+given keys` (`transformFkeyCheckAttrs` tablecmds.c:13657 — goopg does not verify
+the referenced table has a unique index on the ref columns), system-column
+0A000, and the FK column-count (42908) checks.
+
 ## PG oracle citations
 
 - `postgres/src/backend/catalog/partition.c:255` — `has_partition_attrs(Relation,
