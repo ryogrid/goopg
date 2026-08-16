@@ -1,48 +1,46 @@
-# Working set — M0134-0002 alter_table.sql (C3 slice 1 landed)
+# Working set — M0134-0002 alter_table.sql (C3 COMPLETE)
 
 **Task:** M0134-0002 alter_table.sql regress-sql digestion. This loop landed
-**C3 slice 1 — constraint row-validation scans** (commit `93948d24`).
+**C3 slice 2 — the index-build path**, completing class C3 (commit `838172d5`).
 
-**Findings:** C3 (constraint validation scans absent) split into two slices by a
-researcher reassessment. Slice 1 = the three non-index scans; slice 2 = the
-index-build path (deferred). Diff 4298→4185 (−113), zero raw `(byte N)` leaks.
+**Findings:** C3 slice 2 was smaller than the slice-1 deferral note predicted —
+duplicate detection already existed but was mis-formatted (no DETAIL, spurious
+`LINE 1`), and only the ADD-PK-over-NULL 23502 scan was genuinely absent.
+Diff 4185→4157 (−28).
 
-**C3 slice 1 landed:** ADD CHECK (no NOT VALID/NOT ENFORCED), SET NOT NULL + ADD
-CONSTRAINT NOT NULL (both spellings), VALIDATE CHECK now scan existing rows and
-refuse via new `forEachLiveRow` (page-Pin live-row iterator) +
-`validateCheckConstraintRows` (parse-once → `planner.ResolveIndexPredicate` →
-per-row `evalExpr`; 23514 on a definite boolean FALSE only — NULL/UNKNOWN passes).
-55000 `cannot validate NOT ENFORCED constraint` guard + VALIDATE-CHECK convalidated
-flip. All Pos 0. A reviewer round caught + fixed a `parser.SyntaxError` `(byte N)`
-suffix leak. 8 tests.
+**C3 slice 2 landed:** ADD PK/UNIQUE on duplicates now emits 23505
+`could not create unique index %q` + `DETAIL: Key (…) is duplicated.` (new
+`btree.BulkEntry.KeyDesc` value capture + `sortBuildEntriesFindDuplicate`→`int`
+dup index + `btreeBuildKeyDescription` renderer); ADD PK over NULL → 23502 via
+`forEachLiveRow` (dup-then-null = PG pass order, ADD UNIQUE exempt); `Pos=0` on
+all raise sites + the REFRESH MATVIEW sibling re-wrap. 7 tests. tpch-spotcheck
+PASS (Q12=2/Q13=35).
 
-**Files:** internal/executor/operators_ddl.go, operators_ddl_constraint_scan_test.go
-(new), docs/design/0134-0002-alter-table-sql-divergence.md (§"C3 first slice"),
-.ralph/fix_plan.md + .ralph/deferral_ledger.md (5 rows).
+**Files:** internal/executor/operators_ddl.go, pgindex_btree.go,
+operators_ddl_constraint_scan_test.go (7 new tests), pgindex_buildkey_test.go
+(4 call sites); internal/access/btree/bulkload.go (`KeyDesc` field);
+docs/design/0134-0002-alter-table-sql-divergence.md (§"C3 slice 2").
 
-**Key symbols:** `forEachLiveRow`, `validateCheckConstraintRows` (operators_ddl.go),
-`planner.ResolveIndexPredicate`, `evalExpr`.
+**Key symbols:** `btreeBuildKeyDescription`, `btree.BulkEntry.KeyDesc`,
+`sortBuildEntriesFindDuplicate` (now `int`), `forEachLiveRow`.
 
-**Deferred (5 ledger rows):** (1) C3 slice 2 — ADD PK/UNIQUE 23505 `DETAIL: Key …
-is duplicated.` (per-entry value capture in `btree.BulkEntry`) + PK-over-NULL 23502
-scan + Pos 0 on 23505; (2) FK-VALIDATE shadowing (C4 ADD-FK dup-name); (3)
-nondeterministic partition-key DROP COLUMN guard (operators_ddl.go:21879-21883
-`strings.Contains(fmt.Sprintf("%v", expr), …)` matches ASLR pointer hex — flips the
-alter_table regress section between runs); (4) `parseCheckExpr` quote-loss (42601 vs
-42703); (5) ONLY-partitioned DROP COLUMN guard missing.
+**Deferred (1 ledger row, 4 residuals):** float4/float8 DETAIL rendering
+(`Datum.Format()` no float kind), multi-column PK null attnum-order,
+`Duplicate keys exist.` ACL case, 42703/42P16 Pos on the ADD PK/UNIQUE arms.
 
-**Next step:** C3 slice 2 (complete C3 — PK/UNIQUE 23505 DETAIL, PK-over-NULL 23502
-reusing `forEachLiveRow`, Pos 0). Alternatively pull deferral #3 (nondeterministic
-partition-key guard) forward first — it makes the alter_table regress diff
-non-reproducible (measurement concern). New classes PLPGSQL/TYPEDS after C3/C9.
+**Next step:** pull deferral #3 forward — the nondeterministic partition-key
+DROP COLUMN guard (`operators_ddl.go:21879-21883`
+`strings.Contains(fmt.Sprintf("%v", expr), …)` matches ASLR pointer hex), which
+flips the alter_table regress diff between runs. It pollutes the diff measurement
+for every remaining class (C4/C9/C10/C11). Replace with a structural
+`is_partition_attr`-style walk. Then C4 (ADD-FK dup-name / FK VALIDATE) or C10.
 
-**Gates run (this loop):** `go build ./...` PASS; `go test ./internal/executor/
-./internal/parser/ ./internal/catalog/` PASS (8 tests); `scripts/pg-regress-runner.sh
-alter_table` 4298→4185; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=35); pre-commit
-pgbench smoke PASS (12635 tps select-only).
+**Gates run (this loop):** `go build ./...` PASS; `go test ./internal/access/btree/
+./internal/executor/` PASS; `scripts/pg-regress-runner.sh alter_table` 4185→4157;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=35); pre-commit pgbench smoke PASS
+(12642 tps select-only).
 
-**Delegation:** researcher `0134-0002-c3-constraint-scan-research` DONE; implementer
-`0134-0002-c3-constraint-scan-impl` DONE (2 rounds); reviewer
-`0134-0002-c3-constraint-scan-review` DONE; tester tpch-spotcheck DONE.
+**Delegation:** researcher `0134-0002-c3-slice2-research` DONE; implementer
+`0134-0002-c3-slice2-impl` DONE; tester tpch-spotcheck DONE.
 
 **In-flight:** none.
