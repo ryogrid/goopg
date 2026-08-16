@@ -1,49 +1,54 @@
-# Working set — M0134-0002 alter_table.sql (C4 ADD-FK validation landed)
+# Working set — M0134-0002 alter_table.sql (C9 residuals: partition recursion landed)
 
 **Task:** M0134-0002 alter_table.sql regress-sql digestion. This loop landed
-**C4 — ADD FOREIGN KEY validation semantics** (commit `0518b4a4`).
+**C9 residuals — ONLY-on-partitioned guard + descendant-partition recursion**.
 
-**Findings:** the ADD FK arm (`case parser.AlterTableAddForeignKey`,
-operators_ddl.go:7731-7789) only checked referenced-table 42P01 then appended to
-`tbl.ForeignKeys`. So alter_table.sql:355/358/361 (all `add constraint
-attmpconstr foreign key ...`) silently succeeded where PG rejects (42703/42703/23503),
-piling up four same-name entries that shadowed the later `VALIDATE CONSTRAINT`
-scan (first stale `NotValid=false` match) — masking out:499-500. Fix adds, in PG
-order: 42710 dup-name guard (cross-kind, explicit name only), 42703 source then
-42703 ref column check (`fkColumnExists`, case-sensitive dropped-skipping), 23503
-existing-row scan (`!NotValid`, reuse C3 `validateFKConstraintExistingRows`),
-plus VALIDATE FK 23503 Pos-suppression (`ri_ReportViolation` no errposition).
-Diff 4145→4113 (−32), FK block byte-green; 5 tests.
+**Findings:** the partitioned-parent block (`alter_table.sql:2850-2858,2902-2903`)
+cascades off ONE root cause: goopg silently drops `b` from `list_parted2` on
+`ALTER TABLE ONLY ... DROP COLUMN`, so every later statement 42703's on the gone
+column. Three guards close the three guard-statements: (1) ONLY DROP guard —
+42P16 `cannot drop column from only the partitioned table when partitions exist`
++ HINT `Do not specify the ONLY keyword.` (tablecmds.c:9385-9389, Pos 0);
+(2) descendant recursion — `allDescendants` (OID-sorted) walked when `!only`,
+`partitionKeyUsesColumn` per descendant, 42P16 names the DESCENDANT (`part_5`);
+DROP Pos 0, ALTER TYPE `act.Pos()` (tablecmds.c:9373/9422-9424/14576);
+(3) ALTER TYPE inherited-column guard — 42P16 `cannot alter inherited column "%s"`
+(tablecmds.c:14436-14440, `act.Pos()`, before own-key). `only` threaded from
+`execAlterTable` (`s.Only`). Diff 4110→4102 (−8), `:2850`/`:2902`/`:2903` byte-green.
 
-**Files:** internal/executor/operators_ddl.go (ADD-FK arm + 2 helpers +
-VALIDATE Pos-suppression), internal/executor/operators_ddl_fk_add_validation_test.go
-(5 tests); docs/design/0134-0002-alter-table-sql-divergence.md (§C4);
-.ralph/deferral_ledger.md (row 1413 → resolved; NEW row for 42804/42830/42908/
-0A000 residuals); fix_plan.md progress note.
+**Files:** internal/executor/operators_ddl.go (3 guards + only-threading),
+internal/executor/operators_ddl_partition.go (partitionKeyUsesColumn helper),
+internal/executor/operators_fk.go (allDescendants visited set),
+internal/executor/operators_ddl_partition_recursion_test.go (5-case + cycle-safety);
+docs/design/0134-0002-alter-table-sql-divergence.md (§C9 residuals → LANDED);
+.ralph/deferral_ledger.md (2 new rows); fix_plan.md (C9 residuals landed note).
 
-**Key symbols:** `fkColumnExists`, `fkConstraintNameInUse` (new helpers),
-`execAlterTableAddForeignKey` (ADD FK arm), `validateFKConstraintExistingRows`
-(reused scan), `assertParentExists` (23503 source), VALIDATE arm `:7838`.
+**Key symbols:** `partitionKeyUsesColumn` (new), `allDescendants` (visited set),
+`execAlterDropColumn`/`execAlterColumnType` (only param + guards),
+`colStillInherited` (reused), `hasInheritanceChildren` (reused).
 
-**Deferred (1 new ledger row):** 42804 FK type-compat (`findFkeyCast`
-tablecmds.c:10435), 42830 no-unique-constraint (`transformFkeyCheckAttrs`
-:13657), 42908 column-count, 0A000 system-column; + EqualFold-vs-strcmp in the
-42710 guard (quoted mixed-case only).
+**Deferred (2 new ledger rows):** cyclic-ATTACH 42P17 accepted (visited set is the
+guard, not the fix — tablecmds.c:17336); `part_2 ADD COLUMN c text` accepted (no
+`cannot add column to a partition` guard, tablecmds.c:7250). Also still open:
+ATTACH-PARTITION `Inherited`-marking gap (row 1410a) blocks `part_2 DROP/RENAME/
+ALTER` inherited refusals — the ALTER TYPE inherited guard (3) is LATENT until
+that lands (part_2's `b` isn't flagged Inherited).
 
-**Next step:** C10 — ALTER TYPE data-loss (failed int8→int4 rewrite leaves the
-table EMPTY, `internal error: expected int, got kind 1`; evalCast coercion
-matrix, ledger row 1398). Alternatively C11 (rules-subsystem) or C9 residuals
-(descendant-partition recursion, ONLY-on-partitioned DROP COLUMN). Remaining
-alter_table work: C9 residuals, C10/C11.
+**Next step:** close the three remaining C9 residuals to fully green the
+partitioned-parent block, then C11 (rules/view-DML + at_view_2 + top-level-* freeze):
+(1) `execAlterTableAddColumn` relispartition guard (PartitionParentOID != 0 →
+`cannot add column to a partition`); (2) mark attached columns `Inherited` in the
+ATTACH PARTITION path (unblocks :2854-2858 inherited refusals); (3) cyclic-ATTACH
+42P17 ancestor-walk in `execAlterTableAttachPartition`.
 
 **Gates run (this loop):** `go build ./...` PASS; `go test ./internal/executor/`
-PASS (cache warm); `scripts/pg-regress-runner.sh alter_table` 4145→4113 (−32),
-FK block byte-green (verified vs HEAD worktree baseline); pre-commit pgbench
-smoke PASS (12828 tps select-only, 0 failed). tpch-spotcheck NOT re-run —
-DDL-only FK-path change, no query/planner/codec path touched.
+PASS (6.6s); `scripts/pg-regress-runner.sh alter_table` 4110→4102 (−8), three
+guard statements byte-green. tpch-spotcheck NOT re-run — DDL-only ALTER guards,
+no query/planner/codec path. Pre-commit pgbench smoke: runs at commit (hook).
 
-**Delegation:** researcher `0134-0002-c4-fk-dup-name-research` DONE (root cause
-(C): stale pile-up predates DROP; fix = 42710+42703+23503, not 42710 alone);
-implementer `0134-0002-c4-fk-add-validation` DONE (diff −32).
+**Delegation:** researcher `0134-0002-c9-residuals-partition-recursion-research`
+DONE; implementer `0134-0002-c9-residuals-partition-recursion` DONE (deviation:
+allDescendants visited set — justified, cyclic-ATTACH hang; NEEDS-DECISION
+resolved: keep visited set + defer cycle rejection).
 
 **In-flight:** none.
