@@ -1280,6 +1280,20 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		if len(savedBindings) > 0 {
 			remapAggExprsWithBindings(node, savedBindings)
 		}
+		// S8 Slice 2c-i (0134-0001 P2) index-ordered grouping input: port of
+		// the "path already sorted" half of get_useful_group_keys_orderings
+		// (pathkeys.c:466-550). When every GROUP BY key is a plain column of
+		// the scanned table and some ordering of them is exactly a leading
+		// prefix of a usable btree index, replace the child with an
+		// ascending full-range IndexOnlyScan/IndexScan and switch Strategy
+		// to AggStrategySorted WITHOUT inserting a Sort. Runs FIRST — before
+		// applyPresortedAggregateRule / applyEnableHashAggRule — so neither
+		// of those ever gets the chance to wrap this rule's Sort-free child
+		// in a redundant Sort; both bail immediately once Strategy is
+		// already AggStrategySorted (presorted) or the node is no longer
+		// AggStrategyHashed (hashagg bridge). See
+		// internal/optimizer/groupagg_indexorder.go.
+		applyIndexOrderedGroupingRule(agg.node, cat)
 		// S8 Slice 2a (0134-0001 P2) presorted aggregates: port
 		// adjust_group_pathkeys_for_groupagg (planner.c:3229). When ≥1
 		// aggregate carries an internal ORDER BY / DISTINCT clause, choose the

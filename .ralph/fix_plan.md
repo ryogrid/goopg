@@ -1081,6 +1081,51 @@ filed as real until a HEAD re-run (rule §2) says otherwise.
       `go build ./...` at the run's recorded sha. Evidence:
       `ci/logs/20260816-005117/testport/go-test.log`.
 
+### Nightly run 20260817-011734 (sha `240557311c15`, 6 items) — filed 2026-08-17
+
+Filed per the standing M-NIGHTLY obligation; NOT selected this loop (the Current
+Priority banner puts M0134 next and M0134-0001 was in flight). Note this run
+forked BEFORE the race-gate sharding commit `83dd7ae8` landed, so item -001 is
+expected to be stale — the sharding fix is validated by the FIRST nightly that
+starts after `83dd7ae8`. Triage each per the M-NIGHTLY selection rule (re-run the
+repro at HEAD first; the log reflects the last nightly and may be stale).
+
+- [ ] **race/internal/initdb (AI-20260817-011734-001)** — race suite failed in
+      `github.com/goopg/goopg/internal/initdb`. **Almost certainly stale**: this
+      run predates the sharding fix `83dd7ae8` (which took the package from a 45m
+      timeout to ≈19m56s across 4 shards). Verify, then close.
+      Repro: `make race-gate RACE_TIMEOUT=45m RACE_SHARD_ONLY=1`.
+      Evidence: `ci/logs/20260817-011734/race/go-test.log`.
+- [ ] **testport/TestE2E_PGColdStartOnGoopgDataDir (AI-20260817-011734-002)** —
+      FAILed (new tonight). Repro:
+      `go test -v -run '^TestE2E_PGColdStartOnGoopgDataDir$' ./internal/testport/`.
+      Evidence: `ci/logs/20260817-011734/testport/go-test.log`. Note this test was
+      one of the 9 listed as UNATTRIBUTABLE behind the previous run's mid-stage
+      build break (AI-20260816-005117-003), so tonight is its first attributable
+      result.
+- [ ] **testport/TestE2E_PGCrashStartOnGoopgDataDir (AI-20260817-011734-003)** —
+      FAILed (new tonight). Repro:
+      `go test -v -run '^TestE2E_PGCrashStartOnGoopgDataDir$' ./internal/testport/`.
+      Evidence: `ci/logs/20260817-011734/testport/go-test.log`. Same
+      previously-unattributable set as -002; likely shares a root cause with it.
+- [ ] **testport/TestPort_IsolationIndexOnlyBitmapscan (AI-20260817-011734-004)** —
+      FAILed (new tonight). Repro:
+      `go test -v -run '^TestPort_IsolationIndexOnlyBitmapscan$' ./internal/testport/`.
+      Evidence: `ci/logs/20260817-011734/testport/go-test.log`. Also from the
+      previously-unattributable set.
+- [ ] **testport/TestPort_PgoutputInteropPGToGoopgBpcharPadding
+      (AI-20260817-011734-005)** — FAILed (new tonight). Repro:
+      `go test -v -run '^TestPort_PgoutputInteropPGToGoopgBpcharPadding$' ./internal/testport/`.
+      Evidence: `ci/logs/20260817-011734/testport/go-test.log`.
+- [ ] **testport/TestPort_RegressWedgeProbeNamesTheStuckStatement
+      (AI-20260817-011734-006)** — FAILed (new tonight). Repro:
+      `go test -v -run '^TestPort_RegressWedgeProbeNamesTheStuckStatement$' ./internal/testport/`.
+      Evidence: `ci/logs/20260817-011734/testport/go-test.log`.
+
+Non-blocking notice (no task): 17 `TestPort_Psql*`/`TestPort_Scripts*`/
+`TestPort_Pgbench*` cases newly SKIPPED vs the previous run — env-drift, expected
+on partial `NIGHTLY_STAGES` runs; harvest on a full run.
+
 ## M0130 — Cluster-directory compat with PG 18.3 + PG physical replication (filed 2026-08-09)
 
 **Milestone doc:** `docs/milestones/0130-cluster-dir-compat-and-pg-physical-replication.md`
@@ -6291,7 +6336,7 @@ M0119 and M0122's remaining items. Milestone doc:
 `scripts/pg-regress-runner.sh <case>`.
 
 - [ ] **M0134-0001 — aggregates.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
-  - Progress (see `docs/design/0134-0001-p2-explain-format.md`): S1/S2/S4/S5/S6/S7/S10a landed; **S3 (class 7a) landed 2026-08-15** — join labels now PG-interpolated (commit `aa71b24d`). **S8 (class 6) landed through Slice 2b 2026-08-15**: Slice 1 = sorted GroupAggregate executor (`AggStrategySorted` + `openSorted`); Slice 2a = presorted-aggregate planner rule (`applyPresortedAggregateRule`, port of `adjust_group_pathkeys_for_groupagg`); Slice 2b = `enable_hashagg` bridge (`applyEnableHashAggRule`, `SET enable_hashagg=off` → `GroupAggregate`+`Sort`). class 10 blocked by the varno deferral (ledger 615). Remaining: S8 Slice 2c / Rule 3 (ordered-input GroupExprs reordering + redundant-Sort skip — the btg/group_agg_pk shapes; `enable_seqscan=off` not honored), scalar-subquery nesting, inheritance MergeAppend (dead-end).
+  - Progress (see `docs/design/0134-0001-p2-explain-format.md`): S1/S2/S4/S5/S6/S7/S10a landed; **S3 (class 7a) landed 2026-08-15** — join labels now PG-interpolated (commit `aa71b24d`). **S8 (class 6) landed through Slice 2b 2026-08-15**: Slice 1 = sorted GroupAggregate executor (`AggStrategySorted` + `openSorted`); Slice 2a = presorted-aggregate planner rule (`applyPresortedAggregateRule`, port of `adjust_group_pathkeys_for_groupagg`); Slice 2b = `enable_hashagg` bridge (`applyEnableHashAggRule`, `SET enable_hashagg=off` → `GroupAggregate`+`Sort`). class 10 blocked by the varno deferral (ledger 615). **S8 Slice 2c-i landed 2026-08-17** — `applyIndexOrderedGroupingRule` (`internal/optimizer/groupagg_indexorder.go`): when the GROUP BY keys are a permutation of an exact leading prefix of a usable btree index, the `*SeqScan` child becomes an ascending full-range `*IndexOnlyScan`/`*IndexScan`, `Strategy` becomes `AggStrategySorted`, and **no `Sort` is inserted**; PG's reordered `Group Key:` line comes from a new EXPLAIN-only `Aggregate.GroupKeyOrder` (`GroupExprs` is never permuted — the output bindings are positional). Diff 1311/44/661 → **1296/44/651**. Measurement re-attributed the old "Rule 3" scope (3 ledger rows 2026-08-17): the rule is gated on `enable_hashagg=off` pending a cost comparison; **Slice 2c-ii (partial prefix ⇒ needs an Incremental Sort node goopg lacks entirely — 5 of the 7 `btg` EXPLAINs)** and **Slice 2c-iii (ORDER-BY-aware ordering choice)** are DEFERRED; and `enable_hashjoin`/`enable_nestloop` non-honoring, join-aware functional-dependency GROUP BY reduction, and a duplicate residual `Filter` alongside an `Index Cond` were found to be separate gaps, not Rule 3 — while `agg_sort_order` is not a plan divergence at all (only the EXPLAIN underline-width formatter). Remaining: those re-attributed gaps, scalar-subquery nesting, inheritance MergeAppend (dead-end).
 - [ ] **M0134-0002 — alter_table.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit. **Progress (2026-08-17): diff 4073→4048.** C1/C15/C8/C2/C3/C4/C5/C9/C10 landed; **C11a landed** (ALTER-on-view relkind guard, 42809). C11 was split — **C11b** (`to_json` / JSON-producing builtin family) and **C11c** (no `ruleutils.c` SQL deparser; `pg_get_viewdef` echoes raw text — the real cause of the mislabelled "CREATE OR REPLACE VIEW propagation" symptom, and also of the ledgered CHECK-constraint rendering gap) are DEFERRED with ledger rows; C11c warrants its own milestone. Remaining named work is the formatter tail (C7/C12/C13/C14) plus the C9 residuals in the ledger. See `docs/design/0134-0002-alter-table-sql-divergence.md`.
   - Progress (see `docs/design/0134-0002-alter-table-sql-divergence.md`): **Slice 1 landed 2026-08-15 (commit `dc8c0b9d`)** — server-crash fix: `viewColumnMap`'s bare-`*` arm now maps positionally over the frozen column count, so `update v2` (bug #17811) executes instead of panicking. Diff 4668→4671 lines / 44→81 hunks (the tail ~45% previously lost to the crash is now populated). Remaining 14 classes: C1 `text[]||text[]` op missing, C2 ALTER-TABLE grammar cluster (largest), C3/C4/C8/C9/C10/C11 correctness (C10 = data-loss on failed ALTER TYPE; C11 = rules-subsystem + read-path at_view_2 + top-level-* freeze, all ledgered), C5 btree-inet, C6 catalog gaps, C7/C12/C13/C14 formatter.
   - **C1 landed 2026-08-15 (commit `a3dad96f`)** — array `||` operator binding: the analyzer/planner `OpConcat` type-checks now accept array operands (both spellings) and return the array side's type (array_cat/append/prepend); executor + pg_operator seeds already existed. Surfaced **C15**: `pg_catalog.col_description()` builtin unimplemented — the second `\d+` describe blocker (12 errors remain; ledgered). Next in the `\d+` chain: C15, then C2 grammar.

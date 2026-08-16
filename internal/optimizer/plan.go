@@ -1082,6 +1082,23 @@ type Aggregate struct {
 	// capability first); sorted mode is reachable only via direct node
 	// construction until the pathkey slice wires the choice in.
 	Strategy AggStrategy
+
+	// GroupKeyOrder is an EXPLAIN-only permutation: indices into GroupExprs,
+	// in the order applyIndexOrderedGroupingRule's chosen index lays its key
+	// columns out (S8 Slice 2c-i, 0134-0001 P2). GroupExprs itself is NEVER
+	// reordered — every output-column binding downstream of buildAggregateStage
+	// (target list, HAVING, ORDER BY) is fixed to GroupExprs' written
+	// position, and finalizeGroup's group-boundary test
+	// (internal/executor/operators_join_agg.go) is order-independent, so a
+	// permutation is needed only to print PG's reordered `Group Key:` line
+	// (mirrors PG's group_keys_reorder_by_pathkeys, pathkeys.c:375-450, which
+	// reorders the printed key list without touching the parse tree's
+	// groupClause). nil means "written order" — the fallback every existing
+	// construction site gets, so this field never displaces the
+	// remapAggExprsWithBindings-style compensating permutation that would be
+	// the alternative design (see docs/design/0134-0001-p2-explain-format.md
+	// §"S8 Slice 2c").
+	GroupKeyOrder []int
 }
 
 // GroupingMaskColOffset is the index of the first GROUPING(...) output

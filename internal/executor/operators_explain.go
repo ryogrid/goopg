@@ -749,9 +749,20 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		// out of S5 scope (its per-set lines are a separate M0125-0048
 		// shape; the suffix on the label carries the set count).
 		if len(p.GroupExprs) > 0 && p.GroupingSets == nil {
-			parts := make([]string, 0, len(p.GroupExprs))
-			for _, g := range p.GroupExprs {
-				parts = append(parts, formatExprQual(g, reg, qualify))
+			// GroupKeyOrder (S8 Slice 2c-i, 0134-0001 P2) reorders only this
+			// printed line — GroupExprs itself, and every output binding
+			// fixed to its written position, is untouched. nil means the
+			// written order (every pre-2c-i plan).
+			order := p.GroupKeyOrder
+			if order == nil {
+				order = make([]int, len(p.GroupExprs))
+				for i := range order {
+					order[i] = i
+				}
+			}
+			parts := make([]string, 0, len(order))
+			for _, gi := range order {
+				parts = append(parts, formatExprQual(p.GroupExprs[gi], reg, qualify))
 			}
 			*rows = append(*rows, Row{NewStringDatum(indent + "Group Key: " + strings.Join(parts, ", "))})
 		}

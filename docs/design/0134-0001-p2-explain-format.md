@@ -868,6 +868,176 @@ input — skip the redundant `Sort` and reorder `GroupExprs`, the `btg`/
 `Gather Merge` layer PG suppresses by cost (correctness-safe, EXPLAIN-shape only);
 and a redundant-outer-parens rendering gap (`(g % 10000)` vs `((g % 10000))`).
 
+## S8 Slice 2c — Rule 3 (index-ordered grouping input): scope + decomposition
+
+Status: `accepted` (design), Slice 2c-i implemented; 2c-ii/2c-iii deferred with
+ledger rows.
+
+Slice 2b's residual paragraph above named "Rule 3" as one unit and attributed the
+`btg` / `group_agg_pk` / `agg_sort_order` shapes to it. Measurement at HEAD
+(`PATH="$PWD/postgres/local_install/bin:$PATH" scripts/pg-regress-runner.sh
+--verbose aggregates` ⇒ `tmp/regress-diffs/aggregates.diff`, 1311 lines / 44
+hunks / 661 changed lines) shows that attribution was **too broad**. The three
+"Rule 3" hunks decompose as follows, and only a part of them is Rule 3:
+
+| hunk | queries | actually caused by |
+|---|---|---|
+| `btg` block (`aggregates.sql:1266-1314`) | 7 EXPLAINs | Rule 3 proper (all 7), plus goopg having **no Incremental Sort node at all** (5 of the 7), plus a duplicate residual `Filter` alongside an `Index Cond` (1) |
+| `group_agg_pk` block 1 (`avg(... ORDER BY ...)`) | 1 EXPLAIN | **not Rule 3** — goopg's `Group Key`/`Sort Key` lines already match PG byte-for-byte; the sole divergence is goopg picking a Hash Join while `enable_hashjoin`/`enable_nestloop` are off |
+| `group_agg_pk` block 2 | 2 EXPLAINs | Rule 3 **plus** a join-aware functional-dependency GROUP BY reduction (PG drops `c2.x` given `c1.x = c2.x` and `c1.x` already grouped), plus the same join-GUC gap |
+| `agg_sort_order` (`aggregates.diff:1147`) | 1 EXPLAIN | **not Rule 3, not a plan divergence at all** — every plan line is byte-identical; the hunk is only the pre-existing `QUERY PLAN` underline-width cosmetic gap. The Slice 2b residual paragraph naming it was aspirational. |
+
+### What PG actually does (oracle)
+
+`postgres/src/backend/optimizer/path/pathkeys.c:466-550`
+`get_useful_group_keys_orderings` — note the Slice-2b-era citation pointing at
+`planner.c` is wrong: only the *call sites* are in `planner.c` (`:7144`, inside
+`create_ordered_paths` / `add_paths_to_grouping_rel`); the body is in
+`pathkeys.c`. It always returns the original GROUP BY ordering, and returns at
+most **one** alternate — it does not enumerate permutations. The alternate comes
+from `group_keys_reorder_by_pathkeys` (`pathkeys.c:375-450`): walk the *input
+path's* own pathkeys in order, move each one that matches a GROUP BY clause to
+the front of the reordered list, stop at the first pathkey with no matching group
+key, and append the leftover group keys unsorted. It is kept only if it matched
+≥1 prefix key, differs from the original, and (`enable_incremental_sort` is on OR
+the entire group key list matched). With `GROUPING SETS`, or
+`enable_group_by_reordering = off`, the original ordering is the only one. There
+is no "no index matched" special case — cost comparison over the returned
+orderings simply falls back to the original, which is what forces the full
+`Sort`, i.e. exactly today's Slice 2a/2b behaviour.
+
+**The direction is inverted for goopg.** PG reorders group keys *to match a path
+that already exists* (the index path was enumerated by the scan-path machinery
+and carries pathkeys). goopg's optimizer is rule-based with no path enumeration,
+so Rule 3 must run the search the other way: take the group keys, ask
+`cat.IndexesOnTable` (`internal/catalog/catalog.go:20351` / `:23597`, the same
+accessor `tryPromoteOrderedIndexOnlyScan` uses at
+`internal/optimizer/planner.go:13348`) for a usable btree index, and test whether
+the group keys can be ordered to match that index's leading columns. Index
+usability filters must mirror `tryPromoteOrderedIndexOnlyScan` exactly
+(`planner.go:13349-13375`): `Method == "btree"`, not `HasPredicate`, not
+`DeclaredHash`, and every consumed column default-ordered
+(`!ColDescending[i] && !ColNullsFirst[i]`).
+
+### The pinned correctness risk — `GroupExprs` order is load-bearing
+
+`Aggregate.GroupExprs` order is **not** cosmetic. `buildAggregateStage`
+(`internal/optimizer/planner.go:6486-6539`) assigns each GROUP BY item's output
+slot as `idx := len(outputSchema)` (`:6514`) in GROUP BY clause order and records
+`groupByExpr` / `groupByInputCol` (`:6535-6539`); every downstream target-list,
+HAVING and ORDER BY `ColumnRef` is bound to that position, and this happens
+*before* the Rule-2a/2b/3 dispatch point at `planner.go:1292`. At runtime
+`groupRuntime.groupValues[i]` (`internal/executor/operators_join_agg.go:1828-1836`,
+`finalizeGroup`) emits the value of `GroupExprs[i]` at output column `i`. So an
+uncompensated in-place permutation of `GroupExprs` **moves data between output
+columns**, silently — the worst failure class this project has (Hard-won Rule #2:
+the EXPLAIN label and the executor's column mapping are a sibling pair and must
+change together).
+
+PG has the same decoupling and solves it the same way: in the `btg_y_x_w_idx`
+verbose case PG prints `Group Key: btg.y, btg.x` (reordered to the index) while
+`Output: y, x, array_agg(DISTINCT w)` stays in the written projection order.
+
+**Design decision — do not permute `GroupExprs` at all.** The reorder is only
+ever needed for two things: deciding that the index's ordering satisfies the
+grouping, and printing PG's `Group Key:` line. It is *not* needed by the
+executor. A sorted `GroupAggregate` detects a group boundary as "any group key
+value differs from the previous row" (`finalizeGroup` /
+`operators_join_agg.go:1828-1836`), which is order-independent: an input sorted
+by `(x, y)` makes rows with equal `(y, x)` contiguous just as well. So
+`GroupExprs` keeps its written order — output column identity, the positional
+bindings from `buildAggregateStage`, and `groupValues[i]` are all untouched, and
+the data-movement failure mode above cannot occur by construction.
+
+Rule 3 therefore adds a permutation *alongside* `GroupExprs` — indices into it,
+in index-column order — consumed only by the EXPLAIN `Group Key:` renderer. This
+is a strictly smaller change than a compensating output permutation (the
+posMap-style rewrite `remapAggExprsWithBindings` performs at this same dispatch
+point, `planner.go:1276-1282`), which stays the documented fallback if the
+order-independence premise turns out not to hold — it is an explicit
+implementation gate, verified by a test that groups on a permuted key order and
+asserts the *result rows*, not just the plan text.
+
+### Decomposition
+
+- **Slice 2c-i — full-prefix match, Sort elimination (THIS SLICE).** Fires when
+  the group keys are all plain column references over a bare `*SeqScan` (or
+  `*Filter{Child: *SeqScan}`) child and *some* ordering of them is exactly a
+  prefix of a usable btree index's `Columns`. Effect: reorder `GroupExprs` to the
+  index order (with the output permutation above), replace the child with the
+  ascending full-range `*IndexOnlyScan` / `*IndexScan`
+  (`plan.go:794-823`, constructed as at `planner.go:13415-13421` — nil
+  `Key`/`Keys`/`LowKey`/`HighKey` ⇒ the executor RangeScans the whole index in
+  ascending key order), and set `AggStrategySorted` **without** inserting a
+  `*Sort`. Runs *before* `applyPresortedAggregateRule` / `applyEnableHashAggRule`
+  so those never get the chance to wrap the child in a redundant `Sort`.
+  Closes `btg` query (i) (`GROUP BY y, x` ⇒ `Index Only Scan using btg_x_y_idx`,
+  no Sort) outright. Measured: aggregates diff 1311/44/661 → **1296/44/651**.
+
+  **Accepted deviation — the rule is additionally gated on `enable_hashagg` being
+  off** (`hashAggEnabled.Load()`, the same kill-switch Slice 2b's
+  `applyEnableHashAggRule` reads). This was not in the original design and was
+  forced by measurement. The gate exists because goopg has no cost model: PG
+  reaches this plan by comparing a `HashAggregate` path against an index-ordered
+  `GroupAggregate` path (`cost_agg`, `costsize.c:2755-2756`) and picking the
+  cheaper, whereas a goopg rule can only fire or not fire. Firing
+  unconditionally regressed the case to 1386/47/687, because it also promoted
+  `aggregates.sql`'s primary-key functional-dependency block (`t1 GROUP BY
+  a,b,c,d`, reduced to `a,b` by an earlier pass, `enable_hashagg` left ON) where
+  PG correctly prefers `HashAggregate`. Every `btg` probe this slice targets runs
+  inside `SET enable_hashagg = off` (`aggregates.sql:1275-1370`), so the gate
+  costs no coverage here — but it does mean the rule is dormant in ordinary
+  queries, i.e. this reproduces PG's *output* without PG's *reasoning*. That is
+  the same objection this doc raises against gating on `enable_seqscan`, and it
+  is accepted here only because the alternative is a measured regression. The
+  real fix is a cost comparison between the hashed and index-ordered arms;
+  recorded in the deferral ledger, and it is the natural first consumer of the
+  cost-model work in `docs/design/cost-model/`.
+- **Slice 2c-ii — partial-prefix match ⇒ Incremental Sort. DEFERRED.** Five of
+  the seven `btg` queries need PG's `Incremental Sort` node (`Presorted Key:`),
+  which goopg does not have in any form — neither planner node nor executor
+  operator. That is a new subsystem, not a slice of this rule; it needs its own
+  design doc and its own fix_plan item. Until it exists, a partial prefix match
+  is deliberately left to fall through to the Slice 2a/2b full `Sort`, which is
+  precisely PG's own fallback when `enable_incremental_sort` is off
+  (`pathkeys.c:509-511`).
+- **Slice 2c-iii — ORDER-BY-aware ordering choice. DEFERRED.** `btg` query (v)
+  (`GROUP BY w,x,z,y ORDER BY y,x,z,w`) shows PG choosing the group-key ordering
+  that also satisfies the outer `ORDER BY`, so the grouping `Sort` doubles as the
+  ORDER BY sort and the plan has one Sort instead of two. This is a second
+  ordering candidate on top of 2c-i's index-driven one and is independent of it.
+
+Explicitly **out of Rule 3's scope**, recorded so a later loop does not re-derive
+the attribution: `enable_hashjoin` / `enable_nestloop` are not honored (owns all
+of `group_agg_pk` block 1 and part of block 2); the join-aware
+functional-dependency GROUP BY reduction PG applies via
+`remove_useless_groupby_columns`-adjacent logic (block 2); the duplicate residual
+`Filter` emitted alongside an `Index Cond` by
+`rewriteScanInputsWithSingleTablePredicates` (`btg` query vii); and the
+`QUERY PLAN` underline-width cosmetic gap (`agg_sort_order`, and every plan).
+
+### `enable_seqscan = off`
+
+Bridged, but narrowly. The GUC reaches the optimizer as `wrapped.DisableSeqScan`
+(`internal/postmaster/dispatch.go:1551-1557`, `:1614-1617`) and is consumed only
+by `tryPromoteOrderedIndexOnlyScan` (`internal/optimizer/planner.go:13292-13320`,
+gate at `:13318`), which fires exclusively for `Project(Sort(bare *SeqScan))`
+shapes (design `0118-0103`) — never for an `Aggregate`. The comment at
+`planner.go:13296-13300` states the general position: goopg's rule-based planner
+ignores the planner-toggle GUCs outside that one gated promotion. Slice 2c-i does
+**not** gate on `DisableSeqScan`: PG picks the index here by cost, and the regress
+case merely uses the GUC to make that choice deterministic, so gating on it would
+reproduce the output for the wrong reason and leave the rule dead in normal
+queries.
+
+### Path-name correction
+
+Earlier sections of this doc cite `internal/planner/pathkeys.go`,
+`internal/planner/groupagg_presorted.go` and `internal/planner/groupagg_hashagg.go`.
+There is no `internal/planner` package — all three files live in
+**`internal/optimizer/`**. The symbols named are correct; only the directory is
+wrong.
+
 ## Cross-case relevance
 
 Every M0134 regress case whose `.sql` emits `EXPLAIN` inherits the formatter
