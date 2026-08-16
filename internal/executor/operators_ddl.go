@@ -9542,11 +9542,11 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				}
 			}
 		case parser.AlterTableAlterColumnType:
-			if err := o.execAlterColumnType(tbl, act); err != nil {
+			if err := o.execAlterColumnType(tbl, act, s.Only); err != nil {
 				return err
 			}
 		case parser.AlterTableDropColumn:
-			if err := o.execAlterDropColumn(tbl, act); err != nil {
+			if err := o.execAlterDropColumn(tbl, act, s.Only); err != nil {
 				return err
 			}
 		case parser.AlterTableAddOf:
@@ -22020,7 +22020,7 @@ func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {
 // re-inserts all rows and rebuilds indexes. Mirrors execAlterColumnType.
 // Indexes referencing only the dropped column become empty orphans (harmless
 // for now; a future pass can DROP them explicitly).
-func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAction) error {
+func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAction, only bool) error {
 	// Find the column to drop.
 	dropIdx := -1
 	for i, col := range tbl.Columns {
@@ -22058,19 +22058,36 @@ func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAct
 	// (postgres/src/backend/commands/tablecmds.c:9358;
 	// postgres/src/backend/catalog/partition.c:255) which reports 42P16, same as
 	// the inherited-column guard immediately above.
-	if tbl.PartitionMethod != "" {
-		colLower := strings.ToLower(act.ColumnName)
-		for _, keyCol := range tbl.PartitionKey {
-			if strings.ToLower(keyCol) == colLower {
-				return &ExecError{Code: "42P16", Pos: 0,
-					Message: fmt.Sprintf("cannot drop column %q because it is part of the partition key of relation %q", act.ColumnName, tbl.Name)}
-			}
-		}
-		// Also check expression partition keys (e.g. PARTITION BY RANGE (plusone(a))).
-		for _, expr := range tbl.PartitionKeyExprs {
-			if partitionKeyExprUsesColumn(expr, colLower) {
-				return &ExecError{Code: "42P16", Pos: 0,
-					Message: fmt.Sprintf("cannot drop column %q because it is part of the partition key of relation %q", act.ColumnName, tbl.Name)}
+	colLower := strings.ToLower(act.ColumnName)
+	if o.partitionKeyUsesColumn(tbl, colLower) {
+		return &ExecError{Code: "42P16", Pos: 0,
+			Message: fmt.Sprintf("cannot drop column %q because it is part of the partition key of relation %q", act.ColumnName, tbl.Name)}
+	}
+
+	// M0134-0002 C9 residuals: `ALTER TABLE ONLY` DROP COLUMN on a partitioned
+	// parent that still has partitions is refused — PG raises this only for
+	// RELKIND_PARTITIONED_TABLE with children and !recurse (ATExecDropColumn,
+	// postgres/src/backend/commands/tablecmds.c:9385-9389). When recursing (no
+	// ONLY), PG re-runs the partition-key guard on each descendant's OWN key and
+	// names the DESCENDANT (one-level child recursion tablecmds.c:9373/9422-9424
+	// re-entering ATExecDropColumn, which re-hits has_partition_attrs at :9358).
+	// allDescendants is OID-sorted first so the first-hit message text is
+	// deterministic (PG's find_inheritance_children sorts siblings by OID,
+	// pg_inherits.c:200-201). Both raises carry no errposition, so Pos is 0.
+	if only && tbl.PartitionMethod != "" && o.hasInheritanceChildren(tbl) {
+		return &ExecError{Code: "42P16", Pos: 0,
+			Message: "cannot drop column from only the partitioned table when partitions exist",
+			Hint:    "Do not specify the ONLY keyword."}
+	}
+	if !only {
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			descs := allDescendants(im, tbl, 0)
+			sort.Slice(descs, func(i, j int) bool { return descs[i].OID < descs[j].OID })
+			for _, desc := range descs {
+				if o.partitionKeyUsesColumn(desc, colLower) {
+					return &ExecError{Code: "42P16", Pos: 0,
+						Message: fmt.Sprintf("cannot drop column %q because it is part of the partition key of relation %q", act.ColumnName, desc.Name)}
+				}
 			}
 		}
 	}
@@ -22251,7 +22268,7 @@ func noUsingCoercionError(colName, targetType string) *ExecError {
 	}
 }
 
-func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAction) error {
+func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAction, only bool) error {
 	colIdx := -1
 	for i, col := range tbl.Columns {
 		if strings.EqualFold(col.Name, act.ColumnName) {
@@ -22268,6 +22285,17 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 		return &ExecError{Code: "42703", Pos: act.Pos(), Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
 	}
 
+	// M0134-0002 C9 residuals: cannot alter the type of an inherited column.
+	// Same gate as the DROP COLUMN arm (:22052-22055), but PG's ALTER TYPE
+	// ereport says "alter" and carries parser_errposition(pstate, def->location)
+	// (ATExecAlterColumnType, postgres/src/backend/commands/tablecmds.c:14436-14440),
+	// so Pos is act.Pos(). This fires BEFORE the partition-key guard, matching
+	// tablecmds.c's order (inherited :14436 precedes has_partition_attrs :14443).
+	if tbl.Columns[colIdx].Inherited && o.colStillInherited(tbl, act.ColumnName) {
+		return &ExecError{Code: "42P16", Pos: act.Pos(),
+			Message: fmt.Sprintf("cannot alter inherited column %q", act.ColumnName)}
+	}
+
 	// Cannot alter the type of a column that is part of the partition key.
 	// Mirrors ATExecAlterColumnType's has_partition_attrs check
 	// (postgres/src/backend/commands/tablecmds.c:14443;
@@ -22277,18 +22305,27 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 	// column name in the statement (tablecmds.c:14450) — so Pos is act.Pos().
 	// act.Pos() is nonzero now that parseAlterColumnAction threads the
 	// column-name token location into the ALTER TYPE action.
-	if tbl.PartitionMethod != "" {
-		colLower := strings.ToLower(act.ColumnName)
-		for _, keyCol := range tbl.PartitionKey {
-			if strings.ToLower(keyCol) == colLower {
-				return &ExecError{Code: "42P16", Pos: act.Pos(),
-					Message: fmt.Sprintf("cannot alter column %q because it is part of the partition key of relation %q", act.ColumnName, tbl.Name)}
-			}
-		}
-		for _, expr := range tbl.PartitionKeyExprs {
-			if partitionKeyExprUsesColumn(expr, colLower) {
-				return &ExecError{Code: "42P16", Pos: act.Pos(),
-					Message: fmt.Sprintf("cannot alter column %q because it is part of the partition key of relation %q", act.ColumnName, tbl.Name)}
+	colLower := strings.ToLower(act.ColumnName)
+	if o.partitionKeyUsesColumn(tbl, colLower) {
+		return &ExecError{Code: "42P16", Pos: act.Pos(),
+			Message: fmt.Sprintf("cannot alter column %q because it is part of the partition key of relation %q", act.ColumnName, tbl.Name)}
+	}
+
+	// M0134-0002 C9 residuals: when recursing (no ONLY), PG re-runs the
+	// partition-key guard on each descendant's OWN key via find_all_inheritors
+	// (ATPrepAlterColumnType, postgres/src/backend/commands/tablecmds.c:14576),
+	// naming the DESCENDANT with the column-name errposition (tablecmds.c:14450),
+	// so Pos is act.Pos(). allDescendants is OID-sorted first for deterministic
+	// message text (pg_inherits.c:200-201).
+	if !only {
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			descs := allDescendants(im, tbl, 0)
+			sort.Slice(descs, func(i, j int) bool { return descs[i].OID < descs[j].OID })
+			for _, desc := range descs {
+				if o.partitionKeyUsesColumn(desc, colLower) {
+					return &ExecError{Code: "42P16", Pos: act.Pos(),
+						Message: fmt.Sprintf("cannot alter column %q because it is part of the partition key of relation %q", act.ColumnName, desc.Name)}
+				}
 			}
 		}
 	}

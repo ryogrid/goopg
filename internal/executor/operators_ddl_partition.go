@@ -1377,3 +1377,26 @@ func partitionKeyExprUsesColumn(e parser.Expr, colLower string) bool {
 	}
 	return false
 }
+
+// partitionKeyUsesColumn reports whether tbl (a partitioned table) references
+// colLower (already lower-cased) in its partition key — either as a bare key
+// column or inside an expression key. Factored out of the DROP COLUMN / ALTER
+// TYPE partition-key guards (M0134-0002 C9 residuals). PG's equivalent is
+// has_partition_attrs (postgres/src/backend/catalog/partition.c:255), which
+// each ALTER arm re-hits on every descendant relation when recursing.
+func (o *ddlOp) partitionKeyUsesColumn(tbl *catalog.Table, colLower string) bool {
+	if tbl.PartitionMethod == "" {
+		return false
+	}
+	for _, keyCol := range tbl.PartitionKey {
+		if strings.EqualFold(keyCol, colLower) {
+			return true
+		}
+	}
+	for _, expr := range tbl.PartitionKeyExprs {
+		if partitionKeyExprUsesColumn(expr, colLower) {
+			return true
+		}
+	}
+	return false
+}

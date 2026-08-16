@@ -542,6 +542,58 @@ the regress `LINE 1 … ^` caret points at the column name, byte-matching PG
 coercion-failure 42804 arms (evaluation-time, no source location) use `Pos: 0`,
 not `act.Pos()`.
 
+## C9 residuals — ONLY-on-partitioned guard + descendant-partition recursion (2026-08-16)
+
+After the own-key guards landed (DROP COLUMN + ALTER TYPE), two C9 residuals
+remain, both in the partitioned-parent block (`alter_table.sql:2850-2858,2902-2903`),
+and they cascade off one root cause: goopg's `ALTER TABLE ONLY <partitioned> DROP
+COLUMN` silently succeeds where PG refuses, so `b` is dropped from `list_parted2`'s
+catalog and every later statement in the block then reports a spurious 42703 on the
+already-gone column. Three guards close the block (research
+`0134-0002-c9-residuals-partition-recursion-research`):
+
+1. **ONLY-on-partitioned DROP COLUMN guard** (ledger row 1416). PG
+   `ATExecDropColumn` tablecmds.c:9385-9389 raises, when the target is itself
+   `RELKIND_PARTITIONED_TABLE` and has ≥1 child and `!recurse` (ONLY): 42P16
+   `cannot drop column from only the partitioned table when partitions exist` +
+   HINT `Do not specify the ONLY keyword.`, `Pos: 0`. goopg must raise the same
+   in `execAlterDropColumn` after the own-key guard. `ATExecAlterColumnType` has
+   **no** analogous ONLY guard (its recursion is prep-time and silently skipped
+   when `!recurse`, tablecmds.c:14568), so ALTER TYPE does not get one.
+2. **Descendant-partition recursion** (ledger row 1419). PG recurses into
+   descendant partitions and re-runs the partition-key guard on each descendant's
+   OWN key, reporting the DESCENDANT's relation name: `ALTER TABLE list_parted2
+   DROP COLUMN b` → 42P16 `cannot drop column "b" because it is part of the
+   partition key of relation "part_5"` (`ATExecDropColumn` one-level recursion
+   tablecmds.c:9373/9422-9424; `ATPrepAlterColumnType` prep-time `find_all_inheritors`
+   :14576). goopg checks only the parent's own key and reports 42703. goopg already
+   has the walker — `allDescendants(im, tbl, 0)` (operators_fk.go:949, BFS over
+   `InheritanceChildren ∪ PartitionChildren`, transitive, excludes the parent) —
+   and the predicate — `partitionKeyExprUsesColumn` (operators_ddl_partition.go:1338).
+   Walk descendants when `!only`, fire on the FIRST partitioned descendant whose key
+   uses the column. DROP COLUMN uses `Pos: 0`; ALTER TYPE uses `Pos: act.Pos()` (the
+   original column-name errposition, out:4581-4582). Sort the descendant list by OID
+   for deterministic message text (PG BFS-sorts siblings by OID, pg_inherits.c:200-201).
+3. **ALTER TYPE inherited-column guard** (new residual, unmasked once (1) lands).
+   `ALTER TABLE part_2 ALTER COLUMN b TYPE text` must raise 42P16 `cannot alter
+   inherited column "b"` + errposition (tablecmds.c:14436-14440) — the DROP
+   (`:22052`) and RENAME (`:8462`/`:8496`) arms already have the twin; ALTER TYPE
+   lacks it. Same `col.Inherited && colStillInherited` gate, `Pos: act.Pos()`.
+
+`only` is not yet threaded into either function: `execAlterTable` (operators_ddl.go
+:9544/:9548) holds `s.Only` in scope but calls `execAlterDropColumn(tbl, act)` /
+`execAlterColumnType(tbl, act)`. Add an `only bool` param at both call sites.
+
+**Landed (2026-08-16).** All three guards + a shared `partitionKeyUsesColumn`
+helper (operators_ddl_partition.go) + the `allDescendants` `visited` set. Diff
+4110→4102 (−8 lines): the three guard statements (`:2850` ONLY, `:2902` DROP,
+`:2903` ALTER TYPE) are byte-green. Remaining in the block (NOT closed — separate
+C9 residuals, ledgered): `part_2 ADD COLUMN c text` (no `cannot add column to a
+partition` guard, tablecmds.c:7250) and the `part_2 DROP/RENAME/ALTER` inherited
+refusals, all blocked by the pre-existing ATTACH-PARTITION `Inherited`-marking gap
+(ledger row 1410 (a)) — plus the cyclic-ATTACH 42P17 gap the `visited` set guards
+against rather than fixes.
+
 ## C4 — ADD FOREIGN KEY validation semantics (2026-08-16)
 
 **Class: FK semantics (`tablecmds.c`, correctness).** The ADD-FK executor arm

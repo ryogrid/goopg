@@ -950,6 +950,15 @@ func fkSetNull(ctx *Context, childTbl *catalog.Table, fk catalog.ForeignKey, val
 func allDescendants(im *catalog.InMemory, tbl *catalog.Table, snapEpoch uint64) []*catalog.Table {
 	var out []*catalog.Table
 	queue := []*catalog.Table{tbl}
+	// visited guards against inheritance/partition cycles. PostgreSQL forbids
+	// cycles (ALTER TABLE ... ATTACH PARTITION raises "circular inheritance not
+	// allowed"), but goopg's ATTACH validation has a gap and can silently
+	// register a back-edge; without the visited set the M0134-0002 C9
+	// descendant walk below would never terminate on such a graph (BFS without
+	// dedup re-queues the cycle forever, growing `out` until the cgroup OOM-kills
+	// the server). On acyclic graphs the dedup changes nothing observable — PG's
+	// find_all_inheritors dedups too (pg_inherits.c:282-324, via a hash table).
+	visited := map[uint32]bool{tbl.OID: true}
 	for len(queue) > 0 {
 		cur := queue[0]
 		queue = queue[1:]
@@ -959,6 +968,10 @@ func allDescendants(im *catalog.InMemory, tbl *catalog.Table, snapEpoch uint64) 
 			if k != nil && k.DetachPendingEpoch != 0 && snapEpoch >= k.DetachPendingEpoch {
 				continue // detach-pending and invisible to this snapshot — skip subtree
 			}
+			if visited[k.OID] {
+				continue
+			}
+			visited[k.OID] = true
 			out = append(out, k)
 			queue = append(queue, k)
 		}
