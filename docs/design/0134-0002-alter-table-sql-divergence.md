@@ -72,7 +72,7 @@ reorder robustness; deferred, see the ledger.)
 | C7 | constraint naming/rendering (`con1` ignored, `CHECK ((a>10.2))` double-parens, partition-child index `_0_key` vs `_0_id_name_key`) | `operators_ddl.go`/explain | `tablecmds.c`/`ruleutils.c` | formatter |
 | C8 | ~~system columns unmodeled (`ADD COLUMN xmin` accepted)~~ **LANDED** — a case-sensitive `isSystemColumn` helper (ctid/xmin/cmin/xmax/cmax/tableoid, no `oid`) rejects at all four entry points with 42701 + the PG-exact message | `execCreateTable`/`execCreateTableAs`/`execAlterTableAddColumn` + the RENAME arm (`operators_ddl.go`); `validatePartitionKey` reuses the helper (one name-list source). RENAME check corrected: 42P20→42701, `oid` dropped, case-sensitive | `tablecmds.c:7673` `check_for_column_name_collision` (ADD/RENAME) + `heap.c:481` `CheckAttributeNamesTypes` (CREATE/CTAS); `SysAtt[]` `heap.c:144-228` | correctness |
 | C9 | inheritance semantics (inherited CHECK/NOT-NULL not enforced on children, `attinhcount` diverges) | DDL | `tablecmds.c` | correctness |
-| C10 | ALTER TYPE (**data loss**: failed int8→int4 leaves table EMPTY, `internal error: expected int, got kind 1`) | `ATExecAlterColumnType` path | `tablecmds.c` | correctness |
+| C10 | ~~ALTER TYPE (**data loss**: failed int8→int4 leaves table EMPTY, `internal error: expected int, got kind 1`)~~ **LANDED (2026-08-16)** — static assignment-coercibility gate `canAssignCast` (int2/int4/int8→bool + text→int rejected) at the top of `execAlterColumnType`, no-USING path, before storage work; the crash itself was already closed by C2 slice 5 (`fec178bd`). | `ATExecAlterColumnType` path | `tablecmds.c` | correctness |
 | C11 | view-DML (`to_json` missing, `CREATE OR REPLACE VIEW` not propagating to dependents, ALTER-on-view accepted) | view_dml.go | `rewriteHandler.c` | correctness |
 | C12 | message text | error msgs | `errcode()` | formatter |
 | C13 | NOTICE/IF EXISTS | DDL | `tablecmds.c` | formatter |
@@ -607,8 +607,61 @@ given keys` (`transformFkeyCheckAttrs` tablecmds.c:13657 — goopg does not veri
 the referenced table has a unique index on the ref columns), system-column
 0A000, and the FK column-count (42908) checks.
 
+## C10 — ALTER TYPE assignment-coercibility gate (2026-08-16) — LANDED
+
+**Refined scope (researcher `0134-0002-c10-alter-type-coercion-research`):** the
+C10 data-loss crash is ALREADY fixed — C2 slice 5 (`fec178bd`) captures the
+per-row `evalCast` error and returns it before Phase-3 truncation, so `internal
+error: expected int, got kind 1` + empty table are NOT reachable at HEAD. The
+remaining genuine divergence is a **single pair**: `ALTER COLUMN atcol1 TYPE
+boolean` on an `int8` column (`alter_table.sql:1356`) silently succeeds where PG
+raises 42804. Every other C10-region diff line is a cascade of that one flip.
+
+**Root cause.** goopg's per-row `evalCast` (`internal/executor/expr.go:3467`) has
+an int→bool arm (`NewBoolDatum(d.Int != 0)` at :3484) that is correct for the
+EXPLICIT cast context (`1::boolean` is legal) but wrong for the ASSIGNMENT
+context. PG gates coercion by `CoercionContext` per call site: `ATExecAlterColumnType`
+calls `coerce_to_target_type(..., COERCION_ASSIGNMENT, ...)` (tablecmds.c:14503),
+and `find_coercion_pathway` (parse_coerce.c:3152) returns NONE for int→bool —
+int4→bool is castcontext `'e'` (explicit-only, pg_cast.dat:90-92), int8→bool has
+no pg_cast row at all, and the I/O fallback (:3273) requires a string-category
+target. So PG raises 42804 at tablecmds.c:14499-14517 with **no errposition**.
+
+**Fix (static gate, not a global evalCast change).** `evalCast` is shared by
+EXPLICIT paths (`1::boolean`) and the ALTER-TYPE ASSIGNMENT path, so a global
+strictness change would break the explicit cast. Instead, add a static
+assignment-coercibility predicate and call it at the TOP of `execAlterColumnType`
+(`internal/executor/operators_ddl.go`, before the `nBlocks==0` early return —
+PG's 42804 fires even on an empty table, where the per-row evalCast hook never
+runs):
+
+- `canAssignCast(src, dst catalog.Type) bool` — returns false for the pairs PG's
+  COERCION_ASSIGNMENT rejects that goopg currently accepts (int2/int4/int8 → bool,
+  text → int2/int4/int8), true otherwise (preserving current per-row evalCast
+  behaviour, which already handles int8→int4 narrowing byte-identically).
+- On false, raise the existing 42804 arm (byte-exact message + HINT, Pos 0 —
+  the arms at operators_ddl.go:22374-22384 already match tablecmds.c:14495-14511).
+
+Deferred (ledger): the FULL assignment-coercion matrix (bool→int, and any other
+permissive pair not exercised by alter_table.sql) and the INSERT/UPDATE
+assignment-coercion sibling — both out of C10's diff scope; see the ledger row.
+
+**Landed (2026-08-16, this loop):** `canAssignCast` + `noUsingCoercionError`
+added beside `execAlterColumnType` (`operators_ddl.go`); the gate fires on the
+no-USING path after the name-unchanged no-op, before the `Pool == nil` / `nBlocks
+== 0` early returns. The per-row no-USING 42804 raise was refactored onto the
+shared helper (bytes unchanged); `evalCast` and the WITH-USING arm untouched.
+Diff 4113 → 4110 (−3), confined to the `anothertab` C10 region — sql:1356 now
+byte-matches PG. Verified against real PG 18.3 (explicit `1::boolean` preserved,
+empty-table and non-empty int8→bool both 42804, int8→int4 narrowing preserves
+value). 6 subtests in `operators_ddl_alter_type_coercion_test.go`.
+
 ## PG oracle citations
 
+- `postgres/src/backend/parser/parse_coerce.c` — `coerce_to_target_type` (:78),
+  `can_coerce_type` (:557), `find_coercion_pathway` (:3152), I/O fallback (:3273).
+- `postgres/src/include/catalog/pg_cast.dat` — castcontext rows (int8→int4 'a'
+  :23, int4→bool 'e' :90-92).
 - `postgres/src/backend/catalog/partition.c:255` — `has_partition_attrs(Relation,
   Bitmapset *, bool *used_in_expr)`: plain key via `bms_is_member`, expression key
   via `pull_varattnos(expr, 1, &expr_attrs)` (`optimizer/util/var.c:296`) +

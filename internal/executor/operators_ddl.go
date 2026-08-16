@@ -22214,6 +22214,43 @@ func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAct
 	return nil
 }
 
+// canAssignCast is the static assignment-coercibility gate for ALTER TYPE
+// without USING. PG's ATExecAlterColumnType coerces the old column datum with
+// COERCION_ASSIGNMENT (postgres/src/backend/commands/tablecmds.c:14491-14496);
+// find_coercion_pathway (postgres/src/backend/parser/parse_coerce.c:3152)
+// returns NONE for the pairs rejected here — int2/int4/int8 → bool (int4→bool
+// is castcontext 'e' explicit-only, pg_cast.dat:90-92; int8→bool has no
+// pg_cast row), and text → int2/int4/int8 — so PG raises 42804 at parse time
+// even on an empty table. The shared evalCast is NOT changed: explicit :: casts
+// keep their permissive arms. Classify by the type's canonical name (as
+// isSupportedBTreeKeyType does); array-ness is carried separately in
+// catalog.Type.IsArray. M0134-0002 C10.
+func canAssignCast(src, dst catalog.Type) bool {
+	if (isInt2Type(src.Name) || isInt4Type(src.Name) || isInt8Type(src.Name)) &&
+		isBoolType(dst.Name) {
+		return false
+	}
+	if isTextType(src.Name) &&
+		(isInt2Type(dst.Name) || isInt4Type(dst.Name) || isInt8Type(dst.Name)) {
+		return false
+	}
+	return true
+}
+
+// noUsingCoercionError builds the WITHOUT-USING 42804 ATPrepAlterColumnType
+// raise (postgres/src/backend/commands/tablecmds.c:14507-14517): no errposition,
+// message `column "x" cannot be cast automatically to type y`, hint
+// `You might need to specify "USING x::y".`. Shared by the static
+// assignment-coercibility gate (C10) and the per-row evalCast failure path.
+func noUsingCoercionError(colName, targetType string) *ExecError {
+	return &ExecError{
+		Code:    "42804",
+		Pos:     0,
+		Message: fmt.Sprintf("column %q cannot be cast automatically to type %s", colName, targetType),
+		Hint:    fmt.Sprintf("You might need to specify \"USING %s::%s\".", colName, targetType),
+	}
+}
+
 func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAction) error {
 	colIdx := -1
 	for i, col := range tbl.Columns {
@@ -22277,6 +22314,16 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 	// result must still be coerced to the target type).
 	if strings.EqualFold(oldCatalogType.Name, newCatalogType.Name) && act.UsingExpr == nil {
 		return nil
+	}
+
+	// Static assignment-coercibility gate (M0134-0002 C10): PG coerces the old
+	// datum with COERCION_ASSIGNMENT (tablecmds.c:14491-14496) before any
+	// storage work, so the 42804 fires even on an empty table (where the
+	// per-row evalCast hook never runs). The WITH-USING path is excluded — its
+	// coercion error is raised per-row with the "result of USING clause"
+	// message.
+	if act.UsingExpr == nil && !canAssignCast(oldCatalogType, newCatalogType) {
+		return noUsingCoercionError(act.ColumnName, newCatalogType.Name)
 	}
 
 	// If no storage pool is available, just update the catalog type.
@@ -22375,9 +22422,7 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 							Message: fmt.Sprintf("result of USING clause for column %q cannot be cast automatically to type %s", act.ColumnName, newCatalogType.Name),
 							Hint:    "You might need to add an explicit cast."}
 					} else {
-						convErr = &ExecError{Code: "42804", Pos: 0,
-							Message: fmt.Sprintf("column %q cannot be cast automatically to type %s", act.ColumnName, newCatalogType.Name),
-							Hint:    fmt.Sprintf("You might need to specify \"USING %s::%s\".", act.ColumnName, newCatalogType.Name)}
+						convErr = noUsingCoercionError(act.ColumnName, newCatalogType.Name)
 					}
 					break
 				}
