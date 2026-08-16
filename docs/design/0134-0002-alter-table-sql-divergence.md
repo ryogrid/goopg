@@ -73,7 +73,7 @@ reorder robustness; deferred, see the ledger.)
 | C8 | ~~system columns unmodeled (`ADD COLUMN xmin` accepted)~~ **LANDED** — a case-sensitive `isSystemColumn` helper (ctid/xmin/cmin/xmax/cmax/tableoid, no `oid`) rejects at all four entry points with 42701 + the PG-exact message | `execCreateTable`/`execCreateTableAs`/`execAlterTableAddColumn` + the RENAME arm (`operators_ddl.go`); `validatePartitionKey` reuses the helper (one name-list source). RENAME check corrected: 42P20→42701, `oid` dropped, case-sensitive | `tablecmds.c:7673` `check_for_column_name_collision` (ADD/RENAME) + `heap.c:481` `CheckAttributeNamesTypes` (CREATE/CTAS); `SysAtt[]` `heap.c:144-228` | correctness |
 | C9 | inheritance semantics (inherited CHECK/NOT-NULL not enforced on children, `attinhcount` diverges) | DDL | `tablecmds.c` | correctness |
 | C10 | ~~ALTER TYPE (**data loss**: failed int8→int4 leaves table EMPTY, `internal error: expected int, got kind 1`)~~ **LANDED (2026-08-16)** — static assignment-coercibility gate `canAssignCast` (int2/int4/int8→bool + text→int rejected) at the top of `execAlterColumnType`, no-USING path, before storage work; the crash itself was already closed by C2 slice 5 (`fec178bd`). | `ATExecAlterColumnType` path | `tablecmds.c` | correctness |
-| C11 | view-DML (`to_json` missing, `CREATE OR REPLACE VIEW` not propagating to dependents, ALTER-on-view accepted) | view_dml.go | `rewriteHandler.c` | correctness |
+| C11 | **SPLIT (2026-08-17)** into C11a/C11b/C11c — see the "C11 decomposition" section below; the original cell was wrong on two counts (`internal/executor/view_dml.go` does not exist, and the `CREATE OR REPLACE VIEW` symptom is a missing SQL deparser, not a propagation gap). **C11a LANDED**: ALTER TABLE structural actions on a view now raise 42809 + `DETAIL: This operation is not supported for views.` via `viewAllowedAlterAction`/`alterActionName` + an all-actions pre-scan in `execAlterTable` (`operators_ddl.go`). C11b (`to_json` family) and C11c (deparser) deferred with ledger rows. | `internal/executor/operators_ddl.go` `execAlterTable`; C11b `internal/executor/expr.go` fn switch; C11c `execCreateView` :5244 + `expr.go` :8242-8292 | `tablecmds.c:6739` `ATSimplePermissions` + `pg_class.c:24` `errdetail_relkind_not_supported`; C11b `json.c` `to_json`; C11c `view.c` `DefineVirtualRelation` + `ruleutils.c` `get_query_def` | correctness |
 | C12 | message text | error msgs | `errcode()` | formatter |
 | C13 | NOTICE/IF EXISTS | DDL | `tablecmds.c` | formatter |
 | C14 | EXPLAIN verbosity/underline | `operators_explain.go` | `explain.c` | formatter |
@@ -767,6 +767,84 @@ Diff 4113 → 4110 (−3), confined to the `anothertab` C10 region — sql:1356 
 byte-matches PG. Verified against real PG 18.3 (explicit `1::boolean` preserved,
 empty-table and non-empty int8→bool both 42804, int8→int4 narrowing preserves
 value). 6 subtests in `operators_ddl_alter_type_coercion_test.go`.
+
+## C11 decomposition + C11a view-relkind guard (2026-08-17)
+
+Research (`researcher`, 2026-08-17) established that the C11 row in the class
+table above **conflates three unrelated problems** under one `view_dml.go` cell.
+Two corrections to that row, first:
+
+- `internal/executor/view_dml.go` **does not exist**. Auto-updatable view DML
+  lives in `internal/optimizer/view_dml.go`; CREATE/ALTER VIEW DDL lives in
+  `internal/executor/operators_ddl.go`; the `pg_get_viewdef`/`\d+` display path
+  is `internal/executor/expr.go:8242-8292`. Three files, three mechanisms.
+- "`CREATE OR REPLACE VIEW` not propagating to dependents" is **not the bug**.
+  Dependent column counts already track correctly (the M0134 slice-1
+  `viewColumnMap` crash fix). What diverges is the "View definition:" SQL *text*:
+  `execCreateView` (`operators_ddl.go:5244`) stores `vt.ViewDef = s.RawDef`
+  verbatim and `pg_get_viewdef` echoes that string. PG freezes `SELECT *` into an
+  explicit target list at CREATE VIEW time (`view.c` `DefineVirtualRelation`) and
+  re-derives the text from the frozen tree (`ruleutils.c` `get_query_def`).
+  goopg has neither half — this is the "top-level-`*` freeze", and it is a
+  **missing SQL deparser**, not a propagation gap. `catalog.Table.Columns` IS
+  correctly frozen via `planSchema`, so `\d+`'s column table already matches PG;
+  only the definition text below it is wrong.
+
+C11 therefore splits into three independently-scoped items:
+
+| id | problem | diff lines | verdict |
+|----|---------|-----------|---------|
+| C11a | ALTER TABLE structural actions accepted on a view | 6 | **LANDED 2026-08-17** |
+| C11b | `to_json` (and the JSON-producing builtin family) missing | 1 + cascade | deferred — needs a composite/row→JSON encoder design |
+| C11c | no SQL deparser for `pg_get_viewdef`/`\d+` view text | 55 | deferred — cross-cutting, own milestone |
+
+### C11a — LANDED (2026-08-17)
+
+`alter_table.sql:1162-1166` (`alter table myview alter column test {drop,set}
+not null`) and `:1519-1520` (`alter table myview drop d`) silently SUCCEEDED:
+`execAlterTable` had **no relkind guard for views at all**. PG raises 42809
+`ALTER action %s cannot be performed on relation "%s"` with
+`DETAIL: This operation is not supported for views.` — message from
+`ATSimplePermissions` (`tablecmds.c:6739`), detail from
+`errdetail_relkind_not_supported` (`pg_class.c:24-37`), action text from
+`alter_table_type_to_string` (`tablecmds.c:6596`).
+
+Implementation: two new helpers beside `execAlterTable` —
+`viewAllowedAlterAction(kind)` (explicit **allow-list**, refuse by default) and
+`alterActionName(kind)` (PG's action strings, covering all 43
+`AlterTableActionKind` values the dispatch handles so the guard never reaches a
+generic fallback) — plus a pre-scan of **all** `s.Actions` placed before the
+per-action loop. The pre-scan mirrors `ATPrepCmd`, which runs
+`ATSimplePermissions` for every subcommand before Phase 2 executes any of them,
+so a multi-action `ALTER TABLE <view> a, b` fails atomically rather than
+half-applying.
+
+Allow-set, each case source-verified against the `AT_*` switch at
+`tablecmds.c:4943-5282` (NOT taken from a summary): RENAME table/column/
+constraint (`renameatt()`/`rename_constraint()` do their own relkind-agnostic
+checks and never route through `ATSimplePermissions`), ALTER COLUMN SET/DROP
+DEFAULT (`AT_ColumnDefault`, ATT_VIEW-allowed so INSERT-into-view can have
+default-ish behavior), reloptions SET/RESET (incl. `security_barrier` /
+`check_option`), and goopg's internal `AlterTableNoOp`. Two classifications that
+a category-level reading would have gotten wrong:
+
+- `SET STATISTICS` is ATT_MATVIEW|ATT_INDEX but **not** ATT_VIEW
+  (`tablecmds.c:5041-5044`) — refused.
+- ENABLE/DISABLE/ENABLE ALWAYS/ENABLE REPLICA **RULE** is
+  `ATT_TABLE | ATT_PARTITIONED_TABLE` only (`tablecmds.c:5245-5256`) — refused
+  on views despite rules being the view mechanism itself.
+
+`Pos` must be **0**, not the action's position: `ATSimplePermissions` /
+`errdetail_relkind_not_supported` never call `errposition()`, so PG's expected
+output carries no `LINE 1:` cursor. A first pass that used `act.Pos()` emitted a
+spurious cursor and only shrank the diff to 4058; with `Pos: 0` it reaches 4048.
+
+Materialized views are unaffected: `tbl.IsMatView` is a distinct relkind with a
+different allow-set (ATT_MATVIEW) and `execCreateMatView` never populates
+`tbl.View`, so the `tbl.View != nil` gate is matview-exclusive by construction.
+
+Diff **4073 → 4048 (−25)**. `create_view` (2505) and `updatable_views` (4156)
+verified byte-identical to a stash-based pre-change baseline — no over-refusal.
 
 ## PG oracle citations
 

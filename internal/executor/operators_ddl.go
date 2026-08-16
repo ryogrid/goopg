@@ -7388,6 +7388,122 @@ func (o *ddlOp) fkConstraintNameInUse(tbl *catalog.Table, name string) bool {
 	return false
 }
 
+// viewAllowedAlterAction reports whether the given ALTER TABLE subcommand is
+// permitted against a plain view (relkind='v'). Mirrors PostgreSQL's
+// ATT_VIEW allow-set: postgres/src/backend/commands/tablecmds.c:4943-5282
+// (the AT_* switch inside ATPrepCmd, each case's ATSimplePermissions call).
+// Implemented as an explicit allow-list — every AlterTableActionKind the
+// execAlterTable dispatch below handles has been classified against the PG
+// switch; anything not listed here is structural and refused. Views ARE
+// allowed: RENAME (relation/column/constraint — renameatt()/rename_constraint()
+// perform their own relkind-agnostic checks, never routed through
+// ATSimplePermissions), ALTER COLUMN SET/DROP DEFAULT (AT_ColumnDefault,
+// tablecmds.c:4961-4975 — "we allow defaults on views so INSERT into a view
+// can have default-ish behavior"), and table-level reloptions SET/RESET
+// (AT_SetRelOptions/AT_ResetRelOptions, tablecmds.c:5182-5191, includes
+// security_barrier/check_option). AlterTableNoOp is a goopg-internal no-op
+// (unrecognized ADD CONSTRAINT subtype) that performs no structural work
+// either way, so it is harmless to allow. M0134-0002 C11a.
+func viewAllowedAlterAction(kind parser.AlterTableActionKind) bool {
+	switch kind {
+	case parser.AlterTableNoOp,
+		parser.AlterTableRenameTable,
+		parser.AlterTableRenameColumn,
+		parser.AlterTableRenameConstraint,
+		parser.AlterTableSetDefault,
+		parser.AlterTableDropDefault,
+		parser.AlterTableSetReloptions,
+		parser.AlterTableResetReloptions:
+		return true
+	default:
+		return false
+	}
+}
+
+// alterActionName renders the PG `alter_table_type_to_string` text for an
+// ALTER TABLE subcommand, used in the "ALTER action %s cannot be performed
+// on relation %q" 42809 message. postgres/src/backend/commands/tablecmds.c:6596
+// alter_table_type_to_string. Only the strings reachable via
+// viewAllowedAlterAction's refuse branch need to be exact; every
+// AlterTableActionKind the execAlterTable dispatch handles is covered so the
+// guard never falls through to the generic fallback. M0134-0002 C11a.
+func alterActionName(kind parser.AlterTableActionKind) string {
+	switch kind {
+	case parser.AlterTableAddColumn:
+		return "ADD COLUMN"
+	case parser.AlterTableAddCheck, parser.AlterTableAddForeignKey,
+		parser.AlterTableAddExclude, parser.AlterTableAddUnique,
+		parser.AlterTableAddPrimaryKey:
+		return "ADD CONSTRAINT"
+	case parser.AlterTableAttachPartition:
+		return "ATTACH PARTITION"
+	case parser.AlterTableDetachPartition:
+		return "DETACH PARTITION"
+	case parser.AlterTableDropConstraint:
+		return "DROP CONSTRAINT"
+	case parser.AlterTableInherit:
+		return "INHERIT"
+	case parser.AlterTableNoInherit:
+		return "NO INHERIT"
+	case parser.AlterTableAlterColumnSet:
+		return "ALTER COLUMN ... SET"
+	case parser.AlterTableAlterColumnReset:
+		return "ALTER COLUMN ... RESET"
+	case parser.AlterTableAlterColumnType:
+		return "ALTER COLUMN ... SET DATA TYPE"
+	case parser.AlterTableDropColumn:
+		return "DROP COLUMN"
+	case parser.AlterTableSetStatistics:
+		return "ALTER COLUMN ... SET STATISTICS"
+	case parser.AlterTableSetStorage:
+		return "ALTER COLUMN ... SET STORAGE"
+	case parser.AlterTableSetCompression:
+		return "ALTER COLUMN ... SET COMPRESSION"
+	case parser.AlterTableSetNotNull, parser.AlterTableAddNotNull:
+		return "ALTER COLUMN ... SET NOT NULL"
+	case parser.AlterTableDropNotNull:
+		return "ALTER COLUMN ... DROP NOT NULL"
+	case parser.AlterIndexAttachPartition:
+		return "ATTACH PARTITION"
+	case parser.AlterIndexSetReloptions:
+		return "SET"
+	case parser.AlterTableValidateConstraint:
+		return "VALIDATE CONSTRAINT"
+	case parser.AlterTableReplicaIdentity:
+		return "REPLICA IDENTITY"
+	case parser.AlterTableClusterOn:
+		return "CLUSTER ON"
+	case parser.AlterTableSetWithoutCluster:
+		return "SET WITHOUT CLUSTER"
+	case parser.AlterTableEnableRowSecurity:
+		return "ENABLE ROW SECURITY"
+	case parser.AlterTableDisableRowSecurity:
+		return "DISABLE ROW SECURITY"
+	case parser.AlterTableForceRowSecurity:
+		return "FORCE ROW SECURITY"
+	case parser.AlterTableNoForceRowSecurity:
+		return "NO FORCE ROW SECURITY"
+	case parser.AlterTableEnableDisableRule:
+		return "ENABLE RULE"
+	case parser.AlterTableAlterColumnOptions:
+		return "ALTER COLUMN ... OPTIONS"
+	case parser.AlterTableSetForeignOptions:
+		return "OPTIONS"
+	case parser.AlterTableAlterConstraint:
+		return "ALTER CONSTRAINT"
+	case parser.AlterTableSetTablespace:
+		return "SET TABLESPACE"
+	case parser.AlterTableSetAccessMethod:
+		return "SET ACCESS METHOD"
+	case parser.AlterTableAddOf:
+		return "OF"
+	case parser.AlterTableDropOf:
+		return "NOT OF"
+	default:
+		return "ALTER COLUMN"
+	}
+}
+
 func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 	// Handle SET LOGGED / SET UNLOGGED.
 	if s.SetLogged != "" {
@@ -7694,6 +7810,28 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 	if tbl.DetachPendingEpoch != 0 && tbl.PartitionParentOID != 0 {
 		return &ExecError{Code: "55000", Pos: s.Pos(),
 			Message: fmt.Sprintf("cannot alter partition %q with an incomplete detach", tbl.Name)}
+	}
+	// View-relkind guard (ATT_VIEW). PG checks every subcommand's permission
+	// (ATSimplePermissions, called from ATPrepCmd) BEFORE Phase 2 executes any
+	// of them, so a multi-action ALTER TABLE fails atomically on the first
+	// disallowed subcommand without partially applying the earlier ones. A
+	// materialized view (tbl.IsMatView) is a distinct relkind (ATT_MATVIEW,
+	// a different allow-set) and tbl.View is never populated for one
+	// (execCreateMatView never sets it) — this guard only ever fires for a
+	// plain view. postgres/src/backend/commands/tablecmds.c:6739
+	// ATSimplePermissions + the ATT_VIEW bit in the AT_* switch,
+	// tablecmds.c:4943-5282. M0134-0002 C11a.
+	if tbl.View != nil {
+		for _, act := range s.Actions {
+			if !viewAllowedAlterAction(act.Kind) {
+				// ATSimplePermissions/errdetail_relkind_not_supported never call
+				// errposition, so PG's regress .out has no "LINE N:" cursor for
+				// this error — Pos must stay 0, not act.Pos().
+				return &ExecError{Code: "42809", Pos: 0,
+					Message: fmt.Sprintf("ALTER action %s cannot be performed on relation %q", alterActionName(act.Kind), tbl.Name),
+					Detail:  "This operation is not supported for views."}
+			}
+		}
 	}
 	for _, act := range s.Actions {
 		switch act.Kind {
