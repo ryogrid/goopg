@@ -1,60 +1,63 @@
-# Working set — M-NIGHTLY race/internal/initdb (LANDED)
+# Working set — M0134-0001 S8 Slice 2c-i (LANDED `949a71f1`)
 
-**Task:** M-NIGHTLY item `race/internal/initdb`
-(AI-20260815-011722-001 + AI-20260816-005117-001) — two consecutive nightly
-race-stage FAILs. Selected per the Current Priority banner (M-NIGHTLY
-regression fixes precede M0134).
+**Task:** M0134-0001 (aggregates.sql), slice **S8 Slice 2c-i — index-ordered
+grouping input**. Selected per the Current Priority banner (M-NIGHTLY had no open
+item; M0134 is next, and M0134-0001 is its topmost unchecked task).
 
-**Diagnosis (confirmed, not a code bug):** NOT a `DATA RACE` — a per-test-binary
-`-timeout` exhaustion. `go test -timeout` applies per binary, and
-`internal/initdb` is internally sequential (only `relcache_init_test.go` calls
-`t.Parallel()`), so the stage's `GOFLAGS=-p=4` buys it nothing. 122 call sites of
-the full on-disk `initdb.Init(...)` bootstrap (`internal/initdb/initdb.go:1331`)
-across 38 files at ~27-29s each under `-race` ⇒ ≈50-70 min vs the nightly's 45m
-(`FAIL ... internal/initdb 2700.053s`).
+**Landed:** `applyIndexOrderedGroupingRule`
+(`internal/optimizer/groupagg_indexorder.go`, dispatched `planner.go:1296` BEFORE
+the Slice 2a/2b rules). When every GROUP BY key is a plain column of the scanned
+table and some ordering of them is exactly a leading prefix of a usable btree
+index, the `*SeqScan` child becomes an ascending full-range
+`*IndexOnlyScan`/`*IndexScan` and `Strategy` becomes `AggStrategySorted` with
+**no `Sort`**. Port of the "path already sorted" half of
+`get_useful_group_keys_orderings` (`postgres/.../path/pathkeys.c:466-550`), search
+direction inverted (goopg has no path enumeration). Diff **1311/44/661 →
+1296/44/651**; `btg` query (i) closes outright.
 
-**Landed:** `make race-gate` now shards any package in `RACE_SHARD_PKGS`
-(default `internal/initdb`) into `RACE_SHARDS` (4) concurrent
-`go test -race -run <regex>` invocations over a disjoint round-robin partition of
-`go test -list`; every other package keeps the single bulk run. Policy is
-**re-partition, never de-scope** — no test skipped, no `RACE_EXCLUDE` entry, no
-`testing.Short()` gate, no raised global timeout. Two gate-failing self-checks:
-per-shard counts must sum to the `-list` count, and an empty/failed `-list` for a
-listed package is a hard error (closes the hole where a compile break would make
-every shard "0 tests, skipping", the sum-check compare 0==0, and the gate exit 0
-having run nothing). `RACE_SHARD_ONLY=1` times the shard set alone.
+**Key design point (do not regress it):** `GroupExprs` is NEVER permuted —
+`buildAggregateStage` binds every downstream target-list/HAVING/ORDER BY
+`ColumnRef` to a GroupExpr's written position and `finalizeGroup` emits
+`groupValues[i]` at output column `i`, so a permutation moves DATA between output
+columns. The reorder exists only to print PG's `Group Key:` line, via the new
+EXPLAIN-only `Aggregate.GroupKeyOrder` (nil = written order). Sibling half is the
+`Group Key:` renderer in `internal/executor/operators_explain.go`.
 
-**Files:** `Makefile` (race-gate + RACE_SHARD_* vars, comment block cites the
-AI-ids), `ci/batch/lib/summarize.py` (race `repro:` template 15m → the real 45m —
-the stale literal misled two triage rounds), `ci/design/02-test-selection.md`
-(new §"Per-package sharding" + runtime table), `.ralph/fix_plan.md` (item ticked).
+**Files:** `internal/optimizer/groupagg_indexorder.go` (new) + `_test.go` (new, 5
+plan-shape tests), `internal/executor/groupagg_indexorder_data_test.go` (new, 2
+row-VALUE tests — the correctness gate for the no-permutation premise),
+`internal/optimizer/plan.go` (`GroupKeyOrder`), `internal/optimizer/planner.go`
+(dispatch), `internal/executor/operators_explain.go`,
+`docs/design/0134-0001-p2-explain-format.md` (new §"S8 Slice 2c", accepted),
+`.ralph/fix_plan.md`, `.ralph/deferral_ledger.md`.
 
-**Key symbols:** `race-gate` target; `RACE_SHARD_PKGS` / `RACE_SHARDS` /
-`RACE_SHARD_ONLY`; the `awk 'NR % n == (s % n)'` partition; `LISTRC` guard.
+**Gates run:** `go build ./...` PASS; `internal/optimizer` + `internal/executor`
+PASS; `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS (cache
+warm); **`scripts/tpch-spotcheck.sh` PASS — Q12 rows=2, Q13 rows=35, both matching
+the canonical anchors**; pre-commit pgbench smoke PASS. `make ralph-state-guard`
+OK after an automatic repair (previous loop's clean-exit marker).
 
-**Gates run:** measured sharded run under the nightly cgroup envelope —
-152+151+151+151 = 605 tests, **≈19m56s**, slowest shard 1154s, all PASS (was a
-45m timeout); `go build ./...` PASS; `RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh` PASS; failure-propagation and empty-list-guard
-demos both exit non-zero; pre-commit pgbench smoke PASS. No tpch-spotcheck — the
-diff touches no engine code (Makefile + CI summarizer + docs only).
+**Deferral ledger:** 3 rows appended 2026-08-17 — (1) the rule is gated on
+`enable_hashagg=off` pending a real cost comparison (firing unconditionally
+regressed to 1386/47/687); (2) Slice 2c-ii partial-prefix needs an **Incremental
+Sort** node goopg lacks entirely (owns 5 of the 7 `btg` EXPLAINs) + Slice 2c-iii
+ORDER-BY-aware ordering; (3) re-attribution — `enable_hashjoin`/`enable_nestloop`
+non-honoring, join-aware functional-dependency GROUP BY reduction, and a duplicate
+residual `Filter` alongside an `Index Cond` are separate gaps, and
+`agg_sort_order` is only the EXPLAIN underline-width formatter, not a plan
+divergence.
 
-**Next step (NEXT LOOP — re-read the fix_plan banner first):** no M-NIGHTLY item
-is open, so the banner points at **M0134** (regress-sql digestion). For
-`alter_table.sql` no named correctness class remains; cheapest work in order:
-(a) ledgered **C9 residuals** — already-a-partition 42809 re-ATTACH guard
-(alter_table.sql:2697), ADD CONSTRAINT duplicate-name merge accounting,
-ONLY-guards for SET NOT NULL / ADD CONSTRAINT; (b) the formatter tail
-C7/C12/C13/C14 — measure which owns most of the 4048 diff lines before picking.
-C11b (`to_json` family) and C11c (ruleutils deparser) stay DEFERRED.
+**Next step (re-read the fix_plan banner first):** 6 new M-NIGHTLY items were
+FILED this loop from nightly `20260817-011734` and are UNCHECKED, so M-NIGHTLY now
+outranks M0134. Start with `race/internal/initdb` (AI-20260817-011734-001) — that
+run forked before the sharding fix `83dd7ae8`, so it is expected stale; verify with
+`make race-gate RACE_TIMEOUT=45m RACE_SHARD_ONLY=1` and close. Then the two
+`TestE2E_PG{Cold,Crash}StartOnGoopgDataDir` items, which likely share a root cause
+and were previously masked by a mid-stage build break.
 
-**Deferral ledger:** no new row — CI infrastructure, no PG semantics left
-unimplemented.
+**Delegation:** researcher `tmp/ralph-handoffs/m0134-0001-s8-slice2c/` (DONE, 2
+rounds — the scope/attribution work); implementer
+`tmp/ralph-handoffs/m0134-0001-s8-slice2c-i/` (DONE, 1 round); tester, same dir,
+`gate-brief.md` (DONE, 1 round).
 
-**Delegation:** researcher `tmp/ralph-handoffs/nightly-initdb-race-budget/`
-(DONE, 1 round); implementer `tmp/ralph-handoffs/nightly-initdb-race-shard/`
-(DONE, 2 rounds — round 2 closed the silent-pass hole found in coordinator review).
-
-**In-flight:** none. (Note: an unrelated nightly batch run was live in this tree
-during the loop, forked before these edits — left untouched; it will exercise the
-pre-change recipe, so the FIRST nightly to validate the sharding is the next one.)
+**In-flight:** none.
