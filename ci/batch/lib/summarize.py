@@ -308,7 +308,11 @@ def analyze(run_dir, repo_root, run_id):
     # ---- units / race (package-level)
     for stage, repro_tpl in (
         ("units", "go test -timeout 10m ./{pkg}/"),
-        ("race", "go test -race -timeout 15m ./{pkg}/"),
+        # 45m matches the nightly's real RACE_TIMEOUT (ci/batch/stages/stage-race.sh
+        # NIGHTLY_RACE_TIMEOUT default); a stale 15m literal here misled two
+        # triage rounds into thinking the gate had a tighter budget than it does
+        # (AI-20260815-011722-001 / AI-20260816-005117-001).
+        ("race", "go test -race -timeout 45m ./{pkg}/"),
     ):
         st = stages.get(stage, {}).get("status", "")
         if not st.startswith("fail"):

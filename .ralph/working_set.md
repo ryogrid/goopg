@@ -1,60 +1,60 @@
-# Working set — M0134-0002 alter_table.sql (C11a LANDED, committed 603a5e47)
+# Working set — M-NIGHTLY race/internal/initdb (LANDED)
 
-**Task:** M0134-0002 alter_table.sql regress-sql digestion. This loop researched
-C11 (the last named class), found it was three unrelated problems under one
-design-doc cell, and landed the cheap isolated one. Diff **4073 → 4048 (−25)**.
+**Task:** M-NIGHTLY item `race/internal/initdb`
+(AI-20260815-011722-001 + AI-20260816-005117-001) — two consecutive nightly
+race-stage FAILs. Selected per the Current Priority banner (M-NIGHTLY
+regression fixes precede M0134).
 
-**Landed (603a5e47):** ALTER TABLE structural actions on a **view** now raise
-42809 `ALTER action %s cannot be performed on relation %q` + DETAIL
-`This operation is not supported for views.` (`ATSimplePermissions`
-tablecmds.c:6739 + `errdetail_relkind_not_supported` pg_class.c:24-37). New
-`viewAllowedAlterAction` (explicit allow-list) + `alterActionName` (all 43
-action kinds) + an **all-actions pre-scan** before the dispatch loop (mirrors
-`ATPrepCmd` → atomic failure on multi-action ALTER). `Pos: 0` is load-bearing —
-`ATSimplePermissions` never calls `errposition()`, so PG's .out has no `LINE 1:`
-cursor (act.Pos() cost 10 diff lines).
+**Diagnosis (confirmed, not a code bug):** NOT a `DATA RACE` — a per-test-binary
+`-timeout` exhaustion. `go test -timeout` applies per binary, and
+`internal/initdb` is internally sequential (only `relcache_init_test.go` calls
+`t.Parallel()`), so the stage's `GOFLAGS=-p=4` buys it nothing. 122 call sites of
+the full on-disk `initdb.Init(...)` bootstrap (`internal/initdb/initdb.go:1331`)
+across 38 files at ~27-29s each under `-race` ⇒ ≈50-70 min vs the nightly's 45m
+(`FAIL ... internal/initdb 2700.053s`).
 
-**Files:** internal/executor/operators_ddl.go,
-internal/executor/operators_ddl_c11a_view_guard_test.go (new),
-docs/design/0134-0002-alter-table-sql-divergence.md (C11 row rewritten + new
-"C11 decomposition + C11a" §), docs/design/README.md, .ralph/fix_plan.md,
-.ralph/deferral_ledger.md (2 new rows: C11b, C11c).
+**Landed:** `make race-gate` now shards any package in `RACE_SHARD_PKGS`
+(default `internal/initdb`) into `RACE_SHARDS` (4) concurrent
+`go test -race -run <regex>` invocations over a disjoint round-robin partition of
+`go test -list`; every other package keeps the single bulk run. Policy is
+**re-partition, never de-scope** — no test skipped, no `RACE_EXCLUDE` entry, no
+`testing.Short()` gate, no raised global timeout. Two gate-failing self-checks:
+per-shard counts must sum to the `-list` count, and an empty/failed `-list` for a
+listed package is a hard error (closes the hole where a compile break would make
+every shard "0 tests, skipping", the sum-check compare 0==0, and the gate exit 0
+having run nothing). `RACE_SHARD_ONLY=1` times the shard set alone.
 
-**Key symbols:** `viewAllowedAlterAction`, `alterActionName`, `execAlterTable`
-(guard sits after the pending-detach check, before the action loop),
-`tbl.View != nil` (matview-exclusive — `execCreateMatView` never sets it).
+**Files:** `Makefile` (race-gate + RACE_SHARD_* vars, comment block cites the
+AI-ids), `ci/batch/lib/summarize.py` (race `repro:` template 15m → the real 45m —
+the stale literal misled two triage rounds), `ci/design/02-test-selection.md`
+(new §"Per-package sharding" + runtime table), `.ralph/fix_plan.md` (item ticked).
 
-**Findings (corrects the old design doc):** `internal/executor/view_dml.go`
-DOES NOT EXIST (view DML is `internal/optimizer/view_dml.go`). "CREATE OR
-REPLACE VIEW not propagating to dependents" is NOT the bug — dependent column
-counts already track (slice-1 `viewColumnMap` fix); what diverges is the **View
-definition: SQL text**, because goopg has **no deparser** (`execCreateView`
-stores `RawDef` verbatim; `expr.go:8242-8292` echoes it). That is the
-"top-level-`*` freeze" = C11c.
+**Key symbols:** `race-gate` target; `RACE_SHARD_PKGS` / `RACE_SHARDS` /
+`RACE_SHARD_ONLY`; the `awk 'NR % n == (s % n)'` partition; `LISTRC` guard.
 
-**Next step (NEXT LOOP — re-read the fix_plan banner first):** no named
-correctness class remains for alter_table.sql. Cheapest remaining work, in
-order: (a) the ledgered **C9 residuals** — already-a-partition 42809 re-ATTACH
-guard (alter_table.sql:2697), ADD CONSTRAINT duplicate-name merge accounting,
+**Gates run:** measured sharded run under the nightly cgroup envelope —
+152+151+151+151 = 605 tests, **≈19m56s**, slowest shard 1154s, all PASS (was a
+45m timeout); `go build ./...` PASS; `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh` PASS; failure-propagation and empty-list-guard
+demos both exit non-zero; pre-commit pgbench smoke PASS. No tpch-spotcheck — the
+diff touches no engine code (Makefile + CI summarizer + docs only).
+
+**Next step (NEXT LOOP — re-read the fix_plan banner first):** no M-NIGHTLY item
+is open, so the banner points at **M0134** (regress-sql digestion). For
+`alter_table.sql` no named correctness class remains; cheapest work in order:
+(a) ledgered **C9 residuals** — already-a-partition 42809 re-ATTACH guard
+(alter_table.sql:2697), ADD CONSTRAINT duplicate-name merge accounting,
 ONLY-guards for SET NOT NULL / ADD CONSTRAINT; (b) the formatter tail
-C7/C12/C13/C14 (message text, NOTICE/IF EXISTS, EXPLAIN verbosity) — measure
-which owns the most of the 4048 lines before picking. **C11b** (`to_json`
-family) and **C11c** (ruleutils deparser) are DEFERRED — C11c deserves its own
-milestone and would also close the ledgered CHECK-constraint rendering gap.
+C7/C12/C13/C14 — measure which owns most of the 4048 diff lines before picking.
+C11b (`to_json` family) and C11c (ruleutils deparser) stay DEFERRED.
 
-**Gates run (this loop):** `go build ./...` PASS; `go test ./internal/executor/`
-PASS; `go test -run TestAlterTableOnViewRelkindGuard -v` PASS (8 subtests,
-coordinator re-verified pre-commit); `go test ./internal/optimizer/` PASS;
-`scripts/pg-regress-runner.sh alter_table` 4048 (from 4073); create_view (2505)
-and updatable_views (4156) byte-identical to a stash-verified baseline;
-pre-commit pgbench smoke PASS. tpch-spotcheck NOT run — DDL-guard-only diff, no
-query/planner/codec path.
+**Deferral ledger:** no new row — CI infrastructure, no PG semantics left
+unimplemented.
 
-**Nightly triage:** ci/logs/action-items.md run 20260816-005117 — all 3 `## AI-`
-items already filed under M-NIGHTLY (001 open, 002/003 ticked). Nothing new.
+**Delegation:** researcher `tmp/ralph-handoffs/nightly-initdb-race-budget/`
+(DONE, 1 round); implementer `tmp/ralph-handoffs/nightly-initdb-race-shard/`
+(DONE, 2 rounds — round 2 closed the silent-pass hole found in coordinator review).
 
-**Delegation:** researcher brief tmp/ralph-handoffs/0134-0002-c11-research/
-(DONE, NEEDS-DECISION → coordinator split C11); implementer brief
-tmp/ralph-handoffs/0134-0002-c11a-view-guard/ (DONE, 1 round).
-
-**In-flight:** none.
+**In-flight:** none. (Note: an unrelated nightly batch run was live in this tree
+during the loop, forked before these edits — left untouched; it will exercise the
+pre-change recipe, so the FIRST nightly to validate the sharding is the next one.)

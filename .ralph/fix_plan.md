@@ -1027,13 +1027,28 @@ later testport results to that mid-run build break. AI-002/003/004 are
 genuinely-attributed FAILs (distinct from the unattributable set), so they are
 filed as real until a HEAD re-run (rule §2) says otherwise.
 
-- [ ] **race/internal/initdb (AI-20260815-011722-001, AI-20260816-005117-001)** — race suite FAIL (triage
-      2026-08-15 @HEAD `ecd80d4c`): NOT a `DATA RACE` — package-wide race-run
-      **time-budget exhaustion**; initdb under `-race` exceeds even the nightly's
-      45m budget (`RACE_TIMEOUT=45m` → 2700s timeout). In-flight goroutine was
-      `[runnable]` (progressing inside `pglz.Compress`), steady ~25-30s/test
-      cadence (many server-booting tests). Gate-sizing/infra, not a code bug.
-      Repro: `go test -race -timeout 15m ./internal/initdb/`.
+- [x] **race/internal/initdb (AI-20260815-011722-001, AI-20260816-005117-001)** —
+      **FIXED 2026-08-17 by sharding the package inside the race gate.** Triage
+      (2026-08-15 @HEAD `ecd80d4c`, confirmed 2026-08-17): NOT a `DATA RACE` —
+      package-wide race-run **time-budget exhaustion**; `-timeout` is per test
+      binary and `internal/initdb` is internally sequential (122 call sites of
+      the full `initdb.Init(...)` bootstrap, `internal/initdb/initdb.go:1331`,
+      across 38 files at ~27-29s each under `-race`; only
+      `relcache_init_test.go` calls `t.Parallel()`) ⇒ ≈50-70 min sequential vs
+      the nightly's 45m (`RACE_TIMEOUT=45m` → `FAIL ... 2700.053s`).
+      Fix: `make race-gate` now fans every package in `RACE_SHARD_PKGS`
+      (default `internal/initdb`) out into `RACE_SHARDS` (4) concurrent
+      `go test -race -run <regex>` invocations over a disjoint round-robin
+      partition of `go test -list`, with two gate-failing self-checks
+      (per-shard counts must sum to the `-list` count; an empty test list for a
+      listed package is a hard error, so a build break cannot masquerade as a
+      pass). No test skipped, no package excluded — policy is re-partition,
+      never de-scope (`ci/design/02-test-selection.md` §"Per-package
+      sharding"). Measured: 152+151+151+151 = 605 tests, ≈19m56s wall-clock,
+      slowest shard 1154s — faster than the 45m timeout it replaced.
+      `ci/batch/lib/summarize.py`'s race `repro:` template also corrected from a
+      stale `-timeout 15m` to the real 45m (it had misled two triage rounds).
+      Repro: `make race-gate RACE_TIMEOUT=45m RACE_SHARD_ONLY=1`.
 - [x] **testport/TestPort_IsolationEvalPlanQual — REOPENED (4th time)
       (AI-20260815-011722-002)** — **stale — already fixed at HEAD** (triage
       2026-08-15: PASS 27.7s @ `ecd80d4c`).
