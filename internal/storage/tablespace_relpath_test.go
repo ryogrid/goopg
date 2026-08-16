@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/goopg/goopg/internal/config"
+	"github.com/goopg/goopg/internal/utils/misc"
 )
 
 // TestRelPathTablespace verifies that a non-zero TblOid routes a
@@ -23,7 +23,7 @@ func TestRelPathTablespace(t *testing.T) {
 	}
 
 	ts := RelFileNode{TblOid: 40000, DBOid: 5, RelOid: 16407, Fork: MainFork}
-	want := "pg_tblspc/40000/" + config.TablespaceVersionDirectory + "/5/16407"
+	want := "pg_tblspc/40000/" + misc.TablespaceVersionDirectory + "/5/16407"
 	if got := mgr.RelPath(ts); got != want {
 		t.Fatalf("RelPath(tablespace 40000) = %q, want %q", got, want)
 	}
@@ -46,7 +46,7 @@ func TestManagerOpensTablespaceUnderPgTblspcDir(t *testing.T) {
 		t.Fatalf("Extend: %v", err)
 	}
 
-	tsPath := filepath.Join(dataDir, "pg_tblspc", "40000", config.TablespaceVersionDirectory, "5", "16407")
+	tsPath := filepath.Join(dataDir, "pg_tblspc", "40000", misc.TablespaceVersionDirectory, "5", "16407")
 	if _, err := os.Stat(tsPath); err != nil {
 		t.Fatalf("expected %s to exist: %v", tsPath, err)
 	}

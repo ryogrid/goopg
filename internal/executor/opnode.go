@@ -33,7 +33,7 @@
 package executor
 
 import (
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // ---------------------------------------------------------------------------
@@ -60,7 +60,7 @@ import (
 // Operators like projectOp must evaluate targets even when Cells is empty
 // (the target expressions may be constants that don't reference input).
 type Slot struct {
-	schema planner.Schema
+	schema optimizer.Schema
 	Cells  []Datum
 	HasRow bool // false == DML nil-row; true == real row (may have 0 cols)
 	// M0097-0062: ctid system column forwarded from MaterializedSlot.
@@ -102,7 +102,7 @@ func (s *Slot) Get(col int) Datum { return s.Cells[col] }
 func (s *Slot) IsNull(col int) bool { return s.Cells[col].Kind == KindNull }
 
 // Schema implements TupleSlot.
-func (s *Slot) Schema() planner.Schema { return s.schema }
+func (s *Slot) Schema() optimizer.Schema { return s.schema }
 
 // Width implements TupleSlot.
 func (s *Slot) Width() int { return len(s.Cells) }
@@ -243,7 +243,7 @@ type opTreeSlab struct {
 	ops     []OpNode
 	exprs   exprTreeSlab     // expression-tree slab (Phase C.3); immutable after BuildFast
 	plans   planTreeSlab     // plan-tree slab (Phase C.3); immutable after BuildFast
-	schemas []planner.Schema // output-schema pool for OpProject nodes; indexed by schemaIdx
+	schemas []optimizer.Schema // output-schema pool for OpProject nodes; indexed by schemaIdx
 }
 
 // add appends n to the slab and returns its index.
@@ -332,7 +332,7 @@ type deleteOpState struct {
 // so the child subtree uses concrete dispatch while sortOp is unchanged.
 type sortOpState struct {
 	op     *sortOp
-	schema planner.Schema // pre-computed from *planner.Sort.Output()
+	schema optimizer.Schema // pre-computed from *planner.Sort.Output()
 }
 
 type insertOpState struct {
@@ -341,7 +341,7 @@ type insertOpState struct {
 
 type joinOpState struct {
 	op     *joinOp
-	schema planner.Schema // pre-computed from *planner.Join.Output()
+	schema optimizer.Schema // pre-computed from *planner.Join.Output()
 }
 
 // ---------------------------------------------------------------------------
@@ -356,7 +356,7 @@ type joinOpState struct {
 type opNodeOperator struct {
 	tree   *opTreeSlab // shared slab; valid after BuildFast returns
 	idx    int32
-	schema planner.Schema
+	schema optimizer.Schema
 	dst    Slot
 }
 
@@ -376,7 +376,7 @@ func (w *opNodeOperator) Next() (TupleSlot, error) {
 }
 
 func (w *opNodeOperator) Close() error           { return opClose(w.tree, w.idx) }
-func (w *opNodeOperator) Schema() planner.Schema { return w.schema }
+func (w *opNodeOperator) Schema() optimizer.Schema { return w.schema }
 
 // BindLateralOuter forwards the lateral outer-row binding to the wrapped
 // underlying operator when this opNodeOperator fronts a FROM-clause SRF
@@ -413,13 +413,13 @@ func (w *opNodeOperator) BindLateralOuter(slot SlotView) {
 type OpIterator struct {
 	tree    *opTreeSlab
 	rootIdx int32
-	plan    planner.Node
+	plan    optimizer.Node
 	dst     Slot
 }
 
 // BuildFastIterator builds an OpNode tree via BuildFast and wraps it in an
 // OpIterator. It is the drop-in replacement for executor.Build in dispatch.
-func BuildFastIterator(plan planner.Node) (*OpIterator, error) {
+func BuildFastIterator(plan optimizer.Node) (*OpIterator, error) {
 	tree, rootIdx, err := BuildFast(plan)
 	if err != nil {
 		return nil, err
@@ -452,7 +452,7 @@ func (it *OpIterator) Close() error { return opClose(it.tree, it.rootIdx) }
 // operators still in the adapter, delegates to the adapter's Schema() after
 // Open (e.g. CALL with dynamic OUT-param schema). For migrated DML (OpUpdate,
 // OpDelete), returns plan.Output() which carries the RETURNING schema or nil.
-func (it *OpIterator) Schema() planner.Schema {
+func (it *OpIterator) Schema() optimizer.Schema {
 	if s := it.plan.Output(); s != nil {
 		return s
 	}

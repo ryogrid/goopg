@@ -5,9 +5,9 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -29,7 +29,7 @@ func runDDL(t *testing.T, ctx *Context, sql string) error {
 	if err != nil {
 		t.Fatalf("Parse(%q): %v", sql, err)
 	}
-	plan, err := planner.Plan(stmts[0], ctx.Catalog)
+	plan, err := optimizer.Plan(stmts[0], ctx.Catalog)
 	if err != nil {
 		t.Fatalf("Plan(%q): %v", sql, err)
 	}
@@ -351,7 +351,7 @@ func TestDDLTruncateClearsRelation(t *testing.T) {
 		t.Errorf("NBlocks after TRUNCATE = %d want 0", n2)
 	}
 
-	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: tbl})
 	if err := scan.Open(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -439,7 +439,7 @@ func TestDDLAlterTableAddColumnKeepsExistingRows(t *testing.T) {
 		t.Fatalf("columns after ADD COLUMN: %+v", tbl.Columns)
 	}
 
-	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: tbl})
 	if err := scan.Open(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -488,7 +488,7 @@ func TestDDLAlterTableAddColumnDefaultBackfillsExistingRows(t *testing.T) {
 		t.Fatalf("MissingValue = %+v, want KindInt 99", tbl.Columns[1].MissingValue)
 	}
 
-	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: tbl})
 	if err := scan.Open(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -612,8 +612,8 @@ func newDDLFixture(t *testing.T) (*Context, catalog.Catalog, func()) {
 		}
 		return int64(n), true
 	})
-	mgrMVCC := mvcc.NewManager()
-	tx, err := mgrMVCC.Begin(mvcc.IsolationReadCommitted)
+	mgrMVCC := transam.NewManager()
+	tx, err := mgrMVCC.Begin(transam.IsolationReadCommitted)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1154,7 +1154,7 @@ func TestDDLAlterTableDropColumn(t *testing.T) {
 
 	// M0129-S8.3: advance the command counter so the scan sees the heap row.
 	advanceStmtCounter(ctx)
-	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: tbl})
 	if err := scan.Open(ctx); err != nil {
 		t.Fatal(err)
 	}

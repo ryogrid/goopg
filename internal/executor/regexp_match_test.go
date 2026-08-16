@@ -3,7 +3,7 @@ package executor
 import (
 	"testing"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // TestEvalRegexpMatch pins PostgreSQL's regexp_match/regexp_matches element
@@ -17,70 +17,70 @@ func TestEvalRegexpMatch(t *testing.T) {
 	cases := []struct {
 		name string
 		fn   string
-		args []planner.Expr
+		args []optimizer.Expr
 		want Datum
 	}{
 		{
 			name: "no capture group returns whole match",
 			fn:   "regexp_match",
-			args: []planner.Expr{
-				&planner.StringConst{Value: "foobar123"},
-				&planner.StringConst{Value: "[0-9]+"},
+			args: []optimizer.Expr{
+				&optimizer.StringConst{Value: "foobar123"},
+				&optimizer.StringConst{Value: "[0-9]+"},
 			},
 			want: NewStringDatum("{123}"),
 		},
 		{
 			name: "single capture group returns the group, not the full match",
 			fn:   "regexp_matches",
-			args: []planner.Expr{
-				&planner.StringConst{Value: "foo123bar"},
-				&planner.StringConst{Value: "foo([0-9]+)bar"},
+			args: []optimizer.Expr{
+				&optimizer.StringConst{Value: "foo123bar"},
+				&optimizer.StringConst{Value: "foo([0-9]+)bar"},
 			},
 			want: NewStringDatum("{123}"),
 		},
 		{
 			name: "multiple capture groups",
 			fn:   "regexp_matches",
-			args: []planner.Expr{
-				&planner.StringConst{Value: "2026-07-04"},
-				&planner.StringConst{Value: "([0-9]+)-([0-9]+)-([0-9]+)"},
+			args: []optimizer.Expr{
+				&optimizer.StringConst{Value: "2026-07-04"},
+				&optimizer.StringConst{Value: "([0-9]+)-([0-9]+)-([0-9]+)"},
 			},
 			want: NewStringDatum("{2026,07,04}"),
 		},
 		{
 			name: "non-participating group is NULL",
 			fn:   "regexp_matches",
-			args: []planner.Expr{
-				&planner.StringConst{Value: "b"},
-				&planner.StringConst{Value: "(a)|(b)"},
+			args: []optimizer.Expr{
+				&optimizer.StringConst{Value: "b"},
+				&optimizer.StringConst{Value: "(a)|(b)"},
 			},
 			want: NewStringDatum("{NULL,b}"),
 		},
 		{
 			name: "no match returns NULL",
 			fn:   "regexp_matches",
-			args: []planner.Expr{
-				&planner.StringConst{Value: "abc"},
-				&planner.StringConst{Value: "[0-9]+"},
+			args: []optimizer.Expr{
+				&optimizer.StringConst{Value: "abc"},
+				&optimizer.StringConst{Value: "[0-9]+"},
 			},
 			want: NullDatum,
 		},
 		{
 			name: "case-insensitive flag",
 			fn:   "regexp_matches",
-			args: []planner.Expr{
-				&planner.StringConst{Value: "HELLO"},
-				&planner.StringConst{Value: "hello"},
-				&planner.StringConst{Value: "i"},
+			args: []optimizer.Expr{
+				&optimizer.StringConst{Value: "HELLO"},
+				&optimizer.StringConst{Value: "hello"},
+				&optimizer.StringConst{Value: "i"},
 			},
 			want: NewStringDatum("{HELLO}"),
 		},
 		{
 			name: "NULL input propagates",
 			fn:   "regexp_matches",
-			args: []planner.Expr{
-				&planner.NullConst{},
-				&planner.StringConst{Value: "x"},
+			args: []optimizer.Expr{
+				&optimizer.NullConst{},
+				&optimizer.StringConst{Value: "x"},
 			},
 			want: NullDatum,
 		},
@@ -90,9 +90,9 @@ func TestEvalRegexpMatch(t *testing.T) {
 			// quoting collapses the two. postgres/src/backend/utils/adt/regexp.c.
 			name: "empty pattern match yields a one-element array with an empty string",
 			fn:   "regexp_match",
-			args: []planner.Expr{
-				&planner.StringConst{Value: "abc"},
-				&planner.StringConst{Value: ""},
+			args: []optimizer.Expr{
+				&optimizer.StringConst{Value: "abc"},
+				&optimizer.StringConst{Value: ""},
 			},
 			want: NewStringDatum(`{""}`),
 		},
@@ -101,16 +101,16 @@ func TestEvalRegexpMatch(t *testing.T) {
 			// it isn't misread as two elements (arrayfuncs.c array_out needquote).
 			name: "matched text containing a comma is quoted",
 			fn:   "regexp_match",
-			args: []planner.Expr{
-				&planner.StringConst{Value: "a,b"},
-				&planner.StringConst{Value: ".*"},
+			args: []optimizer.Expr{
+				&optimizer.StringConst{Value: "a,b"},
+				&optimizer.StringConst{Value: ".*"},
 			},
 			want: NewStringDatum(`{"a,b"}`),
 		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			fc := &planner.FuncCall{Name: c.fn, Args: c.args}
+			fc := &optimizer.FuncCall{Name: c.fn, Args: c.args}
 			got, err := evalFuncCall(fc, nil, &Context{})
 			if err != nil {
 				t.Fatalf("evalFuncCall: %v", err)

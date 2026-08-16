@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // setupRangeScanFixture creates a table with a timestamp column, inserts
@@ -75,11 +75,11 @@ func TestRangeIndexScanLowerBoundOnly(t *testing.T) {
 
 	// Verify planner chose IndexScan directly (no Filter: the single >=
 	// conjunct is fully implemented by the scan).
-	proj, ok := plan.(*planner.Project)
+	proj, ok := plan.(*optimizer.Project)
 	if !ok {
 		t.Fatalf("root=%T want *planner.Project", plan)
 	}
-	idx, ok := proj.Child.(*planner.IndexScan)
+	idx, ok := proj.Child.(*optimizer.IndexScan)
 	if !ok {
 		t.Fatalf("child=%T want *planner.IndexScan (Filter dropped for single range conjunct)", proj.Child)
 	}
@@ -129,15 +129,15 @@ func TestRangeIndexScanTwoSided(t *testing.T) {
 	plan := planOne(t, sql, ctx.Catalog)
 
 	// Verify planner chose Filter(IndexScan).
-	proj, ok := plan.(*planner.Project)
+	proj, ok := plan.(*optimizer.Project)
 	if !ok {
 		t.Fatalf("root=%T want *planner.Project", plan)
 	}
-	f, ok := proj.Child.(*planner.Filter)
+	f, ok := proj.Child.(*optimizer.Filter)
 	if !ok {
 		t.Fatalf("child=%T want *planner.Filter(IndexScan)", proj.Child)
 	}
-	idx, ok := f.Child.(*planner.IndexScan)
+	idx, ok := f.Child.(*optimizer.IndexScan)
 	if !ok {
 		t.Fatalf("Filter.Child=%T want *planner.IndexScan", f.Child)
 	}
@@ -199,11 +199,11 @@ func TestRangeIndexScanCountMatchesSeqScan(t *testing.T) {
 	plan := planOne(t, sqlIdx, ctx.Catalog)
 
 	// Verify planner chose index scan path (not seq scan)
-	proj, ok := plan.(*planner.Project)
+	proj, ok := plan.(*optimizer.Project)
 	if !ok {
 		t.Fatalf("root=%T want *planner.Project", plan)
 	}
-	if _, ok := proj.Child.(*planner.Filter); !ok {
+	if _, ok := proj.Child.(*optimizer.Filter); !ok {
 		t.Fatalf("child=%T want *planner.Filter", proj.Child)
 	}
 

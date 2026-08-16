@@ -6,7 +6,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -48,7 +48,7 @@ func TestEvalTypedStringLitTimestampForms(t *testing.T) {
 			if typ == "timestamp" && !tc.wantNoTZ.IsZero() {
 				tc.want = tc.wantNoTZ
 			}
-			x := &planner.TypedStringLit{Type: typ, Value: tc.in}
+			x := &optimizer.TypedStringLit{Type: typ, Value: tc.in}
 			d, err := evalTypedStringLit(x, nil)
 			if err != nil {
 				t.Errorf("%s '%s': unexpected error: %v", typ, tc.in, err)
@@ -68,7 +68,7 @@ func TestEvalTypedStringLitTimestampForms(t *testing.T) {
 			"2010-13-01 10:00", // month out of range
 		}
 		for _, in := range invalid {
-			x := &planner.TypedStringLit{Type: typ, Value: in}
+			x := &optimizer.TypedStringLit{Type: typ, Value: in}
 			if _, err := evalTypedStringLit(x, nil); err == nil {
 				t.Errorf("%s '%s': expected error, got none", typ, in)
 			}

@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -15,7 +15,7 @@ import (
 // Open/Next/Close accountBuffers diffing path.
 type fakeIOTimingOp struct{}
 
-func (fakeIOTimingOp) Schema() planner.Schema  { return nil }
+func (fakeIOTimingOp) Schema() optimizer.Schema  { return nil }
 func (fakeIOTimingOp) Open(*Context) error     { return nil }
 func (fakeIOTimingOp) Next() (TupleSlot, error) { return nil, EOF }
 func (fakeIOTimingOp) Close() error            { return nil }
@@ -385,7 +385,7 @@ func TestInstrumentedOpAccountsIOTime(t *testing.T) {
 	defer func() { _ = pool.Close(); _ = mgr.Close() }()
 
 	stats := &nodeStats{}
-	op := &instrumentedOp{inner: fakeIOTimingOp{}, plan: &planner.Values{}, stats: stats}
+	op := &instrumentedOp{inner: fakeIOTimingOp{}, plan: &optimizer.Values{}, stats: stats}
 
 	if err := op.Open(&Context{Pool: pool}); err != nil {
 		t.Fatal(err)
@@ -438,7 +438,7 @@ func TestExplainIOTimingsJSONOmittedWithoutAccumulatedTime(t *testing.T) {
 // properties directly against a synthetic stats table, avoiding the same
 // pre-seeding-lands-in-the-baseline problem a full SQL round trip would hit.
 func TestPlanToJSONWithStatsRendersIOTimingsWhenNonzero(t *testing.T) {
-	n := &planner.Values{}
+	n := &optimizer.Values{}
 	stats := nodeStatsTable{n: {bufReadTimeNs: 2_000_000, bufWriteTimeNs: 500_000}}
 	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, true)
 	if got, ok := obj["Shared I/O Read Time"].(float64); !ok || got != 2.0 {
@@ -457,7 +457,7 @@ func TestPlanToJSONWithStatsRendersIOTimingsWhenNonzero(t *testing.T) {
 // nonzero-only gate the TEXT "I/O Timings:" line (formatIOTimingsLine)
 // still uses.
 func TestPlanToJSONWithStatsRendersIOTimingsWhenTrackIOTimingOnEvenAtZero(t *testing.T) {
-	n := &planner.Values{}
+	n := &optimizer.Values{}
 	stats := nodeStatsTable{n: {}}
 	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, true)
 	if got, ok := obj["Shared I/O Read Time"].(float64); !ok || got != 0 {
@@ -475,7 +475,7 @@ func TestPlanToJSONWithStatsRendersIOTimingsWhenTrackIOTimingOnEvenAtZero(t *tes
 // off, so a nonzero reading with the GUC off shouldn't happen in practice,
 // but the gate must key off the GUC, not the value, to match explain.c).
 func TestPlanToJSONWithStatsOmitsIOTimingsWhenTrackIOTimingOff(t *testing.T) {
-	n := &planner.Values{}
+	n := &optimizer.Values{}
 	stats := nodeStatsTable{n: {bufReadTimeNs: 2_000_000, bufWriteTimeNs: 500_000}}
 	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, false)
 	if _, ok := obj["Shared I/O Read Time"]; ok {
@@ -495,7 +495,7 @@ func TestPlanToJSONWithStatsOmitsIOTimingsWhenTrackIOTimingOff(t *testing.T) {
 // temp-buffer concept, so Local/Temp stay constant zero, same rationale as
 // their Blocks counterparts (TestExplainBuffersJSONAlwaysIncludesLocalTempBlocks).
 func TestPlanToJSONWithStatsIncludesLocalTempIOTimingWhenTrackIOTimingOn(t *testing.T) {
-	n := &planner.Values{}
+	n := &optimizer.Values{}
 	stats := nodeStatsTable{n: {}}
 	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, true)
 	for _, key := range []string{
@@ -513,7 +513,7 @@ func TestPlanToJSONWithStatsIncludesLocalTempIOTimingWhenTrackIOTimingOn(t *test
 // mirror of the above: with track_io_timing off, the Local/Temp terms stay
 // absent alongside the Shared ones.
 func TestPlanToJSONWithStatsOmitsLocalTempIOTimingWhenTrackIOTimingOff(t *testing.T) {
-	n := &planner.Values{}
+	n := &optimizer.Values{}
 	stats := nodeStatsTable{n: {}}
 	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, false)
 	for _, key := range []string{

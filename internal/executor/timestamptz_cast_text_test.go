@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goopg/goopg/internal/config"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/utils/misc"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // M0119-0006, 40th slice — the `::text` cast of a `timestamp with time zone`.
@@ -87,8 +87,8 @@ func TestTimestampTZCastToTextAgreesWithOutputPath(t *testing.T) {
 			if err != nil {
 				t.Fatalf("evalCast(text): %v", err)
 			}
-			style, order := config.ParseDateStyleValue(style)
-			want := config.FormatTimestampTZ(inst, style, order, zone)
+			style, order := misc.ParseDateStyleValue(style)
+			want := misc.FormatTimestampTZ(inst, style, order, zone)
 			if got.StringValue() != want {
 				t.Errorf("cast-to-text %q != output path %q (DateStyle=%q/%q TimeZone=%q)",
 					got.StringValue(), want, style, order, zone)
@@ -131,7 +131,7 @@ func TestPlainTimestampCastToTextStaysZoneless(t *testing.T) {
 // zone-less again — silently, since the value is otherwise identical.
 func TestTimestampTZProducersTagTheSubtype(t *testing.T) {
 	// (1) The typed string literal: TIMESTAMPTZ '…' / '…'::timestamptz.
-	lit := &planner.TypedStringLit{Type: "timestamptz", Value: "2020-01-01 10:00:00+05:30"}
+	lit := &optimizer.TypedStringLit{Type: "timestamptz", Value: "2020-01-01 10:00:00+05:30"}
 	d, err := evalTypedStringLit(lit, nil)
 	if err != nil {
 		t.Fatalf("typed literal: %v", err)
@@ -140,7 +140,7 @@ func TestTimestampTZProducersTagTheSubtype(t *testing.T) {
 		t.Errorf("timestamptz literal produced TimeSub=%d, want TimeSubTimestampTZ", d.TimeSub)
 	}
 	// Its plain-timestamp sibling must NOT be tagged.
-	litTS := &planner.TypedStringLit{Type: "timestamp", Value: "2020-01-01 10:00:00+05:30"}
+	litTS := &optimizer.TypedStringLit{Type: "timestamp", Value: "2020-01-01 10:00:00+05:30"}
 	dTS, err := evalTypedStringLit(litTS, nil)
 	if err != nil {
 		t.Fatalf("typed literal (timestamp): %v", err)

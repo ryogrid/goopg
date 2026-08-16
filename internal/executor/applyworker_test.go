@@ -8,11 +8,11 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // TestApplyWorkerInsertsRowFromPgoutputStream pins the M0008 /
@@ -28,16 +28,16 @@ func TestApplyWorkerInsertsRowFromPgoutputStream(t *testing.T) {
 	// Publisher: encode B → R → I → C through the existing
 	// PgOutput plugin against a snapshot of the publisher's
 	// schema.
-	snap := wal.BuildCatalogSnapshot(pubCat.(*catalog.InMemory), nil)
+	snap := xlog.BuildCatalogSnapshot(pubCat.(*catalog.InMemory), nil)
 	var buf bytes.Buffer
-	po := wal.NewPgOutput(snap, &buf)
+	po := xlog.NewPgOutput(snap, &buf)
 	if err := po.Begin(42, 0xCAFE); err != nil {
 		t.Fatal(err)
 	}
 	body := encodeBodyV0([]any{7, "alpha"}, []string{"int4", "text"})
 	tuple := wrapAsHeapTuple(t, body, 2)
-	if err := po.Change(wal.Change{
-		Kind:     wal.ChangeInsert,
+	if err := po.Change(xlog.Change{
+		Kind:     xlog.ChangeInsert,
 		Rel:      pubCat.RelFileNode(pubTbl),
 		NewTuple: tuple,
 	}); err != nil {
@@ -66,7 +66,7 @@ func TestApplyWorkerInsertsRowFromPgoutputStream(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		m, err := wal.DecodeMessage(stream[consumed : consumed+end])
+		m, err := xlog.DecodeMessage(stream[consumed : consumed+end])
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -97,7 +97,7 @@ func TestApplyWorkerInsertsRowFromPgoutputStream(t *testing.T) {
 	scanCtx.TxnMgr = subCtx.TxnMgr
 	scanCtx.Tx = tx
 	scanCtx.Snap = snap2
-	scan := newSeqScanOp(&planner.SeqScan{Table: subTbl})
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: subTbl})
 	if err := scan.Open(scanCtx); err != nil {
 		t.Fatal(err)
 	}
@@ -135,16 +135,16 @@ func TestApplyWorkerAppliesInsertUnderDistinctSubscriptionDBOid(t *testing.T) {
 	defer pubCleanup()
 	pubTbl, _ := pubCat.LookupTable(parser.ObjectName{Name: "items"})
 
-	snap := wal.BuildCatalogSnapshot(pubCat.(*catalog.InMemory), nil)
+	snap := xlog.BuildCatalogSnapshot(pubCat.(*catalog.InMemory), nil)
 	var buf bytes.Buffer
-	po := wal.NewPgOutput(snap, &buf)
+	po := xlog.NewPgOutput(snap, &buf)
 	if err := po.Begin(42, 0xCAFE); err != nil {
 		t.Fatal(err)
 	}
 	body := encodeBodyV0([]any{7, "alpha"}, []string{"int4", "text"})
 	tuple := wrapAsHeapTuple(t, body, 2)
-	if err := po.Change(wal.Change{
-		Kind:     wal.ChangeInsert,
+	if err := po.Change(xlog.Change{
+		Kind:     xlog.ChangeInsert,
 		Rel:      pubCat.RelFileNode(pubTbl),
 		NewTuple: tuple,
 	}); err != nil {
@@ -183,7 +183,7 @@ func TestApplyWorkerAppliesInsertUnderDistinctSubscriptionDBOid(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		m, err := wal.DecodeMessage(stream[consumed : consumed+end])
+		m, err := xlog.DecodeMessage(stream[consumed : consumed+end])
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -203,7 +203,7 @@ func TestApplyWorkerAppliesInsertUnderDistinctSubscriptionDBOid(t *testing.T) {
 		scanCtx.TxnMgr = subCtx.TxnMgr
 		scanCtx.Tx = tx
 		scanCtx.Snap = snap2
-		scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+		scan := newSeqScanOp(&optimizer.SeqScan{Table: tbl})
 		if err := scan.Open(scanCtx); err != nil {
 			t.Fatal(err)
 		}
@@ -282,7 +282,7 @@ func TestReplicaIdentityKeyRow(t *testing.T) {
 	newRow := Row{NewIntDatum(7), NewIntDatum(42), NewStringDatum("alpha")}
 
 	t.Run("pk_columns_flagged", func(t *testing.T) {
-		remoteCols := []wal.DecodedAttr{
+		remoteCols := []xlog.DecodedAttr{
 			{Name: "id", TypeOID: 23, Flags: 0x01}, // PK column
 			{Name: "a", TypeOID: 23, Flags: 0x00},
 			{Name: "v", TypeOID: 25, Flags: 0x00},
@@ -306,7 +306,7 @@ func TestReplicaIdentityKeyRow(t *testing.T) {
 		// REPLICA IDENTITY USING INDEX on a composite unique (a, v).
 		// `id` is NOT flagged — even if the subscriber declares it as
 		// PRIMARY KEY, the key row must restrict to (a, v).
-		remoteCols := []wal.DecodedAttr{
+		remoteCols := []xlog.DecodedAttr{
 			{Name: "id", TypeOID: 23, Flags: 0x00},
 			{Name: "a", TypeOID: 23, Flags: 0x01},
 			{Name: "v", TypeOID: 25, Flags: 0x01},
@@ -327,7 +327,7 @@ func TestReplicaIdentityKeyRow(t *testing.T) {
 	})
 
 	t.Run("no_flags_returns_nil", func(t *testing.T) {
-		remoteCols := []wal.DecodedAttr{
+		remoteCols := []xlog.DecodedAttr{
 			{Name: "id", TypeOID: 23, Flags: 0x00},
 			{Name: "a", TypeOID: 23, Flags: 0x00},
 			{Name: "v", TypeOID: 25, Flags: 0x00},
@@ -340,7 +340,7 @@ func TestReplicaIdentityKeyRow(t *testing.T) {
 	})
 
 	t.Run("row_length_mismatch_returns_nil", func(t *testing.T) {
-		remoteCols := []wal.DecodedAttr{
+		remoteCols := []xlog.DecodedAttr{
 			{Name: "id", TypeOID: 23, Flags: 0x01},
 		}
 		// newRow shorter than localCols — defensive guard against
@@ -361,7 +361,7 @@ func TestReplicaIdentityKeyRow(t *testing.T) {
 //
 // Design doc: docs/design/0103-0028-m0103-0007-rung-5-pg-to-goopg-toast-unchanged.md.
 func TestApplyWorkerDecodeReturnsUnchangedMask(t *testing.T) {
-	remoteCols := []wal.DecodedAttr{
+	remoteCols := []xlog.DecodedAttr{
 		{Name: "id", TypeOID: 23},      // int4
 		{Name: "name", TypeOID: 25},    // text
 		{Name: "payload", TypeOID: 25}, // text
@@ -371,7 +371,7 @@ func TestApplyWorkerDecodeReturnsUnchangedMask(t *testing.T) {
 		{Name: "name", Type: catalog.Type{Name: "text"}},
 		{Name: "payload", Type: catalog.Type{Name: "text"}},
 	}
-	tup := []wal.DecodedColumn{
+	tup := []xlog.DecodedColumn{
 		{Status: 't', Bytes: []byte("42")},
 		{Status: 'n', Bytes: nil},
 		{Status: 'u', Bytes: nil},
@@ -403,7 +403,7 @@ func TestApplyWorkerDecodeReturnsUnchangedMask(t *testing.T) {
 	}
 
 	// Unknown status still errors.
-	tupBad := []wal.DecodedColumn{
+	tupBad := []xlog.DecodedColumn{
 		{Status: 'x', Bytes: nil},
 	}
 	if _, _, _, err := decodePgoutputTupleAsRow(remoteCols[:1], localCols[:1], tupBad); err == nil {
@@ -419,7 +419,7 @@ func TestApplyWorkerDecodeReturnsUnchangedMask(t *testing.T) {
 // 'id' value would land in the local text 'v' slot and parsePgoutputText
 // would parse "alice" as int4, returning an error.
 func TestApplyWorkerDecodeRemapsReorderedColumns(t *testing.T) {
-	remoteCols := []wal.DecodedAttr{
+	remoteCols := []xlog.DecodedAttr{
 		{Name: "id", TypeOID: 23},
 		{Name: "v", TypeOID: 25},
 	}
@@ -428,7 +428,7 @@ func TestApplyWorkerDecodeRemapsReorderedColumns(t *testing.T) {
 		{Name: "v", Type: catalog.Type{Name: "text"}},
 		{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true},
 	}
-	tup := []wal.DecodedColumn{
+	tup := []xlog.DecodedColumn{
 		{Status: 't', Bytes: []byte("7")},
 		{Status: 't', Bytes: []byte("alice")},
 	}
@@ -454,14 +454,14 @@ func TestApplyWorkerDecodeRemapsReorderedColumns(t *testing.T) {
 // doesn't have, the decoder must refuse rather than silently dropping
 // the wire byte. PG's apply worker raises the same error condition.
 func TestApplyWorkerDecodeRejectsUnmatchedRemoteCol(t *testing.T) {
-	remoteCols := []wal.DecodedAttr{
+	remoteCols := []xlog.DecodedAttr{
 		{Name: "id", TypeOID: 23},
 		{Name: "extra_on_publisher", TypeOID: 25},
 	}
 	localCols := []catalog.Column{
 		{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true},
 	}
-	tup := []wal.DecodedColumn{
+	tup := []xlog.DecodedColumn{
 		{Status: 't', Bytes: []byte("1")},
 		{Status: 't', Bytes: []byte("x")},
 	}
@@ -480,7 +480,7 @@ func TestApplyWorkerDecodeRejectsUnmatchedRemoteCol(t *testing.T) {
 // (and leave the row cell NullDatum). applyUpdateByKey uses the mask to
 // preserve the subscriber-only value across replicated UPDATEs.
 func TestApplyWorkerDecodeMarksSubscriberExtraAsMissing(t *testing.T) {
-	remoteCols := []wal.DecodedAttr{
+	remoteCols := []xlog.DecodedAttr{
 		{Name: "id", TypeOID: 23},
 		{Name: "v", TypeOID: 25},
 	}
@@ -491,7 +491,7 @@ func TestApplyWorkerDecodeMarksSubscriberExtraAsMissing(t *testing.T) {
 		{Name: "v", Type: catalog.Type{Name: "text"}},
 		{Name: "note", Type: catalog.Type{Name: "text"}},
 	}
-	tup := []wal.DecodedColumn{
+	tup := []xlog.DecodedColumn{
 		{Status: 't', Bytes: []byte("1")},
 		{Status: 't', Bytes: []byte("hello")},
 	}
@@ -553,11 +553,11 @@ func TestApplyUpdateByKeyPreservesSubscriberExtraColumn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateTable: %v", err)
 	}
-	mgrMVCC := mvcc.NewManager()
+	mgrMVCC := transam.NewManager()
 
 	// Seed an initial row with all three columns populated (id=1, v="hello",
 	// note="kept"). This is the pre-image the publisher UPDATE will replace.
-	seedTx, err := mgrMVCC.Begin(mvcc.IsolationReadCommitted)
+	seedTx, err := mgrMVCC.Begin(transam.IsolationReadCommitted)
 	if err != nil {
 		t.Fatalf("begin seed: %v", err)
 	}
@@ -581,7 +581,7 @@ func TestApplyUpdateByKeyPreservesSubscriberExtraColumn(t *testing.T) {
 	// Apply path: publisher knows (id, v) only. newRow has the new v at
 	// position 1 and NullDatum at note's local position; newMissing[2]
 	// flags note as a subscriber-extra column that must survive the UPDATE.
-	applyTx, err := mgrMVCC.Begin(mvcc.IsolationReadCommitted)
+	applyTx, err := mgrMVCC.Begin(transam.IsolationReadCommitted)
 	if err != nil {
 		t.Fatalf("begin apply: %v", err)
 	}
@@ -609,7 +609,7 @@ func TestApplyUpdateByKeyPreservesSubscriberExtraColumn(t *testing.T) {
 	}
 
 	// Inspect via a fresh read-only transaction.
-	readTx, err := mgrMVCC.Begin(mvcc.IsolationReadCommitted)
+	readTx, err := mgrMVCC.Begin(transam.IsolationReadCommitted)
 	if err != nil {
 		t.Fatalf("begin read: %v", err)
 	}
@@ -621,7 +621,7 @@ func TestApplyUpdateByKeyPreservesSubscriberExtraColumn(t *testing.T) {
 	scanCtx.TxnMgr = mgrMVCC
 	scanCtx.Tx = readTx
 	scanCtx.Snap = rsnap
-	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: tbl})
 	if err := scan.Open(scanCtx); err != nil {
 		t.Fatalf("seqscan open: %v", err)
 	}
@@ -662,18 +662,18 @@ func TestApplyWorkerInsertRejectsUnchangedToast(t *testing.T) {
 
 	// Drive Begin → Relation → Insert directly via synthesized
 	// DecodedMessage values; no wire-encoder helper required.
-	if _, err := w.ApplyMessage(&wal.DecodedMessage{
+	if _, err := w.ApplyMessage(&xlog.DecodedMessage{
 		Kind: 'B', XID: 99, CommitLSN: 0xBEEF,
 	}); err != nil {
 		t.Fatalf("Begin apply: %v", err)
 	}
-	if _, err := w.ApplyMessage(&wal.DecodedMessage{
+	if _, err := w.ApplyMessage(&xlog.DecodedMessage{
 		Kind: 'R',
-		Relation: &wal.DecodedRelation{
+		Relation: &xlog.DecodedRelation{
 			OID:    rel.RelOid,
 			Schema: "public",
 			Name:   "items",
-			Columns: []wal.DecodedAttr{
+			Columns: []xlog.DecodedAttr{
 				{Name: "id", TypeOID: 23},
 				{Name: "label", TypeOID: 25},
 			},
@@ -683,10 +683,10 @@ func TestApplyWorkerInsertRejectsUnchangedToast(t *testing.T) {
 	}
 	// INSERT with a 'u' cell — encoder would never emit this; we
 	// build it by hand to confirm the apply-side defensive check.
-	insertMsg := &wal.DecodedMessage{
+	insertMsg := &xlog.DecodedMessage{
 		Kind:   'I',
 		RelOID: rel.RelOid,
-		NewTuple: []wal.DecodedColumn{
+		NewTuple: []xlog.DecodedColumn{
 			{Status: 't', Bytes: []byte("1")},
 			{Status: 'u', Bytes: nil},
 		},
@@ -715,19 +715,19 @@ func TestApplyWorkerTruncate(t *testing.T) {
 	w := NewApplyWorker(subCat, subCtx.Pool, subCtx.TxnMgr)
 	defer w.SafeRollback()
 
-	if _, err := w.ApplyMessage(&wal.DecodedMessage{
+	if _, err := w.ApplyMessage(&xlog.DecodedMessage{
 		Kind: 'B', XID: 100, CommitLSN: 0xD00D,
 	}); err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
-	if _, err := w.ApplyMessage(&wal.DecodedMessage{
+	if _, err := w.ApplyMessage(&xlog.DecodedMessage{
 		Kind: 'R',
-		Relation: &wal.DecodedRelation{
+		Relation: &xlog.DecodedRelation{
 			// Schema left empty to match the fixture's unqualified
 			// table — LookupTable falls back to the default schema
 			// when Schema is "".
 			OID: rel.RelOid, Name: "items",
-			Columns: []wal.DecodedAttr{
+			Columns: []xlog.DecodedAttr{
 				{Name: "id", TypeOID: 23},
 				{Name: "label", TypeOID: 25},
 			},
@@ -736,9 +736,9 @@ func TestApplyWorkerTruncate(t *testing.T) {
 		t.Fatalf("Relation: %v", err)
 	}
 	for _, pair := range [][2]string{{"1", "alpha"}, {"2", "beta"}} {
-		if _, err := w.ApplyMessage(&wal.DecodedMessage{
+		if _, err := w.ApplyMessage(&xlog.DecodedMessage{
 			Kind: 'I', RelOID: rel.RelOid,
-			NewTuple: []wal.DecodedColumn{
+			NewTuple: []xlog.DecodedColumn{
 				{Status: 't', Bytes: []byte(pair[0])},
 				{Status: 't', Bytes: []byte(pair[1])},
 			},
@@ -751,14 +751,14 @@ func TestApplyWorkerTruncate(t *testing.T) {
 	// to exercise the option-byte plumbing (the apply worker
 	// records the option but takes no extra action — CASCADE
 	// resolution happens publisher-side).
-	if _, err := w.ApplyMessage(&wal.DecodedMessage{
+	if _, err := w.ApplyMessage(&xlog.DecodedMessage{
 		Kind:           'T',
 		TruncateRels:   []uint32{rel.RelOid},
 		TruncateOption: 0x01,
 	}); err != nil {
 		t.Fatalf("Truncate: %v", err)
 	}
-	if _, err := w.ApplyMessage(&wal.DecodedMessage{
+	if _, err := w.ApplyMessage(&xlog.DecodedMessage{
 		Kind: 'C', CommitLSN: 0xD00D, EndLSN: 0xD00D,
 	}); err != nil {
 		t.Fatalf("Commit: %v", err)
@@ -775,7 +775,7 @@ func TestApplyWorkerTruncate(t *testing.T) {
 	scanCtx.TxnMgr = subCtx.TxnMgr
 	scanCtx.Tx = tx
 	scanCtx.Snap = snap2
-	scan := newSeqScanOp(&planner.SeqScan{Table: subTbl})
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: subTbl})
 	if err := scan.Open(scanCtx); err != nil {
 		t.Fatalf("scan open: %v", err)
 	}
@@ -801,13 +801,13 @@ func TestApplyWorkerTruncateUnknownRelOid(t *testing.T) {
 	w := NewApplyWorker(subCat, subCtx.Pool, subCtx.TxnMgr)
 	defer w.SafeRollback()
 
-	if _, err := w.ApplyMessage(&wal.DecodedMessage{
+	if _, err := w.ApplyMessage(&xlog.DecodedMessage{
 		Kind: 'B', XID: 101, CommitLSN: 0xBEEF,
 	}); err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
 	// No 'R' for OID 99999 — the TRUNCATE handler must reject.
-	_, err := w.ApplyMessage(&wal.DecodedMessage{
+	_, err := w.ApplyMessage(&xlog.DecodedMessage{
 		Kind:         'T',
 		TruncateRels: []uint32{99999},
 	})
@@ -824,7 +824,7 @@ func TestApplyWorkerCommitOutsideXactIsNoop(t *testing.T) {
 	subCtx, subCat, subCleanup := newStorageFixture(t)
 	defer subCleanup()
 	w := NewApplyWorker(subCat, subCtx.Pool, subCtx.TxnMgr)
-	lsn, err := w.ApplyMessage(&wal.DecodedMessage{Kind: 'C', CommitLSN: 0xDEAD})
+	lsn, err := w.ApplyMessage(&xlog.DecodedMessage{Kind: 'C', CommitLSN: 0xDEAD})
 	if err != nil {
 		t.Errorf("commit-only err=%v want nil", err)
 	}
@@ -840,11 +840,11 @@ func TestApplyWorkerInsertWithoutRelationFails(t *testing.T) {
 	subCtx, subCat, subCleanup := newStorageFixture(t)
 	defer subCleanup()
 	w := NewApplyWorker(subCat, subCtx.Pool, subCtx.TxnMgr)
-	if _, err := w.ApplyMessage(&wal.DecodedMessage{Kind: 'B', XID: 42}); err != nil {
+	if _, err := w.ApplyMessage(&xlog.DecodedMessage{Kind: 'B', XID: 42}); err != nil {
 		t.Fatal(err)
 	}
 	defer w.SafeRollback()
-	_, err := w.ApplyMessage(&wal.DecodedMessage{
+	_, err := w.ApplyMessage(&xlog.DecodedMessage{
 		Kind:   'I',
 		RelOID: 99999,
 	})
@@ -962,18 +962,18 @@ func pgoutputMessageLength(buf []byte) (int, error) {
 // over CopyData. Returned bytes are framed back-to-back; the
 // caller chunks them with pgoutputMessageLength. Reused by
 // the tablesync gating tests below.
-func pgoutputBIRC(t *testing.T, snap *wal.CatalogSnapshot, rel storage.RelFileNode,
+func pgoutputBIRC(t *testing.T, snap *xlog.CatalogSnapshot, rel storage.RelFileNode,
 	id int, label string, commitLSN uint64) []byte {
 	t.Helper()
 	var buf bytes.Buffer
-	po := wal.NewPgOutput(snap, &buf)
+	po := xlog.NewPgOutput(snap, &buf)
 	if err := po.Begin(42, commitLSN); err != nil {
 		t.Fatal(err)
 	}
 	body := encodeBodyV0([]any{id, label}, []string{"int4", "text"})
 	tuple := wrapAsHeapTuple(t, body, 2)
-	if err := po.Change(wal.Change{
-		Kind:     wal.ChangeInsert,
+	if err := po.Change(xlog.Change{
+		Kind:     xlog.ChangeInsert,
 		Rel:      rel,
 		NewTuple: tuple,
 	}); err != nil {
@@ -997,7 +997,7 @@ func driveStream(t *testing.T, w *ApplyWorker, stream []byte) uint64 {
 		if err != nil {
 			t.Fatal(err)
 		}
-		m, err := wal.DecodeMessage(stream[consumed : consumed+end])
+		m, err := xlog.DecodeMessage(stream[consumed : consumed+end])
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1023,7 +1023,7 @@ func TestApplyWorkerSkipsChangesForRelInTablesync(t *testing.T) {
 	_, pubCat, pubCleanup := newStorageFixture(t)
 	defer pubCleanup()
 	pubTbl, _ := pubCat.LookupTable(parser.ObjectName{Name: "items"})
-	snap := wal.BuildCatalogSnapshot(pubCat.(*catalog.InMemory), nil)
+	snap := xlog.BuildCatalogSnapshot(pubCat.(*catalog.InMemory), nil)
 	rel := pubCat.RelFileNode(pubTbl)
 
 	subCtx, subCat, subCleanup := newStorageFixture(t)
@@ -1064,7 +1064,7 @@ func TestApplyWorkerSkipsChangesForRelInTablesync(t *testing.T) {
 	scanCtx.TxnMgr = subCtx.TxnMgr
 	scanCtx.Tx = tx
 	scanCtx.Snap = snap2
-	scan := newSeqScanOp(&planner.SeqScan{Table: subTbl})
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: subTbl})
 	if err := scan.Open(scanCtx); err != nil {
 		t.Fatal(err)
 	}
@@ -1094,7 +1094,7 @@ func TestApplyWorkerPromotesSyncDoneToReadyOnCommit(t *testing.T) {
 	_, pubCat, pubCleanup := newStorageFixture(t)
 	defer pubCleanup()
 	pubTbl, _ := pubCat.LookupTable(parser.ObjectName{Name: "items"})
-	snap := wal.BuildCatalogSnapshot(pubCat.(*catalog.InMemory), nil)
+	snap := xlog.BuildCatalogSnapshot(pubCat.(*catalog.InMemory), nil)
 	rel := pubCat.RelFileNode(pubTbl)
 
 	subCtx, subCat, subCleanup := newStorageFixture(t)
@@ -1152,7 +1152,7 @@ func TestApplyWorkerPromotesSyncDoneToReadyOnCommit(t *testing.T) {
 	scanCtx.TxnMgr = subCtx.TxnMgr
 	scanCtx.Tx = tx
 	scanCtx.Snap = snap2
-	scan := newSeqScanOp(&planner.SeqScan{Table: subTbl})
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: subTbl})
 	if err := scan.Open(scanCtx); err != nil {
 		t.Fatal(err)
 	}
@@ -1176,7 +1176,7 @@ func TestApplyWorkerLogsCommitAndPromotion(t *testing.T) {
 	_, pubCat, pubCleanup := newStorageFixture(t)
 	defer pubCleanup()
 	pubTbl, _ := pubCat.LookupTable(parser.ObjectName{Name: "items"})
-	snap := wal.BuildCatalogSnapshot(pubCat.(*catalog.InMemory), nil)
+	snap := xlog.BuildCatalogSnapshot(pubCat.(*catalog.InMemory), nil)
 	rel := pubCat.RelFileNode(pubTbl)
 
 	subCtx, subCat, subCleanup := newStorageFixture(t)
@@ -1241,17 +1241,17 @@ func TestApplyWorkerStatHandleAdvancesOnCommit(t *testing.T) {
 	_, pubCat, pubCleanup := newStorageFixture(t)
 	defer pubCleanup()
 	pubTbl, _ := pubCat.LookupTable(parser.ObjectName{Name: "items"})
-	snap := wal.BuildCatalogSnapshot(pubCat.(*catalog.InMemory), nil)
+	snap := xlog.BuildCatalogSnapshot(pubCat.(*catalog.InMemory), nil)
 	rel := pubCat.RelFileNode(pubTbl)
 
 	subCtx, subCat, subCleanup := newStorageFixture(t)
 	defer subCleanup()
 
-	subs := wal.NewSubscribers()
-	statHandle := subs.Register(wal.SubscriberState{
+	subs := xlog.NewSubscribers()
+	statHandle := subs.Register(xlog.SubscriberState{
 		SubID:      99,
 		SubName:    "sub_stat",
-		WorkerType: wal.SubscriberWorkerLeader,
+		WorkerType: xlog.SubscriberWorkerLeader,
 		PID:        7777,
 	})
 	defer subs.Unregister(statHandle)
@@ -1288,7 +1288,7 @@ func TestApplyWorkerCommitWithoutPromotionLeavesUncrossedRelAtS(t *testing.T) {
 	_, pubCat, pubCleanup := newStorageFixture(t)
 	defer pubCleanup()
 	pubTbl, _ := pubCat.LookupTable(parser.ObjectName{Name: "items"})
-	snap := wal.BuildCatalogSnapshot(pubCat.(*catalog.InMemory), nil)
+	snap := xlog.BuildCatalogSnapshot(pubCat.(*catalog.InMemory), nil)
 	rel := pubCat.RelFileNode(pubTbl)
 
 	subCtx, subCat, subCleanup := newStorageFixture(t)

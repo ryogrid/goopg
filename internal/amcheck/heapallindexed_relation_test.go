@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -13,7 +13,7 @@ import (
 // (keyLen(2) | block(4) | offset(2) | key), setting BOTH the heap TID block and
 // offset — btItemRaw leaves them zero and btDownlinkRaw sets only the block.
 func btLeafRaw(key []byte, block storage.BlockNumber, offset uint16) []byte {
-	return btree.PGBTItemRaw(key, storage.ItemPointer{Block: block, Offset: offset})
+	return nbtree.PGBTItemRaw(key, storage.ItemPointer{Block: block, Offset: offset})
 }
 
 // le is a (key, heap TID) leaf entry for makeLeafPage.
@@ -29,7 +29,7 @@ type le struct {
 func makeLeafPage(t *testing.T, next storage.BlockNumber, entries ...le) storage.Page {
 	t.Helper()
 	p := make(storage.Page, storage.BlockSize)
-	pgInitTestPage(t, p, next, 0, btree.BTLeaf)
+	pgInitTestPage(t, p, next, 0, nbtree.BTLeaf)
 	for i, e := range entries {
 		if _, err := storage.PageAddItemRaw(p, btLeafRaw(e.key, e.block, e.offset)); err != nil {
 			t.Fatalf("PageAddItemRaw[%d]: %v", i, err)
@@ -50,10 +50,10 @@ func makeLeafPage(t *testing.T, next storage.BlockNumber, entries ...le) storage
 // reads as "no key level".
 func makeMetaWithRoot(t *testing.T, root storage.BlockNumber) storage.Page {
 	t.Helper()
-	p := makeMetaPage(t, btree.BTreeMagic, btree.BTreeVersion)
+	p := makeMetaPage(t, nbtree.BTreeMagic, nbtree.BTreeVersion)
 	off := storage.SizeOfPageHeaderData
 	binary.LittleEndian.PutUint32(p[off+8:off+12], uint32(root)) // Root
-	if got := btree.ParseMeta(p); got.Root != root {
+	if got := nbtree.ParseMeta(p); got.Root != root {
 		t.Fatalf("makeMetaWithRoot self-check: Root=%d, want %d", got.Root, root)
 	}
 	return p
@@ -62,7 +62,7 @@ func makeMetaWithRoot(t *testing.T, root storage.BlockNumber) storage.Page {
 // makeDeletedLeaf builds a leaf page flagged deleted (no live items).
 func makeDeletedLeaf(t *testing.T, next storage.BlockNumber) storage.Page {
 	t.Helper()
-	p := makeLinkedPage(t, none, next, 0, btree.BTLeaf|btree.BTDeleted)
+	p := makeLinkedPage(t, none, next, 0, nbtree.BTLeaf|nbtree.BTDeleted)
 	return p
 }
 
@@ -71,7 +71,7 @@ func makeDeletedLeaf(t *testing.T, next storage.BlockNumber) storage.Page {
 // A single root-leaf tree (root == leaf at block 1) yields exactly its entries.
 func TestCollectBtreeLeafEntries_SingleRootLeaf(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
-		btree.MetaBlock: makeMetaWithRoot(t, 1),
+		nbtree.MetaBlock: makeMetaWithRoot(t, 1),
 		1: makeLeafPage(t, none,
 			le{k(1), 10, 1},
 			le{k(2), 10, 2},
@@ -97,7 +97,7 @@ func TestCollectBtreeLeafEntries_SingleRootLeaf(t *testing.T) {
 // collecting all entries in left-to-right order.
 func TestCollectBtreeLeafEntries_MultiLevel(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
-		btree.MetaBlock: makeMetaWithRoot(t, 1),
+		nbtree.MetaBlock: makeMetaWithRoot(t, 1),
 		1: makeInternalPage(t, 1, none,
 			dl{nil, 2}, // leftmost (negative infinity) → leaf 2
 			dl{k(5), 3}),
@@ -123,7 +123,7 @@ func TestCollectBtreeLeafEntries_MultiLevel(t *testing.T) {
 // error.
 func TestCollectBtreeLeafEntries_NoKeyLevel(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
-		btree.MetaBlock: makeMetaPage(t, btree.BTreeMagic, btree.BTreeVersion), // Root left 0
+		nbtree.MetaBlock: makeMetaPage(t, nbtree.BTreeMagic, nbtree.BTreeVersion), // Root left 0
 	}
 	got, err := CollectBtreeLeafEntries(mapSource(pages), blobFmt)
 	if err != nil {
@@ -137,7 +137,7 @@ func TestCollectBtreeLeafEntries_NoKeyLevel(t *testing.T) {
 // An empty leaf (root-leaf with zero items) yields zero entries, not an error.
 func TestCollectBtreeLeafEntries_EmptyLeaf(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
-		btree.MetaBlock: makeMetaWithRoot(t, 1),
+		nbtree.MetaBlock: makeMetaWithRoot(t, 1),
 		1:               makeLeafPage(t, none),
 	}
 	got, err := CollectBtreeLeafEntries(mapSource(pages), blobFmt)
@@ -153,7 +153,7 @@ func TestCollectBtreeLeafEntries_EmptyLeaf(t *testing.T) {
 // items are not live) but does not abort the walk.
 func TestCollectBtreeLeafEntries_DeletedLeafSkipped(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
-		btree.MetaBlock: makeMetaWithRoot(t, 1),
+		nbtree.MetaBlock: makeMetaWithRoot(t, 1),
 		1:               makeLeafPage(t, 2, le{k(1), 30, 1}),
 		2:               makeDeletedLeaf(t, 3),
 		3:               makeLeafPage(t, none, le{k(9), 31, 1}),
@@ -172,7 +172,7 @@ func TestCollectBtreeLeafEntries_DeletedLeafSkipped(t *testing.T) {
 // heapallindexed reports, so this must surface, not silently truncate.
 func TestCollectBtreeLeafEntries_SiblingCycle(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
-		btree.MetaBlock: makeMetaWithRoot(t, 1),
+		nbtree.MetaBlock: makeMetaWithRoot(t, 1),
 		1:               makeLeafPage(t, 2, le{k(1), 40, 1}),
 		2:               makeLeafPage(t, 1, le{k(2), 40, 2}), // points back to 1
 	}
@@ -188,7 +188,7 @@ func TestCollectBtreeLeafEntries_SiblingCycle(t *testing.T) {
 // A read error during the descent surfaces as an error.
 func TestCollectBtreeLeafEntries_DescentReadError(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
-		btree.MetaBlock: makeMetaWithRoot(t, 1),
+		nbtree.MetaBlock: makeMetaWithRoot(t, 1),
 		1:               makeInternalPage(t, 1, none, dl{nil, 2}), // child 2 absent from map
 	}
 	_, err := CollectBtreeLeafEntries(mapSource(pages), blobFmt)
@@ -202,12 +202,12 @@ func TestCollectBtreeLeafEntries_DescentReadError(t *testing.T) {
 // Every heap-formed entry is present in the index → no findings.
 func TestVerifyBtreeHeapAllIndexedRelation_Clean(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
-		btree.MetaBlock: makeMetaWithRoot(t, 1),
+		nbtree.MetaBlock: makeMetaWithRoot(t, 1),
 		1: makeLeafPage(t, none,
 			le{k(1), 10, 1},
 			le{k(2), 10, 2}),
 	}
-	heap := []btree.LeafEntry{
+	heap := []nbtree.LeafEntry{
 		{Key: k(1), TID: storage.ItemPointer{Block: 10, Offset: 1}},
 		{Key: k(2), TID: storage.ItemPointer{Block: 10, Offset: 2}},
 	}
@@ -224,10 +224,10 @@ func TestVerifyBtreeHeapAllIndexedRelation_Clean(t *testing.T) {
 // the upstream-verbatim message and the heap block.
 func TestVerifyBtreeHeapAllIndexedRelation_MissingEntry(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
-		btree.MetaBlock: makeMetaWithRoot(t, 1),
+		nbtree.MetaBlock: makeMetaWithRoot(t, 1),
 		1:               makeLeafPage(t, none, le{k(1), 10, 1}),
 	}
-	heap := []btree.LeafEntry{
+	heap := []nbtree.LeafEntry{
 		{Key: k(1), TID: storage.ItemPointer{Block: 10, Offset: 1}}, // present
 		{Key: k(2), TID: storage.ItemPointer{Block: 12, Offset: 7}}, // absent
 	}
@@ -251,9 +251,9 @@ func TestVerifyBtreeHeapAllIndexedRelation_MissingEntry(t *testing.T) {
 // truncated fingerprint set (which would manufacture spurious reports).
 func TestVerifyBtreeHeapAllIndexedRelation_IndexWalkError(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
-		btree.MetaBlock: makeMetaWithRoot(t, 1), // block 1 absent → read error
+		nbtree.MetaBlock: makeMetaWithRoot(t, 1), // block 1 absent → read error
 	}
-	heap := []btree.LeafEntry{{Key: k(1), TID: storage.ItemPointer{Block: 10, Offset: 1}}}
+	heap := []nbtree.LeafEntry{{Key: k(1), TID: storage.ItemPointer{Block: 10, Offset: 1}}}
 	_, err := VerifyBtreeHeapAllIndexedRelation(mapSource(pages), blobFmt, heap, "ix", "tbl", 1)
 	if err == nil {
 		t.Fatal("expected error on unreadable index, got nil")

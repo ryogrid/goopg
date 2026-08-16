@@ -6,7 +6,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // utilitySettingsOp executes SHOW / SET / RESET statements inside the
@@ -14,16 +14,16 @@ import (
 // and for extended-query protocol execution, both of which bypass the
 // lightweight string-matching handlers in internal/server/query.go.
 type utilitySettingsOp struct {
-	plan   *planner.Utility
+	plan   *optimizer.Utility
 	ctx    *Context
 	rows   []Row
 	rowIdx int
 	done   bool
 }
 
-func newUtilitySettingsOp(p *planner.Utility) *utilitySettingsOp { return &utilitySettingsOp{plan: p} }
+func newUtilitySettingsOp(p *optimizer.Utility) *utilitySettingsOp { return &utilitySettingsOp{plan: p} }
 
-func (o *utilitySettingsOp) Schema() planner.Schema { return o.plan.Output() }
+func (o *utilitySettingsOp) Schema() optimizer.Schema { return o.plan.Output() }
 func (o *utilitySettingsOp) Open(ctx *Context) error {
 	o.ctx = ctx
 	return nil

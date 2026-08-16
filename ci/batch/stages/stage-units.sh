@@ -16,7 +16,7 @@ source "${REPO_ROOT}/ci/batch/lib/common.sh"
 UNITS_TIMEOUT="${NIGHTLY_UNITS_TIMEOUT:-30m}"
 # The CI EXCLUDE list (.github/workflows/test.yml / ralph-precommit-test.sh /
 # Makefile RACE_EXCLUDE — all carry the same alternation).
-EXCLUDE='internal/testport|internal/server|internal/testutil/cluster|internal/testutil/replcluster|internal/testutil/pgcluster|internal/testutil/pubsubcluster|internal/testutil/tpch|/bench/'
+EXCLUDE='internal/testport|internal/postmaster|internal/testutil/cluster|internal/testutil/replcluster|internal/testutil/pgcluster|internal/testutil/pubsubcluster|internal/testutil/tpch|/bench/'
 
 mkdir -p "${RUN_DIR}/units"
 progress "S1.L" "units start (unit=goopg-nightly-units high=6G max=8G p=${NIGHTLY_GO_P:-4} timeout=${UNITS_TIMEOUT})"

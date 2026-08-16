@@ -21,7 +21,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // seqState holds the mutable state of one sequence.
@@ -413,12 +413,12 @@ func SetSequenceColumnMarker(name, spelling string, identityKind byte, dbOid ...
 
 // payloadLocked builds the WAL snapshot for s with the given counter state.
 // Caller must hold s.mu.
-func (s *seqState) payloadLocked(current int64, called bool) wal.SequenceStatePayload {
+func (s *seqState) payloadLocked(current int64, called bool) xlog.SequenceStatePayload {
 	name := s.seqName
 	if s.schema != "" && s.schema != "public" {
 		name = s.schema + "." + s.seqName
 	}
-	return wal.SequenceStatePayload{
+	return xlog.SequenceStatePayload{
 		Name:         name,
 		Start:        s.start,
 		Increment:    s.increment,
@@ -480,16 +480,16 @@ func WALLogSequenceState(ctx *Context, name string) {
 // this is ever called, so ok=false here would only mean a concurrent DROP
 // SEQUENCE raced the clone (the source-database busy guard makes this rare
 // in practice, but the caller must still handle it explicitly).
-func SnapshotSequenceState(name string, dbOid uint32) (wal.SequenceStatePayload, bool) {
+func SnapshotSequenceState(name string, dbOid uint32) (xlog.SequenceStatePayload, bool) {
 	v, ok := seqRegistry.Load(seqKey(name, dbOid))
 	if !ok {
-		return wal.SequenceStatePayload{}, false
+		return xlog.SequenceStatePayload{}, false
 	}
 	s := v.(*seqState)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.temporary {
-		return wal.SequenceStatePayload{}, false
+		return xlog.SequenceStatePayload{}, false
 	}
 	return s.payloadLocked(s.current.Load(), s.called.Load()), true
 }
@@ -574,7 +574,7 @@ func autoGenerateSerialValues(ctx *Context, tableName string, cols []catalog.Col
 // RecordKindSequenceState record (last record wins). Counter state is
 // restored exactly as logged: Current is the pre-logged horizon for records
 // emitted by nextval, or the exact value for create/alter/setval snapshots.
-func RestoreSequenceFromWAL(p wal.SequenceStatePayload) {
+func RestoreSequenceFromWAL(p xlog.SequenceStatePayload) {
 	dbOid := catalog.NamespaceDBOid(p.DBOid)
 	RegisterSequence(p.Name, p.Start, p.Increment, p.Min, p.Max, p.Cycle, dbOid)
 	if p.Cache > 1 {

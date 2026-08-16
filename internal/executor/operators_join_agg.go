@@ -15,7 +15,7 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/hashsize"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -37,10 +37,10 @@ type joinRowCTID struct {
 // back Next left the struct entirely — see the four `*Stream` fields below,
 // exactly one of which is non-nil between Open and Close.
 type joinOp struct {
-	plan   *planner.Join
+	plan   *optimizer.Join
 	left   Operator
 	right  Operator
-	schema planner.Schema
+	schema optimizer.Schema
 
 	ctx *Context
 
@@ -77,10 +77,10 @@ type joinOp struct {
 	// execKeyPackInt selects the fixed-width int64 lane of the composite
 	// encoding (join_composite_key.go); execKeyBuf is its per-row scratch,
 	// reused so the probe side allocates nothing.
-	execKeys       []planner.JoinKeyPair
-	execResidual   planner.Expr
-	buildKeyExprs  []planner.Expr
-	probeKeyExprs  []planner.Expr
+	execKeys       []optimizer.JoinKeyPair
+	execResidual   optimizer.Expr
+	buildKeyExprs  []optimizer.Expr
+	probeKeyExprs  []optimizer.Expr
 	execKeyPackInt bool
 	execKeyBuf     []byte
 
@@ -116,8 +116,8 @@ type joinOp struct {
 	// lazy-hash path only, and a joinOp runs one algorithm, so keeping the
 	// two apart makes a cross-read a compile error rather than a silent
 	// wrong-key join. See join_merge_key.go.
-	mergeKeys     []planner.JoinKeyPair
-	mergeResidual planner.Expr
+	mergeKeys     []optimizer.JoinKeyPair
+	mergeResidual optimizer.Expr
 
 	// M0127-P4.1 (07 §2): the streaming merge join. Non-nil for the whole
 	// life of a JoinAlgoMerge Open, and the reason Next has a third arm:
@@ -282,7 +282,7 @@ type joinOp struct {
 	joinFilterRemoved *int64
 }
 
-func newJoinOp(plan *planner.Join, left, right Operator) *joinOp {
+func newJoinOp(plan *optimizer.Join, left, right Operator) *joinOp {
 	schema := plan.Output()
 	if len(schema) == 0 {
 		schema = append(schema, left.Schema()...)
@@ -291,7 +291,7 @@ func newJoinOp(plan *planner.Join, left, right Operator) *joinOp {
 	// M0127-P2.2: the residual defaults to the full Predicate, which is what
 	// every non-hash algorithm evaluates. openLazyHashJoin narrows it to the
 	// conjuncts the hash key does NOT already enforce.
-	var residual planner.Expr
+	var residual optimizer.Expr
 	if plan != nil {
 		residual = plan.Predicate
 	}
@@ -311,11 +311,11 @@ func (o *joinOp) Open(ctx *Context) error {
 	// Any other algo (Merge, or an unset zero value that is NOT the
 	// planner's explicit NestedLoop choice with a predicate) stays
 	// an internal error.
-	if o.plan.Type == planner.JoinTypeSemi || o.plan.Type == planner.JoinTypeAnti {
+	if o.plan.Type == optimizer.JoinTypeSemi || o.plan.Type == optimizer.JoinTypeAnti {
 		switch o.plan.Algo {
-		case planner.JoinAlgoHash:
+		case optimizer.JoinAlgoHash:
 			return o.openLazyHashJoin(ctx)
-		case planner.JoinAlgoNestedLoop:
+		case optimizer.JoinAlgoNestedLoop:
 			if o.plan.Predicate == nil {
 				// A keyless semi/anti with no predicate would be an
 				// unconditional cross semi — the planner never builds
@@ -339,7 +339,7 @@ func (o *joinOp) Open(ctx *Context) error {
 	if o.plan.Lateral {
 		return o.openLateral(ctx)
 	}
-	if o.plan.Algo == planner.JoinAlgoHash {
+	if o.plan.Algo == optimizer.JoinAlgoHash {
 		return o.openLazyHashJoin(ctx)
 	}
 	// M0127-P4.1 (07 §2): merge join no longer shares the eager both-sides
@@ -347,7 +347,7 @@ func (o *joinOp) Open(ctx *Context) error {
 	// work_mem-bounded sorted sources instead; the CTID side-channel the
 	// drain captures is nested-loop-only anyway (rowSourceLeft, which
 	// runMergeJoin never populated, is what Next needs to use it).
-	if o.plan.Algo == planner.JoinAlgoMerge {
+	if o.plan.Algo == optimizer.JoinAlgoMerge {
 		return o.openMergeJoin(ctx)
 	}
 	// M0127-P4.3 (07 §4): the universal fallback streams too. The outer side
@@ -555,7 +555,7 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	// also defend here so a stray flag doesn't silently break the
 	// emit-once-per-probe-row invariant.
 	buildLeft := o.plan.BuildLeft
-	if o.plan.Type == planner.JoinTypeSemi || o.plan.Type == planner.JoinTypeAnti {
+	if o.plan.Type == optimizer.JoinTypeSemi || o.plan.Type == optimizer.JoinTypeAnti {
 		buildLeft = false
 	}
 	// M0127-P0.3 (05 §4, stage E3): pick the key representation ONCE, here,
@@ -683,7 +683,7 @@ const maxPresizeBuckets = 1 << 20
 // a fixed-width relation), which prices the geometry by column count alone —
 // exactly the old behaviour, so no query changes unless it has text-heavy columns
 // that have been ANALYZEd.
-func (o *joinOp) buildGeometry(ctx *Context, buildNode planner.Node, buildWidth int, buildIsLeft bool) hashsize.Sizing {
+func (o *joinOp) buildGeometry(ctx *Context, buildNode optimizer.Node, buildWidth int, buildIsLeft bool) hashsize.Sizing {
 	var workMem int64
 	if ctx != nil {
 		workMem = ctx.WorkMem
@@ -698,7 +698,7 @@ func (o *joinOp) buildGeometry(ctx *Context, buildNode planner.Node, buildWidth 
 		buildRows = o.plan.OuterRows
 	}
 	if buildRows <= 0 {
-		buildRows = float64(planner.EstimateRows(buildNode))
+		buildRows = float64(optimizer.EstimateRows(buildNode))
 	}
 	avgVarBytes := o.plan.AvgVarBytes
 	return hashsize.Choose(buildRows, buildWidth, avgVarBytes,
@@ -723,7 +723,7 @@ func (o *joinOp) buildGeometry(ctx *Context, buildNode planner.Node, buildWidth 
 //
 // Not called for the FOR-UPDATE ctid build (buildHashRightWithCTID): that path
 // materialises its rows first and its result sets are small by construction.
-func (o *joinOp) presizeLazyHash(ctx *Context, buildNode planner.Node, buildWidth int, buildIsLeft bool) {
+func (o *joinOp) presizeLazyHash(ctx *Context, buildNode optimizer.Node, buildWidth int, buildIsLeft bool) {
 	if buildNode == nil || o.lazyHash != nil || o.lazyIntHash != nil {
 		return
 	}
@@ -981,7 +981,7 @@ func (o *joinOp) buildHashRightWithCTID(ctx *Context, scanLeaf currentTIDProvide
 // evalHashKey evaluates one side of the hash-join key against a
 // padded row and returns its canonical key string. The boolean
 // is false when the key evaluated to NULL (never matches).
-func (o *joinOp) evalHashKey(keyExpr planner.Expr, row Row) (string, bool, error) {
+func (o *joinOp) evalHashKey(keyExpr optimizer.Expr, row Row) (string, bool, error) {
 	v, err := evalExpr(keyExpr, row, o.ctx)
 	if err != nil {
 		return "", false, err
@@ -995,7 +995,7 @@ func (o *joinOp) evalHashKey(keyExpr planner.Expr, row Row) (string, bool, error
 // evalHashKeyDatum is evalHashKey but returns the key Datum instead of its
 // string form, so the int64 fast-path can try datumToInt64Key before
 // falling back to datumKey. ok is false for a NULL key.
-func (o *joinOp) evalHashKeyDatum(keyExpr planner.Expr, row Row) (Datum, bool, error) {
+func (o *joinOp) evalHashKeyDatum(keyExpr optimizer.Expr, row Row) (Datum, bool, error) {
 	v, err := evalExpr(keyExpr, row, o.ctx)
 	if err != nil {
 		return Datum{}, false, err
@@ -1431,7 +1431,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 	//     every x (even NULL x) — emit every probe row unconditionally.
 	//   - subquery produced a NULL key: `x NOT IN (...)` is
 	//     NULL/false for every x — emit nothing.
-	if o.plan.Type == planner.JoinTypeAnti && o.plan.NullAware {
+	if o.plan.Type == optimizer.JoinTypeAnti && o.plan.NullAware {
 		if o.antiBuildHasNull {
 			return nil, EOF
 		}
@@ -1688,7 +1688,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 		// excluded, not kept. The build-empty/build-has-NULL cases
 		// were already short-circuited above this loop, so reaching
 		// here means the subquery is non-empty and NULL-free.
-		if !ok && o.plan.Type == planner.JoinTypeAnti && o.plan.NullAware {
+		if !ok && o.plan.Type == optimizer.JoinTypeAnti && o.plan.NullAware {
 			continue
 		}
 		//
@@ -1708,7 +1708,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 		// hash match AND Predicate=TRUE. The slot composition
 		// already covers both Semi/Anti and INNER predicate eval
 		// — re-bind the build slot per candidate match.
-		if o.plan.Type == planner.JoinTypeSemi || o.plan.Type == planner.JoinTypeAnti {
+		if o.plan.Type == optimizer.JoinTypeSemi || o.plan.Type == optimizer.JoinTypeAnti {
 			anyMatch := false
 			if ok && len(matches) > 0 {
 				// Probe source already bound by bindProbe.
@@ -1724,7 +1724,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 					}
 				}
 			}
-			if o.plan.Type == planner.JoinTypeSemi {
+			if o.plan.Type == optimizer.JoinTypeSemi {
 				if !anyMatch {
 					continue
 				}
@@ -1800,13 +1800,13 @@ func (o *joinOp) Close() error {
 	return errR
 }
 
-func (o *joinOp) Schema() planner.Schema { return o.schema }
+func (o *joinOp) Schema() optimizer.Schema { return o.schema }
 
 // aggregateOp performs grouped aggregation in memory.
 type aggregateOp struct {
-	plan   *planner.Aggregate
+	plan   *optimizer.Aggregate
 	child  Operator
-	schema planner.Schema
+	schema optimizer.Schema
 
 	ctx  *Context
 	rows []Row
@@ -1933,7 +1933,7 @@ type aggRuntime struct {
 	distinctUserAggRows [][]Datum // inner: [sortKey0..., arg0, arg1, ...]
 }
 
-func newAggregateOp(plan *planner.Aggregate, child Operator) *aggregateOp {
+func newAggregateOp(plan *optimizer.Aggregate, child Operator) *aggregateOp {
 	return &aggregateOp{plan: plan, child: child, schema: plan.Output()}
 }
 
@@ -1945,10 +1945,10 @@ func (o *aggregateOp) Open(ctx *Context) error {
 	// the child is a Gather and opening it launches the workers that write to
 	// it. Registering afterwards would be a race with the first worker.
 	var accum *aggPartialAccum
-	if o.plan.Mode == planner.AggModeFinal && o.plan.PartialSource != nil {
+	if o.plan.Mode == optimizer.AggModeFinal && o.plan.PartialSource != nil {
 		accum = newAggPartialAccum()
 		if ctx.PartialAggStates == nil {
-			ctx.PartialAggStates = map[*planner.Aggregate]*aggPartialAccum{}
+			ctx.PartialAggStates = map[*optimizer.Aggregate]*aggPartialAccum{}
 		}
 		ctx.PartialAggStates[o.plan.PartialSource] = accum
 		defer delete(ctx.PartialAggStates, o.plan.PartialSource)
@@ -1976,7 +1976,7 @@ func (o *aggregateOp) Open(ctx *Context) error {
 	// by the GROUP BY keys, so openSorted collapses runs of equal keys instead
 	// of building the groups hash map. Grouping sets, ungrouped
 	// (len(GroupExprs)==0) and parallel split nodes always keep the hash path.
-	if o.plan.Strategy == planner.AggStrategySorted && o.plan.GroupingSets == nil && len(o.plan.GroupExprs) > 0 && o.plan.Mode == planner.AggModeSimple {
+	if o.plan.Strategy == optimizer.AggStrategySorted && o.plan.GroupingSets == nil && len(o.plan.GroupExprs) > 0 && o.plan.Mode == optimizer.AggModeSimple {
 		return o.openSorted(ctx)
 	}
 
@@ -2105,7 +2105,7 @@ func (o *aggregateOp) Open(ctx *Context) error {
 	}
 
 	switch o.plan.Mode {
-	case planner.AggModePartial:
+	case optimizer.AggModePartial:
 		// Publish this worker's groups and emit NOTHING. The Finalize node
 		// supplies every output row from the accumulator, so a Partial node
 		// returning zero rows is by construction, not a failure — see the
@@ -2130,7 +2130,7 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		o.rows = nil
 		return nil
 
-	case planner.AggModeFinal:
+	case optimizer.AggModeFinal:
 		if accum == nil {
 			return &ExecError{
 				Code:    "XX000",
@@ -2537,7 +2537,7 @@ func sameGroupKey(a, b []string) bool {
 	return true
 }
 
-func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot TupleSlot) error {
+func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slot TupleSlot) error {
 	// FILTER (WHERE condition): skip this row if the condition is false/null.
 	// M0097-0007.
 	if call.Filter != nil {
@@ -3162,7 +3162,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 // the accumulated pieces later. A key that fails to evaluate becomes NULL
 // rather than aborting the aggregate — the pre-existing array_agg behaviour
 // this was factored out of.
-func evalAggOrderByKeys(orderBy []planner.SortKey, slot TupleSlot, ctx *Context) []Datum {
+func evalAggOrderByKeys(orderBy []optimizer.SortKey, slot TupleSlot, ctx *Context) []Datum {
 	if len(orderBy) == 0 {
 		return nil
 	}
@@ -3190,7 +3190,7 @@ func evalAggOrderByKeys(orderBy []planner.SortKey, slot TupleSlot, ctx *Context)
 // Shared by array_agg and string_agg — the two ordering-sensitive built-ins in
 // finishAgg's switch. They diverged once already (string_agg simply ignored
 // ORDER BY, M0125-0019); one comparator keeps them from diverging again.
-func aggOrderBySortedIdx(keys [][]Datum, orderBy []planner.SortKey) []int {
+func aggOrderBySortedIdx(keys [][]Datum, orderBy []optimizer.SortKey) []int {
 	idx := make([]int, len(keys))
 	for i := range idx {
 		idx[i] = i
@@ -3240,7 +3240,7 @@ func aggOrderBySortedIdx(keys [][]Datum, orderBy []planner.SortKey) []int {
 // withinGroupTupleLT returns true if row < directArgs in the hypothetical-set ordering.
 // It performs lexicographic comparison of the row's sort-key tuple against directArgs
 // respecting each sort key's ASC/DESC direction and NULL handling.
-func withinGroupTupleLT(row []Datum, directArgs []Datum, sortKeys []planner.SortKey) bool {
+func withinGroupTupleLT(row []Datum, directArgs []Datum, sortKeys []optimizer.SortKey) bool {
 	n := len(sortKeys)
 	if n > len(row) {
 		n = len(row)
@@ -3530,7 +3530,7 @@ func aggDatumToFloat64(d Datum) float64 {
 // that case, so the error must reach the client rather than be turned into a
 // stale state or a NULL. Built-in finalization cannot fail, which is why the
 // bulk of the work lives in finishBuiltinAgg with no error channel at all.
-func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) (Datum, error) {
+func (o *aggregateOp) finishAgg(st aggRuntime, call optimizer.AggregateCall) (Datum, error) {
 	// Handle ordered-set aggregates (WITHIN GROUP) before regular handling. M0097-0035.
 	if call.WithinGroup {
 		return finishWithinGroupAgg(st, call, o.ctx), nil
@@ -3679,7 +3679,7 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) (Datu
 // finishBuiltinAgg finalizes a built-in aggregate. Split out of finishAgg by
 // M0125-0025 so that adding the error channel the user-defined path needs did
 // not have to touch this body's ~100 returns, none of which can fail.
-func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call planner.AggregateCall) Datum {
+func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCall) Datum {
 	switch strings.ToLower(call.Name) {
 	case "count":
 		return Datum{Kind: KindInt, Int: st.count}
@@ -4029,7 +4029,7 @@ func (o *aggregateOp) Close() error {
 	return o.child.Close()
 }
 
-func (o *aggregateOp) Schema() planner.Schema { return o.schema }
+func (o *aggregateOp) Schema() optimizer.Schema { return o.schema }
 
 func drainRows(op Operator) ([]Row, error) {
 	return drainRowsCtx(op, nil)
@@ -4472,7 +4472,7 @@ func formatAvgInt8(sum, count int64) string {
 // The st.withinGroupElems slice contains one []Datum per input row,
 // where each entry holds the sort-key value(s) from WithinGroupOrderBy.
 // For single-key cases (most common), each inner slice has one element.
-func finishWithinGroupAgg(st aggRuntime, call planner.AggregateCall, ctx *Context) Datum {
+func finishWithinGroupAgg(st aggRuntime, call optimizer.AggregateCall, ctx *Context) Datum {
 	name := strings.ToLower(call.Name)
 	elems := st.withinGroupElems
 	if len(elems) == 0 {
@@ -4968,7 +4968,7 @@ func percentileDiscOneFloat(orderedVals []Datum, n int, pf float64) Datum {
 }
 
 
-func evalExprFromRow(expr planner.Expr, row Row, ctx *Context) (Datum, error) {
+func evalExprFromRow(expr optimizer.Expr, row Row, ctx *Context) (Datum, error) {
 	slot := SlotFromRow(nil, row)
 	return evalExprSlot(expr, slot, ctx)
 }

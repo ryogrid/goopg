@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 func TestCompatWindowRowNumberPartitionOrder(t *testing.T) {
@@ -504,7 +504,7 @@ func TestCompatWindowNthValueOutOfFrameAndInvalidN(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse(%q): %v", sql, err)
 	}
-	plan, err := planner.Plan(stmts[0], ctx.Catalog)
+	plan, err := optimizer.Plan(stmts[0], ctx.Catalog)
 	if err != nil {
 		t.Fatalf("Plan(%q): %v", sql, err)
 	}
@@ -644,7 +644,7 @@ func TestCompatWindowNtileInvalidArgument(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse(%q): %v", sql, err)
 	}
-	plan, err := planner.Plan(stmts[0], ctx.Catalog)
+	plan, err := optimizer.Plan(stmts[0], ctx.Catalog)
 	if err != nil {
 		t.Fatalf("Plan(%q): %v", sql, err)
 	}
@@ -956,7 +956,7 @@ func TestCompatWindowFrameNegativeOffsetRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse(%q): %v", sql, err)
 	}
-	plan, err := planner.Plan(stmts[0], ctx.Catalog)
+	plan, err := optimizer.Plan(stmts[0], ctx.Catalog)
 	if err != nil {
 		t.Fatalf("Plan(%q): %v", sql, err)
 	}

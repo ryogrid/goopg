@@ -23,13 +23,13 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
-func batchSchema(prefix string, n int) planner.Schema {
-	s := make(planner.Schema, 0, n)
+func batchSchema(prefix string, n int) optimizer.Schema {
+	s := make(optimizer.Schema, 0, n)
 	for i := 0; i < n; i++ {
-		s = append(s, planner.SchemaColumn{Name: fmt.Sprintf("%s%d", prefix, i)})
+		s = append(s, optimizer.SchemaColumn{Name: fmt.Sprintf("%s%d", prefix, i)})
 	}
 	return s
 }
@@ -39,13 +39,13 @@ func batchSchema(prefix string, n int) planner.Schema {
 // estRows drives planner.EstimateRows, which is what chooses the geometry —
 // keeping it separate from the row slices is deliberate, since an estimate
 // that disagrees with reality is exactly what makes nbatch grow mid-build.
-func batchJoinPlan(leftWidth, estLeft, estRight int) *planner.Join {
-	col := func(idx int) *planner.ColumnRef {
-		return &planner.ColumnRef{Index: idx, Type: catalog.Type{Name: "int4"}}
+func batchJoinPlan(leftWidth, estLeft, estRight int) *optimizer.Join {
+	col := func(idx int) *optimizer.ColumnRef {
+		return &optimizer.ColumnRef{Index: idx, Type: catalog.Type{Name: "int4"}}
 	}
-	return &planner.Join{
-		Type:     planner.JoinTypeInner,
-		Algo:     planner.JoinAlgoHash,
+	return &optimizer.Join{
+		Type:     optimizer.JoinTypeInner,
+		Algo:     optimizer.JoinAlgoHash,
 		LeftKey:  col(0),
 		RightKey: col(leftWidth),
 		Left:     valuesNode(estLeft),
@@ -56,7 +56,7 @@ func batchJoinPlan(leftWidth, estLeft, estRight int) *planner.Join {
 // runBatchJoin opens a joinOp over the given rows under workMem and returns
 // the emitted tuples rendered as strings, plus the batch state (nil when the
 // join never batched).
-func runBatchJoin(t *testing.T, plan *planner.Join, probeRows, buildRows []Row, lw, rw int, workMem int64) ([]string, *hashBatchState) {
+func runBatchJoin(t *testing.T, plan *optimizer.Join, probeRows, buildRows []Row, lw, rw int, workMem int64) ([]string, *hashBatchState) {
 	t.Helper()
 	left := &rowsOp{rows: probeRows, schema: batchSchema("l", lw)}
 	right := &rowsOp{rows: buildRows, schema: batchSchema("r", rw)}
@@ -224,8 +224,8 @@ func TestHashJoinSpillOnStringKeys(t *testing.T) {
 	}
 	buildRows, probeRows := mk(4000, "b"), mk(2500, "p")
 	plan := batchJoinPlan(lw, len(probeRows), len(buildRows))
-	plan.LeftKey.(*planner.ColumnRef).Type = catalog.Type{Name: "text"}
-	plan.RightKey.(*planner.ColumnRef).Type = catalog.Type{Name: "text"}
+	plan.LeftKey.(*optimizer.ColumnRef).Type = catalog.Type{Name: "text"}
+	plan.RightKey.(*optimizer.ColumnRef).Type = catalog.Type{Name: "text"}
 
 	want, _ := runBatchJoin(t, plan, probeRows, buildRows, lw, rw, 0)
 	got, bs := runBatchJoin(t, plan, probeRows, buildRows, lw, rw, 512<<10)
@@ -303,18 +303,18 @@ func TestBatchingDeclinesShapesItDoesNotYetSupport(t *testing.T) {
 	probeRows := intKeyRows(2000, 700, "p")
 	for _, tc := range []struct {
 		name  string
-		mutet func(*planner.Join)
+		mutet func(*optimizer.Join)
 	}{
 		// The build-left outer join used to be declined here: it fills from
 		// the BUILD side, which needs the post-replay unmatched sweep.
 		// M0127-P4.2 landed that sweep, so the shape now batches like any
 		// other — TestHashOuterFillSweepsEveryBatch is its per-batch identity
 		// test and TestBuildOnlyBatchIsNotSkippedWhenBuildFills its skip rule.
-		{"composite key", func(p *planner.Join) {
-			col := func(i int) *planner.ColumnRef {
-				return &planner.ColumnRef{Index: i, Type: catalog.Type{Name: "int4"}}
+		{"composite key", func(p *optimizer.Join) {
+			col := func(i int) *optimizer.ColumnRef {
+				return &optimizer.ColumnRef{Index: i, Type: catalog.Type{Name: "int4"}}
 			}
-			p.HashKeys = []planner.JoinKeyPair{
+			p.HashKeys = []optimizer.JoinKeyPair{
 				{Left: col(0), Right: col(lw)},
 				{Left: col(1), Right: col(lw + 1)},
 			}
@@ -352,12 +352,12 @@ func TestFillingJoinsKeepOuterOnlyBatches(t *testing.T) {
 
 	for _, tc := range []struct {
 		name string
-		typ  planner.JoinType
+		typ  optimizer.JoinType
 	}{
-		{"inner", planner.JoinTypeInner},
-		{"semi", planner.JoinTypeSemi},
-		{"left", planner.JoinTypeLeft},
-		{"anti", planner.JoinTypeAnti},
+		{"inner", optimizer.JoinTypeInner},
+		{"semi", optimizer.JoinTypeSemi},
+		{"left", optimizer.JoinTypeLeft},
+		{"anti", optimizer.JoinTypeAnti},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			plan := batchJoinPlan(lw, len(probeRows), 200000)
@@ -391,8 +391,8 @@ func TestFillingJoinsKeepOuterOnlyBatches(t *testing.T) {
 // directly, including the two (rules 2 and 3) that only matter after a doubling
 // and are therefore invisible in any fixture whose estimate was right.
 func TestBatchSkipRulesRespectFillAndReassignment(t *testing.T) {
-	skippable := func(typ planner.JoinType, buildLeft, hasInner, hasOuter bool, nbatch, orig, outstart int) bool {
-		o := &joinOp{plan: &planner.Join{Type: typ, Algo: planner.JoinAlgoHash, BuildLeft: buildLeft}}
+	skippable := func(typ optimizer.JoinType, buildLeft, hasInner, hasOuter bool, nbatch, orig, outstart int) bool {
+		o := &joinOp{plan: &optimizer.Join{Type: typ, Algo: optimizer.JoinAlgoHash, BuildLeft: buildLeft}}
 		bs := &hashBatchState{
 			nbatch: nbatch, origNBatch: orig, nbatchOutstart: outstart,
 			inner: make([]*joinBatchFile, nbatch), outer: make([]*joinBatchFile, nbatch),
@@ -407,20 +407,20 @@ func TestBatchSkipRulesRespectFillAndReassignment(t *testing.T) {
 	}
 	cases := []struct {
 		name                          string
-		typ                           planner.JoinType
+		typ                           optimizer.JoinType
 		buildLeft, hasInner, hasOuter bool
 		nbatch, orig, outstart        int
 		want                          bool
 	}{
-		{"both sides present", planner.JoinTypeInner, false, true, true, 4, 4, 4, false},
-		{"empty batch", planner.JoinTypeInner, false, false, false, 4, 4, 4, true},
-		{"inner: outer-only is dead", planner.JoinTypeInner, false, false, true, 4, 4, 4, true},
-		{"semi: outer-only is dead", planner.JoinTypeSemi, false, false, true, 4, 4, 4, true},
-		{"left: outer-only fills", planner.JoinTypeLeft, false, false, true, 4, 4, 4, false},
-		{"anti: outer-only fills", planner.JoinTypeAnti, false, false, true, 4, 4, 4, false},
-		{"left: inner-only needs no sweep yet", planner.JoinTypeLeft, false, true, false, 4, 4, 4, true},
-		{"rule 2: inner file predates a doubling", planner.JoinTypeInner, false, true, false, 8, 4, 8, false},
-		{"rule 3: outer file predates a doubling", planner.JoinTypeInner, false, false, true, 8, 8, 4, false},
+		{"both sides present", optimizer.JoinTypeInner, false, true, true, 4, 4, 4, false},
+		{"empty batch", optimizer.JoinTypeInner, false, false, false, 4, 4, 4, true},
+		{"inner: outer-only is dead", optimizer.JoinTypeInner, false, false, true, 4, 4, 4, true},
+		{"semi: outer-only is dead", optimizer.JoinTypeSemi, false, false, true, 4, 4, 4, true},
+		{"left: outer-only fills", optimizer.JoinTypeLeft, false, false, true, 4, 4, 4, false},
+		{"anti: outer-only fills", optimizer.JoinTypeAnti, false, false, true, 4, 4, 4, false},
+		{"left: inner-only needs no sweep yet", optimizer.JoinTypeLeft, false, true, false, 4, 4, 4, true},
+		{"rule 2: inner file predates a doubling", optimizer.JoinTypeInner, false, true, false, 8, 4, 8, false},
+		{"rule 3: outer file predates a doubling", optimizer.JoinTypeInner, false, false, true, 8, 8, 4, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -451,7 +451,7 @@ func TestSharedHashBuildDeclinesWhenItWouldSpill(t *testing.T) {
 	buildRows := intKeyRows(4000, 700, "b")
 	probeRows := intKeyRows(2000, 700, "p")
 
-	prebuild := func(t *testing.T, estRight int, workMem int64) map[*planner.Join]*sharedHashBuild {
+	prebuild := func(t *testing.T, estRight int, workMem int64) map[*optimizer.Join]*sharedHashBuild {
 		t.Helper()
 		plan := batchJoinPlan(lw, len(probeRows), estRight)
 		tree := newJoinOp(plan,

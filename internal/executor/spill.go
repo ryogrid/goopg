@@ -12,7 +12,7 @@ import (
 	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/hashsize"
 	"github.com/goopg/goopg/internal/pgtemp"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // spillWriter writes Row slices to a temporary file using a binary
@@ -651,11 +651,11 @@ func drainRowsToOp(op Operator) (Operator, error) {
 type rowsOp struct {
 	rows   []Row
 	idx    int
-	schema planner.Schema
+	schema optimizer.Schema
 }
 
 func (o *rowsOp) Open(*Context) error    { o.idx = 0; return nil }
-func (o *rowsOp) Schema() planner.Schema { return o.schema } // schema comes from joinOp/upstream
+func (o *rowsOp) Schema() optimizer.Schema { return o.schema } // schema comes from joinOp/upstream
 func (o *rowsOp) Next() (TupleSlot, error) {
 	if o.idx >= len(o.rows) {
 		return nil, EOF
@@ -678,7 +678,7 @@ type spillOp struct {
 }
 
 func (o *spillOp) Open(*Context) error    { return nil }
-func (o *spillOp) Schema() planner.Schema { return nil }
+func (o *spillOp) Schema() optimizer.Schema { return nil }
 
 func (o *spillOp) Next() (TupleSlot, error) {
 	row, err := o.r.ReadRowInto(o.out)

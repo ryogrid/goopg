@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // TestTemplateCloneEquivalence is the correctness guard of
@@ -136,11 +136,11 @@ func TestTemplateCloneEquivalence(t *testing.T) {
 		t.Fatal("WAL segment differs from template outside the long-header sysid")
 	}
 	directSeg := readFileBytes(t, filepath.Join(direct.dataDir, "pg_wal", bootstrapWALSegment))
-	dh, err := wal.DecodeXLogLongPageHeader(directSeg)
+	dh, err := xlog.DecodeXLogLongPageHeader(directSeg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ch, err := wal.DecodeXLogLongPageHeader(cloneSeg)
+	ch, err := xlog.DecodeXLogLongPageHeader(cloneSeg)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // runExplainRows wraps the parser → planner → executor pipeline
@@ -20,7 +20,7 @@ func runExplainRows(t *testing.T, ctx *Context, sql string) []string {
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	plan, err := planner.Plan(stmts[0], ctx.Catalog)
+	plan, err := optimizer.Plan(stmts[0], ctx.Catalog)
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}

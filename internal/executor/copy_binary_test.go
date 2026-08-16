@@ -7,7 +7,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // TestCopyBinaryRoundTrip is the DoD test for M0049-0004.
@@ -136,11 +136,11 @@ func TestCopyBinaryRoundTripViaExecutor(t *testing.T) {
 	// M0129-S8.3: advance the command counter so RunCopyTo sees the seed rows.
 	advanceStmtCounter(ctx)
 
-	plan := &planner.Copy{
-		Direction:   planner.CopyTo,
+	plan := &optimizer.Copy{
+		Direction:   optimizer.CopyTo,
 		Table:       tbl,
 		ColumnIndex: []int{0, 1},
-		Endpoint:    planner.CopyEndpointStdout,
+		Endpoint:    optimizer.CopyEndpointStdout,
 		Options:     []parser.CopyOption{{Name: "binary", Bool: true}},
 	}
 

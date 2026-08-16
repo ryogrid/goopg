@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -14,11 +14,11 @@ const fixedSeed = 0x9e3779b97f4a7c15
 
 // makeLeafEntries builds n distinct (key, heap TID) entries: key = int4(i),
 // TID = (i, 1), for i in [0, n).
-func makeLeafEntries(n int) []btree.LeafEntry {
-	out := make([]btree.LeafEntry, 0, n)
+func makeLeafEntries(n int) []nbtree.LeafEntry {
+	out := make([]nbtree.LeafEntry, 0, n)
 	for i := 0; i < n; i++ {
-		out = append(out, btree.LeafEntry{
-			Key: btree.EncodeInt4(int32(i)),
+		out = append(out, nbtree.LeafEntry{
+			Key: nbtree.EncodeInt4(int32(i)),
 			TID: storage.ItemPointer{Block: storage.BlockNumber(i), Offset: 1},
 		})
 	}
@@ -53,7 +53,7 @@ func TestHeapAllIndexed_DetectsMissingHeapTuple(t *testing.T) {
 
 	heap := makeLeafEntries(n)
 	// Index has every entry except `missing`.
-	index := make([]btree.LeafEntry, 0, n-1)
+	index := make([]nbtree.LeafEntry, 0, n-1)
 	for i, e := range heap {
 		if i == missing {
 			continue
@@ -82,12 +82,12 @@ func TestHeapAllIndexed_DetectsMissingHeapTuple(t *testing.T) {
 // and must be reported. If the fingerprint ignored the TID this would slip
 // through as a false negative.
 func TestHeapAllIndexed_DistinguishesByTID(t *testing.T) {
-	index := []btree.LeafEntry{
-		{Key: btree.EncodeInt4(7), TID: storage.ItemPointer{Block: 3, Offset: 1}},
+	index := []nbtree.LeafEntry{
+		{Key: nbtree.EncodeInt4(7), TID: storage.ItemPointer{Block: 3, Offset: 1}},
 	}
 	// Same key, different TID — not the same logical index entry.
-	heap := []btree.LeafEntry{
-		{Key: btree.EncodeInt4(7), TID: storage.ItemPointer{Block: 9, Offset: 4}},
+	heap := []nbtree.LeafEntry{
+		{Key: nbtree.EncodeInt4(7), TID: storage.ItemPointer{Block: 9, Offset: 4}},
 	}
 
 	reports := VerifyBtreeHeapAllIndexed(index, heap, "idx", "tbl", fixedSeed)
@@ -131,9 +131,9 @@ func TestHeapAllIndexed_EmptyHeap(t *testing.T) {
 // shared-key entry from the index flags exactly the one heap tuple whose TID went
 // missing, while the siblings on the same key stay healthy.
 func TestHeapAllIndexed_SharedKeyDistinctTIDs(t *testing.T) {
-	key := btree.EncodeInt4(2)
+	key := nbtree.EncodeInt4(2)
 	// Three heap rows indexed under one shared key (a posting list of 3 TIDs).
-	heap := []btree.LeafEntry{
+	heap := []nbtree.LeafEntry{
 		{Key: key, TID: storage.ItemPointer{Block: 0, Offset: 2}},
 		{Key: key, TID: storage.ItemPointer{Block: 0, Offset: 3}},
 		{Key: key, TID: storage.ItemPointer{Block: 1, Offset: 1}},
@@ -145,7 +145,7 @@ func TestHeapAllIndexed_SharedKeyDistinctTIDs(t *testing.T) {
 	}
 
 	// Drop the middle TID from the index: exactly that heap tuple is flagged.
-	index := []btree.LeafEntry{heap[0], heap[2]}
+	index := []nbtree.LeafEntry{heap[0], heap[2]}
 	reports := VerifyBtreeHeapAllIndexed(index, heap, "idx", "tbl", fixedSeed)
 	if len(reports) != 1 {
 		t.Fatalf("dropping one shared-key TID: got %d reports, want 1", len(reports))

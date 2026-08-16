@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goopg/goopg/internal/auth"
+	"github.com/goopg/goopg/internal/libpq/auth"
 )
 
 // TestResolveAuthMethods exercises the port of initdb's auth-method option

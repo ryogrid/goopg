@@ -19,7 +19,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // newNLJoinFixture builds outr/innr so that one outer row has TWO
@@ -71,8 +71,8 @@ func mustUseNLSemiAnti(t *testing.T, ctx *Context, sql string) {
 func TestNLSemiJoinEmitOnce(t *testing.T) {
 	ctx, cleanup := newNLJoinFixture(t)
 	defer cleanup()
-	planner.SetSubqueryUnnestEnabled(true)
-	defer planner.SetSubqueryUnnestEnabled(true)
+	optimizer.SetSubqueryUnnestEnabled(true)
+	defer optimizer.SetSubqueryUnnestEnabled(true)
 
 	const sql = "SELECT a FROM outr WHERE EXISTS (SELECT 1 FROM innr WHERE innr.c > outr.b) ORDER BY a"
 	mustUseNLSemiAnti(t, ctx, sql)
@@ -94,8 +94,8 @@ func TestNLSemiJoinEmitOnce(t *testing.T) {
 func TestNLAntiJoinNullPredicate(t *testing.T) {
 	ctx, cleanup := newNLJoinFixture(t)
 	defer cleanup()
-	planner.SetSubqueryUnnestEnabled(true)
-	defer planner.SetSubqueryUnnestEnabled(true)
+	optimizer.SetSubqueryUnnestEnabled(true)
+	defer optimizer.SetSubqueryUnnestEnabled(true)
 
 	const sql = "SELECT a FROM outr WHERE NOT EXISTS (SELECT 1 FROM innr WHERE innr.c > outr.b) ORDER BY a"
 	mustUseNLSemiAnti(t, ctx, sql)
@@ -130,8 +130,8 @@ func TestScalarResidualDuplicateOuterOrdinality(t *testing.T) {
 			t.Fatalf("fixture %q: %v", stmt, err)
 		}
 	}
-	planner.SetSubqueryUnnestEnabled(true)
-	defer planner.SetSubqueryUnnestEnabled(true)
+	optimizer.SetSubqueryUnnestEnabled(true)
+	defer optimizer.SetSubqueryUnnestEnabled(true)
 
 	const sql = "SELECT d1.a FROM d1 WHERE d1.b >= (" +
 		"SELECT min(y.b) FROM d2 y WHERE y.a = d1.a AND y.b <= d1.b) ORDER BY a"

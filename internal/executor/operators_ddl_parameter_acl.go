@@ -5,7 +5,7 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/config"
+	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -54,7 +54,7 @@ func (o *ddlOp) checkParameterACLName(name string) error {
 			return nil
 		}
 	}
-	if config.IsCustomGUCName(name) {
+	if misc.IsCustomGUCName(name) {
 		return nil
 	}
 	if strings.Contains(name, ".") {

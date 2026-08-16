@@ -27,14 +27,14 @@ import (
 
 	"github.com/goopg/goopg/internal/amcheck"
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
 type verifyHeapamOp struct {
-	plan *planner.VerifyHeapam
+	plan *optimizer.VerifyHeapam
 	rows []Row
 	idx  int
 
@@ -47,11 +47,11 @@ type verifyHeapamOp struct {
 	outerSlot SlotView
 }
 
-func newVerifyHeapamOp(p *planner.VerifyHeapam) *verifyHeapamOp {
+func newVerifyHeapamOp(p *optimizer.VerifyHeapam) *verifyHeapamOp {
 	return &verifyHeapamOp{plan: p}
 }
 
-func (o *verifyHeapamOp) Schema() planner.Schema { return o.plan.Output() }
+func (o *verifyHeapamOp) Schema() optimizer.Schema { return o.plan.Output() }
 func (o *verifyHeapamOp) Close() error           { return nil }
 
 // BindLateralOuter binds the outer row's slot for lateral arg evaluation.
@@ -201,7 +201,7 @@ func (o *verifyHeapamOp) Next() (TupleSlot, error) {
 // evalBlockArg evaluates an optional int8 startblock/endblock argument. It
 // returns (value, present, error): present is false for a nil argument or a SQL
 // NULL (both mean "whole relation" in VerifyHeapRelation).
-func (o *verifyHeapamOp) evalBlockArg(ctx *Context, e planner.Expr) (int64, bool, error) {
+func (o *verifyHeapamOp) evalBlockArg(ctx *Context, e optimizer.Expr) (int64, bool, error) {
 	if e == nil {
 		return 0, false, nil
 	}
@@ -238,11 +238,11 @@ func verifyHeapamXidStatus(ctx *Context) amcheck.XidStatusFunc {
 			return amcheck.XidStatusCurrent
 		}
 		switch mgr.ClassifyXID(tid) {
-		case mvcc.XidVisInProgress:
+		case transam.XidVisInProgress:
 			return amcheck.XidStatusInProgress
-		case mvcc.XidVisCommitted:
+		case transam.XidVisCommitted:
 			return amcheck.XidStatusCommitted
-		case mvcc.XidVisAborted:
+		case transam.XidVisAborted:
 			return amcheck.XidStatusAborted
 		default:
 			return amcheck.XidStatusUnknown

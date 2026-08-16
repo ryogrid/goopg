@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -32,7 +32,7 @@ func allVisible() HeapVisibilityFunc {
 // no-false-positive gate for the tier.
 func TestVerifyBtreeUnique_DistinctKeysClean(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
-		btree.MetaBlock: makeMetaWithRoot(t, 1),
+		nbtree.MetaBlock: makeMetaWithRoot(t, 1),
 		1: makeLeafPage(t, none,
 			le{k(1), 10, 1},
 			le{k(2), 10, 2},
@@ -51,7 +51,7 @@ func TestVerifyBtreeUnique_DistinctKeysClean(t *testing.T) {
 // violation upstream's bt_entry_unique_check reports.
 func TestVerifyBtreeUnique_DuplicateBothVisible(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
-		btree.MetaBlock: makeMetaWithRoot(t, 1),
+		nbtree.MetaBlock: makeMetaWithRoot(t, 1),
 		1: makeLeafPage(t, none,
 			le{k(1), 10, 1},
 			le{k(1), 10, 7},
@@ -82,7 +82,7 @@ func TestVerifyBtreeUnique_DuplicateBothVisible(t *testing.T) {
 // would make bt_index_check --checkunique fire on healthy tables.
 func TestVerifyBtreeUnique_DuplicateOneVisibleClean(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
-		btree.MetaBlock: makeMetaWithRoot(t, 1),
+		nbtree.MetaBlock: makeMetaWithRoot(t, 1),
 		1: makeLeafPage(t, none,
 			le{k(1), 10, 1},
 			le{k(1), 10, 7}),
@@ -102,7 +102,7 @@ func TestVerifyBtreeUnique_DuplicateOneVisibleClean(t *testing.T) {
 // of upstream's BtreeLastVisibleEntry.
 func TestVerifyBtreeUnique_DuplicateAcrossLeafBoundary(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
-		btree.MetaBlock: makeMetaWithRoot(t, 1),
+		nbtree.MetaBlock: makeMetaWithRoot(t, 1),
 		1: makeInternalPage(t, 1, none,
 			dl{nil, 2},
 			dl{k(5), 3}),
@@ -134,7 +134,7 @@ func TestVerifyBtreeUnique_DuplicateAcrossLeafBoundary(t *testing.T) {
 // which is a different tier's finding — this tier must not double-report it.)
 func TestVerifyBtreeUnique_RunResetsOnKeyChange(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
-		btree.MetaBlock: makeMetaWithRoot(t, 1),
+		nbtree.MetaBlock: makeMetaWithRoot(t, 1),
 		1: makeLeafPage(t, none,
 			le{k(1), 10, 1},
 			le{k(2), 10, 2},
@@ -155,7 +155,7 @@ func TestVerifyBtreeUnique_RunResetsOnKeyChange(t *testing.T) {
 // governs the uniqueness tier exactly as it governs item order.
 func TestVerifyBtreeUnique_HonoursKeyComparator(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
-		btree.MetaBlock: makeMetaWithRoot(t, 1),
+		nbtree.MetaBlock: makeMetaWithRoot(t, 1),
 		1: makeLeafPage(t, none,
 			le{k(1), 10, 1},
 			le{k(2), 10, 2}),
@@ -174,7 +174,7 @@ func TestVerifyBtreeUnique_HonoursKeyComparator(t *testing.T) {
 // visibility function is a caller error rather than a silent pass.
 func TestVerifyBtreeUnique_EdgeCases(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
-		btree.MetaBlock: makeMetaPage(t, btree.BTreeMagic, btree.BTreeVersion),
+		nbtree.MetaBlock: makeMetaPage(t, nbtree.BTreeMagic, nbtree.BTreeVersion),
 	}
 	got, err := VerifyBtreeUnique(mapSource(pages), "uidx", blobFmt, nil, allVisible())
 	if err != nil || len(got) != 0 {

@@ -3,7 +3,7 @@ package executor
 import (
 	"testing"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // Stage 9 (S2c, design bundle D4.2): the subPlanHandle engine. These
@@ -217,17 +217,17 @@ func TestCloseSubPlansIdempotent(t *testing.T) {
 
 // TestClassifySubPlanKinds pins the classification table directly.
 func TestClassifySubPlanKinds(t *testing.T) {
-	idx := &planner.IndexScan{}
+	idx := &optimizer.IndexScan{}
 	cases := []struct {
 		name string
-		plan planner.Node
+		plan optimizer.Node
 		kind int
 	}{
 		{"bare index scan", idx, rescanReOpen},
-		{"filter over index", &planner.Filter{Child: idx}, rescanReOpen},
-		{"sort forces close+open", &planner.Sort{Child: idx}, rescanCloseOpen},
-		{"lock rows forces close+open", &planner.LockRows{Child: idx}, rescanCloseOpen},
-		{"join forces close+open", &planner.Join{Left: idx, Right: &planner.SeqScan{}}, rescanCloseOpen},
+		{"filter over index", &optimizer.Filter{Child: idx}, rescanReOpen},
+		{"sort forces close+open", &optimizer.Sort{Child: idx}, rescanCloseOpen},
+		{"lock rows forces close+open", &optimizer.LockRows{Child: idx}, rescanCloseOpen},
+		{"join forces close+open", &optimizer.Join{Left: idx, Right: &optimizer.SeqScan{}}, rescanCloseOpen},
 	}
 	for _, c := range cases {
 		kind, _ := classifySubPlan(c.plan, nil)
@@ -236,7 +236,7 @@ func TestClassifySubPlanKinds(t *testing.T) {
 		}
 	}
 	// LockRows is additionally uncacheable.
-	if _, cacheable := classifySubPlan(&planner.LockRows{Child: idx}, nil); cacheable {
+	if _, cacheable := classifySubPlan(&optimizer.LockRows{Child: idx}, nil); cacheable {
 		t.Errorf("LockRows-rooted plan classified cacheable")
 	}
 }

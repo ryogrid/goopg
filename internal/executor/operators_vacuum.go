@@ -6,11 +6,11 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/storage/lmgr"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
-	"github.com/goopg/goopg/internal/vacuum"
+	"github.com/goopg/goopg/internal/commands/vacuum"
 )
 
 // vacuumOp executes a VACUUM statement, running heap page-prune on the
@@ -18,14 +18,14 @@ import (
 // resulting state (M0046-0003/0004/0005). VACUUM without a target list
 // vacuums all user tables.
 type vacuumOp struct {
-	plan *planner.Utility
+	plan *optimizer.Utility
 	ctx  *Context
 	done bool
 }
 
-func newVacuumOp(p *planner.Utility) *vacuumOp { return &vacuumOp{plan: p} }
+func newVacuumOp(p *optimizer.Utility) *vacuumOp { return &vacuumOp{plan: p} }
 
-func (o *vacuumOp) Schema() planner.Schema { return nil }
+func (o *vacuumOp) Schema() optimizer.Schema { return nil }
 
 func (o *vacuumOp) Open(ctx *Context) error {
 	o.ctx = ctx
@@ -80,9 +80,9 @@ func (o *vacuumOp) Next() (TupleSlot, error) {
 	// ShareUpdateExclusiveLock otherwise (vacuum.c vacuum_open_relation); with
 	// SKIP_LOCKED the acquire is conditional and a contended relation is skipped
 	// instead of waited on. M0118-0008 (vacuum-skip-locked).
-	lmMode := lockmgr.ShareUpdateExclusiveLock
+	lmMode := lmgr.ShareUpdateExclusiveLock
 	if vs.Full {
-		lmMode = lockmgr.AccessExclusiveLock
+		lmMode = lmgr.AccessExclusiveLock
 	}
 	targets, parents, terr := o.expandVacuumTargets(vs)
 	if terr != nil {
@@ -318,7 +318,7 @@ func analyzeInheritanceWait(ctx *Context, parent *catalog.Table) {
 			continue
 		}
 		rel := ctx.Catalog.RelFileNode(child)
-		_ = ctx.acquireRelLockMaybeTransient(rel, lockmgr.AccessShareLock)
+		_ = ctx.acquireRelLockMaybeTransient(rel, lmgr.AccessShareLock)
 	}
 }
 

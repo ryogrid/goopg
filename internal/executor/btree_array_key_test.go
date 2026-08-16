@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -161,9 +161,9 @@ func TestArrayIndexCompositeKeyIsSelfDelimiting(t *testing.T) {
 func scanArrayIndexKeys(t *testing.T, ctx *Context, idxName string) [][]byte {
 	t.Helper()
 	idx := lookupIndexByName(t, ctx, idxName)
-	tree, err := btree.Open(ctx.Pool, ctx.Catalog.IndexRelFileNode(idx))
+	tree, err := nbtree.Open(ctx.Pool, ctx.Catalog.IndexRelFileNode(idx))
 	if err != nil {
-		t.Fatalf("btree.Open(%s): %v", idxName, err)
+		t.Fatalf("nbtree.Open(%s): %v", idxName, err)
 	}
 	var got [][]byte
 	if err := tree.RangeScan(nil, nil, func(key []byte, _ storage.ItemPointer) (bool, error) {

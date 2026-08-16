@@ -17,7 +17,7 @@ import (
 	"errors"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // evalBinaryBatch evaluates op over parallel left[i] / right[i]
@@ -83,19 +83,19 @@ func canVectoriseBinary(op parser.OpCode) bool {
 // Excluded: SubqueryExpr / InExpr / ExistsExpr / FuncCall /
 // CaseExpr / ExtractExpr / ParamRef / OuterColumnRef (any node that
 // reaches into ctx.OuterRows or has side effects).
-func canVectoriseExpression(e planner.Expr) bool {
+func canVectoriseExpression(e optimizer.Expr) bool {
 	switch x := e.(type) {
-	case *planner.ColumnRef, *planner.IntegerConst,
-		*planner.NumericConst, *planner.StringConst,
-		*planner.BooleanConst, *planner.NullConst:
+	case *optimizer.ColumnRef, *optimizer.IntegerConst,
+		*optimizer.NumericConst, *optimizer.StringConst,
+		*optimizer.BooleanConst, *optimizer.NullConst:
 		return true
-	case *planner.UnaryOp:
+	case *optimizer.UnaryOp:
 		switch x.Op {
 		case parser.OpUnaryNeg, parser.OpUnaryPos, parser.OpNot:
 			return canVectoriseExpression(x.Operand)
 		}
 		return false
-	case *planner.BinaryOp:
+	case *optimizer.BinaryOp:
 		if !canVectoriseBinary(x.Op) {
 			return false
 		}

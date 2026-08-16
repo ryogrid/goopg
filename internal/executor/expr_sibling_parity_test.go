@@ -33,7 +33,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // ---------------------------------------------------------------------------
@@ -96,7 +96,7 @@ func evalParityOutcome(fn func() (Datum, error)) (out string) {
 // exprTreeSlab.buildExpr, the same entry point initExecKeys/compileExecExprs
 // use, so the fallback-to-ExprAdapter decisions under audit are the
 // production ones.
-func parityOutcomes(e planner.Expr, slot SlotView, ctx *Context) (compiled, interpreted string) {
+func parityOutcomes(e optimizer.Expr, slot SlotView, ctx *Context) (compiled, interpreted string) {
 	var slab exprTreeSlab
 	idx := slab.buildExpr(e)
 	compiled = evalParityOutcome(func() (Datum, error) { return evalFastExpr(slab, idx, slot, ctx) })
@@ -107,7 +107,7 @@ func parityOutcomes(e planner.Expr, slot SlotView, ctx *Context) (compiled, inte
 // parityCase is one corpus entry.
 type parityCase struct {
 	name string
-	expr planner.Expr
+	expr optimizer.Expr
 }
 
 // checkParityCorpus is the shared driver: every case against every SlotView
@@ -166,19 +166,19 @@ func parityRow() Row {
 	}
 }
 
-func pcol(idx int, typeName string) *planner.ColumnRef {
-	return &planner.ColumnRef{Index: idx, Name: fmt.Sprintf("c%d", idx), Type: catalog.Type{Name: typeName}}
+func pcol(idx int, typeName string) *optimizer.ColumnRef {
+	return &optimizer.ColumnRef{Index: idx, Name: fmt.Sprintf("c%d", idx), Type: catalog.Type{Name: typeName}}
 }
 
-func pbin(op parser.OpCode, l, r planner.Expr) *planner.BinaryOp {
-	return &planner.BinaryOp{Op: op, Left: l, Right: r}
+func pbin(op parser.OpCode, l, r optimizer.Expr) *optimizer.BinaryOp {
+	return &optimizer.BinaryOp{Op: op, Left: l, Right: r}
 }
 
-func pbinT(op parser.OpCode, l, r planner.Expr, resultType string) *planner.BinaryOp {
-	return &planner.BinaryOp{Op: op, Left: l, Right: r, ResultType: resultType}
+func pbinT(op parser.OpCode, l, r optimizer.Expr, resultType string) *optimizer.BinaryOp {
+	return &optimizer.BinaryOp{Op: op, Left: l, Right: r, ResultType: resultType}
 }
 
-func pint(v int64) *planner.IntegerConst { return &planner.IntegerConst{Value: v} }
+func pint(v int64) *optimizer.IntegerConst { return &optimizer.IntegerConst{Value: v} }
 
 // ---------------------------------------------------------------------------
 // Corpus 1 — leaves
@@ -192,13 +192,13 @@ func TestExprSiblingParityLeaves(t *testing.T) {
 	corpus := []parityCase{
 		{"int const", pint(42)},
 		{"int const negative", pint(-9223372036854775808)},
-		{"bool const true", &planner.BooleanConst{Value: true}},
-		{"bool const false", &planner.BooleanConst{Value: false}},
-		{"null const", &planner.NullConst{}},
-		{"string const (adapter)", &planner.StringConst{Value: "abc"}},
-		{"numeric const (adapter)", &planner.NumericConst{Value: "12.34"}},
-		{"numeric const malformed (adapter)", &planner.NumericConst{Value: "not-a-number"}},
-		{"typed string lit (adapter)", &planner.TypedStringLit{Type: "date", Value: "2020-01-02"}},
+		{"bool const true", &optimizer.BooleanConst{Value: true}},
+		{"bool const false", &optimizer.BooleanConst{Value: false}},
+		{"null const", &optimizer.NullConst{}},
+		{"string const (adapter)", &optimizer.StringConst{Value: "abc"}},
+		{"numeric const (adapter)", &optimizer.NumericConst{Value: "12.34"}},
+		{"numeric const malformed (adapter)", &optimizer.NumericConst{Value: "not-a-number"}},
+		{"typed string lit (adapter)", &optimizer.TypedStringLit{Type: "date", Value: "2020-01-02"}},
 	}
 	checkParityCorpus(t, corpus, parityRow())
 }
@@ -252,13 +252,13 @@ func TestExprSiblingParityAllOperators(t *testing.T) {
 	}
 	operands := []struct {
 		name string
-		expr planner.Expr
+		expr optimizer.Expr
 	}{
 		{"int", pint(3)},
 		{"intcol", pcol(0, "int4")},
 		{"nullcol", pcol(2, "int4")},
-		{"null", &planner.NullConst{}},
-		{"bool", &planner.BooleanConst{Value: true}},
+		{"null", &optimizer.NullConst{}},
+		{"bool", &optimizer.BooleanConst{Value: true}},
 		{"strcol", pcol(3, "text")},
 		{"numcol", pcol(5, "numeric")},
 	}
@@ -277,7 +277,7 @@ func TestExprSiblingParityAllOperators(t *testing.T) {
 		for _, o := range operands {
 			corpus = append(corpus, parityCase{
 				fmt.Sprintf("unary op=%d %s", op, o.name),
-				&planner.UnaryOp{Op: op, Operand: o.expr},
+				&optimizer.UnaryOp{Op: op, Operand: o.expr},
 			})
 		}
 	}
@@ -360,11 +360,11 @@ func TestExprSiblingParityOverflowCorpus(t *testing.T) {
 func TestExprSiblingParityThreeValuedLogic(t *testing.T) {
 	tf := []struct {
 		name string
-		expr planner.Expr
+		expr optimizer.Expr
 	}{
-		{"true", &planner.BooleanConst{Value: true}},
-		{"false", &planner.BooleanConst{Value: false}},
-		{"null", &planner.NullConst{}},
+		{"true", &optimizer.BooleanConst{Value: true}},
+		{"false", &optimizer.BooleanConst{Value: false}},
+		{"null", &optimizer.NullConst{}},
 		{"nullcol", pcol(2, "bool")},
 		{"boolcol", pcol(4, "bool")},
 		// Non-boolean left operands. BoolValue() is `Int != 0` on ANY Kind, so
@@ -387,7 +387,7 @@ func TestExprSiblingParityThreeValuedLogic(t *testing.T) {
 		}
 	}
 	for _, o := range tf {
-		corpus = append(corpus, parityCase{"NOT " + o.name, &planner.UnaryOp{Op: parser.OpNot, Operand: o.expr}})
+		corpus = append(corpus, parityCase{"NOT " + o.name, &optimizer.UnaryOp{Op: parser.OpNot, Operand: o.expr}})
 	}
 	checkParityCorpus(t, corpus, parityRow())
 }
@@ -403,7 +403,7 @@ func TestExprSiblingParityThreeValuedLogic(t *testing.T) {
 // natively, this test fails — which is the only warning the seam gets, since
 // the shapes still RUN, just wrongly.
 func TestExprSiblingParityAdapterBoundary(t *testing.T) {
-	rowExpr := func(elems ...planner.Expr) *planner.RowExpr { return &planner.RowExpr{Elems: elems} }
+	rowExpr := func(elems ...optimizer.Expr) *optimizer.RowExpr { return &optimizer.RowExpr{Elems: elems} }
 	corpus := []parityCase{
 		{"float8 add", pbinT(parser.OpAdd, pint(1), pint(3), "float8")},
 		{"float8 div", pbinT(parser.OpDiv, pint(1), pint(3), "float8")},
@@ -413,16 +413,16 @@ func TestExprSiblingParityAdapterBoundary(t *testing.T) {
 		{"real add", pbinT(parser.OpAdd, pint(1), pint(3), "real")},
 		{"float8 unsupported op falls through", pbinT(parser.OpEq, pint(1), pint(3), "float8")},
 		{"row-to-row eq", pbin(parser.OpEq, rowExpr(pcol(0, "int4"), pcol(1, "int4")), rowExpr(pint(7), pint(11)))},
-		{"row-to-row ge with null", pbin(parser.OpGe, rowExpr(pcol(3, "text"), pcol(0, "int4")), rowExpr(&planner.StringConst{Value: "abs"}, pcol(2, "int4")))},
-		{"cast", &planner.CastExpr{Operand: pcol(0, "int4"), TargetType: "text"}},
-		{"case", &planner.CaseExpr{Whens: []planner.CaseWhen{{When: &planner.BooleanConst{Value: true}, Then: pint(1)}}}},
-		{"is null", &planner.IsNullExpr{Operand: pcol(2, "int4")}},
-		{"is not null", &planner.IsNullExpr{Operand: pcol(0, "int4"), Negated: true}},
-		{"is distinct from", &planner.IsDistinctFromExpr{Left: pcol(0, "int4"), Right: pcol(2, "int4")}},
-		{"is bool expr", &planner.IsBoolExpr{Operand: pcol(4, "bool"), TestTrue: true}},
+		{"row-to-row ge with null", pbin(parser.OpGe, rowExpr(pcol(3, "text"), pcol(0, "int4")), rowExpr(&optimizer.StringConst{Value: "abs"}, pcol(2, "int4")))},
+		{"cast", &optimizer.CastExpr{Operand: pcol(0, "int4"), TargetType: "text"}},
+		{"case", &optimizer.CaseExpr{Whens: []optimizer.CaseWhen{{When: &optimizer.BooleanConst{Value: true}, Then: pint(1)}}}},
+		{"is null", &optimizer.IsNullExpr{Operand: pcol(2, "int4")}},
+		{"is not null", &optimizer.IsNullExpr{Operand: pcol(0, "int4"), Negated: true}},
+		{"is distinct from", &optimizer.IsDistinctFromExpr{Left: pcol(0, "int4"), Right: pcol(2, "int4")}},
+		{"is bool expr", &optimizer.IsBoolExpr{Operand: pcol(4, "bool"), TestTrue: true}},
 		{"bare row expr", rowExpr(pcol(0, "int4"), pcol(2, "int4"))},
-		{"func call", &planner.FuncCall{Name: "lower", Args: []planner.Expr{pcol(3, "text")}}},
-		{"param ref unbound", &planner.ParamRef{Number: 1}},
+		{"func call", &optimizer.FuncCall{Name: "lower", Args: []optimizer.Expr{pcol(3, "text")}}},
+		{"param ref unbound", &optimizer.ParamRef{Number: 1}},
 	}
 	checkParityCorpus(t, corpus, parityRow())
 }
@@ -435,7 +435,7 @@ func TestExprSiblingParityAdapterBoundary(t *testing.T) {
 // requires the two copies to stay in the same place.
 func TestExprSiblingParityPgLSN(t *testing.T) {
 	row := Row{NewStringDatum("0/16B3748"), NewStringDatum("0/16B3700"), NullDatum, NewStringDatum("not/an/lsn"), NewIntDatum(4), Datum{Kind: KindNumeric, Int: 1, Scale: 0}}
-	lsn := func(s string) planner.Expr { return &planner.StringConst{Value: s} }
+	lsn := func(s string) optimizer.Expr { return &optimizer.StringConst{Value: s} }
 	var corpus []parityCase
 	for _, op := range []parser.OpCode{parser.OpSub, parser.OpAdd, parser.OpEq, parser.OpLt, parser.OpGt, parser.OpNe} {
 		corpus = append(corpus,
@@ -456,15 +456,15 @@ func TestExprSiblingParityPgLSN(t *testing.T) {
 // appends to reallocate. A rotation here would not error — it would evaluate
 // the wrong operands, which is the Q78 shape: right plan, wrong rows.
 func TestExprSiblingParityDeepNesting(t *testing.T) {
-	var deepLeft planner.Expr = pint(0)
-	var deepRight planner.Expr = pint(0)
+	var deepLeft optimizer.Expr = pint(0)
+	var deepRight optimizer.Expr = pint(0)
 	for i := 0; i < 200; i++ {
 		deepLeft = pbinT(parser.OpAdd, deepLeft, pint(int64(i)), "int8")
 		deepRight = pbinT(parser.OpSub, pint(int64(i)), deepRight, "int8")
 	}
 	// A mixed chain whose leaves are column refs, so the slab holds
 	// interleaved kinds rather than a uniform run of one.
-	var mixed planner.Expr = pcol(0, "int4")
+	var mixed optimizer.Expr = pcol(0, "int4")
 	for i := 0; i < 100; i++ {
 		mixed = pbinT(parser.OpAdd, mixed, pcol(i%6, "int4"), "int8")
 	}
@@ -479,10 +479,10 @@ func TestExprSiblingParityDeepNesting(t *testing.T) {
 
 // buildAndChain builds an n-conjunct AND over alternating true/false
 // comparisons — the shape a multi-predicate residual compiles to.
-func buildAndChain(n int) planner.Expr {
-	var e planner.Expr = pbin(parser.OpEq, pcol(0, "int4"), pint(7))
+func buildAndChain(n int) optimizer.Expr {
+	var e optimizer.Expr = pbin(parser.OpEq, pcol(0, "int4"), pint(7))
 	for i := 0; i < n; i++ {
-		var conj planner.Expr
+		var conj optimizer.Expr
 		switch i % 3 {
 		case 0:
 			conj = pbin(parser.OpLt, pcol(1, "int4"), pint(int64(100+i)))
@@ -510,7 +510,7 @@ func buildAndChain(n int) planner.Expr {
 // render pos 0 on a hand-built node, so they agree there for the wrong reason.
 // Resolving real SQL is what makes the position non-zero and the comparison
 // meaningful.
-func parityResolve(t *testing.T, predicate string) planner.Expr {
+func parityResolve(t *testing.T, predicate string) optimizer.Expr {
 	t.Helper()
 	stmts, err := parser.Parse("SELECT 1 FROM t WHERE " + predicate)
 	if err != nil {
@@ -520,7 +520,7 @@ func parityResolve(t *testing.T, predicate string) planner.Expr {
 	if !ok {
 		t.Fatalf("parse %q: not a SelectStmt", predicate)
 	}
-	e, err := planner.ResolveIndexPredicate(sel.Where, parityTable())
+	e, err := optimizer.ResolveIndexPredicate(sel.Where, parityTable())
 	if err != nil {
 		t.Fatalf("resolve %q: %v", predicate, err)
 	}
@@ -594,9 +594,9 @@ func TestExprSiblingParityCompiledPositionIsTheSourcePosition(t *testing.T) {
 	// delegate), so it is the one that proves the position survived the slab.
 	// The explicit ::int4 is required: `c0 + <literal>` resolves to int8.
 	e := parityResolve(t, "c0 + 2147483647::int4 > 0")
-	add, ok := e.(*planner.BinaryOp).Left.(*planner.BinaryOp)
+	add, ok := e.(*optimizer.BinaryOp).Left.(*optimizer.BinaryOp)
 	if !ok {
-		t.Fatalf("expected a BinaryOp under the comparison, got %T", e.(*planner.BinaryOp).Left)
+		t.Fatalf("expected a BinaryOp under the comparison, got %T", e.(*optimizer.BinaryOp).Left)
 	}
 	if add.Pos() == 0 {
 		t.Fatalf("planner produced pos 0; the test cannot distinguish carried from lost")

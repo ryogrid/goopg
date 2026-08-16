@@ -27,7 +27,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/goopg/goopg/internal/config"
+	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/control"
 )
 
@@ -38,7 +38,7 @@ const pgControlFile = "global/pg_control"
 // PostgreSQL pg_control constants (PG18).
 const (
 	pgControlVersion      = 1800
-	pgCatalogVersionNo    = config.CatalogVersionNo
+	pgCatalogVersionNo    = misc.CatalogVersionNo
 	pgControlFileSize     = 8192
 	pgControlDataSize     = 296 // sizeof(ControlFileData) on x86_64
 	pgControlCRCOffset    = 292 // offsetof(ControlFileData, crc) on x86_64
@@ -74,7 +74,7 @@ var crcCastagnoliTable = crc32.MakeTable(crc32.Castagnoli)
 // <dataDir>/global/pg_control. The file is 8192 bytes (PG_CONTROL_FILE_SIZE)
 // with a 296-byte ControlFileData struct at the start and zeros elsewhere.
 // systemID must match the cluster's system_identifier (see LoadOrCreateSystemID).
-func writePgControl(dataDir string, systemID uint64, cfg *config.Registry, dataChecksums bool) error {
+func writePgControl(dataDir string, systemID uint64, cfg *misc.Registry, dataChecksums bool) error {
 	buf := buildPgControl(systemID, time.Now(), cfg, dataChecksums)
 	path := filepath.Join(dataDir, pgControlFile)
 	if err := os.WriteFile(path, buf, 0o600); err != nil {
@@ -86,7 +86,7 @@ func writePgControl(dataDir string, systemID uint64, cfg *config.Registry, dataC
 // gucInt reads an integer GUC from reg, returning def when reg is nil,
 // the GUC is absent, or its value is unparseable. Mirrors upstream's
 // C-side GUC variable access pattern (xlog.c:4223-4227).
-func gucInt(reg *config.Registry, name string, def int32) int32 {
+func gucInt(reg *misc.Registry, name string, def int32) int32 {
 	if reg == nil {
 		return def
 	}
@@ -107,7 +107,7 @@ func gucInt(reg *config.Registry, name string, def int32) int32 {
 //	minimal=0, replica=1, logical=2.
 //
 // Returns 1 (replica) when reg is nil or the GUC is absent.
-func walLevelInt(reg *config.Registry) uint32 {
+func walLevelInt(reg *misc.Registry) uint32 {
 	if reg == nil {
 		return 1
 	}
@@ -192,7 +192,7 @@ func BackupControlImage(dataDir string, redoLSN, ckptRecordLSN uint64, tli uint3
 // the given system identifier and timestamp. The payload is 8192 bytes
 // total; the first 296 bytes are the ControlFileData struct, the rest
 // is zero padding (matching upstream's WriteControlFile).
-func buildPgControl(systemID uint64, now time.Time, cfg *config.Registry, dataChecksums bool) []byte {
+func buildPgControl(systemID uint64, now time.Time, cfg *misc.Registry, dataChecksums bool) []byte {
 	file := make([]byte, pgControlFileSize)
 	hdr := file[:pgControlDataSize]
 

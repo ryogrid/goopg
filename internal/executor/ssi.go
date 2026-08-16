@@ -7,7 +7,7 @@ import (
 	"math"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -18,7 +18,7 @@ import (
 func ssiActive(ctx *Context) bool {
 	return ctx != nil &&
 		ctx.TxnMgr != nil &&
-		ctx.Tx.Isolation == mvcc.IsolationSerializable &&
+		ctx.Tx.Isolation == transam.IsolationSerializable &&
 		ctx.Tx.Handle != 0
 }
 
@@ -53,7 +53,7 @@ func ssiRecordTupleRead(ctx *Context, rel storage.RelFileNode, block storage.Blo
 	if block == storage.InvalidBlockNumber || slot == 0 {
 		return nil
 	}
-	tag := mvcc.TupleLockTag(rel.DBOid, rel.RelOid, block, slot)
+	tag := transam.TupleLockTag(rel.DBOid, rel.RelOid, block, slot)
 	ctx.TxnMgr.AcquirePredicateLock(ctx.Tx.Handle, tag)
 	return ssiConflictOutOnWriters(ctx, writerXmin, writerXmax)
 }
@@ -134,7 +134,7 @@ func ssiRecordHashBucketRead(ctx *Context, dbOid, indexOID uint32, key []byte) {
 	if !ssiActive(ctx) || indexOID == 0 || len(key) == 0 {
 		return
 	}
-	tag := mvcc.PageLockTag(dbOid, indexOID, ssiHashBucket(key))
+	tag := transam.PageLockTag(dbOid, indexOID, ssiHashBucket(key))
 	ctx.TxnMgr.AcquirePredicateLock(ctx.Tx.Handle, tag)
 }
 
@@ -213,7 +213,7 @@ func ssiRecordHashIndexInsert(ctx *Context, tbl *catalog.Table, cols []catalog.C
 		if err != nil || len(key) == 0 {
 			continue
 		}
-		tag := mvcc.PageLockTag(dbOid, idx.OID, ssiHashBucket(key))
+		tag := transam.PageLockTag(dbOid, idx.OID, ssiHashBucket(key))
 		if cerr := ctx.TxnMgr.CheckForSerializableConflictInReportingFailure(ctx.Tx.Handle, tag); cerr != nil {
 			return ssiReadAbortError(cerr)
 		}
@@ -288,7 +288,7 @@ func ssiRecordGistGridRead(ctx *Context, dbOid, indexOID uint32, x, y float64) {
 	if !ssiActive(ctx) || indexOID == 0 {
 		return
 	}
-	tag := mvcc.PageLockTag(dbOid, indexOID, ssiGistGridCell(x, y))
+	tag := transam.PageLockTag(dbOid, indexOID, ssiGistGridCell(x, y))
 	ctx.TxnMgr.AcquirePredicateLock(ctx.Tx.Handle, tag)
 }
 
@@ -321,7 +321,7 @@ func ssiRecordGistIndexInsert(ctx *Context, tbl *catalog.Table, cols []catalog.C
 		if !pok {
 			continue
 		}
-		tag := mvcc.PageLockTag(dbOid, idx.OID, ssiGistGridCell(pt[0], pt[1]))
+		tag := transam.PageLockTag(dbOid, idx.OID, ssiGistGridCell(pt[0], pt[1]))
 		if cerr := ctx.TxnMgr.CheckForSerializableConflictInReportingFailure(ctx.Tx.Handle, tag); cerr != nil {
 			return ssiReadAbortError(cerr)
 		}
@@ -402,12 +402,12 @@ func ssiRecordGinKeyRead(ctx *Context, dbOid, indexOID uint32, keys []string, fa
 		return
 	}
 	if fastUpdate {
-		tag := mvcc.PageLockTag(dbOid, indexOID, ssiGinSentinelPage)
+		tag := transam.PageLockTag(dbOid, indexOID, ssiGinSentinelPage)
 		ctx.TxnMgr.AcquirePredicateLock(ctx.Tx.Handle, tag)
 		return
 	}
 	for _, k := range keys {
-		tag := mvcc.PageLockTag(dbOid, indexOID, ssiGinKeyPage(k))
+		tag := transam.PageLockTag(dbOid, indexOID, ssiGinKeyPage(k))
 		ctx.TxnMgr.AcquirePredicateLock(ctx.Tx.Handle, tag)
 	}
 }
@@ -441,14 +441,14 @@ func ssiRecordGinIndexInsert(ctx *Context, tbl *catalog.Table, cols []catalog.Co
 		// Conflict-in on each inserted key's page (matches a fastupdate=off reader's
 		// per-key SIREAD).
 		for _, e := range parseTextArray(row[colIdx].StringValue()) {
-			tag := mvcc.PageLockTag(dbOid, idx.OID, ssiGinKeyPage(e))
+			tag := transam.PageLockTag(dbOid, idx.OID, ssiGinKeyPage(e))
 			if cerr := ctx.TxnMgr.CheckForSerializableConflictInReportingFailure(ctx.Tx.Handle, tag); cerr != nil {
 				return ssiReadAbortError(cerr)
 			}
 		}
 		// Conflict-in on the whole-index sentinel page (matches a fastupdate=on
 		// reader's sentinel SIREAD). No-op when no reader took the sentinel lock.
-		stag := mvcc.PageLockTag(dbOid, idx.OID, ssiGinSentinelPage)
+		stag := transam.PageLockTag(dbOid, idx.OID, ssiGinSentinelPage)
 		if cerr := ctx.TxnMgr.CheckForSerializableConflictInReportingFailure(ctx.Tx.Handle, stag); cerr != nil {
 			return ssiReadAbortError(cerr)
 		}
@@ -492,7 +492,7 @@ func ssiRecordRelationRead(ctx *Context, rel storage.RelFileNode) {
 	if catalog.IsSystemRelation(rel.RelOid) {
 		return
 	}
-	tag := mvcc.RelationLockTag(rel.DBOid, rel.RelOid)
+	tag := transam.RelationLockTag(rel.DBOid, rel.RelOid)
 	ctx.TxnMgr.AcquirePredicateLock(ctx.Tx.Handle, tag)
 }
 
@@ -537,12 +537,12 @@ func ssiRecordInvisibleTupleRead(ctx *Context, rel storage.RelFileNode, xmin sto
 // on the wire.
 func ssiReadAbortError(err error) error {
 	detail := ""
-	var sfe *mvcc.SerializationFailureError
+	var sfe *transam.SerializationFailureError
 	if errors.As(err, &sfe) {
 		detail = sfe.Detail()
 	}
 	return &ExecError{
-		Code:    mvcc.SerializationFailureSQLState,
+		Code:    transam.SerializationFailureSQLState,
 		Message: "could not serialize access due to read/write dependencies among transactions",
 		Detail:  detail,
 		Hint:    "The transaction might succeed if retried.",
@@ -576,7 +576,7 @@ func ssiRecordTupleWrite(ctx *Context, rel storage.RelFileNode, block storage.Bl
 	if block == storage.InvalidBlockNumber || slot == 0 {
 		return nil
 	}
-	tag := mvcc.TupleLockTag(rel.DBOid, rel.RelOid, block, slot)
+	tag := transam.TupleLockTag(rel.DBOid, rel.RelOid, block, slot)
 	if err := ctx.TxnMgr.CheckForSerializableConflictInReportingFailure(ctx.Tx.Handle, tag); err != nil {
 		return ssiReadAbortError(err)
 	}
@@ -627,8 +627,8 @@ func ssiRecordTableWrite(ctx *Context, rel storage.RelFileNode) error {
 // Returns nil for RC/RR (no PreCommit walk required), for SERIALIZABLE xacts
 // without an allocated handle (write-less and never registered), and when
 // the underlying check observes no dangerous structure.
-func ssiPreCommitCheck(ctx *Context, tx mvcc.Transaction) error {
-	if tx.Isolation != mvcc.IsolationSerializable {
+func ssiPreCommitCheck(ctx *Context, tx transam.Transaction) error {
+	if tx.Isolation != transam.IsolationSerializable {
 		return nil
 	}
 	if ctx == nil || ctx.TxnMgr == nil || tx.Handle == 0 {
@@ -640,7 +640,7 @@ func ssiPreCommitCheck(ctx *Context, tx mvcc.Transaction) error {
 		// reason into the primary message (as the prior code did) diverged from
 		// psql/isolationtester, which print only the errmsg line.
 		detail, hint := "", ""
-		if sfe, ok := err.(*mvcc.SerializationFailureError); ok {
+		if sfe, ok := err.(*transam.SerializationFailureError); ok {
 			detail = sfe.Detail()
 			hint = "The transaction might succeed if retried."
 		}

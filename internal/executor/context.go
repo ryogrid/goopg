@@ -7,18 +7,18 @@ import (
 	"strings"
 	"time"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/executor/kvcache"
-	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/storage/lmgr"
 	"github.com/goopg/goopg/internal/lockwait"
-	"github.com/goopg/goopg/internal/mctx"
-	"github.com/goopg/goopg/internal/multixact"
-	"github.com/goopg/goopg/internal/mvcc"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/utils/mmgr"
+	"github.com/goopg/goopg/internal/access/transam/multixact"
+	"github.com/goopg/goopg/internal/access/transam"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // Context carries per-statement runtime state into every operator's
@@ -45,7 +45,7 @@ type Context struct {
 	// Operators acquire child ExprContexts from it for per-row
 	// scratch; nil disables mctx-backed arena Datums (tests that
 	// don't wire a full server still work via GC-heap fallback).
-	Mctx *mctx.Context
+	Mctx *mmgr.Context
 
 	// Storage handles. Heap-touching operators (SeqScan/Insert/
 	// Update/Delete) require all four to be set; pure-compute
@@ -56,9 +56,9 @@ type Context struct {
 	// calling planner.Plan so that unqualified table names resolve via the
 	// session's search_path. Falls back to Catalog when nil. M0097-0022.
 	PlanCatalog catalog.Catalog
-	TxnMgr      *mvcc.Manager
-	Tx          mvcc.Transaction
-	Snap        mvcc.Snapshot
+	TxnMgr      *transam.Manager
+	Tx          transam.Transaction
+	Snap        transam.Snapshot
 
 	// MultiXact is the process-shared MultiXact member store (the SLRU
 	// analog). It is consulted by the row-locking path (stampLockInner) to
@@ -145,7 +145,7 @@ type Context struct {
 	// overhead. Populated by subqueryImpl; indexScanOp.Open detects the
 	// reuse and skips openPrep on subsequent calls. Operators are not
 	// explicitly closed (locks released at commit; GC handles memory).
-	CorrSubqOps map[*planner.SubqueryExpr]Operator
+	CorrSubqOps map[*optimizer.SubqueryExpr]Operator
 
 	// CorrSubqHashMaps caches hash maps built for correlated scalar subqueries
 	// matching Project(Filter(SeqScan, inner_col = OuterColumnRef)). The hash
@@ -153,7 +153,7 @@ type Context struct {
 	// O(1) lookups per outer row, avoiding O(N²) correlated SeqScan patterns
 	// even when no btree index exists. Keys are datumKey(inner_col_value);
 	// values are the projected result datum.
-	CorrSubqHashMaps map[*planner.SubqueryExpr]map[string]Datum
+	CorrSubqHashMaps map[*optimizer.SubqueryExpr]map[string]Datum
 
 	// SubPlanHandles keeps each sublink's inner operator tree built
 	// (and, where safe, open) across outer rows — the Stage-9 (D4.2)
@@ -161,7 +161,7 @@ type Context struct {
 	// pointer, like SubPlanStats. Torn down by CloseSubPlans at the
 	// statement-dispatch seam. Nil until a sublink executes with the
 	// engine enabled (GOOPG_SUBPLAN_RESCAN, default on).
-	SubPlanHandles map[planner.Expr]*subPlanHandle
+	SubPlanHandles map[optimizer.Expr]*subPlanHandle
 
 	// SubPlanStats records, per sublink expression, what its
 	// evaluation actually cost during this statement. It exists
@@ -174,17 +174,17 @@ type Context struct {
 	//
 	// Written on the single statement-executing goroutine, in the
 	// same style as the sublink result caches above; no synchronisation.
-	SubPlanStats map[planner.Expr]*SubPlanSiteStats
+	SubPlanStats map[optimizer.Expr]*SubPlanSiteStats
 
 	// MemoizeStats carries the per-Memoize-node ANALYZE counters
 	// (Hits/Misses/Evictions/Overflows), keyed by plan node like
 	// SubPlanStats. Lazily allocated by memoizeStat. S7.
-	MemoizeStats map[*planner.Memoize]*MemoizeStats
+	MemoizeStats map[*optimizer.Memoize]*MemoizeStats
 
 	// HashJoinStats carries the per-hash-join ANALYZE counters
 	// (buckets / batches / peak memory), keyed by plan node like the two
 	// maps above. Lazily allocated by hashJoinStat. M0127-P3.5.
-	HashJoinStats map[*planner.Join]*HashJoinStats
+	HashJoinStats map[*optimizer.Join]*HashJoinStats
 
 	// MultiAssignSubqCache caches the result row of a MultiAssignSubqRow
 	// evaluation (tuple SET subquery). Keyed by *planner.MultiAssignSubqRow
@@ -261,7 +261,7 @@ type Context struct {
 	// inserted into lazyHash during probing would turn this into a data race.
 	//
 	// Nil outside a Gather, which is the serial case.
-	SharedHashBuilds map[*planner.Join]*sharedHashBuild
+	SharedHashBuilds map[*optimizer.Join]*sharedHashBuild
 
 	// PartialAggStates carries per-group aggregate transition states from the
 	// Partial nodes running in workers up to the Finalize node in the leader
@@ -273,14 +273,14 @@ type Context struct {
 	// combine happens on insert.
 	//
 	// Nil outside a split aggregate, which is the serial case.
-	PartialAggStates map[*planner.Aggregate]*aggPartialAccum
+	PartialAggStates map[*optimizer.Aggregate]*aggPartialAccum
 
 	// pgKeyDescCache memoises buildPGIndexKeyDesc per index OID for this
 	// statement (M0130-S11.4 slice 3b-2c-ii-A). A present-but-nil entry is
 	// the memoised "this layer cannot describe that index" answer, so the
 	// refusal costs one derivation, not one per row. Populated lazily by
 	// (*Context).pgIndexKeyDesc; nil until the first index btree is opened.
-	pgKeyDescCache map[uint32]*btree.PGIndexKeyDesc
+	pgKeyDescCache map[uint32]*nbtree.PGIndexKeyDesc
 
 	// AnalyzeRandSeed, when non-zero, makes ANALYZE's reservoir
 	// sampler reproducible. Tests set it; production leaves it
@@ -307,13 +307,13 @@ type Context struct {
 	// docs/design/0012-0003-lock-wait-integration-and-test-matrix.md.
 	// nil makes acquireRelLock a no-op so existing tests and
 	// non-storage code paths keep working unchanged.
-	LockMgr *lockmgr.LockManager
+	LockMgr *lmgr.LockManager
 
 	// BackendID identifies this session/transaction to the lock
 	// manager. The wire layer assigns one per connection from a
 	// monotonic atomic counter — the youngest-backend victim
 	// policy from M0012-0002 relies on the monotonic shape.
-	BackendID lockmgr.BackendID
+	BackendID lmgr.BackendID
 
 	// TxnLockBackendID identifies the *transaction* (rather than the
 	// single statement) to the lock manager. It is stable for the life
@@ -324,7 +324,7 @@ type Context struct {
 	// way upstream's lockmgr does. Zero means "not inside an explicit
 	// transaction" — execLockTable then falls back to display-only
 	// registration (no real blocking lock). M0118-0003 (lock-nowait).
-	TxnLockBackendID lockmgr.BackendID
+	TxnLockBackendID lmgr.BackendID
 
 	// ProcNum is the backend's slot index in the Manager's ProcArray.
 	// Set once per connection in serveConn and carried on every ectx so
@@ -494,7 +494,7 @@ type Context struct {
 	// WrittenLSN after a local flush to bound the SyncRep wait. nil
 	// disables the bound and the wait reverts to async behaviour
 	// (commit returns immediately). M0102-0005.
-	WAL *wal.Writer
+	WAL *xlog.Writer
 
 	// ReplSlots exposes the cluster's replication-slot registry to the
 	// SQL-callable slot functions (pg_create_physical_replication_slot,
@@ -504,20 +504,20 @@ type Context struct {
 	// recurring sibling-path trap. nil means the server was started
 	// without slot support, and the functions raise 0A000 exactly as the
 	// wire commands do. M-NIGHTLY AI-20260810-011258-003.
-	ReplSlots *wal.Slots
+	ReplSlots *xlog.Slots
 
 	// SyncRep is the synchronous-replication wait primitive. execCommit
 	// calls SyncRep.WaitForLSN(commitLSN, mode) after local flush when
 	// SyncCommitMode is anything other than SyncRepOff and the configured
 	// `synchronous_standby_names` rule is non-empty. nil disables
 	// sync replication (async — upstream default). M0102-0005.
-	SyncRep *wal.SyncRep
+	SyncRep *xlog.SyncRep
 
 	// SyncCommitMode is the session-effective `synchronous_commit` GUC
 	// level. SyncRepOff means commit returns immediately after local
 	// flush; remote_* levels block until configured standbys ack.
 	// M0102-0005.
-	SyncCommitMode wal.SyncRepMode
+	SyncCommitMode xlog.SyncRepMode
 
 	// AsyncCommit is true only when the session-effective
 	// `synchronous_commit` GUC is literally "off" — the one level that also
@@ -615,7 +615,7 @@ type Context struct {
 	// synthetic combo CID numbers for tuples both inserted and deleted
 	// within this transaction at different command ids. Initialized
 	// lazily on first access; cleared per transaction. M0129-S8.3.
-	comboCIDStore mvcc.ComboCIDStore
+	comboCIDStore transam.ComboCIDStore
 
 	// pendingDMLCTEs is the cteDMLPrefixOp currently driving this statement,
 	// or nil. It is how a MaterializedCTEScan demands the DML CTE it reads:
@@ -873,7 +873,7 @@ type Context struct {
 
 	// MergeAction holds the current MERGE action for MergeActionExpr evaluation
 	// in a MERGE RETURNING clause. Set by mergeOp.collectReturningRow. M0100-0007.
-	MergeAction planner.MergeActionKind
+	MergeAction optimizer.MergeActionKind
 	// MergeOldRow/MergeNewRow hold the pre/post action rows for MergeWholeRowRef
 	// evaluation in a MERGE RETURNING clause. nil = absent (INSERT has no old;
 	// DELETE has no new). M0100-0007.
@@ -932,12 +932,12 @@ func (c *Context) SetParamExec(id int, v Datum) {
 	c.ParamDirty[id] = true
 }
 
-func (c *Context) subPlanStat(e planner.Expr) *SubPlanSiteStats {
+func (c *Context) subPlanStat(e optimizer.Expr) *SubPlanSiteStats {
 	if c == nil {
 		return &SubPlanSiteStats{}
 	}
 	if c.SubPlanStats == nil {
-		c.SubPlanStats = make(map[planner.Expr]*SubPlanSiteStats)
+		c.SubPlanStats = make(map[optimizer.Expr]*SubPlanSiteStats)
 	}
 	s, ok := c.SubPlanStats[e]
 	if !ok {
@@ -1008,7 +1008,7 @@ func (c *Context) ResetCommandCounter() {
 // pairs to synthetic combo CID numbers for tuples both inserted and deleted
 // within this transaction at different command ids. Mirrors PostgreSQL's
 // comboCids (combocid.c). M0129-S8.3.
-func (c *Context) comboStore() *mvcc.ComboCIDStore {
+func (c *Context) comboStore() *transam.ComboCIDStore {
 	return &c.comboCIDStore
 }
 
@@ -1023,7 +1023,7 @@ func (c *Context) ResetComboCIDStore() {
 // through this method rather than calling TxnMgr.Commit directly, so a
 // session's synchronous_commit setting is honoured consistently.
 // M0117-0007 Part B.
-func (c *Context) CommitTransaction(tx mvcc.Transaction) error {
+func (c *Context) CommitTransaction(tx transam.Transaction) error {
 	if c.AsyncCommit {
 		return c.TxnMgr.CommitAsync(tx)
 	}
@@ -1104,7 +1104,7 @@ func (c *Context) TakeWarnings() []string {
 // dispatch.go commit/rollback call to LockMgr.ReleaseAll —
 // so they survive across statements within a multi-statement
 // txn, which is required for any real SQL deadlock to form.
-func (c *Context) acquireRelLock(rel storage.RelFileNode, mode lockmgr.Mode) error {
+func (c *Context) acquireRelLock(rel storage.RelFileNode, mode lmgr.Mode) error {
 	if c.LockMgr == nil {
 		return nil
 	}
@@ -1116,7 +1116,7 @@ func (c *Context) acquireRelLock(rel storage.RelFileNode, mode lockmgr.Mode) err
 	if c.Ctx != nil {
 		lockCtx = c.Ctx
 	}
-	tag := lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
+	tag := lmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
 	err := c.LockMgr.Acquire(lockCtx, c.BackendID, tag, mode)
 	if c.Activity != nil {
 		c.Activity.WaitEventEnd(c.ProcNum)
@@ -1124,7 +1124,7 @@ func (c *Context) acquireRelLock(rel storage.RelFileNode, mode lockmgr.Mode) err
 	if err == nil {
 		return nil
 	}
-	if err == lockmgr.ErrDeadlockDetected {
+	if err == lmgr.ErrDeadlockDetected {
 		return &ExecError{Code: "40P01", Message: "deadlock detected"}
 	}
 	if ee := lockWaitCancelError(err); ee != nil {
@@ -1142,7 +1142,7 @@ func (c *Context) acquireRelLock(rel storage.RelFileNode, mode lockmgr.Mode) err
 // tuple tag are independent map keys, so relation-level
 // locking and tuple-level locking don't accidentally block
 // each other. Same SQLSTATE mappings as acquireRelLock.
-func (c *Context) acquireTupleLock(rel storage.RelFileNode, ptr storage.ItemPointer, mode lockmgr.Mode) error {
+func (c *Context) acquireTupleLock(rel storage.RelFileNode, ptr storage.ItemPointer, mode lmgr.Mode) error {
 	lm, backend, timeout := c.tupleLockManager()
 	if lm == nil {
 		return nil
@@ -1156,7 +1156,7 @@ func (c *Context) acquireTupleLock(rel storage.RelFileNode, ptr storage.ItemPoin
 	if err == nil {
 		return nil
 	}
-	if err == lockmgr.ErrDeadlockDetected {
+	if err == lmgr.ErrDeadlockDetected {
 		return &ExecError{Code: "40P01", Message: "deadlock detected"}
 	}
 	if ee := lockWaitCancelError(err); ee != nil {
@@ -1182,11 +1182,11 @@ func (c *Context) acquireTupleLock(rel storage.RelFileNode, ptr storage.ItemPoin
 //     BackendID (e.g. the extended-protocol path, which never sets it) keeps
 //     tuple locking a no-op there, preserving the pre-existing
 //     xmax/WaitForXID-only behaviour with no lock leak.
-func (c *Context) tupleLockManager() (*lockmgr.LockManager, lockmgr.BackendID, time.Duration) {
+func (c *Context) tupleLockManager() (*lmgr.LockManager, lmgr.BackendID, time.Duration) {
 	if c.LockMgr != nil {
 		// Preserve the historical test-path timeout: the manager's own
 		// configured deadlock_timeout (lockmgr.useConfiguredTimeout sentinel).
-		return c.LockMgr, c.BackendID, lockmgr.UseConfiguredTimeout
+		return c.LockMgr, c.BackendID, lmgr.UseConfiguredTimeout
 	}
 	if c.BackendID == 0 {
 		return nil, 0, 0
@@ -1201,8 +1201,8 @@ func (c *Context) tupleLockManager() (*lockmgr.LockManager, lockmgr.BackendID, t
 // relation tag (Block=0, Offset=0) are independent so
 // AccessShareLock / RowExclusiveLock at the relation never
 // blocks tuple-level acquirers.
-func tupleLockTag(rel storage.RelFileNode, ptr storage.ItemPointer) lockmgr.LockTag {
-	return lockmgr.LockTag{
+func tupleLockTag(rel storage.RelFileNode, ptr storage.ItemPointer) lmgr.LockTag {
+	return lmgr.LockTag{
 		DB:     rel.DBOid,
 		Rel:    rel.RelOid,
 		Block:  uint32(ptr.Block) + 1, // shift so Block=0 isn't an alias for "relation tag"
@@ -1217,16 +1217,16 @@ func tupleLockTag(rel storage.RelFileNode, ptr storage.ItemPointer) lockmgr.Lock
 // diagnostic; goopg's row-locking is relation-coarse for now so
 // the message says "relation" instead of "row" but the SQLSTATE
 // is the canonical one tooling greps for.
-func (c *Context) tryAcquireRelLock(rel storage.RelFileNode, mode lockmgr.Mode) error {
+func (c *Context) tryAcquireRelLock(rel storage.RelFileNode, mode lmgr.Mode) error {
 	if c.LockMgr == nil {
 		return nil
 	}
-	tag := lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
+	tag := lmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
 	err := c.LockMgr.TryAcquire(c.BackendID, tag, mode)
 	if err == nil {
 		return nil
 	}
-	if err == lockmgr.ErrLockNotAvailable {
+	if err == lmgr.ErrLockNotAvailable {
 		return &ExecError{Code: "55P03", Message: "could not obtain lock on relation"}
 	}
 	return &ExecError{Code: "XX000", Message: err.Error()}
@@ -1241,14 +1241,14 @@ func (c *Context) tryAcquireRelLock(rel storage.RelFileNode, mode lockmgr.Mode) 
 // heavyweight locking to explicit LOCK statements: ordinary scans,
 // DML and DDL never touch it, so enabling it can't introduce new
 // blocking on the pgbench/TPC-H hot paths.
-var tableLockMgr = lockmgr.New()
+var tableLockMgr = lmgr.New()
 
 // ReleaseTableLocks drops every LOCK TABLE heavyweight lock held by the
 // given transaction backend identity. The wire layer calls it from
 // connTxState.End() at COMMIT/ROLLBACK (and on connection teardown), so
 // LOCK TABLE locks live exactly as long as the transaction that took
 // them. M0118-0003 (lock-nowait).
-func ReleaseTableLocks(b lockmgr.BackendID) {
+func ReleaseTableLocks(b lmgr.BackendID) {
 	if b == 0 {
 		return
 	}
@@ -1265,7 +1265,7 @@ func ReleaseTableLocks(b lockmgr.BackendID) {
 // duty. It shares tableLockMgr with LOCK TABLE, but LOCK TABLE holds under the
 // disjoint TxnLockBackendID, so releasing the statement backend id here never
 // touches a LOCK TABLE holding.
-func ReleaseTupleLocks(b lockmgr.BackendID) {
+func ReleaseTupleLocks(b lmgr.BackendID) {
 	if b == 0 {
 		return
 	}
@@ -1291,17 +1291,17 @@ func ReleaseTupleLocks(b lockmgr.BackendID) {
 // transaction block) makes this a no-op so autocommit LOCK keeps its
 // historical display-only behaviour and never leaks a lock that nothing
 // would release.
-func (c *Context) acquireRelLockTxn(rel storage.RelFileNode, mode lockmgr.Mode, nowait bool) error {
+func (c *Context) acquireRelLockTxn(rel storage.RelFileNode, mode lmgr.Mode, nowait bool) error {
 	if c.TxnLockBackendID == 0 {
 		return nil
 	}
-	tag := lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
+	tag := lmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
 	if nowait {
 		err := tableLockMgr.TryAcquire(c.TxnLockBackendID, tag, mode)
 		if err == nil {
 			return nil
 		}
-		if err == lockmgr.ErrLockNotAvailable {
+		if err == lmgr.ErrLockNotAvailable {
 			return &ExecError{Code: "55P03", Message: "could not obtain lock on relation"}
 		}
 		return &ExecError{Code: "XX000", Message: err.Error()}
@@ -1320,7 +1320,7 @@ func (c *Context) acquireRelLockTxn(rel storage.RelFileNode, mode lockmgr.Mode, 
 	if err == nil {
 		return nil
 	}
-	if err == lockmgr.ErrDeadlockDetected {
+	if err == lmgr.ErrDeadlockDetected {
 		return &ExecError{Code: "40P01", Message: "deadlock detected"}
 	}
 	if ee := lockWaitCancelError(err); ee != nil {
@@ -1362,7 +1362,7 @@ func (c *Context) acquireScanReadLockTxn(rel storage.RelFileNode) error {
 	if rel.RelOid < firstNormalObjectOID {
 		return nil
 	}
-	return c.acquireRelLockMaybeTransient(rel, lockmgr.AccessShareLock)
+	return c.acquireRelLockMaybeTransient(rel, lmgr.AccessShareLock)
 }
 
 // acquireScanIndexReadLocksTxn takes a transaction-scoped ACCESS SHARE lock on
@@ -1420,7 +1420,7 @@ func (c *Context) acquireWriteLockTxn(rel storage.RelFileNode) error {
 	// the table level — only a DDL-grade lock (Share/ShareRowExclusive/
 	// Exclusive/AccessExclusive) does, matching PostgreSQL. M0118-0008
 	// (detach-partition-concurrently-3, autocommit INSERT behind FINALIZE).
-	if err := c.acquireRelLockMaybeTransient(rel, lockmgr.RowExclusiveLock); err != nil {
+	if err := c.acquireRelLockMaybeTransient(rel, lmgr.RowExclusiveLock); err != nil {
 		return err
 	}
 	// A write to a toast-bearing table also locks that table's TOAST relation
@@ -1432,7 +1432,7 @@ func (c *Context) acquireWriteLockTxn(rel storage.RelFileNode) error {
 	// (reindex-concurrently-toast, design 0118-0088).
 	if im, ok := c.Catalog.(*catalog.InMemory); ok {
 		if toastRel, has := im.ToastRelFileNode(rel); has {
-			if err := c.acquireRelLockMaybeTransient(toastRel, lockmgr.RowExclusiveLock); err != nil {
+			if err := c.acquireRelLockMaybeTransient(toastRel, lmgr.RowExclusiveLock); err != nil {
 				return err
 			}
 		}
@@ -1447,7 +1447,7 @@ func (c *Context) acquireWriteLockTxn(rel storage.RelFileNode) error {
 // reads or SELECT ... FOR UPDATE), mirroring PostgreSQL. Same confinement as the
 // scan/write siblings: a no-op outside an explicit transaction and for system
 // catalogs. M0118-0008.
-func (c *Context) acquireDDLLockTxn(rel storage.RelFileNode, mode lockmgr.Mode) error {
+func (c *Context) acquireDDLLockTxn(rel storage.RelFileNode, mode lmgr.Mode) error {
 	if c.TxnLockBackendID == 0 || rel.RelOid < firstNormalObjectOID {
 		return nil
 	}
@@ -1472,7 +1472,7 @@ func (c *Context) acquireDDLLockTxn(rel storage.RelFileNode, mode lockmgr.Mode) 
 // SERIAL/IDENTITY inserts) never block each other at the table level. System
 // catalogs (OID < firstNormalObjectOID) are skipped. M0118-0008 (sequence-ddl).
 func (c *Context) acquireSequenceLockTxn(rel storage.RelFileNode) error {
-	return c.acquireRelLockMaybeTransient(rel, lockmgr.RowExclusiveLock)
+	return c.acquireRelLockMaybeTransient(rel, lmgr.RowExclusiveLock)
 }
 
 // acquireRelLockMaybeTransient acquires the heavyweight lock `mode` on rel.
@@ -1487,7 +1487,7 @@ func (c *Context) acquireSequenceLockTxn(rel storage.RelFileNode) error {
 // no risk to other backends. System catalogs (OID < firstNormalObjectOID) are
 // skipped. Used by nextval() (RowExclusiveLock, sequence-ddl) and by REINDEX
 // SCHEMA (ShareLock per relation, reindex-schema). M0118-0008.
-func (c *Context) acquireRelLockMaybeTransient(rel storage.RelFileNode, mode lockmgr.Mode) error {
+func (c *Context) acquireRelLockMaybeTransient(rel storage.RelFileNode, mode lmgr.Mode) error {
 	if rel.RelOid < firstNormalObjectOID {
 		return nil
 	}
@@ -1498,7 +1498,7 @@ func (c *Context) acquireRelLockMaybeTransient(rel storage.RelFileNode, mode loc
 	if c.BackendID == 0 {
 		return nil
 	}
-	tag := lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
+	tag := lmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
 	if c.Activity != nil {
 		c.Activity.WaitEventStart(c.ProcNum, activity.WaitTypeLock, activity.WaitRelationLock)
 	}
@@ -1514,7 +1514,7 @@ func (c *Context) acquireRelLockMaybeTransient(rel storage.RelFileNode, mode loc
 		tableLockMgr.Release(c.BackendID, tag, mode)
 		return nil
 	}
-	if err == lockmgr.ErrDeadlockDetected {
+	if err == lmgr.ErrDeadlockDetected {
 		return &ExecError{Code: "40P01", Message: "deadlock detected"}
 	}
 	if ee := lockWaitCancelError(err); ee != nil {
@@ -1538,7 +1538,7 @@ func (c *Context) acquireRelLockMaybeTransient(rel storage.RelFileNode, mode loc
 // which are minted from the same counter and unique, so the targeted Release
 // drops exactly this probe. A zero backend (no identity at all) reports
 // available. M0118-0008 (vacuum-skip-locked).
-func (c *Context) tryAcquireMaintenanceLock(rel storage.RelFileNode, mode lockmgr.Mode) bool {
+func (c *Context) tryAcquireMaintenanceLock(rel storage.RelFileNode, mode lmgr.Mode) bool {
 	if rel.RelOid < firstNormalObjectOID {
 		return true
 	}
@@ -1549,7 +1549,7 @@ func (c *Context) tryAcquireMaintenanceLock(rel storage.RelFileNode, mode lockmg
 	if backend == 0 {
 		return true
 	}
-	tag := lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
+	tag := lmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
 	if err := tableLockMgr.TryAcquire(backend, tag, mode); err != nil {
 		return false
 	}
@@ -1582,7 +1582,7 @@ func (c *Context) waitForRelationLockers(rel storage.RelFileNode) error {
 	if rel.RelOid < firstNormalObjectOID {
 		return nil
 	}
-	tag := lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
+	tag := lmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
 	lockCtx := context.Background()
 	if c.Ctx != nil {
 		lockCtx = c.Ctx
@@ -1669,15 +1669,15 @@ func lockWaitTimeoutError(err error) *ExecError {
 // M0118-0004.
 func (c *Context) deadlockTimeout() time.Duration {
 	if c.GetSetting == nil {
-		return lockmgr.DefaultDeadlockTimeout
+		return lmgr.DefaultDeadlockTimeout
 	}
 	v, ok := c.GetSetting("deadlock_timeout")
 	if !ok {
-		return lockmgr.DefaultDeadlockTimeout
+		return lmgr.DefaultDeadlockTimeout
 	}
 	ms, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
 	if err != nil || ms <= 0 {
-		return lockmgr.DefaultDeadlockTimeout
+		return lmgr.DefaultDeadlockTimeout
 	}
 	return time.Duration(ms) * time.Millisecond
 }

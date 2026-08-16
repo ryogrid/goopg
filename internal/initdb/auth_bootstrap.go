@@ -6,7 +6,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/goopg/goopg/internal/auth"
+	"github.com/goopg/goopg/internal/libpq/auth"
 )
 
 // validAuthMethodsHost is the set of authentication methods accepted for

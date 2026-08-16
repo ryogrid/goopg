@@ -55,7 +55,7 @@ package amcheck
 import (
 	"fmt"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -98,21 +98,21 @@ func VerifyBtreePage(p storage.Page, blkno storage.BlockNumber, indexName string
 	// The metapage (block 0) carries no opaque leaf/level semantics; it is
 	// validated solely by its magic and version, mirroring upstream's
 	// dedicated BTREE_METAPAGE branch in palloc_btree_page.
-	if blkno == btree.MetaBlock {
-		meta := btree.ParseMeta(p)
-		if meta.Magic != btree.BTreeMagic {
+	if blkno == nbtree.MetaBlock {
+		meta := nbtree.ParseMeta(p)
+		if meta.Magic != nbtree.BTreeMagic {
 			return []BtreeReport{{Block: blkno, Msg: fmt.Sprintf(
 				"index \"%s\" meta page is corrupt", indexName)}}
 		}
-		if meta.Version != btree.BTreeVersion {
+		if meta.Version != nbtree.BTreeVersion {
 			return []BtreeReport{{Block: blkno, Msg: fmt.Sprintf(
 				"version mismatch in index \"%s\": file version %d, current version %d, minimum supported version %d",
-				indexName, meta.Version, btree.BTreeVersion, btree.BTreeVersion)}}
+				indexName, meta.Version, nbtree.BTreeVersion, nbtree.BTreeVersion)}}
 		}
 		return nil
 	}
 
-	opaque := btree.ParseOpaque(p)
+	opaque := nbtree.ParseOpaque(p)
 
 	// Deleted pages type-pun their level field and hold no items, so upstream
 	// skips the level checks for them (the !P_ISDELETED guard in
@@ -153,10 +153,10 @@ func VerifyBtreePage(p storage.Page, blkno storage.BlockNumber, indexName string
 		return []BtreeReport{{Block: blkno, Msg: fmt.Sprintf(
 			"index \"%s\" has a damaged page at block %d: %v", indexName, blkno, err)}}
 	}
-	if count > btree.MaxItemsPerPage {
+	if count > nbtree.MaxItemsPerPage {
 		return []BtreeReport{{Block: blkno, Msg: fmt.Sprintf(
 			"Number of items on block %d of index \"%s\" exceeds MaxIndexTuplesPerPage (%d)",
-			blkno, indexName, btree.MaxItemsPerPage)}}
+			blkno, indexName, nbtree.MaxItemsPerPage)}}
 	}
 
 	return nil
@@ -218,7 +218,7 @@ func VerifyBtreePage(p storage.Page, blkno storage.BlockNumber, indexName string
 // a caller holding the index's catalog entry must use VerifyBtreeItemOrderCmp
 // and pass the resolved format.
 func VerifyBtreeItemOrder(p storage.Page, blkno storage.BlockNumber, indexName string) []BtreeReport {
-	return VerifyBtreeItemOrderCmp(p, blkno, indexName, btree.IndexFormat{}, nil)
+	return VerifyBtreeItemOrderCmp(p, blkno, indexName, nbtree.IndexFormat{}, nil)
 }
 
 // KeyComparator compares two encoded index keys, returning <0, 0 or >0 exactly
@@ -246,16 +246,16 @@ type KeyComparator func(a, b []byte) int
 // comparator. Both invariants — high key and item order — are evaluated under
 // the comparator, matching upstream where a single opclass comparator governs
 // every key comparison amcheck performs on the index.
-func VerifyBtreeItemOrderCmp(p storage.Page, blkno storage.BlockNumber, indexName string, keyFmt btree.IndexFormat, cmpKeys KeyComparator) []BtreeReport {
+func VerifyBtreeItemOrderCmp(p storage.Page, blkno storage.BlockNumber, indexName string, keyFmt nbtree.IndexFormat, cmpKeys KeyComparator) []BtreeReport {
 	if cmpKeys == nil {
-		cmpKeys = btree.CompareKeys
+		cmpKeys = nbtree.CompareKeys
 	}
 	// The metapage has no data items; deleted pages hold none either (their
 	// level field is type-punned and the page carries no live tuples).
-	if blkno == btree.MetaBlock {
+	if blkno == nbtree.MetaBlock {
 		return nil
 	}
-	opaque := btree.ParseOpaque(p)
+	opaque := nbtree.ParseOpaque(p)
 	if opaque.IsDeleted() {
 		return nil
 	}
@@ -351,7 +351,7 @@ type PageSource func(storage.BlockNumber) (storage.Page, error)
 // per-page key order (VerifyBtreeItemOrder) are run separately and composed by the
 // SQL surface.
 func VerifyBtreeLevelSiblingLinks(src PageSource, leftmost storage.BlockNumber, indexName string) []BtreeReport {
-	if leftmost == btree.MetaBlock {
+	if leftmost == nbtree.MetaBlock {
 		return []BtreeReport{{Block: leftmost, Msg: fmt.Sprintf(
 			"index \"%s\" has a damaged page at block %d: metapage is not part of a level",
 			indexName, leftmost)}}
@@ -379,7 +379,7 @@ func VerifyBtreeLevelSiblingLinks(src PageSource, leftmost storage.BlockNumber, 
 			return []BtreeReport{{Block: current, Msg: fmt.Sprintf(
 				"index \"%s\" has a damaged page at block %d: %v", indexName, current, err)}}
 		}
-		opaque := btree.ParseOpaque(p)
+		opaque := nbtree.ParseOpaque(p)
 
 		// A deleted page must not be reachable through a sibling link.
 		if opaque.IsDeleted() {
@@ -472,11 +472,11 @@ func VerifyBtreeLevelSiblingLinks(src PageSource, leftmost storage.BlockNumber, 
 // conclusive. A leaf or deleted parentBlk (no downlinks to descend) and the
 // metapage yield nil. It performs only the cross-level checks; per-page
 // structure and key order are run separately and composed by the SQL surface.
-func VerifyBtreeParentDownlinks(src PageSource, parentBlk storage.BlockNumber, indexName string, keyFmt btree.IndexFormat, cmpKeys KeyComparator) []BtreeReport {
+func VerifyBtreeParentDownlinks(src PageSource, parentBlk storage.BlockNumber, indexName string, keyFmt nbtree.IndexFormat, cmpKeys KeyComparator) []BtreeReport {
 	if cmpKeys == nil {
-		cmpKeys = btree.CompareKeys
+		cmpKeys = nbtree.CompareKeys
 	}
-	if parentBlk == btree.MetaBlock {
+	if parentBlk == nbtree.MetaBlock {
 		return nil
 	}
 
@@ -485,7 +485,7 @@ func VerifyBtreeParentDownlinks(src PageSource, parentBlk storage.BlockNumber, i
 		return []BtreeReport{{Block: parentBlk, Msg: fmt.Sprintf(
 			"index \"%s\" has a damaged page at block %d: %v", indexName, parentBlk, err)}}
 	}
-	popaque := btree.ParseOpaque(parent)
+	popaque := nbtree.ParseOpaque(parent)
 
 	// Only internal, live pages have downlinks to descend. A leaf or deleted
 	// page yields nil (upstream descends from internal target pages only).
@@ -505,7 +505,7 @@ func VerifyBtreeParentDownlinks(src PageSource, parentBlk storage.BlockNumber, i
 			return []BtreeReport{{Block: dl.Child, Msg: fmt.Sprintf(
 				"index \"%s\" has a damaged page at block %d: %v", indexName, dl.Child, err)}}
 		}
-		copaque := btree.ParseOpaque(child)
+		copaque := nbtree.ParseOpaque(child)
 
 		// Downlink-to-deleted: a deleted page is unlinked and must not be a
 		// downlink target.

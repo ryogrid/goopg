@@ -3,7 +3,7 @@ package executor
 import (
 	"testing"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // pg_stat_force_next_flush() and pg_stat_clear_snapshot() are void no-ops in
@@ -15,7 +15,7 @@ import (
 // exist (42883)". Each must now evaluate to a non-NULL void-like value.
 func TestPgStatFlushSnapshotVoidNoops(t *testing.T) {
 	for _, name := range []string{"pg_stat_force_next_flush", "pg_stat_clear_snapshot"} {
-		call := &planner.FuncCall{Name: name}
+		call := &optimizer.FuncCall{Name: name}
 		got, err := evalFuncCall(call, nil, &Context{})
 		if err != nil {
 			t.Fatalf("evalFuncCall(%s): %v", name, err)

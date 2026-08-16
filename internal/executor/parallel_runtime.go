@@ -13,7 +13,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/goopg/goopg/internal/mctx"
+	"github.com/goopg/goopg/internal/utils/mmgr"
 )
 
 // ── tuple ownership ─────────────────────────────────────────────────────────
@@ -62,7 +62,7 @@ func MaterializeForTransfer(row Row) Row {
 // for the production send path.
 func AssertTransferable(row Row) error {
 	for i, d := range row {
-		if d.ArenaID == 0 || d.ArenaID == mctx.PermContextID {
+		if d.ArenaID == 0 || d.ArenaID == mmgr.PermContextID {
 			continue
 		}
 		return fmt.Errorf(

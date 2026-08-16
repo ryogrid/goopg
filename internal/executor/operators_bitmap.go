@@ -1,12 +1,12 @@
 package executor
 
 import (
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/lockmgr"
-	"github.com/goopg/goopg/internal/mctx"
-	"github.com/goopg/goopg/internal/pgarray"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/storage/lmgr"
+	"github.com/goopg/goopg/internal/utils/mmgr"
+	"github.com/goopg/goopg/internal/utils/adt/array"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -25,21 +25,21 @@ type bitmapProducer interface {
 // ---------------------------------------------------------------------------
 
 type bitmapIndexScanOp struct {
-	plan *planner.BitmapIndexScan
+	plan *optimizer.BitmapIndexScan
 	ctx  *Context
 
 	heapRel storage.RelFileNode
-	tree    *btree.BTree
+	tree    *nbtree.BTree
 
 	// scanRow is lazily allocated for evalExpr (needs a Row context).
 	scanRow Row
 }
 
-func newBitmapIndexScanOp(p *planner.BitmapIndexScan) *bitmapIndexScanOp {
+func newBitmapIndexScanOp(p *optimizer.BitmapIndexScan) *bitmapIndexScanOp {
 	return &bitmapIndexScanOp{plan: p}
 }
 
-func (o *bitmapIndexScanOp) Schema() planner.Schema { return o.plan.Output() }
+func (o *bitmapIndexScanOp) Schema() optimizer.Schema { return o.plan.Output() }
 
 func (o *bitmapIndexScanOp) Open(ctx *Context) error {
 	if ctx.Pool == nil || ctx.Catalog == nil {
@@ -49,7 +49,7 @@ func (o *bitmapIndexScanOp) Open(ctx *Context) error {
 	o.heapRel = ctx.Catalog.RelFileNode(o.plan.Table)
 
 	// Acquire relation locks (mirrors indexScanOp.openPrep).
-	if err := ctx.acquireRelLock(o.heapRel, lockmgr.AccessShareLock); err != nil {
+	if err := ctx.acquireRelLock(o.heapRel, lmgr.AccessShareLock); err != nil {
 		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 			ee.Pos = o.plan.Pos()
 		}
@@ -114,7 +114,7 @@ func (o *bitmapIndexScanOp) buildBitmap(ctx *Context) (*TIDBitmap, error) {
 	}
 
 	// Scan the B-tree and feed TIDs into the bitmap.
-	scanFn := func(_ []byte, ptr storage.ItemPointer, _ btree.ScanPos) (bool, error) {
+	scanFn := func(_ []byte, ptr storage.ItemPointer, _ nbtree.ScanPos) (bool, error) {
 		tbmAddTuples(tbm, []storage.ItemPointer{ptr}, recheck)
 		return true, nil
 	}
@@ -225,7 +225,7 @@ func (o *bitmapIndexScanOp) lookupKeys(firstCol *catalog.Column) (lo, hi []byte,
 // ---------------------------------------------------------------------------
 
 type bitmapHeapScanOp struct {
-	plan *planner.BitmapHeapScan
+	plan *optimizer.BitmapHeapScan
 	ctx  *Context
 	tbl  *catalog.Table
 	rel  storage.RelFileNode
@@ -247,7 +247,7 @@ type bitmapHeapScanOp struct {
 	// scanRow is reused per Next() — zero allocation per tuple.
 	scanRow Row
 	// mctx is the per-page byte arena for varlena payloads.
-	mctx *mctx.Context
+	mctx *mmgr.Context
 	// slot is the embedded MaterializedSlot reused every Next().
 	slot MaterializedSlot
 	// cols maps column index → catalog.Column for decode.
@@ -258,7 +258,7 @@ type bitmapHeapScanOp struct {
 	// once in Open and only for a relation that has an array column. The two
 	// scans are siblings — a bitmap heap scan and a seq scan of the same array
 	// column must print the same text. M0119-0006.
-	arrayStyle     pgarray.OutputStyle
+	arrayStyle     array.OutputStyle
 	arrayStyleLive bool
 
 	// Stats.
@@ -276,11 +276,11 @@ type bitmapHeapScanOp struct {
 	ownBitmap bool
 }
 
-func newBitmapHeapScanOp(p *planner.BitmapHeapScan) *bitmapHeapScanOp {
+func newBitmapHeapScanOp(p *optimizer.BitmapHeapScan) *bitmapHeapScanOp {
 	return &bitmapHeapScanOp{plan: p}
 }
 
-func (o *bitmapHeapScanOp) Schema() planner.Schema { return o.plan.Output() }
+func (o *bitmapHeapScanOp) Schema() optimizer.Schema { return o.plan.Output() }
 
 func (o *bitmapHeapScanOp) Open(ctx *Context) error {
 	if ctx.Pool == nil || ctx.Catalog == nil {
@@ -307,7 +307,7 @@ func (o *bitmapHeapScanOp) Open(ctx *Context) error {
 
 	// Create mctx for per-page byte arena.
 	if ctx.Mctx != nil {
-		o.mctx = mctx.Acquire(ctx.Mctx, mctx.KindExpr)
+		o.mctx = mmgr.Acquire(ctx.Mctx, mmgr.KindExpr)
 	}
 
 	// S5.6: when a parallel bitmap state is attached, the bitmap was already
@@ -616,17 +616,17 @@ func (o *bitmapHeapScanOp) evalBitmapQual() (bool, error) {
 // ---------------------------------------------------------------------------
 
 type bitmapAndOp struct {
-	plan       *planner.BitmapAnd
+	plan       *optimizer.BitmapAnd
 	inputs     []Operator
 	inputBitmaps []bitmapProducer
 	ctx        *Context
 }
 
-func newBitmapAndOp(p *planner.BitmapAnd) *bitmapAndOp {
+func newBitmapAndOp(p *optimizer.BitmapAnd) *bitmapAndOp {
 	return &bitmapAndOp{plan: p}
 }
 
-func (o *bitmapAndOp) Schema() planner.Schema { return o.plan.Output() }
+func (o *bitmapAndOp) Schema() optimizer.Schema { return o.plan.Output() }
 
 func (o *bitmapAndOp) Open(ctx *Context) error {
 	o.ctx = ctx
@@ -686,17 +686,17 @@ func (o *bitmapAndOp) buildBitmap(ctx *Context) (*TIDBitmap, error) {
 }
 
 type bitmapOrOp struct {
-	plan         *planner.BitmapOr
+	plan         *optimizer.BitmapOr
 	inputs       []Operator
 	inputBitmaps []bitmapProducer
 	ctx          *Context
 }
 
-func newBitmapOrOp(p *planner.BitmapOr) *bitmapOrOp {
+func newBitmapOrOp(p *optimizer.BitmapOr) *bitmapOrOp {
 	return &bitmapOrOp{plan: p}
 }
 
-func (o *bitmapOrOp) Schema() planner.Schema { return o.plan.Output() }
+func (o *bitmapOrOp) Schema() optimizer.Schema { return o.plan.Output() }
 
 func (o *bitmapOrOp) Open(ctx *Context) error {
 	o.ctx = ctx

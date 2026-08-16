@@ -35,7 +35,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // funcStatCounters holds the cumulative counters for one function OID.
@@ -276,7 +276,7 @@ func sessionStatsID(ctx *Context) uint64 {
 // getter. It returns ok=false when the argument evaluates to SQL NULL (the
 // getter then returns NULL), and an error only when argument evaluation itself
 // fails.
-func statFuncOIDArg(x *planner.FuncCall, row Row, ctx *Context) (uint32, bool, error) {
+func statFuncOIDArg(x *optimizer.FuncCall, row Row, ctx *Context) (uint32, bool, error) {
 	if len(x.Args) == 0 {
 		return 0, false, nil
 	}

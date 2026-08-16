@@ -23,7 +23,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // resetFixture: one plain table (heap order = insertion order for this
@@ -55,7 +55,7 @@ func buildFor(t *testing.T, ctx *Context, sql string) Operator {
 	if err != nil {
 		t.Fatalf("parse %q: %v", sql, err)
 	}
-	plan, err := planner.Plan(stmts[0], ctx.Catalog)
+	plan, err := optimizer.Plan(stmts[0], ctx.Catalog)
 	if err != nil {
 		t.Fatalf("plan %q: %v", sql, err)
 	}
@@ -170,7 +170,7 @@ func TestLimitOpDoubleOpenResets(t *testing.T) {
 // stubRowsOp is a minimal re-openable child for isolating limitOp: Open
 // rewinds, Next yields the fixed rows.
 type stubRowsOp struct {
-	schema planner.Schema
+	schema optimizer.Schema
 	rows   []Row
 	i      int
 }
@@ -185,7 +185,7 @@ func (s *stubRowsOp) Next() (TupleSlot, error) { //nolint:ireturn
 	return SlotFromRow(s.schema, r), nil
 }
 func (s *stubRowsOp) Close() error           { return nil }
-func (s *stubRowsOp) Schema() planner.Schema { return s.schema }
+func (s *stubRowsOp) Schema() optimizer.Schema { return s.schema }
 
 // TestLimitOpWithTiesDoubleOpenResets pins the ties-state reset
 // (inTiesPhase/tieKeyVals) in isolation, over a stub child so the test
@@ -196,14 +196,14 @@ func TestLimitOpWithTiesDoubleOpenResets(t *testing.T) {
 	ctx, cleanup := resetFixture(t)
 	defer cleanup()
 
-	schema := planner.Schema{{Name: "k", Type: catalog.Type{Name: "int4"}}}
+	schema := optimizer.Schema{{Name: "k", Type: catalog.Type{Name: "int4"}}}
 	child := &stubRowsOp{schema: schema, rows: []Row{
 		{NewIntDatum(1)}, {NewIntDatum(1)}, {NewIntDatum(2)},
 	}}
-	lim := newLimitOp(&planner.Limit{
-		Limit:    &planner.IntegerConst{Value: 1},
+	lim := newLimitOp(&optimizer.Limit{
+		Limit:    &optimizer.IntegerConst{Value: 1},
 		WithTies: true,
-		TiesKeys: []planner.Expr{&planner.ColumnRef{Name: "k", Index: 0}},
+		TiesKeys: []optimizer.Expr{&optimizer.ColumnRef{Name: "k", Index: 0}},
 	}, child)
 
 	for pass := 1; pass <= 2; pass++ {

@@ -71,7 +71,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 )
 
 // heapAllIndexedWorkMemKB bounds the Bloom filter bitset, standing in for
@@ -90,7 +90,7 @@ const heapAllIndexedWorkMemKB = 64 * 1024
 // present entry would hash differently on the two sides and produce a false
 // "lacks matching index tuple" report — the sibling-path invariant the package
 // guards (see pattern_sibling_paths_must_agree).
-func fingerprintLeafEntry(e btree.LeafEntry) []byte {
+func fingerprintLeafEntry(e nbtree.LeafEntry) []byte {
 	buf := make([]byte, 6+len(e.Key))
 	binary.BigEndian.PutUint32(buf[0:4], uint32(e.TID.Block))
 	binary.BigEndian.PutUint16(buf[4:6], e.TID.Offset)
@@ -118,7 +118,7 @@ func fingerprintLeafEntry(e btree.LeafEntry) []byte {
 // Like the other engines in this package it returns findings, never a Go error:
 // an empty index with a non-empty heap correctly yields one report per heap row
 // (every row lacks an index entry), and an empty heap yields none.
-func VerifyBtreeHeapAllIndexed(indexLeafEntries, heapEntries []btree.LeafEntry, indexName, tableName string, seed uint64) []BtreeReport {
+func VerifyBtreeHeapAllIndexed(indexLeafEntries, heapEntries []nbtree.LeafEntry, indexName, tableName string, seed uint64) []BtreeReport {
 	filter := bloomCreate(int64(len(indexLeafEntries)), heapAllIndexedWorkMemKB, seed)
 	for _, e := range indexLeafEntries {
 		filter.bloomAddElement(fingerprintLeafEntry(e))

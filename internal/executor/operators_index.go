@@ -3,13 +3,13 @@ package executor
 import (
 	"fmt"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/lockmgr"
-	"github.com/goopg/goopg/internal/multixact"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/storage/lmgr"
+	"github.com/goopg/goopg/internal/access/transam/multixact"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -24,7 +24,7 @@ import (
 // ItemIDRedirect line pointers (created by opportunistic pruning when a chain
 // root is freed) are followed transparently — the redirect leads to the live
 // chain tip, skipping the freed slots.
-func followHOTChain(page storage.Page, startSlot uint16, snap mvcc.Snapshot, xid storage.TransactionID, mxs *multixact.Store, curcid storage.CommandId, combo *mvcc.ComboCIDStore) (storage.HeapTuple, uint16, bool) {
+func followHOTChain(page storage.Page, startSlot uint16, snap transam.Snapshot, xid storage.TransactionID, mxs *multixact.Store, curcid storage.CommandId, combo *transam.ComboCIDStore) (storage.HeapTuple, uint16, bool) {
 	// A chain visits distinct slots of ONE page, so MaxHeapTuplesPerPage is
 	// both the tightest correct cycle guard and the only bound PG's
 	// heap_hot_search_buffer implies (it loops until at_chain_end). The
@@ -56,7 +56,7 @@ func followHOTChain(page storage.Page, startSlot uint16, snap mvcc.Snapshot, xid
 		if err != nil {
 			return storage.HeapTuple{}, 0, false
 		}
-		if mvcc.TupleVisible(t.Header, snap, xid, curcid, combo, mxs) {
+		if transam.TupleVisible(t.Header, snap, xid, curcid, combo, mxs) {
 			return t, cur, true
 		}
 		if !t.Header.IsHotUpdated() {
@@ -76,7 +76,7 @@ func followHOTChain(page storage.Page, startSlot uint16, snap mvcc.Snapshot, xid
 // PageGetHeapTupleNoCopy variant. Caller MUST hold the page's
 // content RLock for the lifetime of the returned tuple — the
 // returned tuple.Data aliases the page bytes (M0092-0006).
-func followHOTChainNoCopy(page storage.Page, startSlot uint16, snap mvcc.Snapshot, xid storage.TransactionID, mxs *multixact.Store, curcid storage.CommandId, combo *mvcc.ComboCIDStore) (storage.HeapTuple, uint16, bool) {
+func followHOTChainNoCopy(page storage.Page, startSlot uint16, snap transam.Snapshot, xid storage.TransactionID, mxs *multixact.Store, curcid storage.CommandId, combo *transam.ComboCIDStore) (storage.HeapTuple, uint16, bool) {
 	// Same bound as followHOTChain — see the rationale there (M0131-S32).
 	const maxChain = storage.MaxHeapTuplesPerPage
 	cur := startSlot
@@ -100,7 +100,7 @@ func followHOTChainNoCopy(page storage.Page, startSlot uint16, snap mvcc.Snapsho
 		if err != nil {
 			return storage.HeapTuple{}, 0, false
 		}
-		if mvcc.TupleVisible(t.Header, snap, xid, curcid, combo, mxs) {
+		if transam.TupleVisible(t.Header, snap, xid, curcid, combo, mxs) {
 			return t, cur, true
 		}
 		if !t.Header.IsHotUpdated() {
@@ -183,7 +183,7 @@ func (o *indexScanOp) flushKills() {
 }
 
 type indexScanOp struct {
-	plan *planner.IndexScan
+	plan *optimizer.IndexScan
 	ctx  *Context
 	// M0092-0001: TID-list-eager + heap-fetch-lazy.
 	// `tids[i]` holds the (block, index-pointed offset) pair for the
@@ -208,14 +208,14 @@ type indexScanOp struct {
 	// chain proved dead-to-all at the Next() visibility step. S3 turns
 	// killList into the deferred exclusive-latched mark pass at
 	// Close/Rescan; S2 only collects.
-	poss     []btree.ScanPos
-	killList []btree.KillItem
+	poss     []nbtree.ScanPos
+	killList []nbtree.KillItem
 
 	// M0054-0006a: state captured at Open() time and reused across
 	// Rescan() calls when the index probe is driven by an outer row
 	// from a parent NestedLoopIndexJoin.
 	heapRel storage.RelFileNode
-	tree    *btree.BTree
+	tree    *nbtree.BTree
 	// M0072-0001: outerSlot is the slot the parent NLI bound via
 	// BindOuter. The slot's Get(col) is read by lookupKey /
 	// lookupRangeBounds / lookupKeys via evalExprSlot. nil when this
@@ -254,11 +254,11 @@ type indexScanOp struct {
 	hashProbeFingerprint []byte
 }
 
-func newIndexScanOp(p *planner.IndexScan) *indexScanOp {
+func newIndexScanOp(p *optimizer.IndexScan) *indexScanOp {
 	return &indexScanOp{plan: p}
 }
 
-func (o *indexScanOp) Schema() planner.Schema { return o.plan.Output() }
+func (o *indexScanOp) Schema() optimizer.Schema { return o.plan.Output() }
 
 // Open performs the one-time prep (lock + btree.Open) and then runs
 // a single drain pass with no outer row bound (the historical
@@ -306,7 +306,7 @@ func (o *indexScanOp) openPrep(ctx *Context) error {
 	o.outerWidth = 0
 
 	o.heapRel = ctx.Catalog.RelFileNode(o.plan.Table)
-	if err := ctx.acquireRelLock(o.heapRel, lockmgr.AccessShareLock); err != nil {
+	if err := ctx.acquireRelLock(o.heapRel, lmgr.AccessShareLock); err != nil {
 		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 			ee.Pos = o.plan.Pos()
 		}
@@ -460,7 +460,7 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	// M0092-0001: lazy iteration. The scanFn collects only TIDs;
 	// HOT-chain follow + decode + detoast happen per Next() so the
 	// produced row aliases scanRow (no cloneRow per match).
-	scanFn := func(_ []byte, ptr storage.ItemPointer, pos btree.ScanPos) (bool, error) {
+	scanFn := func(_ []byte, ptr storage.ItemPointer, pos nbtree.ScanPos) (bool, error) {
 		o.tids = append(o.tids, ptr)
 		o.poss = append(o.poss, pos) // C3-S2: kill-list coordinates
 		return true, nil
@@ -558,7 +558,7 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 			if o.ctx.TxnMgr != nil {
 				if tidIdx := o.idx - 1; tidIdx >= 0 && tidIdx < len(o.poss) {
 					if heapChainDeadToAll(slot.Page(), ptr.Offset, o.ctx.TxnMgr.OldestXmin()) {
-						o.killList = append(o.killList, btree.KillItem{Pos: o.poss[tidIdx], Ptr: ptr})
+						o.killList = append(o.killList, nbtree.KillItem{Pos: o.poss[tidIdx], Ptr: ptr})
 					}
 				}
 			}

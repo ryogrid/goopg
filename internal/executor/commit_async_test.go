@@ -4,7 +4,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -16,15 +16,15 @@ import (
 // autocommit) goes through this one method, so this is the single seam that
 // proves the session's synchronous_commit setting reaches the commit path.
 func TestContextCommitTransactionRespectsAsyncCommit(t *testing.T) {
-	mgr := mvcc.NewManager()
+	mgr := transam.NewManager()
 	var got []bool
-	mgr.SetXactMarkerLogger(func(_ storage.TransactionID, _ mvcc.XactMarker, waitLocalFlush bool) error {
+	mgr.SetXactMarkerLogger(func(_ storage.TransactionID, _ transam.XactMarker, waitLocalFlush bool) error {
 		got = append(got, waitLocalFlush)
 		return nil
 	})
 
-	beginAndAssign := func() mvcc.Transaction {
-		tx, err := mgr.Begin(mvcc.IsolationReadCommitted)
+	beginAndAssign := func() transam.Transaction {
+		tx, err := mgr.Begin(transam.IsolationReadCommitted)
 		if err != nil {
 			t.Fatal(err)
 		}

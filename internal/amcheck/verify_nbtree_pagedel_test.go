@@ -3,7 +3,7 @@ package amcheck_test
 import (
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/amcheck"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -38,7 +38,7 @@ import (
 // derived heap TIDs (same scheme as buildRealTree) so the heapallindexed
 // round-trip can distinguish entries and the caller can reconstruct the TID of
 // any inserted key.
-func buildRealTreeHandle(t *testing.T, keys [][]byte) (*storage.Manager, *storage.Pool, storage.RelFileNode, *btree.BTree, func()) {
+func buildRealTreeHandle(t *testing.T, keys [][]byte) (*storage.Manager, *storage.Pool, storage.RelFileNode, *nbtree.BTree, func()) {
 	t.Helper()
 	dir := t.TempDir()
 	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
@@ -47,11 +47,11 @@ func buildRealTreeHandle(t *testing.T, keys [][]byte) (*storage.Manager, *storag
 		t.Fatalf("NewPool: %v", err)
 	}
 	rel := storage.RelFileNode{DBOid: 1, RelOid: 9200, Fork: storage.MainFork}
-	bt, err := btree.Create(pool, rel)
+	bt, err := nbtree.Create(pool, rel)
 	if err != nil {
 		_ = pool.Close()
 		_ = mgr.Close()
-		t.Fatalf("btree.Create: %v", err)
+		t.Fatalf("nbtree.Create: %v", err)
 	}
 	for i, k := range keys {
 		ptr := storage.ItemPointer{Block: storage.BlockNumber(i/100 + 1), Offset: uint16(i%100 + 1)}
@@ -88,7 +88,7 @@ func leafChainBlocks(t *testing.T, src amcheck.PageSource, root storage.BlockNum
 		if err != nil {
 			t.Fatalf("read leaf %d: %v", cur, err)
 		}
-		op := btree.ParseOpaque(p)
+		op := nbtree.ParseOpaque(p)
 		if !op.IsLeaf() {
 			t.Fatalf("block %d on leaf chain is not a leaf", cur)
 		}
@@ -118,11 +118,11 @@ func leafTIDs(t *testing.T, src amcheck.PageSource, blk storage.BlockNumber) []s
 // rootOf reads the metapage and returns the current root block.
 func rootOf(t *testing.T, src amcheck.PageSource) storage.BlockNumber {
 	t.Helper()
-	p, err := src(btree.MetaBlock)
+	p, err := src(nbtree.MetaBlock)
 	if err != nil {
 		t.Fatalf("read metapage: %v", err)
 	}
-	return btree.ParseMeta(p).Root
+	return nbtree.ParseMeta(p).Root
 }
 
 // assertLeafDeleted asserts the given leaf block is now flagged deleted (unlinked
@@ -134,7 +134,7 @@ func assertLeafDeleted(t *testing.T, src amcheck.PageSource, blk storage.BlockNu
 	if err != nil {
 		t.Fatalf("read deleted leaf %d: %v", blk, err)
 	}
-	if !btree.ParseOpaque(p).IsDeleted() {
+	if !nbtree.ParseOpaque(p).IsDeleted() {
 		t.Fatalf("leaf %d was expected to be deleted after VacuumIndexPages but is still live", blk)
 	}
 }
@@ -148,7 +148,7 @@ func TestVerifyBtreeEngineSilentAfterInteriorLeafDeletion(t *testing.T) {
 	const n = 3000
 	keys := make([][]byte, n)
 	for i := range n {
-		keys[i] = btree.EncodeInt4(int32(i))
+		keys[i] = nbtree.EncodeInt4(int32(i))
 	}
 	mgr, pool, rel, bt, cleanup := buildRealTreeHandle(t, keys)
 	defer cleanup()
@@ -196,7 +196,7 @@ func TestVerifyBtreeEngineSilentAfterMultiLeafDeletion(t *testing.T) {
 	const n = 3000
 	keys := make([][]byte, n)
 	for i := range n {
-		keys[i] = btree.EncodeInt4(int32(i))
+		keys[i] = nbtree.EncodeInt4(int32(i))
 	}
 	mgr, pool, rel, bt, cleanup := buildRealTreeHandle(t, keys)
 	defer cleanup()
@@ -259,7 +259,7 @@ func TestVerifyBtreeEngineSilentAfterAdjacentLeafDeletion(t *testing.T) {
 	const n = 3000
 	keys := make([][]byte, n)
 	for i := range n {
-		keys[i] = btree.EncodeInt4(int32(i))
+		keys[i] = nbtree.EncodeInt4(int32(i))
 	}
 	mgr, pool, rel, bt, cleanup := buildRealTreeHandle(t, keys)
 	defer cleanup()

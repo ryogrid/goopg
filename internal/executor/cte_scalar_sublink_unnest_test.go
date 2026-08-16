@@ -20,7 +20,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // q30ShapeSQL is Q30 reduced to its planning-relevant skeleton: a grouped WITH
@@ -94,8 +94,8 @@ func TestCTEScalarSublinkDecorrelatesAndAgrees(t *testing.T) {
 
 	// Same query, same data, pull-up disabled — the SubPlan path's answer is
 	// the oracle here (it is the shape that shipped before this change).
-	planner.SetSubqueryUnnestEnabled(false)
-	defer planner.SetSubqueryUnnestEnabled(true)
+	optimizer.SetSubqueryUnnestEnabled(false)
+	defer optimizer.SetSubqueryUnnestEnabled(true)
 
 	ctxOff, _, cleanupOff := newDDLFixture(t)
 	t.Cleanup(cleanupOff)

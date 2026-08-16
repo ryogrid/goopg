@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/pgarray"
+	"github.com/goopg/goopg/internal/utils/adt/array"
 )
 
 // goopg flattens an array column to its "{…}" text during the HEAP DECODE,
@@ -35,16 +35,16 @@ func TestHeapArrayDecodeHonoursSessionStyle(t *testing.T) {
 	}
 	cases := []struct {
 		name string
-		st   pgarray.OutputStyle
+		st   array.OutputStyle
 		want string
 	}{
-		{"default (UTC/ISO)", pgarray.DefaultOutputStyle(),
+		{"default (UTC/ISO)", array.DefaultOutputStyle(),
 			`{"2020-06-15 10:00:00+00","2020-01-15 10:00:00+00"}`},
-		{"Asia/Kolkata ISO", pgarray.OutputStyle{Style: "ISO", Order: "MDY", Zone: "Asia/Kolkata"},
+		{"Asia/Kolkata ISO", array.OutputStyle{Style: "ISO", Order: "MDY", Zone: "Asia/Kolkata"},
 			`{"2020-06-15 15:30:00+05:30","2020-01-15 15:30:00+05:30"}`},
-		{"America/Los_Angeles ISO (DST both sides)", pgarray.OutputStyle{Style: "ISO", Order: "MDY", Zone: "America/Los_Angeles"},
+		{"America/Los_Angeles ISO (DST both sides)", array.OutputStyle{Style: "ISO", Order: "MDY", Zone: "America/Los_Angeles"},
 			`{"2020-06-15 03:00:00-07","2020-01-15 02:00:00-08"}`},
-		{"Postgres MDY + LA", pgarray.OutputStyle{Style: "Postgres", Order: "MDY", Zone: "America/Los_Angeles"},
+		{"Postgres MDY + LA", array.OutputStyle{Style: "Postgres", Order: "MDY", Zone: "America/Los_Angeles"},
 			`{"Mon Jun 15 03:00:00 2020 PDT","Wed Jan 15 02:00:00 2020 PST"}`},
 	}
 	for _, c := range cases {
@@ -78,8 +78,8 @@ func TestArrayKeyTextMatchesHeapTextUnderSessionStyle(t *testing.T) {
 	if encErr != nil {
 		t.Fatalf("key encode: %s", encErr.Message)
 	}
-	for _, st := range []pgarray.OutputStyle{
-		pgarray.DefaultOutputStyle(),
+	for _, st := range []array.OutputStyle{
+		array.DefaultOutputStyle(),
 		{Style: "ISO", Order: "MDY", Zone: "Asia/Kolkata"},
 		{Style: "German", Order: "DMY", Zone: "America/Los_Angeles"},
 		{Style: "Postgres", Order: "MDY", Zone: "Asia/Kathmandu"},
@@ -107,7 +107,7 @@ func TestArrayOutputStyleReadsTheSameGUCs(t *testing.T) {
 	// OutputStyle now carries a func field (the reg* OID→name renderer), so
 	// the struct is not comparable — compare the GUC fields and renderer
 	// nil-ness individually. M0119-0006 reg* element slice.
-	assertStyle := func(name string, got, want pgarray.OutputStyle, wantRegOutNil bool) {
+	assertStyle := func(name string, got, want array.OutputStyle, wantRegOutNil bool) {
 		t.Helper()
 		if got.Style != want.Style || got.Order != want.Order || got.Zone != want.Zone {
 			t.Errorf("%s = {Style:%q Order:%q Zone:%q}, want {Style:%q Order:%q Zone:%q}",
@@ -117,7 +117,7 @@ func TestArrayOutputStyleReadsTheSameGUCs(t *testing.T) {
 			t.Errorf("%s RegOut nil = %v, want %v", name, got.RegOut == nil, wantRegOutNil)
 		}
 	}
-	assertStyle("nil ctx", arrayOutputStyle(nil), pgarray.DefaultOutputStyle(), true)
+	assertStyle("nil ctx", arrayOutputStyle(nil), array.DefaultOutputStyle(), true)
 	ctx := &Context{GetSetting: func(name string) (string, bool) {
 		switch name {
 		case "datestyle":
@@ -129,12 +129,12 @@ func TestArrayOutputStyleReadsTheSameGUCs(t *testing.T) {
 	}}
 	// The GUC-only ctx has no catalog, so the renderer stays nil.
 	assertStyle("GUC ctx", arrayOutputStyle(ctx),
-		pgarray.OutputStyle{Style: "German", Order: "DMY", Zone: "Asia/Kolkata"}, true)
+		array.OutputStyle{Style: "German", Order: "DMY", Zone: "Asia/Kolkata"}, true)
 	// A session that has set neither GUC must land on the boot default, not on
 	// a zero-valued style (whose empty Style would still format as ISO but
 	// whose empty Order would be a silent behaviour change for SQL/Postgres).
 	bare := &Context{GetSetting: func(string) (string, bool) { return "", false }}
-	assertStyle("unset GUCs", arrayOutputStyle(bare), pgarray.DefaultOutputStyle(), true)
+	assertStyle("unset GUCs", arrayOutputStyle(bare), array.DefaultOutputStyle(), true)
 	// A catalog-carrying session binds the reg* renderer (nil → non-nil).
 	ctxCat := regCopyCat(t)
 	if got := arrayOutputStyle(ctxCat); got.RegOut == nil {

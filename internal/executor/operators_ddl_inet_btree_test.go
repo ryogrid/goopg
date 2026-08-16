@@ -6,7 +6,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // M0134-0002 C5: inet/cidr B-tree keys. The encoder's byte order must equal
@@ -289,11 +289,11 @@ func TestInetExpressionKeyGateAcceptsInet(t *testing.T) {
 	// createBTreeIndex resolves index expressions exactly like the build path:
 	// ResolveIndexPredicate populates the ColumnRef's Type, which
 	// ExprResultType then reports.
-	planExpr, err := planner.ResolveIndexPredicate(pe, tbl)
+	planExpr, err := optimizer.ResolveIndexPredicate(pe, tbl)
 	if err != nil || planExpr == nil {
 		t.Fatalf("ResolveIndexPredicate: %v", err)
 	}
-	typ, ok := planner.ExprResultType(planExpr)
+	typ, ok := optimizer.ExprResultType(planExpr)
 	if !ok {
 		t.Fatalf("ExprResultType: inet column reference resolved to no type")
 	}

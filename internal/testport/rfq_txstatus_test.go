@@ -34,7 +34,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goopg/goopg/internal/protocol"
+	"github.com/goopg/goopg/internal/libpq"
 	"github.com/goopg/goopg/internal/testutil/cluster"
 )
 
@@ -42,8 +42,8 @@ import (
 // back the terminating ReadyForQuery status byte.
 type rfqConn struct {
 	conn net.Conn
-	r    *protocol.FrameReader
-	w    *protocol.FrameWriter
+	r    *libpq.FrameReader
+	w    *libpq.FrameWriter
 }
 
 func dialRFQ(t *testing.T, addr string) *rfqConn {
@@ -56,7 +56,7 @@ func dialRFQ(t *testing.T, addr string) *rfqConn {
 	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
 
 	body := make([]byte, 4)
-	binary.BigEndian.PutUint32(body, protocol.ProtocolVersion3_0)
+	binary.BigEndian.PutUint32(body, libpq.ProtocolVersion3_0)
 	for _, kv := range [][2]string{{"user", "postgres"}, {"database", "postgres"}} {
 		body = append(body, kv[0]...)
 		body = append(body, 0)
@@ -71,8 +71,8 @@ func dialRFQ(t *testing.T, addr string) *rfqConn {
 		t.Fatalf("write startup packet: %v", err)
 	}
 
-	c := &rfqConn{conn: conn, r: protocol.NewFrameReader(conn), w: protocol.NewFrameWriter(conn)}
-	if got := c.readUntilReady(t); got != protocol.TxStatusIdle {
+	c := &rfqConn{conn: conn, r: libpq.NewFrameReader(conn), w: libpq.NewFrameWriter(conn)}
+	if got := c.readUntilReady(t); got != libpq.TxStatusIdle {
 		t.Fatalf("handshake ReadyForQuery = %q, want 'I'", got)
 	}
 	return c
@@ -80,7 +80,7 @@ func dialRFQ(t *testing.T, addr string) *rfqConn {
 
 // readUntilReady drains frames up to and including ReadyForQuery and returns
 // its status byte.
-func (c *rfqConn) readUntilReady(t *testing.T) protocol.TransactionStatus {
+func (c *rfqConn) readUntilReady(t *testing.T) libpq.TransactionStatus {
 	t.Helper()
 	for {
 		f, err := c.r.ReadFrame()
@@ -90,18 +90,18 @@ func (c *rfqConn) readUntilReady(t *testing.T) protocol.TransactionStatus {
 			}
 			t.Fatalf("read frame: %v", err)
 		}
-		if f.Type == protocol.MsgReadyForQuery {
+		if f.Type == libpq.MsgReadyForQuery {
 			if len(f.Payload) != 1 {
 				t.Fatalf("ReadyForQuery payload = %d bytes, want 1", len(f.Payload))
 			}
-			return protocol.TransactionStatus(f.Payload[0])
+			return libpq.TransactionStatus(f.Payload[0])
 		}
 	}
 }
 
 // exec sends one simple Query and returns the status byte of its
 // ReadyForQuery.
-func (c *rfqConn) exec(t *testing.T, sql string) protocol.TransactionStatus {
+func (c *rfqConn) exec(t *testing.T, sql string) libpq.TransactionStatus {
 	t.Helper()
 	if err := c.w.WriteQuery(sql); err != nil {
 		t.Fatalf("write Query %q: %v", sql, err)
@@ -124,26 +124,26 @@ func TestPort_ReadyForQueryTransactionStatus(t *testing.T) {
 
 	steps := []struct {
 		sql  string
-		want protocol.TransactionStatus
+		want libpq.TransactionStatus
 		why  string
 	}{
-		{"SELECT 1", protocol.TxStatusIdle, "autocommit statement outside any block"},
-		{"BEGIN", protocol.TxStatusInTransaction, "explicit block open and valid"},
-		{"CREATE TEMP TABLE rfq_t (a int)", protocol.TxStatusInTransaction, "successful statement inside the block"},
-		{"INSERT INTO rfq_t VALUES (0)", protocol.TxStatusInTransaction, "successful write inside the block"},
+		{"SELECT 1", libpq.TxStatusIdle, "autocommit statement outside any block"},
+		{"BEGIN", libpq.TxStatusInTransaction, "explicit block open and valid"},
+		{"CREATE TEMP TABLE rfq_t (a int)", libpq.TxStatusInTransaction, "successful statement inside the block"},
+		{"INSERT INTO rfq_t VALUES (0)", libpq.TxStatusInTransaction, "successful write inside the block"},
 		// A RUNTIME error (division by a column value, so the planner cannot
 		// constant-fold it) — this is the path that reaches
 		// dispatchSimpleQueryViaExecutor's connTxState.Fail().
-		{"SELECT 1/a FROM rfq_t", protocol.TxStatusInFailedTransaction, "the erroring statement's own ReadyForQuery"},
-		{"SELECT 1", protocol.TxStatusInFailedTransaction, "25P02 while the block stays aborted"},
-		{"ROLLBACK", protocol.TxStatusIdle, "ROLLBACK closes the failed block"},
-		{"SELECT 1", protocol.TxStatusIdle, "back to autocommit"},
+		{"SELECT 1/a FROM rfq_t", libpq.TxStatusInFailedTransaction, "the erroring statement's own ReadyForQuery"},
+		{"SELECT 1", libpq.TxStatusInFailedTransaction, "25P02 while the block stays aborted"},
+		{"ROLLBACK", libpq.TxStatusIdle, "ROLLBACK closes the failed block"},
+		{"SELECT 1", libpq.TxStatusIdle, "back to autocommit"},
 		// An autocommit statement that errors does NOT open a block: PG
 		// reports 'I', not 'E'.
-		{"SELECT 1/0", protocol.TxStatusIdle, "autocommit error leaves no open block"},
+		{"SELECT 1/0", libpq.TxStatusIdle, "autocommit error leaves no open block"},
 		// COMMIT path.
-		{"BEGIN", protocol.TxStatusInTransaction, "second block"},
-		{"COMMIT", protocol.TxStatusIdle, "COMMIT closes the block"},
+		{"BEGIN", libpq.TxStatusInTransaction, "second block"},
+		{"COMMIT", libpq.TxStatusIdle, "COMMIT closes the block"},
 	}
 	for i, st := range steps {
 		got := conn.exec(t, st.sql)
@@ -156,10 +156,10 @@ func TestPort_ReadyForQueryTransactionStatus(t *testing.T) {
 	// The pgbench loop itself: after the failed block is rolled back, the next
 	// BEGIN must succeed. Before the fix this returned 25P02 because the client
 	// had been told (via 'I') that there was no block left to roll back.
-	if got := conn.exec(t, "BEGIN"); got != protocol.TxStatusInTransaction {
+	if got := conn.exec(t, "BEGIN"); got != libpq.TxStatusInTransaction {
 		t.Fatalf("BEGIN after recovered block = %q, want 'T'", string(got))
 	}
-	if got := conn.exec(t, "END"); got != protocol.TxStatusIdle {
+	if got := conn.exec(t, "END"); got != libpq.TxStatusIdle {
 		t.Fatalf("END = %q, want 'I'", string(got))
 	}
 
@@ -173,13 +173,13 @@ func TestPort_ReadyForQueryTransactionStatus(t *testing.T) {
 	// a separate, pre-existing divergence from upstream (every error inside a
 	// transaction block aborts it: AbortCurrentTransaction, xact.c). Recorded
 	// in .ralph/deferral_ledger.md; do not widen this test until it is fixed.
-	if got := conn.exec(t, "BEGIN"); got != protocol.TxStatusInTransaction {
+	if got := conn.exec(t, "BEGIN"); got != libpq.TxStatusInTransaction {
 		t.Fatalf("BEGIN = %q, want 'T'", string(got))
 	}
-	if got := conn.exec(t, "SELECT undefined_column_xyz"); got != protocol.TxStatusInFailedTransaction {
+	if got := conn.exec(t, "SELECT undefined_column_xyz"); got != libpq.TxStatusInFailedTransaction {
 		t.Fatalf("plan-time failure in block = %q, want 'E'", string(got))
 	}
-	if got := conn.exec(t, "ROLLBACK"); got != protocol.TxStatusIdle {
+	if got := conn.exec(t, "ROLLBACK"); got != libpq.TxStatusIdle {
 		t.Fatalf("ROLLBACK = %q, want 'I'", string(got))
 	}
 }

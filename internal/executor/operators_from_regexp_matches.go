@@ -9,19 +9,19 @@ package executor
 // evalRegexpMatchesSRF/regexpAllMatchesArrays machinery landed for the
 // SELECT-list form. M0122-0002 follow-up.
 
-import "github.com/goopg/goopg/internal/planner"
+import "github.com/goopg/goopg/internal/optimizer"
 
 type fromRegexpMatchesOp struct {
-	plan *planner.FromRegexpMatches
+	plan *optimizer.FromRegexpMatches
 	rows []Row
 	idx  int
 }
 
-func newFromRegexpMatchesOp(p *planner.FromRegexpMatches) *fromRegexpMatchesOp {
+func newFromRegexpMatchesOp(p *optimizer.FromRegexpMatches) *fromRegexpMatchesOp {
 	return &fromRegexpMatchesOp{plan: p}
 }
 
-func (o *fromRegexpMatchesOp) Schema() planner.Schema { return o.plan.Output() }
+func (o *fromRegexpMatchesOp) Schema() optimizer.Schema { return o.plan.Output() }
 
 func (o *fromRegexpMatchesOp) Open(ctx *Context) error {
 	o.rows = nil

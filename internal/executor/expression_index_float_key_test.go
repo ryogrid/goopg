@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -14,8 +14,8 @@ import (
 // anything whose planner.ExprResultType is a float type. A bare ColumnRef is the
 // smallest such expression and keeps this unit test independent of which
 // float-returning overloads the pg_proc seed happens to carry.
-func floatKeyExprOf(typeName string) planner.Expr {
-	return &planner.ColumnRef{Type: catalog.Type{Name: typeName}}
+func floatKeyExprOf(typeName string) optimizer.Expr {
+	return &optimizer.ColumnRef{Type: catalog.Type{Name: typeName}}
 }
 
 // TestEncodeArbiterExprKeyFloatIsTypeDirected is the regression witness for the
@@ -134,9 +134,9 @@ func TestExpressionIndexBuildFloatKey(t *testing.T) {
 // bytes nor float-decodable into the right neighbourhood.
 func assertFloatKeyOrder(t *testing.T, ctx *Context, idx *catalog.Index, want int) {
 	t.Helper()
-	tree, err := btree.Open(ctx.Pool, ctx.Catalog.IndexRelFileNode(idx))
+	tree, err := nbtree.Open(ctx.Pool, ctx.Catalog.IndexRelFileNode(idx))
 	if err != nil {
-		t.Fatalf("btree.Open(%s): %v", idx.Name, err)
+		t.Fatalf("nbtree.Open(%s): %v", idx.Name, err)
 	}
 	var vals []float64
 	if err := tree.RangeScan(nil, nil, func(key []byte, _ storage.ItemPointer) (bool, error) {
@@ -144,7 +144,7 @@ func assertFloatKeyOrder(t *testing.T, ctx *Context, idx *catalog.Index, want in
 			t.Errorf("key %x is %d bytes, want the 8 of EncodeFloat8", key, len(key))
 			return true, nil
 		}
-		f, derr := btree.DecodeFloat8(key)
+		f, derr := nbtree.DecodeFloat8(key)
 		if derr != nil {
 			t.Errorf("key %x does not decode as float8: %v", key, derr)
 			return true, nil

@@ -6,26 +6,26 @@ package executor
 import (
 	"sort"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // distinctOp filters duplicate rows from its child operator.
 // It buffers all rows in memory and deduplicates using the same string-key
 // approach as the recursive UNION dedup. M0097-0005.
 type distinctOp struct {
-	plan   *planner.Distinct
+	plan   *optimizer.Distinct
 	child  Operator
 	ctx    *Context
 	rows   []Row
 	idx    int
-	schema planner.Schema
+	schema optimizer.Schema
 }
 
-func newDistinctOp(p *planner.Distinct, child Operator) *distinctOp {
+func newDistinctOp(p *optimizer.Distinct, child Operator) *distinctOp {
 	return &distinctOp{plan: p, child: child, schema: p.Output()}
 }
 
-func (o *distinctOp) Schema() planner.Schema { return o.schema }
+func (o *distinctOp) Schema() optimizer.Schema { return o.schema }
 
 func (o *distinctOp) Open(ctx *Context) error {
 	o.ctx = ctx
@@ -121,19 +121,19 @@ func (o *distinctOp) Close() error { return o.child.Close() }
 // and emitting only the first row per distinct key combination.
 // The child must be pre-sorted so rows with equal keys are contiguous.
 type distinctOnOp struct {
-	plan    *planner.DistinctOn
+	plan    *optimizer.DistinctOn
 	child   Operator
 	ctx     *Context
-	schema  planner.Schema
+	schema  optimizer.Schema
 	prevKey string
 	started bool
 }
 
-func newDistinctOnOp(p *planner.DistinctOn, child Operator) *distinctOnOp {
+func newDistinctOnOp(p *optimizer.DistinctOn, child Operator) *distinctOnOp {
 	return &distinctOnOp{plan: p, child: child, schema: p.Output()}
 }
 
-func (o *distinctOnOp) Schema() planner.Schema { return o.schema }
+func (o *distinctOnOp) Schema() optimizer.Schema { return o.schema }
 
 func (o *distinctOnOp) Open(ctx *Context) error {
 	o.ctx = ctx

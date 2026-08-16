@@ -4,10 +4,10 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser" //nolint:revive
 	"github.com/goopg/goopg/internal/storage"
-	"github.com/goopg/goopg/internal/vacuum"
+	"github.com/goopg/goopg/internal/commands/vacuum"
 )
 
 // newFreezeFixture creates a context wired with FSM, VM, and a FreezeMinAge
@@ -247,11 +247,11 @@ func TestAutoVacuumAntiWraparoundTrigger(t *testing.T) {
 // and AssignXID is the call that fails when nextXID is near the
 // uint32 ceiling.
 func TestXIDWarnLimit(t *testing.T) {
-	mgr := mvcc.NewManager()
+	mgr := transam.NewManager()
 	// Advance to just below the stop limit.
 	mgr.SetNextXID(^storage.TransactionID(0) - 2_000_000)
 	// Begin still succeeds — it doesn't touch nextXID under M0093.
-	tx, err := mgr.Begin(mvcc.IsolationReadCommitted)
+	tx, err := mgr.Begin(transam.IsolationReadCommitted)
 	if err != nil {
 		t.Fatalf("Begin unexpectedly failed near wraparound: %v", err)
 	}

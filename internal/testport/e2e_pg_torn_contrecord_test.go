@@ -64,7 +64,7 @@ import (
 	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/testutil/cluster"
 	"github.com/goopg/goopg/internal/testutil/pgcluster"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 func TestE2E_PGCrashStartOnGoopgTornContrecord(t *testing.T) {
@@ -265,25 +265,25 @@ func TestE2E_PGCrashStartOnGoopgTornContrecord(t *testing.T) {
 	// path over goopg's stream — the page flag cannot appear for any other
 	// reason — and that goopg's page addressing let it resume exactly there.
 	hdr := readWALPageHeader(t, cut.segPath, cut.off)
-	if hdr.Magic != wal.XLOGPageMagic {
+	if hdr.Magic != xlog.XLOGPageMagic {
 		t.Fatalf("page at %s+%d has magic 0x%04x after PG recovery, want 0x%04x — upstream never "+
 			"resumed writing at the missing continuation's page, so it did not treat goopg's tail as "+
 			"an aborted contrecord (it stopped earlier, discarding committed WAL silently)",
-			filepath.Base(cut.segPath), cut.off, hdr.Magic, wal.XLOGPageMagic)
+			filepath.Base(cut.segPath), cut.off, hdr.Magic, xlog.XLOGPageMagic)
 	}
 	if hdr.PageAddr != cut.pageAddr {
 		t.Fatalf("page at %s+%d has xlp_pageaddr=%d after PG recovery, want %d (the value goopg "+
 			"stamped there) — upstream's end-of-log accounting disagrees with goopg's page addressing",
 			filepath.Base(cut.segPath), cut.off, hdr.PageAddr, cut.pageAddr)
 	}
-	if hdr.Info&wal.XLPFirstIsOverwriteContRecord == 0 {
+	if hdr.Info&xlog.XLPFirstIsOverwriteContRecord == 0 {
 		t.Fatalf("page at %s+%d is xlp_info=0x%04x after PG recovery: no "+
 			"XLP_FIRST_IS_OVERWRITE_CONTRECORD. Upstream sets that bit only from "+
 			"CreateOverwriteContrecordRecord, i.e. only when recovery ended inside a multi-page "+
 			"record; its absence means goopg's tail did not present as an aborted contrecord",
 			filepath.Base(cut.segPath), cut.off, hdr.Info)
 	}
-	if hdr.Info&wal.XLPFirstIsContRecord != 0 {
+	if hdr.Info&xlog.XLPFirstIsContRecord != 0 {
 		t.Fatalf("page at %s+%d carries BOTH XLP_FIRST_IS_CONTRECORD and "+
 			"XLP_FIRST_IS_OVERWRITE_CONTRECORD (xlp_info=0x%04x) — upstream replaces the flag, it "+
 			"does not add to it", filepath.Base(cut.segPath), cut.off, hdr.Info)
@@ -357,16 +357,16 @@ scan:
 		if err != nil {
 			t.Fatalf("open %s: %v", seg, err)
 		}
-		for off := int64(0); off+wal.SizeOfXLogLongPHD <= segSize; off += wal.XLOGBlockSize {
-			buf := make([]byte, wal.SizeOfXLogLongPHD)
+		for off := int64(0); off+xlog.SizeOfXLogLongPHD <= segSize; off += xlog.XLOGBlockSize {
+			buf := make([]byte, xlog.SizeOfXLogLongPHD)
 			if _, err := f.ReadAt(buf, off); err != nil {
 				break
 			}
-			hdr, err := wal.DecodeXLogPageHeader(buf)
+			hdr, err := xlog.DecodeXLogPageHeader(buf)
 			// A zeroed or unparseable page header is the end of the written
 			// stream (goopg preallocates zero-filled segments); stale contents
 			// of a recycled segment are rejected by the pageaddr check below.
-			if err != nil || hdr.Magic != wal.XLOGPageMagic {
+			if err != nil || hdr.Magic != xlog.XLOGPageMagic {
 				_ = f.Close()
 				break scan
 			}
@@ -376,7 +376,7 @@ scan:
 			}
 			prevPageAddr = hdr.PageAddr
 			lastValid[seg] = off
-			if hdr.Info&wal.XLPFirstIsContRecord != 0 && off > 0 {
+			if hdr.Info&xlog.XLPFirstIsContRecord != 0 && off > 0 {
 				best = tornCut{segPath: seg, off: off, pageAddr: hdr.PageAddr, remLen: hdr.RemLen}
 				bestSegIx = ix
 				found = true
@@ -398,7 +398,7 @@ scan:
 		t.Fatalf("stat %s: %v", best.segPath, err)
 	}
 	if lv, ok := lastValid[best.segPath]; ok {
-		best.pagesDiscarded = int((lv - best.off) / wal.XLOGBlockSize)
+		best.pagesDiscarded = int((lv - best.off) / xlog.XLOGBlockSize)
 	}
 	zeroRange(t, best.segPath, best.off, fi.Size()-best.off)
 	for _, seg := range segs[bestSegIx+1:] {
@@ -407,7 +407,7 @@ scan:
 			continue
 		}
 		if lv, ok := lastValid[seg]; ok {
-			best.pagesDiscarded += int(lv/wal.XLOGBlockSize) + 1
+			best.pagesDiscarded += int(lv/xlog.XLOGBlockSize) + 1
 		}
 		zeroRange(t, seg, 0, sfi.Size())
 	}
@@ -460,22 +460,22 @@ func zeroRange(t *testing.T, path string, off, n int64) {
 	}
 }
 
-func readWALPageHeader(t *testing.T, segPath string, off int64) wal.XLogPageHeader {
+func readWALPageHeader(t *testing.T, segPath string, off int64) xlog.XLogPageHeader {
 	t.Helper()
 	f, err := os.Open(segPath)
 	if err != nil {
 		t.Fatalf("open %s: %v", segPath, err)
 	}
 	defer func() { _ = f.Close() }()
-	buf := make([]byte, wal.SizeOfXLogLongPHD)
+	buf := make([]byte, xlog.SizeOfXLogLongPHD)
 	if _, err := f.ReadAt(buf, off); err != nil {
 		t.Fatalf("read page header %s@%d: %v", segPath, off, err)
 	}
 	// A zeroed page decodes as an invalid header; return it as-is so the caller
 	// can report the magic it actually found.
-	hdr, err := wal.DecodeXLogPageHeader(buf)
+	hdr, err := xlog.DecodeXLogPageHeader(buf)
 	if err != nil {
-		return wal.XLogPageHeader{Magic: binary.LittleEndian.Uint16(buf[0:2])}
+		return xlog.XLogPageHeader{Magic: binary.LittleEndian.Uint16(buf[0:2])}
 	}
 	return hdr
 }

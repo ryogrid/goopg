@@ -14,9 +14,9 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/executor"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // runCreateTablespaceInPlace issues `CREATE TABLESPACE name LOCATION ''`
@@ -33,7 +33,7 @@ func runCreateTablespaceInPlace(t *testing.T, rt *Runtime, name string) {
 	if err != nil {
 		t.Fatalf("parse %q: %v", sql, err)
 	}
-	plan, err := planner.Plan(stmts[0], rt.Catalog)
+	plan, err := optimizer.Plan(stmts[0], rt.Catalog)
 	if err != nil {
 		t.Fatalf("plan %q: %v", sql, err)
 	}
@@ -41,7 +41,7 @@ func runCreateTablespaceInPlace(t *testing.T, rt *Runtime, name string) {
 	if err != nil {
 		t.Fatalf("build %q: %v", sql, err)
 	}
-	tx, err := rt.TxnMgr.Begin(mvcc.IsolationReadCommitted)
+	tx, err := rt.TxnMgr.Begin(transam.IsolationReadCommitted)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}

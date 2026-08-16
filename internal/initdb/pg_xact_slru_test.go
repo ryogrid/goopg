@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -78,14 +78,14 @@ func TestBootstrapCLog_WritesPGCanonicalSLRU(t *testing.T) {
 	// Reopening via the production recovery sequence must still resolve the
 	// bootstrap/frozen XIDs as committed (the short-circuit, with the SLRU as the
 	// live store).
-	c, err := mvcc.OpenCLog(flatPath)
+	c, err := transam.OpenCLog(flatPath)
 	if err != nil {
 		t.Fatalf("OpenCLog: %v", err)
 	}
 	if err := c.EnablePGSLRUMirror(pgXactDir); err != nil {
 		t.Fatalf("EnablePGSLRUMirror: %v", err)
 	}
-	if !c.DidCommit(mvcc.BootstrapTransactionID, nil) || !c.DidCommit(mvcc.FrozenTransactionID, nil) {
+	if !c.DidCommit(transam.BootstrapTransactionID, nil) || !c.DidCommit(transam.FrozenTransactionID, nil) {
 		t.Errorf("bootstrap/frozen XIDs not resolved committed after reopen")
 	}
 }
@@ -106,7 +106,7 @@ func TestCLog_SLRUMirror_StatusBitLayout(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dataDir, "global"), 0700); err != nil {
 		t.Fatalf("mkdir global: %v", err)
 	}
-	clog, err := mvcc.OpenCLog(filepath.Join(dataDir, "global", "pg_xact"))
+	clog, err := transam.OpenCLog(filepath.Join(dataDir, "global", "pg_xact"))
 	if err != nil {
 		t.Fatalf("OpenCLog: %v", err)
 	}
@@ -160,7 +160,7 @@ func TestCLog_SLRUMirror_ExtendsSegmentFile(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dataDir, "global"), 0700); err != nil {
 		t.Fatalf("mkdir global: %v", err)
 	}
-	clog, err := mvcc.OpenCLog(filepath.Join(dataDir, "global", "pg_xact"))
+	clog, err := transam.OpenCLog(filepath.Join(dataDir, "global", "pg_xact"))
 	if err != nil {
 		t.Fatalf("OpenCLog: %v", err)
 	}
@@ -194,7 +194,7 @@ func TestCLog_SLRUMirror_SegmentRollover(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dataDir, "global"), 0700); err != nil {
 		t.Fatalf("mkdir global: %v", err)
 	}
-	clog, err := mvcc.OpenCLog(filepath.Join(dataDir, "global", "pg_xact"))
+	clog, err := transam.OpenCLog(filepath.Join(dataDir, "global", "pg_xact"))
 	if err != nil {
 		t.Fatalf("OpenCLog: %v", err)
 	}

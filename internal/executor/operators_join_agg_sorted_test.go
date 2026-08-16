@@ -4,30 +4,30 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // sortedAggPlan builds an Aggregate over a Values child for the sorted-strategy
 // tests. kCols are the 0-based child column indexes of the GROUP BY key, vCol is
 // the column summed by the second aggregate, and sortedRows must arrive already
 // ordered by the key columns (ascending), as the S8 contract requires.
-func sortedAggPlan(strategy planner.AggStrategy, kCols []int, vCol int, rows [][]planner.Expr) *planner.Aggregate {
-	groupExprs := make([]planner.Expr, 0, len(kCols))
+func sortedAggPlan(strategy optimizer.AggStrategy, kCols []int, vCol int, rows [][]optimizer.Expr) *optimizer.Aggregate {
+	groupExprs := make([]optimizer.Expr, 0, len(kCols))
 	for _, ci := range kCols {
-		groupExprs = append(groupExprs, &planner.ColumnRef{Index: ci, Name: "k", Type: catalog.Type{Name: "int4"}})
+		groupExprs = append(groupExprs, &optimizer.ColumnRef{Index: ci, Name: "k", Type: catalog.Type{Name: "int4"}})
 	}
-	return &planner.Aggregate{
+	return &optimizer.Aggregate{
 		Strategy:   strategy,
-		Child:      &planner.Values{Rows: rows},
+		Child:      &optimizer.Values{Rows: rows},
 		GroupExprs: groupExprs,
-		Aggs: []planner.AggregateCall{
+		Aggs: []optimizer.AggregateCall{
 			{Name: "count", Star: true, Type: catalog.Type{Name: "int8"}},
-			{Name: "sum", Arg: &planner.ColumnRef{Index: vCol, Name: "v", Type: catalog.Type{Name: "int4"}}, Type: catalog.Type{Name: "int8"}},
+			{Name: "sum", Arg: &optimizer.ColumnRef{Index: vCol, Name: "v", Type: catalog.Type{Name: "int4"}}, Type: catalog.Type{Name: "int8"}},
 		},
 	}
 }
 
-func runAgg(t *testing.T, plan *planner.Aggregate) []Row {
+func runAgg(t *testing.T, plan *optimizer.Aggregate) []Row {
 	t.Helper()
 	op, err := Build(plan)
 	if err != nil {
@@ -46,16 +46,16 @@ func runAgg(t *testing.T, plan *planner.Aggregate) []Row {
 // (input) order. The hash path's M0097-0117 pre-sort orders by GroupExprs the
 // same way, so this expectation is strategy-independent.
 func TestAggSortedGrouping(t *testing.T) {
-	rows := [][]planner.Expr{
-		{&planner.IntegerConst{Value: 1}, &planner.IntegerConst{Value: 1}, &planner.IntegerConst{Value: 10}},
-		{&planner.IntegerConst{Value: 1}, &planner.IntegerConst{Value: 1}, &planner.IntegerConst{Value: 20}}, // adjacent equal key
-		{&planner.IntegerConst{Value: 1}, &planner.IntegerConst{Value: 2}, &planner.IntegerConst{Value: 5}},  // same k1, new k2
-		{&planner.IntegerConst{Value: 2}, &planner.IntegerConst{Value: 1}, &planner.IntegerConst{Value: 7}},
-		{&planner.IntegerConst{Value: 2}, &planner.IntegerConst{Value: 1}, &planner.IntegerConst{Value: 3}}, // adjacent equal key
-		{&planner.IntegerConst{Value: 2}, &planner.IntegerConst{Value: 3}, &planner.IntegerConst{Value: 9}},
-		{&planner.IntegerConst{Value: 3}, &planner.IntegerConst{Value: 1}, &planner.IntegerConst{Value: 4}},
+	rows := [][]optimizer.Expr{
+		{&optimizer.IntegerConst{Value: 1}, &optimizer.IntegerConst{Value: 1}, &optimizer.IntegerConst{Value: 10}},
+		{&optimizer.IntegerConst{Value: 1}, &optimizer.IntegerConst{Value: 1}, &optimizer.IntegerConst{Value: 20}}, // adjacent equal key
+		{&optimizer.IntegerConst{Value: 1}, &optimizer.IntegerConst{Value: 2}, &optimizer.IntegerConst{Value: 5}},  // same k1, new k2
+		{&optimizer.IntegerConst{Value: 2}, &optimizer.IntegerConst{Value: 1}, &optimizer.IntegerConst{Value: 7}},
+		{&optimizer.IntegerConst{Value: 2}, &optimizer.IntegerConst{Value: 1}, &optimizer.IntegerConst{Value: 3}}, // adjacent equal key
+		{&optimizer.IntegerConst{Value: 2}, &optimizer.IntegerConst{Value: 3}, &optimizer.IntegerConst{Value: 9}},
+		{&optimizer.IntegerConst{Value: 3}, &optimizer.IntegerConst{Value: 1}, &optimizer.IntegerConst{Value: 4}},
 	}
-	got := runAgg(t, sortedAggPlan(planner.AggStrategySorted, []int{0, 1}, 2, rows))
+	got := runAgg(t, sortedAggPlan(optimizer.AggStrategySorted, []int{0, 1}, 2, rows))
 
 	want := []struct {
 		k1, k2, cnt, sum int64
@@ -84,12 +84,12 @@ func TestAggSortedGrouping(t *testing.T) {
 // under the sorted strategy — datumKey renders NULL identically to the hash
 // path, and element-wise parts comparison groups all NULL-keyed rows together.
 func TestAggSortedNullKey(t *testing.T) {
-	rows := [][]planner.Expr{
-		{&planner.NullConst{}, &planner.IntegerConst{Value: 10}},
-		{&planner.NullConst{}, &planner.IntegerConst{Value: 20}},
-		{&planner.NullConst{}, &planner.IntegerConst{Value: 30}},
+	rows := [][]optimizer.Expr{
+		{&optimizer.NullConst{}, &optimizer.IntegerConst{Value: 10}},
+		{&optimizer.NullConst{}, &optimizer.IntegerConst{Value: 20}},
+		{&optimizer.NullConst{}, &optimizer.IntegerConst{Value: 30}},
 	}
-	got := runAgg(t, sortedAggPlan(planner.AggStrategySorted, []int{0}, 1, rows))
+	got := runAgg(t, sortedAggPlan(optimizer.AggStrategySorted, []int{0}, 1, rows))
 	if len(got) != 1 {
 		t.Fatalf("rows=%d want 1 (all NULL keys one group): %+v", len(got), got)
 	}
@@ -108,16 +108,16 @@ func TestAggSortedNullKey(t *testing.T) {
 // the hash path's M0097-0117 pre-sort orders by GroupExprs exactly as the
 // sorted path's input-order emission does.
 func TestAggSortedHashParity(t *testing.T) {
-	rows := [][]planner.Expr{
-		{&planner.IntegerConst{Value: 1}, &planner.IntegerConst{Value: 1}, &planner.IntegerConst{Value: 10}},
-		{&planner.IntegerConst{Value: 1}, &planner.IntegerConst{Value: 1}, &planner.IntegerConst{Value: 20}},
-		{&planner.IntegerConst{Value: 1}, &planner.IntegerConst{Value: 2}, &planner.IntegerConst{Value: 5}},
-		{&planner.IntegerConst{Value: 2}, &planner.IntegerConst{Value: 1}, &planner.IntegerConst{Value: 7}},
-		{&planner.IntegerConst{Value: 2}, &planner.IntegerConst{Value: 1}, &planner.IntegerConst{Value: 3}},
-		{&planner.IntegerConst{Value: 3}, &planner.IntegerConst{Value: 1}, &planner.IntegerConst{Value: 4}},
+	rows := [][]optimizer.Expr{
+		{&optimizer.IntegerConst{Value: 1}, &optimizer.IntegerConst{Value: 1}, &optimizer.IntegerConst{Value: 10}},
+		{&optimizer.IntegerConst{Value: 1}, &optimizer.IntegerConst{Value: 1}, &optimizer.IntegerConst{Value: 20}},
+		{&optimizer.IntegerConst{Value: 1}, &optimizer.IntegerConst{Value: 2}, &optimizer.IntegerConst{Value: 5}},
+		{&optimizer.IntegerConst{Value: 2}, &optimizer.IntegerConst{Value: 1}, &optimizer.IntegerConst{Value: 7}},
+		{&optimizer.IntegerConst{Value: 2}, &optimizer.IntegerConst{Value: 1}, &optimizer.IntegerConst{Value: 3}},
+		{&optimizer.IntegerConst{Value: 3}, &optimizer.IntegerConst{Value: 1}, &optimizer.IntegerConst{Value: 4}},
 	}
-	sorted := runAgg(t, sortedAggPlan(planner.AggStrategySorted, []int{0, 1}, 2, rows))
-	hashed := runAgg(t, sortedAggPlan(planner.AggStrategyHashed, []int{0, 1}, 2, rows))
+	sorted := runAgg(t, sortedAggPlan(optimizer.AggStrategySorted, []int{0, 1}, 2, rows))
+	hashed := runAgg(t, sortedAggPlan(optimizer.AggStrategyHashed, []int{0, 1}, 2, rows))
 
 	if len(sorted) != len(hashed) {
 		t.Fatalf("sorted=%d rows, hashed=%d rows", len(sorted), len(hashed))
@@ -150,11 +150,11 @@ func TestAggSortedHashParity(t *testing.T) {
 // empty child yields zero output rows and no panic. (An ungrouped aggregate
 // would emit one row, but the sorted gate requires len(GroupExprs) > 0.)
 func TestAggSortedEmptyInput(t *testing.T) {
-	empty := [][]planner.Expr{}
-	if got := runAgg(t, sortedAggPlan(planner.AggStrategySorted, []int{0}, 1, empty)); len(got) != 0 {
+	empty := [][]optimizer.Expr{}
+	if got := runAgg(t, sortedAggPlan(optimizer.AggStrategySorted, []int{0}, 1, empty)); len(got) != 0 {
 		t.Errorf("sorted empty input produced %d rows, want 0", len(got))
 	}
-	if got := runAgg(t, sortedAggPlan(planner.AggStrategyHashed, []int{0}, 1, empty)); len(got) != 0 {
+	if got := runAgg(t, sortedAggPlan(optimizer.AggStrategyHashed, []int{0}, 1, empty)); len(got) != 0 {
 		t.Errorf("hashed empty input produced %d rows, want 0", len(got))
 	}
 }
@@ -164,16 +164,16 @@ func TestAggSortedEmptyInput(t *testing.T) {
 // "GroupAggregate", the (zero-value) Strategy=Hashed aggregate keeps
 // "HashAggregate", and the ungrouped branch is unaffected ("Aggregate").
 func TestExplainAggregateStrategyLabel(t *testing.T) {
-	groupExprs := []planner.Expr{&planner.ColumnRef{Index: 0, Name: "k", Type: catalog.Type{Name: "int4"}}}
-	aggs := []planner.AggregateCall{{Name: "count", Star: true, Type: catalog.Type{Name: "int8"}}}
+	groupExprs := []optimizer.Expr{&optimizer.ColumnRef{Index: 0, Name: "k", Type: catalog.Type{Name: "int4"}}}
+	aggs := []optimizer.AggregateCall{{Name: "count", Star: true, Type: catalog.Type{Name: "int8"}}}
 
-	if got := describePlan(&planner.Aggregate{Strategy: planner.AggStrategySorted, GroupExprs: groupExprs, Aggs: aggs}, nil); got != "GroupAggregate" {
+	if got := describePlan(&optimizer.Aggregate{Strategy: optimizer.AggStrategySorted, GroupExprs: groupExprs, Aggs: aggs}, nil); got != "GroupAggregate" {
 		t.Errorf("sorted label=%q want GroupAggregate", got)
 	}
-	if got := describePlan(&planner.Aggregate{GroupExprs: groupExprs, Aggs: aggs}, nil); got != "HashAggregate" {
+	if got := describePlan(&optimizer.Aggregate{GroupExprs: groupExprs, Aggs: aggs}, nil); got != "HashAggregate" {
 		t.Errorf("hashed label=%q want HashAggregate", got)
 	}
-	if got := describePlan(&planner.Aggregate{Aggs: aggs}, nil); got != "Aggregate" {
+	if got := describePlan(&optimizer.Aggregate{Aggs: aggs}, nil); got != "Aggregate" {
 		t.Errorf("ungrouped label=%q want Aggregate", got)
 	}
 }

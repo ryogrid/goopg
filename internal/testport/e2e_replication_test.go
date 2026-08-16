@@ -11,12 +11,12 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/executor"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/testutil/cluster"
 	"github.com/goopg/goopg/internal/testutil/replcluster"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // TestE2E_PhysicalReplication tests a primary ↔ standby pair end-to-end.
@@ -98,7 +98,7 @@ func TestE2E_LogicalReplication(t *testing.T) {
 		t.Fatal(err)
 	}
 	pubRel := pubCat.RelFileNode(pubTbl)
-	snap := wal.BuildCatalogSnapshot(pubCat, nil)
+	snap := xlog.BuildCatalogSnapshot(pubCat, nil)
 
 	// Subscriber catalog + storage + transaction manager + apply worker.
 	subDir := t.TempDir()
@@ -113,13 +113,13 @@ func TestE2E_LogicalReplication(t *testing.T) {
 	if _, err := subCat.CreateTable(parser.ObjectName{Name: "pub_t"}, pubCols); err != nil {
 		t.Fatal(err)
 	}
-	subTxnMgr := mvcc.NewManager()
+	subTxnMgr := transam.NewManager()
 	applyWorker := executor.NewApplyWorker(subCat, subPool, subTxnMgr)
 
 	// applyMsg decodes and applies a single pgoutput message.
 	applyMsg := func(t *testing.T, payload []byte) {
 		t.Helper()
-		m, err := wal.DecodeMessage(payload)
+		m, err := xlog.DecodeMessage(payload)
 		if err != nil {
 			t.Fatalf("DecodeMessage: %v", err)
 		}
@@ -129,10 +129,10 @@ func TestE2E_LogicalReplication(t *testing.T) {
 	}
 
 	// emitMsg encodes one pgoutput message into its own buffer using fn.
-	emitMsg := func(t *testing.T, fn func(po *wal.PgOutput) error) []byte {
+	emitMsg := func(t *testing.T, fn func(po *xlog.PgOutput) error) []byte {
 		t.Helper()
 		var buf bytes.Buffer
-		po := wal.NewPgOutput(snap, &buf)
+		po := xlog.NewPgOutput(snap, &buf)
 		if err := fn(po); err != nil {
 			t.Fatal(err)
 		}
@@ -141,8 +141,8 @@ func TestE2E_LogicalReplication(t *testing.T) {
 
 	// emitChange encodes a Change; the first call for a relation also
 	// emits an 'R' message ahead of the change kind byte.
-	emitChange := func(t *testing.T, c wal.Change) []byte {
-		return emitMsg(t, func(po *wal.PgOutput) error { return po.Change(c) })
+	emitChange := func(t *testing.T, c xlog.Change) []byte {
+		return emitMsg(t, func(po *xlog.PgOutput) error { return po.Change(c) })
 	}
 
 	// makeTuple encodes a row as a PG-physical heap-tuple byte slice
@@ -164,14 +164,14 @@ func TestE2E_LogicalReplication(t *testing.T) {
 	// pgoutput message one at a time to the apply worker.
 	driveXact := func(t *testing.T, xid uint32, changes [][]byte) {
 		t.Helper()
-		applyMsg(t, emitMsg(t, func(po *wal.PgOutput) error {
+		applyMsg(t, emitMsg(t, func(po *xlog.PgOutput) error {
 			return po.Begin(storage.TransactionID(xid), uint64(xid)*100)
 		}))
 		for _, payload := range changes {
 			// The change payload may start with 'R' (relation) followed
 			// by the actual change kind. Split and apply each message.
 			for len(payload) > 0 {
-				m, err := wal.DecodeMessage(payload)
+				m, err := xlog.DecodeMessage(payload)
 				if err != nil {
 					t.Fatalf("DecodeMessage in driveXact: %v", err)
 				}
@@ -181,15 +181,15 @@ func TestE2E_LogicalReplication(t *testing.T) {
 				payload = payload[logicalRepMsgLen(m, payload):]
 			}
 		}
-		applyMsg(t, emitMsg(t, func(po *wal.PgOutput) error {
+		applyMsg(t, emitMsg(t, func(po *xlog.PgOutput) error {
 			return po.Commit(storage.TransactionID(xid), uint64(xid)*100)
 		}))
 	}
 
 	// Tx 1: INSERT (id=1, val='hello') → subscriber should have 1 row.
 	driveXact(t, 1, [][]byte{
-		emitChange(t, wal.Change{
-			Kind:     wal.ChangeInsert,
+		emitChange(t, xlog.Change{
+			Kind:     xlog.ChangeInsert,
 			Rel:      pubRel,
 			NewTuple: makeTuple(t, 1, "hello"),
 		}),
@@ -197,8 +197,8 @@ func TestE2E_LogicalReplication(t *testing.T) {
 
 	// Tx 2: DELETE (id=1) → subscriber should have 0 rows.
 	driveXact(t, 2, [][]byte{
-		emitChange(t, wal.Change{
-			Kind:     wal.ChangeDelete,
+		emitChange(t, xlog.Change{
+			Kind:     xlog.ChangeDelete,
 			Rel:      pubRel,
 			OldTuple: makeTuple(t, 1, "hello"),
 		}),
@@ -206,8 +206,8 @@ func TestE2E_LogicalReplication(t *testing.T) {
 
 	// Tx 3: INSERT (id=2, val='world') → 1 row.
 	driveXact(t, 3, [][]byte{
-		emitChange(t, wal.Change{
-			Kind:     wal.ChangeInsert,
+		emitChange(t, xlog.Change{
+			Kind:     xlog.ChangeInsert,
 			Rel:      pubRel,
 			NewTuple: makeTuple(t, 2, "world"),
 		}),
@@ -215,8 +215,8 @@ func TestE2E_LogicalReplication(t *testing.T) {
 
 	// Tx 4: UPDATE (id=2, val='world') → (id=2, val='updated').
 	driveXact(t, 4, [][]byte{
-		emitChange(t, wal.Change{
-			Kind:     wal.ChangeUpdate,
+		emitChange(t, xlog.Change{
+			Kind:     xlog.ChangeUpdate,
 			Rel:      pubRel,
 			OldTuple: makeTuple(t, 2, "world"),
 			NewTuple: makeTuple(t, 2, "updated"),
@@ -226,7 +226,7 @@ func TestE2E_LogicalReplication(t *testing.T) {
 	// Verify subscriber: expect exactly one visible row: (2, 'updated').
 	subTbl, _ := subCat.LookupTable(parser.ObjectName{Name: "pub_t"})
 	subRel := subCat.RelFileNode(subTbl)
-	tx, err := subTxnMgr.Begin(mvcc.IsolationReadCommitted)
+	tx, err := subTxnMgr.Begin(transam.IsolationReadCommitted)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,7 +250,7 @@ func TestE2E_LogicalReplication(t *testing.T) {
 			if err != nil {
 				continue
 			}
-			if !mvcc.TupleVisible(tup.Header, subSnap, tx.XID, storage.InvalidCommandId, nil, nil) {
+			if !transam.TupleVisible(tup.Header, subSnap, tx.XID, storage.InvalidCommandId, nil, nil) {
 				continue
 			}
 			row, _ := executor.DecodeRow(pubCols, tup.Data)
@@ -414,13 +414,13 @@ func logicalRepEncodeBody(values []any, types []string) []byte {
 // logicalRepMsgLen returns the byte length of the pgoutput message
 // starting at payload[0]. Used to advance through a multi-message
 // buffer (e.g. R + I emitted by a single po.Change call).
-func logicalRepMsgLen(m *wal.DecodedMessage, payload []byte) int {
+func logicalRepMsgLen(m *xlog.DecodedMessage, payload []byte) int {
 	// Re-encode the message to the same byte form and measure.
 	// Simpler than a manual length parser: DecodeMessage succeeds,
 	// so we know the start; the next message starts where the
 	// reader would be. We binary-search by trying successive lengths.
 	for n := 1; n <= len(payload); n++ {
-		_, err := wal.DecodeMessage(payload[:n])
+		_, err := xlog.DecodeMessage(payload[:n])
 		if err == nil {
 			// Check that the NEXT byte (if any) starts a different or
 			// self-consistent message — i.e., we haven't over-consumed.

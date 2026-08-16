@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -63,7 +63,7 @@ func TestCrossPageCatalogUpdateStampsOldPageLSN(t *testing.T) {
 	oldRow := Row{NewStringDatum(strings.Repeat("o", 5000))}
 	newRow := Row{NewStringDatum(strings.Repeat("n", 5000))}
 
-	ctx := &Context{Pool: pool, Tx: mvcc.Transaction{XID: 42}}
+	ctx := &Context{Pool: pool, Tx: transam.Transaction{XID: 42}}
 
 	seed, _, err := buildCatalogPGHeapTuple(ctx, cols, oldRow)
 	if err != nil {

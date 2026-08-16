@@ -17,21 +17,21 @@ package executor
 
 import (
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 type tsTokenTypeOp struct {
-	plan      *planner.TSTokenType
+	plan      *optimizer.TSTokenType
 	outerSlot SlotView
 	rows      []catalog.TSTokenType
 	idx       int
 }
 
-func newTSTokenTypeOp(p *planner.TSTokenType) *tsTokenTypeOp {
+func newTSTokenTypeOp(p *optimizer.TSTokenType) *tsTokenTypeOp {
 	return &tsTokenTypeOp{plan: p}
 }
 
-func (o *tsTokenTypeOp) Schema() planner.Schema { return o.plan.Output() }
+func (o *tsTokenTypeOp) Schema() optimizer.Schema { return o.plan.Output() }
 
 // BindLateralOuter binds the outer row's slot for lateral arg evaluation
 // (unused by pg_dump's own literal-argument call, but kept for parity with

@@ -33,12 +33,12 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/config"
+	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/executor"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/storage"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // systemIdentifierFile is the path (relative to the data directory) where
@@ -139,7 +139,7 @@ func writeSystemIDFile(path string, id uint64) error {
 // `PG_VERSION` file. It must match the major version goopg reports
 // in the `server_version` ParameterStatus during the wire-protocol
 // handshake (currently "18", aligned with PostgreSQL 18.x).
-const CatalogVersion = config.MajorVersion
+const CatalogVersion = misc.MajorVersion
 
 // Subdirs is the canonical list of directories goopg init creates
 // under the data directory. The list is exported so tests and the
@@ -189,7 +189,7 @@ type FileSpec struct {
 func SampleFiles() []FileSpec {
 	return []FileSpec{
 		{Path: "PG_VERSION", Build: func() []byte { return []byte(CatalogVersion + "\n") }, Mode: 0o600},
-		{Path: "postgresql.conf", Build: func() []byte { return config.SampleConfig() }, Mode: 0o600},
+		{Path: "postgresql.conf", Build: func() []byte { return misc.SampleConfig() }, Mode: 0o600},
 		{Path: "postgresql.auto.conf", Build: defaultPostgresqlAutoConf, Mode: 0o600},
 		{Path: "pg_hba.conf", Build: defaultPgHBAConf, Mode: 0o600},
 		{Path: "pg_ident.conf", Build: defaultPgIdentConf, Mode: 0o600},
@@ -372,7 +372,7 @@ type Options struct {
 	// global/pg_control so a standby's CheckRequiredParameterValues
 	// sees the primary's resource sizing. When nil, hard-coded
 	// upstream defaults are used.
-	Registry *config.Registry
+	Registry *misc.Registry
 }
 
 // CreatePerDatabaseScaffolding creates base/<dbOID>/ and writes
@@ -6635,7 +6635,7 @@ func pgTypeStorageChar(oid uint32) string {
 // find Unknown status for xmin=1 and skip those rows.
 func bootstrapCLog(dataDir string) error {
 	path := filepath.Join(dataDir, "global", "pg_xact")
-	c, err := mvcc.OpenCLog(path)
+	c, err := transam.OpenCLog(path)
 	if err != nil {
 		return err
 	}
@@ -6652,10 +6652,10 @@ func bootstrapCLog(dataDir string) error {
 	if err := c.EnablePGSLRUMirror(filepath.Join(dataDir, "pg_xact")); err != nil {
 		return fmt.Errorf("enable pg_xact slru mirror: %w", err)
 	}
-	if err := c.SetCommitted(mvcc.BootstrapTransactionID); err != nil {
+	if err := c.SetCommitted(transam.BootstrapTransactionID); err != nil {
 		return fmt.Errorf("mark bootstrap xid: %w", err)
 	}
-	return c.SetCommitted(mvcc.FrozenTransactionID)
+	return c.SetCommitted(transam.FrozenTransactionID)
 }
 
 // bootstrapSystemCatalogs creates the three core system catalog heap
@@ -6751,11 +6751,11 @@ func makeRelMapFile(mappings [][2]uint32) []byte {
 	// B0.4: one encoder for bootstrap AND WAL paths — wal.EncodeRelMapFile
 	// is the normative RelMapFile renderer (relmapper.c layout); this
 	// wrapper only adapts the historical [][2]uint32 call shape.
-	ms := make([]wal.RelMapping, len(mappings))
+	ms := make([]xlog.RelMapping, len(mappings))
 	for i, m := range mappings {
-		ms[i] = wal.RelMapping{Oid: m[0], FileNumber: m[1]}
+		ms[i] = xlog.RelMapping{Oid: m[0], FileNumber: m[1]}
 	}
-	return wal.EncodeRelMapFile(ms)
+	return xlog.EncodeRelMapFile(ms)
 }
 
 func defaultRelMapFile() []byte {

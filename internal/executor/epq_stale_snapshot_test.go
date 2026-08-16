@@ -3,7 +3,7 @@ package executor
 import (
 	"testing"
 
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -89,26 +89,26 @@ func TestEPQChainTailLiveButUnseen(t *testing.T) {
 
 	// --- the defect's exact state: tail committed after our snapshot ---------
 	buildChain(storage.InvalidTransactionID)
-	ctx.Snap = mvcc.Snapshot{Xmin: 150, Xmax: 150}
+	ctx.Snap = transam.Snapshot{Xmin: 150, Xmax: 150}
 	if !epqChainTailLiveButUnseen(ctx, rel, 0, 1) {
 		t.Error("live tail outside the snapshot: got false, want true (the EPQ lap must retry, not drop the write)")
 	}
 
 	// --- anti-livelock: once the snapshot sees it, stop retrying -------------
-	ctx.Snap = mvcc.Snapshot{Xmin: 300, Xmax: 300}
+	ctx.Snap = transam.Snapshot{Xmin: 300, Xmax: 300}
 	if epqChainTailLiveButUnseen(ctx, rel, 0, 1) {
 		t.Error("visible tail: got true, want false — retrying here would livelock instead of skipping a failed WHERE")
 	}
 
 	// --- a genuinely deleted row must still be skipped -----------------------
 	buildChain(deleterXID)
-	ctx.Snap = mvcc.Snapshot{Xmin: 150, Xmax: 150}
+	ctx.Snap = transam.Snapshot{Xmin: 150, Xmax: 150}
 	if epqChainTailLiveButUnseen(ctx, rel, 0, 1) {
 		t.Error("tail deleted by a committed xmax: got true, want false")
 	}
 
 	// --- an in-flight writer belongs to epqChainPendingWriter, not here ------
-	inflight, err := ctx.TxnMgr.Begin(mvcc.IsolationReadCommitted)
+	inflight, err := ctx.TxnMgr.Begin(transam.IsolationReadCommitted)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goopg/goopg/internal/mctx"
+	"github.com/goopg/goopg/internal/utils/mmgr"
 	"github.com/goopg/goopg/internal/pgtemp"
 )
 
@@ -129,7 +129,7 @@ func TestWorkerContextSharesTheLeaderRegistry(t *testing.T) {
 	leader := NewContext()
 	leader.DataDir = t.TempDir()
 
-	arena := mctx.Acquire(nil, mctx.KindStmt)
+	arena := mmgr.Acquire(nil, mmgr.KindStmt)
 	defer arena.Release()
 	wctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

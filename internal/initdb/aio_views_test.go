@@ -3,7 +3,7 @@ package initdb
 import (
 	"testing"
 
-	"github.com/goopg/goopg/internal/aio"
+	"github.com/goopg/goopg/internal/storage/aio"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 )

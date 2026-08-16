@@ -103,7 +103,7 @@ jobs:
       # ------------------------------------------------------------------ #
       - name: Run unit and component tests
         run: |
-          EXCLUDE='internal/testport|internal/server
+          EXCLUDE='internal/testport|internal/postmaster
                    |internal/testutil/cluster|internal/testutil/replcluster
                    |internal/testutil/pgcluster|internal/testutil/pubsubcluster
                    |internal/testutil/tpch|/bench/'

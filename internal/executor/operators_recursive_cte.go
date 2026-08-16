@@ -3,7 +3,7 @@ package executor
 import (
 	"strings"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // maxRecursiveDepth is a safety limit to prevent infinite loops in
@@ -23,7 +23,7 @@ const maxRecursiveDepth = 1000
 // iteration stops when the recursive member produces no rows.
 // M0097-0006: added UnionAll/UNION distinction.
 type recursiveUnionOp struct {
-	plan      *planner.RecursiveUnion
+	plan      *optimizer.RecursiveUnion
 	anchor    Operator
 	recursive Operator
 	working   []Row
@@ -37,11 +37,11 @@ type recursiveUnionOp struct {
 	ctx      *Context
 }
 
-func newRecursiveUnionOp(p *planner.RecursiveUnion, anchor, recursive Operator) *recursiveUnionOp {
+func newRecursiveUnionOp(p *optimizer.RecursiveUnion, anchor, recursive Operator) *recursiveUnionOp {
 	return &recursiveUnionOp{plan: p, anchor: anchor, recursive: recursive}
 }
 
-func (o *recursiveUnionOp) Schema() planner.Schema { return o.plan.Output() }
+func (o *recursiveUnionOp) Schema() optimizer.Schema { return o.plan.Output() }
 
 func (o *recursiveUnionOp) Open(ctx *Context) error {
 	o.ctx = ctx
@@ -221,16 +221,16 @@ func itoa(n int) string {
 // row per Next() call. Used inside the recursive member of a
 // RecursiveUnion.
 type workTableScanOp struct {
-	plan *planner.WorkTableScan
+	plan *optimizer.WorkTableScan
 	ctx  *Context
 	idx  int
 }
 
-func newWorkTableScanOp(p *planner.WorkTableScan) *workTableScanOp {
+func newWorkTableScanOp(p *optimizer.WorkTableScan) *workTableScanOp {
 	return &workTableScanOp{plan: p}
 }
 
-func (o *workTableScanOp) Schema() planner.Schema { return o.plan.Output() }
+func (o *workTableScanOp) Schema() optimizer.Schema { return o.plan.Output() }
 
 func (o *workTableScanOp) Open(ctx *Context) error {
 	o.ctx = ctx

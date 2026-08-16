@@ -21,7 +21,7 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // Integer-overflow codes carried inline in ExprBinaryOp.payload[1]. The
@@ -95,7 +95,7 @@ type ExprNode struct {
 	childA  int32        // left/only child index; noExpr if none
 	childB  int32        // right child index; noExpr if none
 	payload [40]byte     // per-Kind inline data (see constants above)
-	orig    planner.Expr // non-nil only for ExprAdapter
+	orig    optimizer.Expr // non-nil only for ExprAdapter
 }
 
 // exprTreeSlab is the flat slice of ExprNode for a single statement.
@@ -106,12 +106,12 @@ type exprTreeSlab []ExprNode
 // Returns noExpr for nil input. Unrecognised expression kinds fall back
 // to ExprAdapter (delegates to evalExprSlot at evaluation time, so
 // correctness is always preserved).
-func (s *exprTreeSlab) buildExpr(e planner.Expr) int32 {
+func (s *exprTreeSlab) buildExpr(e optimizer.Expr) int32 {
 	if e == nil {
 		return noExpr
 	}
 	switch t := e.(type) {
-	case *planner.ColumnRef:
+	case *optimizer.ColumnRef:
 		idx := int32(len(*s))
 		// orig is kept so the bounds-check arm of evalFastExpr can raise the
 		// interpreted twin's exact error rather than a second, diverging one.
@@ -119,13 +119,13 @@ func (s *exprTreeSlab) buildExpr(e planner.Expr) int32 {
 		binary.LittleEndian.PutUint32((*s)[idx].payload[:], uint32(t.Index))
 		return idx
 
-	case *planner.IntegerConst:
+	case *optimizer.IntegerConst:
 		idx := int32(len(*s))
 		*s = append(*s, ExprNode{Kind: ExprIntConst})
 		binary.LittleEndian.PutUint64((*s)[idx].payload[:], uint64(t.Value))
 		return idx
 
-	case *planner.BooleanConst:
+	case *optimizer.BooleanConst:
 		idx := int32(len(*s))
 		n := ExprNode{Kind: ExprBoolConst}
 		if t.Value {
@@ -134,12 +134,12 @@ func (s *exprTreeSlab) buildExpr(e planner.Expr) int32 {
 		*s = append(*s, n)
 		return idx
 
-	case *planner.NullConst:
+	case *optimizer.NullConst:
 		idx := int32(len(*s))
 		*s = append(*s, ExprNode{Kind: ExprNullConst})
 		return idx
 
-	case *planner.BinaryOp:
+	case *optimizer.BinaryOp:
 		// Float-typed arithmetic must use evalExprSlot's float64 path; the
 		// fast path's exact arithmetic diverges from PostgreSQL float8 output.
 		if isFloatResultType(t.ResultType) {
@@ -153,8 +153,8 @@ func (s *exprTreeSlab) buildExpr(e planner.Expr) int32 {
 		// each RowExpr as a composite text string via evalRowExpr, then compare
 		// the strings — producing "(abs,20)" >= "(abs,)" = TRUE instead of NULL.
 		// M0097-0128.
-		if _, okL := t.Left.(*planner.RowExpr); okL {
-			if _, okR := t.Right.(*planner.RowExpr); okR {
+		if _, okL := t.Left.(*optimizer.RowExpr); okL {
+			if _, okR := t.Right.(*optimizer.RowExpr); okR {
 				idx := int32(len(*s))
 				*s = append(*s, ExprNode{Kind: ExprAdapter, orig: e})
 				return idx
@@ -166,15 +166,15 @@ func (s *exprTreeSlab) buildExpr(e planner.Expr) int32 {
 		// with "scalar subquery returned N columns" before reaching evalBinary.
 		// M0097-0020.
 		if t.Op == parser.OpEq || t.Op == parser.OpNe {
-			if rowFc, okL := t.Left.(*planner.FuncCall); okL && strings.EqualFold(rowFc.Name, "row") {
-				if _, okR := t.Right.(*planner.SubqueryExpr); okR {
+			if rowFc, okL := t.Left.(*optimizer.FuncCall); okL && strings.EqualFold(rowFc.Name, "row") {
+				if _, okR := t.Right.(*optimizer.SubqueryExpr); okR {
 					idx := int32(len(*s))
 					*s = append(*s, ExprNode{Kind: ExprAdapter, orig: e})
 					return idx
 				}
 			}
-			if rowFc, okR := t.Right.(*planner.FuncCall); okR && strings.EqualFold(rowFc.Name, "row") {
-				if _, okL := t.Left.(*planner.SubqueryExpr); okL {
+			if rowFc, okR := t.Right.(*optimizer.FuncCall); okR && strings.EqualFold(rowFc.Name, "row") {
+				if _, okL := t.Left.(*optimizer.SubqueryExpr); okL {
 					idx := int32(len(*s))
 					*s = append(*s, ExprNode{Kind: ExprAdapter, orig: e})
 					return idx
@@ -202,7 +202,7 @@ func (s *exprTreeSlab) buildExpr(e planner.Expr) int32 {
 		binary.LittleEndian.PutUint32((*s)[idx].payload[4:], uint32(int32(t.Pos())))
 		return idx
 
-	case *planner.UnaryOp:
+	case *optimizer.UnaryOp:
 		idx := int32(len(*s))
 		*s = append(*s, ExprNode{Kind: ExprUnaryOp})
 		childA := s.buildExpr(t.Operand)

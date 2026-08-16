@@ -5,10 +5,10 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // TestSynchronousCommitFlushesByDefault verifies the M0042-0003 durability
@@ -86,7 +86,7 @@ func TestWalCommitRecordOnDisk(t *testing.T) {
 	}
 
 	// Run an explicit transaction through Commit so the xactMarkerLogger fires.
-	tx, err := rt.TxnMgr.Begin(mvcc.IsolationReadCommitted)
+	tx, err := rt.TxnMgr.Begin(transam.IsolationReadCommitted)
 	if err != nil {
 		rt.Close()
 		t.Fatal(err)
@@ -127,7 +127,7 @@ func TestWalCommitRecordOnDisk(t *testing.T) {
 
 	// Read the WAL directory from disk. The commit record must be present.
 	walDir := filepath.Join(dir, "pg_wal")
-	records, err := wal.ReadAll(walDir, 0)
+	records, err := xlog.ReadAll(walDir, 0)
 	if err != nil {
 		t.Fatalf("ReadAll WAL: %v", err)
 	}
@@ -137,8 +137,8 @@ func TestWalCommitRecordOnDisk(t *testing.T) {
 		// A6: the commit is a PG xl_xact_commit — no native Payload; the opcode
 		// is in the record header (xl_rmid = RM_XACT, xl_info = XLOG_XACT_COMMIT),
 		// and the committing xid is xl_xid.
-		if r.XLog != nil && r.XLog.Header.Rmid == wal.RmgrXact &&
-			(r.XLog.Header.Info&wal.XlogXactOpMask) == wal.XlogXactCommit {
+		if r.XLog != nil && r.XLog.Header.Rmid == xlog.RmgrXact &&
+			(r.XLog.Header.Info&xlog.XlogXactOpMask) == xlog.XlogXactCommit {
 			found = true
 			break
 		}

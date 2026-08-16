@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 )
 
 // M0119-0006, 41st slice — the ORIGINS of a timestamptz datum, not its renderer.
@@ -96,7 +96,7 @@ func TestTimestampTZOriginsCarryTheSubtypeTag(t *testing.T) {
 			// A composite index-only scan answering the column from the key.
 			name: "composite index-key decode",
 			decode: func(t *testing.T) Datum {
-				d, n, err := decodeIndexKeyColumn(btree.EncodeTimestamp(micros), tstzCol)
+				d, n, err := decodeIndexKeyColumn(nbtree.EncodeTimestamp(micros), tstzCol)
 				if err != nil {
 					t.Fatalf("decodeIndexKeyColumn: %v", err)
 				}
@@ -111,7 +111,7 @@ func TestTimestampTZOriginsCarryTheSubtypeTag(t *testing.T) {
 			// the above (Hard-won Rule #2) — they must agree.
 			name: "single-column index-key decode",
 			decode: func(t *testing.T) Datum {
-				d, err := decodeBTreeKeyToDatum(btree.EncodeTimestamp(micros), tstzCol)
+				d, err := decodeBTreeKeyToDatum(nbtree.EncodeTimestamp(micros), tstzCol)
 				if err != nil {
 					t.Fatalf("decodeBTreeKeyToDatum: %v", err)
 				}
@@ -183,7 +183,7 @@ func TestTimestampTZOriginsTagSiblingTypesCorrectly(t *testing.T) {
 			return copyTextToDatum(catalog.Type{Name: "date"}, []byte("2020-01-01"), "")
 		})},
 		{"index-key timestamp", mustDatum(t, func() (Datum, error) {
-			d, err := decodeBTreeKeyToDatum(btree.EncodeTimestamp(micros),
+			d, err := decodeBTreeKeyToDatum(nbtree.EncodeTimestamp(micros),
 				catalog.Column{Name: "c", Type: catalog.Type{Name: "timestamp"}})
 			return d, err
 		})},

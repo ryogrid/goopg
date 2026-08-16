@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goopg/goopg/internal/pgdatetime"
+	"github.com/goopg/goopg/internal/utils/adt/datetime"
 )
 
 // TestParsePGDateTextTextualMonth pins the DATE entry point (the typed-literal
@@ -66,7 +66,7 @@ func TestParsePGDateTextTextualMonth(t *testing.T) {
 func TestParsePGDateTextTextualMonthOutOfRange(t *testing.T) {
 	for _, lit := range []string{"2002-Feb-30", "Feb 30, 2002", "31-Apr-2002"} {
 		_, err := parsePGDateText(lit)
-		if !errors.Is(err, pgdatetime.ErrFieldOutOfRange) {
+		if !errors.Is(err, datetime.ErrFieldOutOfRange) {
 			t.Errorf("parsePGDateText(%q) = %v, want ErrFieldOutOfRange (PG raises 22008)", lit, err)
 		}
 	}

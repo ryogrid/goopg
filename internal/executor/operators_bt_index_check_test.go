@@ -14,7 +14,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
@@ -107,7 +107,7 @@ func TestBtIndexCheck_DetectsCorruptMetapage(t *testing.T) {
 	rel := ctx.Catalog.IndexRelFileNode(idx)
 
 	// Overwrite the metapage magic (offset 0 of the meta payload) with garbage.
-	s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: btree.MetaBlock})
+	s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: nbtree.MetaBlock})
 	if err != nil {
 		t.Fatalf("pin metapage: %v", err)
 	}
@@ -580,19 +580,19 @@ func TestBtIndexCheck_CheckUniqueDetectsLiveDuplicate(t *testing.T) {
 		binary.LittleEndian.PutUint32(key1, 1)
 		binary.LittleEndian.PutUint32(key2, 2)
 	} else {
-		key1, key2 = btree.EncodeInt4(1), btree.EncodeInt4(2)
+		key1, key2 = nbtree.EncodeInt4(1), nbtree.EncodeInt4(2)
 	}
 	patched := false
 	nblocks, err := ctx.Pool.NBlocks(rel)
 	if err != nil {
 		t.Fatalf("NBlocks: %v", err)
 	}
-	for blk := btree.MetaBlock + 1; blk < nblocks && !patched; blk++ {
+	for blk := nbtree.MetaBlock + 1; blk < nblocks && !patched; blk++ {
 		s, perr := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if perr != nil {
 			t.Fatalf("pin block %d: %v", blk, perr)
 		}
-		if btree.ParseOpaque(s.Page()).IsLeaf() {
+		if nbtree.ParseOpaque(s.Page()).IsLeaf() {
 			count, cerr := storage.PageLinePointerCount(s.Page())
 			if cerr != nil {
 				t.Fatalf("line pointer count: %v", cerr)

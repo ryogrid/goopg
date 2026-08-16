@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/initdb"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // TestStandbyControllerPromoteRemovesSignal exercises the happy
@@ -101,7 +101,7 @@ func TestStandbyControllerPromoteDrainsPendingReplay(t *testing.T) {
 	// handles RecordKindCheckpoint without needing a storage
 	// manager touch, which keeps this test focused on the drain
 	// contract rather than storage mechanics.
-	payload := wal.EncodeCheckpoint()
+	payload := xlog.EncodeCheckpoint()
 	if _, _, err := rt.WAL.Append(payload); err != nil {
 		t.Fatalf("Append: %v", err)
 	}

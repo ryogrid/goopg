@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -43,14 +43,14 @@ func TestCrashRecoveryReplaysWALAfterUncleanShutdown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open phase 1: %v", err)
 	}
-	bt, err := btree.Create(rt.Pool, rel)
+	bt, err := nbtree.Create(rt.Pool, rel)
 	if err != nil {
-		t.Fatalf("btree.Create: %v", err)
+		t.Fatalf("nbtree.Create: %v", err)
 	}
 	const N = 800
 	for i := 0; i < N; i++ {
 		ptr := storage.ItemPointer{Block: storage.BlockNumber(i + 1), Offset: 1}
-		if err := bt.Insert(btree.EncodeInt4(int32(i)), ptr); err != nil {
+		if err := bt.Insert(nbtree.EncodeInt4(int32(i)), ptr); err != nil {
 			t.Fatalf("Insert(%d): %v", i, err)
 		}
 	}
@@ -79,12 +79,12 @@ func TestCrashRecoveryReplaysWALAfterUncleanShutdown(t *testing.T) {
 
 	// Phase 4: every inserted key must be searchable through a
 	// fresh btree handle.
-	bt2, err := btree.Open(rt2.Pool, rel)
+	bt2, err := nbtree.Open(rt2.Pool, rel)
 	if err != nil {
-		t.Fatalf("btree.Open after recovery: %v", err)
+		t.Fatalf("nbtree.Open after recovery: %v", err)
 	}
 	for i := 0; i < N; i++ {
-		ptr, ok, err := bt2.Search(btree.EncodeInt4(int32(i)))
+		ptr, ok, err := bt2.Search(nbtree.EncodeInt4(int32(i)))
 		if err != nil {
 			t.Fatalf("Search(%d) after recovery: %v", i, err)
 		}
@@ -138,14 +138,14 @@ func TestCrashRecoveryReplaysChecksummedClusterCleanly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open phase 1: %v", err)
 	}
-	bt, err := btree.Create(rt.Pool, rel)
+	bt, err := nbtree.Create(rt.Pool, rel)
 	if err != nil {
-		t.Fatalf("btree.Create: %v", err)
+		t.Fatalf("nbtree.Create: %v", err)
 	}
 	const N = 800
 	for i := 0; i < N; i++ {
 		ptr := storage.ItemPointer{Block: storage.BlockNumber(i + 1), Offset: 1}
-		if err := bt.Insert(btree.EncodeInt4(int32(i)), ptr); err != nil {
+		if err := bt.Insert(nbtree.EncodeInt4(int32(i)), ptr); err != nil {
 			t.Fatalf("Insert(%d): %v", i, err)
 		}
 	}
@@ -175,12 +175,12 @@ func TestCrashRecoveryReplaysChecksummedClusterCleanly(t *testing.T) {
 	// Phase 4: every key must be searchable. These reads go through the
 	// checksum-enabled Manager, so a replayed page with a bad pd_checksum would
 	// surface here as a *ChecksumError rather than a wrong answer.
-	bt2, err := btree.Open(rt2.Pool, rel)
+	bt2, err := nbtree.Open(rt2.Pool, rel)
 	if err != nil {
-		t.Fatalf("btree.Open after recovery: %v", err)
+		t.Fatalf("nbtree.Open after recovery: %v", err)
 	}
 	for i := 0; i < N; i++ {
-		ptr, ok, err := bt2.Search(btree.EncodeInt4(int32(i)))
+		ptr, ok, err := bt2.Search(nbtree.EncodeInt4(int32(i)))
 		if err != nil {
 			t.Fatalf("Search(%d) after recovery: %v", i, err)
 		}

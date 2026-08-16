@@ -1,7 +1,7 @@
 package executor
 
 import (
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // TupleSlot is the goopg replacement for Row=[]Datum as the
@@ -17,7 +17,7 @@ import (
 // authoritative design.
 type TupleSlot interface {
 	SlotView
-	Schema() planner.Schema
+	Schema() optimizer.Schema
 	Width() int
 
 	// Row exposes the slot as a Row=[]Datum view. For a
@@ -58,7 +58,7 @@ func (r rowSlotView) IsNull(col int) bool { return r[col].IsNull() }
 // at hash-table storage, sort buffer, aggregate group key, and
 // every other retention boundary.
 type MaterializedSlot struct {
-	schema    planner.Schema
+	schema    optimizer.Schema
 	row       Row
 	ctidBlock uint32 // injected by seqScanOp for CTIDExpr; valid when hasCTID=true. M0097-0038.
 	ctidOff   uint16
@@ -70,11 +70,11 @@ type MaterializedSlot struct {
 // Release behaviour change); it's a zero-copy view. Used at
 // the operator boundary during the M0069-0001..M0070
 // migration window.
-func SlotFromRow(s planner.Schema, r Row) *MaterializedSlot {
+func SlotFromRow(s optimizer.Schema, r Row) *MaterializedSlot {
 	return &MaterializedSlot{schema: s, row: r}
 }
 
-func (s *MaterializedSlot) Schema() planner.Schema { return s.schema }
+func (s *MaterializedSlot) Schema() optimizer.Schema { return s.schema }
 func (s *MaterializedSlot) Width() int             { return len(s.row) }
 func (s *MaterializedSlot) Get(col int) Datum      { return s.row[col] }
 func (s *MaterializedSlot) IsNull(col int) bool    { return s.row[col].IsNull() }
@@ -119,7 +119,7 @@ func (s *MaterializedSlot) Release() {}
 // projectOp / NLI joinBuf / MHJ probe build) lands in
 // subsequent stages.
 type VirtualSlot struct {
-	schema  planner.Schema
+	schema  optimizer.Schema
 	sources []TupleSlot
 	cols    []virtualCol
 }
@@ -129,11 +129,11 @@ type virtualCol struct {
 }
 
 // NewVirtualSlot builds a slot whose column N is sources[cols[N].sourceIdx].Get(cols[N].sourceCol).
-func NewVirtualSlot(schema planner.Schema, sources []TupleSlot, cols []virtualCol) *VirtualSlot {
+func NewVirtualSlot(schema optimizer.Schema, sources []TupleSlot, cols []virtualCol) *VirtualSlot {
 	return &VirtualSlot{schema: schema, sources: sources, cols: cols}
 }
 
-func (s *VirtualSlot) Schema() planner.Schema { return s.schema }
+func (s *VirtualSlot) Schema() optimizer.Schema { return s.schema }
 func (s *VirtualSlot) Width() int             { return len(s.cols) }
 func (s *VirtualSlot) Get(col int) Datum {
 	c := s.cols[col]
@@ -182,7 +182,7 @@ func (s *VirtualSlot) Release() {}
 // asSlot wraps a Row in a MaterializedSlot for return at the
 // Operator.Next() boundary (M0071-0010 Stage B). nil row →
 // nil slot, so EOF returns stay clean.
-func asSlot(s planner.Schema, r Row) TupleSlot {
+func asSlot(s optimizer.Schema, r Row) TupleSlot {
 	if r == nil {
 		return nil
 	}

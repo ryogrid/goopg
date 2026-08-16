@@ -24,11 +24,11 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 func main() {
-	if _, err := fmt.Fprint(os.Stdout, planner.RenderFlagProvenanceEnv()); err != nil {
+	if _, err := fmt.Fprint(os.Stdout, optimizer.RenderFlagProvenanceEnv()); err != nil {
 		fmt.Fprintf(os.Stderr, "gen-planner-flag-labels: %v\n", err)
 		os.Exit(1)
 	}

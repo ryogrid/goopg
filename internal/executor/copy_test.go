@@ -6,7 +6,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // TestRunCopyToTableDefaultColumns: COPY items TO STDOUT emits all
@@ -20,11 +20,11 @@ func TestRunCopyToTableDefaultColumns(t *testing.T) {
 	// M0129-S8.3: advance the command counter so COPY sees the seed rows.
 	advanceStmtCounter(ctx)
 
-	plan := &planner.Copy{
-		Direction:   planner.CopyTo,
+	plan := &optimizer.Copy{
+		Direction:   optimizer.CopyTo,
 		Table:       tbl,
 		ColumnIndex: []int{0, 1},
-		Endpoint:    planner.CopyEndpointStdout,
+		Endpoint:    optimizer.CopyEndpointStdout,
 	}
 	var lines []string
 	count, _, err := RunCopyTo(ctx, plan, func(b []byte) error {
@@ -60,11 +60,11 @@ func TestRunCopyToTableProjectionAndReorder(t *testing.T) {
 	// M0129-S8.3: advance the command counter so COPY sees the seed rows.
 	advanceStmtCounter(ctx)
 
-	plan := &planner.Copy{
-		Direction:   planner.CopyTo,
+	plan := &optimizer.Copy{
+		Direction:   optimizer.CopyTo,
 		Table:       tbl,
 		ColumnIndex: []int{1, 0},
-		Endpoint:    planner.CopyEndpointStdout,
+		Endpoint:    optimizer.CopyEndpointStdout,
 	}
 	var got []string
 	if _, _, err := RunCopyTo(ctx, plan, func(b []byte) error {
@@ -90,11 +90,11 @@ func TestRunCopyToQueryForm(t *testing.T) {
 		t.Fatal(err)
 	}
 	cat := catalog.NewInMemory()
-	node, err := planner.Plan(stmts[0], cat)
+	node, err := optimizer.Plan(stmts[0], cat)
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan, ok := node.(*planner.Copy)
+	plan, ok := node.(*optimizer.Copy)
 	if !ok {
 		t.Fatalf("planner returned %T, want *planner.Copy", node)
 	}
@@ -118,11 +118,11 @@ func TestCopyFromExecutorRoundTrip(t *testing.T) {
 	defer cleanup()
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
 
-	plan := &planner.Copy{
-		Direction:   planner.CopyFrom,
+	plan := &optimizer.Copy{
+		Direction:   optimizer.CopyFrom,
 		Table:       tbl,
 		ColumnIndex: []int{0, 1},
-		Endpoint:    planner.CopyEndpointStdin,
+		Endpoint:    optimizer.CopyEndpointStdin,
 	}
 	cf, err := NewCopyFromExecutor(ctx, plan)
 	if err != nil {
@@ -139,11 +139,11 @@ func TestCopyFromExecutorRoundTrip(t *testing.T) {
 	}
 
 	// Read back via the existing CopyTo path.
-	toPlan := &planner.Copy{
-		Direction:   planner.CopyTo,
+	toPlan := &optimizer.Copy{
+		Direction:   optimizer.CopyTo,
 		Table:       tbl,
 		ColumnIndex: []int{0, 1},
-		Endpoint:    planner.CopyEndpointStdout,
+		Endpoint:    optimizer.CopyEndpointStdout,
 	}
 	var out []string
 	if _, _, err := RunCopyTo(ctx, toPlan, func(b []byte) error {
@@ -164,11 +164,11 @@ func TestCopyFromExecutorBadFieldCount(t *testing.T) {
 	ctx, cat, cleanup := newStorageFixture(t)
 	defer cleanup()
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
-	plan := &planner.Copy{
-		Direction:   planner.CopyFrom,
+	plan := &optimizer.Copy{
+		Direction:   optimizer.CopyFrom,
 		Table:       tbl,
 		ColumnIndex: []int{0, 1},
-		Endpoint:    planner.CopyEndpointStdin,
+		Endpoint:    optimizer.CopyEndpointStdin,
 	}
 	cf, err := NewCopyFromExecutor(ctx, plan)
 	if err != nil {
@@ -194,9 +194,9 @@ func TestRunCopyToFileEndpointRejected(t *testing.T) {
 	ctx, cat, cleanup := newStorageFixture(t)
 	defer cleanup()
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
-	for _, ep := range []planner.CopyEndpoint{planner.CopyEndpointFile, planner.CopyEndpointProgram} {
-		plan := &planner.Copy{
-			Direction:   planner.CopyTo,
+	for _, ep := range []optimizer.CopyEndpoint{optimizer.CopyEndpointFile, optimizer.CopyEndpointProgram} {
+		plan := &optimizer.Copy{
+			Direction:   optimizer.CopyTo,
 			Table:       tbl,
 			ColumnIndex: []int{0, 1},
 			Endpoint:    ep,

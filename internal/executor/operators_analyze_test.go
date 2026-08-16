@@ -10,7 +10,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // TestAnalyzeRelationPopulatesStats pins that running ANALYZE
@@ -25,17 +25,17 @@ func TestAnalyzeRelationPopulatesStats(t *testing.T) {
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
 
 	// Seed 7 rows: 3 distinct labels (a×2, b×2, c×3).
-	insertPlan := &planner.Insert{
+	insertPlan := &optimizer.Insert{
 		Table: tbl,
-		Source: &planner.Values{
-			Rows: [][]planner.Expr{
-				{&planner.IntegerConst{Value: 1}, &planner.StringConst{Value: "a"}},
-				{&planner.IntegerConst{Value: 2}, &planner.StringConst{Value: "a"}},
-				{&planner.IntegerConst{Value: 3}, &planner.StringConst{Value: "b"}},
-				{&planner.IntegerConst{Value: 4}, &planner.StringConst{Value: "b"}},
-				{&planner.IntegerConst{Value: 5}, &planner.StringConst{Value: "c"}},
-				{&planner.IntegerConst{Value: 6}, &planner.StringConst{Value: "c"}},
-				{&planner.IntegerConst{Value: 7}, &planner.StringConst{Value: "c"}},
+		Source: &optimizer.Values{
+			Rows: [][]optimizer.Expr{
+				{&optimizer.IntegerConst{Value: 1}, &optimizer.StringConst{Value: "a"}},
+				{&optimizer.IntegerConst{Value: 2}, &optimizer.StringConst{Value: "a"}},
+				{&optimizer.IntegerConst{Value: 3}, &optimizer.StringConst{Value: "b"}},
+				{&optimizer.IntegerConst{Value: 4}, &optimizer.StringConst{Value: "b"}},
+				{&optimizer.IntegerConst{Value: 5}, &optimizer.StringConst{Value: "c"}},
+				{&optimizer.IntegerConst{Value: 6}, &optimizer.StringConst{Value: "c"}},
+				{&optimizer.IntegerConst{Value: 7}, &optimizer.StringConst{Value: "c"}},
 			},
 		},
 		ColumnIndex: []int{0, 1},
@@ -85,7 +85,7 @@ func TestAnalyzeRelationPopulatesStats(t *testing.T) {
 // seedRowsAndAnalyze is a small helper: insert N rows shaped by
 // makeRow, commit, then reservoir-sample with a deterministic seed
 // + the given statsTarget. Returns the resulting TableStats.
-func seedRowsAndAnalyze(t *testing.T, n int, makeRow func(i int) []planner.Expr, statsTarget int) (*Context, *catalog.TableStats) {
+func seedRowsAndAnalyze(t *testing.T, n int, makeRow func(i int) []optimizer.Expr, statsTarget int) (*Context, *catalog.TableStats) {
 	t.Helper()
 	ctx, cat, cleanup := newStorageFixture(t)
 	// M0129-S8.3: advance the command counter between statements.
@@ -93,13 +93,13 @@ func seedRowsAndAnalyze(t *testing.T, n int, makeRow func(i int) []planner.Expr,
 	t.Cleanup(cleanup)
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
 
-	rows := make([][]planner.Expr, n)
+	rows := make([][]optimizer.Expr, n)
 	for i := 0; i < n; i++ {
 		rows[i] = makeRow(i)
 	}
-	insertPlan := &planner.Insert{
+	insertPlan := &optimizer.Insert{
 		Table:       tbl,
-		Source:      &planner.Values{Rows: rows},
+		Source:      &optimizer.Values{Rows: rows},
 		ColumnIndex: []int{0, 1},
 	}
 	op, err := Build(insertPlan)
@@ -134,7 +134,7 @@ func seedRowsAndAnalyze(t *testing.T, n int, makeRow func(i int) []planner.Expr,
 // across 'F'/'O'/'P' should produce 'F' as MCV[0] with frequency
 // ~0.8 (sample is 100% of the table since N=1000 < targrows).
 func TestAnalyzeBuildsMCVForSkewedColumn(t *testing.T) {
-	makeRow := func(i int) []planner.Expr {
+	makeRow := func(i int) []optimizer.Expr {
 		var label string
 		switch {
 		case i < 800:
@@ -144,9 +144,9 @@ func TestAnalyzeBuildsMCVForSkewedColumn(t *testing.T) {
 		default:
 			label = "P"
 		}
-		return []planner.Expr{
-			&planner.IntegerConst{Value: int64(i)},
-			&planner.StringConst{Value: label},
+		return []optimizer.Expr{
+			&optimizer.IntegerConst{Value: int64(i)},
+			&optimizer.StringConst{Value: label},
 		}
 	}
 	_, stats := seedRowsAndAnalyze(t, 1000, makeRow, 0)
@@ -170,10 +170,10 @@ func TestAnalyzeBuildsMCVForSkewedColumn(t *testing.T) {
 // histogram contract on a uniformly-distributed numeric column:
 // boundaries are strictly ascending and span the value range.
 func TestAnalyzeBuildsHistogramForOrderedColumn(t *testing.T) {
-	makeRow := func(i int) []planner.Expr {
-		return []planner.Expr{
-			&planner.IntegerConst{Value: int64(i + 1)}, // 1..1000
-			&planner.StringConst{Value: "x"},
+	makeRow := func(i int) []optimizer.Expr {
+		return []optimizer.Expr{
+			&optimizer.IntegerConst{Value: int64(i + 1)}, // 1..1000
+			&optimizer.StringConst{Value: "x"},
 		}
 	}
 	_, stats := seedRowsAndAnalyze(t, 1000, makeRow, 10)
@@ -212,10 +212,10 @@ func TestAnalyzeBuildsHistogramForOrderedColumn(t *testing.T) {
 // default of 100 → 30000 kicks in (which exceeds N=400, so the
 // whole table is sampled).
 func TestAnalyzeRespectsStatsTarget(t *testing.T) {
-	makeRow := func(i int) []planner.Expr {
-		return []planner.Expr{
-			&planner.IntegerConst{Value: int64(i + 1)},
-			&planner.StringConst{Value: "x"},
+	makeRow := func(i int) []optimizer.Expr {
+		return []optimizer.Expr{
+			&optimizer.IntegerConst{Value: int64(i + 1)},
+			&optimizer.StringConst{Value: "x"},
 		}
 	}
 
@@ -260,14 +260,14 @@ func TestAnalyzeRespectsPerColumnStatTarget(t *testing.T) {
 	override := 5
 	tbl.Columns[0].StatTarget = &override
 
-	rows := make([][]planner.Expr, 1000)
+	rows := make([][]optimizer.Expr, 1000)
 	for i := 0; i < 1000; i++ {
-		rows[i] = []planner.Expr{
-			&planner.IntegerConst{Value: int64(i + 1)}, // 1..1000, unique
-			&planner.StringConst{Value: "x"},
+		rows[i] = []optimizer.Expr{
+			&optimizer.IntegerConst{Value: int64(i + 1)}, // 1..1000, unique
+			&optimizer.StringConst{Value: "x"},
 		}
 	}
-	insertPlan := &planner.Insert{Table: tbl, Source: &planner.Values{Rows: rows}, ColumnIndex: []int{0, 1}}
+	insertPlan := &optimizer.Insert{Table: tbl, Source: &optimizer.Values{Rows: rows}, ColumnIndex: []int{0, 1}}
 	op, err := Build(insertPlan)
 	if err != nil {
 		t.Fatal(err)
@@ -314,14 +314,14 @@ func TestAnalyzeSetStatisticsZeroDisablesColumn(t *testing.T) {
 	zero := 0
 	tbl.Columns[1].StatTarget = &zero // disable stats on "label"
 
-	rows := make([][]planner.Expr, 10)
+	rows := make([][]optimizer.Expr, 10)
 	for i := 0; i < 10; i++ {
-		rows[i] = []planner.Expr{
-			&planner.IntegerConst{Value: int64(i + 1)},
-			&planner.StringConst{Value: "a"},
+		rows[i] = []optimizer.Expr{
+			&optimizer.IntegerConst{Value: int64(i + 1)},
+			&optimizer.StringConst{Value: "a"},
 		}
 	}
-	insertPlan := &planner.Insert{Table: tbl, Source: &planner.Values{Rows: rows}, ColumnIndex: []int{0, 1}}
+	insertPlan := &optimizer.Insert{Table: tbl, Source: &optimizer.Values{Rows: rows}, ColumnIndex: []int{0, 1}}
 	op, err := Build(insertPlan)
 	if err != nil {
 		t.Fatal(err)
@@ -404,14 +404,14 @@ func TestAnalyzeRespectsNDistinctOption(t *testing.T) {
 	// unique (1000 distinct ids). Column 1 ("label") is a single value.
 	tbl.Columns[0].Options = []string{"n_distinct=5"}
 
-	rows := make([][]planner.Expr, 1000)
+	rows := make([][]optimizer.Expr, 1000)
 	for i := 0; i < 1000; i++ {
-		rows[i] = []planner.Expr{
-			&planner.IntegerConst{Value: int64(i + 1)}, // 1..1000, unique
-			&planner.StringConst{Value: "x"},
+		rows[i] = []optimizer.Expr{
+			&optimizer.IntegerConst{Value: int64(i + 1)}, // 1..1000, unique
+			&optimizer.StringConst{Value: "x"},
 		}
 	}
-	insertPlan := &planner.Insert{Table: tbl, Source: &planner.Values{Rows: rows}, ColumnIndex: []int{0, 1}}
+	insertPlan := &optimizer.Insert{Table: tbl, Source: &optimizer.Values{Rows: rows}, ColumnIndex: []int{0, 1}}
 	op, err := Build(insertPlan)
 	if err != nil {
 		t.Fatal(err)

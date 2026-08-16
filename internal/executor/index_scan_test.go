@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 func TestIndexScanEndToEndConstantKey(t *testing.T) {
@@ -18,11 +18,11 @@ func TestIndexScanEndToEndConstantKey(t *testing.T) {
 	}
 
 	plan := planOne(t, "SELECT id, label FROM items WHERE id = 2", cat)
-	proj, ok := plan.(*planner.Project)
+	proj, ok := plan.(*optimizer.Project)
 	if !ok {
 		t.Fatalf("root=%T want *planner.Project", plan)
 	}
-	if _, ok := proj.Child.(*planner.IndexScan); !ok {
+	if _, ok := proj.Child.(*optimizer.IndexScan); !ok {
 		t.Fatalf("child=%T want *planner.IndexScan", proj.Child)
 	}
 	op, err := Build(plan)

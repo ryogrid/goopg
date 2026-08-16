@@ -49,13 +49,13 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // cteSection is one `CTE <name>` heading plus the body it prints.
 type cteSection struct {
 	name    string
-	body    planner.Node
+	body    optimizer.Node
 	declSeq int
 }
 
@@ -94,17 +94,17 @@ type cteHoist struct {
 //
 // Returns nil when the plan references no CTE, so the render path costs
 // nothing for the overwhelming majority of statements.
-func collectCTEHoist(root planner.Node) *cteHoist {
+func collectCTEHoist(root optimizer.Node) *cteHoist {
 	if root == nil {
 		return nil
 	}
 	h := &cteHoist{byDecl: map[string]*cteSection{}}
-	var walk func(planner.Node)
-	walk = func(n planner.Node) {
+	var walk func(optimizer.Node)
+	walk = func(n optimizer.Node) {
 		if n == nil {
 			return
 		}
-		if scan, ok := n.(*planner.CTEScan); ok && scan.Child != nil {
+		if scan, ok := n.(*optimizer.CTEScan); ok && scan.Child != nil {
 			key := scan.DeclKey()
 			if _, claimed := h.byDecl[key]; claimed {
 				// A second reference to an already-claimed name. Do NOT
@@ -138,11 +138,11 @@ func collectCTEHoist(root planner.Node) *cteHoist {
 
 // hoisted reports whether n is a CTEScan whose body prints as a section
 // elsewhere — i.e. whether the walker must render it as a leaf.
-func (h *cteHoist) hoisted(n planner.Node) bool {
+func (h *cteHoist) hoisted(n optimizer.Node) bool {
 	if h == nil {
 		return false
 	}
-	scan, ok := n.(*planner.CTEScan)
+	scan, ok := n.(*optimizer.CTEScan)
 	if !ok {
 		return false
 	}
@@ -163,7 +163,7 @@ func (h *cteHoist) hoisted(n planner.Node) bool {
 //
 // The sections are drained (order emptied) as they print, so the recursive
 // render of a body — which passes the same subPlanReg — cannot re-emit them.
-func emitCTESections(rows *[]Row, depth int, reg *subPlanReg, render func(planner.Node, int)) {
+func emitCTESections(rows *[]Row, depth int, reg *subPlanReg, render func(optimizer.Node, int)) {
 	if reg == nil || reg.cte == nil || depth != 0 || len(reg.cte.order) == 0 {
 		return
 	}
@@ -187,7 +187,7 @@ func emitCTESections(rows *[]Row, depth int, reg *subPlanReg, render func(planne
 
 // renderChildren returns the children the EXPLAIN walkers should descend into.
 // It is planChildren everywhere except at a hoisted CTE Scan, which is a leaf.
-func renderChildren(n planner.Node, h *cteHoist) []planner.Node {
+func renderChildren(n optimizer.Node, h *cteHoist) []optimizer.Node {
 	if h.hoisted(n) {
 		return nil
 	}

@@ -7,7 +7,7 @@ import (
 	"sort"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // valuesOp emits a fixed sequence of rows produced from literal
@@ -22,14 +22,14 @@ import (
 // against a dynamic view would see the row materialised when the plan
 // was first cached. See M0094-0005.
 type valuesOp struct {
-	plan   *planner.Values
-	rows   [][]planner.Expr
+	plan   *optimizer.Values
+	rows   [][]optimizer.Expr
 	idx    int
 	ctx    *Context
-	schema planner.Schema
+	schema optimizer.Schema
 }
 
-func newValuesOp(plan *planner.Values) *valuesOp {
+func newValuesOp(plan *optimizer.Values) *valuesOp {
 	return &valuesOp{plan: plan, rows: plan.Rows, schema: plan.Output()}
 }
 
@@ -42,15 +42,15 @@ func newValuesOp(plan *planner.Values) *valuesOp {
 // expression rows for a virtual table, used for session-specific tables like
 // pg_prepared_statements where the data comes from the session rather than
 // the global VirtualRows callback.
-func rematerialiseVirtualRowsFromStrings(tbl *catalog.Table, raw [][]string) [][]planner.Expr {
-	out := make([][]planner.Expr, len(raw))
+func rematerialiseVirtualRowsFromStrings(tbl *catalog.Table, raw [][]string) [][]optimizer.Expr {
+	out := make([][]optimizer.Expr, len(raw))
 	for i, r := range raw {
-		cells := make([]planner.Expr, len(tbl.Columns))
+		cells := make([]optimizer.Expr, len(tbl.Columns))
 		for j := range tbl.Columns {
 			if j < len(r) {
-				cells[j] = planner.TypedVirtualCell(0, r[j], tbl.Columns[j].Type.Name)
+				cells[j] = optimizer.TypedVirtualCell(0, r[j], tbl.Columns[j].Type.Name)
 			} else {
-				cells[j] = &planner.NullConst{}
+				cells[j] = &optimizer.NullConst{}
 			}
 		}
 		out[i] = cells
@@ -58,20 +58,20 @@ func rematerialiseVirtualRowsFromStrings(tbl *catalog.Table, raw [][]string) [][
 	return out
 }
 
-func rematerialiseVirtualRows(plan *planner.Values) [][]planner.Expr {
+func rematerialiseVirtualRows(plan *optimizer.Values) [][]optimizer.Expr {
 	tbl := plan.VirtualSource
 	raw := tbl.VirtualRows()
-	out := make([][]planner.Expr, len(raw))
+	out := make([][]optimizer.Expr, len(raw))
 	for i, r := range raw {
-		cells := make([]planner.Expr, len(tbl.Columns))
+		cells := make([]optimizer.Expr, len(tbl.Columns))
 		for j := range tbl.Columns {
 			if j < len(r) {
 				// Sibling of planner.buildVirtualValues — must use the same
 				// typed-cell helper so integer/bool virtual columns compare
 				// by value, not lexicographically (sysviews int8 compare).
-				cells[j] = planner.TypedVirtualCell(0, r[j], tbl.Columns[j].Type.Name)
+				cells[j] = optimizer.TypedVirtualCell(0, r[j], tbl.Columns[j].Type.Name)
 			} else {
-				cells[j] = &planner.NullConst{}
+				cells[j] = &optimizer.NullConst{}
 			}
 		}
 		out[i] = cells
@@ -293,7 +293,7 @@ func (o *valuesOp) Open(ctx *Context) error {
 	}
 	return nil
 }
-func (o *valuesOp) Schema() planner.Schema { return o.schema }
+func (o *valuesOp) Schema() optimizer.Schema { return o.schema }
 func (o *valuesOp) Close() error           { return nil }
 
 func (o *valuesOp) Next() (TupleSlot, error) {
@@ -321,8 +321,8 @@ func (o *valuesOp) Next() (TupleSlot, error) {
 // child's lifetime contract is satisfied by the slot itself.
 type projectOp struct {
 	child   Operator
-	targets []planner.Expr
-	schema  planner.Schema
+	targets []optimizer.Expr
+	schema  optimizer.Schema
 	ctx     *Context
 	out     Row
 	// M0092-0007: stack-aliased slot reused across every Next()
@@ -330,7 +330,7 @@ type projectOp struct {
 	slot MaterializedSlot
 }
 
-func newProjectOp(plan *planner.Project, child Operator) *projectOp {
+func newProjectOp(plan *optimizer.Project, child Operator) *projectOp {
 	return &projectOp{child: child, targets: plan.Targets, schema: plan.Output()}
 }
 
@@ -343,7 +343,7 @@ func (o *projectOp) Open(ctx *Context) error {
 	}
 	return o.child.Open(ctx)
 }
-func (o *projectOp) Schema() planner.Schema { return o.schema }
+func (o *projectOp) Schema() optimizer.Schema { return o.schema }
 func (o *projectOp) Close() error {
 	releaseRow(o.out)
 	o.out = nil
@@ -414,8 +414,8 @@ func (o *projectOp) Next() (TupleSlot, error) {
 // (the parent must consume the slot before pulling again); the const-arg
 // rewrite sits under a LIMIT 1 which pulls exactly once.
 type resultOp struct {
-	targets []planner.Expr
-	schema  planner.Schema
+	targets []optimizer.Expr
+	schema  optimizer.Schema
 	ctx     *Context
 	out     Row
 	emitted bool
@@ -424,13 +424,13 @@ type resultOp struct {
 	// node); set for the const-arg rewrite's inner Result (SeqScan child).
 	child Operator
 	// qual is the optional One-Time Filter (resconstantqual); nil = none.
-	qual planner.Expr
+	qual optimizer.Expr
 	// qualFailed is set at Open when the one-time filter evaluated NULL/false:
 	// Next then returns EOF immediately and the child is never opened.
 	qualFailed bool
 }
 
-func newResultOp(plan *planner.Result, child Operator) *resultOp {
+func newResultOp(plan *optimizer.Result, child Operator) *resultOp {
 	return &resultOp{targets: plan.Targets, schema: plan.Output(),
 		child: child, qual: plan.OneTimeFilter}
 }
@@ -464,7 +464,7 @@ func (o *resultOp) Open(ctx *Context) error {
 	return nil
 }
 
-func (o *resultOp) Schema() planner.Schema { return o.schema }
+func (o *resultOp) Schema() optimizer.Schema { return o.schema }
 
 func (o *resultOp) Close() error {
 	if o.child != nil {
@@ -526,17 +526,17 @@ func (o *resultOp) Next() (TupleSlot, error) {
 
 type filterOp struct {
 	child         Operator
-	pred          planner.Expr
+	pred          optimizer.Expr
 	ctx           *Context
 	filterRemoved *int64 // set by maybeInstrument; nil when not instrumented
 }
 
-func newFilterOp(plan *planner.Filter, child Operator) *filterOp {
+func newFilterOp(plan *optimizer.Filter, child Operator) *filterOp {
 	return &filterOp{child: child, pred: plan.Predicate}
 }
 
 func (o *filterOp) Open(ctx *Context) error { o.ctx = ctx; return o.child.Open(ctx) }
-func (o *filterOp) Schema() planner.Schema  { return o.child.Schema() }
+func (o *filterOp) Schema() optimizer.Schema  { return o.child.Schema() }
 func (o *filterOp) Close() error            { return o.child.Close() }
 
 func (o *filterOp) setFilterRemoveCounter(p *int64) { o.filterRemoved = p }
@@ -588,20 +588,20 @@ func (o *filterOp) Next() (TupleSlot, error) {
 // against each row via evalExpr.
 type limitOp struct {
 	child       Operator
-	limitExpr   planner.Expr
-	offsetExpr  planner.Expr
+	limitExpr   optimizer.Expr
+	offsetExpr  optimizer.Expr
 	limitCount  int64 // -1 for no limit
 	offsetCount int64
 	emitted     int64
 	skipped     int64
 	withTies    bool
-	tieKeyExprs []planner.Expr
+	tieKeyExprs []optimizer.Expr
 	tieKeyVals  Row // key values of last emitted row (set when emitted==limitCount)
 	inTiesPhase bool
 	ctx         *Context
 }
 
-func newLimitOp(plan *planner.Limit, child Operator) *limitOp {
+func newLimitOp(plan *optimizer.Limit, child Operator) *limitOp {
 	return &limitOp{
 		child:       child,
 		limitExpr:   plan.Limit,
@@ -661,7 +661,7 @@ func (o *limitOp) Open(ctx *Context) error {
 	return nil
 }
 
-func (o *limitOp) Schema() planner.Schema { return o.child.Schema() }
+func (o *limitOp) Schema() optimizer.Schema { return o.child.Schema() }
 func (o *limitOp) Close() error           { return o.child.Close() }
 
 func (o *limitOp) Next() (TupleSlot, error) {
@@ -741,7 +741,7 @@ func (o *limitOp) tiesRowMatches(row Row) bool {
 // flagged for large sorts.
 type sortOp struct {
 	child Operator
-	keys  []planner.SortKey
+	keys  []optimizer.SortKey
 	ctx   *Context
 
 	// chunk size threshold for triggering a spill. Default 256 MiB.
@@ -779,7 +779,7 @@ type sortCTID struct {
 	has   bool
 }
 
-func newSortOp(plan *planner.Sort, child Operator) *sortOp {
+func newSortOp(plan *optimizer.Sort, child Operator) *sortOp {
 	return &sortOp{child: child, keys: plan.Keys}
 }
 
@@ -968,7 +968,7 @@ func (o *sortOp) flushChunk() error {
 	return nil
 }
 
-func (o *sortOp) Schema() planner.Schema { return o.child.Schema() }
+func (o *sortOp) Schema() optimizer.Schema { return o.child.Schema() }
 func (o *sortOp) Close() error {
 	// Captured before o.ctx is cleared: the spill-file unlink below has to
 	// tell the statement's registry it no longer owns these paths.

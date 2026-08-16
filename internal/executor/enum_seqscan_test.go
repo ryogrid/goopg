@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // TestEnumSeqScanFilterComparison verifies that seq scan filter predicates on enum columns
@@ -157,7 +157,7 @@ func runQueryWithErr(ctx *Context, sql string) ([]Row, error) {
 	if err != nil {
 		return nil, err
 	}
-	plan, err := planner.Plan(stmts[0], ctx.Catalog)
+	plan, err := optimizer.Plan(stmts[0], ctx.Catalog)
 	if err != nil {
 		return nil, err
 	}

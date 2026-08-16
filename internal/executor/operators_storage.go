@@ -14,16 +14,16 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/lockmgr"
-	"github.com/goopg/goopg/internal/mctx"
-	"github.com/goopg/goopg/internal/multixact"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/storage/lmgr"
+	"github.com/goopg/goopg/internal/utils/mmgr"
+	"github.com/goopg/goopg/internal/access/transam/multixact"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/pgarray"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/utils/adt/array"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -48,8 +48,8 @@ const maxEPQRetriesRC = 100000
 // serialization failure, by isolation level. READ COMMITTED retries (blocking)
 // essentially until success; REPEATABLE READ / SERIALIZABLE surface 40001
 // promptly to preserve first-update-wins semantics.
-func epqRetryLimit(iso mvcc.IsolationLevel) int {
-	if iso == mvcc.IsolationReadCommitted {
+func epqRetryLimit(iso transam.IsolationLevel) int {
+	if iso == transam.IsolationReadCommitted {
 		return maxEPQRetriesRC
 	}
 	return maxEPQRetries
@@ -347,7 +347,7 @@ func epqRecheckVisible(ctx *Context, rel storage.RelFileNode, blk storage.BlockN
 	if gerr != nil {
 		return false, nil // page read error → treat as not visible
 	}
-	return mvcc.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.CmdID, ctx.comboStore(), ctx.MultiXact), nil
+	return transam.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.CmdID, ctx.comboStore(), ctx.MultiXact), nil
 }
 
 // epqXmaxSettled classifies a concurrent modifier xid for an EvalPlanQual
@@ -423,7 +423,7 @@ func epqSerializationErr(ctx *Context, rel storage.RelFileNode, blk storage.Bloc
 // refreshed snapshot but sub-plan quals run against the original BEGIN-time
 // snapshot (so correlated subqueries see pre-commit values).
 func epqFollowHOT(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber,
-	slot uint16, cols []catalog.Column, pred planner.Expr, origSnap *mvcc.Snapshot) (uint16, Row, bool, bool) {
+	slot uint16, cols []catalog.Column, pred optimizer.Expr, origSnap *transam.Snapshot) (uint16, Row, bool, bool) {
 	s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 	if err != nil {
 		return 0, nil, false, false
@@ -635,7 +635,7 @@ func epqChainCheckMovedPartition(ctx *Context, rel storage.RelFileNode,
 // EPQ semantics: if the latest visible version still matches WHERE, the
 // updater proceeds against it; otherwise the row is skipped.
 func epqFollowChain(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber,
-	slot uint16, cols []catalog.Column, pred planner.Expr, origSnap *mvcc.Snapshot) (storage.BlockNumber, uint16, Row, bool) {
+	slot uint16, cols []catalog.Column, pred optimizer.Expr, origSnap *transam.Snapshot) (storage.BlockNumber, uint16, Row, bool) {
 	_, found, movedPart := epqFollowChainFull(ctx, rel, blk, slot, cols, pred, origSnap)
 	if movedPart {
 		return 0, 0, nil, false
@@ -673,7 +673,7 @@ func isChainTailCTID(ctid storage.ItemPointer, curBlk storage.BlockNumber, curSl
 // origSnap, if non-nil, is used temporarily for predicate evaluation so that
 // correlated sub-plans run against the original snapshot (PG EvalPlanQual semantics).
 func epqFollowChainFull(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber,
-	slot uint16, cols []catalog.Column, pred planner.Expr, origSnap *mvcc.Snapshot) (relNode storage.RelFileNode, found epqChainResult, movedPart bool) {
+	slot uint16, cols []catalog.Column, pred optimizer.Expr, origSnap *transam.Snapshot) (relNode storage.RelFileNode, found epqChainResult, movedPart bool) {
 	const maxChain = maxCTIDChainWalk
 	curBlk, curSlot := blk, slot
 	for i := 0; i < maxChain; i++ {
@@ -699,7 +699,7 @@ func epqFollowChainFull(ctx *Context, rel storage.RelFileNode, blk storage.Block
 		// visibility + predicate against this tuple.
 		atTail := isChainTailCTID(ctid, curBlk, curSlot)
 		if atTail {
-			if !mvcc.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
+			if !transam.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
 				return rel, epqChainResult{}, false
 			}
 			row, decErr := DecodeHeapTupleRow(cols, tup, nil)
@@ -862,7 +862,7 @@ func epqChainTailLiveButUnseen(ctx *Context, rel storage.RelFileNode, blk storag
 				return false
 			}
 		}
-		return !mvcc.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.CmdID,
+		return !transam.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.CmdID,
 			ctx.comboStore(), ctx.MultiXact)
 	}
 	return false
@@ -872,7 +872,7 @@ func epqChainTailLiveButUnseen(ctx *Context, rel storage.RelFileNode, blk storag
 // EvalPlanQual lap sees everything committed since the last refresh. A no-op at
 // RR/Serializable, where the snapshot is frozen for the whole transaction.
 func epqRefreshSnapForRetry(ctx *Context) {
-	if ctx.Tx.Isolation != mvcc.IsolationReadCommitted || ctx.TxnMgr == nil {
+	if ctx.Tx.Isolation != transam.IsolationReadCommitted || ctx.TxnMgr == nil {
 		return
 	}
 	if newSnap, err := ctx.TxnMgr.SnapshotFor(ctx.Tx); err == nil {
@@ -980,7 +980,7 @@ type seqScanOp struct {
 	// schema/tbl/pos/rel are extracted from *planner.SeqScan at construction
 	// time (Phase C.3 migration: seqScanOp no longer holds a GC-traced
 	// *planner.SeqScan pointer; the planner struct can be freed after Open).
-	schema planner.Schema
+	schema optimizer.Schema
 	tbl    *catalog.Table
 	pos    int
 	rel    storage.RelFileNode // cached once in Open; avoids catalog lock per Next call
@@ -1018,7 +1018,7 @@ type seqScanOp struct {
 	// in Open, and only for a relation that actually has an array column —
 	// arrayStyleLive gates the whole thing so a scan of an array-free table
 	// pays nothing. M0119-0006.
-	arrayStyle     pgarray.OutputStyle
+	arrayStyle     array.OutputStyle
 	arrayStyleLive bool
 
 	// ssiGistPred is the spatial WHERE predicate of the Filter directly above
@@ -1028,7 +1028,7 @@ type seqScanOp struct {
 	// (design 0118-0137) instead of a relation-grain lock, reproducing PG's
 	// page-level GiST predicate locking (predicate-gist spec). nil for every
 	// non-gist scan (the common case) — pure no-op.
-	ssiGistPred planner.Expr
+	ssiGistPred optimizer.Expr
 	// gistSSIIdxOID / gistSSIColIdx are resolved in Open from ssiGistPred + the
 	// table's GiST index: the index OID used as the predicate-lock relation and
 	// the position of the indexed point column in cols. gistSSIIdxOID==0 disables
@@ -1046,7 +1046,7 @@ type seqScanOp struct {
 	// on the search keys (design 0118-0140) instead of a relation-grain lock,
 	// reproducing PG's per-key GIN index predicate locking (predicate-gin spec).
 	// nil for every non-gin scan — pure no-op.
-	ssiGinPred planner.Expr
+	ssiGinPred optimizer.Expr
 	// ginSSIIdxOID / ginSSIColIdx are resolved in Open from ssiGinPred + the
 	// table's GIN index: the index OID used as the predicate-lock relation and the
 	// position of the indexed array column in cols. ginSSIIdxOID==0 disables the
@@ -1106,7 +1106,7 @@ type seqScanOp struct {
 	// allocated for the previous page's tuples; consumers that
 	// retain rows past the boundary must call slot.Materialize()
 	// to deep-copy. (M0073-0004; M0107-0001: arena→sctx.)
-	sctx *mctx.Context
+	sctx *mmgr.Context
 
 	// M0092-0007: embedded slot reused across every Next() call.
 	// The returned `&o.slot` pointer is stable across calls; its
@@ -1285,7 +1285,7 @@ func canonicalTypeClass(im *catalog.InMemory, t catalog.Type) string {
 	return name
 }
 
-func newSeqScanOp(p *planner.SeqScan) *seqScanOp {
+func newSeqScanOp(p *optimizer.SeqScan) *seqScanOp {
 	return &seqScanOp{
 		schema:                p.Output(),
 		tbl:                   p.Table,
@@ -1299,7 +1299,7 @@ func newSeqScanOp(p *planner.SeqScan) *seqScanOp {
 	}
 }
 
-func (o *seqScanOp) Schema() planner.Schema { return o.schema }
+func (o *seqScanOp) Schema() optimizer.Schema { return o.schema }
 
 // gistRowMatches evaluates the GiST spatial-SSI predicate against an
 // already-decoded leaf-local row, returning whether the row matches the scan's
@@ -1349,12 +1349,12 @@ func (o *seqScanOp) gistTupleMatches(tuple storage.HeapTuple) bool {
 // returns ok=false so the caller keeps relation-grain locking (never under-locks).
 // Design 0118-0140.
 func (o *seqScanOp) extractGinSearchKeys(colName string) ([]string, bool) {
-	bin, ok := o.ssiGinPred.(*planner.BinaryOp)
+	bin, ok := o.ssiGinPred.(*optimizer.BinaryOp)
 	if !ok || bin.Op != parser.OpContains {
 		return nil, false
 	}
 	// `col @> array[...]`: Left is the gin column, Right is the constant array.
-	lc, lok := bin.Left.(*planner.ColumnRef)
+	lc, lok := bin.Left.(*optimizer.ColumnRef)
 	if !lok || !strings.EqualFold(lc.Name, colName) {
 		return nil, false
 	}
@@ -1518,7 +1518,7 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	if o.gistSSIIdxOID == 0 && o.ginSSIIdxOID == 0 && (o.tbl == nil || (!o.tbl.Temp && !o.tbl.IsMatView)) {
 		ssiRecordRelationRead(ctx, o.rel)
 	}
-	if err := ctx.acquireRelLock(o.rel, lockmgr.AccessShareLock); err != nil {
+	if err := ctx.acquireRelLock(o.rel, lmgr.AccessShareLock); err != nil {
 		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 			ee.Pos = o.pos
 		}
@@ -1606,7 +1606,7 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	o.prefetchedThru = 0
 	// M0073-0004 / M0107-0001: per-operator mctx for varchar / char /
 	// text / bytea payload. Reset on block-advance; Release on Close.
-	o.sctx = mctx.Acquire(ctx.Mctx, mctx.KindExpr)
+	o.sctx = mmgr.Acquire(ctx.Mctx, mmgr.KindExpr)
 	// Activate the ring strategy when the relation is large enough that a
 	// full sequential scan would evict most hot pages from the shared pool.
 	// Threshold: pool capacity / 4, matching upstream's heuristic.
@@ -1848,7 +1848,7 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				// partial page writes or WAL-replay debris.
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.CmdID, o.ctx.comboStore(), o.ctx.MultiXact) {
+			if !transam.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.CmdID, o.ctx.comboStore(), o.ctx.MultiXact) {
 				// M0118-0002 (design 0118-0137): in GiST spatial-SSI mode the
 				// invisible-tuple conflict-out is gated by the spatial predicate —
 				// only a concurrent insert that MATCHES this scan's region forms the
@@ -1900,7 +1900,7 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			needsXminHintBit := o.pinned != nil &&
 				tuple.Header.Infomask&storage.HeapXminCommitted == 0 &&
 				tuple.Header.Infomask&storage.HeapXminInvalid == 0 &&
-				!mvcc.IsSelfXID(tuple.Header.Xmin, o.ctx.Tx.XID, o.ctx.TxnMgr)
+				!transam.IsSelfXID(tuple.Header.Xmin, o.ctx.Tx.XID, o.ctx.TxnMgr)
 			// M0104-0007: SSI read-path hook. Tuple is visible to this
 			// reader — install a tuple-grain SIREAD predicate lock and an
 			// rw-conflict edge to the producing writer (xmin). Helper
@@ -2154,7 +2154,7 @@ func (o *seqScanOp) releasePinned() {
 // xmin = ctx.Tx.XID, and writes them through the buffer pool. Each
 // successful insert bumps RowsAffected.
 type insertOp struct {
-	plan         *planner.Insert
+	plan         *optimizer.Insert
 	ctx          *Context
 	child        Operator
 	rowsAffected int64
@@ -2169,11 +2169,11 @@ type insertOp struct {
 // RowsAffected satisfies executor.RowCounter.
 func (o *insertOp) RowsAffected() int64 { return o.rowsAffected }
 
-func newInsertOp(p *planner.Insert, child Operator) *insertOp {
+func newInsertOp(p *optimizer.Insert, child Operator) *insertOp {
 	return &insertOp{plan: p, child: child}
 }
 
-func (o *insertOp) Schema() planner.Schema {
+func (o *insertOp) Schema() optimizer.Schema {
 	if len(o.plan.Returning) > 0 {
 		return o.plan.ReturningSchema
 	}
@@ -2261,7 +2261,7 @@ func (o *insertOp) Open(ctx *Context) error {
 		return &ExecError{Code: "42501", Pos: o.plan.Pos(), Message: fmt.Sprintf("permission denied for table %s", o.plan.Table.Name)}
 	}
 	rel := ctx.Catalog.RelFileNode(o.plan.Table)
-	if err := ctx.acquireRelLock(rel, lockmgr.RowExclusiveLock); err != nil {
+	if err := ctx.acquireRelLock(rel, lmgr.RowExclusiveLock); err != nil {
 		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 			ee.Pos = o.plan.Pos()
 		}
@@ -3208,30 +3208,30 @@ func partitionKeyDatumToListStr(d Datum) string {
 //
 // Surfaces an explicit XX000 for plan shapes the executor doesn't
 // recognise — pre-existing planner-bug guard.
-func extractScan(child planner.Node) (seq *planner.SeqScan, pred planner.Expr, idx *planner.IndexScan, err error) {
+func extractScan(child optimizer.Node) (seq *optimizer.SeqScan, pred optimizer.Expr, idx *optimizer.IndexScan, err error) {
 	switch c := child.(type) {
-	case *planner.SeqScan:
+	case *optimizer.SeqScan:
 		return c, nil, nil, nil
-	case *planner.IndexScan:
+	case *optimizer.IndexScan:
 		// Convert to SeqScan+predicate for the fallback path,
 		// but also return the IndexScan so the caller can use
 		// the B-tree directly.
-		scan := &planner.SeqScan{Table: c.Table}
+		scan := &optimizer.SeqScan{Table: c.Table}
 		return scan, indexScanPredicate(c), c, nil
-	case *planner.Filter:
+	case *optimizer.Filter:
 		switch inner := c.Child.(type) {
-		case *planner.SeqScan:
+		case *optimizer.SeqScan:
 			return inner, c.Predicate, nil, nil
-		case *planner.IndexScan:
-			scan := &planner.SeqScan{Table: inner.Table}
+		case *optimizer.IndexScan:
+			scan := &optimizer.SeqScan{Table: inner.Table}
 			idxPred := indexScanPredicate(inner)
-			var combined planner.Expr
+			var combined optimizer.Expr
 			if idxPred == nil {
 				// Range scan — no synthesised equality predicate;
 				// the Filter predicate alone is the full condition.
 				combined = c.Predicate
 			} else {
-				combined = &planner.BinaryOp{
+				combined = &optimizer.BinaryOp{
 					Op:    parser.OpAnd,
 					Left:  c.Predicate,
 					Right: idxPred,
@@ -3256,7 +3256,7 @@ func extractScan(child planner.Node) (seq *planner.SeqScan, pred planner.Expr, i
 //
 // Range scans (Key == nil) return nil — UPDATE/DELETE with range
 // predicates fall through to seq-scan, which is correct and safe.
-func indexScanPredicate(ix *planner.IndexScan) planner.Expr {
+func indexScanPredicate(ix *optimizer.IndexScan) optimizer.Expr {
 	if ix.Key == nil {
 		// Range scan: no equality predicate to synthesise.
 		// The caller (extractScan) will combine this nil with
@@ -3269,9 +3269,9 @@ func indexScanPredicate(ix *planner.IndexScan) planner.Expr {
 	out := ix.Output()
 	for i, sc := range out {
 		if sc.Name == col {
-			return &planner.BinaryOp{
+			return &optimizer.BinaryOp{
 				Op:    parser.OpEq,
-				Left:  &planner.ColumnRef{Index: i, Name: col, Type: sc.Type},
+				Left:  &optimizer.ColumnRef{Index: i, Name: col, Type: sc.Type},
 				Right: ix.Key,
 			}
 		}
@@ -3310,7 +3310,7 @@ func idxRowHasConcurrentXmax(ctx *Context, rel storage.RelFileNode, blk storage.
 	return isConcurrentlyUpdated(t.Header, ctx.Tx.XID, &ctx.Snap, ctx.MultiXact)
 }
 
-func hotUpdateEligible(plan *planner.Update, ctx *Context) bool {
+func hotUpdateEligible(plan *optimizer.Update, ctx *Context) bool {
 	indexes := ctx.Catalog.IndexesOnTable(plan.Table, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 	for _, idx := range indexes {
 		for _, idxCol := range idx.Columns {
@@ -3437,7 +3437,7 @@ func isSelfModifiedWrite(h storage.HeapTupleHeader, myXID storage.TransactionID)
 // from the member store before the abort/self checks — the raw
 // MultiXactId must never be fed to a single-xid API (myXID equality,
 // snap.HasAborted). Mirrors activeLockHolders' multi resolution. M0118-0003.
-func isConcurrentlyUpdated(h storage.HeapTupleHeader, myXID storage.TransactionID, snap *mvcc.Snapshot, mxs *multixact.Store) bool {
+func isConcurrentlyUpdated(h storage.HeapTupleHeader, myXID storage.TransactionID, snap *transam.Snapshot, mxs *multixact.Store) bool {
 	// effXmax is the transaction id that actually updated/deleted the
 	// tuple. For an updater-bearing multixact xmax, h.Xmax is a
 	// MultiXactId, not a transaction id — resolve the updater member.
@@ -3529,7 +3529,7 @@ func multixactUpdaterXID(mxs *multixact.Store, xmax storage.TransactionID) stora
 // lock. A waiter blocks on the returned xid and re-probes; one wait per
 // remaining holder converges because settled members drop out of IsXIDActive.
 // Callers MUST have already checked storage.IsHeapTupleXmaxMulti(infomask).
-func multixactFirstActiveMember(mxs *multixact.Store, txnMgr *mvcc.Manager, self, xmax storage.TransactionID) storage.TransactionID {
+func multixactFirstActiveMember(mxs *multixact.Store, txnMgr *transam.Manager, self, xmax storage.TransactionID) storage.TransactionID {
 	if mxs == nil || txnMgr == nil {
 		return storage.InvalidTransactionID
 	}
@@ -4060,9 +4060,9 @@ func tryApplyHOTUpdate(
 // the page has space. Falls back to the classic delete+insert pattern
 // when HOT is ineligible or the page is full.
 type updateOp struct {
-	plan         *planner.Update
-	scan         *planner.SeqScan
-	pred         planner.Expr
+	plan         *optimizer.Update
+	scan         *optimizer.SeqScan
+	pred         optimizer.Expr
 	ctx          *Context
 	rowsAffected int64
 	done         bool
@@ -4071,7 +4071,7 @@ type updateOp struct {
 	// updateOp uses the B-tree to find matching tuples (O(log n))
 	// instead of the full SeqScan path (O(n)). Set by newUpdateOp
 	// when the planner produced an IndexScan.
-	idxScan *planner.IndexScan
+	idxScan *optimizer.IndexScan
 
 	// retRows / retIdx: collected RETURNING rows; iterated via Next()
 	// after all updates are applied (M0100-0005).
@@ -4082,7 +4082,7 @@ type updateOp struct {
 // RowsAffected satisfies executor.RowCounter.
 func (o *updateOp) RowsAffected() int64 { return o.rowsAffected }
 
-func newUpdateOp(p *planner.Update) (*updateOp, error) {
+func newUpdateOp(p *optimizer.Update) (*updateOp, error) {
 	scan, pred, idxScan, err := extractScan(p.Child)
 	if err != nil {
 		return nil, err
@@ -4090,7 +4090,7 @@ func newUpdateOp(p *planner.Update) (*updateOp, error) {
 	return &updateOp{plan: p, scan: scan, pred: pred, idxScan: idxScan}, nil
 }
 
-func (o *updateOp) Schema() planner.Schema { return o.plan.ReturningSchema }
+func (o *updateOp) Schema() optimizer.Schema { return o.plan.ReturningSchema }
 
 // childFKsToRecheck returns the foreign keys declared ON the updated table
 // whose referencing columns are modified by this UPDATE's SET list. PostgreSQL
@@ -4178,7 +4178,7 @@ func (o *updateOp) Open(ctx *Context) error {
 		return &ExecError{Code: "42501", Pos: o.plan.Pos(), Message: fmt.Sprintf("permission denied for table %s", o.plan.Table.Name)}
 	}
 	rel := ctx.Catalog.RelFileNode(o.plan.Table)
-	if err := ctx.acquireRelLock(rel, lockmgr.RowExclusiveLock); err != nil {
+	if err := ctx.acquireRelLock(rel, lmgr.RowExclusiveLock); err != nil {
 		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 			ee.Pos = o.plan.Pos()
 		}
@@ -4245,7 +4245,7 @@ func (o *updateOp) nextVirtualPgDatabase() (TupleSlot, error) {
 			if j < len(rawRow) {
 				cell = rawRow[j]
 			}
-			v, err := evalExpr(planner.TypedVirtualCell(o.plan.Pos(), cell, tbl.Columns[j].Type.Name), nil, o.ctx)
+			v, err := evalExpr(optimizer.TypedVirtualCell(o.plan.Pos(), cell, tbl.Columns[j].Type.Name), nil, o.ctx)
 			if err != nil {
 				return nil, err
 			}
@@ -4332,7 +4332,7 @@ func (o *updateOp) nextVirtualPgAmproc() (TupleSlot, error) {
 			if j < len(rawRow) {
 				cell = rawRow[j]
 			}
-			v, err := evalExpr(planner.TypedVirtualCell(o.plan.Pos(), cell, tbl.Columns[j].Type.Name), nil, o.ctx)
+			v, err := evalExpr(optimizer.TypedVirtualCell(o.plan.Pos(), cell, tbl.Columns[j].Type.Name), nil, o.ctx)
 			if err != nil {
 				return nil, err
 			}
@@ -4659,7 +4659,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 					// Without this, the committed xmax stays in snap.InProgress
 					// and epqRecheckVisible returns true indefinitely (tight loop
 					// until maxEPQRetries → spurious 40001). M0100-0005-merge-delete.
-					if o.ctx.Tx.Isolation == mvcc.IsolationReadCommitted && o.ctx.TxnMgr != nil {
+					if o.ctx.Tx.Isolation == transam.IsolationReadCommitted && o.ctx.TxnMgr != nil {
 						if newSnap, snapErr := o.ctx.TxnMgr.SnapshotFor(o.ctx.Tx); snapErr == nil {
 							o.ctx.Snap = newSnap
 						}
@@ -4667,7 +4667,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 					// M0100-0004: EPQ chain-following for RC; 40001 for RR.
 					visible, _ := epqRecheckVisible(o.ctx, rel, pu.blk, pu.slot)
 					if visible {
-						if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted && o.ctx.TxnMgr != nil {
+						if o.ctx.Tx.Isolation != transam.IsolationReadCommitted && o.ctx.TxnMgr != nil {
 							// RR/SSI: classify xmax authoritatively, not by snapshot
 							// membership — a committer that started after our frozen
 							// snapshot is absent from snap.InProgress (0118-0105).
@@ -4700,7 +4700,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 						continue // still in-progress; retry
 					}
 					// Concurrent tx committed — row was updated or deleted.
-					if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
+					if o.ctx.Tx.Isolation != transam.IsolationReadCommitted {
 						errMsg := "could not serialize access due to concurrent update"
 						if sp, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: pu.blk}); perr == nil {
 							sp.RLock()
@@ -4758,7 +4758,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 									Message: "could not serialize access due to concurrent update (deadlock)",
 								}
 							}
-							if o.ctx.Tx.Isolation == mvcc.IsolationReadCommitted && o.ctx.TxnMgr != nil {
+							if o.ctx.Tx.Isolation == transam.IsolationReadCommitted && o.ctx.TxnMgr != nil {
 								if newSnap, snapErr := o.ctx.TxnMgr.SnapshotFor(o.ctx.Tx); snapErr == nil {
 									o.ctx.Snap = newSnap
 								}
@@ -5112,7 +5112,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 		scanRel := o.ctx.Catalog.RelFileNode(scanTbl)
 		scanCols := scanTbl.Columns
 		if scanTbl != tbl {
-			if err := o.ctx.acquireRelLock(scanRel, lockmgr.RowExclusiveLock); err != nil {
+			if err := o.ctx.acquireRelLock(scanRel, lmgr.RowExclusiveLock); err != nil {
 				return nil, err
 			}
 		}
@@ -5256,7 +5256,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					}
 					visible, _ := epqRecheckVisible(o.ctx, captureRel, writeBlk, writeSlot)
 					if visible {
-						if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted && o.ctx.TxnMgr != nil {
+						if o.ctx.Tx.Isolation != transam.IsolationReadCommitted && o.ctx.TxnMgr != nil {
 							// RR/SSI: classify xmax authoritatively, not by snapshot
 							// membership — a committer that started after our frozen
 							// snapshot is absent from snap.InProgress (0118-0105).
@@ -5280,7 +5280,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 						continue
 					}
 					// Concurrent tx committed (visible=false via fresh RC snapshot).
-					if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
+					if o.ctx.Tx.Isolation != transam.IsolationReadCommitted {
 						// Distinguish update vs delete: chain-tail t_ctid (self or
 						// {Invalid,0}) means never-updated; a successor means UPDATE.
 						errMsg := "could not serialize access due to concurrent update"
@@ -5541,7 +5541,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					// M0100-0004: EPQ chain-following for RC; 40001 for RR.
 					visible, _ := epqRecheckVisible(o.ctx, puRel, pu.blk, pu.slot)
 					if visible {
-						if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted && o.ctx.TxnMgr != nil {
+						if o.ctx.Tx.Isolation != transam.IsolationReadCommitted && o.ctx.TxnMgr != nil {
 							// RR/SSI: classify xmax authoritatively, not by snapshot membership —
 							// a committer that started after our frozen snapshot is absent from
 							// snap.InProgress (0118-0105).
@@ -5567,7 +5567,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 						continue
 					}
 					// Concurrent tx committed — row was updated or deleted.
-					if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
+					if o.ctx.Tx.Isolation != transam.IsolationReadCommitted {
 						// Distinguish UPDATE vs DELETE: chain-tail t_ctid (self or
 						// {Invalid,0}) means never-updated; a successor means UPDATE.
 						errMsg := "could not serialize access due to concurrent update"
@@ -5624,7 +5624,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 									Message: "could not serialize access due to concurrent update (deadlock)",
 								}
 							}
-							if o.ctx.Tx.Isolation == mvcc.IsolationReadCommitted && o.ctx.TxnMgr != nil {
+							if o.ctx.Tx.Isolation == transam.IsolationReadCommitted && o.ctx.TxnMgr != nil {
 								if newSnap, snapErr := o.ctx.TxnMgr.SnapshotFor(o.ctx.Tx); snapErr == nil {
 									o.ctx.Snap = newSnap
 								}
@@ -5850,13 +5850,13 @@ func (o *updateOp) Next() (TupleSlot, error) {
 // deleteOp scans the target relation and stamps xmax on visible
 // matching tuples. v0 doesn't reclaim space here — VACUUM does that.
 type deleteOp struct {
-	plan         *planner.Delete
-	scan         *planner.SeqScan
-	pred         planner.Expr
+	plan         *optimizer.Delete
+	scan         *optimizer.SeqScan
+	pred         optimizer.Expr
 	ctx          *Context
 	rowsAffected int64
 	done         bool
-	idxScan      *planner.IndexScan
+	idxScan      *optimizer.IndexScan
 	retRows      []Row
 	retIdx       int
 }
@@ -5864,7 +5864,7 @@ type deleteOp struct {
 // RowsAffected satisfies executor.RowCounter.
 func (o *deleteOp) RowsAffected() int64 { return o.rowsAffected }
 
-func newDeleteOp(p *planner.Delete) (*deleteOp, error) {
+func newDeleteOp(p *optimizer.Delete) (*deleteOp, error) {
 	scan, pred, idxScan, err := extractScan(p.Child)
 	if err != nil {
 		return nil, err
@@ -5930,14 +5930,14 @@ func (o *deleteOp) tryPgClassCatalogDelete() (bool, error) {
 // ok=false for any other shape, or when a relname does not resolve to a live
 // relation. Design 0118-0117 (intra-grant-inplace perm 10).
 func (o *deleteOp) pgClassDeleteTargetOID() (uint32, bool) {
-	bo, ok := o.pred.(*planner.BinaryOp)
+	bo, ok := o.pred.(*optimizer.BinaryOp)
 	if !ok || bo.Op != parser.OpEq {
 		return 0, false
 	}
-	cr, ok := bo.Left.(*planner.ColumnRef)
+	cr, ok := bo.Left.(*optimizer.ColumnRef)
 	constExpr := bo.Right
 	if !ok {
-		if cr, ok = bo.Right.(*planner.ColumnRef); !ok {
+		if cr, ok = bo.Right.(*optimizer.ColumnRef); !ok {
 			return 0, false
 		}
 		constExpr = bo.Left
@@ -5965,7 +5965,7 @@ func (o *deleteOp) pgClassDeleteTargetOID() (uint32, bool) {
 	return 0, false
 }
 
-func (o *deleteOp) Schema() planner.Schema { return o.plan.ReturningSchema }
+func (o *deleteOp) Schema() optimizer.Schema { return o.plan.ReturningSchema }
 
 // appendDeleteRetRow evaluates RETURNING expressions against the old row
 // (before deletion) and appends to o.retRows (M0100-0005).
@@ -6006,7 +6006,7 @@ func (o *deleteOp) Open(ctx *Context) error {
 		return &ExecError{Code: "42501", Pos: o.plan.Pos(), Message: fmt.Sprintf("permission denied for table %s", o.plan.Table.Name)}
 	}
 	rel := ctx.Catalog.RelFileNode(o.plan.Table)
-	if err := ctx.acquireRelLock(rel, lockmgr.RowExclusiveLock); err != nil {
+	if err := ctx.acquireRelLock(rel, lmgr.RowExclusiveLock); err != nil {
 		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 			ee.Pos = o.plan.Pos()
 		}
@@ -6095,7 +6095,7 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 	for _, scanTbl := range scanTables {
 		scanRel := o.ctx.Catalog.RelFileNode(scanTbl)
 		if scanTbl != tbl {
-			if err := o.ctx.acquireRelLock(scanRel, lockmgr.RowExclusiveLock); err != nil {
+			if err := o.ctx.acquireRelLock(scanRel, lmgr.RowExclusiveLock); err != nil {
 				return nil, err
 			}
 		}
@@ -6163,7 +6163,7 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 					}
 					visible, _ := epqRecheckVisible(o.ctx, captureRel, deleteBlk, deleteSlot)
 					if visible {
-						if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted && o.ctx.TxnMgr != nil {
+						if o.ctx.Tx.Isolation != transam.IsolationReadCommitted && o.ctx.TxnMgr != nil {
 							// RR/SSI: classify xmax authoritatively, not by snapshot membership —
 							// a committer that started after our frozen snapshot is absent from
 							// snap.InProgress (0118-0105).
@@ -6186,7 +6186,7 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 						continue
 					}
 					// Concurrent tx committed — row was updated or deleted.
-					if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
+					if o.ctx.Tx.Isolation != transam.IsolationReadCommitted {
 						return &ExecError{Code: "40001", Pos: o.plan.Pos(),
 							Message: "could not serialize access due to concurrent update"}
 					}
@@ -6304,7 +6304,7 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 				// M0100-0004: EPQ chain-following for RC; 40001 for RR.
 				visible, _ := epqRecheckVisible(o.ctx, victimRel, v.blk, v.slot)
 				if visible {
-					if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted && o.ctx.TxnMgr != nil {
+					if o.ctx.Tx.Isolation != transam.IsolationReadCommitted && o.ctx.TxnMgr != nil {
 						// RR/SSI: classify xmax authoritatively, not by snapshot membership —
 						// a committer that started after our frozen snapshot is absent from
 						// snap.InProgress (0118-0105).
@@ -6330,7 +6330,7 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 					continue
 				}
 				// Concurrent tx committed — row was updated or deleted.
-				if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
+				if o.ctx.Tx.Isolation != transam.IsolationReadCommitted {
 					return nil, &ExecError{Code: "40001", Pos: o.plan.Pos(),
 						Message: "could not serialize access due to concurrent update"}
 				}
@@ -6441,7 +6441,7 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 // closes it. Used by UPDATE … FROM and DELETE … USING to materialise their
 // source sets, which may be real-table SeqScans or arbitrary subquery nodes
 // (including VALUES).
-func collectNodeRows(node planner.Node, ctx *Context) ([]Row, error) {
+func collectNodeRows(node optimizer.Node, ctx *Context) ([]Row, error) {
 	op, err := Build(node)
 	if err != nil {
 		return nil, err
@@ -6528,7 +6528,7 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 	if imFrom, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 		// Partition children: same column ordinals as parent, possibly overridden GeneratedExpr.
 		for _, pc := range imFrom.PartitionChildren(o.plan.Table.OID) {
-			if err := o.ctx.acquireRelLock(o.ctx.Catalog.RelFileNode(pc), lockmgr.RowExclusiveLock); err != nil {
+			if err := o.ctx.acquireRelLock(o.ctx.Catalog.RelFileNode(pc), lmgr.RowExclusiveLock); err != nil {
 				return nil, err
 			}
 			fromScanTargets = append(fromScanTargets, fromScanTarget{
@@ -6540,7 +6540,7 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 		// Inheritance children: require column remapping. Drop other-session
 		// temp children (RELATION_IS_OTHER_TEMP). Design 0118-0036.
 		for _, ic := range catalog.AccessibleInheritanceChildren(imFrom.InheritanceChildren(o.plan.Table.OID), sessionTempOwner(o.ctx)) {
-			if err := o.ctx.acquireRelLock(o.ctx.Catalog.RelFileNode(ic), lockmgr.RowExclusiveLock); err != nil {
+			if err := o.ctx.acquireRelLock(o.ctx.Catalog.RelFileNode(ic), lmgr.RowExclusiveLock); err != nil {
 				return nil, err
 			}
 			fromScanTargets = append(fromScanTargets, fromScanTarget{
@@ -6753,7 +6753,7 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 				ts.RLock()
 				if tsTup, tsGerr := storage.PageGetHeapTuple(ts.Page(), pu.slot); tsGerr == nil {
 					if tsTup.Header.Xmax != storage.InvalidTransactionID && tsTup.Header.Xmax == o.ctx.Tx.XID {
-						cmax := mvcc.GetCmax(tsTup.Header, o.ctx.comboStore())
+						cmax := transam.GetCmax(tsTup.Header, o.ctx.comboStore())
 						ts.RUnlock()
 						o.ctx.Pool.Unpin(ts)
 						// cmax == live CID (post-function-sync) → same sub-command → skip silently.
@@ -6799,7 +6799,7 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 				s.Unlock()
 				o.ctx.Pool.Unpin(s)
 				// EPQ: wait for the concurrent transaction and recheck. M0100-0010.
-				if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
+				if o.ctx.Tx.Isolation != transam.IsolationReadCommitted {
 					return nil, &ExecError{Code: "40001", Pos: o.plan.Pos(),
 						Message: "could not serialize access due to concurrent update"}
 				}
@@ -6836,7 +6836,7 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 					tms.RLock()
 					if tmsTup, tmsGerr := storage.PageGetHeapTuple(tms.Page(), newSlot); tmsGerr == nil {
 						if tmsTup.Header.Xmax != storage.InvalidTransactionID && tmsTup.Header.Xmax == o.ctx.Tx.XID {
-							cmax := mvcc.GetCmax(tmsTup.Header, o.ctx.comboStore())
+							cmax := transam.GetCmax(tmsTup.Header, o.ctx.comboStore())
 							liveCID := o.ctx.GetCurrentCommandId(true)
 							tms.RUnlock()
 							o.ctx.Pool.Unpin(tms)
@@ -6916,7 +6916,7 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 				// a sub-command of our transaction. Compare cmax against live CID.
 				// M0129-S2 / AI-007.
 				if oldTup.Header.Xmax != storage.InvalidTransactionID && oldTup.Header.Xmax == o.ctx.Tx.XID {
-					cmax := mvcc.GetCmax(oldTup.Header, o.ctx.comboStore())
+					cmax := transam.GetCmax(oldTup.Header, o.ctx.comboStore())
 					liveCID := o.ctx.GetCurrentCommandId(true)
 					if cmax != liveCID {
 						return nil, errTupleAlreadyModified("updated", o.plan.Pos())
@@ -7048,7 +7048,7 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 	if imDel, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 		// Drop other-session temp inheritance children. Design 0118-0036.
 		for _, ic := range catalog.AccessibleInheritanceChildren(imDel.InheritanceChildren(tbl.OID), sessionTempOwner(o.ctx)) {
-			if err := o.ctx.acquireRelLock(o.ctx.Catalog.RelFileNode(ic), lockmgr.RowExclusiveLock); err != nil {
+			if err := o.ctx.acquireRelLock(o.ctx.Catalog.RelFileNode(ic), lmgr.RowExclusiveLock); err != nil {
 				return nil, err
 			}
 			usingScanTargets = append(usingScanTargets, usingScanTarget{
@@ -7195,7 +7195,7 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 				}
 				visible, _ := epqRecheckVisible(o.ctx, vRel, v.blk, v.slot)
 				if visible {
-					if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted && o.ctx.TxnMgr != nil {
+					if o.ctx.Tx.Isolation != transam.IsolationReadCommitted && o.ctx.TxnMgr != nil {
 						aborted, committed := epqXmaxSettled(o.ctx, xmax)
 						if aborted {
 							epqDoDelete = true
@@ -7218,7 +7218,7 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 					continue
 				}
 				// Concurrent tx committed — row was updated or deleted.
-				if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
+				if o.ctx.Tx.Isolation != transam.IsolationReadCommitted {
 					return nil, &ExecError{
 						Code:    "40001",
 						Pos:     o.plan.Pos(),
@@ -7257,7 +7257,7 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 					tms.RLock()
 					if tmsTup, tmsGerr := storage.PageGetHeapTuple(tms.Page(), newSlot); tmsGerr == nil {
 						if tmsTup.Header.Xmax != storage.InvalidTransactionID && tmsTup.Header.Xmax == o.ctx.Tx.XID {
-							cmax := mvcc.GetCmax(tmsTup.Header, o.ctx.comboStore())
+							cmax := transam.GetCmax(tmsTup.Header, o.ctx.comboStore())
 							liveCID := o.ctx.GetCurrentCommandId(true)
 							tms.RUnlock()
 							o.ctx.Pool.Unpin(tms)
@@ -7338,7 +7338,7 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 // internal FK-maintenance scans that PG does not attribute to the user table):
 // the whole call is one sequential scan reading every visible tuple, recorded
 // (numscans + tuples_returned) at clean completion. M0118-0009 (`stats`, rung 6).
-func scanMatching(ctx *Context, rel storage.RelFileNode, statOID uint32, cols []catalog.Column, pred planner.Expr, fn func(blk storage.BlockNumber, slot uint16, row Row) error) error {
+func scanMatching(ctx *Context, rel storage.RelFileNode, statOID uint32, cols []catalog.Column, pred optimizer.Expr, fn func(blk storage.BlockNumber, slot uint16, row Row) error) error {
 	nBlocks, err := ctx.Pool.NBlocks(rel)
 	if err != nil {
 		return err
@@ -7382,7 +7382,7 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, statOID uint32, cols []
 				ctx.Pool.Unpin(s)
 				return err
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
+			if !transam.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
 				// A tuple this statement's own command already killed is simply
 				// not found by the DML scan. PG reaches it and takes ExecUpdate /
 				// ExecDelete's TM_SelfModified arm with cmax == es_output_cid,
@@ -7802,7 +7802,7 @@ func encodeExprIndexKey(ctx *Context, idx *catalog.Index, tbl *catalog.Table, ro
 			out = append(out, keyPart...)
 		} else if i < len(idx.ColExprs) && idx.ColExprs[i] != nil {
 			// Expression column — resolve then evaluate.
-			planExpr, err := planner.ResolveIndexPredicate(*idx.ColExprs[i], tbl)
+			planExpr, err := optimizer.ResolveIndexPredicate(*idx.ColExprs[i], tbl)
 			if err != nil || planExpr == nil {
 				return nil
 			}
@@ -8427,7 +8427,7 @@ func checkGistOverlapExclusion(ctx *Context, tbl *catalog.Table, idx *catalog.In
 }
 
 // exclusionCheckOnce probes a btree exclusion index for a conflicting live tuple.
-func exclusionCheckOnce(ctx *Context, rel storage.RelFileNode, tree *btree.BTree, key []byte, idxName, detail string, pos int) error {
+func exclusionCheckOnce(ctx *Context, rel storage.RelFileNode, tree *nbtree.BTree, key []byte, idxName, detail string, pos int) error {
 	liveConflict := false
 	_ = tree.RangeScan(key, key, func(_ []byte, ptr storage.ItemPointer) (bool, error) {
 		slot, perr := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
@@ -8488,7 +8488,7 @@ func buildExclusionConstraintDetail(idx *catalog.Index, cols []catalog.Column, r
 //
 // Mirrors upstream heap_check_unique's WaitForLockersMultiple path that
 // produces the <waiting ...> interleaving seen in read-write-unique.spec.
-func uniqueCheckWithWait(ctx *Context, rel storage.RelFileNode, tree *btree.BTree, key []byte, idxName, detail string, pos int) error {
+func uniqueCheckWithWait(ctx *Context, rel storage.RelFileNode, tree *nbtree.BTree, key []byte, idxName, detail string, pos int) error {
 	var inflightXmin storage.TransactionID
 	var liveConflict bool
 	var conflictPtr storage.ItemPointer
@@ -8538,7 +8538,7 @@ func uniqueCheckWithWait(ctx *Context, rel storage.RelFileNode, tree *btree.BTre
 			liveConflict = true
 		}
 		if liveConflict {
-			if ctx.Tx.Isolation == mvcc.IsolationSerializable {
+			if ctx.Tx.Isolation == transam.IsolationSerializable {
 				// M0118-0001: a post-wait unique conflict between two SERIALIZABLE
 				// writers is a serialization failure (40001) only when THIS writer
 				// is the pivot of a dangerous rw-structure — i.e. another
@@ -8575,7 +8575,7 @@ func uniqueCheckWithWait(ctx *Context, rel storage.RelFileNode, tree *btree.BTre
 						Hint:    "The transaction might succeed if retried.",
 					}
 				}
-			} else if ctx.Tx.Isolation == mvcc.IsolationRepeatableRead {
+			} else if ctx.Tx.Isolation == transam.IsolationRepeatableRead {
 				return &ExecError{
 					Code:    "40001",
 					Pos:     pos,

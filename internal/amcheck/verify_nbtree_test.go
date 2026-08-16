@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -17,11 +17,11 @@ import (
 // per-index catalog property the page bytes do not carry — see the note above
 // KeyComparator in verify_nbtree.go), and these tests are bytes-only, so they
 // state the blob choice here once rather than at ~60 call sites.
-var blobFmt = btree.IndexFormat{}
+var blobFmt = nbtree.IndexFormat{}
 
 // btSpecial returns the byte offset where the B-tree opaque special area
 // begins, mirroring btree.go's btSpecialOffset (BlockSize - SizeOfBTPageOpaque).
-func btSpecial() int { return storage.BlockSize - btree.SizeOfBTPageOpaque }
+func btSpecial() int { return storage.BlockSize - nbtree.SizeOfBTPageOpaque }
 
 // makeMetaPage builds a metapage (block 0) carrying the given magic and
 // version, on the upstream shape M0130-S11.3 flipped to: a PG-format page
@@ -33,13 +33,13 @@ func btSpecial() int { return storage.BlockSize - btree.SizeOfBTPageOpaque }
 func makeMetaPage(t *testing.T, magic, version uint32) storage.Page {
 	t.Helper()
 	p := make(storage.Page, storage.BlockSize)
-	if err := btree.InitPGMetaPage(p, 0, 0, true); err != nil {
+	if err := nbtree.InitPGMetaPage(p, 0, 0, true); err != nil {
 		t.Fatalf("InitPGMetaPage: %v", err)
 	}
-	m := btree.ReadPGMetaPage(p)
+	m := nbtree.ReadPGMetaPage(p)
 	m.Magic, m.Version = magic, version
-	btree.WritePGMetaPage(p, m)
-	if got := btree.ParseMeta(p); got.Magic != magic || got.Version != version {
+	nbtree.WritePGMetaPage(p, m)
+	if got := nbtree.ParseMeta(p); got.Magic != magic || got.Version != version {
 		t.Fatalf("makeMetaPage self-check: ParseMeta=%+v, want magic=%#x version=%d", got, magic, version)
 	}
 	return p
@@ -51,11 +51,11 @@ func makeMetaPage(t *testing.T, magic, version uint32) storage.Page {
 func makeDataPage(t *testing.T, flags uint16, level uint32) storage.Page {
 	t.Helper()
 	p := make(storage.Page, storage.BlockSize)
-	if err := btree.InitPGBTPage(p); err != nil {
+	if err := nbtree.InitPGBTPage(p); err != nil {
 		t.Fatalf("InitPGBTPage: %v", err)
 	}
-	btree.WritePGOpaque(p, btree.PGBTPageOpaque{Level: level, Flags: pgFlagsForTest(flags)})
-	op := btree.ParseOpaque(p)
+	nbtree.WritePGOpaque(p, nbtree.PGBTPageOpaque{Level: level, Flags: pgFlagsForTest(flags)})
+	op := nbtree.ParseOpaque(p)
 	if op.Flags != flags || op.Level != level {
 		t.Fatalf("makeDataPage self-check: ParseOpaque flags=%#x level=%d, want flags=%#x level=%d", op.Flags, op.Level, flags, level)
 	}
@@ -63,15 +63,15 @@ func makeDataPage(t *testing.T, flags uint16, level uint32) storage.Page {
 }
 
 func TestVerifyBtreePage_MetaPageClean(t *testing.T) {
-	p := makeMetaPage(t, btree.BTreeMagic, btree.BTreeVersion)
-	if rs := VerifyBtreePage(p, btree.MetaBlock, "ix"); len(rs) != 0 {
+	p := makeMetaPage(t, nbtree.BTreeMagic, nbtree.BTreeVersion)
+	if rs := VerifyBtreePage(p, nbtree.MetaBlock, "ix"); len(rs) != 0 {
 		t.Fatalf("clean metapage reported %d: %+v", len(rs), rs)
 	}
 }
 
 func TestVerifyBtreePage_MetaPageBadMagic(t *testing.T) {
-	p := makeMetaPage(t, btree.BTreeMagic^0xdead, btree.BTreeVersion)
-	rs := VerifyBtreePage(p, btree.MetaBlock, "ix")
+	p := makeMetaPage(t, nbtree.BTreeMagic^0xdead, nbtree.BTreeVersion)
+	rs := VerifyBtreePage(p, nbtree.MetaBlock, "ix")
 	if len(rs) != 1 {
 		t.Fatalf("bad-magic metapage reported %d, want 1: %+v", len(rs), rs)
 	}
@@ -79,15 +79,15 @@ func TestVerifyBtreePage_MetaPageBadMagic(t *testing.T) {
 	if rs[0].Msg != want {
 		t.Fatalf("msg = %q, want %q", rs[0].Msg, want)
 	}
-	if rs[0].Block != btree.MetaBlock {
-		t.Fatalf("block = %d, want %d", rs[0].Block, btree.MetaBlock)
+	if rs[0].Block != nbtree.MetaBlock {
+		t.Fatalf("block = %d, want %d", rs[0].Block, nbtree.MetaBlock)
 	}
 }
 
 func TestVerifyBtreePage_MetaPageBadVersion(t *testing.T) {
-	bad := btree.BTreeVersion + 99
-	p := makeMetaPage(t, btree.BTreeMagic, bad)
-	rs := VerifyBtreePage(p, btree.MetaBlock, "ix")
+	bad := nbtree.BTreeVersion + 99
+	p := makeMetaPage(t, nbtree.BTreeMagic, bad)
+	rs := VerifyBtreePage(p, nbtree.MetaBlock, "ix")
 	if len(rs) != 1 {
 		t.Fatalf("bad-version metapage reported %d, want 1: %+v", len(rs), rs)
 	}
@@ -100,15 +100,15 @@ func TestVerifyBtreePage_MetaPageBadVersion(t *testing.T) {
 // A bad magic masks a bad version: upstream returns after the first conclusive
 // metapage problem, so only the magic finding surfaces.
 func TestVerifyBtreePage_MetaPageMagicMasksVersion(t *testing.T) {
-	p := makeMetaPage(t, btree.BTreeMagic^1, btree.BTreeVersion+7)
-	rs := VerifyBtreePage(p, btree.MetaBlock, "ix")
+	p := makeMetaPage(t, nbtree.BTreeMagic^1, nbtree.BTreeVersion+7)
+	rs := VerifyBtreePage(p, nbtree.MetaBlock, "ix")
 	if len(rs) != 1 || rs[0].Msg != `index "ix" meta page is corrupt` {
 		t.Fatalf("want single meta-corrupt finding, got %+v", rs)
 	}
 }
 
 func TestVerifyBtreePage_LeafLevelZeroClean(t *testing.T) {
-	p := makeDataPage(t, btree.BTLeaf, 0)
+	p := makeDataPage(t, nbtree.BTLeaf, 0)
 	if rs := VerifyBtreePage(p, 1, "ix"); len(rs) != 0 {
 		t.Fatalf("clean leaf reported %d: %+v", len(rs), rs)
 	}
@@ -122,7 +122,7 @@ func TestVerifyBtreePage_InternalNonZeroClean(t *testing.T) {
 }
 
 func TestVerifyBtreePage_LeafBadLevel(t *testing.T) {
-	p := makeDataPage(t, btree.BTLeaf, 3)
+	p := makeDataPage(t, nbtree.BTLeaf, 3)
 	rs := VerifyBtreePage(p, 7, "ix")
 	if len(rs) != 1 {
 		t.Fatalf("bad leaf level reported %d, want 1: %+v", len(rs), rs)
@@ -151,7 +151,7 @@ func TestVerifyBtreePage_InternalLevelZero(t *testing.T) {
 // A fully deleted page type-puns its level field, so the level checks are
 // suppressed even when leaf-with-nonzero-level would otherwise fire.
 func TestVerifyBtreePage_DeletedPageSuppressesLevelCheck(t *testing.T) {
-	p := makeDataPage(t, btree.BTLeaf|btree.BTDeleted, 42)
+	p := makeDataPage(t, nbtree.BTLeaf|nbtree.BTDeleted, 42)
 	if rs := VerifyBtreePage(p, 11, "ix"); len(rs) != 0 {
 		t.Fatalf("deleted page reported %d, want 0: %+v", len(rs), rs)
 	}
@@ -160,7 +160,7 @@ func TestVerifyBtreePage_DeletedPageSuppressesLevelCheck(t *testing.T) {
 // A root page that is also a leaf (single-page tree) sits at level 0 and is
 // clean — guards against the leaf check misfiring on the common new-tree shape.
 func TestVerifyBtreePage_RootLeafClean(t *testing.T) {
-	p := makeDataPage(t, btree.BTLeaf|btree.BTRoot, 0)
+	p := makeDataPage(t, nbtree.BTLeaf|nbtree.BTRoot, 0)
 	if rs := VerifyBtreePage(p, 1, "ix"); len(rs) != 0 {
 		t.Fatalf("root+leaf page reported %d, want 0: %+v", len(rs), rs)
 	}
@@ -176,7 +176,7 @@ func TestVerifyBtreePage_RootLeafClean(t *testing.T) {
 func makeCountPage(t *testing.T, count int) storage.Page {
 	t.Helper()
 	const itemIDSize = 4
-	p := makeDataPage(t, btree.BTLeaf, 0)
+	p := makeDataPage(t, nbtree.BTLeaf, 0)
 	storage.MustHeader(p).SetLower(uint16(storage.SizeOfPageHeaderData + count*itemIDSize))
 	got, err := storage.PageLinePointerCount(p)
 	if err != nil {
@@ -193,21 +193,21 @@ func makeCountPage(t *testing.T, count int) storage.Page {
 // this test rather than silently shifting the ceiling.
 func TestBtreeMaxItemsPerPageValue(t *testing.T) {
 	const want = (storage.BlockSize - storage.SizeOfPageHeaderData) / (4 + 8) // 8168/12 = 680
-	if btree.MaxItemsPerPage != want {
-		t.Fatalf("btree.MaxItemsPerPage = %d, want %d", btree.MaxItemsPerPage, want)
+	if nbtree.MaxItemsPerPage != want {
+		t.Fatalf("nbtree.MaxItemsPerPage = %d, want %d", nbtree.MaxItemsPerPage, want)
 	}
 }
 
 // A page at exactly the ceiling is clean; one item over the ceiling is a finding.
 func TestVerifyBtreePage_ItemCountAtCeilingClean(t *testing.T) {
-	p := makeCountPage(t, btree.MaxItemsPerPage)
+	p := makeCountPage(t, nbtree.MaxItemsPerPage)
 	if rs := VerifyBtreePage(p, 3, "ix"); len(rs) != 0 {
 		t.Fatalf("page at ceiling reported %d, want 0: %+v", len(rs), rs)
 	}
 }
 
 func TestVerifyBtreePage_ItemCountExceedsCeiling(t *testing.T) {
-	p := makeCountPage(t, btree.MaxItemsPerPage+1)
+	p := makeCountPage(t, nbtree.MaxItemsPerPage+1)
 	rs := VerifyBtreePage(p, 3, "ix")
 	if len(rs) != 1 {
 		t.Fatalf("over-ceiling page reported %d, want 1: %+v", len(rs), rs)
@@ -224,7 +224,7 @@ func TestVerifyBtreePage_ItemCountExceedsCeiling(t *testing.T) {
 // A corrupt pd_lower whose line-pointer area is not an itemIDSize multiple is
 // surfaced as a damaged-page finding rather than a Go error or a panic.
 func TestVerifyBtreePage_DamagedLinePointerArea(t *testing.T) {
-	p := makeDataPage(t, btree.BTLeaf, 0)
+	p := makeDataPage(t, nbtree.BTLeaf, 0)
 	storage.MustHeader(p).SetLower(storage.SizeOfPageHeaderData + 3) // not a multiple of 4
 	rs := VerifyBtreePage(p, 6, "ix")
 	if len(rs) != 1 {
@@ -239,8 +239,8 @@ func TestVerifyBtreePage_DamagedLinePointerArea(t *testing.T) {
 // page with an over-ceiling pd_lower is still suppressed (matches the existing
 // level-check suppression).
 func TestVerifyBtreePage_DeletedPageSuppressesItemCount(t *testing.T) {
-	p := makeDataPage(t, btree.BTLeaf|btree.BTDeleted, 0)
-	storage.MustHeader(p).SetLower(uint16(storage.SizeOfPageHeaderData + (btree.MaxItemsPerPage+5)*4))
+	p := makeDataPage(t, nbtree.BTLeaf|nbtree.BTDeleted, 0)
+	storage.MustHeader(p).SetLower(uint16(storage.SizeOfPageHeaderData + (nbtree.MaxItemsPerPage+5)*4))
 	if rs := VerifyBtreePage(p, 8, "ix"); len(rs) != 0 {
 		t.Fatalf("deleted page reported %d, want 0: %+v", len(rs), rs)
 	}
@@ -256,15 +256,15 @@ func TestVerifyBtreePage_DeletedPageSuppressesItemCount(t *testing.T) {
 // high-key invariant tier stays quiet on pages built for the other tiers.
 func pgInitTestPage(t *testing.T, p storage.Page, next storage.BlockNumber, level uint32, flags uint16) {
 	t.Helper()
-	if err := btree.InitPGBTPage(p); err != nil {
+	if err := nbtree.InitPGBTPage(p); err != nil {
 		t.Fatalf("InitPGBTPage: %v", err)
 	}
 	pgNext := next
 	if next == storage.InvalidBlockNumber {
-		pgNext = btree.PNone
+		pgNext = nbtree.PNone
 	}
-	btree.WritePGOpaque(p, btree.PGBTPageOpaque{Next: pgNext, Level: level, Flags: pgFlagsForTest(flags)})
-	if pgNext != btree.PNone {
+	nbtree.WritePGOpaque(p, nbtree.PGBTPageOpaque{Next: pgNext, Level: level, Flags: pgFlagsForTest(flags)})
+	if pgNext != nbtree.PNone {
 		if _, err := storage.PageAddItemRaw(p, btItemRaw([]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff})); err != nil {
 			t.Fatalf("PageAddItemRaw P_HIKEY placeholder: %v", err)
 		}
@@ -279,12 +279,12 @@ func pgInitTestPage(t *testing.T, p storage.Page, next storage.BlockNumber, leve
 func pgFlagsForTest(legacy uint16) uint16 {
 	var out uint16
 	for _, m := range []struct{ legacy, pg uint16 }{
-		{btree.BTLeaf, btree.BTPLeaf},
-		{btree.BTRoot, btree.BTPRoot},
-		{btree.BTDeleted, btree.BTPDeleted},
-		{btree.BTIncompleteSplit, btree.BTPIncompleteSplit},
-		{btree.BTHalfDead, btree.BTPHalfDead},
-		{btree.BTHasGarbage, btree.BTPHasGarbage},
+		{nbtree.BTLeaf, nbtree.BTPLeaf},
+		{nbtree.BTRoot, nbtree.BTPRoot},
+		{nbtree.BTDeleted, nbtree.BTPDeleted},
+		{nbtree.BTIncompleteSplit, nbtree.BTPIncompleteSplit},
+		{nbtree.BTHalfDead, nbtree.BTPHalfDead},
+		{nbtree.BTHasGarbage, nbtree.BTPHasGarbage},
 	} {
 		if legacy&m.legacy != 0 {
 			out |= m.pg
@@ -297,13 +297,13 @@ func pgFlagsForTest(legacy uint16) uint16 {
 // engine's own encoder. The TID is left zero — the item-order / high-key tier
 // compares only keys.
 func btItemRaw(key []byte) []byte {
-	return btree.PGBTItemRaw(key, storage.ItemPointer{})
+	return nbtree.PGBTItemRaw(key, storage.ItemPointer{})
 }
 
 // btHighKeyRaw marshals a P_HIKEY separator, which since M0130-S11.4 slice 3a
 // is a PIVOT tuple (INDEX_ALT_TID_MASK + natts) rather than a plain item.
 func btHighKeyRaw(key []byte) []byte {
-	return btree.PGBTPivotRaw(key, 0)
+	return nbtree.PGBTPivotRaw(key, 0)
 }
 
 // makeItemsPage builds a non-meta B-tree page carrying keys as line pointers in
@@ -326,10 +326,10 @@ func makeItemsPage(t *testing.T, flags uint16, level uint32, next storage.BlockN
 		t.Fatalf("makeItemsPage: a high key requires a right sibling (upstream derives presence from btpo_next)")
 	}
 	if highKey != nil {
-		if err := btree.InitPGBTPage(p); err != nil {
+		if err := nbtree.InitPGBTPage(p); err != nil {
 			t.Fatalf("InitPGBTPage: %v", err)
 		}
-		btree.WritePGOpaque(p, btree.PGBTPageOpaque{Next: next, Level: level, Flags: pgFlagsForTest(flags)})
+		nbtree.WritePGOpaque(p, nbtree.PGBTPageOpaque{Next: next, Level: level, Flags: pgFlagsForTest(flags)})
 		if _, err := storage.PageAddItemRaw(p, btHighKeyRaw(highKey)); err != nil {
 			t.Fatalf("PageAddItemRaw high key: %v", err)
 		}
@@ -345,7 +345,7 @@ func makeItemsPage(t *testing.T, flags uint16, level uint32, next storage.BlockN
 		}
 	}
 
-	op := btree.ParseOpaque(p)
+	op := nbtree.ParseOpaque(p)
 	if op.Flags != flags || op.Level != level || op.Next != next {
 		t.Fatalf("makeItemsPage opaque self-check: got %+v, want flags=%#x level=%d next=%d", op, flags, level, next)
 	}
@@ -368,14 +368,14 @@ func makeItemsPage(t *testing.T, flags uint16, level uint32, next storage.BlockN
 func k(b byte) []byte { return []byte{b} }
 
 func TestVerifyBtreeItemOrder_LeafAscendingClean(t *testing.T) {
-	p := makeItemsPage(t, btree.BTLeaf, 0, 5, nil, k(1), k(2), k(3))
+	p := makeItemsPage(t, nbtree.BTLeaf, 0, 5, nil, k(1), k(2), k(3))
 	if rs := VerifyBtreeItemOrder(p, 1, "ix"); len(rs) != 0 {
 		t.Fatalf("ascending leaf reported %d: %+v", len(rs), rs)
 	}
 }
 
 func TestVerifyBtreeItemOrder_ItemOrderViolation(t *testing.T) {
-	p := makeItemsPage(t, btree.BTLeaf, 0, 5, nil, k(1), k(3), k(2))
+	p := makeItemsPage(t, nbtree.BTLeaf, 0, 5, nil, k(1), k(3), k(2))
 	rs := VerifyBtreeItemOrder(p, 4, "ix")
 	if len(rs) != 1 {
 		t.Fatalf("out-of-order leaf reported %d, want 1: %+v", len(rs), rs)
@@ -400,7 +400,7 @@ func TestVerifyBtreeItemOrder_ItemOrderViolation(t *testing.T) {
 // AI-20260708-064334-001 nightly false-positive corruption report; see
 // .ralph/deferral_ledger.md 2026-07-08.)
 func TestVerifyBtreeItemOrder_DuplicateKeysAllowed(t *testing.T) {
-	p := makeItemsPage(t, btree.BTLeaf, 0, 5, nil, k(1), k(2), k(2))
+	p := makeItemsPage(t, nbtree.BTLeaf, 0, 5, nil, k(1), k(2), k(2))
 	if rs := VerifyBtreeItemOrder(p, 4, "ix"); len(rs) != 0 {
 		t.Fatalf("duplicate keys: want no findings, got %+v", rs)
 	}
@@ -409,7 +409,7 @@ func TestVerifyBtreeItemOrder_DuplicateKeysAllowed(t *testing.T) {
 // A genuine decrease among duplicate-key runs (not just a tie) is still a
 // violation.
 func TestVerifyBtreeItemOrder_DecreaseAfterDuplicateViolation(t *testing.T) {
-	p := makeItemsPage(t, btree.BTLeaf, 0, 5, nil, k(2), k(2), k(1))
+	p := makeItemsPage(t, nbtree.BTLeaf, 0, 5, nil, k(2), k(2), k(1))
 	rs := VerifyBtreeItemOrder(p, 4, "ix")
 	if len(rs) != 1 || rs[0].Msg != `item order invariant violated for index "ix"` {
 		t.Fatalf("decrease after duplicate: want single item-order finding, got %+v", rs)
@@ -419,14 +419,14 @@ func TestVerifyBtreeItemOrder_DecreaseAfterDuplicateViolation(t *testing.T) {
 // Leaf high-key check is <=: a key equal to the high key is allowed (suffix
 // truncation can make a leaf high key an untruncated copy of the last item).
 func TestVerifyBtreeItemOrder_LeafHighKeyEqualOK(t *testing.T) {
-	p := makeItemsPage(t, btree.BTLeaf, 0, 5, k(2), k(1), k(2))
+	p := makeItemsPage(t, nbtree.BTLeaf, 0, 5, k(2), k(1), k(2))
 	if rs := VerifyBtreeItemOrder(p, 2, "ix"); len(rs) != 0 {
 		t.Fatalf("leaf key == high key reported %d, want 0: %+v", len(rs), rs)
 	}
 }
 
 func TestVerifyBtreeItemOrder_LeafHighKeyExceeded(t *testing.T) {
-	p := makeItemsPage(t, btree.BTLeaf, 0, 5, k(3), k(1), k(5))
+	p := makeItemsPage(t, nbtree.BTLeaf, 0, 5, k(3), k(1), k(5))
 	rs := VerifyBtreeItemOrder(p, 2, "ix")
 	if len(rs) != 1 {
 		t.Fatalf("leaf key > high key reported %d, want 1: %+v", len(rs), rs)
@@ -464,22 +464,22 @@ func TestVerifyBtreeItemOrder_InternalNegInfinityClean(t *testing.T) {
 // item 1 is real data. k(5) would violate a k(3) separator; on a rightmost page
 // nothing is reported.
 func TestVerifyBtreeItemOrder_RightmostNoHighKeyCheck(t *testing.T) {
-	p := makeItemsPage(t, btree.BTLeaf, 0, storage.InvalidBlockNumber, nil, k(1), k(5))
+	p := makeItemsPage(t, nbtree.BTLeaf, 0, storage.InvalidBlockNumber, nil, k(1), k(5))
 	if rs := VerifyBtreeItemOrder(p, 9, "ix"); len(rs) != 0 {
 		t.Fatalf("rightmost page reported %d, want 0 (high key not enforced): %+v", len(rs), rs)
 	}
 }
 
 func TestVerifyBtreeItemOrder_MetaPageNil(t *testing.T) {
-	p := makeMetaPage(t, btree.BTreeMagic, btree.BTreeVersion)
-	if rs := VerifyBtreeItemOrder(p, btree.MetaBlock, "ix"); len(rs) != 0 {
+	p := makeMetaPage(t, nbtree.BTreeMagic, nbtree.BTreeVersion)
+	if rs := VerifyBtreeItemOrder(p, nbtree.MetaBlock, "ix"); len(rs) != 0 {
 		t.Fatalf("metapage reported %d, want 0: %+v", len(rs), rs)
 	}
 }
 
 // Deleted pages hold no live items; out-of-order bytes on one are suppressed.
 func TestVerifyBtreeItemOrder_DeletedPageNil(t *testing.T) {
-	p := makeItemsPage(t, btree.BTLeaf|btree.BTDeleted, 0, 5, nil, k(3), k(1))
+	p := makeItemsPage(t, nbtree.BTLeaf|nbtree.BTDeleted, 0, 5, nil, k(3), k(1))
 	if rs := VerifyBtreeItemOrder(p, 11, "ix"); len(rs) != 0 {
 		t.Fatalf("deleted page reported %d, want 0: %+v", len(rs), rs)
 	}
@@ -501,7 +501,7 @@ func makeLinkedPage(t *testing.T, prev, next storage.BlockNumber, level uint32, 
 	binary.LittleEndian.PutUint32(p[off+4:off+8], uint32(next)) // Next
 	binary.LittleEndian.PutUint32(p[off+8:off+12], level)       // Level
 	binary.LittleEndian.PutUint16(p[off+12:off+14], flags)      // Flags
-	op := btree.ParseOpaque(p)
+	op := nbtree.ParseOpaque(p)
 	if op.Prev != prev || op.Next != next || op.Level != level || op.Flags != flags {
 		t.Fatalf("makeLinkedPage self-check: got %+v, want prev=%d next=%d level=%d flags=%#x", op, prev, next, level, flags)
 	}
@@ -526,9 +526,9 @@ const none = storage.InvalidBlockNumber
 // uniform level walks without findings.
 func TestVerifyBtreeSiblingLinks_CleanLevel(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
-		1: makeLinkedPage(t, none, 2, 0, btree.BTLeaf),
-		2: makeLinkedPage(t, 1, 3, 0, btree.BTLeaf),
-		3: makeLinkedPage(t, 2, none, 0, btree.BTLeaf),
+		1: makeLinkedPage(t, none, 2, 0, nbtree.BTLeaf),
+		2: makeLinkedPage(t, 1, 3, 0, nbtree.BTLeaf),
+		3: makeLinkedPage(t, 2, none, 0, nbtree.BTLeaf),
 	}
 	if rs := VerifyBtreeLevelSiblingLinks(mapSource(pages), 1, "ix"); len(rs) != 0 {
 		t.Fatalf("clean level reported %d, want 0: %+v", len(rs), rs)
@@ -538,9 +538,9 @@ func TestVerifyBtreeSiblingLinks_CleanLevel(t *testing.T) {
 // Block 3's back-link points at 9 instead of 2 — the sibling links disagree.
 func TestVerifyBtreeSiblingLinks_BackLinkMismatch(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
-		1: makeLinkedPage(t, none, 2, 0, btree.BTLeaf),
-		2: makeLinkedPage(t, 1, 3, 0, btree.BTLeaf),
-		3: makeLinkedPage(t, 9, none, 0, btree.BTLeaf),
+		1: makeLinkedPage(t, none, 2, 0, nbtree.BTLeaf),
+		2: makeLinkedPage(t, 1, 3, 0, nbtree.BTLeaf),
+		3: makeLinkedPage(t, 9, none, 0, nbtree.BTLeaf),
 	}
 	rs := VerifyBtreeLevelSiblingLinks(mapSource(pages), 1, "ix")
 	if len(rs) != 1 {
@@ -560,8 +560,8 @@ func TestVerifyBtreeSiblingLinks_BackLinkMismatch(t *testing.T) {
 // leftcurrent != P_NONE gate.
 func TestVerifyBtreeSiblingLinks_LeftmostPrevExempt(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
-		1: makeLinkedPage(t, 7, 2, 0, btree.BTLeaf), // Prev=7 but it's leftmost
-		2: makeLinkedPage(t, 1, none, 0, btree.BTLeaf),
+		1: makeLinkedPage(t, 7, 2, 0, nbtree.BTLeaf), // Prev=7 but it's leftmost
+		2: makeLinkedPage(t, 1, none, 0, nbtree.BTLeaf),
 	}
 	if rs := VerifyBtreeLevelSiblingLinks(mapSource(pages), 1, "ix"); len(rs) != 0 {
 		t.Fatalf("leftmost-prev-exempt reported %d, want 0: %+v", len(rs), rs)
@@ -588,8 +588,8 @@ func TestVerifyBtreeSiblingLinks_LevelMismatch(t *testing.T) {
 // A two-page cycle (1 → 2 → 1) is caught when block 1 is revisited.
 func TestVerifyBtreeSiblingLinks_CircularChain(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
-		1: makeLinkedPage(t, none, 2, 0, btree.BTLeaf),
-		2: makeLinkedPage(t, 1, 1, 0, btree.BTLeaf), // Next loops back to 1
+		1: makeLinkedPage(t, none, 2, 0, nbtree.BTLeaf),
+		2: makeLinkedPage(t, 1, 1, 0, nbtree.BTLeaf), // Next loops back to 1
 	}
 	rs := VerifyBtreeLevelSiblingLinks(mapSource(pages), 1, "ix")
 	if len(rs) != 1 {
@@ -604,7 +604,7 @@ func TestVerifyBtreeSiblingLinks_CircularChain(t *testing.T) {
 // A self-loop (1 → 1) is the degenerate cycle and is caught on the second visit.
 func TestVerifyBtreeSiblingLinks_SelfLoop(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
-		1: makeLinkedPage(t, none, 1, 0, btree.BTLeaf),
+		1: makeLinkedPage(t, none, 1, 0, nbtree.BTLeaf),
 	}
 	rs := VerifyBtreeLevelSiblingLinks(mapSource(pages), 1, "ix")
 	if len(rs) != 1 || rs[0].Msg != `circular link chain found in block 1 of index "ix"` {
@@ -616,8 +616,8 @@ func TestVerifyBtreeSiblingLinks_SelfLoop(t *testing.T) {
 // readonly mode.
 func TestVerifyBtreeSiblingLinks_DeletedReachable(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
-		1: makeLinkedPage(t, none, 2, 0, btree.BTLeaf),
-		2: makeLinkedPage(t, 1, none, 0, btree.BTLeaf|btree.BTDeleted),
+		1: makeLinkedPage(t, none, 2, 0, nbtree.BTLeaf),
+		2: makeLinkedPage(t, 1, none, 0, nbtree.BTLeaf|nbtree.BTDeleted),
 	}
 	rs := VerifyBtreeLevelSiblingLinks(mapSource(pages), 1, "ix")
 	if len(rs) != 1 {
@@ -633,7 +633,7 @@ func TestVerifyBtreeSiblingLinks_DeletedReachable(t *testing.T) {
 // finding, not a panic.
 func TestVerifyBtreeSiblingLinks_DanglingRightLink(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
-		1: makeLinkedPage(t, none, 2, 0, btree.BTLeaf),
+		1: makeLinkedPage(t, none, 2, 0, nbtree.BTLeaf),
 		// block 2 absent
 	}
 	rs := VerifyBtreeLevelSiblingLinks(mapSource(pages), 1, "ix")
@@ -648,7 +648,7 @@ func TestVerifyBtreeSiblingLinks_DanglingRightLink(t *testing.T) {
 // A leftmost of the metapage is a damaged starting point (the metapage carries
 // no sibling links).
 func TestVerifyBtreeSiblingLinks_MetaLeftmost(t *testing.T) {
-	rs := VerifyBtreeLevelSiblingLinks(mapSource(nil), btree.MetaBlock, "ix")
+	rs := VerifyBtreeLevelSiblingLinks(mapSource(nil), nbtree.MetaBlock, "ix")
 	if len(rs) != 1 || !strings.Contains(rs[0].Msg, "metapage is not part of a level") {
 		t.Fatalf("meta-leftmost want single damaged finding, got %+v", rs)
 	}
@@ -658,7 +658,7 @@ func TestVerifyBtreeSiblingLinks_MetaLeftmost(t *testing.T) {
 // is a clean level of length one.
 func TestVerifyBtreeSiblingLinks_SinglePageLevel(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
-		1: makeLinkedPage(t, none, none, 0, btree.BTLeaf|btree.BTRoot),
+		1: makeLinkedPage(t, none, none, 0, nbtree.BTLeaf|nbtree.BTRoot),
 	}
 	if rs := VerifyBtreeLevelSiblingLinks(mapSource(pages), 1, "ix"); len(rs) != 0 {
 		t.Fatalf("single-page level reported %d, want 0: %+v", len(rs), rs)
@@ -672,7 +672,7 @@ func TestVerifyBtreeSiblingLinks_SinglePageLevel(t *testing.T) {
 // lives in t_tid's block half and the offset half carries natts, not a line
 // pointer.
 func btDownlinkRaw(key []byte, child storage.BlockNumber) []byte {
-	return btree.PGBTPivotRaw(key, child)
+	return nbtree.PGBTPivotRaw(key, child)
 }
 
 // dl is a (separator key, child block) downlink for makeInternalPage.
@@ -709,7 +709,7 @@ func makeInternalPage(t *testing.T, level uint32, next storage.BlockNumber, down
 				i, got[i].Key, got[i].Child, d.key, d.child)
 		}
 	}
-	op := btree.ParseOpaque(p)
+	op := nbtree.ParseOpaque(p)
 	if op.IsLeaf() || op.IsDeleted() || op.Level != level || op.Next != next {
 		t.Fatalf("makeInternalPage opaque self-check: got %+v, want internal level=%d next=%d", op, level, next)
 	}
@@ -722,8 +722,8 @@ func makeInternalPage(t *testing.T, level uint32, next storage.BlockNumber, down
 func TestVerifyBtreeParentDownlinks_Clean(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
 		1: makeInternalPage(t, 1, none, dl{nil, 2}, dl{k(5), 3}),
-		2: makeItemsPage(t, btree.BTLeaf, 0, 3, k(5), k(1), k(3)),
-		3: makeItemsPage(t, btree.BTLeaf, 0, none, nil, k(5), k(7)),
+		2: makeItemsPage(t, nbtree.BTLeaf, 0, 3, k(5), k(1), k(3)),
+		3: makeItemsPage(t, nbtree.BTLeaf, 0, none, nil, k(5), k(7)),
 	}
 	if rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix", blobFmt, nil); len(rs) != 0 {
 		t.Fatalf("clean parent reported %d, want 0: %+v", len(rs), rs)
@@ -734,8 +734,8 @@ func TestVerifyBtreeParentDownlinks_Clean(t *testing.T) {
 func TestVerifyBtreeParentDownlinks_LowerBoundViolation(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
 		1: makeInternalPage(t, 1, none, dl{nil, 2}, dl{k(5), 3}),
-		2: makeItemsPage(t, btree.BTLeaf, 0, 3, k(5), k(1), k(3)),
-		3: makeItemsPage(t, btree.BTLeaf, 0, none, nil, k(4), k(7)), // k(4) < k(5)
+		2: makeItemsPage(t, nbtree.BTLeaf, 0, 3, k(5), k(1), k(3)),
+		3: makeItemsPage(t, nbtree.BTLeaf, 0, none, nil, k(4), k(7)), // k(4) < k(5)
 	}
 	rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix", blobFmt, nil)
 	want := `down-link lower bound invariant violated for index "ix"`
@@ -751,8 +751,8 @@ func TestVerifyBtreeParentDownlinks_LowerBoundViolation(t *testing.T) {
 func TestVerifyBtreeParentDownlinks_DownlinkToDeleted(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
 		1: makeInternalPage(t, 1, none, dl{nil, 2}, dl{k(5), 3}),
-		2: makeItemsPage(t, btree.BTLeaf, 0, 3, k(5), k(1), k(3)),
-		3: makeItemsPage(t, btree.BTLeaf|btree.BTDeleted, 0, none, nil),
+		2: makeItemsPage(t, nbtree.BTLeaf, 0, 3, k(5), k(1), k(3)),
+		3: makeItemsPage(t, nbtree.BTLeaf|nbtree.BTDeleted, 0, none, nil),
 	}
 	rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix", blobFmt, nil)
 	want := `downlink to deleted page found in index "ix"`
@@ -769,8 +769,8 @@ func TestVerifyBtreeParentDownlinks_DownlinkToDeleted(t *testing.T) {
 func TestVerifyBtreeParentDownlinks_ChildLevelNotOneDown(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
 		1: makeInternalPage(t, 1, none, dl{nil, 2}, dl{k(5), 3}),
-		2: makeItemsPage(t, btree.BTLeaf, 0, 3, k(5), k(1), k(3)),
-		3: makeItemsPage(t, btree.BTLeaf, 2, none, nil, k(5)), // level 2, expected 0
+		2: makeItemsPage(t, nbtree.BTLeaf, 0, 3, k(5), k(1), k(3)),
+		3: makeItemsPage(t, nbtree.BTLeaf, 2, none, nil, k(5)), // level 2, expected 0
 	}
 	rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix", blobFmt, nil)
 	want := `downlink points to block in index "ix" whose level is not one level down`
@@ -811,7 +811,7 @@ func TestVerifyBtreeParentDownlinks_InternalChildRealKeyBelowBound(t *testing.T)
 // A leaf parentBlk has no downlinks to descend; nil.
 func TestVerifyBtreeParentDownlinks_LeafParentNoFindings(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
-		1: makeItemsPage(t, btree.BTLeaf, 0, none, nil, k(1), k(2)),
+		1: makeItemsPage(t, nbtree.BTLeaf, 0, none, nil, k(1), k(2)),
 	}
 	if rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix", blobFmt, nil); rs != nil {
 		t.Fatalf("leaf parent reported %+v, want nil", rs)
@@ -820,7 +820,7 @@ func TestVerifyBtreeParentDownlinks_LeafParentNoFindings(t *testing.T) {
 
 // The metapage carries no downlinks; nil (no read attempted).
 func TestVerifyBtreeParentDownlinks_MetaPageNil(t *testing.T) {
-	if rs := VerifyBtreeParentDownlinks(mapSource(nil), btree.MetaBlock, "ix", blobFmt, nil); rs != nil {
+	if rs := VerifyBtreeParentDownlinks(mapSource(nil), nbtree.MetaBlock, "ix", blobFmt, nil); rs != nil {
 		t.Fatalf("metapage reported %+v, want nil", rs)
 	}
 }

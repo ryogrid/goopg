@@ -4,7 +4,7 @@ import (
 	"math/big"
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/catalog"
 )
 
@@ -33,7 +33,7 @@ func TestNumericIndexKeyDecodeSiblingParity(t *testing.T) {
 		{125, 3, "0.125"},
 	}
 	for _, c := range cases {
-		key := btree.EncodeNumericKey(big.NewInt(c.mant), c.scale)
+		key := nbtree.EncodeNumericKey(big.NewInt(c.mant), c.scale)
 
 		single, err := decodeBTreeKeyToDatum(key, col)
 		if err != nil {
@@ -66,8 +66,8 @@ func TestNumericIndexKeyDecodeCompositeWalk(t *testing.T) {
 	numCol := catalog.Column{Name: "n", Type: catalog.Type{Name: "numeric"}}
 	intCol := catalog.Column{Name: "i", Type: catalog.Type{Name: "int4"}}
 
-	numKey := btree.EncodeNumericKey(big.NewInt(-12345), 3)
-	intKey := btree.EncodeInt4(77)
+	numKey := nbtree.EncodeNumericKey(big.NewInt(-12345), 3)
+	intKey := nbtree.EncodeInt4(77)
 	composite := append(append([]byte{}, numKey...), intKey...)
 
 	d, n, err := decodeIndexKeyColumn(composite, numCol)

@@ -42,7 +42,7 @@ import (
 
 	"github.com/goopg/goopg/internal/testutil/pgcluster"
 	"github.com/goopg/goopg/internal/testutil/pubsubcluster"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // freeTCPPort returns an OS-assigned ephemeral port. Race-safe enough
@@ -122,13 +122,13 @@ func TestPort_PgoutputInteropPGToGoopg(t *testing.T) {
 		inserts  int
 		updates  int
 		deletes  int
-		gotRel   *wal.DecodedRelation
+		gotRel   *xlog.DecodedRelation
 		insertVs []string
 		updateVs []string
 		deleteVs []string
 	)
 	for _, payload := range msgs {
-		m, err := wal.DecodeMessage(payload)
+		m, err := xlog.DecodeMessage(payload)
 		if err != nil {
 			t.Fatalf("DecodeMessage kind=%q: %v (bytes=%x)", payload[0], err, payload)
 		}
@@ -2379,7 +2379,7 @@ func containsTuple(have []string, want ...string) bool {
 
 // tupleSummary renders a `[]wal.DecodedColumn` as "(v0,v1,…)" for
 // diagnostic output. NULL → "<null>", unchanged TOAST → "<u>".
-func tupleSummary(cols []wal.DecodedColumn) string {
+func tupleSummary(cols []xlog.DecodedColumn) string {
 	parts := make([]string, len(cols))
 	for i, c := range cols {
 		switch c.Status {

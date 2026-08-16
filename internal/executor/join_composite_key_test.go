@@ -21,23 +21,23 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // twoKeyJoinPlan builds an INNER hash join whose ON clause is two int
 // equalities, with HashKeys already populated as fillJoinHashKeys would.
 // leftWidth columns come from the left input, so the right key indices are
 // leftWidth+0 and leftWidth+1.
-func twoKeyJoinPlan(leftWidth int) *planner.Join {
-	col := func(idx int) *planner.ColumnRef {
-		return &planner.ColumnRef{Index: idx, Type: catalog.Type{Name: "int4"}}
+func twoKeyJoinPlan(leftWidth int) *optimizer.Join {
+	col := func(idx int) *optimizer.ColumnRef {
+		return &optimizer.ColumnRef{Index: idx, Type: catalog.Type{Name: "int4"}}
 	}
-	return &planner.Join{
-		Type:     planner.JoinTypeInner,
-		Algo:     planner.JoinAlgoHash,
+	return &optimizer.Join{
+		Type:     optimizer.JoinTypeInner,
+		Algo:     optimizer.JoinAlgoHash,
 		LeftKey:  col(0),
 		RightKey: col(leftWidth),
-		HashKeys: []planner.JoinKeyPair{
+		HashKeys: []optimizer.JoinKeyPair{
 			{Left: col(0), Right: col(leftWidth)},
 			{Left: col(1), Right: col(leftWidth + 1)},
 		},
@@ -89,9 +89,9 @@ func TestCompositeKeySpreadsBucketsWhenLeadColumnIsPinned(t *testing.T) {
 // this pass; a separator-joined encoding merges the two keys.
 func TestCompositeKeyEncodingIsInjective(t *testing.T) {
 	o := &joinOp{
-		buildKeyExprs: []planner.Expr{
-			&planner.ColumnRef{Index: 0},
-			&planner.ColumnRef{Index: 1},
+		buildKeyExprs: []optimizer.Expr{
+			&optimizer.ColumnRef{Index: 0},
+			&optimizer.ColumnRef{Index: 1},
 		},
 	}
 	// M0127-PS6.1: the encoder reads compiled slab indices, so a hand-built
@@ -120,9 +120,9 @@ func TestCompositeKeyEncodingIsInjective(t *testing.T) {
 // join each other.
 func TestCompositeKeyNullColumnMatchesNothing(t *testing.T) {
 	o := &joinOp{
-		buildKeyExprs: []planner.Expr{
-			&planner.ColumnRef{Index: 0},
-			&planner.ColumnRef{Index: 1},
+		buildKeyExprs: []optimizer.Expr{
+			&optimizer.ColumnRef{Index: 0},
+			&optimizer.ColumnRef{Index: 1},
 		},
 	}
 	o.compileExecExprs()
@@ -142,10 +142,10 @@ func TestCompositeKeyNullColumnMatchesNothing(t *testing.T) {
 // — rows filed before and after the demotion have to land under one key.
 func TestCompositeIntPackDemotionKeepsEveryRow(t *testing.T) {
 	o := &joinOp{
-		execKeys: make([]planner.JoinKeyPair, 2),
-		buildKeyExprs: []planner.Expr{
-			&planner.ColumnRef{Index: 0},
-			&planner.ColumnRef{Index: 1},
+		execKeys: make([]optimizer.JoinKeyPair, 2),
+		buildKeyExprs: []optimizer.Expr{
+			&optimizer.ColumnRef{Index: 0},
+			&optimizer.ColumnRef{Index: 1},
 		},
 		execKeyPackInt: true,
 	}

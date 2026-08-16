@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // TestEvalBinaryBatchEquivalencePerRowEq pins that
@@ -146,10 +146,10 @@ func TestCanVectoriseBinaryWhitelist(t *testing.T) {
 // any non-amenable node short-circuits. (M0074-0001.)
 func TestCanVectoriseExpressionTreeWalk(t *testing.T) {
 	// Amenable: ColumnRef = IntegerConst.
-	amenable := &planner.BinaryOp{
+	amenable := &optimizer.BinaryOp{
 		Op:    parser.OpEq,
-		Left:  &planner.ColumnRef{Name: "a", Index: 0},
-		Right: &planner.IntegerConst{Value: 5},
+		Left:  &optimizer.ColumnRef{Name: "a", Index: 0},
+		Right: &optimizer.IntegerConst{Value: 5},
 	}
 	if !canVectoriseExpression(amenable) {
 		t.Error("simple ColumnRef = IntegerConst should be vectorisable")
@@ -157,17 +157,17 @@ func TestCanVectoriseExpressionTreeWalk(t *testing.T) {
 
 	// Amenable: ColumnRef AND ColumnRef (each side itself
 	// is a comparison, not just a leaf).
-	amenable2 := &planner.BinaryOp{
+	amenable2 := &optimizer.BinaryOp{
 		Op: parser.OpAnd,
-		Left: &planner.BinaryOp{
+		Left: &optimizer.BinaryOp{
 			Op:    parser.OpLt,
-			Left:  &planner.ColumnRef{Name: "a", Index: 0},
-			Right: &planner.IntegerConst{Value: 100},
+			Left:  &optimizer.ColumnRef{Name: "a", Index: 0},
+			Right: &optimizer.IntegerConst{Value: 100},
 		},
-		Right: &planner.BinaryOp{
+		Right: &optimizer.BinaryOp{
 			Op:    parser.OpGt,
-			Left:  &planner.ColumnRef{Name: "b", Index: 1},
-			Right: &planner.IntegerConst{Value: 50},
+			Left:  &optimizer.ColumnRef{Name: "b", Index: 1},
+			Right: &optimizer.IntegerConst{Value: 50},
 		},
 	}
 	if !canVectoriseExpression(amenable2) {
@@ -175,17 +175,17 @@ func TestCanVectoriseExpressionTreeWalk(t *testing.T) {
 	}
 
 	// Excluded: contains LIKE.
-	excludedLike := &planner.BinaryOp{
+	excludedLike := &optimizer.BinaryOp{
 		Op: parser.OpAnd,
-		Left: &planner.BinaryOp{
+		Left: &optimizer.BinaryOp{
 			Op:    parser.OpLike,
-			Left:  &planner.ColumnRef{Name: "a", Index: 0},
-			Right: &planner.StringConst{Value: "x%"},
+			Left:  &optimizer.ColumnRef{Name: "a", Index: 0},
+			Right: &optimizer.StringConst{Value: "x%"},
 		},
-		Right: &planner.BinaryOp{
+		Right: &optimizer.BinaryOp{
 			Op:    parser.OpEq,
-			Left:  &planner.ColumnRef{Name: "b", Index: 1},
-			Right: &planner.IntegerConst{Value: 5},
+			Left:  &optimizer.ColumnRef{Name: "b", Index: 1},
+			Right: &optimizer.IntegerConst{Value: 5},
 		},
 	}
 	if canVectoriseExpression(excludedLike) {
@@ -193,7 +193,7 @@ func TestCanVectoriseExpressionTreeWalk(t *testing.T) {
 	}
 
 	// Excluded: contains FuncCall.
-	excludedFunc := &planner.FuncCall{Name: "lower", Args: []planner.Expr{&planner.ColumnRef{Name: "x", Index: 0}}}
+	excludedFunc := &optimizer.FuncCall{Name: "lower", Args: []optimizer.Expr{&optimizer.ColumnRef{Name: "x", Index: 0}}}
 	if canVectoriseExpression(excludedFunc) {
 		t.Error("FuncCall should not be vectorisable")
 	}

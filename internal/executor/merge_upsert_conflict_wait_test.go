@@ -4,10 +4,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goopg/goopg/internal/lockmgr"
-	"github.com/goopg/goopg/internal/multixact"
+	"github.com/goopg/goopg/internal/storage/lmgr"
+	"github.com/goopg/goopg/internal/access/transam/multixact"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // These tests prove the M0119-0009 wiring: mergeApplyUpdate, mergeApplyDelete,
@@ -36,7 +36,7 @@ func TestMergeApplyUpdateWaitsOnForeignConflictingLock(t *testing.T) {
 	ctx.MultiXact = multixact.NewStore()
 	rel := ctx.Catalog.RelFileNode(tbl)
 
-	lm := lockmgr.New()
+	lm := lmgr.New()
 
 	s1tx, err := ctx.TxnMgr.Begin(0)
 	if err != nil {
@@ -113,7 +113,7 @@ func TestMergeApplyDeleteWaitsOnForeignConflictingLock(t *testing.T) {
 	ctx.MultiXact = multixact.NewStore()
 	rel := ctx.Catalog.RelFileNode(tbl)
 
-	lm := lockmgr.New()
+	lm := lmgr.New()
 
 	s1tx, err := ctx.TxnMgr.Begin(0)
 	if err != nil {
@@ -189,7 +189,7 @@ func TestUpsertOnConflictDoUpdateWaitsOnForeignConflictingLock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	lm := lockmgr.New()
+	lm := lmgr.New()
 
 	s1tx, err := ctx.TxnMgr.Begin(0)
 	if err != nil {
@@ -232,7 +232,7 @@ func TestUpsertOnConflictDoUpdateWaitsOnForeignConflictingLock(t *testing.T) {
 			done <- perr
 			return
 		}
-		node, perr := planner.Plan(stmts[0], s2.Catalog)
+		node, perr := optimizer.Plan(stmts[0], s2.Catalog)
 		if perr != nil {
 			done <- perr
 			return

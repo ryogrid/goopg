@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // TestM0071NLIVirtualSlotCompose pins the Stage D-1 invariant:
@@ -13,10 +13,10 @@ import (
 // allocation. Rebinding the persistent outerMS / innerMS .row
 // fields is the entire per-match work.
 func TestM0071NLIVirtualSlotCompose(t *testing.T) {
-	outerSchema := planner.Schema{
+	outerSchema := optimizer.Schema{
 		{Name: "o0"}, {Name: "o1"},
 	}
-	innerSchema := planner.Schema{
+	innerSchema := optimizer.Schema{
 		{Name: "i0"}, {Name: "i1"}, {Name: "i2"},
 	}
 	o := &nestedLoopIndexJoinOp{
@@ -32,7 +32,7 @@ func TestM0071NLIVirtualSlotCompose(t *testing.T) {
 		{sourceIdx: 1, sourceCol: 1},
 		{sourceIdx: 1, sourceCol: 2},
 	}
-	o.virtualOut = NewVirtualSlot(append(planner.Schema{}, append(append(planner.Schema{}, outerSchema...), innerSchema...)...),
+	o.virtualOut = NewVirtualSlot(append(optimizer.Schema{}, append(append(optimizer.Schema{}, outerSchema...), innerSchema...)...),
 		[]TupleSlot{o.outerMS, o.innerMS}, cols)
 
 	// First match: outer=[1,"alpha"], inner=[10,"x",100]
@@ -69,14 +69,14 @@ func TestM0071NLIVirtualSlotCompose(t *testing.T) {
 // against the virtualOut composition. The predicate should read
 // directly via slot.Get without forcing a Row materialisation.
 func TestM0071NLIPredicateSlotEval(t *testing.T) {
-	outerSchema := planner.Schema{{Name: "o0"}}
-	innerSchema := planner.Schema{{Name: "i0"}}
-	pred := &planner.BinaryOp{
+	outerSchema := optimizer.Schema{{Name: "o0"}}
+	innerSchema := optimizer.Schema{{Name: "i0"}}
+	pred := &optimizer.BinaryOp{
 		Op: parser.OpEq,
-		Left:  &planner.ColumnRef{Name: "o0", Index: 0},
-		Right: &planner.ColumnRef{Name: "i0", Index: 1},
+		Left:  &optimizer.ColumnRef{Name: "o0", Index: 0},
+		Right: &optimizer.ColumnRef{Name: "i0", Index: 1},
 	}
-	plan := &planner.NestedLoopIndexJoin{Predicate: pred}
+	plan := &optimizer.NestedLoopIndexJoin{Predicate: pred}
 	o := &nestedLoopIndexJoinOp{
 		plan:       plan,
 		outerWidth: 1,
@@ -89,7 +89,7 @@ func TestM0071NLIPredicateSlotEval(t *testing.T) {
 		{sourceIdx: 0, sourceCol: 0},
 		{sourceIdx: 1, sourceCol: 0},
 	}
-	o.virtualOut = NewVirtualSlot(append(planner.Schema{}, append(append(planner.Schema{}, outerSchema...), innerSchema...)...),
+	o.virtualOut = NewVirtualSlot(append(optimizer.Schema{}, append(append(optimizer.Schema{}, outerSchema...), innerSchema...)...),
 		[]TupleSlot{o.outerMS, o.innerMS}, cols)
 
 	// outer=[7], inner=[7] → equal → true

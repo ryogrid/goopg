@@ -25,7 +25,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -33,17 +33,17 @@ import (
 // and tuple former the external-package tuple-format test uses (tupleFmtDesc /
 // tupleFmtKey in verify_nbtree_tupleformat_test.go, package amcheck_test — this
 // file is in-package and cannot see them).
-func postingTupleDesc() *btree.PGIndexKeyDesc {
-	attr := btree.PGKeyAttr{PGIndexAttr: btree.PGIndexAttr{Len: 4, ByVal: true, AlignBy: 4, Storage: 'p'}}
-	attr.Compare = btree.PGCompareInt4
-	return &btree.PGIndexKeyDesc{Attrs: []btree.PGKeyAttr{attr}}
+func postingTupleDesc() *nbtree.PGIndexKeyDesc {
+	attr := nbtree.PGKeyAttr{PGIndexAttr: nbtree.PGIndexAttr{Len: 4, ByVal: true, AlignBy: 4, Storage: 'p'}}
+	attr.Compare = nbtree.PGCompareInt4
+	return &nbtree.PGIndexKeyDesc{Attrs: []nbtree.PGKeyAttr{attr}}
 }
 
-func postingTupleKey(t *testing.T, desc *btree.PGIndexKeyDesc, v int32, tid storage.ItemPointer) []byte {
+func postingTupleKey(t *testing.T, desc *nbtree.PGIndexKeyDesc, v int32, tid storage.ItemPointer) []byte {
 	t.Helper()
 	val := make([]byte, 4)
 	binary.LittleEndian.PutUint32(val, uint32(v))
-	raw, err := btree.FormPGIndexTuple(desc.Physical(), [][]byte{val}, []bool{false}, tid)
+	raw, err := nbtree.FormPGIndexTuple(desc.Physical(), [][]byte{val}, []bool{false}, tid)
 	if err != nil {
 		t.Fatalf("FormPGIndexTuple: %v", err)
 	}
@@ -66,16 +66,16 @@ func htid(block storage.BlockNumber, offset uint16) storage.ItemPointer {
 // mixing plain (`le`) and posting-list (`pl`) items, under `fm`'s layout. It
 // self-checks the page through fm.PageLeafItems — the reader the tier uses — so a
 // layout change fails here rather than as a silent under-report downstream.
-func makeLeafPageMixed(t *testing.T, fm btree.IndexFormat, next storage.BlockNumber, items ...any) storage.Page {
+func makeLeafPageMixed(t *testing.T, fm nbtree.IndexFormat, next storage.BlockNumber, items ...any) storage.Page {
 	t.Helper()
 	p := make(storage.Page, storage.BlockSize)
-	pgInitTestPage(t, p, next, 0, btree.BTLeaf)
+	pgInitTestPage(t, p, next, 0, nbtree.BTLeaf)
 	wantEntries := 0
 	for i, it := range items {
 		var raw []byte
 		switch e := it.(type) {
 		case le:
-			raw = btree.PGBTItemRaw(e.key, htid(e.block, e.offset))
+			raw = nbtree.PGBTItemRaw(e.key, htid(e.block, e.offset))
 			wantEntries++
 		case pl:
 			if len(e.tids) < 2 {
@@ -107,7 +107,7 @@ func makeLeafPageMixed(t *testing.T, fm btree.IndexFormat, next storage.BlockNum
 // spelling when both entries sit at the same (block, offset).
 func TestVerifyBtreeUnique_PostingListBothVisible(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
-		btree.MetaBlock: makeMetaWithRoot(t, 1),
+		nbtree.MetaBlock: makeMetaWithRoot(t, 1),
 		1: makeLeafPageMixed(t, blobFmt, none,
 			pl{k(1), []storage.ItemPointer{htid(10, 1), htid(10, 7)}},
 			le{k(3), 10, 3}),
@@ -134,7 +134,7 @@ func TestVerifyBtreeUnique_PostingListBothVisible(t *testing.T) {
 // do, so the tier must judge the posting list by visibility, not by length.
 func TestVerifyBtreeUnique_PostingListOneVisibleClean(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
-		btree.MetaBlock: makeMetaWithRoot(t, 1),
+		nbtree.MetaBlock: makeMetaWithRoot(t, 1),
 		1: makeLeafPageMixed(t, blobFmt, none,
 			pl{k(1), []storage.ItemPointer{htid(10, 1), htid(10, 7), htid(10, 9)}}),
 	}
@@ -155,7 +155,7 @@ func TestVerifyBtreeUnique_PostingListOneVisibleClean(t *testing.T) {
 // two pure cases produces.
 func TestVerifyBtreeUnique_PostingThenPlainDuplicate(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
-		btree.MetaBlock: makeMetaWithRoot(t, 1),
+		nbtree.MetaBlock: makeMetaWithRoot(t, 1),
 		1: makeLeafPageMixed(t, blobFmt, none,
 			pl{k(1), []storage.ItemPointer{htid(10, 1), htid(10, 7)}},
 			le{k(1), 10, 9}),
@@ -179,7 +179,7 @@ func TestVerifyBtreeUnique_PostingThenPlainDuplicate(t *testing.T) {
 // mostly adjacent posting lists.
 func TestVerifyBtreeUnique_AdjacentPostingListsDistinctKeysClean(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{
-		btree.MetaBlock: makeMetaWithRoot(t, 1),
+		nbtree.MetaBlock: makeMetaWithRoot(t, 1),
 		1: makeLeafPageMixed(t, blobFmt, none,
 			pl{k(1), []storage.ItemPointer{htid(10, 1), htid(10, 2)}},
 			pl{k(2), []storage.ItemPointer{htid(10, 3), htid(10, 4)}}),
@@ -202,10 +202,10 @@ func TestVerifyBtreeUnique_AdjacentPostingListsDistinctKeysClean(t *testing.T) {
 // proof that the comparator argument is load-bearing here.
 func TestVerifyBtreeUnique_PostingListTupleFormat(t *testing.T) {
 	desc := postingTupleDesc()
-	tupleFmt := btree.IndexFormatFor(desc)
+	tupleFmt := nbtree.IndexFormatFor(desc)
 	tids := []storage.ItemPointer{htid(10, 1), htid(10, 7)}
 	pages := map[storage.BlockNumber]storage.Page{
-		btree.MetaBlock: makeMetaWithRoot(t, 1),
+		nbtree.MetaBlock: makeMetaWithRoot(t, 1),
 		1: makeLeafPageMixed(t, tupleFmt, none,
 			pl{postingTupleKey(t, desc, 42, tids[0]), tids}),
 	}

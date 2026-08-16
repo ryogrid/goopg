@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/storage"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // segmentTotalBytes mirrors the helper in
@@ -54,7 +54,7 @@ func TestEvictionDrainsBufferedWALBeforeWritingPage(t *testing.T) {
 	if err := os.MkdirAll(walDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	w, err := wal.NewWriter(wal.Config{
+	w, err := xlog.NewWriter(xlog.Config{
 		WALDir:      walDir,
 		SegmentSize: 4096,
 		WALBuffers:  1 << 16, // 64 KiB — small Append stays in RAM
@@ -122,7 +122,7 @@ func TestEvictionDrainsBufferedWALBeforeWritingPage(t *testing.T) {
 	}
 
 	// 4c. ReadAll round-trip: the appended record is durable.
-	records, err := wal.ReadAll(walDir, 4096)
+	records, err := xlog.ReadAll(walDir, 4096)
 	if err != nil {
 		t.Fatalf("ReadAll: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestFlushAllPacedDrainsBufferedWAL(t *testing.T) {
 	if err := os.MkdirAll(walDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	w, err := wal.NewWriter(wal.Config{
+	w, err := xlog.NewWriter(xlog.Config{
 		WALDir:      walDir,
 		SegmentSize: 4096,
 		WALBuffers:  1 << 16,
@@ -199,7 +199,7 @@ func TestFlushAllPacedDrainsBufferedWAL(t *testing.T) {
 	}
 
 	// Every payload must be durable in the WAL.
-	records, err := wal.ReadAll(walDir, 4096)
+	records, err := xlog.ReadAll(walDir, 4096)
 	if err != nil {
 		t.Fatal(err)
 	}

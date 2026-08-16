@@ -5,7 +5,7 @@ import (
 	
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/analyzer"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -70,7 +70,7 @@ WHERE pr.prrelid = '12345'`
 		t.Fatalf("Analyze error: %v", err)
 	}
 	
-	_, err = planner.Plan(stmts[0], cat)
+	_, err = optimizer.Plan(stmts[0], cat)
 	if err != nil {
 		t.Fatalf("Plan error: %v", err)
 	}

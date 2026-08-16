@@ -3,7 +3,7 @@ package amcheck
 import (
 	"fmt"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -51,7 +51,7 @@ import (
 // surfaces rather than silently dropping the entry — a truncated probe set would
 // manufacture spurious "lacks matching index tuple" reports (the heapallindexed
 // soundness invariant: the probe set must be complete or the check is unsound).
-type HeapEntryFormer func(tid storage.ItemPointer, tuple []byte) (entry btree.LeafEntry, include bool, err error)
+type HeapEntryFormer func(tid storage.ItemPointer, tuple []byte) (entry nbtree.LeafEntry, include bool, err error)
 
 // CollectHeapIndexEntries walks blocks [0, nblocks-1] of a heap relation and
 // returns the B-tree leaf entry each live heap tuple would form, in
@@ -75,7 +75,7 @@ type HeapEntryFormer func(tid storage.ItemPointer, tuple []byte) (entry btree.Le
 // truncated probe set would silently mask missing index entries (the entries that
 // would have been probed are simply never checked), so completeness is enforced
 // by surfacing the error to the SQL surface.
-func CollectHeapIndexEntries(src PageSource, nblocks storage.BlockNumber, form HeapEntryFormer) ([]btree.LeafEntry, error) {
+func CollectHeapIndexEntries(src PageSource, nblocks storage.BlockNumber, form HeapEntryFormer) ([]nbtree.LeafEntry, error) {
 	if src == nil {
 		return nil, fmt.Errorf("amcheck: nil page source")
 	}
@@ -86,7 +86,7 @@ func CollectHeapIndexEntries(src PageSource, nblocks storage.BlockNumber, form H
 		return nil, nil
 	}
 
-	var entries []btree.LeafEntry
+	var entries []nbtree.LeafEntry
 	lastBlock := nblocks - 1
 	for blkno := storage.BlockNumber(0); ; blkno++ {
 		p, err := src(blkno)
@@ -112,7 +112,7 @@ func CollectHeapIndexEntries(src PageSource, nblocks storage.BlockNumber, form H
 // tuple on a single heap page, in offset order. A new (all-zero) page yields
 // nothing. It is the per-page body of CollectHeapIndexEntries, factored out so the
 // line-pointer iteration is unit-testable in isolation.
-func collectHeapPageEntries(p storage.Page, blkno storage.BlockNumber, form HeapEntryFormer) ([]btree.LeafEntry, error) {
+func collectHeapPageEntries(p storage.Page, blkno storage.BlockNumber, form HeapEntryFormer) ([]nbtree.LeafEntry, error) {
 	if len(p) != storage.BlockSize {
 		return nil, fmt.Errorf("amcheck: block %d is %d bytes, want %d", blkno, len(p), storage.BlockSize)
 	}
@@ -125,7 +125,7 @@ func collectHeapPageEntries(p storage.Page, blkno storage.BlockNumber, form Heap
 		return nil, fmt.Errorf("amcheck: block %d: cannot determine line pointer count: %w", blkno, err)
 	}
 
-	var entries []btree.LeafEntry
+	var entries []nbtree.LeafEntry
 	for off := firstOffsetNumber; off <= maxoff; off++ {
 		offnum := uint16(off)
 		item, err := storage.PageGetItemID(p, offnum)

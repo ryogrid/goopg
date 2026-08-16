@@ -6,7 +6,7 @@ import (
 	"testing"
 	"unsafe"
 
-	"github.com/goopg/goopg/internal/mctx"
+	"github.com/goopg/goopg/internal/utils/mmgr"
 )
 
 // TestM0107DatumStructSize pins the post-M0107-0002 Datum layout:
@@ -25,7 +25,7 @@ func TestM0107DatumStructSize(t *testing.T) {
 // payload via StringValue() through mctx.Bytes(). M0107-0002: merged
 // KindStringArena into KindString (ArenaID field distinguishes).
 func TestM0073DatumStringArenaRoundTrip(t *testing.T) {
-	a := mctx.Acquire(nil, mctx.KindStmt)
+	a := mmgr.Acquire(nil, mmgr.KindStmt)
 	defer a.Release()
 	payload := "hello world"
 	offset, length := a.AllocString(payload)
@@ -45,7 +45,7 @@ func TestM0073DatumStringArenaRoundTrip(t *testing.T) {
 // TestM0073DatumBytesArenaRoundTrip mirrors the string arena
 // test for bytes (M0107-0002: KindBytesArena merged into KindBytes).
 func TestM0073DatumBytesArenaRoundTrip(t *testing.T) {
-	a := mctx.Acquire(nil, mctx.KindStmt)
+	a := mmgr.Acquire(nil, mmgr.KindStmt)
 	defer a.Release()
 	payload := []byte{0x01, 0x02, 0x03, 0xFF, 0xFE}
 	offset, length := a.AllocBytes(payload)
@@ -94,7 +94,7 @@ func TestM0073DatumNonArenaPathUnchanged(t *testing.T) {
 // TestM0073RowHasArena pins the fast-path skip predicate used
 // by Materialize.
 func TestM0073RowHasArena(t *testing.T) {
-	a := mctx.Acquire(nil, mctx.KindStmt)
+	a := mmgr.Acquire(nil, mmgr.KindStmt)
 	defer a.Release()
 	off, l := a.AllocBytes([]byte("abcd"))
 
@@ -118,7 +118,7 @@ func TestM0073RowHasArena(t *testing.T) {
 // of the source context. After mctx.Reset(), the cloned bytes
 // must still read correctly.
 func TestM0073CloneRowOwnedPromotesArenaDatums(t *testing.T) {
-	a := mctx.Acquire(nil, mctx.KindStmt)
+	a := mmgr.Acquire(nil, mmgr.KindStmt)
 	defer a.Release()
 	sOff, sLen := a.AllocBytes([]byte("hello"))
 	bOff, bLen := a.AllocBytes([]byte{0xAA, 0xBB, 0xCC})
@@ -174,7 +174,7 @@ func TestM0073CloneRowOwnedPromotesArenaDatums(t *testing.T) {
 // is called. The mctx Reset cycle then doesn't corrupt the
 // retained slot.
 func TestM0073MaterializePromotesArenaDatum(t *testing.T) {
-	a := mctx.Acquire(nil, mctx.KindStmt)
+	a := mmgr.Acquire(nil, mmgr.KindStmt)
 	defer a.Release()
 	off, l := a.AllocBytes([]byte("payl"))
 
@@ -229,7 +229,7 @@ func TestM0092MaterializeAlwaysDeepCopies(t *testing.T) {
 // build rows aliasing an arena that resets at scale (the class of bug
 // behind wrong join results on large builds).
 func TestBigNumericArenaSurvivesReset(t *testing.T) {
-	a := mctx.Acquire(nil, mctx.KindStmt)
+	a := mmgr.Acquire(nil, mmgr.KindStmt)
 	// A value beyond int64 range forces the flagBigNumeric lane.
 	bi, _ := new(big.Int).SetString("123456789012345678901234567890", 10)
 	src := newBigNumericInCtx(a, bi, 5)

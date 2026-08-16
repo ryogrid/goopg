@@ -13,7 +13,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // gmFixture builds a table whose sort keys have deliberate ties and NULLs, so
@@ -55,7 +55,7 @@ func runGatherMerge(t *testing.T, ctx *Context, sql string, workers int) []strin
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	node, err := planner.Plan(stmts[0], ctx.Catalog)
+	node, err := optimizer.Plan(stmts[0], ctx.Catalog)
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
@@ -96,11 +96,11 @@ func runGatherMerge(t *testing.T, ctx *Context, sql string, workers int) []strin
 // Wrapping the bare Sort instead would compare the scan's raw columns against
 // the query's projected output and fail on column count, which says nothing
 // about ordering. This mirrors what MaybeAddGather actually builds.
-func spliceGatherMerge(n planner.Node, workers int) (planner.Node, *planner.Sort) {
+func spliceGatherMerge(n optimizer.Node, workers int) (optimizer.Node, *optimizer.Sort) {
 	switch x := n.(type) {
-	case *planner.Sort:
-		return planner.NewGatherMerge(0, x, workers, x.Keys), x
-	case *planner.Project:
+	case *optimizer.Sort:
+		return optimizer.NewGatherMerge(0, x, workers, x.Keys), x
+	case *optimizer.Project:
 		child, srt := spliceGatherMerge(x.Child, workers)
 		if srt == nil {
 			return n, nil
@@ -108,7 +108,7 @@ func spliceGatherMerge(n planner.Node, workers int) (planner.Node, *planner.Sort
 		c := *x
 		c.Child = child
 		return &c, srt
-	case *planner.Filter:
+	case *optimizer.Filter:
 		child, srt := spliceGatherMerge(x.Child, workers)
 		if srt == nil {
 			return n, nil
@@ -116,7 +116,7 @@ func spliceGatherMerge(n planner.Node, workers int) (planner.Node, *planner.Sort
 		c := *x
 		c.Child = child
 		return &c, srt
-	case *planner.Limit:
+	case *optimizer.Limit:
 		child, srt := spliceGatherMerge(x.Child, workers)
 		if srt == nil {
 			return n, nil
@@ -212,7 +212,7 @@ func TestGatherMergeEarlyClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	node, err := planner.Plan(stmts[0], ctx.Catalog)
+	node, err := optimizer.Plan(stmts[0], ctx.Catalog)
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}

@@ -3,7 +3,7 @@ package initdb
 import (
 	"sync"
 
-	"github.com/goopg/goopg/internal/pgnodes"
+	"github.com/goopg/goopg/internal/nodes"
 )
 
 // pg_proc argument DEFAULTs for bootstrap (internal-language) functions.
@@ -50,7 +50,7 @@ type pgProcSeedDefault struct {
 	nargDefaults int
 	// defaults are the default expressions for those trailing arguments, in
 	// argument order; serialized into proargdefaults as a bare List.
-	defaults []pgnodes.Node
+	defaults []nodes.Node
 }
 
 // pgProcSeedDefaults maps a pg_proc OID to its system_functions.sql defaults.
@@ -61,9 +61,9 @@ var pgProcSeedDefaults = map[uint32]pgProcSeedDefault{
 	//   IN temporary boolean DEFAULT false, OUT ...)
 	3779: {
 		nargDefaults: 2,
-		defaults: []pgnodes.Node{
-			pgnodes.NewBoolConst(false), // immediately_reserve
-			pgnodes.NewBoolConst(false), // temporary
+		defaults: []nodes.Node{
+			nodes.NewBoolConst(false), // immediately_reserve
+			nodes.NewBoolConst(false), // temporary
 		},
 	},
 }
@@ -74,7 +74,7 @@ var pgProcSeedDefaults = map[uint32]pgProcSeedDefault{
 var pgProcSeedDefaultsTrees = sync.OnceValue(func() map[uint32]string {
 	m := make(map[uint32]string, len(pgProcSeedDefaults))
 	for oid, d := range pgProcSeedDefaults {
-		m[oid] = pgnodes.OutList(d.defaults)
+		m[oid] = nodes.OutList(d.defaults)
 	}
 	return m
 })

@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // explainNames is EXPLAIN's range-table name table: the mapping from a
@@ -73,10 +73,10 @@ type explainNames struct {
 }
 
 // nodePtr returns a unique string id for a plan node.
-func nodePtr(n planner.Node) string { return fmt.Sprintf("%p", n) }
+func nodePtr(n optimizer.Node) string { return fmt.Sprintf("%p", n) }
 
 // newExplainNames builds the name table for the plan rooted at n.
-func newExplainNames(n planner.Node) *explainNames {
+func newExplainNames(n optimizer.Node) *explainNames {
 	nm := &explainNames{
 		bySource:   map[int16]string{},
 		taken:      map[string]int{},
@@ -126,18 +126,18 @@ func (nm *explainNames) column(src int16, colName string, prefix bool) string {
 // node's relation name. Registration is ordered by SourceTableIdx (the
 // FROM-clause order the planner assigned) rather than by tree position, so
 // the `_N` suffixes do not depend on which join shape the planner picked.
-func (nm *explainNames) collect(n planner.Node) {
+func (nm *explainNames) collect(n optimizer.Node) {
 	if nm == nil || n == nil {
 		return
 	}
 	type entry struct {
 		src  int16
 		base string
-		node planner.Node
+		node optimizer.Node
 	}
 	var found []entry
-	var walk func(planner.Node)
-	walk = func(node planner.Node) {
+	var walk func(optimizer.Node)
+	walk = func(node optimizer.Node) {
 		if node == nil {
 			return
 		}
@@ -186,7 +186,7 @@ func (nm *explainNames) collect(n planner.Node) {
 // collides with an outer one (the per-query-level SourceTableIdx counter
 // makes that possible) the outer name is the one kept — which is the name a
 // correlated OuterColumnRef, the case this table exists for, needs.
-func (nm *explainNames) register(src int16, base string, node planner.Node) {
+func (nm *explainNames) register(src int16, base string, node optimizer.Node) {
 	if src == 0 || base == "" || nm.seen[src] {
 		return
 	}
@@ -208,35 +208,35 @@ func (nm *explainNames) register(src int16, base string, node planner.Node) {
 // contributes to the range table — its FROM-clause alias when one was
 // written, else the relation's own name, matching what describePlan already
 // prints after `Seq Scan on` / `CTE Scan on`.
-func explainRelBaseName(n planner.Node) (string, bool) {
+func explainRelBaseName(n optimizer.Node) (string, bool) {
 	switch p := n.(type) {
-	case *planner.SeqScan:
+	case *optimizer.SeqScan:
 		if p.Alias != "" {
 			return p.Alias, true
 		}
 		if p.Table != nil {
 			return strings.ToLower(p.Table.Name), true
 		}
-	case *planner.IndexScan:
+	case *optimizer.IndexScan:
 		if p.Alias != "" {
 			return p.Alias, true
 		}
 		if p.Table != nil {
 			return strings.ToLower(p.Table.Name), true
 		}
-	case *planner.IndexOnlyScan:
+	case *optimizer.IndexOnlyScan:
 		// No Alias field: an IOS is only ever substituted for an
 		// IndexScan on a covered relation, so the catalog name is the
 		// only name available here.
 		if p.Table != nil {
 			return strings.ToLower(p.Table.Name), true
 		}
-	case *planner.CTEScan:
+	case *optimizer.CTEScan:
 		if p.Alias != "" {
 			return p.Alias, true
 		}
 		return p.Name, true
-	case *planner.MaterializedCTEScan:
+	case *optimizer.MaterializedCTEScan:
 		if p.Alias != "" {
 			return p.Alias, true
 		}
@@ -249,7 +249,7 @@ func explainRelBaseName(n planner.Node) (string, bool) {
 // carries, when there is exactly one. A scan node's columns all come from
 // one FROM-clause entry, so this is how a plan node is tied back to its
 // range-table identity without the planner having to store it twice.
-func explainSingleSourceIdx(n planner.Node) (int16, bool) {
+func explainSingleSourceIdx(n optimizer.Node) (int16, bool) {
 	var src int16
 	for _, c := range n.Output() {
 		if c.SourceTableIdx == 0 {
@@ -284,14 +284,14 @@ func explainSingleSourceIdx(n planner.Node) (int16, bool) {
 // Returns "" unless exactly one relation in the ancestor subtree exposes the
 // name. An ambiguous match is left unqualified on purpose: a confidently
 // wrong relation name is worse than the bare column this replaced.
-func (nm *explainNames) resolveInAncestor(anc planner.Node, colName string) string {
+func (nm *explainNames) resolveInAncestor(anc optimizer.Node, colName string) string {
 	if nm == nil || anc == nil || colName == "" {
 		return ""
 	}
 	var hit string
 	n := 0
-	var walk func(planner.Node)
-	walk = func(node planner.Node) {
+	var walk func(optimizer.Node)
+	walk = func(node optimizer.Node) {
 		if node == nil || n > 1 {
 			return
 		}
@@ -329,7 +329,7 @@ func (nm *explainNames) resolveInAncestor(anc planner.Node, colName string) stri
 // distinct nodes can share a SourceTableIdx (the column-qualification
 // register() skips the second one via its `seen` guard) but still need
 // distinguishable node labels.
-func (nm *explainNames) disambiguatedName(n planner.Node) string {
+func (nm *explainNames) disambiguatedName(n optimizer.Node) string {
 	if nm == nil || n == nil {
 		return ""
 	}
@@ -343,10 +343,10 @@ func (nm *explainNames) disambiguatedName(n planner.Node) string {
 // || es->verbose`), while a join/aggregate/result qual prints qualified ones
 // (`useprefix = es->rtable_size > 1 || es->verbose`). Q30's CTE Scan filter
 // is the case that makes the difference visible.
-func explainIsScanNode(n planner.Node) bool {
+func explainIsScanNode(n optimizer.Node) bool {
 	switch n.(type) {
-	case *planner.SeqScan, *planner.IndexScan, *planner.IndexOnlyScan,
-		*planner.CTEScan, *planner.MaterializedCTEScan:
+	case *optimizer.SeqScan, *optimizer.IndexScan, *optimizer.IndexOnlyScan,
+		*optimizer.CTEScan, *optimizer.MaterializedCTEScan:
 		return true
 	}
 	return false

@@ -421,7 +421,7 @@ plan-gate: plan-snapshot-build
 # normal due to shadow memory overhead).
 # ---------------------------------------------------------------
 RACE_TIMEOUT ?= 15m
-RACE_EXCLUDE = internal/testport|internal/server|internal/testutil/cluster|internal/testutil/replcluster|internal/testutil/pgcluster|internal/testutil/pubsubcluster|internal/testutil/tpch|/bench/
+RACE_EXCLUDE = internal/testport|internal/postmaster|internal/testutil/cluster|internal/testutil/replcluster|internal/testutil/pgcluster|internal/testutil/pubsubcluster|internal/testutil/tpch|/bench/
 
 race-gate:
 	@echo "race-gate: collecting packages (excluding server/cluster/bench)..."

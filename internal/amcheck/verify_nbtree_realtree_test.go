@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/amcheck"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -84,11 +84,11 @@ func buildRealTree(t *testing.T, keys [][]byte) (*storage.Manager, *storage.Pool
 		t.Fatalf("NewPool: %v", err)
 	}
 	rel := storage.RelFileNode{DBOid: 1, RelOid: 9100, Fork: storage.MainFork}
-	bt, err := btree.Create(pool, rel)
+	bt, err := nbtree.Create(pool, rel)
 	if err != nil {
 		_ = pool.Close()
 		_ = mgr.Close()
-		t.Fatalf("btree.Create: %v", err)
+		t.Fatalf("nbtree.Create: %v", err)
 	}
 	for i, k := range keys {
 		ptr := storage.ItemPointer{Block: storage.BlockNumber(i/100 + 1), Offset: uint16(i%100 + 1)}
@@ -117,7 +117,7 @@ func leftmostByLevel(t *testing.T, src amcheck.PageSource, root storage.BlockNum
 			t.Fatalf("descend read block %d: %v", blk, err)
 		}
 		out = append(out, blk)
-		op := btree.ParseOpaque(p)
+		op := nbtree.ParseOpaque(p)
 		if op.IsLeaf() {
 			return out
 		}
@@ -169,14 +169,14 @@ func assertNonSiblingTiersSilent(t *testing.T, mgr *storage.Manager, pool *stora
 
 	// Cross-level downlink tier on every internal (non-leaf, live) page.
 	for blk := range nblocks {
-		if blk == btree.MetaBlock {
+		if blk == nbtree.MetaBlock {
 			continue
 		}
 		p, err := src(blk)
 		if err != nil {
 			t.Fatalf("read block %d: %v", blk, err)
 		}
-		op := btree.ParseOpaque(p)
+		op := nbtree.ParseOpaque(p)
 		if op.IsLeaf() || op.IsDeleted() {
 			continue
 		}
@@ -207,12 +207,12 @@ func assertNonSiblingTiersSilent(t *testing.T, mgr *storage.Manager, pool *stora
 		t.Fatalf("VerifyBtreeHeapAllIndexedRelation false positive: %+v", rr)
 	}
 
-	meta := func() btree.PGBTMetaPage {
-		p, err := src(btree.MetaBlock)
+	meta := func() nbtree.PGBTMetaPage {
+		p, err := src(nbtree.MetaBlock)
 		if err != nil {
 			t.Fatalf("read metapage: %v", err)
 		}
-		return btree.ParseMeta(p)
+		return nbtree.ParseMeta(p)
 	}()
 	return leftmostByLevel(t, src, meta.Root)
 }
@@ -221,7 +221,7 @@ func TestVerifyBtreeEngineSilentOnRealInt4Sequential(t *testing.T) {
 	const n = 3000 // forces multiple leaf splits and at least one internal level
 	keys := make([][]byte, n)
 	for i := range n {
-		keys[i] = btree.EncodeInt4(int32(i))
+		keys[i] = nbtree.EncodeInt4(int32(i))
 	}
 	mgr, pool, rel, cleanup := buildRealTree(t, keys)
 	defer cleanup()
@@ -243,7 +243,7 @@ func TestVerifyBtreeEngineSilentOnRealVarchar(t *testing.T) {
 	const n = 2500
 	keys := make([][]byte, n)
 	for i := range n {
-		keys[i] = btree.EncodeVarchar(fmt.Appendf(nil, "user-%010d-row", i))
+		keys[i] = nbtree.EncodeVarchar(fmt.Appendf(nil, "user-%010d-row", i))
 	}
 	mgr, pool, rel, cleanup := buildRealTree(t, keys)
 	defer cleanup()
@@ -259,7 +259,7 @@ func TestVerifyBtreeEngineSilentOnRealInt8(t *testing.T) {
 	const n = 2500
 	keys := make([][]byte, n)
 	for i := range n {
-		keys[i] = btree.EncodeInt8(int64(i) * 1_000_003)
+		keys[i] = nbtree.EncodeInt8(int64(i) * 1_000_003)
 	}
 	mgr, pool, rel, cleanup := buildRealTree(t, keys)
 	defer cleanup()
@@ -295,7 +295,7 @@ func TestVerifyBtreeEngineSilentOnRealShuffledInt4(t *testing.T) {
 	perm := rng.Perm(n)
 	keys := make([][]byte, n)
 	for i, v := range perm {
-		keys[i] = btree.EncodeInt4(int32(v))
+		keys[i] = nbtree.EncodeInt4(int32(v))
 	}
 	mgr, pool, rel, cleanup := buildRealTree(t, keys)
 	defer cleanup()
@@ -325,7 +325,7 @@ func TestVerifyBtreeEngineSilentOnRealShuffledInt4(t *testing.T) {
 // which is load-bearing for the repro this harness feeds (see
 // TestVerifyBtreeEngineSilentOnRealConcurrentContended below) — a large pool
 // (no eviction pressure) does not reproduce it.
-func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange int32, seed int64) (*storage.Manager, *storage.Pool, storage.RelFileNode, int, []btree.LeafEntry, *btree.BTree, func()) {
+func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange int32, seed int64) (*storage.Manager, *storage.Pool, storage.RelFileNode, int, []nbtree.LeafEntry, *nbtree.BTree, func()) {
 	t.Helper()
 	dir := t.TempDir()
 	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
@@ -351,11 +351,11 @@ func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange i
 	// amcheck-driven structural verification below remains the correctness
 	// gate.
 	rel := storage.RelFileNode{DBOid: 1, RelOid: 9200, Fork: storage.MainFork}
-	bt, err := btree.Create(pool, rel)
+	bt, err := nbtree.Create(pool, rel)
 	if err != nil {
 		_ = pool.Close()
 		_ = mgr.Close()
-		t.Fatalf("btree.Create: %v", err)
+		t.Fatalf("nbtree.Create: %v", err)
 	}
 
 	var wg sync.WaitGroup
@@ -366,22 +366,22 @@ func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange i
 	// record every successfully-inserted (key, TID) pair so the caller can
 	// diff it against the final on-disk leaf walk and identify exactly
 	// which entries were lost (not just how many).
-	perWriterEntries := make([][]btree.LeafEntry, writers)
+	perWriterEntries := make([][]nbtree.LeafEntry, writers)
 	for w := 0; w < writers; w++ {
 		wg.Add(1)
 		go func(wid int) {
 			defer wg.Done()
 			rng := rand.New(rand.NewSource(seed + int64(wid)))
-			entries := make([]btree.LeafEntry, 0, perWriter)
+			entries := make([]nbtree.LeafEntry, 0, perWriter)
 			for i := 0; i < perWriter; i++ {
-				k := btree.EncodeInt4(rng.Int31n(keyRange))
+				k := nbtree.EncodeInt4(rng.Int31n(keyRange))
 				ptr := storage.ItemPointer{Block: storage.BlockNumber(wid + 1), Offset: uint16(i%60000 + 1)}
 				if err := bt.Insert(k, ptr); err != nil {
 					t.Errorf("writer %d insert #%d: %v", wid, i, err)
 					failed.Store(true)
 					return
 				}
-				entries = append(entries, btree.LeafEntry{Key: k, TID: ptr})
+				entries = append(entries, nbtree.LeafEntry{Key: k, TID: ptr})
 				inserted.Add(1)
 			}
 			perWriterEntries[wid] = entries
@@ -397,7 +397,7 @@ func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange i
 		cleanup()
 		t.FailNow()
 	}
-	var all []btree.LeafEntry
+	var all []nbtree.LeafEntry
 	for _, e := range perWriterEntries {
 		all = append(all, e...)
 	}
@@ -782,7 +782,7 @@ func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
 	if len(actual) != n {
 		for _, e := range expected {
 			if !present[e.TID] {
-				kv, _ := btree.DecodeInt4(e.Key)
+				kv, _ := nbtree.DecodeInt4(e.Key)
 				wid := int(e.TID.Block) - 1
 				i := int(e.TID.Offset) - 1
 				t.Logf("MISSING entry: key=%d TID=%v (writer=%d iter=%d of %d)",
@@ -831,8 +831,8 @@ func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
 						continue
 					}
 					foundRewrite = true
-					inPageItems := btree.RewriteSnapshotHasTID(re.PostPageItems, e.TID)
-					inDedup := btree.RewriteSnapshotHasTID(re.PostDedup, e.TID)
+					inPageItems := nbtree.RewriteSnapshotHasTID(re.PostPageItems, e.TID)
+					inDedup := nbtree.RewriteSnapshotHasTID(re.PostDedup, e.TID)
 					t.Logf("  rewrite-event seq=%d phase=%s preLineCount=%d postPageItemsCount=%d postDedupCount=%d presentAfterPageItems=%v presentAfterDedup=%v",
 						re.Seq, re.Phase, re.PreLineCount, len(re.PostPageItems), len(re.PostDedup), inPageItems, inDedup)
 					if !inPageItems {
@@ -865,7 +865,7 @@ func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
 						if fe.Seq < last.Seq {
 							continue
 						}
-						has := btree.RewriteSnapshotHasTID(fe.Items, e.TID)
+						has := nbtree.RewriteSnapshotHasTID(fe.Items, e.TID)
 						t.Logf("  flush-snapshot seq=%d blk=%d itemCount=%d presentAtFlush=%v",
 							fe.Seq, fe.Block, len(fe.Items), has)
 						if !has {
@@ -889,7 +889,7 @@ func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
 					var lastGoodFlushSeq uint64
 					haveLastGood := false
 					for _, fe := range flushEvents {
-						if btree.RewriteSnapshotHasTID(fe.Items, e.TID) {
+						if nbtree.RewriteSnapshotHasTID(fe.Items, e.TID) {
 							if !haveLastGood || fe.Seq > lastGoodFlushSeq {
 								lastGoodFlushSeq = fe.Seq
 								haveLastGood = true
@@ -906,7 +906,7 @@ func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
 							if re.Seq < lastGoodFlushSeq {
 								continue
 							}
-							has := btree.RewriteSnapshotHasTID(re.Items, e.TID)
+							has := nbtree.RewriteSnapshotHasTID(re.Items, e.TID)
 							t.Logf("  reload-snapshot seq=%d blk=%d itemCount=%d presentAtReload=%v (last good flush seq=%d)",
 								re.Seq, re.Block, len(re.Items), has, lastGoodFlushSeq)
 							if !has {
@@ -1057,8 +1057,8 @@ func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
 							if ce.Seq < last.Seq {
 								continue
 							}
-							beforeHas := btree.RewriteSnapshotHasTID(ce.Before, e.TID)
-							afterHas := btree.RewriteSnapshotHasTID(ce.After, e.TID)
+							beforeHas := nbtree.RewriteSnapshotHasTID(ce.Before, e.TID)
+							afterHas := nbtree.RewriteSnapshotHasTID(ce.After, e.TID)
 							if !beforeHas && !afterHas {
 								continue
 							}
@@ -1096,7 +1096,7 @@ func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
 							// catching a mismatch for any block. Cross-
 							// reference any reload event landing exactly in
 							// that gap to distinguish the two.
-							var next *btree.ContentMuEvent
+							var next *nbtree.ContentMuEvent
 							for i := range cmEvents {
 								if cmEvents[i].Seq <= lastGoodSeq {
 									continue
@@ -1108,20 +1108,20 @@ func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
 							if next == nil {
 								t.Logf("  no contentMu-hold recorded on blk=%d after last-good seq=%d (block was never pinW-locked again during this run after the entry was last seen present)", last.Block, lastGoodSeq)
 							} else {
-								beforeHas := btree.RewriteSnapshotHasTID(next.Before, e.TID)
+								beforeHas := nbtree.RewriteSnapshotHasTID(next.Before, e.TID)
 								t.Logf("  next contentMu-hold after last-good seq=%d is seq=%d blk=%d beforeCount=%d presentBefore=%v",
 									lastGoodSeq, next.Seq, next.Block, len(next.Before), beforeHas)
 								if !beforeHas {
 									t.Logf("  => GAP LOSS: entry was present at hold seq=%d but already absent at the very next traced hold (seq=%d) on the SAME block -- the loss happened BETWEEN two pinW/unpinW holds, not inside one", lastGoodSeq, next.Seq)
 									for _, re := range bt.ReloadSnapshotRecordsForBlock(last.Block) {
 										if re.Seq > lastGoodSeq && re.Seq < next.Seq {
-											has := btree.RewriteSnapshotHasTID(re.Items, e.TID)
+											has := nbtree.RewriteSnapshotHasTID(re.Items, e.TID)
 											t.Logf("  reload-snapshot IN GAP seq=%d itemCount=%d present=%v", re.Seq, len(re.Items), has)
 										}
 									}
 									for _, fe := range bt.FlushSnapshotRecordsForBlock(last.Block) {
 										if fe.Seq > lastGoodSeq && fe.Seq < next.Seq {
-											has := btree.RewriteSnapshotHasTID(fe.Items, e.TID)
+											has := nbtree.RewriteSnapshotHasTID(fe.Items, e.TID)
 											t.Logf("  flush-snapshot IN GAP seq=%d itemCount=%d present=%v", fe.Seq, len(fe.Items), has)
 										}
 									}
@@ -1179,9 +1179,9 @@ func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
 				// `actual` under a still-correct TID — would mean the earlier
 				// `present` map lookup itself is the bug, not the tree).
 				if p, perr := src(last.Block); perr == nil {
-					op := btree.ParseOpaque(p)
+					op := nbtree.ParseOpaque(p)
 					entries, eerr := blobFmt.PageLeafEntries(p)
-					var sameKey []btree.LeafEntry
+					var sameKey []nbtree.LeafEntry
 					if eerr == nil {
 						for _, le := range entries {
 							if len(le.Key) == len(e.Key) && string(le.Key) == string(e.Key) {

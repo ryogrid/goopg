@@ -30,7 +30,7 @@ import (
 	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/testutil/cluster"
 	"github.com/goopg/goopg/internal/testutil/pgcluster"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 func TestE2E_GoopgColdStartOnPGDataDir(t *testing.T) {
@@ -290,12 +290,12 @@ func assertPGWALSegmentNamesAlreadyNormal(t *testing.T, dataDir string) {
 		if entry.IsDir() {
 			continue
 		}
-		tli, segno, ok := wal.ParseXLogFileName(entry.Name(), 16<<20)
+		tli, segno, ok := xlog.ParseXLogFileName(entry.Name(), 16<<20)
 		if !ok {
 			continue
 		}
 		parsed++
-		if got := wal.XLogFileName(tli, segno, 16<<20); got != entry.Name() {
+		if got := xlog.XLogFileName(tli, segno, 16<<20); got != entry.Name() {
 			t.Fatalf("PG-authored WAL segment %q round-trips to %q — goopg's segment naming disagrees with PG's; ledger this before working around it",
 				entry.Name(), got)
 		}

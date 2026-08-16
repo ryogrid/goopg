@@ -20,7 +20,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 func TestUpdatableViewInsertUpdateDeleteRewriteToBase(t *testing.T) {
@@ -226,19 +226,19 @@ func TestUpdatableViewWhereQualEnforcedThroughIndexPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	plan, err := planner.Plan(stmts[0], cat)
+	plan, err := optimizer.Plan(stmts[0], cat)
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
-	upd, ok := plan.(*planner.Update)
+	upd, ok := plan.(*optimizer.Update)
 	if !ok {
 		t.Fatalf("plan type = %T, want *planner.Update", plan)
 	}
-	filt, ok := upd.Child.(*planner.Filter)
+	filt, ok := upd.Child.(*optimizer.Filter)
 	if !ok {
 		t.Fatalf("Update.Child type = %T, want *planner.Filter (view qual)", upd.Child)
 	}
-	if _, ok := filt.Child.(*planner.IndexScan); !ok {
+	if _, ok := filt.Child.(*optimizer.IndexScan); !ok {
 		t.Fatalf("Filter.Child type = %T, want *planner.IndexScan — index path not chosen", filt.Child)
 	}
 
@@ -466,8 +466,8 @@ func TestChainedViewInnerNotAutoUpdatableRejectsWholeChain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	_, err = planner.Plan(stmts[0], cat)
-	pe, ok := err.(*planner.PlanError)
+	_, err = optimizer.Plan(stmts[0], cat)
+	pe, ok := err.(*optimizer.PlanError)
 	if !ok || pe.Code != "55000" {
 		t.Fatalf("INSERT through a chain with a non-updatable inner view: err=%v, want *planner.PlanError 55000", err)
 	}
@@ -494,14 +494,14 @@ func TestNonUpdatableViewDMLRejected(t *testing.T) {
 	must("CREATE VIEW vagg AS SELECT id, count(*) FROM t6 GROUP BY id")
 	must("CREATE VIEW vexpr AS SELECT id, val + 1 AS valplus FROM t6")
 
-	planErr := func(sql string) *planner.PlanError {
+	planErr := func(sql string) *optimizer.PlanError {
 		t.Helper()
 		stmts, err := parser.Parse(sql)
 		if err != nil {
 			t.Fatalf("Parse(%q): %v", sql, err)
 		}
-		_, err = planner.Plan(stmts[0], cat)
-		pe, ok := err.(*planner.PlanError)
+		_, err = optimizer.Plan(stmts[0], cat)
+		pe, ok := err.(*optimizer.PlanError)
 		if !ok {
 			t.Fatalf("Plan(%q) err=%v, want *planner.PlanError", sql, err)
 		}
@@ -603,8 +603,8 @@ func TestUpdatableViewColumnSubsetReorderRename(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	_, err = planner.Plan(stmts[0], ctx.Catalog)
-	pe, ok := err.(*planner.PlanError)
+	_, err = optimizer.Plan(stmts[0], ctx.Catalog)
+	pe, ok := err.(*optimizer.PlanError)
 	if !ok || pe.Code != "42703" {
 		t.Fatalf("UPDATE vsub SET val: err=%v, want *planner.PlanError 42703 (val is not part of vsub's row type)", err)
 	}
@@ -683,8 +683,8 @@ func TestUpdatableViewUpdateFromDeleteUsing(t *testing.T) {
 	if perr != nil {
 		t.Fatalf("Parse: %v", perr)
 	}
-	_, perr = planner.Plan(stmts[0], ctx.Catalog)
-	pe, ok := perr.(*planner.PlanError)
+	_, perr = optimizer.Plan(stmts[0], ctx.Catalog)
+	pe, ok := perr.(*optimizer.PlanError)
 	if !ok || pe.Code != "55000" {
 		t.Fatalf("UPDATE aggregate view FROM: err=%v, want *planner.PlanError 55000", perr)
 	}
@@ -692,8 +692,8 @@ func TestUpdatableViewUpdateFromDeleteUsing(t *testing.T) {
 	if perr != nil {
 		t.Fatalf("Parse: %v", perr)
 	}
-	_, perr = planner.Plan(stmts[0], ctx.Catalog)
-	pe, ok = perr.(*planner.PlanError)
+	_, perr = optimizer.Plan(stmts[0], ctx.Catalog)
+	pe, ok = perr.(*optimizer.PlanError)
 	if !ok || pe.Code != "55000" {
 		t.Fatalf("DELETE aggregate view USING: err=%v, want *planner.PlanError 55000", perr)
 	}

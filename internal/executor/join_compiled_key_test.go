@@ -25,11 +25,11 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
-func intCol(idx int) *planner.ColumnRef {
-	return &planner.ColumnRef{Index: idx, Name: "c", Type: catalog.Type{Name: "int4"}}
+func intCol(idx int) *optimizer.ColumnRef {
+	return &optimizer.ColumnRef{Index: idx, Name: "c", Type: catalog.Type{Name: "int4"}}
 }
 
 // TestCompiledExprMatchesInterpretedOnJoinKeyShapes is the sibling-path
@@ -38,25 +38,25 @@ func intCol(idx int) *planner.ColumnRef {
 // multi-conjunct residual compiles to. An ExprAdapter shape (StringConst) is
 // included on purpose — the fallback lane must stay exactly the interpreter.
 func TestCompiledExprMatchesInterpretedOnJoinKeyShapes(t *testing.T) {
-	cmp := func(op parser.OpCode, l, r planner.Expr) *planner.BinaryOp {
-		return &planner.BinaryOp{Op: op, Left: l, Right: r}
+	cmp := func(op parser.OpCode, l, r optimizer.Expr) *optimizer.BinaryOp {
+		return &optimizer.BinaryOp{Op: op, Left: l, Right: r}
 	}
 	corpus := []struct {
 		name string
-		expr planner.Expr
+		expr optimizer.Expr
 	}{
 		{"bare column", intCol(0)},
-		{"column arithmetic", &planner.BinaryOp{Op: parser.OpAdd, Left: intCol(0), Right: intCol(1), ResultType: "int4"}},
-		{"comparison", cmp(parser.OpEq, intCol(0), &planner.IntegerConst{Value: 7})},
-		{"comparison false", cmp(parser.OpGt, intCol(0), &planner.IntegerConst{Value: 99})},
+		{"column arithmetic", &optimizer.BinaryOp{Op: parser.OpAdd, Left: intCol(0), Right: intCol(1), ResultType: "int4"}},
+		{"comparison", cmp(parser.OpEq, intCol(0), &optimizer.IntegerConst{Value: 7})},
+		{"comparison false", cmp(parser.OpGt, intCol(0), &optimizer.IntegerConst{Value: 99})},
 		{"and chain", cmp(parser.OpAnd,
-			cmp(parser.OpEq, intCol(0), &planner.IntegerConst{Value: 7}),
-			cmp(parser.OpLt, intCol(1), &planner.IntegerConst{Value: 50}))},
+			cmp(parser.OpEq, intCol(0), &optimizer.IntegerConst{Value: 7}),
+			cmp(parser.OpLt, intCol(1), &optimizer.IntegerConst{Value: 50}))},
 		{"and chain short-circuits on false", cmp(parser.OpAnd,
-			cmp(parser.OpEq, intCol(0), &planner.IntegerConst{Value: 0}),
-			cmp(parser.OpLt, intCol(1), &planner.IntegerConst{Value: 50}))},
-		{"null column propagates", cmp(parser.OpEq, intCol(2), &planner.IntegerConst{Value: 7})},
-		{"adapter fallback", &planner.StringConst{}},
+			cmp(parser.OpEq, intCol(0), &optimizer.IntegerConst{Value: 0}),
+			cmp(parser.OpLt, intCol(1), &optimizer.IntegerConst{Value: 50}))},
+		{"null column propagates", cmp(parser.OpEq, intCol(2), &optimizer.IntegerConst{Value: 7})},
+		{"adapter fallback", &optimizer.StringConst{}},
 	}
 	row := Row{NewIntDatum(7), NewIntDatum(11), NullDatum}
 
@@ -189,10 +189,10 @@ func TestJoinCompilesKeysAndResidualAtOpen(t *testing.T) {
 func TestCompositeEncodeNeverRunsOnAnUncompiledNodeList(t *testing.T) {
 	// Deliberately NOT compiled: no plan, no initExecKeys, no Open.
 	o := &joinOp{
-		execKeys: make([]planner.JoinKeyPair, 2),
-		buildKeyExprs: []planner.Expr{
-			&planner.ColumnRef{Index: 0},
-			&planner.ColumnRef{Index: 1},
+		execKeys: make([]optimizer.JoinKeyPair, 2),
+		buildKeyExprs: []optimizer.Expr{
+			&optimizer.ColumnRef{Index: 0},
+			&optimizer.ColumnRef{Index: 1},
 		},
 	}
 	encode := func(a, b int64) string {
@@ -248,10 +248,10 @@ func BenchmarkJoinKeyEval(b *testing.B) {
 // where the expression is an AND of two comparisons rather than a bare
 // accessor — the shape a non-equijoin conjunct leaves behind.
 func BenchmarkJoinResidualEval(b *testing.B) {
-	residual := &planner.BinaryOp{
+	residual := &optimizer.BinaryOp{
 		Op:    parser.OpAnd,
-		Left:  &planner.BinaryOp{Op: parser.OpLt, Left: intCol(0), Right: intCol(2)},
-		Right: &planner.BinaryOp{Op: parser.OpGt, Left: intCol(1), Right: intCol(3)},
+		Left:  &optimizer.BinaryOp{Op: parser.OpLt, Left: intCol(0), Right: intCol(2)},
+		Right: &optimizer.BinaryOp{Op: parser.OpGt, Left: intCol(1), Right: intCol(3)},
 	}
 	slot := SlotFromRow(nil, Row{NewIntDatum(1), NewIntDatum(9), NewIntDatum(5), NewIntDatum(2)})
 

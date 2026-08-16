@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/catalog"
 )
 
@@ -44,7 +44,7 @@ func TestBuildPGIndexKeyDescPhysicalLayout(t *testing.T) {
 	if desc.NKeyAtts() != 4 {
 		t.Fatalf("NKeyAtts = %d, want 4", desc.NKeyAtts())
 	}
-	want := []btree.PGIndexAttr{
+	want := []nbtree.PGIndexAttr{
 		{Len: 4, ByVal: true, AlignBy: 4, Storage: 'p'},   // int4
 		{Len: -1, ByVal: false, AlignBy: 4, Storage: 'x'}, // text
 		{Len: -1, ByVal: false, AlignBy: 4, Storage: 'x'}, // bytea

@@ -9,16 +9,16 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 type pgPartitionTreeOp struct {
-	plan *planner.PgPartitionTree
+	plan *optimizer.PgPartitionTree
 	rows []Row
 	idx  int
 }
 
-func newPgPartitionTreeOp(p *planner.PgPartitionTree) *pgPartitionTreeOp {
+func newPgPartitionTreeOp(p *optimizer.PgPartitionTree) *pgPartitionTreeOp {
 	return &pgPartitionTreeOp{plan: p}
 }
 
@@ -62,7 +62,7 @@ func (o *pgPartitionTreeOp) Next() (TupleSlot, error) {
 }
 
 func (o *pgPartitionTreeOp) Close() error                  { return nil }
-func (o *pgPartitionTreeOp) Schema() planner.Schema        { return o.plan.Output() }
+func (o *pgPartitionTreeOp) Schema() optimizer.Schema        { return o.plan.Output() }
 
 // partitionResolveRegclass converts a KindInt OID or KindString name Datum to
 // a relation name, searching both tables and indexes.

@@ -17,7 +17,7 @@ import (
 	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/sqlkeywords"
+	"github.com/goopg/goopg/internal/parser/sqlkeywords"
 	"github.com/goopg/goopg/internal/storage"
 )
 

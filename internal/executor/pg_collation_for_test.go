@@ -3,7 +3,7 @@ package executor
 import (
 	"testing"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // TestPgCollationForEvalFuncCall exercises evalFuncCall's "pg_collation_for"
@@ -16,7 +16,7 @@ func TestPgCollationForEvalFuncCall(t *testing.T) {
 	ctx := &Context{}
 
 	t.Run("folded StringConst fast path", func(t *testing.T) {
-		call := &planner.FuncCall{Name: "pg_collation_for", Args: []planner.Expr{&planner.StringConst{Value: "default"}}}
+		call := &optimizer.FuncCall{Name: "pg_collation_for", Args: []optimizer.Expr{&optimizer.StringConst{Value: "default"}}}
 		got, err := evalFuncCall(call, nil, ctx)
 		if err != nil {
 			t.Fatalf("evalFuncCall: %v", err)
@@ -27,7 +27,7 @@ func TestPgCollationForEvalFuncCall(t *testing.T) {
 	})
 
 	t.Run("folded NullConst fast path", func(t *testing.T) {
-		call := &planner.FuncCall{Name: "pg_collation_for", Args: []planner.Expr{&planner.NullConst{}}}
+		call := &optimizer.FuncCall{Name: "pg_collation_for", Args: []optimizer.Expr{&optimizer.NullConst{}}}
 		got, err := evalFuncCall(call, nil, ctx)
 		if err != nil {
 			t.Fatalf("evalFuncCall: %v", err)
@@ -38,8 +38,8 @@ func TestPgCollationForEvalFuncCall(t *testing.T) {
 	})
 
 	t.Run("un-folded explicit CollateExpr", func(t *testing.T) {
-		call := &planner.FuncCall{Name: "pg_collation_for", Args: []planner.Expr{
-			&planner.CollateExpr{Operand: &planner.StringConst{Value: "x"}, CollationName: "POSIX"},
+		call := &optimizer.FuncCall{Name: "pg_collation_for", Args: []optimizer.Expr{
+			&optimizer.CollateExpr{Operand: &optimizer.StringConst{Value: "x"}, CollationName: "POSIX"},
 		}}
 		got, err := evalFuncCall(call, nil, ctx)
 		if err != nil {
@@ -57,7 +57,7 @@ func TestPgCollationForEvalFuncCall(t *testing.T) {
 		// but pins the runtime fallback's behavior for any resolver that
 		// bypasses the fold: no collation name is guessed for a non-string
 		// runtime value.
-		call := &planner.FuncCall{Name: "pg_collation_for", Args: []planner.Expr{&planner.IntegerConst{Value: 5}}}
+		call := &optimizer.FuncCall{Name: "pg_collation_for", Args: []optimizer.Expr{&optimizer.IntegerConst{Value: 5}}}
 		got, err := evalFuncCall(call, nil, ctx)
 		if err != nil {
 			t.Fatalf("evalFuncCall: %v", err)

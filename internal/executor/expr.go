@@ -22,12 +22,12 @@ import (
 	"unsafe"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/config"
-	"github.com/goopg/goopg/internal/mctx"
+	"github.com/goopg/goopg/internal/utils/misc"
+	"github.com/goopg/goopg/internal/utils/mmgr"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/pgdatetime"
-	"github.com/goopg/goopg/internal/planner"
-	"github.com/goopg/goopg/internal/sqlkeywords"
+	"github.com/goopg/goopg/internal/utils/adt/datetime"
+	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/parser/sqlkeywords"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -328,7 +328,7 @@ func oidToBuiltinTypeName(oid uint32) string {
 	}
 }
 
-func evalExpr(e planner.Expr, row Row, ctx *Context) (Datum, error) {
+func evalExpr(e optimizer.Expr, row Row, ctx *Context) (Datum, error) {
 	var slot SlotView
 	if row != nil {
 		slot = rowSlotView(row)
@@ -350,9 +350,9 @@ func evalExpr(e planner.Expr, row Row, ctx *Context) (Datum, error) {
 // fast-path early-return ahead of the type switch — saves the
 // 12-arm type-test sequence on the hot path. evalExprSlot cum
 // CPU at M0073-final was 68.68 % cum; this hoist trims dispatch.
-func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
+func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) {
 	// Fast path: ColumnRef. M0074-0001 hoist.
-	if cref, ok := e.(*planner.ColumnRef); ok {
+	if cref, ok := e.(*optimizer.ColumnRef); ok {
 		if slot == nil {
 			return Datum{}, &ExecError{Code: "XX000", Pos: cref.Pos(), Message: fmt.Sprintf("column ref %s/%d on nil slot", cref.Name, cref.Index)}
 		}
@@ -393,7 +393,7 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		return slot.Get(cref.Index), nil
 	}
 	switch x := e.(type) {
-	case *planner.OuterColumnRef:
+	case *optimizer.OuterColumnRef:
 		// Look up the row from the lexical-scope stack pushed
 		// by evalSubquery/evalInExpr/evalExistsExpr before the
 		// inner plan runs. Level 1 is the immediate parent.
@@ -406,7 +406,7 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			return Datum{}, &ExecError{Code: "XX000", Pos: x.Pos(), Message: fmt.Sprintf("outer column ref %s/idx=%d out of range (width=%d)", x.Name, x.Index, len(outer))}
 		}
 		return outer[x.Index], nil
-	case *planner.ExecParamRef:
+	case *optimizer.ExecParamRef:
 		// PARAM_EXEC slot read (D4.1). The enclosing sublink's eval
 		// site bound the slot via bindSubPlanParams before running
 		// this plan; position-independent, no scope stack involved.
@@ -415,32 +415,32 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			return Datum{}, &ExecError{Code: "XX000", Pos: x.Pos(), Message: fmt.Sprintf("SubPlan parameter $%d read before assignment", x.ID)}
 		}
 		return ctx.ParamExec[x.ID], nil
-	case *planner.CaseExpr:
+	case *optimizer.CaseExpr:
 		return evalCaseExpr(x, slotToRow(slot), ctx)
-	case *planner.SubqueryExpr:
+	case *optimizer.SubqueryExpr:
 		return evalSubquery(x, slotToRow(slot), ctx)
-	case *planner.ArraySubqueryExpr:
+	case *optimizer.ArraySubqueryExpr:
 		return evalArraySubquery(x, slotToRow(slot), ctx)
-	case *planner.CollateExpr:
+	case *optimizer.CollateExpr:
 		// Pass-through: evaluate operand and ignore collation at runtime. M0097-0127.
 		return evalExprSlot(x.Operand, slot, ctx)
-	case *planner.MultiAssignSubqElem:
+	case *optimizer.MultiAssignSubqElem:
 		return evalMultiAssignSubqElem(x, slotToRow(slot), ctx)
-	case *planner.InExpr:
+	case *optimizer.InExpr:
 		return evalInExpr(x, slot, ctx)
-	case *planner.ExistsExpr:
+	case *optimizer.ExistsExpr:
 		return evalExistsExpr(x, slotToRow(slot), ctx)
-	case *planner.RowExpr:
+	case *optimizer.RowExpr:
 		return evalRowExpr(x, slot, ctx)
-	case *planner.TypedStringLit:
+	case *optimizer.TypedStringLit:
 		return evalTypedStringLit(x, ctx)
-	case *planner.IntervalLit:
+	case *optimizer.IntervalLit:
 		return evalIntervalLit(x)
-	case *planner.ExtractExpr:
+	case *optimizer.ExtractExpr:
 		return evalExtract(x, slotToRow(slot), ctx)
-	case *planner.IntegerConst:
+	case *optimizer.IntegerConst:
 		return Datum{Kind: KindInt, Int: x.Value}, nil
-	case *planner.TableOidExpr:
+	case *optimizer.TableOidExpr:
 		// `tableoid` system column for a non-partitioned base
 		// relation: the binding's table OID is fixed at plan time
 		// (resolveTableoidForBinding). Partitioned bindings instead
@@ -448,18 +448,18 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		// `tableoid` slot added by the partition-union wrapper.
 		// M0100-0005y.
 		return Datum{Kind: KindInt, Int: int64(x.TableOID)}, nil
-	case *planner.MergeActionExpr:
+	case *optimizer.MergeActionExpr:
 		// MERGE RETURNING merge_action() — returns the action text for this row. M0100-0007.
 		switch ctx.MergeAction {
-		case planner.MergeActionInsert:
+		case optimizer.MergeActionInsert:
 			return NewStringDatum("INSERT"), nil
-		case planner.MergeActionUpdate:
+		case optimizer.MergeActionUpdate:
 			return NewStringDatum("UPDATE"), nil
-		case planner.MergeActionDelete:
+		case optimizer.MergeActionDelete:
 			return NewStringDatum("DELETE"), nil
 		}
 		return Datum{}, nil
-	case *planner.MergeWholeRowRef:
+	case *optimizer.MergeWholeRowRef:
 		// MERGE RETURNING old/new composite. nil row → true NULL. M0100-0007.
 		var row Row
 		if x.IsOld {
@@ -471,7 +471,7 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			return Datum{}, nil
 		}
 		return evalMergeWholeRow(row), nil
-	case *planner.CTIDExpr:
+	case *optimizer.CTIDExpr:
 		// `ctid` system column: per-row TID injected by seqScanOp
 		// into MaterializedSlot.hasCTID. M0097-0038.
 		// M0097-0062: also handle opnode *Slot which propagates ctid
@@ -487,31 +487,31 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			}
 		}
 		return NullDatum, nil
-	case *planner.NumericConst:
+	case *optimizer.NumericConst:
 		m, s, err := parseNumeric(x.Value)
 		if err != nil {
 			return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(), Message: err.Error()}
 		}
 		return newNumeric(m, int(s)), nil
-	case *planner.StringConst:
+	case *optimizer.StringConst:
 		return NewStringDatum(x.Value), nil
-	case *planner.NullConst:
+	case *optimizer.NullConst:
 		return NullDatum, nil
-	case *planner.BooleanConst:
+	case *optimizer.BooleanConst:
 		return NewBoolDatum(x.Value), nil
-	case *planner.ParamRef:
+	case *optimizer.ParamRef:
 		if x.Number < 1 || x.Number > len(ctx.Params) {
 			return Datum{}, &ExecError{Code: "08P01", Pos: x.Pos(), Message: fmt.Sprintf("parameter $%d not bound", x.Number)}
 		}
 		return ctx.Params[x.Number-1], nil
 	// ColumnRef handled by the M0074-0001 fast-path above.
-	case *planner.UnaryOp:
+	case *optimizer.UnaryOp:
 		operand, err := evalExprSlot(x.Operand, slot, ctx)
 		if err != nil {
 			return Datum{}, err
 		}
 		return evalUnary(x.Op, operand, x.Pos())
-	case *planner.CastExpr:
+	case *optimizer.CastExpr:
 		v, err := evalExprSlot(x.Operand, slot, ctx)
 		if err != nil {
 			return Datum{}, err
@@ -1010,12 +1010,12 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			}
 		}
 		return result, nil
-	case *planner.BinaryOp:
+	case *optimizer.BinaryOp:
 		// Row-to-row comparisons: element-wise with proper NULL propagation.
 		// (a,b) OP (c,d): compare element by element; NULL in any element → NULL.
 		// This implements SQL row-comparison semantics (ISO SQL §8.7). M0097-0023.
-		if lRow, ok := x.Left.(*planner.RowExpr); ok {
-			if rRow, ok := x.Right.(*planner.RowExpr); ok {
+		if lRow, ok := x.Left.(*optimizer.RowExpr); ok {
+			if rRow, ok := x.Right.(*optimizer.RowExpr); ok {
 				return evalRowToRowComparison(x.Op, lRow, rRow, slot, ctx)
 			}
 		}
@@ -1023,13 +1023,13 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		// ROW(a, b) = (SELECT x, y FROM ...) → element-wise comparison.
 		// ROW(a,b) is planned as FuncCall{Name:"row",...} not RowExpr. M0097-0020.
 		if x.Op == parser.OpEq || x.Op == parser.OpNe {
-			if rowFc, ok := x.Left.(*planner.FuncCall); ok && strings.EqualFold(rowFc.Name, "row") {
-				if sqOp, ok := x.Right.(*planner.SubqueryExpr); ok {
+			if rowFc, ok := x.Left.(*optimizer.FuncCall); ok && strings.EqualFold(rowFc.Name, "row") {
+				if sqOp, ok := x.Right.(*optimizer.SubqueryExpr); ok {
 					return evalRowFuncCallVsSubqueryExpr(x.Op, rowFc.Args, sqOp, slot, ctx)
 				}
 			}
-			if rowFc, ok := x.Right.(*planner.FuncCall); ok && strings.EqualFold(rowFc.Name, "row") {
-				if sqOp, ok := x.Left.(*planner.SubqueryExpr); ok {
+			if rowFc, ok := x.Right.(*optimizer.FuncCall); ok && strings.EqualFold(rowFc.Name, "row") {
+				if sqOp, ok := x.Left.(*optimizer.SubqueryExpr); ok {
 					return evalRowFuncCallVsSubqueryExpr(x.Op, rowFc.Args, sqOp, slot, ctx)
 				}
 			}
@@ -1157,9 +1157,9 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			}
 		}
 		return result, nil
-	case *planner.FuncCall:
+	case *optimizer.FuncCall:
 		return evalFuncCall(x, slotToRow(slot), ctx)
-	case *planner.IsNullExpr:
+	case *optimizer.IsNullExpr:
 		// IS [NOT] NULL never propagates NULL — it always returns a boolean.
 		// A row-valued operand follows SQL/PG row null semantics: `row IS NULL`
 		// is true iff every field is null, `row IS NOT NULL` iff every field is
@@ -1168,7 +1168,7 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		// path below (a constructed RowExpr is never itself a NULL Datum, which
 		// would make `whole_row IS NOT NULL` wrongly true for an outer-join NULL
 		// row). M0110-0003 (pg_amcheck AC-002 gap #7a).
-		if re, ok := x.Operand.(*planner.RowExpr); ok {
+		if re, ok := x.Operand.(*optimizer.RowExpr); ok {
 			res, err := evalRowNullTest(re, x.Negated, slot, ctx)
 			if err != nil {
 				return Datum{}, err
@@ -1184,7 +1184,7 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			return NewBoolDatum(!isNull), nil // IS NOT NULL
 		}
 		return NewBoolDatum(isNull), nil // IS NULL
-	case *planner.IsBoolExpr:
+	case *optimizer.IsBoolExpr:
 		// IS [NOT] TRUE/FALSE/UNKNOWN. Always returns boolean. M0097-0003.
 		operand, err := evalExprSlot(x.Operand, slot, ctx)
 		if err != nil {
@@ -1205,7 +1205,7 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			result = !result
 		}
 		return NewBoolDatum(result), nil
-	case *planner.IsDistinctFromExpr:
+	case *optimizer.IsDistinctFromExpr:
 		// IS [NOT] DISTINCT FROM — null-safe equality. Always returns boolean.
 		//   a IS DISTINCT FROM b     = NOT (a = b OR (a IS NULL AND b IS NULL))
 		//   a IS NOT DISTINCT FROM b = (a = b OR (a IS NULL AND b IS NULL))
@@ -1263,7 +1263,7 @@ func evalUnary(op parser.OpCode, d Datum, pos int) (Datum, error) {
 			// Negate a numeric/float value. M0097-0003.
 			if d.Flags&flagBigNumeric != 0 {
 				neg := new(big.Int).Neg(d.NumericBigValue())
-				return newBigNumericInCtx(mctx.Perm(), neg, d.Scale), nil
+				return newBigNumericInCtx(mmgr.Perm(), neg, d.Scale), nil
 			}
 			return Datum{Kind: KindNumeric, Int: -d.Int, Scale: d.Scale}, nil
 		case KindInterval:
@@ -2426,9 +2426,9 @@ func tryParseStringAs(target DatumKind, s string) Datum {
 		// path has no target type to decide with. Take the date reading only for
 		// the widths that cannot also be a time — see
 		// pgdatetime.RunTogetherDateIsTimeAmbiguous.
-		normalized := pgdatetime.NormalizeDateTimeInput(s, false)
-		if pgdatetime.RunTogetherDateIsTimeAmbiguous(s) {
-			normalized = pgdatetime.NormalizeInput(s)
+		normalized := datetime.NormalizeDateTimeInput(s, false)
+		if datetime.RunTogetherDateIsTimeAmbiguous(s) {
+			normalized = datetime.NormalizeInput(s)
 		}
 		if hasISODatePrefix(normalized) {
 			if t, err := parseCopyTimestamp(s); err == nil {
@@ -2924,7 +2924,7 @@ func evalOr(a, b Datum) Datum {
 // SESSION TimeZone. That arm never fills CachedTime — it must not, since the
 // cache is keyed on the planner node alone and would freeze one session's zone
 // into a plan another session reuses.
-func evalTypedStringLit(x *planner.TypedStringLit, ctx *Context) (Datum, error) {
+func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error) {
 	if x.CacheValid {
 		return NewTimeDatum(x.CachedTime), nil
 	}
@@ -3390,7 +3390,7 @@ func dateStyleFromCtx(ctx *Context) (style, order string) {
 	style, order = "ISO", "MDY"
 	if ctx != nil && ctx.GetSetting != nil {
 		if v, ok := ctx.GetSetting("datestyle"); ok {
-			style, order = config.ParseDateStyleValue(v)
+			style, order = misc.ParseDateStyleValue(v)
 		}
 	}
 	return style, order
@@ -3437,11 +3437,11 @@ func formatTimeDatumDateStyle(d Datum, style, order, zone string) string {
 	}
 	switch d.TimeSub {
 	case TimeSubDate:
-		return config.FormatDate(d.TimeValue(), style, order)
+		return misc.FormatDate(d.TimeValue(), style, order)
 	case TimeSubTimestampTZ:
-		return config.FormatTimestampTZ(d.TimeValue(), style, order, zone)
+		return misc.FormatTimestampTZ(d.TimeValue(), style, order, zone)
 	}
-	return config.FormatTimestamp(d.TimeValue(), style, order)
+	return misc.FormatTimestamp(d.TimeValue(), style, order)
 }
 
 // formatDatumDateStyle is Datum.Format() with DateStyle-aware KindTime
@@ -3905,9 +3905,9 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			zone := timeZoneFromCtx(ctx)
 			switch {
 			case tz && d.TimeSub == TimeSubTimestamp:
-				return NewTimestampTZDatum(config.TimestampToTimestampTZ(d.TimeValue(), zone)), nil
+				return NewTimestampTZDatum(misc.TimestampToTimestampTZ(d.TimeValue(), zone)), nil
 			case !tz && d.TimeSub == TimeSubTimestampTZ:
-				return NewTimeDatum(config.TimestampTZToTimestamp(d.TimeValue(), zone)), nil
+				return NewTimeDatum(misc.TimestampTZToTimestamp(d.TimeValue(), zone)), nil
 			}
 		}
 		return d, nil
@@ -4139,7 +4139,7 @@ func parsePgSnapshotValid(s string) bool {
 // A regclass value already carries its OID once evaluated (or, less
 // commonly, arrives as the textual OID from an explicit ::regclass cast) —
 // same pattern already used by pg_get_indexdef/pg_get_statisticsobjdef.
-func resolveRegclassOID(argExpr planner.Expr, row Row, ctx *Context) (uint32, bool) {
+func resolveRegclassOID(argExpr optimizer.Expr, row Row, ctx *Context) (uint32, bool) {
 	arg, err := evalExpr(argExpr, row, ctx)
 	if err != nil || arg.IsNull() {
 		return 0, false
@@ -4213,7 +4213,7 @@ func relationFileNodeForOID(cat *catalog.InMemory, oid uint32) (storage.RelFileN
 // evalPgRelationSize implements pg_relation_size(relation [, fork]) → bigint,
 // mirroring PG's calculate_relation_size (dbsize.c): the byte size of one
 // named fork (default "main") of the relation's own storage. M0122-0002.
-func evalPgRelationSize(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalPgRelationSize(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) < 1 {
 		return NullDatum, nil
 	}
@@ -4251,7 +4251,7 @@ func evalPgRelationSize(x *planner.FuncCall, row Row, ctx *Context) (Datum, erro
 // PG's calculate_table_size: the table's own main/fsm/vm forks plus its
 // TOAST relation's forks (but not its indexes — pg_indexes_size covers
 // those separately). M0122-0002.
-func evalPgTableSize(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalPgTableSize(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) < 1 {
 		return NullDatum, nil
 	}
@@ -4276,7 +4276,7 @@ func evalPgTableSize(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) 
 
 // evalPgIndexesSize implements pg_indexes_size(relation) → bigint: the
 // summed size of every index belonging to the named table. M0122-0002.
-func evalPgIndexesSize(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalPgIndexesSize(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) < 1 {
 		return NullDatum, nil
 	}
@@ -4301,7 +4301,7 @@ func evalPgIndexesSize(x *planner.FuncCall, row Row, ctx *Context) (Datum, error
 // evalPgTotalRelationSize implements pg_total_relation_size(relation) →
 // bigint: pg_table_size + pg_indexes_size, matching PG's
 // calculate_total_relation_size. M0122-0002.
-func evalPgTotalRelationSize(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalPgTotalRelationSize(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	tableSize, err := evalPgTableSize(x, row, ctx)
 	if err != nil || tableSize.IsNull() {
 		return tableSize, err
@@ -4638,7 +4638,7 @@ func timeOfDayMicros(t time.Time) int64 {
 // the obvious neighbours (month, day, hour, minute, dow, doy,
 // epoch). Returns int8 for most fields; float8 for fractional-second
 // fields (second, millisecond, epoch). M0097-0004.
-func evalExtract(x *planner.ExtractExpr, row Row, ctx *Context) (Datum, error) {
+func evalExtract(x *optimizer.ExtractExpr, row Row, ctx *Context) (Datum, error) {
 	src, err := evalExpr(x.Source, row, ctx)
 	if err != nil {
 		return Datum{}, err
@@ -4977,7 +4977,7 @@ func extractTimestampField(field string, t time.Time, pos int) (int64, error) {
 // builtin. The first argument is a string literal naming the field
 // (e.g. 'year', 'month', 'quarter'). Semantics match
 // extractTimestampField, which is shared with EXTRACT.
-func evalDatePart(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalDatePart(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) != 2 {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "date_part(text, timestamp) requires exactly 2 arguments"}
 	}
@@ -5038,7 +5038,7 @@ func evalDatePart(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 // evalToChar implements to_char(value, fmt) → text.
 // Converts a timestamp or number to a string using a PostgreSQL format string.
 // Supports a subset of PostgreSQL format codes. M0097-0004.
-func evalToChar(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalToChar(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) < 2 {
 		return NullDatum, nil
 	}
@@ -5763,7 +5763,7 @@ func pgToCharToGoFormat(pg string) string {
 
 // evalDateTrunc implements date_trunc(field, source) → timestamp.
 // Truncates a timestamp to the specified field granularity. M0097-0004.
-func evalDateTrunc(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalDateTrunc(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) < 2 {
 		return NullDatum, nil
 	}
@@ -5837,7 +5837,7 @@ func evalDateTrunc(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 }
 
 // evalAge implements age(ts) and age(ts2, ts1) → interval. M0097-0004.
-func evalAge(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalAge(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	var ts1, ts2 time.Time
 	switch len(x.Args) {
 	case 1:
@@ -6250,7 +6250,7 @@ func buildRuleDefString(tbl *catalog.Table, r catalog.RuleInfo) string {
 }
 
 // evalMakeDate implements make_date(year, month, day) → date. M0097-0004.
-func evalMakeDate(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalMakeDate(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) != 3 {
 		return NullDatum, nil
 	}
@@ -6272,7 +6272,7 @@ func evalMakeDate(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 
 // evalMakeTimestamp implements make_timestamp/make_timestamptz(y,m,d,h,min,sec).
 // M0097-0004.
-func evalMakeTimestamp(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalMakeTimestamp(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) < 6 {
 		return NullDatum, nil
 	}
@@ -6290,7 +6290,7 @@ func evalMakeTimestamp(x *planner.FuncCall, row Row, ctx *Context) (Datum, error
 }
 
 // evalMakeTime implements make_time(h, min, sec) → time. M0097-0004.
-func evalMakeTime(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalMakeTime(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) < 3 {
 		return NullDatum, nil
 	}
@@ -6404,7 +6404,7 @@ func evalRegexpMatchesSRF(sD, patD, flagsD Datum) []Datum {
 // agnostic) and the interval sentinels on KindInterval (unimplemented_feat
 // #5(d-iv)), so both must be checked. NULL input propagates to NULL (isfinite
 // is strict — no NotStrict marker on its pg_proc OIDs; see isfinite_test.go).
-func evalIsFinite(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalIsFinite(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) != 1 {
 		return NullDatum, nil
 	}
@@ -6431,7 +6431,7 @@ var errIntervalRange = &ExecError{Code: "22008", Message: "interval out of range
 // field (Datum.IntervalMicrosValue, populated by timestamp − timestamp and by
 // sub-day literals), justify_hours is no longer the identity: it folds whole
 // 24h chunks of the time field into days. M0097-0004 (extended 2026-07-11).
-func evalJustify(name string, x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalJustify(name string, x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) != 1 {
 		return NullDatum, nil
 	}
@@ -6561,7 +6561,7 @@ func justifyIntervalDays(months, days int32) (int32, int32) {
 // evalDateBin implements date_bin(step interval, source timestamp, origin timestamp).
 // Bins the source timestamp into the bucket identified by origin aligned to step.
 // M0097-0004.
-func evalDateBin(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalDateBin(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) < 3 {
 		return NullDatum, nil
 	}
@@ -6614,7 +6614,7 @@ func parseIntervalCastString(s string) (months, days int32, micros int64, ok boo
 // M0066-0002: caches the parsed N on the planner node so
 // repeated evaluations in a hot loop skip the
 // `strconv.ParseInt` cost.
-func evalIntervalLit(x *planner.IntervalLit) (Datum, error) {
+func evalIntervalLit(x *optimizer.IntervalLit) (Datum, error) {
 	if x.CacheValid {
 		return NewIntervalDatumFull(x.CachedMonths, x.CachedDays, x.CachedMicros), nil
 	}
@@ -6805,10 +6805,10 @@ func roundIntervalMicrosToPrec(micros int64, p int) int64 {
 //
 // Multi-column subqueries raise 42601 unless the operand is a RowExpr,
 // in which case element-wise tuple comparison is used (row-constructor IN).
-func evalInExpr(x *planner.InExpr, slot SlotView, ctx *Context) (Datum, error) {
+func evalInExpr(x *optimizer.InExpr, slot SlotView, ctx *Context) (Datum, error) {
 	// Row-constructor IN/NOT IN subquery: (a, b) IN (SELECT x, y FROM ...).
 	// Route to element-wise tuple comparison. M0097-0020.
-	if rowOp, ok := x.Operand.(*planner.RowExpr); ok && x.Plan != nil {
+	if rowOp, ok := x.Operand.(*optimizer.RowExpr); ok && x.Plan != nil {
 		return evalRowConstructorInExpr(x, rowOp, slot, ctx)
 	}
 	// Use evalExprSlot so CTIDExpr can access hasCTID from the slot. M0097-0062.
@@ -6932,7 +6932,7 @@ func evalInExpr(x *planner.InExpr, slot SlotView, ctx *Context) (Datum, error) {
 
 // evalRowConstructorInExpr handles (a, b, ...) IN (SELECT x, y, ... FROM ...)
 // using element-wise 3-valued-logic tuple comparison. M0097-0020.
-func evalRowConstructorInExpr(x *planner.InExpr, rowOp *planner.RowExpr, slot SlotView, ctx *Context) (Datum, error) {
+func evalRowConstructorInExpr(x *optimizer.InExpr, rowOp *optimizer.RowExpr, slot SlotView, ctx *Context) (Datum, error) {
 	if ctx.Ctx != nil {
 		if err := ctx.Ctx.Err(); err != nil {
 			return Datum{}, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
@@ -7021,7 +7021,7 @@ func evalRowConstructorInExpr(x *planner.InExpr, rowOp *planner.RowExpr, slot Sl
 // by evaluating the subquery as a multi-column row and comparing element-wise.
 // Op must be OpEq or OpNe. The rowArgs are the Args of the FuncCall{Name:"row",...}.
 // M0097-0020.
-func evalRowFuncCallVsSubqueryExpr(op parser.OpCode, rowArgs []planner.Expr, sqOp *planner.SubqueryExpr, slot SlotView, ctx *Context) (Datum, error) {
+func evalRowFuncCallVsSubqueryExpr(op parser.OpCode, rowArgs []optimizer.Expr, sqOp *optimizer.SubqueryExpr, slot SlotView, ctx *Context) (Datum, error) {
 	if ctx.Ctx != nil {
 		if err := ctx.Ctx.Err(); err != nil {
 			return Datum{}, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
@@ -7109,7 +7109,7 @@ func evalRowFuncCallVsSubqueryExpr(op parser.OpCode, rowArgs []planner.Expr, sqO
 // two sublink sites can never collide (the key embeds the expr
 // pointer), which closes the correlated collectInValues collision
 // hazard (ch.04 §2) for every lowered sublink. D4.1/D4.4.
-func bindSubPlanParams(exprPtr any, parParam []int, args []planner.Expr, row Row, ctx *Context) (string, error) {
+func bindSubPlanParams(exprPtr any, parParam []int, args []optimizer.Expr, row Row, ctx *Context) (string, error) {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "%p", exprPtr)
 	for i, a := range args {
@@ -7127,7 +7127,7 @@ func bindSubPlanParams(exprPtr any, parParam []int, args []planner.Expr, row Row
 // collectInValues returns the inner set for `IN (...)`. When
 // the source is a subquery, drains it; the subquery must have
 // exactly one column. Otherwise evaluates the value list.
-func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) {
+func collectInValues(x *optimizer.InExpr, row Row, ctx *Context) ([]Datum, error) {
 	if x.Plan != nil {
 		// Check for query cancellation before each SubPlan evaluation.
 		// Each call may scan millions of rows; this single atomic read
@@ -7298,7 +7298,7 @@ func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) 
 // the inner plan, asks for one row, returns the bool. Works
 // regardless of column count — EXISTS only cares whether at
 // least one row exists.
-func evalExistsExpr(x *planner.ExistsExpr, row Row, ctx *Context) (Datum, error) {
+func evalExistsExpr(x *optimizer.ExistsExpr, row Row, ctx *Context) (Datum, error) {
 	// Check for query cancellation before each EXISTS/NOT EXISTS evaluation.
 	if ctx.Ctx != nil {
 		if err := ctx.Ctx.Err(); err != nil {
@@ -7361,7 +7361,7 @@ func evalExistsExpr(x *planner.ExistsExpr, row Row, ctx *Context) (Datum, error)
 // unlowered path (correlated refs — or a mislabelled IsNonCorrelated —
 // resolve against it) and popped again before returning, so callers'
 // cache operations always run at the host depth.
-func existsWithScope(x *planner.ExistsExpr, row Row, ctx *Context, lowered bool) (Datum, error) {
+func existsWithScope(x *optimizer.ExistsExpr, row Row, ctx *Context, lowered bool) (Datum, error) {
 	if !lowered {
 		ctx.OuterRows = append(ctx.OuterRows, row)
 		defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
@@ -7369,7 +7369,7 @@ func existsWithScope(x *planner.ExistsExpr, row Row, ctx *Context, lowered bool)
 	return existsImpl(x, ctx)
 }
 
-func existsImpl(x *planner.ExistsExpr, ctx *Context) (Datum, error) {
+func existsImpl(x *optimizer.ExistsExpr, ctx *Context) (Datum, error) {
 	// Stage 9 (D4.2): the inner plan is built once per statement and
 	// re-run via its handle; only the legacy path (kill switch off)
 	// re-instantiates per call. The lockRowsOp maxDrain=1 EXISTS
@@ -7398,7 +7398,7 @@ func existsImpl(x *planner.ExistsExpr, ctx *Context) (Datum, error) {
 // v0 is always uncorrelated — the inner plan never sees the
 // outer row. Correlated subqueries (parameter pull-up) are
 // deferred; see docs/design/0003-0008-subqueries.md.
-func evalSubquery(x *planner.SubqueryExpr, row Row, ctx *Context) (Datum, error) {
+func evalSubquery(x *optimizer.SubqueryExpr, row Row, ctx *Context) (Datum, error) {
 	// Check for query cancellation before each scalar SubPlan evaluation.
 	if ctx.Ctx != nil {
 		if err := ctx.Ctx.Err(); err != nil {
@@ -7481,7 +7481,7 @@ func evalSubquery(x *planner.SubqueryExpr, row Row, ctx *Context) (Datum, error)
 // subqueryWithScope runs subqueryImpl with the outer row pushed for the
 // unlowered path and popped before returning, so callers' cache
 // operations always run at the host depth.
-func subqueryWithScope(x *planner.SubqueryExpr, row Row, ctx *Context, lowered bool) (Datum, error) {
+func subqueryWithScope(x *optimizer.SubqueryExpr, row Row, ctx *Context, lowered bool) (Datum, error) {
 	if !lowered {
 		ctx.OuterRows = append(ctx.OuterRows, row)
 		defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
@@ -7489,7 +7489,7 @@ func subqueryWithScope(x *planner.SubqueryExpr, row Row, ctx *Context, lowered b
 	return subqueryImpl(x, ctx)
 }
 
-func subqueryImpl(x *planner.SubqueryExpr, ctx *Context) (Datum, error) {
+func subqueryImpl(x *optimizer.SubqueryExpr, ctx *Context) (Datum, error) {
 	// Correlated scalar subqueries inside aggregates are called once per outer
 	// row. Avoid O(N²) execution via two optimization paths:
 	//
@@ -7516,7 +7516,7 @@ func subqueryImpl(x *planner.SubqueryExpr, ctx *Context) (Datum, error) {
 				return subqueryReadOne(op, x)
 			}
 			if ctx.CorrSubqOps == nil {
-				ctx.CorrSubqOps = make(map[*planner.SubqueryExpr]Operator)
+				ctx.CorrSubqOps = make(map[*optimizer.SubqueryExpr]Operator)
 			}
 			op, found := ctx.CorrSubqOps[x]
 			if found {
@@ -7548,7 +7548,7 @@ func subqueryImpl(x *planner.SubqueryExpr, ctx *Context) (Datum, error) {
 		if info, ok := extractCorrSubqHashInfo(x.Plan); ok &&
 			subPlanResultCacheable(ctx, x, x.Plan, false) {
 			if ctx.CorrSubqHashMaps == nil {
-				ctx.CorrSubqHashMaps = make(map[*planner.SubqueryExpr]map[string]Datum)
+				ctx.CorrSubqHashMaps = make(map[*optimizer.SubqueryExpr]map[string]Datum)
 			}
 			hm, built := ctx.CorrSubqHashMaps[x]
 			if built {
@@ -7616,18 +7616,18 @@ func subqueryImpl(x *planner.SubqueryExpr, ctx *Context) (Datum, error) {
 // support repeated Open() calls without an intervening Close(). Currently
 // true for IndexScan and Project(IndexScan) — the two shapes produced by
 // the correlated-subquery OuterColumnRef → IndexScan rewrite.
-func planIsIndexScanBased(n planner.Node) bool {
+func planIsIndexScanBased(n optimizer.Node) bool {
 	switch x := n.(type) {
-	case *planner.IndexScan:
+	case *optimizer.IndexScan:
 		return true
-	case *planner.Project:
+	case *optimizer.Project:
 		return planIsIndexScanBased(x.Child)
-	case *planner.Aggregate:
+	case *optimizer.Aggregate:
 		// aggregateOp.Open resets o.idx and rebuilds o.rows each time, and its
 		// child is reopened via the child.Open call. Safe as long as the child
 		// (IndexScan) is safe.
 		return planIsIndexScanBased(x.Child)
-	case *planner.Filter:
+	case *optimizer.Filter:
 		// filterOp carries no state besides child+pred; Open just re-opens
 		// the child. Admitting it lets Aggregate{Filter{IndexScan}} shapes
 		// (an index probe with extra local conjuncts, e.g. TPC-H Q20's
@@ -7642,20 +7642,20 @@ func planIsIndexScanBased(n planner.Node) bool {
 // corrSubqHashInfo holds the components extracted from a hash-joinable
 // correlated scalar subquery plan: Project(Filter(SeqScan, col = OuterColumnRef)).
 type corrSubqHashInfo struct {
-	scan       *planner.SeqScan        // inner table to scan
+	scan       *optimizer.SeqScan        // inner table to scan
 	scanColIdx int                     // index of the join key column in SeqScan output
-	outerRef   planner.Expr // outer join-key value: OuterColumnRef or (lowered) ExecParamRef
-	projExpr   planner.Expr            // project expression to evaluate for result
+	outerRef   optimizer.Expr // outer join-key value: OuterColumnRef or (lowered) ExecParamRef
+	projExpr   optimizer.Expr            // project expression to evaluate for result
 }
 
 // extractCorrSubqHashInfo detects the pattern
 // Project(Filter(SeqScan, ColumnRef{col} = OuterColumnRef)) — or the aggregate
 // wrapper Aggregate(same) — and returns the components needed to build a hash
 // map for O(N) build + O(1) lookup per outer row.
-func extractCorrSubqHashInfo(n planner.Node) (corrSubqHashInfo, bool) {
-	var projectTarget planner.Expr
+func extractCorrSubqHashInfo(n optimizer.Node) (corrSubqHashInfo, bool) {
+	var projectTarget optimizer.Expr
 	switch x := n.(type) {
-	case *planner.Project:
+	case *optimizer.Project:
 		if len(x.Targets) != 1 {
 			return corrSubqHashInfo{}, false
 		}
@@ -7665,15 +7665,15 @@ func extractCorrSubqHashInfo(n planner.Node) (corrSubqHashInfo, bool) {
 		return corrSubqHashInfo{}, false
 	}
 	// n should now be Filter(SeqScan) or SeqScan.
-	var filterPred planner.Expr
+	var filterPred optimizer.Expr
 	switch x := n.(type) {
-	case *planner.Filter:
+	case *optimizer.Filter:
 		filterPred = x.Predicate
 		n = x.Child
 	default:
 		return corrSubqHashInfo{}, false
 	}
-	scan, ok := n.(*planner.SeqScan)
+	scan, ok := n.(*optimizer.SeqScan)
 	if !ok {
 		return corrSubqHashInfo{}, false
 	}
@@ -7681,22 +7681,22 @@ func extractCorrSubqHashInfo(n planner.Node) (corrSubqHashInfo, bool) {
 	// where the outer value is an OuterColumnRef (stack path) or, after
 	// D4.1 lowering, an ExecParamRef reading a bound ParamExec slot —
 	// both evaluate position-independently at lookup time.
-	bop, ok := filterPred.(*planner.BinaryOp)
+	bop, ok := filterPred.(*optimizer.BinaryOp)
 	if !ok || bop.Op != parser.OpEq {
 		return corrSubqHashInfo{}, false
 	}
-	isOuterVal := func(e planner.Expr) bool {
+	isOuterVal := func(e optimizer.Expr) bool {
 		switch e.(type) {
-		case *planner.OuterColumnRef, *planner.ExecParamRef:
+		case *optimizer.OuterColumnRef, *optimizer.ExecParamRef:
 			return true
 		}
 		return false
 	}
-	var innerCol *planner.ColumnRef
-	var outerRef planner.Expr
-	if c, ok2 := bop.Left.(*planner.ColumnRef); ok2 && isOuterVal(bop.Right) {
+	var innerCol *optimizer.ColumnRef
+	var outerRef optimizer.Expr
+	if c, ok2 := bop.Left.(*optimizer.ColumnRef); ok2 && isOuterVal(bop.Right) {
 		innerCol, outerRef = c, bop.Right
-	} else if c, ok2 := bop.Right.(*planner.ColumnRef); ok2 && isOuterVal(bop.Left) {
+	} else if c, ok2 := bop.Right.(*optimizer.ColumnRef); ok2 && isOuterVal(bop.Left) {
 		innerCol, outerRef = c, bop.Left
 	}
 	if innerCol == nil || outerRef == nil {
@@ -7747,7 +7747,7 @@ func buildCorrSubqHashMap(info corrSubqHashInfo, ctx *Context) (map[string]Datum
 
 // subqueryReadOne reads exactly one row from op (the scalar subquery result).
 // Returns NullDatum on EOF, error on cardinality violation or scan error.
-func subqueryReadOne(op Operator, x *planner.SubqueryExpr) (Datum, error) {
+func subqueryReadOne(op Operator, x *optimizer.SubqueryExpr) (Datum, error) {
 	slot, err := op.Next()
 	if err == EOF {
 		return NullDatum, nil
@@ -7773,7 +7773,7 @@ func subqueryReadOne(op Operator, x *planner.SubqueryExpr) (Datum, error) {
 // evalArraySubquery implements ARRAY(SELECT ...) — runs the inner plan and
 // collects all result rows (must be single-column) into a PostgreSQL text-array
 // string like {v1,v2,...}. M0097-0127.
-func evalArraySubquery(x *planner.ArraySubqueryExpr, row Row, ctx *Context) (Datum, error) {
+func evalArraySubquery(x *optimizer.ArraySubqueryExpr, row Row, ctx *Context) (Datum, error) {
 	if ctx.Ctx != nil {
 		if err := ctx.Ctx.Err(); err != nil {
 			return Datum{}, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
@@ -7822,7 +7822,7 @@ func evalArraySubquery(x *planner.ArraySubqueryExpr, row Row, ctx *Context) (Dat
 // assignment and caches the full result row in ctx.MultiAssignSubqCache keyed
 // by the *MultiAssignSubqRow pointer. The cache is cleared per-row by the
 // update executor before evaluating SET expressions.
-func evalMultiAssignSubqRow(x *planner.MultiAssignSubqRow, row Row, ctx *Context) ([]Datum, error) {
+func evalMultiAssignSubqRow(x *optimizer.MultiAssignSubqRow, row Row, ctx *Context) ([]Datum, error) {
 	key := uintptr(unsafe.Pointer(x))
 	if ctx.MultiAssignSubqCache != nil {
 		if cached, ok := ctx.MultiAssignSubqCache[key]; ok {
@@ -7878,7 +7878,7 @@ func evalMultiAssignSubqRow(x *planner.MultiAssignSubqRow, row Row, ctx *Context
 }
 
 // evalMultiAssignSubqElem evaluates one column of a multi-column SET subquery.
-func evalMultiAssignSubqElem(x *planner.MultiAssignSubqElem, row Row, ctx *Context) (Datum, error) {
+func evalMultiAssignSubqElem(x *optimizer.MultiAssignSubqElem, row Row, ctx *Context) (Datum, error) {
 	result, err := evalMultiAssignSubqRow(x.Row, row, ctx)
 	if err != nil {
 		return Datum{}, err
@@ -7896,7 +7896,7 @@ func evalMultiAssignSubqElem(x *planner.MultiAssignSubqElem, row Row, ctx *Conte
 //
 // First match wins; ELSE is the fallback. Per upstream, NULL
 // WHEN evaluates as "not matched" — never NULL-true.
-func evalCaseExpr(x *planner.CaseExpr, row Row, ctx *Context) (Datum, error) {
+func evalCaseExpr(x *optimizer.CaseExpr, row Row, ctx *Context) (Datum, error) {
 	var operand Datum
 	hasOperand := x.Operand != nil
 	if hasOperand {
@@ -8034,11 +8034,11 @@ func stringFuncArgTypeName(k DatumKind) string {
 // the same default synthesizeBareCharTypmod applies to casts and the bare-char
 // column type carries. Used by octet_length, whose PG implementation
 // (bpcharoctetlen) returns the blank-PADDED datum size. M0119-0006 (65th slice).
-func declaredBpcharTypmod(e planner.Expr) int64 {
+func declaredBpcharTypmod(e optimizer.Expr) int64 {
 	var name string
 	var typmod int64
 	switch n := e.(type) {
-	case *planner.ColumnRef:
+	case *optimizer.ColumnRef:
 		if n.Type.IsArray {
 			return 0
 		}
@@ -8046,10 +8046,10 @@ func declaredBpcharTypmod(e planner.Expr) int64 {
 		if len(n.Type.Args) > 0 {
 			typmod = n.Type.Args[0]
 		}
-	case *planner.CastExpr:
+	case *optimizer.CastExpr:
 		name = n.TargetType
 		typmod = n.Typmod
-	case *planner.FuncCall:
+	case *optimizer.FuncCall:
 		// coalesce/greatest/least/nullif take the first argument's type
 		// (planner.exprType), so octet_length(coalesce(charcol, '')) still sees
 		// the declared width.
@@ -8078,7 +8078,7 @@ func declaredBpcharTypmod(e planner.Expr) int64 {
 // v0 is small: current_timestamp / now / current_date are the only
 // no-arg time functions pgbench needs; HammerDB TPC-H also uses
 // to_timestamp(text, fmt) to load TIMESTAMP columns.
-func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	name := strings.ToLower(x.Name)
 	// Strip pg_catalog. prefix for matching — these are schema-qualified
 	// versions of the same built-in functions.
@@ -8293,13 +8293,13 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "pg_collation_for":
 		if len(x.Args) == 1 {
 			switch arg := x.Args[0].(type) {
-			case *planner.StringConst:
+			case *optimizer.StringConst:
 				// Fast path: the planner's foldPgCollationFor already computed the
 				// final answer at plan time (mirrors pg_typeof's fold). M0122-0005.
 				return NewStringDatum(arg.Value), nil
-			case *planner.NullConst:
+			case *optimizer.NullConst:
 				return NullDatum, nil
-			case *planner.CollateExpr:
+			case *optimizer.CollateExpr:
 				// Runtime path (reached only if some resolver other than the main
 				// planner.resolveExpr — e.g. plpgsql's expression compiler —
 				// produced this call without going through the plan-time fold):
@@ -11888,7 +11888,7 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			// Fast path: planner folded pg_typeof(expr) to a StringConst
 			// holding the pre-computed type name — resolve it without
 			// evaluating. M0097-0035.
-			if sc, ok := x.Args[0].(*planner.StringConst); ok {
+			if sc, ok := x.Args[0].(*optimizer.StringConst); ok {
 				return NewIntDatum(int64(pgTypeofOIDForName(cat, sc.Value))), nil
 			}
 			// Runtime path: evaluate arg and map Datum kind to PG type name.
@@ -12304,7 +12304,7 @@ func aclRoleNameForOID(oid int64) string {
 // e.g. acldefault('n', 10) → "{postgres=UC/postgres}". The world (PUBLIC) entry
 // is emitted first, then the owner entry, each only when non-empty. NULL input
 // yields NULL. M0110-0001 / DU-002 slice 2.
-func evalAclDefault(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalAclDefault(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) != 2 {
 		return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(),
 			Message: "acldefault(\"char\", oid) requires exactly 2 arguments"}
@@ -12378,7 +12378,7 @@ func evalAclDefault(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 // Returns the latest visible TID for the named relation, or an error for
 // unsupported relation kinds (indexes, partitioned tables, views without ctid).
 // M0097-0038.
-func evalCurrtid2(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalCurrtid2(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) != 2 {
 		return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(),
 			Message: fmt.Sprintf("function currtid2(unknown, unknown) does not exist")}
@@ -12609,7 +12609,7 @@ func parseNumericOrZero(s string) *big.Int {
 //
 //	(bigint)        → key = bigint, twoArg=false
 //	(int4, int4)    → key = (classid, objid), twoArg=true
-func evalAdvisoryLock(x *planner.FuncCall, row Row, ctx *Context, tryOnly bool, xactScoped bool, shared bool) (Datum, error) {
+func evalAdvisoryLock(x *optimizer.FuncCall, row Row, ctx *Context, tryOnly bool, xactScoped bool, shared bool) (Datum, error) {
 	sess := advisorySessionIDFromContext(ctx)
 
 	var key advisoryKey
@@ -12666,7 +12666,7 @@ func evalAdvisoryLock(x *planner.FuncCall, row Row, ctx *Context, tryOnly bool, 
 // pg_advisory_unlock_shared(bigint), and pg_advisory_unlock_shared(int4,int4).
 // Returns true if the lock was held by this session and has been released, false otherwise.
 // Emits WARNING "you don't own a lock of type <mode>" when returning false. M0097-0021.
-func evalAdvisoryUnlock(x *planner.FuncCall, row Row, ctx *Context, shared bool) (Datum, error) {
+func evalAdvisoryUnlock(x *optimizer.FuncCall, row Row, ctx *Context, shared bool) (Datum, error) {
 	sess := advisorySessionIDFromContext(ctx)
 
 	var key advisoryKey
@@ -12740,7 +12740,7 @@ func datumInt64(d Datum) (int64, bool) {
 // timestamp. Real upstream parity (timezone, era handling, locale
 // month names) waits on the type system; this is scoped to "make
 // Q15 plan and run without rejecting the conversion".
-func evalToDate(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalToDate(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) != 2 {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "to_date(text, text) requires exactly 2 arguments"}
 	}
@@ -12779,7 +12779,7 @@ func evalToDate(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 // The 2-argument form returns the substring from `from` to the end of
 // evalPgSleep implements pg_sleep(seconds). Sleeps for the given
 // duration while honouring query cancellation via ctx.Ctx.
-func evalPgSleep(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalPgSleep(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) != 1 {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "pg_sleep(double precision) requires exactly 1 argument"}
 	}
@@ -12822,7 +12822,7 @@ func evalPgSleep(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 // `substr('abcdef', -2, 4)` returns `'a'` (start at position 1, length
 // becomes 1 after subtracting the negative offset). For a v0 simple
 // implementation we follow the spec exactly.
-func evalSubstr(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalSubstr(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) != 2 && len(x.Args) != 3 {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "substr requires 2 or 3 arguments"}
 	}
@@ -12907,7 +12907,7 @@ func evalSubstr(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 // names, fractional seconds) waits on the type system; this is
 // deliberately scoped to "make the loader work without rejecting
 // rows".
-func evalToTimestamp(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalToTimestamp(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) != 2 {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "to_timestamp(text, text) requires exactly 2 arguments"}
 	}
@@ -13969,19 +13969,19 @@ func hashPartTypesCompatible(colType, argTypeName string) bool {
 
 // hashPartTypeName returns the user-visible PG type name for a planner expression,
 // used to build satisfies_hash_partition type mismatch messages. Returns "" if unknown.
-func hashPartTypeName(e planner.Expr) string {
+func hashPartTypeName(e optimizer.Expr) string {
 	switch x := e.(type) {
-	case *planner.CastExpr:
+	case *optimizer.CastExpr:
 		return pgFormatTypeName(x.TargetType)
-	case *planner.IntegerConst:
+	case *optimizer.IntegerConst:
 		return "integer"
-	case *planner.NumericConst:
+	case *optimizer.NumericConst:
 		return "numeric"
-	case *planner.StringConst:
+	case *optimizer.StringConst:
 		return "text"
-	case *planner.BooleanConst:
+	case *optimizer.BooleanConst:
 		return "boolean"
-	case *planner.FuncCall:
+	case *optimizer.FuncCall:
 		switch strings.ToLower(x.Name) {
 		case "now", "current_timestamp":
 			return "timestamp with time zone"
@@ -14767,9 +14767,9 @@ func parseTimezoneOffsetString(s string) (int, error) {
 // enum type name for enum_first / enum_last / enum_range. Arguments are
 // typically NULL::typename or value::typename casts; the CastExpr carries the
 // TargetType. M0097-0063.
-func enumTypeNameFromArgs(args []planner.Expr) string {
+func enumTypeNameFromArgs(args []optimizer.Expr) string {
 	for _, arg := range args {
-		if cast, ok := arg.(*planner.CastExpr); ok {
+		if cast, ok := arg.(*optimizer.CastExpr); ok {
 			return cast.TargetType
 		}
 	}
@@ -14801,7 +14801,7 @@ func enumUnsafeError(label, typeName string, pos int) error {
 // comparison with standard SQL NULL semantics: if any compared element is NULL,
 // the result is NULL for that step. Implements ISO SQL §8.7 row comparison.
 // Used for WHERE (proname, pronamespace) > ('abs', 0) style predicates.
-func evalRowToRowComparison(op parser.OpCode, left, right *planner.RowExpr, slot SlotView, ctx *Context) (Datum, error) {
+func evalRowToRowComparison(op parser.OpCode, left, right *optimizer.RowExpr, slot SlotView, ctx *Context) (Datum, error) {
 	n := len(left.Elems)
 	if len(right.Elems) < n {
 		n = len(right.Elems)
@@ -14841,7 +14841,7 @@ func evalRowToRowComparison(op parser.OpCode, left, right *planner.RowExpr, slot
 // evalRowExpr evaluates a row constructor `(a, b, c)` and returns its
 // PostgreSQL composite text representation `(v1,v2,...,vN)`. NULL elements
 // appear as empty fields. Used for whole-row variable refs. M0097-0020.
-func evalRowExpr(x *planner.RowExpr, slot SlotView, ctx *Context) (Datum, error) {
+func evalRowExpr(x *optimizer.RowExpr, slot SlotView, ctx *Context) (Datum, error) {
 	parts := make([]string, len(x.Elems))
 	allNull := true
 	for i, elem := range x.Elems {
@@ -14905,9 +14905,9 @@ func evalRowExpr(x *planner.RowExpr, slot SlotView, ctx *Context) (Datum, error)
 // fields. This is what lets `whole_row IS NOT NULL` correctly report false for
 // an outer-join non-match (all fields null), as in pg_amcheck's database
 // resolution query `COUNT(*) FILTER (WHERE d IS NOT NULL)`. M0110-0003.
-func evalRowNullTest(re *planner.RowExpr, negated bool, slot SlotView, ctx *Context) (bool, error) {
+func evalRowNullTest(re *optimizer.RowExpr, negated bool, slot SlotView, ctx *Context) (bool, error) {
 	for _, el := range re.Elems {
-		if sub, ok := el.(*planner.RowExpr); ok {
+		if sub, ok := el.(*optimizer.RowExpr); ok {
 			// Nested row: recurse with the same test (per SQL standard).
 			ok2, err := evalRowNullTest(sub, negated, slot, ctx)
 			if err != nil {

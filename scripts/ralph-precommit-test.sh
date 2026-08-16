@@ -63,7 +63,7 @@ else
 
 # Keep this pattern in sync with the EXCLUDE list in
 # .github/workflows/test.yml ("Run unit and component tests").
-EXCLUDE='internal/testport|internal/server|internal/testutil/cluster|internal/testutil/replcluster|internal/testutil/pgcluster|internal/testutil/pubsubcluster|internal/testutil/tpch|/bench/'
+EXCLUDE='internal/testport|internal/postmaster|internal/testutil/cluster|internal/testutil/replcluster|internal/testutil/pgcluster|internal/testutil/pubsubcluster|internal/testutil/tpch|/bench/'
 
 # Build the package list on its own line so a `go list` failure (e.g. a
 # package that fails to compile) is caught by `set -e`/`pipefail` instead of

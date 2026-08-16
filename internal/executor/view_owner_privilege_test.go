@@ -15,7 +15,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // openSelect parses, plans, and opens sql against ctx, returning the
@@ -29,7 +29,7 @@ func openSelect(t *testing.T, ctx *Context, sql string) error {
 	if err != nil {
 		t.Fatalf("Parse(%q): %v", sql, err)
 	}
-	plan, err := planner.Plan(stmts[0], ctx.Catalog)
+	plan, err := optimizer.Plan(stmts[0], ctx.Catalog)
 	if err != nil {
 		t.Fatalf("Plan(%q): %v", sql, err)
 	}

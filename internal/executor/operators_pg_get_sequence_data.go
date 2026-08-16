@@ -22,21 +22,21 @@ import (
 	"strconv"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 type pgGetSequenceDataOp struct {
-	plan      *planner.PgGetSequenceData
+	plan      *optimizer.PgGetSequenceData
 	outerSlot SlotView
 	row       Row // the single output row, or nil for 0 rows
 	emitted   bool
 }
 
-func newPgGetSequenceDataOp(p *planner.PgGetSequenceData) *pgGetSequenceDataOp {
+func newPgGetSequenceDataOp(p *optimizer.PgGetSequenceData) *pgGetSequenceDataOp {
 	return &pgGetSequenceDataOp{plan: p}
 }
 
-func (o *pgGetSequenceDataOp) Schema() planner.Schema { return o.plan.Output() }
+func (o *pgGetSequenceDataOp) Schema() optimizer.Schema { return o.plan.Output() }
 
 // BindLateralOuter binds the outer row's slot for lateral arg evaluation.
 // Called by joinOp before each per-outer-row Open when the SRF sits on the

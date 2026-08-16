@@ -27,8 +27,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/goopg/goopg/internal/mctx"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/utils/mmgr"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // sharedHashBuild is one hash join's build-side result, frozen and shared by
@@ -98,7 +98,7 @@ func (o *joinOp) applySharedBuild(sb *sharedHashBuild) {
 
 // lookupSharedHashBuild returns the published table for a plan node, or nil
 // when this execution is not under a Gather that pre-built one.
-func lookupSharedHashBuild(ctx *Context, p *planner.Join) *sharedHashBuild {
+func lookupSharedHashBuild(ctx *Context, p *optimizer.Join) *sharedHashBuild {
 	if ctx == nil || ctx.SharedHashBuilds == nil || p == nil {
 		return nil
 	}
@@ -113,9 +113,9 @@ func lookupSharedHashBuild(ctx *Context, p *planner.Join) *sharedHashBuild {
 // side, where each worker would build a partition of the table and the join
 // would silently lose rows. Hence one exported-ish helper rather than three
 // copies of `if Semi/Anti { false }`.
-func probeSideIsLeft(p *planner.Join) bool {
+func probeSideIsLeft(p *optimizer.Join) bool {
 	buildLeft := p.BuildLeft
-	if p.Type == planner.JoinTypeSemi || p.Type == planner.JoinTypeAnti {
+	if p.Type == optimizer.JoinTypeSemi || p.Type == optimizer.JoinTypeAnti {
 		buildLeft = false
 	}
 	// The build consumed the left side ⇒ the probe is the right side.
@@ -134,13 +134,13 @@ func probeSideIsLeft(p *planner.Join) bool {
 //
 // Returns nil when the subtree has no shareable hash join, which is the common
 // case and costs nothing — the check is on the plan, not on a built tree.
-func prebuildSharedHashJoins(ctx *Context, plan planner.Node, buildChild func() (Operator, error)) (map[*planner.Join]*sharedHashBuild, error) {
+func prebuildSharedHashJoins(ctx *Context, plan optimizer.Node, buildChild func() (Operator, error)) (map[*optimizer.Join]*sharedHashBuild, error) {
 	// Decide from the PLAN, before building anything. An earlier cut built the
 	// tree unconditionally and then looked for joins in it, which called the
 	// Gather's child-builder one extra time — harmless for the production
 	// builder (a pure Build(p.Child)) but not for any builder that counts its
 	// invocations, as several tests legitimately do.
-	if !planner.HasShareableHashJoin(plan) {
+	if !optimizer.HasShareableHashJoin(plan) {
 		return nil, nil
 	}
 	tree, err := buildChild()
@@ -153,7 +153,7 @@ func prebuildSharedHashJoins(ctx *Context, plan planner.Node, buildChild func() 
 		return nil, nil
 	}
 
-	out := make(map[*planner.Join]*sharedHashBuild, len(joins))
+	out := make(map[*optimizer.Join]*sharedHashBuild, len(joins))
 	for _, j := range joins {
 		j.ctx = ctx
 		// M0127-P3.4: decline the SHARE, not the SPILL.
@@ -222,7 +222,7 @@ func sharedBuildWouldSpill(ctx *Context, j *joinOp) bool {
 func collectShareableJoins(op Operator, out *[]*joinOp) {
 	switch x := op.(type) {
 	case *joinOp:
-		if x.plan == nil || x.plan.Algo != planner.JoinAlgoHash || x.plan.Lateral {
+		if x.plan == nil || x.plan.Algo != optimizer.JoinAlgoHash || x.plan.Lateral {
 			return
 		}
 		*out = append(*out, x)
@@ -254,7 +254,7 @@ func collectShareableJoins(op Operator, out *[]*joinOp) {
 // only difference is the row source (channel vs. child operator tree).
 type channelSource struct {
 	ch     <-chan []Row
-	schema planner.Schema
+	schema optimizer.Schema
 	batch  []Row
 	idx    int
 }
@@ -266,7 +266,7 @@ func (s *channelSource) Close() error {
 	}
 	return nil
 }
-func (s *channelSource) Schema() planner.Schema { return s.schema }
+func (s *channelSource) Schema() optimizer.Schema { return s.schema }
 
 func (s *channelSource) Next() (TupleSlot, error) {
 	for s.idx >= len(s.batch) {
@@ -285,12 +285,12 @@ func (s *channelSource) Next() (TupleSlot, error) {
 // extractSeqScanFromPlan returns the *planner.SeqScan at the root of a plan
 // subtree, unwrapping a single Filter if present. Returns nil when the subtree
 // is not a parallel-scannable shape (e.g. IndexScan, join, subquery).
-func extractSeqScanFromPlan(node planner.Node) *planner.SeqScan {
+func extractSeqScanFromPlan(node optimizer.Node) *optimizer.SeqScan {
 	switch n := node.(type) {
-	case *planner.SeqScan:
+	case *optimizer.SeqScan:
 		return n
-	case *planner.Filter:
-		if s, ok := n.Child.(*planner.SeqScan); ok {
+	case *optimizer.Filter:
+		if s, ok := n.Child.(*optimizer.SeqScan); ok {
 			return s
 		}
 	}
@@ -310,10 +310,10 @@ func extractSeqScanFromPlan(node planner.Node) *planner.SeqScan {
 // The function never mutates join state.
 func (o *joinOp) parallelBuildEligible(ctx *Context, buildLeft bool) bool {
 	// Rule 1: must be shareable (P8 eligibility).
-	if o.plan.Type == planner.JoinTypeFull || o.plan.Type == planner.JoinTypeRight {
+	if o.plan.Type == optimizer.JoinTypeFull || o.plan.Type == optimizer.JoinTypeRight {
 		return false
 	}
-	if o.plan.Type == planner.JoinTypeLeft && buildLeft {
+	if o.plan.Type == optimizer.JoinTypeLeft && buildLeft {
 		// LEFT join with build on the left side: the probe (right) would
 		// carry the outer — wrong shape, declined.
 		return false
@@ -401,9 +401,9 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 	// Pre-allocate arenas and worker contexts. mctx.Acquire is NOT
 	// goroutine-safe (appends to parent.children without synchronisation).
 	var workerCtxs []*Context
-	var arenas []*mctx.Context
+	var arenas []*mmgr.Context
 	for i := 0; i < maxProducers; i++ {
-		arena := mctx.Acquire(ctx.Mctx, mctx.KindStmt)
+		arena := mmgr.Acquire(ctx.Mctx, mmgr.KindStmt)
 		arenas = append(arenas, arena)
 		workerCtxs = append(workerCtxs, NewWorkerContext(ctx, arena, group.Context()))
 	}

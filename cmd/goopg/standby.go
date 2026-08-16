@@ -22,11 +22,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/goopg/goopg/internal/config"
+	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/initdb"
-	"github.com/goopg/goopg/internal/server"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/postmaster"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // drainPollInterval is how often Promote checks the replayer's
@@ -64,7 +64,7 @@ type standbyController struct {
 	receiverDone   chan struct{}
 	replayerCancel context.CancelFunc
 	replayerDone   chan struct{}
-	replayer       *wal.StreamReplayer
+	replayer       *xlog.StreamReplayer
 
 	// signalCancel cancels the promote.signal poller goroutine.
 	// Close cancels it explicitly; a successful Promote also
@@ -87,7 +87,7 @@ type standbyController struct {
 // cancelling it (e.g. SIGTERM) tears down both goroutines via
 // Close. registry supplies the GUC values the receiver needs
 // (`primary_conninfo` and friends).
-func startStandby(parent context.Context, rt *initdb.Runtime, registry *config.Registry, logger *slog.Logger) *standbyController {
+func startStandby(parent context.Context, rt *initdb.Runtime, registry *misc.Registry, logger *slog.Logger) *standbyController {
 	rcvCtx, rcvCancel := context.WithCancel(parent)
 	rplCtx, rplCancel := context.WithCancel(parent)
 	sigCtx, sigCancel := context.WithCancel(parent)
@@ -127,7 +127,7 @@ func startStandby(parent context.Context, rt *initdb.Runtime, registry *config.R
 	return sc
 }
 
-func standbyApplyLSNFunc(replayer *wal.StreamReplayer) func() uint64 {
+func standbyApplyLSNFunc(replayer *xlog.StreamReplayer) func() uint64 {
 	if replayer == nil {
 		return nil
 	}
@@ -287,16 +287,16 @@ func (sc *standbyController) finalizePromotion() error {
 			endLSN = sc.rt.WAL.WrittenLSN()
 		}
 
-		prev, err := wal.ReadHistory(walDir, oldTLI)
+		prev, err := xlog.ReadHistory(walDir, oldTLI)
 		if err != nil {
 			return fmt.Errorf("promote: read prior history: %w", err)
 		}
-		entries := append(prev, wal.TimelineHistoryEntry{
+		entries := append(prev, xlog.TimelineHistoryEntry{
 			TLI:       oldTLI,
 			SwitchLSN: endLSN,
 			Reason:    "no recovery target specified",
 		})
-		if err := wal.WriteHistory(walDir, newTLI, entries); err != nil {
+		if err := xlog.WriteHistory(walDir, newTLI, entries); err != nil {
 			return fmt.Errorf("promote: write timeline history: %w", err)
 		}
 		if err := initdb.WriteTimelineID(sc.rt.DataDir, newTLI); err != nil {
@@ -317,7 +317,7 @@ func (sc *standbyController) finalizePromotion() error {
 		}
 		sc.logger.Info("promote: timeline bumped",
 			"old_tli", oldTLI, "new_tli", newTLI, "switch_lsn", endLSN,
-			"history_file", filepath.Join(walDir, wal.TimelineHistoryFileName(newTLI)))
+			"history_file", filepath.Join(walDir, xlog.TimelineHistoryFileName(newTLI)))
 	}
 
 	if err := initdb.RemoveStandbySignal(sc.rt.DataDir); err != nil {
@@ -440,16 +440,16 @@ func promoteAfterRecovery(rt *initdb.Runtime, logger *slog.Logger) error {
 		endLSN = rt.WAL.WrittenLSN()
 	}
 
-	prev, err := wal.ReadHistory(walDir, oldTLI)
+	prev, err := xlog.ReadHistory(walDir, oldTLI)
 	if err != nil {
 		return fmt.Errorf("promote after recovery: read prior history: %w", err)
 	}
-	entries := append(prev, wal.TimelineHistoryEntry{
+	entries := append(prev, xlog.TimelineHistoryEntry{
 		TLI:       oldTLI,
 		SwitchLSN: endLSN,
 		Reason:    "archive recovery complete",
 	})
-	if err := wal.WriteHistory(walDir, newTLI, entries); err != nil {
+	if err := xlog.WriteHistory(walDir, newTLI, entries); err != nil {
 		return fmt.Errorf("promote after recovery: write timeline history: %w", err)
 	}
 	if err := initdb.WriteTimelineID(rt.DataDir, newTLI); err != nil {
@@ -467,7 +467,7 @@ func promoteAfterRecovery(rt *initdb.Runtime, logger *slog.Logger) error {
 	}
 	logger.Info("archive recovery promotion complete",
 		"old_tli", oldTLI, "new_tli", newTLI, "switch_lsn", endLSN,
-		"history_file", filepath.Join(walDir, wal.TimelineHistoryFileName(newTLI)))
+		"history_file", filepath.Join(walDir, xlog.TimelineHistoryFileName(newTLI)))
 	return nil
 }
 
@@ -477,6 +477,6 @@ func promoteAfterRecovery(rt *initdb.Runtime, logger *slog.Logger) error {
 // them) but moving things around in a future refactor could quietly
 // drop an import. Keeping the alias barrier explicit avoids that
 // surprise.
-var _ server.Config
-var _ = wal.DefaultSegmentSize
+var _ postmaster.Config
+var _ = xlog.DefaultSegmentSize
 var _ = walDirFor

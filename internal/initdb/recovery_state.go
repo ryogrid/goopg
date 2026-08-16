@@ -7,7 +7,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/control"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // startupRecoveryDecision is what Open learns from pg_control before it
@@ -156,7 +156,7 @@ func clearRelcacheInitFiles(dataDir string) {
 // A failure here is logged rather than fatal: replay itself already
 // succeeded and the data files are consistent, so refusing to start would
 // deny service over bookkeeping that the next checkpoint redoes anyway.
-func endOfRecoveryCheckpoint(cp *wal.Checkpointer, dataDir string) {
+func endOfRecoveryCheckpoint(cp *xlog.Checkpointer, dataDir string) {
 	if cp == nil {
 		return
 	}

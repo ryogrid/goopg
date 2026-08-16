@@ -18,7 +18,7 @@ import (
 
 	"github.com/goopg/goopg/internal/testutil/cluster"
 	"github.com/goopg/goopg/internal/testutil/replcluster"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // TestPort_Recovery001StreamRep ports postgres/src/test/recovery/t/001_stream_rep.pl
@@ -176,16 +176,16 @@ func TestPort_Recovery019ReplslotLimit(t *testing.T) {
 
 	// Create physical replication slots on the (stopped) server's data dir.
 	// Mirrors upstream's pg_create_physical_replication_slot() calls.
-	slots, err := wal.OpenSlots(c.DataDir())
+	slots, err := xlog.OpenSlots(c.DataDir())
 	if err != nil {
 		t.Fatalf("OpenSlots: %v", err)
 	}
 	const slotA = "rep_slot_a"
 	const slotB = "rep_slot_b"
-	if _, err := slots.Create(slotA, wal.SlotPhysical, 0); err != nil {
+	if _, err := slots.Create(slotA, xlog.SlotPhysical, 0); err != nil {
 		t.Fatalf("Create %q: %v", slotA, err)
 	}
-	if _, err := slots.Create(slotB, wal.SlotPhysical, 0); err != nil {
+	if _, err := slots.Create(slotB, xlog.SlotPhysical, 0); err != nil {
 		t.Fatalf("Create %q: %v", slotB, err)
 	}
 
@@ -230,7 +230,7 @@ func TestPort_Recovery038SaveLogicalSlots(t *testing.T) {
 	}
 
 	// Create logical slot on the (stopped) data dir.
-	slots, err := wal.OpenSlots(c.DataDir())
+	slots, err := xlog.OpenSlots(c.DataDir())
 	if err != nil {
 		t.Fatalf("OpenSlots: %v", err)
 	}
@@ -368,12 +368,12 @@ func TestPort_Recovery047CheckpointPhysicalSlot(t *testing.T) {
 	}
 
 	// Create physical slot on the (stopped) data dir.
-	slots, err := wal.OpenSlots(c.DataDir())
+	slots, err := xlog.OpenSlots(c.DataDir())
 	if err != nil {
 		t.Fatalf("OpenSlots: %v", err)
 	}
 	const physSlot = "phys_slot_ckpt"
-	if _, err := slots.Create(physSlot, wal.SlotPhysical, 0); err != nil {
+	if _, err := slots.Create(physSlot, xlog.SlotPhysical, 0); err != nil {
 		t.Fatalf("Create physical slot: %v", err)
 	}
 

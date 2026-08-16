@@ -13,7 +13,7 @@ package executor
 import (
 	"testing"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 func hashFixture(t *testing.T) (*Context, func()) {
@@ -42,8 +42,8 @@ func hashFixture(t *testing.T) (*Context, func()) {
 // Returns the hashed-path rows.
 func runBothHashPaths(t *testing.T, ctx *Context, sql string) []Row {
 	t.Helper()
-	planner.SetSubqueryUnnestEnabled(false)
-	defer planner.SetSubqueryUnnestEnabled(true)
+	optimizer.SetSubqueryUnnestEnabled(false)
+	defer optimizer.SetSubqueryUnnestEnabled(true)
 
 	SetHashedSubPlanEnabled(true)
 	defer SetHashedSubPlanEnabled(true) // package default
@@ -110,8 +110,8 @@ func TestHashedInProbeActuallyFires(t *testing.T) {
 	ctx, cleanup := hashFixture(t)
 	defer cleanup()
 
-	planner.SetSubqueryUnnestEnabled(false)
-	defer planner.SetSubqueryUnnestEnabled(true)
+	optimizer.SetSubqueryUnnestEnabled(false)
+	defer optimizer.SetSubqueryUnnestEnabled(true)
 	SetHashedSubPlanEnabled(true)
 
 	runQuery(t, ctx, "SELECT a FROM ht1 WHERE b IN (SELECT b FROM ht2) ORDER BY a")
@@ -179,8 +179,8 @@ func TestScopedCacheDepthConsistency(t *testing.T) {
 	ctx, cleanup := hashFixture(t)
 	defer cleanup()
 
-	planner.SetSubqueryUnnestEnabled(false)
-	defer planner.SetSubqueryUnnestEnabled(true)
+	optimizer.SetSubqueryUnnestEnabled(false)
+	defer optimizer.SetSubqueryUnnestEnabled(true)
 
 	// One statement, TWO scoped non-correlated sublinks (IN + EXISTS):
 	// they share the scoped store and previously ping-pong-cleared it.
@@ -190,9 +190,9 @@ func TestScopedCacheDepthConsistency(t *testing.T) {
 	var inStat, existsStat *SubPlanSiteStats
 	for e, s := range ctx.SubPlanStats {
 		switch e.(type) {
-		case *planner.InExpr:
+		case *optimizer.InExpr:
 			inStat = s
-		case *planner.ExistsExpr:
+		case *optimizer.ExistsExpr:
 			existsStat = s
 		}
 	}

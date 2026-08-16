@@ -5,9 +5,9 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/executor"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // txnConn simulates a single client connection with a persistent BasicSession.
@@ -42,7 +42,7 @@ func (tc *txnConn) run(sql string) {
 	if len(stmts) != 1 {
 		tc.t.Fatalf("expected 1 stmt, got %d", len(stmts))
 	}
-	plan, err := planner.Plan(stmts[0], tc.rt.Catalog)
+	plan, err := optimizer.Plan(stmts[0], tc.rt.Catalog)
 	if err != nil {
 		tc.t.Fatalf("plan %q: %v", sql, err)
 	}
@@ -53,15 +53,15 @@ func (tc *txnConn) run(sql string) {
 
 	inExplicitBefore := tc.sess.InExplicitTransaction()
 
-	var tx mvcc.Transaction
-	var snap mvcc.Snapshot
-	var implicitTx mvcc.Transaction // only set when !inExplicitBefore
+	var tx transam.Transaction
+	var snap transam.Snapshot
+	var implicitTx transam.Transaction // only set when !inExplicitBefore
 
 	if inExplicitBefore {
 		tx, snap, _ = tc.sess.CurrentTransaction()
 	} else {
 		// Create an implicit tx for this statement.
-		tx, err = tc.rt.TxnMgr.Begin(mvcc.IsolationReadCommitted)
+		tx, err = tc.rt.TxnMgr.Begin(transam.IsolationReadCommitted)
 		if err != nil {
 			tc.t.Fatalf("Begin: %v", err)
 		}

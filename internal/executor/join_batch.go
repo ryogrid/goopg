@@ -40,7 +40,7 @@ import (
 	"math/bits"
 
 	"github.com/goopg/goopg/internal/hashsize"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // maxJoinBatches caps nbatch growth. Two independent reasons to have a cap:
@@ -172,12 +172,12 @@ type HashJoinStats struct {
 
 // hashJoinStat returns the instrumentation sink for one hash-join plan node,
 // creating it on first use. Mirrors Context.memoizeStat.
-func (c *Context) hashJoinStat(j *planner.Join) *HashJoinStats {
+func (c *Context) hashJoinStat(j *optimizer.Join) *HashJoinStats {
 	if c == nil || j == nil {
 		return nil
 	}
 	if c.HashJoinStats == nil {
-		c.HashJoinStats = make(map[*planner.Join]*HashJoinStats)
+		c.HashJoinStats = make(map[*optimizer.Join]*HashJoinStats)
 	}
 	st, ok := c.HashJoinStats[j]
 	if !ok {
@@ -247,12 +247,12 @@ func (o *joinOp) joinBatchEligible() bool {
 		return false
 	}
 	switch o.plan.Type {
-	case planner.JoinTypeInner, planner.JoinTypeSemi, planner.JoinTypeAnti:
+	case optimizer.JoinTypeInner, optimizer.JoinTypeSemi, optimizer.JoinTypeAnti:
 		// NullAware (NOT IN) rides along: its two short-circuits read the
 		// build-global counters above and fire before nextLazy probes
 		// anything, so they are unaffected by how the build was partitioned.
 		return true
-	case planner.JoinTypeLeft, planner.JoinTypeRight, planner.JoinTypeFull:
+	case optimizer.JoinTypeLeft, optimizer.JoinTypeRight, optimizer.JoinTypeFull:
 		// M0127-P4.2 (07 §3): every outer-join orientation batches now. The
 		// probe-fill half was always per-row; the build-fill half is per-batch
 		// because the sweep runs while that batch's table is still resident
@@ -270,7 +270,7 @@ func (o *joinOp) joinBatchEligible() bool {
 // as-is under ANTI. Skipping it loses rows silently, which is exactly the
 // failure mode 06 §2.3 warns "the SF0.5 gate would catch only late".
 func (o *joinOp) probeFillsUnmatched() bool {
-	if o.plan.Type == planner.JoinTypeAnti {
+	if o.plan.Type == optimizer.JoinTypeAnti {
 		return true
 	}
 	// M0127-P4.2: the outer-join half is now one shared decision (07 §3), so
@@ -290,7 +290,7 @@ func (o *joinOp) buildFillsUnmatched() bool {
 // newHashBatchState installs batching for a build whose geometry came out
 // multi-batch. buildIsLeft says which side the build drains, so a reloaded row
 // can have its key re-evaluated exactly the way the original insert did.
-func newHashBatchState(ctx *Context, plan *planner.Join, sizing hashsize.Sizing, buildIsLeft bool) *hashBatchState {
+func newHashBatchState(ctx *Context, plan *optimizer.Join, sizing hashsize.Sizing, buildIsLeft bool) *hashBatchState {
 	nbatch := sizing.NBatch
 	if nbatch > maxJoinBatches {
 		nbatch = maxJoinBatches
@@ -665,7 +665,7 @@ type batchReplayOp struct {
 }
 
 func (op *batchReplayOp) Open(*Context) error    { return nil }
-func (op *batchReplayOp) Schema() planner.Schema { return nil }
+func (op *batchReplayOp) Schema() optimizer.Schema { return nil }
 
 func (op *batchReplayOp) Next() (TupleSlot, error) {
 	if op.r == nil {

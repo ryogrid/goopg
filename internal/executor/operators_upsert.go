@@ -6,13 +6,13 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/lockmgr"
-	"github.com/goopg/goopg/internal/multixact"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/storage/lmgr"
+	"github.com/goopg/goopg/internal/access/transam/multixact"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -61,7 +61,7 @@ import (
 //     M0017-0003 inherits — non-arbiter indexes are populated via
 //     CREATE INDEX backfill.
 type upsertOp struct {
-	plan         *planner.Insert
+	plan         *optimizer.Insert
 	ctx          *Context
 	child        Operator
 	rowsAffected int64
@@ -76,11 +76,11 @@ type upsertOp struct {
 	// (the bare DO NOTHING form). For partitioned targets, this
 	// is swapped per-row to point at the routed leaf partition's
 	// matching arbiter index (M0100-0005t).
-	arbiterTree *btree.BTree
+	arbiterTree *nbtree.BTree
 	// leafTrees caches per-leaf-partition arbiter btree handles so
 	// multi-row UPSERTs over the same partition reuse a single
 	// open tree.  Keyed by leaf table OID.  M0100-0005t.
-	leafTrees map[uint32]*btree.BTree
+	leafTrees map[uint32]*nbtree.BTree
 	// writtenPtrs tracks heap ItemPointers written by this statement
 	// (via applyInsert or applyUpdate).  When a subsequent row in the
 	// same multi-row INSERT conflicts with a pointer in this set, the
@@ -106,11 +106,11 @@ type upsertOp struct {
 // upstream).
 func (o *upsertOp) RowsAffected() int64 { return o.rowsAffected }
 
-func newUpsertOp(p *planner.Insert, child Operator) *upsertOp {
+func newUpsertOp(p *optimizer.Insert, child Operator) *upsertOp {
 	return &upsertOp{plan: p, child: child}
 }
 
-func (o *upsertOp) Schema() planner.Schema {
+func (o *upsertOp) Schema() optimizer.Schema {
 	if len(o.plan.Returning) > 0 {
 		return o.plan.ReturningSchema
 	}
@@ -142,7 +142,7 @@ func (o *upsertOp) Open(ctx *Context) error {
 	o.ctx = ctx
 
 	rel := ctx.Catalog.RelFileNode(o.plan.Table)
-	if err := ctx.acquireRelLock(rel, lockmgr.RowExclusiveLock); err != nil {
+	if err := ctx.acquireRelLock(rel, lmgr.RowExclusiveLock); err != nil {
 		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 			ee.Pos = o.plan.Pos()
 		}
@@ -338,7 +338,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 			}
 		}
 		switch o.plan.OnConflict.Action {
-		case planner.OnConflictActionNothing:
+		case optimizer.OnConflictActionNothing:
 			// PostgreSQL's conflict-nothing path evaluates the arbiter expression
 			// twice: once as ExecBuildArbiterKey and once as the btree-insert
 			// expression evaluation inside ExecCheckIndexConstraints. Both produce
@@ -351,7 +351,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 				}
 			}
 			// Skip silently — RowsAffected does NOT bump.
-		case planner.OnConflictActionUpdate:
+		case optimizer.OnConflictActionUpdate:
 			// ExecBuildArbiterKey equivalent: re-evaluate the arbiter expression
 			// once at DO UPDATE entry. For expression-based arbiters this produces
 			// 2 NOTICEs (blurt_and_lock_* tests). For column-based arbiters it is a
@@ -429,7 +429,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 							return nil, werr
 						}
 					}
-					if isInFlightInsert && o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
+					if isInFlightInsert && o.ctx.Tx.Isolation != transam.IsolationReadCommitted {
 						if o.ctx.TxnMgr != nil && !o.ctx.TxnMgr.HasAbortedXID(inProgressXID) {
 							return nil, &ExecError{
 								Code:    "40001",
@@ -561,7 +561,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 // arbiter index (the unique/primary index whose column list matches
 // o.plan.OnConflict.ArbiterIndex).  Returns (nil, nil, nil) when the
 // row does not map to any partition.  M0100-0005t.
-func (o *upsertOp) routeAndOpenLeaf(inserted Row) (*catalog.Table, *btree.BTree, error) {
+func (o *upsertOp) routeAndOpenLeaf(inserted Row) (*catalog.Table, *nbtree.BTree, error) {
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
 		return nil, nil, nil
@@ -574,7 +574,7 @@ func (o *upsertOp) routeAndOpenLeaf(inserted Row) (*catalog.Table, *btree.BTree,
 		return nil, nil, nil
 	}
 	if o.leafTrees == nil {
-		o.leafTrees = make(map[uint32]*btree.BTree)
+		o.leafTrees = make(map[uint32]*nbtree.BTree)
 	}
 	if tree, hit := o.leafTrees[leaf.OID]; hit {
 		return leaf, tree, nil
@@ -821,7 +821,7 @@ func (o *upsertOp) probeArbiterWaiting(rel storage.RelFileNode, cols []catalog.C
 		// silently proceeding with a duplicate or silently skipping.
 		// Case 2 (in-flight delete on a visible row) does NOT raise —
 		// the deletion clears the apparent conflict, INSERT proceeds.
-		if isInFlightInsert && o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
+		if isInFlightInsert && o.ctx.Tx.Isolation != transam.IsolationReadCommitted {
 			if o.ctx.TxnMgr != nil && !o.ctx.TxnMgr.HasAbortedXID(inProgressXID) {
 				return nil, storage.ItemPointer{}, nil, false, &ExecError{
 					Code:    "40001",
@@ -1143,7 +1143,7 @@ func (o *upsertOp) applyUpdate(rel storage.RelFileNode, tbl *catalog.Table, cols
 // FOR KEY SHARE. M0118-0003 (tuplelock-partition).
 func (o *upsertOp) onConflictUpdateTouchesKeyColumn() bool {
 	oc := o.plan.OnConflict
-	if oc == nil || oc.Action != planner.OnConflictActionUpdate || len(oc.UpdateSet) == 0 {
+	if oc == nil || oc.Action != optimizer.OnConflictActionUpdate || len(oc.UpdateSet) == 0 {
 		return false
 	}
 	tbl := o.plan.Table
@@ -1521,7 +1521,7 @@ func (o *upsertOp) evalUpdate(existing Row, inserted Row) (Row, bool, error) {
 // arbiters are supported by concatenating per-column encodings.
 // For expression-based arbiter columns (ArbiterColumns[i] == -1),
 // the expression in ArbiterExprs[i] is evaluated against row.
-func encodeArbiterKey(ctx *Context, oc *planner.OnConflictPlan, tbl *catalog.Table, row Row, pos int) ([]byte, error) {
+func encodeArbiterKey(ctx *Context, oc *optimizer.OnConflictPlan, tbl *catalog.Table, row Row, pos int) ([]byte, error) {
 	if oc.ArbiterIndex == nil || len(oc.ArbiterColumns) == 0 {
 		return nil, nil
 	}
@@ -1627,13 +1627,13 @@ func encodeArbiterKey(ctx *Context, oc *planner.OnConflictPlan, tbl *catalog.Tab
 //
 // Returns nil for a kind with no btree encoding; callers treat that as
 // "row not indexable" rather than an error.
-func encodeArbiterExprKey(ctx *Context, v Datum, keyExpr planner.Expr, pos int) []byte {
+func encodeArbiterExprKey(ctx *Context, v Datum, keyExpr optimizer.Expr, pos int) []byte {
 	if exprKeyIsFloat(keyExpr) {
 		f, _, ok := datumToFloat64ForKey(v)
 		if !ok {
 			return nil
 		}
-		return btree.EncodeFloat8(f)
+		return nbtree.EncodeFloat8(f)
 	}
 	if et, ok := exprKeyEnumType(ctx, keyExpr); ok {
 		order, ok := enumSortOrderForKey(et, v)
@@ -1643,26 +1643,26 @@ func encodeArbiterExprKey(ctx *Context, v Datum, keyExpr planner.Expr, pos int) 
 			// kind the encoder has no arm for.
 			return nil
 		}
-		return btree.EncodeFloat8(order)
+		return nbtree.EncodeFloat8(order)
 	}
 	switch v.Kind {
 	case KindString:
-		return btree.EncodeVarchar([]byte(v.StringValue()))
+		return nbtree.EncodeVarchar([]byte(v.StringValue()))
 	case KindInt:
-		return btree.EncodeInt8(v.Int)
+		return nbtree.EncodeInt8(v.Int)
 	case KindNumeric:
-		return btree.EncodeNumericKey(numericMant(v), v.Scale)
+		return nbtree.EncodeNumericKey(numericMant(v), v.Scale)
 	case KindTime:
-		return btree.EncodeTimestamp(v.TimeValue().Sub(pgEpoch).Microseconds())
+		return nbtree.EncodeTimestamp(v.TimeValue().Sub(pgEpoch).Microseconds())
 	case KindBool:
 		if v.BoolValue() {
-			return btree.EncodeInt8(1)
+			return nbtree.EncodeInt8(1)
 		}
-		return btree.EncodeInt8(0)
+		return nbtree.EncodeInt8(0)
 	case KindEnum:
-		return btree.EncodeFloat8(v.EnumSortOrder())
+		return nbtree.EncodeFloat8(v.EnumSortOrder())
 	case KindBytes:
-		return btree.EncodeVarchar(v.BytesValue())
+		return nbtree.EncodeVarchar(v.BytesValue())
 	}
 	return nil
 }
@@ -1673,11 +1673,11 @@ func encodeArbiterExprKey(ctx *Context, v Datum, keyExpr planner.Expr, pos int) 
 // known to be float" and leaves the kind dispatch in charge — the pre-M0119-0006
 // behaviour — so an expression whose type goopg cannot resolve is never made
 // worse by this check.
-func exprKeyIsFloat(keyExpr planner.Expr) bool {
+func exprKeyIsFloat(keyExpr optimizer.Expr) bool {
 	if keyExpr == nil {
 		return false
 	}
-	t, ok := planner.ExprResultType(keyExpr)
+	t, ok := optimizer.ExprResultType(keyExpr)
 	return ok && !t.IsArray && isFloat8Type(t.Name)
 }
 
@@ -1692,7 +1692,7 @@ func exprKeyIsFloat(keyExpr planner.Expr) bool {
 // whether that name is an enum. exactTypeOID deliberately refuses to resolve
 // non-builtin type names, so a FuncCall *over* an enum argument still declines —
 // conservative in the same direction.
-func exprKeyEnumType(ctx *Context, keyExpr planner.Expr) (*catalog.EnumType, bool) {
+func exprKeyEnumType(ctx *Context, keyExpr optimizer.Expr) (*catalog.EnumType, bool) {
 	if ctx == nil || keyExpr == nil {
 		return nil, false
 	}
@@ -1700,7 +1700,7 @@ func exprKeyEnumType(ctx *Context, keyExpr planner.Expr) (*catalog.EnumType, boo
 	if !ok || im == nil {
 		return nil, false
 	}
-	t, ok := planner.ExprResultType(keyExpr)
+	t, ok := optimizer.ExprResultType(keyExpr)
 	if !ok || t.IsArray || t.Name == "" {
 		return nil, false
 	}

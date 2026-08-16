@@ -7,11 +7,11 @@ package executor
 // and similar patterns. M0096-0006.
 
 import (
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 type generateSeriesOp struct {
-	plan    *planner.GenerateSeries
+	plan    *optimizer.GenerateSeries
 	ctx     *Context
 	current int64
 	stop    int64
@@ -20,11 +20,11 @@ type generateSeriesOp struct {
 	done    bool
 }
 
-func newGenerateSeriesOp(p *planner.GenerateSeries) *generateSeriesOp {
+func newGenerateSeriesOp(p *optimizer.GenerateSeries) *generateSeriesOp {
 	return &generateSeriesOp{plan: p}
 }
 
-func (o *generateSeriesOp) Schema() planner.Schema { return o.plan.Output() }
+func (o *generateSeriesOp) Schema() optimizer.Schema { return o.plan.Output() }
 
 func (o *generateSeriesOp) Open(ctx *Context) error {
 	o.ctx = ctx
@@ -89,7 +89,7 @@ func (o *generateSeriesOp) Next() (TupleSlot, error) {
 // generateSubscriptsOp implements generate_subscripts(arr, dim[, rev]) SRF.
 // Returns integer subscripts 1..array_length(arr, 1) for dim=1.  M0097-0117.
 type generateSubscriptsOp struct {
-	plan    *planner.GenerateSubscripts
+	plan    *optimizer.GenerateSubscripts
 	ctx     *Context
 	current int64
 	stop    int64
@@ -98,11 +98,11 @@ type generateSubscriptsOp struct {
 	done    bool
 }
 
-func newGenerateSubscriptsOp(p *planner.GenerateSubscripts) *generateSubscriptsOp {
+func newGenerateSubscriptsOp(p *optimizer.GenerateSubscripts) *generateSubscriptsOp {
 	return &generateSubscriptsOp{plan: p}
 }
 
-func (o *generateSubscriptsOp) Schema() planner.Schema { return o.plan.Output() }
+func (o *generateSubscriptsOp) Schema() optimizer.Schema { return o.plan.Output() }
 
 func (o *generateSubscriptsOp) Open(ctx *Context) error {
 	o.ctx = ctx

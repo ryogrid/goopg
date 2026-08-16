@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -14,11 +14,11 @@ import (
 // includes it. It stands in for the TupleDesc-coupled index_form_tuple the SQL
 // surface supplies, letting the heap-walk skeleton be exercised in isolation.
 func includeAllFormer(keyLen int) HeapEntryFormer {
-	return func(tid storage.ItemPointer, tuple []byte) (btree.LeafEntry, bool, error) {
+	return func(tid storage.ItemPointer, tuple []byte) (nbtree.LeafEntry, bool, error) {
 		start := int(storage.SizeOfHeapTupleHeaderData)
 		end := min(start+keyLen, len(tuple))
 		key := append([]byte(nil), tuple[start:end]...)
-		return btree.LeafEntry{Key: key, TID: tid}, true, nil
+		return nbtree.LeafEntry{Key: key, TID: tid}, true, nil
 	}
 }
 
@@ -67,9 +67,9 @@ func TestCollectHeapIndexEntries_MultiBlockOrder(t *testing.T) {
 	// A former that records the TID and the length of bytes it received, so we
 	// can assert the heap-walk handed it the right tuple body.
 	var seenLens []int
-	form := func(tid storage.ItemPointer, tuple []byte) (btree.LeafEntry, bool, error) {
+	form := func(tid storage.ItemPointer, tuple []byte) (nbtree.LeafEntry, bool, error) {
 		seenLens = append(seenLens, len(tuple))
-		return btree.LeafEntry{Key: []byte{byte(tid.Block), byte(tid.Offset)}, TID: tid}, true, nil
+		return nbtree.LeafEntry{Key: []byte{byte(tid.Block), byte(tid.Offset)}, TID: tid}, true, nil
 	}
 
 	entries, err := CollectHeapIndexEntries(heapMapSource(pages), 2, form)
@@ -106,8 +106,8 @@ func TestCollectHeapIndexEntries_FormerExcludes(t *testing.T) {
 	addCleanTuple(t, p0, 16) // (0,3) keep
 	pages := map[storage.BlockNumber]storage.Page{0: p0}
 
-	form := func(tid storage.ItemPointer, _ []byte) (btree.LeafEntry, bool, error) {
-		return btree.LeafEntry{TID: tid}, tid.Offset != 2, nil
+	form := func(tid storage.ItemPointer, _ []byte) (nbtree.LeafEntry, bool, error) {
+		return nbtree.LeafEntry{TID: tid}, tid.Offset != 2, nil
 	}
 	entries, err := CollectHeapIndexEntries(heapMapSource(pages), 1, form)
 	if err != nil {
@@ -141,8 +141,8 @@ func TestCollectHeapIndexEntries_SkipsNonNormalItems(t *testing.T) {
 	storage.MustHeader(p).SetLower(uint16(storage.SizeOfPageHeaderData + 5*4))
 
 	pages := map[storage.BlockNumber]storage.Page{0: p}
-	form := func(tid storage.ItemPointer, _ []byte) (btree.LeafEntry, bool, error) {
-		return btree.LeafEntry{TID: tid}, true, nil
+	form := func(tid storage.ItemPointer, _ []byte) (nbtree.LeafEntry, bool, error) {
+		return nbtree.LeafEntry{TID: tid}, true, nil
 	}
 	entries, err := CollectHeapIndexEntries(heapMapSource(pages), 1, form)
 	if err != nil {
@@ -183,8 +183,8 @@ func TestCollectHeapIndexEntries_FormerErrorPropagates(t *testing.T) {
 	pages := map[storage.BlockNumber]storage.Page{0: p}
 
 	want := fmt.Errorf("boom")
-	form := func(storage.ItemPointer, []byte) (btree.LeafEntry, bool, error) {
-		return btree.LeafEntry{}, false, want
+	form := func(storage.ItemPointer, []byte) (nbtree.LeafEntry, bool, error) {
+		return nbtree.LeafEntry{}, false, want
 	}
 	_, err := CollectHeapIndexEntries(heapMapSource(pages), 1, form)
 	if err == nil {
@@ -238,7 +238,7 @@ func TestCollectHeapIndexEntries_ComposesWithProbeCore(t *testing.T) {
 	}
 
 	// A complete index: the same (key, TID) set. No tuple should be flagged.
-	indexEntries := append([]btree.LeafEntry(nil), heapEntries...)
+	indexEntries := append([]nbtree.LeafEntry(nil), heapEntries...)
 	const seed = 0x5eed
 	if reports := VerifyBtreeHeapAllIndexed(indexEntries, heapEntries, "i", "t", seed); len(reports) != 0 {
 		t.Fatalf("complete index produced %d false reports: %+v", len(reports), reports)
@@ -246,7 +246,7 @@ func TestCollectHeapIndexEntries_ComposesWithProbeCore(t *testing.T) {
 
 	// Drop the entry for heap tuple (1,1): it must now be reported as lacking a
 	// matching index tuple.
-	var pruned []btree.LeafEntry
+	var pruned []nbtree.LeafEntry
 	for _, e := range indexEntries {
 		if e.TID == (storage.ItemPointer{Block: 1, Offset: 1}) {
 			continue

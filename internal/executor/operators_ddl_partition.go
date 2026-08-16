@@ -10,7 +10,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1173,7 +1173,7 @@ func checkDefaultPartitionDataConflict(childName string, parent *catalog.Table, 
 	if err != nil || len(stmts) == 0 {
 		return nil
 	}
-	plan, err := planner.Plan(stmts[0], ctxPlanCatalog(ctx))
+	plan, err := optimizer.Plan(stmts[0], ctxPlanCatalog(ctx))
 	if err != nil {
 		return nil
 	}

@@ -26,16 +26,16 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/goopg/goopg/internal/auth"
+	"github.com/goopg/goopg/internal/libpq/auth"
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/config"
+	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/initdb"
-	"github.com/goopg/goopg/internal/multixact"
-	"github.com/goopg/goopg/internal/planner"
-	"github.com/goopg/goopg/internal/server"
+	"github.com/goopg/goopg/internal/access/transam/multixact"
+	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/postmaster"
 	"github.com/goopg/goopg/internal/storage"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 const usage = `goopg — a Go reimplementation of PostgreSQL.
@@ -294,7 +294,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	// shape (the M0054-0006a-pre input-IndexScan rewrite stays
 	// active — only the NestedLoopIndexJoin promotion is gated).
 	if v := os.Getenv("GOOPG_DISABLE_NLI"); v == "1" || v == "true" {
-		planner.SetNLIEnabled(false)
+		optimizer.SetNLIEnabled(false)
 		logger.Info("nestloop index join disabled via env", "var", "GOOPG_DISABLE_NLI")
 	}
 
@@ -371,7 +371,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	cfg := server.Config{
+	cfg := postmaster.Config{
 		Address: *addr,
 		Logger:  logger,
 		// GOOPG_LOG_STATEMENT enables per-statement query logging
@@ -387,7 +387,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	// (shared_buffers, etc.) are available before Open allocates the
 	// buffer pool. Without a config file this is just the seeded
 	// defaults; with one we apply the file's entries on top.
-	registry := config.BuildDefaultRegistry()
+	registry := misc.BuildDefaultRegistry()
 
 	// M0054-0006e-followup: bridge SQL `SET enable_nestloop_index =
 	// off|on` to the planner's process-global atomic kill-switch.
@@ -395,20 +395,20 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	// SET wins process-wide (matches the package-level `atomic.Bool`
 	// design).
 	registry.OnChange("enable_nestloop_index", func(value string) {
-		planner.SetNLIEnabled(value == "on" || value == "true" || value == "1")
+		optimizer.SetNLIEnabled(value == "on" || value == "true" || value == "1")
 	})
 	// S7: same bridge for `SET enable_memoize` — the upstream planner-method
 	// GUC now gates a real plan shape (Memoize under NLI) instead of being
 	// a registration-only no-op.
 	registry.OnChange("enable_memoize", func(value string) {
-		planner.SetMemoizeEnabled(value == "on" || value == "true" || value == "1")
+		optimizer.SetMemoizeEnabled(value == "on" || value == "true" || value == "1")
 	})
 	// S8 Slice 2a: same bridge for `SET enable_presorted_aggregate` — the
 	// upstream planner-method GUC now gates the presorted-aggregate rule
 	// (adjust_group_pathkeys_for_groupagg port) instead of being a
 	// registration-only no-op.
 	registry.OnChange("enable_presorted_aggregate", func(value string) {
-		planner.SetPresortedAggEnabled(value == "on" || value == "true" || value == "1")
+		optimizer.SetPresortedAggEnabled(value == "on" || value == "true" || value == "1")
 	})
 	// S8 Slice 2b: same bridge for `SET enable_hashagg` — when off, the
 	// hashed-aggregate strategy is disabled at cost time in PG
@@ -416,10 +416,10 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	// cost model, so the bridge gates the direct sorted-strategy rule
 	// (applyEnableHashAggRule) instead.
 	registry.OnChange("enable_hashagg", func(value string) {
-		planner.SetHashAggEnabled(value == "on" || value == "true" || value == "1")
+		optimizer.SetHashAggEnabled(value == "on" || value == "true" || value == "1")
 	})
 	if *confPath != "" {
-		entries, err := config.ParseConfigFile(*confPath)
+		entries, err := misc.ParseConfigFile(*confPath)
 		if err != nil {
 			fmt.Fprintf(stderr, "goopg start: %v\n", err)
 			return 1
@@ -736,7 +736,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	if rt != nil && rt.Checkpointer != nil {
 		registry := cfg.Registry
 		if registry == nil {
-			registry = config.BuildDefaultRegistry()
+			registry = misc.BuildDefaultRegistry()
 		}
 		if v, ok := registry.Get("checkpoint_timeout"); ok {
 			if secs, err := strconv.Atoi(v.Display()); err == nil && secs > 0 {
@@ -768,7 +768,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		// slog so retention events show up next to the rest of the
 		// startup chatter.
 		if rt.WAL != nil {
-			retainer := &wal.SlotAwareRetainer{
+			retainer := &xlog.SlotAwareRetainer{
 				Writer: rt.WAL,
 				Slots:  rt.Slots,
 				Logger: logger,
@@ -844,7 +844,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			}
 		} else {
 			logger.Info("archive recovery starting", "restore_command", restoreCmd)
-			if err := wal.RunArchiveRecovery(rt.StorageMgr, rt.DataDir, restoreCmd, 0); err != nil {
+			if err := xlog.RunArchiveRecovery(rt.StorageMgr, rt.DataDir, restoreCmd, 0); err != nil {
 				fmt.Fprintf(stderr, "goopg start: archive recovery: %v\n", err)
 				return 1
 			}
@@ -881,7 +881,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		cfg.IsStandby = func() bool { return sc.rt.Standby }
 	}
 
-	srv := server.New(cfg)
+	srv := postmaster.New(cfg)
 	runErr := srv.Run(ctx)
 	cpCancel()
 	if sc != nil {
@@ -912,7 +912,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 // would compound the corruption. The goroutine also exits when the
 // supplied context is cancelled (clean shutdown) or the writer
 // closes (process tear-down).
-func startStandbyReplayer(ctx context.Context, done chan struct{}, rt *initdb.Runtime, logger *slog.Logger) *wal.StreamReplayer {
+func startStandbyReplayer(ctx context.Context, done chan struct{}, rt *initdb.Runtime, logger *slog.Logger) *xlog.StreamReplayer {
 	// WrittenLSN() is the LSN of the last byte already written. The
 	// iterator's startLSN argument is the LSN of the next record's
 	// first byte (= writer's "tail" position). Anchoring at WrittenLSN
@@ -921,7 +921,7 @@ func startStandbyReplayer(ctx context.Context, done chan struct{}, rt *initdb.Ru
 	writtenLSN := rt.WAL.WrittenLSN()
 	iterStartLSN := writtenLSN + 1
 	walDir := filepath.Join(rt.DataDir, "pg_wal")
-	sr := wal.NewStreamReplayer(rt.StorageMgr, writtenLSN)
+	sr := xlog.NewStreamReplayer(rt.StorageMgr, writtenLSN)
 	// Wire MVCC visibility for hot-standby reads: when the primary
 	// commits a transaction, advance the standby's nextXID past the
 	// committed XID so snapshots taken on the standby see replayed
@@ -938,7 +938,7 @@ func startStandbyReplayer(ctx context.Context, done chan struct{}, rt *initdb.Ru
 	})
 	go func() {
 		defer close(done)
-		iter, err := wal.NewRecordIterator(rt.WAL, walDir, 0, iterStartLSN)
+		iter, err := xlog.NewRecordIterator(rt.WAL, walDir, 0, iterStartLSN)
 		if err != nil {
 			logger.Error("standby replay: iterator init failed", "err", err)
 			return
@@ -948,12 +948,12 @@ func startStandbyReplayer(ctx context.Context, done chan struct{}, rt *initdb.Ru
 			"start_lsn", iterStartLSN)
 		if err := sr.Run(ctx, iter); err != nil {
 			logger.Error("standby replay: stopped on error",
-				"event", wal.EventStandbyReplayError,
+				"event", xlog.EventStandbyReplayError,
 				"apply_lsn", sr.ApplyLSN(), "err", err)
 			return
 		}
 		logger.Info("standby replay: stopped",
-			"event", wal.EventStandbyReplayStopped,
+			"event", xlog.EventStandbyReplayStopped,
 			"apply_lsn", sr.ApplyLSN())
 	}()
 	return sr
@@ -970,7 +970,7 @@ func startStandbyReplayer(ctx context.Context, done chan struct{}, rt *initdb.Ru
 // is logged and the function returns without spawning — useful for
 // integration tests that exercise the standby-mode boot path
 // without an actual primary.
-func startWalreceiver(ctx context.Context, done chan struct{}, rt *initdb.Runtime, registry *config.Registry, logger *slog.Logger, applyLSNFunc func() uint64) {
+func startWalreceiver(ctx context.Context, done chan struct{}, rt *initdb.Runtime, registry *misc.Registry, logger *slog.Logger, applyLSNFunc func() uint64) {
 	conninfo := ""
 	slotName := ""
 	statusInterval := 10 * time.Second
@@ -1012,7 +1012,7 @@ func startWalreceiver(ctx context.Context, done chan struct{}, rt *initdb.Runtim
 			// our local WAL). Sending WrittenLSN itself would make the
 			// primary's iterator anchor inside the last-applied record
 			// and stream garbage.
-			rec, err := server.DialWalReceiver(ctx, server.WalReceiverConfig{
+			rec, err := postmaster.DialWalReceiver(ctx, postmaster.WalReceiverConfig{
 				PrimaryAddr:     addr,
 				User:            user,
 				SlotName:        slotName,
@@ -1028,7 +1028,7 @@ func startWalreceiver(ctx context.Context, done chan struct{}, rt *initdb.Runtim
 			})
 			if err != nil {
 				logger.Warn("walreceiver dial failed; will retry",
-					"event", wal.EventWalreceiverDialFailed,
+					"event", xlog.EventWalreceiverDialFailed,
 					"primary", addr, "err", err, "backoff", backoff)
 				select {
 				case <-ctx.Done():
@@ -1045,7 +1045,7 @@ func startWalreceiver(ctx context.Context, done chan struct{}, rt *initdb.Runtim
 			}
 			backoff = baseBackoff
 			logger.Info("walreceiver connected",
-				"event", wal.EventWalreceiverConnected,
+				"event", xlog.EventWalreceiverConnected,
 				"primary", addr, "slot", slotName,
 				"start_lsn", rt.WAL.WrittenLSN()+1)
 			runErr := rec.Run(ctx)
@@ -1056,11 +1056,11 @@ func startWalreceiver(ctx context.Context, done chan struct{}, rt *initdb.Runtim
 			}
 			if runErr != nil {
 				logger.Warn("walreceiver disconnect; will reconnect",
-					"event", wal.EventWalreceiverDisconnect,
+					"event", xlog.EventWalreceiverDisconnect,
 					"primary", addr, "apply_lsn", lastApplied, "err", runErr)
 			} else {
 				logger.Info("walreceiver disconnect (clean); will reconnect",
-					"event", wal.EventWalreceiverDisconnect,
+					"event", xlog.EventWalreceiverDisconnect,
 					"primary", addr, "apply_lsn", lastApplied)
 			}
 		}
@@ -1124,7 +1124,7 @@ func parsePrimaryConninfoFull(conninfo string) (addr, appName, user, sslmode str
 // boolGUC reads a boolean GUC by name, returning fallback when the
 // registry is nil, the variable isn't registered, or the value
 // can't be parsed.
-func boolGUC(registry *config.Registry, name string, fallback bool) bool {
+func boolGUC(registry *misc.Registry, name string, fallback bool) bool {
 	if registry == nil {
 		return fallback
 	}
@@ -1144,7 +1144,7 @@ func boolGUC(registry *config.Registry, name string, fallback bool) bool {
 // stringGUC reads a string-shaped GUC by name, returning fallback
 // when the registry is nil, the variable isn't registered, or its
 // Display value is empty.
-func stringGUC(registry *config.Registry, name string, fallback string) string {
+func stringGUC(registry *misc.Registry, name string, fallback string) string {
 	if registry == nil {
 		return fallback
 	}
@@ -1161,7 +1161,7 @@ func stringGUC(registry *config.Registry, name string, fallback string) string {
 // intGUC reads an int-shaped GUC by name, returning fallback when
 // the registry is nil, the variable isn't registered, or its
 // Display value isn't a valid integer.
-func intGUC(registry *config.Registry, name string, fallback int) int {
+func intGUC(registry *misc.Registry, name string, fallback int) int {
 	if registry == nil {
 		return fallback
 	}
@@ -1182,7 +1182,7 @@ func intGUC(registry *config.Registry, name string, fallback int) int {
 // default") if the GUC isn't present, isn't parseable, or yields a
 // non-positive count — the registry guarantees a value at boot, so
 // the fallback is purely defensive.
-func poolSlotsFromGUC(registry *config.Registry) int {
+func poolSlotsFromGUC(registry *misc.Registry) int {
 	if registry == nil {
 		return 0
 	}

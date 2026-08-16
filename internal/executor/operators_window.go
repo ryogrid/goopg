@@ -7,16 +7,16 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // windowOp is the Stage-A WindowAgg executor skeleton. It drains
 // child rows, sorts by PARTITION BY/ORDER BY, and appends one
 // placeholder column per planned window function.
 type windowOp struct {
-	plan   *planner.WindowAgg
+	plan   *optimizer.WindowAgg
 	child  Operator
-	schema planner.Schema
+	schema optimizer.Schema
 
 	ctx  *Context
 	rows []Row
@@ -40,7 +40,7 @@ type windowOp struct {
 	frameEndOffDatum   Datum
 }
 
-func newWindowOp(plan *planner.WindowAgg, child Operator) *windowOp {
+func newWindowOp(plan *optimizer.WindowAgg, child Operator) *windowOp {
 	return &windowOp{plan: plan, child: child, schema: plan.Output()}
 }
 
@@ -448,7 +448,7 @@ func isFrameAggWindowFunc(name string) bool {
 // hasFrameValueWindowFunc reports whether fns contains first_value,
 // last_value, nth_value, or cume_dist — functions that need the
 // default-frame end (peer-group boundary) computed per row.
-func hasFrameValueWindowFunc(fns []planner.WindowFunc) bool {
+func hasFrameValueWindowFunc(fns []optimizer.WindowFunc) bool {
 	for _, fn := range fns {
 		switch strings.ToLower(fn.Name) {
 		case "first_value", "last_value", "nth_value", "cume_dist":
@@ -481,7 +481,7 @@ func (o *windowOp) evalNtileFuncs(colBase, pStart, pEnd int) error {
 // in the last bucket. The bucket-count argument is evaluated once, from the
 // partition's first row, matching PostgreSQL's WinGetFuncArgCurrent-on-
 // first-call semantics.
-func (o *windowOp) evalNtileFunc(fn planner.WindowFunc, colIdx, pStart, pEnd int) error {
+func (o *windowOp) evalNtileFunc(fn optimizer.WindowFunc, colIdx, pStart, pEnd int) error {
 	total := int64(pEnd - pStart)
 	if total == 0 {
 		return nil
@@ -648,8 +648,8 @@ func (o *windowOp) evalExplicitFrameAggFuncs(aggHelper *aggregateOp, colBase, pS
 // min/max only) into the planner.AggregateCall shape applyAgg/finishAgg
 // expect, so window aggregates share the exact ordinary-aggregate
 // accumulator instead of a second implementation that could drift.
-func windowFuncToAggregateCall(fn planner.WindowFunc) planner.AggregateCall {
-	call := planner.AggregateCall{
+func windowFuncToAggregateCall(fn optimizer.WindowFunc) optimizer.AggregateCall {
+	call := optimizer.AggregateCall{
 		Name:            fn.Name,
 		Star:            fn.Star,
 		Type:            fn.Type,
@@ -689,7 +689,7 @@ func (o *windowOp) peerGroupBounds(pStart, pEnd int) ([]int, error) {
 // offset for exactly this reason: it's a constant for the whole
 // query, not a per-row value). label is "starting" or "ending" to
 // match nodeWindowAgg.c's exact error wording.
-func (o *windowOp) resolveFrameOffset(expr planner.Expr, label string) (int64, error) {
+func (o *windowOp) resolveFrameOffset(expr optimizer.Expr, label string) (int64, error) {
 	v, err := evalExpr(expr, nil, o.ctx)
 	if err != nil {
 		return 0, err
@@ -773,7 +773,7 @@ func (o *windowOp) frameBounds(pStart, pEnd, i int, groupBounds []int) (int, int
 
 // frameHasValueOffset reports whether either frame bound is a value
 // offset (n PRECEDING / n FOLLOWING).
-func frameHasValueOffset(fr *planner.WindowFrame) bool {
+func frameHasValueOffset(fr *optimizer.WindowFrame) bool {
 	return fr.StartKind == parser.FrameBoundOffsetPreceding ||
 		fr.StartKind == parser.FrameBoundOffsetFollowing ||
 		fr.EndKind == parser.FrameBoundOffsetPreceding ||
@@ -945,7 +945,7 @@ func (o *windowOp) rangePos() int {
 // resolveRangeOffset evaluates a RANGE frame offset once, keeping its native
 // type (numeric/float/interval), and enforces PG's non-null (22004) and
 // non-negative (22013) checks.
-func (o *windowOp) resolveRangeOffset(expr planner.Expr, label string) (Datum, error) {
+func (o *windowOp) resolveRangeOffset(expr optimizer.Expr, label string) (Datum, error) {
 	v, err := evalExpr(expr, nil, o.ctx)
 	if err != nil {
 		return Datum{}, err
@@ -1212,4 +1212,4 @@ func (o *windowOp) Close() error {
 	o.idx = 0
 	return o.child.Close()
 }
-func (o *windowOp) Schema() planner.Schema { return o.schema }
+func (o *windowOp) Schema() optimizer.Schema { return o.schema }

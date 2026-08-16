@@ -51,7 +51,7 @@ func TestExplainUnionAllRendersAppendWithBranches(t *testing.T) {
 		"EXPLAIN SELECT id FROM eso_a UNION ALL SELECT id FROM eso_b")
 
 	joined := strings.Join(lines, "\n")
-	if strings.Contains(joined, "planner.SetOp") {
+	if strings.Contains(joined, "optimizer.SetOp") {
 		t.Fatalf("EXPLAIN still prints the raw Go type name:\n%s", joined)
 	}
 	if !strings.Contains(lines[0], "Append") {

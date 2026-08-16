@@ -7,7 +7,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // M0125-0011 regression: a merge join's key is only the FIRST equality
@@ -29,19 +29,19 @@ import (
 // null-extend the rows that the joinqual rejected.
 
 // mergeResidualSide builds a Values node of two-column int rows.
-func mergeResidualSide(pairs ...[2]int64) *planner.Values {
-	rows := make([][]planner.Expr, 0, len(pairs))
+func mergeResidualSide(pairs ...[2]int64) *optimizer.Values {
+	rows := make([][]optimizer.Expr, 0, len(pairs))
 	for _, p := range pairs {
-		rows = append(rows, []planner.Expr{
-			&planner.IntegerConst{Value: p[0]},
-			&planner.IntegerConst{Value: p[1]},
+		rows = append(rows, []optimizer.Expr{
+			&optimizer.IntegerConst{Value: p[0]},
+			&optimizer.IntegerConst{Value: p[1]},
 		})
 	}
-	return &planner.Values{Rows: rows}
+	return &optimizer.Values{Rows: rows}
 }
 
-func mergeResidualColRef(idx int, name string) *planner.ColumnRef {
-	return &planner.ColumnRef{Index: idx, Name: name, Type: catalog.Type{Name: "int4"}}
+func mergeResidualColRef(idx int, name string) *optimizer.ColumnRef {
+	return &optimizer.ColumnRef{Index: idx, Name: name, Type: catalog.Type{Name: "int4"}}
 }
 
 // formatRows renders rows as "a,b,c,d" with NULLs as "" so expected
@@ -67,8 +67,8 @@ func TestExecMergeJoinAppliesResidualConjuncts(t *testing.T) {
 	left := mergeResidualSide([2]int64{1, 10}, [2]int64{1, 20}, [2]int64{2, 30})
 	right := mergeResidualSide([2]int64{1, 10}, [2]int64{1, 99}, [2]int64{3, 30})
 
-	keyEq := func() *planner.BinaryOp {
-		return &planner.BinaryOp{
+	keyEq := func() *optimizer.BinaryOp {
+		return &optimizer.BinaryOp{
 			Op:    parser.OpEq,
 			Left:  mergeResidualColRef(0, "a"),
 			Right: mergeResidualColRef(2, "a"),
@@ -76,20 +76,20 @@ func TestExecMergeJoinAppliesResidualConjuncts(t *testing.T) {
 	}
 	// ON l.a = r.a AND l.b = r.b — the second conjunct is the residual
 	// that used to be dropped.
-	twoConjunct := &planner.BinaryOp{
+	twoConjunct := &optimizer.BinaryOp{
 		Op:   parser.OpAnd,
 		Left: keyEq(),
-		Right: &planner.BinaryOp{
+		Right: &optimizer.BinaryOp{
 			Op:    parser.OpEq,
 			Left:  mergeResidualColRef(1, "b"),
 			Right: mergeResidualColRef(3, "b"),
 		},
 	}
 
-	build := func(jt planner.JoinType, pred planner.Expr) *planner.Join {
-		return &planner.Join{
+	build := func(jt optimizer.JoinType, pred optimizer.Expr) *optimizer.Join {
+		return &optimizer.Join{
 			Type:      jt,
-			Algo:      planner.JoinAlgoMerge,
+			Algo:      optimizer.JoinAlgoMerge,
 			Left:      left,
 			Right:     right,
 			Predicate: pred,
@@ -98,7 +98,7 @@ func TestExecMergeJoinAppliesResidualConjuncts(t *testing.T) {
 		}
 	}
 
-	run := func(t *testing.T, plan *planner.Join) []string {
+	run := func(t *testing.T, plan *optimizer.Join) []string {
 		t.Helper()
 		op, err := Build(plan)
 		if err != nil {
@@ -113,27 +113,27 @@ func TestExecMergeJoinAppliesResidualConjuncts(t *testing.T) {
 
 	cases := []struct {
 		name string
-		jt   planner.JoinType
+		jt   optimizer.JoinType
 		want []string
 	}{
 		{
 			name: "full",
-			jt:   planner.JoinTypeFull,
+			jt:   optimizer.JoinTypeFull,
 			want: []string{"1,10,1,10", "1,20,,", ",,1,99", "2,30,,", ",,3,30"},
 		},
 		{
 			name: "right",
-			jt:   planner.JoinTypeRight,
+			jt:   optimizer.JoinTypeRight,
 			want: []string{"1,10,1,10", ",,1,99", ",,3,30"},
 		},
 		{
 			name: "left",
-			jt:   planner.JoinTypeLeft,
+			jt:   optimizer.JoinTypeLeft,
 			want: []string{"1,10,1,10", "1,20,,", "2,30,,"},
 		},
 		{
 			name: "inner",
-			jt:   planner.JoinTypeInner,
+			jt:   optimizer.JoinTypeInner,
 			want: []string{"1,10,1,10"},
 		},
 	}
@@ -159,8 +159,8 @@ func TestExecMergeJoinAppliesResidualConjuncts(t *testing.T) {
 	// is the assertion that actually fails on the pre-fix executor —
 	// both sides returned the identical 6-row set.
 	t.Run("two_key_full_differs_from_single_key", func(t *testing.T) {
-		twoKey := run(t, build(planner.JoinTypeFull, twoConjunct))
-		singleKey := run(t, build(planner.JoinTypeFull, keyEq()))
+		twoKey := run(t, build(optimizer.JoinTypeFull, twoConjunct))
+		singleKey := run(t, build(optimizer.JoinTypeFull, keyEq()))
 		if len(singleKey) != 6 {
 			t.Fatalf("single-key FULL rows = %d, want 6 (guards the fixture): %v",
 				len(singleKey), singleKey)

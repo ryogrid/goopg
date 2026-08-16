@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/goopg/goopg/internal/config"
+	"github.com/goopg/goopg/internal/utils/misc"
 )
 
 // relCacheInitMu serializes relcache-init-file operations across goroutines.
@@ -88,7 +88,7 @@ func RelcacheInitFileRemoveAll(dataDir string) error {
 		if !allDigits(e.Name()) {
 			continue
 		}
-		note(removeInitFilesInDir(filepath.Join(tblspcDir, e.Name(), config.TablespaceVersionDirectory)))
+		note(removeInitFilesInDir(filepath.Join(tblspcDir, e.Name(), misc.TablespaceVersionDirectory)))
 	}
 	return firstErr
 }

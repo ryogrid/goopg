@@ -21,7 +21,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/control"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // pgControldataBin locates the real pg_controldata: PATH first, then the
@@ -241,7 +241,7 @@ func TestCheckpointerWritesLiveTimelineToPgControl(t *testing.T) {
 	// A private WAL dir: this test is about what reaches pg_control, and
 	// writing TLI-3 segments into the cluster's own pg_wal would leave a
 	// directory no later assertion could interpret.
-	w, err := wal.NewWriter(wal.Config{
+	w, err := xlog.NewWriter(xlog.Config{
 		WALDir:      filepath.Join(t.TempDir(), "pg_wal"),
 		SegmentSize: 1 << 20,
 		TimelineID:  3,
@@ -251,11 +251,11 @@ func TestCheckpointerWritesLiveTimelineToPgControl(t *testing.T) {
 	}
 	defer w.Close()
 
-	cp := wal.NewCheckpointer(nopFlusher{}, w, wal.CheckpointerConfig{
+	cp := xlog.NewCheckpointer(nopFlusher{}, w, xlog.CheckpointerConfig{
 		DataDir:             dir,
 		SegmentSize:         1 << 20,
 		PGCompatCheckpoints: true,
-		GUCParams:           wal.DefaultGUCParameters(),
+		GUCParams:           xlog.DefaultGUCParameters(),
 		NextXIDFn:           func() uint64 { return 42 },
 		TimelineIDFn:        w.TimelineID,
 		FullPageWritesFn:    func() bool { return false },

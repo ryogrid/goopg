@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -45,8 +45,8 @@ func ssiTestRel() storage.RelFileNode {
 // READ COMMITTED reader must never touch the predicate-lock map or the
 // conflict-out graph, regardless of the writer xid passed in.
 func TestSSI_RecordTupleRead_NoOpForRC(t *testing.T) {
-	mgr := mvcc.NewManager()
-	tx, err := mgr.Begin(mvcc.IsolationReadCommitted)
+	mgr := transam.NewManager()
+	tx, err := mgr.Begin(transam.IsolationReadCommitted)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -69,8 +69,8 @@ func TestSSI_RecordTupleRead_NoOpForRC(t *testing.T) {
 // RR uses the same pinned-snapshot semantics as SERIALIZABLE for the SI half,
 // but the SSI overlay must remain inert.
 func TestSSI_RecordTupleRead_NoOpForRR(t *testing.T) {
-	mgr := mvcc.NewManager()
-	tx, err := mgr.Begin(mvcc.IsolationRepeatableRead)
+	mgr := transam.NewManager()
+	tx, err := mgr.Begin(transam.IsolationRepeatableRead)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -93,8 +93,8 @@ func TestSSI_RecordTupleRead_NoOpForRR(t *testing.T) {
 // predicate lock in the SerializableXact's holdings, so a subsequent
 // CheckForSerializableConflictIn on the matching tag fires.
 func TestSSI_RecordTupleRead_AcquiresPredicateLockForSerializable(t *testing.T) {
-	mgr := mvcc.NewManager()
-	reader, err := mgr.Begin(mvcc.IsolationSerializable)
+	mgr := transam.NewManager()
+	reader, err := mgr.Begin(transam.IsolationSerializable)
 	if err != nil {
 		t.Fatalf("Begin reader: %v", err)
 	}
@@ -111,7 +111,7 @@ func TestSSI_RecordTupleRead_AcquiresPredicateLockForSerializable(t *testing.T) 
 	// side-effect.
 	ssiRecordTupleRead(rctx, ssiTestRel(), ssiTestBlock, ssiTestSlot, storage.InvalidTransactionID, storage.InvalidTransactionID)
 
-	writer, err := mgr.Begin(mvcc.IsolationSerializable)
+	writer, err := mgr.Begin(transam.IsolationSerializable)
 	if err != nil {
 		t.Fatalf("Begin writer: %v", err)
 	}
@@ -137,8 +137,8 @@ func TestSSI_RecordTupleRead_AcquiresPredicateLockForSerializable(t *testing.T) 
 // in seqScanOp; this guards against the "scan returned slot 0" edge case
 // surfacing through the SSI hook.
 func TestSSI_RecordTupleRead_InvalidTagFiltered(t *testing.T) {
-	mgr := mvcc.NewManager()
-	tx, err := mgr.Begin(mvcc.IsolationSerializable)
+	mgr := transam.NewManager()
+	tx, err := mgr.Begin(transam.IsolationSerializable)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -163,9 +163,9 @@ func TestSSI_RecordTupleRead_InvalidTagFiltered(t *testing.T) {
 // and the active-count drops back to zero.
 func TestSSI_ExecCommit_ReturnsSerializationFailureWhenDoomed(t *testing.T) {
 	ctx := NewContext()
-	ctx.TxnMgr = mvcc.NewManager()
+	ctx.TxnMgr = transam.NewManager()
 	sess := NewBasicSession()
-	if err := sess.SetIsolationLevel(mvcc.IsolationSerializable); err != nil {
+	if err := sess.SetIsolationLevel(transam.IsolationSerializable); err != nil {
 		t.Fatal(err)
 	}
 	ctx.Session = sess
@@ -177,7 +177,7 @@ func TestSSI_ExecCommit_ReturnsSerializationFailureWhenDoomed(t *testing.T) {
 	if !ok {
 		t.Fatal("expected active transaction after BEGIN")
 	}
-	if tx.Isolation != mvcc.IsolationSerializable {
+	if tx.Isolation != transam.IsolationSerializable {
 		t.Fatalf("isolation=%v want=Serializable", tx.Isolation)
 	}
 	if !ctx.TxnMgr.MarkDoomedForTest(tx.Handle) {
@@ -216,7 +216,7 @@ func TestSSI_ExecCommit_ReturnsSerializationFailureWhenDoomed(t *testing.T) {
 // of the registry state).
 func TestSSI_ExecCommit_NoOpForRC(t *testing.T) {
 	ctx := NewContext()
-	ctx.TxnMgr = mvcc.NewManager()
+	ctx.TxnMgr = transam.NewManager()
 	sess := NewBasicSession()
 	// Default RC; do not change isolation.
 	ctx.Session = sess
@@ -237,9 +237,9 @@ func TestSSI_ExecCommit_NoOpForRC(t *testing.T) {
 // must NOT spuriously fail on isolated SERIALIZABLE workloads.
 func TestSSI_ExecCommit_HappyPathForSerializable(t *testing.T) {
 	ctx := NewContext()
-	ctx.TxnMgr = mvcc.NewManager()
+	ctx.TxnMgr = transam.NewManager()
 	sess := NewBasicSession()
-	if err := sess.SetIsolationLevel(mvcc.IsolationSerializable); err != nil {
+	if err := sess.SetIsolationLevel(transam.IsolationSerializable); err != nil {
 		t.Fatal(err)
 	}
 	ctx.Session = sess
@@ -261,8 +261,8 @@ func TestSSI_ExecCommit_HappyPathForSerializable(t *testing.T) {
 // the helper must absorb this case without touching ctx.TxnMgr.
 func TestSSI_RecordTupleRead_ZeroHandleSkipped(t *testing.T) {
 	ctx := NewContext()
-	ctx.TxnMgr = mvcc.NewManager()
-	ctx.Tx = mvcc.Transaction{Isolation: mvcc.IsolationSerializable, Handle: 0}
+	ctx.TxnMgr = transam.NewManager()
+	ctx.Tx = transam.Transaction{Isolation: transam.IsolationSerializable, Handle: 0}
 
 	ssiRecordTupleRead(ctx, ssiTestRel(), ssiTestBlock, ssiTestSlot, ssiWriterXID, storage.InvalidTransactionID)
 	ssiRecordTupleWrite(ctx, ssiTestRel(), ssiTestBlock, ssiTestSlot)

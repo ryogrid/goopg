@@ -36,7 +36,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // rescannable is implemented by operators that can replay their output from
@@ -190,7 +190,7 @@ func (b *materialBuffer) close() {
 type materializeOp struct {
 	child  Operator
 	ctx    *Context
-	schema planner.Schema
+	schema optimizer.Schema
 
 	buf materialBuffer
 	pos int
@@ -244,7 +244,7 @@ func (o *materializeOp) openCached(ctx *Context) {
 // releaseCache frees the cache and its spill file without closing the child.
 func (o *materializeOp) releaseCache() { o.buf.close() }
 
-func (o *materializeOp) Schema() planner.Schema { return o.schema }
+func (o *materializeOp) Schema() optimizer.Schema { return o.schema }
 
 func (o *materializeOp) Next() (TupleSlot, error) {
 	if o.pos < o.buf.count {

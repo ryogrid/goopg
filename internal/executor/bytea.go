@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"unicode/utf8"
 
-	"github.com/goopg/goopg/internal/pgarray"
+	"github.com/goopg/goopg/internal/utils/adt/array"
 )
 
 // PG-faithful bytea input/output primitives (M0125-0021).
@@ -337,4 +337,4 @@ func byteaOperand(d Datum) ([]byte, bool) {
 // elements started storing raw bytes: the element decoder there renders the
 // same text and cannot import the executor, so keeping a second copy here
 // would be exactly the sibling drift Hard-won Rule #2 exists to prevent.
-func byteaOutHex(b []byte) string { return pgarray.ByteaOutHex(b) }
+func byteaOutHex(b []byte) string { return array.ByteaOutHex(b) }

@@ -2,7 +2,7 @@ package executor
 
 import (
 	"github.com/goopg/goopg/internal/executor/kvcache"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // Stage 10 (D4.4/D4.5): the sublink result caches, consolidated onto
@@ -100,10 +100,10 @@ func subqResultSize(key string, vals []Datum) int64 {
 // (reserve os, ok); ok=false means the map would not fit — the caller
 // skips building and falls back to the rescan path, which is always
 // correct.
-func (c *Context) corrSubqHashMapReserve(scan planner.Node) (int64, bool) {
+func (c *Context) corrSubqHashMapReserve(scan optimizer.Node) (int64, bool) {
 	c.subqBudgetInit()
 	const perRowEstimate = 64
-	est := planner.EstimateRows(scan) * perRowEstimate
+	est := optimizer.EstimateRows(scan) * perRowEstimate
 	if est < perRowEstimate {
 		est = perRowEstimate
 	}

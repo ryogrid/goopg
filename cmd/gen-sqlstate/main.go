@@ -37,8 +37,8 @@ type entry struct {
 
 func main() {
 	in := flag.String("in", "postgres/src/backend/utils/errcodes.txt", "path to upstream errcodes.txt")
-	out := flag.String("out", "internal/sqlstate/codes.go", "path to write the generated Go file")
-	pkg := flag.String("package", "sqlstate", "package name to generate")
+	out := flag.String("out", "internal/utils/errcodes/codes.go", "path to write the generated Go file")
+	pkg := flag.String("package", "errcodes", "package name to generate")
 	flag.Parse()
 
 	src, err := os.ReadFile(*in)

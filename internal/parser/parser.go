@@ -5,7 +5,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/goopg/goopg/internal/mctx"
+	"github.com/goopg/goopg/internal/utils/mmgr"
 )
 
 // tokenSlicePool recycles []Token backing arrays between calls to Parse.
@@ -67,8 +67,8 @@ func (e *SyntaxError) Error() string {
 // diagnostic.
 //
 // mc follows the same contract as Parse: it is a retained no-op (see Parse).
-func ParseExpr(input string, mc ...*mctx.Context) (Expr, error) {
-	var sctx *mctx.Context
+func ParseExpr(input string, mc ...*mmgr.Context) (Expr, error) {
+	var sctx *mmgr.Context
 	if len(mc) > 0 {
 		sctx = mc[0]
 	}
@@ -129,8 +129,8 @@ func ParseExpr(input string, mc ...*mctx.Context) (Expr, error) {
 // some Value strings by reference (arena release would dangle them). mc is now
 // a no-op retained for source compatibility; tokens always come from the
 // heap-backed tokenSlicePool. See docs/design/0107-0003d-token-pool-gc-safety.md.
-func Parse(input string, mc ...*mctx.Context) ([]Stmt, error) {
-	var sctx *mctx.Context
+func Parse(input string, mc ...*mmgr.Context) ([]Stmt, error) {
+	var sctx *mmgr.Context
 	if len(mc) > 0 {
 		sctx = mc[0]
 	}

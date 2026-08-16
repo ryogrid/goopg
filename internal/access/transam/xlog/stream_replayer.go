@@ -1,0 +1,197 @@
+// Continuous (streaming) WAL replay for standby servers.
+//
+// The crash-recovery path (ReplayRecords / ReplayFromDirWithMgr) is
+// batch-oriented: it reads all records under pg_wal, finds the last
+// checkpoint, and applies the tail in a single pass. That model
+// works for the "open the data dir, replay, then start serving" boot
+// flow but is wrong for streaming replication, where new records
+// arrive indefinitely and must apply as soon as the writer has
+// flushed them.
+//
+// `StreamReplayer` wraps the per-record `ApplyRecord` kernel and
+// drives it from a `RecordIterator`. The standby's main loop wires
+// it up alongside the walreceiver: walreceiver Append's into the
+// local WAL writer, the iterator wakes on the writer's flush
+// subscription, and `StreamReplayer.Run` applies each record
+// one-at-a-time. Apply is idempotent via `pd_lsn` so restart-resume
+// never needs a separate apply cursor — we always start the
+// iterator at the writer's WrittenLSN at boot time and the
+// previously-applied tail is silently skipped.
+//
+// See docs/design/0005-0002-standby-recovery-and-replay.md.
+package xlog
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"sync"
+
+	"github.com/goopg/goopg/internal/storage"
+)
+
+// StreamReplayer is the standby-side continuous-replay driver.
+// Construct via `NewStreamReplayer`, then call `Run(ctx, iter)` from
+// a goroutine. `ApplyLSN()` is safe to call concurrently and returns
+// the LSN of the last record successfully applied (or the
+// constructor-supplied baseline when no records have been applied
+// yet).
+type StreamReplayer struct {
+	mgr *storage.Manager
+
+	// onXactReplay is an optional hook called for every commit/abort
+	// record the replayer processes. The first argument is the
+	// transaction's XID; the second is true for commit, false for
+	// abort. Used by the standby to advance the local MVCC manager's
+	// nextXID so replayed tuples become visible to queries.
+	onXactReplay func(xid storage.TransactionID, committed bool)
+
+	mu       sync.Mutex
+	applyLSN uint64
+	records  uint64
+	applied  uint64
+	// iter is the iterator the current Run call is draining. Held so
+	// observers outside the replay goroutine (the promotion drain)
+	// can ask whether replay has reached end-of-WAL. nil before the
+	// first Run.
+	iter *RecordIterator
+}
+
+// NewStreamReplayer constructs a replayer rooted at `mgr`.
+// `baselineLSN` seeds the initial `ApplyLSN()` reading; pass the
+// local WAL writer's `WrittenLSN()` at boot so observers see a
+// monotone progression even before the first record arrives.
+func NewStreamReplayer(mgr *storage.Manager, baselineLSN uint64) *StreamReplayer {
+	if mgr == nil {
+		panic("wal: NewStreamReplayer: nil storage manager")
+	}
+	return &StreamReplayer{mgr: mgr, applyLSN: baselineLSN}
+}
+
+// SetXactReplayHook installs a callback that is invoked for every
+// commit or abort record the replayer encounters. fn(xid, true)
+// signals a commit; fn(xid, false) signals an abort. The typical
+// standby use-case wires this to mvcc.Manager.ReplayXactCommit /
+// ReplayXactAbort so queries on the standby see replayed tuples as
+// committed (xmin < snap.Xmax) rather than as "future" XIDs.
+// Must be called before Run.
+func (sr *StreamReplayer) SetXactReplayHook(fn func(xid storage.TransactionID, committed bool)) {
+	sr.onXactReplay = fn
+}
+
+// ApplyLSN returns the LSN of the most recently applied record (or
+// the baseline supplied to NewStreamReplayer when no records have
+// been applied yet).
+func (sr *StreamReplayer) ApplyLSN() uint64 {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	return sr.applyLSN
+}
+
+// AtEndOfWAL reports that replay has applied every complete record
+// the local WAL writer holds and is parked waiting for bytes that
+// have not arrived. Returns false before Run has started.
+//
+// The promotion drain uses this as its stop condition because
+// ApplyLSN can never reach WrittenLSN when the received stream was
+// cut mid-record — see RecordIterator.AtEndOfWAL for the full
+// argument and its correctness precondition (the appender must be
+// stopped first).
+func (sr *StreamReplayer) AtEndOfWAL() bool {
+	sr.mu.Lock()
+	iter := sr.iter
+	sr.mu.Unlock()
+	if iter == nil {
+		return false
+	}
+	return iter.AtEndOfWAL()
+}
+
+// Stats returns a snapshot of the replayer's progress counters: the
+// total number of records observed (including markers) and the
+// number that triggered a real page mutation.
+func (sr *StreamReplayer) Stats() (records, applied uint64) {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	return sr.records, sr.applied
+}
+
+// Run pulls records from `iter` and applies each one until the
+// context is cancelled or the iterator returns io.EOF (the writer
+// closed). Returns:
+//   - nil when ctx is cancelled cleanly
+//   - nil when the iterator hits io.EOF (writer closed or iterator
+//     closed) — graceful end-of-stream is not an error
+//   - the wrapped apply error on any per-record failure (the caller
+//     decides whether to crash or retry; in v0 cmd/goopg start logs
+//     and exits the standby because a divergence between primary
+//     WAL and standby data files is unrecoverable without a fresh
+//     base backup)
+func (sr *StreamReplayer) Run(ctx context.Context, iter *RecordIterator) error {
+	if iter == nil {
+		return errors.New("wal: StreamReplayer.Run: nil iterator")
+	}
+	sr.mu.Lock()
+	sr.iter = iter
+	sr.mu.Unlock()
+	for {
+		rec, err := iter.Next(ctx)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil
+			}
+			if errors.Is(err, io.EOF) || errors.Is(err, ErrClosed) {
+				return nil
+			}
+			return fmt.Errorf("wal: stream replay read: %w", err)
+		}
+		applied, err := ApplyRecord(sr.mgr, rec)
+		if err != nil {
+			return fmt.Errorf("wal: stream replay record lsn[%d,%d]: %w", rec.StartLSN, rec.EndLSN, err)
+		}
+		// Notify the standby MVCC manager about commit/abort so that
+		// replayed tuples become visible to queries (standby hot-read
+		// visibility). The hook is called outside the replayer's mutex
+		// because the mvcc.Manager has its own lock; holding both would
+		// risk a deadlock with concurrent snapshot takers.
+		if sr.onXactReplay != nil {
+			if xid, committed, ok := replayedXactInfo(rec); ok {
+				sr.onXactReplay(xid, committed)
+			}
+		}
+		sr.mu.Lock()
+		sr.records++
+		if applied {
+			sr.applied++
+		}
+		if rec.EndLSN > sr.applyLSN {
+			sr.applyLSN = rec.EndLSN
+		}
+		sr.mu.Unlock()
+	}
+}
+
+func replayedXactInfo(rec Record) (storage.TransactionID, bool, bool) {
+	if len(rec.Payload) > 0 {
+		switch rec.Payload[0] {
+		case RecordKindXactCommit:
+			xid, err := DecodeXactMarker(rec.Payload)
+			return xid, true, err == nil
+		case RecordKindXactAbort:
+			xid, err := DecodeXactMarker(rec.Payload)
+			return xid, false, err == nil
+		}
+	}
+	if rec.XLog == nil || rec.XLog.Header.Rmid != RmgrXact {
+		return 0, false, false
+	}
+	switch rec.XLog.Header.Info & xlogXactOpMask {
+	case xlogXactCommit:
+		return storage.TransactionID(rec.XLog.Header.XID), true, true
+	case xlogXactAbort:
+		return storage.TransactionID(rec.XLog.Header.XID), false, true
+	default:
+		return 0, false, false
+	}
+}

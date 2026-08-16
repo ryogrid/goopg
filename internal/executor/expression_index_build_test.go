@@ -3,7 +3,7 @@ package executor
 import (
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
@@ -16,9 +16,9 @@ import (
 // an empty index, hiding exactly the bug under test.
 func countIndexEntries(t *testing.T, ctx *Context, idx *catalog.Index) int {
 	t.Helper()
-	tree, err := btree.Open(ctx.Pool, ctx.Catalog.IndexRelFileNode(idx))
+	tree, err := nbtree.Open(ctx.Pool, ctx.Catalog.IndexRelFileNode(idx))
 	if err != nil {
-		t.Fatalf("btree.Open(%s): %v", idx.Name, err)
+		t.Fatalf("nbtree.Open(%s): %v", idx.Name, err)
 	}
 	n := 0
 	if err := tree.RangeScan(nil, nil, func(_ []byte, _ storage.ItemPointer) (bool, error) {

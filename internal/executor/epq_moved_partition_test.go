@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -131,7 +131,7 @@ func TestStampMovedPartitionOldTupleWritesCmax(t *testing.T) {
 	)
 	// A snapshot that sees insertingXID as committed, so TupleVisible reaches
 	// the xmax arm rather than rejecting on xmin.
-	snap := mvcc.Snapshot{Xmin: 200, Xmax: 300}
+	snap := transam.Snapshot{Xmin: 200, Xmax: 300}
 
 	// setup builds a one-tuple page whose t_cid carries the stale cmin, and
 	// returns the context plus the tuple's slot.
@@ -197,7 +197,7 @@ func TestStampMovedPartitionOldTupleWritesCmax(t *testing.T) {
 		if h.Xmax != deletingXID {
 			t.Errorf("Xmax = %d, want %d", h.Xmax, deletingXID)
 		}
-		if got := mvcc.GetCmax(h, nil); got != moveCID {
+		if got := transam.GetCmax(h, nil); got != moveCID {
 			t.Errorf("cmax = %d, want %d (the moving command's id, not the stale cmin %d)",
 				got, moveCID, staleCmin)
 		}
@@ -207,7 +207,7 @@ func TestStampMovedPartitionOldTupleWritesCmax(t *testing.T) {
 			t.Error("moved-partition sentinel lost after the cmax stamp")
 		}
 		// The deleting transaction's next statement must NOT see the row.
-		if mvcc.TupleVisible(h, snap, deletingXID, nextStmtCurcid, nil, nil) {
+		if transam.TupleVisible(h, snap, deletingXID, nextStmtCurcid, nil, nil) {
 			t.Error("moved-away row still visible to its own transaction at the next command")
 		}
 	})
@@ -228,10 +228,10 @@ func TestStampMovedPartitionOldTupleWritesCmax(t *testing.T) {
 		ctx.Pool.Unpin(pin)
 
 		h := readHeader(t, ctx, rel, slot)
-		if got := mvcc.GetCmax(h, nil); got != staleCmin {
+		if got := transam.GetCmax(h, nil); got != staleCmin {
 			t.Fatalf("precondition: cmax = %d, want the stale cmin %d", got, staleCmin)
 		}
-		if !mvcc.TupleVisible(h, snap, deletingXID, nextStmtCurcid, nil, nil) {
+		if !transam.TupleVisible(h, snap, deletingXID, nextStmtCurcid, nil, nil) {
 			t.Fatal("expected the pre-fix stamp to leak the moved-away row; " +
 				"if this now passes, the visibility rule changed and the fixed sub-test above may be vacuous")
 		}

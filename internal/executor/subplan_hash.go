@@ -4,7 +4,7 @@ import (
 	"os"
 	"sync/atomic"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // Stage 11 (S3, design bundle D4.3): hashed execution for uncorrelated
@@ -190,7 +190,7 @@ func subPlanHashSize(key string, h *subPlanHash) int64 {
 //
 // Precondition: operand is non-NULL (evalInExpr handles the NULL
 // operand before reaching the plain-equality branch).
-func evalInHashProbe(x *planner.InExpr, operand Datum, values []Datum, ctx *Context) (Datum, bool) {
+func evalInHashProbe(x *optimizer.InExpr, operand Datum, values []Datum, ctx *Context) (Datum, bool) {
 	if !hashedSubPlanEnabled() || ctx == nil || x.Plan == nil || !x.IsNonCorrelated || len(values) == 0 {
 		return Datum{}, false
 	}

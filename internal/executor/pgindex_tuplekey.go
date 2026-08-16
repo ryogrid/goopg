@@ -3,7 +3,7 @@ package executor
 import (
 	"fmt"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -78,7 +78,7 @@ import (
 // handling), not a format change, so this reports the fact and leaves today's
 // "a NULL key column means the row is not indexed" policy to the callers. See
 // the deferral ledger row for M0130-S11.4 B2-a.
-func pgIndexTupleKey(desc *btree.PGIndexKeyDesc, cols []*catalog.Column, vals []Datum, tid storage.ItemPointer) (key []byte, hasNull bool, err error) {
+func pgIndexTupleKey(desc *nbtree.PGIndexKeyDesc, cols []*catalog.Column, vals []Datum, tid storage.ItemPointer) (key []byte, hasNull bool, err error) {
 	nkey := desc.NKeyAtts()
 	if nkey == 0 {
 		return nil, false, fmt.Errorf("pgIndexTupleKey: nil or empty key descriptor")
@@ -117,7 +117,7 @@ func pgIndexTupleKey(desc *btree.PGIndexKeyDesc, cols []*catalog.Column, vals []
 		values[i] = img
 	}
 
-	raw, err := btree.FormPGIndexTuple(phys, values, isnull, tid)
+	raw, err := nbtree.FormPGIndexTuple(phys, values, isnull, tid)
 	if err != nil {
 		return nil, false, err
 	}
@@ -125,14 +125,14 @@ func pgIndexTupleKey(desc *btree.PGIndexKeyDesc, cols []*catalog.Column, vals []
 		// A prefix key is a pivot: it carries its own attribute count, and it
 		// keeps no tiebreaker heap TID (heapTID=false), so it is minus infinity
 		// in the TID position as well as in every attribute it dropped.
-		if err := btree.BTreeTupleSetNAtts(raw, uint16(len(vals)), false); err != nil {
+		if err := nbtree.BTreeTupleSetNAtts(raw, uint16(len(vals)), false); err != nil {
 			return nil, false, err
 		}
 	}
 	// BTMaxItemSize is the leaf-page limit upstream enforces in _bt_check_
 	// natts' caller (nbtinsert.c's _bt_check_third_page). Reporting it here,
 	// where the offending column is still nameable, beats a page-split failure.
-	if err := btree.CheckPGBTItemSize(len(raw), true); err != nil {
+	if err := nbtree.CheckPGBTItemSize(len(raw), true); err != nil {
 		return nil, false, err
 	}
 	return raw, hasNull, nil
@@ -144,7 +144,7 @@ func pgIndexTupleKey(desc *btree.PGIndexKeyDesc, cols []*catalog.Column, vals []
 //
 // cols is parallel to desc.Attrs — one entry per KEY column, INCLUDE columns
 // excluded, exactly as buildPGIndexKeyDesc produced them.
-func pgIndexTupleKeyFromRow(desc *btree.PGIndexKeyDesc, cols []*catalog.Column, row Row, tid storage.ItemPointer) (key []byte, hasNull bool, err error) {
+func pgIndexTupleKeyFromRow(desc *nbtree.PGIndexKeyDesc, cols []*catalog.Column, row Row, tid storage.ItemPointer) (key []byte, hasNull bool, err error) {
 	vals := make([]Datum, len(cols))
 	for i, col := range cols {
 		if col == nil {
@@ -210,7 +210,7 @@ func pgIndexKeyColumns(idx *catalog.Index) []*catalog.Column {
 // A PIVOT key is refused rather than decoded: it names fewer attributes than
 // the descriptor and stores no heap TID, so it is a separator inside the tree,
 // never an entry an index-only scan may answer a row from.
-func pgIndexTupleKeyDatums(desc *btree.PGIndexKeyDesc, cols []*catalog.Column, key []byte) ([]Datum, error) {
+func pgIndexTupleKeyDatums(desc *nbtree.PGIndexKeyDesc, cols []*catalog.Column, key []byte) ([]Datum, error) {
 	nkey := desc.NKeyAtts()
 	if nkey == 0 {
 		return nil, fmt.Errorf("pgIndexTupleKeyDatums: nil or empty key descriptor")
@@ -218,13 +218,13 @@ func pgIndexTupleKeyDatums(desc *btree.PGIndexKeyDesc, cols []*catalog.Column, k
 	if len(cols) != nkey {
 		return nil, fmt.Errorf("pgIndexTupleKeyDatums: %d columns for a %d-attribute key", len(cols), nkey)
 	}
-	if len(key) < btree.SizeOfIndexTupleData {
+	if len(key) < nbtree.SizeOfIndexTupleData {
 		return nil, fmt.Errorf("pgIndexTupleKeyDatums: %d-byte key is shorter than an index tuple header", len(key))
 	}
-	if natts := int(btree.BTreeTupleGetNAtts(key, uint16(nkey))); natts != nkey {
+	if natts := int(nbtree.BTreeTupleGetNAtts(key, uint16(nkey))); natts != nkey {
 		return nil, fmt.Errorf("pgIndexTupleKeyDatums: key names %d of %d key attributes (a pivot, not an entry)", natts, nkey)
 	}
-	images, isnull, err := btree.DeformPGIndexTuple(key, desc.Physical(), nkey)
+	images, isnull, err := nbtree.DeformPGIndexTuple(key, desc.Physical(), nkey)
 	if err != nil {
 		return nil, err
 	}

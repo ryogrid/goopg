@@ -6,7 +6,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // TestLIKEIncludingDefaultsDebug verifies that LIKE INCLUDING DEFAULTS
@@ -106,7 +106,7 @@ func runSQLErr(t *testing.T, sql string) ([]Row, error) {
 	if len(stmts) != 1 {
 		t.Fatalf("expected 1 stmt, got %d", len(stmts))
 	}
-	plan, err := planner.Plan(stmts[0], cat)
+	plan, err := optimizer.Plan(stmts[0], cat)
 	if err != nil {
 		return nil, err
 	}

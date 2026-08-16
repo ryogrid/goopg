@@ -1,6 +1,6 @@
 package executor
 
-import "github.com/goopg/goopg/internal/planner"
+import "github.com/goopg/goopg/internal/optimizer"
 
 // fakeBorrowSource is a minimal Operator stub used by tests to
 // drive operators with a pre-built row sequence. M0071-0015
@@ -13,7 +13,7 @@ type fakeBorrowSource struct {
 }
 
 func (o *fakeBorrowSource) Open(*Context) error    { return nil }
-func (o *fakeBorrowSource) Schema() planner.Schema { return nil }
+func (o *fakeBorrowSource) Schema() optimizer.Schema { return nil }
 func (o *fakeBorrowSource) Close() error           { return nil }
 func (o *fakeBorrowSource) Next() (TupleSlot, error) {
 	if o.idx >= len(o.rows) {

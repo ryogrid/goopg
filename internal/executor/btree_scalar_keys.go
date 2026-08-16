@@ -5,7 +5,7 @@ import (
 	"net"
 	"strings"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/catalog"
 )
 
@@ -160,8 +160,8 @@ func timeTzKeyParts(v Datum) (gmtMicros int64, pgZone int32) {
 func encodeTimeTzBTreeKey(v Datum) []byte {
 	gmt, pgZone := timeTzKeyParts(v)
 	key := make([]byte, 0, 12)
-	key = append(key, btree.EncodeInt8(gmt)...)
-	return append(key, btree.EncodeInt4(pgZone)...)
+	key = append(key, nbtree.EncodeInt8(gmt)...)
+	return append(key, nbtree.EncodeInt4(pgZone)...)
 }
 
 // coerceScalarKeyStringDatum resolves an unknown-literal probe (`WHERE b =
@@ -240,7 +240,7 @@ func encodeScalarBTreeKey(v Datum, col *catalog.Column, pos int) (key []byte, ha
 			return nil, true, &ExecError{Code: "22003", Pos: pos,
 				Message: fmt.Sprintf("value %d out of int2 range for index key", v.Int)}
 		}
-		return btree.EncodeInt4(int32(v.Int)), true, nil
+		return nbtree.EncodeInt4(int32(v.Int)), true, nil
 	case isOidType(col.Type.Name):
 		if v.Kind != KindInt {
 			return nil, true, &ExecError{Code: "42804", Pos: pos,
@@ -252,22 +252,22 @@ func encodeScalarBTreeKey(v Datum, col *catalog.Column, pos int) (key []byte, ha
 		}
 		// Unsigned compare: the value is already in 0..2^32-1, so the int8 key
 		// orders it exactly as oidcmp does.
-		return btree.EncodeInt8(v.Int), true, nil
+		return nbtree.EncodeInt8(v.Int), true, nil
 	case isBoolType(col.Type.Name):
 		if v.Kind != KindBool {
 			return nil, true, &ExecError{Code: "42804", Pos: pos,
 				Message: fmt.Sprintf("column %q is not boolean at runtime", col.Name)}
 		}
 		if v.BoolValue() {
-			return btree.EncodeInt4(1), true, nil
+			return nbtree.EncodeInt4(1), true, nil
 		}
-		return btree.EncodeInt4(0), true, nil
+		return nbtree.EncodeInt4(0), true, nil
 	case isByteaType(col.Type.Name):
 		if v.Kind != KindBytes {
 			return nil, true, &ExecError{Code: "42804", Pos: pos,
 				Message: fmt.Sprintf("column %q is not bytea at runtime", col.Name)}
 		}
-		return btree.EncodeVarchar(v.BytesValue()), true, nil
+		return nbtree.EncodeVarchar(v.BytesValue()), true, nil
 	case isTimeTzType(col.Type.Name):
 		if v.Kind != KindTime {
 			return nil, true, &ExecError{Code: "42804", Pos: pos,
@@ -286,7 +286,7 @@ func encodeScalarBTreeKey(v Datum, col *catalog.Column, pos int) (key []byte, ha
 		}
 		// pgTimeMicros is the codec's own time-of-day extraction, so the key
 		// derives from the same microseconds the heap stores.
-		return btree.EncodeInt8(pgTimeMicros(v.TimeValue())), true, nil
+		return nbtree.EncodeInt8(pgTimeMicros(v.TimeValue())), true, nil
 	}
 	return nil, false, nil
 }
@@ -306,7 +306,7 @@ func decodeScalarBTreeKey(key []byte, typeName string) (d Datum, n int, handled 
 		if len(key) < 4 {
 			return NullDatum, 0, true, fmt.Errorf("btree: int2 key truncated, got %d bytes", len(key))
 		}
-		v, derr := btree.DecodeInt4(key[:4])
+		v, derr := nbtree.DecodeInt4(key[:4])
 		return Datum{Kind: KindInt, Int: int64(v)}, 4, true, derr
 	// reg* types share oid's 8-byte unsigned key form (their default opclass is
 	// oid_ops → oidcmp, the same EncodeInt8 the oid arm uses), so this single
@@ -317,19 +317,19 @@ func decodeScalarBTreeKey(key []byte, typeName string) (d Datum, n int, handled 
 		if len(key) < 8 {
 			return NullDatum, 0, true, fmt.Errorf("btree: oid key truncated, got %d bytes", len(key))
 		}
-		v, derr := btree.DecodeInt8(key[:8])
+		v, derr := nbtree.DecodeInt8(key[:8])
 		return Datum{Kind: KindInt, Int: v}, 8, true, derr
 	case isBoolType(typeName):
 		if len(key) < 4 {
 			return NullDatum, 0, true, fmt.Errorf("btree: bool key truncated, got %d bytes", len(key))
 		}
-		v, derr := btree.DecodeInt4(key[:4])
+		v, derr := nbtree.DecodeInt4(key[:4])
 		if derr != nil {
 			return NullDatum, 0, true, derr
 		}
 		return NewBoolDatum(v != 0), 4, true, nil
 	case isByteaType(typeName):
-		raw, n, derr := btree.DecodeVarcharLen(key)
+		raw, n, derr := nbtree.DecodeVarcharLen(key)
 		if derr != nil {
 			return NullDatum, 0, true, derr
 		}
@@ -338,11 +338,11 @@ func decodeScalarBTreeKey(key []byte, typeName string) (d Datum, n int, handled 
 		if len(key) < 12 {
 			return NullDatum, 0, true, fmt.Errorf("btree: timetz key truncated, got %d bytes", len(key))
 		}
-		gmt, derr := btree.DecodeInt8(key[:8])
+		gmt, derr := nbtree.DecodeInt8(key[:8])
 		if derr != nil {
 			return NullDatum, 0, true, derr
 		}
-		pgZone, derr := btree.DecodeInt4(key[8:12])
+		pgZone, derr := nbtree.DecodeInt4(key[8:12])
 		if derr != nil {
 			return NullDatum, 0, true, derr
 		}
@@ -359,7 +359,7 @@ func decodeScalarBTreeKey(key []byte, typeName string) (d Datum, n int, handled 
 		if len(key) < 8 {
 			return NullDatum, 0, true, fmt.Errorf("btree: time key truncated, got %d bytes", len(key))
 		}
-		v, derr := btree.DecodeInt8(key[:8])
+		v, derr := nbtree.DecodeInt8(key[:8])
 		if derr != nil {
 			return NullDatum, 0, true, derr
 		}

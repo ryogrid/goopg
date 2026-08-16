@@ -10,7 +10,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/plpgsql"
 )
 
@@ -160,7 +160,7 @@ func (f *plpgsqlFrame) isRecordVar(name string) bool {
 // Mirrors PostgreSQL's expanded-record representation; shared by SELECT … INTO
 // (bindSelectIntoRow) and the record FOR-loop binding. M0118-0008
 // (plpgsql-toast assign3/4/5/6).
-func bindRecordRowComposite(varName string, row Row, schema planner.Schema, frame *plpgsqlFrame) {
+func bindRecordRowComposite(varName string, row Row, schema optimizer.Schema, frame *plpgsqlFrame) {
 	name := strings.ToLower(varName)
 	for i, sc := range schema {
 		colKey := "_" + name + "_" + strings.ToLower(sc.Name)
@@ -204,7 +204,7 @@ func bindRecordRowComposite(varName string, row Row, schema planner.Schema, fram
 //   - multiple targets bind result columns positionally to scalar variables.
 //
 // A missing column yields NULL. M0118-0008 (plpgsql-toast).
-func bindSelectIntoRow(targets []string, row Row, schema planner.Schema, frame *plpgsqlFrame) {
+func bindSelectIntoRow(targets []string, row Row, schema optimizer.Schema, frame *plpgsqlFrame) {
 	if len(targets) == 0 {
 		return
 	}
@@ -252,7 +252,7 @@ func bindSelectIntoRow(targets []string, row Row, schema planner.Schema, frame *
 // evalStoredRoutineFuncCall resolves and executes user-defined
 // routines (M0015 Stage A runtime path) when a call is not one of
 // the built-ins handled directly in expr.go.
-func evalStoredRoutineFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalStoredRoutineFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if x.Star {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("function %s does not exist", x.Name)}
 	}
@@ -278,7 +278,7 @@ func evalStoredRoutineFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datu
 	if r.IsProcedure {
 		argTypeNames := make([]string, len(x.Args))
 		for i, a := range x.Args {
-			if _, isStr := a.(*planner.StringConst); isStr {
+			if _, isStr := a.(*optimizer.StringConst); isStr {
 				argTypeNames[i] = "unknown"
 			} else if i < len(r.ArgTypes) {
 				argTypeNames[i] = r.ArgTypes[i].Name
@@ -421,7 +421,7 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 			// postquel_getnext calls CommandCounterIncrement for each
 			// command of a volatile function).
 			routineCommandCounterIncrement(child, r)
-			node, err := planner.Plan(stmt, ctxPlanCatalog(child))
+			node, err := optimizer.Plan(stmt, ctxPlanCatalog(child))
 			if err != nil {
 				return Datum{}, wrapSQLFunctionContext(err, r.Name, si+1)
 			}
@@ -460,7 +460,7 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 		// postquel_getnext calls CommandCounterIncrement for each
 		// command of a volatile function).
 		routineCommandCounterIncrement(child, r)
-		node, err := planner.Plan(stmt, ctxPlanCatalog(child))
+		node, err := optimizer.Plan(stmt, ctxPlanCatalog(child))
 		if err != nil {
 			return Datum{}, wrapSQLFunctionContext(err, r.Name, stmtNum)
 		}
@@ -580,7 +580,7 @@ func executeSQLProcedureCore(r *catalog.Routine, args []Datum, ctx *Context, pos
 		// postquel_getnext calls CommandCounterIncrement for each
 		// command of a volatile procedure).
 		routineCommandCounterIncrement(child, r)
-		node, err := planner.Plan(stmt, ctxPlanCatalog(child))
+		node, err := optimizer.Plan(stmt, ctxPlanCatalog(child))
 		if err != nil {
 			return nil, wrapSQLFunctionContext(err, r.Name, stmtNum)
 		}
@@ -662,7 +662,7 @@ func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos in
 	// Execute all statements except the last as side effects; collect rows from last.
 	for i, stmt := range stmts {
 		stmtNum := i + 1
-		node, err := planner.Plan(stmt, ctxPlanCatalog(child))
+		node, err := optimizer.Plan(stmt, ctxPlanCatalog(child))
 		if err != nil {
 			return nil, wrapSQLFunctionContext(err, r.Name, stmtNum)
 		}
@@ -1546,7 +1546,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		if perr != nil || len(stmts) == 0 {
 			return Datum{}, flowNone, &ExecError{Code: "42601", Pos: s.Pos(), Message: fmt.Sprintf("RETURN QUERY: %v", perr)}
 		}
-		plan, perr := planner.Plan(stmts[0], ctxPlanCatalog(ctx))
+		plan, perr := optimizer.Plan(stmts[0], ctxPlanCatalog(ctx))
 		if perr != nil {
 			return Datum{}, flowNone, perr
 		}
@@ -1654,7 +1654,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 			}
 			return Datum{}, flowNone, nil
 		}
-		plan, perr := planner.Plan(stmts[0], ctxPlanCatalog(ctx))
+		plan, perr := optimizer.Plan(stmts[0], ctxPlanCatalog(ctx))
 		if perr != nil {
 			return Datum{}, flowNone, perr
 		}
@@ -1744,7 +1744,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		if len(stmts) == 0 {
 			return Datum{}, flowNone, nil
 		}
-		plan, err := planner.Plan(stmts[0], ctxPlanCatalog(ctx))
+		plan, err := optimizer.Plan(stmts[0], ctxPlanCatalog(ctx))
 		if err != nil {
 			return Datum{}, flowNone, err
 		}
@@ -1827,7 +1827,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		if len(stmts) == 0 {
 			return Datum{}, flowNone, nil
 		}
-		plan, err := planner.Plan(stmts[0], ctxPlanCatalog(ctx))
+		plan, err := optimizer.Plan(stmts[0], ctxPlanCatalog(ctx))
 		if err != nil {
 			return Datum{}, flowNone, err
 		}
@@ -1851,7 +1851,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		// (plpgsql-toast assign6).
 		type forRow struct {
 			row    Row
-			schema planner.Schema
+			schema optimizer.Schema
 		}
 		var collected []forRow
 		for {
@@ -2136,7 +2136,7 @@ func evalScalarSubquery(sq *parser.SubqueryExpr, ctx *Context) (Datum, error) {
 	if sq.Inner == nil {
 		return Datum{}, &ExecError{Code: "42601", Pos: sq.Pos(), Message: "empty subquery in PL/pgSQL expression"}
 	}
-	plan, err := planner.Plan(sq.Inner, ctxPlanCatalog(ctx))
+	plan, err := optimizer.Plan(sq.Inner, ctxPlanCatalog(ctx))
 	if err != nil {
 		return Datum{}, err
 	}
@@ -2171,26 +2171,26 @@ func evalScalarSubquery(sq *parser.SubqueryExpr, ctx *Context) (Datum, error) {
 	return result, nil
 }
 
-func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (planner.Expr, error) {
+func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (optimizer.Expr, error) {
 	switch x := e.(type) {
 	case *parser.IntegerConst:
-		return &planner.IntegerConst{Value: x.Value}, nil
+		return &optimizer.IntegerConst{Value: x.Value}, nil
 	case *parser.NumericConst:
-		return &planner.NumericConst{Value: x.Value}, nil
+		return &optimizer.NumericConst{Value: x.Value}, nil
 	case *parser.StringConst:
-		return &planner.StringConst{Value: x.Value}, nil
+		return &optimizer.StringConst{Value: x.Value}, nil
 	case *parser.TypedStringLit:
-		return &planner.TypedStringLit{Type: x.Type, Value: x.Value}, nil
+		return &optimizer.TypedStringLit{Type: x.Type, Value: x.Value}, nil
 	case *parser.IntervalLit:
-		return &planner.IntervalLit{Value: x.Value, Unit: x.Unit, Qualified: x.Qualified, PreComputed: x.PreComputed, PreMonths: x.PreMonths, PreDays: x.PreDays, PreMicros: x.PreMicros}, nil
+		return &optimizer.IntervalLit{Value: x.Value, Unit: x.Unit, Qualified: x.Qualified, PreComputed: x.PreComputed, PreMonths: x.PreMonths, PreDays: x.PreDays, PreMicros: x.PreMicros}, nil
 	case *parser.ExtractExpr:
 		src, err := lowerPLpgSQLExpr(x.Source, frame)
 		if err != nil {
 			return nil, err
 		}
-		return &planner.ExtractExpr{Field: x.Field, Source: src}, nil
+		return &optimizer.ExtractExpr{Field: x.Field, Source: src}, nil
 	case *parser.CaseExpr:
-		out := &planner.CaseExpr{}
+		out := &optimizer.CaseExpr{}
 		if x.Operand != nil {
 			op, err := lowerPLpgSQLExpr(x.Operand, frame)
 			if err != nil {
@@ -2207,7 +2207,7 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (planner.Expr, error) 
 			if err != nil {
 				return nil, err
 			}
-			out.Whens = append(out.Whens, planner.CaseWhen{When: when, Then: then})
+			out.Whens = append(out.Whens, optimizer.CaseWhen{When: when, Then: then})
 		}
 		if x.Else != nil {
 			els, err := lowerPLpgSQLExpr(x.Else, frame)
@@ -2225,7 +2225,7 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (planner.Expr, error) 
 		if err != nil {
 			return nil, err
 		}
-		list := make([]planner.Expr, 0, len(x.List))
+		list := make([]optimizer.Expr, 0, len(x.List))
 		for _, item := range x.List {
 			v, err := lowerPLpgSQLExpr(item, frame)
 			if err != nil {
@@ -2233,17 +2233,17 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (planner.Expr, error) 
 			}
 			list = append(list, v)
 		}
-		return &planner.InExpr{Operand: op, Negated: x.Negated, List: list}, nil
+		return &optimizer.InExpr{Operand: op, Negated: x.Negated, List: list}, nil
 	case *parser.ExistsExpr:
 		return nil, &ExecError{Code: "0A000", Pos: x.Pos(), Message: "EXISTS is not supported in PL/pgSQL expressions in v0"}
 	case *parser.SubqueryExpr:
 		return nil, &ExecError{Code: "0A000", Pos: x.Pos(), Message: "subqueries are not supported in PL/pgSQL expressions in v0"}
 	case *parser.NullConst:
-		return &planner.NullConst{}, nil
+		return &optimizer.NullConst{}, nil
 	case *parser.BooleanConst:
-		return &planner.BooleanConst{Value: x.Value}, nil
+		return &optimizer.BooleanConst{Value: x.Value}, nil
 	case *parser.ParamRef:
-		return &planner.ParamRef{Number: x.Number}, nil
+		return &optimizer.ParamRef{Number: x.Number}, nil
 	case *parser.ColumnRef:
 		// Handle OLD.col and NEW.col in trigger context by looking them up
 		// in the pre-injected trigger column variables. M0096-0012.
@@ -2257,7 +2257,7 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (planner.Expr, error) 
 					return nil, &ExecError{Code: "42703", Pos: x.Pos(),
 						Message: fmt.Sprintf("column %q not found in trigger %s record", x.Column, which)}
 				}
-				return &planner.ColumnRef{Index: idx, Name: varKey, Type: frame.types[idx]}, nil
+				return &optimizer.ColumnRef{Index: idx, Name: varKey, Type: frame.types[idx]}, nil
 			}
 		}
 		if x.Schema != "" || x.Table != "" {
@@ -2275,16 +2275,16 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (planner.Expr, error) 
 							}
 							val := frame.values[idx]
 							if val.IsNull() {
-								return &planner.NullConst{}, nil
+								return &optimizer.NullConst{}, nil
 							}
 							fieldVal := extractCompositeField(val.StringValue(), i)
 							if fieldVal == "" {
-								return &planner.NullConst{}, nil
+								return &optimizer.NullConst{}, nil
 							}
 							if n, err2 := strconv.ParseInt(fieldVal, 10, 64); err2 == nil {
-								return &planner.IntegerConst{Value: n}, nil
+								return &optimizer.IntegerConst{Value: n}, nil
 							}
-							return &planner.StringConst{Value: fieldVal}, nil
+							return &optimizer.StringConst{Value: fieldVal}, nil
 						}
 					}
 				}
@@ -2296,11 +2296,11 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (planner.Expr, error) 
 			// FOUND special variable: only when not shadowed by a declared
 			// variable of the same name. M0118-0009 (design 0118-0097).
 			if strings.EqualFold(x.Column, "found") {
-				return &planner.BooleanConst{Value: frame.found}, nil
+				return &optimizer.BooleanConst{Value: frame.found}, nil
 			}
 			return nil, &ExecError{Code: "42703", Pos: x.Pos(), Message: fmt.Sprintf("variable %q does not exist", x.Column)}
 		}
-		return &planner.ColumnRef{Index: idx, Name: x.Column, Type: frame.types[idx]}, nil
+		return &optimizer.ColumnRef{Index: idx, Name: x.Column, Type: frame.types[idx]}, nil
 	case *parser.StarExpr:
 		return nil, &ExecError{Code: "42601", Pos: x.Pos(), Message: "'*' is not allowed in PL/pgSQL expression context"}
 	case *parser.UnaryOp:
@@ -2308,7 +2308,7 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (planner.Expr, error) 
 		if err != nil {
 			return nil, err
 		}
-		return &planner.UnaryOp{Op: x.Op, Operand: op}, nil
+		return &optimizer.UnaryOp{Op: x.Op, Operand: op}, nil
 	case *parser.BinaryOp:
 		left, err := lowerPLpgSQLExpr(x.Left, frame)
 		if err != nil {
@@ -2318,14 +2318,14 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (planner.Expr, error) 
 		if err != nil {
 			return nil, err
 		}
-		return &planner.BinaryOp{Op: x.Op, Left: left, Right: right}, nil
+		return &optimizer.BinaryOp{Op: x.Op, Left: left, Right: right}, nil
 	case *parser.CastExpr:
 		return lowerPLpgSQLExpr(x.Operand, frame)
 	case *parser.FuncCall:
 		if x.Over != nil {
 			return nil, &ExecError{Code: "0A000", Pos: x.Pos(), Message: "window function calls are not supported in PL/pgSQL expressions in v0"}
 		}
-		args := make([]planner.Expr, 0, len(x.Args))
+		args := make([]optimizer.Expr, 0, len(x.Args))
 		for _, a := range x.Args {
 			pa, err := lowerPLpgSQLExpr(a, frame)
 			if err != nil {
@@ -2333,9 +2333,9 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (planner.Expr, error) 
 			}
 			args = append(args, pa)
 		}
-		return &planner.FuncCall{Name: x.Name.String(), Args: args, Star: x.Star}, nil
+		return &optimizer.FuncCall{Name: x.Name.String(), Args: args, Star: x.Star}, nil
 	case *parser.ArrayConstructorExpr:
-		largs := make([]planner.Expr, len(x.Elements))
+		largs := make([]optimizer.Expr, len(x.Elements))
 		for i, el := range x.Elements {
 			lowered, err := lowerPLpgSQLExpr(el, frame)
 			if err != nil {
@@ -2343,14 +2343,14 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (planner.Expr, error) 
 			}
 			largs[i] = lowered
 		}
-		return &planner.FuncCall{Name: "array_construct", Args: largs}, nil
+		return &optimizer.FuncCall{Name: "array_construct", Args: largs}, nil
 	case *parser.IsNullExpr:
 		// IS [NOT] NULL in PL/pgSQL condition expressions (e.g. "state is null").
 		op, err := lowerPLpgSQLExpr(x.Operand, frame)
 		if err != nil {
 			return nil, err
 		}
-		return &planner.IsNullExpr{Operand: op, Negated: x.Negated}, nil
+		return &optimizer.IsNullExpr{Operand: op, Negated: x.Negated}, nil
 	case *parser.IsDistinctFromExpr:
 		// IS [NOT] DISTINCT FROM in PL/pgSQL expressions.
 		left, err := lowerPLpgSQLExpr(x.Left, frame)
@@ -2361,7 +2361,7 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (planner.Expr, error) 
 		if err != nil {
 			return nil, err
 		}
-		return &planner.IsDistinctFromExpr{Left: left, Right: right, Negated: x.Negated}, nil
+		return &optimizer.IsDistinctFromExpr{Left: left, Right: right, Negated: x.Negated}, nil
 	case *parser.ArraySubscriptExpr:
 		// array[subscript] read in PL/pgSQL (e.g. x[1] on the RHS).
 		arr, err := lowerPLpgSQLExpr(x.Base, frame)
@@ -2375,9 +2375,9 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (planner.Expr, error) 
 		// tg_argv uses 0-based indexing (PostgreSQL convention for trigger arguments).
 		// Adjust by adding 1 to convert to our 1-based array_subscript function.
 		if cr, ok := x.Base.(*parser.ColumnRef); ok && strings.ToLower(cr.Column) == "tg_argv" {
-			sub = &planner.BinaryOp{Op: parser.OpAdd, Left: sub, Right: &planner.IntegerConst{Value: 1}}
+			sub = &optimizer.BinaryOp{Op: parser.OpAdd, Left: sub, Right: &optimizer.IntegerConst{Value: 1}}
 		}
-		return &planner.FuncCall{Name: "array_subscript", Args: []planner.Expr{arr, sub}}, nil
+		return &optimizer.FuncCall{Name: "array_subscript", Args: []optimizer.Expr{arr, sub}}, nil
 	default:
 		return nil, &ExecError{Code: "0A000", Pos: e.Pos(), Message: fmt.Sprintf("unsupported PL/pgSQL expression %T", e)}
 	}
@@ -2788,7 +2788,7 @@ func execPLpgSQLEmbeddedSQL(sql string, frame *plpgsqlFrame, ctx *Context) (int,
 	// can derive FOUND (PostgreSQL sets FOUND from the final query's row count).
 	rows := 0
 	for _, stmt := range stmts {
-		plan, err := planner.Plan(stmt, ctxPlanCatalog(ctx))
+		plan, err := optimizer.Plan(stmt, ctxPlanCatalog(ctx))
 		if err != nil {
 			return 0, err
 		}
@@ -2912,11 +2912,11 @@ func datumToSQLLiteral(d Datum) string {
 // isRegtypeExpr reports whether e is a pg_typeof(...) call or a ::regtype
 // cast — the two ways a plpgsql expression evaluates to a regtype-typed
 // Datum (a KindInt pg_type OID, per M0122-0005) rather than display text.
-func isRegtypeExpr(e planner.Expr) bool {
+func isRegtypeExpr(e optimizer.Expr) bool {
 	switch x := e.(type) {
-	case *planner.FuncCall:
+	case *optimizer.FuncCall:
 		return strings.EqualFold(x.Name, "pg_typeof")
-	case *planner.CastExpr:
+	case *optimizer.CastExpr:
 		return strings.EqualFold(x.TargetType, "regtype")
 	}
 	return false

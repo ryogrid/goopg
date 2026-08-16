@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goopg/goopg/internal/mctx"
+	"github.com/goopg/goopg/internal/utils/mmgr"
 )
 
 // ── tuple ownership ─────────────────────────────────────────────────────────
@@ -25,7 +25,7 @@ import (
 // stage. It pins the distinction that makes the ownership contract correct:
 // the check is on EVERY kind, not just the two that cloneRowOwned promotes.
 func TestAssertTransferableRejectsArenaBackedRow(t *testing.T) {
-	arena := mctx.Acquire(nil, mctx.KindStmt)
+	arena := mmgr.Acquire(nil, mmgr.KindStmt)
 	defer arena.Release()
 
 	off, length := arena.AllocString("hello")
@@ -65,7 +65,7 @@ func TestAssertTransferableAllowsPermanentArena(t *testing.T) {
 	// stores its payload in mctx.Perm().
 	big1, _ := new(big.Int).SetString("123456789012345678901234567890", 10)
 	d := NewNumericBigDatum(big1, 0)
-	if d.ArenaID != mctx.PermContextID {
+	if d.ArenaID != mmgr.PermContextID {
 		t.Skipf("big numeric did not land in the permanent arena (ArenaID=%d); "+
 			"if this changed, AssertTransferable and the design's 03 §3.1 need revisiting", d.ArenaID)
 	}
@@ -76,7 +76,7 @@ func TestAssertTransferableAllowsPermanentArena(t *testing.T) {
 	// datum (it only handles KindString/KindBytes), yet the row is still safe.
 	// The safety comes from the allocation site, not from the copy.
 	promoted := MaterializeForTransfer(Row{d})
-	if promoted[0].ArenaID != mctx.PermContextID {
+	if promoted[0].ArenaID != mmgr.PermContextID {
 		t.Log("note: cloneRowOwned now promotes big numerics; 03 §3.1 can be simplified")
 	}
 }
@@ -95,7 +95,7 @@ func TestNewWorkerContextSharesAndSeparates(t *testing.T) {
 	leader.OuterRows = []Row{{NewIntDatum(42)}}
 	leader.GetSetting = func(string) (string, bool) { return "", false }
 
-	arena := mctx.Acquire(nil, mctx.KindStmt)
+	arena := mmgr.Acquire(nil, mmgr.KindStmt)
 	defer arena.Release()
 	wctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

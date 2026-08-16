@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/amcheck"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -14,7 +14,7 @@ import (
 // goopg's opaque key blobs, the zero btree.IndexFormat. The amcheck tiers take
 // the format from their caller (a per-index catalog property; see the note
 // above amcheck.KeyComparator), so these bytes-only tests state it once here.
-var blobFmt = btree.IndexFormat{}
+var blobFmt = nbtree.IndexFormat{}
 
 // The heapallindexed tier (heapallindexed.go) rests on a single sibling-path
 // invariant: the fingerprint phase (index leaf entries, read by
@@ -133,17 +133,17 @@ func buildRealIndex(t *testing.T, skip map[int]bool) (amcheck.PageSource, func()
 		t.Fatalf("NewPool: %v", err)
 	}
 	rel := storage.RelFileNode{DBOid: 1, RelOid: 9200, Fork: storage.MainFork}
-	bt, err := btree.Create(pool, rel)
+	bt, err := nbtree.Create(pool, rel)
 	if err != nil {
 		_ = pool.Close()
 		_ = mgr.Close()
-		t.Fatalf("btree.Create: %v", err)
+		t.Fatalf("nbtree.Create: %v", err)
 	}
 	for i := range realHAINTuples {
 		if skip[i] {
 			continue
 		}
-		if err := bt.Insert(btree.EncodeInt4(realHAINValue(i)), realHAINHeapTID(i)); err != nil {
+		if err := bt.Insert(nbtree.EncodeInt4(realHAINValue(i)), realHAINHeapTID(i)); err != nil {
 			_ = pool.Close()
 			_ = mgr.Close()
 			t.Fatalf("Insert(row %d): %v", i, err)
@@ -163,10 +163,10 @@ func buildRealIndex(t *testing.T, skip map[int]bool) (amcheck.PageSource, func()
 // index_form_tuple. The wire-layer former will instead consult the index's
 // TupleDesc; what matters here is that the heap-scan -> key-form path reaches the
 // SAME (key, TID) bytes the index stored.
-func realHAINFormer(tid storage.ItemPointer, tuple []byte) (btree.LeafEntry, bool, error) {
+func realHAINFormer(tid storage.ItemPointer, tuple []byte) (nbtree.LeafEntry, bool, error) {
 	hoff := int(storage.DefaultHeapTupleHoff)
 	v := int32(binary.LittleEndian.Uint32(tuple[hoff : hoff+4]))
-	return btree.LeafEntry{Key: btree.EncodeInt4(v), TID: tid}, true, nil
+	return nbtree.LeafEntry{Key: nbtree.EncodeInt4(v), TID: tid}, true, nil
 }
 
 // A real heap scanned into probe entries and a real index fingerprinted into the

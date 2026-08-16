@@ -4,10 +4,10 @@ import (
 	"errors"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/lockmgr"
-	"github.com/goopg/goopg/internal/multixact"
-	"github.com/goopg/goopg/internal/mvcc"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/storage/lmgr"
+	"github.com/goopg/goopg/internal/access/transam/multixact"
+	"github.com/goopg/goopg/internal/access/transam"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -24,7 +24,7 @@ import (
 //
 // M0096-0010.
 type mergeOp struct {
-	plan         *planner.Merge
+	plan         *optimizer.Merge
 	ctx          *Context
 	rowsAffected int64
 	done         bool
@@ -39,7 +39,7 @@ type mergePendingMod struct {
 	tblRef       *catalog.Table      // actual table metadata (child for partitioned)
 	blk          storage.BlockNumber
 	slot         uint16
-	action       planner.MergeActionKind
+	action       optimizer.MergeActionKind
 	newRow       Row  // for UPDATE
 	srcRow       Row  // source row for EPQ re-evaluation
 	tgtRow       Row  // target old row for BEFORE trigger firing
@@ -47,7 +47,7 @@ type mergePendingMod struct {
 	hasDuplicate bool // a second source row also matched this target during scan; error after apply
 }
 
-func newMergeOp(p *planner.Merge) *mergeOp { return &mergeOp{plan: p} }
+func newMergeOp(p *optimizer.Merge) *mergeOp { return &mergeOp{plan: p} }
 
 // errMergeSourceUnmatched is returned by applyMod when the target row was
 // deleted by a concurrent committed transaction during EPQ. The outer loop
@@ -79,7 +79,7 @@ type mergeEPQOnFailedError struct {
 
 func (e *mergeEPQOnFailedError) Error() string { return "merge EPQ: ON failed" }
 
-func (o *mergeOp) Schema() planner.Schema { return o.plan.ReturningSchema }
+func (o *mergeOp) Schema() optimizer.Schema { return o.plan.ReturningSchema }
 func (o *mergeOp) RowsAffected() int64   { return o.rowsAffected }
 
 func (o *mergeOp) Open(ctx *Context) error {
@@ -95,7 +95,7 @@ func (o *mergeOp) Close() error { return nil }
 // The evaluation row has layout: [std || old || new] where std is the
 // post-action row for INSERT/UPDATE and pre-action row for DELETE.
 // M0100-0007.
-func (o *mergeOp) collectReturningRow(action planner.MergeActionKind, oldRow, newRow Row) {
+func (o *mergeOp) collectReturningRow(action optimizer.MergeActionKind, oldRow, newRow Row) {
 	if len(o.plan.Returning) == 0 {
 		return
 	}
@@ -104,11 +104,11 @@ func (o *mergeOp) collectReturningRow(action planner.MergeActionKind, oldRow, ne
 
 	var stdRow, oldR, newR Row
 	switch action {
-	case planner.MergeActionInsert:
+	case optimizer.MergeActionInsert:
 		stdRow = newRow
 		oldR = nullRow
 		newR = newRow
-	case planner.MergeActionDelete:
+	case optimizer.MergeActionDelete:
 		stdRow = oldRow
 		oldR = oldRow
 		newR = nullRow
@@ -160,7 +160,7 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 	n := len(tbl.Columns)
 
-	if err := o.ctx.acquireRelLock(rel, lockmgr.RowExclusiveLock); err != nil {
+	if err := o.ctx.acquireRelLock(rel, lmgr.RowExclusiveLock); err != nil {
 		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 			ee.Pos = o.plan.Pos()
 		}
@@ -224,7 +224,7 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 		scanRel := o.ctx.Catalog.RelFileNode(scanTbl)
 		// Lock child partitions (parent already locked above).
 		if scanTbl != tbl {
-			if err := o.ctx.acquireRelLock(scanRel, lockmgr.RowExclusiveLock); err != nil {
+			if err := o.ctx.acquireRelLock(scanRel, lmgr.RowExclusiveLock); err != nil {
 				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 					ee.Pos = o.plan.Pos()
 				}
@@ -267,7 +267,7 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 				}
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.CmdID, o.ctx.comboStore(), o.ctx.MultiXact) {
+			if !transam.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.CmdID, o.ctx.comboStore(), o.ctx.MultiXact) {
 				continue
 			}
 			tgtRow, err := DecodeHeapTupleRow(scanTbl.Columns, tuple, nil)
@@ -319,7 +319,7 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 						continue
 					}
 					switch clause.Action {
-					case planner.MergeActionUpdate:
+					case optimizer.MergeActionUpdate:
 						newRow := make(Row, n)
 						for i := range tbl.Columns {
 							if i >= len(clause.UpdateSet) || clause.UpdateSet[i] == nil {
@@ -336,13 +336,13 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 						_ = computeGeneratedColumns(tbl.Columns, newRow)
 						// tgtRow/newRow in parent order; applyMod remaps to child at write.
 						mods = append(mods, mergePendingMod{rel: scanRel, tblRef: scanTbl, blk: blk, slot: vt.slotIdx,
-							action: planner.MergeActionUpdate, newRow: newRow,
+							action: optimizer.MergeActionUpdate, newRow: newRow,
 							srcRow: cloneRow(srcRows[si].row), tgtRow: vtTgtRow, srcIdx: si})
-					case planner.MergeActionDelete:
+					case optimizer.MergeActionDelete:
 						mods = append(mods, mergePendingMod{rel: scanRel, tblRef: scanTbl, blk: blk, slot: vt.slotIdx,
-							action: planner.MergeActionDelete, srcRow: cloneRow(srcRows[si].row),
+							action: optimizer.MergeActionDelete, srcRow: cloneRow(srcRows[si].row),
 							tgtRow: vtTgtRow, srcIdx: si})
-					case planner.MergeActionDoNothing:
+					case optimizer.MergeActionDoNothing:
 						// DO NOTHING — skip this row. M0097-0016.
 					}
 					break // first clause wins
@@ -383,7 +383,7 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 					continue
 				}
 				switch clause.Action {
-				case planner.MergeActionUpdate:
+				case optimizer.MergeActionUpdate:
 					newRow := make(Row, n)
 					for i := range tbl.Columns {
 						if i >= len(clause.UpdateSet) || clause.UpdateSet[i] == nil {
@@ -401,16 +401,16 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 					// Store tgtRow/newRow in parent order; applyMod remaps to child for write.
 					mods = append(mods, mergePendingMod{
 						rel: ut.rel, tblRef: ut.tblRef, blk: ut.blk, slot: ut.slot,
-						action: planner.MergeActionUpdate, newRow: newRow,
+						action: optimizer.MergeActionUpdate, newRow: newRow,
 						tgtRow: utTgtRow,
 					})
-				case planner.MergeActionDelete:
+				case optimizer.MergeActionDelete:
 					mods = append(mods, mergePendingMod{
 						rel: ut.rel, tblRef: ut.tblRef, blk: ut.blk, slot: ut.slot,
-						action: planner.MergeActionDelete,
+						action: optimizer.MergeActionDelete,
 						tgtRow: utTgtRow,
 					})
-				case planner.MergeActionDoNothing:
+				case optimizer.MergeActionDoNothing:
 					// skip
 				}
 				break // first matching clause wins
@@ -453,10 +453,10 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 			o.rowsAffected++
 			// Collect RETURNING row using post-EPQ values (mod is a pointer so
 			// applyMod's EPQ re-evaluation of mod.newRow propagates here).
-			if mod.action == planner.MergeActionUpdate {
-				o.collectReturningRow(planner.MergeActionUpdate, mod.tgtRow, mod.newRow)
-			} else if mod.action == planner.MergeActionDelete {
-				o.collectReturningRow(planner.MergeActionDelete, mod.tgtRow, nil)
+			if mod.action == optimizer.MergeActionUpdate {
+				o.collectReturningRow(optimizer.MergeActionUpdate, mod.tgtRow, mod.newRow)
+			} else if mod.action == optimizer.MergeActionDelete {
+				o.collectReturningRow(optimizer.MergeActionDelete, mod.tgtRow, nil)
 			}
 			// Raise duplicate-source error AFTER the apply (and any epqWait blocking)
 			// so concurrent callers see the <waiting...> / <...completed> sequence that
@@ -478,7 +478,7 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 			if clause.Matched {
 				continue
 			}
-			if clause.Action != planner.MergeActionInsert && clause.Action != planner.MergeActionDoNothing {
+			if clause.Action != optimizer.MergeActionInsert && clause.Action != optimizer.MergeActionDoNothing {
 				continue
 			}
 			// Evaluate condition against source row only.
@@ -492,7 +492,7 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 				}
 			}
 			// DO NOTHING — skip this row without inserting. M0097-0016.
-			if clause.Action == planner.MergeActionDoNothing {
+			if clause.Action == optimizer.MergeActionDoNothing {
 				break // first matching clause wins
 			}
 			row := make(Row, n)
@@ -554,7 +554,7 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 			// rows it writes from the rest of the statement, like INSERT.
 			maintainUniqueIndexesForInsert(o.ctx, insertTbl, insertTbl.Columns, row, ptr)
 			o.rowsAffected++
-			o.collectReturningRow(planner.MergeActionInsert, nil, row)
+			o.collectReturningRow(optimizer.MergeActionInsert, nil, row)
 			break // first matching clause wins
 		}
 	}
@@ -592,9 +592,9 @@ func (o *mergeOp) applyMod(rel storage.RelFileNode, tbl *catalog.Table, n int, m
 			destRel, destCols, writeNewRow = o.routeModNewRow(parentTbl, tbl, rel, mod.newRow)
 		}
 		switch mod.action {
-		case planner.MergeActionUpdate:
+		case optimizer.MergeActionUpdate:
 			err = mergeApplyUpdate(o.ctx, rel, tbl, tbl.Columns, mod.blk, mod.slot, writeNewRow, writeTgtRow, destRel, destCols, o.plan.Pos())
-		case planner.MergeActionDelete:
+		case optimizer.MergeActionDelete:
 			err = mergeApplyDelete(o.ctx, rel, tbl, tbl.Columns, mod.blk, mod.slot, writeTgtRow, o.plan.Pos())
 		default:
 			return false, nil
@@ -639,7 +639,7 @@ func (o *mergeOp) applyMod(rel storage.RelFileNode, tbl *catalog.Table, n int, m
 				continue
 			}
 			switch clause.Action {
-			case planner.MergeActionUpdate:
+			case optimizer.MergeActionUpdate:
 				newRow := make(Row, n)
 				for i := range parentTbl.Columns {
 					if i >= len(clause.UpdateSet) || clause.UpdateSet[i] == nil {
@@ -654,15 +654,15 @@ func (o *mergeOp) applyMod(rel storage.RelFileNode, tbl *catalog.Table, n int, m
 				mod.slot = epqErr.newSlot
 				mod.tgtRow = epqTgtNorm // parent order for RETURNING
 				mod.newRow = newRow     // parent order; remapped to child at write time
-				mod.action = planner.MergeActionUpdate
+				mod.action = optimizer.MergeActionUpdate
 				reMatched = true
-			case planner.MergeActionDelete:
+			case optimizer.MergeActionDelete:
 				mod.blk = epqErr.newBlk
 				mod.slot = epqErr.newSlot
 				mod.tgtRow = epqTgtNorm
-				mod.action = planner.MergeActionDelete
+				mod.action = optimizer.MergeActionDelete
 				reMatched = true
-			case planner.MergeActionDoNothing:
+			case optimizer.MergeActionDoNothing:
 				return false, nil
 			}
 			break // first matching clause wins
@@ -716,7 +716,7 @@ func (o *mergeOp) applyNotMatchedBySource(epqRel storage.RelFileNode, epqTbl *ca
 			continue
 		}
 		switch clause.Action {
-		case planner.MergeActionUpdate:
+		case optimizer.MergeActionUpdate:
 			newRow := make(Row, n)
 			for i := range parentTbl.Columns {
 				if i >= len(clause.UpdateSet) || clause.UpdateSet[i] == nil {
@@ -730,7 +730,7 @@ func (o *mergeOp) applyNotMatchedBySource(epqRel storage.RelFileNode, epqTbl *ca
 			mod := &mergePendingMod{
 				rel: epqRel, tblRef: epqTbl,
 				blk: blk, slot: slot,
-				action: planner.MergeActionUpdate, newRow: newRow, tgtRow: tgtRow,
+				action: optimizer.MergeActionUpdate, newRow: newRow, tgtRow: tgtRow,
 			}
 			applied, applyErr := o.applyMod(epqRel, epqTbl, n, mod)
 			if applyErr != nil {
@@ -738,13 +738,13 @@ func (o *mergeOp) applyNotMatchedBySource(epqRel storage.RelFileNode, epqTbl *ca
 			}
 			if applied {
 				o.rowsAffected++
-				o.collectReturningRow(planner.MergeActionUpdate, tgtRow, newRow)
+				o.collectReturningRow(optimizer.MergeActionUpdate, tgtRow, newRow)
 			}
-		case planner.MergeActionDelete:
+		case optimizer.MergeActionDelete:
 			mod := &mergePendingMod{
 				rel: epqRel, tblRef: epqTbl,
 				blk: blk, slot: slot,
-				action: planner.MergeActionDelete, tgtRow: tgtRow,
+				action: optimizer.MergeActionDelete, tgtRow: tgtRow,
 			}
 			applied, applyErr := o.applyMod(epqRel, epqTbl, n, mod)
 			if applyErr != nil {
@@ -752,9 +752,9 @@ func (o *mergeOp) applyNotMatchedBySource(epqRel storage.RelFileNode, epqTbl *ca
 			}
 			if applied {
 				o.rowsAffected++
-				o.collectReturningRow(planner.MergeActionDelete, tgtRow, nil)
+				o.collectReturningRow(optimizer.MergeActionDelete, tgtRow, nil)
 			}
-		case planner.MergeActionDoNothing:
+		case optimizer.MergeActionDoNothing:
 			// skip
 		}
 		break
@@ -767,7 +767,7 @@ func (o *mergeOp) applyNotMatchedBySource(epqRel storage.RelFileNode, epqTbl *ca
 // Without this, the frozen snapshot keeps the concurrent xmax in InProgress,
 // making the deleted tuple appear live and causing an infinite EPQ retry loop.
 func mergeEPQRefreshSnap(ctx *Context) {
-	if ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
+	if ctx.Tx.Isolation != transam.IsolationReadCommitted {
 		return
 	}
 	if ctx.TxnMgr == nil {
@@ -791,7 +791,7 @@ func mergedRow(tgt, src Row) Row {
 
 // mergeClauseCondMatches reports whether clause.Condition is nil (always matches)
 // or evaluates to true against row.
-func mergeClauseCondMatches(clause *planner.MergeWhenClause, row Row, ctx *Context) bool {
+func mergeClauseCondMatches(clause *optimizer.MergeWhenClause, row Row, ctx *Context) bool {
 	if clause.Condition == nil {
 		return true
 	}

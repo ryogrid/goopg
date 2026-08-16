@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/amcheck"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -41,7 +41,7 @@ func TestAmcheckTiersFollowTheIndexFormat(t *testing.T) {
 	defer func() { _ = pool.Close(); _ = mgr.Close() }()
 
 	rel := storage.RelFileNode{DBOid: 1, RelOid: 9301, Fork: storage.MainFork}
-	bt, err := btree.CreateWithOptions(pool, rel, btree.Options{KeyDesc: desc})
+	bt, err := nbtree.CreateWithOptions(pool, rel, nbtree.Options{KeyDesc: desc})
 	if err != nil {
 		t.Fatalf("CreateWithOptions: %v", err)
 	}
@@ -62,7 +62,7 @@ func TestAmcheckTiersFollowTheIndexFormat(t *testing.T) {
 	}
 
 	src := realPageSource(t, pool, rel)
-	tupleFmt := btree.IndexFormatFor(desc)
+	tupleFmt := nbtree.IndexFormatFor(desc)
 
 	// (a) The leaf walk under the resolved format yields whole index tuples.
 	entries, err := amcheck.CollectBtreeLeafEntries(src, tupleFmt)
@@ -73,10 +73,10 @@ func TestAmcheckTiersFollowTheIndexFormat(t *testing.T) {
 		t.Fatalf("tuple-format leaf walk collected %d entries, want %d", len(entries), n)
 	}
 	for _, e := range entries {
-		if got := btree.PGIndexTupleSize(e.Key); got != len(e.Key) {
+		if got := nbtree.PGIndexTupleSize(e.Key); got != len(e.Key) {
 			t.Fatalf("leaf key is not a whole index tuple: t_info size %d, len %d", got, len(e.Key))
 		}
-		if got := btree.PGIndexTupleTID(e.Key); got != e.TID {
+		if got := nbtree.PGIndexTupleTID(e.Key); got != e.TID {
 			t.Fatalf("tuple TID %v disagrees with the reported entry TID %v", got, e.TID)
 		}
 	}
@@ -85,7 +85,7 @@ func TestAmcheckTiersFollowTheIndexFormat(t *testing.T) {
 	// header-stripped payload. If both formats agreed, the parameter would be
 	// decorative and the flip (B2-c) would silently verify under the wrong
 	// decoder.
-	blobEntries, err := amcheck.CollectBtreeLeafEntries(src, btree.IndexFormat{})
+	blobEntries, err := amcheck.CollectBtreeLeafEntries(src, nbtree.IndexFormat{})
 	if err != nil {
 		t.Fatalf("CollectBtreeLeafEntries(blob format): %v", err)
 	}
@@ -107,7 +107,7 @@ func TestAmcheckTiersFollowTheIndexFormat(t *testing.T) {
 	// the wrong order over tuple bytes — the comparator and the format are the
 	// same per-index catalog resolution and must be supplied together).
 	cmp := func(a, b []byte) int {
-		c, cerr := btree.ComparePGIndexTuples(desc, a, b)
+		c, cerr := nbtree.ComparePGIndexTuples(desc, a, b)
 		if cerr != nil {
 			t.Fatalf("ComparePGIndexTuples: %v", cerr)
 		}
@@ -139,7 +139,7 @@ func TestAmcheckTiersFollowTheIndexFormat(t *testing.T) {
 		if perr != nil {
 			t.Fatalf("read block %d: %v", blk, perr)
 		}
-		if op := btree.ParseOpaque(p); blk == btree.MetaBlock || op.IsLeaf() || op.IsDeleted() {
+		if op := nbtree.ParseOpaque(p); blk == nbtree.MetaBlock || op.IsLeaf() || op.IsDeleted() {
 			continue
 		}
 		internals++
@@ -161,19 +161,19 @@ func TestAmcheckTiersFollowTheIndexFormat(t *testing.T) {
 // tupleFmtDesc is a one-column int4 key descriptor with the int4 opclass
 // comparator — the shape internal/executor's buildPGIndexKeyDesc produces for a
 // single-int4-column index.
-func tupleFmtDesc() *btree.PGIndexKeyDesc {
-	attr := btree.PGKeyAttr{PGIndexAttr: btree.PGIndexAttr{Len: 4, ByVal: true, AlignBy: 4, Storage: 'p'}}
-	attr.Compare = btree.PGCompareInt4
-	return &btree.PGIndexKeyDesc{Attrs: []btree.PGKeyAttr{attr}}
+func tupleFmtDesc() *nbtree.PGIndexKeyDesc {
+	attr := nbtree.PGKeyAttr{PGIndexAttr: nbtree.PGIndexAttr{Len: 4, ByVal: true, AlignBy: 4, Storage: 'p'}}
+	attr.Compare = nbtree.PGCompareInt4
+	return &nbtree.PGIndexKeyDesc{Attrs: []nbtree.PGKeyAttr{attr}}
 }
 
 // tupleFmtKey forms the whole nbtree index tuple that a tuple-format index
 // stores as its item key (PG's index_form_tuple).
-func tupleFmtKey(t *testing.T, desc *btree.PGIndexKeyDesc, v int32, tid storage.ItemPointer) []byte {
+func tupleFmtKey(t *testing.T, desc *nbtree.PGIndexKeyDesc, v int32, tid storage.ItemPointer) []byte {
 	t.Helper()
 	val := make([]byte, 4)
 	binary.LittleEndian.PutUint32(val, uint32(v))
-	raw, err := btree.FormPGIndexTuple(desc.Physical(), [][]byte{val}, []bool{false}, tid)
+	raw, err := nbtree.FormPGIndexTuple(desc.Physical(), [][]byte{val}, []bool{false}, tid)
 	if err != nil {
 		t.Fatalf("FormPGIndexTuple: %v", err)
 	}

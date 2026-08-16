@@ -6,28 +6,28 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/plpgsql"
 )
 
 // callOp executes `CALL proc(...)` (M0015 Stage B).
 type callOp struct {
-	plan    *planner.Call
+	plan    *optimizer.Call
 	ctx     *Context
 	routine *catalog.Routine
 	args    []Datum
 	done    bool
 }
 
-func newCallOp(p *planner.Call) *callOp {
+func newCallOp(p *optimizer.Call) *callOp {
 	return &callOp{plan: p}
 }
 
-func (o *callOp) Schema() planner.Schema {
+func (o *callOp) Schema() optimizer.Schema {
 	if o.routine == nil {
 		return nil
 	}
-	var schema planner.Schema
+	var schema optimizer.Schema
 	for i, mode := range o.routine.ArgModes {
 		if mode == "o" || mode == "b" {
 			colName := ""
@@ -38,7 +38,7 @@ func (o *callOp) Schema() planner.Schema {
 			if i < len(o.routine.ArgTypes) {
 				colType = o.routine.ArgTypes[i]
 			}
-			schema = append(schema, planner.SchemaColumn{
+			schema = append(schema, optimizer.SchemaColumn{
 				Name: colName,
 				Type: colType,
 			})
@@ -352,7 +352,7 @@ func evalCallDefault(expr string, ctx *Context) (Datum, error) {
 	if err != nil || len(stmts) != 1 {
 		return NullDatum, nil
 	}
-	node, err := planner.Plan(stmts[0], ctxPlanCatalog(ctx))
+	node, err := optimizer.Plan(stmts[0], ctxPlanCatalog(ctx))
 	if err != nil {
 		return NullDatum, nil
 	}

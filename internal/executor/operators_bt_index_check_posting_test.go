@@ -31,7 +31,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
@@ -53,12 +53,12 @@ func leafPostingStats(t *testing.T, ctx *Context, idxName string) (entries, post
 		t.Fatalf("index %q not found", idxName)
 	}
 	rel := ctx.Catalog.IndexRelFileNode(idx)
-	fm := btree.IndexFormatFor(ctx.pgIndexKeyDesc(idx))
+	fm := nbtree.IndexFormatFor(ctx.pgIndexKeyDesc(idx))
 	nblocks, err := ctx.Pool.NBlocks(rel)
 	if err != nil {
 		t.Fatalf("NBlocks: %v", err)
 	}
-	for blk := btree.MetaBlock + 1; blk < nblocks; blk++ {
+	for blk := nbtree.MetaBlock + 1; blk < nblocks; blk++ {
 		s, perr := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if perr != nil {
 			t.Fatalf("pin block %d: %v", blk, perr)
@@ -66,7 +66,7 @@ func leafPostingStats(t *testing.T, ctx *Context, idxName string) (entries, post
 		page := make(storage.Page, len(s.Page()))
 		copy(page, s.Page())
 		ctx.Pool.Unpin(s)
-		if !btree.ParseOpaque(page).IsLeaf() {
+		if !nbtree.ParseOpaque(page).IsLeaf() {
 			continue
 		}
 		its, err := fm.PageLeafItems(page)

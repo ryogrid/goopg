@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/storage"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // TestPgStatIORowCount asserts the pg_stat_io view emits upstream's exact
@@ -316,7 +316,7 @@ func TestPgStatIOExtendTimeRendered(t *testing.T) {
 // other untouched wal-object cell still renders.
 func TestPgStatIOWalFsyncsRendered(t *testing.T) {
 	walDir := filepath.Join(t.TempDir(), "pg_wal")
-	w, err := wal.NewWriter(wal.Config{WALDir: walDir, SegmentSize: 128})
+	w, err := xlog.NewWriter(xlog.Config{WALDir: walDir, SegmentSize: 128})
 	if err != nil {
 		t.Fatal(err)
 	}

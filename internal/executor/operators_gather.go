@@ -21,8 +21,8 @@ import (
 	"context"
 	"errors"
 
-	"github.com/goopg/goopg/internal/mctx"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/utils/mmgr"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // gatherBatchRows is how many rows a worker accumulates before sending.
@@ -47,9 +47,9 @@ type rowBatch struct {
 
 // gatherOp implements planner.Gather.
 type gatherOp struct {
-	plan   *planner.Gather
+	plan   *optimizer.Gather
 	ctx    *Context
-	schema planner.Schema
+	schema optimizer.Schema
 
 	// buildChild constructs a fresh operator tree over the partial plan for
 	// one worker. Injected so tests can drive the operator without a planner.
@@ -58,7 +58,7 @@ type gatherOp struct {
 	group   *ParallelGroup
 	ch      chan rowBatch
 	workers []*Context
-	arenas  []*mctx.Context
+	arenas  []*mmgr.Context
 
 	// cur is the batch being drained into Next()'s return values.
 	cur    []Row
@@ -100,11 +100,11 @@ type gatherOp struct {
 	pbm *parallelBitmapState
 }
 
-func newGatherOp(p *planner.Gather, buildChild func() (Operator, error)) *gatherOp {
+func newGatherOp(p *optimizer.Gather, buildChild func() (Operator, error)) *gatherOp {
 	return &gatherOp{plan: p, schema: p.Output(), buildChild: buildChild}
 }
 
-func (o *gatherOp) Schema() planner.Schema { return o.schema }
+func (o *gatherOp) Schema() optimizer.Schema { return o.schema }
 
 // WorkersLaunched reports how many workers actually started, which EXPLAIN
 // ANALYZE renders as PG's `Workers Launched:`. It can be lower than
@@ -119,7 +119,7 @@ func (o *gatherOp) WorkersLaunched() int { return o.launched }
 // workers claim disjoint pages from it.
 func (o *gatherOp) prebuildBitmapScan(ctx *Context) error {
 	// Decide from the PLAN, before building anything.
-	if !planner.HasBitmapScan(o.plan.Child) {
+	if !optimizer.HasBitmapScan(o.plan.Child) {
 		return nil
 	}
 	tree, err := o.buildChild()
@@ -248,7 +248,7 @@ func (o *gatherOp) Open(ctx *Context) error {
 	// starts: mctx.Acquire appends to parent.children without synchronisation,
 	// so concurrent acquisition is itself a slice-append race.
 	for i := 0; i < n; i++ {
-		arena := mctx.Acquire(ctx.Mctx, mctx.KindStmt)
+		arena := mmgr.Acquire(ctx.Mctx, mmgr.KindStmt)
 		o.arenas = append(o.arenas, arena)
 		o.workers = append(o.workers, NewWorkerContext(ctx, arena, o.group.Context()))
 	}

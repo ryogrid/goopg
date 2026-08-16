@@ -15,18 +15,18 @@ import (
 	"strings"
 	"time"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/analyzer"
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/config"
-	"github.com/goopg/goopg/internal/lockmgr"
-	"github.com/goopg/goopg/internal/mctx"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/utils/misc"
+	"github.com/goopg/goopg/internal/storage/lmgr"
+	"github.com/goopg/goopg/internal/utils/mmgr"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/plpgsql"
 	"github.com/goopg/goopg/internal/storage"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // pgEpoch is the PostgreSQL epoch: 2000-01-01 00:00:00 UTC.
@@ -39,12 +39,12 @@ var pgEpoch = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 // output rows; the wire-protocol path emits the canonical
 // CommandComplete tag for the verb.
 type ddlOp struct {
-	plan *planner.DDL
+	plan *optimizer.DDL
 	ctx  *Context
 	done bool
 }
 
-func newDDLOp(p *planner.DDL) *ddlOp { return &ddlOp{plan: p} }
+func newDDLOp(p *optimizer.DDL) *ddlOp { return &ddlOp{plan: p} }
 
 // planCatalog returns the search-path-aware catalog for planner.Plan calls.
 // Falls back to the raw catalog when PlanCatalog is not set. M0097-0022.
@@ -76,7 +76,7 @@ func ctxPlanCatalog(ctx *Context) catalog.Catalog {
 	return ctx.Catalog
 }
 
-func (o *ddlOp) Schema() planner.Schema { return nil }
+func (o *ddlOp) Schema() optimizer.Schema { return nil }
 func (o *ddlOp) Open(ctx *Context) error {
 	if ctx.Catalog == nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "DDL requires Catalog in Context"}
@@ -345,7 +345,7 @@ func (o *ddlOp) execCreateTablespace(s *parser.CreateTablespaceStmt) error {
 		// (tablespace.c). Relation files for this tablespace live under it;
 		// pg_basebackup expects it present so a restored cluster's relfiles
 		// resolve. MkdirAll creates the parent <oid> dir in the same call.
-		versionDir := filepath.Join(dir, config.TablespaceVersionDirectory)
+		versionDir := filepath.Join(dir, misc.TablespaceVersionDirectory)
 		if mkErr := os.MkdirAll(versionDir, 0o700); mkErr != nil {
 			// Roll back the registry insert so a retry can succeed.
 			o.ctx.Catalog.DropTablespace(s.Name)
@@ -373,7 +373,7 @@ func (o *ddlOp) execCreateTablespace(s *parser.CreateTablespaceStmt) error {
 		return fmt.Errorf("pg_shdepend write: %w", err)
 	}
 	if o.ctx.WAL != nil {
-		rec, encErr := wal.EncodeTblspcCreatePG(oid, location, o.ctx.Tx.XID)
+		rec, encErr := xlog.EncodeTblspcCreatePG(oid, location, o.ctx.Tx.XID)
 		if encErr != nil {
 			return fmt.Errorf("encode tblspc-create: %w", encErr)
 		}
@@ -426,7 +426,7 @@ func (o *ddlOp) execDropTablespace(s *parser.DropTablespaceStmt) error {
 	deleteTablespaceCatalogRow(o.ctx, oid)
 	deleteShdependRowsForObject(o.ctx, pgTablespaceClassID, oid)
 	if o.ctx.WAL != nil {
-		rec, encErr := wal.EncodeTblspcDropPG(oid, o.ctx.Tx.XID)
+		rec, encErr := xlog.EncodeTblspcDropPG(oid, o.ctx.Tx.XID)
 		if encErr != nil {
 			return fmt.Errorf("encode tblspc-drop: %w", encErr)
 		}
@@ -4224,7 +4224,7 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 		return nil
 	}
 	// Plan the SELECT to derive the schema.
-	selectNode, err := planner.Plan(s.SelectSource, o.planCatalog())
+	selectNode, err := optimizer.Plan(s.SelectSource, o.planCatalog())
 	if err != nil {
 		return &ExecError{Code: "42601", Pos: s.Pos(), Message: err.Error()}
 	}
@@ -5255,7 +5255,7 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 	// v0-planner "feature not supported" (0A000) errors are ignored so the
 	// planner's incompleteness does not reject views upstream would accept;
 	// those still fail at reference time. M0097-0003 (functional_deps).
-	if _, err := planner.Plan(s.Query, o.planCatalog()); err != nil {
+	if _, err := optimizer.Plan(s.Query, o.planCatalog()); err != nil {
 		// Surface the validation failure as an *ExecError so the wire
 		// layer renders a clean "ERROR:  <message>" line. Returning the
 		// raw *planner.PlanError would let its Error() string —
@@ -5265,7 +5265,7 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 		// "feature not supported" (0A000) errors are still ignored so
 		// the planner's incompleteness does not reject views upstream
 		// would accept; those fail at reference time instead.
-		if pe, ok := err.(*planner.PlanError); ok {
+		if pe, ok := err.(*optimizer.PlanError); ok {
 			// Ignore feature-not-supported (0A000) and circular-view (42P10)
 			// errors — PostgreSQL allows circular/forward-referencing views;
 			// they only error when accessed, not when defined.
@@ -5290,7 +5290,7 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 	// new body's plan doesn't recurse back into the old definition
 	// (circular-view stack overflow). The view is removed only for the
 	// duration of planning, then re-inserted when we call CreateView below.
-	var planSchema planner.Schema
+	var planSchema optimizer.Schema
 	// CreateView below always assigns a fresh OID, even on OR REPLACE — the
 	// old view's pg_class/pg_attribute heap rows (if any) would otherwise
 	// linger under the stale OID and resurrect a duplicate registration for
@@ -5307,7 +5307,7 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 			_ = im.DropView(s.Name, true, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) // remove old def so plan can't cycle back to it
 		}
 	}
-	if viewPlan, planErr := planner.Plan(s.Query, o.planCatalog()); planErr == nil {
+	if viewPlan, planErr := optimizer.Plan(s.Query, o.planCatalog()); planErr == nil {
 		planSchema = viewPlan.Output()
 	}
 	// Ignore plan errors during view creation (including circular-view 42P10).
@@ -6197,7 +6197,7 @@ func routineCascadeDisplayName(r *catalog.Routine) string {
 // M0118-0008.
 func (o *ddlOp) dropTableByRef(name parser.ObjectName, tbl *catalog.Table, allowDefer bool) error {
 	// AccessExclusiveLock on the table being dropped (transaction-scoped).
-	if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.AccessExclusiveLock); err != nil {
+	if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lmgr.AccessExclusiveLock); err != nil {
 		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 			ee.Pos = name.Pos()
 		}
@@ -6211,7 +6211,7 @@ func (o *ddlOp) dropTableByRef(name parser.ObjectName, tbl *catalog.Table, allow
 	// (reindex-concurrently-toast, design 0118-0088).
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 		if toastRel, has := im.ToastRelFileNode(o.ctx.Catalog.RelFileNode(tbl)); has {
-			if err := o.ctx.acquireDDLLockTxn(toastRel, lockmgr.AccessExclusiveLock); err != nil {
+			if err := o.ctx.acquireDDLLockTxn(toastRel, lmgr.AccessExclusiveLock); err != nil {
 				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 					ee.Pos = name.Pos()
 				}
@@ -6290,7 +6290,7 @@ func (o *ddlOp) dropTableByRefImmediate(name parser.ObjectName, tbl *catalog.Tab
 	// dropping transaction commits. M0118-0008 (detach-partition-concurrently-3).
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && tbl.DetachPendingEpoch != 0 && tbl.PartitionParentOID != 0 {
 		if parentTbl, ok2 := im.LookupTableByOID(tbl.PartitionParentOID); ok2 {
-			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(parentTbl), lockmgr.AccessExclusiveLock); err != nil {
+			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(parentTbl), lmgr.AccessExclusiveLock); err != nil {
 				if ee, ok3 := err.(*ExecError); ok3 && ee.Pos == 0 {
 					ee.Pos = name.Pos()
 				}
@@ -6583,9 +6583,9 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 		cicWaitSlots = o.ctx.TxnMgr.SnapshotActiveOtherSlots(o.ctx.Tx.Handle)
 	}
 	// For partial indexes, resolve the WHERE predicate so bulk build can filter rows.
-	var resolvedPred planner.Expr
+	var resolvedPred optimizer.Expr
 	if s.HasPredicate && s.Predicate != nil {
-		resolvedPred, _ = planner.ResolveIndexPredicate(s.Predicate, tbl)
+		resolvedPred, _ = optimizer.ResolveIndexPredicate(s.Predicate, tbl)
 	}
 	// Const-fold a partial-index predicate that references no table columns,
 	// mirroring PostgreSQL's eval_const_expressions over the index predicate in
@@ -6596,14 +6596,14 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	// block another session (isolation spec multiple-cic). The stored predicate
 	// (idx.Predicate) keeps the original expression so pg_get_indexdef / pg_dump
 	// still render the WHERE clause verbatim.
-	if resolvedPred != nil && !planner.ExprContainsColumnRef(resolvedPred) {
+	if resolvedPred != nil && !optimizer.ExprContainsColumnRef(resolvedPred) {
 		pv, pErr := evalExpr(resolvedPred, nil, o.ctx)
 		if pErr != nil {
 			return pErr
 		}
 		if pv.IsNull() || (pv.Kind == KindBool && !pv.BoolValue()) {
 			// Constant FALSE/NULL ⇒ no heap tuple qualifies; build an empty index.
-			resolvedPred = &planner.BooleanConst{}
+			resolvedPred = &optimizer.BooleanConst{}
 		} else {
 			// Constant TRUE ⇒ every heap tuple qualifies; drop the predicate.
 			resolvedPred = nil
@@ -6753,7 +6753,7 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 // upstream's ChooseRelationName. resolvedPred carries the (already const-folded)
 // partial-index predicate so each child filters identically. M0118-0008
 // (partition-drop-index-locking isolation spec).
-func (o *ddlOp) createPartitionChildIndexes(s *parser.CreateIndexStmt, parentTbl *catalog.Table, parentIdx *catalog.Index, resolvedPred planner.Expr) error {
+func (o *ddlOp) createPartitionChildIndexes(s *parser.CreateIndexStmt, parentTbl *catalog.Table, parentIdx *catalog.Index, resolvedPred optimizer.Expr) error {
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
 		return nil
@@ -7212,7 +7212,7 @@ func (o *ddlOp) lockDropIndexSelf(idx *catalog.Index) error {
 	if idx == nil {
 		return nil
 	}
-	return o.ctx.acquireDDLLockTxn(o.ctx.Catalog.IndexRelFileNode(idx), lockmgr.AccessExclusiveLock)
+	return o.ctx.acquireDDLLockTxn(o.ctx.Catalog.IndexRelFileNode(idx), lmgr.AccessExclusiveLock)
 }
 
 // lockDropIndexChildren AccessExclusive-locks every partition-descendant child
@@ -7235,7 +7235,7 @@ func (o *ddlOp) lockDropIndexChildren(idx *catalog.Index) error {
 				continue
 			}
 			visited[ci.OID] = true
-			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.IndexRelFileNode(ci), lockmgr.AccessExclusiveLock); err != nil {
+			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.IndexRelFileNode(ci), lmgr.AccessExclusiveLock); err != nil {
 				return err
 			}
 			if err := rec(ci.OID); err != nil {
@@ -7276,7 +7276,7 @@ func (o *ddlOp) lockPartitionSubtreeAccessExcl(im *catalog.InMemory, tbl *catalo
 		return nil
 	}
 	visited[tbl.OID] = true
-	if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.AccessExclusiveLock); err != nil {
+	if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lmgr.AccessExclusiveLock); err != nil {
 		return err
 	}
 	for _, child := range im.PartitionChildren(tbl.OID) {
@@ -7330,7 +7330,7 @@ func (o *ddlOp) lockDefaultPartitionForAttach(parent *catalog.Table) error {
 	for _, child := range im.PartitionChildren(parent.OID) {
 		for _, pb := range child.PartitionBounds {
 			if pb.IsDefault {
-				return o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(child), lockmgr.AccessExclusiveLock)
+				return o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(child), lmgr.AccessExclusiveLock)
 			}
 		}
 	}
@@ -7461,7 +7461,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			}
 			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Name.String())}
 		}
-		if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.ShareRowExclusiveLock); err != nil {
+		if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lmgr.ShareRowExclusiveLock); err != nil {
 			if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 				ee.Pos = s.Pos()
 			}
@@ -7484,7 +7484,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			}
 			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Name.String())}
 		}
-		if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.AccessExclusiveLock); err != nil {
+		if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lmgr.AccessExclusiveLock); err != nil {
 			if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 				ee.Pos = s.Pos()
 			}
@@ -7725,7 +7725,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// FOR UPDATE proceeds. No-op in autocommit / for system catalogs
 			// (acquireDDLLockTxn), keeping the pg_dump-restore / HammerDB-load
 			// path lock-free. M0118-0008 (alter-table-2 isolation spec).
-			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.ShareRowExclusiveLock); err != nil {
+			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lmgr.ShareRowExclusiveLock); err != nil {
 				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 					ee.Pos = act.Pos()
 				}
@@ -7811,7 +7811,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// inside an open transaction so a concurrent ALTER waits, while a
 			// no-op in autocommit / for system catalogs keeps the dump/load
 			// path lock-free. M0118-0008 (alter-table-1 isolation spec).
-			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.ShareUpdateExclusiveLock); err != nil {
+			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lmgr.ShareUpdateExclusiveLock); err != nil {
 				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 					ee.Pos = act.Pos()
 				}
@@ -7968,7 +7968,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// enforceability, rather than adding a new one.
 			// AlterTableGetLockLevel maps AT_AlterConstraint to
 			// AccessExclusiveLock (tablecmds.c ~4703).
-			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.AccessExclusiveLock); err != nil {
+			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lmgr.AccessExclusiveLock); err != nil {
 				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 					ee.Pos = act.Pos()
 				}
@@ -8240,7 +8240,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					}
 					return ferr
 				}
-				epoch := mvcc.NextPartitionDetachEpoch()
+				epoch := transam.NextPartitionDetachEpoch()
 				im.MarkPartitionDetachPending(childTbl.OID, epoch)
 				// The wait is HYBRID, because goopg's locks are statement-scoped
 				// and BEGIN takes a snapshot — neither alone reproduces upstream's
@@ -8352,7 +8352,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				// acquires+releases transiently in autocommit (the wait still
 				// happens during acquisition). The wait is rendered `<waiting ...>`
 				// by the runner's timing.
-				if werr := o.ctx.acquireRelLockMaybeTransient(o.ctx.Catalog.RelFileNode(childTbl), lockmgr.AccessExclusiveLock); werr != nil {
+				if werr := o.ctx.acquireRelLockMaybeTransient(o.ctx.Catalog.RelFileNode(childTbl), lmgr.AccessExclusiveLock); werr != nil {
 					if ee, ok := werr.(*ExecError); ok && ee.Pos == 0 {
 						ee.Pos = act.Pos()
 					}
@@ -8745,7 +8745,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// Take a transaction-scoped AccessExclusiveLock on the child being added
 			// to the inheritance tree, mirroring PG ATExecAddInherit. No-op in
 			// autocommit / for system catalogs. M0118-0008 (alter-table-4).
-			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.AccessExclusiveLock); err != nil {
+			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lmgr.AccessExclusiveLock); err != nil {
 				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 					ee.Pos = act.Pos()
 				}
@@ -8809,7 +8809,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// a concurrent SELECT on the parent that still includes this child (the
 			// unlink is deferred to commit below) blocks on this lock until commit.
 			// No-op in autocommit / for system catalogs. M0118-0008 (alter-table-4).
-			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.AccessExclusiveLock); err != nil {
+			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lmgr.AccessExclusiveLock); err != nil {
 				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 					ee.Pos = act.Pos()
 				}
@@ -10728,7 +10728,7 @@ func (o *ddlOp) forEachLiveRow(tbl *catalog.Table, fn func(row Row) error) error
 	if err != nil {
 		return &ExecError{Code: "XX000", Message: err.Error()}
 	}
-	sctx := mctx.Acquire(o.ctx.Mctx, mctx.KindExpr)
+	sctx := mmgr.Acquire(o.ctx.Mctx, mmgr.KindExpr)
 	defer sctx.Release()
 	var scanRow Row
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
@@ -10809,7 +10809,7 @@ func (o *ddlOp) validateCheckConstraintRows(tbl *catalog.Table, conName, exprSQL
 		}
 		return &ExecError{Code: "42601", Pos: 0, Message: err.Error()}
 	}
-	planned, err := planner.ResolveIndexPredicate(expr, tbl)
+	planned, err := optimizer.ResolveIndexPredicate(expr, tbl)
 	if err != nil {
 		// Convert *planner.PlanError so the wire layer renders a clean
 		// "ERROR:  <message>" line — returning the raw PlanError would let its
@@ -10818,7 +10818,7 @@ func (o *ddlOp) validateCheckConstraintRows(tbl *catalog.Table, conName, exprSQL
 		// operators_ddl.go:5261-5268). PG emits no errposition for a
 		// column-not-found in a CHECK predicate, so the PlanError's Pos (0 for
 		// these) is forwarded as-is.
-		if pe, ok := err.(*planner.PlanError); ok {
+		if pe, ok := err.(*optimizer.PlanError); ok {
 			return &ExecError{Code: pe.Code, Message: pe.Message, Hint: pe.Hint, Pos: pe.Pos}
 		}
 		return err
@@ -10863,7 +10863,7 @@ func (o *ddlOp) validateFKConstraintExistingRows(fkOwnerTbl *catalog.Table, fk c
 	if err != nil {
 		return &ExecError{Code: "XX000", Message: err.Error()}
 	}
-	sctx := mctx.Acquire(o.ctx.Mctx, mctx.KindExpr)
+	sctx := mmgr.Acquire(o.ctx.Mctx, mmgr.KindExpr)
 	defer sctx.Release()
 	var scanRow Row
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
@@ -11109,7 +11109,7 @@ func (o *ddlOp) createExclusionIndexStub(pos int, idxName parser.ObjectName, tbl
 // an optional trailing arg (nil/omitted for the many call sites that create
 // a plain constraint-backed index with none of these properties).
 type btreeIndexProps struct {
-	Predicate        planner.Expr // resolved WHERE predicate for build-time row filtering; nil = no predicate
+	Predicate        optimizer.Expr // resolved WHERE predicate for build-time row filtering; nil = no predicate
 	HasPredicate     bool
 	PredicateString  string
 	IncludeColumns   []string
@@ -11157,9 +11157,9 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 				// Resolve exactly as the build path does (resolveIndexKeyExprs,
 				// encodeExprIndexKey): ResolveIndexPredicate populates the
 				// ColumnRef Type that ExprResultType then reports.
-				planExpr, err := planner.ResolveIndexPredicate(colExprs[i], tbl)
+				planExpr, err := optimizer.ResolveIndexPredicate(colExprs[i], tbl)
 				if err == nil && planExpr != nil {
-					if typ, ok := planner.ExprResultType(planExpr); ok {
+					if typ, ok := optimizer.ExprResultType(planExpr); ok {
 						if !isSupportedBTreeKeyType(typ.Name) {
 							// Also accept user-defined enum types. M0097-0022.
 							isEnum := false
@@ -11238,7 +11238,7 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 	}
 	idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
 	var buildErr error
-	var predExpr planner.Expr
+	var predExpr optimizer.Expr
 	if xp != nil {
 		predExpr = xp.Predicate
 	}
@@ -11284,7 +11284,7 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 // is not derivable from idxRel — REINDEX CONCURRENTLY builds into a shadow
 // relfile — and the bulk sort needs it: the build's own ordering and every
 // later reader's must come from the same key descriptor.
-func (o *ddlOp) bulkBuildBTreeFull(idx *catalog.Index, idxRel storage.RelFileNode, tbl *catalog.Table, cols []*catalog.Column, keyExprs []planner.Expr, unique, nullsNotDistinct bool, indexName string, pos int, predExpr planner.Expr) error {
+func (o *ddlOp) bulkBuildBTreeFull(idx *catalog.Index, idxRel storage.RelFileNode, tbl *catalog.Table, cols []*catalog.Column, keyExprs []optimizer.Expr, unique, nullsNotDistinct bool, indexName string, pos int, predExpr optimizer.Expr) error {
 	entries, err := o.collectBTreeEntries(idx, tbl, cols, keyExprs, unique, nullsNotDistinct, indexName, pos, predExpr)
 	if err != nil {
 		return err
@@ -11341,13 +11341,13 @@ func btreeBuildKeyDescription(idx *catalog.Index, cols []*catalog.Column, row Ro
 // also performs PG's duplicate-key check (23505, comparetup_index_btree
 // tuplesortvariants.c:1686-1693) over the sorted entries.
 
-func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols []*catalog.Column, keyExprs []planner.Expr, unique, nullsNotDistinct bool, indexName string, pos int, predExpr planner.Expr) ([]btree.BulkEntry, error) {
+func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols []*catalog.Column, keyExprs []optimizer.Expr, unique, nullsNotDistinct bool, indexName string, pos int, predExpr optimizer.Expr) ([]nbtree.BulkEntry, error) {
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 	nBlocks, err := o.ctx.Pool.NBlocks(rel)
 	if err != nil {
 		return nil, &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 	}
-	var entries []btree.BulkEntry
+	var entries []nbtree.BulkEntry
 	// seenNull dedups null-bearing rows for a NULLS NOT DISTINCT unique index
 	// (NULLs collide). Lazily allocated; nil for every default index so non-NND
 	// builds are byte-for-byte unchanged.
@@ -11358,7 +11358,7 @@ func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols
 	// Datum lifetime ends at encodeBTreeKeyForColumn — the encoded
 	// BulkEntry.Key is an explicit append-copy, so no Datum reference
 	// outlives the Reset boundary.
-	sctxDDL := mctx.Acquire(o.ctx.Mctx, mctx.KindExpr)
+	sctxDDL := mmgr.Acquire(o.ctx.Mctx, mmgr.KindExpr)
 	defer sctxDDL.Release()
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
@@ -11474,7 +11474,7 @@ func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols
 				// during bulk build while expression evaluation is unsupported.
 				continue
 			}
-			entry := btree.BulkEntry{Key: append([]byte(nil), key...), Ptr: storage.ItemPointer{Block: blk, Offset: i}}
+			entry := nbtree.BulkEntry{Key: append([]byte(nil), key...), Ptr: storage.ItemPointer{Block: blk, Offset: i}}
 			if unique {
 				// Capture the rendered "Key (cols)=(vals)" description now —
 				// after the post-sort duplicate walk below the source row is
@@ -11530,7 +11530,7 @@ func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols
 // test). Both are blob-format assertions — see `indexBuildEntryKey` and
 // `sortBuildEntriesFindDuplicate` for what the tuple format needs instead, and
 // the deferral-ledger row for B2-c-v.
-func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*catalog.Column, unique, nullsNotDistinct bool, indexName string, pos int) error {
+func (o *ddlOp) backfillBTree(tree *nbtree.BTree, tbl *catalog.Table, cols []*catalog.Column, unique, nullsNotDistinct bool, indexName string, pos int) error {
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 	nBlocks, err := o.ctx.Pool.NBlocks(rel)
 	if err != nil {
@@ -11542,7 +11542,7 @@ func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*cat
 	// M0074-0004 / M0107-0001: per-page mctx for varchar / char / text payloads.
 	// Resulting key is copied by caller (`seen[string(key)]` and `tree.Insert`),
 	// so Datums need not outlive the per-page Reset boundary.
-	sctxDDL := mctx.Acquire(o.ctx.Mctx, mctx.KindExpr)
+	sctxDDL := mmgr.Acquire(o.ctx.Mctx, mmgr.KindExpr)
 	defer sctxDDL.Release()
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
@@ -11720,7 +11720,7 @@ func encodeCompositeBTreeKey(row Row, cols []*catalog.Column, pos int) (key []by
 //     timestamp/bool/enum/bytea by kind, plus float4/float8 by resolved type;
 //     see its comment for the encoder per kind)
 //   - otherwise                       → bytes appended in key-column order
-func encodeCompositeBTreeKeyWithExprs(ctx *Context, row Row, cols []*catalog.Column, keyExprs []planner.Expr, pos int) (key []byte, hasNullKey bool, err *ExecError) {
+func encodeCompositeBTreeKeyWithExprs(ctx *Context, row Row, cols []*catalog.Column, keyExprs []optimizer.Expr, pos int) (key []byte, hasNullKey bool, err *ExecError) {
 	var out []byte
 	for i, col := range cols {
 		if col == nil {
@@ -11765,21 +11765,21 @@ func encodeCompositeBTreeKeyWithExprs(ctx *Context, row Row, cols []*catalog.Col
 // (idx.ColExprs, set where idx.Columns[i] == "") against tbl so the bulk-build
 // path can evaluate them per row. Returns nil when idx has no expression key
 // column, which keeps every plain index on the byte-for-byte-unchanged path.
-func resolveIndexKeyExprs(tbl *catalog.Table, idx *catalog.Index) []planner.Expr {
+func resolveIndexKeyExprs(tbl *catalog.Table, idx *catalog.Index) []optimizer.Expr {
 	if idx == nil || len(idx.ColExprs) == 0 {
 		return nil
 	}
-	var out []planner.Expr
+	var out []optimizer.Expr
 	for i, name := range idx.Columns {
 		if name != "" || i >= len(idx.ColExprs) || idx.ColExprs[i] == nil {
 			continue
 		}
-		planExpr, err := planner.ResolveIndexPredicate(*idx.ColExprs[i], tbl)
+		planExpr, err := optimizer.ResolveIndexPredicate(*idx.ColExprs[i], tbl)
 		if err != nil || planExpr == nil {
 			continue
 		}
 		if out == nil {
-			out = make([]planner.Expr, len(idx.Columns))
+			out = make([]optimizer.Expr, len(idx.Columns))
 		}
 		out[i] = planExpr
 	}
@@ -11859,7 +11859,7 @@ func encodeBTreeKeyForColumn(ctx *Context, v Datum, col *catalog.Column, pos int
 		if rerr != nil {
 			return nil, keyExecError(rerr, pos)
 		}
-		return btree.EncodeInt8(int64(oid)), nil
+		return nbtree.EncodeInt8(int64(oid)), nil
 	}
 	// Unknown-literal coercion (sibling of the seq-scan promoteCrossKind path):
 	// a probe key built from a quoted literal (`WHERE id = '1'`) arrives as
@@ -11913,30 +11913,30 @@ func encodeBTreeKeyForColumn(ctx *Context, v Datum, col *catalog.Column, pos int
 		if v.Int < minInt32 || v.Int > maxInt32 {
 			return nil, &ExecError{Code: "22003", Pos: pos, Message: fmt.Sprintf("value %d out of int4 range for index key", v.Int)}
 		}
-		return btree.EncodeInt4(int32(v.Int)), nil
+		return nbtree.EncodeInt4(int32(v.Int)), nil
 	case isInt8Type(col.Type.Name):
 		if v.Kind != KindInt {
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not integer at runtime", col.Name)}
 		}
-		return btree.EncodeInt8(v.Int), nil
+		return nbtree.EncodeInt8(v.Int), nil
 	case isNumericType(col.Type.Name):
 		switch v.Kind {
 		case KindNumeric:
-			return btree.EncodeNumericKey(numericMant(v), v.Scale), nil
+			return nbtree.EncodeNumericKey(numericMant(v), v.Scale), nil
 		case KindInt:
-			return btree.EncodeNumericKey(big.NewInt(v.Int), 0), nil
+			return nbtree.EncodeNumericKey(big.NewInt(v.Int), 0), nil
 		}
 		return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not numeric at runtime", col.Name)}
 	case isVarcharType(col.Type.Name):
 		if v.Kind != KindString {
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a string at runtime", col.Name)}
 		}
-		return btree.EncodeVarchar([]byte(v.StringValue())), nil
+		return nbtree.EncodeVarchar([]byte(v.StringValue())), nil
 	case isCharType(col.Type.Name):
 		if v.Kind != KindString {
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a string at runtime", col.Name)}
 		}
-		return btree.EncodeChar([]byte(v.StringValue())), nil
+		return nbtree.EncodeChar([]byte(v.StringValue())), nil
 	case isTimestampType(col.Type.Name) || isTimestamptzType(col.Type.Name):
 		// timestamp and timestamptz share the int64-micros-since-epoch on-disk
 		// form, so both encode via EncodeTimestamp. M0118-0001.
@@ -11944,7 +11944,7 @@ func encodeBTreeKeyForColumn(ctx *Context, v Datum, col *catalog.Column, pos int
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a timestamp at runtime", col.Name)}
 		}
 		micros := v.TimeValue().Sub(pgEpoch).Microseconds()
-		return btree.EncodeTimestamp(micros), nil
+		return nbtree.EncodeTimestamp(micros), nil
 	case isDateType(col.Type.Name):
 		// date stored as int32 days since the PG epoch (2000-01-01); encode via
 		// the order-preserving int4 path. Mirrors the codec date encoding so a
@@ -11954,13 +11954,13 @@ func encodeBTreeKeyForColumn(ctx *Context, v Datum, col *catalog.Column, pos int
 		}
 		micros := v.TimeValue().UnixMicro() - pgEpochUnixMicros
 		days := int32(micros / (24 * 3600 * 1000000))
-		return btree.EncodeInt4(days), nil
+		return nbtree.EncodeInt4(days), nil
 	case strings.ToLower(col.Type.Name) == "uuid":
 		// uuid stored as canonical lowercase-dashes text; sort order matches byte order.
 		if v.Kind != KindString {
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not uuid at runtime", col.Name)}
 		}
-		return btree.EncodeVarchar([]byte(v.StringValue())), nil
+		return nbtree.EncodeVarchar([]byte(v.StringValue())), nil
 	case strings.ToLower(col.Type.Name) == "text":
 		// text type: encode as varchar bytes. M0096-0008.
 		var s string
@@ -11972,13 +11972,13 @@ func encodeBTreeKeyForColumn(ctx *Context, v Datum, col *catalog.Column, pos int
 		default:
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not text at runtime", col.Name)}
 		}
-		return btree.EncodeVarchar([]byte(s)), nil
+		return nbtree.EncodeVarchar([]byte(s)), nil
 	case strings.ToLower(col.Type.Name) == "name":
 		// name type: encode as varchar bytes (max 63 chars).
 		if v.Kind != KindString {
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a string at runtime", col.Name)}
 		}
-		return btree.EncodeVarchar([]byte(v.StringValue())), nil
+		return nbtree.EncodeVarchar([]byte(v.StringValue())), nil
 	case isFloat8Type(col.Type.Name):
 		// float4/float8 stored as text; decode then re-encode sortably.
 		f, badSyntax, ok := datumToFloat64ForKey(v)
@@ -11988,7 +11988,7 @@ func encodeBTreeKeyForColumn(ctx *Context, v Datum, col *catalog.Column, pos int
 			}
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not float at runtime (kind %d)", col.Name, v.Kind)}
 		}
-		return btree.EncodeFloat8(f), nil
+		return nbtree.EncodeFloat8(f), nil
 	case isInetType(col.Type.Name), isCidrType(col.Type.Name):
 		// inet/cidr share the btree/inet_ops opclass (cidr binary-coerces to
 		// it), so both encode through the same order-preserving network key
@@ -12000,7 +12000,7 @@ func encodeBTreeKeyForColumn(ctx *Context, v Datum, col *catalog.Column, pos int
 	// The caller (collectBTreeEntries) pre-converts KindString enum labels to KindEnum
 	// so both backfill and probe paths use the same float64 encoding.
 	if v.Kind == KindEnum {
-		return btree.EncodeFloat8(v.EnumSortOrder()), nil
+		return nbtree.EncodeFloat8(v.EnumSortOrder()), nil
 	}
 	return nil, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 cannot index column %q of type %q", col.Name, col.Type.Name)}
 }
@@ -12742,7 +12742,7 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 	// that session commits (truncate-conflict's granted permutations — design
 	// 0118-0039). Both via acquireRelLockMaybeTransient. M0118-0008.
 	for _, entry := range sortedTruncateTableSet(tableSet, nameOrder) {
-		if err := o.ctx.acquireRelLockMaybeTransient(o.ctx.Catalog.RelFileNode(entry.tbl), lockmgr.AccessExclusiveLock); err != nil {
+		if err := o.ctx.acquireRelLockMaybeTransient(o.ctx.Catalog.RelFileNode(entry.tbl), lmgr.AccessExclusiveLock); err != nil {
 			return err
 		}
 	}
@@ -15424,7 +15424,7 @@ func (o *ddlOp) execCreateTrigger(s *parser.CreateTriggerStmt) error {
 	// UPDATE (RowShareLock), so a concurrent UPDATE blocks until this
 	// transaction commits while a concurrent read proceeds. M0118-0008
 	// (create-trigger isolation spec).
-	if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.ShareRowExclusiveLock); err != nil {
+	if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lmgr.ShareRowExclusiveLock); err != nil {
 		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 			ee.Pos = s.Pos()
 		}
@@ -16011,7 +16011,7 @@ func (o *ddlOp) execAlterSequence(s *parser.AlterSequenceStmt) error {
 	// another session holds an in-progress nextval lock. M0118-0008
 	// (sequence-ddl isolation spec).
 	if tbl, ok := o.ctx.Catalog.LookupTable(s.Name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok {
-		if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.AccessExclusiveLock); err != nil {
+		if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lmgr.AccessExclusiveLock); err != nil {
 			if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 				ee.Pos = s.Pos()
 			}
@@ -16155,7 +16155,7 @@ func truncateRelation(ctx *Context, rel storage.RelFileNode) error {
 			if err != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
+			if !transam.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
 				continue
 			}
 			_ = storage.PageSetHeapTupleXmax(page, slot, ctx.Tx.XID)
@@ -16193,14 +16193,14 @@ func (o *ddlOp) execCreateMatView(s *parser.CreateMatViewStmt) error {
 	if err := analyzer.Analyze(s.Query, o.planCatalog()); err != nil {
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
 	}
-	var selectPlan planner.Node
+	var selectPlan optimizer.Node
 	var err error
 	if s.WithNoData {
 		// WITH NO DATA: use schema-only planning that suppresses runtime
 		// evaluation errors (e.g. division by zero) — the query will never execute.
-		selectPlan, err = planner.PlanSchemaOnly(s.Query, o.planCatalog())
+		selectPlan, err = optimizer.PlanSchemaOnly(s.Query, o.planCatalog())
 	} else {
-		selectPlan, err = planner.Plan(s.Query, o.planCatalog())
+		selectPlan, err = optimizer.Plan(s.Query, o.planCatalog())
 	}
 	if err != nil {
 		return err
@@ -16261,7 +16261,7 @@ func (o *ddlOp) execCreateMatView(s *parser.CreateMatViewStmt) error {
 // materializeView executes the view's SELECT query and writes results
 // to the materialized view heap, then rebuilds all btree indexes.
 // Used by both initial populate and REFRESH. M0097-0013.
-func (o *ddlOp) materializeView(tbl *catalog.Table, selectPlan planner.Node) error {
+func (o *ddlOp) materializeView(tbl *catalog.Table, selectPlan optimizer.Node) error {
 	op, err := Build(selectPlan)
 	if err != nil {
 		return err
@@ -16387,7 +16387,7 @@ func (o *ddlOp) execRefreshMatView(s *parser.RefreshMatViewStmt) error {
 	if err := analyzer.Analyze(tbl.View, o.planCatalog()); err != nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: fmt.Sprintf("refresh plan error: %v", err)}
 	}
-	selectPlan, err := planner.Plan(tbl.View, o.planCatalog())
+	selectPlan, err := optimizer.Plan(tbl.View, o.planCatalog())
 	if err != nil {
 		return err
 	}
@@ -22119,7 +22119,7 @@ func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAct
 			if terr != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.CmdID, o.ctx.comboStore(), o.ctx.MultiXact) {
+			if !transam.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.CmdID, o.ctx.comboStore(), o.ctx.MultiXact) {
 				continue
 			}
 			row := acquireRow(len(oldCols))
@@ -22263,10 +22263,10 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 	// mutation, so ColumnRefs still resolve to old-column positions (PG
 	// parses the USING expr against the original row type —
 	// tablecmds.c:14373 ATPrepAlterColumnType). M0134-0002 C2 slice 5.
-	var plannedUsing planner.Expr
+	var plannedUsing optimizer.Expr
 	if act.UsingExpr != nil {
 		var rerr error
-		plannedUsing, rerr = planner.ResolveAlterColumnTypeUsing(tbl, act.UsingExpr)
+		plannedUsing, rerr = optimizer.ResolveAlterColumnTypeUsing(tbl, act.UsingExpr)
 		if rerr != nil {
 			return rerr
 		}
@@ -22333,7 +22333,7 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 			if terr != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.CmdID, o.ctx.comboStore(), o.ctx.MultiXact) {
+			if !transam.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.CmdID, o.ctx.comboStore(), o.ctx.MultiXact) {
 				continue
 			}
 			row := acquireRow(len(oldCols))
@@ -22466,7 +22466,7 @@ func (o *ddlOp) execLockTable(s *parser.LockTableStmt) error {
 		// translation table. An unrecognised name leaves lmMode == NoLock and
 		// acquireRelLockTxn becomes a no-op (display-only), preserving the
 		// historical behaviour for any exotic mode.
-		lmMode, _ := lockmgr.ParseMode(s.Mode)
+		lmMode, _ := lmgr.ParseMode(s.Mode)
 		if err := lockRelationTransitively(o.ctx, sess, dbOID, s.Mode, lmMode, s.NoWait, tbl, o.ctx.Catalog, visited); err != nil {
 			return err
 		}
@@ -22489,7 +22489,7 @@ func (o *ddlOp) execLockTable(s *parser.LockTableStmt) error {
 // (TxnLockBackendID == 0) the acquire is a no-op and only the display
 // registration happens, matching historical autocommit behaviour.
 // M0118-0003 (lock-nowait).
-func lockRelationTransitively(ctx *Context, sess Session, dbOID uint32, mode string, lmMode lockmgr.Mode, nowait bool, tbl *catalog.Table, cat catalog.Catalog, visited map[uint32]bool) error {
+func lockRelationTransitively(ctx *Context, sess Session, dbOID uint32, mode string, lmMode lmgr.Mode, nowait bool, tbl *catalog.Table, cat catalog.Catalog, visited map[uint32]bool) error {
 	if visited[tbl.OID] {
 		return nil
 	}
@@ -22501,10 +22501,10 @@ func lockRelationTransitively(ctx *Context, sess Session, dbOID uint32, mode str
 	// (lmMode == NoLock). An explicit-transaction LOCK TABLE with a parsable mode
 	// takes a real tableLockMgr lock, which the bridge already surfaces with a
 	// real PID; recording it here too would double it in pg_locks.
-	if lmMode == lockmgr.NoLock || ctx.TxnLockBackendID == 0 {
+	if lmMode == lmgr.NoLock || ctx.TxnLockBackendID == 0 {
 		globalRelLockMgr.AddRelationLock(sess, dbOID, tbl.OID, mode)
 	}
-	if lmMode != lockmgr.NoLock {
+	if lmMode != lmgr.NoLock {
 		rel := storage.RelFileNode{DBOid: dbOID, RelOid: tbl.OID}
 		if err := ctx.acquireRelLockTxn(rel, lmMode, nowait); err != nil {
 			return err

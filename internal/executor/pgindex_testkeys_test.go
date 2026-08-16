@@ -3,7 +3,7 @@ package executor
 import (
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 )
@@ -29,7 +29,7 @@ import (
 // openIndexTreeForTest looks up a named index and opens its btree the way the
 // executor does — with the key descriptor when the index is describable, and
 // without when it is not.
-func openIndexTreeForTest(t *testing.T, ctx *Context, idxName string) (*catalog.Index, *btree.BTree) {
+func openIndexTreeForTest(t *testing.T, ctx *Context, idxName string) (*catalog.Index, *nbtree.BTree) {
 	t.Helper()
 	idx, ok := ctx.Catalog.LookupIndex(parser.ObjectName{Name: idxName})
 	if !ok {

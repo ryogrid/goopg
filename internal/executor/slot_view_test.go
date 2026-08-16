@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // TestM0071SlotViewRowAdapter pins the rowSlotView Row → SlotView
@@ -66,33 +66,33 @@ func TestM0071EvalExprSlotMatchesRow(t *testing.T) {
 	}
 	slot := rowSlotView(row)
 
-	exprs := []planner.Expr{
+	exprs := []optimizer.Expr{
 		// Constants
-		&planner.IntegerConst{Value: 42},
-		&planner.StringConst{Value: "x"},
-		&planner.NullConst{},
-		&planner.BooleanConst{Value: true},
+		&optimizer.IntegerConst{Value: 42},
+		&optimizer.StringConst{Value: "x"},
+		&optimizer.NullConst{},
+		&optimizer.BooleanConst{Value: true},
 		// Column refs
-		&planner.ColumnRef{Name: "c0", Index: 0},
-		&planner.ColumnRef{Name: "c1", Index: 1},
-		&planner.ColumnRef{Name: "c2", Index: 2},
-		&planner.ColumnRef{Name: "c4null", Index: 4},
+		&optimizer.ColumnRef{Name: "c0", Index: 0},
+		&optimizer.ColumnRef{Name: "c1", Index: 1},
+		&optimizer.ColumnRef{Name: "c2", Index: 2},
+		&optimizer.ColumnRef{Name: "c4null", Index: 4},
 		// UnaryOp
-		&planner.UnaryOp{Op: parser.OpSub, Operand: &planner.ColumnRef{Index: 0}},
-		&planner.UnaryOp{Op: parser.OpNot, Operand: &planner.ColumnRef{Index: 3}},
+		&optimizer.UnaryOp{Op: parser.OpSub, Operand: &optimizer.ColumnRef{Index: 0}},
+		&optimizer.UnaryOp{Op: parser.OpNot, Operand: &optimizer.ColumnRef{Index: 3}},
 		// BinaryOp
-		&planner.BinaryOp{Op: parser.OpAdd,
-			Left:  &planner.ColumnRef{Index: 0},
-			Right: &planner.ColumnRef{Index: 2}},
-		&planner.BinaryOp{Op: parser.OpEq,
-			Left:  &planner.ColumnRef{Index: 0},
-			Right: &planner.IntegerConst{Value: 7}},
-		&planner.BinaryOp{Op: parser.OpLt,
-			Left:  &planner.ColumnRef{Index: 0},
-			Right: &planner.ColumnRef{Index: 2}},
-		&planner.BinaryOp{Op: parser.OpAnd,
-			Left:  &planner.BooleanConst{Value: true},
-			Right: &planner.ColumnRef{Index: 3}},
+		&optimizer.BinaryOp{Op: parser.OpAdd,
+			Left:  &optimizer.ColumnRef{Index: 0},
+			Right: &optimizer.ColumnRef{Index: 2}},
+		&optimizer.BinaryOp{Op: parser.OpEq,
+			Left:  &optimizer.ColumnRef{Index: 0},
+			Right: &optimizer.IntegerConst{Value: 7}},
+		&optimizer.BinaryOp{Op: parser.OpLt,
+			Left:  &optimizer.ColumnRef{Index: 0},
+			Right: &optimizer.ColumnRef{Index: 2}},
+		&optimizer.BinaryOp{Op: parser.OpAnd,
+			Left:  &optimizer.BooleanConst{Value: true},
+			Right: &optimizer.ColumnRef{Index: 3}},
 	}
 
 	ctx := &Context{}
@@ -117,13 +117,13 @@ func TestM0071EvalExprSlotMatchesRow(t *testing.T) {
 // matching the prior nil-Row contract at expr.go.
 func TestM0071EvalExprSlotNilSlot(t *testing.T) {
 	ctx := &Context{}
-	cr := &planner.ColumnRef{Name: "c", Index: 0}
+	cr := &optimizer.ColumnRef{Name: "c", Index: 0}
 	_, err := evalExprSlot(cr, nil, ctx)
 	if err == nil {
 		t.Fatalf("expected error for ColumnRef on nil slot, got nil")
 	}
 	// Constants must succeed even with nil slot.
-	v, err := evalExprSlot(&planner.IntegerConst{Value: 1}, nil, ctx)
+	v, err := evalExprSlot(&optimizer.IntegerConst{Value: 1}, nil, ctx)
 	if err != nil {
 		t.Errorf("constant on nil slot: unexpected err %v", err)
 	}

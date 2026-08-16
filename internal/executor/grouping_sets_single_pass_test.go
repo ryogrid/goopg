@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // M0125-0048 — the single-pass grouping-sets aggregate.
@@ -102,7 +102,7 @@ func TestGroupingFuncColumnIsNamedGrouping(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan, err := planner.Plan(stmts[0], ctx.Catalog)
+	plan, err := optimizer.Plan(stmts[0], ctx.Catalog)
 	if err != nil {
 		t.Fatal(err)
 	}

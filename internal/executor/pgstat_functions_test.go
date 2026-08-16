@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 )
 
 // TestFunctionStatsManager exercises the two-tier (pending → shared) cumulative
@@ -160,7 +160,7 @@ func TestFetchFuncStatConsistency(t *testing.T) {
 
 	// cache, inside an explicit transaction: A freezes at first read; B read
 	// later still sees live.
-	sess.BeginExplicitTransaction(mvcc.Transaction{}, mvcc.Snapshot{})
+	sess.BeginExplicitTransaction(transam.Transaction{}, transam.Snapshot{})
 	mode = "cache"
 	if n, _ := calls(oidA); n != 2 { // first in-txn read of A → caches 2
 		t.Fatalf("cache: want A=2 at first read, got %d", n)
@@ -183,7 +183,7 @@ func TestFetchFuncStatConsistency(t *testing.T) {
 
 	// snapshot, inside an explicit transaction: first read freezes A AND B; B
 	// read later returns its value as of that first access, not the live value.
-	sess.BeginExplicitTransaction(mvcc.Transaction{}, mvcc.Snapshot{})
+	sess.BeginExplicitTransaction(transam.Transaction{}, transam.Snapshot{})
 	mode = "snapshot"
 	if n, _ := calls(oidA); n != 3 { // first read snapshots everything (A=3, B=2)
 		t.Fatalf("snapshot: want A=3 at first read, got %d", n)

@@ -3,7 +3,7 @@ package executor
 import (
 	"testing"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // TestEvalArrayRemove pins PostgreSQL-compatible array_remove(anyarray,
@@ -15,53 +15,53 @@ import (
 func TestEvalArrayRemove(t *testing.T) {
 	cases := []struct {
 		name string
-		args []planner.Expr
+		args []optimizer.Expr
 		want Datum
 	}{
 		{
 			name: "removes every matching element",
-			args: []planner.Expr{
-				&planner.StringConst{Value: "{a,b,a,c}"},
-				&planner.StringConst{Value: "a"},
+			args: []optimizer.Expr{
+				&optimizer.StringConst{Value: "{a,b,a,c}"},
+				&optimizer.StringConst{Value: "a"},
 			},
 			want: NewStringDatum("{b,c}"),
 		},
 		{
 			name: "no match leaves array unchanged",
-			args: []planner.Expr{
-				&planner.StringConst{Value: "{x,y,z}"},
-				&planner.StringConst{Value: "a"},
+			args: []optimizer.Expr{
+				&optimizer.StringConst{Value: "{x,y,z}"},
+				&optimizer.StringConst{Value: "a"},
 			},
 			want: NewStringDatum("{x,y,z}"),
 		},
 		{
 			name: "pg_dump reloptions check_option strip",
-			args: []planner.Expr{
-				&planner.StringConst{Value: "{security_barrier=true,check_option=local}"},
-				&planner.StringConst{Value: "check_option=local"},
+			args: []optimizer.Expr{
+				&optimizer.StringConst{Value: "{security_barrier=true,check_option=local}"},
+				&optimizer.StringConst{Value: "check_option=local"},
 			},
 			want: NewStringDatum("{security_barrier=true}"),
 		},
 		{
 			name: "removing only element yields empty array",
-			args: []planner.Expr{
-				&planner.StringConst{Value: "{check_option=cascaded}"},
-				&planner.StringConst{Value: "check_option=cascaded"},
+			args: []optimizer.Expr{
+				&optimizer.StringConst{Value: "{check_option=cascaded}"},
+				&optimizer.StringConst{Value: "check_option=cascaded"},
 			},
 			want: NewStringDatum("{}"),
 		},
 		{
 			name: "NULL array propagates",
-			args: []planner.Expr{
-				&planner.NullConst{},
-				&planner.StringConst{Value: "a"},
+			args: []optimizer.Expr{
+				&optimizer.NullConst{},
+				&optimizer.StringConst{Value: "a"},
 			},
 			want: NullDatum,
 		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			fc := &planner.FuncCall{Name: "array_remove", Args: c.args}
+			fc := &optimizer.FuncCall{Name: "array_remove", Args: c.args}
 			got, err := evalFuncCall(fc, nil, &Context{})
 			if err != nil {
 				t.Fatalf("evalFuncCall: %v", err)
@@ -76,18 +76,18 @@ func TestEvalArrayRemove(t *testing.T) {
 // TestEvalArrayRemoveNested verifies the exact nested form pg_dump's getTables
 // uses to strip both view check_option markers in one expression.
 func TestEvalArrayRemoveNested(t *testing.T) {
-	inner := &planner.FuncCall{
+	inner := &optimizer.FuncCall{
 		Name: "array_remove",
-		Args: []planner.Expr{
-			&planner.StringConst{Value: "{check_option=local,check_option=cascaded}"},
-			&planner.StringConst{Value: "check_option=local"},
+		Args: []optimizer.Expr{
+			&optimizer.StringConst{Value: "{check_option=local,check_option=cascaded}"},
+			&optimizer.StringConst{Value: "check_option=local"},
 		},
 	}
-	outer := &planner.FuncCall{
+	outer := &optimizer.FuncCall{
 		Name: "array_remove",
-		Args: []planner.Expr{
+		Args: []optimizer.Expr{
 			inner,
-			&planner.StringConst{Value: "check_option=cascaded"},
+			&optimizer.StringConst{Value: "check_option=cascaded"},
 		},
 	}
 	got, err := evalFuncCall(outer, nil, &Context{})

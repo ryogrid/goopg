@@ -6,17 +6,17 @@ package executor
 // file present on disk. goopg v0 never produces WAL summaries because
 // summarize_wal is always off; this operator always returns 0 rows. M0095-0002.
 
-import "github.com/goopg/goopg/internal/planner"
+import "github.com/goopg/goopg/internal/optimizer"
 
 type pgAvailableWalSummariesOp struct {
-	plan *planner.PgAvailableWalSummaries
+	plan *optimizer.PgAvailableWalSummaries
 }
 
-func newPgAvailableWalSummariesOp(p *planner.PgAvailableWalSummaries) *pgAvailableWalSummariesOp {
+func newPgAvailableWalSummariesOp(p *optimizer.PgAvailableWalSummaries) *pgAvailableWalSummariesOp {
 	return &pgAvailableWalSummariesOp{plan: p}
 }
 
-func (o *pgAvailableWalSummariesOp) Schema() planner.Schema { return o.plan.Output() }
+func (o *pgAvailableWalSummariesOp) Schema() optimizer.Schema { return o.plan.Output() }
 
 func (o *pgAvailableWalSummariesOp) Open(_ *Context) error { return nil }
 

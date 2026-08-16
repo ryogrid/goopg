@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/storage/lmgr"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -21,7 +21,7 @@ func rel(relOid uint32) storage.RelFileNode {
 // makeCtx builds an executor.Context wired to the given lock
 // manager and backend ID. Other Context fields stay zero/nil —
 // the tests don't touch the storage / planner paths.
-func makeCtx(lm *lockmgr.LockManager, b lockmgr.BackendID) *Context {
+func makeCtx(lm *lmgr.LockManager, b lmgr.BackendID) *Context {
 	c := NewContext()
 	c.LockMgr = lm
 	c.BackendID = b
@@ -36,7 +36,7 @@ func makeCtx(lm *lockmgr.LockManager, b lockmgr.BackendID) *Context {
 // to wire a lock manager.
 func TestExecutorAcquireHelperNilLockMgr(t *testing.T) {
 	c := NewContext()
-	if err := c.acquireRelLock(rel(100), lockmgr.AccessShareLock); err != nil {
+	if err := c.acquireRelLock(rel(100), lmgr.AccessShareLock); err != nil {
 		t.Errorf("nil-LockMgr should be a no-op, got %v", err)
 	}
 }
@@ -45,12 +45,12 @@ func TestExecutorAcquireHelperNilLockMgr(t *testing.T) {
 // uncontended Acquire returns nil and the lock manager records
 // the holder.
 func TestExecutorAcquireHelperGrantsLock(t *testing.T) {
-	lm := lockmgr.New()
+	lm := lmgr.New()
 	c := makeCtx(lm, 1)
-	if err := c.acquireRelLock(rel(100), lockmgr.RowExclusiveLock); err != nil {
+	if err := c.acquireRelLock(rel(100), lmgr.RowExclusiveLock); err != nil {
 		t.Fatalf("Acquire: %v", err)
 	}
-	tag := lockmgr.LockTag{DB: 1, Rel: 100}
+	tag := lmgr.LockTag{DB: 1, Rel: 100}
 	if got := lm.Holders(tag); len(got) != 1 {
 		t.Errorf("Holders=%v, want 1 holder", got)
 	}
@@ -65,27 +65,27 @@ func TestExecutorAcquireHelperGrantsLock(t *testing.T) {
 // mapping in context.go — flip the mapping or break the
 // translation and this test fails.
 func TestExecutorDeadlockTwoSession(t *testing.T) {
-	lm := lockmgr.New()
+	lm := lmgr.New()
 	lm.SetDeadlockTimeout(0) // synchronous trigger via CheckDeadlocksNow
 	c1 := makeCtx(lm, 1)
 	c2 := makeCtx(lm, 2)
 	relA := rel(10)
 	relB := rel(20)
-	if err := c1.acquireRelLock(relA, lockmgr.RowExclusiveLock); err != nil {
+	if err := c1.acquireRelLock(relA, lmgr.RowExclusiveLock); err != nil {
 		t.Fatal(err)
 	}
-	if err := c2.acquireRelLock(relB, lockmgr.RowExclusiveLock); err != nil {
+	if err := c2.acquireRelLock(relB, lmgr.RowExclusiveLock); err != nil {
 		t.Fatal(err)
 	}
 	res1 := make(chan error, 1)
 	res2 := make(chan error, 1)
-	go func() { res1 <- c1.acquireRelLock(relB, lockmgr.AccessExclusiveLock) }()
-	go func() { res2 <- c2.acquireRelLock(relA, lockmgr.AccessExclusiveLock) }()
+	go func() { res1 <- c1.acquireRelLock(relB, lmgr.AccessExclusiveLock) }()
+	go func() { res2 <- c2.acquireRelLock(relA, lmgr.AccessExclusiveLock) }()
 
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
-		if len(lm.Waiters(lockmgr.LockTag{DB: 1, Rel: 10})) == 1 &&
-			len(lm.Waiters(lockmgr.LockTag{DB: 1, Rel: 20})) == 1 {
+		if len(lm.Waiters(lmgr.LockTag{DB: 1, Rel: 10})) == 1 &&
+			len(lm.Waiters(lmgr.LockTag{DB: 1, Rel: 20})) == 1 {
 			break
 		}
 		time.Sleep(time.Millisecond)
@@ -132,32 +132,32 @@ func TestExecutorDeadlockTwoSession(t *testing.T) {
 // longer than 2, and that exactly one backend (the youngest)
 // gets the 40P01 mapping.
 func TestExecutorDeadlockThreeSession(t *testing.T) {
-	lm := lockmgr.New()
+	lm := lmgr.New()
 	lm.SetDeadlockTimeout(0)
 	c := []*Context{nil, makeCtx(lm, 1), makeCtx(lm, 2), makeCtx(lm, 3)}
 	relA := rel(10)
 	relB := rel(20)
 	relC := rel(30)
 
-	if err := c[1].acquireRelLock(relA, lockmgr.RowExclusiveLock); err != nil {
+	if err := c[1].acquireRelLock(relA, lmgr.RowExclusiveLock); err != nil {
 		t.Fatal(err)
 	}
-	if err := c[2].acquireRelLock(relB, lockmgr.RowExclusiveLock); err != nil {
+	if err := c[2].acquireRelLock(relB, lmgr.RowExclusiveLock); err != nil {
 		t.Fatal(err)
 	}
-	if err := c[3].acquireRelLock(relC, lockmgr.RowExclusiveLock); err != nil {
+	if err := c[3].acquireRelLock(relC, lmgr.RowExclusiveLock); err != nil {
 		t.Fatal(err)
 	}
 	res := []chan error{nil, make(chan error, 1), make(chan error, 1), make(chan error, 1)}
-	go func() { res[1] <- c[1].acquireRelLock(relB, lockmgr.AccessExclusiveLock) }()
-	go func() { res[2] <- c[2].acquireRelLock(relC, lockmgr.AccessExclusiveLock) }()
-	go func() { res[3] <- c[3].acquireRelLock(relA, lockmgr.AccessExclusiveLock) }()
+	go func() { res[1] <- c[1].acquireRelLock(relB, lmgr.AccessExclusiveLock) }()
+	go func() { res[2] <- c[2].acquireRelLock(relC, lmgr.AccessExclusiveLock) }()
+	go func() { res[3] <- c[3].acquireRelLock(relA, lmgr.AccessExclusiveLock) }()
 
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
-		w := len(lm.Waiters(lockmgr.LockTag{DB: 1, Rel: 10})) +
-			len(lm.Waiters(lockmgr.LockTag{DB: 1, Rel: 20})) +
-			len(lm.Waiters(lockmgr.LockTag{DB: 1, Rel: 30}))
+		w := len(lm.Waiters(lmgr.LockTag{DB: 1, Rel: 10})) +
+			len(lm.Waiters(lmgr.LockTag{DB: 1, Rel: 20})) +
+			len(lm.Waiters(lmgr.LockTag{DB: 1, Rel: 30}))
 		if w == 3 {
 			break
 		}
@@ -201,24 +201,24 @@ func TestExecutorDeadlockThreeSession(t *testing.T) {
 // tests confirm no false-positive 40P01 under normal
 // wait/unblock flows."
 func TestExecutorNonDeadlockContention(t *testing.T) {
-	lm := lockmgr.New()
+	lm := lmgr.New()
 	lm.SetDeadlockTimeout(0)
 	c1 := makeCtx(lm, 1)
 	c2 := makeCtx(lm, 2)
 	c3 := makeCtx(lm, 3)
 	r := rel(10)
-	tag := lockmgr.LockTag{DB: 1, Rel: 10}
+	tag := lmgr.LockTag{DB: 1, Rel: 10}
 
-	if err := c1.acquireRelLock(r, lockmgr.AccessExclusiveLock); err != nil {
+	if err := c1.acquireRelLock(r, lmgr.AccessExclusiveLock); err != nil {
 		t.Fatal(err)
 	}
 	res2 := make(chan error, 1)
-	go func() { res2 <- c2.acquireRelLock(r, lockmgr.AccessShareLock) }()
+	go func() { res2 <- c2.acquireRelLock(r, lmgr.AccessShareLock) }()
 	for time.Now().Before(time.Now().Add(time.Second)) && len(lm.Waiters(tag)) != 1 {
 		time.Sleep(time.Millisecond)
 	}
 	res3 := make(chan error, 1)
-	go func() { res3 <- c3.acquireRelLock(r, lockmgr.AccessShareLock) }()
+	go func() { res3 <- c3.acquireRelLock(r, lmgr.AccessShareLock) }()
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) && len(lm.Waiters(tag)) != 2 {
 		time.Sleep(time.Millisecond)
@@ -235,7 +235,7 @@ func TestExecutorNonDeadlockContention(t *testing.T) {
 		select {
 		case err := <-ch:
 			if err != nil {
-				if errors.Is(err, lockmgr.ErrDeadlockDetected) {
+				if errors.Is(err, lmgr.ErrDeadlockDetected) {
 					t.Errorf("false-positive ErrDeadlockDetected: %v", err)
 				} else {
 					t.Errorf("waiter: %v", err)

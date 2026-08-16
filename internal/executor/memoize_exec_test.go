@@ -20,7 +20,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // newMemoizeFixture: mo(k, pad) drives mi(id PRIMARY KEY, v) through
@@ -70,8 +70,8 @@ func TestMemoizeExplainAndResults(t *testing.T) {
 	ctx, cleanup := newMemoizeFixture(t)
 	defer cleanup()
 
-	planner.SetMemoizeEnabled(true)
-	defer planner.SetMemoizeEnabled(true)
+	optimizer.SetMemoizeEnabled(true)
+	defer optimizer.SetMemoizeEnabled(true)
 
 	plan := explainText(t, ctx, memoizeJoinSQL)
 	if !strings.Contains(plan, "Nested Loop") {
@@ -86,7 +86,7 @@ func TestMemoizeExplainAndResults(t *testing.T) {
 		t.Fatalf("memoized query: %v", err)
 	}
 
-	planner.SetMemoizeEnabled(false)
+	optimizer.SetMemoizeEnabled(false)
 	if off := explainText(t, ctx, memoizeJoinSQL); strings.Contains(off, "Memoize") {
 		t.Fatalf("Memoize node survived SetMemoizeEnabled(false):\n%s", off)
 	}
@@ -116,8 +116,8 @@ func TestMemoizeAnalyzeCounters(t *testing.T) {
 	ctx, cleanup := newMemoizeFixture(t)
 	defer cleanup()
 
-	planner.SetMemoizeEnabled(true)
-	defer planner.SetMemoizeEnabled(true)
+	optimizer.SetMemoizeEnabled(true)
+	defer optimizer.SetMemoizeEnabled(true)
 
 	lines := runExplainRows(t, ctx, "EXPLAIN ANALYZE "+memoizeJoinSQL)
 	joined := strings.Join(lines, "\n")
@@ -137,8 +137,8 @@ func TestMemoizeOverflowPassThrough(t *testing.T) {
 	ctx, cleanup := newMemoizeFixture(t)
 	defer cleanup()
 
-	planner.SetMemoizeEnabled(true)
-	defer planner.SetMemoizeEnabled(true)
+	optimizer.SetMemoizeEnabled(true)
+	defer optimizer.SetMemoizeEnabled(true)
 
 	savedWorkMem := ctx.WorkMem
 	ctx.WorkMem = 100 // budget = WorkMem/4 = 25 bytes < any entry

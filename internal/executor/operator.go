@@ -3,7 +3,7 @@ package executor
 import (
 	"errors"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // EOF is the sentinel returned by Operator.Next when no more rows
@@ -35,7 +35,7 @@ type Operator interface {
 	Open(ctx *Context) error
 	Next() (TupleSlot, error)
 	Close() error
-	Schema() planner.Schema
+	Schema() optimizer.Schema
 }
 
 // RowCounter is implemented by DML operators that report a

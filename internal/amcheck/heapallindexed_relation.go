@@ -3,7 +3,7 @@ package amcheck
 import (
 	"fmt"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -55,17 +55,17 @@ import (
 // returned as an error so the SQL surface surfaces it rather than silently
 // fingerprinting a truncated entry set (which would manufacture spurious "lacks
 // matching index tuple" reports — the heapallindexed soundness invariant).
-func CollectBtreeLeafEntries(src PageSource, keyFmt btree.IndexFormat) ([]btree.LeafEntry, error) {
+func CollectBtreeLeafEntries(src PageSource, keyFmt nbtree.IndexFormat) ([]nbtree.LeafEntry, error) {
 	if src == nil {
 		return nil, fmt.Errorf("amcheck: nil page source")
 	}
 
-	metaPage, err := src(btree.MetaBlock)
+	metaPage, err := src(nbtree.MetaBlock)
 	if err != nil {
 		return nil, fmt.Errorf("amcheck: reading metapage: %w", err)
 	}
-	meta := btree.ParseMeta(metaPage)
-	if meta.Root == btree.MetaBlock || meta.Root == storage.InvalidBlockNumber {
+	meta := nbtree.ParseMeta(metaPage)
+	if meta.Root == nbtree.MetaBlock || meta.Root == storage.InvalidBlockNumber {
 		// No key level (defensive: a real goopg index always roots at block 1).
 		return nil, nil
 	}
@@ -75,7 +75,7 @@ func CollectBtreeLeafEntries(src PageSource, keyFmt btree.IndexFormat) ([]btree.
 		return nil, err
 	}
 
-	var entries []btree.LeafEntry
+	var entries []nbtree.LeafEntry
 	visited := make(map[storage.BlockNumber]bool)
 	for current := leftmost; current != storage.InvalidBlockNumber; {
 		if visited[current] {
@@ -87,7 +87,7 @@ func CollectBtreeLeafEntries(src PageSource, keyFmt btree.IndexFormat) ([]btree.
 		if err != nil {
 			return nil, fmt.Errorf("amcheck: reading leaf block %d: %w", current, err)
 		}
-		opaque := btree.ParseOpaque(p)
+		opaque := nbtree.ParseOpaque(p)
 		if !opaque.IsLeaf() {
 			return nil, fmt.Errorf("amcheck: block %d on leaf walk is not a leaf page", current)
 		}
@@ -110,11 +110,11 @@ func CollectBtreeLeafEntries(src PageSource, keyFmt btree.IndexFormat) ([]btree.
 // The descent is bounded by a visited set so a corrupt downlink cycle terminates
 // with an error rather than looping forever — a bytes-only checker cannot
 // otherwise guarantee termination.
-func leftmostLeafBlock(src PageSource, root storage.BlockNumber, keyFmt btree.IndexFormat) (storage.BlockNumber, error) {
+func leftmostLeafBlock(src PageSource, root storage.BlockNumber, keyFmt nbtree.IndexFormat) (storage.BlockNumber, error) {
 	visited := make(map[storage.BlockNumber]bool)
 	current := root
 	for {
-		if current == btree.MetaBlock || current == storage.InvalidBlockNumber {
+		if current == nbtree.MetaBlock || current == storage.InvalidBlockNumber {
 			return 0, fmt.Errorf("amcheck: invalid child block %d during leftmost descent", current)
 		}
 		if visited[current] {
@@ -126,7 +126,7 @@ func leftmostLeafBlock(src PageSource, root storage.BlockNumber, keyFmt btree.In
 		if err != nil {
 			return 0, fmt.Errorf("amcheck: reading block %d during leftmost descent: %w", current, err)
 		}
-		opaque := btree.ParseOpaque(p)
+		opaque := nbtree.ParseOpaque(p)
 		if opaque.IsLeaf() {
 			return current, nil
 		}
@@ -157,7 +157,7 @@ func leftmostLeafBlock(src PageSource, root storage.BlockNumber, keyFmt btree.In
 // caught on re-check, tests pin it). An index-walk error (unreadable page,
 // structural cycle) is returned rather than yielding a truncated fingerprint set
 // that would manufacture spurious reports.
-func VerifyBtreeHeapAllIndexedRelation(idxSrc PageSource, keyFmt btree.IndexFormat, heapEntries []btree.LeafEntry, indexName, tableName string, seed uint64) ([]BtreeReport, error) {
+func VerifyBtreeHeapAllIndexedRelation(idxSrc PageSource, keyFmt nbtree.IndexFormat, heapEntries []nbtree.LeafEntry, indexName, tableName string, seed uint64) ([]BtreeReport, error) {
 	leafEntries, err := CollectBtreeLeafEntries(idxSrc, keyFmt)
 	if err != nil {
 		return nil, err

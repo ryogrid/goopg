@@ -4,7 +4,7 @@ import (
 	"fmt"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // Build walks a plan tree and produces an Operator tree ready to
@@ -18,7 +18,7 @@ import (
 // maybeInstrument so the EXPLAIN renderer can read per-node
 // rows/loops/timing counters. nil-scope (the default) returns
 // raw operators byte-for-byte unchanged.
-func Build(plan planner.Node) (Operator, error) {
+func Build(plan optimizer.Node) (Operator, error) {
 	return buildNode(plan)
 }
 
@@ -29,29 +29,29 @@ func Build(plan planner.Node) (Operator, error) {
 // reader of that env, so a worker build is now byte-for-byte a leader
 // build. The entry point stays because gatherOp/gatherMergeOp and
 // join_worker_path_test.go name it as the worker seam.
-func BuildWorker(plan planner.Node) (Operator, error) {
+func BuildWorker(plan optimizer.Node) (Operator, error) {
 	return buildNode(plan)
 }
 
-func buildNode(plan planner.Node) (Operator, error) {
+func buildNode(plan optimizer.Node) (Operator, error) {
 	switch p := plan.(type) {
-	case *planner.Values:
+	case *optimizer.Values:
 		return maybeInstrument(p, newValuesOp(p)), nil
-	case *planner.GenerateSeries:
+	case *optimizer.GenerateSeries:
 		return maybeInstrument(p, newGenerateSeriesOp(p)), nil
-	case *planner.UserSrfScan:
+	case *optimizer.UserSrfScan:
 		return maybeInstrument(p, newUserSrfScanOp(p)), nil
-	case *planner.GenerateSubscripts:
+	case *optimizer.GenerateSubscripts:
 		return maybeInstrument(p, newGenerateSubscriptsOp(p)), nil
-	case *planner.FromUnnest:
+	case *optimizer.FromUnnest:
 		return maybeInstrument(p, newFromUnnestOp(p)), nil
-	case *planner.OrdinalityWrap:
+	case *optimizer.OrdinalityWrap:
 		child, err := Build(p.Child)
 		if err != nil {
 			return nil, err
 		}
 		return maybeInstrument(p, newOrdinalityOp(p, child)), nil
-	case *planner.RowsFrom:
+	case *optimizer.RowsFrom:
 		children := make([]Operator, len(p.Funcs))
 		for i, f := range p.Funcs {
 			c, err := Build(f)
@@ -61,33 +61,33 @@ func buildNode(plan planner.Node) (Operator, error) {
 			children[i] = c
 		}
 		return maybeInstrument(p, newRowsFromOp(p, children)), nil
-	case *planner.PgInputErrorInfo:
+	case *optimizer.PgInputErrorInfo:
 		return maybeInstrument(p, newPgInputErrorInfoOp(p)), nil
-	case *planner.PgGetPublicationTables:
+	case *optimizer.PgGetPublicationTables:
 		return maybeInstrument(p, newPgGetPublicationTablesOp(p)), nil
-	case *planner.PgAvailableWalSummaries:
+	case *optimizer.PgAvailableWalSummaries:
 		return maybeInstrument(p, newPgAvailableWalSummariesOp(p)), nil
-	case *planner.PgGetSequenceData:
+	case *optimizer.PgGetSequenceData:
 		return maybeInstrument(p, newPgGetSequenceDataOp(p)), nil
-	case *planner.TSTokenType:
+	case *optimizer.TSTokenType:
 		return maybeInstrument(p, newTSTokenTypeOp(p)), nil
-	case *planner.VerifyHeapam:
+	case *optimizer.VerifyHeapam:
 		return maybeInstrument(p, newVerifyHeapamOp(p)), nil
-	case *planner.ProjectSet:
+	case *optimizer.ProjectSet:
 		child, err := Build(p.Child)
 		if err != nil {
 			return nil, err
 		}
 		return maybeInstrument(p, newProjectSetOp(p, child)), nil
-	case *planner.ScalarFuncScan:
+	case *optimizer.ScalarFuncScan:
 		return maybeInstrument(p, newScalarFuncScanOp(p)), nil
-	case *planner.PgPartitionTree:
+	case *optimizer.PgPartitionTree:
 		return maybeInstrument(p, newPgPartitionTreeOp(p)), nil
-	case *planner.PgOptionsToTable:
+	case *optimizer.PgOptionsToTable:
 		return maybeInstrument(p, newPgOptionsToTableOp(p)), nil
-	case *planner.FromRegexpMatches:
+	case *optimizer.FromRegexpMatches:
 		return maybeInstrument(p, newFromRegexpMatchesOp(p)), nil
-	case *planner.CTEScan:
+	case *optimizer.CTEScan:
 		// CTEScan wraps the inlined CTE body. Use cteScanOp which materializes
 		// all rows on first Open() and replays them on subsequent Open() calls
 		// (same CTE declaration, same ctx.CTERowCache entry). This implements PostgreSQL's
@@ -98,11 +98,11 @@ func buildNode(plan planner.Node) (Operator, error) {
 			return nil, err
 		}
 		return maybeInstrument(p, op), nil
-	case *planner.CTEDMLPrefix:
+	case *optimizer.CTEDMLPrefix:
 		return maybeInstrument(p, newCTEDMLPrefixOp(p)), nil
-	case *planner.MaterializedCTEScan:
+	case *optimizer.MaterializedCTEScan:
 		return maybeInstrument(p, newMaterializedCTEScanOp(p)), nil
-	case *planner.Project:
+	case *optimizer.Project:
 		child, err := Build(p.Child)
 		if err != nil {
 			return nil, err
@@ -112,7 +112,7 @@ func buildNode(plan planner.Node) (Operator, error) {
 		// slot lifetime is bounded by projectOp's per-Next read
 		// — no borrow contract needed.
 		return maybeInstrument(p, newProjectOp(p, child)), nil
-	case *planner.Filter:
+	case *optimizer.Filter:
 		child, err := Build(p.Child)
 		if err != nil {
 			return nil, err
@@ -122,7 +122,7 @@ func buildNode(plan planner.Node) (Operator, error) {
 		// table can take per-matching-tuple grid-cell SIREAD locks instead of a
 		// relation-grain lock. No-op unless the runtime scan resolves a GiST index
 		// (gistSSIIdxOID stays 0 otherwise). Mirrors the buildRec twin.
-		if _, ok := p.Child.(*planner.SeqScan); ok {
+		if _, ok := p.Child.(*optimizer.SeqScan); ok {
 			if so := unwrapSeqScanOp(child); so != nil {
 				so.ssiGistPred = p.Predicate
 				so.ssiGinPred = p.Predicate
@@ -136,7 +136,7 @@ func buildNode(plan planner.Node) (Operator, error) {
 		// the eventual parent (project, output sink) flips the
 		// filter itself to BorrowedRow.
 		return maybeInstrument(p, newFilterOp(p, child)), nil
-	case *planner.Limit:
+	case *optimizer.Limit:
 		child, err := Build(p.Child)
 		if err != nil {
 			return nil, err
@@ -145,13 +145,13 @@ func buildNode(plan planner.Node) (Operator, error) {
 		// filterOp; child borrow propagates from limit's own
 		// parent via SetBorrow.
 		return maybeInstrument(p, newLimitOp(p, child)), nil
-	case *planner.Sort:
+	case *optimizer.Sort:
 		child, err := Build(p.Child)
 		if err != nil {
 			return nil, err
 		}
 		return maybeInstrument(p, newSortOp(p, child)), nil
-	case *planner.Join:
+	case *optimizer.Join:
 		left, err := Build(p.Left)
 		if err != nil {
 			return nil, err
@@ -161,7 +161,7 @@ func buildNode(plan planner.Node) (Operator, error) {
 			return nil, err
 		}
 		return maybeInstrument(p, newJoinOp(p, left, right)), nil
-	case *planner.NestedLoopIndexJoin:
+	case *optimizer.NestedLoopIndexJoin:
 		outer, err := Build(p.Outer)
 		if err != nil {
 			return nil, err
@@ -181,7 +181,7 @@ func buildNode(plan planner.Node) (Operator, error) {
 		// BindOuter is M0072 future work). No borrow contract
 		// needed at this boundary.
 		return maybeInstrument(p, newNestedLoopIndexJoinOp(p, outer, innerScan)), nil
-	case *planner.Aggregate:
+	case *optimizer.Aggregate:
 		child, err := Build(p.Child)
 		if err != nil {
 			return nil, err
@@ -192,19 +192,19 @@ func buildNode(plan planner.Node) (Operator, error) {
 		// child slot — slot lifetime is bounded by the per-Next
 		// read, no borrow contract needed.
 		return maybeInstrument(p, newAggregateOp(p, child)), nil
-	case *planner.WindowAgg:
+	case *optimizer.WindowAgg:
 		child, err := Build(p.Child)
 		if err != nil {
 			return nil, err
 		}
 		return maybeInstrument(p, newWindowOp(p, child)), nil
-	case *planner.SeqScan:
+	case *optimizer.SeqScan:
 		return maybeInstrument(p, newSeqScanOp(p)), nil
-	case *planner.IndexScan:
+	case *optimizer.IndexScan:
 		return maybeInstrument(p, newIndexScanOp(p)), nil
-	case *planner.IndexOnlyScan:
+	case *optimizer.IndexOnlyScan:
 		return maybeInstrument(p, newIndexOnlyScanOp(p)), nil
-	case *planner.Result:
+	case *optimizer.Result:
 		if p.Child != nil {
 			// Result-with-child (S6 Slice 3d const-arg rewrite): build the inner
 			// scan so the One-Time Filter can stream projected rows through it.
@@ -217,13 +217,13 @@ func buildNode(plan planner.Node) (Operator, error) {
 		// Childless Result (S6 min/max rewrite top node): resultOp evaluates
 		// Targets once and emits exactly one row. No child to Build.
 		return maybeInstrument(p, newResultOp(p, nil)), nil
-	case *planner.LockRows:
+	case *optimizer.LockRows:
 		child, err := Build(p.Child)
 		if err != nil {
 			return nil, err
 		}
 		return maybeInstrument(p, newLockRowsOp(p, child)), nil
-	case *planner.Insert:
+	case *optimizer.Insert:
 		child, err := Build(p.Source)
 		if err != nil {
 			return nil, err
@@ -232,7 +232,7 @@ func buildNode(plan planner.Node) (Operator, error) {
 			return maybeInstrument(p, newUpsertOp(p, child)), nil
 		}
 		return maybeInstrument(p, newInsertOp(p, child)), nil
-	case *planner.Gather:
+	case *optimizer.Gather:
 		// Each worker builds its OWN operator tree over the shared, read-only
 		// partial plan — Build is a pure function of the plan node, so N calls
 		// give N independent trees. The closure is what makes that per-worker
@@ -244,25 +244,25 @@ func buildNode(plan planner.Node) (Operator, error) {
 		return maybeInstrument(p, newGatherOp(p, func() (Operator, error) {
 			return BuildWorker(p.Child)
 		})), nil
-	case *planner.GatherMerge:
+	case *optimizer.GatherMerge:
 		// Same per-worker construction as Gather; the difference is entirely in
 		// how the leader consumes the streams.
 		return maybeInstrument(p, newGatherMergeOp(p, func() (Operator, error) {
 			return BuildWorker(p.Child)
 		})), nil
-	case *planner.Distinct:
+	case *optimizer.Distinct:
 		child, err := Build(p.Child)
 		if err != nil {
 			return nil, err
 		}
 		return maybeInstrument(p, newDistinctOp(p, child)), nil
-	case *planner.DistinctOn:
+	case *optimizer.DistinctOn:
 		child, err := Build(p.Child)
 		if err != nil {
 			return nil, err
 		}
 		return maybeInstrument(p, newDistinctOnOp(p, child)), nil
-	case *planner.SetOp:
+	case *optimizer.SetOp:
 		left, err := Build(p.Left)
 		if err != nil {
 			return nil, err
@@ -273,7 +273,7 @@ func buildNode(plan planner.Node) (Operator, error) {
 			return nil, err
 		}
 		return maybeInstrument(p, newSetOp(p, left, right)), nil
-	case *planner.RecursiveUnion:
+	case *optimizer.RecursiveUnion:
 		anchor, err := Build(p.Anchor)
 		if err != nil {
 			return nil, err
@@ -284,31 +284,31 @@ func buildNode(plan planner.Node) (Operator, error) {
 			return nil, err
 		}
 		return maybeInstrument(p, newRecursiveUnionOp(p, anchor, recursive)), nil
-	case *planner.WorkTableScan:
+	case *optimizer.WorkTableScan:
 		return maybeInstrument(p, newWorkTableScanOp(p)), nil
-	case *planner.Update:
+	case *optimizer.Update:
 		op, err := newUpdateOp(p)
 		if err != nil {
 			return nil, err
 		}
 		return maybeInstrument(p, op), nil
-	case *planner.Delete:
+	case *optimizer.Delete:
 		op, err := newDeleteOp(p)
 		if err != nil {
 			return nil, err
 		}
 		return maybeInstrument(p, op), nil
-	case *planner.Merge:
+	case *optimizer.Merge:
 		return maybeInstrument(p, newMergeOp(p)), nil
-	case *planner.DDL:
+	case *optimizer.DDL:
 		return newDDLOp(p), nil
-	case *planner.Transaction:
+	case *optimizer.Transaction:
 		return newTransactionOp(p), nil
-	case *planner.Checkpoint:
+	case *optimizer.Checkpoint:
 		return newCheckpointOp(p), nil
-	case *planner.Explain:
+	case *optimizer.Explain:
 		return newExplainOp(p), nil
-	case *planner.Utility:
+	case *optimizer.Utility:
 		// VACUUM / ANALYZE / SHOW / SET / RESET are utility statements.
 		// VACUUM runs the heap page-prune and updates the FSM (M0046-0003).
 		// ANALYZE drives the catalog-stats collector. SHOW/SET/RESET also
@@ -345,7 +345,7 @@ func buildNode(plan planner.Node) (Operator, error) {
 			return newReindexOp(rs), nil
 		}
 		return newUtilityNoOp(p), nil
-	case *planner.Copy:
+	case *optimizer.Copy:
 		// COPY is currently driven from the wire-protocol layer
 		// (see internal/server/copy.go). The planner produces a
 		// Copy node so the layer can resolve table/columns through
@@ -354,15 +354,15 @@ func buildNode(plan planner.Node) (Operator, error) {
 		// then, fall through with a stable feature-not-supported
 		// error rather than a generic "unsupported plan node".
 		return nil, &ExecError{Code: "0A000", Pos: p.Pos(), Message: "COPY is driven from the wire layer; planner.Copy has no executor path yet"}
-	case *planner.Call:
+	case *optimizer.Call:
 		return newCallOp(p), nil
-	case *planner.BitmapIndexScan:
+	case *optimizer.BitmapIndexScan:
 		return maybeInstrument(p, newBitmapIndexScanOp(p)), nil
-	case *planner.BitmapHeapScan:
+	case *optimizer.BitmapHeapScan:
 		return maybeInstrument(p, newBitmapHeapScanOp(p)), nil
-	case *planner.BitmapAnd:
+	case *optimizer.BitmapAnd:
 		return maybeInstrument(p, newBitmapAndOp(p)), nil
-	case *planner.BitmapOr:
+	case *optimizer.BitmapOr:
 		return maybeInstrument(p, newBitmapOrOp(p)), nil
 	}
 	return nil, &ExecError{Code: "0A000", Pos: plan.Pos(), Message: fmt.Sprintf("unsupported plan node %T", plan)}
@@ -373,11 +373,11 @@ func buildNode(plan planner.Node) (Operator, error) {
 // recognises but doesn't yet have a real implementation for at the
 // executor level — running them is a no-op so pgbench's `vacuum
 // analyze pgbench_branches` (and similar) succeed cleanly.
-type utilityNoOp struct{ plan *planner.Utility }
+type utilityNoOp struct{ plan *optimizer.Utility }
 
-func newUtilityNoOp(p *planner.Utility) *utilityNoOp { return &utilityNoOp{plan: p} }
+func newUtilityNoOp(p *optimizer.Utility) *utilityNoOp { return &utilityNoOp{plan: p} }
 
-func (o *utilityNoOp) Schema() planner.Schema   { return nil }
+func (o *utilityNoOp) Schema() optimizer.Schema   { return nil }
 func (o *utilityNoOp) Open(*Context) error      { return nil }
 func (o *utilityNoOp) Next() (TupleSlot, error) { return nil, EOF }
 func (o *utilityNoOp) Close() error             { return nil }
@@ -454,12 +454,12 @@ func unwrapSeqScanOp(op Operator) *seqScanOp {
 }
 
 // buildRec is the recursive tree builder for BuildFast.
-func (tree *opTreeSlab) buildRec(plan planner.Node) (int32, error) {
+func (tree *opTreeSlab) buildRec(plan optimizer.Node) (int32, error) {
 	switch p := plan.(type) {
-	case *planner.SeqScan:
+	case *optimizer.SeqScan:
 		return tree.add(OpNode{Kind: OpSeqScan, childA: noChild, childB: noChild, state: newSeqScanOp(p)}), nil
 
-	case *planner.Filter:
+	case *optimizer.Filter:
 		childIdx, err := tree.buildRec(p.Child)
 		if err != nil {
 			return noChild, err
@@ -469,7 +469,7 @@ func (tree *opTreeSlab) buildRec(plan planner.Node) (int32, error) {
 		// table takes per-matching-tuple grid-cell SIREAD locks instead of a
 		// relation-grain lock. This is the LIVE server path (BuildFastIterator);
 		// Build has the twin. No-op unless the scan resolves a GiST index at Open.
-		if _, ok := p.Child.(*planner.SeqScan); ok {
+		if _, ok := p.Child.(*optimizer.SeqScan); ok {
 			if so, ok2 := tree.ops[childIdx].state.(*seqScanOp); ok2 {
 				so.ssiGistPred = p.Predicate
 				so.ssiGinPred = p.Predicate
@@ -481,7 +481,7 @@ func (tree *opTreeSlab) buildRec(plan planner.Node) (int32, error) {
 		return tree.add(OpNode{Kind: OpFilter, childA: childIdx, childB: noChild,
 			state: &filterState{predIdx: predIdx}}), nil
 
-	case *planner.Project:
+	case *optimizer.Project:
 		childIdx, err := tree.buildRec(p.Child)
 		if err != nil {
 			return noChild, err
@@ -498,7 +498,7 @@ func (tree *opTreeSlab) buildRec(plan planner.Node) (int32, error) {
 		return tree.add(OpNode{Kind: OpProject, childA: childIdx, childB: noChild,
 			state: &projectState{schemaIdx: schemaIdx, targExprs: targExprs}}), nil
 
-	case *planner.Limit:
+	case *optimizer.Limit:
 		childIdx, err := tree.buildRec(p.Child)
 		if err != nil {
 			return noChild, err
@@ -523,7 +523,7 @@ func (tree *opTreeSlab) buildRec(plan planner.Node) (int32, error) {
 				withTies:       p.WithTies,
 			}}), nil
 
-	case *planner.Sort:
+	case *optimizer.Sort:
 		childIdx, err := tree.buildRec(p.Child)
 		if err != nil {
 			return noChild, err
@@ -536,21 +536,21 @@ func (tree *opTreeSlab) buildRec(plan planner.Node) (int32, error) {
 		sortLegacy := newSortOp(p, childOp)
 		return tree.add(OpNode{Kind: OpSort, childA: noChild, childB: noChild, state: &sortOpState{op: sortLegacy, schema: p.Output()}}), nil
 
-	case *planner.Update:
+	case *optimizer.Update:
 		op, err := newUpdateOp(p)
 		if err != nil {
 			return noChild, err
 		}
 		return tree.add(OpNode{Kind: OpUpdate, childA: noChild, childB: noChild, state: &updateOpState{op: op}}), nil
 
-	case *planner.Delete:
+	case *optimizer.Delete:
 		op, err := newDeleteOp(p)
 		if err != nil {
 			return noChild, err
 		}
 		return tree.add(OpNode{Kind: OpDelete, childA: noChild, childB: noChild, state: &deleteOpState{op: op}}), nil
 
-	case *planner.Insert:
+	case *optimizer.Insert:
 		childIdx, err := tree.buildRec(p.Source)
 		if err != nil {
 			return noChild, err
@@ -563,7 +563,7 @@ func (tree *opTreeSlab) buildRec(plan planner.Node) (int32, error) {
 		}
 		return tree.add(OpNode{Kind: OpInsert, childA: noChild, childB: noChild, state: &insertOpState{op: newInsertOp(p, childOp)}}), nil
 
-	case *planner.Join:
+	case *optimizer.Join:
 		leftIdx, err := tree.buildRec(p.Left)
 		if err != nil {
 			return noChild, err
@@ -592,12 +592,12 @@ func (tree *opTreeSlab) buildRec(plan planner.Node) (int32, error) {
 // BuildFast constructs an op-tree slab from plan and returns the slab and
 // the root index. Non-migrated operators are wrapped in an opAdapter that
 // drives the legacy Operator interface.
-func BuildFast(plan planner.Node) (*opTreeSlab, int32, error) {
+func BuildFast(plan optimizer.Node) (*opTreeSlab, int32, error) {
 	tree := &opTreeSlab{
 		ops:     make([]OpNode, 0, 8),
 		exprs:   make(exprTreeSlab, 0, 16),
 		plans:   make(planTreeSlab, 0, 8),
-		schemas: make([]planner.Schema, 0, 4),
+		schemas: make([]optimizer.Schema, 0, 4),
 	}
 	rootIdx, err := tree.buildRec(plan)
 	if err != nil {

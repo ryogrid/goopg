@@ -27,7 +27,7 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/executor/kvcache"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // MemoizeStats carries the per-node ANALYZE counters, PG's
@@ -40,12 +40,12 @@ type MemoizeStats struct {
 }
 
 // memoizeStat returns (lazily allocating) the stats block for m.
-func (c *Context) memoizeStat(m *planner.Memoize) *MemoizeStats {
+func (c *Context) memoizeStat(m *optimizer.Memoize) *MemoizeStats {
 	if c == nil {
 		return &MemoizeStats{}
 	}
 	if c.MemoizeStats == nil {
-		c.MemoizeStats = make(map[*planner.Memoize]*MemoizeStats)
+		c.MemoizeStats = make(map[*optimizer.Memoize]*MemoizeStats)
 	}
 	st, ok := c.MemoizeStats[m]
 	if !ok {
@@ -69,7 +69,7 @@ const (
 const memoEntryRowOverhead = 48
 
 type memoizeOp struct {
-	plan  *planner.Memoize
+	plan  *optimizer.Memoize
 	child *indexScanOp
 	ctx   *Context
 	cache *kvcache.Cache
@@ -87,11 +87,11 @@ type memoizeOp struct {
 	emitMS    *MaterializedSlot
 }
 
-func newMemoizeOp(p *planner.Memoize, child *indexScanOp) *memoizeOp {
+func newMemoizeOp(p *optimizer.Memoize, child *indexScanOp) *memoizeOp {
 	return &memoizeOp{plan: p, child: child}
 }
 
-func (o *memoizeOp) Schema() planner.Schema { return o.child.Schema() }
+func (o *memoizeOp) Schema() optimizer.Schema { return o.child.Schema() }
 
 func (o *memoizeOp) openPrep(ctx *Context) error {
 	o.ctx = ctx
@@ -126,12 +126,12 @@ func (o *memoizeOp) BindOuter(slot SlotView, outerWidth int) {
 // cache on them is correct by construction even if the snapshot went
 // stale. KeyExprs stays authoritative only for EXPLAIN and the attach
 // gate.
-func (o *memoizeOp) keyExprs() []planner.Expr {
+func (o *memoizeOp) keyExprs() []optimizer.Expr {
 	if len(o.child.plan.Keys) > 0 {
 		return o.child.plan.Keys
 	}
 	if o.child.plan.Key != nil {
-		return []planner.Expr{o.child.plan.Key}
+		return []optimizer.Expr{o.child.plan.Key}
 	}
 	return o.plan.KeyExprs
 }

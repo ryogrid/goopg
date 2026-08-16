@@ -48,7 +48,7 @@ package amcheck
 import (
 	"fmt"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -81,7 +81,7 @@ type lastVisibleEntry struct {
 // It returns at most one finding (the first duplicate is conclusive) and a Go
 // error only for a genuine read/decode failure of the leaf level, which the SQL
 // surface reports rather than silently treating as a clean index.
-func VerifyBtreeUnique(src PageSource, indexName string, keyFmt btree.IndexFormat, cmpKeys KeyComparator, visible HeapVisibilityFunc) ([]BtreeReport, error) {
+func VerifyBtreeUnique(src PageSource, indexName string, keyFmt nbtree.IndexFormat, cmpKeys KeyComparator, visible HeapVisibilityFunc) ([]BtreeReport, error) {
 	if src == nil {
 		return nil, fmt.Errorf("amcheck: nil page source")
 	}
@@ -91,15 +91,15 @@ func VerifyBtreeUnique(src PageSource, indexName string, keyFmt btree.IndexForma
 		return nil, fmt.Errorf("amcheck: checkunique requires a heap visibility function")
 	}
 	if cmpKeys == nil {
-		cmpKeys = btree.CompareKeys
+		cmpKeys = nbtree.CompareKeys
 	}
 
-	metaPage, err := src(btree.MetaBlock)
+	metaPage, err := src(nbtree.MetaBlock)
 	if err != nil {
 		return nil, fmt.Errorf("amcheck: reading metapage: %w", err)
 	}
-	meta := btree.ParseMeta(metaPage)
-	if meta.Root == btree.MetaBlock || meta.Root == storage.InvalidBlockNumber {
+	meta := nbtree.ParseMeta(metaPage)
+	if meta.Root == nbtree.MetaBlock || meta.Root == storage.InvalidBlockNumber {
 		return nil, nil // no key level: vacuously unique
 	}
 	leftmost, err := leftmostLeafBlock(src, meta.Root, keyFmt)
@@ -119,7 +119,7 @@ func VerifyBtreeUnique(src PageSource, indexName string, keyFmt btree.IndexForma
 		if err != nil {
 			return nil, fmt.Errorf("amcheck: reading leaf block %d: %w", current, err)
 		}
-		opaque := btree.ParseOpaque(p)
+		opaque := nbtree.ParseOpaque(p)
 		if !opaque.IsLeaf() {
 			return nil, fmt.Errorf("amcheck: block %d on leaf walk is not a leaf page", current)
 		}
@@ -171,7 +171,7 @@ func VerifyBtreeUnique(src PageSource, indexName string, keyFmt btree.IndexForma
 // (block, offset) — i.e. when the two conflicting entries are two postings of
 // the *same* line pointer, upstream prints the tid once and distinguishes them
 // by posting index alone.
-func duplicateDetail(lVis *lastVisibleEntry, blk storage.BlockNumber, it btree.LeafItem, lsn storage.LSN) string {
+func duplicateDetail(lVis *lastVisibleEntry, blk storage.BlockNumber, it nbtree.LeafItem, lsn storage.LSN) string {
 	posting := func(i int) string {
 		if i < 0 {
 			return ""

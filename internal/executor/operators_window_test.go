@@ -4,23 +4,23 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 func TestWindowOpRowNumberByPartitionAndOrder(t *testing.T) {
-	plan := &planner.WindowAgg{
-		Child: &planner.Values{Rows: [][]planner.Expr{
-			{&planner.IntegerConst{Value: 1}, &planner.IntegerConst{Value: 20}},
-			{&planner.IntegerConst{Value: 2}, &planner.IntegerConst{Value: 5}},
-			{&planner.IntegerConst{Value: 1}, &planner.IntegerConst{Value: 10}},
+	plan := &optimizer.WindowAgg{
+		Child: &optimizer.Values{Rows: [][]optimizer.Expr{
+			{&optimizer.IntegerConst{Value: 1}, &optimizer.IntegerConst{Value: 20}},
+			{&optimizer.IntegerConst{Value: 2}, &optimizer.IntegerConst{Value: 5}},
+			{&optimizer.IntegerConst{Value: 1}, &optimizer.IntegerConst{Value: 10}},
 		}},
-		PartitionBy: []planner.Expr{
-			&planner.ColumnRef{Index: 0, Name: "grp", Type: catalog.Type{Name: "int4"}},
+		PartitionBy: []optimizer.Expr{
+			&optimizer.ColumnRef{Index: 0, Name: "grp", Type: catalog.Type{Name: "int4"}},
 		},
-		OrderBy: []planner.SortKey{
-			{Expr: &planner.ColumnRef{Index: 1, Name: "val", Type: catalog.Type{Name: "int4"}}},
+		OrderBy: []optimizer.SortKey{
+			{Expr: &optimizer.ColumnRef{Index: 1, Name: "val", Type: catalog.Type{Name: "int4"}}},
 		},
-		Funcs: []planner.WindowFunc{
+		Funcs: []optimizer.WindowFunc{
 			{Name: "row_number", Type: catalog.Type{Name: "int8"}},
 		},
 	}
@@ -51,13 +51,13 @@ func TestWindowOpRowNumberByPartitionAndOrder(t *testing.T) {
 }
 
 func TestWindowOpRankWithoutOrderAllPeers(t *testing.T) {
-	plan := &planner.WindowAgg{
-		Child: &planner.Values{Rows: [][]planner.Expr{
-			{&planner.IntegerConst{Value: 9}},
-			{&planner.IntegerConst{Value: 3}},
-			{&planner.IntegerConst{Value: 7}},
+	plan := &optimizer.WindowAgg{
+		Child: &optimizer.Values{Rows: [][]optimizer.Expr{
+			{&optimizer.IntegerConst{Value: 9}},
+			{&optimizer.IntegerConst{Value: 3}},
+			{&optimizer.IntegerConst{Value: 7}},
 		}},
-		Funcs: []planner.WindowFunc{{Name: "rank", Type: catalog.Type{Name: "int8"}}},
+		Funcs: []optimizer.WindowFunc{{Name: "rank", Type: catalog.Type{Name: "int8"}}},
 	}
 	op, err := Build(plan)
 	if err != nil {
@@ -82,15 +82,15 @@ func TestWindowOpRankWithoutOrderAllPeers(t *testing.T) {
 func TestWindowOpLagBasic(t *testing.T) {
 	// lag(val) with no explicit offset (default 1): each row gets the
 	// previous row's value; the first row returns NULL.
-	valRef := &planner.ColumnRef{Index: 0, Name: "val", Type: catalog.Type{Name: "int8"}}
-	plan := &planner.WindowAgg{
-		Child: &planner.Values{Rows: [][]planner.Expr{
-			{&planner.IntegerConst{Value: 10}},
-			{&planner.IntegerConst{Value: 20}},
-			{&planner.IntegerConst{Value: 30}},
+	valRef := &optimizer.ColumnRef{Index: 0, Name: "val", Type: catalog.Type{Name: "int8"}}
+	plan := &optimizer.WindowAgg{
+		Child: &optimizer.Values{Rows: [][]optimizer.Expr{
+			{&optimizer.IntegerConst{Value: 10}},
+			{&optimizer.IntegerConst{Value: 20}},
+			{&optimizer.IntegerConst{Value: 30}},
 		}},
-		Funcs: []planner.WindowFunc{
-			{Name: "lag", Type: catalog.Type{Name: "int8"}, Args: []planner.Expr{valRef}},
+		Funcs: []optimizer.WindowFunc{
+			{Name: "lag", Type: catalog.Type{Name: "int8"}, Args: []optimizer.Expr{valRef}},
 		},
 	}
 	op, err := Build(plan)
@@ -121,15 +121,15 @@ func TestWindowOpLagBasic(t *testing.T) {
 func TestWindowOpLeadBasic(t *testing.T) {
 	// lead(val) with default offset 1: each row gets the next row's
 	// value; the last row returns NULL.
-	valRef := &planner.ColumnRef{Index: 0, Name: "val", Type: catalog.Type{Name: "int8"}}
-	plan := &planner.WindowAgg{
-		Child: &planner.Values{Rows: [][]planner.Expr{
-			{&planner.IntegerConst{Value: 10}},
-			{&planner.IntegerConst{Value: 20}},
-			{&planner.IntegerConst{Value: 30}},
+	valRef := &optimizer.ColumnRef{Index: 0, Name: "val", Type: catalog.Type{Name: "int8"}}
+	plan := &optimizer.WindowAgg{
+		Child: &optimizer.Values{Rows: [][]optimizer.Expr{
+			{&optimizer.IntegerConst{Value: 10}},
+			{&optimizer.IntegerConst{Value: 20}},
+			{&optimizer.IntegerConst{Value: 30}},
 		}},
-		Funcs: []planner.WindowFunc{
-			{Name: "lead", Type: catalog.Type{Name: "int8"}, Args: []planner.Expr{valRef}},
+		Funcs: []optimizer.WindowFunc{
+			{Name: "lead", Type: catalog.Type{Name: "int8"}, Args: []optimizer.Expr{valRef}},
 		},
 	}
 	op, err := Build(plan)
@@ -155,18 +155,18 @@ func TestWindowOpLeadBasic(t *testing.T) {
 
 func TestWindowOpLagWithExplicitOffset(t *testing.T) {
 	// lag(val, 2): each row gets the value 2 rows back.
-	valRef := &planner.ColumnRef{Index: 0, Name: "val", Type: catalog.Type{Name: "int8"}}
-	plan := &planner.WindowAgg{
-		Child: &planner.Values{Rows: [][]planner.Expr{
-			{&planner.IntegerConst{Value: 10}},
-			{&planner.IntegerConst{Value: 20}},
-			{&planner.IntegerConst{Value: 30}},
-			{&planner.IntegerConst{Value: 40}},
+	valRef := &optimizer.ColumnRef{Index: 0, Name: "val", Type: catalog.Type{Name: "int8"}}
+	plan := &optimizer.WindowAgg{
+		Child: &optimizer.Values{Rows: [][]optimizer.Expr{
+			{&optimizer.IntegerConst{Value: 10}},
+			{&optimizer.IntegerConst{Value: 20}},
+			{&optimizer.IntegerConst{Value: 30}},
+			{&optimizer.IntegerConst{Value: 40}},
 		}},
-		Funcs: []planner.WindowFunc{
-			{Name: "lag", Type: catalog.Type{Name: "int8"}, Args: []planner.Expr{
+		Funcs: []optimizer.WindowFunc{
+			{Name: "lag", Type: catalog.Type{Name: "int8"}, Args: []optimizer.Expr{
 				valRef,
-				&planner.IntegerConst{Value: 2},
+				&optimizer.IntegerConst{Value: 2},
 			}},
 		},
 	}
@@ -194,17 +194,17 @@ func TestWindowOpLagWithExplicitOffset(t *testing.T) {
 
 func TestWindowOpLagWithDefault(t *testing.T) {
 	// lag(val, 1, -1): out-of-range rows return -1 instead of NULL.
-	valRef := &planner.ColumnRef{Index: 0, Name: "val", Type: catalog.Type{Name: "int8"}}
-	plan := &planner.WindowAgg{
-		Child: &planner.Values{Rows: [][]planner.Expr{
-			{&planner.IntegerConst{Value: 10}},
-			{&planner.IntegerConst{Value: 20}},
+	valRef := &optimizer.ColumnRef{Index: 0, Name: "val", Type: catalog.Type{Name: "int8"}}
+	plan := &optimizer.WindowAgg{
+		Child: &optimizer.Values{Rows: [][]optimizer.Expr{
+			{&optimizer.IntegerConst{Value: 10}},
+			{&optimizer.IntegerConst{Value: 20}},
 		}},
-		Funcs: []planner.WindowFunc{
-			{Name: "lag", Type: catalog.Type{Name: "int8"}, Args: []planner.Expr{
+		Funcs: []optimizer.WindowFunc{
+			{Name: "lag", Type: catalog.Type{Name: "int8"}, Args: []optimizer.Expr{
 				valRef,
-				&planner.IntegerConst{Value: 1},
-				&planner.IntegerConst{Value: -1},
+				&optimizer.IntegerConst{Value: 1},
+				&optimizer.IntegerConst{Value: -1},
 			}},
 		},
 	}
@@ -227,17 +227,17 @@ func TestWindowOpLagWithDefault(t *testing.T) {
 
 func TestWindowOpLeadWithDefault(t *testing.T) {
 	// lead(val, 1, 99): last row returns 99.
-	valRef := &planner.ColumnRef{Index: 0, Name: "val", Type: catalog.Type{Name: "int8"}}
-	plan := &planner.WindowAgg{
-		Child: &planner.Values{Rows: [][]planner.Expr{
-			{&planner.IntegerConst{Value: 10}},
-			{&planner.IntegerConst{Value: 20}},
+	valRef := &optimizer.ColumnRef{Index: 0, Name: "val", Type: catalog.Type{Name: "int8"}}
+	plan := &optimizer.WindowAgg{
+		Child: &optimizer.Values{Rows: [][]optimizer.Expr{
+			{&optimizer.IntegerConst{Value: 10}},
+			{&optimizer.IntegerConst{Value: 20}},
 		}},
-		Funcs: []planner.WindowFunc{
-			{Name: "lead", Type: catalog.Type{Name: "int8"}, Args: []planner.Expr{
+		Funcs: []optimizer.WindowFunc{
+			{Name: "lead", Type: catalog.Type{Name: "int8"}, Args: []optimizer.Expr{
 				valRef,
-				&planner.IntegerConst{Value: 1},
-				&planner.IntegerConst{Value: 99},
+				&optimizer.IntegerConst{Value: 1},
+				&optimizer.IntegerConst{Value: 99},
 			}},
 		},
 	}
@@ -260,19 +260,19 @@ func TestWindowOpLeadWithDefault(t *testing.T) {
 func TestWindowOpLagLeadWithPartitions(t *testing.T) {
 	// lag(val) and lead(val) with PARTITION BY grp.
 	// Partition boundaries mean lag/lead cannot cross partition edges.
-	grpRef := &planner.ColumnRef{Index: 0, Name: "grp", Type: catalog.Type{Name: "int4"}}
-	valRef := &planner.ColumnRef{Index: 1, Name: "val", Type: catalog.Type{Name: "int8"}}
-	plan := &planner.WindowAgg{
-		Child: &planner.Values{Rows: [][]planner.Expr{
-			{&planner.IntegerConst{Value: 1}, &planner.IntegerConst{Value: 10}},
-			{&planner.IntegerConst{Value: 1}, &planner.IntegerConst{Value: 20}},
-			{&planner.IntegerConst{Value: 2}, &planner.IntegerConst{Value: 5}},
-			{&planner.IntegerConst{Value: 2}, &planner.IntegerConst{Value: 15}},
+	grpRef := &optimizer.ColumnRef{Index: 0, Name: "grp", Type: catalog.Type{Name: "int4"}}
+	valRef := &optimizer.ColumnRef{Index: 1, Name: "val", Type: catalog.Type{Name: "int8"}}
+	plan := &optimizer.WindowAgg{
+		Child: &optimizer.Values{Rows: [][]optimizer.Expr{
+			{&optimizer.IntegerConst{Value: 1}, &optimizer.IntegerConst{Value: 10}},
+			{&optimizer.IntegerConst{Value: 1}, &optimizer.IntegerConst{Value: 20}},
+			{&optimizer.IntegerConst{Value: 2}, &optimizer.IntegerConst{Value: 5}},
+			{&optimizer.IntegerConst{Value: 2}, &optimizer.IntegerConst{Value: 15}},
 		}},
-		PartitionBy: []planner.Expr{grpRef},
-		Funcs: []planner.WindowFunc{
-			{Name: "lag", Type: catalog.Type{Name: "int8"}, Args: []planner.Expr{valRef}},
-			{Name: "lead", Type: catalog.Type{Name: "int8"}, Args: []planner.Expr{valRef}},
+		PartitionBy: []optimizer.Expr{grpRef},
+		Funcs: []optimizer.WindowFunc{
+			{Name: "lag", Type: catalog.Type{Name: "int8"}, Args: []optimizer.Expr{valRef}},
+			{Name: "lead", Type: catalog.Type{Name: "int8"}, Args: []optimizer.Expr{valRef}},
 		},
 	}
 	op, err := Build(plan)
@@ -329,21 +329,21 @@ func TestWindowOpLagLeadWithPartitions(t *testing.T) {
 }
 
 func TestWindowOpRankWithPeersAndPartitions(t *testing.T) {
-	plan := &planner.WindowAgg{
-		Child: &planner.Values{Rows: [][]planner.Expr{
-			{&planner.IntegerConst{Value: 1}, &planner.IntegerConst{Value: 10}},
-			{&planner.IntegerConst{Value: 1}, &planner.IntegerConst{Value: 20}},
-			{&planner.IntegerConst{Value: 1}, &planner.IntegerConst{Value: 10}},
-			{&planner.IntegerConst{Value: 2}, &planner.IntegerConst{Value: 5}},
-			{&planner.IntegerConst{Value: 2}, &planner.IntegerConst{Value: 5}},
+	plan := &optimizer.WindowAgg{
+		Child: &optimizer.Values{Rows: [][]optimizer.Expr{
+			{&optimizer.IntegerConst{Value: 1}, &optimizer.IntegerConst{Value: 10}},
+			{&optimizer.IntegerConst{Value: 1}, &optimizer.IntegerConst{Value: 20}},
+			{&optimizer.IntegerConst{Value: 1}, &optimizer.IntegerConst{Value: 10}},
+			{&optimizer.IntegerConst{Value: 2}, &optimizer.IntegerConst{Value: 5}},
+			{&optimizer.IntegerConst{Value: 2}, &optimizer.IntegerConst{Value: 5}},
 		}},
-		PartitionBy: []planner.Expr{
-			&planner.ColumnRef{Index: 0, Name: "grp", Type: catalog.Type{Name: "int4"}},
+		PartitionBy: []optimizer.Expr{
+			&optimizer.ColumnRef{Index: 0, Name: "grp", Type: catalog.Type{Name: "int4"}},
 		},
-		OrderBy: []planner.SortKey{
-			{Expr: &planner.ColumnRef{Index: 1, Name: "val", Type: catalog.Type{Name: "int4"}}},
+		OrderBy: []optimizer.SortKey{
+			{Expr: &optimizer.ColumnRef{Index: 1, Name: "val", Type: catalog.Type{Name: "int4"}}},
 		},
-		Funcs: []planner.WindowFunc{{Name: "rank", Type: catalog.Type{Name: "int8"}}},
+		Funcs: []optimizer.WindowFunc{{Name: "rank", Type: catalog.Type{Name: "int8"}}},
 	}
 	op, err := Build(plan)
 	if err != nil {

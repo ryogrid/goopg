@@ -4,9 +4,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/storage"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // TestReplayCLogFromWAL_NativeCommit verifies that a native
@@ -15,22 +15,22 @@ func TestReplayCLogFromWAL_NativeCommit(t *testing.T) {
 	dir := t.TempDir()
 	walDir := filepath.Join(dir, "pg_wal")
 
-	clog, err := mvcc.OpenCLog(filepath.Join(dir, "pg_xact"))
+	clog, err := transam.OpenCLog(filepath.Join(dir, "pg_xact"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := clog.EnablePGSLRUMirror(filepath.Join(dir, "pg_xact_slru")); err != nil {
 		t.Fatal(err)
 	}
-	txnMgr := mvcc.NewManager()
+	txnMgr := transam.NewManager()
 
 	// Write a WAL segment with one commit record for XID=5.
 	xid := storage.TransactionID(5)
-	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: true})
+	w, err := xlog.NewWriter(xlog.Config{WALDir: walDir, PageHeaders: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload := wal.EncodeXactCommit(xid)
+	payload := xlog.EncodeXactCommit(xid)
 	if _, _, err := w.Append(payload); err != nil {
 		t.Fatalf("Append commit: %v", err)
 	}
@@ -40,7 +40,7 @@ func TestReplayCLogFromWAL_NativeCommit(t *testing.T) {
 		t.Fatalf("replayCLogFromWAL: %v", err)
 	}
 
-	if got := clog.GetStatus(xid); got != mvcc.TxnStatusCommitted {
+	if got := clog.GetStatus(xid); got != transam.TxnStatusCommitted {
 		t.Errorf("XID %d: got %v want TxnStatusCommitted", xid, got)
 	}
 	if got := txnMgr.NextXID(); got <= xid {
@@ -54,21 +54,21 @@ func TestReplayCLogFromWAL_NativeAbort(t *testing.T) {
 	dir := t.TempDir()
 	walDir := filepath.Join(dir, "pg_wal")
 
-	clog, err := mvcc.OpenCLog(filepath.Join(dir, "pg_xact"))
+	clog, err := transam.OpenCLog(filepath.Join(dir, "pg_xact"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := clog.EnablePGSLRUMirror(filepath.Join(dir, "pg_xact_slru")); err != nil {
 		t.Fatal(err)
 	}
-	txnMgr := mvcc.NewManager()
+	txnMgr := transam.NewManager()
 
-	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: true})
+	w, err := xlog.NewWriter(xlog.Config{WALDir: walDir, PageHeaders: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	xid := storage.TransactionID(7)
-	payload := wal.EncodeXactAbort(xid)
+	payload := xlog.EncodeXactAbort(xid)
 	if _, _, err := w.Append(payload); err != nil {
 		t.Fatalf("Append abort: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestReplayCLogFromWAL_NativeAbort(t *testing.T) {
 		t.Fatalf("replayCLogFromWAL: %v", err)
 	}
 
-	if got := clog.GetStatus(xid); got != mvcc.TxnStatusAborted {
+	if got := clog.GetStatus(xid); got != transam.TxnStatusAborted {
 		t.Errorf("XID %d: got %v want TxnStatusAborted", xid, got)
 	}
 }
@@ -99,14 +99,14 @@ func TestReplayCLogFromWAL_RecoversUnflushedAsyncCommit(t *testing.T) {
 	dir := t.TempDir()
 	walDir := filepath.Join(dir, "pg_wal")
 	slruDir := filepath.Join(dir, "pg_xact")
-	const xid = storage.TransactionID(mvcc.FirstNormalTransactionID + 100)
+	const xid = storage.TransactionID(transam.FirstNormalTransactionID + 100)
 	const lsn = uint64(55555)
 
 	// Simulate the live server: an async commit marks the page dirty and
 	// commits successfully without a durable write-back (no FlushWALHook
 	// installed, mirroring the default-off barrier; no FlushAll/checkpoint
 	// runs either).
-	live, err := mvcc.OpenCLog(filepath.Join(dir, "pg_xact_flat"))
+	live, err := transam.OpenCLog(filepath.Join(dir, "pg_xact_flat"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +116,7 @@ func TestReplayCLogFromWAL_RecoversUnflushedAsyncCommit(t *testing.T) {
 	if err := live.SetCommittedWithLSN(xid, lsn); err != nil {
 		t.Fatalf("SetCommittedWithLSN: %v", err)
 	}
-	if got := live.GetStatus(xid); got != mvcc.TxnStatusCommitted {
+	if got := live.GetStatus(xid); got != transam.TxnStatusCommitted {
 		t.Fatalf("live in-memory GetStatus(%d) = %v, want Committed", xid, got)
 	}
 	// Deliberately do NOT call live.FlushAll() — the dirty page is "lost" in
@@ -126,14 +126,14 @@ func TestReplayCLogFromWAL_RecoversUnflushedAsyncCommit(t *testing.T) {
 	// Simulate the crash + restart: open a fresh CLog against the SAME SLRU
 	// directory. Since the page was never flushed, disk still shows the
 	// pre-commit (in-progress) lane.
-	recovered, err := mvcc.OpenCLog(filepath.Join(dir, "pg_xact_flat2"))
+	recovered, err := transam.OpenCLog(filepath.Join(dir, "pg_xact_flat2"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := recovered.EnablePGSLRUMirror(slruDir); err != nil {
 		t.Fatal(err)
 	}
-	if got := recovered.GetStatus(xid); got == mvcc.TxnStatusCommitted {
+	if got := recovered.GetStatus(xid); got == transam.TxnStatusCommitted {
 		t.Fatalf("recovered GetStatus(%d) already Committed before replay — the dirty page must not have been flushed for this test to be meaningful", xid)
 	}
 
@@ -141,20 +141,20 @@ func TestReplayCLogFromWAL_RecoversUnflushedAsyncCommit(t *testing.T) {
 	// the client only waited for the local WAL flush, not the CLOG
 	// write-back) — write the matching commit record and replay it, exactly
 	// as initdb.Open's crash-recovery path does.
-	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: true})
+	w, err := xlog.NewWriter(xlog.Config{WALDir: walDir, PageHeaders: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := w.Append(wal.EncodeXactCommit(xid)); err != nil {
+	if _, _, err := w.Append(xlog.EncodeXactCommit(xid)); err != nil {
 		t.Fatalf("Append commit: %v", err)
 	}
 	_ = w.Close()
 
-	txnMgr := mvcc.NewManager()
+	txnMgr := transam.NewManager()
 	if err := replayCLogFromWAL(walDir, recovered, txnMgr); err != nil {
 		t.Fatalf("replayCLogFromWAL: %v", err)
 	}
-	if got := recovered.GetStatus(xid); got != mvcc.TxnStatusCommitted {
+	if got := recovered.GetStatus(xid); got != transam.TxnStatusCommitted {
 		t.Errorf("recovered GetStatus(%d) after replay = %v, want Committed", xid, got)
 	}
 }
@@ -163,14 +163,14 @@ func TestReplayCLogFromWAL_RecoversUnflushedAsyncCommit(t *testing.T) {
 // treated as a no-op (fresh cluster has no WAL yet).
 func TestReplayCLogFromWAL_MissingWalDir(t *testing.T) {
 	dir := t.TempDir()
-	clog, err := mvcc.OpenCLog(filepath.Join(dir, "pg_xact"))
+	clog, err := transam.OpenCLog(filepath.Join(dir, "pg_xact"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := clog.EnablePGSLRUMirror(filepath.Join(dir, "pg_xact_slru")); err != nil {
 		t.Fatal(err)
 	}
-	txnMgr := mvcc.NewManager()
+	txnMgr := transam.NewManager()
 	// Non-existent WAL dir — must not error.
 	if err := replayCLogFromWAL(filepath.Join(dir, "nonexistent_pg_wal"), clog, txnMgr); err != nil {
 		t.Errorf("replayCLogFromWAL with missing dir: %v", err)
@@ -187,10 +187,10 @@ func TestReplayCLogFromWAL_RecoversUnflushedSyncCommit(t *testing.T) {
 	dir := t.TempDir()
 	walDir := filepath.Join(dir, "pg_wal")
 	slruDir := filepath.Join(dir, "pg_xact")
-	const xid = storage.TransactionID(mvcc.FirstNormalTransactionID + 200)
+	const xid = storage.TransactionID(transam.FirstNormalTransactionID + 200)
 	const lsn = uint64(66666)
 
-	live, err := mvcc.OpenCLog(filepath.Join(dir, "pg_xact_flat"))
+	live, err := transam.OpenCLog(filepath.Join(dir, "pg_xact_flat"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,40 +202,40 @@ func TestReplayCLogFromWAL_RecoversUnflushedSyncCommit(t *testing.T) {
 	if err := live.SetCommittedWithLSN(xid, lsn); err != nil {
 		t.Fatalf("SetCommittedWithLSN: %v", err)
 	}
-	if got := live.GetStatus(xid); got != mvcc.TxnStatusCommitted {
+	if got := live.GetStatus(xid); got != transam.TxnStatusCommitted {
 		t.Fatalf("live GetStatus(%d) = %v, want Committed", xid, got)
 	}
 
 	// Simulated SIGKILL: reopen against the same SLRU dir; the lane must NOT
 	// be on disk (this is the discriminator that fails if the eager
 	// write-back comes back).
-	recovered, err := mvcc.OpenCLog(filepath.Join(dir, "pg_xact_flat2"))
+	recovered, err := transam.OpenCLog(filepath.Join(dir, "pg_xact_flat2"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := recovered.EnablePGSLRUMirror(slruDir); err != nil {
 		t.Fatal(err)
 	}
-	if got := recovered.GetStatus(xid); got == mvcc.TxnStatusCommitted {
+	if got := recovered.GetStatus(xid); got == transam.TxnStatusCommitted {
 		t.Fatalf("recovered GetStatus(%d) already Committed before replay — sync commit still writes pg_xact eagerly (C2-S3 cut regressed)", xid)
 	}
 
 	// The WAL commit record IS durable (FlushUpTo before ack, fatal on error
 	// since C2-S3) — replay reconstructs the commit.
-	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: true})
+	w, err := xlog.NewWriter(xlog.Config{WALDir: walDir, PageHeaders: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := w.Append(wal.EncodeXactCommit(xid)); err != nil {
+	if _, _, err := w.Append(xlog.EncodeXactCommit(xid)); err != nil {
 		t.Fatalf("Append commit: %v", err)
 	}
 	_ = w.Close()
 
-	txnMgr := mvcc.NewManager()
+	txnMgr := transam.NewManager()
 	if err := replayCLogFromWAL(walDir, recovered, txnMgr); err != nil {
 		t.Fatalf("replayCLogFromWAL: %v", err)
 	}
-	if got := recovered.GetStatus(xid); got != mvcc.TxnStatusCommitted {
+	if got := recovered.GetStatus(xid); got != transam.TxnStatusCommitted {
 		t.Errorf("recovered GetStatus(%d) after replay = %v, want Committed", xid, got)
 	}
 }
@@ -252,10 +252,10 @@ func TestReplayCLogFromWAL_OverridesMarkUnknownAsAborted(t *testing.T) {
 	dir := t.TempDir()
 	walDir := filepath.Join(dir, "pg_wal")
 	slruDir := filepath.Join(dir, "pg_xact")
-	const committedXid = storage.TransactionID(mvcc.FirstNormalTransactionID + 300)
+	const committedXid = storage.TransactionID(transam.FirstNormalTransactionID + 300)
 	const inFlightXid = committedXid + 1
 
-	c, err := mvcc.OpenCLog(filepath.Join(dir, "pg_xact_flat"))
+	c, err := transam.OpenCLog(filepath.Join(dir, "pg_xact_flat"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,27 +267,27 @@ func TestReplayCLogFromWAL_OverridesMarkUnknownAsAborted(t *testing.T) {
 	if err := c.MarkUnknownAsAborted(inFlightXid + 1); err != nil {
 		t.Fatalf("MarkUnknownAsAborted: %v", err)
 	}
-	if got := c.GetStatus(committedXid); got != mvcc.TxnStatusAborted {
+	if got := c.GetStatus(committedXid); got != transam.TxnStatusAborted {
 		t.Fatalf("after MarkUnknownAsAborted GetStatus(%d) = %v, want Aborted", committedXid, got)
 	}
 
 	// Step 2: WAL replay overrides the acked commit back to Committed; the
 	// genuinely in-flight XID (no commit record) stays aborted.
-	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: true})
+	w, err := xlog.NewWriter(xlog.Config{WALDir: walDir, PageHeaders: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := w.Append(wal.EncodeXactCommit(committedXid)); err != nil {
+	if _, _, err := w.Append(xlog.EncodeXactCommit(committedXid)); err != nil {
 		t.Fatalf("Append commit: %v", err)
 	}
 	_ = w.Close()
-	if err := replayCLogFromWAL(walDir, c, mvcc.NewManager()); err != nil {
+	if err := replayCLogFromWAL(walDir, c, transam.NewManager()); err != nil {
 		t.Fatalf("replayCLogFromWAL: %v", err)
 	}
-	if got := c.GetStatus(committedXid); got != mvcc.TxnStatusCommitted {
+	if got := c.GetStatus(committedXid); got != transam.TxnStatusCommitted {
 		t.Errorf("GetStatus(%d) = %v, want Committed (WAL must override the blanket abort)", committedXid, got)
 	}
-	if got := c.GetStatus(inFlightXid); got != mvcc.TxnStatusAborted {
+	if got := c.GetStatus(inFlightXid); got != transam.TxnStatusAborted {
 		t.Errorf("GetStatus(%d) = %v, want Aborted (no commit record — stays aborted)", inFlightXid, got)
 	}
 }
@@ -303,9 +303,9 @@ func TestReplayCLogFromWAL_RecoversUnflushedAbort(t *testing.T) {
 	dir := t.TempDir()
 	walDir := filepath.Join(dir, "pg_wal")
 	slruDir := filepath.Join(dir, "pg_xact")
-	const xid = storage.TransactionID(mvcc.FirstNormalTransactionID + 400)
+	const xid = storage.TransactionID(transam.FirstNormalTransactionID + 400)
 
-	live, err := mvcc.OpenCLog(filepath.Join(dir, "pg_xact_flat"))
+	live, err := transam.OpenCLog(filepath.Join(dir, "pg_xact_flat"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -316,31 +316,31 @@ func TestReplayCLogFromWAL_RecoversUnflushedAbort(t *testing.T) {
 		t.Fatalf("SetAborted: %v", err)
 	}
 
-	recovered, err := mvcc.OpenCLog(filepath.Join(dir, "pg_xact_flat2"))
+	recovered, err := transam.OpenCLog(filepath.Join(dir, "pg_xact_flat2"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := recovered.EnablePGSLRUMirror(slruDir); err != nil {
 		t.Fatal(err)
 	}
-	if got := recovered.GetStatus(xid); got == mvcc.TxnStatusAborted {
+	if got := recovered.GetStatus(xid); got == transam.TxnStatusAborted {
 		t.Fatalf("aborted lane already on disk before replay — the C2-S3 cut regressed for aborts")
 	}
 
-	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: true})
+	w, err := xlog.NewWriter(xlog.Config{WALDir: walDir, PageHeaders: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := w.Append(wal.EncodeXactAbort(xid)); err != nil {
+	if _, _, err := w.Append(xlog.EncodeXactAbort(xid)); err != nil {
 		t.Fatalf("Append abort: %v", err)
 	}
 	_ = w.Close()
 
-	txnMgr := mvcc.NewManager()
+	txnMgr := transam.NewManager()
 	if err := replayCLogFromWAL(walDir, recovered, txnMgr); err != nil {
 		t.Fatalf("replayCLogFromWAL: %v", err)
 	}
-	if got := recovered.GetStatus(xid); got != mvcc.TxnStatusAborted {
+	if got := recovered.GetStatus(xid); got != transam.TxnStatusAborted {
 		t.Errorf("GetStatus(%d) after replay = %v, want Aborted", xid, got)
 	}
 	if next := txnMgr.NextXID(); next <= xid {
@@ -367,27 +367,27 @@ func TestReplayCLogFromWAL_AdvancesPastInFlightXID(t *testing.T) {
 	dir := t.TempDir()
 	walDir := filepath.Join(dir, "pg_wal")
 
-	clog, err := mvcc.OpenCLog(filepath.Join(dir, "pg_xact"))
+	clog, err := transam.OpenCLog(filepath.Join(dir, "pg_xact"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := clog.EnablePGSLRUMirror(filepath.Join(dir, "pg_xact_slru")); err != nil {
 		t.Fatal(err)
 	}
-	txnMgr := mvcc.NewManager()
+	txnMgr := transam.NewManager()
 
-	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: true})
+	w, err := xlog.NewWriter(xlog.Config{WALDir: walDir, PageHeaders: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	const committed = storage.TransactionID(11)
 	const inFlight = storage.TransactionID(17)
-	if _, _, err := w.Append(wal.EncodeXactCommit(committed)); err != nil {
+	if _, _, err := w.Append(xlog.EncodeXactCommit(committed)); err != nil {
 		t.Fatalf("Append commit: %v", err)
 	}
 	// A record belonging to a transaction that never committed: same shape as
 	// the pgbench UPDATE whose commit record never made it to disk.
-	framed, err := wal.EncodeSmgrCreatePG(storage.RelFileNode{DBOid: 5, RelOid: 16407}, inFlight)
+	framed, err := xlog.EncodeSmgrCreatePG(storage.RelFileNode{DBOid: 5, RelOid: 16407}, inFlight)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -406,16 +406,16 @@ func TestReplayCLogFromWAL_AdvancesPastInFlightXID(t *testing.T) {
 	// The in-flight XID must not be committed: the implicit-abort sweep in
 	// initdb.Open (MarkUnknownAsAborted, bounded by NextXID) is what stamps it
 	// Aborted, and it can only reach XIDs below NextXID.
-	if got := clog.GetStatus(inFlight); got == mvcc.TxnStatusCommitted {
+	if got := clog.GetStatus(inFlight); got == transam.TxnStatusCommitted {
 		t.Errorf("GetStatus(%d) = Committed after replay, want not-committed", inFlight)
 	}
 	if err := clog.MarkUnknownAsAborted(txnMgr.NextXID()); err != nil {
 		t.Fatalf("MarkUnknownAsAborted: %v", err)
 	}
-	if got := clog.GetStatus(inFlight); got != mvcc.TxnStatusAborted {
+	if got := clog.GetStatus(inFlight); got != transam.TxnStatusAborted {
 		t.Errorf("GetStatus(%d) after sweep = %v, want Aborted", inFlight, got)
 	}
-	if got := clog.GetStatus(committed); got != mvcc.TxnStatusCommitted {
+	if got := clog.GetStatus(committed); got != transam.TxnStatusCommitted {
 		t.Errorf("GetStatus(%d) after sweep = %v, want Committed", committed, got)
 	}
 }
@@ -435,7 +435,7 @@ func TestReplayNextOIDFromWAL(t *testing.T) {
 	dir := t.TempDir()
 	walDir := filepath.Join(dir, "pg_wal")
 
-	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: true})
+	w, err := xlog.NewWriter(xlog.Config{WALDir: walDir, PageHeaders: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -443,14 +443,14 @@ func TestReplayNextOIDFromWAL(t *testing.T) {
 	// between them: the scan must return the HIGHEST, not the last-seen or
 	// the first.
 	for _, oid := range []uint32{24576, 32768} {
-		payload, eerr := wal.EncodeXLogNextOidPG(oid)
+		payload, eerr := xlog.EncodeXLogNextOidPG(oid)
 		if eerr != nil {
 			t.Fatal(eerr)
 		}
 		if _, _, aerr := w.Append(payload); aerr != nil {
 			t.Fatalf("Append NEXTOID %d: %v", oid, aerr)
 		}
-		if _, _, aerr := w.Append(wal.EncodeXactCommit(storage.TransactionID(7))); aerr != nil {
+		if _, _, aerr := w.Append(xlog.EncodeXactCommit(storage.TransactionID(7))); aerr != nil {
 			t.Fatal(aerr)
 		}
 	}
@@ -472,11 +472,11 @@ func TestReplayNextOIDFromWALNoRecords(t *testing.T) {
 	dir := t.TempDir()
 	walDir := filepath.Join(dir, "pg_wal")
 
-	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: true})
+	w, err := xlog.NewWriter(xlog.Config{WALDir: walDir, PageHeaders: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := w.Append(wal.EncodeXactCommit(storage.TransactionID(11))); err != nil {
+	if _, _, err := w.Append(xlog.EncodeXactCommit(storage.TransactionID(11))); err != nil {
 		t.Fatal(err)
 	}
 	_ = w.Close()
@@ -498,9 +498,9 @@ func TestReplayNextOIDFromWALNoRecords(t *testing.T) {
 
 // newRecoveryCLog opens the pair of stores the clog replay pass writes through
 // (flat file + PG SLRU mirror), matching the other tests in this file.
-func newRecoveryCLog(t *testing.T, dir string) *mvcc.CLog {
+func newRecoveryCLog(t *testing.T, dir string) *transam.CLog {
 	t.Helper()
-	clog, err := mvcc.OpenCLog(filepath.Join(dir, "pg_xact"))
+	clog, err := transam.OpenCLog(filepath.Join(dir, "pg_xact"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -521,16 +521,16 @@ func TestReplayCLogFromWAL_PGCommitStampsSubxacts(t *testing.T) {
 	dir := t.TempDir()
 	walDir := filepath.Join(dir, "pg_wal")
 	clog := newRecoveryCLog(t, dir)
-	txnMgr := mvcc.NewManager()
+	txnMgr := transam.NewManager()
 
 	const top = storage.TransactionID(900)
 	subs := []storage.TransactionID{901, 902, 903}
 
-	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: true})
+	w, err := xlog.NewWriter(xlog.Config{WALDir: walDir, PageHeaders: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload, err := wal.EncodeXactCommitPGWithSubxacts(top, subs, false)
+	payload, err := xlog.EncodeXactCommitPGWithSubxacts(top, subs, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -543,7 +543,7 @@ func TestReplayCLogFromWAL_PGCommitStampsSubxacts(t *testing.T) {
 		t.Fatalf("replayCLogFromWAL: %v", err)
 	}
 	for _, xid := range append([]storage.TransactionID{top}, subs...) {
-		if got := clog.GetStatus(xid); got != mvcc.TxnStatusCommitted {
+		if got := clog.GetStatus(xid); got != transam.TxnStatusCommitted {
 			t.Errorf("XID %d: got %v, want TxnStatusCommitted (whole tree must be stamped)", xid, got)
 		}
 	}
@@ -563,16 +563,16 @@ func TestReplayCLogFromWAL_PGAbortStampsSubxacts(t *testing.T) {
 	dir := t.TempDir()
 	walDir := filepath.Join(dir, "pg_wal")
 	clog := newRecoveryCLog(t, dir)
-	txnMgr := mvcc.NewManager()
+	txnMgr := transam.NewManager()
 
 	const top = storage.TransactionID(950)
 	subs := []storage.TransactionID{951, 952}
 
-	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: true})
+	w, err := xlog.NewWriter(xlog.Config{WALDir: walDir, PageHeaders: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload, err := wal.EncodeXactAbortPGWithSubxacts(top, subs)
+	payload, err := xlog.EncodeXactAbortPGWithSubxacts(top, subs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -585,7 +585,7 @@ func TestReplayCLogFromWAL_PGAbortStampsSubxacts(t *testing.T) {
 		t.Fatalf("replayCLogFromWAL: %v", err)
 	}
 	for _, xid := range append([]storage.TransactionID{top}, subs...) {
-		if got := clog.GetStatus(xid); got != mvcc.TxnStatusAborted {
+		if got := clog.GetStatus(xid); got != transam.TxnStatusAborted {
 			t.Errorf("XID %d: got %v, want TxnStatusAborted", xid, got)
 		}
 	}
@@ -603,16 +603,16 @@ func TestReplayCLogFromWAL_PGAssignmentIsNotAnAbort(t *testing.T) {
 	dir := t.TempDir()
 	walDir := filepath.Join(dir, "pg_wal")
 	clog := newRecoveryCLog(t, dir)
-	txnMgr := mvcc.NewManager()
+	txnMgr := transam.NewManager()
 
 	const top = storage.TransactionID(1000)
 	subs := []storage.TransactionID{1001, 1002}
 
-	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: true})
+	w, err := xlog.NewWriter(xlog.Config{WALDir: walDir, PageHeaders: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	assign, err := wal.EncodeXactAssignmentPG(top, subs)
+	assign, err := xlog.EncodeXactAssignmentPG(top, subs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -625,7 +625,7 @@ func TestReplayCLogFromWAL_PGAssignmentIsNotAnAbort(t *testing.T) {
 		t.Fatalf("replayCLogFromWAL: %v", err)
 	}
 	for _, xid := range append([]storage.TransactionID{top}, subs...) {
-		if got := clog.GetStatus(xid); got == mvcc.TxnStatusAborted {
+		if got := clog.GetStatus(xid); got == transam.TxnStatusAborted {
 			t.Errorf("XID %d: XLOG_XACT_ASSIGNMENT stamped it Aborted; an assignment is not a completion record", xid)
 		}
 	}
@@ -643,23 +643,23 @@ func TestReplayCLogFromWAL_PGAssignmentThenCommit(t *testing.T) {
 	dir := t.TempDir()
 	walDir := filepath.Join(dir, "pg_wal")
 	clog := newRecoveryCLog(t, dir)
-	txnMgr := mvcc.NewManager()
+	txnMgr := transam.NewManager()
 
 	const top = storage.TransactionID(1100)
 	subs := []storage.TransactionID{1101, 1102}
 
-	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: true})
+	w, err := xlog.NewWriter(xlog.Config{WALDir: walDir, PageHeaders: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	assign, err := wal.EncodeXactAssignmentPG(top, subs)
+	assign, err := xlog.EncodeXactAssignmentPG(top, subs)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := w.Append(assign); err != nil {
 		t.Fatal(err)
 	}
-	commit, err := wal.EncodeXactCommitPGWithSubxacts(top, subs, false)
+	commit, err := xlog.EncodeXactCommitPGWithSubxacts(top, subs, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -672,7 +672,7 @@ func TestReplayCLogFromWAL_PGAssignmentThenCommit(t *testing.T) {
 		t.Fatalf("replayCLogFromWAL: %v", err)
 	}
 	for _, xid := range append([]storage.TransactionID{top}, subs...) {
-		if got := clog.GetStatus(xid); got != mvcc.TxnStatusCommitted {
+		if got := clog.GetStatus(xid); got != transam.TxnStatusCommitted {
 			t.Errorf("XID %d: got %v, want TxnStatusCommitted", xid, got)
 		}
 	}

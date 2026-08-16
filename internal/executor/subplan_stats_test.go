@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // Stage S0-2 (design bundle correlated-subquery-planning, gate V6):
@@ -70,11 +70,11 @@ func onlyStat(t *testing.T, ctx *Context) *SubPlanSiteStats {
 func onlyOuterStat(t *testing.T, ctx *Context) *SubPlanSiteStats {
 	t.Helper()
 	for e, s := range ctx.SubPlanStats {
-		sq, ok := e.(*planner.SubqueryExpr)
+		sq, ok := e.(*optimizer.SubqueryExpr)
 		if !ok {
 			continue
 		}
-		if _, isLimit := sq.Plan.(*planner.Limit); isLimit {
+		if _, isLimit := sq.Plan.(*optimizer.Limit); isLimit {
 			continue // the inner min/max InitPlan
 		}
 		return s
@@ -249,7 +249,7 @@ func TestSubPlanSubtreeIndentUnderRootNode(t *testing.T) {
 // panics there.
 func TestSubPlanStatNilContextSafe(t *testing.T) {
 	var ctx *Context
-	e := &planner.ExistsExpr{}
+	e := &optimizer.ExistsExpr{}
 	if s := ctx.subPlanStat(e); s == nil {
 		t.Fatal("nil Context: want a throwaway stats block, got nil")
 	}

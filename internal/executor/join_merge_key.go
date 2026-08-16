@@ -34,7 +34,7 @@ package executor
 // Both routes null-extend the row for an outer join and drop it for an inner
 // one, which is why this is a cost change and not a semantic one.
 
-import "github.com/goopg/goopg/internal/planner"
+import "github.com/goopg/goopg/internal/optimizer"
 
 // initMergeKeys resolves this merge join's key list and residual. Called once
 // at the top of runMergeJoin, before either side is keyed, since the two sides
@@ -59,7 +59,7 @@ func (o *joinOp) initMergeKeys() {
 		// slot populated with whatever the plan has, nil included, so
 		// buildMergeSide raises the same "merge join key is nil" error it
 		// raised before P2.3 rather than silently joining on nothing.
-		o.mergeKeys = []planner.JoinKeyPair{{Left: o.plan.LeftKey, Right: o.plan.RightKey}}
+		o.mergeKeys = []optimizer.JoinKeyPair{{Left: o.plan.LeftKey, Right: o.plan.RightKey}}
 		o.mergeResidual = o.plan.Predicate
 	}
 }
@@ -68,8 +68,8 @@ func (o *joinOp) initMergeKeys() {
 // isLeft selects the expressions that reference the left input; both are
 // evaluated against the MERGED (left ++ right) row space, which is why
 // buildMergeSide pads the row before evaluating.
-func (o *joinOp) mergeSideKeyExprs(isLeft bool) []planner.Expr {
-	out := make([]planner.Expr, len(o.mergeKeys))
+func (o *joinOp) mergeSideKeyExprs(isLeft bool) []optimizer.Expr {
+	out := make([]optimizer.Expr, len(o.mergeKeys))
 	for i, k := range o.mergeKeys {
 		if isLeft {
 			out[i] = k.Left

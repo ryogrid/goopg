@@ -30,7 +30,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // lateralOuterOp is the outer side: a row source that counts how many tuples
@@ -44,8 +44,8 @@ type lateralOuterOp struct {
 }
 
 func (o *lateralOuterOp) Open(*Context) error { o.opens++; o.idx = 0; return nil }
-func (o *lateralOuterOp) Schema() planner.Schema {
-	return planner.Schema{{Name: "k", Type: catalog.Type{Name: "int4"}}}
+func (o *lateralOuterOp) Schema() optimizer.Schema {
+	return optimizer.Schema{{Name: "k", Type: catalog.Type{Name: "int4"}}}
 }
 func (o *lateralOuterOp) Close() error { return nil }
 func (o *lateralOuterOp) Next() (TupleSlot, error) { //nolint:ireturn
@@ -77,8 +77,8 @@ type lateralProbeOp struct {
 	sawDepth []int   // len(ctx.OuterRows) observed at each Open
 }
 
-func (o *lateralProbeOp) Schema() planner.Schema {
-	return planner.Schema{{Name: "v", Type: catalog.Type{Name: "int4"}}}
+func (o *lateralProbeOp) Schema() optimizer.Schema {
+	return optimizer.Schema{{Name: "v", Type: catalog.Type{Name: "int4"}}}
 }
 
 func (o *lateralProbeOp) Open(ctx *Context) error {
@@ -117,8 +117,8 @@ func (o *lateralProbeOp) Next() (TupleSlot, error) { //nolint:ireturn
 func (o *lateralProbeOp) Close() error { o.closes++; return nil }
 
 // lateralPlan is a LATERAL join over a width-1 outer and a width-1 inner.
-func lateralPlan(jt planner.JoinType, residual planner.Expr) *planner.Join {
-	return &planner.Join{Type: jt, Lateral: true, Predicate: residual}
+func lateralPlan(jt optimizer.JoinType, residual optimizer.Expr) *optimizer.Join {
+	return &optimizer.Join{Type: jt, Lateral: true, Predicate: residual}
 }
 
 func lateralOuterRows(keys ...int64) []Row {
@@ -175,7 +175,7 @@ func formatLateralPair(outer int64, inner string) string {
 func TestLateralJoinDoesNothingAtOpen(t *testing.T) {
 	left := &lateralOuterOp{rows: lateralOuterRows(1, 2, 3)}
 	right := &lateralProbeOp{fanout: func(k int64) []int64 { return []int64{k * 10} }}
-	o := newJoinOp(lateralPlan(planner.JoinTypeInner, nil), left, right)
+	o := newJoinOp(lateralPlan(optimizer.JoinTypeInner, nil), left, right)
 	ctx := NewContext()
 	if err := o.Open(ctx); err != nil {
 		t.Fatalf("Open: %v", err)
@@ -198,7 +198,7 @@ func TestLateralJoinDoesNothingAtOpen(t *testing.T) {
 func TestLateralJoinOuterStreamsOnDemand(t *testing.T) {
 	left := &lateralOuterOp{rows: lateralOuterRows(1, 2, 3, 4)}
 	right := &lateralProbeOp{fanout: func(k int64) []int64 { return []int64{k * 10} }}
-	o := newJoinOp(lateralPlan(planner.JoinTypeInner, nil), left, right)
+	o := newJoinOp(lateralPlan(optimizer.JoinTypeInner, nil), left, right)
 	ctx := NewContext()
 	if err := o.Open(ctx); err != nil {
 		t.Fatalf("Open: %v", err)
@@ -239,7 +239,7 @@ func TestLateralJoinPerOuterReExecution(t *testing.T) {
 			return []int64{90, 91}
 		}
 	}}
-	o := newJoinOp(lateralPlan(planner.JoinTypeInner, nil), left, right)
+	o := newJoinOp(lateralPlan(optimizer.JoinTypeInner, nil), left, right)
 	ctx := NewContext()
 	if err := o.Open(ctx); err != nil {
 		t.Fatalf("Open: %v", err)
@@ -272,10 +272,10 @@ func TestLateralJoinPerOuterReExecution(t *testing.T) {
 func TestLateralLeftJoinNullExtends(t *testing.T) {
 	// Predicate: inner value != 20. Outer key 1 → no rows at all; key 2 → one
 	// row that the predicate rejects; key 3 → one row that survives.
-	residual := &planner.BinaryOp{
+	residual := &optimizer.BinaryOp{
 		Op:    parser.OpNe,
-		Left:  &planner.ColumnRef{Index: 1, Type: catalog.Type{Name: "int4"}},
-		Right: &planner.IntegerConst{Value: 20},
+		Left:  &optimizer.ColumnRef{Index: 1, Type: catalog.Type{Name: "int4"}},
+		Right: &optimizer.IntegerConst{Value: 20},
 	}
 	left := &lateralOuterOp{rows: lateralOuterRows(1, 2, 3)}
 	right := &lateralProbeOp{fanout: func(k int64) []int64 {
@@ -284,7 +284,7 @@ func TestLateralLeftJoinNullExtends(t *testing.T) {
 		}
 		return []int64{k * 10}
 	}}
-	o := newJoinOp(lateralPlan(planner.JoinTypeLeft, residual), left, right)
+	o := newJoinOp(lateralPlan(optimizer.JoinTypeLeft, residual), left, right)
 	ctx := NewContext()
 	if err := o.Open(ctx); err != nil {
 		t.Fatalf("Open: %v", err)
@@ -297,7 +297,7 @@ func TestLateralLeftJoinNullExtends(t *testing.T) {
 	// The same shape as an INNER lateral drops both unmatched outer tuples.
 	left2 := &lateralOuterOp{rows: lateralOuterRows(1, 2, 3)}
 	right2 := &lateralProbeOp{fanout: right.fanout}
-	o2 := newJoinOp(lateralPlan(planner.JoinTypeInner, residual), left2, right2)
+	o2 := newJoinOp(lateralPlan(optimizer.JoinTypeInner, residual), left2, right2)
 	if err := o2.Open(NewContext()); err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -315,7 +315,7 @@ func TestLateralLeftJoinNullExtends(t *testing.T) {
 func TestLateralJoinDoesNotLeakCorrelationContext(t *testing.T) {
 	left := &lateralOuterOp{rows: lateralOuterRows(1, 2, 3)}
 	right := &lateralProbeOp{fanout: func(k int64) []int64 { return []int64{k * 10, k*10 + 1} }}
-	o := newJoinOp(lateralPlan(planner.JoinTypeInner, nil), left, right)
+	o := newJoinOp(lateralPlan(optimizer.JoinTypeInner, nil), left, right)
 
 	ctx := NewContext()
 	// Simulate an enclosing correlated scope: one outer row already pushed, and
@@ -376,7 +376,7 @@ func runQueryFast(t *testing.T, ctx *Context, sql string) ([]Row, error) {
 	if err != nil {
 		return nil, err
 	}
-	plan, err := planner.Plan(stmts[0], ctx.Catalog)
+	plan, err := optimizer.Plan(stmts[0], ctx.Catalog)
 	if err != nil {
 		return nil, err
 	}

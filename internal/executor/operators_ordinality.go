@@ -5,21 +5,21 @@ package executor
 // RowsFromOp zips multiple SRF children side-by-side (NULL-pads shorter).
 
 import (
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // ordinalityOp wraps a child operator, appending a bigint ordinality counter.
 type ordinalityOp struct {
-	plan  *planner.OrdinalityWrap
+	plan  *optimizer.OrdinalityWrap
 	child Operator
 	ord   int64
 }
 
-func newOrdinalityOp(p *planner.OrdinalityWrap, child Operator) *ordinalityOp {
+func newOrdinalityOp(p *optimizer.OrdinalityWrap, child Operator) *ordinalityOp {
 	return &ordinalityOp{plan: p, child: child}
 }
 
-func (o *ordinalityOp) Schema() planner.Schema { return o.plan.Output() }
+func (o *ordinalityOp) Schema() optimizer.Schema { return o.plan.Output() }
 
 func (o *ordinalityOp) Open(ctx *Context) error {
 	o.ord = 0
@@ -44,13 +44,13 @@ func (o *ordinalityOp) Next() (TupleSlot, error) {
 // rowsFromOp zips multiple child SRF operators side-by-side.
 // When one child is exhausted, its columns are NULL-padded.
 type rowsFromOp struct {
-	plan      *planner.RowsFrom
+	plan      *optimizer.RowsFrom
 	children  []Operator
 	widths    []int  // number of output columns per child
 	exhausted []bool // true once a child returned EOF
 }
 
-func newRowsFromOp(p *planner.RowsFrom, children []Operator) *rowsFromOp {
+func newRowsFromOp(p *optimizer.RowsFrom, children []Operator) *rowsFromOp {
 	widths := make([]int, len(children))
 	for i, c := range children {
 		widths[i] = len(c.Schema())
@@ -63,7 +63,7 @@ func newRowsFromOp(p *planner.RowsFrom, children []Operator) *rowsFromOp {
 	}
 }
 
-func (o *rowsFromOp) Schema() planner.Schema { return o.plan.Output() }
+func (o *rowsFromOp) Schema() optimizer.Schema { return o.plan.Output() }
 
 func (o *rowsFromOp) Open(ctx *Context) error {
 	for i := range o.exhausted {

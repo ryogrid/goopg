@@ -20,7 +20,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // parallelIdentityFixture builds a table big enough to be worth scanning, with
@@ -48,9 +48,9 @@ func parallelIdentityFixture(t *testing.T) (*Context, func()) {
 // rendered rows.
 func runForced(t *testing.T, ctx *Context, sql string, parallel bool) []string {
 	t.Helper()
-	prev := planner.ParallelEnabled()
-	planner.SetParallelEnabled(parallel)
-	defer planner.SetParallelEnabled(prev)
+	prev := optimizer.ParallelEnabled()
+	optimizer.SetParallelEnabled(parallel)
+	defer optimizer.SetParallelEnabled(prev)
 
 	rows, err := runQueryWithErr(ctx, sql)
 	if err != nil {
@@ -120,11 +120,11 @@ func TestParallelIdentityWithRealGather(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parse: %v", err)
 			}
-			node, err := planner.Plan(stmts[0], ctx.Catalog)
+			node, err := optimizer.Plan(stmts[0], ctx.Catalog)
 			if err != nil {
 				t.Fatalf("plan: %v", err)
 			}
-			gathered := planner.NewGather(0, node, workers)
+			gathered := optimizer.NewGather(0, node, workers)
 
 			ctx.MaxParallelWorkers = 8
 			ctx.ParallelLeaderParticipation = true

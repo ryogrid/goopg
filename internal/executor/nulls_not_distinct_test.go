@@ -4,10 +4,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // nndNewTable creates a fresh table with two nullable int4 columns (a, b) in the
@@ -27,21 +27,21 @@ func nndNewTable(t *testing.T, ctx *Context, cat catalog.Catalog, name string, i
 		t.Fatalf("CreateIndex %s: %v", name, err)
 	}
 	idx.NullsNotDistinct = nnd
-	if _, err := btree.Create(ctx.Pool, cat.IndexRelFileNode(idx)); err != nil {
-		t.Fatalf("btree.Create %s: %v", name, err)
+	if _, err := nbtree.Create(ctx.Pool, cat.IndexRelFileNode(idx)); err != nil {
+		t.Fatalf("nbtree.Create %s: %v", name, err)
 	}
 	return tbl
 }
 
 // nndInsert runs a single-row INSERT through the executor (which invokes the
 // uniqueness check) and returns its error (nil on success).
-func nndInsert(t *testing.T, ctx *Context, tbl *catalog.Table, vals ...planner.Expr) error {
+func nndInsert(t *testing.T, ctx *Context, tbl *catalog.Table, vals ...optimizer.Expr) error {
 	t.Helper()
 	// M0129-S8.3: advance the command counter between statements.
 	advanceStmtCounter(ctx)
-	op, err := Build(&planner.Insert{
+	op, err := Build(&optimizer.Insert{
 		Table:       tbl,
-		Source:      &planner.Values{Rows: [][]planner.Expr{vals}},
+		Source:      &optimizer.Values{Rows: [][]optimizer.Expr{vals}},
 		ColumnIndex: []int{0, 1},
 	})
 	if err != nil {
@@ -89,8 +89,8 @@ func TestNullsNotDistinctSingleColEnforced(t *testing.T) {
 	defer cleanup()
 	tbl := nndNewTable(t, ctx, cat, "nnd1", []string{"a"}, true)
 
-	null := func() planner.Expr { return &planner.NullConst{} }
-	i := func(v int64) planner.Expr { return &planner.IntegerConst{Value: v} }
+	null := func() optimizer.Expr { return &optimizer.NullConst{} }
+	i := func(v int64) optimizer.Expr { return &optimizer.IntegerConst{Value: v} }
 
 	if err := nndInsert(t, ctx, tbl, null(), i(1)); err != nil {
 		t.Fatalf("first NULL insert should succeed: %v", err)
@@ -113,8 +113,8 @@ func TestNullsDistinctControlAllowsDuplicateNulls(t *testing.T) {
 	defer cleanup()
 	tbl := nndNewTable(t, ctx, cat, "nnd2", []string{"a"}, false)
 
-	null := func() planner.Expr { return &planner.NullConst{} }
-	i := func(v int64) planner.Expr { return &planner.IntegerConst{Value: v} }
+	null := func() optimizer.Expr { return &optimizer.NullConst{} }
+	i := func(v int64) optimizer.Expr { return &optimizer.IntegerConst{Value: v} }
 
 	if err := nndInsert(t, ctx, tbl, null(), i(1)); err != nil {
 		t.Fatalf("first NULL insert: %v", err)
@@ -131,8 +131,8 @@ func TestNullsNotDistinctMultiColEnforced(t *testing.T) {
 	defer cleanup()
 	tbl := nndNewTable(t, ctx, cat, "nnd3", []string{"a", "b"}, true)
 
-	null := func() planner.Expr { return &planner.NullConst{} }
-	i := func(v int64) planner.Expr { return &planner.IntegerConst{Value: v} }
+	null := func() optimizer.Expr { return &optimizer.NullConst{} }
+	i := func(v int64) optimizer.Expr { return &optimizer.IntegerConst{Value: v} }
 
 	if err := nndInsert(t, ctx, tbl, null(), i(5)); err != nil {
 		t.Fatalf("(NULL,5): %v", err)
@@ -161,25 +161,25 @@ func TestNullsNotDistinctUpdateNoSelfConflict(t *testing.T) {
 	defer cleanup()
 	tbl := nndNewTable(t, ctx, cat, "nnd4", []string{"a"}, true)
 
-	null := func() planner.Expr { return &planner.NullConst{} }
-	i := func(v int64) planner.Expr { return &planner.IntegerConst{Value: v} }
+	null := func() optimizer.Expr { return &optimizer.NullConst{} }
+	i := func(v int64) optimizer.Expr { return &optimizer.IntegerConst{Value: v} }
 
 	if err := nndInsert(t, ctx, tbl, null(), i(1)); err != nil {
 		t.Fatalf("seed (NULL,1): %v", err)
 	}
 
 	// UPDATE nnd4 SET b = 2 WHERE b = 1  (a stays NULL — no key change).
-	upd := &planner.Update{
+	upd := &optimizer.Update{
 		Table: tbl,
-		Child: &planner.Filter{
-			Child: &planner.SeqScan{Table: tbl},
-			Predicate: &planner.BinaryOp{
+		Child: &optimizer.Filter{
+			Child: &optimizer.SeqScan{Table: tbl},
+			Predicate: &optimizer.BinaryOp{
 				Op:    parser.OpEq,
-				Left:  &planner.ColumnRef{Index: 1, Name: "b", Type: catalog.Type{Name: "int4"}},
-				Right: &planner.IntegerConst{Value: 1},
+				Left:  &optimizer.ColumnRef{Index: 1, Name: "b", Type: catalog.Type{Name: "int4"}},
+				Right: &optimizer.IntegerConst{Value: 1},
 			},
 		},
-		Set: []planner.Expr{nil, &planner.IntegerConst{Value: 2}},
+		Set: []optimizer.Expr{nil, &optimizer.IntegerConst{Value: 2}},
 	}
 	// M0129-S8.3: advance the command counter so the UPDATE sees the seed row.
 	advanceStmtCounter(ctx)
@@ -205,21 +205,21 @@ func TestNullsNotDistinctUpdateNoSelfConflict(t *testing.T) {
 // nndUpsert runs a single-row INSERT … ON CONFLICT (idx) <action> through the
 // executor. action selects DO NOTHING vs DO UPDATE SET b = setB. It returns the
 // number of rows affected by the upsert op.
-func nndUpsert(t *testing.T, ctx *Context, tbl *catalog.Table, idx *catalog.Index, action planner.OnConflictAction, setB planner.Expr, vals ...planner.Expr) int64 {
+func nndUpsert(t *testing.T, ctx *Context, tbl *catalog.Table, idx *catalog.Index, action optimizer.OnConflictAction, setB optimizer.Expr, vals ...optimizer.Expr) int64 {
 	t.Helper()
 	// M0129-S8.3: advance the command counter between statements.
 	advanceStmtCounter(ctx)
-	oc := &planner.OnConflictPlan{
+	oc := &optimizer.OnConflictPlan{
 		Action:         action,
 		ArbiterIndex:   idx,
 		ArbiterColumns: []int{0}, // arbiter over column "a" (ordinal 0)
 	}
-	if action == planner.OnConflictActionUpdate {
-		oc.UpdateSet = []planner.Expr{nil, setB}
+	if action == optimizer.OnConflictActionUpdate {
+		oc.UpdateSet = []optimizer.Expr{nil, setB}
 	}
-	op, err := Build(&planner.Insert{
+	op, err := Build(&optimizer.Insert{
 		Table:       tbl,
-		Source:      &planner.Values{Rows: [][]planner.Expr{vals}},
+		Source:      &optimizer.Values{Rows: [][]optimizer.Expr{vals}},
 		ColumnIndex: []int{0, 1},
 		OnConflict:  oc,
 	})
@@ -241,7 +241,7 @@ func nndUpsert(t *testing.T, ctx *Context, tbl *catalog.Table, idx *catalog.Inde
 // heap content after an upsert.
 func nndScanColB(t *testing.T, ctx *Context, tbl *catalog.Table) []Datum {
 	t.Helper()
-	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: tbl})
 	if err := scan.Open(ctx); err != nil {
 		t.Fatalf("scan Open: %v", err)
 	}
@@ -270,13 +270,13 @@ func TestNullsNotDistinctOnConflictDoNothing(t *testing.T) {
 		t.Fatal("index nndc1_key not found")
 	}
 
-	null := func() planner.Expr { return &planner.NullConst{} }
-	i := func(v int64) planner.Expr { return &planner.IntegerConst{Value: v} }
+	null := func() optimizer.Expr { return &optimizer.NullConst{} }
+	i := func(v int64) optimizer.Expr { return &optimizer.IntegerConst{Value: v} }
 
 	if err := nndInsert(t, ctx, tbl, null(), i(1)); err != nil {
 		t.Fatalf("seed (NULL,1): %v", err)
 	}
-	if ra := nndUpsert(t, ctx, tbl, idx, planner.OnConflictActionNothing, nil, null(), i(2)); ra != 0 {
+	if ra := nndUpsert(t, ctx, tbl, idx, optimizer.OnConflictActionNothing, nil, null(), i(2)); ra != 0 {
 		t.Fatalf("DO NOTHING on NULL conflict: RowsAffected=%d want 0", ra)
 	}
 	if got := nndScanColB(t, ctx, tbl); len(got) != 1 || got[0].Int != 1 {
@@ -295,13 +295,13 @@ func TestNullsNotDistinctOnConflictDoUpdate(t *testing.T) {
 		t.Fatal("index nndc2_key not found")
 	}
 
-	null := func() planner.Expr { return &planner.NullConst{} }
-	i := func(v int64) planner.Expr { return &planner.IntegerConst{Value: v} }
+	null := func() optimizer.Expr { return &optimizer.NullConst{} }
+	i := func(v int64) optimizer.Expr { return &optimizer.IntegerConst{Value: v} }
 
 	if err := nndInsert(t, ctx, tbl, null(), i(1)); err != nil {
 		t.Fatalf("seed (NULL,1): %v", err)
 	}
-	if ra := nndUpsert(t, ctx, tbl, idx, planner.OnConflictActionUpdate, i(7), null(), i(2)); ra != 1 {
+	if ra := nndUpsert(t, ctx, tbl, idx, optimizer.OnConflictActionUpdate, i(7), null(), i(2)); ra != 1 {
 		t.Fatalf("DO UPDATE on NULL conflict: RowsAffected=%d want 1", ra)
 	}
 	// M0129-S8.3: advance the command counter so the scan sees the upserted row.
@@ -500,13 +500,13 @@ func TestNullsDistinctOnConflictControlInserts(t *testing.T) {
 		t.Fatal("index nndc3_key not found")
 	}
 
-	null := func() planner.Expr { return &planner.NullConst{} }
-	i := func(v int64) planner.Expr { return &planner.IntegerConst{Value: v} }
+	null := func() optimizer.Expr { return &optimizer.NullConst{} }
+	i := func(v int64) optimizer.Expr { return &optimizer.IntegerConst{Value: v} }
 
 	if err := nndInsert(t, ctx, tbl, null(), i(1)); err != nil {
 		t.Fatalf("seed (NULL,1): %v", err)
 	}
-	if ra := nndUpsert(t, ctx, tbl, idx, planner.OnConflictActionNothing, nil, null(), i(2)); ra != 1 {
+	if ra := nndUpsert(t, ctx, tbl, idx, optimizer.OnConflictActionNothing, nil, null(), i(2)); ra != 1 {
 		t.Fatalf("DO NOTHING under NULLS DISTINCT: RowsAffected=%d want 1 (NULL never conflicts)", ra)
 	}
 	// M0129-S8.3: advance the command counter so the scan sees both inserted rows.

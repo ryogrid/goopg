@@ -18,7 +18,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // pqAggFixture uses values chosen so every exact aggregate is representable
@@ -49,8 +49,8 @@ func pqAggFixture(t *testing.T) (*Context, func()) {
 	return ctx, cleanup
 }
 
-func pqAggSettings(workers int) planner.ParallelSettings {
-	return planner.ParallelSettings{
+func pqAggSettings(workers int) optimizer.ParallelSettings {
+	return optimizer.ParallelSettings{
 		MaxWorkersPerGather: workers,
 		MinTableScanBlocks:  1,
 		DebugParallelQuery:  "on", // fixtures are small; force past the size gate
@@ -68,11 +68,11 @@ func runAggSplit(t *testing.T, ctx *Context, sql string, workers int) ([]string,
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	node, err := planner.Plan(stmts[0], ctx.Catalog)
+	node, err := optimizer.Plan(stmts[0], ctx.Catalog)
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
-	gathered := planner.MaybeAddGather(node, pqAggSettings(workers))
+	gathered := optimizer.MaybeAddGather(node, pqAggSettings(workers))
 	split := planHasFinalizeAgg(gathered)
 
 	ctx.MaxParallelWorkers = 8
@@ -101,18 +101,18 @@ func runAggSplit(t *testing.T, ctx *Context, sql string, workers int) ([]string,
 	return out, split
 }
 
-func planHasFinalizeAgg(n planner.Node) bool {
+func planHasFinalizeAgg(n optimizer.Node) bool {
 	found := false
-	var walk func(planner.Node)
-	walk = func(cur planner.Node) {
+	var walk func(optimizer.Node)
+	walk = func(cur optimizer.Node) {
 		if cur == nil || found {
 			return
 		}
-		if a, ok := cur.(*planner.Aggregate); ok && a.Mode == planner.AggModeFinal {
+		if a, ok := cur.(*optimizer.Aggregate); ok && a.Mode == optimizer.AggModeFinal {
 			found = true
 			return
 		}
-		for _, c := range planner.ParallelChildrenForTest(cur) {
+		for _, c := range optimizer.ParallelChildrenForTest(cur) {
 			walk(c)
 		}
 	}

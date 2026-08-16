@@ -33,8 +33,8 @@ OUT_FILE="${REPO_ROOT}/docs/parity-dashboard.md"
 # -------------------------------------------------------------------------- #
 PG_GUC_SRC="${REPO_ROOT}/postgres/src/backend/utils/misc/guc_tables.c"
 PG_ERRCODES="${REPO_ROOT}/postgres/src/backend/utils/errcodes.txt"
-GOOPG_GUC_SRC="${REPO_ROOT}/internal/config/defaults.go"
-GOOPG_SQLSTATE_SRC="${REPO_ROOT}/internal/sqlstate/codes.go"
+GOOPG_GUC_SRC="${REPO_ROOT}/internal/utils/misc/defaults.go"
+GOOPG_SQLSTATE_SRC="${REPO_ROOT}/internal/utils/errcodes/codes.go"
 
 # pg_catalog table list: extract from goopg's catalog.go and from PG's
 # pg_catalog schema definition files.

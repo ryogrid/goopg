@@ -1,6 +1,6 @@
 package executor
 
-import "github.com/goopg/goopg/internal/planner"
+import "github.com/goopg/goopg/internal/optimizer"
 
 // Streaming LATERAL join — M0127-P4.4 (design leftdeep-joins/07 §4, the last
 // row of the P4 table).
@@ -103,7 +103,7 @@ func (o *joinOp) openLateral(ctx *Context) error {
 	m := &lateralJoinStream{
 		o:         o,
 		rw:        len(o.right.Schema()),
-		fillOuter: o.plan.Type == planner.JoinTypeLeft,
+		fillOuter: o.plan.Type == optimizer.JoinTypeLeft,
 	}
 	if bindable, ok := o.right.(lateralBindable); ok {
 		m.bindable = bindable

@@ -4,9 +4,9 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -28,10 +28,10 @@ func newSavepointFixture(t *testing.T) (*Context, *catalog.InMemory, *BasicSessi
 		t.Fatalf("CreateTable: %v", err)
 	}
 
-	mgrMVCC := mvcc.NewManager()
+	mgrMVCC := transam.NewManager()
 	sess := NewBasicSession()
 
-	tx, err := mgrMVCC.Begin(mvcc.IsolationReadCommitted)
+	tx, err := mgrMVCC.Begin(transam.IsolationReadCommitted)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -71,7 +71,7 @@ func runSavepointStmt(t *testing.T, ctx *Context, sql string) error {
 	if len(stmts) != 1 {
 		t.Fatalf("Parse(%q): got %d statements", sql, len(stmts))
 	}
-	plan, err := planner.Plan(stmts[0], catalog.NewInMemory())
+	plan, err := optimizer.Plan(stmts[0], catalog.NewInMemory())
 	if err != nil {
 		t.Fatalf("Plan(%q): %v", sql, err)
 	}
@@ -87,11 +87,11 @@ func runSavepointStmt(t *testing.T, ctx *Context, sql string) error {
 func insertRow(t *testing.T, ctx *Context, cat catalog.Catalog, id int64, val string) {
 	t.Helper()
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
-	ins := &planner.Insert{
+	ins := &optimizer.Insert{
 		Table: tbl,
-		Source: &planner.Values{
-			Rows: [][]planner.Expr{
-				{&planner.IntegerConst{Value: id}, &planner.StringConst{Value: val}},
+		Source: &optimizer.Values{
+			Rows: [][]optimizer.Expr{
+				{&optimizer.IntegerConst{Value: id}, &optimizer.StringConst{Value: val}},
 			},
 		},
 		ColumnIndex: []int{0, 1},
@@ -113,7 +113,7 @@ func insertRow(t *testing.T, ctx *Context, cat catalog.Catalog, id int64, val st
 func seqScanAll(t *testing.T, ctx *Context, cat catalog.Catalog) []Row {
 	t.Helper()
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
-	scan := &planner.SeqScan{Table: tbl}
+	scan := &optimizer.SeqScan{Table: tbl}
 	op, err := Build(scan)
 	if err != nil {
 		t.Fatalf("Build seqscan: %v", err)
@@ -203,7 +203,7 @@ func TestSavepointDoD(t *testing.T) {
 	sess.EndExplicitTransaction()
 
 	// Begin a new read transaction and verify only 'a' and 'c' are visible.
-	tx2, err := ctx.TxnMgr.Begin(mvcc.IsolationReadCommitted)
+	tx2, err := ctx.TxnMgr.Begin(transam.IsolationReadCommitted)
 	if err != nil {
 		t.Fatalf("Begin tx2: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestSavepointDoD(t *testing.T) {
 // return SQLSTATE 25P01 when called outside an explicit transaction block.
 func TestSavepointOutsideTransaction(t *testing.T) {
 	ctx := NewContext()
-	ctx.TxnMgr = mvcc.NewManager()
+	ctx.TxnMgr = transam.NewManager()
 	sess := NewBasicSession()
 	ctx.Session = sess
 
@@ -262,7 +262,7 @@ func TestSavepointOutsideTransaction(t *testing.T) {
 // returns SQLSTATE 3B001.
 func TestSavepointReleaseNotFound(t *testing.T) {
 	ctx := NewContext()
-	ctx.TxnMgr = mvcc.NewManager()
+	ctx.TxnMgr = transam.NewManager()
 	sess := NewBasicSession()
 	ctx.Session = sess
 
@@ -286,14 +286,14 @@ func TestSavepointReleaseNotFound(t *testing.T) {
 func TestSavepointPlannerParsesVerbs(t *testing.T) {
 	cases := []struct {
 		sql  string
-		verb planner.TransactionVerb
+		verb optimizer.TransactionVerb
 		name string
 	}{
-		{"SAVEPOINT sp1", planner.TxSavepoint, "sp1"},
-		{"RELEASE SAVEPOINT sp1", planner.TxRelease, "sp1"},
-		{"ROLLBACK TO SAVEPOINT sp1", planner.TxRollbackTo, "sp1"},
-		{"RELEASE sp1", planner.TxRelease, "sp1"},
-		{"ROLLBACK TO sp1", planner.TxRollbackTo, "sp1"},
+		{"SAVEPOINT sp1", optimizer.TxSavepoint, "sp1"},
+		{"RELEASE SAVEPOINT sp1", optimizer.TxRelease, "sp1"},
+		{"ROLLBACK TO SAVEPOINT sp1", optimizer.TxRollbackTo, "sp1"},
+		{"RELEASE sp1", optimizer.TxRelease, "sp1"},
+		{"ROLLBACK TO sp1", optimizer.TxRollbackTo, "sp1"},
 	}
 	for _, tc := range cases {
 		stmts, err := parser.Parse(tc.sql)
@@ -301,12 +301,12 @@ func TestSavepointPlannerParsesVerbs(t *testing.T) {
 			t.Errorf("Parse(%q): %v", tc.sql, err)
 			continue
 		}
-		node, err := planner.Plan(stmts[0], catalog.NewInMemory())
+		node, err := optimizer.Plan(stmts[0], catalog.NewInMemory())
 		if err != nil {
 			t.Errorf("Plan(%q): %v", tc.sql, err)
 			continue
 		}
-		txn, ok := node.(*planner.Transaction)
+		txn, ok := node.(*optimizer.Transaction)
 		if !ok {
 			t.Errorf("%q: want *planner.Transaction, got %T", tc.sql, node)
 			continue

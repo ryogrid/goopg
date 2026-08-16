@@ -3,9 +3,9 @@ package executor
 import (
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -21,8 +21,8 @@ const (
 // enumKeyExpr is the smallest expression whose planner.ExprResultType names the
 // enum — a bare ColumnRef of that type. Using it keeps the unit test independent
 // of which enum-returning overloads the pg_proc seed happens to carry.
-func enumKeyExpr() planner.Expr {
-	return &planner.ColumnRef{Type: catalog.Type{Name: enumKeyTypeNam}}
+func enumKeyExpr() optimizer.Expr {
+	return &optimizer.ColumnRef{Type: catalog.Type{Name: enumKeyTypeNam}}
 }
 
 // TestEncodeArbiterExprKeyEnumIsTypeDirected is the regression witness for the
@@ -159,9 +159,9 @@ func assertEnumKeyOrder(t *testing.T, ctx *Context, idx *catalog.Index, wantLabe
 		}
 	}
 
-	tree, err := btree.Open(ctx.Pool, ctx.Catalog.IndexRelFileNode(idx))
+	tree, err := nbtree.Open(ctx.Pool, ctx.Catalog.IndexRelFileNode(idx))
 	if err != nil {
-		t.Fatalf("btree.Open(%s): %v", idx.Name, err)
+		t.Fatalf("nbtree.Open(%s): %v", idx.Name, err)
 	}
 	var got []float64
 	if err := tree.RangeScan(nil, nil, func(key []byte, _ storage.ItemPointer) (bool, error) {
@@ -169,7 +169,7 @@ func assertEnumKeyOrder(t *testing.T, ctx *Context, idx *catalog.Index, wantLabe
 			t.Errorf("key %x is %d bytes, want the 8 of EncodeFloat8", key, len(key))
 			return true, nil
 		}
-		f, derr := btree.DecodeFloat8(key)
+		f, derr := nbtree.DecodeFloat8(key)
 		if derr != nil {
 			t.Errorf("key %x does not decode as float8: %v", key, derr)
 			return true, nil

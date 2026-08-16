@@ -1,6 +1,6 @@
 package executor
 
-import "github.com/goopg/goopg/internal/planner"
+import "github.com/goopg/goopg/internal/optimizer"
 
 // M0127-P4.2 (design leftdeep-joins/07 §3): outer-join fill for the hash join.
 //
@@ -34,7 +34,7 @@ import "github.com/goopg/goopg/internal/planner"
 // fill decision taken from the raw flag would disagree with the table that got
 // built.
 func (o *joinOp) hashBuildIsLeft() bool {
-	if o.plan.Type == planner.JoinTypeSemi || o.plan.Type == planner.JoinTypeAnti {
+	if o.plan.Type == optimizer.JoinTypeSemi || o.plan.Type == optimizer.JoinTypeAnti {
 		return false
 	}
 	return o.plan.BuildLeft
@@ -43,11 +43,11 @@ func (o *joinOp) hashBuildIsLeft() bool {
 // fillProbeSide reports whether an unmatched probe row still emits.
 func (o *joinOp) fillProbeSide() bool {
 	switch o.plan.Type {
-	case planner.JoinTypeLeft:
+	case optimizer.JoinTypeLeft:
 		return !o.hashBuildIsLeft()
-	case planner.JoinTypeRight:
+	case optimizer.JoinTypeRight:
 		return o.hashBuildIsLeft()
-	case planner.JoinTypeFull:
+	case optimizer.JoinTypeFull:
 		return true
 	}
 	return false
@@ -57,11 +57,11 @@ func (o *joinOp) fillProbeSide() bool {
 // that needs the bitmap and the sweep.
 func (o *joinOp) fillBuildSide() bool {
 	switch o.plan.Type {
-	case planner.JoinTypeLeft:
+	case optimizer.JoinTypeLeft:
 		return o.hashBuildIsLeft()
-	case planner.JoinTypeRight:
+	case optimizer.JoinTypeRight:
 		return !o.hashBuildIsLeft()
-	case planner.JoinTypeFull:
+	case optimizer.JoinTypeFull:
 		return true
 	}
 	return false

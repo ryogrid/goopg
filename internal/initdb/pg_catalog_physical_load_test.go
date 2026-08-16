@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -71,7 +71,7 @@ func TestLoadUserTablesFromPhysicalPGCatalogTuples(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dataDir, "global"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	clog, err := mvcc.OpenCLog(filepath.Join(dataDir, "global", "pg_xact"))
+	clog, err := transam.OpenCLog(filepath.Join(dataDir, "global", "pg_xact"))
 	if err != nil {
 		t.Fatal(err)
 	}

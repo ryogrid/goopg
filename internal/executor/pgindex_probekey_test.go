@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -93,7 +93,7 @@ func TestIndexProbeKeyTupleIsAnIndexTuple(t *testing.T) {
 	if !bytes.Equal(full, want) {
 		t.Fatalf("tuple probe = %x, want %x", full, want)
 	}
-	if n := btree.BTreeTupleGetNAtts(full, 2); n != 2 {
+	if n := nbtree.BTreeTupleGetNAtts(full, 2); n != 2 {
 		t.Errorf("full probe reports %d attributes, want 2", n)
 	}
 
@@ -104,7 +104,7 @@ func TestIndexProbeKeyTupleIsAnIndexTuple(t *testing.T) {
 	if encErr != nil {
 		t.Fatalf("indexProbeKey(prefix): %v", encErr)
 	}
-	if n := btree.BTreeTupleGetNAtts(prefix, 2); n != 1 {
+	if n := nbtree.BTreeTupleGetNAtts(prefix, 2); n != 1 {
 		t.Errorf("prefix probe reports %d attributes, want 1", n)
 	}
 	if bytes.HasPrefix(full, prefix) {

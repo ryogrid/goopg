@@ -1,20 +1,20 @@
 package executor
 
 import (
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // checkpointOp drives the SQL `CHECKPOINT` verb. It calls
 // Context.Checkpointer.CheckpointNow synchronously on Open and
 // returns a no-row stream so the wire layer emits just the
 // CommandComplete tag.
-type checkpointOp struct{ plan *planner.Checkpoint }
+type checkpointOp struct{ plan *optimizer.Checkpoint }
 
-func newCheckpointOp(p *planner.Checkpoint) *checkpointOp {
+func newCheckpointOp(p *optimizer.Checkpoint) *checkpointOp {
 	return &checkpointOp{plan: p}
 }
 
-func (o *checkpointOp) Schema() planner.Schema { return nil }
+func (o *checkpointOp) Schema() optimizer.Schema { return nil }
 
 func (o *checkpointOp) Open(ctx *Context) error {
 	if ctx == nil || ctx.Checkpointer == nil {

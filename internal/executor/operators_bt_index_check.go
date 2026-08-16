@@ -41,19 +41,19 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/amcheck"
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
 // evalBtIndexCheck implements bt_index_check (parentCheck=false) and
 // bt_index_parent_check (parentCheck=true). Both share the structural
 // orchestration; parent-check additionally runs the parent-downlink tier.
-func evalBtIndexCheck(x *planner.FuncCall, row Row, ctx *Context, parentCheck bool) (Datum, error) {
+func evalBtIndexCheck(x *optimizer.FuncCall, row Row, ctx *Context, parentCheck bool) (Datum, error) {
 	fname := "bt_index_check"
 	if parentCheck {
 		fname = "bt_index_parent_check"
@@ -142,7 +142,7 @@ func evalBtIndexCheck(x *planner.FuncCall, row Row, ctx *Context, parentCheck bo
 	// slice 3b-2c-ii-B2-b). It is nil-descriptor / blob for every index today,
 	// but this is where the answer comes from once the writers flip, so the
 	// engine's readers are never handed a format they had to assume.
-	keyFmt := btree.IndexFormatFor(ctx.pgIndexKeyDesc(idx))
+	keyFmt := nbtree.IndexFormatFor(ctx.pgIndexKeyDesc(idx))
 	reports, err := btIndexVerify(src, nblocks, idx.Name, parentCheck, cmpKeys, keyFmt)
 	if err == nil && len(reports) == 0 {
 		// checkunique runs only on a structurally sound index: upstream reaches
@@ -169,7 +169,7 @@ func evalBtIndexCheck(x *planner.FuncCall, row Row, ctx *Context, parentCheck bo
 // returns every finding (so the SQL surface can report the count, mirroring how
 // the standalone realtree test exercises the same tiers). It returns a Go error
 // only for a genuine page-read failure, never for a corruption finding.
-func btIndexVerify(src amcheck.PageSource, nblocks storage.BlockNumber, name string, parentCheck bool, cmpKeys amcheck.KeyComparator, keyFmt btree.IndexFormat) ([]amcheck.BtreeReport, error) {
+func btIndexVerify(src amcheck.PageSource, nblocks storage.BlockNumber, name string, parentCheck bool, cmpKeys amcheck.KeyComparator, keyFmt nbtree.IndexFormat) ([]amcheck.BtreeReport, error) {
 	var reports []amcheck.BtreeReport
 
 	// Per-page tiers over every block, including the metapage (block 0).
@@ -184,17 +184,17 @@ func btIndexVerify(src amcheck.PageSource, nblocks storage.BlockNumber, name str
 
 	// A tree with only the metapage (an empty index, or none) has no key levels
 	// to descend; the per-page tiers above are conclusive.
-	if nblocks <= btree.MetaBlock+1 {
+	if nblocks <= nbtree.MetaBlock+1 {
 		return reports, nil
 	}
 
 	// Cross-level sibling-link tier: descend root → leftmost child per level,
 	// then walk each level's right-links from its leftmost page.
-	metaPage, err := src(btree.MetaBlock)
+	metaPage, err := src(nbtree.MetaBlock)
 	if err != nil {
 		return nil, err
 	}
-	if meta := btree.ParseMeta(metaPage); meta.Root != 0 {
+	if meta := nbtree.ParseMeta(metaPage); meta.Root != 0 {
 		for _, lm := range btIndexLeftmostByLevel(src, meta.Root, keyFmt) {
 			reports = append(reports, amcheck.VerifyBtreeLevelSiblingLinks(src, lm, name)...)
 		}
@@ -204,12 +204,12 @@ func btIndexVerify(src amcheck.PageSource, nblocks storage.BlockNumber, name str
 	// non-deleted page's downlinks must reach existing children. Leaf and
 	// fully-deleted pages carry no downlinks and are exempt.
 	if parentCheck {
-		for blk := btree.MetaBlock + 1; blk < nblocks; blk++ {
+		for blk := nbtree.MetaBlock + 1; blk < nblocks; blk++ {
 			p, err := src(blk)
 			if err != nil {
 				return nil, err
 			}
-			op := btree.ParseOpaque(p)
+			op := nbtree.ParseOpaque(p)
 			if op.IsLeaf() || op.IsDeleted() {
 				continue
 			}
@@ -237,8 +237,8 @@ func btIndexVerify(src amcheck.PageSource, nblocks storage.BlockNumber, name str
 // transaction snapshot taken once per index check (verify_nbtree.c:471). Without
 // a snapshot in Context there is nothing to judge liveness against, so the tier
 // is skipped rather than answered wrongly. M0119-0006.
-func btIndexCheckUnique(x *planner.FuncCall, row Row, ctx *Context, idx *catalog.Index,
-	src amcheck.PageSource, parentCheck bool, cmpKeys amcheck.KeyComparator, keyFmt btree.IndexFormat,
+func btIndexCheckUnique(x *optimizer.FuncCall, row Row, ctx *Context, idx *catalog.Index,
+	src amcheck.PageSource, parentCheck bool, cmpKeys amcheck.KeyComparator, keyFmt nbtree.IndexFormat,
 ) ([]amcheck.BtreeReport, error) {
 	argIdx := 2
 	if parentCheck {
@@ -285,7 +285,7 @@ func btIndexCheckUnique(x *planner.FuncCall, row Row, ctx *Context, idx *catalog
 			// which verify_heapam reports; it is not a live duplicate.
 			return false
 		}
-		return mvcc.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.CmdID,
+		return transam.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.CmdID,
 			ctx.comboStore(), ctx.MultiXact)
 	}
 	return amcheck.VerifyBtreeUnique(src, idx.Name, keyFmt, cmpKeys, visible)
@@ -402,7 +402,7 @@ func btIndexOpClassComparator(idx *catalog.Index, im *catalog.InMemory, ctx *Con
 				// this column. Byte order over what remains is correct for
 				// those, exactly as it is for the leftmost downlink upstream
 				// treats as minus infinity.
-				return btree.CompareKeys(a[ao:], b[bo:])
+				return nbtree.CompareKeys(a[ao:], b[bo:])
 			}
 			if cmp := btIndexCompareKeyColumn(kc.routine, a[ao:ao+an], b[bo:bo+bn], ad, bd, ctx, pos); cmp != 0 {
 				return cmp
@@ -412,7 +412,7 @@ func btIndexOpClassComparator(idx *catalog.Index, im *catalog.InMemory, ctx *Con
 		}
 		// Equal on every key column: any trailing bytes decide, as they do for
 		// the engine's own comparator.
-		return btree.CompareKeys(a[ao:], b[bo:])
+		return nbtree.CompareKeys(a[ao:], b[bo:])
 	}
 }
 
@@ -432,11 +432,11 @@ func exprKeyColumnType(idx *catalog.Index, i int) (surrogate catalog.Type, allow
 	if i >= len(idx.ColExprs) || idx.ColExprs[i] == nil || idx.Table == nil {
 		return catalog.Type{}, false, false
 	}
-	planExpr, err := planner.ResolveIndexPredicate(*idx.ColExprs[i], idx.Table)
+	planExpr, err := optimizer.ResolveIndexPredicate(*idx.ColExprs[i], idx.Table)
 	if err != nil || planExpr == nil {
 		return catalog.Type{}, false, false
 	}
-	sqlType, resolved := planner.ExprResultType(planExpr)
+	sqlType, resolved := optimizer.ExprResultType(planExpr)
 	if !resolved {
 		return catalog.Type{}, false, false
 	}
@@ -448,7 +448,7 @@ func exprKeyColumnType(idx *catalog.Index, i int) (surrogate catalog.Type, allow
 // column's encoded bytes (which are the built-in class's order by construction).
 func btIndexCompareKeyColumn(routine *catalog.Routine, aRaw, bRaw []byte, ad, bd Datum, ctx *Context, pos int) int {
 	if routine == nil {
-		return btree.CompareKeys(aRaw, bRaw)
+		return nbtree.CompareKeys(aRaw, bRaw)
 	}
 	res, err := executeStoredRoutine(routine, []Datum{ad, bd}, ctx, pos)
 	if err != nil || res.IsNull() {
@@ -456,7 +456,7 @@ func btIndexCompareKeyColumn(routine *catalog.Routine, aRaw, bRaw []byte, ad, bd
 		// fall back rather than manufacture a bogus finding (upstream would
 		// ereport, but amcheck's contract here is report-and-continue over the
 		// whole index).
-		return btree.CompareKeys(aRaw, bRaw)
+		return nbtree.CompareKeys(aRaw, bRaw)
 	}
 	switch {
 	case res.Int < 0:
@@ -474,7 +474,7 @@ func btIndexCompareKeyColumn(routine *catalog.Routine, aRaw, bRaw []byte, ad, bd
 // read/decode error or an empty internal page stops the descent gracefully (the
 // per-page tier already flagged the structural fault); a visited-set guards
 // against a downlink cycle so a corrupt tree cannot loop forever.
-func btIndexLeftmostByLevel(src amcheck.PageSource, root storage.BlockNumber, keyFmt btree.IndexFormat) []storage.BlockNumber {
+func btIndexLeftmostByLevel(src amcheck.PageSource, root storage.BlockNumber, keyFmt nbtree.IndexFormat) []storage.BlockNumber {
 	var out []storage.BlockNumber
 	seen := make(map[storage.BlockNumber]bool)
 	for blk := root; ; {
@@ -487,7 +487,7 @@ func btIndexLeftmostByLevel(src amcheck.PageSource, root storage.BlockNumber, ke
 			return out
 		}
 		out = append(out, blk)
-		op := btree.ParseOpaque(p)
+		op := nbtree.ParseOpaque(p)
 		if op.IsLeaf() {
 			return out
 		}

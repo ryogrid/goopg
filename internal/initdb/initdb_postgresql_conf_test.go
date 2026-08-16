@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/goopg/goopg/internal/config"
+	"github.com/goopg/goopg/internal/utils/misc"
 )
 
 // TestInitWritesEmbeddedSampleAsPostgresqlConf pins M0108-0002: a
@@ -26,7 +26,7 @@ func TestInitWritesEmbeddedSampleAsPostgresqlConf(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read postgresql.conf: %v", err)
 	}
-	want := config.SampleConfig()
+	want := misc.SampleConfig()
 	if !bytes.Equal(got, want) {
 		t.Fatalf("postgresql.conf bytes differ from config.SampleConfig(): got %d bytes, want %d bytes",
 			len(got), len(want))

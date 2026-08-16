@@ -6,11 +6,11 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/lockmgr"
-	"github.com/goopg/goopg/internal/multixact"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/storage/lmgr"
+	"github.com/goopg/goopg/internal/access/transam/multixact"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -69,7 +69,7 @@ func (o *lockRowsOp) rowWaitTimeoutError(werr error) *ExecError {
 // lifecycle (acquireRelLock callers don't release manually
 // either).
 type lockRowsOp struct {
-	plan  *planner.LockRows
+	plan  *optimizer.LockRows
 	ctx   *Context
 	child Operator
 
@@ -124,14 +124,14 @@ type lockRowsOp struct {
 	// When stampLock follows a committed-update CTID chain to a live successor
 	// (EPQ for SELECT FOR UPDATE), the filter predicate is re-evaluated against
 	// the new row — matching PostgreSQL's EvalPlanQualFetchRowMark behaviour.
-	filterPred planner.Expr
+	filterPred optimizer.Expr
 	filterCols []catalog.Column
 
 	// waitPolicy is the effective NOWAIT / SKIP LOCKED / (default) blocking
 	// policy for the per-tuple lock acquisition in stampLock. Resolved once at
 	// Open from Locks[0].WaitPolicy (v0 assumes a single policy per LockRows;
 	// multi-clause merge is deferred, consistent with lockStrength). M0118-0003.
-	waitPolicy planner.LockWaitPolicy
+	waitPolicy optimizer.LockWaitPolicy
 	// lockRelName is the name of the first locked relation, used to format the
 	// NOWAIT "could not obtain lock on row in relation \"%s\"" diagnostic with
 	// the upstream-canonical relation name. Resolved at Open from Locks[0].
@@ -164,13 +164,13 @@ type pendingLockedRow struct {
 	newPtrValid bool
 }
 
-func newLockRowsOp(p *planner.LockRows, child Operator) *lockRowsOp {
+func newLockRowsOp(p *optimizer.LockRows, child Operator) *lockRowsOp {
 	return &lockRowsOp{plan: p, child: child}
 }
 
 // findFilterPred walks the child chain past Project wrappers and returns the
 // predicate of the first filterOp found. Returns nil when no filter is present.
-func findFilterPred(op Operator) planner.Expr {
+func findFilterPred(op Operator) optimizer.Expr {
 	for {
 		switch v := op.(type) {
 		case *filterOp:
@@ -187,46 +187,46 @@ func findFilterPred(op Operator) planner.Expr {
 // expr, or -1 if there are none. Used to detect when a filter predicate
 // references columns from a non-locked join input so EPQ recheck can be safely
 // skipped (M0100-0010).
-func filterPredMaxColRef(expr planner.Expr) int {
+func filterPredMaxColRef(expr optimizer.Expr) int {
 	max := -1
-	var walk func(planner.Expr)
-	walk = func(e planner.Expr) {
+	var walk func(optimizer.Expr)
+	walk = func(e optimizer.Expr) {
 		if e == nil {
 			return
 		}
-		if cr, ok := e.(*planner.ColumnRef); ok {
+		if cr, ok := e.(*optimizer.ColumnRef); ok {
 			if cr.Index > max {
 				max = cr.Index
 			}
 			return
 		}
 		switch x := e.(type) {
-		case *planner.BinaryOp:
+		case *optimizer.BinaryOp:
 			walk(x.Left)
 			walk(x.Right)
-		case *planner.UnaryOp:
+		case *optimizer.UnaryOp:
 			walk(x.Operand)
-		case *planner.CastExpr:
+		case *optimizer.CastExpr:
 			walk(x.Operand)
-		case *planner.IsNullExpr:
+		case *optimizer.IsNullExpr:
 			walk(x.Operand)
-		case *planner.IsBoolExpr:
+		case *optimizer.IsBoolExpr:
 			walk(x.Operand)
-		case *planner.IsDistinctFromExpr:
+		case *optimizer.IsDistinctFromExpr:
 			walk(x.Left)
 			walk(x.Right)
-		case *planner.FuncCall:
+		case *optimizer.FuncCall:
 			for _, a := range x.Args {
 				walk(a)
 			}
-		case *planner.CaseExpr:
+		case *optimizer.CaseExpr:
 			walk(x.Operand)
 			for _, w := range x.Whens {
 				walk(w.When)
 				walk(w.Then)
 			}
 			walk(x.Else)
-		case *planner.InExpr:
+		case *optimizer.InExpr:
 			walk(x.Operand)
 			for _, v := range x.List {
 				walk(v)
@@ -243,26 +243,26 @@ func filterPredMaxColRef(expr planner.Expr) int {
 // than a row-local constant, so it must not be folded into the per-row EPQ
 // recheck filter (its column indices live in a different coordinate space than
 // the locked table's own columns). M0118-0009.
-func exprRefsColumnOrOuter(expr planner.Expr) bool {
+func exprRefsColumnOrOuter(expr optimizer.Expr) bool {
 	found := false
-	var walk func(planner.Expr)
-	walk = func(e planner.Expr) {
+	var walk func(optimizer.Expr)
+	walk = func(e optimizer.Expr) {
 		if e == nil || found {
 			return
 		}
 		switch x := e.(type) {
-		case *planner.ColumnRef:
+		case *optimizer.ColumnRef:
 			found = true
-		case *planner.OuterColumnRef:
+		case *optimizer.OuterColumnRef:
 			found = true
-		case *planner.BinaryOp:
+		case *optimizer.BinaryOp:
 			walk(x.Left)
 			walk(x.Right)
-		case *planner.UnaryOp:
+		case *optimizer.UnaryOp:
 			walk(x.Operand)
-		case *planner.CastExpr:
+		case *optimizer.CastExpr:
 			walk(x.Operand)
-		case *planner.FuncCall:
+		case *optimizer.FuncCall:
 			for _, a := range x.Args {
 				walk(a)
 			}
@@ -602,7 +602,7 @@ func parseRowCTID(d Datum) (storage.ItemPointer, bool) {
 	return storage.ItemPointer{Block: storage.BlockNumber(block), Offset: uint16(off)}, true
 }
 
-func (o *lockRowsOp) Schema() planner.Schema { return o.plan.Output() }
+func (o *lockRowsOp) Schema() optimizer.Schema { return o.plan.Output() }
 
 func (o *lockRowsOp) Open(ctx *Context) error {
 	o.ctx = ctx
@@ -632,11 +632,11 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 		// SHARE — and FOR UPDATE additionally reserves the key (HEAP_KEYS_UPDATED)
 		// vs FOR NO KEY UPDATE. Mirrors heap_lock_tuple's per-mode new_infomask.
 		switch o.plan.Locks[0].Strength {
-		case planner.LockStrengthForKeyShare:
+		case optimizer.LockStrengthForKeyShare:
 			o.lockStrength = storage.HeapXmaxKeyShrLock
-		case planner.LockStrengthForShare:
+		case optimizer.LockStrengthForShare:
 			o.lockStrength = storage.HeapXmaxShrLock
-		case planner.LockStrengthForNoKeyUpdate:
+		case optimizer.LockStrengthForNoKeyUpdate:
 			o.lockStrength = storage.HeapXmaxExclLock
 		default:
 			// FOR UPDATE — strongest; reserves the key just as a key-changing
@@ -664,21 +664,21 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 		rel := ctx.Catalog.RelFileNode(lk.Table)
 		var err error
 		switch lk.WaitPolicy {
-		case planner.LockWaitBlock, planner.LockWaitSkipLocked:
+		case optimizer.LockWaitBlock, optimizer.LockWaitSkipLocked:
 			// SKIP LOCKED affects only per-row locks: the relation-level
 			// RowShareLock is always acquired with the normal blocking
 			// policy. Mirrors upstream — the LockWaitPolicy governs
 			// heap_lock_tuple, not the relation lock. The actual row
 			// skipping happens per-tuple in stampLock / stampLockInner.
 			// M0118-0003.
-			err = ctx.acquireRelLock(rel, lockmgr.RowShareLock)
-		case planner.LockWaitNoWait:
+			err = ctx.acquireRelLock(rel, lmgr.RowShareLock)
+		case optimizer.LockWaitNoWait:
 			// NOWAIT: try once and bail with 55P03 if the
 			// relation lock isn't immediately grantable.
 			// Mirrors upstream's "could not obtain lock on
 			// row" diagnostic at the relation-coarse layer
 			// goopg has today.
-			err = ctx.tryAcquireRelLock(rel, lockmgr.RowShareLock)
+			err = ctx.tryAcquireRelLock(rel, lmgr.RowShareLock)
 		default:
 			return &ExecError{
 				Code:    "XX000",
@@ -771,7 +771,7 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 			if o.filterPred == nil {
 				o.filterPred = idxPred
 			} else {
-				o.filterPred = &planner.BinaryOp{Op: parser.OpAnd, Left: o.filterPred, Right: idxPred}
+				o.filterPred = &optimizer.BinaryOp{Op: parser.OpAnd, Left: o.filterPred, Right: idxPred}
 			}
 		}
 	}
@@ -850,7 +850,7 @@ func (o *lockRowsOp) maybeRecordPgClassRowMark() *ExecError {
 	}
 	// Every row-lock strength conflicts with a concurrent in-place pg_class
 	// update (heap_inplace_update's no-key update) except FOR KEY SHARE.
-	conflicts := o.plan.Locks[0].Strength != planner.LockStrengthForKeyShare
+	conflicts := o.plan.Locks[0].Strength != optimizer.LockStrengthForKeyShare
 	im.AddPgClassRowMark(relOID, xid, conflicts)
 	o.pgClassRowMarkOID = relOID
 	o.pgClassRowMarkXID = xid
@@ -871,14 +871,14 @@ func (o *lockRowsOp) maybeRecordPgClassRowMark() *ExecError {
 // SELECT uses). Returns ok=false for any other predicate shape so the rowmark is
 // simply not recorded. Design 0118-0113.
 func (o *lockRowsOp) pgClassFilterOID() (uint32, bool) {
-	bo, ok := findFilterPred(o.child).(*planner.BinaryOp)
+	bo, ok := findFilterPred(o.child).(*optimizer.BinaryOp)
 	if !ok || bo.Op != parser.OpEq {
 		return 0, false
 	}
-	cr, ok := bo.Left.(*planner.ColumnRef)
+	cr, ok := bo.Left.(*optimizer.ColumnRef)
 	constExpr := bo.Right
 	if !ok {
-		if cr, ok = bo.Right.(*planner.ColumnRef); !ok {
+		if cr, ok = bo.Right.(*optimizer.ColumnRef); !ok {
 			return 0, false
 		}
 		constExpr = bo.Left
@@ -1255,9 +1255,9 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 		// policy is honoured exactly as for the updater wait below.
 		if len(multiHolders) > 0 {
 			switch o.waitPolicy {
-			case planner.LockWaitSkipLocked:
+			case optimizer.LockWaitSkipLocked:
 				return storage.ItemPointer{}, false, true, nil // epqSkipped
-			case planner.LockWaitNoWait:
+			case optimizer.LockWaitNoWait:
 				return storage.ItemPointer{}, false, false, &ExecError{
 					Code:    "55P03",
 					Pos:     o.plan.Pos(),
@@ -1301,9 +1301,9 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 		isActive := o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(xmax)
 		if isActive {
 			switch o.waitPolicy {
-			case planner.LockWaitSkipLocked:
+			case optimizer.LockWaitSkipLocked:
 				return storage.ItemPointer{}, false, true, nil // epqSkipped
-			case planner.LockWaitNoWait:
+			case optimizer.LockWaitNoWait:
 				return storage.ItemPointer{}, false, false, &ExecError{
 					Code:    "55P03",
 					Pos:     o.plan.Pos(),
@@ -1349,7 +1349,7 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 
 		// Updater committed: under RR/SER raise a serialization error.
 		// Under RC: follow CTID chain to find the live successor.
-		if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
+		if o.ctx.Tx.Isolation != transam.IsolationReadCommitted {
 			return storage.ItemPointer{}, false, false, &ExecError{
 				Code:    "40001",
 				Message: "could not serialize access due to concurrent update",
@@ -1435,10 +1435,10 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 			slot.Unlock()
 			o.ctx.Pool.Unpin(slot)
 			switch o.waitPolicy {
-			case planner.LockWaitSkipLocked:
+			case optimizer.LockWaitSkipLocked:
 				// SKIP LOCKED: silently drop the contended row.
 				return storage.ItemPointer{}, false, true, nil // epqSkipped
-			case planner.LockWaitNoWait:
+			case optimizer.LockWaitNoWait:
 				return storage.ItemPointer{}, false, false, &ExecError{
 					Code:    "55P03",
 					Pos:     o.plan.Pos(),
@@ -1695,7 +1695,7 @@ func (o *lockRowsOp) refetchRow(rel storage.RelFileNode, ptr storage.ItemPointer
 // tupleLockMode picks the lockmgr Mode used for the tuple-tag
 // acquire based on the SELECT FOR clause's four-way strength — the
 // hwlock column of upstream's tupleLockExtraInfo (see tupleLockHwMode).
-func (o *lockRowsOp) tupleLockMode() lockmgr.Mode {
+func (o *lockRowsOp) tupleLockMode() lmgr.Mode {
 	return tupleLockHwMode(o.lockMemberStatus())
 }
 
@@ -1708,16 +1708,16 @@ func (o *lockRowsOp) tupleLockMode() lockmgr.Mode {
 // (no-key) UPDATE / FOR NO KEY UPDATE holder — collapsing the two shared
 // strengths to RowShareLock made exactly that pairing block and time out
 // (tuplelock-upgrade-no-deadlock, design 0021-0012).
-func tupleLockHwMode(req multixact.Status) lockmgr.Mode {
+func tupleLockHwMode(req multixact.Status) lmgr.Mode {
 	switch req {
 	case multixact.StatusForKeyShare:
-		return lockmgr.AccessShareLock
+		return lmgr.AccessShareLock
 	case multixact.StatusForShare:
-		return lockmgr.RowShareLock
+		return lmgr.RowShareLock
 	case multixact.StatusForNoKeyUpdate, multixact.StatusNoKeyUpdate:
-		return lockmgr.ExclusiveLock
+		return lmgr.ExclusiveLock
 	default: // StatusForUpdate, StatusUpdate (DELETE / key-changing UPDATE)
-		return lockmgr.AccessExclusiveLock
+		return lmgr.AccessExclusiveLock
 	}
 }
 
