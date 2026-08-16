@@ -24,10 +24,10 @@ import graph is only relabelled and can never gain a cycle.
 cd tools/backend-layout
 go build -o backend-layout .
 
-# dry run — report moves and edits, write tools/backend-layout/moves.log
+# dry run — report moves and edits, write tools/backend-layout/moves.tsv
 ./backend-layout -root ../.. plan
 
-# apply — rewrite files, then move directories, write moves.log
+# apply — rewrite files, then move directories, write moves.tsv
 ./backend-layout -root ../.. apply
 ```
 
@@ -43,8 +43,8 @@ to `github.com/goopg/goopg`), `-mapping` (path to the TSV, defaults to
 | `main.go` | CLI: `plan` / `apply` |
 | `mapping.go` | mapping loader |
 | `edits.go` | edit computation (syntactic + type-aware) |
-| `move.go` | directory relocation + `moves.log` |
-| `moves.log` | generated record of every `old path → new path` |
+| `move.go` | directory relocation + `moves.tsv` |
+| `moves.tsv` | generated record of every `old path → new path` |
 | `DESIGN.md` | full design and rationale |
 
 ## Safety properties

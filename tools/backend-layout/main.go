@@ -9,8 +9,8 @@
 //
 // Subcommands:
 //
-//	plan   dry-run: report every directory move and file edit, write moves.log.
-//	apply  perform the moves and edits, write moves.log.
+//	plan   dry-run: report every directory move and file edit, write moves.tsv.
+//	apply  perform the moves and edits, write moves.tsv.
 //
 // Run from the module root, e.g.:
 //

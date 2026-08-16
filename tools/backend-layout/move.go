@@ -58,7 +58,7 @@ func printPlan(a *analysis, ms []Mapping) {
 	}
 }
 
-// writeMoveLog writes moves.log: a per-file TSV of every old path -> new path.
+// writeMoveLog writes moves.tsv: a per-file TSV of every old path -> new path.
 func writeMoveLog(root string, ms []Mapping) error {
 	var b strings.Builder
 	b.WriteString("# old_path\tnew_path\n")
@@ -86,7 +86,7 @@ func writeMoveLog(root string, ms []Mapping) error {
 			return fmt.Errorf("walk %s: %w", m.OldDir, err)
 		}
 	}
-	return os.WriteFile(filepath.Join(root, "tools", "backend-layout", "moves.log"), []byte(b.String()), 0644)
+	return os.WriteFile(filepath.Join(root, "tools", "backend-layout", "moves.tsv"), []byte(b.String()), 0644)
 }
 
 // moveDirs relocates directories with os.Rename (filesystem-only; git staging and
