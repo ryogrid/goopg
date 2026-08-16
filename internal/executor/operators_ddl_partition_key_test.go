@@ -53,3 +53,82 @@ func TestPartitionKeyExprUsesColumn(t *testing.T) {
 		})
 	}
 }
+
+// TestAlterTablePartitionKeyGuardAlterType pins the M0134-0002 ALTER-TYPE
+// partition-key guard in execAlterColumnType — the sibling of the DROP COLUMN
+// guard in execAlterDropColumn. PG refuses to alter the type of a column that
+// is part of the partition key (a bare key column, or a column referenced
+// inside an expression key) BEFORE any rewrite — even when the target type is
+// unchanged — with byte-exact 42P16 "cannot alter column %q because it is part
+// of the partition key of relation %q" and an errposition at the column name
+// (ATExecAlterColumnType, parser_errposition(pstate, def->location);
+// postgres/src/backend/commands/tablecmds.c:14443,14450). The errposition is
+// covered by the alter_table regress run (expected alter_table.out:3977-3979);
+// here we assert Code+Message only. Tables are built for real through the DDL
+// executor so PartitionKey/PartitionKeyExprs come from CREATE TABLE, never
+// faked in the fixture. Non-key columns still alter fine.
+func TestAlterTablePartitionKeyGuardAlterType(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	for _, s := range []string{
+		"CREATE TABLE alt_pk (a int, b int) PARTITION BY RANGE (a)",
+		"CREATE TABLE alt_pk_expr (a int, b int) PARTITION BY RANGE (plusone(a))",
+		"CREATE TABLE alt_pk_plain (a int, b int) PARTITION BY RANGE (a)",
+	} {
+		if err := runDDL(t, ctx, s); err != nil {
+			t.Fatalf("setup %q: %v", s, err)
+		}
+	}
+
+	tests := []struct {
+		name    string
+		sql     string
+		wantErr bool
+		code    string
+		message string
+	}{
+		{
+			name:    "key column refused",
+			sql:     "ALTER TABLE alt_pk ALTER COLUMN a TYPE bigint",
+			wantErr: true,
+			code:    "42P16",
+			message: `cannot alter column "a" because it is part of the partition key of relation "alt_pk"`,
+		},
+		{
+			// The guard sits before the no-op type check, so PG refuses even
+			// when the type name is unchanged.
+			name:    "key column refused even when type unchanged",
+			sql:     "ALTER TABLE alt_pk ALTER COLUMN a TYPE int",
+			wantErr: true,
+			code:    "42P16",
+			message: `cannot alter column "a" because it is part of the partition key of relation "alt_pk"`,
+		},
+		{
+			// PARTITION BY RANGE (plusone(a)) stores a FuncCall in
+			// PartitionKeyExprs; the structural walker must catch column a.
+			name:    "expression key column refused",
+			sql:     "ALTER TABLE alt_pk_expr ALTER COLUMN a TYPE bigint",
+			wantErr: true,
+			code:    "42P16",
+			message: `cannot alter column "a" because it is part of the partition key of relation "alt_pk_expr"`,
+		},
+		{
+			// Guard must not false-positive on a column outside the key.
+			name: "non-key column alter ok",
+			sql:  "ALTER TABLE alt_pk_plain ALTER COLUMN b TYPE bigint",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := runDDL(t, ctx, tc.sql)
+			if !tc.wantErr {
+				if err != nil {
+					t.Fatalf("%s: %v", tc.sql, err)
+				}
+				return
+			}
+			wantExecError(t, err, tc.code, tc.message)
+		})
+	}
+}

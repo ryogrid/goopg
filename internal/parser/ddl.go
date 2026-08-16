@@ -8994,10 +8994,15 @@ func (p *parser) parseAlterColumnAction() (AlterTableAction, error) {
 	p.advance() // consume ALTER
 	// Skip COLUMN keyword if present.
 	_ = p.acceptKeyword(KwColumn)
-	// Read the column name.
+	// Read the column name. colPos records the column-name token's location so
+	// ALTER COLUMN TYPE refusals can report PG's errposition pointing at the
+	// column (parser_errposition(pstate, def->location) at
+	// postgres/src/backend/commands/tablecmds.c:14409,14450).
 	colName := ""
+	colPos := 0
 	if p.cur().Kind == TokenIdent || p.cur().Kind == TokenQuotedIdent {
 		colName = p.cur().Value
+		colPos = p.cur().Pos
 		p.advance()
 	}
 	// OPTIONS ( [ADD|SET|DROP] name ['value'], … ) — ALTER FOREIGN TABLE's
@@ -9172,6 +9177,7 @@ func (p *parser) parseAlterColumnAction() (AlterTableAction, error) {
 			}
 		}
 		return AlterTableAction{
+			pos:        colPos,
 			Kind:       AlterTableAlterColumnType,
 			ColumnName: colName,
 			NewType:    newType,

@@ -22137,8 +22137,38 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 			break
 		}
 	}
+	// Missing-column refusal. Unlike the SET/DROP NOT NULL arms (which ereport
+	// without errposition — alter_table.out:1156-1159), the ALTER TYPE arm of
+	// ATPrepAlterColumnType DOES carry parser_errposition(pstate, def->location)
+	// (postgres/src/backend/commands/tablecmds.c:14404-14409), so Pos must be
+	// act.Pos() — the column-name location threaded by parseAlterColumnAction.
 	if colIdx < 0 {
 		return &ExecError{Code: "42703", Pos: act.Pos(), Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
+	}
+
+	// Cannot alter the type of a column that is part of the partition key.
+	// Mirrors ATExecAlterColumnType's has_partition_attrs check
+	// (postgres/src/backend/commands/tablecmds.c:14443;
+	// postgres/src/backend/catalog/partition.c:255). Unlike the DROP COLUMN
+	// sibling (tablecmds.c:9358-9364, no errposition), this ereport carries
+	// parser_errposition(pstate, def->location) — an errposition pointing at the
+	// column name in the statement (tablecmds.c:14450) — so Pos is act.Pos().
+	// act.Pos() is nonzero now that parseAlterColumnAction threads the
+	// column-name token location into the ALTER TYPE action.
+	if tbl.PartitionMethod != "" {
+		colLower := strings.ToLower(act.ColumnName)
+		for _, keyCol := range tbl.PartitionKey {
+			if strings.ToLower(keyCol) == colLower {
+				return &ExecError{Code: "42P16", Pos: act.Pos(),
+					Message: fmt.Sprintf("cannot alter column %q because it is part of the partition key of relation %q", act.ColumnName, tbl.Name)}
+			}
+		}
+		for _, expr := range tbl.PartitionKeyExprs {
+			if partitionKeyExprUsesColumn(expr, colLower) {
+				return &ExecError{Code: "42P16", Pos: act.Pos(),
+					Message: fmt.Sprintf("cannot alter column %q because it is part of the partition key of relation %q", act.ColumnName, tbl.Name)}
+			}
+		}
 	}
 
 	oldCatalogType := tbl.Columns[colIdx].Type
@@ -22243,18 +22273,24 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 					}
 					src = val
 				}
-				converted, cErr := evalCast(src, newCatalogType.Name, act.Pos(), o.ctx)
+				// Evaluation-time cast failures (22P02 etc.) carry no errposition:
+				// PG performs the coercion during ATRewriteTable's expression
+				// evaluation, which has no source location. pos 0.
+				converted, cErr := evalCast(src, newCatalogType.Name, 0, o.ctx)
 				if cErr != nil {
 					// Coercion failure: propagate deterministically BEFORE
 					// Phase 2 (catalog mutation) / Phase 3 (heap truncation)
 					// run, so the table stays intact. Map to PG's
 					// ATPrepAlterColumnType message (tablecmds.c:14495-14511).
+					// PG's coercion ereports carry NO parser_errposition
+					// (tablecmds.c:14500-14517), so Pos is 0 — not act.Pos(),
+					// which now resolves to the column-name location.
 					if act.UsingExpr != nil {
-						convErr = &ExecError{Code: "42804", Pos: act.Pos(),
+						convErr = &ExecError{Code: "42804", Pos: 0,
 							Message: fmt.Sprintf("result of USING clause for column %q cannot be cast automatically to type %s", act.ColumnName, newCatalogType.Name),
 							Hint:    "You might need to add an explicit cast."}
 					} else {
-						convErr = &ExecError{Code: "42804", Pos: act.Pos(),
+						convErr = &ExecError{Code: "42804", Pos: 0,
 							Message: fmt.Sprintf("column %q cannot be cast automatically to type %s", act.ColumnName, newCatalogType.Name),
 							Hint:    fmt.Sprintf("You might need to specify \"USING %s::%s\".", act.ColumnName, newCatalogType.Name)}
 					}

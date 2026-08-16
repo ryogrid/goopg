@@ -528,10 +528,19 @@ its default arm, so the walker must not silently miss them).
 here; message text already matches PG (`cannot drop column %s because it is part
 of the partition key of relation %s`).
 
-**Sibling (separate gap, not this slice).** `execAlterColumnType`
-(operators_ddl.go:22127) has no partition-key guard; PG rejects at
-tablecmds.c:14443 with the same 42P16. Recorded in the ledger; the new walker
-serves it later.
+**Sibling (landed 2026-08-16).** `execAlterColumnType` (operators_ddl.go:22137)
+has the same partition-key guard, raising 42P16 `cannot alter column %q because
+it is part of the partition key of relation %q` before any rewrite — a bare key
+column, or a column referenced inside an expression key (walked via
+`partitionKeyExprUsesColumn`). One difference from the DROP COLUMN arm:
+`ATExecAlterColumnType` carries `parser_errposition(pstate, def->location)`
+(tablecmds.c:14450) where `ATExecDropColumn` (tablecmds.c:9358-9364) does not, so
+the ALTER-TYPE raise uses `Pos: act.Pos()` — the column-name token location
+threaded by `parseAlterColumnAction` → `colPos` (`internal/parser/ddl.go`) — and
+the regress `LINE 1 … ^` caret points at the column name, byte-matching PG
+(expected alter_table.out:3977-3983). For the same reason the ALTER-TYPE
+coercion-failure 42804 arms (evaluation-time, no source location) use `Pos: 0`,
+not `act.Pos()`.
 
 ## PG oracle citations
 
