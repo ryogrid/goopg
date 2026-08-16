@@ -497,8 +497,48 @@ lines are 4 leading columns narrower than PG's (PG `ExplainNode` `explain.c:1619
 `2*depth` add only +2/level). Fix = +1 deeper depth for subtree descendants.
 Re-verify on a deeper InitPlan before fixing (measured on a 2-level subtree).
 
+## partition-key DROP COLUMN guard — structural walk (surfaced by C3, 2026-08-16)
+
+**Bug (pre-existing, surfaced by the C3 row-scan running against partitioned
+tables).** `execAlterDropColumn` (`operators_ddl.go:21970-21986`) decides whether
+the dropped column is an expression partition key via
+`strings.Contains(strings.ToLower(fmt.Sprintf("%v", expr)), colLower)` — a
+string search over the Go `%v` rendering of the expression node. That rendering
+embeds raw pointer addresses, so the hex digits can contain the target column
+name and flip the guard silent↔error between runs (ASLR), with no code change.
+The `ALTER TABLE partitioned DROP COLUMN b` regress section therefore oscillates.
+
+**Fix.** Replace the `%v`-contains heuristic with a structural walker
+`partitionKeyExprUsesColumn(e parser.Expr, colLower string) bool` that recurses
+the expression tree and matches a `*parser.ColumnRef` by column name
+(case-insensitive) — the same name-only convention as the plain-key loop
+(`strings.EqualFold`, `evalPartitionKeyExpr` operators_storage.go:2773) and the
+existing `funcExprContainsName` (operators_ddl_partition.go:1301), which this
+walker mirrors. Node kinds to recurse: `ColumnRef` (leaf match), `FuncCall`
+(args), `BinaryOp` (Left/Right), `UnaryOp` (Operand), `CastExpr` (Operand),
+`CollateExpr` (Operand), plus the CaseExpr/ExtractExpr/IsNullExpr arms that
+`funcExprContainsName` lacks (the partition-key validator `validatePartKeyExprInner`
+operators_ddl_partition.go:237-327 accepts CaseExpr/ExtractExpr/IsNullExpr via
+its default arm, so the walker must not silently miss them).
+
+**SQLSTATE correction (same line).** The guard raises `0A000`
+(`ERRCODE_FEATURE_NOT_SUPPORTED`) where PG raises `42P16`
+(`ERRCODE_INVALID_TABLE_DEFINITION`) — `ATExecDropColumn` calls
+`has_partition_attrs` (`tablecmds.c:9358`) which reports 42P16. Correct it while
+here; message text already matches PG (`cannot drop column %s because it is part
+of the partition key of relation %s`).
+
+**Sibling (separate gap, not this slice).** `execAlterColumnType`
+(operators_ddl.go:22127) has no partition-key guard; PG rejects at
+tablecmds.c:14443 with the same 42P16. Recorded in the ledger; the new walker
+serves it later.
+
 ## PG oracle citations
 
+- `postgres/src/backend/catalog/partition.c:255` — `has_partition_attrs(Relation,
+  Bitmapset *, bool *used_in_expr)`: plain key via `bms_is_member`, expression key
+  via `pull_varattnos(expr, 1, &expr_attrs)` (`optimizer/util/var.c:296`) +
+  `bms_overlap`. Call sites tablecmds.c:9358 (DROP COLUMN) / :14443 (ALTER TYPE).
 - `postgres/src/backend/commands/tablecmds.c` — ALTER TABLE grammar + execution
   (`ATExecAddConstraint`, `ATExecAlterColumnType`, constraint naming).
 - `postgres/src/backend/commands/explain.c:1619-1633` (`ExplainNode` indent),

@@ -21967,19 +21967,24 @@ func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAct
 		return &ExecError{Code: "42P16", Pos: 0, Message: fmt.Sprintf("cannot drop inherited column %q", act.ColumnName)}
 	}
 
-	// Cannot drop a column that is part of the partition key.
+	// Cannot drop a column that is part of the partition key. Both refusal
+	// raises are 42P16 ERRCODE_INVALID_TABLE_DEFINITION with no errposition —
+	// ATExecDropColumn calls has_partition_attrs
+	// (postgres/src/backend/commands/tablecmds.c:9358;
+	// postgres/src/backend/catalog/partition.c:255) which reports 42P16, same as
+	// the inherited-column guard immediately above.
 	if tbl.PartitionMethod != "" {
 		colLower := strings.ToLower(act.ColumnName)
 		for _, keyCol := range tbl.PartitionKey {
 			if strings.ToLower(keyCol) == colLower {
-				return &ExecError{Code: "0A000", Pos: act.Pos(),
+				return &ExecError{Code: "42P16", Pos: 0,
 					Message: fmt.Sprintf("cannot drop column %q because it is part of the partition key of relation %q", act.ColumnName, tbl.Name)}
 			}
 		}
 		// Also check expression partition keys (e.g. PARTITION BY RANGE (plusone(a))).
 		for _, expr := range tbl.PartitionKeyExprs {
-			if strings.Contains(strings.ToLower(fmt.Sprintf("%v", expr)), colLower) {
-				return &ExecError{Code: "0A000", Pos: act.Pos(),
+			if partitionKeyExprUsesColumn(expr, colLower) {
+				return &ExecError{Code: "42P16", Pos: 0,
 					Message: fmt.Sprintf("cannot drop column %q because it is part of the partition key of relation %q", act.ColumnName, tbl.Name)}
 			}
 		}

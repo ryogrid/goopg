@@ -1321,3 +1321,59 @@ func funcExprContainsName(expr parser.Expr, funcName string) bool {
 	}
 	return false
 }
+
+// partitionKeyExprUsesColumn returns true if expr (a partition-key expression)
+// references a column whose name matches colLower (already lower-cased)
+// case-insensitively. It is the structural replacement for the old
+// `strings.Contains(fmt.Sprintf("%v", expr), colLower)` heuristic, whose Go
+// `%v` rendering embeds raw pointer addresses and could false-positive on the
+// target column name via ASLR hex digits (flipping the DROP COLUMN partition-key
+// guard silent<->error between runs). Mirrors funcExprContainsName's recursion
+// shape, extended to the CaseExpr/ExtractExpr/IsNullExpr arms that
+// validatePartKeyExprInner (above) accepts via its default arm, so the walker
+// cannot silently miss them. Matches by column name only (ignore .Table/.Schema
+// qualification) — the same convention as the plain-key loop and
+// evalPartitionKeyExpr (operators_storage.go). PG's equivalent is
+// has_partition_attrs (postgres/src/backend/catalog/partition.c:255):
+// expression key via pull_varattnos (optimizer/util/var.c:296) + bms_overlap.
+func partitionKeyExprUsesColumn(e parser.Expr, colLower string) bool {
+	if e == nil {
+		return false
+	}
+	switch v := e.(type) {
+	case *parser.ColumnRef:
+		return strings.EqualFold(v.Column, colLower)
+	case *parser.FuncCall:
+		for _, arg := range v.Args {
+			if partitionKeyExprUsesColumn(arg, colLower) {
+				return true
+			}
+		}
+		if v.Filter != nil {
+			return partitionKeyExprUsesColumn(v.Filter, colLower)
+		}
+	case *parser.BinaryOp:
+		return partitionKeyExprUsesColumn(v.Left, colLower) || partitionKeyExprUsesColumn(v.Right, colLower)
+	case *parser.UnaryOp:
+		return partitionKeyExprUsesColumn(v.Operand, colLower)
+	case *parser.CastExpr:
+		return partitionKeyExprUsesColumn(v.Operand, colLower)
+	case *parser.CollateExpr:
+		return partitionKeyExprUsesColumn(v.Operand, colLower)
+	case *parser.CaseExpr:
+		if partitionKeyExprUsesColumn(v.Operand, colLower) {
+			return true
+		}
+		for _, w := range v.Whens {
+			if partitionKeyExprUsesColumn(w.When, colLower) || partitionKeyExprUsesColumn(w.Then, colLower) {
+				return true
+			}
+		}
+		return partitionKeyExprUsesColumn(v.Else, colLower)
+	case *parser.ExtractExpr:
+		return partitionKeyExprUsesColumn(v.Source, colLower)
+	case *parser.IsNullExpr:
+		return partitionKeyExprUsesColumn(v.Operand, colLower)
+	}
+	return false
+}
