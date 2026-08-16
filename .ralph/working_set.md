@@ -1,56 +1,48 @@
-# Working set — M0134-0002 alter_table.sql (C9 slice 1 landed)
+# Working set — M0134-0002 alter_table.sql (C3 slice 1 landed)
 
 **Task:** M0134-0002 alter_table.sql regress-sql digestion. This loop landed
-**C9 slice 1 — inherited-DDL guards** (commit `a5d06075`). After C2 (grammar
-cluster) completed last loop, a researcher reassessment re-ran the regress and
-ranked the remaining correctness classes; C9 inheritance (553 lines) is the
-largest, and its guard half is bounded.
+**C3 slice 1 — constraint row-validation scans** (commit `93948d24`).
 
-**Findings:** diff re-captured at HEAD `bdba00b1` = **4349 lines / 104 hunks /
-746+/849−**. Remaining classes ranked: C9 553 · C6 356 · C7 179 · C10 146 ·
-C7/C12 87 · C12 85 · C11 58 · C3 46 · C4 21 · C8 17 · C13 1, plus two NEW classes
-surfaced: **PLPGSQL** 39 (`v := expr FROM table` assignment rejected — blocks all
-6 `check_ddl_rewrite`) and **TYPEDS** 7 (`'epoch'` timestamp literal rejected).
+**Findings:** C3 (constraint validation scans absent) split into two slices by a
+researcher reassessment. Slice 1 = the three non-index scans; slice 2 = the
+index-build path (deferred). Diff 4298→4185 (−113), zero raw `(byte N)` leaks.
 
-**C9 slice 1 landed:** five ALTER-TABLE refusals — DROP/RENAME COLUMN, ADD COLUMN
-ONLY, DROP/RENAME CONSTRAINT on inherited columns/constraints — byte-exact 42P16
-messages from `ATExecDropColumn`/`renameatt_internal`/`ATExecAddColumn`/
-`dropconstraint_internal`/`rename_constraint_internal`. `ONLY` guards key off new
-`hasInheritanceChildren` (INHERITS∪PARTITION); inherited guards key off
-`col.Inherited`/`nc.InhCount` with `colStillInherited`/`parentStillHasColumn`
-live-hierarchy narrowing (stale-flag-safe) + a NO INHERIT flag-clear; parser
-records `AlterTableStmt.Only`. Diff 4349→4298 (−51), zero new divergence; 8 tests.
+**C3 slice 1 landed:** ADD CHECK (no NOT VALID/NOT ENFORCED), SET NOT NULL + ADD
+CONSTRAINT NOT NULL (both spellings), VALIDATE CHECK now scan existing rows and
+refuse via new `forEachLiveRow` (page-Pin live-row iterator) +
+`validateCheckConstraintRows` (parse-once → `planner.ResolveIndexPredicate` →
+per-row `evalExpr`; 23514 on a definite boolean FALSE only — NULL/UNKNOWN passes).
+55000 `cannot validate NOT ENFORCED constraint` guard + VALIDATE-CHECK convalidated
+flip. All Pos 0. A reviewer round caught + fixed a `parser.SyntaxError` `(byte N)`
+suffix leak. 8 tests.
 
-**Files:** internal/parser/{ast.go,ddl.go}, internal/executor/operators_ddl.go,
-internal/executor/operators_ddl_inherit_guards_test.go (new),
-docs/design/0134-0002-alter-table-sql-divergence.md (§C9 first slice),
-.ralph/fix_plan.md + .ralph/deferral_ledger.md (3 rows).
+**Files:** internal/executor/operators_ddl.go, operators_ddl_constraint_scan_test.go
+(new), docs/design/0134-0002-alter-table-sql-divergence.md (§"C3 first slice"),
+.ralph/fix_plan.md + .ralph/deferral_ledger.md (5 rows).
 
-**Key symbols:** `hasInheritanceChildren`, `colStillInherited`,
-`parentStillHasColumn` (operators_ddl.go), `AlterTableStmt.Only`,
-`execAlterDropColumn`, `execAlterTableDropConstraint`, `execAlterTableAddColumn`.
+**Key symbols:** `forEachLiveRow`, `validateCheckConstraintRows` (operators_ddl.go),
+`planner.ResolveIndexPredicate`, `evalExpr`.
 
-**Deferred (3 ledger rows):** `Column.InhCount int` multi-parent bookkeeping
-(attinhcount 1-vs-2 `c1` merge; bool guard can't fire on the merge case);
-LIKE+ATTACH-PARTITION `Inherited`; INHERIT child-validation; INHERITS merge
-NOTICEs; inline `CONSTRAINT con1` name (C7).
+**Deferred (5 ledger rows):** (1) C3 slice 2 — ADD PK/UNIQUE 23505 `DETAIL: Key …
+is duplicated.` (per-entry value capture in `btree.BulkEntry`) + PK-over-NULL 23502
+scan + Pos 0 on 23505; (2) FK-VALIDATE shadowing (C4 ADD-FK dup-name); (3)
+nondeterministic partition-key DROP COLUMN guard (operators_ddl.go:21879-21883
+`strings.Contains(fmt.Sprintf("%v", expr), …)` matches ASLR pointer hex — flips the
+alter_table regress section between runs); (4) `parseCheckExpr` quote-loss (42601 vs
+42703); (5) ONLY-partitioned DROP COLUMN guard missing.
 
-**Next step:** brief + implement the **C3 constraint-validation scans** slice
-(ADD CHECK / SET NOT NULL / VALIDATE / ADD PK must scan existing rows and raise
-23514/23502 — mirrors existing `validateFKConstraintExistingRows`
-operators_ddl.go:10467; ~46 lines, bounded, the doc's next-unmasked class, and it
-unmasks the sequential-apply gap). Alternative: continue C9 with the
-`Column.InhCount int` follow-up. New classes PLPGSQL/TYPEDS get their own slices
-after C3/C9.
+**Next step:** C3 slice 2 (complete C3 — PK/UNIQUE 23505 DETAIL, PK-over-NULL 23502
+reusing `forEachLiveRow`, Pos 0). Alternatively pull deferral #3 (nondeterministic
+partition-key guard) forward first — it makes the alter_table regress diff
+non-reproducible (measurement concern). New classes PLPGSQL/TYPEDS after C3/C9.
 
-**Gates run (this loop):** `scripts/pg-regress-runner.sh alter_table` (baseline
-4349 → post 4298, −51, zero new divergence); `go build ./...` PASS; `go test
-./internal/executor/ ./internal/parser/ ./internal/catalog/` PASS (8 new tests);
-`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=35); pre-commit pgbench smoke PASS
-(12567 tps select-only); `make ralph-state-guard` (see status block).
+**Gates run (this loop):** `go build ./...` PASS; `go test ./internal/executor/
+./internal/parser/ ./internal/catalog/` PASS (8 tests); `scripts/pg-regress-runner.sh
+alter_table` 4298→4185; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=35); pre-commit
+pgbench smoke PASS (12635 tps select-only).
 
-**Delegation:** researcher `0134-0002-c3-reassess-research` DONE (report has the
-per-class table + recommendation); implementer `0134-0002-c9-inherit-guards` DONE
-(1 round); tester tpch-spotcheck DONE.
+**Delegation:** researcher `0134-0002-c3-constraint-scan-research` DONE; implementer
+`0134-0002-c3-constraint-scan-impl` DONE (2 rounds); reviewer
+`0134-0002-c3-constraint-scan-review` DONE; tester tpch-spotcheck DONE.
 
 **In-flight:** none.
