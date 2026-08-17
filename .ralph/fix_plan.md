@@ -1152,21 +1152,34 @@ repro at HEAD first; the log reflects the last nightly and may be stale).
       PASS, `RALPH_PRECOMMIT_SCOPE=units`. Ledger row 2026-08-17: the harness
       still has no apply-position (LSN) `wait_for_catchup` primitive.
       Evidence: `ci/logs/20260817-011734/testport/go-test.log`.
-- [ ] **testport/TestPort_RegressWedgeProbeNamesTheStuckStatement
-      (AI-20260817-011734-006)** — FAILed (new tonight). Repro:
-      `go test -v -run '^TestPort_RegressWedgeProbeNamesTheStuckStatement$' ./internal/testport/`.
+- [x] **testport/TestPort_RegressWedgeProbeNamesTheStuckStatement
+      (AI-20260817-011734-006)** — FIXED 2026-08-17. **A stale assertion string in
+      the guard test, not an engine bug and not a wrong-process capture.** The
+      probe's pprof plumbing is correct end to end: it GETs
+      `/debug/pprof/goroutine?debug=2` from the goopg server subprocess
+      (`regress_wedge_probe_test.go:274 fetchGoroutineDump`; server listener
+      `cmd/goopg/main.go:338-352`, addr via `GOOPG_PPROF_ADDR` set at
+      `regress_wedge_probe_guard_test.go:41-42`). Check (3) asserted the dump
+      contained `internal/server` — **a package that does not exist in this
+      module** (the postmaster/connection code is `internal/postmaster`; the many
+      `internal/server` mentions in the tree are stale COMMENTS). The test is new
+      (`b0b4dc61`) and had never passed. The misleading error text came from
+      `truncate(dump, 400)`: every `debug=2` dump legitimately opens with the
+      requesting goroutine's own `runtime/pprof.writeGoroutineStacks` frames, so
+      the 400-byte prefix looks like an in-process capture even when it is not.
+      Discriminating evidence before editing: the captured dump holds **35**
+      `github.com/goopg/goopg/` frame lines, incl.
+      `internal/postmaster.(*Server).acceptLoop`, `…(*Server).Run`,
+      `internal/access/transam/xlog.(*Checkpointer).Run`,
+      `internal/storage.(*Bgwriter).run`, `internal/control.(*Listener).Serve`.
+      Fix (test-only, 1 file): match the module import prefix
+      `github.com/goopg/goopg/internal/` instead of a specific package name —
+      still discriminates a real server capture from bare `runtime/*` pprof
+      frames (the stated intent of check (3)) while surviving package renames.
+      Gates: `go build ./...`, `go vet ./internal/testport/`, target test 3/3
+      PASS + `TestRegressWedgeProbeStuckFilter` PASS,
+      `RALPH_PRECOMMIT_SCOPE=units` PASS, pre-commit pgbench smoke.
       Evidence: `ci/logs/20260817-011734/testport/go-test.log`.
-      **TRIAGED 2026-08-17 (still reproduces at HEAD `574b2d69`, 3.86 s) — a bug
-      in the wedge-probe TOOLING, not in the engine.** The probe's own self-test
-      (`case=probe_selftest`) correctly captured `pg_stat_activity` (the induced
-      `SELECT pg_sleep(30), 'goopg_wedge_probe_marker'` backend shows `active`)
-      and the server's RSS/log tail, then failed at
-      `regress_wedge_probe_guard_test.go:94`: `goroutine dump has no goopg server
-      frames (wrong process?)` — the captured dump is the **test harness's own**
-      Go runtime stack (bare `runtime/pprof.writeGoroutineStacks` frames), so the
-      probe's goroutine-dump collector is reading the wrong process/endpoint.
-      Next step: find where the probe requests the goroutine dump and point it at
-      the goopg server subprocess instead of `runtime/pprof` in-process.
 
 Non-blocking notice (no task): 17 `TestPort_Psql*`/`TestPort_Scripts*`/
 `TestPort_Pgbench*` cases newly SKIPPED vs the previous run — env-drift, expected
