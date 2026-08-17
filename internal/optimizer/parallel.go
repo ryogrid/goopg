@@ -181,17 +181,6 @@ func subtreeHasUnsafeNode(n Node) bool {
 			// disables parallelism outright for plans carrying row marks.
 			unsafe = true
 			return
-		case *Aggregate:
-			// An order-sensitive aggregate above a Gather returns its elements
-			// in worker-arrival order — a different order on every run. It is
-			// not decomposable either, so parallelising below it buys only the
-			// scan and costs determinism. Refused outright.
-			for _, call := range x.Aggs {
-				if AggregateIsOrderSensitive(call) {
-					unsafe = true
-					return
-				}
-			}
 		case *SeqScan:
 			if tableIsUnsafeForParallel(x.Table) {
 				unsafe = true

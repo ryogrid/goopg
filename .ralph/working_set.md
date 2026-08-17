@@ -1,41 +1,64 @@
-# Working set — M-NIGHTLY run 20260817-011734 DRAINED (all 6 items closed)
+# Working set — M0134-0001 S16 LANDED
 
-**Task:** M-NIGHTLY nightly triage, item **AI-20260817-011734-001**
-(`race/internal/initdb`). Selected per the Current Priority banner (M-NIGHTLY is
-the standing highest-priority obligation). **Closed STALE — verification only,
-zero code change.**
+**Task:** M0134-0001 (`aggregates.sql`), slice **S16 — an order-sensitive
+aggregate refuses its SPLIT, not the whole plan**. Selected per the Current
+Priority banner (M-NIGHTLY drained: `ci/logs/action-items.md` still run
+`20260817-011734`, all 6 `[x]`; nothing new to file).
 
-**Finding:** the recorded nightly failure was `panic: test timed out after 45m0s`
-(`FAIL github.com/goopg/goopg/internal/initdb 2700.056s`) — a whole-package
-timeout from running 605 `Init()`-heavy tests as ONE `go test -race` binary. It
-was **never a data race**: the goroutine dump showed only a normal in-progress
-`pglz.Compress`. The run forked before the race-shard fix `83dd7ae8`
-(`git merge-base --is-ancestor 83dd7ae8 HEAD` → IN-HEAD now).
+**Fix:** deleted the `case *Aggregate:` arm from `subtreeHasUnsafeNode`
+(`internal/optimizer/parallel.go` ~184-194). It suppressed every `Gather` in the
+statement whenever an undecorated `array_agg`/`string_agg`/`json*_agg`/`xmlagg`
+appeared anywhere — redundant (the split is refused independently by
+`aggregateSplitIsSafe`→`AggregateIsDecomposable`, which the veto was never wired
+to) and too strong (PG's `max_parallel_hazard_walker`, `clauses.c:827-970`, has
+NO `Aggref` order case). `AggregateIsOrderSensitive` kept as documented
+zero-caller code for the deferred S10b split gating.
 
-**Verification at HEAD:** `make race-gate RACE_TIMEOUT=45m RACE_SHARD_ONLY=1`
-→ 4/4 shards PASS (152/151/151/151 = 605 tests, matching `go test -list`),
-per-shard 748.6 / 726.7 / 776.6 / 873.4 s, **wall clock 15m52s** — beats the
-fix's ≈19m56s estimate, well inside the 45m budget. Useful datum for future
-loops: this gate costs ~16 min, not ~45.
+**The measurement worth carrying — the predicted win did NOT materialise:**
+`aggregates` **1001→999 lines, 29→29 hunks**. The structural claim still holds,
+verified by the hunk's own context rather than the line count: `Aggregate`,
+`Gather` and `Workers Planned: 2` all moved into unchanged context. What
+survives is ONE line — `Parallel Seq Scan` vs `Seq Scan` — a **renderer** gap,
+not a planner one. PG prefixes `"Parallel "` whenever `plan->parallel_aware` is
+set (`explain.c:1630-1631`, beside the sibling `"Async "`); goopg's EXPLAIN
+walkers have no such prefix. **This surface was unobservable before S16** — with
+the veto in place no `Gather` was ever planted, so there was no
+scan-below-a-Gather to mislabel. Third bucket lesson of the milestone and the
+first where the label held: S11 and S15 were misattributions of *cause*; this
+one was right about the cause and wrong only about how much diff sat behind it.
 
-**Files:** `.ralph/fix_plan.md` only (item ticked with the evidence; run header
-marked DRAINED).
+**An existing test encoded the old veto:** `TestPartialAggregateRefusals` went
+red. Its positional-equality assertion held only because `isSplit=false` used to
+imply "no Gather anywhere". Relaxed to sorted-multiset for `string_agg`/
+`array_agg` only (two orderings observed across consecutive runs); `isSplit`
+false, exact row count, and `count(DISTINCT v)`'s exact compare all kept.
 
-**Gates run:** race-gate shard-only PASS (see above). No units/tpch-spotcheck —
-bookkeeping-only change, no production code touched; the pre-commit pgbench smoke
-still runs on the commit.
+**Files:** `internal/optimizer/{parallel.go,parallel_agg.go,parallel_test.go}`,
+`internal/executor/parallel_agg_split_test.go`,
+`docs/design/0134-0001-p7-parallel-aggregate-veto.md` + README row.
 
-**Deferral ledger:** no row. Nothing PG-semantic was left unimplemented.
+**Gates run:** `go build ./...` PASS; UNITS suite PASS (~9 min, warm cache);
+regress fresh — `aggregates` 999/29, sentinels byte-identical (`functional_deps`
+56, `groupingsets` 2373); `scripts/tpch-spotcheck.sh` PASS Q12=2/Q13=35;
+pgbench smoke PASS via hook.
 
-**Next step:** M-NIGHTLY run `20260817-011734` is fully drained (6/6). No
-unchecked `## AI-` item remains in `ci/logs/action-items.md`. The banner therefore
-routes the next loop to **M0134** (regress-sql `failed`/`not-tried` digestion) —
-after the unconditional re-read of `ci/logs/action-items.md`, since a newer
-nightly run may have landed. NOTE: the next nightly that starts *after*
-`83dd7ae8` is the one that validates the sharding fix in CI; if it still reports
-`race/internal/initdb`, that item is NOT stale and needs real triage.
+**Deferral ledger:** row 1440 flipped `resolved`; 2 new rows 2026-08-17 — the
+`"Parallel "` label prefix, and the untested `array_agg(v ORDER BY v)` decorated
+form (no coverage of the sort-below-the-aggregate path under parallelism).
 
-**Delegation:** `tmp/ralph-handoffs/m-nightly-20260817-001-race-initdb/`
-(tester DONE, 1 round; gate output in `race.log`).
+**Next step:** continue **M0134-0001** with the **`"Parallel "` label prefix**
+slice — cheapest remaining, EXPLAIN-text blast radius only, closes the last line
+of the `array_dims` hunk and the same residue at `v_pagg_test`. Needs the
+per-node parallel-aware flag readable in `internal/executor/operators_explain.go`
+**and its ANALYZE twin** (`walkPlanFiltered`/`walkPlanAnalyzeFiltered` — the S11
+twin-divergence trap). Other buckets: deparser/C11c 8, S6 min/max-InitPlan 5,
+isolated bugs 4, qualification 3, Parallel Append (S10b) 2.
+
+**Delegation:** `tmp/ralph-handoffs/m0134-0001-s16-agg-veto/` — `brief.md`
+(researcher), `impl-brief.md` + `decision-brief.md` (implementer, 2 rounds,
+round 2 = coordinator's multiset decision), `gate-brief.md` (tester, 1 round).
 
 **In-flight:** none.
+
+**Note:** untracked `internal/nodes/int2_cast_test.go` and
+`internal/testport/datconnlimit_durability_test.go` are foreign WIP — untouched.

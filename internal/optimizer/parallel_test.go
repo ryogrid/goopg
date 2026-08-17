@@ -312,6 +312,37 @@ func TestKillSwitchSuppressesGather(t *testing.T) {
 	}
 }
 
+// TestMaybeAddGatherOrderSensitiveAggregateGathersBelow pins M0134-0001 S16:
+// an order-sensitive aggregate (array_agg with no ORDER BY) refuses only its
+// own SPLIT — never the whole statement. A Gather may still be placed BELOW a
+// plain, non-split Aggregate to parallelise the scan, matching PG's shape
+// (`postgres/src/backend/optimizer/util/clauses.c max_parallel_hazard_walker`
+// has no Aggref order-sensitivity special case at all; only
+// AggregateIsDecomposable / aggregateSplitIsSafe refuse the split, in
+// parallel_agg.go).
+func TestMaybeAddGatherOrderSensitiveAggregateGathersBelow(t *testing.T) {
+	tbl := bigTable(t, "big")
+	scan := seqScanOver(tbl)
+	agg := &Aggregate{Child: scan, Aggs: []AggregateCall{{Name: "array_agg"}}}
+
+	out := MaybeAddGather(agg, parallelTestSettings())
+
+	// The Gather must be present, below the Aggregate.
+	outAgg, ok := out.(*Aggregate)
+	if !ok {
+		t.Fatalf("expected the root to stay a plain Aggregate, got %T", out)
+	}
+	if outAgg.Mode != AggModeSimple {
+		t.Errorf("array_agg must not be split: Mode = %v, want AggModeSimple", outAgg.Mode)
+	}
+	if _, isGather := outAgg.Child.(*Gather); !isGather {
+		t.Errorf("expected a Gather directly below the Aggregate, got %T", outAgg.Child)
+	}
+	if !planHasGather(out) {
+		t.Error("expected a Gather somewhere in the plan (scan-level parallelism)")
+	}
+}
+
 // planHasGather reports whether any node in the tree is a Gather.
 func planHasGather(n Node) bool {
 	if n == nil {

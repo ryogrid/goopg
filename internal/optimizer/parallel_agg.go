@@ -84,6 +84,15 @@ func AggregateIsDecomposable(call AggregateCall) bool {
 //
 // An explicit ORDER BY inside the aggregate makes it deterministic again,
 // because the aggregate sorts its own input, so that form is not refused.
+//
+// It has no callers as of M0134-0001 S16. The whole-statement parallel veto
+// in subtreeHasUnsafeNode that used to call it was deleted, because PG
+// refuses only the aggregate SPLIT, never scan-level parallelism —
+// postgres/src/backend/optimizer/util/clauses.c max_parallel_hazard_walker
+// has no Aggref order-sensitivity case at all. It is retained for the
+// deferred S10b combine-function work (internal/executor/parallel_agg_combine.go):
+// once array_agg/string_agg become decomposable, this is exactly what will
+// gate splitting an ORDER BY-decorated call.
 func AggregateIsOrderSensitive(call AggregateCall) bool {
 	if len(call.OrderBy) > 0 {
 		return false
