@@ -179,3 +179,7 @@
 2026-08-17T02:13:41+09:00 [RUN]	S1 barrier reached
 2026-08-17T02:51:10+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
 2026-08-17T02:52:51+09:00 [RUN]	log-push: committed + pushed batch logs to origin/dir-compat
+2026-08-18T00:55:18+09:00 [RUN]	start run_id=20260818-005518 sha=7576256c dirty=4 src_fp=3e977621a9415829 stages=preflight,units,race,testport,pgbench,tpch,tpcds,summary
+2026-08-18T00:55:28+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
+2026-08-18T03:43:11+09:00 [RUN]	S1 barrier reached
+2026-08-18T04:20:44+09:00 [RUN]	end status_rc=3 (0 pass / 2 fail / 3 inconclusive) — see summary.md
