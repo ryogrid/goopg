@@ -6522,16 +6522,36 @@ M0119 and M0122's remaining items. Milestone doc:
       `NE_CHECK_TBL`/`NE_INSERT_TBL_CON` hunks gone. Pinned by
       `TestCheckConstraintNotEnforcedSkipsRuntimeEvaluation`. `NOT ENFORCED` on
       **UNIQUE** constraints still diverges — ledgered, different code path.
-      **Next slices (independent, bounded):** Bucket 3 — `DROP`/`RENAME CONSTRAINT` cannot find a
-      NOT NULL constraint by name (`internal/executor/operators_ddl.go:10719` never
-      consults `tbl.NotNullConstraints`; **confirm the RENAME sibling before briefing** —
-      Hard-won Rule #2); Bucket 6 — `ALTER CONSTRAINT … NOT VALID/INHERIT/NO INHERIT`
-      unparsed. **Not slices:** Bucket 4 (statement-level/deferred UNIQUE checking for
-      self-referencing UPDATE permutations) and Bucket 5 (missing GiST `circle_ops`
-      default opclass) are milestone-sized. **Do not brief Bucket 7** (float8 `DEFAULT`
-      truncation on an omitted column, `a_expr`-vs-`b_expr` DEFAULT grammar, `currval()`
-      default ordering) — root cause is not pinned; it needs another research pass on the
-      missing-column catalog-default fill path.
+      **Bucket 3 LANDED 2026-08-18**: `DROP CONSTRAINT` / `RENAME CONSTRAINT` now resolve
+      named NOT NULL constraints. The Rule-#2 sibling check came back **positive** — the
+      RENAME path is an inline `case parser.AlterTableRenameConstraint:`
+      (`operators_ddl.go:8796`) that already *referenced* `NotNullConstraints` in its
+      `constraintNameInUse` helper while its own resolution chain skipped them. Child
+      recursion matches by **column name**, not constraint name (`tablecmds.c:14251-14255`).
+      Diff 1465 → **1431** lines (hunks 31 → 33 — an unmasking).
+      **Bucket 6 LANDED 2026-08-18** — and its premise was wrong: `ALTER CONSTRAINT` was
+      never a blanket parse error (`[NOT] DEFERRABLE` / `[NOT] ENFORCED` already worked).
+      Only `NOT VALID` (parser-only — PG raises it in the **grammar action**,
+      `gram.y:2672-2676`, `0A000`) and `[NO] INHERIT` (both arms; bare `INHERIT` is its own
+      production `gram.y:2686-2699`, `NO INHERIT` rides `ConstraintAttributeSpec`) were
+      broken. Executor arm mirrors `tablecmds.c:12615-12684` (contype-gated to
+      `CONSTRAINT_NOTNULL`, no-op if already in state, **one-level** child propagation).
+      Sibling check **negative** this time. Diff 1431 → **1411** lines, hunks 33 → **33**.
+      **The flat hunk count is the finding**: both target statements now behave, but every
+      hunk holding them stays open on an unrelated defect — the **bucket-interference**
+      signature (2 ledger rows).
+      **Next slices, re-ranked by that measurement:** (i) the `EXECUTE
+      get_nnconstraint_info(…)` → `(0 rows)` **file-wide masking bug** — cheapest, and it
+      unblocks the observability of several buckets at once; (ii) Bucket 3's leftover NOT
+      NULL inheritance-propagation gap (`operators_ddl.go:4748-4753`). **Not slices:**
+      Bucket 4 (statement-level/deferred UNIQUE checking) is now known to be what caps both
+      Bucket 6 *and* Bucket 2's remaining hunks — goopg builds the unique index immediately
+      for `UNIQUE … DEFERRABLE INITIALLY DEFERRED`, so `unique_tbl_i_key` never exists —
+      but it is still milestone-sized and needs its own research pass; Bucket 5 (missing
+      GiST `circle_ops` default opclass) likewise. **Do not brief Bucket 7** (float8
+      `DEFAULT` truncation on an omitted column, `a_expr`-vs-`b_expr` DEFAULT grammar,
+      `currval()` default ordering) — root cause is not pinned; it needs another research
+      pass on the missing-column catalog-default fill path.
 - [ ] **M0134-0006 — copy.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
 - [ ] **M0134-0007 — copy2.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
 - [ ] **M0134-0008 — create_index.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.

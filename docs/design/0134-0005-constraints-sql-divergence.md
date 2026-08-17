@@ -175,13 +175,84 @@ were already absent from the pre-existing `DROP NOT NULL <col>` path, so
 implementing them here would have fixed a different bug than the one briefed.
 Ledgered.
 
-## 6. Next slice for this case
+## 6. Bucket 6 — `ALTER CONSTRAINT … NOT VALID / [NO] INHERIT` (LANDED 2026-08-18)
 
-Bucket 6 (`ALTER TABLE … ALTER CONSTRAINT <name> NOT VALID / INHERIT / NO INHERIT`
-is a parse error) — the smallest remaining, and Bucket 3's unmasking just made two
-of its hunks visible, so it now has more measurable upside than when it was sized.
-Bucket 3's leftover NOT NULL inheritance-propagation gap (above) is the other
-candidate and is the better one if Bucket 6's parser work turns out to need a
-matching executor arm. Buckets 4 and 5 need their own milestones. Bucket 7 still
-needs a research pass before it can be briefed at all — its root cause is not
-pinned.
+**The bucket's own premise was wrong and the research pass corrected it.** Bucket 6
+was sized as "`ALTER TABLE … ALTER CONSTRAINT` is a parse error". It is not:
+`parseAlterConstraintAttrs` (`internal/parser/ddl.go:2925`) has handled
+`[NOT] DEFERRABLE [INITIALLY …]` and `[NOT] ENFORCED` since an earlier slice, and
+`execAlterTableAlterConstraint` (`internal/executor/operators_ddl.go:10996`) carries
+real FK deferrability/enforceability logic — not an accept-and-ignore stub. Only two
+spellings were genuinely broken, and they need *different* amounts of work:
+
+1. **`NOT VALID` is parser-only.** PG rejects it **in the grammar action**, not the
+   executor: `postgres/src/backend/parser/gram.y:2656-2685` special-cases
+   `CAS_NOT_VALID` at `:2672-2676` with
+   `ereport(ERROR, ERRCODE_FEATURE_NOT_SUPPORTED, "constraints cannot be altered to
+   be NOT VALID")`. goopg reached the generic trailing-token error
+   (`internal/parser/parser.go:169-189`) instead. Fixed at the `ALTER CONSTRAINT`
+   dispatch site (`ddl.go:8892-8931`), which detects the `NOT VALID` that
+   `parseAlterConstraintAttrs` deliberately leaves unconsumed (its comment at
+   `:2916-2920`) and raises `0A000` with PG's exact text. **Verified byte-exact** —
+   that statement's three output lines are now pure diff context.
+2. **`[NO] INHERIT` needed both arms.** A grammar asymmetry drives the shape: bare
+   `INHERIT` is its **own production** (`gram.y:2686-2699`) and is mutually exclusive
+   with other attributes, while `NO INHERIT` arrives through
+   `ConstraintAttributeSpec` (`gram.y:6249`). goopg mirrors that split — `NO INHERIT`
+   inside `parseAlterConstraintAttrs`, bare `INHERIT` at the dispatch site — with new
+   `AlterConstraintNoInherit` / `AlterConstraintHasInheritability` fields on
+   `AlterTableAction` following the file's existing `Has*` tri-state convention.
+   `catalog.NotNullConstraint.NoInherit` (`internal/catalog/catalog.go:244`) already
+   existed, so this is a toggle path, not a data-model change. The executor arm
+   (`execAlterConstraintInheritability`) mirrors
+   `tablecmds.c:12615-12684 ATExecAlterConstrInheritability`: contype-gated to
+   `CONSTRAINT_NOTNULL` (`tablecmds.c:12198-12334`), 42704 for an unknown name,
+   **no-op when already in the requested state**, and propagation to children that is
+   **one level, not recursive** — matched by column name, per Bucket 3's precedent.
+   Durability rides `resyncNotNullCatalogHeap`, the Bucket 3 heap-resync pattern.
+
+**Sibling check (Rule #2) came back negative this time**, and that is worth
+recording because Bucket 3's came back positive: the third constraint-attribute
+acceptor — `AlterTableAddNotNull`'s inline `NOT NULL <col> NOT VALID NO INHERIT`
+form (`ddl.go:9859-9892`, exercised at `constraints.sql:831`) — is genuinely
+independent code on a different dispatch branch with different AST fields, and
+already wires `NoInherit` end to end. Traced, not grepped.
+
+**Measured effect:** `scripts/pg-regress-runner.sh constraints` 1431 → **1411**
+lines, hunks **33 → 33**. Neither a plain shrink nor an unmasking: both target
+statements now behave, but every hunk containing them stays open on a *different*,
+pre-existing defect. This is the bucket-interference signature and it is the main
+lesson of this slice — **a bucket's measurable upside can be capped by an unrelated
+bug sharing its hunk**:
+- the `NOT VALID` hunk survives because the two lines above it
+  (`ALTER CONSTRAINT unique_tbl_i_key ENFORCED / NOT ENFORCED`) diverge for a reason
+  that has nothing to do with `ALTER CONSTRAINT` — `unique_tbl_i_key` never gets
+  created, since `ADD CONSTRAINT … UNIQUE (i) DEFERRABLE INITIALLY DEFERRED` fails
+  with `could not create unique index … Key (i)=(3) is duplicated`. goopg builds the
+  index immediately instead of deferring the uniqueness check to commit — that is
+  **Bucket 4's** defect, and it also invalidates the Bucket 2 ledger row's assumption
+  that those two hunks were waiting on UNIQUE enforceability.
+- both `[NO] INHERIT` hunks survive because every
+  `EXECUTE get_nnconstraint_info(…)` in this file returns `(0 rows)` in goopg — a
+  file-wide masking bug (ledgered) that hides the state assertions this bucket would
+  otherwise have proved.
+
+**Deliberately not done:** PG's non-topmost / partition-child `ALTER CONSTRAINT`
+refusal (`tablecmds.c:12275-12317`) — goopg has no `ALTER CONSTRAINT`
+partition-recursion story at all, so it is a milestone, not this slice. Ledgered
+along with the `get_nnconstraint_info` masking bug and the newly surfaced
+`would be inherited from more than once` divergence.
+
+## 7. Next slice for this case
+
+**Bucket 4 is now the highest-value target**, promoted by this loop's measurement:
+its deferred-UNIQUE defect is what caps Bucket 6's *and* (contrary to that row's
+stated assumption) Bucket 2's remaining hunks. It is still milestone-sized —
+statement-level/deferred UNIQUE checking is a real executor feature — so it needs a
+research pass and its own decomposition, not a direct brief.
+
+Cheaper alternatives, in order: the `get_nnconstraint_info` `(0 rows)` masking bug
+(file-wide; unblocks the *observability* of several buckets at once and is the single
+highest hunk-per-effort item if it is a shallow catalog-query gap); then Bucket 3's
+leftover NOT NULL inheritance-propagation gap. Bucket 5 (GiST `circle_ops`) is a
+milestone. **Bucket 7 still has no pinned root cause — do not brief from it.**

@@ -10998,6 +10998,16 @@ func (o *ddlOp) execAlterTableAlterConstraint(tbl *catalog.Table, act parser.Alt
 		if !strings.EqualFold(tbl.ForeignKeys[i].Name, act.ConstraintName) {
 			continue
 		}
+		// Inheritability only applies to NOT NULL constraints — a FOREIGN KEY
+		// match here means the wrong object type (tablecmds.c
+		// ATExecAlterConstraint ~12259-12264, ERRCODE_WRONG_OBJECT_TYPE).
+		if act.AlterConstraintHasInheritability {
+			return &ExecError{
+				Code:    "42809",
+				Pos:     act.Pos(),
+				Message: fmt.Sprintf("constraint %q of relation %q is not a not-null constraint", act.ConstraintName, tbl.Name),
+			}
+		}
 		if act.AlterConstraintHasDeferrability {
 			tbl.ForeignKeys[i].Deferrable = act.AlterConstraintDeferrable
 			tbl.ForeignKeys[i].InitiallyDeferred = act.AlterConstraintInitiallyDeferred
@@ -11029,10 +11039,14 @@ func (o *ddlOp) execAlterTableAlterConstraint(tbl *catalog.Table, act parser.Alt
 		}
 		return nil
 	}
-	// The name exists but names a non-FK constraint: real PG reports a
-	// type-specific 42809 depending on which attribute class was requested
-	// (ATExecAlterConstraint, tablecmds.c ~12249/12254).
-	if o.nonFKConstraintExists(tbl, act.ConstraintName) {
+	// NOT NULL constraints — the only kind AlterConstraintHasInheritability
+	// (INHERIT / NO INHERIT) may legally target (tablecmds.c
+	// ATExecAlterConstrInheritability, PG18+). DEFERRABLE/ENFORCED remain
+	// FK-only, mirroring the FK branch above. M0134-0005 S05.
+	for i := range tbl.NotNullConstraints {
+		if !strings.EqualFold(tbl.NotNullConstraints[i].Name, act.ConstraintName) {
+			continue
+		}
 		if act.AlterConstraintHasDeferrability {
 			return &ExecError{
 				Code:    "42809",
@@ -11040,10 +11054,42 @@ func (o *ddlOp) execAlterTableAlterConstraint(tbl *catalog.Table, act parser.Alt
 				Message: fmt.Sprintf("constraint %q of relation %q is not a foreign key constraint", act.ConstraintName, tbl.Name),
 			}
 		}
-		return &ExecError{
-			Code:    "42809",
-			Pos:     act.Pos(),
-			Message: fmt.Sprintf("cannot alter enforceability of constraint %q of relation %q", act.ConstraintName, tbl.Name),
+		if act.AlterConstraintHasEnforceability {
+			return &ExecError{
+				Code:    "42809",
+				Pos:     act.Pos(),
+				Message: fmt.Sprintf("cannot alter enforceability of constraint %q of relation %q", act.ConstraintName, tbl.Name),
+			}
+		}
+		if act.AlterConstraintHasInheritability {
+			return o.execAlterConstraintInheritability(tbl, i, act)
+		}
+		return nil
+	}
+	// The name exists but names a non-FK, non-NOT-NULL constraint (CHECK,
+	// PRIMARY KEY, UNIQUE): real PG reports a type-specific 42809 depending on
+	// which attribute class was requested (ATExecAlterConstraint,
+	// tablecmds.c ~12249/12254/12259-12264).
+	if o.nonFKConstraintExists(tbl, act.ConstraintName) {
+		switch {
+		case act.AlterConstraintHasDeferrability:
+			return &ExecError{
+				Code:    "42809",
+				Pos:     act.Pos(),
+				Message: fmt.Sprintf("constraint %q of relation %q is not a foreign key constraint", act.ConstraintName, tbl.Name),
+			}
+		case act.AlterConstraintHasInheritability:
+			return &ExecError{
+				Code:    "42809",
+				Pos:     act.Pos(),
+				Message: fmt.Sprintf("constraint %q of relation %q is not a not-null constraint", act.ConstraintName, tbl.Name),
+			}
+		default:
+			return &ExecError{
+				Code:    "42809",
+				Pos:     act.Pos(),
+				Message: fmt.Sprintf("cannot alter enforceability of constraint %q of relation %q", act.ConstraintName, tbl.Name),
+			}
 		}
 	}
 	return &ExecError{
@@ -11051,6 +11097,110 @@ func (o *ddlOp) execAlterTableAlterConstraint(tbl *catalog.Table, act parser.Alt
 		Pos:     act.Pos(),
 		Message: fmt.Sprintf("constraint %q of relation %q does not exist", act.ConstraintName, tbl.Name),
 	}
+}
+
+// execAlterConstraintInheritability handles `ALTER TABLE t ALTER CONSTRAINT
+// name [NO] INHERIT` for the NOT NULL constraint at tbl.NotNullConstraints[i]
+// (tablecmds.c ATExecAlterConstraint's coninhcount guard plus
+// ATExecAlterConstrInheritability, PG18+). Propagation to inheritance
+// children is exactly one level, not recursive (ATExecAlterConstrInheritability
+// only walks find_inheritance_children(rel) once, tablecmds.c:12644-12678) —
+// matches PG's own semantics, since further-nested grandchildren keep
+// whatever coninhcount/conislocal they already have. M0134-0005 S05.
+func (o *ddlOp) execAlterConstraintInheritability(tbl *catalog.Table, i int, act parser.AlterTableAction) error {
+	nc := &tbl.NotNullConstraints[i]
+	// Refuse NO INHERIT on a constraint still enforced by a parent
+	// (coninhcount > 0) — ATExecAlterConstraint, tablecmds.c:12266-12273,
+	// ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE (55000). Checked BEFORE the
+	// no-op test below, matching PG's own ordering (the guard fires on
+	// currcon->coninhcount regardless of the current connoinherit value).
+	if act.AlterConstraintNoInherit && nc.InhCount > 0 {
+		return &ExecError{
+			Code:    "55000",
+			Pos:     act.Pos(),
+			Message: fmt.Sprintf("cannot alter inherited constraint %q on relation %q", act.ConstraintName, tbl.Name),
+		}
+	}
+	// Already in the requested state: silent no-op, no catalog write
+	// (ATExecAlterConstrInheritability, tablecmds.c:12635-12636).
+	if nc.NoInherit == act.AlterConstraintNoInherit {
+		return nil
+	}
+	nc.NoInherit = act.AlterConstraintNoInherit
+	colName := nc.ColName
+	if err := o.resyncNotNullCatalogHeap(tbl); err != nil {
+		return err
+	}
+	// Propagate one level to inheritance children (tablecmds.c:12644-12678),
+	// matched by COLUMN NAME like the rest of the NOT NULL inheritance
+	// machinery (dropconstraint_internal's own comment at tablecmds.c:14251-
+	// 14255: "we search for not-null constraints by column name").
+	im, isIM := o.ctx.Catalog.(*catalog.InMemory)
+	if !isIM {
+		return nil
+	}
+	for _, childTbl := range im.InheritanceChildren(tbl.OID) {
+		found := false
+		for j := range childTbl.NotNullConstraints {
+			if !strings.EqualFold(childTbl.NotNullConstraints[j].ColName, colName) {
+				continue
+			}
+			found = true
+			if act.AlterConstraintNoInherit {
+				// NO INHERIT: the child's copy stops being enforced by this
+				// parent — decrement coninhcount and mark it locally-owned
+				// (ATExecAlterConstrInheritability's noinherit branch,
+				// tablecmds.c:12656-12667).
+				if childTbl.NotNullConstraints[j].InhCount > 0 {
+					childTbl.NotNullConstraints[j].InhCount--
+				}
+				childTbl.NotNullConstraints[j].IsLocal = true
+			} else {
+				// INHERIT: re-establish the parent's enforcement
+				// (ATExecSetNotNull's recursing=true "found" branch,
+				// tablecmds.c:7962-7972 — increments coninhcount).
+				childTbl.NotNullConstraints[j].InhCount++
+			}
+			break
+		}
+		if !found && !act.AlterConstraintNoInherit {
+			// INHERIT and the child has no copy at all yet: create one
+			// (ATExecSetNotNull's recursing=true "not found" branch,
+			// tablecmds.c:8030-8046 — conislocal=false, coninhcount=1).
+			for ci := range childTbl.Columns {
+				if strings.EqualFold(childTbl.Columns[ci].Name, colName) {
+					childTbl.Columns[ci].NotNull = true
+					break
+				}
+			}
+			childTbl.AddNotNull(nc.Name, colName, im.AllocOID(), false, false, false, 1)
+		}
+		if err := o.resyncNotNullCatalogHeap(childTbl); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// resyncNotNullCatalogHeap re-syncs tbl's catalog heap rows (pg_attribute /
+// pg_constraint) after an in-memory NOT NULL constraint mutation — the same
+// delete-old-rows-then-resync pattern clearNotNullConstraint uses for DROP
+// NOT NULL / DROP CONSTRAINT, so the change survives a restart. M0134-0005
+// S05, per Bucket 3's durability precedent.
+func (o *ddlOp) resyncNotNullCatalogHeap(tbl *catalog.Table) error {
+	if !catalogHeapSyncAvailable(o.ctx) {
+		return nil
+	}
+	if err := o.ctx.MaterializeWriterXID(); err == nil {
+		xmax := o.ctx.Tx.XID
+		for _, dbOid := range tableCatalogDBOids(o.ctx) {
+			deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+		}
+	}
+	if err := syncTableToCatalogHeap(o.ctx, tbl); err != nil {
+		return fmt.Errorf("DDL catalog sync: %w", err)
+	}
+	return nil
 }
 
 // nonFKConstraintExists reports whether tbl has a CHECK, PRIMARY KEY, or

@@ -3395,6 +3395,17 @@ type AlterTableAction struct {
 	AlterConstraintHasDeferrability  bool
 	AlterConstraintEnforced          bool
 	AlterConstraintHasEnforceability bool
+	// AlterConstraintNoInherit/AlterConstraintHasInheritability carry the
+	// `INHERIT` / `NO INHERIT` trailer of ALTER CONSTRAINT (PG18
+	// CONSTRAINT_NOTNULL-only toggle, tablecmds.c
+	// ATExecAlterConstrInheritability): AlterConstraintHasInheritability
+	// records whether the statement named this attribute class at all
+	// (bare INHERIT is its own grammar production, gram.y:2686-2699; NO
+	// INHERIT is part of ConstraintAttributeSpec, gram.y:6249) —
+	// AlterConstraintNoInherit is true for NO INHERIT, false for INHERIT.
+	// M0134-0005 S05.
+	AlterConstraintNoInherit         bool
+	AlterConstraintHasInheritability bool
 }
 
 func (a AlterTableAction) Pos() int { return a.pos }

@@ -2922,7 +2922,7 @@ func (p *parser) parseFKConstraintAttrs() (deferrable, initiallyDeferred, notVal
 // ATAlterConstraint.alterDeferrability/alterEnforceability (tablecmds.c):
 // ALTER CONSTRAINT only touches the attribute(s) actually named. DU-002
 // slice 433.
-func (p *parser) parseAlterConstraintAttrs() (deferrable, initiallyDeferred, enforced, hasDeferrability, hasEnforceability bool) {
+func (p *parser) parseAlterConstraintAttrs() (deferrable, initiallyDeferred, enforced, noInherit, hasDeferrability, hasEnforceability, hasInheritability bool) {
 	for {
 		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot {
 			switch {
@@ -2963,6 +2963,19 @@ func (p *parser) parseAlterConstraintAttrs() (deferrable, initiallyDeferred, enf
 		if p.acceptIdentKeyword("enforced") { // bare ENFORCED
 			enforced = true
 			hasEnforceability = true
+			continue
+		}
+		// NO INHERIT — part of ConstraintAttributeSpec (gram.y:6249, CAS_NO_INHERIT),
+		// unlike bare INHERIT which is its own separate grammar production
+		// (gram.y:2686-2699) handled at the ALTER CONSTRAINT dispatch site before
+		// this function is even called. NO INHERIT toggles a NOT NULL
+		// constraint's connoinherit; the executor gates it to CONSTRAINT_NOTNULL
+		// (tablecmds.c ATExecAlterConstraint ~12259-12264). DU-002 slice 433
+		// follow-up, M0134-0005 S05.
+		if p.acceptIdentKeyword("no") {
+			_ = p.acceptIdentKeyword("inherit")
+			noInherit = true
+			hasInheritability = true
 			continue
 		}
 		break
@@ -8884,7 +8897,37 @@ func (p *parser) parseAlter() (Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
-		deferrable, initiallyDeferred, enforced, hasDeferrability, hasEnforceability := p.parseAlterConstraintAttrs()
+		// Bare `INHERIT` (no NOT) is its own grammar production (gram.y:2686-2699
+		// `ALTER CONSTRAINT name INHERIT`) — NOT part of ConstraintAttributeSpec,
+		// so it cannot combine with DEFERRABLE/ENFORCED/NO INHERIT in the same
+		// statement. M0134-0005 S05.
+		if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "inherit") {
+			p.advance()
+			stmt.Actions = append(stmt.Actions, AlterTableAction{
+				pos:                              nameTok.Pos,
+				Kind:                             AlterTableAlterConstraint,
+				ConstraintName:                   identText(nameTok),
+				AlterConstraintHasInheritability: true,
+				AlterConstraintNoInherit:         false,
+			})
+			return stmt, nil
+		}
+		deferrable, initiallyDeferred, enforced, noInherit, hasDeferrability, hasEnforceability, hasInheritability := p.parseAlterConstraintAttrs()
+		// `NOT VALID` is explicitly rejected by PG's grammar action itself
+		// (gram.y:2672-2676, the CAS_NOT_VALID special case inside the
+		// ConstraintAttributeSpec production) — a parse-time error, before any
+		// executor/catalog involvement. parseAlterConstraintAttrs deliberately
+		// leaves a bare NOT VALID unconsumed (see its doc comment) so this is
+		// the only place that needs to recognize it. M0134-0005 S05.
+		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot &&
+			p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "valid") {
+			return nil, &SyntaxError{
+				Pos:     p.cur().Pos,
+				Message: "constraints cannot be altered to be NOT VALID",
+				Raw:     true,
+				Code:    "0A000",
+			}
+		}
 		stmt.Actions = append(stmt.Actions, AlterTableAction{
 			pos:                              nameTok.Pos,
 			Kind:                             AlterTableAlterConstraint,
@@ -8894,6 +8937,8 @@ func (p *parser) parseAlter() (Stmt, error) {
 			AlterConstraintHasDeferrability:  hasDeferrability,
 			AlterConstraintEnforced:          enforced,
 			AlterConstraintHasEnforceability: hasEnforceability,
+			AlterConstraintNoInherit:         noInherit,
+			AlterConstraintHasInheritability: hasInheritability,
 		})
 		return stmt, nil
 	}
