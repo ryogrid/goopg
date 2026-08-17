@@ -1255,10 +1255,24 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	// query_planner — planner.c:1617). On a rewrite the Result is returned
 	// directly (same early-return pattern as tryPromoteAggSublink above); on a
 	// rejection we fall through to the ordinary Aggregate path untouched.
+	//
+	// S19 (M0134-0001): ORDER BY / SELECT DISTINCT are no longer gated inside
+	// rewriteMinMaxAggregates (PG's planagg.c doesn't gate on them either —
+	// see the comment there). wrapMinMaxOrderByDistinct re-attaches the
+	// equivalent Sort/Distinct wrap, mirroring the shared ORDER BY sort build
+	// (~1428-1518 below) and the plain-DISTINCT Unique wrap (~1824-1855
+	// below) so the executed semantics stay identical to the un-rewritten
+	// Aggregate path. If any ORDER BY item can't be resolved against the
+	// rewritten output (or the query is DISTINCT ON), wrapMinMaxOrderByDistinct
+	// declines (ok=false) and we fall through to the ordinary Aggregate path —
+	// the escape hatch: a declined rewrite is always correct, a wrong wrap is
+	// not.
 	if rewritten, ok, err := rewriteMinMaxAggregates(s, ctx, cat); err != nil {
 		return nil, err
 	} else if ok {
-		return rewritten, nil
+		if wrapped, wrapOK := wrapMinMaxOrderByDistinct(s, rewritten, cat); wrapOK {
+			return wrapped, nil
+		}
 	}
 
 	var agg *aggregateSurface
@@ -8836,12 +8850,18 @@ func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.
 // Aggregate path byte-identical. Only min() (ASC sortop) is rewritten; max()
 // (the DESC/Backward half) is Slice 2 and explicitly rejected.
 func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat catalog.Catalog) (Node, bool, error) {
-	// Gating, mirroring planagg.c:87-137. Also reject ORDER BY / LIMIT /
-	// OFFSET / DISTINCT because planSelect applies those ABOVE the point this
-	// hook early-returns; a rewritten Result would silently skip them.
+	// Gating, mirroring planagg.c:87-137. Also reject LIMIT / OFFSET because
+	// planSelect applies those ABOVE the point this hook early-returns; a
+	// rewritten Result would silently skip them. ORDER BY and SELECT DISTINCT
+	// are NOT gated here (M0134-0001 S19): planagg.c never inspects
+	// sortClause/distinctClause — they run in the SAME generic
+	// grouping_planner tail regardless of aggregation strategy
+	// (planner.c:1611-1618 vs ~1670-1855) — so the call site
+	// (wrapMinMaxOrderByDistinct, below planSelect's rewrite call) re-attaches
+	// the equivalent Sort/Distinct wrap around the rewritten Result instead.
 	if s.With != nil || len(s.GroupBy) > 0 || s.GroupingSets != nil ||
-		s.Having != nil || len(s.WindowClause) > 0 || s.Distinct ||
-		s.Limit != nil || s.Offset != nil || len(s.OrderBy) > 0 {
+		s.Having != nil || len(s.WindowClause) > 0 ||
+		s.Limit != nil || s.Offset != nil {
 		return nil, false, nil
 	}
 	if len(s.Targets) != 1 {
@@ -9182,6 +9202,127 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 	// single target is the InitPlan value.
 	return &Result{pos: pos, Targets: []Expr{init},
 		schema: Schema{{Name: label, Type: colType}}}, true, nil
+}
+
+// wrapMinMaxOrderByDistinct re-attaches ORDER BY / SELECT DISTINCT around a
+// successful min/max InitPlan rewrite (M0134-0001 S19). PostgreSQL's
+// preprocess_minmax_aggregates never inspects sortClause/distinctClause
+// (postgres/src/backend/optimizer/plan/planagg.c:73-224) — they are consumed
+// by the SAME generic grouping_planner tail regardless of which aggregation
+// strategy was chosen (postgres/src/backend/optimizer/plan/planner.c
+// ~1670-1855), so ORDER BY / DISTINCT are agnostic to the rewrite in
+// PostgreSQL. Mirrors this file's shared ORDER BY sort build (~1428-1518)
+// and the plain-DISTINCT Unique wrap (~1824-1855) — same Sort{pos, Child,
+// Keys} / Distinct{pos, Child, schema} idiom, not a new construction
+// pattern.
+//
+// Escape hatch (mandatory): returns (nil, false) whenever the query cannot
+// be safely wrapped — DISTINCT ON (distinctClause with an ON-list has no
+// equivalent here; it stays on the Aggregate path), or any ORDER BY item
+// that does not resolve to one of the three supported forms (see
+// substituteMinMaxOrderByExpr). The caller then falls through to today's
+// exact (pre-S19) behavior — a declined rewrite is always correct, a wrong
+// wrap is not.
+func wrapMinMaxOrderByDistinct(s *parser.SelectStmt, rewritten Node, cat catalog.Catalog) (Node, bool) {
+	if len(s.DistinctOn) > 0 {
+		return nil, false
+	}
+	if len(s.OrderBy) == 0 && !s.Distinct {
+		return rewritten, true
+	}
+	// The gate (rewriteMinMaxAggregates) already proved len(s.Targets) == 1
+	// and that its Expr is a bare min/max FuncCall — re-extract it here
+	// rather than threading it through the function's return signature.
+	fc, ok := s.Targets[0].Expr.(*parser.FuncCall)
+	if !ok {
+		return nil, false
+	}
+	outSchema := rewritten.Output()
+	if len(outSchema) != 1 {
+		return nil, false
+	}
+	label := outSchema[0].Name
+
+	out := rewritten
+	if len(s.OrderBy) > 0 {
+		orderCtx := newResolveContext(nil, outSchema)
+		orderCtx.cat = cat
+		keys := make([]SortKey, 0, len(s.OrderBy))
+		for _, sb := range s.OrderBy {
+			substituted, ok := substituteMinMaxOrderByExpr(sb.Expr, fc, label)
+			if !ok {
+				return nil, false
+			}
+			e, err := resolveExpr(substituted, orderCtx)
+			if err != nil {
+				return nil, false
+			}
+			keys = append(keys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
+		}
+		out = &Sort{pos: s.Pos(), Child: out, Keys: keys}
+	}
+	if s.Distinct {
+		out = &Distinct{pos: s.Pos(), Child: out, schema: out.Output()}
+	}
+	return out, true
+}
+
+// substituteMinMaxOrderByExpr resolves one ORDER BY item against the output
+// of a min/max InitPlan rewrite. The rewritten plan's output is the InitPlan
+// result column, not the original min/max FuncCall, so each item must be
+// rewritten to reference that output column (an unqualified ColumnRef named
+// `label`). Supports exactly three forms:
+//  1. an ordinal referencing the sole target (`ORDER BY 1`);
+//  2. an expression that IS the target's min/max FuncCall
+//     (`ORDER BY max(unique2)`), matched structurally via parserExprKey —
+//     the same key aggregateSurface uses to bind GROUP BY / aggregate exprs;
+//  3. an expression that CONTAINS the FuncCall as a strict sub-expression
+//     (`ORDER BY max(unique2)+1`), which is substituted in place, keeping
+//     the rest of the expression (and any COLLATE wrapper) intact.
+// Any other shape returns (nil, false) — the escape hatch.
+func substituteMinMaxOrderByExpr(e parser.Expr, fc *parser.FuncCall, label string) (parser.Expr, bool) {
+	if ic, ok := e.(*parser.IntegerConst); ok {
+		if ic.Value == 1 {
+			return &parser.ColumnRef{Column: label}, true
+		}
+		return nil, false
+	}
+	return substituteMinMaxFuncCallSubexpr(e, fc, label)
+}
+
+// substituteMinMaxFuncCallSubexpr recurses through the handful of wrapper
+// node shapes ORDER BY commonly uses over an aggregate call (arithmetic,
+// unary sign, explicit COLLATE), replacing the first structural match of fc
+// with a ColumnRef into the rewritten output. Any node type not explicitly
+// handled here declines rather than guess — the escape hatch in
+// substituteMinMaxOrderByExpr's caller then keeps the ordinary Aggregate
+// path, which is always correct.
+func substituteMinMaxFuncCallSubexpr(e parser.Expr, fc *parser.FuncCall, label string) (parser.Expr, bool) {
+	if parserExprKey(e) == parserExprKey(fc) {
+		return &parser.ColumnRef{Column: label}, true
+	}
+	switch x := e.(type) {
+	case *parser.BinaryOp:
+		if l, ok := substituteMinMaxFuncCallSubexpr(x.Left, fc, label); ok {
+			return &parser.BinaryOp{Op: x.Op, Left: l, Right: x.Right}, true
+		}
+		if r, ok := substituteMinMaxFuncCallSubexpr(x.Right, fc, label); ok {
+			return &parser.BinaryOp{Op: x.Op, Left: x.Left, Right: r}, true
+		}
+		return nil, false
+	case *parser.UnaryOp:
+		if o, ok := substituteMinMaxFuncCallSubexpr(x.Operand, fc, label); ok {
+			return &parser.UnaryOp{Op: x.Op, Operand: o}, true
+		}
+		return nil, false
+	case *parser.CollateExpr:
+		if o, ok := substituteMinMaxFuncCallSubexpr(x.Operand, fc, label); ok {
+			return &parser.CollateExpr{Operand: o, CollationName: x.CollationName}, true
+		}
+		return nil, false
+	default:
+		return nil, false
+	}
 }
 
 // wherePredSafeForIOS reports whether the resolved WHERE qual can be pushed into

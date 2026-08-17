@@ -1319,6 +1319,64 @@ Blast radius is every case emitting a non-Var `Sort Key:`; the direction is
 strictly corrective (goopg under-parenthesises today), but the `HashAggregate`
 carve-out is what keeps it from over-correcting.
 
+## S19 — ORDER BY / SELECT DISTINCT never gated the min/max InitPlan rewrite
+
+Status: landed 2026-08-17. Reopens the S6 (class 4) min/max→InitPlan line that
+S6 Slices 1–3e left with a structural over-refusal.
+
+**The divergence.** goopg's `rewriteMinMaxAggregates`
+(`internal/optimizer/planner.go:8838`) declined the rewrite whenever the query
+carried `ORDER BY`, `SELECT DISTINCT`, `LIMIT`, or `OFFSET`. Its own comment was
+honest about the reason: `planSelect` early-`return`s on a successful rewrite
+(`planner.go:1258-1262`), *above* the shared ORDER BY sort (`~1428-1518`) and the
+plain-DISTINCT `Unique` wrap (`~1824-1855`), so a rewritten `Result` would have
+silently skipped them. The gate was therefore **structural, not semantic** — a
+guard against goopg's own control flow, never a claim about PG.
+
+**What PG actually does.** `preprocess_minmax_aggregates`
+(`postgres/src/backend/optimizer/plan/planagg.c:73-224`) checks only
+`groupClause` / `groupingSets>1` / `hasWindowFuncs` (98-100), `cteList` (108), a
+single-relation jointree (118-136), and `can_minmax_aggs` (143-144). It never
+inspects `sortClause`, `distinctClause`, or `limitCount` — it cannot, because it
+runs from `planner.c:1617-1618` *before* `query_planner()`, while the sort and
+distinct stages of `grouping_planner` run afterwards and identically regardless
+of which aggregation strategy was chosen. ORDER BY and DISTINCT are simply
+agnostic to this optimization in PG.
+
+**The rule adopted.** Drop `s.Distinct` and `len(s.OrderBy) > 0` from the gate;
+re-attach the equivalent nodes at the call site via a new
+`wrapMinMaxOrderByDistinct`, bottom-up `Result → Sort → Distinct`, reusing
+`planSelect`'s own `Sort{pos, Child, Keys}` / `Distinct{pos, Child, schema}`
+idiom rather than a second construction pattern. `LIMIT`/`OFFSET` stay gated
+(not investigated this slice); `len(s.Targets) != 1` stays gated (multi-target
+is a follow-up — see the ledger).
+
+**ORDER BY key resolution.** The rewritten plan outputs the InitPlan result
+column, not the original `max(x)` aggregate, so each ORDER BY item is rewritten
+to reference that column. Three forms are supported: an ordinal (`ORDER BY 1`),
+the exact aggregate `FuncCall` (`ORDER BY max(unique2)`, matched structurally via
+the existing `parserExprKey` — the same key `aggregateSurface` uses), and an
+expression *containing* it (`ORDER BY max(unique2)+1`, substituted in place
+through `BinaryOp`/`UnaryOp`/`CollateExpr` wrappers).
+
+**The escape hatch is the design, not a detail.** Any unresolvable ORDER BY item,
+any unhandled wrapper node type, and `DISTINCT ON` all make
+`wrapMinMaxOrderByDistinct` return `ok=false`, and `planSelect` falls through to
+the pre-S19 Aggregate path. A declined rewrite is always correct; a wrong wrap
+silently drops row order or row uniqueness. This is what let the slice relax a
+correctness-load-bearing gate without a proportional correctness risk — and what
+distinguishes it from Slice 3f, which was reverted for growing the diff.
+
+**Measurement:** `aggregates` **963 → 956 lines, 27 hunks (unchanged)**. The four
+target shapes (`select distinct max(unique2) …`, `… order by 1`,
+`… order by max(unique2)`, `… order by max(unique2)+1`) now produce PG's
+`InitPlan 1 -> Limit -> Index Only Scan Backward … -> Result` shape; what still
+holds those hunks open is pure render cosmetics — `Sort Key: max` vs PG's
+`Sort Key: ((InitPlan 1).col1)`, and goopg's system-wide `Unique` where PG prints
+`HashAggregate / Group Key:`. Every data row printed in the corpus is byte-identical
+before and after, which is the executed-semantics proof. `functional_deps` (56)
+unchanged — the only trustworthy sentinel (see the S18 ledger rows).
+
 ## Cross-case relevance
 
 Every M0134 regress case whose `.sql` emits `EXPLAIN` inherits the formatter
