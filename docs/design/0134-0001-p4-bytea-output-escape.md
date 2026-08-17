@@ -142,3 +142,56 @@ This is an output-encoder fix, so every regress case that sets `bytea_output` or
 prints a bytea inherits it. The regress-runner's `normalise_output()` does not
 collapse these bytes, so unlike the S11 indentation gap this divergence is fully
 visible to the gate.
+
+## Follow-up (2026-08-17, S14): the untyped-literal delimiter, closed
+
+The blocker named above is now fixed, and the fix is *not* in the output layer at
+all — it is an input-coercion gap one stage earlier.
+
+**PG's mechanism.** `string_agg` has two `pg_proc` entries: `(text,text)` (oid
+3538) and `(bytea,bytea)` (oid 3545, `pg_proc.dat:5197`). Once overload
+resolution picks the bytea entry, the parser coerces the untyped second argument
+through the declared parameter type's `typinput` —
+`postgres/src/backend/parser/parse_coerce.c coerce_type`, UNKNOWNOID `Const`
+branch → `byteain`. So `','` becomes the single byte `0x2c` and `'\x41'` becomes
+`0x41`: the escape/hex *input* grammar applies, and the two spellings genuinely
+mean different things.
+
+**goopg's gap.** goopg has no aggregate-argument overload resolution that retypes
+an unknown literal; a bare `','` evaluates to `KindString` unconditionally
+(`internal/executor/expr.go:496`). `accumAgg`'s bytea `string_agg` branch gated
+the delimiter on `dv.Kind == KindBytes`
+(`internal/executor/operators_join_agg.go`), so the literal failed the gate and
+the delimiter was silently dropped — every element concatenated with no
+separator, in hex mode as well as escape mode.
+
+**Fix.** Route the delimiter through the existing `byteaOperand`
+(`internal/executor/bytea.go:319`), which returns `KindBytes` verbatim and runs
+`byteaIn` (goopg's `byteain` port) on `KindString`, reporting `false` — and thus
+keeping today's empty-delimiter behaviour rather than raising — on invalid input.
+One site covers both accumulation paths: the streaming concatenation and the
+`ORDER BY` path both read the same `delimRaw`, and `finishAgg`'s reassembly
+consumes `st.strDelims` captured here. `finishAgg`'s `byteaOutMode` render
+dispatch (S12) is untouched.
+
+**Why the seam is accumAgg and not the planner.** goopg types a string literal
+`unknown` only for comparisons and assignments
+(`internal/analyzer/analyzer.go:1143`), never for aggregate-argument dispatch, so
+there is no earlier point at which the declared parameter type is known. Adding
+one would be aggregate overload resolution — a much larger change than this
+divergence justifies. `byteaOperand` is the same seam the bytea *operators*
+already use, so the coercion rule stays in one place.
+
+**Measurement.** `aggregates` **1079 → 1029 lines** (hunk count 29 → 30: closing
+the value mismatch split one region, but 50 diff lines went away). The
+`v_pagg_test` row that carried `string_agg(x::text::bytea, ',')` is now an
+unchanged context line — including its `bmin`/`bmax` columns, which resolves the
+"min/max renders hex despite escape" suspicion raised during research as a
+downstream symptom of the same dropped delimiter, not a separate gap. Sentinels
+byte-identical: `functional_deps` 56, `groupingsets` 2373. Remaining hunks in
+that region are `EXPLAIN` plan-shape only (parallel-aggregation nodes goopg does
+not emit).
+
+The five raw-bytes sites (`concat`, `format('%s',…)`, `quote_literal`,
+`array_agg`, `ARRAY[…::bytea]`) recorded by the second S12 ledger row are
+untouched and remain open.

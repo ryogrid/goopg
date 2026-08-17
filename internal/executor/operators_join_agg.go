@@ -2866,25 +2866,26 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 		// stayed hex forever regardless of the GUC. That specific case is
 		// fixed by this slice (verified: `1,2,3`, not `\x313233`).
 		//
-		// What this slice does NOT fix: the delimiter check below
-		// (`dv.Kind == KindBytes`) still silently drops an UNTYPED literal
-		// delimiter — `string_agg(x::text::bytea, ',')` with no `::bytea`
-		// cast on the delimiter, which is exactly what aggregates.sql's
-		// pagg_test/v_pagg_test view uses. That concatenates every element
-		// with NO separator regardless of `bytea_output` (confirmed present
-		// on HEAD under hex mode too — `\x313233...`, not `\x31,2c,32,...` —
-		// so it predates this slice and is not a regression). Fixing the
-		// untyped-literal-to-bytea coercion is out of scope here: it would
-		// also change HEX-mode output, which this slice must leave
-		// byte-identical to HEAD. Recorded in the deferral ledger by the
-		// coordinator rather than fixed in place.
+		// The delimiter itself is coerced through byteaOperand, which mirrors
+		// PG's `parse_coerce.c coerce_type` UNKNOWNOID-Const branch: once
+		// overload resolution locks in `string_agg(bytea,bytea)` (pg_proc oid
+		// 3545), an untyped literal delimiter like `','` (no `::bytea` cast)
+		// is run through the target type's typinput (`byteain`) rather than
+		// dropped. goopg has no per-overload aggregate-arg dispatch to do this
+		// at analyze time, so it happens here at accumulation time instead,
+		// using the same `byteaOperand` helper already shared by other bytea
+		// operator sites (M0125-0021). An invalid-bytea-input delimiter keeps
+		// today's behaviour (empty separator, no error) per byteaOperand's
+		// contract, matching how those sibling sites already handle it.
 		if arg.Kind == KindBytes {
 			raw := string(arg.BytesValue())
 			delimRaw := ""
 			if call.Arg2 != nil {
 				dv, _ := evalExprSlot(call.Arg2, slot, o.ctx)
-				if !dv.IsNull() && dv.Kind == KindBytes {
-					delimRaw = string(dv.BytesValue())
+				if !dv.IsNull() {
+					if b, ok := byteaOperand(dv); ok {
+						delimRaw = string(b)
+					}
 				}
 			}
 			st.boolResult = true // bytea mode flag
