@@ -1,63 +1,53 @@
-# Working set — M0134-0005 Bucket 4 core fix landed; next is the exposed index-build defect
+# Working set — M0134-0005c landed; Bucket 4 is CLOSED as a line driver
 
-**Task:** M0134-0005 (`constraints.sql`) — **M0134-0005b landed and pushed**
-(`7ac8c177`). Sub-item `[x]`, parent case stays `[ ]`. Selected per the Current
-Priority banner (M0134 next after M-NIGHTLY). M-NIGHTLY drained:
-`ci/logs/action-items.md` still at run `20260818-005518`, **items: 0** — nothing to
-file.
+**Task:** M0134-0005 (`constraints.sql`) — **M0134-0005c landed**. Sub-item `[x]`,
+parent case stays `[ ]`. Selected per the Current Priority banner (M0134 next after
+M-NIGHTLY). M-NIGHTLY drained: `ci/logs/action-items.md` still at run
+`20260818-005518`, **items: 0** — nothing to file.
 
-**What landed:** goopg had TWO unique check-timing tiers where PG has THREE. PG sets
-`pg_index.indimmediate=false` for **every** deferrable index regardless of INITIALLY
-mode (`catalog/index.c:2080-2082`); only the recheck *timing* differs.
-`uniqueCheckDeferred` now answers only "needs a partial check?" (explicit-txn gate
-**removed**); new `uniqueCheckDeferToCommit` holds the old resolver; queue entries
-carry a `DeferToCommit` tier tag (plain-key **and** NND twin); new
-`RunStmtEndDeferredUniqueChecks` drains the non-commit tier. Files:
-`internal/executor/{deferred_unique.go,session.go}`,
-`internal/postmaster/{dispatch.go,dispatch_extended.go}`,
-`internal/testport/deferred_unique_stmt_end_e2e_test.go` (5 tests).
+**The headline is a refuted hypothesis.** Loop #18's §10.4 guess ("the build scan
+counts dead row versions") was **REFUTED by direct probe** — a plain committed UPDATE
+leaving superseded versions behind provokes nothing. The real trigger is the
+**preceding `BEGIN; UPDATE …; ROLLBACK;`** block. Three DDL bulk scans in
+`internal/executor/operators_ddl.go` decided liveness structurally
+(`Xmin==Invalid ⇒ dead`, `Xmax!=Invalid ⇒ dead`), never consulting abort status, so
+after an aborted UPDATE they got liveness wrong **in both directions**: the real row
+(aborted xmax) dropped, the phantom `i=1` (aborted xmin) kept. Fix: `collectBTreeEntries`
+(~:11890), `forEachLiveRow` (~:11261), `validateFKConstraintExistingRows` (~:11396) now
+call the **pre-existing** `isLiveForUniqueCheck` (`operators_storage.go:8767-8832`) —
+no new predicate, no ctx threading.
 
 **Two things worth not re-deriving:**
-1. **Bucket 4's "MILESTONE" sizing in §2 was wrong** — the machinery already existed
-   (M0119-0004). Size buckets from the existing code, not the symptom.
-2. **The dispatch twins were NOT symmetric.** Extended-protocol out-of-block
-   `Execute` commits via `ectx.CommitTransaction` (`internal/executor/context.go:1030`),
-   a bare `TxnMgr.Commit` with **no** deferred drain. UNIQUE is wired there now; **FK
-   and EXCLUDE still are not** — silent uncaught violations for prepared-statement
-   clients (ledgered, real bug).
+1. **Twice now the doc's own guess was wrong** (0005b: Bucket 4 mis-sized as a
+   milestone; 0005c: dead-versions hypothesis). **Probe empirically before briefing.**
+   The brief that demanded a live-server probe is what caught it.
+2. **`ADD CONSTRAINT … UNIQUE` and `CREATE UNIQUE INDEX` are ONE path** (both via
+   `bulkBuildBTreeFull` → `collectBTreeEntries`) — measured, not assumed.
+   `backfillBTree` (~:12040) keeps the inverted check but has **zero callers** (ledgered).
 
-**Measured:** 1376 → **1299** lines (−77), hunks 34 → **36** (unmasking split).
-`timeout 300 scripts/pg-regress-runner.sh --verbose constraints`; artifact
+**Measured:** 1299 → **1251** lines (−48), hunks 36 → **35**; the
+`could not create unique index`/`is duplicated` error class is **gone from the diff
+entirely**. `timeout 300 scripts/pg-regress-runner.sh --verbose constraints`; artifact
 `tmp/regress-diffs/constraints.diff`. **Never compare to a pre-2026-08-18 number.**
 
-**Do not misread the raw diff** (§10.3): the "9 rows vs expected 5, no error" block is
-a **cascade** of `unique_tbl_i_key` never being created, NOT a data-integrity
-regression — with no constraint, those duplicates are legitimately unconstrained.
+**Next step:** **Bucket 4 is no longer this file's dominant line driver** — size the
+next slice from the hunk classification, not the residual count. Cheapest next:
+research slices 3 and 4 (`UNIQUE ENFORCED` grammar rejection; `ALTER CONSTRAINT …
+ENFORCED` contype gate) — **slice 4's block on §10.4 is now lifted**. Then Bucket 3's
+NOT NULL inheritance leftover, CHECK-constraint inheritance naming, and COPY FROM not
+rejecting bad rows. **Bucket 5 (GiST `circle_ops`) is a real milestone; do not brief
+Bucket 7.**
 
-**Next step:** **M0134-0005c** — `ADD CONSTRAINT … UNIQUE (i) DEFERRABLE INITIALLY
-DEFERRED` fails `Key (i)=(1) is duplicated` while the preceding `SELECT *` matches PG
-byte-for-byte. **Hypothesis, UNCONFIRMED: the eager validate-then-build scan counts
-dead row versions** (the `UPDATE i=i+1` now succeeds and leaves old versions behind —
-exposed by, not caused by, 0005b). **Confirm the hypothesis with a targeted probe
-before briefing an implementer** (UPDATE a row, then ADD CONSTRAINT UNIQUE on an
-untouched column). Resume: `internal/executor/operators_ddl.go:11969` / `:12016` vs
-PG's MVCC-aware `catalog/index.c:index_build` → `IndexBuildHeapScan`. It caps the rest
-of Bucket 4. After that: research slices 3/4 (`UNIQUE ENFORCED` grammar rejection;
-`ALTER CONSTRAINT … ENFORCED` contype gate), then Bucket 3's NOT NULL inheritance
-leftover. ~20 of the 36 hunks are untouched by Bucket 4 — it is no longer the dominant
-line driver. **Bucket 5 (GiST `circle_ops`) is a real milestone; do not brief Bucket 7.**
-
-**Gates run:** 10-test guard 10/10 PASS (3 FAIL-pre/PASS-post via stash);
+**Gates run:** 3 new guards 3/3 PASS (all FAIL-pre/PASS-post, proven by stashing only
+`operators_ddl.go`); `go test ./internal/executor/...` PASS;
 `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
-`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35 — Rule #1); deferred-FK cross-tier
-PASS; pre-commit pgbench smoke PASS (12886 TPS). `make ralph-state-guard` OK after
-self-repair.
+`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35 — Rule #1). Note `cmd/goopg` +
+`internal/initdb` ran cold (cache miss, not a regression signal).
 
-**Delegation:** `tmp/ralph-handoffs/m0134-0005-b4-research/` (researcher
-`a2dc55818f96adfc3`, DONE — the report is excellent, read it before 0005c);
-`tmp/ralph-handoffs/m0134-0005-b4-s1-stmt-end-unique/` (implementer
-`a6cd58aa69aad90b7`, 1 round DONE, no deviations — note its report.md was
-coordinator-transcribed, its own write was tool-blocked); testers
-`a534047298f10d48e` (gates), `a490e2899abc78fec` (re-measure).
+**Delegation:** `tmp/ralph-handoffs/m0134-0005c-index-build-liveness/` (researcher
+`a9ae16725b1e263b7`, DONE — the probe report is the reason this loop found the real
+cause); `tmp/ralph-handoffs/m0134-0005c-s1-ddl-scan-liveness/` (implementer
+`ae8d79a83349fcea2`, 1 round DONE, no deviations; testers `a10b9a35c7f808053` gates,
+`a9ee31b7f6355cd1f` re-measure).
 
 **In-flight:** none.

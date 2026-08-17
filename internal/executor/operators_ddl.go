@@ -11258,7 +11258,8 @@ func (o *ddlOp) forEachLiveRow(tbl *catalog.Table, fn func(row Row) error) error
 			if terr != nil {
 				continue
 			}
-			if tuple.Header.Xmin == storage.InvalidTransactionID || tuple.Header.Xmax != storage.InvalidTransactionID {
+			// Abort-aware liveness — see collectBTreeEntries. M0134-0005c.
+			if !isLiveForUniqueCheck(o.ctx, tuple.Header.Xmin, tuple.Header.Xmax) {
 				continue
 			}
 			if scanRow == nil || len(scanRow) != len(tbl.Columns) {
@@ -11393,7 +11394,8 @@ func (o *ddlOp) validateFKConstraintExistingRows(fkOwnerTbl *catalog.Table, fk c
 			if terr != nil {
 				continue
 			}
-			if tuple.Header.Xmin == storage.InvalidTransactionID || tuple.Header.Xmax != storage.InvalidTransactionID {
+			// Abort-aware liveness — see collectBTreeEntries. M0134-0005c.
+			if !isLiveForUniqueCheck(o.ctx, tuple.Header.Xmin, tuple.Header.Xmax) {
 				continue
 			}
 			if scanRow == nil || len(scanRow) != len(fkOwnerTbl.Columns) {
@@ -11887,7 +11889,14 @@ func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols
 			if err != nil {
 				continue
 			}
-			if tuple.Header.Xmin == storage.InvalidTransactionID || tuple.Header.Xmax != storage.InvalidTransactionID {
+			// Abort-aware liveness (not the naive Xmin-valid/Xmax-invalid
+			// structural test): an aborted xmin's tuple is dead even though
+			// Xmin is non-invalid, and a tuple whose xmax belongs to an
+			// aborted transaction is still live. PG oracle:
+			// heapam_visibility.c:1205 HeapTupleSatisfiesVacuumHorizon,
+			// consumed by heapam_handler.c:1415 heapam_index_build_range_scan.
+			// M0134-0005c.
+			if !isLiveForUniqueCheck(o.ctx, tuple.Header.Xmin, tuple.Header.Xmax) {
 				continue
 			}
 			// M0054-0005c: reuse a per-CREATE-INDEX decode buffer to

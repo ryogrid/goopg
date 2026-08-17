@@ -474,34 +474,113 @@ Two results that look alarming in the raw diff and are **not** what they appear:
   prediction that this statement would need no code change once the enqueue gate was
   fixed is therefore **refuted**.
 
-### 10.4 The newly EXPOSED defect — index build appears to scan non-live tuples
+### 10.4 The newly EXPOSED defect — DDL bulk scans got tuple liveness BACKWARDS (root cause CONFIRMED and FIXED 2026-08-18, M0134-0005c)
 
-**Hypothesis (not yet confirmed — this is the next slice's job, do not treat as
-established):** the index-build uniqueness scan counts dead row versions. Before this
-slice, `UPDATE unique_tbl SET i = i + 1` *failed*, so the table carried no dead
-versions at that point in the file; now it succeeds and leaves the old versions
-behind, and the build scan sees both. That would explain a duplicate `i=1` that no
-MVCC-correct `SELECT` can see.
+**§10.4's original hypothesis — "the build scan counts dead row versions" — is
+REFUTED.** A plain committed `UPDATE` leaving superseded versions behind does *not*
+provoke a spurious duplicate. Probed directly on a live server: `UPDATE p SET j=j+100`
+followed by `ALTER TABLE p ADD CONSTRAINT p_i_key UNIQUE (i)` (and the
+`CREATE UNIQUE INDEX` spelling) both succeed. Dead versions were never the trigger.
 
-This defect is **exposed by, not caused by,** the statement-end tier — but it is now
-the cap on the rest of Bucket 4, exactly as `unique_tbl_i_key`'s absence was before.
-Resume point: the eager validate-then-build scan at
-`internal/executor/operators_ddl.go:11969` / `:12016`; check whether it filters by
-tuple liveness (PG's equivalent build scan is MVCC-aware —
-`postgres/src/backend/catalog/index.c:index_build` → `IndexBuildHeapScan`'s
-`HeapTupleSatisfiesVacuum`/snapshot handling). Ledgered.
+The real trigger is the **`BEGIN; UPDATE …; ROLLBACK;` block that precedes** the
+deferred-constraint block in `constraints.sql` — a statement that fails on a genuine
+duplicate and rolls back. Minimal confirmed reproducer:
 
-### 10.5 Remaining Bucket 4 work, re-scoped
+```sql
+CREATE TABLE ut4 (i int UNIQUE DEFERRABLE, t text);
+INSERT INTO ut4 VALUES (0,'one'),(1,'two'),(2,'tree'),(3,'four'),(4,'five');
+BEGIN; UPDATE ut4 SET i = 1 WHERE i = 0;   -- fails (real dup)
+ROLLBACK;
+UPDATE ut4 SET i = i + 1;                  -- succeeds; SELECT * correctly shows 1..5
+ALTER TABLE ut4 DROP CONSTRAINT ut4_i_key;
+ALTER TABLE ut4 ADD CONSTRAINT ut4_i_key UNIQUE (i) DEFERRABLE INITIALLY DEFERRED;
+-- goopg (pre-fix): ERROR could not create unique index "ut4_i_key" / Key (i)=(1) is duplicated
+-- PG: succeeds
+```
 
-- **Next slice:** the §10.4 index-build liveness defect. It caps everything else here.
-- Partitioned `parted_uniq_tbl` still diverges two ways, both independent of timing:
-  goopg materializes **1** `pg_constraint` row where PG has **3** (no per-partition
-  unique-constraint catalog rows), and the deferred-violation case enforces correctly
-  but emits the ERROR/`COMMIT` echo in the opposite order. Ledgered separately.
-- Research slices 3 and 4 (the `UNIQUE ENFORCED` / `NOT ENFORCED` grammar rejection,
-  and the `ALTER CONSTRAINT … ENFORCED` contype gate) remain valid small independent
-  slices; slice 4 stays blocked on §10.4 for end-to-end testability.
-- Per the tester's classification, **~20 of the 36 remaining hunks are untouched by
-  Bucket 4 at all** — CHECK-constraint inheritance naming, COPY FROM not rejecting bad
-  rows, the GiST `circle` block (Bucket 5), and the NOT NULL inheritance block
-  (Bucket 3's leftover). Bucket 4 is no longer this file's dominant line driver.
+**Root cause.** Three DDL bulk-scan functions in `internal/executor/operators_ddl.go`
+decided liveness by a purely *structural* test — `Xmin == Invalid ⇒ dead`,
+`Xmax != Invalid ⇒ dead` — that never consulted transaction commit/abort status:
+
+| function | line | scan |
+|---|---|---|
+| `collectBTreeEntries` | ~11890 | index-build key collector |
+| `forEachLiveRow` | ~11261 | generic DDL row iterator |
+| `validateFKConstraintExistingRows` | ~11396 | FK validation scan |
+
+After the aborted UPDATE the page carries two poisoned tuples, and the structural test
+gets liveness wrong **in both directions**: the real `i=0` row now bears a non-invalid
+but *aborted* `xmax` and is wrongly dropped, while the aborted UPDATE's phantom `i=1`
+version bears an *aborted* `xmin` and is wrongly kept. That phantom then collides with
+the legitimate `i=1` the later `UPDATE i=i+1` produces. Nothing prunes it, so the
+poisoning is permanent for that page — every subsequent `CREATE INDEX` /
+`ADD CONSTRAINT` / FK-validate on the table inherits it.
+
+**PG oracle.** `postgres/src/backend/access/heap/heapam_visibility.c:1205`
+`HeapTupleSatisfiesVacuumHorizon`: an xmin that is neither committed, in-progress, nor
+current is "aborted or crashed" ⇒ `HEAPTUPLE_DEAD` (~:1291-1294). That verdict feeds
+`postgres/src/backend/access/heap/heapam_handler.c:1415-1613`
+`heapam_index_build_range_scan`'s `indexIt`/`tupleIsAlive` switch — the structural
+analogue of goopg's scan loop.
+
+**Fix (landed 2026-08-18).** All three sites now call the pre-existing abort-aware
+helper `isLiveForUniqueCheck(ctx, xmin, xmax)`
+(`internal/executor/operators_storage.go:8767-8832`), which already consults
+`ctx.Snap.HasAborted` / `ctx.TxnMgr.HasAbortedXID` and was already used at 6+
+INSERT/UPDATE-time call sites — it was simply never wired into the DDL scans. No new
+liveness predicate was written; all three call sites already had `o.ctx` in scope, so
+no parameter threading was needed.
+
+**On Rule #2 (sibling paths).** `ADD CONSTRAINT … UNIQUE` and `CREATE UNIQUE INDEX`
+are **not** two paths here — both route through `bulkBuildBTreeFull` →
+`collectBTreeEntries`, so the one edit covers the pair. This was measured, not
+assumed: `TestPort_CreateUniqueIndexSkipsAbortedXminPhantom` exercises the
+`CREATE UNIQUE INDEX` spelling of the same sequence independently. `backfillBTree`
+(~:12040) carries the identical naive check but has **zero callers** — deliberately
+left untouched as dead code (ledgered).
+
+**Guards** (`internal/testport/ddl_scan_abort_liveness_test.go`, all three FAIL-pre /
+PASS-post, proven by stashing only `operators_ddl.go`):
+`TestPort_AddConstraintUniqueSkipsAbortedXminPhantom` (the `ut4` sequence),
+`TestPort_CreateUniqueIndexSkipsAbortedXminPhantom` (the twin spelling), and
+`TestPort_AddConstraintUniqueCatchesLiveRowWithAbortedXmax` — the **inverse**
+direction, where a rolled-back `DELETE`'s aborted xmax must not hide a live duplicate
+and the constraint addition must still correctly ERROR. The inverse case matters
+because the pre-fix behaviour there was a *silent false success*, not an error: a
+liveness bug that over-reports duplicates is loud, but the same bug under-reporting
+them lets a violating table acquire a UNIQUE constraint it does not satisfy.
+
+**The generalisable lesson.** The naive test is not merely *imprecise*, it is
+*inverted* under abort. Any structural "is this tuple live" check written without an
+abort consult will pass every test whose fixtures only ever commit — which is why this
+survived until a regress file happened to roll a statement back mid-sequence.
+
+### 10.5 Measured payoff of 10.4, and remaining Bucket 4 work
+
+**Measured 2026-08-18, after the liveness fix:** `constraints` 1299 → **1251** lines
+(−48), hunks 36 → **35**. Command: `timeout 300 scripts/pg-regress-runner.sh --verbose
+constraints`; artifact `tmp/regress-diffs/constraints.diff`. **Never compare against a
+pre-2026-08-18 number** — the C19 harness fix moved the baseline.
+
+The decisive check is not the line count but the disappearance of the error class:
+`grep -n "is duplicated\|could not create unique index" tmp/regress-diffs/constraints.diff`
+now returns **nothing**. `ALTER TABLE unique_tbl ADD CONSTRAINT unique_tbl_i_key UNIQUE
+(i) DEFERRABLE INITIALLY DEFERRED` succeeds, which also retires the downstream cascade
+(§10.3) of hunks that only diverged because that constraint never existed.
+
+**Bucket 4 is now closed as a line driver.** With the cap removed, the 35 surviving
+hunks are dominated by work outside it: CHECK-constraint inheritance naming, COPY FROM
+not rejecting bad rows, the GiST `circle` block (Bucket 5 — a genuine milestone), and
+the NOT NULL inheritance block (Bucket 3's leftover). Sizing the next slice off this
+file should start from that classification, not from the residual line count.
+
+Still open, all independent of check timing:
+
+- Partitioned `parted_uniq_tbl` diverges two ways: goopg materializes **1**
+  `pg_constraint` row where PG has **3** (no per-partition unique-constraint catalog
+  rows), and the deferred-violation case enforces correctly but emits the
+  ERROR/`COMMIT` echo in the opposite order. Ledgered separately.
+- Research slices 3 and 4 — the `UNIQUE ENFORCED` / `NOT ENFORCED` grammar rejection,
+  and the `ALTER CONSTRAINT … ENFORCED` contype gate. Slice 4 was blocked on §10.4 for
+  end-to-end testability; **that block is now lifted**, so both are selectable small
+  independent slices.
