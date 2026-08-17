@@ -167,7 +167,7 @@ func TestSessionLayering(t *testing.T) {
 	if _, eff, _ := sess.Get("application_name"); eff != "local" {
 		t.Errorf("local layer = %q, want local", eff)
 	}
-	sess.EndTransaction()
+	sess.EndTransaction(true)
 	if _, eff, _ := sess.Get("application_name"); eff != "session" {
 		t.Errorf("after EndTransaction = %q, want session", eff)
 	}

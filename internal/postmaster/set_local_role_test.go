@@ -1,6 +1,7 @@
 package postmaster
 
 import (
+	"net"
 	"testing"
 
 	"github.com/goopg/goopg/internal/libpq"
@@ -110,5 +111,66 @@ func TestSimpleProtocolSetLocalRoleRevertsAtCommitAndRollback(t *testing.T) {
 	readUntilReady(t, conn)
 	if got := queryIsSuperuser(t, conn); got != "on" {
 		t.Fatalf("after RESET ROLE: is_superuser=%q, want %q", got, "on")
+	}
+}
+
+// showValue runs `SHOW name` over the simple protocol and returns the single
+// resulting cell as a string. Test helper shared with queryIsSuperuser's
+// pattern (extended_set_role_test.go).
+func showValue(t *testing.T, conn net.Conn, name string) string {
+	t.Helper()
+	writeQuery(t, conn, "SHOW "+name)
+	frames := readUntilReady(t, conn)
+	for _, f := range frames {
+		if f.Type == libpq.MsgDataRow {
+			row := decodeDataRow(t, f.Payload)
+			if len(row) != 1 {
+				t.Fatalf("SHOW %s: cell count=%d, want 1", name, len(row))
+			}
+			return string(row[0])
+		}
+	}
+	t.Fatalf("SHOW %s: no DataRow in %+v", name, frames)
+	return ""
+}
+
+// TestSimpleProtocolPlainSetRevertsOnRollback is the SQL-level end-to-end
+// guard for 0134-0001 P6/S15: a plain (non-LOCAL) `SET` inside an explicit
+// transaction that ROLLBACKs must revert to the pre-BEGIN value, exercising
+// the Context.EndLocalTransaction(committed) hook rewiring (Part 1) together
+// with the SessionRegistry undo journal (Part 2) — not just the registry in
+// isolation. min_parallel_table_scan_size's PostgreSQL default is 8MB.
+func TestSimpleProtocolPlainSetRevertsOnRollback(t *testing.T) {
+	addr, _, stop := startCopyExecServer(t)
+	defer stop()
+	conn := dialAndComplete(t, addr)
+	defer conn.Close()
+
+	if got := showValue(t, conn, "min_parallel_table_scan_size"); got != "8MB" {
+		t.Fatalf("initial min_parallel_table_scan_size=%q, want %q", got, "8MB")
+	}
+
+	writeQuery(t, conn, "BEGIN")
+	readUntilReady(t, conn)
+	writeQuery(t, conn, "SET min_parallel_table_scan_size = 0")
+	readUntilReady(t, conn)
+	if got := showValue(t, conn, "min_parallel_table_scan_size"); got != "0" {
+		t.Fatalf("in txn after SET: min_parallel_table_scan_size=%q, want %q", got, "0")
+	}
+	writeQuery(t, conn, "ROLLBACK")
+	readUntilReady(t, conn)
+	if got := showValue(t, conn, "min_parallel_table_scan_size"); got != "8MB" {
+		t.Fatalf("after ROLLBACK: min_parallel_table_scan_size=%q, want %q (plain SET must revert)", got, "8MB")
+	}
+
+	// Regression guard: a plain SET inside a COMMITted transaction stays.
+	writeQuery(t, conn, "BEGIN")
+	readUntilReady(t, conn)
+	writeQuery(t, conn, "SET min_parallel_table_scan_size = 0")
+	readUntilReady(t, conn)
+	writeQuery(t, conn, "COMMIT")
+	readUntilReady(t, conn)
+	if got := showValue(t, conn, "min_parallel_table_scan_size"); got != "0" {
+		t.Fatalf("after COMMIT: min_parallel_table_scan_size=%q, want %q (plain SET must persist)", got, "0")
 	}
 }

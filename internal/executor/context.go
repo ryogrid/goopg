@@ -392,10 +392,14 @@ type Context struct {
 	ResetAllSettings func()
 
 	// BeginLocalTransaction and EndLocalTransaction bracket an explicit
-	// transaction so that SET LOCAL changes are discarded on COMMIT/ROLLBACK.
-	// Wired to SessionRegistry.BeginTransaction / EndTransaction. M0097-0023.
+	// transaction so that SET LOCAL changes are discarded on COMMIT/ROLLBACK,
+	// and plain SET changes are reverted on ROLLBACK. EndLocalTransaction's
+	// committed flag mirrors PostgreSQL's AtEOXact_GUC(bool isCommit, int
+	// nestLevel) (guc.c) — every call site must pass the verb it actually
+	// dispatched. Wired to SessionRegistry.BeginTransaction / EndTransaction.
+	// M0097-0023; committed flag added 0134-0001 P6/S15.
 	BeginLocalTransaction func()
-	EndLocalTransaction   func()
+	EndLocalTransaction   func(committed bool)
 
 	// PLpgSQLCommitChain commits (rollback=false) or rolls back (rollback=true)
 	// the current transaction and immediately begins a fresh one, updating

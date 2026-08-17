@@ -276,8 +276,8 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 		ectx.ResetSetting = sess.Reset
 		ectx.ResetAllSettings = sess.ResetAll
 		ectx.BeginLocalTransaction = sess.BeginTransaction
-		ectx.EndLocalTransaction = func() {
-			sess.EndTransaction()
+		ectx.EndLocalTransaction = func(committed bool) {
+			sess.EndTransaction(committed)
 			// Re-sync is_superuser / the executor-context mirror after
 			// connTx.End() (called by the caller just before this) restores
 			// NonSuperuserRole from a pending SET LOCAL ROLE / SESSION

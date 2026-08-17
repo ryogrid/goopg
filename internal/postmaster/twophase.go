@@ -226,7 +226,9 @@ func (s *Server) abortForPrepareSSIFailure(w *libpq.FrameWriter, ctx *executor.C
 	undoEnumDDLForRollback(connTx, s.cfg.Catalog, ctx.CurrentDatabaseOid)
 	connTx.End()
 	if ctx != nil && ctx.EndLocalTransaction != nil {
-		ctx.EndLocalTransaction()
+		// abortForPrepareSSIFailure always rolls the transaction back (see
+		// the Rollback call above) — never committed. 0134-0001 P6/S15.
+		ctx.EndLocalTransaction(false)
 	}
 	if ctx != nil {
 		ctx.PendingEnumValues = nil

@@ -96,13 +96,17 @@ func noTransactionInProgressNotice() []libpq.ErrorField {
 // queues WITHOUT undoEnumDDLForRollback. The M-NIGHTLY regress/enum regression
 // (AI-20260814-011711-001) is the direct consequence — after COMMIT, the newly
 // added enum label had been removed from the in-memory catalog.
+//
+// The same undoEnumDDL flag doubles as the COMMIT/ROLLBACK verb for
+// EndLocalTransaction (committed = !undoEnumDDL, 0134-0001 P6/S15): every
+// call site above sets undoEnumDDL=true exactly on an abort path.
 func (s *Server) endExplicitBlock(ctx *executor.Context, connTx *connTxState, undoEnumDDL bool) {
 	if undoEnumDDL {
 		undoEnumDDLForRollback(connTx, s.cfg.Catalog, ctx.CurrentDatabaseOid)
 	}
 	connTx.End()
 	if ctx.EndLocalTransaction != nil {
-		ctx.EndLocalTransaction()
+		ctx.EndLocalTransaction(!undoEnumDDL)
 	}
 	ctx.PendingEnumValues = nil
 	ctx.PendingEnumRenames = nil

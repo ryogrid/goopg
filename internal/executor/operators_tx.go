@@ -213,7 +213,7 @@ func (o *transactionOp) execCommit() error {
 	CommitRelStats(o.ctx)
 	o.ctx.Session.EndExplicitTransaction()
 	if o.ctx.EndLocalTransaction != nil {
-		o.ctx.EndLocalTransaction()
+		o.ctx.EndLocalTransaction(true)
 	}
 	// Clear pending truncate/sequence undos — they're committed.
 	if sess, isBas := o.ctx.Session.(*BasicSession); isBas {
@@ -265,7 +265,7 @@ func (o *transactionOp) execRollback() error {
 	AbortRelStats(o.ctx)
 	o.ctx.Session.EndExplicitTransaction()
 	if o.ctx.EndLocalTransaction != nil {
-		o.ctx.EndLocalTransaction()
+		o.ctx.EndLocalTransaction(false)
 	}
 	globalRelLockMgr.ReleaseSession(o.ctx.Session)
 	undoEnumDDLFromContext(o.ctx)

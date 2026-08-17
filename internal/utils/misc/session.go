@@ -28,6 +28,15 @@ type SessionRegistry struct {
 	custom  map[string]*Variable
 	inTx    bool
 
+	// txPrior is the undo journal for plain SET while inTx: for each
+	// session-layer key mutated since BeginTransaction, the value that key
+	// held in s.session before the first mutation in this transaction. A
+	// nil *string means the key was absent from s.session at that point (so
+	// EndTransaction's restore must delete, not write ""). Mirrors PostgreSQL's
+	// GucStack / AtEOXact_GUC(isCommit=false) at goopg's flat, non-nested
+	// fidelity. Design 0134-0001-p6-guc-transaction-rollback.
+	txPrior map[string]*string
+
 	// onReportableChange, if non-nil, is called whenever a Report-flagged
 	// variable's effective value changes. The caller (the server) wires
 	// this to a ParameterStatus emitter so libpq clients see auto-tracked
@@ -43,6 +52,7 @@ func NewSessionRegistry(global *Registry) *SessionRegistry {
 		session: map[string]string{},
 		local:   map[string]string{},
 		custom:  map[string]*Variable{},
+		txPrior: map[string]*string{},
 	}
 }
 
@@ -152,6 +162,7 @@ func (s *SessionRegistry) Set(name, value string, isLocal bool) error {
 		}
 		s.local[key] = canon
 	} else {
+		s.snapshotPrior(key)
 		s.session[key] = canon
 		// SET (not SET LOCAL) clears any local override too — matches
 		// upstream which treats SET as "session value plus implicit
@@ -209,6 +220,7 @@ func (s *SessionRegistry) Reset(name string) error {
 		return fmt.Errorf("unrecognized configuration parameter %q", name)
 	}
 	key := strings.ToLower(name)
+	s.snapshotPrior(key)
 	delete(s.session, key)
 	delete(s.local, key)
 	if v.Flags&FlagReport != 0 && s.onReportableChange != nil {
@@ -218,6 +230,29 @@ func (s *SessionRegistry) Reset(name string) error {
 	// callback for the post-Reset value (which is the global default).
 	s.global.invokeOnChange(v.Name, v.Value)
 	return nil
+}
+
+// snapshotPrior records, once per key per transaction, the value key held in
+// s.session immediately before the first mutation of the current explicit
+// transaction — the undo entry EndTransaction(false) restores. No-op outside
+// a transaction (s.inTx == false) and a no-op on the second and later
+// mutation of the same key within one transaction (the journal always holds
+// the pre-BEGIN value, not an intermediate one). A nil *string means key had
+// no session-layer entry at all, so the eventual restore must delete rather
+// than write "". Design 0134-0001-p6-guc-transaction-rollback §Design 2.
+func (s *SessionRegistry) snapshotPrior(key string) {
+	if !s.inTx {
+		return
+	}
+	if _, already := s.txPrior[key]; already {
+		return
+	}
+	if val, ok := s.session[key]; ok {
+		v := val
+		s.txPrior[key] = &v
+	} else {
+		s.txPrior[key] = nil
+	}
 }
 
 func (s *SessionRegistry) lookupVariable(name string) (*Variable, bool) {
@@ -277,13 +312,29 @@ func (s *SessionRegistry) ResetAll() {
 	}
 }
 
-// BeginTransaction marks the start of a transaction. SET LOCAL inside
-// a transaction is dropped on Commit/Rollback.
-func (s *SessionRegistry) BeginTransaction() { s.inTx = true }
+// BeginTransaction marks the start of a transaction and resets the plain-SET
+// undo journal (txPrior). SET LOCAL inside a transaction is dropped on
+// Commit/Rollback; plain SET inside a transaction is journalled and reverted
+// on Rollback (see EndTransaction).
+func (s *SessionRegistry) BeginTransaction() {
+	s.inTx = true
+	s.txPrior = map[string]*string{}
+}
 
-// EndTransaction discards the local layer and flips us out of the
-// in-transaction flag. Call from both COMMIT and ROLLBACK.
-func (s *SessionRegistry) EndTransaction() {
+// EndTransaction discards the local layer and, on an aborted transaction
+// (committed == false), restores every session-layer key this transaction's
+// journal (txPrior) recorded — mirroring PostgreSQL's
+// AtEOXact_GUC(isCommit, nestLevel) (guc.c), which unwinds the GucStack on
+// abort and keeps it on commit. A journalled nil prior means the key had no
+// session-layer entry before the transaction, so the restore deletes it
+// rather than writing an empty string. Fires onReportableChange for any
+// FlagReport variable whose effective value actually moves, exactly as the
+// local-layer drop below does, so a rolled-back SET DateStyle doesn't leave
+// the client's ParameterStatus view stale. Call from both COMMIT and
+// ROLLBACK; clears the journal and the in-transaction flag on both outcomes.
+// committed's flag mirrors AtEOXact_GUC(bool isCommit, …).
+// Design 0134-0001-p6-guc-transaction-rollback.
+func (s *SessionRegistry) EndTransaction(committed bool) {
 	for name := range s.local {
 		v, _ := s.global.Get(name)
 		delete(s.local, name)
@@ -292,6 +343,27 @@ func (s *SessionRegistry) EndTransaction() {
 			s.onReportableChange(v.Name, eff)
 		}
 	}
+	if !committed {
+		for key, prior := range s.txPrior {
+			v, _ := s.lookupVariable(key)
+			_, before, _ := s.Get(key)
+			if prior == nil {
+				delete(s.session, key)
+			} else {
+				s.session[key] = *prior
+			}
+			if v != nil {
+				_, after, _ := s.Get(key)
+				if v.Flags&FlagReport != 0 && s.onReportableChange != nil && after != before {
+					s.onReportableChange(v.Name, after)
+				}
+				// Mirror Set's tail: fire the process-global change callback
+				// for the restored effective value, same as a plain SET does.
+				s.global.invokeOnChange(v.Name, after)
+			}
+		}
+	}
+	s.txPrior = map[string]*string{}
 	s.inTx = false
 }
 
