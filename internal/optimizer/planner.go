@@ -8373,7 +8373,14 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 				}
 				if (aLow == "text" || aLow == "unknown") && isNumericOrderT(oLow) {
 					if i == 0 {
-						argExpr = &CastExpr{Operand: argExpr, TargetType: orderT}
+						// Set pos from the original (pre-wrap) direct-arg expression so a
+						// runtime coercion failure (e.g. rank('fred') within group (order
+						// by int_col)) renders LINE 1:/^ like PG's parse_coerce.c:coerce_type
+						// (:294-298), which keeps the original literal's location when
+						// folding a Const through its input function. Pos==0 is goopg's
+						// convention for "suppress LINE 1" (operators_ddl.go:3207,10043),
+						// so this must be nonzero. M0134-0001 S21.
+						argExpr = &CastExpr{pos: argE.Pos(), Operand: argExpr, TargetType: orderT}
 					}
 					argT = orderT
 				}
