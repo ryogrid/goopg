@@ -1716,9 +1716,20 @@ func describePlanVerbose(n optimizer.Node, verbose bool, nm *explainNames) strin
 		return describePlan(n, nm)
 	}
 	switch p := n.(type) {
+	// SIBLING PAIR (M0134-0001 S17): this case and describePlan's
+	// *optimizer.SeqScan case must move together. PG's "Parallel " prefix is
+	// emitted in ExplainNode before the pname append and is entirely
+	// independent of es->verbose (explain.c:1630-1631) — this case has its
+	// own return statements rather than delegating to describePlan (except
+	// when p.Table == nil), so the prefix has to be applied here too, or
+	// EXPLAIN VERBOSE would silently diverge from plain EXPLAIN.
 	case *optimizer.SeqScan:
 		if p.Table == nil {
 			return describePlan(n, nm)
+		}
+		parallelPrefix := ""
+		if p.Parallel {
+			parallelPrefix = "Parallel "
 		}
 		// When the range-table name table disambiguates a repeated
 		// relation name (PG select_rtable_names_for_explain), use
@@ -1726,13 +1737,13 @@ func describePlanVerbose(n optimizer.Node, verbose bool, nm *explainNames) strin
 		// relation scanned twice without an alias prints two
 		// distinguishable labels (e.g. "nation" / "nation_1").
 		if dname := nm.disambiguatedName(n); dname != "" {
-			return "Seq Scan on " + dname
+			return parallelPrefix + "Seq Scan on " + dname
 		}
 		tname := schemaQualify(p.Table.QualifiedName())
 		if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
-			return fmt.Sprintf("Seq Scan on %s %s", tname, p.Alias)
+			return fmt.Sprintf("%sSeq Scan on %s %s", parallelPrefix, tname, p.Alias)
 		}
-		return "Seq Scan on " + tname
+		return parallelPrefix + "Seq Scan on " + tname
 	case *optimizer.IndexScan:
 		if dname := nm.disambiguatedName(n); dname != "" {
 			return fmt.Sprintf("Index Scan using %s on %s", p.Index.QualifiedName(), dname)
@@ -1866,13 +1877,27 @@ func describePlan(n optimizer.Node, nm *explainNames) string {
 	case *optimizer.WindowAgg:
 		return fmt.Sprintf("WindowAgg (%d funcs)", len(p.Funcs))
 	case *optimizer.SeqScan:
+		// S17 (0134-0001): "Parallel " prefix mirrors PG's plan->parallel_aware
+		// (explain.c:1630-1631), stamped once at Gather-construction time by
+		// parallel.go's stampParallelScan — see optimizer.SeqScan.Parallel.
+		//
+		// SIBLING PAIR: describePlanVerbose's *optimizer.SeqScan case (above,
+		// verbose=true path) has its own independent return statements rather
+		// than delegating here, so it applies the SAME prefix logic itself —
+		// PG's prefix is verbose-independent (explain.c:1630-1631), so if
+		// these two ever disagree, EXPLAIN VERBOSE silently drops the label
+		// EXPLAIN (plain) shows.
+		parallelPrefix := ""
+		if p.Parallel {
+			parallelPrefix = "Parallel "
+		}
 		if dname := nm.disambiguatedName(n); dname != "" {
-			return "Seq Scan on " + dname
+			return parallelPrefix + "Seq Scan on " + dname
 		}
 		if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
-			return fmt.Sprintf("Seq Scan on %s %s", p.Table.QualifiedName(), p.Alias)
+			return fmt.Sprintf("%sSeq Scan on %s %s", parallelPrefix, p.Table.QualifiedName(), p.Alias)
 		}
-		return fmt.Sprintf("Seq Scan on %s", p.Table.QualifiedName())
+		return fmt.Sprintf("%sSeq Scan on %s", parallelPrefix, p.Table.QualifiedName())
 	case *optimizer.IndexScan:
 		if dname := nm.disambiguatedName(n); dname != "" {
 			return fmt.Sprintf("Index Scan using %s on %s", p.Index.QualifiedName(), dname)

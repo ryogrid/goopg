@@ -326,6 +326,78 @@ func terminatesPartial(n Node) bool {
 	return false
 }
 
+// stampParallelScan is drivingScan's copy-on-write sibling: it performs the
+// EXACT SAME traversal decision (Filter/Project pass-through, Join probe-side
+// only under hashJoinIsPartialCapable, terminating on *SeqScan/*BitmapHeapScan)
+// but instead of merely locating the driving scan, it returns a NEW tree with
+// Parallel: true stamped on a COPY of that scan. This mirrors PostgreSQL's
+// parallel_aware, which is set per-PATH-CHOICE at path-construction time
+// (create_seqscan_path, pathnode.c:996; create_bitmap_heap_path,
+// pathnode.c:1115) — not inferred later by walking under a Gather (a
+// render-time "am I under a Gather" walk would mislabel a future single-copy
+// Gather over a non-partial subtree; see docs/design's Q3 discussion).
+//
+// SIBLING WARNING: this traversal must stay identical to drivingScan's. If
+// the two ever diverge, a scan gets labelled "Parallel " that workers never
+// actually read, or vice versa — drivingScan decides ELIGIBILITY,
+// stampParallelScan decides the render-time LABEL for that same decision.
+//
+// Respects this file's non-mutating discipline (file-level comment above):
+// every node on the path down to the terminal scan is shallow-copied
+// (mirroring replaceSingleChild, below), and if no eligible scan is reached,
+// n is returned UNCHANGED (identical pointer) — no copies leaked.
+func stampParallelScan(n Node) Node {
+	switch x := n.(type) {
+	case *SeqScan:
+		c := *x
+		c.Parallel = true
+		return &c
+	case *BitmapHeapScan:
+		c := *x
+		c.Parallel = true
+		return &c
+	case *Filter:
+		child := stampParallelScan(x.Child)
+		if child == x.Child {
+			return x
+		}
+		c := *x
+		c.Child = child
+		return &c
+	case *Project:
+		child := stampParallelScan(x.Child)
+		if child == x.Child {
+			return x
+		}
+		c := *x
+		c.Child = child
+		return &c
+	case *Join:
+		// P8 (drivingScan): a hash join is partial through its PROBE side
+		// only. Mirrored here so the same side gets labelled.
+		if !hashJoinIsPartialCapable(x) {
+			return n
+		}
+		if joinProbeSideIsLeft(x) {
+			left := stampParallelScan(x.Left)
+			if left == x.Left {
+				return x
+			}
+			c := *x
+			c.Left = left
+			return &c
+		}
+		right := stampParallelScan(x.Right)
+		if right == x.Right {
+			return x
+		}
+		c := *x
+		c.Right = right
+		return &c
+	}
+	return n
+}
+
 // drivingScan finds the scan node a subtree ultimately reads from, or nil
 // when the subtree is not driven by a single scannable relation.
 //
@@ -564,11 +636,13 @@ func rebuildWithGather(root Node, tgt partialTarget, workers int) Node {
 	if root == tgt.node {
 		switch {
 		case tgt.mergeKeys != nil:
-			return NewGatherMerge(root.Pos(), root, workers, tgt.mergeKeys)
+			stamped := stampParallelScan(root)
+			return NewGatherMerge(stamped.Pos(), stamped, workers, tgt.mergeKeys)
 		case tgt.splitAgg:
 			return splitAggregate(root.(*Aggregate), workers)
 		}
-		return NewGather(root.Pos(), root, workers)
+		stamped := stampParallelScan(root)
+		return NewGather(stamped.Pos(), stamped, workers)
 	}
 	kids := parallelChildren(root)
 	if len(kids) != 1 {
@@ -595,6 +669,10 @@ func rebuildWithGather(root Node, tgt partialTarget, workers int) Node {
 func splitAggregate(a *Aggregate, workers int) Node {
 	partial := *a
 	partial.Mode = AggModePartial
+	// Stamp the "Parallel " label on the partial side's driving scan — the
+	// split-aggregate shape puts a real Gather here too (rebuildWithGather's
+	// sibling call site).
+	partial.Child = stampParallelScan(partial.Child)
 
 	gather := NewGather(a.Pos(), &partial, workers)
 

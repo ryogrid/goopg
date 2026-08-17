@@ -1,64 +1,57 @@
-# Working set — M0134-0001 S16 LANDED
+# Working set — M0134-0001 S17 LANDED
 
-**Task:** M0134-0001 (`aggregates.sql`), slice **S16 — an order-sensitive
-aggregate refuses its SPLIT, not the whole plan**. Selected per the Current
-Priority banner (M-NIGHTLY drained: `ci/logs/action-items.md` still run
-`20260817-011734`, all 6 `[x]`; nothing new to file).
+**Task:** M0134-0001 (`aggregates.sql`), slice **S17 — the `"Parallel "` EXPLAIN
+node-label prefix**. Selected per the Current Priority banner (M-NIGHTLY drained:
+`ci/logs/action-items.md` still run `20260817-011734`, all 6 `[x]`; nothing new
+to file).
 
-**Fix:** deleted the `case *Aggregate:` arm from `subtreeHasUnsafeNode`
-(`internal/optimizer/parallel.go` ~184-194). It suppressed every `Gather` in the
-statement whenever an undecorated `array_agg`/`string_agg`/`json*_agg`/`xmlagg`
-appeared anywhere — redundant (the split is refused independently by
-`aggregateSplitIsSafe`→`AggregateIsDecomposable`, which the veto was never wired
-to) and too strong (PG's `max_parallel_hazard_walker`, `clauses.c:827-970`, has
-NO `Aggref` order case). `AggregateIsOrderSensitive` kept as documented
-zero-caller code for the deferred S10b split gating.
+**Fix:** a real per-node `Parallel bool` on `SeqScan`/`BitmapHeapScan`, stamped
+once at Gather-construction time by `stampParallelScan` (`parallel.go`), rendered
+by `describePlan` **and** `describePlanVerbose`.
 
-**The measurement worth carrying — the predicted win did NOT materialise:**
-`aggregates` **1001→999 lines, 29→29 hunks**. The structural claim still holds,
-verified by the hunk's own context rather than the line count: `Aggregate`,
-`Gather` and `Workers Planned: 2` all moved into unchanged context. What
-survives is ONE line — `Parallel Seq Scan` vs `Seq Scan` — a **renderer** gap,
-not a planner one. PG prefixes `"Parallel "` whenever `plan->parallel_aware` is
-set (`explain.c:1630-1631`, beside the sibling `"Async "`); goopg's EXPLAIN
-walkers have no such prefix. **This surface was unobservable before S16** — with
-the veto in place no `Gather` was ever planted, so there was no
-scan-below-a-Gather to mislabel. Third bucket lesson of the milestone and the
-first where the label held: S11 and S15 were misattributions of *cause*; this
-one was right about the cause and wrong only about how much diff sat behind it.
+**Why not a render-time walk:** PG's `parallel_aware` is per-PATH-CHOICE
+(`pathnode.c:996`/`:1115`, gated `parallel_workers > 0`), not per-tree-position —
+PG admits a single-copy `Gather` over a non-partial subtree whose scan takes NO
+prefix. `explain.c:1630-1631` renders it generically for any node kind.
 
-**An existing test encoded the old veto:** `TestPartialAggregateRefusals` went
-red. Its positional-equality assertion held only because `isSplit=false` used to
-imply "no Gather anywhere". Relaxed to sorted-multiset for `string_agg`/
-`array_agg` only (two orderings observed across consecutive runs); `isSplit`
-false, exact row count, and `count(DISTINCT v)`'s exact compare all kept.
+**The twin the brief got wrong — worth carrying:** research concluded
+`describePlan` was the single label emitter and `describePlanVerbose` needed no
+change. False: its `*SeqScan` case has three independent `return`s and does not
+fall through, so `EXPLAIN VERBOSE` would have kept rendering a bare `Seq Scan`.
+Shipping that would have *created* a divergence. Caught by the implementer, fixed
+under coordinator ruling; both cases now carry reciprocal sibling-pair comments.
+Same failure mode as S11's two walkers — the standing sibling-paths rule earned
+its keep again, and against a research report this time, not just against code.
 
-**Files:** `internal/optimizer/{parallel.go,parallel_agg.go,parallel_test.go}`,
-`internal/executor/parallel_agg_split_test.go`,
-`docs/design/0134-0001-p7-parallel-aggregate-veto.md` + README row.
+**Measurement:** `aggregates` **999 → 981 lines, 29 → 28 hunks**; the
+`array_dims(array_agg(s))` block gone entirely — first slice this milestone where
+the predicted win landed exactly as scoped. Class confirmed beyond the case:
+`select_distinct` **304 → 301**.
 
-**Gates run:** `go build ./...` PASS; UNITS suite PASS (~9 min, warm cache);
-regress fresh — `aggregates` 999/29, sentinels byte-identical (`functional_deps`
-56, `groupingsets` 2373); `scripts/tpch-spotcheck.sh` PASS Q12=2/Q13=35;
-pgbench smoke PASS via hook.
+**Files:** `internal/optimizer/{plan.go,parallel.go,parallel_test.go}`,
+`internal/executor/{operators_explain.go,parallel_label_test.go}`,
+`docs/design/0134-0001-p2-explain-format.md` (S17 section) + README row.
 
-**Deferral ledger:** row 1440 flipped `resolved`; 2 new rows 2026-08-17 — the
-`"Parallel "` label prefix, and the untested `array_agg(v ORDER BY v)` decorated
-form (no coverage of the sort-below-the-aggregate path under parallelism).
+**Gates run:** build + vet PASS; `go test ./internal/optimizer/ ./internal/executor/`
+PASS; UNITS suite PASS; regress `aggregates` 981/28, sentinels byte-identical
+(`functional_deps` 56, `groupingsets` 2373); `scripts/tpch-spotcheck.sh` PASS
+Q12=2/Q13=35; pgbench smoke PASS via hook.
 
-**Next step:** continue **M0134-0001** with the **`"Parallel "` label prefix**
-slice — cheapest remaining, EXPLAIN-text blast radius only, closes the last line
-of the `array_dims` hunk and the same residue at `v_pagg_test`. Needs the
-per-node parallel-aware flag readable in `internal/executor/operators_explain.go`
-**and its ANALYZE twin** (`walkPlanFiltered`/`walkPlanAnalyzeFiltered` — the S11
-twin-divergence trap). Other buckets: deparser/C11c 8, S6 min/max-InitPlan 5,
-isolated bugs 4, qualification 3, Parallel Append (S10b) 2.
+**Deferral ledger:** S16's `"Parallel "` row flipped `resolved`; 3 new rows
+2026-08-17 — `BitmapHeapScan` has no `describePlan` case at all (its correctly
+stamped flag has no reader), the non-text `"Parallel Aware"` JSON property
+(`explain.c:1652`, emitted on EVERY node ⇒ JSON-format-wide), and the absent
+parallel index-scan eligibility that makes `balk`'s `Parallel Index Only Scan`
+unreachable.
 
-**Delegation:** `tmp/ralph-handoffs/m0134-0001-s16-agg-veto/` — `brief.md`
-(researcher), `impl-brief.md` + `decision-brief.md` (implementer, 2 rounds,
-round 2 = coordinator's multiset decision), `gate-brief.md` (tester, 1 round).
+**Next step:** continue **M0134-0001**. Remaining buckets at 28 hunks:
+deparser/C11c 8, S6 min/max-InitPlan 5, isolated bugs 4, qualification 3, plus
+the `string_agg` delimiter coercion (closes hunk 18, already ledgered and
+self-contained — cheapest next).
+
+**Delegation:** `tmp/ralph-handoffs/m0134-0001-s17-parallel-label/` — `brief.md`
+(researcher, 1 round), `impl-brief.md` (implementer, 2 rounds; round 2 =
+coordinator rulings on the VERBOSE twin + the relaxed pointer-identity
+assertion), `gate-brief.md` (tester, 1 round).
 
 **In-flight:** none.
-
-**Note:** untracked `internal/nodes/int2_cast_test.go` and
-`internal/testport/datconnlimit_durability_test.go` are foreign WIP — untouched.

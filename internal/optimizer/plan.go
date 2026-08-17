@@ -664,6 +664,14 @@ type SeqScan struct {
 	// (view-owner privilege gap).
 	PrivilegeCheckRole    string
 	PrivilegeCheckRoleSet bool
+	// Parallel mirrors PostgreSQL's Plan.parallel_aware: true when this scan
+	// was chosen as the worker-read driving scan under a Gather/GatherMerge
+	// (PG sets it in create_seqscan_path, pathnode.c:996, gated on
+	// parallel_workers > 0). Stamped once, at Gather-construction time, by
+	// parallel.go's stampParallelScan — NOT inferred at render time (see
+	// that function's comment for why). Only affects the "Parallel " EXPLAIN
+	// text prefix (operators_explain.go describePlan).
+	Parallel bool
 }
 
 func (n *SeqScan) Pos() int       { return n.pos }
@@ -2431,6 +2439,14 @@ type BitmapHeapScan struct {
 	// Outer is the bitmap-producing subtree (BitmapIndexScan / BitmapAnd / BitmapOr).
 	Outer  Node
 	schema Schema
+	// Parallel mirrors PostgreSQL's Plan.parallel_aware: true when this scan
+	// was chosen as the worker-read driving scan under a Gather/GatherMerge
+	// (PG sets it in create_bitmap_heap_path, pathnode.c:1115, gated on
+	// parallel_degree > 0). Stamped once, at Gather-construction time, by
+	// parallel.go's stampParallelScan — NOT inferred at render time (see
+	// that function's comment for why). Only affects the "Parallel " EXPLAIN
+	// text prefix (operators_explain.go describePlan).
+	Parallel bool
 }
 
 func (n *BitmapHeapScan) Pos() int       { return n.pos }

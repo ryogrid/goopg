@@ -1152,6 +1152,78 @@ verbatim PG 18.3 captures rather than transcribed.
 **Cross-case leverage:** this is an emitter fix, so every M0134 case that emits
 a nested `EXPLAIN` inherits it — `explain.sql` (M0134-0017) most directly.
 
+## S17 — landed 2026-08-17 (the `"Parallel "` node-label prefix)
+
+Status: `accepted`. The formatter sub-slice of the S10 (parallel-query) bucket.
+It closes the single line S16 left behind, and it is the first slice in this doc
+whose target was *created* by an earlier slice: with S16's over-broad
+`subtreeHasUnsafeNode` aggregate veto still in place no `Gather` was ever
+planted, so there was no scan-below-a-Gather to mislabel and the gap was
+literally unobservable.
+
+**PG's rule is per-PATH-CHOICE, not per-tree-position — and that distinction
+drove the whole design.** `ExplainNode` prints the bare token generically for any
+node kind (`postgres/src/backend/commands/explain.c:1630-1631`,
+`if (plan->parallel_aware) appendStringInfoString(es->str, "Parallel ")`,
+immediately before the `pname` append and beside the sibling `"Async "` prefix),
+but the flag itself is only ever set at path construction:
+`create_seqscan_path` (`pathnode.c:996`, gated `parallel_workers > 0`),
+`create_bitmap_heap_path` (`:1115`, `parallel_degree > 0`),
+`create_append_path` (`:1338`, explicit argument → "Parallel Append") and
+`create_hashjoin_path` (`:2861-2862`, the shared-hash *build* node — note the
+join itself is never `parallel_aware`). Every other path constructor in the file
+sets it `false` unconditionally.
+
+So **"any node below a `Gather`" is the wrong rule**, and a render-time "am I
+under a Gather" walk was rejected: PG admits a `Gather` with `single_copy` over a
+non-partial subtree, in which case the scan beneath renders with no prefix at
+all. A render-time inference would also have duplicated `drivingScan`'s
+traversal — a second copy of a decision goopg already makes exactly once.
+
+**Implementation.** A real per-node flag, stamped once at Gather-construction
+time:
+
+- `Parallel bool` on `SeqScan` and `BitmapHeapScan` (`internal/optimizer/plan.go`)
+  — the only two types `drivingScan` recognises today. `IndexScan`/
+  `IndexOnlyScan` deliberately did *not* get the field: goopg has no parallel
+  index-scan eligibility, so it would be dead weight (PG's `Parallel Index Only
+  Scan` does appear in the diffs, but oracle-side only).
+- `stampParallelScan` (`internal/optimizer/parallel.go`) — `drivingScan`'s
+  copy-on-write sibling. It repeats that traversal exactly (Filter/Project
+  pass-through, `Join` PROBE side only under `hashJoinIsPartialCapable`,
+  terminating on the two scan types) and returns a new tree with `Parallel: true`
+  on a *copy* of the terminal scan, honouring this file's non-mutating discipline;
+  when no eligible scan is reached it returns the identical pointer, so no copies
+  leak. Both functions carry a sibling warning: if the traversals ever diverge, a
+  scan gets labelled that workers never read, or vice versa.
+- Applied at **both** planting sites — `rebuildWithGather`'s `Gather` and
+  `GatherMerge` branches, and the partial side inside `splitAggregate`.
+
+**The twin that the research premise got wrong.** The design assumed
+`describePlan` was the single label emitter and that `describePlanVerbose` merely
+fell through to it. It does for most node types — but its `*SeqScan` case has
+three independent `return` statements (disambiguated, aliased, plain), so
+`EXPLAIN VERBOSE` would have rendered a bare `Seq Scan` while plain `EXPLAIN`
+rendered `Parallel Seq Scan`. Shipping that would have *created* a divergence
+rather than preserved one. Both cases now carry the prefix and a sibling-pair
+comment citing `explain.c:1630-1631` for why PG's prefix is verbose-independent.
+This is the same failure mode as S11's two walkers and this project's standing
+sibling-paths rule; the implementer caught it, the brief did not.
+
+**Measurement.** `aggregates` **999 → 981 lines, 29 → 28 hunks**; the
+`array_dims(array_agg(s))` block is gone from the diff entirely — the pure-label
+thesis confirmed. Sentinels byte-identical (`functional_deps` 56, `groupingsets`
+2373). The class exists beyond this case, as predicted: `select_distinct`
+**304 → 301 lines** with its `Gather → Limit → Parallel Seq Scan` shape now
+matching. TPC-H spot-check Q12=2 / Q13=35.
+
+**Explicitly not claimed by this slice** (each independently ledgered): the
+Partial/Finalize split wording, `"Parallel Hash"` / `"Parallel Hash Join"`,
+`"Parallel Append"`, parallel index-scan eligibility, the non-text
+`"Parallel Aware": true` JSON property (`explain.c:1652`), and the fact that
+`BitmapHeapScan` has no `describePlan` case at all today — its `Parallel` flag is
+correctly stamped but has no renderer to read it.
+
 ## Cross-case relevance
 
 Every M0134 regress case whose `.sql` emits `EXPLAIN` inherits the formatter

@@ -107,13 +107,44 @@ func TestMaybeAddGatherSharesUntouchedSubtrees(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected the Gather at the root, got %T", out)
 	}
-	// And the whole partial subtree is SHARED by pointer, not deep-copied —
-	// copying it would work but would defeat the point of caching a plan.
-	if g.Child != Node(root) {
-		t.Error("the partial subtree should be shared by pointer")
+	// M0134-0001 S17: stampParallelScan now shallow-copies every node on the
+	// path down to the driving scan (to stamp Parallel: true on a COPY of
+	// the scan without mutating the shared original), so g.Child is a stamped
+	// COPY of root, not root itself by pointer. What must still hold is the
+	// COW property one level down: the copy's Child is a stamped SeqScan
+	// wrapping the SAME *catalog.Table, not a deep copy of the whole subtree.
+	gProj, ok := g.Child.(*Project)
+	if !ok {
+		t.Fatalf("expected a *Project directly under Gather, got %T", g.Child)
 	}
+	// This was `g.Child == Node(root)` before S17 — a stronger, but WRONG
+	// invariant to restore: it asserted "nothing on the partial path was
+	// copied," an implementation detail the Parallel-flag copy-on-write stamp
+	// legitimately invalidates (stampParallelScan must copy root itself when
+	// root IS tgt.node, to change its Child without mutating it in place).
+	// The invariant this file actually exists to protect — MaybeAddGather
+	// never mutates the CALLER's tree — is checked below via root/scan, not
+	// here. Do not revert this to pointer-identity on gProj/root.
+	if gProj == root {
+		t.Error("g.Child should be a stamped COPY of root (its SeqScan child changed), not the same pointer")
+	}
+	gScan, ok := gProj.Child.(*SeqScan)
+	if !ok {
+		t.Fatalf("expected a *SeqScan under the stamped Project, got %T", gProj.Child)
+	}
+	if gScan.Table != scan.Table {
+		t.Error("the stamped scan should share the same underlying Table by pointer, not deep-copy it")
+	}
+	if !gScan.Parallel {
+		t.Error("the scan directly under Gather should be stamped Parallel")
+	}
+	// The ORIGINAL root and its subtree must be entirely untouched — the
+	// non-mutating invariant this file exists to protect.
 	if root.Child != Node(scan) {
 		t.Error("the shared subtree was rewritten")
+	}
+	if scan.Parallel {
+		t.Error("stampParallelScan mutated the original scan's Parallel flag")
 	}
 }
 
@@ -340,6 +371,64 @@ func TestMaybeAddGatherOrderSensitiveAggregateGathersBelow(t *testing.T) {
 	}
 	if !planHasGather(out) {
 		t.Error("expected a Gather somewhere in the plan (scan-level parallelism)")
+	}
+}
+
+// TestStampParallelScanIsNonMutating pins the copy-on-write invariant on
+// stampParallelScan directly (M0134-0001 S17), independent of MaybeAddGather's
+// own non-mutation tests above: the ORIGINAL tree's Parallel flags must stay
+// false, and an unreachable subtree (no eligible scan) must come back as the
+// identical pointer with zero copies made.
+func TestStampParallelScanIsNonMutating(t *testing.T) {
+	tbl := bigTable(t, "big")
+	scan := seqScanOver(tbl)
+	filter := &Filter{Child: scan}
+	root := &Project{Child: filter, schema: filter.Output()}
+
+	out := stampParallelScan(root)
+
+	if scan.Parallel {
+		t.Error("stampParallelScan mutated the original scan's Parallel flag")
+	}
+	if root.Child != Node(filter) {
+		t.Error("stampParallelScan mutated the original root's child")
+	}
+	if filter.Child != Node(scan) {
+		t.Error("stampParallelScan mutated a node below the root")
+	}
+
+	outProj, ok := out.(*Project)
+	if !ok {
+		t.Fatalf("expected a *Project at the root of the stamped copy, got %T", out)
+	}
+	if outProj == root {
+		t.Error("expected a COPY of the root (its Filter->SeqScan chain changed)")
+	}
+	outFilter, ok := outProj.Child.(*Filter)
+	if !ok {
+		t.Fatalf("expected a *Filter under the stamped Project, got %T", outProj.Child)
+	}
+	outScan, ok := outFilter.Child.(*SeqScan)
+	if !ok {
+		t.Fatalf("expected a *SeqScan under the stamped Filter, got %T", outFilter.Child)
+	}
+	if !outScan.Parallel {
+		t.Error("the copy's terminal scan should be stamped Parallel")
+	}
+	if outScan.Table != tbl {
+		t.Error("the stamped scan should share the same underlying Table by pointer")
+	}
+}
+
+// TestStampParallelScanNoEligibleScanReturnsSamePointer pins the "no copies
+// leaked" half: a subtree with no eligible driving scan (e.g. an unadorned
+// Aggregate, which drivingScan has no case for) must come back unchanged, by
+// identical pointer.
+func TestStampParallelScanNoEligibleScanReturnsSamePointer(t *testing.T) {
+	agg := &Aggregate{}
+	out := stampParallelScan(agg)
+	if out != Node(agg) {
+		t.Error("a subtree with no eligible scan must return the identical pointer, not a copy")
 	}
 }
 
