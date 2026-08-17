@@ -1083,19 +1083,27 @@ filed as real until a HEAD re-run (rule §2) says otherwise.
 
 ### Nightly run 20260817-011734 (sha `240557311c15`, 6 items) — filed 2026-08-17
 
-Filed per the standing M-NIGHTLY obligation; NOT selected this loop (the Current
-Priority banner puts M0134 next and M0134-0001 was in flight). Note this run
+**DRAINED 2026-08-17 — all 6 items closed** (-002…-006 fixed; -001 closed stale
+after re-verification at HEAD).
+
+Filed per the standing M-NIGHTLY obligation; NOT selected on the filing loop (the
+Current Priority banner puts M0134 next and M0134-0001 was in flight). Note this run
 forked BEFORE the race-gate sharding commit `83dd7ae8` landed, so item -001 is
 expected to be stale — the sharding fix is validated by the FIRST nightly that
 starts after `83dd7ae8`. Triage each per the M-NIGHTLY selection rule (re-run the
 repro at HEAD first; the log reflects the last nightly and may be stale).
 
-- [ ] **race/internal/initdb (AI-20260817-011734-001)** — race suite failed in
-      `github.com/goopg/goopg/internal/initdb`. **Almost certainly stale**: this
-      run predates the sharding fix `83dd7ae8` (which took the package from a 45m
-      timeout to ≈19m56s across 4 shards). Verify, then close.
-      Repro: `make race-gate RACE_TIMEOUT=45m RACE_SHARD_ONLY=1`.
-      Evidence: `ci/logs/20260817-011734/race/go-test.log`.
+- [x] **race/internal/initdb (AI-20260817-011734-001)** — CLOSED STALE 2026-08-17,
+      no code change. Recorded failure was `panic: test timed out after 45m0s`
+      (`FAIL … internal/initdb 2700.056s`) — a whole-package timeout from running
+      605 `Init()`-heavy tests as ONE `go test -race` binary, **not** a data race
+      (the dump showed a normal in-progress `pglz.Compress`). The run forked
+      before the sharding fix `83dd7ae8`, which is now `IN-HEAD`. Re-ran the repro
+      at HEAD: `make race-gate RACE_TIMEOUT=45m RACE_SHARD_ONLY=1` → **4/4 shards
+      PASS** (152/151/151/151 = 605 tests; per-shard 748.6/726.7/776.6/873.4 s),
+      wall clock **15m52s** — better than the fix's ≈19m56s estimate and well
+      inside the 45m budget. Evidence: `ci/logs/20260817-011734/race/go-test.log`
+      (old), handoff `race.log` (new).
 - [x] **testport/TestE2E_PGColdStartOnGoopgDataDir (AI-20260817-011734-002)** —
       FIXED 2026-08-17. NOT an E2E-harness or PG-interop bug: the tests died on the
       goopg side, before PG was ever attached. Root cause: S4's Filter-drop
