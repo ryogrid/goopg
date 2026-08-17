@@ -19,7 +19,7 @@
 // corresponding slot's `confirmed_flush_lsn`.
 //
 // See docs/design/0005-0001-streaming-replication-architecture.md.
-package postmaster
+package replication
 
 import (
 	"context"

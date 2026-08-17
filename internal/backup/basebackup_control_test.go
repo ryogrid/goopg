@@ -1,4 +1,4 @@
-package postmaster
+package backup_test
 
 import (
 	"archive/tar"

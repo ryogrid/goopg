@@ -1,4 +1,14 @@
-// BASE_BACKUP wire-protocol command on the goopg primary (M0102-0002).
+// Package backup implements the BASE_BACKUP wire-protocol command on the
+// goopg primary (M0102-0002).
+//
+// It mirrors postgres/src/backend/backup/ — upstream's `basebackup.c` is
+// reached from `walsender.c`'s command dispatcher and never calls back into
+// replication/, so this package is a LEAF of internal/replication. Do not
+// import internal/replication (nor internal/postmaster) from here: the
+// dependency runs postmaster -> replication -> backup, and an import in the
+// other direction is an immediate cycle. The two helpers this package used to
+// borrow from replication.go — writeStreamingError and formatLSN — are
+// therefore carried locally.
 //
 // Implements the upstream `pg_basebackup`-compatible replication
 // command so a libpq client (PostgreSQL's pg_basebackup or any other
@@ -34,13 +44,12 @@
 // result-set always reports a single NULL/NULL row mirroring the
 // upstream "default tablespace only" shape.
 //
-// Verification: `internal/server/basebackup_test.go` drives a server
-// through BASE_BACKUP via the in-process protocol harness and asserts
-// the tar parses cleanly with `archive/tar` and contains
-// `backup_label` + `global/pg_control` + at least one base/<oid>/
-// file. End-to-end interop with upstream pg_basebackup is exercised by
-// M0102-0006/0007 once the E2E harness lands.
-package postmaster
+// Verification: `basebackup_wire_test.go` drives a server through BASE_BACKUP
+// via the in-process protocol harness and asserts the tar parses cleanly with
+// `archive/tar` and contains `backup_label` + `global/pg_control` + at least
+// one base/<oid>/ file. End-to-end interop with upstream pg_basebackup is
+// exercised by M0102-0006/0007 once the E2E harness lands.
+package backup
 
 import (
 	"archive/tar"
@@ -65,11 +74,89 @@ import (
 	"unicode/utf8"
 
 	"github.com/goopg/goopg/internal/utils/misc"
+	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/initdb"
 	"github.com/goopg/goopg/internal/libpq"
 	"github.com/goopg/goopg/internal/utils/errcodes"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
+
+// Config is the narrow slice of the postmaster's Config that BASE_BACKUP
+// needs. postmaster builds one in New (server.go) and it is immutable for the
+// life of the process, so the Handler is constructed once rather than per
+// connection.
+type Config struct {
+	// DataDir is the cluster directory that gets tarred up. Empty means
+	// BASE_BACKUP is unavailable (in-process protocol-only tests).
+	DataDir string
+	// WAL supplies the start/stop LSNs stamped into backup_label and the
+	// two recptr result sets. nil leaves them zero.
+	WAL *xlog.Writer
+	// WALSegmentSize sizes the pg_wal segment names when INCLUDE_WAL is on.
+	WALSegmentSize int64
+	// Checkpointer forces the pre-backup checkpoint and supplies the REDO
+	// location patched into the shipped pg_control. nil skips the
+	// checkpoint, matching the v0 in-process default.
+	Checkpointer executor.Checkpointer
+}
+
+// WriteQueryErrorFunc writes an ErrorResponse plus a trailing ReadyForQuery on
+// w and returns the caller's "error already reported" sentinel — it must never
+// return nil on success. postmaster wires (*Server).writeQueryError
+// (internal/postmaster/query.go) here, which returns errQueryErrorSent; the
+// dispatch loop then recognises that sentinel with errors.Is and stops without
+// sending a duplicate ReadyForQuery. Passing the writer as a callback rather
+// than exporting it keeps that sentinel, and the "postmaster.handleQuery"
+// Routine field, byte-identical to what the pre-split code emitted.
+type WriteQueryErrorFunc func(w *libpq.FrameWriter, code errcodes.Code, msg string, extra ...libpq.ErrorField) error
+
+// Handler serves the BASE_BACKUP replication command. It replaces the
+// *postmaster.Server receiver these methods used to hang off; the receiver is
+// still named s and the config field is still named cfg so the handler bodies
+// read exactly as they did inside postmaster.
+type Handler struct {
+	cfg  Config
+	werr WriteQueryErrorFunc
+}
+
+// NewHandler returns a Handler. werr must be non-nil in production; see
+// writeQueryError for what a nil one degrades to.
+func NewHandler(cfg Config, werr WriteQueryErrorFunc) *Handler {
+	return &Handler{cfg: cfg, werr: werr}
+}
+
+// writeQueryError forwards to the postmaster-supplied writer. A nil writer
+// MUST NOT yield a nil error: the dispatch loop reads nil as "handled
+// cleanly, keep reading frames", so swallowing the failure here would leave
+// the client waiting on a reply that never comes.
+func (s *Handler) writeQueryError(w *libpq.FrameWriter, code errcodes.Code, msg string, extra ...libpq.ErrorField) error {
+	if s.werr == nil {
+		return fmt.Errorf("backup: no error writer configured: %s: %s", code, msg)
+	}
+	return s.werr(w, code, msg, extra...)
+}
+
+// writeStreamingError emits an ErrorResponse on a CopyBoth-mode connection.
+// Upstream's walsender does the same: an error mid-stream goes via a regular
+// error frame and the standby treats it as a terminal disconnect. Twin of
+// internal/replication's method of the same name — duplicated, not imported,
+// to keep this package a leaf (see the package doc).
+func (s *Handler) writeStreamingError(w *libpq.FrameWriter, code errcodes.Code, msg string) error {
+	return s.writeQueryError(w, code, msg)
+}
+
+// formatLSN renders an LSN in upstream's X/X hex form. Third copy in the tree
+// (internal/replication and internal/initdb carry the others) — the
+// alternative is an import edge that would make this package non-leaf.
+func formatLSN(lsn uint64) string {
+	return fmt.Sprintf("%X/%X", uint32(lsn>>32), uint32(lsn))
+}
+
+// oidText is pg_type.dat's text OID, used for the recptr / spclocation
+// result-set columns. Mirrors internal/postmaster/query.go's const block and
+// catalog.OIDText; kept local so this package pulls in no extra dependency for
+// two integers.
+const oidText = 25
 
 // oidInt8 is pg_type.dat int8 OID; used for the BASE_BACKUP result
 // sets that report start/stop TLI. Mirrors upstream's
@@ -149,11 +236,12 @@ func isExcludedFile(base string) bool {
 	return false
 }
 
-// replyBaseBackup is the top-level handler invoked from
-// handleReplicationCommand. `args` is the suffix after `BASE_BACKUP `
-// (possibly empty for a bare `BASE_BACKUP` command, which upstream
-// also accepts).
-func (s *Server) replyBaseBackup(ctx context.Context, w *libpq.FrameWriter, args string) error {
+// ReplyBaseBackup is the top-level handler, invoked from
+// internal/replication's HandleCommand (upstream: walsender.c's
+// exec_replication_command reaching basebackup.c's SendBaseBackup). `args` is
+// the suffix after `BASE_BACKUP ` (possibly empty for a bare `BASE_BACKUP`
+// command, which upstream also accepts).
+func (s *Handler) ReplyBaseBackup(ctx context.Context, w *libpq.FrameWriter, args string) error {
 	if s.cfg.DataDir == "" {
 		return s.writeQueryError(w, errcodes.FeatureNotSupported,
 			"BASE_BACKUP requires Config.DataDir to be set")

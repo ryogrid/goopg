@@ -1,4 +1,4 @@
-package postmaster
+package replication
 
 import (
 	"bytes"
@@ -453,7 +453,7 @@ func TestLogicalSyncRepDispatchUnblocksOnApplyCatchup(t *testing.T) {
 		t.Fatalf("SetStandbyNames: %v", err)
 	}
 
-	s := &Server{cfg: Config{SyncRep: syncRep}}
+	s := &Handler{cfg: Config{SyncRep: syncRep}}
 
 	const commitLSN uint64 = 0x1000
 
@@ -518,7 +518,7 @@ func TestLogicalSyncRepDispatchEmptyAppNameIsNoop(t *testing.T) {
 	t.Parallel()
 
 	syncRep := xlog.NewSyncRep()
-	s := &Server{cfg: Config{SyncRep: syncRep}}
+	s := &Handler{cfg: Config{SyncRep: syncRep}}
 
 	payload := libpq.EncodeStandbyStatusUpdate(0x500, 0x500, 0x500,
 		time.Unix(0, 0).UTC(), false)

@@ -50,6 +50,8 @@ import (
 
 	"github.com/goopg/goopg/internal/utils/activity"
 	"github.com/goopg/goopg/internal/libpq/auth"
+	"github.com/goopg/goopg/internal/backup"
+	"github.com/goopg/goopg/internal/replication"
 	"github.com/goopg/goopg/internal/postmaster/autovacuum"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/utils/misc"
@@ -363,7 +365,14 @@ type Server struct {
 	// applyLauncher is the logical-replication subscription
 	// auto-launcher (M0103-0002). nil when PubSub is unconfigured.
 	// Constructed in New, started in Run, drained on Run exit.
-	applyLauncher *ApplyLauncher
+	applyLauncher *replication.ApplyLauncher
+
+	// replHandler dispatches MsgQuery frames on a replication=true
+	// connection (IDENTIFY_SYSTEM / CREATE_REPLICATION_SLOT /
+	// START_REPLICATION / BASE_BACKUP / …). Built once in New because cfg
+	// is immutable afterwards; if a future loop makes any of the fields it
+	// snapshots runtime-mutable, rebuild it there too. Always non-nil.
+	replHandler *replication.Handler
 
 	// notify is the cross-session LISTEN/NOTIFY hub (M0118-0009,
 	// async-notify). Always non-nil; channel registrations and queued
@@ -463,7 +472,7 @@ func New(cfg Config) *Server {
 	// wired (PubSub + storage handles). Server.Run starts it so its
 	// lifetime matches the listener's. M0103-0002.
 	if cfg.PubSub != nil && cfg.hasStorage() {
-		s.applyLauncher = NewApplyLauncher(ApplyLauncherConfig{
+		s.applyLauncher = replication.NewApplyLauncher(replication.ApplyLauncherConfig{
 			PubSub:  cfg.PubSub,
 			Catalog: cfg.Catalog,
 			Pool:    cfg.Pool,
@@ -472,6 +481,34 @@ func New(cfg Config) *Server {
 			Logger:  cfg.Logger,
 		})
 	}
+
+	// Build the replication-command dispatcher and the BASE_BACKUP handler
+	// it fans out to. s.writeQueryError is handed over as a callback so the
+	// errQueryErrorSent sentinel — which runPostStartupLoop below matches
+	// with errors.Is — never has to leave this package. See
+	// replication.WriteQueryErrorFunc.
+	s.replHandler = replication.NewHandler(
+		replication.Config{
+			Logger:         cfg.Logger,
+			Catalog:        cfg.Catalog,
+			PubSub:         cfg.PubSub,
+			Slots:          cfg.Slots,
+			SyncRep:        cfg.SyncRep,
+			WalSenders:     cfg.WalSenders,
+			WAL:            cfg.WAL,
+			WALDirPath:     cfg.WALDirPath,
+			WALSegmentSize: cfg.WALSegmentSize,
+			SystemID:       cfg.SystemID,
+			Timeline:       cfg.Timeline,
+		},
+		s.writeQueryError,
+		backup.NewHandler(backup.Config{
+			DataDir:        cfg.DataDir,
+			WAL:            cfg.WAL,
+			WALSegmentSize: cfg.WALSegmentSize,
+			Checkpointer:   cfg.Checkpointer,
+		}, s.writeQueryError),
+	)
 	return s
 }
 
@@ -479,7 +516,7 @@ func New(cfg Config) *Server {
 // auto-launcher attached to this Server. Returns nil when PubSub or
 // storage is unconfigured. Test-only accessor; production code paths
 // use the wake hook plumbed through executor.Context.
-func (s *Server) ApplyLauncher() *ApplyLauncher { return s.applyLauncher }
+func (s *Server) ApplyLauncher() *replication.ApplyLauncher { return s.applyLauncher }
 
 // Addr returns the listen address (resolved port if the config used :0).
 // Returns nil before Run has bound the listener; callers in tests should
@@ -1633,7 +1670,7 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 				// connection's dbName down so the logical walsender can scope
 				// every catalog lookup to the slot's database instead of the
 				// DefaultDBOid fallback (DB 1).
-				handled, err := s.handleReplicationCommand(ctx, r, w, f.Payload, appName, dbName)
+				handled, err := s.replHandler.HandleCommand(ctx, r, w, f.Payload, appName, dbName)
 				if err != nil {
 					entry.clearQueryCancel()
 					queryCancel()

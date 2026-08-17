@@ -3,11 +3,11 @@
 // CopyBoth streaming session and ships each emitted pgoutput message
 // to the standby in a `'w'` CopyData frame.
 //
-// The standby (`internal/server/logicalreceiver.go`) consumes the
+// The standby (`logicalreceiver.go`, this package) consumes the
 // stream and applies each event through `*executor.ApplyWorker`.
 // See docs/design/0008-0004-apply-worker-and-tablesync.md.
 
-package postmaster
+package replication
 
 import (
 	"context"
@@ -30,7 +30,7 @@ import (
 // builds a SlotDecoder over the slot, plumbs its OutputPlugin into
 // a PgOutput writing through `walsenderPgoutputAdapter`, and runs
 // until the standby disconnects or ctx is cancelled.
-func (s *Server) runLogicalWalsender(ctx context.Context, r *libpq.FrameReader, w *libpq.FrameWriter, args startReplicationArgs, appName, dbName string) error {
+func (s *Handler) runLogicalWalsender(ctx context.Context, r *libpq.FrameReader, w *libpq.FrameWriter, args startReplicationArgs, appName, dbName string) error {
 	if s.cfg.WAL == nil {
 		return s.writeStreamingError(w, errcodes.FeatureNotSupported,
 			"START_REPLICATION LOGICAL requires a configured WAL writer")
@@ -320,6 +320,30 @@ func (f *publicationFilter) Allows(rel *xlog.RelationDef, kind xlog.ChangeKind) 
 // through unchanged (catalog.go:23539-23544).
 func walsenderCatalogDBOidVar(im *catalog.InMemory, dbName string) []uint32 {
 	return []uint32{catalog.NamespaceDBOid(resolveConnDBOid(im, dbName))}
+}
+
+// databaseOidResolver is implemented by catalogs that can resolve a database
+// name to its real, physical pg_database.oid (catalog.InMemory). Structural
+// copy of internal/postmaster/dispatch.go's interface — declaring it locally
+// costs three lines and keeps this package independent of postmaster.
+type databaseOidResolver interface {
+	ResolveDatabaseOid(name string) (uint32, bool)
+}
+
+// resolveConnDBOid resolves a connection's database name to its physical
+// pg_database.oid, returning 0 (SearchPathCatalog.effectiveDBOid's fallback)
+// when the catalog cannot answer. Copy of internal/postmaster/dispatch.go's
+// helper; M0122-0007 slice 4c.
+func resolveConnDBOid(cat catalog.Catalog, dbName string) uint32 {
+	if dbName == "" {
+		return 0
+	}
+	if dr, ok := cat.(databaseOidResolver); ok {
+		if oid, ok := dr.ResolveDatabaseOid(dbName); ok {
+			return oid
+		}
+	}
+	return 0
 }
 
 // buildPublicationFilter materialises the membership rules from

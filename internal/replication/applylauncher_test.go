@@ -1,4 +1,4 @@
-package postmaster
+package replication
 
 import (
 	"context"

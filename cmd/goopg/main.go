@@ -34,6 +34,7 @@ import (
 	"github.com/goopg/goopg/internal/access/transam/multixact"
 	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/postmaster"
+	"github.com/goopg/goopg/internal/replication"
 	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
@@ -1012,7 +1013,7 @@ func startWalreceiver(ctx context.Context, done chan struct{}, rt *initdb.Runtim
 			// our local WAL). Sending WrittenLSN itself would make the
 			// primary's iterator anchor inside the last-applied record
 			// and stream garbage.
-			rec, err := postmaster.DialWalReceiver(ctx, postmaster.WalReceiverConfig{
+			rec, err := replication.DialWalReceiver(ctx, replication.WalReceiverConfig{
 				PrimaryAddr:     addr,
 				User:            user,
 				SlotName:        slotName,

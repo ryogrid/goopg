@@ -1,4 +1,4 @@
-package postmaster
+package replication_test
 
 import (
 	"bytes"
@@ -11,8 +11,33 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/libpq"
+	"github.com/goopg/goopg/internal/postmaster"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
+
+// writeStartupPacket encodes a regular protocol-3.0 StartupMessage to w. Copy
+// of internal/postmaster/server_test.go's helper: this file is an EXTERNAL
+// test package (replication_test) so it can import postmaster and drive a real
+// server, which also means postmaster's unexported test helpers are out of
+// reach. Duplicating ~15 lines is the price of that.
+func writeStartupPacket(t *testing.T, w io.Writer, params map[string]string) {
+	t.Helper()
+	body := make([]byte, 4) // protocol version
+	binary.BigEndian.PutUint32(body, libpq.ProtocolVersion3_0)
+	for k, v := range params {
+		body = append(body, k...)
+		body = append(body, 0)
+		body = append(body, v...)
+		body = append(body, 0)
+	}
+	body = append(body, 0) // empty key terminator
+	pkt := make([]byte, 4+len(body))
+	binary.BigEndian.PutUint32(pkt[:4], uint32(4+len(body)))
+	copy(pkt[4:], body)
+	if _, err := w.Write(pkt); err != nil {
+		t.Fatalf("write startup packet: %v", err)
+	}
+}
 
 // startReplicationTestServer brings up a Server with a Slots registry
 // rooted at a tempdir but no storage handles — replication command
@@ -48,7 +73,7 @@ func startReplicationTestServerWithDir(t *testing.T) (string, *xlog.Slots, *xlog
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := New(Config{
+	srv := postmaster.New(postmaster.Config{
 		Address:          "127.0.0.1:0",
 		Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
 		AcceptDeadline:   25 * time.Millisecond,

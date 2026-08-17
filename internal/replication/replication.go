@@ -1,3 +1,15 @@
+// Package replication implements goopg's streaming and logical replication:
+// the walsender-side command dispatcher and BASE_BACKUP routing, the physical
+// and logical walreceivers, initial table sync, and the subscription apply
+// launcher. It mirrors postgres/src/backend/replication/ (walsender.c,
+// walreceiver.c, slot.c, syncrep.c and logical/{launcher,tablesync,worker}.c).
+//
+// The dependency direction is postmaster -> replication -> backup, and it must
+// stay that way: do NOT import internal/postmaster from here. The handful of
+// postmaster helpers this code used to reach — writeQueryError (supplied as a
+// callback), extractCString, resolveConnDBOid and the pg_type OID consts —
+// are carried locally for exactly that reason.
+//
 // Replication-command dispatcher for connections opened with
 // `replication=true` in the StartupMessage. Handles the three
 // commands a v0 walreceiver needs before it can stream:
@@ -11,13 +23,14 @@
 // docs/design/0005-0001-streaming-replication-architecture.md.
 //
 // Replication commands ride on top of the regular MsgQuery framing,
-// just like upstream PostgreSQL — `runPostStartupLoop` peels off the
+// just like upstream PostgreSQL — postmaster's `runPostStartupLoop`
+// hands the frame to HandleCommand, which peels off the
 // command before the normal SQL dispatcher gets a look at it. When
 // the input doesn't match a known replication verb we return
 // (false, nil) so the regular handler can take it; this keeps utility
 // commands like `SHOW server_version` working for diagnostics on a
 // replication connection.
-package postmaster
+package replication
 
 import (
 	"context"
@@ -30,19 +43,119 @@ import (
 	"strings"
 	"time"
 
+	"log/slog"
+
+	"github.com/goopg/goopg/internal/backup"
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/libpq"
 	"github.com/goopg/goopg/internal/utils/errcodes"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
-// handleReplicationCommand inspects a Query payload and dispatches
+// Config is the narrow slice of the postmaster's Config the replication
+// command handlers need. postmaster builds one in New (server.go); cfg is
+// immutable after construction, so the Handler is built once per process
+// rather than per connection. Adding a field here means adding it to
+// postmaster's New wiring too.
+type Config struct {
+	// Logger receives walsender lifecycle events. nil means slog.Default().
+	Logger *slog.Logger
+	// Catalog and PubSub scope the logical walsender's relation lookups and
+	// publication membership. nil PubSub disables logical replication.
+	Catalog catalog.Catalog
+	PubSub  *catalog.PubSub
+	// Slots is the replication-slot registry backing
+	// CREATE/DROP/READ_REPLICATION_SLOT and slot-scoped retention.
+	Slots *xlog.Slots
+	// SyncRep resolves standby acknowledgements into synchronous-commit
+	// releases; WalSenders tracks the live senders pg_stat_replication
+	// reports.
+	SyncRep    *xlog.SyncRep
+	WalSenders *xlog.Senders
+	// WAL supplies the LSNs IDENTIFY_SYSTEM reports and the segment stream
+	// START_REPLICATION ships. WALDirPath / WALSegmentSize locate and size
+	// those segments; Timeline and SystemID are the cluster identity.
+	WAL            *xlog.Writer
+	WALDirPath     string
+	WALSegmentSize int64
+	SystemID       string
+	Timeline       uint32
+}
+
+// WriteQueryErrorFunc writes an ErrorResponse plus a trailing ReadyForQuery on
+// w and returns the caller's "error already reported" sentinel — it must never
+// return nil on success. postmaster wires (*Server).writeQueryError
+// (internal/postmaster/query.go) here, which returns errQueryErrorSent; the
+// dispatch loop recognises that sentinel with errors.Is and stops without
+// sending a duplicate ReadyForQuery. Passing the writer as a callback rather
+// than exporting it keeps both the sentinel and the "postmaster.handleQuery"
+// Routine field byte-identical to what the pre-split code emitted.
+type WriteQueryErrorFunc func(w *libpq.FrameWriter, code errcodes.Code, msg string, extra ...libpq.ErrorField) error
+
+// Handler is the walsender-side replication-command dispatcher — upstream's
+// walsender.c exec_replication_command. It replaces the *postmaster.Server
+// receiver these methods used to hang off; the receiver is still named s and
+// the config field is still named cfg, so the handler bodies read exactly as
+// they did inside postmaster.
+type Handler struct {
+	cfg  Config
+	werr WriteQueryErrorFunc
+	// bb serves the BASE_BACKUP verb. nil makes that one command report
+	// feature_not_supported while every other verb keeps working.
+	bb *backup.Handler
+}
+
+// NewHandler returns a Handler. werr must be non-nil in production; see
+// writeQueryError for what a nil one degrades to.
+func NewHandler(cfg Config, werr WriteQueryErrorFunc, bb *backup.Handler) *Handler {
+	return &Handler{cfg: cfg, werr: werr, bb: bb}
+}
+
+// writeQueryError forwards to the postmaster-supplied writer. A nil writer
+// MUST NOT yield a nil error: the dispatch loop reads nil as "handled cleanly,
+// keep reading frames", so swallowing the failure here would leave the client
+// waiting on a reply that never comes.
+func (s *Handler) writeQueryError(w *libpq.FrameWriter, code errcodes.Code, msg string, extra ...libpq.ErrorField) error {
+	if s.werr == nil {
+		return fmt.Errorf("replication: no error writer configured: %s: %s", code, msg)
+	}
+	return s.werr(w, code, msg, extra...)
+}
+
+// pg_type.dat OIDs for the replication-command result sets. Local copies of
+// internal/postmaster/query.go's block (and catalog.OIDInt4 etc.) so this
+// package does not depend on either for four integers.
+const (
+	oidInt4  = 23
+	oidText  = 25
+	oidBytea = 17
+	// oidInt8 mirrors upstream's TupleDescInitBuiltinEntry(..., INT8OID, ...)
+	// in basebackup_copy.c; READ_REPLICATION_SLOT reports restart_tli with it.
+	oidInt8 = 20
+)
+
+// extractCString returns the C string at the start of buf (everything up to
+// the first NUL), which is how a Query payload carries its SQL text. Copy of
+// internal/postmaster/query.go's helper — hoisting the parse to the postmaster
+// call site instead would leak HandleCommand's (false, nil) fall-through
+// contract into server.go's dispatch loop.
+func extractCString(buf []byte) (string, error) {
+	for i, b := range buf {
+		if b == 0 {
+			return string(buf[:i]), nil
+		}
+	}
+	return "", fmt.Errorf("replication: query payload is not NUL-terminated")
+}
+
+// HandleCommand inspects a Query payload and dispatches
 // recognised replication verbs. Returns (handled=true, err) when the
 // command was a replication verb (regardless of success/failure),
 // (false, nil) when the dispatcher should let the regular SQL path
 // take it. Errors are write errors on the wire (the connection is
 // likely dead); SQLSTATE-level command failures are reported via
 // ErrorResponse and still return (true, nil).
-func (s *Server) handleReplicationCommand(ctx context.Context, r *libpq.FrameReader, w *libpq.FrameWriter, payload []byte, appName, dbName string) (bool, error) {
+func (s *Handler) HandleCommand(ctx context.Context, r *libpq.FrameReader, w *libpq.FrameWriter, payload []byte, appName, dbName string) (bool, error) {
 	q, err := extractCString(payload)
 	if err != nil {
 		return false, nil // let the regular handler emit the error
@@ -67,7 +180,11 @@ func (s *Server) handleReplicationCommand(ctx context.Context, r *libpq.FrameRea
 		if len(trimmed) > len("BASE_BACKUP") {
 			args = strings.TrimSpace(trimmed[len("BASE_BACKUP"):])
 		}
-		return true, s.replyBaseBackup(ctx, w, args)
+		if s.bb == nil {
+			return true, s.writeQueryError(w, errcodes.FeatureNotSupported,
+				"BASE_BACKUP is not configured on this server")
+		}
+		return true, s.bb.ReplyBaseBackup(ctx, w, args)
 	}
 	return false, nil
 }
@@ -80,7 +197,7 @@ func (s *Server) handleReplicationCommand(ctx context.Context, r *libpq.FrameRea
 // upstream's walreceiver treats that as "no history yet" rather than
 // an error. Mirrors `postgres/src/backend/replication/walsender.c`'s
 // SendTimeLineHistory branch.
-func (s *Server) replyTimelineHistory(w *libpq.FrameWriter, args string) error {
+func (s *Handler) replyTimelineHistory(w *libpq.FrameWriter, args string) error {
 	tok := strings.Fields(strings.TrimSpace(args))
 	if len(tok) == 0 {
 		return s.writeQueryError(w, errcodes.SyntaxError,
@@ -135,7 +252,7 @@ func (s *Server) replyTimelineHistory(w *libpq.FrameWriter, args string) error {
 //	timeline  : int4   — current timeline from pg_control (M0130-S8)
 //	xlogpos   : text   — current write LSN as `X/X` hex pair
 //	dbname    : text   — empty for physical replication
-func (s *Server) replyIdentifySystem(w *libpq.FrameWriter) error {
+func (s *Handler) replyIdentifySystem(w *libpq.FrameWriter) error {
 	systemID := s.cfg.SystemID
 	if systemID == "" {
 		// Mirror upstream's 64-bit decimal format. The real value
@@ -185,7 +302,7 @@ func (s *Server) replyIdentifySystem(w *libpq.FrameWriter) error {
 // TWO_PHASE [bool], RESERVE_WAL [bool], FAILOVER [bool]. All known
 // options are no-ops in v0 because goopg does not yet ship a snapshot
 // exporter; snapshot_name is always returned NULL.
-func (s *Server) replyCreateReplicationSlot(w *libpq.FrameWriter, args string) error {
+func (s *Handler) replyCreateReplicationSlot(w *libpq.FrameWriter, args string) error {
 	if s.cfg.Slots == nil {
 		return s.writeQueryError(w, errcodes.FeatureNotSupported,
 			"replication slots are not configured on this server")
@@ -317,7 +434,7 @@ func (s *Server) replyCreateReplicationSlot(w *libpq.FrameWriter, args string) e
 // inactive) is accepted but the v0 implementation refuses to drop an
 // active slot rather than blocking — that's adequate for a synchronous
 // test harness and avoids tying up a server goroutine indefinitely.
-func (s *Server) replyDropReplicationSlot(w *libpq.FrameWriter, args string) error {
+func (s *Handler) replyDropReplicationSlot(w *libpq.FrameWriter, args string) error {
 	if s.cfg.Slots == nil {
 		return s.writeQueryError(w, errcodes.FeatureNotSupported,
 			"replication slots are not configured on this server")
@@ -352,7 +469,7 @@ func (s *Server) replyDropReplicationSlot(w *libpq.FrameWriter, args string) err
 //   - logical slot                -> feature_not_supported, mirroring
 //     upstream's "cannot use READ_REPLICATION_SLOT with a logical
 //     replication slot".
-func (s *Server) replyReadReplicationSlot(w *libpq.FrameWriter, args string) error {
+func (s *Handler) replyReadReplicationSlot(w *libpq.FrameWriter, args string) error {
 	if s.cfg.Slots == nil {
 		return s.writeQueryError(w, errcodes.FeatureNotSupported,
 			"replication slots are not configured on this server")
@@ -411,7 +528,7 @@ func (s *Server) replyReadReplicationSlot(w *libpq.FrameWriter, args string) err
 // arrive. When absent the walsender streams without slot-backed WAL
 // retention — fine for one-shot test traffic, dangerous in
 // production. Upstream behaves identically.
-func (s *Server) replyStartReplication(ctx context.Context, r *libpq.FrameReader, w *libpq.FrameWriter, raw string, appName, dbName string) error {
+func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReader, w *libpq.FrameWriter, raw string, appName, dbName string) error {
 	if s.cfg.WAL == nil {
 		return s.writeQueryError(w, errcodes.FeatureNotSupported,
 			"START_REPLICATION requires a configured WAL writer")
@@ -672,7 +789,7 @@ func (s *Server) replyStartReplication(ctx context.Context, r *libpq.FrameReader
 // stream. When a senderHandle is supplied the standby-reported LSNs
 // are also pushed into the observability registry so
 // pg_stat_replication renders write_lsn / flush_lsn / replay_lsn.
-func (s *Server) handleStandbyCopyData(slotName string, payload []byte, senderHandle *xlog.Sender, syncRep *xlog.SyncRep, appName string) error {
+func (s *Handler) handleStandbyCopyData(slotName string, payload []byte, senderHandle *xlog.Sender, syncRep *xlog.SyncRep, appName string) error {
 	parsed, kind, err := libpq.DecodeReplicationMessage(payload)
 	if err != nil {
 		return err
@@ -709,7 +826,7 @@ func walsenderClientAddr(_ *libpq.FrameReader) string {
 // connection. Upstream's walsender does the same: error mid-stream
 // goes via a regular error frame, and the standby treats it as a
 // terminal disconnect.
-func (s *Server) writeStreamingError(w *libpq.FrameWriter, code errcodes.Code, msg string) error {
+func (s *Handler) writeStreamingError(w *libpq.FrameWriter, code errcodes.Code, msg string) error {
 	return s.writeQueryError(w, code, msg)
 }
 

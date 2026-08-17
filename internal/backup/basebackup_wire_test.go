@@ -1,4 +1,4 @@
-package postmaster
+package backup_test
 
 import (
 	"archive/tar"
@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/initdb"
 	"github.com/goopg/goopg/internal/libpq"
+	"github.com/goopg/goopg/internal/postmaster"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
@@ -80,7 +82,7 @@ func startBaseBackupTestServerWithCheckpointer(t *testing.T, ckpt executor.Check
 		t.Fatal(err)
 	}
 
-	srv := New(Config{
+	srv := postmaster.New(postmaster.Config{
 		Address:          "127.0.0.1:0",
 		Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
 		AcceptDeadline:   25 * time.Millisecond,
@@ -380,61 +382,189 @@ func TestBaseBackupRejectsWithoutDataDir(t *testing.T) {
 	}
 }
 
-// TestBaseBackupParseOptions exercises both PG17+ parenthesized
-// option grammar and the legacy whitespace-separated form.
-func TestBaseBackupParseOptions(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		in   string
-		want baseBackupOptions
-	}{
-		{
-			name: "empty",
-			in:   "",
-			want: baseBackupOptions{},
-		},
-		{
-			name: "parenthesized",
-			in:   "(LABEL 'pg_basebackup base backup', PROGRESS, WAIT 0, TARGET 'client', MANIFEST 'yes')",
-			want: baseBackupOptions{Label: "pg_basebackup base backup", Progress: true, Manifest: "yes", Target: "client", Wait: 0},
-		},
-		{
-			name: "legacy",
-			in:   "LABEL 'tag' PROGRESS",
-			want: baseBackupOptions{Label: "tag", Progress: true},
-		},
-		{
-			name: "unknown_key_tolerated",
-			in:   "(LABEL 'x', SOMETHING_NEW 'y')",
-			want: baseBackupOptions{Label: "x"},
-		},
-		{
-			// pg_basebackup -X fetch sends a bare `WAL` boolean option.
-			name: "wal_fetch_new_syntax",
-			in:   "(LABEL 'x', WAL, MANIFEST 'no')",
-			want: baseBackupOptions{Label: "x", Manifest: "no", IncludeWAL: true},
-		},
-		{
-			// Legacy walsender clients send `WAL` as a bare keyword.
-			name: "wal_fetch_legacy",
-			in:   "LABEL 'tag' PROGRESS WAL",
-			want: baseBackupOptions{Label: "tag", Progress: true, IncludeWAL: true},
-		},
-		{
-			// An explicit false value disables WAL inclusion.
-			name: "wal_explicit_false",
-			in:   "(WAL 'f')",
-			want: baseBackupOptions{IncludeWAL: false},
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := parseBaseBackupOptions(tc.in)
-			if err != nil {
-				t.Fatalf("err = %v", err)
-			}
-			if got != tc.want {
-				t.Errorf("parseBaseBackupOptions(%q) = %+v, want %+v", tc.in, got, tc.want)
-			}
-		})
+// ---------------------------------------------------------------------------
+// Wire harness. Copies of internal/replication/replication_test.go's helpers.
+// This file is an EXTERNAL test package (backup_test) so it can import
+// postmaster and drive a real server through BASE_BACKUP; that also puts
+// postmaster's and replication's unexported test helpers out of reach, so the
+// harness is duplicated here. Keep it in sync with the originals.
+// ---------------------------------------------------------------------------
+
+// startReplicationTestServer brings up a Server with a Slots registry
+// rooted at a tempdir but no storage handles — replication command
+// dispatch only needs the slot store + (optionally) a WAL writer.
+func startReplicationTestServer(t *testing.T) (string, *xlog.Slots, func()) {
+	t.Helper()
+	addr, slots, _, stop := startReplicationTestServerFull(t)
+	return addr, slots, stop
+}
+// startReplicationTestServerFull is the variant used by tests that
+// need the WAL writer too (e.g., START_REPLICATION). Returns the
+// listen address, the slot registry, the live writer, and a stop
+// func.
+func startReplicationTestServerFull(t *testing.T) (string, *xlog.Slots, *xlog.Writer, func()) {
+	t.Helper()
+	addr, slots, writer, _, stop := startReplicationTestServerWithDir(t)
+	return addr, slots, writer, stop
+}
+// startReplicationTestServerWithDir is the M0102-0003 variant that
+// also exposes the walDir so TIMELINE_HISTORY tests can seed a
+// `<NN>.history` file in the spot the server reads from.
+func startReplicationTestServerWithDir(t *testing.T) (string, *xlog.Slots, *xlog.Writer, string, func()) {
+	t.Helper()
+	dataDir := t.TempDir()
+	slots, err := xlog.OpenSlots(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	walDir := dataDir + "/pg_wal"
+	walWriter, err := xlog.NewWriter(xlog.Config{WALDir: walDir, SegmentSize: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := postmaster.New(postmaster.Config{
+		Address:          "127.0.0.1:0",
+		Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+		AcceptDeadline:   25 * time.Millisecond,
+		HandshakeTimeout: 2 * time.Second,
+		Slots:            slots,
+		WAL:              walWriter,
+		WALDirPath:       walDir,
+		WALSegmentSize:   4096,
+		SystemID:         "7300000000000000001",
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.Run(ctx) }()
+	<-srv.Ready()
+	addr := srv.Addr().String()
+	stop := func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Error("Server.Run did not return within 2s of cancel")
+		}
+		_ = walWriter.Close()
+	}
+	return addr, slots, walWriter, walDir, stop
+}
+// dialReplication completes the startup handshake with replication=true
+// and returns a FrameReader/Writer pair positioned at ReadyForQuery.
+func dialReplication(t *testing.T, addr string) (net.Conn, *libpq.FrameReader, *libpq.FrameWriter) {
+	t.Helper()
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeStartupPacket(t, conn, map[string]string{
+		"user":        "rep",
+		"replication": "true",
+	})
+	r := libpq.NewFrameReader(conn)
+	w := libpq.NewFrameWriter(conn)
+	// Drain the handshake: AuthOK + N×ParameterStatus + BackendKeyData
+	// + ReadyForQuery.
+	for {
+		f, err := r.ReadFrame()
+		if err != nil {
+			t.Fatalf("handshake read: %v", err)
+		}
+		if f.Type == libpq.MsgReadyForQuery {
+			break
+		}
+	}
+	return conn, r, w
+}
+// sendQuery emits a Query frame with the SQL string, including the
+// trailing NUL the protocol requires.
+func sendQuery(t *testing.T, w *libpq.FrameWriter, sql string) {
+	t.Helper()
+	body := append([]byte(sql), 0)
+	if err := w.WriteFrame(libpq.MsgQuery, body); err != nil {
+		t.Fatalf("write Query: %v", err)
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+}
+// readUntilReadyForQuery drains backend frames until a ReadyForQuery,
+// returning every frame in order. Useful for asserting on the entire
+// reply tuple of a single Query.
+func readUntilReadyForQuery(t *testing.T, r *libpq.FrameReader) []libpq.Frame {
+	t.Helper()
+	var out []libpq.Frame
+	for {
+		f, err := r.ReadFrame()
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		// Copy payload; the FrameReader reuses its buffer.
+		copyPayload := make([]byte, len(f.Payload))
+		copy(copyPayload, f.Payload)
+		out = append(out, libpq.Frame{Type: f.Type, Payload: copyPayload})
+		if f.Type == libpq.MsgReadyForQuery {
+			return out
+		}
+	}
+}
+// decodeDataRow parses a DataRow payload into per-column byte slices.
+// nil indicates a NULL column. Format:
+//
+//	int16 ncolumns | { int32 length | bytes[length] | length=-1 means NULL } * ncolumns
+func decodeDataRow(t *testing.T, payload []byte) [][]byte {
+	t.Helper()
+	if len(payload) < 2 {
+		t.Fatalf("DataRow payload too short: %d", len(payload))
+	}
+	n := binary.BigEndian.Uint16(payload[:2])
+	out := make([][]byte, n)
+	off := 2
+	for i := 0; i < int(n); i++ {
+		if off+4 > len(payload) {
+			t.Fatalf("DataRow truncated at column %d", i)
+		}
+		length := int32(binary.BigEndian.Uint32(payload[off : off+4]))
+		off += 4
+		if length == -1 {
+			out[i] = nil
+			continue
+		}
+		if off+int(length) > len(payload) {
+			t.Fatalf("DataRow value at column %d truncated", i)
+		}
+		out[i] = make([]byte, length)
+		copy(out[i], payload[off:off+int(length)])
+		off += int(length)
+	}
+	return out
+}
+func replicationFrameTypes(frames []libpq.Frame) string {
+	out := make([]byte, len(frames))
+	for i, f := range frames {
+		out[i] = f.Type
+	}
+	return string(out)
+}
+
+// writeStartupPacket encodes a regular protocol-3.0 StartupMessage to w. Copy
+// of internal/postmaster/server_test.go's helper, for the same reason.
+func writeStartupPacket(t *testing.T, w io.Writer, params map[string]string) {
+	t.Helper()
+	body := make([]byte, 4) // protocol version
+	binary.BigEndian.PutUint32(body, libpq.ProtocolVersion3_0)
+	for k, v := range params {
+		body = append(body, k...)
+		body = append(body, 0)
+		body = append(body, v...)
+		body = append(body, 0)
+	}
+	body = append(body, 0) // empty key terminator
+	pkt := make([]byte, 4+len(body))
+	binary.BigEndian.PutUint32(pkt[:4], uint32(4+len(body)))
+	copy(pkt[4:], body)
+	if _, err := w.Write(pkt); err != nil {
+		t.Fatalf("write startup packet: %v", err)
 	}
 }

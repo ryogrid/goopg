@@ -104,6 +104,16 @@ tool deliberately cannot express:
 | `internal/access/amcheck/bloomfilter.go` | extract to `internal/lib/bloomfilter` (PG: `src/backend/lib/bloomfilter.c`; amcheck merely borrows it) |
 | `internal/access/transam/control` | split the `postmaster.pid` / control-socket half out to `internal/postmaster/control` |
 
+`internal/backup` and `internal/replication` were on this list and have now been
+carved out of `internal/postmaster` **by hand** (PG: `src/backend/backup/` and
+`src/backend/replication/`). They are the worked example of why this tool cannot
+express a split: three of the moved files defined methods on `*postmaster.Server`,
+and Go pins a method to its receiver's package, so the move required converting
+those receivers to a `Handler` type carrying a narrow `Config` plus a
+`WriteQueryErrorFunc` callback. `mapping.tsv` / `moves.tsv` were deliberately
+NOT touched — those tables are the per-round record of *relocations*, and this
+was not one.
+
 ## 4. Safety argument — no import cycles
 
 Every relocation renames one node of the module's import graph; the edge set is

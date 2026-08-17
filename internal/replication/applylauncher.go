@@ -7,7 +7,7 @@
 //
 // Design: docs/design/0103-0001-apply-worker-launcher.md.
 
-package postmaster
+package replication
 
 import (
 	"context"

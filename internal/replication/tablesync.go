@@ -37,7 +37,7 @@
 //     do not yet buffer across frames. A row split across frames
 //     is a wire error today.
 
-package postmaster
+package replication
 
 import (
 	"errors"

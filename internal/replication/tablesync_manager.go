@@ -25,7 +25,7 @@
 //     retry. This mirrors upstream's behaviour where one stuck
 //     table doesn't block the rest.
 
-package postmaster
+package replication
 
 import (
 	"context"

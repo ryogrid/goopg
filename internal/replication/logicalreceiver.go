@@ -22,7 +22,7 @@
 // docs/design/0103-0002-apply-worker-reconnect.md (Run's reconnect
 // loop and bounded backoff).
 
-package postmaster
+package replication
 
 import (
 	"context"
