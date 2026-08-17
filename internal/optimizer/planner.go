@@ -6497,6 +6497,52 @@ func pruneUselessGroupByColumns(groupExprs []Expr, inputCtx *resolveContext, cat
 	return keep, prunedInputCols
 }
 
+// groupByNameIsInputColumn is a name-*visibility* probe (not a bind) for
+// PG's EXPR_KIND_GROUP_BY gate: postgres/src/backend/parser/parse_clause.c
+// :2056-2076 findTargetlistEntrySQL92 tries colNameToVar (a FROM-clause
+// input column) BEFORE the target-list alias/output-name match — the
+// opposite priority from ORDER BY, where the target-list name always wins.
+// It reports whether `name` is visible as an ordinary relation column, or
+// (via usingHidden) as the left side's column standing in for a JOIN USING
+// merged pseudo-column, among the top-level bindings of ctx.
+//
+// This deliberately does NOT raise on an ambiguous match — colNameToVar
+// does, but goopg's resolveExpr(g, inputCtx) call immediately following the
+// (skipped) substitution already reports that same ambiguity with the
+// correct PG diagnostic, so "visible (possibly ambiguously)" is enough for
+// this probe to defer to.
+func groupByNameIsInputColumn(name string, ctx *resolveContext) bool {
+	if len(ctx.bindings) == 0 {
+		for _, col := range ctx.schema {
+			if strings.EqualFold(col.Name, name) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, b := range ctx.bindings {
+		if b.qualifiedOnly {
+			continue
+		}
+		for _, c := range b.table.Columns {
+			if !strings.EqualFold(c.Name, name) {
+				continue
+			}
+			hidden := false
+			for _, uh := range b.usingHidden {
+				if strings.EqualFold(uh, c.Name) {
+					hidden = true
+					break
+				}
+			}
+			if !hidden {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext, cat catalog.Catalog) (Node, *resolveContext, *aggregateSurface, Expr, error) {
 	groupExprs := make([]Expr, 0, len(s.GroupBy))
 	groupByExpr := map[string]int{}
@@ -6512,7 +6558,18 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		// same substitution as ORDER BY so the resolved
 		// expression — and the parserExprKey we record below —
 		// matches what the target list and ORDER BY look up.
-		g = resolveOrderBySubstitution(g, s.Targets)
+		//
+		// PG's EXPR_KIND_GROUP_BY gate (parse_clause.c:2056-2076
+		// findTargetlistEntrySQL92) inverts ORDER BY's priority: a
+		// FROM-clause input column — including a JOIN USING merged
+		// pseudo-column — outranks a target-list alias/output-name
+		// match. Skip the substitution when the bare name is already
+		// visible as an input column, so it resolves as one below and
+		// the groupByMergedByName tracking a few lines down actually
+		// sees the unqualified ColumnRef.
+		if cr, isColRef := g.(*parser.ColumnRef); !(isColRef && cr.Table == "" && cr.Schema == "" && groupByNameIsInputColumn(cr.Column, inputCtx)) {
+			g = resolveOrderBySubstitution(g, s.Targets)
+		}
 		// Positional GROUP BY that wasn't substituted → out-of-range position. M0097-0003.
 		if ic, ok := g.(*parser.IntegerConst); ok {
 			return nil, nil, nil, nil, &PlanError{Pos: g.Pos(), Code: "42P10",

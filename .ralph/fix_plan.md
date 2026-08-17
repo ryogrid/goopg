@@ -6419,7 +6419,28 @@ M0119 and M0122's remaining items. Milestone doc:
       fixed the GUC plus a pre-existing COPY TO bug that wrote raw unencoded bytes for bytea.
       The case gate did **not** move (1096 lines / 30 hunks before and after) — hunk 18 is
       blocked by an independent untyped-literal delimiter drop in `string_agg`, ledgered
-      2026-08-17. Highest-leverage next slices: the 42803 GROUP BY correctness bug, the
+      2026-08-17.
+      **S13 landed 2026-08-17 — 42803 GROUP BY over-permit** (design
+      `docs/design/0134-0001-p5-groupby-name-resolution.md`): `select t1.f1 from t1 left join
+      t2 using (f1) group by f1` returned `(0 rows)` where PG rejects it with 42803. goopg's
+      downstream guard (`resolveExprAfterAggregate`, M0097-0155) was already CORRECT but
+      **starved of its input signal** — `buildAggregateStage` ran the shared ORDER-BY alias
+      substitution on every GROUP BY item (`planner.go:6515`), rewriting the bare `f1` into the
+      target list's `t1.f1` *before* the USING-merge tracking loop (`:6554`, which requires
+      `cr.Table == ""`) could see it, so `groupByMergedByName` stayed empty. PG resolves GROUP BY
+      names in the OPPOSITE order from ORDER BY: `parse_clause.c:2056-2076
+      findTargetlistEntrySQL92` gates the alias match on `EXPR_KIND_GROUP_BY` via `colNameToVar`
+      — the **FROM-clause column wins**, the target-list alias is only a fallback. Fix = a new
+      `groupByNameIsInputColumn` name-*visibility* probe gating the single GROUP BY call site;
+      the seven ORDER BY / DISTINCT ON call sites are already correct and stay untouched.
+      Diff **1096→1079 lines, 30→29 hunks** (owning hunk `@@ -1363,13 +1287,13 @@` closed);
+      blast-radius sentinels `functional_deps` 56→56 and `groupingsets` 2373→2373
+      byte-identical. Also corrects alias shadowing (`SELECT a AS b … GROUP BY b` now binds
+      `t.b`; under strict PG semantics that query then errors 42803 — verified as real PG
+      behaviour, not a goopg bug). Positional GROUP BY and genuine alias GROUP BY (TPC-H Q7)
+      are unaffected by construction. Guards:
+      `internal/optimizer/groupby_from_column_priority_test.go` (8 tests, FAIL-pre/PASS-post).
+      Highest-leverage next slices: the
       `string_agg` delimiter coercion (closes hunk 18), and the over-eager-parallelization
       size-threshold audit in `computeParallelWorkers`.
   - Progress (see `docs/design/0134-0001-p2-explain-format.md`): S1/S2/S4/S5/S6/S7/S10a landed; **S3 (class 7a) landed 2026-08-15** — join labels now PG-interpolated (commit `aa71b24d`). **S8 (class 6) landed through Slice 2b 2026-08-15**: Slice 1 = sorted GroupAggregate executor (`AggStrategySorted` + `openSorted`); Slice 2a = presorted-aggregate planner rule (`applyPresortedAggregateRule`, port of `adjust_group_pathkeys_for_groupagg`); Slice 2b = `enable_hashagg` bridge (`applyEnableHashAggRule`, `SET enable_hashagg=off` → `GroupAggregate`+`Sort`). class 10 blocked by the varno deferral (ledger 615). **S8 Slice 2c-i landed 2026-08-17** — `applyIndexOrderedGroupingRule` (`internal/optimizer/groupagg_indexorder.go`): when the GROUP BY keys are a permutation of an exact leading prefix of a usable btree index, the `*SeqScan` child becomes an ascending full-range `*IndexOnlyScan`/`*IndexScan`, `Strategy` becomes `AggStrategySorted`, and **no `Sort` is inserted**; PG's reordered `Group Key:` line comes from a new EXPLAIN-only `Aggregate.GroupKeyOrder` (`GroupExprs` is never permuted — the output bindings are positional). Diff 1311/44/661 → **1296/44/651**. Measurement re-attributed the old "Rule 3" scope (3 ledger rows 2026-08-17): the rule is gated on `enable_hashagg=off` pending a cost comparison; **Slice 2c-ii (partial prefix ⇒ needs an Incremental Sort node goopg lacks entirely — 5 of the 7 `btg` EXPLAINs)** and **Slice 2c-iii (ORDER-BY-aware ordering choice)** are DEFERRED; and `enable_hashjoin`/`enable_nestloop` non-honoring, join-aware functional-dependency GROUP BY reduction, and a duplicate residual `Filter` alongside an `Index Cond` were found to be separate gaps, not Rule 3 — while `agg_sort_order` is not a plan divergence at all (only the EXPLAIN underline-width formatter). **S11 landed 2026-08-17 — PG-faithful cumulative EXPLAIN indentation** (`internal/executor/operators_explain.go` + `explain_cte.go`): the "underline-width cosmetic gap" was a MISDIAGNOSIS — both `walkPlanFiltered` and its ANALYZE twin `walkPlanAnalyzeFiltered` computed the prefix as flat `strings.Repeat("  ", depth)`, while PG threads a cumulative `es->indent` (`explain.c:1616-1635 ExplainNode`; `->` marker at raw cols 0/2/8/14, deltas 2/6/6). The models coincide at depths 0-1, which is why the whole S8 line rendered byte-identical and the bug survived five slices; it reached the diff only because `psql` computes the header underline from the RAW widest cell while `pg-regress-runner.sh`'s `normalise_output()` collapses space runs (ledger row: the regress gate is blind to whitespace-layout divergence). Two corrections: PG's `plan_name` (CTE/InitPlan) branch bumps indent by only **+1** (verified against live PG + `rowsecurity.out:3333-3336` — the existing `explain_cte_test.go` assertion of 4 spaces was already right and was kept), and the VERBOSE `Output:` line carried a second independent indent bug, now on `detailIndent`. Diff **1296→1096 lines, 44→30 hunks, 14→0 dash-only**; the 30 remaining hunks are all S10 parallel-query plan shapes. Guards `TestExplainIndentDeepNesting` / `TestExplainAnalyzeIndentDeepNesting` (twin) / `TestExplainIndentInitPlanBranch` in `internal/executor/explain_indent_test.go`. Cross-case: every M0134 case emitting a nested EXPLAIN inherits this, `explain.sql` (M0134-0017) most directly. Remaining: S10 parallel-agg, those re-attributed gaps, scalar-subquery nesting, inheritance MergeAppend (dead-end).
