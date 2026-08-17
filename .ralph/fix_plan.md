@@ -6499,6 +6499,30 @@ M0119 and M0122's remaining items. Milestone doc:
 - [ ] **M0134-0004 — cluster.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit. **PARKED 2026-08-18 — do not re-select until the re-arm trigger fires.** Measured post-C19 harness fix: **5747 lines** (5223 `+` / 257 `-`), one hunk ~4700. Full six-bucket map in `docs/design/0134-0004-cluster-sql-divergence.md`. **Bucket 1 dominates (~4900 lines): `CLUSTER` is a no-op stub** — `clusterOp.Next()` (`internal/executor/operators_cluster.go:1-97`) locks, checks existence, and flips `pg_index.indisclustered`, but never tuplesorts the heap, swaps the relfilenode, or rebuilds indexes (PG: `cluster.c:cluster_rel`→`rebuild_relation`→`copy_table_data`→`finish_heap_swap`), so every `SELECT` after the first `CLUSTER` diverges on row order. VACUUM-FULL-scale, not a slice. Buckets 2 (old-style `CLUSTER idx ON tbl` syntax), 3 (`SUBSTRING(str FOR n)` without `FROM`), 5 (`maintenance_work_mem` GUC) are each bounded but **inert** — tens of lines out of 5747, since Bucket 1 governs everything downstream; Bucket 6 (nested default-partition conflict) is **inferred, not verified** — do not brief from it without another caller-chain read. **Bucket 4 LANDED 2026-08-18** (see the follow-up item below). **Re-arm trigger:** a real CLUSTER implementation lands as its own milestone (no design doc exists yet — writing one is step 1); then re-measure from scratch and re-classify. Ledger: 3 rows 2026-08-18.
 - [ ] **M0134-0004-a — `CREATE DATABASE ... TEMPLATE` drops table owners** — follow-up discovered while classifying `cluster.sql`. `internal/postmaster/database_ddl.go:917-923` builds a fresh `&catalog.Table{...}` per cloned table without copying `srcTbl.Owner`, so every table in a template-cloned database silently reverts to bootstrap-superuser ownership. Same failure shape as the landed Bucket 4 fix, but a different package and call site, so it needs its own brief plus a CREATE DATABASE-level test. Also fold in the no-storage CTAS fallback (`internal/executor/operators_ddl.go` ~4225-4232), which discards the `*catalog.Table` returned by `Catalog.CreateTable` and so cannot stamp an owner. Ledger: 2026-08-18.
 - [ ] **M0134-0005 — constraints.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
+      **Measured + bucketed 2026-08-18** — full map in `docs/design/0134-0005-constraints-sql-divergence.md`
+      (baseline 1496 lines / 30 hunks, post-C19 harness fix; **never compare to a
+      pre-2026-08-18 `constraints` number**). Seven buckets, one cascade.
+      **Bucket 1 LANDED**: `PREPARE`'s parameter-type validator `isValidSQLTypeName`
+      (`internal/postmaster/dispatch.go:2038`) was a hand-written allowlist of *bare*
+      built-in names, so `PREPARE p (regclass[])` failed 42704 and 13 of 30 hunks were
+      the follow-on `prepared statement "get_nnconstraint_info" does not exist`. It now
+      strips balanced typmod groups and `[]`/`[N]` array suffixes and accepts the `reg*`
+      family plus the other built-ins goopg already implements. Cascade 13 → **0**;
+      diff 1496 → **1515** lines / 30 hunks — it *grew* because the fix **unmasks**
+      (aborted statements now emit real, still-wrong result sets), so diff line count is
+      not this case's metric of record.
+      **Next slices (independent, bounded):** Bucket 2 — `NOT ENFORCED` CHECK
+      constraints are still enforced (`internal/executor/operators_fk.go:1664` ignores
+      `NamedChecks[i].NotEnforced`); Bucket 3 — `DROP`/`RENAME CONSTRAINT` cannot find a
+      NOT NULL constraint by name (`internal/executor/operators_ddl.go:10719` never
+      consults `tbl.NotNullConstraints`; **confirm the RENAME sibling before briefing** —
+      Hard-won Rule #2); Bucket 6 — `ALTER CONSTRAINT … NOT VALID/INHERIT/NO INHERIT`
+      unparsed. **Not slices:** Bucket 4 (statement-level/deferred UNIQUE checking for
+      self-referencing UPDATE permutations) and Bucket 5 (missing GiST `circle_ops`
+      default opclass) are milestone-sized. **Do not brief Bucket 7** (float8 `DEFAULT`
+      truncation on an omitted column, `a_expr`-vs-`b_expr` DEFAULT grammar, `currval()`
+      default ordering) — root cause is not pinned; it needs another research pass on the
+      missing-column catalog-default fill path.
 - [ ] **M0134-0006 — copy.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
 - [ ] **M0134-0007 — copy2.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
 - [ ] **M0134-0008 — create_index.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.

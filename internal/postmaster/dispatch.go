@@ -2038,11 +2038,58 @@ func normResultType(t string) string {
 // isValidSQLTypeName reports whether t is a known built-in SQL type name.
 // Used to validate PREPARE parameter type declarations (SQLSTATE 42704).
 func isValidSQLTypeName(t string) bool {
-	switch strings.ToLower(strings.TrimSpace(t)) {
+	s := strings.ToLower(strings.TrimSpace(t))
+	if s == "" {
+		return false
+	}
+	if strings.Count(s, "(") != strings.Count(s, ")") {
+		return false
+	}
+
+	// Strip a typmod: a balanced "( ... )" group, wherever it appears (PG
+	// allows it inside a multi-word name, e.g. "timestamp(3) with time
+	// zone"). Re-collapse surrounding whitespace to a single space.
+	for {
+		open := strings.IndexByte(s, '(')
+		if open == -1 {
+			break
+		}
+		closeRel := strings.IndexByte(s[open:], ')')
+		if closeRel == -1 {
+			// Unbalanced typmod; reject rather than silently accepting.
+			return false
+		}
+		close := open + closeRel
+		s = strings.Join(strings.Fields(s[:open]+" "+s[close+1:]), " ")
+	}
+
+	// Strip any number of trailing array-dimension suffixes: "[]" or "[N]".
+	// PG treats all array dimensionalities of a base type as the same type.
+	for {
+		s = strings.TrimSpace(s)
+		if !strings.HasSuffix(s, "]") {
+			break
+		}
+		open := strings.LastIndexByte(s, '[')
+		if open == -1 {
+			return false
+		}
+		inner := s[open+1 : len(s)-1]
+		if inner != "" {
+			if _, err := strconv.Atoi(inner); err != nil {
+				return false
+			}
+		}
+		s = s[:open]
+	}
+	s = strings.TrimSpace(s)
+
+	switch s {
 	case "int", "int2", "int4", "int8", "integer", "smallint", "bigint",
 		"float", "float4", "float8", "real", "double", "double precision",
 		"bool", "boolean",
 		"text", "varchar", "char", "bpchar", "name",
+		"character", "character varying",
 		"oid", "xid", "cid", "tid",
 		"date", "time", "timetz",
 		"time without time zone", "time with time zone",
@@ -2054,7 +2101,15 @@ func isValidSQLTypeName(t string) bool {
 		"json", "jsonb",
 		"unknown", "void", "any", "anyarray", "anyelement", "record",
 		"pg_lsn", "txid_snapshot",
-		"path", "box", "circle", "line", "lseg", "polygon", "point":
+		"path", "box", "circle", "line", "lseg", "polygon", "point",
+		"regclass", "regproc", "regprocedure", "regoper", "regoperator",
+		"regtype", "regrole", "regnamespace", "regconfig", "regdictionary",
+		"regcollation",
+		"bit", "bit varying", "varbit",
+		"inet", "cidr", "macaddr", "macaddr8",
+		"money", "xml", "tsvector", "tsquery", "jsonpath",
+		"int2vector", "oidvector", "pg_snapshot",
+		`"char"`:
 		return true
 	}
 	return false
