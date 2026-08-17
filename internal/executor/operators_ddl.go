@@ -3264,6 +3264,16 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
 	}
+	// Stamp the creating role as owner (PG: tablecmds.c DefineRelation ->
+	// heap_create_with_catalog(ownerId = GetUserId())), so a non-superuser
+	// role's own CREATE TABLE (including CREATE TEMP TABLE, which shares this
+	// construction point) doesn't get "permission denied" on itself. The
+	// bootstrap superuser leaves Owner at its zero-value sentinel
+	// (catalog.go:611-621) so every existing table's behavior is unchanged.
+	// M0134-0004 S2.
+	if o.ctx.NonSuperuserRole != "" {
+		tbl.Owner = o.ctx.NonSuperuserRole
+	}
 	tbl.Tablespace = tablespaceOID
 	if s.ForeignServer != "" {
 		tbl.ForeignServerName = s.ForeignServer
@@ -4279,6 +4289,15 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
 	}
+	// Stamp the creating role as owner (PG: tablecmds.c DefineRelation ->
+	// heap_create_with_catalog(ownerId = GetUserId())), so a non-superuser
+	// role's own CREATE TABLE ... AS SELECT doesn't get "permission denied"
+	// on itself. The bootstrap superuser leaves Owner at its zero-value
+	// sentinel (catalog.go:611-621) so every existing table's behavior is
+	// unchanged. M0134-0004 S2.
+	if o.ctx.NonSuperuserRole != "" {
+		tbl.Owner = o.ctx.NonSuperuserRole
+	}
 	tbl.Tablespace = tablespaceOID
 	// If the table was created without an explicit schema qualifier, record the
 	// resolved writable schema so TablesInSchema() can find it for DROP CASCADE.
@@ -4404,6 +4423,15 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
+	}
+	// Stamp the creating role as owner (PG: tablecmds.c DefineRelation ->
+	// heap_create_with_catalog(ownerId = GetUserId())), so a non-superuser
+	// role's own CREATE TABLE ... PARTITION OF doesn't get "permission
+	// denied" on itself. The bootstrap superuser leaves Owner at its
+	// zero-value sentinel (catalog.go:611-621) so every existing table's
+	// behavior is unchanged. M0134-0004 S2 round 2.
+	if o.ctx.NonSuperuserRole != "" {
+		tbl.Owner = o.ctx.NonSuperuserRole
 	}
 	tbl.Tablespace = tablespaceOID
 	// If the table was created without an explicit schema qualifier, record the
