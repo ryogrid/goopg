@@ -1,52 +1,62 @@
-# Working set — M-NIGHTLY AI-20260817-011734-002/-003 (LANDED `6536bdf5`)
+# Working set — M-NIGHTLY AI-20260817-011734-004/-005 (LANDED `c90da521`)
 
-**Task:** M-NIGHTLY nightly triage, items -002/-003
-(`TestE2E_PG{Cold,Crash}StartOnGoopgDataDir`). Selected per the Current Priority
-banner: M-NIGHTLY outranks M0134 and had 6 unchecked items.
+**Task:** M-NIGHTLY nightly triage, items -004 and -005. Selected per the Current
+Priority banner (M-NIGHTLY outranks M0134).
 
-**Landed:** a live **data-corruption** fix, not an E2E-harness fix. Both tests
-died on the goopg side before PG was ever attached. S4's Filter-drop (`aa40caa6`,
-M0134-0001) made `tryRangeIndexScan` return a **bare** `*IndexScan`;
-`extractScan` (`internal/executor/operators_storage.go:3211`) degrades an
-`*IndexScan` DML child to `SeqScan + indexScanPredicate(ix)`, and that function
-handled only `Key != nil`, returning `nil` otherwise — safe only while a `Filter`
-always wrapped the scan. With no Filter, `scanMatching` ran with **no predicate**,
-so `DELETE`/`UPDATE ... WHERE <indexed_col> <range-op> <const>` hit EVERY row
-(verified: `UPDATE ... WHERE id > 15` updated 20 of 20). Fix: reconstruct the
-bound for every shape — `Key`, `Keys` (multi-column probe, same latent hazard),
-`LowKey`/`HighKey` honoring `LowOp`/`HighOp` — via a new `indexScanColumnRef`
-helper. Planner deliberately untouched.
+**Landed (test-harness only, zero production-code change):**
+- **-005** `TestPort_PgoutputInteropPGToGoopgBpcharPadding` — a **harness race**,
+  not an engine bug. The test does 4 INSERTs then a value-only `UPDATE ... SET
+  filler='new' WHERE id=1`, but `PubSubCluster.WaitForRow` polls only
+  `count(*)`, which the INSERTs already satisfy — so it returned pre-UPDATE and
+  the assertion read `'ab'` (length 2, want 3). Deterministic (3/3), not flaky.
+  Fix: new `PubSubCluster.WaitForScalar(t, query, want, timeout)` (reports the
+  last-observed value on timeout, so a genuinely wrong applied value still
+  surfaces) + unit test; the test waits on it before its unchanged assertions.
+  Swept all other `WaitForRow` callers in `pgoutput_interop_test.go` — no other hit.
+- **-004** `TestPort_IsolationIndexOnlyBitmapscan` — **stale**, closed with no code
+  change: PASSes at HEAD in 3.66 s, already fixed by `6536bdf5`.
 
-**Invariant (do not regress):** `indexScanPredicate` returning `nil` means
-"match every row". Any new `IndexScan` field that restricts rows (backward scan,
-partial-index predicate, skip prefix) MUST be reconstructed there.
+**Ruled out (do not re-investigate):** the bpchar codec path is correct.
+`parsePgoutputText` (`internal/executor/applyworker.go`) deliberately has no
+bpchar branch — the padded `bpcharout` wire value is re-trimmed by
+`coerceTextLikeDatum` (`internal/executor/codec.go`), matching
+`varchar.c::bpcharin`/`bpcharlen`. A bpchar branch there is a no-op "fix".
 
-**Files:** `internal/executor/operators_storage.go`,
-`internal/executor/range_dml_predicate_test.go` (new),
-`docs/design/0134-0001-p2-explain-format.md` (new §"S4 follow-up"),
-`.ralph/fix_plan.md`, `.ralph/deferral_ledger.md`.
+**Invariant (do not regress):** `WaitForRow` can only observe a change that moves
+a row count. Any assertion about an UPDATE — or anything leaving `count(*)`
+unchanged — needs `WaitForScalar`.
 
-**Gates run:** `go build ./...` PASS; `internal/executor` + `internal/optimizer`
-PASS; new tests FAIL-pre / PASS-post (RowsAffected 10/10 before);
-both E2E repros PASS; `RALPH_PRECOMMIT_SCOPE=units` PASS; `scripts/tpch-spotcheck.sh`
-PASS (Q12=2, Q13=35); pre-commit pgbench smoke PASS.
+**Files:** `internal/testutil/pubsubcluster/cluster.go` + `cluster_test.go`,
+`internal/testport/pgoutput_interop_test.go`,
+`docs/design/0103-0047-m0103-0007-rung-24-bpchar-padding.md` (new §"Follow-up
+2026-08-17"), `.ralph/fix_plan.md`, `.ralph/deferral_ledger.md`.
 
-**Deferral ledger:** 1 row (2026-08-17) — the degrade-to-SeqScan contract itself:
-DML never uses the btree for access (PG's `nodeModifyTable.c` has no predicate
-reconstruction step at all) and the reconstruction is a hand-maintained mirror of
-the planner's bound fields. Resume: drive `deleteOp`/`updateOp` from the child
-plan's own operator, as `updateOp.updateViaIndex` already does for equality.
+**Gates run:** `go build ./...` PASS; `internal/testutil/pubsubcluster` PASS;
+target test FAIL-pre / 3/3 PASS-post; `RALPH_PRECOMMIT_SCOPE=units` PASS (warm
+cache, 3.2 s); pre-commit pgbench smoke PASS. No tpch-spotcheck — no
+planner/executor/codec file was touched.
 
-**Next step:** M-NIGHTLY still has 4 unchecked items from run `20260817-011734`
-(banner keeps M-NIGHTLY first). Take **AI-20260817-011734-004**
-(`TestPort_IsolationIndexOnlyBitmapscan`) next — same previously-unattributable
-set, and index-adjacent, so re-run its repro at HEAD first: it may already be
-fixed by `6536bdf5`. Item -001 (race/internal/initdb) is still expected stale
-(run predates `83dd7ae8`); verify with
+**Deferral ledger:** 1 row (2026-08-17) — the harness has **no apply-position
+(LSN) wait primitive**; all sync is value polling, so an event changing NO
+subscriber-visible value stays unwaitable. Resume: add `WaitForCatchup` modeled
+on `Cluster.pm::wait_for_catchup`, but first check whether goopg exposes
+`pg_stat_subscription.latest_end_lsn` / `pg_replication_origin_progress` at all.
+
+**Next step:** M-NIGHTLY run `20260817-011734` has 2 unchecked items left.
+Take **AI-20260817-011734-006** (`TestPort_RegressWedgeProbeNamesTheStuckStatement`)
+next — already triaged this loop and still failing at HEAD: a **probe-tooling**
+bug, not an engine bug. Its goroutine dump captures the test harness's own
+`runtime/pprof.writeGoroutineStacks` frames instead of the goopg server
+subprocess (`regress_wedge_probe_guard_test.go:94`); the probe's
+`pg_stat_activity` + RSS/log-tail capture already work. Fix = point the dump
+collector at the server subprocess. Item -001 (race/internal/initdb) is still
+expected stale (run predates `83dd7ae8`); verify with
 `make race-gate RACE_TIMEOUT=45m RACE_SHARD_ONLY=1` when a ~20 min slot is free.
 
-**Delegation:** `tmp/ralph-handoffs/m-nightly-20260817-e2e-pgstart/` — tester
-triage (DONE), researcher root-cause (DONE), implementer (DONE, 1 round), tester
-gate round (DONE). All rounds converged first try.
+**Delegation:** `tmp/ralph-handoffs/m-nightly-20260817-testport-triage/` (tester,
+DONE — 3 verdicts) and `tmp/ralph-handoffs/m-nightly-20260817-bpchar-pgoutput/`
+(researcher DONE, tester determinism+timing probe DONE, implementer DONE 1 round).
+The researcher's race hypothesis was NOT taken on trust — the tester probe
+discriminated it from an apply-path bug before any code was written.
 
 **In-flight:** none.
