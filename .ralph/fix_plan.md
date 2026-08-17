@@ -1096,14 +1096,27 @@ repro at HEAD first; the log reflects the last nightly and may be stale).
       timeout to ≈19m56s across 4 shards). Verify, then close.
       Repro: `make race-gate RACE_TIMEOUT=45m RACE_SHARD_ONLY=1`.
       Evidence: `ci/logs/20260817-011734/race/go-test.log`.
-- [ ] **testport/TestE2E_PGColdStartOnGoopgDataDir (AI-20260817-011734-002)** —
+- [x] **testport/TestE2E_PGColdStartOnGoopgDataDir (AI-20260817-011734-002)** —
+      FIXED 2026-08-17. NOT an E2E-harness or PG-interop bug: the tests died on the
+      goopg side, before PG was ever attached. Root cause: S4's Filter-drop
+      (`aa40caa6`) made `tryRangeIndexScan` return a bare `*IndexScan`, and
+      `indexScanPredicate` (`internal/executor/operators_storage.go`) reconstructed
+      a predicate only for `Key != nil`, so `UPDATE`/`DELETE ... WHERE
+      <indexed_col> <range-op> <const>` ran `scanMatching` with a nil predicate and
+      hit EVERY row (live data corruption). Fix: reconstruct the predicate for
+      `Key`, `Keys` and `LowKey`/`HighKey` (honoring `LowOp`/`HighOp`). Design:
+      `docs/design/0134-0001-p2-explain-format.md` §"S4 follow-up". Gates: units +
+      tpch-spotcheck (Q12=2/Q13=35) + both E2E tests PASS.
       FAILed (new tonight). Repro:
       `go test -v -run '^TestE2E_PGColdStartOnGoopgDataDir$' ./internal/testport/`.
       Evidence: `ci/logs/20260817-011734/testport/go-test.log`. Note this test was
       one of the 9 listed as UNATTRIBUTABLE behind the previous run's mid-stage
       build break (AI-20260816-005117-003), so tonight is its first attributable
       result.
-- [ ] **testport/TestE2E_PGCrashStartOnGoopgDataDir (AI-20260817-011734-003)** —
+- [x] **testport/TestE2E_PGCrashStartOnGoopgDataDir (AI-20260817-011734-003)** —
+      FIXED 2026-08-17 by the same commit as -002 (shared root cause: range-index
+      DML over-match; this test's `DELETE FROM ... WHERE id BETWEEN 860 AND 900`
+      hit the same path). See -002 for the full attribution.
       FAILed (new tonight). Repro:
       `go test -v -run '^TestE2E_PGCrashStartOnGoopgDataDir$' ./internal/testport/`.
       Evidence: `ci/logs/20260817-011734/testport/go-test.log`. Same

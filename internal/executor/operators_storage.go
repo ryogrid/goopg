@@ -3199,12 +3199,24 @@ func partitionKeyDatumToListStr(d Datum) string {
 // the runtime should apply per row. The runtime's scanMatching is
 // inherently sequential — it walks every block of the relation —
 // so an IndexScan plan is treated as "SeqScan with a synthesised
-// `<indexed_col> = key` equality predicate". This is correct (the
-// predicate filters the same tuples the index would have probed)
-// but does not exploit the index for fast access; that
+// predicate reconstructing whatever bound(s) the IndexScan encodes
+// (equality via Key/Keys, or a range via LowKey/HighKey)". This is
+// correct (the predicate filters the same tuples the index would
+// have probed) but does not exploit the index for fast access; that
 // optimisation is a follow-up. Filter(IndexScan) combines the
-// outer Filter's predicate with the synthesised key predicate
-// via AND.
+// outer Filter's predicate with the synthesised predicate via AND
+// (harmless when both express the same condition — the AND is then
+// simply redundant, not incorrect).
+//
+// M0134-0001 S4 (aa40caa6) taught the planner to drop the wrapping
+// Filter for a single-conjunct single-column range IndexScan (see
+// tryRangeIndexScan), returning a bare *IndexScan with Key == nil and
+// LowKey/HighKey set. Before this fix, indexScanPredicate returned nil
+// for that shape and the bare-*IndexScan branch below had no Filter to
+// fall back on, so scanMatching ran with a nil predicate — matching
+// every row of the table. indexScanPredicate must therefore be able to
+// reconstruct a predicate for EVERY IndexScan shape the planner can
+// produce, not just point-lookup equality.
 //
 // Surfaces an explicit XX000 for plan shapes the executor doesn't
 // recognise — pre-existing planner-bug guard.
@@ -3227,8 +3239,9 @@ func extractScan(child optimizer.Node) (seq *optimizer.SeqScan, pred optimizer.E
 			idxPred := indexScanPredicate(inner)
 			var combined optimizer.Expr
 			if idxPred == nil {
-				// Range scan — no synthesised equality predicate;
-				// the Filter predicate alone is the full condition.
+				// No synthesised predicate (e.g. catalog-inconsistency
+				// fallback) — the Filter predicate alone is the full
+				// condition.
 				combined = c.Predicate
 			} else {
 				combined = &optimizer.BinaryOp{
@@ -3244,42 +3257,111 @@ func extractScan(child optimizer.Node) (seq *optimizer.SeqScan, pred optimizer.E
 	return nil, nil, nil, &ExecError{Code: "XX000", Pos: child.Pos(), Message: "Update/Delete: unsupported child plan"}
 }
 
-// indexScanPredicate synthesises a `<indexed_col> = key` equality
-// predicate from a planner.IndexScan node so the runtime's
-// scanMatching loop (which always seq-scans) filters correctly
-// against the index's key target. The IndexScan's resolved
-// `Key` expression carries the rhs; the lhs reconstructs as a
-// ColumnRef pointing at the indexed column's table-output
-// ordinal. v0 indexes are single-column so Index.Columns[0] is
-// the relevant name; resolving against the IndexScan's parent
-// schema gives the correct output index for ColumnRef.
-//
-// Range scans (Key == nil) return nil — UPDATE/DELETE with range
-// predicates fall through to seq-scan, which is correct and safe.
-func indexScanPredicate(ix *optimizer.IndexScan) optimizer.Expr {
-	if ix.Key == nil {
-		// Range scan: no equality predicate to synthesise.
-		// The caller (extractScan) will combine this nil with
-		// any Filter predicate already present. Returning nil
-		// here causes the update/delete path to fall through to
-		// a full seq-scan with Filter, which is always correct.
-		return nil
-	}
-	col := ix.Index.Columns[0]
+// indexScanColumnRef resolves the given index-column name against the
+// IndexScan's output schema, returning a ColumnRef bound to the correct
+// table-output ordinal. Factored out of indexScanPredicate because every
+// bound-reconstruction branch (equality, multi-key equality, range) needs
+// the same lookup. Returns ok=false on catalog inconsistency (index
+// references a column not on the table's output schema).
+func indexScanColumnRef(ix *optimizer.IndexScan, col string) (*optimizer.ColumnRef, bool) {
 	out := ix.Output()
 	for i, sc := range out {
 		if sc.Name == col {
-			return &optimizer.BinaryOp{
-				Op:    parser.OpEq,
-				Left:  &optimizer.ColumnRef{Index: i, Name: col, Type: sc.Type},
-				Right: ix.Key,
-			}
+			return &optimizer.ColumnRef{Index: i, Name: col, Type: sc.Type}, true
 		}
 	}
-	// Catalog inconsistency — index references a column that
-	// isn't on the table's output schema. Conservative: drop
-	// the predicate (over-match into the seq-scan body); the
-	// planner-side resolver should have caught this.
+	return nil, false
+}
+
+// indexScanPredicate synthesises a predicate from a planner.IndexScan
+// node so the runtime's scanMatching loop (which always seq-scans)
+// filters correctly against whatever bound(s) the index scan encodes.
+// v0 indexes are single-column for the Key/LowKey/HighKey shapes;
+// Keys (M0054-0006-followup) covers multi-column equality probes.
+//
+//   - ix.Key != nil: single-column equality scan — `col = Key`.
+//   - len(ix.Keys) != 0: multi-column equality probe — AND one
+//     `Index.Columns[i] = Keys[i]` per key (takes priority over Key,
+//     matching the planner's own precedence — see the IndexScan doc
+//     comment on plan.go).
+//   - ix.LowKey != nil || ix.HighKey != nil: range scan (M0134-0001 S4
+//     may hand this back with Key == nil and no wrapping Filter — see
+//     extractScan's doc comment). Reconstructs `col >= LowKey` (or
+//     `col > LowKey` when LowOp == parser.OpGt) AND/OR `col <= HighKey`
+//     (or `col < HighKey` when HighOp == parser.OpLt), mirroring the
+//     inclusive/exclusive convention documented on IndexScan.LowOp/HighOp.
+//     Both bounds present are AND-combined.
+//
+// Returns nil only as a last resort — when none of the above shapes
+// apply, or when a column ordinal can't be resolved (catalog
+// inconsistency; the planner-side resolver should have caught this).
+// A nil return causes the bare-*IndexScan branch of extractScan to run
+// scanMatching with NO predicate — i.e. it matches every row — so new
+// IndexScan bound shapes must be added here, not left to fall through.
+func indexScanPredicate(ix *optimizer.IndexScan) optimizer.Expr {
+	switch {
+	case ix.Key != nil:
+		col := ix.Index.Columns[0]
+		ref, ok := indexScanColumnRef(ix, col)
+		if !ok {
+			return nil
+		}
+		return &optimizer.BinaryOp{Op: parser.OpEq, Left: ref, Right: ix.Key}
+
+	case len(ix.Keys) != 0:
+		var combined optimizer.Expr
+		for i, key := range ix.Keys {
+			if i >= len(ix.Index.Columns) {
+				// Catalog inconsistency (more keys than indexed
+				// columns) — conservative: drop the predicate.
+				return nil
+			}
+			ref, ok := indexScanColumnRef(ix, ix.Index.Columns[i])
+			if !ok {
+				return nil
+			}
+			eq := &optimizer.BinaryOp{Op: parser.OpEq, Left: ref, Right: key}
+			if combined == nil {
+				combined = eq
+			} else {
+				combined = &optimizer.BinaryOp{Op: parser.OpAnd, Left: combined, Right: eq}
+			}
+		}
+		return combined
+
+	case ix.LowKey != nil || ix.HighKey != nil:
+		col := ix.Index.Columns[0]
+		var combined optimizer.Expr
+		if ix.LowKey != nil {
+			ref, ok := indexScanColumnRef(ix, col)
+			if !ok {
+				return nil
+			}
+			op := parser.OpGe
+			if ix.LowOp == parser.OpGt {
+				op = parser.OpGt
+			}
+			combined = &optimizer.BinaryOp{Op: op, Left: ref, Right: ix.LowKey}
+		}
+		if ix.HighKey != nil {
+			ref, ok := indexScanColumnRef(ix, col)
+			if !ok {
+				return nil
+			}
+			op := parser.OpLe
+			if ix.HighOp == parser.OpLt {
+				op = parser.OpLt
+			}
+			high := &optimizer.BinaryOp{Op: op, Left: ref, Right: ix.HighKey}
+			if combined == nil {
+				combined = high
+			} else {
+				combined = &optimizer.BinaryOp{Op: parser.OpAnd, Left: combined, Right: high}
+			}
+		}
+		return combined
+	}
+	// No Key/Keys/LowKey/HighKey at all — nothing to reconstruct.
 	return nil
 }
 

@@ -695,6 +695,48 @@ from a range scan renders neither Index Cond nor Filter and cannot express exclu
 (Option A scope); (2) multi-conjunct/composite WHERE keeps the redundant range
 conjunct in the Filter (PG trims it via `is_redundant_with_indexclauses`).
 
+### S4 follow-up — the Filter-drop broke UPDATE/DELETE row selection (fixed 2026-08-17)
+
+S4's Filter-drop changed a plan-shape *contract* the executor's DML path silently
+depended on, and the nightly caught it two runs later (AI-20260817-011734-002 /
+-003: `TestE2E_PG{Cold,Crash}StartOnGoopgDataDir`, both failing on a
+`WHERE id = <lit>` point lookup that returned 0 rows *after* an earlier
+`DELETE ... WHERE id > 15` had wiped the whole table).
+
+**Chain.** `extractScan` (`internal/executor/operators_storage.go:3211`) turns an
+UPDATE/DELETE child plan into `SeqScan + predicate`, because `scanMatching` is
+inherently sequential. For an `*IndexScan` child it reconstructs the predicate via
+`indexScanPredicate`, which handled *only* `Key != nil` (single-column equality) and
+returned `nil` otherwise — safe while every range scan was wrapped in a `Filter`
+(the `Filter(*IndexScan)` branch then used the Filter predicate alone). After S4 a
+single-conjunct single-column range scan arrives as a **bare** `*IndexScan` with
+`Key == nil`, so the reconstruction produced `nil` and `scanMatching` ran with **no
+predicate at all** — matching, and deleting/updating, every row of the relation.
+Verified directly: `UPDATE t SET qty=0 WHERE id > 15` on a 20-row table updated 20
+rows (want 5).
+
+**Fix (executor-side, one place, both DML operators).** `indexScanPredicate` now
+reconstructs a predicate for *every* bound shape the planner can emit:
+`Key` (equality), `Keys` (multi-column equality probe — also previously nil, same
+over-match hazard), and `LowKey`/`HighKey` honoring `LowOp`/`HighOp` for exclusive
+bounds. A shared `indexScanColumnRef` helper does the output-ordinal lookup. `nil`
+is now returned only on catalog inconsistency or a genuinely bound-less scan (where
+"match everything" is the correct answer). The planner was deliberately NOT touched:
+gating the Filter-drop to SELECT would have kept the executor's fragile contract.
+
+**Invariant to preserve:** any new `IndexScan` bound field that restricts which
+rows the scan returns MUST be reconstructed here — the doc comments on both
+`extractScan` and `indexScanPredicate` now say so, and `nil` is documented as
+"matches every row", not as "safe fallback".
+
+**Gates:** `internal/executor` + `internal/optimizer` PASS; the two E2E tests PASS;
+`RALPH_PRECOMMIT_SCOPE=units` PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2,
+Q13=35). New regression file `internal/executor/range_dml_predicate_test.go` covers
+`>`, `>=`, `<`, `<=`, `BETWEEN` and multi-column equality for both DELETE and
+UPDATE, asserting affected-row counts *and* that untouched rows keep their values;
+it pins the bug-triggering plan shape (bare `*IndexScan`, no `Filter`) and was
+verified FAIL-pre (RowsAffected=10 of 10 on every range case) / PASS-post.
+
 ## class 10 (VERBOSE `Output:` qualification) — blocked by the varno deferral (2026-08-15)
 
 The class-10 qualification gap is NOT a self-contained formatter fix. A slice
