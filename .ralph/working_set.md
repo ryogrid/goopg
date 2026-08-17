@@ -1,60 +1,62 @@
-# Working set — M0134-0005 Bucket 2 landed; case still open, Bucket 3 is next
+# Working set — M0134-0005 Bucket 3 landed; case still open, Bucket 6 is next
 
-**Task:** M0134-0005 (`constraints.sql`) — **Bucket 2 LANDED 2026-08-18**
-(commit `30855a6b`); the case stays `[ ]`. Selected per the Current Priority
-banner (M0134 next after M-NIGHTLY). M-NIGHTLY drained: `ci/logs/action-items.md`
-is still run `20260817-011734`, all 6 filed and `[x]` — nothing new to file.
+**Task:** M0134-0005 (`constraints.sql`) — **Bucket 3 LANDED 2026-08-18**; the case
+stays `[ ]`. Selected per the Current Priority banner (M0134 next after M-NIGHTLY).
+M-NIGHTLY drained: `ci/logs/action-items.md` advanced to run `20260818-005518` with
+**items: 0** — nothing to file.
 
-**What landed.** `checkConstraints` (`internal/executor/operators_fk.go:1664`)
-looped `tbl.CheckConstraints` unconditionally and never consulted
-`tbl.NamedChecks[i].NotEnforced`, so a `NOT ENFORCED` CHECK still raised 23514 on
-rows PG accepts. Six-line fix: `continue` when the aligned `NamedChecks` entry is
-`NotEnforced` (bounds-checked). PG: `execMain.c:ExecRelCheck:1813-1815`.
+**What landed.** `ALTER TABLE … DROP CONSTRAINT <name>` and `… RENAME CONSTRAINT
+<old> TO <new>` now resolve named NOT NULL constraints. Both were blind; the twin
+check the previous baton demanded came back **positive**.
 
-**Three facts the research pass settled (don't re-derive).** (1) `NotEnforced` is
-already parsed/stored for both CREATE TABLE and ALTER TABLE ADD CONSTRAINT, and
-the ADD-CONSTRAINT initial scan (`operators_ddl.go:8093`) + VALIDATE CONSTRAINT
-(`:8037`) already honour it. (2) `CheckConstraints` and `NamedChecks` are
-index-aligned 1:1 by construction — single fan-in `catalog.AddCheckFull`
-(`internal/catalog/catalog.go:288`). (3) `checkConstraints` is the ONLY runtime
-enforcement site: INSERT/COPY (`operators_storage.go:2494`) and UPDATE
-(`checkRowConstraintsForWrite`, `operators_fk.go:1830`) both route through it —
-no sibling edit needed (Rule #2 verified, not assumed). Domain checks are a
-separate path (`checkDomainConstraintsForRow`), out of scope.
+**Four facts the research pass settled (don't re-derive).** (1) The RENAME path is
+NOT a function named `execAlterTableRenameConstraint` — it is an inline `case
+parser.AlterTableRenameConstraint:` at `operators_ddl.go:8796`. (2) It already
+*referenced* `tbl.NotNullConstraints` inside the `constraintNameInUse` helper
+(`:8836-8840`), which is exactly what makes a grep-based check wrongly report
+"already handled"; its own resolution chain skipped NOT NULL. Its comment claiming
+parity with the drop path's "same four stores" was wrong in both count and contents.
+(3) `NamedNotNullConstraint.Name` is always populated, auto-named
+`<table>_<col>_not_null` at every construction site — no data-model gap. (4) PG
+recurses to children by **column name** for not-nulls and by constraint name for
+everything else (`tablecmds.c:14251-14255`).
 
-**Measurement.** `constraints` diff 1515 → **1465** lines, hunks 30 → 31 (one
-surviving hunk split, NOT new divergence). `NE_CHECK_TBL`/`NE_INSERT_TBL_CON`
-gone. A plain shrink, unlike Bucket 1's unmasking. **Never compare to a
-pre-2026-08-18 `constraints` number** (pre-C19 harness).
+**Measurement.** `constraints` diff 1465 → **1431** lines, hunks 31 → **33**. An
+**unmasking** like Bucket 1, not a plain shrink: every added hunk traced to a
+pre-existing unrelated gap (ALTER CONSTRAINT ENFORCED / INHERIT parser gaps, NOT
+NULL inheritance propagation). **Never compare to a pre-2026-08-18 `constraints`
+number** (pre-C19 harness).
 
-**Files:** `internal/executor/operators_fk.go`,
-`internal/executor/operators_fk_check_notenforced_skip_test.go` (new,
-`TestCheckConstraintNotEnforcedSkipsRuntimeEvaluation`),
-`docs/design/0134-0005-constraints-sql-divergence.md` (§4 Bucket 2),
-`docs/design/README.md`, `.ralph/fix_plan.md`, `.ralph/deferral_ledger.md` (1 row).
+**Files:** `internal/executor/operators_ddl.go` (new `clearNotNullConstraint`
+helper factored from the `AlterTableDropNotNull` case; step "3.7" in
+`execAlterTableDropConstraint`; step "2.5" in the rename case; two stale comments
+corrected), `internal/executor/operators_fk_unique_drop_constraint_test.go`,
+`internal/executor/operators_ddl_rename_constraint_test.go`,
+`docs/design/0134-0005-constraints-sql-divergence.md` (§5 Bucket 3, §6 next),
+`docs/design/README.md`, `.ralph/deferral_ledger.md` (2 rows).
 
-**Next step:** stay on M0134-0005 and brief **Bucket 3** — `ALTER TABLE DROP
-CONSTRAINT` can't resolve a NOT NULL constraint by name
-(`internal/executor/operators_ddl.go:10719` checks NamedChecks/FK/UNIQUE/EXCLUDE/PK
-but never `tbl.NotNullConstraints`; PG `tablecmds.c:dropconstraint_internal`
-handles `CONSTR_NOTNULL`). **First confirm whether `execAlterTableRenameConstraint`
-shares the omission** — sibling pair, Hard-won Rule #2; the design doc flags it as
-assumed-by-pattern, not read. Bucket 6 (`ALTER CONSTRAINT … NOT VALID/INHERIT/NO
-INHERIT` unparsed) is the next-smallest after that. **Do not brief Bucket 7**
-(root cause unpinned — needs research on the missing-column catalog-default *fill*
-path). Buckets 4 (deferred statement-level UNIQUE) and 5 (GiST `circle_ops`) are
-milestone-sized. New ledger item: `NOT ENFORCED` on **UNIQUE** constraints
-(`UNIQUE_NOTEN_TBL`) — parser + index-maintenance path, not `checkConstraints`.
+**Next step:** stay on M0134-0005 and brief **Bucket 6** — `ALTER TABLE … ALTER
+CONSTRAINT <name> NOT VALID / INHERIT / NO INHERIT` is a parse error (no production
+near `internal/parser/ddl.go:2863` `parseFKConstraintAttrs`; PG
+`tablecmds.c:ATExecAlterConstrEnforceability` + the NO INHERIT toggle). It is the
+smallest remaining and Bucket 3's unmasking just made two more of its hunks visible.
+Watch the split flagged in the bucket table: the *parser* gap is a slice, the
+*semantics* of toggling inheritance on an existing not-null is separate and larger —
+brief the parser arm only, ledger the semantics. Alternative if Bucket 6 needs a
+matching executor arm: the NOT NULL inheritance-propagation gap ledgered this loop
+(`operators_ddl.go:4748-4753`). **Do not brief Bucket 7** (root cause unpinned).
+Buckets 4 (deferred statement-level UNIQUE) and 5 (GiST `circle_ops`) are
+milestone-sized.
 
-**Gates run:** guard test FAIL pre / PASS post; `go test ./internal/executor/`
-and `./internal/catalog/` PASS; `RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh` PASS (~9 min); `scripts/tpch-spotcheck.sh` PASS
-(Q12=2, Q13=35 — executor change, Rule #1); `scripts/pg-regress-runner.sh
-constraints` re-measured 1465/31; pre-commit pgbench smoke PASS (select-only
-12.8k tps). No TPC-DS — write-path-only constraint change.
+**Gates run:** guard tests FAIL pre / PASS post; `go test ./internal/executor/` and
+`./internal/catalog/` PASS; `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh` PASS (~9 min; `cmd/goopg` + `internal/initdb` ran
+cold — cache miss, not a regression); `scripts/tpch-spotcheck.sh` PASS (Q12=2,
+Q13=35 — executor change, Rule #1); `scripts/pg-regress-runner.sh constraints`
+re-measured 1431/33. No TPC-DS — DDL-only change.
 
-**Delegation:** `tmp/ralph-handoffs/m0134-0005-s03-not-enforced-check/`
-(researcher `a4171ab8654e1a662` 1 round → the three facts above; implementer
-`ad24ea1b0e8fdeaa3` 1 round DONE; tester `a40d42e7d76325875` 1 round, 4 gates).
+**Delegation:** `tmp/ralph-handoffs/m0134-0005-s04-notnull-constraint-byname/`
+(researcher `a3681e5c45d1307f2` 1 round → the four facts above; implementer
+`a6a36ac04a3f339df` 1 round DONE; tester `aef5d01a9beb8d0ca` 1 round, 4 gates).
 
 **In-flight:** none.

@@ -1,6 +1,8 @@
-# M0134-0005 — `constraints.sql` divergence map + Bucket 1 (PREPARE parameter type names)
+# M0134-0005 — `constraints.sql` divergence map + Buckets 1-3
 
-Status: accepted — Buckets 1 and 2 LANDED 2026-08-18; the case stays open (`[ ]`).
+Status: accepted — Buckets 1, 2 and 3 LANDED 2026-08-18; the case stays open (`[ ]`).
+Running measurement: 1496 (baseline) → 1515 (B1, unmasking) → 1465 (B2) → **1431** (B3,
+unmasking); hunks 30 → 30 → 31 → **33**.
 
 ## 1. Baseline (re-measured 2026-08-18)
 
@@ -32,7 +34,7 @@ cannot be judged until an earlier bucket is fixed.
 |---|---|---|---|---|---|
 | **1** | **PREPARE parameter-type validator rejects `regclass[]`** — and any array or typmod spelling, and whole built-in families | 13 hunks / ~120 lines | `internal/postmaster/dispatch.go:2038` `isValidSQLTypeName` | `gram.y` `PreparableStmt` takes `Typename` (carries `arrayBounds` + `typmods`); resolution is `parse_type.c:typenameType`, a real `pg_type` lookup | **LANDED** — see §3 |
 | **2** | **`NOT ENFORCED` CHECK constraints are still enforced on INSERT** | ~4 hunks / 50 lines | `internal/executor/operators_fk.go:1664` `checkConstraints` loops `tbl.CheckConstraints` unconditionally, never consulting `tbl.NamedChecks[i].NotEnforced` | `execMain.c:ExecRelCheck` lines 1813-1815 — `/* Skip not enforced constraint */ if (!check[i].ccenforced) continue;` | **LANDED** — see §4 |
-| 3 | `DROP CONSTRAINT` / `RENAME CONSTRAINT` cannot find a NOT NULL constraint by name | ~6 hunks | `internal/executor/operators_ddl.go:10719` `execAlterTableDropConstraint` checks NamedChecks/FK/UNIQUE/EXCLUDE/PK but never `tbl.NotNullConstraints`; the RENAME sibling is **assumed by pattern, not read** | `tablecmds.c:dropconstraint_internal` handles `CONSTR_NOTNULL` alongside the other contypes | independent, bounded ⇒ good next slice; **verify the RENAME sibling before briefing** |
+| **3** | **`DROP CONSTRAINT` / `RENAME CONSTRAINT` cannot find a NOT NULL constraint by name** — LANDED 2026-08-18, see §5 | ~6 hunks | `internal/executor/operators_ddl.go:10719` `execAlterTableDropConstraint` checks NamedChecks/FK/UNIQUE/EXCLUDE/PK but never `tbl.NotNullConstraints`; the RENAME sibling is **assumed by pattern, not read** | `tablecmds.c:dropconstraint_internal` handles `CONSTR_NOTNULL` alongside the other contypes | independent, bounded ⇒ good next slice; **verify the RENAME sibling before briefing** — verified 2026-08-18: the sibling DID share the omission. **LANDED**, §5 |
 | 4 | statement-level / deferred UNIQUE checking during self-referencing UPDATE (`UPDATE unique_tbl SET i=i+1`, ring rotations, `SET CONSTRAINTS … DEFERRED` re-check timing) | ~6-8 hunks, the largest line driver (~340 lines) | not one function: goopg maintains unique indexes row-by-row inside UPDATE | PG defers same-statement duplicate detection so a row-permutation UPDATE succeeds despite colliding intermediate states (`ExecInsertIndexTuples` + the deferred-trigger queue) | **MILESTONE**, not a slice — real constraint-timing/MVCC work |
 | 5 | `EXCLUDE USING gist` on `circle` → "data type circle has no default operator class", cascading to 10× "relation circles does not exist" | ~11 hunks | opclass registry has no circle/gist default opclass | PG ships `circle_ops` for GiST | **MILESTONE** (GiST opclass coverage) |
 | 6 | `ALTER TABLE … ALTER CONSTRAINT <name> NOT VALID / INHERIT / NO INHERIT` unparsed (syntax error) | ~3 hunks | parser: no production for the standalone `ALTER CONSTRAINT` trailers (near `internal/parser/ddl.go:2863` `parseFKConstraintAttrs`) | `tablecmds.c:ATExecAlterConstrEnforceability` and the NO INHERIT toggle | parser gap is a small slice; the *semantics* of toggling inheritance on an existing not-null constraint is separate and larger |
@@ -122,11 +124,64 @@ constraint type on a different code path. Ledgered. Note that PG has **no** CHEC
 `ATExecAlterConstrEnforceability` asserts `contype == CONSTRAINT_FOREIGN`), so none was
 added here.
 
-## 5. Next slice for this case
+## 5. Bucket 3 — NOT NULL constraints resolvable by name (LANDED 2026-08-18)
 
-Bucket 3 (NOT NULL constraint by name) — independent, bounded, single-site.
-Bucket 3 must first confirm whether
-`execAlterTableRenameConstraint` has the same omission as the DROP handler; that is a
-sibling pair, and a fix to only one of them is the failure mode Hard-won Rule #2 exists
-to prevent. Buckets 4 and 5 need their own milestones. Bucket 7 needs a research pass
-before it can be briefed at all.
+**The sibling check the previous §5 demanded came back positive.** The DROP handler
+`execAlterTableDropConstraint` (`internal/executor/operators_ddl.go:10719`) and the
+RENAME path both ignored `tbl.NotNullConstraints`, so each raised
+`42704 constraint "x" of relation "y" does not exist` for a constraint that plainly
+exists. Two facts about the RENAME path are worth recording because both are traps:
+
+1. It is **not** a function named `execAlterTableRenameConstraint` — it is an inline
+   `case parser.AlterTableRenameConstraint:` at `:8796` inside `execAlterTable`.
+2. It *does* reference `tbl.NotNullConstraints`, but only inside the
+   `constraintNameInUse` collision helper (`:8836-8840`) — enough to make a
+   grep-based check conclude "already handled". Its own resolution chain skipped
+   NOT NULL entirely. This file is itself the evidence for Hard-won Rule #2: the
+   arm carried a comment claiming it mirrored the drop path's "same four stores",
+   and that comment was wrong in both the count and the contents.
+
+**What landed.** A NOT NULL branch in each site, plus a shared
+`clearNotNullConstraint` helper factored out of the existing
+`case parser.AlterTableDropNotNull:` body (`:9659`) so DROP-by-name and
+DROP-by-column apply the identical three steps (clear `Columns[i].NotNull`, splice
+`NotNullConstraints`, catalog-heap resync). Matching is by constraint `Name` in the
+new branch versus `ColName` in the old — that is the only difference. Two PG
+refusals are honoured: the inherited-constraint guard (`InhCount > 0`, PG applies it
+uniformly to all contypes at `tablecmds.c:14103-14107`) and the PK-membership
+refusal `column "%s" is in a primary key` (`tablecmds.c:14154-14159`). Recursion to
+children matches by **column name, not constraint name** — PG is explicit about the
+asymmetry (`tablecmds.c:14251-14255`: "We search for not-null constraints by column
+name, and others by constraint name"), so the NOT NULL cascade deliberately differs
+from the CHECK cascade sitting directly above it. The rename branch mutates `Name`
+directly rather than taking the `RenameIndex` arm, because PG's `conindid` is NULL
+for a NOT NULL constraint and `rename_constraint_internal` therefore always takes
+the `RenameConstraintById` branch (`tablecmds.c:4126-4131`).
+
+**Measured effect:** `scripts/pg-regress-runner.sh constraints` 1465 → **1431**
+lines, hunks 31 → **33**. Like Bucket 1 and unlike Bucket 2, this is an
+**unmasking**, not a plain shrink: statements that previously aborted at the bogus
+42704 now execute and expose gaps further down. Every added hunk was traced to a
+pre-existing unrelated gap — the `ALTER CONSTRAINT … ENFORCED / NOT ENFORCED`
+parser gap, the `ALTER CONSTRAINT … INHERIT / NO INHERIT` parser gap (Bucket 6), and
+incomplete propagation of NOT NULL constraint rows into inheritance children
+(affecting `VALIDATE CONSTRAINT` and `COMMENT ON CONSTRAINT`). No hunk this bucket
+targeted reappeared. **Never compare a `constraints` number against anything
+measured before 2026-08-18** — those predate the C19 harness fix.
+
+**Deliberately not done:** the replica-identity-index membership refusal
+(`tablecmds.c:14162-14167`) and the identity-column refusal (`:14174-14181`). Both
+were already absent from the pre-existing `DROP NOT NULL <col>` path, so
+implementing them here would have fixed a different bug than the one briefed.
+Ledgered.
+
+## 6. Next slice for this case
+
+Bucket 6 (`ALTER TABLE … ALTER CONSTRAINT <name> NOT VALID / INHERIT / NO INHERIT`
+is a parse error) — the smallest remaining, and Bucket 3's unmasking just made two
+of its hunks visible, so it now has more measurable upside than when it was sized.
+Bucket 3's leftover NOT NULL inheritance-propagation gap (above) is the other
+candidate and is the better one if Bucket 6's parser work turns out to need a
+matching executor arm. Buckets 4 and 5 need their own milestones. Bucket 7 still
+needs a research pass before it can be briefed at all — its root cause is not
+pinned.

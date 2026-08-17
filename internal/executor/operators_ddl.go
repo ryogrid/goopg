@@ -8797,8 +8797,9 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// ALTER TABLE name RENAME CONSTRAINT old TO new. Renames an existing
 			// constraint in place with its OID stable, mirroring PG's
 			// rename_constraint_internal (tablecmds.c:4047). The constraint is
-			// found by name across the same four stores as the drop path
-			// (execAlterTableDropConstraint): CHECK → FK → UNIQUE → EXCLUDE → PK.
+			// found by name across the same six stores as the drop path
+			// (execAlterTableDropConstraint): CHECK → FK → NOT NULL → UNIQUE →
+			// EXCLUDE → PK.
 			// For UNIQUE/PK/EXCLUDE the constraint name IS the backing index name
 			// (pg_constraint.conindid), so the rename re-keys the index via
 			// InMemory.RenameIndex — PG does the same (RenameRelationInternal on
@@ -8896,6 +8897,43 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					return &ExecError{Code: "42710", Pos: act.Pos(), Message: fmt.Sprintf("constraint %q for relation %q already exists", newName, tbl.Name)}
 				}
 				tbl.ForeignKeys[i].Name = newName
+				return nil
+			}
+
+			// 2.5. NOT NULL constraints (contype='n', PG 18+) — same direct
+			// Name mutation as CHECK/FK, NOT the RenameIndex path below: PG's
+			// conindid is NULL for a NOT NULL constraint, so
+			// rename_constraint_internal always takes the RenameConstraintById
+			// branch, never RenameRelationInternal (tablecmds.c:4126-4131). The
+			// inheritance guards mirror the CHECK arm above verbatim — PG gates
+			// both refusals on `(contype == CHECK || contype == NOTNULL) &&
+			// !connoinherit` (tablecmds.c:4085-4123).
+			for i, nc := range tbl.NotNullConstraints {
+				if !strings.EqualFold(nc.Name, oldName) {
+					continue
+				}
+				if s.Only && o.hasInheritanceChildren(tbl) && !nc.NoInherit {
+					return &ExecError{Code: "42P16", Pos: 0, Message: fmt.Sprintf("inherited constraint %q must be renamed in child tables too", oldName)}
+				}
+				if nc.InhCount > 0 && !nc.NoInherit {
+					return &ExecError{Code: "42P16", Pos: 0, Message: fmt.Sprintf("cannot rename inherited constraint %q", oldName)}
+				}
+				if constraintNameInUse(newName) {
+					return &ExecError{Code: "42710", Pos: act.Pos(), Message: fmt.Sprintf("constraint %q for relation %q already exists", newName, tbl.Name)}
+				}
+				tbl.NotNullConstraints[i].Name = newName
+				// Cascade to partition children: rename the inherited copy in
+				// each child, mirroring the CHECK cascade above.
+				if imNN, okNN := o.ctx.Catalog.(*catalog.InMemory); okNN {
+					for _, childTbl := range imNN.PartitionChildren(tbl.OID) {
+						for j := range childTbl.NotNullConstraints {
+							if strings.EqualFold(childTbl.NotNullConstraints[j].Name, oldName) {
+								childTbl.NotNullConstraints[j].Name = newName
+								break
+							}
+						}
+					}
+				}
 				return nil
 			}
 
@@ -9660,11 +9698,14 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// DROP NOT NULL — clear the column's NOT NULL flag and drop its
 			// contype='n' constraint (same heap re-sync as SET NOT NULL). DROP
 			// NOT NULL on a column with no NOT NULL is a no-op in PG; we mirror
-			// that (no error). DU-002 slice 270.
+			// that (no error). DU-002 slice 270. The three-step body (clear
+			// flag / splice NotNullConstraints / catalog-heap resync) is
+			// factored into clearNotNullConstraint so DROP CONSTRAINT <name>
+			// on a NOT NULL constraint (execAlterTableDropConstraint) can reuse
+			// it — M0134-0005 S04.
 			found := false
 			for i := range tbl.Columns {
 				if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
-					tbl.Columns[i].NotNull = false
 					found = true
 					break
 				}
@@ -9673,23 +9714,8 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				return &ExecError{Code: "42703", Pos: act.Pos(),
 					Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
 			}
-			kept := tbl.NotNullConstraints[:0]
-			for _, nc := range tbl.NotNullConstraints {
-				if !strings.EqualFold(nc.ColName, act.ColumnName) {
-					kept = append(kept, nc)
-				}
-			}
-			tbl.NotNullConstraints = kept
-			if catalogHeapSyncAvailable(o.ctx) {
-				if err := o.ctx.MaterializeWriterXID(); err == nil {
-					xmax := o.ctx.Tx.XID
-					for _, dbOid := range tableCatalogDBOids(o.ctx) {
-						deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
-					}
-				}
-				if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
-					return fmt.Errorf("DDL catalog sync: %w", syncErr)
-				}
+			if err := o.clearNotNullConstraint(tbl, act.ColumnName); err != nil {
+				return err
 			}
 		case parser.AlterTableAddNotNull:
 			// ADD [CONSTRAINT name] NOT NULL col — the named (PG18) counterpart
@@ -10701,6 +10727,42 @@ func (o *ddlOp) execAlterTableAddExclude(tbl *catalog.Table, act parser.AlterTab
 	return nil
 }
 
+// clearNotNullConstraint drops the named column's NOT NULL flag and its
+// contype='n' catalog entry: clears tbl.Columns[i].NotNull, splices the
+// matching entry out of tbl.NotNullConstraints, and re-syncs the catalog
+// heap. Shared by `ALTER TABLE ... DROP NOT NULL <col>` (AlterTableDropNotNull
+// case) and `ALTER TABLE ... DROP CONSTRAINT <name>` when the resolved
+// constraint is a NOT NULL (execAlterTableDropConstraint) — both apply the
+// identical three-step body per dropconstraint_internal
+// (postgres/src/backend/commands/tablecmds.c:14184-14188). M0134-0005 S04.
+func (o *ddlOp) clearNotNullConstraint(tbl *catalog.Table, colName string) error {
+	for i := range tbl.Columns {
+		if strings.EqualFold(tbl.Columns[i].Name, colName) {
+			tbl.Columns[i].NotNull = false
+			break
+		}
+	}
+	kept := tbl.NotNullConstraints[:0]
+	for _, nc := range tbl.NotNullConstraints {
+		if !strings.EqualFold(nc.ColName, colName) {
+			kept = append(kept, nc)
+		}
+	}
+	tbl.NotNullConstraints = kept
+	if catalogHeapSyncAvailable(o.ctx) {
+		if err := o.ctx.MaterializeWriterXID(); err == nil {
+			xmax := o.ctx.Tx.XID
+			for _, dbOid := range tableCatalogDBOids(o.ctx) {
+				deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+			}
+		}
+		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+			return fmt.Errorf("DDL catalog sync: %w", syncErr)
+		}
+	}
+	return nil
+}
+
 // execAlterTableDropConstraint handles `ALTER TABLE t DROP CONSTRAINT name [RESTRICT|CASCADE]`.
 // Checked in the order CHECK / FOREIGN KEY / UNIQUE / PRIMARY KEY, mirroring
 // real PG's name-based pg_constraint lookup (the constraint kind only matters
@@ -10805,6 +10867,64 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 		return nil
 	}
 
+	// 3.7. NOT NULL constraints (contype='n', PG 18+) — matched by constraint
+	// name here (unlike `ALTER TABLE ... DROP NOT NULL <col>`, which matches
+	// by column name). PG's dropconstraint_internal treats NOT NULL the same
+	// as CHECK for the inherited-constraint guard
+	// (tablecmds.c:14103-14107) and additionally refuses to drop a not-null
+	// backing a PRIMARY KEY column (tablecmds.c:14154-14159, `"column \"%s\"
+	// is in a primary key"`). The replica-identity-index
+	// (tablecmds.c:14162-14167) and identity-column (tablecmds.c:14174-14181)
+	// refusals are NOT implemented — out of scope, M0134-0005 S04 (ledgered).
+	// Recursion to children matches by COLUMN NAME, not constraint name
+	// (tablecmds.c:14251-14255: "We search for not-null constraints by column
+	// name, and others by constraint name") — unlike the CHECK cascade above,
+	// which matches by constraint name.
+	for _, nc := range tbl.NotNullConstraints {
+		if !strings.EqualFold(nc.Name, act.ConstraintName) {
+			continue
+		}
+		if nc.InhCount > 0 {
+			return &ExecError{
+				Code:    "42P16",
+				Pos:     0,
+				Message: fmt.Sprintf("cannot drop inherited constraint %q of relation %q", act.ConstraintName, tbl.Name),
+			}
+		}
+		for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
+			if !idx.Primary {
+				continue
+			}
+			for _, pkCol := range idx.Columns {
+				if strings.EqualFold(pkCol, nc.ColName) {
+					return &ExecError{
+						Code:    "42P16",
+						Pos:     act.Pos(),
+						Message: fmt.Sprintf("column %q is in a primary key", nc.ColName),
+					}
+				}
+			}
+			break
+		}
+		colName := nc.ColName
+		if err := o.clearNotNullConstraint(tbl, colName); err != nil {
+			return err
+		}
+		if isIM && !only {
+			for _, childTbl := range im.PartitionChildren(tbl.OID) {
+				for _, cnc := range childTbl.NotNullConstraints {
+					if strings.EqualFold(cnc.ColName, colName) {
+						if err := o.clearNotNullConstraint(childTbl, colName); err != nil {
+							return err
+						}
+						break
+					}
+				}
+			}
+		}
+		return nil
+	}
+
 	// 4. PRIMARY KEY constraints.
 	var pkIdx *catalog.Index
 	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
@@ -10815,8 +10935,8 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 	}
 	// M0134-0002 C2: `DROP CONSTRAINT IF EXISTS` on a missing constraint emits
 	// PG's NOTICE and skips instead of raising 42704 — but only at this
-	// fall-through after all five kinds (NamedChecks/FKs/UNIQUE/EXCLUDE/PK)
-	// missed. Mirrors ATExecDropConstraint's if_exists branch
+	// fall-through after all six kinds (NamedChecks/FKs/UNIQUE/EXCLUDE/NOT
+	// NULL/PK) missed. Mirrors ATExecDropConstraint's if_exists branch
 	// (postgres/src/backend/commands/tablecmds.c:14060-14062). A real constraint
 	// of any kind is handled above and must never be skipped.
 	if pkIdx == nil {

@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
@@ -141,6 +142,72 @@ func TestDropConstraintForeignKeyAndUnique(t *testing.T) {
 		ee, ok = err.(*ExecError)
 		if !ok || ee.Code != "42704" {
 			t.Fatalf("expected 42704 on re-drop, got: %v", err)
+		}
+	})
+
+	t.Run("NotNull", func(t *testing.T) {
+		// M0134-0005 S04: `DROP CONSTRAINT <name>` on a NOT NULL constraint
+		// (contype='n', PG 18+) previously fell through every branch to the
+		// PK arm's 42704 even though the constraint existed —
+		// tbl.NotNullConstraints was never consulted.
+		ctx, cat, cleanup := newDDLFixture(t)
+		defer cleanup()
+
+		if err := runDDL(t, ctx, `CREATE TABLE dcnn_t (id integer PRIMARY KEY, name text NOT NULL)`); err != nil {
+			t.Fatalf("CREATE TABLE dcnn_t: %v", err)
+		}
+
+		tbl, ok := cat.LookupTable(parser.ObjectName{Name: "dcnn_t"})
+		if !ok {
+			t.Fatal("dcnn_t table not found")
+		}
+		// Auto-name is `<table>_<col>_not_null` (lowercased).
+		if err := runDDL(t, ctx, `ALTER TABLE dcnn_t DROP CONSTRAINT dcnn_t_name_not_null`); err != nil {
+			t.Fatalf("DROP CONSTRAINT dcnn_t_name_not_null: %v", err)
+		}
+		for _, nc := range tbl.NotNullConstraints {
+			if strings.EqualFold(nc.ColName, "name") {
+				t.Fatalf("expected dcnn_t_name_not_null constraint gone, still present: %+v", nc)
+			}
+		}
+		for _, col := range tbl.Columns {
+			if strings.EqualFold(col.Name, "name") && col.NotNull {
+				t.Fatal("expected name column's NotNull flag cleared")
+			}
+		}
+
+		// The NOT NULL check must actually be gone: a NULL now inserts.
+		if err := runDDL(t, ctx, `INSERT INTO dcnn_t VALUES (1, NULL)`); err != nil {
+			t.Fatalf("INSERT with NULL name (no more NOT NULL constraint) should succeed: %v", err)
+		}
+
+		// Dropping again must report undefined_object, not silently succeed.
+		err := runDDL(t, ctx, `ALTER TABLE dcnn_t DROP CONSTRAINT dcnn_t_name_not_null`)
+		ee, ok := err.(*ExecError)
+		if !ok || ee.Code != "42704" {
+			t.Fatalf("expected 42704 on re-drop, got: %v", err)
+		}
+	})
+
+	t.Run("NotNullPkMemberRefused", func(t *testing.T) {
+		// A NOT NULL constraint backing a PRIMARY KEY column cannot be
+		// dropped by name — PG's dropconstraint_internal
+		// (tablecmds.c:14154-14159) raises 42P16 "column %q is in a primary
+		// key" before resetting attnotnull.
+		ctx, _, cleanup := newDDLFixture(t)
+		defer cleanup()
+
+		if err := runDDL(t, ctx, `CREATE TABLE dcnnpk_t (id integer PRIMARY KEY)`); err != nil {
+			t.Fatalf("CREATE TABLE dcnnpk_t: %v", err)
+		}
+
+		err := runDDL(t, ctx, `ALTER TABLE dcnnpk_t DROP CONSTRAINT dcnnpk_t_id_not_null`)
+		ee, ok := err.(*ExecError)
+		if !ok || ee.Code != "42P16" {
+			t.Fatalf("expected 42P16, got: %v", err)
+		}
+		if ee.Message != `column "id" is in a primary key` {
+			t.Fatalf("unexpected message: %q", ee.Message)
 		}
 	})
 

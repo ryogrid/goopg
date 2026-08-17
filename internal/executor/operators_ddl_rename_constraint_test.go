@@ -1,9 +1,10 @@
 package executor
 
 // operators_ddl_rename_constraint_test.go pins `ALTER TABLE name RENAME
-// CONSTRAINT old TO new` (M0134-0002 C2). Constraint lookup spans the same four
-// stores as DROP CONSTRAINT (CHECK → FK → UNIQUE → EXCLUDE → PK, see
-// execAlterTableDropConstraint); UNIQUE/PK/EXCLUDE re-key the backing index
+// CONSTRAINT old TO new` (M0134-0002 C2, NOT NULL added M0134-0005 S04).
+// Constraint lookup spans the same six stores as DROP CONSTRAINT (CHECK → FK →
+// NOT NULL → UNIQUE → EXCLUDE → PK, see execAlterTableDropConstraint);
+// UNIQUE/PK/EXCLUDE re-key the backing index
 // because the constraint name IS the index name (rename_constraint_internal →
 // RenameRelationInternal on conindid, tablecmds.c:4129-4134). Error codes match
 // PG: 42704 not-found (pg_constraint.c:1234), 42710 CHECK/FK name collision
@@ -133,6 +134,38 @@ func TestAlterTableRenameConstraint(t *testing.T) {
 				}
 				if _, still := im.LookupIndex(parser.ObjectName{Name: "pk_a"}); still {
 					t.Errorf("old index name pk_a still present")
+				}
+			},
+		},
+		{
+			// M0134-0005 S04: NOT NULL constraints (contype='n', PG 18+) were
+			// never consulted by the rename lookup, so a real one always fell
+			// through to the 42704 "does not exist" arm even though it
+			// existed (postgres/src/test/regress/sql/constraints.sql:787 is
+			// PG's equivalent acceptance case).
+			name:      "not null rename keeps OID and resolves under new name",
+			table:     "rc_notnull",
+			setup:     []string{"ALTER TABLE rc_notnull ADD CONSTRAINT nn_a NOT NULL a"},
+			renameSQL: "ALTER TABLE rc_notnull RENAME CONSTRAINT nn_a TO nn_a_new",
+			verify: func(t *testing.T, tbl *catalog.Table) {
+				found := false
+				for i := range tbl.NotNullConstraints {
+					switch tbl.NotNullConstraints[i].Name {
+					case "nn_a_new":
+						if tbl.NotNullConstraints[i].OID == 0 {
+							t.Errorf("renamed NOT NULL constraint has zero OID")
+						}
+						found = true
+					case "nn_a":
+						t.Errorf("old name nn_a still present: %+v", tbl.NotNullConstraints)
+					}
+				}
+				if !found {
+					t.Fatalf("NotNullConstraints after rename = %+v, want nn_a_new", tbl.NotNullConstraints)
+				}
+				// A subsequent DROP CONSTRAINT must resolve under the NEW name.
+				if err := runDDL(t, ctx, "ALTER TABLE rc_notnull DROP CONSTRAINT nn_a_new"); err != nil {
+					t.Fatalf("DROP CONSTRAINT nn_a_new (renamed): %v", err)
 				}
 			},
 		},
