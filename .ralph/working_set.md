@@ -1,58 +1,65 @@
-# Working set — M0134-0003 S1 landed + case PARKED; pick the next M0134 case
+# Working set — M0134-0004 Bucket 4 landed, cluster.sql PARKED; pick the next M0134 case
 
-**Task:** M0134-0003 (`arrays.sql`) — **S1 LANDED, umbrella PARKED 2026-08-18**
-(commit `bfe0586f`). Selected per the Current Priority banner (M0134 next after
-M-NIGHTLY). M-NIGHTLY drained: `ci/logs/action-items.md` is still run
-`20260817-011734`, all 6 filed and `[x]` — nothing new to file.
+**Task:** M0134-0004 (`cluster.sql`) — **Bucket 4 LANDED, case PARKED
+2026-08-18** (commit `821cd17c`). Selected per the Current Priority banner
+(M0134 next after M-NIGHTLY). M-NIGHTLY drained: `ci/logs/action-items.md` is
+still run `20260817-011734`, all 6 filed and `[x]` — nothing new to file.
 
-**What landed.** `expr [NOT] LIKE|ILIKE ANY|SOME|ALL (…)` now parses/evaluates
-per PG. A **sibling-path omission**, not a missing feature: `parseExprPrec` wires
-quantifiers for the ordering comparisons (M0122-0004) and the POSIX regex
-operators (M0097-0068) but skipped the LIKE family sitting between them. Fixed in
-all four blocks. **Parser-only, verified not assumed** — `evalInExpr`
-(`internal/executor/expr.go:6859,6877`) dispatches `AnyOp` through the *general*
-`evalBinary`, which already implements all four opcodes at `:1684-1699`.
-Measured `arrays` **3311→3251** lines, all 8 statements of `arrays.sql:463-470`
-now unchanged context; sentinel `char` 172 unchanged.
+**What landed.** `CREATE TABLE` never recorded the creating role in
+`catalog.Table.Owner`, so the owner-shortcut in `dmlPrivilegePermittedAs`
+(`internal/executor/operators_storage.go:2222-2242`) and `maintenancePermitted`
+(`internal/executor/operators_vacuum.go:333-342`) could never fire and a
+non-superuser got a false 42501 on its own table. A **sibling-path omission** —
+`execCreateView` (`operators_ddl.go:5391`) already stamped it. Fixed at **three**
+independent construction sites: `execCreateTable`, `execCreateTableAs`, and
+`execCreatePartitionChild` (the third was missed by the first brief — `PARTITION
+OF` returns early into its own top-level function; the implementer caught it and
+I widened the brief in round 2 rather than ship a partial fix). Assignment is
+`if o.ctx.NonSuperuserRole != "" { tbl.Owner = … }` — deliberately **not**
+`currentDDLOwnerName()`, which returns literal `"postgres"` and would break the
+`""`-means-bootstrap-superuser sentinel (`catalog.go:611-621`).
 
-**Why parked.** Residual has no bounded slice: **A** slice subscripting
-`a[lo:hi]` absent read+write (~900) and **B** assignment-target indirection
-`SET col[i]=…` (~250) are ~1150 *coupled* lines sharing one representation goopg
-lacks; **C** is 13 array builtins catalog-registered with no executor dispatch
-(~600); D′ (~10) and E (~40) are fragments. **Re-arm trigger:** A+B landing as
-their own milestone, or class C being filled in — then re-measure.
+**Safety was verified, not assumed** (do not re-derive): an exhaustive
+`find_referencing_symbols` pass over `Owner` found no read site where empty means
+allow-everyone — `HasTablePrivilege` is default-deny
+(`catalog.go:16351-16366`) and the only allow-on-empty branches key on the
+*session's* role. Pinned by `TestCreateTableOwnerNegativeGuardDeniesOtherRole`,
+which passes both pre- and post-change.
 
-**Correction to carry forward (do not re-derive):** class D is NOT "generalize
-ANY/ALL to arbitrary operators". A precision pass found the only operators
-failing with a quantifier in this file are the LIKE family and `*`; no
-`@>`/`<@`/`&&`/`~`/`IS DISTINCT FROM` appears with ANY/ALL anywhere here, so a
-general rewrite has no corpus witness.
+**Why cluster.sql is parked.** 5747 lines (5223 `+` / 257 `-`), ~4900 of them
+Bucket 1: `CLUSTER` is a no-op stub (`internal/executor/operators_cluster.go:1-97`
+flips `pg_index.indisclustered`, never rewrites the heap) so every SELECT after
+the first CLUSTER diverges on row order — VACUUM-FULL-scale, not a slice.
+Buckets 2/3/5 are bounded but **inert** behind it; Bucket 6 is **inferred, not
+verified**. **Re-arm trigger:** a real CLUSTER milestone (no design doc exists —
+writing one is step 1), then re-measure from scratch.
 
-**Files:** `internal/parser/select.go` (4 LIKE blocks),
-`internal/parser/any_all_test.go` (`TestParseLikeFamilyAnyAll`),
-`internal/executor/any_all_test.go` (`TestLikeFamilyAnyAllEvaluation`),
-`docs/design/0134-0003-arrays-sql-divergence.md` (new),
-`docs/design/README.md`, `.ralph/fix_plan.md`, `.ralph/deferral_ledger.md` (2
-rows 2026-08-18).
+**Files:** `internal/executor/operators_ddl.go` (3 sites),
+`internal/executor/create_table_owner_test.go` (5 guards, new),
+`docs/design/0134-0004-cluster-sql-divergence.md` (new), `docs/design/README.md`,
+`.ralph/fix_plan.md`, `.ralph/deferral_ledger.md` (3 rows 2026-08-18).
 
-**Next step:** M0134-0001/-0002/-0003 are all parked, so select the **next
-unparked M0134 case**: M0134-0004 (`cluster.sql`) at `.ralph/fix_plan.md:6476`,
-then 0005 onward (`failed` before `not-tried`). Start with
+**Next step:** 0001-0004 are all parked, so select the **next unparked M0134
+case**: M0134-0005 (`constraints.sql`), then 0006 onward. Also newly filed and
+selectable: **M0134-0004-a** (CREATE DATABASE ... TEMPLATE drops table owners,
+`internal/postmaster/database_ddl.go:917-923`) — a small, well-specified
+follow-up if a short loop is wanted. Start any case with
 `scripts/pg-regress-runner.sh <case>` + a researcher classification pass before
-briefing any implementer. **Never compare to a pre-2026-08-18 regress number** —
+briefing an implementer. **Never compare to a pre-2026-08-18 regress number** —
 they predate the C19 harness fix (`-v HIDE_TABLEAM=on
 -v HIDE_TOAST_COMPRESSION=on`); re-measure from scratch.
 
-**Gates run:** `go test ./internal/parser/` PASS; `go test ./internal/executor/`
-PASS; `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS; named
-guards re-run by coordinator pre-commit PASS; pre-commit pgbench smoke PASS
-(TPC-B 335 tps, simple update 632 tps, select-only 12.4k tps); regress `arrays`
-3311→3251 + sentinel `char` PASS. No TPC-H/TPC-DS — parser-only.
+**Gates run:** `go test ./internal/executor/` PASS; `go test ./internal/catalog/`
+PASS; `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS (both
+rounds); 5 named guards re-run by coordinator pre-commit PASS; pre-commit pgbench
+smoke PASS (TPC-B 336 tps, simple update 635 tps, select-only 12.6k tps). No
+TPC-H/TPC-DS — no planner/codec change.
 
-**Delegation:** `tmp/ralph-handoffs/m0134-0003-s01-measure/` (researcher
-`a78c083fd98e16874`, 2 rounds — the round-2 precision pass corrected its own
-round-1 bucket-D framing); `tmp/ralph-handoffs/m0134-0003-s02-like-any-all/`
-(implementer `a2dc9b3700c6a7f8b`, 1 round, DONE; tester `a7d28a25020e063e6`,
-1 round, re-measure).
+**Delegation:** `tmp/ralph-handoffs/m0134-0004-s01-measure/` (researcher
+`a8907815f4943e613`, 2 rounds — round 2 was the Owner blast-radius probe that
+de-risked the fix); `tmp/ralph-handoffs/m0134-0004-s02-create-table-owner/`
+(implementer `ac8651874d73574a7`, 2 rounds, DONE — note: the harness blocks
+worker `report.md` writes, so its findings live only in the commit message,
+design doc, and ledger).
 
 **In-flight:** none.
