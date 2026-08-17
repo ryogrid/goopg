@@ -60,6 +60,66 @@ func TestNamedCheckPropagatesThroughLikeConstraints(t *testing.T) {
 	}
 }
 
+// TestColumnLevelCheckPreservesExplicitName verifies that an inline
+// column-level CHECK declared with an explicit `CONSTRAINT <name>` prefix
+// (`a int CONSTRAINT con1 CHECK (a > 0)`) is stored under that user-given
+// name instead of the auto-generated `<table>_<col>_check`, matching PG's
+// transformCheckConstraints (parse_utilcmd.c: Constraint->conname carried
+// verbatim; ChooseConstraintName in heap.c only auto-names when conname is
+// NULL). A later `ALTER TABLE ... RENAME CONSTRAINT con1 TO ...` must find
+// it. The anonymous form must still fall back to the auto-name. M0134-0002
+// slice S02.
+func TestColumnLevelCheckPreservesExplicitName(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE cln_named (a int CONSTRAINT con1 CHECK (a > 0))`); err != nil {
+		t.Fatalf("CREATE TABLE cln_named: %v", err)
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "cln_named"})
+	if !ok {
+		t.Fatal("cln_named table not found")
+	}
+	if len(tbl.NamedChecks) != 1 || tbl.NamedChecks[0].Name != "con1" {
+		t.Fatalf("expected NamedChecks[0].Name=con1, got %+v", tbl.NamedChecks)
+	}
+	// The auto-name must NOT also be present.
+	for _, nc := range tbl.NamedChecks {
+		if nc.Name == "cln_named_a_check" {
+			t.Errorf("column CHECK kept the auto-name %q despite an explicit CONSTRAINT name", nc.Name)
+		}
+	}
+
+	// RENAME CONSTRAINT must find the user-given name.
+	if err := runDDL(t, ctx, `ALTER TABLE cln_named RENAME CONSTRAINT con1 TO con2`); err != nil {
+		t.Fatalf("RENAME CONSTRAINT con1 TO con2: %v", err)
+	}
+	found := false
+	for _, nc := range tbl.NamedChecks {
+		if nc.Name == "con2" {
+			found = true
+		}
+		if nc.Name == "con1" {
+			t.Errorf("old name con1 still present after rename: %+v", tbl.NamedChecks)
+		}
+	}
+	if !found {
+		t.Fatalf("NamedChecks after rename = %+v, want con2", tbl.NamedChecks)
+	}
+
+	// The anonymous form is unaffected: it keeps the auto-generated name.
+	if err := runDDL(t, ctx, `CREATE TABLE cln_anon (a int CHECK (a > 0))`); err != nil {
+		t.Fatalf("CREATE TABLE cln_anon: %v", err)
+	}
+	anonTbl, ok := cat.LookupTable(parser.ObjectName{Name: "cln_anon"})
+	if !ok {
+		t.Fatal("cln_anon table not found")
+	}
+	if len(anonTbl.NamedChecks) != 1 || anonTbl.NamedChecks[0].Name != "cln_anon_a_check" {
+		t.Fatalf("anonymous column CHECK: NamedChecks=%+v, want [cln_anon_a_check]", anonTbl.NamedChecks)
+	}
+}
+
 // TestAlterTableSetDropNotNull verifies that `ALTER TABLE ... ALTER COLUMN c
 // SET NOT NULL` marks the column NOT NULL AND records a contype='n' constraint
 // (catalog.Table.AddNotNull, conislocal=true), and that `DROP NOT NULL` clears

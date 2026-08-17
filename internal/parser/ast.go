@@ -1236,6 +1236,12 @@ type ColumnDef struct {
 	// CheckExpr holds the raw SQL expression for an inline CHECK constraint.
 	// M0097-0014.
 	CheckExpr string
+	// CheckConstraintName holds the user-given name when the inline CHECK is
+	// written with an explicit `CONSTRAINT <name>` prefix
+	// (`a int CONSTRAINT myname CHECK (a > 0)`). Empty for the anonymous form,
+	// in which case the constraint is auto-named (<table>_<col>_check). Only
+	// meaningful when CheckExpr is non-empty. M0134-0002 slice S02.
+	CheckConstraintName string
 	// NotNullNoInherit is true when the NOT NULL constraint carries NO INHERIT
 	// (PG18: `c int NOT NULL NO INHERIT`). goopg v0 tracks the flag to emit
 	// the partitioned-table error for LIKE INCLUDING ALL. M0097-0023.

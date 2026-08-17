@@ -4614,6 +4614,10 @@ func (p *parser) parseColumnConstraintList(col *ColumnDef) error {
 					return err
 				}
 				col.CheckExpr = expr
+				// Named inline column CHECK — carry the explicit constraint name so
+				// it round-trips instead of being overwritten by the auto-name
+				// (<table>_<col>_check). M0134-0002 slice S02.
+				col.CheckConstraintName = identText(cnameTok)
 				if p.acceptKeyword(KwNot) {
 					if p.acceptIdentKeyword("enforced") {
 						col.CheckNotEnforced = true

@@ -3792,15 +3792,22 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// name for violation messages. Inline/table-level checks are anonymous in
 	// the current parser, so they get empty names (invisible to pg_constraint).
 	// Column-level CHECKs are auto-named using PostgreSQL's convention
-	// {tablename}_{colname}_check (mirrors how PG assigns names in DDL). M0097-0023.
+	// {tablename}_{colname}_check (mirrors how PG assigns names in DDL) UNLESS
+	// the user gave an explicit `CONSTRAINT <name> CHECK (...)`, in which case
+	// the given name is preserved verbatim (transformCheckConstraints,
+	// parse_utilcmd.c; ChooseConstraintName only auto-names when conname is
+	// NULL). M0097-0023, M0134-0002 slice S02.
 	for _, c := range s.Columns {
 		if c.CheckExpr != "" {
-			autoName := tbl.Name + "_" + c.Name + "_check"
+			name := c.CheckConstraintName
+			if name == "" {
+				name = tbl.Name + "_" + c.Name + "_check"
+			}
 			// c.CheckNotEnforced carries a column-level `CHECK (...) NOT
 			// ENFORCED` (PG18) so the dumped constraintdef re-emits the
 			// suffix and pg_constraint reports conenforced=false. DU-002
 			// slice 430.
-			tbl.AddCheckFull(autoName, c.CheckExpr, o.allocConstraintOID(autoName), false, false, c.CheckNotEnforced)
+			tbl.AddCheckFull(name, c.CheckExpr, o.allocConstraintOID(name), false, false, c.CheckNotEnforced)
 		}
 	}
 	// Table-level CHECK constraints written without an explicit CONSTRAINT name

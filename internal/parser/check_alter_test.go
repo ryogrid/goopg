@@ -124,6 +124,22 @@ func TestParseCheckNotEnforced(t *testing.T) {
 		if !ct.Columns[0].CheckNotEnforced {
 			t.Errorf("expected Columns[0].CheckNotEnforced=true")
 		}
+		// The explicit constraint name must be preserved (transformCheckConstraints,
+		// parse_utilcmd.c: Constraint->conname carried verbatim), not dropped in
+		// favor of the auto-name. M0134-0002 slice S02.
+		if ct.Columns[0].CheckConstraintName != "c" {
+			t.Errorf("expected Columns[0].CheckConstraintName=%q, got %q", "c", ct.Columns[0].CheckConstraintName)
+		}
+	})
+	t.Run("CreateTableInlineColumnAnonymousNameEmpty", func(t *testing.T) {
+		stmts, err := Parse("CREATE TABLE t (a integer CHECK (a > 0))")
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		ct := stmts[0].(*CreateTableStmt)
+		if ct.Columns[0].CheckConstraintName != "" {
+			t.Errorf("expected Columns[0].CheckConstraintName=%q for anonymous CHECK, got %q", "", ct.Columns[0].CheckConstraintName)
+		}
 	})
 	t.Run("CreateTableNoTrailerDefaultsFalse", func(t *testing.T) {
 		stmts, err := Parse("CREATE TABLE t (a integer, CHECK (a > 0))")

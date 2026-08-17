@@ -69,7 +69,7 @@ reorder robustness; deferred, see the ledger.)
 | C4 | FK semantics | DDL | `tablecmds.c` | correctness |
 | C5 | ~~btree-inet rejected~~ **LANDED (2026-08-16)** — the full btree/inet_ops catalog stack (type 869, opclass 9013, opfamily 1974, amop/amproc, network_* procs, pg_operator `=`/`<`/etc.) was ALREADY seeded; the rejection was a **hardcoded Go allow-list** (`isSupportedBTreeKeyType`) missing `"inet"`/`"cidr"`, NOT an opclass lookup. Fixed: `"inet"`/`"cidr"` added to the allow-list + a new order-preserving encoder/decoder arm (`encodeInetBTreeKey`/`decodeInetBTreeKey`, fixed-width `[family][masked-network-addr][bits][full-addr]` key reproducing `network_cmp_internal` byte-wise). The expression-key gate routes through the same allow-list (no separate edit needed). | `operators_ddl.go:11364-11384` allow-list; `createBTreeIndex` :10389-10398; error :11393-11403; encoder `encodeBTreeKeyForColumn` :10981-11149 (falls to 0A000 at :11148); decoder `decodeScalarBTreeKey` `btree_scalar_keys.go:302`; expression-key gate :10370-10378 (second parallel gate) | `network.c:402-420` `network_cmp_internal` + `network_in`/`inet_in` (address-masking); `indexcmds.c` `GetDefaultOpClass` | executor (encoder/decoder arm) |
 | C6 | catalog gaps (pg_type array rows, pg_trigger FK rows, pg_locks) | catalog build | `pg_*.dat` | catalog |
-| C7 | constraint naming/rendering (`con1` ignored, `CHECK ((a>10.2))` double-parens, partition-child index `_0_key` vs `_0_id_name_key`) | `operators_ddl.go`/explain | `tablecmds.c`/`ruleutils.c` | formatter |
+| C7 | constraint naming/rendering — **`con1` ignored: LANDED (2026-08-18)**, see the "C7 slice 1" section below; still open: `CHECK ((a>10.2))` double-parens, partition-child index `_0_key` vs `_0_id_name_key` | `internal/parser/ast.go`/`ddl.go` + `operators_ddl.go` `execCreateTable`; rendering side still `operators_ddl.go`/explain | `parse_utilcmd.c` `transformCheckConstraints` + `heap.c` `ChooseConstraintName`; rendering `ruleutils.c` | parser+executor (naming) / formatter (rendering) |
 | C8 | ~~system columns unmodeled (`ADD COLUMN xmin` accepted)~~ **LANDED** — a case-sensitive `isSystemColumn` helper (ctid/xmin/cmin/xmax/cmax/tableoid, no `oid`) rejects at all four entry points with 42701 + the PG-exact message | `execCreateTable`/`execCreateTableAs`/`execAlterTableAddColumn` + the RENAME arm (`operators_ddl.go`); `validatePartitionKey` reuses the helper (one name-list source). RENAME check corrected: 42P20→42701, `oid` dropped, case-sensitive | `tablecmds.c:7673` `check_for_column_name_collision` (ADD/RENAME) + `heap.c:481` `CheckAttributeNamesTypes` (CREATE/CTAS); `SysAtt[]` `heap.c:144-228` | correctness |
 | C9 | inheritance semantics (inherited CHECK/NOT-NULL not enforced on children, `attinhcount` diverges) | DDL | `tablecmds.c` | correctness |
 | C10 | ~~ALTER TYPE (**data loss**: failed int8→int4 leaves table EMPTY, `internal error: expected int, got kind 1`)~~ **LANDED (2026-08-16)** — static assignment-coercibility gate `canAssignCast` (int2/int4/int8→bool + text→int rejected) at the top of `execAlterColumnType`, no-USING path, before storage work; the crash itself was already closed by C2 slice 5 (`fec178bd`). | `ATExecAlterColumnType` path | `tablecmds.c` | correctness |
@@ -845,6 +845,62 @@ different allow-set (ATT_MATVIEW) and `execCreateMatView` never populates
 
 Diff **4073 → 4048 (−25)**. `create_view` (2505) and `updatable_views` (4156)
 verified byte-identical to a stash-based pre-change baseline — no over-refusal.
+
+## C7 slice 1 — an inline column CHECK must keep its user-given name (2026-08-18)
+
+The formatter-tail scoping pass (researcher `af1679ca6e2065b46`,
+`tmp/ralph-handoffs/m0134-0002-s01-formatter-tail/report.md`) re-measured the
+case at HEAD `f8284ae2`: **4048 lines / 107 hunks**, matching this doc's last
+recorded number exactly — no drift. Its main structural finding is that the
+remaining diff is **no longer dominated by C7/C12/C13/C14**. Newly-visible
+classes sitting outside the original 14-class frame: ownership/ACL checks are
+absent entirely (`must be owner of …` is never raised), `pg_locks` is always
+empty, an EXPLAIN Append/**constraint-exclusion planner** gap (a planner gap,
+not C14 "verbosity"), and a `\d+` describe drift (missing `Compression` column
+and `Access method: heap` line; the Index `Definition` column renders the whole
+`CREATE INDEX` statement instead of just the expression). Those are future
+classes, deliberately NOT folded into C7.
+
+The one genuinely-C7, genuinely-isolated slice it found is implemented here.
+
+**Divergence.** `CREATE TABLE t (a int CONSTRAINT con1 CHECK (a > 0))` parsed
+the name `con1` and discarded it; `execCreateTable` then unconditionally
+auto-named the constraint `t_a_check`. A later `ALTER TABLE t RENAME CONSTRAINT
+con1 TO …` therefore failed with `constraint "con1" … does not exist` — the
+symptom that made this look like a *rename* gap when it is a *naming* gap.
+
+**PG oracle.** `parse_utilcmd.c` `transformCheckConstraints` preserves
+`Constraint->conname` verbatim; `heap.c` `ChooseConstraintName` generates
+`<rel>_<col>_check` **only when `conname` is NULL**. Naming is decided at parse
+time, not at catalog time.
+
+**Fix.** The sibling pattern already shipped for inline UNIQUE and inline NOT
+NULL was the whole design: `ColumnDef` already carried `UniqueConstraintName`
+and `NotNullConstraintName`, and CHECK was the missing third.
+`internal/parser/ast.go` gains `ColumnDef.CheckConstraintName`;
+`internal/parser/ddl.go`'s `CONSTRAINT <name> CHECK (…)` column arm stores the
+identifier it was already parsing and throwing away; `execCreateTable`
+(`internal/executor/operators_ddl.go`) prefers that name and falls back to the
+existing auto-name when empty. Table-level named CHECK (`s.TableNamedChecks`)
+was already correct and is untouched.
+
+**Sibling-path audit (Hard-won Rule #2).** Three other `ColumnDef`-CHECK
+consumers were checked. `CREATE TABLE … LIKE INCLUDING CONSTRAINTS` copies from
+the materialized source table's catalog constraints, so it inherits the fix with
+no code change. `PARTITION OF` uses a separate `PartitionCheckConstraint`
+structure, not `ColumnDef` — unaffected. `ALTER TABLE … ADD COLUMN` never reads
+`col.CheckExpr` **at all** (`operators_ddl.go:10033`) and silently drops an
+inline CHECK regardless of naming — a pre-existing missing feature, ledgered
+rather than fixed here.
+
+**Result.** Diff **4048 → 4039 (−9)**; three `RENAME CONSTRAINT con1 TO con1foo`
+statements now succeed. Hunk count rose 107 → 108, which is benign: the newly
+matching content splits one large divergent hunk into two smaller ones (verified
+by diffing the before/after `.diff` files). No new divergence. Guards:
+`internal/parser` `TestParseCheckNotEnforced/CreateTableInlineColumnNamed`
+(plus a new `…/CreateTableInlineColumnAnonymousNameEmpty` sibling pinning the
+anonymous form) and `internal/executor`
+`TestColumnLevelCheckPreservesExplicitName`; both confirmed FAIL-pre/PASS-post.
 
 ## PG oracle citations
 
