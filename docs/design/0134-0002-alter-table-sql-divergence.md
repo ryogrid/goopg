@@ -77,6 +77,36 @@ reorder robustness; deferred, see the ledger.)
 | C12 | message text | error msgs | `errcode()` | formatter |
 | C13 | NOTICE/IF EXISTS | DDL | `tablecmds.c` | formatter |
 | C14 | EXPLAIN verbosity/underline | `operators_explain.go` | `explain.c` | formatter |
+| C16 | **ownership/ACL checks absent entirely** — `must be owner of ...` is never raised for tables/indexes/views (only `database_ddl.go` has any owner check); goopg happily executes DDL the regress script expects to be refused | RENAME family `operators_ddl.go:7729-7749` (index) + table/view RENAME paths — no ownership verification anywhere; only an owner-*stamping* helper at `operators_ddl.go:936` | `tablecmds.c:6795` `ATSimplePermissions` → `object_ownercheck` (`aclchk.c`) | correctness — **own milestone**; cheapest slice = the RENAME family only (3–4 call sites behind one shared helper) |
+| C17 | **`pg_locks` always empty** — largest single class (~180 changed lines). NOT a view-rendering or lock-machinery gap: the txn-scoped lock machinery (`context.go:1279-1298`) and the view renderer (`relation_locks.go:80-183`) are both correct. Most ALTER TABLE sub-actions simply never acquire a lock | only DROP/ATTACH/OWNER-TO call `acquireDDLLockTxn`/`acquireRelLockTxn` (`operators_ddl.go:6207,6300,7229,7293,7347,7617`); SET STATISTICS, CLUSTER ON, reloptions, SET STORAGE/DEFAULT, ADD FK, VALIDATE CONSTRAINT, CREATE TRIGGER acquire nothing | `tablecmds.c:4608` `AlterTableGetLockLevel`; `lock.c` `GetLockStatusData` | correctness — **own milestone**; first cheap sub-slice = one blanket `AccessExclusiveLock` acquire at the top of `execAlterTable` (fixes row *existence*, not the exact per-action `mode` strings) |
+| C18 | **EXPLAIN `Append` / constraint exclusion** — a *planner* gap, not C14 verbosity. Three bundled issues: no constraint exclusion at all (the Go `ConstraintExclusion` GUC is a dead stub), missing per-child `<parent>_N` alias, and Filter hoisted onto the Append instead of repeated per child | planner inheritance expansion; no `relation_excluded_by_constraints` equivalent exists | `plancat.c relation_excluded_by_constraints`; `prepunion.c expand_inherited_rtentry` | planner — **own milestone** (needs a real optimizer pass) |
+| C19 | ~~`\d+` describe drift~~ **LANDED (2026-08-18)** — see the "C19 — LANDED" section below. **The premise was inverted.** goopg *over*-produces the `Compression` column and the `Access method: heap` footer because `pg_regress` always invokes psql with `-v HIDE_TABLEAM=on -v HIDE_TOAST_COMPRESSION=on` (`pg_regress_main.c:74-79`) and goopg's own runner never passes them — a **harness** bug worth ~8 hunks suite-wide, not an engine gap. The one genuine engine bug in the class: `pg_get_indexdef` ignores its 2nd/3rd arguments and always returns the whole `CREATE INDEX` statement | harness: `scripts/pg-regress-runner.sh:214`; engine: `internal/executor/expr.go:9469-9491` (`pg_get_indexdef` arity) | `pg_regress_main.c:74-79`; psql caller `describe.c:1936-1937` (3-arg per-column form); `ruleutils.c:1270` `pg_get_indexdef_worker`, `colno`-gated branches :1417-1460 | harness + executor — **the cheapest real slice of the four** |
+
+## Residual re-characterisation (2026-08-18) — C16–C19
+
+After the C7 slice-1 landing the residual `alter_table` diff (4048 lines / 107
+hunks at `f8284ae2`) is **no longer dominated by the C7/C12/C13/C14 formatter
+tail**. Four classes outside the original 14-class frame carry most of it; they
+are filed above as C16–C19. Two conclusions govern the next slices:
+
+1. **C16, C17 and C18 are each milestone-sized**, not slices. C16 needs an
+   ownership-check layer goopg does not have at all; C17 needs per-action lock
+   levels across the whole ALTER TABLE surface; C18 needs a constraint-exclusion
+   optimizer pass. Filing them here is the deliverable — do not attempt them as
+   `alter_table.sql` slices.
+2. **C19 is the reachable one, and half of it is our own harness.** goopg's
+   regress runner diverges from upstream `pg_regress`, which sets
+   `HIDE_TABLEAM=on` and `HIDE_TOAST_COMPRESSION=on` on every psql invocation
+   (`postgres/src/test/regress/pg_regress_main.c:74-79`). Because those are
+   *client-side* psql variables consumed by `describe.c`, passing them costs
+   nothing in the engine and corrects the comparison for the whole suite, not
+   just `alter_table`. The remaining engine half is `pg_get_indexdef`: psql's
+   `\d+` calls the three-argument per-column form
+   (`describe.c:1936-1937`), and PG's `pg_get_indexdef_worker`
+   (`ruleutils.c:1270`, `colno`-gated branches :1417-1460) returns just that
+   column's key expression when `colno != 0`, whereas goopg's implementation
+   (`internal/executor/expr.go:9469-9491`) discards `colno`/`pretty` and always
+   emits the full statement.
 
 ## First slice
 
@@ -902,8 +932,80 @@ by diffing the before/after `.diff` files). No new divergence. Guards:
 anonymous form) and `internal/executor`
 `TestColumnLevelCheckPreservesExplicitName`; both confirmed FAIL-pre/PASS-post.
 
+## C19 — LANDED (2026-08-18): the `\d+` drift was half harness, half `pg_get_indexdef` arity
+
+**The premise was inverted.** The previous loop recorded goopg as *missing* the
+`Compression` column and the `Access method: heap` footer. It is the opposite:
+goopg **over-produces** them. Upstream `pg_regress` invokes every psql with
+`-v HIDE_TABLEAM=on -v HIDE_TOAST_COMPRESSION=on`
+(`postgres/src/test/regress/pg_regress_main.c:74-79`), so the expected `.out`
+files were generated with those sections suppressed; goopg's own runner
+(`scripts/pg-regress-runner.sh`) never passed them. Because they are
+*client-side* psql variables consumed by `describe.c`, this was a **harness**
+bug with zero engine content, and the fix corrects the comparison for the entire
+regress suite rather than for `alter_table` alone. Lesson worth generalising: a
+`\d`-shaped divergence must be checked against `pg_regress`'s own psql
+invocation before it is attributed to the engine.
+
+**The genuine engine half** was `pg_get_indexdef` arity. psql's `\d+` reaches
+the per-column form (`describe.c:1936-1937`), and PG's
+`pg_get_indexdef_worker` (`ruleutils.c:1270`) switches to an `attrsOnly` mode
+via `pg_get_indexdef_ext` (`ruleutils.c:1198-1217`) whenever `colno != 0`,
+emitting **only** that column's name or parenthesised key expression — the
+COLLATE / opclass / ASC-DESC / NULLS decorations are gated off wholesale at
+`ruleutils.c:1459`. goopg's implementation discarded both the `colno` and
+`pretty` arguments and always returned the full `CREATE INDEX` statement, so
+every `\d+` index `Definition` cell diverged.
+
+**Fix.** `internal/catalog/catalog.go` gains `BuildIndexDefColumn(idx, colno)`
+beside the existing `BuildIndexDef`, walking key columns then INCLUDE columns on
+one 1-based combined ordinal (the same convention `PGIndexRowsForDBOid`'s
+`indkey` construction already uses). `internal/executor/expr.go`'s
+`pg_get_indexdef` case parses `Args[1]`: `colno == 0`/absent keeps the existing
+full-statement path, `colno != 0` routes to the new helper. The `pretty`
+argument stays a documented no-op — goopg has no deparser to pretty-print
+against, which is the already-ledgered C11c gap.
+
+**Oracle correction found while implementing.** An out-of-range `colno` on a
+*valid* index OID returns the **empty string**, not NULL —
+`pg_get_indexdef_worker` never range-checks `colno`, its loop simply never
+matches; NULL is reserved for an OID that does not resolve. Verified directly
+against a throwaway real PG 18.3 instance
+(`pg_get_indexdef('t19_idx'::regclass, 3, true) IS NULL` → `f`,
+`pg_get_indexdef(0, 1, true) IS NULL` → `t`). The implementation follows the
+oracle, not the brief.
+
+**Sibling-path audit (Hard-won Rule #2).** All 18 hits for
+`pg_get_indexdef|buildIndexDefString|BuildIndexDef` resolve to the single
+canonical chain (`expr.go` case → `buildIndexDefString` →
+`catalog.BuildIndexDef`), plus comments, `colno=0`-only unit tests and `pg_proc`
+seed rows. There is no second index-definition renderer and no separate
+`\d`-support path, so there was no twin to change.
+
+**Result.** `alter_table` **4039 → 3981** lines after the harness half, **→ 3968**
+after the engine half (−71 total). `create_table` 831 → 791 confirms the
+suite-wide harness yield; `create_index` 3613 → 3613 confirms the harness change
+is a no-op where it does not apply. Hunk count rose 108 → 111, the same benign
+`diff --unified=5` windowing artifact seen in C7 slice 1: removing the
+Compression/access-method noise deleted the lines that used to bridge two
+genuinely-different regions, so one hunk now renders as two. Proof point —
+`atnnpart1_pkey`'s `Definition` went from
+`CREATE UNIQUE INDEX atnnpart1_pkey ON public.atnnpart1 USING btree (id)` to
+exactly `id`, byte-identical to PG, contributing zero diff lines, which is
+precisely why that hunk split. Guard:
+`internal/executor/pg_get_indexdef_test.go`
+(`TestBuildIndexDefColumn` / `TestBuildIndexDefColumnExpression`), confirmed
+FAIL-pre (compile error) / PASS-post.
+
 ## PG oracle citations
 
+- `postgres/src/test/regress/pg_regress_main.c:74-79` — the psql variables
+  (`HIDE_TABLEAM`, `HIDE_TOAST_COMPRESSION`) upstream sets on every regress
+  invocation; goopg's runner must match them or `\d+` output over-produces.
+- `postgres/src/backend/utils/adt/ruleutils.c:1270` `pg_get_indexdef_worker`
+  (+ `pg_get_indexdef_ext` :1198-1217, decoration gate :1459) — per-column
+  `attrsOnly` rendering when `colno != 0`; psql caller
+  `postgres/src/bin/psql/describe.c:1936-1937`.
 - `postgres/src/backend/parser/parse_coerce.c` — `coerce_to_target_type` (:78),
   `can_coerce_type` (:557), `find_coercion_pathway` (:3152), I/O fallback (:3273).
 - `postgres/src/include/catalog/pg_cast.dat` — castcontext rows (int8→int4 'a'

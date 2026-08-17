@@ -9467,7 +9467,16 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 		return NullDatum, nil
 	case "pg_get_indexdef":
-		// pg_get_indexdef(indexrelid) → text — reconstructs CREATE INDEX DDL. M0097-0023.
+		// pg_get_indexdef(indexrelid) → text — reconstructs CREATE INDEX DDL.
+		// M0097-0023. The 3-arg form pg_get_indexdef(indexrelid, colno,
+		// pretty) is pg_get_indexdef_ext (ruleutils.c:1198-1217): colno == 0
+		// behaves exactly like the 1-arg form; colno != 0 selects just the
+		// Nth index attribute's bare column name/expression with none of the
+		// CREATE INDEX decoration (catalog.BuildIndexDefColumn). `pretty`
+		// (3rd arg) only affects real PG's line-wrapping of long expression
+		// text (PRETTYFLAG_INDENT) — goopg has no multi-line expression
+		// deparse, so it is parsed but has no observable effect. M0134-0002
+		// C19.
 		if len(x.Args) < 1 {
 			return NullDatum, nil
 		}
@@ -9482,9 +9491,27 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			v, _ := strconv.ParseUint(strings.TrimSpace(arg.StringValue()), 10, 32)
 			targetOID = uint32(v)
 		}
+		var colno int
+		if len(x.Args) >= 2 {
+			colArg, err := evalExpr(x.Args[1], row, ctx)
+			if err != nil {
+				return NullDatum, nil
+			}
+			if !colArg.IsNull() {
+				if colArg.Kind == KindInt {
+					colno = int(colArg.Int)
+				} else {
+					v, _ := strconv.ParseInt(strings.TrimSpace(colArg.StringValue()), 10, 32)
+					colno = int(v)
+				}
+			}
+		}
 		for _, idx := range ctx.Catalog.AllIndexes() {
 			if idx.OID != targetOID {
 				continue
+			}
+			if colno != 0 {
+				return NewStringDatum(catalog.BuildIndexDefColumn(idx, colno)), nil
 			}
 			return NewStringDatum(buildIndexDefString(idx)), nil
 		}

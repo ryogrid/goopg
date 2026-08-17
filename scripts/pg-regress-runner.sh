@@ -211,7 +211,8 @@ if ! pg_isready -h 127.0.0.1 -p "${PORT}" -U postgres -q 2>/dev/null; then
     exit 2
 fi
 
-PSQL=(psql -h 127.0.0.1 -p "${PORT}" -U postgres -d postgres --no-psqlrc -X -a -q)
+PSQL=(psql -h 127.0.0.1 -p "${PORT}" -U postgres -d postgres --no-psqlrc -X -a -q \
+    -v HIDE_TABLEAM=on -v HIDE_TOAST_COMPRESSION=on)
 
 # -------------------------------------------------------------------------- #
 # Run test_setup.sql (best-effort: goopg may not support everything)
