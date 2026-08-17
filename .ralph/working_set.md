@@ -1,57 +1,57 @@
-# Working set — M0134-0001 S21 LANDED (pushed)
+# Working set — M0134-0001 S22 was a SCOPING loop: two NO-GOs, residual re-characterised
 
-**Task:** M0134-0001 (`aggregates.sql`), slice **S21 — a deferred coercion must
-still carry the literal's position**. Selected per the Current Priority banner
-(M-NIGHTLY drained: `ci/logs/action-items.md` still run `20260817-011734`, all 6
-filed and `[x]`; nothing new to file).
+**Task:** M0134-0001 (`aggregates.sql`), slice **S22**. Selected per the Current
+Priority banner (M-NIGHTLY drained: `ci/logs/action-items.md` still run
+`20260817-011734`, all 6 filed and `[x]`; nothing new to file).
 
-**What landed:** `rank('fred') within group (order by x)` emitted its
-`ERROR: invalid input syntax for type integer: "fred"` with no `LINE 1:`/`^`.
-`buildAggregateCall` defers the coercion to a runtime `CastExpr`
-(`planner.go:8374-8379`) and never set the type's **unexported** `pos`, leaving
-0 — goopg's own convention for "suppress LINE 1". One-line fix:
-`pos: argE.Pos()`, matching the sibling `PlanError` at `:8386`.
+**No code changed this loop — by design.** Both candidates the S21 map named as
+next-best were scoped and both came back NO-GO with evidence. Recording that is
+the deliverable; manufacturing a GO would have been the failure.
 
-**The technique that made it cheap:** the sibling 42P21 error two lines away in
-the SAME hunk already rendered its pointer lines correctly and was unchanged by
-the diff — proving the plumbing worked and only one position was missing, before
-any code was read. Reuse this: read the hunk's unchanged context for a
-same-mechanism control.
+**Baseline reconfirmed at HEAD `45cb67c0`: `aggregates` 930 lines / 25 hunks** —
+S21's prediction hit exactly.
 
-**Twin: NONE, positively verified** (one evaluator site `expr.go:514` in
-`evalExprSlot`, shared by general exprs and the hypothetical-set direct arg; one
-construction site, its two callers share it). Recorded as a result because
-S11/S17/S18/S20 were each bitten by an unpaired twin.
+**NO-GO 1 — `Group Key:` qualification (hunks #8/#9).** Not an EXPLAIN-formatter
+gap: `operators_explain.go:778-816` already reuses the shared `formatExprQual`/
+`qualify` helper. Real cause is **three** independent mechanisms —
+`planner.go:3013,3059` gives every child scan of an inherited/partitioned table
+the SAME `SourceTableIdx` (so `explain_names.go:96-98,189-205` counts a
+multi-child `Append` as one relation; PG uses `rtable_size > 1`,
+`explain.c:774-782`); a partitioned table has **no parent scan node at all** in
+goopg's plan (hunk #9's `p_t1` names nothing); and PG's `inherit.c` positional
+Seq-Scan aliasing is absent (hunk #8). Entangles the already-failing
+`partition_aggregate.out`, which uses the OPPOSITE alias rule.
 
-**Measurement:** `aggregates` **943 → 930 lines, 26 → 25 hunks** — scoping
-prediction hit exactly. Sentinel `functional_deps` 56 unchanged.
+**NO-GO 2 — NOTICE trans-function ordering (hunk #14). S21's hypothesis is
+REFUTED.** goopg's `1,3,1,3` is **not a bug** — it is PG's own baseline
+semantics, correctly implemented. PG's `1,1,3,3` is a side effect of the
+presorted-DISTINCT-aggregate optimization (`aggpresorted`,
+`nodeAgg.c:4260-4271` / `planner.c:3199-3227`, GUC `enable_presorted_aggregate`).
+**Trap for the next loop:** goopg's `applyPresortedAggregateRule` (S8 slice 2a)
+ports only the pathkey-*ordering* half of that same PG function — it does NOT
+set `aggpresorted`. Closing 1 hunk would cost a new planner feature plus a third
+arm in `operators_join_agg.go:applyAgg`/`finishAgg` (hottest aggregate path,
+every TPC-H/DS query), and built-in DISTINCT aggs already advance inline while
+user-defined ones buffer — naive unification regresses built-ins.
 
-**Files:** `internal/optimizer/planner.go` (1 line + comment),
-`internal/executor/hypothetical_set_agg_errpos_test.go` (new, 2 guards),
-`docs/design/0134-0001-p9-agg-coercion-error-position.md` + README row.
+**Residual re-characterisation (the real finding):** after S21, **no small
+isolated slices remain** in `aggregates`. All 25 hunks are ruled out (deparser
+8, varno 1, VERBOSE/parallel 4, SubPlan-absence 3) or large/confounded (min/max
+inheritance bundle, Incremental Sort — operator absent, join-method selection,
+#8/#9, #14).
 
-**Gates run:** `go build ./...` PASS; `internal/optimizer`+`internal/executor`
-PASS; UNITS PASS; caret column verified byte-identical vs PG via `psql` on a
-capped throwaway server; pgbench smoke PASS via hook.
+**Next step:** do NOT slice M0134-0001 further. Either (a) scope hunk #7 knowing
+it is two orthogonal planner gaps in one hunk needing de-confounding first, or
+(b) **re-scope/park M0134-0001 and advance to M0134-0002** — the remaining
+`aggregates` work is 3-4 genuine feature milestones, not slices.
 
-**Deferral ledger:** 1 new row 2026-08-17 — the coercion still happens at the
-wrong TIME (PG folds the literal at parse analysis, `parse_coerce.c:coerce_type`
-:294-304; goopg evaluates per row), so a shape that never evaluates the arg
-(zero rows, `WHERE false`) should error in PG and stays silent in goopg. No
-corpus witness; the row carries the probe.
+**Files:** `.ralph/fix_plan.md` (S22 note + residual re-characterisation),
+`.ralph/deferral_ledger.md` (2 rows 2026-08-17). No `internal/` changes.
 
-**Next step:** continue **M0134-0001** at 25 hunks. Best candidates: the NOTICE
-trans-function ordering hunk (real `nodeAgg.c`-style execution-order gap, not
-string-only); the `Group Key:` qualification-under-`Append`/inheritance pair
-(hunks #8/#9, small, root cause untraced); the multi-target +
-inheritance/`Merge Append` min/max bundle (ONE slice per the S19 row). Ruled
-out: deparser/C11c (8 hunks, own milestone), VERBOSE `Output:` pruning,
-class-10 varno, correlated-subquery class (d), and the plain-aggregate
-collation successor (**zero regress-diff witness** — would not move the count).
+**Gates run:** `scripts/pg-regress-runner.sh --verbose aggregates` (baseline
+930/25, unchanged). No build/unit gates needed — zero code change.
 
-**Delegation:** `tmp/ralph-handoffs/m0134-0001-s21-scope/report.md` (researcher,
-1 round — its 26-hunk table is the map for the next slice) and
-`tmp/ralph-handoffs/m0134-0001-s21-cast-errpos/report.md` (implementer, 1 round,
-no deviations).
+**Delegation:** `tmp/ralph-handoffs/m0134-0001-s22-groupkey-qual/` (researcher
+`a2921fd55e90154b3`, 2 rounds, both NO-GO; report.md has full citations).
 
 **In-flight:** none.
