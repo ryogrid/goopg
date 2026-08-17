@@ -1678,6 +1678,12 @@ func checkConstraints(ctx *Context, tbl *catalog.Table, row Row) error {
 		if exprSQL == "" {
 			continue
 		}
+		// Skip not enforced constraint. Mirrors PG's ExecRelCheck, which
+		// never builds an ExprState for a check with ccenforced=false
+		// (postgres/src/backend/executor/execMain.c:1813-1815).
+		if ci < len(tbl.NamedChecks) && tbl.NamedChecks[ci].NotEnforced {
+			continue
+		}
 		// Build actual-value from clause for this row.
 		colVals := make([]string, len(tbl.Columns))
 		for i, col := range tbl.Columns {

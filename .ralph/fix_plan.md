@@ -6511,9 +6511,18 @@ M0119 and M0122's remaining items. Milestone doc:
       diff 1496 → **1515** lines / 30 hunks — it *grew* because the fix **unmasks**
       (aborted statements now emit real, still-wrong result sets), so diff line count is
       not this case's metric of record.
-      **Next slices (independent, bounded):** Bucket 2 — `NOT ENFORCED` CHECK
-      constraints are still enforced (`internal/executor/operators_fk.go:1664` ignores
-      `NamedChecks[i].NotEnforced`); Bucket 3 — `DROP`/`RENAME CONSTRAINT` cannot find a
+      **Bucket 2 LANDED 2026-08-18**: `checkConstraints`
+      (`internal/executor/operators_fk.go:1664`) — the single runtime fan-in for
+      INSERT/COPY/UPDATE — now skips a check whose `tbl.NamedChecks[i].NotEnforced` is
+      set, mirroring PG `execMain.c:ExecRelCheck:1813-1815`. The two slices are
+      index-aligned 1:1 by construction (`catalog.AddCheckFull`,
+      `internal/catalog/catalog.go:288`); the ADD-CONSTRAINT scan and VALIDATE
+      CONSTRAINT paths already honoured the flag and were left alone. Diff 1515 →
+      **1465** lines (hunks 30 → 31: one surviving hunk split, not new divergence);
+      `NE_CHECK_TBL`/`NE_INSERT_TBL_CON` hunks gone. Pinned by
+      `TestCheckConstraintNotEnforcedSkipsRuntimeEvaluation`. `NOT ENFORCED` on
+      **UNIQUE** constraints still diverges — ledgered, different code path.
+      **Next slices (independent, bounded):** Bucket 3 — `DROP`/`RENAME CONSTRAINT` cannot find a
       NOT NULL constraint by name (`internal/executor/operators_ddl.go:10719` never
       consults `tbl.NotNullConstraints`; **confirm the RENAME sibling before briefing** —
       Hard-won Rule #2); Bucket 6 — `ALTER CONSTRAINT … NOT VALID/INHERIT/NO INHERIT`

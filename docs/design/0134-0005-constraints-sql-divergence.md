@@ -1,6 +1,6 @@
 # M0134-0005 — `constraints.sql` divergence map + Bucket 1 (PREPARE parameter type names)
 
-Status: accepted — Bucket 1 LANDED 2026-08-18; the case stays open (`[ ]`).
+Status: accepted — Buckets 1 and 2 LANDED 2026-08-18; the case stays open (`[ ]`).
 
 ## 1. Baseline (re-measured 2026-08-18)
 
@@ -31,7 +31,7 @@ cannot be judged until an earlier bucket is fixed.
 | # | bucket | size | goopg site | PG oracle | verdict |
 |---|---|---|---|---|---|
 | **1** | **PREPARE parameter-type validator rejects `regclass[]`** — and any array or typmod spelling, and whole built-in families | 13 hunks / ~120 lines | `internal/postmaster/dispatch.go:2038` `isValidSQLTypeName` | `gram.y` `PreparableStmt` takes `Typename` (carries `arrayBounds` + `typmods`); resolution is `parse_type.c:typenameType`, a real `pg_type` lookup | **LANDED** — see §3 |
-| 2 | `NOT ENFORCED` CHECK constraints are still enforced on INSERT | ~4 hunks / ~20 lines | `internal/executor/operators_fk.go:1664` `checkConstraints` loops `tbl.CheckConstraints` unconditionally, never consulting `tbl.NamedChecks[i].NotEnforced` | `tablecmds.c` — executor skips `conenforced = false` rows | independent, bounded ⇒ good next slice |
+| **2** | **`NOT ENFORCED` CHECK constraints are still enforced on INSERT** | ~4 hunks / 50 lines | `internal/executor/operators_fk.go:1664` `checkConstraints` loops `tbl.CheckConstraints` unconditionally, never consulting `tbl.NamedChecks[i].NotEnforced` | `execMain.c:ExecRelCheck` lines 1813-1815 — `/* Skip not enforced constraint */ if (!check[i].ccenforced) continue;` | **LANDED** — see §4 |
 | 3 | `DROP CONSTRAINT` / `RENAME CONSTRAINT` cannot find a NOT NULL constraint by name | ~6 hunks | `internal/executor/operators_ddl.go:10719` `execAlterTableDropConstraint` checks NamedChecks/FK/UNIQUE/EXCLUDE/PK but never `tbl.NotNullConstraints`; the RENAME sibling is **assumed by pattern, not read** | `tablecmds.c:dropconstraint_internal` handles `CONSTR_NOTNULL` alongside the other contypes | independent, bounded ⇒ good next slice; **verify the RENAME sibling before briefing** |
 | 4 | statement-level / deferred UNIQUE checking during self-referencing UPDATE (`UPDATE unique_tbl SET i=i+1`, ring rotations, `SET CONSTRAINTS … DEFERRED` re-check timing) | ~6-8 hunks, the largest line driver (~340 lines) | not one function: goopg maintains unique indexes row-by-row inside UPDATE | PG defers same-statement duplicate detection so a row-permutation UPDATE succeeds despite colliding intermediate states (`ExecInsertIndexTuples` + the deferred-trigger queue) | **MILESTONE**, not a slice — real constraint-timing/MVCC work |
 | 5 | `EXCLUDE USING gist` on `circle` → "data type circle has no default operator class", cascading to 10× "relation circles does not exist" | ~11 hunks | opclass registry has no circle/gist default opclass | PG ships `circle_ops` for GiST | **MILESTONE** (GiST opclass coverage) |
@@ -78,10 +78,54 @@ the function's signature and pull user-defined type resolution (enum / domain /
 composite) into a slice scoped to a cascade fix. Consequence: `PREPARE p (my_enum)` is
 still a false 42704. Ledgered.
 
-## 4. Next slice for this case
+## 4. Bucket 2 — what landed (2026-08-18)
 
-Bucket 2 (`NOT ENFORCED` CHECK) or bucket 3 (NOT NULL constraint by name) — both
-independent and bounded, both single-site. Bucket 3 must first confirm whether
+Research (`tmp/ralph-handoffs/m0134-0005-s03-not-enforced-check/report.md`) settled the
+three questions that decided the shape of the fix:
+
+1. **`NotEnforced` is already parsed, stored, and honoured everywhere except at
+   runtime.** `catalog.NamedCheckConstraint.NotEnforced`
+   (`internal/catalog/catalog.go:216`) is set by both `CREATE TABLE … CHECK (…) NOT
+   ENFORCED` and `ALTER TABLE … ADD CONSTRAINT … NOT ENFORCED`. The ADD-CONSTRAINT
+   initial data scan (`internal/executor/operators_ddl.go:8093`) already skips it, and
+   `VALIDATE CONSTRAINT` already raises 55000 for it (`:8037`).
+2. **The two slices cannot diverge.** `tbl.CheckConstraints` and `tbl.NamedChecks` are
+   appended together in the single fan-in `catalog.AddCheckFull` /
+   `AddCheckInherited` (`internal/catalog/catalog.go:288`), so they are index-aligned
+   1:1 by construction. The fix indexes `NamedChecks` by the `CheckConstraints` loop
+   index, with a defensive bounds check.
+3. **There is exactly one runtime enforcement site** — `checkConstraints`
+   (`internal/executor/operators_fk.go:1664`) is the single fan-in for INSERT/COPY
+   (`operators_storage.go:2494`) and UPDATE (`checkRowConstraintsForWrite`,
+   `operators_fk.go:1830`). No sibling path needed a matching edit (Hard-won Rule #2
+   checked, not assumed). Domain CHECK constraints run through a genuinely separate
+   path (`checkDomainConstraintsForRow`) and are out of this bucket's scope.
+
+So the fix is six lines: `continue` when
+`ci < len(tbl.NamedChecks) && tbl.NamedChecks[ci].NotEnforced`. Pinned by
+`TestCheckConstraintNotEnforcedSkipsRuntimeEvaluation`
+(`internal/executor/operators_fk_check_notenforced_skip_test.go`, FAIL pre / PASS
+post), which asserts all three directions: a NOT ENFORCED check accepts violating rows
+on INSERT *and* UPDATE; an enforced check still raises 23514 (the skip must not
+over-fire); and a table carrying both kinds evaluates only the enforced one (the
+index-alignment guard).
+
+**Measured effect:** `scripts/pg-regress-runner.sh constraints` 1515 → **1465** lines
+(hunks 30 → 31 — one surviving hunk split, not new divergence). The `NE_CHECK_TBL` and
+`NE_INSERT_TBL_CON` hunks are gone. Unlike Bucket 1 this is a plain shrink, not an
+unmasking.
+
+**Deliberately not done:** `NOT ENFORCED` on **UNIQUE** constraints
+(`UNIQUE_NOTEN_TBL`, `ALTER CONSTRAINT … ENFORCED`) still diverges — a different
+constraint type on a different code path. Ledgered. Note that PG has **no** CHECK
+`ALTER CONSTRAINT … ENFORCED` toggle at all (`tablecmds.c:12412`
+`ATExecAlterConstrEnforceability` asserts `contype == CONSTRAINT_FOREIGN`), so none was
+added here.
+
+## 5. Next slice for this case
+
+Bucket 3 (NOT NULL constraint by name) — independent, bounded, single-site.
+Bucket 3 must first confirm whether
 `execAlterTableRenameConstraint` has the same omission as the DROP handler; that is a
 sibling pair, and a fix to only one of them is the failure mode Hard-won Rule #2 exists
 to prevent. Buckets 4 and 5 need their own milestones. Bucket 7 needs a research pass
