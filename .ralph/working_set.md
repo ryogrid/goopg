@@ -1,59 +1,63 @@
-# Working set — M0134-0005: `reg*[]` cast landed; next slice is PREPARE param coercion
+# Working set — M0134-0005 Bucket 4 core fix landed; next is the exposed index-build defect
 
-**Task:** M0134-0005 (`constraints.sql`) — the **`reg*[]` array cast** landed
-2026-08-18; the case stays `[ ]`. Selected per the Current Priority banner (M0134
-next after M-NIGHTLY). M-NIGHTLY drained: `ci/logs/action-items.md` still at run
-`20260818-005518`, **items: 0** — nothing to file.
+**Task:** M0134-0005 (`constraints.sql`) — **M0134-0005b landed and pushed**
+(`7ac8c177`). Sub-item `[x]`, parent case stays `[ ]`. Selected per the Current
+Priority banner (M0134 next after M-NIGHTLY). M-NIGHTLY drained:
+`ci/logs/action-items.md` still at run `20260818-005518`, **items: 0** — nothing to
+file.
 
-**Root cause was TWO stacked causes — do not re-bisect.** A six-step bisect
-**cleared** `pg_constraint` contype='n' population, the `convalidated`/
-`conislocal`/`coninhcount` columns, `= ANY`, plain `int[]` prepared params, and
-the `COLLATE "C"` sort. **Cause A (FIXED):** `evalCast` had **no case for any
-reg\*-array type** → fell through to the terminal `return d, nil // pass-through
-for unknown types`, so `'{tbl}'::regclass[]` stayed raw text (`pg_typeof` →
-`text`) and every OID comparison silently evaluated **false**. New arm covers all
-8 reg\*[] types, shaped like `case "name[]":`, resolving via `regIdentifierInput`;
-misses now raise 42P01/42704. Rule-#2 sibling check **negative** (encode twin
-`codec_array.go:encodeArrayElem` already correct). Forced adjacent fix:
-`evalExprSlot`'s reverse-direction `TargetType == "regtype[]"` oidvector case
-intercepted brace literals — now requires the string not to start with `{`.
+**What landed:** goopg had TWO unique check-timing tiers where PG has THREE. PG sets
+`pg_index.indimmediate=false` for **every** deferrable index regardless of INITIALLY
+mode (`catalog/index.c:2080-2082`); only the recheck *timing* differs.
+`uniqueCheckDeferred` now answers only "needs a partial check?" (explicit-txn gate
+**removed**); new `uniqueCheckDeferToCommit` holds the old resolver; queue entries
+carry a `DeferToCommit` tier tag (plain-key **and** NND twin); new
+`RunStmtEndDeferredUniqueChecks` drains the non-commit tier. Files:
+`internal/executor/{deferred_unique.go,session.go}`,
+`internal/postmaster/{dispatch.go,dispatch_extended.go}`,
+`internal/testport/deferred_unique_stmt_end_e2e_test.go` (5 tests).
 
-**Cause B (NOT fixed) is why the metric moved zero.** `internal/postmaster/
-dispatch.go` never applies `prepDef.paramTypes` as a coercion (arity check +
-`execParamTypeIncompatible` only), so `EXECUTE get_nnconstraint_info('{…}')` is
-still `(0 rows)` while the inline `ANY('{tbl}'::regclass[])` form now returns the
-row. Generic, not reg\*-specific (scalar `regclass` mis-binds identically).
+**Two things worth not re-deriving:**
+1. **Bucket 4's "MILESTONE" sizing in §2 was wrong** — the machinery already existed
+   (M0119-0004). Size buckets from the existing code, not the symptom.
+2. **The dispatch twins were NOT symmetric.** Extended-protocol out-of-block
+   `Execute` commits via `ectx.CommitTransaction` (`internal/executor/context.go:1030`),
+   a bare `TxnMgr.Commit` with **no** deferred drain. UNIQUE is wired there now; **FK
+   and EXCLUDE still are not** — silent uncaught violations for prepared-statement
+   clients (ledgered, real bug).
 
-**Measurement:** `constraints` 1411 → **1411** lines, hunks 33 → **33**, all 15
-`get_nnconstraint_info` mentions still in open hunks. That is a **stacked root
-cause** — a third outcome shape beside Bucket 1's *unmasking* and Bucket 6's
-*bucket interference*. A flat number here does NOT mean the slice did nothing.
-**Never compare to a pre-2026-08-18 `constraints` number** (pre-C19 harness).
+**Measured:** 1376 → **1299** lines (−77), hunks 34 → **36** (unmasking split).
+`timeout 300 scripts/pg-regress-runner.sh --verbose constraints`; artifact
+`tmp/regress-diffs/constraints.diff`. **Never compare to a pre-2026-08-18 number.**
 
-**Files:** `internal/executor/expr.go` (`evalCast` reg\*[] arm, `evalExprSlot`
-`regtype[]` guard), `internal/executor/reg_array_cast_test.go` (new),
-`docs/design/0134-0005-constraints-sql-divergence.md` (§7 new, §8 next slice),
-`docs/design/README.md`, `.ralph/fix_plan.md` (new sub-item M0134-0005a),
-`.ralph/deferral_ledger.md` (2 rows).
+**Do not misread the raw diff** (§10.3): the "9 rows vs expected 5, no error" block is
+a **cascade** of `unique_tbl_i_key` never being created, NOT a data-integrity
+regression — with no constraint, those duplicates are legitimately unconstrained.
 
-**Next step:** brief **M0134-0005a** — apply a PREPARE's declared parameter types
-as a real coercion at EXECUTE time in `internal/postmaster/dispatch.go`, mirroring
-`postgres/src/backend/commands/prepare.c:EvaluateParams` (`coerce_to_target_type`);
-probe numeric/interval/date for the same mis-binding; verify with `PREPARE
-gi(regclass[]) … EXECUTE gi('{notnull_tbl1}')` → 1 row, then re-measure. After
-that: Bucket 4 (deferred UNIQUE — milestone-sized, research first). Bucket 5
-(GiST `circle_ops`) is a milestone. **Do not brief Bucket 7** (root cause unpinned).
+**Next step:** **M0134-0005c** — `ADD CONSTRAINT … UNIQUE (i) DEFERRABLE INITIALLY
+DEFERRED` fails `Key (i)=(1) is duplicated` while the preceding `SELECT *` matches PG
+byte-for-byte. **Hypothesis, UNCONFIRMED: the eager validate-then-build scan counts
+dead row versions** (the `UPDATE i=i+1` now succeeds and leaves old versions behind —
+exposed by, not caused by, 0005b). **Confirm the hypothesis with a targeted probe
+before briefing an implementer** (UPDATE a row, then ADD CONSTRAINT UNIQUE on an
+untouched column). Resume: `internal/executor/operators_ddl.go:11969` / `:12016` vs
+PG's MVCC-aware `catalog/index.c:index_build` → `IndexBuildHeapScan`. It caps the rest
+of Bucket 4. After that: research slices 3/4 (`UNIQUE ENFORCED` grammar rejection;
+`ALTER CONSTRAINT … ENFORCED` contype gate), then Bucket 3's NOT NULL inheritance
+leftover. ~20 of the 36 hunks are untouched by Bucket 4 — it is no longer the dominant
+line driver. **Bucket 5 (GiST `circle_ops`) is a real milestone; do not brief Bucket 7.**
 
-**Gates run:** `TestRegArrayCastResolvesElements` FAIL-pre (8/9) / PASS-post (9/9);
-`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS (7m49s; warm
-except cold `cmd/goopg` + `internal/initdb`); `scripts/tpch-spotcheck.sh` PASS
-(Q12=2, Q13=35 — executor change, Rule #1); `scripts/pg-regress-runner.sh
-constraints` re-measured 1411/33. No TPC-DS (cast-only, no row-shape impact).
+**Gates run:** 10-test guard 10/10 PASS (3 FAIL-pre/PASS-post via stash);
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35 — Rule #1); deferred-FK cross-tier
+PASS; pre-commit pgbench smoke PASS (12886 TPS). `make ralph-state-guard` OK after
+self-repair.
 
-**Delegation:** `tmp/ralph-handoffs/m0134-0005-s06-nnconstraint-info-zero-rows/`
-(researcher `aba408b63734bed9c`, 1 round — pinned cause A, wrongly cleared the
-PREPARE path); `tmp/ralph-handoffs/m0134-0005-s07-regclass-array-cast/`
-(implementer `a2a9a205dbc6e1cb1`, 1 round NEEDS-DECISION → coordinator accepted
-option (a); tester `ae0f7459b162fe262`, 3 gates PASS).
+**Delegation:** `tmp/ralph-handoffs/m0134-0005-b4-research/` (researcher
+`a2dc55818f96adfc3`, DONE — the report is excellent, read it before 0005c);
+`tmp/ralph-handoffs/m0134-0005-b4-s1-stmt-end-unique/` (implementer
+`a6cd58aa69aad90b7`, 1 round DONE, no deviations — note its report.md was
+coordinator-transcribed, its own write was tool-blocked); testers
+`a534047298f10d48e` (gates), `a490e2899abc78fec` (re-measure).
 
 **In-flight:** none.
