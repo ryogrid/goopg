@@ -80,6 +80,10 @@ reorder robustness; deferred, see the ledger.)
 | C16 | **ownership/ACL checks absent entirely** — `must be owner of ...` is never raised for tables/indexes/views (only `database_ddl.go` has any owner check); goopg happily executes DDL the regress script expects to be refused | RENAME family `operators_ddl.go:7729-7749` (index) + table/view RENAME paths — no ownership verification anywhere; only an owner-*stamping* helper at `operators_ddl.go:936` | `tablecmds.c:6795` `ATSimplePermissions` → `object_ownercheck` (`aclchk.c`) | correctness — **own milestone**; cheapest slice = the RENAME family only (3–4 call sites behind one shared helper) |
 | C17 | **`pg_locks` always empty** — largest single class (~180 changed lines). NOT a view-rendering or lock-machinery gap: the txn-scoped lock machinery (`context.go:1279-1298`) and the view renderer (`relation_locks.go:80-183`) are both correct. Most ALTER TABLE sub-actions simply never acquire a lock | only DROP/ATTACH/OWNER-TO call `acquireDDLLockTxn`/`acquireRelLockTxn` (`operators_ddl.go:6207,6300,7229,7293,7347,7617`); SET STATISTICS, CLUSTER ON, reloptions, SET STORAGE/DEFAULT, ADD FK, VALIDATE CONSTRAINT, CREATE TRIGGER acquire nothing | `tablecmds.c:4608` `AlterTableGetLockLevel`; `lock.c` `GetLockStatusData` | correctness — **own milestone**; first cheap sub-slice = one blanket `AccessExclusiveLock` acquire at the top of `execAlterTable` (fixes row *existence*, not the exact per-action `mode` strings) |
 | C18 | **EXPLAIN `Append` / constraint exclusion** — a *planner* gap, not C14 verbosity. Three bundled issues: no constraint exclusion at all (the Go `ConstraintExclusion` GUC is a dead stub), missing per-child `<parent>_N` alias, and Filter hoisted onto the Append instead of repeated per child | planner inheritance expansion; no `relation_excluded_by_constraints` equivalent exists | `plancat.c relation_excluded_by_constraints`; `prepunion.c expand_inherited_rtentry` | planner — **own milestone** (needs a real optimizer pass) |
+| C20 | **ATTACH PARTITION validation family mostly absent** (~15 hunks / ~120 lines) — most of the `fail_part` negative-test block silently SUCCEEDS: no column-set match, no per-column type/collation/NOT-NULL match, no constraint presence/definition match, no bound-overlap check, no typed-table/temp/inheritance-child rejection. (The cyclic-ATTACH refusal landed under C9-final S4; it is the only member of the family goopg has.) | `internal/executor/operators_ddl.go` ATTACH arm — the validation block PG runs before `StorePartitionBound` has no counterpart | `tablecmds.c` `ATExecAttachPartition` (~:19800-20360) + `MergeAttributesIntoExisting`; overlap via `partbounds.c check_new_partition_bound` | correctness — **own milestone** (a family of ~7 independent gates; cheapest first slice = the column-set/type match gate alone) |
+| C21 | **non-table `SET SCHEMA` is a silent no-op** (~10 hunks / ~90 lines, high cascade) — `ALTER {DOMAIN,TYPE,OPERATOR,OPERATOR CLASS/FAMILY,FUNCTION,CONVERSION,TEXT SEARCH *} … SET SCHEMA` parses and returns success while the object stays in its old namespace, so every later reference through the new schema (and every `DROP SCHEMA … CASCADE` expectation) diverges | no `execAlterObjectSetSchema` dispatch exists — `internal/executor` implements SET SCHEMA for tables/views only | `alter.c` `AlterObjectNamespace_oid` / `ExecAlterObjectSchemaStmt` (per-object-kind namespace move) | correctness — **own milestone**; the highest *cascade* yield of the unfiled classes |
+| C22 | **`SET LOGGED` / `SET UNLOGGED` unimplemented, and the C11a view-guard over-fires on it** — the actions are absent from `execAlterTable`'s dispatch switch, so they fall into the guard's default-refuse arm and are rejected even for plain tables (~4 hunks / ~20 lines) | `internal/executor/operators_ddl.go` `execAlterTable` dispatch + `viewAllowedAlterAction` | `tablecmds.c` `ATExecChangePersistence` (persistence rewrite + FK cross-persistence checks) | correctness — milestone-adjacent (needs a storage-fork rewrite); the *guard over-fire* half alone is not separable, since accepting the action without implementing it is worse |
+| C23 | **`ADD COLUMN … NOT NULL` on a non-empty table not refused** (~3 hunks / ~15 lines) — PG rejects when the default is not fast-default-eligible; goopg accepts | `internal/executor/operators_ddl.go` `execAlterTableAddColumn` | `tablecmds.c` `ATExecAddColumn` ("ADD COLUMN … NOT NULL is only supported on empty tables") | correctness — SLICE-sized but ~15-line yield |
 | C19 | ~~`\d+` describe drift~~ **LANDED (2026-08-18)** — see the "C19 — LANDED" section below. **The premise was inverted.** goopg *over*-produces the `Compression` column and the `Access method: heap` footer because `pg_regress` always invokes psql with `-v HIDE_TABLEAM=on -v HIDE_TOAST_COMPRESSION=on` (`pg_regress_main.c:74-79`) and goopg's own runner never passes them — a **harness** bug worth ~8 hunks suite-wide, not an engine gap. The one genuine engine bug in the class: `pg_get_indexdef` ignores its 2nd/3rd arguments and always returns the whole `CREATE INDEX` statement | harness: `scripts/pg-regress-runner.sh:214`; engine: `internal/executor/expr.go:9469-9491` (`pg_get_indexdef` arity) | `pg_regress_main.c:74-79`; psql caller `describe.c:1936-1937` (3-arg per-column form); `ruleutils.c:1270` `pg_get_indexdef_worker`, `colno`-gated branches :1417-1460 | harness + executor — **the cheapest real slice of the four** |
 
 ## Residual re-characterisation (2026-08-18) — C16–C19
@@ -1020,3 +1024,44 @@ FAIL-pre (compile error) / PASS-post.
   `:4774` (`ExplainSubPlans`).
 - `postgres/src/backend/utils/adt/arrayfuncs.c` — `array_cat`/`||`.
 - `postgres/src/backend/rewrite/rewriteHandler.c` — view DML rules.
+
+## PARKED (2026-08-18) — the residual is a flat long tail, not a slice queue
+
+Re-measured at `aa1f40ea`: **3968 lines / 111 hunks**, zero drift from the C19
+landing (`tmp/ralph-handoffs/m0134-0002-s05-residual-rank/report.md`). A
+hunk-by-hunk re-classification of ~87% of the diff by line count found **no
+bounded slice left** — every remaining bucket is either an already-filed
+milestone or a ~15-line fragment:
+
+| bucket | ~lines | verdict |
+|---|---|---|
+| C17 `pg_locks` | 180 | milestone (filed) |
+| C20 ATTACH PARTITION validation family | 120 | **milestone (new)** |
+| C21 non-table `SET SCHEMA` no-op | 90 | **milestone (new)**, highest cascade |
+| C12 message text | 90 | ~20 *unrelated* one-off wrong strings, 1-3 lines each |
+| C7(a) `CHECK ((…))` double-parens | 70 | is C11c (deparser milestone), not a slice |
+| C3/C4/C10 tails | 60 | long tails of landed milestones |
+| C13 merge NOTICEs | 40 | blocked on the C9 `InhCount` multi-parent bookkeeping |
+| C18 EXPLAIN Append | 35 | milestone (filed) |
+| C16 ownership/ACL | 30 | milestone (filed) |
+| C22 `SET LOGGED`/`UNLOGGED` | 20 | **new**, milestone-adjacent |
+| C7(b) partition-child `_0_key` naming | 15 | genuinely slice-sized, ~15-line yield |
+| C23 `ADD COLUMN NOT NULL` on non-empty | 15 | **new**, slice-sized |
+| C9 duplicate merged column in `\d` | 15 | part of the filed C9 `InhCount` milestone |
+
+Two corrections to earlier framing worth carrying forward:
+
+1. **C7(a) is not a paren-counting bug.** PG's rendering also carries explicit
+   casts the goopg builder omits (`a > 10.2::double precision`), so a shallow
+   "wrap once more" patch would trade one divergence for another. It only closes
+   with the C11c `ruleutils.c`-equivalent deparser.
+2. **C12 is not one formatter class.** The remaining message-text lines are ~20
+   independent bugs with distinct causes (parser-vs-executor message mismatches,
+   HINTs present on some `column not found` paths but not others, INSERT-arity
+   wording) — the "formatter tail" framing understated it.
+
+**Decision:** park M0134-0002 the same way M0134-0001 was parked at S22. It
+re-arms when any of C11c / C17 / C20 / C21 lands as its own milestone — each
+would take a measurable bite out of this diff, and re-measuring afterwards is
+cheap. Do not open further `alter_table` slices before then; the ~15-line
+fragments (C7(b), C23) are not worth an implementer brief on their own.
