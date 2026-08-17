@@ -86,8 +86,24 @@ func TestExplainCTESectionIndentAndOrder(t *testing.T) {
 	if idx == 0 {
 		t.Fatalf("`CTE x` cannot be the first line — it hangs off the top node")
 	}
+	// 4 raw spaces before "->": under PG's cumulative es->indent model
+	// (postgres/src/backend/commands/explain.c:1616-1635, ExplainNode),
+	// a `plan_name` label (the CTE-heading branch, step 1) is printed at
+	// the owning node's own post-processing indent and then bumped by
+	// only +1 (not +2 — the +2 for the "->  " marker itself is applied
+	// when ExplainNode is re-entered for the body). For this fixture the
+	// owning node is the query root, whose own post-processing indent is
+	// 1 unit (2 raw spaces, matching the `  CTE x` heading assertion
+	// above) — so the body's incoming indent is 2 units, and its "->  "
+	// prints at 2*2=4 raw spaces. Verified against a live PostgreSQL
+	// capture of this exact statement (`WITH x AS (...) SELECT * FROM x
+	// p JOIN x q ON p.a = q.b`, both merge- and hash-joined) and against
+	// postgres/src/test/regress/expected/rowsecurity.out:3333-3336
+	// (`CTE Scan on cte1` / `CTE cte1` / `->  Seq Scan on t1`, the same
+	// single-level-nested shape) — both give 4, not the flat model's
+	// coincidental agreement at this shallow depth.
 	if idx+1 >= len(lines) || !strings.HasPrefix(lines[idx+1], "    ->  ") {
-		t.Errorf("body must follow the heading at depth+2 with an arrow, got %q",
+		t.Errorf("body must follow the heading at the label's childIndent+1 with an arrow, got %q",
 			lines[min(idx+1, len(lines)-1)])
 	}
 }

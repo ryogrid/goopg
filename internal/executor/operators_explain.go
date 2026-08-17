@@ -408,11 +408,11 @@ func walkPlan(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts
 // the next scan-like node we render. attachedFilterNode is that same
 // wrapper's plan node, carried so the collapsed line can report the
 // wrapper's POST-qual row estimate (see below).
-func walkPlanFiltered(n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, attachedFilter optimizer.Expr, attachedFilterNode optimizer.Node, reg *subPlanReg) {
+func walkPlanFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.ExplainOptions, attachedFilter optimizer.Expr, attachedFilterNode optimizer.Node, reg *subPlanReg) {
 	// Skip Project wrappers: PG has no "Projection" plan node;
 	// the projection is part of the parent / scan's render.
 	if p, ok := n.(*optimizer.Project); ok {
-		walkPlanFiltered(p.Child, depth, rows, opts, attachedFilter, attachedFilterNode, reg)
+		walkPlanFiltered(p.Child, indent, rows, opts, attachedFilter, attachedFilterNode, reg)
 		return
 	}
 	// Skip Filter wrappers and push their predicate down to be
@@ -432,15 +432,27 @@ func walkPlanFiltered(n optimizer.Node, depth int, rows *[]Row, opts parser.Expl
 			next = attachedFilter
 			nextNode = attachedFilterNode
 		}
-		walkPlanFiltered(f.Child, depth, rows, opts, next, nextNode, reg)
+		walkPlanFiltered(f.Child, indent, rows, opts, next, nextNode, reg)
 		return
 	}
 
-	indent := strings.Repeat("  ", depth)
-	prefix := indent
-	if depth > 0 {
-		prefix = indent + "->  "
+	// PG-faithful cumulative indent (postgres/src/backend/commands/explain.c
+	// ExplainNode, ~1616-1635): `indent` here is `es->indent` as seen on
+	// entry. A node at nonzero incoming indent prints "->  " at `indent*2`
+	// raw spaces and bumps the running indent by 2 for it; every node then
+	// gets an UNCONDITIONAL +1 for its own name. `childIndent` is the
+	// resulting value — what gets handed to this node's children, its
+	// detail lines, and any InitPlan/SubPlan/CTE label hanging off it. This
+	// is NOT a flat `2*depth`: the "->  " marker lands at raw columns
+	// 0, 2, 8, 14, 20 … (deltas 2, 6, 6, 6) as nesting deepens, verified
+	// against postgres/src/test/regress/expected/aggregates.out:3158-3165.
+	prefix := ""
+	arrowIndent := indent
+	if indent != 0 {
+		prefix = strings.Repeat(" ", indent*2) + "->  "
+		arrowIndent = indent + 2
 	}
+	childIndent := arrowIndent + 1
 	label := prefix + describePlanVerbose(n, opts.Verbose, reg.names())
 	// COSTS defaults to ON in PostgreSQL (and goopg); only suppress when
 	// the user explicitly wrote COSTS OFF (Set.Costs=true and Costs=false).
@@ -481,15 +493,17 @@ func walkPlanFiltered(n optimizer.Node, depth int, rows *[]Row, opts parser.Expl
 	}
 	*rows = append(*rows, Row{NewStringDatum(label)})
 
-	// Detail indent: matches the content column of the node
-	// label plus 2 spaces, mirroring PG's `Sort Key:` / `Index
-	// Cond:` / `Filter:` indent convention.
-	detailIndent := strings.Repeat(" ", len(prefix)+2)
+	// Detail indent: the node's own post-increment `childIndent`, in raw
+	// spaces — mirrors PG's `Sort Key:` / `Index Cond:` / `Filter:` /
+	// `Output:` indent convention (explain.c's ExplainPropertyText et al.
+	// all indent at the CURRENT es->indent, same column for every property
+	// of a node).
+	detailIndent := strings.Repeat(" ", childIndent*2)
 	emitNodeDetailLines(n, detailIndent, opts.Verbose, rows, attachedFilter, reg)
 
 	if opts.Verbose {
 		if cols := schemaColumnNames(n); len(cols) > 0 {
-			outline := indent + "  Output: " + strings.Join(cols, ", ")
+			outline := detailIndent + "Output: " + strings.Join(cols, ", ")
 			*rows = append(*rows, Row{NewStringDatum(outline)})
 		}
 	}
@@ -497,8 +511,8 @@ func walkPlanFiltered(n optimizer.Node, depth int, rows *[]Row, opts parser.Expl
 	// The `CTE <name>` sections belong to the top plan node, before its
 	// InitPlans and children — upstream prints them from the top node's
 	// subplan list (M0125-0049; explain_cte.go carries the shape).
-	emitCTESections(rows, depth, reg, func(body optimizer.Node, bodyDepth int) {
-		walkPlanFiltered(body, bodyDepth, rows, opts, nil, nil, reg)
+	emitCTESections(rows, indent, childIndent, reg, func(body optimizer.Node, bodyIndent int) {
+		walkPlanFiltered(body, bodyIndent, rows, opts, nil, nil, reg)
 	})
 
 	// Sublinks referenced by this node's detail lines print their
@@ -509,13 +523,13 @@ func walkPlanFiltered(n optimizer.Node, depth int, rows *[]Row, opts parser.Expl
 	// the relation the sublink itself scans.
 	prevAncestor := reg.ancestor
 	reg.ancestor = n
-	emitSubPlanSubtrees(rows, detailIndent, opts, reg, nil, func(sub optimizer.Node, subDepth int) {
-		walkPlanFiltered(sub, subDepth, rows, opts, nil, nil, reg)
+	emitSubPlanSubtrees(rows, detailIndent, opts, reg, nil, func(sub optimizer.Node, subIndent int) {
+		walkPlanFiltered(sub, subIndent, rows, opts, nil, nil, reg)
 	})
 	reg.ancestor = prevAncestor
 
 	for _, c := range renderChildren(n, reg.cte) {
-		walkPlanFiltered(c, depth+1, rows, opts, nil, nil, reg)
+		walkPlanFiltered(c, childIndent, rows, opts, nil, nil, reg)
 	}
 }
 
@@ -525,7 +539,7 @@ func walkPlanFiltered(n optimizer.Node, depth int, rows *[]Row, opts parser.Expl
 //	SubPlan N
 //	  ->  <inner plan tree>
 //
-// render walks one sublink's inner plan at the given depth. The
+// render walks one sublink's inner plan at the given indent. The
 // queue is drained in a loop because a sublink's own plan can
 // reference further sublinks, which assign higher numbers as they
 // are rendered (matching upstream's nested-SubPlan output).
@@ -560,15 +574,18 @@ func emitSubPlanSubtrees(rows *[]Row, detailIndent string, opts parser.ExplainOp
 				// keeps the walk to the tree planChildren exposes —
 				// sublink plans hang off expressions, not off it.
 				reg.names().collect(sp.plan)
-				// Indent the sublink's plan one "->" level under the
-				// `SubPlan N` line, matching upstream's shape. A node
-				// rendered at depth d starts its "->" at 2*d columns,
-				// so the depth that lands on detailIndent+2 is
-				// (len(detailIndent)+2)/2. Deriving it from the indent
-				// rather than from depth keeps the root node right:
-				// depth 0 has no "->  " prefix, so its detailIndent is
-				// 4 columns narrower than every deeper node's.
-				render(sp.plan, (len(detailIndent)+2)/2)
+				// The `SubPlan N` / `InitPlan N` label was printed at
+				// this owner's own childIndent (detailIndent = that
+				// value in raw spaces), matching upstream's plan_name
+				// branch printing at the CURRENT es->indent. Upstream
+				// then does an UNCONDITIONAL `es->indent++` (only +1,
+				// not +2 — the body's own "->  " arrow is what adds the
+				// +2, once ExplainNode is entered for it) before
+				// rendering the body, so the body's incoming indent is
+				// childIndent+1 = len(detailIndent)/2 + 1. Verified
+				// against postgres/src/test/regress/expected/
+				// subselect.out:380-391 (nested SubPlan/InitPlan).
+				render(sp.plan, len(detailIndent)/2+1)
 			}
 		}
 	}
@@ -1313,9 +1330,9 @@ func walkPlanAnalyze(b *strings.Builder, n optimizer.Node, depth int, rows *[]Ro
 	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, memoStats, hashStats, nil, 0, &subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n)})
 }
 
-func walkPlanAnalyzeFiltered(n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, attachedFilter optimizer.Expr, filterRowsRemoved int64, reg *subPlanReg) {
+func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, attachedFilter optimizer.Expr, filterRowsRemoved int64, reg *subPlanReg) {
 	if p, ok := n.(*optimizer.Project); ok {
-		walkPlanAnalyzeFiltered(p.Child, depth, rows, opts, stats, spStats, memoStats, hashStats, attachedFilter, filterRowsRemoved, reg)
+		walkPlanAnalyzeFiltered(p.Child, indent, rows, opts, stats, spStats, memoStats, hashStats, attachedFilter, filterRowsRemoved, reg)
 		return
 	}
 	if f, ok := n.(*optimizer.Filter); ok {
@@ -1332,15 +1349,21 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, depth int, rows *[]Row, opts pars
 		if fs, ok := stats[f]; ok && fs != nil {
 			fr += fs.filterRejected
 		}
-		walkPlanAnalyzeFiltered(f.Child, depth, rows, opts, stats, spStats, memoStats, hashStats, next, fr, reg)
+		walkPlanAnalyzeFiltered(f.Child, indent, rows, opts, stats, spStats, memoStats, hashStats, next, fr, reg)
 		return
 	}
 
-	indent := strings.Repeat("  ", depth)
-	prefix := indent
-	if depth > 0 {
-		prefix = indent + "->  "
+	// PG-faithful cumulative indent — see walkPlanFiltered's twin comment
+	// (postgres/src/backend/commands/explain.c:1616-1635, ExplainNode) for
+	// the derivation. Both walkers must agree: a test pinning one proves
+	// nothing about the other.
+	prefix := ""
+	arrowIndent := indent
+	if indent != 0 {
+		prefix = strings.Repeat(" ", indent*2) + "->  "
+		arrowIndent = indent + 2
 	}
+	childIndent := arrowIndent + 1
 	label := prefix + describePlanVerbose(n, opts.Verbose, reg.names())
 	showCostsA := !opts.Set.Costs || opts.Costs
 	if showCostsA {
@@ -1361,7 +1384,7 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, depth int, rows *[]Row, opts pars
 	}
 	*rows = append(*rows, Row{NewStringDatum(label)})
 
-	detailIndent := strings.Repeat(" ", len(prefix)+2)
+	detailIndent := strings.Repeat(" ", childIndent*2)
 	emitNodeDetailLines(n, detailIndent, opts.Verbose, rows, attachedFilter, reg)
 
 	// IndexOnlyScan emits a "Heap Fetches: N" detail line under ANALYZE,
@@ -1453,7 +1476,7 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, depth int, rows *[]Row, opts pars
 
 	if opts.Verbose {
 		if cols := schemaColumnNames(n); len(cols) > 0 {
-			outline := indent + "  Output: " + strings.Join(cols, ", ")
+			outline := detailIndent + "Output: " + strings.Join(cols, ", ")
 			*rows = append(*rows, Row{NewStringDatum(outline)})
 		}
 	}
@@ -1461,21 +1484,21 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, depth int, rows *[]Row, opts pars
 	// The CTE sections print with their instrumentation intact: every
 	// reference shares one body Node, so the section IS the subtree that
 	// ran (the later references replay from ctx.CTERowCache). M0125-0049.
-	emitCTESections(rows, depth, reg, func(body optimizer.Node, bodyDepth int) {
-		walkPlanAnalyzeFiltered(body, bodyDepth, rows, opts, stats, spStats, memoStats, hashStats, nil, 0, reg)
+	emitCTESections(rows, indent, childIndent, reg, func(body optimizer.Node, bodyIndent int) {
+		walkPlanAnalyzeFiltered(body, bodyIndent, rows, opts, stats, spStats, memoStats, hashStats, nil, 0, reg)
 	})
 
 	// Sublink subtrees keep their instrumentation: stats is passed
 	// through so inner nodes still report actual rows / loops.
 	prevAncestor := reg.ancestor
 	reg.ancestor = n
-	emitSubPlanSubtrees(rows, detailIndent, opts, reg, spStats, func(sub optimizer.Node, subDepth int) {
-		walkPlanAnalyzeFiltered(sub, subDepth, rows, opts, stats, spStats, memoStats, hashStats, nil, 0, reg)
+	emitSubPlanSubtrees(rows, detailIndent, opts, reg, spStats, func(sub optimizer.Node, subIndent int) {
+		walkPlanAnalyzeFiltered(sub, subIndent, rows, opts, stats, spStats, memoStats, hashStats, nil, 0, reg)
 	})
 	reg.ancestor = prevAncestor
 
 	for _, c := range renderChildren(n, reg.cte) {
-		walkPlanAnalyzeFiltered(c, depth+1, rows, opts, stats, spStats, memoStats, hashStats, nil, 0, reg)
+		walkPlanAnalyzeFiltered(c, childIndent, rows, opts, stats, spStats, memoStats, hashStats, nil, 0, reg)
 	}
 }
 

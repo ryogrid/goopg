@@ -1080,6 +1080,78 @@ There is no `internal/planner` package — all three files live in
 **`internal/optimizer/`**. The symbols named are correct; only the directory is
 wrong.
 
+## S11 — landed 2026-08-17 (PG-faithful cumulative EXPLAIN indentation)
+
+Status: `accepted`. Closes the item this doc has carried since Slice 2b as the
+"`QUERY PLAN` underline-width cosmetic gap (`agg_sort_order`, and every plan)".
+
+**That characterisation was wrong, and the correction is the finding.** The
+underline was only the visible symptom; the underlying defect was a *plan-text*
+divergence that the regress harness was structurally blind to.
+
+- **goopg (before):** `walkPlanFiltered` (`internal/executor/operators_explain.go`)
+  and its ANALYZE twin `walkPlanAnalyzeFiltered` computed the prefix as
+  `strings.Repeat("  ", depth)` — a pure function of tree depth.
+- **PG (`postgres/src/backend/commands/explain.c:1616-1635`, `ExplainNode`):** a
+  *stateful, cumulative* `es->indent`, emitted as `es->indent * 2` spaces by
+  `ExplainIndentText`. Per node, in TEXT format: (1) if a `plan_name` label is
+  present, indent-text, print the label, `es->indent++`; (2) if `es->indent != 0`,
+  indent-text, print `"->  "`, `es->indent += 2`; (3) print the node name, then
+  **unconditionally** `es->indent++`.
+- **Net:** the `->` marker sits at raw columns 0, 2, 8, 14, 20 … (deltas 2, 6, 6),
+  not goopg's 0, 2, 4, 6. The two models **coincide at depth 0 and depth 1**,
+  which is exactly why the whole S8 Slice-1/2a/2b line (2-level
+  `GroupAggregate → Sort → SeqScan` shapes) rendered byte-identical and the bug
+  stayed invisible through five landed slices.
+
+**Why the diff hid it.** `scripts/pg-regress-runner.sh`'s `normalise_output()`
+collapses any run of 2+ *spaces* to exactly 2, so both sides' content lines
+flatten to the same indentation regardless of true depth. The `-----` underline
+is dashes, not spaces, so it survives — and real `psql` computes it from the RAW
+widest cell (`postgres/src/fe_utils/print.c`, `print_aligned_text`). The dash
+count was therefore the *only* channel through which a content-level divergence
+could reach the diff. Filed as a ledger row: the regress gate cannot see
+whitespace-layout divergence at all.
+
+**Implementation.** Both walkers take an explicit `indent` unit counter threaded
+as `es->indent` is (raw spaces = `indent*2`), with PG's save/restore discipline
+across recursion — *not* a formula derived from `depth`, which breaks the moment
+a `plan_name` label appears. Converted call sites (exhaustive): both wrapper-skip
+recursions (Project/Filter, indent passed through unchanged), the CTE-section
+callback, the SubPlan-subtree callback, and the single normal-children loop per
+walker (which covers Append/MergeAppend/Hash/join children).
+
+**Two corrections found while implementing:**
+
+1. **The CTE/InitPlan `plan_name` branch bumps indent by only +1, not +3.** The
+   body's own `"->  "` supplies its own +2. Verified against live PG output for
+   `WITH x AS (…) SELECT … JOIN`, and cross-checked against
+   `postgres/src/test/regress/expected/rowsecurity.out:3333-3336` and
+   `subselect.out:1350-1373`: the CTE body's `->` sits at **4** raw spaces.
+   `explain_cte_test.go`'s existing assertion was therefore already correct and
+   was kept (only its comment updated to cite `ExplainNode`). A brief that
+   predicted 8 was wrong; the oracle capture overruled it.
+2. **The VERBOSE `Output:` line carried a second, independent indent bug** — it
+   used an ad-hoc `indent + "  "` formula and was wrong at every depth ≥ 1
+   regardless of this defect. It now uses `detailIndent` like every other detail
+   line.
+
+**Measurement (`scripts/pg-regress-runner.sh aggregates`):** diff lines
+**1296 → 1096**, hunks **44 → 30**, dash-only hunks **14 → 0** (eliminated, with
+no new dash-only hunks appearing elsewhere). The 30 remaining hunks are
+orthogonal — parallel-query plan shapes (`Gather` / `Parallel Seq Scan` /
+`Finalize` / `Partial Aggregate`), i.e. S10.
+
+**Guards:** `TestExplainIndentDeepNesting`, `TestExplainAnalyzeIndentDeepNesting`
+(the twin — the flat model was present in both walkers and a test on one proves
+nothing about the other) and `TestExplainIndentInitPlanBranch` (the `plan_name`
+branch, the case a depth-formula gets wrong), all in
+`internal/executor/explain_indent_test.go`, with expectations taken from
+verbatim PG 18.3 captures rather than transcribed.
+
+**Cross-case leverage:** this is an emitter fix, so every M0134 case that emits
+a nested `EXPLAIN` inherits it — `explain.sql` (M0134-0017) most directly.
+
 ## Cross-case relevance
 
 Every M0134 regress case whose `.sql` emits `EXPLAIN` inherits the formatter
