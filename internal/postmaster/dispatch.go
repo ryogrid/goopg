@@ -1076,6 +1076,40 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 			}
 			return err
 		}
+		// End-of-statement drain for DEFERRABLE (but not currently deferred-to-
+		// COMMIT) UNIQUE/PK checks queued during the statement that just
+		// succeeded — PostgreSQL fires every constraint trigger whose deferred
+		// flag is not set at the end of its own SQL statement, regardless of
+		// whether the statement runs in autocommit or inside an explicit
+		// transaction block (postgres/src/backend/catalog/index.c:2080-2082,
+		// indimmediate=false for any DEFERRABLE index; trigger.c's
+		// end-of-command AfterTriggerFireDeferred firing). A violation here
+		// rolls the (auto-begun or explicit) transaction back with 23505, the
+		// same shape the immediate synchronous check raises. No-op when
+		// nothing was queued. b4-s1-stmt-end-unique.
+		if bs, ok := ectx.Session.(*executor.BasicSession); ok {
+			if drainErr := executor.RunStmtEndDeferredUniqueChecks(ectx, bs); drainErr != nil {
+				if !autoCommit && connTx != nil && connTx.InExplicit() {
+					connTx.Fail()
+					connTx.ReleasePinnedSnapshotOnFail(ectx.TxnMgr)
+				} else {
+					_ = ectx.TxnMgr.Rollback(tx)
+				}
+				code := errcodes.UniqueViolation
+				var fields []libpq.ErrorField
+				msg := drainErr.Error()
+				if ee, eok := drainErr.(*executor.ExecError); eok {
+					if ee.Code != "" {
+						code = errcodes.Code(ee.Code)
+					}
+					msg = ee.Message
+					if ee.Detail != "" {
+						fields = append(fields, libpq.ErrorField{Code: libpq.FieldDetail, Value: ee.Detail})
+					}
+				}
+				return s.writeQueryError(w, code, msg, fields...)
+			}
+		}
 		// An explicit transaction block (BEGIN/START TRANSACTION … COMMIT/ROLLBACK)
 		// ended mid-batch. The message-level transaction `tx` was finalized by the
 		// verb (committed or rolled back) and is now dead, and *autoCommitPtr was

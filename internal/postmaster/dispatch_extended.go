@@ -482,6 +482,30 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 	if err := op.Close(); err != nil {
 		return nil, newExtendedQueryError(err)
 	}
+	// End-of-statement drain for DEFERRABLE (but not currently deferred-to-
+	// COMMIT) UNIQUE/PK checks queued by this Execute, mirroring the
+	// simple-query dispatcher's identical hook (dispatch.go). Extended Execute
+	// is one statement regardless of whether it owns its transaction or joins
+	// an explicit block, so this must run for BOTH cases — PG's constraint
+	// trigger queue fires at end of the SQL statement, not end of transaction.
+	// A violation here surfaces as this Execute's own error; ownTx leaves
+	// commit=false so the deferred rollback above fires, and an in-block
+	// violation is reported to the caller, which marks the block failed
+	// exactly like any other in-block statement error (handleExecuteFrame →
+	// failExplicitBlock). b4-s1-stmt-end-unique.
+	if bs, ok := ectx.Session.(*executor.BasicSession); ok {
+		if drainErr := executor.RunStmtEndDeferredUniqueChecks(ectx, bs); drainErr != nil {
+			qerr := &extendedQueryError{Code: errcodes.UniqueViolation, Message: drainErr.Error()}
+			if ee, eok := drainErr.(*executor.ExecError); eok {
+				if ee.Code != "" {
+					qerr.Code = errcodes.Code(ee.Code)
+				}
+				qerr.Message = ee.Message
+				qerr.Detail = ee.Detail
+			}
+			return nil, qerr
+		}
+	}
 	// M0132-S3: only an Execute that began its own transaction commits one.
 	// In a block the work stays uncommitted until the client's COMMIT, and the
 	// transaction-scoped advisory locks stay held for the block.

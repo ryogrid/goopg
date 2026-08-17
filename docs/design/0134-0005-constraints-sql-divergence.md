@@ -1,11 +1,13 @@
-# M0134-0005 — `constraints.sql` divergence map + Buckets 1-3, 6, and the PREPARE/EXECUTE parameter path
+# M0134-0005 — `constraints.sql` divergence map + Buckets 1-4, 6, and the PREPARE/EXECUTE parameter path
 
 Status: accepted — Buckets 1, 2, 3 and 6 LANDED 2026-08-18, plus BOTH halves of the
 `get_nnconstraint_info` masking bug: the `reg*[]` cast (§7) and the declared-
-parameter-type coercion at `EXECUTE` (§8); the case stays open (`[ ]`).
+parameter-type coercion at `EXECUTE` (§8), and Bucket 4's core fix (§10); the case
+stays open (`[ ]`).
 Running measurement: 1496 (baseline) → 1515 (B1, unmasking) → 1465 (B2) → 1431 (B3,
 unmasking) → 1411 (B6, bucket interference) → 1411 (§7, stacked root cause) →
-**1376** (§8, the stack's upper half); hunks 30 → 30 → 31 → 33 → 33 → 33 → **34**.
+1376 (§8, the stack's upper half) → **1299** (§10, Bucket 4 statement-end tier);
+hunks 30 → 30 → 31 → 33 → 33 → 33 → 34 → **36**.
 
 ## 1. Baseline (re-measured 2026-08-18)
 
@@ -38,7 +40,7 @@ cannot be judged until an earlier bucket is fixed.
 | **1** | **PREPARE parameter-type validator rejects `regclass[]`** — and any array or typmod spelling, and whole built-in families | 13 hunks / ~120 lines | `internal/postmaster/dispatch.go:2038` `isValidSQLTypeName` | `gram.y` `PreparableStmt` takes `Typename` (carries `arrayBounds` + `typmods`); resolution is `parse_type.c:typenameType`, a real `pg_type` lookup | **LANDED** — see §3 |
 | **2** | **`NOT ENFORCED` CHECK constraints are still enforced on INSERT** | ~4 hunks / 50 lines | `internal/executor/operators_fk.go:1664` `checkConstraints` loops `tbl.CheckConstraints` unconditionally, never consulting `tbl.NamedChecks[i].NotEnforced` | `execMain.c:ExecRelCheck` lines 1813-1815 — `/* Skip not enforced constraint */ if (!check[i].ccenforced) continue;` | **LANDED** — see §4 |
 | **3** | **`DROP CONSTRAINT` / `RENAME CONSTRAINT` cannot find a NOT NULL constraint by name** — LANDED 2026-08-18, see §5 | ~6 hunks | `internal/executor/operators_ddl.go:10719` `execAlterTableDropConstraint` checks NamedChecks/FK/UNIQUE/EXCLUDE/PK but never `tbl.NotNullConstraints`; the RENAME sibling is **assumed by pattern, not read** | `tablecmds.c:dropconstraint_internal` handles `CONSTR_NOTNULL` alongside the other contypes | independent, bounded ⇒ good next slice; **verify the RENAME sibling before briefing** — verified 2026-08-18: the sibling DID share the omission. **LANDED**, §5 |
-| 4 | statement-level / deferred UNIQUE checking during self-referencing UPDATE (`UPDATE unique_tbl SET i=i+1`, ring rotations, `SET CONSTRAINTS … DEFERRED` re-check timing) | ~6-8 hunks, the largest line driver (~340 lines) | not one function: goopg maintains unique indexes row-by-row inside UPDATE | PG defers same-statement duplicate detection so a row-permutation UPDATE succeeds despite colliding intermediate states (`ExecInsertIndexTuples` + the deferred-trigger queue) | **MILESTONE**, not a slice — real constraint-timing/MVCC work |
+| **4** | statement-level / deferred UNIQUE checking during self-referencing UPDATE (`UPDATE unique_tbl SET i=i+1`, ring rotations, `SET CONSTRAINTS … DEFERRED` re-check timing) | ~6-8 hunks, was believed the largest line driver (~340 lines) | ~~not one function: goopg maintains unique indexes row-by-row inside UPDATE~~ — **wrong**: the DML sites already fan into one shared queue pair; the gap was a missing tier in `uniqueCheckDeferred` (`internal/executor/deferred_unique.go:45-53`) | `catalog/index.c:2080-2082` (`indimmediate=false` for ANY deferrable index) + `execIndexing.c:ExecInsertIndexTuples` `UNIQUE_CHECK_PARTIAL` + `unique_key_recheck` on the after-trigger queue | **LANDED** — see §10. **This row's "MILESTONE, real constraint-timing/MVCC work" sizing was REFUTED by research**: the milestone-sized machinery already existed (M0119-0004), and the fix was one slice. Sizing a bucket from the *symptom* rather than from the existing code is the error to avoid repeating. |
 | 5 | `EXCLUDE USING gist` on `circle` → "data type circle has no default operator class", cascading to 10× "relation circles does not exist" | ~11 hunks | opclass registry has no circle/gist default opclass | PG ships `circle_ops` for GiST | **MILESTONE** (GiST opclass coverage) |
 | 6 | `ALTER TABLE … ALTER CONSTRAINT <name> NOT VALID / INHERIT / NO INHERIT` unparsed (syntax error) | ~3 hunks | parser: no production for the standalone `ALTER CONSTRAINT` trailers (near `internal/parser/ddl.go:2863` `parseFKConstraintAttrs`) | `tablecmds.c:ATExecAlterConstrEnforceability` and the NO INHERIT toggle | parser gap is a small slice; the *semantics* of toggling inheritance on an existing not-null constraint is separate and larger |
 | 7 | misc, **root cause not pinned** — `DEFAULT 123.456` on float8 truncated to `123` when the column is omitted from the INSERT; DEFAULT parsed as `a_expr` where PG uses `b_expr` (accepts `1 IN (1,2)`); a `currval()`-based default evaluating out of order relative to the `nextval()` default in the same row-fill | 2-3 hunks each, drives ~250 lines of INSERT_TBL | the missing-column *catalog-default fill* path — **distinct from** `rewriteInsertDefaultMarkers`/`defaultMarkerReplacement` (`internal/optimizer/planner.go:9860`), which only handles the explicit `DEFAULT` keyword | — | **do not brief from this row** without another researcher pass to pin the fill path |
@@ -393,3 +395,113 @@ decomposition, not a direct brief.
 After those: Bucket 3's leftover NOT NULL inheritance-propagation gap. Bucket 5
 (GiST `circle_ops`) is a milestone. **Bucket 7 still has no pinned root cause — do
 not brief from it.**
+
+## 10. Bucket 4 — the missing statement-end tier (core fix LANDED 2026-08-18)
+
+### 10.1 Bucket 4 was mis-sized as a milestone; it was one slice
+
+The §2 Bucket 4 row called this "real constraint-timing/MVCC work" and a
+milestone. The research pass (`tmp/ralph-handoffs/m0134-0005-b4-research/`)
+**refuted that**: the milestone-sized machinery already existed. M0119-0004 landed
+`internal/executor/deferred_unique.go` — a working deferred-to-COMMIT queue with a
+drain at commit, a `SET CONSTRAINTS` resolver, and an NND sibling — *before* M0134-0005
+started. Nothing new had to be built.
+
+**goopg had two tiers where PG has three.**
+
+| constraint state | per-row behavior | drain point |
+|---|---|---|
+| NOT deferrable | synchronous check | — (unchanged) |
+| `DEFERRABLE` (INITIALLY IMMEDIATE, or `SET CONSTRAINTS … IMMEDIATE`) | **queue, never block** | **end of statement** ← was MISSING |
+| deferred to COMMIT (`INITIALLY DEFERRED` / `SET CONSTRAINTS … DEFERRED`) | queue, never block | COMMIT (already worked) |
+
+PG applies the middle tier to **every** deferrable index unconditionally:
+`postgres/src/backend/catalog/index.c:2080-2082` sets `pg_index.indimmediate = false`
+whenever `deferrable`, *independent of the INITIALLY mode*; only the recheck **timing**
+differs. The per-row insert then takes `UNIQUE_CHECK_PARTIAL` in
+`execIndexing.c:ExecInsertIndexTuples`, which never errors and instead flags a recheck
+that the after-trigger queue fires (`unique_key_recheck`).
+
+goopg's `uniqueCheckDeferred` collapsed the two deferrable tiers into one boolean
+gated on "deferred to commit" **and** on `InExplicitTransaction()`. So plain
+`DEFERRABLE` still blocked synchronously on the first transient duplicate — the
+canonical `UPDATE unique_tbl SET i = i + 1;` failed even inside an explicit `BEGIN`.
+
+### 10.2 What landed
+
+- `internal/executor/deferred_unique.go` — `uniqueCheckDeferred` now answers only
+  "needs a partial (queue, never block) check?" = `idx != nil && idx.Deferrable`; the
+  `InExplicitTransaction()` gate is **removed** (PG does not have it). The old resolver
+  body moved to a new companion `uniqueCheckDeferToCommit`, so the two questions no
+  longer share one predicate. `queueDeferredUniqueCheck` **and** its NND twin
+  `queueDeferredNNDUniqueCheck` (Rule #2) stamp a `DeferToCommit` tier tag at enqueue
+  time. New `RunStmtEndDeferredUniqueChecks` mirrors `RunDeferredUniqueChecks`, draining
+  only the `DeferToCommit == false` subset.
+- `internal/executor/session.go` — `DeferredUniqueCheck.DeferToCommit`; new
+  `TakeDeferredUniqueChecksStmtEnd()`. `constraintDeferredByName` and the
+  `FKConstraintDeferred`/`UniqueConstraintDeferred`/`ExclusionConstraintDeferred`
+  delegates are **unchanged** — deliberately, so the FK tier keeps its semantics. The
+  COMMIT-path `TakeDeferredUniqueChecks()` still takes everything, as a safety net.
+- `internal/postmaster/dispatch.go` — statement-end drain in the simple-query loop.
+- `internal/postmaster/dispatch_extended.go` — **the Rule #2 twin, and it was NOT
+  symmetric.** The extended-protocol out-of-block `Execute` path commits via
+  `ectx.CommitTransaction` (`internal/executor/context.go:1030`), a bare
+  `TxnMgr.Commit` that runs **no** deferred-check drain at all; only the simple-query
+  `TxCommit` verb and `transactionOp.execCommit` do. The drain was added there
+  explicitly rather than assumed covered.
+- `internal/testport/deferred_unique_stmt_end_e2e_test.go` — 5 tests; the 3 new
+  behavioral ones are FAIL-pre (`23505` on `unique_tbl_i_key`) / PASS-post.
+
+The DML call sites needed **zero** changes: `checkUniqueIndexesForInsert` /
+`checkUniqueIndexesForUpdate` already fan into the shared queue pair.
+
+### 10.3 Measured payoff, and the honest reading of it
+
+1376 → **1299** lines (−77); hunks 34 → **36** (+2). Hunk count rose because
+unmasking splits context runs — the same shape Bucket 1 produced. **Do not compare to
+any pre-2026-08-18 number** (pre-C19 harness).
+
+Two results that look alarming in the raw diff and are **not** what they appear:
+
+- *"4 duplicate rows persist, no error"* at the `INSERT (3,'Three')` block (9 rows vs
+  expected 5) is a **cascade of `unique_tbl_i_key` never being created**, not a
+  data-integrity regression. With no constraint in place, those duplicates are
+  legitimately unconstrained. Same for the downstream `ALTER CONSTRAINT … ENFORCED`
+  hunks now reading `constraint … does not exist`.
+- The `ADD CONSTRAINT … UNIQUE (i) DEFERRABLE INITIALLY DEFERRED` failure **changed
+  shape**, from `Key (i)=(3) is duplicated` to `Key (i)=(1) is duplicated`, while the
+  immediately preceding `SELECT * FROM unique_tbl` matches PG byte-for-byte. §7's
+  prediction that this statement would need no code change once the enqueue gate was
+  fixed is therefore **refuted**.
+
+### 10.4 The newly EXPOSED defect — index build appears to scan non-live tuples
+
+**Hypothesis (not yet confirmed — this is the next slice's job, do not treat as
+established):** the index-build uniqueness scan counts dead row versions. Before this
+slice, `UPDATE unique_tbl SET i = i + 1` *failed*, so the table carried no dead
+versions at that point in the file; now it succeeds and leaves the old versions
+behind, and the build scan sees both. That would explain a duplicate `i=1` that no
+MVCC-correct `SELECT` can see.
+
+This defect is **exposed by, not caused by,** the statement-end tier — but it is now
+the cap on the rest of Bucket 4, exactly as `unique_tbl_i_key`'s absence was before.
+Resume point: the eager validate-then-build scan at
+`internal/executor/operators_ddl.go:11969` / `:12016`; check whether it filters by
+tuple liveness (PG's equivalent build scan is MVCC-aware —
+`postgres/src/backend/catalog/index.c:index_build` → `IndexBuildHeapScan`'s
+`HeapTupleSatisfiesVacuum`/snapshot handling). Ledgered.
+
+### 10.5 Remaining Bucket 4 work, re-scoped
+
+- **Next slice:** the §10.4 index-build liveness defect. It caps everything else here.
+- Partitioned `parted_uniq_tbl` still diverges two ways, both independent of timing:
+  goopg materializes **1** `pg_constraint` row where PG has **3** (no per-partition
+  unique-constraint catalog rows), and the deferred-violation case enforces correctly
+  but emits the ERROR/`COMMIT` echo in the opposite order. Ledgered separately.
+- Research slices 3 and 4 (the `UNIQUE ENFORCED` / `NOT ENFORCED` grammar rejection,
+  and the `ALTER CONSTRAINT … ENFORCED` contype gate) remain valid small independent
+  slices; slice 4 stays blocked on §10.4 for end-to-end testability.
+- Per the tester's classification, **~20 of the 36 remaining hunks are untouched by
+  Bucket 4 at all** — CHECK-constraint inheritance naming, COPY FROM not rejecting bad
+  rows, the GiST `circle` block (Bucket 5), and the NOT NULL inheritance block
+  (Bucket 3's leftover). Bucket 4 is no longer this file's dominant line driver.

@@ -34,17 +34,37 @@ import (
 // row is already present in the index, so a violation is "two or more live
 // visible tuples share this key", not "any other live tuple shares this key".
 
-// uniqueCheckDeferred reports whether the uniqueness enforcement for idx should
-// be queued to COMMIT instead of raised now. It honours both the constraint's
-// declared DEFERRABLE INITIALLY {DEFERRED|IMMEDIATE} mode and any in-effect
-// SET CONSTRAINTS override on the session. Only a DEFERRABLE constraint inside
-// an explicit transaction can ever be deferred, so with no SET CONSTRAINTS in
-// effect this is exactly `idx.Deferrable && idx.InitiallyDeferred &&
-// InExplicitTransaction()` — every plain (NOT DEFERRABLE) unique index keeps
-// its immediate check. Mirrors fkCheckDeferred. 0119-0004.
+// uniqueCheckDeferred reports whether the uniqueness enforcement for idx
+// should be QUEUED instead of raised synchronously now. This is the "needs a
+// partial check" predicate, not "deferred to COMMIT": PostgreSQL sets
+// pg_index.indimmediate = false for ANY DEFERRABLE unique/PK index regardless
+// of its INITIALLY mode (postgres/src/backend/catalog/index.c:2080-2082), so
+// every DEFERRABLE index always uses UNIQUE_CHECK_PARTIAL at insert time and
+// NEVER blocks per-row — the only thing INITIALLY {DEFERRED|IMMEDIATE} (and
+// any in-effect SET CONSTRAINTS override) selects is *when* the queued
+// candidate is rechecked: end-of-statement (the common case) vs COMMIT. See
+// uniqueCheckDeferToCommit for that companion decision, consulted only once a
+// check is already known to be queued (Bucket 4 slice 1: b4-s1-stmt-end-unique).
+// A plain (NOT DEFERRABLE) unique index keeps its immediate synchronous check.
+// Mirrors fkCheckDeferred in spirit but NOT in the InExplicitTransaction gate
+// — that gate stays on fkCheckDeferred (FK checks have no PARTIAL tier) but is
+// deliberately dropped here.
 func uniqueCheckDeferred(ctx *Context, idx *catalog.Index) bool {
-	if idx == nil || !idx.Deferrable || ctx.Session == nil || !ctx.Session.InExplicitTransaction() {
-		return false
+	return idx != nil && idx.Deferrable
+}
+
+// uniqueCheckDeferToCommit reports whether a queued deferrable-unique check
+// should be rechecked at COMMIT (true) rather than at the end of the current
+// statement (false). Callers must have already established idx.Deferrable via
+// uniqueCheckDeferred. Honours the constraint's declared INITIALLY
+// {DEFERRED|IMMEDIATE} default and any in-effect SET CONSTRAINTS override on
+// the session, exactly like the pre-existing UniqueConstraintDeferred
+// resolver — this is that SAME resolver, just consulted independently of
+// InExplicitTransaction() (an autocommit statement has no override in effect,
+// so it correctly falls through to idx.InitiallyDeferred). b4-s1-stmt-end-unique.
+func uniqueCheckDeferToCommit(ctx *Context, idx *catalog.Index) bool {
+	if ctx.Session == nil {
+		return idx.InitiallyDeferred
 	}
 	if sess, ok := ctx.Session.(*BasicSession); ok {
 		return sess.UniqueConstraintDeferred(idx.Name, idx.InitiallyDeferred)
@@ -64,10 +84,11 @@ func queueDeferredUniqueCheck(ctx *Context, tbl *catalog.Table, idx *catalog.Ind
 		return
 	}
 	sess.AddDeferredUniqueCheck(DeferredUniqueCheck{
-		TableName: tbl.Name,
-		IndexName: idx.Name,
-		Key:       append([]byte(nil), key...),
-		Detail:    buildUniqueConstraintDetail(idx, cols, row),
+		TableName:     tbl.Name,
+		IndexName:     idx.Name,
+		Key:           append([]byte(nil), key...),
+		Detail:        buildUniqueConstraintDetail(idx, cols, row),
+		DeferToCommit: uniqueCheckDeferToCommit(ctx, idx),
 	})
 }
 
@@ -103,10 +124,11 @@ func queueDeferredNNDUniqueCheck(ctx *Context, tbl *catalog.Table, idx *catalog.
 		})
 	}
 	sess.AddDeferredUniqueCheck(DeferredUniqueCheck{
-		TableName:  tbl.Name,
-		IndexName:  idx.Name,
-		NNDKeyCols: nnd,
-		Detail:     nndDetail(idx, cols, row),
+		TableName:     tbl.Name,
+		IndexName:     idx.Name,
+		NNDKeyCols:    nnd,
+		Detail:        nndDetail(idx, cols, row),
+		DeferToCommit: uniqueCheckDeferToCommit(ctx, idx),
 	})
 }
 
@@ -121,6 +143,30 @@ func RunDeferredUniqueChecks(ctx *Context, sess *BasicSession) error {
 		return nil
 	}
 	checks := sess.TakeDeferredUniqueChecks()
+	if len(checks) == 0 {
+		return nil
+	}
+	return runAllDeferredUniqueChecks(ctx, checks)
+}
+
+// RunStmtEndDeferredUniqueChecks re-verifies every queued UNIQUE/PK check that
+// is NOT currently deferred to COMMIT (i.e. every DEFERRABLE-but-not-deferred
+// candidate queued by uniqueCheckDeferred during the statement that just
+// finished) and clears just that subset — the COMMIT-tier subset stays queued
+// for RunDeferredUniqueChecks. This is the "end of statement" firing PostgreSQL
+// gives every constraint trigger whose deferred flag is not currently set
+// (postgres/src/backend/commands/trigger.c, AfterTriggerFireDeferred at
+// end-of-command). Called once per top-level statement from both the
+// simple-query dispatcher and the extended-protocol Execute path — regardless
+// of whether the statement is inside an explicit transaction block or
+// autocommit, matching PG's per-statement (not per-transaction) firing
+// granularity. A violation raises the same 23505 shape as the immediate path.
+// No-op when nothing is queued for this tier. b4-s1-stmt-end-unique.
+func RunStmtEndDeferredUniqueChecks(ctx *Context, sess *BasicSession) error {
+	if sess == nil || ctx == nil || ctx.Pool == nil {
+		return nil
+	}
+	checks := sess.TakeDeferredUniqueChecksStmtEnd()
 	if len(checks) == 0 {
 		return nil
 	}
