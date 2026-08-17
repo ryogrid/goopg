@@ -643,11 +643,28 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		// them itself one line below.
 		*rows = append(*rows, Row{NewStringDatum(
 			indent + fmt.Sprintf("Workers Planned: %d", p.WorkersPlanned))})
+	// SIBLING PAIR (M0134-0001 S18): this case and *optimizer.Aggregate's
+	// group-key loop below must move together. Both derive from PG's single
+	// show_sort_group_keys (explain.c:2767-2823) — a GroupAggregate/Sort
+	// stack prints one line from each, two rows apart, so a change to one
+	// without the other manufactures an internal inconsistency within a
+	// single EXPLAIN output. See docs/design/0134-0001-p2-explain-format.md
+	// § S18 for the "reference vs compute" rule this pair implements.
 	case *optimizer.Sort:
 		if len(p.Keys) > 0 {
 			parts := make([]string, 0, len(p.Keys))
 			for _, k := range p.Keys {
 				s := formatExprQual(k.Expr, reg, qualify)
+				// S18: a Sort never evaluates expressions — its key is
+				// always PG's OUTER_VAR reference into the child's target
+				// list, so get_special_variable's "force parentheses for a
+				// non-Var referent" rule applies unconditionally here.
+				// Placed BEFORE the DESC/NULLS suffix: PG prints
+				// `Sort Key: ((g % 10000)) DESC`, keeping the decoration
+				// outside the added pair.
+				if _, isVar := k.Expr.(*optimizer.ColumnRef); !isVar {
+					s = forceParen(s)
+				}
 				if k.Desc {
 					s += " DESC"
 				}
@@ -777,9 +794,23 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 					order[i] = i
 				}
 			}
+			// SIBLING PAIR (M0134-0001 S18): see the *optimizer.Sort case
+			// above. A GroupAggregate reads its already-sorted input
+			// through a child Sort, so it inherits that Sort's OUTER_VAR
+			// reference wrap; a HashAggregate sitting directly on a
+			// scan/join computes the group key itself and keeps the
+			// single (unwrapped) form. docs/design/0134-0001-p2-explain-format.md
+			// § S18.
+			_, groupAgg := p.Child.(*optimizer.Sort)
 			parts := make([]string, 0, len(order))
 			for _, gi := range order {
-				parts = append(parts, formatExprQual(p.GroupExprs[gi], reg, qualify))
+				s := formatExprQual(p.GroupExprs[gi], reg, qualify)
+				if groupAgg {
+					if _, isVar := p.GroupExprs[gi].(*optimizer.ColumnRef); !isVar {
+						s = forceParen(s)
+					}
+				}
+				parts = append(parts, s)
 			}
 			*rows = append(*rows, Row{NewStringDatum(indent + "Group Key: " + strings.Join(parts, ", "))})
 		}
@@ -942,6 +973,17 @@ func wrapParen(s string) string {
 		}
 		return s
 	}
+	return "(" + s + ")"
+}
+
+// forceParen unconditionally wraps s in one more parenthesis pair — S18's
+// `get_special_variable` "force parentheses for a non-Var referent" rule
+// (ruleutils.c). Deliberately NOT `wrapParen`: wrapParen is idempotent
+// ("skip if already parenthesised") for the Filter:/Index Cond: sites and
+// would silently no-op on an already-parenthesised OpExpr like
+// `(g % 10000)`, which S18's Sort Key:/Group Key: sites must still wrap to
+// `((g % 10000))`.
+func forceParen(s string) string {
 	return "(" + s + ")"
 }
 

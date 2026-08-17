@@ -1224,6 +1224,101 @@ Partial/Finalize split wording, `"Parallel Hash"` / `"Parallel Hash Join"`,
 `BitmapHeapScan` has no `describePlan` case at all today — its `Parallel` flag is
 correctly stamped but has no renderer to read it.
 
+## S18 — `Sort Key:` / `Group Key:` parenthesisation is a *reference* property
+
+Status: accepted 2026-08-17. Executes the third of S15's three ledger rows
+("EXPLAIN `Group Key:`/`Sort Key:` under-parenthesisation of non-Var keys").
+
+**The divergence.** `aggregates` hunk `@@ -3130,13 +3021,13 @@`:
+
+```
+ GroupAggregate
+-  Group Key: ((g % 10000))      <- PG
++  Group Key: (g % 10000)        <- goopg
+   ->  Sort
+-  Sort Key: ((g % 10000))       <- PG
++  Sort Key: (g % 10000)         <- goopg
+   ->  Seq Scan on agg_data_20k
+```
+
+**Why it is not "always add a paren".** The same corpus contains BOTH forms for
+the identical expression:
+
+| `postgres/src/test/regress/expected/aggregates.out` | node | rendering |
+|---|---|---|
+| `:3464-3465` | `GroupAggregate` over a `Sort` | `Group Key: ((g % 10000))` |
+| `:3500-3501` | `HashAggregate` directly over the scan | `Group Key: (g % 10000)` |
+
+`show_sort_group_keys` (`explain.c:2767-2823`) adds nothing of its own — it
+deparses `target->expr` and prints it. The extra pair comes from **ruleutils**,
+in `get_special_variable`
+(`postgres/src/backend/utils/adt/ruleutils.c`):
+
+```c
+/*
+ * For a non-Var referent, force parentheses because our caller probably
+ * assumed a Var is a simple expression.
+ */
+if (!IsA(node, Var))
+    appendStringInfoChar(buf, '(');
+get_rule_expr(node, context, true);
+if (!IsA(node, Var))
+    appendStringInfoChar(buf, ')');
+```
+
+reached whenever the key is an `OUTER_VAR`/`INNER_VAR`/`INDEX_VAR` reference that
+`resolve_special_varno` chases down into the child's target list. So the rule is:
+
+> The extra pair appears iff the node **references** the expression through a
+> child's output column, and disappears iff the node **computes** the expression
+> in its own target list. It is a property of where the value is evaluated, not
+> of the expression's shape.
+
+A `Sort` never evaluates expressions, so its key is always an `OUTER_VAR`
+reference — hence `Sort Key:` on a non-Var is wrapped throughout the corpus
+(`((g % 10000))`, `(COALESCE(prt1.a, p2.a))`, `(area(f1))`, `((a <-> '(5,5)'::point))`).
+A `GroupAggregate` reads its already-sorted input through the `Sort`, so it
+inherits the wrap; a `HashAggregate` sitting on the scan computes the key itself
+and does not.
+
+Note the visual: for an `OpExpr` the inner pair is `get_oper_expr`'s own
+(`(g % 10000)`), so the wrapped form shows two; for a `FuncExpr` there is no
+inner pair, so the corpus shows bare `length((stringu1)::text)` unwrapped versus
+`(length((stringu1)::text))` wrapped. Any implementation that keys off "does it
+already start with `(`" gets the `FuncExpr` case wrong — see the gotcha below.
+
+**goopg's rule (structural approximation).** goopg has no varno machinery
+(that is the long-standing class-10 deferral, ledger row 615), so the
+"reference vs compute" distinction is approximated from plan shape at the two
+emitter sites in `internal/executor/operators_explain.go`:
+
+- `case *optimizer.Sort` (`:646-664`) — wrap every non-Var key. Unconditional:
+  goopg's `Sort` is a pass-through by construction, exactly as PG's is.
+- `case *optimizer.Aggregate` (`:761-785`) — wrap non-Var group keys **iff the
+  aggregate's input arrives through a non-evaluating node**, i.e. its child is a
+  `*optimizer.Sort`. `AggStrategyHashed` directly over a scan/join keeps the
+  single form.
+
+These two are a **sibling pair**: PG derives both from one `show_sort_group_keys`
+call, so a change to one without the other manufactures an internal
+inconsistency within a single EXPLAIN output (the `GroupAggregate`/`Sort` stack
+above prints both lines two rows apart). Both sites carry reciprocal comments.
+
+The grouping-sets path (`:1835-1845`) emits no per-set key detail lines at all
+today, so it is untouched and `groupingsets` stays byte-identical; when
+M0125-0048 adds those lines it must adopt this rule (ledgered).
+
+**Gotcha — `wrapParen` is the wrong helper.** The existing `wrapParen`
+(`operators_explain.go:924`) is deliberately idempotent ("skip if already
+parenthesised") for the `Filter:`/`Index Cond:` sites, so calling it on
+`(g % 10000)` silently returns it unchanged. S18 needs a distinct
+unconditional helper.
+
+**Predicted measurement:** `aggregates` 981 → ~968 lines, 28 → 27 hunks.
+Blast radius is every case emitting a non-Var `Sort Key:`; the direction is
+strictly corrective (goopg under-parenthesises today), but the `HashAggregate`
+carve-out is what keeps it from over-correcting.
+
 ## Cross-case relevance
 
 Every M0134 regress case whose `.sql` emits `EXPLAIN` inherits the formatter

@@ -1,57 +1,56 @@
-# Working set — M0134-0001 S17 LANDED
+# Working set — M0134-0001 S18 LANDED
 
-**Task:** M0134-0001 (`aggregates.sql`), slice **S17 — the `"Parallel "` EXPLAIN
-node-label prefix**. Selected per the Current Priority banner (M-NIGHTLY drained:
+**Task:** M0134-0001 (`aggregates.sql`), slice **S18 — `Sort Key:`/`Group Key:`
+parenthesisation**. Selected per the Current Priority banner (M-NIGHTLY drained:
 `ci/logs/action-items.md` still run `20260817-011734`, all 6 `[x]`; nothing new
 to file).
 
-**Fix:** a real per-node `Parallel bool` on `SeqScan`/`BitmapHeapScan`, stamped
-once at Gather-construction time by `stampParallelScan` (`parallel.go`), rendered
-by `describePlan` **and** `describePlanVerbose`.
+**The finding worth carrying:** the extra paren pair is NOT an
+expression-shape property. `show_sort_group_keys` (`explain.c:2767-2823`) adds
+nothing; the pair comes from `ruleutils.c get_special_variable` ("force
+parentheses for a non-Var referent"), reached only when the key is an
+`OUTER_VAR` chased into a child's tlist by `resolve_special_varno`. It marks
+**where the value is evaluated**. Corpus proof, same expression both ways:
+`aggregates.out:3464-3465` `GroupAggregate`→`((g % 10000))` vs `:3500-3501`
+`HashAggregate`→`(g % 10000)`. "Always wrap" would have been wrong.
 
-**Why not a render-time walk:** PG's `parallel_aware` is per-PATH-CHOICE
-(`pathnode.c:996`/`:1115`, gated `parallel_workers > 0`), not per-tree-position —
-PG admits a single-copy `Gather` over a non-partial subtree whose scan takes NO
-prefix. `explain.c:1630-1631` renders it generically for any node kind.
+**goopg's rule (structural proxy — no varno machinery, class-10 row 615):**
+`*optimizer.Sort` wraps every non-`ColumnRef` key unconditionally; `Aggregate`
+wraps iff `p.Child` is a `*optimizer.Sort`. Wrap sits INSIDE the
+`DESC`/`NULLS`/`COLLATE` decoration. New `forceParen` — NOT `wrapParen`, which
+is idempotent and would have silently no-opped on `(g % 10000)` (the scoping
+research flagged this trap in advance; first slice this milestone where a
+predicted trap was avoided rather than hit).
 
-**The twin the brief got wrong — worth carrying:** research concluded
-`describePlan` was the single label emitter and `describePlanVerbose` needed no
-change. False: its `*SeqScan` case has three independent `return`s and does not
-fall through, so `EXPLAIN VERBOSE` would have kept rendering a bare `Seq Scan`.
-Shipping that would have *created* a divergence. Caught by the implementer, fixed
-under coordinator ruling; both cases now carry reciprocal sibling-pair comments.
-Same failure mode as S11's two walkers — the standing sibling-paths rule earned
-its keep again, and against a research report this time, not just against code.
+**Measurement:** `aggregates` **981 → 963 lines, 28 → 27 hunks** (beat the
+predicted ~968). Blast radius across 8 cases: net **−18, zero growth**.
 
-**Measurement:** `aggregates` **999 → 981 lines, 29 → 28 hunks**; the
-`array_dims(array_agg(s))` block gone entirely — first slice this milestone where
-the predicted win landed exactly as scoped. Class confirmed beyond the case:
-`select_distinct` **304 → 301**.
+**Files:** `internal/executor/{operators_explain.go,explain_sortgroup_paren_test.go}`,
+`docs/design/0134-0001-p2-explain-format.md` (S18 section) + README row.
 
-**Files:** `internal/optimizer/{plan.go,parallel.go,parallel_test.go}`,
-`internal/executor/{operators_explain.go,parallel_label_test.go}`,
-`docs/design/0134-0001-p2-explain-format.md` (S17 section) + README row.
+**Gates run:** guard 5/5 PASS (3 FAIL-pre/PASS-post); UNITS suite PASS;
+`scripts/tpch-spotcheck.sh` PASS Q12=2/Q13=35; pgbench smoke PASS via hook.
 
-**Gates run:** build + vet PASS; `go test ./internal/optimizer/ ./internal/executor/`
-PASS; UNITS suite PASS; regress `aggregates` 981/28, sentinels byte-identical
-(`functional_deps` 56, `groupingsets` 2373); `scripts/tpch-spotcheck.sh` PASS
-Q12=2/Q13=35; pgbench smoke PASS via hook.
+**Deferral ledger:** S15's parenthesisation row flipped `resolved`; 3 new rows
+2026-08-17 — the proxy's two blind spots (non-`Sort` pass-through under an
+Aggregate ⇒ under-wrap; the corpus's rarer single-wrapped
+`Sort Key: (COALESCE(t3.q1))` ⇒ over-wrap), the absent per-set grouping-sets key
+lines (must adopt this rule when M0125-0048 adds them), and **the regress gate
+is not run-to-run deterministic**: `groupingsets` 2373-2377 and `subselect`
+2845-2846 move on an unchanged tree. Only `functional_deps` (56) is a
+trustworthy sentinel — stop quoting `groupingsets` 2373 as one.
 
-**Deferral ledger:** S16's `"Parallel "` row flipped `resolved`; 3 new rows
-2026-08-17 — `BitmapHeapScan` has no `describePlan` case at all (its correctly
-stamped flag has no reader), the non-text `"Parallel Aware"` JSON property
-(`explain.c:1652`, emitted on EVERY node ⇒ JSON-format-wide), and the absent
-parallel index-scan eligibility that makes `balk`'s `Parallel Index Only Scan`
-unreachable.
+**Next step:** continue **M0134-0001**. At 27 hunks: deparser/C11c 8 (confirmed
+`ruleutils.c`-grade, own milestone — rule it out), S6 min/max-InitPlan 5
+(`rewriteMinMaxAggregates` `planner.go:8814` already ports `planagg.c`; its gate
+at `:8842-8848` bails on `OrderBy`/`Distinct`/multi-target — that gate is the
+slice), the NEW unledgered VERBOSE `Output:` column-pruning gap 2, isolated-bug
+residue. S6-gate is the cheapest confirmed next.
 
-**Next step:** continue **M0134-0001**. Remaining buckets at 28 hunks:
-deparser/C11c 8, S6 min/max-InitPlan 5, isolated bugs 4, qualification 3, plus
-the `string_agg` delimiter coercion (closes hunk 18, already ledgered and
-self-contained — cheapest next).
-
-**Delegation:** `tmp/ralph-handoffs/m0134-0001-s17-parallel-label/` — `brief.md`
-(researcher, 1 round), `impl-brief.md` (implementer, 2 rounds; round 2 =
-coordinator rulings on the VERBOSE twin + the relaxed pointer-identity
-assertion), `gate-brief.md` (tester, 1 round).
+**Delegation:** `tmp/ralph-handoffs/m0134-0001-s18-scope/` (researcher, 1 round —
+its full hunk table is the map for the next slice) and
+`tmp/ralph-handoffs/m0134-0001-s18-sortgroup-parens/` (implementer 1 round,
+tester 1 round; both reported as text, the harness blocked their report.md
+writes).
 
 **In-flight:** none.
