@@ -2855,43 +2855,51 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 		}
 	case "string_agg":
 		// string_agg(expr, delimiter) — accumulate in strResult with delimiter.
-		// For bytea values, st.boolResult=true signals hex-encoded mode.
-		const hexChars = "0123456789abcdef"
+		// For bytea values, st.boolResult=true signals bytea mode: the RAW
+		// bytes are accumulated (a Go string is just a byte sequence — no hex
+		// encoding here), and finishAgg's "string_agg" case renders the
+		// concatenated bytes through byteaOutMode once, at the end, under the
+		// session's `bytea_output` GUC. Before M0134-0001 S12 this hex-encoded
+		// every piece INLINE during accumulation, which threw the raw bytes
+		// away before the GUC could ever be consulted — `SET bytea_output =
+		// 'escape'; select string_agg(x::text::bytea, ','::bytea) from ...`
+		// stayed hex forever regardless of the GUC. That specific case is
+		// fixed by this slice (verified: `1,2,3`, not `\x313233`).
+		//
+		// What this slice does NOT fix: the delimiter check below
+		// (`dv.Kind == KindBytes`) still silently drops an UNTYPED literal
+		// delimiter — `string_agg(x::text::bytea, ',')` with no `::bytea`
+		// cast on the delimiter, which is exactly what aggregates.sql's
+		// pagg_test/v_pagg_test view uses. That concatenates every element
+		// with NO separator regardless of `bytea_output` (confirmed present
+		// on HEAD under hex mode too — `\x313233...`, not `\x31,2c,32,...` —
+		// so it predates this slice and is not a regression). Fixing the
+		// untyped-literal-to-bytea coercion is out of scope here: it would
+		// also change HEX-mode output, which this slice must leave
+		// byte-identical to HEAD. Recorded in the deferral ledger by the
+		// coordinator rather than fixed in place.
 		if arg.Kind == KindBytes {
-			// Bytea string_agg: concatenate hex-encoded bytes with hex-encoded delimiter.
-			b := arg.BytesValue()
-			hexBuf := make([]byte, len(b)*2)
-			for i, bb := range b {
-				hexBuf[2*i] = hexChars[bb>>4]
-				hexBuf[2*i+1] = hexChars[bb&0x0f]
-			}
-			hexVal := string(hexBuf)
-			delimHex := ""
+			raw := string(arg.BytesValue())
+			delimRaw := ""
 			if call.Arg2 != nil {
 				dv, _ := evalExprSlot(call.Arg2, slot, o.ctx)
 				if !dv.IsNull() && dv.Kind == KindBytes {
-					db := dv.BytesValue()
-					dh := make([]byte, len(db)*2)
-					for i, bb := range db {
-						dh[2*i] = hexChars[bb>>4]
-						dh[2*i+1] = hexChars[bb&0x0f]
-					}
-					delimHex = string(dh)
+					delimRaw = string(dv.BytesValue())
 				}
 			}
 			st.boolResult = true // bytea mode flag
 			if len(call.OrderBy) > 0 {
-				st.strElems = append(st.strElems, hexVal)
-				st.strDelims = append(st.strDelims, delimHex)
+				st.strElems = append(st.strElems, raw)
+				st.strDelims = append(st.strDelims, delimRaw)
 				st.strElemKeys = append(st.strElemKeys, evalAggOrderByKeys(call.OrderBy, slot, o.ctx))
 				st.hasValue = true
 				break
 			}
 			if !st.hasValue {
-				st.strResult = hexVal
+				st.strResult = raw
 				st.hasValue = true
 			} else {
-				st.strResult += delimHex + hexVal
+				st.strResult += delimRaw + raw
 			}
 			break
 		}
@@ -3797,9 +3805,13 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 			}
 			out = b.String()
 		}
-		// Bytea mode: st.boolResult=true means result is hex-encoded bytes.
+		// Bytea mode: st.boolResult=true means out holds the RAW concatenated
+		// bytes (accumAgg no longer hex-encodes them early — M0134-0001 S12),
+		// rendered here through the SAME dispatch the scalar cast-to-text and
+		// wire renderers use, so `string_agg` over bytea honors `bytea_output`
+		// exactly like every other bytea-to-text site (Hard-won Rule #2).
 		if st.boolResult {
-			return NewStringDatum(`\x` + out)
+			return NewStringDatum(byteaOutMode([]byte(out), byteaOutputModeFromCtx(o.ctx)))
 		}
 		return NewStringDatum(out)
 	case "array_agg":

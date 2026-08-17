@@ -330,11 +330,34 @@ func byteaOperand(d Datum) ([]byte, bool) {
 	return nil, false
 }
 
-// byteaOutHex is byteaout under the default `bytea_output = hex` GUC: the
-// literal two characters `\x` followed by lowercase hex. This is the text a
-// bytea value takes on when cast to text and what the wire renderer emits.
-// The implementation moved to the leaf internal/pgarray when bytea ARRAY
-// elements started storing raw bytes: the element decoder there renders the
-// same text and cannot import the executor, so keeping a second copy here
-// would be exactly the sibling drift Hard-won Rule #2 exists to prevent.
-func byteaOutHex(b []byte) string { return array.ByteaOutHex(b) }
+// byteaOutMode renders b per the `bytea_output` mode string ("hex", "escape",
+// or absent/unrecognised → hex). This is the ONLY correct entry point for a
+// bytea text-output site to call — every one of them (scalar cast-to-text,
+// the wire renderer, COPY TO, string_agg's finish step, and the array-element
+// renderer via array.ByteaOutStyled) resolves through this single dispatch,
+// so hex stays the default everywhere and an `escape` GUC changes all of them
+// together (Hard-won Rule #2). Round 2 of M0134-0001 S12 deleted the
+// standalone byteaOutHex/byteaOutEscape wrappers that used to sit here:
+// after the sibling sweep landed, byteaOutHex had zero non-test callers left
+// and a future call site could have grabbed it directly, silently
+// reintroducing the GUC-blind path this slice exists to close. Call
+// byteaOutMode(b, "hex") / byteaOutMode(b, "escape") directly if a fixed
+// mode is genuinely needed (e.g. a test oracle); every real render site
+// should be resolving the mode from the session via byteaOutputModeFromCtx
+// or the equivalent getSetting lookup, never hardcoding one.
+func byteaOutMode(b []byte, mode string) string { return array.ByteaOutStyled(b, mode) }
+
+// byteaOutputModeFromCtx resolves the session's `bytea_output` GUC via
+// ctx.GetSetting, defaulting to "hex" (PostgreSQL's boot default) when ctx is
+// nil, has no GetSetting wired, or the GUC is unset — mirroring
+// dateStyleFromCtx/timeZoneFromCtx (internal/executor/expr.go). PG validates
+// the enum at SET time, so any other stored value is unreachable in practice;
+// byteaOutMode still normalises it to hex out of caution. M0134-0001 S12.
+func byteaOutputModeFromCtx(ctx *Context) string {
+	if ctx != nil && ctx.GetSetting != nil {
+		if v, ok := ctx.GetSetting("bytea_output"); ok {
+			return v
+		}
+	}
+	return "hex"
+}

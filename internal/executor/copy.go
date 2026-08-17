@@ -65,12 +65,19 @@ func RunCopyTo(ctx *Context, plan *optimizer.Copy, emit func([]byte) error) (cou
 	// timeZone feeds the timestamptz columns only (config.FormatTimestampTZ);
 	// "" means the boot default, UTC.
 	timeZone := ""
+	// byteaMode feeds the bytea columns (M0134-0001 S12); "hex" is the boot
+	// default, matching dispatch.go's appendTypedCellText (SELECT wire) so
+	// COPY TO and SELECT agree on the same `bytea_output` GUC.
+	byteaMode := "hex"
 	if ctx.GetSetting != nil {
 		if v, ok := ctx.GetSetting("datestyle"); ok {
 			dateStyle, dateOrder = misc.ParseDateStyleValue(v)
 		}
 		if v, ok := ctx.GetSetting("timezone"); ok {
 			timeZone = v
+		}
+		if v, ok := ctx.GetSetting("bytea_output"); ok {
+			byteaMode = v
 		}
 	}
 	// M0119-0006 (68th slice): the catalog + search-path-qualify flag the reg*
@@ -136,9 +143,9 @@ func RunCopyTo(ctx *Context, plan *optimizer.Copy, emit func([]byte) error) (cou
 		case binary:
 			buf, encErr = AppendCopyBinaryRow(buf, row, cols)
 		case format.csv:
-			buf, encErr = EncodeCopyCsvRow(buf, row, cols, format, dateStyle, dateOrder, timeZone, cat, qualify, argVisible)
+			buf, encErr = EncodeCopyCsvRow(buf, row, cols, format, dateStyle, dateOrder, timeZone, byteaMode, cat, qualify, argVisible)
 		default:
-			buf, encErr = EncodeCopyTextRow(buf, row, cols, dateStyle, dateOrder, timeZone, cat, qualify, argVisible)
+			buf, encErr = EncodeCopyTextRow(buf, row, cols, dateStyle, dateOrder, timeZone, byteaMode, cat, qualify, argVisible)
 		}
 		if encErr != nil {
 			return count, binary, encErr

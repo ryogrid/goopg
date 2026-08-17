@@ -3640,9 +3640,10 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 	case "text", "varchar", "bpchar", "char":
 		switch d.Kind {
 		case KindBytes:
-			// byteaout, hex mode: a bytea cast to text is the `\x…` escape
-			// string, NOT the raw payload bytes. M0125-0021.
-			return NewStringDatum(byteaOutHex(d.BytesValue())), nil
+			// byteaout: a bytea cast to text is the escape string the
+			// session's `bytea_output` GUC selects (hex's `\x…` by default),
+			// NOT the raw payload bytes. M0125-0021, M0134-0001 S12.
+			return NewStringDatum(byteaOutMode(d.BytesValue(), byteaOutputModeFromCtx(ctx))), nil
 		case KindBool:
 			if d.BoolValue() {
 				return NewStringDatum("true"), nil

@@ -157,7 +157,7 @@ func TestRegArraySelectCopySiblingAgree(t *testing.T) {
 
 	// COPY TO consumes the decoded text verbatim (datumToCopyText's IsArray arm
 	// passes the KindString through), so it must print the same bytes.
-	text, err := EncodeCopyTextRow(nil, Row{d}, []catalog.Column{col}, "ISO", "MDY", "", ctx.Catalog, false)
+	text, err := EncodeCopyTextRow(nil, Row{d}, []catalog.Column{col}, "ISO", "MDY", "", "hex", ctx.Catalog, false)
 	if err != nil {
 		t.Fatalf("COPY TO: %v", err)
 	}

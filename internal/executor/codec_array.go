@@ -320,6 +320,9 @@ func arrayOutputStyle(ctx *Context) array.OutputStyle {
 	if v, ok := ctx.GetSetting("timezone"); ok {
 		st.Zone = v
 	}
+	if v, ok := ctx.GetSetting("bytea_output"); ok {
+		st.ByteaMode = v
+	}
 	return st
 }
 

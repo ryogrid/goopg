@@ -86,7 +86,7 @@ func TestRegCopyToRendersName(t *testing.T) {
 	for _, tc := range cases {
 		cols := []catalog.Column{{Name: "c", Type: catalog.Type{Name: tc.typ}}}
 		row := Row{NewIntDatum(tc.oid)}
-		text, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY", "", ctx.Catalog, false)
+		text, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY", "", "hex", ctx.Catalog, false)
 		if err != nil {
 			t.Fatalf("TEXT %s: %v", tc.typ, err)
 		}
@@ -97,7 +97,7 @@ func TestRegCopyToRendersName(t *testing.T) {
 		if tc.wantCsv != "" {
 			wantCsv = tc.wantCsv
 		}
-		csv, err := EncodeCopyCsvRow(nil, row, cols, csvFmt, "ISO", "MDY", "", ctx.Catalog, false)
+		csv, err := EncodeCopyCsvRow(nil, row, cols, csvFmt, "ISO", "MDY", "", "hex", ctx.Catalog, false)
 		if err != nil {
 			t.Fatalf("CSV %s: %v", tc.typ, err)
 		}
@@ -117,14 +117,14 @@ func TestRegCopyToInvalidOidIsDash(t *testing.T) {
 	for _, typ := range []string{"regclass", "regproc", "regprocedure", "regtype", "regrole", "regcollation"} {
 		cols := []catalog.Column{{Name: "c", Type: catalog.Type{Name: typ}}}
 		row := Row{NewIntDatum(0)}
-		text, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY", "", ctx.Catalog, false)
+		text, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY", "", "hex", ctx.Catalog, false)
 		if err != nil {
 			t.Fatalf("TEXT %s: %v", typ, err)
 		}
 		if want := "-\n"; string(text) != want {
 			t.Errorf("TEXT %s(oid 0) = %q, want %q", typ, text, want)
 		}
-		csv, err := EncodeCopyCsvRow(nil, row, cols, csvFmt, "ISO", "MDY", "", ctx.Catalog, false)
+		csv, err := EncodeCopyCsvRow(nil, row, cols, csvFmt, "ISO", "MDY", "", "hex", ctx.Catalog, false)
 		if err != nil {
 			t.Fatalf("CSV %s: %v", typ, err)
 		}
@@ -141,7 +141,7 @@ func TestRegCopyToKindStringPassthrough(t *testing.T) {
 	ctx := regCopyCat(t)
 	cols := []catalog.Column{{Name: "c", Type: catalog.Type{Name: "regclass"}}}
 	row := Row{NewStringDatum("pg_type")}
-	got, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY", "", ctx.Catalog, false)
+	got, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY", "", "hex", ctx.Catalog, false)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -351,7 +351,7 @@ func arrayKeyElemRendererPGImage(name string, st array.OutputStyle) func(Datum) 
 		}
 	case isByteaType(name):
 		return func(d Datum) (string, error) {
-			return quoteArrayTextElem(byteaOutHex(d.BytesValue())), nil
+			return quoteArrayTextElem(byteaOutMode(d.BytesValue(), st.ByteaMode)), nil
 		}
 	}
 	return nil

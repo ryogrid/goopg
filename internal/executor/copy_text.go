@@ -31,8 +31,10 @@ import (
 // including the trailing newline. dateStyle/dateOrder select the DATE
 // column rendering (PostgreSQL's DateStyle GUC style/order components,
 // e.g. "ISO"/"MDY" — see config.ParseDateStyleValue); pass "ISO", "MDY"
-// for the boot default.
-func EncodeCopyTextRow(dst []byte, row Row, cols []catalog.Column, dateStyle, dateOrder, timeZone string, cat catalog.Catalog, qualify bool, visible ...func(schema string) bool) ([]byte, error) {
+// for the boot default. byteaMode selects the `bytea_output` GUC's rendering
+// for a bytea column ("hex", the boot default, or "escape" —
+// M0134-0001 S12); pass "hex" (or "") for the boot default.
+func EncodeCopyTextRow(dst []byte, row Row, cols []catalog.Column, dateStyle, dateOrder, timeZone, byteaMode string, cat catalog.Catalog, qualify bool, visible ...func(schema string) bool) ([]byte, error) {
 	if len(row) != len(cols) {
 		return nil, fmt.Errorf("EncodeCopyTextRow: %d cols vs %d datums", len(cols), len(row))
 	}
@@ -45,7 +47,7 @@ func EncodeCopyTextRow(dst []byte, row Row, cols []catalog.Column, dateStyle, da
 			dst = append(dst, '\\', 'N')
 			continue
 		}
-		s, err := datumToCopyText(c.Type, d, dateStyle, dateOrder, timeZone, cat, qualify, visible...)
+		s, err := datumToCopyText(c.Type, d, dateStyle, dateOrder, timeZone, byteaMode, cat, qualify, visible...)
 		if err != nil {
 			return nil, err
 		}
@@ -268,7 +270,7 @@ func appendCopyTextEscaped(dst []byte, s string) []byte {
 // value parameters rather than a *Context so the TEXT and CSV renderers share
 // exactly the narrow seam they already did. A nil cat preserves the pre-68th
 // numeric rendering.
-func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone string, cat catalog.Catalog, qualify bool, visible ...func(schema string) bool) (string, error) {
+func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone, byteaMode string, cat catalog.Catalog, qualify bool, visible ...func(schema string) bool) (string, error) {
 	// Array columns FIRST. A user array column is
 	// catalog.Type{Name:<ELEMENT type>, IsArray:true}, so every arm of the
 	// switch below would claim the array under its ELEMENT's name and reject
@@ -368,6 +370,32 @@ func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone str
 			return "", fmt.Errorf("expected time datum for time, got kind %d", d.Kind)
 		}
 		return datetime.FormatTime(pgTimeMicros(d.TimeValue())), nil
+	case "bytea":
+		// COPY TO renders bytea per the session's `bytea_output` GUC — the
+		// SAME dispatch dispatch.go's appendTypedCellText (SELECT wire) uses —
+		// so COPY and SELECT cannot drift on this axis (Hard-won Rule #2).
+		// Previously unhandled: bytea fell to the default arm's KindBytes case,
+		// which wrote the RAW payload bytes into the text stream instead of an
+		// output-function-encoded string. M0134-0001 S12.
+		//
+		// A KindString datum reaching here is ALREADY output-function text —
+		// e.g. string_agg(bytea,...) advertises RetType bytea (pg_proc OID
+		// 3545) but returns its accumulated result as a KindString, the same
+		// shape dispatch.go's appendTypedCellText (SELECT wire, the sibling
+		// this arm must not drift from) already falls through to
+		// d.AppendValueText for — so it must pass through verbatim rather
+		// than error. Round 2 regression fix: an earlier version of this arm
+		// rejected non-KindBytes outright, which turned
+		// `COPY (SELECT string_agg(b,','::bytea) FROM zs) TO STDOUT` into a
+		// hard 500 instead of the working query it was on HEAD.
+		switch d.Kind {
+		case KindBytes:
+			return byteaOutMode(d.BytesValue(), byteaMode), nil
+		case KindString:
+			return d.StringValue(), nil
+		default:
+			return "", fmt.Errorf("expected bytes datum for bytea, got kind %d", d.Kind)
+		}
 	case "timetz":
 		// Sibling of the "time" arm; timetz_out prints the local time of day
 		// followed by the UTC offset. pgdatetime.FormatTimeTZ takes PG's own

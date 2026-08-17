@@ -65,6 +65,12 @@ type OutputStyle struct {
 	// callers have no catalog) falls back to "-"/numeric. M0119-0006 reg*
 	// element slice.
 	RegOut func(typeName string, oid uint32) string
+	// ByteaMode selects the `bytea_output` GUC's rendering for a bytea array
+	// element: "" or "hex" (the default) → ByteaOutHex, "escape" →
+	// ByteaOutEscape. Any other/unrecognised spelling also falls back to hex,
+	// matching the scalar renderer (PG validates the enum at SET time, so the
+	// output path never needs to error). M0134-0001 S12.
+	ByteaMode string
 }
 
 // DefaultOutputStyle is the boot-default rendering — ISO/MDY dates in UTC —
@@ -338,11 +344,13 @@ func DecodeElemStyled(elemName string, data []byte, varlena bool, size int, st O
 		}
 		if lower == "bytea" {
 			// Sibling of encodeArrayElem's "bytea" arm: the body is the RAW
-			// bytes, so it renders through byteaout's hex form rather than being
+			// bytes, so it renders through byteaout (hex or escape, per
+			// st.ByteaMode / the session's `bytea_output` GUC) rather than being
 			// treated as text (which would emit the raw bytes and could not even
 			// be quoted safely). The backslash makes array_out quote it, so the
-			// element comes back as PG prints it: {"\\x0102"}.
-			return QuoteTextElem(ByteaOutHex(data[4:sz])), sz, nil
+			// element comes back as PG prints it: {"\\x0102"} under hex,
+			// {"\\000\\001..."}-shaped under escape. M0134-0001 S12.
+			return QuoteTextElem(ByteaOutStyled(data[4:sz], st.ByteaMode)), sz, nil
 		}
 		return QuoteTextElem(string(data[4:sz])), sz, nil
 	}
@@ -435,6 +443,48 @@ func ByteaOutHex(b []byte) string {
 		out = append(out, hexdigits[c>>4], hexdigits[c&0x0f])
 	}
 	return string(out)
+}
+
+// ByteaOutEscape is byteaout under `bytea_output = escape` GUC (the
+// traditional format PG used before 9.0): a literal backslash renders as `\\`,
+// a byte outside the printable ASCII range (unsigned `< 0x20 || > 0x7e`, per
+// postgres/src/backend/utils/adt/varlena.c:397 byteaout's escape branch)
+// renders as a backslash plus a FIXED-WIDTH 3-digit octal escape (`\000` ..
+// `\377` — never variable-length), and everything else passes through
+// verbatim. Deliberately not escEncodePG (internal/executor/bytea.go): that is
+// encode()'s separate 'escape' format, which only escapes NUL/high-bit/
+// backslash and leaves other non-printables (e.g. a bare newline) untouched —
+// a different upstream function with a different escape set. Pure/session-free
+// like ByteaOutHex; the caller resolves the `bytea_output` GUC and picks which
+// of the two to call (M0134-0001 S12 — see docs/design/0134-0001-p4-bytea-
+// output-escape.md).
+func ByteaOutEscape(b []byte) string {
+	out := make([]byte, 0, len(b))
+	for _, c := range b {
+		switch {
+		case c == '\\':
+			out = append(out, '\\', '\\')
+		case c < 0x20 || c > 0x7e:
+			out = append(out, '\\',
+				'0'+(c>>6),
+				'0'+((c>>3)&0x07),
+				'0'+(c&0x07))
+		default:
+			out = append(out, c)
+		}
+	}
+	return string(out)
+}
+
+// ByteaOutStyled renders b per the `bytea_output` GUC value carried in mode
+// ("hex", "escape", or "" — case-insensitive; anything else, including an
+// absent/unrecognised value, falls back to hex exactly as ByteaOutHex always
+// has). M0134-0001 S12.
+func ByteaOutStyled(b []byte, mode string) string {
+	if strings.EqualFold(mode, "escape") {
+		return ByteaOutEscape(b)
+	}
+	return ByteaOutHex(b)
 }
 
 // QuoteTextElem applies PG array-output quoting: an element is double-quoted

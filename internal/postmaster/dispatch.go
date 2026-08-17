@@ -13,6 +13,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/utils/misc"
+	"github.com/goopg/goopg/internal/utils/adt/array"
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/storage/lmgr"
 	"github.com/goopg/goopg/internal/lockwait"
@@ -3193,14 +3194,18 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 		}
 		return d.AppendValueText(dst)
 	case "bytea":
-		// Bytea values display as \xhexstring (default hex mode). M0097-0035.
+		// Bytea values render per the session's `bytea_output` GUC: hex
+		// (\xhexstring, the default) or escape (PG's traditional backslash-
+		// octal format). Previously hardcoded hex regardless of the GUC.
+		// M0097-0035, M0134-0001 S12.
 		if d.Kind == executor.KindBytes {
-			dst = append(dst, '\\', 'x')
-			const hexChars = "0123456789abcdef"
-			for _, b := range d.BytesValue() {
-				dst = append(dst, hexChars[b>>4], hexChars[b&0x0f])
+			mode := "hex"
+			if getSetting != nil {
+				if v, ok := getSetting("bytea_output"); ok {
+					mode = v
+				}
 			}
-			return dst
+			return append(dst, array.ByteaOutStyled(d.BytesValue(), mode)...)
 		}
 		return d.AppendValueText(dst)
 	case "regclass", "regproc", "regprocedure", "regtype", "regrole", "regcollation":
