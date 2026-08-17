@@ -8292,6 +8292,11 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 		return NewStringDatum(def + ";"), nil
 	case "pg_collation_for":
+		// Left unchanged deliberately for the ordered-set-aggregate WITHIN
+		// GROUP collation merge (M0134-0001 S20): this runtime path sees only
+		// the evaluated Datum, never the parser-level WITHIN GROUP clause, so
+		// it structurally cannot implement PG's merge rule. See "Sibling-pair
+		// analysis" in docs/design/0134-0001-p8-ordered-set-agg-collation.md.
 		if len(x.Args) == 1 {
 			switch arg := x.Args[0].(type) {
 			case *optimizer.StringConst:

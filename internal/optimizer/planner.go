@@ -7391,6 +7391,24 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 			typName := pgTypeofDisplayName(exprType(arg))
 			return &FuncCall{pos: x.Pos(), Name: "pg_typeof", Args: []Expr{&StringConst{Value: typName}}}, nil
 		}
+		// pg_collation_for(ordered-set-agg(...) WITHIN GROUP (...)): the same
+		// structural problem pg_typeof solves just above -- a compile-time
+		// function wrapping an aggregate loses its argument to the aggregate
+		// surface (isAggregateFunc branch above rewrites it to a bare,
+		// collation-less ColumnRef before any fold could see the WITHIN GROUP
+		// clause). Intercept on the RAW argument, mirroring resolveExpr's
+		// aggregate-free sibling (planner.go:12787-ish). A decline here means
+		// there was no pre-S20 fold in this post-aggregate resolver at all
+		// (pg_collation_for went unhandled and fell to the generic FuncCall
+		// case below, letting the executor's runtime approximation at
+		// internal/executor/expr.go:8294-8320 evaluate it per-row) -- so
+		// falling through unchanged IS the pre-S20 path here. M0134-0001 S20;
+		// see docs/design/0134-0001-p8-ordered-set-agg-collation.md.
+		if strings.ToLower(x.Name.String()) == "pg_collation_for" && len(x.Args) == 1 {
+			if result, ok := foldPgCollationForWithinGroup(x.Args[0], agg.cat, agg.input, x.Pos()); ok {
+				return &FuncCall{pos: x.Pos(), Name: "pg_collation_for", Args: []Expr{result}}, nil
+			}
+		}
 		args := make([]Expr, 0, len(x.Args))
 		for _, a := range x.Args {
 			pa, err := resolveExprAfterAggregate(a, agg)
@@ -11549,6 +11567,47 @@ func foldPgCollationFor(arg Expr, cat catalog.Catalog, ctx *resolveContext, pos 
 		"collations are not supported by type %s", pgTypeofDisplayName(catalog.Type{Name: baseName}))}
 }
 
+// foldPgCollationForWithinGroup attempts PostgreSQL's ordered-set-aggregate
+// collation merge rule (assign_ordered_set_collations, parse_collate.c:918-943,
+// merge condition :926-927) on a RAW, unresolved pg_collation_for argument. It
+// returns (foldedResult, true) when rawArg is a WITHIN GROUP aggregate call
+// (`*parser.FuncCall` with exactly one WithinGroup sort key) and
+// foldPgCollationFor can resolve that key's collation; otherwise (nil, false)
+// and the caller must fall through to its own pre-S20 behaviour unchanged —
+// two or more WITHIN GROUP keys deliberately do NOT merge (PG's rationale
+// comment at parse_collate.c:901-916: this is what lets
+// `agg(...) WITHIN GROUP (ORDER BY x COLLATE a, y COLLATE b)` avoid erroring),
+// and any other shape declines rather than guessing.
+//
+// Shared by the aggregate-free and post-aggregate halves of this one rule —
+// resolveExpr's pg_collation_for interception (:12787-ish, for queries with no
+// aggregate in the target list) and resolveExprAfterAggregate's pg_collation_for
+// branch (:7356-ish, for queries where percentile_disc/mode/rank's own
+// WITHIN GROUP call makes it an aggregate itself, routing target-list
+// resolution through the post-aggregate resolver — planner.go:4241-4247).
+// These two call sites are a genuine sibling pair (this milestone's fourth:
+// S11/S17/S18) and must keep agreeing on rules 1-3 here. See
+// docs/design/0134-0001-p8-ordered-set-agg-collation.md ("Design" +
+// "Sibling-pair analysis" — round 1 of this slice implemented only the
+// resolveExpr half and found it unreachable for the acceptance query; this
+// helper is the round-2 fix, factored once to keep the pair from silently
+// diverging). M0134-0001 S20.
+func foldPgCollationForWithinGroup(rawArg parser.Expr, cat catalog.Catalog, ctx *resolveContext, pos int) (Expr, bool) {
+	inner, ok := rawArg.(*parser.FuncCall)
+	if !ok || len(inner.WithinGroup) != 1 {
+		return nil, false
+	}
+	sortArg, err := resolveExpr(inner.WithinGroup[0].Expr, ctx)
+	if err != nil {
+		return nil, false
+	}
+	result, perr := foldPgCollationFor(sortArg, cat, ctx, pos)
+	if perr != nil {
+		return nil, false
+	}
+	return result, true
+}
+
 // explicitColumnCollationName resolves the DDL-declared column-level COLLATE
 // name (catalog.Column.Collation) for a resolved column reference, or "" when
 // the column has no explicit collation or the reference can't be mapped to a
@@ -12785,6 +12844,17 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		// per-row expression-collation model to consult. Oracle:
 		// postgres/src/backend/utils/adt/misc.c pg_collation_for. M0122-0005.
 		if strings.ToLower(x.Name.String()) == "pg_collation_for" && len(x.Args) == 1 {
+			// Ordered-set aggregate (WITHIN GROUP) collation merge, on the RAW
+			// argument, ahead of the generic resolveExpr(x.Args[0], ctx) below --
+			// this is the aggregate-free sibling of resolveExprAfterAggregate's
+			// pg_collation_for branch (post-aggregate queries, where the
+			// WITHIN GROUP call itself makes the target an aggregate and routes
+			// resolution there instead of here). Keep both in agreement on
+			// foldPgCollationForWithinGroup's rules. M0134-0001 S20; see
+			// docs/design/0134-0001-p8-ordered-set-agg-collation.md.
+			if result, ok := foldPgCollationForWithinGroup(x.Args[0], ctx.cat, ctx, x.Pos()); ok {
+				return &FuncCall{pos: x.Pos(), Name: "pg_collation_for", Args: []Expr{result}}, nil
+			}
 			arg, err := resolveExpr(x.Args[0], ctx)
 			if err != nil {
 				return nil, err
