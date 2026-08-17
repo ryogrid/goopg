@@ -1,62 +1,59 @@
-# Working set — M0134-0005 Bucket 6 landed; case still open, next target re-ranked
+# Working set — M0134-0005: `reg*[]` cast landed; next slice is PREPARE param coercion
 
-**Task:** M0134-0005 (`constraints.sql`) — **Bucket 6 LANDED 2026-08-18**; the case
-stays `[ ]`. Selected per the Current Priority banner (M0134 next after M-NIGHTLY).
-M-NIGHTLY drained: `ci/logs/action-items.md` still at run `20260818-005518`,
-**items: 0** — nothing to file.
+**Task:** M0134-0005 (`constraints.sql`) — the **`reg*[]` array cast** landed
+2026-08-18; the case stays `[ ]`. Selected per the Current Priority banner (M0134
+next after M-NIGHTLY). M-NIGHTLY drained: `ci/logs/action-items.md` still at run
+`20260818-005518`, **items: 0** — nothing to file.
 
-**The bucket's premise was wrong — don't re-derive it.** `ALTER TABLE … ALTER
-CONSTRAINT` was NEVER a blanket parse error: `[NOT] DEFERRABLE` / `[NOT] ENFORCED`
-already parsed (`parseAlterConstraintAttrs`, `internal/parser/ddl.go:2925`) and
-`execAlterTableAlterConstraint` (`operators_ddl.go:10996`) carried real FK logic.
-Only two spellings were broken, needing different work: **`NOT VALID` is
-parser-only** (PG raises it in the *grammar action*, `gram.y:2672-2676`, `0A000`
-"constraints cannot be altered to be NOT VALID") and **`[NO] INHERIT` needed both
-arms**, copying a grammar asymmetry — bare `INHERIT` is its own production
-(`gram.y:2686-2699`), `NO INHERIT` rides `ConstraintAttributeSpec` (`gram.y:6249`).
-Executor arm mirrors `tablecmds.c:12615-12684` (contype-gated to `CONSTRAINT_NOTNULL`,
-42704 unknown name, no-op if already in state, **one-level** child propagation).
-Rule-#2 sibling check came back **negative** this time (unlike Bucket 3).
+**Root cause was TWO stacked causes — do not re-bisect.** A six-step bisect
+**cleared** `pg_constraint` contype='n' population, the `convalidated`/
+`conislocal`/`coninhcount` columns, `= ANY`, plain `int[]` prepared params, and
+the `COLLATE "C"` sort. **Cause A (FIXED):** `evalCast` had **no case for any
+reg\*-array type** → fell through to the terminal `return d, nil // pass-through
+for unknown types`, so `'{tbl}'::regclass[]` stayed raw text (`pg_typeof` →
+`text`) and every OID comparison silently evaluated **false**. New arm covers all
+8 reg\*[] types, shaped like `case "name[]":`, resolving via `regIdentifierInput`;
+misses now raise 42P01/42704. Rule-#2 sibling check **negative** (encode twin
+`codec_array.go:encodeArrayElem` already correct). Forced adjacent fix:
+`evalExprSlot`'s reverse-direction `TargetType == "regtype[]"` oidvector case
+intercepted brace literals — now requires the string not to start with `{`.
 
-**Measurement — the real finding.** `constraints` diff 1431 → **1411** lines, hunks
-**33 → 33**. Neither shrink nor unmasking but **bucket interference**: both target
-statements now behave, yet every hunk holding them stays open on an unrelated
-defect. Two capping defects isolated and ledgered: (a) `ADD CONSTRAINT … UNIQUE (i)
-DEFERRABLE INITIALLY DEFERRED` builds the index immediately → `unique_tbl_i_key`
-never exists (**Bucket 4's** defect — this also *invalidates the Bucket 2 ledger
-row's* claim that those hunks awaited UNIQUE enforceability); (b) every `EXECUTE
-get_nnconstraint_info(…)` returns `(0 rows)` file-wide. Also surfaced: `ALTER TABLE
-… INHERIT` raises "would be inherited from more than once" where PG succeeds —
-confirmed NOT caused by this diff (it touches no inheritance-attach code).
+**Cause B (NOT fixed) is why the metric moved zero.** `internal/postmaster/
+dispatch.go` never applies `prepDef.paramTypes` as a coercion (arity check +
+`execParamTypeIncompatible` only), so `EXECUTE get_nnconstraint_info('{…}')` is
+still `(0 rows)` while the inline `ANY('{tbl}'::regclass[])` form now returns the
+row. Generic, not reg\*-specific (scalar `regclass` mis-binds identically).
+
+**Measurement:** `constraints` 1411 → **1411** lines, hunks 33 → **33**, all 15
+`get_nnconstraint_info` mentions still in open hunks. That is a **stacked root
+cause** — a third outcome shape beside Bucket 1's *unmasking* and Bucket 6's
+*bucket interference*. A flat number here does NOT mean the slice did nothing.
 **Never compare to a pre-2026-08-18 `constraints` number** (pre-C19 harness).
 
-**Files:** `internal/parser/ddl.go` (dispatch `:8892-8931`, `parseAlterConstraintAttrs`),
-`internal/parser/ast.go` (`AlterConstraintNoInherit` / `AlterConstraintHasInheritability`),
-`internal/parser/alter_constraint_test.go`, `internal/executor/operators_ddl.go`
-(`execAlterConstraintInheritability`, `resyncNotNullCatalogHeap`),
-`internal/executor/operators_ddl_alter_constraint_inherit_test.go`,
-`docs/design/0134-0005-constraints-sql-divergence.md` (§6 Bucket 6, §7 next),
-`docs/design/README.md`, `.ralph/fix_plan.md`, `.ralph/deferral_ledger.md` (2 rows).
+**Files:** `internal/executor/expr.go` (`evalCast` reg\*[] arm, `evalExprSlot`
+`regtype[]` guard), `internal/executor/reg_array_cast_test.go` (new),
+`docs/design/0134-0005-constraints-sql-divergence.md` (§7 new, §8 next slice),
+`docs/design/README.md`, `.ralph/fix_plan.md` (new sub-item M0134-0005a),
+`.ralph/deferral_ledger.md` (2 rows).
 
-**Next step:** stay on M0134-0005 and brief a **research pass on the
-`get_nnconstraint_info` → `(0 rows)` masking bug** — cheapest remaining and it
-unblocks the observability of several buckets at once (probe: run that PREPARE's
-`SELECT` body standalone against goopg; suspect `pg_constraint` contype='n' row
-population). Fallback: Bucket 3's NOT NULL inheritance-propagation gap
-(`operators_ddl.go:4748-4753`). Bucket 4 is the highest *value* but is
-milestone-sized (deferred UNIQUE checking) — research first, do not brief directly.
-**Do not brief Bucket 7** (root cause unpinned). Bucket 5 (GiST `circle_ops`) is a
-milestone.
+**Next step:** brief **M0134-0005a** — apply a PREPARE's declared parameter types
+as a real coercion at EXECUTE time in `internal/postmaster/dispatch.go`, mirroring
+`postgres/src/backend/commands/prepare.c:EvaluateParams` (`coerce_to_target_type`);
+probe numeric/interval/date for the same mis-binding; verify with `PREPARE
+gi(regclass[]) … EXECUTE gi('{notnull_tbl1}')` → 1 row, then re-measure. After
+that: Bucket 4 (deferred UNIQUE — milestone-sized, research first). Bucket 5
+(GiST `circle_ops`) is a milestone. **Do not brief Bucket 7** (root cause unpinned).
 
-**Gates run:** guard tests FAIL pre / PASS post (`TestAlterConstraintNotValidRejected`,
-`TestParseAlterConstraintInherit`, `TestAlterConstraintInheritabilityToggle` — coordinator
-re-ran all three post-handoff); `RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh` PASS (~9 min, warm cache); `scripts/tpch-spotcheck.sh`
-PASS (Q12=2, Q13=35 — executor change, Rule #1); `scripts/pg-regress-runner.sh
-constraints` re-measured 1411/33. No TPC-DS — DDL-only change.
+**Gates run:** `TestRegArrayCastResolvesElements` FAIL-pre (8/9) / PASS-post (9/9);
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS (7m49s; warm
+except cold `cmd/goopg` + `internal/initdb`); `scripts/tpch-spotcheck.sh` PASS
+(Q12=2, Q13=35 — executor change, Rule #1); `scripts/pg-regress-runner.sh
+constraints` re-measured 1411/33. No TPC-DS (cast-only, no row-shape impact).
 
-**Delegation:** `tmp/ralph-handoffs/m0134-0005-s05-alter-constraint-attrs/`
-(researcher `a9b46057165f682fd` 1 round → corrected the bucket premise; implementer
-`a7363c249ae5ee8c5` 1 round DONE; tester `ae4b501789c6f0bdb` 1 round, 3 gates).
+**Delegation:** `tmp/ralph-handoffs/m0134-0005-s06-nnconstraint-info-zero-rows/`
+(researcher `aba408b63734bed9c`, 1 round — pinned cause A, wrongly cleared the
+PREPARE path); `tmp/ralph-handoffs/m0134-0005-s07-regclass-array-cast/`
+(implementer `a2a9a205dbc6e1cb1`, 1 round NEEDS-DECISION → coordinator accepted
+option (a); tester `ae0f7459b162fe262`, 3 gates PASS).
 
 **In-flight:** none.

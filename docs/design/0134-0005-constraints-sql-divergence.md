@@ -1,8 +1,10 @@
-# M0134-0005 — `constraints.sql` divergence map + Buckets 1-3
+# M0134-0005 — `constraints.sql` divergence map + Buckets 1-3, 6, and the `reg*[]` cast
 
-Status: accepted — Buckets 1, 2 and 3 LANDED 2026-08-18; the case stays open (`[ ]`).
-Running measurement: 1496 (baseline) → 1515 (B1, unmasking) → 1465 (B2) → **1431** (B3,
-unmasking); hunks 30 → 30 → 31 → **33**.
+Status: accepted — Buckets 1, 2, 3 and 6 LANDED 2026-08-18, plus the `reg*[]` cast
+half of the `get_nnconstraint_info` masking bug (§7); the case stays open (`[ ]`).
+Running measurement: 1496 (baseline) → 1515 (B1, unmasking) → 1465 (B2) → 1431 (B3,
+unmasking) → 1411 (B6, bucket interference) → **1411** (§7, stacked root cause);
+hunks 30 → 30 → 31 → 33 → 33 → **33**.
 
 ## 1. Baseline (re-measured 2026-08-18)
 
@@ -243,16 +245,103 @@ partition-recursion story at all, so it is a milestone, not this slice. Ledgered
 along with the `get_nnconstraint_info` masking bug and the newly surfaced
 `would be inherited from more than once` divergence.
 
-## 7. Next slice for this case
+## 7. The `get_nnconstraint_info` `(0 rows)` masking bug — root cause pinned; `reg*[]` cast half LANDED (2026-08-18)
 
-**Bucket 4 is now the highest-value target**, promoted by this loop's measurement:
-its deferred-UNIQUE defect is what caps Bucket 6's *and* (contrary to that row's
-stated assumption) Bucket 2's remaining hunks. It is still milestone-sized —
-statement-level/deferred UNIQUE checking is a real executor feature — so it needs a
-research pass and its own decomposition, not a direct brief.
+The file-wide masking bug named at the end of §6 was diagnosed to a **silent
+wrong-answer bug in the cast evaluator**, not a catalog gap. The prepared
+statement under test (`postgres/src/test/regress/sql/constraints.sql:816-820`) is
 
-Cheaper alternatives, in order: the `get_nnconstraint_info` `(0 rows)` masking bug
-(file-wide; unblocks the *observability* of several buckets at once and is the single
-highest hunk-per-effort item if it is a shallow catalog-query gap); then Bucket 3's
-leftover NOT NULL inheritance-propagation gap. Bucket 5 (GiST `circle_ops`) is a
-milestone. **Bucket 7 still has no pinned root cause — do not brief from it.**
+```sql
+PREPARE get_nnconstraint_info(regclass[]) AS
+SELECT conrelid::regclass AS tabname, conname, convalidated, conislocal, coninhcount
+FROM pg_constraint WHERE conrelid = ANY($1)
+ORDER BY conrelid::regclass::text COLLATE "C", conname;
+```
+
+A six-step bisect against a live server (research handoff
+`m0134-0005-s06-nnconstraint-info-zero-rows`) **cleared** the obvious suspects:
+goopg's `pg_constraint` does carry the `contype='n'` rows, and `convalidated` /
+`conislocal` / `coninhcount` all match PG; `= ANY(...)` works; a plain `int[]`
+prepared parameter binds fine; the `ORDER BY … COLLATE "C"` drops nothing.
+
+**Root cause A (fixed here).** `evalCast` (`internal/executor/expr.go`) had **no
+case for any reg\*-array type**, so `'{notnull_tbl1}'::regclass[]` fell through to
+the function's terminal `return d, nil // pass-through for unknown types`. The array
+literal stayed raw text — `pg_typeof` reported `text`, `(…)[1]::oid` raised 22P02 —
+so every element comparison against an OID column silently evaluated **false**. No
+error, no rows. PG instead resolves each element through `regclassin`
+(`postgres/src/backend/utils/adt/regproc.c`) during `array_in`
+(`postgres/src/backend/utils/adt/arrayfuncs.c`).
+
+The fix adds one arm covering the whole family — `regclass[] regproc[]
+regprocedure[] regtype[] regrole[] regcollation[] regnamespace[] regdictionary[]` —
+shaped exactly like the existing `case "name[]":` precedent (`{…}` guard →
+`parseTextArray` → per-element transform → `formatTextArray`), resolving each
+element through **`regIdentifierInput`** (`internal/executor/reg_identifier.go`),
+which is the same resolver the heap/encode twin already uses. A resolution miss now
+raises the type's own undefined-object SQLSTATE (42P01 / 42704) instead of being
+swallowed. The stale comment in the scalar `case "regclass":` arm claiming the
+catalog is unreachable from `evalCast` predates that function's `ctx *Context`
+parameter and is simply wrong.
+
+One adjacent fix was forced: `evalExprSlot`'s pre-existing `TargetType ==
+"regtype[]"` special case (the *reverse* oidvector→name direction, used by
+`proargtypes::regtype[]`) treated **any** `KindString` as oidvector text via
+`strings.Fields`, so it intercepted a brace-delimited literal before the new arm
+could run. It now takes that branch only when the string does not begin with `{`.
+
+**Rule #2 sibling check: NEGATIVE.** The storage/encode twin
+`internal/executor/codec_array.go` (`encodeArrayElem`) already resolved reg\* array
+elements through `regIdentifierInput` with an identical `-`/numeric-first contract;
+`regnamespace`/`regdictionary` fall to its `default:` raw-text arm, which matches the
+new cast arm's outcome (those two types still have no name-resolution seam anywhere —
+a pre-existing documented exclusion, unchanged here).
+
+**Root cause B (NOT fixed — the reason the hunks stay open).** With A fixed, the
+*inline-literal* form works end to end (`conrelid = ANY('{notnull_tbl1}'::regclass[])`
+returns the `nn` row), but the regress file's actual `EXECUTE
+get_nnconstraint_info('{…}')` **still returns `(0 rows)`**. Reason:
+`internal/postmaster/dispatch.go` uses a PREPARE's declared parameter types
+(`prepDef.paramTypes`) only for an arity check and a coarse
+`execParamTypeIncompatible` gate — **it never applies them as a coercion to the bound
+value**. `PREPARE p(regclass) AS SELECT pg_typeof($1)` / `EXECUTE p('pg_class')`
+reports `unknown`, so this is a *generic* PREPARE/EXECUTE gap, not a reg\*-specific
+one, and it very likely mis-binds other types too (numeric/interval/date — unprobed).
+Fixing A first is nonetheless the right order: coerced parameters have to land on a
+working `reg*[]` cast to produce anything. Both halves are ledgered.
+
+**Measured effect: none, and that is the expected result.**
+`scripts/pg-regress-runner.sh constraints` 1411 → **1411** lines, hunks 33 → **33**,
+and all 15 `get_nnconstraint_info` mentions still sit inside open hunks. Because the
+regress file reaches the cast *only through* `EXECUTE`, root cause B gates the entire
+measurable upside of fixing A. This is a third distinct outcome shape for this case,
+alongside Bucket 1's *unmasking* (diff grew) and Bucket 6's *bucket interference*
+(hunks held open by an unrelated defect): a **stacked root cause**, where the fix is
+correct, verified, and a strict prerequisite, but invisible to the metric until the
+layer above it is also fixed. Do not read the flat number as "the slice did nothing"
+— read it as "B is next".
+
+**Also recorded, not fixed:** `SELECT '{notnull_tbl1}'::regclass[]` renders
+`{16406}` where PG renders `{notnull_tbl1}` (PG models regclass as an OID with a
+name-rendering *output* function). Matching that needs a new Datum kind or a
+wire-formatter change; the comparison semantics this slice was after do not depend
+on it.
+
+## 8. Next slice for this case
+
+**Take the PREPARE/EXECUTE declared-parameter-type coercion gap (§7 root cause B)
+next** — it is now the direct blocker for the `get_nnconstraint_info` hunks, its
+root cause is *pinned* (unlike Bucket 7's), and it is cross-cutting well beyond this
+regress file, so its value is not capped by bucket interference. Brief it against
+`internal/postmaster/dispatch.go`'s `prepDef.paramTypes` handling, and expect to
+probe non-reg\* types (numeric/interval/date) for the same mis-binding.
+
+**Bucket 4 remains the highest-value target for this file**: its deferred-UNIQUE
+defect is what caps Bucket 6's *and* (contrary to that row's stated assumption)
+Bucket 2's remaining hunks. It is still milestone-sized — statement-level/deferred
+UNIQUE checking is a real executor feature — so it needs a research pass and its own
+decomposition, not a direct brief.
+
+After those: Bucket 3's leftover NOT NULL inheritance-propagation gap. Bucket 5
+(GiST `circle_ops`) is a milestone. **Bucket 7 still has no pinned root cause — do
+not brief from it.**

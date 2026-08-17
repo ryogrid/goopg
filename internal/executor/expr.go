@@ -769,7 +769,16 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 			var oidParts []string
 			switch v.Kind {
 			case KindString:
-				oidParts = strings.Fields(v.StringValue())
+				sv := v.StringValue()
+				// A brace-delimited array LITERAL (name→OID direction, e.g.
+				// '{int4}'::regtype[]) is not an oidvector — it must fall
+				// through to evalCastTyped/evalCast's "regtype[]" arm below,
+				// which resolves each element via regIdentifierInput. Only
+				// genuine oidvector text (space-separated OIDs, no braces)
+				// takes this OID→name branch. M0134-0005 S07.
+				if len(sv) == 0 || sv[0] != '{' {
+					oidParts = strings.Fields(sv)
+				}
 			case KindInt:
 				oidParts = []string{fmt.Sprintf("%d", v.Int)}
 			}
@@ -3619,6 +3628,45 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			return NewStringDatum(formatTextArray(elems)), nil
 		}
 		return d, nil
+	case "regclass[]", "regproc[]", "regprocedure[]", "regtype[]", "regrole[]",
+		"regcollation[]", "regnamespace[]", "regdictionary[]":
+		// reg*[] cast: resolve each array-literal element to its OID via the
+		// SAME regIdentifierInput the scalar reg* casts (case "regclass" below
+		// delegates name→OID resolution to evalExprSlot's CastExpr arm, which
+		// calls the equivalent catalog lookups) and the heap encode path
+		// (codec_array.go's encodeArrayElem) already use — parseRegDashOrOid
+		// ("-"/numeric) first, then the per-type catalog lookup, propagating a
+		// miss as the type's own undefined-object SQLSTATE rather than
+		// swallowing it. Before this arm the switch had no case for any
+		// reg*-array type, so control fell through to the unknown-type
+		// pass-through at the end of this function and the literal stayed raw,
+		// unresolved text — every downstream `conrelid = ANY('{tbl}'::regclass[])`
+		// silently evaluated false instead of erroring or matching (M0134-0005
+		// S07; S06 diagnosis). Mirrors the "name[]" arm's shape immediately
+		// above (parseTextArray → per-element transform → formatTextArray).
+		// regnamespace/regdictionary have no name-resolution seam yet
+		// (reg_identifier.go's file-level comment) — they still pass through
+		// unresolved here, matching the scalar family's existing documented
+		// limitation, not a regression introduced by this arm.
+		s := d.StringValue()
+		if len(s) == 0 || s[0] != '{' || s[len(s)-1] != '}' {
+			return d, nil
+		}
+		elemType := strings.TrimSuffix(strings.ToLower(targetType), "[]")
+		elems := parseTextArray(s)
+		resolved := make([]string, len(elems))
+		for i, e := range elems {
+			rd, err := regIdentifierInput(NewStringDatum(e), elemType, ctx, pos)
+			if err != nil {
+				return Datum{}, err
+			}
+			if rd.Kind == KindInt {
+				resolved[i] = strconv.FormatInt(rd.Int, 10)
+			} else {
+				resolved[i] = rd.StringValue()
+			}
+		}
+		return NewStringDatum(formatTextArray(resolved)), nil
 	case "bytea":
 		// byteain (postgres/src/backend/utils/adt/varlena.c). An unknown-type
 		// literal and an explicitly-typed text value both reach this arm as
