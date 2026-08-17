@@ -1,10 +1,11 @@
-# M0134-0005 — `constraints.sql` divergence map + Buckets 1-3, 6, and the `reg*[]` cast
+# M0134-0005 — `constraints.sql` divergence map + Buckets 1-3, 6, and the PREPARE/EXECUTE parameter path
 
-Status: accepted — Buckets 1, 2, 3 and 6 LANDED 2026-08-18, plus the `reg*[]` cast
-half of the `get_nnconstraint_info` masking bug (§7); the case stays open (`[ ]`).
+Status: accepted — Buckets 1, 2, 3 and 6 LANDED 2026-08-18, plus BOTH halves of the
+`get_nnconstraint_info` masking bug: the `reg*[]` cast (§7) and the declared-
+parameter-type coercion at `EXECUTE` (§8); the case stays open (`[ ]`).
 Running measurement: 1496 (baseline) → 1515 (B1, unmasking) → 1465 (B2) → 1431 (B3,
-unmasking) → 1411 (B6, bucket interference) → **1411** (§7, stacked root cause);
-hunks 30 → 30 → 31 → 33 → 33 → **33**.
+unmasking) → 1411 (B6, bucket interference) → 1411 (§7, stacked root cause) →
+**1376** (§8, the stack's upper half); hunks 30 → 30 → 31 → 33 → 33 → 33 → **34**.
 
 ## 1. Baseline (re-measured 2026-08-18)
 
@@ -327,16 +328,63 @@ name-rendering *output* function). Matching that needs a new Datum kind or a
 wire-formatter change; the comparison semantics this slice was after do not depend
 on it.
 
-## 8. Next slice for this case
+## 8. Root cause B — declared-parameter-type coercion at `EXECUTE` (LANDED 2026-08-18)
 
-**Take the PREPARE/EXECUTE declared-parameter-type coercion gap (§7 root cause B)
-next** — it is now the direct blocker for the `get_nnconstraint_info` hunks, its
-root cause is *pinned* (unlike Bucket 7's), and it is cross-cutting well beyond this
-regress file, so its value is not capped by bucket interference. Brief it against
-`internal/postmaster/dispatch.go`'s `prepDef.paramTypes` handling, and expect to
-probe non-reg\* types (numeric/interval/date) for the same mis-binding.
+§7's stacked root cause B is now fixed, and the metric moved: `constraints`
+**1411 → 1376 lines** (−35), hunks 33 → **34** (+1 — a fixed region split one open
+hunk in two, the same *unmasking* shape Bucket 1 produced), `get_nnconstraint_info`
+mentions 15 → **14**, and the remaining 14 are unified-diff *context* lines (the
+literal `PREPARE`/`EXECUTE` statement text, byte-identical on both sides) rather
+than divergences of their own — what still differs is the surrounding result-row /
+NOTICE / ERROR text. This is the empirical confirmation of §7's claim that A was a
+correct, strictly-prerequisite fix whose upside was gated by B.
 
-**Bucket 4 remains the highest-value target for this file**: its deferred-UNIQUE
+**What PG does.** `postgres/src/backend/commands/prepare.c:EvaluateParams` runs
+`coerce_to_target_type(..., COERCION_ASSIGNMENT, COERCE_IMPLICIT_CAST, -1)` over
+every supplied argument against `pstmt->argtypes[i]` before execution. goopg had
+only the *validation* half of that (arity check + `execParamTypeIncompatible`,
+which emits PG's exact 42804 wording) and then bound the raw literal datum — so a
+`regclass[]` argument stayed `KindString` and every OID comparison in the plan
+evaluated false, silently, with no error.
+
+**What landed.** A thin exported wrapper `executor.CoerceParamToDeclaredType`
+(`internal/executor/expr.go`, beside `evalCast`) normalises the declared spelling
+(quotes stripped, lower-cased, typmod parenthesis dropped, trailing `[]` kept) and
+delegates to `evalCast`. Both dispatch sites call it (Hard-won Rule #2 — they are a
+sibling pair and were both blind): the `*parser.ExecuteStmt` branch and the
+`CREATE TABLE … AS EXECUTE` branch of
+`internal/postmaster/dispatch.go:dispatchSimpleQueryViaExecutor`. Cast failures
+surface with the cast's own SQLSTATE (42P01 for an unresolvable relation name)
+instead of a silent wrong answer.
+
+**Design deviation worth remembering.** Scalar (non-array) `reg*` targets are
+resolved *inside the wrapper* via `regIdentifierInput`, **not** by widening
+`evalCast`'s own `regclass` case. `evalCast`'s `case "regclass"` is deliberately a
+`KindInt`-only pass-through: real scalar `'name'::regclass` resolution lives inline
+in `evalExprSlot`'s `*optimizer.CastExpr` arm and in `evalFuncCall`'s reg\* arm,
+neither of which a bound EXECUTE parameter ever traverses (the parameter value never
+becomes a CastExpr/FuncCall AST node). Widening `evalCast` was tried and reverted —
+it regressed `TestRegCastToStringRendersName`, whose fixture deliberately makes
+system tables un-resolvable by name and pins `'pg_type'::regclass::text` to the old
+silent pass-through. Keeping the resolution in the wrapper leaves every other
+`evalCast` caller byte-identical.
+
+**Still open after this slice** (both ledgered):
+- `pg_typeof($1)` reports `unknown` for **every** bound EXECUTE parameter, of any
+  type. `internal/optimizer/planner.go`'s `resolveExpr`/`resolveExprAfterAggregate`
+  fold `pg_typeof(<arg>)` to a `StringConst` at *plan* time via
+  `pgTypeofDisplayName(exprType(arg))`; `exprType` has no `*ParamRef` case and
+  `optimizer.ParamRef` carries no `Type` field, so it falls through to `unknown`,
+  and `evalFuncCall`'s runtime `pg_typeof` case is dead code for `$N`. This is a
+  static-typing/display gap, not a value-correctness gap — the coercion above was
+  verified with `WHERE oid = $1` probes instead.
+- `regnamespace`/`regdictionary`/`regoper`/`regoperator`/`regconfig` parameters
+  still do not resolve (no name-resolution seam), matching the reg\*[] array arm's
+  own caveat at `expr.go:3687-3689`.
+
+## 9. Next slice for this case
+
+**Bucket 4 is now the highest-value target for this file**: its deferred-UNIQUE
 defect is what caps Bucket 6's *and* (contrary to that row's stated assumption)
 Bucket 2's remaining hunks. It is still milestone-sized — statement-level/deferred
 UNIQUE checking is a real executor feature — so it needs a research pass and its own

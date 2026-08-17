@@ -766,6 +766,24 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 								libpq.ErrorField{Code: libpq.FieldHint, Value: "You will need to rewrite or cast the expression."})
 						}
 					}
+					// Coerce each argument to the declared parameter type, mirroring
+					// PG's EvaluateParams (prepare.c). Without this, the raw literal
+					// datum reaches the plan un-cast (e.g. a regclass[] arg stays
+					// KindString), so OID comparisons silently evaluate false.
+					// M0134-0005.
+					for idx := range params {
+						if idx >= len(prepDef.paramTypes) {
+							break
+						}
+						coerced, cerr := executor.CoerceParamToDeclaredType(params[idx], prepDef.paramTypes[idx], ectx)
+						if cerr != nil {
+							if _, ok := cerr.(*executor.ExecError); ok {
+								return s.writeQueryError(w, execErrCode(cerr), execErrMsg(cerr), execErrDetailFields(cerr)...)
+							}
+							return s.writeQueryError(w, errcodes.SyntaxError, cerr.Error())
+						}
+						params[idx] = coerced
+					}
 					stmt = prepDef.stmt
 					ectx.Params = params
 					disablePlanCache = true
@@ -807,6 +825,21 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 						return s.writeQueryError(w, execErrCode(err), execErrMsg(err), execErrDetailFields(err)...)
 					}
 					return s.writeQueryError(w, errcodes.SyntaxError, err.Error())
+				}
+				// Sibling of the *parser.ExecuteStmt branch above: coerce each
+				// argument to the declared parameter type. M0134-0005.
+				for idx := range params {
+					if idx >= len(prepDef.paramTypes) {
+						break
+					}
+					coerced, cerr := executor.CoerceParamToDeclaredType(params[idx], prepDef.paramTypes[idx], ectx)
+					if cerr != nil {
+						if _, ok := cerr.(*executor.ExecError); ok {
+							return s.writeQueryError(w, execErrCode(cerr), execErrMsg(cerr), execErrDetailFields(cerr)...)
+						}
+						return s.writeQueryError(w, errcodes.SyntaxError, cerr.Error())
+					}
+					params[idx] = coerced
 				}
 				ectx.Params = params
 				disablePlanCache = true

@@ -3466,6 +3466,65 @@ func formatDatumDateStyle(d Datum, ctx *Context) string {
 	return formatTimeDatumDateStyle(d, style, order, timeZoneFromCtx(ctx))
 }
 
+// CoerceParamToDeclaredType applies the declared parameter type from a SQL
+// PREPARE/EXECUTE to a supplied argument, mirroring
+// postgres/src/backend/commands/prepare.c:EvaluateParams, which runs
+// coerce_to_target_type(..., COERCION_ASSIGNMENT, COERCE_IMPLICIT_CAST, -1)
+// over every supplied expression against pstmt->argtypes[i]. Without this,
+// goopg only validated argument compatibility (execParamTypeIncompatible)
+// and then bound the raw literal datum, so e.g. a regclass[] parameter kept
+// its KindString and every OID comparison in the plan silently evaluated
+// false. targetType is normalised here (quotes stripped, lower-cased,
+// typmod parenthesis dropped, trailing "[]" kept) so callers may pass the
+// declared spelling straight from parser.PrepareStmt.ParamTypes or
+// normPrepParamType's output — this function is a thin wrapper and delegates
+// all actual coercion to evalCast; it must not duplicate cast logic.
+//
+// One exception: a scalar (non-array) reg* target — e.g. `PREPARE
+// t(regclass) AS ...; EXECUTE t('tbl')` — is resolved directly via
+// regIdentifierInput (the same shared primitive evalCast's reg*[] array
+// arm already calls per-element) rather than through evalCast. evalCast's
+// own "regclass" case is deliberately a KindInt-only pass-through for
+// KindString (see its comment): scalar `'name'::regclass` name→OID
+// resolution normally happens inline in evalExprSlot's *optimizer.CastExpr
+// arm (which is catalog/dbOid-aware) or evalFuncCall's reg* arm — neither
+// of which a bound EXECUTE parameter ever passes through, since the
+// parameter value never becomes a CastExpr/FuncCall AST node. Resolving it
+// here (not by widening evalCast's own regclass case) keeps every other
+// evalCast caller's existing regclass behavior byte-identical — widening
+// evalCast's case regressed TestRegCastToStringRendersName's pinned
+// bare-catalog literals (a test fixture where system tables are
+// deliberately not name-resolvable, discovered and reverted during
+// M0134-0005a). M0134-0005a.
+func CoerceParamToDeclaredType(d Datum, targetType string, ctx *Context) (Datum, error) {
+	if targetType == "" || d.IsNull() {
+		return d, nil
+	}
+	t := strings.TrimSpace(targetType)
+	t = strings.Trim(t, `"`)
+	t = strings.ToLower(t)
+	isArray := strings.HasSuffix(t, "[]")
+	if isArray {
+		t = strings.TrimSuffix(t, "[]")
+	}
+	// Drop a typmod parenthesis, e.g. "varchar(10)" -> "varchar",
+	// "numeric(10,2)" -> "numeric". evalCast dispatches on the bare type
+	// name; typmod-specific range/precision enforcement is out of scope
+	// for parameter coercion (matches EvaluateParams, which coerces
+	// against the type OID, not the typmod, for this path).
+	if i := strings.IndexByte(t, '('); i >= 0 {
+		t = t[:i]
+	}
+	t = strings.TrimSpace(t)
+	if !isArray && d.Kind == KindString && ctx != nil && isRegIdentifierTypeName(t) {
+		return regIdentifierInput(d, t, ctx, 0)
+	}
+	if isArray {
+		t += "[]"
+	}
+	return evalCast(d, t, 0, ctx)
+}
+
 // evalCast coerces datum d to the declared SQL type name.
 // Handles: string→bool, bool→text, int→text, int→int2 (range check),
 // string→int2/4/8 (via parseIntegerInput). Pass-through for unknown types.
