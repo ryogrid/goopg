@@ -1121,19 +1121,52 @@ repro at HEAD first; the log reflects the last nightly and may be stale).
       `go test -v -run '^TestE2E_PGCrashStartOnGoopgDataDir$' ./internal/testport/`.
       Evidence: `ci/logs/20260817-011734/testport/go-test.log`. Same
       previously-unattributable set as -002; likely shares a root cause with it.
-- [ ] **testport/TestPort_IsolationIndexOnlyBitmapscan (AI-20260817-011734-004)** —
-      FAILed (new tonight). Repro:
-      `go test -v -run '^TestPort_IsolationIndexOnlyBitmapscan$' ./internal/testport/`.
-      Evidence: `ci/logs/20260817-011734/testport/go-test.log`. Also from the
-      previously-unattributable set.
-- [ ] **testport/TestPort_PgoutputInteropPGToGoopgBpcharPadding
-      (AI-20260817-011734-005)** — FAILed (new tonight). Repro:
-      `go test -v -run '^TestPort_PgoutputInteropPGToGoopgBpcharPadding$' ./internal/testport/`.
+- [x] **testport/TestPort_IsolationIndexOnlyBitmapscan (AI-20260817-011734-004)** —
+      **STALE, closed 2026-08-17 with no code change.** Re-run at HEAD `574b2d69`
+      (i.e. after the range-index DML fix `6536bdf5` that closed -002/-003):
+      **PASS** in 3.66 s — `isolation_port_test.go:1597: PASS:
+      postgres/src/test/isolation/specs/index-only-bitmapscan.spec`. Closed per
+      the M-NIGHTLY selection rule step 1 (re-run the repro at HEAD first; the
+      nightly log predates the fix). It was in the previously-unattributable set
+      behind AI-20260816-005117-003, and its failure is consistent with the same
+      range-index DML over-match root cause as -002/-003.
+      Evidence: `ci/logs/20260817-011734/testport/go-test.log`.
+- [x] **testport/TestPort_PgoutputInteropPGToGoopgBpcharPadding
+      (AI-20260817-011734-005)** — FIXED 2026-08-17. **Test-harness race, NOT an
+      engine bug.** The test does 4 INSERTs then `UPDATE ... SET filler='new'
+      WHERE id=1`, but `PubSubCluster.WaitForRow`
+      (`internal/testutil/pubsubcluster/cluster.go`) gates only on `count(*)`,
+      which the INSERTs already satisfy — so the assertion deterministically
+      sampled the pre-UPDATE value (`length=2` for `'ab'`, want `3`). Proven by a
+      throwaway timing probe: with a 5 s wait the value is `3` and stays `3`
+      across 10 s of polling, the row never disappears, and the apply worker logs
+      no error; the bpchar codec path (`parsePgoutputText` →
+      `coerceTextLikeDatum`) was audited against `varchar.c`
+      (`bpcharin`/`bpcharlen`) and is correct — a bpchar branch there would have
+      been a no-op "fix". Fix: new `PubSubCluster.WaitForScalar` (polls an
+      arbitrary scalar query, reports the last-observed value on timeout) + its
+      unit test, used to wait for the UPDATE before the existing assertions, which
+      are unchanged. Swept every other `WaitForRow` caller in
+      `pgoutput_interop_test.go` for the same latent pattern — no other hit.
+      Gates: `go build ./...`, `internal/testutil/pubsubcluster`, the test 3/3
+      PASS, `RALPH_PRECOMMIT_SCOPE=units`. Ledger row 2026-08-17: the harness
+      still has no apply-position (LSN) `wait_for_catchup` primitive.
       Evidence: `ci/logs/20260817-011734/testport/go-test.log`.
 - [ ] **testport/TestPort_RegressWedgeProbeNamesTheStuckStatement
       (AI-20260817-011734-006)** — FAILed (new tonight). Repro:
       `go test -v -run '^TestPort_RegressWedgeProbeNamesTheStuckStatement$' ./internal/testport/`.
       Evidence: `ci/logs/20260817-011734/testport/go-test.log`.
+      **TRIAGED 2026-08-17 (still reproduces at HEAD `574b2d69`, 3.86 s) — a bug
+      in the wedge-probe TOOLING, not in the engine.** The probe's own self-test
+      (`case=probe_selftest`) correctly captured `pg_stat_activity` (the induced
+      `SELECT pg_sleep(30), 'goopg_wedge_probe_marker'` backend shows `active`)
+      and the server's RSS/log tail, then failed at
+      `regress_wedge_probe_guard_test.go:94`: `goroutine dump has no goopg server
+      frames (wrong process?)` — the captured dump is the **test harness's own**
+      Go runtime stack (bare `runtime/pprof.writeGoroutineStacks` frames), so the
+      probe's goroutine-dump collector is reading the wrong process/endpoint.
+      Next step: find where the probe requests the goroutine dump and point it at
+      the goopg server subprocess instead of `runtime/pprof` in-process.
 
 Non-blocking notice (no task): 17 `TestPort_Psql*`/`TestPort_Scripts*`/
 `TestPort_Pgbench*` cases newly SKIPPED vs the previous run — env-drift, expected

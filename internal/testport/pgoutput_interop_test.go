@@ -2855,6 +2855,12 @@ func TestPort_PgoutputInteropPGToGoopgBpcharPadding(t *testing.T) {
 	// below catch a stuck apply worker independently.
 	psc.WaitForRow(t, "public.bpchar_log", "id IN (1, 2, 3, 4)", 4, 60*time.Second)
 
+	// WaitForRow above only gates on count(*), which the four INSERTs
+	// already satisfy — it cannot observe the trailing UPDATE (it
+	// doesn't change the row count), so wait separately for that value
+	// to land before asserting on it below.
+	psc.WaitForScalar(t, "SELECT length(filler) FROM public.bpchar_log WHERE id = 1", "3", 60*time.Second)
+
 	// count(*) = 4: all four INSERTs landed.
 	if got := psc.Subscriber.QueryScalar(t, "SELECT count(*) FROM public.bpchar_log"); got != "4" {
 		t.Fatalf("subscriber count(*) = %s, want 4", got)

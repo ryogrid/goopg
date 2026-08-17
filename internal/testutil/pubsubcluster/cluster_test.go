@@ -187,6 +187,53 @@ func indexBytes(b []byte, s string) int {
 	return -1
 }
 
+// fakeScalarPeer is a minimal ReplPeer stub used to unit-test
+// WaitForScalar without spinning up a real publisher/subscriber pair.
+// Only QueryScalar is exercised; every other method is an unused stub.
+type fakeScalarPeer struct {
+	values []string // successive QueryScalar results, last one repeats once exhausted
+	calls  int
+}
+
+func (f *fakeScalarPeer) Kind() ClusterKind { return ClusterKindGoopg }
+func (f *fakeScalarPeer) Host() string      { return "" }
+func (f *fakeScalarPeer) Port() int         { return 0 }
+func (f *fakeScalarPeer) User() string      { return "" }
+func (f *fakeScalarPeer) Database() string  { return "" }
+
+func (f *fakeScalarPeer) Conninfo(applicationName string) string { return "" }
+
+func (f *fakeScalarPeer) Start() error { return nil }
+func (f *fakeScalarPeer) Stop() error  { return nil }
+func (f *fakeScalarPeer) Kill() error  { return nil }
+
+func (f *fakeScalarPeer) Exec(t *testing.T, sql string) {}
+
+func (f *fakeScalarPeer) Pgbench(t *testing.T, args ...string) string { return "" }
+
+func (f *fakeScalarPeer) QueryScalar(t *testing.T, sql string) string {
+	idx := f.calls
+	if idx >= len(f.values) {
+		idx = len(f.values) - 1
+	}
+	f.calls++
+	return f.values[idx]
+}
+
+// TestWaitForScalarSuccess pins the success path: WaitForScalar must
+// return once the polled value matches `want`, without waiting out the
+// full timeout. This is the shape the bpchar-padding regression needed
+// — a value change (UPDATE) that WaitForRow's count(*) polling cannot
+// observe.
+func TestWaitForScalarSuccess(t *testing.T) {
+	peer := &fakeScalarPeer{values: []string{"2", "2", "3"}}
+	psc := &PubSubCluster{Subscriber: peer}
+	psc.WaitForScalar(t, "SELECT length(filler) FROM t WHERE id = 1", "3", 5*time.Second)
+	if peer.calls < 3 {
+		t.Fatalf("expected WaitForScalar to poll until the value changed, got %d calls", peer.calls)
+	}
+}
+
 func repoRoot(t *testing.T) string {
 	t.Helper()
 	wd, err := os.Getwd()
