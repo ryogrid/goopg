@@ -1,59 +1,60 @@
-# Working set — M0134-0005 Bucket 1 landed; case still open, Buckets 2/3 are next
+# Working set — M0134-0005 Bucket 2 landed; case still open, Bucket 3 is next
 
-**Task:** M0134-0005 (`constraints.sql`) — **Bucket 1 LANDED 2026-08-18**
-(commit `8edbf9ee`); the case stays `[ ]`. Selected per the Current Priority
+**Task:** M0134-0005 (`constraints.sql`) — **Bucket 2 LANDED 2026-08-18**
+(commit `30855a6b`); the case stays `[ ]`. Selected per the Current Priority
 banner (M0134 next after M-NIGHTLY). M-NIGHTLY drained: `ci/logs/action-items.md`
 is still run `20260817-011734`, all 6 filed and `[x]` — nothing new to file.
 
-**What landed.** `PREPARE p (regclass[])` returned a false `42704 type
-"regclass[]" does not exist`, and every following EXECUTE then reported
-`prepared statement "get_nnconstraint_info" does not exist` — 13 of 30 hunks,
-the only cascade in the file. `isValidSQLTypeName`
-(`internal/postmaster/dispatch.go:2038`, called from `:700`) was a hand-written
-allowlist of **bare** built-in names. It now rejects unbalanced parens, strips
-balanced `( … )` typmod groups wherever they appear (`timestamp(3) with time
-zone`), strips trailing `[]`/`[N]` array suffixes (non-numeric subscript =
-reject, not strip), then matches an **additively** extended allowlist (`reg*`
-family, `bit`/`varbit`, `inet`/`cidr`/`macaddr`/`macaddr8`, `money`, `xml`,
-`tsvector`, `tsquery`, `jsonpath`, `int2vector`, `oidvector`, `pg_snapshot`,
-`"char"`, `character`/`character varying`). Signature and call site unchanged.
+**What landed.** `checkConstraints` (`internal/executor/operators_fk.go:1664`)
+looped `tbl.CheckConstraints` unconditionally and never consulted
+`tbl.NamedChecks[i].NotEnforced`, so a `NOT ENFORCED` CHECK still raised 23514 on
+rows PG accepts. Six-line fix: `continue` when the aligned `NamedChecks` entry is
+`NotEnforced` (bounds-checked). PG: `execMain.c:ExecRelCheck:1813-1815`.
 
-**Read this before re-measuring.** Cascade 13 → **0**, but the diff *grew*
-1496 → **1515** lines (30 hunks both sides). That is an **unmasking** fix —
-statements that used to abort on one error line now execute and emit real,
-still-wrong result sets. Diff line count is NOT this case's metric of record.
-Both numbers are post-C19 harness fix; **never compare to a pre-2026-08-18
-`constraints` number**.
+**Three facts the research pass settled (don't re-derive).** (1) `NotEnforced` is
+already parsed/stored for both CREATE TABLE and ALTER TABLE ADD CONSTRAINT, and
+the ADD-CONSTRAINT initial scan (`operators_ddl.go:8093`) + VALIDATE CONSTRAINT
+(`:8037`) already honour it. (2) `CheckConstraints` and `NamedChecks` are
+index-aligned 1:1 by construction — single fan-in `catalog.AddCheckFull`
+(`internal/catalog/catalog.go:288`). (3) `checkConstraints` is the ONLY runtime
+enforcement site: INSERT/COPY (`operators_storage.go:2494`) and UPDATE
+(`checkRowConstraintsForWrite`, `operators_fk.go:1830`) both route through it —
+no sibling edit needed (Rule #2 verified, not assumed). Domain checks are a
+separate path (`checkDomainConstraintsForRow`), out of scope.
 
-**Files:** `internal/postmaster/dispatch.go`,
-`internal/postmaster/prepare_param_type_test.go` (new, `TestIsValidSQLTypeName`),
-`docs/design/0134-0005-constraints-sql-divergence.md` (new — full 7-bucket map),
-`docs/design/README.md`, `.ralph/fix_plan.md`, `.ralph/deferral_ledger.md`
-(3 rows 2026-08-18).
+**Measurement.** `constraints` diff 1515 → **1465** lines, hunks 30 → 31 (one
+surviving hunk split, NOT new divergence). `NE_CHECK_TBL`/`NE_INSERT_TBL_CON`
+gone. A plain shrink, unlike Bucket 1's unmasking. **Never compare to a
+pre-2026-08-18 `constraints` number** (pre-C19 harness).
 
-**Next step:** stay on M0134-0005 and brief **Bucket 2** — `NOT ENFORCED` CHECK
-constraints are still enforced on INSERT; `internal/executor/operators_fk.go:1664`
-`checkConstraints` loops `tbl.CheckConstraints` unconditionally and never consults
-`tbl.NamedChecks[i].NotEnforced` (PG skips `conenforced=false`). Bucket 3
-(`DROP`/`RENAME CONSTRAINT` can't resolve a NOT NULL constraint by name,
-`operators_ddl.go:10719`) is equally bounded but **must first confirm whether
-`execAlterTableRenameConstraint` shares the omission** — sibling pair, Hard-won
-Rule #2. **Do not brief Bucket 7** (float8 DEFAULT truncation / `a_expr`-vs-`b_expr`
-DEFAULT grammar / `currval()` default ordering): root cause unpinned, needs a
-research pass on the missing-column catalog-default *fill* path. Buckets 4
-(deferred statement-level UNIQUE) and 5 (GiST `circle_ops`) are milestone-sized.
+**Files:** `internal/executor/operators_fk.go`,
+`internal/executor/operators_fk_check_notenforced_skip_test.go` (new,
+`TestCheckConstraintNotEnforcedSkipsRuntimeEvaluation`),
+`docs/design/0134-0005-constraints-sql-divergence.md` (§4 Bucket 2),
+`docs/design/README.md`, `.ralph/fix_plan.md`, `.ralph/deferral_ledger.md` (1 row).
 
-**Gates run:** `go test ./internal/postmaster/` PASS; `TestIsValidSQLTypeName`
-re-run by coordinator pre-commit PASS; `RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh` PASS; `scripts/pg-regress-runner.sh constraints`
-re-measured by coordinator at the committed tree (1515/30, cascade 0); pre-commit
-pgbench smoke PASS (TPC-B 338 tps, simple update 635 tps, select-only 12.8k tps).
-No TPC-H/TPC-DS — no planner/executor/codec change.
+**Next step:** stay on M0134-0005 and brief **Bucket 3** — `ALTER TABLE DROP
+CONSTRAINT` can't resolve a NOT NULL constraint by name
+(`internal/executor/operators_ddl.go:10719` checks NamedChecks/FK/UNIQUE/EXCLUDE/PK
+but never `tbl.NotNullConstraints`; PG `tablecmds.c:dropconstraint_internal`
+handles `CONSTR_NOTNULL`). **First confirm whether `execAlterTableRenameConstraint`
+shares the omission** — sibling pair, Hard-won Rule #2; the design doc flags it as
+assumed-by-pattern, not read. Bucket 6 (`ALTER CONSTRAINT … NOT VALID/INHERIT/NO
+INHERIT` unparsed) is the next-smallest after that. **Do not brief Bucket 7**
+(root cause unpinned — needs research on the missing-column catalog-default *fill*
+path). Buckets 4 (deferred statement-level UNIQUE) and 5 (GiST `circle_ops`) are
+milestone-sized. New ledger item: `NOT ENFORCED` on **UNIQUE** constraints
+(`UNIQUE_NOTEN_TBL`) — parser + index-maintenance path, not `checkConstraints`.
 
-**Delegation:** `tmp/ralph-handoffs/m0134-0005-s01-measure/` (researcher
-`a060c437efcb7b08d`, 1 round — produced the 7-bucket map, now durable in the
-design doc); `tmp/ralph-handoffs/m0134-0005-s02-prepare-typenames/`
-(implementer `a73212e2ab0f16dde`, 1 round, reported NEEDS-DECISION purely because
-the diff grew — coordinator resolved it as unmasking after re-measuring).
+**Gates run:** guard test FAIL pre / PASS post; `go test ./internal/executor/`
+and `./internal/catalog/` PASS; `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh` PASS (~9 min); `scripts/tpch-spotcheck.sh` PASS
+(Q12=2, Q13=35 — executor change, Rule #1); `scripts/pg-regress-runner.sh
+constraints` re-measured 1465/31; pre-commit pgbench smoke PASS (select-only
+12.8k tps). No TPC-DS — write-path-only constraint change.
+
+**Delegation:** `tmp/ralph-handoffs/m0134-0005-s03-not-enforced-check/`
+(researcher `a4171ab8654e1a662` 1 round → the three facts above; implementer
+`ad24ea1b0e8fdeaa3` 1 round DONE; tester `a40d42e7d76325875` 1 round, 4 gates).
 
 **In-flight:** none.
