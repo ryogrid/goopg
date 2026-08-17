@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/storage/lmgr"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -29,7 +29,7 @@ func TestAttachPartitionLocksDefaultPartition(t *testing.T) {
 
 	// Explicit-transaction backend so acquireDDLLockTxn takes a real lock held
 	// to end-of-transaction (it is a no-op when TxnLockBackendID==0, autocommit).
-	const backend lockmgr.BackendID = 91003
+	const backend lmgr.BackendID = 91003
 	ctx.TxnLockBackendID = backend
 	defer tableLockMgr.ReleaseAll(backend)
 
@@ -62,7 +62,7 @@ func TestAttachPartitionLocksDefaultPartition(t *testing.T) {
 
 	held := make(map[uint32]bool)
 	for _, h := range tableLockMgr.AllLocks() {
-		if h.Backend == backend && h.Granted && h.Mode == lockmgr.AccessExclusiveLock &&
+		if h.Backend == backend && h.Granted && h.Mode == lmgr.AccessExclusiveLock &&
 			h.Tag.Block == 0 && h.Tag.Offset == 0 {
 			held[h.Tag.Rel] = true
 		}
@@ -85,7 +85,7 @@ func TestAttachPartitionNoDefaultNoLock(t *testing.T) {
 	ctx, cat, cleanup := newDDLFixture(t)
 	defer cleanup()
 
-	const backend lockmgr.BackendID = 91004
+	const backend lmgr.BackendID = 91004
 	ctx.TxnLockBackendID = backend
 	defer tableLockMgr.ReleaseAll(backend)
 
@@ -111,7 +111,7 @@ func TestAttachPartitionNoDefaultNoLock(t *testing.T) {
 	}
 
 	for _, h := range tableLockMgr.AllLocks() {
-		if h.Backend == backend && h.Granted && h.Mode == lockmgr.AccessExclusiveLock &&
+		if h.Backend == backend && h.Granted && h.Mode == lmgr.AccessExclusiveLock &&
 			h.Tag.Rel == sibOID && h.Tag.Block == 0 && h.Tag.Offset == 0 {
 			t.Errorf("ATTACH with no default partition wrongly AccessExclusive-locked sibling tpb_1 (oid %d)", sibOID)
 		}
@@ -169,7 +169,7 @@ func TestAttachPartitionDeferredUntilCommit(t *testing.T) {
 	sess := NewBasicSession()
 	sess.BeginExplicitTransaction(ctx.Tx, ctx.Snap)
 	ctx.Session = sess
-	const backend lockmgr.BackendID = 91005
+	const backend lmgr.BackendID = 91005
 	ctx.TxnLockBackendID = backend
 	defer tableLockMgr.ReleaseAll(backend)
 

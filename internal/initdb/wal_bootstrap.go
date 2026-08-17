@@ -20,7 +20,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 const (
@@ -48,33 +48,33 @@ const (
 // long page header and the XLOG_CHECKPOINT_SHUTDOWN record.
 // Must be called before writePgControl.
 func WriteBootstrapWAL(dataDir string, sysID uint64, now time.Time) error {
-	name := wal.XLogFileName(walBootstrapTLI, walBootstrapSegNo, wal.DefaultSegmentSize)
+	name := xlog.XLogFileName(walBootstrapTLI, walBootstrapSegNo, xlog.DefaultSegmentSize)
 	segPath := filepath.Join(dataDir, "pg_wal", name)
 
 	// Allocate one 8 KiB page; only this page carries data.
 	// The segment's remaining bytes (wal_segment_size - XLOG_BLCKSZ) are
 	// zero-filled via Truncate, matching XLogFileInit's pre-zero allocation.
-	page := make([]byte, wal.XLOGBlockSize)
+	page := make([]byte, xlog.XLOGBlockSize)
 
 	// -- Long page header (bytes 0..39) --
 	//
 	// xlp_pageaddr = wal_segment_size (0x01000000): absolute byte position
 	// of this page in the WAL stream.  Segment 1 page 0 starts at byte
 	// 1 * wal_segment_size.
-	pageAddr := uint64(wal.DefaultSegmentSize) // 0x01000000
-	lph := wal.XLogLongPageHeader{
-		Std: wal.XLogPageHeader{
-			Magic:    wal.XLOGPageMagic, // 0xD118
+	pageAddr := uint64(xlog.DefaultSegmentSize) // 0x01000000
+	lph := xlog.XLogLongPageHeader{
+		Std: xlog.XLogPageHeader{
+			Magic:    xlog.XLOGPageMagic, // 0xD118
 			Info:     0,                 // EncodeXLogLongPageHeader adds XLPLongHeader
 			TLI:      walBootstrapTLI,   // 1
 			PageAddr: pageAddr,
 			RemLen:   0, // no continuation record
 		},
 		SysID:      sysID,
-		SegSize:    uint32(wal.DefaultSegmentSize), // 16 MiB
-		XLogBlcksz: uint32(wal.XLOGBlockSize),      // 8192
+		SegSize:    uint32(xlog.DefaultSegmentSize), // 16 MiB
+		XLogBlcksz: uint32(xlog.XLOGBlockSize),      // 8192
 	}
-	if err := wal.EncodeXLogLongPageHeader(page[:wal.SizeOfXLogLongPHD], lph); err != nil {
+	if err := xlog.EncodeXLogLongPageHeader(page[:xlog.SizeOfXLogLongPHD], lph); err != nil {
 		return fmt.Errorf("wal bootstrap: long page header: %w", err)
 	}
 
@@ -92,18 +92,18 @@ func WriteBootstrapWAL(dataDir string, sysID uint64, now time.Time) error {
 
 	// XLogRecord header (24 bytes) at page[40..63], CRC computed over
 	// payload then header[0..19] — see EncodeXLogRecordHeader.
-	recDst := page[wal.SizeOfXLogLongPHD:] // starts at byte 40
-	hdr := wal.XLogRecord{
-		TotLen: uint32(wal.SizeOfXLogRecord) + uint32(len(payload)), // 114
+	recDst := page[xlog.SizeOfXLogLongPHD:] // starts at byte 40
+	hdr := xlog.XLogRecord{
+		TotLen: uint32(xlog.SizeOfXLogRecord) + uint32(len(payload)), // 114
 		XID:    0,                                                    // InvalidTransactionId
 		Prev:   0,                                                    // first record; no predecessor
 		Info:   walXlogCheckpointShutdown,
-		Rmid:   wal.RmgrXLog, // RM_XLOG_ID = 0
+		Rmid:   xlog.RmgrXLog, // RM_XLOG_ID = 0
 	}
-	if err := wal.EncodeXLogRecordHeader(recDst[:wal.SizeOfXLogRecord], hdr, payload); err != nil {
+	if err := xlog.EncodeXLogRecordHeader(recDst[:xlog.SizeOfXLogRecord], hdr, payload); err != nil {
 		return fmt.Errorf("wal bootstrap: xlog record header: %w", err)
 	}
-	copy(recDst[wal.SizeOfXLogRecord:], payload)
+	copy(recDst[xlog.SizeOfXLogRecord:], payload)
 
 	// Write the segment file: first page filled, then zero-extend to
 	// wal_segment_size via Truncate (sparse on supporting filesystems).
@@ -115,7 +115,7 @@ func WriteBootstrapWAL(dataDir string, sysID uint64, now time.Time) error {
 		_ = f.Close()
 		return fmt.Errorf("wal bootstrap: write page: %w", err)
 	}
-	if err := f.Truncate(wal.DefaultSegmentSize); err != nil {
+	if err := f.Truncate(xlog.DefaultSegmentSize); err != nil {
 		_ = f.Close()
 		return fmt.Errorf("wal bootstrap: truncate to segment size: %w", err)
 	}

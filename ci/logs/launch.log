@@ -168,3 +168,14 @@
 2026-08-15T01:17:31+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
 2026-08-15T03:52:44+09:00 [RUN]	S1 barrier reached
 2026-08-15T04:30:54+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-08-15T04:32:34+09:00 [RUN]	log-push: committed + pushed batch logs to origin/try-cost-optimization
+2026-08-16T00:51:17+09:00 [RUN]	start run_id=20260816-005117 sha=cf1c548f dirty=62 src_fp=6d8db122d05e5acf stages=preflight,units,race,testport,pgbench,tpch,tpcds,summary
+2026-08-16T00:51:26+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
+2026-08-16T03:31:53+09:00 [RUN]	S1 barrier reached
+2026-08-16T04:09:32+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-08-16T04:11:13+09:00 [RUN]	log-push: committed + pushed batch logs to origin/try-cost-optimization
+2026-08-17T01:17:34+09:00 [RUN]	start run_id=20260817-011734 sha=24055731 dirty=9 src_fp=80285ec1d210b4c5 stages=preflight,units,race,testport,pgbench,tpch,tpcds,summary
+2026-08-17T01:17:44+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
+2026-08-17T02:13:41+09:00 [RUN]	S1 barrier reached
+2026-08-17T02:51:10+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-08-17T02:52:51+09:00 [RUN]	log-push: committed + pushed batch logs to origin/dir-compat

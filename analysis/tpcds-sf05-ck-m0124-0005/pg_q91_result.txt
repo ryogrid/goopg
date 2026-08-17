@@ -1,0 +1,5 @@
+   call_center    | call_center_name |    manager     | returns_loss 
+------------------+------------------+----------------+--------------
+ AAAAAAAACAAAAAAA | Mid Atlantic     | Felipe Perkins |       341.90
+(1 row)
+

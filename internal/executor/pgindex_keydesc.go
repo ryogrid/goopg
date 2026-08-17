@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/catalog"
 )
 
@@ -46,38 +46,38 @@ import (
 // date/time/timestamp/timestamptz reuse the int4/int8 comparators, exactly as
 // upstream does (pg_amproc.dat maps date_cmp/time_cmp/timestamp_cmp onto the
 // same integer comparison of their by-value representations).
-func pgIndexComparatorForOID(oid uint32) btree.PGAttrComparator {
+func pgIndexComparatorForOID(oid uint32) nbtree.PGAttrComparator {
 	switch oid {
 	case catalog.OIDBool:
-		return btree.PGCompareBool
+		return nbtree.PGCompareBool
 	case catalog.OIDChar:
-		return btree.PGCompareCharType
+		return nbtree.PGCompareCharType
 	case catalog.OIDName:
-		return btree.PGCompareName
+		return nbtree.PGCompareName
 	case catalog.OIDInt2:
-		return btree.PGCompareInt2
+		return nbtree.PGCompareInt2
 	case catalog.OIDInt4, catalog.OIDDate:
-		return btree.PGCompareInt4
+		return nbtree.PGCompareInt4
 	case catalog.OIDInt8, catalog.OIDTime, catalog.OIDTimestamp, catalog.OIDTimestampTZ:
-		return btree.PGCompareInt8
+		return nbtree.PGCompareInt8
 	case catalog.OIDOID:
-		return btree.PGCompareOID
+		return nbtree.PGCompareOID
 	case catalog.OIDFloat4:
-		return btree.PGCompareFloat4
+		return nbtree.PGCompareFloat4
 	case catalog.OIDFloat8:
-		return btree.PGCompareFloat8
+		return nbtree.PGCompareFloat8
 	case catalog.OIDBytea:
-		return btree.PGCompareBytea
+		return nbtree.PGCompareBytea
 	case catalog.OIDText, catalog.OIDVarChar:
-		return btree.PGCompareTextC
+		return nbtree.PGCompareTextC
 	case catalog.OIDBpChar:
-		return btree.PGCompareBpcharC
+		return nbtree.PGCompareBpcharC
 	case catalog.OIDNumeric:
-		return btree.PGCompareNumeric
+		return nbtree.PGCompareNumeric
 	case catalog.OIDUUID:
-		return btree.PGCompareUUID
+		return nbtree.PGCompareUUID
 	case catalog.OIDTimeTZ:
-		return btree.PGCompareTimeTZ
+		return nbtree.PGCompareTimeTZ
 	}
 	return nil
 }
@@ -232,7 +232,7 @@ func findColumnByName(tbl *catalog.Table, name string) *catalog.Column {
 // access method, an expression key, a key column missing from the table, an
 // explicit operator class (goopg has no pg_opclass registry to resolve one
 // against), a non-bytewise collation, or a type with no 3b-2a comparator.
-func buildPGIndexKeyDesc(idx *catalog.Index) (*btree.PGIndexKeyDesc, error) {
+func buildPGIndexKeyDesc(idx *catalog.Index) (*nbtree.PGIndexKeyDesc, error) {
 	if idx == nil {
 		return nil, fmt.Errorf("btree key descriptor: nil index")
 	}
@@ -245,7 +245,7 @@ func buildPGIndexKeyDesc(idx *catalog.Index) (*btree.PGIndexKeyDesc, error) {
 	if len(idx.Columns) == 0 {
 		return nil, fmt.Errorf("btree key descriptor: index %q has no key columns", idx.Name)
 	}
-	attrs := make([]btree.PGKeyAttr, 0, len(idx.Columns))
+	attrs := make([]nbtree.PGKeyAttr, 0, len(idx.Columns))
 	for i, name := range idx.Columns {
 		if name == "" {
 			// Columns[i]=="" marks an expression key (ColExprs[i]); its output
@@ -279,7 +279,7 @@ func buildPGIndexKeyDesc(idx *catalog.Index) (*btree.PGIndexKeyDesc, error) {
 			return nil, fmt.Errorf("btree key descriptor: index %q key %q (type oid %d) has no btree comparator", idx.Name, name, typOID)
 		}
 		ta := userTypeAttrsForOID(typOID)
-		alignBy, err := btree.PGAlignBy(ta.TypAlign)
+		alignBy, err := nbtree.PGAlignBy(ta.TypAlign)
 		if err != nil {
 			return nil, fmt.Errorf("btree key descriptor: index %q key %q: %w", idx.Name, name, err)
 		}
@@ -291,8 +291,8 @@ func buildPGIndexKeyDesc(idx *catalog.Index) (*btree.PGIndexKeyDesc, error) {
 		// `... DESC NULLS LAST` is legal and sets only Desc.
 		desc := i < len(idx.ColDescending) && idx.ColDescending[i]
 		nullsFirst := i < len(idx.ColNullsFirst) && idx.ColNullsFirst[i]
-		attrs = append(attrs, btree.PGKeyAttr{
-			PGIndexAttr: btree.PGIndexAttr{
+		attrs = append(attrs, nbtree.PGKeyAttr{
+			PGIndexAttr: nbtree.PGIndexAttr{
 				Len:     ta.TypLen,
 				ByVal:   ta.TypByVal,
 				AlignBy: alignBy,
@@ -303,5 +303,5 @@ func buildPGIndexKeyDesc(idx *catalog.Index) (*btree.PGIndexKeyDesc, error) {
 			NullsFirst: nullsFirst,
 		})
 	}
-	return &btree.PGIndexKeyDesc{Attrs: attrs}, nil
+	return &nbtree.PGIndexKeyDesc{Attrs: attrs}, nil
 }

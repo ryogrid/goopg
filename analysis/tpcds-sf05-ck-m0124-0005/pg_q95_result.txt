@@ -1,0 +1,5 @@
+ order count | total shipping cost | total net profit 
+-------------+---------------------+------------------
+          23 |            45031.03 |         -1282.36
+(1 row)
+

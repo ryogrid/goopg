@@ -11,8 +11,8 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/goopg/goopg/internal/mctx"
-	"github.com/goopg/goopg/internal/pgdatetime"
+	"github.com/goopg/goopg/internal/utils/mmgr"
+	"github.com/goopg/goopg/internal/utils/adt/datetime"
 )
 
 // DatumKind discriminates the value carrier in a Datum.
@@ -171,7 +171,7 @@ const (
 type Datum struct {
 	Kind    DatumKind      // 1B @ 0 (was int = 8B; M0107-0002)
 	Flags   uint8          // 1B @ 1 (flagBigNumeric; reserved others)
-	ArenaID mctx.ContextID // 2B @ 2 (replaces *mctx.Context; 0 = no mctx payload)
+	ArenaID mmgr.ContextID // 2B @ 2 (replaces *mctx.Context; 0 = no mctx payload)
 	Scale   int16          // 2B @ 4
 	TimeSub TimeSubtype    // 1B @ 6 (KindTime only; else zero. M0127-P5.9-u —
 	//                        carved out of the alignment pad, so the 48 B
@@ -207,7 +207,7 @@ func (d Datum) BoolValue() bool { return d.Int != 0 }
 func (d Datum) StringValue() string {
 	if d.ArenaID != 0 {
 		// mctx-backed (hot path from seqScan/indexScan decode).
-		ctx := mctx.Lookup(d.ArenaID)
+		ctx := mmgr.Lookup(d.ArenaID)
 		if ctx == nil {
 			return ""
 		}
@@ -231,7 +231,7 @@ func (d Datum) StringValue() string {
 // past the arena's next Reset().
 func (d Datum) BytesValue() []byte {
 	if d.ArenaID != 0 {
-		ctx := mctx.Lookup(d.ArenaID)
+		ctx := mmgr.Lookup(d.ArenaID)
 		if ctx == nil {
 			return nil
 		}
@@ -351,7 +351,7 @@ func (d Datum) NumericBigValue() *big.Int {
 	if d.Flags&flagBigNumeric == 0 {
 		return nil
 	}
-	ctx := mctx.Lookup(d.ArenaID)
+	ctx := mmgr.Lookup(d.ArenaID)
 	if ctx == nil {
 		return new(big.Int)
 	}
@@ -404,7 +404,7 @@ func NewBytesDatum(b []byte) Datum {
 // newStringArenaDatum constructs a KindStringArena Datum encoding
 // the (offset, length) pair into the Int field. Used by the
 // arena-aware decode path (M0073-0002 wires this through).
-func newStringArenaDatum(sctx *mctx.Context, offset, length uint32) Datum {
+func newStringArenaDatum(sctx *mmgr.Context, offset, length uint32) Datum {
 	return Datum{
 		Kind:    KindString,
 		ArenaID: sctx.ID(),
@@ -413,7 +413,7 @@ func newStringArenaDatum(sctx *mctx.Context, offset, length uint32) Datum {
 }
 
 // newBytesArenaDatum constructs a KindBytesArena Datum.
-func newBytesArenaDatum(sctx *mctx.Context, offset, length uint32) Datum {
+func newBytesArenaDatum(sctx *mmgr.Context, offset, length uint32) Datum {
 	return Datum{
 		Kind:    KindBytes,
 		ArenaID: sctx.ID(),
@@ -441,7 +441,7 @@ func (d Datum) MaterializeArena() Datum {
 	// String/Bytes were covering; see rowHasArena/cloneRowOwned). Re-store
 	// it in the permanent arena, which never resets.
 	if d.Kind == KindNumeric && d.Flags&flagBigNumeric != 0 {
-		return newBigNumericInCtx(mctx.Perm(), d.NumericBigValue(), d.Scale)
+		return newBigNumericInCtx(mmgr.Perm(), d.NumericBigValue(), d.Scale)
 	}
 	if d.Kind != KindString && d.Kind != KindBytes {
 		return d
@@ -450,7 +450,7 @@ func (d Datum) MaterializeArena() Datum {
 	if length == 0 {
 		return Datum{Kind: d.Kind}
 	}
-	ctx := mctx.Lookup(d.ArenaID)
+	ctx := mmgr.Lookup(d.ArenaID)
 	if ctx == nil {
 		return Datum{Kind: d.Kind}
 	}
@@ -603,12 +603,12 @@ func NewNumericInt64Datum(mant int64, scale int16) Datum {
 // overflow lane (used when the result of arithmetic exceeds int64
 // range, e.g. TPC-H Q8's `1.00000000000000000000`).
 func NewNumericBigDatum(bi *big.Int, scale int16) Datum {
-	return newBigNumericInCtx(mctx.Perm(), bi, scale)
+	return newBigNumericInCtx(mmgr.Perm(), bi, scale)
 }
 
 // newBigNumericInCtx stores bi's sign+BE-magnitude in ctx and returns
 // a KindNumeric Datum with flagBigNumeric set. ctx must outlive the Datum.
-func newBigNumericInCtx(ctx *mctx.Context, bi *big.Int, scale int16) Datum {
+func newBigNumericInCtx(ctx *mmgr.Context, bi *big.Int, scale int16) Datum {
 	mag := bi.Bytes() // big-endian magnitude; one alloc inside big.Int
 	sign := byte(0)
 	if bi.Sign() < 0 {
@@ -658,7 +658,7 @@ func (d Datum) AppendValueText(dst []byte) []byte {
 		return strconv.AppendInt(dst, d.Int, 10)
 	case KindString:
 		if d.ArenaID != 0 {
-			ctx := mctx.Lookup(d.ArenaID)
+			ctx := mmgr.Lookup(d.ArenaID)
 			if ctx != nil {
 				return append(dst, ctx.Bytes(uint32(d.Int>>32), uint32(d.Int&0xFFFFFFFF))...)
 			}
@@ -667,7 +667,7 @@ func (d Datum) AppendValueText(dst []byte) []byte {
 		return append(dst, d.Buf...)
 	case KindBytes:
 		if d.ArenaID != 0 {
-			ctx := mctx.Lookup(d.ArenaID)
+			ctx := mmgr.Lookup(d.ArenaID)
 			if ctx != nil {
 				return append(dst, ctx.Bytes(uint32(d.Int>>32), uint32(d.Int&0xFFFFFFFF))...)
 			}
@@ -784,7 +784,7 @@ func (d Datum) Format() string {
 // same bytes and must render the same text, and it cannot import the executor.
 // See pgdatetime.FormatInterval for the full behavioural contract.
 func formatInterval(months, days int32, micros int64) string {
-	return pgdatetime.FormatInterval(months, days, micros)
+	return datetime.FormatInterval(months, days, micros)
 }
 
 // formatNumeric renders mantissa * 10^-scale as the decimal string

@@ -60,7 +60,7 @@ import (
 
 	_ "github.com/lib/pq"
 
-	"github.com/goopg/goopg/internal/estimateaudit"
+	"github.com/goopg/goopg/internal/testutil/estimateaudit"
 	"github.com/goopg/goopg/internal/testutil/tpch"
 )
 

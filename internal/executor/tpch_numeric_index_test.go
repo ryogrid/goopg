@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/testutil/tpch"
 )
 
@@ -93,7 +93,7 @@ func TestTPCHNumericSingleColumnIndexesAccepted(t *testing.T) {
 	if perr != nil {
 		t.Fatalf("parse: %v", perr)
 	}
-	plan, err := planner.Plan(stmts[0], ctx.Catalog)
+	plan, err := optimizer.Plan(stmts[0], ctx.Catalog)
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
@@ -125,17 +125,17 @@ func TestTPCHNumericSingleColumnIndexesAccepted(t *testing.T) {
 // whether any node is an IndexScan or IndexOnlyScan. Used by the TPC-H
 // integration test to confirm the planner picked the index path even when
 // the outer node is a Project / Filter wrapper.
-func planContainsIndexScan(n planner.Node) bool {
-	if _, ok := n.(*planner.IndexScan); ok {
+func planContainsIndexScan(n optimizer.Node) bool {
+	if _, ok := n.(*optimizer.IndexScan); ok {
 		return true
 	}
-	if _, ok := n.(*planner.IndexOnlyScan); ok {
+	if _, ok := n.(*optimizer.IndexOnlyScan); ok {
 		return true
 	}
 	switch v := n.(type) {
-	case *planner.Project:
+	case *optimizer.Project:
 		return planContainsIndexScan(v.Child)
-	case *planner.Filter:
+	case *optimizer.Filter:
 		return planContainsIndexScan(v.Child)
 	}
 	return false

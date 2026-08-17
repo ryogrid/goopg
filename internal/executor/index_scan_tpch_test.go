@@ -6,7 +6,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // newTpchTypeFixture creates a DDL-based context with three tables
@@ -116,11 +116,11 @@ func TestIndexScanVarcharEndToEnd(t *testing.T) {
 	plan := planOne(t, sql, ctx.Catalog)
 
 	// Verify the planner chose IndexScan.
-	proj, ok := plan.(*planner.Project)
+	proj, ok := plan.(*optimizer.Project)
 	if !ok {
 		t.Fatalf("root=%T want *planner.Project", plan)
 	}
-	if _, ok := proj.Child.(*planner.IndexScan); !ok {
+	if _, ok := proj.Child.(*optimizer.IndexScan); !ok {
 		t.Fatalf("child=%T want *planner.IndexScan — varchar index not selected by planner", proj.Child)
 	}
 
@@ -168,11 +168,11 @@ func TestIndexScanCharEndToEnd(t *testing.T) {
 	sql := "SELECT c_custkey FROM customer WHERE c_mktsegment = 'FURNITURE'"
 	plan := planOne(t, sql, ctx.Catalog)
 
-	proj, ok := plan.(*planner.Project)
+	proj, ok := plan.(*optimizer.Project)
 	if !ok {
 		t.Fatalf("root=%T want *planner.Project", plan)
 	}
-	if _, ok := proj.Child.(*planner.IndexScan); !ok {
+	if _, ok := proj.Child.(*optimizer.IndexScan); !ok {
 		t.Fatalf("child=%T want *planner.IndexScan — char index not selected", proj.Child)
 	}
 
@@ -225,11 +225,11 @@ func TestIndexScanTimestampEndToEnd(t *testing.T) {
 	sql := "SELECT l_linenumber FROM lineitem WHERE l_shipdate = timestamp '1995-09-15'"
 	plan := planOne(t, sql, ctx.Catalog)
 
-	proj, ok := plan.(*planner.Project)
+	proj, ok := plan.(*optimizer.Project)
 	if !ok {
 		t.Fatalf("root=%T want *planner.Project", plan)
 	}
-	if _, ok := proj.Child.(*planner.IndexScan); !ok {
+	if _, ok := proj.Child.(*optimizer.IndexScan); !ok {
 		t.Fatalf("child=%T want *planner.IndexScan — timestamp index not selected", proj.Child)
 	}
 

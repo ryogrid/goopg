@@ -42,7 +42,7 @@ import (
 
 	"github.com/goopg/goopg/internal/testutil/pgcluster"
 	"github.com/goopg/goopg/internal/testutil/pubsubcluster"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // freeTCPPort returns an OS-assigned ephemeral port. Race-safe enough
@@ -122,13 +122,13 @@ func TestPort_PgoutputInteropPGToGoopg(t *testing.T) {
 		inserts  int
 		updates  int
 		deletes  int
-		gotRel   *wal.DecodedRelation
+		gotRel   *xlog.DecodedRelation
 		insertVs []string
 		updateVs []string
 		deleteVs []string
 	)
 	for _, payload := range msgs {
-		m, err := wal.DecodeMessage(payload)
+		m, err := xlog.DecodeMessage(payload)
 		if err != nil {
 			t.Fatalf("DecodeMessage kind=%q: %v (bytes=%x)", payload[0], err, payload)
 		}
@@ -2379,7 +2379,7 @@ func containsTuple(have []string, want ...string) bool {
 
 // tupleSummary renders a `[]wal.DecodedColumn` as "(v0,v1,…)" for
 // diagnostic output. NULL → "<null>", unchanged TOAST → "<u>".
-func tupleSummary(cols []wal.DecodedColumn) string {
+func tupleSummary(cols []xlog.DecodedColumn) string {
 	parts := make([]string, len(cols))
 	for i, c := range cols {
 		switch c.Status {
@@ -2854,6 +2854,12 @@ func TestPort_PgoutputInteropPGToGoopgBpcharPadding(t *testing.T) {
 	// Wait for all four rows to land. Bounded; the per-row assertions
 	// below catch a stuck apply worker independently.
 	psc.WaitForRow(t, "public.bpchar_log", "id IN (1, 2, 3, 4)", 4, 60*time.Second)
+
+	// WaitForRow above only gates on count(*), which the four INSERTs
+	// already satisfy — it cannot observe the trailing UPDATE (it
+	// doesn't change the row count), so wait separately for that value
+	// to land before asserting on it below.
+	psc.WaitForScalar(t, "SELECT length(filler) FROM public.bpchar_log WHERE id = 1", "3", 60*time.Second)
 
 	// count(*) = 4: all four INSERTs landed.
 	if got := psc.Subscriber.QueryScalar(t, "SELECT count(*) FROM public.bpchar_log"); got != "4" {

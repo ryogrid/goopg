@@ -3,7 +3,7 @@ package executor
 import (
 	"testing"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // TestM0072BindOuterAcceptsSlotView pins the M0072-0001 contract:
@@ -12,7 +12,7 @@ import (
 // path via evalExprSlot.
 func TestM0072BindOuterAcceptsSlotView(t *testing.T) {
 	o := &indexScanOp{}
-	outerSchema := planner.Schema{{Name: "o0"}, {Name: "o1"}}
+	outerSchema := optimizer.Schema{{Name: "o0"}, {Name: "o1"}}
 	outerMS := SlotFromRow(outerSchema, Row{NewIntDatum(7), NewIntDatum(99)})
 
 	o.BindOuter(outerMS, 2)

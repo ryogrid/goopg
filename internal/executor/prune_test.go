@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -12,7 +12,7 @@ import (
 // beginTx starts a new transaction and installs it in ctx.
 func beginTx(t *testing.T, ctx *Context) {
 	t.Helper()
-	tx, err := ctx.TxnMgr.Begin(mvcc.IsolationReadCommitted)
+	tx, err := ctx.TxnMgr.Begin(transam.IsolationReadCommitted)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}

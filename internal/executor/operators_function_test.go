@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -307,7 +307,7 @@ func TestExecDropProcedureDeferredToCommit(t *testing.T) {
 	}
 
 	sess := NewBasicSession()
-	sess.BeginExplicitTransaction(mvcc.Transaction{}, mvcc.Snapshot{})
+	sess.BeginExplicitTransaction(transam.Transaction{}, transam.Snapshot{})
 	ctx := NewContext()
 	ctx.Catalog = cat
 	ctx.Session = sess
@@ -342,7 +342,7 @@ func TestExecDropProcedureRollbackLeavesEntry(t *testing.T) {
 	}
 
 	sess := NewBasicSession()
-	sess.BeginExplicitTransaction(mvcc.Transaction{}, mvcc.Snapshot{})
+	sess.BeginExplicitTransaction(transam.Transaction{}, transam.Snapshot{})
 	ctx := NewContext()
 	ctx.Catalog = cat
 	ctx.Session = sess

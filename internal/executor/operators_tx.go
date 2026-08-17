@@ -4,26 +4,26 @@ import (
 	"fmt"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // transactionOp is a one-shot operator that mutates explicit
 // transaction state for BEGIN/COMMIT/ROLLBACK.
 type transactionOp struct {
-	plan *planner.Transaction
+	plan *optimizer.Transaction
 	ctx  *Context
 	done bool
 }
 
-func newTransactionOp(p *planner.Transaction) *transactionOp {
+func newTransactionOp(p *optimizer.Transaction) *transactionOp {
 	return &transactionOp{plan: p}
 }
 
-func (o *transactionOp) Schema() planner.Schema { return nil }
+func (o *transactionOp) Schema() optimizer.Schema { return nil }
 
 func (o *transactionOp) Open(ctx *Context) error {
 	if ctx.TxnMgr == nil {
@@ -45,17 +45,17 @@ func (o *transactionOp) Next() (TupleSlot, error) {
 	}
 	o.done = true
 	switch o.plan.Verb {
-	case planner.TxBegin:
+	case optimizer.TxBegin:
 		return nil, o.execBegin()
-	case planner.TxCommit:
+	case optimizer.TxCommit:
 		return nil, o.execCommit()
-	case planner.TxRollback:
+	case optimizer.TxRollback:
 		return nil, o.execRollback()
-	case planner.TxSavepoint:
+	case optimizer.TxSavepoint:
 		return nil, o.execSavepoint()
-	case planner.TxRelease:
+	case optimizer.TxRelease:
 		return nil, o.execRelease()
-	case planner.TxRollbackTo:
+	case optimizer.TxRollbackTo:
 		return nil, o.execRollbackTo()
 	default:
 		return nil, &ExecError{Code: "0A000", Pos: o.plan.Pos(), Message: fmt.Sprintf("unsupported transaction verb %d", o.plan.Verb)}
@@ -72,7 +72,7 @@ func (o *transactionOp) execBegin() error {
 	// the session default and update the session so subsequent operations in
 	// this transaction use the same level.
 	if o.plan.IsolationLevel != "" {
-		parsed, err := mvcc.ParseIsolationLevel(o.plan.IsolationLevel)
+		parsed, err := transam.ParseIsolationLevel(o.plan.IsolationLevel)
 		if err != nil {
 			return &ExecError{Code: "0A000", Pos: o.plan.Pos(), Message: err.Error()}
 		}
@@ -88,7 +88,7 @@ func (o *transactionOp) execBegin() error {
 	// SERIALIZABLE READ ONLY DEFERRABLE transaction (it waits for concurrent
 	// writers to drain instead of risking a 40001 abort). No-op for RC/RR.
 	// M0118-0001 (read-only-anomaly-3).
-	if level == mvcc.IsolationSerializable {
+	if level == transam.IsolationSerializable {
 		o.ctx.TxnMgr.MarkSerializableModes(tx.Handle, o.plan.ReadOnly, o.plan.Deferrable)
 	}
 	// PG-parity: for RR/SERIALIZABLE, the snapshot is captured at the first
@@ -97,8 +97,8 @@ func (o *transactionOp) execBegin() error {
 	// each query sets it on the first real statement after BEGIN. For RC, the
 	// snapshot is refreshed per-statement anyway, so the timing doesn't matter.
 	// M0100-0001 (first-statement snapshot semantics for read-write-unique).
-	var snap mvcc.Snapshot
-	if level == mvcc.IsolationReadCommitted {
+	var snap transam.Snapshot
+	if level == transam.IsolationReadCommitted {
 		snap, err = o.ctx.TxnMgr.SnapshotFor(tx)
 		if err != nil {
 			_ = o.ctx.TxnMgr.Rollback(tx)
@@ -202,7 +202,7 @@ func (o *transactionOp) execCommit() error {
 	// hook always advances it). NeedsWait short-circuits the cheap
 	// path when synchronous_standby_names is empty.
 	if o.ctx.SyncRep != nil && o.ctx.WAL != nil &&
-		o.ctx.SyncCommitMode != wal.SyncRepOff && o.ctx.SyncRep.NeedsWait() {
+		o.ctx.SyncCommitMode != xlog.SyncRepOff && o.ctx.SyncRep.NeedsWait() {
 		_ = o.ctx.SyncRep.WaitForLSN(o.ctx.Ctx, o.ctx.WAL.WrittenLSN(), o.ctx.SyncCommitMode)
 	}
 	// M0118-0009 (`stats`, rung 7; design 0118-0131): fold this transaction's
@@ -213,7 +213,7 @@ func (o *transactionOp) execCommit() error {
 	CommitRelStats(o.ctx)
 	o.ctx.Session.EndExplicitTransaction()
 	if o.ctx.EndLocalTransaction != nil {
-		o.ctx.EndLocalTransaction()
+		o.ctx.EndLocalTransaction(true)
 	}
 	// Clear pending truncate/sequence undos — they're committed.
 	if sess, isBas := o.ctx.Session.(*BasicSession); isBas {
@@ -265,7 +265,7 @@ func (o *transactionOp) execRollback() error {
 	AbortRelStats(o.ctx)
 	o.ctx.Session.EndExplicitTransaction()
 	if o.ctx.EndLocalTransaction != nil {
-		o.ctx.EndLocalTransaction()
+		o.ctx.EndLocalTransaction(false)
 	}
 	globalRelLockMgr.ReleaseSession(o.ctx.Session)
 	undoEnumDDLFromContext(o.ctx)
@@ -280,7 +280,7 @@ func (o *transactionOp) execRollback() error {
 // no current spec uses, are left behind but are harmless — WaitForXID returns
 // immediately once that sub-XID is no longer active). Harmless no-op when none
 // were recorded. Design 0118-0113 (intra-grant-inplace).
-func (o *transactionOp) clearPgClassRowMarks(tx mvcc.Transaction) {
+func (o *transactionOp) clearPgClassRowMarks(tx transam.Transaction) {
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok || tx.XID == storage.InvalidTransactionID {
 		return
@@ -372,8 +372,8 @@ func ProcessRollbackUndos(ctx *Context, sess *BasicSession) {
 }
 
 func (o *transactionOp) clearCtxTransaction() {
-	o.ctx.Tx = mvcc.Transaction{}
-	o.ctx.Snap = mvcc.Snapshot{}
+	o.ctx.Tx = transam.Transaction{}
+	o.ctx.Snap = transam.Snapshot{}
 	if o.ctx.Session != nil {
 		o.ctx.Session.SetReadOnlyTxn(false)
 	}
@@ -593,7 +593,7 @@ func newSetTransactionOp(s *parser.SetTransactionStmt) *setTransactionOp {
 	return &setTransactionOp{stmt: s}
 }
 
-func (o *setTransactionOp) Schema() planner.Schema  { return nil }
+func (o *setTransactionOp) Schema() optimizer.Schema  { return nil }
 func (o *setTransactionOp) Open(ctx *Context) error { o.ctx = ctx; return nil }
 func (o *setTransactionOp) Close() error            { return nil }
 
@@ -605,7 +605,7 @@ func (o *setTransactionOp) Next() (TupleSlot, error) {
 	if o.stmt.IsolationLevel == "" || o.ctx == nil || o.ctx.Session == nil {
 		return nil, EOF
 	}
-	level, err := mvcc.ParseIsolationLevel(o.stmt.IsolationLevel)
+	level, err := transam.ParseIsolationLevel(o.stmt.IsolationLevel)
 	if err != nil {
 		return nil, &ExecError{Code: "0A000", Message: err.Error()}
 	}
@@ -630,7 +630,7 @@ func newSetConstraintsOp(s *parser.SetConstraintsStmt) *setConstraintsOp {
 	return &setConstraintsOp{stmt: s}
 }
 
-func (o *setConstraintsOp) Schema() planner.Schema  { return nil }
+func (o *setConstraintsOp) Schema() optimizer.Schema  { return nil }
 func (o *setConstraintsOp) Open(ctx *Context) error { o.ctx = ctx; return nil }
 func (o *setConstraintsOp) Close() error            { return nil }
 

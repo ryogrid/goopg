@@ -15,20 +15,20 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 type pgInputErrorInfoOp struct {
-	plan *planner.PgInputErrorInfo
+	plan *optimizer.PgInputErrorInfo
 	ctx  *Context
 	done bool
 }
 
-func newPgInputErrorInfoOp(p *planner.PgInputErrorInfo) *pgInputErrorInfoOp {
+func newPgInputErrorInfoOp(p *optimizer.PgInputErrorInfo) *pgInputErrorInfoOp {
 	return &pgInputErrorInfoOp{plan: p}
 }
 
-func (o *pgInputErrorInfoOp) Schema() planner.Schema { return o.plan.Output() }
+func (o *pgInputErrorInfoOp) Schema() optimizer.Schema { return o.plan.Output() }
 
 func (o *pgInputErrorInfoOp) Open(ctx *Context) error {
 	o.ctx = ctx

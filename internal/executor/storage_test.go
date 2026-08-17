@@ -5,9 +5,9 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -29,8 +29,8 @@ func newStorageFixture(t *testing.T) (*Context, catalog.Catalog, func()) {
 	}); err != nil {
 		t.Fatalf("CreateTable: %v", err)
 	}
-	mgrMVCC := mvcc.NewManager()
-	tx, err := mgrMVCC.Begin(mvcc.IsolationReadCommitted)
+	mgrMVCC := transam.NewManager()
+	tx, err := mgrMVCC.Begin(transam.IsolationReadCommitted)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,13 +63,13 @@ func TestInsertThenSeqScanRoundTrip(t *testing.T) {
 
 	// Hand-build an Insert plan rather than going through the parser
 	// so this test focuses on executor mechanics, not name resolution.
-	insertPlan := &planner.Insert{
+	insertPlan := &optimizer.Insert{
 		Table: tbl,
-		Source: &planner.Values{
-			Rows: [][]planner.Expr{
-				{&planner.IntegerConst{Value: 1}, &planner.StringConst{Value: "alpha"}},
-				{&planner.IntegerConst{Value: 2}, &planner.StringConst{Value: "beta"}},
-				{&planner.IntegerConst{Value: 3}, &planner.StringConst{Value: "gamma"}},
+		Source: &optimizer.Values{
+			Rows: [][]optimizer.Expr{
+				{&optimizer.IntegerConst{Value: 1}, &optimizer.StringConst{Value: "alpha"}},
+				{&optimizer.IntegerConst{Value: 2}, &optimizer.StringConst{Value: "beta"}},
+				{&optimizer.IntegerConst{Value: 3}, &optimizer.StringConst{Value: "gamma"}},
 			},
 		},
 		ColumnIndex: []int{0, 1},
@@ -95,7 +95,7 @@ func TestInsertThenSeqScanRoundTrip(t *testing.T) {
 	// — the insert above used currentXID = ctx.Tx.XID, which is the
 	// same xid we'll scan with. mvcc.TupleVisible's "same xact" branch
 	// returns true regardless of snapshot.
-	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: tbl})
 	if err := scan.Open(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -125,10 +125,10 @@ func TestSeqScanRespectsVisibility(t *testing.T) {
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
 
 	// Insert one row under ctx.Tx, then "abort" by rolling back.
-	in := &planner.Insert{
+	in := &optimizer.Insert{
 		Table: tbl,
-		Source: &planner.Values{
-			Rows: [][]planner.Expr{{&planner.IntegerConst{Value: 99}, &planner.StringConst{Value: "ghost"}}},
+		Source: &optimizer.Values{
+			Rows: [][]optimizer.Expr{{&optimizer.IntegerConst{Value: 99}, &optimizer.StringConst{Value: "ghost"}}},
 		},
 		ColumnIndex: []int{0, 1},
 	}
@@ -143,13 +143,13 @@ func TestSeqScanRespectsVisibility(t *testing.T) {
 	// Open a fresh transaction. The aborted insert's xid is now tracked
 	// in the snapshot's Aborted list (M0100-0002), so the ghost row is
 	// correctly invisible (0 rows).
-	tx2, _ := ctx.TxnMgr.Begin(mvcc.IsolationReadCommitted)
+	tx2, _ := ctx.TxnMgr.Begin(transam.IsolationReadCommitted)
 	defer ctx.TxnMgr.Rollback(tx2)
 	snap2, _ := ctx.TxnMgr.SnapshotFor(tx2)
 	ctx.Tx = tx2
 	ctx.Snap = snap2
 
-	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: tbl})
 	if err := scan.Open(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -173,16 +173,16 @@ func TestInsertExtendsRelation(t *testing.T) {
 	rel := cat.RelFileNode(tbl)
 
 	const N = 600 // each row is ~34 bytes payload + tuple header; ~200/page
-	rows := make([][]planner.Expr, N)
+	rows := make([][]optimizer.Expr, N)
 	for i := 0; i < N; i++ {
-		rows[i] = []planner.Expr{
-			&planner.IntegerConst{Value: int64(i)},
-			&planner.StringConst{Value: "row-text-payload-padding"},
+		rows[i] = []optimizer.Expr{
+			&optimizer.IntegerConst{Value: int64(i)},
+			&optimizer.StringConst{Value: "row-text-payload-padding"},
 		}
 	}
-	in := &planner.Insert{
+	in := &optimizer.Insert{
 		Table:       tbl,
-		Source:      &planner.Values{Rows: rows},
+		Source:      &optimizer.Values{Rows: rows},
 		ColumnIndex: []int{0, 1},
 	}
 	op, _ := Build(in)
@@ -199,7 +199,7 @@ func TestInsertExtendsRelation(t *testing.T) {
 	}
 
 	// Round-trip count check.
-	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: tbl})
 	_ = scan.Open(ctx)
 	defer scan.Close()
 	got, _ := drainScan(scan)
@@ -242,11 +242,11 @@ func TestInsertFillsMissingColumnDefault(t *testing.T) {
 	}
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "withdefault"})
 
-	insertPlan := &planner.Insert{
+	insertPlan := &optimizer.Insert{
 		Table: tbl,
-		Source: &planner.Values{
-			Rows: [][]planner.Expr{
-				{&planner.IntegerConst{Value: 1}, &planner.StringConst{Value: "one"}},
+		Source: &optimizer.Values{
+			Rows: [][]optimizer.Expr{
+				{&optimizer.IntegerConst{Value: 1}, &optimizer.StringConst{Value: "one"}},
 			},
 		},
 		// INSERT INTO withdefault (id, label) VALUES (1, 'one') — note and
@@ -270,7 +270,7 @@ func TestInsertFillsMissingColumnDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: tbl})
 	if err := scan.Open(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -319,11 +319,11 @@ func TestInsertDoesNotOverrideExplicitColumnDefault(t *testing.T) {
 	}
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "withdefault2"})
 
-	insertPlan := &planner.Insert{
+	insertPlan := &optimizer.Insert{
 		Table: tbl,
-		Source: &planner.Values{
-			Rows: [][]planner.Expr{
-				{&planner.IntegerConst{Value: 1}, &planner.StringConst{Value: "explicit"}},
+		Source: &optimizer.Values{
+			Rows: [][]optimizer.Expr{
+				{&optimizer.IntegerConst{Value: 1}, &optimizer.StringConst{Value: "explicit"}},
 			},
 		},
 		// INSERT INTO withdefault2 (id, note) VALUES (1, 'explicit') — both
@@ -339,7 +339,7 @@ func TestInsertDoesNotOverrideExplicitColumnDefault(t *testing.T) {
 	}
 	_ = op.Close()
 
-	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: tbl})
 	_ = scan.Open(ctx)
 	defer scan.Close()
 	rows, _ := drainScan(scan)
@@ -377,11 +377,11 @@ func TestInsertFillsMissingColumnDefaultCurrentTimestamp(t *testing.T) {
 	}
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "audit_ts"})
 
-	insertPlan := &planner.Insert{
+	insertPlan := &optimizer.Insert{
 		Table: tbl,
-		Source: &planner.Values{
-			Rows: [][]planner.Expr{
-				{&planner.IntegerConst{Value: 1}},
+		Source: &optimizer.Values{
+			Rows: [][]optimizer.Expr{
+				{&optimizer.IntegerConst{Value: 1}},
 			},
 		},
 		// INSERT INTO audit_ts (id) VALUES (1) — created_at omitted, DEFAULT fires.
@@ -402,7 +402,7 @@ func TestInsertFillsMissingColumnDefaultCurrentTimestamp(t *testing.T) {
 	_ = op.Close()
 	after := time.Now().UTC()
 
-	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: tbl})
 	if err := scan.Open(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -452,11 +452,11 @@ func TestInsertFillsMissingColumnDefaultCurrentDate(t *testing.T) {
 	}
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "audit_date"})
 
-	insertPlan := &planner.Insert{
+	insertPlan := &optimizer.Insert{
 		Table: tbl,
-		Source: &planner.Values{
-			Rows: [][]planner.Expr{
-				{&planner.IntegerConst{Value: 1}},
+		Source: &optimizer.Values{
+			Rows: [][]optimizer.Expr{
+				{&optimizer.IntegerConst{Value: 1}},
 			},
 		},
 		ColumnIndex: []int{0},
@@ -474,7 +474,7 @@ func TestInsertFillsMissingColumnDefaultCurrentDate(t *testing.T) {
 	}
 	_ = op.Close()
 
-	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: tbl})
 	if err := scan.Open(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -539,11 +539,11 @@ func TestInsertFillsMissingColumnDefaultNextval(t *testing.T) {
 
 	// Two INSERTs that each omit the DEFAULT column; expected ids are 1, 2.
 	for i := 0; i < 2; i++ {
-		insertPlan := &planner.Insert{
+		insertPlan := &optimizer.Insert{
 			Table: tbl,
-			Source: &planner.Values{
-				Rows: [][]planner.Expr{
-					{&planner.StringConst{Value: "row"}},
+			Source: &optimizer.Values{
+				Rows: [][]optimizer.Expr{
+					{&optimizer.StringConst{Value: "row"}},
 				},
 			},
 			ColumnIndex: []int{1},
@@ -561,7 +561,7 @@ func TestInsertFillsMissingColumnDefaultNextval(t *testing.T) {
 		_ = op.Close()
 	}
 
-	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: tbl})
 	if err := scan.Open(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -617,11 +617,11 @@ func TestInsertFillsMissingColumnDefaultNextvalAutoCreates(t *testing.T) {
 	}
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "audit_seq_auto"})
 
-	insertPlan := &planner.Insert{
+	insertPlan := &optimizer.Insert{
 		Table: tbl,
-		Source: &planner.Values{
-			Rows: [][]planner.Expr{
-				{&planner.StringConst{Value: "row"}},
+		Source: &optimizer.Values{
+			Rows: [][]optimizer.Expr{
+				{&optimizer.StringConst{Value: "row"}},
 			},
 		},
 		ColumnIndex: []int{1},
@@ -638,7 +638,7 @@ func TestInsertFillsMissingColumnDefaultNextvalAutoCreates(t *testing.T) {
 	}
 	_ = op.Close()
 
-	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: tbl})
 	if err := scan.Open(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -734,16 +734,16 @@ func TestSeqScanFiresPrefetchesAcrossBlocks(t *testing.T) {
 
 	// Stuff enough rows in to span several blocks.
 	const N = 600
-	rows := make([][]planner.Expr, N)
+	rows := make([][]optimizer.Expr, N)
 	for i := range rows {
-		rows[i] = []planner.Expr{
-			&planner.IntegerConst{Value: int64(i)},
-			&planner.StringConst{Value: "row"},
+		rows[i] = []optimizer.Expr{
+			&optimizer.IntegerConst{Value: int64(i)},
+			&optimizer.StringConst{Value: "row"},
 		}
 	}
-	in := &planner.Insert{
+	in := &optimizer.Insert{
 		Table:       tbl,
-		Source:      &planner.Values{Rows: rows},
+		Source:      &optimizer.Values{Rows: rows},
 		ColumnIndex: []int{0, 1},
 	}
 	op, _ := Build(in)
@@ -777,7 +777,7 @@ func TestSeqScanFiresPrefetchesAcrossBlocks(t *testing.T) {
 	// prefetches, not any Pin-driven background reads from the
 	// insert path.
 	eng.submits = 0
-	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: tbl})
 	if err := scan.Open(ctx); err != nil {
 		t.Fatal(err)
 	}

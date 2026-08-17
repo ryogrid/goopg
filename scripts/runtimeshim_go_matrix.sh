@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # runtimeshim_go_matrix.sh — verify the //go:linkname bindings in
-# internal/runtimeshim against every Go toolchain present on the host.
+# internal/port/runtimeshim against every Go toolchain present on the host.
 #
 # The runtimeshim package binds three primitives to runtime/sync internal
 # symbols via //go:linkname (per docs/design/perf-optimize/08-runtime-internals.md
@@ -74,7 +74,7 @@ for tc in "${TOOLCHAINS[@]}"; do
   ver="$("$tc" version 2>/dev/null || echo "unknown")"
   echo "=== $tc ($ver) [linkname] ==="
 
-  if "$tc" test -race -count=1 ./internal/runtimeshim/...; then
+  if "$tc" test -race -count=1 ./internal/port/runtimeshim/...; then
     SUMMARY+=("$tc linkname: PASS ($ver)")
   else
     SUMMARY+=("$tc linkname: FAIL ($ver)")
@@ -82,7 +82,7 @@ for tc in "${TOOLCHAINS[@]}"; do
   fi
 
   echo "=== $tc ($ver) [fallback -tags noLinkname] ==="
-  if "$tc" test -race -count=1 -tags noLinkname ./internal/runtimeshim/...; then
+  if "$tc" test -race -count=1 -tags noLinkname ./internal/port/runtimeshim/...; then
     SUMMARY+=("$tc fallback: PASS ($ver)")
   else
     SUMMARY+=("$tc fallback: FAIL ($ver)")

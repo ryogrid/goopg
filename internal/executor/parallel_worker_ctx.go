@@ -43,7 +43,7 @@ package executor
 import (
 	"context"
 
-	"github.com/goopg/goopg/internal/mctx"
+	"github.com/goopg/goopg/internal/utils/mmgr"
 )
 
 // NewWorkerContext derives a context for one parallel worker from the leader's.
@@ -55,7 +55,7 @@ import (
 // fan-out — cancelling it stops every worker.
 //
 // The returned context is safe to hand to exactly one goroutine.
-func NewWorkerContext(leader *Context, workerMctx *mctx.Context, workerCtx context.Context) *Context {
+func NewWorkerContext(leader *Context, workerMctx *mmgr.Context, workerCtx context.Context) *Context {
 	w := NewContext()
 
 	// ── shared, read-only ────────────────────────────────────────────────

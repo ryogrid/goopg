@@ -64,7 +64,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/executor"
-	"github.com/goopg/goopg/internal/pglz"
+	"github.com/goopg/goopg/internal/access/common/pglz"
 )
 
 const (

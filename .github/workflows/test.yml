@@ -100,10 +100,16 @@ jobs:
       #   internal/testutil/pubsubcluster — pub/sub multi-node
       #   internal/testutil/tpch    — TPC-H parity against PostgreSQL
       #   /bench/                   — benchmarks; smoke test run separately
+      #
+      # The internal/testutil/* entries are enumerated ONE BY ONE on purpose.
+      # Do not collapse them to a bare `internal/testutil`:
+      # internal/testutil/estimateaudit is a plain library with ordinary unit
+      # tests and must keep running in the gates. Collapsing the alternation
+      # would drop it silently.
       # ------------------------------------------------------------------ #
       - name: Run unit and component tests
         run: |
-          EXCLUDE='internal/testport|internal/server
+          EXCLUDE='internal/testport|internal/postmaster
                    |internal/testutil/cluster|internal/testutil/replcluster
                    |internal/testutil/pgcluster|internal/testutil/pubsubcluster
                    |internal/testutil/tpch|/bench/'

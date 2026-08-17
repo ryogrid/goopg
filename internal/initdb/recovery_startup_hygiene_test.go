@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/goopg/goopg/internal/config"
-	"github.com/goopg/goopg/internal/control"
+	"github.com/goopg/goopg/internal/utils/misc"
+	"github.com/goopg/goopg/internal/access/transam/control"
 )
 
 // TestClearRelcacheInitFilesSweepsWholeCluster pins M0131-S20.3's sweep against
@@ -23,7 +23,7 @@ import (
 func TestClearRelcacheInitFilesSweepsWholeCluster(t *testing.T) {
 	dir := t.TempDir()
 
-	verDir := config.TablespaceVersionDirectory
+	verDir := misc.TablespaceVersionDirectory
 	swept := []string{
 		filepath.Join("global", "pg_internal.init"),
 		filepath.Join("base", "1", "pg_internal.init"),

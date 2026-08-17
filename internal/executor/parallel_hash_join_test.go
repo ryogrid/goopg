@@ -25,7 +25,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // pqJoinFixture builds a small dimension and a larger fact table, plus NULLs on
@@ -111,11 +111,11 @@ func runJoinGathered(t *testing.T, ctx *Context, sql string, workers int) ([]str
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	node, err := planner.Plan(stmts[0], ctx.Catalog)
+	node, err := optimizer.Plan(stmts[0], ctx.Catalog)
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
-	gathered := planner.MaybeAddGather(node, planner.ParallelSettings{
+	gathered := optimizer.MaybeAddGather(node, optimizer.ParallelSettings{
 		MaxWorkersPerGather: workers,
 		MinTableScanBlocks:  1,
 		DebugParallelQuery:  "on", // force past the size gate; fixtures are small
@@ -149,19 +149,19 @@ func runJoinGathered(t *testing.T, ctx *Context, sql string, workers int) ([]str
 	return out, hasGather
 }
 
-func planTreeHasParallelNode(n planner.Node) bool {
+func planTreeHasParallelNode(n optimizer.Node) bool {
 	found := false
-	var walk func(planner.Node)
-	walk = func(cur planner.Node) {
+	var walk func(optimizer.Node)
+	walk = func(cur optimizer.Node) {
 		if cur == nil || found {
 			return
 		}
 		switch cur.(type) {
-		case *planner.Gather, *planner.GatherMerge:
+		case *optimizer.Gather, *optimizer.GatherMerge:
 			found = true
 			return
 		}
-		for _, c := range planner.ParallelChildrenForTest(cur) {
+		for _, c := range optimizer.ParallelChildrenForTest(cur) {
 			walk(c)
 		}
 	}
@@ -246,11 +246,11 @@ func TestSharedHashBuildRunsOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	node, err := planner.Plan(stmts[0], ctx.Catalog)
+	node, err := optimizer.Plan(stmts[0], ctx.Catalog)
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
-	gathered := planner.MaybeAddGather(node, planner.ParallelSettings{
+	gathered := optimizer.MaybeAddGather(node, optimizer.ParallelSettings{
 		MaxWorkersPerGather: 4,
 		MinTableScanBlocks:  1,
 		DebugParallelQuery:  "on",

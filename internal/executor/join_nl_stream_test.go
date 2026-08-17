@@ -26,7 +26,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // countingOp wraps a rowsOp and records how many times Open and Next were
@@ -39,12 +39,12 @@ type countingOp struct {
 	closes int
 }
 
-func newCountingOp(rows []Row, schema planner.Schema) *countingOp {
+func newCountingOp(rows []Row, schema optimizer.Schema) *countingOp {
 	return &countingOp{inner: &rowsOp{rows: rows, schema: schema}}
 }
 
 func (c *countingOp) Open(ctx *Context) error { c.opens++; return c.inner.Open(ctx) }
-func (c *countingOp) Schema() planner.Schema  { return c.inner.Schema() }
+func (c *countingOp) Schema() optimizer.Schema  { return c.inner.Schema() }
 func (c *countingOp) Next() (TupleSlot, error) { //nolint:ireturn
 	c.nexts++
 	return c.inner.Next()
@@ -189,14 +189,14 @@ func withNLInnerWorkMem(t *testing.T) {
 
 // nlJoinPlan is a nested-loop join of the given type on (l0 = r0). The
 // equality lives in Predicate because that is all a nested loop evaluates.
-func nlJoinPlan(jt planner.JoinType, leftWidth int) *planner.Join {
-	col := func(idx int) *planner.ColumnRef {
-		return &planner.ColumnRef{Index: idx, Type: catalog.Type{Name: "int4"}}
+func nlJoinPlan(jt optimizer.JoinType, leftWidth int) *optimizer.Join {
+	col := func(idx int) *optimizer.ColumnRef {
+		return &optimizer.ColumnRef{Index: idx, Type: catalog.Type{Name: "int4"}}
 	}
-	return &planner.Join{
+	return &optimizer.Join{
 		Type:      jt,
-		Algo:      planner.JoinAlgoNestedLoop,
-		Predicate: &planner.BinaryOp{Op: parser.OpEq, Left: col(0), Right: col(leftWidth)},
+		Algo:      optimizer.JoinAlgoNestedLoop,
+		Predicate: &optimizer.BinaryOp{Op: parser.OpEq, Left: col(0), Right: col(leftWidth)},
 		Left:      valuesNode(0),
 		Right:     valuesNode(0),
 	}
@@ -209,7 +209,7 @@ func TestNestedLoopStreamsOuterAndReadsInnerOnce(t *testing.T) {
 	const outerN, innerN = 40, 60
 	outer := newCountingOp(seqRows(outerN, "l"), batchSchema("l", 2))
 	inner := newCountingOp(seqRows(innerN, "r"), batchSchema("r", 2))
-	o := newJoinOp(nlJoinPlan(planner.JoinTypeInner, 2), outer, inner)
+	o := newJoinOp(nlJoinPlan(optimizer.JoinTypeInner, 2), outer, inner)
 	if err := o.Open(&Context{}); err != nil {
 		t.Fatalf("open join: %v", err)
 	}
@@ -242,8 +242,8 @@ func TestNestedLoopIdenticalWhenInnerCacheSpills(t *testing.T) {
 	const outerN, innerN, lw, rw = 30, 80, 2, 2
 	left := seqRows(outerN, "l")
 	right := seqRows(innerN, "r")
-	for _, jt := range []planner.JoinType{
-		planner.JoinTypeInner, planner.JoinTypeLeft, planner.JoinTypeRight, planner.JoinTypeFull,
+	for _, jt := range []optimizer.JoinType{
+		optimizer.JoinTypeInner, optimizer.JoinTypeLeft, optimizer.JoinTypeRight, optimizer.JoinTypeFull,
 	} {
 		t.Run(fmt.Sprint(jt), func(t *testing.T) {
 			want, _ := runBatchJoin(t, nlJoinPlan(jt, lw), left, right, lw, rw, 0)
@@ -263,7 +263,7 @@ func TestNestedLoopRightJoinOverEmptyOuter(t *testing.T) {
 	right := seqRows(innerN, "r")
 	for _, workMem := range []int64{0, 256} {
 		t.Run(fmt.Sprintf("workmem%d", workMem), func(t *testing.T) {
-			got, _ := runBatchJoin(t, nlJoinPlan(planner.JoinTypeRight, lw), nil, right, lw, rw, workMem)
+			got, _ := runBatchJoin(t, nlJoinPlan(optimizer.JoinTypeRight, lw), nil, right, lw, rw, workMem)
 			if len(got) != innerN {
 				t.Fatalf("%d rows, want %d (every right tuple, null-extended)", len(got), innerN)
 			}
@@ -281,11 +281,11 @@ func TestNestedLoopKeylessSemiAntiEarlyOut(t *testing.T) {
 	left := seqRows(10, "l")
 	right := seqRows(5, "r")
 	for _, tc := range []struct {
-		jt   planner.JoinType
+		jt   optimizer.JoinType
 		want int
 	}{
-		{planner.JoinTypeSemi, 5},
-		{planner.JoinTypeAnti, 5},
+		{optimizer.JoinTypeSemi, 5},
+		{optimizer.JoinTypeAnti, 5},
 	} {
 		t.Run(fmt.Sprint(tc.jt), func(t *testing.T) {
 			for _, workMem := range []int64{0, 128} {

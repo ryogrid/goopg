@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goopg/goopg/internal/access/btree"
-	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/access/nbtree"
+	"github.com/goopg/goopg/internal/storage/lmgr"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -55,9 +55,9 @@ func TestReindexIndexPhysicallyRebuilds(t *testing.T) {
 		t.Fatalf("REINDEX INDEX: %v", err)
 	}
 
-	bt, err := btree.Open(ctx.Pool, idxRel)
+	bt, err := nbtree.Open(ctx.Pool, idxRel)
 	if err != nil {
-		t.Fatalf("btree.Open after REINDEX: %v", err)
+		t.Fatalf("nbtree.Open after REINDEX: %v", err)
 	}
 	var got []storage.ItemPointer
 	if err := bt.RangeScan(nil, nil, func(key []byte, ptr storage.ItemPointer) (bool, error) {
@@ -105,9 +105,9 @@ func TestReindexTablePhysicallyRebuildsAllIndexes(t *testing.T) {
 		t.Fatalf("REINDEX TABLE: %v", err)
 	}
 
-	bt, err := btree.Open(ctx.Pool, aRel)
+	bt, err := nbtree.Open(ctx.Pool, aRel)
 	if err != nil {
-		t.Fatalf("btree.Open(t_a_idx) after REINDEX TABLE: %v", err)
+		t.Fatalf("nbtree.Open(t_a_idx) after REINDEX TABLE: %v", err)
 	}
 	var count int
 	if err := bt.RangeScan(nil, nil, func(key []byte, ptr storage.ItemPointer) (bool, error) {
@@ -178,9 +178,9 @@ func TestReindexSchemaPhysicallyRebuildsAllTables(t *testing.T) {
 	}
 
 	for name, rel := range map[string]storage.RelFileNode{"t1_idx": rel1, "t2_idx": rel2} {
-		bt, err := btree.Open(ctx.Pool, rel)
+		bt, err := nbtree.Open(ctx.Pool, rel)
 		if err != nil {
-			t.Fatalf("btree.Open(%s) after REINDEX SCHEMA: %v", name, err)
+			t.Fatalf("nbtree.Open(%s) after REINDEX SCHEMA: %v", name, err)
 		}
 		var count int
 		if err := bt.RangeScan(nil, nil, func(key []byte, ptr storage.ItemPointer) (bool, error) {
@@ -219,10 +219,10 @@ func TestReindexIndexBlocksBehindConcurrentIndexReader(t *testing.T) {
 		t.Fatalf("t_idx not found after CREATE INDEX")
 	}
 	idxRel := ctx.Catalog.IndexRelFileNode(idx)
-	idxTag := lockmgr.LockTag{DB: idxRel.DBOid, Rel: idxRel.RelOid}
+	idxTag := lmgr.LockTag{DB: idxRel.DBOid, Rel: idxRel.RelOid}
 
-	const readerBackend lockmgr.BackendID = 424242
-	if err := tableLockMgr.Acquire(context.Background(), readerBackend, idxTag, lockmgr.AccessShareLock); err != nil {
+	const readerBackend lmgr.BackendID = 424242
+	if err := tableLockMgr.Acquire(context.Background(), readerBackend, idxTag, lmgr.AccessShareLock); err != nil {
 		t.Fatalf("reader Acquire: %v", err)
 	}
 
@@ -236,7 +236,7 @@ func TestReindexIndexBlocksBehindConcurrentIndexReader(t *testing.T) {
 	case <-time.After(150 * time.Millisecond):
 	}
 
-	tableLockMgr.Release(readerBackend, idxTag, lockmgr.AccessShareLock)
+	tableLockMgr.Release(readerBackend, idxTag, lmgr.AccessShareLock)
 
 	select {
 	case err := <-done:
@@ -296,9 +296,9 @@ func TestReindexIndexConcurrentlyPhysicallyRebuilds(t *testing.T) {
 		t.Fatalf("index RelFileNode changed after REINDEX CONCURRENTLY: got %v, want unchanged %v", got, idxRel)
 	}
 
-	bt, err := btree.Open(ctx.Pool, idxRel)
+	bt, err := nbtree.Open(ctx.Pool, idxRel)
 	if err != nil {
-		t.Fatalf("btree.Open after REINDEX INDEX CONCURRENTLY: %v", err)
+		t.Fatalf("nbtree.Open after REINDEX INDEX CONCURRENTLY: %v", err)
 	}
 	var got []storage.ItemPointer
 	if err := bt.RangeScan(nil, nil, func(key []byte, ptr storage.ItemPointer) (bool, error) {
@@ -348,9 +348,9 @@ func TestReindexTableConcurrentlyPhysicallyRebuildsAllIndexes(t *testing.T) {
 		t.Fatalf("REINDEX TABLE CONCURRENTLY: %v", err)
 	}
 
-	bt, err := btree.Open(ctx.Pool, aRel)
+	bt, err := nbtree.Open(ctx.Pool, aRel)
 	if err != nil {
-		t.Fatalf("btree.Open(t_a_idx) after REINDEX TABLE CONCURRENTLY: %v", err)
+		t.Fatalf("nbtree.Open(t_a_idx) after REINDEX TABLE CONCURRENTLY: %v", err)
 	}
 	var count int
 	if err := bt.RangeScan(nil, nil, func(key []byte, ptr storage.ItemPointer) (bool, error) {

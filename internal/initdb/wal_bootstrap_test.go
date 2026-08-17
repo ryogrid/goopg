@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // TestWriteBootstrapWAL verifies that WriteBootstrapWAL produces a
@@ -50,7 +50,7 @@ func TestWriteBootstrapWAL(t *testing.T) {
 	}
 
 	// File must be exactly wal_segment_size.
-	want := int(wal.DefaultSegmentSize)
+	want := int(xlog.DefaultSegmentSize)
 	if len(data) != want {
 		t.Fatalf("segment size = %d, want %d", len(data), want)
 	}
@@ -59,11 +59,11 @@ func TestWriteBootstrapWAL(t *testing.T) {
 
 	// Long page header (bytes 0..39).
 	magic := le.Uint16(data[0:2])
-	if magic != wal.XLOGPageMagic {
-		t.Errorf("xlp_magic = 0x%04X, want 0x%04X", magic, wal.XLOGPageMagic)
+	if magic != xlog.XLOGPageMagic {
+		t.Errorf("xlp_magic = 0x%04X, want 0x%04X", magic, xlog.XLOGPageMagic)
 	}
 	info := le.Uint16(data[2:4])
-	if info&wal.XLPLongHeader == 0 {
+	if info&xlog.XLPLongHeader == 0 {
 		t.Errorf("xlp_info = 0x%04X: XLPLongHeader bit not set", info)
 	}
 	tli := le.Uint32(data[4:8])
@@ -71,7 +71,7 @@ func TestWriteBootstrapWAL(t *testing.T) {
 		t.Errorf("xlp_tli = %d, want 1", tli)
 	}
 	pageAddr := le.Uint64(data[8:16])
-	wantPageAddr := uint64(wal.DefaultSegmentSize)
+	wantPageAddr := uint64(xlog.DefaultSegmentSize)
 	if pageAddr != wantPageAddr {
 		t.Errorf("xlp_pageaddr = 0x%016X, want 0x%016X", pageAddr, wantPageAddr)
 	}
@@ -80,16 +80,16 @@ func TestWriteBootstrapWAL(t *testing.T) {
 		t.Errorf("xlp_sysid = 0x%016X, want 0x%016X", gotSysID, sysID)
 	}
 	segSize := le.Uint32(data[32:36])
-	if segSize != uint32(wal.DefaultSegmentSize) {
-		t.Errorf("xlp_seg_size = %d, want %d", segSize, wal.DefaultSegmentSize)
+	if segSize != uint32(xlog.DefaultSegmentSize) {
+		t.Errorf("xlp_seg_size = %d, want %d", segSize, xlog.DefaultSegmentSize)
 	}
 	xlogBlcksz := le.Uint32(data[36:40])
-	if xlogBlcksz != uint32(wal.XLOGBlockSize) {
-		t.Errorf("xlp_xlog_blcksz = %d, want %d", xlogBlcksz, wal.XLOGBlockSize)
+	if xlogBlcksz != uint32(xlog.XLOGBlockSize) {
+		t.Errorf("xlp_xlog_blcksz = %d, want %d", xlogBlcksz, xlog.XLOGBlockSize)
 	}
 
 	// XLogRecord header starts at byte 40 (SizeOfXLogLongPHD).
-	recOff := wal.SizeOfXLogLongPHD // 40
+	recOff := xlog.SizeOfXLogLongPHD // 40
 	totLen := le.Uint32(data[recOff+0 : recOff+4])
 	if totLen != 114 {
 		t.Errorf("xl_tot_len = %d, want 114", totLen)
@@ -123,7 +123,7 @@ func TestWriteBootstrapWAL(t *testing.T) {
 	// Payload starts at byte 40+24 = 64.
 	// Byte 64: XLogRecordDataHeaderShort id = 255.
 	// Byte 65: data_length = 88.
-	payOff := recOff + wal.SizeOfXLogRecord // 64
+	payOff := recOff + xlog.SizeOfXLogRecord // 64
 	if data[payOff] != 255 {
 		t.Errorf("data header id = %d, want 255 (XLR_BLOCK_ID_DATA_SHORT)", data[payOff])
 	}
@@ -155,7 +155,7 @@ func TestWriteBootstrapWAL(t *testing.T) {
 	}
 
 	// Bytes beyond the first 8 KiB page must be zero.
-	for i := wal.XLOGBlockSize; i < want; i++ {
+	for i := xlog.XLOGBlockSize; i < want; i++ {
 		if data[i] != 0 {
 			t.Fatalf("byte %d beyond first page is non-zero: 0x%02X", i, data[i])
 		}

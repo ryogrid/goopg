@@ -37,6 +37,40 @@ list, `-race`; timeout raised from the 15m default for nightly co-load),
 wrapped the same way with `GOOPG_CG_UNIT=goopg-nightly-race`. Also
 no-expected-fail. Race findings are regressions by definition.
 
+**Per-package sharding (added 2026-08-17, AI-20260815-011722-001 /
+AI-20260816-005117-001).** A package can blow `RACE_TIMEOUT` without being
+racy at all, when it is slow *and* internally sequential — the timeout is
+per test binary, so a package with no `t.Parallel()` fan-out gets no benefit
+from the stage's `GOFLAGS=-p=4`. `internal/initdb` is the known case: 122
+call sites of the full on-disk `initdb.Init(...)` bootstrap
+(`internal/initdb/initdb.go:1331`) across 38 files at ~27–29s each under
+`-race`, only `relcache_init_test.go` calling `t.Parallel()` — ≈50–70 min
+sequential, which timed out at 45m on two consecutive nightlies
+(`panic: test timed out after 45m0s`, zero `DATA RACE` matches).
+
+The policy answer is **re-partition, never de-scope**: the fix must not be
+an `RACE_EXCLUDE` entry, a `testing.Short()` gate, or a raised global
+timeout, because each of those trades away the coverage the gate exists for
+(unlike the `RACE_EXCLUDE` entries above, which are justified by the
+integration suite covering the same code). Instead `make race-gate` fans a
+listed package out into `RACE_SHARDS` concurrent `go test -race -run <regex>`
+invocations over a disjoint round-robin partition of its `go test -list`
+test names:
+
+- `RACE_SHARD_PKGS` (default `internal/initdb`) — import-path suffixes to shard.
+- `RACE_SHARDS` (default 4) — shards per listed package.
+- `RACE_SHARD_ONLY=1` — skip the bulk run, to time the shard set alone.
+
+Every other package still runs through one bulk `go test -race` exactly as
+before. Two self-checks keep the sharding honest, both failing the gate: the
+per-shard test counts must sum to the `go test -list` count (catches
+partition drift), and an empty test list for a listed package is a hard
+error rather than a silently-skipped package (catches a build failure or a
+stale suffix in `RACE_SHARD_PKGS` masquerading as success). Measured
+2026-08-17: 4 shards, 152+151+151+151 = 605 tests, ≈19m56s wall-clock,
+slowest shard 1154s — comfortably inside the 45m budget and faster than the
+timeout it replaced.
+
 ### Lane H step 1 — oracle-port suite (`stage-testport.sh`)
 
 ```bash
@@ -297,7 +331,7 @@ Unchanged from the established process; the batch is a pure consumer:
 |-------|---------------------|
 | S0 preflight + build | ~2–4 min |
 | Lane L units | ~10 min uncontended; up to `NIGHTLY_UNITS_TIMEOUT` (30m) under co-load |
-| Lane L race | ~15 min uncontended; `RACE_TIMEOUT` raised to 45m for the nightly |
+| Lane L race | ~15 min uncontended; `RACE_TIMEOUT` raised to 45m for the nightly. `internal/initdb` is sharded ×4 (≈20 min for the shard set alone, measured 2026-08-17) — see §"Per-package sharding" |
 | Lane H testport (incl. regress+isolation) | not yet measured as one run; budget `-timeout 120m`, record actual on first nights |
 | Lane H pgbench nightly (s=50, c=100, j=20, T=180×3) | ~12–15 min |
 | S2 TPC-H | sweep ≤ 2 h hard + ≤ ~35 min setup/spotcheck/EXPLAIN overhead (doc 05 §D scope note); baseline full pass 1469 s |

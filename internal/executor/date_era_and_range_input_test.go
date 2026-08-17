@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goopg/goopg/internal/pgdatetime"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/utils/adt/datetime"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // PostgreSQL's date/time input carries an era: '2020-01-01 BC' is an ordinary
@@ -43,7 +43,7 @@ func TestDateInputRejectsUnrepresentableInsteadOfWrapping(t *testing.T) {
 			t.Errorf("parseCopyTimestamp(%q) = %v, want a range error — the nanosecond carrier cannot hold this and must not wrap it", in, got)
 			continue
 		}
-		if !errors.Is(err, errTimeCarrierRange) && !errors.Is(err, pgdatetime.ErrFieldOutOfRange) {
+		if !errors.Is(err, errTimeCarrierRange) && !errors.Is(err, datetime.ErrFieldOutOfRange) {
 			t.Errorf("parseCopyTimestamp(%q) err = %v, want a RANGE error (22008), not a syntax miss", in, err)
 		}
 	}
@@ -53,7 +53,7 @@ func TestDateInputRejectsUnrepresentableInsteadOfWrapping(t *testing.T) {
 // applies in both eras.
 func TestDateInputRejectsYearZero(t *testing.T) {
 	for _, in := range []string{"0000-01-01", "0000-01-01 BC", "0000-06-15 10:00:00"} {
-		if _, err := parseCopyTimestamp(in); !errors.Is(err, pgdatetime.ErrFieldOutOfRange) {
+		if _, err := parseCopyTimestamp(in); !errors.Is(err, datetime.ErrFieldOutOfRange) {
 			t.Errorf("parseCopyTimestamp(%q) err = %v, want ErrFieldOutOfRange — PG raises 22008 here", in, err)
 		}
 	}
@@ -160,7 +160,7 @@ func TestDateEraLiteralAndCopyPathsAgree(t *testing.T) {
 	}
 	for _, in := range forms {
 		_, copyErr := parsePGDateText(in)
-		_, litErr := evalTypedStringLit(&planner.TypedStringLit{Type: "date", Value: in}, nil)
+		_, litErr := evalTypedStringLit(&optimizer.TypedStringLit{Type: "date", Value: in}, nil)
 		if (copyErr == nil) != (litErr == nil) {
 			t.Errorf("date %q: shared-entry err=%v but literal path err=%v — the date input paths have drifted apart",
 				in, copyErr, litErr)
@@ -269,7 +269,7 @@ func TestBCLeapDayTimestampFallbackKeepsTheErrorClasses(t *testing.T) {
 			t.Errorf("parsePGTimestampText(%q): %v — inside the representable range", in, err)
 		}
 	}
-	if _, err := parsePGTimestampText("2021-02-29 10:00:00"); !errors.Is(err, pgdatetime.ErrFieldOutOfRange) {
+	if _, err := parsePGTimestampText("2021-02-29 10:00:00"); !errors.Is(err, datetime.ErrFieldOutOfRange) {
 		t.Errorf("parsePGTimestampText(2021-02-29 10:00:00) err = %v, want ErrFieldOutOfRange — 2021 is not leap", err)
 	}
 }

@@ -1,7 +1,7 @@
 ---
 name: implementer
-description: Execute one narrowly-specified implementation slice from a coordinator brief (tmp/ralph-handoffs/<id>/brief.md) — edit the named goopg source files, add the named targeted tests, run package-level tests, append report.md. Use for any code change the coordinator has already designed and decomposed. Never redesigns, never commits.
-tools: Read, Grep, Glob, Bash, Write, Edit, mcp__serena__*, mcp__any-script__*
+description: Execute one narrowly-specified implementation slice from a coordinator brief (tmp/ralph-handoffs/<id>/brief.md) — edit the named goopg source files, add the named targeted tests, run package-level tests, append report.md. Use for any code change the coordinator has already designed and decomposed. Never commits.
+tools: Read, Grep, Glob, Bash, Write, Edit, mcp__serena__*
 model: sonnet
 ---
 
@@ -18,8 +18,7 @@ definition only summarizes.
    code actually does, STOP and report NEEDS-DECISION — do not improvise.
 2. **No commits, ever.** Leave the tree uncommitted; the coordinator reviews the
    diff and commits. Do not run `git commit`, `git push`, `git stash`, or
-   `git checkout --` (another loop's WIP may share the tree — touch only the
-   brief's files).
+   `git checkout --` (another loop's WIP may share the tree).
 3. **Oracle citations.** The brief cites PG source (e.g.
    `postgres/src/backend/utils/adt/regproc.c:regprocin`). Mirror upstream semantics
    — error SQLSTATEs, edge-case behavior — and cite the upstream file in code

@@ -1,0 +1,60 @@
+pgbench (18.3)
+starting vacuum...end.
+progress: 30.0 s, 88216.6 tps, lat 0.566 ms stddev 2.680, 0 failed
+progress: 60.0 s, 92087.7 tps, lat 0.542 ms stddev 2.380, 0 failed
+progress: 90.0 s, 90855.8 tps, lat 0.549 ms stddev 2.484, 0 failed
+progress: 120.0 s, 91463.1 tps, lat 0.546 ms stddev 2.434, 0 failed
+progress: 150.0 s, 90410.8 tps, lat 0.552 ms stddev 2.423, 0 failed
+progress: 180.0 s, 92216.5 tps, lat 0.541 ms stddev 2.458, 0 failed
+pgbench: error: client 3 script 0 aborted in command 1 query 1: ERROR:  mvcc: unknown transaction
+pgbench: error: client 6 script 0 aborted in command 1 query 1: ERROR:  mvcc: unknown transaction
+pgbench: error: client 9 script 0 aborted in command 1 query 1: ERROR:  mvcc: unknown transaction
+pgbench: error: client 2 script 0 aborted in command 1 query 1: ERROR:  mvcc: unknown transaction
+pgbench: error: client 1 script 0 aborted in command 1 query 1: ERROR:  mvcc: unknown transaction
+pgbench: error: client 5 script 0 aborted in command 1 query 1: ERROR:  mvcc: unknown transaction
+pgbench: error: client 8 script 0 aborted in command 1 query 0: ERROR:  mvcc: unknown transaction
+pgbench: error: client 40 script 0 aborted in command 1 query 1: ERROR:  mvcc: unknown transaction
+pgbench: error: client 0 script 0 aborted in command 1 query 1: ERROR:  mvcc: unknown transaction
+pgbench: error: client 41 script 0 aborted in command 1 query 1: ERROR:  mvcc: unknown transaction
+pgbench: error: client 15 script 0 aborted in command 1 query 1: ERROR:  mvcc: unknown transaction
+pgbench: error: client 16 script 0 aborted in command 1 query 1: ERROR:  mvcc: unknown transaction
+pgbench: error: client 25 script 0 aborted in command 1 query 1: ERROR:  mvcc: unknown transaction
+pgbench: error: client 23 script 0 aborted in command 1 query 0: ERROR:  mvcc: unknown transaction
+pgbench: error: client 12 script 0 aborted in command 1 query 1: ERROR:  mvcc: unknown transaction
+pgbench: error: client 28 script 0 aborted in command 1 query 1: ERROR:  mvcc: unknown transaction
+pgbench: error: client 39 script 0 aborted in command 1 query 1: ERROR:  mvcc: unknown transaction
+pgbench: error: client 14 script 0 aborted in command 1 query 1: ERROR:  mvcc: unknown transaction
+pgbench: error: client 29 script 0 aborted in command 1 query 1: ERROR:  mvcc: unknown transaction
+pgbench: error: client 18 script 0 aborted in command 1 query 0: ERROR:  mvcc: unknown transaction
+pgbench: error: client 36 script 0 aborted in command 1 query 0: ERROR:  mvcc: unknown transaction
+pgbench: error: client 42 script 0 aborted in command 1 query 1: ERROR:  mvcc: unknown transaction
+pgbench: error: client 45 script 0 aborted in command 1 query 1: ERROR:  mvcc: unknown transaction
+pgbench: error: client 49 script 0 aborted in command 1 query 1: ERROR:  mvcc: unknown transaction
+pgbench: error: client 4 script 0 aborted in command 1 query 1: ERROR:  mvcc: unknown transaction
+pgbench: error: client 30 script 0 aborted in command 1 query 1: ERROR:  mvcc: unknown transaction
+pgbench: error: client 37 script 0 aborted in command 1 query 1: ERROR:  mvcc: unknown transaction
+pgbench: error: client 10 script 0 aborted in command 1 query 1: ERROR:  mvcc: unknown transaction
+pgbench: error: client 43 script 0 aborted in command 1 query 0: ERROR:  mvcc: unknown transaction
+pgbench: error: client 24 script 0 aborted in command 1 query 0: ERROR:  mvcc: unknown transaction
+pgbench: error: client 17 script 0 aborted in command 1 query 1: ERROR:  mvcc: unknown transaction
+pgbench: error: client 26 script 0 aborted in command 1 query 1: ERROR:  mvcc: unknown transaction
+pgbench: error: client 44 script 0 aborted in command 1 query 1: ERROR:  mvcc: unknown transaction
+pgbench: error: client 31 script 0 aborted in command 1 query 1: ERROR:  mvcc: unknown transaction
+pgbench: error: client 11 script 0 aborted in command 1 query 1: ERROR:  mvcc: unknown transaction
+transaction type: <builtin: select only>
+scaling factor: 100
+query mode: simple
+number of clients: 50
+number of threads: 50
+maximum number of tries: 1
+duration: 600 s
+number of transactions actually processed: 47857808
+number of failed transactions: 0 (0.000%)
+latency average = 0.383 ms
+latency stddev = 1.896 ms
+initial connection time = 6.490 ms
+tps = 79763.762980 (without initial connection time)
+statement latencies in milliseconds and failures:
+         0.001           0 \set aid random(1, 100000 * :scale)
+         0.385           0 SELECT abalance FROM pgbench_accounts WHERE aid = :aid;
+pgbench: error: Run was aborted; the above results are incomplete.

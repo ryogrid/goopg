@@ -7,11 +7,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/pgarray"
-	"github.com/goopg/goopg/internal/lockmgr"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/utils/adt/array"
+	"github.com/goopg/goopg/internal/storage/lmgr"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -21,13 +21,13 @@ import (
 // For pages not yet marked ALL_VISIBLE it falls back to a full heap fetch
 // so MVCC visibility is always respected.
 type indexOnlyScanOp struct {
-	plan *planner.IndexOnlyScan
+	plan *optimizer.IndexOnlyScan
 	ctx  *Context
 	rows []Row
 	idx  int
 	// arrayStyle is the session DateStyle/TimeZone an array element's output
 	// function reads, resolved once in Open. M0119-0006.
-	arrayStyle pgarray.OutputStyle
+	arrayStyle array.OutputStyle
 	// M0092-0007: embedded slot reused across every Next() call
 	// so we don't allocate a fresh MaterializedSlot per emission.
 	slot MaterializedSlot
@@ -52,11 +52,11 @@ type indexOnlyScanOp struct {
 // ANALYZE can surface this scan's heap-fetch count (design 0118-0102).
 func (o *indexOnlyScanOp) setHeapFetchCounter(c *int64) { o.heapFetchCount = c }
 
-func newIndexOnlyScanOp(p *planner.IndexOnlyScan) *indexOnlyScanOp {
+func newIndexOnlyScanOp(p *optimizer.IndexOnlyScan) *indexOnlyScanOp {
 	return &indexOnlyScanOp{plan: p}
 }
 
-func (o *indexOnlyScanOp) Schema() planner.Schema { return o.plan.Output() }
+func (o *indexOnlyScanOp) Schema() optimizer.Schema { return o.plan.Output() }
 
 func (o *indexOnlyScanOp) Open(ctx *Context) error {
 	if ctx.Pool == nil || ctx.Catalog == nil {
@@ -76,7 +76,7 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 	o.arrayStyle = arrayOutputStyle(ctx)
 
 	heapRel := ctx.Catalog.RelFileNode(o.plan.Table)
-	if err := ctx.acquireRelLock(heapRel, lockmgr.AccessShareLock); err != nil {
+	if err := ctx.acquireRelLock(heapRel, lmgr.AccessShareLock); err != nil {
 		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 			ee.Pos = o.plan.Pos()
 		}
@@ -298,6 +298,14 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
 
+	// S6 max rewrite: a Backward IOS emits the materialised rows in reverse.
+	// o.rows is only complete once RangeScan has run (Open materialises the
+	// whole index range before Next ever runs), so the start index is derived
+	// here — not at the top of Open, where o.rows is still nil.
+	if o.plan.Backward {
+		o.idx = len(o.rows) - 1
+	}
+
 	// Prune-on-read for TEMPORARY relations (horizons.spec, M0118-0009). PG
 	// opportunistically prunes a heap page whenever a scan visits it; for a temp
 	// relation that prune uses the session-local horizon (GlobalVisTempRels), so
@@ -362,15 +370,36 @@ func (o *indexOnlyScanOp) pruneTouchedTempPages(ctx *Context, heapRel storage.Re
 }
 
 func (o *indexOnlyScanOp) Next() (TupleSlot, error) {
-	if o.idx >= len(o.rows) {
-		return nil, EOF
+	// S6 min/max rewrite: the IOS carries a residual `col IS NOT NULL` qual in
+	// Cond that could not be pushed into the btree probe (planagg.c pushes it as
+	// an index qual; goopg's probe is equality/range-shaped). Skip rows that do
+	// not satisfy it. Nil Cond means no filtering.
+	//
+	// The max (Backward) rewrite steps the materialised rows in reverse — and
+	// MUST keep this same Cond check: emitting o.rows[len-1] without it leaks a
+	// NULL for a table that contains NULLs (the NULL-trap rule).
+	step := 1
+	if o.plan.Backward {
+		step = -1
 	}
-	r := o.rows[o.idx]
-	o.idx++
-	// M0092-0007: stack-aliased slot reused across Next() calls.
-	o.slot.schema = o.Schema()
-	o.slot.row = r
-	return &o.slot, nil
+	for o.idx >= 0 && o.idx < len(o.rows) {
+		r := o.rows[o.idx]
+		o.idx += step
+		if o.plan.Cond != nil {
+			d, err := evalExpr(o.plan.Cond, r, o.ctx)
+			if err != nil {
+				return nil, err
+			}
+			if d.IsNull() || d.Kind != KindBool || !d.BoolValue() {
+				continue
+			}
+		}
+		// M0092-0007: stack-aliased slot reused across Next() calls.
+		o.slot.schema = o.Schema()
+		o.slot.row = r
+		return &o.slot, nil
+	}
+	return nil, EOF
 }
 
 func (o *indexOnlyScanOp) Close() error {
@@ -489,13 +518,13 @@ func numericDatumFromBig(m *big.Int, scale int16) Datum {
 // decodeIndexKeyColumn decodes one column from a B-tree key slice and returns
 // the Datum plus the number of bytes consumed. Used by the multi-column path.
 func decodeIndexKeyColumn(key []byte, col catalog.Column) (Datum, int, error) {
-	return decodeIndexKeyColumnStyled(key, col, pgarray.DefaultOutputStyle())
+	return decodeIndexKeyColumnStyled(key, col, array.DefaultOutputStyle())
 }
 
 // decodeIndexKeyColumnStyled is decodeIndexKeyColumn under an explicit array
 // output style; only an ARRAY key column of a date/timestamp/timestamptz
 // element type reads it (M0119-0006).
-func decodeIndexKeyColumnStyled(key []byte, col catalog.Column, st pgarray.OutputStyle) (Datum, int, error) {
+func decodeIndexKeyColumnStyled(key []byte, col catalog.Column, st array.OutputStyle) (Datum, int, error) {
 	typeName := col.Type.Name
 	// Fixed-width branches must slice `key` to the type's exact byte
 	// width before delegating — btree.DecodeInt4 / DecodeInt8 enforce
@@ -519,26 +548,26 @@ func decodeIndexKeyColumnStyled(key []byte, col catalog.Column, st pgarray.Outpu
 		if len(key) < 4 {
 			return NullDatum, 0, fmt.Errorf("btree: int4 key truncated, got %d bytes", len(key))
 		}
-		v, err := btree.DecodeInt4(key[:4])
+		v, err := nbtree.DecodeInt4(key[:4])
 		return Datum{Kind: KindInt, Int: int64(v)}, 4, err
 	case isInt8Type(typeName):
 		if len(key) < 8 {
 			return NullDatum, 0, fmt.Errorf("btree: int8 key truncated, got %d bytes", len(key))
 		}
-		v, err := btree.DecodeInt8(key[:8])
+		v, err := nbtree.DecodeInt8(key[:8])
 		return Datum{Kind: KindInt, Int: v}, 8, err
 	case isFloat8Type(typeName):
 		if len(key) < 8 {
 			return NullDatum, 0, fmt.Errorf("btree: float8 key truncated, got %d bytes", len(key))
 		}
-		v, err := btree.DecodeFloat8(key[:8])
+		v, err := nbtree.DecodeFloat8(key[:8])
 		return NewStringDatum(strconv.FormatFloat(v, 'g', -1, 64)), 8, err
 	case isTimestampType(typeName) || isTimestamptzType(typeName):
 		// timestamp and timestamptz share the int64-micros key form. M0118-0001.
 		if len(key) < 8 {
 			return NullDatum, 0, fmt.Errorf("btree: timestamp key truncated, got %d bytes", len(key))
 		}
-		v, err := btree.DecodeTimestamp(key[:8])
+		v, err := nbtree.DecodeTimestamp(key[:8])
 		ts := pgEpoch.Add(time.Duration(v) * time.Microsecond)
 		// The key form is shared but the TYPE is not: an index-only scan answers
 		// the column from the key, so this datum reaches the user in place of the
@@ -553,7 +582,7 @@ func decodeIndexKeyColumnStyled(key []byte, col catalog.Column, st pgarray.Outpu
 		if len(key) < 4 {
 			return NullDatum, 0, fmt.Errorf("btree: date key truncated, got %d bytes", len(key))
 		}
-		v, err := btree.DecodeInt4(key[:4])
+		v, err := nbtree.DecodeInt4(key[:4])
 		ts := pgEpoch.Add(time.Duration(v) * 24 * time.Hour)
 		return NewDateDatum(ts), 4, err
 	case isNumericType(typeName):
@@ -561,14 +590,14 @@ func decodeIndexKeyColumnStyled(key []byte, col catalog.Column, st pgarray.Outpu
 		// composite walk can consume exactly this column. Value-preserving,
 		// not byte-preserving: EncodeNumericKey strips trailing mantissa
 		// zeros, so 1.50 decodes as (15, scale 1). M0119-0006.
-		m, scale, n, err := btree.DecodeNumericKey(key)
+		m, scale, n, err := nbtree.DecodeNumericKey(key)
 		if err != nil {
 			return NullDatum, 0, err
 		}
 		return numericDatumFromBig(m, scale), n, nil
 	case isVarcharType(typeName), isCharType(typeName), isTextType(typeName), isNameType(typeName),
 		strings.ToLower(typeName) == "uuid":
-		raw, n, err := btree.DecodeVarcharLen(key)
+		raw, n, err := nbtree.DecodeVarcharLen(key)
 		return NewStringDatum(string(raw)), n, err
 	default:
 		// For unknown types (e.g. user-defined enums encoded as float8), attempt float8 decode.
@@ -576,7 +605,7 @@ func decodeIndexKeyColumnStyled(key []byte, col catalog.Column, st pgarray.Outpu
 		if len(key) < 8 {
 			return NullDatum, 0, fmt.Errorf("IOS: unsupported key type %q (too short for float8)", typeName)
 		}
-		f, err := btree.DecodeFloat8(key[:8])
+		f, err := nbtree.DecodeFloat8(key[:8])
 		if err != nil {
 			return NullDatum, 0, fmt.Errorf("IOS: unsupported key type %q", typeName)
 		}
@@ -623,12 +652,12 @@ func (o *indexOnlyScanOp) decodeRowFromHeap(t storage.HeapTuple) (Row, error) {
 // decodeBTreeKeyToDatum inverts the B-tree key encoding for a single column
 // back to an executor Datum.
 func decodeBTreeKeyToDatum(key []byte, col catalog.Column) (Datum, error) {
-	return decodeBTreeKeyToDatumStyled(key, col, pgarray.DefaultOutputStyle())
+	return decodeBTreeKeyToDatumStyled(key, col, array.DefaultOutputStyle())
 }
 
 // decodeBTreeKeyToDatumStyled is decodeBTreeKeyToDatum under an explicit array
 // output style (M0119-0006).
-func decodeBTreeKeyToDatumStyled(key []byte, col catalog.Column, st pgarray.OutputStyle) (Datum, error) {
+func decodeBTreeKeyToDatumStyled(key []byte, col catalog.Column, st array.OutputStyle) (Datum, error) {
 	typeName := col.Type.Name
 	// Sibling of decodeIndexKeyColumn's array routing (same ordering rationale:
 	// an array's Type.Name is its ELEMENT type name, so it must not reach any
@@ -653,21 +682,21 @@ func decodeBTreeKeyToDatumStyled(key []byte, col catalog.Column, st pgarray.Outp
 	}
 	switch {
 	case isInt4Type(typeName):
-		v, err := btree.DecodeInt4(key)
+		v, err := nbtree.DecodeInt4(key)
 		if err != nil {
 			return NullDatum, err
 		}
 		return Datum{Kind: KindInt, Int: int64(v)}, nil
 
 	case isInt8Type(typeName):
-		v, err := btree.DecodeInt8(key)
+		v, err := nbtree.DecodeInt8(key)
 		if err != nil {
 			return NullDatum, err
 		}
 		return Datum{Kind: KindInt, Int: v}, nil
 
 	case isFloat8Type(typeName):
-		v, err := btree.DecodeFloat8(key)
+		v, err := nbtree.DecodeFloat8(key)
 		if err != nil {
 			return NullDatum, err
 		}
@@ -678,7 +707,7 @@ func decodeBTreeKeyToDatumStyled(key []byte, col catalog.Column, st pgarray.Outp
 		// must invert EncodeNumericKey, or a NUMERIC key column decodes one
 		// way in a single-column IOS and another way in a composite one.
 		// M0119-0006.
-		m, scale, _, err := btree.DecodeNumericKey(key)
+		m, scale, _, err := nbtree.DecodeNumericKey(key)
 		if err != nil {
 			return NullDatum, err
 		}
@@ -695,7 +724,7 @@ func decodeBTreeKeyToDatumStyled(key []byte, col catalog.Column, st pgarray.Outp
 		// the uuid. Latent today only because a uuid index takes the PG
 		// tuple-image key path (pgIndexTupleKeys), which is exactly why the
 		// blob sibling drifted. M0119-0006, Hard-won Rule #2.
-		b, err := btree.DecodeVarchar(key)
+		b, err := nbtree.DecodeVarchar(key)
 		if err != nil {
 			return NullDatum, err
 		}
@@ -703,7 +732,7 @@ func decodeBTreeKeyToDatumStyled(key []byte, col catalog.Column, st pgarray.Outp
 
 	case isTimestampType(typeName) || isTimestamptzType(typeName):
 		// timestamp and timestamptz share the int64-micros key form. M0118-0001.
-		v, err := btree.DecodeTimestamp(key)
+		v, err := nbtree.DecodeTimestamp(key)
 		if err != nil {
 			return NullDatum, err
 		}
@@ -718,7 +747,7 @@ func decodeBTreeKeyToDatumStyled(key []byte, col catalog.Column, st pgarray.Outp
 
 	case isDateType(typeName):
 		// date is encoded as int4 days since the PG epoch. M0118-0001.
-		v, err := btree.DecodeInt4(key)
+		v, err := nbtree.DecodeInt4(key)
 		if err != nil {
 			return NullDatum, err
 		}
@@ -730,7 +759,7 @@ func decodeBTreeKeyToDatumStyled(key []byte, col catalog.Column, st pgarray.Outp
 		if len(key) < 8 {
 			return NullDatum, fmt.Errorf("index-only scan: unsupported key type %q for key decode", typeName)
 		}
-		f, err2 := btree.DecodeFloat8(key[:8])
+		f, err2 := nbtree.DecodeFloat8(key[:8])
 		if err2 != nil {
 			return NullDatum, fmt.Errorf("index-only scan: unsupported key type %q for key decode", typeName)
 		}

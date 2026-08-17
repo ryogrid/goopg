@@ -39,7 +39,7 @@ package executor
 import (
 	"encoding/binary"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // compositeKeyWidth is the per-column width of the packed int64 lane.
@@ -77,10 +77,10 @@ func (o *joinOp) initExecKeys() {
 		// outside Plan()): keep the single-pair slots populated anyway so
 		// the non-composite path evaluates exactly the expressions it did
 		// before P2.2, nil included.
-		pairs = []planner.JoinKeyPair{{Left: o.plan.LeftKey, Right: o.plan.RightKey}}
+		pairs = []optimizer.JoinKeyPair{{Left: o.plan.LeftKey, Right: o.plan.RightKey}}
 	}
-	o.buildKeyExprs = make([]planner.Expr, len(pairs))
-	o.probeKeyExprs = make([]planner.Expr, len(pairs))
+	o.buildKeyExprs = make([]optimizer.Expr, len(pairs))
+	o.probeKeyExprs = make([]optimizer.Expr, len(pairs))
 	for i, k := range pairs {
 		if buildLeft {
 			o.buildKeyExprs[i], o.probeKeyExprs[i] = k.Left, k.Right
@@ -137,9 +137,9 @@ func (o *joinOp) ensureExecKeys() {
 // execKeyPlan is initExecKeys' planner query, isolated so a joinOp with no
 // plan (constructed directly by a test) degrades to the single-pair behaviour
 // instead of panicking.
-func (o *joinOp) execKeyPlan() planner.JoinExecKeys {
+func (o *joinOp) execKeyPlan() optimizer.JoinExecKeys {
 	if o.plan == nil {
-		return planner.JoinExecKeys{}
+		return optimizer.JoinExecKeys{}
 	}
 	return o.plan.ExecHashKeyPlan()
 }

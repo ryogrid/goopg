@@ -25,7 +25,7 @@ package executor
 import (
 	"testing"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // assertIntBuildTable is assertBuildTable's int64-map twin.
@@ -63,10 +63,10 @@ func TestBuildLoopBuildsOnlyTheSelectedMap(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			child := &bufferReuseOp{rows: buildProbeRows()}
 			o := &joinOp{
-				plan: &planner.Join{
-					Type:     planner.JoinTypeInner,
-					Algo:     planner.JoinAlgoHash,
-					RightKey: &planner.ColumnRef{Index: leftWidth},
+				plan: &optimizer.Join{
+					Type:     optimizer.JoinTypeInner,
+					Algo:     optimizer.JoinAlgoHash,
+					RightKey: &optimizer.ColumnRef{Index: leftWidth},
 				},
 				right:         child,
 				lazyRW:        2,
@@ -100,13 +100,13 @@ func TestBuildLoopBuildsOnlyTheSelectedMap(t *testing.T) {
 func TestBuildLoopSemiUsesIntMap(t *testing.T) {
 	const leftWidth = 4
 
-	for _, jt := range []planner.JoinType{planner.JoinTypeSemi, planner.JoinTypeAnti} {
+	for _, jt := range []optimizer.JoinType{optimizer.JoinTypeSemi, optimizer.JoinTypeAnti} {
 		child := &bufferReuseOp{rows: buildProbeRows()}
 		o := &joinOp{
-			plan: &planner.Join{
+			plan: &optimizer.Join{
 				Type:     jt,
-				Algo:     planner.JoinAlgoHash,
-				RightKey: &planner.ColumnRef{Index: leftWidth},
+				Algo:     optimizer.JoinAlgoHash,
+				RightKey: &optimizer.ColumnRef{Index: leftWidth},
 			},
 			right:         child,
 			lazyRW:        2,
@@ -131,7 +131,7 @@ func TestBuildLoopSemiUsesIntMap(t *testing.T) {
 // one key into two buckets and drops the pairs.
 func TestDemoteIntHashKeepsEveryRow(t *testing.T) {
 	o := &joinOp{
-		plan:          &planner.Join{Type: planner.JoinTypeInner, Algo: planner.JoinAlgoHash},
+		plan:          &optimizer.Join{Type: optimizer.JoinTypeInner, Algo: optimizer.JoinAlgoHash},
 		lazyHashIsInt: true,
 	}
 	// Two int keys land in the int map...

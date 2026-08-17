@@ -4,15 +4,15 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // boxKeyExpr is the smallest expression whose planner.ExprResultType names box
 // — a bare ColumnRef of that type. It mirrors floatKeyExprOf / enumKeyExpr and
 // keeps the test independent of which box-returning overloads the pg_proc seed
 // happens to carry.
-func boxKeyExpr() planner.Expr {
-	return &planner.ColumnRef{Type: catalog.Type{Name: "box"}}
+func boxKeyExpr() optimizer.Expr {
+	return &optimizer.ColumnRef{Type: catalog.Type{Name: "box"}}
 }
 
 // TestExpressionIndexKeyRejectsBoxAndInt4Range is the DDL-gate regression
@@ -43,7 +43,7 @@ func TestExpressionIndexKeyRejectsBoxAndInt4Range(t *testing.T) {
 		code    string
 		message string
 		hint    string
-		keyExpr planner.Expr
+		keyExpr optimizer.Expr
 		datum   Datum
 	}{
 		{

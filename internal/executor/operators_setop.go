@@ -2,7 +2,7 @@ package executor
 
 import (
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -14,7 +14,7 @@ import (
 // (DISTINCT), INTERSECT [ALL], EXCEPT [ALL] — buffers both inputs at Open and
 // applies the appropriate multiset semantics. M0097-0024.
 type setOp struct {
-	plan  *planner.SetOp
+	plan  *optimizer.SetOp
 	left  Operator
 	right Operator
 
@@ -29,7 +29,7 @@ type setOp struct {
 	idx  int
 }
 
-func newSetOp(p *planner.SetOp, left, right Operator) *setOp {
+func newSetOp(p *optimizer.SetOp, left, right Operator) *setOp {
 	return &setOp{
 		plan:      p,
 		left:      left,
@@ -38,7 +38,7 @@ func newSetOp(p *planner.SetOp, left, right Operator) *setOp {
 	}
 }
 
-func (o *setOp) Schema() planner.Schema {
+func (o *setOp) Schema() optimizer.Schema {
 	return o.plan.Output()
 }
 

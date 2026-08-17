@@ -32,11 +32,11 @@ package executor
 // borrowed slice safely.
 
 import (
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 type nestedLoopIndexJoinOp struct {
-	plan  *planner.NestedLoopIndexJoin
+	plan  *optimizer.NestedLoopIndexJoin
 	outer Operator
 	inner nliInner
 	ctx   *Context
@@ -99,7 +99,7 @@ type nestedLoopIndexJoinOp struct {
 // bare probe) and *memoizeOp (S7's parameterized result cache, which
 // forwards to a child *indexScanOp on cache misses).
 type nliInner interface {
-	Schema() planner.Schema
+	Schema() optimizer.Schema
 	openPrep(ctx *Context) error
 	Next() (TupleSlot, error)
 	BindOuter(slot SlotView, outerWidth int)
@@ -120,11 +120,11 @@ func nliInnerIndexScan(in nliInner) *indexScanOp {
 	return nil
 }
 
-func newNestedLoopIndexJoinOp(p *planner.NestedLoopIndexJoin, outer Operator, inner nliInner) *nestedLoopIndexJoinOp {
+func newNestedLoopIndexJoinOp(p *optimizer.NestedLoopIndexJoin, outer Operator, inner nliInner) *nestedLoopIndexJoinOp {
 	return &nestedLoopIndexJoinOp{plan: p, outer: outer, inner: inner}
 }
 
-func (o *nestedLoopIndexJoinOp) Schema() planner.Schema {
+func (o *nestedLoopIndexJoinOp) Schema() optimizer.Schema {
 	return o.plan.Output()
 }
 
@@ -187,7 +187,7 @@ func (o *nestedLoopIndexJoinOp) Next() (TupleSlot, error) {
 				// reference yields NULL -> false, dropping the
 				// preserved outer row. The hash join has always done
 				// it this way (openLazyHashJoin's null-pad path).
-				if !o.outerMatched && o.plan.Type == planner.JoinTypeLeft {
+				if !o.outerMatched && o.plan.Type == optimizer.JoinTypeLeft {
 					o.outerMatched = true
 					o.outerMS.row = o.currentOuter
 					o.innerMS.row = o.nullInner
@@ -196,7 +196,7 @@ func (o *nestedLoopIndexJoinOp) Next() (TupleSlot, error) {
 				// M0063-0004: Anti-join fallback. When no inner row
 				// passed the predicate AND the join is JoinTypeAnti,
 				// emit the outer row alone.
-				if o.plan.Type == planner.JoinTypeAnti && !o.outerMatched {
+				if o.plan.Type == optimizer.JoinTypeAnti && !o.outerMatched {
 					o.outerMatched = true
 					o.outerOnly.row = o.currentOuter
 					return o.outerOnly, nil
@@ -236,7 +236,7 @@ func (o *nestedLoopIndexJoinOp) Next() (TupleSlot, error) {
 			// M0063-0004: Semi emits the OUTER row exactly
 			// once on first qualifying match; advance to the
 			// next outer.
-			if o.plan.Type == planner.JoinTypeSemi {
+			if o.plan.Type == optimizer.JoinTypeSemi {
 				o.innerExhausted = true
 				o.outerOnly.row = o.currentOuter
 				return o.outerOnly, nil
@@ -244,7 +244,7 @@ func (o *nestedLoopIndexJoinOp) Next() (TupleSlot, error) {
 			// M0063-0004: Anti's qualifying inner match means
 			// the outer row will NOT be emitted. Fast-forward
 			// past remaining inner rows.
-			if o.plan.Type == planner.JoinTypeAnti {
+			if o.plan.Type == optimizer.JoinTypeAnti {
 				o.innerExhausted = true
 				continue
 			}

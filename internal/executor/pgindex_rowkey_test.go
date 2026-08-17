@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -88,10 +88,10 @@ func TestIndexRowKeyTupleEntryCarriesTheHeapTIDAndProbeSortsFirst(t *testing.T) 
 	// difference is the TID tiebreak alone — and the zero TID is minus infinity,
 	// so the probe lands BEFORE the entry it is looking for. That is what makes
 	// a duplicate scan see all of its own matches.
-	if got := btree.BTreeTupleGetNAtts(entry, uint16(desc.NKeyAtts())); int(got) != desc.NKeyAtts() {
+	if got := nbtree.BTreeTupleGetNAtts(entry, uint16(desc.NKeyAtts())); int(got) != desc.NKeyAtts() {
 		t.Fatalf("entry natts = %d, want %d (a full key must not be a pivot)", got, desc.NKeyAtts())
 	}
-	cmp, err := btree.ComparePGIndexTuples(desc, probe, entry)
+	cmp, err := nbtree.ComparePGIndexTuples(desc, probe, entry)
 	if err != nil {
 		t.Fatalf("ComparePGIndexTuples: %v", err)
 	}
@@ -100,11 +100,11 @@ func TestIndexRowKeyTupleEntryCarriesTheHeapTIDAndProbeSortsFirst(t *testing.T) 
 	}
 
 	// And the attributes themselves are the same on both sides.
-	pa, _, err := btree.DeformPGIndexTuple(probe, desc.Physical(), desc.NKeyAtts())
+	pa, _, err := nbtree.DeformPGIndexTuple(probe, desc.Physical(), desc.NKeyAtts())
 	if err != nil {
 		t.Fatalf("deform probe: %v", err)
 	}
-	ea, _, err := btree.DeformPGIndexTuple(entry, desc.Physical(), desc.NKeyAtts())
+	ea, _, err := nbtree.DeformPGIndexTuple(entry, desc.Physical(), desc.NKeyAtts())
 	if err != nil {
 		t.Fatalf("deform entry: %v", err)
 	}

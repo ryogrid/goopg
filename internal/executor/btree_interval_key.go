@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"math/bits"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -119,7 +119,7 @@ func encodeIntervalBTreeKey(v Datum, colName string, pos int) ([]byte, *ExecErro
 			Message: fmt.Sprintf("column %q is not interval at runtime", colName)}
 	}
 	hi, lo := intervalSpan128(months, days, micros)
-	return btree.EncodeInt128(hi, lo), nil
+	return nbtree.EncodeInt128(hi, lo), nil
 }
 
 // intervalKeyNotDecodable is the refusal both key-decode siblings return for an

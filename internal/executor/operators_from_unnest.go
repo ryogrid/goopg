@@ -7,21 +7,21 @@ package executor
 import (
 	"strings"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 type fromUnnestOp struct {
-	plan *planner.FromUnnest
+	plan *optimizer.FromUnnest
 	ctx  *Context
 	rows []Row
 	idx  int
 }
 
-func newFromUnnestOp(p *planner.FromUnnest) *fromUnnestOp {
+func newFromUnnestOp(p *optimizer.FromUnnest) *fromUnnestOp {
 	return &fromUnnestOp{plan: p}
 }
 
-func (o *fromUnnestOp) Schema() planner.Schema { return o.plan.Output() }
+func (o *fromUnnestOp) Schema() optimizer.Schema { return o.plan.Output() }
 
 func (o *fromUnnestOp) Open(ctx *Context) error {
 	o.ctx = ctx

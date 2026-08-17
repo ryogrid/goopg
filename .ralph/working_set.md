@@ -1,51 +1,59 @@
-(row 1355 closed — M0119-0006 continues)
+# Working set — M0134-0005 Bucket 1 landed; case still open, Buckets 2/3 are next
 
-**This loop (2026-08-14):** closed deferral-ledger row 1355 (regtype schema-gap)
-in two slices. Slice A (`f4d594d3`, 88th) added `NamespaceOID` to the four
-user-type registries (enum/domain/composite/range), populated at CREATE
-TYPE/DOMAIN (CREATE AGGREGATE schema-with-public-fallback pattern) and at
-WAL/startup reload (pg_type typnamespace col 2, previously dropped). Slice B
-(`3a03e18e`, 89th) made `userTypeNameForOID`/`RegtypeName` take a per-schema
-`qualify func(schema) bool` (was fixed bool), added `Catalog.SchemaNameForOID`,
-and made all ten user-type arms render `regOutQualified(schema, name,
-qualify(schema))` with `"[]"`/multirange kept outside quoting; `regOutShared`
-dropped `regtypeQualify`. The `::regtype` cast / `format_type()` / walsender /
-RAISE now render an off-path non-public type as `schema.name` + quoted.
+**Task:** M0134-0005 (`constraints.sql`) — **Bucket 1 LANDED 2026-08-18**
+(commit `8edbf9ee`); the case stays `[ ]`. Selected per the Current Priority
+banner (M0134 next after M-NIGHTLY). M-NIGHTLY drained: `ci/logs/action-items.md`
+is still run `20260817-011734`, all 6 filed and `[x]` — nothing new to file.
 
-**Key symbols:** `userTypeNameForOID`/`RegtypeName`/`regOutQualifySchema`
-(expr.go), `regOutShared`/`RegOut`/`RegOutArgVisible`/`RegOutRendererVisible`
-(reg_identifier.go), `Catalog.SchemaNameForOID` + `NamespaceOID` on
-EnumType/Domain/CompositeType/RangeType (catalog.go), reloadUser*FromHeap
-(catalog_heap_reload.go). Tests: `regtype_actual_schema_test.go`,
-`TestCreateTypeDomainRecordsNamespaceOID`.
+**What landed.** `PREPARE p (regclass[])` returned a false `42704 type
+"regclass[]" does not exist`, and every following EXECUTE then reported
+`prepared statement "get_nnconstraint_info" does not exist` — 13 of 30 hunks,
+the only cascade in the file. `isValidSQLTypeName`
+(`internal/postmaster/dispatch.go:2038`, called from `:700`) was a hand-written
+allowlist of **bare** built-in names. It now rejects unbalanced parens, strips
+balanced `( … )` typmod groups wherever they appear (`timestamp(3) with time
+zone`), strips trailing `[]`/`[N]` array suffixes (non-numeric subscript =
+reject, not strip), then matches an **additively** extended allowlist (`reg*`
+family, `bit`/`varbit`, `inet`/`cidr`/`macaddr`/`macaddr8`, `money`, `xml`,
+`tsvector`, `tsquery`, `jsonpath`, `int2vector`, `oidvector`, `pg_snapshot`,
+`"char"`, `character`/`character varying`). Signature and call site unchanged.
 
-**Residual (filed):** new ledger row — the SELECT wire / COPY TO / `reg*`→text
-cast / array-element paths still pass a constant `!publicSchemaVisible` predicate
-(dispatch.go:3227, copy.go:90, expr.go:3381 regCastQualify, codec_array.go:335),
-so an off-path non-public type renders BARE there under the default search_path,
-now divergent from the corrected cast path. Row-1339 family; thread a per-schema
-predicate through those four sites.
+**Read this before re-measuring.** Cascade 13 → **0**, but the diff *grew*
+1496 → **1515** lines (30 hunks both sides). That is an **unmasking** fix —
+statements that used to abort on one error line now execute and emit real,
+still-wrong result sets. Diff line count is NOT this case's metric of record.
+Both numbers are post-C19 harness fix; **never compare to a pre-2026-08-18
+`constraints` number**.
 
-**Remaining M0119-0006 (rough order of narrowness):**
-1. row 1351 — bare-`char` arg OID: arglist carries only arg Name; carry resolved
-   OID per arg (catalog-representation change).
-2. rows 1340/1344 — mixed-case role folding / arg-type case (case-folding family).
-3. whole-db (unscoped) pg_amcheck — blocked on index AMs, STORAGE EXTERNAL
-   TOAST, box/int4range/int4[] HEAP types, multi-DB orchestration.
+**Files:** `internal/postmaster/dispatch.go`,
+`internal/postmaster/prepare_param_type_test.go` (new, `TestIsValidSQLTypeName`),
+`docs/design/0134-0005-constraints-sql-divergence.md` (new — full 7-bucket map),
+`docs/design/README.md`, `.ralph/fix_plan.md`, `.ralph/deferral_ledger.md`
+(3 rows 2026-08-18).
 
-**Next step:** row 1351 (bare-`char` arg OID) — delegate a `researcher` to scope
-it first: which arglist carriers need the resolved OID, where each is populated,
-and the exact regprocedure-arglist render sites. Banner ranks M0119 first
-(M-NIGHTLY has no open items; the 2 regress/enum+oid nightly items were already
-filed+fixed by an earlier slice this loop).
+**Next step:** stay on M0134-0005 and brief **Bucket 2** — `NOT ENFORCED` CHECK
+constraints are still enforced on INSERT; `internal/executor/operators_fk.go:1664`
+`checkConstraints` loops `tbl.CheckConstraints` unconditionally and never consults
+`tbl.NamedChecks[i].NotEnforced` (PG skips `conenforced=false`). Bucket 3
+(`DROP`/`RENAME CONSTRAINT` can't resolve a NOT NULL constraint by name,
+`operators_ddl.go:10719`) is equally bounded but **must first confirm whether
+`execAlterTableRenameConstraint` shares the omission** — sibling pair, Hard-won
+Rule #2. **Do not brief Bucket 7** (float8 DEFAULT truncation / `a_expr`-vs-`b_expr`
+DEFAULT grammar / `currval()` default ordering): root cause unpinned, needs a
+research pass on the missing-column catalog-default *fill* path. Buckets 4
+(deferred statement-level UNIQUE) and 5 (GiST `circle_ops`) are milestone-sized.
 
-**Gates run:** go build PASS; executor/server/wal/catalog/plpgsql suites PASS;
-5 targeted regtype tests PASS (uncached); tpch-spotcheck PASS (Q12=2/Q13=35);
-pre-commit units PASS; pre-commit pgbench smoke PASS (hook); full
-TestPort_RegressSuite PASS (47 PASS/185 SKIP/0 FAIL, all 41 must-pass green).
+**Gates run:** `go test ./internal/postmaster/` PASS; `TestIsValidSQLTypeName`
+re-run by coordinator pre-commit PASS; `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh` PASS; `scripts/pg-regress-runner.sh constraints`
+re-measured by coordinator at the committed tree (1515/30, cascade 0); pre-commit
+pgbench smoke PASS (TPC-B 338 tps, simple update 635 tps, select-only 12.8k tps).
+No TPC-H/TPC-DS — no planner/executor/codec change.
 
-**Delegation:** implementer (slice B) + tester (package gates, long gates,
-regress) + reviewer (adversarial) all DONE. Handoff:
-`tmp/ralph-handoffs/0119-0006-regtype-schema-qualify/`.
+**Delegation:** `tmp/ralph-handoffs/m0134-0005-s01-measure/` (researcher
+`a060c437efcb7b08d`, 1 round — produced the 7-bucket map, now durable in the
+design doc); `tmp/ralph-handoffs/m0134-0005-s02-prepare-typenames/`
+(implementer `a73212e2ab0f16dde`, 1 round, reported NEEDS-DECISION purely because
+the diff grew — coordinator resolved it as unmasking after re-measuring).
 
 **In-flight:** none.

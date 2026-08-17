@@ -8,10 +8,10 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/config"
+	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/pgarray"
-	"github.com/goopg/goopg/internal/pgnodes"
+	"github.com/goopg/goopg/internal/utils/adt/array"
+	"github.com/goopg/goopg/internal/nodes"
 )
 
 // User-table array columns (e.g. `p int4[]`) carry catalog.Type{Name:"int4",
@@ -43,7 +43,7 @@ const arrayHeaderSize = 24 // bytes 0..23: varlena + ndim + dataoffset + elemtyp
 // (internal/wal/pgoutput.go), which cannot import the executor, reads the same
 // on-disk blobs through the same element table and renderer. M0119-0006.
 func arrayElemTypeInfo(elemName string) (oid uint32, size, align int, varlena, ok bool) {
-	return pgarray.ElemTypeInfo(elemName)
+	return array.ElemTypeInfo(elemName)
 }
 
 // encodeArrayValuePG encodes an array-typed datum (t.IsArray) into a PG-native
@@ -133,7 +133,7 @@ func encodeArrayElem(elemName, e string, varlena bool, ctx *Context, pos int) ([
 		// instead of the decimal string. Every other varlena element type
 		// goopg supports (text/varchar/bpchar) IS its own text.
 		if lower == "numeric" || lower == "decimal" {
-			body, nerr := pgnodes.NumericBodyFromText(strings.TrimSpace(e))
+			body, nerr := nodes.NumericBodyFromText(strings.TrimSpace(e))
 			if nerr != nil {
 				return nil, &ExecError{Code: "22P02",
 					Message: fmt.Sprintf("invalid input syntax for type numeric: %q", e)}
@@ -300,8 +300,8 @@ func array4ByteVarlenaBytes(body []byte) []byte {
 // DateStyle and TimeZone). Same GUC spellings and same boot-default fallbacks
 // as RunCopyTo's pair (internal/executor/copy.go), which is its sibling: a
 // COPY … TO and a SELECT of the same array column must print the same text.
-func arrayOutputStyle(ctx *Context) pgarray.OutputStyle {
-	st := pgarray.DefaultOutputStyle()
+func arrayOutputStyle(ctx *Context) array.OutputStyle {
+	st := array.DefaultOutputStyle()
 	// Reg* element renderer, bound FIRST so a catalog-carrying ctx gets it even
 	// when the style GUCs are unreadable (nil GetSetting): an array of
 	// regclass/regtype/… is flattened to text at heap-decode time, so the
@@ -315,10 +315,13 @@ func arrayOutputStyle(ctx *Context) pgarray.OutputStyle {
 		return st
 	}
 	if v, ok := ctx.GetSetting("datestyle"); ok {
-		st.Style, st.Order = config.ParseDateStyleValue(v)
+		st.Style, st.Order = misc.ParseDateStyleValue(v)
 	}
 	if v, ok := ctx.GetSetting("timezone"); ok {
 		st.Zone = v
+	}
+	if v, ok := ctx.GetSetting("bytea_output"); ok {
+		st.ByteaMode = v
 	}
 	return st
 }
@@ -351,7 +354,7 @@ func colsHaveArray(cols []catalog.Column) bool {
 }
 
 func decodeArrayValuePG(t catalog.Type, data []byte) (Datum, int, error) {
-	return decodeArrayValuePGStyled(t, data, pgarray.DefaultOutputStyle())
+	return decodeArrayValuePGStyled(t, data, array.DefaultOutputStyle())
 }
 
 // decodeArrayValuePGStyled is decodeArrayValuePG under an explicit session
@@ -361,7 +364,7 @@ func decodeArrayValuePG(t catalog.Type, data []byte) (Datum, int, error) {
 // function reads — has to be carried down here. Decode sites with no session
 // (catalog reload, VACUUM, ANALYZE, DDL rescans) keep passing the default; see
 // pgarray.OutputStyle. M0119-0006.
-func decodeArrayValuePGStyled(t catalog.Type, data []byte, st pgarray.OutputStyle) (Datum, int, error) {
+func decodeArrayValuePGStyled(t catalog.Type, data []byte, st array.OutputStyle) (Datum, int, error) {
 	payload, consumed, err := decodePhysicalPGVarlena(data)
 	if err != nil {
 		return Datum{}, 0, err
@@ -370,7 +373,7 @@ func decodeArrayValuePGStyled(t catalog.Type, data []byte, st pgarray.OutputStyl
 	//   [0:4] ndim [4:8] dataoffset [8:12] elemtype [12:16] dims[0] [16:20] lbound[0]
 	// The rendering itself lives in internal/pgarray, shared with the pgoutput
 	// decoder (M0119-0006).
-	text, err := pgarray.RenderTextStyled(t.Name, payload, st)
+	text, err := array.RenderTextStyled(t.Name, payload, st)
 	if err != nil {
 		return Datum{}, 0, err
 	}
@@ -380,4 +383,4 @@ func decodeArrayValuePGStyled(t catalog.Type, data []byte, st pgarray.OutputStyl
 // quoteArrayTextElem applies PG array-output quoting: an element is double-
 // quoted when empty, equal to the literal NULL, or containing a character that
 // would otherwise be ambiguous ({ } , " \ or whitespace).
-func quoteArrayTextElem(s string) string { return pgarray.QuoteTextElem(s) }
+func quoteArrayTextElem(s string) string { return array.QuoteTextElem(s) }

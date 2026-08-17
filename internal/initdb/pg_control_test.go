@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goopg/goopg/internal/config"
+	"github.com/goopg/goopg/internal/utils/misc"
 )
 
 // TestBuildPgControlCheckpointFields verifies that buildPgControl fills the
@@ -238,7 +238,7 @@ func TestBuildPgControlUnloggedLSN(t *testing.T) {
 // non-nil registry is passed. A standby's CheckRequiredParameterValues
 // (xlog.c:5423) fatals if these values fall below the primary's.
 func TestBuildPgControlGUCWiring(t *testing.T) {
-	reg := config.BuildDefaultRegistry()
+	reg := misc.BuildDefaultRegistry()
 	// Set non-default values so the test would fail if defaults are used.
 	for name, val := range map[string]string{
 		"max_connections":         "200",
@@ -248,7 +248,7 @@ func TestBuildPgControlGUCWiring(t *testing.T) {
 		"max_locks_per_transaction": "128",
 		"wal_level":               "logical",
 	} {
-		if err := reg.Set(name, val, config.SourceCommandLine); err != nil {
+		if err := reg.Set(name, val, misc.SourceCommandLine); err != nil {
 			t.Fatalf("reg.Set(%q, %q): %v", name, val, err)
 		}
 	}

@@ -327,6 +327,30 @@ func (p *PubSubCluster) WaitForRow(t *testing.T, table, pred string, want int, t
 		q, want, timeout)
 }
 
+// WaitForScalar polls the subscriber, running `query` (a full scalar
+// SQL query, not just table+pred), until it returns `want` or the
+// deadline fires. `WaitForRow` cannot observe an UPDATE that leaves
+// `count(*)` unchanged — e.g. a value-only UPDATE against a predicate
+// the row already satisfies — so callers that need to wait on such a
+// change should poll the changing value directly with WaitForScalar
+// instead. On timeout the failure message names the query, the wanted
+// value, and the last value actually observed, since a genuinely wrong
+// applied value must still be visible in the failure.
+func (p *PubSubCluster) WaitForScalar(t *testing.T, query, want string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var last string
+	for time.Now().Before(deadline) {
+		last = p.Subscriber.QueryScalar(t, query)
+		if last == want {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("pubsubcluster: WaitForScalar %s: did not see %q within %s (last observed %q)",
+		query, want, timeout, last)
+}
+
 // Close tears down both peers. Errors are joined so a transient
 // subscriber-side failure doesn't hide a publisher-side one.
 func (p *PubSubCluster) Close() error {

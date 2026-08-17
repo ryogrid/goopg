@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 func TestUDFSimpleReturn(t *testing.T) {
@@ -22,7 +22,7 @@ func TestUDFSimpleReturn(t *testing.T) {
 	ctx.Now = time.Now()
 
 	// SELECT answer()
-	expr := &planner.FuncCall{Name: "answer"}
+	expr := &optimizer.FuncCall{Name: "answer"}
 	res, err := evalExpr(expr, nil, ctx)
 	if err != nil {
 		t.Fatalf("evalExpr: %v", err)
@@ -52,9 +52,9 @@ func TestUDFWithArgsAndVars(t *testing.T) {
 	ctx.Now = time.Now()
 
 	// SELECT add_one(10)
-	expr := &planner.FuncCall{
+	expr := &optimizer.FuncCall{
 		Name: "add_one",
-		Args: []planner.Expr{&planner.IntegerConst{Value: 10}},
+		Args: []optimizer.Expr{&optimizer.IntegerConst{Value: 10}},
 	}
 	res, err := evalExpr(expr, nil, ctx)
 	if err != nil {
@@ -98,9 +98,9 @@ func TestUDFIfStmt(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		expr := &planner.FuncCall{
+		expr := &optimizer.FuncCall{
 			Name: "is_positive",
-			Args: []planner.Expr{&planner.IntegerConst{Value: tc.input}},
+			Args: []optimizer.Expr{&optimizer.IntegerConst{Value: tc.input}},
 		}
 		res, err := evalExpr(expr, nil, ctx)
 		if err != nil {
@@ -140,9 +140,9 @@ func TestUDFLoopExit(t *testing.T) {
 	ctx.Catalog = cat
 	ctx.Now = time.Now()
 
-	expr := &planner.FuncCall{
+	expr := &optimizer.FuncCall{
 		Name: "sum_to",
-		Args: []planner.Expr{&planner.IntegerConst{Value: 10}},
+		Args: []optimizer.Expr{&optimizer.IntegerConst{Value: 10}},
 	}
 	res, err := evalExpr(expr, nil, ctx)
 	if err != nil {
@@ -177,9 +177,9 @@ func TestUDFWhile(t *testing.T) {
 	ctx.Catalog = cat
 	ctx.Now = time.Now()
 
-	expr := &planner.FuncCall{
+	expr := &optimizer.FuncCall{
 		Name: "factorial",
-		Args: []planner.Expr{&planner.IntegerConst{Value: 5}},
+		Args: []optimizer.Expr{&optimizer.IntegerConst{Value: 5}},
 	}
 	res, err := evalExpr(expr, nil, ctx)
 	if err != nil {
@@ -220,9 +220,9 @@ func TestUDFContinue(t *testing.T) {
 	ctx.Catalog = cat
 	ctx.Now = time.Now()
 
-	expr := &planner.FuncCall{
+	expr := &optimizer.FuncCall{
 		Name: "sum_odd",
-		Args: []planner.Expr{&planner.IntegerConst{Value: 10}},
+		Args: []optimizer.Expr{&optimizer.IntegerConst{Value: 10}},
 	}
 	res, err := evalExpr(expr, nil, ctx)
 	if err != nil {
@@ -255,9 +255,9 @@ func TestUDFFor(t *testing.T) {
 	ctx.Catalog = cat
 	ctx.Now = time.Now()
 
-	expr := &planner.FuncCall{
+	expr := &optimizer.FuncCall{
 		Name: "sum_for",
-		Args: []planner.Expr{&planner.IntegerConst{Value: 10}},
+		Args: []optimizer.Expr{&optimizer.IntegerConst{Value: 10}},
 	}
 	res, err := evalExpr(expr, nil, ctx)
 	if err != nil {
@@ -290,9 +290,9 @@ func TestUDFForReverse(t *testing.T) {
 	ctx.Catalog = cat
 	ctx.Now = time.Now()
 
-	expr := &planner.FuncCall{
+	expr := &optimizer.FuncCall{
 		Name: "countdown",
-		Args: []planner.Expr{&planner.IntegerConst{Value: 10}},
+		Args: []optimizer.Expr{&optimizer.IntegerConst{Value: 10}},
 	}
 	res, err := evalExpr(expr, nil, ctx)
 	if err != nil {
@@ -320,7 +320,7 @@ func TestUDFPerform(t *testing.T) {
 	ctx.Catalog = cat
 	ctx.Now = time.Now()
 
-	expr := &planner.FuncCall{Name: "test_perform"}
+	expr := &optimizer.FuncCall{Name: "test_perform"}
 	_, err := evalExpr(expr, nil, ctx)
 	if err != nil {
 		t.Fatalf("evalExpr: %v", err)

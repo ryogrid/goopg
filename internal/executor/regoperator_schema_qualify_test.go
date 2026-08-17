@@ -473,7 +473,7 @@ func TestRegprocedureCharArgCastAndWireAgree(t *testing.T) {
 		// the same qualify flag.
 		copyRow, err := EncodeCopyTextRow(nil, Row{NewIntDatum(int64(oid))},
 			[]catalog.Column{{Name: "r", Type: catalog.Type{Name: "regprocedure"}}},
-			"ISO", "MDY", "", ctx.Catalog, false)
+			"ISO", "MDY", "", "hex", ctx.Catalog, false)
 		if err != nil {
 			t.Fatalf("%s COPY TO: %v", tc.name, err)
 		}

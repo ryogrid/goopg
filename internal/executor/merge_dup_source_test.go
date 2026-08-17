@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // These tests pin PostgreSQL's MERGE duplicate-source cardinality rule
@@ -35,7 +35,7 @@ func runMergeStmt(t *testing.T, ctx *Context, sql string) error {
 	if err != nil {
 		return err
 	}
-	plan, err := planner.Plan(stmts[0], ctx.Catalog)
+	plan, err := optimizer.Plan(stmts[0], ctx.Catalog)
 	if err != nil {
 		return err
 	}

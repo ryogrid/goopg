@@ -33,7 +33,7 @@ error cases. It depends on two things the runner does not provide:
 | P5 | 1.3% | `string_agg` over `bytea` drops the delimiter (text `','` fails the `KindBytes` gate) | ~~engine, narrow~~ **non-issue** — the bytea section already matches PG (verified: `grep bytea tmp/regress-diffs/aggregates.diff` → empty) |
 | P6 | 1.1% | `pg_get_viewdef` deparse lowercase/unqualified | engine |
 | P7 | 0.2% | collation propagation (`"POSIX"` → `default`) | engine |
-| P8 | <1% | `column ref f1/0 on nil slot` (partial-index DDL), `outer column ref s1/level=1 out of range` (lateral+agg), missing GROUP-BY-via-USING error | engine |
+| P8 | <1% | ~~`column ref f1/0 on nil slot` (partial-index DDL)~~ — **RESOLVED** (S6 Slice 3e `walkExprTree` `*IsNullExpr` arm); ~~`outer column ref s1/level=1 out of range` (lateral+agg)~~ — **RESOLVED** (Q3, commit `6b9abfb8`: `bindOuter`/`unbindOuter` install the slot bind + `ctx.OuterRows` push orthogonally); missing GROUP-BY-via-USING error (still open — deferral-ledger row) | engine |
 
 ## Root causes (top two)
 
@@ -73,9 +73,14 @@ error cases. It depends on two things the runner does not provide:
 3. **P3 error-position context** — **(a) harness half LANDED 2026-08-15:** drop the
    `psql:file:line:` prefix by feeding each `.sql` via stdin redirect (`< file`)
    instead of `-f`, mirroring `pg_regress_main.c:74-75` (56 prefix lines → 0).
-   **(b) engine half open:** add `LINE n:`/`^` to parse-analysis errors (27 lines) —
-   a shared gap across cases, likely warrants a cross-case design note.
-4. **P2 `EXPLAIN` format** — broadest remaining engine gap; separate milestone-sized effort.
+   **(b) engine half LANDED 2026-08-15** — emit the `P` field for planner errors on
+   both protocol paths + re-point 7 raise sites to the offending subexpression;
+   raw-verify 23/23 common carets byte-match PG. Cross-case note:
+   `docs/design/0134-0001-p3b-error-position-context.md`. Two deferrals remain
+   (22P02 type-coercion location; byte-vs-char multibyte index).
+4. **P2 `EXPLAIN` format** — broadest remaining engine gap; separate milestone-sized effort
+   (mapped + decomposed 2026-08-15 → `docs/design/0134-0001-p2-explain-format.md`,
+   slices S1–S10; note the diff-direction correction `-`=PG/`+`=goopg).
 5. **P6/P7/P8** — deparse, collation, residual expr errors.
 6. ~~P5 bytea string_agg delimiter~~ — reclassified non-issue (see map above).
 

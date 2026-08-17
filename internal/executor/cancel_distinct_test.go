@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // genRowsOp is an unbounded synthetic child: it emits int rows forever.
@@ -14,14 +14,14 @@ import (
 // this one exists to prove a drain loop honours cancellation mid-stream —
 // without the ctx.Err() check the DISTINCT drain would never return.
 type genRowsOp struct {
-	schema planner.Schema
+	schema optimizer.Schema
 	slot   *MaterializedSlot
 	n      int64
 }
 
 func (g *genRowsOp) Open(*Context) error    { return nil }
 func (g *genRowsOp) Close() error           { return nil }
-func (g *genRowsOp) Schema() planner.Schema { return g.schema }
+func (g *genRowsOp) Schema() optimizer.Schema { return g.schema }
 func (g *genRowsOp) Next() (TupleSlot, error) {
 	g.n++
 	g.slot.row = Row{NewIntDatum(g.n)}
@@ -33,13 +33,13 @@ func (g *genRowsOp) Next() (TupleSlot, error) {
 // cancelled context and return SQLSTATE 57014 promptly instead of draining
 // an effectively unbounded child to completion.
 func TestDistinctOpenAbortsOnCancel(t *testing.T) {
-	schema := planner.Schema{{Name: "n"}}
+	schema := optimizer.Schema{{Name: "n"}}
 	child := &genRowsOp{schema: schema}
 	child.slot = SlotFromRow(schema, nil)
 
 	// Construct directly (same package): a zero-value planner.Distinct has
 	// no child wired for Output(), and only plan/child/schema matter here.
-	op := &distinctOp{plan: &planner.Distinct{}, child: child, schema: schema}
+	op := &distinctOp{plan: &optimizer.Distinct{}, child: child, schema: schema}
 
 	cctx, cancel := context.WithCancel(context.Background())
 	ctx := &Context{Ctx: cctx}

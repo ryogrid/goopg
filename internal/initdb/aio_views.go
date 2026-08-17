@@ -19,7 +19,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/goopg/goopg/internal/aio"
+	"github.com/goopg/goopg/internal/storage/aio"
 	"github.com/goopg/goopg/internal/catalog"
 )
 

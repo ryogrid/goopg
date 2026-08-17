@@ -14,14 +14,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/goopg/goopg/internal/activity"
-	"github.com/goopg/goopg/internal/aio"
+	"github.com/goopg/goopg/internal/utils/activity"
+	"github.com/goopg/goopg/internal/storage/aio"
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/control"
+	"github.com/goopg/goopg/internal/access/transam/control"
 	"github.com/goopg/goopg/internal/executor"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/storage"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // Runtime is the bundle of long-lived handles a running goopg
@@ -33,7 +33,7 @@ import (
 type Runtime struct {
 	StorageMgr *storage.Manager
 	Pool       *storage.Pool
-	TxnMgr     *mvcc.Manager
+	TxnMgr     *transam.Manager
 	Catalog    catalog.Catalog
 	// FSM is the in-memory free-space map (M0046-0003). VACUUM updates
 	// it; INSERT consults it before extending the relation.
@@ -41,9 +41,9 @@ type Runtime struct {
 	// VM is the in-memory visibility map (M0046-0004). VACUUM sets the
 	// ALL_VISIBLE bit; index-only scans check it to skip heap fetches.
 	VM           *storage.VisibilityMap
-	WAL          *wal.Writer
-	Checkpointer *wal.Checkpointer
-	Slots        *wal.Slots
+	WAL          *xlog.Writer
+	Checkpointer *xlog.Checkpointer
+	Slots        *xlog.Slots
 	// SyncRep is the synchronous-replication wait primitive
 	// (M0102-0005). The commit-path xactMarkerLogger uses it to
 	// block COMMIT until configured standbys ack the commit LSN; the
@@ -51,10 +51,10 @@ type Runtime struct {
 	// here would disable sync replication entirely, but Open
 	// constructs one unconditionally — it is a no-op when
 	// `synchronous_standby_names` is empty (upstream's async default).
-	SyncRep        *wal.SyncRep
-	WalSenders     *wal.Senders
-	WalReceivers   *wal.Receivers
-	WalSubscribers *wal.Subscribers
+	SyncRep        *xlog.SyncRep
+	WalSenders     *xlog.Senders
+	WalReceivers   *xlog.Receivers
+	WalSubscribers *xlog.Subscribers
 	PubSub         *catalog.PubSub
 	AIO            *aio.Engine
 	DataDir        string
@@ -312,7 +312,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// atomic WaitEventStart/WaitEventEnd.  Background workers (WAL writer,
 	// etc.) are assigned slots in the background-worker range above the
 	// regular backend range.
-	act := activity.NewActivityRegistry(mvcc.DefaultProcArraySize)
+	act := activity.NewActivityRegistry(transam.DefaultProcArraySize)
 	// Publish the process-wide registry so hot-path callers can use
 	// LookupByBackendID → gls.BackendID() instead of runtime.Stack.
 	// See docs/design/tpch-round5-fixes/02.
@@ -377,7 +377,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// instead of being reconstructed by scanning the stream for a record
 	// goopg's own isCheckpointRecord recognises. The scan survives as the
 	// fallback for redo == 0 (fresh cluster / no control file).
-	if _, err := wal.ReplayFromDirWithMgrAt(mgr, filepath.Join(abs, "pg_wal"), 0, recov.redoLSN); err != nil {
+	if _, err := xlog.ReplayFromDirWithMgrAt(mgr, filepath.Join(abs, "pg_wal"), 0, recov.redoLSN); err != nil {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: wal replay: %w", err)
 	}
@@ -409,7 +409,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		isStby, _ := IsStandby(abs)
 		if !isStby {
 			walDir := filepath.Join(abs, "pg_wal")
-			if newTLI, wrote, tliErr := wal.WriteHistoryAfterRecovery(walDir, tli, 0); tliErr != nil {
+			if newTLI, wrote, tliErr := xlog.WriteHistoryAfterRecovery(walDir, tli, 0); tliErr != nil {
 				_ = mgr.Close()
 				return nil, fmt.Errorf("goopg: post-recovery TLI check: %w", tliErr)
 			} else if wrote {
@@ -422,7 +422,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		}
 	}
 
-	walCfg := wal.Config{
+	walCfg := xlog.Config{
 		WALDir:              filepath.Join(abs, "pg_wal"),
 		SegmentSize:         opts.WALSegmentSize, // 0 → wal.DefaultSegmentSize
 		Preallocate:         opts.WALInitZero,
@@ -452,7 +452,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	if aioEngine != nil {
 		walCfg.AIO = walAIOEngineAdapter{eng: aioEngine}
 	}
-	walWriter, err := wal.NewWriter(walCfg)
+	walWriter, err := xlog.NewWriter(walCfg)
 	if err != nil {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: wal: %w", err)
@@ -465,7 +465,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// the page as a block-0 apply-image (hole removed) instead of the
 		// goopg-native full-page body. Recovery restores it via the RmgrXLog
 		// XLOG_FPI decoded arm (replayDecodedXLogHeapFPIBlocks).
-		payload, err := wal.EncodePageImagePG(rel, blk, page)
+		payload, err := xlog.EncodePageImagePG(rel, blk, page)
 		if err != nil {
 			return 0, err
 		}
@@ -484,7 +484,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// half is described incrementally from prePage + newItem when that
 		// reproduces the page the primary wrote, and logged as a full-page
 		// image when it does not.
-		payload, err := wal.EncodeBtreeSplitPG(rel, leftBlk, rightBlk, prePage, leftPage, rightPage, newItem, sibBlk, sibPage, childBlk)
+		payload, err := xlog.EncodeBtreeSplitPG(rel, leftBlk, rightBlk, prePage, leftPage, rightPage, newItem, sibBlk, sibPage, childBlk)
 		if err != nil {
 			return 0, err
 		}
@@ -502,7 +502,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// + tuple, xl_xid = t_xmin) instead of the goopg-native body. Recovery
 		// routes it to replayDecodedXLogHeapInsert (the decoded path) since it
 		// carries a block ref. See docs/design/wal-pg-identical-stream/01.
-		payload, err := wal.EncodeHeapInsertPG(rel, blk, lineSlot, tuple, initPage)
+		payload, err := xlog.EncodeHeapInsertPG(rel, blk, lineSlot, tuple, initPage)
 		if err != nil {
 			return 0, err
 		}
@@ -524,7 +524,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// placeholder 0 because goopg replay re-inserted by key. That closes
 		// A5's documented parity gap (a real-PG standby applies at offnum) and
 		// is what lets goopg's own replay stop needing the index's key format.
-		payload, err := wal.EncodeBtreeInsertPG(rel, blk, offnum, item)
+		payload, err := xlog.EncodeBtreeInsertPG(rel, blk, offnum, item)
 		if err != nil {
 			return 0, err
 		}
@@ -541,7 +541,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	logHeapDelete := func(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, xmax storage.TransactionID, oldTuple []byte) (storage.LSN, error) {
 		// A3: emit a PostgreSQL xl_heap_delete record (block ref + xmax/offnum
 		// main-data, old tuple for logical) instead of the goopg-native body.
-		payload, err := wal.EncodeHeapDeletePG(rel, blk, lineSlot, xmax, oldTuple)
+		payload, err := xlog.EncodeHeapDeletePG(rel, blk, lineSlot, xmax, oldTuple)
 		if err != nil {
 			return 0, err
 		}
@@ -554,7 +554,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 
 	// Logical heap-vacuum (page prune) change record.
 	logHeapVacuum := func(rel storage.RelFileNode, blk storage.BlockNumber, deadSlots []uint16) (storage.LSN, error) {
-		payload := wal.EncodeHeapVacuum(rel, blk, deadSlots)
+		payload := xlog.EncodeHeapVacuum(rel, blk, deadSlots)
 		_, end, err := walWriter.Append(payload)
 		if err != nil {
 			return 0, err
@@ -571,7 +571,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// M0130-S11.5c: emit PG's xl_btree_vacuum — main data {ndeleted,
 		// nupdated} plus the deleted offset numbers as block-0 data, or a
 		// full-page image when the rewrite is not a plain deletion.
-		payload, err := wal.EncodeBtreeVacuumPG(rel, blk, prePage, page, deleted)
+		payload, err := xlog.EncodeBtreeVacuumPG(rel, blk, prePage, page, deleted)
 		if err != nil {
 			return 0, err
 		}
@@ -592,7 +592,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// standby reading it casts the main data to a struct it is not and then
 	// PANICs in XLogInitBufferForRedo on a block id that was never registered.
 	logBtreeUnlinkPage := func(rel storage.RelFileNode, req storage.BtreeUnlinkPageRequest) (storage.LSN, error) {
-		payload, err := wal.EncodeBtreeUnlinkPagePG(wal.BtreeUnlinkPagePGRequest{
+		payload, err := xlog.EncodeBtreeUnlinkPagePG(xlog.BtreeUnlinkPagePGRequest{
 			Rel:        rel,
 			TargetBlk:  req.TargetBlk,
 			TargetPage: req.TargetPage,
@@ -617,7 +617,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// _bt_restore_page form, block 1 the left child (incomplete-split clear),
 		// block 2 the metapage as xl_btree_metadata. Content-parity with
 		// upstream _bt_newroot; no longer full-page images.
-		payload, err := wal.EncodeBtreeNewRootPG(rel, rootBlk, rootPage, leftChildBlk, metaBlk, metaPage)
+		payload, err := xlog.EncodeBtreeNewRootPG(rel, rootBlk, rootPage, leftChildBlk, metaBlk, metaPage)
 		if err != nil {
 			return 0, err
 		}
@@ -636,7 +636,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// blocks at all) — see EncodeBtreeMarkPageHalfDeadPG for why that record
 	// PANICs a standby rather than merely diverging.
 	logBtreeMarkPageHalfDead := func(rel storage.RelFileNode, req storage.BtreeMarkPageHalfDeadRequest) (storage.LSN, error) {
-		payload, err := wal.EncodeBtreeMarkPageHalfDeadPG(rel, req.LeafBlk, req.LeafPage, req.ParentBlk, req.POffset, req.TopParent)
+		payload, err := xlog.EncodeBtreeMarkPageHalfDeadPG(rel, req.LeafBlk, req.LeafPage, req.ParentBlk, req.POffset, req.TopParent)
 		if err != nil {
 			return 0, err
 		}
@@ -652,7 +652,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// A7: emit a PostgreSQL xl_heap_prune (RM_HEAP2) record with a single
 		// freeze plan covering all frozen slots. Recovery routes it to
 		// replayDecodedXLogHeapPrune (PageFreezeBySlots).
-		payload, err := wal.EncodeHeapFreezePG(rel, blk, frozenSlots)
+		payload, err := xlog.EncodeHeapFreezePG(rel, blk, frozenSlots)
 		if err != nil {
 			return 0, err
 		}
@@ -666,7 +666,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// Row-lock (lock-only xmax + lock-strength) change record.
 	// M0021 tuple-level locking step 2 producer hook.
 	logHeapLock := func(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, xmax storage.TransactionID, lockStrength uint16) (storage.LSN, error) {
-		payload := wal.EncodeHeapLock(rel, blk, lineSlot, xmax, lockStrength)
+		payload := xlog.EncodeHeapLock(rel, blk, lineSlot, xmax, lockStrength)
 		_, end, err := walWriter.Append(payload)
 		if err != nil {
 			return 0, err
@@ -681,7 +681,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// A7: emit a PostgreSQL xl_heap_prune (RM_HEAP2) record with the redirect
 		// + now-unused sub-records instead of the goopg-native body. Recovery
 		// routes it to replayDecodedXLogHeapPrune.
-		payload, err := wal.EncodeHeapPruneOptPG(rel, blk, redirects, unused)
+		payload, err := xlog.EncodeHeapPruneOptPG(rel, blk, redirects, unused)
 		if err != nil {
 			return 0, err
 		}
@@ -698,7 +698,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	logHeapHotUpdate := func(rel storage.RelFileNode, blk storage.BlockNumber, oldSlot, newSlot uint16, xmax storage.TransactionID, tupleBytes []byte) (storage.LSN, error) {
 		// A4: emit a PostgreSQL xl_heap_update (HOT opcode) record instead of the
 		// goopg-native body. Recovery routes it to replayDecodedXLogHeapUpdate.
-		payload, err := wal.EncodeHeapHotUpdatePG(rel, blk, oldSlot, newSlot, xmax, tupleBytes)
+		payload, err := xlog.EncodeHeapHotUpdatePG(rel, blk, oldSlot, newSlot, xmax, tupleBytes)
 		if err != nil {
 			return 0, err
 		}
@@ -714,7 +714,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// forward ctid + new version, one xl_heap_update record. Replay routes
 	// to replayDecodedXLogHeapUpdate(hot=false).
 	logHeapUpdate := func(rel storage.RelFileNode, oldBlk storage.BlockNumber, oldSlot uint16, newBlk storage.BlockNumber, newSlot uint16, xmax storage.TransactionID, tupleBytes []byte) (storage.LSN, error) {
-		payload, err := wal.EncodeHeapUpdatePG(rel, oldBlk, oldSlot, newBlk, newSlot, xmax, tupleBytes)
+		payload, err := xlog.EncodeHeapUpdatePG(rel, oldBlk, oldSlot, newBlk, newSlot, xmax, tupleBytes)
 		if err != nil {
 			return 0, err
 		}
@@ -732,7 +732,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// A9: emit a PG RM_SMGR xl_smgr_create record (RelFileLocator+forkNum
 		// main-data, creating xid in the header) instead of the goopg-native
 		// body. Recovery routes it to the RmgrStorage/XLOG_SMGR_CREATE decoded arm.
-		payload, err := wal.EncodeSmgrCreatePG(rel, xid)
+		payload, err := xlog.EncodeSmgrCreatePG(rel, xid)
 		if err != nil {
 			return err
 		}
@@ -983,7 +983,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		}
 		return int64(n), true
 	})
-	txnMgr := mvcc.NewManager()
+	txnMgr := transam.NewManager()
 	// M0130-S11.5d-3c: b-tree page deletion's recycle horizon. `next` is
 	// upstream's ReadNextFullTransactionId (stamped into the deleted page as
 	// its BTDeletedPageData.safexid); `oldestVisible` is the boundary
@@ -1004,7 +1004,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// Open the commit log (pg_xact). Created by bootstrapCLog during initdb;
 	// upgraded on old clusters by InitializeAsCommitted.
 	clogPath := filepath.Join(abs, "global", "pg_xact")
-	clog, err := mvcc.OpenCLog(clogPath)
+	clog, err := transam.OpenCLog(clogPath)
 	if err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
@@ -1062,7 +1062,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// the Manager route all subxact registration/resolution through it. Unlike PG
 	// (which zeroes pg_subtrans on startup) goopg restores it for durable subxact
 	// resolution by an attached standby / 2PC / post-backend-exit readers.
-	subxactMap := mvcc.NewSubxactMap()
+	subxactMap := transam.NewSubxactMap()
 	if err := subxactMap.EnablePersistence(filepath.Join(abs, "pg_subtrans")); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
@@ -1105,13 +1105,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// barrier have records above the already-published redo, which the
 	// redo-anchored replay (wal.replayStart) re-stamps after a crash.
 	var commitStampMu sync.RWMutex
-	txnMgr.SetXactMarkerLogger(func(xid storage.TransactionID, kind mvcc.XactMarker, waitLocalFlush bool) error {
+	txnMgr.SetXactMarkerLogger(func(xid storage.TransactionID, kind transam.XactMarker, waitLocalFlush bool) error {
 		commitStampMu.RLock()
 		defer commitStampMu.RUnlock()
 		var payload []byte
 		var perr error
 		switch kind {
-		case mvcc.XactCommit:
+		case transam.XactCommit:
 			// If the transaction wrote to a nailed catalog relation (pg_class,
 			// pg_attribute, pg_proc, or pg_type), emit a commit-with-inval
 			// record and unlink both pg_internal.init files so the next backend
@@ -1120,7 +1120,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			// M0106-0010 batched-31.
 			if txnMgr.TakeRelcacheInvalPending() {
 				// A6: PG xl_xact_commit with HAS_INVALS (xid in the header).
-				payload, perr = wal.EncodeXactCommitPG(xid, true)
+				payload, perr = xlog.EncodeXactCommitPG(xid, true)
 				_ = catalog.WithRelCacheInitLock(func() error {
 					if err := catalog.RelcacheInitFileUnlink(abs, catalog.DefaultDBOid); err != nil {
 						return err
@@ -1138,10 +1138,10 @@ func Open(opts OpenOptions) (*Runtime, error) {
 					return bootstrapRelcacheInitFiles(abs)
 				})
 			} else {
-				payload, perr = wal.EncodeXactCommitPG(xid, false)
+				payload, perr = xlog.EncodeXactCommitPG(xid, false)
 			}
-		case mvcc.XactAbort:
-			payload, perr = wal.EncodeXactAbortPG(xid)
+		case transam.XactAbort:
+			payload, perr = xlog.EncodeXactAbortPG(xid)
 		default:
 			return fmt.Errorf("goopg: unknown xact marker %v", kind)
 		}
@@ -1162,7 +1162,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// associates endLSN with this XID's CLOG page, and
 		// flushWALBeforeWriteLocked flushes the WAL up to it the moment that
 		// page is written back to disk, whenever that happens).
-		if waitLocalFlush && (kind == mvcc.XactCommit || kind == mvcc.XactAbort) {
+		if waitLocalFlush && (kind == transam.XactCommit || kind == transam.XactAbort) {
 			// C2-S3: a synchronous COMMIT waits for its flush — it is never
 			// acked with the commit record unflushed (PG's XLogFlush blocks
 			// the committer; design 02 §4 adversarial F3: post-cut the WAL
@@ -1195,7 +1195,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 				if werr == nil {
 					break
 				}
-				if !errors.Is(werr, wal.ErrLSNNotWritten) {
+				if !errors.Is(werr, xlog.ErrLSNNotWritten) {
 					return fmt.Errorf("goopg: sync %v flush xid=%d lsn=%d: %w", kind, xid, endLSN, werr)
 				}
 				if attempt < 100 {
@@ -1213,7 +1213,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// WAL XactCommit record is the primary durability mechanism (or, for
 		// an async commit, the CLOG write barrier — see above).
 		switch kind {
-		case mvcc.XactCommit:
+		case transam.XactCommit:
 			// C2 (S2..S4): sync and async commits stamp identically —
 			// endLSN is associated with the CLOG page (D2: arms the SLRU
 			// write barrier for the eviction/checkpoint write-back; on the
@@ -1222,7 +1222,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			// stamp is memory-only; durability rides on checkpoint/
 			// eviction/replay (C2-S3).
 			_ = clog.SetCommittedWithLSN(xid, endLSN)
-		case mvcc.XactAbort:
+		case transam.XactAbort:
 			_ = clog.SetAborted(xid)
 		}
 		return nil
@@ -1272,8 +1272,8 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// above the IsEmpty branch (C2-S3) so walHasXactRecords shares the
 	// decode with every replay pass below; nothing appends to the WAL in
 	// this window.
-	wal.BeginRecoveryCache(filepath.Join(abs, "pg_wal"))
-	defer wal.EndRecoveryCache()
+	xlog.BeginRecoveryCache(filepath.Join(abs, "pg_wal"))
+	defer xlog.EndRecoveryCache()
 	// C2-S3 (review MUST-FIX): IsEmpty alone no longer implies "no txn
 	// history" — post-cut, a crashed cluster that never reached its first
 	// checkpoint has an all-zero on-disk pg_xact. Any xact record in the
@@ -1743,7 +1743,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			// (goopg's redo uses only pageno+oldestXact; threading the real oldest
 			// datfrozenxid db is a follow-up — see deferral ledger). Recovery
 			// re-applies the truncation via replayCLogFromWAL's PG-format branch.
-			payload, err := wal.EncodeClogTruncatePG(oldestXid, 0)
+			payload, err := xlog.EncodeClogTruncatePG(oldestXid, 0)
 			if err != nil {
 				return err
 			}
@@ -1768,7 +1768,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// registry here also makes slots available to the
 	// CREATE_REPLICATION_SLOT / DROP_REPLICATION_SLOT wire
 	// handlers without an extra OpenSlots call from main.
-	slotsReg, err := wal.OpenSlots(abs)
+	slotsReg, err := xlog.OpenSlots(abs)
 	if err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
@@ -1786,12 +1786,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// each walsender goroutine on entry; the (single) Receivers
 	// entry is registered by the standby's walreceiver. The two
 	// virtual views below render whichever entries are live.
-	walSenders := wal.NewSenders()
-	walReceivers := wal.NewReceivers()
-	walSubscribers := wal.NewSubscribers()
-	syncRep := wal.NewSyncRep()
+	walSenders := xlog.NewSenders()
+	walReceivers := xlog.NewReceivers()
+	walSubscribers := xlog.NewSubscribers()
+	syncRep := xlog.NewSyncRep()
 
-	defaultGUC := wal.DefaultGUCParameters()
+	defaultGUC := xlog.DefaultGUCParameters()
 	// Pre-register the checkpointer background slot (M0122-0003 writeback
 	// simplification 3 follow-up) so Run's OnLoopStart/OnLoopEnd hooks below
 	// can track its goroutine identity the same way walProcNum tracks the
@@ -1812,7 +1812,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		State:       "active",
 	})
 	act.UpdateTrackIOTiming(checkpointerProcNum, opts.TrackIOTiming)
-	cp := wal.NewCheckpointer(pool, walWriter, wal.CheckpointerConfig{
+	cp := xlog.NewCheckpointer(pool, walWriter, xlog.CheckpointerConfig{
 		DataDir:             abs,
 		SegmentSize:         walCfg.SegmentSize,
 		GUCParams:           defaultGUC,
@@ -1892,7 +1892,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// skip truncation entirely (truncate less when in doubt).
 		TruncateCLOGFn: func() error {
 			datFrozen := cat.DatFrozenXID()
-			if datFrozen < mvcc.FirstNormalTransactionID {
+			if datFrozen < transam.FirstNormalTransactionID {
 				return nil // nothing frozen yet — never truncate
 			}
 			horizon := datFrozen
@@ -1905,7 +1905,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			if ox := txnMgr.OldestXmin(); ox != 0 && storage.XIDPrecedes(ox, horizon) {
 				horizon = ox
 			}
-			if horizon < mvcc.FirstNormalTransactionID {
+			if horizon < transam.FirstNormalTransactionID {
 				return nil
 			}
 			return clog.TruncateCLOG(horizon)
@@ -1918,14 +1918,14 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// for the lifetime of a long-lived cluster.
 		TruncateSubtransFn: func() error {
 			datFrozen := cat.DatFrozenXID()
-			if datFrozen < mvcc.FirstNormalTransactionID {
+			if datFrozen < transam.FirstNormalTransactionID {
 				return nil
 			}
 			horizon := datFrozen
 			if ox := txnMgr.OldestXmin(); ox != 0 && storage.XIDPrecedes(ox, horizon) {
 				horizon = ox
 			}
-			if horizon < mvcc.FirstNormalTransactionID {
+			if horizon < transam.FirstNormalTransactionID {
 				return nil
 			}
 			return subxactMap.Truncate(horizon)
@@ -2287,7 +2287,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 
 	// fix-05: last WAL-scanning recovery pass done — release the memoized WAL
 	// decode now (the deferred EndRecoveryCache remains as a harmless no-op).
-	wal.EndRecoveryCache()
+	xlog.EndRecoveryCache()
 
 	// pg_sequences: virtual catalog view listing all registered sequences.
 	// M0097-0024.
@@ -2704,9 +2704,9 @@ type walAIOEngineAdapter struct {
 	eng *aio.Engine
 }
 
-func (a walAIOEngineAdapter) Submit(op wal.AIOSubmitOp) wal.AIOHandle {
+func (a walAIOEngineAdapter) Submit(op xlog.AIOSubmitOp) xlog.AIOHandle {
 	dir := aio.DirRead
-	if op.Direction == wal.AIODirWrite {
+	if op.Direction == xlog.AIODirWrite {
 		dir = aio.DirWrite
 	}
 	return walAIOHandleAdapter{
@@ -2721,7 +2721,7 @@ func (a walAIOEngineAdapter) Submit(op wal.AIOSubmitOp) wal.AIOHandle {
 }
 
 type walAIOFileAdapter struct {
-	f wal.AIOFile
+	f xlog.AIOFile
 }
 
 func (a walAIOFileAdapter) ReadAt(p []byte, off int64) (int, error) {
@@ -2754,7 +2754,7 @@ func (a walAIOHandleAdapter) Wait() (int, error) {
 // registerStatCheckpointerView installs the
 // `pg_catalog.pg_stat_checkpointer` virtual table backed by
 // `Checkpointer.Stats`. Column ordering matches upstream PG 18.x.
-func registerStatCheckpointerView(cat *catalog.InMemory, cp *wal.Checkpointer) error {
+func registerStatCheckpointerView(cat *catalog.InMemory, cp *xlog.Checkpointer) error {
 	tbl := &catalog.Table{
 		Schema: "pg_catalog",
 		Name:   "pg_stat_checkpointer",
@@ -2960,7 +2960,7 @@ func highestCatalogXID(mgr *storage.Manager, cat *catalog.InMemory) (storage.Tra
 	return maxXID, nil
 }
 
-func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	return loadUserTablesFromHeapForDB(mgr, cat, clog, cat.DBOID(), 0)
 }
 
@@ -2972,7 +2972,7 @@ func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 // A distinct-dbOid database passes its own oid for both, so a table created
 // under CREATE DATABASE reloads into that database's namespace with its
 // data-file routing (Table.DBOid → base/<dbOid>/<relOid>) intact.
-func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog, heapDBOid, nsDBOid uint32) error {
+func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid, nsDBOid uint32) error {
 	// B0.1: both scan passes ride the generic catalog-heap reload loop
 	// (catalog_heap_reload.go) — the per-tuple walk, xmin/xmax liveness and
 	// the M0030-0007/M0106-0010 CLOG rules (aborted-xmin filter for every
@@ -3429,7 +3429,7 @@ func verifyInitialized(dir string) error {
 //
 // Non-fatal: if pg_index is absent or malformed, this function returns an error
 // and the caller falls back to WAL-replay-based index recovery.
-func loadUserIndexesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func loadUserIndexesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	// The main pass keeps its historical asymmetry: it READS base/<cat.DBOID()>
 	// (which detects as 5/"postgres" on any modern data dir, and receives the
 	// default namespace's rows through mirrorTouchedCatalogsToPostgresDB) while
@@ -3470,7 +3470,7 @@ func loadUserIndexesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 // directory the pg_class / pg_index pages are read from, `nsDBOid` the catalog
 // namespace the owning table is resolved in and the recovered index is
 // registered into. They differ only on the main pass — see its call site.
-func loadUserIndexesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog, heapDBOid, nsDBOid uint32) error {
+func loadUserIndexesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid, nsDBOid uint32) error {
 	// --- Pass 1: collect index rows from pg_class (relkind='i') ---
 	classRel := storage.RelFileNode{
 		DBOid:  heapDBOid,
@@ -3509,7 +3509,7 @@ func loadUserIndexesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, c
 			if ht.Header.Xmin == storage.InvalidTransactionID || ht.Header.Xmax != storage.InvalidTransactionID {
 				continue
 			}
-			if clog != nil && clog.GetStatus(ht.Header.Xmin) == mvcc.TxnStatusAborted {
+			if clog != nil && clog.GetStatus(ht.Header.Xmin) == transam.TxnStatusAborted {
 				continue
 			}
 			row, err := catalog.DecodePGClassPhysicalRow(ht.Data)
@@ -3585,7 +3585,7 @@ func loadUserIndexesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, c
 			if ht.Header.Xmin == storage.InvalidTransactionID || ht.Header.Xmax != storage.InvalidTransactionID {
 				continue
 			}
-			if clog != nil && clog.GetStatus(ht.Header.Xmin) == mvcc.TxnStatusAborted {
+			if clog != nil && clog.GetStatus(ht.Header.Xmin) == transam.TxnStatusAborted {
 				continue
 			}
 			row, err := catalog.DecodePGIndexPhysicalRow(ht.Data, ht.Bitmap)
@@ -3733,7 +3733,7 @@ func loadUserIndexesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, c
 // M0125-0029 only the main pass existed, and since the writer also routes
 // per-DB now (persistStatsToPGStatistic), a tpch/tpcds ANALYZE would have
 // been written to a heap no reload pass ever scanned.
-func loadStatisticsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func loadStatisticsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	// The main pass reads base/<DefaultDBOid>, NOT base/<cat.DBOID()>: the
 	// writer routes a default-namespace connection's stats to DefaultDBOid
 	// (tableCatalogHeapDBOid), while cat.DBOID() detects as 5 ("postgres")
@@ -3770,7 +3770,7 @@ func loadStatisticsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 // file is silently ignored; the planner falls back to hard-coded defaults
 // until the next ANALYZE run. heapDBOid picks the base/<dbOid> directory,
 // nsDBOid the catalog namespace the relids resolve in.
-func loadStatisticsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog, heapDBOid, nsDBOid uint32) error {
+func loadStatisticsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid, nsDBOid uint32) error {
 	statRel := storage.RelFileNode{
 		DBOid:  heapDBOid,
 		RelOid: catalog.StatisticRelationId,
@@ -3808,7 +3808,7 @@ func loadStatisticsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 			if ht.Header.Xmin == storage.InvalidTransactionID || ht.Header.Xmax != storage.InvalidTransactionID {
 				continue
 			}
-			if clog != nil && clog.GetStatus(ht.Header.Xmin) == mvcc.TxnStatusAborted {
+			if clog != nil && clog.GetStatus(ht.Header.Xmin) == transam.TxnStatusAborted {
 				continue
 			}
 			row, err := catalog.DecodePGStatisticPhysicalRow(ht.Data, ht.Bitmap)

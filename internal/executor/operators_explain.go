@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // explainOp renders the inner plan tree as a single-column
@@ -18,16 +18,16 @@ import (
 // ANALYZE / VERBOSE / FORMAT JSON wait on later loops; see
 // docs/design/0003-0007-explain.md.
 type explainOp struct {
-	plan *planner.Explain
+	plan *optimizer.Explain
 	rows []Row
 	idx  int
 }
 
-func newExplainOp(p *planner.Explain) *explainOp {
+func newExplainOp(p *optimizer.Explain) *explainOp {
 	return &explainOp{plan: p}
 }
 
-func (o *explainOp) Schema() planner.Schema {
+func (o *explainOp) Schema() optimizer.Schema {
 	return o.plan.Output()
 }
 
@@ -398,7 +398,7 @@ func (o *explainOp) Close() error { return nil }
 // `(rows=N)` is only appended when opts.Costs is true (the PG
 // default). `EXPLAIN (COSTS OFF) ...` therefore renders bare
 // node labels, matching upstream `COSTS OFF` output.
-func walkPlan(b *strings.Builder, n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions) {
+func walkPlan(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions) {
 	walkPlanFiltered(n, depth, rows, opts, nil, nil, &subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n)})
 }
 
@@ -408,18 +408,18 @@ func walkPlan(b *strings.Builder, n planner.Node, depth int, rows *[]Row, opts p
 // the next scan-like node we render. attachedFilterNode is that same
 // wrapper's plan node, carried so the collapsed line can report the
 // wrapper's POST-qual row estimate (see below).
-func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, attachedFilter planner.Expr, attachedFilterNode planner.Node, reg *subPlanReg) {
+func walkPlanFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.ExplainOptions, attachedFilter optimizer.Expr, attachedFilterNode optimizer.Node, reg *subPlanReg) {
 	// Skip Project wrappers: PG has no "Projection" plan node;
 	// the projection is part of the parent / scan's render.
-	if p, ok := n.(*planner.Project); ok {
-		walkPlanFiltered(p.Child, depth, rows, opts, attachedFilter, attachedFilterNode, reg)
+	if p, ok := n.(*optimizer.Project); ok {
+		walkPlanFiltered(p.Child, indent, rows, opts, attachedFilter, attachedFilterNode, reg)
 		return
 	}
 	// Skip Filter wrappers and push their predicate down to be
 	// rendered as `Filter:` detail under the next scan node.
-	if f, ok := n.(*planner.Filter); ok {
+	if f, ok := n.(*optimizer.Filter); ok {
 		next := f.Predicate
-		nextNode := planner.Node(f)
+		nextNode := optimizer.Node(f)
 		// If multiple Filter wrappers stack, render only the
 		// outermost predicate to keep the detail line readable.
 		// Inner Filter predicates collapse with the outer via
@@ -432,15 +432,27 @@ func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.Explai
 			next = attachedFilter
 			nextNode = attachedFilterNode
 		}
-		walkPlanFiltered(f.Child, depth, rows, opts, next, nextNode, reg)
+		walkPlanFiltered(f.Child, indent, rows, opts, next, nextNode, reg)
 		return
 	}
 
-	indent := strings.Repeat("  ", depth)
-	prefix := indent
-	if depth > 0 {
-		prefix = indent + "->  "
+	// PG-faithful cumulative indent (postgres/src/backend/commands/explain.c
+	// ExplainNode, ~1616-1635): `indent` here is `es->indent` as seen on
+	// entry. A node at nonzero incoming indent prints "->  " at `indent*2`
+	// raw spaces and bumps the running indent by 2 for it; every node then
+	// gets an UNCONDITIONAL +1 for its own name. `childIndent` is the
+	// resulting value — what gets handed to this node's children, its
+	// detail lines, and any InitPlan/SubPlan/CTE label hanging off it. This
+	// is NOT a flat `2*depth`: the "->  " marker lands at raw columns
+	// 0, 2, 8, 14, 20 … (deltas 2, 6, 6, 6) as nesting deepens, verified
+	// against postgres/src/test/regress/expected/aggregates.out:3158-3165.
+	prefix := ""
+	arrowIndent := indent
+	if indent != 0 {
+		prefix = strings.Repeat(" ", indent*2) + "->  "
+		arrowIndent = indent + 2
 	}
+	childIndent := arrowIndent + 1
 	label := prefix + describePlanVerbose(n, opts.Verbose, reg.names())
 	// COSTS defaults to ON in PostgreSQL (and goopg); only suppress when
 	// the user explicitly wrote COSTS OFF (Set.Costs=true and Costs=false).
@@ -471,7 +483,7 @@ func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.Explai
 		if attachedFilterNode != nil {
 			rowSrc = attachedFilterNode
 		}
-		est := planner.EstimateRows(rowSrc)
+		est := optimizer.EstimateRows(rowSrc)
 		if est <= 0 {
 			est = 1
 		}
@@ -481,15 +493,17 @@ func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.Explai
 	}
 	*rows = append(*rows, Row{NewStringDatum(label)})
 
-	// Detail indent: matches the content column of the node
-	// label plus 2 spaces, mirroring PG's `Sort Key:` / `Index
-	// Cond:` / `Filter:` indent convention.
-	detailIndent := strings.Repeat(" ", len(prefix)+2)
-	emitNodeDetailLines(n, detailIndent, rows, attachedFilter, reg)
+	// Detail indent: the node's own post-increment `childIndent`, in raw
+	// spaces — mirrors PG's `Sort Key:` / `Index Cond:` / `Filter:` /
+	// `Output:` indent convention (explain.c's ExplainPropertyText et al.
+	// all indent at the CURRENT es->indent, same column for every property
+	// of a node).
+	detailIndent := strings.Repeat(" ", childIndent*2)
+	emitNodeDetailLines(n, detailIndent, opts.Verbose, rows, attachedFilter, reg)
 
 	if opts.Verbose {
 		if cols := schemaColumnNames(n); len(cols) > 0 {
-			outline := indent + "  Output: " + strings.Join(cols, ", ")
+			outline := detailIndent + "Output: " + strings.Join(cols, ", ")
 			*rows = append(*rows, Row{NewStringDatum(outline)})
 		}
 	}
@@ -497,8 +511,8 @@ func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.Explai
 	// The `CTE <name>` sections belong to the top plan node, before its
 	// InitPlans and children — upstream prints them from the top node's
 	// subplan list (M0125-0049; explain_cte.go carries the shape).
-	emitCTESections(rows, depth, reg, func(body planner.Node, bodyDepth int) {
-		walkPlanFiltered(body, bodyDepth, rows, opts, nil, nil, reg)
+	emitCTESections(rows, indent, childIndent, reg, func(body optimizer.Node, bodyIndent int) {
+		walkPlanFiltered(body, bodyIndent, rows, opts, nil, nil, reg)
 	})
 
 	// Sublinks referenced by this node's detail lines print their
@@ -509,13 +523,13 @@ func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.Explai
 	// the relation the sublink itself scans.
 	prevAncestor := reg.ancestor
 	reg.ancestor = n
-	emitSubPlanSubtrees(rows, detailIndent, opts, reg, nil, func(sub planner.Node, subDepth int) {
-		walkPlanFiltered(sub, subDepth, rows, opts, nil, nil, reg)
+	emitSubPlanSubtrees(rows, detailIndent, opts, reg, nil, func(sub optimizer.Node, subIndent int) {
+		walkPlanFiltered(sub, subIndent, rows, opts, nil, nil, reg)
 	})
 	reg.ancestor = prevAncestor
 
 	for _, c := range renderChildren(n, reg.cte) {
-		walkPlanFiltered(c, depth+1, rows, opts, nil, nil, reg)
+		walkPlanFiltered(c, childIndent, rows, opts, nil, nil, reg)
 	}
 }
 
@@ -525,20 +539,28 @@ func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.Explai
 //	SubPlan N
 //	  ->  <inner plan tree>
 //
-// render walks one sublink's inner plan at the given depth. The
+// render walks one sublink's inner plan at the given indent. The
 // queue is drained in a loop because a sublink's own plan can
 // reference further sublinks, which assign higher numbers as they
 // are rendered (matching upstream's nested-SubPlan output).
 // spStats, when non-nil (the ANALYZE path), appends this sublink's
 // measured execution counters to its `SubPlan N` line.
-func emitSubPlanSubtrees(rows *[]Row, detailIndent string, opts parser.ExplainOptions, reg *subPlanReg, spStats map[planner.Expr]*SubPlanSiteStats, render func(planner.Node, int)) {
+func emitSubPlanSubtrees(rows *[]Row, detailIndent string, opts parser.ExplainOptions, reg *subPlanReg, spStats map[optimizer.Expr]*SubPlanSiteStats, render func(optimizer.Node, int)) {
 	for {
 		pending := reg.takePending()
 		if len(pending) == 0 {
 			return
 		}
 		for _, sp := range pending {
-			line := detailIndent + fmt.Sprintf("SubPlan %d", sp.n)
+			// A non-correlated scalar SubqueryExpr is an InitPlan (upstream
+			// plan_name "InitPlan %d", rendered bare — see subPlanName); the
+			// rest keep the `SubPlan N` label. Same discriminator as
+			// subPlanName so the number and its subtree agree.
+			kind := "SubPlan"
+			if sq, ok := sp.expr.(*optimizer.SubqueryExpr); ok && sq.IsNonCorrelated {
+				kind = "InitPlan"
+			}
+			line := detailIndent + fmt.Sprintf("%s %d", kind, sp.n)
 			if s := spStats[sp.expr]; s != nil {
 				line += fmt.Sprintf(" (calls=%d rebuilds=%d rescans=%d hits=%d misses=%d)",
 					s.Calls, s.Rebuilds, s.Rescans, s.CacheHits, s.CacheMisses)
@@ -552,15 +574,18 @@ func emitSubPlanSubtrees(rows *[]Row, detailIndent string, opts parser.ExplainOp
 				// keeps the walk to the tree planChildren exposes —
 				// sublink plans hang off expressions, not off it.
 				reg.names().collect(sp.plan)
-				// Indent the sublink's plan one "->" level under the
-				// `SubPlan N` line, matching upstream's shape. A node
-				// rendered at depth d starts its "->" at 2*d columns,
-				// so the depth that lands on detailIndent+2 is
-				// (len(detailIndent)+2)/2. Deriving it from the indent
-				// rather than from depth keeps the root node right:
-				// depth 0 has no "->  " prefix, so its detailIndent is
-				// 4 columns narrower than every deeper node's.
-				render(sp.plan, (len(detailIndent)+2)/2)
+				// The `SubPlan N` / `InitPlan N` label was printed at
+				// this owner's own childIndent (detailIndent = that
+				// value in raw spaces), matching upstream's plan_name
+				// branch printing at the CURRENT es->indent. Upstream
+				// then does an UNCONDITIONAL `es->indent++` (only +1,
+				// not +2 — the body's own "->  " arrow is what adds the
+				// +2, once ExplainNode is entered for it) before
+				// rendering the body, so the body's incoming indent is
+				// childIndent+1 = len(detailIndent)/2 + 1. Verified
+				// against postgres/src/test/regress/expected/
+				// subselect.out:380-391 (nested SubPlan/InitPlan).
+				render(sp.plan, len(detailIndent)/2+1)
 			}
 		}
 	}
@@ -570,7 +595,7 @@ func emitSubPlanSubtrees(rows *[]Row, detailIndent string, opts parser.ExplainOp
 // belong under n (Sort Key / Index Cond / Filter). attachedFilter
 // is a Filter.Predicate from a Filter wrapper above n that was
 // skipped — it surfaces as `Filter:` when n is a scan-like node.
-func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFilter planner.Expr, reg *subPlanReg) {
+func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]Row, attachedFilter optimizer.Expr, reg *subPlanReg) {
 	// M0125-0039: whether this node's detail lines print qualified column
 	// references. Upstream splits the decision by node kind — show_scan_qual
 	// deparses a scan's `Filter:`/`Index Cond:` with varprefix=false, while
@@ -582,24 +607,64 @@ func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFil
 	// (VERBOSE does not force prefixing here yet — see the deferral row.)
 	qualify := reg.names().qualify() && !explainIsScanNode(n)
 	switch p := n.(type) {
-	case *planner.Gather:
+	case *optimizer.Result:
+		// A childless Result's targets carry sublinks (the S6 min/max
+		// InitPlan). Non-verbose EXPLAIN prints no Output line for Result,
+		// but a target-only sublink must still be ASSIGNED here so
+		// emitSubPlanSubtrees (run right after this walker in
+		// walkPlanFiltered) prints its `InitPlan N` subtree under the
+		// Result label — the targets are the one place a sublink can live
+		// without a detail line, so nothing else would ever number it. The
+		// rendered text is discarded; only the assignment side effect
+		// (subPlanName → assign) is wanted. PG does the same structural
+		// walk through SS_process_sublinks/ExplainSubPlans.
+		for _, t := range p.Targets {
+			formatExprQual(t, reg, qualify)
+		}
+		// S6 Slice 3d: the const-arg inner Result carries a resconstantqual
+		// that PG prints as `One-Time Filter:` (explain.c:2234-2240
+		// show_upper_qual, "One-Time Filter" label) — same indent/paren shape
+		// as the scan `Filter:` line. formatExprQual's IsNullExpr arm renders
+		// `(100 IS NOT NULL)` with its parens already built in, and wrapParen
+		// does not double-wrap a single paren group.
+		if p.OneTimeFilter != nil {
+			*rows = append(*rows, Row{NewStringDatum(indent + "One-Time Filter: " + wrapParen(formatExprQual(p.OneTimeFilter, reg, qualify)))})
+		}
+	case *optimizer.Gather:
 		// PG emits `Workers Planned:` in PLAIN EXPLAIN — it is a plan-time
 		// property. `Workers Launched:` is execution-time and belongs to the
 		// ANALYZE walk instead.
 		*rows = append(*rows, Row{NewStringDatum(
 			indent + fmt.Sprintf("Workers Planned: %d", p.WorkersPlanned))})
-	case *planner.GatherMerge:
+	case *optimizer.GatherMerge:
 		// PG prints Workers Planned for Gather Merge and, unlike Sort, does NOT
 		// print the merge keys (explain.c has no show_sort_keys call in the
 		// T_GatherMerge arm) — the keys are the child Sort's, and it prints
 		// them itself one line below.
 		*rows = append(*rows, Row{NewStringDatum(
 			indent + fmt.Sprintf("Workers Planned: %d", p.WorkersPlanned))})
-	case *planner.Sort:
+	// SIBLING PAIR (M0134-0001 S18): this case and *optimizer.Aggregate's
+	// group-key loop below must move together. Both derive from PG's single
+	// show_sort_group_keys (explain.c:2767-2823) — a GroupAggregate/Sort
+	// stack prints one line from each, two rows apart, so a change to one
+	// without the other manufactures an internal inconsistency within a
+	// single EXPLAIN output. See docs/design/0134-0001-p2-explain-format.md
+	// § S18 for the "reference vs compute" rule this pair implements.
+	case *optimizer.Sort:
 		if len(p.Keys) > 0 {
 			parts := make([]string, 0, len(p.Keys))
 			for _, k := range p.Keys {
 				s := formatExprQual(k.Expr, reg, qualify)
+				// S18: a Sort never evaluates expressions — its key is
+				// always PG's OUTER_VAR reference into the child's target
+				// list, so get_special_variable's "force parentheses for a
+				// non-Var referent" rule applies unconditionally here.
+				// Placed BEFORE the DESC/NULLS suffix: PG prints
+				// `Sort Key: ((g % 10000)) DESC`, keeping the decoration
+				// outside the added pair.
+				if _, isVar := k.Expr.(*optimizer.ColumnRef); !isVar {
+					s = forceParen(s)
+				}
 				if k.Desc {
 					s += " DESC"
 				}
@@ -614,14 +679,22 @@ func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFil
 			}
 			*rows = append(*rows, Row{NewStringDatum(indent + "Sort Key: " + strings.Join(parts, ", "))})
 		}
-	case *planner.IndexScan:
+	case *optimizer.IndexScan:
 		if cond := formatIndexCond(p, reg); cond != "" {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Index Cond: " + cond)})
 		}
 		if attachedFilter != nil {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
 		}
-	case *planner.Join:
+	case *optimizer.IndexOnlyScan:
+		// S6 min/max rewrite: the IOS's residual `col IS NOT NULL` qual is
+		// stored in Cond (it cannot be pushed into the btree probe) and
+		// rendered as an Index Cond, matching upstream's build_minmax_path
+		// which carries it as an index qual (planagg.c build_minmax_path).
+		if p.Cond != nil {
+			*rows = append(*rows, Row{NewStringDatum(indent + "Index Cond: " + wrapParen(formatExprQual(p.Cond, reg, qualify)))})
+		}
+	case *optimizer.Join:
 		// M0127-P2.1: render the join's equi-key list, upstream's
 		// `Hash Cond:` / `Merge Cond:`. explain.c reaches these through
 		// show_upper_qual (T_HashJoin → hashclauses, T_MergeJoin →
@@ -638,7 +711,7 @@ func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFil
 		// readable against PG's own output for the same query.
 		if cond := formatJoinKeyCond(p, reg, qualify); cond != "" {
 			label := "Hash Cond: "
-			if p.Algo == planner.JoinAlgoMerge {
+			if p.Algo == optimizer.JoinAlgoMerge {
 				label = "Merge Cond: "
 			}
 			*rows = append(*rows, Row{NewStringDatum(indent + label + cond)})
@@ -660,7 +733,7 @@ func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFil
 		if attachedFilter != nil {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
 		}
-	case *planner.NestedLoopIndexJoin:
+	case *optimizer.NestedLoopIndexJoin:
 		// The NLI's residual predicate (conjuncts the index probe does not
 		// enforce — hoisted inner filters, OR-factoring residuals,
 		// decorrelated-EXISTS residuals like Q4's l_commitdate <
@@ -673,7 +746,7 @@ func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFil
 		if attachedFilter != nil {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
 		}
-	case *planner.Memoize:
+	case *optimizer.Memoize:
 		// Upstream shape: `Cache Key: t.a, t.b` under the Memoize node.
 		if len(p.KeyExprs) > 0 {
 			parts := make([]string, 0, len(p.KeyExprs))
@@ -682,7 +755,67 @@ func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFil
 			}
 			*rows = append(*rows, Row{NewStringDatum(indent + "Cache Key: " + strings.Join(parts, ", "))})
 		}
-	case *planner.SeqScan:
+	case *optimizer.SeqScan:
+		if attachedFilter != nil {
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+		}
+	case *optimizer.GenerateSeries, *optimizer.GenerateSubscripts, *optimizer.FromUnnest, *optimizer.UserSrfScan:
+		// M0134-0001 P2 S2: the verbose-only `Function Call:` deparse
+		// (explain.c T_FunctionScan 2067-2083), emitted before any
+		// Filter. Built from a synthetic FuncCall and rendered through
+		// the existing FuncCall case so `generate_series(1, 3)` is
+		// byte-identical to PG. Not emitted for ProjectSet (no case
+		// here).
+		if verbose {
+			if name, args := srfFunctionCallArgs(n); name != "" {
+				fc := &optimizer.FuncCall{Name: name, Args: args}
+				*rows = append(*rows, Row{NewStringDatum(indent + "Function Call: " + formatExprQual(fc, reg, qualify))})
+			}
+		}
+		if attachedFilter != nil {
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+		}
+	case *optimizer.Aggregate:
+		// S5 (0134-0001 P2): PG's show_agg_keys prints a `Group Key:` line
+		// for ANY grouped aggregate, regardless of strategy — AGG_HASHED
+		// included (explain.c:2616-2636); show_hashagg_info emits no key
+		// line of its own (explain.c:3716-3830). The grouping-sets path is
+		// out of S5 scope (its per-set lines are a separate M0125-0048
+		// shape; the suffix on the label carries the set count).
+		if len(p.GroupExprs) > 0 && p.GroupingSets == nil {
+			// GroupKeyOrder (S8 Slice 2c-i, 0134-0001 P2) reorders only this
+			// printed line — GroupExprs itself, and every output binding
+			// fixed to its written position, is untouched. nil means the
+			// written order (every pre-2c-i plan).
+			order := p.GroupKeyOrder
+			if order == nil {
+				order = make([]int, len(p.GroupExprs))
+				for i := range order {
+					order[i] = i
+				}
+			}
+			// SIBLING PAIR (M0134-0001 S18): see the *optimizer.Sort case
+			// above. A GroupAggregate reads its already-sorted input
+			// through a child Sort, so it inherits that Sort's OUTER_VAR
+			// reference wrap; a HashAggregate sitting directly on a
+			// scan/join computes the group key itself and keeps the
+			// single (unwrapped) form. docs/design/0134-0001-p2-explain-format.md
+			// § S18.
+			_, groupAgg := p.Child.(*optimizer.Sort)
+			parts := make([]string, 0, len(order))
+			for _, gi := range order {
+				s := formatExprQual(p.GroupExprs[gi], reg, qualify)
+				if groupAgg {
+					if _, isVar := p.GroupExprs[gi].(*optimizer.ColumnRef); !isVar {
+						s = forceParen(s)
+					}
+				}
+				parts = append(parts, s)
+			}
+			*rows = append(*rows, Row{NewStringDatum(indent + "Group Key: " + strings.Join(parts, ", "))})
+		}
+		// PG order (explain.c:2196-2197): Group Key first, then the HAVING
+		// qual as `Filter:` (show_upper_qual plan->qual).
 		if attachedFilter != nil {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
 		}
@@ -709,8 +842,8 @@ func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFil
 // empty — a join built outside Plan()'s tail never gets the list, and an
 // unrendered condition would be a silent regression against the pre-P2.1
 // output for exactly those plans.
-func formatJoinKeyCond(p *planner.Join, reg *subPlanReg, qualify bool) string {
-	if p.Algo != planner.JoinAlgoHash && p.Algo != planner.JoinAlgoMerge {
+func formatJoinKeyCond(p *optimizer.Join, reg *subPlanReg, qualify bool) string {
+	if p.Algo != optimizer.JoinAlgoHash && p.Algo != optimizer.JoinAlgoMerge {
 		return ""
 	}
 	pairs := p.HashKeys
@@ -718,7 +851,7 @@ func formatJoinKeyCond(p *planner.Join, reg *subPlanReg, qualify bool) string {
 		if p.LeftKey == nil || p.RightKey == nil {
 			return ""
 		}
-		pairs = []planner.JoinKeyPair{{Left: p.LeftKey, Right: p.RightKey}}
+		pairs = []optimizer.JoinKeyPair{{Left: p.LeftKey, Right: p.RightKey}}
 	}
 	parts := make([]string, 0, len(pairs))
 	for _, k := range pairs {
@@ -726,7 +859,7 @@ func formatJoinKeyCond(p *planner.Join, reg *subPlanReg, qualify bool) string {
 			continue
 		}
 		parts = append(parts, formatExprQual(
-			&planner.BinaryOp{Op: parser.OpEq, Left: k.Left, Right: k.Right}, reg, qualify))
+			&optimizer.BinaryOp{Op: parser.OpEq, Left: k.Left, Right: k.Right}, reg, qualify))
 	}
 	if len(parts) == 0 {
 		return ""
@@ -754,15 +887,15 @@ func formatJoinKeyCond(p *planner.Join, reg *subPlanReg, qualify bool) string {
 // Nested loop has no key list, so its whole Predicate is the residual; that
 // matches upstream, where a NestLoop's joinqual is the full set of join
 // clauses the inner index scan did not consume.
-func formatJoinFilter(p *planner.Join, reg *subPlanReg, qualify bool) string {
+func formatJoinFilter(p *optimizer.Join, reg *subPlanReg, qualify bool) string {
 	if p == nil || p.Predicate == nil {
 		return ""
 	}
 	residual := p.Predicate
 	switch p.Algo {
-	case planner.JoinAlgoHash:
+	case optimizer.JoinAlgoHash:
 		residual = p.ExecHashKeyPlan().Residual
-	case planner.JoinAlgoMerge:
+	case optimizer.JoinAlgoMerge:
 		residual = p.ExecMergeKeyPlan().Residual
 	}
 	if residual == nil {
@@ -774,7 +907,7 @@ func formatJoinFilter(p *planner.Join, reg *subPlanReg, qualify bool) string {
 // formatIndexCond renders the equality / range condition of an
 // IndexScan node as a PG-style `(col = key)` (or range) expression.
 // Empty when the scan has no bound (full-range probe).
-func formatIndexCond(p *planner.IndexScan, reg *subPlanReg) string {
+func formatIndexCond(p *optimizer.IndexScan, reg *subPlanReg) string {
 	if p == nil || p.Index == nil {
 		return ""
 	}
@@ -799,10 +932,18 @@ func formatIndexCond(p *planner.IndexScan, reg *subPlanReg) string {
 		col := cols[0]
 		var parts []string
 		if p.LowKey != nil {
-			parts = append(parts, col+" >= "+formatExprPGReg(p.LowKey, reg))
+			loOp := ">="
+			if p.LowOp == parser.OpGt {
+				loOp = ">"
+			}
+			parts = append(parts, col+" "+loOp+" "+formatExprPGReg(p.LowKey, reg))
 		}
 		if p.HighKey != nil {
-			parts = append(parts, col+" <= "+formatExprPGReg(p.HighKey, reg))
+			hiOp := "<="
+			if p.HighOp == parser.OpLt {
+				hiOp = "<"
+			}
+			parts = append(parts, col+" "+hiOp+" "+formatExprPGReg(p.HighKey, reg))
 		}
 		if len(parts) > 0 {
 			return wrapParen(strings.Join(parts, " AND "))
@@ -835,6 +976,17 @@ func wrapParen(s string) string {
 	return "(" + s + ")"
 }
 
+// forceParen unconditionally wraps s in one more parenthesis pair — S18's
+// `get_special_variable` "force parentheses for a non-Var referent" rule
+// (ruleutils.c). Deliberately NOT `wrapParen`: wrapParen is idempotent
+// ("skip if already parenthesised") for the Filter:/Index Cond: sites and
+// would silently no-op on an already-parenthesised OpExpr like
+// `(g % 10000)`, which S18's Sort Key:/Group Key: sites must still wrap to
+// `((g % 10000))`.
+func forceParen(s string) string {
+	return "(" + s + ")"
+}
+
 // subPlanReg assigns PG-style "SubPlan N" numbers to the sublink
 // expressions encountered while rendering one EXPLAIN result, and
 // queues their inner plans so the owning node can print them as
@@ -851,7 +1003,7 @@ func wrapParen(s string) string {
 // nothing, so callers without a registry (JSON rendering, direct
 // formatExprPG users) keep working unchanged.
 type subPlanReg struct {
-	num     map[planner.Expr]int
+	num     map[optimizer.Expr]int
 	pending []subPlanEntry
 	// rel is the render's range-table name table (M0125-0039). It lives
 	// here rather than in its own parameter because subPlanReg is already
@@ -865,7 +1017,7 @@ type subPlanReg struct {
 	// correlated reference whose binding id was erased on the way up
 	// (an aggregate zeroes SourceTableIdx). Set by the walkers around
 	// each node's render; nil outside one.
-	ancestor planner.Node
+	ancestor optimizer.Node
 	// cte holds the CTE bodies lifted out of their reference sites for this
 	// render, so a multiply-referenced CTE prints once as a `CTE <name>`
 	// section instead of once per reference (M0125-0049). Shared with the
@@ -876,7 +1028,7 @@ type subPlanReg struct {
 }
 
 // ancestorNode returns the plan node currently being rendered, or nil.
-func (r *subPlanReg) ancestorNode() planner.Node {
+func (r *subPlanReg) ancestorNode() optimizer.Node {
 	if r == nil {
 		return nil
 	}
@@ -898,13 +1050,13 @@ func (r *subPlanReg) names() *explainNames {
 // up in Context.SubPlanStats when rendering its `SubPlan N` line.
 type subPlanEntry struct {
 	n    int
-	expr planner.Expr
-	plan planner.Node
+	expr optimizer.Expr
+	plan optimizer.Node
 }
 
 // assign returns the SubPlan number already given to e, or
 // allocates the next one and queues e's inner plan for emission.
-func (r *subPlanReg) assign(e planner.Expr, plan planner.Node) int {
+func (r *subPlanReg) assign(e optimizer.Expr, plan optimizer.Node) int {
 	if r == nil {
 		return 0
 	}
@@ -912,7 +1064,7 @@ func (r *subPlanReg) assign(e planner.Expr, plan planner.Node) int {
 		return n
 	}
 	if r.num == nil {
-		r.num = make(map[planner.Expr]int)
+		r.num = make(map[optimizer.Expr]int)
 	}
 	n := len(r.num) + 1
 	r.num[e] = n
@@ -931,12 +1083,22 @@ func (r *subPlanReg) takePending() []subPlanEntry {
 	return out
 }
 
-// subPlanName renders the `SubPlan N` token for e, matching
-// upstream's SubPlan.plan_name. Without a registry the number is
-// unknown, so the bare kind is printed instead of a wrong number.
-func subPlanName(r *subPlanReg, e planner.Expr, plan planner.Node) string {
+// subPlanName renders the plan-name token for e, matching upstream's
+// SubPlan.plan_name: a non-correlated scalar SubqueryExpr is an
+// InitPlan (`InitPlan %d` — subselect.c:3154 psprintf("InitPlan %d",
+// node->plan_id), rendered bare by ExplainSubPlans), everything else a
+// SubPlan (`SubPlan %d`). PG 18.3 emits the bare `InitPlan 1` with NO
+// `(returns $0)` suffix in every EXPLAIN mode; verified against the
+// committed expected/aggregates.out and a live PG 18.3 on 2026-08-15.
+// Without a registry the number is unknown, so the bare kind is
+// printed instead of a wrong number.
+func subPlanName(r *subPlanReg, e optimizer.Expr, plan optimizer.Node) string {
 	if n := r.assign(e, plan); n > 0 {
-		return fmt.Sprintf("SubPlan %d", n)
+		kind := "SubPlan"
+		if sq, ok := e.(*optimizer.SubqueryExpr); ok && sq.IsNonCorrelated {
+			kind = "InitPlan"
+		}
+		return fmt.Sprintf("%s %d", kind, n)
 	}
 	return "SubPlan"
 }
@@ -946,7 +1108,7 @@ func subPlanName(r *subPlanReg, e planner.Expr, plan planner.Node) string {
 // `SubPlan` without a number. Prefer formatExprPGReg from the
 // EXPLAIN walkers so sublinks are numbered and their subtrees
 // emitted.
-func formatExprPG(e planner.Expr) string {
+func formatExprPG(e optimizer.Expr) string {
 	return formatExprPGReg(e, nil)
 }
 
@@ -955,7 +1117,7 @@ func formatExprPG(e planner.Expr) string {
 // right one for a scan-node qual, which upstream deparses with
 // varprefix=false (explain.c show_scan_qual). Call formatExprQual directly
 // with qualify=true for the upper-node quals PG prefixes.
-func formatExprPGReg(e planner.Expr, reg *subPlanReg) string {
+func formatExprPGReg(e optimizer.Expr, reg *subPlanReg) string {
 	return formatExprQual(e, reg, false)
 }
 
@@ -966,18 +1128,18 @@ func formatExprPGReg(e planner.Expr, reg *subPlanReg) string {
 // compact `<type>` token for expression kinds we don't yet render
 // (sufficient for the isolation specs that pass through
 // `EXPLAIN (COSTS OFF)`; the detail line is informational).
-func formatExprQual(e planner.Expr, reg *subPlanReg, qualify bool) string {
+func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 	if e == nil {
 		return ""
 	}
 	switch x := e.(type) {
-	case *planner.ColumnRef:
+	case *optimizer.ColumnRef:
 		// qualify is upstream's deparse_context.varprefix
 		// (ruleutils.c get_variable's need_prefix): a plain Var is
 		// printed bare on a scan qual and qualified everywhere else
 		// once the query has more than one range-table entry.
 		return reg.names().column(x.SourceTableIdx, x.Name, qualify)
-	case *planner.OuterColumnRef:
+	case *optimizer.OuterColumnRef:
 		// A correlated reference is always prefixed, even inside a
 		// scan qual. Upstream reaches the same output through
 		// get_parameter, which forces varprefix=true while deparsing
@@ -998,45 +1160,45 @@ func formatExprQual(e planner.Expr, reg *subPlanReg, qualify bool) string {
 			return rel + "." + x.Name
 		}
 		return x.Name
-	case *planner.IntegerConst:
+	case *optimizer.IntegerConst:
 		return fmt.Sprintf("%d", x.Value)
-	case *planner.NumericConst:
+	case *optimizer.NumericConst:
 		return x.Value
-	case *planner.StringConst:
+	case *optimizer.StringConst:
 		// PG renders string literals as single-quoted; escape
 		// embedded single quotes per SQL convention.
 		return "'" + strings.ReplaceAll(x.Value, "'", "''") + "'"
-	case *planner.BooleanConst:
+	case *optimizer.BooleanConst:
 		if x.Value {
 			return "true"
 		}
 		return "false"
-	case *planner.NullConst:
+	case *optimizer.NullConst:
 		return "NULL"
-	case *planner.BinaryOp:
+	case *optimizer.BinaryOp:
 		return "(" + formatExprQual(x.Left, reg, qualify) + " " + x.Op.String() + " " + formatExprQual(x.Right, reg, qualify) + ")"
-	case *planner.UnaryOp:
+	case *optimizer.UnaryOp:
 		return "(" + x.Op.String() + " " + formatExprQual(x.Operand, reg, qualify) + ")"
-	case *planner.CastExpr:
+	case *optimizer.CastExpr:
 		return formatExprQual(x.Operand, reg, qualify)
-	case *planner.FuncCall:
+	case *optimizer.FuncCall:
 		args := make([]string, len(x.Args))
 		for i, a := range x.Args {
 			args[i] = formatExprQual(a, reg, qualify)
 		}
 		return x.Name + "(" + strings.Join(args, ", ") + ")"
-	case *planner.ParamRef:
+	case *optimizer.ParamRef:
 		return fmt.Sprintf("$%d", x.Number)
-	case *planner.ExecParamRef:
+	case *optimizer.ExecParamRef:
 		// PARAM_EXEC slot (D4.1) — upstream prints exec params the
 		// same `$N` way (e.g. `Index Cond: (l_orderkey = $0)`); the
 		// number is the flat per-statement slot ID.
 		return fmt.Sprintf("$%d", x.ID)
-	case *planner.TypedStringLit:
+	case *optimizer.TypedStringLit:
 		// Upstream renders a typed literal as `'value'::type`
 		// (ruleutils.c get_const_expr with showtype).
 		return "'" + strings.ReplaceAll(x.Value, "'", "''") + "'::" + x.Type
-	case *planner.IntervalLit:
+	case *optimizer.IntervalLit:
 		// `interval 'N' <unit>` (Qualified) folds the unit into the
 		// literal text so the rendering stays a single typed constant.
 		lit := x.Value
@@ -1044,7 +1206,7 @@ func formatExprQual(e planner.Expr, reg *subPlanReg, qualify bool) string {
 			lit += " " + x.Unit
 		}
 		return "'" + strings.ReplaceAll(lit, "'", "''") + "'::interval"
-	case *planner.ExistsExpr:
+	case *optimizer.ExistsExpr:
 		// Upstream renders EXISTS sublinks as `EXISTS(SubPlan N)`
 		// (ruleutils.c get_rule_expr, T_SubPlan / EXISTS_SUBLINK).
 		s := "EXISTS(" + subPlanName(reg, x, x.Plan) + ")"
@@ -1052,22 +1214,22 @@ func formatExprQual(e planner.Expr, reg *subPlanReg, qualify bool) string {
 			return "NOT " + s
 		}
 		return s
-	case *planner.SubqueryExpr:
+	case *optimizer.SubqueryExpr:
 		// EXPR_SUBLINK: upstream decorates scalar subplan
 		// references with nothing but parentheses.
 		return "(" + subPlanName(reg, x, x.Plan) + ")"
-	case *planner.ArraySubqueryExpr:
+	case *optimizer.ArraySubqueryExpr:
 		// ARRAY_SUBLINK: upstream prints `ARRAY(<plan_name>)`.
 		return "ARRAY(" + subPlanName(reg, x, x.Plan) + ")"
-	case *planner.InExpr:
+	case *optimizer.InExpr:
 		return formatInExprPG(x, reg, qualify)
-	case *planner.IsNullExpr:
+	case *optimizer.IsNullExpr:
 		// ruleutils.c get_rule_expr, T_NullTest.
 		if x.Negated {
 			return "(" + formatExprQual(x.Operand, reg, qualify) + " IS NOT NULL)"
 		}
 		return "(" + formatExprQual(x.Operand, reg, qualify) + " IS NULL)"
-	case *planner.IsBoolExpr:
+	case *optimizer.IsBoolExpr:
 		// T_BooleanTest. TestTrue/TestFalse both false means IS UNKNOWN
 		// (see evalExprSlot's IsBoolExpr arm).
 		what := "UNKNOWN"
@@ -1081,13 +1243,13 @@ func formatExprQual(e planner.Expr, reg *subPlanReg, qualify bool) string {
 			not = "NOT "
 		}
 		return "(" + formatExprQual(x.Operand, reg, qualify) + " IS " + not + what + ")"
-	case *planner.IsDistinctFromExpr:
+	case *optimizer.IsDistinctFromExpr:
 		op := " IS DISTINCT FROM "
 		if x.Negated {
 			op = " IS NOT DISTINCT FROM "
 		}
 		return "(" + formatExprQual(x.Left, reg, qualify) + op + formatExprQual(x.Right, reg, qualify) + ")"
-	case *planner.CaseExpr:
+	case *optimizer.CaseExpr:
 		// T_CaseExpr. Simple form keeps the operand after CASE.
 		var b strings.Builder
 		b.WriteString("CASE")
@@ -1107,32 +1269,32 @@ func formatExprQual(e planner.Expr, reg *subPlanReg, qualify bool) string {
 		}
 		b.WriteString(" END")
 		return b.String()
-	case *planner.ExtractExpr:
+	case *optimizer.ExtractExpr:
 		return "EXTRACT(" + x.Field + " FROM " + formatExprQual(x.Source, reg, qualify) + ")"
-	case *planner.CollateExpr:
+	case *optimizer.CollateExpr:
 		return "(" + formatExprQual(x.Operand, reg, qualify) + " COLLATE " + x.CollationName + ")"
-	case *planner.RowExpr:
+	case *optimizer.RowExpr:
 		elems := make([]string, len(x.Elems))
 		for i, el := range x.Elems {
 			elems[i] = formatExprQual(el, reg, qualify)
 		}
 		return "ROW(" + strings.Join(elems, ", ") + ")"
-	case *planner.TableOidExpr:
+	case *optimizer.TableOidExpr:
 		return "tableoid"
-	case *planner.CTIDExpr:
+	case *optimizer.CTIDExpr:
 		return "ctid"
-	case *planner.MergeActionExpr:
+	case *optimizer.MergeActionExpr:
 		return "merge_action()"
-	case *planner.MergeWholeRowRef:
+	case *optimizer.MergeWholeRowRef:
 		if x.IsOld {
 			return "old"
 		}
 		return "new"
-	case *planner.MultiAssignSubqRow:
+	case *optimizer.MultiAssignSubqRow:
 		// Multi-assignment sublink (`SET (a,b) = (SELECT …)`); the row
 		// itself is the subplan reference.
 		return "(" + subPlanName(reg, x, x.Plan) + ")"
-	case *planner.MultiAssignSubqElem:
+	case *optimizer.MultiAssignSubqElem:
 		// One column of the multi-assignment row. PG renders these as
 		// PARAM_EXEC slots; goopg has no slot number here, so name the
 		// owning subplan and the 1-based column.
@@ -1150,7 +1312,7 @@ func formatExprQual(e planner.Expr, reg *subPlanReg, qualify bool) string {
 // no param slots yet, so the operand and the SubPlan reference are
 // rendered side by side instead; this converges on PG's form when
 // D4.1 lands param slots.
-func formatInExprPG(x *planner.InExpr, reg *subPlanReg, qualify bool) string {
+func formatInExprPG(x *optimizer.InExpr, reg *subPlanReg, qualify bool) string {
 	operand := formatExprQual(x.Operand, reg, qualify)
 
 	// Comparison spelling: default `=` for IN, or the explicit
@@ -1189,7 +1351,7 @@ func formatInExprPG(x *planner.InExpr, reg *subPlanReg, qualify bool) string {
 // schemaColumnNames returns the names of n's output columns,
 // or nil when the node doesn't expose a schema (Insert/Update/
 // Delete operators run for side effects and have empty Output).
-func schemaColumnNames(n planner.Node) []string {
+func schemaColumnNames(n optimizer.Node) []string {
 	out := n.Output()
 	if len(out) == 0 {
 		return nil
@@ -1206,16 +1368,16 @@ func schemaColumnNames(n planner.Node) []string {
 // `(actual time=startup..total rows=R loops=L)` suffix pulled
 // from the instrumentation table. Loops > 0 means the operator
 // ran at least once. Total time is in milliseconds.
-func walkPlanAnalyze(b *strings.Builder, n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[planner.Expr]*SubPlanSiteStats, memoStats map[*planner.Memoize]*MemoizeStats, hashStats map[*planner.Join]*HashJoinStats) {
+func walkPlanAnalyze(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats) {
 	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, memoStats, hashStats, nil, 0, &subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n)})
 }
 
-func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[planner.Expr]*SubPlanSiteStats, memoStats map[*planner.Memoize]*MemoizeStats, hashStats map[*planner.Join]*HashJoinStats, attachedFilter planner.Expr, filterRowsRemoved int64, reg *subPlanReg) {
-	if p, ok := n.(*planner.Project); ok {
-		walkPlanAnalyzeFiltered(p.Child, depth, rows, opts, stats, spStats, memoStats, hashStats, attachedFilter, filterRowsRemoved, reg)
+func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, attachedFilter optimizer.Expr, filterRowsRemoved int64, reg *subPlanReg) {
+	if p, ok := n.(*optimizer.Project); ok {
+		walkPlanAnalyzeFiltered(p.Child, indent, rows, opts, stats, spStats, memoStats, hashStats, attachedFilter, filterRowsRemoved, reg)
 		return
 	}
-	if f, ok := n.(*planner.Filter); ok {
+	if f, ok := n.(*optimizer.Filter); ok {
 		next := f.Predicate
 		if attachedFilter != nil {
 			next = attachedFilter
@@ -1229,19 +1391,25 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 		if fs, ok := stats[f]; ok && fs != nil {
 			fr += fs.filterRejected
 		}
-		walkPlanAnalyzeFiltered(f.Child, depth, rows, opts, stats, spStats, memoStats, hashStats, next, fr, reg)
+		walkPlanAnalyzeFiltered(f.Child, indent, rows, opts, stats, spStats, memoStats, hashStats, next, fr, reg)
 		return
 	}
 
-	indent := strings.Repeat("  ", depth)
-	prefix := indent
-	if depth > 0 {
-		prefix = indent + "->  "
+	// PG-faithful cumulative indent — see walkPlanFiltered's twin comment
+	// (postgres/src/backend/commands/explain.c:1616-1635, ExplainNode) for
+	// the derivation. Both walkers must agree: a test pinning one proves
+	// nothing about the other.
+	prefix := ""
+	arrowIndent := indent
+	if indent != 0 {
+		prefix = strings.Repeat(" ", indent*2) + "->  "
+		arrowIndent = indent + 2
 	}
+	childIndent := arrowIndent + 1
 	label := prefix + describePlanVerbose(n, opts.Verbose, reg.names())
 	showCostsA := !opts.Set.Costs || opts.Costs
 	if showCostsA {
-		est := planner.EstimateRows(n)
+		est := optimizer.EstimateRows(n)
 		if est <= 0 {
 			est = 1
 		}
@@ -1258,12 +1426,12 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 	}
 	*rows = append(*rows, Row{NewStringDatum(label)})
 
-	detailIndent := strings.Repeat(" ", len(prefix)+2)
-	emitNodeDetailLines(n, detailIndent, rows, attachedFilter, reg)
+	detailIndent := strings.Repeat(" ", childIndent*2)
+	emitNodeDetailLines(n, detailIndent, opts.Verbose, rows, attachedFilter, reg)
 
 	// IndexOnlyScan emits a "Heap Fetches: N" detail line under ANALYZE,
 		// matching upstream's text format (design 0118-0102).
-		if _, isIOS := n.(*planner.IndexOnlyScan); isIOS {
+		if _, isIOS := n.(*optimizer.IndexOnlyScan); isIOS {
 			if s, ok := stats[n]; ok && s != nil {
 				*rows = append(*rows, Row{NewStringDatum(detailIndent + fmt.Sprintf("Heap Fetches: %d", s.heapFetches))})
 			}
@@ -1296,7 +1464,7 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 	// show_memoize_info line shape (S7; Memory Usage is deferred — our
 	// byte accounting is a budget approximation, not a report-grade
 	// number).
-	if m, isMemo := n.(*planner.Memoize); isMemo {
+	if m, isMemo := n.(*optimizer.Memoize); isMemo {
 		if ms := memoStats[m]; ms != nil {
 			*rows = append(*rows, Row{NewStringDatum(detailIndent + fmt.Sprintf(
 				"Hits: %d  Misses: %d  Evictions: %d  Overflows: %d",
@@ -1307,7 +1475,7 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 	// A hash join emits PG's hash-table line under ANALYZE. Upstream hangs it
 	// off the HASH node; goopg has no Hash node (the build lives inside
 	// joinOp), so it hangs off the Hash Join. M0127-P3.5 / design 06 §4.
-	if j, isJoin := n.(*planner.Join); isJoin && j.Algo == planner.JoinAlgoHash {
+	if j, isJoin := n.(*optimizer.Join); isJoin && j.Algo == optimizer.JoinAlgoHash {
 		if line := formatHashJoinInfoLine(hashStats[j]); line != "" {
 			*rows = append(*rows, Row{NewStringDatum(detailIndent + line)})
 		}
@@ -1350,7 +1518,7 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 
 	if opts.Verbose {
 		if cols := schemaColumnNames(n); len(cols) > 0 {
-			outline := indent + "  Output: " + strings.Join(cols, ", ")
+			outline := detailIndent + "Output: " + strings.Join(cols, ", ")
 			*rows = append(*rows, Row{NewStringDatum(outline)})
 		}
 	}
@@ -1358,21 +1526,21 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 	// The CTE sections print with their instrumentation intact: every
 	// reference shares one body Node, so the section IS the subtree that
 	// ran (the later references replay from ctx.CTERowCache). M0125-0049.
-	emitCTESections(rows, depth, reg, func(body planner.Node, bodyDepth int) {
-		walkPlanAnalyzeFiltered(body, bodyDepth, rows, opts, stats, spStats, memoStats, hashStats, nil, 0, reg)
+	emitCTESections(rows, indent, childIndent, reg, func(body optimizer.Node, bodyIndent int) {
+		walkPlanAnalyzeFiltered(body, bodyIndent, rows, opts, stats, spStats, memoStats, hashStats, nil, 0, reg)
 	})
 
 	// Sublink subtrees keep their instrumentation: stats is passed
 	// through so inner nodes still report actual rows / loops.
 	prevAncestor := reg.ancestor
 	reg.ancestor = n
-	emitSubPlanSubtrees(rows, detailIndent, opts, reg, spStats, func(sub planner.Node, subDepth int) {
-		walkPlanAnalyzeFiltered(sub, subDepth, rows, opts, stats, spStats, memoStats, hashStats, nil, 0, reg)
+	emitSubPlanSubtrees(rows, detailIndent, opts, reg, spStats, func(sub optimizer.Node, subIndent int) {
+		walkPlanAnalyzeFiltered(sub, subIndent, rows, opts, stats, spStats, memoStats, hashStats, nil, 0, reg)
 	})
 	reg.ancestor = prevAncestor
 
 	for _, c := range renderChildren(n, reg.cte) {
-		walkPlanAnalyzeFiltered(c, depth+1, rows, opts, stats, spStats, memoStats, hashStats, nil, 0, reg)
+		walkPlanAnalyzeFiltered(c, childIndent, rows, opts, stats, spStats, memoStats, hashStats, nil, 0, reg)
 	}
 }
 
@@ -1384,7 +1552,7 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 // trackIOTiming is the caller's track_io_timing GUC snapshot (see the
 // "Shared I/O Read/Write Time" gating below) and is threaded unchanged
 // through the recursive Plans re-render.
-func planToJSONWithStats(n planner.Node, opts parser.ExplainOptions, stats nodeStatsTable, trackIOTiming bool) map[string]any {
+func planToJSONWithStats(n optimizer.Node, opts parser.ExplainOptions, stats nodeStatsTable, trackIOTiming bool) map[string]any {
 	obj := planToJSON(n, opts)
 	if s, ok := stats[n]; ok && s != nil {
 		obj["Actual Rows"] = s.rowsOut
@@ -1396,7 +1564,7 @@ func planToJSONWithStats(n planner.Node, opts parser.ExplainOptions, stats nodeS
 		// "Heap Fetches" is an IndexOnlyScan-only field upstream emits under
 			// ANALYZE (design 0118-0102). horizons.spec reads it via
 			// ...->'Plan'->'Heap Fetches'.
-			if _, isIOS := n.(*planner.IndexOnlyScan); isIOS {
+			if _, isIOS := n.(*optimizer.IndexOnlyScan); isIOS {
 				obj["Heap Fetches"] = s.heapFetches
 			}
 			// M0128-P5.2: "Rows Removed by Filter" and "Rows Removed by Join
@@ -1480,7 +1648,7 @@ func planToJSONWithStats(n planner.Node, opts parser.ExplainOptions, stats nodeS
 // only when opts.Verbose is set (matches upstream's behaviour
 // where columns are part of VERBOSE output, not the default
 // JSON shape).
-func planToJSON(n planner.Node, opts parser.ExplainOptions) map[string]any {
+func planToJSON(n optimizer.Node, opts parser.ExplainOptions) map[string]any {
 	obj := map[string]any{
 		"Node Type": describePlan(n, nil),
 	}
@@ -1491,12 +1659,12 @@ func planToJSON(n planner.Node, opts parser.ExplainOptions) map[string]any {
 	// (explain.c uses `sname` for the property and `pname` for the text
 	// line). A UNION ALL has no SetOp node upstream at all, so it keeps
 	// the plain "Append" describePlan gives it.
-	if p, ok := n.(*planner.SetOp); ok && !setOpRendersAsAppend(p) {
+	if p, ok := n.(*optimizer.SetOp); ok && !setOpRendersAsAppend(p) {
 		obj["Node Type"] = "SetOp"
 		obj["Strategy"] = "Hashed"
 		obj["Command"] = setOpCommandName(p)
 	}
-	if est := planner.EstimateRows(n); est > 0 {
+	if est := optimizer.EstimateRows(n); est > 0 {
 		obj["Plan Rows"] = est
 	}
 	if opts.Verbose {
@@ -1529,15 +1697,81 @@ func schemaQualify(name string) string {
 	return "public." + name
 }
 
+// srfFunctionScanLabel builds the plain EXPLAIN label for a set-returning
+// function scan node. PG prints the FROM-item alias (refname) only when it
+// differs from the function name (explain.c:4498); the default alias — no
+// AS clause — IS the function name, so it is omitted.
+func srfFunctionScanLabel(funcName, alias string) string {
+	if alias != "" && alias != funcName {
+		return "Function Scan on " + funcName + " " + alias
+	}
+	return "Function Scan on " + funcName
+}
+
+// srfFunctionScanLabelQualified is the verbose counterpart of
+// srfFunctionScanLabel: the schema is qualified in the label (explain.c
+// 4493-4495), but the alias is still omitted only when it equals the BARE
+// function name — PG compares refname against get_func_name(objectname),
+// never the namespace-qualified spelling (explain.c:4498).
+func srfFunctionScanLabelQualified(qualified, bareFuncName, alias string) string {
+	label := "Function Scan on " + qualified
+	if alias != "" && alias != bareFuncName {
+		label += " " + alias
+	}
+	return label
+}
+
+// srfFunctionCallArgs returns the synthetic FuncCall name and argument list
+// for an SRF scan node's verbose-only `Function Call:` detail line (PG
+// explain.c T_FunctionScan 2067-2083). Returns ("", nil) for node kinds that
+// carry no function call (e.g. ProjectSet). UserSrfScan uses the BARE
+// routine name: PG deparses rtfunc->funcexpr, whose FuncExpr name is
+// unqualified — the schema is carried only by the label above.
+func srfFunctionCallArgs(n optimizer.Node) (string, []optimizer.Expr) {
+	switch p := n.(type) {
+	case *optimizer.GenerateSeries:
+		args := []optimizer.Expr{p.Start, p.Stop}
+		if p.Step != nil {
+			args = append(args, p.Step)
+		}
+		return "generate_series", args
+	case *optimizer.GenerateSubscripts:
+		args := []optimizer.Expr{p.ArrExpr, p.Dim}
+		if p.Reversed != nil {
+			args = append(args, p.Reversed)
+		}
+		return "generate_subscripts", args
+	case *optimizer.FromUnnest:
+		if p.ArrExpr != nil {
+			return "unnest", []optimizer.Expr{p.ArrExpr}
+		}
+		return "unnest", p.ArrExprs
+	case *optimizer.UserSrfScan:
+		return p.Routine.Name, p.Args
+	}
+	return "", nil
+}
+
 // describePlanVerbose returns the plan-node description; verbose=true adds schema qualification.
-func describePlanVerbose(n planner.Node, verbose bool, nm *explainNames) string {
+func describePlanVerbose(n optimizer.Node, verbose bool, nm *explainNames) string {
 	if !verbose {
 		return describePlan(n, nm)
 	}
 	switch p := n.(type) {
-	case *planner.SeqScan:
+	// SIBLING PAIR (M0134-0001 S17): this case and describePlan's
+	// *optimizer.SeqScan case must move together. PG's "Parallel " prefix is
+	// emitted in ExplainNode before the pname append and is entirely
+	// independent of es->verbose (explain.c:1630-1631) — this case has its
+	// own return statements rather than delegating to describePlan (except
+	// when p.Table == nil), so the prefix has to be applied here too, or
+	// EXPLAIN VERBOSE would silently diverge from plain EXPLAIN.
+	case *optimizer.SeqScan:
 		if p.Table == nil {
 			return describePlan(n, nm)
+		}
+		parallelPrefix := ""
+		if p.Parallel {
+			parallelPrefix = "Parallel "
 		}
 		// When the range-table name table disambiguates a repeated
 		// relation name (PG select_rtable_names_for_explain), use
@@ -1545,75 +1779,89 @@ func describePlanVerbose(n planner.Node, verbose bool, nm *explainNames) string 
 		// relation scanned twice without an alias prints two
 		// distinguishable labels (e.g. "nation" / "nation_1").
 		if dname := nm.disambiguatedName(n); dname != "" {
-			if p.Table.Stats != nil {
-				return fmt.Sprintf("Seq Scan on %s (stats)", dname)
-			}
-			return "Seq Scan on " + dname
+			return parallelPrefix + "Seq Scan on " + dname
 		}
 		tname := schemaQualify(p.Table.QualifiedName())
 		if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
-			return fmt.Sprintf("Seq Scan on %s %s", tname, p.Alias)
+			return fmt.Sprintf("%sSeq Scan on %s %s", parallelPrefix, tname, p.Alias)
 		}
-		return "Seq Scan on " + tname
-	case *planner.IndexScan:
+		return parallelPrefix + "Seq Scan on " + tname
+	case *optimizer.IndexScan:
 		if dname := nm.disambiguatedName(n); dname != "" {
 			return fmt.Sprintf("Index Scan using %s on %s", p.Index.QualifiedName(), dname)
 		}
 		return fmt.Sprintf("Index Scan using %s on %s", p.Index.QualifiedName(), schemaQualify(p.Table.QualifiedName()))
-	case *planner.IndexOnlyScan:
-		if dname := nm.disambiguatedName(n); dname != "" {
-			return fmt.Sprintf("Index Only Scan using %s on %s", p.Index.QualifiedName(), dname)
+	case *optimizer.IndexOnlyScan:
+		// S6 max rewrite: PG's ExplainIndexScanDetails (explain.c:4330-4336)
+		// puts " Backward" between the scan name and " using".
+		dir := ""
+		if p.Backward {
+			dir = " Backward"
 		}
-		return fmt.Sprintf("Index Only Scan using %s on %s", p.Index.QualifiedName(), schemaQualify(p.Table.QualifiedName()))
-	case *planner.Insert:
+		if dname := nm.disambiguatedName(n); dname != "" {
+			return fmt.Sprintf("Index Only Scan%s using %s on %s", dir, p.Index.QualifiedName(), dname)
+		}
+		return fmt.Sprintf("Index Only Scan%s using %s on %s", dir, p.Index.QualifiedName(), schemaQualify(p.Table.QualifiedName()))
+	case *optimizer.Insert:
 		return "Insert on " + schemaQualify(p.Table.QualifiedName())
-	case *planner.Update:
+	case *optimizer.Update:
 		return "Update on " + schemaQualify(p.Table.QualifiedName())
-	case *planner.Delete:
+	case *optimizer.Delete:
 		return "Delete on " + schemaQualify(p.Table.QualifiedName())
+	case *optimizer.GenerateSeries:
+		// M0134-0001 P2 S2: verbose Function Scan label qualifies the
+		// schema (explain.c:4493-4495); builtin SRFs live in pg_catalog.
+		return srfFunctionScanLabelQualified("pg_catalog.generate_series", "generate_series", p.Alias)
+	case *optimizer.GenerateSubscripts:
+		return srfFunctionScanLabelQualified("pg_catalog.generate_subscripts", "generate_subscripts", p.Alias)
+	case *optimizer.FromUnnest:
+		return srfFunctionScanLabelQualified("pg_catalog.unnest", "unnest", p.Alias)
+	case *optimizer.UserSrfScan:
+		return srfFunctionScanLabelQualified(p.Routine.QualifiedName(), p.Routine.Name, p.Alias)
 	}
 	return describePlan(n, nm)
 }
 
-func describePlan(n planner.Node, nm *explainNames) string {
+func describePlan(n optimizer.Node, nm *explainNames) string {
 	switch p := n.(type) {
-	case *planner.Project:
+	case *optimizer.Project:
 		return "Projection"
-	case *planner.Filter:
+	case *optimizer.Filter:
 		return "Filter"
-	case *planner.Sort:
+	case *optimizer.Sort:
 		return "Sort"
-	case *planner.Limit:
+	case *optimizer.Limit:
 		return "Limit"
-	case *planner.Values:
+	case *optimizer.Result:
+		// Childless projection (S6 min/max rewrite top node). PG's T_Result
+		// emits a bare `Result` label (explain.c, T_Result arm).
+		return "Result"
+	case *optimizer.Values:
 		return fmt.Sprintf("Values (%d rows)", len(p.Rows))
-	case *planner.Join:
+	case *optimizer.Join:
+		// S3 (0134-0001 P2, class 7a): PG interpolates the join type
+		// into the node name (explain.c jointype switch 1712-1763, text
+		// rule 1754-1758). Base words are explain.c's pname: T_NestLoop
+		// 1421 "Nested Loop", T_MergeJoin 1424 "Merge", T_HashJoin 1428
+		// "Hash" — "Join" is appended by the jointype rule. NullAware and
+		// BuildLeft remain planner fields the executor consumes; only the
+		// label rendering changed (no more "(TYPE)", "NULL-AWARE" or
+		// "build=left" annotations).
 		algo := "Nested Loop"
-		if p.Algo == planner.JoinAlgoHash {
-			algo = "Hash Join"
+		if p.Algo == optimizer.JoinAlgoHash {
+			algo = "Hash"
 		}
-		if p.Algo == planner.JoinAlgoMerge {
-			algo = "Merge Join"
+		if p.Algo == optimizer.JoinAlgoMerge {
+			algo = "Merge"
 		}
-		// A NullAware anti join (from unnesting a non-correlated
-		// NOT IN, M0122-0011) carries three-valued-NULL semantics
-		// the join type alone does not convey; surface it so plan
-		// diffs can tell the two anti joins apart.
-		jt := joinTypeName(p.Type)
-		if p.Type == planner.JoinTypeAnti && p.NullAware {
-			jt += " NULL-AWARE"
-		}
-		if p.Algo == planner.JoinAlgoHash && p.BuildLeft {
-			return fmt.Sprintf("%s (%s, build=left)", algo, jt)
-		}
-		return fmt.Sprintf("%s (%s)", algo, jt)
-	case *planner.Gather:
+		return joinLabel(algo, p.Type)
+	case *optimizer.Gather:
 		return "Gather"
-	case *planner.GatherMerge:
+	case *optimizer.GatherMerge:
 		return "Gather Merge"
-	case *planner.Distinct:
+	case *optimizer.Distinct:
 		return "Unique"
-	case *planner.Aggregate:
+	case *optimizer.Aggregate:
 		// P9: PG prefixes a split aggregate's two halves with "Partial " and
 		// "Finalize " (explain.c, from the Agg node's aggsplit). Without them
 		// a parallel plan shows two identical HashAggregate lines stacked with
@@ -1621,9 +1869,9 @@ func describePlan(n planner.Node, nm *explainNames) string {
 		// is. This is the prefix P2's rename was sequenced to protect.
 		prefix := ""
 		switch p.Mode {
-		case planner.AggModePartial:
+		case optimizer.AggModePartial:
 			prefix = "Partial "
-		case planner.AggModeFinal:
+		case optimizer.AggModeFinal:
 			prefix = "Finalize "
 		}
 		if p.GroupingSets != nil {
@@ -1655,68 +1903,82 @@ func describePlan(n planner.Node, nm *explainNames) string {
 		// with "Partial "/"Finalize " for parallel aggregation, which would
 		// otherwise cement "Partial GroupAggregate" onto a hash node.
 		//
-		// The "(%d keys)" suffix is goopg's own; PG emits a separate
-		// "Group Key: <exprs>" detail line instead. Kept as-is to hold this
-		// stage to the rename — see the TODO's follow-up note.
-		return fmt.Sprintf("%sHashAggregate (%d keys)", prefix, len(p.GroupExprs))
-	case *planner.WindowAgg:
-		return fmt.Sprintf("WindowAgg (%d funcs)", len(p.Funcs))
-	case *planner.SeqScan:
-		// `(stats)` flags scans whose Table.Stats has been
-		// populated by ANALYZE — the planner's cost-driven
-		// decisions (Filter selectivity from MCV / histogram,
-		// INNER-join algorithm choice) are only active for
-		// these. M0006 / 0006-0004 surfaces this so an operator
-		// inspecting EXPLAIN can verify which scans feed the
-		// cost model.
-		if dname := nm.disambiguatedName(n); dname != "" {
-			if p.Table != nil && p.Table.Stats != nil {
-				return fmt.Sprintf("Seq Scan on %s (stats)", dname)
-			}
-			return "Seq Scan on " + dname
+		// S5 (0134-0001 P2): the "(%d keys)" suffix is gone — PG's AGG_HASHED
+		// label is a bare "HashAggregate" (explain.c:1549). The grouping
+		// expressions render as a separate "Group Key: <exprs>" detail line
+		// (emitNodeDetailLines; show_agg_keys, explain.c:2616-2636).
+		//
+		// S8 (M0134-0001): the Strategy field now discriminates. PG labels
+		// AGG_SORTED "GroupAggregate" and AGG_HASHED "HashAggregate"
+		// (explain.c:1531-1553). The planner does not set Strategy yet, so a
+		// hand-built node is the only way this renders GroupAggregate today.
+		if p.Strategy == optimizer.AggStrategySorted {
+			return prefix + "GroupAggregate"
 		}
-		if p.Table != nil && p.Table.Stats != nil {
-			if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
-				return fmt.Sprintf("Seq Scan on %s %s (stats)", p.Table.QualifiedName(), p.Alias)
-			}
-			return fmt.Sprintf("Seq Scan on %s (stats)", p.Table.QualifiedName())
+		return prefix + "HashAggregate"
+	case *optimizer.WindowAgg:
+		return fmt.Sprintf("WindowAgg (%d funcs)", len(p.Funcs))
+	case *optimizer.SeqScan:
+		// S17 (0134-0001): "Parallel " prefix mirrors PG's plan->parallel_aware
+		// (explain.c:1630-1631), stamped once at Gather-construction time by
+		// parallel.go's stampParallelScan — see optimizer.SeqScan.Parallel.
+		//
+		// SIBLING PAIR: describePlanVerbose's *optimizer.SeqScan case (above,
+		// verbose=true path) has its own independent return statements rather
+		// than delegating here, so it applies the SAME prefix logic itself —
+		// PG's prefix is verbose-independent (explain.c:1630-1631), so if
+		// these two ever disagree, EXPLAIN VERBOSE silently drops the label
+		// EXPLAIN (plain) shows.
+		parallelPrefix := ""
+		if p.Parallel {
+			parallelPrefix = "Parallel "
+		}
+		if dname := nm.disambiguatedName(n); dname != "" {
+			return parallelPrefix + "Seq Scan on " + dname
 		}
 		if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
-			return fmt.Sprintf("Seq Scan on %s %s", p.Table.QualifiedName(), p.Alias)
+			return fmt.Sprintf("%sSeq Scan on %s %s", parallelPrefix, p.Table.QualifiedName(), p.Alias)
 		}
-		return fmt.Sprintf("Seq Scan on %s", p.Table.QualifiedName())
-	case *planner.IndexScan:
+		return fmt.Sprintf("%sSeq Scan on %s", parallelPrefix, p.Table.QualifiedName())
+	case *optimizer.IndexScan:
 		if dname := nm.disambiguatedName(n); dname != "" {
 			return fmt.Sprintf("Index Scan using %s on %s", p.Index.QualifiedName(), dname)
 		}
 		return fmt.Sprintf("Index Scan using %s on %s", p.Index.QualifiedName(), p.Table.QualifiedName())
-	case *planner.IndexOnlyScan:
+	case *optimizer.IndexOnlyScan:
 		// M0118-0009 (design 0118-0102): horizons.spec inspects the IOS
 		// label via `EXPLAIN (COSTS OFF)` (pruner_query_plan) — mirror
 		// upstream's "Index Only Scan using <idx> on <table>".
-		if dname := nm.disambiguatedName(n); dname != "" {
-			return fmt.Sprintf("Index Only Scan using %s on %s", p.Index.QualifiedName(), dname)
+		// S6 max rewrite: PG puts " Backward" between the scan name and
+		// " using" for a backward index scan (ExplainIndexScanDetails,
+		// explain.c:4330-4336).
+		dir := ""
+		if p.Backward {
+			dir = " Backward"
 		}
-		return fmt.Sprintf("Index Only Scan using %s on %s", p.Index.QualifiedName(), p.Table.QualifiedName())
-	case *planner.Insert:
+		if dname := nm.disambiguatedName(n); dname != "" {
+			return fmt.Sprintf("Index Only Scan%s using %s on %s", dir, p.Index.QualifiedName(), dname)
+		}
+		return fmt.Sprintf("Index Only Scan%s using %s on %s", dir, p.Index.QualifiedName(), p.Table.QualifiedName())
+	case *optimizer.Insert:
 		return fmt.Sprintf("Insert on %s", p.Table.QualifiedName())
-	case *planner.Update:
+	case *optimizer.Update:
 		return fmt.Sprintf("Update on %s", p.Table.QualifiedName())
-	case *planner.Delete:
+	case *optimizer.Delete:
 		return fmt.Sprintf("Delete on %s", p.Table.QualifiedName())
-	case *planner.DDL:
+	case *optimizer.DDL:
 		return fmt.Sprintf("DDL %T", p.Stmt)
-	case *planner.Transaction:
+	case *optimizer.Transaction:
 		return fmt.Sprintf("Transaction (%v)", p.Verb)
-	case *planner.Checkpoint:
+	case *optimizer.Checkpoint:
 		return "Checkpoint"
-	case *planner.Utility:
+	case *optimizer.Utility:
 		return fmt.Sprintf("Utility %T", p.Stmt)
-	case *planner.Copy:
+	case *optimizer.Copy:
 		return fmt.Sprintf("Copy %s", p.Table.QualifiedName())
-	case *planner.Explain:
+	case *optimizer.Explain:
 		return "Explain"
-	case *planner.CTEScan:
+	case *optimizer.CTEScan:
 		// Mirrors upstream's "CTE Scan on <name>" label; the
 		// alias is rendered separately when distinct so output
 		// like `WITH a AS (SELECT 1) SELECT * FROM a x` shows
@@ -1725,32 +1987,32 @@ func describePlan(n planner.Node, nm *explainNames) string {
 			return fmt.Sprintf("CTE Scan on %s %s", p.Name, p.Alias)
 		}
 		return fmt.Sprintf("CTE Scan on %s", p.Name)
-	case *planner.LockRows:
+	case *optimizer.LockRows:
 		// Mirrors upstream's "LockRows" label; per-relation
 		// detail is too verbose for the single-line label and
 		// is left to a future VERBOSE-only extension.
 		return "LockRows"
-	case *planner.OrdinalityWrap:
+	case *optimizer.OrdinalityWrap:
 		// WITH ORDINALITY wrapper; also reused by the S4a scalar
 		// residual rewrite to tag the outer side with a per-row
 		// ordinal (preserving duplicate-row multiplicity through
 		// the aggregate-above-join shape).
 		return "Ordinality"
-	case *planner.NestedLoopIndexJoin:
-		// M0054-0006: render `Nested Loop` matching upstream's
-		// EXPLAIN output for a nested-loop join with an inner
-		// IndexScan side. The inner IndexScan node renders its
-		// own label (`Index Scan using <idx> on <table>`) below.
-		return fmt.Sprintf("Nested Loop (%s)", joinTypeName(p.Type))
-	case *planner.Memoize:
+	case *optimizer.NestedLoopIndexJoin:
+		// M0054-0006: this node is always a nested loop; S3
+		// (0134-0001 P2) applies the same PG label rule as the
+		// parameterised Join above. The inner IndexScan node renders
+		// its own label (`Index Scan using <idx> on <table>`) below.
+		return joinLabel("Nested Loop", p.Type)
+	case *optimizer.Memoize:
 		return "Memoize"
-	case *planner.Merge:
+	case *optimizer.Merge:
 		return fmt.Sprintf("Merge on %s", p.Target.QualifiedName())
-	case *planner.CTEDMLPrefix:
+	case *optimizer.CTEDMLPrefix:
 		return "CTE DML"
-	case *planner.MaterializedCTEScan:
+	case *optimizer.MaterializedCTEScan:
 		return fmt.Sprintf("CTE %s", p.Name)
-	case *planner.SetOp:
+	case *optimizer.SetOp:
 		// M0125-0037(i): this node used to fall through to the `%T`
 		// default and print the raw Go type name `*planner.SetOp` —
 		// with no children, because planChildren had no case for it
@@ -1773,13 +2035,33 @@ func describePlan(n planner.Node, nm *explainNames) string {
 		// two-node HashAggregate/Append shape PG uses there is a
 		// deferral-ledger row, not a silent divergence.
 		return setOpNodeName(p)
+	case *optimizer.GenerateSeries:
+		// M0134-0001 P2 S2: SRF FROM-clause scans render as PG's
+		// `Function Scan on <func> [<alias>]` (explain.c T_FunctionScan
+		// 1465-1466) instead of leaking the Go type via the %T fallback.
+		return srfFunctionScanLabel("generate_series", p.Alias)
+	case *optimizer.GenerateSubscripts:
+		return srfFunctionScanLabel("generate_subscripts", p.Alias)
+	case *optimizer.FromUnnest:
+		return srfFunctionScanLabel("unnest", p.Alias)
+	case *optimizer.UserSrfScan:
+		// PG's get_func_name returns the BARE function name in both plain
+		// and verbose modes; the schema is prepended only under VERBOSE
+		// (explain.c:4490-4500: plain emits ` <objectname>`, verbose emits
+		// ` <namespace>.<objectname>`). So plain output must not qualify.
+		return srfFunctionScanLabel(p.Routine.Name, p.Alias)
+	case *optimizer.ProjectSet:
+		// PG renders a SELECT-list SRF as a bare `ProjectSet` label
+		// (explain.c T_ProjectSet 1382-1384): no `on <funcname>`, no
+		// Function Call detail. Its child renders beneath it.
+		return "ProjectSet"
 	}
 	return fmt.Sprintf("%T", n)
 }
 
 // setOpNodeName renders a SetOp's PG-style label — see the
 // describePlan case above for the mapping rationale.
-func setOpNodeName(p *planner.SetOp) string {
+func setOpNodeName(p *optimizer.SetOp) string {
 	if setOpRendersAsAppend(p) {
 		return "Append"
 	}
@@ -1792,13 +2074,13 @@ func setOpNodeName(p *planner.SetOp) string {
 // (planner.go:2495 and :2545 construct `SetOp{All: true}` chains),
 // so getting this branch right is what keeps a partitioned scan from
 // printing as a set operation.
-func setOpRendersAsAppend(p *planner.SetOp) bool {
+func setOpRendersAsAppend(p *optimizer.SetOp) bool {
 	return p.All && p.Op == parser.SetOpUnion
 }
 
 // setOpCommandName mirrors explain.c's SETOPCMD_* text (the token PG
 // appends after the node name, and its JSON "Command" property).
-func setOpCommandName(p *planner.SetOp) string {
+func setOpCommandName(p *optimizer.SetOp) string {
 	var cmd string
 	switch p.Op {
 	case parser.SetOpIntersect:
@@ -1821,9 +2103,9 @@ func setOpCommandName(p *planner.SetOp) string {
 // children, and TPC-DS Q5's five-branch union would render five levels
 // deep. Only ALL-union links are absorbed — an INTERSECT or EXCEPT in
 // the chain is a real node and keeps its own line.
-func setOpAppendBranches(p *planner.SetOp, out []planner.Node) []planner.Node {
-	for _, side := range [...]planner.Node{p.Left, p.Right} {
-		if inner, ok := side.(*planner.SetOp); ok && setOpRendersAsAppend(inner) {
+func setOpAppendBranches(p *optimizer.SetOp, out []optimizer.Node) []optimizer.Node {
+	for _, side := range [...]optimizer.Node{p.Left, p.Right} {
+		if inner, ok := side.(*optimizer.SetOp); ok && setOpRendersAsAppend(inner) {
 			out = setOpAppendBranches(inner, out)
 			continue
 		}
@@ -1832,27 +2114,32 @@ func setOpAppendBranches(p *planner.SetOp, out []planner.Node) []planner.Node {
 	return out
 }
 
-func joinTypeName(t planner.JoinType) string {
+// joinLabel renders PG's EXPLAIN node name for a join, mirroring the
+// jointype switch at postgres/src/backend/commands/explain.c:1712-1763
+// (word: Left/Right/Full/Semi/Anti; Inner and Cross are never spelled)
+// and the text-format rule at 1754-1758: a non-INNER jointype appends
+// " <Type> Join"; an INNER appends " Join" unless the node is a
+// NestLoop. CROSS JOIN is folded to JOIN_INNER during parse transform
+// (parse_clause.c), so it renders through the Inner path — a bare
+// "Nested Loop" for a nested-loop cross join. algo is the base node
+// word ("Nested Loop" / "Hash" / "Merge").
+func joinLabel(algo string, t optimizer.JoinType) string {
 	switch t {
-	case planner.JoinTypeInner:
-		return "INNER"
-	case planner.JoinTypeLeft:
-		return "LEFT"
-	case planner.JoinTypeRight:
-		return "RIGHT"
-	case planner.JoinTypeFull:
-		return "FULL"
-	case planner.JoinTypeCross:
-		return "CROSS"
-	case planner.JoinTypeSemi:
-		// Produced by EXISTS / IN unnesting (M0061-0001). Rendered
-		// inside goopg's `<algo> (<type>)` label rather than
-		// upstream's `Hash Semi Join` node spelling — switching to
-		// PG's spelling would churn every existing plan line and is
-		// tracked separately.
-		return "SEMI"
-	case planner.JoinTypeAnti:
-		return "ANTI"
+	case optimizer.JoinTypeInner, optimizer.JoinTypeCross:
+		if algo == "Nested Loop" {
+			return algo
+		}
+		return algo + " Join"
+	case optimizer.JoinTypeLeft:
+		return algo + " Left Join"
+	case optimizer.JoinTypeRight:
+		return algo + " Right Join"
+	case optimizer.JoinTypeFull:
+		return algo + " Full Join"
+	case optimizer.JoinTypeSemi:
+		return algo + " Semi Join"
+	case optimizer.JoinTypeAnti:
+		return algo + " Anti Join"
 	}
 	return "?"
 }
@@ -1867,64 +2154,74 @@ func joinTypeName(t planner.JoinType) string {
 // per-node actual-rows/time stats for it (falls back to the
 // cost-estimate-only line — see walkPlanAnalyzeFiltered's
 // `stats[n]` miss path). Returns nil for leaf nodes.
-func planChildren(n planner.Node) []planner.Node {
+func planChildren(n optimizer.Node) []optimizer.Node {
 	switch p := n.(type) {
-	case *planner.Project:
-		return []planner.Node{p.Child}
-	case *planner.Filter:
-		return []planner.Node{p.Child}
-	case *planner.Sort:
-		return []planner.Node{p.Child}
-	case *planner.Limit:
-		return []planner.Node{p.Child}
-	case *planner.Gather:
-		return []planner.Node{p.Child}
-	case *planner.GatherMerge:
-		return []planner.Node{p.Child}
-	case *planner.Distinct:
-		return []planner.Node{p.Child}
-	case *planner.Aggregate:
-		return []planner.Node{p.Child}
-	case *planner.WindowAgg:
-		return []planner.Node{p.Child}
-	case *planner.Join:
-		return []planner.Node{p.Left, p.Right}
-	case *planner.Insert:
-		return []planner.Node{p.Source}
-	case *planner.Update:
-		out := make([]planner.Node, 0, 1+len(p.FromScans))
+	case *optimizer.Project:
+		return []optimizer.Node{p.Child}
+	case *optimizer.Result:
+		// Childless Result (S6): the InitPlan hangs off the SubqueryExpr
+		// target, not a child scan, so the node renders no children. A
+		// Result-with-child (S6 Slice 3d const-arg rewrite) renders its inner
+		// scan beneath it — the oracle's `-> Result / One-Time Filter: / ->
+		// Seq Scan on tenk1` (aggregates.out:1198-1200).
+		if p.Child != nil {
+			return []optimizer.Node{p.Child}
+		}
+		return nil
+	case *optimizer.Filter:
+		return []optimizer.Node{p.Child}
+	case *optimizer.Sort:
+		return []optimizer.Node{p.Child}
+	case *optimizer.Limit:
+		return []optimizer.Node{p.Child}
+	case *optimizer.Gather:
+		return []optimizer.Node{p.Child}
+	case *optimizer.GatherMerge:
+		return []optimizer.Node{p.Child}
+	case *optimizer.Distinct:
+		return []optimizer.Node{p.Child}
+	case *optimizer.Aggregate:
+		return []optimizer.Node{p.Child}
+	case *optimizer.WindowAgg:
+		return []optimizer.Node{p.Child}
+	case *optimizer.Join:
+		return []optimizer.Node{p.Left, p.Right}
+	case *optimizer.Insert:
+		return []optimizer.Node{p.Source}
+	case *optimizer.Update:
+		out := make([]optimizer.Node, 0, 1+len(p.FromScans))
 		out = append(out, p.Child)
 		out = append(out, p.FromScans...)
 		return out
-	case *planner.Delete:
-		out := make([]planner.Node, 0, 1+len(p.UsingScans))
+	case *optimizer.Delete:
+		out := make([]optimizer.Node, 0, 1+len(p.UsingScans))
 		out = append(out, p.Child)
 		out = append(out, p.UsingScans...)
 		return out
-	case *planner.CTEScan:
-		return []planner.Node{p.Child}
-	case *planner.LockRows:
-		return []planner.Node{p.Child}
-	case *planner.OrdinalityWrap:
-		return []planner.Node{p.Child}
-	case *planner.NestedLoopIndexJoin:
+	case *optimizer.CTEScan:
+		return []optimizer.Node{p.Child}
+	case *optimizer.LockRows:
+		return []optimizer.Node{p.Child}
+	case *optimizer.OrdinalityWrap:
+		return []optimizer.Node{p.Child}
+	case *optimizer.NestedLoopIndexJoin:
 		// M0054-0006: render outer driver and inner index probe. With an
 		// S7 Memoize attached, the cache node renders between the join
 		// and the probe (InnerMemo.Child aliases p.Inner).
 		if p.InnerMemo != nil {
-			return []planner.Node{p.Outer, p.InnerMemo}
+			return []optimizer.Node{p.Outer, p.InnerMemo}
 		}
-		return []planner.Node{p.Outer, p.Inner}
-	case *planner.Memoize:
-		return []planner.Node{p.Child}
-	case *planner.Merge:
-		return []planner.Node{p.Source}
-	case *planner.CTEDMLPrefix:
-		out := make([]planner.Node, 0, len(p.DMls)+1)
+		return []optimizer.Node{p.Outer, p.Inner}
+	case *optimizer.Memoize:
+		return []optimizer.Node{p.Child}
+	case *optimizer.Merge:
+		return []optimizer.Node{p.Source}
+	case *optimizer.CTEDMLPrefix:
+		out := make([]optimizer.Node, 0, len(p.DMls)+1)
 		out = append(out, p.DMls...)
 		out = append(out, p.Body)
 		return out
-	case *planner.SetOp:
+	case *optimizer.SetOp:
 		// M0125-0037(i): the missing case that truncated Q5/Q18/Q67 to a
 		// four-line plan. A UNION ALL chain collapses into one Append's
 		// child list the way PG plans it; every other set operation is a
@@ -1934,7 +2231,13 @@ func planChildren(n planner.Node) []planner.Node {
 		if setOpRendersAsAppend(p) {
 			return setOpAppendBranches(p, nil)
 		}
-		return []planner.Node{p.Left, p.Right}
+		return []optimizer.Node{p.Left, p.Right}
+	case *optimizer.ProjectSet:
+		// M0134-0001 P2 S2: a SELECT-list SRF's child plan renders
+		// beneath the bare `ProjectSet` label (mirrors PG, which walks
+		// ProjectSet's single child). Without this case the whole subtree
+		// was invisible after the label.
+		return []optimizer.Node{p.Child}
 	}
 	return nil
 }

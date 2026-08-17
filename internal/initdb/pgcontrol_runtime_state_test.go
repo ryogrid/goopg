@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/goopg/goopg/internal/control"
+	"github.com/goopg/goopg/internal/access/transam/control"
 )
 
 // TestOpenStampsDBInProduction is the M0131-S17 guard.

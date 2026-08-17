@@ -1,0 +1,104 @@
+        substr        |            sm_type             | web_name | 30 days | 31-INTERVAL '60 days' | 61-INTERVAL '90 days' | 91-INTERVAL '120 days' | >120 days 
+----------------------+--------------------------------+----------+---------+-----------------------+-----------------------+------------------------+-----------
+ Bad cards must make. | EXPRESS                        | site_0   |     159 |                   152 |                   136 |                    133 |         0
+ Bad cards must make. | EXPRESS                        | site_1   |     143 |                   113 |                   148 |                    128 |         0
+ Bad cards must make. | EXPRESS                        | site_2   |     154 |                   145 |                   150 |                    158 |         0
+ Bad cards must make. | EXPRESS                        | site_3   |     131 |                   157 |                   140 |                    151 |         0
+ Bad cards must make. | EXPRESS                        | site_4   |     143 |                   180 |                   129 |                    166 |         0
+ Bad cards must make. | LIBRARY                        | site_0   |     126 |                    94 |                   131 |                    124 |         0
+ Bad cards must make. | LIBRARY                        | site_1   |     128 |                   108 |                   111 |                    118 |         0
+ Bad cards must make. | LIBRARY                        | site_2   |     100 |                    84 |                    83 |                     95 |         0
+ Bad cards must make. | LIBRARY                        | site_3   |      92 |                    89 |                   105 |                    104 |         0
+ Bad cards must make. | LIBRARY                        | site_4   |      90 |                   116 |                   126 |                    108 |         0
+ Bad cards must make. | NEXT DAY                       | site_0   |     133 |                   159 |                   125 |                    136 |         0
+ Bad cards must make. | NEXT DAY                       | site_1   |     151 |                   156 |                   154 |                    152 |         0
+ Bad cards must make. | NEXT DAY                       | site_2   |     155 |                   158 |                   145 |                    158 |         0
+ Bad cards must make. | NEXT DAY                       | site_3   |     162 |                   158 |                   169 |                    162 |         0
+ Bad cards must make. | NEXT DAY                       | site_4   |     119 |                   126 |                   129 |                    129 |         0
+ Bad cards must make. | OVERNIGHT                      | site_0   |     117 |                   102 |                   106 |                    114 |         0
+ Bad cards must make. | OVERNIGHT                      | site_1   |     108 |                   113 |                   110 |                    126 |         0
+ Bad cards must make. | OVERNIGHT                      | site_2   |     113 |                   110 |                   113 |                    127 |         0
+ Bad cards must make. | OVERNIGHT                      | site_3   |      75 |                   127 |                   115 |                    117 |         0
+ Bad cards must make. | OVERNIGHT                      | site_4   |     101 |                    83 |                   107 |                     77 |         0
+ Bad cards must make. | REGULAR                        | site_0   |      93 |                   112 |                   103 |                    107 |         0
+ Bad cards must make. | REGULAR                        | site_1   |      84 |                    88 |                    90 |                     84 |         0
+ Bad cards must make. | REGULAR                        | site_2   |      92 |                   116 |                   108 |                    121 |         0
+ Bad cards must make. | REGULAR                        | site_3   |     116 |                   120 |                   112 |                    133 |         0
+ Bad cards must make. | REGULAR                        | site_4   |     110 |                   129 |                   138 |                    118 |         0
+ Bad cards must make. | TWO DAY                        | site_0   |     105 |                   114 |                   120 |                    112 |         0
+ Bad cards must make. | TWO DAY                        | site_1   |     110 |                   118 |                   112 |                    105 |         0
+ Bad cards must make. | TWO DAY                        | site_2   |     124 |                   100 |                   114 |                     97 |         0
+ Bad cards must make. | TWO DAY                        | site_3   |     100 |                    77 |                    90 |                     89 |         0
+ Bad cards must make. | TWO DAY                        | site_4   |      88 |                   100 |                    95 |                    118 |         0
+ Conventional childr  | EXPRESS                        | site_0   |     142 |                   141 |                   150 |                    156 |         0
+ Conventional childr  | EXPRESS                        | site_1   |     120 |                   116 |                   139 |                    139 |         0
+ Conventional childr  | EXPRESS                        | site_2   |     117 |                   135 |                   132 |                    142 |         0
+ Conventional childr  | EXPRESS                        | site_3   |     149 |                   145 |                   157 |                    146 |         0
+ Conventional childr  | EXPRESS                        | site_4   |     149 |                   124 |                   165 |                    143 |         0
+ Conventional childr  | LIBRARY                        | site_0   |     114 |                   100 |                   111 |                    100 |         0
+ Conventional childr  | LIBRARY                        | site_1   |     105 |                   132 |                   115 |                    124 |         0
+ Conventional childr  | LIBRARY                        | site_2   |     108 |                    98 |                    95 |                    101 |         0
+ Conventional childr  | LIBRARY                        | site_3   |      73 |                    84 |                    87 |                     84 |         0
+ Conventional childr  | LIBRARY                        | site_4   |     115 |                   107 |                   105 |                    103 |         0
+ Conventional childr  | NEXT DAY                       | site_0   |     119 |                   117 |                   126 |                    129 |         0
+ Conventional childr  | NEXT DAY                       | site_1   |     130 |                   124 |                   143 |                    119 |         0
+ Conventional childr  | NEXT DAY                       | site_2   |     154 |                   138 |                   155 |                    152 |         0
+ Conventional childr  | NEXT DAY                       | site_3   |     139 |                   141 |                   170 |                    145 |         0
+ Conventional childr  | NEXT DAY                       | site_4   |     141 |                   137 |                   145 |                    135 |         0
+ Conventional childr  | OVERNIGHT                      | site_0   |      92 |                    91 |                    83 |                     96 |         0
+ Conventional childr  | OVERNIGHT                      | site_1   |     108 |                   104 |                   115 |                    112 |         0
+ Conventional childr  | OVERNIGHT                      | site_2   |     110 |                   117 |                   130 |                    128 |         0
+ Conventional childr  | OVERNIGHT                      | site_3   |     114 |                   123 |                   118 |                    119 |         0
+ Conventional childr  | OVERNIGHT                      | site_4   |     108 |                    97 |                   100 |                    105 |         0
+ Conventional childr  | REGULAR                        | site_0   |     104 |                   116 |                   123 |                    118 |         0
+ Conventional childr  | REGULAR                        | site_1   |     119 |                   104 |                   101 |                    114 |         0
+ Conventional childr  | REGULAR                        | site_2   |     101 |                    89 |                    93 |                    105 |         0
+ Conventional childr  | REGULAR                        | site_3   |      97 |                    99 |                   114 |                    108 |         0
+ Conventional childr  | REGULAR                        | site_4   |     129 |                   108 |                   117 |                    120 |         0
+ Conventional childr  | TWO DAY                        | site_0   |     115 |                    97 |                   119 |                    112 |         0
+ Conventional childr  | TWO DAY                        | site_1   |     125 |                   117 |                   131 |                    118 |         0
+ Conventional childr  | TWO DAY                        | site_2   |     106 |                   128 |                   141 |                    136 |         0
+ Conventional childr  | TWO DAY                        | site_3   |     116 |                   108 |                    84 |                     90 |         0
+ Conventional childr  | TWO DAY                        | site_4   |      84 |                    84 |                    92 |                    108 |         0
+ Doors canno          | EXPRESS                        | site_0   |     138 |                   161 |                   142 |                    143 |         0
+ Doors canno          | EXPRESS                        | site_1   |     135 |                   144 |                   142 |                    174 |         0
+ Doors canno          | EXPRESS                        | site_2   |     129 |                   129 |                   154 |                    134 |         0
+ Doors canno          | EXPRESS                        | site_3   |     160 |                   140 |                   145 |                    132 |         0
+ Doors canno          | EXPRESS                        | site_4   |     125 |                   126 |                   141 |                    154 |         0
+ Doors canno          | LIBRARY                        | site_0   |      98 |                   107 |                   116 |                    115 |         0
+ Doors canno          | LIBRARY                        | site_1   |     130 |                   124 |                   142 |                    115 |         0
+ Doors canno          | LIBRARY                        | site_2   |     107 |                   125 |                   116 |                    103 |         0
+ Doors canno          | LIBRARY                        | site_3   |     102 |                   107 |                   104 |                    107 |         0
+ Doors canno          | LIBRARY                        | site_4   |      79 |                    85 |                    84 |                     98 |         0
+ Doors canno          | NEXT DAY                       | site_0   |     153 |                   148 |                   134 |                    171 |         0
+ Doors canno          | NEXT DAY                       | site_1   |     121 |                   155 |                   116 |                    134 |         0
+ Doors canno          | NEXT DAY                       | site_2   |     128 |                   131 |                   125 |                     95 |         0
+ Doors canno          | NEXT DAY                       | site_3   |     147 |                   145 |                   143 |                    153 |         0
+ Doors canno          | NEXT DAY                       | site_4   |     133 |                   146 |                   162 |                    144 |         0
+ Doors canno          | OVERNIGHT                      | site_0   |      97 |                   106 |                   102 |                     98 |         0
+ Doors canno          | OVERNIGHT                      | site_1   |      89 |                    86 |                    98 |                     77 |         0
+ Doors canno          | OVERNIGHT                      | site_2   |     125 |                    86 |                    85 |                    115 |         0
+ Doors canno          | OVERNIGHT                      | site_3   |     117 |                   112 |                   144 |                    130 |         0
+ Doors canno          | OVERNIGHT                      | site_4   |     137 |                   116 |                   113 |                    122 |         0
+ Doors canno          | REGULAR                        | site_0   |     118 |                   108 |                   102 |                    117 |         0
+ Doors canno          | REGULAR                        | site_1   |     129 |                   128 |                   140 |                    105 |         0
+ Doors canno          | REGULAR                        | site_2   |     122 |                   108 |                   111 |                     85 |         0
+ Doors canno          | REGULAR                        | site_3   |      84 |                    90 |                    97 |                    101 |         0
+ Doors canno          | REGULAR                        | site_4   |     110 |                    91 |                    97 |                    122 |         0
+ Doors canno          | TWO DAY                        | site_0   |      83 |                    92 |                    93 |                     99 |         0
+ Doors canno          | TWO DAY                        | site_1   |     105 |                   106 |                    84 |                    123 |         0
+ Doors canno          | TWO DAY                        | site_2   |     130 |                   134 |                   128 |                    111 |         0
+ Doors canno          | TWO DAY                        | site_3   |     115 |                   119 |                   115 |                    141 |         0
+ Doors canno          | TWO DAY                        | site_4   |     101 |                   118 |                   112 |                    118 |         0
+ Important issues liv | EXPRESS                        | site_0   |     146 |                   129 |                   165 |                    114 |         0
+ Important issues liv | EXPRESS                        | site_1   |     154 |                   144 |                   154 |                    150 |         0
+ Important issues liv | EXPRESS                        | site_2   |     149 |                   166 |                   146 |                    147 |         0
+ Important issues liv | EXPRESS                        | site_3   |     147 |                   147 |                   148 |                    146 |         0
+ Important issues liv | EXPRESS                        | site_4   |     135 |                   120 |                   142 |                    137 |         0
+ Important issues liv | LIBRARY                        | site_0   |     106 |                    98 |                    96 |                    115 |         0
+ Important issues liv | LIBRARY                        | site_1   |      77 |                    97 |                    81 |                     95 |         0
+ Important issues liv | LIBRARY                        | site_2   |     113 |                   115 |                   105 |                    118 |         0
+ Important issues liv | LIBRARY                        | site_3   |     110 |                   125 |                   133 |                    124 |         0
+ Important issues liv | LIBRARY                        | site_4   |     107 |                   131 |                    98 |                    147 |         0
+(100 rows)
+

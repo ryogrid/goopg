@@ -21,8 +21,9 @@ package testport
 // an executor unit test over newDDLFixture, and one was written first — it
 // passed against the UNFIXED code. That fixture's scan yields a non-nil,
 // zero-length Row where a real heap scan yields nil, so the pair never becomes
-// nil and the seam is never reached. Identical plans (`Nested Loop (CROSS)`
-// over two width=0 Seq Scans) on both sides; only the Row's nil-ness differs.
+// nil and the seam is never reached. Identical plans (`Nested Loop`
+// over two width=0 Seq Scans — a CROSS join, which PG folds to
+// JOIN_INNER) on both sides; only the Row's nil-ness differs.
 // A guard that cannot fail on the broken code is worse than no guard, so this
 // one runs against a live cluster, which is the level that reproduces.
 // Verified by A/B of two binaries differing only in the two seam lines: the

@@ -16,7 +16,7 @@ import (
 	"sync"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/storage/lmgr"
 )
 
 type relLockEntry struct {
@@ -116,12 +116,12 @@ func (m *relLockMgr) PgLockRows() [][]string {
 // they surface with PID 0 (filtered out by the pg_stat_activity join).
 var (
 	lockBackendPIDMu sync.RWMutex
-	lockBackendPID   = map[lockmgr.BackendID]string{}
+	lockBackendPID   = map[lmgr.BackendID]string{}
 )
 
 // RegisterLockBackendPID records the PID that backs the given transaction-scoped
 // lock-manager identity. Called once per connection from runPostStartupLoop.
-func RegisterLockBackendPID(b lockmgr.BackendID, pid uint32) {
+func RegisterLockBackendPID(b lmgr.BackendID, pid uint32) {
 	if b == 0 {
 		return
 	}
@@ -131,7 +131,7 @@ func RegisterLockBackendPID(b lockmgr.BackendID, pid uint32) {
 }
 
 // UnregisterLockBackendPID drops the mapping at connection teardown.
-func UnregisterLockBackendPID(b lockmgr.BackendID) {
+func UnregisterLockBackendPID(b lmgr.BackendID) {
 	if b == 0 {
 		return
 	}
@@ -140,7 +140,7 @@ func UnregisterLockBackendPID(b lockmgr.BackendID) {
 	lockBackendPIDMu.Unlock()
 }
 
-func lookupLockBackendPID(b lockmgr.BackendID) string {
+func lookupLockBackendPID(b lmgr.BackendID) string {
 	lockBackendPIDMu.RLock()
 	pid := lockBackendPID[b]
 	lockBackendPIDMu.RUnlock()

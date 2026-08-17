@@ -3,8 +3,8 @@ package executor
 import (
 	"testing"
 
-	"github.com/goopg/goopg/internal/activity"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/utils/activity"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // pg_backend_pid() must return the integer PID of the server process attached
@@ -15,7 +15,7 @@ import (
 // "function pg_backend_pid does not exist" (detach-partition-concurrently-3/4
 // step s2snitch: INSERT INTO d_pid SELECT pg_backend_pid()).
 func TestPgBackendPID(t *testing.T) {
-	call := &planner.FuncCall{Name: "pg_backend_pid"}
+	call := &optimizer.FuncCall{Name: "pg_backend_pid"}
 
 	// Primary path: activity registry keyed by ProcNum.
 	reg := activity.NewRegistry()

@@ -16,7 +16,7 @@ import (
 	"fmt"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // registerStatWALIOView installs `pg_catalog.pg_stat_wal_io`
@@ -36,7 +36,7 @@ import (
 //   - wal_init_zero_bytes_total (M0007 follow-up): lifetime bytes written zero-filling
 //     new WAL segments.
 //   - format_version (M0014-0004): active on-disk WAL format (`legacy` / `pgcompat`).
-func registerStatWALIOView(cat *catalog.InMemory, w *wal.Writer) error {
+func registerStatWALIOView(cat *catalog.InMemory, w *xlog.Writer) error {
 	tbl := &catalog.Table{
 		Schema: "pg_catalog",
 		Name:   "pg_stat_wal_io",

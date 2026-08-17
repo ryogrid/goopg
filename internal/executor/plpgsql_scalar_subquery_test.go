@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // TestPlpgSQLScalarSubquery pins the M0118-0008 PL/pgSQL scalar-subquery
@@ -86,7 +86,7 @@ func runQueryExpectErr(ctx *Context, sql string) error {
 	if err != nil {
 		return err
 	}
-	plan, err := planner.Plan(stmts[0], ctx.Catalog)
+	plan, err := optimizer.Plan(stmts[0], ctx.Catalog)
 	if err != nil {
 		return err
 	}

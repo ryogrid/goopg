@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -51,8 +51,8 @@ func TestSeqScanReadsPostgresPhysicalTuple(t *testing.T) {
 		t.Fatalf("Extend: %v", err)
 	}
 
-	txnMgr := mvcc.NewManager()
-	tx, err := txnMgr.Begin(mvcc.IsolationReadCommitted)
+	txnMgr := transam.NewManager()
+	tx, err := txnMgr.Begin(transam.IsolationReadCommitted)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}

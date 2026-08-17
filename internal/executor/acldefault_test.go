@@ -3,7 +3,7 @@ package executor
 import (
 	"testing"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // TestEvalAclDefault pins acldefault("char", oid) to PostgreSQL's hard-wired
@@ -47,11 +47,11 @@ func TestEvalAclDefault(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			fc := &planner.FuncCall{
+			fc := &optimizer.FuncCall{
 				Name: "acldefault",
-				Args: []planner.Expr{
-					&planner.StringConst{Value: c.objtype},
-					&planner.IntegerConst{Value: c.owner},
+				Args: []optimizer.Expr{
+					&optimizer.StringConst{Value: c.objtype},
+					&optimizer.IntegerConst{Value: c.owner},
 				},
 			}
 			got, err := evalFuncCall(fc, nil, &Context{})
@@ -70,9 +70,9 @@ func TestEvalAclDefault(t *testing.T) {
 // abbreviation").
 func TestEvalAclDefaultEdgeCases(t *testing.T) {
 	t.Run("NULL objtype propagates", func(t *testing.T) {
-		fc := &planner.FuncCall{
+		fc := &optimizer.FuncCall{
 			Name: "acldefault",
-			Args: []planner.Expr{&planner.NullConst{}, &planner.IntegerConst{Value: 10}},
+			Args: []optimizer.Expr{&optimizer.NullConst{}, &optimizer.IntegerConst{Value: 10}},
 		}
 		got, err := evalFuncCall(fc, nil, &Context{})
 		if err != nil {
@@ -83,9 +83,9 @@ func TestEvalAclDefaultEdgeCases(t *testing.T) {
 		}
 	})
 	t.Run("NULL owner propagates", func(t *testing.T) {
-		fc := &planner.FuncCall{
+		fc := &optimizer.FuncCall{
 			Name: "acldefault",
-			Args: []planner.Expr{&planner.StringConst{Value: "n"}, &planner.NullConst{}},
+			Args: []optimizer.Expr{&optimizer.StringConst{Value: "n"}, &optimizer.NullConst{}},
 		}
 		got, err := evalFuncCall(fc, nil, &Context{})
 		if err != nil {
@@ -96,9 +96,9 @@ func TestEvalAclDefaultEdgeCases(t *testing.T) {
 		}
 	})
 	t.Run("unrecognized objtype errors", func(t *testing.T) {
-		fc := &planner.FuncCall{
+		fc := &optimizer.FuncCall{
 			Name: "acldefault",
-			Args: []planner.Expr{&planner.StringConst{Value: "z"}, &planner.IntegerConst{Value: 10}},
+			Args: []optimizer.Expr{&optimizer.StringConst{Value: "z"}, &optimizer.IntegerConst{Value: 10}},
 		}
 		if _, err := evalFuncCall(fc, nil, &Context{}); err == nil {
 			t.Fatalf("expected error for unrecognized object type, got nil")

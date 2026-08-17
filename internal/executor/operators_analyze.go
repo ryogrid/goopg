@@ -11,11 +11,11 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/lockmgr"
-	"github.com/goopg/goopg/internal/multixact"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/storage/lmgr"
+	"github.com/goopg/goopg/internal/access/transam/multixact"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -49,7 +49,7 @@ func newAnalyzeOp(stmt *parser.AnalyzeStmt) *analyzeOp {
 	return &analyzeOp{stmt: stmt}
 }
 
-func (o *analyzeOp) Schema() planner.Schema { return nil }
+func (o *analyzeOp) Schema() optimizer.Schema { return nil }
 
 func (o *analyzeOp) Open(ctx *Context) error {
 	o.ctx = ctx
@@ -78,13 +78,13 @@ func (o *analyzeOp) Next() (TupleSlot, error) {
 		// silently. Without SKIP_LOCKED the acquire blocks, so ANALYZE waits
 		// behind a conflicting holder such as LOCK ... IN SHARE MODE. M0118-0008.
 		if o.stmt.SkipLocked {
-			if !o.ctx.tryAcquireMaintenanceLock(rel, lockmgr.ShareUpdateExclusiveLock) {
+			if !o.ctx.tryAcquireMaintenanceLock(rel, lmgr.ShareUpdateExclusiveLock) {
 				if at.explicit {
 					o.ctx.AddWarning(fmt.Sprintf("skipping analyze of %q --- lock not available", tbl.Name))
 				}
 				continue
 			}
-		} else if err := o.ctx.acquireRelLockMaybeTransient(rel, lockmgr.ShareUpdateExclusiveLock); err != nil {
+		} else if err := o.ctx.acquireRelLockMaybeTransient(rel, lmgr.ShareUpdateExclusiveLock); err != nil {
 			continue
 		}
 		// After taking the lock the relation may have been dropped by a
@@ -130,6 +130,35 @@ func (o *analyzeOp) Next() (TupleSlot, error) {
 // tables, so `ANALYZE lineitem` in db tpch raised 42P01 while
 // `SELECT ... FROM lineitem` worked (ledger `bench-reorg ANALYZE-scope`).
 // M0125-0028.
+// resolveAnalyzeColumns validates an ANALYZE / VACUUM ANALYZE per-relation
+// column list, reproducing PG's attnameAttNum + analyze_rel duplicate check
+// (postgres/src/backend/parser/parse_relation.c:3589-3609,
+// postgres/src/backend/commands/analyze.c:372-400): a case-sensitive lookup
+// that skips dropped columns; the first unresolved name is 42703 and a repeat
+// (same resolved column Ordinal twice) is 42701. Validation only — the
+// per-column stats restriction is deferred. NOT InMemory.LookupColumn, which is
+// case-insensitive and ignores Dropped.
+func resolveAnalyzeColumns(tbl *catalog.Table, cols []string, pos int) *ExecError {
+	seen := make(map[int]bool)
+	for _, name := range cols {
+		var col *catalog.Column
+		for i := range tbl.Columns {
+			if tbl.Columns[i].Name == name && !tbl.Columns[i].Dropped {
+				col = &tbl.Columns[i]
+				break
+			}
+		}
+		if col == nil {
+			return &ExecError{Code: "42703", Pos: pos, Message: fmt.Sprintf("column %q of relation %q does not exist", name, tbl.Name)}
+		}
+		if seen[col.Ordinal] {
+			return &ExecError{Code: "42701", Pos: pos, Message: fmt.Sprintf("column %q of relation %q appears more than once", name, tbl.Name)}
+		}
+		seen[col.Ordinal] = true
+	}
+	return nil
+}
+
 func (o *analyzeOp) expandAnalyzeTargets() ([]vacuumTarget, []*catalog.Table, *ExecError) {
 	cat := ctxPlanCatalog(o.ctx)
 	// Partition-child expansion needs the concrete InMemory catalog; peel it
@@ -186,10 +215,19 @@ func (o *analyzeOp) expandAnalyzeTargets() ([]vacuumTarget, []*catalog.Table, *E
 		}
 		return out, parents, nil
 	}
-	for _, name := range o.stmt.Targets {
+	for i, name := range o.stmt.Targets {
 		tbl, ok := cat.LookupTable(name)
 		if !ok {
 			return nil, nil, &ExecError{Code: "42P01", Pos: o.stmt.Pos(), Message: fmt.Sprintf("relation %q does not exist", name.String())}
+		}
+		// Per-relation column list (ANALYZE tab (col, ...)): validate the names
+		// before the permission check. PG resolves va_cols in analyze_rel
+		// (analyze.c:372-400) and aborts the statement on a bad column
+		// (42703/42701). No per-column stats restriction yet (deferred).
+		if i < len(o.stmt.TargetCols) && o.stmt.TargetCols[i] != nil {
+			if cerr := resolveAnalyzeColumns(tbl, o.stmt.TargetCols[i], o.stmt.Pos()); cerr != nil {
+				return nil, nil, cerr
+			}
 		}
 		// Maintenance-privilege check (vacuum_is_permitted_to_vacuum, analyze
 		// verb). A non-superuser session may only analyze a relation it owns (or
@@ -332,7 +370,7 @@ func analyzeRelationCtx(ctx *Context, tbl *catalog.Table) (*catalog.TableStats, 
 // analyzeRelation is kept as a thin wrapper for tests that don't
 // thread a Context — it uses the upstream-default stats target
 // and a wall-clock-seeded sampler.
-func analyzeRelation(pool *storage.Pool, mgr *mvcc.Manager, cat catalog.Catalog, tbl *catalog.Table) (*catalog.TableStats, error) {
+func analyzeRelation(pool *storage.Pool, mgr *transam.Manager, cat catalog.Catalog, tbl *catalog.Table) (*catalog.TableStats, error) {
 	// nil store: analyzeRelation is the test-only convenience wrapper with no
 	// executor.Context (hence no MultiXact) in scope. M0118-0003.
 	return analyzeRelationWith(pool, mgr, cat, tbl, upstreamDefaultStatsTarget, rand.New(rand.NewSource(time.Now().UnixNano())), nil, nil)
@@ -347,10 +385,10 @@ func analyzeRelation(pool *storage.Pool, mgr *mvcc.Manager, cat catalog.Catalog,
 // histogram-bound rendering (formatDatumDateStyle); pass nil where no
 // session context is available (falls back to ISO/MDY, matching
 // Datum.Format()'s pre-existing hardcoded default).
-func analyzeRelationWith(pool *storage.Pool, mgr *mvcc.Manager, cat catalog.Catalog, tbl *catalog.Table, target int, rng *rand.Rand, mxs *multixact.Store, dsCtx *Context) (*catalog.TableStats, error) {
+func analyzeRelationWith(pool *storage.Pool, mgr *transam.Manager, cat catalog.Catalog, tbl *catalog.Table, target int, rng *rand.Rand, mxs *multixact.Store, dsCtx *Context) (*catalog.TableStats, error) {
 	rel := cat.RelFileNode(tbl)
 
-	tx, err := mgr.Begin(mvcc.IsolationReadCommitted)
+	tx, err := mgr.Begin(transam.IsolationReadCommitted)
 	if err != nil {
 		return nil, err
 	}
@@ -412,12 +450,12 @@ func analyzeRelationWith(pool *storage.Pool, mgr *mvcc.Manager, cat catalog.Cata
 			// before judging visibility — a stats-sampling scan must not
 			// undercount a live, only-row-locked tuple as invisible. M0118-0003.
 			var curcid storage.CommandId = storage.InvalidCommandId
-		var combo *mvcc.ComboCIDStore
+		var combo *transam.ComboCIDStore
 		if dsCtx != nil {
 			curcid = dsCtx.CmdID
 			combo = dsCtx.comboStore()
 		}
-		if !mvcc.TupleVisible(t.Header, snap, tx.XID, curcid, combo, mxs) {
+		if !transam.TupleVisible(t.Header, snap, tx.XID, curcid, combo, mxs) {
 				continue
 			}
 			// Decode the PG-physical tuple body using the header (natts +

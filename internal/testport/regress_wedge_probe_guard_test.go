@@ -90,7 +90,13 @@ func TestPort_RegressWedgeProbeNamesTheStuckStatement(t *testing.T) {
 		t.Errorf("probe could not fetch a goroutine dump from %s:\n%s", pprofAddr, report)
 	}
 	dump := readBundleFile(t, bundleDir, "goroutines.txt")
-	if !strings.Contains(dump, "internal/server") {
+	// Match the module import prefix rather than a specific package name: the
+	// postmaster/connection code lives in internal/postmaster (there is no
+	// internal/server package in this module), and matching the prefix keeps
+	// this discriminating even if packages get renamed later. It still tells
+	// a real goopg-process capture apart from a dump that is only the pprof
+	// handler's own runtime/* frames, which is the whole point of check (3).
+	if !strings.Contains(dump, "github.com/goopg/goopg/internal/") {
 		t.Errorf("goroutine dump has no goopg server frames (wrong process?); first 400 bytes:\n%s",
 			truncate(dump, 400))
 	}

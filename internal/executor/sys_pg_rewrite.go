@@ -26,7 +26,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/pgnodes"
+	"github.com/goopg/goopg/internal/nodes"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -84,8 +84,8 @@ func pgRewriteRel(ctx *Context) storage.RelFileNode {
 // standby unable to expand a canonical rule it did stream into pg_rewrite.
 func canonicalViewEvAction(ctx *Context, tbl *catalog.Table, sqlText string) (evAction string, canonical bool) {
 	if tbl.View != nil && !tbl.IsMatView {
-		if q, err := pgnodes.ResolveViewQuery(tbl.View, viewRelationResolver{ctx: ctx}); err == nil {
-			return pgnodes.OutRuleAction([]pgnodes.Node{q}), true
+		if q, err := nodes.ResolveViewQuery(tbl.View, viewRelationResolver{ctx: ctx}); err == nil {
+			return nodes.OutRuleAction([]nodes.Node{q}), true
 		}
 	}
 	return sqlText, false
@@ -143,20 +143,20 @@ type viewRelationResolver struct {
 // attcollation the standby sees in its own pg_attribute — the exact same values
 // buildUserPGAttributeRow writes. viewColumnCanonicalType reuses that writer so
 // the two paths cannot drift (sibling-paths-must-agree).
-func (r viewRelationResolver) LookupRelation(schema, name string) (*pgnodes.RelationInfo, bool) {
+func (r viewRelationResolver) LookupRelation(schema, name string) (*nodes.RelationInfo, bool) {
 	tbl, ok := r.ctx.Catalog.LookupTable(
 		parser.ObjectName{Schema: schema, Name: name},
 		catalog.NamespaceDBOid(r.ctx.CurrentDatabaseOid))
 	if !ok || tbl == nil {
 		return nil, false
 	}
-	cols := make([]pgnodes.ColumnInfo, 0, len(tbl.Columns))
+	cols := make([]nodes.ColumnInfo, 0, len(tbl.Columns))
 	for _, col := range tbl.Columns {
 		typeOID, typmod, collation, ok := viewColumnCanonicalType(r.ctx.Catalog, tbl, col)
 		if !ok {
 			return nil, false // user/array/dropped column ⇒ not serializable
 		}
-		cols = append(cols, pgnodes.ColumnInfo{
+		cols = append(cols, nodes.ColumnInfo{
 			Name:      col.Name,
 			Attno:     int32(col.Ordinal + 1),
 			TypeOID:   typeOID,
@@ -164,7 +164,7 @@ func (r viewRelationResolver) LookupRelation(schema, name string) (*pgnodes.Rela
 			Collation: collation,
 		})
 	}
-	return &pgnodes.RelationInfo{
+	return &nodes.RelationInfo{
 		Relid:   tbl.OID,
 		Relname: tbl.Name,
 		Relkind: relkindByteForTable(tbl),

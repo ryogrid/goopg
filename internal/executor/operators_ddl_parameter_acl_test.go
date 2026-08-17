@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/config"
+	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -13,7 +13,7 @@ import (
 // "does this compiled-in GUC exist" branch exercises actual registered names
 // rather than a hand-picked stand-in list.
 func sessionGetSetting() func(name string) (string, bool) {
-	sess := config.NewSessionRegistry(config.BuildDefaultRegistry())
+	sess := misc.NewSessionRegistry(misc.BuildDefaultRegistry())
 	return func(name string) (string, bool) {
 		_, val, ok := sess.Get(name)
 		return val, ok

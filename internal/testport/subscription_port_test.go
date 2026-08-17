@@ -16,10 +16,10 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/executor"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // TestPort_Subscription001RepChanges ports postgres/src/test/subscription/t/001_rep_changes.pl
@@ -49,14 +49,14 @@ func TestPort_Subscription001RepChanges(t *testing.T) {
 	_ = pubCat
 	w := executor.NewApplyWorker(sub.cat, sub.pool, sub.txnMgr)
 
-	drive := func(xid uint32, changes ...wal.Change) {
+	drive := func(xid uint32, changes ...xlog.Change) {
 		t.Helper()
 		subDrive(t, snap, w, xid, changes)
 	}
 
 	// INSERT (1, 10) and (2, 20) — mirrors upstream's initial INSERTs.
-	drive(1, wal.Change{Kind: wal.ChangeInsert, Rel: pubRel, NewTuple: subTuple2(t, 1, 10)})
-	drive(2, wal.Change{Kind: wal.ChangeInsert, Rel: pubRel, NewTuple: subTuple2(t, 2, 20)})
+	drive(1, xlog.Change{Kind: xlog.ChangeInsert, Rel: pubRel, NewTuple: subTuple2(t, 1, 10)})
+	drive(2, xlog.Change{Kind: xlog.ChangeInsert, Rel: pubRel, NewTuple: subTuple2(t, 2, 20)})
 
 	rows := subScanInt2(t, sub, "tab_rep", tabCols)
 	if len(rows) != 2 {
@@ -64,7 +64,7 @@ func TestPort_Subscription001RepChanges(t *testing.T) {
 	}
 
 	// DELETE (id=1).
-	drive(3, wal.Change{Kind: wal.ChangeDelete, Rel: pubRel, OldTuple: subTuple2(t, 1, 10)})
+	drive(3, xlog.Change{Kind: xlog.ChangeDelete, Rel: pubRel, OldTuple: subTuple2(t, 1, 10)})
 	rows = subScanInt2(t, sub, "tab_rep", tabCols)
 	if len(rows) != 1 {
 		t.Fatalf("after DELETE id=1: got %d rows, want 1; rows=%v", len(rows), rows)
@@ -74,8 +74,8 @@ func TestPort_Subscription001RepChanges(t *testing.T) {
 	}
 
 	// UPDATE (id=2, a=20) → (id=2, a=99).
-	drive(4, wal.Change{
-		Kind:     wal.ChangeUpdate,
+	drive(4, xlog.Change{
+		Kind:     xlog.ChangeUpdate,
 		Rel:      pubRel,
 		OldTuple: subTuple2(t, 2, 20),
 		NewTuple: subTuple2(t, 2, 99),
@@ -118,10 +118,10 @@ func TestPort_Subscription004Sync(t *testing.T) {
 	// Simulate initial table sync: apply N pre-existing rows as a single batch
 	// (mirrors upstream's INSERT...generate_series(1,10) before subscription).
 	const N = 10
-	initChanges := make([]wal.Change, N)
+	initChanges := make([]xlog.Change, N)
 	for i := 0; i < N; i++ {
-		initChanges[i] = wal.Change{
-			Kind:     wal.ChangeInsert,
+		initChanges[i] = xlog.Change{
+			Kind:     xlog.ChangeInsert,
 			Rel:      pubRel,
 			NewTuple: subTuple1(t, i+1),
 		}
@@ -142,8 +142,8 @@ func TestPort_Subscription004Sync(t *testing.T) {
 	}
 
 	// Streaming INSERT after sync handoff — no gap, no duplicate.
-	subDrive(t, snap, w, 2, []wal.Change{{
-		Kind:     wal.ChangeInsert,
+	subDrive(t, snap, w, 2, []xlog.Change{{
+		Kind:     xlog.ChangeInsert,
 		Rel:      pubRel,
 		NewTuple: subTuple1(t, N+1),
 	}})
@@ -193,8 +193,8 @@ func TestPort_Subscription026Stats(t *testing.T) {
 
 	// Register a subscriber in the stats registry (mirrors LogicalReceiver.Run()
 	// calling subs.Register on startup). pg_stat_subscription renders this as a row.
-	subs := wal.NewSubscribers()
-	handle := subs.Register(wal.SubscriberState{
+	subs := xlog.NewSubscribers()
+	handle := subs.Register(xlog.SubscriberState{
 		SubID:   42,
 		SubName: "sub_stats_test",
 	})
@@ -204,12 +204,12 @@ func TestPort_Subscription026Stats(t *testing.T) {
 	// Drive an INSERT + commit through the apply worker with a non-zero EndLSN.
 	const commitLSN = uint64(0xABCD)
 	var buf bytes.Buffer
-	po := wal.NewPgOutput(snap, &buf)
+	po := xlog.NewPgOutput(snap, &buf)
 	if err := po.Begin(storage.TransactionID(1), commitLSN); err != nil {
 		t.Fatal(err)
 	}
-	if err := po.Change(wal.Change{
-		Kind:     wal.ChangeInsert,
+	if err := po.Change(xlog.Change{
+		Kind:     xlog.ChangeInsert,
 		Rel:      pubRel,
 		NewTuple: subTuple1(t, 100),
 	}); err != nil {
@@ -222,7 +222,7 @@ func TestPort_Subscription026Stats(t *testing.T) {
 	// Feed each message with EndLSN set so MarkMessage / AdvanceReceivedLSN fire.
 	payload := buf.Bytes()
 	for len(payload) > 0 {
-		m, err := wal.DecodeMessage(payload)
+		m, err := xlog.DecodeMessage(payload)
 		if err != nil {
 			t.Fatalf("DecodeMessage: %v", err)
 		}
@@ -260,7 +260,7 @@ func TestPort_Subscription026Stats(t *testing.T) {
 type subDB struct {
 	cat    catalog.Catalog
 	pool   *storage.Pool
-	txnMgr *mvcc.Manager
+	txnMgr *transam.Manager
 }
 
 func newSubDB(t *testing.T) *subDB {
@@ -276,30 +276,30 @@ func newSubDB(t *testing.T) *subDB {
 	return &subDB{
 		cat:    catalog.NewInMemory(),
 		pool:   pool,
-		txnMgr: mvcc.NewManager(),
+		txnMgr: transam.NewManager(),
 	}
 }
 
 // subMakePub creates a publisher catalog + relation + catalog snapshot.
-func subMakePub(t *testing.T, tableName string, cols []catalog.Column) (catalog.Catalog, storage.RelFileNode, *wal.CatalogSnapshot) {
+func subMakePub(t *testing.T, tableName string, cols []catalog.Column) (catalog.Catalog, storage.RelFileNode, *xlog.CatalogSnapshot) {
 	t.Helper()
 	cat := catalog.NewInMemory()
 	tbl, err := cat.CreateTable(parser.ObjectName{Name: tableName}, cols)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return cat, cat.RelFileNode(tbl), wal.BuildCatalogSnapshot(cat, nil)
+	return cat, cat.RelFileNode(tbl), xlog.BuildCatalogSnapshot(cat, nil)
 }
 
 // subDrive applies a batch of changes as one transaction to the apply worker.
-func subDrive(t *testing.T, snap *wal.CatalogSnapshot, w *executor.ApplyWorker, xid uint32, changes []wal.Change) {
+func subDrive(t *testing.T, snap *xlog.CatalogSnapshot, w *executor.ApplyWorker, xid uint32, changes []xlog.Change) {
 	t.Helper()
 	commitLSN := uint64(xid) * 100
 
 	applyPayload := func(payload []byte) {
 		t.Helper()
 		for len(payload) > 0 {
-			m, err := wal.DecodeMessage(payload)
+			m, err := xlog.DecodeMessage(payload)
 			if err != nil {
 				t.Fatalf("DecodeMessage: %v", err)
 			}
@@ -310,23 +310,23 @@ func subDrive(t *testing.T, snap *wal.CatalogSnapshot, w *executor.ApplyWorker, 
 		}
 	}
 
-	encode := func(fn func(*wal.PgOutput) error) []byte {
+	encode := func(fn func(*xlog.PgOutput) error) []byte {
 		t.Helper()
 		var buf bytes.Buffer
-		po := wal.NewPgOutput(snap, &buf)
+		po := xlog.NewPgOutput(snap, &buf)
 		if err := fn(po); err != nil {
 			t.Fatal(err)
 		}
 		return buf.Bytes()
 	}
 
-	applyPayload(encode(func(po *wal.PgOutput) error {
+	applyPayload(encode(func(po *xlog.PgOutput) error {
 		return po.Begin(storage.TransactionID(xid), commitLSN)
 	}))
 	for _, c := range changes {
-		applyPayload(encode(func(po *wal.PgOutput) error { return po.Change(c) }))
+		applyPayload(encode(func(po *xlog.PgOutput) error { return po.Change(c) }))
 	}
-	applyPayload(encode(func(po *wal.PgOutput) error {
+	applyPayload(encode(func(po *xlog.PgOutput) error {
 		return po.Commit(storage.TransactionID(xid), commitLSN)
 	}))
 }
@@ -376,7 +376,7 @@ func subScanInt2(t *testing.T, db *subDB, tableName string, cols []catalog.Colum
 		t.Fatalf("subScanInt2: table %q not found", tableName)
 	}
 	rel := db.cat.RelFileNode(tbl)
-	tx, err := db.txnMgr.Begin(mvcc.IsolationReadCommitted)
+	tx, err := db.txnMgr.Begin(transam.IsolationReadCommitted)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -400,7 +400,7 @@ func subScanInt2(t *testing.T, db *subDB, tableName string, cols []catalog.Colum
 			if err != nil {
 				continue
 			}
-			if !mvcc.TupleVisible(tup.Header, snap, tx.XID, storage.InvalidCommandId, nil, nil) {
+			if !transam.TupleVisible(tup.Header, snap, tx.XID, storage.InvalidCommandId, nil, nil) {
 				continue
 			}
 			row, _ := executor.DecodeRow(cols, tup.Data)
@@ -417,7 +417,7 @@ func subScanInt2(t *testing.T, db *subDB, tableName string, cols []catalog.Colum
 // scanIntCol scans the heap of rel and returns the int value of colIdx for each visible row.
 func scanIntCol(t *testing.T, db *subDB, rel storage.RelFileNode, cols []catalog.Column, colIdx int) []int {
 	t.Helper()
-	tx, err := db.txnMgr.Begin(mvcc.IsolationReadCommitted)
+	tx, err := db.txnMgr.Begin(transam.IsolationReadCommitted)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -441,7 +441,7 @@ func scanIntCol(t *testing.T, db *subDB, rel storage.RelFileNode, cols []catalog
 			if err != nil {
 				continue
 			}
-			if !mvcc.TupleVisible(tup.Header, snap, tx.XID, storage.InvalidCommandId, nil, nil) {
+			if !transam.TupleVisible(tup.Header, snap, tx.XID, storage.InvalidCommandId, nil, nil) {
 				continue
 			}
 			row, _ := executor.DecodeRow(cols, tup.Data)

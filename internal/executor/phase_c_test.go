@@ -15,7 +15,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -25,7 +25,7 @@ import (
 
 // runBothAndCompare runs the same plan via Run and RunFast and asserts
 // that the row sets are identical.
-func runBothAndCompare(t *testing.T, plan planner.Node, ctx *Context) {
+func runBothAndCompare(t *testing.T, plan optimizer.Node, ctx *Context) {
 	t.Helper()
 
 	// Build + Run (legacy path).
@@ -287,13 +287,13 @@ func TestRunFastInsert(t *testing.T) {
 
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
 
-	insertPlan := &planner.Insert{
+	insertPlan := &optimizer.Insert{
 		Table: tbl,
-		Source: &planner.Values{
-			Rows: [][]planner.Expr{
+		Source: &optimizer.Values{
+			Rows: [][]optimizer.Expr{
 				{
-					&planner.IntegerConst{Value: 99},
-					&planner.StringConst{Value: "inserted"},
+					&optimizer.IntegerConst{Value: 99},
+					&optimizer.StringConst{Value: "inserted"},
 				},
 			},
 		},
@@ -343,70 +343,70 @@ func TestBuildFastNodeKinds(t *testing.T) {
 
 	// Build a minimal SeqScan plan node with a real table
 	// (BuildFast calls newSeqScanOp which dereferences p.Table).
-	seqScanPlan := &planner.SeqScan{Table: tbl}
+	seqScanPlan := &optimizer.SeqScan{Table: tbl}
 
 	cases := []struct {
-		plan planner.Node
+		plan optimizer.Node
 		want OpKind
 	}{
 		{seqScanPlan, OpSeqScan},
 		{
-			&planner.Filter{
+			&optimizer.Filter{
 				Child:     seqScanPlan,
-				Predicate: &planner.BooleanConst{Value: true},
+				Predicate: &optimizer.BooleanConst{Value: true},
 			},
 			OpFilter,
 		},
 		{
-			&planner.Project{
+			&optimizer.Project{
 				Child:   seqScanPlan,
-				Targets: []planner.Expr{},
+				Targets: []optimizer.Expr{},
 			},
 			OpProject,
 		},
 		{
-			&planner.Limit{
+			&optimizer.Limit{
 				Child: seqScanPlan,
 			},
 			OpLimit,
 		},
 		// Update/Delete produce concrete kinds (no Operator child).
 		{
-			&planner.Update{
+			&optimizer.Update{
 				Table: tbl,
-				Child: &planner.SeqScan{Table: tbl},
+				Child: &optimizer.SeqScan{Table: tbl},
 			},
 			OpUpdate,
 		},
 		{
-			&planner.Delete{
+			&optimizer.Delete{
 				Table: tbl,
-				Child: &planner.SeqScan{Table: tbl},
+				Child: &optimizer.SeqScan{Table: tbl},
 			},
 			OpDelete,
 		},
 		// Sort produces OpSort (child bridged via opNodeOperator).
 		{
-			&planner.Sort{
+			&optimizer.Sort{
 				Child: seqScanPlan,
-				Keys:  []planner.SortKey{},
+				Keys:  []optimizer.SortKey{},
 			},
 			OpSort,
 		},
 		// Insert (no ON CONFLICT) migrated to concrete OpInsert kind.
 		{
-			&planner.Insert{
+			&optimizer.Insert{
 				Table:  tbl,
-				Source: &planner.Values{},
+				Source: &optimizer.Values{},
 			},
 			OpInsert,
 		},
 		// Join (children bridged via opNodeOperator) migrated to OpJoin.
 		{
-			&planner.Join{
+			&optimizer.Join{
 				Left:  seqScanPlan,
 				Right: seqScanPlan,
-				Algo:  planner.JoinAlgoHash,
+				Algo:  optimizer.JoinAlgoHash,
 			},
 			OpJoin,
 		},
@@ -508,9 +508,9 @@ func TestBuildFastIteratorRowsAffected(t *testing.T) {
 	}
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
 
-	updatePlan := &planner.Update{
+	updatePlan := &optimizer.Update{
 		Table: tbl,
-		Child: &planner.SeqScan{Table: tbl},
+		Child: &optimizer.SeqScan{Table: tbl},
 	}
 	it, err := BuildFastIterator(updatePlan)
 	if err != nil {
@@ -535,9 +535,9 @@ func TestOpIteratorNilSlotForDMLNoRow(t *testing.T) {
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
 	// Use an INSERT into an empty table — OpInsert concrete kind;
 	// OpIterator.Next() must propagate the nil-slot correctly.
-	insertPlan := &planner.Insert{
+	insertPlan := &optimizer.Insert{
 		Table:  tbl,
-		Source: &planner.Values{},
+		Source: &optimizer.Values{},
 	}
 	it, err := BuildFastIterator(insertPlan)
 	if err != nil {
@@ -573,12 +573,12 @@ func TestRunFastInsertRowsAffected(t *testing.T) {
 	defer cleanup()
 
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
-	insertPlan := &planner.Insert{
+	insertPlan := &optimizer.Insert{
 		Table: tbl,
-		Source: &planner.Values{
-			Rows: [][]planner.Expr{
-				{&planner.IntegerConst{Value: 200}, &planner.StringConst{Value: "ra"}},
-				{&planner.IntegerConst{Value: 201}, &planner.StringConst{Value: "rb"}},
+		Source: &optimizer.Values{
+			Rows: [][]optimizer.Expr{
+				{&optimizer.IntegerConst{Value: 200}, &optimizer.StringConst{Value: "ra"}},
+				{&optimizer.IntegerConst{Value: 201}, &optimizer.StringConst{Value: "rb"}},
 			},
 		},
 		ColumnIndex: []int{0, 1},
@@ -653,7 +653,7 @@ func TestRunFastJoinConcrete(t *testing.T) {
 func TestBuildExprSlabCommonKinds(t *testing.T) {
 	t.Run("ColumnRef", func(t *testing.T) {
 		var slab exprTreeSlab
-		e := &planner.ColumnRef{Index: 3}
+		e := &optimizer.ColumnRef{Index: 3}
 		idx := slab.buildExpr(e)
 		if idx != 0 {
 			t.Fatalf("expected root index 0, got %d", idx)
@@ -670,7 +670,7 @@ func TestBuildExprSlabCommonKinds(t *testing.T) {
 
 	t.Run("IntegerConst", func(t *testing.T) {
 		var slab exprTreeSlab
-		e := &planner.IntegerConst{Value: 42}
+		e := &optimizer.IntegerConst{Value: 42}
 		idx := slab.buildExpr(e)
 		if slab[idx].Kind != ExprIntConst {
 			t.Fatalf("expected ExprIntConst, got %d", slab[idx].Kind)
@@ -683,7 +683,7 @@ func TestBuildExprSlabCommonKinds(t *testing.T) {
 
 	t.Run("BooleanConst_true", func(t *testing.T) {
 		var slab exprTreeSlab
-		e := &planner.BooleanConst{Value: true}
+		e := &optimizer.BooleanConst{Value: true}
 		idx := slab.buildExpr(e)
 		if slab[idx].Kind != ExprBoolConst {
 			t.Fatalf("expected ExprBoolConst, got %d", slab[idx].Kind)
@@ -695,7 +695,7 @@ func TestBuildExprSlabCommonKinds(t *testing.T) {
 
 	t.Run("BooleanConst_false", func(t *testing.T) {
 		var slab exprTreeSlab
-		e := &planner.BooleanConst{Value: false}
+		e := &optimizer.BooleanConst{Value: false}
 		idx := slab.buildExpr(e)
 		if slab[idx].payload[0] != 0 {
 			t.Errorf("expected payload[0]=0 for false, got %d", slab[idx].payload[0])
@@ -704,7 +704,7 @@ func TestBuildExprSlabCommonKinds(t *testing.T) {
 
 	t.Run("NullConst", func(t *testing.T) {
 		var slab exprTreeSlab
-		e := &planner.NullConst{}
+		e := &optimizer.NullConst{}
 		idx := slab.buildExpr(e)
 		if slab[idx].Kind != ExprNullConst {
 			t.Fatalf("expected ExprNullConst, got %d", slab[idx].Kind)
@@ -724,10 +724,10 @@ func TestBuildExprSlabCommonKinds(t *testing.T) {
 
 	t.Run("BinaryOp_reserves_before_children", func(t *testing.T) {
 		var slab exprTreeSlab
-		e := &planner.BinaryOp{
+		e := &optimizer.BinaryOp{
 			Op:    parser.OpEq,
-			Left:  &planner.ColumnRef{Index: 0},
-			Right: &planner.IntegerConst{Value: 7},
+			Left:  &optimizer.ColumnRef{Index: 0},
+			Right: &optimizer.IntegerConst{Value: 7},
 		}
 		rootIdx := slab.buildExpr(e)
 		// Root must be index 0 (BinaryOp reserved first).
@@ -758,7 +758,7 @@ func TestBuildExprSlabCommonKinds(t *testing.T) {
 	t.Run("UnknownKind_falls_back_to_adapter", func(t *testing.T) {
 		var slab exprTreeSlab
 		// StringConst is not handled natively → ExprAdapter.
-		e := &planner.StringConst{Value: "hello"}
+		e := &optimizer.StringConst{Value: "hello"}
 		idx := slab.buildExpr(e)
 		if slab[idx].Kind != ExprAdapter {
 			t.Fatalf("expected ExprAdapter for StringConst, got %d", slab[idx].Kind)
@@ -791,7 +791,7 @@ func TestEvalFastExprCommonKinds(t *testing.T) {
 
 	t.Run("ColumnRef_reads_slot", func(t *testing.T) {
 		var slab exprTreeSlab
-		idx := slab.buildExpr(&planner.ColumnRef{Index: 0})
+		idx := slab.buildExpr(&optimizer.ColumnRef{Index: 0})
 		d, err := evalFastExpr(slab, idx, slot, nil)
 		if err != nil {
 			t.Fatal(err)
@@ -803,7 +803,7 @@ func TestEvalFastExprCommonKinds(t *testing.T) {
 
 	t.Run("ColumnRef_null_column", func(t *testing.T) {
 		var slab exprTreeSlab
-		idx := slab.buildExpr(&planner.ColumnRef{Index: 2})
+		idx := slab.buildExpr(&optimizer.ColumnRef{Index: 2})
 		d, err := evalFastExpr(slab, idx, slot, nil)
 		if err != nil {
 			t.Fatal(err)
@@ -815,7 +815,7 @@ func TestEvalFastExprCommonKinds(t *testing.T) {
 
 	t.Run("IntConst", func(t *testing.T) {
 		var slab exprTreeSlab
-		idx := slab.buildExpr(&planner.IntegerConst{Value: 99})
+		idx := slab.buildExpr(&optimizer.IntegerConst{Value: 99})
 		d, err := evalFastExpr(slab, idx, slot, nil)
 		if err != nil {
 			t.Fatal(err)
@@ -827,7 +827,7 @@ func TestEvalFastExprCommonKinds(t *testing.T) {
 
 	t.Run("BoolConst_true", func(t *testing.T) {
 		var slab exprTreeSlab
-		idx := slab.buildExpr(&planner.BooleanConst{Value: true})
+		idx := slab.buildExpr(&optimizer.BooleanConst{Value: true})
 		d, err := evalFastExpr(slab, idx, slot, nil)
 		if err != nil {
 			t.Fatal(err)
@@ -839,7 +839,7 @@ func TestEvalFastExprCommonKinds(t *testing.T) {
 
 	t.Run("NullConst", func(t *testing.T) {
 		var slab exprTreeSlab
-		idx := slab.buildExpr(&planner.NullConst{})
+		idx := slab.buildExpr(&optimizer.NullConst{})
 		d, err := evalFastExpr(slab, idx, slot, nil)
 		if err != nil {
 			t.Fatal(err)
@@ -851,10 +851,10 @@ func TestEvalFastExprCommonKinds(t *testing.T) {
 
 	t.Run("BinaryOp_eq_true", func(t *testing.T) {
 		var slab exprTreeSlab
-		e := &planner.BinaryOp{
+		e := &optimizer.BinaryOp{
 			Op:    parser.OpEq,
-			Left:  &planner.ColumnRef{Index: 0}, // 10
-			Right: &planner.IntegerConst{Value: 10},
+			Left:  &optimizer.ColumnRef{Index: 0}, // 10
+			Right: &optimizer.IntegerConst{Value: 10},
 		}
 		idx := slab.buildExpr(e)
 		d, err := evalFastExpr(slab, idx, slot, nil)
@@ -868,10 +868,10 @@ func TestEvalFastExprCommonKinds(t *testing.T) {
 
 	t.Run("BinaryOp_eq_false", func(t *testing.T) {
 		var slab exprTreeSlab
-		e := &planner.BinaryOp{
+		e := &optimizer.BinaryOp{
 			Op:    parser.OpEq,
-			Left:  &planner.ColumnRef{Index: 0}, // 10
-			Right: &planner.IntegerConst{Value: 5},
+			Left:  &optimizer.ColumnRef{Index: 0}, // 10
+			Right: &optimizer.IntegerConst{Value: 5},
 		}
 		idx := slab.buildExpr(e)
 		d, err := evalFastExpr(slab, idx, slot, nil)
@@ -887,10 +887,10 @@ func TestEvalFastExprCommonKinds(t *testing.T) {
 		var slab exprTreeSlab
 		// FALSE AND <anything> → FALSE without evaluating right.
 		// Right side has an out-of-bounds ColumnRef that would panic if evaluated.
-		e := &planner.BinaryOp{
+		e := &optimizer.BinaryOp{
 			Op:    parser.OpAnd,
-			Left:  &planner.BooleanConst{Value: false},
-			Right: &planner.ColumnRef{Index: 999}, // would panic if reached
+			Left:  &optimizer.BooleanConst{Value: false},
+			Right: &optimizer.ColumnRef{Index: 999}, // would panic if reached
 		}
 		idx := slab.buildExpr(e)
 		d, err := evalFastExpr(slab, idx, slot, nil)
@@ -904,10 +904,10 @@ func TestEvalFastExprCommonKinds(t *testing.T) {
 
 	t.Run("BinaryOp_and_null_false", func(t *testing.T) {
 		var slab exprTreeSlab
-		e := &planner.BinaryOp{
+		e := &optimizer.BinaryOp{
 			Op:    parser.OpAnd,
-			Left:  &planner.NullConst{},
-			Right: &planner.BooleanConst{Value: false},
+			Left:  &optimizer.NullConst{},
+			Right: &optimizer.BooleanConst{Value: false},
 		}
 		idx := slab.buildExpr(e)
 		d, err := evalFastExpr(slab, idx, slot, nil)
@@ -921,10 +921,10 @@ func TestEvalFastExprCommonKinds(t *testing.T) {
 
 	t.Run("BinaryOp_or_null_true", func(t *testing.T) {
 		var slab exprTreeSlab
-		e := &planner.BinaryOp{
+		e := &optimizer.BinaryOp{
 			Op:    parser.OpOr,
-			Left:  &planner.NullConst{},
-			Right: &planner.BooleanConst{Value: true},
+			Left:  &optimizer.NullConst{},
+			Right: &optimizer.BooleanConst{Value: true},
 		}
 		idx := slab.buildExpr(e)
 		d, err := evalFastExpr(slab, idx, slot, nil)
@@ -939,7 +939,7 @@ func TestEvalFastExprCommonKinds(t *testing.T) {
 	t.Run("ExprAdapter_delegates_to_evalExprSlot", func(t *testing.T) {
 		var slab exprTreeSlab
 		// StringConst → ExprAdapter → evalExprSlot.
-		e := &planner.StringConst{Value: "hello"}
+		e := &optimizer.StringConst{Value: "hello"}
 		idx := slab.buildExpr(e)
 		d, err := evalFastExpr(slab, idx, slot, nil)
 		if err != nil {
@@ -1265,11 +1265,11 @@ func TestProjectStateNoSchemaField(t *testing.T) {
 // `int2 32767 * int2 2` returned 65534 instead of raising "smallint out of
 // range" — regressing the int2/int4 pg_regress cases.
 func TestEvalFastExprIntOverflow(t *testing.T) {
-	mkBinOp := func(op parser.OpCode, l, r int64, resultType string) *planner.BinaryOp {
-		return &planner.BinaryOp{
+	mkBinOp := func(op parser.OpCode, l, r int64, resultType string) *optimizer.BinaryOp {
+		return &optimizer.BinaryOp{
 			Op:         op,
-			Left:       &planner.IntegerConst{Value: l},
-			Right:      &planner.IntegerConst{Value: r},
+			Left:       &optimizer.IntegerConst{Value: l},
+			Right:      &optimizer.IntegerConst{Value: r},
 			ResultType: resultType,
 		}
 	}
@@ -1277,7 +1277,7 @@ func TestEvalFastExprIntOverflow(t *testing.T) {
 
 	cases := []struct {
 		name       string
-		expr       *planner.BinaryOp
+		expr       *optimizer.BinaryOp
 		wantErr    bool
 		wantErrMsg string
 		wantVal    int64
@@ -1321,10 +1321,10 @@ func TestEvalFastExprIntOverflow(t *testing.T) {
 // them (the fast path's exact arithmetic diverges from PostgreSQL float8).
 func TestBuildExprFloatFallsBackToAdapter(t *testing.T) {
 	var slab exprTreeSlab
-	e := &planner.BinaryOp{
+	e := &optimizer.BinaryOp{
 		Op:         parser.OpAdd,
-		Left:       &planner.ColumnRef{Index: 0},
-		Right:      &planner.IntegerConst{Value: 1},
+		Left:       &optimizer.ColumnRef{Index: 0},
+		Right:      &optimizer.IntegerConst{Value: 1},
 		ResultType: "float8",
 	}
 	idx := slab.buildExpr(e)
@@ -1349,10 +1349,10 @@ func TestBuildExprFloatFallsBackToAdapter(t *testing.T) {
 func TestBuildExprRowToRowNullFallsBackToAdapter(t *testing.T) {
 	t.Run("buildExpr_emits_ExprAdapter", func(t *testing.T) {
 		var slab exprTreeSlab
-		e := &planner.BinaryOp{
+		e := &optimizer.BinaryOp{
 			Op:    parser.OpGe,
-			Left:  &planner.RowExpr{Elems: []planner.Expr{&planner.ColumnRef{Index: 0}, &planner.ColumnRef{Index: 1}}},
-			Right: &planner.RowExpr{Elems: []planner.Expr{&planner.StringConst{Value: "abs"}, &planner.NullConst{}}},
+			Left:  &optimizer.RowExpr{Elems: []optimizer.Expr{&optimizer.ColumnRef{Index: 0}, &optimizer.ColumnRef{Index: 1}}},
+			Right: &optimizer.RowExpr{Elems: []optimizer.Expr{&optimizer.StringConst{Value: "abs"}, &optimizer.NullConst{}}},
 		}
 		idx := slab.buildExpr(e)
 		if slab[idx].Kind != ExprAdapter {

@@ -6,10 +6,10 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/lockmgr"
-	"github.com/goopg/goopg/internal/multixact"
+	"github.com/goopg/goopg/internal/storage/lmgr"
+	"github.com/goopg/goopg/internal/access/transam/multixact"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -25,7 +25,7 @@ func runForUpdate(t *testing.T, ctx *Context, sql string) ([]Row, error) {
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	node, err := planner.Plan(stmts[0], ctx.Catalog)
+	node, err := optimizer.Plan(stmts[0], ctx.Catalog)
 	if err != nil {
 		return nil, err
 	}
@@ -60,7 +60,7 @@ func runForUpdate(t *testing.T, ctx *Context, sql string) ([]Row, error) {
 func TestLockRowsAcquiresRowShareLock(t *testing.T) {
 	ctx, cat, cleanup := newStorageFixture(t)
 	defer cleanup()
-	lm := lockmgr.New()
+	lm := lmgr.New()
 	ctx.LockMgr = lm
 	ctx.BackendID = 1
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
@@ -70,7 +70,7 @@ func TestLockRowsAcquiresRowShareLock(t *testing.T) {
 		t.Fatalf("runForUpdate: %v", err)
 	}
 	rel := ctx.Catalog.RelFileNode(tbl)
-	tag := lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
+	tag := lmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
 	holders := lm.Holders(tag)
 	if len(holders) == 0 {
 		t.Fatalf("Holders=%v, want at least 1", holders)
@@ -78,7 +78,7 @@ func TestLockRowsAcquiresRowShareLock(t *testing.T) {
 	// The locked relation should report RowShareLock granted to
 	// our backend. Holders is a map[BackendID]Mask; check the
 	// RowShareLock bit is set on backend 1.
-	if mask, ok := holders[1]; !ok || mask&(1<<lockmgr.RowShareLock) == 0 {
+	if mask, ok := holders[1]; !ok || mask&(1<<lmgr.RowShareLock) == 0 {
 		t.Errorf("backend 1 mask=0b%b, want RowShareLock bit set", mask)
 	}
 }
@@ -91,7 +91,7 @@ func TestLockRowsAcquiresRowShareLock(t *testing.T) {
 func TestLockRowsForShareAlsoUsesRowShareLock(t *testing.T) {
 	ctx, cat, cleanup := newStorageFixture(t)
 	defer cleanup()
-	lm := lockmgr.New()
+	lm := lmgr.New()
 	ctx.LockMgr = lm
 	ctx.BackendID = 1
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
@@ -101,8 +101,8 @@ func TestLockRowsForShareAlsoUsesRowShareLock(t *testing.T) {
 		t.Fatalf("runForUpdate: %v", err)
 	}
 	rel := ctx.Catalog.RelFileNode(tbl)
-	tag := lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
-	if mask, ok := lm.Holders(tag)[1]; !ok || mask&(1<<lockmgr.RowShareLock) == 0 {
+	tag := lmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
+	if mask, ok := lm.Holders(tag)[1]; !ok || mask&(1<<lmgr.RowShareLock) == 0 {
 		t.Errorf("FOR SHARE backend 1 mask=0b%b, want RowShareLock bit set", mask)
 	}
 }
@@ -113,7 +113,7 @@ func TestLockRowsForShareAlsoUsesRowShareLock(t *testing.T) {
 func TestLockRowsNoWaitSucceedsUncontended(t *testing.T) {
 	ctx, cat, cleanup := newStorageFixture(t)
 	defer cleanup()
-	ctx.LockMgr = lockmgr.New()
+	ctx.LockMgr = lmgr.New()
 	ctx.BackendID = 1
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
 	seedItems(t, ctx, tbl)
@@ -137,13 +137,13 @@ func TestLockRowsNoWaitFailsOnContention(t *testing.T) {
 	// would block our blocker's ExclusiveLock acquisition.
 	seedItems(t, ctx, tbl)
 
-	lm := lockmgr.New()
+	lm := lmgr.New()
 	rel := ctx.Catalog.RelFileNode(tbl)
-	tag := lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
-	if err := lm.Acquire(context.Background(), 1, tag, lockmgr.ExclusiveLock); err != nil {
+	tag := lmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
+	if err := lm.Acquire(context.Background(), 1, tag, lmgr.ExclusiveLock); err != nil {
 		t.Fatalf("blocker Acquire: %v", err)
 	}
-	defer lm.Release(1, tag, lockmgr.ExclusiveLock)
+	defer lm.Release(1, tag, lmgr.ExclusiveLock)
 
 	ctx.LockMgr = lm
 	ctx.BackendID = 2
@@ -286,7 +286,7 @@ func TestLockOnlyMemberStatusFourWay(t *testing.T) {
 func TestLockRowsStampsTupleLockOnlyXmax(t *testing.T) {
 	ctx, cat, cleanup := newStorageFixture(t)
 	defer cleanup()
-	ctx.LockMgr = lockmgr.New()
+	ctx.LockMgr = lmgr.New()
 	ctx.BackendID = 1
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
 	seedItems(t, ctx, tbl)
@@ -370,7 +370,7 @@ func TestUpdateBlocksOnForeignTupleLock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	lm := lockmgr.New()
+	lm := lmgr.New()
 
 	// Session 1: SELECT FOR UPDATE — stamps tuple lock on every
 	// returned row.
@@ -416,7 +416,7 @@ func TestUpdateBlocksOnForeignTupleLock(t *testing.T) {
 			done <- err
 			return
 		}
-		node, err := planner.Plan(stmts[0], s2.Catalog)
+		node, err := optimizer.Plan(stmts[0], s2.Catalog)
 		if err != nil {
 			done <- err
 			return
@@ -450,7 +450,7 @@ func TestUpdateBlocksOnForeignTupleLock(t *testing.T) {
 		// sleeping); it is session 2's UPDATE that grabs the tag as
 		// HOLDER right before parking on session 1's xact — the
 		// pre-sleep heap_acquire_tuplock analogue (design 0021-0012).
-		h := lm.Holders(lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid, Block: 1, Offset: 2})
+		h := lm.Holders(lmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid, Block: 1, Offset: 2})
 		if h[2] != 0 {
 			registered = true
 			break
@@ -507,7 +507,7 @@ func TestLockRowsStampsLockOnlyXmaxIndexScan(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ctx.LockMgr = lockmgr.New()
+	ctx.LockMgr = lmgr.New()
 	ctx.BackendID = 1
 
 	rows, err := runForUpdate(t, ctx, "SELECT id FROM items WHERE id = 2 FOR UPDATE")
@@ -577,7 +577,7 @@ func TestUpdateViaIndexScanBlocksOnForeignTupleLock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	lm := lockmgr.New()
+	lm := lmgr.New()
 
 	s1tx, _ := ctx.TxnMgr.Begin(0)
 	s1snap, _ := ctx.TxnMgr.SnapshotFor(s1tx)
@@ -608,7 +608,7 @@ func TestUpdateViaIndexScanBlocksOnForeignTupleLock(t *testing.T) {
 			done <- err
 			return
 		}
-		node, err := planner.Plan(stmts[0], s2.Catalog)
+		node, err := optimizer.Plan(stmts[0], s2.Catalog)
 		if err != nil {
 			done <- err
 			return
@@ -640,7 +640,7 @@ func TestUpdateViaIndexScanBlocksOnForeignTupleLock(t *testing.T) {
 		// session 2's UPDATE that grabs the tag as HOLDER right before
 		// parking on session 1's xact — the pre-sleep
 		// heap_acquire_tuplock analogue (design 0021-0012).
-		h := lm.Holders(lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid, Block: 1, Offset: 2})
+		h := lm.Holders(lmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid, Block: 1, Offset: 2})
 		if h[2] != 0 {
 			registered = true
 			break
@@ -695,7 +695,7 @@ func TestForShareCompatibleMultipleHolders(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	lm := lockmgr.New()
+	lm := lmgr.New()
 
 	// Two sessions concurrently take FOR SHARE on the same row.
 	s1tx, _ := ctx.TxnMgr.Begin(0)
@@ -736,7 +736,7 @@ func TestForShareCompatibleMultipleHolders(t *testing.T) {
 	// test pins is instead verified below by the fact that neither call
 	// blocked, plus session 3's UPDATE waiting for BOTH to release.
 	rel := ctx.Catalog.RelFileNode(tbl)
-	tag := lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid, Block: 1, Offset: 2}
+	tag := lmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid, Block: 1, Offset: 2}
 
 	// A third session attempting UPDATE on the same row must
 	// block until BOTH FOR SHARE holders release.
@@ -753,7 +753,7 @@ func TestForShareCompatibleMultipleHolders(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		stmts, _ := parser.Parse("UPDATE items SET label = 'updated' WHERE id = 1")
-		node, err := planner.Plan(stmts[0], s3.Catalog)
+		node, err := optimizer.Plan(stmts[0], s3.Catalog)
 		if err != nil {
 			done <- err
 			return
@@ -880,10 +880,10 @@ func TestForShareFormsLockOnlyMultiXact(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	lm := lockmgr.New()
+	lm := lmgr.New()
 	store := multixact.NewStore()
 
-	mkSession := func(b lockmgr.BackendID) *Context {
+	mkSession := func(b lmgr.BackendID) *Context {
 		tx, _ := ctx.TxnMgr.Begin(0)
 		snap, _ := ctx.TxnMgr.SnapshotFor(tx)
 		s := makeCtx(lm, b)
@@ -994,9 +994,9 @@ func TestForShareJoinsInProgressUpdaterFormsMultiXact(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	lm := lockmgr.New()
+	lm := lmgr.New()
 	store := multixact.NewStore()
-	mkSession := func(b lockmgr.BackendID) *Context {
+	mkSession := func(b lmgr.BackendID) *Context {
 		tx, _ := ctx.TxnMgr.Begin(0)
 		snap, _ := ctx.TxnMgr.SnapshotFor(tx)
 		s := makeCtx(lm, b)
@@ -1082,9 +1082,9 @@ func TestForKeySharePropagatesLockToUpdatedSuccessor(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	lm := lockmgr.New()
+	lm := lmgr.New()
 	store := multixact.NewStore()
-	mkSession := func(b lockmgr.BackendID) *Context {
+	mkSession := func(b lmgr.BackendID) *Context {
 		tx, _ := ctx.TxnMgr.Begin(0)
 		snap, _ := ctx.TxnMgr.SnapshotFor(tx)
 		s := makeCtx(lm, b)
@@ -1159,9 +1159,9 @@ func TestConflictingRowLockHoldersHonoursStrengthMatrix(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	lm := lockmgr.New()
+	lm := lmgr.New()
 	store := multixact.NewStore()
-	mkSession := func(b lockmgr.BackendID) *Context {
+	mkSession := func(b lmgr.BackendID) *Context {
 		tx, _ := ctx.TxnMgr.Begin(0)
 		snap, _ := ctx.TxnMgr.SnapshotFor(tx)
 		s := makeCtx(lm, b)
@@ -1239,9 +1239,9 @@ func TestForShareSkipsAbortedUpdaterNoMultiXact(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	lm := lockmgr.New()
+	lm := lmgr.New()
 	store := multixact.NewStore()
-	mkSession := func(b lockmgr.BackendID) *Context {
+	mkSession := func(b lmgr.BackendID) *Context {
 		tx, _ := ctx.TxnMgr.Begin(0)
 		snap, _ := ctx.TxnMgr.SnapshotFor(tx)
 		s := makeCtx(lm, b)
@@ -1289,7 +1289,7 @@ func TestForShareSkipsAbortedUpdaterNoMultiXact(t *testing.T) {
 func TestLockRowsSkipLockedNoContention(t *testing.T) {
 	ctx, cat, cleanup := newStorageFixture(t)
 	defer cleanup()
-	ctx.LockMgr = lockmgr.New()
+	ctx.LockMgr = lmgr.New()
 	ctx.BackendID = 1
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
 	seedItems(t, ctx, tbl)
@@ -1319,7 +1319,7 @@ func TestLockRowsBlocksOnExclusiveLock(t *testing.T) {
 	// ExclusiveLock acquisition below.
 	seedItems(t, ctx, tbl)
 
-	lm := lockmgr.New()
+	lm := lmgr.New()
 	ctx.LockMgr = lm
 	ctx.BackendID = 2
 
@@ -1327,8 +1327,8 @@ func TestLockRowsBlocksOnExclusiveLock(t *testing.T) {
 	// trying to acquire RowShareLock (RowShareLock conflicts
 	// with ExclusiveLock per upstream's lock matrix).
 	rel := ctx.Catalog.RelFileNode(tbl)
-	tag := lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
-	if err := lm.Acquire(context.Background(), 1, tag, lockmgr.ExclusiveLock); err != nil {
+	tag := lmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
+	if err := lm.Acquire(context.Background(), 1, tag, lmgr.ExclusiveLock); err != nil {
 		t.Fatalf("blocker Acquire: %v", err)
 	}
 
@@ -1349,13 +1349,13 @@ func TestLockRowsBlocksOnExclusiveLock(t *testing.T) {
 	if got := lm.Waiters(tag); len(got) != 1 {
 		// Release blocker so the goroutine can finish even on
 		// a failed assertion — keeps the test from hanging.
-		lm.Release(1, tag, lockmgr.ExclusiveLock)
+		lm.Release(1, tag, lmgr.ExclusiveLock)
 		<-done
 		t.Fatalf("Waiters=%v, want 1 waiter (lockRowsOp pending)", got)
 	}
 
 	// Release blocker; the goroutine should now complete.
-	lm.Release(1, tag, lockmgr.ExclusiveLock)
+	lm.Release(1, tag, lmgr.ExclusiveLock)
 	select {
 	case err := <-done:
 		if err != nil {
@@ -1379,7 +1379,7 @@ func TestLockRowsBlocksOnExclusiveLock(t *testing.T) {
 func TestLockRowsStampsXmaxOnPartitionedTableLeaf(t *testing.T) {
 	ctx, cat, cleanup := newStorageFixture(t)
 	defer cleanup()
-	ctx.LockMgr = lockmgr.New()
+	ctx.LockMgr = lmgr.New()
 	ctx.BackendID = 1
 
 	im := cat.(*catalog.InMemory)
@@ -1455,7 +1455,7 @@ type unknownOp struct{ child Operator }
 func (o *unknownOp) Open(*Context) error     { return nil }
 func (o *unknownOp) Next() (TupleSlot, error) { return nil, EOF }
 func (o *unknownOp) Close() error             { return nil }
-func (o *unknownOp) Schema() planner.Schema   { return nil }
+func (o *unknownOp) Schema() optimizer.Schema   { return nil }
 
 // TestLockRowsWalkersGracefulOnUnknown verifies that findScanLeaf,
 // findScanLeafForRel, and markJoinPreserveCTID gracefully return nil
@@ -1553,13 +1553,13 @@ func TestParseRowCTID(t *testing.T) {
 // TestLockRowsOutputStripsCtidColumns verifies that LockRows.Output() removes
 // the trailing ctid junk columns from the child schema.
 func TestLockRowsOutputStripsCtidColumns(t *testing.T) {
-	colA := planner.SchemaColumn{Name: "a", Type: catalog.Type{Name: "int4"}}
-	colB := planner.SchemaColumn{Name: "b", Type: catalog.Type{Name: "int4"}}
-	ctidCol := planner.SchemaColumn{Name: "ctid1", Type: catalog.Type{Name: "tid"}}
+	colA := optimizer.SchemaColumn{Name: "a", Type: catalog.Type{Name: "int4"}}
+	colB := optimizer.SchemaColumn{Name: "b", Type: catalog.Type{Name: "int4"}}
+	ctidCol := optimizer.SchemaColumn{Name: "ctid1", Type: catalog.Type{Name: "tid"}}
 
 	t.Run("no_ctid_columns", func(t *testing.T) {
-		lr := &planner.LockRows{
-			Child:       &planner.SeqScan{},
+		lr := &optimizer.LockRows{
+			Child:       &optimizer.SeqScan{},
 			NumCtidCols: 0,
 		}
 		// Output should equal child output (identity when no ctid columns)
@@ -1571,9 +1571,9 @@ func TestLockRowsOutputStripsCtidColumns(t *testing.T) {
 
 	t.Run("strips_trailing_ctid", func(t *testing.T) {
 		// Simulate: child has [a, b, ctid1, ctid2], NumCtidCols=2
-		childSchema := planner.Schema{colA, colB, ctidCol, ctidCol}
+		childSchema := optimizer.Schema{colA, colB, ctidCol, ctidCol}
 		mock := &mockSchemaNode{schema: childSchema}
-		lr := &planner.LockRows{
+		lr := &optimizer.LockRows{
 			Child:       mock,
 			NumCtidCols: 2,
 		}
@@ -1587,9 +1587,9 @@ func TestLockRowsOutputStripsCtidColumns(t *testing.T) {
 	})
 
 	t.Run("NumCtidCols_exceeds_schema", func(t *testing.T) {
-		childSchema := planner.Schema{colA}
+		childSchema := optimizer.Schema{colA}
 		mock := &mockSchemaNode{schema: childSchema}
-		lr := &planner.LockRows{
+		lr := &optimizer.LockRows{
 			Child:       mock,
 			NumCtidCols: 5,
 		}
@@ -1602,8 +1602,8 @@ func TestLockRowsOutputStripsCtidColumns(t *testing.T) {
 
 // mockSchemaNode implements planner.Node with just a schema for testing.
 type mockSchemaNode struct {
-	schema planner.Schema
+	schema optimizer.Schema
 }
 
 func (m *mockSchemaNode) Pos() int             { return 0 }
-func (m *mockSchemaNode) Output() planner.Schema { return m.schema }
+func (m *mockSchemaNode) Output() optimizer.Schema { return m.schema }

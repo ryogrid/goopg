@@ -10,7 +10,7 @@ PROJECT_TYPE="generic"
 # If "claude" is not in your PATH, set to your installation:
 #   "npx @anthropic-ai/claude-code"  (uses npx, no global install needed)
 #   "/path/to/claude"                (custom path)
-#CLAUDE_CODE_CMD="claude"
+CLAUDE_CODE_CMD="claude"
 
 # Loop settings
 MAX_CALLS_PER_HOUR=100

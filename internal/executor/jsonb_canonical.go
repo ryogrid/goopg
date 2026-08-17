@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/goopg/goopg/internal/pgnodes"
+	"github.com/goopg/goopg/internal/nodes"
 )
 
 // jsonb canonicalisation (M0119-0006, 64th slice).
@@ -245,11 +245,11 @@ func lengthCompareJSONBKey(a, b string) int {
 // / numeric_out, which is exactly what jsonb_in_scalar → jsonb_put_escaped_value
 // does (jsonb.c: JSON_TOKEN_NUMBER → numeric_in, output → numeric_out).
 func canonicalizeJSONBNumber(lit string) (string, error) {
-	body, err := pgnodes.NumericBodyFromText(lit)
+	body, err := nodes.NumericBodyFromText(lit)
 	if err != nil {
 		return "", err
 	}
-	return pgnodes.NumericTextFromBody(body)
+	return nodes.NumericTextFromBody(body)
 }
 
 // appendJSONBEscaped writes s as a JSON string literal using escape_json_char's

@@ -5,10 +5,10 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
-func planOne(t *testing.T, sql string, cat catalog.Catalog) planner.Node {
+func planOne(t *testing.T, sql string, cat catalog.Catalog) optimizer.Node {
 	t.Helper()
 	stmts, err := parser.Parse(sql)
 	if err != nil {
@@ -17,7 +17,7 @@ func planOne(t *testing.T, sql string, cat catalog.Catalog) planner.Node {
 	if len(stmts) != 1 {
 		t.Fatalf("Parse(%q): %d stmts", sql, len(stmts))
 	}
-	plan, err := planner.Plan(stmts[0], cat)
+	plan, err := optimizer.Plan(stmts[0], cat)
 	if err != nil {
 		t.Fatalf("Plan(%q): %v", sql, err)
 	}
@@ -83,11 +83,11 @@ func TestExecParamRef(t *testing.T) {
 // rows where the predicate is FALSE/NULL are dropped). Built by hand
 // because the planner's INSERT path doesn't emit this shape directly.
 func TestExecValuesProjectFilter(t *testing.T) {
-	values := &planner.Values{
-		Rows: [][]planner.Expr{
-			{&planner.IntegerConst{Value: 1}, &planner.IntegerConst{Value: 10}},
-			{&planner.IntegerConst{Value: 2}, &planner.IntegerConst{Value: 20}},
-			{&planner.IntegerConst{Value: 3}, &planner.IntegerConst{Value: 30}},
+	values := &optimizer.Values{
+		Rows: [][]optimizer.Expr{
+			{&optimizer.IntegerConst{Value: 1}, &optimizer.IntegerConst{Value: 10}},
+			{&optimizer.IntegerConst{Value: 2}, &optimizer.IntegerConst{Value: 20}},
+			{&optimizer.IntegerConst{Value: 3}, &optimizer.IntegerConst{Value: 30}},
 		},
 	}
 	op, err := Build(values)
@@ -106,14 +106,14 @@ func TestExecValuesProjectFilter(t *testing.T) {
 // TestExecLimitOffset verifies LIMIT and OFFSET apply correctly when
 // stacked on Values.
 func TestExecLimitOffset(t *testing.T) {
-	rowsExpr := func(n int64) []planner.Expr { return []planner.Expr{&planner.IntegerConst{Value: n}} }
-	values := &planner.Values{
-		Rows: [][]planner.Expr{rowsExpr(1), rowsExpr(2), rowsExpr(3), rowsExpr(4), rowsExpr(5)},
+	rowsExpr := func(n int64) []optimizer.Expr { return []optimizer.Expr{&optimizer.IntegerConst{Value: n}} }
+	values := &optimizer.Values{
+		Rows: [][]optimizer.Expr{rowsExpr(1), rowsExpr(2), rowsExpr(3), rowsExpr(4), rowsExpr(5)},
 	}
-	limit := &planner.Limit{
+	limit := &optimizer.Limit{
 		Child:  values,
-		Limit:  &planner.IntegerConst{Value: 2},
-		Offset: &planner.IntegerConst{Value: 1},
+		Limit:  &optimizer.IntegerConst{Value: 2},
+		Offset: &optimizer.IntegerConst{Value: 1},
 	}
 	op, _ := Build(limit)
 	rows, err := Run(op, NewContext())
@@ -130,13 +130,13 @@ func TestExecLimitOffset(t *testing.T) {
 
 // TestExecSort ascending/descending semantics on int columns.
 func TestExecSort(t *testing.T) {
-	rowsExpr := func(n int64) []planner.Expr { return []planner.Expr{&planner.IntegerConst{Value: n}} }
-	values := &planner.Values{
-		Rows: [][]planner.Expr{rowsExpr(3), rowsExpr(1), rowsExpr(4), rowsExpr(1), rowsExpr(5)},
+	rowsExpr := func(n int64) []optimizer.Expr { return []optimizer.Expr{&optimizer.IntegerConst{Value: n}} }
+	values := &optimizer.Values{
+		Rows: [][]optimizer.Expr{rowsExpr(3), rowsExpr(1), rowsExpr(4), rowsExpr(1), rowsExpr(5)},
 	}
-	sortDesc := &planner.Sort{
+	sortDesc := &optimizer.Sort{
 		Child: values,
-		Keys:  []planner.SortKey{{Expr: &planner.ColumnRef{Index: 0, Type: catalog.Type{Name: "int4"}}, Desc: true}},
+		Keys:  []optimizer.SortKey{{Expr: &optimizer.ColumnRef{Index: 0, Type: catalog.Type{Name: "int4"}}, Desc: true}},
 	}
 	op, _ := Build(sortDesc)
 	rows, err := Run(op, NewContext())
@@ -152,21 +152,21 @@ func TestExecSort(t *testing.T) {
 }
 
 func TestExecJoinVariants(t *testing.T) {
-	makeSide := func(vals ...int64) *planner.Values {
-		rows := make([][]planner.Expr, 0, len(vals))
+	makeSide := func(vals ...int64) *optimizer.Values {
+		rows := make([][]optimizer.Expr, 0, len(vals))
 		for _, v := range vals {
-			rows = append(rows, []planner.Expr{&planner.IntegerConst{Value: v}})
+			rows = append(rows, []optimizer.Expr{&optimizer.IntegerConst{Value: v}})
 		}
-		return &planner.Values{Rows: rows}
+		return &optimizer.Values{Rows: rows}
 	}
-	pred := &planner.BinaryOp{
+	pred := &optimizer.BinaryOp{
 		Op: parser.OpEq,
-		Left: &planner.ColumnRef{
+		Left: &optimizer.ColumnRef{
 			Index: 0,
 			Name:  "l",
 			Type:  catalog.Type{Name: "int4"},
 		},
-		Right: &planner.ColumnRef{
+		Right: &optimizer.ColumnRef{
 			Index: 1,
 			Name:  "r",
 			Type:  catalog.Type{Name: "int4"},
@@ -174,17 +174,17 @@ func TestExecJoinVariants(t *testing.T) {
 	}
 	tests := []struct {
 		name string
-		jt   planner.JoinType
+		jt   optimizer.JoinType
 		want []Row
 	}{
 		{
 			name: "inner",
-			jt:   planner.JoinTypeInner,
+			jt:   optimizer.JoinTypeInner,
 			want: []Row{{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 1}}},
 		},
 		{
 			name: "left",
-			jt:   planner.JoinTypeLeft,
+			jt:   optimizer.JoinTypeLeft,
 			want: []Row{
 				{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 1}},
 				{{Kind: KindInt, Int: 2}, NullDatum},
@@ -192,7 +192,7 @@ func TestExecJoinVariants(t *testing.T) {
 		},
 		{
 			name: "right",
-			jt:   planner.JoinTypeRight,
+			jt:   optimizer.JoinTypeRight,
 			want: []Row{
 				{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 1}},
 				{NullDatum, {Kind: KindInt, Int: 3}},
@@ -200,7 +200,7 @@ func TestExecJoinVariants(t *testing.T) {
 		},
 		{
 			name: "full",
-			jt:   planner.JoinTypeFull,
+			jt:   optimizer.JoinTypeFull,
 			want: []Row{
 				{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 1}},
 				{{Kind: KindInt, Int: 2}, NullDatum},
@@ -209,20 +209,20 @@ func TestExecJoinVariants(t *testing.T) {
 		},
 	}
 	for _, tc := range tests {
-		for _, algo := range []planner.JoinAlgo{planner.JoinAlgoNestedLoop, planner.JoinAlgoMerge} {
+		for _, algo := range []optimizer.JoinAlgo{optimizer.JoinAlgoNestedLoop, optimizer.JoinAlgoMerge} {
 			name := tc.name
-			plan := &planner.Join{
+			plan := &optimizer.Join{
 				Type:      tc.jt,
 				Algo:      algo,
 				Left:      makeSide(1, 2),
 				Right:     makeSide(1, 3),
 				Predicate: pred,
-				LeftKey: &planner.ColumnRef{
+				LeftKey: &optimizer.ColumnRef{
 					Index: 0,
 					Name:  "l",
 					Type:  catalog.Type{Name: "int4"},
 				},
-				RightKey: &planner.ColumnRef{
+				RightKey: &optimizer.ColumnRef{
 					Index: 1,
 					Name:  "r",
 					Type:  catalog.Type{Name: "int4"},
@@ -257,18 +257,18 @@ func TestExecJoinVariants(t *testing.T) {
 }
 
 func TestExecAggregateGroupBy(t *testing.T) {
-	child := &planner.Values{Rows: [][]planner.Expr{
-		{&planner.IntegerConst{Value: 1}, &planner.IntegerConst{Value: 10}},
-		{&planner.IntegerConst{Value: 1}, &planner.IntegerConst{Value: 20}},
-		{&planner.IntegerConst{Value: 2}, &planner.IntegerConst{Value: 5}},
+	child := &optimizer.Values{Rows: [][]optimizer.Expr{
+		{&optimizer.IntegerConst{Value: 1}, &optimizer.IntegerConst{Value: 10}},
+		{&optimizer.IntegerConst{Value: 1}, &optimizer.IntegerConst{Value: 20}},
+		{&optimizer.IntegerConst{Value: 2}, &optimizer.IntegerConst{Value: 5}},
 	}}
-	plan := &planner.Aggregate{
+	plan := &optimizer.Aggregate{
 		Child: child,
-		GroupExprs: []planner.Expr{
-			&planner.ColumnRef{Index: 0, Name: "k", Type: catalog.Type{Name: "int4"}},
+		GroupExprs: []optimizer.Expr{
+			&optimizer.ColumnRef{Index: 0, Name: "k", Type: catalog.Type{Name: "int4"}},
 		},
-		Aggs: []planner.AggregateCall{
-			{Name: "sum", Arg: &planner.ColumnRef{Index: 1, Name: "v", Type: catalog.Type{Name: "int4"}}, Type: catalog.Type{Name: "int8"}},
+		Aggs: []optimizer.AggregateCall{
+			{Name: "sum", Arg: &optimizer.ColumnRef{Index: 1, Name: "v", Type: catalog.Type{Name: "int4"}}, Type: catalog.Type{Name: "int8"}},
 			{Name: "count", Star: true, Type: catalog.Type{Name: "int8"}},
 		},
 	}
@@ -296,11 +296,11 @@ func TestExecAggregateGroupBy(t *testing.T) {
 }
 
 func TestExecAggregateGlobalEmptyInput(t *testing.T) {
-	plan := &planner.Aggregate{
-		Child: &planner.Values{Rows: nil},
-		Aggs: []planner.AggregateCall{
+	plan := &optimizer.Aggregate{
+		Child: &optimizer.Values{Rows: nil},
+		Aggs: []optimizer.AggregateCall{
 			{Name: "count", Star: true, Type: catalog.Type{Name: "int8"}},
-			{Name: "sum", Arg: &planner.ColumnRef{Index: 0, Name: "v", Type: catalog.Type{Name: "int4"}}, Type: catalog.Type{Name: "int8"}},
+			{Name: "sum", Arg: &optimizer.ColumnRef{Index: 0, Name: "v", Type: catalog.Type{Name: "int4"}}, Type: catalog.Type{Name: "int8"}},
 		},
 	}
 	op, err := Build(plan)
@@ -358,10 +358,10 @@ func TestExecDivisionByZero(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	plan, planErr := planner.Plan(stmts[0], catalog.NewInMemory())
+	plan, planErr := optimizer.Plan(stmts[0], catalog.NewInMemory())
 	if planErr != nil {
 		// Plan-time failure: check for SQLSTATE 22012.
-		pe, ok := planErr.(*planner.PlanError)
+		pe, ok := planErr.(*optimizer.PlanError)
 		if !ok || pe.Code != "22012" {
 			t.Errorf("planErr=%v, want *PlanError{Code:\"22012\"}", planErr)
 		}

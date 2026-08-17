@@ -1,6 +1,6 @@
 package executor
 
-import "github.com/goopg/goopg/internal/planner"
+import "github.com/goopg/goopg/internal/optimizer"
 
 // Streaming LATERAL join — M0127-P4.4 (design leftdeep-joins/07 §4, the last
 // row of the P4 table).
@@ -50,13 +50,19 @@ const (
 type lateralJoinStream struct {
 	o *joinOp
 
-	// Exactly one correlation mechanism is live per stream:
-	//   - bindable != nil: the right child is a set-returning function that
-	//     takes the outer tuple directly (pg_get_publication_tables & co.,
-	//     M0103-0008). outerSlot is the slot it was handed at Open; its `row`
-	//     field is repointed per outer tuple.
-	//   - bindable == nil: the general path, which pushes the outer tuple onto
-	//     ctx.OuterRows so OuterColumnRef (level=1) resolves against it.
+	// The two correlation mechanisms are ORTHOGONAL and both install whenever
+	// they can, rather than being mutually exclusive:
+	//   - bindable != nil: the right child accepts the outer tuple through the
+	//     slot it was handed at Open (a FROM-clause SRF — pg_get_publication_tables
+	//     & co., M0103-0008 — or, on the BuildFast path, the opNodeOperator bridge
+	//     that forwards to one). outerSlot is that slot; its `row` field is
+	//     repointed per outer tuple, which carries same-level ColumnRef args.
+	//   - ctx.OuterRows push (whenever ctx != nil): the outer tuple is ALSO pushed
+	//     onto ctx.OuterRows so OuterColumnRef (level>=1) resolves against it —
+	//     e.g. a LATERAL aggregate over generate_series whose aggregate expression
+	//     references the outer row (M0134-0001). A lateralBindable SRF whose args
+	//     are all same-level ColumnRef never reads ctx.OuterRows, so both can
+	//     install without interfering.
 	bindable  lateralBindable
 	outerSlot *MaterializedSlot
 
@@ -97,7 +103,7 @@ func (o *joinOp) openLateral(ctx *Context) error {
 	m := &lateralJoinStream{
 		o:         o,
 		rw:        len(o.right.Schema()),
-		fillOuter: o.plan.Type == planner.JoinTypeLeft,
+		fillOuter: o.plan.Type == optimizer.JoinTypeLeft,
 	}
 	if bindable, ok := o.right.(lateralBindable); ok {
 		m.bindable = bindable
@@ -280,12 +286,14 @@ func (m *lateralJoinStream) closeRight() {
 // resolve against this join's outer tuple.
 func (m *lateralJoinStream) bindOuter() {
 	if m.bindable != nil {
-		// The SRF path never touches ctx: the outer tuple travels through the
-		// slot the child was handed at Open. Repointing per call (rather than
-		// per outer tuple) is required because outerRow's backing array moves
-		// when it grows.
+		// The SRF slot bind and the ctx.OuterRows push are ADDITIONS, not
+		// alternatives: the slot carries same-level ColumnRef args for a
+		// lateralBindable right child, while ctx.OuterRows carries
+		// OuterColumnRef (level>=1) — which a BuildFast-wrapped right child can
+		// need even when bindable is set (M0134-0001). Repointing per call
+		// (rather than per outer tuple) is required because outerRow's backing
+		// array moves when it grows.
 		m.outerSlot.row = m.outerRow
-		return
 	}
 	ctx := m.o.ctx
 	if ctx == nil {
@@ -299,9 +307,6 @@ func (m *lateralJoinStream) bindOuter() {
 // unbindOuter removes what bindOuter installed, carrying the right side's CTE
 // materialisations forward to the next call for the SAME outer tuple.
 func (m *lateralJoinStream) unbindOuter() {
-	if m.bindable != nil {
-		return
-	}
 	ctx := m.o.ctx
 	if ctx == nil {
 		return

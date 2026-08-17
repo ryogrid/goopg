@@ -5,7 +5,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // seedItems fills the items table with three rows so DML tests have a
@@ -14,13 +14,13 @@ func seedItems(t *testing.T, ctx *Context, tbl *catalog.Table) {
 	t.Helper()
 	// M0129-S8.3: advance the command counter between statements.
 	advanceStmtCounter(ctx)
-	in := &planner.Insert{
+	in := &optimizer.Insert{
 		Table: tbl,
-		Source: &planner.Values{
-			Rows: [][]planner.Expr{
-				{&planner.IntegerConst{Value: 1}, &planner.StringConst{Value: "alpha"}},
-				{&planner.IntegerConst{Value: 2}, &planner.StringConst{Value: "beta"}},
-				{&planner.IntegerConst{Value: 3}, &planner.StringConst{Value: "gamma"}},
+		Source: &optimizer.Values{
+			Rows: [][]optimizer.Expr{
+				{&optimizer.IntegerConst{Value: 1}, &optimizer.StringConst{Value: "alpha"}},
+				{&optimizer.IntegerConst{Value: 2}, &optimizer.StringConst{Value: "beta"}},
+				{&optimizer.IntegerConst{Value: 3}, &optimizer.StringConst{Value: "gamma"}},
 			},
 		},
 		ColumnIndex: []int{0, 1},
@@ -52,17 +52,17 @@ func TestUpdateRewritesMatchingRows(t *testing.T) {
 	advanceStmtCounter(ctx)
 
 	// UPDATE items SET label = 'updated' WHERE id = 2
-	upd := &planner.Update{
+	upd := &optimizer.Update{
 		Table: tbl,
-		Child: &planner.Filter{
-			Child: &planner.SeqScan{Table: tbl},
-			Predicate: &planner.BinaryOp{
+		Child: &optimizer.Filter{
+			Child: &optimizer.SeqScan{Table: tbl},
+			Predicate: &optimizer.BinaryOp{
 				Op: parser.OpEq,
-				Left:  &planner.ColumnRef{Index: 0, Name: "id", Type: catalog.Type{Name: "int4"}},
-				Right: &planner.IntegerConst{Value: 2},
+				Left:  &optimizer.ColumnRef{Index: 0, Name: "id", Type: catalog.Type{Name: "int4"}},
+				Right: &optimizer.IntegerConst{Value: 2},
 			},
 		},
-		Set: []planner.Expr{nil, &planner.StringConst{Value: "updated"}},
+		Set: []optimizer.Expr{nil, &optimizer.StringConst{Value: "updated"}},
 	}
 	op, err := Build(upd)
 	if err != nil {
@@ -85,7 +85,7 @@ func TestUpdateRewritesMatchingRows(t *testing.T) {
 	// new id=2 updated. The old id=2 beta is invisible because its
 	// xmax = ctx.Tx.XID (TupleVisible's "deleted by current xact"
 	// branch returns false).
-	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: tbl})
 	_ = scan.Open(ctx)
 	defer scan.Close()
 	rows, err := drainScan(scan)
@@ -119,14 +119,14 @@ func TestDeleteStampsXmax(t *testing.T) {
 	advanceStmtCounter(ctx)
 
 	// DELETE FROM items WHERE id = 2
-	del := &planner.Delete{
+	del := &optimizer.Delete{
 		Table: tbl,
-		Child: &planner.Filter{
-			Child: &planner.SeqScan{Table: tbl},
-			Predicate: &planner.BinaryOp{
+		Child: &optimizer.Filter{
+			Child: &optimizer.SeqScan{Table: tbl},
+			Predicate: &optimizer.BinaryOp{
 				Op: parser.OpEq,
-				Left:  &planner.ColumnRef{Index: 0, Name: "id", Type: catalog.Type{Name: "int4"}},
-				Right: &planner.IntegerConst{Value: 2},
+				Left:  &optimizer.ColumnRef{Index: 0, Name: "id", Type: catalog.Type{Name: "int4"}},
+				Right: &optimizer.IntegerConst{Value: 2},
 			},
 		},
 	}
@@ -143,7 +143,7 @@ func TestDeleteStampsXmax(t *testing.T) {
 	}
 	_ = op.Close()
 
-	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: tbl})
 	_ = scan.Open(ctx)
 	defer scan.Close()
 	rows, err := drainScan(scan)
@@ -171,9 +171,9 @@ func TestDeleteAllRowsWithoutPredicate(t *testing.T) {
 	// M0129-S8.3: advance the command counter so the DELETE sees the seed rows.
 	advanceStmtCounter(ctx)
 
-	del := &planner.Delete{
+	del := &optimizer.Delete{
 		Table: tbl,
-		Child: &planner.SeqScan{Table: tbl},
+		Child: &optimizer.SeqScan{Table: tbl},
 	}
 	op, _ := Build(del)
 	_ = op.Open(ctx)
@@ -183,7 +183,7 @@ func TestDeleteAllRowsWithoutPredicate(t *testing.T) {
 	}
 	_ = op.Close()
 
-	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: tbl})
 	_ = scan.Open(ctx)
 	defer scan.Close()
 	rows, _ := drainScan(scan)
@@ -217,7 +217,7 @@ func TestUpdateViaIndexScanPath(t *testing.T) {
 	}
 	// M0129-S8.3: advance the command counter so the scan sees the UPDATE's new tuples.
 	advanceStmtCounter(ctx)
-	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: tbl})
 	_ = scan.Open(ctx)
 	defer scan.Close()
 	rows, err := drainScan(scan)
@@ -250,34 +250,34 @@ func TestDMLRequiresTablePrivilege(t *testing.T) {
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
 	seedItems(t, ctx, tbl)
 
-	insertStmt := func() *planner.Insert {
-		return &planner.Insert{
+	insertStmt := func() *optimizer.Insert {
+		return &optimizer.Insert{
 			Table:       tbl,
-			Source:      &planner.Values{Rows: [][]planner.Expr{{&planner.IntegerConst{Value: 4}, &planner.StringConst{Value: "delta"}}}},
+			Source:      &optimizer.Values{Rows: [][]optimizer.Expr{{&optimizer.IntegerConst{Value: 4}, &optimizer.StringConst{Value: "delta"}}}},
 			ColumnIndex: []int{0, 1},
 		}
 	}
-	updateStmt := func() *planner.Update {
-		return &planner.Update{
+	updateStmt := func() *optimizer.Update {
+		return &optimizer.Update{
 			Table: tbl,
-			Child: &planner.Filter{
-				Child:     &planner.SeqScan{Table: tbl},
-				Predicate: &planner.BinaryOp{Op: parser.OpEq, Left: &planner.ColumnRef{Index: 0, Name: "id", Type: catalog.Type{Name: "int4"}}, Right: &planner.IntegerConst{Value: 1}},
+			Child: &optimizer.Filter{
+				Child:     &optimizer.SeqScan{Table: tbl},
+				Predicate: &optimizer.BinaryOp{Op: parser.OpEq, Left: &optimizer.ColumnRef{Index: 0, Name: "id", Type: catalog.Type{Name: "int4"}}, Right: &optimizer.IntegerConst{Value: 1}},
 			},
-			Set: []planner.Expr{nil, &planner.StringConst{Value: "updated"}},
+			Set: []optimizer.Expr{nil, &optimizer.StringConst{Value: "updated"}},
 		}
 	}
-	deleteStmt := func() *planner.Delete {
-		return &planner.Delete{
+	deleteStmt := func() *optimizer.Delete {
+		return &optimizer.Delete{
 			Table: tbl,
-			Child: &planner.Filter{
-				Child:     &planner.SeqScan{Table: tbl},
-				Predicate: &planner.BinaryOp{Op: parser.OpEq, Left: &planner.ColumnRef{Index: 0, Name: "id", Type: catalog.Type{Name: "int4"}}, Right: &planner.IntegerConst{Value: 1}},
+			Child: &optimizer.Filter{
+				Child:     &optimizer.SeqScan{Table: tbl},
+				Predicate: &optimizer.BinaryOp{Op: parser.OpEq, Left: &optimizer.ColumnRef{Index: 0, Name: "id", Type: catalog.Type{Name: "int4"}}, Right: &optimizer.IntegerConst{Value: 1}},
 			},
 		}
 	}
 
-	assertDenied := func(t *testing.T, plan planner.Node, priv string) {
+	assertDenied := func(t *testing.T, plan optimizer.Node, priv string) {
 		t.Helper()
 		op, err := Build(plan)
 		if err != nil {
@@ -289,7 +289,7 @@ func TestDMLRequiresTablePrivilege(t *testing.T) {
 			t.Fatalf("%s: expected 42501 permission-denied, got %#v", priv, err)
 		}
 	}
-	assertAllowed := func(t *testing.T, plan planner.Node, priv string) {
+	assertAllowed := func(t *testing.T, plan optimizer.Node, priv string) {
 		t.Helper()
 		op, err := Build(plan)
 		if err != nil {
@@ -345,7 +345,7 @@ func TestSeqScanRequiresSelectPrivilege(t *testing.T) {
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
 	seedItems(t, ctx, tbl)
 
-	scanStmt := func() *planner.SeqScan { return &planner.SeqScan{Table: tbl} }
+	scanStmt := func() *optimizer.SeqScan { return &optimizer.SeqScan{Table: tbl} }
 
 	assertDenied := func(t *testing.T) {
 		t.Helper()
@@ -402,13 +402,13 @@ func TestIndexScansRequireSelectPrivilege(t *testing.T) {
 	if dmlPrivilegePermitted(ctx, tbl, "SELECT") {
 		t.Fatal("expected SELECT denied with no grant")
 	}
-	idxOp := &indexScanOp{plan: &planner.IndexScan{Table: tbl}}
+	idxOp := &indexScanOp{plan: &optimizer.IndexScan{Table: tbl}}
 	if err := idxOp.openPrep(ctx); err == nil {
 		t.Fatal("indexScanOp.openPrep: expected 42501, got nil")
 	} else if ee, ok := err.(*ExecError); !ok || ee.Code != "42501" {
 		t.Fatalf("indexScanOp.openPrep: expected 42501, got %#v", err)
 	}
-	ionOp := &indexOnlyScanOp{plan: &planner.IndexOnlyScan{Table: tbl}}
+	ionOp := &indexOnlyScanOp{plan: &optimizer.IndexOnlyScan{Table: tbl}}
 	if err := ionOp.Open(ctx); err == nil {
 		t.Fatal("indexOnlyScanOp.Open: expected 42501, got nil")
 	} else if ee, ok := err.(*ExecError); !ok || ee.Code != "42501" {
@@ -452,13 +452,13 @@ func TestScanOperatorsUseViewOwnerPrivilegeOverride(t *testing.T) {
 	// owner nor a grantee must be denied regardless of the querying
 	// session's own privileges — proves checkRole REPLACES the querying
 	// role rather than merely supplementing it.
-	idxOpDenied := &indexScanOp{plan: &planner.IndexScan{Table: tbl, PrivilegeCheckRole: "carol", PrivilegeCheckRoleSet: true}}
+	idxOpDenied := &indexScanOp{plan: &optimizer.IndexScan{Table: tbl, PrivilegeCheckRole: "carol", PrivilegeCheckRoleSet: true}}
 	if err := idxOpDenied.openPrep(ctx); err == nil {
 		t.Fatal("indexScanOp.openPrep: expected 42501 for untagged non-owner role, got nil")
 	} else if ee, ok := err.(*ExecError); !ok || ee.Code != "42501" {
 		t.Fatalf("indexScanOp.openPrep: expected 42501, got %#v", err)
 	}
-	ionOpDenied := &indexOnlyScanOp{plan: &planner.IndexOnlyScan{Table: tbl, PrivilegeCheckRole: "carol", PrivilegeCheckRoleSet: true}}
+	ionOpDenied := &indexOnlyScanOp{plan: &optimizer.IndexOnlyScan{Table: tbl, PrivilegeCheckRole: "carol", PrivilegeCheckRoleSet: true}}
 	if err := ionOpDenied.Open(ctx); err == nil {
 		t.Fatal("indexOnlyScanOp.Open: expected 42501 for untagged non-owner role, got nil")
 	} else if ee, ok := err.(*ExecError); !ok || ee.Code != "42501" {

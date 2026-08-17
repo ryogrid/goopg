@@ -60,6 +60,66 @@ func TestNamedCheckPropagatesThroughLikeConstraints(t *testing.T) {
 	}
 }
 
+// TestColumnLevelCheckPreservesExplicitName verifies that an inline
+// column-level CHECK declared with an explicit `CONSTRAINT <name>` prefix
+// (`a int CONSTRAINT con1 CHECK (a > 0)`) is stored under that user-given
+// name instead of the auto-generated `<table>_<col>_check`, matching PG's
+// transformCheckConstraints (parse_utilcmd.c: Constraint->conname carried
+// verbatim; ChooseConstraintName in heap.c only auto-names when conname is
+// NULL). A later `ALTER TABLE ... RENAME CONSTRAINT con1 TO ...` must find
+// it. The anonymous form must still fall back to the auto-name. M0134-0002
+// slice S02.
+func TestColumnLevelCheckPreservesExplicitName(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE cln_named (a int CONSTRAINT con1 CHECK (a > 0))`); err != nil {
+		t.Fatalf("CREATE TABLE cln_named: %v", err)
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "cln_named"})
+	if !ok {
+		t.Fatal("cln_named table not found")
+	}
+	if len(tbl.NamedChecks) != 1 || tbl.NamedChecks[0].Name != "con1" {
+		t.Fatalf("expected NamedChecks[0].Name=con1, got %+v", tbl.NamedChecks)
+	}
+	// The auto-name must NOT also be present.
+	for _, nc := range tbl.NamedChecks {
+		if nc.Name == "cln_named_a_check" {
+			t.Errorf("column CHECK kept the auto-name %q despite an explicit CONSTRAINT name", nc.Name)
+		}
+	}
+
+	// RENAME CONSTRAINT must find the user-given name.
+	if err := runDDL(t, ctx, `ALTER TABLE cln_named RENAME CONSTRAINT con1 TO con2`); err != nil {
+		t.Fatalf("RENAME CONSTRAINT con1 TO con2: %v", err)
+	}
+	found := false
+	for _, nc := range tbl.NamedChecks {
+		if nc.Name == "con2" {
+			found = true
+		}
+		if nc.Name == "con1" {
+			t.Errorf("old name con1 still present after rename: %+v", tbl.NamedChecks)
+		}
+	}
+	if !found {
+		t.Fatalf("NamedChecks after rename = %+v, want con2", tbl.NamedChecks)
+	}
+
+	// The anonymous form is unaffected: it keeps the auto-generated name.
+	if err := runDDL(t, ctx, `CREATE TABLE cln_anon (a int CHECK (a > 0))`); err != nil {
+		t.Fatalf("CREATE TABLE cln_anon: %v", err)
+	}
+	anonTbl, ok := cat.LookupTable(parser.ObjectName{Name: "cln_anon"})
+	if !ok {
+		t.Fatal("cln_anon table not found")
+	}
+	if len(anonTbl.NamedChecks) != 1 || anonTbl.NamedChecks[0].Name != "cln_anon_a_check" {
+		t.Fatalf("anonymous column CHECK: NamedChecks=%+v, want [cln_anon_a_check]", anonTbl.NamedChecks)
+	}
+}
+
 // TestAlterTableSetDropNotNull verifies that `ALTER TABLE ... ALTER COLUMN c
 // SET NOT NULL` marks the column NOT NULL AND records a contype='n' constraint
 // (catalog.Table.AddNotNull, conislocal=true), and that `DROP NOT NULL` clears
@@ -397,6 +457,76 @@ func TestAlterTableAddNotNullNamed(t *testing.T) {
 	}
 	if ee, ok := err.(*ExecError); !ok || ee.Code != "42703" {
 		t.Errorf("missing column: err=%v want SQLSTATE 42703", err)
+	}
+}
+
+// TestAlterTableAddNotNullNotValid verifies the PG18 `ADD CONSTRAINT name NOT
+// NULL col NOT VALID` trailer (alter_table.sql:915 `ALTER TABLE atnnparted ADD
+// CONSTRAINT dummy_constr NOT NULL id NOT VALID`): the constraint is recorded
+// with convalidated='f' in pg_constraint (psql renders the trailing ` NOT
+// VALID`), and `VALIDATE CONSTRAINT name` flips it back to 't' (re-renders
+// without ` NOT VALID`). PG excludes CONSTR_NOTNULL from the Phase-3 pre-scan
+// (ATExecValidateConstraint, tablecmds.c:9956), so the flip is the whole
+// behavior — no row scan. M0134-0002 C2 slice 10.
+func TestAlterTableAddNotNullNotValid(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE atnnparted (id int, col1 int)`); err != nil {
+		t.Fatalf("CREATE TABLE atnnparted: %v", err)
+	}
+	if err := runDDL(t, ctx, `ALTER TABLE atnnparted ADD CONSTRAINT dummy_constr NOT NULL id NOT VALID`); err != nil {
+		t.Fatalf("ADD CONSTRAINT dummy_constr NOT NULL id NOT VALID: %v", err)
+	}
+
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "atnnparted"})
+	if !ok {
+		t.Fatal("atnnparted table not found")
+	}
+	if len(tbl.NotNullConstraints) != 1 || tbl.NotNullConstraints[0].Name != "dummy_constr" {
+		t.Fatalf("expected 1 NOT NULL constraint dummy_constr, got %+v", tbl.NotNullConstraints)
+	}
+	if !tbl.NotNullConstraints[0].NotValid {
+		t.Fatalf("expected NotNullConstraints[0].NotValid=true, got %+v", tbl.NotNullConstraints[0])
+	}
+
+	pgcon, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_constraint"})
+	if !ok || pgcon.VirtualRows == nil {
+		t.Fatal("pg_constraint virtual table not found")
+	}
+	// PGConstraintRowsForDBOid re-reads the live in-memory catalog on every
+	// call, so re-invoking VirtualRows after VALIDATE observes the flip.
+	convalidated := func() string {
+		for _, r := range pgcon.VirtualRows() {
+			if r[3] == "n" && r[1] == "dummy_constr" {
+				return r[6]
+			}
+		}
+		return ""
+	}
+	if got := convalidated(); got != "f" {
+		t.Errorf("convalidated after ADD ... NOT VALID = %q, want f", got)
+	}
+
+	// VALIDATE CONSTRAINT flips convalidated back to 't'; psql's \d+ then
+	// re-renders the constraint without the ` NOT VALID` suffix (alter_table.sql:922).
+	if err := runDDL(t, ctx, `ALTER TABLE atnnparted VALIDATE CONSTRAINT dummy_constr`); err != nil {
+		t.Fatalf("ALTER TABLE atnnparted VALIDATE CONSTRAINT dummy_constr: %v", err)
+	}
+	if tbl.NotNullConstraints[0].NotValid {
+		t.Errorf("NotValid still true after VALIDATE CONSTRAINT")
+	}
+	if got := convalidated(); got != "t" {
+		t.Errorf("convalidated after VALIDATE = %q, want t", got)
+	}
+
+	// An unknown name still raises 42704.
+	err := runDDL(t, ctx, `ALTER TABLE atnnparted VALIDATE CONSTRAINT no_such_constraint`)
+	if err == nil {
+		t.Fatal("VALIDATE CONSTRAINT on a missing name should error")
+	}
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42704" {
+		t.Errorf("missing constraint: err=%v want SQLSTATE 42704", err)
 	}
 }
 

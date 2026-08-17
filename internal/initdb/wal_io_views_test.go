@@ -7,7 +7,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // TestStatWALIOEmptyWithoutWriter: registering the view with a
@@ -34,7 +34,7 @@ func TestStatWALIOEmptyWithoutWriter(t *testing.T) {
 // columns reflect the live counters.
 func TestStatWALIORendersWriterCounters(t *testing.T) {
 	walDir := filepath.Join(t.TempDir(), "pg_wal")
-	w, err := wal.NewWriter(wal.Config{
+	w, err := xlog.NewWriter(xlog.Config{
 		WALDir:             walDir,
 		SegmentSize:        4096,
 		SenderMemoryBuffer: 1 << 16,
@@ -87,7 +87,7 @@ func TestStatWALIORendersWriterCounters(t *testing.T) {
 func TestStatWALIOPreallocationCounters(t *testing.T) {
 	t.Run("preallocate-on", func(t *testing.T) {
 		const segSize = 8192
-		w, err := wal.NewWriter(wal.Config{
+		w, err := xlog.NewWriter(xlog.Config{
 			WALDir:      filepath.Join(t.TempDir(), "pg_wal"),
 			SegmentSize: segSize,
 			Preallocate: true,
@@ -113,7 +113,7 @@ func TestStatWALIOPreallocationCounters(t *testing.T) {
 		}
 	})
 	t.Run("preallocate-off", func(t *testing.T) {
-		w, err := wal.NewWriter(wal.Config{
+		w, err := xlog.NewWriter(xlog.Config{
 			WALDir:      filepath.Join(t.TempDir(), "pg_wal"),
 			SegmentSize: 8192,
 		})
@@ -145,7 +145,7 @@ func TestStatWALIOPreallocationCounters(t *testing.T) {
 // default writer reports `pgcompat` too.
 func TestStatWALIOFormatVersionColumn(t *testing.T) {
 	t.Run("default_config", func(t *testing.T) {
-		w, err := wal.NewWriter(wal.Config{
+		w, err := xlog.NewWriter(xlog.Config{
 			WALDir:      filepath.Join(t.TempDir(), "pg_wal"),
 			SegmentSize: 4096,
 		})
@@ -165,7 +165,7 @@ func TestStatWALIOFormatVersionColumn(t *testing.T) {
 		}
 	})
 	t.Run("pgcompat", func(t *testing.T) {
-		w, err := wal.NewWriter(wal.Config{
+		w, err := xlog.NewWriter(xlog.Config{
 			WALDir:      filepath.Join(t.TempDir(), "pg_wal"),
 			SegmentSize: 4096,
 			PageHeaders: true,

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/testutil/cluster"
 )
 
@@ -63,20 +63,20 @@ func TestNLIResultParityVsHashJoin(t *testing.T) {
 	const q = `SELECT k, payload FROM small, indexed WHERE k = id ORDER BY k, payload`
 
 	// First run with NLI on (default).
-	planner.SetNLIEnabled(true)
-	defer planner.SetNLIEnabled(true)
+	optimizer.SetNLIEnabled(true)
+	defer optimizer.SetNLIEnabled(true)
 	rowsNLI, err := c.Query(ctx, q)
 	if err != nil {
 		t.Fatalf("query (NLI on): %v", err)
 	}
 
 	// Then run with NLI off — Hash join path.
-	planner.SetNLIEnabled(false)
+	optimizer.SetNLIEnabled(false)
 	rowsHash, err := c.Query(ctx, q)
 	if err != nil {
 		t.Fatalf("query (NLI off): %v", err)
 	}
-	planner.SetNLIEnabled(true)
+	optimizer.SetNLIEnabled(true)
 
 	if len(rowsNLI) != len(rowsHash) {
 		t.Fatalf("row count differs: NLI=%d Hash=%d", len(rowsNLI), len(rowsHash))
@@ -157,19 +157,19 @@ func TestNLIResultParityCompositeKey(t *testing.T) {
 		WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey
 		ORDER BY l_partkey, l_suppkey`
 
-	planner.SetNLIEnabled(true)
-	defer planner.SetNLIEnabled(true)
+	optimizer.SetNLIEnabled(true)
+	defer optimizer.SetNLIEnabled(true)
 	rowsNLI, err := c.Query(ctx, q)
 	if err != nil {
 		t.Fatalf("query (NLI on, composite key): %v", err)
 	}
 
-	planner.SetNLIEnabled(false)
+	optimizer.SetNLIEnabled(false)
 	rowsHash, err := c.Query(ctx, q)
 	if err != nil {
 		t.Fatalf("query (NLI off, composite key): %v", err)
 	}
-	planner.SetNLIEnabled(true)
+	optimizer.SetNLIEnabled(true)
 
 	if len(rowsNLI) != len(rowsHash) {
 		t.Fatalf("row count differs: NLI=%d Hash=%d", len(rowsNLI), len(rowsHash))

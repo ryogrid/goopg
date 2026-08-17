@@ -3,7 +3,7 @@ package executor
 import (
 	"testing"
 
-	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/storage/lmgr"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -21,7 +21,7 @@ func TestSelectLocksLeafPartitionIndexes(t *testing.T) {
 
 	// Explicit-transaction backend so the AccessShare scan locks are held to
 	// end-of-transaction (acquireScanReadLockTxn is transient in autocommit).
-	const backend lockmgr.BackendID = 91002
+	const backend lmgr.BackendID = 91002
 	ctx.TxnLockBackendID = backend
 	defer tableLockMgr.ReleaseAll(backend)
 
@@ -61,7 +61,7 @@ func TestSelectLocksLeafPartitionIndexes(t *testing.T) {
 
 	held := make(map[uint32]bool)
 	for _, h := range tableLockMgr.AllLocks() {
-		if h.Backend == backend && h.Granted && h.Mode == lockmgr.AccessShareLock &&
+		if h.Backend == backend && h.Granted && h.Mode == lmgr.AccessShareLock &&
 			h.Tag.Block == 0 && h.Tag.Offset == 0 {
 			held[h.Tag.Rel] = true
 		}
@@ -96,7 +96,7 @@ func TestDropIndexLocksIndexRelationTree(t *testing.T) {
 
 	// An explicit-transaction backend so acquireDDLLockTxn takes real locks
 	// (it is a no-op when TxnLockBackendID==0, i.e. autocommit).
-	const backend lockmgr.BackendID = 91001
+	const backend lmgr.BackendID = 91001
 	ctx.TxnLockBackendID = backend
 	defer tableLockMgr.ReleaseAll(backend)
 
@@ -134,7 +134,7 @@ func TestDropIndexLocksIndexRelationTree(t *testing.T) {
 	// catalog mutation — they are keyed by OID and released at COMMIT/ROLLBACK).
 	held := make(map[uint32]bool)
 	for _, h := range tableLockMgr.AllLocks() {
-		if h.Backend == backend && h.Granted && h.Mode == lockmgr.AccessExclusiveLock &&
+		if h.Backend == backend && h.Granted && h.Mode == lmgr.AccessExclusiveLock &&
 			h.Tag.Block == 0 && h.Tag.Offset == 0 {
 			held[h.Tag.Rel] = true
 		}

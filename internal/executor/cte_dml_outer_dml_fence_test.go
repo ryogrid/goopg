@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // M0125-0052 — an outer INSERT/UPDATE/DELETE must not see the rows its own
@@ -47,7 +47,7 @@ func runDMLRows(t *testing.T, ctx *Context, sql string) []Row {
 	if err != nil {
 		t.Fatalf("Parse(%q): %v", sql, err)
 	}
-	plan, err := planner.Plan(stmts[0], ctx.Catalog)
+	plan, err := optimizer.Plan(stmts[0], ctx.Catalog)
 	if err != nil {
 		t.Fatalf("Plan(%q): %v", sql, err)
 	}

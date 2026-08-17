@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // Stage S0-1 (design bundle correlated-subquery-planning, ch.06 §6):
@@ -83,8 +83,8 @@ func assertNoOpaqueExpr(t *testing.T, plan string) {
 // conversion now claims.
 func pinCorrelatedSubPlanPath(t *testing.T) {
 	t.Helper()
-	planner.SetExistsToAnyEnabled(false)
-	t.Cleanup(func() { planner.SetExistsToAnyEnabled(true) })
+	optimizer.SetExistsToAnyEnabled(false)
+	t.Cleanup(func() { optimizer.SetExistsToAnyEnabled(true) })
 }
 
 func TestExplainSubPlanCorrelatedExists(t *testing.T) {
@@ -153,29 +153,29 @@ func TestExplainSubPlanCorrelatedScalar(t *testing.T) {
 // pull-up loop (OR, NOT, CASE inside WHERE) trips the live
 // non-termination bug F1, which stage S1a fixes.
 func TestFormatInExprSubPlanForms(t *testing.T) {
-	operand := &planner.ColumnRef{Name: "b"}
-	inner := &planner.SeqScan{}
+	operand := &optimizer.ColumnRef{Name: "b"}
+	inner := &optimizer.SeqScan{}
 
 	cases := []struct {
 		name string
-		expr *planner.InExpr
+		expr *optimizer.InExpr
 		want string
 	}{
 		{
 			name: "in subquery",
-			expr: &planner.InExpr{Operand: operand, Plan: inner},
+			expr: &optimizer.InExpr{Operand: operand, Plan: inner},
 			want: "(b = ANY (SubPlan 1))",
 		},
 		{
 			name: "not in subquery",
-			expr: &planner.InExpr{Operand: operand, Plan: inner, Negated: true},
+			expr: &optimizer.InExpr{Operand: operand, Plan: inner, Negated: true},
 			want: "(NOT (b = ANY (SubPlan 1)))",
 		},
 		{
 			name: "literal list",
-			expr: &planner.InExpr{Operand: operand, List: []planner.Expr{
-				&planner.IntegerConst{Value: 3},
-				&planner.IntegerConst{Value: 5},
+			expr: &optimizer.InExpr{Operand: operand, List: []optimizer.Expr{
+				&optimizer.IntegerConst{Value: 3},
+				&optimizer.IntegerConst{Value: 5},
 			}},
 			want: "(b = ANY (3, 5))",
 		},
@@ -197,7 +197,7 @@ func TestFormatInExprSubPlanForms(t *testing.T) {
 // TestSubPlanRegNilSafe: the registry is optional — formatExprPG
 // (no registry) must not panic on a sublink.
 func TestSubPlanRegNilSafe(t *testing.T) {
-	e := &planner.ExistsExpr{Plan: &planner.SeqScan{}}
+	e := &optimizer.ExistsExpr{Plan: &optimizer.SeqScan{}}
 	if got := formatExprPG(e); !strings.Contains(got, "SubPlan") {
 		t.Errorf("nil-registry render = %q, want it to mention SubPlan", got)
 	}
@@ -256,8 +256,8 @@ func TestExplainSemiAntiJoinLabels(t *testing.T) {
 	if strings.Contains(semi, "(?)") {
 		t.Errorf("join type rendered as `(?)`:\n%s", semi)
 	}
-	if !strings.Contains(semi, "SEMI") {
-		t.Errorf("correlated IN did not produce a SEMI join label:\n%s", semi)
+	if !strings.Contains(semi, "Semi Join") {
+		t.Errorf("correlated IN did not produce a Semi Join label:\n%s", semi)
 	}
 
 	// A non-correlated NOT IN unnests to a null-aware anti join, and
@@ -268,20 +268,37 @@ func TestExplainSemiAntiJoinLabels(t *testing.T) {
 	if strings.Contains(anti, "(?)") {
 		t.Errorf("join type rendered as `(?)`:\n%s", anti)
 	}
-	if !strings.Contains(anti, "ANTI") {
-		t.Errorf("non-correlated NOT IN did not produce an ANTI join label:\n%s", anti)
+	if !strings.Contains(anti, "Anti Join") {
+		t.Errorf("non-correlated NOT IN did not produce an Anti Join label:\n%s", anti)
 	}
 	assertNoOpaqueExpr(t, anti)
 }
 
 // TestJoinTypeNameSemiAnti pins the label strings directly, so the
 // mapping survives even if no planner path currently produces them.
-func TestJoinTypeNameSemiAnti(t *testing.T) {
-	if got := joinTypeName(planner.JoinTypeSemi); got != "SEMI" {
-		t.Errorf("JoinTypeSemi label = %q, want SEMI", got)
+// TestJoinLabelPinsPGLabels pins the label mapping directly, so the
+// rule survives even if no planner path currently produces a given
+// (algo, join type) pair. Spellings match PG 18.3 explain.c:1712-1763.
+func TestJoinLabelPinsPGLabels(t *testing.T) {
+	cases := []struct {
+		algo string
+		typ  optimizer.JoinType
+		want string
+	}{
+		{"Nested Loop", optimizer.JoinTypeInner, "Nested Loop"},
+		{"Hash", optimizer.JoinTypeInner, "Hash Join"},
+		{"Merge", optimizer.JoinTypeInner, "Merge Join"},
+		{"Nested Loop", optimizer.JoinTypeCross, "Nested Loop"},
+		{"Hash", optimizer.JoinTypeLeft, "Hash Left Join"},
+		{"Merge", optimizer.JoinTypeRight, "Merge Right Join"},
+		{"Nested Loop", optimizer.JoinTypeFull, "Nested Loop Full Join"},
+		{"Nested Loop", optimizer.JoinTypeSemi, "Nested Loop Semi Join"},
+		{"Hash", optimizer.JoinTypeAnti, "Hash Anti Join"},
 	}
-	if got := joinTypeName(planner.JoinTypeAnti); got != "ANTI" {
-		t.Errorf("JoinTypeAnti label = %q, want ANTI", got)
+	for _, c := range cases {
+		if got := joinLabel(c.algo, c.typ); got != c.want {
+			t.Errorf("joinLabel(%q, %v) = %q, want %q", c.algo, c.typ, got, c.want)
+		}
 	}
 }
 
@@ -303,11 +320,11 @@ func TestNLIResidualPredicateRendered(t *testing.T) {
 	}
 	out, _ := joinedPlan(t, ctx,
 		"EXPLAIN SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a AND t2.b < t1.b)")
-	if strings.Contains(out, "Nested Loop (SEMI)") {
+	if strings.Contains(out, "Nested Loop Semi Join") {
 		if !strings.Contains(out, "b < ") && !strings.Contains(out, "< b") {
 			t.Errorf("NLI semi residual predicate not rendered:\n%s", out)
 		}
-	} else if strings.Contains(out, "(SEMI)") {
+	} else if strings.Contains(out, "Semi Join") {
 		// Hash semi carries the residual on the join predicate — the
 		// display concern is NLI-specific; nothing to assert here.
 		t.Logf("shape took hash semi, NLI residual display not exercised:\n%s", out)

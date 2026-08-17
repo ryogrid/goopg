@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -19,7 +19,7 @@ import (
 //	pass-through) UNLESS requireCommittedXmin (legacy-layout pg_class rows).
 func TestCatalogRowLive(t *testing.T) {
 	dir := t.TempDir()
-	clog, err := mvcc.OpenCLog(filepath.Join(dir, "pg_xact"))
+	clog, err := transam.OpenCLog(filepath.Join(dir, "pg_xact"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestRunCatalogReloadsOrderAndFatality(t *testing.T) {
 	mk := func(name string, slot int, fatal bool, fail error) catalogReloadDesc {
 		return catalogReloadDesc{
 			Name: name, Slot: slot, Fatal: fatal,
-			Reload: func(*storage.Manager, *catalog.InMemory, *mvcc.CLog, uint32, uint32) error {
+			Reload: func(*storage.Manager, *catalog.InMemory, *transam.CLog, uint32, uint32) error {
 				ran = append(ran, name)
 				return fail
 			},

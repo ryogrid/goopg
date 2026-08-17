@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -53,14 +53,14 @@ func TestRuntimeCloseTriggersFinalCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open phase 1: %v", err)
 	}
-	bt, err := btree.Create(rt.Pool, rel)
+	bt, err := nbtree.Create(rt.Pool, rel)
 	if err != nil {
-		t.Fatalf("btree.Create: %v", err)
+		t.Fatalf("nbtree.Create: %v", err)
 	}
 	const wantBlock = storage.BlockNumber(42)
 	ptr := storage.ItemPointer{Block: wantBlock, Offset: 7}
-	if err := bt.Insert(btree.EncodeInt4(int32(1234)), ptr); err != nil {
-		t.Fatalf("btree.Insert: %v", err)
+	if err := bt.Insert(nbtree.EncodeInt4(int32(1234)), ptr); err != nil {
+		t.Fatalf("nbtree.Insert: %v", err)
 	}
 
 	// Snapshot the on-disk file size BEFORE Close to confirm the
@@ -91,11 +91,11 @@ func TestRuntimeCloseTriggersFinalCheckpoint(t *testing.T) {
 	}
 	defer rt2.Close()
 
-	bt2, err := btree.Open(rt2.Pool, rel)
+	bt2, err := nbtree.Open(rt2.Pool, rel)
 	if err != nil {
-		t.Fatalf("btree.Open after restart: %v", err)
+		t.Fatalf("nbtree.Open after restart: %v", err)
 	}
-	gotPtr, ok, err := bt2.Search(btree.EncodeInt4(int32(1234)))
+	gotPtr, ok, err := bt2.Search(nbtree.EncodeInt4(int32(1234)))
 	if err != nil {
 		t.Fatalf("Search after restart: %v", err)
 	}

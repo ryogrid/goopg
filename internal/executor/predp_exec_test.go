@@ -11,12 +11,12 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 func TestPreDPExistsValuesSurviveDPReorder(t *testing.T) {
-	planner.SetUnnestPreDPEnabled(true)
-	t.Cleanup(func() { planner.SetUnnestPreDPEnabled(true) })
+	optimizer.SetUnnestPreDPEnabled(true)
+	t.Cleanup(func() { optimizer.SetUnnestPreDPEnabled(true) })
 
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
@@ -86,13 +86,13 @@ func TestPreDPExistsValuesSurviveDPReorder(t *testing.T) {
 	}
 
 	// Same query, legacy order: identical values.
-	planner.SetUnnestPreDPEnabled(false)
+	optimizer.SetUnnestPreDPEnabled(false)
 	rows2, err := runQueryWithErr(ctx,
 		"SELECT b1_k FROM big1, big2, small3 "+
 			"WHERE b1_j = b2_j AND b2_j = s3_j "+
 			"AND EXISTS (SELECT 1 FROM inner_e WHERE e_k = big1.b1_k) "+
 			"ORDER BY b1_k")
-	planner.SetUnnestPreDPEnabled(true)
+	optimizer.SetUnnestPreDPEnabled(true)
 	if err != nil {
 		t.Fatalf("legacy query: %v", err)
 	}

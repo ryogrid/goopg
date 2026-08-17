@@ -5,7 +5,7 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // routineCommandCounterIncrement is goopg's CommandCounterIncrement: it moves
@@ -63,7 +63,7 @@ func routineCommandCounterIncrement(child *Context, r *catalog.Routine) {
 // INSERT INTO t SELECT 'outer' RETURNING tag` puts 'outer' at ctid (0,1) and
 // 'cte' at (0,2) on live PG 18.3 — the reverse of the old prefix order.
 type cteDMLPrefixOp struct {
-	plan  *planner.CTEDMLPrefix
+	plan  *optimizer.CTEDMLPrefix
 	ctx   *Context
 	inner Operator // outer query operator
 
@@ -97,7 +97,7 @@ type cteDMLPrefixOp struct {
 	scope *instrumenter
 }
 
-func newCTEDMLPrefixOp(p *planner.CTEDMLPrefix) *cteDMLPrefixOp {
+func newCTEDMLPrefixOp(p *optimizer.CTEDMLPrefix) *cteDMLPrefixOp {
 	return &cteDMLPrefixOp{plan: p}
 }
 
@@ -107,14 +107,14 @@ func (o *cteDMLPrefixOp) setInstrumentScope(s *instrumenter) { o.scope = s }
 // temporarily set to o.scope, so maybeInstrument wraps n's operator (and
 // records its stats in the same nodeStatsTable the EXPLAIN renderer
 // reads) exactly as if it had been Build() during the original dispatch.
-func (o *cteDMLPrefixOp) buildUnderScope(n planner.Node) (Operator, error) {
+func (o *cteDMLPrefixOp) buildUnderScope(n optimizer.Node) (Operator, error) {
 	prev := instrumentScope
 	instrumentScope = o.scope
 	defer func() { instrumentScope = prev }()
 	return Build(n)
 }
 
-func (o *cteDMLPrefixOp) Schema() planner.Schema { return o.plan.Body.Output() }
+func (o *cteDMLPrefixOp) Schema() optimizer.Schema { return o.plan.Body.Output() }
 
 func (o *cteDMLPrefixOp) Open(ctx *Context) error {
 	o.ctx = ctx
@@ -276,12 +276,12 @@ func (o *cteDMLPrefixOp) Next() (TupleSlot, error) {
 // materializedCTEScanOp reads rows from ctx.MaterializedCTEs[name].
 // Used when the outer SELECT references a data-modifying CTE by name.
 type materializedCTEScanOp struct {
-	plan *planner.MaterializedCTEScan
+	plan *optimizer.MaterializedCTEScan
 	rows [][]Datum
 	idx  int
 }
 
-func newMaterializedCTEScanOp(p *planner.MaterializedCTEScan) *materializedCTEScanOp {
+func newMaterializedCTEScanOp(p *optimizer.MaterializedCTEScan) *materializedCTEScanOp {
 	return &materializedCTEScanOp{plan: p}
 }
 
@@ -297,14 +297,14 @@ func newMaterializedCTEScanOp(p *planner.MaterializedCTEScan) *materializedCTESc
 //     implements PostgreSQL's CTE optimization-fence: volatile CTEs
 //     (e.g. random()) produce the same rows every reference. M0097-0099.
 type cteScanOp struct {
-	plan      *planner.CTEScan
+	plan      *optimizer.CTEScan
 	child     Operator
 	streaming bool // true = don't cache; stream from child
 	rows      []Row
 	idx       int
 }
 
-func newCteScanOp(p *planner.CTEScan) (*cteScanOp, error) {
+func newCteScanOp(p *optimizer.CTEScan) (*cteScanOp, error) {
 	child, err := Build(p.Child)
 	if err != nil {
 		return nil, err
@@ -312,11 +312,11 @@ func newCteScanOp(p *planner.CTEScan) (*cteScanOp, error) {
 	return &cteScanOp{plan: p, child: child}, nil
 }
 
-func (o *cteScanOp) Schema() planner.Schema { return o.plan.Output() }
+func (o *cteScanOp) Schema() optimizer.Schema { return o.plan.Output() }
 
 func (o *cteScanOp) isStreamingChild() bool {
 	switch o.plan.Child.(type) {
-	case *planner.WorkTableScan, *planner.RecursiveUnion:
+	case *optimizer.WorkTableScan, *optimizer.RecursiveUnion:
 		return true
 	}
 	// If the child plan subtree contains a WorkTableScan (e.g. a non-recursive
@@ -328,29 +328,29 @@ func (o *cteScanOp) isStreamingChild() bool {
 // planContainsWorkTableScan walks the plan tree looking for a WorkTableScan node.
 // This is needed to detect CTEs whose body (even indirectly) reads from a recursive
 // CTE's work table — those CTEs must be streamed, not materialized.
-func planContainsWorkTableScan(n planner.Node) bool {
+func planContainsWorkTableScan(n optimizer.Node) bool {
 	if n == nil {
 		return false
 	}
-	if _, ok := n.(*planner.WorkTableScan); ok {
+	if _, ok := n.(*optimizer.WorkTableScan); ok {
 		return true
 	}
-	if scan, ok := n.(*planner.CTEScan); ok {
+	if scan, ok := n.(*optimizer.CTEScan); ok {
 		return planContainsWorkTableScan(scan.Child)
 	}
-	if ru, ok := n.(*planner.RecursiveUnion); ok {
+	if ru, ok := n.(*optimizer.RecursiveUnion); ok {
 		return planContainsWorkTableScan(ru.Anchor) || planContainsWorkTableScan(ru.Recursive)
 	}
-	if p, ok := n.(*planner.Project); ok {
+	if p, ok := n.(*optimizer.Project); ok {
 		return planContainsWorkTableScan(p.Child)
 	}
-	if f, ok := n.(*planner.Filter); ok {
+	if f, ok := n.(*optimizer.Filter); ok {
 		return planContainsWorkTableScan(f.Child)
 	}
-	if s, ok := n.(*planner.Sort); ok {
+	if s, ok := n.(*optimizer.Sort); ok {
 		return planContainsWorkTableScan(s.Child)
 	}
-	if so, ok := n.(*planner.SetOp); ok {
+	if so, ok := n.(*optimizer.SetOp); ok {
 		return planContainsWorkTableScan(so.Left) || planContainsWorkTableScan(so.Right)
 	}
 	return false
@@ -429,7 +429,7 @@ func (o *cteScanOp) Next() (TupleSlot, error) {
 	return SlotFromRow(o.plan.Output(), row), nil
 }
 
-func (o *materializedCTEScanOp) Schema() planner.Schema { return o.plan.Output() }
+func (o *materializedCTEScanOp) Schema() optimizer.Schema { return o.plan.Output() }
 
 func (o *materializedCTEScanOp) Open(ctx *Context) error {
 	key := strings.ToLower(o.plan.Name)

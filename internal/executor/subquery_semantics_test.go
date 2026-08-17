@@ -40,7 +40,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // known pins a divergence that exists at HEAD: the rows goopg actually returns
@@ -561,8 +561,8 @@ func TestSubquerySemanticsMatrix(t *testing.T) {
 					ctx, cleanup := newSemanticsFixture(t)
 					defer cleanup()
 
-					planner.SetSubqueryUnnestEnabled(unnest)
-					defer planner.SetSubqueryUnnestEnabled(true)
+					optimizer.SetSubqueryUnnestEnabled(unnest)
+					defer optimizer.SetSubqueryUnnestEnabled(true)
 
 					rows, err := runQueryWithErr(ctx, tc.sql)
 					if tc.wantErrCode != "" {
@@ -622,11 +622,11 @@ func TestSubqueryUnnestKillSwitch(t *testing.T) {
 
 	const sql = "SELECT a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a) ORDER BY a"
 
-	planner.SetSubqueryUnnestEnabled(true)
-	defer planner.SetSubqueryUnnestEnabled(true)
+	optimizer.SetSubqueryUnnestEnabled(true)
+	defer optimizer.SetSubqueryUnnestEnabled(true)
 	on := explainText(t, ctx, sql)
 
-	planner.SetSubqueryUnnestEnabled(false)
+	optimizer.SetSubqueryUnnestEnabled(false)
 	off := explainText(t, ctx, sql)
 
 	if !strings.Contains(off, "SubPlan 1") {

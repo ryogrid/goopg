@@ -12,9 +12,9 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/storage/lmgr"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 
@@ -29,7 +29,7 @@ type clusterOp struct {
 
 func newClusterOp(s *parser.ClusterStmt) *clusterOp { return &clusterOp{stmt: s} }
 
-func (o *clusterOp) Schema() planner.Schema { return nil }
+func (o *clusterOp) Schema() optimizer.Schema { return nil }
 
 func (o *clusterOp) Open(ctx *Context) error {
 	o.ctx = ctx
@@ -74,7 +74,7 @@ func (o *clusterOp) Next() (TupleSlot, error) {
 		// (cluster-conflict).
 		if tbl != nil {
 			rel := o.ctx.Catalog.RelFileNode(tbl)
-			if err := o.ctx.acquireRelLockMaybeTransient(rel, lockmgr.AccessExclusiveLock); err != nil {
+			if err := o.ctx.acquireRelLockMaybeTransient(rel, lmgr.AccessExclusiveLock); err != nil {
 				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 					ee.Pos = o.stmt.Pos()
 				}

@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goopg/goopg/internal/control"
+	"github.com/goopg/goopg/internal/access/transam/control"
 )
 
 // The regress "suite wedge": one case in an otherwise healthy run sits at the

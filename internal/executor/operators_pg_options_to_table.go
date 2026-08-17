@@ -15,20 +15,20 @@ package executor
 import (
 	"strings"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 type pgOptionsToTableOp struct {
-	plan *planner.PgOptionsToTable
+	plan *optimizer.PgOptionsToTable
 	rows []Row
 	idx  int
 }
 
-func newPgOptionsToTableOp(p *planner.PgOptionsToTable) *pgOptionsToTableOp {
+func newPgOptionsToTableOp(p *optimizer.PgOptionsToTable) *pgOptionsToTableOp {
 	return &pgOptionsToTableOp{plan: p}
 }
 
-func (o *pgOptionsToTableOp) Schema() planner.Schema { return o.plan.Output() }
+func (o *pgOptionsToTableOp) Schema() optimizer.Schema { return o.plan.Output() }
 
 func (o *pgOptionsToTableOp) Open(ctx *Context) error {
 	o.rows = nil

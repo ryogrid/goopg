@@ -4,9 +4,9 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 func runTransactionStmt(t *testing.T, ctx *Context, sql string) error {
@@ -18,7 +18,7 @@ func runTransactionStmt(t *testing.T, ctx *Context, sql string) error {
 	if len(stmts) != 1 {
 		t.Fatalf("Parse(%q): got %d statements", sql, len(stmts))
 	}
-	plan, err := planner.Plan(stmts[0], catalog.NewInMemory())
+	plan, err := optimizer.Plan(stmts[0], catalog.NewInMemory())
 	if err != nil {
 		t.Fatalf("Plan(%q): %v", sql, err)
 	}
@@ -32,7 +32,7 @@ func runTransactionStmt(t *testing.T, ctx *Context, sql string) error {
 
 func TestTransactionBeginCommitLifecycle(t *testing.T) {
 	ctx := NewContext()
-	ctx.TxnMgr = mvcc.NewManager()
+	ctx.TxnMgr = transam.NewManager()
 	sess := NewBasicSession()
 	ctx.Session = sess
 
@@ -83,7 +83,7 @@ func TestTransactionBeginCommitLifecycle(t *testing.T) {
 
 func TestTransactionRollbackLifecycle(t *testing.T) {
 	ctx := NewContext()
-	ctx.TxnMgr = mvcc.NewManager()
+	ctx.TxnMgr = transam.NewManager()
 	ctx.Session = NewBasicSession()
 
 	if err := runTransactionStmt(t, ctx, "BEGIN"); err != nil {
@@ -107,7 +107,7 @@ func TestTransactionRollbackLifecycle(t *testing.T) {
 
 func TestTransactionBeginInsideTransactionIsNoOp(t *testing.T) {
 	ctx := NewContext()
-	ctx.TxnMgr = mvcc.NewManager()
+	ctx.TxnMgr = transam.NewManager()
 	sess := NewBasicSession()
 	ctx.Session = sess
 
@@ -136,9 +136,9 @@ func TestTransactionBeginInsideTransactionIsNoOp(t *testing.T) {
 
 func TestTransactionBeginUsesSessionIsolation(t *testing.T) {
 	ctx := NewContext()
-	ctx.TxnMgr = mvcc.NewManager()
+	ctx.TxnMgr = transam.NewManager()
 	sess := NewBasicSession()
-	if err := sess.SetIsolationLevel(mvcc.IsolationRepeatableRead); err != nil {
+	if err := sess.SetIsolationLevel(transam.IsolationRepeatableRead); err != nil {
 		t.Fatal(err)
 	}
 	ctx.Session = sess
@@ -150,8 +150,8 @@ func TestTransactionBeginUsesSessionIsolation(t *testing.T) {
 	if !ok {
 		t.Fatal("expected active transaction after BEGIN")
 	}
-	if tx.Isolation != mvcc.IsolationRepeatableRead {
-		t.Fatalf("tx isolation=%v want=%v", tx.Isolation, mvcc.IsolationRepeatableRead)
+	if tx.Isolation != transam.IsolationRepeatableRead {
+		t.Fatalf("tx isolation=%v want=%v", tx.Isolation, transam.IsolationRepeatableRead)
 	}
 }
 
@@ -162,9 +162,9 @@ func TestTransactionBeginUsesSessionIsolation(t *testing.T) {
 // the executor BEGIN path.
 func TestTransactionBeginSerializableSession(t *testing.T) {
 	ctx := NewContext()
-	ctx.TxnMgr = mvcc.NewManager()
+	ctx.TxnMgr = transam.NewManager()
 	sess := NewBasicSession()
-	if err := sess.SetIsolationLevel(mvcc.IsolationSerializable); err != nil {
+	if err := sess.SetIsolationLevel(transam.IsolationSerializable); err != nil {
 		t.Fatal(err)
 	}
 	ctx.Session = sess
@@ -176,14 +176,14 @@ func TestTransactionBeginSerializableSession(t *testing.T) {
 	if !ok {
 		t.Fatal("expected active transaction after BEGIN")
 	}
-	if tx.Isolation != mvcc.IsolationSerializable {
-		t.Fatalf("tx isolation=%v want=%v", tx.Isolation, mvcc.IsolationSerializable)
+	if tx.Isolation != transam.IsolationSerializable {
+		t.Fatalf("tx isolation=%v want=%v", tx.Isolation, transam.IsolationSerializable)
 	}
 }
 
 func TestTransactionRequiresContextHooks(t *testing.T) {
 	ctx := NewContext()
-	ctx.TxnMgr = mvcc.NewManager()
+	ctx.TxnMgr = transam.NewManager()
 	err := runTransactionStmt(t, ctx, "BEGIN")
 	if err == nil {
 		t.Fatal("expected BEGIN to fail without Session")

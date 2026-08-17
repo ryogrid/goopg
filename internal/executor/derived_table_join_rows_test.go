@@ -6,7 +6,8 @@ package executor
 // round-1 stage-6b measurements: `FROM orders, (SELECT DISTINCT l_orderkey
 // FROM lineitem WHERE l_commitdate < l_receiptdate) lk WHERE o_orderkey =
 // lk.l_orderkey` returned 0 rows fast on SF1 while the derived subquery
-// alone counted 1 375 096, with a `NL (CROSS) + Filter` over `Unique` plan.
+// alone counted 1 375 096, with a `Nested Loop` (CROSS-join) + `Filter`
+// over `Unique` plan.
 // The hypothesised mechanism was the NL operator re-Opening a Unique-rooted
 // inner and finding it already at EOF.
 //

@@ -145,3 +145,46 @@ func TestParseRegexAnyAll(t *testing.T) {
 		})
 	}
 }
+
+// TestParseLikeFamilyAnyAll pins ANY/SOME/ALL support for the LIKE-family
+// operators (LIKE, NOT LIKE, ILIKE, NOT ILIKE), mirroring the regex-operator
+// desugaring above. M0134-0003.
+func TestParseLikeFamilyAnyAll(t *testing.T) {
+	cases := []struct {
+		sql     string
+		wantOp  OpCode
+		wantAll bool
+	}{
+		{"SELECT * FROM t WHERE x LIKE ANY (ARRAY['%a', '%b'])", OpLike, false},
+		{"SELECT * FROM t WHERE x LIKE SOME (ARRAY['%a', '%b'])", OpLike, false},
+		{"SELECT * FROM t WHERE x LIKE ALL (ARRAY['%a', '%b'])", OpLike, true},
+		{"SELECT * FROM t WHERE x NOT LIKE ANY (ARRAY['%a', '%b'])", OpNotLike, false},
+		{"SELECT * FROM t WHERE x NOT LIKE SOME (ARRAY['%a', '%b'])", OpNotLike, false},
+		{"SELECT * FROM t WHERE x NOT LIKE ALL (ARRAY['%a', '%b'])", OpNotLike, true},
+		{"SELECT * FROM t WHERE x ILIKE ANY (ARRAY['%a', '%b'])", OpILike, false},
+		{"SELECT * FROM t WHERE x ILIKE SOME (ARRAY['%a', '%b'])", OpILike, false},
+		{"SELECT * FROM t WHERE x ILIKE ALL (ARRAY['%a', '%b'])", OpILike, true},
+		{"SELECT * FROM t WHERE x NOT ILIKE ANY (ARRAY['%a', '%b'])", OpNotILike, false},
+		{"SELECT * FROM t WHERE x NOT ILIKE SOME (ARRAY['%a', '%b'])", OpNotILike, false},
+		{"SELECT * FROM t WHERE x NOT ILIKE ALL (ARRAY['%a', '%b'])", OpNotILike, true},
+	}
+	for _, c := range cases {
+		t.Run(c.sql, func(t *testing.T) {
+			stmts, err := Parse(c.sql)
+			if err != nil {
+				t.Fatalf("Parse(%q): %v", c.sql, err)
+			}
+			sel := stmts[0].(*SelectStmt)
+			ie, ok := sel.Where.(*InExpr)
+			if !ok {
+				t.Fatalf("WHERE root=%T(%v), want *InExpr", sel.Where, sel.Where)
+			}
+			if ie.AnyOp != c.wantOp {
+				t.Errorf("AnyOp=%v, want %v", ie.AnyOp, c.wantOp)
+			}
+			if ie.AllOp != c.wantAll {
+				t.Errorf("AllOp=%v, want %v", ie.AllOp, c.wantAll)
+			}
+		})
+	}
+}

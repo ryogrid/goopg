@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -20,8 +20,8 @@ func newAmprocUpdateFixture(t *testing.T) *Context {
 		t.Fatalf("NewPool: %v", err)
 	}
 	cat := catalog.NewInMemory()
-	mgrMVCC := mvcc.NewManager()
-	tx, err := mgrMVCC.Begin(mvcc.IsolationReadCommitted)
+	mgrMVCC := transam.NewManager()
+	tx, err := mgrMVCC.Begin(transam.IsolationReadCommitted)
 	if err != nil {
 		t.Fatal(err)
 	}

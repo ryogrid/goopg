@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // TestEvalPgClientEncoding verifies that pg_client_encoding() returns the
@@ -109,7 +109,7 @@ func TestEvalPgCharToEncoding(t *testing.T) {
 	ctx := &Context{}
 
 	t.Run("canonical name UTF8", func(t *testing.T) {
-		call := &planner.FuncCall{Name: "pg_char_to_encoding", Args: []planner.Expr{&planner.StringConst{Value: "UTF8"}}}
+		call := &optimizer.FuncCall{Name: "pg_char_to_encoding", Args: []optimizer.Expr{&optimizer.StringConst{Value: "UTF8"}}}
 		got, err := evalFuncCall(call, nil, ctx)
 		if err != nil {
 			t.Fatalf("evalFuncCall: %v", err)
@@ -120,7 +120,7 @@ func TestEvalPgCharToEncoding(t *testing.T) {
 	})
 
 	t.Run("alias unicode to UTF8", func(t *testing.T) {
-		call := &planner.FuncCall{Name: "pg_char_to_encoding", Args: []planner.Expr{&planner.StringConst{Value: "unicode"}}}
+		call := &optimizer.FuncCall{Name: "pg_char_to_encoding", Args: []optimizer.Expr{&optimizer.StringConst{Value: "unicode"}}}
 		got, err := evalFuncCall(call, nil, ctx)
 		if err != nil {
 			t.Fatalf("evalFuncCall: %v", err)
@@ -131,7 +131,7 @@ func TestEvalPgCharToEncoding(t *testing.T) {
 	})
 
 	t.Run("canonical LATIN1", func(t *testing.T) {
-		call := &planner.FuncCall{Name: "pg_char_to_encoding", Args: []planner.Expr{&planner.StringConst{Value: "LATIN1"}}}
+		call := &optimizer.FuncCall{Name: "pg_char_to_encoding", Args: []optimizer.Expr{&optimizer.StringConst{Value: "LATIN1"}}}
 		got, err := evalFuncCall(call, nil, ctx)
 		if err != nil {
 			t.Fatalf("evalFuncCall: %v", err)
@@ -142,7 +142,7 @@ func TestEvalPgCharToEncoding(t *testing.T) {
 	})
 
 	t.Run("NULL returns NULL", func(t *testing.T) {
-		call := &planner.FuncCall{Name: "pg_char_to_encoding", Args: []planner.Expr{&planner.NullConst{}}}
+		call := &optimizer.FuncCall{Name: "pg_char_to_encoding", Args: []optimizer.Expr{&optimizer.NullConst{}}}
 		got, err := evalFuncCall(call, nil, ctx)
 		if err != nil {
 			t.Fatalf("evalFuncCall: %v", err)
@@ -153,7 +153,7 @@ func TestEvalPgCharToEncoding(t *testing.T) {
 	})
 
 	t.Run("unknown encoding returns -1", func(t *testing.T) {
-		call := &planner.FuncCall{Name: "pg_char_to_encoding", Args: []planner.Expr{&planner.StringConst{Value: "nonexistent_encoding_xyz"}}}
+		call := &optimizer.FuncCall{Name: "pg_char_to_encoding", Args: []optimizer.Expr{&optimizer.StringConst{Value: "nonexistent_encoding_xyz"}}}
 		got, err := evalFuncCall(call, nil, ctx)
 		if err != nil {
 			t.Fatalf("evalFuncCall: %v", err)
@@ -164,7 +164,7 @@ func TestEvalPgCharToEncoding(t *testing.T) {
 	})
 
 	t.Run("case insensitive", func(t *testing.T) {
-		call := &planner.FuncCall{Name: "pg_char_to_encoding", Args: []planner.Expr{&planner.StringConst{Value: "utf8"}}}
+		call := &optimizer.FuncCall{Name: "pg_char_to_encoding", Args: []optimizer.Expr{&optimizer.StringConst{Value: "utf8"}}}
 		got, err := evalFuncCall(call, nil, ctx)
 		if err != nil {
 			t.Fatalf("evalFuncCall: %v", err)
@@ -175,7 +175,7 @@ func TestEvalPgCharToEncoding(t *testing.T) {
 	})
 
 	t.Run("punctuation variant UTF-8", func(t *testing.T) {
-		call := &planner.FuncCall{Name: "pg_char_to_encoding", Args: []planner.Expr{&planner.StringConst{Value: "UTF-8"}}}
+		call := &optimizer.FuncCall{Name: "pg_char_to_encoding", Args: []optimizer.Expr{&optimizer.StringConst{Value: "UTF-8"}}}
 		got, err := evalFuncCall(call, nil, ctx)
 		if err != nil {
 			t.Fatalf("evalFuncCall: %v", err)

@@ -41,7 +41,7 @@ package executor
 import (
 	"sync"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // aggPartialGroup is one group's accumulated state, combined across workers.
@@ -73,7 +73,7 @@ func newAggPartialAccum() *aggPartialAccum {
 // states is consumed by reference: the caller must not touch it afterwards.
 // That is safe because a Partial node merges its groups exactly once, at the
 // end of its own Open, and never reads them again.
-func (a *aggPartialAccum) merge(key string, groupValues, passthrough Row, states []aggRuntime, aggs []planner.AggregateCall) error {
+func (a *aggPartialAccum) merge(key string, groupValues, passthrough Row, states []aggRuntime, aggs []optimizer.AggregateCall) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -103,7 +103,7 @@ func (a *aggPartialAccum) merge(key string, groupValues, passthrough Row, states
 
 // lookupAggPartialAccum returns the accumulator a Partial node should publish
 // into, or nil when this execution is not under a Finalize node.
-func lookupAggPartialAccum(ctx *Context, p *planner.Aggregate) *aggPartialAccum {
+func lookupAggPartialAccum(ctx *Context, p *optimizer.Aggregate) *aggPartialAccum {
 	if ctx == nil || ctx.PartialAggStates == nil || p == nil {
 		return nil
 	}

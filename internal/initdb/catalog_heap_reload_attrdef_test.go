@@ -5,7 +5,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/pgnodes"
+	"github.com/goopg/goopg/internal/nodes"
 )
 
 // TestRebuildAttrdefExpr covers the pg_attrdef reload discriminator (M0123-S2
@@ -20,10 +20,10 @@ func TestRebuildAttrdefExpr(t *testing.T) {
 		targetType uint32
 		canonical  bool // whether the writer would store canonical bytes
 	}{
-		{"int4-op", "40 + 2", pgnodes.OidInt4, true},
-		{"int4-neg", "-1", pgnodes.OidInt4, true},
-		{"text-func", "upper('x')", pgnodes.OidText, true},
-		{"int8-lit", "5000000000", pgnodes.OidInt8, true},
+		{"int4-op", "40 + 2", nodes.OidInt4, true},
+		{"int4-neg", "-1", nodes.OidInt4, true},
+		{"text-func", "upper('x')", nodes.OidText, true},
+		{"int8-lit", "5000000000", nodes.OidInt8, true},
 		// Integer literal in a numeric column: canonical via the implicit
 		// int4_numeric cast FuncExpr; reload rebuilds it back to the bare "0"
 		// literal (M0123-S4 sub-slice 4a).
@@ -39,8 +39,8 @@ func TestRebuildAttrdefExpr(t *testing.T) {
 
 			// Reproduce exactly what the writer stores.
 			var adbin string
-			if node, ok := pgnodes.ResolveForColumn(src, tc.targetType); ok {
-				adbin = pgnodes.Out(node)
+			if node, ok := nodes.ResolveForColumn(src, tc.targetType); ok {
+				adbin = nodes.Out(node)
 			} else {
 				adbin = wantSQL
 			}

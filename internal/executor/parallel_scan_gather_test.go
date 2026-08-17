@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -75,13 +75,13 @@ func TestParallelScanStateEmptyRelation(t *testing.T) {
 type scriptedOp struct {
 	rows    []Row
 	idx     int
-	schema  planner.Schema
+	schema  optimizer.Schema
 	onNext  func() error // optional hook: inject an error or a panic
 	openErr error
 	slot    MaterializedSlot
 }
 
-func (s *scriptedOp) Schema() planner.Schema { return s.schema }
+func (s *scriptedOp) Schema() optimizer.Schema { return s.schema }
 func (s *scriptedOp) Open(ctx *Context) error {
 	s.slot = MaterializedSlot{schema: s.schema}
 	return s.openErr
@@ -117,20 +117,20 @@ func gatherTestCtx(t *testing.T) *Context {
 	return ctx
 }
 
-func newTestGather(nWorkers int, mk func() (Operator, error)) (*gatherOp, *planner.Gather) {
-	schema := planner.Schema{{Name: "n"}}
+func newTestGather(nWorkers int, mk func() (Operator, error)) (*gatherOp, *optimizer.Gather) {
+	schema := optimizer.Schema{{Name: "n"}}
 	child := &scriptedOp{schema: schema}
-	p := planner.NewGather(0, &stubPlanNode{schema: schema}, nWorkers)
+	p := optimizer.NewGather(0, &stubPlanNode{schema: schema}, nWorkers)
 	_ = child
 	return newGatherOp(p, mk), p
 }
 
 // stubPlanNode stands in for a partial plan subtree; gatherOp only reads its
 // Output(), because the operator tree comes from the injected builder.
-type stubPlanNode struct{ schema planner.Schema }
+type stubPlanNode struct{ schema optimizer.Schema }
 
 func (s *stubPlanNode) Pos() int               { return 0 }
-func (s *stubPlanNode) Output() planner.Schema { return s.schema }
+func (s *stubPlanNode) Output() optimizer.Schema { return s.schema }
 
 // TestGatherCollectsEveryWorkersRows pins the basic contract: the leader sees
 // the union of what the workers produced, once each.
@@ -148,7 +148,7 @@ func TestGatherCollectsEveryWorkersRows(t *testing.T) {
 		assigned++
 		mu.Unlock()
 		return &scriptedOp{
-			schema: planner.Schema{{Name: "n"}},
+			schema: optimizer.Schema{{Name: "n"}},
 			rows:   intRows(id*perWorker, (id+1)*perWorker),
 		}, nil
 	})
@@ -192,7 +192,7 @@ func TestGatherCollectsEveryWorkersRows(t *testing.T) {
 func TestGatherRowsAreTransferable(t *testing.T) {
 	g, _ := newTestGather(2, func() (Operator, error) {
 		return &scriptedOp{
-			schema: planner.Schema{{Name: "n"}},
+			schema: optimizer.Schema{{Name: "n"}},
 			rows:   []Row{{NewStringDatum("abc")}, {NewStringDatum("def")}},
 		}, nil
 	})
@@ -221,7 +221,7 @@ func TestGatherWorkerErrorSurfaces(t *testing.T) {
 	sentinel := &ExecError{Code: "XX000", Message: "worker exploded"}
 	var once sync.Once
 	g, _ := newTestGather(3, func() (Operator, error) {
-		op := &scriptedOp{schema: planner.Schema{{Name: "n"}}, rows: intRows(0, 100)}
+		op := &scriptedOp{schema: optimizer.Schema{{Name: "n"}}, rows: intRows(0, 100)}
 		once.Do(func() {
 			op.onNext = func() error { return sentinel }
 		})
@@ -253,7 +253,7 @@ func TestGatherWorkerErrorSurfaces(t *testing.T) {
 func TestGatherWorkerPanicBecomesError(t *testing.T) {
 	var once sync.Once
 	g, _ := newTestGather(2, func() (Operator, error) {
-		op := &scriptedOp{schema: planner.Schema{{Name: "n"}}, rows: intRows(0, 50)}
+		op := &scriptedOp{schema: optimizer.Schema{{Name: "n"}}, rows: intRows(0, 50)}
 		once.Do(func() {
 			op.onNext = func() error { panic("worker boom") }
 		})
@@ -290,7 +290,7 @@ func TestGatherWorkerPanicBecomesError(t *testing.T) {
 // exists to prevent.
 func TestGatherEarlyCloseDoesNotDeadlock(t *testing.T) {
 	g, _ := newTestGather(4, func() (Operator, error) {
-		return &scriptedOp{schema: planner.Schema{{Name: "n"}}, rows: intRows(0, 20000)}, nil
+		return &scriptedOp{schema: optimizer.Schema{{Name: "n"}}, rows: intRows(0, 20000)}, nil
 	})
 	ctx := gatherTestCtx(t)
 	if err := g.Open(ctx); err != nil {
@@ -319,7 +319,7 @@ func TestGatherEarlyCloseDoesNotDeadlock(t *testing.T) {
 // timeout, client EOF, explicit cancel — reaches the workers.
 func TestGatherCancellationStopsWorkers(t *testing.T) {
 	g, _ := newTestGather(4, func() (Operator, error) {
-		return &scriptedOp{schema: planner.Schema{{Name: "n"}}, rows: intRows(0, 100000)}, nil
+		return &scriptedOp{schema: optimizer.Schema{{Name: "n"}}, rows: intRows(0, 100000)}, nil
 	})
 	ctx := gatherTestCtx(t)
 	cctx, cancel := context.WithCancel(context.Background())
@@ -357,7 +357,7 @@ func TestGatherLeaksNoGoroutines(t *testing.T) {
 	before := runtime.NumGoroutine()
 	for i := 0; i < 5; i++ {
 		g, _ := newTestGather(4, func() (Operator, error) {
-			return &scriptedOp{schema: planner.Schema{{Name: "n"}}, rows: intRows(0, 2000)}, nil
+			return &scriptedOp{schema: optimizer.Schema{{Name: "n"}}, rows: intRows(0, 2000)}, nil
 		})
 		ctx := gatherTestCtx(t)
 		if err := g.Open(ctx); err != nil {
@@ -392,7 +392,7 @@ func TestGatherLeaksNoGoroutines(t *testing.T) {
 // made `SET max_parallel_workers = 0` silently ineffective.
 func TestGatherZeroWorkersRunsSerially(t *testing.T) {
 	g, _ := newTestGather(4, func() (Operator, error) {
-		return &scriptedOp{schema: planner.Schema{{Name: "n"}}, rows: intRows(0, 10)}, nil
+		return &scriptedOp{schema: optimizer.Schema{{Name: "n"}}, rows: intRows(0, 10)}, nil
 	})
 	ctx := gatherTestCtx(t)
 	ctx.MaxParallelWorkers = 0
@@ -458,7 +458,7 @@ func TestGatherCloseTerminatesAfterOpenError(t *testing.T) {
 		{"workers launched, builder fails", 2, func() (Operator, error) { return nil, buildErr }},
 		// The second error return in Open: the child builds but refuses Open.
 		{"child Open fails", 0, func() (Operator, error) {
-			return &scriptedOp{schema: planner.Schema{{Name: "n"}}, openErr: buildErr}, nil
+			return &scriptedOp{schema: optimizer.Schema{{Name: "n"}}, openErr: buildErr}, nil
 		}},
 	}
 

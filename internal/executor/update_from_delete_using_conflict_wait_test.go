@@ -4,9 +4,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/storage/lmgr"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // These tests are the UPDATE...FROM / DELETE...USING siblings of
@@ -33,7 +33,7 @@ func TestUpdateFromBlocksOnForeignConflictingLock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	lm := lockmgr.New()
+	lm := lmgr.New()
 
 	s1tx, err := ctx.TxnMgr.Begin(0)
 	if err != nil {
@@ -76,7 +76,7 @@ func TestUpdateFromBlocksOnForeignConflictingLock(t *testing.T) {
 			done <- perr
 			return
 		}
-		node, perr := planner.Plan(stmts[0], s2.Catalog)
+		node, perr := optimizer.Plan(stmts[0], s2.Catalog)
 		if perr != nil {
 			done <- perr
 			return
@@ -136,7 +136,7 @@ func TestDeleteUsingBlocksOnForeignConflictingLock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	lm := lockmgr.New()
+	lm := lmgr.New()
 
 	s1tx, err := ctx.TxnMgr.Begin(0)
 	if err != nil {
@@ -180,7 +180,7 @@ func TestDeleteUsingBlocksOnForeignConflictingLock(t *testing.T) {
 			done <- perr
 			return
 		}
-		node, perr := planner.Plan(stmts[0], s2.Catalog)
+		node, perr := optimizer.Plan(stmts[0], s2.Catalog)
 		if perr != nil {
 			done <- perr
 			return

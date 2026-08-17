@@ -1,8 +1,0 @@
-# arm=q17on2 GOOPG_PGSHAPED_DP=1 GOOPG_PGSHAPED_COLLAPSE=0
-# started 2026-08-05T17:11:38+09:00
-# engine-id: 6cc666e77391ed46dc3185b154986ce70858489e 9b06b5433a2c1807361b57dcf6f4cecceb222f7d  diff=1447578f5be4
-# engine-binary: on-disk=c3bb4efa88fd4982 (tmp/goopg-acceptance-bin)
-# per-query cap 180s, serial, digest=1, queries=17
-# host: load0.83 0.81 1.03
-Q17: ERROR after 28.73s — pq: column ref l_quantity/30 out of VirtualSlot range 27 (chained-NLI?) (XX000)
-# finished 2026-08-05T17:12:08+09:00

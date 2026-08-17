@@ -23,7 +23,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/goopg/goopg/internal/control"
+	"github.com/goopg/goopg/internal/access/transam/control"
 )
 
 // timelineIDFile is the on-disk path (relative to DataDir) where the

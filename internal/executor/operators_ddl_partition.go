@@ -10,7 +10,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -165,11 +165,10 @@ func validatePartitionKey(s *parser.CreateTableStmt, cols []catalog.Column, ctx 
 		colsByName[strings.ToLower(c.Name)] = c
 	}
 
-	systemCols := map[string]bool{
-		"tableoid": true, "xmin": true, "cmin": true,
-		"xmax": true, "cmax": true, "ctid": true,
-	}
-
+	// System-column name set: single source of truth is isSystemColumn in
+	// operators_ddl.go (M0134-0002 C8). The partition-key check case-folds
+	// first (the parser has already folded unquoted identifiers; `lower` keeps
+	// the pre-existing behavior for quoted mixed-case names unchanged).
 	for i := 0; i < nKeyCols; i++ {
 		colName := pb.KeyCols[i]
 		opClass := ""
@@ -201,7 +200,7 @@ func validatePartitionKey(s *parser.CreateTableStmt, cols []catalog.Column, ctx 
 		}
 
 		// System column check.
-		if systemCols[lower] {
+		if isSystemColumn(lower) {
 			return &ExecError{Code: "42P16", Pos: pos,
 				Message: fmt.Sprintf("cannot use system column %q in partition key", lower)}
 		}
@@ -1174,7 +1173,7 @@ func checkDefaultPartitionDataConflict(childName string, parent *catalog.Table, 
 	if err != nil || len(stmts) == 0 {
 		return nil
 	}
-	plan, err := planner.Plan(stmts[0], ctxPlanCatalog(ctx))
+	plan, err := optimizer.Plan(stmts[0], ctxPlanCatalog(ctx))
 	if err != nil {
 		return nil
 	}
@@ -1319,6 +1318,85 @@ func funcExprContainsName(expr parser.Expr, funcName string) bool {
 		return funcExprContainsName(v.Operand, funcName)
 	case *parser.CastExpr:
 		return funcExprContainsName(v.Operand, funcName)
+	}
+	return false
+}
+
+// partitionKeyExprUsesColumn returns true if expr (a partition-key expression)
+// references a column whose name matches colLower (already lower-cased)
+// case-insensitively. It is the structural replacement for the old
+// `strings.Contains(fmt.Sprintf("%v", expr), colLower)` heuristic, whose Go
+// `%v` rendering embeds raw pointer addresses and could false-positive on the
+// target column name via ASLR hex digits (flipping the DROP COLUMN partition-key
+// guard silent<->error between runs). Mirrors funcExprContainsName's recursion
+// shape, extended to the CaseExpr/ExtractExpr/IsNullExpr arms that
+// validatePartKeyExprInner (above) accepts via its default arm, so the walker
+// cannot silently miss them. Matches by column name only (ignore .Table/.Schema
+// qualification) — the same convention as the plain-key loop and
+// evalPartitionKeyExpr (operators_storage.go). PG's equivalent is
+// has_partition_attrs (postgres/src/backend/catalog/partition.c:255):
+// expression key via pull_varattnos (optimizer/util/var.c:296) + bms_overlap.
+func partitionKeyExprUsesColumn(e parser.Expr, colLower string) bool {
+	if e == nil {
+		return false
+	}
+	switch v := e.(type) {
+	case *parser.ColumnRef:
+		return strings.EqualFold(v.Column, colLower)
+	case *parser.FuncCall:
+		for _, arg := range v.Args {
+			if partitionKeyExprUsesColumn(arg, colLower) {
+				return true
+			}
+		}
+		if v.Filter != nil {
+			return partitionKeyExprUsesColumn(v.Filter, colLower)
+		}
+	case *parser.BinaryOp:
+		return partitionKeyExprUsesColumn(v.Left, colLower) || partitionKeyExprUsesColumn(v.Right, colLower)
+	case *parser.UnaryOp:
+		return partitionKeyExprUsesColumn(v.Operand, colLower)
+	case *parser.CastExpr:
+		return partitionKeyExprUsesColumn(v.Operand, colLower)
+	case *parser.CollateExpr:
+		return partitionKeyExprUsesColumn(v.Operand, colLower)
+	case *parser.CaseExpr:
+		if partitionKeyExprUsesColumn(v.Operand, colLower) {
+			return true
+		}
+		for _, w := range v.Whens {
+			if partitionKeyExprUsesColumn(w.When, colLower) || partitionKeyExprUsesColumn(w.Then, colLower) {
+				return true
+			}
+		}
+		return partitionKeyExprUsesColumn(v.Else, colLower)
+	case *parser.ExtractExpr:
+		return partitionKeyExprUsesColumn(v.Source, colLower)
+	case *parser.IsNullExpr:
+		return partitionKeyExprUsesColumn(v.Operand, colLower)
+	}
+	return false
+}
+
+// partitionKeyUsesColumn reports whether tbl (a partitioned table) references
+// colLower (already lower-cased) in its partition key — either as a bare key
+// column or inside an expression key. Factored out of the DROP COLUMN / ALTER
+// TYPE partition-key guards (M0134-0002 C9 residuals). PG's equivalent is
+// has_partition_attrs (postgres/src/backend/catalog/partition.c:255), which
+// each ALTER arm re-hits on every descendant relation when recursing.
+func (o *ddlOp) partitionKeyUsesColumn(tbl *catalog.Table, colLower string) bool {
+	if tbl.PartitionMethod == "" {
+		return false
+	}
+	for _, keyCol := range tbl.PartitionKey {
+		if strings.EqualFold(keyCol, colLower) {
+			return true
+		}
+	}
+	for _, expr := range tbl.PartitionKeyExprs {
+		if partitionKeyExprUsesColumn(expr, colLower) {
+			return true
+		}
 	}
 	return false
 }

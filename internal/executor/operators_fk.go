@@ -20,10 +20,10 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/multixact"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam/multixact"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -492,7 +492,7 @@ func fullTableFKCheck(ctx *Context, childTbl *catalog.Table, fk catalog.ForeignK
 			if err != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
+			if !transam.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
 				continue
 			}
 			row, err := DecodeHeapTupleRow(cols, tuple, nil)
@@ -808,7 +808,7 @@ func fkCascadeDelete(ctx *Context, childTbl *catalog.Table, fk catalog.ForeignKe
 				if err != nil {
 					continue
 				}
-				if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
+				if !transam.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
 					continue
 				}
 				row, err := DecodeHeapTupleRow(cols, tuple, nil)
@@ -886,7 +886,7 @@ func fkSetNull(ctx *Context, childTbl *catalog.Table, fk catalog.ForeignKey, val
 			if err != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
+			if !transam.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
 				continue
 			}
 			row, err := DecodeHeapTupleRow(cols, tuple, nil)
@@ -950,6 +950,15 @@ func fkSetNull(ctx *Context, childTbl *catalog.Table, fk catalog.ForeignKey, val
 func allDescendants(im *catalog.InMemory, tbl *catalog.Table, snapEpoch uint64) []*catalog.Table {
 	var out []*catalog.Table
 	queue := []*catalog.Table{tbl}
+	// visited guards against inheritance/partition cycles. PostgreSQL forbids
+	// cycles (ALTER TABLE ... ATTACH PARTITION raises "circular inheritance not
+	// allowed"), but goopg's ATTACH validation has a gap and can silently
+	// register a back-edge; without the visited set the M0134-0002 C9
+	// descendant walk below would never terminate on such a graph (BFS without
+	// dedup re-queues the cycle forever, growing `out` until the cgroup OOM-kills
+	// the server). On acyclic graphs the dedup changes nothing observable — PG's
+	// find_all_inheritors dedups too (pg_inherits.c:282-324, via a hash table).
+	visited := map[uint32]bool{tbl.OID: true}
 	for len(queue) > 0 {
 		cur := queue[0]
 		queue = queue[1:]
@@ -959,6 +968,10 @@ func allDescendants(im *catalog.InMemory, tbl *catalog.Table, snapEpoch uint64) 
 			if k != nil && k.DetachPendingEpoch != 0 && snapEpoch >= k.DetachPendingEpoch {
 				continue // detach-pending and invisible to this snapshot — skip subtree
 			}
+			if visited[k.OID] {
+				continue
+			}
+			visited[k.OID] = true
 			out = append(out, k)
 			queue = append(queue, k)
 		}
@@ -981,7 +994,7 @@ func allDescendants(im *catalog.InMemory, tbl *catalog.Table, snapEpoch uint64) 
 // mvcc.CurrentPartitionDetachEpoch(). Design 0118-0062 (M0118-0008,
 // detach-partition-concurrently-4).
 func snapDetachEpoch(_ *Context) uint64 {
-	return mvcc.CurrentPartitionDetachEpoch()
+	return transam.CurrentPartitionDetachEpoch()
 }
 
 func scanTableForMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals []Datum) (bool, error) {
@@ -1116,7 +1129,7 @@ func scanRefTableForDetachedPartitionMatch(ctx *Context, im *catalog.InMemory, f
 			if terr != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
+			if !transam.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
 				continue
 			}
 			row, derr := DecodeHeapTupleRow(cols, tuple, nil)
@@ -1200,7 +1213,7 @@ func scanRelForMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals [
 			if err != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
+			if !transam.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
 				continue
 			}
 			row, err := DecodeHeapTupleRow(cols, tuple, nil)
@@ -1278,7 +1291,7 @@ func scanRelForFKMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals
 			if err != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
+			if !transam.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
 				continue
 			}
 			row, err := DecodeHeapTupleRow(cols, tuple, nil)
@@ -1432,7 +1445,7 @@ func scanTableForMatchFKWait(ctx *Context, tbl *catalog.Table, colNames []string
 		// gone (DELETE) and lets the caller emit the 23503 FK violation, or
 		// re-finds a still-matching version.  Mirrors fkChildWaitForInFlightInsert
 		// on the referenced-DELETE side (isolation spec fk-partitioned-2).
-		if ctx.Tx.Isolation != mvcc.IsolationReadCommitted &&
+		if ctx.Tx.Isolation != transam.IsolationReadCommitted &&
 			ctx.TxnMgr != nil && !ctx.TxnMgr.HasAbortedXID(pending.xid) {
 			return false, &ExecError{
 				Code:    "40001",
@@ -1556,7 +1569,7 @@ func fkChildWaitForInFlightInsert(ctx *Context, childTbl *catalog.Table, fkCols 
 		// would touch a row that didn't exist in our snapshot — that's
 		// the upstream "concurrent update" serialization break.  Match
 		// the wire shape ExecError emits for plain DML EPQ retries.
-		if ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
+		if ctx.Tx.Isolation != transam.IsolationReadCommitted {
 			if ctx.TxnMgr != nil && !ctx.TxnMgr.HasAbortedXID(xid) {
 				return &ExecError{
 					Code:    "40001",
@@ -1681,7 +1694,7 @@ func checkConstraints(ctx *Context, tbl *catalog.Table, row Row) error {
 		if err != nil || len(stmts) == 0 {
 			continue
 		}
-		plan, err := planner.Plan(stmts[0], ctxPlanCatalog(ctx))
+		plan, err := optimizer.Plan(stmts[0], ctxPlanCatalog(ctx))
 		if err != nil {
 			continue
 		}
@@ -1862,7 +1875,7 @@ func evalDomainCheckExpr(ctx *Context, exprSQL string, v Datum, baseType string)
 	if err != nil || len(stmts) == 0 {
 		return true, nil
 	}
-	plan, err := planner.Plan(stmts[0], ctxPlanCatalog(ctx))
+	plan, err := optimizer.Plan(stmts[0], ctxPlanCatalog(ctx))
 	if err != nil {
 		return true, nil
 	}
@@ -1903,7 +1916,7 @@ func evalDomainCheckExpr(ctx *Context, exprSQL string, v Datum, baseType string)
 // the row an UPDATE's SET produced. Mirrors execMain.c's ExecWCOQual /
 // WCO_VIEW_CHECK — NULL or FALSE is a violation, matching the same truthiness
 // rule filterOp already uses. M0119-0004 slice-365 follow-up.
-func checkViewCheckOption(ctx *Context, qual planner.Expr, viewName string, row Row) error {
+func checkViewCheckOption(ctx *Context, qual optimizer.Expr, viewName string, row Row) error {
 	v, err := evalExpr(qual, row, ctx)
 	if err != nil {
 		return err

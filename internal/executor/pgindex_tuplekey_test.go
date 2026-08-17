@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
@@ -28,7 +28,7 @@ import (
 // replaces, and the test would not be able to tell a regression to bytewise
 // ordering from success.
 
-func tupleKeyIndex(t *testing.T, tbl *catalog.Table, cols ...string) (*btree.PGIndexKeyDesc, []*catalog.Column, *catalog.Index) {
+func tupleKeyIndex(t *testing.T, tbl *catalog.Table, cols ...string) (*nbtree.PGIndexKeyDesc, []*catalog.Column, *catalog.Index) {
 	t.Helper()
 	idx := &catalog.Index{Name: "i", Table: tbl, Method: "btree", Columns: cols}
 	desc, err := buildPGIndexKeyDesc(idx)
@@ -129,7 +129,7 @@ func TestPGIndexTupleKeyOrdersEveryDescribableType(t *testing.T) {
 			// written at the wrong alignment still sorts correctly among its
 			// own siblings).
 			for i, v := range tc.vals {
-				vals, isnull, err := btree.DeformPGIndexTuple(keys[i], desc.Physical(), 1)
+				vals, isnull, err := nbtree.DeformPGIndexTuple(keys[i], desc.Physical(), 1)
 				if err != nil {
 					t.Fatalf("value %d: DeformPGIndexTuple: %v", i, err)
 				}
@@ -147,7 +147,7 @@ func TestPGIndexTupleKeyOrdersEveryDescribableType(t *testing.T) {
 
 			for i := range keys {
 				for j := range keys {
-					got, err := btree.ComparePGIndexTuples(desc, keys[i], keys[j])
+					got, err := nbtree.ComparePGIndexTuples(desc, keys[i], keys[j])
 					if err != nil {
 						t.Fatalf("ComparePGIndexTuples(%d,%d): %v", i, j, err)
 					}
@@ -235,15 +235,15 @@ func TestPGIndexKeyImagesStayPGFaithful(t *testing.T) {
 		}
 		return img
 	}
-	if c := btree.PGCompareNumeric(numImg(-1000, 0), numImg(0, 0)); c >= 0 {
+	if c := nbtree.PGCompareNumeric(numImg(-1000, 0), numImg(0, 0)); c >= 0 {
 		t.Errorf("PGCompareNumeric(-1000, 0) = %d, want < 0 — the image looks like ASCII text again", c)
 	}
-	if c := btree.PGCompareNumeric(numImg(5, 1), numImg(1, 0)); c >= 0 {
+	if c := nbtree.PGCompareNumeric(numImg(5, 1), numImg(1, 0)); c >= 0 {
 		t.Errorf("PGCompareNumeric(0.5, 1) = %d, want < 0 — the image looks like ASCII text again", c)
 	}
 	// dscale is display-only: 1.00 = 1, though the two images differ byte for
 	// byte (different dscale, and a digit array of one element either way).
-	if c := btree.PGCompareNumeric(numImg(100, 2), numImg(1, 0)); c != 0 {
+	if c := nbtree.PGCompareNumeric(numImg(100, 2), numImg(1, 0)); c != 0 {
 		t.Errorf("PGCompareNumeric(1.00, 1) = %d, want 0 (numeric_cmp ignores dscale)", c)
 	}
 	if bytes.Equal(numImg(100, 2), numImg(1, 0)) {
@@ -290,15 +290,15 @@ func TestPGIndexTupleKeyPrefixIsMinusInfinityBeyondItsAttributes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prefix key: %v", err)
 	}
-	if !btree.BTreeTupleIsPivot(prefix) {
+	if !nbtree.BTreeTupleIsPivot(prefix) {
 		t.Fatalf("prefix key is not stamped as a pivot; BTreeTupleGetNAtts would report the index's full key count")
 	}
-	if n := btree.BTreeTupleGetNAtts(prefix, 2); n != 1 {
+	if n := nbtree.BTreeTupleGetNAtts(prefix, 2); n != 1 {
 		t.Fatalf("prefix natts = %d, want 1", n)
 	}
 
 	cmp := func(a, b []byte) int {
-		got, err := btree.ComparePGIndexTuples(desc, a, b)
+		got, err := nbtree.ComparePGIndexTuples(desc, a, b)
 		if err != nil {
 			t.Fatalf("ComparePGIndexTuples: %v", err)
 		}
@@ -331,13 +331,13 @@ func TestPGIndexTupleKeyZeroTIDSortsBeforeEveryDuplicate(t *testing.T) {
 	}
 	search := at(storage.ItemPointer{})
 	for _, tid := range []storage.ItemPointer{{Block: 0, Offset: 1}, {Block: 1, Offset: 1}, {Block: 9999, Offset: 200}} {
-		if got, err := btree.ComparePGIndexTuples(desc, search, at(tid)); err != nil || got != -1 {
+		if got, err := nbtree.ComparePGIndexTuples(desc, search, at(tid)); err != nil || got != -1 {
 			t.Errorf("search key vs entry at %+v = %d (err %v), want -1", tid, got, err)
 		}
 	}
 	// …and the entries themselves are ordered by TID, so equal keys have a
 	// total order (heapkeyspace).
-	if got, _ := btree.ComparePGIndexTuples(desc, at(storage.ItemPointer{Block: 1, Offset: 2}), at(storage.ItemPointer{Block: 1, Offset: 3})); got != -1 {
+	if got, _ := nbtree.ComparePGIndexTuples(desc, at(storage.ItemPointer{Block: 1, Offset: 2}), at(storage.ItemPointer{Block: 1, Offset: 3})); got != -1 {
 		t.Errorf("TID tiebreak not applied: got %d, want -1", got)
 	}
 }
@@ -351,7 +351,7 @@ func TestPGIndexTupleKeyNullAndDirectionFlags(t *testing.T) {
 	idx := &catalog.Index{Name: "i", Table: tbl, Method: "btree", Columns: []string{"a"}}
 	keyCols := pgIndexKeyColumns(idx)
 
-	build := func(descending, nullsFirst bool) *btree.PGIndexKeyDesc {
+	build := func(descending, nullsFirst bool) *nbtree.PGIndexKeyDesc {
 		idx.ColDescending = []bool{descending}
 		idx.ColNullsFirst = []bool{nullsFirst}
 		d, err := buildPGIndexKeyDesc(idx)
@@ -360,7 +360,7 @@ func TestPGIndexTupleKeyNullAndDirectionFlags(t *testing.T) {
 		}
 		return d
 	}
-	keyFor := func(d *btree.PGIndexKeyDesc, v Datum) ([]byte, bool) {
+	keyFor := func(d *nbtree.PGIndexKeyDesc, v Datum) ([]byte, bool) {
 		k, hasNull, err := pgIndexTupleKey(d, keyCols, []Datum{v}, tupleKeyHeapTID)
 		if err != nil {
 			t.Fatalf("pgIndexTupleKey: %v", err)
@@ -373,18 +373,18 @@ func TestPGIndexTupleKeyNullAndDirectionFlags(t *testing.T) {
 	if !hasNull {
 		t.Fatalf("hasNull not reported for a NULL key attribute")
 	}
-	if !btree.PGIndexTupleHasNulls(nullKey) {
+	if !nbtree.PGIndexTupleHasNulls(nullKey) {
 		t.Fatalf("INDEX_NULL_MASK not set on a NULL-bearing key")
 	}
 	one, _ := keyFor(asc, NewIntDatum(1))
-	if got, _ := btree.ComparePGIndexTuples(asc, nullKey, one); got != 1 {
+	if got, _ := nbtree.ComparePGIndexTuples(asc, nullKey, one); got != 1 {
 		t.Errorf("ASC NULLS LAST: NULL vs 1 = %d, want 1", got)
 	}
 
 	nf := build(false, true)
 	nullKeyNF, _ := keyFor(nf, Datum{})
 	oneNF, _ := keyFor(nf, NewIntDatum(1))
-	if got, _ := btree.ComparePGIndexTuples(nf, nullKeyNF, oneNF); got != -1 {
+	if got, _ := nbtree.ComparePGIndexTuples(nf, nullKeyNF, oneNF); got != -1 {
 		t.Errorf("ASC NULLS FIRST: NULL vs 1 = %d, want -1", got)
 	}
 
@@ -393,7 +393,7 @@ func TestPGIndexTupleKeyNullAndDirectionFlags(t *testing.T) {
 	dsc := build(true, false)
 	lo, _ := keyFor(dsc, NewIntDatum(1))
 	hi, _ := keyFor(dsc, NewIntDatum(2))
-	if got, _ := btree.ComparePGIndexTuples(dsc, lo, hi); got != 1 {
+	if got, _ := nbtree.ComparePGIndexTuples(dsc, lo, hi); got != 1 {
 		t.Errorf("DESC: 1 vs 2 = %d, want 1", got)
 	}
 }

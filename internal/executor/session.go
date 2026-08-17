@@ -6,7 +6,7 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -22,10 +22,10 @@ type DeferredFKCheck struct {
 // Session stores per-connection state the Transaction operator needs
 // to manage BEGIN/COMMIT/ROLLBACK.
 type Session interface {
-	IsolationLevel() mvcc.IsolationLevel
+	IsolationLevel() transam.IsolationLevel
 	// SetIsolationLevel updates the session-default isolation level.
 	// Used by BEGIN ISOLATION LEVEL and SET TRANSACTION ISOLATION LEVEL.
-	SetIsolationLevel(level mvcc.IsolationLevel) error
+	SetIsolationLevel(level transam.IsolationLevel) error
 	InExplicitTransaction() bool
 	// TracksDDLUndo reports whether enum/composite-type DDL (CREATE TYPE ... AS
 	// ENUM/composite, ALTER TYPE ... ADD VALUE/RENAME TO) should be tracked in
@@ -39,8 +39,8 @@ type Session interface {
 	TracksDDLUndo() bool
 	IsReadOnlyTxn() bool // true when the current transaction was started with READ ONLY
 	SetReadOnlyTxn(v bool)
-	CurrentTransaction() (mvcc.Transaction, mvcc.Snapshot, bool)
-	BeginExplicitTransaction(tx mvcc.Transaction, snap mvcc.Snapshot)
+	CurrentTransaction() (transam.Transaction, transam.Snapshot, bool)
+	BeginExplicitTransaction(tx transam.Transaction, snap transam.Snapshot)
 	EndExplicitTransaction()
 }
 
@@ -178,10 +178,10 @@ type SeqRestoreEntry struct {
 // BasicSession is a minimal Session implementation for the v0
 // executor path.
 type BasicSession struct {
-	isolation           mvcc.IsolationLevel
+	isolation           transam.IsolationLevel
 	inTx                bool
-	tx                  mvcc.Transaction
-	snap                mvcc.Snapshot
+	tx                  transam.Transaction
+	snap                transam.Snapshot
 	pendingDDL          []DDLUndoEntry             // DDL creates pending rollback
 	pendingTruncates    []TruncateUndoEntry        // heap/index page snapshots for TRUNCATE rollback
 	pendingSeqRestores  []SeqRestoreEntry          // sequence counter restores for RESTART IDENTITY rollback
@@ -191,7 +191,7 @@ type BasicSession struct {
 	pendingInheritChng  []PendingInheritanceChange // ALTER TABLE {NO} INHERIT deferred to COMMIT (M0118-0008)
 	pendingTableDrops   []PendingTableDrop         // DROP TABLE deferred to COMMIT (M0118-0008 alter-table-4)
 	deferRoutineDrops   []DeferredRoutineDrop      // DROP FUNCTION deferred to COMMIT (M0118-0009 stats)
-	subxactStack        mvcc.SubxactStack          // savepoint stack (M0050-0004)
+	subxactStack        transam.SubxactStack          // savepoint stack (M0050-0004)
 	currentSubXid       storage.TransactionID      // 0 = use top-level tx.XID
 	txFailed            bool                       // in_failed_sql_transaction (25P02)
 	txnReadOnly         bool                       // true while inside a READ ONLY transaction (M0097-0024)
@@ -209,7 +209,7 @@ type BasicSession struct {
 // NewBasicSession constructs an explicit-transaction session state
 // holder with READ COMMITTED as default isolation.
 func NewBasicSession() *BasicSession {
-	return &BasicSession{isolation: mvcc.IsolationReadCommitted}
+	return &BasicSession{isolation: transam.IsolationReadCommitted}
 }
 
 // NewAutocommitUndoSession constructs a message-scoped, throwaway session for
@@ -229,9 +229,9 @@ func NewAutocommitUndoSession() *BasicSession {
 }
 
 // SetIsolationLevel updates the default isolation level used by BEGIN.
-func (s *BasicSession) SetIsolationLevel(level mvcc.IsolationLevel) error {
+func (s *BasicSession) SetIsolationLevel(level transam.IsolationLevel) error {
 	switch level {
-	case mvcc.IsolationReadCommitted, mvcc.IsolationRepeatableRead, mvcc.IsolationSerializable:
+	case transam.IsolationReadCommitted, transam.IsolationRepeatableRead, transam.IsolationSerializable:
 	default:
 		return fmt.Errorf("executor: unsupported isolation level %v", level)
 	}
@@ -239,7 +239,7 @@ func (s *BasicSession) SetIsolationLevel(level mvcc.IsolationLevel) error {
 	return nil
 }
 
-func (s *BasicSession) IsolationLevel() mvcc.IsolationLevel { return s.isolation }
+func (s *BasicSession) IsolationLevel() transam.IsolationLevel { return s.isolation }
 
 func (s *BasicSession) InExplicitTransaction() bool { return s.inTx }
 
@@ -248,14 +248,14 @@ func (s *BasicSession) TracksDDLUndo() bool { return s.inTx || s.autocommitUndoS
 func (s *BasicSession) IsReadOnlyTxn() bool    { return s.txnReadOnly }
 func (s *BasicSession) SetReadOnlyTxn(v bool)  { s.txnReadOnly = v }
 
-func (s *BasicSession) CurrentTransaction() (mvcc.Transaction, mvcc.Snapshot, bool) {
+func (s *BasicSession) CurrentTransaction() (transam.Transaction, transam.Snapshot, bool) {
 	if !s.inTx {
-		return mvcc.Transaction{}, mvcc.Snapshot{}, false
+		return transam.Transaction{}, transam.Snapshot{}, false
 	}
 	return s.tx, s.snap.Clone(), true
 }
 
-func (s *BasicSession) BeginExplicitTransaction(tx mvcc.Transaction, snap mvcc.Snapshot) {
+func (s *BasicSession) BeginExplicitTransaction(tx transam.Transaction, snap transam.Snapshot) {
 	s.tx = tx
 	s.snap = snap.Clone()
 	s.inTx = true
@@ -272,7 +272,7 @@ func (s *BasicSession) CmdCounter() *CommandCounter { return &s.cmdCounter }
 // detach). The XID, snapshot and pending-work state are unchanged; only the
 // Handle (and thus the proc slot the later COMMIT/ROLLBACK PREPARED finalises)
 // differs. No-op outside an open explicit transaction. M0118-0009.
-func (s *BasicSession) RelocateTransaction(tx mvcc.Transaction) {
+func (s *BasicSession) RelocateTransaction(tx transam.Transaction) {
 	if !s.inTx {
 		return
 	}
@@ -298,8 +298,8 @@ func (s *BasicSession) OnTopLevelXIDAssigned(xid storage.TransactionID) {
 }
 
 func (s *BasicSession) EndExplicitTransaction() {
-	s.tx = mvcc.Transaction{}
-	s.snap = mvcc.Snapshot{}
+	s.tx = transam.Transaction{}
+	s.snap = transam.Snapshot{}
 	s.inTx = false
 	s.pendingDDL = nil
 	s.pendingTruncates = nil
@@ -310,7 +310,7 @@ func (s *BasicSession) EndExplicitTransaction() {
 	s.pendingInheritChng = nil
 	s.pendingTableDrops = nil
 	s.deferRoutineDrops = nil
-	s.subxactStack = mvcc.SubxactStack{}
+	s.subxactStack = transam.SubxactStack{}
 	s.currentSubXid = 0
 	s.txFailed = false
 	s.deferredFKChecks = nil
@@ -637,7 +637,7 @@ func (s *BasicSession) EffectiveWriterXID() storage.TransactionID {
 
 // PushSavepoint records a new savepoint on the stack with the given
 // sub-transaction XID. The sub-XID is stamped on subsequent heap mutations.
-func (s *BasicSession) PushSavepoint(name string, snap mvcc.Snapshot, subXid storage.TransactionID) {
+func (s *BasicSession) PushSavepoint(name string, snap transam.Snapshot, subXid storage.TransactionID) {
 	entry := s.subxactStack.Push(name, snap)
 	entry.SubXid = subXid
 	s.currentSubXid = subXid
@@ -645,7 +645,7 @@ func (s *BasicSession) PushSavepoint(name string, snap mvcc.Snapshot, subXid sto
 
 // ReleaseSavepoint marks the named savepoint and all savepoints above it
 // as committed and removes them from the stack. Returns released entries.
-func (s *BasicSession) ReleaseSavepoint(name string) ([]*mvcc.SubTransactionState, error) {
+func (s *BasicSession) ReleaseSavepoint(name string) ([]*transam.SubTransactionState, error) {
 	released, err := s.subxactStack.Release(name)
 	if err != nil {
 		return nil, err
@@ -662,7 +662,7 @@ func (s *BasicSession) ReleaseSavepoint(name string) ([]*mvcc.SubTransactionStat
 // RollbackToSavepoint aborts the named savepoint and all savepoints above
 // it, then pushes a fresh entry for the same name with the given snapshot
 // and new sub-XID. Returns the aborted entries.
-func (s *BasicSession) RollbackToSavepoint(name string, newSnap mvcc.Snapshot, newSubXid storage.TransactionID) ([]*mvcc.SubTransactionState, *mvcc.SubTransactionState, error) {
+func (s *BasicSession) RollbackToSavepoint(name string, newSnap transam.Snapshot, newSubXid storage.TransactionID) ([]*transam.SubTransactionState, *transam.SubTransactionState, error) {
 	aborted, fresh, err := s.subxactStack.RollbackTo(name, newSnap)
 	if err != nil {
 		return nil, nil, err

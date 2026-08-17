@@ -26,9 +26,9 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/storage"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // replayCLogFromWAL reads every WAL record under walDir and, for each
@@ -40,7 +40,7 @@ import (
 // (RmgrXact / xlogXactCommit / xlogXactAbort emitted in PageHeaders mode)
 // are processed. The native records carry the XID at payload bytes 1..4;
 // canonical records carry it in the XLogRecord header's XID field.
-func replayCLogFromWAL(walDir string, clog *mvcc.CLog, txnMgr *mvcc.Manager) error {
+func replayCLogFromWAL(walDir string, clog *transam.CLog, txnMgr *transam.Manager) error {
 	if _, err := os.Stat(walDir); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil
@@ -49,7 +49,7 @@ func replayCLogFromWAL(walDir string, clog *mvcc.CLog, txnMgr *mvcc.Manager) err
 		// we treat them as non-fatal (physical replay already succeeded).
 		return nil
 	}
-	records, err := wal.ReadAll(filepath.Clean(walDir), 0)
+	records, err := xlog.ReadAll(filepath.Clean(walDir), 0)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil
@@ -59,7 +59,7 @@ func replayCLogFromWAL(walDir string, clog *mvcc.CLog, txnMgr *mvcc.Manager) err
 	// Walk records from the first post-checkpoint position onward. This
 	// skips pre-checkpoint records whose XIDs are already covered by the
 	// checkpoint's pg_control state.
-	startIdx, _ := wal.ExportedReplayStart(records)
+	startIdx, _ := xlog.ExportedReplayStart(records)
 	for _, r := range records[startIdx:] {
 		// M0131-S30.7: nextXID must be beyond EVERY replayed record's XID,
 		// not only the XIDs that reached a commit/abort record. Upstream does
@@ -85,17 +85,17 @@ func replayCLogFromWAL(walDir string, clog *mvcc.CLog, txnMgr *mvcc.Manager) err
 			txnMgr.SetNextXID(storage.TransactionID(r.XLog.Header.XID) + 1)
 		}
 		// --- Native goopg commit/abort records ---
-		if len(r.Payload) >= wal.XactRecordSize {
+		if len(r.Payload) >= xlog.XactRecordSize {
 			switch r.Payload[0] {
-			case wal.RecordKindXactCommit:
+			case xlog.RecordKindXactCommit:
 				xid := storage.TransactionID(binary.LittleEndian.Uint32(r.Payload[1:5]))
 				xactStampAndAdvance(clog, txnMgr, xid, true)
 				continue
-			case wal.RecordKindXactAbort:
+			case xlog.RecordKindXactAbort:
 				xid := storage.TransactionID(binary.LittleEndian.Uint32(r.Payload[1:5]))
 				xactStampAndAdvance(clog, txnMgr, xid, false)
 				continue
-			case wal.RecordKindClogTruncate:
+			case xlog.RecordKindClogTruncate:
 				// G9: re-apply the (idempotent) CLOG truncation so the
 				// post-recovery clog matches the durable WAL state. PG's
 				// clog_redo CLOG_TRUNCATE branch does the same
@@ -107,7 +107,7 @@ func replayCLogFromWAL(walDir string, clog *mvcc.CLog, txnMgr *mvcc.Manager) err
 		}
 		// --- Canonical PG-format records (emitted alongside native in
 		//     PageHeaders mode, M0106-0010 batched-46). ---
-		if r.XLog != nil && r.XLog.Header.Rmid == wal.RmgrXact {
+		if r.XLog != nil && r.XLog.Header.Rmid == xlog.RmgrXact {
 			// M0131-S22: dispatch on the OPCODE. This branch used to read
 			// "isCommit := info&OpMask == XLOG_XACT_COMMIT" and stamp
 			// unconditionally, which made every RM_XACT_ID record that is not a
@@ -118,15 +118,15 @@ func replayCLogFromWAL(walDir string, clog *mvcc.CLog, txnMgr *mvcc.Manager) err
 			// switches on the opcode and touches the clog only for
 			// COMMIT/ABORT (and their two-phase variants, which goopg refuses
 			// in the physical pass).
-			op := r.XLog.Header.Info & wal.XlogXactOpMask
-			if op != wal.XlogXactCommit && op != wal.XlogXactAbort {
+			op := r.XLog.Header.Info & xlog.XlogXactOpMask
+			if op != xlog.XlogXactCommit && op != xlog.XlogXactAbort {
 				continue
 			}
 			if r.XLog.Header.XID == 0 {
 				continue
 			}
 			xid := storage.TransactionID(r.XLog.Header.XID)
-			isCommit := op == wal.XlogXactCommit
+			isCommit := op == xlog.XlogXactCommit
 			xactStampAndAdvance(clog, txnMgr, xid, isCommit)
 			// M0131-S22: stamp the whole transaction TREE, as
 			// TransactionIdCommitTree / TransactionIdAbortTree do
@@ -139,7 +139,7 @@ func replayCLogFromWAL(walDir string, clog *mvcc.CLog, txnMgr *mvcc.Manager) err
 			// the reader already CRC-verified these bytes, so a parse error
 			// means an unfamiliar record shape, and the top-level status is
 			// still strictly better than none.
-			if parsed, perr := wal.ParseXactRecord(r.XLog.Header.Info, r.XLog.MainData); perr == nil {
+			if parsed, perr := xlog.ParseXactRecord(r.XLog.Header.Info, r.XLog.MainData); perr == nil {
 				for _, sub := range parsed.Subxacts {
 					xactStampAndAdvance(clog, txnMgr, storage.TransactionID(sub), isCommit)
 				}
@@ -149,9 +149,9 @@ func replayCLogFromWAL(walDir string, clog *mvcc.CLog, txnMgr *mvcc.Manager) err
 		// A9: PG-format clog truncation (RM_CLOG / CLOG_TRUNCATE). Decode the
 		// xl_clog_truncate body and re-apply the (idempotent) truncation — the
 		// PG-format twin of the native RecordKindClogTruncate branch above.
-		if r.XLog != nil && r.XLog.Header.Rmid == wal.RmgrCLOG &&
-			(r.XLog.Header.Info&wal.XLRRmgrInfoMask) == wal.XlogClogTruncate {
-			_, oldestXact, _, derr := wal.DecodeXLogClogTruncate(r.XLog.MainData)
+		if r.XLog != nil && r.XLog.Header.Rmid == xlog.RmgrCLOG &&
+			(r.XLog.Header.Info&xlog.XLRRmgrInfoMask) == xlog.XlogClogTruncate {
+			_, oldestXact, _, derr := xlog.DecodeXLogClogTruncate(r.XLog.MainData)
 			if derr == nil {
 				replayClogTruncate(clog, oldestXact)
 			}
@@ -187,7 +187,7 @@ func replayNextOIDFromWAL(walDir string) (uint32, error) {
 	if _, err := os.Stat(walDir); err != nil {
 		return 0, nil
 	}
-	records, err := wal.ReadAll(filepath.Clean(walDir), 0)
+	records, err := xlog.ReadAll(filepath.Clean(walDir), 0)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return 0, nil
@@ -202,13 +202,13 @@ func replayNextOIDFromWAL(walDir string) (uint32, error) {
 	// ReadAll memoization.
 	var maxOID uint32
 	for _, r := range records {
-		if r.XLog == nil || r.XLog.Header.Rmid != wal.RmgrXLog {
+		if r.XLog == nil || r.XLog.Header.Rmid != xlog.RmgrXLog {
 			continue
 		}
-		if (r.XLog.Header.Info & wal.XLRRmgrInfoMask) != wal.XlogXLogNextOid {
+		if (r.XLog.Header.Info & xlog.XLRRmgrInfoMask) != xlog.XlogXLogNextOid {
 			continue
 		}
-		nextOID, derr := wal.DecodeXLogNextOid(r.XLog.MainData)
+		nextOID, derr := xlog.DecodeXLogNextOid(r.XLog.MainData)
 		if derr != nil {
 			// A malformed body is not a reason to refuse the start — the
 			// reader already CRC-verified the bytes, so this can only mean a
@@ -232,7 +232,7 @@ func replayNextOIDFromWAL(walDir string) (uint32, error) {
 // truncate-logger hook is NOT re-fired (open.go installs the logger only
 // after this replay pass completes), preventing a recursive WAL append
 // during recovery.
-func replayClogTruncate(clog *mvcc.CLog, oldestXid storage.TransactionID) {
+func replayClogTruncate(clog *transam.CLog, oldestXid storage.TransactionID) {
 	if oldestXid == storage.InvalidTransactionID {
 		return
 	}
@@ -243,7 +243,7 @@ func replayClogTruncate(clog *mvcc.CLog, oldestXid storage.TransactionID) {
 // Errors from SetCommitted/SetAborted are silently ignored (the WAL record
 // is the authoritative durability guarantee; the clog is a write-behind
 // cache per M0106-0013 design).
-func xactStampAndAdvance(clog *mvcc.CLog, txnMgr *mvcc.Manager, xid storage.TransactionID, commit bool) {
+func xactStampAndAdvance(clog *transam.CLog, txnMgr *transam.Manager, xid storage.TransactionID, commit bool) {
 	if xid == storage.InvalidTransactionID {
 		return
 	}
@@ -271,18 +271,18 @@ func walHasXactRecords(walDir string) (bool, error) {
 	if _, err := os.Stat(walDir); os.IsNotExist(err) {
 		return false, nil
 	}
-	records, err := wal.ReadAll(walDir, 0)
+	records, err := xlog.ReadAll(walDir, 0)
 	if err != nil {
 		return false, err
 	}
 	for _, r := range records {
 		if len(r.Payload) >= 5 {
 			switch r.Payload[0] {
-			case wal.RecordKindXactCommit, wal.RecordKindXactAbort:
+			case xlog.RecordKindXactCommit, xlog.RecordKindXactAbort:
 				return true, nil
 			}
 		}
-		if r.XLog != nil && r.XLog.Header.Rmid == wal.RmgrXact && r.XLog.Header.XID != 0 {
+		if r.XLog != nil && r.XLog.Header.Rmid == xlog.RmgrXact && r.XLog.Header.XID != 0 {
 			return true, nil
 		}
 	}

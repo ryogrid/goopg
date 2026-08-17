@@ -7,9 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -25,7 +25,7 @@ import (
 // byte-for-byte identity, the per-index dual-format property, and the
 // column/attribute reconciliation the tuple branch cannot do silently.
 
-func arbiterFixture(t *testing.T, oid uint32, cols ...catalog.Column) (*Context, *planner.OnConflictPlan, *catalog.Table) {
+func arbiterFixture(t *testing.T, oid uint32, cols ...catalog.Column) (*Context, *optimizer.OnConflictPlan, *catalog.Table) {
 	t.Helper()
 	tbl := keyDescTable(cols...)
 	names := make([]string, len(cols))
@@ -35,7 +35,7 @@ func arbiterFixture(t *testing.T, oid uint32, cols ...catalog.Column) (*Context,
 		ords[i] = i
 	}
 	idx := &catalog.Index{OID: oid, Name: "arb", Table: tbl, Method: "btree", Unique: true, Columns: names}
-	return &Context{}, &planner.OnConflictPlan{ArbiterIndex: idx, ArbiterColumns: ords}, tbl
+	return &Context{}, &optimizer.OnConflictPlan{ArbiterIndex: idx, ArbiterColumns: ords}, tbl
 }
 
 func TestArbiterKeyBlobProbeAndEntryAreIdentical(t *testing.T) {
@@ -91,10 +91,10 @@ func TestArbiterKeyTupleEntryCarriesTheHeapTIDAndProbeSortsFirst(t *testing.T) {
 	// difference is the TID tiebreak — and the zero TID is minus infinity, so the
 	// probe lands BEFORE the entry it is looking for. That is what makes an
 	// arbiter scan over duplicates see all of its own matches.
-	if got := btree.BTreeTupleGetNAtts(entry, uint16(desc.NKeyAtts())); int(got) != desc.NKeyAtts() {
+	if got := nbtree.BTreeTupleGetNAtts(entry, uint16(desc.NKeyAtts())); int(got) != desc.NKeyAtts() {
 		t.Fatalf("entry natts = %d, want %d (a full key must not be a pivot)", got, desc.NKeyAtts())
 	}
-	cmp, err := btree.ComparePGIndexTuples(desc, probe, entry)
+	cmp, err := nbtree.ComparePGIndexTuples(desc, probe, entry)
 	if err != nil {
 		t.Fatalf("ComparePGIndexTuples: %v", err)
 	}
@@ -102,7 +102,7 @@ func TestArbiterKeyTupleEntryCarriesTheHeapTIDAndProbeSortsFirst(t *testing.T) {
 		t.Fatalf("probe vs entry = %d, want < 0 (zero TID is minus infinity)", cmp)
 	}
 	// Same key attributes on both sides: the split is about the TID, not the key.
-	if c, err := btree.ComparePGIndexTupleKeyAttrs(desc, probe, entry); err != nil || c != 0 {
+	if c, err := nbtree.ComparePGIndexTupleKeyAttrs(desc, probe, entry); err != nil || c != 0 {
 		t.Fatalf("key-attribute comparison = %d, %v; want 0, nil", c, err)
 	}
 }

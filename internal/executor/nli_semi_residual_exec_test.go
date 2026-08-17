@@ -32,7 +32,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 func newNLIResidualFixture(t *testing.T) (*Context, func()) {
@@ -103,14 +103,14 @@ func nliResidualExplain(t *testing.T, ctx *Context, sql string) string {
 }
 
 func TestNLISemiResidualExecution(t *testing.T) {
-	planner.SetIndexKeyHarvestEnabled(true)
-	t.Cleanup(func() { planner.SetIndexKeyHarvestEnabled(true) }) // restore the ON default
+	optimizer.SetIndexKeyHarvestEnabled(true)
+	t.Cleanup(func() { optimizer.SetIndexKeyHarvestEnabled(true) }) // restore the ON default
 	ctx, cleanup := newNLIResidualFixture(t)
 	defer cleanup()
 
 	sql := "SELECT o_key FROM ord WHERE EXISTS (SELECT 1 FROM line WHERE l_key = o_key AND l_c < l_r) ORDER BY o_key"
 	plan := nliResidualExplain(t, ctx, sql)
-	if !strings.Contains(plan, "Nested Loop (SEMI)") {
+	if !strings.Contains(plan, "Nested Loop Semi Join") {
 		t.Fatalf("expected the NLI semi path to serve this query; plan:\n%s", plan)
 	}
 	got := nliResidualRows(t, ctx, sql)
@@ -121,14 +121,14 @@ func TestNLISemiResidualExecution(t *testing.T) {
 }
 
 func TestNLIAntiResidualExecution(t *testing.T) {
-	planner.SetIndexKeyHarvestEnabled(true)
-	t.Cleanup(func() { planner.SetIndexKeyHarvestEnabled(true) }) // restore the ON default
+	optimizer.SetIndexKeyHarvestEnabled(true)
+	t.Cleanup(func() { optimizer.SetIndexKeyHarvestEnabled(true) }) // restore the ON default
 	ctx, cleanup := newNLIResidualFixture(t)
 	defer cleanup()
 
 	sql := "SELECT o_key FROM ord WHERE NOT EXISTS (SELECT 1 FROM line WHERE l_key = o_key AND l_c < l_r) ORDER BY o_key"
 	plan := nliResidualExplain(t, ctx, sql)
-	if !strings.Contains(plan, "Nested Loop (ANTI)") {
+	if !strings.Contains(plan, "Nested Loop Anti Join") {
 		t.Fatalf("expected the NLI anti path to serve this query; plan:\n%s", plan)
 	}
 	got := nliResidualRows(t, ctx, sql)
@@ -151,10 +151,10 @@ func TestNLISemiResidualMatchesSubPlanPath(t *testing.T) {
 	// o_val > 3 keeps {2,3,4}; EXISTS keeps {3}.
 	want := []string{"3"}
 
-	defer planner.SetIndexKeyHarvestEnabled(true) // restore the ON default
-	planner.SetIndexKeyHarvestEnabled(true)
+	defer optimizer.SetIndexKeyHarvestEnabled(true) // restore the ON default
+	optimizer.SetIndexKeyHarvestEnabled(true)
 	nliGot := nliResidualRows(t, ctx, sql)
-	planner.SetIndexKeyHarvestEnabled(false)
+	optimizer.SetIndexKeyHarvestEnabled(false)
 	subplanGot := nliResidualRows(t, ctx, sql)
 
 	if len(nliGot) != 1 || nliGot[0] != want[0] {
@@ -178,10 +178,10 @@ func TestScalarProbeCheapPolicyResultsAgree(t *testing.T) {
 	// 1<2 ✓, 4<5 ✓, 5<9 ✓, 7<NULL → NULL → excluded.
 	want := []string{"1", "2", "3"}
 
-	defer planner.SetIndexKeyHarvestEnabled(true) // restore the ON default
-	planner.SetIndexKeyHarvestEnabled(true)
+	defer optimizer.SetIndexKeyHarvestEnabled(true) // restore the ON default
+	optimizer.SetIndexKeyHarvestEnabled(true)
 	onGot := nliResidualRows(t, ctx, sql)
-	planner.SetIndexKeyHarvestEnabled(false)
+	optimizer.SetIndexKeyHarvestEnabled(false)
 	offGot := nliResidualRows(t, ctx, sql)
 
 	for name, got := range map[string][]string{"harvest-on": onGot, "harvest-off": offGot} {

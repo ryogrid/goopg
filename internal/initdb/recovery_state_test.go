@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/goopg/goopg/internal/control"
+	"github.com/goopg/goopg/internal/access/transam/control"
 )
 
 // TestBeginRecoveryReadsPgControlState is the M0131-S20.1 guard on the

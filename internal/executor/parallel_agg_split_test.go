@@ -14,11 +14,13 @@ package executor
 
 import (
 	"fmt"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // pqAggFixture uses values chosen so every exact aggregate is representable
@@ -49,8 +51,8 @@ func pqAggFixture(t *testing.T) (*Context, func()) {
 	return ctx, cleanup
 }
 
-func pqAggSettings(workers int) planner.ParallelSettings {
-	return planner.ParallelSettings{
+func pqAggSettings(workers int) optimizer.ParallelSettings {
+	return optimizer.ParallelSettings{
 		MaxWorkersPerGather: workers,
 		MinTableScanBlocks:  1,
 		DebugParallelQuery:  "on", // fixtures are small; force past the size gate
@@ -68,11 +70,11 @@ func runAggSplit(t *testing.T, ctx *Context, sql string, workers int) ([]string,
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	node, err := planner.Plan(stmts[0], ctx.Catalog)
+	node, err := optimizer.Plan(stmts[0], ctx.Catalog)
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
-	gathered := planner.MaybeAddGather(node, pqAggSettings(workers))
+	gathered := optimizer.MaybeAddGather(node, pqAggSettings(workers))
 	split := planHasFinalizeAgg(gathered)
 
 	ctx.MaxParallelWorkers = 8
@@ -101,18 +103,18 @@ func runAggSplit(t *testing.T, ctx *Context, sql string, workers int) ([]string,
 	return out, split
 }
 
-func planHasFinalizeAgg(n planner.Node) bool {
+func planHasFinalizeAgg(n optimizer.Node) bool {
 	found := false
-	var walk func(planner.Node)
-	walk = func(cur planner.Node) {
+	var walk func(optimizer.Node)
+	walk = func(cur optimizer.Node) {
 		if cur == nil || found {
 			return
 		}
-		if a, ok := cur.(*planner.Aggregate); ok && a.Mode == planner.AggModeFinal {
+		if a, ok := cur.(*optimizer.Aggregate); ok && a.Mode == optimizer.AggModeFinal {
 			found = true
 			return
 		}
-		for _, c := range planner.ParallelChildrenForTest(cur) {
+		for _, c := range optimizer.ParallelChildrenForTest(cur) {
 			walk(c)
 		}
 	}
@@ -182,28 +184,58 @@ func TestPartialFinalizeIdentity(t *testing.T) {
 	}
 }
 
+// pqAggMultiset normalises a rendered array_agg/string_agg value for
+// order-insensitive comparison: strip a surrounding array-literal `{`/`}`
+// if present, split on `,`, sort the elements, rejoin. Safe here only
+// because the pq_agg fixture's `s` ("r-%d") and `v` (bare integers) values
+// contain no embedded commas or braces to be confused with delimiters.
+func pqAggMultiset(s string) string {
+	s = strings.TrimPrefix(s, "{")
+	s = strings.TrimSuffix(s, "}")
+	parts := strings.Split(s, ",")
+	sort.Strings(parts)
+	return strings.Join(parts, ",")
+}
+
 // TestPartialAggregateRefusals pins the whitelist at the PLACEMENT level. P5
 // tested the predicate; this tests that the planner honours it.
 func TestPartialAggregateRefusals(t *testing.T) {
 	ctx, cleanup := pqAggFixture(t)
 	defer cleanup()
 
-	for name, sql := range map[string]string{
-		// Each worker's distinct map sees only its own share.
-		"distinct-agg": "SELECT count(DISTINCT v) FROM pq_agg",
-		// Order-dependent: parallel scans do not preserve input order.
-		"string_agg": "SELECT string_agg(s, ',') FROM pq_agg",
-		"array_agg":  "SELECT array_agg(v) FROM pq_agg",
-	} {
-		t.Run(name, func(t *testing.T) {
+	cases := []struct {
+		name string
+		sql  string
+		// orderSensitive: after M0134-0001 S16, a Gather may sit below the
+		// plain (unsplit) Aggregate, so the element order this aggregate's
+		// input arrives in is genuinely nondeterministic — and PG does not
+		// guarantee it either (postgres/doc/src/sgml/parallel.sgml:101-104:
+		// Gather "reads tuples from the workers in whatever order is
+		// convenient, destroying any sort order that may have existed").
+		// Asserting positional equality would pin a property PostgreSQL
+		// itself does not offer, so these two compare as sorted multisets
+		// instead — which still catches a dropped or duplicated row, the
+		// real parallel-execution risk this test exists to guard against.
+		orderSensitive bool
+	}{
+		// Each worker's distinct map sees only its own share. Result is
+		// order-independent (a scalar count), so nothing here became
+		// nondeterministic — keeps its exact positional comparison.
+		{name: "distinct-agg", sql: "SELECT count(DISTINCT v) FROM pq_agg"},
+		{name: "string_agg", sql: "SELECT string_agg(s, ',') FROM pq_agg", orderSensitive: true},
+		{name: "array_agg", sql: "SELECT array_agg(v) FROM pq_agg", orderSensitive: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
 			// Correctness first: whatever the planner decides, the answer must
 			// match serial.
-			serialRows, err := runQueryWithErr(ctx, sql)
+			serialRows, err := runQueryWithErr(ctx, tc.sql)
 			if err != nil {
 				t.Skipf("serial execution unsupported for this shape: %v", err)
 			}
 			want := renderRows(serialRows)
-			got, isSplit := runAggSplit(t, ctx, sql, 4)
+			got, isSplit := runAggSplit(t, ctx, tc.sql, 4)
 			if isSplit {
 				t.Errorf("planner split an aggregate the whitelist refuses")
 			}
@@ -211,7 +243,11 @@ func TestPartialAggregateRefusals(t *testing.T) {
 				t.Fatalf("got %d rows, want %d", len(got), len(want))
 			}
 			for i := range want {
-				if got[i] != want[i] {
+				g, w := got[i], want[i]
+				if tc.orderSensitive {
+					g, w = pqAggMultiset(g), pqAggMultiset(w)
+				}
+				if g != w {
 					t.Errorf("row %d: got %q, want %q", i, got[i], want[i])
 				}
 			}

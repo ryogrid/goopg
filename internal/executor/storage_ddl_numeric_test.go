@@ -3,7 +3,7 @@ package executor
 import (
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -159,12 +159,12 @@ func TestDDLInt4IndexUnchangedRegressionGuard(t *testing.T) {
 		t.Fatalf("CREATE UNIQUE INDEX (int4): %v", err)
 	}
 	idx, _ := ctx.Catalog.LookupIndex(parser.ObjectName{Name: "idx_t_id"})
-	tree, err := btree.Open(ctx.Pool, ctx.Catalog.IndexRelFileNode(idx))
+	tree, err := nbtree.Open(ctx.Pool, ctx.Catalog.IndexRelFileNode(idx))
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, k := range []int32{1, 2, 3, -5, 1000} {
-		ptr, found, err := tree.Search(btree.EncodeInt4(k))
+		ptr, found, err := tree.Search(nbtree.EncodeInt4(k))
 		if err != nil || !found {
 			t.Errorf("Search(%d): found=%v err=%v", k, found, err)
 		}

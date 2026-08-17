@@ -18,7 +18,7 @@ package executor
 
 import (
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/pgnodes"
+	"github.com/goopg/goopg/internal/nodes"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -47,9 +47,9 @@ func canonicalAttrdefText(col catalog.Column) string {
 	// varchar(N), bpchar(N), …) emits the implicit length-coercion FuncExpr PG uses.
 	// ColumnTypmod returns the packed atttypmod for modeled types and -1 for bare or
 	// non-length-qualified columns, which correctly rejects an inapplicable cast.
-	targetTypmod := pgnodes.ColumnTypmod(col.Type.Name, col.Type.Args)
-	if node, ok := pgnodes.ResolveForColumnTypmod(col.DefaultExpr, targetOID, targetTypmod); ok {
-		return pgnodes.Out(node)
+	targetTypmod := nodes.ColumnTypmod(col.Type.Name, col.Type.Args)
+	if node, ok := nodes.ResolveForColumnTypmod(col.DefaultExpr, targetOID, targetTypmod); ok {
+		return nodes.Out(node)
 	}
 	return catalog.FormatExprForAttrdef(col.DefaultExpr)
 }

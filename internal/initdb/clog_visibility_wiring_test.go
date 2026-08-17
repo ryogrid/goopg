@@ -32,7 +32,7 @@ func TestOpenAttachesCLogToTxnManager(t *testing.T) {
 
 	if !rt.TxnMgr.HasCLog() {
 		t.Fatal("initdb.Open must install the durable CLOG on the transaction manager " +
-			"(mvcc.Manager.SetCLog); without it every snapshot's durable-abort " +
+			"(transam.Manager.SetCLog); without it every snapshot's durable-abort " +
 			"fallback is dead and recovered aborts read as committed")
 	}
 }

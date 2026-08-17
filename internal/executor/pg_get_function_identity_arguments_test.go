@@ -16,7 +16,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 func TestPgGetFunctionIdentityArguments(t *testing.T) {
@@ -37,11 +37,11 @@ func TestPgGetFunctionIdentityArguments(t *testing.T) {
 	ctx.Catalog = cat
 	ctx.Now = time.Now()
 
-	oidArg := &planner.IntegerConst{Value: int64(created.OID)}
+	oidArg := &optimizer.IntegerConst{Value: int64(created.OID)}
 
-	identity, err := evalExpr(&planner.FuncCall{
+	identity, err := evalExpr(&optimizer.FuncCall{
 		Name: "pg_get_function_identity_arguments",
-		Args: []planner.Expr{oidArg},
+		Args: []optimizer.Expr{oidArg},
 	}, nil, ctx)
 	if err != nil {
 		t.Fatalf("pg_get_function_identity_arguments: %v", err)
@@ -56,9 +56,9 @@ func TestPgGetFunctionIdentityArguments(t *testing.T) {
 
 	// For an all-IN function with no defaults, identity arguments and the full
 	// argument list are byte-identical — the documented invariant for goopg.
-	full, err := evalExpr(&planner.FuncCall{
+	full, err := evalExpr(&optimizer.FuncCall{
 		Name: "pg_get_function_arguments",
-		Args: []planner.Expr{oidArg},
+		Args: []optimizer.Expr{oidArg},
 	}, nil, ctx)
 	if err != nil {
 		t.Fatalf("pg_get_function_arguments: %v", err)
@@ -90,9 +90,9 @@ func TestPgGetFunctionIdentityArgumentsOutMode(t *testing.T) {
 	ctx.Catalog = cat
 	ctx.Now = time.Now()
 
-	identity, err := evalExpr(&planner.FuncCall{
+	identity, err := evalExpr(&optimizer.FuncCall{
 		Name: "pg_get_function_identity_arguments",
-		Args: []planner.Expr{&planner.IntegerConst{Value: int64(created.OID)}},
+		Args: []optimizer.Expr{&optimizer.IntegerConst{Value: int64(created.OID)}},
 	}, nil, ctx)
 	if err != nil {
 		t.Fatalf("pg_get_function_identity_arguments: %v", err)
@@ -130,11 +130,11 @@ func TestPgGetFunctionArgumentsDefault(t *testing.T) {
 	ctx.Catalog = cat
 	ctx.Now = time.Now()
 
-	oidArg := &planner.IntegerConst{Value: int64(created.OID)}
+	oidArg := &optimizer.IntegerConst{Value: int64(created.OID)}
 
-	full, err := evalExpr(&planner.FuncCall{
+	full, err := evalExpr(&optimizer.FuncCall{
 		Name: "pg_get_function_arguments",
-		Args: []planner.Expr{oidArg},
+		Args: []optimizer.Expr{oidArg},
 	}, nil, ctx)
 	if err != nil {
 		t.Fatalf("pg_get_function_arguments: %v", err)
@@ -143,9 +143,9 @@ func TestPgGetFunctionArgumentsDefault(t *testing.T) {
 		t.Errorf("full args = %q, want %q", got, want)
 	}
 
-	identity, err := evalExpr(&planner.FuncCall{
+	identity, err := evalExpr(&optimizer.FuncCall{
 		Name: "pg_get_function_identity_arguments",
-		Args: []planner.Expr{oidArg},
+		Args: []optimizer.Expr{oidArg},
 	}, nil, ctx)
 	if err != nil {
 		t.Fatalf("pg_get_function_identity_arguments: %v", err)
@@ -185,13 +185,13 @@ func TestPgGetFunctionResultReturnsTable(t *testing.T) {
 	ctx.Catalog = cat
 	ctx.Now = time.Now()
 
-	oidArg := &planner.IntegerConst{Value: int64(created.OID)}
+	oidArg := &optimizer.IntegerConst{Value: int64(created.OID)}
 
 	// Arguments exclude the table columns; the lone IN arg keeps no mode prefix
 	// (PG omits IN for plain functions once the TABLE columns are removed).
-	args, err := evalExpr(&planner.FuncCall{
+	args, err := evalExpr(&optimizer.FuncCall{
 		Name: "pg_get_function_arguments",
-		Args: []planner.Expr{oidArg},
+		Args: []optimizer.Expr{oidArg},
 	}, nil, ctx)
 	if err != nil {
 		t.Fatalf("pg_get_function_arguments: %v", err)
@@ -201,9 +201,9 @@ func TestPgGetFunctionResultReturnsTable(t *testing.T) {
 	}
 
 	// Identity arguments share the same exclusion.
-	ident, err := evalExpr(&planner.FuncCall{
+	ident, err := evalExpr(&optimizer.FuncCall{
 		Name: "pg_get_function_identity_arguments",
-		Args: []planner.Expr{oidArg},
+		Args: []optimizer.Expr{oidArg},
 	}, nil, ctx)
 	if err != nil {
 		t.Fatalf("pg_get_function_identity_arguments: %v", err)
@@ -213,9 +213,9 @@ func TestPgGetFunctionResultReturnsTable(t *testing.T) {
 	}
 
 	// The result renders the TABLE(...) clause from the OUT-stored columns.
-	result, err := evalExpr(&planner.FuncCall{
+	result, err := evalExpr(&optimizer.FuncCall{
 		Name: "pg_get_function_result",
-		Args: []planner.Expr{oidArg},
+		Args: []optimizer.Expr{oidArg},
 	}, nil, ctx)
 	if err != nil {
 		t.Fatalf("pg_get_function_result: %v", err)
@@ -249,11 +249,11 @@ func TestPgGetFunctionResultReturnsTableNoArgs(t *testing.T) {
 	ctx.Catalog = cat
 	ctx.Now = time.Now()
 
-	oidArg := &planner.IntegerConst{Value: int64(created.OID)}
+	oidArg := &optimizer.IntegerConst{Value: int64(created.OID)}
 
-	args, err := evalExpr(&planner.FuncCall{
+	args, err := evalExpr(&optimizer.FuncCall{
 		Name: "pg_get_function_arguments",
-		Args: []planner.Expr{oidArg},
+		Args: []optimizer.Expr{oidArg},
 	}, nil, ctx)
 	if err != nil {
 		t.Fatalf("pg_get_function_arguments: %v", err)
@@ -262,9 +262,9 @@ func TestPgGetFunctionResultReturnsTableNoArgs(t *testing.T) {
 		t.Errorf("arguments = %q, want empty", got)
 	}
 
-	result, err := evalExpr(&planner.FuncCall{
+	result, err := evalExpr(&optimizer.FuncCall{
 		Name: "pg_get_function_result",
-		Args: []planner.Expr{oidArg},
+		Args: []optimizer.Expr{oidArg},
 	}, nil, ctx)
 	if err != nil {
 		t.Fatalf("pg_get_function_result: %v", err)

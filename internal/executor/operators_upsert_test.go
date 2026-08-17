@@ -5,7 +5,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // upsertSeed installs the items fixture rows AND a unique index on
@@ -40,7 +40,7 @@ func runUpsertSQL(t *testing.T, ctx *Context, sql string) (rowsAffected int64) {
 	if err != nil {
 		t.Fatalf("Parse(%q): %v", sql, err)
 	}
-	node, err := planner.Plan(stmts[0], ctx.Catalog)
+	node, err := optimizer.Plan(stmts[0], ctx.Catalog)
 	if err != nil {
 		t.Fatalf("Plan(%q): %v", sql, err)
 	}
@@ -67,7 +67,7 @@ func runUpsertSQL(t *testing.T, ctx *Context, sql string) (rowsAffected int64) {
 // id→label map for cheap content assertions.
 func scanItems(t *testing.T, ctx *Context, tbl *catalog.Table) map[int64]string {
 	t.Helper()
-	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: tbl})
 	if err := scan.Open(ctx); err != nil {
 		t.Fatalf("scan.Open: %v", err)
 	}
@@ -179,11 +179,11 @@ func TestPlanUpsertDoNothingNoTargetUsesExpressionUniqueIndex(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	node, err := planner.Plan(stmts[0], ctx.Catalog)
+	node, err := optimizer.Plan(stmts[0], ctx.Catalog)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ins, ok := node.(*planner.Insert)
+	ins, ok := node.(*optimizer.Insert)
 	if !ok {
 		t.Fatalf("node = %T, want *planner.Insert", node)
 	}
@@ -225,11 +225,11 @@ func TestPlanUpsertDoNothingNoTargetFindsArbiterUnderDistinctDBOid(t *testing.T)
 	}
 	planCat := catalog.WithSearchPath(ctx.Catalog, nil)
 	planCat.DBOid = otherDBOid
-	node, err := planner.Plan(stmts[0], planCat)
+	node, err := optimizer.Plan(stmts[0], planCat)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ins, ok := node.(*planner.Insert)
+	ins, ok := node.(*optimizer.Insert)
 	if !ok {
 		t.Fatalf("node = %T, want *planner.Insert", node)
 	}
@@ -336,7 +336,7 @@ func TestUpsertConflictKeyModificationAllowed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	node, err := planner.Plan(stmts[0], ctx.Catalog)
+	node, err := optimizer.Plan(stmts[0], ctx.Catalog)
 	if err != nil {
 		t.Fatal(err)
 	}

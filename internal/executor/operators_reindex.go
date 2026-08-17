@@ -22,9 +22,9 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/storage/lmgr"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -36,7 +36,7 @@ type reindexOp struct {
 
 func newReindexOp(s *parser.ReindexStmt) *reindexOp { return &reindexOp{stmt: s} }
 
-func (o *reindexOp) Schema() planner.Schema { return nil }
+func (o *reindexOp) Schema() optimizer.Schema { return nil }
 
 func (o *reindexOp) Open(ctx *Context) error {
 	o.ctx = ctx
@@ -237,9 +237,9 @@ func (o *reindexOp) rebuildIndex(idx *catalog.Index, pos int) error {
 		}
 		cols[i] = col
 	}
-	var predExpr planner.Expr
+	var predExpr optimizer.Expr
 	if idx.HasPredicate && idx.Predicate != nil {
-		predExpr, _ = planner.ResolveIndexPredicate(idx.Predicate, tbl)
+		predExpr, _ = optimizer.ResolveIndexPredicate(idx.Predicate, tbl)
 	}
 	idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
 	tblRel := o.ctx.Catalog.RelFileNode(tbl)
@@ -398,9 +398,9 @@ func (o *reindexOp) buildIndexShadow(idx *catalog.Index, pos int) (storage.RelFi
 		}
 		cols[i] = col
 	}
-	var predExpr planner.Expr
+	var predExpr optimizer.Expr
 	if idx.HasPredicate && idx.Predicate != nil {
-		predExpr, _ = planner.ResolveIndexPredicate(idx.Predicate, tbl)
+		predExpr, _ = optimizer.ResolveIndexPredicate(idx.Predicate, tbl)
 	}
 	shadowRel := o.ctx.Catalog.IndexRelFileNode(idx)
 	shadowRel.RelOid = o.ctx.Catalog.AllocOID()
@@ -452,18 +452,18 @@ func (o *reindexOp) acquireReindexLocks(idxRel, tblRel storage.RelFileNode) (fun
 	if c.Ctx != nil {
 		lockCtx = c.Ctx
 	}
-	tblTag := lockmgr.LockTag{DB: tblRel.DBOid, Rel: tblRel.RelOid}
-	idxTag := lockmgr.LockTag{DB: idxRel.DBOid, Rel: idxRel.RelOid}
-	if err := tableLockMgr.AcquireWithTimeout(lockCtx, backend, tblTag, lockmgr.ShareLock, c.deadlockTimeout()); err != nil {
+	tblTag := lmgr.LockTag{DB: tblRel.DBOid, Rel: tblRel.RelOid}
+	idxTag := lmgr.LockTag{DB: idxRel.DBOid, Rel: idxRel.RelOid}
+	if err := tableLockMgr.AcquireWithTimeout(lockCtx, backend, tblTag, lmgr.ShareLock, c.deadlockTimeout()); err != nil {
 		return nil, reindexLockWaitError(err)
 	}
-	if err := tableLockMgr.AcquireWithTimeout(lockCtx, backend, idxTag, lockmgr.AccessExclusiveLock, c.deadlockTimeout()); err != nil {
-		tableLockMgr.Release(backend, tblTag, lockmgr.ShareLock)
+	if err := tableLockMgr.AcquireWithTimeout(lockCtx, backend, idxTag, lmgr.AccessExclusiveLock, c.deadlockTimeout()); err != nil {
+		tableLockMgr.Release(backend, tblTag, lmgr.ShareLock)
 		return nil, reindexLockWaitError(err)
 	}
 	return func() {
-		tableLockMgr.Release(backend, idxTag, lockmgr.AccessExclusiveLock)
-		tableLockMgr.Release(backend, tblTag, lockmgr.ShareLock)
+		tableLockMgr.Release(backend, idxTag, lmgr.AccessExclusiveLock)
+		tableLockMgr.Release(backend, tblTag, lmgr.ShareLock)
 	}, nil
 }
 
@@ -472,7 +472,7 @@ func (o *reindexOp) acquireReindexLocks(idxRel, tblRel storage.RelFileNode) (fun
 // wait reports deadlocks/cancellations identically to every other blocking
 // DDL lock acquisition in this codebase.
 func reindexLockWaitError(err error) error {
-	if err == lockmgr.ErrDeadlockDetected {
+	if err == lmgr.ErrDeadlockDetected {
 		return &ExecError{Code: "40P01", Message: "deadlock detected"}
 	}
 	if ee := lockWaitCancelError(err); ee != nil {

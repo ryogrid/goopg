@@ -16,11 +16,11 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/executor"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/pgnodes"
+	"github.com/goopg/goopg/internal/nodes"
 	"github.com/goopg/goopg/internal/storage"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // catalogRowLive is the SINGLE liveness filter for catalog-heap reload scans,
@@ -39,7 +39,7 @@ import (
 //     Unknown) and must pass through, or catalogs empty on standby bootstrap.
 //  4. requireCommittedXmin (legacy-layout rows in scans that opt in) → the
 //     row additionally needs a locally-committed xmin.
-func catalogRowLive(clog *mvcc.CLog, ht storage.HeapTuple, requireCommittedXmin bool) bool {
+func catalogRowLive(clog *transam.CLog, ht storage.HeapTuple, requireCommittedXmin bool) bool {
 	if ht.Header.Xmin == storage.InvalidTransactionID {
 		return false
 	}
@@ -49,10 +49,10 @@ func catalogRowLive(clog *mvcc.CLog, ht storage.HeapTuple, requireCommittedXmin 
 	if clog == nil {
 		return true
 	}
-	if clog.GetStatus(ht.Header.Xmin) == mvcc.TxnStatusAborted {
+	if clog.GetStatus(ht.Header.Xmin) == transam.TxnStatusAborted {
 		return false
 	}
-	if requireCommittedXmin && clog.GetStatus(ht.Header.Xmin) != mvcc.TxnStatusCommitted {
+	if requireCommittedXmin && clog.GetStatus(ht.Header.Xmin) != transam.TxnStatusCommitted {
 		return false
 	}
 	return true
@@ -72,7 +72,7 @@ func catalogRowLive(clog *mvcc.CLog, ht storage.HeapTuple, requireCommittedXmin 
 // clusters / fresh initdb and that is not an error. Block-read failures are
 // fatal (the file exists but cannot be read); torn line-pointer counts skip
 // the block, matching the historical loops.
-func scanCatalogHeapRows(mgr *storage.Manager, rel storage.RelFileNode, clog *mvcc.CLog,
+func scanCatalogHeapRows(mgr *storage.Manager, rel storage.RelFileNode, clog *transam.CLog,
 	name string, decode func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error)) ([]any, error) {
 	nBlocks, err := mgr.NBlocks(rel)
 	if err != nil || nBlocks == 0 {
@@ -124,7 +124,7 @@ type catalogReloadDesc struct {
 	// Reload performs the catalog's scan+apply. Simple single-heap catalogs
 	// build this with simpleCatalogReload; multi-heap joins (the pg_class +
 	// pg_attribute exemplar) implement it directly.
-	Reload func(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog, heapDBOid, nsDBOid uint32) error
+	Reload func(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid, nsDBOid uint32) error
 }
 
 // simpleCatalogReload builds a Reload for a single-heap catalog from the doc
@@ -132,8 +132,8 @@ type catalogReloadDesc struct {
 func simpleCatalogReload(relOid uint32, shared bool, name string,
 	decode func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error),
 	applyBatch func(cat *catalog.InMemory, nsDBOid uint32, rows []any) error,
-) func(*storage.Manager, *catalog.InMemory, *mvcc.CLog, uint32, uint32) error {
-	return func(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog, heapDBOid, nsDBOid uint32) error {
+) func(*storage.Manager, *catalog.InMemory, *transam.CLog, uint32, uint32) error {
+	return func(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid, nsDBOid uint32) error {
 		dbOid := heapDBOid
 		if shared {
 			dbOid = 0 // global/ tablespace routing (B4)
@@ -159,7 +159,7 @@ func simpleCatalogReload(relOid uint32, shared bool, name string,
 // ALTER/DROP can locate the row (doc 02a §3.3). Dropped/renamed schemas
 // need no special handling: their old versions carry xmax and the liveness
 // filter skips them.
-func reloadUserSchemasFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func reloadUserSchemasFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	type nsRow struct {
 		oid   uint32
 		name  string
@@ -214,7 +214,7 @@ func reloadUserSchemasFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog
 // user database's heap. Lookups are dbOid-agnostic (LookupTableByOIDAllDBs),
 // matching the old WAL replay, so a row is applied to whichever namespace its
 // table reloaded into.
-func loadColumnDefaultsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func loadColumnDefaultsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	if cat == nil {
 		return nil
 	}
@@ -240,7 +240,7 @@ func loadColumnDefaultsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clo
 // adrelid → table OID, adnum → 1-based ordinal). A missing/empty heap is a
 // no-op. A deparse/reparse gap for one column degrades to the pre-record state
 // (NULL default) rather than failing startup, matching the old replay.
-func loadColumnDefaultsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog, heapDBOid uint32) error {
+func loadColumnDefaultsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid uint32) error {
 	type adRow struct {
 		adrelid uint32
 		adnum   int16
@@ -298,7 +298,7 @@ func loadColumnDefaultsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory
 // run AFTER every table-load pass (the M0114 catalog cache bypasses
 // loadUserTablesFromHeap, so it cannot live inside it), scanning the main DB
 // heap plus each registered user database's own heap.
-func loadInheritanceFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func loadInheritanceFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	if cat == nil {
 		return nil
 	}
@@ -325,7 +325,7 @@ func loadInheritanceFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 // parent→children registry. A missing/empty heap is a no-op; an edge whose child
 // or parent no longer exists is skipped rather than failing startup, matching the
 // other reload passes.
-func loadInheritanceFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog, heapDBOid uint32) error {
+func loadInheritanceFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid uint32) error {
 	type inhRow struct {
 		child  uint32
 		parent uint32
@@ -393,11 +393,11 @@ func loadInheritanceFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, c
 // rather than failing startup, matching the pre-canonical behavior.
 func rebuildAttrdefExpr(adbin string) (parser.Expr, error) {
 	if len(adbin) > 0 && adbin[0] == '{' {
-		node, err := pgnodes.Read(adbin)
+		node, err := nodes.Read(adbin)
 		if err != nil {
 			return nil, err
 		}
-		return pgnodes.Rebuild(node)
+		return nodes.Rebuild(node)
 	}
 	return parser.ParseExpr(adbin)
 }
@@ -417,15 +417,15 @@ func rebuildAttrdefExpr(adbin string) (parser.Expr, error) {
 // one view to a plain relation rather than failing startup.
 func rebuildViewFromEvAction(evAction string) (sel *parser.SelectStmt, canonical bool, ok bool) {
 	if strings.HasPrefix(evAction, "({") {
-		nodes, err := pgnodes.ReadRuleAction(evAction)
-		if err != nil || len(nodes) != 1 {
+		nlist, err := nodes.ReadRuleAction(evAction)
+		if err != nil || len(nlist) != 1 {
 			return nil, false, false
 		}
-		q, qok := nodes[0].(*pgnodes.Query)
+		q, qok := nlist[0].(*nodes.Query)
 		if !qok {
 			return nil, false, false
 		}
-		s, err := pgnodes.RebuildViewQuery(q)
+		s, err := nodes.RebuildViewQuery(q)
 		if err != nil {
 			return nil, false, false
 		}
@@ -468,7 +468,7 @@ var statCharToKind = map[byte]string{
 // them into the statisticsObjs registry (the query path). Must run AFTER every
 // loadUserTablesFromHeap pass so each object's owning table (stxrelid) is
 // registered — stxkeys attnums decode back to column names via it.
-func loadStatisticsExtFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func loadStatisticsExtFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	if cat == nil {
 		return nil
 	}
@@ -490,7 +490,7 @@ func loadStatisticsExtFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog
 
 // loadStatisticsExtFromHeapForDB scans base/<heapDBOid>/3381 and re-registers
 // each live pg_statistic_ext row. A missing/empty heap is a no-op.
-func loadStatisticsExtFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog, heapDBOid uint32) error {
+func loadStatisticsExtFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid uint32) error {
 	var reg statExtRegistryRecovery = cat
 	type stxRow struct {
 		oid, relid, nsOID, owner uint32
@@ -622,7 +622,7 @@ func parsePGCharArrayPayload(b []byte) []byte {
 // matview IsPopulated is restored from pg_class.relispopulated during
 // loadUserTablesFromHeap (02e item A), which runs before this pass, so this pass
 // only rebuilds the query AST and must NOT touch tbl.IsPopulated.
-func loadViewsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func loadViewsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	if cat == nil {
 		return nil
 	}
@@ -646,7 +646,7 @@ func loadViewsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.C
 // for each user _RETURN rule. A missing/empty heap is a no-op; a query that no
 // longer re-parses degrades that one view to its pre-record state (a plain
 // relkind-tagged relation with View=nil), never failing startup.
-func loadViewsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog, heapDBOid uint32) error {
+func loadViewsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid uint32) error {
 	type rewriteRow struct {
 		rulename string
 		evClass  uint32
@@ -707,7 +707,7 @@ func loadViewsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 // filter. The registry's owner/location fields are never read (the virtual
 // view hardcodes spcowner=10), so they are re-registered empty. Dropped
 // tablespaces carry xmax and the liveness filter skips them.
-func reloadUserTablespacesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func reloadUserTablespacesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	type tsRow struct {
 		oid  uint32
 		name string
@@ -747,7 +747,7 @@ func reloadUserTablespacesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, 
 // reload see the row regardless of file-flush timing — the same crash-consistent
 // path B4.1-B4.5 use. Dropped databases carry xmax and are skipped by the
 // liveness filter.
-func reloadDatabasesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func reloadDatabasesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	if cat == nil {
 		return nil
 	}
@@ -802,7 +802,7 @@ func reloadDatabasesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 // when the file itself is flushed — the same crash-consistent path B4.1–B4.4
 // use. Dropped/renamed old rows carry xmax and are skipped by the liveness
 // filter.
-func reloadRolesFromAuthidHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func reloadRolesFromAuthidHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	if cat == nil {
 		return nil
 	}
@@ -880,7 +880,7 @@ func reloadRolesFromAuthidHeap(mgr *storage.Manager, cat *catalog.InMemory, clog
 // registries via the idempotent SetDatabaseConfig (setrole==0) / SetRoleConfig
 // (setrole!=0). Dropped rows (RESET ALL) carry xmax and are skipped by the
 // liveness filter.
-func reloadDbRoleSettingsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func reloadDbRoleSettingsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	type cfgRow struct {
 		setDatabase uint32
 		setRole     uint32
@@ -928,7 +928,7 @@ func reloadDbRoleSettingsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, c
 // pg_subscription is SHARED (global/6100). Each live row's 8 goopg-tracked
 // columns rebuild a catalog.Subscription (the other 10 PG columns are
 // registry-irrelevant defaults); dropped rows carry xmax and are skipped.
-func reloadSubscriptionsFromHeap(mgr *storage.Manager, pubsub *catalog.PubSub, clog *mvcc.CLog) error {
+func reloadSubscriptionsFromHeap(mgr *storage.Manager, pubsub *catalog.PubSub, clog *transam.CLog) error {
 	rel := storage.RelFileNode{DBOid: 0, RelOid: 6100, Fork: storage.MainFork}
 	cols := executor.PGSubscriptionColumnsPG18()
 	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_subscription",
@@ -963,7 +963,7 @@ func reloadSubscriptionsFromHeap(mgr *storage.Manager, pubsub *catalog.PubSub, c
 // (RecordKinds 79/80). pg_auth_members is SHARED (global/1261). Each live row
 // is re-registered into the roleMembers registry with its original OID and
 // option flags; revoked rows carry xmax and are skipped by the liveness filter.
-func reloadRoleMembershipsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func reloadRoleMembershipsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	rel := storage.RelFileNode{DBOid: 0, RelOid: 1261, Fork: storage.MainFork}
 	cols := executor.PGAuthMembersColumnsPG18()
 	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_auth_members",
@@ -998,7 +998,7 @@ func reloadRoleMembershipsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, 
 // full Routine metadata as JSON in proargdefaults (col 24, see
 // executor.DecodePGProcArgMeta) + the body in prosrc; builtins (the 3397
 // seed rows) stay compiled-in/seeded and are skipped by the OID filter.
-func reloadUserRoutinesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func reloadUserRoutinesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	rs := cat.Routines()
 	if rs == nil {
 		return nil
@@ -1059,7 +1059,7 @@ var errSkipBuiltinRow = fmt.Errorf("catalog reload: builtin row skipped")
 //
 // Pre-B1.3b data dirs (sequences journaled only via kind-65) need re-init:
 // their counters have no physical page and the WAL scanner is gone.
-func reloadSequencesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func reloadSequencesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	// OWNED BY map: seqrelid → (tableOID, attnum) from pg_depend auto rows.
 	depCols := executor.PGDependColumnsPG18()
 	type depRow struct{ objid, refobjid, refsubid uint32 }
@@ -1135,7 +1135,7 @@ func reloadSequencesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 				}
 			}
 		}
-		p := wal.SequenceStatePayload{
+		p := xlog.SequenceStatePayload{
 			Name:      name,
 			Start:     d[2].Int,
 			Increment: d[3].Int,
@@ -1201,7 +1201,7 @@ func reloadSequencesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 // runCatalogReloads executes every descriptor in Slot order. Non-Fatal
 // descriptor errors are returned in aggregate form by the caller's logging
 // convention; Fatal ones abort immediately.
-func runCatalogReloads(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog,
+func runCatalogReloads(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog,
 	heapDBOid, nsDBOid uint32, descs []catalogReloadDesc, warn func(name string, err error)) error {
 	sorted := make([]catalogReloadDesc, len(descs))
 	copy(sorted, descs)
@@ -1302,7 +1302,7 @@ func domainInValuesFromConbin(conbin string) []string {
 // heap rows keyed by contypid. Every user pg_type row's TID (domains AND
 // their array peers — also enum/range/composite rows) is seeded into the
 // TypeHeapTID cache so ALTER-driven non-HOT updates find the live version.
-func reloadUserDomainsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func reloadUserDomainsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	typeCols := executor.PGTypeColumnsPG18()
 	type typeRow struct {
 		decoded executor.Row
@@ -1424,7 +1424,7 @@ func reloadUserDomainsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog
 // linkage (subtype, multirange, opclass, collation); the range and
 // multirange pg_type rows carry names/array peers/owner; the subtype name
 // resolves via pgTypeCanonical.
-func reloadUserRangeTypesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func reloadUserRangeTypesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	rangeCols := executor.PGRangeColumnsPG18()
 	type rangeRow struct {
 		typid, subtype, multitypid, collation, subopc uint32
@@ -1526,7 +1526,7 @@ func reloadUserRangeTypesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, c
 // no WAL record, no scanner). The enum skeleton comes from its pg_type row
 // (typtype='e', oid >= FirstUserOID); its labels come from the pg_enum heap
 // rows grouped by enumtypid, ordered by enumsortorder.
-func reloadUserEnumsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func reloadUserEnumsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	enumCols := executor.PGEnumColumnsPG18()
 	type labelRow struct {
 		oid   uint32
@@ -1613,7 +1613,7 @@ func reloadUserEnumsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 // 38/39). Fully physical: the six pg_cast columns map 1:1 onto the Cast
 // registry; source/target type names revive via pgTypeCanonical for
 // builtins and the user pg_type rows otherwise.
-func reloadUserCastsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func reloadUserCastsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	castCols := executor.PGCastColumnsPG18()
 	type castRow struct {
 		oid, source, target, funcOID uint32
@@ -1681,7 +1681,7 @@ func reloadUserCastsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 // Must run after reloadUserRoutinesFromHeap (which skips prokind='a' rows)
 // and after the schema reload (RegisterUserAggregateDuringRecovery resolves
 // NamespaceOID by schema name).
-func reloadUserAggregatesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func reloadUserAggregatesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	rs := cat.Routines()
 	if rs == nil {
 		return nil
@@ -1733,7 +1733,7 @@ func reloadUserAggregatesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, c
 // lookups. Shell operators (oprcode=0) reload as shells, exactly as the
 // pre-crash server held them. Seeds the operator TID cache so a post-restart
 // back-patch or shell fill-in updates the row in place.
-func reloadUserOperatorsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func reloadUserOperatorsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	opCols := executor.PGOperatorColumnsPG18()
 	type opRow struct {
 		op  catalog.UserOperator
@@ -1816,7 +1816,7 @@ func reloadTypeNameForOID(cat *catalog.InMemory, oid uint32) string {
 // resolved session DB; verified empirically — registering under cat.DBOID()
 // made every post-restart lookup miss). Cross-database collations remain
 // non-dbOid-aware (pre-existing ledger row).
-func reloadUserCollationsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func reloadUserCollationsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	collCols := executor.PGCollationColumnsPG18()
 	type collRow struct {
 		uc  catalog.UserCollation
@@ -1875,7 +1875,7 @@ func reloadUserCollationsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, c
 // routines registry (user funcs) or the curated builtin set — "" when
 // neither resolves (the virtual view then renders from FuncOID, which is
 // the authoritative source anyway).
-func reloadUserConversionsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func reloadUserConversionsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	convCols := executor.PGConversionColumnsPG18()
 	type convRow struct {
 		uc  catalog.UserConversion
@@ -1951,7 +1951,7 @@ func reloadUserConversionsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, 
 // Registries key on DefaultDBOid for postgres-DB sessions (NamespaceDBOid),
 // so the reload leaves DBOid unset and the *DuringRecovery zero-fallback
 // supplies it — the B2.2d rule.
-func reloadOpClassFamilyFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func reloadOpClassFamilyFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	if err := reloadOpFamiliesFromHeap(mgr, cat, clog); err != nil {
 		return err
 	}
@@ -1968,7 +1968,7 @@ func reloadOpClassFamilyFromHeap(mgr *storage.Manager, cat *catalog.InMemory, cl
 	return reloadAmProcMembersFromHeap(mgr, cat, clog, classByMember)
 }
 
-func reloadOpFamiliesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func reloadOpFamiliesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	cols := executor.PGOpfamilyColumnsPG18()
 	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2753, Fork: storage.MainFork}
 	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_opfamily",
@@ -2003,7 +2003,7 @@ func reloadOpFamiliesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog 
 	return nil
 }
 
-func reloadOpClassesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func reloadOpClassesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	cols := executor.PGOpclassColumnsPG18()
 	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2616, Fork: storage.MainFork}
 	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_opclass",
@@ -2045,7 +2045,7 @@ func reloadOpClassesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 // scanAmMemberClassDepends returns (member classid, member oid) → owning
 // opclass OID, read from the INTERNAL pg_depend rows the member writers
 // journal (see executor.writeAmMemberClassDependRow).
-func scanAmMemberClassDepends(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) (map[[2]uint32]uint32, error) {
+func scanAmMemberClassDepends(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) (map[[2]uint32]uint32, error) {
 	cols := executor.PGDependColumnsPG18()
 	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2608, Fork: storage.MainFork}
 	type dep struct {
@@ -2076,7 +2076,7 @@ func scanAmMemberClassDepends(mgr *storage.Manager, cat *catalog.InMemory, clog 
 	return out, nil
 }
 
-func reloadAmOpMembersFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog, classByMember map[[2]uint32]uint32) error {
+func reloadAmOpMembersFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, classByMember map[[2]uint32]uint32) error {
 	cols := executor.PGAmopColumnsPG18()
 	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2602, Fork: storage.MainFork}
 	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_amop",
@@ -2111,7 +2111,7 @@ func reloadAmOpMembersFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog
 	return nil
 }
 
-func reloadAmProcMembersFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog, classByMember map[[2]uint32]uint32) error {
+func reloadAmProcMembersFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, classByMember map[[2]uint32]uint32) error {
 	cols := executor.PGAmprocColumnsPG18()
 	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2603, Fork: storage.MainFork}
 	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_amproc",
@@ -2156,7 +2156,7 @@ func reloadAmProcMembersFromHeap(mgr *storage.Manager, cat *catalog.InMemory, cl
 // OIDs, and the registry's two name fields reverse from trftype/trflang
 // (the cast-reload type-name pattern; the language name comes from the same
 // four-way builtin map LanguageNameToOID renders forward).
-func reloadUserTransformsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func reloadUserTransformsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	cols := executor.PGTransformColumnsPG18()
 	type trfRow struct {
 		oid, typeOID, langOID, fromFn, toFn uint32
@@ -2213,7 +2213,7 @@ func languageNameForOID(oid uint32) string {
 // ParseTextArrayLiteral splits back to the registry's Tags slice (NULL → nil,
 // no WHEN TAG filter). Seeds the TID cache so a post-restart ALTER updates
 // the row in place.
-func reloadUserEventTriggersFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func reloadUserEventTriggersFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	cols := executor.PGEventTriggerColumnsPG18()
 	type etRow struct {
 		et  catalog.EventTrigger
@@ -2266,7 +2266,7 @@ func reloadUserEventTriggersFromHeap(mgr *storage.Manager, cat *catalog.InMemory
 // (prrelid → the qualified table name via cat.LookupTableByOID), then
 // registers each into the PubSub registry. Seeds the InMemory TID cache so a
 // post-restart ALTER PUBLICATION OWNER updates the base row in place.
-func reloadUserPublicationsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, pubsub *catalog.PubSub, clog *mvcc.CLog) error {
+func reloadUserPublicationsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, pubsub *catalog.PubSub, clog *transam.CLog) error {
 	// Pass 1: member rows, grouped by publication OID.
 	membersByPub := map[uint32][]string{}
 	prCols := executor.PGPublicationRelColumnsPG18()
@@ -2351,7 +2351,7 @@ func reloadUserPublicationsFromHeap(mgr *storage.Manager, cat *catalog.InMemory,
 // → role name). Options are text[] columns decoded to "{a,b}" and split via
 // ParseTextArrayLiteral. Per-database catalogs, so the reload keys under
 // DefaultDBOid (the registries' resolveDBOid default), matching live writes.
-func reloadForeignDataFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func reloadForeignDataFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	if err := reloadFdwsFromHeap(mgr, cat, clog); err != nil {
 		return err
 	}
@@ -2368,7 +2368,7 @@ func decodeOptions(d executor.Datum) []string {
 	return nil
 }
 
-func reloadFdwsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func reloadFdwsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	cols := executor.PGForeignDataWrapperColumnsPG18()
 	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2328, Fork: storage.MainFork}
 	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_foreign_data_wrapper",
@@ -2400,7 +2400,7 @@ func reloadFdwsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.
 	return nil
 }
 
-func reloadForeignServersFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func reloadForeignServersFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	cols := executor.PGForeignServerColumnsPG18()
 	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 1417, Fork: storage.MainFork}
 	type srvRow struct {
@@ -2441,7 +2441,7 @@ func reloadForeignServersFromHeap(mgr *storage.Manager, cat *catalog.InMemory, c
 	return nil
 }
 
-func reloadUserMappingsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func reloadUserMappingsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	cols := executor.PGUserMappingColumnsPG18()
 	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 1418, Fork: storage.MainFork}
 	type umRow struct {
@@ -2491,7 +2491,7 @@ func reloadUserMappingsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clo
 // serialized text), so the reload is fully physical; only dictnamespace
 // reverses to a schema name for CreateTSDictDuringRecovery. Seeds the TID
 // cache so a post-restart ALTER updates the row in place.
-func reloadUserTSDictsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func reloadUserTSDictsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	cols := executor.PGTSDictColumnsPG18()
 	type dictRow struct {
 		ud  catalog.UserTSDict
@@ -2545,7 +2545,7 @@ func reloadUserTSDictsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog
 // mapping's mapdict OID is a dictionary the registry already knows (though
 // mapdict stays an OID in the mapping regardless). Seeds the base-row TID
 // cache for post-restart ALTER RENAME / SET SCHEMA.
-func reloadUserTSConfigsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func reloadUserTSConfigsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	// Pass 1: config_map rows, grouped by mapcfg then token type.
 	type mapKey struct {
 		cfgOID  uint32
@@ -2658,7 +2658,7 @@ func buildTSConfigMappings(byTok map[int32]map[int32]uint32) []catalog.TSConfigM
 // see sys_pg_am.go), skips the built-in rows (oid < FirstUserOID), and
 // re-registers each user access method. amtype and amhandler are stored
 // directly (char / pg_proc OID).
-func reloadUserAccessMethodsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func reloadUserAccessMethodsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	cols := executor.PGAccessMethodColumnsPG18()
 	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2601, Fork: storage.MainFork}
 	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_am",
@@ -2691,7 +2691,7 @@ func reloadUserAccessMethodsFromHeap(mgr *storage.Manager, cat *catalog.InMemory
 // reloadUserExtensionsFromHeap (M0130-S3) is the pg_extension reload —
 // reads base/*/3079 to reconstruct the in-memory runtime extension registry
 // after a restart. Each row maps onto the catalog extensionRow.
-func reloadUserExtensionsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+func reloadUserExtensionsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
 	extCols := executor.PGExtensionColumnsPG18()
 	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 3079, Fork: storage.MainFork}
 	type extRec struct {

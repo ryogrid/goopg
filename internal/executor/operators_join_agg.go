@@ -13,9 +13,9 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/hashsize"
+	"github.com/goopg/goopg/internal/executor/hashsize"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -37,10 +37,10 @@ type joinRowCTID struct {
 // back Next left the struct entirely — see the four `*Stream` fields below,
 // exactly one of which is non-nil between Open and Close.
 type joinOp struct {
-	plan   *planner.Join
+	plan   *optimizer.Join
 	left   Operator
 	right  Operator
-	schema planner.Schema
+	schema optimizer.Schema
 
 	ctx *Context
 
@@ -77,10 +77,10 @@ type joinOp struct {
 	// execKeyPackInt selects the fixed-width int64 lane of the composite
 	// encoding (join_composite_key.go); execKeyBuf is its per-row scratch,
 	// reused so the probe side allocates nothing.
-	execKeys       []planner.JoinKeyPair
-	execResidual   planner.Expr
-	buildKeyExprs  []planner.Expr
-	probeKeyExprs  []planner.Expr
+	execKeys       []optimizer.JoinKeyPair
+	execResidual   optimizer.Expr
+	buildKeyExprs  []optimizer.Expr
+	probeKeyExprs  []optimizer.Expr
 	execKeyPackInt bool
 	execKeyBuf     []byte
 
@@ -116,8 +116,8 @@ type joinOp struct {
 	// lazy-hash path only, and a joinOp runs one algorithm, so keeping the
 	// two apart makes a cross-read a compile error rather than a silent
 	// wrong-key join. See join_merge_key.go.
-	mergeKeys     []planner.JoinKeyPair
-	mergeResidual planner.Expr
+	mergeKeys     []optimizer.JoinKeyPair
+	mergeResidual optimizer.Expr
 
 	// M0127-P4.1 (07 §2): the streaming merge join. Non-nil for the whole
 	// life of a JoinAlgoMerge Open, and the reason Next has a third arm:
@@ -282,7 +282,7 @@ type joinOp struct {
 	joinFilterRemoved *int64
 }
 
-func newJoinOp(plan *planner.Join, left, right Operator) *joinOp {
+func newJoinOp(plan *optimizer.Join, left, right Operator) *joinOp {
 	schema := plan.Output()
 	if len(schema) == 0 {
 		schema = append(schema, left.Schema()...)
@@ -291,7 +291,7 @@ func newJoinOp(plan *planner.Join, left, right Operator) *joinOp {
 	// M0127-P2.2: the residual defaults to the full Predicate, which is what
 	// every non-hash algorithm evaluates. openLazyHashJoin narrows it to the
 	// conjuncts the hash key does NOT already enforce.
-	var residual planner.Expr
+	var residual optimizer.Expr
 	if plan != nil {
 		residual = plan.Predicate
 	}
@@ -311,11 +311,11 @@ func (o *joinOp) Open(ctx *Context) error {
 	// Any other algo (Merge, or an unset zero value that is NOT the
 	// planner's explicit NestedLoop choice with a predicate) stays
 	// an internal error.
-	if o.plan.Type == planner.JoinTypeSemi || o.plan.Type == planner.JoinTypeAnti {
+	if o.plan.Type == optimizer.JoinTypeSemi || o.plan.Type == optimizer.JoinTypeAnti {
 		switch o.plan.Algo {
-		case planner.JoinAlgoHash:
+		case optimizer.JoinAlgoHash:
 			return o.openLazyHashJoin(ctx)
-		case planner.JoinAlgoNestedLoop:
+		case optimizer.JoinAlgoNestedLoop:
 			if o.plan.Predicate == nil {
 				// A keyless semi/anti with no predicate would be an
 				// unconditional cross semi — the planner never builds
@@ -339,7 +339,7 @@ func (o *joinOp) Open(ctx *Context) error {
 	if o.plan.Lateral {
 		return o.openLateral(ctx)
 	}
-	if o.plan.Algo == planner.JoinAlgoHash {
+	if o.plan.Algo == optimizer.JoinAlgoHash {
 		return o.openLazyHashJoin(ctx)
 	}
 	// M0127-P4.1 (07 §2): merge join no longer shares the eager both-sides
@@ -347,7 +347,7 @@ func (o *joinOp) Open(ctx *Context) error {
 	// work_mem-bounded sorted sources instead; the CTID side-channel the
 	// drain captures is nested-loop-only anyway (rowSourceLeft, which
 	// runMergeJoin never populated, is what Next needs to use it).
-	if o.plan.Algo == planner.JoinAlgoMerge {
+	if o.plan.Algo == optimizer.JoinAlgoMerge {
 		return o.openMergeJoin(ctx)
 	}
 	// M0127-P4.3 (07 §4): the universal fallback streams too. The outer side
@@ -555,7 +555,7 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	// also defend here so a stray flag doesn't silently break the
 	// emit-once-per-probe-row invariant.
 	buildLeft := o.plan.BuildLeft
-	if o.plan.Type == planner.JoinTypeSemi || o.plan.Type == planner.JoinTypeAnti {
+	if o.plan.Type == optimizer.JoinTypeSemi || o.plan.Type == optimizer.JoinTypeAnti {
 		buildLeft = false
 	}
 	// M0127-P0.3 (05 §4, stage E3): pick the key representation ONCE, here,
@@ -683,7 +683,7 @@ const maxPresizeBuckets = 1 << 20
 // a fixed-width relation), which prices the geometry by column count alone —
 // exactly the old behaviour, so no query changes unless it has text-heavy columns
 // that have been ANALYZEd.
-func (o *joinOp) buildGeometry(ctx *Context, buildNode planner.Node, buildWidth int, buildIsLeft bool) hashsize.Sizing {
+func (o *joinOp) buildGeometry(ctx *Context, buildNode optimizer.Node, buildWidth int, buildIsLeft bool) hashsize.Sizing {
 	var workMem int64
 	if ctx != nil {
 		workMem = ctx.WorkMem
@@ -698,7 +698,7 @@ func (o *joinOp) buildGeometry(ctx *Context, buildNode planner.Node, buildWidth 
 		buildRows = o.plan.OuterRows
 	}
 	if buildRows <= 0 {
-		buildRows = float64(planner.EstimateRows(buildNode))
+		buildRows = float64(optimizer.EstimateRows(buildNode))
 	}
 	avgVarBytes := o.plan.AvgVarBytes
 	return hashsize.Choose(buildRows, buildWidth, avgVarBytes,
@@ -723,7 +723,7 @@ func (o *joinOp) buildGeometry(ctx *Context, buildNode planner.Node, buildWidth 
 //
 // Not called for the FOR-UPDATE ctid build (buildHashRightWithCTID): that path
 // materialises its rows first and its result sets are small by construction.
-func (o *joinOp) presizeLazyHash(ctx *Context, buildNode planner.Node, buildWidth int, buildIsLeft bool) {
+func (o *joinOp) presizeLazyHash(ctx *Context, buildNode optimizer.Node, buildWidth int, buildIsLeft bool) {
 	if buildNode == nil || o.lazyHash != nil || o.lazyIntHash != nil {
 		return
 	}
@@ -981,7 +981,7 @@ func (o *joinOp) buildHashRightWithCTID(ctx *Context, scanLeaf currentTIDProvide
 // evalHashKey evaluates one side of the hash-join key against a
 // padded row and returns its canonical key string. The boolean
 // is false when the key evaluated to NULL (never matches).
-func (o *joinOp) evalHashKey(keyExpr planner.Expr, row Row) (string, bool, error) {
+func (o *joinOp) evalHashKey(keyExpr optimizer.Expr, row Row) (string, bool, error) {
 	v, err := evalExpr(keyExpr, row, o.ctx)
 	if err != nil {
 		return "", false, err
@@ -995,7 +995,7 @@ func (o *joinOp) evalHashKey(keyExpr planner.Expr, row Row) (string, bool, error
 // evalHashKeyDatum is evalHashKey but returns the key Datum instead of its
 // string form, so the int64 fast-path can try datumToInt64Key before
 // falling back to datumKey. ok is false for a NULL key.
-func (o *joinOp) evalHashKeyDatum(keyExpr planner.Expr, row Row) (Datum, bool, error) {
+func (o *joinOp) evalHashKeyDatum(keyExpr optimizer.Expr, row Row) (Datum, bool, error) {
 	v, err := evalExpr(keyExpr, row, o.ctx)
 	if err != nil {
 		return Datum{}, false, err
@@ -1431,7 +1431,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 	//     every x (even NULL x) — emit every probe row unconditionally.
 	//   - subquery produced a NULL key: `x NOT IN (...)` is
 	//     NULL/false for every x — emit nothing.
-	if o.plan.Type == planner.JoinTypeAnti && o.plan.NullAware {
+	if o.plan.Type == optimizer.JoinTypeAnti && o.plan.NullAware {
 		if o.antiBuildHasNull {
 			return nil, EOF
 		}
@@ -1688,7 +1688,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 		// excluded, not kept. The build-empty/build-has-NULL cases
 		// were already short-circuited above this loop, so reaching
 		// here means the subquery is non-empty and NULL-free.
-		if !ok && o.plan.Type == planner.JoinTypeAnti && o.plan.NullAware {
+		if !ok && o.plan.Type == optimizer.JoinTypeAnti && o.plan.NullAware {
 			continue
 		}
 		//
@@ -1708,7 +1708,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 		// hash match AND Predicate=TRUE. The slot composition
 		// already covers both Semi/Anti and INNER predicate eval
 		// — re-bind the build slot per candidate match.
-		if o.plan.Type == planner.JoinTypeSemi || o.plan.Type == planner.JoinTypeAnti {
+		if o.plan.Type == optimizer.JoinTypeSemi || o.plan.Type == optimizer.JoinTypeAnti {
 			anyMatch := false
 			if ok && len(matches) > 0 {
 				// Probe source already bound by bindProbe.
@@ -1724,7 +1724,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 					}
 				}
 			}
-			if o.plan.Type == planner.JoinTypeSemi {
+			if o.plan.Type == optimizer.JoinTypeSemi {
 				if !anyMatch {
 					continue
 				}
@@ -1800,13 +1800,13 @@ func (o *joinOp) Close() error {
 	return errR
 }
 
-func (o *joinOp) Schema() planner.Schema { return o.schema }
+func (o *joinOp) Schema() optimizer.Schema { return o.schema }
 
 // aggregateOp performs grouped aggregation in memory.
 type aggregateOp struct {
-	plan   *planner.Aggregate
+	plan   *optimizer.Aggregate
 	child  Operator
-	schema planner.Schema
+	schema optimizer.Schema
 
 	ctx  *Context
 	rows []Row
@@ -1819,6 +1819,20 @@ type aggregateOp struct {
 	sharedUserStateSet     []bool
 	sharedUserStateVersion []int64 // which currentRowVersion last updated this slot
 	currentRowVersion      int64   // incremented per input row
+}
+
+// groupRuntime is one accumulated output group: the GROUP BY key values, the
+// functionally-determined passthrough columns, and one aggRuntime per
+// AggregateCall. It used to be declared inside Open; it is package-level now
+// (M0134-0001 S8) so the hash path and the sorted path can share the
+// finalizeGroup emit step. groupValues[i] holds the value of GroupExprs[i] for
+// this group (NULL for a column rolled up away at this grouping set level);
+// setIdx identifies the grouping set that produced it.
+type groupRuntime struct {
+	setIdx          int // which grouping set produced this group
+	groupValues     Row
+	passthroughVals Row // values of functionally-determined passthrough columns
+	aggs            []aggRuntime
 }
 
 // floatSpecialKind encodes the IEEE 754 special-value state for
@@ -1919,7 +1933,7 @@ type aggRuntime struct {
 	distinctUserAggRows [][]Datum // inner: [sortKey0..., arg0, arg1, ...]
 }
 
-func newAggregateOp(plan *planner.Aggregate, child Operator) *aggregateOp {
+func newAggregateOp(plan *optimizer.Aggregate, child Operator) *aggregateOp {
 	return &aggregateOp{plan: plan, child: child, schema: plan.Output()}
 }
 
@@ -1931,10 +1945,10 @@ func (o *aggregateOp) Open(ctx *Context) error {
 	// the child is a Gather and opening it launches the workers that write to
 	// it. Registering afterwards would be a race with the first worker.
 	var accum *aggPartialAccum
-	if o.plan.Mode == planner.AggModeFinal && o.plan.PartialSource != nil {
+	if o.plan.Mode == optimizer.AggModeFinal && o.plan.PartialSource != nil {
 		accum = newAggPartialAccum()
 		if ctx.PartialAggStates == nil {
-			ctx.PartialAggStates = map[*planner.Aggregate]*aggPartialAccum{}
+			ctx.PartialAggStates = map[*optimizer.Aggregate]*aggPartialAccum{}
 		}
 		ctx.PartialAggStates[o.plan.PartialSource] = accum
 		defer delete(ctx.PartialAggStates, o.plan.PartialSource)
@@ -1957,11 +1971,13 @@ func (o *aggregateOp) Open(ctx *Context) error {
 	o.sharedUserStateVersion = make([]int64, nSlots)
 	o.currentRowVersion = 0
 
-	type groupRuntime struct {
-		setIdx          int // which grouping set produced this group
-		groupValues     Row
-		passthroughVals Row // values of functionally-determined passthrough columns
-		aggs            []aggRuntime
+	// Sorted aggregation (M0134-0001 S8): when the node is marked
+	// AggStrategySorted the child is expected to deliver rows already ordered
+	// by the GROUP BY keys, so openSorted collapses runs of equal keys instead
+	// of building the groups hash map. Grouping sets, ungrouped
+	// (len(GroupExprs)==0) and parallel split nodes always keep the hash path.
+	if o.plan.Strategy == optimizer.AggStrategySorted && o.plan.GroupingSets == nil && len(o.plan.GroupExprs) > 0 && o.plan.Mode == optimizer.AggModeSimple {
+		return o.openSorted(ctx)
 	}
 
 	groups := map[string]*groupRuntime{}
@@ -2089,7 +2105,7 @@ func (o *aggregateOp) Open(ctx *Context) error {
 	}
 
 	switch o.plan.Mode {
-	case planner.AggModePartial:
+	case optimizer.AggModePartial:
 		// Publish this worker's groups and emit NOTHING. The Finalize node
 		// supplies every output row from the accumulator, so a Partial node
 		// returning zero rows is by construction, not a failure — see the
@@ -2114,7 +2130,7 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		o.rows = nil
 		return nil
 
-	case planner.AggModeFinal:
+	case optimizer.AggModeFinal:
 		if accum == nil {
 			return &ExecError{
 				Code:    "XX000",
@@ -2160,128 +2176,10 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		if gr == nil {
 			continue
 		}
-		out := make(Row, 0, len(gr.groupValues)+len(o.plan.Aggs)+len(gr.passthroughVals))
-		out = append(out, gr.groupValues...)
-		// Sync follower aggregates from their leader before finishAgg. M0097-0035.
-		// For DISTINCT aggregates with actual followers (multiple aggs sharing the
-		// same slot), compute the leader's sfunc state once and inject it into
-		// followers so they skip sfunc calls (avoiding duplicate NOTICE/side-
-		// effects) and only apply their own finalfunc. M0097-0155.
-		//
-		// First, count how many aggregates exist per SharedStateSlot to detect
-		// actual sharing (a slot with only one agg is not shared).
-		slotCount := map[int]int{}
-		for _, call := range o.plan.Aggs {
-			if call.SharedStateSlot >= 0 && call.UserAgg != nil {
-				slotCount[call.SharedStateSlot]++
-			}
+		out, ferr := o.finalizeGroup(gr)
+		if ferr != nil {
+			return ferr
 		}
-		type slotState struct {
-			state    Datum
-			computed bool
-		}
-		distinctSlotStates := map[int]slotState{}
-		for i, call := range o.plan.Aggs {
-			if call.SharedStateSlot < 0 || call.UserAgg == nil {
-				continue
-			}
-			if !(call.Distinct || len(call.OrderBy) > 0) {
-				// Non-DISTINCT sync: copy userState as before.
-				if i == 0 {
-					continue
-				}
-				for j := 0; j < i; j++ {
-					if o.plan.Aggs[j].SharedStateSlot == call.SharedStateSlot {
-						gr.aggs[i].userState = gr.aggs[j].userState
-						gr.aggs[i].userStateSet = gr.aggs[j].userStateSet
-						gr.aggs[i].hasValue = gr.aggs[j].hasValue
-						break
-					}
-				}
-				continue
-			}
-			// DISTINCT path: pre-compute leader's sfunc state once only when
-			// there are actual followers (slot count > 1). Solo aggregates run
-			// finishAgg normally to preserve ORDER BY sort behaviour.
-			if slotCount[call.SharedStateSlot] <= 1 {
-				continue
-			}
-			ss, alreadyComputed := distinctSlotStates[call.SharedStateSlot]
-			if !alreadyComputed {
-				// This is the leader: compute dedup+sort+sfunc state.
-				ua := call.UserAgg
-				st := gr.aggs[i]
-				nSortKeys := len(call.OrderBy)
-				var deduped [][]Datum
-				if call.Distinct && len(st.distinctUserAggRows) > 0 {
-					seen := map[string]struct{}{}
-					for _, row := range st.distinctUserAggRows {
-						argSlice := row[nSortKeys:]
-						var keyParts []string
-						for _, d := range argSlice {
-							keyParts = append(keyParts, datumKey(d))
-						}
-						k := strings.Join(keyParts, "\t")
-						if _, ok := seen[k]; ok {
-							continue
-						}
-						seen[k] = struct{}{}
-						deduped = append(deduped, row)
-					}
-				} else {
-					deduped = st.distinctUserAggRows
-				}
-				state := userAggInitState(ua)
-				for _, row := range deduped {
-					argSlice := row[nSortKeys:]
-					sfuncArgs := make([]Datum, 0, 1+len(argSlice))
-					sfuncArgs = append(sfuncArgs, state)
-					sfuncArgs = append(sfuncArgs, argSlice...)
-					newState, serr := executeSFuncCall(ua.SFunc, sfuncArgs, o.ctx)
-					if sfuncRaised(serr) {
-						return serr
-					}
-					if serr == nil {
-						state = newState
-					}
-				}
-				ss = slotState{state: state, computed: true}
-				distinctSlotStates[call.SharedStateSlot] = ss
-				// Replace leader's rows with the pre-computed state so finishAgg
-				// skips sfunc and applies only the leader's finalfunc.
-				gr.aggs[i].userState = state
-				gr.aggs[i].userStateSet = true
-				gr.aggs[i].hasValue = true
-				gr.aggs[i].distinctUserAggRows = nil
-			} else {
-				// Follower: inject leader's sfunc state; clear rows so finishAgg
-				// skips sfunc and applies only the follower's finalfunc.
-				gr.aggs[i].userState = ss.state
-				gr.aggs[i].userStateSet = true
-				gr.aggs[i].hasValue = true
-				gr.aggs[i].distinctUserAggRows = nil
-			}
-		}
-		for i, call := range o.plan.Aggs {
-			d, ferr := o.finishAgg(gr.aggs[i], call)
-			if ferr != nil {
-				return ferr
-			}
-			out = append(out, d)
-		}
-		// GROUPING(...) columns: the bitmask depends only on which grouping
-		// set produced this row, so it is materialised here rather than
-		// evaluated per row above the node. Emitted between the aggregates
-		// and the passthrough columns, matching the output schema
-		// buildAggregateStage laid out. M0125-0048.
-		for _, masks := range o.plan.GroupingMasks {
-			if gr.setIdx < len(masks) {
-				out = append(out, NewIntDatum(masks[gr.setIdx]))
-			} else {
-				out = append(out, NewIntDatum(0))
-			}
-		}
-		out = append(out, gr.passthroughVals...)
 		o.rows = append(o.rows, out)
 		emitted = append(emitted, gr.setIdx)
 	}
@@ -2381,7 +2279,265 @@ func (o *aggregateOp) setGroupKey(si int, set []int, allKeys []string, multiSet 
 	return b.String()
 }
 
-func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot TupleSlot) error {
+// finalizeGroup finalizes one group's aggregates and builds its single output
+// Row: GROUP BY key values, then per-aggregate finished values, then
+// GROUPING(...) masks, then passthrough columns. Shared verbatim by the hash
+// path (Open's emit loop) and the sorted path (openSorted), so the two
+// strategies can never diverge on shared-state sync, finishAgg, GROUPING mask
+// or passthrough semantics. M0134-0001 S8.
+func (o *aggregateOp) finalizeGroup(gr *groupRuntime) (Row, error) {
+	out := make(Row, 0, len(gr.groupValues)+len(o.plan.Aggs)+len(gr.passthroughVals))
+	out = append(out, gr.groupValues...)
+	// Sync follower aggregates from their leader before finishAgg. M0097-0035.
+	// For DISTINCT aggregates with actual followers (multiple aggs sharing the
+	// same slot), compute the leader's sfunc state once and inject it into
+	// followers so they skip sfunc calls (avoiding duplicate NOTICE/side-
+	// effects) and only apply their own finalfunc. M0097-0155.
+	//
+	// First, count how many aggregates exist per SharedStateSlot to detect
+	// actual sharing (a slot with only one agg is not shared).
+	slotCount := map[int]int{}
+	for _, call := range o.plan.Aggs {
+		if call.SharedStateSlot >= 0 && call.UserAgg != nil {
+			slotCount[call.SharedStateSlot]++
+		}
+	}
+	type slotState struct {
+		state    Datum
+		computed bool
+	}
+	distinctSlotStates := map[int]slotState{}
+	for i, call := range o.plan.Aggs {
+		if call.SharedStateSlot < 0 || call.UserAgg == nil {
+			continue
+		}
+		if !(call.Distinct || len(call.OrderBy) > 0) {
+			// Non-DISTINCT sync: copy userState as before.
+			if i == 0 {
+				continue
+			}
+			for j := 0; j < i; j++ {
+				if o.plan.Aggs[j].SharedStateSlot == call.SharedStateSlot {
+					gr.aggs[i].userState = gr.aggs[j].userState
+					gr.aggs[i].userStateSet = gr.aggs[j].userStateSet
+					gr.aggs[i].hasValue = gr.aggs[j].hasValue
+					break
+				}
+			}
+			continue
+		}
+		// DISTINCT path: pre-compute leader's sfunc state once only when
+		// there are actual followers (slot count > 1). Solo aggregates run
+		// finishAgg normally to preserve ORDER BY sort behaviour.
+		if slotCount[call.SharedStateSlot] <= 1 {
+			continue
+		}
+		ss, alreadyComputed := distinctSlotStates[call.SharedStateSlot]
+		if !alreadyComputed {
+			// This is the leader: compute dedup+sort+sfunc state.
+			ua := call.UserAgg
+			st := gr.aggs[i]
+			nSortKeys := len(call.OrderBy)
+			var deduped [][]Datum
+			if call.Distinct && len(st.distinctUserAggRows) > 0 {
+				seen := map[string]struct{}{}
+				for _, row := range st.distinctUserAggRows {
+					argSlice := row[nSortKeys:]
+					var keyParts []string
+					for _, d := range argSlice {
+						keyParts = append(keyParts, datumKey(d))
+					}
+					k := strings.Join(keyParts, "\t")
+					if _, ok := seen[k]; ok {
+						continue
+					}
+					seen[k] = struct{}{}
+					deduped = append(deduped, row)
+				}
+			} else {
+				deduped = st.distinctUserAggRows
+			}
+			state := userAggInitState(ua)
+			for _, row := range deduped {
+				argSlice := row[nSortKeys:]
+				sfuncArgs := make([]Datum, 0, 1+len(argSlice))
+				sfuncArgs = append(sfuncArgs, state)
+				sfuncArgs = append(sfuncArgs, argSlice...)
+				newState, serr := executeSFuncCall(ua.SFunc, sfuncArgs, o.ctx)
+				if sfuncRaised(serr) {
+					return nil, serr
+				}
+				if serr == nil {
+					state = newState
+				}
+			}
+			ss = slotState{state: state, computed: true}
+			distinctSlotStates[call.SharedStateSlot] = ss
+			// Replace leader's rows with the pre-computed state so finishAgg
+			// skips sfunc and applies only the leader's finalfunc.
+			gr.aggs[i].userState = state
+			gr.aggs[i].userStateSet = true
+			gr.aggs[i].hasValue = true
+			gr.aggs[i].distinctUserAggRows = nil
+		} else {
+			// Follower: inject leader's sfunc state; clear rows so finishAgg
+			// skips sfunc and applies only the follower's finalfunc.
+			gr.aggs[i].userState = ss.state
+			gr.aggs[i].userStateSet = true
+			gr.aggs[i].hasValue = true
+			gr.aggs[i].distinctUserAggRows = nil
+		}
+	}
+	for i, call := range o.plan.Aggs {
+		d, ferr := o.finishAgg(gr.aggs[i], call)
+		if ferr != nil {
+			return nil, ferr
+		}
+		out = append(out, d)
+	}
+	// GROUPING(...) columns: the bitmask depends only on which grouping
+	// set produced this row, so it is materialised here rather than
+	// evaluated per row above the node. Emitted between the aggregates
+	// and the passthrough columns, matching the output schema
+	// buildAggregateStage laid out. M0125-0048.
+	for _, masks := range o.plan.GroupingMasks {
+		if gr.setIdx < len(masks) {
+			out = append(out, NewIntDatum(masks[gr.setIdx]))
+		} else {
+			out = append(out, NewIntDatum(0))
+		}
+	}
+	out = append(out, gr.passthroughVals...)
+	return out, nil
+}
+
+// openSorted implements the sorted (AGG_SORTED) grouping strategy: the child
+// is assumed to deliver rows in GROUP BY key order, so groups are collapsed by
+// comparing each incoming key run against the current group's key rather than
+// hashing (nodeAgg.c agg_retrieve_direct, postgres/src/backend/executor/
+// nodeAgg.c:2280-2619). Like the hash path it is materialized — the child is
+// drained to EOF first — but unlike the hash path it emits one row per key
+// RUN in input order and never runs the emit-time key sort (the child is
+// already sorted, so input order IS key order). The finalize/emit step is
+// shared with the hash path via finalizeGroup, so the two strategies can never
+// diverge on shared-state sync, finishAgg, GROUPING mask or passthrough
+// semantics. M0134-0001 S8.
+//
+// Invariant: the caller (Open) only routes here when GroupingSets == nil,
+// len(GroupExprs) > 0 and Mode == AggModeSimple, so there is exactly one
+// implicit grouping set holding every group column and setIdx is always 0.
+func (o *aggregateOp) openSorted(ctx *Context) error {
+	nGroupCols := len(o.plan.GroupExprs)
+
+	// The current group is always the group of the previous row: the input is
+	// sorted, so a key change is a group boundary. aggs is a fresh slice per
+	// group, mirroring the hash path's per-group make([]aggRuntime, nAggs).
+	var curParts []string
+	var cur *groupRuntime
+
+	flush := func() error {
+		if cur == nil {
+			return nil
+		}
+		out, err := o.finalizeGroup(cur)
+		if err != nil {
+			return err
+		}
+		o.rows = append(o.rows, out)
+		cur = nil
+		return nil
+	}
+
+	for {
+		slot, err := o.child.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if ctx.Ctx != nil {
+			if cerr := ctx.Ctx.Err(); cerr != nil {
+				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+			}
+		}
+		allVals, parts, err := o.evalGroupExprs(slot)
+		if err != nil {
+			return err
+		}
+		if cur == nil || !sameGroupKey(curParts, parts) {
+			// Group boundary: finalize and emit the previous group, then start
+			// a fresh one from this row.
+			if err := flush(); err != nil {
+				return err
+			}
+			// Evaluate passthrough (functionally-determined) columns from the
+			// first row of the group — identical to the hash path's group
+			// creation.
+			var ptVals Row
+			if len(o.plan.Passthrough) > 0 {
+				ptVals = make(Row, len(o.plan.Passthrough))
+				for i, expr := range o.plan.Passthrough {
+					v, err := evalExprSlot(expr, slot, o.ctx)
+					if err != nil {
+						ptVals[i] = NullDatum
+					} else {
+						ptVals[i] = v
+					}
+				}
+			}
+			var gv Row
+			if nGroupCols > 0 {
+				gv = make(Row, nGroupCols)
+				copy(gv, allVals)
+			}
+			cur = &groupRuntime{setIdx: 0, groupValues: gv, passthroughVals: ptVals, aggs: make([]aggRuntime, len(o.plan.Aggs))}
+			curParts = parts
+		}
+		o.currentRowVersion++
+		for i, call := range o.plan.Aggs {
+			// For user-defined aggregates with shared transition state, only the
+			// "leader" (first call with this SharedStateSlot) calls sfunc. Followers
+			// skip applyAgg — they will be synced from the leader's final state just
+			// before finishAgg. M0097-0035.
+			if call.SharedStateSlot >= 0 && call.UserAgg != nil && i > 0 {
+				isFollower := false
+				for j := 0; j < i; j++ {
+					if o.plan.Aggs[j].SharedStateSlot == call.SharedStateSlot {
+						isFollower = true
+						break
+					}
+				}
+				if isFollower {
+					continue
+				}
+			}
+			if err := o.applyAgg(&cur.aggs[i], call, slot); err != nil {
+				return err
+			}
+		}
+	}
+	return flush()
+}
+
+// sameGroupKey reports whether two per-column key vectors denote the same
+// group. The hash path builds its map key by joining these same parts with a
+// literal separator (setGroupKey, single-set case), so element-wise equality
+// makes the EXACT same grouping decision — including NULL keys, which
+// datumKey renders identically for both paths. M0134-0001 S8.
+func sameGroupKey(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slot TupleSlot) error {
 	// FILTER (WHERE condition): skip this row if the condition is false/null.
 	// M0097-0007.
 	if call.Filter != nil {
@@ -2699,43 +2855,52 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 		}
 	case "string_agg":
 		// string_agg(expr, delimiter) — accumulate in strResult with delimiter.
-		// For bytea values, st.boolResult=true signals hex-encoded mode.
-		const hexChars = "0123456789abcdef"
+		// For bytea values, st.boolResult=true signals bytea mode: the RAW
+		// bytes are accumulated (a Go string is just a byte sequence — no hex
+		// encoding here), and finishAgg's "string_agg" case renders the
+		// concatenated bytes through byteaOutMode once, at the end, under the
+		// session's `bytea_output` GUC. Before M0134-0001 S12 this hex-encoded
+		// every piece INLINE during accumulation, which threw the raw bytes
+		// away before the GUC could ever be consulted — `SET bytea_output =
+		// 'escape'; select string_agg(x::text::bytea, ','::bytea) from ...`
+		// stayed hex forever regardless of the GUC. That specific case is
+		// fixed by this slice (verified: `1,2,3`, not `\x313233`).
+		//
+		// The delimiter itself is coerced through byteaOperand, which mirrors
+		// PG's `parse_coerce.c coerce_type` UNKNOWNOID-Const branch: once
+		// overload resolution locks in `string_agg(bytea,bytea)` (pg_proc oid
+		// 3545), an untyped literal delimiter like `','` (no `::bytea` cast)
+		// is run through the target type's typinput (`byteain`) rather than
+		// dropped. goopg has no per-overload aggregate-arg dispatch to do this
+		// at analyze time, so it happens here at accumulation time instead,
+		// using the same `byteaOperand` helper already shared by other bytea
+		// operator sites (M0125-0021). An invalid-bytea-input delimiter keeps
+		// today's behaviour (empty separator, no error) per byteaOperand's
+		// contract, matching how those sibling sites already handle it.
 		if arg.Kind == KindBytes {
-			// Bytea string_agg: concatenate hex-encoded bytes with hex-encoded delimiter.
-			b := arg.BytesValue()
-			hexBuf := make([]byte, len(b)*2)
-			for i, bb := range b {
-				hexBuf[2*i] = hexChars[bb>>4]
-				hexBuf[2*i+1] = hexChars[bb&0x0f]
-			}
-			hexVal := string(hexBuf)
-			delimHex := ""
+			raw := string(arg.BytesValue())
+			delimRaw := ""
 			if call.Arg2 != nil {
 				dv, _ := evalExprSlot(call.Arg2, slot, o.ctx)
-				if !dv.IsNull() && dv.Kind == KindBytes {
-					db := dv.BytesValue()
-					dh := make([]byte, len(db)*2)
-					for i, bb := range db {
-						dh[2*i] = hexChars[bb>>4]
-						dh[2*i+1] = hexChars[bb&0x0f]
+				if !dv.IsNull() {
+					if b, ok := byteaOperand(dv); ok {
+						delimRaw = string(b)
 					}
-					delimHex = string(dh)
 				}
 			}
 			st.boolResult = true // bytea mode flag
 			if len(call.OrderBy) > 0 {
-				st.strElems = append(st.strElems, hexVal)
-				st.strDelims = append(st.strDelims, delimHex)
+				st.strElems = append(st.strElems, raw)
+				st.strDelims = append(st.strDelims, delimRaw)
 				st.strElemKeys = append(st.strElemKeys, evalAggOrderByKeys(call.OrderBy, slot, o.ctx))
 				st.hasValue = true
 				break
 			}
 			if !st.hasValue {
-				st.strResult = hexVal
+				st.strResult = raw
 				st.hasValue = true
 			} else {
-				st.strResult += delimHex + hexVal
+				st.strResult += delimRaw + raw
 			}
 			break
 		}
@@ -3006,7 +3171,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 // the accumulated pieces later. A key that fails to evaluate becomes NULL
 // rather than aborting the aggregate — the pre-existing array_agg behaviour
 // this was factored out of.
-func evalAggOrderByKeys(orderBy []planner.SortKey, slot TupleSlot, ctx *Context) []Datum {
+func evalAggOrderByKeys(orderBy []optimizer.SortKey, slot TupleSlot, ctx *Context) []Datum {
 	if len(orderBy) == 0 {
 		return nil
 	}
@@ -3034,7 +3199,7 @@ func evalAggOrderByKeys(orderBy []planner.SortKey, slot TupleSlot, ctx *Context)
 // Shared by array_agg and string_agg — the two ordering-sensitive built-ins in
 // finishAgg's switch. They diverged once already (string_agg simply ignored
 // ORDER BY, M0125-0019); one comparator keeps them from diverging again.
-func aggOrderBySortedIdx(keys [][]Datum, orderBy []planner.SortKey) []int {
+func aggOrderBySortedIdx(keys [][]Datum, orderBy []optimizer.SortKey) []int {
 	idx := make([]int, len(keys))
 	for i := range idx {
 		idx[i] = i
@@ -3084,7 +3249,7 @@ func aggOrderBySortedIdx(keys [][]Datum, orderBy []planner.SortKey) []int {
 // withinGroupTupleLT returns true if row < directArgs in the hypothetical-set ordering.
 // It performs lexicographic comparison of the row's sort-key tuple against directArgs
 // respecting each sort key's ASC/DESC direction and NULL handling.
-func withinGroupTupleLT(row []Datum, directArgs []Datum, sortKeys []planner.SortKey) bool {
+func withinGroupTupleLT(row []Datum, directArgs []Datum, sortKeys []optimizer.SortKey) bool {
 	n := len(sortKeys)
 	if n > len(row) {
 		n = len(row)
@@ -3374,7 +3539,7 @@ func aggDatumToFloat64(d Datum) float64 {
 // that case, so the error must reach the client rather than be turned into a
 // stale state or a NULL. Built-in finalization cannot fail, which is why the
 // bulk of the work lives in finishBuiltinAgg with no error channel at all.
-func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) (Datum, error) {
+func (o *aggregateOp) finishAgg(st aggRuntime, call optimizer.AggregateCall) (Datum, error) {
 	// Handle ordered-set aggregates (WITHIN GROUP) before regular handling. M0097-0035.
 	if call.WithinGroup {
 		return finishWithinGroupAgg(st, call, o.ctx), nil
@@ -3523,7 +3688,7 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) (Datu
 // finishBuiltinAgg finalizes a built-in aggregate. Split out of finishAgg by
 // M0125-0025 so that adding the error channel the user-defined path needs did
 // not have to touch this body's ~100 returns, none of which can fail.
-func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call planner.AggregateCall) Datum {
+func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCall) Datum {
 	switch strings.ToLower(call.Name) {
 	case "count":
 		return Datum{Kind: KindInt, Int: st.count}
@@ -3641,9 +3806,13 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call planner.AggregateCall
 			}
 			out = b.String()
 		}
-		// Bytea mode: st.boolResult=true means result is hex-encoded bytes.
+		// Bytea mode: st.boolResult=true means out holds the RAW concatenated
+		// bytes (accumAgg no longer hex-encodes them early — M0134-0001 S12),
+		// rendered here through the SAME dispatch the scalar cast-to-text and
+		// wire renderers use, so `string_agg` over bytea honors `bytea_output`
+		// exactly like every other bytea-to-text site (Hard-won Rule #2).
 		if st.boolResult {
-			return NewStringDatum(`\x` + out)
+			return NewStringDatum(byteaOutMode([]byte(out), byteaOutputModeFromCtx(o.ctx)))
 		}
 		return NewStringDatum(out)
 	case "array_agg":
@@ -3873,7 +4042,7 @@ func (o *aggregateOp) Close() error {
 	return o.child.Close()
 }
 
-func (o *aggregateOp) Schema() planner.Schema { return o.schema }
+func (o *aggregateOp) Schema() optimizer.Schema { return o.schema }
 
 func drainRows(op Operator) ([]Row, error) {
 	return drainRowsCtx(op, nil)
@@ -4316,7 +4485,7 @@ func formatAvgInt8(sum, count int64) string {
 // The st.withinGroupElems slice contains one []Datum per input row,
 // where each entry holds the sort-key value(s) from WithinGroupOrderBy.
 // For single-key cases (most common), each inner slice has one element.
-func finishWithinGroupAgg(st aggRuntime, call planner.AggregateCall, ctx *Context) Datum {
+func finishWithinGroupAgg(st aggRuntime, call optimizer.AggregateCall, ctx *Context) Datum {
 	name := strings.ToLower(call.Name)
 	elems := st.withinGroupElems
 	if len(elems) == 0 {
@@ -4812,7 +4981,7 @@ func percentileDiscOneFloat(orderedVals []Datum, n int, pf float64) Datum {
 }
 
 
-func evalExprFromRow(expr planner.Expr, row Row, ctx *Context) (Datum, error) {
+func evalExprFromRow(expr optimizer.Expr, row Row, ctx *Context) (Datum, error) {
 	slot := SlotFromRow(nil, row)
 	return evalExprSlot(expr, slot, ctx)
 }

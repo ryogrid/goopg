@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/pgnodes"
+	"github.com/goopg/goopg/internal/nodes"
 )
 
 // TestViewAttrIndexConstants pins the pg_attribute row-index constants
@@ -39,14 +39,14 @@ func TestViewColumnCanonicalType(t *testing.T) {
 	t.Run("int4", func(t *testing.T) {
 		oid, typmod, coll, ok := viewColumnCanonicalType(nil, tbl,
 			catalog.Column{Name: "client", Type: catalog.Type{Name: "int4"}, Ordinal: 0})
-		if !ok || oid != pgnodes.OidInt4 || typmod != -1 || coll != 0 {
+		if !ok || oid != nodes.OidInt4 || typmod != -1 || coll != 0 {
 			t.Fatalf("int4 => (%d,%d,%d,%v) want (23,-1,0,true)", oid, typmod, coll, ok)
 		}
 	})
 	t.Run("text", func(t *testing.T) {
 		oid, typmod, coll, ok := viewColumnCanonicalType(nil, tbl,
 			catalog.Column{Name: "src", Type: catalog.Type{Name: "text"}, Ordinal: 1})
-		if !ok || oid != pgnodes.OidText || typmod != -1 || coll != pgnodes.DefaultCollationOid {
+		if !ok || oid != nodes.OidText || typmod != -1 || coll != nodes.DefaultCollationOid {
 			t.Fatalf("text => (%d,%d,%d,%v) want (25,-1,100,true)", oid, typmod, coll, ok)
 		}
 	})

@@ -1,12 +1,13 @@
 package executor
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -28,7 +29,7 @@ func runDDL(t *testing.T, ctx *Context, sql string) error {
 	if err != nil {
 		t.Fatalf("Parse(%q): %v", sql, err)
 	}
-	plan, err := planner.Plan(stmts[0], ctx.Catalog)
+	plan, err := optimizer.Plan(stmts[0], ctx.Catalog)
 	if err != nil {
 		t.Fatalf("Plan(%q): %v", sql, err)
 	}
@@ -64,6 +65,49 @@ func TestDDLCreateTableEndToEnd(t *testing.T) {
 	}
 	if tbl.Columns[1].Type.Name != "text" {
 		t.Errorf("col[1].Type=%+v", tbl.Columns[1].Type)
+	}
+}
+
+// TestDDLCreateTableStorageClause verifies the CREATE TABLE column-level
+// `STORAGE <mode>` clause (M0134-0002 C2 slice 9): a valid mode threads onto
+// the catalog column, and a non-plain mode on a plain-storage type raises the
+// PG-exact 0A000 error "column data type integer can only have storage PLAIN"
+// (GetAttributeStorage, tablecmds.c:22082-22112).
+func TestDDLCreateTableStorageClause(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	// text is TOAST-aware (typstorage 'x'): STORAGE plain is accepted and the
+	// mode threads onto the catalog column (attstorage reports it for pg_dump).
+	if err := runDDL(t, ctx, "CREATE TABLE t (a text, c text storage plain)"); err != nil {
+		t.Fatalf("CREATE TABLE (text storage plain): %v", err)
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "t"})
+	if !ok {
+		t.Fatal("table t not in catalog")
+	}
+	if len(tbl.Columns) != 2 {
+		t.Fatalf("expected 2 columns, got %d", len(tbl.Columns))
+	}
+	if got := tbl.Columns[1].Storage; got != "plain" {
+		t.Errorf("col c Storage=%q, want %q", got, "plain")
+	}
+
+	// int is plain-storage (typstorage 'p'): STORAGE extended is 0A000 with the
+	// format_type_be-rendered type name ("integer", not "int4").
+	err := runDDL(t, ctx, "CREATE TABLE f (a text, b int storage extended)")
+	if err == nil {
+		t.Fatal("expected error for int storage extended, got nil")
+	}
+	var ee *ExecError
+	if !errors.As(err, &ee) {
+		t.Fatalf("expected *ExecError, got %T (%v)", err, err)
+	}
+	if ee.Code != "0A000" {
+		t.Errorf("Code=%q, want %q", ee.Code, "0A000")
+	}
+	if ee.Message != "column data type integer can only have storage PLAIN" {
+		t.Errorf("Message=%q, want %q", ee.Message, "column data type integer can only have storage PLAIN")
 	}
 }
 
@@ -307,7 +351,7 @@ func TestDDLTruncateClearsRelation(t *testing.T) {
 		t.Errorf("NBlocks after TRUNCATE = %d want 0", n2)
 	}
 
-	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: tbl})
 	if err := scan.Open(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -395,7 +439,7 @@ func TestDDLAlterTableAddColumnKeepsExistingRows(t *testing.T) {
 		t.Fatalf("columns after ADD COLUMN: %+v", tbl.Columns)
 	}
 
-	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: tbl})
 	if err := scan.Open(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -444,7 +488,7 @@ func TestDDLAlterTableAddColumnDefaultBackfillsExistingRows(t *testing.T) {
 		t.Fatalf("MissingValue = %+v, want KindInt 99", tbl.Columns[1].MissingValue)
 	}
 
-	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: tbl})
 	if err := scan.Open(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -568,8 +612,8 @@ func newDDLFixture(t *testing.T) (*Context, catalog.Catalog, func()) {
 		}
 		return int64(n), true
 	})
-	mgrMVCC := mvcc.NewManager()
-	tx, err := mgrMVCC.Begin(mvcc.IsolationReadCommitted)
+	mgrMVCC := transam.NewManager()
+	tx, err := mgrMVCC.Begin(transam.IsolationReadCommitted)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1110,7 +1154,7 @@ func TestDDLAlterTableDropColumn(t *testing.T) {
 
 	// M0129-S8.3: advance the command counter so the scan sees the heap row.
 	advanceStmtCounter(ctx)
-	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: tbl})
 	if err := scan.Open(ctx); err != nil {
 		t.Fatal(err)
 	}

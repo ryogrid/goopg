@@ -26,7 +26,7 @@ package executor
 import (
 	"encoding/binary"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // PlanKind discriminates PlanNode variants in the plan-tree slab.
@@ -61,7 +61,7 @@ type PlanNode struct {
 	childA  int32              // primary plan child; noPlan if none
 	childB  int32              // secondary plan child; noPlan if none
 	payload [planPayloadSize]byte
-	orig    planner.Node // non-nil only for Adapter and unmigrated nodes
+	orig    optimizer.Node // non-nil only for Adapter and unmigrated nodes
 }
 
 // planTreeSlab is the flat slice of PlanNode for a single statement.
@@ -102,7 +102,7 @@ func PlanLimitExprs(n *PlanNode) (limitIdx, offsetIdx int32) {
 }
 
 // buildPlanAdapter appends a PlanAdapter node that keeps orig alive.
-func (s *planTreeSlab) buildPlanAdapter(orig planner.Node, childA int32) int32 {
+func (s *planTreeSlab) buildPlanAdapter(orig optimizer.Node, childA int32) int32 {
 	idx := int32(len(*s))
 	*s = append(*s, PlanNode{Kind: PlanAdapter, childA: childA, childB: noPlan, orig: orig})
 	return idx

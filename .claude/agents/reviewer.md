@@ -18,8 +18,7 @@ servers without the cgroup wrapper (`GOOPG_CG_UNIT=<name> scripts/goopg-test-run
 ## Review dimensions (in priority order)
 
 1. **PG fidelity.** Does the behavior match the oracle cited in the brief? Check
-   `postgres/src/...:<function>` (use the `mcp__any-script__pg_*` tools or
-   `global -x` inside `./postgres`). SQLSTATEs must match exactly — clients gate on
+   `postgres/src/...:<function>` (use the `global -x` inside `./postgres`). SQLSTATEs must match exactly — clients gate on
    them. Naming, defaults, and edge cases matter.
 2. **Brief conformance.** Every acceptance criterion met? Any scope creep (files
    changed that the brief didn't name)? Any acceptance criterion claimed but not

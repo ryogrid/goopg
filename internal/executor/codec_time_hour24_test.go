@@ -5,7 +5,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 )
 
 // M0119-0006 (50th slice). `24:00:00` is a real PG TimeADT value: time_in
@@ -103,9 +103,9 @@ func TestScalarBTreeKeyTimeHour24SortsAboveMidnight(t *testing.T) {
 		return k
 	}
 	midnight, oneSec, hour24 := keyOf("00:00:00"), keyOf("00:00:01"), keyOf("24:00:00")
-	if !(btree.CompareKeys(midnight, oneSec) < 0 && btree.CompareKeys(oneSec, hour24) < 0) {
+	if !(nbtree.CompareKeys(midnight, oneSec) < 0 && nbtree.CompareKeys(oneSec, hour24) < 0) {
 		t.Fatalf("key order broken: 00:00:00 vs 00:00:01 = %d, 00:00:01 vs 24:00:00 = %d",
-			btree.CompareKeys(midnight, oneSec), btree.CompareKeys(oneSec, hour24))
+			nbtree.CompareKeys(midnight, oneSec), nbtree.CompareKeys(oneSec, hour24))
 	}
 }
 
@@ -121,7 +121,7 @@ func TestDatumToCopyTextTimeHour24(t *testing.T) {
 		// a time(2) column unchanged. M0119-0006 (62nd slice).
 		{catalog.Type{Name: "time", Args: []int64{2}}, "24:00:00"},
 	} {
-		got, err := datumToCopyText(tc.typ, d, "ISO", "MDY", "", nil, false)
+		got, err := datumToCopyText(tc.typ, d, "ISO", "MDY", "", "hex", nil, false)
 		if err != nil {
 			t.Fatalf("datumToCopyText(%v): %v", tc.typ, err)
 		}

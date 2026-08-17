@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // TestExprKeyDecodeTypeRoundTrip is the sibling-path pin between the two halves
@@ -26,12 +26,12 @@ func TestExprKeyDecodeTypeRoundTrip(t *testing.T) {
 	// matters for the type-directed float arm (exprKeyIsFloat); every other row
 	// encodes off the Datum kind and passes nil, exactly as a caller with an
 	// unresolvable expression would.
-	floatKeyExpr := &planner.ColumnRef{Type: catalog.Type{Name: "float8"}}
+	floatKeyExpr := &optimizer.ColumnRef{Type: catalog.Type{Name: "float8"}}
 	for _, tc := range []struct {
 		name    string
 		sqlType string
 		v       Datum
-		keyExpr planner.Expr
+		keyExpr optimizer.Expr
 	}{
 		{"int2", "int2", NewIntDatum(7), nil},
 		{"int4", "int4", NewIntDatum(42), nil},

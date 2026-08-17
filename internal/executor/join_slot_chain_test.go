@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // M0127-P1.1 — probe-side slot chaining on the legacy Build path (design
@@ -60,7 +60,7 @@ func (s probeSlotShape) String() string {
 // shapedProbeOp is a probe child that returns its rows through a chosen
 // concrete slot shape.
 type shapedProbeOp struct {
-	schema planner.Schema
+	schema optimizer.Schema
 	rows   []Row
 	shape  probeSlotShape
 	i      int
@@ -72,7 +72,7 @@ type shapedProbeOp struct {
 }
 
 func (o *shapedProbeOp) Open(*Context) error    { o.i, o.calls = 0, 0; return nil }
-func (o *shapedProbeOp) Schema() planner.Schema { return o.schema }
+func (o *shapedProbeOp) Schema() optimizer.Schema { return o.schema }
 func (o *shapedProbeOp) Close() error           { return nil }
 
 func (o *shapedProbeOp) Next() (TupleSlot, error) { //nolint:ireturn
@@ -112,44 +112,44 @@ func (o *shapedProbeOp) Next() (TupleSlot, error) { //nolint:ireturn
 }
 
 // chainSchema names lw left columns followed by rw right columns.
-func chainSchema(lw, rw int) planner.Schema {
-	s := make(planner.Schema, 0, lw+rw)
+func chainSchema(lw, rw int) optimizer.Schema {
+	s := make(optimizer.Schema, 0, lw+rw)
 	for i := 0; i < lw; i++ {
-		s = append(s, planner.SchemaColumn{Name: fmt.Sprintf("l%d", i)})
+		s = append(s, optimizer.SchemaColumn{Name: fmt.Sprintf("l%d", i)})
 	}
 	for i := 0; i < rw; i++ {
-		s = append(s, planner.SchemaColumn{Name: fmt.Sprintf("r%d", i)})
+		s = append(s, optimizer.SchemaColumn{Name: fmt.Sprintf("r%d", i)})
 	}
 	return s
 }
 
 // stubOp stands in for the build-side operator: ensureLazyVirtual reads
 // o.left/o.right schemas, but the hash table is pre-loaded here.
-type stubOp struct{ schema planner.Schema }
+type stubOp struct{ schema optimizer.Schema }
 
 func (o *stubOp) Open(*Context) error      { return nil }
-func (o *stubOp) Schema() planner.Schema   { return o.schema }
+func (o *stubOp) Schema() optimizer.Schema   { return o.schema }
 func (o *stubOp) Close() error             { return nil }
 func (o *stubOp) Next() (TupleSlot, error) { return nil, EOF } //nolint:ireturn
 
 // chainFixture wires a lazy hash joinOp: `probe` on the left (the probe side,
 // the !BuildLeft orientation the plan-shape contract fixes), and buildRows
 // pre-loaded into the string hash table keyed on their column 0.
-func chainFixture(jt planner.JoinType, probe *shapedProbeOp, buildRows []Row, lw, rw int) *joinOp {
+func chainFixture(jt optimizer.JoinType, probe *shapedProbeOp, buildRows []Row, lw, rw int) *joinOp {
 	schema := chainSchema(lw, rw)
-	if jt == planner.JoinTypeSemi || jt == planner.JoinTypeAnti {
+	if jt == optimizer.JoinTypeSemi || jt == optimizer.JoinTypeAnti {
 		// Join.Output() derives Semi/Anti output from Left alone.
 		schema = schema[:lw]
 	}
 	o := &joinOp{
-		plan: &planner.Join{
+		plan: &optimizer.Join{
 			Type: jt,
-			Algo: planner.JoinAlgoHash,
+			Algo: optimizer.JoinAlgoHash,
 			// Keys are read in the merged left++right column space:
 			// the probe key is left column 0, the build key sits at
 			// the first right column.
-			LeftKey:  &planner.ColumnRef{Index: 0},
-			RightKey: &planner.ColumnRef{Index: lw},
+			LeftKey:  &optimizer.ColumnRef{Index: 0},
+			RightKey: &optimizer.ColumnRef{Index: lw},
 		},
 		schema:    schema,
 		left:      probe,
@@ -257,7 +257,7 @@ func TestProbeChainFanOut(t *testing.T) {
 			{NewIntDatum(1), NewStringDatum("b1c")},
 			{NewIntDatum(2), NewStringDatum("b2a")},
 		}
-		o := chainFixture(planner.JoinTypeInner, probe, build, 2, 2)
+		o := chainFixture(optimizer.JoinTypeInner, probe, build, 2, 2)
 		if err := probe.Open(nil); err != nil {
 			t.Fatalf("open probe: %v", err)
 		}
@@ -279,7 +279,7 @@ func TestProbeChainBindsChildSlot(t *testing.T) {
 		shape:  probeShapeSharedVirtual,
 		rows:   []Row{{NewIntDatum(1), NewStringDatum("p1")}},
 	}
-	o := chainFixture(planner.JoinTypeInner, probe, []Row{{NewIntDatum(1), NewStringDatum("b1")}}, 2, 2)
+	o := chainFixture(optimizer.JoinTypeInner, probe, []Row{{NewIntDatum(1), NewStringDatum("b1")}}, 2, 2)
 	if err := probe.Open(nil); err != nil {
 		t.Fatalf("open probe: %v", err)
 	}
@@ -318,7 +318,7 @@ func TestProbeChainKillSwitch(t *testing.T) {
 			{NewIntDatum(1), NewStringDatum("b1b")},
 			{NewIntDatum(2), NewStringDatum("b2a")},
 		}
-		o := chainFixture(planner.JoinTypeInner, probe, build, 2, 2)
+		o := chainFixture(optimizer.JoinTypeInner, probe, build, 2, 2)
 		if err := probe.Open(nil); err != nil {
 			t.Fatalf("open probe: %v", err)
 		}
@@ -342,11 +342,11 @@ func TestProbeChainSemiAnti(t *testing.T) {
 	}
 	for _, tc := range []struct {
 		name string
-		jt   planner.JoinType
+		jt   optimizer.JoinType
 		want []string
 	}{
-		{"semi", planner.JoinTypeSemi, []string{"1|p1", "1|p3"}},
-		{"anti", planner.JoinTypeAnti, []string{"2|p2"}},
+		{"semi", optimizer.JoinTypeSemi, []string{"1|p1", "1|p3"}},
+		{"anti", optimizer.JoinTypeAnti, []string{"2|p2"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			eachShape(t, func(t *testing.T, shape probeSlotShape) {
@@ -380,7 +380,7 @@ func TestProbeChainOuterOnlyWidthFallback(t *testing.T) {
 			{NewIntDatum(2), NewStringDatum("p2"), NewStringDatum("extra")},
 		},
 	}
-	o := chainFixture(planner.JoinTypeSemi, probe, []Row{{NewIntDatum(1)}}, 2, 1)
+	o := chainFixture(optimizer.JoinTypeSemi, probe, []Row{{NewIntDatum(1)}}, 2, 1)
 	if err := probe.Open(nil); err != nil {
 		t.Fatalf("open probe: %v", err)
 	}
@@ -406,7 +406,7 @@ func TestProbeChainLeftJoinNullPad(t *testing.T) {
 				{NewIntDatum(9), NewStringDatum("p9")}, // hash-level miss
 			},
 		}
-		o := chainFixture(planner.JoinTypeLeft, probe, []Row{{NewIntDatum(1), NewStringDatum("b1")}}, 2, 2)
+		o := chainFixture(optimizer.JoinTypeLeft, probe, []Row{{NewIntDatum(1), NewStringDatum("b1")}}, 2, 2)
 		if err := probe.Open(nil); err != nil {
 			t.Fatalf("open probe: %v", err)
 		}
@@ -420,11 +420,11 @@ func TestProbeChainLeftJoinNullPad(t *testing.T) {
 		shape:  probeShapeSharedVirtual,
 		rows:   []Row{{NewIntDatum(1), NewStringDatum("p1")}},
 	}
-	o := chainFixture(planner.JoinTypeLeft, probe, []Row{{NewIntDatum(1), NewStringDatum("other")}}, 2, 2)
-	o.plan.Predicate = &planner.BinaryOp{
+	o := chainFixture(optimizer.JoinTypeLeft, probe, []Row{{NewIntDatum(1), NewStringDatum("other")}}, 2, 2)
+	o.plan.Predicate = &optimizer.BinaryOp{
 		Op:    parser.OpEq,
-		Left:  &planner.ColumnRef{Index: 1},
-		Right: &planner.ColumnRef{Index: 3},
+		Left:  &optimizer.ColumnRef{Index: 1},
+		Right: &optimizer.ColumnRef{Index: 3},
 	}
 	if err := probe.Open(nil); err != nil {
 		t.Fatalf("open probe: %v", err)
@@ -442,7 +442,7 @@ func TestProbeChainRebindAssertion(t *testing.T) {
 		shape:  probeShapeSharedVirtual,
 		rows:   []Row{{NewIntDatum(1), NewStringDatum("p1")}},
 	}
-	o := chainFixture(planner.JoinTypeInner, probe, []Row{{NewIntDatum(1), NewStringDatum("b1")}}, 2, 2)
+	o := chainFixture(optimizer.JoinTypeInner, probe, []Row{{NewIntDatum(1), NewStringDatum("b1")}}, 2, 2)
 	if err := probe.Open(nil); err != nil {
 		t.Fatalf("open probe: %v", err)
 	}
@@ -471,7 +471,7 @@ func newSeamFixture() (*shapedProbeOp, *joinOp) {
 		build[i] = Row{NewIntDatum(int64(i)), NewStringDatum("b")}
 	}
 	probe := &shapedProbeOp{schema: chainSchema(3, 0), shape: probeShapeSharedVirtual, rows: rows}
-	o := chainFixture(planner.JoinTypeInner, probe, build, 3, 2)
+	o := chainFixture(optimizer.JoinTypeInner, probe, build, 3, 2)
 	o.lazyHash = nil
 	o.lazyHashIsInt = true
 	o.lazyIntHash = map[int64][]Row{}

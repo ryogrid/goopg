@@ -127,6 +127,9 @@ type VacuumStmt struct {
 	ParallelWorkers     int          // -1 = not specified
 	BufferUsageLimit    string       // "" = not specified
 	Targets             []ObjectName // empty -> all relations
+	// TargetCols is parallel to Targets; TargetCols[i] is nil when
+	// Targets[i] carries no column list.
+	TargetCols [][]string
 }
 
 func (s *VacuumStmt) Pos() int  { return s.pos }
@@ -138,6 +141,9 @@ type AnalyzeStmt struct {
 	Verbose    bool
 	SkipLocked bool
 	Targets    []ObjectName
+	// TargetCols is parallel to Targets; TargetCols[i] is nil when
+	// Targets[i] carries no column list.
+	TargetCols [][]string
 }
 
 func (s *AnalyzeStmt) Pos() int  { return s.pos }
@@ -1230,6 +1236,12 @@ type ColumnDef struct {
 	// CheckExpr holds the raw SQL expression for an inline CHECK constraint.
 	// M0097-0014.
 	CheckExpr string
+	// CheckConstraintName holds the user-given name when the inline CHECK is
+	// written with an explicit `CONSTRAINT <name>` prefix
+	// (`a int CONSTRAINT myname CHECK (a > 0)`). Empty for the anonymous form,
+	// in which case the constraint is auto-named (<table>_<col>_check). Only
+	// meaningful when CheckExpr is non-empty. M0134-0002 slice S02.
+	CheckConstraintName string
 	// NotNullNoInherit is true when the NOT NULL constraint carries NO INHERIT
 	// (PG18: `c int NOT NULL NO INHERIT`). goopg v0 tracks the flag to emit
 	// the partitioned-table error for LIKE INCLUDING ALL. M0097-0023.
@@ -1256,6 +1268,16 @@ type ColumnDef struct {
 	// Compression purely so the column round-trips through pg_dump (goopg does
 	// not actually TOAST/compress). DU-002 slice 183.
 	Compression string
+	// Storage is the per-column storage mode from an inline `STORAGE <mode>`
+	// clause (`col text STORAGE plain`) — "plain", "external", "extended", or
+	// "main". Empty when no clause was written. Threaded onto
+	// catalog.Column.Storage so the synthesized pg_attribute row reports
+	// attstorage and pg_dump re-emits a SET STORAGE clause when it differs
+	// from the type default (goopg does not actually TOAST). The requested
+	// mode is validated against the type's intrinsic storage at CREATE TABLE
+	// time (GetAttributeStorage, tablecmds.c:22082-22112). M0134-0002 C2
+	// slice 9.
+	Storage string
 	// Collation is the collation name from an inline `COLLATE <name>` clause
 	// (`col text COLLATE "C"`). Empty when none was written. Stored as the bare
 	// (last-component, unquoted) collation name — e.g. "C", "POSIX", "ucs_basic".
@@ -3160,6 +3182,23 @@ const (
 	// AccessMethodName holds the target AM name. DU-002: pg_dump emits this for
 	// partitioned tables whose relam differs from the default.
 	AlterTableSetAccessMethod
+	// AlterTableRenameConstraint — `ALTER TABLE name RENAME CONSTRAINT old TO new`.
+	// Renames an existing table constraint in place, keeping its OID. For
+	// UNIQUE/PK/EXCLUDE the constraint name IS the backing index name, so the
+	// rename re-keys the index too (rename_constraint_internal →
+	// RenameRelationInternal, tablecmds.c:4129-4134). OldConstraintName holds the
+	// old name; NewName the new one. M0134-0002 C2.
+	AlterTableRenameConstraint
+	// AlterTableAddOf — `ALTER TABLE t OF type_name` (PG AT_AddOf). Re-tags an
+	// existing table as a typed table of the named composite type after
+	// validating the column layout order-strictly. OfType holds the composite
+	// type name. Mirrors CREATE TABLE ... OF (gram.y's `OF any_name`);
+	// M0134-0002 C2 slice 11.
+	AlterTableAddOf
+	// AlterTableDropOf — `ALTER TABLE t NOT OF` (PG AT_DropOf). Detaches a
+	// typed table from its originating composite type by clearing
+	// pg_class.reloftype. PG grammar gram.y's `NOT OF`; M0134-0002 C2 slice 11.
+	AlterTableDropOf
 )
 
 // FDWOptionVerb tags one entry of an `ALTER FOREIGN TABLE ... OPTIONS (...)`
@@ -3227,10 +3266,18 @@ type AlterTableAction struct {
 	// OldColumnName is populated for AlterTableRenameColumn and holds the
 	// existing column name to be renamed. M0097-regress.
 	OldColumnName string
+	// OldConstraintName is populated for AlterTableRenameConstraint and holds
+	// the existing constraint name to be renamed (ConstraintName is reserved for
+	// "ADD CONSTRAINT name"). M0134-0002 C2.
+	OldConstraintName string
 
 	// InheritParent is populated for AlterTableInherit and AlterTableNoInherit.
 	// Holds the parent table name. M0097-0048.
 	InheritParent ObjectName
+	// OfType is populated for AlterTableAddOf (`ALTER TABLE t OF type_name`)
+	// and holds the composite type name. Value type, mirrors InheritParent;
+	// empty for AlterTableDropOf. M0134-0002 C2 slice 11.
+	OfType ObjectName
 
 	// CheckExpr is the raw SQL expression for AlterTableAddCheck.
 	CheckExpr string
@@ -3272,6 +3319,11 @@ type AlterTableAction struct {
 	// (`ALTER COLUMN name SET DEFAULT expr`). Nil for AlterTableDropDefault.
 	// DU-002 slice 269.
 	DefaultExpr Expr
+	// UsingExpr is the parsed USING expression for AlterTableAlterColumnType
+	// (`ALTER COLUMN name TYPE t USING expr`); nil when no USING clause is
+	// present. The executor evaluates it per-row against the OLD row and
+	// coerces the result to the target type. M0134-0002 C2 slice 5.
+	UsingExpr Expr
 	// SetOptions holds the per-column attribute options captured from
 	// `ALTER COLUMN name SET (opt=value, …)` for AlterTableAlterColumnSet, each
 	// entry normalized to PG's stored `name=value` form (e.g. "n_distinct=0.5").
@@ -3287,6 +3339,12 @@ type AlterTableAction struct {
 	// NoInherit is set for AlterTableAddNotNull when the constraint carries a
 	// `NO INHERIT` trailer (contype='n', connoinherit='t'). DU-002 slice 271.
 	NoInherit bool
+	// IfExists is set for `ADD COLUMN IF NOT EXISTS ...` (gram.y opt_if_not_exists,
+	// postgres/src/backend/parser/gram.y:6661). When the column already exists,
+	// PG emits NOTICE `column "c" of relation "r" already exists, skipping` and
+	// skips instead of raising 42701 (check_for_column_name_collision,
+	// postgres/src/backend/commands/tablecmds.c:7677-7684). M0134-0002 C2.
+	IfExists bool
 	// ChildIndexName is populated for AlterIndexAttachPartition and holds
 	// the name of the child index to attach. M0097-0023.
 	ChildIndexName string
@@ -3353,6 +3411,12 @@ type AlterTableStmt struct {
 	IfExists bool
 	Name     ObjectName
 	Actions  []AlterTableAction
+	// Only is true for `ALTER TABLE [IF EXISTS] ONLY name` (inheritance
+	// exclusion, gram.y opt_only). PG threads it as recurse=false into the
+	// ATExec* routines, which refuse ONLY on a parent that has children
+	// ("column/constraint must be added/renamed in child tables too").
+	// M0134-0002 C9.
+	Only bool
 	// SetSchema holds the target schema name for ALTER TABLE/VIEW/MATERIALIZED VIEW
 	// ... SET SCHEMA <newschema>. Empty means no SET SCHEMA action. M0097-0025.
 	SetSchema string

@@ -36,7 +36,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/pgnodes"
+	"github.com/goopg/goopg/internal/nodes"
 	"github.com/goopg/goopg/internal/testutil/pgcluster"
 )
 
@@ -50,7 +50,7 @@ type liveRelationResolver struct {
 	c *pgcluster.Cluster
 }
 
-func (r liveRelationResolver) LookupRelation(schema, name string) (*pgnodes.RelationInfo, bool) {
+func (r liveRelationResolver) LookupRelation(schema, name string) (*nodes.RelationInfo, bool) {
 	rel := name
 	if schema != "" {
 		rel = schema + "." + name
@@ -82,7 +82,7 @@ func (r liveRelationResolver) LookupRelation(schema, name string) (*pgnodes.Rela
 	if colsStr == "" {
 		r.t.Fatalf("liveRelationResolver: no user columns for %s", rel)
 	}
-	var cols []pgnodes.ColumnInfo
+	var cols []nodes.ColumnInfo
 	for _, cs := range strings.Split(colsStr, ",") {
 		f := strings.Split(cs, ":")
 		if len(f) != 5 {
@@ -92,7 +92,7 @@ func (r liveRelationResolver) LookupRelation(schema, name string) (*pgnodes.Rela
 		typOid, _ := strconv.ParseUint(f[2], 10, 32)
 		typmod, _ := strconv.ParseInt(f[3], 10, 32)
 		coll, _ := strconv.ParseUint(f[4], 10, 32)
-		cols = append(cols, pgnodes.ColumnInfo{
+		cols = append(cols, nodes.ColumnInfo{
 			Name:      f[0],
 			Attno:     int32(attno),
 			TypeOID:   uint32(typOid),
@@ -100,7 +100,7 @@ func (r liveRelationResolver) LookupRelation(schema, name string) (*pgnodes.Rela
 			Collation: uint32(coll),
 		})
 	}
-	return &pgnodes.RelationInfo{
+	return &nodes.RelationInfo{
 		Relid:   uint32(relOid),
 		Relname: name,
 		Relkind: mp[1][0],
@@ -194,12 +194,12 @@ func TestOraclePgnodesEvActionBytesMatchPG(t *testing.T) {
 			want := normalizeOracleLocations(pgEvAction)
 
 			sel := parseSelectForOracle(t, tc.sel)
-			q, err := pgnodes.ResolveViewQuery(sel, resolver)
+			q, err := nodes.ResolveViewQuery(sel, resolver)
 			if err != nil {
 				t.Fatalf("goopg ResolveViewQuery(%q) degraded (%v), but PG18 stored a canonical ev_action:\n  PG18: %s",
 					tc.sel, err, want)
 			}
-			got := pgnodes.OutRuleAction([]pgnodes.Node{q})
+			got := nodes.OutRuleAction([]nodes.Node{q})
 			if got != want {
 				t.Fatalf("ev_action byte mismatch for view %s (%s):\n  goopg: %s\n  PG18:  %s", view, tc.sel, got, want)
 			}

@@ -33,10 +33,10 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // ApplyWorker drives one subscription's apply loop. Construct
@@ -45,7 +45,7 @@ import (
 type ApplyWorker struct {
 	cat    catalog.Catalog
 	pool   *storage.Pool
-	txnMgr *mvcc.Manager
+	txnMgr *transam.Manager
 
 	// relations caches `R` messages keyed by remote rel OID,
 	// resolved to the local catalog.Table once on first
@@ -56,7 +56,7 @@ type ApplyWorker struct {
 	// `B` and closed on `C` / abort. Apply work happens inside
 	// it. When inXact is false, change events outside an open
 	// xact are an apply error.
-	currentTx mvcc.Transaction
+	currentTx transam.Transaction
 	inXact    bool
 
 	// Tablesync gating. When pubsub and subName are both set,
@@ -76,7 +76,7 @@ type ApplyWorker struct {
 	// commit advances the worker's received_lsn to the commit
 	// LSN. Nil disables observability — the legacy path used by
 	// existing tests.
-	stat *wal.Subscriber
+	stat *xlog.Subscriber
 
 	// logger receives structured replication-event lines (apply
 	// commits, apply errors, tablesync state promotions). nil
@@ -90,12 +90,12 @@ type ApplyWorker struct {
 // matching local table — the apply worker rejects subsequent
 // changes on it instead of silently dropping data.
 type applyRel struct {
-	remote *wal.DecodedRelation
+	remote *xlog.DecodedRelation
 	local  *catalog.Table
 }
 
 // NewApplyWorker wires an apply worker to local storage handles.
-func NewApplyWorker(cat catalog.Catalog, pool *storage.Pool, txnMgr *mvcc.Manager) *ApplyWorker {
+func NewApplyWorker(cat catalog.Catalog, pool *storage.Pool, txnMgr *transam.Manager) *ApplyWorker {
 	return &ApplyWorker{
 		cat:       cat,
 		pool:      pool,
@@ -136,7 +136,7 @@ func (w *ApplyWorker) SetSubscriptionContext(ps *catalog.PubSub, subName string)
 // commit advances received_lsn via AdvanceReceivedLSN. Nil
 // disables observability. Caller owns the handle's lifecycle
 // (Register before, Unregister after the apply loop). Idempotent.
-func (w *ApplyWorker) SetStatHandle(sub *wal.Subscriber) {
+func (w *ApplyWorker) SetStatHandle(sub *xlog.Subscriber) {
 	w.stat = sub
 }
 
@@ -161,7 +161,7 @@ func (w *ApplyWorker) log() *slog.Logger {
 // carries the remote commit LSN so the caller can advance the
 // slot's `confirmed_flush_lsn`. Errors abort the apply and
 // rollback the in-progress txn (if any).
-func (w *ApplyWorker) ApplyMessage(m *wal.DecodedMessage) (uint64, error) {
+func (w *ApplyWorker) ApplyMessage(m *xlog.DecodedMessage) (uint64, error) {
 	if m == nil {
 		return 0, errors.New("applyworker: nil message")
 	}
@@ -196,14 +196,14 @@ func (w *ApplyWorker) ApplyMessage(m *wal.DecodedMessage) (uint64, error) {
 	}
 	if err != nil {
 		w.log().Error("logical apply: per-message failure",
-			"event", wal.EventApplyError,
+			"event", xlog.EventApplyError,
 			"sub", w.subName, "kind", string(m.Kind),
 			"rel_oid", m.RelOID, "lsn", m.EndLSN, "err", err)
 	}
 	return commitLSN, err
 }
 
-func (w *ApplyWorker) applyBegin(m *wal.DecodedMessage) error {
+func (w *ApplyWorker) applyBegin(m *xlog.DecodedMessage) error {
 	if w.inXact {
 		// Defensive: a B inside an open xact means the previous
 		// transaction was never finalised. Roll it back to keep
@@ -211,7 +211,7 @@ func (w *ApplyWorker) applyBegin(m *wal.DecodedMessage) error {
 		_ = w.txnMgr.Rollback(w.currentTx)
 		w.inXact = false
 	}
-	tx, err := w.txnMgr.Begin(mvcc.IsolationReadCommitted)
+	tx, err := w.txnMgr.Begin(transam.IsolationReadCommitted)
 	if err != nil {
 		return fmt.Errorf("applyworker: begin txn (xid=%d): %w", m.XID, err)
 	}
@@ -220,7 +220,7 @@ func (w *ApplyWorker) applyBegin(m *wal.DecodedMessage) error {
 	return nil
 }
 
-func (w *ApplyWorker) applyRelation(m *wal.DecodedMessage) error {
+func (w *ApplyWorker) applyRelation(m *xlog.DecodedMessage) error {
 	if m.Relation == nil {
 		return errors.New("applyworker: R message missing relation body")
 	}
@@ -233,7 +233,7 @@ func (w *ApplyWorker) applyRelation(m *wal.DecodedMessage) error {
 	return nil
 }
 
-func (w *ApplyWorker) applyInsert(m *wal.DecodedMessage) error {
+func (w *ApplyWorker) applyInsert(m *xlog.DecodedMessage) error {
 	if !w.inXact {
 		return errors.New("applyworker: INSERT outside transaction")
 	}
@@ -309,7 +309,7 @@ func (w *ApplyWorker) applyInsert(m *wal.DecodedMessage) error {
 	return nil
 }
 
-func (w *ApplyWorker) applyDelete(m *wal.DecodedMessage) error {
+func (w *ApplyWorker) applyDelete(m *xlog.DecodedMessage) error {
 	if !w.inXact {
 		return errors.New("applyworker: DELETE outside transaction")
 	}
@@ -334,7 +334,7 @@ func (w *ApplyWorker) applyDelete(m *wal.DecodedMessage) error {
 	return applyDeleteByKey(ctx, rel, r.local.Columns, keyRow)
 }
 
-func (w *ApplyWorker) applyUpdate(m *wal.DecodedMessage) error {
+func (w *ApplyWorker) applyUpdate(m *xlog.DecodedMessage) error {
 	if !w.inXact {
 		return errors.New("applyworker: UPDATE outside transaction")
 	}
@@ -419,7 +419,7 @@ func (w *ApplyWorker) applyUpdate(m *wal.DecodedMessage) error {
 // goopg never saw a relation descriptor for points at a publisher /
 // subscriber catalog drift the operator must investigate, not a
 // silent data-loss outcome.
-func (w *ApplyWorker) applyTruncate(m *wal.DecodedMessage) error {
+func (w *ApplyWorker) applyTruncate(m *xlog.DecodedMessage) error {
 	if !w.inXact {
 		return errors.New("applyworker: TRUNCATE outside transaction")
 	}
@@ -496,7 +496,7 @@ func applyDeleteByKey(ctx *Context, rel storage.RelFileNode, cols []catalog.Colu
 			if err != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
+			if !transam.TupleVisibleSubxact(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
 				continue
 			}
 			if err := DecodeHeapTupleRowInto(scanRow, cols, tup, nil); err != nil {
@@ -635,7 +635,7 @@ func applyScanFirstMatch(ctx *Context, rel storage.RelFileNode, cols []catalog.C
 			if err != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
+			if !transam.TupleVisibleSubxact(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
 				continue
 			}
 			if err := DecodeHeapTupleRowInto(scanRow, cols, tup, nil); err != nil {
@@ -719,7 +719,7 @@ func primaryKeyOnlyRow(cat catalog.Catalog, tbl *catalog.Table, full Row) Row {
 // corrupt streams without identity hints fall back to `primaryKeyOnlyRow` in
 // `applyUpdate`. Design doc:
 // docs/design/0103-0035-m0103-0007-rung-12-pg-to-goopg-replica-identity-index.md.
-func replicaIdentityKeyRow(remoteCols []wal.DecodedAttr, localCols []catalog.Column, newRow Row) Row {
+func replicaIdentityKeyRow(remoteCols []xlog.DecodedAttr, localCols []catalog.Column, newRow Row) Row {
 	if len(newRow) != len(localCols) {
 		return nil
 	}
@@ -784,13 +784,13 @@ func applyDatumEqual(a, b Datum) bool {
 	return false
 }
 
-func (w *ApplyWorker) applyCommit(m *wal.DecodedMessage) error {
+func (w *ApplyWorker) applyCommit(m *xlog.DecodedMessage) error {
 	if w.inXact {
 		if err := w.txnMgr.Commit(w.currentTx); err != nil {
 			return fmt.Errorf("applyworker: commit (commit_lsn=%d): %w", m.CommitLSN, err)
 		}
 		w.inXact = false
-		w.currentTx = mvcc.Transaction{}
+		w.currentTx = transam.Transaction{}
 	}
 	// (Idle commit with no Begin observed — v0 pgoutput can emit
 	// commit-only sequences when every change was filtered.
@@ -800,7 +800,7 @@ func (w *ApplyWorker) applyCommit(m *wal.DecodedMessage) error {
 		w.stat.AdvanceReceivedLSN(m.CommitLSN)
 	}
 	w.log().Info("logical apply: commit",
-		"event", wal.EventApplyCommit,
+		"event", xlog.EventApplyCommit,
 		"sub", w.subName, "xid", m.XID, "lsn", m.CommitLSN)
 	return nil
 }
@@ -830,7 +830,7 @@ func (w *ApplyWorker) promoteSyncedRels(commitLSN uint64) {
 		if _, err := w.pubsub.AdvanceSubscriptionRel(w.subName, sr.RelOID,
 			catalog.SubRelStateReady, commitLSN); err == nil {
 			w.log().Info("logical apply: tablesync rel promoted",
-				"event", wal.EventTablesyncStateChange,
+				"event", xlog.EventTablesyncStateChange,
 				"sub", w.subName, "rel_oid", sr.RelOID,
 				"from", catalog.SubRelStateSyncDone,
 				"to", catalog.SubRelStateReady,
@@ -850,7 +850,7 @@ func (w *ApplyWorker) promoteSyncedRels(commitLSN uint64) {
 // ignore the mask — the NullDatum + rowMatchesKey's
 // "skip NULL key cells" semantics yield correct behaviour
 // for OldTuple/key-row use cases.
-func decodePgoutputTupleAsRow(remoteCols []wal.DecodedAttr, localCols []catalog.Column, tup []wal.DecodedColumn) (Row, []bool, []bool, error) {
+func decodePgoutputTupleAsRow(remoteCols []xlog.DecodedAttr, localCols []catalog.Column, tup []xlog.DecodedColumn) (Row, []bool, []bool, error) {
 	if len(tup) != len(remoteCols) {
 		return nil, nil, nil, fmt.Errorf("tuple has %d cols, R message described %d", len(tup), len(remoteCols))
 	}
@@ -958,6 +958,6 @@ func (w *ApplyWorker) SafeRollback() {
 	if w.inXact {
 		_ = w.txnMgr.Rollback(w.currentTx)
 		w.inXact = false
-		w.currentTx = mvcc.Transaction{}
+		w.currentTx = transam.Transaction{}
 	}
 }

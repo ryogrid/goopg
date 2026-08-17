@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/goopg/goopg/internal/mctx"
+	"github.com/goopg/goopg/internal/utils/mmgr"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -191,7 +191,7 @@ func newNumeric(b *big.Int, scale int) Datum {
 		return Datum{Kind: KindNumeric, Int: b.Int64(), Scale: int16(scale)}
 	}
 	bb := new(big.Int).Set(b)
-	return newBigNumericInCtx(mctx.Perm(), bb, int16(scale))
+	return newBigNumericInCtx(mmgr.Perm(), bb, int16(scale))
 }
 
 // parseNumericFast attempts an int64-only fast path for the

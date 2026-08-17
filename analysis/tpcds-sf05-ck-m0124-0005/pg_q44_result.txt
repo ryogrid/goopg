@@ -1,0 +1,14 @@
+ rnk |                  best_performing                   |                  worst_performing                  
+-----+----------------------------------------------------+----------------------------------------------------
+   1 | antiationpriantiought                              | eingantiationpriought                             
+   2 | baroughtn stese                                    | eingpriablepri                                    
+   3 | barcallyationation                                 | esecallyoughtbarought                             
+   4 | eseantieseable                                     | barationn stoughtought                            
+   5 | barableesecally                                    | ableeingationought                                
+   6 | esebarableeseought                                 | eingeseoughteing                                  
+   7 | baresebarpriought                                  | callyprioughtanti                                 
+   8 | antin steseought                                   | eseeing                                           
+   9 | ationesen stanti                                   | eingbarbarcallyought                              
+  10 | eseationeingese                                    | callyeingbarcallyought                            
+(10 rows)
+

@@ -6,9 +6,9 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/executor"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -23,7 +23,7 @@ func runDDL(t *testing.T, rt *Runtime, sql string) {
 	if len(stmts) != 1 {
 		t.Fatalf("expected 1 statement, got %d", len(stmts))
 	}
-	plan, err := planner.Plan(stmts[0], rt.Catalog)
+	plan, err := optimizer.Plan(stmts[0], rt.Catalog)
 	if err != nil {
 		t.Fatalf("plan %q: %v", sql, err)
 	}
@@ -32,7 +32,7 @@ func runDDL(t *testing.T, rt *Runtime, sql string) {
 		t.Fatalf("build %q: %v", sql, err)
 	}
 
-	tx, err := rt.TxnMgr.Begin(mvcc.IsolationReadCommitted)
+	tx, err := rt.TxnMgr.Begin(transam.IsolationReadCommitted)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}

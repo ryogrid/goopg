@@ -4,9 +4,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goopg/goopg/internal/mctx"
+	"github.com/goopg/goopg/internal/utils/mmgr"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // TestFormatMemoryLine pins formatMemoryLine's TEXT rendering:
@@ -63,7 +63,7 @@ func TestExplainMemoryAnalyzeTextLine(t *testing.T) {
 	ctx, cleanup := newVMFixture(t)
 	defer cleanup()
 
-	ctx.Mctx = mctx.Acquire(nil, mctx.KindStmt)
+	ctx.Mctx = mmgr.Acquire(nil, mmgr.KindStmt)
 	defer ctx.Mctx.Release()
 
 	runComposite(t, ctx,
@@ -96,7 +96,7 @@ func TestExplainMemoryJSONAlwaysIncludesKeys(t *testing.T) {
 	ctx, cleanup := newVMFixture(t)
 	defer cleanup()
 
-	ctx.Mctx = mctx.Acquire(nil, mctx.KindStmt)
+	ctx.Mctx = mmgr.Acquire(nil, mmgr.KindStmt)
 	defer ctx.Mctx.Release()
 
 	runComposite(t, ctx,
@@ -143,11 +143,11 @@ func TestExplainMemoryJSONOmittedWithoutMemoryOption(t *testing.T) {
 func TestInstrumentedOpAccountsMemory(t *testing.T) {
 	// We use a dedicated mctx context rather than relying on the test
 	// harness's SQL-level context, so we can seed bytes precisely.
-	sctx := mctx.Acquire(nil, mctx.KindStmt)
+	sctx := mmgr.Acquire(nil, mmgr.KindStmt)
 	defer sctx.Release()
 
 	stats := &nodeStats{}
-	op := &instrumentedOp{inner: fakeIOTimingOp{}, plan: &planner.Values{}, stats: stats}
+	op := &instrumentedOp{inner: fakeIOTimingOp{}, plan: &optimizer.Values{}, stats: stats}
 
 	if err := op.Open(&Context{Mctx: sctx}); err != nil {
 		t.Fatal(err)
@@ -183,7 +183,7 @@ func TestInstrumentedOpAccountsMemory(t *testing.T) {
 // planToJSONWithStats's "Memory Used"/"Memory Allocated" properties
 // directly against a synthetic stats table.
 func TestPlanToJSONWithStatsRendersMemoryWhenNonzero(t *testing.T) {
-	n := &planner.Values{}
+	n := &optimizer.Values{}
 	stats := nodeStatsTable{n: {memPeak: 8192, memAllocated: 65536}}
 	obj := planToJSONWithStats(n, parser.ExplainOptions{Memory: true}, stats, false)
 	if got, ok := obj["Memory Used"].(int64); !ok || got != 8 {
@@ -198,7 +198,7 @@ func TestPlanToJSONWithStatsRendersMemoryWhenNonzero(t *testing.T) {
 // above: without opts.Memory, the properties stay absent even though the
 // node has nonzero memory counters.
 func TestPlanToJSONWithStatsOmitsMemoryWhenOptionOff(t *testing.T) {
-	n := &planner.Values{}
+	n := &optimizer.Values{}
 	stats := nodeStatsTable{n: {memPeak: 4096, memAllocated: 16384}}
 	obj := planToJSONWithStats(n, parser.ExplainOptions{}, stats, false)
 	if _, ok := obj["Memory Used"]; ok {
@@ -219,7 +219,7 @@ func TestExplainMemoryRepeatScanAccumulatesMore(t *testing.T) {
 	ctx, cleanup := newVMFixture(t)
 	defer cleanup()
 
-	ctx.Mctx = mctx.Acquire(nil, mctx.KindStmt)
+	ctx.Mctx = mmgr.Acquire(nil, mmgr.KindStmt)
 	defer ctx.Mctx.Release()
 
 	runComposite(t, ctx,
@@ -248,7 +248,7 @@ func TestExplainMemoryRepeatScanAccumulatesMore(t *testing.T) {
 func TestExplainMemoryWithMctxNil(t *testing.T) {
 	// Direct low-level test: instrumentedOp with nil Mctx must not panic.
 	stats := &nodeStats{}
-	op := &instrumentedOp{inner: fakeIOTimingOp{}, plan: &planner.Values{}, stats: stats}
+	op := &instrumentedOp{inner: fakeIOTimingOp{}, plan: &optimizer.Values{}, stats: stats}
 
 	// Open with nil Mctx.
 	if err := op.Open(&Context{}); err != nil {

@@ -62,7 +62,7 @@ help:
 	@echo "  make ralph-state-check  Validate .ralph/status.json and .ralph/progress.json consistency."
 	@echo "  make ralph-state-repair Attempt safe auto-repair for .ralph/status.json and .ralph/progress.json."
 	@echo "  make ralph-state-guard  Check Ralph state, auto-repair if needed, then verify again."
-	@echo "  make runtimeshim-matrix Run internal/runtimeshim tests under every Go toolchain in PATH."
+	@echo "  make runtimeshim-matrix Run internal/port/runtimeshim tests under every Go toolchain in PATH."
 	@echo "  make pgbench-compare    Run pgbench comparison between goopg and PostgreSQL."
 	@echo "  make pgbench-compare-matrix Run the full goopg pgbench matrix survey."
 	@echo "  make pgbench-compare-report Generate markdown report from latest pgbench results."
@@ -217,7 +217,7 @@ ralph-metrics:
 		python3 metrics_report.py
 
 # M0107-0008 per-Go-minor maintenance: verify //go:linkname targets in
-# internal/runtimeshim against every Go toolchain present in PATH (the
+# internal/port/runtimeshim against every Go toolchain present in PATH (the
 # default `go` plus any `go1.N`-style binaries installed via
 # `go install golang.org/dl/go1.N@latest`). See
 # docs/design/perf-optimize/08-runtime-internals.md §8.
@@ -419,9 +419,40 @@ plan-gate: plan-snapshot-build
 #
 # RACE_TIMEOUT defaults to 15m (race tests run ~2–3× slower than
 # normal due to shadow memory overhead).
+#
+# RACE_SHARD_PKGS / RACE_SHARDS / RACE_SHARD_ONLY: some packages are
+# effectively sequential (no t.Parallel() fan-out) and slow enough
+# under -race to blow a single test binary's RACE_TIMEOUT even though
+# the package as a whole is not racy. internal/initdb is the known
+# case: 122 call sites of the full on-disk initdb.Init(...) bootstrap
+# (internal/initdb/initdb.go:1331) across 38 files, each ~27-29s under
+# -race (measured: 3 Init-heavy tests = 84.9s), and only
+# internal/initdb/relcache_init_test.go:18,50,83 call t.Parallel() —
+# sequential total is ~50-70min, over the nightly's 45m budget
+# (two consecutive nightly failures: "panic: test timed out after
+# 45m0s" / "FAIL ... internal/initdb 2700.053s" — closes nightly items
+# AI-20260815-011722-001 / AI-20260816-005117-001). For every package
+# import-path-suffix listed in RACE_SHARD_PKGS, race-gate instead
+# fans that ONE package out into RACE_SHARDS concurrent
+# `go test -race -run <regex>` invocations, each covering a disjoint,
+# round-robin-assigned slice of the package's top-level `go test
+# -list` test names — full race coverage is retained, no test is
+# skipped and no package is excluded, just re-partitioned across more
+# test binaries within the same nightly concurrency envelope
+# (ci/batch/stages/stage-race.sh already runs GOFLAGS=-p=4). Every
+# other selected package still runs through one bulk `go test -race`
+# invocation exactly as before. RACE_SHARD_ONLY=1 skips that bulk run
+# so the shard set alone can be timed/measured in isolation.
 # ---------------------------------------------------------------
 RACE_TIMEOUT ?= 15m
-RACE_EXCLUDE = internal/testport|internal/server|internal/testutil/cluster|internal/testutil/replcluster|internal/testutil/pgcluster|internal/testutil/pubsubcluster|internal/testutil/tpch|/bench/
+# The internal/testutil/* entries are enumerated ONE BY ONE on purpose. Do not
+# collapse them to a bare `internal/testutil`: internal/testutil/estimateaudit
+# is a plain library with ordinary unit tests and must keep running in the
+# gates. Collapsing the alternation would drop it silently.
+RACE_EXCLUDE = internal/testport|internal/postmaster|internal/testutil/cluster|internal/testutil/replcluster|internal/testutil/pgcluster|internal/testutil/pubsubcluster|internal/testutil/tpch|/bench/
+RACE_SHARD_PKGS ?= internal/initdb
+RACE_SHARDS ?= 4
+RACE_SHARD_ONLY ?=
 
 race-gate:
 	@echo "race-gate: collecting packages (excluding server/cluster/bench)..."
@@ -429,8 +460,71 @@ race-gate:
 	if [ -z "$$PKGS" ]; then \
 		echo "race-gate: no packages selected" >&2; exit 1; \
 	fi; \
-	echo "race-gate: running go test -race on $$(echo "$$PKGS" | wc -l) packages (timeout $(RACE_TIMEOUT))..."; \
-	go test -race -timeout $(RACE_TIMEOUT) $$PKGS
+	DOLLAR='$$'; \
+	SHARD_PKGS=""; \
+	for p in $$PKGS; do \
+		for suf in $(RACE_SHARD_PKGS); do \
+			case "$$p" in \
+				*"/$$suf") SHARD_PKGS="$$SHARD_PKGS $$p" ;; \
+			esac; \
+		done; \
+	done; \
+	BULK_PKGS="$$PKGS"; \
+	for p in $$SHARD_PKGS; do \
+		BULK_PKGS=$$(echo "$$BULK_PKGS" | grep -vFx "$$p"); \
+	done; \
+	RC=0; \
+	if [ -z "$(RACE_SHARD_ONLY)" ] && [ -n "$$BULK_PKGS" ]; then \
+		echo "race-gate: running go test -race on $$(echo "$$BULK_PKGS" | wc -l) packages (timeout $(RACE_TIMEOUT))..."; \
+		go test -race -timeout $(RACE_TIMEOUT) $$BULK_PKGS || RC=1; \
+	fi; \
+	for pkg in $$SHARD_PKGS; do \
+		LISTOUT=$$(go test -list '^Test' $$pkg 2>&1); LISTRC=$$?; \
+		TESTS=$$(echo "$$LISTOUT" | grep -E '^Test'); \
+		NTESTS=$$(echo "$$TESTS" | grep -c '^Test'); \
+		if [ $$LISTRC -ne 0 ] || [ "$$NTESTS" -eq 0 ]; then \
+			echo "race-gate: $$pkg: go test -list produced no tests (list rc=$$LISTRC) — refusing to report coverage" >&2; \
+			echo "$$LISTOUT" >&2; \
+			RC=1; \
+			continue; \
+		fi; \
+		echo "race-gate: sharding $$pkg ($$NTESTS top-level tests) into $(RACE_SHARDS) shards (timeout $(RACE_TIMEOUT) each)..."; \
+		SHTMP=$$(mktemp -d); \
+		SUM=0; \
+		for s in $$(seq 1 $(RACE_SHARDS)); do \
+			GROUP=$$(echo "$$TESTS" | awk -v n=$(RACE_SHARDS) -v s=$$s 'NR % n == (s % n)'); \
+			if [ -z "$$GROUP" ]; then \
+				echo "race-gate: $$pkg shard $$s/$(RACE_SHARDS): 0 tests, skipping"; \
+				continue; \
+			fi; \
+			CNT=$$(echo "$$GROUP" | grep -c '^Test'); \
+			SUM=$$((SUM + CNT)); \
+			RE="^($$(echo "$$GROUP" | paste -sd'|' -))$$DOLLAR"; \
+			echo "race-gate: $$pkg shard $$s/$(RACE_SHARDS): $$CNT tests"; \
+			( go test -race -timeout $(RACE_TIMEOUT) -run "$$RE" $$pkg > "$$SHTMP/shard-$$s.log" 2>&1; echo $$? > "$$SHTMP/shard-$$s.rc" ) & \
+		done; \
+		wait; \
+		if [ "$$SUM" != "$$NTESTS" ]; then \
+			echo "race-gate: $$pkg shard partition BUG: sum=$$SUM but go test -list says $$NTESTS — refusing to trust coverage" >&2; \
+			RC=1; \
+		else \
+			echo "race-gate: $$pkg shard test-count sum=$$SUM matches go test -list count=$$NTESTS"; \
+		fi; \
+		for s in $$(seq 1 $(RACE_SHARDS)); do \
+			if [ -f "$$SHTMP/shard-$$s.log" ]; then \
+				cat "$$SHTMP/shard-$$s.log"; \
+				SRC=$$(cat "$$SHTMP/shard-$$s.rc"); \
+				if [ "$$SRC" != "0" ]; then \
+					echo "race-gate: $$pkg shard $$s/$(RACE_SHARDS) FAILED (rc=$$SRC)"; \
+					RC=1; \
+				else \
+					echo "race-gate: $$pkg shard $$s/$(RACE_SHARDS) PASSED"; \
+				fi; \
+			fi; \
+		done; \
+		rm -rf "$$SHTMP"; \
+	done; \
+	exit $$RC
 
 # ---------------------------------------------------------------
 # parity-dashboard: diff PG 18.3's GUC list, SQLSTATE codes, and

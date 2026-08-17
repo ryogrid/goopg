@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goopg/goopg/internal/auth"
+	"github.com/goopg/goopg/internal/libpq/auth"
 	"github.com/goopg/goopg/internal/testutil/cluster"
 )
 

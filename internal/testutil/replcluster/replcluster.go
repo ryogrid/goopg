@@ -37,7 +37,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/testutil/cluster"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // Options controls cluster pair creation.
@@ -154,15 +154,15 @@ func (r *ReplCluster) Setup() error {
 			return fmt.Errorf("replcluster: primary extra conf %q: %w", line, err)
 		}
 	}
-	slots, err := wal.OpenSlots(r.Primary.DataDir())
+	slots, err := xlog.OpenSlots(r.Primary.DataDir())
 	if err != nil {
 		return fmt.Errorf("replcluster: open primary slots: %w", err)
 	}
 	// startLSN=0 lets the walreceiver request from the very
 	// beginning. The slot's RestartLSN advances as the standby
 	// confirms flushed bytes.
-	if _, err := slots.Create(r.SlotName, wal.SlotPhysical, 0); err != nil &&
-		!errors.Is(err, wal.ErrSlotExists) {
+	if _, err := slots.Create(r.SlotName, xlog.SlotPhysical, 0); err != nil &&
+		!errors.Is(err, xlog.ErrSlotExists) {
 		return fmt.Errorf("replcluster: pre-create slot: %w", err)
 	}
 

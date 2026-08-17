@@ -4,7 +4,7 @@ import (
 	"math/rand"
 	"testing"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // TestM0068SortExternalSpills constructs a sortOp with a tiny chunk
@@ -24,8 +24,8 @@ func TestM0068SortExternalSpills(t *testing.T) {
 	src := &fakeBorrowSource{rows: rows}
 	s := &sortOp{
 		child: src,
-		keys: []planner.SortKey{
-			{Expr: &planner.ColumnRef{Index: 0}, Desc: false},
+		keys: []optimizer.SortKey{
+			{Expr: &optimizer.ColumnRef{Index: 0}, Desc: false},
 		},
 		chunkLimitBytes: 1024, // tiny, forces many spills
 	}
@@ -71,8 +71,8 @@ func TestM0068SortNoSpillBelowChunk(t *testing.T) {
 	src := &fakeBorrowSource{rows: rows}
 	s := &sortOp{
 		child: src,
-		keys: []planner.SortKey{
-			{Expr: &planner.ColumnRef{Index: 0}, Desc: false},
+		keys: []optimizer.SortKey{
+			{Expr: &optimizer.ColumnRef{Index: 0}, Desc: false},
 		},
 	}
 	if err := s.Open(&Context{}); err != nil {

@@ -24,17 +24,17 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // valuesNode returns a plan node whose EstimateRows is exactly n — Values is
 // the one node type the planner estimates exactly rather than statistically.
-func valuesNode(n int) *planner.Values {
-	rows := make([][]planner.Expr, n)
+func valuesNode(n int) *optimizer.Values {
+	rows := make([][]optimizer.Expr, n)
 	for i := range rows {
-		rows[i] = []planner.Expr{&planner.ColumnRef{Index: 0, Type: catalog.Type{Name: "int4"}}}
+		rows[i] = []optimizer.Expr{&optimizer.ColumnRef{Index: 0, Type: catalog.Type{Name: "int4"}}}
 	}
-	return &planner.Values{Rows: rows}
+	return &optimizer.Values{Rows: rows}
 }
 
 func TestPresizeLazyHashChoosesTheLaneTheBuildCommittedTo(t *testing.T) {
@@ -68,7 +68,7 @@ func TestPresizeLazyHashChoosesTheLaneTheBuildCommittedTo(t *testing.T) {
 func TestPresizeLazyHashSkipsWhenSizeIsUnknownOrTiny(t *testing.T) {
 	cases := []struct {
 		name string
-		node planner.Node
+		node optimizer.Node
 	}{
 		{"no node", nil},
 		{"no estimate", valuesNode(0)},

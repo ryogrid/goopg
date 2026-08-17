@@ -2815,6 +2815,39 @@ func (p *parser) parseConstraintDeferrable(deferrable, initiallyDeferred *bool) 
 	}
 }
 
+// isEnforcedAttr reports whether the token stream at cur begins a `[NOT]
+// ENFORCED` attribute (bare ENFORCED, or NOT immediately followed by
+// ENFORCED). Used to detect a duplicate after a single-shot consume;
+// deliberately does NOT match NOT NULL / NOT VALID (the peek must be ENFORCED).
+// M0134-0002 C2 slice 12.
+func (p *parser) isEnforcedAttr() bool {
+	t := p.cur()
+	if t.Kind == TokenIdent && strings.EqualFold(t.Value, "enforced") {
+		return true
+	}
+	return t.Kind == TokenKeyword && t.Keyword == KwNot &&
+		p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "enforced")
+}
+
+// rejectDuplicateEnforced returns PG's "multiple ENFORCED/NOT ENFORCED clauses
+// not allowed" when the current token begins a second `[NOT] ENFORCED`
+// attribute. PG's transformConstraintAttrs (parse_utilcmd.c:3999-4027)
+// rejects any second ENFORCED-ish ConstraintAttr with exactly this message
+// (42601) — DIFFERENT from the table-level ConstraintAttributeSpec's
+// "conflicting constraint properties" (gram.y:6234). Raw suppresses the
+// "syntax error at or near" wrapper so the bare message matches PG verbatim.
+// M0134-0002 C2 slice 12.
+func (p *parser) rejectDuplicateEnforced() error {
+	if p.isEnforcedAttr() {
+		return &SyntaxError{
+			Pos:     p.cur().Pos,
+			Message: "multiple ENFORCED/NOT ENFORCED clauses not allowed",
+			Raw:     true,
+		}
+	}
+	return nil
+}
+
 // parseFKConstraintAttrs consumes the `[NOT] DEFERRABLE [INITIALLY DEFERRED |
 // INITIALLY IMMEDIATE]`, `NOT VALID`, and `[NOT] ENFORCED` trailer that can
 // follow a FOREIGN KEY constraint's REFERENCES/ON DELETE/ON UPDATE clauses, in
@@ -2824,15 +2857,24 @@ func (p *parser) parseConstraintDeferrable(deferrable, initiallyDeferred *bool) 
 // FOREIGN KEY so all three stay in lockstep — NOT VALID/NOT ENFORCED
 // previously only round-tripped through the ALTER TABLE form (DU-002 slice
 // 431); this extends the same trailer to CREATE TABLE-time FK constraints
-// (DU-002 slice 432).
-func (p *parser) parseFKConstraintAttrs() (deferrable, initiallyDeferred, notValid, notEnforced bool) {
+// (DU-002 slice 432). A second [NOT] ENFORCED is rejected like the CHECK
+// forms (saw_enforced in transformConstraintAttrs) rather than silently
+// overwriting the flag. M0134-0002 C2 slice 12.
+func (p *parser) parseFKConstraintAttrs() (deferrable, initiallyDeferred, notValid, notEnforced bool, err error) {
+	sawEnforced := false
 	for {
+		// Check for a duplicate before the consume so the caret lands on the
+		// 2nd attribute's first token (its location in transformConstraintAttrs).
+		if sawEnforced && p.isEnforcedAttr() {
+			return deferrable, initiallyDeferred, notValid, notEnforced, p.rejectDuplicateEnforced()
+		}
 		if p.acceptKeyword(KwNot) {
 			if p.acceptIdentKeyword("valid") {
 				notValid = true
 				continue
 			}
 			if p.acceptIdentKeyword("enforced") {
+				sawEnforced = true
 				notEnforced = true
 				continue
 			}
@@ -2859,6 +2901,7 @@ func (p *parser) parseFKConstraintAttrs() (deferrable, initiallyDeferred, notVal
 			continue
 		}
 		if p.acceptIdentKeyword("enforced") { // bare ENFORCED — already the default
+			sawEnforced = true
 			continue
 		}
 		break
@@ -3754,6 +3797,11 @@ func (p *parser) parseTableConstraintElement(stmt *CreateTableStmt) (bool, error
 		} else {
 			_ = p.acceptIdentKeyword("enforced")
 		}
+		// A second [NOT] ENFORCED is a PG error (transformConstraintAttrs,
+		// parse_utilcmd.c:3999-4027). M0134-0002 C2 slice 12.
+		if err := p.rejectDuplicateEnforced(); err != nil {
+			return false, err
+		}
 		// Accept optional NO INHERIT, recording it per-check so the suffix
 		// round-trips through the dump. DU-002 slice 128.
 		noInherit := false
@@ -3761,6 +3809,15 @@ func (p *parser) parseTableConstraintElement(stmt *CreateTableStmt) (bool, error
 			_ = p.acceptIdentKeyword("inherit")
 			stmt.TableHasNoInheritCheck = true
 			noInherit = true
+		}
+		// Accept optional NOT VALID trailer, consumed-and-dropped. PG
+		// auto-validates NOT VALID at CREATE TABLE — transformCheckConstraints
+		// (parse_utilcmd.c:2946) overrides it (skip_validation=true,
+		// initially_valid=is_enforced) and heap.c:2584-2587 writes convalidated
+		// from initially_valid, so a fresh table's constraint is created
+		// validated (no convalidated='f' recorded here). M0134-0002 C2 slice 10.
+		if p.acceptKeyword(KwNot) {
+			_ = p.acceptIdentKeyword("valid")
 		}
 		stmt.TableCheckNoInherit = append(stmt.TableCheckNoInherit, noInherit)
 		stmt.TableCheckNotEnforced = append(stmt.TableCheckNotEnforced, notEnforced)
@@ -3917,12 +3974,23 @@ func (p *parser) parseTableConstraintElement(stmt *CreateTableStmt) (bool, error
 			} else {
 				_ = p.acceptIdentKeyword("enforced")
 			}
+			// A second [NOT] ENFORCED is a PG error (transformConstraintAttrs,
+			// parse_utilcmd.c:3999-4027). M0134-0002 C2 slice 12.
+			if err := p.rejectDuplicateEnforced(); err != nil {
+				return false, err
+			}
 			// Accept optional NO INHERIT (CONSTRAINT name CHECK NO INHERIT).
 			noInherit := false
 			if p.acceptIdentKeyword("no") {
 				_ = p.acceptIdentKeyword("inherit")
 				stmt.TableHasNoInheritCheck = true
 				noInherit = true
+			}
+			// Accept optional NOT VALID trailer, consumed-and-dropped (same
+			// reason as the anonymous arm: PG auto-validates at CREATE TABLE,
+			// parse_utilcmd.c:2946 + heap.c:2584-2587). M0134-0002 C2 slice 10.
+			if p.acceptKeyword(KwNot) {
+				_ = p.acceptIdentKeyword("valid")
 			}
 			// Keep TableCheckNoInherit/TableCheckNotEnforced parallel to
 			// TableChecks: only the anonymous branch appended an expr.
@@ -4282,6 +4350,28 @@ func (p *parser) parseColumnConstraintList(col *ColumnDef) error {
 		case p.acceptIdentKeyword("compression"):
 			method, _ := p.parseIdent() // consume method name (pglz, lz4, default, etc.)
 			col.Compression = normalizeCompressionMethod(method.Value)
+		// STORAGE mode — column-level storage strategy, PG gram.y column_storage
+		// (gram.y:3888-3896): `col type STORAGE {PLAIN|EXTERNAL|EXTENDED|MAIN}`.
+		// `storage` and the four mode names lex as TokenIdent (unreserved words).
+		// goopg does not actually TOAST, but records the mode so the synthesized
+		// pg_attribute row reports attstorage and pg_dump re-emits a SET STORAGE
+		// clause when it differs from the type default; the executor enforces
+		// GetAttributeStorage's datatype-vs-mode rule (tablecmds.c:22082-22112)
+		// when the CREATE TABLE runs. Mirrors the COMPRESSION arm's structure.
+		// M0134-0002 C2 slice 9.
+		case p.acceptIdentKeyword("storage"):
+			switch {
+			case p.acceptIdentKeyword("plain"):
+				col.Storage = "plain"
+			case p.acceptIdentKeyword("external"):
+				col.Storage = "external"
+			case p.acceptIdentKeyword("extended"):
+				col.Storage = "extended"
+			case p.acceptIdentKeyword("main"):
+				col.Storage = "main"
+			default:
+				return p.errAtCur("expected plain, external, extended, or main after STORAGE")
+			}
 		// OPTIONS ( name 'value', … ) — per-column FOREIGN TABLE options
 		// (`c1 int OPTIONS (column_name 'col1')`). Captured onto
 		// catalog.Column.FDWOptions so pg_attribute.attfdwoptions round-trips
@@ -4459,7 +4549,11 @@ func (p *parser) parseColumnConstraintList(col *ColumnDef) error {
 			// NOT VALID, and [NOT] ENFORCED, in any order (PG18 for the latter
 			// two). DU-002 slice 432 — extends slice 431's ALTER TABLE-only fix
 			// to the inline column REFERENCES form.
-			col.FKDeferrable, col.FKInitiallyDeferred, col.FKNotValid, col.FKNotEnforced = p.parseFKConstraintAttrs()
+			var fkErr error
+			col.FKDeferrable, col.FKInitiallyDeferred, col.FKNotValid, col.FKNotEnforced, fkErr = p.parseFKConstraintAttrs()
+			if fkErr != nil {
+				return fkErr
+			}
 		// UNIQUE constraint on column
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
 			p.advance()
@@ -4497,6 +4591,12 @@ func (p *parser) parseColumnConstraintList(col *ColumnDef) error {
 			} else {
 				_ = p.acceptIdentKeyword("enforced")
 			}
+			// A second [NOT] ENFORCED is a PG error (transformConstraintAttrs,
+			// parse_utilcmd.c:3999-4027), not an unconsumed trailing token.
+			// M0134-0002 C2 slice 12.
+			if err := p.rejectDuplicateEnforced(); err != nil {
+				return err
+			}
 			// Accept optional NO INHERIT — PG18 column-level CHECK NO INHERIT.
 			if p.acceptIdentKeyword("no") {
 				_ = p.acceptIdentKeyword("inherit")
@@ -4514,12 +4614,21 @@ func (p *parser) parseColumnConstraintList(col *ColumnDef) error {
 					return err
 				}
 				col.CheckExpr = expr
+				// Named inline column CHECK — carry the explicit constraint name so
+				// it round-trips instead of being overwritten by the auto-name
+				// (<table>_<col>_check). M0134-0002 slice S02.
+				col.CheckConstraintName = identText(cnameTok)
 				if p.acceptKeyword(KwNot) {
 					if p.acceptIdentKeyword("enforced") {
 						col.CheckNotEnforced = true
 					}
 				} else {
 					_ = p.acceptIdentKeyword("enforced")
+				}
+				// A second [NOT] ENFORCED is a PG error (transformConstraintAttrs,
+				// parse_utilcmd.c:3999-4027). M0134-0002 C2 slice 12.
+				if err := p.rejectDuplicateEnforced(); err != nil {
+					return err
 				}
 				// Accept optional NO INHERIT (CONSTRAINT name CHECK NO INHERIT).
 				if p.acceptIdentKeyword("no") {
@@ -5918,7 +6027,11 @@ func (p *parser) parseTableForeignKey(name string) (TableForeignKeyDef, error) {
 	// and [NOT] ENFORCED, in any order (PG18 for the latter two). DU-002 slice
 	// 432 — extends slice 431's ALTER TABLE-only fix to the table-level
 	// FOREIGN KEY form.
-	fk.Deferrable, fk.InitiallyDeferred, fk.NotValid, fk.NotEnforced = p.parseFKConstraintAttrs()
+	var fkErr error
+	fk.Deferrable, fk.InitiallyDeferred, fk.NotValid, fk.NotEnforced, fkErr = p.parseFKConstraintAttrs()
+	if fkErr != nil {
+		return TableForeignKeyDef{}, fkErr
+	}
 	return fk, nil
 }
 
@@ -8488,8 +8601,10 @@ func (p *parser) parseAlter() (Stmt, error) {
 		}
 		stmt.IfExists = true
 	}
-	// Optional ONLY modifier (inheritance exclusion) — accept and discard.
-	_ = p.acceptIdentKeyword("only")
+	// Optional ONLY modifier (inheritance exclusion) — recorded on the stmt so
+	// the executor can refuse ONLY on a parent that has children (M0134-0002
+	// C9). Previously accepted and discarded.
+	stmt.Only = p.acceptIdentKeyword("only")
 	name, err := p.parseObjectName()
 	if err != nil {
 		return nil, err
@@ -8525,10 +8640,18 @@ func (p *parser) parseAlter() (Stmt, error) {
 		}
 		return stmt, nil
 	}
-	// RENAME COLUMN old TO new  |  RENAME TO new_name  |  RENAME VALUE 'old' TO 'new'.
+	// RENAME CONSTRAINT old TO new | RENAME VALUE 'old' TO 'new' | RENAME TO
+	// new_name | RENAME [COLUMN] old_name TO new_name. M0134-0002 C2 slice 8:
+	// COLUMN is optional in PG's grammar (opt_column: COLUMN | /*EMPTY*/,
+	// gram.y:9974; the RENAME opt_column name TO name production at gram.y:9720),
+	// so the bare form `RENAME a TO b` must reach the column path via the
+	// fallthrough below. RENAME TO is checked before that fallthrough because TO
+	// is a RESERVED keyword that parseIdent cannot consume.
 	if p.acceptIdentKeyword("rename") {
-		// RENAME COLUMN old_name TO new_name
-		if p.acceptKeyword(KwColumn) {
+		// RENAME CONSTRAINT old TO new — mirrors the ALTER DOMAIN RENAME
+		// CONSTRAINT arm (ddl.go:8215-8228). Renames an existing table
+		// constraint (CHECK/FK/UNIQUE/PK/EXCLUDE) in place. M0134-0002 C2.
+		if p.acceptKeyword(KwConstraint) {
 			oldNameTok, err := p.parseIdent()
 			if err != nil {
 				return nil, err
@@ -8541,10 +8664,10 @@ func (p *parser) parseAlter() (Stmt, error) {
 				return nil, err
 			}
 			stmt.Actions = append(stmt.Actions, AlterTableAction{
-				pos:           oldNameTok.Pos,
-				Kind:          AlterTableRenameColumn,
-				OldColumnName: identText(oldNameTok),
-				NewName:       identText(newNameTok),
+				pos:               oldNameTok.Pos,
+				Kind:              AlterTableRenameConstraint,
+				OldConstraintName: identText(oldNameTok),
+				NewName:           identText(newNameTok),
 			})
 			return stmt, nil
 		}
@@ -8558,7 +8681,29 @@ func (p *parser) parseAlter() (Stmt, error) {
 			}
 			return stmt, nil
 		}
-		// RENAME TO new_name
+		// RENAME TO new_name — must precede the bare-column fallthrough below:
+		// TO is a RESERVED keyword that parseIdent cannot consume, so a table
+		// rename would otherwise misparse as a column rename.
+		if p.acceptKeyword(KwTo) {
+			newNameTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Actions = append(stmt.Actions, AlterTableAction{
+				pos:     newNameTok.Pos,
+				Kind:    AlterTableRenameTable,
+				NewName: identText(newNameTok),
+			})
+			return stmt, nil
+		}
+		// RENAME [COLUMN] old_name TO new_name — COLUMN is optional in PG's
+		// grammar, so the bare form `RENAME a TO b` flows into the existing
+		// AlterTableRenameColumn executor path. M0134-0002 C2 slice 8.
+		_ = p.acceptKeyword(KwColumn)
+		oldNameTok, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
 		if _, err := p.expectKeyword(KwTo); err != nil {
 			return nil, err
 		}
@@ -8567,9 +8712,10 @@ func (p *parser) parseAlter() (Stmt, error) {
 			return nil, err
 		}
 		stmt.Actions = append(stmt.Actions, AlterTableAction{
-			pos:     newNameTok.Pos,
-			Kind:    AlterTableRenameTable,
-			NewName: identText(newNameTok),
+			pos:           oldNameTok.Pos,
+			Kind:          AlterTableRenameColumn,
+			OldColumnName: identText(oldNameTok),
+			NewName:       identText(newNameTok),
 		})
 		return stmt, nil
 	}
@@ -8751,198 +8897,11 @@ func (p *parser) parseAlter() (Stmt, error) {
 		})
 		return stmt, nil
 	}
-	// ALTER COLUMN — handle SET (options) and TYPE specially; consume other forms as no-op.
-	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAlter {
-		p.advance() // consume ALTER
-		// Skip COLUMN keyword if present.
-		_ = p.acceptKeyword(KwColumn)
-		// Read the column name.
-		colName := ""
-		if p.cur().Kind == TokenIdent || p.cur().Kind == TokenQuotedIdent {
-			colName = p.cur().Value
-			p.advance()
-		}
-		// OPTIONS ( [ADD|SET|DROP] name ['value'], … ) — ALTER FOREIGN TABLE's
-		// per-column generic option list (AT_AlterColumnGenericOptions in real
-		// PG). The executor rejects this on a non-foreign table. DU-002 slice
-		// 419, closes the loop #55 deferral-ledger resume point.
-		if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "options") {
-			changes := p.scanAlterFDWOptionsList()
-			stmt.Actions = append(stmt.Actions, AlterTableAction{
-				Kind:             AlterTableAlterColumnOptions,
-				ColumnName:       colName,
-				FDWOptionChanges: changes,
-			})
-			return stmt, nil
-		}
-		// Check for SET (options) or SET STORAGE pattern.
-		if p.acceptIdentKeyword("set") || p.acceptKeyword(KwSet) {
-			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
-				// SET (opt=value, …) — per-column attribute options (e.g.
-				// n_distinct). Capture each pair, normalized to PG's stored
-				// `name=value` form, so pg_dump re-emits the clause via
-				// pg_attribute.attoptions. DU-002 slice 185.
-				opts := p.parseColumnSetOptions()
-				stmt.Actions = append(stmt.Actions, AlterTableAction{
-					Kind:       AlterTableAlterColumnSet,
-					ColumnName: colName,
-					SetOptions: opts,
-				})
-				return stmt, nil
-			}
-			// SET STORAGE type — record storage strategy on the catalog column.
-			if p.acceptIdentKeyword("storage") {
-				storageType := ""
-				if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
-					storageType = strings.ToLower(p.cur().Value)
-					p.advance()
-				}
-				stmt.Actions = append(stmt.Actions, AlterTableAction{
-					Kind:        AlterTableSetStorage,
-					ColumnName:  colName,
-					StorageType: storageType,
-				})
-				return stmt, nil
-			}
-			// SET COMPRESSION method — record TOAST compression on the catalog
-			// column for pg_dump round-trip fidelity (goopg does not TOAST).
-			// DU-002 slice 183.
-			if p.acceptIdentKeyword("compression") {
-				method := ""
-				if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
-					method = p.cur().Value
-					p.advance()
-				}
-				stmt.Actions = append(stmt.Actions, AlterTableAction{
-					Kind:            AlterTableSetCompression,
-					ColumnName:      colName,
-					CompressionType: normalizeCompressionMethod(method),
-				})
-				return stmt, nil
-			}
-			// SET STATISTICS value — record the per-column statistics target on the
-			// catalog column for pg_dump round-trip fidelity. pg_dump emits an
-			// `ALTER TABLE ONLY ... ALTER COLUMN ... SET STATISTICS <n>` whenever
-			// attstattarget >= 0 (pg_dump.c dumpTableSchema); the default (-1) emits
-			// nothing. goopg does not sample statistics targets at this granularity;
-			// the value is recorded purely so the column round-trips. DU-002 slice 184.
-			if p.acceptIdentKeyword("statistics") {
-				statsVal := ""
-				if (p.cur().Kind == TokenOperator || p.cur().Kind == TokenSymbol) && p.cur().Value == "-" {
-					// SET STATISTICS -1 resets to the default.
-					statsVal = "-"
-					p.advance()
-				}
-				if p.cur().Kind == TokenIntLit {
-					statsVal += p.cur().Value
-					p.advance()
-				}
-				stmt.Actions = append(stmt.Actions, AlterTableAction{
-					Kind:       AlterTableSetStatistics,
-					ColumnName: colName,
-					CheckExpr:  statsVal,
-				})
-				return stmt, nil
-			}
-			// SET DEFAULT expr — record the parsed DEFAULT expression on the
-			// catalog column. pg_dump re-emits it inline on a printed local
-			// column, or as a separate `ALTER TABLE ONLY ... ALTER COLUMN ...
-			// SET DEFAULT` when the column is a suppressed inherited column.
-			// DU-002 slice 269.
-			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwDefault {
-				p.advance() // consume DEFAULT
-				expr, err := p.parseExpr()
-				if err != nil {
-					return nil, err
-				}
-				stmt.Actions = append(stmt.Actions, AlterTableAction{
-					Kind:        AlterTableSetDefault,
-					ColumnName:  colName,
-					DefaultExpr: expr,
-				})
-				return stmt, nil
-			}
-			// SET NOT NULL — mark the column NOT NULL. The executor records a
-			// contype='n' constraint so pg_dump re-emits the NOT NULL: inline on
-			// a printed local column, or as a standalone `NOT NULL <col>` item in
-			// the child CREATE TABLE body when the column is a suppressed
-			// inherited column. DU-002 slice 270.
-			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot {
-				p.advance() // consume NOT
-				if _, err := p.expectKeyword(KwNull); err != nil {
-					return nil, err
-				}
-				stmt.Actions = append(stmt.Actions, AlterTableAction{
-					Kind:       AlterTableSetNotNull,
-					ColumnName: colName,
-				})
-				return stmt, nil
-			}
-		}
-		// RESET (opt, …) — clear the named per-column attribute options set by
-		// the SET (...) form above. Unlike SET, RESET has no STORAGE/COMPRESSION/
-		// STATISTICS/DEFAULT/NOT NULL counterparts in upstream grammar — only the
-		// parenthesized attribute-option list is valid here.
-		if p.acceptIdentKeyword("reset") || p.acceptKeyword(KwReset) {
-			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
-				opts := p.parseColumnSetOptions()
-				stmt.Actions = append(stmt.Actions, AlterTableAction{
-					Kind:       AlterTableAlterColumnReset,
-					ColumnName: colName,
-					SetOptions: opts,
-				})
-				return stmt, nil
-			}
-		}
-		// DROP DEFAULT / DROP NOT NULL — clear the column's DEFAULT expression or
-		// NOT NULL flag. Other DROP forms (DROP IDENTITY, …) fall through to the
-		// no-op consume below for now. DU-002 slices 269, 270.
-		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwDrop {
-			p.advance() // consume DROP
-			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwDefault {
-				p.advance() // consume DEFAULT
-				stmt.Actions = append(stmt.Actions, AlterTableAction{
-					Kind:       AlterTableDropDefault,
-					ColumnName: colName,
-				})
-				return stmt, nil
-			}
-			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot {
-				p.advance() // consume NOT
-				if _, err := p.expectKeyword(KwNull); err != nil {
-					return nil, err
-				}
-				stmt.Actions = append(stmt.Actions, AlterTableAction{
-					Kind:       AlterTableDropNotNull,
-					ColumnName: colName,
-				})
-				return stmt, nil
-			}
-		}
-		// Check for TYPE newtype pattern.
-		// "type" is not in goopg's keyword map — arrives as TokenIdent.
-		if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "type") {
-			p.advance() // consume TYPE
-			newType, err := p.parseColumnType()
-			if err != nil {
-				return nil, err
-			}
-			stmt.Actions = append(stmt.Actions, AlterTableAction{
-				Kind:       AlterTableAlterColumnType,
-				ColumnName: colName,
-				NewType:    newType,
-			})
-			return stmt, nil
-		}
-		// Other ALTER COLUMN forms: consume rest as no-op.
-		for p.cur().Kind != TokenEOF {
-			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
-				break
-			}
-			p.advance()
-		}
-		return stmt, nil
-	}
+	// ALTER COLUMN sub-commands (SET/DROP/TYPE/OPTIONS/STORAGE/COMPRESSION/
+	// STATISTICS/DEFAULT/NOT NULL) are handled by parseAlterTableAction() to
+	// support comma-separated multi-action ALTER TABLE statements (e.g. "ALTER
+	// TABLE t ALTER COLUMN a SET NOT NULL, ALTER COLUMN b DROP NOT NULL"). Fall
+	// through to the multi-action loop below.
 	first, err := p.parseAlterTableAction()
 	if err != nil {
 		return nil, err
@@ -9027,7 +8986,227 @@ func isAlterReloptVerb(tok Token) bool {
 	return false
 }
 
+// parseAlterColumnAction parses a single `ALTER [COLUMN] name …` sub-command of
+// an ALTER TABLE statement — the AT_AlterColumn* family in upstream grammar
+// (postgres/src/backend/parser/gram.y alter_table_cmd). It returns the one
+// action rather than appending to the statement, so the caller's comma loop can
+// build a multi-action ALTER TABLE list (e.g. "ALTER TABLE t ALTER COLUMN a SET
+// NOT NULL, ALTER COLUMN b DROP NOT NULL"). Previously this block lived inline
+// in parseAlter and early-returned, so a comma was never consumed and bubbled to
+// the statement loop as `syntax error ... (got ,)`. M0134-0002 C2 slice 6.
+func (p *parser) parseAlterColumnAction() (AlterTableAction, error) {
+	p.advance() // consume ALTER
+	// Skip COLUMN keyword if present.
+	_ = p.acceptKeyword(KwColumn)
+	// Read the column name. colPos records the column-name token's location so
+	// ALTER COLUMN TYPE refusals can report PG's errposition pointing at the
+	// column (parser_errposition(pstate, def->location) at
+	// postgres/src/backend/commands/tablecmds.c:14409,14450).
+	colName := ""
+	colPos := 0
+	if p.cur().Kind == TokenIdent || p.cur().Kind == TokenQuotedIdent {
+		colName = p.cur().Value
+		colPos = p.cur().Pos
+		p.advance()
+	}
+	// OPTIONS ( [ADD|SET|DROP] name ['value'], … ) — ALTER FOREIGN TABLE's
+	// per-column generic option list (AT_AlterColumnGenericOptions in real
+	// PG). The executor rejects this on a non-foreign table. DU-002 slice
+	// 419, closes the loop #55 deferral-ledger resume point.
+	if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "options") {
+		changes := p.scanAlterFDWOptionsList()
+		return AlterTableAction{
+			Kind:             AlterTableAlterColumnOptions,
+			ColumnName:       colName,
+			FDWOptionChanges: changes,
+		}, nil
+	}
+	// Check for SET (options) or SET STORAGE pattern.
+	if p.acceptIdentKeyword("set") || p.acceptKeyword(KwSet) {
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+			// SET (opt=value, …) — per-column attribute options (e.g.
+			// n_distinct). Capture each pair, normalized to PG's stored
+			// `name=value` form, so pg_dump re-emits the clause via
+			// pg_attribute.attoptions. DU-002 slice 185.
+			opts := p.parseColumnSetOptions()
+			return AlterTableAction{
+				Kind:       AlterTableAlterColumnSet,
+				ColumnName: colName,
+				SetOptions: opts,
+			}, nil
+		}
+		// SET STORAGE type — record storage strategy on the catalog column.
+		if p.acceptIdentKeyword("storage") {
+			storageType := ""
+			if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+				storageType = strings.ToLower(p.cur().Value)
+				p.advance()
+			}
+			return AlterTableAction{
+				Kind:        AlterTableSetStorage,
+				ColumnName:  colName,
+				StorageType: storageType,
+			}, nil
+		}
+		// SET COMPRESSION method — record TOAST compression on the catalog
+		// column for pg_dump round-trip fidelity (goopg does not TOAST).
+		// DU-002 slice 183.
+		if p.acceptIdentKeyword("compression") {
+			method := ""
+			if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+				method = p.cur().Value
+				p.advance()
+			}
+			return AlterTableAction{
+				Kind:            AlterTableSetCompression,
+				ColumnName:      colName,
+				CompressionType: normalizeCompressionMethod(method),
+			}, nil
+		}
+		// SET STATISTICS value — record the per-column statistics target on the
+		// catalog column for pg_dump round-trip fidelity. pg_dump emits an
+		// `ALTER TABLE ONLY ... ALTER COLUMN ... SET STATISTICS <n>` whenever
+		// attstattarget >= 0 (pg_dump.c dumpTableSchema); the default (-1) emits
+		// nothing. goopg does not sample statistics targets at this granularity;
+		// the value is recorded purely so the column round-trips. DU-002 slice 184.
+		if p.acceptIdentKeyword("statistics") {
+			statsVal := ""
+			if (p.cur().Kind == TokenOperator || p.cur().Kind == TokenSymbol) && p.cur().Value == "-" {
+				// SET STATISTICS -1 resets to the default.
+				statsVal = "-"
+				p.advance()
+			}
+			if p.cur().Kind == TokenIntLit {
+				statsVal += p.cur().Value
+				p.advance()
+			}
+			return AlterTableAction{
+				Kind:       AlterTableSetStatistics,
+				ColumnName: colName,
+				CheckExpr:  statsVal,
+			}, nil
+		}
+		// SET DEFAULT expr — record the parsed DEFAULT expression on the
+		// catalog column. pg_dump re-emits it inline on a printed local
+		// column, or as a separate `ALTER TABLE ONLY ... ALTER COLUMN ...
+		// SET DEFAULT` when the column is a suppressed inherited column.
+		// DU-002 slice 269.
+		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwDefault {
+			p.advance() // consume DEFAULT
+			expr, err := p.parseExpr()
+			if err != nil {
+				return AlterTableAction{}, err
+			}
+			return AlterTableAction{
+				Kind:        AlterTableSetDefault,
+				ColumnName:  colName,
+				DefaultExpr: expr,
+			}, nil
+		}
+		// SET NOT NULL — mark the column NOT NULL. The executor records a
+		// contype='n' constraint so pg_dump re-emits the NOT NULL: inline on
+		// a printed local column, or as a standalone `NOT NULL <col>` item in
+		// the child CREATE TABLE body when the column is a suppressed
+		// inherited column. DU-002 slice 270.
+		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot {
+			p.advance() // consume NOT
+			if _, err := p.expectKeyword(KwNull); err != nil {
+				return AlterTableAction{}, err
+			}
+			return AlterTableAction{
+				Kind:       AlterTableSetNotNull,
+				ColumnName: colName,
+			}, nil
+		}
+	}
+	// RESET (opt, …) — clear the named per-column attribute options set by
+	// the SET (...) form above. Unlike SET, RESET has no STORAGE/COMPRESSION/
+	// STATISTICS/DEFAULT/NOT NULL counterparts in upstream grammar — only the
+	// parenthesized attribute-option list is valid here.
+	if p.acceptIdentKeyword("reset") || p.acceptKeyword(KwReset) {
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+			opts := p.parseColumnSetOptions()
+			return AlterTableAction{
+				Kind:       AlterTableAlterColumnReset,
+				ColumnName: colName,
+				SetOptions: opts,
+			}, nil
+		}
+	}
+	// DROP DEFAULT / DROP NOT NULL — clear the column's DEFAULT expression or
+	// NOT NULL flag. Other DROP forms (DROP IDENTITY, …) fall through to the
+	// no-op consume below for now. DU-002 slices 269, 270.
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwDrop {
+		p.advance() // consume DROP
+		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwDefault {
+			p.advance() // consume DEFAULT
+			return AlterTableAction{
+				Kind:       AlterTableDropDefault,
+				ColumnName: colName,
+			}, nil
+		}
+		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot {
+			p.advance() // consume NOT
+			if _, err := p.expectKeyword(KwNull); err != nil {
+				return AlterTableAction{}, err
+			}
+			return AlterTableAction{
+				Kind:       AlterTableDropNotNull,
+				ColumnName: colName,
+			}, nil
+		}
+	}
+	// Check for TYPE newtype pattern.
+	// "type" is not in goopg's keyword map — arrives as TokenIdent.
+	if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "type") {
+		p.advance() // consume TYPE
+		newType, err := p.parseColumnType()
+		if err != nil {
+			return AlterTableAction{}, err
+		}
+		// TYPE newtype [USING expr] — consume an optional USING
+		// expression (gram.y alter_using). Before this slice the
+		// trailer was left unconsumed and bubbled to the statement
+		// loop as `syntax error at or near ... (got using)`; PG
+		// carries it in AlterTableCmd->def->raw_default
+		// (postgres/src/backend/parser/gram.y:3028) and evaluates it
+		// per-row against the original row type. Mirrors the SET
+		// DEFAULT arm above (which stores its parsed expr on
+		// DefaultExpr). M0134-0002 C2 slice 5.
+		var usingExpr Expr
+		if p.acceptKeyword(KwUsing) {
+			usingExpr, err = p.parseExpr()
+			if err != nil {
+				return AlterTableAction{}, err
+			}
+		}
+		return AlterTableAction{
+			pos:        colPos,
+			Kind:       AlterTableAlterColumnType,
+			ColumnName: colName,
+			NewType:    newType,
+			UsingExpr:  usingExpr,
+		}, nil
+	}
+	// Other ALTER COLUMN forms: consume rest as no-op. Break on both ',' (so the
+	// caller's comma loop can pick up the next action) and ';' (statement end);
+	// the executor ignores AlterTableNoOp actions.
+	for p.cur().Kind != TokenEOF {
+		if p.cur().Kind == TokenSymbol && (p.cur().Value == ";" || p.cur().Value == ",") {
+			break
+		}
+		p.advance()
+	}
+	return AlterTableAction{Kind: AlterTableNoOp}, nil
+}
+
 func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
+	// ALTER COLUMN sub-command — comma-combinable with the other alter_table_cmds.
+	// The bare ALTER token cannot collide with ATTACH/DETACH/DROP/SET/RESET/etc.
+	// (distinct tokens); ALTER CONSTRAINT is intercepted in parseAlter.
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAlter {
+		return p.parseAlterColumnAction()
+	}
 	// ATTACH PARTITION child FOR VALUES … (M0096-0007)
 	if p.acceptIdentKeyword("attach") {
 		if !p.acceptKeyword(KwPartition) {
@@ -9234,11 +9413,20 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 	// SET WITHOUT CLUSTER — clear the table's clustering selection (every index's
 	// pg_index.indisclustered → false). Distinct from `SET (reloptions)` below,
 	// which is the parenthesized form. DU-002 slice 321.
+	// SET WITHOUT OIDS — same arm: PG gram.y:2731-2738 maps `SET WITHOUT OIDS` to
+	// AT_DropOids, whose ATExecCmd is a silent no-op ("nothing to do here, oid
+	// columns don't exist anymore", tablecmds.c:5528-5530; alter_table.out:1503
+	// is empty). goopg returns the existing AlterTableNoOp (a silent no-op in
+	// execAlterTable) for the same result. M0134-0002 C2 slice 12.
 	if cur := p.cur(); (cur.Kind == TokenKeyword && cur.Keyword == KwSet) &&
 		p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "without") {
 		pos := cur.Pos
 		p.advance() // SET
 		p.advance() // WITHOUT
+		if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "oids") {
+			p.advance() // OIDS
+			return AlterTableAction{pos: pos, Kind: AlterTableNoOp}, nil
+		}
 		if !p.acceptKeyword(KwCluster) {
 			return AlterTableAction{}, p.errAtCur("expected CLUSTER after SET WITHOUT")
 		}
@@ -9249,6 +9437,17 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 	// work correctly. M0097-0028.
 	if p.acceptKeyword(KwDrop) {
 		if p.acceptKeyword(KwConstraint) {
+			// DROP CONSTRAINT [IF EXISTS] name (gram.y opt_if_exists:
+			// IF_P EXISTS). Match with acceptKeyword — NOT acceptIdentKeyword,
+			// which only matches TokenIdent and would silently drop the
+			// KwIf/KwExists keyword tokens. M0134-0002 C2.
+			ifExists := false
+			if p.acceptKeyword(KwIf) {
+				if !p.acceptKeyword(KwExists) {
+					return AlterTableAction{}, p.errAtCur("expected EXISTS after IF")
+				}
+				ifExists = true
+			}
 			nameTok, err := p.parseIdent()
 			if err != nil {
 				return AlterTableAction{}, err
@@ -9264,11 +9463,22 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 				Kind:           AlterTableDropConstraint,
 				ConstraintName: identText(nameTok),
 				Restrict:       restrict,
+				IfExists:       ifExists,
 			}, nil
 		}
 		// DROP COLUMN [IF EXISTS] col_name [RESTRICT|CASCADE]
 		_ = p.acceptKeyword(KwColumn)
-		_ = p.acceptIdentKeyword("if") && p.acceptIdentKeyword("exists")
+		// Optional `IF EXISTS` (gram.y opt_if_exists: IF_P EXISTS). Match it
+		// with acceptKeyword — NOT acceptIdentKeyword, which only matches
+		// TokenIdent and would silently drop the KwIf/KwExists keyword tokens
+		// (same trap the ADD COLUMN arm documents at ddl.go:9701). M0134-0002 C2.
+		ifExists := false
+		if p.acceptKeyword(KwIf) {
+			if !p.acceptKeyword(KwExists) {
+				return AlterTableAction{}, p.errAtCur("expected EXISTS after IF")
+			}
+			ifExists = true
+		}
 		colTok := p.cur()
 		if colTok.Kind == TokenIdent || colTok.Kind == TokenQuotedIdent {
 			p.advance()
@@ -9277,6 +9487,7 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 				pos:        colTok.Pos,
 				Kind:       AlterTableDropColumn,
 				ColumnName: identText(colTok),
+				IfExists:   ifExists,
 			}, nil
 		}
 		return AlterTableAction{}, p.errAtCur("expected column or constraint name after DROP")
@@ -9335,6 +9546,39 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 			kind = AlterTableResetReloptions
 		}
 		return AlterTableAction{pos: pos, Kind: kind, With: opts}, nil
+	}
+	// OF type_name — make the table a typed table of the composite type
+	// (PG gram.y `OF any_name` → AT_AddOf). `OF` is a distinct keyword token
+	// (KwOf, token.go:169). All type resolution + column validation happens at
+	// EXECUTE time (ATExecAddOf, tablecmds.c:18216); here we only capture the
+	// name, mirroring the INHERIT arm above. M0134-0002 C2 slice 11.
+	if p.acceptKeyword(KwOf) {
+		tn, err := p.parseObjectName()
+		if err != nil {
+			return AlterTableAction{}, err
+		}
+		return AlterTableAction{pos: p.cur().Pos, Kind: AlterTableAddOf, OfType: tn}, nil
+	}
+	// NOT OF — detach a typed table from its originating type
+	// (PG gram.y `NOT OF` → AT_DropOf). `NOT` matches KwNot (token.go:81) — do
+	// NOT confuse with the acceptIdentKeyword("no") NO INHERIT path above.
+	// M0134-0002 C2 slice 11.
+	if p.acceptKeyword(KwNot) {
+		if !p.acceptKeyword(KwOf) {
+			return AlterTableAction{}, p.errAtCur("expected OF after NOT")
+		}
+		return AlterTableAction{pos: p.cur().Pos, Kind: AlterTableDropOf}, nil
+	}
+	// SET WITH … — no production in PG's gram.y alter_table_cmd (no SET WITH
+	// arm), so the generic bison error points at the WITH keyword. PG's
+	// scanner_yyerror echoes the raw source token (scan.l:1234-1241), which for
+	// the regress input `SET WITH OIDS` (alter_table.sql:1044) is uppercase;
+	// goopg's lexer lowercases keyword Values, so re-uppercase it. M0134-0002
+	// C2 slice 12.
+	if cur := p.cur(); cur.Kind == TokenKeyword && cur.Keyword == KwSet &&
+		p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwWith {
+		withTok := p.peek(1)
+		return AlterTableAction{}, &SyntaxError{Pos: withTok.Pos, Message: strings.ToUpper(withTok.Value)}
 	}
 	if !p.acceptKeyword(KwAdd) {
 		return AlterTableAction{}, p.errAtCur("expected ADD or DROP")
@@ -9472,7 +9716,10 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		// parseFKConstraintAttrs so all three stay in lockstep (DU-002 slice
 		// 432); AlterTableAction has no InitiallyDeferred field to populate, so
 		// that return value is discarded here.
-		deferrable, _, notValid, notEnforced := p.parseFKConstraintAttrs()
+		deferrable, _, notValid, notEnforced, fkErr := p.parseFKConstraintAttrs()
+		if fkErr != nil {
+			return AlterTableAction{}, fkErr
+		}
 		act.Kind = AlterTableAddForeignKey
 		act.Columns = cols
 		act.RefTable = refTable
@@ -9502,6 +9749,16 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		// over NOT VALID in the rendered text). DU-002 slice 430.
 		notValid := false
 		notEnforced := false
+		noInherit := false
+		// Accept optional NO INHERIT trailer (connoinherit='t'). PG's
+		// ConstraintAttributeSpec (gram.y) is order-independent, so NO INHERIT
+		// may precede OR follow the NOT VALID/[NOT] ENFORCED block — consume at
+		// both points. alter_table.sql has `check (a = 2) no inherit not valid`
+		// (:420) and trailing ` NO INHERIT` (:309/663/670/1582). M0134-0002 C2.
+		if p.acceptIdentKeyword("no") {
+			_ = p.acceptIdentKeyword("inherit")
+			noInherit = true
+		}
 		if p.acceptKeyword(KwNot) {
 			if !p.acceptIdentKeyword("valid") {
 				if p.acceptIdentKeyword("enforced") { // NOT ENFORCED
@@ -9521,10 +9778,21 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		} else {
 			_ = p.acceptIdentKeyword("enforced") // bare ENFORCED
 		}
+		// A second [NOT] ENFORCED is a PG error (transformConstraintAttrs,
+		// parse_utilcmd.c:3999-4027). M0134-0002 C2 slice 12.
+		if err := p.rejectDuplicateEnforced(); err != nil {
+			return AlterTableAction{}, err
+		}
+		// NO INHERIT may also trail the NOT VALID/[NOT] ENFORCED block.
+		if p.acceptIdentKeyword("no") {
+			_ = p.acceptIdentKeyword("inherit")
+			noInherit = true
+		}
 		act.Kind = AlterTableAddCheck
 		act.CheckExpr = expr
 		act.NotValid = notValid
 		act.CheckNotEnforced = notEnforced
+		act.NoInherit = noInherit
 		return act, nil
 	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
 		// ADD [CONSTRAINT name] UNIQUE (cols) [INCLUDE (incl)] — create a unique index.
@@ -9607,6 +9875,19 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 			_ = p.acceptIdentKeyword("inherit")
 			act.NoInherit = true
 		}
+		// Optional `NOT VALID` trailer (convalidated='f'), accepted before OR
+		// after NO INHERIT — PG's ConstraintAttributeSpec is order-independent
+		// (gram.y:6213-6252). M0134-0002 C2 slice 10.
+		if p.acceptKeyword(KwNot) {
+			if !p.acceptIdentKeyword("valid") {
+				return AlterTableAction{}, p.errAtCur("expected VALID after NOT")
+			}
+			act.NotValid = true
+		}
+		if p.acceptIdentKeyword("no") {
+			_ = p.acceptIdentKeyword("inherit")
+			act.NoInherit = true
+		}
 		act.Kind = AlterTableAddNotNull
 		return act, nil
 	default:
@@ -9627,6 +9908,20 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 			return AlterTableAction{pos: pos, Kind: AlterTableNoOp}, nil
 		}
 		_ = p.acceptKeyword(KwColumn)
+		// Optional `IF NOT EXISTS` (gram.y opt_if_not_exists:
+		// IF_P NOT EXISTS). Match it with acceptKeyword — NOT acceptIdentKeyword,
+		// which only matches TokenIdent and would silently drop the KwIf keyword
+		// (same trap as the DROP COLUMN arm at ddl.go:9096). Mirrors the CREATE
+		// TABLE IF NOT EXISTS pattern in parseCreateTableTail. M0134-0002 C2.
+		if p.acceptKeyword(KwIf) {
+			if !p.acceptKeyword(KwNot) {
+				return AlterTableAction{}, p.errAtCur("expected NOT after IF")
+			}
+			if _, err := p.expectKeyword(KwExists); err != nil {
+				return AlterTableAction{}, err
+			}
+			act.IfExists = true
+		}
 		col, err := p.parseColumnDef()
 		if err != nil {
 			return AlterTableAction{}, err

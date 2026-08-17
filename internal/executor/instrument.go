@@ -9,8 +9,8 @@ package executor
 import (
 	"time"
 
-	"github.com/goopg/goopg/internal/mctx"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/utils/mmgr"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -97,10 +97,10 @@ type nodeStats struct {
 // surface actual-rows / loops / timing per Node.
 type instrumentedOp struct {
 	inner Operator
-	plan  planner.Node
+	plan  optimizer.Node
 	stats *nodeStats
 	pool  *storage.Pool  // captured from ctx.Pool in Open; nil-safe (BUFFERS off / no ctx.Pool)
-	sctx  *mctx.Context  // captured from ctx.Mctx in Open; nil-safe (MEMORY off / no ctx.Mctx)
+	sctx  *mmgr.Context  // captured from ctx.Mctx in Open; nil-safe (MEMORY off / no ctx.Mctx)
 }
 
 // underlying lets `setChildBorrow` (M0054-0005a-followup) reach
@@ -111,7 +111,7 @@ func (o *instrumentedOp) underlying() Operator { return o.inner }
 // Schema delegates to the wrapped operator. EXPLAIN ANALYZE never
 // changes the executed plan's output schema — the wrap is a pure
 // counter sidecar.
-func (o *instrumentedOp) Schema() planner.Schema { return o.inner.Schema() }
+func (o *instrumentedOp) Schema() optimizer.Schema { return o.inner.Schema() }
 
 // Open increments the loop counter, snapshots the start time
 // (when timing is enabled), and resets per-Open stats so a
@@ -273,7 +273,7 @@ type joinFilterRemoveCounter interface {
 // counters. The EXPLAIN ANALYZE renderer walks the plan tree the
 // same way the static path does and looks up stats in this map
 // for each visited node.
-type nodeStatsTable map[planner.Node]*nodeStats
+type nodeStatsTable map[optimizer.Node]*nodeStats
 
 // instrumentScope wires the package-local instrumentation state
 // the Build dispatch consults. When non-nil, every successful
@@ -312,7 +312,7 @@ func withInstrumentation(timing bool, fn func() (Operator, error)) (Operator, no
 // returns. When instrumentScope is non-nil it allocates a stats
 // record keyed on plan and wraps op; when nil it returns op
 // unchanged (keeping every existing path unchanged byte-for-byte).
-func maybeInstrument(plan planner.Node, op Operator) Operator {
+func maybeInstrument(plan optimizer.Node, op Operator) Operator {
 	if instrumentScope == nil || op == nil {
 		return op
 	}

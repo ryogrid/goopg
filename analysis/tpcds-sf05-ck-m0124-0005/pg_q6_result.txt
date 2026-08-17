@@ -1,0 +1,41 @@
+ state | cnt 
+-------+-----
+ UT    |  10
+ AK    |  12
+ FL    |  12
+ ND    |  13
+ NM    |  13
+ WA    |  13
+ OR    |  16
+ PA    |  16
+ MT    |  20
+ ID    |  21
+ LA    |  25
+ NY    |  25
+ WV    |  26
+ SD    |  27
+ MI    |  28
+ CO    |  29
+ MO    |  30
+ AL    |  31
+ MN    |  31
+ OH    |  31
+ WI    |  31
+ AR    |  33
+ CA    |  33
+ OK    |  33
+ NE    |  35
+ MS    |  36
+ IN    |  39
+ IA    |  40
+ IL    |  41
+ TN    |  41
+ NC    |  48
+ KS    |  53
+ KY    |  59
+ VA    |  60
+       |  65
+ GA    |  73
+ TX    | 110
+(37 rows)
+

@@ -19,7 +19,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // registerStatReplicationView installs `pg_catalog.pg_stat_replication`
@@ -31,7 +31,7 @@ import (
 // counters live alongside the per-sender LSN fields here so an
 // operator's `\watch pg_stat_replication` shows ring health in
 // the same query.
-func registerStatReplicationView(cat *catalog.InMemory, senders *wal.Senders, writer *wal.Writer, syncRep *wal.SyncRep) error {
+func registerStatReplicationView(cat *catalog.InMemory, senders *xlog.Senders, writer *xlog.Writer, syncRep *xlog.SyncRep) error {
 	tbl := &catalog.Table{
 		Schema: "pg_catalog",
 		Name:   "pg_stat_replication",
@@ -121,7 +121,7 @@ func registerStatReplicationView(cat *catalog.InMemory, senders *wal.Senders, wr
 
 // syncState returns the pg_stat_replication.sync_state string for appName.
 // Returns "async" when syncRep is nil (no synchronous replication configured).
-func syncState(syncRep *wal.SyncRep, appName string) string {
+func syncState(syncRep *xlog.SyncRep, appName string) string {
 	if syncRep == nil {
 		return "async"
 	}
@@ -130,7 +130,7 @@ func syncState(syncRep *wal.SyncRep, appName string) string {
 
 // syncPriority returns the pg_stat_replication.sync_priority integer string
 // for appName. Returns "0" when syncRep is nil.
-func syncPriority(syncRep *wal.SyncRep, appName string) string {
+func syncPriority(syncRep *xlog.SyncRep, appName string) string {
 	if syncRep == nil {
 		return "0"
 	}
@@ -141,7 +141,7 @@ func syncPriority(syncRep *wal.SyncRep, appName string) string {
 // backed by the process-wide *wal.Receivers registry. The view is
 // empty when no walreceiver is registered (the standard "primary
 // node" case).
-func registerStatWalReceiverView(cat *catalog.InMemory, receivers *wal.Receivers) error {
+func registerStatWalReceiverView(cat *catalog.InMemory, receivers *xlog.Receivers) error {
 	tbl := &catalog.Table{
 		Schema: "pg_catalog",
 		Name:   "pg_stat_wal_receiver",
@@ -208,7 +208,7 @@ func registerStatWalReceiverView(cat *catalog.InMemory, receivers *wal.Receivers
 // SELECT against a quiet subscription returns identical bytes.
 //
 // See docs/design/0008-0005-logical-replication-observability.md.
-func registerStatSubscriptionView(cat *catalog.InMemory, subs *wal.Subscribers) error {
+func registerStatSubscriptionView(cat *catalog.InMemory, subs *xlog.Subscribers) error {
 	tbl := &catalog.Table{
 		Schema: "pg_catalog",
 		Name:   "pg_stat_subscription",
@@ -339,7 +339,7 @@ func registerStatSubscriptionStatsView(cat *catalog.InMemory, ps *catalog.PubSub
 // `two_phase`, `inactive_since`, `failover`, `synced`,
 // `conflict_reason`) emit empty strings. See
 // docs/design/0008-0001-logical-decoding-pipeline.md.
-func registerReplicationSlotsView(cat *catalog.InMemory, slots *wal.Slots) error {
+func registerReplicationSlotsView(cat *catalog.InMemory, slots *xlog.Slots) error {
 	tbl := &catalog.Table{
 		Schema: "pg_catalog",
 		Name:   "pg_replication_slots",
@@ -704,7 +704,7 @@ func formatStringList(xs []string) string {
 // `extended` / `unreserved` states upstream uses for the in-between
 // lag tier aren't surfaced yet — v0's retention path either keeps
 // the slot live or invalidates it outright.
-func slotWalStatus(s wal.Slot) string {
+func slotWalStatus(s xlog.Slot) string {
 	if s.Invalidated {
 		return "lost"
 	}

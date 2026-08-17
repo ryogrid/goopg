@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // TestPgInputIsValidEnum verifies that pg_input_is_valid correctly returns
@@ -31,11 +31,11 @@ func TestPgInputIsValidEnum(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		fc := &planner.FuncCall{
+		fc := &optimizer.FuncCall{
 			Name: "pg_input_is_valid",
-			Args: []planner.Expr{
-				&planner.StringConst{Value: tc.value},
-				&planner.StringConst{Value: "rainbow"},
+			Args: []optimizer.Expr{
+				&optimizer.StringConst{Value: tc.value},
+				&optimizer.StringConst{Value: "rainbow"},
 			},
 		}
 		got, err := evalFuncCall(fc, nil, ctx)
@@ -61,9 +61,9 @@ func TestPgInputErrorInfoEnum(t *testing.T) {
 	ctx := &Context{Catalog: cat}
 
 	// Build a fake PgInputErrorInfo plan.
-	pgPlan := &planner.PgInputErrorInfo{
-		Value: &planner.StringConst{Value: "mauve"},
-		Type:  &planner.StringConst{Value: "rainbow"},
+	pgPlan := &optimizer.PgInputErrorInfo{
+		Value: &optimizer.StringConst{Value: "mauve"},
+		Type:  &optimizer.StringConst{Value: "rainbow"},
 	}
 	op := newPgInputErrorInfoOp(pgPlan)
 	if err := op.Open(ctx); err != nil {
@@ -102,9 +102,9 @@ func TestPgInputErrorInfoEnum(t *testing.T) {
 
 	// Valid enum value → one row whose four columns are all NULL (upstream
 	// misc.c:731-733), not zero rows. M0119-0006.
-	pgPlan2 := &planner.PgInputErrorInfo{
-		Value: &planner.StringConst{Value: "red"},
-		Type:  &planner.StringConst{Value: "rainbow"},
+	pgPlan2 := &optimizer.PgInputErrorInfo{
+		Value: &optimizer.StringConst{Value: "red"},
+		Type:  &optimizer.StringConst{Value: "rainbow"},
 	}
 	op2 := newPgInputErrorInfoOp(pgPlan2)
 	if err := op2.Open(ctx); err != nil {

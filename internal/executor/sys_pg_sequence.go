@@ -21,7 +21,7 @@ import (
 
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // pgSequenceRelOID / pgSequenceSeqrelidIndexOID are pg_sequence's relation
@@ -60,7 +60,7 @@ func seqTypIDForDataType(dataType string) int64 {
 
 // buildPGSequenceRow builds one Form_pg_sequence row from the definition
 // snapshot the kind-65 payload carries.
-func buildPGSequenceRow(seqrelid uint32, p wal.SequenceStatePayload) Row {
+func buildPGSequenceRow(seqrelid uint32, p xlog.SequenceStatePayload) Row {
 	return Row{
 		NewIntDatum(int64(seqrelid)),                 // seqrelid
 		NewIntDatum(seqTypIDForDataType(p.DataType)), // seqtypid
@@ -85,7 +85,7 @@ type seqHeapEntry struct {
 
 var seqHeapTIDs sync.Map // seqKey → seqHeapEntry
 
-func seqDefSig(seqrelid uint32, p wal.SequenceStatePayload) string {
+func seqDefSig(seqrelid uint32, p xlog.SequenceStatePayload) string {
 	return fmt.Sprintf("%d|%s|%d|%d|%d|%d|%d|%v", seqrelid, p.DataType, p.Start, p.Increment, p.Max, p.Min, p.Cache, p.Cycle)
 }
 
@@ -131,7 +131,7 @@ func lastDotIndex(s string) int {
 // definition carried by p — called from WALLogSequenceState (the definition
 // funnel) beside the kind-65 emit. Counter-only snapshots (unchanged
 // definition) are skipped via the fingerprint.
-func syncSequenceDefinitionToCatalogHeap(ctx *Context, name string, p wal.SequenceStatePayload) {
+func syncSequenceDefinitionToCatalogHeap(ctx *Context, name string, p xlog.SequenceStatePayload) {
 	if ctx == nil || ctx.Pool == nil || ctx.Catalog == nil {
 		return
 	}
@@ -220,7 +220,7 @@ func dropSequenceCatalogHeapRow(ctx *Context, name string, dbOid uint32) {
 // SeedSequenceHeapTID is the startup reload hook (initdb): records the live
 // pg_sequence row TID for a restored sequence so post-restart ALTERs update
 // in place instead of inserting duplicates.
-func SeedSequenceHeapTID(name string, dbOid uint32, seqrelid uint32, tid catalog.SchemaHeapTID, p wal.SequenceStatePayload) {
+func SeedSequenceHeapTID(name string, dbOid uint32, seqrelid uint32, tid catalog.SchemaHeapTID, p xlog.SequenceStatePayload) {
 	seqHeapTIDs.Store(seqKey(name, resolveSeqDBOid([]uint32{dbOid})), seqHeapEntry{tid: tid, defSig: seqDefSig(seqrelid, p)})
 }
 
@@ -276,7 +276,7 @@ func WriteSequencePageAndLog(ctx *Context, name string, dbOid uint32, lastValue,
 		physDBOid = dbOid
 	}
 	rel := storage.RelFileNode{DBOid: physDBOid, RelOid: seqrelid, Fork: storage.MainFork}
-	pageBytes, err := wal.BuildSequencePage(tupleBytes)
+	pageBytes, err := xlog.BuildSequencePage(tupleBytes)
 	if err != nil {
 		return
 	}
@@ -307,7 +307,7 @@ func WriteSequencePageAndLog(ctx *Context, name string, dbOid uint32, lastValue,
 	// page from the logged tuple), so the dirty mark rides the record — no
 	// separate FPI needed.
 	_ = ctx.Pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
-		framed, ferr := wal.EncodeSeqLogPG(rel, tupleBytes)
+		framed, ferr := xlog.EncodeSeqLogPG(rel, tupleBytes)
 		if ferr != nil {
 			return 0, ferr
 		}
@@ -324,7 +324,7 @@ func WriteSequencePageAndLog(ctx *Context, name string, dbOid uint32, lastValue,
 // syncSequenceOwnedByDependRow resolves p.OwnedBy ("table.column" or
 // "schema.table.column") to (tableOID, attnum) and maintains the pg_depend
 // auto row. Empty OwnedBy stamps any existing row (OWNED BY NONE).
-func syncSequenceOwnedByDependRow(ctx *Context, seqrelid uint32, p wal.SequenceStatePayload) {
+func syncSequenceOwnedByDependRow(ctx *Context, seqrelid uint32, p xlog.SequenceStatePayload) {
 	if p.OwnedBy == "" {
 		if ctx.MaterializeWriterXID() == nil {
 			deleteSequenceOwnedByDependRow(ctx, seqrelid, ctx.Tx.XID)

@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"math/big"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -14,18 +15,18 @@ import (
 	"strings"
 	"time"
 
-	"github.com/goopg/goopg/internal/access/btree"
-	"github.com/goopg/goopg/internal/analyzer"
+	"github.com/goopg/goopg/internal/access/nbtree"
+	"github.com/goopg/goopg/internal/parser/analyzer"
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/config"
-	"github.com/goopg/goopg/internal/lockmgr"
-	"github.com/goopg/goopg/internal/mctx"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/utils/misc"
+	"github.com/goopg/goopg/internal/storage/lmgr"
+	"github.com/goopg/goopg/internal/utils/mmgr"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
-	"github.com/goopg/goopg/internal/plpgsql"
+	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/pl/plpgsql"
 	"github.com/goopg/goopg/internal/storage"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // pgEpoch is the PostgreSQL epoch: 2000-01-01 00:00:00 UTC.
@@ -38,12 +39,12 @@ var pgEpoch = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 // output rows; the wire-protocol path emits the canonical
 // CommandComplete tag for the verb.
 type ddlOp struct {
-	plan *planner.DDL
+	plan *optimizer.DDL
 	ctx  *Context
 	done bool
 }
 
-func newDDLOp(p *planner.DDL) *ddlOp { return &ddlOp{plan: p} }
+func newDDLOp(p *optimizer.DDL) *ddlOp { return &ddlOp{plan: p} }
 
 // planCatalog returns the search-path-aware catalog for planner.Plan calls.
 // Falls back to the raw catalog when PlanCatalog is not set. M0097-0022.
@@ -75,7 +76,7 @@ func ctxPlanCatalog(ctx *Context) catalog.Catalog {
 	return ctx.Catalog
 }
 
-func (o *ddlOp) Schema() planner.Schema { return nil }
+func (o *ddlOp) Schema() optimizer.Schema { return nil }
 func (o *ddlOp) Open(ctx *Context) error {
 	if ctx.Catalog == nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "DDL requires Catalog in Context"}
@@ -344,7 +345,7 @@ func (o *ddlOp) execCreateTablespace(s *parser.CreateTablespaceStmt) error {
 		// (tablespace.c). Relation files for this tablespace live under it;
 		// pg_basebackup expects it present so a restored cluster's relfiles
 		// resolve. MkdirAll creates the parent <oid> dir in the same call.
-		versionDir := filepath.Join(dir, config.TablespaceVersionDirectory)
+		versionDir := filepath.Join(dir, misc.TablespaceVersionDirectory)
 		if mkErr := os.MkdirAll(versionDir, 0o700); mkErr != nil {
 			// Roll back the registry insert so a retry can succeed.
 			o.ctx.Catalog.DropTablespace(s.Name)
@@ -372,7 +373,7 @@ func (o *ddlOp) execCreateTablespace(s *parser.CreateTablespaceStmt) error {
 		return fmt.Errorf("pg_shdepend write: %w", err)
 	}
 	if o.ctx.WAL != nil {
-		rec, encErr := wal.EncodeTblspcCreatePG(oid, location, o.ctx.Tx.XID)
+		rec, encErr := xlog.EncodeTblspcCreatePG(oid, location, o.ctx.Tx.XID)
 		if encErr != nil {
 			return fmt.Errorf("encode tblspc-create: %w", encErr)
 		}
@@ -425,7 +426,7 @@ func (o *ddlOp) execDropTablespace(s *parser.DropTablespaceStmt) error {
 	deleteTablespaceCatalogRow(o.ctx, oid)
 	deleteShdependRowsForObject(o.ctx, pgTablespaceClassID, oid)
 	if o.ctx.WAL != nil {
-		rec, encErr := wal.EncodeTblspcDropPG(oid, o.ctx.Tx.XID)
+		rec, encErr := xlog.EncodeTblspcDropPG(oid, o.ctx.Tx.XID)
 		if encErr != nil {
 			return fmt.Errorf("encode tblspc-drop: %w", encErr)
 		}
@@ -1592,6 +1593,73 @@ func compositeFieldColumnType(colType string) parser.ColumnType {
 	return parser.ColumnType{Name: base, Args: args, IsArray: isArray}
 }
 
+// validateColumnStorage enforces PG's GetAttributeStorage rule at CREATE TABLE
+// time: a column whose type is not TOAST-aware (pg_type.typstorage == 'p' —
+// plain, e.g. int/integer/oid) may only be declared `STORAGE plain`. Any other
+// declared mode raises ERRCODE_FEATURE_NOT_SUPPORTED (0A000), mirroring
+// GetAttributeStorage (postgres/src/backend/commands/tablecmds.c:22082-22112,
+// errmsg :22109). The type name in the message renders via pgFormatTypeName
+// (goopg's format_type_be port), so `int`/`int4`/`integer` all print
+// "integer" exactly as format_type_be(int4oid) does. Returns nil when no
+// STORAGE clause was written, the requested mode is plain, or the type is
+// TOAST-aware. M0134-0002 C2 slice 9.
+func validateColumnStorage(cat catalog.Catalog, col catalog.Column) *ExecError {
+	if col.Storage == "" || strings.EqualFold(col.Storage, "plain") {
+		return nil
+	}
+	if columnTypeStorageCode(cat, col) != 'p' {
+		return nil
+	}
+	return &ExecError{
+		Code:    "0A000",
+		Message: fmt.Sprintf("column data type %s can only have storage PLAIN", pgFormatTypeName(col.Type.Name)),
+	}
+}
+
+// columnTypeStorageCode returns the intrinsic pg_type typstorage character for
+// a freshly-declared column — the attstorage PG assumes before any per-column
+// STORAGE clause. Mirrors buildUserPGAttributeRow's typOID resolution
+// (pg18_user_catalog_rows.go): serial spellings remap to their integer base, a
+// quoted "char" maps to the single-byte OID 18, an array column is always
+// extended ('x'), a domain column's Type.Name was already resolved to its base
+// by execCreateTable's ResolveColumnType, and a user-defined enum reports plain
+// ('p', pg_type.dat) while composite/range/multirange and unknown types report
+// extended (userTypeAttrsForOID's fallback). M0134-0002 C2 slice 9.
+func columnTypeStorageCode(cat catalog.Catalog, col catalog.Column) byte {
+	typOID := catalog.TypeNameToOID(col.Type.Name)
+	// Disambiguate the single-byte "char" (OID 18) from bpchar (1042): both
+	// arrive as catalog type name "char", but only the bpchar-equivalent
+	// unquoted `char` carries a length arg ([1]). Mirrors the atttypid remap in
+	// buildUserPGAttributeRow (DU-002 slice 87).
+	if typOID == catalog.OIDBpChar && col.Type.Name == "char" && len(col.Type.Args) == 0 {
+		typOID = catalog.OIDChar
+	}
+	switch strings.ToLower(col.Type.Name) {
+	case "serial", "serial4":
+		typOID = catalog.OIDInt4
+	case "bigserial", "serial8":
+		typOID = catalog.OIDInt8
+	case "smallserial", "serial2":
+		typOID = catalog.OIDInt2
+	}
+	if col.Type.IsArray {
+		return 'x' // every array type is TOAST-aware (pg_type.dat typstorage 'x')
+	}
+	if typOID == catalog.OIDText {
+		// TypeNameToOID falls back to text for names it does not know — text
+		// itself AND user-defined enum/composite/range/multirange types. Only
+		// an enum deviates from the extended default: pg_type.dat enum
+		// typstorage 'p' (a 4-byte by-value value, like oid).
+		if im, ok := cat.(*catalog.InMemory); ok {
+			if _, isEnum := im.LookupEnum(col.Type.Name); isEnum {
+				return 'p'
+			}
+		}
+		return 'x'
+	}
+	return userTypeAttrsForOID(typOID).TypStorage
+}
+
 func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// Temporary tables may only be created in the temp schema (pg_temp),
 	// not in a permanent schema like public.
@@ -1846,7 +1914,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				}
 			}
 		}
-		addCol := func(c parser.ColumnDef) {
+		addCol := func(c parser.ColumnDef) error {
 			typeName := strings.ToLower(c.Type.Name)
 			declaredTypeName := "" // non-empty only when a domain is resolved
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
@@ -1859,7 +1927,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			isSerialCol := serialTyp == "serial" || serialTyp == "serial4" ||
 				serialTyp == "bigserial" || serialTyp == "serial8" ||
 				serialTyp == "smallserial" || serialTyp == "serial2"
-			cols = append(cols, catalog.Column{
+			col := catalog.Column{
 				Name:              c.Name,
 				Type:              catalog.Type{Name: typeName, Args: append([]int64(nil), c.Type.Args...), IsArray: c.Type.IsArray},
 				DeclaredTypeName:  declaredTypeName,
@@ -1879,7 +1947,17 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				Compression:       c.Compression,
 				Collation:         c.Collation,
 				FDWOptions:        c.FDWOptions,
-			})
+				Storage:           c.Storage,
+			}
+			// A declared STORAGE mode must be compatible with the column type's
+			// intrinsic storage: a non-plain mode on a plain-storage type (e.g.
+			// int) is 0A000 — GetAttributeStorage (tablecmds.c:22082-22112).
+			// M0134-0002 C2 slice 9.
+			if verr := validateColumnStorage(o.ctx.Catalog, col); verr != nil {
+				return verr
+			}
+			cols = append(cols, col)
+			return nil
 		}
 		for _, item := range s.BodyOrder {
 			if strings.HasPrefix(item, "@@LIKE:") {
@@ -2060,7 +2138,9 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 							}
 						}
 					} else {
-						addCol(c)
+						if err := addCol(c); err != nil {
+							return err
+						}
 					}
 				}
 			}
@@ -2089,6 +2169,18 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 					typeName = resolved
 				}
 			}
+			// A declared STORAGE mode must be compatible with the column type's
+			// intrinsic storage (GetAttributeStorage, tablecmds.c:22082-22112) —
+			// same rule addCol enforces on the BodyOrder path. M0134-0002 C2
+			// slice 9.
+			if c.Storage != "" {
+				if verr := validateColumnStorage(o.ctx.Catalog, catalog.Column{
+					Type:    catalog.Type{Name: typeName, Args: c.Type.Args, IsArray: c.Type.IsArray},
+					Storage: c.Storage,
+				}); verr != nil {
+					return verr
+				}
+			}
 			cols = append(cols, catalog.Column{
 				Name:             c.Name,
 				Type:             catalog.Type{Name: typeName, Args: append([]int64(nil), c.Type.Args...)},
@@ -2100,6 +2192,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				Compression:      c.Compression,
 				Collation:        c.Collation,
 				FDWOptions:       c.FDWOptions,
+				Storage:          c.Storage,
 			})
 		}
 	}
@@ -3106,6 +3199,16 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	}
 	// Validate DEFAULT expressions (no column refs, aggregates, subqueries, SRFs).
 	for _, c := range s.Columns {
+		// M0134-0002 C8: PG rejects a user column whose name collides with a
+		// system column (CheckAttributeNamesTypes, postgres/src/backend/catalog/
+		// heap.c:478-483 — SystemAttributeByName). Exact, case-sensitive; the
+		// parser has already folded unquoted identifiers to lowercase, so only a
+		// genuinely system-named column reaches this branch. Pos 0: the PG
+		// ereport carries no errposition (psql renders no LINE 1).
+		if isSystemColumn(c.Name) {
+			return &ExecError{Code: "42701", Pos: 0,
+				Message: fmt.Sprintf("column name %q conflicts with a system column name", c.Name)}
+		}
 		if strings.EqualFold(c.Type.Name, "unknown") {
 			return &ExecError{Code: "42P16", Pos: s.Pos(),
 				Message: fmt.Sprintf("column %q has pseudo-type unknown", c.Name)}
@@ -3160,6 +3263,16 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
+	}
+	// Stamp the creating role as owner (PG: tablecmds.c DefineRelation ->
+	// heap_create_with_catalog(ownerId = GetUserId())), so a non-superuser
+	// role's own CREATE TABLE (including CREATE TEMP TABLE, which shares this
+	// construction point) doesn't get "permission denied" on itself. The
+	// bootstrap superuser leaves Owner at its zero-value sentinel
+	// (catalog.go:611-621) so every existing table's behavior is unchanged.
+	// M0134-0004 S2.
+	if o.ctx.NonSuperuserRole != "" {
+		tbl.Owner = o.ctx.NonSuperuserRole
 	}
 	tbl.Tablespace = tablespaceOID
 	if s.ForeignServer != "" {
@@ -3689,15 +3802,22 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// name for violation messages. Inline/table-level checks are anonymous in
 	// the current parser, so they get empty names (invisible to pg_constraint).
 	// Column-level CHECKs are auto-named using PostgreSQL's convention
-	// {tablename}_{colname}_check (mirrors how PG assigns names in DDL). M0097-0023.
+	// {tablename}_{colname}_check (mirrors how PG assigns names in DDL) UNLESS
+	// the user gave an explicit `CONSTRAINT <name> CHECK (...)`, in which case
+	// the given name is preserved verbatim (transformCheckConstraints,
+	// parse_utilcmd.c; ChooseConstraintName only auto-names when conname is
+	// NULL). M0097-0023, M0134-0002 slice S02.
 	for _, c := range s.Columns {
 		if c.CheckExpr != "" {
-			autoName := tbl.Name + "_" + c.Name + "_check"
+			name := c.CheckConstraintName
+			if name == "" {
+				name = tbl.Name + "_" + c.Name + "_check"
+			}
 			// c.CheckNotEnforced carries a column-level `CHECK (...) NOT
 			// ENFORCED` (PG18) so the dumped constraintdef re-emits the
 			// suffix and pg_constraint reports conenforced=false. DU-002
 			// slice 430.
-			tbl.AddCheckFull(autoName, c.CheckExpr, o.allocConstraintOID(autoName), false, false, c.CheckNotEnforced)
+			tbl.AddCheckFull(name, c.CheckExpr, o.allocConstraintOID(name), false, false, c.CheckNotEnforced)
 		}
 	}
 	// Table-level CHECK constraints written without an explicit CONSTRAINT name
@@ -3854,7 +3974,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 					noInherit = true
 				}
 			}
-			tbl.AddNotNull(name, col.Name, im.AllocOID(), noInherit, isLocal, inhCount)
+			tbl.AddNotNull(name, col.Name, im.AllocOID(), noInherit, false, isLocal, inhCount)
 		}
 	}
 	// Copy pg_description comments from LIKE INCLUDING COMMENTS sources:
@@ -4121,7 +4241,7 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 		return nil
 	}
 	// Plan the SELECT to derive the schema.
-	selectNode, err := planner.Plan(s.SelectSource, o.planCatalog())
+	selectNode, err := optimizer.Plan(s.SelectSource, o.planCatalog())
 	if err != nil {
 		return &ExecError{Code: "42601", Pos: s.Pos(), Message: err.Error()}
 	}
@@ -4148,6 +4268,19 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 			Name: colName, Type: catalog.Type{Name: strings.ToLower(typeName)},
 		}
 	}
+	// M0134-0002 C8: PG validates CTAS column names — both the SELECT's output
+	// names and any column-alias list — through DefineRelation →
+	// heap_create_with_catalog → CheckAttributeNamesTypes (heap.c:478-483),
+	// which rejects a system-column name (createas.c:166-188 builds the
+	// ColumnDefs from tlist + colNames, createas.c:114 → DefineRelation).
+	// So `CREATE TABLE t (xmin) AS SELECT ...` and even `CREATE TABLE t AS
+	// SELECT xmin FROM ...` must both fail with 42701.
+	for _, c := range cols {
+		if isSystemColumn(c.Name) {
+			return &ExecError{Code: "42701", Pos: 0,
+				Message: fmt.Sprintf("column name %q conflicts with a system column name", c.Name)}
+		}
+	}
 	tablespaceOID, err := resolveTablespaceClause(o.ctx, s.Pos(), s.Tablespace)
 	if err != nil {
 		return err
@@ -4155,6 +4288,15 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
+	}
+	// Stamp the creating role as owner (PG: tablecmds.c DefineRelation ->
+	// heap_create_with_catalog(ownerId = GetUserId())), so a non-superuser
+	// role's own CREATE TABLE ... AS SELECT doesn't get "permission denied"
+	// on itself. The bootstrap superuser leaves Owner at its zero-value
+	// sentinel (catalog.go:611-621) so every existing table's behavior is
+	// unchanged. M0134-0004 S2.
+	if o.ctx.NonSuperuserRole != "" {
+		tbl.Owner = o.ctx.NonSuperuserRole
 	}
 	tbl.Tablespace = tablespaceOID
 	// If the table was created without an explicit schema qualifier, record the
@@ -4281,6 +4423,15 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
+	}
+	// Stamp the creating role as owner (PG: tablecmds.c DefineRelation ->
+	// heap_create_with_catalog(ownerId = GetUserId())), so a non-superuser
+	// role's own CREATE TABLE ... PARTITION OF doesn't get "permission
+	// denied" on itself. The bootstrap superuser leaves Owner at its
+	// zero-value sentinel (catalog.go:611-621) so every existing table's
+	// behavior is unchanged. M0134-0004 S2 round 2.
+	if o.ctx.NonSuperuserRole != "" {
+		tbl.Owner = o.ctx.NonSuperuserRole
 	}
 	tbl.Tablespace = tablespaceOID
 	// If the table was created without an explicit schema qualifier, record the
@@ -4595,11 +4746,11 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 					inhCount = 1
 				}
 				constraintName := strings.ToLower(tbl.Name) + "_" + colKey + "_not_null"
-				tbl.AddNotNull(constraintName, col.Name, im2.AllocOID(), false, true, inhCount)
+				tbl.AddNotNull(constraintName, col.Name, im2.AllocOID(), false, false, true, inhCount)
 				continue
 			}
 			if parentNC != nil {
-				tbl.AddNotNull(parentNC.Name, col.Name, im2.AllocOID(), parentNC.NoInherit, false, 1)
+				tbl.AddNotNull(parentNC.Name, col.Name, im2.AllocOID(), parentNC.NoInherit, parentNC.NotValid, false, 1)
 			}
 		}
 	}
@@ -5139,7 +5290,7 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 	// v0-planner "feature not supported" (0A000) errors are ignored so the
 	// planner's incompleteness does not reject views upstream would accept;
 	// those still fail at reference time. M0097-0003 (functional_deps).
-	if _, err := planner.Plan(s.Query, o.planCatalog()); err != nil {
+	if _, err := optimizer.Plan(s.Query, o.planCatalog()); err != nil {
 		// Surface the validation failure as an *ExecError so the wire
 		// layer renders a clean "ERROR:  <message>" line. Returning the
 		// raw *planner.PlanError would let its Error() string —
@@ -5149,7 +5300,7 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 		// "feature not supported" (0A000) errors are still ignored so
 		// the planner's incompleteness does not reject views upstream
 		// would accept; those fail at reference time instead.
-		if pe, ok := err.(*planner.PlanError); ok {
+		if pe, ok := err.(*optimizer.PlanError); ok {
 			// Ignore feature-not-supported (0A000) and circular-view (42P10)
 			// errors — PostgreSQL allows circular/forward-referencing views;
 			// they only error when accessed, not when defined.
@@ -5174,7 +5325,7 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 	// new body's plan doesn't recurse back into the old definition
 	// (circular-view stack overflow). The view is removed only for the
 	// duration of planning, then re-inserted when we call CreateView below.
-	var planSchema planner.Schema
+	var planSchema optimizer.Schema
 	// CreateView below always assigns a fresh OID, even on OR REPLACE — the
 	// old view's pg_class/pg_attribute heap rows (if any) would otherwise
 	// linger under the stale OID and resurrect a duplicate registration for
@@ -5191,7 +5342,7 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 			_ = im.DropView(s.Name, true, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) // remove old def so plan can't cycle back to it
 		}
 	}
-	if viewPlan, planErr := planner.Plan(s.Query, o.planCatalog()); planErr == nil {
+	if viewPlan, planErr := optimizer.Plan(s.Query, o.planCatalog()); planErr == nil {
 		planSchema = viewPlan.Output()
 	}
 	// Ignore plan errors during view creation (including circular-view 42P10).
@@ -6081,7 +6232,7 @@ func routineCascadeDisplayName(r *catalog.Routine) string {
 // M0118-0008.
 func (o *ddlOp) dropTableByRef(name parser.ObjectName, tbl *catalog.Table, allowDefer bool) error {
 	// AccessExclusiveLock on the table being dropped (transaction-scoped).
-	if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.AccessExclusiveLock); err != nil {
+	if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lmgr.AccessExclusiveLock); err != nil {
 		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 			ee.Pos = name.Pos()
 		}
@@ -6095,7 +6246,7 @@ func (o *ddlOp) dropTableByRef(name parser.ObjectName, tbl *catalog.Table, allow
 	// (reindex-concurrently-toast, design 0118-0088).
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 		if toastRel, has := im.ToastRelFileNode(o.ctx.Catalog.RelFileNode(tbl)); has {
-			if err := o.ctx.acquireDDLLockTxn(toastRel, lockmgr.AccessExclusiveLock); err != nil {
+			if err := o.ctx.acquireDDLLockTxn(toastRel, lmgr.AccessExclusiveLock); err != nil {
 				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 					ee.Pos = name.Pos()
 				}
@@ -6174,7 +6325,7 @@ func (o *ddlOp) dropTableByRefImmediate(name parser.ObjectName, tbl *catalog.Tab
 	// dropping transaction commits. M0118-0008 (detach-partition-concurrently-3).
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && tbl.DetachPendingEpoch != 0 && tbl.PartitionParentOID != 0 {
 		if parentTbl, ok2 := im.LookupTableByOID(tbl.PartitionParentOID); ok2 {
-			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(parentTbl), lockmgr.AccessExclusiveLock); err != nil {
+			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(parentTbl), lmgr.AccessExclusiveLock); err != nil {
 				if ee, ok3 := err.(*ExecError); ok3 && ee.Pos == 0 {
 					ee.Pos = name.Pos()
 				}
@@ -6467,9 +6618,9 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 		cicWaitSlots = o.ctx.TxnMgr.SnapshotActiveOtherSlots(o.ctx.Tx.Handle)
 	}
 	// For partial indexes, resolve the WHERE predicate so bulk build can filter rows.
-	var resolvedPred planner.Expr
+	var resolvedPred optimizer.Expr
 	if s.HasPredicate && s.Predicate != nil {
-		resolvedPred, _ = planner.ResolveIndexPredicate(s.Predicate, tbl)
+		resolvedPred, _ = optimizer.ResolveIndexPredicate(s.Predicate, tbl)
 	}
 	// Const-fold a partial-index predicate that references no table columns,
 	// mirroring PostgreSQL's eval_const_expressions over the index predicate in
@@ -6480,14 +6631,14 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	// block another session (isolation spec multiple-cic). The stored predicate
 	// (idx.Predicate) keeps the original expression so pg_get_indexdef / pg_dump
 	// still render the WHERE clause verbatim.
-	if resolvedPred != nil && !planner.ExprContainsColumnRef(resolvedPred) {
+	if resolvedPred != nil && !optimizer.ExprContainsColumnRef(resolvedPred) {
 		pv, pErr := evalExpr(resolvedPred, nil, o.ctx)
 		if pErr != nil {
 			return pErr
 		}
 		if pv.IsNull() || (pv.Kind == KindBool && !pv.BoolValue()) {
 			// Constant FALSE/NULL ⇒ no heap tuple qualifies; build an empty index.
-			resolvedPred = &planner.BooleanConst{}
+			resolvedPred = &optimizer.BooleanConst{}
 		} else {
 			// Constant TRUE ⇒ every heap tuple qualifies; drop the predicate.
 			resolvedPred = nil
@@ -6637,7 +6788,7 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 // upstream's ChooseRelationName. resolvedPred carries the (already const-folded)
 // partial-index predicate so each child filters identically. M0118-0008
 // (partition-drop-index-locking isolation spec).
-func (o *ddlOp) createPartitionChildIndexes(s *parser.CreateIndexStmt, parentTbl *catalog.Table, parentIdx *catalog.Index, resolvedPred planner.Expr) error {
+func (o *ddlOp) createPartitionChildIndexes(s *parser.CreateIndexStmt, parentTbl *catalog.Table, parentIdx *catalog.Index, resolvedPred optimizer.Expr) error {
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
 		return nil
@@ -6812,6 +6963,20 @@ func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 			}
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("index %q does not exist", name.String())}
 		}
+		// M0134-0002 C2: DROP INDEX on an index that backs a UNIQUE / PRIMARY KEY
+		// / EXCLUDE constraint raises 2BP01 instead of silently dropping the
+		// backing index (PG dependency.c:780-795, performDeletion — the constraint
+		// still depends on the index). The constraint name == index name for all
+		// three kinds (goopg invariant). Fires for plain and CONCURRENTLY drops
+		// alike (both reach this loop).
+		if idx.IsConstraint || idx.IsExclusion {
+			return &ExecError{
+				Code:    "2BP01",
+				Pos:     s.Pos(),
+				Message: fmt.Sprintf("cannot drop index %s because constraint %s on table %s requires it", idx.Name, idx.Name, idx.Table.Name),
+				Hint:    fmt.Sprintf("You can drop constraint %s on table %s instead.", idx.Name, idx.Table.Name),
+			}
+		}
 		// DROP INDEX (non-CONCURRENTLY) takes an AccessExclusiveLock on the
 		// index relation itself, then descends the index's table tree, then locks
 		// the descendant child indexes — mirroring PostgreSQL's
@@ -6979,6 +7144,13 @@ func ApplyPendingPartitionAttaches(ctx *Context, sess *BasicSession) {
 			childTbl.PartitionBounds = a.Bounds
 		}
 		im.RegisterPartitionChild(a.ParentOID, a.ChildOID)
+		// M0134-0002 C9 residual (S2): same column-merge as the immediate ATTACH
+		// arm (MergeAttributesIntoExisting, tablecmds.c:17500) — an ATTACH that
+		// was deferred to COMMIT must also mark the child's same-named columns
+		// Inherited, else the inherited-DDL guards stay off on the ATTACHed child.
+		if parentTbl, ok := im.LookupTableByOID(a.ParentOID); ok {
+			markAttachedColumnsInherited(parentTbl, childTbl)
+		}
 		// fk-partitioned-1 (design 0118-0120): the partition is now registered
 		// (IsPartitionChild true), so a concurrent DELETE that was waiting on
 		// this attach can resolve via the normal committed-clone path; drop the
@@ -7082,7 +7254,7 @@ func (o *ddlOp) lockDropIndexSelf(idx *catalog.Index) error {
 	if idx == nil {
 		return nil
 	}
-	return o.ctx.acquireDDLLockTxn(o.ctx.Catalog.IndexRelFileNode(idx), lockmgr.AccessExclusiveLock)
+	return o.ctx.acquireDDLLockTxn(o.ctx.Catalog.IndexRelFileNode(idx), lmgr.AccessExclusiveLock)
 }
 
 // lockDropIndexChildren AccessExclusive-locks every partition-descendant child
@@ -7105,7 +7277,7 @@ func (o *ddlOp) lockDropIndexChildren(idx *catalog.Index) error {
 				continue
 			}
 			visited[ci.OID] = true
-			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.IndexRelFileNode(ci), lockmgr.AccessExclusiveLock); err != nil {
+			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.IndexRelFileNode(ci), lmgr.AccessExclusiveLock); err != nil {
 				return err
 			}
 			if err := rec(ci.OID); err != nil {
@@ -7146,7 +7318,7 @@ func (o *ddlOp) lockPartitionSubtreeAccessExcl(im *catalog.InMemory, tbl *catalo
 		return nil
 	}
 	visited[tbl.OID] = true
-	if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.AccessExclusiveLock); err != nil {
+	if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lmgr.AccessExclusiveLock); err != nil {
 		return err
 	}
 	for _, child := range im.PartitionChildren(tbl.OID) {
@@ -7200,11 +7372,171 @@ func (o *ddlOp) lockDefaultPartitionForAttach(parent *catalog.Table) error {
 	for _, child := range im.PartitionChildren(parent.OID) {
 		for _, pb := range child.PartitionBounds {
 			if pb.IsDefault {
-				return o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(child), lockmgr.AccessExclusiveLock)
+				return o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(child), lmgr.AccessExclusiveLock)
 			}
 		}
 	}
 	return nil
+}
+
+// fkColumnExists reports whether tbl has a live (non-dropped) column named
+// col — a case-sensitive match, mirroring PG's SearchSysCacheAttName lookup in
+// transformColumnNameList (tablecmds.c:13327-13346) and NOT the
+// case-insensitive InMemory.LookupColumn. The scan is the same dropped-skipping
+// pattern resolveAnalyzeColumns uses (operators_analyze.go:141-146).
+// M0134-0002 C4 (ADD FOREIGN KEY column validation).
+func fkColumnExists(tbl *catalog.Table, col string) bool {
+	for i := range tbl.Columns {
+		if tbl.Columns[i].Name == col && !tbl.Columns[i].Dropped {
+			return true
+		}
+	}
+	return false
+}
+
+// fkConstraintNameInUse reports whether name is already a constraint on tbl
+// across every kind execAlterTableDropConstraint enumerates: FK + CHECK +
+// PK/UNIQUE/EXCLUDE index + named NOT NULL. Mirrors PG's ConstraintNameIsUsed
+// (pg_constraint.c:412) — a scan over pg_constraint for any constraint sharing
+// the name on the same relation. M0134-0002 C4 (42710 duplicate-name guard).
+func (o *ddlOp) fkConstraintNameInUse(tbl *catalog.Table, name string) bool {
+	for i := range tbl.ForeignKeys {
+		if strings.EqualFold(tbl.ForeignKeys[i].Name, name) {
+			return true
+		}
+	}
+	for i := range tbl.NamedChecks {
+		if strings.EqualFold(tbl.NamedChecks[i].Name, name) {
+			return true
+		}
+	}
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
+		if (idx.IsConstraint || idx.IsExclusion) && strings.EqualFold(idx.Name, name) {
+			return true
+		}
+	}
+	for i := range tbl.NotNullConstraints {
+		if strings.EqualFold(tbl.NotNullConstraints[i].Name, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// viewAllowedAlterAction reports whether the given ALTER TABLE subcommand is
+// permitted against a plain view (relkind='v'). Mirrors PostgreSQL's
+// ATT_VIEW allow-set: postgres/src/backend/commands/tablecmds.c:4943-5282
+// (the AT_* switch inside ATPrepCmd, each case's ATSimplePermissions call).
+// Implemented as an explicit allow-list — every AlterTableActionKind the
+// execAlterTable dispatch below handles has been classified against the PG
+// switch; anything not listed here is structural and refused. Views ARE
+// allowed: RENAME (relation/column/constraint — renameatt()/rename_constraint()
+// perform their own relkind-agnostic checks, never routed through
+// ATSimplePermissions), ALTER COLUMN SET/DROP DEFAULT (AT_ColumnDefault,
+// tablecmds.c:4961-4975 — "we allow defaults on views so INSERT into a view
+// can have default-ish behavior"), and table-level reloptions SET/RESET
+// (AT_SetRelOptions/AT_ResetRelOptions, tablecmds.c:5182-5191, includes
+// security_barrier/check_option). AlterTableNoOp is a goopg-internal no-op
+// (unrecognized ADD CONSTRAINT subtype) that performs no structural work
+// either way, so it is harmless to allow. M0134-0002 C11a.
+func viewAllowedAlterAction(kind parser.AlterTableActionKind) bool {
+	switch kind {
+	case parser.AlterTableNoOp,
+		parser.AlterTableRenameTable,
+		parser.AlterTableRenameColumn,
+		parser.AlterTableRenameConstraint,
+		parser.AlterTableSetDefault,
+		parser.AlterTableDropDefault,
+		parser.AlterTableSetReloptions,
+		parser.AlterTableResetReloptions:
+		return true
+	default:
+		return false
+	}
+}
+
+// alterActionName renders the PG `alter_table_type_to_string` text for an
+// ALTER TABLE subcommand, used in the "ALTER action %s cannot be performed
+// on relation %q" 42809 message. postgres/src/backend/commands/tablecmds.c:6596
+// alter_table_type_to_string. Only the strings reachable via
+// viewAllowedAlterAction's refuse branch need to be exact; every
+// AlterTableActionKind the execAlterTable dispatch handles is covered so the
+// guard never falls through to the generic fallback. M0134-0002 C11a.
+func alterActionName(kind parser.AlterTableActionKind) string {
+	switch kind {
+	case parser.AlterTableAddColumn:
+		return "ADD COLUMN"
+	case parser.AlterTableAddCheck, parser.AlterTableAddForeignKey,
+		parser.AlterTableAddExclude, parser.AlterTableAddUnique,
+		parser.AlterTableAddPrimaryKey:
+		return "ADD CONSTRAINT"
+	case parser.AlterTableAttachPartition:
+		return "ATTACH PARTITION"
+	case parser.AlterTableDetachPartition:
+		return "DETACH PARTITION"
+	case parser.AlterTableDropConstraint:
+		return "DROP CONSTRAINT"
+	case parser.AlterTableInherit:
+		return "INHERIT"
+	case parser.AlterTableNoInherit:
+		return "NO INHERIT"
+	case parser.AlterTableAlterColumnSet:
+		return "ALTER COLUMN ... SET"
+	case parser.AlterTableAlterColumnReset:
+		return "ALTER COLUMN ... RESET"
+	case parser.AlterTableAlterColumnType:
+		return "ALTER COLUMN ... SET DATA TYPE"
+	case parser.AlterTableDropColumn:
+		return "DROP COLUMN"
+	case parser.AlterTableSetStatistics:
+		return "ALTER COLUMN ... SET STATISTICS"
+	case parser.AlterTableSetStorage:
+		return "ALTER COLUMN ... SET STORAGE"
+	case parser.AlterTableSetCompression:
+		return "ALTER COLUMN ... SET COMPRESSION"
+	case parser.AlterTableSetNotNull, parser.AlterTableAddNotNull:
+		return "ALTER COLUMN ... SET NOT NULL"
+	case parser.AlterTableDropNotNull:
+		return "ALTER COLUMN ... DROP NOT NULL"
+	case parser.AlterIndexAttachPartition:
+		return "ATTACH PARTITION"
+	case parser.AlterIndexSetReloptions:
+		return "SET"
+	case parser.AlterTableValidateConstraint:
+		return "VALIDATE CONSTRAINT"
+	case parser.AlterTableReplicaIdentity:
+		return "REPLICA IDENTITY"
+	case parser.AlterTableClusterOn:
+		return "CLUSTER ON"
+	case parser.AlterTableSetWithoutCluster:
+		return "SET WITHOUT CLUSTER"
+	case parser.AlterTableEnableRowSecurity:
+		return "ENABLE ROW SECURITY"
+	case parser.AlterTableDisableRowSecurity:
+		return "DISABLE ROW SECURITY"
+	case parser.AlterTableForceRowSecurity:
+		return "FORCE ROW SECURITY"
+	case parser.AlterTableNoForceRowSecurity:
+		return "NO FORCE ROW SECURITY"
+	case parser.AlterTableEnableDisableRule:
+		return "ENABLE RULE"
+	case parser.AlterTableAlterColumnOptions:
+		return "ALTER COLUMN ... OPTIONS"
+	case parser.AlterTableSetForeignOptions:
+		return "OPTIONS"
+	case parser.AlterTableAlterConstraint:
+		return "ALTER CONSTRAINT"
+	case parser.AlterTableSetTablespace:
+		return "SET TABLESPACE"
+	case parser.AlterTableSetAccessMethod:
+		return "SET ACCESS METHOD"
+	case parser.AlterTableAddOf:
+		return "OF"
+	case parser.AlterTableDropOf:
+		return "NOT OF"
+	default:
+		return "ALTER COLUMN"
+	}
 }
 
 func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
@@ -7287,7 +7619,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			}
 			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Name.String())}
 		}
-		if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.ShareRowExclusiveLock); err != nil {
+		if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lmgr.ShareRowExclusiveLock); err != nil {
 			if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 				ee.Pos = s.Pos()
 			}
@@ -7310,7 +7642,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			}
 			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Name.String())}
 		}
-		if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.AccessExclusiveLock); err != nil {
+		if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lmgr.AccessExclusiveLock); err != nil {
 			if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 				ee.Pos = s.Pos()
 			}
@@ -7514,6 +7846,28 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 		return &ExecError{Code: "55000", Pos: s.Pos(),
 			Message: fmt.Sprintf("cannot alter partition %q with an incomplete detach", tbl.Name)}
 	}
+	// View-relkind guard (ATT_VIEW). PG checks every subcommand's permission
+	// (ATSimplePermissions, called from ATPrepCmd) BEFORE Phase 2 executes any
+	// of them, so a multi-action ALTER TABLE fails atomically on the first
+	// disallowed subcommand without partially applying the earlier ones. A
+	// materialized view (tbl.IsMatView) is a distinct relkind (ATT_MATVIEW,
+	// a different allow-set) and tbl.View is never populated for one
+	// (execCreateMatView never sets it) — this guard only ever fires for a
+	// plain view. postgres/src/backend/commands/tablecmds.c:6739
+	// ATSimplePermissions + the ATT_VIEW bit in the AT_* switch,
+	// tablecmds.c:4943-5282. M0134-0002 C11a.
+	if tbl.View != nil {
+		for _, act := range s.Actions {
+			if !viewAllowedAlterAction(act.Kind) {
+				// ATSimplePermissions/errdetail_relkind_not_supported never call
+				// errposition, so PG's regress .out has no "LINE N:" cursor for
+				// this error — Pos must stay 0, not act.Pos().
+				return &ExecError{Code: "42809", Pos: 0,
+					Message: fmt.Sprintf("ALTER action %s cannot be performed on relation %q", alterActionName(act.Kind), tbl.Name),
+					Detail:  "This operation is not supported for views."}
+			}
+		}
+	}
 	for _, act := range s.Actions {
 		switch act.Kind {
 		case parser.AlterTableAddColumn:
@@ -7551,14 +7905,44 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// FOR UPDATE proceeds. No-op in autocommit / for system catalogs
 			// (acquireDDLLockTxn), keeping the pg_dump-restore / HammerDB-load
 			// path lock-free. M0118-0008 (alter-table-2 isolation spec).
-			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.ShareRowExclusiveLock); err != nil {
+			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lmgr.ShareRowExclusiveLock); err != nil {
 				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 					ee.Pos = act.Pos()
 				}
 				return err
 			}
-			if _, ok := o.ctx.Catalog.LookupTable(act.RefTable, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); !ok {
+			refTbl, ok := o.ctx.Catalog.LookupTable(act.RefTable, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+			if !ok {
 				return &ExecError{Code: "42P01", Pos: act.Pos(), Message: fmt.Sprintf("relation %q does not exist", act.RefTable.String())}
+			}
+			// 42710 duplicate-name guard: an explicit CONSTRAINT name must not
+			// collide with a constraint of any kind already on the table (FK +
+			// CHECK + PK/UNIQUE/EXCLUDE index + NOT NULL). PG raises this only for
+			// an explicit conname — ATExecAddConstraint CONSTR_FOREIGN,
+			// tablecmds.c:9824-9833 → ConstraintNameIsUsed, pg_constraint.c:412;
+			// auto-named constraints skip the check via the ChooseConstraintName
+			// branch. No errposition. M0134-0002 C4.
+			if act.ConstraintName != "" && o.fkConstraintNameInUse(tbl, act.ConstraintName) {
+				return &ExecError{Code: "42710", Pos: 0, Message: fmt.Sprintf("constraint %q for relation %q already exists", act.ConstraintName, tbl.Name)}
+			}
+			// 42703 source-column check: each local column must exist on the
+			// altered table (case-sensitive, dropped-skipping — transformColumnNameList,
+			// tablecmds.c:13327-13346). No errposition. M0134-0002 C4.
+			for _, c := range act.Columns {
+				if !fkColumnExists(tbl, c) {
+					return &ExecError{Code: "42703", Pos: 0, Message: fmt.Sprintf("column %q referenced in foreign key constraint does not exist", c)}
+				}
+			}
+			// 42703 ref-column check: same scan against the referenced table,
+			// skipped entirely when no ref columns are named (PG infers the PK —
+			// transformFkeyGetPrimaryKey, tablecmds.c:13382; goopg's scan infers
+			// via pkColumns). Source columns resolve before ref columns
+			// (ATAddForeignKeyConstraint :10166 then :10192/10205). No errposition.
+			// M0134-0002 C4.
+			for _, c := range act.RefColumns {
+				if !fkColumnExists(refTbl, c) {
+					return &ExecError{Code: "42703", Pos: 0, Message: fmt.Sprintf("column %q referenced in foreign key constraint does not exist", c)}
+				}
 			}
 			// Surface the FK in pg_constraint (contype='f') so pg_dump can
 			// re-emit it: honour an explicit CONSTRAINT name, else PG's
@@ -7585,6 +7969,16 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				MatchFull:       act.MatchFull,
 				NotEnforced:     act.FKNotEnforced,
 			}
+			// 23503 existing-row scan: unless NOT VALID, ADD FOREIGN KEY validates
+			// existing rows before registering (validateForeignKeyConstraint,
+			// tablecmds.c:13694). The scan emits the byte-exact error + DETAIL
+			// with Pos 0 (assertParentExists, operators_fk.go:608) — propagate
+			// unchanged, do NOT re-wrap Pos. M0134-0002 C4.
+			if !act.NotValid {
+				if err := o.validateFKConstraintExistingRows(tbl, fk); err != nil {
+					return err
+				}
+			}
 			tbl.ForeignKeys = append(tbl.ForeignKeys, fk)
 		case parser.AlterTableValidateConstraint:
 			// VALIDATE CONSTRAINT name — validate a constraint added with
@@ -7597,7 +7991,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// inside an open transaction so a concurrent ALTER waits, while a
 			// no-op in autocommit / for system catalogs keeps the dump/load
 			// path lock-free. M0118-0008 (alter-table-1 isolation spec).
-			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.ShareUpdateExclusiveLock); err != nil {
+			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lmgr.ShareUpdateExclusiveLock); err != nil {
 				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 					ee.Pos = act.Pos()
 				}
@@ -7624,10 +8018,11 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 						// Real phase-3 dangling-reference scan (validateForeignKeyConstraint,
 						// tablecmds.c), gated exactly like PG's `if (!con->convalidated)`
 						// in ATExecValidateConstraint — an already-valid FK is a no-op.
+						// PG's FK-violation ereports carry no errposition
+						// (ri_ReportViolation, ri_triggers.c:2778), so the scan's
+						// 23503 stays Pos 0 — do NOT wrap it with act.Pos().
+						// M0134-0002 C4.
 						if err := o.validateFKConstraintExistingRows(tbl, tbl.ForeignKeys[i]); err != nil {
-							if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
-								ee.Pos = act.Pos()
-							}
 							return err
 						}
 						tbl.ForeignKeys[i].NotValid = false
@@ -7639,6 +8034,40 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if !found {
 				for i := range tbl.NamedChecks {
 					if strings.EqualFold(tbl.NamedChecks[i].Name, act.ConstraintName) {
+						// PG's ATExecValidateConstraint refuses NOT ENFORCED for
+						// every constraint type before the convalidated check
+						// (tablecmds.c:12955-12958, 55000). No errposition (Pos 0).
+						if tbl.NamedChecks[i].NotEnforced {
+							return &ExecError{Code: "55000", Pos: 0, Message: "cannot validate NOT ENFORCED constraint"}
+						}
+						// Only an unvalidated constraint is re-scanned
+						// (ATExecValidateConstraint gates on !convalidated,
+						// tablecmds.c:12960); an already-valid CHECK is a no-op.
+						// QueueCheckConstraintValidation re-reads conbin and runs
+						// the SAME 23514 scan as ADD CHECK (tablecmds.c:13116);
+						// on success convalidated 'f'→'t'. M0134-0002 C3 slice 1.
+						if tbl.NamedChecks[i].NotValid {
+							if err := o.validateCheckConstraintRows(tbl, act.ConstraintName, tbl.NamedChecks[i].Expr); err != nil {
+								return err
+							}
+							tbl.NamedChecks[i].NotValid = false
+						}
+						found = true
+						break
+					}
+				}
+			}
+			// Named NOT NULL constraints (contype='n') are validatable too. PG
+			// excludes CONSTR_NOTNULL from the Phase-3 pre-scan
+			// (ATExecValidateConstraint, tablecmds.c:9956) — there are no
+			// existing rows to scan, so the convalidated 'f'→'t' flip is the
+			// whole behavior. pg_constraint is virtual, so flipping the
+			// in-memory struct is what makes psql's \d+ re-render without the
+			// ` NOT VALID` suffix. M0134-0002 C2 slice 10.
+			if !found {
+				for i := range tbl.NotNullConstraints {
+					if strings.EqualFold(tbl.NotNullConstraints[i].Name, act.ConstraintName) {
+						tbl.NotNullConstraints[i].NotValid = false
 						found = true
 						break
 					}
@@ -7654,12 +8083,37 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// (the latent virtual-table join crash was fixed in
 			// M0097-0023-loop34). M0097-0023.
 			if act.CheckExpr != "" {
+				// PG18: NO INHERIT constraints cannot be added to partitioned
+				// tables — ATAddCheckConstraint raises 42P16
+				// (tablecmds.c). Mirrors the CREATE TABLE sibling above
+				// (same Code 42P16, same message, same %q). M0134-0002 C2.
+				if act.NoInherit && tbl.PartitionKey != nil {
+					return &ExecError{Code: "42P16", Pos: act.Pos(), Message: fmt.Sprintf("cannot add NO INHERIT constraint to partitioned table %q", tbl.Name)}
+				}
+				// Scan existing rows when the constraint is validating
+				// (not NOT VALID / not NOT ENFORCED). PG queues the constraint
+				// for ATRewriteTable's phase-3 scan when !skip_validation
+				// (ATAddCheckNNConstraint, tablecmds.c:9956) and raises 23514
+				// on a definite FALSE (tablecmds.c:6493-6498). The scan runs
+				// BEFORE registration so a failed statement leaves no in-memory
+				// constraint behind (mirrors PG, where the whole statement
+				// rolls back). An anonymous constraint uses the auto-generated
+				// name so the message matches PG's. M0134-0002 C3 slice 1.
+				if !act.NotValid && !act.CheckNotEnforced {
+					conName := act.ConstraintName
+					if conName == "" {
+						conName = o.autoCheckName(tbl, act.CheckExpr)
+					}
+					if err := o.validateCheckConstraintRows(tbl, conName, act.CheckExpr); err != nil {
+						return err
+					}
+				}
 				// act.CheckNotEnforced carries an `ADD CONSTRAINT ... CHECK
 				// (...) NOT ENFORCED` (PG18) so the dumped constraintdef
 				// re-emits the ` NOT ENFORCED` suffix (taking precedence over
 				// NOT VALID) and pg_constraint reports conenforced=false.
 				// DU-002 slice 430.
-				tbl.AddCheckFull(act.ConstraintName, act.CheckExpr, o.allocConstraintOID(act.ConstraintName), act.NotValid, false, act.CheckNotEnforced)
+				tbl.AddCheckFull(act.ConstraintName, act.CheckExpr, o.allocConstraintOID(act.ConstraintName), act.NotValid, act.NoInherit, act.CheckNotEnforced)
 				// Propagate to partition children: merge if child already has the
 				// same constraint (locally defined), otherwise inherit it. M0097-0023.
 				if im3, ok3 := o.ctx.Catalog.(*catalog.InMemory); ok3 {
@@ -7685,7 +8139,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 		case parser.AlterTableNoOp:
 			// Unknown ADD CONSTRAINT type — no-op.
 		case parser.AlterTableDropConstraint:
-			if err := o.execAlterTableDropConstraint(tbl, act); err != nil {
+			if err := o.execAlterTableDropConstraint(tbl, act, s.Only); err != nil {
 				return err
 			}
 		case parser.AlterTableAlterConstraint:
@@ -7694,7 +8148,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// enforceability, rather than adding a new one.
 			// AlterTableGetLockLevel maps AT_AlterConstraint to
 			// AccessExclusiveLock (tablecmds.c ~4703).
-			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.AccessExclusiveLock); err != nil {
+			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lmgr.AccessExclusiveLock); err != nil {
 				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 					ee.Pos = act.Pos()
 				}
@@ -7728,6 +8182,35 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			childTbl, ok := o.ctx.Catalog.LookupTable(poc.Parent, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			if !ok {
 				break // child doesn't exist yet, skip
+			}
+			// M0134-0002 C9 residual (S4): reject a circular attach — the table
+			// being attached (attachrel) is the ALTER target (the prospective
+			// parent) itself, or the target is one of the child's OWN descendants.
+			// Mirrors ATExecAttachPartition's find_all_inheritors(attachrel)
+			// membership test (postgres/src/backend/commands/tablecmds.c:20338-20362),
+			// which catches both self-attach and a back-edge with
+			// ERRCODE_DUPLICATE_TABLE 42P07 — NOT 42P17 (the design-doc/ledger
+			// placeholder is not a real SQLSTATE). allDescendants walks the CHILD's
+			// descendants (BFS over InheritanceChildren ∪ PartitionChildren, so
+			// ATTACH links are covered) and looks for the PARENT; the parent's own
+			// descendants are NOT walked. errdetail names parent then child — the
+			// exact PG argument order (RelationGetRelationName(rel) then
+			// RelationGetRelationName(attachrel)). No errhint, Pos 0.
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				isCycle := childTbl.OID == tbl.OID
+				if !isCycle {
+					for _, d := range allDescendants(im, childTbl, 0) {
+						if d.OID == tbl.OID {
+							isCycle = true
+							break
+						}
+					}
+				}
+				if isCycle {
+					return &ExecError{Code: "42P07", Pos: 0,
+						Message: "circular inheritance not allowed",
+						Detail:  fmt.Sprintf("%q is already a child of %q.", tbl.Name, childTbl.Name)}
+				}
 			}
 			// Lock the parent's existing DEFAULT partition AccessExclusive for the
 			// attaching transaction — PG ATExecAttachPartition locks it first
@@ -7846,6 +8329,11 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				}
 				if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 					im.RegisterPartitionChild(tbl.OID, childTbl.OID)
+					// M0134-0002 C9 residual (S2): mark the child's same-named
+					// columns Inherited so the inherited-DDL guards (DROP / RENAME /
+					// ALTER TYPE) fire on an ATTACHed partition. Mirrors PG's
+					// MergeAttributesIntoExisting (tablecmds.c:17500).
+					markAttachedColumnsInherited(tbl, childTbl)
 				}
 			}
 			// Propagate parent unique/PK indexes to the newly attached child
@@ -7966,7 +8454,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					}
 					return ferr
 				}
-				epoch := mvcc.NextPartitionDetachEpoch()
+				epoch := transam.NextPartitionDetachEpoch()
 				im.MarkPartitionDetachPending(childTbl.OID, epoch)
 				// The wait is HYBRID, because goopg's locks are statement-scoped
 				// and BEGIN takes a snapshot — neither alone reproduces upstream's
@@ -8053,6 +8541,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				}
 				// Phase 2: finalize the detach.
 				im.UnregisterPartitionChild(tbl.OID, childTbl.OID)
+				clearAttachedColumnsInherited(tbl, childTbl)
 				childTbl.PartitionParentOID = 0
 				childTbl.PartitionBounds = nil
 				im.ClearPartitionDetachPending(childTbl.OID)
@@ -8078,13 +8567,14 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				// acquires+releases transiently in autocommit (the wait still
 				// happens during acquisition). The wait is rendered `<waiting ...>`
 				// by the runner's timing.
-				if werr := o.ctx.acquireRelLockMaybeTransient(o.ctx.Catalog.RelFileNode(childTbl), lockmgr.AccessExclusiveLock); werr != nil {
+				if werr := o.ctx.acquireRelLockMaybeTransient(o.ctx.Catalog.RelFileNode(childTbl), lmgr.AccessExclusiveLock); werr != nil {
 					if ee, ok := werr.(*ExecError); ok && ee.Pos == 0 {
 						ee.Pos = act.Pos()
 					}
 					return werr
 				}
 				im.UnregisterPartitionChild(tbl.OID, childTbl.OID)
+				clearAttachedColumnsInherited(tbl, childTbl)
 				childTbl.PartitionParentOID = 0
 				childTbl.PartitionBounds = nil
 				im.ClearPartitionDetachPending(childTbl.OID)
@@ -8180,24 +8670,46 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			oldColName := act.OldColumnName
 			newColName := act.NewName
 
+			// M0134-0002 C9: `ONLY` on a parent that has children is refused
+			// BEFORE the column-existence lookup, mirroring renameatt_internal's
+			// not-recursing branch (postgres/src/backend/commands/tablecmds.c:3912-3917).
+			// PG emits no errposition here, so Pos is 0. 42P16.
+			if s.Only && o.hasInheritanceChildren(tbl) {
+				return &ExecError{Code: "42P16", Pos: 0, Message: fmt.Sprintf("inherited column %q must be renamed in child tables too", oldColName)}
+			}
+
 			// Check old column exists.
-			colExists := false
-			for _, col := range tbl.Columns {
+			colIdx := -1
+			for i, col := range tbl.Columns {
 				if strings.EqualFold(col.Name, oldColName) {
-					colExists = true
+					colIdx = i
 					break
 				}
 			}
-			if !colExists {
+			if colIdx < 0 {
 				return &ExecError{Code: "42703", Pos: act.Pos(), Message: fmt.Sprintf("column %q does not exist", oldColName)}
 			}
 
-			// Check new name is not a system column name.
-			sysColumns := []string{"ctid", "tableoid", "xmin", "cmin", "xmax", "cmax", "oid"}
-			for _, sc := range sysColumns {
-				if strings.EqualFold(newColName, sc) {
-					return &ExecError{Code: "42P20", Pos: act.Pos(), Message: fmt.Sprintf("column name %q conflicts with a system column name", newColName)}
-				}
+			// Check new name is not a system column name. M0134-0002 C8: PG
+			// rejects via check_for_column_name_collision (tablecmds.c:7670-7674),
+			// SQLSTATE 42701 (not 42P20), using SystemAttributeByName — an exact,
+			// case-sensitive strcmp match (heap.c:248), so "oid" is legal since
+			// PG 12 and quoted "XMIN" is accepted. Pos 0: the PG ereport carries
+			// no errposition.
+			if isSystemColumn(newColName) {
+				return &ExecError{Code: "42701", Pos: 0, Message: fmt.Sprintf("column name %q conflicts with a system column name", newColName)}
+			}
+
+			// M0134-0002 C9: an inherited column cannot be renamed unless the
+			// recursion is coming from its parent (attinhcount > expected_parents,
+			// renameatt_internal, tablecmds.c:3960-3964). goopg does not yet recurse
+			// RENAME COLUMN into children, so the plain guard is correct. The
+			// colStillInherited live-hierarchy check keeps the guard off stale
+			// Inherited flags (a parent-side DROP COLUMN leaves the child flag set;
+			// NO INHERIT clears it in the catalog but the flag lingers until then).
+			// PG emits no errposition here, so Pos is 0. 42P16.
+			if tbl.Columns[colIdx].Inherited && o.colStillInherited(tbl, oldColName) {
+				return &ExecError{Code: "42P16", Pos: 0, Message: fmt.Sprintf("cannot rename inherited column %q", oldColName)}
 			}
 
 			// Check inheritance children for name conflict.
@@ -8281,6 +8793,164 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					return fmt.Errorf("DDL catalog sync: %w", syncErr)
 				}
 			}
+		case parser.AlterTableRenameConstraint:
+			// ALTER TABLE name RENAME CONSTRAINT old TO new. Renames an existing
+			// constraint in place with its OID stable, mirroring PG's
+			// rename_constraint_internal (tablecmds.c:4047). The constraint is
+			// found by name across the same four stores as the drop path
+			// (execAlterTableDropConstraint): CHECK → FK → UNIQUE → EXCLUDE → PK.
+			// For UNIQUE/PK/EXCLUDE the constraint name IS the backing index name
+			// (pg_constraint.conindid), so the rename re-keys the index via
+			// InMemory.RenameIndex — PG does the same (RenameRelationInternal on
+			// conindid, tablecmds.c:4129-4134).
+			//
+			// Error codes match PG: 42704
+			// `constraint "%s" for table "%s" does not exist`
+			// (get_relation_constraint_oid, pg_constraint.c:1234) when nothing
+			// carries the old name; 42710
+			// `constraint "%s" for relation "%s" already exists`
+			// (RenameConstraintById, pg_constraint.c:1025) for a CHECK/FK name
+			// collision; 42P07 `relation "%s" already exists`
+			// (RenameRelationInternal, tablecmds.c:4303-4307) for the
+			// index-backed path. M0134-0002 C2.
+			oldName := act.OldConstraintName
+			newName := act.NewName
+			dbOidRC := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+
+			// constraintNameInUse mirrors PG's ConstraintNameIsUsed(CONSTRAINT_RELATION,
+			// conrelid, newname): a collision with ANY constraint kind on the
+			// relation blocks a CHECK/FK rename (pg_constraint.c:1019-1026). The
+			// constraint being renamed still carries oldName at this point, so a
+			// self-rename (old == new) is caught exactly as PG catches it.
+			constraintNameInUse := func(name string) bool {
+				for _, nc := range tbl.NamedChecks {
+					if strings.EqualFold(nc.Name, name) {
+						return true
+					}
+				}
+				for _, fk := range tbl.ForeignKeys {
+					if strings.EqualFold(fk.Name, name) {
+						return true
+					}
+				}
+				for _, nn := range tbl.NotNullConstraints {
+					if strings.EqualFold(nn.Name, name) {
+						return true
+					}
+				}
+				for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl, dbOidRC) {
+					if (idx.Unique && idx.IsConstraint) || idx.Primary || idx.IsExclusion {
+						if strings.EqualFold(idx.Name, name) {
+							return true
+						}
+					}
+				}
+				return false
+			}
+
+			// 1. CHECK constraints — checked before PK so an inherited check
+			// takes priority, mirroring the drop path.
+			for i, nc := range tbl.NamedChecks {
+				if !strings.EqualFold(nc.Name, oldName) {
+					continue
+				}
+				// M0134-0002 C9: inherited-constraint guards, mirroring
+				// rename_constraint_internal (tablecmds.c:4112-4126). PG gates the
+				// whole block on `contype == CHECK || NOTNULL && !con->connoinherit`
+				// (tablecmds.c:4086-4089): a NO INHERIT constraint is exempt from
+				// both refusals. The ONLY-with-children refusal comes first (else
+				// branch, fired before the coninhcount test); then a constraint
+				// inherited from a parent outside the processed hierarchy is
+				// refused outright. Both 42P16; PG emits no errposition, so Pos 0.
+				if s.Only && o.hasInheritanceChildren(tbl) && !nc.NoInherit {
+					return &ExecError{Code: "42P16", Pos: 0, Message: fmt.Sprintf("inherited constraint %q must be renamed in child tables too", oldName)}
+				}
+				if nc.InhCount > 0 && !nc.NoInherit {
+					return &ExecError{Code: "42P16", Pos: 0, Message: fmt.Sprintf("cannot rename inherited constraint %q", oldName)}
+				}
+				if constraintNameInUse(newName) {
+					return &ExecError{Code: "42710", Pos: act.Pos(), Message: fmt.Sprintf("constraint %q for relation %q already exists", newName, tbl.Name)}
+				}
+				tbl.NamedChecks[i].Name = newName
+				// Cascade to partition children: rename the inherited copy in
+				// each child, mirroring the drop cascade at :9873-9883.
+				if imRC, okRC := o.ctx.Catalog.(*catalog.InMemory); okRC {
+					for _, childTbl := range imRC.PartitionChildren(tbl.OID) {
+						for j := range childTbl.NamedChecks {
+							if strings.EqualFold(childTbl.NamedChecks[j].Name, oldName) {
+								childTbl.NamedChecks[j].Name = newName
+								break
+							}
+						}
+					}
+				}
+				return nil
+			}
+
+			// 2. FOREIGN KEY constraints.
+			for i, fk := range tbl.ForeignKeys {
+				if !strings.EqualFold(fk.Name, oldName) {
+					continue
+				}
+				if constraintNameInUse(newName) {
+					return &ExecError{Code: "42710", Pos: act.Pos(), Message: fmt.Sprintf("constraint %q for relation %q already exists", newName, tbl.Name)}
+				}
+				tbl.ForeignKeys[i].Name = newName
+				return nil
+			}
+
+			// 3. UNIQUE constraints — index-backed (constraint name == index
+			// name), so the rename re-keys the index.
+			var renameIdx *catalog.Index
+			for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl, dbOidRC) {
+				if !idx.Primary && idx.Unique && idx.IsConstraint && strings.EqualFold(idx.Name, oldName) {
+					renameIdx = idx
+					break
+				}
+			}
+			// 3.5. EXCLUDE constraints.
+			if renameIdx == nil {
+				for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl, dbOidRC) {
+					if idx.IsExclusion && strings.EqualFold(idx.Name, oldName) {
+						renameIdx = idx
+						break
+					}
+				}
+			}
+			// 4. PRIMARY KEY constraints.
+			if renameIdx == nil {
+				for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl, dbOidRC) {
+					if idx.Primary && strings.EqualFold(idx.Name, oldName) {
+						renameIdx = idx
+						break
+					}
+				}
+			}
+			if renameIdx == nil {
+				return &ExecError{Code: "42704", Pos: act.Pos(), Message: fmt.Sprintf("constraint %q for table %q does not exist", oldName, tbl.Name)}
+			}
+			imRC, okRC := o.ctx.Catalog.(*catalog.InMemory)
+			if !okRC {
+				return &ExecError{Code: "XX000", Pos: act.Pos(), Message: "catalog does not support index rename"}
+			}
+			oldObjName := parser.ObjectName{Schema: renameIdx.Schema, Name: oldName}
+			newObjName := parser.ObjectName{Schema: renameIdx.Schema, Name: newName}
+			// RenameIndex renames index AND constraint in one call (constraint
+			// name == index name), wrapping any name collision as 42P07 exactly
+			// as ALTER INDEX RENAME does.
+			if err := imRC.RenameIndex(oldObjName, newObjName, dbOidRC); err != nil {
+				return &ExecError{Code: "42P07", Pos: act.Pos(), Message: err.Error()}
+			}
+			// The index name lives in pg_class.relname (not pg_index), so
+			// rewrite the index's pg_class heap row with the new name for
+			// restart durability (loadUserIndexesFromHeap), mirroring ALTER
+			// INDEX RENAME's resyncIndexClassHeapRow step.
+			if catalogHeapSyncAvailable(o.ctx) {
+				if syncErr := resyncIndexClassHeapRow(o.ctx, renameIdx); syncErr != nil {
+					return syncErr
+				}
+			}
+			return nil
 		case parser.AlterTableInherit:
 			// INHERIT parent_table — register the named table as a parent of tbl
 			// so that scanning the parent includes tbl's rows (M0097-0048).
@@ -8291,7 +8961,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// Take a transaction-scoped AccessExclusiveLock on the child being added
 			// to the inheritance tree, mirroring PG ATExecAddInherit. No-op in
 			// autocommit / for system catalogs. M0118-0008 (alter-table-4).
-			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.AccessExclusiveLock); err != nil {
+			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lmgr.AccessExclusiveLock); err != nil {
 				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 					ee.Pos = act.Pos()
 				}
@@ -8355,7 +9025,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// a concurrent SELECT on the parent that still includes this child (the
 			// unlink is deferred to commit below) blocks on this lock until commit.
 			// No-op in autocommit / for system catalogs. M0118-0008 (alter-table-4).
-			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.AccessExclusiveLock); err != nil {
+			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lmgr.AccessExclusiveLock); err != nil {
 				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 					ee.Pos = act.Pos()
 				}
@@ -8377,6 +9047,24 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					im.MarkInheritanceChangePending()
 				} else {
 					im.UnregisterInheritanceChild(parentTbl.OID, tbl.OID)
+				}
+			}
+			// M0134-0002 C9: clear the Inherited flag on the columns that came from
+			// this parent (PG decrements attinhcount per parent, ATExecDropInherit
+			// tablecmds.c ~17000). Without this the C9 inherited-DDL guards would
+			// keep firing on a now-local column after NO INHERIT (the atacc3 regress
+			// case), refusing renames/drops PG allows. A column shared with another
+			// surviving parent stays flagged — only single-parent columns flip here;
+			// per-parent attinhcount is the follow-up bookkeeping slice.
+			for i := range tbl.Columns {
+				if !tbl.Columns[i].Inherited {
+					continue
+				}
+				for _, pc := range parentTbl.Columns {
+					if strings.EqualFold(pc.Name, tbl.Columns[i].Name) {
+						tbl.Columns[i].Inherited = false
+						break
+					}
 				}
 			}
 		case parser.AlterTableSetStorage:
@@ -8912,9 +9600,10 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// populated at CREATE TABLE, so the change is flushed via
 			// delete-old-rows + re-sync. DU-002 slice 270.
 			found := false
+			colIdx := -1
 			for i := range tbl.Columns {
 				if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
-					tbl.Columns[i].NotNull = true
+					colIdx = i
 					found = true
 					break
 				}
@@ -8923,6 +9612,24 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				return &ExecError{Code: "42703", Pos: act.Pos(),
 					Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
 			}
+			// Scan existing rows for NULLs BEFORE mutating in-memory state so a
+			// failed statement (23502) leaves no trace. PG's ATExecSetNotNull
+			// queues a phase-3 verify_new_notnull scan (tablecmds.c:8057 →
+			// ATRewriteTable :6450-6463) that aborts at the FIRST NULL with a
+			// single 23502 — distinct from the INSERT/UPDATE runtime wording
+			// (`null value in column %q ... violates not-null constraint`,
+			// operators_fk.go:1831). No errposition, so Pos stays 0.
+			// M0134-0002 C3 slice 1.
+			if err := o.forEachLiveRow(tbl, func(row Row) error {
+				if row[colIdx].IsNull() {
+					return &ExecError{Code: "23502", Pos: 0,
+						Message: fmt.Sprintf("column %q of relation %q contains null values", act.ColumnName, tbl.Name)}
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+			tbl.Columns[colIdx].NotNull = true
 			// Add a named NOT NULL constraint unless one already exists for the
 			// column (SET NOT NULL is idempotent in PG — no duplicate row).
 			hasNN := false
@@ -8935,7 +9642,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if !hasNN {
 				if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 					name := strings.ToLower(tbl.Name) + "_" + strings.ToLower(act.ColumnName) + "_not_null"
-					tbl.AddNotNull(name, act.ColumnName, im.AllocOID(), false, true, 0)
+					tbl.AddNotNull(name, act.ColumnName, im.AllocOID(), false, false, true, 0)
 				}
 			}
 			if catalogHeapSyncAvailable(o.ctx) {
@@ -8994,9 +9701,10 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// pg_attribute.attnotnull flush goes through the same delete-old-rows
 			// + syncTableToCatalogHeap path as SET NOT NULL. DU-002 slice 271.
 			found := false
+			colIdx := -1
 			for i := range tbl.Columns {
 				if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
-					tbl.Columns[i].NotNull = true
+					colIdx = i
 					found = true
 					break
 				}
@@ -9005,6 +9713,21 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				return &ExecError{Code: "42703", Pos: act.Pos(),
 					Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
 			}
+			// Scan existing rows for NULLs BEFORE mutating in-memory state (same
+			// 23502 scan as SET NOT NULL; NOT VALID defers validation, mirroring
+			// PG's skip_validation). M0134-0002 C3 slice 1.
+			if !act.NotValid {
+				if err := o.forEachLiveRow(tbl, func(row Row) error {
+					if row[colIdx].IsNull() {
+						return &ExecError{Code: "23502", Pos: 0,
+							Message: fmt.Sprintf("column %q of relation %q contains null values", act.ColumnName, tbl.Name)}
+					}
+					return nil
+				}); err != nil {
+					return err
+				}
+			}
+			tbl.Columns[colIdx].NotNull = true
 			// Idempotent: a column already carrying a NOT NULL constraint is left
 			// as-is (PG raises no error and adds no duplicate row).
 			hasNN := false
@@ -9020,7 +9743,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					if name == "" {
 						name = strings.ToLower(tbl.Name) + "_" + strings.ToLower(act.ColumnName) + "_not_null"
 					}
-					tbl.AddNotNull(name, act.ColumnName, im.AllocOID(), act.NoInherit, true, 0)
+					tbl.AddNotNull(name, act.ColumnName, im.AllocOID(), act.NoInherit, act.NotValid, true, 0)
 				}
 			}
 			if catalogHeapSyncAvailable(o.ctx) {
@@ -9035,17 +9758,137 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				}
 			}
 		case parser.AlterTableAlterColumnType:
-			if err := o.execAlterColumnType(tbl, act); err != nil {
+			if err := o.execAlterColumnType(tbl, act, s.Only); err != nil {
 				return err
 			}
 		case parser.AlterTableDropColumn:
-			if err := o.execAlterDropColumn(tbl, act); err != nil {
+			if err := o.execAlterDropColumn(tbl, act, s.Only); err != nil {
+				return err
+			}
+		case parser.AlterTableAddOf:
+			if err := o.execAlterTableAddOf(tbl, act); err != nil {
+				return err
+			}
+		case parser.AlterTableDropOf:
+			if err := o.execAlterTableDropOf(tbl, act); err != nil {
 				return err
 			}
 		default:
 			return &ExecError{Code: "0A000", Pos: act.Pos(), Message: "ALTER TABLE action is not supported in v0"}
 		}
 	}
+	return nil
+}
+
+// typeArgsEqual reports whether two column-type typmod argument slices are
+// equal element-for-element (empty == nil). Used by execAlterTableAddOf's
+// strict type match, which mirrors PG's atttypmod comparison
+// (postgres/src/backend/commands/tablecmds.c:18296-18298).
+func typeArgsEqual(a, b []int64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// execAlterTableAddOf implements `ALTER TABLE … OF type_name` (PG AT_AddOf,
+// postgres/src/backend/commands/tablecmds.c:18216-18349), re-tagging an
+// existing table as a typed table of the named composite type. Validation is
+// order-strict and position-by-position, mirroring ATExecAddOf: the composite
+// type's (compacted) fields pair with the table's non-dropped columns in order
+// — attnotnull need not match — and any leftover non-dropped table column is an
+// error. The 42804/42809 messages and SQLSTATEs are byte-exact against PG 18.3.
+// Success (re)stamps pg_class.reloftype via tbl.OfTypeOID; goopg tracks no
+// table↔type dependency, so overwriting the OID is all that's needed, and the
+// virtual pg_class builder (catalog.go:7217) surfaces it to pg_dump / \d with
+// no heap re-sync (SET RELOPTIONS precedent, operators_ddl.go:8926-8937).
+// M0134-0002 C2 slice 11.
+func (o *ddlOp) execAlterTableAddOf(tbl *catalog.Table, act parser.AlterTableAction) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return &ExecError{Code: "0A000", Pos: act.Pos(), Message: "typed tables are not supported on this catalog"}
+	}
+	ct := im.LookupCompositeType(act.OfType.Name)
+	if ct == nil {
+		// Same message the CREATE TABLE … OF arm emits (execCreateTable,
+		// operators_ddl.go:1747-1751) — do not invent a new one.
+		return &ExecError{Code: "42704", Pos: act.Pos(),
+			Message: fmt.Sprintf("type %q does not exist", act.OfType.String())}
+	}
+	// Fail if the table has any inheritance parents (pg_inherits scan,
+	// tablecmds.c:18240-18253).
+	if len(tbl.InheritsParentOIDs) > 0 || tbl.PartitionParentOID != 0 {
+		return &ExecError{Code: "42809", Pos: act.Pos(), Message: "typed tables cannot inherit"}
+	}
+	// Check the tuple descriptors for compatibility. Unlike inheritance, we
+	// require that the order also match. However, attnotnull need not match.
+	// tablecmds.c:18255-18317.
+	colIdx := 0
+	for _, f := range ct.Fields {
+		// Get the next non-dropped table attribute.
+		var col *catalog.Column
+		for {
+			if colIdx >= len(tbl.Columns) {
+				return &ExecError{Code: "42804", Pos: act.Pos(),
+					Message: fmt.Sprintf("table is missing column %q", f.Name)}
+			}
+			c := &tbl.Columns[colIdx]
+			colIdx++
+			if !c.Dropped {
+				col = c
+				break
+			}
+		}
+		// Compare name.
+		if !strings.EqualFold(col.Name, f.Name) {
+			return &ExecError{Code: "42804", Pos: act.Pos(),
+				Message: fmt.Sprintf("table has column %q where type requires %q", col.Name, f.Name)}
+		}
+		// Compare type (atttypid, atttypmod, attcollation). Derive the expected
+		// canonical catalog.Type exactly as the CREATE path's addCol does
+		// (operators_ddl.go:1917-1961): split the field's ColType string via
+		// compositeFieldColumnType and resolve any domain to its base type.
+		ctt := compositeFieldColumnType(f.ColType)
+		typeName := strings.ToLower(ctt.Name)
+		if resolved := im.ResolveColumnType(typeName); resolved != typeName {
+			typeName = resolved
+		}
+		expected := catalog.Type{Name: typeName, Args: append([]int64(nil), ctt.Args...), IsArray: ctt.IsArray}
+		if expected.Name != col.Type.Name || expected.IsArray != col.Type.IsArray ||
+			!typeArgsEqual(expected.Args, col.Type.Args) || f.Collation != col.Collation {
+			return &ExecError{Code: "42804", Pos: act.Pos(),
+				Message: fmt.Sprintf("table %q has different type for column %q", tbl.Name, f.Name)}
+		}
+	}
+	// Any remaining columns at the end of the table had better be dropped
+	// (tablecmds.c:18306-18317).
+	for ; colIdx < len(tbl.Columns); colIdx++ {
+		c := tbl.Columns[colIdx]
+		if !c.Dropped {
+			return &ExecError{Code: "42804", Pos: act.Pos(),
+				Message: fmt.Sprintf("table has extra column %q", c.Name)}
+		}
+	}
+	tbl.OfTypeOID = ct.OID
+	return nil
+}
+
+// execAlterTableDropOf implements `ALTER TABLE … NOT OF` (PG AT_DropOf,
+// postgres/src/backend/commands/tablecmds.c:18358-18390): clear reloftype. If
+// the table was never a typed table, raise 42809 `"%s" is not a typed table`
+// (relname). No column changes are made — tbl.OfTypeOID is the sole "is typed"
+// signal, so clearing it is all that's required. M0134-0002 C2 slice 11.
+func (o *ddlOp) execAlterTableDropOf(tbl *catalog.Table, act parser.AlterTableAction) error {
+	if tbl.OfTypeOID == 0 {
+		return &ExecError{Code: "42809", Pos: act.Pos(),
+			Message: fmt.Sprintf("%q is not a typed table", tbl.Name)}
+	}
+	tbl.OfTypeOID = 0
 	return nil
 }
 
@@ -9217,6 +10060,47 @@ func (o *ddlOp) execAlterTableResetReloptions(tbl *catalog.Table, act parser.Alt
 
 func (o *ddlOp) execAlterTableAddColumn(stmt *parser.AlterTableStmt, tbl *catalog.Table, act parser.AlterTableAction) error {
 	col := act.Column
+	// M0134-0002 C9 residual (S1): PG refuses ADD COLUMN on a partition child
+	// with 42809 ERRCODE_WRONG_OBJECT_TYPE, no errdetail, no errhint, Pos 0.
+	// This is the FIRST check in ATExecAddColumn — before the system-column
+	// collision check and before the if-not-exists NOTICE — gated on
+	// `relispartition && !recursing` (postgres/src/backend/commands/
+	// tablecmds.c:7247-7250). IsPartitionChild consults the live
+	// partitionChildren map, so it covers BOTH CREATE TABLE … PARTITION OF and
+	// ALTER TABLE … ATTACH PARTITION — Table.PartitionParentOID is 0 for the
+	// latter (the regress part_2 is ATTACHed), so that field must not gate this.
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && im.IsPartitionChild(tbl.OID) {
+		return &ExecError{Code: "42809", Pos: 0, Message: "cannot add column to a partition"}
+	}
+	// M0134-0002 C8: PG rejects ADD COLUMN whose name collides with a system
+	// column (check_for_column_name_collision, postgres/src/backend/commands/
+	// tablecmds.c:7670-7674 — attnum <= 0 test). Exact, case-sensitive. Pos is
+	// left 0: the PG ereport carries no errposition, so psql renders no LINE 1.
+	if isSystemColumn(col.Name) {
+		return &ExecError{Code: "42701", Pos: 0,
+			Message: fmt.Sprintf("column name %q conflicts with a system column name", col.Name)}
+	}
+	// M0134-0002 C2: `ADD COLUMN IF NOT EXISTS` on an existing column emits
+	// PG's NOTICE and skips instead of raising 42701. Mirrors
+	// check_for_column_name_collision's if_not_exists branch
+	// (postgres/src/backend/commands/tablecmds.c:7677-7684): the system-column
+	// collision check above still errors first (attnum <= 0 test), exactly as
+	// PG does even with if_not_exists set.
+	if act.IfExists {
+		if _, exists := o.ctx.Catalog.LookupColumn(tbl, col.Name); exists {
+			o.ctx.AddNotice(fmt.Sprintf("column %q of relation %q already exists, skipping", col.Name, tbl.Name))
+			return nil
+		}
+	}
+	// M0134-0002 C9: `ADD COLUMN ... ONLY` on a parent that has children is
+	// refused — the addition would put the children out of step. Mirrors
+	// ATExecAddColumn's `children && !recurse` refusal
+	// (postgres/src/backend/commands/tablecmds.c:7596-7603); children covers
+	// both INHERITS children and PARTITION OF partitions (pg_inherits). PG emits
+	// no errposition here, so Pos is 0. 42P16.
+	if stmt.Only && o.hasInheritanceChildren(tbl) {
+		return &ExecError{Code: "42P16", Pos: 0, Message: "column must be added to child tables too"}
+	}
 	if col.NotNull {
 		rel := o.ctx.Catalog.RelFileNode(tbl)
 		n, err := o.ctx.Pool.NBlocks(rel)
@@ -9491,6 +10375,35 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 	if err := o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, true, true, false, nil, nil); err != nil {
 		return err
 	}
+	// M0134-0002 C3 slice 2: PG's ATRewriteTable verify scan
+	// (tablecmds.c:6456-6462) raises 23502 on the first NULL in any PK
+	// column. The index build above (AT_PASS_ADD_INDEX, pass 3) runs
+	// FIRST, so a table with BOTH a duplicate and a NULL reports the
+	// 23505 from createBTreeIndex and only a NULL-only table reaches
+	// this scan — matching PG's pass ordering (dup at index build, null
+	// at phase-2 verify). ADD UNIQUE deliberately does not run this scan
+	// (NULLs are distinct by default). No errposition — Pos stays 0.
+	pkv := make([]int, 0, len(act.Columns))
+	for _, pkCol := range act.Columns {
+		col, ok := o.ctx.Catalog.LookupColumn(tbl, pkCol)
+		if !ok {
+			continue
+		}
+		pkv = append(pkv, col.Ordinal)
+	}
+	if len(pkv) > 0 {
+		if err := o.forEachLiveRow(tbl, func(row Row) error {
+			for _, ci := range pkv {
+				if row[ci].IsNull() {
+					return &ExecError{Code: "23502", Pos: 0,
+						Message: fmt.Sprintf("column %q of relation %q contains null values", tbl.Columns[ci].Name, tbl.Name)}
+				}
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
 	if idx, ok := o.ctx.Catalog.LookupIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok {
 		idx.IsConstraint = true
 		idx.IncludeColumns = act.IncludeColumns
@@ -9523,7 +10436,7 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 		}
 		if !hasConstraint {
 			nnName := strings.ToLower(tbl.Name) + "_" + strings.ToLower(col.Name) + "_not_null"
-			tbl.AddNotNull(nnName, col.Name, im.AllocOID(), false, true, 0)
+			tbl.AddNotNull(nnName, col.Name, im.AllocOID(), false, false, true, 0)
 		}
 	}
 	return nil
@@ -9797,7 +10710,13 @@ func (o *ddlOp) execAlterTableAddExclude(tbl *catalog.Table, act parser.AlterTab
 // added DU-002 slice 433 follow-up (previously misreported 42704 for a real
 // constraint of either kind — see deferral ledger).
 // M0097-0036 / functional_deps / M0097-0023.
-func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.AlterTableAction) error {
+// execAlterTableDropConstraint handles `ALTER TABLE t DROP CONSTRAINT name
+// [RESTRICT|CASCADE]`. `only` is true for `ALTER TABLE ONLY` (recurse=false):
+// with ONLY the constraint is removed from the parent only and the children's
+// inherited copies are left intact (dropconstraint_internal,
+// postgres/src/backend/commands/tablecmds.c:14025-14110), so the child cascade
+// below is skipped.
+func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.AlterTableAction, only bool) error {
 	im, isIM := o.ctx.Catalog.(*catalog.InMemory)
 
 	// 1. Check constraints: handle before PK so inherited check takes priority.
@@ -9805,11 +10724,15 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 		if !strings.EqualFold(nc.Name, act.ConstraintName) {
 			continue
 		}
-		// Cannot drop an inherited constraint (coninhcount > 0).
+		// Cannot drop an inherited constraint (coninhcount > 0, not recursing).
+		// Mirrors dropconstraint_internal
+		// (postgres/src/backend/commands/tablecmds.c:14102-14107), SQLSTATE
+		// 42P16 (ERRCODE_INVALID_TABLE_DEFINITION). PG emits no errposition, so
+		// Pos is 0. M0134-0002 C9.
 		if nc.InhCount > 0 {
 			return &ExecError{
-				Code:    "42704",
-				Pos:     act.Pos(),
+				Code:    "42P16",
+				Pos:     0,
 				Message: fmt.Sprintf("cannot drop inherited constraint %q of relation %q", act.ConstraintName, tbl.Name),
 			}
 		}
@@ -9817,7 +10740,10 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 		tbl.CheckConstraints = append(tbl.CheckConstraints[:i], tbl.CheckConstraints[i+1:]...)
 		tbl.NamedChecks = append(tbl.NamedChecks[:i], tbl.NamedChecks[i+1:]...)
 		// Cascade to partition children: drop the inherited copy from each child.
-		if isIM {
+		// ONLY (recurse=false) must NOT propagate — PG's dropconstraint_internal
+		// removes the constraint from the parent only, leaving each child's
+		// inherited copy (coninhcount) intact (tablecmds.c:14025-14110).
+		if isIM && !only {
 			for _, childTbl := range im.PartitionChildren(tbl.OID) {
 				for j, cnc := range childTbl.NamedChecks {
 					if strings.EqualFold(cnc.Name, act.ConstraintName) {
@@ -9887,7 +10813,17 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 			break
 		}
 	}
+	// M0134-0002 C2: `DROP CONSTRAINT IF EXISTS` on a missing constraint emits
+	// PG's NOTICE and skips instead of raising 42704 — but only at this
+	// fall-through after all five kinds (NamedChecks/FKs/UNIQUE/EXCLUDE/PK)
+	// missed. Mirrors ATExecDropConstraint's if_exists branch
+	// (postgres/src/backend/commands/tablecmds.c:14060-14062). A real constraint
+	// of any kind is handled above and must never be skipped.
 	if pkIdx == nil {
+		if act.IfExists {
+			o.ctx.AddNotice(fmt.Sprintf("constraint %q of relation %q does not exist, skipping", act.ConstraintName, tbl.Name))
+			return nil
+		}
 		return &ExecError{
 			Code:    "42704",
 			Pos:     act.Pos(),
@@ -10015,6 +10951,133 @@ func (o *ddlOp) nonFKConstraintExists(tbl *catalog.Table, name string) bool {
 	return false
 }
 
+// forEachLiveRow invokes fn for every live heap row of tbl. The row passed to
+// fn is a reused decode buffer and is only valid for the duration of the call.
+// Iterates with the same page-Pin loop as validateFKConstraintExistingRows and
+// collectBTreeEntries: the simplified "Xmin valid, Xmax invalid" liveness check
+// (no snapshot MVCC visibility), the established pattern for DDL-time
+// existing-row scans. Aborts on the first fn error, unpinning the current page.
+// M0134-0002 C3 slice 1 (shared by the ADD CHECK / SET NOT NULL / VALIDATE
+// CHECK scans).
+func (o *ddlOp) forEachLiveRow(tbl *catalog.Table, fn func(row Row) error) error {
+	rel := o.ctx.Catalog.RelFileNode(tbl)
+	nBlocks, err := o.ctx.Pool.NBlocks(rel)
+	if err != nil {
+		return &ExecError{Code: "XX000", Message: err.Error()}
+	}
+	sctx := mmgr.Acquire(o.ctx.Mctx, mmgr.KindExpr)
+	defer sctx.Release()
+	var scanRow Row
+	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
+		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+		if err != nil {
+			return &ExecError{Code: "XX000", Message: err.Error()}
+		}
+		page := slot.Page()
+		if storage.IsNew(page) {
+			o.ctx.Pool.Unpin(slot)
+			continue
+		}
+		count, err := storage.PageLinePointerCount(page)
+		if err != nil {
+			o.ctx.Pool.Unpin(slot)
+			return &ExecError{Code: "XX000", Message: err.Error()}
+		}
+		for i := uint16(1); i <= uint16(count); i++ {
+			tuple, terr := storage.PageGetHeapTuple(page, i)
+			if terr != nil {
+				continue
+			}
+			if tuple.Header.Xmin == storage.InvalidTransactionID || tuple.Header.Xmax != storage.InvalidTransactionID {
+				continue
+			}
+			if scanRow == nil || len(scanRow) != len(tbl.Columns) {
+				scanRow = make(Row, len(tbl.Columns))
+			}
+			if decErr := DecodeHeapTupleRowInto(scanRow, tbl.Columns, tuple, sctx); decErr != nil {
+				continue
+			}
+			if fnErr := fn(scanRow); fnErr != nil {
+				o.ctx.Pool.Unpin(slot)
+				return fnErr
+			}
+		}
+		o.ctx.Pool.Unpin(slot)
+	}
+	return nil
+}
+
+// validateCheckConstraintRows scans tbl's existing rows against a CHECK
+// constraint expression and raises 23514 on the first row where the expression
+// evaluates to a definite boolean FALSE. SQL 3-valued logic: NULL/UNKNOWN
+// passes (ExecCheck in ATRewriteTable, tablecmds.c:6492-6498). The expression
+// is parsed and resolved against the table schema ONCE (planner
+// ResolveIndexPredicate — the same preparation the CREATE INDEX bulk-build
+// path uses for partial-index predicates, planner.go:74), then evaluated per
+// row via evalExpr — NOT the per-row mini-query rebuild in checkConstraints
+// (O(N·parse+plan)). PG emits no errposition on this refusal, so the error
+// carries Pos 0. Used by ADD CHECK and VALIDATE CHECK (CHECK), M0134-0002 C3
+// slice 1. conName is used verbatim; for an anonymous ADD CHECK callers pass
+// the auto-generated name so the message matches PG's.
+func (o *ddlOp) validateCheckConstraintRows(tbl *catalog.Table, conName, exprSQL string) error {
+	if exprSQL == "" {
+		return nil
+	}
+	expr, err := parser.ParseExpr(exprSQL)
+	if err != nil {
+		// Surface parse failures as a normal ExecError (syntax_error 42601
+		// unless the parser assigned a different code) rather than letting the
+		// raw *parser.SyntaxError string — which carries a "(byte <pos>)"
+		// suffix goopg's psql path otherwise renders via LINE/caret — leak.
+		// For a *parser.SyntaxError, rebuild the standard "syntax error at or
+		// near %q" wording from its clean fields (Message is the offending
+		// token/description; Raw errors carry their own full wording), so the
+		// message has no byte-position artifact. Pos is forwarded as-is.
+		if se, ok := err.(*parser.SyntaxError); ok {
+			code := se.Code
+			if code == "" {
+				code = "42601"
+			}
+			msg := se.Message
+			if !se.Raw {
+				msg = fmt.Sprintf("syntax error at or near %q", se.Message)
+			}
+			return &ExecError{Code: code, Pos: se.Pos, Message: msg}
+		}
+		return &ExecError{Code: "42601", Pos: 0, Message: err.Error()}
+	}
+	planned, err := optimizer.ResolveIndexPredicate(expr, tbl)
+	if err != nil {
+		// Convert *planner.PlanError so the wire layer renders a clean
+		// "ERROR:  <message>" line — returning the raw PlanError would let its
+		// Error() string ("<code>: <message> (byte <pos>)") leak into the
+		// message field (same rationale as the CREATE VIEW validation at
+		// operators_ddl.go:5261-5268). PG emits no errposition for a
+		// column-not-found in a CHECK predicate, so the PlanError's Pos (0 for
+		// these) is forwarded as-is.
+		if pe, ok := err.(*optimizer.PlanError); ok {
+			return &ExecError{Code: pe.Code, Message: pe.Message, Hint: pe.Hint, Pos: pe.Pos}
+		}
+		return err
+	}
+	return o.forEachLiveRow(tbl, func(row Row) error {
+		pv, pErr := evalExpr(planned, row, o.ctx)
+		if pErr != nil {
+			return pErr
+		}
+		// Only a definite boolean FALSE violates. NULL/UNKNOWN and a
+		// non-boolean result pass (ExecCheck's 3-valued logic).
+		if pv.IsNull() || pv.Kind != KindBool {
+			return nil
+		}
+		if pv.BoolValue() {
+			return nil
+		}
+		return &ExecError{Code: "23514", Pos: 0,
+			Message: fmt.Sprintf("check constraint %q of relation %q is violated by some row", conName, tbl.Name)}
+	})
+}
+
 // validateFKConstraintExistingRows scans every live row of fkOwnerTbl and, for
 // each non-null FK key value, checks that a matching parent row exists —
 // mirroring PostgreSQL's validateForeignKeyConstraint (tablecmds.c), which
@@ -10037,7 +11100,7 @@ func (o *ddlOp) validateFKConstraintExistingRows(fkOwnerTbl *catalog.Table, fk c
 	if err != nil {
 		return &ExecError{Code: "XX000", Message: err.Error()}
 	}
-	sctx := mctx.Acquire(o.ctx.Mctx, mctx.KindExpr)
+	sctx := mmgr.Acquire(o.ctx.Mctx, mmgr.KindExpr)
 	defer sctx.Release()
 	var scanRow Row
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
@@ -10283,7 +11346,7 @@ func (o *ddlOp) createExclusionIndexStub(pos int, idxName parser.ObjectName, tbl
 // an optional trailing arg (nil/omitted for the many call sites that create
 // a plain constraint-backed index with none of these properties).
 type btreeIndexProps struct {
-	Predicate        planner.Expr // resolved WHERE predicate for build-time row filtering; nil = no predicate
+	Predicate        optimizer.Expr // resolved WHERE predicate for build-time row filtering; nil = no predicate
 	HasPredicate     bool
 	PredicateString  string
 	IncludeColumns   []string
@@ -10331,9 +11394,9 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 				// Resolve exactly as the build path does (resolveIndexKeyExprs,
 				// encodeExprIndexKey): ResolveIndexPredicate populates the
 				// ColumnRef Type that ExprResultType then reports.
-				planExpr, err := planner.ResolveIndexPredicate(colExprs[i], tbl)
+				planExpr, err := optimizer.ResolveIndexPredicate(colExprs[i], tbl)
 				if err == nil && planExpr != nil {
-					if typ, ok := planner.ExprResultType(planExpr); ok {
+					if typ, ok := optimizer.ExprResultType(planExpr); ok {
 						if !isSupportedBTreeKeyType(typ.Name) {
 							// Also accept user-defined enum types. M0097-0022.
 							isEnum := false
@@ -10412,7 +11475,7 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 	}
 	idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
 	var buildErr error
-	var predExpr planner.Expr
+	var predExpr optimizer.Expr
 	if xp != nil {
 		predExpr = xp.Predicate
 	}
@@ -10458,7 +11521,7 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 // is not derivable from idxRel — REINDEX CONCURRENTLY builds into a shadow
 // relfile — and the bulk sort needs it: the build's own ordering and every
 // later reader's must come from the same key descriptor.
-func (o *ddlOp) bulkBuildBTreeFull(idx *catalog.Index, idxRel storage.RelFileNode, tbl *catalog.Table, cols []*catalog.Column, keyExprs []planner.Expr, unique, nullsNotDistinct bool, indexName string, pos int, predExpr planner.Expr) error {
+func (o *ddlOp) bulkBuildBTreeFull(idx *catalog.Index, idxRel storage.RelFileNode, tbl *catalog.Table, cols []*catalog.Column, keyExprs []optimizer.Expr, unique, nullsNotDistinct bool, indexName string, pos int, predExpr optimizer.Expr) error {
 	entries, err := o.collectBTreeEntries(idx, tbl, cols, keyExprs, unique, nullsNotDistinct, indexName, pos, predExpr)
 	if err != nil {
 		return err
@@ -10477,13 +11540,51 @@ func (o *ddlOp) bulkBuildBTreeFull(idx *catalog.Index, idxRel storage.RelFileNod
 // this loop encodes, and the order + duplicate test it then applies to them,
 // are properties of THAT index's key format, not of the column list: see
 // `indexBuildEntryKey` and `sortBuildEntriesFindDuplicate`.
-func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols []*catalog.Column, keyExprs []planner.Expr, unique, nullsNotDistinct bool, indexName string, pos int, predExpr planner.Expr) ([]btree.BulkEntry, error) {
+// btreeBuildKeyDescription renders the "Key (cols)=(vals)" prefix of PG's
+// duplicate-key DETAIL (BuildIndexValueDescription,
+// postgres/src/backend/access/index/genam.c:178-276) for the bulk index-build
+// 23505 raise. Key column names are comma-space separated
+// (pg_get_indexdef_columns, ruleutils.c:1235) and each value via the Datum's
+// output rendering. When nullAsLiteral is set (NULLS NOT DISTINCT build) a NULL
+// key column renders as the literal lowercase "null" (genam.c:246-247); the
+// default path never sees a NULL key value (such rows are dropped from the
+// entry list). The caller appends the suffix (" is duplicated.").
+func btreeBuildKeyDescription(idx *catalog.Index, cols []*catalog.Column, row Row, nullAsLiteral bool) string {
+	colNames := make([]string, 0, len(idx.Columns))
+	colVals := make([]string, 0, len(idx.Columns))
+	// cols is parallel to idx.Columns (key columns in declared order, nil for
+	// expression columns) — the same shape buildUniqueConstraintDetail relies
+	// on (operators_storage.go:8605).
+	for i, idxCol := range idx.Columns {
+		colNames = append(colNames, idxCol)
+		val := ""
+		if i < len(cols) && cols[i] != nil && cols[i].Ordinal >= 0 && cols[i].Ordinal < len(row) {
+			d := row[cols[i].Ordinal]
+			if d.IsNull() {
+				if nullAsLiteral {
+					val = "null"
+				}
+			} else {
+				val = d.Format()
+			}
+		}
+		colVals = append(colVals, val)
+	}
+	return fmt.Sprintf("Key (%s)=(%s)", strings.Join(colNames, ", "), strings.Join(colVals, ", "))
+}
+
+// collectBTreeEntries walks every live row of tbl, encodes the btree key, and
+// returns the BulkEntry list for bulk index creation. For a unique index it
+// also performs PG's duplicate-key check (23505, comparetup_index_btree
+// tuplesortvariants.c:1686-1693) over the sorted entries.
+
+func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols []*catalog.Column, keyExprs []optimizer.Expr, unique, nullsNotDistinct bool, indexName string, pos int, predExpr optimizer.Expr) ([]nbtree.BulkEntry, error) {
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 	nBlocks, err := o.ctx.Pool.NBlocks(rel)
 	if err != nil {
 		return nil, &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 	}
-	var entries []btree.BulkEntry
+	var entries []nbtree.BulkEntry
 	// seenNull dedups null-bearing rows for a NULLS NOT DISTINCT unique index
 	// (NULLs collide). Lazily allocated; nil for every default index so non-NND
 	// builds are byte-for-byte unchanged.
@@ -10494,7 +11595,7 @@ func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols
 	// Datum lifetime ends at encodeBTreeKeyForColumn — the encoded
 	// BulkEntry.Key is an explicit append-copy, so no Datum reference
 	// outlives the Reset boundary.
-	sctxDDL := mctx.Acquire(o.ctx.Mctx, mctx.KindExpr)
+	sctxDDL := mmgr.Acquire(o.ctx.Mctx, mmgr.KindExpr)
 	defer sctxDDL.Release()
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
@@ -10590,8 +11691,13 @@ func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols
 					}
 					if _, dup := seenNull[string(ndk)]; dup {
 						o.ctx.Pool.Unpin(slot)
-						return nil, &ExecError{Code: "23505", Pos: pos,
-							Message: fmt.Sprintf("could not create unique index %q", indexName)}
+						// NULLS NOT DISTINCT: render the offending key inline from
+						// the still-in-scope row (NULL key columns as the literal
+						// "null", genam.c:246-247). No errposition — Pos stays 0.
+						// M0134-0002 C3 slice 2.
+						return nil, &ExecError{Code: "23505", Pos: 0,
+							Message: fmt.Sprintf("could not create unique index %q", indexName),
+							Detail:  btreeBuildKeyDescription(idx, cols, row, true) + " is duplicated."}
 					}
 					seenNull[string(ndk)] = struct{}{}
 				}
@@ -10605,7 +11711,16 @@ func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols
 				// during bulk build while expression evaluation is unsupported.
 				continue
 			}
-			entries = append(entries, btree.BulkEntry{Key: append([]byte(nil), key...), Ptr: storage.ItemPointer{Block: blk, Offset: i}})
+			entry := nbtree.BulkEntry{Key: append([]byte(nil), key...), Ptr: storage.ItemPointer{Block: blk, Offset: i}}
+			if unique {
+				// Capture the rendered "Key (cols)=(vals)" description now —
+				// after the post-sort duplicate walk below the source row is
+				// gone, and only the entry list survives. Non-unique builds
+				// never read KeyDesc, so skip the per-row string allocation.
+				// M0134-0002 C3 slice 2.
+				entry.KeyDesc = btreeBuildKeyDescription(idx, cols, row, false)
+			}
+			entries = append(entries, entry)
 		}
 		// M0074-0004 / M0107-0001: page boundary — reset sctx. All
 		// Datums from this page were consumed by encodeBTreeKeyForColumn
@@ -10621,9 +11736,15 @@ func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols
 	// (matching its convention) and walk adjacencies for the
 	// unique check.
 	if unique && len(entries) > 1 {
-		if sortBuildEntriesFindDuplicate(o.ctx.pgIndexKeyDesc(idx), entries) {
-			return nil, &ExecError{Code: "23505", Pos: pos,
-				Message: fmt.Sprintf("could not create unique index %q", indexName)}
+		// di is the index of the second entry of the first adjacent duplicate
+		// pair; both carry the same rendered key description, so either renders
+		// PG's `Key (…)=(…) is duplicated.` DETAIL (comparetup_index_btree,
+		// tuplesortvariants.c:1686-1693). No errposition — Pos stays 0.
+		// M0134-0002 C3 slice 2.
+		if di := sortBuildEntriesFindDuplicate(o.ctx.pgIndexKeyDesc(idx), entries); di >= 0 {
+			return nil, &ExecError{Code: "23505", Pos: 0,
+				Message: fmt.Sprintf("could not create unique index %q", indexName),
+				Detail:  entries[di].KeyDesc + " is duplicated."}
 		}
 	}
 	return entries, nil
@@ -10646,7 +11767,7 @@ func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols
 // test). Both are blob-format assertions — see `indexBuildEntryKey` and
 // `sortBuildEntriesFindDuplicate` for what the tuple format needs instead, and
 // the deferral-ledger row for B2-c-v.
-func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*catalog.Column, unique, nullsNotDistinct bool, indexName string, pos int) error {
+func (o *ddlOp) backfillBTree(tree *nbtree.BTree, tbl *catalog.Table, cols []*catalog.Column, unique, nullsNotDistinct bool, indexName string, pos int) error {
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 	nBlocks, err := o.ctx.Pool.NBlocks(rel)
 	if err != nil {
@@ -10658,7 +11779,7 @@ func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*cat
 	// M0074-0004 / M0107-0001: per-page mctx for varchar / char / text payloads.
 	// Resulting key is copied by caller (`seen[string(key)]` and `tree.Insert`),
 	// so Datums need not outlive the per-page Reset boundary.
-	sctxDDL := mctx.Acquire(o.ctx.Mctx, mctx.KindExpr)
+	sctxDDL := mmgr.Acquire(o.ctx.Mctx, mmgr.KindExpr)
 	defer sctxDDL.Release()
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
@@ -10836,7 +11957,7 @@ func encodeCompositeBTreeKey(row Row, cols []*catalog.Column, pos int) (key []by
 //     timestamp/bool/enum/bytea by kind, plus float4/float8 by resolved type;
 //     see its comment for the encoder per kind)
 //   - otherwise                       → bytes appended in key-column order
-func encodeCompositeBTreeKeyWithExprs(ctx *Context, row Row, cols []*catalog.Column, keyExprs []planner.Expr, pos int) (key []byte, hasNullKey bool, err *ExecError) {
+func encodeCompositeBTreeKeyWithExprs(ctx *Context, row Row, cols []*catalog.Column, keyExprs []optimizer.Expr, pos int) (key []byte, hasNullKey bool, err *ExecError) {
 	var out []byte
 	for i, col := range cols {
 		if col == nil {
@@ -10881,21 +12002,21 @@ func encodeCompositeBTreeKeyWithExprs(ctx *Context, row Row, cols []*catalog.Col
 // (idx.ColExprs, set where idx.Columns[i] == "") against tbl so the bulk-build
 // path can evaluate them per row. Returns nil when idx has no expression key
 // column, which keeps every plain index on the byte-for-byte-unchanged path.
-func resolveIndexKeyExprs(tbl *catalog.Table, idx *catalog.Index) []planner.Expr {
+func resolveIndexKeyExprs(tbl *catalog.Table, idx *catalog.Index) []optimizer.Expr {
 	if idx == nil || len(idx.ColExprs) == 0 {
 		return nil
 	}
-	var out []planner.Expr
+	var out []optimizer.Expr
 	for i, name := range idx.Columns {
 		if name != "" || i >= len(idx.ColExprs) || idx.ColExprs[i] == nil {
 			continue
 		}
-		planExpr, err := planner.ResolveIndexPredicate(*idx.ColExprs[i], tbl)
+		planExpr, err := optimizer.ResolveIndexPredicate(*idx.ColExprs[i], tbl)
 		if err != nil || planExpr == nil {
 			continue
 		}
 		if out == nil {
-			out = make([]planner.Expr, len(idx.Columns))
+			out = make([]optimizer.Expr, len(idx.Columns))
 		}
 		out[i] = planExpr
 	}
@@ -10975,7 +12096,7 @@ func encodeBTreeKeyForColumn(ctx *Context, v Datum, col *catalog.Column, pos int
 		if rerr != nil {
 			return nil, keyExecError(rerr, pos)
 		}
-		return btree.EncodeInt8(int64(oid)), nil
+		return nbtree.EncodeInt8(int64(oid)), nil
 	}
 	// Unknown-literal coercion (sibling of the seq-scan promoteCrossKind path):
 	// a probe key built from a quoted literal (`WHERE id = '1'`) arrives as
@@ -11029,30 +12150,30 @@ func encodeBTreeKeyForColumn(ctx *Context, v Datum, col *catalog.Column, pos int
 		if v.Int < minInt32 || v.Int > maxInt32 {
 			return nil, &ExecError{Code: "22003", Pos: pos, Message: fmt.Sprintf("value %d out of int4 range for index key", v.Int)}
 		}
-		return btree.EncodeInt4(int32(v.Int)), nil
+		return nbtree.EncodeInt4(int32(v.Int)), nil
 	case isInt8Type(col.Type.Name):
 		if v.Kind != KindInt {
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not integer at runtime", col.Name)}
 		}
-		return btree.EncodeInt8(v.Int), nil
+		return nbtree.EncodeInt8(v.Int), nil
 	case isNumericType(col.Type.Name):
 		switch v.Kind {
 		case KindNumeric:
-			return btree.EncodeNumericKey(numericMant(v), v.Scale), nil
+			return nbtree.EncodeNumericKey(numericMant(v), v.Scale), nil
 		case KindInt:
-			return btree.EncodeNumericKey(big.NewInt(v.Int), 0), nil
+			return nbtree.EncodeNumericKey(big.NewInt(v.Int), 0), nil
 		}
 		return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not numeric at runtime", col.Name)}
 	case isVarcharType(col.Type.Name):
 		if v.Kind != KindString {
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a string at runtime", col.Name)}
 		}
-		return btree.EncodeVarchar([]byte(v.StringValue())), nil
+		return nbtree.EncodeVarchar([]byte(v.StringValue())), nil
 	case isCharType(col.Type.Name):
 		if v.Kind != KindString {
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a string at runtime", col.Name)}
 		}
-		return btree.EncodeChar([]byte(v.StringValue())), nil
+		return nbtree.EncodeChar([]byte(v.StringValue())), nil
 	case isTimestampType(col.Type.Name) || isTimestamptzType(col.Type.Name):
 		// timestamp and timestamptz share the int64-micros-since-epoch on-disk
 		// form, so both encode via EncodeTimestamp. M0118-0001.
@@ -11060,7 +12181,7 @@ func encodeBTreeKeyForColumn(ctx *Context, v Datum, col *catalog.Column, pos int
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a timestamp at runtime", col.Name)}
 		}
 		micros := v.TimeValue().Sub(pgEpoch).Microseconds()
-		return btree.EncodeTimestamp(micros), nil
+		return nbtree.EncodeTimestamp(micros), nil
 	case isDateType(col.Type.Name):
 		// date stored as int32 days since the PG epoch (2000-01-01); encode via
 		// the order-preserving int4 path. Mirrors the codec date encoding so a
@@ -11070,13 +12191,13 @@ func encodeBTreeKeyForColumn(ctx *Context, v Datum, col *catalog.Column, pos int
 		}
 		micros := v.TimeValue().UnixMicro() - pgEpochUnixMicros
 		days := int32(micros / (24 * 3600 * 1000000))
-		return btree.EncodeInt4(days), nil
+		return nbtree.EncodeInt4(days), nil
 	case strings.ToLower(col.Type.Name) == "uuid":
 		// uuid stored as canonical lowercase-dashes text; sort order matches byte order.
 		if v.Kind != KindString {
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not uuid at runtime", col.Name)}
 		}
-		return btree.EncodeVarchar([]byte(v.StringValue())), nil
+		return nbtree.EncodeVarchar([]byte(v.StringValue())), nil
 	case strings.ToLower(col.Type.Name) == "text":
 		// text type: encode as varchar bytes. M0096-0008.
 		var s string
@@ -11088,13 +12209,13 @@ func encodeBTreeKeyForColumn(ctx *Context, v Datum, col *catalog.Column, pos int
 		default:
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not text at runtime", col.Name)}
 		}
-		return btree.EncodeVarchar([]byte(s)), nil
+		return nbtree.EncodeVarchar([]byte(s)), nil
 	case strings.ToLower(col.Type.Name) == "name":
 		// name type: encode as varchar bytes (max 63 chars).
 		if v.Kind != KindString {
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a string at runtime", col.Name)}
 		}
-		return btree.EncodeVarchar([]byte(v.StringValue())), nil
+		return nbtree.EncodeVarchar([]byte(v.StringValue())), nil
 	case isFloat8Type(col.Type.Name):
 		// float4/float8 stored as text; decode then re-encode sortably.
 		f, badSyntax, ok := datumToFloat64ForKey(v)
@@ -11104,15 +12225,210 @@ func encodeBTreeKeyForColumn(ctx *Context, v Datum, col *catalog.Column, pos int
 			}
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not float at runtime (kind %d)", col.Name, v.Kind)}
 		}
-		return btree.EncodeFloat8(f), nil
+		return nbtree.EncodeFloat8(f), nil
+	case isInetType(col.Type.Name), isCidrType(col.Type.Name):
+		// inet/cidr share the btree/inet_ops opclass (cidr binary-coerces to
+		// it), so both encode through the same order-preserving network key
+		// that reproduces network_cmp_internal's total order byte-wise
+		// (postgres/src/backend/utils/adt/network.c:402-420). M0134-0002 C5.
+		return encodeInetBTreeKey(v, col, pos)
 	}
 	// Enum types: encode sort order as float64. M0097-0022.
 	// The caller (collectBTreeEntries) pre-converts KindString enum labels to KindEnum
 	// so both backfill and probe paths use the same float64 encoding.
 	if v.Kind == KindEnum {
-		return btree.EncodeFloat8(v.EnumSortOrder()), nil
+		return nbtree.EncodeFloat8(v.EnumSortOrder()), nil
 	}
 	return nil, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 cannot index column %q of type %q", col.Name, col.Type.Name)}
+}
+
+// encodeInetBTreeKey encodes an inet/cidr value into a fixed-width, self-
+// delimiting B-tree key whose byte-wise lexicographic order reproduces PG's
+// network_cmp_internal total order (postgres/src/backend/utils/adt/network.c:
+// 402-420).
+//
+// Layout (width = 4 for AF_INET, 16 for AF_INET6):
+//
+//	[0]             family byte: PGSQL_AF_INET (2) or PGSQL_AF_INET6 (3).
+//	                PGSQL_AF_INET6 is AF_INET+1 (utils/inet.h:39-40), NOT the
+//	                OS AF_INET6 value — network_cmp_internal's cross-family
+//	                branch is ip_family(a1)-ip_family(a2), so 2<3 orders
+//	                IPv4 before IPv6.
+//	[1..width]      the address MASKED to `bits` (host bits zeroed)
+//	[width+1]       the netmask length `bits` (0..32 / 0..128, unsigned byte)
+//	[width+2..]     the FULL (unmasked) address — the final tiebreak
+//
+// Order-preserving: the masked-network component compares the common prefix
+// first (bitncmp(ip_addr, ip_addr, Min(bits1,bits2))), and when the common
+// prefix is equal a value with the LONGER mask that has a bit set beyond the
+// shorter mask sorts LATER by this component — exactly the mask-length
+// tiebreak PG applies next, so the byte order never contradicts the operator
+// order. Equal masked networks compare `bits` ascending, then the full
+// address (bitncmp over ip_maxbits), which carries inet's host bits (network_in
+// does NOT mask inet input — inet_net_pton_ipv4, inet_net_pton.c:259-336; cidr
+// input is masked, so its full component is the network itself). The RAW
+// address in the prefix position would be wrong: 10.0.0.1/8 must sort before
+// 10.0.0.0/32 (equal 8-bit prefix, then 8<32).
+func encodeInetBTreeKey(v Datum, col *catalog.Column, pos int) ([]byte, *ExecError) {
+	if v.Kind != KindString {
+		return nil, &ExecError{Code: "42804", Pos: pos,
+			Message: fmt.Sprintf("column %q is not inet at runtime", col.Name)}
+	}
+	typName := "inet"
+	if isCidrType(col.Type.Name) {
+		typName = "cidr"
+	}
+	family, addr, bits, err := parseInetKeyText(v.StringValue(), isCidrType(col.Type.Name))
+	if err != nil {
+		return nil, &ExecError{Code: "22P02", Pos: pos,
+			Message: fmt.Sprintf("invalid input syntax for type %s: %q", typName, v.StringValue())}
+	}
+	width := len(addr)
+	key := make([]byte, 1+width+1+width)
+	key[0] = family
+	copy(key[1:1+width], maskInetAddr(addr, bits))
+	key[1+width] = byte(bits)
+	copy(key[2+width:], addr)
+	return key, nil
+}
+
+// parseInetKeyText parses an inet/cidr text form into (family, address bytes,
+// netmask bits). `isCidr` selects cidr's classful default mask when no /n is
+// present (inet defaults to /32 or /128). Mirrors the address+bits extraction
+// of pg_inet_net_pton (postgres/src/backend/utils/adt/inet_net_pton.c):
+// inet_net_pton_ipv4/ipv6 (inet path, no masking) and inet_cidr_pton_ipv4/ipv6
+// (cidr path, classful defaults). The family is decided exactly as network_in
+// does — a ':' anywhere means IPv6 — so a v4-mapped text like "::ffff:1.2.3.4"
+// stays a 16-byte IPv6 value.
+func parseInetKeyText(s string, isCidr bool) (family byte, addr []byte, bits int, err error) {
+	addrPart := s
+	bits = -1
+	if i := strings.IndexByte(s, '/'); i >= 0 {
+		addrPart = s[:i]
+		rest := s[i+1:]
+		if rest == "" {
+			return 0, nil, 0, fmt.Errorf("bad mask")
+		}
+		for j := 0; j < len(rest); j++ {
+			if rest[j] < '0' || rest[j] > '9' {
+				return 0, nil, 0, fmt.Errorf("bad mask")
+			}
+		}
+		n, convErr := strconv.Atoi(rest)
+		if convErr != nil || n > 128 {
+			return 0, nil, 0, fmt.Errorf("bad mask")
+		}
+		bits = n
+	}
+	if strings.Contains(addrPart, ":") {
+		// IPv6 (network_in: a ':' anywhere selects PGSQL_AF_INET6). Go parses
+		// the full 16-byte form, including embedded-v4 spellings.
+		ip := net.ParseIP(addrPart)
+		if ip == nil {
+			return 0, nil, 0, fmt.Errorf("bad address")
+		}
+		family = 3 // PGSQL_AF_INET6
+		addr = ip
+		if bits == -1 {
+			// inet_net_pton_ipv6 / inet_cidr_pton_ipv6 both default to /128.
+			bits = 128
+		}
+		if bits < 0 || bits > 128 {
+			return 0, nil, 0, fmt.Errorf("bad mask")
+		}
+		return family, addr, bits, nil
+	}
+	// IPv4.
+	var v4 [4]byte
+	var nOctets int
+	if !parseInetV4Octets(addrPart, &v4) {
+		return 0, nil, 0, fmt.Errorf("bad address")
+	}
+	nOctets = len(strings.Split(addrPart, "."))
+	family = 2 // PGSQL_AF_INET
+	addr = v4[:]
+	if bits == -1 {
+		if !isCidr {
+			if nOctets != 4 {
+				// inet_net_pton_ipv4: no mask and not all four octets → enoent.
+				return 0, nil, 0, fmt.Errorf("bad address")
+			}
+			bits = 32
+		} else {
+			bits = cidrDefaultV4Mask(v4[0], nOctets)
+		}
+	} else if bits > nOctets*8 {
+		// "If prefix length overspecifies mantissa, life is bad." (enoent)
+		return 0, nil, 0, fmt.Errorf("bad mask")
+	}
+	if bits < 0 || bits > 32 {
+		return 0, nil, 0, fmt.Errorf("bad mask")
+	}
+	return family, addr, bits, nil
+}
+
+// parseInetV4Octets parses a dotted IPv4 mantissa of 1..4 decimal octets into
+// the zero-padded 4-byte address (inet_net_pton_ipv4 / inet_cidr_pton_ipv4,
+// inet_net_pton.c:95-336).
+func parseInetV4Octets(s string, out *[4]byte) bool {
+	octets := strings.Split(s, ".")
+	if len(octets) < 1 || len(octets) > 4 {
+		return false
+	}
+	for i, o := range octets {
+		if o == "" || o[0] < '0' || o[0] > '9' {
+			return false
+		}
+		v, err := strconv.Atoi(o)
+		if err != nil || v < 0 || v > 255 {
+			return false
+		}
+		out[i] = byte(v)
+	}
+	return true
+}
+
+// cidrDefaultV4Mask returns the classful netmask length cidr input infers when
+// no /n is present (inet_cidr_pton_ipv4, inet_net_pton.c:199-222): Class A /8,
+// B /16, C /24, D /8 (224 → /4), E /32, widened to cover the octets actually
+// written.
+func cidrDefaultV4Mask(first byte, nOctets int) int {
+	var bits int
+	switch {
+	case first >= 240: // Class E
+		bits = 32
+	case first >= 224: // Class D
+		bits = 8
+	case first >= 192: // Class C
+		bits = 24
+	case first >= 128: // Class B
+		bits = 16
+	default: // Class A
+		bits = 8
+	}
+	if octets := nOctets * 8; bits < octets {
+		bits = octets
+	}
+	if bits == 8 && first == 224 {
+		bits = 4
+	}
+	return bits
+}
+
+// maskInetAddr zeroes the host bits of `addr` to the right of `bits`, yielding
+// the network-prefix component of the inet key.
+func maskInetAddr(addr []byte, bits int) []byte {
+	out := append([]byte(nil), addr...)
+	full := bits / 8
+	rem := bits % 8
+	if rem != 0 {
+		out[full] &= byte(0xFF << uint(8-rem))
+		full++
+	}
+	for i := full; i < len(out); i++ {
+		out[i] = 0
+	}
+	return out
 }
 
 // keyExecError adapts the plain-error returns of regIdentifierInput /
@@ -11125,6 +12441,167 @@ func keyExecError(err error, pos int) *ExecError {
 		return ee
 	}
 	return &ExecError{Code: "42804", Pos: pos, Message: err.Error()}
+}
+
+// isSystemColumn reports whether name is one of the six PostgreSQL system
+// column names (ctid, xmin, cmin, xmax, cmax, tableoid). Matching is exact and
+// case-sensitive — PG's SystemAttributeByName compares with strcmp
+// (postgres/src/backend/catalog/heap.c:248) over SysAtt[]
+// (postgres/src/backend/catalog/heap.c:144-228). The caller must pass the
+// parsed identifier as-is: an unquoted name is already lower-cased by the
+// parser, so it matches; a quoted mixed-case name like "XMIN" stays mixed-case
+// and correctly does not match. "oid" is deliberately NOT in the list — it has
+// been an ordinary user column since PG 12. This helper is the single source of
+// truth for the name list; the partition-key check in
+// validatePartitionKey (operators_ddl_partition.go) calls it too.
+func isSystemColumn(name string) bool {
+	switch name {
+	case "ctid", "xmin", "cmin", "xmax", "cmax", "tableoid":
+		return true
+	}
+	return false
+}
+
+// hasInheritanceChildren reports whether tbl has any inheritance or partition
+// children. PG's find_inheritance_children scans pg_inherits (pg_inherits.c:81-121),
+// which holds BOTH `INHERITS` children and `PARTITION OF` partitions, so both
+// goopg maps must be consulted. Used by the C9 ONLY-guards (RENAME/DROP
+// COLUMN, ADD COLUMN, RENAME/DROP CONSTRAINT): PG refuses ONLY on a parent
+// with children via this exact child set (tablecmds.c:3912-3917, 7600-7603,
+// 4114-4119).
+func (o *ddlOp) hasInheritanceChildren(tbl *catalog.Table) bool {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return false
+	}
+	return len(im.InheritanceChildren(tbl.OID)) > 0 || len(im.PartitionChildren(tbl.OID)) > 0
+}
+
+// markAttachedColumnsInherited marks every non-dropped CHILD column that has a
+// same-named (case-sensitive Name match) PARENT column as Inherited
+// (attislocal=false, attinhcount=1). Mirrors PG's MergeAttributesIntoExisting
+// (postgres/src/backend/commands/tablecmds.c:17500), which ALTER TABLE …
+// ATTACH PARTITION runs via CreateInheritance to bump attinhcount and clear
+// attislocal on the child's matching columns. Child columns with no same-named
+// parent column stay local (they are the child's own); a missing child column
+// is NOT an error here — the 42804 column-validation gap is a separate
+// ledgered item. M0134-0002 C9 residual (S2).
+func markAttachedColumnsInherited(parent, child *catalog.Table) {
+	for _, pc := range parent.Columns {
+		if pc.Dropped {
+			continue
+		}
+		for i := range child.Columns {
+			if child.Columns[i].Name == pc.Name {
+				child.Columns[i].Inherited = true
+				break
+			}
+		}
+	}
+}
+
+// clearAttachedColumnsInherited is the S2 sibling (inverse of
+// markAttachedColumnsInherited): on ALTER TABLE … DETACH PARTITION, PG's
+// RemoveInheritance decrements attinhcount on every child column that has a
+// same-named parent column and sets attislocal=true when the count reaches 0
+// (postgres/src/backend/commands/tablecmds.c:18009-18014). Without this the
+// Inherited flag set at ATTACH would linger after DETACH and goopg's
+// pg_attribute would report attinhcount=1/attislocal=false on a detached
+// partition, diverging from PG (the alter_table regress asserts the reset at
+// alter_table.out:4416-4422). M0134-0002 C9 residual (S2 sibling).
+func clearAttachedColumnsInherited(parent, child *catalog.Table) {
+	for i := range child.Columns {
+		col := &child.Columns[i]
+		if !col.Inherited {
+			continue
+		}
+		for _, pc := range parent.Columns {
+			if pc.Dropped {
+				continue
+			}
+			if col.Name == pc.Name {
+				col.Inherited = false
+				break
+			}
+		}
+	}
+}
+
+// colStillInherited reports whether colName is still inherited in the LIVE
+// hierarchy: a direct parent (INHERITS or PARTITION OF) whose edge to tbl is
+// still registered still carries a column of that name.
+//
+// The catalog.Column.Inherited flag alone is insufficient. goopg does not yet
+// maintain PG's per-parent attinhcount bookkeeping (the M0134-0002 C9
+// follow-up), so the flag goes stale: a parent-side DROP COLUMN removes the
+// column from the parent but leaves the child's flag set, and NO INHERIT /
+// DETACH unregister the edge without clearing it. PG's guards key off attinhcount
+// in the live state (ATExecDropColumn tablecmds.c:9350, renameatt_internal
+// :3960), so the C9 guards must too. M0134-0002 C9.
+func (o *ddlOp) colStillInherited(tbl *catalog.Table, colName string) bool {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return false
+	}
+	for _, parentOID := range tbl.InheritsParentOIDs {
+		if o.parentStillHasColumn(im, parentOID, tbl.OID, colName) {
+			return true
+		}
+	}
+	// M0134-0002 C9 residual (S3): Table.PartitionParentOID is only populated on
+	// the CREATE TABLE … PARTITION OF path — an ALTER TABLE … ATTACH PARTITION
+	// child (the regress part_2) leaves it 0 and registers only the live
+	// partitionChildren map, so without a map fallback the inherited-DDL guards
+	// never fire on an ATTACHed child even after S2 sets Column.Inherited.
+	// PartitionParentOf is true for both child shapes, so PARTITION-OF behavior
+	// is preserved (the field branch above still wins when set).
+	parentOID := tbl.PartitionParentOID
+	if parentOID == 0 {
+		if poid, isChild := im.PartitionParentOf(tbl.OID); isChild {
+			parentOID = poid
+		}
+	}
+	if parentOID != 0 && o.parentStillHasColumn(im, parentOID, tbl.OID, colName) {
+		return true
+	}
+	return false
+}
+
+// parentStillHasColumn reports whether parentOID's inheritance/partition edge to
+// childOID is still registered AND the parent currently carries colName. The
+// edge check mirrors find_inheritance_children (pg_inherits.c:81-121): pg_inherits
+// holds both INHERITS children and PARTITION OF partitions, and NO INHERIT /
+// DETACH delete the row, so a child whose edge was unregistered no longer counts
+// regardless of any lingering column flag.
+func (o *ddlOp) parentStillHasColumn(im *catalog.InMemory, parentOID, childOID uint32, colName string) bool {
+	live := false
+	for _, child := range im.InheritanceChildren(parentOID) {
+		if child.OID == childOID {
+			live = true
+			break
+		}
+	}
+	if !live {
+		for _, child := range im.PartitionChildren(parentOID) {
+			if child.OID == childOID {
+				live = true
+				break
+			}
+		}
+	}
+	if !live {
+		return false
+	}
+	parent, ok := im.LookupTableByOID(parentOID)
+	if !ok {
+		return false
+	}
+	for _, pc := range parent.Columns {
+		if strings.EqualFold(pc.Name, colName) {
+			return true
+		}
+	}
+	return false
 }
 
 // pgDeduplicateColNames replicates PostgreSQL's ChooseIndexColumnNames logic:
@@ -11305,6 +12782,21 @@ func isNameType(name string) bool {
 	return strings.ToLower(name) == "name"
 }
 
+// isInetType returns true for the inet network-address type. inet is the base
+// type of the btree/inet_ops opfamily (IntypeOID OIDInet, catalog.go:21907);
+// cidr binary-coerces to the same opclass.
+func isInetType(name string) bool {
+	return strings.ToLower(name) == "inet"
+}
+
+// isCidrType returns true for the cidr network-address type. cidr's default
+// btree opclass is inet_ops via binary coercion (catalog.go:21908), so it uses
+// the same order-preserving key as inet — only the no-/mask input default
+// differs (cidr's classful mask).
+func isCidrType(name string) bool {
+	return strings.ToLower(name) == "cidr"
+}
+
 // isSupportedBTreeKeyType lists the column types accepted by
 // createSingleColumnBTreeIndex. int4 is the original v0 path; int8
 // and numeric landed for HammerDB TPC-H compatibility. varchar landed
@@ -11328,7 +12820,11 @@ func isSupportedBTreeKeyType(name string) bool {
 		// interval — M0119-0006, the lossy 128-bit comparison span
 		// (btree_interval_key.go).
 		isIntervalTypeName(name) ||
-		strings.ToLower(name) == "uuid"
+		strings.ToLower(name) == "uuid" ||
+		// inet / cidr — M0134-0002 C5, the order-preserving network key
+		// (encodeInetBTreeKey / decodeScalarBTreeKey). Both share the
+		// btree/inet_ops opclass (cidr binary-coerces to it).
+		isInetType(name) || isCidrType(name)
 }
 
 // btreeKeyTypeRejectionError returns the PG-faithful rejection for a type goopg
@@ -11546,7 +13042,7 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 	// that session commits (truncate-conflict's granted permutations — design
 	// 0118-0039). Both via acquireRelLockMaybeTransient. M0118-0008.
 	for _, entry := range sortedTruncateTableSet(tableSet, nameOrder) {
-		if err := o.ctx.acquireRelLockMaybeTransient(o.ctx.Catalog.RelFileNode(entry.tbl), lockmgr.AccessExclusiveLock); err != nil {
+		if err := o.ctx.acquireRelLockMaybeTransient(o.ctx.Catalog.RelFileNode(entry.tbl), lmgr.AccessExclusiveLock); err != nil {
 			return err
 		}
 	}
@@ -14228,7 +15724,7 @@ func (o *ddlOp) execCreateTrigger(s *parser.CreateTriggerStmt) error {
 	// UPDATE (RowShareLock), so a concurrent UPDATE blocks until this
 	// transaction commits while a concurrent read proceeds. M0118-0008
 	// (create-trigger isolation spec).
-	if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.ShareRowExclusiveLock); err != nil {
+	if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lmgr.ShareRowExclusiveLock); err != nil {
 		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 			ee.Pos = s.Pos()
 		}
@@ -14815,7 +16311,7 @@ func (o *ddlOp) execAlterSequence(s *parser.AlterSequenceStmt) error {
 	// another session holds an in-progress nextval lock. M0118-0008
 	// (sequence-ddl isolation spec).
 	if tbl, ok := o.ctx.Catalog.LookupTable(s.Name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok {
-		if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.AccessExclusiveLock); err != nil {
+		if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lmgr.AccessExclusiveLock); err != nil {
 			if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 				ee.Pos = s.Pos()
 			}
@@ -14959,7 +16455,7 @@ func truncateRelation(ctx *Context, rel storage.RelFileNode) error {
 			if err != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
+			if !transam.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
 				continue
 			}
 			_ = storage.PageSetHeapTupleXmax(page, slot, ctx.Tx.XID)
@@ -14997,14 +16493,14 @@ func (o *ddlOp) execCreateMatView(s *parser.CreateMatViewStmt) error {
 	if err := analyzer.Analyze(s.Query, o.planCatalog()); err != nil {
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
 	}
-	var selectPlan planner.Node
+	var selectPlan optimizer.Node
 	var err error
 	if s.WithNoData {
 		// WITH NO DATA: use schema-only planning that suppresses runtime
 		// evaluation errors (e.g. division by zero) — the query will never execute.
-		selectPlan, err = planner.PlanSchemaOnly(s.Query, o.planCatalog())
+		selectPlan, err = optimizer.PlanSchemaOnly(s.Query, o.planCatalog())
 	} else {
-		selectPlan, err = planner.Plan(s.Query, o.planCatalog())
+		selectPlan, err = optimizer.Plan(s.Query, o.planCatalog())
 	}
 	if err != nil {
 		return err
@@ -15065,7 +16561,7 @@ func (o *ddlOp) execCreateMatView(s *parser.CreateMatViewStmt) error {
 // materializeView executes the view's SELECT query and writes results
 // to the materialized view heap, then rebuilds all btree indexes.
 // Used by both initial populate and REFRESH. M0097-0013.
-func (o *ddlOp) materializeView(tbl *catalog.Table, selectPlan planner.Node) error {
+func (o *ddlOp) materializeView(tbl *catalog.Table, selectPlan optimizer.Node) error {
 	op, err := Build(selectPlan)
 	if err != nil {
 		return err
@@ -15191,7 +16687,7 @@ func (o *ddlOp) execRefreshMatView(s *parser.RefreshMatViewStmt) error {
 	if err := analyzer.Analyze(tbl.View, o.planCatalog()); err != nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: fmt.Sprintf("refresh plan error: %v", err)}
 	}
-	selectPlan, err := planner.Plan(tbl.View, o.planCatalog())
+	selectPlan, err := optimizer.Plan(tbl.View, o.planCatalog())
 	if err != nil {
 		return err
 	}
@@ -15218,7 +16714,9 @@ func (o *ddlOp) execRefreshMatView(s *parser.RefreshMatViewStmt) error {
 				return &ExecError{Code: "55000", Pos: s.Pos(),
 					Message: fmt.Sprintf("new data for materialized view %q contains duplicate rows without any null columns", s.Name.String())}
 			}
-			// Non-concurrent REFRESH → "could not create unique index 'name'".
+			// Non-concurrent REFRESH → "could not create unique index 'name'",
+			// carrying the inner build's DETAIL ("Key (…)=(…) is duplicated.")
+			// and no errposition (Pos stays 0). M0134-0002 C3 slice 2.
 			idxName := ""
 			if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
 				for _, idx := range im.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
@@ -15228,8 +16726,9 @@ func (o *ddlOp) execRefreshMatView(s *parser.RefreshMatViewStmt) error {
 					}
 				}
 			}
-			return &ExecError{Code: "23505", Pos: s.Pos(),
-				Message: fmt.Sprintf("could not create unique index %q", idxName)}
+			return &ExecError{Code: "23505", Pos: 0,
+				Message: fmt.Sprintf("could not create unique index %q", idxName),
+				Detail:  ee.Detail}
 		}
 		return err
 	}
@@ -20821,7 +22320,7 @@ func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {
 // re-inserts all rows and rebuilds indexes. Mirrors execAlterColumnType.
 // Indexes referencing only the dropped column become empty orphans (harmless
 // for now; a future pass can DROP them explicitly).
-func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAction) error {
+func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAction, only bool) error {
 	// Find the column to drop.
 	dropIdx := -1
 	for i, col := range tbl.Columns {
@@ -20830,24 +22329,65 @@ func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAct
 			break
 		}
 	}
+	// M0134-0002 C2: `DROP COLUMN IF EXISTS` on a missing column emits PG's
+	// NOTICE and skips instead of raising 42703. Mirrors ATExecDropColumn's
+	// if_exists branch (postgres/src/backend/commands/tablecmds.c:9326-9328).
+	if act.IfExists && dropIdx < 0 {
+		o.ctx.AddNotice(fmt.Sprintf("column %q of relation %q does not exist, skipping", act.ColumnName, tbl.Name))
+		return nil
+	}
 	if dropIdx < 0 {
 		return &ExecError{Code: "42703", Pos: act.Pos(), Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
 	}
 
-	// Cannot drop a column that is part of the partition key.
-	if tbl.PartitionMethod != "" {
-		colLower := strings.ToLower(act.ColumnName)
-		for _, keyCol := range tbl.PartitionKey {
-			if strings.ToLower(keyCol) == colLower {
-				return &ExecError{Code: "0A000", Pos: act.Pos(),
-					Message: fmt.Sprintf("cannot drop column %q because it is part of the partition key of relation %q", act.ColumnName, tbl.Name)}
-			}
-		}
-		// Also check expression partition keys (e.g. PARTITION BY RANGE (plusone(a))).
-		for _, expr := range tbl.PartitionKeyExprs {
-			if strings.Contains(strings.ToLower(fmt.Sprintf("%v", expr)), colLower) {
-				return &ExecError{Code: "0A000", Pos: act.Pos(),
-					Message: fmt.Sprintf("cannot drop column %q because it is part of the partition key of relation %q", act.ColumnName, tbl.Name)}
+	// Cannot drop an inherited column (attinhcount > 0) unless recursing from a
+	// parent drop. Mirrors ATExecDropColumn's refusal
+	// (postgres/src/backend/commands/tablecmds.c:9343-9351). goopg does not yet
+	// recurse DROP COLUMN into inheritance/partition children, so the plain
+	// guard (no `recursing` skip) is correct for now. The colStillInherited
+	// live-hierarchy check keeps the guard off stale Inherited flags (a
+	// parent-side DROP COLUMN leaves the child flag set). PG emits no errposition
+	// here, so Pos is 0. 42P16.
+	if tbl.Columns[dropIdx].Inherited && o.colStillInherited(tbl, act.ColumnName) {
+		return &ExecError{Code: "42P16", Pos: 0, Message: fmt.Sprintf("cannot drop inherited column %q", act.ColumnName)}
+	}
+
+	// Cannot drop a column that is part of the partition key. Both refusal
+	// raises are 42P16 ERRCODE_INVALID_TABLE_DEFINITION with no errposition —
+	// ATExecDropColumn calls has_partition_attrs
+	// (postgres/src/backend/commands/tablecmds.c:9358;
+	// postgres/src/backend/catalog/partition.c:255) which reports 42P16, same as
+	// the inherited-column guard immediately above.
+	colLower := strings.ToLower(act.ColumnName)
+	if o.partitionKeyUsesColumn(tbl, colLower) {
+		return &ExecError{Code: "42P16", Pos: 0,
+			Message: fmt.Sprintf("cannot drop column %q because it is part of the partition key of relation %q", act.ColumnName, tbl.Name)}
+	}
+
+	// M0134-0002 C9 residuals: `ALTER TABLE ONLY` DROP COLUMN on a partitioned
+	// parent that still has partitions is refused — PG raises this only for
+	// RELKIND_PARTITIONED_TABLE with children and !recurse (ATExecDropColumn,
+	// postgres/src/backend/commands/tablecmds.c:9385-9389). When recursing (no
+	// ONLY), PG re-runs the partition-key guard on each descendant's OWN key and
+	// names the DESCENDANT (one-level child recursion tablecmds.c:9373/9422-9424
+	// re-entering ATExecDropColumn, which re-hits has_partition_attrs at :9358).
+	// allDescendants is OID-sorted first so the first-hit message text is
+	// deterministic (PG's find_inheritance_children sorts siblings by OID,
+	// pg_inherits.c:200-201). Both raises carry no errposition, so Pos is 0.
+	if only && tbl.PartitionMethod != "" && o.hasInheritanceChildren(tbl) {
+		return &ExecError{Code: "42P16", Pos: 0,
+			Message: "cannot drop column from only the partitioned table when partitions exist",
+			Hint:    "Do not specify the ONLY keyword."}
+	}
+	if !only {
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			descs := allDescendants(im, tbl, 0)
+			sort.Slice(descs, func(i, j int) bool { return descs[i].OID < descs[j].OID })
+			for _, desc := range descs {
+				if o.partitionKeyUsesColumn(desc, colLower) {
+					return &ExecError{Code: "42P16", Pos: 0,
+						Message: fmt.Sprintf("cannot drop column %q because it is part of the partition key of relation %q", act.ColumnName, desc.Name)}
+				}
 			}
 		}
 	}
@@ -20896,7 +22436,7 @@ func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAct
 			if terr != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.CmdID, o.ctx.comboStore(), o.ctx.MultiXact) {
+			if !transam.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.CmdID, o.ctx.comboStore(), o.ctx.MultiXact) {
 				continue
 			}
 			row := acquireRow(len(oldCols))
@@ -20991,7 +22531,44 @@ func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAct
 	return nil
 }
 
-func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAction) error {
+// canAssignCast is the static assignment-coercibility gate for ALTER TYPE
+// without USING. PG's ATExecAlterColumnType coerces the old column datum with
+// COERCION_ASSIGNMENT (postgres/src/backend/commands/tablecmds.c:14491-14496);
+// find_coercion_pathway (postgres/src/backend/parser/parse_coerce.c:3152)
+// returns NONE for the pairs rejected here — int2/int4/int8 → bool (int4→bool
+// is castcontext 'e' explicit-only, pg_cast.dat:90-92; int8→bool has no
+// pg_cast row), and text → int2/int4/int8 — so PG raises 42804 at parse time
+// even on an empty table. The shared evalCast is NOT changed: explicit :: casts
+// keep their permissive arms. Classify by the type's canonical name (as
+// isSupportedBTreeKeyType does); array-ness is carried separately in
+// catalog.Type.IsArray. M0134-0002 C10.
+func canAssignCast(src, dst catalog.Type) bool {
+	if (isInt2Type(src.Name) || isInt4Type(src.Name) || isInt8Type(src.Name)) &&
+		isBoolType(dst.Name) {
+		return false
+	}
+	if isTextType(src.Name) &&
+		(isInt2Type(dst.Name) || isInt4Type(dst.Name) || isInt8Type(dst.Name)) {
+		return false
+	}
+	return true
+}
+
+// noUsingCoercionError builds the WITHOUT-USING 42804 ATPrepAlterColumnType
+// raise (postgres/src/backend/commands/tablecmds.c:14507-14517): no errposition,
+// message `column "x" cannot be cast automatically to type y`, hint
+// `You might need to specify "USING x::y".`. Shared by the static
+// assignment-coercibility gate (C10) and the per-row evalCast failure path.
+func noUsingCoercionError(colName, targetType string) *ExecError {
+	return &ExecError{
+		Code:    "42804",
+		Pos:     0,
+		Message: fmt.Sprintf("column %q cannot be cast automatically to type %s", colName, targetType),
+		Hint:    fmt.Sprintf("You might need to specify \"USING %s::%s\".", colName, targetType),
+	}
+}
+
+func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAction, only bool) error {
 	colIdx := -1
 	for i, col := range tbl.Columns {
 		if strings.EqualFold(col.Name, act.ColumnName) {
@@ -20999,16 +22576,91 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 			break
 		}
 	}
+	// Missing-column refusal. Unlike the SET/DROP NOT NULL arms (which ereport
+	// without errposition — alter_table.out:1156-1159), the ALTER TYPE arm of
+	// ATPrepAlterColumnType DOES carry parser_errposition(pstate, def->location)
+	// (postgres/src/backend/commands/tablecmds.c:14404-14409), so Pos must be
+	// act.Pos() — the column-name location threaded by parseAlterColumnAction.
 	if colIdx < 0 {
 		return &ExecError{Code: "42703", Pos: act.Pos(), Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
+	}
+
+	// M0134-0002 C9 residuals: cannot alter the type of an inherited column.
+	// Same gate as the DROP COLUMN arm (:22052-22055), but PG's ALTER TYPE
+	// ereport says "alter" and carries parser_errposition(pstate, def->location)
+	// (ATExecAlterColumnType, postgres/src/backend/commands/tablecmds.c:14436-14440),
+	// so Pos is act.Pos(). This fires BEFORE the partition-key guard, matching
+	// tablecmds.c's order (inherited :14436 precedes has_partition_attrs :14443).
+	if tbl.Columns[colIdx].Inherited && o.colStillInherited(tbl, act.ColumnName) {
+		return &ExecError{Code: "42P16", Pos: act.Pos(),
+			Message: fmt.Sprintf("cannot alter inherited column %q", act.ColumnName)}
+	}
+
+	// Cannot alter the type of a column that is part of the partition key.
+	// Mirrors ATExecAlterColumnType's has_partition_attrs check
+	// (postgres/src/backend/commands/tablecmds.c:14443;
+	// postgres/src/backend/catalog/partition.c:255). Unlike the DROP COLUMN
+	// sibling (tablecmds.c:9358-9364, no errposition), this ereport carries
+	// parser_errposition(pstate, def->location) — an errposition pointing at the
+	// column name in the statement (tablecmds.c:14450) — so Pos is act.Pos().
+	// act.Pos() is nonzero now that parseAlterColumnAction threads the
+	// column-name token location into the ALTER TYPE action.
+	colLower := strings.ToLower(act.ColumnName)
+	if o.partitionKeyUsesColumn(tbl, colLower) {
+		return &ExecError{Code: "42P16", Pos: act.Pos(),
+			Message: fmt.Sprintf("cannot alter column %q because it is part of the partition key of relation %q", act.ColumnName, tbl.Name)}
+	}
+
+	// M0134-0002 C9 residuals: when recursing (no ONLY), PG re-runs the
+	// partition-key guard on each descendant's OWN key via find_all_inheritors
+	// (ATPrepAlterColumnType, postgres/src/backend/commands/tablecmds.c:14576),
+	// naming the DESCENDANT with the column-name errposition (tablecmds.c:14450),
+	// so Pos is act.Pos(). allDescendants is OID-sorted first for deterministic
+	// message text (pg_inherits.c:200-201).
+	if !only {
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			descs := allDescendants(im, tbl, 0)
+			sort.Slice(descs, func(i, j int) bool { return descs[i].OID < descs[j].OID })
+			for _, desc := range descs {
+				if o.partitionKeyUsesColumn(desc, colLower) {
+					return &ExecError{Code: "42P16", Pos: act.Pos(),
+						Message: fmt.Sprintf("cannot alter column %q because it is part of the partition key of relation %q", act.ColumnName, desc.Name)}
+				}
+			}
+		}
 	}
 
 	oldCatalogType := tbl.Columns[colIdx].Type
 	newCatalogType := catalog.Type{Name: strings.ToLower(act.NewType.Name), Args: append([]int64(nil), act.NewType.Args...)}
 
-	// No-op when the type name is unchanged.
-	if strings.EqualFold(oldCatalogType.Name, newCatalogType.Name) {
+	// Resolve the USING expression against the OLD column schema BEFORE any
+	// mutation, so ColumnRefs still resolve to old-column positions (PG
+	// parses the USING expr against the original row type —
+	// tablecmds.c:14373 ATPrepAlterColumnType). M0134-0002 C2 slice 5.
+	var plannedUsing optimizer.Expr
+	if act.UsingExpr != nil {
+		var rerr error
+		plannedUsing, rerr = optimizer.ResolveAlterColumnTypeUsing(tbl, act.UsingExpr)
+		if rerr != nil {
+			return rerr
+		}
+	}
+
+	// No-op when the type name is unchanged — unless a USING clause is
+	// present, in which case PG still rewrites the column (the USING expr
+	// result must still be coerced to the target type).
+	if strings.EqualFold(oldCatalogType.Name, newCatalogType.Name) && act.UsingExpr == nil {
 		return nil
+	}
+
+	// Static assignment-coercibility gate (M0134-0002 C10): PG coerces the old
+	// datum with COERCION_ASSIGNMENT (tablecmds.c:14491-14496) before any
+	// storage work, so the 42804 fires even on an empty table (where the
+	// per-row evalCast hook never runs). The WITH-USING path is excluded — its
+	// coercion error is raised per-row with the "result of USING clause"
+	// message.
+	if act.UsingExpr == nil && !canAssignCast(oldCatalogType, newCatalogType) {
+		return noUsingCoercionError(act.ColumnName, newCatalogType.Name)
 	}
 
 	// If no storage pool is available, just update the catalog type.
@@ -21036,6 +22688,12 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 	// oldCols[colIdx] already has the old type.
 
 	var allRows []Row
+	// A per-row conversion failure must be reported AFTER the current page's
+	// slot is RUnlock()ed and Unpin()ed — returning from inside the blk loop
+	// would leak the slot's read lock + pin (a leaked reader then deadlocks
+	// the next writeHeapRow against the checkpointer's flushBatch). Captured
+	// here and returned after both loops unwind. M0134-0002 C2 slice 5.
+	var convErr error
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
 		bufSlot, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if perr != nil {
@@ -21059,7 +22717,7 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 			if terr != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.CmdID, o.ctx.comboStore(), o.ctx.MultiXact) {
+			if !transam.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.CmdID, o.ctx.comboStore(), o.ctx.MultiXact) {
 				continue
 			}
 			row := acquireRow(len(oldCols))
@@ -21067,11 +22725,45 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 			if decErr := DecodeRowIntoMctxPGTuple(row, oldCols, tuple.Data, tuple.Bitmap, storedNatts, nil); decErr != nil {
 				continue
 			}
-			// Convert the changed column to the new type.
+			// Convert the changed column to the new type. With USING, evaluate
+			// the USING expression against the OLD row and coerce its result
+			// to the target type; without, coerce the old datum directly.
+			// PG's ATRewriteTable evaluates ex->expr per old tuple with the
+			// old slot as scantuple (tablecmds.c:6126). M0134-0002 C2 slice 5.
 			if colIdx < len(row) {
-				if converted, cErr := evalCast(row[colIdx], newCatalogType.Name, act.Pos(), o.ctx); cErr == nil {
-					row[colIdx] = converted
+				src := row[colIdx]
+				if act.UsingExpr != nil {
+					val, verr := evalExpr(plannedUsing, row, o.ctx)
+					if verr != nil {
+						// Expression evaluation error (e.g. div-by-zero, a bad
+						// inner cast): propagate as-is, NOT as a coercion error.
+						convErr = verr
+						break
+					}
+					src = val
 				}
+				// Evaluation-time cast failures (22P02 etc.) carry no errposition:
+				// PG performs the coercion during ATRewriteTable's expression
+				// evaluation, which has no source location. pos 0.
+				converted, cErr := evalCast(src, newCatalogType.Name, 0, o.ctx)
+				if cErr != nil {
+					// Coercion failure: propagate deterministically BEFORE
+					// Phase 2 (catalog mutation) / Phase 3 (heap truncation)
+					// run, so the table stays intact. Map to PG's
+					// ATPrepAlterColumnType message (tablecmds.c:14495-14511).
+					// PG's coercion ereports carry NO parser_errposition
+					// (tablecmds.c:14500-14517), so Pos is 0 — not act.Pos(),
+					// which now resolves to the column-name location.
+					if act.UsingExpr != nil {
+						convErr = &ExecError{Code: "42804", Pos: 0,
+							Message: fmt.Sprintf("result of USING clause for column %q cannot be cast automatically to type %s", act.ColumnName, newCatalogType.Name),
+							Hint:    "You might need to add an explicit cast."}
+					} else {
+						convErr = noUsingCoercionError(act.ColumnName, newCatalogType.Name)
+					}
+					break
+				}
+				row[colIdx] = converted
 			}
 			// Deep-copy the row so arena-backed string Datums survive
 			// beyond the page pin (cloneRowOwned allocates fresh backing).
@@ -21080,6 +22772,12 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 		}
 		bufSlot.RUnlock()
 		o.ctx.Pool.Unpin(bufSlot)
+		if convErr != nil {
+			break
+		}
+	}
+	if convErr != nil {
+		return convErr
 	}
 
 	// Phase 2: update the catalog column type.
@@ -21150,7 +22848,7 @@ func (o *ddlOp) execLockTable(s *parser.LockTableStmt) error {
 		// translation table. An unrecognised name leaves lmMode == NoLock and
 		// acquireRelLockTxn becomes a no-op (display-only), preserving the
 		// historical behaviour for any exotic mode.
-		lmMode, _ := lockmgr.ParseMode(s.Mode)
+		lmMode, _ := lmgr.ParseMode(s.Mode)
 		if err := lockRelationTransitively(o.ctx, sess, dbOID, s.Mode, lmMode, s.NoWait, tbl, o.ctx.Catalog, visited); err != nil {
 			return err
 		}
@@ -21173,7 +22871,7 @@ func (o *ddlOp) execLockTable(s *parser.LockTableStmt) error {
 // (TxnLockBackendID == 0) the acquire is a no-op and only the display
 // registration happens, matching historical autocommit behaviour.
 // M0118-0003 (lock-nowait).
-func lockRelationTransitively(ctx *Context, sess Session, dbOID uint32, mode string, lmMode lockmgr.Mode, nowait bool, tbl *catalog.Table, cat catalog.Catalog, visited map[uint32]bool) error {
+func lockRelationTransitively(ctx *Context, sess Session, dbOID uint32, mode string, lmMode lmgr.Mode, nowait bool, tbl *catalog.Table, cat catalog.Catalog, visited map[uint32]bool) error {
 	if visited[tbl.OID] {
 		return nil
 	}
@@ -21185,10 +22883,10 @@ func lockRelationTransitively(ctx *Context, sess Session, dbOID uint32, mode str
 	// (lmMode == NoLock). An explicit-transaction LOCK TABLE with a parsable mode
 	// takes a real tableLockMgr lock, which the bridge already surfaces with a
 	// real PID; recording it here too would double it in pg_locks.
-	if lmMode == lockmgr.NoLock || ctx.TxnLockBackendID == 0 {
+	if lmMode == lmgr.NoLock || ctx.TxnLockBackendID == 0 {
 		globalRelLockMgr.AddRelationLock(sess, dbOID, tbl.OID, mode)
 	}
-	if lmMode != lockmgr.NoLock {
+	if lmMode != lmgr.NoLock {
 		rel := storage.RelFileNode{DBOid: dbOID, RelOid: tbl.OID}
 		if err := ctx.acquireRelLockTxn(rel, lmMode, nowait); err != nil {
 			return err

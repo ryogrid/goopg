@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/testutil/tpch"
 )
 
@@ -36,7 +36,7 @@ func TestBuildTPCHQueries(t *testing.T) {
 			if len(stmts) == 0 {
 				t.Fatalf("no statements parsed")
 			}
-			node, err := planner.Plan(stmts[0], cat)
+			node, err := optimizer.Plan(stmts[0], cat)
 			if err != nil {
 				t.Fatalf("plan: %v", err)
 			}

@@ -4,10 +4,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // TestInsertRuntimeUniqueViolationRaises23505 pins the M0100-0005r fix:
@@ -30,12 +30,12 @@ func TestInsertRuntimeUniqueViolationRaises23505(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := btree.Create(ctx.Pool, cat.IndexRelFileNode(idx)); err != nil {
+	if _, err := nbtree.Create(ctx.Pool, cat.IndexRelFileNode(idx)); err != nil {
 		t.Fatal(err)
 	}
 
-	insert := func(rows [][]planner.Expr) error {
-		op, err := Build(&planner.Insert{Table: tbl, Source: &planner.Values{Rows: rows}, ColumnIndex: []int{0, 1}})
+	insert := func(rows [][]optimizer.Expr) error {
+		op, err := Build(&optimizer.Insert{Table: tbl, Source: &optimizer.Values{Rows: rows}, ColumnIndex: []int{0, 1}})
 		if err != nil {
 			return err
 		}
@@ -50,10 +50,10 @@ func TestInsertRuntimeUniqueViolationRaises23505(t *testing.T) {
 		return err
 	}
 
-	if err := insert([][]planner.Expr{{&planner.IntegerConst{Value: 42}, &planner.StringConst{Value: "a"}}}); err != nil {
+	if err := insert([][]optimizer.Expr{{&optimizer.IntegerConst{Value: 42}, &optimizer.StringConst{Value: "a"}}}); err != nil {
 		t.Fatalf("first insert: %v", err)
 	}
-	err = insert([][]planner.Expr{{&planner.IntegerConst{Value: 42}, &planner.StringConst{Value: "b"}}})
+	err = insert([][]optimizer.Expr{{&optimizer.IntegerConst{Value: 42}, &optimizer.StringConst{Value: "b"}}})
 	if err == nil {
 		t.Fatal("second insert with duplicate id=42 should have failed; got nil")
 	}
@@ -84,12 +84,12 @@ func TestInsertRuntimeUniqueViolationAllowsAfterRolledBackInsert(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := btree.Create(ctx.Pool, cat.IndexRelFileNode(idx)); err != nil {
+	if _, err := nbtree.Create(ctx.Pool, cat.IndexRelFileNode(idx)); err != nil {
 		t.Fatal(err)
 	}
 
-	insert := func(rows [][]planner.Expr) error {
-		op, err := Build(&planner.Insert{Table: tbl, Source: &planner.Values{Rows: rows}, ColumnIndex: []int{0, 1}})
+	insert := func(rows [][]optimizer.Expr) error {
+		op, err := Build(&optimizer.Insert{Table: tbl, Source: &optimizer.Values{Rows: rows}, ColumnIndex: []int{0, 1}})
 		if err != nil {
 			return err
 		}
@@ -104,7 +104,7 @@ func TestInsertRuntimeUniqueViolationAllowsAfterRolledBackInsert(t *testing.T) {
 		return err
 	}
 
-	if err := insert([][]planner.Expr{{&planner.IntegerConst{Value: 7}, &planner.StringConst{Value: "x"}}}); err != nil {
+	if err := insert([][]optimizer.Expr{{&optimizer.IntegerConst{Value: 7}, &optimizer.StringConst{Value: "x"}}}); err != nil {
 		t.Fatalf("first insert: %v", err)
 	}
 	abortedXID := ctx.Tx.XID
@@ -129,7 +129,7 @@ func TestInsertRuntimeUniqueViolationAllowsAfterRolledBackInsert(t *testing.T) {
 		t.Fatalf("snapshot.Aborted missing prior xid %d (got %v)", abortedXID, snap.Aborted)
 	}
 
-	if err := insert([][]planner.Expr{{&planner.IntegerConst{Value: 7}, &planner.StringConst{Value: "y"}}}); err != nil {
+	if err := insert([][]optimizer.Expr{{&optimizer.IntegerConst{Value: 7}, &optimizer.StringConst{Value: "y"}}}); err != nil {
 		t.Fatalf("post-rollback insert should succeed; got: %v", err)
 	}
 
@@ -218,15 +218,15 @@ func uniqueCheckFixture(t *testing.T) (*Context, *catalog.Table, []catalog.Colum
 		cleanup()
 		t.Fatal(err)
 	}
-	if _, err := btree.Create(ctx.Pool, cat.IndexRelFileNode(idx)); err != nil {
+	if _, err := nbtree.Create(ctx.Pool, cat.IndexRelFileNode(idx)); err != nil {
 		cleanup()
 		t.Fatal(err)
 	}
 	insert := func(id int64, label string) {
 		t.Helper()
-		op, err := Build(&planner.Insert{
+		op, err := Build(&optimizer.Insert{
 			Table:       tbl,
-			Source:      &planner.Values{Rows: [][]planner.Expr{{&planner.IntegerConst{Value: id}, &planner.StringConst{Value: label}}}},
+			Source:      &optimizer.Values{Rows: [][]optimizer.Expr{{&optimizer.IntegerConst{Value: id}, &optimizer.StringConst{Value: label}}}},
 			ColumnIndex: []int{0, 1},
 		})
 		if err != nil {

@@ -3,8 +3,8 @@ package executor
 import (
 	"testing"
 
-	"github.com/goopg/goopg/internal/multixact"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam/multixact"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -398,9 +398,9 @@ func TestStampUpdaterXmaxPreservingLockers(t *testing.T) {
 // beginTxn opens a fresh READ_COMMITTED transaction on the same mvcc
 // manager as ctx. Used by the concurrent-update tests to simulate
 // two clients hitting the same row.
-func beginTxn(t *testing.T, ctx *Context) mvcc.Transaction {
+func beginTxn(t *testing.T, ctx *Context) transam.Transaction {
 	t.Helper()
-	tx, err := ctx.TxnMgr.Begin(mvcc.IsolationReadCommitted)
+	tx, err := ctx.TxnMgr.Begin(transam.IsolationReadCommitted)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}

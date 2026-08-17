@@ -9,10 +9,10 @@ import (
 	"os"
 	"time"
 
-	"github.com/goopg/goopg/internal/activity"
-	"github.com/goopg/goopg/internal/hashsize"
-	"github.com/goopg/goopg/internal/pgtemp"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/utils/activity"
+	"github.com/goopg/goopg/internal/executor/hashsize"
+	"github.com/goopg/goopg/internal/storage/file"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // spillWriter writes Row slices to a temporary file using a binary
@@ -64,7 +64,7 @@ func newSpillWriter(ctx *Context) (*spillWriter, error) {
 // registry itself (which resolves the directory once per statement) and for
 // tests that want a t.TempDir() with no Context at all.
 func newSpillWriterInDir(dir string) (*spillWriter, error) {
-	f, err := os.CreateTemp(dir, pgtemp.FilePattern(os.Getpid()))
+	f, err := os.CreateTemp(dir, file.FilePattern(os.Getpid()))
 	if err != nil {
 		return nil, fmt.Errorf("spillWriter: create temp file: %w", err)
 	}
@@ -651,11 +651,11 @@ func drainRowsToOp(op Operator) (Operator, error) {
 type rowsOp struct {
 	rows   []Row
 	idx    int
-	schema planner.Schema
+	schema optimizer.Schema
 }
 
 func (o *rowsOp) Open(*Context) error    { o.idx = 0; return nil }
-func (o *rowsOp) Schema() planner.Schema { return o.schema } // schema comes from joinOp/upstream
+func (o *rowsOp) Schema() optimizer.Schema { return o.schema } // schema comes from joinOp/upstream
 func (o *rowsOp) Next() (TupleSlot, error) {
 	if o.idx >= len(o.rows) {
 		return nil, EOF
@@ -678,7 +678,7 @@ type spillOp struct {
 }
 
 func (o *spillOp) Open(*Context) error    { return nil }
-func (o *spillOp) Schema() planner.Schema { return nil }
+func (o *spillOp) Schema() optimizer.Schema { return nil }
 
 func (o *spillOp) Next() (TupleSlot, error) {
 	row, err := o.r.ReadRowInto(o.out)

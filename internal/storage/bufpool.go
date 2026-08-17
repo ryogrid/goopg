@@ -8,8 +8,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/goopg/goopg/internal/runtimeshim"
-	"github.com/goopg/goopg/internal/stats"
+	"github.com/goopg/goopg/internal/port/runtimeshim"
+	"github.com/goopg/goopg/internal/utils/activity/stats"
 	"runtime"
 	"time"
 )

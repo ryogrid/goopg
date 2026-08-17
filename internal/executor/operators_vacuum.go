@@ -6,11 +6,11 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/storage/lmgr"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
-	"github.com/goopg/goopg/internal/vacuum"
+	"github.com/goopg/goopg/internal/commands/vacuum"
 )
 
 // vacuumOp executes a VACUUM statement, running heap page-prune on the
@@ -18,14 +18,14 @@ import (
 // resulting state (M0046-0003/0004/0005). VACUUM without a target list
 // vacuums all user tables.
 type vacuumOp struct {
-	plan *planner.Utility
+	plan *optimizer.Utility
 	ctx  *Context
 	done bool
 }
 
-func newVacuumOp(p *planner.Utility) *vacuumOp { return &vacuumOp{plan: p} }
+func newVacuumOp(p *optimizer.Utility) *vacuumOp { return &vacuumOp{plan: p} }
 
-func (o *vacuumOp) Schema() planner.Schema { return nil }
+func (o *vacuumOp) Schema() optimizer.Schema { return nil }
 
 func (o *vacuumOp) Open(ctx *Context) error {
 	o.ctx = ctx
@@ -80,11 +80,15 @@ func (o *vacuumOp) Next() (TupleSlot, error) {
 	// ShareUpdateExclusiveLock otherwise (vacuum.c vacuum_open_relation); with
 	// SKIP_LOCKED the acquire is conditional and a contended relation is skipped
 	// instead of waited on. M0118-0008 (vacuum-skip-locked).
-	lmMode := lockmgr.ShareUpdateExclusiveLock
+	lmMode := lmgr.ShareUpdateExclusiveLock
 	if vs.Full {
-		lmMode = lockmgr.AccessExclusiveLock
+		lmMode = lmgr.AccessExclusiveLock
 	}
-	targets, parents := o.expandVacuumTargets(vs)
+	targets, parents, terr := o.expandVacuumTargets(vs)
+	if terr != nil {
+		// A bad column list aborts the whole VACUUM ANALYZE (not suppressed).
+		return nil, terr
+	}
 	for _, vt := range targets {
 		tbl := vt.tbl
 		rel := o.ctx.Catalog.RelFileNode(tbl)
@@ -225,7 +229,7 @@ type vacuumTarget struct {
 // partitions (the parent itself has no storage). It returns the flat target
 // list plus the partitioned parents encountered, which the caller uses to drive
 // the inheritance-statistics AccessShare scan when ANALYZE is requested.
-func (o *vacuumOp) expandVacuumTargets(vs *parser.VacuumStmt) ([]vacuumTarget, []*catalog.Table) {
+func (o *vacuumOp) expandVacuumTargets(vs *parser.VacuumStmt) ([]vacuumTarget, []*catalog.Table, *ExecError) {
 	// Named targets resolve through ctxPlanCatalog — the per-connection,
 	// DB-scoped catalog SELECT plans against — mirroring expandAnalyzeTargets
 	// (sibling paths change together): a raw ctx.Catalog.LookupTable keys off
@@ -254,10 +258,20 @@ func (o *vacuumOp) expandVacuumTargets(vs *parser.VacuumStmt) ([]vacuumTarget, [
 		out = append(out, vacuumTarget{tbl: tbl, explicit: explicit})
 	}
 	if len(vs.Targets) > 0 {
-		for _, name := range vs.Targets {
+		for i, name := range vs.Targets {
 			tbl, ok := cat.LookupTable(name)
 			if !ok {
 				continue
+			}
+			// VACUUM ANALYZE with a per-relation column list (VACUUM ANALYZE
+			// tab (col, ...)): validate the names — PG aborts the whole
+			// statement on a bad column (42703/42701, analyze.c:372-400).
+			// Plain VACUUM ignores va_cols (analyze_rel is never reached), so
+			// only the ANALYZE verb validates.
+			if vs.Analyze && i < len(vs.TargetCols) && vs.TargetCols[i] != nil {
+				if cerr := resolveAnalyzeColumns(tbl, vs.TargetCols[i], vs.Pos()); cerr != nil {
+					return nil, nil, cerr
+				}
 			}
 			// Maintenance-privilege check (vacuum_is_permitted_to_vacuum). A
 			// non-superuser session (SET ROLE) may only vacuum a relation it owns
@@ -272,7 +286,7 @@ func (o *vacuumOp) expandVacuumTargets(vs *parser.VacuumStmt) ([]vacuumTarget, [
 			}
 			add(tbl, true)
 		}
-		return out, parents
+		return out, parents, nil
 	}
 	// Database-wide VACUUM: every user table, none "explicitly" named, so a
 	// SKIP_LOCKED skip is silent (matches PG's autovacuum-style log suppression).
@@ -283,7 +297,7 @@ func (o *vacuumOp) expandVacuumTargets(vs *parser.VacuumStmt) ([]vacuumTarget, [
 			}
 		}
 	}
-	return out, parents
+	return out, parents, nil
 }
 
 // analyzeInheritanceWait reproduces the AccessShareLock that ANALYZE of a
@@ -304,7 +318,7 @@ func analyzeInheritanceWait(ctx *Context, parent *catalog.Table) {
 			continue
 		}
 		rel := ctx.Catalog.RelFileNode(child)
-		_ = ctx.acquireRelLockMaybeTransient(rel, lockmgr.AccessShareLock)
+		_ = ctx.acquireRelLockMaybeTransient(rel, lmgr.AccessShareLock)
 	}
 }
 

@@ -1,0 +1,6 @@
+                    product_name                    | store_name | store_zip  | b_street_number | b_street_name |    b_city    |   b_zip    | c_street_number | c_street_name |   c_city   |   c_zip    | syear | cnt |  s11  |  s21   |  s31   |  s12  |  s22  | s32  | syear | cnt 
+----------------------------------------------------+------------+------------+-----------------+---------------+--------------+------------+-----------------+---------------+------------+------------+-------+-----+-------+--------+--------+-------+-------+------+-------+-----
+ priableantiantiought                               | eing       | 35709      | 817             | Third         | Mount Vernon | 68482      | 85              | Third Cherry  | Greenville | 31387      |  1999 |   1 | 10.89 |  19.81 |   0.00 | 43.72 | 80.44 | 0.00 |  2000 |   1
+ priableantiantiought                               | ought      | 31904      | 326             | Madison       | Bethel       | 75281      | 231             | 8th 4th       | Elkton     | 53481      |  1999 |   1 | 81.69 | 152.76 | 525.50 |  9.05 | 10.58 | 0.00 |  2000 |   1
+(2 rows)
+

@@ -16,7 +16,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // aggTestOp gives the tests access to the REAL transition and finalize
@@ -25,23 +25,23 @@ import (
 // with the transition function's own state representation is exactly the bug
 // this file exists to catch.
 func aggTestOp(ctx *Context) *aggregateOp {
-	return &aggregateOp{ctx: ctx, plan: &planner.Aggregate{}}
+	return &aggregateOp{ctx: ctx, plan: &optimizer.Aggregate{}}
 }
 
 // applyAggValue feeds one value through the real transition function.
-func applyAggValue(ctx *Context, call planner.AggregateCall, st *aggRuntime, v Datum) error {
+func applyAggValue(ctx *Context, call optimizer.AggregateCall, st *aggRuntime, v Datum) error {
 	op := aggTestOp(ctx)
-	slot := SlotFromRow(planner.Schema{{Name: "v"}}, Row{v})
+	slot := SlotFromRow(optimizer.Schema{{Name: "v"}}, Row{v})
 	c := call
-	c.Arg = &planner.ColumnRef{Index: 0}
+	c.Arg = &optimizer.ColumnRef{Index: 0}
 	return op.applyAgg(st, c, slot)
 }
 
 // finishAggValue runs the real finalize function.
-func finishAggValue(ctx *Context, call planner.AggregateCall, st *aggRuntime) (Datum, error) {
+func finishAggValue(ctx *Context, call optimizer.AggregateCall, st *aggRuntime) (Datum, error) {
 	op := aggTestOp(ctx)
 	c := call
-	c.Arg = &planner.ColumnRef{Index: 0}
+	c.Arg = &optimizer.ColumnRef{Index: 0}
 	return op.finishAgg(*st, c)
 }
 
@@ -64,7 +64,7 @@ func TestAggregateIsDecomposableWhitelist(t *testing.T) {
 		"var_pop", "var_samp", "variance", "stddev", "stddev_pop", "stddev_samp",
 		"regr_count", "regr_sxx", "covar_pop", "corr",
 	} {
-		if !aggregateIsDecomposable(planner.AggregateCall{Name: name}) {
+		if !aggregateIsDecomposable(optimizer.AggregateCall{Name: name}) {
 			t.Errorf("%s should be decomposable", name)
 		}
 	}
@@ -73,33 +73,28 @@ func TestAggregateIsDecomposableWhitelist(t *testing.T) {
 	// silently stops refusing is how wrong results ship.
 	for _, tc := range []struct {
 		what string
-		call planner.AggregateCall
+		call optimizer.AggregateCall
 	}{
-		{"array_agg (order-dependent)", planner.AggregateCall{Name: "array_agg"}},
-		{"string_agg (order-dependent)", planner.AggregateCall{Name: "string_agg"}},
-		{"DISTINCT (needs global dedup)", planner.AggregateCall{Name: "count", Distinct: true}},
-		{"ORDER BY inside the aggregate", planner.AggregateCall{Name: "sum", OrderBy: []planner.SortKey{{}}}},
-		{"percentile_cont (WITHIN GROUP)", planner.AggregateCall{Name: "percentile_cont"}},
-		{"user aggregate without COMBINEFUNC", planner.AggregateCall{
+		{"array_agg (order-dependent)", optimizer.AggregateCall{Name: "array_agg"}},
+		{"string_agg (order-dependent)", optimizer.AggregateCall{Name: "string_agg"}},
+		{"DISTINCT (needs global dedup)", optimizer.AggregateCall{Name: "count", Distinct: true}},
+		{"ORDER BY inside the aggregate", optimizer.AggregateCall{Name: "sum", OrderBy: []optimizer.SortKey{{}}}},
+		{"percentile_cont (WITHIN GROUP)", optimizer.AggregateCall{Name: "percentile_cont"}},
+		{"user aggregate without COMBINEFUNC", optimizer.AggregateCall{
 			Name: "myagg", UserAgg: &catalog.UserAggregate{SFunc: "f"}}},
+		{"user aggregate declaring COMBINEFUNC (no combine rule for user aggs)",
+			optimizer.AggregateCall{Name: "myagg", UserAgg: &catalog.UserAggregate{SFunc: "f", CombineFunc: "c"}}},
 	} {
 		if aggregateIsDecomposable(tc.call) {
 			t.Errorf("%s must NOT be decomposable", tc.what)
 		}
 	}
 
-	// A user aggregate WITH a combine function is decomposable — that is what
-	// COMBINEFUNC is for, and goopg already parses and stores it.
-	if !aggregateIsDecomposable(planner.AggregateCall{
-		Name: "myagg", UserAgg: &catalog.UserAggregate{SFunc: "f", CombineFunc: "c"}}) {
-		t.Error("a user aggregate declaring COMBINEFUNC should be decomposable")
-	}
-
 	// The whitelist must refuse anything it does not know. applyAgg's default
 	// arm silently does `count++; sum += arg.Int` for unrecognised names, so a
 	// blacklist would let a future aggregate split through it and return
 	// garbage.
-	if aggregateIsDecomposable(planner.AggregateCall{Name: "some_future_aggregate"}) {
+	if aggregateIsDecomposable(optimizer.AggregateCall{Name: "some_future_aggregate"}) {
 		t.Error("an unknown aggregate must be refused, not guessed at")
 	}
 }
@@ -116,7 +111,7 @@ type aggHarness struct {
 
 func (h *aggHarness) run(values []Datum, parts int) (serial, combined Datum) {
 	h.t.Helper()
-	call := planner.AggregateCall{Name: h.name, InputType: h.input}
+	call := optimizer.AggregateCall{Name: h.name, InputType: h.input}
 	ctx := NewContext()
 
 	apply := func(st *aggRuntime, vals []Datum) {
@@ -144,7 +139,7 @@ func (h *aggHarness) run(values []Datum, parts int) (serial, combined Datum) {
 	return h.finish(&whole, call, ctx), h.finish(&acc, call, ctx)
 }
 
-func (h *aggHarness) finish(st *aggRuntime, call planner.AggregateCall, ctx *Context) Datum {
+func (h *aggHarness) finish(st *aggRuntime, call optimizer.AggregateCall, ctx *Context) Datum {
 	h.t.Helper()
 	d, err := finishAggValue(ctx, call, st)
 	if err != nil {
@@ -205,7 +200,7 @@ func TestCombineVarianceMatchesSerial(t *testing.T) {
 // happens whenever a group's rows all land in other workers' blocks.
 func TestCombineVarianceEmptyPartial(t *testing.T) {
 	ctx := NewContext()
-	call := planner.AggregateCall{Name: "var_pop", InputType: catalog.Type{Name: "float8"}}
+	call := optimizer.AggregateCall{Name: "var_pop", InputType: catalog.Type{Name: "float8"}}
 
 	var withData, empty aggRuntime
 	for _, v := range ints(2, 4, 6) {

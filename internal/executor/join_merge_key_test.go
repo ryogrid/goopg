@@ -27,7 +27,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // twoKeyMergePlan builds a merge join over two int equalities with HashKeys
@@ -39,25 +39,25 @@ import (
 // `mergeResidual` here is whatever `withPredicate` supplies rather than the
 // narrowed split — which is why the residual-emptying assertion lives in the
 // planner test and this file parameterises over the residual instead.
-func twoKeyMergePlan(jt planner.JoinType, leftWidth int, withPredicate bool) *planner.Join {
-	col := func(idx int) *planner.ColumnRef {
-		return &planner.ColumnRef{Index: idx, Type: catalog.Type{Name: "int4"}}
+func twoKeyMergePlan(jt optimizer.JoinType, leftWidth int, withPredicate bool) *optimizer.Join {
+	col := func(idx int) *optimizer.ColumnRef {
+		return &optimizer.ColumnRef{Index: idx, Type: catalog.Type{Name: "int4"}}
 	}
-	eq := func(l, r int) planner.Expr {
-		return &planner.BinaryOp{Op: parser.OpEq, Left: col(l), Right: col(r)}
+	eq := func(l, r int) optimizer.Expr {
+		return &optimizer.BinaryOp{Op: parser.OpEq, Left: col(l), Right: col(r)}
 	}
-	j := &planner.Join{
+	j := &optimizer.Join{
 		Type:     jt,
-		Algo:     planner.JoinAlgoMerge,
+		Algo:     optimizer.JoinAlgoMerge,
 		LeftKey:  col(0),
 		RightKey: col(leftWidth),
-		HashKeys: []planner.JoinKeyPair{
+		HashKeys: []optimizer.JoinKeyPair{
 			{Left: col(0), Right: col(leftWidth)},
 			{Left: col(1), Right: col(leftWidth + 1)},
 		},
 	}
 	if withPredicate {
-		j.Predicate = &planner.BinaryOp{
+		j.Predicate = &optimizer.BinaryOp{
 			Op:    parser.OpAnd,
 			Left:  eq(0, leftWidth),
 			Right: eq(1, leftWidth+1),
@@ -132,7 +132,7 @@ func TestMergeKeyTupleSplitsPinnedLeadColumnGroups(t *testing.T) {
 	const leftWidth = 2
 	const nRows = 64
 
-	o := &joinOp{plan: twoKeyMergePlan(planner.JoinTypeInner, leftWidth, true)}
+	o := &joinOp{plan: twoKeyMergePlan(optimizer.JoinTypeInner, leftWidth, true)}
 	o.initMergeKeys()
 	if len(o.mergeKeys) != 2 {
 		t.Fatalf("merge join adopted %d key pair(s), want both", len(o.mergeKeys))
@@ -174,7 +174,7 @@ func TestMergeJoinFullKeyLeftOuterNullSecondKey(t *testing.T) {
 
 	for _, withPredicate := range []bool{true, false} {
 		o := &joinOp{
-			plan:  twoKeyMergePlan(planner.JoinTypeLeft, width, withPredicate),
+			plan:  twoKeyMergePlan(optimizer.JoinTypeLeft, width, withPredicate),
 			left:  &rowsOp{rows: leftRows},
 			right: &rowsOp{rows: rightRows},
 		}

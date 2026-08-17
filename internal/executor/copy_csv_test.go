@@ -32,7 +32,7 @@ func TestCopyCsvForceQuoteHeader(t *testing.T) {
 	}
 
 	row := Row{NewStringDatum("a")}
-	got, err := EncodeCopyCsvRow(nil, row, cols, f, "ISO", "MDY", "UTC", nil, false)
+	got, err := EncodeCopyCsvRow(nil, row, cols, f, "ISO", "MDY", "UTC", "hex", nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +58,7 @@ func TestCopyCsvDefaultsAndQuoting(t *testing.T) {
 	// a: contains a comma → quoted; b: NULL → empty unquoted; c: contains
 	// a quote → quoted with the quote doubled.
 	row := Row{NewStringDatum("x,y"), NullDatum, NewStringDatum(`he"llo`)}
-	got, err := EncodeCopyCsvRow(nil, row, cols, f, "ISO", "MDY", "UTC", nil, false)
+	got, err := EncodeCopyCsvRow(nil, row, cols, f, "ISO", "MDY", "UTC", "hex", nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}

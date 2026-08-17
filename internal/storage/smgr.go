@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/goopg/goopg/internal/config"
+	"github.com/goopg/goopg/internal/utils/misc"
 )
 
 // Manager is the storage manager. It owns one open file per loaded
@@ -650,7 +650,7 @@ func relDir(rel RelFileNode) string {
 		return sharedOrPerDBRelDir(rel.DBOid)
 	}
 	return "pg_tblspc/" + strconv.FormatUint(uint64(rel.TblOid), 10) + "/" +
-		config.TablespaceVersionDirectory + "/" + fmt.Sprint(rel.DBOid)
+		misc.TablespaceVersionDirectory + "/" + fmt.Sprint(rel.DBOid)
 }
 
 func (m *Manager) relPath(rel RelFileNode) string {

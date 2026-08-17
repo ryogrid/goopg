@@ -1,0 +1,4 @@
+ s_store_name | s_company_name | d_year | avg_monthly_sales | sum_sales | psum | nsum 
+--------------+----------------+--------+-------------------+-----------+------+------
+(0 rows)
+

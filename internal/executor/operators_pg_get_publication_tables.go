@@ -16,11 +16,11 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 type pgGetPublicationTablesOp struct {
-	plan *planner.PgGetPublicationTables
+	plan *optimizer.PgGetPublicationTables
 	ctx  *Context
 	rows []Row
 	pos  int
@@ -34,11 +34,11 @@ type pgGetPublicationTablesOp struct {
 	outerSlot SlotView
 }
 
-func newPgGetPublicationTablesOp(p *planner.PgGetPublicationTables) *pgGetPublicationTablesOp {
+func newPgGetPublicationTablesOp(p *optimizer.PgGetPublicationTables) *pgGetPublicationTablesOp {
 	return &pgGetPublicationTablesOp{plan: p}
 }
 
-func (o *pgGetPublicationTablesOp) Schema() planner.Schema { return o.plan.Output() }
+func (o *pgGetPublicationTablesOp) Schema() optimizer.Schema { return o.plan.Output() }
 
 func (o *pgGetPublicationTablesOp) Open(ctx *Context) error {
 	o.ctx = ctx

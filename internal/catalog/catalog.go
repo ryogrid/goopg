@@ -17,7 +17,7 @@ import (
 	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/sqlkeywords"
+	"github.com/goopg/goopg/internal/parser/sqlkeywords"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -242,6 +242,7 @@ type NamedNotNullConstraint struct {
 	ColName   string // column this constraint applies to
 	OID       uint32 // synthetic OID for pg_constraint virtual table
 	NoInherit bool   // PG18: NOT NULL NO INHERIT
+	NotValid  bool   // convalidated='f': added NOT VALID, not yet VALIDATE'd
 	IsLocal   bool   // conislocal: true if locally declared
 	InhCount  int    // coninhcount: how many parents (plain-INHERITS or partition) enforce this NOT NULL
 }
@@ -250,9 +251,9 @@ type NamedNotNullConstraint struct {
 // isLocal=true means the constraint is locally declared (attislocal or explicitly
 // re-declared); inhCount counts enforcing parents — 0 for a purely local
 // constraint, 1 for one inheriting/partition parent that also enforces it.
-func (t *Table) AddNotNull(name, colName string, oid uint32, noInherit bool, isLocal bool, inhCount int) {
+func (t *Table) AddNotNull(name, colName string, oid uint32, noInherit, notValid bool, isLocal bool, inhCount int) {
 	t.NotNullConstraints = append(t.NotNullConstraints, NamedNotNullConstraint{
-		Name: name, ColName: colName, OID: oid, NoInherit: noInherit,
+		Name: name, ColName: colName, OID: oid, NoInherit: noInherit, NotValid: notValid,
 		IsLocal: isLocal, InhCount: inhCount,
 	})
 }
@@ -6696,7 +6697,11 @@ func (c *InMemory) PGConstraintRowsForDBOid(dbOid uint32) [][]string {
 			row[3] = "n" // contype = not null
 			row[4] = "f"
 			row[5] = "f"
-			row[6] = "t"
+			if nc.NotValid {
+				row[6] = "f" // convalidated — added NOT VALID, not yet validated
+			} else {
+				row[6] = "t" // convalidated
+			}
 			row[7] = fmt.Sprintf("%d", tbl.OID)
 			row[8] = "0"
 			row[9] = "0"
@@ -20614,6 +20619,60 @@ func BuildIndexDef(idx *Index) string {
 		sb.WriteString(idx.PredicateString)
 	}
 	return sb.String()
+}
+
+// BuildIndexDefColumn renders just the colno-th index attribute (1-based,
+// key columns first then INCLUDE columns, matching pg_index.indkey/indnatts
+// ordering) with none of the CREATE INDEX wrapper or per-column decoration
+// (COLLATE / opclass / ASC-DESC / NULLS). This is the `attrsOnly = true`
+// branch of ruleutils.c pg_get_indexdef_worker, entered by pg_get_indexdef_ext
+// (ruleutils.c:1198-1217) whenever the SQL-callable pg_get_indexdef(oid,
+// colno, pretty) is invoked with colno != 0: attrsOnly disables the closing
+// paren, NULLS NOT DISTINCT, WITH (options), tablespace and WHERE clauses,
+// AND the whole "Print additional decoration for (selected) key columns"
+// block (ruleutils.c:1459 `if (!attrsOnly && ...)`), leaving only the bare
+// column name or parenthesized expression text for the requested column.
+// An out-of-range colno (verified empirically against a live PG 18.3
+// instance — no regress-suite coverage exercises this) returns an empty
+// string, NOT NULL: pg_get_indexdef_worker never special-cases colno range,
+// it simply never matches `colno == keyno + 1` in the loop and returns the
+// (still-valid, just empty) StringInfo buffer. NULL is reserved for the
+// index OID itself not resolving (missing_ok path). DU-002 / M0134-0002 C19.
+func BuildIndexDefColumn(idx *Index, colno int) string {
+	if colno <= 0 {
+		return ""
+	}
+	total := len(idx.Columns) + len(idx.IncludeColumns)
+	if colno > total {
+		return ""
+	}
+	i := colno - 1
+	if i < len(idx.Columns) {
+		col := idx.Columns[i]
+		if col != "" {
+			return col
+		}
+		// Expression column: same paren-wrapping rule as BuildIndexDef's
+		// main loop (ruleutils.c:1444-1453 `looks_like_function`).
+		exprStr := ""
+		if i < len(idx.ColExprStrings) {
+			exprStr = idx.ColExprStrings[i]
+		}
+		if exprStr == "" {
+			return "(expr)"
+		}
+		var keyAST *parser.Expr
+		if i < len(idx.ColExprs) {
+			keyAST = idx.ColExprs[i]
+		}
+		if indexKeyIsBareFuncCall(keyAST) {
+			return exprStr
+		}
+		return "(" + exprStr + ")"
+	}
+	// INCLUDE column: always a simple column name, no expressions allowed
+	// there (PG rejects expressions in INCLUDE lists at CREATE INDEX time).
+	return idx.IncludeColumns[i-len(idx.Columns)]
 }
 
 // AllIndexes returns every index in the catalog, sorted by OID.

@@ -1,0 +1,10 @@
+   customer_id    |  customername   
+------------------+-----------------
+ AAAAAAAAGCCDAAAA | Rudd, Kathy
+ AAAAAAAAGKGGBAAA | Brown, Steven
+ AAAAAAAAHFANAAAA | Berry, Angela
+ AAAAAAAAINJAAAAA | Malcolm, Adolfo
+ AAAAAAAAJHMNAAAA | , Chrystal
+ AAAAAAAAMAHGBAAA | Mccarthy, Cliff
+(6 rows)
+

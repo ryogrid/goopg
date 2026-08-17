@@ -1938,6 +1938,22 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 			if t := p.cur(); t.Kind == TokenKeyword && t.Keyword == KwLike {
 				pos := t.Pos
 				p.advance()
+				// `expr LIKE ANY|SOME|ALL (array)` — ScalarArrayOpExpr,
+				// same desugaring as the regex operators below. M0134-0003.
+				if isAnyOrSomeTok(p.cur()) || isAllTok(p.cur()) {
+					allQuant := isAllTok(p.cur())
+					p.advance() // ANY / SOME / ALL
+					inExpr, err := p.parseAnyTail(left, pos)
+					if err != nil {
+						return nil, err
+					}
+					if ie, ok := inExpr.(*InExpr); ok {
+						ie.AnyOp = OpLike
+						ie.AllOp = allQuant
+					}
+					left = inExpr
+					continue
+				}
 				rhs, err := p.parseExprPrec(precCompare + 1)
 				if err != nil {
 					return nil, err
@@ -1950,6 +1966,21 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				pos := t.Pos
 				p.advance() // NOT
 				p.advance() // LIKE
+				// `expr NOT LIKE ANY|SOME|ALL (array)`. M0134-0003.
+				if isAnyOrSomeTok(p.cur()) || isAllTok(p.cur()) {
+					allQuant := isAllTok(p.cur())
+					p.advance() // ANY / SOME / ALL
+					inExpr, err := p.parseAnyTail(left, pos)
+					if err != nil {
+						return nil, err
+					}
+					if ie, ok := inExpr.(*InExpr); ok {
+						ie.AnyOp = OpNotLike
+						ie.AllOp = allQuant
+					}
+					left = inExpr
+					continue
+				}
 				rhs, err := p.parseExprPrec(precCompare + 1)
 				if err != nil {
 					return nil, err
@@ -1961,6 +1992,21 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 			if t := p.cur(); t.Kind == TokenKeyword && t.Keyword == KwIlike {
 				pos := t.Pos
 				p.advance()
+				// `expr ILIKE ANY|SOME|ALL (array)`. M0134-0003.
+				if isAnyOrSomeTok(p.cur()) || isAllTok(p.cur()) {
+					allQuant := isAllTok(p.cur())
+					p.advance() // ANY / SOME / ALL
+					inExpr, err := p.parseAnyTail(left, pos)
+					if err != nil {
+						return nil, err
+					}
+					if ie, ok := inExpr.(*InExpr); ok {
+						ie.AnyOp = OpILike
+						ie.AllOp = allQuant
+					}
+					left = inExpr
+					continue
+				}
 				rhs, err := p.parseExprPrec(precCompare + 1)
 				if err != nil {
 					return nil, err
@@ -1973,6 +2019,21 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				pos := t.Pos
 				p.advance() // NOT
 				p.advance() // ILIKE
+				// `expr NOT ILIKE ANY|SOME|ALL (array)`. M0134-0003.
+				if isAnyOrSomeTok(p.cur()) || isAllTok(p.cur()) {
+					allQuant := isAllTok(p.cur())
+					p.advance() // ANY / SOME / ALL
+					inExpr, err := p.parseAnyTail(left, pos)
+					if err != nil {
+						return nil, err
+					}
+					if ie, ok := inExpr.(*InExpr); ok {
+						ie.AnyOp = OpNotILike
+						ie.AllOp = allQuant
+					}
+					left = inExpr
+					continue
+				}
 				rhs, err := p.parseExprPrec(precCompare + 1)
 				if err != nil {
 					return nil, err
@@ -4348,7 +4409,15 @@ func (p *parser) parseFuncCallTail(pos int, name ObjectName) (Expr, error) {
 func (p *parser) maybeWindowTail(fc *FuncCall) (Expr, error) {
 	// WITHIN GROUP (ORDER BY sortlist) — ordered-set aggregate.
 	// `within` is an identifier (not a reserved keyword), so use acceptIdentKeyword.
+	// Record the `within` token's offset: PG's "cannot use multiple ORDER BY
+	// clauses with WITHIN GROUP" caret points at this keyword (gram.y
+	// func_expr: parser_errposition(@2)). M0134-0001 P3b.
+	withinPos := 0
+	if t := p.cur(); t.Kind == TokenIdent && strings.EqualFold(t.Value, "within") {
+		withinPos = t.Pos
+	}
 	if p.acceptIdentKeyword("within") {
+		fc.WithinGroupPos = withinPos
 		if !p.acceptKeyword(KwGroup) {
 			return nil, p.errAtCur("expected GROUP after WITHIN")
 		}

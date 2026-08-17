@@ -2,9 +2,10 @@ package executor
 
 import (
 	"fmt"
+	"net"
 	"strings"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/catalog"
 )
 
@@ -159,8 +160,8 @@ func timeTzKeyParts(v Datum) (gmtMicros int64, pgZone int32) {
 func encodeTimeTzBTreeKey(v Datum) []byte {
 	gmt, pgZone := timeTzKeyParts(v)
 	key := make([]byte, 0, 12)
-	key = append(key, btree.EncodeInt8(gmt)...)
-	return append(key, btree.EncodeInt4(pgZone)...)
+	key = append(key, nbtree.EncodeInt8(gmt)...)
+	return append(key, nbtree.EncodeInt4(pgZone)...)
 }
 
 // coerceScalarKeyStringDatum resolves an unknown-literal probe (`WHERE b =
@@ -239,7 +240,7 @@ func encodeScalarBTreeKey(v Datum, col *catalog.Column, pos int) (key []byte, ha
 			return nil, true, &ExecError{Code: "22003", Pos: pos,
 				Message: fmt.Sprintf("value %d out of int2 range for index key", v.Int)}
 		}
-		return btree.EncodeInt4(int32(v.Int)), true, nil
+		return nbtree.EncodeInt4(int32(v.Int)), true, nil
 	case isOidType(col.Type.Name):
 		if v.Kind != KindInt {
 			return nil, true, &ExecError{Code: "42804", Pos: pos,
@@ -251,22 +252,22 @@ func encodeScalarBTreeKey(v Datum, col *catalog.Column, pos int) (key []byte, ha
 		}
 		// Unsigned compare: the value is already in 0..2^32-1, so the int8 key
 		// orders it exactly as oidcmp does.
-		return btree.EncodeInt8(v.Int), true, nil
+		return nbtree.EncodeInt8(v.Int), true, nil
 	case isBoolType(col.Type.Name):
 		if v.Kind != KindBool {
 			return nil, true, &ExecError{Code: "42804", Pos: pos,
 				Message: fmt.Sprintf("column %q is not boolean at runtime", col.Name)}
 		}
 		if v.BoolValue() {
-			return btree.EncodeInt4(1), true, nil
+			return nbtree.EncodeInt4(1), true, nil
 		}
-		return btree.EncodeInt4(0), true, nil
+		return nbtree.EncodeInt4(0), true, nil
 	case isByteaType(col.Type.Name):
 		if v.Kind != KindBytes {
 			return nil, true, &ExecError{Code: "42804", Pos: pos,
 				Message: fmt.Sprintf("column %q is not bytea at runtime", col.Name)}
 		}
-		return btree.EncodeVarchar(v.BytesValue()), true, nil
+		return nbtree.EncodeVarchar(v.BytesValue()), true, nil
 	case isTimeTzType(col.Type.Name):
 		if v.Kind != KindTime {
 			return nil, true, &ExecError{Code: "42804", Pos: pos,
@@ -285,7 +286,7 @@ func encodeScalarBTreeKey(v Datum, col *catalog.Column, pos int) (key []byte, ha
 		}
 		// pgTimeMicros is the codec's own time-of-day extraction, so the key
 		// derives from the same microseconds the heap stores.
-		return btree.EncodeInt8(pgTimeMicros(v.TimeValue())), true, nil
+		return nbtree.EncodeInt8(pgTimeMicros(v.TimeValue())), true, nil
 	}
 	return nil, false, nil
 }
@@ -305,7 +306,7 @@ func decodeScalarBTreeKey(key []byte, typeName string) (d Datum, n int, handled 
 		if len(key) < 4 {
 			return NullDatum, 0, true, fmt.Errorf("btree: int2 key truncated, got %d bytes", len(key))
 		}
-		v, derr := btree.DecodeInt4(key[:4])
+		v, derr := nbtree.DecodeInt4(key[:4])
 		return Datum{Kind: KindInt, Int: int64(v)}, 4, true, derr
 	// reg* types share oid's 8-byte unsigned key form (their default opclass is
 	// oid_ops → oidcmp, the same EncodeInt8 the oid arm uses), so this single
@@ -316,19 +317,19 @@ func decodeScalarBTreeKey(key []byte, typeName string) (d Datum, n int, handled 
 		if len(key) < 8 {
 			return NullDatum, 0, true, fmt.Errorf("btree: oid key truncated, got %d bytes", len(key))
 		}
-		v, derr := btree.DecodeInt8(key[:8])
+		v, derr := nbtree.DecodeInt8(key[:8])
 		return Datum{Kind: KindInt, Int: v}, 8, true, derr
 	case isBoolType(typeName):
 		if len(key) < 4 {
 			return NullDatum, 0, true, fmt.Errorf("btree: bool key truncated, got %d bytes", len(key))
 		}
-		v, derr := btree.DecodeInt4(key[:4])
+		v, derr := nbtree.DecodeInt4(key[:4])
 		if derr != nil {
 			return NullDatum, 0, true, derr
 		}
 		return NewBoolDatum(v != 0), 4, true, nil
 	case isByteaType(typeName):
-		raw, n, derr := btree.DecodeVarcharLen(key)
+		raw, n, derr := nbtree.DecodeVarcharLen(key)
 		if derr != nil {
 			return NullDatum, 0, true, derr
 		}
@@ -337,11 +338,11 @@ func decodeScalarBTreeKey(key []byte, typeName string) (d Datum, n int, handled 
 		if len(key) < 12 {
 			return NullDatum, 0, true, fmt.Errorf("btree: timetz key truncated, got %d bytes", len(key))
 		}
-		gmt, derr := btree.DecodeInt8(key[:8])
+		gmt, derr := nbtree.DecodeInt8(key[:8])
 		if derr != nil {
 			return NullDatum, 0, true, derr
 		}
-		pgZone, derr := btree.DecodeInt4(key[8:12])
+		pgZone, derr := nbtree.DecodeInt4(key[8:12])
 		if derr != nil {
 			return NullDatum, 0, true, derr
 		}
@@ -358,11 +359,71 @@ func decodeScalarBTreeKey(key []byte, typeName string) (d Datum, n int, handled 
 		if len(key) < 8 {
 			return NullDatum, 0, true, fmt.Errorf("btree: time key truncated, got %d bytes", len(key))
 		}
-		v, derr := btree.DecodeInt8(key[:8])
+		v, derr := nbtree.DecodeInt8(key[:8])
 		if derr != nil {
 			return NullDatum, 0, true, derr
 		}
 		return NewTimeDatum(pgTimeFromMicros(v)), 8, true, nil
+	case isInetType(typeName), isCidrType(typeName):
+		// M0134-0002 C5: inverts encodeInetBTreeKey. The key is fixed-width
+		// and self-describing (the family byte selects the address width), so
+		// a composite walk consumes exactly this column. The reconstructed
+		// text is the canonical network_out form (mask printed only when it is
+		// not the family default for inet, always for cidr).
+		d, n, derr := decodeInetBTreeKey(key, isCidrType(typeName))
+		return d, n, true, derr
 	}
 	return NullDatum, 0, false, nil
+}
+
+// decodeInetBTreeKey inverts encodeInetBTreeKey (operators_ddl.go): reads the
+// fixed-width [family][masked-network-addr][bits][full-addr] key back into the
+// canonical inet/cidr text. The family byte selects the address width (2 →
+// 4-byte IPv4, 3 → 16-byte IPv6), so the consumed length is deterministic:
+// 1+4+1+4 = 10 bytes for IPv4, 1+16+1+16 = 34 bytes for IPv6. The OUTPUT text
+// uses the full (host-bit-carrying) address — the same network_in keeps for
+// inet — so re-encoding the decoded text reproduces the key byte-for-byte.
+func decodeInetBTreeKey(key []byte, isCidr bool) (Datum, int, error) {
+	if len(key) < 2 {
+		return NullDatum, 0, fmt.Errorf("btree: inet key truncated, got %d bytes", len(key))
+	}
+	var width int
+	switch key[0] {
+	case 2: // PGSQL_AF_INET
+		width = 4
+	case 3: // PGSQL_AF_INET6
+		width = 16
+	default:
+		return NullDatum, 0, fmt.Errorf("btree: inet key has invalid family byte %d", key[0])
+	}
+	n := 1 + width + 1 + width
+	if len(key) < n {
+		return NullDatum, 0, fmt.Errorf("btree: inet key truncated, got %d bytes", len(key))
+	}
+	// Masked network addr: key[1 : 1+width] (not needed for output; the full
+	// address below is the value network_in stores).
+	bits := int(key[1+width])
+	fullAddr := key[1+width+1 : n]
+	return NewStringDatum(formatInetKeyText(key[0], fullAddr, bits, isCidr)), n, nil
+}
+
+// formatInetKeyText renders an inet/cidr address in PG's canonical network_out
+// form (network.c:140-162 + inet_net_ntop_ipv4 / inet_net_ntop_ipv6,
+// port/inet_net_ntop.c): dotted quad for IPv4, colon-hex (Go's canonical IPv6
+// form, which matches PG's ::-run compression and lowercase hex for the
+// practical cases) for IPv6. The /bits suffix is printed when bits is not the
+// family default (32/128) for INET, and ALWAYS for CIDR — cidr_out appends
+// /n whenever inet_net_ntop's rendering lacks it (network.c:155-159). The
+// always-on cidr mask is what keeps a cidr round-trip lossless: '10.0.0.1/32'
+//::cidr outputs '10.0.0.1/32', not the classful-reparse '10.0.0.1'.
+func formatInetKeyText(family byte, addr []byte, bits int, isCidr bool) string {
+	maxBits := 32
+	if family != 2 {
+		maxBits = 128
+	}
+	s := net.IP(addr).String()
+	if isCidr || bits != maxBits {
+		return fmt.Sprintf("%s/%d", s, bits)
+	}
+	return s
 }

@@ -15,24 +15,24 @@ package executor
 import (
 	"strings"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 type projectSetOp struct {
-	plan   *planner.ProjectSet
+	plan   *optimizer.ProjectSet
 	child  Operator
-	schema planner.Schema
+	schema optimizer.Schema
 
 	ctx  *Context
 	rows []Row
 	pos  int
 }
 
-func newProjectSetOp(p *planner.ProjectSet, child Operator) *projectSetOp {
+func newProjectSetOp(p *optimizer.ProjectSet, child Operator) *projectSetOp {
 	return &projectSetOp{plan: p, child: child, schema: p.Output()}
 }
 
-func (o *projectSetOp) Schema() planner.Schema { return o.schema }
+func (o *projectSetOp) Schema() optimizer.Schema { return o.schema }
 
 func (o *projectSetOp) Open(ctx *Context) error {
 	o.ctx = ctx

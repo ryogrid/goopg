@@ -7,7 +7,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // runDMLUnderDBOid is like runDDL, but plans the statement through a
@@ -28,7 +28,7 @@ func runDMLUnderDBOid(t *testing.T, ctx *Context, sql string) error {
 	}
 	planCat := catalog.WithSearchPath(ctx.Catalog, nil)
 	planCat.DBOid = ctx.CurrentDatabaseOid
-	plan, err := planner.Plan(stmts[0], planCat)
+	plan, err := optimizer.Plan(stmts[0], planCat)
 	if err != nil {
 		t.Fatalf("Plan(%q): %v", sql, err)
 	}
@@ -58,7 +58,7 @@ func runQueryUnderDBOid(t *testing.T, ctx *Context, sql string) []Row {
 	}
 	planCat := catalog.WithSearchPath(ctx.Catalog, nil)
 	planCat.DBOid = ctx.CurrentDatabaseOid
-	plan, err := planner.Plan(stmts[0], planCat)
+	plan, err := optimizer.Plan(stmts[0], planCat)
 	if err != nil {
 		t.Fatalf("Plan(%q): %v", sql, err)
 	}
@@ -189,7 +189,7 @@ func TestPgClassResolvesUnderFreshDistinctDBOid(t *testing.T) {
 	}
 	planCat := catalog.WithSearchPath(ctx.Catalog, nil)
 	planCat.DBOid = ctx.CurrentDatabaseOid
-	if _, err := planner.Plan(stmts[0], planCat); err == nil {
+	if _, err := optimizer.Plan(stmts[0], planCat); err == nil {
 		t.Fatal("expected \"relation does not exist\" for a genuinely nonexistent table, got no error")
 	}
 }

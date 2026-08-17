@@ -34,7 +34,7 @@ package executor
 
 import (
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/pgarray"
+	"github.com/goopg/goopg/internal/utils/adt/array"
 )
 
 // indexKeyColumnIsDecodable reports whether decodeBTreeKeyToDatum /
@@ -50,7 +50,7 @@ func indexKeyColumnIsDecodable(col catalog.Column) bool {
 		// the recursion decodeArrayBTreeKey performs: an array key is
 		// invertible exactly when its elements are, both as VALUES (the
 		// element's own scalar key) and as TEXT (arrayKeyElemRenderer).
-		if arrayKeyElemRenderer(name, pgarray.DefaultOutputStyle()) == nil {
+		if arrayKeyElemRenderer(name, array.DefaultOutputStyle()) == nil {
 			return false
 		}
 		return indexKeyColumnIsDecodable(catalog.Column{Name: col.Name, Type: catalog.Type{Name: name}})

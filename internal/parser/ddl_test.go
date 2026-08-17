@@ -1144,6 +1144,38 @@ func TestParseColumnDefCompression(t *testing.T) {
 	}
 }
 
+// TestParseColumnDefStorage verifies that a per-column `STORAGE <mode>` clause
+// (`col type STORAGE {PLAIN|EXTERNAL|EXTENDED|MAIN}`, PG gram.y column_storage)
+// parses in CREATE TABLE column definitions and is captured onto ColumnDef.
+// Storage (lowercased). All four modes, case-insensitively, and composing with
+// a following NOT NULL. M0134-0002 C2 slice 9.
+func TestParseColumnDefStorage(t *testing.T) {
+	sql := `CREATE TABLE t (a int STORAGE PLAIN, b text STORAGE EXTENDED, c varchar STORAGE EXTERNAL NOT NULL, d numeric STORAGE MAIN, e timestamptz)`
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("expected 1 statement, got %d", len(stmts))
+	}
+	ct, ok := stmts[0].(*CreateTableStmt)
+	if !ok {
+		t.Fatalf("expected *CreateTableStmt, got %T", stmts[0])
+	}
+	wantStorage := []string{"plain", "extended", "external", "main", ""}
+	if len(ct.Columns) != len(wantStorage) {
+		t.Fatalf("expected %d columns, got %d", len(wantStorage), len(ct.Columns))
+	}
+	for i, want := range wantStorage {
+		if got := ct.Columns[i].Storage; got != want {
+			t.Errorf("col[%d].Storage=%q, want %q", i, got, want)
+		}
+	}
+	if !ct.Columns[2].NotNull {
+		t.Errorf("col[2].NotNull=false, want true (STORAGE must not swallow NOT NULL)")
+	}
+}
+
 // TestParseColumnDefFDWOptions verifies that a per-column `OPTIONS (name
 // 'value', …)` clause on a CREATE FOREIGN TABLE column is captured onto
 // ColumnDef.FDWOptions (normalized "name=value" pairs, matching

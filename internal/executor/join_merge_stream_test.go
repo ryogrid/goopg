@@ -31,24 +31,24 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/pgtemp"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/storage/file"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
-func mergeStreamCol(idx int) *planner.ColumnRef {
-	return &planner.ColumnRef{Index: idx, Type: catalog.Type{Name: "int4"}}
+func mergeStreamCol(idx int) *optimizer.ColumnRef {
+	return &optimizer.ColumnRef{Index: idx, Type: catalog.Type{Name: "int4"}}
 }
 
 // mergeStreamPlan is a single-key merge join over width-2 rows: column 0 is
 // the key, column 1 the payload. residual is the ON-clause remainder (nil =
 // the all-equijoin steady state P2.3 produces).
-func mergeStreamPlan(jt planner.JoinType, leftWidth int, residual planner.Expr) *planner.Join {
-	return &planner.Join{
+func mergeStreamPlan(jt optimizer.JoinType, leftWidth int, residual optimizer.Expr) *optimizer.Join {
+	return &optimizer.Join{
 		Type:      jt,
-		Algo:      planner.JoinAlgoMerge,
+		Algo:      optimizer.JoinAlgoMerge,
 		LeftKey:   mergeStreamCol(0),
 		RightKey:  mergeStreamCol(leftWidth),
-		HashKeys:  []planner.JoinKeyPair{{Left: mergeStreamCol(0), Right: mergeStreamCol(leftWidth)}},
+		HashKeys:  []optimizer.JoinKeyPair{{Left: mergeStreamCol(0), Right: mergeStreamCol(leftWidth)}},
 		Predicate: residual,
 	}
 }
@@ -90,19 +90,19 @@ func mergeStreamRight() []Row {
 // payload 201 outright, so inside key 2's group one outer row matches nothing
 // (the intra-group MJFillOuter arm) and one inner row is matched by nobody
 // (the RIGHT/FULL sweep arm) — the two arms an all-equijoin join never reaches.
-func mergeStreamResidual() planner.Expr {
-	return &planner.BinaryOp{
+func mergeStreamResidual() optimizer.Expr {
+	return &optimizer.BinaryOp{
 		Op: parser.OpAnd,
-		Left: &planner.BinaryOp{
-			Op: parser.OpNe, Left: mergeStreamCol(1), Right: &planner.IntegerConst{Value: 21},
+		Left: &optimizer.BinaryOp{
+			Op: parser.OpNe, Left: mergeStreamCol(1), Right: &optimizer.IntegerConst{Value: 21},
 		},
-		Right: &planner.BinaryOp{
-			Op: parser.OpNe, Left: mergeStreamCol(3), Right: &planner.IntegerConst{Value: 201},
+		Right: &optimizer.BinaryOp{
+			Op: parser.OpNe, Left: mergeStreamCol(3), Right: &optimizer.IntegerConst{Value: 201},
 		},
 	}
 }
 
-func runMergeStream(t *testing.T, jt planner.JoinType, residual planner.Expr, workMem int64) []string {
+func runMergeStream(t *testing.T, jt optimizer.JoinType, residual optimizer.Expr, workMem int64) []string {
 	t.Helper()
 	o := &joinOp{
 		plan:  mergeStreamPlan(jt, 2, residual),
@@ -128,12 +128,12 @@ func runMergeStream(t *testing.T, jt planner.JoinType, residual planner.Expr, wo
 func TestMergeJoinSpilledRunIsIdenticalToResident(t *testing.T) {
 	types := []struct {
 		name string
-		jt   planner.JoinType
+		jt   optimizer.JoinType
 	}{
-		{"inner", planner.JoinTypeInner},
-		{"left", planner.JoinTypeLeft},
-		{"right", planner.JoinTypeRight},
-		{"full", planner.JoinTypeFull},
+		{"inner", optimizer.JoinTypeInner},
+		{"left", optimizer.JoinTypeLeft},
+		{"right", optimizer.JoinTypeRight},
+		{"full", optimizer.JoinTypeFull},
 	}
 	for _, tc := range types {
 		for _, withResidual := range []bool{false, true} {
@@ -142,7 +142,7 @@ func TestMergeJoinSpilledRunIsIdenticalToResident(t *testing.T) {
 				name += "/residual"
 			}
 			t.Run(name, func(t *testing.T) {
-				var residual planner.Expr
+				var residual optimizer.Expr
 				if withResidual {
 					residual = mergeStreamResidual()
 				}
@@ -173,12 +173,12 @@ func TestMergeJoinSpilledRunIsIdenticalToResident(t *testing.T) {
 func TestMergeJoinInnerAnswersArePGShaped(t *testing.T) {
 	cases := []struct {
 		name string
-		jt   planner.JoinType
+		jt   optimizer.JoinType
 		want []string
 	}{
 		{
 			name: "inner",
-			jt:   planner.JoinTypeInner,
+			jt:   optimizer.JoinTypeInner,
 			want: []string{
 				"2,20,2,200", "2,20,2,201", "2,20,2,202", "2,20,2,203",
 				"2,21,2,200", "2,21,2,201", "2,21,2,202", "2,21,2,203",
@@ -188,7 +188,7 @@ func TestMergeJoinInnerAnswersArePGShaped(t *testing.T) {
 		},
 		{
 			name: "left",
-			jt:   planner.JoinTypeLeft,
+			jt:   optimizer.JoinTypeLeft,
 			want: []string{
 				"1,10,,",
 				"2,20,2,200", "2,20,2,201", "2,20,2,202", "2,20,2,203",
@@ -205,7 +205,7 @@ func TestMergeJoinInnerAnswersArePGShaped(t *testing.T) {
 			// A right-only key and the NULL-keyed inner row are
 			// null-extended on the LEFT; the NULL-keyed one comes last.
 			name: "right",
-			jt:   planner.JoinTypeRight,
+			jt:   optimizer.JoinTypeRight,
 			want: []string{
 				"2,20,2,200", "2,20,2,201", "2,20,2,202", "2,20,2,203",
 				"2,21,2,200", "2,21,2,201", "2,21,2,202", "2,21,2,203",
@@ -253,7 +253,7 @@ func TestMergeJoinDoesNotAccumulateOutput(t *testing.T) {
 		right = append(right, Row{NewIntDatum(1), NewIntDatum(int64(i))})
 	}
 	o := &joinOp{
-		plan:  mergeStreamPlan(planner.JoinTypeInner, 2, nil),
+		plan:  mergeStreamPlan(optimizer.JoinTypeInner, 2, nil),
 		left:  &rowsOp{rows: left},
 		right: &rowsOp{rows: right},
 	}
@@ -303,7 +303,7 @@ func TestMergeJoinDoesNotAccumulateOutput(t *testing.T) {
 // deregistered by Close, not left for the statement-end sweep (M0127-P3.3).
 func TestMergeJoinReleasesSpillFilesOnClose(t *testing.T) {
 	o := &joinOp{
-		plan:  mergeStreamPlan(planner.JoinTypeFull, 2, mergeStreamResidual()),
+		plan:  mergeStreamPlan(optimizer.JoinTypeFull, 2, mergeStreamResidual()),
 		left:  &rowsOp{rows: mergeStreamLeft()},
 		right: &rowsOp{rows: mergeStreamRight()},
 	}
@@ -313,7 +313,7 @@ func TestMergeJoinReleasesSpillFilesOnClose(t *testing.T) {
 	if _, err := Run(o, ctx); err != nil {
 		t.Fatalf("merge join: %v", err)
 	}
-	dir := pgtemp.Dir(ctx.DataDir)
+	dir := file.Dir(ctx.DataDir)
 	entries, err := os.ReadDir(dir)
 	if err != nil && !os.IsNotExist(err) {
 		t.Fatalf("ReadDir(%s): %v", dir, err)
@@ -336,7 +336,7 @@ func TestMergeJoinReleasesSpillFilesOnClose(t *testing.T) {
 // three out.
 func TestMergeJoinSpillsInnerGroupPastWorkMem(t *testing.T) {
 	o := &joinOp{
-		plan:  mergeStreamPlan(planner.JoinTypeInner, 2, nil),
+		plan:  mergeStreamPlan(optimizer.JoinTypeInner, 2, nil),
 		left:  &rowsOp{rows: mergeStreamLeft()},
 		right: &rowsOp{rows: mergeStreamRight()},
 	}

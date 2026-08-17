@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/pgnodes"
+	"github.com/goopg/goopg/internal/nodes"
 )
 
 // benchLogStubResolver mirrors the pgnodes resolver_query_test stub so this test
@@ -12,17 +12,17 @@ import (
 // decode. bench_log(client int4, src text), relid 16384.
 type benchLogStubResolver struct{}
 
-func (benchLogStubResolver) LookupRelation(schema, name string) (*pgnodes.RelationInfo, bool) {
+func (benchLogStubResolver) LookupRelation(schema, name string) (*nodes.RelationInfo, bool) {
 	if (schema != "" && schema != "public") || name != "bench_log" {
 		return nil, false
 	}
-	return &pgnodes.RelationInfo{
+	return &nodes.RelationInfo{
 		Relid:   16384,
 		Relname: "bench_log",
 		Relkind: 'r',
-		Columns: []pgnodes.ColumnInfo{
-			{Name: "client", Attno: 1, TypeOID: pgnodes.OidInt4, Typmod: -1, Collation: 0},
-			{Name: "src", Attno: 2, TypeOID: pgnodes.OidText, Typmod: -1, Collation: pgnodes.DefaultCollationOid},
+		Columns: []nodes.ColumnInfo{
+			{Name: "client", Attno: 1, TypeOID: nodes.OidInt4, Typmod: -1, Collation: 0},
+			{Name: "src", Attno: 2, TypeOID: nodes.OidText, Typmod: -1, Collation: nodes.DefaultCollationOid},
 		},
 	}, true
 }
@@ -39,11 +39,11 @@ func canonicalEvAction(t *testing.T, sql string) string {
 	if !ok {
 		t.Fatalf("parse %q: not a SelectStmt", sql)
 	}
-	q, err := pgnodes.ResolveViewQuery(sel, benchLogStubResolver{})
+	q, err := nodes.ResolveViewQuery(sel, benchLogStubResolver{})
 	if err != nil {
 		t.Fatalf("ResolveViewQuery %q: %v", sql, err)
 	}
-	return pgnodes.OutRuleAction([]pgnodes.Node{q})
+	return nodes.OutRuleAction([]nodes.Node{q})
 }
 
 // TestRebuildViewFromEvAction is the reload-side gate for M0123-S3 sub-slice 2c:

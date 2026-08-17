@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // setupRangeScanFixture creates a table with a timestamp column, inserts
@@ -62,8 +62,10 @@ func setupRangeScanFixture(t *testing.T) (*Context, func()) {
 }
 
 // TestRangeIndexScanLowerBoundOnly verifies that a single >= predicate
-// on an indexed timestamp column uses Filter(IndexScan) and returns
-// the correct rows (id >= 1995-01-01 → ids 3, 4, 5, 6).
+// on an indexed timestamp column uses the IndexScan directly (M0134-0001
+// S4: the scan implements the >= bound INCLUSIVELY via LowOp=OpGe, so the
+// Filter is dropped for a single-conjunct WHERE) and returns the correct
+// rows (id >= 1995-01-01 → ids 3, 4, 5, 6).
 func TestRangeIndexScanLowerBoundOnly(t *testing.T) {
 	ctx, cleanup := setupRangeScanFixture(t)
 	defer cleanup()
@@ -71,17 +73,18 @@ func TestRangeIndexScanLowerBoundOnly(t *testing.T) {
 	sql := "SELECT id FROM events WHERE ts >= timestamp '1995-01-01'"
 	plan := planOne(t, sql, ctx.Catalog)
 
-	// Verify planner chose Filter(IndexScan).
-	proj, ok := plan.(*planner.Project)
+	// Verify planner chose IndexScan directly (no Filter: the single >=
+	// conjunct is fully implemented by the scan).
+	proj, ok := plan.(*optimizer.Project)
 	if !ok {
 		t.Fatalf("root=%T want *planner.Project", plan)
 	}
-	f, ok := proj.Child.(*planner.Filter)
+	idx, ok := proj.Child.(*optimizer.IndexScan)
 	if !ok {
-		t.Fatalf("child=%T want *planner.Filter(IndexScan)", proj.Child)
+		t.Fatalf("child=%T want *planner.IndexScan (Filter dropped for single range conjunct)", proj.Child)
 	}
-	if _, ok := f.Child.(*planner.IndexScan); !ok {
-		t.Fatalf("Filter.Child=%T want *planner.IndexScan", f.Child)
+	if idx.LowOp != parser.OpGe {
+		t.Fatalf("IndexScan.LowOp=%v want OpGe (inclusive lower bound)", idx.LowOp)
 	}
 
 	op, err := Build(plan)
@@ -126,15 +129,15 @@ func TestRangeIndexScanTwoSided(t *testing.T) {
 	plan := planOne(t, sql, ctx.Catalog)
 
 	// Verify planner chose Filter(IndexScan).
-	proj, ok := plan.(*planner.Project)
+	proj, ok := plan.(*optimizer.Project)
 	if !ok {
 		t.Fatalf("root=%T want *planner.Project", plan)
 	}
-	f, ok := proj.Child.(*planner.Filter)
+	f, ok := proj.Child.(*optimizer.Filter)
 	if !ok {
 		t.Fatalf("child=%T want *planner.Filter(IndexScan)", proj.Child)
 	}
-	idx, ok := f.Child.(*planner.IndexScan)
+	idx, ok := f.Child.(*optimizer.IndexScan)
 	if !ok {
 		t.Fatalf("Filter.Child=%T want *planner.IndexScan", f.Child)
 	}
@@ -155,8 +158,9 @@ func TestRangeIndexScanTwoSided(t *testing.T) {
 	}
 
 	// Rows with 1994-01-01 <= ts < 1996-01-01: ids 2 (1994-06-15), 3 (1995-01-01), 4 (1995-06-01)
-	// Note: 1996-01-01 is exclusive (< not <=), but since RangeScan uses inclusive bounds
-	// and the Filter re-applies the predicate, id=5 (1996-01-01) will be filtered out.
+	// Note: 1996-01-01 is exclusive (< not <=), so the scan itself stops
+	// EXCLUSIVELY (M0134-0001 S4: HighOp=OpLt) and id=5 (1996-01-01) is not
+	// emitted; the kept Filter re-applies the predicate as a second guard.
 	if len(rows) != 3 {
 		t.Fatalf("rows=%d want 3 (ids 2,3,4); rows=%v", len(rows), rows)
 	}
@@ -195,11 +199,11 @@ func TestRangeIndexScanCountMatchesSeqScan(t *testing.T) {
 	plan := planOne(t, sqlIdx, ctx.Catalog)
 
 	// Verify planner chose index scan path (not seq scan)
-	proj, ok := plan.(*planner.Project)
+	proj, ok := plan.(*optimizer.Project)
 	if !ok {
 		t.Fatalf("root=%T want *planner.Project", plan)
 	}
-	if _, ok := proj.Child.(*planner.Filter); !ok {
+	if _, ok := proj.Child.(*optimizer.Filter); !ok {
 		t.Fatalf("child=%T want *planner.Filter", proj.Child)
 	}
 

@@ -3,7 +3,7 @@ package executor
 import (
 	"testing"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // TestEvalSubstr pins PostgreSQL-compatible substr() semantics for the
@@ -12,57 +12,57 @@ import (
 func TestEvalSubstr(t *testing.T) {
 	cases := []struct {
 		name string
-		args []planner.Expr
+		args []optimizer.Expr
 		want Datum
 	}{
 		{
 			name: "Q22: country code prefix",
-			args: []planner.Expr{
-				&planner.StringConst{Value: "13-123-456-7890"},
-				&planner.IntegerConst{Value: 1},
-				&planner.IntegerConst{Value: 2},
+			args: []optimizer.Expr{
+				&optimizer.StringConst{Value: "13-123-456-7890"},
+				&optimizer.IntegerConst{Value: 1},
+				&optimizer.IntegerConst{Value: 2},
 			},
 			want: NewStringDatum("13"),
 		},
 		{
 			name: "two-argument tail form",
-			args: []planner.Expr{
-				&planner.StringConst{Value: "abcdef"},
-				&planner.IntegerConst{Value: 3},
+			args: []optimizer.Expr{
+				&optimizer.StringConst{Value: "abcdef"},
+				&optimizer.IntegerConst{Value: 3},
 			},
 			want: NewStringDatum("cdef"),
 		},
 		{
 			name: "start beyond end returns empty",
-			args: []planner.Expr{
-				&planner.StringConst{Value: "abc"},
-				&planner.IntegerConst{Value: 10},
-				&planner.IntegerConst{Value: 5},
+			args: []optimizer.Expr{
+				&optimizer.StringConst{Value: "abc"},
+				&optimizer.IntegerConst{Value: 10},
+				&optimizer.IntegerConst{Value: 5},
 			},
 			want: NewStringDatum(""),
 		},
 		{
 			name: "count truncates to string length",
-			args: []planner.Expr{
-				&planner.StringConst{Value: "abc"},
-				&planner.IntegerConst{Value: 1},
-				&planner.IntegerConst{Value: 99},
+			args: []optimizer.Expr{
+				&optimizer.StringConst{Value: "abc"},
+				&optimizer.IntegerConst{Value: 1},
+				&optimizer.IntegerConst{Value: 99},
 			},
 			want: NewStringDatum("abc"),
 		},
 		{
 			name: "NULL src propagates",
-			args: []planner.Expr{
-				&planner.NullConst{},
-				&planner.IntegerConst{Value: 1},
-				&planner.IntegerConst{Value: 2},
+			args: []optimizer.Expr{
+				&optimizer.NullConst{},
+				&optimizer.IntegerConst{Value: 1},
+				&optimizer.IntegerConst{Value: 2},
 			},
 			want: NullDatum,
 		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			fc := &planner.FuncCall{Name: "substr", Args: c.args}
+			fc := &optimizer.FuncCall{Name: "substr", Args: c.args}
 			got, err := evalFuncCall(fc, nil, &Context{})
 			if err != nil {
 				t.Fatalf("evalFuncCall: %v", err)
@@ -77,12 +77,12 @@ func TestEvalSubstr(t *testing.T) {
 // TestEvalSubstrNegativeCount errors per PG's behavior (SQLSTATE 22011
 // "negative substring length not allowed").
 func TestEvalSubstrNegativeCount(t *testing.T) {
-	fc := &planner.FuncCall{
+	fc := &optimizer.FuncCall{
 		Name: "substr",
-		Args: []planner.Expr{
-			&planner.StringConst{Value: "abc"},
-			&planner.IntegerConst{Value: 1},
-			&planner.IntegerConst{Value: -1},
+		Args: []optimizer.Expr{
+			&optimizer.StringConst{Value: "abc"},
+			&optimizer.IntegerConst{Value: 1},
+			&optimizer.IntegerConst{Value: -1},
 		},
 	}
 	if _, err := evalFuncCall(fc, nil, &Context{}); err == nil {
@@ -93,11 +93,11 @@ func TestEvalSubstrNegativeCount(t *testing.T) {
 // TestEvalToDate pins to_date() to the YYYY-MM-DD form HammerDB
 // TPC-H Q15 uses, plus a NULL-propagation case.
 func TestEvalToDate(t *testing.T) {
-	fc := &planner.FuncCall{
+	fc := &optimizer.FuncCall{
 		Name: "to_date",
-		Args: []planner.Expr{
-			&planner.StringConst{Value: "1996-01-01"},
-			&planner.StringConst{Value: "YYYY-MM-DD"},
+		Args: []optimizer.Expr{
+			&optimizer.StringConst{Value: "1996-01-01"},
+			&optimizer.StringConst{Value: "YYYY-MM-DD"},
 		},
 	}
 	got, err := evalFuncCall(fc, nil, &Context{})
@@ -115,11 +115,11 @@ func TestEvalToDate(t *testing.T) {
 		t.Fatalf("got time-of-day %02d:%02d:%02d, want 00:00:00", h, m, s)
 	}
 
-	null := &planner.FuncCall{
+	null := &optimizer.FuncCall{
 		Name: "to_date",
-		Args: []planner.Expr{
-			&planner.NullConst{},
-			&planner.StringConst{Value: "YYYY-MM-DD"},
+		Args: []optimizer.Expr{
+			&optimizer.NullConst{},
+			&optimizer.StringConst{Value: "YYYY-MM-DD"},
 		},
 	}
 	gotNull, err := evalFuncCall(null, nil, &Context{})

@@ -3,7 +3,7 @@ package executor
 import (
 	"testing"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // M0127-P0.2 — the single-pass hash build (design leftdeep-joins/05 §4, stage
@@ -28,14 +28,14 @@ import (
 // to perform: it copies each row into ONE shared buffer and returns a slot over
 // that buffer, so the previously returned Row is clobbered on every Next.
 type bufferReuseOp struct {
-	schema planner.Schema
+	schema optimizer.Schema
 	rows   []Row
 	i      int
 	buf    Row
 }
 
 func (o *bufferReuseOp) Open(*Context) error    { o.i = 0; return nil }
-func (o *bufferReuseOp) Schema() planner.Schema { return o.schema }
+func (o *bufferReuseOp) Schema() optimizer.Schema { return o.schema }
 func (o *bufferReuseOp) Close() error           { return nil }
 
 func (o *bufferReuseOp) Next() (TupleSlot, error) { //nolint:ireturn
@@ -88,19 +88,19 @@ func TestBuildLoopRightOwnsBuildRows(t *testing.T) {
 
 	for _, tc := range []struct {
 		name     string
-		joinType planner.JoinType
+		joinType optimizer.JoinType
 	}{
-		{"inner", planner.JoinTypeInner},
-		{"semi", planner.JoinTypeSemi}, // the string-map lane
+		{"inner", optimizer.JoinTypeInner},
+		{"semi", optimizer.JoinTypeSemi}, // the string-map lane
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			child := &bufferReuseOp{rows: buildProbeRows()}
 			o := &joinOp{
-				plan: &planner.Join{
+				plan: &optimizer.Join{
 					Type: tc.joinType,
-					Algo: planner.JoinAlgoHash,
+					Algo: optimizer.JoinAlgoHash,
 					// Real columns sit at [leftWidth, leftWidth+2).
-					RightKey: &planner.ColumnRef{Index: leftWidth},
+					RightKey: &optimizer.ColumnRef{Index: leftWidth},
 				},
 				right:  child,
 				lazyRW: 2,
@@ -121,11 +121,11 @@ func TestBuildLoopLeftOwnsBuildRows(t *testing.T) {
 
 	child := &bufferReuseOp{rows: buildProbeRows()}
 	o := &joinOp{
-		plan: &planner.Join{
-			Type: planner.JoinTypeInner,
-			Algo: planner.JoinAlgoHash,
+		plan: &optimizer.Join{
+			Type: optimizer.JoinTypeInner,
+			Algo: optimizer.JoinAlgoHash,
 			// Real columns sit at [0, 2) for the BuildLeft orientation.
-			LeftKey:   &planner.ColumnRef{Index: 0},
+			LeftKey:   &optimizer.ColumnRef{Index: 0},
 			BuildLeft: true,
 		},
 		left:   child,
@@ -152,10 +152,10 @@ func TestBuildLoopRightNullKeyBookkeeping(t *testing.T) {
 		{NewIntDatum(3), NewStringDatum("three")},
 	}}
 	o := &joinOp{
-		plan: &planner.Join{
-			Type:      planner.JoinTypeAnti,
-			Algo:      planner.JoinAlgoHash,
-			RightKey:  &planner.ColumnRef{Index: leftWidth},
+		plan: &optimizer.Join{
+			Type:      optimizer.JoinTypeAnti,
+			Algo:      optimizer.JoinAlgoHash,
+			RightKey:  &optimizer.ColumnRef{Index: leftWidth},
 			NullAware: true,
 		},
 		right:  child,
@@ -190,10 +190,10 @@ func BenchmarkSinglePassBuild(b *testing.B) {
 	child := &bufferReuseOp{rows: rows}
 	for b.Loop() {
 		o := &joinOp{
-			plan: &planner.Join{
-				Type:     planner.JoinTypeInner,
-				Algo:     planner.JoinAlgoHash,
-				RightKey: &planner.ColumnRef{Index: 0},
+			plan: &optimizer.Join{
+				Type:     optimizer.JoinTypeInner,
+				Algo:     optimizer.JoinAlgoHash,
+				RightKey: &optimizer.ColumnRef{Index: 0},
 			},
 			right:  child,
 			lazyRW: 2,

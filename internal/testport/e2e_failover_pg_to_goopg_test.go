@@ -21,7 +21,7 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/testutil/cluster"
 	"github.com/goopg/goopg/internal/testutil/pgcluster"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 type physicalFailoverMode struct {
@@ -322,12 +322,12 @@ func normalizePGWALSegmentNames(t *testing.T, dataDir string) {
 		if entry.IsDir() {
 			continue
 		}
-		tli, segno, ok := wal.ParseXLogFileName(entry.Name(), 16<<20)
+		tli, segno, ok := xlog.ParseXLogFileName(entry.Name(), 16<<20)
 		if !ok {
 			continue
 		}
 		oldPath := filepath.Join(dataDir, "pg_wal", entry.Name())
-		newName := wal.XLogFileName(tli, segno, 16<<20)
+		newName := xlog.XLogFileName(tli, segno, 16<<20)
 		newPath := filepath.Join(dataDir, "pg_wal", newName)
 		if oldPath == newPath {
 			continue

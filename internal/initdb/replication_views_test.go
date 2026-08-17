@@ -6,7 +6,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // TestStatReplicationRendersRegisteredSenders confirms the view's
@@ -15,7 +15,7 @@ import (
 // post-Advance state, and the row vanishes after Unregister.
 func TestStatReplicationRendersRegisteredSenders(t *testing.T) {
 	cat := catalog.NewInMemory()
-	senders := wal.NewSenders()
+	senders := xlog.NewSenders()
 	if err := registerStatReplicationView(cat, senders, nil, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -27,7 +27,7 @@ func TestStatReplicationRendersRegisteredSenders(t *testing.T) {
 		t.Fatalf("empty registry must yield 0 rows, got %d", len(got))
 	}
 
-	se := senders.Register(wal.SenderState{
+	se := senders.Register(xlog.SenderState{
 		PID:             4242,
 		ApplicationName: "standby01",
 		SlotName:        "phys_replica",
@@ -79,7 +79,7 @@ func TestStatReplicationRendersRegisteredSenders(t *testing.T) {
 // updates flow into the snapshot.
 func TestStatWalReceiverRendersWhenRegistered(t *testing.T) {
 	cat := catalog.NewInMemory()
-	receivers := wal.NewReceivers()
+	receivers := xlog.NewReceivers()
 	if err := registerStatWalReceiverView(cat, receivers); err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestStatWalReceiverRendersWhenRegistered(t *testing.T) {
 		t.Fatalf("no receiver: rows=%d, want 0", len(rows))
 	}
 
-	rec := receivers.Register(wal.ReceiverState{
+	rec := receivers.Register(xlog.ReceiverState{
 		PID:             1234,
 		Status:          "streaming",
 		ReceiveStartLSN: 0x100,
@@ -162,11 +162,11 @@ func TestFormatLSN(t *testing.T) {
 // slots and empty for physical ones.
 func TestPgReplicationSlotsViewRendersBothKinds(t *testing.T) {
 	dir := t.TempDir()
-	slots, err := wal.OpenSlots(dir)
+	slots, err := xlog.OpenSlots(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := slots.Create("phys1", wal.SlotPhysical, 0x100); err != nil {
+	if _, err := slots.Create("phys1", xlog.SlotPhysical, 0x100); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := slots.CreateLogical("logical1", "pgoutput", "appdb", 0x500); err != nil {
@@ -320,7 +320,7 @@ func TestPgSubscriptionViewRendersRows(t *testing.T) {
 // and disappear on Unregister.
 func TestStatSubscriptionRendersRegisteredSubscribers(t *testing.T) {
 	cat := catalog.NewInMemory()
-	subs := wal.NewSubscribers()
+	subs := xlog.NewSubscribers()
 	if err := registerStatSubscriptionView(cat, subs); err != nil {
 		t.Fatal(err)
 	}
@@ -332,17 +332,17 @@ func TestStatSubscriptionRendersRegisteredSubscribers(t *testing.T) {
 		t.Fatalf("empty registry must yield 0 rows, got %d", len(got))
 	}
 
-	leader := subs.Register(wal.SubscriberState{
+	leader := subs.Register(xlog.SubscriberState{
 		SubID:      42,
 		SubName:    "sub_test",
-		WorkerType: wal.SubscriberWorkerLeader,
+		WorkerType: xlog.SubscriberWorkerLeader,
 		PID:        1001,
 	})
 	leader.AdvanceReceivedLSN(0x100)
-	tablesync := subs.Register(wal.SubscriberState{
+	tablesync := subs.Register(xlog.SubscriberState{
 		SubID:      42,
 		SubName:    "sub_test",
-		WorkerType: wal.SubscriberWorkerTablesync,
+		WorkerType: xlog.SubscriberWorkerTablesync,
 		PID:        1002,
 		LeaderPID:  1001,
 		RelOID:     16400,

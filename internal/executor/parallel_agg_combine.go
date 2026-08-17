@@ -23,7 +23,7 @@ import (
 	"math/big"
 	"strings"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // normalizeAggName matches how applyAgg and finishAgg dispatch on the name
@@ -39,8 +39,8 @@ func normalizeAggName(n string) string { return strings.ToLower(strings.TrimSpac
 // what must refuse to combine one. Two copies of a whitelist would eventually
 // disagree, and the direction of that disagreement is a silent wrong answer:
 // the planner splitting something combineAggRuntime has no rule for.
-func aggregateIsDecomposable(call planner.AggregateCall) bool {
-	return planner.AggregateIsDecomposable(call)
+func aggregateIsDecomposable(call optimizer.AggregateCall) bool {
+	return optimizer.AggregateIsDecomposable(call)
 }
 
 // combineAggRuntime merges src into dst for the named aggregate.

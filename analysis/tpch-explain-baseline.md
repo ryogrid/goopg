@@ -91,13 +91,13 @@ Root node: `Projection`
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
 | 1 | Seq Scan | lineitem | — |
-| 2 | Seq Scan | part | — |
+| 2 | Seq Scan | customer | — |
 | 3 | Seq Scan | orders | — |
-| 4 | Seq Scan | supplier | — |
-| 5 | Seq Scan | nation n2 | — |
-| 6 | Seq Scan | customer | — |
-| 7 | Seq Scan | nation n1 | — |
-| 8 | Seq Scan | region | — |
+| 4 | Seq Scan | nation n1 | — |
+| 5 | Seq Scan | region | — |
+| 6 | Seq Scan | supplier | — |
+| 7 | Seq Scan | nation n2 | — |
+| 8 | Seq Scan | part | — |
 
 ### Q9
 

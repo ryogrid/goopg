@@ -41,7 +41,7 @@ package executor
 import (
 	"os"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // nlInnerWorkMemEnabled gates the work_mem bound on the nested loop's inner
@@ -129,10 +129,10 @@ func (o *joinOp) openNestedLoop(ctx *Context, captureCTID bool) error {
 		inner:     inner,
 		lw:        len(o.left.Schema()),
 		rw:        len(o.right.Schema()),
-		semiAnti:  o.plan.Type == planner.JoinTypeSemi || o.plan.Type == planner.JoinTypeAnti,
-		anti:      o.plan.Type == planner.JoinTypeAnti,
-		fillOuter: o.plan.Type == planner.JoinTypeLeft || o.plan.Type == planner.JoinTypeFull,
-		fillInner: o.plan.Type == planner.JoinTypeRight || o.plan.Type == planner.JoinTypeFull,
+		semiAnti:  o.plan.Type == optimizer.JoinTypeSemi || o.plan.Type == optimizer.JoinTypeAnti,
+		anti:      o.plan.Type == optimizer.JoinTypeAnti,
+		fillOuter: o.plan.Type == optimizer.JoinTypeLeft || o.plan.Type == optimizer.JoinTypeFull,
+		fillInner: o.plan.Type == optimizer.JoinTypeRight || o.plan.Type == optimizer.JoinTypeFull,
 	}
 	if captureCTID {
 		// The ctid side-channel is an optimisation for LockRows;

@@ -1,0 +1,10 @@
+# TPC-DS SF0.5 goopg sweep — 2026-07-29T06:26:07+09:00
+# goopg: 991fc9c3 bench(tpcds): M0124-0004 — "solo, fresh server" was true and still wrong: the nightly batch had the other 15 cores
+# oracle: /home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-results-sf05/oracle.txt (PG 18.3 plain-run row counts + value checksums)
+# timeout: 300s
+# SUBSET PROBE (QUERIES=3 96) — NOT a gate result; the summary below covers only these queries
+Q3   PASS        8s       31 rows  ck=n/a
+Q96  PASS       14s        1 rows  ck=n/a
+
+=== SUMMARY: PASS=2 (0 ck-verified, 2 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=0 ===
+# ck=n/a queries are row-count-only: a saturated LIMIT window has no stable row set.

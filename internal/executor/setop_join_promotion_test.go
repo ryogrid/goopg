@@ -9,7 +9,7 @@ import (
 // Cartesian product.
 //
 // Two planner defects stacked, and both are pinned here because each one
-// alone is enough to reproduce the `Nested Loop (CROSS)`:
+// alone is enough to reproduce the Cartesian-product `Nested Loop`:
 //
 //  1. `collectScanOutputNames` (planner/pushdown.go) had no `*SetOp` case,
 //     so `allColumnRefNamesInScope` never found the set operation's own
@@ -26,7 +26,7 @@ import (
 // Measured on the TPC-DS SF0.5 cluster (:65437) against the git-tracked PG
 // 18.3 oracle: Q5 Q8 Q14 Q54 Q71 all went TIMEOUT -> PASS with
 // oracle-identical row counts and value checksums (Q71 `580 rows
-// ck=521a7af7606d10c1`), and 30 `Nested Loop (CROSS)` nodes disappeared
+// ck=521a7af7606d10c1`), and 30 `Nested Loop` nodes disappeared
 // from the plan capture. See docs/design/0125-0034-setop-join-promotion.md.
 
 // setopJoinFixture builds the miniature TPC-DS Q71 shape: a dimension
@@ -69,7 +69,11 @@ const setopJoinQ71 = `select i_brand_id, i_brand, t_hour, t_minute, sum(ext_pric
 func TestSetOpJoinPromotesToHashJoin(t *testing.T) {
 	ctx := setopJoinFixture(t)
 	plan := strings.Join(runExplainRows(t, ctx, "EXPLAIN "+setopJoinQ71), "\n")
-	if strings.Contains(plan, "Nested Loop (CROSS)") {
+	if strings.Contains(plan, "Nested Loop") {
+		// A cross join renders as a bare `Nested Loop` (PG folds CROSS
+		// to INNER; explain.c 1754-1758), so any Nested Loop here is the
+		// unpromoted Cartesian product over the Append — all joins in the
+		// promoted plan are hash joins (see below).
 		t.Fatalf("equi-join across the set operation was not promoted:\n%s", plan)
 	}
 	if !strings.Contains(plan, "Hash Join") {
@@ -159,7 +163,10 @@ func TestIntersectJoinPromotesToHashJoin(t *testing.T) {
 	 where s_zip = zip and ss_name = s_name order by s_name`
 
 	plan := strings.Join(runExplainRows(t, ctx, "EXPLAIN "+q), "\n")
-	if strings.Contains(plan, "Nested Loop (CROSS)") {
+	if strings.Contains(plan, "Nested Loop") {
+		// See TestSetOpJoinPromotesToHashJoin: a cross join renders as a
+		// bare `Nested Loop`, so any Nested Loop here is the unpromoted
+		// Cartesian product over the INTERSECT.
 		t.Fatalf("equi-join across the INTERSECT was not promoted:\n%s", plan)
 	}
 	rows := runQuery(t, ctx, q)

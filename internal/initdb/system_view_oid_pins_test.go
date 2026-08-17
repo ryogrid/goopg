@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/config"
+	"github.com/goopg/goopg/internal/utils/misc"
 )
 
 // Guards for the M0131-S8a system-view OID policy
@@ -204,7 +204,7 @@ func TestSystemViewOIDPinsAreDisjointAndInBand(t *testing.T) {
 func TestSystemViewOIDPinsOracleStampMatchesTree(t *testing.T) {
 	// The tree's pinned PG version is the server_version GUC's BootVal —
 	// the same string a client sees in ParameterStatus.
-	sv, ok := config.BuildDefaultRegistry().Get("server_version")
+	sv, ok := misc.BuildDefaultRegistry().Get("server_version")
 	if !ok {
 		t.Fatal("server_version GUC missing from the default registry")
 	}
@@ -214,10 +214,10 @@ func TestSystemViewOIDPinsOracleStampMatchesTree(t *testing.T) {
 			"(docs/design/0131-0008-system-view-oid-policy.md §Guards 5)",
 			systemViewOIDOracleVersion, want)
 	}
-	if systemViewOIDOracleCatVersion != config.CatalogVersionNo {
+	if systemViewOIDOracleCatVersion != misc.CatalogVersionNo {
 		t.Errorf("pinned table captured from catversion %d but the tree pins "+
 			"%d — re-capture systemViewOIDPins()",
-			systemViewOIDOracleCatVersion, config.CatalogVersionNo)
+			systemViewOIDOracleCatVersion, misc.CatalogVersionNo)
 	}
 }
 

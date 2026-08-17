@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -87,13 +87,13 @@ func TestIndexBuildEntryKeyTupleCarriesTheRowsHeapTID(t *testing.T) {
 	if bytes.Equal(lo, hi) {
 		t.Fatal("two entries for different heap TIDs produced identical keys; the TID never reached the image")
 	}
-	if got := btree.BTreeTupleGetNAtts(lo, uint16(desc.NKeyAtts())); int(got) != desc.NKeyAtts() {
+	if got := nbtree.BTreeTupleGetNAtts(lo, uint16(desc.NKeyAtts())); int(got) != desc.NKeyAtts() {
 		t.Fatalf("entry natts = %d, want %d (a stored entry must not be a pivot)", got, desc.NKeyAtts())
 	}
-	if tid, ok := btree.BTreeTupleGetHeapTID(lo); !ok || tid.Block != 2 || tid.Offset != 1 {
+	if tid, ok := nbtree.BTreeTupleGetHeapTID(lo); !ok || tid.Block != 2 || tid.Offset != 1 {
 		t.Fatalf("entry heap TID = %v, %v; want {2 1}", tid, ok)
 	}
-	cmp, cmpErr := btree.ComparePGIndexTuples(desc, lo, hi)
+	cmp, cmpErr := nbtree.ComparePGIndexTuples(desc, lo, hi)
 	if cmpErr != nil {
 		t.Fatalf("ComparePGIndexTuples: %v", cmpErr)
 	}
@@ -102,7 +102,7 @@ func TestIndexBuildEntryKeyTupleCarriesTheRowsHeapTID(t *testing.T) {
 	}
 	// ...and the SAME pair is equal to the uniqueness question, which is the
 	// whole reason ComparePGIndexTupleKeyAttrs exists.
-	keyCmp, keyCmpErr := btree.ComparePGIndexTupleKeyAttrs(desc, lo, hi)
+	keyCmp, keyCmpErr := nbtree.ComparePGIndexTupleKeyAttrs(desc, lo, hi)
 	if keyCmpErr != nil {
 		t.Fatalf("ComparePGIndexTupleKeyAttrs: %v", keyCmpErr)
 	}
@@ -163,15 +163,15 @@ func TestSortBuildEntriesFindDuplicateBlobUnchanged(t *testing.T) {
 	// The blob branch must be M0055-0006 Phase E byte for byte: bytewise order,
 	// bytewise equality.
 	ctx, idx, cols := buildKeyCtxAndIndex(t, 424, col("a", "int4"))
-	mk := func(v int64, blk storage.BlockNumber) btree.BulkEntry {
+	mk := func(v int64, blk storage.BlockNumber) nbtree.BulkEntry {
 		key, _, err := ctx.indexBuildEntryKey(idx, cols, nil, Row{NewIntDatum(v)}, storage.ItemPointer{Block: blk, Offset: 1}, 0)
 		if err != nil {
 			t.Fatalf("indexBuildEntryKey: %v", err)
 		}
-		return btree.BulkEntry{Key: key, Ptr: storage.ItemPointer{Block: blk, Offset: 1}}
+		return nbtree.BulkEntry{Key: key, Ptr: storage.ItemPointer{Block: blk, Offset: 1}}
 	}
-	entries := []btree.BulkEntry{mk(256, 1), mk(1, 2), mk(3, 3)}
-	if sortBuildEntriesFindDuplicate(nil, entries) {
+	entries := []nbtree.BulkEntry{mk(256, 1), mk(1, 2), mk(3, 3)}
+	if sortBuildEntriesFindDuplicate(nil, entries) >= 0 {
 		t.Fatal("distinct blob keys reported as duplicates")
 	}
 	if !sort.SliceIsSorted(entries, func(i, j int) bool {
@@ -181,8 +181,8 @@ func TestSortBuildEntriesFindDuplicateBlobUnchanged(t *testing.T) {
 	}
 	// Two rows with the same value: distinct heap TIDs, but the blob key is
 	// TID-free, so they ARE the same key.
-	dups := []btree.BulkEntry{mk(5, 1), mk(5, 2)}
-	if !sortBuildEntriesFindDuplicate(nil, dups) {
+	dups := []nbtree.BulkEntry{mk(5, 1), mk(5, 2)}
+	if sortBuildEntriesFindDuplicate(nil, dups) < 0 {
 		t.Fatal("equal blob keys not reported as duplicates")
 	}
 }
@@ -194,12 +194,12 @@ func TestSortBuildEntriesFindDuplicateTupleOrdersByAttributeAndIgnoresTheTID(t *
 	if desc == nil {
 		t.Fatal("fixture index is not describable; the test would pass for the wrong reason")
 	}
-	mk := func(v int64, blk storage.BlockNumber, off uint16) btree.BulkEntry {
+	mk := func(v int64, blk storage.BlockNumber, off uint16) nbtree.BulkEntry {
 		key, _, err := ctx.indexBuildEntryKey(idx, cols, nil, Row{NewIntDatum(v)}, storage.ItemPointer{Block: blk, Offset: off}, 0)
 		if err != nil {
 			t.Fatalf("indexBuildEntryKey: %v", err)
 		}
-		return btree.BulkEntry{Key: key, Ptr: storage.ItemPointer{Block: blk, Offset: off}}
+		return nbtree.BulkEntry{Key: key, Ptr: storage.ItemPointer{Block: blk, Offset: off}}
 	}
 
 	// 1 and 256 are the pair that separates the two orders: an int4 datum is
@@ -212,14 +212,14 @@ func TestSortBuildEntriesFindDuplicateTupleOrdersByAttributeAndIgnoresTheTID(t *
 	// field of an index tuple, so a differing TID would dominate the bytewise
 	// comparison and the pair would demonstrate the TID's effect on byte order
 	// rather than the datum's.
-	entries := []btree.BulkEntry{mk(256, 1, 1), mk(1, 1, 1)}
+	entries := []nbtree.BulkEntry{mk(256, 1, 1), mk(1, 1, 1)}
 	if !(string(entries[0].Key) < string(entries[1].Key)) {
 		t.Fatal("fixture pair is bytewise-ordered the same way as the index order; it cannot tell the two sorts apart")
 	}
-	if sortBuildEntriesFindDuplicate(desc, entries) {
+	if sortBuildEntriesFindDuplicate(desc, entries) >= 0 {
 		t.Fatal("distinct tuple keys reported as duplicates")
 	}
-	first, _, err := btree.DeformPGIndexTuple(entries[0].Key, desc.Physical(), 1)
+	first, _, err := nbtree.DeformPGIndexTuple(entries[0].Key, desc.Physical(), 1)
 	if err != nil {
 		t.Fatalf("deform: %v", err)
 	}
@@ -230,11 +230,11 @@ func TestSortBuildEntriesFindDuplicateTupleOrdersByAttributeAndIgnoresTheTID(t *
 	// The duplicate test: same value, two heap rows. Under the tuple format the
 	// keys DIFFER (the TID is in the image), which is exactly why bytes.Equal
 	// would have admitted a duplicate into a unique index.
-	dups := []btree.BulkEntry{mk(5, 1, 1), mk(5, 2, 4)}
+	dups := []nbtree.BulkEntry{mk(5, 1, 1), mk(5, 2, 4)}
 	if bytes.Equal(dups[0].Key, dups[1].Key) {
 		t.Fatal("fixture duplicates have identical keys; the test would pass for the wrong reason")
 	}
-	if !sortBuildEntriesFindDuplicate(desc, dups) {
+	if sortBuildEntriesFindDuplicate(desc, dups) < 0 {
 		t.Fatal("duplicate key values not reported: a unique index build would admit them")
 	}
 }

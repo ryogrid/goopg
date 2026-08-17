@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goopg/goopg/internal/config"
-	"github.com/goopg/goopg/internal/control"
+	"github.com/goopg/goopg/internal/utils/misc"
+	"github.com/goopg/goopg/internal/access/transam/control"
 )
 
 // TestNoArgsPrintsUsage guards the contract from
@@ -586,9 +586,9 @@ func TestPoolSlotsFromGUC(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			r := config.BuildDefaultRegistry()
+			r := misc.BuildDefaultRegistry()
 			if c.set != "" {
-				if err := r.Set("shared_buffers", c.set, config.SourceConfigFile); err != nil {
+				if err := r.Set("shared_buffers", c.set, misc.SourceConfigFile); err != nil {
 					t.Fatalf("Set shared_buffers=%q: %v", c.set, err)
 				}
 			}
@@ -624,9 +624,9 @@ func TestTransactionBuffersFromGUC(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			r := config.BuildDefaultRegistry()
+			r := misc.BuildDefaultRegistry()
 			if c.set != "" {
-				if err := r.Set("transaction_buffers", c.set, config.SourceConfigFile); err != nil {
+				if err := r.Set("transaction_buffers", c.set, misc.SourceConfigFile); err != nil {
 					t.Fatalf("Set transaction_buffers=%q: %v", c.set, err)
 				}
 			}

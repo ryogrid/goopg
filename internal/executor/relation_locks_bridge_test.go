@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/storage/lmgr"
 )
 
 // findBridgeRow scans the bridge output for a row matching (relOID, mode,
@@ -28,13 +28,13 @@ func findBridgeRow(rows [][]string, relOID, mode, granted string) (pid string, f
 // TestTableLockMgrBridgeSurfacesGrantedRelationLock: a granted relation lock on
 // tableLockMgr appears as a pg_locks row with the registered backend PID.
 func TestTableLockMgrBridgeSurfacesGrantedRelationLock(t *testing.T) {
-	const backend lockmgr.BackendID = 90001
+	const backend lmgr.BackendID = 90001
 	const relOID = uint32(778001)
-	tag := lockmgr.LockTag{DB: 5, Rel: relOID}
+	tag := lmgr.LockTag{DB: 5, Rel: relOID}
 
 	RegisterLockBackendPID(backend, 4242)
 	defer UnregisterLockBackendPID(backend)
-	if err := tableLockMgr.TryAcquire(backend, tag, lockmgr.AccessExclusiveLock); err != nil {
+	if err := tableLockMgr.TryAcquire(backend, tag, lmgr.AccessExclusiveLock); err != nil {
 		t.Fatalf("TryAcquire: %v", err)
 	}
 	defer tableLockMgr.ReleaseAll(backend)
@@ -52,10 +52,10 @@ func TestTableLockMgrBridgeSurfacesGrantedRelationLock(t *testing.T) {
 // TestTableLockMgrBridgeWaiterNotGranted: a backend blocked behind a conflicting
 // holder surfaces with granted="f" and its own PID.
 func TestTableLockMgrBridgeWaiterNotGranted(t *testing.T) {
-	const holder lockmgr.BackendID = 90010
-	const waiter lockmgr.BackendID = 90011
+	const holder lmgr.BackendID = 90010
+	const waiter lmgr.BackendID = 90011
 	const relOID = uint32(778002)
-	tag := lockmgr.LockTag{DB: 5, Rel: relOID}
+	tag := lmgr.LockTag{DB: 5, Rel: relOID}
 
 	RegisterLockBackendPID(holder, 5000)
 	RegisterLockBackendPID(waiter, 5001)
@@ -63,7 +63,7 @@ func TestTableLockMgrBridgeWaiterNotGranted(t *testing.T) {
 	defer UnregisterLockBackendPID(waiter)
 
 	// holder takes ACCESS SHARE; an AccessExclusive acquirer must wait.
-	if err := tableLockMgr.TryAcquire(holder, tag, lockmgr.AccessShareLock); err != nil {
+	if err := tableLockMgr.TryAcquire(holder, tag, lmgr.AccessShareLock); err != nil {
 		t.Fatalf("holder TryAcquire: %v", err)
 	}
 	defer tableLockMgr.ReleaseAll(holder)
@@ -73,7 +73,7 @@ func TestTableLockMgrBridgeWaiterNotGranted(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		close(started)
-		_ = tableLockMgr.Acquire(context.Background(), waiter, tag, lockmgr.AccessExclusiveLock)
+		_ = tableLockMgr.Acquire(context.Background(), waiter, tag, lmgr.AccessExclusiveLock)
 		close(done)
 	}()
 	<-started
@@ -106,11 +106,11 @@ func TestTableLockMgrBridgeWaiterNotGranted(t *testing.T) {
 // was never registered surfaces with pid "0" (filtered by the pg_stat_activity
 // join, but row-count-honest for un-joined readers).
 func TestTableLockMgrBridgeUnknownBackendPidZero(t *testing.T) {
-	const backend lockmgr.BackendID = 90020
+	const backend lmgr.BackendID = 90020
 	const relOID = uint32(778003)
-	tag := lockmgr.LockTag{DB: 5, Rel: relOID}
+	tag := lmgr.LockTag{DB: 5, Rel: relOID}
 
-	if err := tableLockMgr.TryAcquire(backend, tag, lockmgr.ShareLock); err != nil {
+	if err := tableLockMgr.TryAcquire(backend, tag, lmgr.ShareLock); err != nil {
 		t.Fatalf("TryAcquire: %v", err)
 	}
 	defer tableLockMgr.ReleaseAll(backend)
@@ -127,13 +127,13 @@ func TestTableLockMgrBridgeUnknownBackendPidZero(t *testing.T) {
 // TestTableLockMgrBridgeSkipsTupleTags: a tuple-level lock (Block/Offset set)
 // is NOT surfaced as a relation row.
 func TestTableLockMgrBridgeSkipsTupleTags(t *testing.T) {
-	const backend lockmgr.BackendID = 90030
+	const backend lmgr.BackendID = 90030
 	const relOID = uint32(778004)
-	tupleTag := lockmgr.LockTag{DB: 5, Rel: relOID, Block: 1, Offset: 2}
+	tupleTag := lmgr.LockTag{DB: 5, Rel: relOID, Block: 1, Offset: 2}
 
 	RegisterLockBackendPID(backend, 6000)
 	defer UnregisterLockBackendPID(backend)
-	if err := tableLockMgr.TryAcquire(backend, tupleTag, lockmgr.ExclusiveLock); err != nil {
+	if err := tableLockMgr.TryAcquire(backend, tupleTag, lmgr.ExclusiveLock); err != nil {
 		t.Fatalf("TryAcquire: %v", err)
 	}
 	defer tableLockMgr.ReleaseAll(backend)

@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 func TestPgGetFunctionSqlbody(t *testing.T) {
@@ -35,9 +35,9 @@ func TestPgGetFunctionSqlbody(t *testing.T) {
 	ctx.Catalog = cat
 	ctx.Now = time.Now()
 
-	body, err := evalExpr(&planner.FuncCall{
+	body, err := evalExpr(&optimizer.FuncCall{
 		Name: "pg_get_function_sqlbody",
-		Args: []planner.Expr{&planner.IntegerConst{Value: int64(created.OID)}},
+		Args: []optimizer.Expr{&optimizer.IntegerConst{Value: int64(created.OID)}},
 	}, nil, ctx)
 	if err != nil {
 		t.Fatalf("pg_get_function_sqlbody: %v", err)
@@ -58,9 +58,9 @@ func TestPgGetFunctionSqlbodyUnknownOID(t *testing.T) {
 	ctx.Catalog = cat
 	ctx.Now = time.Now()
 
-	body, err := evalExpr(&planner.FuncCall{
+	body, err := evalExpr(&optimizer.FuncCall{
 		Name: "pg_get_function_sqlbody",
-		Args: []planner.Expr{&planner.IntegerConst{Value: 999999}},
+		Args: []optimizer.Expr{&optimizer.IntegerConst{Value: 999999}},
 	}, nil, ctx)
 	if err != nil {
 		t.Fatalf("pg_get_function_sqlbody: %v", err)

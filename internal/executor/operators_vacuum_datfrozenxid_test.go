@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -113,8 +113,8 @@ func newDatFrozenXIDFixture(t *testing.T) (*Context, string, func()) {
 	}
 	cat := catalog.NewInMemory()
 	cat.SetDBOID(5)
-	mgrMVCC := mvcc.NewManager()
-	tx, err := mgrMVCC.Begin(mvcc.IsolationReadCommitted)
+	mgrMVCC := transam.NewManager()
+	tx, err := mgrMVCC.Begin(transam.IsolationReadCommitted)
 	if err != nil {
 		t.Fatal(err)
 	}

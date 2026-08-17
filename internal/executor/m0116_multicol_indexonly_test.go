@@ -4,24 +4,24 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // findIndexOnlyScan walks the planner tree through the unary scaffolding
 // nodes (Project / Filter / Sort / Limit) and returns the first
 // *planner.IndexOnlyScan, or nil if none is present.
-func findIndexOnlyScan(n planner.Node) *planner.IndexOnlyScan {
+func findIndexOnlyScan(n optimizer.Node) *optimizer.IndexOnlyScan {
 	for n != nil {
 		switch v := n.(type) {
-		case *planner.IndexOnlyScan:
+		case *optimizer.IndexOnlyScan:
 			return v
-		case *planner.Project:
+		case *optimizer.Project:
 			n = v.Child
-		case *planner.Filter:
+		case *optimizer.Filter:
 			n = v.Child
-		case *planner.Sort:
+		case *optimizer.Sort:
 			n = v.Child
-		case *planner.Limit:
+		case *optimizer.Limit:
 			n = v.Child
 		default:
 			return nil
@@ -32,20 +32,20 @@ func findIndexOnlyScan(n planner.Node) *planner.IndexOnlyScan {
 
 // findIndexScan mirrors findIndexOnlyScan for the heap-fetching IndexScan
 // node so HeapFallback tests can prove the planner did NOT promote.
-func findIndexScan(n planner.Node) *planner.IndexScan {
+func findIndexScan(n optimizer.Node) *optimizer.IndexScan {
 	for n != nil {
 		switch v := n.(type) {
-		case *planner.IndexScan:
+		case *optimizer.IndexScan:
 			return v
-		case *planner.IndexOnlyScan:
+		case *optimizer.IndexOnlyScan:
 			return nil
-		case *planner.Project:
+		case *optimizer.Project:
 			n = v.Child
-		case *planner.Filter:
+		case *optimizer.Filter:
 			n = v.Child
-		case *planner.Sort:
+		case *optimizer.Sort:
 			n = v.Child
-		case *planner.Limit:
+		case *optimizer.Limit:
 			n = v.Child
 		default:
 			return nil

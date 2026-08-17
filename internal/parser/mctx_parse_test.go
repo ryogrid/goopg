@@ -3,7 +3,7 @@ package parser_test
 import (
 	"testing"
 
-	"github.com/goopg/goopg/internal/mctx"
+	"github.com/goopg/goopg/internal/utils/mmgr"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -26,7 +26,7 @@ func TestParseMctxPath(t *testing.T) {
 				t.Fatalf("pool path parse error: %v", err)
 			}
 			// mctx path.
-			mc := mctx.Acquire(nil, mctx.KindStmt)
+			mc := mmgr.Acquire(nil, mmgr.KindStmt)
 			defer mc.Release()
 			got, err := parser.Parse(q, mc)
 			if err != nil {
@@ -56,7 +56,7 @@ func TestParseExprMctxPath(t *testing.T) {
 				t.Fatalf("pool path: %v", err)
 			}
 			// mctx path.
-			mc := mctx.Acquire(nil, mctx.KindExpr)
+			mc := mmgr.Acquire(nil, mmgr.KindExpr)
 			defer mc.Release()
 			got, err := parser.ParseExpr(e, mc)
 			if err != nil {

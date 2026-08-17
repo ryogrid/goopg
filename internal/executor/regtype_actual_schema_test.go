@@ -180,7 +180,7 @@ func TestRegtypeSiblingAgreementOffPath(t *testing.T) {
 	// COPY TO: datumToCopyText → RegOutArgVisible with the same qualify flag.
 	copyRow, err := EncodeCopyTextRow(nil, Row{NewIntDatum(int64(et.OID))},
 		[]catalog.Column{{Name: "r", Type: catalog.Type{Name: "regtype"}}},
-		"ISO", "MDY", "", ctx.Catalog, true)
+		"ISO", "MDY", "", "hex", ctx.Catalog, true)
 	if err != nil {
 		t.Fatalf("COPY TO: %v", err)
 	}

@@ -1,0 +1,5 @@
+                   i_product_name                   
+----------------------------------------------------
+ ablen stn stbarought                              
+(1 row)
+

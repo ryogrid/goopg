@@ -6,7 +6,7 @@ the combined ~40-package `units` log (e.g. one real assertion failure) used
 to mask the resource-kill signature (`signal: killed`, no `--- FAIL` of its
 own) on every OTHER package killed by the shared nightly cgroup memory cap,
 misreporting pure resource kills as regressions (AI-20260715-010036-001/002/004
-against `cmd/goopg`/`internal/amcheck`/`internal/mvcc`).
+against `cmd/goopg`/`internal/access/amcheck`/`internal/mvcc`).
 
 Run: python3 ci/batch/lib/test_summarize.py
 """
@@ -35,7 +35,7 @@ PC=0x48cec1 m=0 sigcode=0
 
 *** Test killed with quit: ran too long (33m0s).
 signal: killed
-FAIL\tgithub.com/goopg/goopg/internal/amcheck\t2160.522s
+FAIL\tgithub.com/goopg/goopg/internal/access/amcheck\t2160.522s
 *** Test killed with quit: ran too long (33m0s).
 signal: killed
 FAIL\tgithub.com/goopg/goopg/cmd/goopg\t2160.144s
@@ -53,7 +53,7 @@ class SplitGoTestPkgBlocksTest(unittest.TestCase):
                 ("github.com/goopg/goopg/internal/access/btree", "ok"),
                 ("github.com/goopg/goopg/internal/wal", "FAIL"),
                 ("github.com/goopg/goopg/internal/executor", "ok"),
-                ("github.com/goopg/goopg/internal/amcheck", "FAIL"),
+                ("github.com/goopg/goopg/internal/access/amcheck", "FAIL"),
                 ("github.com/goopg/goopg/cmd/goopg", "FAIL"),
                 ("github.com/goopg/goopg/internal/mctx", "ok"),
             ],
@@ -63,7 +63,7 @@ class SplitGoTestPkgBlocksTest(unittest.TestCase):
         blocks = summarize.split_go_test_pkg_blocks(SYNTHETIC_UNITS_LOG)
         by_pkg = {pkg: text for pkg, _status, text in blocks}
         self.assertIn("--- FAIL", by_pkg["github.com/goopg/goopg/internal/wal"])
-        self.assertNotIn("--- FAIL", by_pkg["github.com/goopg/goopg/internal/amcheck"])
+        self.assertNotIn("--- FAIL", by_pkg["github.com/goopg/goopg/internal/access/amcheck"])
         self.assertNotIn("--- FAIL", by_pkg["github.com/goopg/goopg/cmd/goopg"])
 
 
@@ -86,14 +86,14 @@ class AnalyzeUnitsClassificationTest(unittest.TestCase):
         it = self._run_analyze(SYNTHETIC_UNITS_LOG)
 
         rk_pkgs = {r["pkg"] for r in it.resource_kills}
-        self.assertEqual(rk_pkgs, {"internal/amcheck", "cmd/goopg"})
+        self.assertEqual(rk_pkgs, {"internal/access/amcheck", "cmd/goopg"})
 
         reg_subjects = {r["subject"] for r in it.regressions}
         self.assertIn("units/internal/wal", reg_subjects)
         # The two pure resource-kills must NOT also show up as regressions —
         # this is exactly the bug: pre-fix, every FAIL package in a log
         # containing any "--- FAIL" was reported as a regression.
-        self.assertNotIn("units/internal/amcheck", reg_subjects)
+        self.assertNotIn("units/internal/access/amcheck", reg_subjects)
         self.assertNotIn("units/cmd/goopg", reg_subjects)
 
     def test_build_failed_packages_collapse_into_one_infra_item(self):
@@ -145,7 +145,7 @@ class AnalyzeUnitsClassificationTest(unittest.TestCase):
         it = self._run_analyze(log)
         self.assertEqual(len(it.regressions), 0)
         rk_pkgs = {r["pkg"] for r in it.resource_kills}
-        self.assertEqual(rk_pkgs, {"internal/amcheck", "cmd/goopg"})
+        self.assertEqual(rk_pkgs, {"internal/access/amcheck", "cmd/goopg"})
 
 
 SYNTHETIC_TESTPORT_LOG = """\

@@ -494,6 +494,12 @@ type FuncCall struct {
 	// Non-nil only for ordered-set aggregate functions (percentile_cont,
 	// percentile_disc, rank, dense_rank, mode). M0097-0035.
 	WithinGroup []SortBy
+	// WithinGroupPos is the byte offset of the `within` keyword of the
+	// WITHIN GROUP clause, or 0 when absent. PG reports the caret for
+	// "cannot use multiple ORDER BY clauses with WITHIN GROUP" at this
+	// keyword (gram.y func_expr: parser_errposition(@2)); the funcall head
+	// is wrong. M0134-0001 P3b.
+	WithinGroupPos int
 	// Variadic is a parallel slice to Args. When Variadic[i] is true, the i-th
 	// argument was prefixed with the VARIADIC keyword (M0103-0008 probe-
 	// survival: libpqrcv fetch_table_list emits

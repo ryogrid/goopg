@@ -20,23 +20,23 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // outerFillPlan builds a two-column-per-side equi-join of the given type on
 // (l0 = r0). Predicate carries the equality as well as the keys, because the
 // nested-loop oracle has only the Predicate to work from and the hash path must
 // reach the identical answer whether or not the residual is redundant.
-func outerFillPlan(jt planner.JoinType, algo planner.JoinAlgo, leftWidth, estLeft, estRight int) *planner.Join {
-	col := func(idx int) *planner.ColumnRef {
-		return &planner.ColumnRef{Index: idx, Type: catalog.Type{Name: "int4"}}
+func outerFillPlan(jt optimizer.JoinType, algo optimizer.JoinAlgo, leftWidth, estLeft, estRight int) *optimizer.Join {
+	col := func(idx int) *optimizer.ColumnRef {
+		return &optimizer.ColumnRef{Index: idx, Type: catalog.Type{Name: "int4"}}
 	}
-	return &planner.Join{
+	return &optimizer.Join{
 		Type:      jt,
 		Algo:      algo,
 		LeftKey:   col(0),
 		RightKey:  col(leftWidth),
-		Predicate: &planner.BinaryOp{Op: parser.OpEq, Left: col(0), Right: col(leftWidth)},
+		Predicate: &optimizer.BinaryOp{Op: parser.OpEq, Left: col(0), Right: col(leftWidth)},
 		Left:      valuesNode(estLeft),
 		Right:     valuesNode(estRight),
 	}
@@ -45,7 +45,7 @@ func outerFillPlan(jt planner.JoinType, algo planner.JoinAlgo, leftWidth, estLef
 // runOuterFillJoin is runBatchJoin without the batch-state return: the same
 // open/drain/close, so both arms of every comparison below render rows
 // identically.
-func runOuterFillJoin(t *testing.T, plan *planner.Join, leftRows, rightRows []Row, lw, rw int, workMem int64) []string {
+func runOuterFillJoin(t *testing.T, plan *optimizer.Join, leftRows, rightRows []Row, lw, rw int, workMem int64) []string {
 	t.Helper()
 	out, _ := runBatchJoin(t, plan, leftRows, rightRows, lw, rw, workMem)
 	return out
@@ -87,24 +87,24 @@ func TestHashOuterFillMatchesNestedLoopOracle(t *testing.T) {
 
 	cases := []struct {
 		name      string
-		jt        planner.JoinType
+		jt        optimizer.JoinType
 		buildLeft bool
 	}{
-		{"left/build-right", planner.JoinTypeLeft, false},
-		{"left/build-left", planner.JoinTypeLeft, true},
-		{"right/build-left", planner.JoinTypeRight, true},
-		{"right/build-right", planner.JoinTypeRight, false},
-		{"full/build-right", planner.JoinTypeFull, false},
-		{"full/build-left", planner.JoinTypeFull, true},
+		{"left/build-right", optimizer.JoinTypeLeft, false},
+		{"left/build-left", optimizer.JoinTypeLeft, true},
+		{"right/build-left", optimizer.JoinTypeRight, true},
+		{"right/build-right", optimizer.JoinTypeRight, false},
+		{"full/build-right", optimizer.JoinTypeFull, false},
+		{"full/build-left", optimizer.JoinTypeFull, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			oracle := outerFillPlan(tc.jt, planner.JoinAlgoNestedLoop, lw, len(left), len(right))
+			oracle := outerFillPlan(tc.jt, optimizer.JoinAlgoNestedLoop, lw, len(left), len(right))
 			want := runOuterFillJoin(t, oracle, left, right, lw, rw, 0)
 			if len(want) == 0 {
 				t.Fatalf("precondition: the nested-loop oracle emitted nothing")
 			}
-			hash := outerFillPlan(tc.jt, planner.JoinAlgoHash, lw, len(left), len(right))
+			hash := outerFillPlan(tc.jt, optimizer.JoinAlgoHash, lw, len(left), len(right))
 			hash.BuildLeft = tc.buildLeft
 			got := runOuterFillJoin(t, hash, left, right, lw, rw, 0)
 			assertSameMultiset(t, "hash vs nested-loop", got, want)
@@ -119,35 +119,35 @@ func TestHashOuterFillMatchesNestedLoopOracle(t *testing.T) {
 // every test above and silently drops these rows.
 func TestHashOuterFillResidualRejectionStillFills(t *testing.T) {
 	const lw, rw = 2, 2
-	col := func(idx int) *planner.ColumnRef {
-		return &planner.ColumnRef{Index: idx, Type: catalog.Type{Name: "int4"}}
+	col := func(idx int) *optimizer.ColumnRef {
+		return &optimizer.ColumnRef{Index: idx, Type: catalog.Type{Name: "int4"}}
 	}
 	// Key 5 hash-matches, but the residual `l1 = r1` (the payload columns,
 	// which never agree here) rejects every candidate pair.
 	left := []Row{{NewIntDatum(5), NewIntDatum(100)}}
 	right := []Row{{NewIntDatum(5), NewIntDatum(200)}}
-	residual := &planner.BinaryOp{
+	residual := &optimizer.BinaryOp{
 		Op: parser.OpAnd,
-		Left: &planner.BinaryOp{
+		Left: &optimizer.BinaryOp{
 			Op: parser.OpEq, Left: col(0), Right: col(lw),
 		},
-		Right: &planner.BinaryOp{
+		Right: &optimizer.BinaryOp{
 			Op: parser.OpEq, Left: col(1), Right: col(lw + 1),
 		},
 	}
 	for _, tc := range []struct {
 		name string
-		jt   planner.JoinType
+		jt   optimizer.JoinType
 		want []string
 	}{
-		{"left", planner.JoinTypeLeft, []string{"5|100||"}},
-		{"right", planner.JoinTypeRight, []string{"||5|200"}},
-		{"full", planner.JoinTypeFull, []string{"5|100||", "||5|200"}},
+		{"left", optimizer.JoinTypeLeft, []string{"5|100||"}},
+		{"right", optimizer.JoinTypeRight, []string{"||5|200"}},
+		{"full", optimizer.JoinTypeFull, []string{"5|100||", "||5|200"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			plan := outerFillPlan(tc.jt, planner.JoinAlgoHash, lw, 1, 1)
+			plan := outerFillPlan(tc.jt, optimizer.JoinAlgoHash, lw, 1, 1)
 			plan.Predicate = residual
-			if tc.jt == planner.JoinTypeRight {
+			if tc.jt == optimizer.JoinTypeRight {
 				plan.BuildLeft = true
 			}
 			got := runOuterFillJoin(t, plan, left, right, lw, rw, 0)
@@ -169,7 +169,7 @@ func TestHashOuterFillEmitsNullKeyedBuildRows(t *testing.T) {
 		{NewIntDatum(2), NewStringDatum("r-match")},
 		{NullDatum, NewStringDatum("r-nullkey")},
 	}
-	plan := outerFillPlan(planner.JoinTypeFull, planner.JoinAlgoHash, lw, len(left), len(right))
+	plan := outerFillPlan(optimizer.JoinTypeFull, optimizer.JoinAlgoHash, lw, len(left), len(right))
 	got := runOuterFillJoin(t, plan, left, right, lw, rw, 0)
 	// datumToString renders a NULL as an empty field, so a null-padded side
 	// shows up as consecutive separators.
@@ -182,7 +182,7 @@ func TestHashOuterFillEmitsNullKeyedBuildRows(t *testing.T) {
 	assertSameMultiset(t, "null-keyed build fill", got, want)
 	// And the nested-loop oracle agrees, which is the point: dropping the row
 	// would have been a silent divergence from goopg's own semantics.
-	oracle := outerFillPlan(planner.JoinTypeFull, planner.JoinAlgoNestedLoop, lw, len(left), len(right))
+	oracle := outerFillPlan(optimizer.JoinTypeFull, optimizer.JoinAlgoNestedLoop, lw, len(left), len(right))
 	assertSameMultiset(t, "null-keyed build fill vs oracle", got,
 		runOuterFillJoin(t, oracle, left, right, lw, rw, 0))
 }
@@ -203,13 +203,13 @@ func TestHashOuterFillSweepsEveryBatch(t *testing.T) {
 		k, _ := datumToInt64Key(r[0])
 		probe = append(probe, Row{NewIntDatum(k + 10_000), r[1]})
 	}
-	for _, jt := range []planner.JoinType{planner.JoinTypeRight, planner.JoinTypeFull} {
+	for _, jt := range []optimizer.JoinType{optimizer.JoinTypeRight, optimizer.JoinTypeFull} {
 		name := "right"
-		if jt == planner.JoinTypeFull {
+		if jt == optimizer.JoinTypeFull {
 			name = "full"
 		}
 		t.Run(name, func(t *testing.T) {
-			plan := outerFillPlan(jt, planner.JoinAlgoHash, lw, len(probe), len(build))
+			plan := outerFillPlan(jt, optimizer.JoinAlgoHash, lw, len(probe), len(build))
 			// Build on the right for both, so RIGHT exercises the sweep too
 			// (the planner's own RIGHT orientation probes the preserved side
 			// and is covered by the oracle test above).
@@ -236,19 +236,19 @@ func TestHashOuterFillSweepsEveryBatch(t *testing.T) {
 func TestBuildOnlyBatchIsNotSkippedWhenBuildFills(t *testing.T) {
 	for _, tc := range []struct {
 		name string
-		jt   planner.JoinType
+		jt   optimizer.JoinType
 		bl   bool
 		want bool // skippable
 	}{
-		{"inner", planner.JoinTypeInner, false, true},
-		{"left/build-right", planner.JoinTypeLeft, false, true},
-		{"left/build-left", planner.JoinTypeLeft, true, false},
-		{"right/build-right", planner.JoinTypeRight, false, false},
-		{"right/build-left", planner.JoinTypeRight, true, true},
-		{"full", planner.JoinTypeFull, false, false},
+		{"inner", optimizer.JoinTypeInner, false, true},
+		{"left/build-right", optimizer.JoinTypeLeft, false, true},
+		{"left/build-left", optimizer.JoinTypeLeft, true, false},
+		{"right/build-right", optimizer.JoinTypeRight, false, false},
+		{"right/build-left", optimizer.JoinTypeRight, true, true},
+		{"full", optimizer.JoinTypeFull, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			plan := outerFillPlan(tc.jt, planner.JoinAlgoHash, 2, 1, 1)
+			plan := outerFillPlan(tc.jt, optimizer.JoinAlgoHash, 2, 1, 1)
 			plan.BuildLeft = tc.bl
 			o := &joinOp{plan: plan}
 			bs := &hashBatchState{
@@ -270,23 +270,23 @@ func TestBuildOnlyBatchIsNotSkippedWhenBuildFills(t *testing.T) {
 func TestOuterFillSidesFollowTypeAndOrientation(t *testing.T) {
 	for _, tc := range []struct {
 		name             string
-		jt               planner.JoinType
+		jt               optimizer.JoinType
 		bl               bool
 		probe, buildFill bool
 	}{
-		{"inner", planner.JoinTypeInner, false, false, false},
-		{"left/build-right", planner.JoinTypeLeft, false, true, false},
-		{"left/build-left", planner.JoinTypeLeft, true, false, true},
-		{"right/build-left", planner.JoinTypeRight, true, true, false},
-		{"right/build-right", planner.JoinTypeRight, false, false, true},
-		{"full", planner.JoinTypeFull, false, true, true},
+		{"inner", optimizer.JoinTypeInner, false, false, false},
+		{"left/build-right", optimizer.JoinTypeLeft, false, true, false},
+		{"left/build-left", optimizer.JoinTypeLeft, true, false, true},
+		{"right/build-left", optimizer.JoinTypeRight, true, true, false},
+		{"right/build-right", optimizer.JoinTypeRight, false, false, true},
+		{"full", optimizer.JoinTypeFull, false, true, true},
 		// Semi/Anti are build-right by contract whatever the flag says, so a
 		// stray BuildLeft must not turn them into filling joins.
-		{"semi/stray-build-left", planner.JoinTypeSemi, true, false, false},
-		{"anti/stray-build-left", planner.JoinTypeAnti, true, false, false},
+		{"semi/stray-build-left", optimizer.JoinTypeSemi, true, false, false},
+		{"anti/stray-build-left", optimizer.JoinTypeAnti, true, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			plan := outerFillPlan(tc.jt, planner.JoinAlgoHash, 2, 1, 1)
+			plan := outerFillPlan(tc.jt, optimizer.JoinAlgoHash, 2, 1, 1)
 			plan.BuildLeft = tc.bl
 			o := &joinOp{plan: plan}
 			if got := o.fillProbeSide(); got != tc.probe {

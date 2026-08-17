@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -22,8 +22,8 @@ func newHOTFixture(t *testing.T) (*Context, catalog.Catalog, func()) {
 		t.Fatalf("NewPool: %v", err)
 	}
 	cat := catalog.NewInMemory()
-	mgrMVCC := mvcc.NewManager()
-	tx, err := mgrMVCC.Begin(mvcc.IsolationReadCommitted)
+	mgrMVCC := transam.NewManager()
+	tx, err := mgrMVCC.Begin(transam.IsolationReadCommitted)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,7 +267,7 @@ func TestFollowHOTChainDirect(t *testing.T) {
 	// xid=5 is the current transaction.
 	// Snapshot sees xids 1..4 as committed, 5..∞ as future/in-progress.
 	xid := storage.TransactionID(5)
-	snap := mvcc.Snapshot{Xmin: 5, Xmax: 10}
+	snap := transam.Snapshot{Xmin: 5, Xmax: 10}
 
 	// Slot 1: old tuple — created in xid=4 (visible to snap), deleted by
 	// xid=5 (our transaction → invisible to us), with HEAP_HOT_UPDATED.

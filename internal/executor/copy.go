@@ -9,9 +9,9 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/config"
+	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // IsBinaryFormat reports whether the COPY options select binary format.
@@ -48,8 +48,8 @@ func IsBinaryFormat(opts []parser.CopyOption) bool {
 // emits text rows (one per call to emit). Returns the row count and
 // whether binary format was selected (so the caller can set the
 // wire-protocol format code accordingly).
-func RunCopyTo(ctx *Context, plan *planner.Copy, emit func([]byte) error) (count int64, binary bool, err error) {
-	if plan == nil || plan.Direction != planner.CopyTo {
+func RunCopyTo(ctx *Context, plan *optimizer.Copy, emit func([]byte) error) (count int64, binary bool, err error) {
+	if plan == nil || plan.Direction != optimizer.CopyTo {
 		return 0, false, &ExecError{Code: "XX000", Message: "RunCopyTo: plan is nil or not CopyTo"}
 	}
 	if err := rejectFileEndpoint(plan); err != nil {
@@ -65,12 +65,19 @@ func RunCopyTo(ctx *Context, plan *planner.Copy, emit func([]byte) error) (count
 	// timeZone feeds the timestamptz columns only (config.FormatTimestampTZ);
 	// "" means the boot default, UTC.
 	timeZone := ""
+	// byteaMode feeds the bytea columns (M0134-0001 S12); "hex" is the boot
+	// default, matching dispatch.go's appendTypedCellText (SELECT wire) so
+	// COPY TO and SELECT agree on the same `bytea_output` GUC.
+	byteaMode := "hex"
 	if ctx.GetSetting != nil {
 		if v, ok := ctx.GetSetting("datestyle"); ok {
-			dateStyle, dateOrder = config.ParseDateStyleValue(v)
+			dateStyle, dateOrder = misc.ParseDateStyleValue(v)
 		}
 		if v, ok := ctx.GetSetting("timezone"); ok {
 			timeZone = v
+		}
+		if v, ok := ctx.GetSetting("bytea_output"); ok {
+			byteaMode = v
 		}
 	}
 	// M0119-0006 (68th slice): the catalog + search-path-qualify flag the reg*
@@ -136,9 +143,9 @@ func RunCopyTo(ctx *Context, plan *planner.Copy, emit func([]byte) error) (count
 		case binary:
 			buf, encErr = AppendCopyBinaryRow(buf, row, cols)
 		case format.csv:
-			buf, encErr = EncodeCopyCsvRow(buf, row, cols, format, dateStyle, dateOrder, timeZone, cat, qualify, argVisible)
+			buf, encErr = EncodeCopyCsvRow(buf, row, cols, format, dateStyle, dateOrder, timeZone, byteaMode, cat, qualify, argVisible)
 		default:
-			buf, encErr = EncodeCopyTextRow(buf, row, cols, dateStyle, dateOrder, timeZone, cat, qualify, argVisible)
+			buf, encErr = EncodeCopyTextRow(buf, row, cols, dateStyle, dateOrder, timeZone, byteaMode, cat, qualify, argVisible)
 		}
 		if encErr != nil {
 			return count, binary, encErr
@@ -168,7 +175,7 @@ func RunCopyTo(ctx *Context, plan *planner.Copy, emit func([]byte) error) (count
 // Binary path: the wire layer accumulates CopyData payloads and calls PushBinaryData.
 type CopyFromExecutor struct {
 	ctx    *Context
-	plan   *planner.Copy
+	plan   *optimizer.Copy
 	cols   []catalog.Column // table's full column list, in declared order
 	rowsIn int64
 	// format carries the text/CSV knobs (delimiter, quote, escape, NULL
@@ -192,8 +199,8 @@ type CopyFromExecutor struct {
 // NewCopyFromExecutor binds a CopyFromExecutor to ctx and plan.
 // Returns an error when plan is wrong-shape, the endpoint is
 // file/PROGRAM, or the storage handles are missing.
-func NewCopyFromExecutor(ctx *Context, plan *planner.Copy) (*CopyFromExecutor, error) {
-	if plan == nil || plan.Direction != planner.CopyFrom {
+func NewCopyFromExecutor(ctx *Context, plan *optimizer.Copy) (*CopyFromExecutor, error) {
+	if plan == nil || plan.Direction != optimizer.CopyFrom {
 		return nil, &ExecError{Code: "XX000", Message: "NewCopyFromExecutor: plan is nil or not CopyFrom"}
 	}
 	if plan.Table == nil {
@@ -212,7 +219,7 @@ func NewCopyFromExecutor(ctx *Context, plan *planner.Copy) (*CopyFromExecutor, e
 // checks, so the file endpoint (RunCopyFromFile) and the STDIN endpoint
 // share one option-interpretation site. They previously diverged by
 // construction: each hand-built the struct and read only the NULL option.
-func newCopyFromExecutor(ctx *Context, plan *planner.Copy) *CopyFromExecutor {
+func newCopyFromExecutor(ctx *Context, plan *optimizer.Copy) *CopyFromExecutor {
 	format := copyToFormatFromOptions(plan.Options)
 	return &CopyFromExecutor{
 		ctx:           ctx,
@@ -412,7 +419,7 @@ func (c *CopyFromExecutor) RowsInserted() int64 { return c.rowsIn }
 // projection (a slice of indices into the source row to pick + reorder
 // when the user-supplied column list differs from the table's
 // declared order). projection is nil when no reordering is needed.
-func buildCopySource(plan *planner.Copy) (Operator, []catalog.Column, []int, error) {
+func buildCopySource(plan *optimizer.Copy) (Operator, []catalog.Column, []int, error) {
 	if plan.Query != nil {
 		op, err := Build(plan.Query)
 		if err != nil {
@@ -436,7 +443,7 @@ func buildCopySource(plan *planner.Copy) (Operator, []catalog.Column, []int, err
 	if plan.Table == nil {
 		return nil, nil, nil, &ExecError{Code: "XX000", Pos: plan.Pos(), Message: "COPY TO: plan has neither Table nor Query"}
 	}
-	scan := newSeqScanOp(&planner.SeqScan{Table: plan.Table})
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: plan.Table})
 	declared := plan.Table.Columns
 	// projection only needed when ColumnIndex is non-default.
 	projection := plan.ColumnIndex
@@ -461,11 +468,11 @@ func buildCopySource(plan *planner.Copy) (Operator, []catalog.Column, []int, err
 	return scan, cols, projection, nil
 }
 
-func rejectFileEndpoint(plan *planner.Copy) error {
+func rejectFileEndpoint(plan *optimizer.Copy) error {
 	switch plan.Endpoint {
-	case planner.CopyEndpointFile:
+	case optimizer.CopyEndpointFile:
 		return &ExecError{Code: "0A000", Pos: plan.Pos(), Message: "COPY to/from file is not supported"}
-	case planner.CopyEndpointProgram:
+	case optimizer.CopyEndpointProgram:
 		return &ExecError{Code: "0A000", Pos: plan.Pos(), Message: "COPY to/from PROGRAM is not supported"}
 	}
 	return nil
@@ -475,8 +482,8 @@ func rejectFileEndpoint(plan *planner.Copy) error {
 // It opens the file, reads tab-delimited text rows, and inserts them
 // using the same CopyFromExecutor path as COPY FROM STDIN.
 // The file must use PostgreSQL's COPY TEXT format (tab-separated, \N for NULL).
-func RunCopyFromFile(ctx *Context, plan *planner.Copy) (int64, error) {
-	if plan.Endpoint != planner.CopyEndpointFile || plan.Filename == "" {
+func RunCopyFromFile(ctx *Context, plan *optimizer.Copy) (int64, error) {
+	if plan.Endpoint != optimizer.CopyEndpointFile || plan.Filename == "" {
 		return 0, &ExecError{Code: "XX000", Message: "RunCopyFromFile: not a file endpoint"}
 	}
 	if plan.Table == nil {

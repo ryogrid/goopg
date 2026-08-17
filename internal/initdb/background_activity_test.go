@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goopg/goopg/internal/activity"
+	"github.com/goopg/goopg/internal/utils/activity"
 )
 
 // TestOpenRegistersDistinctWalWriterAndCheckpointerSlots is the M0122-0003

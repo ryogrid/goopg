@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // This file is the Stage-9 (S2c, design bundle D4.2) SubPlan execution
@@ -70,7 +70,7 @@ const (
 // for the statement; Context.CloseSubPlans tears them down.
 type subPlanHandle struct {
 	op        Operator
-	plan      planner.Node
+	plan      optimizer.Node
 	kind      int
 	cacheable bool
 	opOpen    bool // op has been Opened and not yet Closed
@@ -105,14 +105,14 @@ var volatileBuiltins = map[string]bool{
 // unknown builtin would disable subquery caching wholesale — the
 // opposite of PG, whose builtins carry explicit (overwhelmingly i/s)
 // provolatile markings.
-func subPlanExprVolatile(e planner.Expr, ctx *Context) bool {
+func subPlanExprVolatile(e optimizer.Expr, ctx *Context) bool {
 	vol := false
-	planner.WalkExprTree(e, func(sub planner.Expr) {
+	optimizer.WalkExprTree(e, func(sub optimizer.Expr) {
 		if vol {
 			return
 		}
 		switch x := sub.(type) {
-		case *planner.FuncCall:
+		case *optimizer.FuncCall:
 			name := strings.ToLower(x.Name)
 			if volatileBuiltins[name] {
 				vol = true
@@ -133,15 +133,15 @@ func subPlanExprVolatile(e planner.Expr, ctx *Context) bool {
 					}
 				}
 			}
-		case *planner.SubqueryExpr:
+		case *optimizer.SubqueryExpr:
 			if x.Plan != nil && subPlanContainsVolatile(x.Plan, ctx) {
 				vol = true
 			}
-		case *planner.ExistsExpr:
+		case *optimizer.ExistsExpr:
 			if x.Plan != nil && subPlanContainsVolatile(x.Plan, ctx) {
 				vol = true
 			}
-		case *planner.InExpr:
+		case *optimizer.InExpr:
 			if x.Plan != nil && subPlanContainsVolatile(x.Plan, ctx) {
 				vol = true
 			}
@@ -157,9 +157,9 @@ func subPlanExprVolatile(e planner.Expr, ctx *Context) bool {
 // classifySubPlan independently downgrades unknown NODE kinds to
 // rescanRebuild, and result caching for those plans keeps today's
 // semantics.
-func subPlanContainsVolatile(n planner.Node, ctx *Context) bool {
+func subPlanContainsVolatile(n optimizer.Node, ctx *Context) bool {
 	vol := false
-	planner.WalkPlanExprs(n, func(e planner.Expr) {
+	optimizer.WalkPlanExprs(n, func(e optimizer.Expr) {
 		if !vol && subPlanExprVolatile(e, ctx) {
 			vol = true
 		}
@@ -182,61 +182,61 @@ func subPlanContainsVolatile(n planner.Node, ctx *Context) bool {
 //     Values/GenerateSeries → rescanReOpen.
 //   - A volatile function anywhere (incl. nested sublinks) →
 //     cacheable=false.
-func classifySubPlan(n planner.Node, ctx *Context) (kind int, cacheable bool) {
+func classifySubPlan(n optimizer.Node, ctx *Context) (kind int, cacheable bool) {
 	kind = rescanReOpen
 	cacheable = true
-	var walk func(planner.Node)
-	walk = func(node planner.Node) {
+	var walk func(optimizer.Node)
+	walk = func(node optimizer.Node) {
 		if node == nil || kind == rescanRebuild {
 			return
 		}
 		switch x := node.(type) {
-		case *planner.Filter:
+		case *optimizer.Filter:
 			walk(x.Child)
-		case *planner.Project:
+		case *optimizer.Project:
 			walk(x.Child)
-		case *planner.Aggregate:
+		case *optimizer.Aggregate:
 			walk(x.Child)
-		case *planner.Limit:
+		case *optimizer.Limit:
 			walk(x.Child)
-		case *planner.Sort:
+		case *optimizer.Sort:
 			if kind == rescanReOpen {
 				kind = rescanCloseOpen
 			}
 			walk(x.Child)
-		case *planner.Distinct:
+		case *optimizer.Distinct:
 			// Re-Open-safe since the Stage-9 reset in distinctOp.Open
 			// (rows/idx cleared, child re-drained); the tree's kind is
 			// then decided by the child.
 			walk(x.Child)
-		case *planner.WindowAgg:
+		case *optimizer.WindowAgg:
 			if kind == rescanReOpen {
 				kind = rescanCloseOpen
 			}
 			walk(x.Child)
-		case *planner.LockRows:
+		case *optimizer.LockRows:
 			if kind == rescanReOpen {
 				kind = rescanCloseOpen
 			}
 			cacheable = false
 			walk(x.Child)
-		case *planner.Join:
+		case *optimizer.Join:
 			if kind == rescanReOpen {
 				kind = rescanCloseOpen
 			}
 			walk(x.Left)
 			walk(x.Right)
-		case *planner.NestedLoopIndexJoin:
+		case *optimizer.NestedLoopIndexJoin:
 			if kind == rescanReOpen {
 				kind = rescanCloseOpen
 			}
 			walk(x.Outer)
 			walk(x.Inner)
-		case *planner.SeqScan, *planner.IndexScan, *planner.IndexOnlyScan,
-			*planner.Values, *planner.GenerateSeries, *planner.GenerateSubscripts:
+		case *optimizer.SeqScan, *optimizer.IndexScan, *optimizer.IndexOnlyScan,
+			*optimizer.Values, *optimizer.GenerateSeries, *optimizer.GenerateSubscripts:
 			// Leaves. IndexOnlyScan re-Open safety has not been
 			// audited; keep it conservative.
-			if _, ios := node.(*planner.IndexOnlyScan); ios && kind == rescanReOpen {
+			if _, ios := node.(*optimizer.IndexOnlyScan); ios && kind == rescanReOpen {
 				kind = rescanCloseOpen
 			}
 		default:
@@ -252,9 +252,9 @@ func classifySubPlan(n planner.Node, ctx *Context) (kind int, cacheable bool) {
 
 // getSubPlanHandle returns (allocating on first use) the handle for
 // sublink key whose inner plan is plan.
-func getSubPlanHandle(ctx *Context, key planner.Expr, plan planner.Node, forExists bool) *subPlanHandle {
+func getSubPlanHandle(ctx *Context, key optimizer.Expr, plan optimizer.Node, forExists bool) *subPlanHandle {
 	if ctx.SubPlanHandles == nil {
-		ctx.SubPlanHandles = make(map[planner.Expr]*subPlanHandle)
+		ctx.SubPlanHandles = make(map[optimizer.Expr]*subPlanHandle)
 	}
 	h, ok := ctx.SubPlanHandles[key]
 	if !ok {
@@ -271,7 +271,7 @@ func getSubPlanHandle(ctx *Context, key planner.Expr, plan planner.Node, forExis
 // InitPlan semantics and cache unconditionally (see the file comment).
 // On the legacy path (kill switch off) this always reports true, which
 // is exactly the pre-Stage-9 behavior.
-func subPlanResultCacheable(ctx *Context, key planner.Expr, plan planner.Node, forExists bool) bool {
+func subPlanResultCacheable(ctx *Context, key optimizer.Expr, plan optimizer.Node, forExists bool) bool {
 	if !subPlanRescanEnabled() {
 		return true
 	}
@@ -291,7 +291,7 @@ func subPlanResultCacheable(ctx *Context, key planner.Expr, plan planner.Node, f
 //
 // Legacy path (kill switch off): Build+Open per call, done() Closes —
 // byte-for-byte the pre-Stage-9 lifecycle.
-func acquireSubPlanOp(ctx *Context, key planner.Expr, plan planner.Node, forExists bool) (Operator, func(), error) {
+func acquireSubPlanOp(ctx *Context, key optimizer.Expr, plan optimizer.Node, forExists bool) (Operator, func(), error) {
 	stat := ctx.subPlanStat(key)
 	if !subPlanRescanEnabled() {
 		stat.Rebuilds++

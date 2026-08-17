@@ -3,24 +3,24 @@ package executor
 import (
 	"strings"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // userSrfScanOp executes a user-defined SETOF function in the FROM clause.
 // It calls evalSQLFunctionSetof / evalPLpgSQLFunctionSetof and emits each
 // returned value as one row. M0097-0153.
 type userSrfScanOp struct {
-	plan *planner.UserSrfScan
+	plan *optimizer.UserSrfScan
 	ctx  *Context
 	rows []Datum
 	idx  int
 }
 
-func newUserSrfScanOp(p *planner.UserSrfScan) *userSrfScanOp {
+func newUserSrfScanOp(p *optimizer.UserSrfScan) *userSrfScanOp {
 	return &userSrfScanOp{plan: p}
 }
 
-func (o *userSrfScanOp) Schema() planner.Schema {
+func (o *userSrfScanOp) Schema() optimizer.Schema {
 	return o.plan.Output()
 }
 

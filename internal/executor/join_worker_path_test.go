@@ -41,7 +41,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // workerSeamSQL is an INNER hash join over the P8 fixture: one join node, a
@@ -50,13 +50,13 @@ import (
 const workerSeamSQL = "SELECT f.fid, f.amt, d.dname FROM pq_fact f JOIN pq_dim d ON f.fk = d.dk"
 
 // planWorkerQuery parses and plans sql against the fixture catalog.
-func planWorkerQuery(t *testing.T, ctx *Context, sql string) planner.Node {
+func planWorkerQuery(t *testing.T, ctx *Context, sql string) optimizer.Node {
 	t.Helper()
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		t.Fatalf("parse %q: %v", sql, err)
 	}
-	node, err := planner.Plan(stmts[0], ctx.Catalog)
+	node, err := optimizer.Plan(stmts[0], ctx.Catalog)
 	if err != nil {
 		t.Fatalf("plan %q: %v", sql, err)
 	}
@@ -71,7 +71,7 @@ func planWorkerQuery(t *testing.T, ctx *Context, sql string) planner.Node {
 // the next, so a probe source that the next pull overwrites is invisible to
 // it; a worker batches 256 rows before sending, so the same defect corrupts
 // every row but the last.
-func drainWorkerTree(t *testing.T, ctx *Context, node planner.Node) ([]Row, []*joinOp) {
+func drainWorkerTree(t *testing.T, ctx *Context, node optimizer.Node) ([]Row, []*joinOp) {
 	t.Helper()
 	// M0129-S8.3: advance the command counter between statements.
 	advanceStmtCounter(ctx)
@@ -229,7 +229,7 @@ func runSeamGathered(t *testing.T, ctx *Context, sql string, workers int, leader
 	// M0129-S8.3: advance the command counter between statements.
 	advanceStmtCounter(ctx)
 	node := planWorkerQuery(t, ctx, sql)
-	gathered := planner.MaybeAddGather(node, planner.ParallelSettings{
+	gathered := optimizer.MaybeAddGather(node, optimizer.ParallelSettings{
 		MaxWorkersPerGather: workers,
 		MinTableScanBlocks:  1,
 		DebugParallelQuery:  "on", // force past the size gate; the fixture is small

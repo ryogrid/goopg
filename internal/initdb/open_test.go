@@ -8,10 +8,10 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
-	"github.com/goopg/goopg/internal/wal"
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // TestOpenAfterInitReturnsRuntime: the typical operator flow —
@@ -200,7 +200,7 @@ func TestOpenWiresXactMarkerHook(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tx, err := rt.TxnMgr.Begin(mvcc.IsolationReadCommitted)
+	tx, err := rt.TxnMgr.Begin(transam.IsolationReadCommitted)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +215,7 @@ func TestOpenWiresXactMarkerHook(t *testing.T) {
 	if err := rt.TxnMgr.Commit(tx); err != nil {
 		t.Fatal(err)
 	}
-	tx2, _ := rt.TxnMgr.Begin(mvcc.IsolationReadCommitted)
+	tx2, _ := rt.TxnMgr.Begin(transam.IsolationReadCommitted)
 	if xid, err := rt.TxnMgr.AssignXID(tx2); err != nil {
 		t.Fatal(err)
 	} else {
@@ -234,7 +234,7 @@ func TestOpenWiresXactMarkerHook(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	recs, err := wal.ReadAll(filepath.Join(dir, "pg_wal"), 0)
+	recs, err := xlog.ReadAll(filepath.Join(dir, "pg_wal"), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,16 +242,16 @@ func TestOpenWiresXactMarkerHook(t *testing.T) {
 	for _, r := range recs {
 		// A6: commit/abort are PG xl_xact_commit / xl_xact_abort — no native
 		// Payload; the opcode is in the header and the xid is xl_xid.
-		if r.XLog == nil || r.XLog.Header.Rmid != wal.RmgrXact {
+		if r.XLog == nil || r.XLog.Header.Rmid != xlog.RmgrXact {
 			continue
 		}
 		xid := storage.TransactionID(r.XLog.Header.XID)
-		switch r.XLog.Header.Info & wal.XlogXactOpMask {
-		case wal.XlogXactCommit:
+		switch r.XLog.Header.Info & xlog.XlogXactOpMask {
+		case xlog.XlogXactCommit:
 			if xid == tx.XID {
 				sawCommit = true
 			}
-		case wal.XlogXactAbort:
+		case xlog.XlogXactAbort:
 			if xid == tx2.XID {
 				sawAbort = true
 			}

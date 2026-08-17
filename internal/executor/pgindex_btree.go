@@ -5,9 +5,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -69,7 +69,7 @@ var pgIndexTupleKeys = true
 // the per-statement Context, so the only staleness window is DDL that alters a
 // key column's type inside the very statement that is also writing through the
 // index — which cannot happen, since ALTER TABLE takes AccessExclusiveLock.
-func (ctx *Context) pgIndexKeyDesc(idx *catalog.Index) *btree.PGIndexKeyDesc {
+func (ctx *Context) pgIndexKeyDesc(idx *catalog.Index) *nbtree.PGIndexKeyDesc {
 	if !pgIndexTupleKeys || idx == nil {
 		return nil
 	}
@@ -83,7 +83,7 @@ func (ctx *Context) pgIndexKeyDesc(idx *catalog.Index) *btree.PGIndexKeyDesc {
 		desc = nil
 	}
 	if ctx.pgKeyDescCache == nil {
-		ctx.pgKeyDescCache = make(map[uint32]*btree.PGIndexKeyDesc)
+		ctx.pgKeyDescCache = make(map[uint32]*nbtree.PGIndexKeyDesc)
 	}
 	ctx.pgKeyDescCache[idx.OID] = desc
 	return desc
@@ -330,7 +330,7 @@ func (ctx *Context) indexRowKey(idx *catalog.Index, cols []catalog.Column, row R
 // `buildPGIndexKeyDesc` refuses it. A descriptor arriving together with an
 // unresolvable column is therefore a contradiction, and is reported rather than
 // silently encoded as a shorter (pivot!) key.
-func (ctx *Context) indexBuildEntryKey(idx *catalog.Index, cols []*catalog.Column, keyExprs []planner.Expr, row Row, tid storage.ItemPointer, pos int) (key []byte, hasNullKey bool, err *ExecError) {
+func (ctx *Context) indexBuildEntryKey(idx *catalog.Index, cols []*catalog.Column, keyExprs []optimizer.Expr, row Row, tid storage.ItemPointer, pos int) (key []byte, hasNullKey bool, err *ExecError) {
 	desc := ctx.pgIndexKeyDesc(idx)
 	if desc == nil {
 		return encodeCompositeBTreeKeyWithExprs(ctx, row, cols, keyExprs, pos)
@@ -408,16 +408,16 @@ func (ctx *Context) indexBuildEntryKey(idx *catalog.Index, cols []*catalog.Colum
 // Expression arbiter columns (`ArbiterColumns[i] == -1`) only ever appear on
 // indexes `buildPGIndexKeyDesc` refuses, which resolve to a nil descriptor and
 // keep the blob path whole.
-func (ctx *Context) arbiterProbeKey(oc *planner.OnConflictPlan, tbl *catalog.Table, row Row, pos int) ([]byte, error) {
+func (ctx *Context) arbiterProbeKey(oc *optimizer.OnConflictPlan, tbl *catalog.Table, row Row, pos int) ([]byte, error) {
 	return ctx.arbiterKey(oc, tbl, row, storage.ItemPointer{}, pos)
 }
 
 // arbiterEntryKey — see arbiterProbeKey.
-func (ctx *Context) arbiterEntryKey(oc *planner.OnConflictPlan, tbl *catalog.Table, row Row, tid storage.ItemPointer, pos int) ([]byte, error) {
+func (ctx *Context) arbiterEntryKey(oc *optimizer.OnConflictPlan, tbl *catalog.Table, row Row, tid storage.ItemPointer, pos int) ([]byte, error) {
 	return ctx.arbiterKey(oc, tbl, row, tid, pos)
 }
 
-func (ctx *Context) arbiterKey(oc *planner.OnConflictPlan, tbl *catalog.Table, row Row, tid storage.ItemPointer, pos int) ([]byte, error) {
+func (ctx *Context) arbiterKey(oc *optimizer.OnConflictPlan, tbl *catalog.Table, row Row, tid storage.ItemPointer, pos int) ([]byte, error) {
 	if oc == nil || oc.ArbiterIndex == nil || len(oc.ArbiterColumns) == 0 {
 		return nil, nil
 	}
@@ -490,22 +490,27 @@ func (ctx *Context) arbiterKey(oc *planner.OnConflictPlan, tbl *catalog.Table, r
 //
 // For the blob format both reduce to what M0055-0006 Phase E shipped, byte for
 // byte: `CompareKeys` IS bytes.Compare, and equality under it IS bytesEqual.
-func sortBuildEntriesFindDuplicate(desc *btree.PGIndexKeyDesc, entries []btree.BulkEntry) bool {
-	cmp := func(a, b []byte) int { return btree.CompareKeys(a, b) }
-	dup := func(a, b []byte) bool { return btree.CompareKeys(a, b) == 0 }
+// sortBuildEntriesFindDuplicate sorts entries in place (matching BulkBuild's
+// convention) and returns the index of the SECOND entry of the first adjacent
+// duplicate pair (entries[i] duplicates entries[i-1]), or -1 when the entries
+// are all distinct. The caller can use entries[result].KeyDesc to render PG's
+// "Key (…)=(…) is duplicated." DETAIL. M0134-0002 C3 slice 2.
+func sortBuildEntriesFindDuplicate(desc *nbtree.PGIndexKeyDesc, entries []nbtree.BulkEntry) int {
+	cmp := func(a, b []byte) int { return nbtree.CompareKeys(a, b) }
+	dup := func(a, b []byte) bool { return nbtree.CompareKeys(a, b) == 0 }
 	if desc != nil {
 		cmp = func(a, b []byte) int {
-			res, err := btree.ComparePGIndexTuples(desc, a, b)
+			res, err := nbtree.ComparePGIndexTuples(desc, a, b)
 			if err != nil {
 				// Same total-order fallback indexFormat.compare makes: a sort
 				// predicate has nowhere to put an error, and an intransitive
 				// one is worse than a wrong one.
-				return btree.CompareKeys(a, b)
+				return nbtree.CompareKeys(a, b)
 			}
 			return res
 		}
 		dup = func(a, b []byte) bool {
-			res, err := btree.ComparePGIndexTupleKeyAttrs(desc, a, b)
+			res, err := nbtree.ComparePGIndexTupleKeyAttrs(desc, a, b)
 			if err != nil {
 				return false
 			}
@@ -515,10 +520,10 @@ func sortBuildEntriesFindDuplicate(desc *btree.PGIndexKeyDesc, entries []btree.B
 	sort.SliceStable(entries, func(i, j int) bool { return cmp(entries[i].Key, entries[j].Key) < 0 })
 	for i := 1; i < len(entries); i++ {
 		if dup(entries[i].Key, entries[i-1].Key) {
-			return true
+			return i
 		}
 	}
-	return false
+	return -1
 }
 
 func columnNameOrEmpty(c *catalog.Column) string {
@@ -531,15 +536,15 @@ func columnNameOrEmpty(c *catalog.Column) string {
 // indexBTreeOptions is the Options every index btree in the engine is
 // opened/created with: the pool's split-WAL hook (what plain btree.Open
 // supplies) plus this index's key descriptor.
-func indexBTreeOptions(ctx *Context, idx *catalog.Index) btree.Options {
-	opts := btree.Options{KeyDesc: ctx.pgIndexKeyDesc(idx)}
+func indexBTreeOptions(ctx *Context, idx *catalog.Index) nbtree.Options {
+	opts := nbtree.Options{KeyDesc: ctx.pgIndexKeyDesc(idx)}
 	if ctx.Pool != nil {
 		// btree.Open takes the same hook from the pool; asking a nil pool for
 		// it dereferences (storage.(*Pool).LogBtreeSplit). The open itself
 		// fails right after on a nil pool, so guarding here only keeps the
 		// options constructor callable on its own — which is what lets the
 		// descriptor wiring be tested without a buffer pool.
-		opts.LogSplit = btree.PoolLogSplit(ctx.Pool)
+		opts.LogSplit = nbtree.PoolLogSplit(ctx.Pool)
 	}
 	return opts
 }
@@ -552,25 +557,25 @@ func indexBTreeOptions(ctx *Context, idx *catalog.Index) btree.Options {
 // callers open a relfilenode that is NOT ctx.Catalog.IndexRelFileNode(idx) —
 // REINDEX CONCURRENTLY builds into a shadow relfile that carries the same key
 // shape as the index it will replace.
-func openIndexBTree(ctx *Context, idx *catalog.Index, idxRel storage.RelFileNode) (*btree.BTree, error) {
-	return btree.OpenWithOptions(ctx.Pool, idxRel, indexBTreeOptions(ctx, idx))
+func openIndexBTree(ctx *Context, idx *catalog.Index, idxRel storage.RelFileNode) (*nbtree.BTree, error) {
+	return nbtree.OpenWithOptions(ctx.Pool, idxRel, indexBTreeOptions(ctx, idx))
 }
 
 // createIndexBTree initialises an empty btree for a catalog index, stamping
 // the creating xid onto the block-0 smgr-create record (what
 // btree.CreateWithXID does) and installing the key descriptor.
-func createIndexBTree(ctx *Context, idx *catalog.Index, idxRel storage.RelFileNode) (*btree.BTree, error) {
+func createIndexBTree(ctx *Context, idx *catalog.Index, idxRel storage.RelFileNode) (*nbtree.BTree, error) {
 	opts := indexBTreeOptions(ctx, idx)
 	opts.CreateXID = ctx.Tx.XID
-	return btree.CreateWithOptions(ctx.Pool, idxRel, opts)
+	return nbtree.CreateWithOptions(ctx.Pool, idxRel, opts)
 }
 
 // bulkCreateIndexBTree sort-builds a btree for a catalog index (CREATE INDEX /
 // REINDEX), installing the key descriptor so the build's own sort and the
 // later readers agree on the ordering — the one place where disagreeing would
 // produce a tree that is wrong from birth rather than wrong on the next write.
-func bulkCreateIndexBTree(ctx *Context, idx *catalog.Index, idxRel storage.RelFileNode, entries []btree.BulkEntry) (*btree.BTree, error) {
+func bulkCreateIndexBTree(ctx *Context, idx *catalog.Index, idxRel storage.RelFileNode, entries []nbtree.BulkEntry) (*nbtree.BTree, error) {
 	opts := indexBTreeOptions(ctx, idx)
 	opts.CreateXID = ctx.Tx.XID
-	return btree.BulkCreateWithOptions(ctx.Pool, idxRel, entries, opts)
+	return nbtree.BulkCreateWithOptions(ctx.Pool, idxRel, entries, opts)
 }

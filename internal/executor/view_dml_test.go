@@ -20,7 +20,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 func TestUpdatableViewInsertUpdateDeleteRewriteToBase(t *testing.T) {
@@ -226,19 +226,19 @@ func TestUpdatableViewWhereQualEnforcedThroughIndexPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	plan, err := planner.Plan(stmts[0], cat)
+	plan, err := optimizer.Plan(stmts[0], cat)
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
-	upd, ok := plan.(*planner.Update)
+	upd, ok := plan.(*optimizer.Update)
 	if !ok {
 		t.Fatalf("plan type = %T, want *planner.Update", plan)
 	}
-	filt, ok := upd.Child.(*planner.Filter)
+	filt, ok := upd.Child.(*optimizer.Filter)
 	if !ok {
 		t.Fatalf("Update.Child type = %T, want *planner.Filter (view qual)", upd.Child)
 	}
-	if _, ok := filt.Child.(*planner.IndexScan); !ok {
+	if _, ok := filt.Child.(*optimizer.IndexScan); !ok {
 		t.Fatalf("Filter.Child type = %T, want *planner.IndexScan — index path not chosen", filt.Child)
 	}
 
@@ -466,8 +466,8 @@ func TestChainedViewInnerNotAutoUpdatableRejectsWholeChain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	_, err = planner.Plan(stmts[0], cat)
-	pe, ok := err.(*planner.PlanError)
+	_, err = optimizer.Plan(stmts[0], cat)
+	pe, ok := err.(*optimizer.PlanError)
 	if !ok || pe.Code != "55000" {
 		t.Fatalf("INSERT through a chain with a non-updatable inner view: err=%v, want *planner.PlanError 55000", err)
 	}
@@ -494,14 +494,14 @@ func TestNonUpdatableViewDMLRejected(t *testing.T) {
 	must("CREATE VIEW vagg AS SELECT id, count(*) FROM t6 GROUP BY id")
 	must("CREATE VIEW vexpr AS SELECT id, val + 1 AS valplus FROM t6")
 
-	planErr := func(sql string) *planner.PlanError {
+	planErr := func(sql string) *optimizer.PlanError {
 		t.Helper()
 		stmts, err := parser.Parse(sql)
 		if err != nil {
 			t.Fatalf("Parse(%q): %v", sql, err)
 		}
-		_, err = planner.Plan(stmts[0], cat)
-		pe, ok := err.(*planner.PlanError)
+		_, err = optimizer.Plan(stmts[0], cat)
+		pe, ok := err.(*optimizer.PlanError)
 		if !ok {
 			t.Fatalf("Plan(%q) err=%v, want *planner.PlanError", sql, err)
 		}
@@ -603,8 +603,8 @@ func TestUpdatableViewColumnSubsetReorderRename(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	_, err = planner.Plan(stmts[0], ctx.Catalog)
-	pe, ok := err.(*planner.PlanError)
+	_, err = optimizer.Plan(stmts[0], ctx.Catalog)
+	pe, ok := err.(*optimizer.PlanError)
 	if !ok || pe.Code != "42703" {
 		t.Fatalf("UPDATE vsub SET val: err=%v, want *planner.PlanError 42703 (val is not part of vsub's row type)", err)
 	}
@@ -683,8 +683,8 @@ func TestUpdatableViewUpdateFromDeleteUsing(t *testing.T) {
 	if perr != nil {
 		t.Fatalf("Parse: %v", perr)
 	}
-	_, perr = planner.Plan(stmts[0], ctx.Catalog)
-	pe, ok := perr.(*planner.PlanError)
+	_, perr = optimizer.Plan(stmts[0], ctx.Catalog)
+	pe, ok := perr.(*optimizer.PlanError)
 	if !ok || pe.Code != "55000" {
 		t.Fatalf("UPDATE aggregate view FROM: err=%v, want *planner.PlanError 55000", perr)
 	}
@@ -692,8 +692,8 @@ func TestUpdatableViewUpdateFromDeleteUsing(t *testing.T) {
 	if perr != nil {
 		t.Fatalf("Parse: %v", perr)
 	}
-	_, perr = planner.Plan(stmts[0], ctx.Catalog)
-	pe, ok = perr.(*planner.PlanError)
+	_, perr = optimizer.Plan(stmts[0], ctx.Catalog)
+	pe, ok = perr.(*optimizer.PlanError)
 	if !ok || pe.Code != "55000" {
 		t.Fatalf("DELETE aggregate view USING: err=%v, want *planner.PlanError 55000", perr)
 	}
@@ -840,5 +840,79 @@ func TestUpdatableViewOnConflictRenamedColumn(t *testing.T) {
 	rows = runQueryRows(t, ctx, "SELECT val FROM toc1 WHERE id = 1")
 	if len(rows) != 1 || rows[0][0].Format() != "1009" {
 		t.Fatalf("ON CONFLICT DO NOTHING via renamed view column must leave row unchanged: got %v", rows)
+	}
+}
+
+// TestUpdatableViewStarFrozenAcrossViewReplace pins M0134-0002 slice 1 (bug
+// #17811 / alter_table.sql:1664): a view defined as a bare `SELECT *` from
+// another view freezes its column list at creation, but goopg stores the star
+// UNEXPANDED (v.View.Targets = [StarExpr]). After CREATE OR REPLACE VIEW
+// grows the inner view 1→2 columns, viewColumnMap's bare-* arm must map the
+// outer view's OWN frozen columns (tbl.Columns, still 1 here: q1) onto the
+// base relation BY NAME — not an identity map over len(base.Columns), which
+// leaves colMap longer than viewColumnNames(tbl) and panics in viewProxyTable
+// (`index out of range [1] with length 1`). PostgreSQL executes this update
+// (alter_table.out:2655-2677); goopg must too.
+func TestUpdatableViewStarFrozenAcrossViewReplace(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	must := func(sql string) {
+		t.Helper()
+		if err := runDDL(t, ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	must("CREATE TABLE t1 (q1 int8, q2 int8)")
+	must("INSERT INTO t1 VALUES (123, 1), (123, 2), (999, 3)")
+	// v1 starts as a 1-column view; v2's bare `SELECT *` is frozen to that
+	// single column (q1) at creation.
+	must("CREATE VIEW v1 AS SELECT 1::int8 AS q1")
+	must("CREATE VIEW v2 AS SELECT * FROM v1")
+	// Grow v1 1→2 columns. v2's frozen column list still has just 1 (q1).
+	must("CREATE OR REPLACE VIEW v1 AS SELECT * FROM t1")
+
+	// Pre-fix this panics in viewProxyTable (names[1] with len(names)=1);
+	// post-fix it resolves q1 by name through the chain onto t1's column 0.
+	must("UPDATE v2 SET q1 = q1 + 1 WHERE q1 = 123")
+	rows := runQueryRows(t, ctx, "SELECT q1, q2 FROM t1 ORDER BY q2")
+	if len(rows) != 3 {
+		t.Fatalf("after UPDATE through stale-* view: got %d base rows, want 3", len(rows))
+	}
+	// Both rows with q1=123 flip to 124; the q1=999 row is untouched.
+	for i, want := range []string{"124", "124", "999"} {
+		if got := rows[i][0].Format(); got != want {
+			t.Errorf("row %d q1 = %s, want %s", i+1, got, want)
+		}
+	}
+}
+
+// TestUpdatableViewStarWithColumnListRename pins the companion edge of the
+// M0134-0002 slice-1 fix: a bare `SELECT *` view WITH an explicit CREATE VIEW
+// column list (`v2 (x) AS SELECT * FROM v1`) stays simply updatable — a star
+// maps positionally by definition, so the renamed output name x resolves onto
+// the base's column 0. A by-name frozen-column map would fail closed 55000
+// here (x does not name-resolve against the base column q1 — goopg stores
+// only the renamed output name); the positional frozen-count map keeps both
+// the frozen-growth shape and this rename shape working.
+func TestUpdatableViewStarWithColumnListRename(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	must := func(sql string) {
+		t.Helper()
+		if err := runDDL(t, ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	must("CREATE TABLE ts1 (q1 int)")
+	must("INSERT INTO ts1 VALUES (1), (2)")
+	must("CREATE VIEW vs2 (x) AS SELECT * FROM ts1")
+
+	// Must stay updatable (no 55000, no panic) and resolve x onto q1.
+	must("UPDATE vs2 SET x = 99 WHERE x = 1")
+	rows := runQueryRows(t, ctx, "SELECT q1 FROM ts1 ORDER BY q1")
+	if len(rows) != 2 || rows[0][0].Format() != "2" || rows[1][0].Format() != "99" {
+		t.Fatalf("after UPDATE through column-list-renamed star view: got %v, want [2 99]", rows)
 	}
 }

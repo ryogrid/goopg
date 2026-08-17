@@ -58,3 +58,48 @@ func TestAnySomeAllOrderingOperators(t *testing.T) {
 		})
 	}
 }
+
+// TestLikeFamilyAnyAllEvaluation pins the M0134-0003 executor-level
+// evaluation of `expr [NOT] LIKE|ILIKE ANY|SOME|ALL (array)`, previously
+// unparseable (`function any does not exist`). Cases mirror
+// postgres/src/test/regress/sql/arrays.sql lines 463-470; the trailing
+// comment on each PG line is the expected value reproduced here.
+func TestLikeFamilyAnyAllEvaluation(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	scalarBool := func(sql string) bool {
+		t.Helper()
+		rows := runQuery(t, ctx, sql)
+		if len(rows) != 1 {
+			t.Fatalf("%s: got %d rows, want 1", sql, len(rows))
+		}
+		return rows[0][0].BoolValue()
+	}
+
+	cases := []struct {
+		sql  string
+		want bool
+	}{
+		{"select 'foo' like any (array['%a', '%o'])", true},
+		{"select 'foo' like any (array['%a', '%b'])", false},
+		{"select 'foo' like all (array['f%', '%o'])", true},
+		{"select 'foo' like all (array['f%', '%b'])", false},
+		{"select 'foo' not like any (array['%a', '%b'])", true},
+		{"select 'foo' not like all (array['%a', '%o'])", false},
+		{"select 'foo' ilike any (array['%A', '%O'])", true},
+		{"select 'foo' ilike all (array['F%', '%O'])", true},
+		// SOME synonym + NOT ILIKE, not in the PG corpus block but
+		// exercising the remaining two sibling blocks.
+		{"select 'foo' like some (array['%a', '%b'])", false},
+		{"select 'foo' not ilike any (array['%A', '%B'])", true},
+		{"select 'foo' not ilike all (array['%A', '%O'])", false},
+	}
+	for _, c := range cases {
+		t.Run(c.sql, func(t *testing.T) {
+			if got := scalarBool(c.sql); got != c.want {
+				t.Errorf("got %v, want %v", got, c.want)
+			}
+		})
+	}
+}

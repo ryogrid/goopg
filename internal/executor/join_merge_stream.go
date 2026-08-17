@@ -51,7 +51,7 @@ import (
 	"io"
 	"sort"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // errMergeKeyNil is the diagnosis buildMergeSide raised when a Join reached
@@ -84,7 +84,7 @@ type mergeSortedSource struct {
 	o        *joinOp
 	child    Operator
 	isLeft   bool
-	keyExprs []planner.Expr
+	keyExprs []optimizer.Expr
 	nkeys    int
 
 	// Widths of the merged column space this side's key expressions are
@@ -489,8 +489,8 @@ func newMergeJoinStream(o *joinOp, leftWidth, rightWidth int,
 		right:     right,
 		nullLeft:  nullRow(leftWidth),
 		nullRight: nullRow(rightWidth),
-		fillLeft:  o.plan.Type == planner.JoinTypeLeft || o.plan.Type == planner.JoinTypeFull,
-		fillRight: o.plan.Type == planner.JoinTypeRight || o.plan.Type == planner.JoinTypeFull,
+		fillLeft:  o.plan.Type == optimizer.JoinTypeLeft || o.plan.Type == optimizer.JoinTypeFull,
+		fillRight: o.plan.Type == optimizer.JoinTypeRight || o.plan.Type == optimizer.JoinTypeFull,
 	}
 }
 

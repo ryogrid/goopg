@@ -1,6 +1,10 @@
 package parser
 
-import "testing"
+import (
+	"errors"
+	"strings"
+	"testing"
+)
 
 // TestParseAlterTablePgbenchPrimaryKey: pgbench's exact strings for
 // installing primary keys after the data load. This is the
@@ -128,6 +132,48 @@ func TestParseAlterTableAddColumn(t *testing.T) {
 	}
 }
 
+// TestParseAlterTableAddColumnIfNotExists covers `ADD COLUMN [IF NOT EXISTS]
+// coldef` (M0134-0002 C2). The IF NOT EXISTS form must set IfExists=true so the
+// executor emits PG's "already exists, skipping" NOTICE instead of 42701; the
+// WITHOUT-clause form must leave IfExists=false.
+func TestParseAlterTableAddColumnIfNotExists(t *testing.T) {
+	cases := []struct {
+		sql        string
+		wantName   string
+		wantExists bool
+		wantN      int
+	}{
+		{"ALTER TABLE t ADD COLUMN IF NOT EXISTS c integer", "c", true, 1},
+		{"ALTER TABLE t ADD IF NOT EXISTS c integer", "c", true, 1}, // opt_column omitted
+		{"ALTER TABLE t ADD COLUMN c integer", "c", false, 1},
+		{"ALTER TABLE t ADD COLUMN IF NOT EXISTS c2 integer, ADD COLUMN IF NOT EXISTS c3 integer", "c2", true, 2},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T", tc.sql, stmts[0])
+		}
+		if len(at.Actions) != tc.wantN {
+			t.Fatalf("Parse(%q): actions=%+v want %d", tc.sql, at.Actions, tc.wantN)
+		}
+		for i, act := range at.Actions {
+			if act.Kind != AlterTableAddColumn {
+				t.Errorf("Parse(%q): actions[%d].Kind=%v want AlterTableAddColumn", tc.sql, i, act.Kind)
+			}
+		}
+		if at.Actions[0].Column.Name != tc.wantName {
+			t.Errorf("Parse(%q): Column.Name=%q want %q", tc.sql, at.Actions[0].Column.Name, tc.wantName)
+		}
+		if at.Actions[0].IfExists != tc.wantExists {
+			t.Errorf("Parse(%q): IfExists=%v want %v", tc.sql, at.Actions[0].IfExists, tc.wantExists)
+		}
+	}
+}
+
 // TestParseAlterTableSyntaxErrors pins SyntaxError for canonical
 // missing-piece cases.
 func TestParseAlterTableSyntaxErrors(t *testing.T) {
@@ -198,6 +244,54 @@ func TestParseAlterTableDropConstraint(t *testing.T) {
 	}
 }
 
+// TestParseAlterTableDropIfExists covers `DROP COLUMN [IF EXISTS] c` and
+// `DROP CONSTRAINT [IF EXISTS] c` (M0134-0002 C2 slice 7). The IF EXISTS form
+// must set IfExists=true so the executor emits PG's "does not exist, skipping"
+// NOTICE instead of 42703/42704; the bare form must leave IfExists=false.
+func TestParseAlterTableDropIfExists(t *testing.T) {
+	cases := []struct {
+		sql        string
+		wantKind   AlterTableActionKind
+		wantName   string
+		wantExists bool
+	}{
+		{"ALTER TABLE t DROP COLUMN IF EXISTS c", AlterTableDropColumn, "c", true},
+		{"ALTER TABLE t DROP COLUMN c", AlterTableDropColumn, "c", false},
+		{"ALTER TABLE t DROP CONSTRAINT IF EXISTS c", AlterTableDropConstraint, "c", true},
+		{"ALTER TABLE t DROP CONSTRAINT c", AlterTableDropConstraint, "c", false},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T", tc.sql, stmts[0])
+		}
+		if len(at.Actions) != 1 {
+			t.Fatalf("Parse(%q): actions=%+v want 1", tc.sql, at.Actions)
+		}
+		act := at.Actions[0]
+		if act.Kind != tc.wantKind {
+			t.Errorf("Parse(%q): Kind=%v want %v", tc.sql, act.Kind, tc.wantKind)
+		}
+		switch tc.wantKind {
+		case AlterTableDropColumn:
+			if act.ColumnName != tc.wantName {
+				t.Errorf("Parse(%q): ColumnName=%q want %q", tc.sql, act.ColumnName, tc.wantName)
+			}
+		case AlterTableDropConstraint:
+			if act.ConstraintName != tc.wantName {
+				t.Errorf("Parse(%q): ConstraintName=%q want %q", tc.sql, act.ConstraintName, tc.wantName)
+			}
+		}
+		if act.IfExists != tc.wantExists {
+			t.Errorf("Parse(%q): IfExists=%v want %v", tc.sql, act.IfExists, tc.wantExists)
+		}
+	}
+}
+
 // TestParseAlterTableSetCompression covers `ALTER TABLE ... ALTER COLUMN c SET
 // COMPRESSION <method>` (DU-002 slice 183). The method normalizes to pglz/lz4;
 // `default` (and any unknown token) normalizes to "" so no SET COMPRESSION is
@@ -229,6 +323,111 @@ func TestParseAlterTableSetCompression(t *testing.T) {
 		}
 		if at.Actions[0].CompressionType != tc.wantMeth {
 			t.Errorf("Parse(%q): CompressionType=%q want %q", tc.sql, at.Actions[0].CompressionType, tc.wantMeth)
+		}
+	}
+}
+
+// TestParseAlterTableSetWithoutOids covers `ALTER TABLE ... SET WITHOUT OIDS`
+// (M0134-0002 C2 slice 12; alter_table.sql:1041). PG gram.y:2731-2738 maps it
+// to AT_DropOids, whose ATExecCmd is a SILENT no-op (tablecmds.c:5528-5530) —
+// goopg must parse it into the existing AlterTableNoOp action (also silent in
+// execAlterTable), not die with `expected CLUSTER after SET WITHOUT`.
+func TestParseAlterTableSetWithoutOids(t *testing.T) {
+	stmts, err := Parse("ALTER TABLE atacc1 SET WITHOUT OIDS")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	at, ok := stmts[0].(*AlterTableStmt)
+	if !ok {
+		t.Fatalf("got %T", stmts[0])
+	}
+	if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableNoOp {
+		t.Fatalf("actions=%+v want one AlterTableNoOp", at.Actions)
+	}
+
+	// SET WITHOUT CLUSTER must still parse as its own kind, not be shadowed.
+	stmts, err = Parse("ALTER TABLE t SET WITHOUT CLUSTER")
+	if err != nil {
+		t.Fatalf("Parse SET WITHOUT CLUSTER: %v", err)
+	}
+	at, _ = stmts[0].(*AlterTableStmt)
+	if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableSetWithoutCluster {
+		t.Fatalf("SET WITHOUT CLUSTER: actions=%+v", at.Actions)
+	}
+}
+
+// TestParseAlterTableSetWithOids covers `ALTER TABLE ... SET WITH OIDS`
+// (M0134-0002 C2 slice 12; alter_table.sql:1044). PG's gram.y has no
+// alter_table_cmd production for it, so the generic bison error points at the
+// WITH keyword (scanner_yyerror echoes the raw source token, scan.l:1234-1241)
+// — uppercase in the regress input. goopg must emit `syntax error at or near
+// "WITH"`, not `expected ADD or DROP (got set)`.
+func TestParseAlterTableSetWithOids(t *testing.T) {
+	_, err := Parse("ALTER TABLE atacc1 SET WITH OIDS")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), `"WITH"`) {
+		t.Errorf("error %q does not contain %q", err.Error(), `"WITH"`)
+	}
+	var se *SyntaxError
+	if !errors.As(err, &se) {
+		t.Fatalf("err type=%T want *SyntaxError", err)
+	}
+	if se.Message != "WITH" {
+		t.Errorf("SyntaxError.Message=%q want %q", se.Message, "WITH")
+	}
+}
+
+// TestParseColumnConstraintDuplicateEnforced covers the duplicate `[NOT]
+// ENFORCED` column-constraint path (M0134-0002 C2 slice 12; alter_table.sql:1211
+// `add column y int check (x > 0) not enforced enforced`). PG's
+// transformConstraintAttrs (parse_utilcmd.c:3999-4027) rejects any second
+// ENFORCED-ish attribute with the bare `multiple ENFORCED/NOT ENFORCED clauses
+// not allowed` (42601) — a DIFFERENT message from the table-level
+// `conflicting constraint properties` (gram.y:6234) — so the goopg error must
+// be a Raw SyntaxError carrying exactly that text.
+func TestParseColumnConstraintDuplicateEnforced(t *testing.T) {
+	cases := []struct {
+		sql string
+	}{
+		{"alter table renameColumn add column y int check (x > 0) not enforced enforced"},
+		{"alter table t add column y int check (x > 0) enforced enforced"},
+		{"alter table t add column y int check (x > 0) enforced not enforced"},
+		{"alter table t add column y int check (x > 0) not enforced not enforced"},
+		{"alter table t add column y int constraint c check (x > 0) not enforced enforced"},
+	}
+	for _, tc := range cases {
+		_, err := Parse(tc.sql)
+		if err == nil {
+			t.Errorf("Parse(%q): expected error", tc.sql)
+			continue
+		}
+		if !strings.Contains(err.Error(), "multiple ENFORCED/NOT ENFORCED clauses not allowed") {
+			t.Errorf("Parse(%q): error %q does not contain %q", tc.sql, err.Error(), "multiple ENFORCED/NOT ENFORCED clauses not allowed")
+			continue
+		}
+		var se *SyntaxError
+		if !errors.As(err, &se) {
+			t.Errorf("Parse(%q): err type=%T want *SyntaxError", tc.sql, err)
+			continue
+		}
+		if !se.Raw {
+			t.Errorf("Parse(%q): SyntaxError.Raw=false, want true (bare PG message)", tc.sql)
+		}
+	}
+
+	// A single [NOT] ENFORCED must NOT be flagged, and a trailing NOT NULL /
+	// NOT VALID must not false-positive the dup check (NOT VALID is only a
+	// valid trailer on ALTER TABLE ADD CHECK, not on an ADD COLUMN constraint).
+	for _, ok := range []string{
+		"alter table t add column y int check (x > 0) not enforced",
+		"alter table t add column y int check (x > 0) enforced",
+		"alter table t add column y int check (x > 0) not enforced not null",
+		"alter table t add column y int check (x > 0) not null",
+	} {
+		if _, err := Parse(ok); err != nil {
+			t.Errorf("Parse(%q): unexpected error %v", ok, err)
 		}
 	}
 }
@@ -488,6 +687,181 @@ func TestParseAlterTableAddNotNull(t *testing.T) {
 		}
 		if a.NoInherit != tc.wantNoInherit {
 			t.Errorf("Parse(%q): NoInherit=%v want %v", tc.sql, a.NoInherit, tc.wantNoInherit)
+		}
+	}
+}
+
+// TestParseAlterTableAddNotNullNotValid covers the `ALTER TABLE ... ADD
+// [CONSTRAINT name] NOT NULL col NOT VALID` trailer (alter_table.sql:915,
+// `ADD CONSTRAINT dummy_constr NOT NULL id NOT VALID`). PG's
+// ConstraintAttributeSpec is order-independent, so NOT VALID may precede or
+// follow NO INHERIT. M0134-0002 C2 slice 10.
+func TestParseAlterTableAddNotNullNotValid(t *testing.T) {
+	for _, tc := range []struct {
+		sql           string
+		wantNotValid  bool
+		wantNoInherit bool
+	}{
+		{"ALTER TABLE t ADD CONSTRAINT c NOT NULL col NOT VALID", true, false},
+		{"ALTER TABLE t ADD CONSTRAINT c NOT NULL col NOT VALID NO INHERIT", true, true},
+		{"ALTER TABLE t ADD CONSTRAINT c NOT NULL col NO INHERIT NOT VALID", true, true},
+		{"ALTER TABLE t ADD CONSTRAINT c NOT NULL col", false, false},
+	} {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T", tc.sql, stmts[0])
+		}
+		if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableAddNotNull {
+			t.Fatalf("Parse(%q): actions=%+v", tc.sql, at.Actions)
+		}
+		a := at.Actions[0]
+		if a.NotValid != tc.wantNotValid {
+			t.Errorf("Parse(%q): NotValid=%v want %v", tc.sql, a.NotValid, tc.wantNotValid)
+		}
+		if a.NoInherit != tc.wantNoInherit {
+			t.Errorf("Parse(%q): NoInherit=%v want %v", tc.sql, a.NoInherit, tc.wantNoInherit)
+		}
+	}
+}
+
+// TestParseAlterTableAddCheckNoInherit covers the `ALTER TABLE ... ADD
+// [CONSTRAINT name] CHECK (expr) [NO INHERIT]` trailer (connoinherit='t').
+// PG's ConstraintAttributeSpec is order-independent, so NO INHERIT may precede
+// or follow the NOT VALID/[NOT] ENFORCED block — alter_table.sql:420 has
+// `check (a = 2) no inherit not valid` and :309/663/670/1582 trail a bare
+// ` NO INHERIT`. M0134-0002 C2.
+func TestParseAlterTableAddCheckNoInherit(t *testing.T) {
+	for _, tc := range []struct {
+		sql           string
+		wantNoInherit bool
+		wantNotValid  bool
+	}{
+		{"ALTER TABLE t ADD CONSTRAINT c CHECK (x > 0) NO INHERIT", true, false},
+		{"ALTER TABLE t ADD CONSTRAINT c CHECK (x > 0)", false, false},
+		{"ALTER TABLE t ADD CONSTRAINT c CHECK (a = 2) NO INHERIT NOT VALID", true, true},
+		{"ALTER TABLE t ADD CONSTRAINT c CHECK (a = 2) NOT VALID NO INHERIT", true, true},
+	} {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T", tc.sql, stmts[0])
+		}
+		if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableAddCheck {
+			t.Fatalf("Parse(%q): actions=%+v", tc.sql, at.Actions)
+		}
+		a := at.Actions[0]
+		if a.NoInherit != tc.wantNoInherit {
+			t.Errorf("Parse(%q): NoInherit=%v want %v", tc.sql, a.NoInherit, tc.wantNoInherit)
+		}
+		if a.NotValid != tc.wantNotValid {
+			t.Errorf("Parse(%q): NotValid=%v want %v", tc.sql, a.NotValid, tc.wantNotValid)
+		}
+	}
+}
+
+// TestParseAlterTableRenameConstraint guards the `ALTER TABLE name RENAME
+// CONSTRAINT old TO new` grammar (M0134-0002 C2): `ALTER TABLE t RENAME
+// CONSTRAINT c1 TO c2` parses into a single AlterTableRenameConstraint action
+// carrying OldConstraintName=c1 and NewName=c2. Mirrors the ALTER DOMAIN RENAME
+// CONSTRAINT arm's shape (ddl.go RENAME branch).
+func TestParseAlterTableRenameConstraint(t *testing.T) {
+	for _, tc := range []struct {
+		sql    string
+		wantOK bool
+	}{
+		{"ALTER TABLE t RENAME CONSTRAINT c1 TO c2", true},
+		{"ALTER TABLE t rename constraint c1 to c2", true},
+		{"ALTER TABLE ONLY t RENAME CONSTRAINT c1 TO c2", true},
+		// Not a valid RENAME form: missing TO (old constraint only).
+		{"ALTER TABLE t RENAME CONSTRAINT c1", false},
+	} {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			if tc.wantOK {
+				t.Fatalf("Parse(%q): %v", tc.sql, err)
+			}
+			continue
+		}
+		if !tc.wantOK {
+			t.Fatalf("Parse(%q): expected error, got %+v", tc.sql, stmts)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T", tc.sql, stmts[0])
+		}
+		if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableRenameConstraint {
+			t.Fatalf("Parse(%q): actions=%+v", tc.sql, at.Actions)
+		}
+		a := at.Actions[0]
+		if a.OldConstraintName != "c1" {
+			t.Errorf("Parse(%q): OldConstraintName=%q want %q", tc.sql, a.OldConstraintName, "c1")
+		}
+		if a.NewName != "c2" {
+			t.Errorf("Parse(%q): NewName=%q want %q", tc.sql, a.NewName, "c2")
+		}
+	}
+}
+
+// TestParseAlterTableRenameColumn covers the ALTER TABLE RENAME [COLUMN] form.
+// COLUMN is optional in PG's grammar (opt_column: COLUMN | /*EMPTY*/,
+// gram.y:9974; the RENAME opt_column name TO name production at gram.y:9720),
+// so the bare form `RENAME a TO b` must parse identically to `RENAME COLUMN a
+// TO b`. Also guards the sibling forms in the same arm: RENAME TO (table) and
+// RENAME CONSTRAINT (slice 3). M0134-0002 C2 slice 8.
+func TestParseAlterTableRenameColumn(t *testing.T) {
+	for _, tc := range []struct {
+		sql         string
+		wantOK      bool
+		wantKind    AlterTableActionKind
+		wantOldName string
+		wantNewName string
+	}{
+		// Bare form — COLUMN omitted, the slice-8 feature.
+		{"ALTER TABLE t RENAME a TO b", true, AlterTableRenameColumn, "a", "b"},
+		{"ALTER TABLE t RENAME COLUMN a TO b", true, AlterTableRenameColumn, "a", "b"},
+		// Regression guards: table rename and constraint rename in the same arm.
+		{"ALTER TABLE t RENAME TO t2", true, AlterTableRenameTable, "", "t2"},
+		{"ALTER TABLE t RENAME CONSTRAINT c1 TO c2", true, AlterTableRenameConstraint, "c1", "c2"},
+		// Not a valid RENAME form: missing TO (old column only).
+		{"ALTER TABLE t RENAME a", false, 0, "", ""},
+	} {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			if tc.wantOK {
+				t.Fatalf("Parse(%q): %v", tc.sql, err)
+			}
+			continue
+		}
+		if !tc.wantOK {
+			t.Fatalf("Parse(%q): expected error, got %+v", tc.sql, stmts)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T", tc.sql, stmts[0])
+		}
+		if len(at.Actions) != 1 || at.Actions[0].Kind != tc.wantKind {
+			t.Fatalf("Parse(%q): actions=%+v", tc.sql, at.Actions)
+		}
+		a := at.Actions[0]
+		switch tc.wantKind {
+		case AlterTableRenameColumn:
+			if a.OldColumnName != tc.wantOldName {
+				t.Errorf("Parse(%q): OldColumnName=%q want %q", tc.sql, a.OldColumnName, tc.wantOldName)
+			}
+		case AlterTableRenameConstraint:
+			if a.OldConstraintName != tc.wantOldName {
+				t.Errorf("Parse(%q): OldConstraintName=%q want %q", tc.sql, a.OldConstraintName, tc.wantOldName)
+			}
+		}
+		if a.NewName != tc.wantNewName {
+			t.Errorf("Parse(%q): NewName=%q want %q", tc.sql, a.NewName, tc.wantNewName)
 		}
 	}
 }
@@ -854,6 +1228,106 @@ func TestParseAlterTableSetAccessMethod(t *testing.T) {
 		act := at.Actions[0]
 		if act.AccessMethodName != tc.wantAM {
 			t.Errorf("Parse(%q): AccessMethodName=%q want %q", tc.sql, act.AccessMethodName, tc.wantAM)
+		}
+	}
+}
+
+// TestParseAlterTableTypeUsing covers `ALTER TABLE ... ALTER [COLUMN] c TYPE
+// t [USING expr]` (M0134-0002 C2 slice 5). The TYPE arm previously consumed
+// exactly `TYPE <typename>` and left an optional USING trailer unconsumed,
+// which bubbled to the statement loop as `syntax error at or near ... (got
+// using)`. Now the USING expression is parsed onto UsingExpr.
+func TestParseAlterTableTypeUsing(t *testing.T) {
+	cases := []struct {
+		name     string
+		sql      string
+		wantType string
+		wantExpr bool // whether a UsingExpr is expected
+	}{
+		{"no-using", "ALTER TABLE t ALTER COLUMN c TYPE integer", "integer", false},
+		{"using-literal", "ALTER TABLE t ALTER c TYPE integer USING 0", "integer", true},
+		{"using-cast", "ALTER TABLE t ALTER COLUMN c TYPE numeric USING b::numeric", "numeric", true},
+		{"using-case-multiline", "ALTER TABLE t ALTER COLUMN c TYPE text\n" +
+			"  using case when c is true then 'IT WAS TRUE'\n" +
+			"  when c is false then 'IT WAS FALSE'\n" +
+			"  else 'IT WAS NULL!' end", "text", true},
+		{"using-bool-target", "alter table anothertab alter column atcol1 type boolean using atcol1::int", "boolean", true},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("%s: Parse(%q): %v", tc.name, tc.sql, err)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("%s: got %T", tc.name, stmts[0])
+		}
+		if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableAlterColumnType {
+			t.Fatalf("%s: actions=%+v", tc.name, at.Actions)
+		}
+		act := at.Actions[0]
+		if act.NewType.Name != tc.wantType {
+			t.Errorf("%s: NewType.Name=%q want %q", tc.name, act.NewType.Name, tc.wantType)
+		}
+		if (act.UsingExpr != nil) != tc.wantExpr {
+			t.Errorf("%s: UsingExpr present=%v want %v (expr=%+v)", tc.name, act.UsingExpr != nil, tc.wantExpr, act.UsingExpr)
+		}
+	}
+}
+
+// TestParseAlterTableAlterColumnMultiAction covers comma-separated
+// `ALTER TABLE ... ALTER COLUMN ...` action lists (M0134-0002 C2 slice 6): each
+// ALTER COLUMN sub-command becomes its own AlterTableAction instead of the old
+// parseAlter early-return that left the comma unconsumed (syntax error
+// "(got ,)"). This is the alter_table.sql regress shape.
+func TestParseAlterTableAlterColumnMultiAction(t *testing.T) {
+	cases := []struct {
+		sql       string
+		wantKinds []AlterTableActionKind
+		wantCols  []string
+	}{
+		{
+			"ALTER TABLE t ALTER COLUMN a SET NOT NULL, ALTER COLUMN b DROP NOT NULL",
+			[]AlterTableActionKind{AlterTableSetNotNull, AlterTableDropNotNull},
+			[]string{"a", "b"},
+		},
+		{
+			"ALTER TABLE t ALTER COLUMN a TYPE bigint, ALTER COLUMN b SET DEFAULT 1",
+			[]AlterTableActionKind{AlterTableAlterColumnType, AlterTableSetDefault},
+			[]string{"a", "b"},
+		},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T", tc.sql, stmts[0])
+		}
+		if len(at.Actions) != len(tc.wantKinds) {
+			t.Fatalf("Parse(%q): actions=%+v want %d", tc.sql, at.Actions, len(tc.wantKinds))
+		}
+		for i, wantKind := range tc.wantKinds {
+			act := at.Actions[i]
+			if act.Kind != wantKind {
+				t.Errorf("Parse(%q): actions[%d].Kind=%v want %v", tc.sql, i, act.Kind, wantKind)
+			}
+			if act.ColumnName != tc.wantCols[i] {
+				t.Errorf("Parse(%q): actions[%d].ColumnName=%q want %q", tc.sql, i, act.ColumnName, tc.wantCols[i])
+			}
+		}
+		// TYPE arm carries the target type; SET DEFAULT arm carries the expression.
+		if tc.wantKinds[0] == AlterTableAlterColumnType {
+			if got := at.Actions[0].NewType.Name; got != "bigint" {
+				t.Errorf("Parse(%q): NewType.Name=%q want %q", tc.sql, got, "bigint")
+			}
+		}
+		if tc.wantKinds[1] == AlterTableSetDefault {
+			if at.Actions[1].DefaultExpr == nil {
+				t.Errorf("Parse(%q): SET DEFAULT DefaultExpr is nil", tc.sql)
+			}
 		}
 	}
 }

@@ -10,12 +10,12 @@ import (
 	"unicode/utf8"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/mctx"
+	"github.com/goopg/goopg/internal/utils/mmgr"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/pgarray"
-	"github.com/goopg/goopg/internal/pgdatetime"
-	"github.com/goopg/goopg/internal/pglz"
-	"github.com/goopg/goopg/internal/pgnodes"
+	"github.com/goopg/goopg/internal/utils/adt/array"
+	"github.com/goopg/goopg/internal/utils/adt/datetime"
+	"github.com/goopg/goopg/internal/access/common/pglz"
+	"github.com/goopg/goopg/internal/nodes"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -682,7 +682,7 @@ func encodeValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]byte, e
 		if err != nil {
 			return nil, err
 		}
-		body, nerr := pgnodes.NumericBodyFromText(s)
+		body, nerr := nodes.NumericBodyFromText(s)
 		if nerr != nil {
 			return nil, &ExecError{Code: "22P02",
 				Message: fmt.Sprintf("invalid input syntax for type numeric: %q", s)}
@@ -958,7 +958,7 @@ func roundTimeDatumToPrecision(d Datum, prec int64) Datum {
 	if d.Kind != KindTime || prec < 0 || prec > 6 {
 		return d
 	}
-	micros := pgdatetime.AdjustTimeForTypmod(pgTimeMicros(d.TimeValue()), int32(prec))
+	micros := datetime.AdjustTimeForTypmod(pgTimeMicros(d.TimeValue()), int32(prec))
 	tv := pgTimeFromMicros(micros)
 	if d.TimeSub == TimeSubTimeTZ {
 		return NewTimeTZDatum(tv, d.TimeTZOffsetSecs())
@@ -1004,7 +1004,7 @@ func roundIntervalDatumToTypmod(d Datum, typmod int64) (Datum, error) {
 	if err != nil {
 		return Datum{}, err
 	}
-	months, days, micros = pgdatetime.AdjustIntervalForTypmod(months, days, micros, int32(typmod))
+	months, days, micros = datetime.AdjustIntervalForTypmod(months, days, micros, int32(typmod))
 	return NewIntervalDatumFull(months, days, micros), nil
 }
 
@@ -1054,7 +1054,7 @@ func DecodeRowInto(dst Row, cols []catalog.Column, data []byte) error {
 // DecodeRowIntoMctx is the mctx-aware sibling of DecodeRowInto.
 // Variable-length columns (varchar, char, text, bytea) are backed by sctx;
 // callers must not access those Datums after sctx.Reset() or sctx.Release().
-func DecodeRowIntoMctx(dst Row, cols []catalog.Column, data []byte, sctx *mctx.Context) error {
+func DecodeRowIntoMctx(dst Row, cols []catalog.Column, data []byte, sctx *mmgr.Context) error {
 	return decodeRowIntoMctx(dst, cols, data, sctx)
 }
 
@@ -1070,8 +1070,8 @@ func DecodeRowIntoMctx(dst Row, cols []catalog.Column, data []byte, sctx *mctx.C
 // else is PG-physical. bitmap may be nil for an all-non-null PG row (then natts
 // distinguishes it from legacy). storedNatts < len(cols) means ALTER TABLE ADD
 // COLUMN — trailing columns decode as NULL.
-func DecodeRowIntoMctxPGTuple(dst Row, cols []catalog.Column, data, bitmap []byte, storedNatts int, sctx *mctx.Context) error {
-	return DecodeRowIntoMctxPGTupleStyled(dst, cols, data, bitmap, storedNatts, sctx, pgarray.DefaultOutputStyle())
+func DecodeRowIntoMctxPGTuple(dst Row, cols []catalog.Column, data, bitmap []byte, storedNatts int, sctx *mmgr.Context) error {
+	return DecodeRowIntoMctxPGTupleStyled(dst, cols, data, bitmap, storedNatts, sctx, array.DefaultOutputStyle())
 }
 
 // DecodeRowIntoMctxPGTupleStyled is DecodeRowIntoMctxPGTuple carrying the
@@ -1086,7 +1086,7 @@ func DecodeRowIntoMctxPGTuple(dst Row, cols []catalog.Column, data, bitmap []byt
 // The plain (unstyled) entry point stays the default for the ~70 session-less
 // decode sites — catalog reload, VACUUM, ANALYZE, DDL rescans — which have no
 // GUCs to read and must not acquire a dependency on any. M0119-0006.
-func DecodeRowIntoMctxPGTupleStyled(dst Row, cols []catalog.Column, data, bitmap []byte, storedNatts int, sctx *mctx.Context, st pgarray.OutputStyle) error {
+func DecodeRowIntoMctxPGTupleStyled(dst Row, cols []catalog.Column, data, bitmap []byte, storedNatts int, sctx *mmgr.Context, st array.OutputStyle) error {
 	// PG-physical decode with null-bitmap and natts awareness. M0111-0002 S3:
 	// the goopg legacy format has been removed, so there is a single on-disk
 	// format. A PG-physical tuple always records natts; storedNatts==0 means a
@@ -1136,7 +1136,7 @@ func DecodeRowIntoMctxPGTupleStyled(dst Row, cols []catalog.Column, data, bitmap
 // deterministically from the tuple header (natts + null bitmap) rather than
 // guessing from the bytes. This is the header-driven replacement for the bare
 // DecodeRowInto on any read path that holds the storage.HeapTuple. M0111-0002.
-func DecodeHeapTupleRowInto(dst Row, cols []catalog.Column, tuple storage.HeapTuple, sctx *mctx.Context) error {
+func DecodeHeapTupleRowInto(dst Row, cols []catalog.Column, tuple storage.HeapTuple, sctx *mmgr.Context) error {
 	natts := int(tuple.Header.Infomask2 & storage.HeapNattsMask)
 	return DecodeRowIntoMctxPGTuple(dst, cols, tuple.Data, tuple.Bitmap, natts, sctx)
 }
@@ -1144,7 +1144,7 @@ func DecodeHeapTupleRowInto(dst Row, cols []catalog.Column, tuple storage.HeapTu
 // DecodeHeapTupleRow is the allocating sibling of DecodeHeapTupleRowInto: it
 // returns a freshly-allocated Row. Use it where the bare DecodeRow was used on
 // a path that holds the storage.HeapTuple. M0111-0002.
-func DecodeHeapTupleRow(cols []catalog.Column, tuple storage.HeapTuple, sctx *mctx.Context) (Row, error) {
+func DecodeHeapTupleRow(cols []catalog.Column, tuple storage.HeapTuple, sctx *mmgr.Context) (Row, error) {
 	row := make(Row, len(cols))
 	if err := DecodeHeapTupleRowInto(row, cols, tuple, sctx); err != nil {
 		return nil, err
@@ -1152,7 +1152,7 @@ func DecodeHeapTupleRow(cols []catalog.Column, tuple storage.HeapTuple, sctx *mc
 	return row, nil
 }
 
-func decodeRowIntoMctx(dst Row, cols []catalog.Column, data []byte, sctx *mctx.Context) error {
+func decodeRowIntoMctx(dst Row, cols []catalog.Column, data []byte, sctx *mmgr.Context) error {
 	// M0111-0002 S3: single on-disk format. The bare DecodeRow*/DecodeRowInto*
 	// wrappers (header-less paths, used by tests) decode PG-physical bodies
 	// only; the goopg legacy format and the format-guessing fallback were
@@ -1160,7 +1160,7 @@ func decodeRowIntoMctx(dst Row, cols []catalog.Column, data []byte, sctx *mctx.C
 	return decodePhysicalPGRowIntoMctx(dst, cols, data, sctx)
 }
 
-func decodePhysicalPGRowIntoMctx(dst Row, cols []catalog.Column, data []byte, sctx *mctx.Context) error {
+func decodePhysicalPGRowIntoMctx(dst Row, cols []catalog.Column, data []byte, sctx *mmgr.Context) error {
 	off := 0
 	for i, c := range cols {
 		off = alignPhysicalPGOffset(off, physicalPGTypeAlign(c.Type))
@@ -1321,11 +1321,11 @@ func pgRowHasExternal(cols []catalog.Column, row Row) bool {
 	return false
 }
 
-func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) (Datum, int, error) {
-	return decodePhysicalPGValueMctxStyled(t, data, sctx, pgarray.DefaultOutputStyle())
+func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mmgr.Context) (Datum, int, error) {
+	return decodePhysicalPGValueMctxStyled(t, data, sctx, array.DefaultOutputStyle())
 }
 
-func decodePhysicalPGValueMctxStyled(t catalog.Type, data []byte, sctx *mctx.Context, st pgarray.OutputStyle) (Datum, int, error) {
+func decodePhysicalPGValueMctxStyled(t catalog.Type, data []byte, sctx *mmgr.Context, st array.OutputStyle) (Datum, int, error) {
 	// User array column: decode the ArrayType varlena blob back to the
 	// canonical "{1,2}" text (sibling of encodeValuePG's IsArray branch).
 	// M0118-0002. The session DateStyle/TimeZone rides along because goopg
@@ -1600,7 +1600,7 @@ func decodePhysicalPGValueMctxStyled(t catalog.Type, data []byte, sctx *mctx.Con
 		if err != nil {
 			return Datum{}, 0, err
 		}
-		text, err := pgnodes.NumericTextFromStoredPayload(payload)
+		text, err := nodes.NumericTextFromStoredPayload(payload)
 		if err != nil {
 			return Datum{}, 0, err
 		}

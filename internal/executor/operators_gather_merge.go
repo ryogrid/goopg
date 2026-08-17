@@ -19,8 +19,8 @@ import (
 	"context"
 	"errors"
 
-	"github.com/goopg/goopg/internal/mctx"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/utils/mmgr"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // gmSource is one ordered input to the merge: a worker's channel, or the
@@ -39,20 +39,20 @@ type gmSource struct {
 
 // gatherMergeOp implements planner.GatherMerge.
 type gatherMergeOp struct {
-	plan       *planner.GatherMerge
+	plan       *optimizer.GatherMerge
 	ctx        *Context
-	schema     planner.Schema
+	schema     optimizer.Schema
 	buildChild func() (Operator, error)
 
 	group   *ParallelGroup
 	chans   []chan rowBatch
 	workers []*Context
-	arenas  []*mctx.Context
+	arenas  []*mmgr.Context
 	pscan   *parallelScanState
 
 	sources  []*gmSource
 	h        *gmHeap
-	keys     []planner.SortKey
+	keys     []optimizer.SortKey
 	sortErr  error
 	slot     MaterializedSlot
 	launched int
@@ -64,11 +64,11 @@ type gatherMergeOp struct {
 	ownsSharedBuilds bool
 }
 
-func newGatherMergeOp(p *planner.GatherMerge, buildChild func() (Operator, error)) *gatherMergeOp {
+func newGatherMergeOp(p *optimizer.GatherMerge, buildChild func() (Operator, error)) *gatherMergeOp {
 	return &gatherMergeOp{plan: p, schema: p.Output(), buildChild: buildChild, keys: p.Keys}
 }
 
-func (o *gatherMergeOp) Schema() planner.Schema { return o.schema }
+func (o *gatherMergeOp) Schema() optimizer.Schema { return o.schema }
 
 // WorkersLaunched reports the worker count for EXPLAIN ANALYZE.
 func (o *gatherMergeOp) WorkersLaunched() int { return o.launched }
@@ -108,7 +108,7 @@ func (o *gatherMergeOp) Open(ctx *Context) error {
 	// interleave the streams and destroy the ordering the node exists to
 	// preserve.
 	for i := 0; i < n; i++ {
-		arena := mctx.Acquire(ctx.Mctx, mctx.KindStmt)
+		arena := mmgr.Acquire(ctx.Mctx, mmgr.KindStmt)
 		o.arenas = append(o.arenas, arena)
 		o.workers = append(o.workers, NewWorkerContext(ctx, arena, o.group.Context()))
 		o.chans = append(o.chans, make(chan rowBatch, gatherChanDepth))

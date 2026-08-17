@@ -28,7 +28,7 @@ package executor
 import (
 	"testing"
 
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 func newCompositeExistsFixture(t *testing.T, withCompositeIndex bool) (*Context, func()) {
@@ -119,11 +119,11 @@ func TestCompositeExistsMatchesSubPlanPath(t *testing.T) {
 			ctx, cleanup := newCompositeExistsFixture(t, indexed)
 			defer cleanup()
 			for _, sql := range []string{compositeExistsSQL, compositeNotExistsSQL} {
-				planner.SetSubqueryUnnestEnabled(true)
+				optimizer.SetSubqueryUnnestEnabled(true)
 				unnested := compositeRows(t, ctx, sql)
-				planner.SetSubqueryUnnestEnabled(false)
+				optimizer.SetSubqueryUnnestEnabled(false)
 				subplan := compositeRows(t, ctx, sql)
-				planner.SetSubqueryUnnestEnabled(true)
+				optimizer.SetSubqueryUnnestEnabled(true)
 				assertEqualRows(t, "unnested vs SubPlan ("+sql+")", unnested, subplan)
 			}
 		})

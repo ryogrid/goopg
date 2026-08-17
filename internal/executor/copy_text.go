@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/config"
-	"github.com/goopg/goopg/internal/pgdatetime"
+	"github.com/goopg/goopg/internal/utils/misc"
+	"github.com/goopg/goopg/internal/utils/adt/datetime"
 )
 
 // COPY TEXT format (the default for `COPY ... TO/FROM STDOUT/STDIN`):
@@ -31,8 +31,10 @@ import (
 // including the trailing newline. dateStyle/dateOrder select the DATE
 // column rendering (PostgreSQL's DateStyle GUC style/order components,
 // e.g. "ISO"/"MDY" — see config.ParseDateStyleValue); pass "ISO", "MDY"
-// for the boot default.
-func EncodeCopyTextRow(dst []byte, row Row, cols []catalog.Column, dateStyle, dateOrder, timeZone string, cat catalog.Catalog, qualify bool, visible ...func(schema string) bool) ([]byte, error) {
+// for the boot default. byteaMode selects the `bytea_output` GUC's rendering
+// for a bytea column ("hex", the boot default, or "escape" —
+// M0134-0001 S12); pass "hex" (or "") for the boot default.
+func EncodeCopyTextRow(dst []byte, row Row, cols []catalog.Column, dateStyle, dateOrder, timeZone, byteaMode string, cat catalog.Catalog, qualify bool, visible ...func(schema string) bool) ([]byte, error) {
 	if len(row) != len(cols) {
 		return nil, fmt.Errorf("EncodeCopyTextRow: %d cols vs %d datums", len(cols), len(row))
 	}
@@ -45,7 +47,7 @@ func EncodeCopyTextRow(dst []byte, row Row, cols []catalog.Column, dateStyle, da
 			dst = append(dst, '\\', 'N')
 			continue
 		}
-		s, err := datumToCopyText(c.Type, d, dateStyle, dateOrder, timeZone, cat, qualify, visible...)
+		s, err := datumToCopyText(c.Type, d, dateStyle, dateOrder, timeZone, byteaMode, cat, qualify, visible...)
 		if err != nil {
 			return nil, err
 		}
@@ -268,7 +270,7 @@ func appendCopyTextEscaped(dst []byte, s string) []byte {
 // value parameters rather than a *Context so the TEXT and CSV renderers share
 // exactly the narrow seam they already did. A nil cat preserves the pre-68th
 // numeric rendering.
-func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone string, cat catalog.Catalog, qualify bool, visible ...func(schema string) bool) (string, error) {
+func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone, byteaMode string, cat catalog.Catalog, qualify bool, visible ...func(schema string) bool) (string, error) {
 	// Array columns FIRST. A user array column is
 	// catalog.Type{Name:<ELEMENT type>, IsArray:true}, so every arm of the
 	// switch below would claim the array under its ELEMENT's name and reject
@@ -332,7 +334,7 @@ func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone str
 		if d.Kind != KindTime {
 			return "", fmt.Errorf("expected time datum for date, got kind %d", d.Kind)
 		}
-		return config.FormatDate(d.TimeValue(), dateStyle, dateOrder), nil
+		return misc.FormatDate(d.TimeValue(), dateStyle, dateOrder), nil
 	case "timestamp":
 		// DateStyle-aware, mirroring the "date" case above and dispatch.go's
 		// appendTypedCellText. M-NIGHTLY (run 20260714-011651) DateStyle
@@ -340,7 +342,7 @@ func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone str
 		if d.Kind != KindTime {
 			return "", fmt.Errorf("expected time datum, got kind %d", d.Kind)
 		}
-		return config.FormatTimestamp(d.TimeValue().UTC(), dateStyle, dateOrder), nil
+		return misc.FormatTimestamp(d.TimeValue().UTC(), dateStyle, dateOrder), nil
 	case "timestamptz":
 		// COPY TO emits the same text timestamptz_out does, so this must track
 		// dispatch.go's appendTypedCellText exactly: convert into the session
@@ -350,7 +352,7 @@ func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone str
 		if d.Kind != KindTime {
 			return "", fmt.Errorf("expected time datum, got kind %d", d.Kind)
 		}
-		return config.FormatTimestampTZ(d.TimeValue(), dateStyle, dateOrder, timeZone), nil
+		return misc.FormatTimestampTZ(d.TimeValue(), dateStyle, dateOrder, timeZone), nil
 	case "time":
 		// M0119-0006 (49th slice): previously unhandled — a `time` column fell
 		// through to the default arm, whose Kind switch has no KindTime case, so
@@ -367,7 +369,33 @@ func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone str
 		if d.Kind != KindTime {
 			return "", fmt.Errorf("expected time datum for time, got kind %d", d.Kind)
 		}
-		return pgdatetime.FormatTime(pgTimeMicros(d.TimeValue())), nil
+		return datetime.FormatTime(pgTimeMicros(d.TimeValue())), nil
+	case "bytea":
+		// COPY TO renders bytea per the session's `bytea_output` GUC — the
+		// SAME dispatch dispatch.go's appendTypedCellText (SELECT wire) uses —
+		// so COPY and SELECT cannot drift on this axis (Hard-won Rule #2).
+		// Previously unhandled: bytea fell to the default arm's KindBytes case,
+		// which wrote the RAW payload bytes into the text stream instead of an
+		// output-function-encoded string. M0134-0001 S12.
+		//
+		// A KindString datum reaching here is ALREADY output-function text —
+		// e.g. string_agg(bytea,...) advertises RetType bytea (pg_proc OID
+		// 3545) but returns its accumulated result as a KindString, the same
+		// shape dispatch.go's appendTypedCellText (SELECT wire, the sibling
+		// this arm must not drift from) already falls through to
+		// d.AppendValueText for — so it must pass through verbatim rather
+		// than error. Round 2 regression fix: an earlier version of this arm
+		// rejected non-KindBytes outright, which turned
+		// `COPY (SELECT string_agg(b,','::bytea) FROM zs) TO STDOUT` into a
+		// hard 500 instead of the working query it was on HEAD.
+		switch d.Kind {
+		case KindBytes:
+			return byteaOutMode(d.BytesValue(), byteaMode), nil
+		case KindString:
+			return d.StringValue(), nil
+		default:
+			return "", fmt.Errorf("expected bytes datum for bytea, got kind %d", d.Kind)
+		}
 	case "timetz":
 		// Sibling of the "time" arm; timetz_out prints the local time of day
 		// followed by the UTC offset. pgdatetime.FormatTimeTZ takes PG's own
@@ -377,7 +405,7 @@ func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder, timeZone str
 		if d.Kind != KindTime {
 			return "", fmt.Errorf("expected time datum for timetz, got kind %d", d.Kind)
 		}
-		return pgdatetime.FormatTimeTZ(pgTimeMicros(d.TimeValue()),
+		return datetime.FormatTimeTZ(pgTimeMicros(d.TimeValue()),
 			int32(-d.TimeTZOffsetSecs())), nil
 	default:
 		switch d.Kind {
@@ -525,7 +553,7 @@ func parseTimeString(s string) (time.Time, error) {
 	// front. Everything below indexes fixed offsets — the date-prefix probe
 	// `s[4] == '-' && s[7] == '-'`, the hour-24 rewrite on s[:2], the
 	// leap-second probe on s[5] — so it only ever worked on padded input.
-	s = pgdatetime.NormalizeInput(s)
+	s = datetime.NormalizeInput(s)
 
 	// Full timestamp with date prefix: strip date, keep time part.
 	// e.g. "2003-03-07 15:36:39 America/New_York" → "15:36:39"
@@ -555,9 +583,9 @@ func parseTimeString(s string) (time.Time, error) {
 	// M0119-0006: field decoding proper is PostgreSQL's, not a layout table's —
 	// see pgdatetime.ParseTimeOfDay for the forms this unlocks ('10:00.5' as
 	// MINUTE TO SECOND, '040506', '10::00', 'allballs', hour-12 AM).
-	tod, err := pgdatetime.ParseTimeOfDay(s)
+	tod, err := datetime.ParseTimeOfDay(s)
 	if err != nil {
-		if errors.Is(err, pgdatetime.ErrTimeFieldOverflow) {
+		if errors.Is(err, datetime.ErrTimeFieldOverflow) {
 			return time.Time{}, &ExecError{Code: "22008",
 				Message: fmt.Sprintf("date/time field value out of range: %q", orig)}
 		}
@@ -592,7 +620,7 @@ func parseTimeString(s string) (time.Time, error) {
 	// time_overflows() plus tm2time()'s composition, shared with the timestamp
 	// path through pgdatetime — the two used to carry their own copies, and only
 	// this one had them (a timestamp rejected '24:00:00' outright).
-	norm, dayCarry, err := pgdatetime.TimeOfDay{Hour: h, Min: m, Sec: sec, Nsec: ns}.Normalize()
+	norm, dayCarry, err := datetime.TimeOfDay{Hour: h, Min: m, Sec: sec, Nsec: ns}.Normalize()
 	if err != nil {
 		return time.Time{}, &ExecError{Code: "22008",
 			Message: fmt.Sprintf("date/time field value out of range: %q", orig)}
@@ -706,7 +734,7 @@ func parseTimeTZString(s string, zone string) (time.Time, int, error) {
 	orig := s
 	// M0125-0007: as in parseTimeString — the date-prefix probe below is a
 	// fixed-offset test (s[4], s[7], s[:10]) that assumes zero-padded fields.
-	s = pgdatetime.NormalizeInput(s)
+	s = datetime.NormalizeInput(s)
 
 	offsetSecs := 0
 	// haveOff distinguishes "the input carried a zone field that resolved to +00"
@@ -780,7 +808,7 @@ func parseTimeTZString(s string, zone string) (time.Time, int, error) {
 		// 10:00:00-04. M0119-0006.
 		if !haveOff && zone != "" {
 			if d, e := time.Parse("2006-01-02", dateStr); e == nil {
-				offsetSecs = config.ZoneOffsetForLocalTime(zone,
+				offsetSecs = misc.ZoneOffsetForLocalTime(zone,
 					time.Date(d.Year(), d.Month(), d.Day(),
 						t.Hour(), t.Minute(), t.Second(), 0, time.UTC))
 			}
@@ -825,7 +853,7 @@ func parseTimeTZString(s string, zone string) (time.Time, int, error) {
 	// No zone field and no date: GetCurrentDateTime supplies today's date and the
 	// session zone supplies the offset for it. M0119-0006.
 	if !haveOff && zone != "" {
-		offsetSecs = config.TimeTZSessionOffset(zone, t.Hour(), t.Minute(), t.Second())
+		offsetSecs = misc.TimeTZSessionOffset(zone, t.Hour(), t.Minute(), t.Second())
 	}
 	return t, offsetSecs, nil
 }
@@ -1007,7 +1035,7 @@ func parsePGTimestampTextZone(s string, zone tsZoneMode) (time.Time, error) {
 // see the parts, not the composed value: '2020-01-01 24:00:00'::date is
 // 2020-01-01 even though the identical text as a timestamp is 2020-01-02 00:00:00.
 func parsePGTimestampTextParts(s string, zone tsZoneMode) (time.Time, int, error) {
-	body, bc := pgdatetime.SplitEra(s)
+	body, bc := datetime.SplitEra(s)
 	// M0125-0007: PG decodes date/time fields one numeric run at a time, so an
 	// unpadded month, day, hour, minute or second is legal input. Normalise
 	// before the fixed layouts below, which are not. This is also the coercion
@@ -1017,7 +1045,7 @@ func parsePGTimestampTextParts(s string, zone tsZoneMode) (time.Time, int, error
 	// separator-less digit run is a DATE ('20200101', '20200101T040506') — see
 	// pgdatetime.NormalizeDateTimeInput. bc must be threaded in because the
 	// 2-digit-year windowing is suppressed under an era suffix.
-	body = pgdatetime.NormalizeDateTimeInput(body, bc)
+	body = datetime.NormalizeDateTimeInput(body, bc)
 	// M0119-0006: a time of day PostgreSQL decodes field-by-field ('10:00 PM',
 	// '040506', '10::00', '10:00.5' — see pgdatetime.ParseTimeOfDay) is beyond
 	// any layout, but the DATE and ZONE parts around it are not. Canonicalizing
@@ -1030,8 +1058,8 @@ func parsePGTimestampTextParts(s string, zone tsZoneMode) (time.Time, int, error
 	// ('25:00:00', '24:00:00.5' — see pgdatetime.TimeOfDay.Overflows) is a field
 	// error, not a spelling the layouts should get a second go at.
 	canon, canonCarry, canonErr := canonicalizeTimestampTimeToken(body)
-	if errors.Is(canonErr, pgdatetime.ErrTimeFieldOverflow) {
-		return time.Time{}, 0, pgdatetime.ErrFieldOutOfRange
+	if errors.Is(canonErr, datetime.ErrTimeFieldOverflow) {
+		return time.Time{}, 0, datetime.ErrFieldOutOfRange
 	}
 	// M0119-0006: a month/day ValidateDate() would reject ('20201301',
 	// '2020-13-01') matches no layout below and previously fell through to the
@@ -1052,7 +1080,7 @@ func parsePGTimestampTextParts(s string, zone tsZoneMode) (time.Time, int, error
 		}
 		for _, layout := range pgTimestampLayouts {
 			if ts, err := time.Parse(layout, cand.text); err == nil {
-				ts, err := pgdatetime.ApplyEra(applyTSZoneMode(ts, zone), bc)
+				ts, err := datetime.ApplyEra(applyTSZoneMode(ts, zone), bc)
 				if err != nil {
 					return time.Time{}, 0, err
 				}
@@ -1109,12 +1137,12 @@ func bcLeapTimestampFallback(text string, bc bool, zone tsZoneMode) (time.Time, 
 		return time.Time{}, false
 	}
 	dateTok := dateTokenPrefix(text)
-	month, day, mdok := pgdatetime.DateTokenMonthDay(dateTok)
-	year, yok := pgdatetime.DateTokenYear(dateTok)
+	month, day, mdok := datetime.DateTokenMonthDay(dateTok)
+	year, yok := datetime.DateTokenYear(dateTok)
 	if !mdok || !yok {
 		return time.Time{}, false
 	}
-	astroYear, ok := pgdatetime.AstronomicalYear(year, bc)
+	astroYear, ok := datetime.AstronomicalYear(year, bc)
 	if !ok {
 		return time.Time{}, false
 	}
@@ -1160,7 +1188,7 @@ func canonicalizeTimestampTimeToken(body string) (string, int, error) {
 	if sep := body[10]; sep != ' ' && sep != 'T' {
 		return "", 0, nil
 	}
-	canon, dayCarry, err := pgdatetime.CanonicalizeTimeToken(body[11:])
+	canon, dayCarry, err := datetime.CanonicalizeTimeToken(body[11:])
 	if err != nil {
 		return "", 0, err
 	}
@@ -1211,7 +1239,7 @@ func dateTimeInputError(err error, typeName, input string, pos int) *ExecError {
 				typeName, input, typeName,
 				timeCarrierMin.Format("2006-01-02"), timeCarrierMax.Format("2006-01-02"))}
 	}
-	if errors.Is(err, pgdatetime.ErrFieldOutOfRange) {
+	if errors.Is(err, datetime.ErrFieldOutOfRange) {
 		return &ExecError{Code: "22008", Pos: pos,
 			Message: fmt.Sprintf("date/time field value out of range: %q", input)}
 	}
@@ -1226,8 +1254,8 @@ func dateTimeInputError(err error, typeName, input string, pos int) *ExecError {
 // the cast path, not this one), so the two differ only in the layout set — the
 // pre/post steps around it are shared, which is the property that kept breaking.
 func parsePGDateText(s string) (time.Time, error) {
-	body, bc := pgdatetime.SplitEra(s)
-	norm := pgdatetime.NormalizeDateTimeInput(body, bc)
+	body, bc := datetime.SplitEra(s)
+	norm := datetime.NormalizeDateTimeInput(body, bc)
 	if err := validateDateTokenFull(norm, bc); err != nil {
 		return time.Time{}, err
 	}
@@ -1250,7 +1278,7 @@ func parsePGDateText(s string) (time.Time, error) {
 		}
 		return time.Time{}, err
 	}
-	t, err = pgdatetime.ApplyEra(t.UTC(), bc)
+	t, err = datetime.ApplyEra(t.UTC(), bc)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -1268,12 +1296,12 @@ func bcLeapDateFallback(dateToken string, bc bool) (time.Time, bool) {
 	if !bc {
 		return time.Time{}, false
 	}
-	month, day, mdok := pgdatetime.DateTokenMonthDay(dateToken)
-	year, yok := pgdatetime.DateTokenYear(dateToken)
+	month, day, mdok := datetime.DateTokenMonthDay(dateToken)
+	year, yok := datetime.DateTokenYear(dateToken)
 	if !mdok || !yok {
 		return time.Time{}, false
 	}
-	astroYear, ok := pgdatetime.AstronomicalYear(year, bc)
+	astroYear, ok := datetime.AstronomicalYear(year, bc)
 	if !ok {
 		return time.Time{}, false
 	}
@@ -1291,22 +1319,22 @@ func bcLeapDateFallback(dateToken string, bc bool) (time.Time, bool) {
 // own digits are gone. DateTokenYear/DateTokenMonthDay read the token
 // directly, so the astronomical year is available before any Parse call.
 func validateDateTokenFull(dateToken string, bc bool) error {
-	month, day, haveMD := pgdatetime.DateTokenMonthDay(dateToken)
+	month, day, haveMD := datetime.DateTokenMonthDay(dateToken)
 	if !haveMD {
 		return nil
 	}
-	if err := pgdatetime.ValidateMonthDay(month, day); err != nil {
+	if err := datetime.ValidateMonthDay(month, day); err != nil {
 		return err
 	}
-	year, haveY := pgdatetime.DateTokenYear(dateToken)
+	year, haveY := datetime.DateTokenYear(dateToken)
 	if !haveY {
 		return nil
 	}
-	astroYear, ok := pgdatetime.AstronomicalYear(year, bc)
+	astroYear, ok := datetime.AstronomicalYear(year, bc)
 	if !ok {
 		return nil
 	}
-	return pgdatetime.ValidateDayOfMonth(astroYear, month, day)
+	return datetime.ValidateDayOfMonth(astroYear, month, day)
 }
 
 // parseDateInputText is date_in()'s reading of a string that may carry a time
@@ -1358,7 +1386,7 @@ func parseCopyTimestampZoneParts(s string, zone tsZoneMode) (time.Time, int, err
 	if err == nil {
 		return ts, dayCarry, nil
 	}
-	if errors.Is(err, pgdatetime.ErrFieldOutOfRange) || errors.Is(err, errTimeCarrierRange) {
+	if errors.Is(err, datetime.ErrFieldOutOfRange) || errors.Is(err, errTimeCarrierRange) {
 		// A field that decoded but cannot be represented is a range failure, not
 		// a syntax miss: do not let the natural-language fallback below have a
 		// second go at it and turn a definite answer into "invalid timestamp".
@@ -1366,7 +1394,7 @@ func parseCopyTimestampZoneParts(s string, zone tsZoneMode) (time.Time, int, err
 	}
 	// Try verbose natural-language format used by PostgreSQL's datetime output
 	// e.g. "Tuesday, February 22, 2022 2:22:22.00 PM GMT+05:00".
-	if ts, err := parseFullTimestamp(pgdatetime.NormalizeDateTimeInput(s, false)); err == nil {
+	if ts, err := parseFullTimestamp(datetime.NormalizeDateTimeInput(s, false)); err == nil {
 		return ts, 0, nil
 	}
 	return time.Time{}, 0, fmt.Errorf("invalid timestamp %q", s)

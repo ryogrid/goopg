@@ -14,7 +14,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -223,7 +223,7 @@ func runQueryFastVH(t *testing.T, ctx *Context, sql string) ([]Row, error) {
 	if err != nil {
 		return nil, err
 	}
-	plan, err := planner.Plan(stmts[0], ctx.Catalog)
+	plan, err := optimizer.Plan(stmts[0], ctx.Catalog)
 	if err != nil {
 		return nil, err
 	}
