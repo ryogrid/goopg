@@ -16,7 +16,7 @@ import (
 	"github.com/goopg/goopg/internal/utils/adt/array"
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/storage/lmgr"
-	"github.com/goopg/goopg/internal/lockwait"
+	"github.com/goopg/goopg/internal/storage/lmgr/lockwait"
 	"github.com/goopg/goopg/internal/utils/mb"
 	"github.com/goopg/goopg/internal/utils/mmgr"
 	"github.com/goopg/goopg/internal/access/transam"

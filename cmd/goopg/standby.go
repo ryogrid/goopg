@@ -23,7 +23,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/utils/misc"
-	"github.com/goopg/goopg/internal/control"
+	"github.com/goopg/goopg/internal/access/transam/control"
 	"github.com/goopg/goopg/internal/initdb"
 	"github.com/goopg/goopg/internal/postmaster"
 	"github.com/goopg/goopg/internal/access/transam/xlog"

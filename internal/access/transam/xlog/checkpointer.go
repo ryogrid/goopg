@@ -8,8 +8,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/goopg/goopg/internal/control"
-	"github.com/goopg/goopg/internal/stats"
+	"github.com/goopg/goopg/internal/access/transam/control"
+	"github.com/goopg/goopg/internal/utils/activity/stats"
 )
 
 // DirtyPageFlusher is the buffer-pool contract used by the checkpointer.

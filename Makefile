@@ -62,7 +62,7 @@ help:
 	@echo "  make ralph-state-check  Validate .ralph/status.json and .ralph/progress.json consistency."
 	@echo "  make ralph-state-repair Attempt safe auto-repair for .ralph/status.json and .ralph/progress.json."
 	@echo "  make ralph-state-guard  Check Ralph state, auto-repair if needed, then verify again."
-	@echo "  make runtimeshim-matrix Run internal/runtimeshim tests under every Go toolchain in PATH."
+	@echo "  make runtimeshim-matrix Run internal/port/runtimeshim tests under every Go toolchain in PATH."
 	@echo "  make pgbench-compare    Run pgbench comparison between goopg and PostgreSQL."
 	@echo "  make pgbench-compare-matrix Run the full goopg pgbench matrix survey."
 	@echo "  make pgbench-compare-report Generate markdown report from latest pgbench results."
@@ -217,7 +217,7 @@ ralph-metrics:
 		python3 metrics_report.py
 
 # M0107-0008 per-Go-minor maintenance: verify //go:linkname targets in
-# internal/runtimeshim against every Go toolchain present in PATH (the
+# internal/port/runtimeshim against every Go toolchain present in PATH (the
 # default `go` plus any `go1.N`-style binaries installed via
 # `go install golang.org/dl/go1.N@latest`). See
 # docs/design/perf-optimize/08-runtime-internals.md §8.
@@ -445,6 +445,10 @@ plan-gate: plan-snapshot-build
 # so the shard set alone can be timed/measured in isolation.
 # ---------------------------------------------------------------
 RACE_TIMEOUT ?= 15m
+# The internal/testutil/* entries are enumerated ONE BY ONE on purpose. Do not
+# collapse them to a bare `internal/testutil`: internal/testutil/estimateaudit
+# is a plain library with ordinary unit tests and must keep running in the
+# gates. Collapsing the alternation would drop it silently.
 RACE_EXCLUDE = internal/testport|internal/postmaster|internal/testutil/cluster|internal/testutil/replcluster|internal/testutil/pgcluster|internal/testutil/pubsubcluster|internal/testutil/tpch|/bench/
 RACE_SHARD_PKGS ?= internal/initdb
 RACE_SHARDS ?= 4

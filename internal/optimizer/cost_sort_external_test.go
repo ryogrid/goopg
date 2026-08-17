@@ -14,7 +14,7 @@ import (
 	"math"
 	"testing"
 
-	"github.com/goopg/goopg/internal/hashsize"
+	"github.com/goopg/goopg/internal/executor/hashsize"
 )
 
 // sortRowsFillingBudget returns a row count whose footprint at `ncols` columns

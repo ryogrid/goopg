@@ -34,7 +34,7 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/utils/adt/array"
 	"github.com/goopg/goopg/internal/utils/adt/datetime"
-	"github.com/goopg/goopg/internal/pglz"
+	"github.com/goopg/goopg/internal/access/common/pglz"
 	"github.com/goopg/goopg/internal/nodes"
 	"github.com/goopg/goopg/internal/storage"
 )

@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/utils/misc"
-	"github.com/goopg/goopg/internal/control"
+	"github.com/goopg/goopg/internal/access/transam/control"
 )
 
 // TestClearRelcacheInitFilesSweepsWholeCluster pins M0131-S20.3's sweep against

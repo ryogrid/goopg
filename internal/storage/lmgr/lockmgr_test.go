@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goopg/goopg/internal/lockwait"
+	"github.com/goopg/goopg/internal/storage/lmgr/lockwait"
 )
 
 var testTag = LockTag{DB: 1, Rel: 100}

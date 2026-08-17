@@ -7,7 +7,7 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/optimizer"
-	"github.com/goopg/goopg/internal/plpgsql"
+	"github.com/goopg/goopg/internal/pl/plpgsql"
 )
 
 // callOp executes `CALL proc(...)` (M0015 Stage B).

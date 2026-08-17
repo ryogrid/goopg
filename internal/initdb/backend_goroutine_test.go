@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/goopg/goopg/internal/activity"
+	"github.com/goopg/goopg/internal/utils/activity"
 )
 
 // TestBackendGoroutineDoesNotFsync is the M0042-0004 regression test.

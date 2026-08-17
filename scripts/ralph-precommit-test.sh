@@ -18,7 +18,7 @@
 #
 # Excluded packages in part 1 (kept in sync with the CI EXCLUDE list):
 #   internal/testport               — full port suite, cluster-backed
-#   internal/server                 — starts a goopg instance per test
+#   internal/postmaster             — starts a goopg instance per test
 #   internal/testutil/cluster       — crash recovery needs a cluster
 #   internal/testutil/replcluster   — multi-node replication
 #   internal/testutil/pgcluster     — upstream PostgreSQL cluster
@@ -63,6 +63,10 @@ else
 
 # Keep this pattern in sync with the EXCLUDE list in
 # .github/workflows/test.yml ("Run unit and component tests").
+# The internal/testutil/* entries are enumerated ONE BY ONE on purpose. Do not
+# collapse them to a bare `internal/testutil`: internal/testutil/estimateaudit
+# is a plain library with ordinary unit tests and must keep running in the
+# gates. Collapsing the alternation would drop it silently.
 EXCLUDE='internal/testport|internal/postmaster|internal/testutil/cluster|internal/testutil/replcluster|internal/testutil/pgcluster|internal/testutil/pubsubcluster|internal/testutil/tpch|/bench/'
 
 # Build the package list on its own line so a `go list` failure (e.g. a

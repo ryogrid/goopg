@@ -42,7 +42,7 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/access/nbtree"
-	"github.com/goopg/goopg/internal/amcheck"
+	"github.com/goopg/goopg/internal/access/amcheck"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"

@@ -5,7 +5,7 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/goopg/goopg/internal/hashsize"
+	"github.com/goopg/goopg/internal/executor/hashsize"
 )
 
 // envFloatDefault reads a float from the environment, returning def when unset

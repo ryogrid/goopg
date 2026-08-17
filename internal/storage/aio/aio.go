@@ -47,7 +47,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/goopg/goopg/internal/stats"
+	"github.com/goopg/goopg/internal/utils/activity/stats"
 )
 
 // Direction is the read-vs-write flavour of an Op.

@@ -228,7 +228,7 @@ def split_go_test_pkg_blocks(log_text):
     every OTHER package that was purely SIGKILLed/timed-out by the shared
     cgroup memory cap in the same run, misclassifying them as regressions
     (observed 2026-07-15: `internal/wal`'s one real `--- FAIL` caused
-    `cmd/goopg`/`internal/amcheck`/`internal/mvcc` — all pure resource kills
+    `cmd/goopg`/`internal/access/amcheck`/`internal/mvcc` — all pure resource kills
     under nightly's `-p=4`/`GOMEMLIMIT=5GiB`/`MemoryMax=8G` — to be reported
     as regressions for multiple consecutive nightly runs).
     """

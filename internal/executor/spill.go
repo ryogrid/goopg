@@ -9,9 +9,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/goopg/goopg/internal/activity"
-	"github.com/goopg/goopg/internal/hashsize"
-	"github.com/goopg/goopg/internal/pgtemp"
+	"github.com/goopg/goopg/internal/utils/activity"
+	"github.com/goopg/goopg/internal/executor/hashsize"
+	"github.com/goopg/goopg/internal/storage/file"
 	"github.com/goopg/goopg/internal/optimizer"
 )
 
@@ -64,7 +64,7 @@ func newSpillWriter(ctx *Context) (*spillWriter, error) {
 // registry itself (which resolves the directory once per statement) and for
 // tests that want a t.TempDir() with no Context at all.
 func newSpillWriterInDir(dir string) (*spillWriter, error) {
-	f, err := os.CreateTemp(dir, pgtemp.FilePattern(os.Getpid()))
+	f, err := os.CreateTemp(dir, file.FilePattern(os.Getpid()))
 	if err != nil {
 		return nil, fmt.Errorf("spillWriter: create temp file: %w", err)
 	}

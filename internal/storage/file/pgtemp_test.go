@@ -1,4 +1,4 @@
-package pgtemp
+package file
 
 import (
 	"os"

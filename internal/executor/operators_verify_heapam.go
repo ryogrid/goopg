@@ -25,7 +25,7 @@ package executor
 import (
 	"fmt"
 
-	"github.com/goopg/goopg/internal/amcheck"
+	"github.com/goopg/goopg/internal/access/amcheck"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"

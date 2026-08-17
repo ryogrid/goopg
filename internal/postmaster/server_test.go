@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goopg/goopg/internal/activity"
+	"github.com/goopg/goopg/internal/utils/activity"
 	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/libpq"
 )

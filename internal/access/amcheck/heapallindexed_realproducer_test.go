@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/access/nbtree"
-	"github.com/goopg/goopg/internal/amcheck"
+	"github.com/goopg/goopg/internal/access/amcheck"
 	"github.com/goopg/goopg/internal/storage"
 )
 

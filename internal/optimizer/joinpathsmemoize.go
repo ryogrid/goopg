@@ -56,7 +56,7 @@ package optimizer
 import (
 	"math"
 
-	"github.com/goopg/goopg/internal/hashsize"
+	"github.com/goopg/goopg/internal/executor/hashsize"
 )
 
 // memoizePathInfo is the `MemoizePath`-only payload carried on `Path`. Both

@@ -3,7 +3,7 @@ package xlog
 import (
 	"sync"
 
-	"github.com/goopg/goopg/internal/stats"
+	"github.com/goopg/goopg/internal/utils/activity/stats"
 )
 
 // MemRing is the bounded in-memory mirror of recently-written WAL

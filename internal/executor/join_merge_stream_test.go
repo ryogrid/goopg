@@ -31,7 +31,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/pgtemp"
+	"github.com/goopg/goopg/internal/storage/file"
 	"github.com/goopg/goopg/internal/optimizer"
 )
 
@@ -313,7 +313,7 @@ func TestMergeJoinReleasesSpillFilesOnClose(t *testing.T) {
 	if _, err := Run(o, ctx); err != nil {
 		t.Fatalf("merge join: %v", err)
 	}
-	dir := pgtemp.Dir(ctx.DataDir)
+	dir := file.Dir(ctx.DataDir)
 	entries, err := os.ReadDir(dir)
 	if err != nil && !os.IsNotExist(err) {
 		t.Fatalf("ReadDir(%s): %v", dir, err)

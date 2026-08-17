@@ -14,10 +14,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/goopg/goopg/internal/activity"
+	"github.com/goopg/goopg/internal/utils/activity"
 	"github.com/goopg/goopg/internal/storage/aio"
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/control"
+	"github.com/goopg/goopg/internal/access/transam/control"
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/storage"

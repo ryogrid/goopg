@@ -13,8 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/goopg/goopg/internal/gls"
-	"github.com/goopg/goopg/internal/stats"
+	"github.com/goopg/goopg/internal/port/gls"
+	"github.com/goopg/goopg/internal/utils/activity/stats"
 
 	"github.com/goopg/goopg/internal/storage"
 )

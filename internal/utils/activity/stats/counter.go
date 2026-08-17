@@ -15,7 +15,7 @@ package stats
 import (
 	"sync/atomic"
 
-	"github.com/goopg/goopg/internal/runtimeshim"
+	"github.com/goopg/goopg/internal/port/runtimeshim"
 )
 
 // maxShards bounds the per-P shard table. PinP returns an index in

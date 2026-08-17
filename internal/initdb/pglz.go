@@ -17,7 +17,7 @@ package initdb
 
 import (
 	"github.com/goopg/goopg/internal/executor"
-	"github.com/goopg/goopg/internal/pglz"
+	"github.com/goopg/goopg/internal/access/common/pglz"
 )
 
 // pglzToastThreshold is the minimum size at which PG applies inline TOAST

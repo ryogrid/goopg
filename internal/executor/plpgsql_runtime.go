@@ -11,7 +11,7 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/optimizer"
-	"github.com/goopg/goopg/internal/plpgsql"
+	"github.com/goopg/goopg/internal/pl/plpgsql"
 )
 
 // wrapSQLFunctionContext wraps an error with CONTEXT showing the SQL function

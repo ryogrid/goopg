@@ -8,7 +8,7 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/pglz"
+	"github.com/goopg/goopg/internal/access/common/pglz"
 	"github.com/goopg/goopg/internal/storage"
 )
 

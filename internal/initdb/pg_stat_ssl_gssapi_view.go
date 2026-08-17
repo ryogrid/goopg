@@ -1,7 +1,7 @@
 package initdb
 
 import (
-	"github.com/goopg/goopg/internal/activity"
+	"github.com/goopg/goopg/internal/utils/activity"
 	"github.com/goopg/goopg/internal/catalog"
 )
 

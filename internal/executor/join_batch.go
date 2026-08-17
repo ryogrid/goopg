@@ -39,7 +39,7 @@ import (
 	"log/slog"
 	"math/bits"
 
-	"github.com/goopg/goopg/internal/hashsize"
+	"github.com/goopg/goopg/internal/executor/hashsize"
 	"github.com/goopg/goopg/internal/optimizer"
 )
 

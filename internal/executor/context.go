@@ -8,11 +8,11 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/access/nbtree"
-	"github.com/goopg/goopg/internal/activity"
+	"github.com/goopg/goopg/internal/utils/activity"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/executor/kvcache"
 	"github.com/goopg/goopg/internal/storage/lmgr"
-	"github.com/goopg/goopg/internal/lockwait"
+	"github.com/goopg/goopg/internal/storage/lmgr/lockwait"
 	"github.com/goopg/goopg/internal/utils/mmgr"
 	"github.com/goopg/goopg/internal/access/transam/multixact"
 	"github.com/goopg/goopg/internal/access/transam"

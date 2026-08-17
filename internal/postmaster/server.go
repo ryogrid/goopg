@@ -48,19 +48,19 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"github.com/goopg/goopg/internal/activity"
+	"github.com/goopg/goopg/internal/utils/activity"
 	"github.com/goopg/goopg/internal/libpq/auth"
 	"github.com/goopg/goopg/internal/postmaster/autovacuum"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/utils/misc"
-	"github.com/goopg/goopg/internal/control"
+	"github.com/goopg/goopg/internal/access/transam/control"
 	"github.com/goopg/goopg/internal/executor"
-	"github.com/goopg/goopg/internal/gls"
+	"github.com/goopg/goopg/internal/port/gls"
 	"github.com/goopg/goopg/internal/storage/lmgr"
 	"github.com/goopg/goopg/internal/utils/mmgr"
 	"github.com/goopg/goopg/internal/access/transam/multixact"
 	"github.com/goopg/goopg/internal/access/transam"
-	"github.com/goopg/goopg/internal/pgtemp"
+	"github.com/goopg/goopg/internal/storage/file"
 	"github.com/goopg/goopg/internal/libpq"
 	"github.com/goopg/goopg/internal/utils/errcodes"
 	"github.com/goopg/goopg/internal/storage"
@@ -553,13 +553,13 @@ func (s *Server) Run(ctx context.Context) error {
 	// definition a stray. Sweeping BEFORE close(s.ready) keeps a test that
 	// connects the instant the server is ready from racing the sweep.
 	if s.cfg.DataDir != "" {
-		if n, err := pgtemp.RemoveStrayFiles(s.cfg.DataDir); err != nil {
+		if n, err := file.RemoveStrayFiles(s.cfg.DataDir); err != nil {
 			// Non-fatal, exactly as PG logs and continues: a stray temp
 			// file wastes space, it does not threaten correctness.
 			s.cfg.Logger.Warn("removing stray temp files failed", "err", err)
 		} else if n > 0 {
 			s.cfg.Logger.Info("removed stray temporary files", "count", n,
-				"dir", pgtemp.Dir(s.cfg.DataDir))
+				"dir", file.Dir(s.cfg.DataDir))
 		}
 	}
 

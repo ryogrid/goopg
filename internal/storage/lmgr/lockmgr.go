@@ -20,7 +20,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/goopg/goopg/internal/lockwait"
+	"github.com/goopg/goopg/internal/storage/lmgr/lockwait"
 )
 
 // ErrDeadlockDetected is returned by Acquire when the deadlock

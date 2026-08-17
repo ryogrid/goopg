@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/utils/misc"
-	"github.com/goopg/goopg/internal/control"
+	"github.com/goopg/goopg/internal/access/transam/control"
 )
 
 // TestNoArgsPrintsUsage guards the contract from

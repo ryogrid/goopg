@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/access/nbtree"
-	"github.com/goopg/goopg/internal/analyzer"
+	"github.com/goopg/goopg/internal/parser/analyzer"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/storage/lmgr"
@@ -24,7 +24,7 @@ import (
 	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/optimizer"
-	"github.com/goopg/goopg/internal/plpgsql"
+	"github.com/goopg/goopg/internal/pl/plpgsql"
 	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
 )

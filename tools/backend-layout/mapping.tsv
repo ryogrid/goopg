@@ -1,21 +1,23 @@
 # old_dir	old_pkg	new_dir	new_pkg
-internal/planner	planner	internal/optimizer	optimizer
-internal/pgnodes	pgnodes	internal/nodes	nodes
-internal/access/btree	btree	internal/access/nbtree	nbtree
-internal/aio	aio	internal/storage/aio	aio
-internal/mctx	mctx	internal/utils/mmgr	mmgr
-internal/mb	mb	internal/utils/mb	mb
-internal/mvcc	mvcc	internal/access/transam	transam
-internal/multixact	multixact	internal/access/transam/multixact	multixact
-internal/wal	wal	internal/access/transam/xlog	xlog
-internal/vacuum	vacuum	internal/commands/vacuum	vacuum
-internal/autovacuum	autovacuum	internal/postmaster/autovacuum	autovacuum
-internal/sqlstate	sqlstate	internal/utils/errcodes	errcodes
-internal/server	server	internal/postmaster	postmaster
-internal/protocol	protocol	internal/libpq	libpq
-internal/auth	auth	internal/libpq/auth	auth
-internal/lockmgr	lockmgr	internal/storage/lmgr	lmgr
-internal/pgdatetime	pgdatetime	internal/utils/adt/datetime	datetime
-internal/pgarray	pgarray	internal/utils/adt/array	array
-internal/sqlkeywords	sqlkeywords	internal/parser/sqlkeywords	sqlkeywords
-internal/config	config	internal/utils/misc	misc
+#
+# Round 1 (20 packages) was applied in bf6767e8; recover its table and per-file
+# log with:
+#   git show 22ed9000:tools/backend-layout/mapping.tsv
+#   git show 22ed9000:tools/backend-layout/moves.tsv
+#
+# Round 2 (this table, 13 packages) retires DESIGN.md's former "Intentionally
+# not moved" list. Keep internal/activity above internal/stats: stats lands
+# inside activity's destination, and moveDirs resolves that by deferral.
+internal/activity	activity	internal/utils/activity	activity
+internal/stats	stats	internal/utils/activity/stats	stats
+internal/lockwait	lockwait	internal/storage/lmgr/lockwait	lockwait
+internal/runtimeshim	runtimeshim	internal/port/runtimeshim	runtimeshim
+internal/gls	gls	internal/port/gls	gls
+internal/hashsize	hashsize	internal/executor/hashsize	hashsize
+internal/plpgsql	plpgsql	internal/pl/plpgsql	plpgsql
+internal/amcheck	amcheck	internal/access/amcheck	amcheck
+internal/pgtemp	pgtemp	internal/storage/file	file
+internal/estimateaudit	estimateaudit	internal/testutil/estimateaudit	estimateaudit
+internal/pglz	pglz	internal/access/common/pglz	pglz
+internal/control	control	internal/access/transam/control	control
+internal/analyzer	analyzer	internal/parser/analyzer	analyzer

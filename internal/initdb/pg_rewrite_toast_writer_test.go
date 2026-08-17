@@ -21,7 +21,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/executor"
-	"github.com/goopg/goopg/internal/pglz"
+	"github.com/goopg/goopg/internal/access/common/pglz"
 	"github.com/goopg/goopg/internal/storage"
 )
 

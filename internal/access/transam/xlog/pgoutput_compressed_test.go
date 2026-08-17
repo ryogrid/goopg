@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goopg/goopg/internal/pglz"
+	"github.com/goopg/goopg/internal/access/common/pglz"
 )
 
 // TestPgoDecodePhysicalVarlenaCompressed verifies pgoDecodePhysicalVarlena

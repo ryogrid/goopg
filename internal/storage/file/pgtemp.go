@@ -1,6 +1,11 @@
-// Package pgtemp implements PostgreSQL's temporary-file directory
-// convention for query-time spill files (sorts, hash-join batches,
-// materialised sides).
+// Package file implements PostgreSQL's temporary-file directory convention
+// for query-time spill files (sorts, hash-join batches, materialised sides).
+//
+// The package is named for its PG home, src/backend/storage/file (fd.c), and
+// is the receptacle for the rest of that layer as goopg grows it — BufFile,
+// FileSet, the crash-time reinit sweep. Callers: do not shadow the package
+// name with a local `file` variable; in a package that opens files that is an
+// easy accident, and it silently breaks every `file.X` reference after it.
 //
 // PG keeps them in `<datadir>/base/pgsql_tmp/` and names every file with the
 // `pgsql_tmp` prefix (`PG_TEMP_FILES_DIR` / `PG_TEMP_FILE_PREFIX`,
@@ -15,7 +20,7 @@
 // behind, and they escaped the datadir's filesystem/quota entirely) and gave a
 // restart nothing to sweep. This package is the shared substrate M0127-P3.3
 // moves them onto; see docs/design/leftdeep-joins/06 §3.
-package pgtemp
+package file
 
 import (
 	"fmt"

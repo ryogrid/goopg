@@ -4,7 +4,7 @@ import (
 	"os"
 	"sync"
 
-	"github.com/goopg/goopg/internal/pgtemp"
+	"github.com/goopg/goopg/internal/storage/file"
 )
 
 // tempFileRegistry is the per-query owner of every spill file the executor
@@ -60,7 +60,7 @@ func (r *tempFileRegistry) dirFor(dataDir string) (string, error) {
 		r.dir = os.TempDir()
 		return r.dir, nil
 	}
-	r.dir, r.dirErr = pgtemp.EnsureDir(dataDir)
+	r.dir, r.dirErr = file.EnsureDir(dataDir)
 	if r.dirErr != nil {
 		// A cluster whose datadir is read-only should still be able to
 		// spill somewhere rather than fail the query outright; PG would

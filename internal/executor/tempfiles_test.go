@@ -8,13 +8,13 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/utils/mmgr"
-	"github.com/goopg/goopg/internal/pgtemp"
+	"github.com/goopg/goopg/internal/storage/file"
 )
 
 // countTempFiles returns the pgsql_tmp entries under a datadir's temp dir.
 func countTempFiles(t *testing.T, dataDir string) []string {
 	t.Helper()
-	entries, err := os.ReadDir(pgtemp.Dir(dataDir))
+	entries, err := os.ReadDir(file.Dir(dataDir))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -43,11 +43,11 @@ func TestSpillFileUsesPGDirectoryAndPrefix(t *testing.T) {
 	defer ctx.ReleaseSpillFiles()
 	_ = w.Close()
 
-	if got, want := filepath.Dir(w.Path()), pgtemp.Dir(ctx.DataDir); got != want {
+	if got, want := filepath.Dir(w.Path()), file.Dir(ctx.DataDir); got != want {
 		t.Errorf("spill file directory = %q, want %q", got, want)
 	}
-	if base := filepath.Base(w.Path()); !strings.HasPrefix(base, pgtemp.FilePrefix) {
-		t.Errorf("spill file %q lacks the %q prefix the crash sweep filters on", base, pgtemp.FilePrefix)
+	if base := filepath.Base(w.Path()); !strings.HasPrefix(base, file.FilePrefix) {
+		t.Errorf("spill file %q lacks the %q prefix the crash sweep filters on", base, file.FilePrefix)
 	}
 }
 
@@ -140,8 +140,8 @@ func TestWorkerContextSharesTheLeaderRegistry(t *testing.T) {
 		t.Fatalf("newSpillWriter on worker ctx: %v", err)
 	}
 	_ = w.Close()
-	if dir := filepath.Dir(w.Path()); dir != pgtemp.Dir(leader.DataDir) {
-		t.Errorf("worker spilled to %q, want the leader's %q", dir, pgtemp.Dir(leader.DataDir))
+	if dir := filepath.Dir(w.Path()); dir != file.Dir(leader.DataDir) {
+		t.Errorf("worker spilled to %q, want the leader's %q", dir, file.Dir(leader.DataDir))
 	}
 	if n := leader.ReleaseSpillFiles(); n != 1 {
 		t.Fatalf("leader released %d worker files, want 1", n)
@@ -176,7 +176,7 @@ func TestStartupSweepReclaimsCrashedQueryFiles(t *testing.T) {
 	if got := countTempFiles(t, dataDir); len(got) != 4 {
 		t.Fatalf("expected 4 files to survive the crash, got %v", got)
 	}
-	n, err := pgtemp.RemoveStrayFiles(dataDir)
+	n, err := file.RemoveStrayFiles(dataDir)
 	if err != nil {
 		t.Fatalf("RemoveStrayFiles: %v", err)
 	}

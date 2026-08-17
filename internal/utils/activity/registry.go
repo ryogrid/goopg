@@ -11,8 +11,8 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/goopg/goopg/internal/gls"
-	"github.com/goopg/goopg/internal/runtimeshim"
+	"github.com/goopg/goopg/internal/port/gls"
+	"github.com/goopg/goopg/internal/port/runtimeshim"
 )
 
 // BackgroundWorkerSlots is the number of extra slots reserved beyond the

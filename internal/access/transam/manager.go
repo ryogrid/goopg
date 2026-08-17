@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/goopg/goopg/internal/lockwait"
+	"github.com/goopg/goopg/internal/storage/lmgr/lockwait"
 	"github.com/goopg/goopg/internal/storage"
 )
 

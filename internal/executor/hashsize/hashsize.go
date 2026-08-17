@@ -5,13 +5,21 @@
 // It exists as its own leaf package for one reason — the planner and the
 // executor MUST agree. PG's `final_cost_hashjoin` (costsize.c) prices the
 // batch I/O of exactly the geometry `ExecChooseHashTableSize` (nodeHash.c:658)
-// will pick at run time, because both call that one function. goopg's planner
-// imports the executor nowhere (the dependency runs executor → planner), so a
-// shared sizing rule has to live below both. Putting it anywhere else would
-// recreate the sibling-path divergence the project keeps paying for: a cost
-// model that believes a build fits and an executor that spills, or the
-// reverse. Design: docs/design/leftdeep-joins/06-hash-spill-and-memory.md
-// §2.1 and 04-cost-and-cardinality.md §4 (milestone M0127-P3.1).
+// will pick at run time, because both call that one function. Putting the rule
+// anywhere the two sides could drift apart would recreate the sibling-path
+// divergence the project keeps paying for: a cost model that believes a build
+// fits and an executor that spills, or the reverse.
+// Design: docs/design/leftdeep-joins/06-hash-spill-and-memory.md §2.1 and
+// 04-cost-and-cardinality.md §4 (milestone M0127-P3.1).
+//
+// INVARIANT — do not "fix" this package's imports. It lives under
+// internal/executor/ to mirror `ExecChooseHashTableSize`'s home in
+// src/backend/executor/nodeHash.c, but it imports NEITHER internal/executor
+// NOR internal/optimizer, and it must stay that way. In Go a directory is not
+// a dependency: internal/optimizer importing internal/executor/hashsize
+// creates no edge to internal/executor, so the planner still imports the
+// executor nowhere (the dependency runs executor → optimizer). An import of
+// either parent from here would make that false and introduce a cycle.
 //
 // The algorithm is `ExecChooseHashTableSize` with goopg's widths substituted
 // for PG's. PG measures a hash entry as
