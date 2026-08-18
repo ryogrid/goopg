@@ -2142,6 +2142,12 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 							for _, idx := range im2.IndexesOnTable(src, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 								if idx.Primary {
 									s.PrimaryKey = append(s.PrimaryKey, idx.Columns...)
+									// Carry forward the source PK's deferrability, mirroring
+									// PG's generateClonedIndexStmt (parse_utilcmd.c:1804-1805):
+									// index->deferrable = conrec->condeferrable;
+									// index->initdeferred = conrec->condeferred;
+									s.PrimaryKeyDeferrable = idx.Deferrable
+									s.PrimaryKeyInitiallyDeferred = idx.InitiallyDeferred
 									break
 								}
 							}
@@ -4412,6 +4418,33 @@ func checkNameTaken(tbl *catalog.Table, name string) bool {
 	for _, nc := range tbl.NamedChecks {
 		if nc.Name == name {
 			return true
+		}
+	}
+	return false
+}
+
+// constraintNameTaken reports whether name is already used by ANY constraint
+// on tbl — CHECK, foreign key, or PK/unique/exclusion index — mirroring PG's
+// single per-relation pg_constraint namespace that ChooseConstraintName probes
+// via ConstraintNameIsUsed (postgres/src/backend/catalog/pg_constraint.c:513).
+// Unlike checkNameTaken (CHECK-only, reused elsewhere and left untouched),
+// this is the broader namespace check needed by callers that clone a
+// constraint of unknown kind onto a table that may already own a
+// same-named constraint of a DIFFERENT kind.
+func constraintNameTaken(ctx *Context, tbl *catalog.Table, name string) bool {
+	if checkNameTaken(tbl, name) {
+		return true
+	}
+	for _, fk := range tbl.ForeignKeys {
+		if fk.Name == name {
+			return true
+		}
+	}
+	if ctx != nil && ctx.Catalog != nil {
+		for _, idx := range ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
+			if idx.Name == name {
+				return true
+			}
 		}
 	}
 	return false

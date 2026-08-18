@@ -17,6 +17,7 @@ package executor
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -579,6 +580,23 @@ func cloneAndValidateAttachPartitionFKs(ctx *Context, parentTbl, childTbl *catal
 		// the clone so the validation error names the parent constraint.
 		clone := pfk
 		clone.Name = fkConstraintName(parentTbl, pfk)
+		// If the child already owns a constraint (of ANY kind — CHECK, FK,
+		// PK/unique/exclusion) named like the parent's FK, disambiguate by
+		// appending an incrementing suffix, mirroring PG's ChooseConstraintName
+		// (postgres/src/backend/catalog/pg_constraint.c:513), invoked from
+		// addFkConstraint (postgres/src/backend/commands/tablecmds.c:10748-10760)
+		// when ConstraintNameIsUsed reports a collision in the relation's
+		// constraint namespace.
+		if constraintNameTaken(ctx, childTbl, clone.Name) {
+			base := clone.Name
+			for i := 1; ; i++ {
+				candidate := base + "_" + strconv.Itoa(i)
+				if !constraintNameTaken(ctx, childTbl, candidate) {
+					clone.Name = candidate
+					break
+				}
+			}
+		}
 		// Validate the partition's existing rows BEFORE recording the clone, so a
 		// failed attach leaves no half-attached FK behind.
 		if err := fullTableFKCheck(ctx, childTbl, clone); err != nil {
