@@ -3018,3 +3018,79 @@ on child INSERT, `NO INHERIT` not propagated, two-parent dedup yields one
 constraint, single-column-reference auto-name, multi-column-reference auto-name.
 Three FAIL-pre / PASS-post; the two auto-name/NO-INHERIT guards that already
 passed pre-fix are recorded as such rather than credited to this slice.
+
+## 34. M0134-0005aa — a CHECK on `tableoid` was never enforced, and a CHECK on any other system column was never rejected (LANDED 2026-08-19)
+
+Selected from a fresh census at HEAD (`tmp/ralph-handoffs/m0134-0005aa-census/`),
+which re-confirmed the **465 lines / 22 hunks** baseline — 0005y and 0005z moved
+neither number, so the ranking was made on causes, not on a stale map.
+
+Upstream this is **one rule** (`postgres/src/backend/parser/parse_relation.c:707-713`,
+`scanNSItemForColumn`): inside `EXPR_KIND_CHECK_CONSTRAINT`, no system column is
+allowed **except** `tableoid`, and a violation is `ERRCODE_INVALID_COLUMN_REFERENCE`
+(42703) with `parser_errposition`. goopg got both halves of that rule wrong, in two
+different files, in opposite directions.
+
+### 34.1 The `tableoid` half was a SILENT INTEGRITY GAP
+
+`checkConstraints` (`internal/executor/operators_fk.go:1700`) — the single runtime
+fan-in for INSERT/COPY/UPDATE — evaluates each CHECK by re-planning it against a
+synthetic `SELECT (expr) FROM (VALUES (…)) AS _chk(<the table's real columns>)`.
+`tableoid` is not a real column, so `optimizer.Plan` failed — and the failure hit
+`if err != nil { continue }`, which **skipped the constraint and passed the row**.
+goopg therefore accepted a row PG rejects with 23514, the same class as 0005e /
+0005h / 0005z.
+
+Fix: bind `tableoid` as an extra synthetic column carrying `<tbl.OID>::oid`.
+
+### 34.2 The durable half — the `continue`s themselves were the bug
+
+Binding `tableoid` fixes *one* cause of an unevaluable CHECK. The design decision
+that matters is that **every** parse/plan/build/open/next failure in that loop now
+returns an `XX000` naming the constraint, the relation and the failing stage,
+instead of silently passing the row. Only the three legitimate no-ops remain
+`continue`: an empty expression, a `NOT ENFORCED` constraint (§ bucket 2), and a
+NULL result (SQL NULL is not a violation). Without this, the next expression form
+goopg cannot plan would have been just as silently unenforced, and equally
+invisible to the regress diff.
+
+### 34.3 The `ctid` half — a missing DDL gate
+
+`validateCheckExprSystemColumns` (`internal/executor/operators_ddl.go`) reuses the
+existing `collectCheckExprColumns` walker (which already lower-cases names, so
+`CTID` is caught too) and rejects `ctid`/`xmin`/`xmax`/`cmin`/`cmax` with PG's exact
+message and SQLSTATE. It is wired into **both** sites — `execCreateTable` and
+`ALTER TABLE … ADD CONSTRAINT … CHECK` — a Rule-#2 sibling pair.
+
+The gate runs **before** `Catalog.CreateTable`, not after the brief's literal call
+sites, so a rejected CHECK never leaves a half-created relation behind. A
+malformed expression is passed through untouched for the existing planner-time
+error path to report, rather than being masked by this gate.
+
+### 34.4 Two things this slice deliberately did NOT do
+
+- **No cursor position.** PG *does* set one here (the expected output shows
+  `LINE 3:` and a caret), so this is a real remaining divergence — but goopg's
+  parser stores a CHECK body as a token-rejoined string with no source offset on
+  `CheckExpr`/`TableChecks`/`TableNamedChecks`. The error carries `Pos: 0` rather
+  than an invented position; inventing one is the exact defect 0005u and 0005w
+  had to clean up. Ledgered.
+- **Generated columns are the same upstream rule** (`EXPR_KIND_GENERATED_COLUMN`,
+  same function, lines 715-724, different message) and goopg has **no DDL-time
+  validation of generated-column expressions at all** — not merely a missing
+  system-column gate. Separate path, separate slice. Ledgered.
+
+### 34.5 Measurement
+
+`GOOPG_CG_UNIT=m0134-0005aa-impl scripts/pg-regress-runner.sh --verbose constraints`:
+**465 → 460 lines**, hunks **22 → 23**. Both target divergences are gone (the
+23514 hunk and the `ctid` ERROR line now match byte-for-byte); the hunk rise is
+unified-diff context splitting around the shrunk region, not new divergence — the
+recurring "unmasking" signature already recorded in §§ 1, 3, 6.
+
+Guards (`internal/executor/operators_fk_syscol_check_test.go`, all FAIL-pre /
+PASS-post): `TestCheckConstraintTableoidEnforcedOnInsert`,
+`TestCheckConstraintSystemColumnRejectedAtCreateTable`,
+`TestCheckConstraintSystemColumnRejectedAtAlterTable`, and
+`TestCheckConstraintTableoidAcceptedAtAlterTable` — the last one guarding against
+**over**-rejection, since the whole point of the rule is that `tableoid` stays legal.

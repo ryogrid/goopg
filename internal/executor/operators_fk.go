@@ -1708,6 +1708,15 @@ func checkConstraints(ctx *Context, tbl *catalog.Table, row Row) error {
 	for i, col := range tbl.Columns {
 		colNames[i] = col.Name
 	}
+	// tableoid is the only system column a CHECK expression may reference
+	// (validateCheckExprSystemColumns, operators_ddl.go, rejects every other
+	// one at DDL time). Bind it here as an extra synthetic column so such
+	// expressions resolve against the planner instead of failing to plan —
+	// previously that plan error was silently swallowed by the `continue`
+	// below, so a CHECK referencing tableoid was accepted at DDL time but
+	// never enforced at INSERT (M0134-0005aa, PG oracle:
+	// postgres/src/backend/parser/parse_relation.c scanNSItemForColumn).
+	colNames = append(colNames, "tableoid")
 	colNamesJoined := strings.Join(colNames, ", ")
 
 	for ci, exprSQL := range tbl.CheckConstraints {
@@ -1730,24 +1739,44 @@ func checkConstraints(ctx *Context, tbl *catalog.Table, row Row) error {
 				colVals[i] = "NULL::" + col.Type.Name
 			}
 		}
+		colVals = append(colVals, fmt.Sprintf("%d::oid", tbl.OID))
 		rowFrom := " FROM (VALUES (" + strings.Join(colVals, ", ") + ")) AS _chk(" + colNamesJoined + ")"
 		fullSQL := "SELECT (" + exprSQL + ")" + rowFrom
+		// Every failure from here down used to `continue`, silently passing
+		// the row instead of enforcing (or even reporting) an unevaluable
+		// CHECK constraint. That is the durable half of M0134-0005aa: the
+		// tableoid binding above fixes ONE cause of an unevaluable CHECK,
+		// but any other cause must still be loud, not silently skipped.
+		unevaluable := func(stage string, cause error) error {
+			name := ""
+			if ci < len(tbl.NamedChecks) {
+				name = tbl.NamedChecks[ci].Name
+			}
+			return &ExecError{
+				Code: "XX000",
+				Message: fmt.Sprintf("internal error: could not evaluate check constraint %q on relation %q (%s): %v",
+					name, tbl.Name, stage, cause),
+			}
+		}
 		stmts, err := parser.Parse(fullSQL)
-		if err != nil || len(stmts) == 0 {
-			continue
+		if err != nil {
+			return unevaluable("parse", err)
+		}
+		if len(stmts) == 0 {
+			return unevaluable("parse", fmt.Errorf("no statement produced"))
 		}
 		plan, err := optimizer.Plan(stmts[0], ctxPlanCatalog(ctx))
 		if err != nil {
-			continue
+			return unevaluable("plan", err)
 		}
 		op, err := Build(plan)
 		if err != nil {
-			continue
+			return unevaluable("build", err)
 		}
 		synthCtx := *ctx
 		if err := op.Open(&synthCtx); err != nil {
 			op.Close()
-			continue
+			return unevaluable("open", err)
 		}
 		slot, err2 := op.Next()
 		// Read slot data BEFORE Close (Close releases the backing row memory).
@@ -1762,7 +1791,10 @@ func checkConstraints(ctx *Context, tbl *catalog.Table, row Row) error {
 		}
 		op.Close()
 		if !hasResult {
-			continue
+			if err2 != nil {
+				return unevaluable("next", err2)
+			}
+			return unevaluable("next", fmt.Errorf("evaluation produced no result"))
 		}
 		// NULL check result → pass (SQL NULL is not a constraint failure)
 		if result.IsNull() {

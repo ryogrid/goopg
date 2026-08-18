@@ -3288,6 +3288,28 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	if err != nil {
 		return err
 	}
+	// CHECK expressions may reference no system column except tableoid
+	// (parse_relation.c:707-713, scanNSItemForColumn,
+	// EXPR_KIND_CHECK_CONSTRAINT). Validated before CreateTable, like the
+	// SERVER-name check above, so a bad CHECK never leaves a half-created
+	// relation behind. M0134-0005aa.
+	for _, c := range s.Columns {
+		if c.CheckExpr != "" {
+			if err := validateCheckExprSystemColumns(c.CheckExpr); err != nil {
+				return err
+			}
+		}
+	}
+	for _, chk := range s.TableChecks {
+		if err := validateCheckExprSystemColumns(chk); err != nil {
+			return err
+		}
+	}
+	for _, nc := range s.TableNamedChecks {
+		if err := validateCheckExprSystemColumns(nc.Expr); err != nil {
+			return err
+		}
+	}
 	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
@@ -4386,6 +4408,47 @@ func collectCheckExprColumns(e parser.Expr, out *[]string) {
 		collectCheckExprColumns(n.Base, out)
 		collectCheckExprColumns(n.Index, out)
 	}
+}
+
+// checkConstraintForbiddenSystemColumns are PostgreSQL's system columns that
+// a CHECK constraint expression may NOT reference. tableoid is the sole
+// exception (postgres/src/backend/parser/parse_relation.c:707-713,
+// scanNSItemForColumn: "In constraint check, no system column is allowed
+// except tableOid"). M0134-0005aa.
+var checkConstraintForbiddenSystemColumns = map[string]bool{
+	"ctid": true,
+	"xmin": true,
+	"xmax": true,
+	"cmin": true,
+	"cmax": true,
+}
+
+// validateCheckExprSystemColumns rejects a CHECK expression that references
+// any system column other than tableoid, mirroring PG's
+// scanNSItemForColumn EXPR_KIND_CHECK_CONSTRAINT gate (SQLSTATE 42703,
+// parse_relation.c:707-713). exprSQL is goopg's already-reconstructed
+// (token-joined) CHECK body text — the parser does not thread source
+// positions through CheckExpr/TableChecks/TableNamedChecks, so unlike PG's
+// LINE/cursor-position rendering the returned ExecError carries Pos 0
+// rather than an invented cursor position (M0134-0005aa report.md).
+// A malformed expression is left for the existing planner-time error path
+// to report, not this gate.
+func validateCheckExprSystemColumns(exprSQL string) error {
+	parsed, err := parser.ParseExpr(exprSQL)
+	if err != nil {
+		return nil
+	}
+	var cols []string
+	collectCheckExprColumns(parsed, &cols)
+	for _, c := range cols {
+		if checkConstraintForbiddenSystemColumns[c] {
+			return &ExecError{
+				Code:    "42703",
+				Message: fmt.Sprintf("system column %q reference in check constraint is invalid", c),
+			}
+		}
+	}
+	return nil
 }
 
 // appendLikeChecks copies src's CHECK constraints (name + expression) into
@@ -8385,6 +8448,11 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// (the latent virtual-table join crash was fixed in
 			// M0097-0023-loop34). M0097-0023.
 			if act.CheckExpr != "" {
+				// System-column gate — see the CREATE TABLE sibling above
+				// (execCreateTable). M0134-0005aa.
+				if err := validateCheckExprSystemColumns(act.CheckExpr); err != nil {
+					return err
+				}
 				// PG18: NO INHERIT constraints cannot be added to partitioned
 				// tables — ATAddCheckConstraint raises 42P16
 				// (tablecmds.c). Mirrors the CREATE TABLE sibling above
