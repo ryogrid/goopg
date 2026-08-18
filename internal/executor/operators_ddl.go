@@ -4916,7 +4916,13 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 				continue
 			}
 			if parentNC != nil {
-				tbl.AddNotNull(parentNC.Name, col.Name, im2.AllocOID(), parentNC.NoInherit, parentNC.NotValid, false, 1)
+				// A freshly created (empty) partition always cooks
+				// convalidated=true regardless of the parent's own
+				// validation state — PG validates a not-null constraint
+				// against the table it's being added to, and an empty
+				// table has no rows to violate it (heap.c:2385
+				// AddRelationNewConstraints). M0134-0005p sub-slice B.
+				tbl.AddNotNull(parentNC.Name, col.Name, im2.AllocOID(), parentNC.NoInherit, false, false, 1)
 			}
 		}
 	}
@@ -9852,10 +9858,25 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// column (SET NOT NULL is idempotent in PG — no duplicate row).
 			hasNN := false
 			nnName := ""
-			for _, nc := range tbl.NotNullConstraints {
+			shouldCascade := false
+			for i := range tbl.NotNullConstraints {
+				nc := &tbl.NotNullConstraints[i]
 				if strings.EqualFold(nc.ColName, act.ColumnName) {
 					hasNN = true
 					nnName = nc.Name
+					// Existing constraint: merge in place, mirroring
+					// AdjustNotNullInheritance (pg_constraint.c:742) — if not
+					// already local, mark it local; else if it is NOT VALID,
+					// validate it (the NULL scan already ran above). Either
+					// way ATExecSetNotNull's existing-constraint branch
+					// (tablecmds.c:7950-8010) returns WITHOUT recursing to
+					// children — only the "no constraint yet" branch below
+					// cascades. M0134-0005p sub-slice A.
+					if !nc.IsLocal {
+						nc.IsLocal = true
+					} else if nc.NotValid {
+						nc.NotValid = false
+					}
 					break
 				}
 			}
@@ -9864,6 +9885,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					name := strings.ToLower(tbl.Name) + "_" + strings.ToLower(act.ColumnName) + "_not_null"
 					tbl.AddNotNull(name, act.ColumnName, im.AllocOID(), false, false, true, 0)
 					nnName = name
+					shouldCascade = true
 				}
 			}
 			if catalogHeapSyncAvailable(o.ctx) {
@@ -9879,9 +9901,11 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			}
 			// Cascade to already-existing inheritance children and partitions,
 			// recursively, mirroring PG's ATExecSetNotNull recursion
-			// (tablecmds.c:8062-8079). M0134-0005i.
-			if nnName != "" {
-				if err := o.cascadeNotNullToChildren(tbl, act.ColumnName, nnName); err != nil {
+			// (tablecmds.c:8062-8079) — ONLY on the "no constraint yet" path;
+			// the already-exists branch above returns without cascading.
+			// M0134-0005i, M0134-0005p sub-slice A.
+			if shouldCascade && nnName != "" {
+				if err := o.cascadeNotNullToChildren(tbl, act.ColumnName, nnName, false); err != nil {
 					return err
 				}
 			}
@@ -10025,7 +10049,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// tablecmds.c:9995-9998: "If adding a NO INHERIT constraint, no
 			// need to find our children"). M0134-0005i.
 			if nnName != "" && !act.NoInherit {
-				if err := o.cascadeNotNullToChildren(tbl, act.ColumnName, nnName); err != nil {
+				if err := o.cascadeNotNullToChildren(tbl, act.ColumnName, nnName, act.NotValid); err != nil {
 					return err
 				}
 			}
@@ -10743,7 +10767,7 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 			// for the synthesized AT_AddConstraint (tablecmds.c:9499-9573),
 			// which drives the same find_all_inheritors cascade as SET NOT
 			// NULL (ATExecSetNotNull, tablecmds.c:8062-8079). M0134-0005o.
-			if err := o.cascadeNotNullToChildren(tbl, col.Name, nnName); err != nil {
+			if err := o.cascadeNotNullToChildren(tbl, col.Name, nnName, false); err != nil {
 				return err
 			}
 		}
@@ -11044,21 +11068,30 @@ const maxNotNullCascadeDepth = 64
 // coninhcount incremented — no duplicate row (tablecmds.c:7971-7993 "merge
 // with an existing constraint"). A child with none gets a brand-new
 // constraint under the PARENT's constraint name, conislocal=false,
-// coninhcount=1. The column is resolved BY NAME in each child (a child's
-// column order can differ from its parent's — M0134-0005h avoided the same
-// positional-index mistake). No-op on a non-*catalog.InMemory catalog.
-func (o *ddlOp) cascadeNotNullToChildren(tbl *catalog.Table, colName, constraintName string) error {
+// coninhcount=1, and inherits the source constraint's NotValid (PG copies
+// the cooked constraint verbatim — heap.c:2385 AddRelationNewConstraints).
+// The column is resolved BY NAME in each child (a child's column order can
+// differ from its parent's — M0134-0005h avoided the same positional-index
+// mistake). No-op on a non-*catalog.InMemory catalog.
+//
+// The visited guard is keyed per (child OID, immediate-parent OID) EDGE, not
+// per child alone: PG's real recursion (tablecmds.c:8062-8079) has no
+// visited-set at all, so a diamond-inherited descendant reached via two
+// distinct parent edges is counted (coninhcount++) once per edge — keying
+// on child OID alone under-counts that case. maxNotNullCascadeDepth remains
+// the recursion backstop against a genuine cycle. M0134-0005p sub-slice B.
+func (o *ddlOp) cascadeNotNullToChildren(tbl *catalog.Table, colName, constraintName string, notValid bool) error {
 	im, isIM := o.ctx.Catalog.(*catalog.InMemory)
 	if !isIM {
 		return nil
 	}
-	visited := make(map[uint32]bool)
-	return o.cascadeNotNullToChildrenAt(im, tbl, colName, constraintName, visited, 0)
+	visited := make(map[[2]uint32]bool)
+	return o.cascadeNotNullToChildrenAt(im, tbl, colName, constraintName, notValid, visited, 0)
 }
 
 // cascadeNotNullToChildrenAt is the depth/visited-bounded recursive body of
 // cascadeNotNullToChildren.
-func (o *ddlOp) cascadeNotNullToChildrenAt(im *catalog.InMemory, tbl *catalog.Table, colName, constraintName string, visited map[uint32]bool, depth int) error {
+func (o *ddlOp) cascadeNotNullToChildrenAt(im *catalog.InMemory, tbl *catalog.Table, colName, constraintName string, notValid bool, visited map[[2]uint32]bool, depth int) error {
 	if depth >= maxNotNullCascadeDepth {
 		return nil
 	}
@@ -11076,10 +11109,11 @@ func (o *ddlOp) cascadeNotNullToChildrenAt(im *catalog.InMemory, tbl *catalog.Ta
 		}
 	}
 	for _, child := range children {
-		if visited[child.OID] {
+		edge := [2]uint32{child.OID, tbl.OID}
+		if visited[edge] {
 			continue
 		}
-		visited[child.OID] = true
+		visited[edge] = true
 
 		colIdx := -1
 		for i := range child.Columns {
@@ -11102,7 +11136,7 @@ func (o *ddlOp) cascadeNotNullToChildrenAt(im *catalog.InMemory, tbl *catalog.Ta
 			}
 		}
 		if !merged {
-			child.AddNotNull(constraintName, colName, im.AllocOID(), false, false, false, 1)
+			child.AddNotNull(constraintName, colName, im.AllocOID(), false, notValid, false, 1)
 		}
 
 		if catalogHeapSyncAvailable(o.ctx) {
@@ -11117,7 +11151,7 @@ func (o *ddlOp) cascadeNotNullToChildrenAt(im *catalog.InMemory, tbl *catalog.Ta
 			}
 		}
 
-		if err := o.cascadeNotNullToChildrenAt(im, child, colName, constraintName, visited, depth+1); err != nil {
+		if err := o.cascadeNotNullToChildrenAt(im, child, colName, constraintName, notValid, visited, depth+1); err != nil {
 			return err
 		}
 	}

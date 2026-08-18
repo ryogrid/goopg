@@ -1910,3 +1910,105 @@ Gates: `go build ./...`; `go test ./internal/{executor,catalog}/`;
 `go test -run 'TestPort_.*(NotNull|Constraint|Inherit)' ./internal/testport/` (19 tests);
 `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
 `scripts/tpch-spotcheck.sh` PASS (**Q12=2, Q13=35** — Rule #1).
+
+## 23. M0134-0005p — NOT NULL inheritance bookkeeping (`coninhcount`/`conislocal`/`convalidated`) drifted from PG (LANDED 2026-08-18)
+
+### 23.1 Why this slice
+
+Census re-measured at HEAD `09a53e8f` with the §1 command (probe
+`tmp/ralph-handoffs/m0134-0005p-nninh/census`): **775 lines / 29 hunks — an exact
+match to the 0005o baseline**, so no unmasking occurred and §21.1's ranking held.
+This slice takes the cluster's largest *silent* sub-bug: the fixture's
+`get_nnconstraint_info` probe (`SELECT conrelid::regclass, conname, convalidated,
+conislocal, coninhcount FROM pg_constraint …`, `constraints.sql:876`, 8 call
+sites) reported wrong counter values under multi-level `INHERITS` and under
+partitioning — a wrong answer, not an error.
+
+**The research pass again changed the slice boundary**, as §21.1's rule predicts.
+Two corrections worth keeping:
+
+- The ~200-line hunk span is **not** ~200 lines of this bug. Those 5 hunks are
+  *entangled* with at least three independently-rooted divergences (NOTICE
+  suppression, a false "inherited from more than once" error, a `regclass`
+  `ORDER BY` sort bug). Only ~40-60 of the 205 lines were ever ours. **Hunk span
+  is an upper bound on a sub-bug's size, never an estimate of it** — a partial
+  shrink was the predicted success criterion, and it is what we got.
+- `pg_get_partition_constraintdef` — ranked #2 filler by the 0005o baton — was
+  **dropped**: it has zero occurrences in the current `constraints.sql`/`.out`.
+  The `:912` line the baton cited is actually the diamond-inheritance block, i.e.
+  part of *this* bug. It remains real feature debt (a `pg_proc` stub at
+  `internal/initdb/pg_proc_seed_data.go:2272`, OID 3408, with no executor
+  implementation) but witnesses no hunk; it is ledgered, not scheduled.
+
+### 23.2 The PG invariant
+
+From `pg_constraint.c:742 AdjustNotNullInheritance`,
+`tablecmds.c:7913 ATExecSetNotNull`, `heap.c:2385 AddRelationNewConstraints`:
+
+- **`coninhcount`** counts *immediate* parent edges enforcing the constraint,
+  incremented **once per distinct parent-child edge**. PG's recursion carries
+  **no visited-set at all** — it relies on the inheritance DAG being acyclic
+  (enforced at `INHERIT`/`ATTACH` time), so a diamond descendant reached via two
+  parent edges is legitimately counted **twice**.
+- **`conislocal`** is true iff the constraint was ALSO declared directly on this
+  table — independent of `coninhcount`; a constraint can be both.
+- **`convalidated`** reflects **this table's own** rows, never an ancestor's.
+  A fresh/empty table (including a new `PARTITION OF` child) always cooks
+  `convalidated=true`.
+
+`AdjustNotNullInheritance` returns a bool "an existing constraint absorbed this";
+the caller creates a new row only when it returns false. That return value is the
+structural distinction goopg was missing.
+
+### 23.3 The four defects (all `internal/executor/operators_ddl.go`)
+
+The root cause is shared: `catalog.Table.AddNotNull`
+(`internal/catalog/catalog.go:253-258`) is a **pure append that validates
+nothing** — every call site decides `NoInherit`/`NotValid`/`IsLocal`/`InhCount`
+by hand. Five independent hand-written call sites, no shared "merge-or-create"
+primitive, is exactly how four different arithmetic errors accumulated.
+
+| # | site | defect | fix |
+|---|---|---|---|
+| A | `:9858` `AlterTableSetNotNull` | the already-exists branch fell through to create **and cascade** | merge in place (`IsLocal=true`, else validate a local NOT VALID) and **return without recursing** — PG's existing-constraint branch (`tablecmds.c:7950-8010`) never recurses; only `:8012-8082` does |
+| B1 | `:11105` `cascadeNotNullToChildrenAt` | `notValid` hardcoded `false` | thread the source constraint's `NotValid` through the helper (all 3 callers updated: SET NOT NULL→`false`, ADD CONSTRAINT→`act.NotValid`, PK-synthesis→`false`) |
+| B2 | `:11068-11109` same | `visited` keyed on child OID alone → a diamond descendant counted once instead of once per edge | re-key to the **(child OID, immediate-parent OID) edge**; `maxNotNullCascadeDepth` stays as the cycle backstop |
+| C | `:4919` `execCreatePartitionChild` | copied `parentNC.NotValid` onto a brand-new empty partition | pass `notValid=false` unconditionally (§23.2) |
+
+**Not a heap-resync bug.** Unlike 0005o, all four sites already call the
+`catalogHeapSyncAvailable`→…→`syncTableToCatalogHeap` quadruple. This was pure
+bookkeeping arithmetic — a distinct failure mode, and the reason the guards for
+it can be in-memory (only C's needed a full-server `pg_constraint` read).
+
+### 23.4 Out of scope (each separately ledgered 2026-08-18)
+
+`ALTER TABLE … ATTACH PARTITION` absorption (write-site **D**) is a **complete
+no-op** on NOT NULL bookkeeping — `markAttachedColumnsInherited`
+(`:13215-13227`) only flips `Columns[i].Inherited`. It was cut from this slice
+for the §21.1 reason: its PG oracle could not be pinned to a function inside
+`ATExecAttachPartition` during the research pass, and the milestone's rule is to
+size from pinned code. It is structurally "A's already-exists branch at ATTACH
+time, but `conislocal` flips the OPPOSITE direction (t→f)". Also deferred: the
+recursive validation of descendants (`QueueNNConstraintValidation`,
+`tablecmds.c:13213-13290`) that PG's `ATExecValidateConstraint` performs —
+**discovered by this slice and made visible by its own correct B1 fix**; the
+`regclass` `ORDER BY` sort bug; the suppressed inheritance NOTICEs; the false
+"inherited from more than once" error; and the diff:616-621 check-ordering bug
+(D1 family, §21.3).
+
+### 23.5 Outcome
+
+`constraints` regress diff **775 → 763 lines** (−12) at 29 → 30 hunks (a hunk
+*split* from the line shift, not a new divergence). A partial shrink was the
+predicted and correct result per §23.1.
+
+Guards: `internal/testport/notnull_inherit_counters_test.go` (4 new tests, each
+verified FAIL-before/PASS-after by reverting only `operators_ddl.go`) — diamond
+`coninhcount`=2; repeat SET NOT NULL does not double-bump and validates a local
+NOT VALID; NOT VALID propagates to a cascaded child; a fresh `PARTITION OF` child
+is always validated (full-server `pg_constraint` read).
+
+Gates: `go build ./...`; `go test ./internal/{executor,catalog}/`;
+`go test -run 'TestPort_.*(NotNull|Constraint|Inherit|Partition)' ./internal/testport/`
+(40 subtests); `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
+`scripts/tpch-spotcheck.sh` PASS (**Q12=2, Q13=35** — Rule #1).
