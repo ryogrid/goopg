@@ -1079,3 +1079,127 @@ direction. The remaining 33 hunks are NOT-NULL-constraint inheritance-validate a
 - **`cloneAndValidateAttachPartitionFKs` was probed and found NOT affected** — it
   always passes the real leaf as both scan target and storage owner. Recorded so a
   later loop does not re-probe it.
+
+## 16. M0134-0005i — `ALTER TABLE … SET/ADD NOT NULL` never cascades to existing children
+
+### 16.1 Why this slice, and how it was chosen
+
+Sections §11.4 and §15.6 both *guessed* at what dominated the remaining diff. This
+slice was chosen instead from a **fresh measured bucket census** (probe
+`tmp/ralph-handoffs/m0134-0005i-probe`), regenerated with:
+
+```
+GOOPG_CG_UNIT=m0134-0005i-probe scripts/pg-regress-runner.sh --verbose constraints
+```
+
+Baseline re-confirmed at **1164 lines / 33 hunks**. Ranked buckets:
+
+| # | bucket | ≈lines | class |
+|---|---|---|---|
+| 1 | **`SET`/`ADD NOT NULL` never propagates to existing children** (+ its ripples: `VALIDATE`/`DROP`/`COMMENT ON CONSTRAINT … does not exist` on the child, wrong `conislocal`/`coninhcount`, `\d+` output, ATTACH PARTITION) | **~690** | metadata + integrity-adjacent |
+| 2 | `DEFAULT -1 * currval('insert_seq')` silently evaluates to NULL — corrupts SELECT output **and** lets `CHECK(x+z=0)` pass violating rows via 3-valued logic | ~150–180 | **silent wrong answer** |
+| 3 | GiST `circle` default opclass missing ⇒ whole `circles` EXCLUDE block never creates its table | ~60 | pre-existing (§11.4 Bucket 5) |
+| 4 | multi-unnamed-CHECK auto-naming picks the wrong column; `COPY FROM` does not re-check CHECK | ~40 | silent wrong answer |
+| 5 | `ADD EXCLUDE` misses existing violations; ON CONFLICT arbiter wording | ~25 | mixed |
+| 6 | partitioned FK naming on ATTACH (`dummy_constr_1` vs `dummy_constr`); `SET CONSTRAINTS` message ordering | ~25 | message |
+| 7 | `DEFAULT` uses `a_expr` not `b_expr`, so `DEFAULT 1 IN (1,2)` parses where PG rejects | ~10 | grammar |
+| 8 | `DEFAULT_TBL` float8 `123.456` prints as `123` | ~2 | formatting |
+
+The previous loop's second hypothesis — that `COMMENT ON CONSTRAINT … does not exist`
+was an independent driver — is **REFUTED**: it is a downstream symptom of bucket 1
+(the constraint was never created on the child at all). The genuinely independent
+COMMENT wording diffs are ~10 lines and out of scope. Bucket 2 is the largest *silent
+wrong-answer* bucket and is the natural successor slice; it is deliberately **not**
+conflated here (default-expression evaluation, an unrelated subsystem).
+
+### 16.2 Root cause
+
+`internal/executor/operators_ddl.go`:
+
+- `case parser.AlterTableSetNotNull:` (~:9661) and `case parser.AlterTableAddNotNull:`
+  (~:9754) each mutate **only `tbl`** — they set `tbl.Columns[colIdx].NotNull` and call
+  `tbl.AddNotNull(…)` on `tbl` alone. Neither consults
+  `catalog.InMemory.InheritanceChildren` / `PartitionChildren`.
+
+The machinery is not missing — it is **unwired**, the same shape as §14 and §15:
+
+- The sibling **DROP** path (`~:10917-10960`) already cascades, looping
+  `im.PartitionChildren(tbl.OID)` and calling `o.clearNotNullConstraint(childTbl, …)`
+  (`~:10947-10957`). ADD/SET cascading and DROP cascading is an asymmetric pair — the
+  asymmetry *is* the bug.
+- `CREATE TABLE … INHERITS` already seeds a child's NOT-NULL constraints from its
+  parent at creation time (`~:3925-3977`, `~:4756-4773`), including the
+  merge-not-duplicate accounting. The gap is exclusively the **post-hoc ALTER on a
+  parent that already has children**.
+
+### 16.3 PG oracle
+
+`postgres/src/backend/commands/tablecmds.c:7913` `ATExecSetNotNull()`:
+
+- `:8062-8079` — when `recurse`, it calls `find_inheritance_children()` and re-invokes
+  **itself** per child with `recursing = true` and the **same constraint name** chosen
+  for the parent. Because each child re-enters the same function, the cascade is
+  **recursive**, not one level: grandchildren are reached.
+- `:7971-7993` — on a child that already carries a NOT-NULL constraint for that column,
+  PG **increments `coninhcount`** on the existing row rather than creating a duplicate.
+  The child's row ends `conislocal = f, coninhcount = 1` when it was purely inherited,
+  which is exactly what the diff's `constr_child2` / `notnull_tbl4_cld*` hunks expect.
+- PG 18 unified `SET NOT NULL` and named `ADD CONSTRAINT … NOT NULL` into this **one**
+  function. goopg has **two** handlers, so they are a Rule-#2 twin pair: both must
+  change, and they must share one cascade helper — otherwise the next loop inherits a
+  fresh divergence between them.
+
+### 16.4 Design decisions taken before briefing
+
+1. **Recursive, not one-level.** PG recurses; so must goopg. The DROP sibling's
+   single-level `PartitionChildren` loop is *not* the model to copy verbatim — that
+   same one-level shortcoming is already a ledgered defect elsewhere
+   (`fkCascadeDelete`, §15.7). Walk both inheritance and partition children
+   transitively, with a depth/visited bound.
+2. **Resolve the column BY NAME per child.** A partition's (or inheritance child's)
+   column order can differ from its parent's; hoisting a parent-computed positional
+   index would be a fresh silent-corruption bug. This is the §15.3 lesson restated.
+3. **Merge, do not duplicate.** Child already has a NOT-NULL constraint for the
+   column ⇒ increment its inherited count only. Child has none ⇒ create it with the
+   **parent's** constraint name, `IsLocal = false`, inherited count 1.
+4. **Bucket 2 is out of scope** and is the designated successor slice.
+
+### 16.5 Status
+
+Briefed as `tmp/ralph-handoffs/m0134-0005i-notnull-inherit-cascade`. Outcome, measured
+line delta, and any deviations are recorded in the fix_plan item and in §16.6 once the
+slice lands.
+
+### 16.6 Outcome (LANDED 2026-08-18)
+
+One new shared helper `cascadeNotNullToChildren` / `cascadeNotNullToChildrenAt`
+(+ `const maxNotNullCascadeDepth = 64`, mirroring `maxCTIDChainWalk` /
+`maxPartitionParentWalk`) in `internal/executor/operators_ddl.go`, called from **both**
+`case parser.AlterTableSetNotNull:` and `case parser.AlterTableAddNotNull:` — the
+Rule-#2 twin pair PG collapses into a single function. +123 production lines; no new
+`catalog` field, no new catalog column. All four §16.4 decisions held as designed.
+
+**Measured: `constraints` 1164 → 1122 lines (−42), hunks 33 → 33**, established as a
+true stash-based counterfactual (measure post-fix, stash the production file only,
+re-measure, restore) — a single post-fix reading is not attribution, an error already
+made twice in this milestone.
+
+Guards, `internal/testport/notnull_inherit_cascade_test.go`, 6 `TestPort_*`:
+`…SetNotNullCascadesToChildren`, `…AddConstraintCascadesUnderParentName`,
+`…CascadesMultiLevel` (the grandchild case — this is what proves recursion),
+`…CascadeMergesExistingChildConstraint` (asserts exactly one `pg_constraint` row),
+`…CascadeSkipsUnrelatedSibling`. The first three are proven FAIL-pre/PASS-post by
+stashing only `operators_ddl.go`; **the pre-fix failures are silent SUCCESSES**
+(`INSERT INTO ch (a) VALUES (NULL) succeeded after parent SET NOT NULL; want 23502`),
+which is precisely why no message-diff guard would ever have caught this and why the
+merge and negative guards were mandatory.
+
+**Brief correction worth keeping:** this brief's criterion 2 wrote the named form as
+`ADD CONSTRAINT p_a_nn NOT NULL (a)`. That parenthesised spelling is not valid PG or
+goopg grammar — `postgres/src/test/regress/sql/alter_table.sql:915,917` uses the
+unparenthesised `NOT NULL a`. The implementer corrected it rather than working around
+it.
+
+Deferred, ledgered 2026-08-18: bucket 2 (`DEFAULT … currval()` → NULL, the successor
+slice), a missing `NO INHERIT` cascade-skip negative guard, and the surviving
+partition-ATTACH `convalidated` + independent `COMMENT ON CONSTRAINT` wording lines.
