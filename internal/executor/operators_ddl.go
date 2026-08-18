@@ -4013,6 +4013,9 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			if col.Inherited && s.PartitionOf == nil {
 				for _, parent := range inheritParents {
 					for _, pnc := range parent.NotNullConstraints {
+						if pnc.NoInherit {
+							continue
+						}
 						if strings.EqualFold(pnc.ColName, col.Name) {
 							if inhCount == 0 && pnc.Name != "" {
 								name = pnc.Name
@@ -4040,6 +4043,9 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				// (pg_upgrade, introspection). DU-002.
 				for _, parent := range inheritParents {
 					for _, pnc := range parent.NotNullConstraints {
+						if pnc.NoInherit {
+							continue
+						}
 						if strings.EqualFold(pnc.ColName, col.Name) {
 							inhCount = 1
 							break
@@ -13498,6 +13504,9 @@ func unmergeNotNullOnDetach(parent, child *catalog.Table) {
 		cnc := &child.NotNullConstraints[ci]
 		matched := false
 		for pi := range parent.NotNullConstraints {
+			if parent.NotNullConstraints[pi].NoInherit {
+				continue
+			}
 			if strings.EqualFold(parent.NotNullConstraints[pi].ColName, cnc.ColName) {
 				matched = true
 				break

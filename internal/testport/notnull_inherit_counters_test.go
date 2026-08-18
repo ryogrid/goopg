@@ -503,3 +503,41 @@ func TestPort_NotNullInheritTransactionalFormAbsorbs(t *testing.T) {
 		t.Fatalf("txinh_c's txinh_nn coninhcount after transactional NO INHERIT = %q, want 0", got)
 	}
 }
+
+// TestPort_NotNullNoInheritParentSkippedOnCreateInherits is M0134-0005t: a
+// parent NOT NULL constraint marked NO INHERIT must never be counted toward
+// a NEW `CREATE TABLE ... INHERITS (parent)` child's coninhcount, nor supply
+// the child's constraint name. PG's MergeAttributes calls
+// RelationGetNotNullConstraints(relid, true, /*include_noinh=*/false)
+// (tablecmds.c:2757), and RelationGetNotNullConstraints skips
+// connoinherit='t' rows entirely (pg_constraint.c:834) — such a constraint
+// never reaches MergeAttributes' nncols/nnconstraints sets at all, so the
+// child's own PRIMARY KEY-implied NOT NULL constraint must come out fully
+// local (coninhcount=0, conislocal=true) with its own child-derived name,
+// not the parent's.
+func TestPort_NotNullNoInheritParentSkippedOnCreateInherits(t *testing.T) {
+	c := startNotNullCascadeCluster(t, "notnull-noinherit-parent-skipped-create")
+
+	for _, stmt := range []string{
+		"CREATE TABLE nip_p (a int, b int)",
+		"ALTER TABLE nip_p ADD CONSTRAINT nip_con NOT NULL a NO INHERIT",
+		"CREATE TABLE nip_c (PRIMARY KEY (a)) INHERITS (nip_p)",
+	} {
+		if err := runSQLSimple(t, c, stmt); err != nil {
+			t.Fatalf("setup %q: %v", stmt, err)
+		}
+	}
+
+	if got := queryScalar(t, c,
+		"SELECT coninhcount FROM pg_constraint WHERE contype = 'n' AND conrelid = 'nip_c'::regclass"); got != "0" {
+		t.Fatalf("nip_c's NOT NULL coninhcount after INHERITS from a NO INHERIT parent = %q, want 0 (PG's MergeAttributes never absorbs a connoinherit parent constraint)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT conislocal FROM pg_constraint WHERE contype = 'n' AND conrelid = 'nip_c'::regclass"); got != "true" {
+		t.Fatalf("nip_c's NOT NULL conislocal after INHERITS from a NO INHERIT parent = %q, want true", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT conname FROM pg_constraint WHERE contype = 'n' AND conrelid = 'nip_c'::regclass"); got == "nip_con" {
+		t.Fatalf("nip_c's NOT NULL constraint name = %q, must NOT be the parent's NO INHERIT constraint name nip_con", got)
+	}
+}

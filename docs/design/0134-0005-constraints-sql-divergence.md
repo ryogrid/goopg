@@ -2426,3 +2426,91 @@ constraint into `old_notnulls` at all, so the child inherits nothing and
 `coninhcount` stays 0. This is one bug, not the two-part entanglement §26.6
 guessed at: the `col.NotNull` clearing at `:1854-1861` is the *correct* half.
 Ledgered with this resume point; a good ~4-line follow-up slice.
+
+## 27. M0134-0005t — a `NO INHERIT` parent NOT NULL was counted toward the child's `coninhcount`
+
+Closes the deferral §26.9 opened, and with it the last of §26.6's carve-out.
+
+### 27.1 The divergence
+
+`constraints.sql`'s `CREATE TABLE ATACC3 (PRIMARY KEY (a)) INHERITS (ATACC1)`
+(diff `:290-301`), where ATACC1's own not-null is `NO INHERIT`: goopg tagged the
+child's PK-implied constraint `(local, inherited)`; PG 18.3 emits **no tag** —
+the constraint is purely local, `coninhcount = 0`.
+
+### 27.2 The PG oracle (re-verified, not inherited from §26.9's note)
+
+`MergeAttributes` never sees a `NO INHERIT` parent not-null at all. It collects
+the parent's constraints via
+
+```c
+/* tablecmds.c:2757 */
+nnconstrs = RelationGetNotNullConstraints(RelationGetRelid(relation),
+                                          true, /* include_noinh = */ false);
+```
+
+and `RelationGetNotNullConstraints` (`catalog/pg_constraint.c:834`) filters at
+the top of its scan:
+
+```c
+if (conForm->connoinherit && !include_noinh)
+    continue;
+```
+
+That single list feeds **both** consumers: `nncols` (the `attnotnull` request
+set, built at `:2759-2760`) and the `nnconstraints` list appended at
+`tablecmds.c:2952`. So a `NO INHERIT` parent constraint contributes neither an
+inherited count nor a name — it is invisible to inheritance, full stop.
+
+### 27.3 The fix
+
+Three `if …NoInherit { continue }` guards, 9 lines total, in
+`internal/executor/operators_ddl.go`:
+
+1. `execCreateTable`'s `col.Inherited && s.PartitionOf == nil` parent-scan loop
+   (`:4013`) — the one that both increments `inhCount` and may assign
+   `name = pnc.Name`. Guarding before the `EqualFold` match kills both effects at
+   once, which is why the name half needed no separate change.
+2. The sibling `!col.Inherited && s.PartitionOf == nil` loop (`:4043`) that sets
+   `inhCount = 1` for a child re-declaring the column in its own list. Same
+   oracle, same filter — Rule #2 demanded both loops move together.
+3. `unmergeNotNullOnDetach` (`:13504`), which selected parent constraints
+   *without* the `NoInherit` skip its ATTACH twin `mergeNotNullOnAttach` already
+   had. Behaviourally a no-op today (a `NO INHERIT` parent constraint was never
+   absorbed, so the `InhCount > 0` clamp already swallowed the decrement) — this
+   closes the latent Rule-#2 twin divergence ledgered under M0134-0005q rather
+   than leaving a future CHECK/multi-parent extension to make it live.
+
+`:1854-1861`'s `col.NotNull` clearing is the correct half and was **not**
+touched, per §26.9.
+
+### 27.4 Measured outcome (LANDED 2026-08-18)
+
+`constraints` regress diff **707 → 702 lines**, hunks unchanged at **31** — the
+~4-line estimate in §26.9's ledger row, met (5). The ATACC3 hunk's
+`(local, inherited)` mis-tag is gone and goopg now matches PG byte-for-byte on
+that line.
+
+Guard: `TestPort_NotNullNoInheritParentSkippedOnCreateInherits`
+(`internal/testport/notnull_inherit_counters_test.go`), asserting all three
+properties the oracle implies — `coninhcount = 0`, `conislocal = true`, and a
+name that is *not* the parent's. FAIL pre (`coninhcount = "1", want 0`) / PASS
+post, verified by stashing the executor edits in-session.
+
+Gates: `go build ./...`; `go test ./internal/{executor,catalog}/`;
+`go test -run 'TestPort_.*(NotNull|Constraint|Inherit|Partition)'
+./internal/testport/` (75.3s PASS, 12 pre-existing guards + the new one);
+`scripts/pg-regress-runner.sh constraints` (702/31);
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS
+(`internal/initdb` cold at 436s — diff cache invalidation, not a regression;
+note this scope EXCLUDES `internal/testport`); `scripts/tpch-spotcheck.sh` PASS
+(**Q12=2, Q13=35**, Rule #1); pgbench smoke via the pre-commit hook.
+
+### 27.5 Carried out of this slice (ledgered)
+
+One residual line remains in the ATACC3 hunk, **pre-existing and unchanged by
+this diff**: `\d+`'s per-column *Nullable* display shows blank where PG shows
+`not null`, for a column that is both `col.Inherited` (plain INHERITS) and
+PK-implied NOT NULL. The describe renderer evidently reads a different signal
+than `catalog.Table.Columns[i].NotNull` / the `pg_constraint` row — a separate
+bug in the describe path, not in the inheritance bookkeeping this section fixes.
