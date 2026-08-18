@@ -11403,8 +11403,38 @@ func (o *ddlOp) validateCheckConstraintRows(tbl *catalog.Table, conName, exprSQL
 // existing-row scans in this codebase (CREATE INDEX bulk build). Returns the
 // first 23503 violation found, same error shape as an ordinary INSERT FK
 // check (assertParentExists), matching real PG's ri_ReportViolation format.
+//
+// fkOwnerTbl is frequently the storage-less partitioned ROOT — ADD FOREIGN
+// KEY / VALIDATE CONSTRAINT / ALTER CONSTRAINT … ENFORCED are all invoked
+// with the ALTER TABLE target, which for a partitioned table is the root, not
+// a leaf. A root has zero physical blocks, so scanning only fkOwnerTbl would
+// silently accept a violating row that lives only in a leaf partition — the
+// same M0134-0005h gap fixed for the COMMIT-tier fullTableFKCheck. Mirror
+// that fix here: scan fkOwnerTbl itself (no-op for a storage-less root) THEN
+// every allDescendants(fkOwnerTbl) partition/inheritance descendant.
 func (o *ddlOp) validateFKConstraintExistingRows(fkOwnerTbl *catalog.Table, fk catalog.ForeignKey) error {
-	rel := o.ctx.Catalog.RelFileNode(fkOwnerTbl)
+	if err := o.validateFKConstraintExistingRowsRel(fkOwnerTbl, fkOwnerTbl, fk); err != nil {
+		return err
+	}
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		for _, child := range allDescendants(im, fkOwnerTbl, snapDetachEpoch(o.ctx)) {
+			if err := o.validateFKConstraintExistingRowsRel(fkOwnerTbl, child, fk); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// validateFKConstraintExistingRowsRel scans every live row of exactly
+// leafTbl (no descendant expansion — that is validateFKConstraintExistingRows'
+// job). Column positions are resolved from leafTbl.Columns (by name, via
+// fkColValues), never from a caller's precomputed index, so a partition
+// whose physical column order differs from the root's is still decoded
+// correctly. fkOwnerTbl is passed through to assertParentExists purely for
+// constraint-name synthesis when fk.Name is unset.
+func (o *ddlOp) validateFKConstraintExistingRowsRel(fkOwnerTbl, leafTbl *catalog.Table, fk catalog.ForeignKey) error {
+	rel := o.ctx.Catalog.RelFileNode(leafTbl)
 	nBlocks, err := o.ctx.Pool.NBlocks(rel)
 	if err != nil {
 		return &ExecError{Code: "XX000", Message: err.Error()}
@@ -11436,17 +11466,17 @@ func (o *ddlOp) validateFKConstraintExistingRows(fkOwnerTbl *catalog.Table, fk c
 			if !isLiveForUniqueCheck(o.ctx, tuple.Header.Xmin, tuple.Header.Xmax) {
 				continue
 			}
-			if scanRow == nil || len(scanRow) != len(fkOwnerTbl.Columns) {
-				scanRow = make(Row, len(fkOwnerTbl.Columns))
+			if scanRow == nil || len(scanRow) != len(leafTbl.Columns) {
+				scanRow = make(Row, len(leafTbl.Columns))
 			}
-			if decErr := DecodeHeapTupleRowInto(scanRow, fkOwnerTbl.Columns, tuple, sctx); decErr != nil {
+			if decErr := DecodeHeapTupleRowInto(scanRow, leafTbl.Columns, tuple, sctx); decErr != nil {
 				continue
 			}
-			vals, allNull := fkColValues(fkOwnerTbl.Columns, fk.Columns, scanRow)
+			vals, allNull := fkColValues(leafTbl.Columns, fk.Columns, scanRow)
 			if allNull {
 				continue
 			}
-			if perr := assertParentExists(o.ctx, fkOwnerTbl, nil, fk, vals); perr != nil {
+			if perr := assertParentExists(o.ctx, fkOwnerTbl, leafTbl, fk, vals); perr != nil {
 				o.ctx.Pool.Unpin(slot)
 				return perr
 			}

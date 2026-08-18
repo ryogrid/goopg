@@ -962,3 +962,120 @@ re-run green rather than duplicated.
   `session.go:383` / `operators_tx.go:637` accept any name silently. PG raises `42704
   constraint "%s" does not exist`, and `ERRCODE_WRONG_OBJECT_TYPE` when a non-deferrable
   constraint is named under `DEFERRED`. Ledgered; independent of this slice.
+
+## 15. M0134-0005h — FK scans over a partitioned child never reached the leaves
+
+### 15.1 The divergence
+
+Same class as §12 (0005e): a **silent wrong answer**, not a message divergence. goopg
+committed a transaction PG 18.3 rejects.
+
+```sql
+CREATE TABLE fk_parent (id int PRIMARY KEY);
+CREATE TABLE fk_child (pid int REFERENCES fk_parent(id)
+                       DEFERRABLE INITIALLY DEFERRED) PARTITION BY RANGE (pid);
+CREATE TABLE fk_child_p1 PARTITION OF fk_child FOR VALUES FROM (0) TO (100);
+BEGIN; INSERT INTO fk_child VALUES (42); COMMIT;   -- 42 is NOT in fk_parent
+```
+
+PG raises `23503` at COMMIT naming the **leaf** (`fk_child_p1`); goopg committed
+cleanly, leaving a violated FK on disk. The same shape held for the DDL tier:
+`ALTER TABLE fk_child ADD CONSTRAINT … FOREIGN KEY (pid) REFERENCES fk_parent(id)`
+over a partitioned root already holding a violating leaf row was silently **accepted**.
+
+### 15.2 Root cause — §14.6's claim, confirmed but narrowed
+
+§14.6 said the queue "resolves the FK owner by name and scans the partitioned root".
+The *observation* is right; the *sizing* was again too large. Two refinements the probe
+established before any code was written:
+
+- **What is queued is correct and must not change.** `DeferredFKCheck.ChildTableName`
+  (`internal/executor/session.go:17`) records the **root**, set at `operators_fk.go:129`
+  from `fkOwnerTbl = o.plan.Table` (`operators_storage.go:2558`). That matches how the
+  two already-correct sibling scans work. The bug is entirely at SCAN time.
+- **The recursive walk already existed and was already used twice in the same file.**
+  `allDescendants(im, tbl, snapEpoch)` (`operators_fk.go:950`) does the
+  inheritance+partition BFS with detach-pending filtering; `scanTableForMatch` (`:1000`)
+  and `scanTableForMatchFKWait` (`:1370`) both call it with `snapDetachEpoch(ctx)`.
+  Only `fullTableFKCheck` (`:465`) was written to scan the single table object handed
+  to it. A partitioned root has zero physical blocks, so its loop over `NBlocks` ran
+  zero iterations — the check "passed" by scanning nothing.
+
+This is the same lesson as §14: **probe the producer before believing a "needs new
+infrastructure" claim.** §14.6 sized this from the consumer plus the PG oracle and
+inferred missing machinery; the machinery was three functions away in the same file.
+
+### 15.3 The fix
+
+Both scans split into a per-relation helper, then loop root + `allDescendants`:
+
+- `internal/executor/operators_fk.go` — `fullTableFKCheck` → new
+  `fullTableFKCheckRel(ctx, ownerTbl, leafTbl, fk)`.
+- `internal/executor/operators_ddl.go` — `validateFKConstraintExistingRows` → new
+  `validateFKConstraintExistingRowsRel` (the Rule-#2 DDL twin, serving `ADD FOREIGN
+  KEY` / `VALIDATE CONSTRAINT` / `ALTER CONSTRAINT … ENFORCED`).
+
+The twin was **live-probed before being touched**, not assumed from code shape: it
+reproduced independently (goopg accepted the `ADD CONSTRAINT`, PG raised 23503 naming
+`fk_child_p1`). Had it not reproduced it would have been ledgered, not edited.
+
+Two details that are load-bearing:
+
+- **Per-relation column resolution.** The original body closed over `childTbl.Columns`
+  for `DecodeHeapTupleRow` and resolved FK column positions against that list. A
+  partition's column order can differ from its root's, so the helper resolves columns
+  by NAME against each scanned relation's own `Columns`/`RelFileNode`. Hoisting a
+  positional index computed once on the root would have been a fresh silent-corruption
+  bug.
+- **`assertParentExists`'s `reportTbl` now carries the scanned leaf** (it was
+  self-referential to the root). This is what makes the message name `fk_child_p1`, and
+  the leaf-naming was verified byte-for-byte against the live 18.3 oracle rather than
+  inferred from `ri_triggers.c`.
+
+Non-`*catalog.InMemory` catalogs fall back to root-only, guarded exactly as
+`scanTableForMatch` guards it — unchanged behaviour, no new failure mode.
+
+### 15.4 Why PG cannot have this bug
+
+PG recurses FK creation over partitions in
+`postgres/src/backend/commands/tablecmds.c` and installs **per-leaf RI triggers**
+(`utils/adt/ri_triggers.c`), so PG's deferred after-trigger queue naturally holds
+*leaf* entries — there is no "scan the owner" step to get wrong. goopg queues one
+root-scoped entry instead, which is a legitimate design difference, but it makes the
+leaf expansion the scan's own responsibility. Expect this shape anywhere goopg holds
+one root-scoped record where PG holds one record per leaf.
+
+### 15.5 Guards
+
+`internal/testport/partitioned_deferred_fk_test.go` — 7 `TestPort_*` tests:
+the COMMIT-tier positive guard, the DDL-twin positive guard, a **multi-level**
+partitioning case (partition of a partition — `allDescendants` is recursive and this
+proves it, `fk_child_p1_p1`), a satisfied-FK negative guard (partitioned + deferred
+must still commit cleanly), and the non-partitioned deferred control (must not
+regress). The three positive guards are FAIL-pre/PASS-post, proven by stashing only
+the two production files: each failed with `expected 23503 … got <nil>` — i.e. the
+pre-fix behaviour was a *silent success*, which is exactly why a one-directional
+message-diff guard would not have caught it.
+
+### 15.6 Measurement — and why it is zero
+
+`constraints` regress diff: **1164 lines / 33 hunks, UNCHANGED** from 0005g. That is
+the honest result and it is expected: this bug was found by the 0005g *probe*, not by
+the `constraints` case, which never exercises a partitioned deferred FK. The slice's
+value is the closed integrity gap, not a line delta. Recording it as a diff win would
+have been false attribution — the same error §14 already made once in the other
+direction. The remaining 33 hunks are NOT-NULL-constraint inheritance-validate and
+`COMMENT ON CONSTRAINT` gaps.
+
+### 15.7 Deliberately not absorbed
+
+- **No per-partition `pg_constraint` FK clone row.** PG has one row per leaf reusing
+  the parent's `conname`; goopg still has only the root's. Needed for introspection /
+  `pg_dump` parity, **not** for enforcement (which §15.3 now handles). Separable and
+  larger — ledgered.
+- **`fkCascadeDelete` walks `im.PartitionChildren` one level only** where
+  `allDescendants` recurses, so `ON DELETE CASCADE` under multi-level partitioning
+  misses grandchildren. Same fix idiom, different function; ledgered.
+- **`cloneAndValidateAttachPartitionFKs` was probed and found NOT affected** — it
+  always passes the real leaf as both scan target and storage owner. Recorded so a
+  later loop does not re-probe it.
