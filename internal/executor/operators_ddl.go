@@ -3584,6 +3584,12 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// Named UNIQUE/PRIMARY KEY/EXCLUDE constraints with optional INCLUDE columns. M0097-0023.
 	// These override the generic PK/UNIQUE index name with the constraint name.
 	namedPKCreated := false
+	// notNullHeapDirty tracks whether any block below flips col.NotNull /
+	// calls tbl.AddNotNull AFTER the single early syncTableToCatalogHeap call
+	// above — pg_attribute is heap-backed (goopg_pg_class_virtual_pg_attribute_heap),
+	// so those in-memory mutations are invisible to \d+/pg_dump until a
+	// second sync runs. M0134-0005y.
+	notNullHeapDirty := false
 	for _, nc := range s.NamedConstraints {
 		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: nc.Name}
 		if nc.IsExclusion {
@@ -3637,6 +3643,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			for _, pkCol := range nc.Columns {
 				if col, ok := o.ctx.Catalog.LookupColumn(tbl, pkCol); ok {
 					col.NotNull = true
+					notNullHeapDirty = true
 				}
 			}
 		}
@@ -3699,6 +3706,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		for _, pkCol := range pkCols {
 			if col, ok := o.ctx.Catalog.LookupColumn(tbl, pkCol); ok {
 				col.NotNull = true
+				notNullHeapDirty = true
 			}
 		}
 	}
@@ -3954,6 +3962,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		for _, colName := range s.TableNotNullCols {
 			if col, ok2 := o.ctx.Catalog.LookupColumn(tbl, colName); ok2 {
 				col.NotNull = true
+				notNullHeapDirty = true
 			}
 		}
 		// PG18 records a contype='n' NOT NULL constraint for EVERY not-null
@@ -4082,6 +4091,11 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				noInherit = mergedNoInherit
 			}
 			tbl.AddNotNull(name, col.Name, im.AllocOID(), noInherit, false, isLocal, inhCount)
+			// AddNotNull runs after the single early syncTableToCatalogHeap
+			// call above; this covers PK-implied NOT NULL absorbed via
+			// INHERITS/LIKE as well as any not-null column not yet flagged
+			// dirty above. M0134-0005y.
+			notNullHeapDirty = true
 		}
 	}
 	// Copy pg_description comments from LIKE INCLUDING COMMENTS sources:
@@ -4155,6 +4169,31 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 					}
 				}
 			}
+		}
+	}
+	// pg_attribute/pg_class are heap-backed, not virtual — the named/anonymous
+	// PRIMARY KEY blocks above and the INHERITS/LIKE NOT-NULL merge all run
+	// AFTER the single early syncTableToCatalogHeap call near the top of this
+	// function, so their col.NotNull/AddNotNull mutations never reached the
+	// heap row that sync wrote. Re-sync now, same delete-old-then-resync
+	// pattern as finishPrimaryKeyConstraint (M0134-0005o/-0005x), but only
+	// when a downstream arm actually flipped NOT-NULL state — a table with
+	// no PK/NOT NULL columns must not pay for (or duplicate) a resync.
+	// execCreatePartitionChild applies its NOT NULL overrides BEFORE its own
+	// syncTableToCatalogHeap call instead; CREATE TABLE can't do the same
+	// because the constraint-processing blocks above depend on catalog state
+	// (namedPKCreated, index lookups, inherited-parent columns) that isn't
+	// available until after the table/columns are fully constructed and the
+	// initial sync has already run. M0134-0005y.
+	if notNullHeapDirty && catalogHeapSyncAvailable(o.ctx) {
+		if err := o.ctx.MaterializeWriterXID(); err == nil {
+			xmax := o.ctx.Tx.XID
+			for _, dbOid := range tableCatalogDBOids(o.ctx) {
+				deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+			}
+		}
+		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+			return fmt.Errorf("DDL catalog sync: %w", syncErr)
 		}
 	}
 	return nil

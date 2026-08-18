@@ -2825,3 +2825,83 @@ faster than carried line counts.
 - `adoptExistingIndexAsConstraint` omits PG's "cannot use a deferrable index"
   rejection (`parse_utilcmd.c:2486-2492`): unreachable in goopg's model because
   the already-associated-with-a-constraint check fires first. Documented in-code.
+
+## 32. M0134-0005y — `CREATE TABLE` never re-synced the catalog heap after its constraint arms flipped NOT NULL (LANDED 2026-08-19)
+
+### Symptom
+
+`constraints.sql` fixture (`postgres/src/test/regress/sql/constraints.sql:744-748`):
+
+```sql
+CREATE TABLE cnn_pk (a int, b int, CONSTRAINT cnn_primarykey PRIMARY KEY (b));
+CREATE TABLE cnn_pk_child () INHERITS (cnn_pk);
+```
+
+`\d+ cnn_pk` printed `b | integer | | |` where PG prints
+`b | integer | | not null |` — for both the parent and the inherited child —
+even though the `Not-null constraints:` footer of the same `\d+` output was
+byte-identical to PG's. Two hunks of the `constraints.sql` diff.
+
+### Root cause
+
+`execCreateTable` (`internal/executor/operators_ddl.go`) calls
+`syncTableToCatalogHeap` **exactly once**, immediately after `CreateTable` /
+`DDLUndoEntry` recording — and *before* every constraint-processing arm. Four
+later blocks mutate NOT-NULL state and none of them reached the heap:
+
+1. named table-level `CONSTRAINT … PRIMARY KEY (cols)` (`col.NotNull = true`)
+2. anonymous table-level / `LIKE … INCLUDING`-folded PK, shared `pkCols` block
+3. `s.TableNotNullCols` table-level NOT NULL merge
+4. the INHERITS / `LIKE` NOT-NULL merge (`tbl.AddNotNull`) — this is why the
+   inherited child was wrong too
+
+pg_class is a virtual catalog but **pg_attribute is heap-backed**, and `\d+` /
+pg_dump read the heap. An in-memory `col.NotNull` flip after the sync is
+therefore invisible to them, while the footer — which renders from the live
+`catalog.Table` — stays correct. That asymmetry is the whole bug, and it is the
+same class M0134-0005o (§22) fixed on the `ALTER TABLE ADD CONSTRAINT` path but
+never applied to CREATE TABLE's own arm.
+
+PG has no equivalent staging problem: `heap_create_with_catalog`
+(`postgres/src/backend/catalog/heap.c`) writes pg_attribute from a tuple
+descriptor whose `attnotnull` bits are already final, so PG writes once.
+
+### Fix
+
+A `notNullHeapDirty bool` local, set at all four mutation sites (Rule #2 — a
+green test on one arm proves nothing about the other three), and a
+delete-old-then-resync at the end of `execCreateTable`, gated on
+`notNullHeapDirty && catalogHeapSyncAvailable(o.ctx)`:
+
+```
+MaterializeWriterXID → deleteCatalogRowsForOID (per DB, via tableCatalogDBOids)
+                     → syncTableToCatalogHeap
+```
+
+The **delete step is mandatory**, not defensive: `syncTableToCatalogHeap` is
+append-only (`writeHeapRowCanonical`), so a bare second sync would leave
+duplicate *live* pg_class/pg_attribute rows — a silent corruption that only
+surfaces later as doubled columns in `\d`/pg_dump. Guard tests assert each
+column appears exactly once on both the dirty and the clean path.
+
+The early sync is **not** moved: the constraint arms depend on catalog state
+(`namedPKCreated`, index lookups, inherited-parent columns) that does not exist
+at that point. `execCreatePartitionChild` applies its NOT NULL overrides
+*before* its own sync and needs no resync — the correct pattern where the
+ordering allows it; the in-code comment cites it for contrast.
+
+### Not a bug (checked)
+
+Inline **column-level** `b int PRIMARY KEY` does *not* reproduce: the parser
+(`internal/parser/ddl.go`) sets `col.NotNull = true` on the `ColumnDef` at parse
+time for both the bare and the named-constraint inline spellings, so it is
+already true before the early sync. The genuine twin of the named table-level
+form is the **anonymous** table-level `PRIMARY KEY (b)`, which is what the guard
+test covers.
+
+### Result
+
+`scripts/pg-regress-runner.sh constraints`: **555 lines / 26 hunks → 516 lines /
+23 hunks**. Five guard tests in `internal/testport/create_table_pk_notnull_test.go`
+(named PK, INHERITS child, anonymous table-level PK, no-duplicate-rows on the
+dirty path, no-duplicate-rows on the clean path), all FAIL-pre / PASS-post.
