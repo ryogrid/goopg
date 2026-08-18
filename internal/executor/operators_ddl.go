@@ -8093,7 +8093,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				return err
 			}
 		case parser.AlterTableAddPrimaryKey:
-			if err := o.execAlterTableAddPrimaryKey(tbl, act); err != nil {
+			if err := o.execAlterTableAddPrimaryKey(tbl, act, s.Only); err != nil {
 				return err
 			}
 		case parser.AlterTableAddUnique:
@@ -10805,7 +10805,7 @@ func stringConstAsType(s string, t catalog.Type) (Datum, bool) {
 	return Datum{}, false
 }
 
-func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.AlterTableAction) error {
+func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.AlterTableAction, only bool) error {
 	if o.ctx.Pool == nil {
 		return &ExecError{Code: "XX000", Pos: act.Pos(), Message: "ALTER TABLE ADD PRIMARY KEY requires Pool in Context"}
 	}
@@ -10829,6 +10829,43 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 	}
 	if o.ctx.Catalog.HasPrimaryKey(tbl) {
 		return &ExecError{Code: "42P16", Pos: act.Pos(), Message: fmt.Sprintf("multiple primary keys for table %q are not allowed", tbl.QualifiedName())}
+	}
+	// PG's ATPrepAddPrimaryKey (tablecmds.c:9512-9531) checks each PK column's
+	// existing NOT NULL constraint, if any, for PK-compatibility BEFORE the
+	// index is built (verifyNotNullPKCompatible, tablecmds.c:9577-9608): a
+	// NO INHERIT or NOT VALID NOT NULL is incompatible with a primary key.
+	// Both arms are 55000 ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE, no
+	// errposition() — Pos stays 0. M0134-0005v.
+	for _, pkCol := range act.Columns {
+		col, ok := o.ctx.Catalog.LookupColumn(tbl, pkCol)
+		if !ok {
+			continue
+		}
+		ownFound := false
+		for i := range tbl.NotNullConstraints {
+			nc := &tbl.NotNullConstraints[i]
+			if !strings.EqualFold(nc.ColName, col.Name) {
+				continue
+			}
+			ownFound = true
+			if ee := verifyNotNullPKCompatible(nc, col.Name, tbl.Name); ee != nil {
+				return ee
+			}
+			break
+		}
+		// PG only reaches this branch (tablecmds.c:9532-9557) when the
+		// parent has no matching NOT NULL of its own AND was asked not to
+		// recurse (ALTER TABLE ONLY): it then verifies every direct
+		// inheritance/partition child carries a compatible NOT NULL, instead
+		// of synthesizing one on the parent. With `only` false (the
+		// default), PG instead queues a new NOT NULL that cascades to
+		// children — already handled below by cascadeNotNullToChildren, so
+		// no child check applies in that case. M0134-0005v.
+		if !ownFound && only {
+			if childErr := o.verifyNotNullPKCompatibleChildren(tbl, col.Name); childErr != nil {
+				return childErr
+			}
+		}
 	}
 	name := act.ConstraintName
 	if name == "" {
@@ -10924,6 +10961,74 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 		}
 		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
 			return fmt.Errorf("DDL catalog sync: %w", syncErr)
+		}
+	}
+	return nil
+}
+
+// verifyNotNullPKCompatible mirrors PG's verifyNotNullPKCompatible
+// (postgres/src/backend/commands/tablecmds.c:9577-9608): a NO INHERIT or
+// NOT VALID NOT NULL constraint cannot back a primary key. Both arms are
+// 55000 ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE with no errposition().
+// relName is the table the constraint lives on — the PK-adding table for an
+// own constraint, or a child's name when called from
+// verifyNotNullPKCompatibleChildren. M0134-0005v.
+func verifyNotNullPKCompatible(nc *catalog.NamedNotNullConstraint, colName, relName string) *ExecError {
+	if nc.NoInherit {
+		return &ExecError{Code: "55000", Pos: 0,
+			Message: fmt.Sprintf("cannot create primary key on column %q", colName),
+			Detail: fmt.Sprintf("The constraint %q on column %q of table %q, marked %s, is incompatible with a primary key.",
+				nc.Name, colName, relName, "NO INHERIT"),
+			Hint: "You might need to make the existing constraint inheritable using ALTER TABLE ... ALTER CONSTRAINT ... INHERIT."}
+	}
+	if nc.NotValid {
+		return &ExecError{Code: "55000", Pos: 0,
+			Message: fmt.Sprintf("cannot create primary key on column %q", colName),
+			Detail: fmt.Sprintf("The constraint %q on column %q of table %q, marked %s, is incompatible with a primary key.",
+				nc.Name, colName, relName, "NOT VALID"),
+			Hint: "You might need to validate it using ALTER TABLE ... VALIDATE CONSTRAINT."}
+	}
+	return nil
+}
+
+// verifyNotNullPKCompatibleChildren mirrors the `!recurse` arm of PG's
+// ATPrepAddPrimaryKey (tablecmds.c:9532-9557, reached by
+// `ALTER TABLE ONLY parent ADD PRIMARY KEY (col)` when the parent itself has
+// no matching NOT NULL): every direct inheritance/partition child's NOT
+// NULL constraint on colName must independently pass
+// verifyNotNullPKCompatible. A child with no such constraint at all is a
+// different PG error ("column ... is not marked NOT NULL",
+// tablecmds.c:9552-9554) that no fixture in this slice's scope reaches —
+// left unhandled here, matching the design-doc scope boundary
+// (M0134-0005v §29.3). M0134-0005v.
+func (o *ddlOp) verifyNotNullPKCompatibleChildren(tbl *catalog.Table, colName string) *ExecError {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	children := append([]*catalog.Table(nil), im.InheritanceChildren(tbl.OID)...)
+	for _, pc := range im.PartitionChildren(tbl.OID) {
+		dup := false
+		for _, c := range children {
+			if c.OID == pc.OID {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			children = append(children, pc)
+		}
+	}
+	for _, child := range children {
+		for i := range child.NotNullConstraints {
+			nc := &child.NotNullConstraints[i]
+			if !strings.EqualFold(nc.ColName, colName) {
+				continue
+			}
+			if ee := verifyNotNullPKCompatible(nc, colName, child.Name); ee != nil {
+				return ee
+			}
+			break
 		}
 	}
 	return nil

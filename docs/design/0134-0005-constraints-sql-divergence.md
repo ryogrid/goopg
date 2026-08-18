@@ -2595,3 +2595,95 @@ magnitude, and re-measure.
 - The 15 lock-acquire `ee.Pos` sites — PG-faithful to remove, zero payoff here,
   unverified against the isolation specs.
 - The FK phase-3 site (`:11600`) — same bug, `foreign_key.sql` scope.
+
+## 29. M0134-0005v — `ADD PRIMARY KEY` never verified the pre-existing NOT NULL is VALID and inheritable
+
+### 29.1 Selection — the reachability pass overturned the carried ranking
+
+The §28 baton ranked three candidates. A fixture-reachability pass at HEAD
+`fa84e214` (baseline **672 lines / 30 hunks**) retired the top two outright:
+
+- **`ATExecValidateConstraint` descendant recursion** (`postgres/src/backend/commands/tablecmds.c:13219-13300`,
+  `QueueNNConstraintValidation`) — every `VALIDATE CONSTRAINT` in the fixture
+  (`constraints.sql:864,866,904,934,947`) targets a table with **zero descendants
+  at that moment**. The apparent counter-example at `:904` inverts: the preceding
+  `ALTER TABLE notnull_tbl1 INHERIT notnull_chld0` (`:901`) makes `notnull_chld0`
+  the *parent*. Payoff **0**.
+- **The CHECK half of `MergeConstraintsIntoExisting`** (`tablecmds.c:17638-17817`,
+  reached only from `ATAddInherit`) — all five `ALTER TABLE … INHERIT` sites
+  (`:710,855,857,897,901`) carry NOT NULL constraints only; no shared-name CHECK
+  scenario exists in the fixture. Payoff **0**.
+- **`DROP CONSTRAINT … ONLY` child `InhCount`/`IsLocal`** — reachable
+  (`constraints.sql:803-806`, `notnull_tbl5_child`) but owns exactly **4 lines in
+  1 hunk**.
+
+This is the second consecutive loop in which the reachability pass, not the site
+census, decided the slice — see §28.2. **A carried ranking is a hypothesis, not a
+queue.** Re-measure it against the current diff before briefing.
+
+### 29.2 The divergence
+
+PG's `verifyNotNullPKCompatible` (`tablecmds.c:9577-9608`) rejects an
+`ADD PRIMARY KEY` whose column is already covered by a NOT NULL constraint that is
+either `NO INHERIT` or not validated — such a constraint cannot back a primary
+key. Both arms raise `55000` (`ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE`)
+`cannot create primary key on column "%s"`, differing only in the DETAIL's marking
+and the HINT (`… ALTER CONSTRAINT … INHERIT` vs `… VALIDATE CONSTRAINT`). Neither
+`ereport` carries an `errposition`, so goopg must leave `Pos` at 0 (the §28 rule).
+It is called from `ATPrepAddPrimaryKey`'s not-recurse loop (`:9556`), which walks
+children as well.
+
+goopg's `execAlterTableAddPrimaryKey` (`internal/executor/operators_ddl.go:10876-10913`)
+tests only `alreadyHadNotNull := col.NotNull` and, when true, `continue`s at
+`:10890` — it never inspects the matching `NotNullConstraints` entry's
+`NoInherit`/`NotValid` flags. Three fixture sites hit this today:
+`constraints.sql:834-835` (`notnull_tbl1`, `nn` is `NOT VALID`), `:954-955`
+(`pp_nn_1` `NOT VALID` via `ALTER TABLE ONLY pp_nn ADD PRIMARY KEY`), and
+`:960-961` (same shape, `NO INHERIT`) — together **~10 diff lines across 2 of the
+30 hunks**, 2.5x the retired candidate 3.
+
+### 29.3 Scope boundary
+
+`constraints.sql:838` — `ADD GENERATED ALWAYS AS IDENTITY` over an invalid NOT
+NULL — looks adjacent but is a **different** PG check (`incompatible NOT VALID
+constraint`, `tablecmds.c:8311`, inside `ATExecSetNotNull`'s identity path), worth
+~2 more diff lines. Deliberately out of scope; ledgered, not conflated.
+
+### 29.4 Implementation and measured result
+
+Two helpers in `internal/executor/operators_ddl.go`, plus an `only bool` threaded
+into `execAlterTableAddPrimaryKey` from its single call site (`:8096` — the
+call-site sweep found exactly one caller, so §29.2's "second caller" risk did not
+materialise):
+
+- `verifyNotNullPKCompatible(nc, colName, relName)` — the direct port, both arms
+  `Pos: 0`.
+- `verifyNotNullPKCompatibleChildren` — the `ALTER TABLE ONLY` arm, mirroring PG's
+  `!recurse` branch (`tablecmds.c:9532-9557`). It gathers direct
+  `InheritanceChildren` + `PartitionChildren` deduped (the `cascadeNotNullToChildrenAt`
+  pattern) and names the **child** in the DETAIL, matching the oracle's expected
+  output (`pp_nn_1`, not the parent `pp_nn`).
+
+The check block sits after the `42P16` multiple-PK guard and before
+`createBTreeIndex`/the null scan — PG's `ATPrepAddPrimaryKey`-before-`ATExecAddIndex`
+ordering, the same ordering trap §21 hit.
+
+**Measured: 672 → 647 lines / 30 hunks** (predicted ~662). The over-delivery is
+the `ONLY` branch: §29.2 named three fixture sites and two of them
+(`constraints.sql:954-955`, `:960-961`) require the children walk, so the narrow
+own-column-only reading of the slice would have closed one site out of three.
+**Where the brief's file/line pointer and the design section's fixture list
+disagree, the fixture list is the real scope** — the pointer is a starting
+address, not a boundary. Hunk count held at 30, as neither hunk fully empties.
+Verified non-vacuous: the surviving `cannot create primary key on column` lines in
+the diff are context-only (no `-` prefix), and a before/after content comparison
+(ignoring `@@` churn) shows only the three named sites changed — no new divergence.
+
+### 29.5 Carried out of this slice (ledgered)
+
+- PG's other `!recurse` error — a child with **no** NOT NULL at all
+  (`tablecmds.c:9552-9554`); no fixture reaches it.
+- The identity-column `NOT VALID` check (§29.3).
+- A latent `execAlterTableDropConstraint` cascade gap: it appears to walk only
+  `PartitionChildren`, not plain-`INHERITS` children — masked today because the
+  one plain-INHERITS fixture case also uses `ONLY`.
