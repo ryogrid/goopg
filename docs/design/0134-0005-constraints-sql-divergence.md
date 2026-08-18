@@ -1560,3 +1560,91 @@ and are the natural next Rule-#2 sweep. The confirmed one is
 constraint. Flagged but uninvestigated: `applyworker.go`, `operators_merge.go`,
 `operators_storage.go` (partition/UPDATE paths), `operators_ddl.go`,
 `operators_upsert.go`. Ledgered 2026-08-18.
+
+## 20. M0134-0005m — `INSERT … SELECT` loses omitted columns' DEFAULT expressions
+
+### 20.1 Symptom
+
+`tmp/regress-diffs/constraints.diff:110-166`, three hunks (the third being pure
+downstream corruption of the second). Fixture
+`postgres/src/test/regress/sql/constraints.sql:103-129`:
+
+```sql
+CREATE TABLE INSERT_TBL (x INT  DEFAULT nextval('insert_seq'),
+                         y TEXT DEFAULT '-NULL-',
+                         z INT  DEFAULT -1 * currval('insert_seq'), …);
+…
+INSERT INTO INSERT_TBL(y) SELECT yd FROM tmp;
+```
+
+PG fills `z` per row (`-4, -5, -6`); goopg leaves it NULL. Note `x` **is**
+filled — the sequence path covers it — so the gap is specific to general
+DEFAULT *expressions* under the `INSERT … SELECT` shape. The `INSERT INTO
+INSERT_TBL SELECT * FROM tmp` (no column list, SELECT narrower than the table)
+form at `constraints.sql:~119` has the same hole.
+
+### 20.2 Root cause — *not* "DEFAULT is never attempted"
+
+The obvious reading (`rewriteInsertDefaultMarkers` bails at
+`internal/optimizer/planner.go:9877` on `s.Select != nil`, so nothing happens)
+is only half the story, and the wrong half to fix blindly. Two things compose:
+
+1. `planInsert`'s SELECT branch (`internal/optimizer/planner.go:10145-10181`)
+   never applies the M0134-0005j column-list extension (`:9916-9945`), so an
+   omitted DEFAULT column is simply absent from `Insert.ColumnIndex`.
+2. The executor (`internal/executor/operators_storage.go:2405-2440`) derives
+   `insertMissing` purely from "ordinal not in `ColumnIndex`", so it **does**
+   route `z` to `applyDefaultsForMissing`
+   (`internal/executor/operators_generated.go:63`) — but that path uses the
+   hand-rolled `evalGenExpr`/`evalGenFuncCall`
+   (`operators_generated.go:101-230`), which has **no `currval` case** and
+   silently returns `NullDatum, nil`.
+
+So the DEFAULT *is* attempted, through a deliberately lightweight evaluator that
+cannot express it. That is the same evaluator gap M0134-0005j documented and
+worked around for the VALUES shape (`internal/executor/default_omitted_column_test.go:37-45`).
+
+### 20.3 Decision
+
+Fix **in the planner, in `planInsert`'s SELECT branch**, by routing the DEFAULT
+through the *full* expression evaluator rather than by widening the lightweight
+one:
+
+- Wrap the planned SELECT (`sel`) in an `optimizer.Project`
+  (`internal/optimizer/plan.go:1287-1307`) that passes the SELECT's own output
+  columns through (`ColumnRef`, `plan.go:429-435`) and **appends one resolved
+  DEFAULT expression per omitted column**, resolved with the same
+  `resolveExpr` call the branch already uses at `:10198-10206`.
+- Extend `colIndex` in lockstep so `Insert.ColumnIndex` covers the appended
+  columns. The executor then sees them as ordinary supplied values and needs
+  **zero change** — `insertMissing` is already generic over `ColumnIndex` width.
+- Factor the M0134-0005j eligibility predicate (`DefaultExpr != nil &&
+  !GeneratedAlways`) into one shared helper used by both the VALUES
+  marker-substitution path and the new SELECT Project-append path. This is a
+  Rule-#2 twin pair; a private copy in each would drift. The predicate is what
+  keeps serial/identity columns out (their `DefaultExpr` is nil by convention),
+  avoiding a double sequence advance — see §17.3 decision 3.
+- Apply the same treatment to the **no-column-list** SELECT case
+  (`:10179-10181`), where the SELECT is narrower than the table.
+
+Rejected: lifting the `s.Select != nil` guard at `:9877` so the marker rewriter
+runs for SELECT too. `rewriteInsertDefaultMarkers` operates on `s.Rows` cells;
+there are no cells in the SELECT shape, so the guard is structurally correct
+and removing it buys nothing. Also rejected: teaching `evalGenFuncCall` about
+`currval` — that evaluator is shared with the apply worker (see its doc
+comment) and widening it is a larger, riskier surface than the planner fix.
+
+### 20.4 PG oracle
+
+`postgres/src/backend/rewrite/rewriteHandler.c:rewriteTargetListIU` (~:775),
+called from `RewriteQuery` (~:4046-4070). PG runs **one** INSERT rewrite path
+regardless of source shape; the only branch there is a VALUES-RTE
+*optimization*, not a semantic fork. Omitted columns' defaults are appended as
+ordinary extra targetlist entries and evaluated normally — which is exactly
+what the Project-wrap reproduces.
+
+### 20.5 Out of scope (ledger candidates)
+
+`COPY FROM` and the upsert insert branch reach the same currval-blind
+`applyDefaultsForMissing` in principle. Neither is exercised by this fixture;
+recorded as a follow-up rather than widened into this slice.
