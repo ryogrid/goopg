@@ -1308,3 +1308,151 @@ PG returns 8. Routing through the planner fixes this for free — no separate ch
   bugs: inherited-CHECK naming/enforcement on `INSERT_CHILD` (~19 lines), `tableoid`
   inside a CHECK (~15 lines), and missing DDL-time rejection of `ctid` in a CHECK
   (~5 lines). Deliberately not conflated.
+
+## 18. M0134-0005k — NOT NULL constraint-name / NO INHERIT conflict validation is absent
+
+### 18.1 Why this slice, and how it was chosen
+
+Chosen from a **fresh measured bucket census** at HEAD `442863f6` (probe
+`tmp/ralph-handoffs/m0134-0005k-census`), regenerated with:
+
+```
+GOOPG_CG_UNIT=m0134census scripts/pg-regress-runner.sh --verbose constraints
+```
+
+New baseline: **1024 lines / 31 hunks** (down from the §16.1 1164/33; **never
+compare to a pre-2026-08-18 number**). Re-ranked buckets:
+
+| # | bucket | ≈lines | class |
+|---|---|---|---|
+| 1 | **NOT NULL constraint-name / NO INHERIT conflict validation entirely absent** — PG rejects 14 `notnull_tbl_fail` shapes; goopg accepts every one, then cascades into `relation already exists` + phantom columns for the rest of the script | **~500 (≈49%)** | **silent wrong answer** |
+| 2 | `INSERT … SELECT` with an explicit column list drops the DEFAULT (`s.Select != nil` early return in `rewriteInsertDefaultMarkers`) | ~55 | **silent wrong answer** (ledgered §17.3) |
+| 3 | `COPY` with a partial column list drops every DEFAULT and skips CHECK (`copy.go:323`) | ~20 | **silent wrong answer** (ledgered §17.4) |
+| 4 | GiST `circle` default opclass missing | ~65 | pre-existing |
+| 5 | `DEFAULT 1 IN (1,2)` a_expr/b_expr grammar gap | ~15 | grammar |
+| 6 | `tableoid`/`ctid` inside a CHECK | ~15 | silent wrong answer |
+| 7 | `pp_nn` `NOT NULL a` + `PARTITION BY` parser ordering | ~10 | parser |
+| 8 | missing `pg_get_partition_constraintdef` builtin | ~15 | clean error |
+| 9 | misc cosmetic (SET CONSTRAINTS/COMMIT ordering, FK-naming suffix, ON CONFLICT wording) | ~25 | message |
+
+Bucket 1 is both the largest bucket *and* a silent-accept integrity gap, so it is
+this slice. Buckets 2 and 3 stay ledgered; the `applyworker.go:286` mini-evaluator
+gap (§17.3) is **confirmed absent from this diff** — `constraints.sql` never drives
+the logical-replication apply path, so it needs the pgoutput harness, not a psql
+snippet, and remains ledgered.
+
+### 18.2 The four PG error conditions (oracle)
+
+All 14 failing shapes reduce to three distinct messages plus a partitioned-table
+variant. Verbatim from `postgres/src/test/regress/expected/constraints.out`:
+
+| # | message | errcode | PG site |
+|---|---|---|---|
+| E1 | `conflicting not-null constraint names "%s" and "%s"` | (elog / 42601) | `parse_utilcmd.c:802` (column-level, `elog`), `heap.c:2982` (table-level, `ERRCODE_SYNTAX_ERROR`) |
+| E2 | `conflicting NO INHERIT declarations for not-null constraints on column "%s"` (**plural**) | 42601 | `parse_utilcmd.c:773` and `:808` — column-level only |
+| E3 | `conflicting NO INHERIT declaration for not-null constraint on column "%s"` (**singular**) | 42601 | `heap.c:2968` — table-level merge only |
+| E4 | `not-null constraints on partitioned tables cannot be NO INHERIT` | 0A000 | `parse_utilcmd.c:759` (column-level), `:1077` (table-level) |
+
+The singular/plural split is **not** cosmetic: it is how PG distinguishes the
+column-constraint path (`transformColumnDefinition`) from the table-constraint
+merge (`AddRelationNotNullConstraints`). Both spellings appear in the expected
+output, so goopg must reproduce both, from the corresponding path.
+
+### 18.3 The two PG algorithms to mirror
+
+**(A) Column-level — `parse_utilcmd.c:transformColumnDefinition`.** A pre-scan
+sets `disallow_noinherit_notnull` when the column also carries `PRIMARY KEY` or
+`IDENTITY` (`CONSTR_PRIMARY` / `CONSTR_IDENTITY`). Then, per `CONSTR_NOTNULL`
+constraint on the column, in order:
+1. partitioned && `is_no_inherit` → **E4**;
+2. `disallow_noinherit_notnull && is_no_inherit` → **E2** (this is what rejects
+   `a int primary key constraint foo not null no inherit` and
+   `a int not null no inherit primary key` — order-independent, because the
+   pre-scan runs first);
+3. first NOT NULL on the column becomes `notnull_constraint`; each **subsequent**
+   one is compared against it — differing non-empty names → **E1**; differing
+   `is_no_inherit` → **E2**; an unnamed first constraint **adopts** the later name.
+
+**(B) Table-level merge — `heap.c:AddRelationNotNullConstraints`.** Over the list
+of table-constraint NOT NULLs (which already includes the column-level ones
+promoted by (A), and any copied in by `LIKE`), for each entry scan the remainder:
+same column ⇒
+1. differing `is_no_inherit` → **E3**;
+2. `other` named and `constr` unnamed → adopt; both named and different → **E1**;
+3. duplicate is deleted from the list (a column gets exactly ONE not-null row).
+
+Order matters: (A) runs first and raises the *plural* E2, (B) second and raises
+the *singular* E3. `a int primary key, not null a no inherit` therefore yields E3
+(the PK's implicit NN and the table-level NN merge), while
+`a int primary key constraint foo not null no inherit` yields E2 (both on the
+column).
+
+### 18.4 goopg state before the slice
+
+- **The catalog model is already sufficient.** `catalog.NamedNotNullConstraint`
+  (`internal/catalog/catalog.go:240`) carries `Name`, `ColName`, `OID`,
+  `NoInherit`, `NotValid`, and `Table.AddNotNull` (`:254`) threads all of them.
+  **No model extension is needed** — this is the sixth "unwired, not missing"
+  finding in this milestone.
+- **Column-level parsing is present**: `parser.ColumnDef.NotNullNoInherit`
+  (`ast.go:1248`) and `NotNullConstraintName` (`:1255`).
+- **Table-level parsing is MISSING**: there is no CREATE TABLE AST field for
+  `[CONSTRAINT name] NOT NULL col [NO INHERIT]` as a *table* constraint (the form
+  exists only for `ALTER TABLE … ADD`, `AlterTableAddNotNull`, `ast.go:3054`).
+  Adding it is a prerequisite for 5 of the 14 shapes and for bucket 7.
+- **No validation exists anywhere**: none of E1–E4 appears in `internal/`
+  (grep-confirmed). `Table.AddNotNull` appends unconditionally.
+
+### 18.5 Slice boundary
+
+In scope: the parser's table-level NOT NULL constraint form, algorithms (A) and
+(B) above, and E1–E4 — enough to make all 14 `notnull_tbl_fail` statements fail
+with PG's exact message, which also stops the downstream catalog corruption
+(`relation already exists`, phantom columns) that inflates this bucket.
+
+Out of scope (ledger, not this slice): the inherited-parent branch of
+`AddRelationNotNullConstraints` (`coninhcount`/`conislocal` accounting and the
+"a parent already has one, so refuse NO INHERIT" rule), `ALTER TABLE … INHERIT`
+not-null satisfaction, and ATTACH/DETACH `convalidated` accounting (already
+ledgered under M0134-0005i).
+
+### 18.6 Outcome (LANDED 2026-08-18)
+
+`constraints` regress diff **1024 → 933 lines** (−91) at unchanged 31 hunks; the
+`notnull_tbl_fail` block and the two `NOT NULL NO INHERIT` acceptance blocks are
+now diff-free. **14/14** shapes match PG byte-for-byte, including the LIKE case
+that §18.5 allowed to be left failing — goopg's LIKE path does copy the constraint
+name, so no exception was needed.
+
+Landed:
+- **Parser** (`internal/parser/ast.go`, `ddl.go`): `ColumnDef.NotNullExplicit` plus
+  the parallel table-constraint slices `CreateTableStmt.TableNotNullNames` /
+  `TableNotNullCols` / `TableNotNullNoInherit` (mirroring the existing
+  `TableChecks`/`TableCheckNoInherit` style). `parseTableConstraintElement` gained
+  the `CONSTRAINT name NOT NULL col [NO INHERIT]` case — **previously parsed and
+  then silently dropped**. `parseColumnConstraintList` now accumulates all
+  occurrences on a column and defers to a new `resolveColumnNotNull`, which is
+  algorithm (A) of §18.3 including the PRIMARY KEY / IDENTITY pre-scan.
+- **Executor** (`internal/executor/operators_ddl.go`): new
+  `mergeNotNullEntries`/`nnEntry` implement algorithm (B); `execCreateTable`'s
+  not-null loop was rebuilt around per-column entry lists and a new E4 pre-check.
+
+Three pre-existing bugs were **exposed** by the new coverage and had to be fixed
+for the shapes to fail *correctly* rather than differently-wrong:
+1. the partitioned-table NO-INHERIT guard mis-attributed a `NOT NULL NO INHERIT`
+   to the CHECK-only `42P16` message;
+2. a `colByName`/BodyOrder shadowing bug;
+3. the INHERITS column-copy path propagated NOT NULL to children **unconditionally,
+   ignoring the parent's NO INHERIT flag** — acceptance criterion 2 (the `ATACC1`/
+   `ATACC2` block) could not pass without it.
+
+Confirmed by measurement, not assumption: the catalog model needed no extension
+(§18.4), and the round-1 census's `:10523` "ADD COLUMN twin" citation was wrong —
+that line is `execAlterTableAddPrimaryKey`. The real `execAlterTableAddColumn`
+(`:10145`) turned out to have a *larger* gap (it registers no `pg_constraint` row
+at all for an inline named NOT NULL); it is ledgered, not bundled.
+
+Gates: `go build ./...`; `go test ./internal/{parser,catalog,executor,optimizer}/`;
+`go test -run 'TestPort_.*(NotNull|Constraint|Inherit)' ./internal/testport/` (18
+subtests); `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
+`scripts/tpch-spotcheck.sh` PASS (**Q12=2, Q13=35** — Rule #1).

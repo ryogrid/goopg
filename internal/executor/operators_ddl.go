@@ -1842,6 +1842,22 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				}
 				if !found {
 					c := pc
+					// A NO INHERIT not-null constraint on the parent must NOT
+					// propagate to an INHERITS child (constraints.out's
+					// "NOT NULL NO INHERIT" block, right after the
+					// notnull_tbl_fail cases: `CREATE TABLE ATACC1 (a int,
+					// NOT NULL a NO INHERIT); CREATE TABLE ATACC2 () INHERITS
+					// (ATACC1);` leaves ATACC2.a nullable). Deep-copying
+					// pc.NotNull verbatim would otherwise always inherit it.
+					// M0134-0005k.
+					if c.NotNull {
+						for _, pnc := range parent.NotNullConstraints {
+							if pnc.NoInherit && strings.EqualFold(pnc.ColName, pc.Name) {
+								c.NotNull = false
+								break
+							}
+						}
+					}
 					cols = append(cols, c)
 				}
 			}
@@ -1887,7 +1903,20 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		// Build a lookup map for explicit columns by name.
 		colByName := make(map[string]parser.ColumnDef, len(s.Columns))
 		for _, c := range s.Columns {
-			colByName[strings.ToLower(c.Name)] = c
+			key := strings.ToLower(c.Name)
+			// A "constraint-only" entry (Type.Name == "", synthesized for a
+			// bare table-level `NOT NULL col [NO INHERIT]` constraint,
+			// M0119-0004) must never shadow the column's own REAL typed
+			// definition in this map: BodyOrder lists the same column name
+			// once per occurrence (once for the typed column, once for the
+			// constraint-only entry), and every occurrence resolves through
+			// this single map — so if the fake entry won the map slot, the
+			// real column would never reach addCol below (e.g. `a int
+			// primary key, not null a no inherit`). M0134-0005k.
+			if existing, ok := colByName[key]; ok && existing.Type.Name != "" && c.Type.Name == "" {
+				continue
+			}
+			colByName[key] = c
 		}
 		// Build a lookup for LIKE sources.
 		_ = likeCheckConstraints // will be populated below for LIKE INCLUDING CONSTRAINTS
@@ -2209,21 +2238,20 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				Message: fmt.Sprintf("cannot add NO INHERIT constraint to partitioned table %q", s.Name.Name),
 			}
 		}
-		// Check LIKE-sourced NOT NULL constraints.
-		for _, entry := range likeNotNullByCol {
-			if entry.noInherit {
-				return noInheritErr()
-			}
-		}
 		// Check LIKE-sourced CHECK constraints.
 		for _, nc := range likeCheckConstraints {
 			if nc.NoInherit {
 				return noInheritErr()
 			}
 		}
-		// Check explicit column NOT NULL NO INHERIT.
+		// Check explicit column CHECK NO INHERIT. NOT NULL NO INHERIT on a
+		// partitioned table is handled separately below with PG's own
+		// wording/errcode ("not-null constraints on partitioned tables
+		// cannot be NO INHERIT", 0A000, parse_utilcmd.c:759/:1077) — it is
+		// NOT the generic "cannot add NO INHERIT constraint" (42P16) this
+		// CHECK-only block raises. M0134-0005k.
 		for _, c := range s.Columns {
-			if c.NotNullNoInherit || c.CheckNoInherit {
+			if c.CheckNoInherit {
 				return noInheritErr()
 			}
 		}
@@ -3877,19 +3905,55 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// explicit or inherited columns get auto-name <tablename>_<colname>_not_null.
 	// M0097-0023.
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-		// Build set of explicit column defs that carry NOT NULL NO INHERIT, plus
-		// any user-given inline constraint name (`CONSTRAINT <name> NOT NULL`).
-		// A non-default name makes pg_dump re-emit the inline
-		// `CONSTRAINT <name> NOT NULL` form rather than a bare `NOT NULL`.
-		// DU-002 slice 273.
-		explicitNoInherit := make(map[string]bool)
-		explicitNotNullName := make(map[string]string)
-		for _, origCol := range s.Columns {
-			if origCol.NotNullNoInherit {
-				explicitNoInherit[strings.ToLower(origCol.Name)] = true
+		// origColByName maps each REAL (non-fake) column def from the CREATE
+		// TABLE column list to its parsed NOT NULL state, keyed lowercase.
+		// "Fake" ColumnDefs (Type.Name == "") are the merge-only entries the
+		// parser synthesizes for a bare table-level `NOT NULL col [NO
+		// INHERIT]` (M0119-0004) / OF-type constraint-only column list — they
+		// carry no algorithm-A result of their own and are represented
+		// instead via TableNotNullCols below. M0134-0005k.
+		origColByName := make(map[string]*parser.ColumnDef, len(s.Columns))
+		for i := range s.Columns {
+			oc := &s.Columns[i]
+			if oc.Type.Name == "" {
+				continue
 			}
-			if origCol.NotNullConstraintName != "" {
-				explicitNotNullName[strings.ToLower(origCol.Name)] = origCol.NotNullConstraintName
+			key := strings.ToLower(oc.Name)
+			if _, exists := origColByName[key]; !exists {
+				origColByName[key] = oc
+			}
+		}
+		pkColSet := make(map[string]bool, len(pkCols))
+		for _, c := range pkCols {
+			pkColSet[strings.ToLower(c)] = true
+		}
+		// §18.2/18.3 E4: not-null constraints on partitioned tables cannot be
+		// NO INHERIT (parse_utilcmd.c:759 column-level, :1077 table-level).
+		// Checked before any name/NO-INHERIT merge conflict, matching PG's
+		// per-occurrence check order. M0134-0005k.
+		if s.PartitionBy != nil {
+			for _, oc := range s.Columns {
+				if oc.NotNullNoInherit {
+					return &ExecError{Code: "0A000", Pos: s.Pos(),
+						Message: "not-null constraints on partitioned tables cannot be NO INHERIT"}
+				}
+			}
+			for _, ni := range s.TableNotNullNoInherit {
+				if ni {
+					return &ExecError{Code: "0A000", Pos: s.Pos(),
+						Message: "not-null constraints on partitioned tables cannot be NO INHERIT"}
+				}
+			}
+		}
+		// A table-level `[CONSTRAINT name] NOT NULL col [NO INHERIT]` marks
+		// its column NOT NULL even when the column carries no inline NOT
+		// NULL/PRIMARY KEY/SERIAL/IDENTITY of its own (e.g. AC2's `CREATE
+		// TABLE ATACC1 (a int, NOT NULL a NO INHERIT)`), so it must flip
+		// col.NotNull here — otherwise the loop below (gated on col.NotNull)
+		// never sees the column at all. M0134-0005k.
+		for _, colName := range s.TableNotNullCols {
+			if col, ok2 := o.ctx.Catalog.LookupColumn(tbl, colName); ok2 {
+				col.NotNull = true
 			}
 		}
 		// PG18 records a contype='n' NOT NULL constraint for EVERY not-null
@@ -3904,8 +3968,33 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				continue
 			}
 			colKey := strings.ToLower(col.Name)
-			noInherit := explicitNoInherit[colKey]
+			// §18.3 (B): build this column's ordered NOT NULL entry list —
+			// the column's own resolved algorithm-A result (or an implicit
+			// unnamed entry when NOT NULL is only implied by PRIMARY KEY/
+			// SERIAL/IDENTITY with no literal NOT NULL keyword), then any
+			// LIKE-copied entry, then every table-level `[CONSTRAINT name]
+			// NOT NULL col [NO INHERIT]` entry, in written order — mirrors
+			// heap.c:AddRelationNotNullConstraints's input list order.
+			var entries []nnEntry
+			if oc, ok2 := origColByName[colKey]; ok2 {
+				if oc.NotNullExplicit {
+					entries = append(entries, nnEntry{oc.NotNullConstraintName, oc.NotNullNoInherit})
+				} else if oc.Primary || pkColSet[colKey] || isSerialTypeName(oc.Type.Name) || oc.IdentityColumn {
+					entries = append(entries, nnEntry{})
+				}
+			} else if pkColSet[colKey] {
+				entries = append(entries, nnEntry{})
+			}
+			if entry, ok2 := likeNotNullByCol[colKey]; ok2 {
+				entries = append(entries, nnEntry{entry.name, entry.noInherit})
+			}
+			for i, c := range s.TableNotNullCols {
+				if strings.EqualFold(c, col.Name) {
+					entries = append(entries, nnEntry{s.TableNotNullNames[i], s.TableNotNullNoInherit[i]})
+				}
+			}
 			name := strings.ToLower(tbl.Name) + "_" + colKey + "_not_null"
+			var noInherit bool
 			isLocal := true
 			inhCount := 0
 			// A column carried in purely by a plain `INHERITS (parent)` clause
@@ -3960,19 +4049,16 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 					}
 				}
 			}
-			if custom, ok2 := explicitNotNullName[colKey]; ok2 {
-				// Explicit inline `CONSTRAINT <name> NOT NULL` overrides the
-				// auto-name. DU-002 slice 273.
-				name = custom
-			}
-			if entry, ok2 := likeNotNullByCol[colKey]; ok2 {
-				// LIKE INCLUDING preserves the source NOT NULL constraint name.
-				if entry.name != "" {
-					name = entry.name
+			if len(entries) > 0 {
+				mergedName, mergedNoInherit, execErr := mergeNotNullEntries(col.Name, entries)
+				if execErr != nil {
+					execErr.Pos = s.Pos()
+					return execErr
 				}
-				if entry.noInherit {
-					noInherit = true
+				if mergedName != "" {
+					name = mergedName
 				}
+				noInherit = mergedNoInherit
 			}
 			tbl.AddNotNull(name, col.Name, im.AllocOID(), noInherit, false, isLocal, inhCount)
 		}
@@ -4219,6 +4305,66 @@ func appendLikeChecks(dst []catalog.NamedCheckConstraint, src *catalog.Table) []
 		}
 	}
 	return dst
+}
+
+// isSerialTypeName reports whether typeName is one of the SERIAL pseudo-type
+// spellings, as originally declared (before the executor resolves it to its
+// base integer type). SERIAL columns are always NOT NULL and, like PRIMARY
+// KEY/IDENTITY, are an implicit (unnamed) not-null source for
+// mergeNotNullEntries when the column carries no literal NOT NULL keyword.
+// Mirrors internal/parser's isSerialTypeName (parse_utilcmd.c:751-753,
+// disallow_noinherit_notnull for is_serial). M0134-0005k.
+func isSerialTypeName(typeName string) bool {
+	switch strings.ToLower(typeName) {
+	case "serial", "serial4", "bigserial", "serial8", "smallserial", "serial2":
+		return true
+	default:
+		return false
+	}
+}
+
+// nnEntry is one source of a column's NOT NULL constraint feeding
+// mergeNotNullEntries — the column's own resolved declaration, a
+// LIKE-copied constraint, or a table-level `[CONSTRAINT name] NOT NULL col
+// [NO INHERIT]` entry. A zero value represents an unnamed, INHERIT (not NO
+// INHERIT) entry, matching PG's implicit not-null constraint synthesized for
+// a PRIMARY KEY/SERIAL/IDENTITY column with no literal NOT NULL keyword
+// (parse_utilcmd.c:997-1000). M0134-0005k.
+type nnEntry struct {
+	name      string
+	noInherit bool
+}
+
+// mergeNotNullEntries implements PostgreSQL's table-level NOT NULL
+// constraint merge — heap.c:AddRelationNotNullConstraints (~2900-2990),
+// §18.3 algorithm (B) of docs/design/0134-0005-constraints-sql-divergence.md.
+// Given every NOT NULL source for one column, in written order (the
+// column's own entry first, then LIKE-copied, then table-level, in the
+// order parsed), it collapses them into the single (name, noInherit) pair
+// PG would settle on, or reports the conflict PG would raise: a differing
+// NO INHERIT flag is the *singular* "conflicting NO INHERIT declaration for
+// not-null constraint" (E3, 42601 — table-level merges use singular
+// wording, distinct from the parser's column-level algorithm A's plural
+// E2); two differing non-empty names is "conflicting not-null constraint
+// names" (E1, 42601). An unnamed entry adopts a later explicit name.
+// entries must be non-empty. M0134-0005k.
+func mergeNotNullEntries(colName string, entries []nnEntry) (name string, noInherit bool, execErr *ExecError) {
+	constr := entries[0]
+	for _, other := range entries[1:] {
+		if constr.noInherit != other.noInherit {
+			return "", false, &ExecError{Code: "42601",
+				Message: fmt.Sprintf("conflicting NO INHERIT declaration for not-null constraint on column %q", colName)}
+		}
+		if other.name != "" {
+			if constr.name == "" {
+				constr.name = other.name
+			} else if constr.name != other.name {
+				return "", false, &ExecError{Code: "42601",
+					Message: fmt.Sprintf("conflicting not-null constraint names %q and %q", constr.name, other.name)}
+			}
+		}
+	}
+	return constr.name, constr.noInherit, nil
 }
 
 // execCreateTableAs implements `CREATE TABLE name AS SELECT …`.

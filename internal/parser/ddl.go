@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 )
@@ -3549,8 +3550,39 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				_ = p.acceptIdentKeyword("inherit")
 				col.NotNullNoInherit = true
 			}
-			stmt.Columns = append(stmt.Columns, col)
-			stmt.BodyOrder = append(stmt.BodyOrder, col.Name)
+			// Only synthesize the constraint-only merge entry (M0119-0004,
+			// for a column that arrives purely via INHERITS and isn't
+			// redeclared locally) when this column name hasn't already been
+			// declared with a real type earlier in the same table element
+			// list. Otherwise the real column and this fake one would share
+			// one BodyOrder name, and colByName (a flat map keyed by name)
+			// can only remember one of them — duplicating the real column's
+			// name into BodyOrder a second time risks either shadowing the
+			// real ColumnDef or double-adding it (`a int primary key, not
+			// null a no inherit`). The algorithm-B bookkeeping below is
+			// unconditional so the conflict check still runs. M0134-0005k.
+			alreadyRealCol := false
+			for _, existing := range stmt.Columns {
+				if existing.Type.Name != "" && strings.EqualFold(existing.Name, col.Name) {
+					alreadyRealCol = true
+					break
+				}
+			}
+			if !alreadyRealCol {
+				stmt.Columns = append(stmt.Columns, col)
+				stmt.BodyOrder = append(stmt.BodyOrder, col.Name)
+			}
+			// Also record this as an anonymous table-level NOT NULL entry
+			// (parallel to the named CONSTRAINT form above) so the executor's
+			// algorithm-B merge (heap.c:AddRelationNotNullConstraints) can
+			// detect a conflicting name/NO INHERIT against any other NOT NULL
+			// source for the same column (e.g. `a int primary key, not null a
+			// no inherit`). The fake ColumnDef above stays for the pre-existing
+			// INHERITS-merge path (M0119-0004); this is additive bookkeeping
+			// only. M0134-0005k.
+			stmt.TableNotNullNames = append(stmt.TableNotNullNames, "")
+			stmt.TableNotNullCols = append(stmt.TableNotNullCols, col.Name)
+			stmt.TableNotNullNoInherit = append(stmt.TableNotNullNoInherit, col.NotNullNoInherit)
 		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwLike {
 			// LIKE source_table [INCLUDING/EXCLUDING option …] — copy columns. M0097-0069.
 			p.advance() // consume LIKE
@@ -4054,6 +4086,30 @@ func (p *parser) parseTableConstraintElement(stmt *CreateTableStmt) (bool, error
 				return false, err
 			}
 			stmt.TableForeignKeys = append(stmt.TableForeignKeys, fk)
+		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot:
+			// CONSTRAINT name NOT NULL colname [NO INHERIT] — named table-level
+			// NOT NULL constraint (PG18). parse_utilcmd.c:1071-1078 (the table-
+			// constraint CONSTR_NOTNULL case in transformTableConstraint).
+			// Recorded on parallel slices; the executor merges it against the
+			// referenced column's own NOT NULL entry (heap.c:
+			// AddRelationNotNullConstraints), which may raise a conflicting-
+			// name or conflicting-NO-INHERIT error. M0134-0005k.
+			p.advance() // NOT
+			if _, err := p.expectKeyword(KwNull); err != nil {
+				return false, err
+			}
+			nnColTok, err := p.parseIdent()
+			if err != nil {
+				return false, err
+			}
+			nnNoInherit := false
+			if p.acceptIdentKeyword("no") {
+				_ = p.acceptIdentKeyword("inherit")
+				nnNoInherit = true
+			}
+			stmt.TableNotNullNames = append(stmt.TableNotNullNames, constraintName)
+			stmt.TableNotNullCols = append(stmt.TableNotNullCols, identText(nnColTok))
+			stmt.TableNotNullNoInherit = append(stmt.TableNotNullNoInherit, nnNoInherit)
 		case p.acceptIdentKeyword("exclude"):
 			// CONSTRAINT name EXCLUDE USING method (col WITH op) [INCLUDE (cols)]. M0097-0023.
 			cdef := p.parseExcludeConstraint()
@@ -4341,6 +4397,15 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 // first token it does not recognise as a constraint (comma, closing paren,
 // ...), leaving it unconsumed for the caller. DU-002 slice 374 follow-up.
 func (p *parser) parseColumnConstraintList(col *ColumnDef) error {
+	// nnOccurrences accumulates every literal column-level `NOT NULL` /
+	// `CONSTRAINT name NOT NULL` clause seen for this column, in written
+	// order. Resolved into col.NotNull/NotNullConstraintName/NotNullNoInherit/
+	// NotNullExplicit once the whole constraint list has been consumed (see
+	// resolveColumnNotNull below), mirroring PG's two-pass
+	// transformColumnDefinition: a PRIMARY KEY/IDENTITY clause anywhere in the
+	// list (even after a NOT NULL NO INHERIT) disallows NO INHERIT.
+	// M0134-0005k.
+	var nnOccurrences []colNotNullOccurrence
 	for {
 		switch {
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot:
@@ -4348,12 +4413,13 @@ func (p *parser) parseColumnConstraintList(col *ColumnDef) error {
 			if _, err := p.expectKeyword(KwNull); err != nil {
 				return err
 			}
-			col.NotNull = true
+			occ := colNotNullOccurrence{pos: p.cur().Pos}
 			// Optional NO INHERIT — PG18 NOT NULL constraints may carry NO INHERIT.
 			if p.acceptIdentKeyword("no") {
 				_ = p.acceptIdentKeyword("inherit")
-				col.NotNullNoInherit = true
+				occ.noInherit = true
 			}
+			nnOccurrences = append(nnOccurrences, occ)
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwPrimary:
 			p.advance()
 			if _, err := p.expectKeyword(KwKey); err != nil {
@@ -4741,12 +4807,12 @@ func (p *parser) parseColumnConstraintList(col *ColumnDef) error {
 				if _, err := p.expectKeyword(KwNull); err != nil {
 					return err
 				}
-				col.NotNull = true
-				col.NotNullConstraintName = identText(cnameTok)
+				occ := colNotNullOccurrence{name: identText(cnameTok), pos: p.cur().Pos}
 				if p.acceptIdentKeyword("no") {
 					_ = p.acceptIdentKeyword("inherit")
-					col.NotNullNoInherit = true
+					occ.noInherit = true
 				}
+				nnOccurrences = append(nnOccurrences, occ)
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwReferences:
 				// CONSTRAINT name REFERENCES table (cols) — FK; parsed below.
 				// Fall through to FK parsing path by continuing the outer loop.
@@ -4763,8 +4829,92 @@ func (p *parser) parseColumnConstraintList(col *ColumnDef) error {
 				}
 			}
 		default:
-			return nil
+			return p.resolveColumnNotNull(col, nnOccurrences)
 		}
+	}
+}
+
+// colNotNullOccurrence records one literal column-level `NOT NULL` /
+// `CONSTRAINT name NOT NULL` clause as parseColumnConstraintList encounters
+// it, before algorithm (A) resolves the whole column into a single final
+// NOT NULL constraint. M0134-0005k.
+type colNotNullOccurrence struct {
+	name      string
+	noInherit bool
+	pos       int
+}
+
+// resolveColumnNotNull implements PostgreSQL's column-level NOT NULL
+// constraint-conflict algorithm — parse_utilcmd.c:transformColumnDefinition
+// (~lines 710-812). A pre-scan disallows NO INHERIT on any column-level NOT
+// NULL when the column also carries PRIMARY KEY or IDENTITY (order-
+// independent: col.Primary/col.IdentityColumn are already fully resolved by
+// the time the whole constraint list has been consumed). Then, per NOT NULL
+// occurrence in written order: the first becomes the column's constraint;
+// each subsequent one is compared against it — differing non-empty names
+// raise "conflicting not-null constraint names" (E1, 42601); differing NO
+// INHERIT raises the *plural* "conflicting NO INHERIT declarations for
+// not-null constraints on column %q" (E2, 42601); an unnamed first
+// constraint adopts a later explicit name. M0134-0005k.
+func (p *parser) resolveColumnNotNull(col *ColumnDef, occurrences []colNotNullOccurrence) error {
+	if len(occurrences) == 0 {
+		return nil
+	}
+	disallowNoInherit := col.Primary || col.IdentityColumn || isSerialTypeName(col.Type.Name)
+	var chosenName string
+	var chosenNoInherit bool
+	haveChosen := false
+	for _, occ := range occurrences {
+		if disallowNoInherit && occ.noInherit {
+			return &SyntaxError{
+				Pos:     -1,
+				Message: fmt.Sprintf("conflicting NO INHERIT declarations for not-null constraints on column %q", col.Name),
+				Raw:     true,
+				Code:    "42601",
+			}
+		}
+		if !haveChosen {
+			chosenName, chosenNoInherit, haveChosen = occ.name, occ.noInherit, true
+			continue
+		}
+		if chosenName != "" && occ.name != "" && chosenName != occ.name {
+			return &SyntaxError{
+				Pos:     -1,
+				Message: fmt.Sprintf("conflicting not-null constraint names %q and %q", chosenName, occ.name),
+				Raw:     true,
+				Code:    "42601",
+			}
+		}
+		if chosenNoInherit != occ.noInherit {
+			return &SyntaxError{
+				Pos:     -1,
+				Message: fmt.Sprintf("conflicting NO INHERIT declarations for not-null constraints on column %q", col.Name),
+				Raw:     true,
+				Code:    "42601",
+			}
+		}
+		if chosenName == "" && occ.name != "" {
+			chosenName = occ.name
+		}
+	}
+	col.NotNull = true
+	col.NotNullExplicit = true
+	col.NotNullConstraintName = chosenName
+	col.NotNullNoInherit = chosenNoInherit
+	return nil
+}
+
+// isSerialTypeName reports whether typeName is one of the SERIAL pseudo-type
+// spellings. SERIAL columns are always NOT NULL and, like PRIMARY KEY/
+// IDENTITY, disallow a column-level NOT NULL NO INHERIT
+// (parse_utilcmd.c:751-753, disallow_noinherit_notnull = true for is_serial).
+// M0134-0005k.
+func isSerialTypeName(typeName string) bool {
+	switch strings.ToLower(typeName) {
+	case "serial", "serial4", "bigserial", "serial8", "smallserial", "serial2":
+		return true
+	default:
+		return false
 	}
 }
 
