@@ -9846,11 +9846,19 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		if _, err := p.expectKeyword(KwKey); err != nil {
 			return AlterTableAction{}, err
 		}
-		// PRIMARY KEY USING INDEX name — adopt existing index. Treat as no-op.
+		// PRIMARY KEY USING INDEX name — adopt existing index as the PK's
+		// backing index. tablecmds.c:ATExecAddIndexConstraint. M0134-0005x.
 		if p.acceptKeyword(KwUsing) || p.acceptIdentKeyword("using") {
 			p.acceptKeyword(KwIndex) // consume INDEX keyword
-			_, _ = p.parseIdent()    // consume index name
-			return AlterTableAction{pos: pos, Kind: AlterTableNoOp}, nil
+			idxTok, err := p.parseIdent()
+			if err != nil {
+				return AlterTableAction{}, err
+			}
+			act.Kind = AlterTableAddPrimaryKey
+			act.UsingIndexName = identText(idxTok)
+			// ExistingIndex ConstraintAttributeSpec — gram.y:4283.
+			p.parseConstraintDeferrable(&act.Deferrable, &act.InitiallyDeferred)
+			return act, nil
 		}
 		if !p.acceptSymbol("(") {
 			return AlterTableAction{}, p.errAtCur("expected '(' after PRIMARY KEY")
@@ -10078,10 +10086,18 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 				}
 			}
 		} else {
-			// ADD UNIQUE USING INDEX indexname — adopt existing index as unique constraint.
-			// Treat as no-op; the index already exists in the catalog. M0097-0023.
-			_, _ = p.parseIdent() // consume indexname
-			return AlterTableAction{pos: pos, Kind: AlterTableNoOp}, nil
+			// ADD UNIQUE USING INDEX indexname — adopt existing index as the
+			// unique constraint's backing index. tablecmds.c:ATExecAddIndexConstraint.
+			// M0134-0005x (was a no-op stub, M0097-0023).
+			idxTok, err := p.parseIdent()
+			if err != nil {
+				return AlterTableAction{}, err
+			}
+			act.Kind = AlterTableAddUnique
+			act.UsingIndexName = identText(idxTok)
+			// ExistingIndex ConstraintAttributeSpec — gram.y:4249.
+			p.parseConstraintDeferrable(&act.Deferrable, &act.InitiallyDeferred)
+			return act, nil
 		}
 		// Optional DEFERRABLE [INITIALLY {DEFERRED|IMMEDIATE}].
 		// pg_dump emits `UNIQUE (col) DEFERRABLE INITIALLY DEFERRED`

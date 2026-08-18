@@ -10838,6 +10838,12 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 	if o.ctx.Catalog.HasPrimaryKey(tbl) {
 		return &ExecError{Code: "42P16", Pos: act.Pos(), Message: fmt.Sprintf("multiple primary keys for table %q are not allowed", tbl.QualifiedName())}
 	}
+	// PRIMARY KEY USING INDEX name — adopt an existing unique index as the
+	// PK's backing index instead of building a new one.
+	// tablecmds.c:ATExecAddIndexConstraint. M0134-0005x.
+	if act.UsingIndexName != "" {
+		return o.execAlterTableAddPrimaryKeyUsingIndex(tbl, act, only)
+	}
 	// PG's ATPrepAddPrimaryKey (tablecmds.c:9512-9531) checks each PK column's
 	// existing NOT NULL constraint, if any, for PK-compatibility BEFORE the
 	// index is built (verifyNotNullPKCompatible, tablecmds.c:9577-9608): a
@@ -10912,9 +10918,73 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 			return err
 		}
 	}
-	if idx, ok := o.ctx.Catalog.LookupIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok {
+	idx, _ := o.ctx.Catalog.LookupIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+	return o.finishPrimaryKeyConstraint(tbl, act, idx)
+}
+
+// execAlterTableAddPrimaryKeyUsingIndex handles `ADD [CONSTRAINT name]
+// PRIMARY KEY USING INDEX idxname`: adopts idxname as the table's PK index
+// (renaming it to the constraint name when they differ, emitting PG's
+// NOTICE) instead of building a fresh one, then applies the same
+// NOT-NULL-compatibility checks and not-null synthesis the column-list form
+// applies. tablecmds.c:ATExecAddIndexConstraint calls index_check_primary_key
+// (catalog/index.c) for this — the same not-null enforcement point the
+// column-list path reaches via ATPrepAddPrimaryKey/cascadeNotNullToChildren.
+// M0134-0005x.
+func (o *ddlOp) execAlterTableAddPrimaryKeyUsingIndex(tbl *catalog.Table, act parser.AlterTableAction, only bool) error {
+	idx, verr := o.adoptExistingIndexAsConstraint(tbl, act, true)
+	if verr != nil {
+		return verr
+	}
+	act.Columns = append([]string(nil), idx.Columns...)
+	// Same PK-compatibility check the column-list form runs before building
+	// its index (tablecmds.c:9577-9608 verifyNotNullPKCompatible), just
+	// against the adopted index's existing key columns instead of a freshly
+	// parsed column list. M0134-0005v's error shape applies unchanged.
+	for _, pkCol := range act.Columns {
+		col, ok := o.ctx.Catalog.LookupColumn(tbl, pkCol)
+		if !ok {
+			continue
+		}
+		ownFound := false
+		for i := range tbl.NotNullConstraints {
+			nc := &tbl.NotNullConstraints[i]
+			if !strings.EqualFold(nc.ColName, col.Name) {
+				continue
+			}
+			ownFound = true
+			if ee := verifyNotNullPKCompatible(nc, col.Name, tbl.Name); ee != nil {
+				return ee
+			}
+			break
+		}
+		if !ownFound && only {
+			if childErr := o.verifyNotNullPKCompatibleChildren(tbl, col.Name); childErr != nil {
+				return childErr
+			}
+		}
+	}
+	return o.finishPrimaryKeyConstraint(tbl, act, idx)
+}
+
+// finishPrimaryKeyConstraint marks idx as the constraint's backing index,
+// synthesizes NOT NULL on every key column (SQL standard: PRIMARY KEY implies
+// NOT NULL; PG18 also materializes it as a contype='n' pg_constraint row,
+// cascading to inheritance children/partitions), and re-syncs the table's
+// catalog-heap rows so \d+/pg_dump observe it. Shared by the column-list
+// PRIMARY KEY form and the USING INDEX adopt form — mirrors how PG's
+// index_check_primary_key (catalog/index.c) serves both ATExecAddIndexConstraint
+// and the ATPrepAddPrimaryKey column-list path. Extracted from
+// execAlterTableAddPrimaryKey by M0134-0005x (previously inline).
+func (o *ddlOp) finishPrimaryKeyConstraint(tbl *catalog.Table, act parser.AlterTableAction, idx *catalog.Index) error {
+	if idx != nil {
 		idx.IsConstraint = true
-		idx.IncludeColumns = act.IncludeColumns
+		// USING INDEX carries no INCLUDE (…) clause of its own — only
+		// overwrite the adopted index's existing covering columns when the
+		// caller actually parsed some (the column-list form).
+		if act.UsingIndexName == "" {
+			idx.IncludeColumns = act.IncludeColumns
+		}
 		idx.Deferrable = act.Deferrable
 		idx.InitiallyDeferred = act.InitiallyDeferred
 	}
@@ -10972,6 +11042,87 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 		}
 	}
 	return nil
+}
+
+// adoptExistingIndexAsConstraint locates the index named by `USING INDEX
+// idxname` on tbl, validates it per PG's transformIndexConstraint
+// (parse_utilcmd.c:2391-2492) and ATExecAddIndexConstraint
+// (tablecmds.c:9704-9787), renames it to the constraint name when they
+// differ (emitting PG's rename NOTICE), and marks it as the backing index
+// for a PRIMARY KEY (primary=true) or UNIQUE (primary=false) constraint.
+// Shared by execAlterTableAddPrimaryKeyUsingIndex and execAlterTableAddUnique.
+// M0134-0005x.
+func (o *ddlOp) adoptExistingIndexAsConstraint(tbl *catalog.Table, act parser.AlterTableAction, primary bool) (*catalog.Index, *ExecError) {
+	pos := act.Pos()
+	var idx *catalog.Index
+	for _, candidate := range o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
+		if strings.EqualFold(candidate.Name, act.UsingIndexName) {
+			idx = candidate
+			break
+		}
+	}
+	if idx == nil {
+		return nil, &ExecError{Code: "42704", Pos: pos,
+			Message: fmt.Sprintf("index %q does not exist", act.UsingIndexName)}
+	}
+	// parse_utilcmd.c:2427-2433 — an index already backing another
+	// constraint cannot be adopted a second time.
+	if idx.IsConstraint {
+		return nil, &ExecError{Code: "55000", Pos: pos,
+			Message: fmt.Sprintf("index %q is already associated with a constraint", idx.Name)}
+	}
+	// parse_utilcmd.c:2456-2462 — "Today we forbid non-unique indexes".
+	if !idx.Unique {
+		return nil, &ExecError{Code: "42809", Pos: pos,
+			Message: fmt.Sprintf("%q is not a unique index", idx.Name),
+			Detail:  "Cannot create a primary key or unique constraint using such an index."}
+	}
+	// parse_utilcmd.c:2465-2474 — expression key columns are rejected.
+	for _, col := range idx.Columns {
+		if col == "" {
+			return nil, &ExecError{Code: "42809", Pos: pos,
+				Message: fmt.Sprintf("index %q contains expressions", idx.Name),
+				Detail:  "Cannot create a primary key or unique constraint using such an index."}
+		}
+	}
+	// parse_utilcmd.c:2476-2481 — a partial index cannot back a constraint.
+	if idx.HasPredicate {
+		return nil, &ExecError{Code: "42809", Pos: pos,
+			Message: fmt.Sprintf("%q is a partial index", idx.Name),
+			Detail:  "Cannot create a primary key or unique constraint using such an index."}
+	}
+	// Constraint name defaults to the index's own name; an explicit name
+	// that differs renames the index (and emits PG's NOTICE).
+	// tablecmds.c:9739-9755.
+	constraintName := act.ConstraintName
+	if constraintName != "" && !strings.EqualFold(constraintName, idx.Name) {
+		o.ctx.Notices = append(o.ctx.Notices,
+			fmt.Sprintf("ALTER TABLE / ADD CONSTRAINT USING INDEX will rename index %q to %q", idx.Name, constraintName))
+		im, isIM := o.ctx.Catalog.(*catalog.InMemory)
+		if !isIM {
+			return nil, &ExecError{Code: "XX000", Pos: pos, Message: "catalog does not support index rename"}
+		}
+		oldObjName := parser.ObjectName{Schema: idx.Schema, Name: idx.Name}
+		newObjName := parser.ObjectName{Schema: idx.Schema, Name: constraintName}
+		if err := im.RenameIndex(oldObjName, newObjName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
+			return nil, &ExecError{Code: "42P07", Pos: pos, Message: err.Error()}
+		}
+		if catalogHeapSyncAvailable(o.ctx) {
+			if syncErr := resyncIndexClassHeapRow(o.ctx, idx); syncErr != nil {
+				return nil, &ExecError{Code: "XX000", Pos: pos, Message: syncErr.Error()}
+			}
+		}
+	}
+	idx.IsConstraint = true
+	idx.Primary = primary
+	idx.Deferrable = act.Deferrable
+	idx.InitiallyDeferred = act.InitiallyDeferred
+	if catalogHeapSyncAvailable(o.ctx) {
+		if syncErr := resyncIndexHeapRow(o.ctx, idx); syncErr != nil {
+			return nil, &ExecError{Code: "XX000", Pos: pos, Message: syncErr.Error()}
+		}
+	}
+	return idx, nil
 }
 
 // verifyNotNullPKCompatible mirrors PG's verifyNotNullPKCompatible
@@ -11227,6 +11378,19 @@ func waitPgClassRowMarkReleased(ctx *Context, holderXID storage.TransactionID, r
 // execAlterTableAddUnique handles ADD [CONSTRAINT name] UNIQUE (cols) [INCLUDE (incl)].
 // Creates a btree unique index. M0097-0023.
 func (o *ddlOp) execAlterTableAddUnique(tbl *catalog.Table, act parser.AlterTableAction) error {
+	if act.UsingIndexName != "" {
+		// ADD UNIQUE USING INDEX indexname — adopt the existing index as the
+		// unique constraint's backing index. Unlike PRIMARY KEY, UNIQUE does
+		// not synthesize NOT NULL (index_check_primary_key is only called
+		// when stmt->primary, tablecmds.c:9757-9759), so there's nothing to
+		// share with finishPrimaryKeyConstraint beyond the adopt/rename step
+		// itself. M0134-0005x (was a no-op stub, M0097-0023).
+		_, verr := o.adoptExistingIndexAsConstraint(tbl, act, false)
+		if verr != nil {
+			return verr
+		}
+		return nil
+	}
 	if len(act.Columns) == 0 {
 		return nil // UNIQUE USING INDEX — index already exists, treat as no-op
 	}

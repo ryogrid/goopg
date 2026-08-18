@@ -3430,6 +3430,13 @@ type AlterTableAction struct {
 	// M0134-0005 S05.
 	AlterConstraintNoInherit         bool
 	AlterConstraintHasInheritability bool
+
+	// UsingIndexName is populated for `ADD [CONSTRAINT name] PRIMARY KEY|UNIQUE
+	// USING INDEX idxname` (AlterTableAddPrimaryKey/AlterTableAddUnique with
+	// Columns left empty): the existing unique index to adopt as the
+	// constraint's backing index. tablecmds.c:ATExecAddIndexConstraint.
+	// M0134-0005x.
+	UsingIndexName string
 }
 
 func (a AlterTableAction) Pos() int { return a.pos }

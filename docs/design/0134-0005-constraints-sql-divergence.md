@@ -2749,3 +2749,79 @@ never set**, a silent-no-op correctness gap well beyond a local `NOT VALID`
 check. Finishing it needs a new action kind, a parser branch, and a port of
 `ATExecAddIdentity` (`tablecmds.c:8239-8326`). Ledgered; not a 2-line fix as
 §29.5 assumed.
+
+## 31. M0134-0005x — `ADD CONSTRAINT … {PRIMARY KEY|UNIQUE} USING INDEX` was a silent no-op (LANDED 2026-08-19)
+
+### 31.1 Symptom
+
+`constraints.sql`'s `cnn_pk` fixture promotes a pre-existing unique index into a
+primary key:
+
+```sql
+ALTER TABLE cnn_pk ADD CONSTRAINT cnn_primarykey PRIMARY KEY USING INDEX cnn_uq;
+```
+
+PG renames `cnn_uq` to `cnn_primarykey` (with a NOTICE), marks it
+`indisprimary`, and sets `attnotnull` on the key column. goopg accepted the
+statement and did **nothing**: `\d+ cnn_pk` still showed `"cnn_uq" UNIQUE`, the
+`Nullable` column stayed blank, and the "Not-null constraints:" footer was
+missing. The sibling `ADD CONSTRAINT … UNIQUE USING INDEX` had the identical
+defect.
+
+### 31.2 Root cause — parser discard, not executor desync
+
+The preceding census (§30.5 ranking) filed this under the "`Nullable`-blank
+family" and assumed a catalog-heap sync gap like §30's path 2. That was wrong,
+and the research pass that preceded this slice is the reason it did not cost a
+wasted implementation round: the two other paths of that family had **already
+been fixed** by M0134-0005o and M0134-0005v, and path 3's cause is upstream of
+the executor entirely. `internal/parser/ddl.go` parsed `USING INDEX <name>`,
+**threw the name away**, and downgraded the action to `AlterTableNoOp` — so
+`execAlterTableAddPrimaryKey` never ran. No amount of executor-side tracing
+would have found it.
+
+### 31.3 The fix
+
+- `internal/parser/ast.go` — `AlterTableAction.UsingIndexName string`.
+- `internal/parser/ddl.go` — both the `PRIMARY KEY USING INDEX` and
+  `UNIQUE USING INDEX` arms keep their real `Kind` and populate
+  `UsingIndexName`; both also now parse the trailing
+  `DEFERRABLE [INITIALLY DEFERRED]` per `gram.y:4249/4283`.
+- `internal/executor/operators_ddl.go`:
+  - `adoptExistingIndexAsConstraint` (new, shared by PK and UNIQUE) — ports
+    `tablecmds.c:ATExecAddIndexConstraint`'s validation set (missing index
+    `42704`; already-a-constraint `55000`; non-unique / expression / partial
+    `42809`), renames on name mismatch with PG's exact NOTICE text, and sets
+    `IsConstraint`/`Primary`/`Deferrable`/`InitiallyDeferred` + `resyncIndexHeapRow`.
+  - `finishPrimaryKeyConstraint` (new) — the previously-inline PK tail,
+    extracted so the USING-INDEX path reuses the *already-correct*
+    not-null-synthesis block rather than cloning it. Its `IncludeColumns`
+    write is now guarded so adopting an index cannot erase its own INCLUDE list.
+  - `execAlterTableAddUnique` — the matching no-op stub replaced with the same
+    helper at `primary=false` (Hard-won Rule #2: the twin shipped together).
+
+### 31.4 Result
+
+`scripts/pg-regress-runner.sh constraints`: **601 → 555 lines, 28 → 26 hunks.**
+The sibling UNIQUE fix closed the `cnn_uq_idx` hunk on its own, beating the
+24-line/1-hunk forecast — fixing the Rule-#2 twin was worth ~22 extra diff lines
+here, not merely hygiene.
+
+### 31.5 Worth carrying
+
+**Re-verify a carried ranking's *cause*, not just its reachability.** The census
+correctly measured that these hunks were open; its attributed root cause was
+stale by two commits. A ~20-minute read-only research pass reclassified the bug
+from "executor catalog-sync" to "parser discard" before any code was written.
+On a diff being ground down slice-by-slice, carried causal attributions decay
+faster than carried line counts.
+
+### 31.6 Carried out of this slice (ledgered)
+
+- Inline `CONSTRAINT … PRIMARY KEY (b)` **at CREATE TABLE time** sets
+  `col.NotNull` and the footer but leaves `\d+`'s `Nullable` blank — the same
+  heap-resync class fixed for `ALTER TABLE ADD CONSTRAINT` in M0134-0005o, never
+  applied to CREATE TABLE's own inline-PK path. 2 of the remaining 26 hunks.
+- `adoptExistingIndexAsConstraint` omits PG's "cannot use a deferrable index"
+  rejection (`parse_utilcmd.c:2486-2492`): unreachable in goopg's model because
+  the already-associated-with-a-constraint check fires first. Documented in-code.
