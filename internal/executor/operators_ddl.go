@@ -4619,6 +4619,18 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 		}); err != nil {
 			return err
 		}
+		// M0134-0005g: wire the child index's PartitionParentOID (and the
+		// forward map) exactly as the CREATE INDEX cascade / ATTACH PARTITION
+		// index cascade already do (see :6846/:8610) so a deferred
+		// uniqueCheckDeferToCommit lookup can walk child->root to find the
+		// name the user typed in SET CONSTRAINTS (which is the PARENT
+		// constraint's name, not this auto-generated child name).
+		if childIdx, ok2 := o.ctx.Catalog.LookupIndex(childIdxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok2 {
+			childIdx.PartitionParentOID = parentIdx.OID
+			if im, ok3 := o.ctx.Catalog.(*catalog.InMemory); ok3 {
+				im.RegisterIndexPartitionChild(parentIdx.OID, childIdx.OID)
+			}
+		}
 	}
 	// Create btree indexes for UNIQUE column constraints declared directly on
 	// this partition: `CREATE TABLE child PARTITION OF parent (b UNIQUE) FOR VALUES …`.
@@ -8392,6 +8404,14 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					InitiallyDeferred: parentIdx.InitiallyDeferred,
 					IsConstraint:      parentIdx.IsConstraint,
 				})
+				// M0134-0005g: wire PartitionParentOID/forward map — same
+				// idiom as the PARTITION OF clone loop above.
+				if newChildIdx, ok2 := o.ctx.Catalog.LookupIndex(childIdxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok2 {
+					newChildIdx.PartitionParentOID = parentIdx.OID
+					if im2, ok3 := o.ctx.Catalog.(*catalog.InMemory); ok3 {
+						im2.RegisterIndexPartitionChild(parentIdx.OID, newChildIdx.OID)
+					}
+				}
 			}
 		case parser.AlterTableDetachPartition:
 			// ALTER TABLE parent DETACH PARTITION child — remove child from parent's

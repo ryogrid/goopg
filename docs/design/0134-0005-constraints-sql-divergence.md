@@ -861,3 +861,104 @@ partitions are very likely affected too — unprobed.
 - `TestPort_PartitionedNonDeferrableUniqueErrorsAtInsert` — **negative** guard: a
   non-deferrable partitioned UNIQUE must still error at INSERT time. Continuing the
   0005e lesson, one-directional guards are not sufficient for tier-selection fixes.
+
+## 14. M0134-0005g — the named `SET CONSTRAINTS` form (LANDED 2026-08-18)
+
+§13.4 filed this as "needs a constraint-hierarchy linkage that does not exist anywhere
+in goopg today; strictly larger than one slice". **That sizing was wrong**, and a
+read-only probe refuted it before any code was written — the linkage already exists.
+
+### 14.1 What the probe refuted
+
+`catalog.Index.PartitionParentOID` (`internal/catalog/catalog.go:1818`) has existed all
+along, together with a parallel `InMemory.indexPartitionChildren` map (`:2369`) and its
+`RegisterIndexPartitionChild` / `IndexPartitionChildren` accessors (`:4744` / `:4752`).
+Two goopg sites already populate it correctly (`internal/executor/operators_ddl.go:6846`
+and `:8610`). The **two 0005f clone sites did not** — they call `createBTreeIndex` and
+never assign the field, so the child index had no route back to its parent. No new
+`catalog.Index` field was required; no `conparentid` catalog column was required.
+
+The lesson generalises past this slice: §13.4's sizing came from reading the *consumer*
+(`uniqueCheckDeferToCommit`) and the PG oracle, and inferring the producer side must be
+missing. It was not — it was merely unwired at two of four sites. **Probe the producer
+before sizing a "needs new infrastructure" claim.**
+
+### 14.2 Root cause and fix
+
+`BasicSession.SetConstraintsNamed` (`internal/executor/session.go:383`) keys a flat
+`map[string]bool` by the name the user typed — the parent's, `parted_uniq_tbl_i_key`.
+goopg auto-names the per-partition clone `parted_uniq_tbl_1_i_key`, so
+`uniqueCheckDeferToCommit` (`internal/executor/deferred_unique.go:66`) looked up the
+**child's** name, missed, and silently fell back to `idx.InitiallyDeferred` (false) —
+statement-end enforcement where PG defers to COMMIT.
+
+Fix, two parts:
+
+1. `internal/executor/operators_ddl.go` — both clone sites (`~:4615` `CREATE TABLE …
+   PARTITION OF`, `~:8402` `ALTER TABLE … ATTACH PARTITION`) now set
+   `childIdx.PartitionParentOID = parentIdx.OID` and call `RegisterIndexPartitionChild`,
+   mirroring the already-correct idiom at `:6846`/`:8610` rather than inventing one.
+   These are the same twin sites 0005f edited — Rule #2 applies again and both changed.
+2. `internal/executor/deferred_unique.go` — `uniqueCheckDeferToCommit` tries the index's
+   **own** name first (so naming a partition's own constraint directly keeps working),
+   then walks `PartitionParentOID` child→root trying each ancestor's name against the
+   session map. The walk is bounded by a new `maxPartitionParentWalk = 64`, mirroring
+   `maxCTIDChainWalk`'s idiom, so a corrupt/cyclic linkage cannot spin.
+
+### 14.3 Why goopg walks OIDs where PG scans names
+
+PG's `AlterConstraint` (`postgres/src/backend/commands/trigger.c:5820-5960`) resolves the
+name primarily by a `(conname, connamespace)` scan, because **PG reuses the same
+`conname` for a partition's constraint clone** (verified live against the 18.3 oracle),
+with a secondary `conparentid` descent for deeper hierarchies. goopg's clones are named
+*differently* from their parent, so porting PG's by-name scan would find nothing. The
+OID walk is the correct goopg-side adaptation; do not "fix" this by renaming the clones —
+that would be a schema-visible change with its own `pg_constraint` fallout.
+
+### 14.4 Measurement — read this before comparing numbers
+
+`parted_uniq` matches in `tmp/regress-diffs/constraints.diff`: **5 → 0**. The aggregate
+count is **1164 lines / 33 hunks both before and after** — unchanged. This was measured
+as a true counterfactual (stash only the two production files, re-run the regress
+runner, restore), *not* inferred from a post-fix reading; the first measurement pass
+concluded from post-fix-only data that an earlier slice had already cleared the hunk,
+and that conclusion was wrong. **A single post-fix measurement cannot attribute a
+metric change.** The aggregate staying flat while the targeted content vanishes is the
+expected shape here: the resolved hunk is replaced by an equal-length unrelated
+divergence further down the file.
+
+### 14.5 Guards
+
+Added to the existing `internal/testport/partitioned_deferrable_unique_test.go` (the
+0005f file, deliberately extended rather than duplicated):
+
+- `TestPort_PartitionedDeferrableUniqueDefersToCommitViaSetConstraintsNamed` — the named
+  parent form defers to COMMIT. **FAIL-pre proven** by reverting only the two production
+  files: fails at the INSERT with `duplicate key value violates unique constraint
+  "parted_uniq_tbl_1_i_key" (23505)`.
+- `TestPort_PartitionedDeferrableUniqueNamedChildOwnConstraintStillDefers` — naming the
+  child's own constraint directly still defers, pinning the child-name-first ordering.
+  Note this guard passes pre-fix by construction (`idx.Name` was already tried first);
+  it is a **regression** guard for the ordering, not a FAIL-pre guard, and is recorded
+  as such rather than being presented as evidence the fix works.
+
+The negative direction (no `SET CONSTRAINTS` ⇒ still errors at INSERT) is already
+covered by 0005f's `TestPort_PartitionedNonDeferrableUniqueErrorsAtInsert`, which was
+re-run green rather than duplicated.
+
+### 14.6 Two divergences deliberately NOT absorbed
+
+- **Deferred FK checks on partitioned tables are broken by a different and worse
+  mechanism** (filed as M0134-0005h). The probe found goopg creates *no* per-partition
+  FK constraint clone at all (`pg_constraint`: 1 row vs PG's 2, and PG reuses the same
+  `conname`), and `runAllDeferredFKChecks` / `fullTableFKCheck`
+  (`internal/executor/operators_fk.go:430` / `:462`) resolve the FK owner by name and
+  scan the **partitioned root**, which has zero physical blocks — every row lives in a
+  leaf. So the COMMIT-tier recheck silently scans nothing and a deferred partitioned-FK
+  transaction **commits where PG raises 23503**. This is a silent integrity gap of the
+  same class as 0005e, not a message divergence. Wiring `PartitionParentOID` does not
+  fix it; a non-partitioned deferred FK works correctly (sanity control).
+- **`SET CONSTRAINTS` does no catalog validation at all** —
+  `session.go:383` / `operators_tx.go:637` accept any name silently. PG raises `42704
+  constraint "%s" does not exist`, and `ERRCODE_WRONG_OBJECT_TYPE` when a non-deferrable
+  constraint is named under `DEFERRED`. Ledgered; independent of this slice.

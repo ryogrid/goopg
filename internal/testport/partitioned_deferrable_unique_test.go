@@ -25,23 +25,16 @@ import (
 //
 // This uses the UNNAMED `SET CONSTRAINTS ALL DEFERRED` form, not the named
 // form the upstream regress file actually uses
-// (`SET CONSTRAINTS parted_uniq_tbl_i_key DEFERRED`). The named form is
-// deliberately NOT covered here: goopg has no `conparentid`-equivalent
-// parent→child constraint linkage. `SetConstraintsNamed`
-// (internal/executor/session.go:383) records the override in a flat
-// map[string]bool keyed by whatever name was typed — here the PARENT's
-// constraint name, `parted_uniq_tbl_i_key` — but the per-partition clone's
-// own index is auto-named `parted_uniq_tbl_1_i_key`. At recheck time
-// `uniqueCheckDeferToCommit` (internal/executor/deferred_unique.go:66) looks
-// up the override by the CHILD's index name, misses, and silently falls back
-// to `idx.InitiallyDeferred` (false), so the check runs at end-of-statement
-// instead of COMMIT. PG resolves the named form by walking
-// `pg_constraint.conparentid` to collect every descendant (partition-child)
-// constraint OID before resolving deferred state
-// (postgres/src/backend/commands/trigger.c:AlterConstraint,
-// ~trigger.c:5850-5990, comment: "Scan for any possible descendants of the
-// constraints"). Adding that linkage is out of this slice's scope; tracked
-// as a follow-up under M0134-0005g.
+// (`SET CONSTRAINTS parted_uniq_tbl_i_key DEFERRED`). The named form has its
+// own dedicated guard,
+// TestPort_PartitionedDeferrableUniqueDefersToCommitViaSetConstraintsNamed
+// below (M0134-0005g): goopg's per-partition clone index is auto-named
+// differently from the parent's constraint name (`parted_uniq_tbl_1_i_key`
+// vs `parted_uniq_tbl_i_key`), so `uniqueCheckDeferToCommit`
+// (internal/executor/deferred_unique.go) walks the clone's
+// `catalog.Index.PartitionParentOID` up to the root and tries each
+// ancestor's name against the session's SET-CONSTRAINTS override map before
+// falling back to `idx.InitiallyDeferred`.
 func TestPort_PartitionedDeferrableUniqueDefersToCommitViaSetConstraintsAll(t *testing.T) {
 	c := newCluster(t, "partdeferuniq")
 	mustInitStart(t, c)
@@ -260,6 +253,126 @@ func TestPort_PartitionedNonDeferrableUniqueErrorsAtInsert(t *testing.T) {
 	_ = ex("ROLLBACK")
 
 	if err := runSQLSimple(t, c, "DROP TABLE parted_nd_tbl"); err != nil {
+		t.Fatalf("drop parent: %v", err)
+	}
+}
+
+// TestPort_PartitionedDeferrableUniqueDefersToCommitViaSetConstraintsNamed is
+// the M0134-0005g positive guard for the NAMED SET CONSTRAINTS form used by
+// upstream's own regress case (postgres/src/test/regress/sql/constraints.sql
+// :432-445): `SET CONSTRAINTS parted_uniq_tbl_i_key DEFERRED` names the
+// PARENT's constraint, not the per-partition clone's own auto-generated name
+// (`parted_uniq_tbl_1_i_key`). Before this fix, `catalog.Index.
+// PartitionParentOID` was left zero at the CREATE TABLE … PARTITION OF clone
+// site (internal/executor/operators_ddl.go), so uniqueCheckDeferToCommit
+// (internal/executor/deferred_unique.go) had no way to walk from the clone
+// to the parent's name and silently fell back to idx.InitiallyDeferred
+// (false) — the duplicate raised 23505 at INSERT, not COMMIT.
+func TestPort_PartitionedDeferrableUniqueDefersToCommitViaSetConstraintsNamed(t *testing.T) {
+	c := newCluster(t, "partdeferuniqnamed")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	if err := runSQLSimple(t, c, "CREATE TABLE parted_uniq_tbl (i int UNIQUE DEFERRABLE) "+
+		"partition by range (i)"); err != nil {
+		t.Fatalf("create parent: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE parted_uniq_tbl_1 PARTITION OF parted_uniq_tbl "+
+		"FOR VALUES FROM (0) TO (10)"); err != nil {
+		t.Fatalf("create child 1: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	db, conn := scConn(t, c, ctx)
+	defer db.Close()
+	defer conn.Close()
+
+	ex := func(q string) error {
+		_, err := conn.ExecContext(ctx, q)
+		return err
+	}
+
+	if err := ex("BEGIN"); err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := ex("INSERT INTO parted_uniq_tbl VALUES (1)"); err != nil {
+		t.Fatalf("first insert: %v", err)
+	}
+	// Name the PARENT's constraint, exactly as upstream's regress case does.
+	if err := ex("SET CONSTRAINTS parted_uniq_tbl_i_key DEFERRED"); err != nil {
+		t.Fatalf("set constraints (named, parent name) deferred: %v", err)
+	}
+	if err := ex("INSERT INTO parted_uniq_tbl VALUES (1)"); err != nil {
+		t.Fatalf("deferred duplicate insert should not fail at INSERT: %v", err)
+	}
+	err := ex("COMMIT")
+	if !isUniqueErr(err) {
+		t.Fatalf("expected 23505 at COMMIT, got %v", err)
+	}
+	_ = ex("ROLLBACK")
+
+	// The failed COMMIT rolled back: no row should have landed.
+	rows := runSQL(t, c, "SELECT i FROM parted_uniq_tbl WHERE i = 1")
+	if len(rows) != 0 {
+		t.Fatalf("duplicate row should have rolled back, got %v", rows)
+	}
+
+	if err := runSQLSimple(t, c, "DROP TABLE parted_uniq_tbl"); err != nil {
+		t.Fatalf("drop parent: %v", err)
+	}
+}
+
+// TestPort_PartitionedDeferrableUniqueNamedChildOwnConstraintStillDefers
+// proves the child-name-first ordering: naming the PARTITION'S OWN
+// auto-generated constraint name directly (not the parent's) must ALSO defer
+// — the child->root walk must not skip trying idx.Name itself before
+// ascending to ancestors.
+func TestPort_PartitionedDeferrableUniqueNamedChildOwnConstraintStillDefers(t *testing.T) {
+	c := newCluster(t, "partdeferuniqchildname")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	if err := runSQLSimple(t, c, "CREATE TABLE parted_uniq_tbl (i int UNIQUE DEFERRABLE) "+
+		"partition by range (i)"); err != nil {
+		t.Fatalf("create parent: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE parted_uniq_tbl_1 PARTITION OF parted_uniq_tbl "+
+		"FOR VALUES FROM (0) TO (10)"); err != nil {
+		t.Fatalf("create child 1: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	db, conn := scConn(t, c, ctx)
+	defer db.Close()
+	defer conn.Close()
+
+	ex := func(q string) error {
+		_, err := conn.ExecContext(ctx, q)
+		return err
+	}
+
+	if err := ex("BEGIN"); err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := ex("INSERT INTO parted_uniq_tbl VALUES (1)"); err != nil {
+		t.Fatalf("first insert: %v", err)
+	}
+	// Name the CHILD's own auto-generated constraint, not the parent's.
+	if err := ex("SET CONSTRAINTS parted_uniq_tbl_1_i_key DEFERRED"); err != nil {
+		t.Fatalf("set constraints (named, child's own name) deferred: %v", err)
+	}
+	if err := ex("INSERT INTO parted_uniq_tbl VALUES (1)"); err != nil {
+		t.Fatalf("deferred duplicate insert should not fail at INSERT: %v", err)
+	}
+	err := ex("COMMIT")
+	if !isUniqueErr(err) {
+		t.Fatalf("expected 23505 at COMMIT, got %v", err)
+	}
+	_ = ex("ROLLBACK")
+
+	if err := runSQLSimple(t, c, "DROP TABLE parted_uniq_tbl"); err != nil {
 		t.Fatalf("drop parent: %v", err)
 	}
 }

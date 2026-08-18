@@ -62,12 +62,50 @@ func uniqueCheckDeferred(ctx *Context, idx *catalog.Index) bool {
 // resolver — this is that SAME resolver, just consulted independently of
 // InExplicitTransaction() (an autocommit statement has no override in effect,
 // so it correctly falls through to idx.InitiallyDeferred). b4-s1-stmt-end-unique.
+// maxPartitionParentWalk bounds the child->root PartitionParentOID walk in
+// uniqueCheckDeferToCommit. Partition hierarchies are shallow in practice
+// (a handful of levels at most); this only guards against a cyclic/corrupt
+// linkage spinning forever, mirroring maxCTIDChainWalk's idiom
+// (operators_storage.go) at a much smaller bound appropriate to partition
+// nesting depth rather than heap-page chains.
+const maxPartitionParentWalk = 64
+
 func uniqueCheckDeferToCommit(ctx *Context, idx *catalog.Index) bool {
 	if ctx.Session == nil {
 		return idx.InitiallyDeferred
 	}
-	if sess, ok := ctx.Session.(*BasicSession); ok {
-		return sess.UniqueConstraintDeferred(idx.Name, idx.InitiallyDeferred)
+	sess, ok := ctx.Session.(*BasicSession)
+	if !ok {
+		return idx.InitiallyDeferred
+	}
+	// M0134-0005g: SET CONSTRAINTS <name> DEFERRED keys BasicSession's
+	// name-keyed map by the name the user typed, which for a partitioned
+	// table's PK/UNIQUE constraint is the PARENT index's name — goopg's
+	// per-partition clone gets a DIFFERENT auto-generated name (e.g.
+	// "<child>_<col>_key" vs the parent's "<parent>_<col>_key", see
+	// operators_ddl.go's PARTITION OF / ATTACH PARTITION clone loops). Try
+	// idx's own name first (a directly-named partition constraint must keep
+	// working), then walk PartitionParentOID up to the root, trying each
+	// ancestor's name in turn; first hit wins. Bounded (maxPartitionParentWalk)
+	// so a cyclic/corrupt linkage cannot spin — mirrors maxCTIDChainWalk's
+	// idiom in operators_storage.go.
+	if sess.UniqueConstraintDeferred(idx.Name, idx.InitiallyDeferred) {
+		return true
+	}
+	im, isIM := ctx.Catalog.(*catalog.InMemory)
+	if !isIM {
+		return idx.InitiallyDeferred
+	}
+	cur := idx
+	for i := 0; i < maxPartitionParentWalk && cur.PartitionParentOID != 0; i++ {
+		parent, ok := im.LookupIndexByOID(cur.PartitionParentOID)
+		if !ok {
+			break
+		}
+		if sess.UniqueConstraintDeferred(parent.Name, idx.InitiallyDeferred) {
+			return true
+		}
+		cur = parent
 	}
 	return idx.InitiallyDeferred
 }
