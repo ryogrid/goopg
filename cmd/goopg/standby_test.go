@@ -23,7 +23,7 @@ import (
 // flag is false, (c) Promote returns nil.
 //
 // We deliberately skip wiring an actual primary so the walreceiver
-// short-circuits in startWalreceiver (empty primary_conninfo logs
+// short-circuits in replication.StartWalReceiver (empty primary_conninfo logs
 // and closes the done channel). The replayer still runs against
 // the local WAL writer; on an idle data dir there are no records
 // to apply, so ApplyLSN stays at the writer's WrittenLSN (= 0)

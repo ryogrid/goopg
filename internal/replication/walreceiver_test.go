@@ -126,3 +126,37 @@ func TestDialWalReceiverRejectsUnsupportedSSLMode(t *testing.T) {
 		t.Fatal("DialWalReceiver with sslmode=require: got nil error, want rejection (goopg has no TLS)")
 	}
 }
+
+// TestParsePrimaryConninfoFull pins the libpq-style conninfo bag parsing that
+// seeds every walreceiver dial. Moved here from cmd/goopg/main_test.go along
+// with parsePrimaryConninfoFull itself.
+func TestParsePrimaryConninfoFull(t *testing.T) {
+	addr, appName, user, sslmode := parsePrimaryConninfoFull(
+		"host=127.0.0.1 port=5544 user=ryo dbname=postgres application_name=standby_a sslmode=require")
+	if addr != "127.0.0.1:5544" {
+		t.Fatalf("addr = %q, want 127.0.0.1:5544", addr)
+	}
+	if appName != "standby_a" {
+		t.Fatalf("appName = %q, want standby_a", appName)
+	}
+	if user != "ryo" {
+		t.Fatalf("user = %q, want ryo", user)
+	}
+	if sslmode != "require" {
+		t.Fatalf("sslmode = %q, want require", sslmode)
+	}
+
+	addr, appName, user, sslmode = parsePrimaryConninfoFull("host=127.0.0.1 application_name=standby_b")
+	if addr != "127.0.0.1:5432" {
+		t.Fatalf("default-port addr = %q, want 127.0.0.1:5432", addr)
+	}
+	if appName != "standby_b" {
+		t.Fatalf("default-port appName = %q, want standby_b", appName)
+	}
+	if user != "" {
+		t.Fatalf("default-port user = %q, want empty", user)
+	}
+	if sslmode != "" {
+		t.Fatalf("default sslmode = %q, want empty", sslmode)
+	}
+}

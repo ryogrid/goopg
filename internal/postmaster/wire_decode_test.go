@@ -7,7 +7,8 @@ import (
 
 // Wire-decode helpers shared by the extended-protocol and SET ROLE tests.
 // They used to live in replication_test.go, which moved to
-// internal/replication in the backup/replication split; decodeDataRow has four
+// internal/replication in the backup/replication split (and is now
+// walsender_wire_test.go there); decodeDataRow has four
 // consumers that stayed behind (prepare_execute_test.go,
 // dispatch_extended_types_test.go, extended_set_role_test.go,
 // set_local_role_test.go), so it lives here now instead.

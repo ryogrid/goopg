@@ -1,8 +1,8 @@
 // Physical-walreceiver integration test. It lives in the EXTERNAL test
 // package because it drives a real postmaster server through the shared wire
-// harness in replication_test.go; the rest of walreceiver_test.go stays
-// in-package because it reaches unexported symbols (checkSSLMode, the
-// WalReceiver.cfg literal, handleCopyData).
+// harness in walsender_wire_test.go; the rest of walreceiver_test.go stays
+// in-package because it reaches unexported symbols (checkSSLMode,
+// parsePrimaryConninfoFull, the WalReceiver.cfg literal, handleCopyData).
 package replication_test
 
 import (

@@ -1,35 +1,28 @@
-// Package replication implements goopg's streaming and logical replication:
-// the walsender-side command dispatcher and BASE_BACKUP routing, the physical
-// and logical walreceivers, initial table sync, and the subscription apply
-// launcher. It mirrors postgres/src/backend/replication/ (walsender.c,
-// walreceiver.c, slot.c, syncrep.c and logical/{launcher,tablesync,worker}.c).
+// Primary-side walsender: the replication-command dispatcher for connections
+// opened with `replication=true` in the StartupMessage, plus the physical
+// streaming loop that ships raw WAL to a standby.
 //
-// The dependency direction is postmaster -> replication -> backup, and it must
-// stay that way: do NOT import internal/postmaster from here. The handful of
-// postmaster helpers this code used to reach — writeQueryError (supplied as a
-// callback), extractCString, resolveConnDBOid and the pg_type OID consts —
-// are carried locally for exactly that reason.
+// Mirrors postgres/src/backend/replication/walsender.c. The verbs handled
+// here are upstream's exec_replication_command set:
 //
-// Replication-command dispatcher for connections opened with
-// `replication=true` in the StartupMessage. Handles the three
-// commands a v0 walreceiver needs before it can stream:
+//   - IDENTIFY_SYSTEM        — cluster identity (walsender.c IdentifySystem)
+//   - CREATE_REPLICATION_SLOT / DROP_REPLICATION_SLOT / READ_REPLICATION_SLOT
+//   - START_REPLICATION      — CopyBoth handoff + the streaming loop
+//   - TIMELINE_HISTORY       — walsender.c SendTimeLineHistory
+//   - BASE_BACKUP            — routed to internal/backup
 //
-//   - IDENTIFY_SYSTEM                       — returns cluster identity
-//   - CREATE_REPLICATION_SLOT name PHYSICAL — durable slot for retention
-//   - DROP_REPLICATION_SLOT name            — release a slot
-//
-// START_REPLICATION + the walsender goroutine ship in the next loop
-// per the implementation plan in
-// docs/design/0005-0001-streaming-replication-architecture.md.
-//
-// Replication commands ride on top of the regular MsgQuery framing,
-// just like upstream PostgreSQL — postmaster's `runPostStartupLoop`
-// hands the frame to HandleCommand, which peels off the
-// command before the normal SQL dispatcher gets a look at it. When
-// the input doesn't match a known replication verb we return
-// (false, nil) so the regular handler can take it; this keeps utility
+// Replication commands ride on top of the regular MsgQuery framing, just like
+// upstream PostgreSQL — postmaster's `runPostStartupLoop` hands the frame to
+// HandleCommand, which peels off the command before the normal SQL dispatcher
+// gets a look at it. When the input doesn't match a known replication verb we
+// return (false, nil) so the regular handler can take it; this keeps utility
 // commands like `SHOW server_version` working for diagnostics on a
 // replication connection.
+//
+// Upstream keeps the physical and logical walsenders in the same file; goopg
+// splits the logical side into logicalwalsender.go, but both hang off the
+// Handler declared here. See
+// docs/design/0005-0001-streaming-replication-architecture.md.
 package replication
 
 import (
@@ -389,7 +382,7 @@ func (s *Handler) replyCreateReplicationSlot(w *libpq.FrameWriter, args string) 
 	// the last byte of the previous record and the very first
 	// readOneAt() would decode garbage (e.g., rmid=240 from random
 	// payload bytes). Same off-by-one M0094-0005 fixed for
-	// startStandbyReplayer / startWalreceiver.
+	// startStandbyReplayer / StartWalReceiver.
 	var startLSN uint64
 	if s.cfg.WAL != nil {
 		startLSN = s.cfg.WAL.WrittenLSN() + 1
@@ -1102,32 +1095,6 @@ func parseReplicationSlotOptions(raw string, kind xlog.SlotKind) error {
 		}
 	}
 	return nil
-}
-
-// parseLSN parses upstream's `X/X` hex notation back into a uint64.
-// Empty / "0/0" → 0 (start of WAL).
-func parseLSN(s string) (uint64, error) {
-	parts := strings.SplitN(s, "/", 2)
-	if len(parts) != 2 {
-		return 0, fmt.Errorf("invalid LSN %q (want X/X)", s)
-	}
-	hi, err := strconv.ParseUint(parts[0], 16, 32)
-	if err != nil {
-		return 0, fmt.Errorf("invalid LSN %q: %w", s, err)
-	}
-	lo, err := strconv.ParseUint(parts[1], 16, 32)
-	if err != nil {
-		return 0, fmt.Errorf("invalid LSN %q: %w", s, err)
-	}
-	return (hi << 32) | lo, nil
-}
-
-// formatLSN renders an LSN in upstream's `X/X` notation. PostgreSQL's
-// pg_lsn is an unsigned 64-bit byte position split into two 32-bit
-// halves, hex-formatted. Walprotocol payloads carry the value as a
-// big-endian uint64; this is just for the human-facing wire columns.
-func formatLSN(lsn uint64) string {
-	return fmt.Sprintf("%X/%X", uint32(lsn>>32), uint32(lsn))
 }
 
 // formatTimeline returns the TLI as a decimal string for the IDENTIFY_SYSTEM

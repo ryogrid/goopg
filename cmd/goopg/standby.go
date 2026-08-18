@@ -26,6 +26,7 @@ import (
 	"github.com/goopg/goopg/internal/access/transam/control"
 	"github.com/goopg/goopg/internal/initdb"
 	"github.com/goopg/goopg/internal/postmaster"
+	"github.com/goopg/goopg/internal/replication"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
@@ -97,7 +98,13 @@ func startStandby(parent context.Context, rt *initdb.Runtime, registry *misc.Reg
 	sigDone := make(chan struct{})
 
 	replayer := startStandbyReplayer(rplCtx, rplDone, rt, logger)
-	startWalreceiver(rcvCtx, rcvDone, rt, registry, logger, standbyApplyLSNFunc(replayer))
+	replication.StartWalReceiver(rcvCtx, rcvDone, replication.WalReceiverLauncherConfig{
+		WAL:          rt.WAL,
+		Receivers:    rt.WalReceivers,
+		Registry:     registry,
+		Logger:       logger,
+		ApplyLSNFunc: standbyApplyLSNFunc(replayer),
+	})
 
 	sc := &standbyController{
 		rt:             rt,

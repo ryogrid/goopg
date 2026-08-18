@@ -18,6 +18,11 @@
 // current ApplyLSN. The primary uses these to advance the
 // corresponding slot's `confirmed_flush_lsn`.
 //
+// This file also carries the standby-side launcher (StartWalReceiver — the
+// reconnect-with-backoff loop upstream keeps in walreceiver.c's
+// WalReceiverMain) and the `primary_conninfo` parsing that upstream splits
+// into libpqwalreceiver.c's libpqrcv_connect.
+//
 // See docs/design/0005-0001-streaming-replication-architecture.md.
 package replication
 
@@ -29,11 +34,13 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/goopg/goopg/internal/libpq"
+	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
@@ -492,38 +499,198 @@ func buildStartReplicationCommand(slotName string, startLSN uint64) string {
 	return fmt.Sprintf("START_REPLICATION PHYSICAL %s", formatLSN(startLSN))
 }
 
-// summariseErrorResponse extracts a human-readable summary from an
-// ErrorResponse payload (sequence of (field-byte, NUL-terminated
-// string) pairs ending with a terminating zero byte). Used only
-// for error messages — full structured access lives in the wire
-// dispatcher.
-func summariseErrorResponse(payload []byte) string {
-	var msg, code string
-	i := 0
-	for i < len(payload) {
-		field := payload[i]
-		i++
-		if field == 0 {
-			break
+// WalReceiverLauncherConfig is the narrow slice of the standby runtime the
+// launcher needs. It exists so this package does not have to import
+// internal/initdb just to reach two fields — the same "carry a narrow Config"
+// rule the package doc states for the walsender Handler.
+type WalReceiverLauncherConfig struct {
+	// WAL is the local WAL writer received records land in, and whose
+	// WrittenLSN seeds each (re)connect's StartLSN.
+	WAL *xlog.Writer
+
+	// Receivers is the process-wide observability registry backing
+	// pg_stat_wal_receiver. nil disables registration.
+	Receivers *xlog.Receivers
+
+	// Registry supplies primary_conninfo, primary_slot_name and
+	// wal_receiver_status_interval. Upstream's WalReceiverMain reads the
+	// same GUCs directly. nil falls back to the built-in defaults, which
+	// means an empty conninfo and therefore no connection attempt.
+	Registry *misc.Registry
+
+	// Logger receives the dial/connect/disconnect lifecycle events. nil
+	// means slog.Default().
+	Logger *slog.Logger
+
+	// ApplyLSNFunc is forwarded to WalReceiverConfig.ApplyLSNFunc so
+	// standby status updates report real replay progress.
+	ApplyLSNFunc func() uint64
+}
+
+// StartWalReceiver dials the primary identified by `primary_conninfo`
+// and runs a `WalReceiver` in a goroutine, reconnecting with
+// exponential backoff on transient failures. Returns once the
+// goroutine is launched; the supplied `done` channel closes when
+// the goroutine exits (after the parent context is cancelled).
+// Upstream's equivalent is walreceiver.c's WalReceiverMain retry loop.
+//
+// `primary_conninfo` is parsed as a libpq-style key=value bag; v0
+// honours `host` + `port` (anything else is ignored). Empty conninfo
+// is logged and the function returns without spawning — useful for
+// integration tests that exercise the standby-mode boot path
+// without an actual primary.
+func StartWalReceiver(ctx context.Context, done chan struct{}, cfg WalReceiverLauncherConfig) {
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	registry := cfg.Registry
+	conninfo := ""
+	slotName := ""
+	statusInterval := 10 * time.Second
+	if registry != nil {
+		if v, ok := registry.Get("primary_conninfo"); ok {
+			conninfo = v.Display()
 		}
-		end := i
-		for end < len(payload) && payload[end] != 0 {
-			end++
+		if v, ok := registry.Get("primary_slot_name"); ok {
+			slotName = v.Display()
 		}
-		val := string(payload[i:end])
-		i = end + 1
-		switch field {
-		case 'M':
-			msg = val
-		case 'C':
-			code = val
+		if v, ok := registry.Get("wal_receiver_status_interval"); ok {
+			if secs, err := strconv.Atoi(v.Display()); err == nil && secs > 0 {
+				statusInterval = time.Duration(secs) * time.Second
+			}
 		}
 	}
-	if code != "" && msg != "" {
-		return fmt.Sprintf("%s: %s", code, msg)
+	addr, appName, user, sslmode := parsePrimaryConninfoFull(conninfo)
+	if addr == "" {
+		logger.Info("standby mode: primary_conninfo empty or missing host:port; walreceiver not started")
+		close(done)
+		return
 	}
-	if msg != "" {
-		return msg
+	if user == "" {
+		user = "postgres"
 	}
-	return "(empty error)"
+	logger.Info("standby mode: starting walreceiver",
+		"primary", addr, "slot", slotName, "status_interval", statusInterval)
+	go func() {
+		defer close(done)
+		const baseBackoff = 500 * time.Millisecond
+		const maxBackoff = 30 * time.Second
+		backoff := baseBackoff
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+			// StartLSN is the LSN of the next record's first byte —
+			// i.e., WrittenLSN+1 (one past the last byte already in
+			// our local WAL). Sending WrittenLSN itself would make the
+			// primary's iterator anchor inside the last-applied record
+			// and stream garbage.
+			rec, err := DialWalReceiver(ctx, WalReceiverConfig{
+				PrimaryAddr:     addr,
+				User:            user,
+				SlotName:        slotName,
+				StartLSN:        cfg.WAL.WrittenLSN() + 1,
+				WAL:             cfg.WAL,
+				StatusInterval:  statusInterval,
+				DialTimeout:     10 * time.Second,
+				Receivers:       cfg.Receivers,
+				Conninfo:        conninfo,
+				ApplicationName: appName,
+				ApplyLSNFunc:    cfg.ApplyLSNFunc,
+				SSLMode:         sslmode,
+			})
+			if err != nil {
+				logger.Warn("walreceiver dial failed; will retry",
+					"event", xlog.EventWalreceiverDialFailed,
+					"primary", addr, "err", err, "backoff", backoff)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(backoff):
+				}
+				if backoff < maxBackoff {
+					backoff *= 2
+					if backoff > maxBackoff {
+						backoff = maxBackoff
+					}
+				}
+				continue
+			}
+			backoff = baseBackoff
+			logger.Info("walreceiver connected",
+				"event", xlog.EventWalreceiverConnected,
+				"primary", addr, "slot", slotName,
+				"start_lsn", cfg.WAL.WrittenLSN()+1)
+			runErr := rec.Run(ctx)
+			lastApplied := rec.ApplyLSN()
+			_ = rec.Close()
+			if ctx.Err() != nil {
+				return
+			}
+			if runErr != nil {
+				logger.Warn("walreceiver disconnect; will reconnect",
+					"event", xlog.EventWalreceiverDisconnect,
+					"primary", addr, "apply_lsn", lastApplied, "err", runErr)
+			} else {
+				logger.Info("walreceiver disconnect (clean); will reconnect",
+					"event", xlog.EventWalreceiverDisconnect,
+					"primary", addr, "apply_lsn", lastApplied)
+			}
+		}
+	}()
+}
+
+// parsePrimaryConninfo extracts the host:port from a libpq-style
+// `key=value [key=value ...]` conninfo string. Defaults port to 5432
+// when host is given without one. Returns "" when no host is
+// provided. v0 honours host + port + sslmode; password follows in a
+// later loop once the replication connection speaks an auth
+// challenge (today it's trust-only, so a password has nowhere to go).
+func parsePrimaryConninfo(conninfo string) string {
+	addr, _, _, _ := parsePrimaryConninfoFull(conninfo)
+	return addr
+}
+
+// parsePrimaryConninfoFull extracts host:port, application_name, user
+// override, and sslmode (if any) from a libpq-style `key=value
+// [key=value ...]` conninfo string. host:port defaults port to 5432;
+// missing host yields empty addr. application_name is forwarded to
+// the primary in the startup parameters so SyncRep can match the
+// standby against synchronous_standby_names. M0102-0005. sslmode
+// defaults to libpq's "prefer" when unset; DialWalReceiver rejects
+// require/verify-ca/verify-full since goopg has no TLS implementation
+// (falling back to plaintext there would silently defeat the
+// operator's explicit encryption requirement).
+func parsePrimaryConninfoFull(conninfo string) (addr, appName, user, sslmode string) {
+	conninfo = strings.TrimSpace(conninfo)
+	if conninfo == "" {
+		return "", "", "", ""
+	}
+	host := ""
+	port := "5432"
+	for _, tok := range strings.Fields(conninfo) {
+		eq := strings.IndexByte(tok, '=')
+		if eq < 0 {
+			continue
+		}
+		k := strings.ToLower(tok[:eq])
+		v := tok[eq+1:]
+		switch k {
+		case "host":
+			host = v
+		case "port":
+			port = v
+		case "application_name":
+			appName = v
+		case "user":
+			user = v
+		case "sslmode":
+			sslmode = v
+		}
+	}
+	if host == "" {
+		return "", appName, user, sslmode
+	}
+	return host + ":" + port, appName, user, sslmode
 }
