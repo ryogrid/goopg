@@ -8469,17 +8469,45 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					}
 				}
 			}
-			// Named NOT NULL constraints (contype='n') are validatable too. PG
-			// excludes CONSTR_NOTNULL from the Phase-3 pre-scan
-			// (ATExecValidateConstraint, tablecmds.c:9956) — there are no
-			// existing rows to scan, so the convalidated 'f'→'t' flip is the
-			// whole behavior. pg_constraint is virtual, so flipping the
-			// in-memory struct is what makes psql's \d+ re-render without the
-			// ` NOT VALID` suffix. M0134-0002 C2 slice 10.
+			// Named NOT NULL constraints (contype='n') are validatable too.
+			// tablecmds.c:9956 excludes CONSTR_NOTNULL from the GENERIC
+			// ADD-constraint Phase-3 queue only — that earlier comment
+			// conflated this with VALIDATE CONSTRAINT's own scan.
+			// ATExecValidateConstraint's notnull branch
+			// (tablecmds.c:13291-13295) independently sets
+			// tab->verify_new_notnull = true, which DOES trigger a full
+			// existing-row scan (ATRewriteTable, same 23502 wording as SET
+			// NOT NULL / ADD PRIMARY KEY). Only an unvalidated constraint is
+			// re-scanned (mirrors the FK/CHECK branches above,
+			// tablecmds.c:12960); an already-valid one is a no-op. On
+			// success the convalidated 'f'→'t' flip makes psql's \d+
+			// re-render without the ` NOT VALID` suffix (pg_constraint is
+			// virtual). M0134-0005ac.
 			if !found {
 				for i := range tbl.NotNullConstraints {
 					if strings.EqualFold(tbl.NotNullConstraints[i].Name, act.ConstraintName) {
-						tbl.NotNullConstraints[i].NotValid = false
+						if tbl.NotNullConstraints[i].NotValid {
+							colName := tbl.NotNullConstraints[i].ColName
+							colIdx := -1
+							for ci := range tbl.Columns {
+								if strings.EqualFold(tbl.Columns[ci].Name, colName) {
+									colIdx = ci
+									break
+								}
+							}
+							if colIdx >= 0 {
+								if err := o.forEachLiveRow(tbl, func(row Row, relName string) error {
+									if row[colIdx].IsNull() {
+										return &ExecError{Code: "23502", Pos: 0,
+											Message: fmt.Sprintf("column %q of relation %q contains null values", colName, relName)}
+									}
+									return nil
+								}); err != nil {
+									return err
+								}
+							}
+							tbl.NotNullConstraints[i].NotValid = false
+						}
 						found = true
 						break
 					}
@@ -10182,10 +10210,10 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// (`null value in column %q ... violates not-null constraint`,
 			// operators_fk.go:1831). No errposition, so Pos stays 0.
 			// M0134-0002 C3 slice 1.
-			if err := o.forEachLiveRow(tbl, func(row Row) error {
+			if err := o.forEachLiveRow(tbl, func(row Row, relName string) error {
 				if row[colIdx].IsNull() {
 					return &ExecError{Code: "23502", Pos: 0,
-						Message: fmt.Sprintf("column %q of relation %q contains null values", act.ColumnName, tbl.Name)}
+						Message: fmt.Sprintf("column %q of relation %q contains null values", act.ColumnName, relName)}
 				}
 				return nil
 			}); err != nil {
@@ -10352,10 +10380,10 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// 23502 scan as SET NOT NULL; NOT VALID defers validation, mirroring
 			// PG's skip_validation). M0134-0002 C3 slice 1.
 			if !act.NotValid {
-				if err := o.forEachLiveRow(tbl, func(row Row) error {
+				if err := o.forEachLiveRow(tbl, func(row Row, relName string) error {
 					if row[colIdx].IsNull() {
 						return &ExecError{Code: "23502", Pos: 0,
-							Message: fmt.Sprintf("column %q of relation %q contains null values", act.ColumnName, tbl.Name)}
+							Message: fmt.Sprintf("column %q of relation %q contains null values", act.ColumnName, relName)}
 					}
 					return nil
 				}); err != nil {
@@ -11105,11 +11133,11 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 		pkv = append(pkv, col.Ordinal)
 	}
 	if len(pkv) > 0 {
-		if err := o.forEachLiveRow(tbl, func(row Row) error {
+		if err := o.forEachLiveRow(tbl, func(row Row, relName string) error {
 			for _, ci := range pkv {
 				if row[ci].IsNull() {
 					return &ExecError{Code: "23502", Pos: 0,
-						Message: fmt.Sprintf("column %q of relation %q contains null values", tbl.Columns[ci].Name, tbl.Name)}
+						Message: fmt.Sprintf("column %q of relation %q contains null values", tbl.Columns[ci].Name, relName)}
 				}
 			}
 			return nil
@@ -12271,23 +12299,70 @@ func (o *ddlOp) nonFKConstraintExists(tbl *catalog.Table, name string) bool {
 	return false
 }
 
-// forEachLiveRow invokes fn for every live heap row of tbl. The row passed to
-// fn is a reused decode buffer and is only valid for the duration of the call.
-// Iterates with the same page-Pin loop as validateFKConstraintExistingRows and
-// collectBTreeEntries: the simplified "Xmin valid, Xmax invalid" liveness check
-// (no snapshot MVCC visibility), the established pattern for DDL-time
-// existing-row scans. Aborts on the first fn error, unpinning the current page.
-// M0134-0002 C3 slice 1 (shared by the ADD CHECK / SET NOT NULL / VALIDATE
-// CHECK scans).
-func (o *ddlOp) forEachLiveRow(tbl *catalog.Table, fn func(row Row) error) error {
-	rel := o.ctx.Catalog.RelFileNode(tbl)
+// forEachLiveRow invokes fn for every live heap row of tbl, INCLUDING every
+// row held only by a partition/inheritance descendant's own storage. The row
+// passed to fn is a reused decode buffer, shaped like tbl.Columns (so a
+// caller's column indices/ordinals resolved against tbl stay valid even for
+// a descendant row), and is only valid for the duration of the call. relName
+// is the relation that ACTUALLY holds the row on disk — tbl.Name for a
+// same-shape (non-recursive) row, or the descendant's own name for a row
+// found only in its storage; PG's phase-3 verify errors always name the
+// relation being scanned at that moment (ATRewriteTable operates per queued
+// relation), not the ALTER TABLE target, so a caller building a 23502/23514
+// message must use relName, not tbl.Name. Iterates with the same page-Pin
+// loop as validateFKConstraintExistingRows and collectBTreeEntries: the
+// simplified "Xmin valid, Xmax invalid" liveness check (no snapshot MVCC
+// visibility), the established pattern for DDL-time existing-row scans.
+// Aborts on the first fn error, unpinning the current page. M0134-0002 C3
+// slice 1 (shared by the ADD CHECK / SET NOT NULL / VALIDATE CHECK scans).
+//
+// A partitioned parent has NO storage of its own — ATExecSetNotNull /
+// ATRewriteTable queue phase-3 verification work per relation across the
+// whole partition tree (ATSimpleRecursion / find_all_inheritors,
+// tablecmds.c), never just the parent's (empty) heap. M0134-0005ac closes
+// that gap here so every existing caller (SET NOT NULL, ADD PRIMARY KEY, ADD
+// NOT NULL, and the CHECK-constraint validators via
+// validateCheckConstraintRows) picks up partition/inheritance coverage
+// without its own edit. Descendants are resolved the same way
+// validateFKConstraintExistingRows already does (allDescendants +
+// snapDetachEpoch), so detach-pending partitions stay excluded consistently
+// with FK scans.
+func (o *ddlOp) forEachLiveRow(tbl *catalog.Table, fn func(row Row, relName string) error) error {
+	if err := o.forEachLiveRowRel(tbl, tbl, fn); err != nil {
+		return err
+	}
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		for _, child := range allDescendants(im, tbl, snapDetachEpoch(o.ctx)) {
+			if err := o.forEachLiveRowRel(tbl, child, fn); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// forEachLiveRowRel scans exactly leafTbl's own storage and invokes fn once
+// per live row, passing leafTbl.Name as relName (see forEachLiveRow's doc).
+// Each row is decoded using leafTbl.Columns (so a leaf whose physical column
+// order differs from targetTbl's — same caveat
+// validateFKConstraintExistingRowsRel documents — still decodes correctly),
+// then remapped BY NAME into a buffer shaped like targetTbl.Columns before fn
+// is called, so a caller's column indices (resolved against targetTbl) stay
+// valid regardless of which relation in the tree actually held the row. When
+// leafTbl == targetTbl (the common, non-recursive case) the remap is a
+// same-shape identity copy, matching forEachLiveRow's pre-M0134-0005ac
+// behavior exactly.
+func (o *ddlOp) forEachLiveRowRel(targetTbl, leafTbl *catalog.Table, fn func(row Row, relName string) error) error {
+	rel := o.ctx.Catalog.RelFileNode(leafTbl)
 	nBlocks, err := o.ctx.Pool.NBlocks(rel)
 	if err != nil {
 		return &ExecError{Code: "XX000", Message: err.Error()}
 	}
 	sctx := mmgr.Acquire(o.ctx.Mctx, mmgr.KindExpr)
 	defer sctx.Release()
-	var scanRow Row
+	sameShape := leafTbl == targetTbl
+	var leafRow Row
+	var outRow Row
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
@@ -12312,13 +12387,29 @@ func (o *ddlOp) forEachLiveRow(tbl *catalog.Table, fn func(row Row) error) error
 			if !isLiveForUniqueCheck(o.ctx, tuple.Header.Xmin, tuple.Header.Xmax) {
 				continue
 			}
-			if scanRow == nil || len(scanRow) != len(tbl.Columns) {
-				scanRow = make(Row, len(tbl.Columns))
+			if leafRow == nil || len(leafRow) != len(leafTbl.Columns) {
+				leafRow = make(Row, len(leafTbl.Columns))
 			}
-			if decErr := DecodeHeapTupleRowInto(scanRow, tbl.Columns, tuple, sctx); decErr != nil {
+			if decErr := DecodeHeapTupleRowInto(leafRow, leafTbl.Columns, tuple, sctx); decErr != nil {
 				continue
 			}
-			if fnErr := fn(scanRow); fnErr != nil {
+			passRow := leafRow
+			if !sameShape {
+				if outRow == nil || len(outRow) != len(targetTbl.Columns) {
+					outRow = make(Row, len(targetTbl.Columns))
+				}
+				for ti, tc := range targetTbl.Columns {
+					outRow[ti] = Datum{}
+					for li, lc := range leafTbl.Columns {
+						if strings.EqualFold(tc.Name, lc.Name) {
+							outRow[ti] = leafRow[li]
+							break
+						}
+					}
+				}
+				passRow = outRow
+			}
+			if fnErr := fn(passRow, leafTbl.Name); fnErr != nil {
 				o.ctx.Pool.Unpin(slot)
 				return fnErr
 			}
@@ -12381,7 +12472,7 @@ func (o *ddlOp) validateCheckConstraintRows(tbl *catalog.Table, conName, exprSQL
 		}
 		return err
 	}
-	return o.forEachLiveRow(tbl, func(row Row) error {
+	return o.forEachLiveRow(tbl, func(row Row, relName string) error {
 		pv, pErr := evalExpr(planned, row, o.ctx)
 		if pErr != nil {
 			return pErr
@@ -12395,7 +12486,7 @@ func (o *ddlOp) validateCheckConstraintRows(tbl *catalog.Table, conName, exprSQL
 			return nil
 		}
 		return &ExecError{Code: "23514", Pos: 0,
-			Message: fmt.Sprintf("check constraint %q of relation %q is violated by some row", conName, tbl.Name)}
+			Message: fmt.Sprintf("check constraint %q of relation %q is violated by some row", conName, relName)}
 	})
 }
 

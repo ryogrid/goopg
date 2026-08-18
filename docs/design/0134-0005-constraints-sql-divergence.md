@@ -3179,3 +3179,108 @@ identity), alongside the retained `child2_t` over-merge guard.
 descendant — `notnull_inhchild`/`notnull_inhgrand` keep `convalidated=f`. That is
 a cascade-validation gap in the ALTER path, structurally separate from this
 slice's CREATE-time merge, and it survives into the remaining 21 hunks.
+
+## 36. M0134-0005ac — the NOT-NULL / PK verification scan did not cover the rows it must (LANDED 2026-08-19)
+
+Baseline entering this slice: **406 lines / 21 hunks** (measured at `3083cd1c`;
+never compare to a pre-2026-08-19 number). A fresh census attributed all 21 hunks
+to 12 buckets; four of those hunks — 13, 17, 18a, 18b — turned out to share one
+root cause, stated at the level that makes it one bug rather than four:
+
+> goopg's existing-row verification for NOT NULL / PRIMARY KEY either never ran,
+> or ran against storage that is empty by construction.
+
+### 36.1 Failure mode B — the scan never ran
+
+`ALTER TABLE … VALIDATE CONSTRAINT <notnull>` simply set `NotValid = false`. It
+was guarded by an in-code comment asserting that PG never scans for
+`CONSTR_NOTNULL`. That comment is **wrong**, and it is wrong in an instructive
+way: it conflates two distinct PG sites.
+
+- `postgres/src/backend/commands/tablecmds.c:9956` — `CONSTR_NOTNULL` **is**
+  excluded from the generic Phase-3 queue, but that is the *ADD*-constraint path.
+- `postgres/src/backend/commands/tablecmds.c:13291-13295` — `ATExecValidateConstraint`'s
+  notnull branch **independently** sets `tab->verify_new_notnull = true`, which
+  does trigger a full-relation scan.
+
+Reading only the first site and generalising produced a comment that then
+protected the bug from review for as long as it stood. The lesson generalises
+beyond this slice: an exclusion in one PG code path is not a statement about the
+feature.
+
+### 36.2 Failure mode C — the scan read storage that cannot hold rows
+
+`forEachLiveRow` scanned exactly `o.ctx.Catalog.RelFileNode(tbl)` — the target's
+own heap. A **partitioned parent has no own storage**, so `SET NOT NULL` and
+`ADD PRIMARY KEY` on such a parent iterated zero rows and reported success over
+NULL-bearing partitions. The scan was not broken in any way a unit test on a
+plain table could observe; it was correct code applied to the wrong extent.
+
+### 36.3 The fix
+
+`forEachLiveRow` now recurses the partition/inheritance tree using the
+`allDescendants` + `snapDetachEpoch` helpers that `validateFKConstraintExistingRows`
+already relied on — i.e. the recursion machinery existed and this caller had
+simply never been wired to it. The per-relation work moved to a new
+`forEachLiveRowRel(targetTbl, leafTbl, fn)`, which scans the leaf's heap, decodes
+with the **leaf's** `Columns`, and remaps the row **by name** into a buffer shaped
+like `targetTbl.Columns`. The by-name remap is not defensive padding: a partition's
+physical column order may legitimately differ from its parent's, and
+`validateFKConstraintExistingRowsRel` already resolves columns this way.
+
+The VALIDATE branch gained a real 23502 scan, gated on `NotValid` so that
+re-validating an already-valid constraint stays a no-op — mirroring the FK and
+CHECK branches immediately above it in the same function.
+
+### 36.4 The signature change the oracle forced
+
+The callback became `func(row Row, relName string) error` at all five call sites.
+PG's phase-3 error names the relation that actually **holds** the violating row,
+not the relation named in the `ALTER TABLE`: `constraints.out:1254` says
+`cnn_part1` (not `cnn2_parted`) and `:1561` says `notnull_tbl1_3` (not
+`notnull_tbl1`). The first implementation pass named the ALTER target and the
+regress runner caught it — the recursion is only half the fidelity, error
+attribution is the other half.
+
+### 36.5 Sibling audit (Hard-won Rule #2)
+
+All five `forEachLiveRow` callers were checked against PG before the helper's
+default behaviour was changed:
+
+| caller | PG behaviour | verdict |
+|---|---|---|
+| `SET NOT NULL` | recurses the tree | correct, no caller edit needed |
+| `ADD NOT NULL` | recurses the tree | correct, no caller edit needed |
+| `ADD PRIMARY KEY` | recurses the tree | correct, no caller edit needed |
+| VALIDATE CONSTRAINT (new) | targets exactly the named relation | correct — non-recursive in PG too, and the named relation is the scan root |
+| `validateCheckConstraintRows` | PG cascades CHECK to partitions and scans the tree | now **more** PG-correct, but inert (see 36.6) |
+
+### 36.6 Deferred (ledgered 2026-08-19)
+
+`ALTER TABLE <partitioned parent> ADD CHECK …` does not cascade the CHECK
+constraint's **registration** to partitions, where PG's `ATAddCheckNNConstraint`
+creates a `pg_constraint` row on every descendant. After this slice the *scan*
+half is correct while the *registration* half is not, so the two are out of step;
+nothing observable flips until registration lands, because no `constraints.sql`
+case inserts into a partition after a parent-level ADD CHECK.
+
+### 36.7 Result, and the one new `@@` header
+
+Measured **406 → 381 lines, 21 → 19 hunks**. Hunks 13, 17, 18a and 18b closed.
+One new `@@` header appeared, and it is an **unmasking, not a regression**:
+`VALIDATE CONSTRAINT nn3` on a partition used to succeed silently, and that
+accidental success happened to leave `nn3` in exactly the state PG's real cascade
+produces. Now that the statement correctly ERRORs, the already-ledgered
+`SET NOT NULL` descendant-`convalidated` cascade gap (§35.4) becomes visible at a
+second point in the script. Worth carrying forward: **a bug that is fixed can
+reveal a second bug it was compensating for**, and the hunk count is the honest
+metric there, not the `@@` count.
+
+Guards (FAIL-pre / PASS-post) in
+`internal/executor/operators_ddl_notnull_partition_scan_test.go`:
+`TestAlterTableValidateConstraintNotNullScansExistingRows`,
+`TestAlterTableValidateConstraintNotNullOnPartitionScans`,
+`TestAlterTableSetNotNullOnPartitionedParentScansPartitions`,
+`TestAlterTableAddPrimaryKeyOnPartitionedParentScansPartitions`, plus the
+over-fix guard `TestAlterTableSetNotNullAndValidateStillSucceedWithoutNulls`
+(a plain table with no NULLs must still succeed).

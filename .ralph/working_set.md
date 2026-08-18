@@ -1,61 +1,62 @@
-# Working set — M0134-0005ab LANDED (INHERITS column merge)
+# Working set — M0134-0005ac LANDED (not-null verification scan coverage)
 
-**Task:** M0134-0005 / sub-item **M0134-0005ab** — LANDED, item ticked. Selected
+**Task:** M0134-0005 / sub-item **M0134-0005ac** — LANDED, item ticked. Selected
 per the Current Priority banner (M-NIGHTLY had no new item; M0134 is next).
 
 **Nightly triage:** `ci/logs/action-items.md` still shows run `20260819-011823`,
-items: 1 — the SAME AI-20260819-011823-001 fixed two loops ago. Nothing new to
-file. The next nightly run should drop it.
+items: 1 — the SAME AI-20260819-011823-001 fixed three loops ago (`2289e149`).
+Nothing new to file. The next nightly run should drop it.
 
-**What landed:** goopg implemented PG's column-merge rule ONLY in the `@@LIKE:`
-branch of `execCreateTable` (`internal/executor/operators_ddl.go`). The plain
-explicit-column path (`addCol`) never consulted `inheritedColNames` and just
-appended — and nothing de-duplicates before `catalog.InMemory.CreateTable`.
-Three symptoms, ONE cause:
-1. no `merging column "%s" with inherited definition` NOTICE on plain INHERITS;
-2. the column was **created twice** (verified live pre-fix: 4 `pg_attribute`
-   rows for 2 columns) — invisible in the diff text, the real defect;
-3. the multi-parent NOTICE double-fired on a 3-level chain — that site was NOT
-   buggy, it iterated a middle table already holding `i` twice. Fixing `addCol`
-   corrected it with **zero changes there** (the brief forbade touching it in
-   round 1 precisely to test this).
-Fix: one shared `mergeExplicitColumnIntoInherited` called by BOTH paths, LIKE's
-inline copy deleted. Constraint identity needed a new `explicitNotNullLocal`
-signal (from `NotNullExplicit`) because `col.Inherited` is false whenever the
-child redeclares at all — that alone cannot separate "retyped only" (merge) from
-"wrote NOT NULL itself" (`child2_t`, stays local).
+**What landed:** one root cause, four symptoms — goopg's NOT-NULL/PK existing-row
+verification either never ran or scanned storage that is empty by construction.
+(B) `VALIDATE CONSTRAINT <notnull>` flipped `NotValid=false` with zero scan,
+protected by an in-code comment that wrongly generalised `tablecmds.c:9956`'s
+*ADD*-path exclusion over `ATExecValidateConstraint`'s own scan at `:13291-13295`.
+(C) `forEachLiveRow` scanned only `RelFileNode(tbl)` — a partitioned parent has
+no own storage, so `SET NOT NULL` / `ADD PRIMARY KEY` on a parent scanned nothing.
+Fix: `forEachLiveRow` recurses via `allDescendants`+`snapDetachEpoch` (machinery
+the FK validator already used), new `forEachLiveRowRel` scans the leaf and remaps
+BY NAME into a parent-shaped buffer. Callback became `func(row Row, relName
+string) error` at all 5 sites — forced by the oracle: PG's phase-3 error names the
+relation HOLDING the row (`constraints.out:1254` `cnn_part1`, `:1561`
+`notnull_tbl1_3`), not the ALTER target. The first pass got this wrong; the
+regress runner caught it.
 
-**Measurement:** constraints **460 → 406 lines, 23 → 21 hunks**. Never compare to
-a pre-2026-08-19 number.
+**Measurement:** constraints **406 → 381 lines, 21 → 19 hunks**. Never compare to
+a pre-2026-08-19 number. One NEW `@@` header appeared and is an **unmasking**:
+`VALIDATE CONSTRAINT nn3` used to succeed silently and accidentally left `nn3` in
+the state PG's real cascade produces; now that it errors, the already-ledgered
+`SET NOT NULL` descendant-`convalidated` gap shows at a second script location.
+Judge by hunk count, not `@@` count.
 
-**Worth not re-learning:** when a diff shows a doubled NOTICE, suspect doubled
-STATE upstream before editing the emit site. And the `child2_t` test was the
-over-merge guard — a fix that relaxed it would have swapped one wrong answer for
-another.
+**Worth not re-learning:** a wrong in-code comment can shield a bug longer than
+missing code does — an exclusion in ONE PG path is not a statement about the
+feature. And a fixed bug can expose a second one it was compensating for.
 
 **Gates run:** `go build ./...` PASS; `go test ./internal/executor/
 ./internal/catalog/` PASS; `scripts/pg-regress-runner.sh --verbose constraints`
-460/23 → 406/21; `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
-PASS; the 3 new guards re-run by the coordinator PASS; pgbench smoke via hook.
+406/21 → 381/19; `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
+PASS; the 5 guards re-run by the coordinator via `tester` PASS; pgbench smoke via
+the hook.
 
-**Next step:** continue M0134-0005 at the **406/21** baseline. Take a FRESH
-census — the previous one was taken at 460/23 and this slice removed 4 hunks, so
-its ranking below is now partly stale. Standing candidates from that census:
-1. **chained-cast column label** — `targetMeta`
-   (`internal/optimizer/planner.go:11423-11449`) has no `*CastExpr` operand arm.
-   Needs PG's strength semantics, not a naive recurse (`NULL::int::text` must
-   stay `text`). Ledgered; separable `*CollateExpr` gap alongside.
-2. **`SET NOT NULL` cascade does not propagate `convalidated=true`** to an
-   already-merged descendant NOT NULL — freshly ledgered this loop, and it
-   survives into the remaining 21 hunks.
-3. `pg_get_partition_constraintdef` — 1 hunk but breaks `\d+` on ANY partition
-   table; from-scratch builder, higher risk.
-Runner-up: partitioned-parent `SET NOT NULL` never scans partitions
-(`operators_ddl.go` ~10070, `forEachLiveRow` on a parent with no local storage).
+**Next step:** continue M0134-0005 at the **381/19** baseline. The census at
+`tmp/ralph-handoffs/m0134-0005ac-census/report.md` (21 hunks → 12 buckets A-L) is
+still ~90% valid — subtract buckets B and C. Top remaining, per that ranking:
+1. **bucket G** — 4 independent low-risk line-pinned display/property-copy fixes
+   (ATTACH PARTITION FK `_1` renaming; `\d+` sequence default not schema-qualified;
+   LIKE not copying PK deferrability; the `(inherited)` tag on a redeclared+
+   inherited NOT NULL). ~61 lines / 4 hunks, but 4 causes — pick ONE.
+2. **bucket E** — hunks 11+12, two missing NOT-NULL validations (NO-INHERIT
+   conflict on a descendant; duplicate constraint name within one CREATE TABLE).
+3. **bucket D** — `pg_get_partition_constraintdef`, 1 hunk but 22 lines and
+   breaks `\d+` on ANY partition; from-scratch builtin, higher risk.
+Standing ledgered: chained-cast column label (bucket A, needs PG strength
+semantics), and the `convalidated` cascade now visible twice.
 
-**Delegation:** `tmp/ralph-handoffs/m0134-0005ab-{research,impl}/`
-(researcher `a2a3163d77f4316ac` DONE 1 round; implementer `a8033ba1654072cdf`
-DONE 1 round, one in-goal deviation: the `explicitNotNullLocal` signal, which
-criterion 3 could not be met without).
+**Delegation:** `tmp/ralph-handoffs/m0134-0005ac-{census,impl}/`
+(researcher `aa99631f9a3f8ddc7` DONE 1 round; implementer `a7e1fc3f81676c356`
+DONE 1 round, one in-goal deviation: the `relName` callback parameter, without
+which the error text could not match PG; tester `aa461df390d7d3bd8` re-verified
+the 5 guards pre-commit).
 
 **In-flight:** none.
