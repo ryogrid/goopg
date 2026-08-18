@@ -1,53 +1,57 @@
-# Working set — M0134-0005c landed; Bucket 4 is CLOSED as a line driver
+# Working set — M0134-0005d landed; constraints.sql has no cheap slices left
 
-**Task:** M0134-0005 (`constraints.sql`) — **M0134-0005c landed**. Sub-item `[x]`,
+**Task:** M0134-0005 (`constraints.sql`) — **M0134-0005d landed**. Sub-item `[x]`,
 parent case stays `[ ]`. Selected per the Current Priority banner (M0134 next after
 M-NIGHTLY). M-NIGHTLY drained: `ci/logs/action-items.md` still at run
 `20260818-005518`, **items: 0** — nothing to file.
 
-**The headline is a refuted hypothesis.** Loop #18's §10.4 guess ("the build scan
-counts dead row versions") was **REFUTED by direct probe** — a plain committed UPDATE
-leaving superseded versions behind provokes nothing. The real trigger is the
-**preceding `BEGIN; UPDATE …; ROLLBACK;`** block. Three DDL bulk scans in
-`internal/executor/operators_ddl.go` decided liveness structurally
-(`Xmin==Invalid ⇒ dead`, `Xmax!=Invalid ⇒ dead`), never consulting abort status, so
-after an aborted UPDATE they got liveness wrong **in both directions**: the real row
-(aborted xmax) dropped, the phantom `i=1` (aborted xmin) kept. Fix: `collectBTreeEntries`
-(~:11890), `forEachLiveRow` (~:11261), `validateFKConstraintExistingRows` (~:11396) now
-call the **pre-existing** `isLiveForUniqueCheck` (`operators_storage.go:8767-8832`) —
-no new predicate, no ctx threading.
+**What landed (two line-disjoint parts, one implementer slice):**
+1. **Parser.** PG accepts `ENFORCED` in the *grammar* (`gram.y:4135-4150`, ordinary
+   `ConstraintAttributeElem`) and rejects it semantically in
+   `parse_utilcmd.c:3991-4021` `transformConstraintAttrs` — `misplaced [NOT] ENFORCED
+   clause`, **42601**, **with** a caret (under `ENFORCED` bare; under `NOT` for the
+   pair). goopg emitted a generic syntax error because `parseConstraintDeferrable`
+   (`internal/parser/ddl.go:2786`) unconditionally swallows a leading `NOT` while
+   probing for `NOT DEFERRABLE`. New `rejectMisplacedEnforced` reuses the pre-existing
+   `isEnforcedAttr` + the `SyntaxError{…,Raw:true}` template; calling it **before**
+   `parseConstraintDeferrable` at the four column-level sites *is* the fix.
+2. **Executor.** `ALTER CONSTRAINT … [NOT] ENFORCED` already matched PG's message and
+   SQLSTATE (42809); only a spurious `LINE`/caret differed. Dropped `Pos: act.Pos()`
+   from two `ExecError`s in `execAlterTableAlterConstraint` (`operators_ddl.go`
+   ~:11061, ~:11091). `Pos == 0` ⇒ no wire `'P'` field.
 
-**Two things worth not re-deriving:**
-1. **Twice now the doc's own guess was wrong** (0005b: Bucket 4 mis-sized as a
-   milestone; 0005c: dead-versions hypothesis). **Probe empirically before briefing.**
-   The brief that demanded a live-server probe is what caught it.
-2. **`ADD CONSTRAINT … UNIQUE` and `CREATE UNIQUE INDEX` are ONE path** (both via
-   `bulkBuildBTreeFull` → `collectBTreeEntries`) — measured, not assumed.
-   `backfillBTree` (~:12040) keeps the inverted check but has **zero callers** (ledgered).
+**Two traps recorded so they are not re-hit:**
+- **Table-level `UNIQUE (…) ENFORCED` is a DIFFERENT PG path** (`processCASbits`):
+  message `"UNIQUE constraints cannot be marked ENFORCED"`, SQLSTATE **0A000**.
+  Reusing the column-level text there would be a NEW divergence. Ledgered, not fixed.
+- **Do not sweep the 4 sibling `Pos: act.Pos()` sites** in the same function — one
+  (`constraints cannot be altered to be NOT VALID`) currently matches PG *with* a
+  caret. Per-site verification only. Ledgered.
 
-**Measured:** 1299 → **1251** lines (−48), hunks 36 → **35**; the
-`could not create unique index`/`is duplicated` error class is **gone from the diff
-entirely**. `timeout 300 scripts/pg-regress-runner.sh --verbose constraints`; artifact
+**Measured:** 1251 → **1232** lines (−19), hunks 35 → **35** (no split); every `+`/`-`
+ENFORCED line gone (3 context lines remain). `timeout 300
+scripts/pg-regress-runner.sh --verbose constraints`; artifact
 `tmp/regress-diffs/constraints.diff`. **Never compare to a pre-2026-08-18 number.**
 
-**Next step:** **Bucket 4 is no longer this file's dominant line driver** — size the
-next slice from the hunk classification, not the residual count. Cheapest next:
-research slices 3 and 4 (`UNIQUE ENFORCED` grammar rejection; `ALTER CONSTRAINT …
-ENFORCED` contype gate) — **slice 4's block on §10.4 is now lifted**. Then Bucket 3's
-NOT NULL inheritance leftover, CHECK-constraint inheritance naming, and COPY FROM not
-rejecting bad rows. **Bucket 5 (GiST `circle_ops`) is a real milestone; do not brief
-Bucket 7.**
+**Next step:** `constraints.sql` has **no cheap slices left** — §11.4 lists only
+CHECK-constraint inheritance naming, COPY FROM not rejecting bad rows, Bucket 3's NOT
+NULL inheritance leftover, the partitioned `parted_uniq_tbl` pair, and Bucket 5 (GiST
+`circle_ops`, a genuine milestone). **Bucket 7 still has no pinned root cause — do not
+brief from it.** Strong candidate instead: the ledgered **silent** integrity gap from
+0005c — an explicit-txn UPDATE that PG rejects at COMMIT with a duplicate key
+**silently commits** on goopg (2 of the 35 hunks). Otherwise move to the next M0134
+case in CSV order. **Probe empirically before briefing** — the doc's own guess has now
+been wrong three times.
 
-**Gates run:** 3 new guards 3/3 PASS (all FAIL-pre/PASS-post, proven by stashing only
-`operators_ddl.go`); `go test ./internal/executor/...` PASS;
-`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
-`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35 — Rule #1). Note `cmd/goopg` +
-`internal/initdb` ran cold (cache miss, not a regression signal).
+**Gates run:** `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS
+(initdb + cmd/goopg ran cold — cache miss, not a regression signal);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35 — Rule #1);
+`go test ./internal/parser/... ./internal/executor/... ./internal/postmaster/...` PASS;
+new guards FAIL-pre/PASS-post by stashing the single changed file.
 
-**Delegation:** `tmp/ralph-handoffs/m0134-0005c-index-build-liveness/` (researcher
-`a9ae16725b1e263b7`, DONE — the probe report is the reason this loop found the real
-cause); `tmp/ralph-handoffs/m0134-0005c-s1-ddl-scan-liveness/` (implementer
-`ae8d79a83349fcea2`, 1 round DONE, no deviations; testers `a10b9a35c7f808053` gates,
-`a9ee31b7f6355cd1f` re-measure).
+**Delegation:** `tmp/ralph-handoffs/m0134-0005d-enforced-clause-fidelity/`
+(researcher `a16a0752465c2409e`, DONE — the live probe is what found the `NOT`-swallow);
+`tmp/ralph-handoffs/m0134-0005d-s1-enforced-fidelity/` (implementer
+`aa5b5271315b7a841`, 1 round DONE, no deviations); tester `ad227756292443d23` (gates).
 
 **In-flight:** none.

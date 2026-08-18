@@ -2848,6 +2848,30 @@ func (p *parser) rejectDuplicateEnforced() error {
 	return nil
 }
 
+// rejectMisplacedEnforced returns PG's "misplaced [NOT] ENFORCED clause"
+// (42601) when the current token begins a `[NOT] ENFORCED` attribute
+// following an inline column UNIQUE or PRIMARY KEY constraint.
+// transformConstraintAttrs (parse_utilcmd.c:3991-4021) only accepts ENFORCED/
+// NOT ENFORCED for CHECK and FOREIGN KEY constraints; UNIQUE, PRIMARY KEY and
+// EXCLUSION always hit this "misplaced" branch instead — n->location = @1
+// (gram.y:4135-4150) puts the caret under ENFORCED for the bare form and
+// under NOT for the NOT ENFORCED pair, which is exactly what isEnforcedAttr's
+// own bare-vs-NOT peek already captures via p.cur().Pos. M0134-0005d slice 1.
+func (p *parser) rejectMisplacedEnforced() error {
+	if !p.isEnforcedAttr() {
+		return nil
+	}
+	msg := "misplaced ENFORCED clause"
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot {
+		msg = "misplaced NOT ENFORCED clause"
+	}
+	return &SyntaxError{
+		Pos:     p.cur().Pos,
+		Message: msg,
+		Raw:     true,
+	}
+}
+
 // parseFKConstraintAttrs consumes the `[NOT] DEFERRABLE [INITIALLY DEFERRED |
 // INITIALLY IMMEDIATE]`, `NOT VALID`, and `[NOT] ENFORCED` trailer that can
 // follow a FOREIGN KEY constraint's REFERENCES/ON DELETE/ON UPDATE clauses, in
@@ -4342,6 +4366,13 @@ func (p *parser) parseColumnConstraintList(col *ColumnDef) error {
 			// (rides the backing tbl_pkey index built in the executor). Without this
 			// the keyword fell through to the column-constraint loop's default arm and
 			// failed the whole CREATE TABLE. DU-002 slice 142.
+			// [NOT] ENFORCED on a column-level PRIMARY KEY is a PG error
+			// ("misplaced [NOT] ENFORCED clause", 42601) — must be checked
+			// before parseConstraintDeferrable, which would otherwise
+			// silently swallow a leading NOT. M0134-0005d slice 1.
+			if err := p.rejectMisplacedEnforced(); err != nil {
+				return err
+			}
 			p.parseConstraintDeferrable(&col.PrimaryDeferrable, &col.PrimaryInitiallyDeferred)
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNull:
 			p.advance() // NULL is the default; absorb it
@@ -4585,6 +4616,13 @@ func (p *parser) parseColumnConstraintList(col *ColumnDef) error {
 			// trailer on the inline column UNIQUE. Without this, a trailing
 			// DEFERRABLE fell through to the default arm and became a HARD PARSE
 			// ERROR for the whole CREATE TABLE. DU-002 slice 141.
+			// [NOT] ENFORCED on a column-level UNIQUE is a PG error
+			// ("misplaced [NOT] ENFORCED clause", 42601) — must be checked
+			// before parseConstraintDeferrable, which would otherwise
+			// silently swallow a leading NOT. M0134-0005d slice 1.
+			if err := p.rejectMisplacedEnforced(); err != nil {
+				return err
+			}
 			p.parseConstraintDeferrable(&col.UniqueDeferrable, &col.UniqueInitiallyDeferred)
 		// CHECK (expr) inline column constraint. M0097-0014.
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck:
@@ -4658,6 +4696,13 @@ func (p *parser) parseColumnConstraintList(col *ColumnDef) error {
 				col.NotNull = true
 				// Optional DEFERRABLE trailer (named inline column PRIMARY KEY).
 				// DU-002 slice 142.
+				// [NOT] ENFORCED on a column-level PRIMARY KEY is a PG error
+				// ("misplaced [NOT] ENFORCED clause", 42601) — must be checked
+				// before parseConstraintDeferrable, which would otherwise
+				// silently swallow a leading NOT. M0134-0005d slice 1.
+				if err := p.rejectMisplacedEnforced(); err != nil {
+					return err
+				}
 				p.parseConstraintDeferrable(&col.PrimaryDeferrable, &col.PrimaryInitiallyDeferred)
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
 				// CONSTRAINT name UNIQUE [NULLS [NOT] DISTINCT] — named inline
@@ -4676,6 +4721,13 @@ func (p *parser) parseColumnConstraintList(col *ColumnDef) error {
 				}
 				// Optional DEFERRABLE trailer (named inline column UNIQUE).
 				// DU-002 slice 141.
+				// [NOT] ENFORCED on a column-level UNIQUE is a PG error
+				// ("misplaced [NOT] ENFORCED clause", 42601) — must be checked
+				// before parseConstraintDeferrable, which would otherwise
+				// silently swallow a leading NOT. M0134-0005d slice 1.
+				if err := p.rejectMisplacedEnforced(); err != nil {
+					return err
+				}
 				p.parseConstraintDeferrable(&col.UniqueDeferrable, &col.UniqueInitiallyDeferred)
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot:
 				// CONSTRAINT name NOT NULL [NO INHERIT] — named inline NOT NULL.

@@ -584,3 +584,94 @@ Still open, all independent of check timing:
   and the `ALTER CONSTRAINT … ENFORCED` contype gate. Slice 4 was blocked on §10.4 for
   end-to-end testability; **that block is now lifted**, so both are selectable small
   independent slices.
+
+## 11. Slice `d` — `[NOT] ENFORCED` clause fidelity (LANDED 2026-08-18, M0134-0005d)
+
+This is §10.5's "research slices 3 and 4", landed together as one implementer slice
+(two line-disjoint parts, one file each). Both were pinned by an empirical probe pass
+before any brief was written — the third consecutive time on this case that a probe
+was the deciding evidence.
+
+### 11.1 Part A — the grammar must ACCEPT `[NOT] ENFORCED`, then reject it semantically
+
+PG does not reject `CREATE TABLE t(i int UNIQUE ENFORCED)` in the grammar. `ENFORCED`
+is an ordinary `ConstraintAttributeElem` (`gram.y:4135-4150`, `n->location = @1`); the
+rejection happens later in `parse_utilcmd.c:3991-4021` `transformConstraintAttrs`,
+cases `CONSTR_ATTR_ENFORCED` / `CONSTR_ATTR_NOT_ENFORCED`, which permit the attribute
+only on CHECK and FOREIGN KEY and raise, for UNIQUE / PRIMARY KEY / EXCLUSION:
+
+```
+ERROR:  misplaced ENFORCED clause          -- caret under ENFORCED
+ERROR:  misplaced NOT ENFORCED clause      -- caret under NOT (start of the pair)
+```
+
+both `errcode(ERRCODE_SYNTAX_ERROR)` = **42601**, both **with** `parser_errposition`.
+Caret columns verified by counting against
+`postgres/src/test/regress/expected/constraints.out:740-746`, not assumed.
+
+goopg's failure was a token-stream accident, not a missing feature: the four
+column-level constraint sites call `parseConstraintDeferrable`
+(`internal/parser/ddl.go:2786`) as their only trailer parser, and it unconditionally
+swallows a leading `NOT` while probing for `NOT DEFERRABLE`. So `NOT ENFORCED` lost
+its `NOT` and left `ENFORCED` dangling (`syntax error at or near "expected ',' or ')'
+(got enforced)"`), while bare `ENFORCED` was never inspected at all.
+
+Fix: new `rejectMisplacedEnforced` (`ddl.go`, immediately after
+`rejectDuplicateEnforced`) reuses the pre-existing `isEnforcedAttr` (`ddl.go:2818`,
+which deliberately requires an `ENFORCED` peek so it never matches `NOT NULL` /
+`NOT VALID` / `NOT DEFERRABLE`) and the pre-existing `SyntaxError{Pos, Message,
+Raw: true}` template — `SyntaxError`'s default SQLSTATE is already 42601, and `Raw`
+suppresses the `syntax error at or near` wrapper. It is called **before**
+`parseConstraintDeferrable` at all four column-level sites: bare column `PRIMARY KEY`,
+bare column `UNIQUE`, and the two named-inline `CONSTRAINT <c> PRIMARY KEY | UNIQUE`
+spellings. Ordering is the whole fix — after the call, the `NOT` is already gone.
+
+**Deliberately not table-level.** `UNIQUE (i) ENFORCED` is a *different* PG code path
+(`processCASbits`, `gram.y:19447-19543`) with a different message and SQLSTATE —
+`"UNIQUE constraints cannot be marked ENFORCED"`, **0A000** — so reusing the
+column-level message there would have been a new divergence, not a fix. No
+`constraints.sql` line exercises it; ledgered 2026-08-18.
+
+### 11.2 Part B — `ALTER CONSTRAINT … [NOT] ENFORCED` carried a position PG does not
+
+Message and SQLSTATE (42809) already matched PG byte-for-byte; the sole divergence was
+a spurious `LINE 1: …` + caret, because two `ExecError` literals in
+`execAlterTableAlterConstraint` (`internal/executor/operators_ddl.go` ~:11061, ~:11091)
+set `Pos: act.Pos()`. PG's `tablecmds.c:12254-12258` `ereport` has no
+`parser_errposition`. Dropping the field is sufficient: `Pos == 0` suppresses the wire
+`'P'` field (convention asserted by `internal/postmaster/plan_error_position_test.go:12-16`).
+
+Four sibling `ExecError` sites in the same function carry the same `Pos: act.Pos()`,
+and the researcher flagged them as the same suspected bug — but they were left alone
+**on purpose**: at least one of them (`constraints cannot be altered to be NOT VALID`)
+currently matches PG *with* a LINE+caret in the expected output, so a blanket sweep
+would regress it. Any future fix there is per-site verification against
+`constraints.out`, not a sweep. Ledgered 2026-08-18.
+
+### 11.3 Measured
+
+`constraints` 1251 → **1232** lines (−19); hunks **35 → 35** (no split this time). The
+decisive check is again the disappearance of a class, not the count:
+`grep -n ENFORCED tmp/regress-diffs/constraints.diff` now returns only three
+*context* lines — every `+`/`-` ENFORCED line is gone, including the `NOT ENFORCED`
+pair and both `ALTER CONSTRAINT` LINE/caret additions. Command: `timeout 300
+scripts/pg-regress-runner.sh --verbose constraints`. **Never compare against a
+pre-2026-08-18 number.**
+
+Guards: `TestParseColumnConstraintMisplacedEnforced` (8 cases — bare/`NOT` ×
+`UNIQUE`/`PRIMARY KEY` × bare/named-inline, asserting message, `Raw`, and the exact
+caret column, plus a `DEFERRABLE`/`NOT DEFERRABLE`/`INITIALLY DEFERRED` regression
+block for the trailer path Part A edits) in `internal/parser/ddl_test.go`; a `Pos == 0`
+assertion added to `TestFKAlterConstraint/NonFKConstraintRejected`
+(`internal/executor/operators_fk_alter_constraint_test.go`); and
+`internal/postmaster/exec_error_position_test.go` guarding the wire-conversion layer.
+Both production-code fixes were FAIL-pre/PASS-post demonstrated by stashing the single
+changed file.
+
+### 11.4 What is left on this file
+
+Unchanged from §10.5 minus the two now-landed research slices: CHECK-constraint
+inheritance naming, COPY FROM not rejecting bad rows, the NOT NULL inheritance
+leftover (Bucket 3), the partitioned `parted_uniq_tbl` pair of divergences, and Bucket
+5 (GiST `circle_ops`) which is a genuine milestone. **Bucket 7 still has no pinned root
+cause — do not brief from it.**

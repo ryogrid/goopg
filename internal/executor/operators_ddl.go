@@ -11055,9 +11055,11 @@ func (o *ddlOp) execAlterTableAlterConstraint(tbl *catalog.Table, act parser.Alt
 			}
 		}
 		if act.AlterConstraintHasEnforceability {
+			// PG's ATExecAlterConstraint (tablecmds.c:12254-12258) has no
+			// parser_errposition call for this ereport — no LINE/caret on
+			// the wire. M0134-0005d slice 1.
 			return &ExecError{
 				Code:    "42809",
-				Pos:     act.Pos(),
 				Message: fmt.Sprintf("cannot alter enforceability of constraint %q of relation %q", act.ConstraintName, tbl.Name),
 			}
 		}
@@ -11085,9 +11087,11 @@ func (o *ddlOp) execAlterTableAlterConstraint(tbl *catalog.Table, act parser.Alt
 				Message: fmt.Sprintf("constraint %q of relation %q is not a not-null constraint", act.ConstraintName, tbl.Name),
 			}
 		default:
+			// PG's ATExecAlterConstraint (tablecmds.c:12254-12258) has no
+			// parser_errposition call for this ereport — no LINE/caret on
+			// the wire. M0134-0005d slice 1.
 			return &ExecError{
 				Code:    "42809",
-				Pos:     act.Pos(),
 				Message: fmt.Sprintf("cannot alter enforceability of constraint %q of relation %q", act.ConstraintName, tbl.Name),
 			}
 		}
