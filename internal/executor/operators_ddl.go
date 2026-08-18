@@ -10118,7 +10118,9 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if hasNN && existingNN != nil {
 				// Check 1: NO INHERIT mismatch (pg_constraint.c:761-767).
 				if act.NoInherit != existingNN.NoInherit {
-					return &ExecError{Code: "55000", Pos: act.Pos(),
+					// PG's AdjustNotNullInheritance (pg_constraint.c:759-767)
+					// raises this via bare ereport — no errposition. M0134-0005w Part A.
+					return &ExecError{Code: "55000", Pos: 0,
 						Message: fmt.Sprintf("cannot change NO INHERIT status of NOT NULL constraint %q on relation %q",
 							existingNN.Name, tbl.Name),
 						Hint: "You might need to make the existing constraint inheritable using ALTER TABLE ... ALTER CONSTRAINT ... INHERIT."}
@@ -10127,7 +10129,9 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				// (pg_constraint.c:773-779). existingNN.NotValid true means
 				// convalidated=false (not yet validated).
 				if !act.NotValid && existingNN.NotValid {
-					return &ExecError{Code: "55000", Pos: act.Pos(),
+					// pg_constraint.c:770-779 — bare ereport, no errposition.
+					// M0134-0005w Part A.
+					return &ExecError{Code: "55000", Pos: 0,
 						Message: fmt.Sprintf("incompatible NOT VALID constraint %q on relation %q",
 							existingNN.Name, tbl.Name),
 						Hint: "You might need to validate it using ALTER TABLE ... VALIDATE CONSTRAINT."}
@@ -10136,7 +10140,9 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				// Fires only for an explicitly user-given name (PG's is_local &&
 				// new_conname); an omitted name is a silent no-op.
 				if act.ConstraintName != "" && act.ConstraintName != existingNN.Name {
-					return &ExecError{Code: "55000", Pos: act.Pos(),
+					// pg_constraint.c:788-795 — bare ereport, no errposition.
+					// M0134-0005w Part A.
+					return &ExecError{Code: "55000", Pos: 0,
 						Message: fmt.Sprintf("cannot create not-null constraint %q on column %q of table %q",
 							act.ConstraintName, act.ColumnName, tbl.Name),
 						Detail: fmt.Sprintf("A not-null constraint named %q already exists for this column.",
@@ -10554,7 +10560,9 @@ func (o *ddlOp) execAlterTableAddColumn(stmt *parser.AlterTableStmt, tbl *catalo
 		// ColumnDef rather than splitting it into a synthesized
 		// AT_AddConstraint subcommand the way PG's parse_utilcmd.c does.
 		if col.NotNullConstraintName != "" && o.fkConstraintNameInUse(tbl, col.NotNullConstraintName) {
-			return &ExecError{Code: "42710", Pos: act.Pos(),
+			// heap.c:2645-2652 (ConstraintNameIsUsed check) — bare ereport,
+			// no errposition. M0134-0005w Part A.
+			return &ExecError{Code: "42710", Pos: 0,
 				Message: fmt.Sprintf("constraint %q for relation %q already exists", col.NotNullConstraintName, tbl.Name)}
 		}
 	}

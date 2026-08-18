@@ -2687,3 +2687,65 @@ the diff are context-only (no `-` prefix), and a before/after content comparison
 - A latent `execAlterTableDropConstraint` cascade gap: it appears to walk only
   `PartitionChildren`, not plain-`INHERITS` children — masked today because the
   one plain-INHERITS fixture case also uses `ONLY`.
+
+## 30. M0134-0005w — four more spurious `LINE n:` cursor positions on constraint-name / NOT-NULL errors (LANDED 2026-08-18)
+
+### 30.1 Symptom
+
+`scripts/pg-regress-runner.sh constraints` differed on five hunks (@248, @261,
+@485 ×2, @546) purely because goopg appended a `LINE 1: …` echo plus a `^` caret
+under statements where PG 18.3 emits the bare message alone. Same family as §28
+(commit `fa84e214`), different call sites — §28 fixed the merge path
+(`mergeNotNullOnAttach`); the sites here are on the `ALTER TABLE … ADD
+CONSTRAINT … NOT NULL` and `ADD COLUMN … CONSTRAINT <name> NOT NULL` paths.
+
+### 30.2 PG oracle — these `ereport`s carry no `errposition()`
+
+The implementer read `postgres/src/backend/catalog/pg_constraint.c` end to end:
+the file contains **zero** `errposition()` calls, so none of
+`AdjustNotNullInheritance`'s three rejections sets a cursor position.
+
+| goopg site (`internal/executor/operators_ddl.go`) | PG oracle | error |
+|---|---|---|
+| `:10121` | `pg_constraint.c:759-767` | `55000` cannot change NO INHERIT status |
+| `:10130` | `pg_constraint.c:770-779` | `55000` incompatible NOT VALID constraint |
+| `:10139` | `pg_constraint.c:788-795` | `55000` cannot create not-null constraint |
+| `:10557` | `heap.c:2645-2652` (`ConstraintNameIsUsed`, in `AddRelationNewConstraints`) | `42710` constraint … already exists |
+
+All four were verified individually — the brief required leaving alone any site
+whose PG counterpart *does* set a position; none did.
+
+### 30.3 The fix
+
+`Pos: act.Pos()` → `Pos: 0` at the four sites, each with the PG citation inline.
+12 insertions / 4 deletions. Guard tests:
+`internal/executor/operators_ddl_errpos_identity_test.go`, one per site,
+asserting `ExecError.Pos == 0` alongside the code (FAIL-pre / PASS-post).
+
+**Measured: 647 → 601 lines / 30 → 28 hunks** against a ~635/25-26 prediction —
+a 46-line drop where ~12 was forecast. The estimate counted only the diff lines
+that name these errors; each spurious position actually costs **three** lines
+(the message, the `LINE 1:` echo, and the caret) and the caret line displaces
+context, so a position-only bug is consistently ~3-4× the naive line estimate.
+Worth carrying: **`Pos` bugs are the cheapest lines-per-source-edit in this
+gate** — 4 edited lines closed 46 diff lines.
+
+### 30.4 Sibling check (Hard-won Rule #2)
+
+`Pos: act.Pos()` in this file went 57 → 53 sites. The `42710 already exists`
+message also appears at `:9161`, `:9185`, `:9210` inside `RENAME CONSTRAINT`,
+but those route through PG's `rename_constraint_internal`, a different function
+that was not verified — deliberately left alone rather than changed for symmetry.
+
+### 30.5 Carried out of this slice (ledgered)
+
+Part B of the brief (the identity-column `NOT VALID` check, PG
+`tablecmds.c:8311`, carried from §29.5) is **blocked by a larger gap**:
+`ALTER TABLE … ALTER COLUMN … ADD GENERATED … AS IDENTITY` is not implemented at
+all. `parser/ddl.go:parseAlterColumnAction` has no `ADD` branch and falls through
+to `AlterTableNoOp`; there is no `AlterTableActionKind` for it. Verified live
+against a running goopg — the statement **returns success while `attidentity` is
+never set**, a silent-no-op correctness gap well beyond a local `NOT VALID`
+check. Finishing it needs a new action kind, a parser branch, and a port of
+`ATExecAddIdentity` (`tablecmds.c:8239-8326`). Ledgered; not a 2-line fix as
+§29.5 assumed.
