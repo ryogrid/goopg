@@ -2142,3 +2142,115 @@ Gates: `go build ./...`; `go test ./internal/{executor,catalog}/`;
 `scripts/pg-regress-runner.sh constraints`;
 `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`;
 `scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35 — Rule #1).
+
+## 25. M0134-0005r — plain `ALTER TABLE … INHERIT / NO INHERIT` never merges NOT NULL
+
+**Baseline at entry:** 738 lines / 31 hunks (re-measured 2026-08-18 at `2f1d324d`;
+never compare to a pre-2026-08-18 number).
+
+### 25.1 The discovery
+
+M0134-0005q (§24) implemented the *partition* half of NOT NULL constraint
+absorption: `mergeNotNullOnAttach` / `unmergeNotNullOnDetach`
+(`internal/executor/operators_ddl.go:13357` / `:13413`), wired at `ATTACH` and the
+three `DETACH` sites. Upstream, the partition and the plain-inheritance halves are
+**the same function**: `CreateInheritance(…, ispartition)`
+(`postgres/src/backend/commands/tablecmds.c:17374`) → `MergeConstraintsIntoExisting`
+(`:17636`) is reached from `ATExecAttachPartition` *and* from `ATExecAddInherit`
+(`:17261`, `ispartition=false`). goopg had only wired the partition caller.
+
+goopg's plain-inheritance paths therefore do **no** NOT NULL bookkeeping at all:
+
+- `parser.AlterTableInherit` (`operators_ddl.go:9234-9296`) copies missing *columns*
+  only; the comment at `:9286` admits the constraint half is unimplemented ("v0").
+- `parser.AlterTableNoInherit` (`:9297-9341`) unregisters the inheritance edge and
+  clears `col.Inherited`, but never decrements the NOT NULL constraint's `InhCount`.
+
+Consequence in `constraints.sql`: `ALTER TABLE … INHERIT` leaves the child's NOT NULL
+`InhCount` at 0 / `IsLocal` true, so later `\d+` and `pg_constraint` probes diverge,
+and the conflict checks PG raises at merge time (NO INHERIT status change, NOT VALID
+conflict, NOT ENFORCED conflict, parent constraint missing on child) never fire.
+
+### 25.2 The one behavioural delta vs the partition half
+
+`MergeConstraintsIntoExisting` branches on `is_partition` in exactly one place —
+`tablecmds.c:17771-17777`: `conislocal` is cleared to false **only** when the parent
+is a partitioned table. For plain `INHERITS`, the child's constraint keeps
+`conislocal = true` while `coninhcount` is incremented; the constraint is then both
+local and inherited, and survives a later `NO INHERIT` as a local constraint.
+
+`RemoveInheritance` (`:17950`, decrement loop at `:18103-18125`) has **no**
+`is_partition` branch — the detach-side helper is reusable unchanged.
+
+### 25.3 Message-argument sources (pinned, not guessed)
+
+Per §24's lesson, arguments are pinned from the oracle source and, where witnessed,
+from `postgres/src/test/regress/expected/constraints.out`:
+
+- NO-INHERIT / NOT-VALID / NOT-ENFORCED conflicts (`tablecmds.c:17736-17762`) name
+  the **child's** constraint name.
+- The "missing constraint on child" error (`:17797-17812`) names the **parent's**
+  attname.
+
+### 25.4 The slice
+
+Parameterize `mergeNotNullOnAttach(parent, child *catalog.Table, isPartition bool)`;
+gate the `IsLocal = false` assignment (`:13399`) on `isPartition`. Wire it into
+`AlterTableInherit` with `isPartition=false` and wire the unchanged
+`unmergeNotNullOnDetach` into `AlterTableNoInherit`. Update the existing ATTACH /
+DETACH call sites to pass `isPartition=true`. **Twin pair:** INHERIT ↔ NO INHERIT
+must land together (the §24 precedent — a merge without its unmerge leaves
+`InhCount` monotonically climbing across INHERIT/NO INHERIT cycles).
+
+**Measured result: 738/31 → 731 lines / 32 hunks** (predicted ~715-724/31 — the
+shrink landed 7 lines short of the band, and hunk count rose by one; see §25.6
+for the root cause, which is a newly *unmasked* pre-existing bug, not a
+regression). The plain-
+inheritance NOT NULL cluster owns only ~45-55 of the 738 lines and splits three ways;
+this slice takes cluster A (the missing call, ~14-18 lines). Deliberately out of
+scope, carried to the ledger:
+
+- **Cluster B (~26 lines)** — `CREATE TABLE … INHERITS` merge-time NOT NULL name /
+  `conislocal` handling (`operators_ddl.go:3966-4051`) is a *different, pre-existing*
+  bug, not a missing call: the witnessed case is a child column redeclared **without**
+  its own `NOT NULL` keyword, which the code's "verified live against PG 18.3"
+  comment (`:4032`) does not actually cover.
+- **Cluster C (~4 lines)** — the single-parent redeclare case emits no "merging
+  column" NOTICE; goopg's only NOTICE site (`:1831`) is the multi-parent dedup path.
+
+### 25.5 The deferred-to-COMMIT twin (round 2)
+
+`ALTER TABLE … {NO} INHERIT` has **two** execution paths in goopg, and only wiring
+the immediate one would have left the bug unfixed under `BEGIN`/`COMMIT`. Inside an
+explicit transaction the case records a `PendingInheritanceChange` and `break`s
+(M0118-0008 alter-table-4, transactional-DDL visibility: the link must stay invisible
+to concurrent sessions until commit); the real catalog mutation happens in
+`ApplyPendingInheritanceChanges` (`operators_ddl.go:7341`), which already replayed the
+column copy but did no constraint merge. Both arms are now mirrored there —
+`unmergeNotNullOnDetach` before `UnregisterInheritanceChild`, and
+`mergeNotNullOnAttach(…, false)` after the column copy with `RegisterInheritanceChild`
+moved after it, matching the immediate path's ordering.
+
+`ApplyPendingInheritanceChanges` has no error-return channel and runs before
+`TxnMgr.Commit`, so the merge error is deliberately discarded there; see §25.6. Heap
+resync is deliberately omitted, matching the sibling deferred function
+`ApplyPendingPartitionAttaches`, which omits it too.
+
+### 25.6 Carried out of this slice (all ledgered)
+
+- **The `LINE N:` / `^` echo quirk** — the `mergeNotNullOnAttach` call sites stamp
+  `ee.Pos = act.Pos()`, so goopg annotates these `42P17`/`42804` errors with a cursor
+  position PG does not set for them. Pre-existing (already present at the
+  ATTACH-PARTITION baseline), but this slice *unmasks* it at the new INHERIT sites —
+  which is why the diff shrank only to 731 and gained a hunk instead of hitting the
+  predicted 715-724/31.
+- **No statement-time conflict check on the deferred path** — PG's `ATExecAddInherit`
+  raises `42P17`/`42804` synchronously regardless of transaction wrapping; goopg's
+  deferred path performs the merge only at COMMIT, so a genuine conflict is silently
+  skipped rather than raised at the `ALTER TABLE`. Unwitnessed by `constraints.sql`
+  (autocommit-only fixtures).
+- **Cluster B** (`CREATE TABLE … INHERITS` merge-time NOT NULL name / `conislocal`)
+  and **cluster C** (missing single-parent "merging column" NOTICE), per §25.4.
+- `ALTER TABLE … ADD CONSTRAINT` cascading down the inheritance tree (the
+  `ditto`/`ATACC2` case, diff ~317/321) — same missing-merge-check family, different
+  call site.

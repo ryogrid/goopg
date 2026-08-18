@@ -20,8 +20,10 @@ package testport
 //     convalidated=true regardless of the parent's own NOT VALID state.
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lib/pq"
 )
@@ -302,5 +304,202 @@ func TestPort_NotNullDetachPartitionUnabsorbs(t *testing.T) {
 	if got := queryScalar(t, c,
 		"SELECT coninhcount FROM pg_constraint WHERE conname = 'dt_nn' AND conrelid = 'dt_c'::regclass"); got != "0" {
 		t.Fatalf("dt_c's dt_nn coninhcount after DETACH = %q, want 0 (un-absorbed)", got)
+	}
+}
+
+// TestPort_NotNullInheritAbsorbsButKeepsLocal guards M0134-0005r: plain
+// ALTER TABLE … INHERIT must absorb the child's own NOT NULL constraint into
+// the parent's (coninhcount++), mirroring the ATTACH PARTITION case above —
+// but with the ONE behavioural delta pinned by the design doc §25.2
+// (tablecmds.c:17771-17777, the is_partition guard on conislocal): plain
+// INHERIT must leave conislocal TRUE, unlike ATTACH PARTITION which flips it
+// to false. Mirrors constraints.sql's notnull_tbl1_child2 fixture shape
+// (child declares its own matching NOT NULL, then INHERITs).
+func TestPort_NotNullInheritAbsorbsButKeepsLocal(t *testing.T) {
+	c := startNotNullCascadeCluster(t, "notnull-inherit-absorb-local")
+
+	for _, stmt := range []string{
+		"CREATE TABLE inh_p (a int, b int, NOT NULL a)",
+		"CREATE TABLE inh_c (a int, CONSTRAINT inh_nn NOT NULL a, b int)",
+		"ALTER TABLE inh_c INHERIT inh_p",
+	} {
+		if err := runSQLSimple(t, c, stmt); err != nil {
+			t.Fatalf("setup %q: %v", stmt, err)
+		}
+	}
+
+	if got := queryScalar(t, c,
+		"SELECT coninhcount FROM pg_constraint WHERE conname = 'inh_nn' AND conrelid = 'inh_c'::regclass"); got != "1" {
+		t.Fatalf("inh_c's inh_nn coninhcount after INHERIT = %q, want 1", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT conislocal FROM pg_constraint WHERE conname = 'inh_nn' AND conrelid = 'inh_c'::regclass"); got != "true" {
+		t.Fatalf("inh_c's inh_nn conislocal after INHERIT = %q, want true (plain INHERIT does NOT clear conislocal, unlike ATTACH PARTITION)", got)
+	}
+}
+
+// TestPort_NotNullNoInheritUnabsorbs is the NO INHERIT twin (Rule #2) of
+// TestPort_NotNullInheritAbsorbsButKeepsLocal: after NO INHERIT, the child's
+// NOT NULL constraint's coninhcount must go back to 0 (RemoveInheritance's
+// decrement loop, tablecmds.c:18103-18125, has no is-partition branch so this
+// side is identical to the DETACH case).
+func TestPort_NotNullNoInheritUnabsorbs(t *testing.T) {
+	c := startNotNullCascadeCluster(t, "notnull-noinherit-unabsorb")
+
+	for _, stmt := range []string{
+		"CREATE TABLE ni_p (a int, b int, NOT NULL a)",
+		"CREATE TABLE ni_c (a int, CONSTRAINT ni_nn NOT NULL a, b int)",
+		"ALTER TABLE ni_c INHERIT ni_p",
+	} {
+		if err := runSQLSimple(t, c, stmt); err != nil {
+			t.Fatalf("setup %q: %v", stmt, err)
+		}
+	}
+	if got := queryScalar(t, c,
+		"SELECT coninhcount FROM pg_constraint WHERE conname = 'ni_nn' AND conrelid = 'ni_c'::regclass"); got != "1" {
+		t.Fatalf("ni_c's ni_nn coninhcount after INHERIT = %q, want 1 (precondition)", got)
+	}
+
+	if err := runSQLSimple(t, c, "ALTER TABLE ni_c NO INHERIT ni_p"); err != nil {
+		t.Fatalf("NO INHERIT ni_p: %v", err)
+	}
+
+	if got := queryScalar(t, c,
+		"SELECT coninhcount FROM pg_constraint WHERE conname = 'ni_nn' AND conrelid = 'ni_c'::regclass"); got != "0" {
+		t.Fatalf("ni_c's ni_nn coninhcount after NO INHERIT = %q, want 0 (un-absorbed)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT conislocal FROM pg_constraint WHERE conname = 'ni_nn' AND conrelid = 'ni_c'::regclass"); got != "true" {
+		t.Fatalf("ni_c's ni_nn conislocal after NO INHERIT = %q, want true", got)
+	}
+}
+
+// TestPort_NotNullInheritNoInheritCycleDoesNotDriftCoinhcount is acceptance
+// criterion (c): repeating the INHERIT/NO INHERIT cycle twice must not let
+// coninhcount drift away from {0,1} — a merge without a matching unmerge (or
+// vice versa) would climb monotonically across cycles.
+func TestPort_NotNullInheritNoInheritCycleDoesNotDriftCoinhcount(t *testing.T) {
+	c := startNotNullCascadeCluster(t, "notnull-inherit-cycle-nodrift")
+
+	for _, stmt := range []string{
+		"CREATE TABLE cyc_p (a int, b int, NOT NULL a)",
+		"CREATE TABLE cyc_c (a int, CONSTRAINT cyc_nn NOT NULL a, b int)",
+	} {
+		if err := runSQLSimple(t, c, stmt); err != nil {
+			t.Fatalf("setup %q: %v", stmt, err)
+		}
+	}
+
+	for i := 0; i < 2; i++ {
+		if err := runSQLSimple(t, c, "ALTER TABLE cyc_c INHERIT cyc_p"); err != nil {
+			t.Fatalf("cycle %d: INHERIT cyc_p: %v", i, err)
+		}
+		if got := queryScalar(t, c,
+			"SELECT coninhcount FROM pg_constraint WHERE conname = 'cyc_nn' AND conrelid = 'cyc_c'::regclass"); got != "1" {
+			t.Fatalf("cycle %d: cyc_c's cyc_nn coninhcount after INHERIT = %q, want 1", i, got)
+		}
+		if err := runSQLSimple(t, c, "ALTER TABLE cyc_c NO INHERIT cyc_p"); err != nil {
+			t.Fatalf("cycle %d: NO INHERIT cyc_p: %v", i, err)
+		}
+		if got := queryScalar(t, c,
+			"SELECT coninhcount FROM pg_constraint WHERE conname = 'cyc_nn' AND conrelid = 'cyc_c'::regclass"); got != "0" {
+			t.Fatalf("cycle %d: cyc_c's cyc_nn coninhcount after NO INHERIT = %q, want 0", i, got)
+		}
+	}
+}
+
+// TestPort_NotNullAttachPartitionStillClearsLocal is a regression guard
+// (acceptance criterion d) for the isPartition=true call sites after
+// mergeNotNullOnAttach grew the isPartition parameter: ATTACH PARTITION must
+// still flip conislocal to false, unlike the plain-INHERIT case exercised by
+// TestPort_NotNullInheritAbsorbsButKeepsLocal above. Re-exercises the same
+// shape as TestPort_NotNullAttachPartitionAbsorbs.
+func TestPort_NotNullAttachPartitionStillClearsLocal(t *testing.T) {
+	c := startNotNullCascadeCluster(t, "notnull-attach-still-clears-local")
+
+	for _, stmt := range []string{
+		"CREATE TABLE ap_p (a int, b int) PARTITION BY LIST (a)",
+		"ALTER TABLE ap_p ADD CONSTRAINT ap_con NOT NULL a NOT VALID",
+		"CREATE TABLE ap_c(a int, CONSTRAINT ap_nn NOT NULL a, b int)",
+		"ALTER TABLE ap_p ATTACH PARTITION ap_c FOR VALUES IN (3,4)",
+	} {
+		if err := runSQLSimple(t, c, stmt); err != nil {
+			t.Fatalf("setup %q: %v", stmt, err)
+		}
+	}
+
+	if got := queryScalar(t, c,
+		"SELECT conislocal FROM pg_constraint WHERE conname = 'ap_nn' AND conrelid = 'ap_c'::regclass"); got != "false" {
+		t.Fatalf("ap_c's ap_nn conislocal after ATTACH PARTITION = %q, want false (isPartition=true must still clear conislocal)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT coninhcount FROM pg_constraint WHERE conname = 'ap_nn' AND conrelid = 'ap_c'::regclass"); got != "1" {
+		t.Fatalf("ap_c's ap_nn coninhcount after ATTACH PARTITION = %q, want 1", got)
+	}
+}
+
+// TestPort_NotNullInheritTransactionalFormAbsorbs guards M0134-0005r round 2:
+// ALTER TABLE … {NO} INHERIT issued inside an explicit transaction defers its
+// catalog mutation to COMMIT (ApplyPendingInheritanceChanges,
+// operators_ddl.go:7341, M0118-0008 alter-table-4) — that deferred path must
+// run the SAME mergeNotNullOnAttach/unmergeNotNullOnDetach absorption as the
+// immediate (autocommit) path exercised by
+// TestPort_NotNullInheritAbsorbsButKeepsLocal /
+// TestPort_NotNullNoInheritUnabsorbs, or `BEGIN; ALTER TABLE c INHERIT p;
+// COMMIT;` silently leaves InhCount at 0.
+func TestPort_NotNullInheritTransactionalFormAbsorbs(t *testing.T) {
+	c := startNotNullCascadeCluster(t, "notnull-inherit-txn-absorb")
+
+	for _, stmt := range []string{
+		"CREATE TABLE txinh_p (a int, b int, NOT NULL a)",
+		"CREATE TABLE txinh_c (a int, CONSTRAINT txinh_nn NOT NULL a, b int)",
+	} {
+		if err := runSQLSimple(t, c, stmt); err != nil {
+			t.Fatalf("setup %q: %v", stmt, err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	db, conn := scConn(t, c, ctx)
+	defer db.Close()
+	defer conn.Close()
+	ex := func(q string) error {
+		_, err := conn.ExecContext(ctx, q)
+		return err
+	}
+
+	if err := ex("BEGIN"); err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := ex("ALTER TABLE txinh_c INHERIT txinh_p"); err != nil {
+		t.Fatalf("transactional INHERIT: %v", err)
+	}
+	if err := ex("COMMIT"); err != nil {
+		t.Fatalf("commit INHERIT: %v", err)
+	}
+
+	if got := queryScalar(t, c,
+		"SELECT coninhcount FROM pg_constraint WHERE conname = 'txinh_nn' AND conrelid = 'txinh_c'::regclass"); got != "1" {
+		t.Fatalf("txinh_c's txinh_nn coninhcount after transactional INHERIT = %q, want 1", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT conislocal FROM pg_constraint WHERE conname = 'txinh_nn' AND conrelid = 'txinh_c'::regclass"); got != "true" {
+		t.Fatalf("txinh_c's txinh_nn conislocal after transactional INHERIT = %q, want true", got)
+	}
+
+	if err := ex("BEGIN"); err != nil {
+		t.Fatalf("begin 2: %v", err)
+	}
+	if err := ex("ALTER TABLE txinh_c NO INHERIT txinh_p"); err != nil {
+		t.Fatalf("transactional NO INHERIT: %v", err)
+	}
+	if err := ex("COMMIT"); err != nil {
+		t.Fatalf("commit NO INHERIT: %v", err)
+	}
+
+	if got := queryScalar(t, c,
+		"SELECT coninhcount FROM pg_constraint WHERE conname = 'txinh_nn' AND conrelid = 'txinh_c'::regclass"); got != "0" {
+		t.Fatalf("txinh_c's txinh_nn coninhcount after transactional NO INHERIT = %q, want 0", got)
 	}
 }

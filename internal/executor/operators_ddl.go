@@ -7352,9 +7352,18 @@ func ApplyPendingInheritanceChanges(ctx *Context, sess *BasicSession) {
 	}
 	for _, ch := range changes {
 		if ch.NoInherit {
+			// Un-absorb the child's NOT NULL constraints BEFORE unregistering
+			// the edge, matching the immediate NO INHERIT path's ordering
+			// (RemoveInheritance's decrement loop runs while the relationship
+			// is still live) and mergeNotNullOnAttach's own twin call in the
+			// immediate AlterTableInherit case. M0134-0005r round 2.
+			if childTbl, okc := im.LookupTableByOID(ch.ChildOID); okc {
+				if parentTbl, okp := im.LookupTableByOID(ch.ParentOID); okp {
+					unmergeNotNullOnDetach(parentTbl, childTbl)
+				}
+			}
 			im.UnregisterInheritanceChild(ch.ParentOID, ch.ChildOID)
 		} else {
-			im.RegisterInheritanceChild(ch.ParentOID, ch.ChildOID)
 			// Copy parent columns the child doesn't already have, matching the
 			// immediate (autocommit) INHERIT path. In alter-table-4 the child
 			// already has matching columns so this is a no-op.
@@ -7369,8 +7378,24 @@ func ApplyPendingInheritanceChanges(ctx *Context, sess *BasicSession) {
 							childTbl.Columns = append(childTbl.Columns, pc)
 						}
 					}
+					// Absorb the child's NOT NULL constraints, matching the
+					// immediate AlterTableInherit path's mergeNotNullOnAttach
+					// call. ApplyPendingInheritanceChanges runs at COMMIT with
+					// no error-return channel (M0118-0008 alter-table-4) and PG
+					// raises these conflicts (42P17/42804) synchronously from
+					// ATExecAddInherit at ALTER TABLE statement time, not at
+					// commit — so reaching here with a still-live pending
+					// change means the statement-time path already accepted
+					// it. goopg does not yet re-run the equivalent check at
+					// statement time on the deferred path (M0118-0008's
+					// transactional-visibility deferral predates this merge),
+					// so a genuine conflict is possible here; ignore it rather
+					// than invent a mid-commit abort path — deferral candidate,
+					// M0134-0005r round 2.
+					_ = mergeNotNullOnAttach(parentTbl, childTbl, false)
 				}
 			}
+			im.RegisterInheritanceChild(ch.ParentOID, ch.ChildOID)
 		}
 		im.UnmarkInheritanceChangePending()
 	}
@@ -8416,7 +8441,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// the deferred-to-commit one below — because PG raises these
 			// errors synchronously from ATExecAttachPartition, not at
 			// commit. M0134-0005q.
-			if err := mergeNotNullOnAttach(tbl, childTbl); err != nil {
+			if err := mergeNotNullOnAttach(tbl, childTbl, true); err != nil {
 				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 					ee.Pos = act.Pos()
 				}
@@ -9267,9 +9292,10 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					}
 				}
 				// Inside an explicit transaction, defer the registration (and the
-				// column copy below) to COMMIT so the new inheritance link is
-				// invisible to concurrent sessions until commit — PG transactional-
-				// DDL visibility (alter-table-4). In autocommit, apply immediately.
+				// column/constraint merge below) to COMMIT so the new inheritance
+				// link is invisible to concurrent sessions until commit — PG
+				// transactional-DDL visibility (alter-table-4). In autocommit,
+				// apply immediately.
 				if defSess := o.inheritDeferSession(); defSess != nil {
 					defSess.AddPendingInheritanceChange(PendingInheritanceChange{
 						ParentOID:      parentTbl.OID,
@@ -9280,19 +9306,47 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					im.MarkInheritanceChangePending()
 					break
 				}
-				im.RegisterInheritanceChild(parentTbl.OID, tbl.OID)
-			}
-			// Copy parent columns that the child doesn't already have.
-			// In PostgreSQL, ALTER TABLE child INHERIT parent validates that child
-			// already has matching columns; goopg v0 just ensures they are present.
-			childColByName := make(map[string]bool, len(tbl.Columns))
-			for _, c := range tbl.Columns {
-				childColByName[strings.ToLower(c.Name)] = true
-			}
-			for _, pc := range parentTbl.Columns {
-				if !childColByName[strings.ToLower(pc.Name)] {
-					tbl.Columns = append(tbl.Columns, pc)
+				// Copy parent columns that the child doesn't already have.
+				// In PostgreSQL, ALTER TABLE child INHERIT parent validates that
+				// child already has matching columns; goopg v0 just ensures they
+				// are present.
+				childColByName := make(map[string]bool, len(tbl.Columns))
+				for _, c := range tbl.Columns {
+					childColByName[strings.ToLower(c.Name)] = true
 				}
+				for _, pc := range parentTbl.Columns {
+					if !childColByName[strings.ToLower(pc.Name)] {
+						tbl.Columns = append(tbl.Columns, pc)
+					}
+				}
+				// Absorb the child's NOT NULL constraints into the parent's,
+				// mirroring PG's CreateInheritance → MergeConstraintsIntoExisting
+				// (tablecmds.c:17422, :17636-17817), reached from ATExecAddInherit
+				// with ispartition=false. Run BEFORE registering the inheritance
+				// edge, matching PG's ordering (duplicate-parent check, then
+				// MergeAttributesIntoExisting/column merge, then
+				// MergeConstraintsIntoExisting, then StoreCatalogInheritance1) —
+				// a failed merge must NOT leave a half-registered edge behind, or
+				// a retried INHERIT falsely trips the duplicate-parent check
+				// above. M0134-0005r (design doc §25.4).
+				if err := mergeNotNullOnAttach(parentTbl, tbl, false); err != nil {
+					if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+						ee.Pos = act.Pos()
+					}
+					return err
+				}
+				if catalogHeapSyncAvailable(o.ctx) {
+					if err := o.ctx.MaterializeWriterXID(); err == nil {
+						xmax := o.ctx.Tx.XID
+						for _, dbOid := range tableCatalogDBOids(o.ctx) {
+							deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+						}
+					}
+					if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+						return fmt.Errorf("DDL catalog sync: %w", syncErr)
+					}
+				}
+				im.RegisterInheritanceChild(parentTbl.OID, tbl.OID)
 			}
 		case parser.AlterTableNoInherit:
 			// NO INHERIT parent_table — unregister the inheritance relationship.
@@ -9311,6 +9365,14 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				}
 				return err
 			}
+			// Un-absorb the child's NOT NULL constraints, mirroring PG's
+			// RemoveInheritance (tablecmds.c:17950-18144, decrement loop
+			// :18103-18125) — twin of the mergeNotNullOnAttach call in the
+			// AlterTableInherit case above. Run before the edge is unregistered
+			// / col.Inherited is cleared below, matching RemoveInheritance's own
+			// ordering (the decrement loop runs while the relationship is still
+			// live). M0134-0005r (design doc §25.4).
+			unmergeNotNullOnDetach(parentTbl, tbl)
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 				// Inside an explicit transaction, defer the unregister to COMMIT so
 				// concurrent sessions keep seeing the child until commit (and a
@@ -13345,16 +13407,19 @@ func clearAttachedColumnsInherited(parent, child *catalog.Table) {
 }
 
 // mergeNotNullOnAttach absorbs the CHILD's NOT NULL constraints into the
-// PARENT's on ALTER TABLE … ATTACH PARTITION, mirroring PG's
-// MergeConstraintsIntoExisting (postgres/src/backend/commands/tablecmds.c:
-// 17638-17817), restricted to the NOT NULL half (CHECK-constraint merging is
-// a separately ledgered gap, M0134-0005q §24.5). For each PARENT
-// NamedNotNullConstraint with !NoInherit, find the CHILD's constraint on the
-// same column (ColName, case-folded — goopg's proxy for PG's attnum match).
-// The constraint keeps its own name; only IsLocal/InhCount are mutated.
-// Callers must run the heap-resync quadruple for the CHILD afterwards (PG
-// writes rows only on conrelid = attachrel). M0134-0005q.
-func mergeNotNullOnAttach(parent, child *catalog.Table) error {
+// PARENT's on ALTER TABLE … ATTACH PARTITION and on plain ALTER TABLE …
+// INHERIT, mirroring PG's shared MergeConstraintsIntoExisting
+// (postgres/src/backend/commands/tablecmds.c:17638-17817), restricted to the
+// NOT NULL half (CHECK-constraint merging is a separately ledgered gap,
+// M0134-0005q §24.5). For each PARENT NamedNotNullConstraint with
+// !NoInherit, find the CHILD's constraint on the same column (ColName,
+// case-folded — goopg's proxy for PG's attnum match). The constraint keeps
+// its own name; only IsLocal/InhCount are mutated. Callers must run the
+// heap-resync quadruple for the CHILD afterwards (PG writes rows only on
+// conrelid = attachrel). isPartition selects the is_partition delta at
+// tablecmds.c:17771-17777 (see below); it is true for ATTACH PARTITION,
+// false for plain INHERIT. M0134-0005q, M0134-0005r (design doc §25.2).
+func mergeNotNullOnAttach(parent, child *catalog.Table, isPartition bool) error {
 	for pi := range parent.NotNullConstraints {
 		pnc := &parent.NotNullConstraints[pi]
 		if pnc.NoInherit {
@@ -13393,11 +13458,14 @@ func mergeNotNullOnAttach(parent, child *catalog.Table) error {
 		// omitted — goopg's NamedNotNullConstraint has no conenforced field
 		// and the fixture does not witness it. M0134-0005q §24.5.
 		//
-		// Absorb: coninhcount++ and (this call site is always the
-		// partitioned-table ATTACH path) conislocal = false, unconditionally
-		// — tablecmds.c:17771-17786.
+		// Absorb: coninhcount++ always (tablecmds.c:17764-17770); conislocal
+		// = false only when the parent is a partitioned table
+		// (tablecmds.c:17771-17777, the is_partition delta) — plain INHERIT
+		// leaves conislocal exactly as-is. M0134-0005r (design doc §25.2).
 		cnc.InhCount++
-		cnc.IsLocal = false
+		if isPartition {
+			cnc.IsLocal = false
+		}
 	}
 	return nil
 }
