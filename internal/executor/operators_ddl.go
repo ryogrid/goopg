@@ -4608,7 +4608,15 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 			}
 			childIdxName = parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + suffix}
 		}
-		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, parentIdx.Columns, nil, parentIdx.Unique, parentIdx.Primary, parentIdx.NullsNotDistinct, parentIdx.ColDescending, parentIdx.ColNullsFirst); err != nil {
+		// M0134-0005f: forward the parent constraint index's Deferrable/
+		// InitiallyDeferred/IsConstraint so the clone honours SET CONSTRAINTS
+		// … DEFERRED and appears in pg_constraint — see btreeIndexProps'
+		// doc comment.
+		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, parentIdx.Columns, nil, parentIdx.Unique, parentIdx.Primary, parentIdx.NullsNotDistinct, parentIdx.ColDescending, parentIdx.ColNullsFirst, &btreeIndexProps{
+			Deferrable:        parentIdx.Deferrable,
+			InitiallyDeferred: parentIdx.InitiallyDeferred,
+			IsConstraint:      parentIdx.IsConstraint,
+		}); err != nil {
 			return err
 		}
 	}
@@ -8377,7 +8385,13 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					}
 					childIdxName = parser.ObjectName{Schema: childTbl.Schema, Name: childTbl.Name + suffix}
 				}
-				_ = o.createBTreeIndex(act.Pos(), childIdxName, childTbl, parentIdx.Columns, nil, parentIdx.Unique, parentIdx.Primary, parentIdx.NullsNotDistinct, parentIdx.ColDescending, parentIdx.ColNullsFirst)
+				// M0134-0005f: same forwarding as the PARTITION OF clone loop
+				// above — see btreeIndexProps' doc comment.
+				_ = o.createBTreeIndex(act.Pos(), childIdxName, childTbl, parentIdx.Columns, nil, parentIdx.Unique, parentIdx.Primary, parentIdx.NullsNotDistinct, parentIdx.ColDescending, parentIdx.ColNullsFirst, &btreeIndexProps{
+					Deferrable:        parentIdx.Deferrable,
+					InitiallyDeferred: parentIdx.InitiallyDeferred,
+					IsConstraint:      parentIdx.IsConstraint,
+				})
 			}
 		case parser.AlterTableDetachPartition:
 			// ALTER TABLE parent DETACH PARTITION child — remove child from parent's
@@ -11637,6 +11651,20 @@ type btreeIndexProps struct {
 	// graceful shutdown checkpoint but reverted to 0 across a genuine crash
 	// restart replayed purely from WAL.
 	Tablespace uint32
+	// Deferrable / InitiallyDeferred / IsConstraint mirror the same-named
+	// catalog.Index fields (indexcmds.c: INDEX_CONSTR_CREATE_DEFERRABLE et
+	// al.). M0134-0005f: the partition-clone call sites (CREATE TABLE …
+	// PARTITION OF and ALTER TABLE … ATTACH PARTITION) forward the parent
+	// constraint index's these three fields through here so the per-partition
+	// clone participates in SET CONSTRAINTS … DEFERRED (deferred_unique.go's
+	// uniqueCheckDeferred gates on idx.Deferrable) and shows up in
+	// pg_constraint (catalog.go's PGConstraintRowsForDBOid filters on
+	// idx.IsConstraint). PG's DefineIndex recurses on the same IndexStmt* per
+	// partition so these propagate for free there; goopg materialises a new
+	// catalog.Index per partition and has no equivalent free path.
+	Deferrable        bool
+	InitiallyDeferred bool
+	IsConstraint      bool
 }
 
 func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalog.Table, columns []string, colExprs []parser.Expr, unique bool, primary bool, nullsNotDistinct bool, colDescending, colNullsFirst []bool, props ...*btreeIndexProps) error {
@@ -11735,6 +11763,9 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 		idx.Fillfactor = xp.Fillfactor
 		idx.DeduplicateItems = xp.DeduplicateItems
 		idx.Tablespace = xp.Tablespace
+		idx.Deferrable = xp.Deferrable
+		idx.InitiallyDeferred = xp.InitiallyDeferred
+		idx.IsConstraint = xp.IsConstraint
 	}
 	// Store parsed expressions for expression-based index columns so the
 	// planner and executor can evaluate them at conflict-detection time.

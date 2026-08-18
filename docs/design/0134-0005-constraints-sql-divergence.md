@@ -766,3 +766,98 @@ The *immediate* (non-deferred) probes `uniqueCheckWithWait`
 no chain-follow. They are far less exposed — each runs synchronously right after
 its own statement's index maintenance — but a same-transaction HOT update of an
 earlier statement's row could in principle open the same blind spot. Not probed.
+
+## 13. Slice `f` — per-partition index clones dropped the parent's constraint attributes (M0134-0005f)
+
+**Status: LANDED 2026-08-18.** Measured `constraints` **1181 → 1164** lines (−17),
+hunks **33 → 33**.
+
+### 13.1 The divergence (two symptoms, one cause)
+
+Upstream case: `postgres/src/test/regress/sql/constraints.sql:432-445`
+(`parted_uniq_tbl`). Pinned by a live two-engine probe before briefing, not guessed:
+
+1. **`pg_constraint` fanout.** PG lists three rows —
+   `parted_uniq_tbl_i_key`, `parted_uniq_tbl_1_i_key`, `parted_uniq_tbl_2_i_key`.
+   goopg listed only the parent's.
+2. **Deferred enforcement.** With the constraint deferred, PG accepts the duplicate
+   INSERT and raises `23505` at **COMMIT**. goopg raised at the INSERT.
+
+### 13.2 Root cause
+
+Both goopg sites that build a partition's copy of the parent's UNIQUE/PK index
+cloned only the *shape* fields and silently dropped the *constraint* fields:
+
+- `internal/executor/operators_ddl.go:4611` — `CREATE TABLE … PARTITION OF`
+- `internal/executor/operators_ddl.go:8380` — `ALTER TABLE … ATTACH PARTITION`
+
+Each called `createBTreeIndex(…, parentIdx.Unique, parentIdx.Primary,
+parentIdx.NullsNotDistinct, parentIdx.ColDescending, parentIdx.ColNullsFirst)` and
+never forwarded `Deferrable`, `InitiallyDeferred`, or `IsConstraint`. The two
+downstream consumers were already correct and are what proved the fix:
+`uniqueCheckDeferred` (`internal/executor/deferred_unique.go:51-53`) reads
+`idx.Deferrable`; `PGConstraintRowsForDBOid` (`internal/catalog/catalog.go:6624-6627`)
+filters on `idx.IsConstraint`. Neither was touched.
+
+**Why PG cannot have this bug.** `postgres/src/backend/commands/indexcmds.c:DefineIndex`
+recurses on the **same `IndexStmt*`** for each partition (dispatch at
+`indexcmds.c:706` for `RELKIND_PARTITIONED_TABLE`), so
+`deferrable`/`initdeferred`/`isconstraint` propagate for free. PG has no per-field
+copy step to get wrong; goopg's clone-a-new-`catalog.Index` architecture does. This
+is an *architectural* divergence class, not a typo — expect the same shape wherever
+goopg clones a catalog object rather than re-running its constructor.
+
+### 13.3 The fix
+
+The three fields were added to the pre-existing `btreeIndexProps` optional-arg struct
+(`operators_ddl.go:~11624`) and applied inside `createBTreeIndex`'s existing
+`if xp != nil` block (`~:11751`), alongside Fillfactor/DeduplicateItems/Tablespace —
+rather than growing the positional signature. Both clone sites forward identically.
+
+Rule #2: the two sites **are** a genuine twin pair (confirmed by reading both, not
+grepping). The column-level declared-UNIQUE path on a partition (`:4620`) and the
+plain-index inheritance loop (`:4631-4674`) are **not** affected — no parent
+constraint to forward, or explicitly excluded.
+
+### 13.4 What this slice did NOT fix — the named `SET CONSTRAINTS` gap
+
+The probe's literal SQL uses `SET CONSTRAINTS parted_uniq_tbl_i_key DEFERRED` — the
+**named** form. That still diverges, and it is a *second, distinct* bug the
+implementer correctly escalated rather than absorbing:
+
+`BasicSession.SetConstraintsNamed` (`internal/executor/session.go:383`) populates a
+flat `map[string]bool` keyed by the name the user typed — the **parent's**
+(`parted_uniq_tbl_i_key`). The per-partition clone is auto-named
+`parted_uniq_tbl_1_i_key`. At recheck time `uniqueCheckDeferToCommit`
+(`internal/executor/deferred_unique.go:66`) looks up `sess.UniqueConstraintDeferred(idx.Name, …)`
+with the **child's** name, misses, and silently falls back to `idx.InitiallyDeferred`
+(false) — so the check runs at statement end.
+
+PG resolves this in `postgres/src/backend/commands/trigger.c:AlterConstraint`, which
+resolves the named constraint's OID and then **walks `pg_constraint.conparentid` to
+collect every descendant partition-child constraint OID** before setting deferred
+state. goopg has no `conparentid` equivalent: `catalog.Index` carries no
+"cloned from constraint X" linkage, and `session.constraintDeferral` is partition-blind.
+
+Consequence for this doc's measurement: the surviving `parted_uniq` hunk
+(`@@ -590,13 +579,13 @@`, 5 matches) is **this gap**, not a psql transcript-echo
+artifact — the ERROR line precedes `COMMIT;` in goopg's transcript precisely because
+goopg errors at the INSERT. Filed as **M0134-0005g** with a ledger row. The same
+flat resolver serves `FKConstraintDeferred`, so FK constraints inherited onto
+partitions are very likely affected too — unprobed.
+
+### 13.5 Guards
+
+`internal/testport/partitioned_deferrable_unique_test.go` (new, 3 tests):
+
+- `TestPort_PartitionedDeferrableUniqueDefersToCommitViaSetConstraintsAll` — the
+  COMMIT-tier `23505` via the **unnamed** `SET CONSTRAINTS ALL DEFERRED` form (the
+  form this slice actually fixes). Proven FAIL-pre by stashing **only**
+  `operators_ddl.go`: pre-fix it fails at the INSERT with
+  `duplicate key value violates unique constraint "parted_uniq_tbl_1_i_key"`. Not vacuous.
+- `TestPort_PartitionedUniqueConstraintFansOutToPgConstraint` — the 3-row
+  `pg_constraint` result for **both** creation paths; the `ATTACH PARTITION` half is
+  what proves the twin site.
+- `TestPort_PartitionedNonDeferrableUniqueErrorsAtInsert` — **negative** guard: a
+  non-deferrable partitioned UNIQUE must still error at INSERT time. Continuing the
+  0005e lesson, one-directional guards are not sufficient for tier-selection fixes.

@@ -1,57 +1,52 @@
-# Working set — M0134-0005d landed; constraints.sql has no cheap slices left
+# Working set — M0134-0005f landed; 0005g filed (named SET CONSTRAINTS)
 
-**Task:** M0134-0005 (`constraints.sql`) — **M0134-0005d landed**. Sub-item `[x]`,
+**Task:** M0134-0005 (`constraints.sql`) — **M0134-0005f LANDED**. Sub-item `[x]`,
 parent case stays `[ ]`. Selected per the Current Priority banner (M0134 next after
 M-NIGHTLY). M-NIGHTLY drained: `ci/logs/action-items.md` still at run
 `20260818-005518`, **items: 0** — nothing to file.
 
-**What landed (two line-disjoint parts, one implementer slice):**
-1. **Parser.** PG accepts `ENFORCED` in the *grammar* (`gram.y:4135-4150`, ordinary
-   `ConstraintAttributeElem`) and rejects it semantically in
-   `parse_utilcmd.c:3991-4021` `transformConstraintAttrs` — `misplaced [NOT] ENFORCED
-   clause`, **42601**, **with** a caret (under `ENFORCED` bare; under `NOT` for the
-   pair). goopg emitted a generic syntax error because `parseConstraintDeferrable`
-   (`internal/parser/ddl.go:2786`) unconditionally swallows a leading `NOT` while
-   probing for `NOT DEFERRABLE`. New `rejectMisplacedEnforced` reuses the pre-existing
-   `isEnforcedAttr` + the `SyntaxError{…,Raw:true}` template; calling it **before**
-   `parseConstraintDeferrable` at the four column-level sites *is* the fix.
-2. **Executor.** `ALTER CONSTRAINT … [NOT] ENFORCED` already matched PG's message and
-   SQLSTATE (42809); only a spurious `LINE`/caret differed. Dropped `Pos: act.Pos()`
-   from two `ExecError`s in `execAlterTableAlterConstraint` (`operators_ddl.go`
-   ~:11061, ~:11091). `Pos == 0` ⇒ no wire `'P'` field.
+**What landed:** per-partition UNIQUE/PK index clones dropped the parent's
+`Deferrable`/`InitiallyDeferred`/`IsConstraint`. Two symptoms, one cause: `pg_constraint`
+showed 1 row where PG shows 3, and a deferred duplicate INSERT errored immediately
+instead of at COMMIT. Both clone sites now forward the three fields via the
+pre-existing `btreeIndexProps` struct: `internal/executor/operators_ddl.go:4611`
+(`PARTITION OF`) and `:8380` (`ATTACH PARTITION`). Downstream consumers
+(`uniqueCheckDeferred`, `PGConstraintRowsForDBOid`) were already correct and untouched.
 
-**Two traps recorded so they are not re-hit:**
-- **Table-level `UNIQUE (…) ENFORCED` is a DIFFERENT PG path** (`processCASbits`):
-  message `"UNIQUE constraints cannot be marked ENFORCED"`, SQLSTATE **0A000**.
-  Reusing the column-level text there would be a NEW divergence. Ledgered, not fixed.
-- **Do not sweep the 4 sibling `Pos: act.Pos()` sites** in the same function — one
-  (`constraints cannot be altered to be NOT VALID`) currently matches PG *with* a
-  caret. Per-site verification only. Ledgered.
+**Three things worth not re-learning:**
+- **PG cannot have this bug by construction** — `indexcmds.c:DefineIndex` recurses on
+  the *same* `IndexStmt*` per partition (`indexcmds.c:706`). goopg clones a fresh
+  `catalog.Index` field-by-field, so every clone site is a silent-drop candidate.
+  Ledgered as an unaudited architectural class.
+- **The implementer's escalation was correct and load-bearing** — the brief's literal
+  probe SQL used the *named* `SET CONSTRAINTS <name>`, which is a DIFFERENT bug. It
+  refused to absorb it; I split it out as 0005g. Guard was retargeted to the unnamed
+  `ALL` form and re-proven FAIL-pre, not softened.
+- The surviving `parted_uniq` hunk is **not** a psql echo artifact (the tester's first
+  read) — goopg's ERROR precedes `COMMIT;` because it errors at the INSERT. That is 0005g.
 
-**Measured:** 1251 → **1232** lines (−19), hunks 35 → **35** (no split); every `+`/`-`
-ENFORCED line gone (3 context lines remain). `timeout 300
-scripts/pg-regress-runner.sh --verbose constraints`; artifact
-`tmp/regress-diffs/constraints.diff`. **Never compare to a pre-2026-08-18 number.**
+**Measured:** 1181 → **1164** lines (−17), hunks 33 → **33**.
+Artifact `tmp/regress-diffs/constraints.diff`. **Never compare to a pre-2026-08-18 number.**
 
-**Next step:** `constraints.sql` has **no cheap slices left** — §11.4 lists only
-CHECK-constraint inheritance naming, COPY FROM not rejecting bad rows, Bucket 3's NOT
-NULL inheritance leftover, the partitioned `parted_uniq_tbl` pair, and Bucket 5 (GiST
-`circle_ops`, a genuine milestone). **Bucket 7 still has no pinned root cause — do not
-brief from it.** Strong candidate instead: the ledgered **silent** integrity gap from
-0005c — an explicit-txn UPDATE that PG rejects at COMMIT with a duplicate key
-**silently commits** on goopg (2 of the 35 hunks). Otherwise move to the next M0134
-case in CSV order. **Probe empirically before briefing** — the doc's own guess has now
-been wrong three times.
+**Next step:** re-measure first, then pick. Candidates, best first: **M0134-0005g**
+(named `SET CONSTRAINTS` → `conparentid`-equivalent linkage; needs a new
+`catalog.Index` field, size >1 slice, and **probe the FK twin first** — the same flat
+resolver serves `FKConstraintDeferred`). Otherwise §11.4's remaining list: CHECK-constraint
+inheritance naming, COPY FROM not rejecting bad rows, Bucket 3's NOT NULL inheritance
+leftover, Bucket 5 (GiST `circle_ops`, a genuine milestone). **Bucket 7 still has no
+pinned root cause — do not brief from it.** **Probe empirically before briefing** —
+this doc's own guesses have been wrong four times.
 
 **Gates run:** `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS
-(initdb + cmd/goopg ran cold — cache miss, not a regression signal);
-`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35 — Rule #1);
-`go test ./internal/parser/... ./internal/executor/... ./internal/postmaster/...` PASS;
-new guards FAIL-pre/PASS-post by stashing the single changed file.
+(~7m52s; `internal/initdb` 417s uncached — input change, not a cold-cache event);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35 — Rule #1); `internal/executor` +
+`internal/catalog` + `internal/postmaster` PASS; all 3 new guards PASS with FAIL-pre
+proven by stashing only `operators_ddl.go`; pre-commit pgbench smoke PASS via the hook.
 
-**Delegation:** `tmp/ralph-handoffs/m0134-0005d-enforced-clause-fidelity/`
-(researcher `a16a0752465c2409e`, DONE — the live probe is what found the `NOT`-swallow);
-`tmp/ralph-handoffs/m0134-0005d-s1-enforced-fidelity/` (implementer
-`aa5b5271315b7a841`, 1 round DONE, no deviations); tester `ad227756292443d23` (gates).
+**Delegation:** `tmp/ralph-handoffs/m0134-0005f-probe/` (researcher `af58d10808a28c43a`,
+DONE — live two-engine probe pinned the cause);
+`tmp/ralph-handoffs/m0134-0005f-s1-partition-index-constraint-attrs/` (implementer
+`a688b010429ee11f0`, 2 rounds, DONE — round 1 NEEDS-DECISION, round 2 retarget);
+tester `a354a0fb1b0ebaeac` (gates + re-measure).
 
 **In-flight:** none.
