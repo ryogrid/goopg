@@ -2012,3 +2012,133 @@ Gates: `go build ./...`; `go test ./internal/{executor,catalog}/`;
 `go test -run 'TestPort_.*(NotNull|Constraint|Inherit|Partition)' ./internal/testport/`
 (40 subtests); `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
 `scripts/tpch-spotcheck.sh` PASS (**Q12=2, Q13=35** — Rule #1).
+
+## 24. M0134-0005q — `ATTACH`/`DETACH PARTITION` never absorb the child's NOT NULL constraints
+
+Status: **accepted / LANDED 2026-08-18**. Baseline at selection: **763 diff lines / 30 hunks**
+(re-measured at `bae52414`, unchanged from §23.5 — 0005p unmasked nothing).
+
+### 24.1 Symptom (what the regress diff witnesses)
+
+Two hunks, ~54 diff lines total:
+
+| hunk | source | symptom |
+|---|---|---|
+| `@@ -1468,54 +1466,49 @@` | `constraints.sql:918-960` | `notnull_tbl1_2`/`_3` keep `conislocal=t, coninhcount=0` after `ATTACH PARTITION` (PG: `f`/`1`); the follow-on `SET NOT NULL` / `VALIDATE CONSTRAINT nn3` errors PG raises never fire; and `ALTER TABLE pp_nn ATTACH PARTITION pp_nn_1` silently succeeds where PG raises `42P17 constraint "nn1" conflicts with NOT VALID constraint on child table "pp_nn_1"`, desynchronising ~12 further lines |
+| `@@ -1545,18 +1538,17 @@` | `constraints.sql:983-991` | the `notnull_part1_*_upg` pg_upgrade fixture — same `t/0` vs `f/1` divergence, **4 lines only** |
+
+**Not this bug, inside the same spans** (do not credit to this slice): the
+`regclass` `ORDER BY` sort bug and the suppressed `merging column` NOTICE (both
+ledgered under the 0005p rows), the recursive `QueueNNConstraintValidation` gap
+(ledgered under 0005p), and the ATACC3/`ALTER TABLE … INHERIT` validation hunks
+(0005k) — the latter share PG's fan-in function but arrive from a **different
+call site**.
+
+### 24.2 Root cause — PG's fan-in function has no goopg counterpart
+
+The 0005p ledger guessed `AdjustNotNullInheritance`; **that guess is wrong for
+this path**. `AdjustNotNullInheritance` serves only same-table paths (`ADD
+CONSTRAINT` / `ADD PRIMARY KEY` / identity — 0005n/0005o). ATTACH flows through:
+
+- `tablecmds.c:ATExecAttachPartition` (:20250) → `CreateInheritance(attachrel,
+  rel, ispartition=true)` (:20448)
+- `CreateInheritance` (:17374) → `MergeAttributesIntoExisting` (:17419, the
+  column-level twin goopg *does* implement as `markAttachedColumnsInherited`)
+  → **`MergeConstraintsIntoExisting` (:17422)** — the constraint-level merge,
+  **entirely absent in goopg**.
+
+`MergeConstraintsIntoExisting` (:17638-17817), per parent constraint with
+`contype IN (CHECK, NOTNULL)` and `!connoinherit`, matching the child's NOT NULL
+**by attribute number, not by name** (:17709-17718):
+
+1. child `connoinherit` → `42P17` `constraint "%s" conflicts with non-inherited constraint on child table "%s"` (:17736)
+2. parent validated && child enforced && !child validated → `42P17` `constraint "%s" conflicts with NOT VALID constraint on child table "%s"` (:17746) ← the missing `pp_nn` error
+3. parent enforced && !child enforced → `42P17` NOT ENFORCED conflict (:17758) — **goopg's model has no `conenforced` on NOT NULL; out of scope, ledgered**
+4. otherwise absorb: `coninhcount++` (:17771); **only when the parent is `RELKIND_PARTITIONED_TABLE`** `conislocal = false` (:17782) — plain `INHERITS` leaves `conislocal` alone
+5. no matching child constraint → `42804` `column "%s" in child table "%s" must be marked NOT NULL` (:17797)
+
+DETACH is the exact twin: `ATExecDetachPartition`/`…Finalize` → `RemoveInheritance`
+(:17950-18144, shared with `ATExecDropInherit`): `coninhcount--`, and
+`conislocal = true` once it reaches 0 (:18123). Never decrement past 0 (PG
+`elog`s an internal assert there, :18119).
+
+The constraint **keeps its own name** across absorb and detach — the merge is
+positional, never a rename.
+
+### 24.3 goopg's gap (confirmed, both directions)
+
+- `internal/executor/operators_ddl.go:8332` (`AlterTableAttachPartition`): clones
+  FKs, checks default-partition conflicts, propagates indexes, calls
+  `markAttachedColumnsInherited` (:8508) — and touches `NotNullConstraints`
+  **zero times**.
+- `:8730` / `:8763` (`AlterTableDetachPartition`, both branches): call
+  `clearAttachedColumnsInherited` (:13273), likewise never touching
+  `NotNullConstraints`.
+- The column-level pair `markAttachedColumnsInherited` (:13250) /
+  `clearAttachedColumnsInherited` (:13273) is the **structural template** — this
+  slice adds their constraint-level twins.
+- `catalog.Table.AddNotNull` (`internal/catalog/catalog.go:254`) is a pure append
+  that validates nothing (the 0005p root cause); the in-place-merge shape to
+  reuse is `AlterTableSetNotNull`'s already-exists branch
+  (`operators_ddl.go:9862-9882`).
+- **Heap resync**: per the 0005o convention every `NotNullConstraints` write site
+  needs `catalogHeapSyncAvailable` → `MaterializeWriterXID` →
+  `deleteCatalogRowsForOID` (looped over `tableCatalogDBOids`) →
+  `syncTableToCatalogHeap` (template at `:9891-9901`). ATTACH/DETACH run none of
+  it today. PG writes rows only on `conrelid = attachrel`, so **only the child**
+  needs the resync — the parent's own constraint rows are untouched.
+
+### 24.4 Design
+
+Add the two constraint-level twins alongside the existing column-level ones, and
+run the merge at **statement execution time** in every ATTACH branch (including
+the deferred one): PG raises its `42P17`/`42804` errors from
+`ATExecAttachPartition` itself, so deferring the check to COMMIT would report the
+error at the wrong statement.
+
+1. `mergeNotNullOnAttach(parent, child *catalog.Table) error` — cases 1, 2, 4, 5
+   of §24.2 (case 3 omitted, ledgered). Match on `ColName` case-folded (goopg's
+   proxy for PG's attnum match — equivalent because a column name is unique
+   within a table).
+2. `unmergeNotNullOnDetach(parent, child *catalog.Table)` — `InhCount--`,
+   `IsLocal = (InhCount == 0)`, clamped at 0.
+3. Heap-resync quadruple for the child after either mutation.
+4. Error messages byte-identical to PG's, with PG's SQLSTATEs (`42P17`, `42804`).
+
+### 24.5 Out of scope (ledgered, not fixed here)
+
+- The **CHECK-constraint half** of `MergeConstraintsIntoExisting` — same function
+  upstream, separate witness set.
+- The **NOT ENFORCED** conflict branch — goopg's `NamedNotNullConstraint` has no
+  `conenforced` field; unwitnessed by this fixture.
+- The plain `ALTER TABLE … INHERIT` call site (`ATExecAddInherit`), which shares
+  the upstream function but differs in the `conislocal` rule (§24.2 step 4) —
+  that is 0005k's territory.
+
+### 24.6 Outcome (LANDED 2026-08-18)
+
+Measured **763 → 738 lines**, hunks 30 → **31** — the +1 is a pure split of the
+shrunk hunk (the surrounding `@@` header list is byte-identical). The §24.1 sizing
+prediction held exactly: ~54 lines were ever this bug's, and the rest of the span
+belongs to the separately-ledgered `regclass` sort / suppressed NOTICE /
+`QueueNNConstraintValidation` gaps, which were correctly not chased.
+
+Landed as `mergeNotNullOnAttach` (`internal/executor/operators_ddl.go:13347`) and
+`unmergeNotNullOnDetach` (`:13405`), wired at ATTACH (~:8409), concurrent-detach
+phase 2 (~:8757) and plain DETACH/FINALIZE (~:8790), each followed by the
+child-only heap-resync quadruple. 144 production lines, 4 new real-server guards in
+`internal/testport/notnull_inherit_counters_test.go` (all FAIL-pre / PASS-post).
+
+**One oracle correction worth carrying forward:** §24.2's steps 1 and 2 quote PG's
+`errmsg` with `%s` = the constraint name, and the brief assumed that meant the
+*parent's*. It is the **child's** (`NameStr(child_con->conname)`), confirmed
+against `expected/constraints.out:1581`, where `nn1` is `pp_nn_1`'s own
+constraint. **When pinning a message's arguments, read the expected output, not
+only the `errmsg` call site** — the call site alone is ambiguous about which of
+two same-typed variables is in scope.
+
+Gates: `go build ./...`; `go test ./internal/{executor,catalog}/`;
+`go test -run 'TestPort_.*(NotNull|Constraint|Inherit|Partition)' ./internal/testport/`;
+`scripts/pg-regress-runner.sh constraints`;
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35 — Rule #1).

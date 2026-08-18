@@ -8406,6 +8406,33 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					return err
 				}
 			}
+			// Absorb the child's NOT NULL constraints into the parent's,
+			// mirroring PG's CreateInheritance → MergeConstraintsIntoExisting
+			// (tablecmds.c:17422, :17638-17817), reached from
+			// ATExecAttachPartition itself — run at statement time, BEFORE
+			// any catalog mutation below (FK cloning, bound assignment,
+			// index propagation), so a failed merge (42P17/42804) leaves no
+			// partial attach behind. Runs in every ATTACH branch — including
+			// the deferred-to-commit one below — because PG raises these
+			// errors synchronously from ATExecAttachPartition, not at
+			// commit. M0134-0005q.
+			if err := mergeNotNullOnAttach(tbl, childTbl); err != nil {
+				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+					ee.Pos = act.Pos()
+				}
+				return err
+			}
+			if catalogHeapSyncAvailable(o.ctx) {
+				if err := o.ctx.MaterializeWriterXID(); err == nil {
+					xmax := o.ctx.Tx.XID
+					for _, dbOid := range tableCatalogDBOids(o.ctx) {
+						deleteCatalogRowsForOID(o.ctx, dbOid, childTbl.OID, xmax)
+					}
+				}
+				if syncErr := syncTableToCatalogHeap(o.ctx, childTbl); syncErr != nil {
+					return fmt.Errorf("DDL catalog sync: %w", syncErr)
+				}
+			}
 			// Clone the parent partitioned table's foreign keys onto the new
 			// partition and validate its existing rows against the referenced
 			// table — PG ATExecAttachPartition → CloneForeignKeyConstraints. Runs
@@ -8728,6 +8755,21 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				// Phase 2: finalize the detach.
 				im.UnregisterPartitionChild(tbl.OID, childTbl.OID)
 				clearAttachedColumnsInherited(tbl, childTbl)
+				// Un-absorb the child's NOT NULL constraints, mirroring PG's
+				// RemoveInheritance (tablecmds.c:17950-18144), twin of
+				// mergeNotNullOnAttach. M0134-0005q.
+				unmergeNotNullOnDetach(tbl, childTbl)
+				if catalogHeapSyncAvailable(o.ctx) {
+					if err := o.ctx.MaterializeWriterXID(); err == nil {
+						xmax := o.ctx.Tx.XID
+						for _, dbOid := range tableCatalogDBOids(o.ctx) {
+							deleteCatalogRowsForOID(o.ctx, dbOid, childTbl.OID, xmax)
+						}
+					}
+					if syncErr := syncTableToCatalogHeap(o.ctx, childTbl); syncErr != nil {
+						return fmt.Errorf("DDL catalog sync: %w", syncErr)
+					}
+				}
 				childTbl.PartitionParentOID = 0
 				childTbl.PartitionBounds = nil
 				im.ClearPartitionDetachPending(childTbl.OID)
@@ -8761,6 +8803,20 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				}
 				im.UnregisterPartitionChild(tbl.OID, childTbl.OID)
 				clearAttachedColumnsInherited(tbl, childTbl)
+				// Un-absorb the child's NOT NULL constraints — twin of the
+				// concurrent-detach phase-2 branch above. M0134-0005q.
+				unmergeNotNullOnDetach(tbl, childTbl)
+				if catalogHeapSyncAvailable(o.ctx) {
+					if err := o.ctx.MaterializeWriterXID(); err == nil {
+						xmax := o.ctx.Tx.XID
+						for _, dbOid := range tableCatalogDBOids(o.ctx) {
+							deleteCatalogRowsForOID(o.ctx, dbOid, childTbl.OID, xmax)
+						}
+					}
+					if syncErr := syncTableToCatalogHeap(o.ctx, childTbl); syncErr != nil {
+						return fmt.Errorf("DDL catalog sync: %w", syncErr)
+					}
+				}
 				childTbl.PartitionParentOID = 0
 				childTbl.PartitionBounds = nil
 				im.ClearPartitionDetachPending(childTbl.OID)
@@ -13284,6 +13340,94 @@ func clearAttachedColumnsInherited(parent, child *catalog.Table) {
 				col.Inherited = false
 				break
 			}
+		}
+	}
+}
+
+// mergeNotNullOnAttach absorbs the CHILD's NOT NULL constraints into the
+// PARENT's on ALTER TABLE … ATTACH PARTITION, mirroring PG's
+// MergeConstraintsIntoExisting (postgres/src/backend/commands/tablecmds.c:
+// 17638-17817), restricted to the NOT NULL half (CHECK-constraint merging is
+// a separately ledgered gap, M0134-0005q §24.5). For each PARENT
+// NamedNotNullConstraint with !NoInherit, find the CHILD's constraint on the
+// same column (ColName, case-folded — goopg's proxy for PG's attnum match).
+// The constraint keeps its own name; only IsLocal/InhCount are mutated.
+// Callers must run the heap-resync quadruple for the CHILD afterwards (PG
+// writes rows only on conrelid = attachrel). M0134-0005q.
+func mergeNotNullOnAttach(parent, child *catalog.Table) error {
+	for pi := range parent.NotNullConstraints {
+		pnc := &parent.NotNullConstraints[pi]
+		if pnc.NoInherit {
+			continue
+		}
+		var cnc *catalog.NamedNotNullConstraint
+		for ci := range child.NotNullConstraints {
+			if strings.EqualFold(child.NotNullConstraints[ci].ColName, pnc.ColName) {
+				cnc = &child.NotNullConstraints[ci]
+				break
+			}
+		}
+		if cnc == nil {
+			// tablecmds.c:17797-17812 — no matching child constraint.
+			return &ExecError{Code: "42804",
+				Message: fmt.Sprintf("column %q in child table %q must be marked NOT NULL", pnc.ColName, child.Name)}
+		}
+		if cnc.NoInherit {
+			// tablecmds.c:17736-17740. PG's errmsg names the CHILD
+			// constraint (NameStr(child_con->conname)), confirmed against
+			// live expected/constraints.out — not the parent's, despite the
+			// brief's parenthetical.
+			return &ExecError{Code: "42P17",
+				Message: fmt.Sprintf("constraint %q conflicts with non-inherited constraint on child table %q", cnc.Name, child.Name)}
+		}
+		if !pnc.NotValid && cnc.NotValid {
+			// tablecmds.c:17746-17751 — the missing pp_nn/nn1 ATTACH-time
+			// error. Uses the CHILD constraint's name (see note above);
+			// pinned against expected/constraints.out:1581
+			// (`ERROR: constraint "nn1" conflicts with NOT VALID constraint
+			// on child table "pp_nn_1"` — nn1 is pp_nn_1's OWN constraint).
+			return &ExecError{Code: "42P17",
+				Message: fmt.Sprintf("constraint %q conflicts with NOT VALID constraint on child table %q", cnc.Name, child.Name)}
+		}
+		// NOT ENFORCED conflict (tablecmds.c:17758-17762) intentionally
+		// omitted — goopg's NamedNotNullConstraint has no conenforced field
+		// and the fixture does not witness it. M0134-0005q §24.5.
+		//
+		// Absorb: coninhcount++ and (this call site is always the
+		// partitioned-table ATTACH path) conislocal = false, unconditionally
+		// — tablecmds.c:17771-17786.
+		cnc.InhCount++
+		cnc.IsLocal = false
+	}
+	return nil
+}
+
+// unmergeNotNullOnDetach is the DETACH twin of mergeNotNullOnAttach, mirroring
+// PG's RemoveInheritance (postgres/src/backend/commands/tablecmds.c:
+// 17950-18144): for each CHILD NamedNotNullConstraint whose column matches a
+// PARENT constraint's column, decrement InhCount and set IsLocal=true once it
+// reaches 0 (:18123-18125). Never decrements below 0 (PG elog-asserts this
+// internally at :18119-18121; goopg treats it as an invariant, not a
+// user-facing error). Callers must run the heap-resync quadruple for the
+// CHILD afterwards. M0134-0005q.
+func unmergeNotNullOnDetach(parent, child *catalog.Table) {
+	for ci := range child.NotNullConstraints {
+		cnc := &child.NotNullConstraints[ci]
+		matched := false
+		for pi := range parent.NotNullConstraints {
+			if strings.EqualFold(parent.NotNullConstraints[pi].ColName, cnc.ColName) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		if cnc.InhCount > 0 {
+			cnc.InhCount--
+		}
+		if cnc.InhCount == 0 {
+			cnc.IsLocal = true
 		}
 	}
 }
