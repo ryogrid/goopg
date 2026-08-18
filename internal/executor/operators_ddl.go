@@ -1943,6 +1943,59 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				}
 			}
 		}
+		// mergeExplicitColumnIntoInherited implements PostgreSQL's column-merge
+		// semantics shared by plain explicit columns and LIKE-sourced columns
+		// (postgres/src/backend/commands/tablecmds.c:3259 MergeChildAttribute):
+		// a column redeclared by the child that collides by name with an
+		// already-inherited column merges into the SAME cols[] entry (emitting
+		// "merging column %q with inherited definition") instead of appending a
+		// second entry; a collision with a column that was NOT inherited (a
+		// duplicate explicit/LIKE column) is a hard 42701 error. Both the addCol
+		// closure below and the @@LIKE: branch call this helper so they cannot
+		// drift out of sync (Hard-won Rule #2 — sibling paths must stay in
+		// sync). M0134-0005ab.
+		mergeExplicitColumnIntoInherited := func(c catalog.Column) (merged bool, err error) {
+			lname := strings.ToLower(c.Name)
+			for i := range cols {
+				if !strings.EqualFold(cols[i].Name, c.Name) {
+					continue
+				}
+				if !inheritedColNames[lname] {
+					// Column already defined by an explicit column or a previous LIKE
+					// clause. PostgreSQL raises "column X specified more than once" (42701).
+					return false, &ExecError{
+						Code:    "42701",
+						Pos:     s.Pos(),
+						Message: fmt.Sprintf("column %q specified more than once", c.Name),
+					}
+				}
+				// PostgreSQL emits the merging NOTICE before the storage conflict error.
+				o.ctx.AddNotice(fmt.Sprintf("merging column %q with inherited definition", c.Name))
+				if c.Storage != "" {
+					ecStor := strings.ToLower(cols[i].Storage)
+					ccStor := strings.ToLower(c.Storage)
+					if ecStor == "" {
+						ecStor = "extended"
+					}
+					if ccStor == "" {
+						ccStor = "extended"
+					}
+					if ecStor != ccStor {
+						return false, &ExecError{
+							Code:    "42611",
+							Pos:     s.Pos(),
+							Message: fmt.Sprintf("inherited column %q has a storage parameter conflict", c.Name),
+							Detail:  fmt.Sprintf("%s versus %s", strings.ToUpper(ecStor), strings.ToUpper(ccStor)),
+						}
+					}
+				}
+				if c.NotNull {
+					cols[i].NotNull = true
+				}
+				return true, nil
+			}
+			return false, nil
+		}
 		addCol := func(c parser.ColumnDef) error {
 			typeName := strings.ToLower(c.Type.Name)
 			declaredTypeName := "" // non-empty only when a domain is resolved
@@ -1985,7 +2038,13 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			if verr := validateColumnStorage(o.ctx.Catalog, col); verr != nil {
 				return verr
 			}
-			cols = append(cols, col)
+			merged, err := mergeExplicitColumnIntoInherited(col)
+			if err != nil {
+				return err
+			}
+			if !merged {
+				cols = append(cols, col)
+			}
 			return nil
 		}
 		for _, item := range s.BodyOrder {
@@ -2014,57 +2073,6 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 					likeStatisticsSources = append(likeStatisticsSources, likeStatisticsSource{src: src})
 				}
 				for _, sc := range src.Columns {
-					colNameLower := strings.ToLower(sc.Name)
-					found := false
-					for _, ec := range cols {
-						if strings.EqualFold(ec.Name, sc.Name) {
-							found = true
-							break
-						}
-					}
-					if found {
-						if inheritedColNames[colNameLower] {
-							// PostgreSQL emits the merging NOTICE before the storage conflict error.
-							o.ctx.AddNotice(fmt.Sprintf("merging column %q with inherited definition", sc.Name))
-							// Check for storage conflict when INCLUDING STORAGE.
-							if includeStorage {
-								for _, ec := range cols {
-									if strings.EqualFold(ec.Name, sc.Name) {
-										ecStor := strings.ToLower(ec.Storage)
-										scStor := strings.ToLower(sc.Storage)
-										if ecStor == "" {
-											ecStor = "extended"
-										}
-										if scStor == "" {
-											scStor = "extended"
-										}
-										if ecStor != scStor {
-											return &ExecError{
-												Code:    "42611",
-												Pos:     s.Pos(),
-												Message: fmt.Sprintf("inherited column %q has a storage parameter conflict", sc.Name),
-												Detail:  fmt.Sprintf("%s versus %s", strings.ToUpper(ecStor), strings.ToUpper(scStor)),
-											}
-										}
-										break
-									}
-								}
-							}
-						} else {
-							// Column already defined by an explicit column or a previous LIKE clause.
-							// PostgreSQL raises "column X specified more than once" (42701).
-							return &ExecError{
-								Code:    "42701",
-								Pos:     s.Pos(),
-								Message: fmt.Sprintf("column %q specified more than once", sc.Name),
-							}
-						}
-						// Either way, skip (don't add the column again) and continue.
-						if includeConstraints {
-							likeCheckConstraints = appendLikeChecks(likeCheckConstraints, src)
-						}
-						continue
-					}
 					c := sc
 					// Clear IdentityColumn unless INCLUDING IDENTITY or INCLUDING ALL was specified.
 					if !includeIdentity {
@@ -2083,6 +2091,17 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 					// Clear Storage unless INCLUDING STORAGE or INCLUDING ALL was specified.
 					if !includeStorage {
 						c.Storage = ""
+					}
+					merged, err := mergeExplicitColumnIntoInherited(c)
+					if err != nil {
+						return err
+					}
+					if merged {
+						// Either way, skip (don't add the column again) and continue.
+						if includeConstraints {
+							likeCheckConstraints = appendLikeChecks(likeCheckConstraints, src)
+						}
+						continue
 					}
 					cols = append(cols, c)
 					// Carry forward the source table's NOT NULL constraint name for
@@ -4086,7 +4105,31 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			// but partitions always print every column inline regardless of
 			// locality (pg_dump.c's `tbinfo->ispartition` check), so this
 			// re-derivation only matters for s.PartitionOf == nil. DU-002.
-			if col.Inherited && s.PartitionOf == nil {
+			//
+			// col.Inherited alone under-fires here: it is FALSE whenever the
+			// child textually redeclares the column (attislocal must be true
+			// per MergeChildAttribute, tablecmds.c:3392 `inhdef->is_local =
+			// true` unconditionally) -- even when the redeclaration carries no
+			// NOT NULL keyword of its own (`CREATE TABLE child (a int, ...)
+			// INHERITS (parent)` where parent has a NAMED not-null
+			// constraint). PG's constraint-level merge (MergeChildAttribute
+			// tablecmds.c:3332 `inhdef->is_not_null |= newdef->is_not_null`)
+			// does NOT make that case locally-owned at the pg_constraint
+			// level: verified live against goopg (constraints.sql's
+			// notnull_tbl1_child) and cross-checked against
+			// constraints.out:1437-1445 -- expects conname='nn' (the parent's
+			// name), conislocal='f', coninhcount=1. So the pg_constraint
+			// locality signal here must be "did the child's OWN ColumnDef
+			// carry an explicit NOT NULL keyword" (explicitNotNullLocal), not
+			// "is the column absent from the child's column list"
+			// (col.Inherited) -- a bare retype-only redeclaration must still
+			// route through the parent-name/non-local branch below.
+			// M0134-0005ab.
+			explicitNotNullLocal := false
+			if oc, ok2 := origColByName[colKey]; ok2 && oc.NotNullExplicit {
+				explicitNotNullLocal = true
+			}
+			if (col.Inherited || !explicitNotNullLocal) && s.PartitionOf == nil {
 				for _, parent := range inheritParents {
 					for _, pnc := range parent.NotNullConstraints {
 						if pnc.NoInherit {
@@ -4104,19 +4147,23 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				if inhCount > 0 {
 					isLocal = false
 				}
-			} else if !col.Inherited && s.PartitionOf == nil {
+			} else if !col.Inherited && explicitNotNullLocal && s.PartitionOf == nil {
 				// Column explicitly re-declared in the child's own column
-				// list (e.g. `CREATE TABLE child (id int NOT NULL, ...)
-				// INHERITS (parent)`) that ALSO matches a NOT NULL
-				// constraint enforced by an INHERITS parent: PG's
-				// MergeAttributes ("merging column ... with inherited
-				// definition") still counts the parent's enforcement,
-				// giving coninhcount=1 despite conislocal=t and the child's
-				// own auto-generated name (verified live against PG 18.3).
-				// No pg_dump text impact (print_notnull only gates on
+				// list WITH its own literal NOT NULL keyword (e.g. `CREATE
+				// TABLE child (id int NOT NULL, ...) INHERITS (parent)`) that
+				// ALSO matches a NOT NULL constraint enforced by an INHERITS
+				// parent: PG's MergeAttributes ("merging column ... with
+				// inherited definition") still counts the parent's
+				// enforcement, giving coninhcount=1 despite conislocal=t and
+				// the child's own auto-generated name (verified live against
+				// PG 18.3). A retype-only redeclaration (no literal NOT NULL
+				// keyword) does NOT reach this branch -- it is routed through
+				// the branch above instead (explicitNotNullLocal is false),
+				// matching PG's own conislocal=f/parent-name behavior for that
+				// case. No pg_dump text impact (print_notnull only gates on
 				// conislocal for a plain-INHERITS child), but pg_constraint
 				// itself must match for direct-catalog consumers
-				// (pg_upgrade, introspection). DU-002.
+				// (pg_upgrade, introspection). DU-002 / M0134-0005ab.
 				for _, parent := range inheritParents {
 					for _, pnc := range parent.NotNullConstraints {
 						if pnc.NoInherit {

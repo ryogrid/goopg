@@ -3094,3 +3094,88 @@ PASS-post): `TestCheckConstraintTableoidEnforcedOnInsert`,
 `TestCheckConstraintSystemColumnRejectedAtAlterTable`, and
 `TestCheckConstraintTableoidAcceptedAtAlterTable` — the last one guarding against
 **over**-rejection, since the whole point of the rule is that `tableoid` stays legal.
+
+## 35. M0134-0005ab — plain `INHERITS` never merged a redeclared column, so it silently created the column TWICE (LANDED 2026-08-19)
+
+Selected from the 0005aa census as the largest remaining cluster (4 of 23 hunks).
+Measured **460 lines / 23 hunks → 406 lines / 21 hunks**.
+
+### 35.1 One root cause, three symptoms
+
+PG collects a new table's columns in two ordered passes (`MergeAttributes`,
+`postgres/src/backend/commands/tablecmds.c`): first the `INHERITS` parent scan,
+then a separate loop over the child's own declared columns. When a child-declared
+column collides by name with one already collected from a parent,
+`MergeChildAttribute` (`tablecmds.c:3259`) **merges into the existing entry** and
+emits `NOTICE: merging column "%s" with inherited definition`. The sibling
+`MergeInheritedAttribute` (`tablecmds.c:3430`) does the same across parents with
+`merging multiple inherited definitions of column "%s"` (N parents sharing a
+column ⇒ N−1 notices). `transformTableLikeClause`
+(`postgres/src/backend/parser/parse_utilcmd.c`) emits **none** of these — LIKE
+columns are simply more entries the same merge logic sees, which is why one
+shared code path is the faithful shape.
+
+goopg had implemented that merge **only inside the `@@LIKE:` branch** of
+`execCreateTable` (`internal/executor/operators_ddl.go`). The plain
+explicit-column path — the `addCol` closure — never consulted
+`inheritedColNames` and unconditionally appended, and nothing between there and
+`catalog.InMemory.CreateTable` de-duplicates. This is a textbook instance of
+Hard-won Rule #2: two siblings of one rule, one of them silently unimplemented.
+
+Three diff symptoms, all downstream of that single append:
+
+1. **Missing NOTICE.** `CREATE TABLE c (a int) INHERITS (p)` emitted nothing.
+2. **A genuinely duplicated column.** Verified live before the fix: `c (a int, b
+   int) INHERITS (p)` produced **four** `pg_attribute` rows, not two.
+3. **A DOUBLE "merging multiple inherited definitions" NOTICE** on a 3-level
+   chain (`notnull_inhparent`/`notnull_inhchild`/`notnull_inhgrand`). The
+   multi-parent site was *not itself* buggy — it faithfully fires once per
+   colliding parent — but it iterated a middle table whose own `Columns` slice
+   already carried `i` twice from symptom 2. Fixing `addCol` made it correct with
+   **zero changes to that site**, which is why the brief forbade touching it in
+   the first round.
+
+### 35.2 The merge needs a provenance signal `col.Inherited` cannot carry
+
+Satisfying PG's constraint identity for a merged column (`conname` from the
+parent, `conislocal=false`, `coninhcount=1`) exposed a second gap. The
+NOT-NULL locality branch keyed off `col.Inherited`, which is false whenever the
+child textually redeclares a column — so it could not tell apart:
+
+- `child (a int) INHERITS (p)` — retype only ⇒ **merge**, keep the parent's
+  constraint name, `conislocal=false`; from
+- `child2_t (id integer NOT NULL, …) INHERITS (parent_t)` — the child wrote
+  `NOT NULL` itself ⇒ the constraint stays **local** with the child's own name.
+
+Both redeclare; only the second is local. The distinguishing fact is whether the
+child's `ColumnDef` carried an explicit `NOT NULL` token, which the parse already
+records as `NotNullExplicit`. Threading that through as an `explicitNotNullLocal`
+signal is what makes both cases correct simultaneously. The pre-existing
+`child2_t` assertion was kept untouched **as the over-merge guard** — a fix that
+made the new case pass by relaxing that test would have traded one wrong answer
+for another.
+
+### 35.3 Shape of the fix
+
+A single shared helper (`mergeExplicitColumnIntoInherited`) now owns the whole
+rule — collision lookup, the 42701 "specified more than once" error for a
+non-inherited collision, the storage/type-conflict checks, the NOT-NULL OR-in,
+and the NOTICE — and **both** the `addCol` path and the `@@LIKE:` branch call it.
+The LIKE branch's bespoke inline copy was deleted rather than left in place, so
+the two siblings cannot drift apart again.
+
+Guards (FAIL-pre / PASS-post), in
+`internal/executor/operators_ddl_named_check_test.go`:
+`TestInheritsMergesRedeclaredColumnCount` (the duplicate-column half — the
+symptom that was invisible in the diff text),
+`TestInheritsThreeLevelChainMergeNoticeFiresOnce` (the double emission), and
+`TestInheritsRedeclaredColumnKeepsInheritedNotNullIdentity` (constraint
+identity), alongside the retained `child2_t` over-merge guard.
+
+### 35.4 Deferred (ledgered 2026-08-19)
+
+`ALTER TABLE parent ALTER col SET NOT NULL` does not propagate
+`convalidated=true` down to an already-merged NOT NULL constraint on an INHERITS
+descendant — `notnull_inhchild`/`notnull_inhgrand` keep `convalidated=f`. That is
+a cascade-validation gap in the ALTER path, structurally separate from this
+slice's CREATE-time merge, and it survives into the remaining 21 hunks.

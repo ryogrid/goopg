@@ -631,3 +631,158 @@ func TestCheckViolationReportsNameAndDetail(t *testing.T) {
 		t.Errorf("pg_constraint did not surface named check %q", "foo")
 	}
 }
+
+// TestInheritsMergesRedeclaredColumnCount verifies that a child that
+// re-declares a column already inherited from an INHERITS parent merges the
+// two into ONE catalog entry rather than appending a duplicate — the plain
+// explicit-column path (addCol) must share the same merge helper the
+// `LIKE` branch already used. Also asserts the "merging column %q with
+// inherited definition" NOTICE fires exactly once per redeclared column
+// (postgres/src/backend/commands/tablecmds.c:3259 MergeChildAttribute).
+// M0134-0005ab.
+func TestInheritsMergesRedeclaredColumnCount(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE p (a int, b int)`); err != nil {
+		t.Fatalf("CREATE TABLE p: %v", err)
+	}
+	ctx.Notices = nil
+	if err := runDDL(t, ctx, `CREATE TABLE c (a int, b int) INHERITS (p)`); err != nil {
+		t.Fatalf("CREATE TABLE c: %v", err)
+	}
+
+	cTbl, ok := cat.LookupTable(parser.ObjectName{Name: "c"})
+	if !ok {
+		t.Fatal("c table not found")
+	}
+	counts := map[string]int{}
+	for _, col := range cTbl.Columns {
+		counts[strings.ToLower(col.Name)]++
+	}
+	if counts["a"] != 1 {
+		t.Errorf("c.a should appear exactly once, got %d entries (Columns=%+v)", counts["a"], cTbl.Columns)
+	}
+	if counts["b"] != 1 {
+		t.Errorf("c.b should appear exactly once, got %d entries (Columns=%+v)", counts["b"], cTbl.Columns)
+	}
+
+	wantNotices := []string{
+		`merging column "a" with inherited definition`,
+		`merging column "b" with inherited definition`,
+	}
+	for _, want := range wantNotices {
+		n := 0
+		for _, got := range ctx.Notices {
+			if got == want {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Errorf("expected notice %q exactly once, got %d occurrences (Notices=%v)", want, n, ctx.Notices)
+		}
+	}
+}
+
+// TestInheritsThreeLevelChainMergeNoticeFiresOnce verifies that
+// "merging multiple inherited definitions of column" (MergeInheritedAttribute,
+// tablecmds.c:3430) fires exactly ONCE for a 3-level multiple-inheritance
+// chain where the grandchild inherits the same column from two different
+// ancestors — the double-emission this brief fixes was a downstream symptom
+// of the duplicate-column bug TestInheritsMergesRedeclaredColumnCount checks
+// directly (the grandchild's parent-scan loop was seeing the same column
+// name twice inside notnull_inhchild.Columns). M0134-0005ab.
+func TestInheritsThreeLevelChainMergeNoticeFiresOnce(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE notnull_inhparent (i int)`); err != nil {
+		t.Fatalf("CREATE TABLE notnull_inhparent: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE notnull_inhchild (i int) INHERITS (notnull_inhparent)`); err != nil {
+		t.Fatalf("CREATE TABLE notnull_inhchild: %v", err)
+	}
+	ctx.Notices = nil
+	if err := runDDL(t, ctx, `CREATE TABLE notnull_inhgrand () INHERITS (notnull_inhparent, notnull_inhchild)`); err != nil {
+		t.Fatalf("CREATE TABLE notnull_inhgrand: %v", err)
+	}
+
+	grandTbl, ok := cat.LookupTable(parser.ObjectName{Name: "notnull_inhgrand"})
+	if !ok {
+		t.Fatal("notnull_inhgrand table not found")
+	}
+	iCount := 0
+	for _, col := range grandTbl.Columns {
+		if strings.EqualFold(col.Name, "i") {
+			iCount++
+		}
+	}
+	if iCount != 1 {
+		t.Errorf("notnull_inhgrand.i should appear exactly once, got %d entries (Columns=%+v)", iCount, grandTbl.Columns)
+	}
+
+	want := `merging multiple inherited definitions of column "i"`
+	n := 0
+	for _, got := range ctx.Notices {
+		if got == want {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("expected notice %q exactly once, got %d occurrences (Notices=%v)", want, n, ctx.Notices)
+	}
+}
+
+// TestInheritsRedeclaredColumnKeepsInheritedNotNullIdentity verifies that
+// when a parent carries a NAMED not-null constraint and a child redeclares
+// the same column WITHOUT the NOT NULL keyword, the merged column inherits
+// the constraint's identity rather than manufacturing a fresh local one:
+// conname must stay the parent's name, conislocal=false, coninhcount=1
+// (postgres/src/test/regress/expected/constraints.out:1437-1445,
+// notnull_tbl1_child). This distinguishes "child retyped the column only"
+// from child2_t's "child ALSO wrote NOT NULL itself" case (which correctly
+// stays local — see TestCreateTableInheritsNotNullConstraintIsNonLocal).
+// M0134-0005ab.
+func TestInheritsRedeclaredColumnKeepsInheritedNotNullIdentity(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE notnull_tbl1 (a int, b int)`); err != nil {
+		t.Fatalf("CREATE TABLE notnull_tbl1: %v", err)
+	}
+	if err := runDDL(t, ctx, `ALTER TABLE notnull_tbl1 ADD CONSTRAINT nn NOT NULL a NOT VALID`); err != nil {
+		t.Fatalf("ALTER TABLE ADD CONSTRAINT nn: %v", err)
+	}
+	if err := runDDL(t, ctx, `ALTER TABLE notnull_tbl1 VALIDATE CONSTRAINT nn`); err != nil {
+		t.Fatalf("ALTER TABLE VALIDATE CONSTRAINT nn: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE notnull_tbl1_child (a int, b int) INHERITS (notnull_tbl1)`); err != nil {
+		t.Fatalf("CREATE TABLE notnull_tbl1_child: %v", err)
+	}
+
+	childTbl, ok := cat.LookupTable(parser.ObjectName{Name: "notnull_tbl1_child"})
+	if !ok {
+		t.Fatal("notnull_tbl1_child table not found")
+	}
+	var nc catalog.NamedNotNullConstraint
+	found := false
+	for _, c := range childTbl.NotNullConstraints {
+		if strings.EqualFold(c.ColName, "a") {
+			nc = c
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("notnull_tbl1_child.a should carry a contype='n' constraint; got %+v", childTbl.NotNullConstraints)
+	}
+	if nc.Name != "nn" {
+		t.Errorf("notnull_tbl1_child.a NOT NULL constraint name should be the parent's %q, got %q", "nn", nc.Name)
+	}
+	if nc.IsLocal {
+		t.Errorf("notnull_tbl1_child.a NOT NULL should be conislocal=f (retype-only redeclaration), got IsLocal=true")
+	}
+	if nc.InhCount != 1 {
+		t.Errorf("notnull_tbl1_child.a NOT NULL should be coninhcount=1, got %d", nc.InhCount)
+	}
+}
