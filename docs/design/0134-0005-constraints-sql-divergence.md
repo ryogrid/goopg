@@ -1456,3 +1456,107 @@ Gates: `go build ./...`; `go test ./internal/{parser,catalog,executor,optimizer}
 `go test -run 'TestPort_.*(NotNull|Constraint|Inherit)' ./internal/testport/` (18
 subtests); `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
 `scripts/tpch-spotcheck.sh` PASS (**Q12=2, Q13=35** — Rule #1).
+
+## 19. M0134-0005l — `COPY FROM` enforced *no* constraints at all (LANDED 2026-08-18)
+
+### 19.1 The gap
+
+`COPY <table> FROM …` wrote rows straight to the heap. `insertSourceRow`
+(`internal/executor/copy.go`) scattered the parsed input columns into a `Row`,
+left every other column NULL, and handed it to `writeHeapRowReturning` — the raw
+heap writer. Along that path goopg applied **no** column DEFAULTs, enforced **no**
+NOT NULL, evaluated **no** CHECK constraints, and checked **no** domain
+constraints. This is a *silent integrity gap* of the same class as M0134-0005e and
+-0005h: goopg accepted and durably stored rows PostgreSQL rejects outright, and
+stored NULL where PostgreSQL stores a default.
+
+PostgreSQL does the opposite of goopg's "fork by statement shape": `CopyFrom`
+(`postgres/src/backend/commands/copyfrom.c:1352-1358`) calls `ExecConstraints`
+unconditionally for **every** copied row, and builds `defmap`/`defexprs`
+(~:1545-1833) so that every column *absent from the COPY column list* gets its
+default expression evaluated. There is no bulk-load exemption.
+
+### 19.2 Scope correction found during the census
+
+The slice was briefed from the previous loop's note as "COPY with a **partial**
+column list drops DEFAULTs". The census (`tmp/ralph-handoffs/m0134-0005l-census/`)
+corrected this against the actual fixture: the exercising case is
+`postgres/src/test/regress/sql/constraints.sql:255-267`, a **bare**
+`COPY COPY_TBL FROM …` with *no column list at all*, whose CHECK constraint must
+reject a row. The defect was therefore never partial-column-list-specific — COPY
+FROM skipped constraints unconditionally. Briefing the narrow framing would have
+produced a fix that missed the fixture entirely; **re-derive a carried-over
+candidate's framing from the fixture before briefing it.**
+
+### 19.3 The fix — reuse, not reimplementation
+
+`insertOp.Next` (`internal/executor/operators_storage.go:2405-2508`) already ran
+the correct sequence, and its **order is load-bearing** because PG's error
+precedence depends on it:
+
+    applyDefaultsForMissing → NOT NULL loop → checkConstraints → checkDomainConstraintsForRow
+
+`insertSourceRow` now runs exactly that sequence, calling the same four helpers,
+before `writeHeapRowReturning`. This is Rule #2 (sibling paths) in its purest
+form: the slice existed *because* COPY and INSERT had diverged, so the fix is
+wiring, not new logic (~91 lines including comments).
+
+Two details worth preserving:
+
+- **`missing[]` mirrors PG's `defmap`, not "is NULL".** A column *present* in the
+  COPY column list but holding an explicit NULL from the input is **not**
+  missing — PG substitutes a default only for columns the column list never
+  targets. `missing[]` is derived once per statement from `plan.ColumnIndex`
+  (all-true for a bare COPY, since `ColumnIndex` then covers and clears every
+  column).
+- **`needsConstraints` is a per-statement fast path.** COPY is the bulk-load path
+  (TPC-H/TPC-DS loads), so the whole sequence is skipped for a table with no
+  DEFAULTs, no NOT NULL columns, no CHECK constraints and no domain-typed
+  columns. The guard is computed once in `newCopyFromExecutor`, never per row.
+  It is a genuine fast path, not a dead branch: `Column.DeclaredTypeName` is
+  populated only when the DDL type differs from the resolved base type
+  (`internal/catalog/catalog.go:159`), i.e. for domains — an ordinary staging
+  table still takes the cheap path.
+
+### 19.4 Measured result
+
+`constraints` regress diff **933 → 923 lines** (hunks unchanged at 31). The target
+hunk shrank substantially but did **not** vanish, for a reason unrelated to
+constraints — see §19.5.
+
+Guards (all FAIL-pre / PASS-post except the fast-path guard, which is a
+performance-regression guard and passes both ways by design), in
+`internal/executor/copy_constraints_test.go`:
+`TestCopyFromCheckConstraintViolationRejected`,
+`TestCopyFromDefaultFilledForOmittedColumn`,
+`TestCopyFromNotNullViolationRejected`,
+`TestCopyFromConstraintFreeTableFastPath`.
+
+Gates: `go build ./...`; `go test ./internal/{executor,optimizer,catalog}/`;
+`go test -run 'TestPort_.*(Copy|Constraint)' ./internal/testport/` (12);
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
+`scripts/tpch-spotcheck.sh` PASS (**Q12=2, Q13=35** — Rule #1).
+
+### 19.5 Why the hunk only shrank — the COPY error-reporting holdout
+
+The remaining diff lines in that hunk are the CHECK violation's `DETAIL: Failing
+row contains (…)` and `CONTEXT: COPY <table>, line N: "…"` trailers. goopg now
+raises the right error with the right SQLSTATE, but drops both trailers on the
+floor: the nine COPY-FROM error call sites in `internal/postmaster/copy.go` call
+`s.writeQueryError(w, execErrCode(perr), execErrMsg(perr))` **without**
+`execErrDetailFields(perr)...`. Every other error site (`dispatch.go`) already
+forwards it — COPY FROM is the lone holdout, so `ExecError.Detail`/`.Context`
+never reach the wire. This is pre-existing, affects *all* COPY FROM errors rather
+than constraints specifically, and additionally needs input-line tracking to
+synthesize `CONTEXT` at all. Deliberately not bundled (third file, nine call
+sites, different subsystem) — ledgered 2026-08-18.
+
+### 19.6 Sibling paths still bypassing constraints (ledgered)
+
+`writeHeapRowReturning` has other callers that were **not** touched by this slice
+and are the natural next Rule-#2 sweep. The confirmed one is
+`PushBinaryData` in the same file — the **COPY BINARY** path bypasses
+`insertSourceRow` entirely and therefore still skips every default and
+constraint. Flagged but uninvestigated: `applyworker.go`, `operators_merge.go`,
+`operators_storage.go` (partition/UPDATE paths), `operators_ddl.go`,
+`operators_upsert.go`. Ledgered 2026-08-18.

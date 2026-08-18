@@ -194,6 +194,20 @@ type CopyFromExecutor struct {
 	// binary path state
 	binaryBuf        []byte
 	binaryHeaderSeen bool
+
+	// missing[i]=true when column i is absent from the COPY column list
+	// (PG copyfrom.c defmap: only columns NOT in the list get a default —
+	// a column present in the list but holding an explicit NULL input is
+	// not "missing"). Computed once per statement since plan.ColumnIndex
+	// is immutable across rows. M0134-0005l.
+	missing []bool
+	// needsConstraints is the fast-path guard: true only when the target
+	// table actually has DEFAULTs, NOT NULL columns, CHECK constraints, or
+	// domain-typed columns to enforce. COPY is the bulk-load path, so a
+	// constraint-free table (the common case for staging loads) skips the
+	// whole default/constraint sequence below rather than paying a
+	// per-row cost for work that can never fire. M0134-0005l.
+	needsConstraints bool
 }
 
 // NewCopyFromExecutor binds a CopyFromExecutor to ctx and plan.
@@ -221,12 +235,44 @@ func NewCopyFromExecutor(ctx *Context, plan *optimizer.Copy) (*CopyFromExecutor,
 // construction: each hand-built the struct and read only the NULL option.
 func newCopyFromExecutor(ctx *Context, plan *optimizer.Copy) *CopyFromExecutor {
 	format := copyToFormatFromOptions(plan.Options)
+	cols := plan.Table.Columns
+
+	// missing[i]=true for every target column not in the COPY column list
+	// (defaults to "all missing" for a bare `COPY tbl FROM ...` with no
+	// column list, since plan.ColumnIndex then covers every column and
+	// clears every entry). Computed once per statement — M0134-0005l.
+	missing := make([]bool, len(cols))
+	for i := range missing {
+		missing[i] = true
+	}
+	for _, tgtOrd := range plan.ColumnIndex {
+		if tgtOrd >= 0 && tgtOrd < len(missing) {
+			missing[tgtOrd] = false
+		}
+	}
+
+	// needsConstraints: the fast-path guard computed ONCE per COPY
+	// statement (not per row) — a table with no DEFAULTs, no NOT NULL
+	// columns, no CHECK constraints, and no domain-typed columns skips the
+	// whole default/constraint sequence in insertSourceRow.
+	needsConstraints := len(plan.Table.CheckConstraints) > 0
+	for i, col := range cols {
+		if col.NotNull || col.DeclaredTypeName != "" {
+			needsConstraints = true
+		}
+		if missing[i] && col.DefaultExpr != nil {
+			needsConstraints = true
+		}
+	}
+
 	return &CopyFromExecutor{
-		ctx:           ctx,
-		plan:          plan,
-		cols:          plan.Table.Columns,
-		format:        format,
-		headerPending: format.hasHeader(),
+		ctx:              ctx,
+		plan:             plan,
+		cols:             cols,
+		format:           format,
+		headerPending:    format.hasHeader(),
+		missing:          missing,
+		needsConstraints: needsConstraints,
 	}
 }
 
@@ -342,6 +388,46 @@ func (c *CopyFromExecutor) insertSourceRow(src Row) error {
 	}, c.ctx, c.plan.Pos()); err != nil {
 		return err
 	}
+
+	// M0134-0005l: apply the same default-filling and constraint sequence
+	// insertOp.Next runs, so COPY FROM stops silently accepting rows PG
+	// rejects and stops storing NULL where PG stores a default
+	// (postgres/src/backend/commands/copyfrom.c ExecConstraints runs
+	// unconditionally per row; defmap/defexprs fill omitted columns).
+	// needsConstraints is computed once per statement (newCopyFromExecutor)
+	// so a constraint-free table pays nothing extra per row.
+	if c.needsConstraints {
+		// DEFAULT filling for columns absent from the COPY column list. A
+		// column present in the list but holding an explicit NULL is NOT
+		// "missing" — c.missing only marks columns plan.ColumnIndex never
+		// targets, matching PG's defmap.
+		applyDefaultsForMissing(c.cols, row, c.missing, ctxSeqDBOid(c.ctx))
+
+		// NOT NULL constraint enforcement.
+		for i, col := range c.cols {
+			if col.NotNull && i < len(row) && row[i].IsNull() {
+				return &ExecError{
+					Code:    "23502",
+					Message: fmt.Sprintf("null value in column %q of relation %q violates not-null constraint", col.Name, c.plan.Table.Name),
+					Detail:  formatRowForDetail(c.cols, row),
+				}
+			}
+		}
+
+		// CHECK constraint enforcement.
+		if len(c.plan.Table.CheckConstraints) > 0 {
+			if err := checkConstraints(c.ctx, c.plan.Table, row); err != nil {
+				return err
+			}
+		}
+
+		// Domain NOT NULL / CHECK constraint enforcement for domain-typed
+		// columns.
+		if err := checkDomainConstraintsForRow(c.ctx, c.cols, row); err != nil {
+			return err
+		}
+	}
+
 	rel := c.ctx.Catalog.RelFileNode(c.plan.Table)
 	ptr, err := writeHeapRowReturning(c.ctx, rel, c.cols, row)
 	if err != nil {
