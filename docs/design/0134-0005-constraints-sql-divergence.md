@@ -675,3 +675,94 @@ inheritance naming, COPY FROM not rejecting bad rows, the NOT NULL inheritance
 leftover (Bucket 3), the partitioned `parted_uniq_tbl` pair of divergences, and Bucket
 5 (GiST `circle_ops`) which is a genuine milestone. **Bucket 7 still has no pinned root
 cause — do not brief from it.**
+
+## 12. Slice `e` — the COMMIT-tier deferred unique recheck is blind to HOT chains (M0134-0005e)
+
+Status: **draft → accepted** (root cause pinned by live probe 2026-08-18, both
+engines; see §12.2). This is the *silent* integrity gap ledgered by slice `c`:
+unlike every earlier bucket in this document, the divergence is not a wrong
+message — goopg **commits a transaction PostgreSQL rejects**, leaving a genuine
+duplicate on disk.
+
+### 12.1 The SQL surface
+
+`postgres/src/test/regress/sql/constraints.sql:510-517` (the `unique_tbl` block
+whose own comment reads *"test a HOT update that invalidates the conflicting
+tuple. the trigger should still fire and catch the violation"*). Reduced to a
+minimal probe:
+
+```sql
+CREATE TABLE t (i int, t text);
+INSERT INTO t VALUES (3, 'three');
+ALTER TABLE t ADD CONSTRAINT t_i_key UNIQUE (i) DEFERRABLE INITIALLY DEFERRED;
+BEGIN;
+  INSERT INTO t VALUES (3, 'Three');                       -- queues a deferred check
+  UPDATE t SET t = 'THREE' WHERE i = 3 AND t = 'Three';    -- non-key column ⇒ HOT
+COMMIT;
+```
+
+PG 18.3: `COMMIT` raises `23505 duplicate key value violates unique constraint
+"t_i_key"` and the transaction rolls back (1 row remains). goopg HEAD: `COMMIT`
+succeeds, leaving **2 rows with `i = 3`**.
+
+### 12.2 Root cause — a false premise, stated exactly
+
+The premise *"`recheckDeferredUniqueKey`'s per-pointer liveness fetch resolves
+the current live version of the candidate row"* is **false**.
+
+`recheckDeferredUniqueKey` (`internal/executor/deferred_unique.go:239-268`)
+scans the b-tree with `tree.RangeScan(key, key, …)` and, for each returned
+`ItemPointer`, fetches the tuple **at exactly that pointer** via
+`storage.PageGetHeapTuple(slot.Page(), ptr.Offset)`, then judges it with
+`isLiveForUniqueCheck`. It never follows `t_ctid`.
+
+The `UPDATE` touches only a non-key column, so it takes the HOT path
+(`hotUpdateEligible` → `tryApplyHOTUpdate`,
+`internal/executor/operators_storage.go:4609-4668, 3896-4136`) which — correctly,
+matching PG — performs **no index maintenance at all**. It stamps the old slot's
+`xmax` to the updater's own XID and its `t_ctid` to the new HEAP_ONLY_TUPLE slot.
+So the candidate's only b-tree entry is the INSERT-time one, now pointing at a
+slot that `isLiveForUniqueCheck` *correctly* calls dead (`xmax == selfXID`,
+`operators_storage.go:8805-8808`). The live successor is one `t_ctid` hop away
+and is never visited. Live count comes out 1 instead of 2; the check passes.
+
+Everything else in the chain is already right, and was verified rather than
+assumed: the UPDATE is deliberately **not** re-enqueued
+(`indexKeyColumnsChanged` gate, `operators_storage.go:8312` — PG does the same),
+and the COMMIT-tier drain **does** run on both commit paths
+(`internal/postmaster/txn_verb.go:333`; `internal/executor/operators_tx.go:140`).
+
+PG oracle: `postgres/src/backend/commands/trigger.c` `unique_key_recheck` exists
+precisely to re-fetch a queued candidate through its update chain before judging
+it; goopg's recheck was never given that capability.
+
+### 12.3 Not a Rule #2 divergence — but check the twin anyway
+
+Both protocols reach the *same* shared drain: an explicit `COMMIT` over the
+extended protocol parses to the same `optimizer.TxCommit` node and dispatches
+through `txn_verb.go`'s shared verb handler. The defect therefore lives one layer
+**below** M0134-0005b's asymmetry fix (bare `ectx.CommitTransaction` running no
+drain), and a single fix covers both. `recheckDeferredNNDUniqueKey` (same file)
+is heap-scan based, resolves no stored index pointers, and is unaffected.
+
+### 12.4 Fix shape
+
+In `recheckDeferredUniqueKey`'s `RangeScan` callback, resolve each pointer to its
+chain **tail** before the liveness test, reusing the pre-existing primitives
+rather than inventing a predicate: `isChainTailCTID`
+(`operators_storage.go:653-670`) to detect the tail, `maxCTIDChainWalk`
+(`operators_storage.go:499-509`) as the loop bound, and the traversal shape of
+`epqFollowChainFull` (`operators_storage.go:674-733`) minus its
+predicate/snapshot evaluation — the recheck needs only `isLiveForUniqueCheck` on
+the tail's Xmin/Xmax, not full MVCC visibility. De-duplicate `seen` by the
+**resolved tail** pointer, not the raw b-tree pointer, so two entries whose
+chains converge on one physical tuple are not double-counted.
+
+### 12.5 Known adjacent exposure (ledgered, not fixed here)
+
+The *immediate* (non-deferred) probes `uniqueCheckWithWait`
+(`operators_storage.go:8573`) and `exclusionCheckOnce`
+(`operators_storage.go:8512`) use the identical direct-pointer-fetch pattern with
+no chain-follow. They are far less exposed — each runs synchronously right after
+its own statement's index maintenance — but a same-transaction HOT update of an
+earlier statement's row could in principle open the same blind spot. Not probed.

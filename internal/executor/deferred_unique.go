@@ -266,11 +266,85 @@ func indexByNameOnTable(ctx *Context, tbl *catalog.Table, name string) *catalog.
 	return nil
 }
 
+// resolveDeferredUniqueChainTail walks the t_ctid chain from ptr forward to its
+// HOT tail — the version a deferred UNIQUE recheck must judge. A non-key-column
+// HOT update (tryApplyHOTUpdate) does no index maintenance, so the b-tree's only
+// entry for the candidate key still points at the original slot; that slot's
+// xmax has been stamped to the updater's own XID (correctly making it dead per
+// isLiveForUniqueCheck) while the live successor sits one t_ctid hop away and is
+// never visited by a raw per-pointer fetch. M0134-0005e §12.2
+// (docs/design/0134-0005-constraints-sql-divergence.md).
+//
+// The walk follows a hop ONLY while the tuple being left behind carries
+// HeapHotUpdated — mirroring PG's own recheck (unique_key_recheck,
+// postgres/src/backend/commands/constraint.c) fetching through SnapshotSelf via
+// table_index_fetch_tuple/heap_hot_search_buffer, which likewise stops at the
+// first non-HOT link. This matters for correctness, not just fidelity: a
+// non-HOT update (any indexed column changed) gets its OWN new index entry
+// inserted separately, so continuing past it here would misattribute a later,
+// unrelated key value to THIS entry's candidate key and over-count a resolved
+// duplicate as still live. A tuple with no HOT successor (isChainTailCTID) or
+// no successor at all IS the tail. Reuses isChainTailCTID for the "no
+// successor" test and maxCTIDChainWalk as the loop bound, and mirrors
+// epqFollowChainFull's per-hop traversal shape (Pin/RLock/copy/RUnlock/Unpin,
+// one page pinned at a time) — but WITHOUT its predicate/snapshot evaluation,
+// since this recheck needs only isLiveForUniqueCheck on the resolved tuple's
+// Xmin/Xmax, not full MVCC visibility. Defensive: bounded by maxCTIDChainWalk,
+// and on a missing/unreadable hop or chain exhaustion it falls back to the last
+// tuple it did resolve (never panics, never loops forever); ok is false only
+// when even the starting pointer could not be fetched.
+func resolveDeferredUniqueChainTail(ctx *Context, rel storage.RelFileNode, ptr storage.ItemPointer) (tailPtr storage.ItemPointer, tuple storage.HeapTuple, ok bool) {
+	curBlk, curSlot := ptr.Block, ptr.Offset
+	var lastTup storage.HeapTuple
+	var lastPtr storage.ItemPointer
+	haveLast := false
+	for i := 0; i < maxCTIDChainWalk; i++ {
+		slot, perr := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: curBlk})
+		if perr != nil {
+			return lastPtr, lastTup, haveLast
+		}
+		slot.RLock()
+		tup, terr := storage.PageGetHeapTuple(slot.Page(), curSlot)
+		slot.RUnlock()
+		ctx.Pool.Unpin(slot)
+		if terr != nil {
+			return lastPtr, lastTup, haveLast
+		}
+		curPtr := storage.ItemPointer{Block: curBlk, Offset: curSlot}
+		lastTup, lastPtr, haveLast = tup, curPtr, true
+		if storage.IsMovedToAnotherPartition(tup.Header.CTID) {
+			// Sentinel — no live successor reachable through this chain;
+			// judge the sentinel-bearing tuple itself (it is dead: xmax was
+			// stamped by the move).
+			return curPtr, tup, true
+		}
+		if isChainTailCTID(tup.Header.CTID, curBlk, curSlot) {
+			return curPtr, tup, true
+		}
+		if !tup.Header.IsHotUpdated() {
+			// A successor is stamped, but this link is NOT a HOT link (a
+			// non-key-column HOT update always sets HeapHotUpdated on the
+			// tuple it leaves behind — PageStampHotOldTuple — while a
+			// key-changing/non-HOT update clears it — PageStampUpdatedOldTuple
+			// / PageApplyHeapUpdateOldRedo). The successor already has its own
+			// separate index entry; stop here and judge THIS tuple.
+			return curPtr, tup, true
+		}
+		curBlk, curSlot = tup.Header.CTID.Block, tup.Header.CTID.Offset
+	}
+	// Chain walk exhausted (corruption backstop) — judge the last tuple
+	// resolved rather than looping forever.
+	return lastPtr, lastTup, haveLast
+}
+
 // recheckDeferredUniqueKey scans the index for key and counts the distinct live
 // visible heap tuples carrying it. Two or more is a deferred uniqueness
 // violation (the candidate row is itself one of them); it raises 23505. A
 // no-key-change transient duplicate that was resolved before COMMIT (e.g. the
-// id+1 swap) leaves a single live tuple per key and passes. 0119-0004.
+// id+1 swap) leaves a single live tuple per key and passes. Each candidate
+// pointer is first resolved to its t_ctid chain tail (resolveDeferredUniqueChainTail)
+// before judgement, so a non-key HOT update of the candidate row does not hide
+// its live successor from the count (M0134-0005e). 0119-0004.
 func recheckDeferredUniqueKey(ctx *Context, tbl *catalog.Table, idx *catalog.Index, key []byte, detail string) error {
 	rel := ctx.Catalog.RelFileNode(tbl)
 	idxRel := ctx.Catalog.IndexRelFileNode(idx)
@@ -279,25 +353,25 @@ func recheckDeferredUniqueKey(ctx *Context, tbl *catalog.Table, idx *catalog.Ind
 		// Index unreadable (e.g. dropped in-txn) — nothing to enforce.
 		return nil
 	}
+	// De-duplicated by the RESOLVED TAIL pointer, not the raw b-tree pointer:
+	// two entries whose chains converge on one physical tuple (e.g. the
+	// insert-time entry and a later re-probe both HOT-chaining to the same
+	// live successor) must not be double-counted. Mirrors the M0131-S32.1
+	// TM_SelfModified convergence guard elsewhere in this package
+	// (operators_storage.go:4685) — same "two pointers, one physical tuple"
+	// hazard, different call site.
 	seen := make(map[storage.ItemPointer]struct{})
 	live := 0
 	_ = tree.RangeScan(key, key, func(_ []byte, ptr storage.ItemPointer) (bool, error) {
-		if _, dup := seen[ptr]; dup {
+		tailPtr, tuple, ok := resolveDeferredUniqueChainTail(ctx, rel, ptr)
+		if !ok {
 			return true, nil
 		}
-		slot, perr := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
-		if perr != nil {
-			return true, nil
-		}
-		slot.RLock()
-		tuple, terr := storage.PageGetHeapTuple(slot.Page(), ptr.Offset)
-		slot.RUnlock()
-		ctx.Pool.Unpin(slot)
-		if terr != nil {
+		if _, dup := seen[tailPtr]; dup {
 			return true, nil
 		}
 		if isLiveForUniqueCheck(ctx, tuple.Header.Xmin, tuple.Header.Xmax) {
-			seen[ptr] = struct{}{}
+			seen[tailPtr] = struct{}{}
 			live++
 		}
 		return true, nil
