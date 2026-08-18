@@ -1,7 +1,9 @@
 package parser
 
 import (
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -1473,5 +1475,87 @@ func TestParseStandaloneNotNullColumnConstraint(t *testing.T) {
 	ct4 := stmts4[0].(*CreateTableStmt)
 	if len(ct4.Columns) != 1 || ct4.Columns[0].Name != "pid" || !ct4.Columns[0].NotNull {
 		t.Errorf("NOT-NULL-only: col=%+v", ct4.Columns[0])
+	}
+}
+
+// TestParseColumnConstraintMisplacedEnforced pins M0134-0005d slice 1: a
+// column-level UNIQUE or PRIMARY KEY (bare or named inline `CONSTRAINT name
+// ...`) followed by `[NOT] ENFORCED` must be a semantic rejection —
+// PG's transformConstraintAttrs (parse_utilcmd.c:3991-4021) only accepts
+// ENFORCED/NOT ENFORCED for CHECK and FOREIGN KEY constraints; UNIQUE and
+// PRIMARY KEY always raise "misplaced [NOT] ENFORCED clause" (42601) via
+// parser_errposition(cxt->pstate, con->location), where con->location = @1
+// (gram.y:4135-4150) — the ENFORCED token itself for the bare form, the NOT
+// token for the NOT ENFORCED pair. Before this fix goopg silently swallowed a
+// leading NOT in parseConstraintDeferrable's own NOT-DEFERRABLE probe and
+// left ENFORCED dangling, producing a generic "expected ',' or ')'" error
+// instead (see tmp/ralph-handoffs/m0134-0005d-enforced-clause-fidelity/report.md).
+func TestParseColumnConstraintMisplacedEnforced(t *testing.T) {
+	cases := []struct {
+		sql     string
+		wantMsg string
+		// caretTok is the exact substring whose start byte offset the
+		// SyntaxError.Pos must equal — ENFORCED for the bare form, NOT for
+		// the NOT ENFORCED pair (matches constraints.out:740-746).
+		caretTok string
+	}{
+		{"CREATE TABLE t (i int UNIQUE ENFORCED)", "misplaced ENFORCED clause", "ENFORCED"},
+		{"CREATE TABLE t (i int UNIQUE NOT ENFORCED)", "misplaced NOT ENFORCED clause", "NOT ENFORCED"},
+		{"CREATE TABLE t (i int PRIMARY KEY ENFORCED)", "misplaced ENFORCED clause", "ENFORCED"},
+		{"CREATE TABLE t (i int PRIMARY KEY NOT ENFORCED)", "misplaced NOT ENFORCED clause", "NOT ENFORCED"},
+		{"CREATE TABLE t (i int CONSTRAINT c UNIQUE ENFORCED)", "misplaced ENFORCED clause", "ENFORCED"},
+		{"CREATE TABLE t (i int CONSTRAINT c UNIQUE NOT ENFORCED)", "misplaced NOT ENFORCED clause", "NOT ENFORCED"},
+		{"CREATE TABLE t (i int CONSTRAINT c PRIMARY KEY ENFORCED)", "misplaced ENFORCED clause", "ENFORCED"},
+		{"CREATE TABLE t (i int CONSTRAINT c PRIMARY KEY NOT ENFORCED)", "misplaced NOT ENFORCED clause", "NOT ENFORCED"},
+	}
+	for _, c := range cases {
+		_, err := Parse(c.sql)
+		if err == nil {
+			t.Errorf("Parse(%q): expected error", c.sql)
+			continue
+		}
+		if !strings.Contains(err.Error(), c.wantMsg) {
+			t.Errorf("Parse(%q): error %q does not contain %q", c.sql, err.Error(), c.wantMsg)
+			continue
+		}
+		var se *SyntaxError
+		if !errors.As(err, &se) {
+			t.Errorf("Parse(%q): err type=%T want *SyntaxError", c.sql, err)
+			continue
+		}
+		if !se.Raw {
+			t.Errorf("Parse(%q): SyntaxError.Raw=false, want true (bare PG message)", c.sql)
+		}
+		if se.Message != c.wantMsg {
+			t.Errorf("Parse(%q): SyntaxError.Message=%q want %q", c.sql, se.Message, c.wantMsg)
+		}
+		wantPos := strings.Index(c.sql, c.caretTok)
+		if wantPos < 0 {
+			t.Fatalf("test bug: caretTok %q not found in %q", c.caretTok, c.sql)
+		}
+		if se.Pos != wantPos {
+			t.Errorf("Parse(%q): SyntaxError.Pos=%d want %d (caret under %q)", c.sql, se.Pos, wantPos, c.caretTok)
+		}
+	}
+
+	// Regression guard: DEFERRABLE / NOT DEFERRABLE / INITIALLY DEFERRED
+	// trailers on the same four column-level sites still parse cleanly —
+	// Part A's fix must not disturb the DEFERRABLE-trailer path it sits in
+	// front of.
+	for _, ok := range []string{
+		"CREATE TABLE t (i int UNIQUE DEFERRABLE)",
+		"CREATE TABLE t (i int UNIQUE NOT DEFERRABLE)",
+		"CREATE TABLE t (i int UNIQUE INITIALLY DEFERRED)",
+		"CREATE TABLE t (i int PRIMARY KEY DEFERRABLE)",
+		"CREATE TABLE t (i int PRIMARY KEY NOT DEFERRABLE)",
+		"CREATE TABLE t (i int PRIMARY KEY INITIALLY DEFERRED)",
+		"CREATE TABLE t (i int CONSTRAINT c UNIQUE DEFERRABLE)",
+		"CREATE TABLE t (i int CONSTRAINT c UNIQUE NOT DEFERRABLE)",
+		"CREATE TABLE t (i int CONSTRAINT c PRIMARY KEY DEFERRABLE)",
+		"CREATE TABLE t (i int CONSTRAINT c PRIMARY KEY NOT DEFERRABLE)",
+	} {
+		if _, err := Parse(ok); err != nil {
+			t.Errorf("Parse(%q): unexpected error: %v", ok, err)
+		}
 	}
 }

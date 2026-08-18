@@ -161,6 +161,12 @@ func TestFKAlterConstraint(t *testing.T) {
 		if !strings.Contains(ee.Message, "cannot alter enforceability of constraint") {
 			t.Errorf("message = %q, want it to match real PG's enforceability-specific wording", ee.Message)
 		}
+		// PG's ATExecAlterConstraint (tablecmds.c:12254-12258) has no
+		// parser_errposition call for this ereport, so the wire carries no
+		// LINE/caret — ExecError.Pos must stay 0. M0134-0005d slice 1.
+		if ee.Pos != 0 {
+			t.Errorf("ee.Pos = %d, want 0 (PG's ereport has no parser_errposition)", ee.Pos)
+		}
 	})
 
 	t.Run("UndefinedConstraintRejected", func(t *testing.T) {

@@ -766,6 +766,24 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 								libpq.ErrorField{Code: libpq.FieldHint, Value: "You will need to rewrite or cast the expression."})
 						}
 					}
+					// Coerce each argument to the declared parameter type, mirroring
+					// PG's EvaluateParams (prepare.c). Without this, the raw literal
+					// datum reaches the plan un-cast (e.g. a regclass[] arg stays
+					// KindString), so OID comparisons silently evaluate false.
+					// M0134-0005.
+					for idx := range params {
+						if idx >= len(prepDef.paramTypes) {
+							break
+						}
+						coerced, cerr := executor.CoerceParamToDeclaredType(params[idx], prepDef.paramTypes[idx], ectx)
+						if cerr != nil {
+							if _, ok := cerr.(*executor.ExecError); ok {
+								return s.writeQueryError(w, execErrCode(cerr), execErrMsg(cerr), execErrDetailFields(cerr)...)
+							}
+							return s.writeQueryError(w, errcodes.SyntaxError, cerr.Error())
+						}
+						params[idx] = coerced
+					}
 					stmt = prepDef.stmt
 					ectx.Params = params
 					disablePlanCache = true
@@ -807,6 +825,21 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 						return s.writeQueryError(w, execErrCode(err), execErrMsg(err), execErrDetailFields(err)...)
 					}
 					return s.writeQueryError(w, errcodes.SyntaxError, err.Error())
+				}
+				// Sibling of the *parser.ExecuteStmt branch above: coerce each
+				// argument to the declared parameter type. M0134-0005.
+				for idx := range params {
+					if idx >= len(prepDef.paramTypes) {
+						break
+					}
+					coerced, cerr := executor.CoerceParamToDeclaredType(params[idx], prepDef.paramTypes[idx], ectx)
+					if cerr != nil {
+						if _, ok := cerr.(*executor.ExecError); ok {
+							return s.writeQueryError(w, execErrCode(cerr), execErrMsg(cerr), execErrDetailFields(cerr)...)
+						}
+						return s.writeQueryError(w, errcodes.SyntaxError, cerr.Error())
+					}
+					params[idx] = coerced
 				}
 				ectx.Params = params
 				disablePlanCache = true
@@ -1042,6 +1075,40 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 				return nil
 			}
 			return err
+		}
+		// End-of-statement drain for DEFERRABLE (but not currently deferred-to-
+		// COMMIT) UNIQUE/PK checks queued during the statement that just
+		// succeeded — PostgreSQL fires every constraint trigger whose deferred
+		// flag is not set at the end of its own SQL statement, regardless of
+		// whether the statement runs in autocommit or inside an explicit
+		// transaction block (postgres/src/backend/catalog/index.c:2080-2082,
+		// indimmediate=false for any DEFERRABLE index; trigger.c's
+		// end-of-command AfterTriggerFireDeferred firing). A violation here
+		// rolls the (auto-begun or explicit) transaction back with 23505, the
+		// same shape the immediate synchronous check raises. No-op when
+		// nothing was queued. b4-s1-stmt-end-unique.
+		if bs, ok := ectx.Session.(*executor.BasicSession); ok {
+			if drainErr := executor.RunStmtEndDeferredUniqueChecks(ectx, bs); drainErr != nil {
+				if !autoCommit && connTx != nil && connTx.InExplicit() {
+					connTx.Fail()
+					connTx.ReleasePinnedSnapshotOnFail(ectx.TxnMgr)
+				} else {
+					_ = ectx.TxnMgr.Rollback(tx)
+				}
+				code := errcodes.UniqueViolation
+				var fields []libpq.ErrorField
+				msg := drainErr.Error()
+				if ee, eok := drainErr.(*executor.ExecError); eok {
+					if ee.Code != "" {
+						code = errcodes.Code(ee.Code)
+					}
+					msg = ee.Message
+					if ee.Detail != "" {
+						fields = append(fields, libpq.ErrorField{Code: libpq.FieldDetail, Value: ee.Detail})
+					}
+				}
+				return s.writeQueryError(w, code, msg, fields...)
+			}
 		}
 		// An explicit transaction block (BEGIN/START TRANSACTION … COMMIT/ROLLBACK)
 		// ended mid-batch. The message-level transaction `tx` was finalized by the

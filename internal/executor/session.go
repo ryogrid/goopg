@@ -461,6 +461,14 @@ type DeferredUniqueCheck struct {
 	// Design 0119-0004-deferred-unique-nnd.
 	NNDKeyCols []DeferredNNDKeyCol
 	Detail     string
+	// DeferToCommit is true when this check must wait until COMMIT (the
+	// constraint is INITIALLY DEFERRED, or SET CONSTRAINTS … DEFERRED is in
+	// effect for it); false means it is only deferred to the END of the
+	// statement that queued it (the common DEFERRABLE-without-INITIALLY-DEFERRED
+	// case, and any index made partial-checked while SET CONSTRAINTS …
+	// IMMEDIATE is in effect). Resolved once at queue time by
+	// uniqueCheckDeferToCommit. b4-s1-stmt-end-unique.
+	DeferToCommit bool
 }
 
 // DeferredNNDKeyCol is one index key column's candidate value, captured at DML
@@ -509,6 +517,28 @@ func (s *BasicSession) TakeDeferredUniqueChecks() []DeferredUniqueCheck {
 	out := s.deferredUniqChecks
 	s.deferredUniqChecks = nil
 	return out
+}
+
+// TakeDeferredUniqueChecksStmtEnd removes and returns every queued deferred
+// UNIQUE/PK check that is NOT currently deferred to COMMIT (DeferToCommit ==
+// false) — the end-of-statement tier. Checks whose DeferToCommit is true stay
+// queued for COMMIT (TakeDeferredUniqueChecks / TakeDeferredUniqueChecksMatching).
+// Called once per top-level statement by RunStmtEndDeferredUniqueChecks.
+// b4-s1-stmt-end-unique.
+func (s *BasicSession) TakeDeferredUniqueChecksStmtEnd() []DeferredUniqueCheck {
+	if len(s.deferredUniqChecks) == 0 {
+		return nil
+	}
+	var taken, kept []DeferredUniqueCheck
+	for _, c := range s.deferredUniqChecks {
+		if c.DeferToCommit {
+			kept = append(kept, c)
+		} else {
+			taken = append(taken, c)
+		}
+	}
+	s.deferredUniqChecks = kept
+	return taken
 }
 
 // TakeDeferredUniqueChecksMatching removes and returns the queued deferred

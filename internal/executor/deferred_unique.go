@@ -34,20 +34,78 @@ import (
 // row is already present in the index, so a violation is "two or more live
 // visible tuples share this key", not "any other live tuple shares this key".
 
-// uniqueCheckDeferred reports whether the uniqueness enforcement for idx should
-// be queued to COMMIT instead of raised now. It honours both the constraint's
-// declared DEFERRABLE INITIALLY {DEFERRED|IMMEDIATE} mode and any in-effect
-// SET CONSTRAINTS override on the session. Only a DEFERRABLE constraint inside
-// an explicit transaction can ever be deferred, so with no SET CONSTRAINTS in
-// effect this is exactly `idx.Deferrable && idx.InitiallyDeferred &&
-// InExplicitTransaction()` — every plain (NOT DEFERRABLE) unique index keeps
-// its immediate check. Mirrors fkCheckDeferred. 0119-0004.
+// uniqueCheckDeferred reports whether the uniqueness enforcement for idx
+// should be QUEUED instead of raised synchronously now. This is the "needs a
+// partial check" predicate, not "deferred to COMMIT": PostgreSQL sets
+// pg_index.indimmediate = false for ANY DEFERRABLE unique/PK index regardless
+// of its INITIALLY mode (postgres/src/backend/catalog/index.c:2080-2082), so
+// every DEFERRABLE index always uses UNIQUE_CHECK_PARTIAL at insert time and
+// NEVER blocks per-row — the only thing INITIALLY {DEFERRED|IMMEDIATE} (and
+// any in-effect SET CONSTRAINTS override) selects is *when* the queued
+// candidate is rechecked: end-of-statement (the common case) vs COMMIT. See
+// uniqueCheckDeferToCommit for that companion decision, consulted only once a
+// check is already known to be queued (Bucket 4 slice 1: b4-s1-stmt-end-unique).
+// A plain (NOT DEFERRABLE) unique index keeps its immediate synchronous check.
+// Mirrors fkCheckDeferred in spirit but NOT in the InExplicitTransaction gate
+// — that gate stays on fkCheckDeferred (FK checks have no PARTIAL tier) but is
+// deliberately dropped here.
 func uniqueCheckDeferred(ctx *Context, idx *catalog.Index) bool {
-	if idx == nil || !idx.Deferrable || ctx.Session == nil || !ctx.Session.InExplicitTransaction() {
-		return false
+	return idx != nil && idx.Deferrable
+}
+
+// uniqueCheckDeferToCommit reports whether a queued deferrable-unique check
+// should be rechecked at COMMIT (true) rather than at the end of the current
+// statement (false). Callers must have already established idx.Deferrable via
+// uniqueCheckDeferred. Honours the constraint's declared INITIALLY
+// {DEFERRED|IMMEDIATE} default and any in-effect SET CONSTRAINTS override on
+// the session, exactly like the pre-existing UniqueConstraintDeferred
+// resolver — this is that SAME resolver, just consulted independently of
+// InExplicitTransaction() (an autocommit statement has no override in effect,
+// so it correctly falls through to idx.InitiallyDeferred). b4-s1-stmt-end-unique.
+// maxPartitionParentWalk bounds the child->root PartitionParentOID walk in
+// uniqueCheckDeferToCommit. Partition hierarchies are shallow in practice
+// (a handful of levels at most); this only guards against a cyclic/corrupt
+// linkage spinning forever, mirroring maxCTIDChainWalk's idiom
+// (operators_storage.go) at a much smaller bound appropriate to partition
+// nesting depth rather than heap-page chains.
+const maxPartitionParentWalk = 64
+
+func uniqueCheckDeferToCommit(ctx *Context, idx *catalog.Index) bool {
+	if ctx.Session == nil {
+		return idx.InitiallyDeferred
 	}
-	if sess, ok := ctx.Session.(*BasicSession); ok {
-		return sess.UniqueConstraintDeferred(idx.Name, idx.InitiallyDeferred)
+	sess, ok := ctx.Session.(*BasicSession)
+	if !ok {
+		return idx.InitiallyDeferred
+	}
+	// M0134-0005g: SET CONSTRAINTS <name> DEFERRED keys BasicSession's
+	// name-keyed map by the name the user typed, which for a partitioned
+	// table's PK/UNIQUE constraint is the PARENT index's name — goopg's
+	// per-partition clone gets a DIFFERENT auto-generated name (e.g.
+	// "<child>_<col>_key" vs the parent's "<parent>_<col>_key", see
+	// operators_ddl.go's PARTITION OF / ATTACH PARTITION clone loops). Try
+	// idx's own name first (a directly-named partition constraint must keep
+	// working), then walk PartitionParentOID up to the root, trying each
+	// ancestor's name in turn; first hit wins. Bounded (maxPartitionParentWalk)
+	// so a cyclic/corrupt linkage cannot spin — mirrors maxCTIDChainWalk's
+	// idiom in operators_storage.go.
+	if sess.UniqueConstraintDeferred(idx.Name, idx.InitiallyDeferred) {
+		return true
+	}
+	im, isIM := ctx.Catalog.(*catalog.InMemory)
+	if !isIM {
+		return idx.InitiallyDeferred
+	}
+	cur := idx
+	for i := 0; i < maxPartitionParentWalk && cur.PartitionParentOID != 0; i++ {
+		parent, ok := im.LookupIndexByOID(cur.PartitionParentOID)
+		if !ok {
+			break
+		}
+		if sess.UniqueConstraintDeferred(parent.Name, idx.InitiallyDeferred) {
+			return true
+		}
+		cur = parent
 	}
 	return idx.InitiallyDeferred
 }
@@ -64,10 +122,11 @@ func queueDeferredUniqueCheck(ctx *Context, tbl *catalog.Table, idx *catalog.Ind
 		return
 	}
 	sess.AddDeferredUniqueCheck(DeferredUniqueCheck{
-		TableName: tbl.Name,
-		IndexName: idx.Name,
-		Key:       append([]byte(nil), key...),
-		Detail:    buildUniqueConstraintDetail(idx, cols, row),
+		TableName:     tbl.Name,
+		IndexName:     idx.Name,
+		Key:           append([]byte(nil), key...),
+		Detail:        buildUniqueConstraintDetail(idx, cols, row),
+		DeferToCommit: uniqueCheckDeferToCommit(ctx, idx),
 	})
 }
 
@@ -103,10 +162,11 @@ func queueDeferredNNDUniqueCheck(ctx *Context, tbl *catalog.Table, idx *catalog.
 		})
 	}
 	sess.AddDeferredUniqueCheck(DeferredUniqueCheck{
-		TableName:  tbl.Name,
-		IndexName:  idx.Name,
-		NNDKeyCols: nnd,
-		Detail:     nndDetail(idx, cols, row),
+		TableName:     tbl.Name,
+		IndexName:     idx.Name,
+		NNDKeyCols:    nnd,
+		Detail:        nndDetail(idx, cols, row),
+		DeferToCommit: uniqueCheckDeferToCommit(ctx, idx),
 	})
 }
 
@@ -121,6 +181,30 @@ func RunDeferredUniqueChecks(ctx *Context, sess *BasicSession) error {
 		return nil
 	}
 	checks := sess.TakeDeferredUniqueChecks()
+	if len(checks) == 0 {
+		return nil
+	}
+	return runAllDeferredUniqueChecks(ctx, checks)
+}
+
+// RunStmtEndDeferredUniqueChecks re-verifies every queued UNIQUE/PK check that
+// is NOT currently deferred to COMMIT (i.e. every DEFERRABLE-but-not-deferred
+// candidate queued by uniqueCheckDeferred during the statement that just
+// finished) and clears just that subset — the COMMIT-tier subset stays queued
+// for RunDeferredUniqueChecks. This is the "end of statement" firing PostgreSQL
+// gives every constraint trigger whose deferred flag is not currently set
+// (postgres/src/backend/commands/trigger.c, AfterTriggerFireDeferred at
+// end-of-command). Called once per top-level statement from both the
+// simple-query dispatcher and the extended-protocol Execute path — regardless
+// of whether the statement is inside an explicit transaction block or
+// autocommit, matching PG's per-statement (not per-transaction) firing
+// granularity. A violation raises the same 23505 shape as the immediate path.
+// No-op when nothing is queued for this tier. b4-s1-stmt-end-unique.
+func RunStmtEndDeferredUniqueChecks(ctx *Context, sess *BasicSession) error {
+	if sess == nil || ctx == nil || ctx.Pool == nil {
+		return nil
+	}
+	checks := sess.TakeDeferredUniqueChecksStmtEnd()
 	if len(checks) == 0 {
 		return nil
 	}
@@ -220,11 +304,85 @@ func indexByNameOnTable(ctx *Context, tbl *catalog.Table, name string) *catalog.
 	return nil
 }
 
+// resolveDeferredUniqueChainTail walks the t_ctid chain from ptr forward to its
+// HOT tail — the version a deferred UNIQUE recheck must judge. A non-key-column
+// HOT update (tryApplyHOTUpdate) does no index maintenance, so the b-tree's only
+// entry for the candidate key still points at the original slot; that slot's
+// xmax has been stamped to the updater's own XID (correctly making it dead per
+// isLiveForUniqueCheck) while the live successor sits one t_ctid hop away and is
+// never visited by a raw per-pointer fetch. M0134-0005e §12.2
+// (docs/design/0134-0005-constraints-sql-divergence.md).
+//
+// The walk follows a hop ONLY while the tuple being left behind carries
+// HeapHotUpdated — mirroring PG's own recheck (unique_key_recheck,
+// postgres/src/backend/commands/constraint.c) fetching through SnapshotSelf via
+// table_index_fetch_tuple/heap_hot_search_buffer, which likewise stops at the
+// first non-HOT link. This matters for correctness, not just fidelity: a
+// non-HOT update (any indexed column changed) gets its OWN new index entry
+// inserted separately, so continuing past it here would misattribute a later,
+// unrelated key value to THIS entry's candidate key and over-count a resolved
+// duplicate as still live. A tuple with no HOT successor (isChainTailCTID) or
+// no successor at all IS the tail. Reuses isChainTailCTID for the "no
+// successor" test and maxCTIDChainWalk as the loop bound, and mirrors
+// epqFollowChainFull's per-hop traversal shape (Pin/RLock/copy/RUnlock/Unpin,
+// one page pinned at a time) — but WITHOUT its predicate/snapshot evaluation,
+// since this recheck needs only isLiveForUniqueCheck on the resolved tuple's
+// Xmin/Xmax, not full MVCC visibility. Defensive: bounded by maxCTIDChainWalk,
+// and on a missing/unreadable hop or chain exhaustion it falls back to the last
+// tuple it did resolve (never panics, never loops forever); ok is false only
+// when even the starting pointer could not be fetched.
+func resolveDeferredUniqueChainTail(ctx *Context, rel storage.RelFileNode, ptr storage.ItemPointer) (tailPtr storage.ItemPointer, tuple storage.HeapTuple, ok bool) {
+	curBlk, curSlot := ptr.Block, ptr.Offset
+	var lastTup storage.HeapTuple
+	var lastPtr storage.ItemPointer
+	haveLast := false
+	for i := 0; i < maxCTIDChainWalk; i++ {
+		slot, perr := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: curBlk})
+		if perr != nil {
+			return lastPtr, lastTup, haveLast
+		}
+		slot.RLock()
+		tup, terr := storage.PageGetHeapTuple(slot.Page(), curSlot)
+		slot.RUnlock()
+		ctx.Pool.Unpin(slot)
+		if terr != nil {
+			return lastPtr, lastTup, haveLast
+		}
+		curPtr := storage.ItemPointer{Block: curBlk, Offset: curSlot}
+		lastTup, lastPtr, haveLast = tup, curPtr, true
+		if storage.IsMovedToAnotherPartition(tup.Header.CTID) {
+			// Sentinel — no live successor reachable through this chain;
+			// judge the sentinel-bearing tuple itself (it is dead: xmax was
+			// stamped by the move).
+			return curPtr, tup, true
+		}
+		if isChainTailCTID(tup.Header.CTID, curBlk, curSlot) {
+			return curPtr, tup, true
+		}
+		if !tup.Header.IsHotUpdated() {
+			// A successor is stamped, but this link is NOT a HOT link (a
+			// non-key-column HOT update always sets HeapHotUpdated on the
+			// tuple it leaves behind — PageStampHotOldTuple — while a
+			// key-changing/non-HOT update clears it — PageStampUpdatedOldTuple
+			// / PageApplyHeapUpdateOldRedo). The successor already has its own
+			// separate index entry; stop here and judge THIS tuple.
+			return curPtr, tup, true
+		}
+		curBlk, curSlot = tup.Header.CTID.Block, tup.Header.CTID.Offset
+	}
+	// Chain walk exhausted (corruption backstop) — judge the last tuple
+	// resolved rather than looping forever.
+	return lastPtr, lastTup, haveLast
+}
+
 // recheckDeferredUniqueKey scans the index for key and counts the distinct live
 // visible heap tuples carrying it. Two or more is a deferred uniqueness
 // violation (the candidate row is itself one of them); it raises 23505. A
 // no-key-change transient duplicate that was resolved before COMMIT (e.g. the
-// id+1 swap) leaves a single live tuple per key and passes. 0119-0004.
+// id+1 swap) leaves a single live tuple per key and passes. Each candidate
+// pointer is first resolved to its t_ctid chain tail (resolveDeferredUniqueChainTail)
+// before judgement, so a non-key HOT update of the candidate row does not hide
+// its live successor from the count (M0134-0005e). 0119-0004.
 func recheckDeferredUniqueKey(ctx *Context, tbl *catalog.Table, idx *catalog.Index, key []byte, detail string) error {
 	rel := ctx.Catalog.RelFileNode(tbl)
 	idxRel := ctx.Catalog.IndexRelFileNode(idx)
@@ -233,25 +391,25 @@ func recheckDeferredUniqueKey(ctx *Context, tbl *catalog.Table, idx *catalog.Ind
 		// Index unreadable (e.g. dropped in-txn) — nothing to enforce.
 		return nil
 	}
+	// De-duplicated by the RESOLVED TAIL pointer, not the raw b-tree pointer:
+	// two entries whose chains converge on one physical tuple (e.g. the
+	// insert-time entry and a later re-probe both HOT-chaining to the same
+	// live successor) must not be double-counted. Mirrors the M0131-S32.1
+	// TM_SelfModified convergence guard elsewhere in this package
+	// (operators_storage.go:4685) — same "two pointers, one physical tuple"
+	// hazard, different call site.
 	seen := make(map[storage.ItemPointer]struct{})
 	live := 0
 	_ = tree.RangeScan(key, key, func(_ []byte, ptr storage.ItemPointer) (bool, error) {
-		if _, dup := seen[ptr]; dup {
+		tailPtr, tuple, ok := resolveDeferredUniqueChainTail(ctx, rel, ptr)
+		if !ok {
 			return true, nil
 		}
-		slot, perr := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
-		if perr != nil {
-			return true, nil
-		}
-		slot.RLock()
-		tuple, terr := storage.PageGetHeapTuple(slot.Page(), ptr.Offset)
-		slot.RUnlock()
-		ctx.Pool.Unpin(slot)
-		if terr != nil {
+		if _, dup := seen[tailPtr]; dup {
 			return true, nil
 		}
 		if isLiveForUniqueCheck(ctx, tuple.Header.Xmin, tuple.Header.Xmax) {
-			seen[ptr] = struct{}{}
+			seen[tailPtr] = struct{}{}
 			live++
 		}
 		return true, nil

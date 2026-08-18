@@ -9865,6 +9865,30 @@ func defaultMarkerReplacement(tbl *catalog.Table, ordinal int) parser.Expr {
 	return &parser.NullConst{}
 }
 
+// defaultAppendableColumns returns, in table-column order, the ordinals of
+// tbl's columns that are eligible to receive an appended DEFAULT-expression
+// value for an INSERT that omits them: not already supplied (per the
+// `present` map), not GENERATED ALWAYS AS (computed later by
+// computeGeneratedColumns), and carrying a real catalog DefaultExpr.
+// Serial/identity columns are deliberately excluded — catalog.Column.
+// DefaultExpr is left nil for them by convention (see
+// defaultMarkerReplacement's doc comment above) so autoGenerateSerialValues
+// remains the sole nextval-caller for them, avoiding a double sequence
+// advance (§17.3 decision 3). Shared (Rule #2 twin pair) by the VALUES-shape
+// marker rewriter (rewriteInsertDefaultMarkers, M0134-0005j) and the
+// SELECT-shape Project-append path in planInsert (M0134-0005m) so the two
+// sibling paths cannot drift on eligibility.
+func defaultAppendableColumns(tbl *catalog.Table, present map[int]bool) []int {
+	var out []int
+	for i, col := range tbl.Columns {
+		if present[i] || col.GeneratedAlways || col.DefaultExpr == nil {
+			continue
+		}
+		out = append(out, i)
+	}
+	return out
+}
+
 // rewriteInsertDefaultMarkers substitutes `*parser.DefaultMarker` cells
 // in an INSERT's VALUES rows with the target column's catalog
 // `DefaultExpr` (or `*parser.NullConst` when the column has no
@@ -9888,6 +9912,12 @@ func rewriteInsertDefaultMarkers(s *parser.InsertStmt, cat catalog.Catalog) erro
 	// derivation so DEFAULT substitution sees the same mapping the
 	// planner will use.
 	var colIndex []int
+	// explicitColCount tracks how many cells the user's own VALUES rows are
+	// expected to supply BEFORE any M0134-0005j column-list extension below.
+	// A row whose length doesn't match this is a genuine user arity error
+	// (e.g. `INSERT INTO t(a,b) VALUES(1)`) and must fall through to
+	// planInsert's 42601 diagnostic rather than be silently DEFAULT-padded.
+	explicitColCount := 0
 	if len(s.Columns) == 0 {
 		colIndex = make([]int, 0, len(tbl.Columns))
 		for i, col := range tbl.Columns {
@@ -9905,6 +9935,34 @@ func rewriteInsertDefaultMarkers(s *parser.InsertStmt, cat catalog.Catalog) erro
 				return nil
 			}
 			colIndex = append(colIndex, col.Ordinal)
+		}
+		explicitColCount = len(colIndex)
+		// M0134-0005j: a column omitted from an EXPLICIT column list must
+		// still get its DEFAULT evaluated through the normal planner/
+		// executor path, exactly like the no-column-list padding above
+		// already does for trailing columns. Mirrors PostgreSQL's
+		// transformInsertStmt, which fills omitted columns from pg_attrdef
+		// at parse-analysis time (postgres/src/backend/parser/analyze.c).
+		// Append such columns to both the column list and colIndex here;
+		// the row-padding step below then adds a DefaultMarker cell per
+		// appended column and the substitution loop fills it with
+		// col.DefaultExpr, same as any other DEFAULT cell.
+		//
+		// Serial/identity columns are deliberately NOT appended here:
+		// catalog.Column.DefaultExpr is left nil for them by convention
+		// (see defaultMarkerReplacement's doc comment) — the executor's
+		// autoGenerateSerialValues remains authoritative for OMITTED
+		// serial/identity columns, so keying strictly on DefaultExpr != nil
+		// avoids a double sequence advance (§17.3 decision 3). GENERATED
+		// ALWAYS AS columns are excluded too — they are computed by
+		// computeGeneratedColumns, not substituted here (§17.3 decision 5).
+		present := make(map[int]bool, len(colIndex))
+		for _, ord := range colIndex {
+			present[ord] = true
+		}
+		for _, i := range defaultAppendableColumns(tbl, present) {
+			s.Columns = append(s.Columns, tbl.Columns[i].Name)
+			colIndex = append(colIndex, i)
 		}
 	}
 	// M0103-0007 rung 17: expand `INSERT … DEFAULT VALUES` into a
@@ -9927,6 +9985,22 @@ func rewriteInsertDefaultMarkers(s *parser.InsertStmt, cat catalog.Catalog) erro
 			padded := make([]parser.Expr, len(colIndex))
 			copy(padded, r)
 			for i := len(r); i < len(colIndex); i++ {
+				padded[i] = &parser.DefaultMarker{}
+			}
+			s.Rows[ri] = padded
+			r = padded
+		}
+		// M0134-0005j: explicit column list extended above with omitted
+		// DEFAULT-bearing columns — pad each row (whose length still
+		// matches the user's ORIGINAL explicit list) with a DefaultMarker
+		// per appended column. A row that does NOT match explicitColCount
+		// is a genuine user arity error and must NOT be padded here; it
+		// falls through to the len(r) != len(colIndex) check below and
+		// planInsert's 42601 diagnostic.
+		if explicitColCount > 0 && len(r) == explicitColCount && len(colIndex) > explicitColCount {
+			padded := make([]parser.Expr, len(colIndex))
+			copy(padded, r)
+			for i := explicitColCount; i < len(colIndex); i++ {
 				padded[i] = &parser.DefaultMarker{}
 			}
 			s.Rows[ri] = padded
@@ -10096,18 +10170,13 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 		if err != nil {
 			return nil, err
 		}
-		source = sel
 		// Reconcile the source arity with the target column list, mirroring
 		// PostgreSQL transformInsertStmt:
 		//   * more source expressions than target columns is an error;
 		//   * with NO explicit column list, fewer source expressions is legal —
 		//     the leading columns are filled and the trailing target columns
 		//     fall back to their DEFAULT (or NULL). PG: "if there are only N
-		//     columns supplied … the first N column names". Truncating colIndex
-		//     here leaves the remaining columns flagged missing in the executor
-		//     (insertOp.Next) so applyDefaultsForMissing fills them; without the
-		//     truncation the executor indexes past the shorter source row and
-		//     panics (index out of range).
+		//     columns supplied … the first N column names".
 		srcWidth := len(sel.Output())
 		if srcWidth > len(colIndex) {
 			return nil, &PlanError{
@@ -10123,9 +10192,55 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 				Message: "INSERT has more target columns than expressions",
 			}
 		}
+		// mapped is the prefix of colIndex actually filled by the SELECT's own
+		// output columns (all of colIndex for an explicit column list, since
+		// the arity checks above force srcWidth == len(colIndex) there; the
+		// leading srcWidth columns for a no-column-list SELECT narrower than
+		// the table).
+		mapped := colIndex
 		if srcWidth < len(colIndex) {
-			colIndex = colIndex[:srcWidth]
+			mapped = colIndex[:srcWidth]
 		}
+		// M0134-0005m: any target column in tbl NOT covered by `mapped` —
+		// omitted from an explicit column list, or past a no-column-list
+		// SELECT's narrower width — still needs its DEFAULT evaluated through
+		// the FULL expression evaluator (currval, volatile functions, etc.),
+		// exactly like INSERT … VALUES since M0134-0005j. Route it by wrapping
+		// `sel` in a Project that passes its own columns through and appends
+		// one resolved DEFAULT expression per eligible omitted column; extend
+		// colIndex in lockstep so the executor's existing ColumnIndex-width-
+		// generic Insert.Next needs no change. PG oracle: rewriteTargetListIU
+		// (rewriteHandler.c ~:775) appends the same defaults as ordinary
+		// targetlist entries regardless of INSERT source shape (§20.3/§20.4).
+		present := make(map[int]bool, len(mapped))
+		for _, ord := range mapped {
+			present[ord] = true
+		}
+		appended := defaultAppendableColumns(tbl, present)
+		colIndex = mapped
+		if len(appended) > 0 {
+			selOut := sel.Output()
+			targets := make([]Expr, len(mapped), len(mapped)+len(appended))
+			outSchema := make(Schema, len(mapped), len(mapped)+len(appended))
+			for i := 0; i < len(mapped); i++ {
+				c := selOut[i]
+				targets[i] = &ColumnRef{pos: s.Pos(), Index: i, Name: c.Name, Type: c.Type, SourceTableIdx: c.SourceTableIdx}
+				outSchema[i] = c
+			}
+			ctx := &resolveContext{cat: cat}
+			for _, ord := range appended {
+				col := tbl.Columns[ord]
+				pe, perr := resolveExpr(col.DefaultExpr, ctx)
+				if perr != nil {
+					return nil, perr
+				}
+				targets = append(targets, pe)
+				outSchema = append(outSchema, SchemaColumn{Name: col.Name, Type: col.Type})
+				colIndex = append(colIndex, ord)
+			}
+			sel = &Project{pos: s.Pos(), Child: sel, Targets: targets, schema: outSchema}
+		}
+		source = sel
 	} else {
 		// Validate row arity and build planner expressions.
 		if len(s.Rows) == 0 {

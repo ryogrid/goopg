@@ -1253,6 +1253,17 @@ type ColumnDef struct {
 	// `CONSTRAINT <name> NOT NULL` form rather than a bare `NOT NULL`. Empty for
 	// the common unnamed case. DU-002 slice 273.
 	NotNullConstraintName string
+	// NotNullExplicit is true when the column carries at least one literal
+	// column-level `NOT NULL` (or `CONSTRAINT name NOT NULL`) clause — as
+	// opposed to NotNull being true only because of an implied source
+	// (PRIMARY KEY, SERIAL, IDENTITY) with no literal NOT NULL keyword.
+	// parseColumnConstraintList resolves stacked column-level NOT NULL
+	// clauses (PG's parse_utilcmd.c:transformColumnDefinition algorithm) into
+	// this single flag plus NotNullConstraintName/NotNullNoInherit; the
+	// executor's table-level merge (heap.c:AddRelationNotNullConstraints)
+	// needs to distinguish an explicit occurrence from a merely-implied one
+	// when building its per-column entry list. M0134-0005k.
+	NotNullExplicit bool
 	// CheckNoInherit is true when the inline CHECK constraint carries NO INHERIT.
 	// Stored so LIKE INCLUDING ALL can error on partitioned tables. M0097-0023.
 	CheckNoInherit bool
@@ -1482,6 +1493,19 @@ type CreateTableStmt struct {
 	// TableHasNoInheritCheck is true when any table-level CHECK constraint carries
 	// NO INHERIT. Partitioned tables reject such constraints. M0097-0023.
 	TableHasNoInheritCheck bool
+	// TableNotNullNames/TableNotNullCols/TableNotNullNoInherit hold table-level
+	// NOT NULL constraints — `[CONSTRAINT name] NOT NULL colname [NO INHERIT]`
+	// written as a *table* constraint element (parse_utilcmd.c:1071-1078),
+	// distinct from a column-level NOT NULL (which lives on ColumnDef's
+	// NotNullNoInherit/NotNullConstraintName/NotNullExplicit). Parallel slices
+	// mirroring TableChecks/TableCheckNoInherit; TableNotNullNames[i] is ""
+	// for the anonymous `NOT NULL col [NO INHERIT]` form. The executor merges
+	// these against each column's own NOT NULL entry (heap.c:
+	// AddRelationNotNullConstraints) to detect conflicting names/NO INHERIT
+	// declarations. M0134-0005k.
+	TableNotNullNames     []string
+	TableNotNullCols      []string
+	TableNotNullNoInherit []bool
 	// LikeTables holds the source table names from LIKE clauses.
 	// `CREATE TABLE t (LIKE src INCLUDING DEFAULTS)` copies src's columns. M0097-0069.
 	// Deprecated: use BodyOrder for positional interleaving.
@@ -3395,6 +3419,17 @@ type AlterTableAction struct {
 	AlterConstraintHasDeferrability  bool
 	AlterConstraintEnforced          bool
 	AlterConstraintHasEnforceability bool
+	// AlterConstraintNoInherit/AlterConstraintHasInheritability carry the
+	// `INHERIT` / `NO INHERIT` trailer of ALTER CONSTRAINT (PG18
+	// CONSTRAINT_NOTNULL-only toggle, tablecmds.c
+	// ATExecAlterConstrInheritability): AlterConstraintHasInheritability
+	// records whether the statement named this attribute class at all
+	// (bare INHERIT is its own grammar production, gram.y:2686-2699; NO
+	// INHERIT is part of ConstraintAttributeSpec, gram.y:6249) —
+	// AlterConstraintNoInherit is true for NO INHERIT, false for INHERIT.
+	// M0134-0005 S05.
+	AlterConstraintNoInherit         bool
+	AlterConstraintHasInheritability bool
 }
 
 func (a AlterTableAction) Pos() int { return a.pos }

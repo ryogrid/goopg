@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 )
@@ -2848,6 +2849,30 @@ func (p *parser) rejectDuplicateEnforced() error {
 	return nil
 }
 
+// rejectMisplacedEnforced returns PG's "misplaced [NOT] ENFORCED clause"
+// (42601) when the current token begins a `[NOT] ENFORCED` attribute
+// following an inline column UNIQUE or PRIMARY KEY constraint.
+// transformConstraintAttrs (parse_utilcmd.c:3991-4021) only accepts ENFORCED/
+// NOT ENFORCED for CHECK and FOREIGN KEY constraints; UNIQUE, PRIMARY KEY and
+// EXCLUSION always hit this "misplaced" branch instead — n->location = @1
+// (gram.y:4135-4150) puts the caret under ENFORCED for the bare form and
+// under NOT for the NOT ENFORCED pair, which is exactly what isEnforcedAttr's
+// own bare-vs-NOT peek already captures via p.cur().Pos. M0134-0005d slice 1.
+func (p *parser) rejectMisplacedEnforced() error {
+	if !p.isEnforcedAttr() {
+		return nil
+	}
+	msg := "misplaced ENFORCED clause"
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot {
+		msg = "misplaced NOT ENFORCED clause"
+	}
+	return &SyntaxError{
+		Pos:     p.cur().Pos,
+		Message: msg,
+		Raw:     true,
+	}
+}
+
 // parseFKConstraintAttrs consumes the `[NOT] DEFERRABLE [INITIALLY DEFERRED |
 // INITIALLY IMMEDIATE]`, `NOT VALID`, and `[NOT] ENFORCED` trailer that can
 // follow a FOREIGN KEY constraint's REFERENCES/ON DELETE/ON UPDATE clauses, in
@@ -2922,7 +2947,7 @@ func (p *parser) parseFKConstraintAttrs() (deferrable, initiallyDeferred, notVal
 // ATAlterConstraint.alterDeferrability/alterEnforceability (tablecmds.c):
 // ALTER CONSTRAINT only touches the attribute(s) actually named. DU-002
 // slice 433.
-func (p *parser) parseAlterConstraintAttrs() (deferrable, initiallyDeferred, enforced, hasDeferrability, hasEnforceability bool) {
+func (p *parser) parseAlterConstraintAttrs() (deferrable, initiallyDeferred, enforced, noInherit, hasDeferrability, hasEnforceability, hasInheritability bool) {
 	for {
 		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot {
 			switch {
@@ -2963,6 +2988,19 @@ func (p *parser) parseAlterConstraintAttrs() (deferrable, initiallyDeferred, enf
 		if p.acceptIdentKeyword("enforced") { // bare ENFORCED
 			enforced = true
 			hasEnforceability = true
+			continue
+		}
+		// NO INHERIT — part of ConstraintAttributeSpec (gram.y:6249, CAS_NO_INHERIT),
+		// unlike bare INHERIT which is its own separate grammar production
+		// (gram.y:2686-2699) handled at the ALTER CONSTRAINT dispatch site before
+		// this function is even called. NO INHERIT toggles a NOT NULL
+		// constraint's connoinherit; the executor gates it to CONSTRAINT_NOTNULL
+		// (tablecmds.c ATExecAlterConstraint ~12259-12264). DU-002 slice 433
+		// follow-up, M0134-0005 S05.
+		if p.acceptIdentKeyword("no") {
+			_ = p.acceptIdentKeyword("inherit")
+			noInherit = true
+			hasInheritability = true
 			continue
 		}
 		break
@@ -3512,8 +3550,39 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				_ = p.acceptIdentKeyword("inherit")
 				col.NotNullNoInherit = true
 			}
-			stmt.Columns = append(stmt.Columns, col)
-			stmt.BodyOrder = append(stmt.BodyOrder, col.Name)
+			// Only synthesize the constraint-only merge entry (M0119-0004,
+			// for a column that arrives purely via INHERITS and isn't
+			// redeclared locally) when this column name hasn't already been
+			// declared with a real type earlier in the same table element
+			// list. Otherwise the real column and this fake one would share
+			// one BodyOrder name, and colByName (a flat map keyed by name)
+			// can only remember one of them — duplicating the real column's
+			// name into BodyOrder a second time risks either shadowing the
+			// real ColumnDef or double-adding it (`a int primary key, not
+			// null a no inherit`). The algorithm-B bookkeeping below is
+			// unconditional so the conflict check still runs. M0134-0005k.
+			alreadyRealCol := false
+			for _, existing := range stmt.Columns {
+				if existing.Type.Name != "" && strings.EqualFold(existing.Name, col.Name) {
+					alreadyRealCol = true
+					break
+				}
+			}
+			if !alreadyRealCol {
+				stmt.Columns = append(stmt.Columns, col)
+				stmt.BodyOrder = append(stmt.BodyOrder, col.Name)
+			}
+			// Also record this as an anonymous table-level NOT NULL entry
+			// (parallel to the named CONSTRAINT form above) so the executor's
+			// algorithm-B merge (heap.c:AddRelationNotNullConstraints) can
+			// detect a conflicting name/NO INHERIT against any other NOT NULL
+			// source for the same column (e.g. `a int primary key, not null a
+			// no inherit`). The fake ColumnDef above stays for the pre-existing
+			// INHERITS-merge path (M0119-0004); this is additive bookkeeping
+			// only. M0134-0005k.
+			stmt.TableNotNullNames = append(stmt.TableNotNullNames, "")
+			stmt.TableNotNullCols = append(stmt.TableNotNullCols, col.Name)
+			stmt.TableNotNullNoInherit = append(stmt.TableNotNullNoInherit, col.NotNullNoInherit)
 		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwLike {
 			// LIKE source_table [INCLUDING/EXCLUDING option …] — copy columns. M0097-0069.
 			p.advance() // consume LIKE
@@ -4017,6 +4086,30 @@ func (p *parser) parseTableConstraintElement(stmt *CreateTableStmt) (bool, error
 				return false, err
 			}
 			stmt.TableForeignKeys = append(stmt.TableForeignKeys, fk)
+		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot:
+			// CONSTRAINT name NOT NULL colname [NO INHERIT] — named table-level
+			// NOT NULL constraint (PG18). parse_utilcmd.c:1071-1078 (the table-
+			// constraint CONSTR_NOTNULL case in transformTableConstraint).
+			// Recorded on parallel slices; the executor merges it against the
+			// referenced column's own NOT NULL entry (heap.c:
+			// AddRelationNotNullConstraints), which may raise a conflicting-
+			// name or conflicting-NO-INHERIT error. M0134-0005k.
+			p.advance() // NOT
+			if _, err := p.expectKeyword(KwNull); err != nil {
+				return false, err
+			}
+			nnColTok, err := p.parseIdent()
+			if err != nil {
+				return false, err
+			}
+			nnNoInherit := false
+			if p.acceptIdentKeyword("no") {
+				_ = p.acceptIdentKeyword("inherit")
+				nnNoInherit = true
+			}
+			stmt.TableNotNullNames = append(stmt.TableNotNullNames, constraintName)
+			stmt.TableNotNullCols = append(stmt.TableNotNullCols, identText(nnColTok))
+			stmt.TableNotNullNoInherit = append(stmt.TableNotNullNoInherit, nnNoInherit)
 		case p.acceptIdentKeyword("exclude"):
 			// CONSTRAINT name EXCLUDE USING method (col WITH op) [INCLUDE (cols)]. M0097-0023.
 			cdef := p.parseExcludeConstraint()
@@ -4304,6 +4397,15 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 // first token it does not recognise as a constraint (comma, closing paren,
 // ...), leaving it unconsumed for the caller. DU-002 slice 374 follow-up.
 func (p *parser) parseColumnConstraintList(col *ColumnDef) error {
+	// nnOccurrences accumulates every literal column-level `NOT NULL` /
+	// `CONSTRAINT name NOT NULL` clause seen for this column, in written
+	// order. Resolved into col.NotNull/NotNullConstraintName/NotNullNoInherit/
+	// NotNullExplicit once the whole constraint list has been consumed (see
+	// resolveColumnNotNull below), mirroring PG's two-pass
+	// transformColumnDefinition: a PRIMARY KEY/IDENTITY clause anywhere in the
+	// list (even after a NOT NULL NO INHERIT) disallows NO INHERIT.
+	// M0134-0005k.
+	var nnOccurrences []colNotNullOccurrence
 	for {
 		switch {
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot:
@@ -4311,12 +4413,13 @@ func (p *parser) parseColumnConstraintList(col *ColumnDef) error {
 			if _, err := p.expectKeyword(KwNull); err != nil {
 				return err
 			}
-			col.NotNull = true
+			occ := colNotNullOccurrence{pos: p.cur().Pos}
 			// Optional NO INHERIT — PG18 NOT NULL constraints may carry NO INHERIT.
 			if p.acceptIdentKeyword("no") {
 				_ = p.acceptIdentKeyword("inherit")
-				col.NotNullNoInherit = true
+				occ.noInherit = true
 			}
+			nnOccurrences = append(nnOccurrences, occ)
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwPrimary:
 			p.advance()
 			if _, err := p.expectKeyword(KwKey); err != nil {
@@ -4329,6 +4432,13 @@ func (p *parser) parseColumnConstraintList(col *ColumnDef) error {
 			// (rides the backing tbl_pkey index built in the executor). Without this
 			// the keyword fell through to the column-constraint loop's default arm and
 			// failed the whole CREATE TABLE. DU-002 slice 142.
+			// [NOT] ENFORCED on a column-level PRIMARY KEY is a PG error
+			// ("misplaced [NOT] ENFORCED clause", 42601) — must be checked
+			// before parseConstraintDeferrable, which would otherwise
+			// silently swallow a leading NOT. M0134-0005d slice 1.
+			if err := p.rejectMisplacedEnforced(); err != nil {
+				return err
+			}
 			p.parseConstraintDeferrable(&col.PrimaryDeferrable, &col.PrimaryInitiallyDeferred)
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNull:
 			p.advance() // NULL is the default; absorb it
@@ -4572,6 +4682,13 @@ func (p *parser) parseColumnConstraintList(col *ColumnDef) error {
 			// trailer on the inline column UNIQUE. Without this, a trailing
 			// DEFERRABLE fell through to the default arm and became a HARD PARSE
 			// ERROR for the whole CREATE TABLE. DU-002 slice 141.
+			// [NOT] ENFORCED on a column-level UNIQUE is a PG error
+			// ("misplaced [NOT] ENFORCED clause", 42601) — must be checked
+			// before parseConstraintDeferrable, which would otherwise
+			// silently swallow a leading NOT. M0134-0005d slice 1.
+			if err := p.rejectMisplacedEnforced(); err != nil {
+				return err
+			}
 			p.parseConstraintDeferrable(&col.UniqueDeferrable, &col.UniqueInitiallyDeferred)
 		// CHECK (expr) inline column constraint. M0097-0014.
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck:
@@ -4645,6 +4762,13 @@ func (p *parser) parseColumnConstraintList(col *ColumnDef) error {
 				col.NotNull = true
 				// Optional DEFERRABLE trailer (named inline column PRIMARY KEY).
 				// DU-002 slice 142.
+				// [NOT] ENFORCED on a column-level PRIMARY KEY is a PG error
+				// ("misplaced [NOT] ENFORCED clause", 42601) — must be checked
+				// before parseConstraintDeferrable, which would otherwise
+				// silently swallow a leading NOT. M0134-0005d slice 1.
+				if err := p.rejectMisplacedEnforced(); err != nil {
+					return err
+				}
 				p.parseConstraintDeferrable(&col.PrimaryDeferrable, &col.PrimaryInitiallyDeferred)
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
 				// CONSTRAINT name UNIQUE [NULLS [NOT] DISTINCT] — named inline
@@ -4663,6 +4787,13 @@ func (p *parser) parseColumnConstraintList(col *ColumnDef) error {
 				}
 				// Optional DEFERRABLE trailer (named inline column UNIQUE).
 				// DU-002 slice 141.
+				// [NOT] ENFORCED on a column-level UNIQUE is a PG error
+				// ("misplaced [NOT] ENFORCED clause", 42601) — must be checked
+				// before parseConstraintDeferrable, which would otherwise
+				// silently swallow a leading NOT. M0134-0005d slice 1.
+				if err := p.rejectMisplacedEnforced(); err != nil {
+					return err
+				}
 				p.parseConstraintDeferrable(&col.UniqueDeferrable, &col.UniqueInitiallyDeferred)
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot:
 				// CONSTRAINT name NOT NULL [NO INHERIT] — named inline NOT NULL.
@@ -4676,12 +4807,12 @@ func (p *parser) parseColumnConstraintList(col *ColumnDef) error {
 				if _, err := p.expectKeyword(KwNull); err != nil {
 					return err
 				}
-				col.NotNull = true
-				col.NotNullConstraintName = identText(cnameTok)
+				occ := colNotNullOccurrence{name: identText(cnameTok), pos: p.cur().Pos}
 				if p.acceptIdentKeyword("no") {
 					_ = p.acceptIdentKeyword("inherit")
-					col.NotNullNoInherit = true
+					occ.noInherit = true
 				}
+				nnOccurrences = append(nnOccurrences, occ)
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwReferences:
 				// CONSTRAINT name REFERENCES table (cols) — FK; parsed below.
 				// Fall through to FK parsing path by continuing the outer loop.
@@ -4698,8 +4829,92 @@ func (p *parser) parseColumnConstraintList(col *ColumnDef) error {
 				}
 			}
 		default:
-			return nil
+			return p.resolveColumnNotNull(col, nnOccurrences)
 		}
+	}
+}
+
+// colNotNullOccurrence records one literal column-level `NOT NULL` /
+// `CONSTRAINT name NOT NULL` clause as parseColumnConstraintList encounters
+// it, before algorithm (A) resolves the whole column into a single final
+// NOT NULL constraint. M0134-0005k.
+type colNotNullOccurrence struct {
+	name      string
+	noInherit bool
+	pos       int
+}
+
+// resolveColumnNotNull implements PostgreSQL's column-level NOT NULL
+// constraint-conflict algorithm — parse_utilcmd.c:transformColumnDefinition
+// (~lines 710-812). A pre-scan disallows NO INHERIT on any column-level NOT
+// NULL when the column also carries PRIMARY KEY or IDENTITY (order-
+// independent: col.Primary/col.IdentityColumn are already fully resolved by
+// the time the whole constraint list has been consumed). Then, per NOT NULL
+// occurrence in written order: the first becomes the column's constraint;
+// each subsequent one is compared against it — differing non-empty names
+// raise "conflicting not-null constraint names" (E1, 42601); differing NO
+// INHERIT raises the *plural* "conflicting NO INHERIT declarations for
+// not-null constraints on column %q" (E2, 42601); an unnamed first
+// constraint adopts a later explicit name. M0134-0005k.
+func (p *parser) resolveColumnNotNull(col *ColumnDef, occurrences []colNotNullOccurrence) error {
+	if len(occurrences) == 0 {
+		return nil
+	}
+	disallowNoInherit := col.Primary || col.IdentityColumn || isSerialTypeName(col.Type.Name)
+	var chosenName string
+	var chosenNoInherit bool
+	haveChosen := false
+	for _, occ := range occurrences {
+		if disallowNoInherit && occ.noInherit {
+			return &SyntaxError{
+				Pos:     -1,
+				Message: fmt.Sprintf("conflicting NO INHERIT declarations for not-null constraints on column %q", col.Name),
+				Raw:     true,
+				Code:    "42601",
+			}
+		}
+		if !haveChosen {
+			chosenName, chosenNoInherit, haveChosen = occ.name, occ.noInherit, true
+			continue
+		}
+		if chosenName != "" && occ.name != "" && chosenName != occ.name {
+			return &SyntaxError{
+				Pos:     -1,
+				Message: fmt.Sprintf("conflicting not-null constraint names %q and %q", chosenName, occ.name),
+				Raw:     true,
+				Code:    "42601",
+			}
+		}
+		if chosenNoInherit != occ.noInherit {
+			return &SyntaxError{
+				Pos:     -1,
+				Message: fmt.Sprintf("conflicting NO INHERIT declarations for not-null constraints on column %q", col.Name),
+				Raw:     true,
+				Code:    "42601",
+			}
+		}
+		if chosenName == "" && occ.name != "" {
+			chosenName = occ.name
+		}
+	}
+	col.NotNull = true
+	col.NotNullExplicit = true
+	col.NotNullConstraintName = chosenName
+	col.NotNullNoInherit = chosenNoInherit
+	return nil
+}
+
+// isSerialTypeName reports whether typeName is one of the SERIAL pseudo-type
+// spellings. SERIAL columns are always NOT NULL and, like PRIMARY KEY/
+// IDENTITY, disallow a column-level NOT NULL NO INHERIT
+// (parse_utilcmd.c:751-753, disallow_noinherit_notnull = true for is_serial).
+// M0134-0005k.
+func isSerialTypeName(typeName string) bool {
+	switch strings.ToLower(typeName) {
+	case "serial", "serial4", "bigserial", "serial8", "smallserial", "serial2":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -8884,7 +9099,37 @@ func (p *parser) parseAlter() (Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
-		deferrable, initiallyDeferred, enforced, hasDeferrability, hasEnforceability := p.parseAlterConstraintAttrs()
+		// Bare `INHERIT` (no NOT) is its own grammar production (gram.y:2686-2699
+		// `ALTER CONSTRAINT name INHERIT`) — NOT part of ConstraintAttributeSpec,
+		// so it cannot combine with DEFERRABLE/ENFORCED/NO INHERIT in the same
+		// statement. M0134-0005 S05.
+		if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "inherit") {
+			p.advance()
+			stmt.Actions = append(stmt.Actions, AlterTableAction{
+				pos:                              nameTok.Pos,
+				Kind:                             AlterTableAlterConstraint,
+				ConstraintName:                   identText(nameTok),
+				AlterConstraintHasInheritability: true,
+				AlterConstraintNoInherit:         false,
+			})
+			return stmt, nil
+		}
+		deferrable, initiallyDeferred, enforced, noInherit, hasDeferrability, hasEnforceability, hasInheritability := p.parseAlterConstraintAttrs()
+		// `NOT VALID` is explicitly rejected by PG's grammar action itself
+		// (gram.y:2672-2676, the CAS_NOT_VALID special case inside the
+		// ConstraintAttributeSpec production) — a parse-time error, before any
+		// executor/catalog involvement. parseAlterConstraintAttrs deliberately
+		// leaves a bare NOT VALID unconsumed (see its doc comment) so this is
+		// the only place that needs to recognize it. M0134-0005 S05.
+		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot &&
+			p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "valid") {
+			return nil, &SyntaxError{
+				Pos:     p.cur().Pos,
+				Message: "constraints cannot be altered to be NOT VALID",
+				Raw:     true,
+				Code:    "0A000",
+			}
+		}
 		stmt.Actions = append(stmt.Actions, AlterTableAction{
 			pos:                              nameTok.Pos,
 			Kind:                             AlterTableAlterConstraint,
@@ -8894,6 +9139,8 @@ func (p *parser) parseAlter() (Stmt, error) {
 			AlterConstraintHasDeferrability:  hasDeferrability,
 			AlterConstraintEnforced:          enforced,
 			AlterConstraintHasEnforceability: hasEnforceability,
+			AlterConstraintNoInherit:         noInherit,
+			AlterConstraintHasInheritability: hasInheritability,
 		})
 		return stmt, nil
 	}

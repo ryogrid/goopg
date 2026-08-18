@@ -988,14 +988,147 @@ func TestPlanInsertDefaultValuesSkipsGeneratedColumns(t *testing.T) {
 	}
 }
 
-// TestPlanInsertSelectFewerColumnsTruncatesColumnIndex: INSERT ... SELECT with
-// NO explicit column list, where the SELECT yields fewer columns than the
-// table. PostgreSQL fills the leading columns and lets the trailing target
-// columns fall back to their DEFAULT. The planner must truncate ColumnIndex to
-// the source width so the executor does not index past the shorter source row
-// (the panic regression fixed in design 0118-0038 / index-only-bitmapscan
-// setup crash). The remaining column is then flagged missing and defaulted.
-func TestPlanInsertSelectFewerColumnsTruncatesColumnIndex(t *testing.T) {
+// TestPlanInsertExplicitColumnListOmittedDefaultColumnSubstituted:
+// M0134-0005j — an EXPLICIT column list that omits a DEFAULT-bearing
+// column must still get that column's DEFAULT substituted at plan
+// time, exactly like the no-column-list padding above already does
+// for trailing columns. Before this fix `INSERT INTO t (y) VALUES
+// ('Y')` left column z out of the target list entirely and the
+// executor's `applyDefaultsForMissing` mini-evaluator (which cannot
+// evaluate `currval`) silently filled it with NULL. §17 of
+// docs/design/0134-0005-constraints-sql-divergence.md.
+func TestPlanInsertExplicitColumnListOmittedDefaultColumnSubstituted(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "x", Type: catalog.Type{Name: "int4"}, DefaultExpr: &parser.IntegerConst{Value: 5}},
+		{Name: "y", Type: catalog.Type{Name: "text"}},
+		{Name: "z", Type: catalog.Type{Name: "int4"}, DefaultExpr: &parser.IntegerConst{Value: -1}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	node, err := Plan(parseOne(t, "INSERT INTO t (y) VALUES ('Y')"), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	ins, ok := node.(*Insert)
+	if !ok {
+		t.Fatalf("got %T", node)
+	}
+	// ColumnIndex must now cover all three columns: y (0-th user
+	// column, ordinal 1), then x and z appended in table-declaration
+	// order (ordinals 0 and 2).
+	if got, want := ins.ColumnIndex, []int{1, 0, 2}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+		t.Fatalf("ColumnIndex=%v want %v", got, want)
+	}
+	values, ok := ins.Source.(*Values)
+	if !ok {
+		t.Fatalf("ins.Source=%T", ins.Source)
+	}
+	if len(values.Rows) != 1 || len(values.Rows[0]) != 3 {
+		t.Fatalf("values shape=%v", values.Rows)
+	}
+	// Cell 0: explicit 'Y'.
+	if _, ok := values.Rows[0][0].(*StringConst); !ok {
+		t.Errorf("row[0][0]=%T want *StringConst", values.Rows[0][0])
+	}
+	// Cell 1: x's substituted DefaultExpr (appended).
+	if ic, ok := values.Rows[0][1].(*IntegerConst); !ok || ic.Value != 5 {
+		t.Errorf("row[0][1]=%v want IntegerConst{Value: 5}", values.Rows[0][1])
+	}
+	// Cell 2: z's substituted DefaultExpr (appended).
+	if ic, ok := values.Rows[0][2].(*IntegerConst); !ok || ic.Value != -1 {
+		t.Errorf("row[0][2]=%v want IntegerConst{Value: -1}", values.Rows[0][2])
+	}
+}
+
+// TestPlanInsertExplicitColumnListOmittedNoDefaultColumnStaysUnmapped:
+// M0134-0005j negative guard — a column with NO DefaultExpr that is
+// omitted from an explicit column list must NOT be appended by the
+// new substitution (it stays unmapped, so the executor's
+// applyDefaultsForMissing/NOT NULL machinery still handles it exactly
+// as before — NULL for a nullable column, a constraint violation for
+// a NOT NULL one).
+func TestPlanInsertExplicitColumnListOmittedNoDefaultColumnStaysUnmapped(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "a", Type: catalog.Type{Name: "int4"}},
+		{Name: "bare", Type: catalog.Type{Name: "text"}}, // no DefaultExpr
+	}); err != nil {
+		t.Fatal(err)
+	}
+	node, err := Plan(parseOne(t, "INSERT INTO t (a) VALUES (1)"), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	ins := node.(*Insert)
+	if got, want := ins.ColumnIndex, []int{0}; len(got) != len(want) || got[0] != want[0] {
+		t.Errorf("ColumnIndex=%v want %v (bare stays unmapped)", got, want)
+	}
+	values := ins.Source.(*Values)
+	if len(values.Rows[0]) != 1 {
+		t.Fatalf("values shape=%v want 1 cell", values.Rows[0])
+	}
+}
+
+// TestPlanInsertExplicitColumnListOmittedSerialColumnNotSubstituted:
+// M0134-0005j primary regression hazard — a SERIAL column's catalog
+// DefaultExpr is nil by convention (defaultMarkerReplacement's doc
+// comment); the new omitted-column substitution must NOT append it,
+// or the executor's autoGenerateSerialValues would double-advance the
+// sequence. Confirms the fix's ColumnIndex leaves the serial column
+// unmapped exactly like before.
+func TestPlanInsertExplicitColumnListOmittedSerialColumnNotSubstituted(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "s1"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "serial"}},
+		{Name: "v", Type: catalog.Type{Name: "text"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	node, err := Plan(parseOne(t, "INSERT INTO s1 (v) VALUES ('a')"), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	ins := node.(*Insert)
+	if got, want := ins.ColumnIndex, []int{1}; len(got) != len(want) || got[0] != want[0] {
+		t.Errorf("ColumnIndex=%v want %v (serial id stays unmapped)", got, want)
+	}
+}
+
+// TestPlanInsertExplicitColumnListArityErrorNotDefaultPadded:
+// M0134-0005j — a row genuinely too short for its EXPLICIT column
+// list (a real user arity error, unrelated to any omitted-default
+// column) must still surface planInsert's 42601 diagnostic and not be
+// silently DEFAULT-padded by the new appending logic.
+func TestPlanInsertExplicitColumnListArityErrorNotDefaultPadded(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "a", Type: catalog.Type{Name: "int4"}},
+		{Name: "b", Type: catalog.Type{Name: "int4"}, DefaultExpr: &parser.IntegerConst{Value: 9}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Plan(parseOne(t, "INSERT INTO t (a, b) VALUES (1)"), c)
+	if err == nil {
+		t.Fatal("expected arity error for INSERT INTO t (a, b) VALUES (1)")
+	}
+	pe, ok := err.(*PlanError)
+	if !ok || pe.Code != "42601" {
+		t.Fatalf("err=%v want PlanError code 42601", err)
+	}
+}
+
+// TestPlanInsertSelectFewerColumnsAppendsOmittedDefault: INSERT ... SELECT
+// with NO explicit column list, where the SELECT yields fewer columns than
+// the table. PostgreSQL fills the leading columns and lets the trailing
+// target columns fall back to their DEFAULT, evaluated through the full
+// expression evaluator (M0134-0005m, §20.3). A trailing column WITHOUT a
+// catalog DefaultExpr still gets dropped from ColumnIndex (stays NULL,
+// same as before — see the panic regression this originally guarded,
+// design 0118-0038 / index-only-bitmapscan setup crash); a trailing column
+// WITH one is appended via a Project wrap instead of being silently
+// truncated away.
+func TestPlanInsertSelectFewerColumnsAppendsOmittedDefault(t *testing.T) {
 	c := catalog.NewInMemory()
 	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
 		{Name: "a", Type: catalog.Type{Name: "int4"}},
@@ -1009,8 +1142,59 @@ func TestPlanInsertSelectFewerColumnsTruncatesColumnIndex(t *testing.T) {
 		t.Fatalf("Plan: %v", err)
 	}
 	ins := node.(*Insert)
+	// M0134-0005m: "pad" carries a real catalog DefaultExpr, so it is no
+	// longer dropped from ColumnIndex — it is appended as a resolved
+	// DEFAULT expression via a Project wrap (§20.3), and the source is no
+	// longer the bare SELECT.
+	if got, want := ins.ColumnIndex, []int{0, 1, 2}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+		t.Errorf("ColumnIndex=%v want %v (omitted DEFAULT column appended)", got, want)
+	}
+	// The SELECT's own output has 2 columns; a DEFAULT-appended source must
+	// widen to 3. Asserting the node type (*Project) alone is weak — planSelect
+	// may independently wrap even a bare constant SELECT in its own *Project,
+	// unrelated to the M0134-0005m DEFAULT-append wrap — so check width.
+	if got, want := len(ins.Source.Output()), 3; got != want {
+		t.Errorf("Source.Output() width=%d want %d (DEFAULT column appended)", got, want)
+	}
+}
+
+// TestPlanInsertSelectFewerColumnsTruncatesUndefaultedColumn: sibling of
+// TestPlanInsertSelectFewerColumnsAppendsOmittedDefault, same shape except
+// the trailing target column has NO catalog DefaultExpr. This preserves the
+// original panic-regression guard (design 0118-0038 / index-only-bitmapscan
+// setup crash) — the planner must still truncate ColumnIndex to the source
+// width for a column with no DEFAULT to append, rather than leaving it in
+// ColumnIndex with no matching source value (which indexed past the
+// shorter source row and panicked). No DefaultExpr means no column is
+// appended to the source's output width (verified below via Output()
+// length, since planSelect may independently wrap even a bare constant
+// SELECT in its own *Project — that wrap is unrelated to M0134-0005m's
+// DEFAULT-append wrap).
+func TestPlanInsertSelectFewerColumnsTruncatesUndefaultedColumn(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "a", Type: catalog.Type{Name: "int4"}},
+		{Name: "b", Type: catalog.Type{Name: "int4"}},
+		{Name: "pad", Type: catalog.Type{Name: "text"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	node, err := Plan(parseOne(t, "INSERT INTO t SELECT 1, 2"), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	ins := node.(*Insert)
 	if got, want := ins.ColumnIndex, []int{0, 1}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
-		t.Errorf("ColumnIndex=%v want %v (truncated to source width)", got, want)
+		t.Errorf("ColumnIndex=%v want %v (truncated to source width; no DEFAULT to append)", got, want)
+	}
+	// planSelect itself wraps a constant "SELECT 1, 2" in a *Project
+	// (unrelated to the M0134-0005m DEFAULT-append wrap), so the type alone
+	// doesn't distinguish "wrapped again to append a DEFAULT" from "plain
+	// planned SELECT". Assert on width instead: no DEFAULT column means no
+	// column is appended, so Source.Output() must stay at the SELECT's own
+	// width (2), not grow to 3.
+	if got, want := len(ins.Source.Output()), 2; got != want {
+		t.Errorf("Source.Output() width=%d want %d (no DEFAULT column appended)", got, want)
 	}
 }
 

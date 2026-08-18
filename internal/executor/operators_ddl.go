@@ -1842,6 +1842,22 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				}
 				if !found {
 					c := pc
+					// A NO INHERIT not-null constraint on the parent must NOT
+					// propagate to an INHERITS child (constraints.out's
+					// "NOT NULL NO INHERIT" block, right after the
+					// notnull_tbl_fail cases: `CREATE TABLE ATACC1 (a int,
+					// NOT NULL a NO INHERIT); CREATE TABLE ATACC2 () INHERITS
+					// (ATACC1);` leaves ATACC2.a nullable). Deep-copying
+					// pc.NotNull verbatim would otherwise always inherit it.
+					// M0134-0005k.
+					if c.NotNull {
+						for _, pnc := range parent.NotNullConstraints {
+							if pnc.NoInherit && strings.EqualFold(pnc.ColName, pc.Name) {
+								c.NotNull = false
+								break
+							}
+						}
+					}
 					cols = append(cols, c)
 				}
 			}
@@ -1887,7 +1903,20 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		// Build a lookup map for explicit columns by name.
 		colByName := make(map[string]parser.ColumnDef, len(s.Columns))
 		for _, c := range s.Columns {
-			colByName[strings.ToLower(c.Name)] = c
+			key := strings.ToLower(c.Name)
+			// A "constraint-only" entry (Type.Name == "", synthesized for a
+			// bare table-level `NOT NULL col [NO INHERIT]` constraint,
+			// M0119-0004) must never shadow the column's own REAL typed
+			// definition in this map: BodyOrder lists the same column name
+			// once per occurrence (once for the typed column, once for the
+			// constraint-only entry), and every occurrence resolves through
+			// this single map — so if the fake entry won the map slot, the
+			// real column would never reach addCol below (e.g. `a int
+			// primary key, not null a no inherit`). M0134-0005k.
+			if existing, ok := colByName[key]; ok && existing.Type.Name != "" && c.Type.Name == "" {
+				continue
+			}
+			colByName[key] = c
 		}
 		// Build a lookup for LIKE sources.
 		_ = likeCheckConstraints // will be populated below for LIKE INCLUDING CONSTRAINTS
@@ -2209,21 +2238,20 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				Message: fmt.Sprintf("cannot add NO INHERIT constraint to partitioned table %q", s.Name.Name),
 			}
 		}
-		// Check LIKE-sourced NOT NULL constraints.
-		for _, entry := range likeNotNullByCol {
-			if entry.noInherit {
-				return noInheritErr()
-			}
-		}
 		// Check LIKE-sourced CHECK constraints.
 		for _, nc := range likeCheckConstraints {
 			if nc.NoInherit {
 				return noInheritErr()
 			}
 		}
-		// Check explicit column NOT NULL NO INHERIT.
+		// Check explicit column CHECK NO INHERIT. NOT NULL NO INHERIT on a
+		// partitioned table is handled separately below with PG's own
+		// wording/errcode ("not-null constraints on partitioned tables
+		// cannot be NO INHERIT", 0A000, parse_utilcmd.c:759/:1077) — it is
+		// NOT the generic "cannot add NO INHERIT constraint" (42P16) this
+		// CHECK-only block raises. M0134-0005k.
 		for _, c := range s.Columns {
-			if c.NotNullNoInherit || c.CheckNoInherit {
+			if c.CheckNoInherit {
 				return noInheritErr()
 			}
 		}
@@ -3877,19 +3905,55 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// explicit or inherited columns get auto-name <tablename>_<colname>_not_null.
 	// M0097-0023.
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-		// Build set of explicit column defs that carry NOT NULL NO INHERIT, plus
-		// any user-given inline constraint name (`CONSTRAINT <name> NOT NULL`).
-		// A non-default name makes pg_dump re-emit the inline
-		// `CONSTRAINT <name> NOT NULL` form rather than a bare `NOT NULL`.
-		// DU-002 slice 273.
-		explicitNoInherit := make(map[string]bool)
-		explicitNotNullName := make(map[string]string)
-		for _, origCol := range s.Columns {
-			if origCol.NotNullNoInherit {
-				explicitNoInherit[strings.ToLower(origCol.Name)] = true
+		// origColByName maps each REAL (non-fake) column def from the CREATE
+		// TABLE column list to its parsed NOT NULL state, keyed lowercase.
+		// "Fake" ColumnDefs (Type.Name == "") are the merge-only entries the
+		// parser synthesizes for a bare table-level `NOT NULL col [NO
+		// INHERIT]` (M0119-0004) / OF-type constraint-only column list — they
+		// carry no algorithm-A result of their own and are represented
+		// instead via TableNotNullCols below. M0134-0005k.
+		origColByName := make(map[string]*parser.ColumnDef, len(s.Columns))
+		for i := range s.Columns {
+			oc := &s.Columns[i]
+			if oc.Type.Name == "" {
+				continue
 			}
-			if origCol.NotNullConstraintName != "" {
-				explicitNotNullName[strings.ToLower(origCol.Name)] = origCol.NotNullConstraintName
+			key := strings.ToLower(oc.Name)
+			if _, exists := origColByName[key]; !exists {
+				origColByName[key] = oc
+			}
+		}
+		pkColSet := make(map[string]bool, len(pkCols))
+		for _, c := range pkCols {
+			pkColSet[strings.ToLower(c)] = true
+		}
+		// §18.2/18.3 E4: not-null constraints on partitioned tables cannot be
+		// NO INHERIT (parse_utilcmd.c:759 column-level, :1077 table-level).
+		// Checked before any name/NO-INHERIT merge conflict, matching PG's
+		// per-occurrence check order. M0134-0005k.
+		if s.PartitionBy != nil {
+			for _, oc := range s.Columns {
+				if oc.NotNullNoInherit {
+					return &ExecError{Code: "0A000", Pos: s.Pos(),
+						Message: "not-null constraints on partitioned tables cannot be NO INHERIT"}
+				}
+			}
+			for _, ni := range s.TableNotNullNoInherit {
+				if ni {
+					return &ExecError{Code: "0A000", Pos: s.Pos(),
+						Message: "not-null constraints on partitioned tables cannot be NO INHERIT"}
+				}
+			}
+		}
+		// A table-level `[CONSTRAINT name] NOT NULL col [NO INHERIT]` marks
+		// its column NOT NULL even when the column carries no inline NOT
+		// NULL/PRIMARY KEY/SERIAL/IDENTITY of its own (e.g. AC2's `CREATE
+		// TABLE ATACC1 (a int, NOT NULL a NO INHERIT)`), so it must flip
+		// col.NotNull here — otherwise the loop below (gated on col.NotNull)
+		// never sees the column at all. M0134-0005k.
+		for _, colName := range s.TableNotNullCols {
+			if col, ok2 := o.ctx.Catalog.LookupColumn(tbl, colName); ok2 {
+				col.NotNull = true
 			}
 		}
 		// PG18 records a contype='n' NOT NULL constraint for EVERY not-null
@@ -3904,8 +3968,33 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				continue
 			}
 			colKey := strings.ToLower(col.Name)
-			noInherit := explicitNoInherit[colKey]
+			// §18.3 (B): build this column's ordered NOT NULL entry list —
+			// the column's own resolved algorithm-A result (or an implicit
+			// unnamed entry when NOT NULL is only implied by PRIMARY KEY/
+			// SERIAL/IDENTITY with no literal NOT NULL keyword), then any
+			// LIKE-copied entry, then every table-level `[CONSTRAINT name]
+			// NOT NULL col [NO INHERIT]` entry, in written order — mirrors
+			// heap.c:AddRelationNotNullConstraints's input list order.
+			var entries []nnEntry
+			if oc, ok2 := origColByName[colKey]; ok2 {
+				if oc.NotNullExplicit {
+					entries = append(entries, nnEntry{oc.NotNullConstraintName, oc.NotNullNoInherit})
+				} else if oc.Primary || pkColSet[colKey] || isSerialTypeName(oc.Type.Name) || oc.IdentityColumn {
+					entries = append(entries, nnEntry{})
+				}
+			} else if pkColSet[colKey] {
+				entries = append(entries, nnEntry{})
+			}
+			if entry, ok2 := likeNotNullByCol[colKey]; ok2 {
+				entries = append(entries, nnEntry{entry.name, entry.noInherit})
+			}
+			for i, c := range s.TableNotNullCols {
+				if strings.EqualFold(c, col.Name) {
+					entries = append(entries, nnEntry{s.TableNotNullNames[i], s.TableNotNullNoInherit[i]})
+				}
+			}
 			name := strings.ToLower(tbl.Name) + "_" + colKey + "_not_null"
+			var noInherit bool
 			isLocal := true
 			inhCount := 0
 			// A column carried in purely by a plain `INHERITS (parent)` clause
@@ -3960,19 +4049,16 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 					}
 				}
 			}
-			if custom, ok2 := explicitNotNullName[colKey]; ok2 {
-				// Explicit inline `CONSTRAINT <name> NOT NULL` overrides the
-				// auto-name. DU-002 slice 273.
-				name = custom
-			}
-			if entry, ok2 := likeNotNullByCol[colKey]; ok2 {
-				// LIKE INCLUDING preserves the source NOT NULL constraint name.
-				if entry.name != "" {
-					name = entry.name
+			if len(entries) > 0 {
+				mergedName, mergedNoInherit, execErr := mergeNotNullEntries(col.Name, entries)
+				if execErr != nil {
+					execErr.Pos = s.Pos()
+					return execErr
 				}
-				if entry.noInherit {
-					noInherit = true
+				if mergedName != "" {
+					name = mergedName
 				}
+				noInherit = mergedNoInherit
 			}
 			tbl.AddNotNull(name, col.Name, im.AllocOID(), noInherit, false, isLocal, inhCount)
 		}
@@ -4219,6 +4305,66 @@ func appendLikeChecks(dst []catalog.NamedCheckConstraint, src *catalog.Table) []
 		}
 	}
 	return dst
+}
+
+// isSerialTypeName reports whether typeName is one of the SERIAL pseudo-type
+// spellings, as originally declared (before the executor resolves it to its
+// base integer type). SERIAL columns are always NOT NULL and, like PRIMARY
+// KEY/IDENTITY, are an implicit (unnamed) not-null source for
+// mergeNotNullEntries when the column carries no literal NOT NULL keyword.
+// Mirrors internal/parser's isSerialTypeName (parse_utilcmd.c:751-753,
+// disallow_noinherit_notnull for is_serial). M0134-0005k.
+func isSerialTypeName(typeName string) bool {
+	switch strings.ToLower(typeName) {
+	case "serial", "serial4", "bigserial", "serial8", "smallserial", "serial2":
+		return true
+	default:
+		return false
+	}
+}
+
+// nnEntry is one source of a column's NOT NULL constraint feeding
+// mergeNotNullEntries — the column's own resolved declaration, a
+// LIKE-copied constraint, or a table-level `[CONSTRAINT name] NOT NULL col
+// [NO INHERIT]` entry. A zero value represents an unnamed, INHERIT (not NO
+// INHERIT) entry, matching PG's implicit not-null constraint synthesized for
+// a PRIMARY KEY/SERIAL/IDENTITY column with no literal NOT NULL keyword
+// (parse_utilcmd.c:997-1000). M0134-0005k.
+type nnEntry struct {
+	name      string
+	noInherit bool
+}
+
+// mergeNotNullEntries implements PostgreSQL's table-level NOT NULL
+// constraint merge — heap.c:AddRelationNotNullConstraints (~2900-2990),
+// §18.3 algorithm (B) of docs/design/0134-0005-constraints-sql-divergence.md.
+// Given every NOT NULL source for one column, in written order (the
+// column's own entry first, then LIKE-copied, then table-level, in the
+// order parsed), it collapses them into the single (name, noInherit) pair
+// PG would settle on, or reports the conflict PG would raise: a differing
+// NO INHERIT flag is the *singular* "conflicting NO INHERIT declaration for
+// not-null constraint" (E3, 42601 — table-level merges use singular
+// wording, distinct from the parser's column-level algorithm A's plural
+// E2); two differing non-empty names is "conflicting not-null constraint
+// names" (E1, 42601). An unnamed entry adopts a later explicit name.
+// entries must be non-empty. M0134-0005k.
+func mergeNotNullEntries(colName string, entries []nnEntry) (name string, noInherit bool, execErr *ExecError) {
+	constr := entries[0]
+	for _, other := range entries[1:] {
+		if constr.noInherit != other.noInherit {
+			return "", false, &ExecError{Code: "42601",
+				Message: fmt.Sprintf("conflicting NO INHERIT declaration for not-null constraint on column %q", colName)}
+		}
+		if other.name != "" {
+			if constr.name == "" {
+				constr.name = other.name
+			} else if constr.name != other.name {
+				return "", false, &ExecError{Code: "42601",
+					Message: fmt.Sprintf("conflicting not-null constraint names %q and %q", constr.name, other.name)}
+			}
+		}
+	}
+	return constr.name, constr.noInherit, nil
 }
 
 // execCreateTableAs implements `CREATE TABLE name AS SELECT …`.
@@ -4608,8 +4754,28 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 			}
 			childIdxName = parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + suffix}
 		}
-		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, parentIdx.Columns, nil, parentIdx.Unique, parentIdx.Primary, parentIdx.NullsNotDistinct, parentIdx.ColDescending, parentIdx.ColNullsFirst); err != nil {
+		// M0134-0005f: forward the parent constraint index's Deferrable/
+		// InitiallyDeferred/IsConstraint so the clone honours SET CONSTRAINTS
+		// … DEFERRED and appears in pg_constraint — see btreeIndexProps'
+		// doc comment.
+		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, parentIdx.Columns, nil, parentIdx.Unique, parentIdx.Primary, parentIdx.NullsNotDistinct, parentIdx.ColDescending, parentIdx.ColNullsFirst, &btreeIndexProps{
+			Deferrable:        parentIdx.Deferrable,
+			InitiallyDeferred: parentIdx.InitiallyDeferred,
+			IsConstraint:      parentIdx.IsConstraint,
+		}); err != nil {
 			return err
+		}
+		// M0134-0005g: wire the child index's PartitionParentOID (and the
+		// forward map) exactly as the CREATE INDEX cascade / ATTACH PARTITION
+		// index cascade already do (see :6846/:8610) so a deferred
+		// uniqueCheckDeferToCommit lookup can walk child->root to find the
+		// name the user typed in SET CONSTRAINTS (which is the PARENT
+		// constraint's name, not this auto-generated child name).
+		if childIdx, ok2 := o.ctx.Catalog.LookupIndex(childIdxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok2 {
+			childIdx.PartitionParentOID = parentIdx.OID
+			if im, ok3 := o.ctx.Catalog.(*catalog.InMemory); ok3 {
+				im.RegisterIndexPartitionChild(parentIdx.OID, childIdx.OID)
+			}
 		}
 	}
 	// Create btree indexes for UNIQUE column constraints declared directly on
@@ -4750,7 +4916,13 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 				continue
 			}
 			if parentNC != nil {
-				tbl.AddNotNull(parentNC.Name, col.Name, im2.AllocOID(), parentNC.NoInherit, parentNC.NotValid, false, 1)
+				// A freshly created (empty) partition always cooks
+				// convalidated=true regardless of the parent's own
+				// validation state — PG validates a not-null constraint
+				// against the table it's being added to, and an empty
+				// table has no rows to violate it (heap.c:2385
+				// AddRelationNewConstraints). M0134-0005p sub-slice B.
+				tbl.AddNotNull(parentNC.Name, col.Name, im2.AllocOID(), parentNC.NoInherit, false, false, 1)
 			}
 		}
 	}
@@ -8377,7 +8549,21 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					}
 					childIdxName = parser.ObjectName{Schema: childTbl.Schema, Name: childTbl.Name + suffix}
 				}
-				_ = o.createBTreeIndex(act.Pos(), childIdxName, childTbl, parentIdx.Columns, nil, parentIdx.Unique, parentIdx.Primary, parentIdx.NullsNotDistinct, parentIdx.ColDescending, parentIdx.ColNullsFirst)
+				// M0134-0005f: same forwarding as the PARTITION OF clone loop
+				// above — see btreeIndexProps' doc comment.
+				_ = o.createBTreeIndex(act.Pos(), childIdxName, childTbl, parentIdx.Columns, nil, parentIdx.Unique, parentIdx.Primary, parentIdx.NullsNotDistinct, parentIdx.ColDescending, parentIdx.ColNullsFirst, &btreeIndexProps{
+					Deferrable:        parentIdx.Deferrable,
+					InitiallyDeferred: parentIdx.InitiallyDeferred,
+					IsConstraint:      parentIdx.IsConstraint,
+				})
+				// M0134-0005g: wire PartitionParentOID/forward map — same
+				// idiom as the PARTITION OF clone loop above.
+				if newChildIdx, ok2 := o.ctx.Catalog.LookupIndex(childIdxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok2 {
+					newChildIdx.PartitionParentOID = parentIdx.OID
+					if im2, ok3 := o.ctx.Catalog.(*catalog.InMemory); ok3 {
+						im2.RegisterIndexPartitionChild(parentIdx.OID, newChildIdx.OID)
+					}
+				}
 			}
 		case parser.AlterTableDetachPartition:
 			// ALTER TABLE parent DETACH PARTITION child — remove child from parent's
@@ -8797,8 +8983,9 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// ALTER TABLE name RENAME CONSTRAINT old TO new. Renames an existing
 			// constraint in place with its OID stable, mirroring PG's
 			// rename_constraint_internal (tablecmds.c:4047). The constraint is
-			// found by name across the same four stores as the drop path
-			// (execAlterTableDropConstraint): CHECK → FK → UNIQUE → EXCLUDE → PK.
+			// found by name across the same six stores as the drop path
+			// (execAlterTableDropConstraint): CHECK → FK → NOT NULL → UNIQUE →
+			// EXCLUDE → PK.
 			// For UNIQUE/PK/EXCLUDE the constraint name IS the backing index name
 			// (pg_constraint.conindid), so the rename re-keys the index via
 			// InMemory.RenameIndex — PG does the same (RenameRelationInternal on
@@ -8896,6 +9083,43 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					return &ExecError{Code: "42710", Pos: act.Pos(), Message: fmt.Sprintf("constraint %q for relation %q already exists", newName, tbl.Name)}
 				}
 				tbl.ForeignKeys[i].Name = newName
+				return nil
+			}
+
+			// 2.5. NOT NULL constraints (contype='n', PG 18+) — same direct
+			// Name mutation as CHECK/FK, NOT the RenameIndex path below: PG's
+			// conindid is NULL for a NOT NULL constraint, so
+			// rename_constraint_internal always takes the RenameConstraintById
+			// branch, never RenameRelationInternal (tablecmds.c:4126-4131). The
+			// inheritance guards mirror the CHECK arm above verbatim — PG gates
+			// both refusals on `(contype == CHECK || contype == NOTNULL) &&
+			// !connoinherit` (tablecmds.c:4085-4123).
+			for i, nc := range tbl.NotNullConstraints {
+				if !strings.EqualFold(nc.Name, oldName) {
+					continue
+				}
+				if s.Only && o.hasInheritanceChildren(tbl) && !nc.NoInherit {
+					return &ExecError{Code: "42P16", Pos: 0, Message: fmt.Sprintf("inherited constraint %q must be renamed in child tables too", oldName)}
+				}
+				if nc.InhCount > 0 && !nc.NoInherit {
+					return &ExecError{Code: "42P16", Pos: 0, Message: fmt.Sprintf("cannot rename inherited constraint %q", oldName)}
+				}
+				if constraintNameInUse(newName) {
+					return &ExecError{Code: "42710", Pos: act.Pos(), Message: fmt.Sprintf("constraint %q for relation %q already exists", newName, tbl.Name)}
+				}
+				tbl.NotNullConstraints[i].Name = newName
+				// Cascade to partition children: rename the inherited copy in
+				// each child, mirroring the CHECK cascade above.
+				if imNN, okNN := o.ctx.Catalog.(*catalog.InMemory); okNN {
+					for _, childTbl := range imNN.PartitionChildren(tbl.OID) {
+						for j := range childTbl.NotNullConstraints {
+							if strings.EqualFold(childTbl.NotNullConstraints[j].Name, oldName) {
+								childTbl.NotNullConstraints[j].Name = newName
+								break
+							}
+						}
+					}
+				}
 				return nil
 			}
 
@@ -9633,9 +9857,26 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// Add a named NOT NULL constraint unless one already exists for the
 			// column (SET NOT NULL is idempotent in PG — no duplicate row).
 			hasNN := false
-			for _, nc := range tbl.NotNullConstraints {
+			nnName := ""
+			shouldCascade := false
+			for i := range tbl.NotNullConstraints {
+				nc := &tbl.NotNullConstraints[i]
 				if strings.EqualFold(nc.ColName, act.ColumnName) {
 					hasNN = true
+					nnName = nc.Name
+					// Existing constraint: merge in place, mirroring
+					// AdjustNotNullInheritance (pg_constraint.c:742) — if not
+					// already local, mark it local; else if it is NOT VALID,
+					// validate it (the NULL scan already ran above). Either
+					// way ATExecSetNotNull's existing-constraint branch
+					// (tablecmds.c:7950-8010) returns WITHOUT recursing to
+					// children — only the "no constraint yet" branch below
+					// cascades. M0134-0005p sub-slice A.
+					if !nc.IsLocal {
+						nc.IsLocal = true
+					} else if nc.NotValid {
+						nc.NotValid = false
+					}
 					break
 				}
 			}
@@ -9643,6 +9884,8 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 					name := strings.ToLower(tbl.Name) + "_" + strings.ToLower(act.ColumnName) + "_not_null"
 					tbl.AddNotNull(name, act.ColumnName, im.AllocOID(), false, false, true, 0)
+					nnName = name
+					shouldCascade = true
 				}
 			}
 			if catalogHeapSyncAvailable(o.ctx) {
@@ -9656,15 +9899,28 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					return fmt.Errorf("DDL catalog sync: %w", syncErr)
 				}
 			}
+			// Cascade to already-existing inheritance children and partitions,
+			// recursively, mirroring PG's ATExecSetNotNull recursion
+			// (tablecmds.c:8062-8079) — ONLY on the "no constraint yet" path;
+			// the already-exists branch above returns without cascading.
+			// M0134-0005i, M0134-0005p sub-slice A.
+			if shouldCascade && nnName != "" {
+				if err := o.cascadeNotNullToChildren(tbl, act.ColumnName, nnName, false); err != nil {
+					return err
+				}
+			}
 		case parser.AlterTableDropNotNull:
 			// DROP NOT NULL — clear the column's NOT NULL flag and drop its
 			// contype='n' constraint (same heap re-sync as SET NOT NULL). DROP
 			// NOT NULL on a column with no NOT NULL is a no-op in PG; we mirror
-			// that (no error). DU-002 slice 270.
+			// that (no error). DU-002 slice 270. The three-step body (clear
+			// flag / splice NotNullConstraints / catalog-heap resync) is
+			// factored into clearNotNullConstraint so DROP CONSTRAINT <name>
+			// on a NOT NULL constraint (execAlterTableDropConstraint) can reuse
+			// it — M0134-0005 S04.
 			found := false
 			for i := range tbl.Columns {
 				if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
-					tbl.Columns[i].NotNull = false
 					found = true
 					break
 				}
@@ -9673,23 +9929,8 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				return &ExecError{Code: "42703", Pos: act.Pos(),
 					Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
 			}
-			kept := tbl.NotNullConstraints[:0]
-			for _, nc := range tbl.NotNullConstraints {
-				if !strings.EqualFold(nc.ColName, act.ColumnName) {
-					kept = append(kept, nc)
-				}
-			}
-			tbl.NotNullConstraints = kept
-			if catalogHeapSyncAvailable(o.ctx) {
-				if err := o.ctx.MaterializeWriterXID(); err == nil {
-					xmax := o.ctx.Tx.XID
-					for _, dbOid := range tableCatalogDBOids(o.ctx) {
-						deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
-					}
-				}
-				if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
-					return fmt.Errorf("DDL catalog sync: %w", syncErr)
-				}
+			if err := o.clearNotNullConstraint(tbl, act.ColumnName); err != nil {
+				return err
 			}
 		case parser.AlterTableAddNotNull:
 			// ADD [CONSTRAINT name] NOT NULL col — the named (PG18) counterpart
@@ -9713,6 +9954,56 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				return &ExecError{Code: "42703", Pos: act.Pos(),
 					Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
 			}
+			// Existing-constraint lookup + PG's three ordered
+			// AdjustNotNullInheritance checks (postgres/src/backend/catalog/
+			// pg_constraint.c:741, ~:761/:773/:788, reached from
+			// AddRelationNewConstraints's CONSTR_NOTNULL branch via
+			// ATAddCheckNNConstraint) run BEFORE the 23502 null-value table
+			// scan below — in PG these checks happen at constraint-registration
+			// time (AddRelationNewConstraints), before ATRewriteTable's later
+			// phase-3 validation scan, so an incompatible existing constraint
+			// is reported even over a table with no NULLs and even when the
+			// table WOULD also fail the null scan. All three are 55000
+			// ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE. M0134-0005n D1.
+			hasNN := false
+			nnName := ""
+			var existingNN *catalog.NamedNotNullConstraint
+			for i := range tbl.NotNullConstraints {
+				if strings.EqualFold(tbl.NotNullConstraints[i].ColName, act.ColumnName) {
+					hasNN = true
+					nnName = tbl.NotNullConstraints[i].Name
+					existingNN = &tbl.NotNullConstraints[i]
+					break
+				}
+			}
+			if hasNN && existingNN != nil {
+				// Check 1: NO INHERIT mismatch (pg_constraint.c:761-767).
+				if act.NoInherit != existingNN.NoInherit {
+					return &ExecError{Code: "55000", Pos: act.Pos(),
+						Message: fmt.Sprintf("cannot change NO INHERIT status of NOT NULL constraint %q on relation %q",
+							existingNN.Name, tbl.Name),
+						Hint: "You might need to make the existing constraint inheritable using ALTER TABLE ... ALTER CONSTRAINT ... INHERIT."}
+				}
+				// Check 2: existing NOT VALID but caller wants a valid one
+				// (pg_constraint.c:773-779). existingNN.NotValid true means
+				// convalidated=false (not yet validated).
+				if !act.NotValid && existingNN.NotValid {
+					return &ExecError{Code: "55000", Pos: act.Pos(),
+						Message: fmt.Sprintf("incompatible NOT VALID constraint %q on relation %q",
+							existingNN.Name, tbl.Name),
+						Hint: "You might need to validate it using ALTER TABLE ... VALIDATE CONSTRAINT."}
+				}
+				// Check 3: explicit differing name (pg_constraint.c:788-795).
+				// Fires only for an explicitly user-given name (PG's is_local &&
+				// new_conname); an omitted name is a silent no-op.
+				if act.ConstraintName != "" && act.ConstraintName != existingNN.Name {
+					return &ExecError{Code: "55000", Pos: act.Pos(),
+						Message: fmt.Sprintf("cannot create not-null constraint %q on column %q of table %q",
+							act.ConstraintName, act.ColumnName, tbl.Name),
+						Detail: fmt.Sprintf("A not-null constraint named %q already exists for this column.",
+							existingNN.Name)}
+				}
+			}
 			// Scan existing rows for NULLs BEFORE mutating in-memory state (same
 			// 23502 scan as SET NOT NULL; NOT VALID defers validation, mirroring
 			// PG's skip_validation). M0134-0002 C3 slice 1.
@@ -9729,14 +10020,8 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			}
 			tbl.Columns[colIdx].NotNull = true
 			// Idempotent: a column already carrying a NOT NULL constraint is left
-			// as-is (PG raises no error and adds no duplicate row).
-			hasNN := false
-			for _, nc := range tbl.NotNullConstraints {
-				if strings.EqualFold(nc.ColName, act.ColumnName) {
-					hasNN = true
-					break
-				}
-			}
+			// as-is (PG raises no error and adds no duplicate row); the checks
+			// above already rejected any incompatible re-specification.
 			if !hasNN {
 				if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 					name := act.ConstraintName
@@ -9744,6 +10029,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 						name = strings.ToLower(tbl.Name) + "_" + strings.ToLower(act.ColumnName) + "_not_null"
 					}
 					tbl.AddNotNull(name, act.ColumnName, im.AllocOID(), act.NoInherit, act.NotValid, true, 0)
+					nnName = name
 				}
 			}
 			if catalogHeapSyncAvailable(o.ctx) {
@@ -9755,6 +10041,16 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				}
 				if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
 					return fmt.Errorf("DDL catalog sync: %w", syncErr)
+				}
+			}
+			// Cascade to already-existing inheritance children and partitions,
+			// recursively — same idiom as SET NOT NULL, EXCEPT a NO INHERIT
+			// constraint stops at this table (PG's ATAddCheckNNConstraint,
+			// tablecmds.c:9995-9998: "If adding a NO INHERIT constraint, no
+			// need to find our children"). M0134-0005i.
+			if nnName != "" && !act.NoInherit {
+				if err := o.cascadeNotNullToChildren(tbl, act.ColumnName, nnName, act.NotValid); err != nil {
+					return err
 				}
 			}
 		case parser.AlterTableAlterColumnType:
@@ -10110,6 +10406,18 @@ func (o *ddlOp) execAlterTableAddColumn(stmt *parser.AlterTableStmt, tbl *catalo
 		if n > 0 {
 			return &ExecError{Code: "0A000", Pos: act.Pos(), Message: "ALTER TABLE ADD COLUMN ... NOT NULL is only supported on empty tables"}
 		}
+		// M0134-0005n D2: an explicit inline `CONSTRAINT name NOT NULL` name
+		// already used on this relation is 42710 ERRCODE_DUPLICATE_OBJECT
+		// (postgres/src/backend/catalog/heap.c:AddRelationNewConstraints,
+		// ~:2641-2652, the ConstraintNameIsUsed check inside CONSTR_NOTNULL).
+		// Raised BEFORE the column is added so a rejected statement leaves no
+		// phantom column. goopg's parser keeps the name inline on the
+		// ColumnDef rather than splitting it into a synthesized
+		// AT_AddConstraint subcommand the way PG's parse_utilcmd.c does.
+		if col.NotNullConstraintName != "" && o.fkConstraintNameInUse(tbl, col.NotNullConstraintName) {
+			return &ExecError{Code: "42710", Pos: act.Pos(),
+				Message: fmt.Sprintf("constraint %q for relation %q already exists", col.NotNullConstraintName, tbl.Name)}
+		}
 	}
 	newCol := catalog.Column{
 		Name:        col.Name,
@@ -10129,6 +10437,22 @@ func (o *ddlOp) execAlterTableAddColumn(stmt *parser.AlterTableStmt, tbl *catalo
 	}
 	if err := o.addColumnRecursive(tbl, newCol, act, stmt, true); err != nil {
 		return err
+	}
+	// M0134-0005n D2: register the NamedNotNullConstraint row that ADD
+	// COLUMN ... NOT NULL previously never created (design doc §18.6/§21.5).
+	// PG registers a pg_constraint contype='n' row for both the named and
+	// the unnamed inline form (postgres/src/backend/catalog/
+	// heap.c:AddRelationNewConstraints, CONSTR_NOTNULL branch); the
+	// synthesised name matches the spelling every other goopg NOT-NULL path
+	// already produces.
+	if col.NotNull {
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			name := col.NotNullConstraintName
+			if name == "" {
+				name = strings.ToLower(tbl.Name) + "_" + strings.ToLower(col.Name) + "_not_null"
+			}
+			tbl.AddNotNull(name, col.Name, im.AllocOID(), col.NotNullNoInherit, false, true, 0)
+		}
 	}
 	// M0130-S3: sync the new column set to the pg_attribute heap so a
 	// PG standby (and a goopg restart) see the added column. Same
@@ -10437,6 +10761,30 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 		if !hasConstraint {
 			nnName := strings.ToLower(tbl.Name) + "_" + strings.ToLower(col.Name) + "_not_null"
 			tbl.AddNotNull(nnName, col.Name, im.AllocOID(), false, false, true, 0)
+			// Cascade the freshly synthesized NOT NULL to already-existing
+			// inheritance children and partitions, recursively, mirroring
+			// PG's ATPrepAddPrimaryKey re-entering ATPrepCmd with recurse=true
+			// for the synthesized AT_AddConstraint (tablecmds.c:9499-9573),
+			// which drives the same find_all_inheritors cascade as SET NOT
+			// NULL (ATExecSetNotNull, tablecmds.c:8062-8079). M0134-0005o.
+			if err := o.cascadeNotNullToChildren(tbl, col.Name, nnName, false); err != nil {
+				return err
+			}
+		}
+	}
+	// pg_attribute/pg_class are heap-backed, not virtual — the in-memory
+	// col.NotNull/AddNotNull mutations above are invisible to \d+/pg_dump
+	// until the table's catalog-heap rows are re-synced, same as SET NOT
+	// NULL (:9861-9869 above) and ADD NOT NULL. M0134-0005o.
+	if catalogHeapSyncAvailable(o.ctx) {
+		if err := o.ctx.MaterializeWriterXID(); err == nil {
+			xmax := o.ctx.Tx.XID
+			for _, dbOid := range tableCatalogDBOids(o.ctx) {
+				deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+			}
+		}
+		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+			return fmt.Errorf("DDL catalog sync: %w", syncErr)
 		}
 	}
 	return nil
@@ -10701,6 +11049,151 @@ func (o *ddlOp) execAlterTableAddExclude(tbl *catalog.Table, act parser.AlterTab
 	return nil
 }
 
+// maxNotNullCascadeDepth bounds the recursive inheritance/partition-child
+// walk in cascadeNotNullToChildren, mirroring the maxPartitionParentWalk
+// idiom in internal/executor/deferred_unique.go. M0134-0005i.
+const maxNotNullCascadeDepth = 64
+
+// cascadeNotNullToChildren propagates a NOT NULL constraint newly added (or
+// already present) on tbl's colName column to every already-existing
+// inheritance child and partition, recursively (grandchildren too). This is
+// the shared helper for both `ALTER TABLE ... ALTER COLUMN ... SET NOT NULL`
+// and `ALTER TABLE ... ADD CONSTRAINT ... NOT NULL (...)` — PG implements
+// both spellings via one recursive routine
+// (postgres/src/backend/commands/tablecmds.c:7913 ATExecSetNotNull /
+// :9912 ATAddCheckNNConstraint), and both cascade to children the same way
+// (:8062-8079, :10019-10042).
+//
+// A child that already carries a NOT NULL constraint on colName has its
+// coninhcount incremented — no duplicate row (tablecmds.c:7971-7993 "merge
+// with an existing constraint"). A child with none gets a brand-new
+// constraint under the PARENT's constraint name, conislocal=false,
+// coninhcount=1, and inherits the source constraint's NotValid (PG copies
+// the cooked constraint verbatim — heap.c:2385 AddRelationNewConstraints).
+// The column is resolved BY NAME in each child (a child's column order can
+// differ from its parent's — M0134-0005h avoided the same positional-index
+// mistake). No-op on a non-*catalog.InMemory catalog.
+//
+// The visited guard is keyed per (child OID, immediate-parent OID) EDGE, not
+// per child alone: PG's real recursion (tablecmds.c:8062-8079) has no
+// visited-set at all, so a diamond-inherited descendant reached via two
+// distinct parent edges is counted (coninhcount++) once per edge — keying
+// on child OID alone under-counts that case. maxNotNullCascadeDepth remains
+// the recursion backstop against a genuine cycle. M0134-0005p sub-slice B.
+func (o *ddlOp) cascadeNotNullToChildren(tbl *catalog.Table, colName, constraintName string, notValid bool) error {
+	im, isIM := o.ctx.Catalog.(*catalog.InMemory)
+	if !isIM {
+		return nil
+	}
+	visited := make(map[[2]uint32]bool)
+	return o.cascadeNotNullToChildrenAt(im, tbl, colName, constraintName, notValid, visited, 0)
+}
+
+// cascadeNotNullToChildrenAt is the depth/visited-bounded recursive body of
+// cascadeNotNullToChildren.
+func (o *ddlOp) cascadeNotNullToChildrenAt(im *catalog.InMemory, tbl *catalog.Table, colName, constraintName string, notValid bool, visited map[[2]uint32]bool, depth int) error {
+	if depth >= maxNotNullCascadeDepth {
+		return nil
+	}
+	children := append([]*catalog.Table(nil), im.InheritanceChildren(tbl.OID)...)
+	for _, pc := range im.PartitionChildren(tbl.OID) {
+		dup := false
+		for _, c := range children {
+			if c.OID == pc.OID {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			children = append(children, pc)
+		}
+	}
+	for _, child := range children {
+		edge := [2]uint32{child.OID, tbl.OID}
+		if visited[edge] {
+			continue
+		}
+		visited[edge] = true
+
+		colIdx := -1
+		for i := range child.Columns {
+			if strings.EqualFold(child.Columns[i].Name, colName) {
+				colIdx = i
+				break
+			}
+		}
+		if colIdx == -1 {
+			continue
+		}
+		child.Columns[colIdx].NotNull = true
+
+		merged := false
+		for i := range child.NotNullConstraints {
+			if strings.EqualFold(child.NotNullConstraints[i].ColName, colName) {
+				child.NotNullConstraints[i].InhCount++
+				merged = true
+				break
+			}
+		}
+		if !merged {
+			child.AddNotNull(constraintName, colName, im.AllocOID(), false, notValid, false, 1)
+		}
+
+		if catalogHeapSyncAvailable(o.ctx) {
+			if err := o.ctx.MaterializeWriterXID(); err == nil {
+				xmax := o.ctx.Tx.XID
+				for _, dbOid := range tableCatalogDBOids(o.ctx) {
+					deleteCatalogRowsForOID(o.ctx, dbOid, child.OID, xmax)
+				}
+			}
+			if syncErr := syncTableToCatalogHeap(o.ctx, child); syncErr != nil {
+				return fmt.Errorf("DDL catalog sync: %w", syncErr)
+			}
+		}
+
+		if err := o.cascadeNotNullToChildrenAt(im, child, colName, constraintName, notValid, visited, depth+1); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// clearNotNullConstraint drops the named column's NOT NULL flag and its
+// contype='n' catalog entry: clears tbl.Columns[i].NotNull, splices the
+// matching entry out of tbl.NotNullConstraints, and re-syncs the catalog
+// heap. Shared by `ALTER TABLE ... DROP NOT NULL <col>` (AlterTableDropNotNull
+// case) and `ALTER TABLE ... DROP CONSTRAINT <name>` when the resolved
+// constraint is a NOT NULL (execAlterTableDropConstraint) — both apply the
+// identical three-step body per dropconstraint_internal
+// (postgres/src/backend/commands/tablecmds.c:14184-14188). M0134-0005 S04.
+func (o *ddlOp) clearNotNullConstraint(tbl *catalog.Table, colName string) error {
+	for i := range tbl.Columns {
+		if strings.EqualFold(tbl.Columns[i].Name, colName) {
+			tbl.Columns[i].NotNull = false
+			break
+		}
+	}
+	kept := tbl.NotNullConstraints[:0]
+	for _, nc := range tbl.NotNullConstraints {
+		if !strings.EqualFold(nc.ColName, colName) {
+			kept = append(kept, nc)
+		}
+	}
+	tbl.NotNullConstraints = kept
+	if catalogHeapSyncAvailable(o.ctx) {
+		if err := o.ctx.MaterializeWriterXID(); err == nil {
+			xmax := o.ctx.Tx.XID
+			for _, dbOid := range tableCatalogDBOids(o.ctx) {
+				deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+			}
+		}
+		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+			return fmt.Errorf("DDL catalog sync: %w", syncErr)
+		}
+	}
+	return nil
+}
+
 // execAlterTableDropConstraint handles `ALTER TABLE t DROP CONSTRAINT name [RESTRICT|CASCADE]`.
 // Checked in the order CHECK / FOREIGN KEY / UNIQUE / PRIMARY KEY, mirroring
 // real PG's name-based pg_constraint lookup (the constraint kind only matters
@@ -10805,6 +11298,64 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 		return nil
 	}
 
+	// 3.7. NOT NULL constraints (contype='n', PG 18+) — matched by constraint
+	// name here (unlike `ALTER TABLE ... DROP NOT NULL <col>`, which matches
+	// by column name). PG's dropconstraint_internal treats NOT NULL the same
+	// as CHECK for the inherited-constraint guard
+	// (tablecmds.c:14103-14107) and additionally refuses to drop a not-null
+	// backing a PRIMARY KEY column (tablecmds.c:14154-14159, `"column \"%s\"
+	// is in a primary key"`). The replica-identity-index
+	// (tablecmds.c:14162-14167) and identity-column (tablecmds.c:14174-14181)
+	// refusals are NOT implemented — out of scope, M0134-0005 S04 (ledgered).
+	// Recursion to children matches by COLUMN NAME, not constraint name
+	// (tablecmds.c:14251-14255: "We search for not-null constraints by column
+	// name, and others by constraint name") — unlike the CHECK cascade above,
+	// which matches by constraint name.
+	for _, nc := range tbl.NotNullConstraints {
+		if !strings.EqualFold(nc.Name, act.ConstraintName) {
+			continue
+		}
+		if nc.InhCount > 0 {
+			return &ExecError{
+				Code:    "42P16",
+				Pos:     0,
+				Message: fmt.Sprintf("cannot drop inherited constraint %q of relation %q", act.ConstraintName, tbl.Name),
+			}
+		}
+		for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
+			if !idx.Primary {
+				continue
+			}
+			for _, pkCol := range idx.Columns {
+				if strings.EqualFold(pkCol, nc.ColName) {
+					return &ExecError{
+						Code:    "42P16",
+						Pos:     act.Pos(),
+						Message: fmt.Sprintf("column %q is in a primary key", nc.ColName),
+					}
+				}
+			}
+			break
+		}
+		colName := nc.ColName
+		if err := o.clearNotNullConstraint(tbl, colName); err != nil {
+			return err
+		}
+		if isIM && !only {
+			for _, childTbl := range im.PartitionChildren(tbl.OID) {
+				for _, cnc := range childTbl.NotNullConstraints {
+					if strings.EqualFold(cnc.ColName, colName) {
+						if err := o.clearNotNullConstraint(childTbl, colName); err != nil {
+							return err
+						}
+						break
+					}
+				}
+			}
+		}
+		return nil
+	}
+
 	// 4. PRIMARY KEY constraints.
 	var pkIdx *catalog.Index
 	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
@@ -10815,8 +11366,8 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 	}
 	// M0134-0002 C2: `DROP CONSTRAINT IF EXISTS` on a missing constraint emits
 	// PG's NOTICE and skips instead of raising 42704 — but only at this
-	// fall-through after all five kinds (NamedChecks/FKs/UNIQUE/EXCLUDE/PK)
-	// missed. Mirrors ATExecDropConstraint's if_exists branch
+	// fall-through after all six kinds (NamedChecks/FKs/UNIQUE/EXCLUDE/NOT
+	// NULL/PK) missed. Mirrors ATExecDropConstraint's if_exists branch
 	// (postgres/src/backend/commands/tablecmds.c:14060-14062). A real constraint
 	// of any kind is handled above and must never be skipped.
 	if pkIdx == nil {
@@ -10878,6 +11429,16 @@ func (o *ddlOp) execAlterTableAlterConstraint(tbl *catalog.Table, act parser.Alt
 		if !strings.EqualFold(tbl.ForeignKeys[i].Name, act.ConstraintName) {
 			continue
 		}
+		// Inheritability only applies to NOT NULL constraints — a FOREIGN KEY
+		// match here means the wrong object type (tablecmds.c
+		// ATExecAlterConstraint ~12259-12264, ERRCODE_WRONG_OBJECT_TYPE).
+		if act.AlterConstraintHasInheritability {
+			return &ExecError{
+				Code:    "42809",
+				Pos:     act.Pos(),
+				Message: fmt.Sprintf("constraint %q of relation %q is not a not-null constraint", act.ConstraintName, tbl.Name),
+			}
+		}
 		if act.AlterConstraintHasDeferrability {
 			tbl.ForeignKeys[i].Deferrable = act.AlterConstraintDeferrable
 			tbl.ForeignKeys[i].InitiallyDeferred = act.AlterConstraintInitiallyDeferred
@@ -10909,10 +11470,14 @@ func (o *ddlOp) execAlterTableAlterConstraint(tbl *catalog.Table, act parser.Alt
 		}
 		return nil
 	}
-	// The name exists but names a non-FK constraint: real PG reports a
-	// type-specific 42809 depending on which attribute class was requested
-	// (ATExecAlterConstraint, tablecmds.c ~12249/12254).
-	if o.nonFKConstraintExists(tbl, act.ConstraintName) {
+	// NOT NULL constraints — the only kind AlterConstraintHasInheritability
+	// (INHERIT / NO INHERIT) may legally target (tablecmds.c
+	// ATExecAlterConstrInheritability, PG18+). DEFERRABLE/ENFORCED remain
+	// FK-only, mirroring the FK branch above. M0134-0005 S05.
+	for i := range tbl.NotNullConstraints {
+		if !strings.EqualFold(tbl.NotNullConstraints[i].Name, act.ConstraintName) {
+			continue
+		}
 		if act.AlterConstraintHasDeferrability {
 			return &ExecError{
 				Code:    "42809",
@@ -10920,10 +11485,46 @@ func (o *ddlOp) execAlterTableAlterConstraint(tbl *catalog.Table, act parser.Alt
 				Message: fmt.Sprintf("constraint %q of relation %q is not a foreign key constraint", act.ConstraintName, tbl.Name),
 			}
 		}
-		return &ExecError{
-			Code:    "42809",
-			Pos:     act.Pos(),
-			Message: fmt.Sprintf("cannot alter enforceability of constraint %q of relation %q", act.ConstraintName, tbl.Name),
+		if act.AlterConstraintHasEnforceability {
+			// PG's ATExecAlterConstraint (tablecmds.c:12254-12258) has no
+			// parser_errposition call for this ereport — no LINE/caret on
+			// the wire. M0134-0005d slice 1.
+			return &ExecError{
+				Code:    "42809",
+				Message: fmt.Sprintf("cannot alter enforceability of constraint %q of relation %q", act.ConstraintName, tbl.Name),
+			}
+		}
+		if act.AlterConstraintHasInheritability {
+			return o.execAlterConstraintInheritability(tbl, i, act)
+		}
+		return nil
+	}
+	// The name exists but names a non-FK, non-NOT-NULL constraint (CHECK,
+	// PRIMARY KEY, UNIQUE): real PG reports a type-specific 42809 depending on
+	// which attribute class was requested (ATExecAlterConstraint,
+	// tablecmds.c ~12249/12254/12259-12264).
+	if o.nonFKConstraintExists(tbl, act.ConstraintName) {
+		switch {
+		case act.AlterConstraintHasDeferrability:
+			return &ExecError{
+				Code:    "42809",
+				Pos:     act.Pos(),
+				Message: fmt.Sprintf("constraint %q of relation %q is not a foreign key constraint", act.ConstraintName, tbl.Name),
+			}
+		case act.AlterConstraintHasInheritability:
+			return &ExecError{
+				Code:    "42809",
+				Pos:     act.Pos(),
+				Message: fmt.Sprintf("constraint %q of relation %q is not a not-null constraint", act.ConstraintName, tbl.Name),
+			}
+		default:
+			// PG's ATExecAlterConstraint (tablecmds.c:12254-12258) has no
+			// parser_errposition call for this ereport — no LINE/caret on
+			// the wire. M0134-0005d slice 1.
+			return &ExecError{
+				Code:    "42809",
+				Message: fmt.Sprintf("cannot alter enforceability of constraint %q of relation %q", act.ConstraintName, tbl.Name),
+			}
 		}
 	}
 	return &ExecError{
@@ -10931,6 +11532,110 @@ func (o *ddlOp) execAlterTableAlterConstraint(tbl *catalog.Table, act parser.Alt
 		Pos:     act.Pos(),
 		Message: fmt.Sprintf("constraint %q of relation %q does not exist", act.ConstraintName, tbl.Name),
 	}
+}
+
+// execAlterConstraintInheritability handles `ALTER TABLE t ALTER CONSTRAINT
+// name [NO] INHERIT` for the NOT NULL constraint at tbl.NotNullConstraints[i]
+// (tablecmds.c ATExecAlterConstraint's coninhcount guard plus
+// ATExecAlterConstrInheritability, PG18+). Propagation to inheritance
+// children is exactly one level, not recursive (ATExecAlterConstrInheritability
+// only walks find_inheritance_children(rel) once, tablecmds.c:12644-12678) —
+// matches PG's own semantics, since further-nested grandchildren keep
+// whatever coninhcount/conislocal they already have. M0134-0005 S05.
+func (o *ddlOp) execAlterConstraintInheritability(tbl *catalog.Table, i int, act parser.AlterTableAction) error {
+	nc := &tbl.NotNullConstraints[i]
+	// Refuse NO INHERIT on a constraint still enforced by a parent
+	// (coninhcount > 0) — ATExecAlterConstraint, tablecmds.c:12266-12273,
+	// ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE (55000). Checked BEFORE the
+	// no-op test below, matching PG's own ordering (the guard fires on
+	// currcon->coninhcount regardless of the current connoinherit value).
+	if act.AlterConstraintNoInherit && nc.InhCount > 0 {
+		return &ExecError{
+			Code:    "55000",
+			Pos:     act.Pos(),
+			Message: fmt.Sprintf("cannot alter inherited constraint %q on relation %q", act.ConstraintName, tbl.Name),
+		}
+	}
+	// Already in the requested state: silent no-op, no catalog write
+	// (ATExecAlterConstrInheritability, tablecmds.c:12635-12636).
+	if nc.NoInherit == act.AlterConstraintNoInherit {
+		return nil
+	}
+	nc.NoInherit = act.AlterConstraintNoInherit
+	colName := nc.ColName
+	if err := o.resyncNotNullCatalogHeap(tbl); err != nil {
+		return err
+	}
+	// Propagate one level to inheritance children (tablecmds.c:12644-12678),
+	// matched by COLUMN NAME like the rest of the NOT NULL inheritance
+	// machinery (dropconstraint_internal's own comment at tablecmds.c:14251-
+	// 14255: "we search for not-null constraints by column name").
+	im, isIM := o.ctx.Catalog.(*catalog.InMemory)
+	if !isIM {
+		return nil
+	}
+	for _, childTbl := range im.InheritanceChildren(tbl.OID) {
+		found := false
+		for j := range childTbl.NotNullConstraints {
+			if !strings.EqualFold(childTbl.NotNullConstraints[j].ColName, colName) {
+				continue
+			}
+			found = true
+			if act.AlterConstraintNoInherit {
+				// NO INHERIT: the child's copy stops being enforced by this
+				// parent — decrement coninhcount and mark it locally-owned
+				// (ATExecAlterConstrInheritability's noinherit branch,
+				// tablecmds.c:12656-12667).
+				if childTbl.NotNullConstraints[j].InhCount > 0 {
+					childTbl.NotNullConstraints[j].InhCount--
+				}
+				childTbl.NotNullConstraints[j].IsLocal = true
+			} else {
+				// INHERIT: re-establish the parent's enforcement
+				// (ATExecSetNotNull's recursing=true "found" branch,
+				// tablecmds.c:7962-7972 — increments coninhcount).
+				childTbl.NotNullConstraints[j].InhCount++
+			}
+			break
+		}
+		if !found && !act.AlterConstraintNoInherit {
+			// INHERIT and the child has no copy at all yet: create one
+			// (ATExecSetNotNull's recursing=true "not found" branch,
+			// tablecmds.c:8030-8046 — conislocal=false, coninhcount=1).
+			for ci := range childTbl.Columns {
+				if strings.EqualFold(childTbl.Columns[ci].Name, colName) {
+					childTbl.Columns[ci].NotNull = true
+					break
+				}
+			}
+			childTbl.AddNotNull(nc.Name, colName, im.AllocOID(), false, false, false, 1)
+		}
+		if err := o.resyncNotNullCatalogHeap(childTbl); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// resyncNotNullCatalogHeap re-syncs tbl's catalog heap rows (pg_attribute /
+// pg_constraint) after an in-memory NOT NULL constraint mutation — the same
+// delete-old-rows-then-resync pattern clearNotNullConstraint uses for DROP
+// NOT NULL / DROP CONSTRAINT, so the change survives a restart. M0134-0005
+// S05, per Bucket 3's durability precedent.
+func (o *ddlOp) resyncNotNullCatalogHeap(tbl *catalog.Table) error {
+	if !catalogHeapSyncAvailable(o.ctx) {
+		return nil
+	}
+	if err := o.ctx.MaterializeWriterXID(); err == nil {
+		xmax := o.ctx.Tx.XID
+		for _, dbOid := range tableCatalogDBOids(o.ctx) {
+			deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+		}
+	}
+	if err := syncTableToCatalogHeap(o.ctx, tbl); err != nil {
+		return fmt.Errorf("DDL catalog sync: %w", err)
+	}
+	return nil
 }
 
 // nonFKConstraintExists reports whether tbl has a CHECK, PRIMARY KEY, or
@@ -10988,7 +11693,8 @@ func (o *ddlOp) forEachLiveRow(tbl *catalog.Table, fn func(row Row) error) error
 			if terr != nil {
 				continue
 			}
-			if tuple.Header.Xmin == storage.InvalidTransactionID || tuple.Header.Xmax != storage.InvalidTransactionID {
+			// Abort-aware liveness — see collectBTreeEntries. M0134-0005c.
+			if !isLiveForUniqueCheck(o.ctx, tuple.Header.Xmin, tuple.Header.Xmax) {
 				continue
 			}
 			if scanRow == nil || len(scanRow) != len(tbl.Columns) {
@@ -11094,8 +11800,38 @@ func (o *ddlOp) validateCheckConstraintRows(tbl *catalog.Table, conName, exprSQL
 // existing-row scans in this codebase (CREATE INDEX bulk build). Returns the
 // first 23503 violation found, same error shape as an ordinary INSERT FK
 // check (assertParentExists), matching real PG's ri_ReportViolation format.
+//
+// fkOwnerTbl is frequently the storage-less partitioned ROOT — ADD FOREIGN
+// KEY / VALIDATE CONSTRAINT / ALTER CONSTRAINT … ENFORCED are all invoked
+// with the ALTER TABLE target, which for a partitioned table is the root, not
+// a leaf. A root has zero physical blocks, so scanning only fkOwnerTbl would
+// silently accept a violating row that lives only in a leaf partition — the
+// same M0134-0005h gap fixed for the COMMIT-tier fullTableFKCheck. Mirror
+// that fix here: scan fkOwnerTbl itself (no-op for a storage-less root) THEN
+// every allDescendants(fkOwnerTbl) partition/inheritance descendant.
 func (o *ddlOp) validateFKConstraintExistingRows(fkOwnerTbl *catalog.Table, fk catalog.ForeignKey) error {
-	rel := o.ctx.Catalog.RelFileNode(fkOwnerTbl)
+	if err := o.validateFKConstraintExistingRowsRel(fkOwnerTbl, fkOwnerTbl, fk); err != nil {
+		return err
+	}
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		for _, child := range allDescendants(im, fkOwnerTbl, snapDetachEpoch(o.ctx)) {
+			if err := o.validateFKConstraintExistingRowsRel(fkOwnerTbl, child, fk); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// validateFKConstraintExistingRowsRel scans every live row of exactly
+// leafTbl (no descendant expansion — that is validateFKConstraintExistingRows'
+// job). Column positions are resolved from leafTbl.Columns (by name, via
+// fkColValues), never from a caller's precomputed index, so a partition
+// whose physical column order differs from the root's is still decoded
+// correctly. fkOwnerTbl is passed through to assertParentExists purely for
+// constraint-name synthesis when fk.Name is unset.
+func (o *ddlOp) validateFKConstraintExistingRowsRel(fkOwnerTbl, leafTbl *catalog.Table, fk catalog.ForeignKey) error {
+	rel := o.ctx.Catalog.RelFileNode(leafTbl)
 	nBlocks, err := o.ctx.Pool.NBlocks(rel)
 	if err != nil {
 		return &ExecError{Code: "XX000", Message: err.Error()}
@@ -11123,20 +11859,21 @@ func (o *ddlOp) validateFKConstraintExistingRows(fkOwnerTbl *catalog.Table, fk c
 			if terr != nil {
 				continue
 			}
-			if tuple.Header.Xmin == storage.InvalidTransactionID || tuple.Header.Xmax != storage.InvalidTransactionID {
+			// Abort-aware liveness — see collectBTreeEntries. M0134-0005c.
+			if !isLiveForUniqueCheck(o.ctx, tuple.Header.Xmin, tuple.Header.Xmax) {
 				continue
 			}
-			if scanRow == nil || len(scanRow) != len(fkOwnerTbl.Columns) {
-				scanRow = make(Row, len(fkOwnerTbl.Columns))
+			if scanRow == nil || len(scanRow) != len(leafTbl.Columns) {
+				scanRow = make(Row, len(leafTbl.Columns))
 			}
-			if decErr := DecodeHeapTupleRowInto(scanRow, fkOwnerTbl.Columns, tuple, sctx); decErr != nil {
+			if decErr := DecodeHeapTupleRowInto(scanRow, leafTbl.Columns, tuple, sctx); decErr != nil {
 				continue
 			}
-			vals, allNull := fkColValues(fkOwnerTbl.Columns, fk.Columns, scanRow)
+			vals, allNull := fkColValues(leafTbl.Columns, fk.Columns, scanRow)
 			if allNull {
 				continue
 			}
-			if perr := assertParentExists(o.ctx, fkOwnerTbl, nil, fk, vals); perr != nil {
+			if perr := assertParentExists(o.ctx, fkOwnerTbl, leafTbl, fk, vals); perr != nil {
 				o.ctx.Pool.Unpin(slot)
 				return perr
 			}
@@ -11361,6 +12098,20 @@ type btreeIndexProps struct {
 	// graceful shutdown checkpoint but reverted to 0 across a genuine crash
 	// restart replayed purely from WAL.
 	Tablespace uint32
+	// Deferrable / InitiallyDeferred / IsConstraint mirror the same-named
+	// catalog.Index fields (indexcmds.c: INDEX_CONSTR_CREATE_DEFERRABLE et
+	// al.). M0134-0005f: the partition-clone call sites (CREATE TABLE …
+	// PARTITION OF and ALTER TABLE … ATTACH PARTITION) forward the parent
+	// constraint index's these three fields through here so the per-partition
+	// clone participates in SET CONSTRAINTS … DEFERRED (deferred_unique.go's
+	// uniqueCheckDeferred gates on idx.Deferrable) and shows up in
+	// pg_constraint (catalog.go's PGConstraintRowsForDBOid filters on
+	// idx.IsConstraint). PG's DefineIndex recurses on the same IndexStmt* per
+	// partition so these propagate for free there; goopg materialises a new
+	// catalog.Index per partition and has no equivalent free path.
+	Deferrable        bool
+	InitiallyDeferred bool
+	IsConstraint      bool
 }
 
 func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalog.Table, columns []string, colExprs []parser.Expr, unique bool, primary bool, nullsNotDistinct bool, colDescending, colNullsFirst []bool, props ...*btreeIndexProps) error {
@@ -11459,6 +12210,9 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 		idx.Fillfactor = xp.Fillfactor
 		idx.DeduplicateItems = xp.DeduplicateItems
 		idx.Tablespace = xp.Tablespace
+		idx.Deferrable = xp.Deferrable
+		idx.InitiallyDeferred = xp.InitiallyDeferred
+		idx.IsConstraint = xp.IsConstraint
 	}
 	// Store parsed expressions for expression-based index columns so the
 	// planner and executor can evaluate them at conflict-detection time.
@@ -11617,7 +12371,14 @@ func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols
 			if err != nil {
 				continue
 			}
-			if tuple.Header.Xmin == storage.InvalidTransactionID || tuple.Header.Xmax != storage.InvalidTransactionID {
+			// Abort-aware liveness (not the naive Xmin-valid/Xmax-invalid
+			// structural test): an aborted xmin's tuple is dead even though
+			// Xmin is non-invalid, and a tuple whose xmax belongs to an
+			// aborted transaction is still live. PG oracle:
+			// heapam_visibility.c:1205 HeapTupleSatisfiesVacuumHorizon,
+			// consumed by heapam_handler.c:1415 heapam_index_build_range_scan.
+			// M0134-0005c.
+			if !isLiveForUniqueCheck(o.ctx, tuple.Header.Xmin, tuple.Header.Xmax) {
 				continue
 			}
 			// M0054-0005c: reuse a per-CREATE-INDEX decode buffer to

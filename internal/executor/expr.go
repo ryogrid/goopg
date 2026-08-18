@@ -769,7 +769,16 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 			var oidParts []string
 			switch v.Kind {
 			case KindString:
-				oidParts = strings.Fields(v.StringValue())
+				sv := v.StringValue()
+				// A brace-delimited array LITERAL (name→OID direction, e.g.
+				// '{int4}'::regtype[]) is not an oidvector — it must fall
+				// through to evalCastTyped/evalCast's "regtype[]" arm below,
+				// which resolves each element via regIdentifierInput. Only
+				// genuine oidvector text (space-separated OIDs, no braces)
+				// takes this OID→name branch. M0134-0005 S07.
+				if len(sv) == 0 || sv[0] != '{' {
+					oidParts = strings.Fields(sv)
+				}
 			case KindInt:
 				oidParts = []string{fmt.Sprintf("%d", v.Int)}
 			}
@@ -3457,6 +3466,65 @@ func formatDatumDateStyle(d Datum, ctx *Context) string {
 	return formatTimeDatumDateStyle(d, style, order, timeZoneFromCtx(ctx))
 }
 
+// CoerceParamToDeclaredType applies the declared parameter type from a SQL
+// PREPARE/EXECUTE to a supplied argument, mirroring
+// postgres/src/backend/commands/prepare.c:EvaluateParams, which runs
+// coerce_to_target_type(..., COERCION_ASSIGNMENT, COERCE_IMPLICIT_CAST, -1)
+// over every supplied expression against pstmt->argtypes[i]. Without this,
+// goopg only validated argument compatibility (execParamTypeIncompatible)
+// and then bound the raw literal datum, so e.g. a regclass[] parameter kept
+// its KindString and every OID comparison in the plan silently evaluated
+// false. targetType is normalised here (quotes stripped, lower-cased,
+// typmod parenthesis dropped, trailing "[]" kept) so callers may pass the
+// declared spelling straight from parser.PrepareStmt.ParamTypes or
+// normPrepParamType's output — this function is a thin wrapper and delegates
+// all actual coercion to evalCast; it must not duplicate cast logic.
+//
+// One exception: a scalar (non-array) reg* target — e.g. `PREPARE
+// t(regclass) AS ...; EXECUTE t('tbl')` — is resolved directly via
+// regIdentifierInput (the same shared primitive evalCast's reg*[] array
+// arm already calls per-element) rather than through evalCast. evalCast's
+// own "regclass" case is deliberately a KindInt-only pass-through for
+// KindString (see its comment): scalar `'name'::regclass` name→OID
+// resolution normally happens inline in evalExprSlot's *optimizer.CastExpr
+// arm (which is catalog/dbOid-aware) or evalFuncCall's reg* arm — neither
+// of which a bound EXECUTE parameter ever passes through, since the
+// parameter value never becomes a CastExpr/FuncCall AST node. Resolving it
+// here (not by widening evalCast's own regclass case) keeps every other
+// evalCast caller's existing regclass behavior byte-identical — widening
+// evalCast's case regressed TestRegCastToStringRendersName's pinned
+// bare-catalog literals (a test fixture where system tables are
+// deliberately not name-resolvable, discovered and reverted during
+// M0134-0005a). M0134-0005a.
+func CoerceParamToDeclaredType(d Datum, targetType string, ctx *Context) (Datum, error) {
+	if targetType == "" || d.IsNull() {
+		return d, nil
+	}
+	t := strings.TrimSpace(targetType)
+	t = strings.Trim(t, `"`)
+	t = strings.ToLower(t)
+	isArray := strings.HasSuffix(t, "[]")
+	if isArray {
+		t = strings.TrimSuffix(t, "[]")
+	}
+	// Drop a typmod parenthesis, e.g. "varchar(10)" -> "varchar",
+	// "numeric(10,2)" -> "numeric". evalCast dispatches on the bare type
+	// name; typmod-specific range/precision enforcement is out of scope
+	// for parameter coercion (matches EvaluateParams, which coerces
+	// against the type OID, not the typmod, for this path).
+	if i := strings.IndexByte(t, '('); i >= 0 {
+		t = t[:i]
+	}
+	t = strings.TrimSpace(t)
+	if !isArray && d.Kind == KindString && ctx != nil && isRegIdentifierTypeName(t) {
+		return regIdentifierInput(d, t, ctx, 0)
+	}
+	if isArray {
+		t += "[]"
+	}
+	return evalCast(d, t, 0, ctx)
+}
+
 // evalCast coerces datum d to the declared SQL type name.
 // Handles: string→bool, bool→text, int→text, int→int2 (range check),
 // string→int2/4/8 (via parseIntegerInput). Pass-through for unknown types.
@@ -3619,6 +3687,45 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			return NewStringDatum(formatTextArray(elems)), nil
 		}
 		return d, nil
+	case "regclass[]", "regproc[]", "regprocedure[]", "regtype[]", "regrole[]",
+		"regcollation[]", "regnamespace[]", "regdictionary[]":
+		// reg*[] cast: resolve each array-literal element to its OID via the
+		// SAME regIdentifierInput the scalar reg* casts (case "regclass" below
+		// delegates name→OID resolution to evalExprSlot's CastExpr arm, which
+		// calls the equivalent catalog lookups) and the heap encode path
+		// (codec_array.go's encodeArrayElem) already use — parseRegDashOrOid
+		// ("-"/numeric) first, then the per-type catalog lookup, propagating a
+		// miss as the type's own undefined-object SQLSTATE rather than
+		// swallowing it. Before this arm the switch had no case for any
+		// reg*-array type, so control fell through to the unknown-type
+		// pass-through at the end of this function and the literal stayed raw,
+		// unresolved text — every downstream `conrelid = ANY('{tbl}'::regclass[])`
+		// silently evaluated false instead of erroring or matching (M0134-0005
+		// S07; S06 diagnosis). Mirrors the "name[]" arm's shape immediately
+		// above (parseTextArray → per-element transform → formatTextArray).
+		// regnamespace/regdictionary have no name-resolution seam yet
+		// (reg_identifier.go's file-level comment) — they still pass through
+		// unresolved here, matching the scalar family's existing documented
+		// limitation, not a regression introduced by this arm.
+		s := d.StringValue()
+		if len(s) == 0 || s[0] != '{' || s[len(s)-1] != '}' {
+			return d, nil
+		}
+		elemType := strings.TrimSuffix(strings.ToLower(targetType), "[]")
+		elems := parseTextArray(s)
+		resolved := make([]string, len(elems))
+		for i, e := range elems {
+			rd, err := regIdentifierInput(NewStringDatum(e), elemType, ctx, pos)
+			if err != nil {
+				return Datum{}, err
+			}
+			if rd.Kind == KindInt {
+				resolved[i] = strconv.FormatInt(rd.Int, 10)
+			} else {
+				resolved[i] = rd.StringValue()
+			}
+		}
+		return NewStringDatum(formatTextArray(resolved)), nil
 	case "bytea":
 		// byteain (postgres/src/backend/utils/adt/varlena.c). An unknown-type
 		// literal and an explicitly-typed text value both reach this arm as
