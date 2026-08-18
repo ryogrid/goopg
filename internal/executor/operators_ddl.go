@@ -8463,9 +8463,9 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// errors synchronously from ATExecAttachPartition, not at
 			// commit. M0134-0005q.
 			if err := mergeNotNullOnAttach(tbl, childTbl, true); err != nil {
-				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
-					ee.Pos = act.Pos()
-				}
+				// PG raises these from MergeConstraintsIntoExisting
+				// (tablecmds.c:17638-17817) with no errposition(), so no
+				// cursor position is stamped — M0134-0005u.
 				return err
 			}
 			if catalogHeapSyncAvailable(o.ctx) {
@@ -9351,9 +9351,9 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				// a retried INHERIT falsely trips the duplicate-parent check
 				// above. M0134-0005r (design doc §25.4).
 				if err := mergeNotNullOnAttach(parentTbl, tbl, false); err != nil {
-					if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
-						ee.Pos = act.Pos()
-					}
+					// PG raises these from MergeConstraintsIntoExisting
+					// (tablecmds.c:17638-17817) with no errposition(), so no
+					// cursor position is stamped — M0134-0005u.
 					return err
 				}
 				if catalogHeapSyncAvailable(o.ctx) {

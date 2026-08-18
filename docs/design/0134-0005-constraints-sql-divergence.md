@@ -2514,3 +2514,84 @@ this diff**: `\d+`'s per-column *Nullable* display shows blank where PG shows
 PK-implied NOT NULL. The describe renderer evidently reads a different signal
 than `catalog.Table.Columns[i].NotNull` / the `pg_constraint` row — a separate
 bug in the describe path, not in the inheritance bookkeeping this section fixes.
+
+## 28. M0134-0005u — goopg stamped a cursor position PG does not set on the NOT-NULL merge errors
+
+Baseline when this slice was selected: **702 diff lines / 31 hunks** (HEAD
+`26b6b5ac`, per §27 — never compare against an older number). Research pass:
+`tmp/ralph-handoffs/m0134-0005u-eepos-audit/report.md`.
+
+### 28.1 The divergence
+
+Both `mergeNotNullOnAttach` call sites wrapped their error return in
+
+```go
+if ee, ok := err.(*ExecError); ok && ee.Pos == 0 { ee.Pos = act.Pos() }
+```
+
+so goopg emitted a `FieldPosition` — rendered by psql as a `LINE N:` / `^`
+caret block — on the `42P17` / `42804` NOT-NULL merge conflicts raised by
+`ALTER TABLE … ATTACH PARTITION` and plain `ALTER TABLE … INHERIT`. PG 18.3
+raises both from `MergeConstraintsIntoExisting`
+(`postgres/src/backend/commands/tablecmds.c:17638-17817`), which calls no
+`errposition()`; `postgres/src/test/regress/expected/constraints.out:1497,1581`
+accordingly carries no caret block. This is the §25.6 quirk, ledgered under
+M0134-0005r and re-measured under M0134-0005s.
+
+Note the gate asymmetry that makes this visible at all: `scripts/pg-regress-runner.sh`
+uses its own bash `normalise_output` (script lines ~250-266), which does **not**
+strip `LINE `/`^`, whereas `NormalizeRegressOutput`
+(`internal/testport/framework/regress.go`) does. A payoff claim about error
+positions is meaningless until you name which normaliser it is about.
+
+### 28.2 The audit — the ledger's "36 lines across ~20 sites" was wrong
+
+The M0134-0005s ledger row scoped this as "a single audit of all ~20
+`ee.Pos == 0` stamping sites … worth 36 lines". The research pass enumerated all
+20 sites in `internal/executor/operators_ddl.go` and found that number does not
+survive contact:
+
+- **15 sites** are lock-acquire / deadlock / cancel paths (`acquireDDLLockTxn`
+  and friends, plus `detachPartitionFKRefCheck`). PG never attaches a position to
+  these either (`lock.c`, `proc.c`, `deadlock.c` call no `errposition`), so
+  removing the stamps *would* be PG-faithful — but none are witnessed by
+  `constraints.sql`, which is serial and cannot reach a lock wait. Payoff on this
+  gate: **zero**. Risk: non-zero, because the isolation specs (`alter-table-*`,
+  `detach-partition-concurrently-*`) do exercise them and were not checked.
+- **1 site** (`:11600`, the FK phase-3 `validateFKConstraintExistingRows` scan,
+  23503) is a real instance of the same bug — PG's `ri_triggers.c`
+  `ri_ReportViolation` sets no position — but it is witnessed by
+  `foreign_key.sql`, not `constraints.sql`, and its sibling at `:8196` already
+  skips the wrap. It belongs to a `foreign_key`-scoped slice.
+- **2 sites** (`:8466` ATTACH, `:9354` INHERIT) are both PG-cited and
+  byte-witnessed in `constraints.out`. Those are this slice.
+
+The lesson generalises past this file: an `ee.Pos` site count is not a payoff
+estimate. Only sites whose error is *reached by the fixture under measurement*
+move the number, and "PG-faithful to remove" and "safe to remove blind" are
+different predicates — M0129-S10 broke 26 regress cases by treating a
+position-stripping change as site-blind (2026-08-10 ledger row).
+
+### 28.3 What landed
+
+Six lines in `internal/executor/operators_ddl.go`: the two stamping wrappers
+replaced by a comment citing `tablecmds.c:17638-17817`. The third
+`mergeNotNullOnAttach` call site (`~:7416`, the deferred-to-commit path of §25.5)
+already discards its error and carried no stamp.
+
+**Measured result: 702/31 → 672 lines / 30 hunks** — predicted −6/0, actual
+−30/−1. The four directly-removed diff lines are real; the rest is unified-diff
+realignment, two previously separate hunks merging once the caret lines
+disappeared (consistent with the hunk count falling by exactly one). Verified
+non-vacuous: `grep 'conflicts with NOT VALID constraint on child table'` over the
+new diff returns zero matches — both target errors now match PG byte-for-byte —
+and all 30 surviving hunks are pre-existing, unrelated divergences. **This is the
+inverse of §27's marker-line rule:** a hunk that goes clean can take far more than
+its own line count with it, in either direction. Predict the *sign*, not the
+magnitude, and re-measure.
+
+### 28.4 Carried out of this slice (ledgered)
+
+- The 15 lock-acquire `ee.Pos` sites — PG-faithful to remove, zero payoff here,
+  unverified against the isolation specs.
+- The FK phase-3 site (`:11600`) — same bug, `foreign_key.sql` scope.
