@@ -1,61 +1,63 @@
-# Working set — M0134-0005v landed (ADD PRIMARY KEY / NOT NULL compatibility)
+# Working set — M0134-0005w landed (spurious LINE cursor positions)
 
-**Task:** M0134-0005 (`constraints.sql`) — **M0134-0005v LANDED**. Parent case
-stays `[ ]`. Selected per the Current Priority banner (M0134 after M-NIGHTLY).
-M-NIGHTLY drained: `ci/logs/action-items.md` still at run `20260818-005518`,
-**items: 0** — nothing to file.
+**Task:** M0134-0005 (`constraints.sql`) — **M0134-0005w LANDED** (`9c1254ee`).
+Parent case stays `[ ]`. Selected per the Current Priority banner (M0134 after
+M-NIGHTLY). M-NIGHTLY drained: `ci/logs/action-items.md` still at run
+`20260818-005518`, **items: 0** — nothing to file.
 
-**What landed (design §29):** `internal/executor/operators_ddl.go` —
-`verifyNotNullPKCompatible` (port of `tablecmds.c:9577-9608`) +
-`verifyNotNullPKCompatibleChildren` (PG's `!recurse` branch `:9532-9557`), with
-`only` threaded from the single call site `:8096`. `ADD PRIMARY KEY` over a
-column whose existing NOT NULL is `NO INHERIT` or `NOT VALID` now raises `55000`
-with PG-verbatim message/DETAIL/HINT, `Pos: 0`, before index creation and the
-null scan. New `operators_ddl_addpk_notnull_pkcompat_test.go` (5 tests,
-FAIL-pre/PASS-post). **672 → 647 lines / 30 hunks.**
+**What landed (design §30):** `internal/executor/operators_ddl.go` — four
+`Pos: act.Pos()` → `Pos: 0` at `:10121/:10130/:10139/:10557`. PG's
+`pg_constraint.c` has **zero** `errposition()` calls, so none of
+`AdjustNotNullInheritance`'s three rejections nor `heap.c:ConstraintNameIsUsed`
+sets a position. New `operators_ddl_errpos_identity_test.go` (4 tests, Pos==0,
+FAIL-pre/PASS-post). **647 → 601 lines / 30 → 28 hunks.**
 
 **Three things worth not re-learning:**
-- **A carried ranking is a hypothesis, not a queue.** The §28 baton's ranked #1
-  and #2 are both *fixture-unreachable* — real divergences, zero payoff here. The
-  reachability pass retired both and found an in-diff 4th candidate at 2.5x the
-  surviving #3. Second consecutive loop decided this way. Always re-measure a
-  carried ranking against the current diff before briefing.
-- **The fixture list is the scope, not the brief's line pointer.** My brief
-  pointed at the own-column check (`~:10883-10913`); §29.2's three fixture sites
-  needed the `ONLY`-children branch too. The narrow reading would have closed 1
-  of 3 sites. The implementer widened correctly and disclosed it.
-- **Over-delivery on the estimate**, for once: predicted ~662, measured 647 —
-  because the `ONLY` branch closed two sites the estimate credited to one.
+- **`Pos` bugs are the cheapest lines-per-edit on this gate.** 4 edited lines
+  closed 46 diff lines vs a ~12-line forecast: each spurious position costs
+  *three* diff lines (message + `LINE 1:` echo + caret) and the caret displaces
+  context. Multiply any position-bug estimate by ~3-4×. Prefer these first.
+- **The re-census earned its keep again (3rd consecutive loop).** The carried #1
+  (`DROP CONSTRAINT … ONLY` InhCount) is real and reachable but *shares its hunk*
+  with a 15-line `pg_get_partition_constraintdef` gap — landing it alone closes
+  no hunk. The carried #3 (ATACC3 `Nullable`) was badly *understated*: 8
+  occurrences / 6 hunks / 3 code paths, not "the last residual line". Never brief
+  off a carried ranking without re-measuring.
+- **A "~2-line check" can hide a missing feature.** §29.5 estimated the identity
+  `NOT VALID` check at 2 lines assuming the identity-add path existed. It does
+  not: `ADD GENERATED … AS IDENTITY` is a *silent no-op* (verified live —
+  succeeds, `attidentity` never set). Verify the host path exists before sizing a
+  check inside it.
 
-**Gates run:** `go build ./...`; `go test ./internal/executor/`; 5 new guard tests
-PASS; `TestPort_.*(NotNull|Constraint|Inherit|Partition)` (54 subtests, 75.1s);
-`scripts/pg-regress-runner.sh constraints` **647/30**;
-`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS (7m48s,
-`internal/initdb` + `cmd/goopg` cold cache — not a regression);
+**Gates run:** `go build ./...`; `go test ./internal/executor/`; 4 new guard tests
+PASS; `TestPort_.*(NotNull|Constraint|Identity|Inherit)` PASS (33s);
+`scripts/pg-regress-runner.sh constraints` **601/28**;
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS (7m45s);
 `scripts/tpch-spotcheck.sh` PASS (**Q12=2, Q13=35**, Rule #1); pgbench smoke via hook.
 
-**Next step — pick from the remaining cluster.** Baseline is now **647 lines / 30
-hunks** (never compare to a pre-2026-08-18 number). Carried, but each needs its
-own fixture-reachability pass before any estimate is trusted:
-1. `DROP CONSTRAINT … ONLY` not decrementing the child's `InhCount`/`IsLocal`
-   (`notnull_tbl5_child`, `constraints.sql:803-806`) — reachable, measured **4
-   lines / 1 hunk** at the 672 baseline; re-measure against 647.
-2. The identity-column `NOT VALID` check (`constraints.sql:838`,
-   `tablecmds.c:8311`) — reachable, ~2 lines.
-3. `\d+`'s per-column *Nullable* blank for an inherited + PK-implied column —
-   a describe-path bug (the last residual ATACC3 line).
-4. Cosmetic: missing "merging column" NOTICE; suppressed inheritance NOTICEs;
-   `regclass` ORDER BY sorting by non-OID.
-**Not selectable here** (ledgered, zero payoff on this gate): `ATExecValidateConstraint`
-recursion, the CHECK half of `MergeConstraintsIntoExisting`, the child-has-no-NOT-NULL
-arm of `verifyNotNullPKCompatibleChildren`, the 15 lock `ee.Pos` sites, FK `:11600`.
-The remaining candidates are small — consider whether the next loop should instead
-re-census the 647-line diff for a new dominant bucket rather than drain 2-4 line items.
+**Next step — baseline is now 601 lines / 28 hunks** (never compare to a
+pre-2026-08-18 number). Full measured hunk-by-hunk census with citations:
+`tmp/ralph-handoffs/m0134-0005w-census/report.md` — read it before re-measuring.
+Ranked, but re-verify reachability against 601/28 first:
+1. **ATACC3 `Nullable`-blank family** — now the biggest in-theme bucket (~33+
+   lines, 8 occurrences, 6 hunks) via 3 distinct paths: inline PK+INHERITS at
+   CREATE TABLE; `ADD CONSTRAINT … PRIMARY KEY` heap-`attnotnull`-sync gap;
+   `PRIMARY KEY USING INDEX` (missing the not-null constraint *and* the index
+   rename). Needs **3 separate slices** — brief one path at a time.
+2. Inherited-CHECK-enforcement family (82 lines / 2 hunks) — the most
+   *consequential* correctness bug in the diff (inherited CHECK not enforced on
+   child INSERT) but bundles ≥5 sub-bugs; needs its own research loop, not a slice.
+3. `DROP CONSTRAINT … ONLY` InhCount — only worth doing bundled with the
+   co-resident `pg_get_partition_constraintdef` gap.
+**Not selectable** (ledgered, zero payoff here): identity `NOT VALID` (blocked on
+the missing `ADD GENERATED` implementation), `ATExecValidateConstraint` recursion,
+the CHECK half of `MergeConstraintsIntoExisting`, the child-has-no-NOT-NULL arm,
+the 15 lock `ee.Pos` sites, FK `:11600`, the circle/GiST opclass cascade (67
+lines, out of theme).
 
-**Delegation:** `tmp/ralph-handoffs/m0134-0005v-research/` (researcher
-`afdf51fe0f04a976b`, 1 round, DONE) and `tmp/ralph-handoffs/m0134-0005v-pkcompat/`
-(implementer `a82eca33bae316c30`, 1 round, DONE — a write-guard blocked its
-`report.md`, so its log lives only in the loop transcript and this file; testers
-`a04d0873e87a9f90b` 6 gates PASS, `a58603e9601c21aad` spotcheck PASS).
+**Delegation:** `tmp/ralph-handoffs/m0134-0005w-census/` (researcher
+`a6755b24ad7aba182`, 1 round, DONE) and `tmp/ralph-handoffs/m0134-0005w-errpos/`
+(implementer `a2f58afa8c840b841`, 1 round, Part A DONE / Part B BLOCKED-ledgered;
+tester `ab7e5e2761b4b420c`, both gates PASS).
 
 **In-flight:** none.
