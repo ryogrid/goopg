@@ -1,60 +1,58 @@
-# Working set — M0134-0005ad LANDED (two skipped NOT-NULL constraint checks)
+# Working set — M0134-0005af LANDED (two exclusion-constraint gaps)
 
-**Task:** M0134-0005 / sub-item **M0134-0005ad** — LANDED, item ticked. Selected
-per the Current Priority banner (M-NIGHTLY had nothing new; M0134 is next).
+**Task:** M0134-0005 / sub-item **M0134-0005af** — LANDED.
+Selected per the Current Priority banner (M-NIGHTLY had nothing new; M0134 next).
 
 **Nightly triage:** `ci/logs/action-items.md` STILL shows run `20260819-011823`,
-items: 1 — the same AI-20260819-011823-001 fixed four loops ago (`2289e149`).
-Nothing to file. It has now been stale for four loops; if the next nightly run
-does not refresh it, suspect the nightly lane itself is not running.
+items: 1 — the same AI-20260819-011823-001 fixed six loops ago (`2289e149`).
+Nothing to file. **Stale for SIX loops.** The prior baton already said: if the
+nightly does not refresh, treat the nightly lane itself as not running and
+investigate that. It has not refreshed. **Next loop should spend one researcher
+on why ci/batch has not produced a new run** before taking another M0134 slice.
 
-**What landed (bucket E of the census):** one shape, two sites — goopg HAD the
-right check and just did not run it on the second path reaching the same state.
-Hard-won Rule #2 in its least obvious form: the sibling pair is *direct target
-vs recursion target* and *first column vs later column of one statement*, not
-encode/decode. **E1** `cascadeNotNullToChildrenAt` bumped a child's `InhCount`
-with no re-check, so a NO-INHERIT conflict on a DESCENDANT went unreported —
-though `AlterTableAddNotNull` raised that exact 55000 for the ALTER target. PG
-has no asymmetry because the check is INSIDE the recursion (`tablecmds.c:10012`
-→ `heap.c:2609` → `AdjustNotNullInheritance`). Error names the CHILD (same rule
-§36.4 found). The hunk's second `+ERROR` ("cannot drop inherited constraint")
-self-resolved — the false merge made a local constraint look inherited.
-**E2** duplicate explicitly-named NOT NULL in one `CREATE TABLE` → 42710 via the
-existing `fkConstraintNameInUse` helper.
+**What landed (bucket F, its 2 located items).**
+**F9** (silent integrity gap) `ALTER TABLE … ADD EXCLUDE (col WITH =)` never
+scanned existing rows: the build's duplicate check in `collectBTreeEntries` was
+gated on the same `unique` flag that sets `idx.Unique`, hardcoded false for
+exclusions. Fixed by decoupling a new `CheckDup` (on `btreeIndexProps`) from
+`unique`, across BOTH the ALTER and CREATE-TABLE sibling call sites. Needed
+`IsExclusion`/`ExclusionOp` on the same struct — `execAlterTableAddExclude` set
+`idx.IsExclusion` only AFTER `LookupIndex`, too late for the build to pick its
+error shape. PG: `execIndexing.c:893-918`, two-sided 23P01.
+**F8** ON CONFLICT arbiter validation gated on `idx.Unique` alone in BOTH
+`analyzeOnConflict` and `resolveArbiterIndex` → rejected every exclusion
+constraint with 42P10. PG accepts them; only `INITIALLY DEFERRED` (i.e.
+`indimmediate=false`, NOT plain `Deferrable`) is rejected, with 55000, and with
+NO cursor position (`Pos: 0` — PG raises it at execution time).
 
-**Worth not re-learning:** E2's naive fix ADDED a diff line. `Catalog.CreateTable`
-runs before constraint processing and is NOT transactional, so rejecting left a
-phantom relation and the script's next `CREATE TABLE` failed a spurious 42P07.
-PG is immune (the utility statement's txn aborts). Every post-`CreateTable`
-error return in `execCreateTable` leaks this way — ledgered as a class.
-
-**Measurement:** constraints **381 → 360 lines, 19 → 18 hunks**, no new `@@`.
+**Measurement:** constraints **322 → 294 lines, 16 → 14 hunks**, no new `@@`.
 Never compare to a pre-2026-08-19 number.
 
 **Gates run:** `go build ./...` PASS; `go test ./internal/executor/
-./internal/catalog/` PASS; `scripts/pg-regress-runner.sh --verbose constraints`
-381/19 → 360/18; `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
-PASS; both new guards FAIL-pre/PASS-post (verified by stashing); pgbench smoke
-via the hook. Test cache was warm.
+./internal/parser/analyzer/ ./internal/optimizer/` PASS; `pg-regress-runner
+--verbose constraints` 322/16 → 294/14; `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh` PASS; all 7 guards re-run by me PASS; pgbench
+smoke via the hook. Cache warm.
 
-**Next step:** continue M0134-0005 at the **360/18** baseline. The census
-(`tmp/ralph-handoffs/m0134-0005ac-census/report.md`) is still ~85% valid —
-subtract buckets B, C and E; its hunk NUMBERS are stale, re-derive from a fresh
-run. Top remaining, per that ranking:
-1. **bucket G** — 4 independent low-risk line-pinned display/property-copy fixes
-   (ATTACH PARTITION FK `_1` renaming; `\d+` sequence default not schema-
-   qualified; LIKE not copying PK deferrability; the `(inherited)` tag on a
-   redeclared+inherited NOT NULL). ~61 lines / 4 hunks but 4 causes — pick ONE.
-2. **bucket F** — exclusion-constraint gaps, 3 hunks / 95 lines, 3 causes; the
-   circle default gist opclass (catalog seed data) cascades widest.
-3. **bucket D** — `pg_get_partition_constraintdef`, 1 hunk / 22 lines, breaks
-   `\d+` on ANY partition; from-scratch builtin, higher risk.
-Standing ledgered: chained-cast column label (bucket A), the `convalidated`
-cascade (visible twice), the CREATE-time twin of E1, the phantom-relation class.
+**Next step:** after the nightly-lane check above, continue M0134-0005 at the
+**294/14** baseline. Remaining, ranked:
+1. **bucket D** — `pg_get_partition_constraintdef` missing builtin, 1 hunk,
+   breaks `\d+` on ANY partition; from-scratch builtin. Landing it ALSO unblocks
+   closing G4's shared hunk.
+2. **G4** — `ALTER TABLE ONLY … DROP CONSTRAINT`/`DROP NOT NULL` never orphans
+   the child copy (real `coninhcount`/`conislocal` corruption); two sibling call
+   sites; ledgered; closes no hunk without D.
+3. **G2** — unqualified `nextval(…)` in `\d+`; **do NOT brief as a one-line
+   fix** — the only nextval-constructing site already qualifies, so the real
+   row-source is unknown and needs a live `pg_attrdef` probe first. Ledgered.
+4. **F7** — gist exclusions past single-column box overlap; the LARGEST hunk
+   left (67 lines) but a multi-piece feature; ledgered, needs its own design.
+   Census's "missing circle opclass seed data" framing is WRONG — it is seeded.
 
-**Delegation:** `tmp/ralph-handoffs/m0134-0005ad-{research,impl}/` (researcher
-`a25e5832b54c633b9` DONE 1 round; implementer `a5206c382023b7e2d` DONE 1 round,
-one in-goal deviation: the compensating `DropTable`, without which the fix added
-a diff line instead of removing one).
+**Delegation:** `tmp/ralph-handoffs/m0134-0005af-{research,impl}/` (researcher
+`a3094e9c20bd811f8` DONE 1 round — it also CORRECTED the census on F7;
+implementer `a770eec137031210d` DONE 1 round, one accepted deviation: `CheckDup`
+as a `btreeIndexProps` field rather than a positional param, which avoided
+editing ~15 unrelated `createBTreeIndex` call sites).
 
 **In-flight:** none.

@@ -3377,3 +3377,118 @@ Guards (FAIL-pre / PASS-post, both verified by stashing the fix) in
 - The phantom-relation class of §37.3: the remaining post-`CreateTable` error
   returns in `execCreateTable` still leave a registered relation behind. The
   durable fix is transactional DDL, not more compensating drops.
+
+## 38. M0134-0005af — the two *located* exclusion-constraint gaps: a build that never scanned, and an arbiter check that never asked (LANDED 2026-08-19)
+
+Bucket F of the census, re-pinned at the **322 lines / 16 hunks** baseline left
+by 0005ae (`tmp/ralph-handoffs/m0134-0005af-research/report.md`). The bucket
+holds three sub-items; this slice took the two whose code sites are exactly
+located and low-risk. **F7 is deliberately out** — see §38.4.
+
+### 38.1 F9 — `ALTER TABLE … ADD EXCLUDE (col WITH =)` accepted conflicting rows
+
+A **silent integrity gap**, the same class as §34/§36: the statement succeeded
+over data that violates the constraint it just created.
+
+goopg implements a btree-equality exclusion constraint by building a real btree
+so `checkExclusionConstraintsForInsert` can probe it later
+(`internal/executor/operators_ddl.go`, `execAlterTableAddExclude`). That call
+hardcoded `unique=false` — and `unique` was the **only** gate on the duplicate
+scan in `collectBTreeEntries`, the sole place in the whole build path that ever
+looks at existing rows. So the ALTER built its index and validated nothing.
+
+The naive fix (flip `unique` to `true`) is wrong twice over: `idx.Unique` is read
+elsewhere and an exclusion constraint is not a unique constraint, and the
+CREATE-TABLE-time `EXCLUDE (col WITH =)` branch passes the identical `unique=false`
+— flipping only the ALTER site would leave the two paths building
+catalog-divergent indexes for one constraint shape (Hard-won Rule #2 in its
+"two producers of one artifact" form). The landed fix therefore **decouples the
+two meanings**: a new `CheckDup` field on the existing variadic
+`btreeIndexProps` drives the duplicate scan, `unique` still solely drives
+`idx.Unique`, and both call sites pass the same props. Existing callers are
+byte-identical (`checkDup = unique`).
+
+Two further fields, `IsExclusion`/`ExclusionOp`, had to move onto the same props
+struct for an ordering reason worth recording: `execAlterTableAddExclude`
+already set `idx.IsExclusion` — but *after* `LookupIndex`, i.e. after the build
+had already run and already had to choose its error shape. The flag must be set
+**before** `bulkBuildBTreeFull`, not after.
+
+PG oracle: `postgres/src/backend/executor/execIndexing.c:893-918`,
+`check_exclusion_or_unique_constraint`. One function backs both INSERT-time and
+build-time checking; its `newIndex` branch raises `ERRCODE_EXCLUSION_VIOLATION`
+(**23P01**) `could not create exclusion constraint "%s"` with a **two-sided**
+detail `Key %s conflicts with key %s.` — unlike the unique-index path's
+one-sided `Key %s is duplicated.` (23505). goopg's duplicate block now branches
+on `idx.IsExclusion` to pick the shape; the 23505 branch is untouched.
+
+### 38.2 F8 — every exclusion constraint was rejected as an ON CONFLICT arbiter
+
+`INSERT … ON CONFLICT ON CONSTRAINT <excl> DO NOTHING` returned
+`42P10 constraint "…" is not a unique constraint`. Two sibling sites gated
+arbiter validity on `idx.Unique` alone — `analyzeOnConflict`
+(`internal/parser/analyzer/analyzer.go`) and its self-described defensive
+re-check `resolveArbiterIndex` (`internal/optimizer/planner.go`). Since
+`idx.Unique` is false for *every* exclusion constraint, goopg rejected them all,
+deferred or not — a broader bug than the regress case exposes.
+
+PG (`execIndexing.c:592-610`, `ExecCheckIndexConstraints`) does two distinct
+things goopg conflated into one:
+
+```c
+if (!indexInfo->ii_Unique && !indexInfo->ii_ExclusionOps)
+    continue;                       /* not an arbiter candidate at all */
+...
+if (!indexRelation->rd_index->indimmediate)
+    ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+        errmsg("ON CONFLICT does not support deferrable unique constraints/"
+               "exclusion constraints as arbiters"), ...));
+```
+
+So an exclusion constraint **is** a legal arbiter; what disqualifies it is
+deferredness. Both goopg sites now read
+`if !idx.Unique && !idx.IsExclusion` (unchanged 42P10) followed by a new
+`if idx.InitiallyDeferred` → **55000** with PG's exact message.
+
+The gate is `InitiallyDeferred`, **not** `Deferrable`: PG keys on
+`indimmediate`, which is false only for `INITIALLY DEFERRED`. A plain
+`DEFERRABLE` constraint has `indimmediate = true` and is a valid arbiter.
+
+One diagnostic-shape note: this error carries `Pos: 0`. PG raises it at
+execution time from `execIndexing.c` with no `errposition()`, so the expected
+output has no `LINE N:` — goopg front-loads the check to analyze time (the
+property is catalog-static and cannot change per statement) but must not
+front-load a cursor position with it.
+
+### 38.3 Measurement
+
+`constraints` **322 → 294 lines, 16 → 14 hunks**; both targeted hunks closed and
+the `deferred_excl` block is now byte-identical to PG. **No new `@@` header** —
+so unlike §34/§36 this slice unmasked nothing downstream. Guards, all
+FAIL-pre/PASS-post verified in both directions:
+`TestAlterTableAddExcludeRejectsExistingConflict`,
+`TestAlterTableAddExcludeSucceedsOverCleanData` (the over-rejection guard —
+clean data must still succeed), `TestAnalyzeOnConflict{AcceptsExclusionConstraintArbiter,
+RejectsDeferrableExclusionArbiter,RejectsDeferrableUniqueArbiter}`,
+`TestResolveArbiterIndex{AcceptsExclusionConstraintArbiter,RejectsDeferrableExclusionArbiter}`.
+
+The planner guards call `resolveArbiterIndex` directly rather than through
+`Plan()`, because `Plan()` runs `analyzer.Analyze` first and the analyzer's own
+check masks the planner's — a test-topology trap for whoever next touches
+either arbiter site.
+
+### 38.4 F7 stays open, and the census's framing of it was wrong
+
+The census recorded F7 as "missing default gist opclass for circle — catalog
+seed data, cascades hugely". It is not seed data: `gist/circle_ops` is already
+seeded correctly (`internal/initdb/initdb.go`, `pg_amproc_entries.go`,
+`pg_opfamily_bootstrap.go`). The real blocker is a **hardcoded box-only
+allow-list** in `createExclusionIndexStub`
+(`internal/executor/operators_ddl.go`) compounded by `checkGistOverlapExclusion`
+(`internal/executor/operators_storage.go`) supporting only single-column box
+overlap — no expression columns, no `WHERE` predicate. Closing F7 is a
+multi-piece feature (DDL opclass lookup + multi-column + expression-column +
+partial-predicate enforcement), and doing it **partially is worse than not at
+all**, because a half-implementation creates exclusion constraints that are
+catalogued but unenforced — precisely the silent-integrity class §38.1 just
+closed. It gets its own slice, ledgered.

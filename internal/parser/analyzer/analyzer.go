@@ -658,9 +658,23 @@ func analyzeOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, cat cata
 				return analyzeError(oc.Target.Pos(), "42704",
 					fmt.Sprintf("constraint %q does not belong to table %q", oc.Target.Constraint, tbl.Name))
 			}
-			if !idx.Unique {
+			if !idx.Unique && !idx.IsExclusion {
 				return analyzeError(oc.Target.Pos(), "42P10",
 					fmt.Sprintf("constraint %q is not a unique constraint", oc.Target.Constraint))
+			}
+			// M0134-0005af: an exclusion constraint IS a legal ON CONFLICT
+			// arbiter (PG oracle execIndexing.c:592-596,
+			// ExecCheckIndexConstraints: `!ii_Unique && !ii_ExclusionOps` is
+			// the only skip condition), but neither kind may be deferrable —
+			// keyed on indimmediate, which is false only for INITIALLY
+			// DEFERRED (a plain DEFERRABLE constraint stays immediate by
+			// default and remains a valid arbiter). execIndexing.c:604-610.
+			if idx.InitiallyDeferred {
+				// Pos: 0 — PG raises this at execution time
+				// (ExecCheckIndexConstraints, execIndexing.c) with no
+				// errposition, so the transcript has no "LINE N:" annotation.
+				return analyzeError(0, "55000",
+					"ON CONFLICT does not support deferrable unique constraints/exclusion constraints as arbiters")
 			}
 		default:
 			if len(oc.Target.Columns) == 0 {

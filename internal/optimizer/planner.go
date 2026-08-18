@@ -10527,8 +10527,19 @@ func resolveArbiterIndex(target *parser.OnConflictTarget, tbl *catalog.Table, re
 		if idx.Table != tbl {
 			return nil, nil, &PlanError{Pos: target.Pos(), Code: "42704", Message: fmt.Sprintf("constraint %q does not belong to table %q", target.Constraint, tbl.Name)}
 		}
-		if !idx.Unique {
+		if !idx.Unique && !idx.IsExclusion {
 			return nil, nil, &PlanError{Pos: target.Pos(), Code: "42P10", Message: fmt.Sprintf("constraint %q is not a unique constraint", target.Constraint)}
+		}
+		// M0134-0005af: an exclusion constraint IS a legal arbiter (PG oracle
+		// execIndexing.c:592-596), sibling of the analyzer's identical check
+		// (analyzer.go analyzeOnConflict) — this defensive re-check must stay
+		// in lockstep. Deferrable exclusion/unique constraints are rejected
+		// regardless of kind, keyed on InitiallyDeferred (indimmediate is
+		// false only for INITIALLY DEFERRED). execIndexing.c:604-610.
+		if idx.InitiallyDeferred {
+			// Pos: 0 — see analyzer.go's identical check; PG raises this at
+			// execution time with no errposition.
+			return nil, nil, &PlanError{Pos: 0, Code: "55000", Message: "ON CONFLICT does not support deferrable unique constraints/exclusion constraints as arbiters"}
 		}
 		ords := make([]int, 0, len(idx.Columns))
 		for _, ic := range idx.Columns {

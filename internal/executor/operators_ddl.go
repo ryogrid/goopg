@@ -3823,7 +3823,12 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		ec.Name = name
 		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: name}
 		if ec.ExclusionOp == "=" && strings.ToLower(ec.Method) == "btree" {
-			if err := o.createBTreeIndex(s.Pos(), idxName, tbl, ec.Columns, nil, false, false, false, nil, nil); err != nil {
+			// Rule-#2 sibling of execAlterTableAddExclude's identical branch
+			// (M0134-0005af): CREATE TABLE never has pre-existing rows, so
+			// checkDup is a behavioural no-op here, but the constraint shape
+			// is identical to the ALTER path and must not silently diverge —
+			// e.g. via a future LIKE/inheritance-copy that does carry rows.
+			if err := o.createBTreeIndex(s.Pos(), idxName, tbl, ec.Columns, nil, false, false, false, nil, nil, &btreeIndexProps{CheckDup: true, IsExclusion: true, ExclusionOp: "="}); err != nil {
 				return err
 			}
 			if idx, ok := o.ctx.Catalog.LookupIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok {
@@ -11713,7 +11718,12 @@ func (o *ddlOp) execAlterTableAddExclude(tbl *catalog.Table, act parser.AlterTab
 	if act.ExclusionOp == "=" && strings.ToLower(method) == "btree" {
 		// btree equality exclusion ≈ unique constraint: build a real
 		// btree so checkExclusionConstraintsForInsert can probe it.
-		if err := o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, false, false, false, nil, nil); err != nil {
+		// unique stays false (idx.Unique must not be set — this is not a
+		// unique constraint), but checkDup=true so the build validates
+		// pre-existing rows for conflicts exactly like PG's
+		// check_exclusion_or_unique_constraint does at build time
+		// (execIndexing.c:893-918, newIndex branch). M0134-0005af.
+		if err := o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, false, false, false, nil, nil, &btreeIndexProps{CheckDup: true, IsExclusion: true, ExclusionOp: "="}); err != nil {
 			return err
 		}
 		if idx, ok := o.ctx.Catalog.LookupIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok {
@@ -12885,6 +12895,21 @@ type btreeIndexProps struct {
 	Deferrable        bool
 	InitiallyDeferred bool
 	IsConstraint      bool
+	// CheckDup forces collectBTreeEntries' existing-row duplicate scan on even
+	// when unique is false. M0134-0005af: `ALTER TABLE … ADD EXCLUDE (col WITH
+	// =)` builds a non-unique btree (idx.Unique must stay false — it is not a
+	// unique constraint, PG oracle execIndexing.c check_exclusion_or_unique_
+	// constraint's newIndex branch) but must still validate pre-existing rows
+	// for conflicts, exactly like a real unique-index build does. Every other
+	// caller leaves this false, so checkDup collapses to `unique` for them —
+	// byte-identical behaviour.
+	CheckDup bool
+	// IsExclusion / ExclusionOp (M0134-0005af) let a checkDup=true caller mark
+	// idx.IsExclusion BEFORE the build runs (see createBTreeIndex), so
+	// collectBTreeEntries' duplicate-scan branch picks the exclusion-
+	// constraint 23P01 message shape rather than the unique-index 23505 one.
+	IsExclusion bool
+	ExclusionOp string
 }
 
 func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalog.Table, columns []string, colExprs []parser.Expr, unique bool, primary bool, nullsNotDistinct bool, colDescending, colNullsFirst []bool, props ...*btreeIndexProps) error {
@@ -12986,6 +13011,15 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 		idx.Deferrable = xp.Deferrable
 		idx.InitiallyDeferred = xp.InitiallyDeferred
 		idx.IsConstraint = xp.IsConstraint
+		if xp.IsExclusion {
+			// M0134-0005af: must be set BEFORE bulkBuildBTreeFull below so
+			// collectBTreeEntries' checkDup duplicate scan can see it and pick
+			// the 23P01 exclusion-constraint DETAIL shape instead of 23505's —
+			// the caller's own post-LookupIndex idx.IsExclusion=true assignment
+			// (execAlterTableAddExclude) runs too late for that.
+			idx.IsExclusion = true
+			idx.ExclusionOp = xp.ExclusionOp
+		}
 	}
 	// Store parsed expressions for expression-based index columns so the
 	// planner and executor can evaluate them at conflict-detection time.
@@ -13003,14 +13037,18 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 	idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
 	var buildErr error
 	var predExpr optimizer.Expr
+	checkDup := unique
 	if xp != nil {
 		predExpr = xp.Predicate
+		if xp.CheckDup {
+			checkDup = true
+		}
 	}
 	// M0119-0006: resolve expression key columns so the build indexes them too.
 	// Before this, `CREATE INDEX ON t(lower(c))` over pre-existing rows built an
 	// EMPTY index while INSERT-time maintenance did populate it.
 	keyExprs := resolveIndexKeyExprs(tbl, idx)
-	buildErr = o.bulkBuildBTreeFull(idx, idxRel, tbl, cols, keyExprs, unique, nullsNotDistinct, idxName.String(), pos, predExpr)
+	buildErr = o.bulkBuildBTreeFull(idx, idxRel, tbl, cols, keyExprs, unique, checkDup, nullsNotDistinct, idxName.String(), pos, predExpr)
 	if buildErr != nil {
 		_ = o.ctx.Catalog.DropIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		o.ctx.Pool.InvalidateRel(idxRel)
@@ -13048,8 +13086,11 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 // is not derivable from idxRel — REINDEX CONCURRENTLY builds into a shadow
 // relfile — and the bulk sort needs it: the build's own ordering and every
 // later reader's must come from the same key descriptor.
-func (o *ddlOp) bulkBuildBTreeFull(idx *catalog.Index, idxRel storage.RelFileNode, tbl *catalog.Table, cols []*catalog.Column, keyExprs []optimizer.Expr, unique, nullsNotDistinct bool, indexName string, pos int, predExpr optimizer.Expr) error {
-	entries, err := o.collectBTreeEntries(idx, tbl, cols, keyExprs, unique, nullsNotDistinct, indexName, pos, predExpr)
+// checkDup (M0134-0005af) decouples "scan existing rows for conflicts" from
+// unique (which also drives idx.Unique upstream in createBTreeIndex); every
+// caller other than the ALTER-EXCLUDE btree build passes checkDup == unique.
+func (o *ddlOp) bulkBuildBTreeFull(idx *catalog.Index, idxRel storage.RelFileNode, tbl *catalog.Table, cols []*catalog.Column, keyExprs []optimizer.Expr, unique, checkDup, nullsNotDistinct bool, indexName string, pos int, predExpr optimizer.Expr) error {
+	entries, err := o.collectBTreeEntries(idx, tbl, cols, keyExprs, unique, checkDup, nullsNotDistinct, indexName, pos, predExpr)
 	if err != nil {
 		return err
 	}
@@ -13105,7 +13146,7 @@ func btreeBuildKeyDescription(idx *catalog.Index, cols []*catalog.Column, row Ro
 // also performs PG's duplicate-key check (23505, comparetup_index_btree
 // tuplesortvariants.c:1686-1693) over the sorted entries.
 
-func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols []*catalog.Column, keyExprs []optimizer.Expr, unique, nullsNotDistinct bool, indexName string, pos int, predExpr optimizer.Expr) ([]nbtree.BulkEntry, error) {
+func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols []*catalog.Column, keyExprs []optimizer.Expr, unique, checkDup, nullsNotDistinct bool, indexName string, pos int, predExpr optimizer.Expr) ([]nbtree.BulkEntry, error) {
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 	nBlocks, err := o.ctx.Pool.NBlocks(rel)
 	if err != nil {
@@ -13246,12 +13287,14 @@ func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols
 				continue
 			}
 			entry := nbtree.BulkEntry{Key: append([]byte(nil), key...), Ptr: storage.ItemPointer{Block: blk, Offset: i}}
-			if unique {
+			if checkDup {
 				// Capture the rendered "Key (cols)=(vals)" description now —
 				// after the post-sort duplicate walk below the source row is
-				// gone, and only the entry list survives. Non-unique builds
-				// never read KeyDesc, so skip the per-row string allocation.
-				// M0134-0002 C3 slice 2.
+				// gone, and only the entry list survives. Builds that skip the
+				// duplicate scan never read KeyDesc, so skip the per-row string
+				// allocation. M0134-0002 C3 slice 2; M0134-0005af widened the
+				// gate from `unique` to `checkDup` so an ALTER TABLE … ADD
+				// EXCLUDE build (non-unique, checkDup=true) also captures it.
 				entry.KeyDesc = btreeBuildKeyDescription(idx, cols, row, false)
 			}
 			entries = append(entries, entry)
@@ -13269,13 +13312,30 @@ func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols
 	// the entries by key before inserting, so we sort here
 	// (matching its convention) and walk adjacencies for the
 	// unique check.
-	if unique && len(entries) > 1 {
+	//
+	// checkDup (M0134-0005af) widens this from `unique`-only: an `ALTER TABLE
+	// … ADD EXCLUDE (col WITH =)` build is non-unique (idx.Unique stays
+	// false — an exclusion constraint is not a unique constraint) but must
+	// still reject pre-existing conflicting rows, exactly like PG's
+	// check_exclusion_or_unique_constraint (execIndexing.c:893-918) does for
+	// both index kinds via its shared `newIndex` branch.
+	if checkDup && len(entries) > 1 {
 		// di is the index of the second entry of the first adjacent duplicate
 		// pair; both carry the same rendered key description, so either renders
 		// PG's `Key (…)=(…) is duplicated.` DETAIL (comparetup_index_btree,
 		// tuplesortvariants.c:1686-1693). No errposition — Pos stays 0.
 		// M0134-0002 C3 slice 2.
 		if di := sortBuildEntriesFindDuplicate(o.ctx.pgIndexKeyDesc(idx), entries); di >= 0 {
+			if idx.IsExclusion {
+				// PG's exclusion-constraint build-time DETAIL needs BOTH
+				// sides of the conflict (execIndexing.c:908-916:
+				// `errdetail("Key %s conflicts with key %s.", error_new,
+				// error_existing)`), unlike the one-sided unique-index
+				// wording above. M0134-0005af.
+				return nil, &ExecError{Code: "23P01", Pos: 0,
+					Message: fmt.Sprintf("could not create exclusion constraint %q", indexName),
+					Detail:  entries[di-1].KeyDesc + " conflicts with key " + entries[di].KeyDesc[len("Key "):] + "."}
+			}
 			return nil, &ExecError{Code: "23505", Pos: 0,
 				Message: fmt.Sprintf("could not create unique index %q", indexName),
 				Detail:  entries[di].KeyDesc + " is duplicated."}
@@ -18241,7 +18301,7 @@ func (o *ddlOp) materializeView(tbl *catalog.Table, selectPlan optimizer.Node) e
 				}
 			}
 			idxName := idx.QualifiedName()
-			if err := o.bulkBuildBTreeFull(idx, idxRel, tbl, cols, resolveIndexKeyExprs(tbl, idx), idx.Unique, idx.NullsNotDistinct, idxName, 0, nil); err != nil {
+			if err := o.bulkBuildBTreeFull(idx, idxRel, tbl, cols, resolveIndexKeyExprs(tbl, idx), idx.Unique, idx.Unique, idx.NullsNotDistinct, idxName, 0, nil); err != nil {
 				return err
 			}
 		}
