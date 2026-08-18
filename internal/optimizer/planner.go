@@ -9888,6 +9888,12 @@ func rewriteInsertDefaultMarkers(s *parser.InsertStmt, cat catalog.Catalog) erro
 	// derivation so DEFAULT substitution sees the same mapping the
 	// planner will use.
 	var colIndex []int
+	// explicitColCount tracks how many cells the user's own VALUES rows are
+	// expected to supply BEFORE any M0134-0005j column-list extension below.
+	// A row whose length doesn't match this is a genuine user arity error
+	// (e.g. `INSERT INTO t(a,b) VALUES(1)`) and must fall through to
+	// planInsert's 42601 diagnostic rather than be silently DEFAULT-padded.
+	explicitColCount := 0
 	if len(s.Columns) == 0 {
 		colIndex = make([]int, 0, len(tbl.Columns))
 		for i, col := range tbl.Columns {
@@ -9905,6 +9911,37 @@ func rewriteInsertDefaultMarkers(s *parser.InsertStmt, cat catalog.Catalog) erro
 				return nil
 			}
 			colIndex = append(colIndex, col.Ordinal)
+		}
+		explicitColCount = len(colIndex)
+		// M0134-0005j: a column omitted from an EXPLICIT column list must
+		// still get its DEFAULT evaluated through the normal planner/
+		// executor path, exactly like the no-column-list padding above
+		// already does for trailing columns. Mirrors PostgreSQL's
+		// transformInsertStmt, which fills omitted columns from pg_attrdef
+		// at parse-analysis time (postgres/src/backend/parser/analyze.c).
+		// Append such columns to both the column list and colIndex here;
+		// the row-padding step below then adds a DefaultMarker cell per
+		// appended column and the substitution loop fills it with
+		// col.DefaultExpr, same as any other DEFAULT cell.
+		//
+		// Serial/identity columns are deliberately NOT appended here:
+		// catalog.Column.DefaultExpr is left nil for them by convention
+		// (see defaultMarkerReplacement's doc comment) — the executor's
+		// autoGenerateSerialValues remains authoritative for OMITTED
+		// serial/identity columns, so keying strictly on DefaultExpr != nil
+		// avoids a double sequence advance (§17.3 decision 3). GENERATED
+		// ALWAYS AS columns are excluded too — they are computed by
+		// computeGeneratedColumns, not substituted here (§17.3 decision 5).
+		present := make(map[int]bool, len(colIndex))
+		for _, ord := range colIndex {
+			present[ord] = true
+		}
+		for i, col := range tbl.Columns {
+			if present[i] || col.GeneratedAlways || col.DefaultExpr == nil {
+				continue
+			}
+			s.Columns = append(s.Columns, col.Name)
+			colIndex = append(colIndex, i)
 		}
 	}
 	// M0103-0007 rung 17: expand `INSERT … DEFAULT VALUES` into a
@@ -9927,6 +9964,22 @@ func rewriteInsertDefaultMarkers(s *parser.InsertStmt, cat catalog.Catalog) erro
 			padded := make([]parser.Expr, len(colIndex))
 			copy(padded, r)
 			for i := len(r); i < len(colIndex); i++ {
+				padded[i] = &parser.DefaultMarker{}
+			}
+			s.Rows[ri] = padded
+			r = padded
+		}
+		// M0134-0005j: explicit column list extended above with omitted
+		// DEFAULT-bearing columns — pad each row (whose length still
+		// matches the user's ORIGINAL explicit list) with a DefaultMarker
+		// per appended column. A row that does NOT match explicitColCount
+		// is a genuine user arity error and must NOT be padded here; it
+		// falls through to the len(r) != len(colIndex) check below and
+		// planInsert's 42601 diagnostic.
+		if explicitColCount > 0 && len(r) == explicitColCount && len(colIndex) > explicitColCount {
+			padded := make([]parser.Expr, len(colIndex))
+			copy(padded, r)
+			for i := explicitColCount; i < len(colIndex); i++ {
 				padded[i] = &parser.DefaultMarker{}
 			}
 			s.Rows[ri] = padded

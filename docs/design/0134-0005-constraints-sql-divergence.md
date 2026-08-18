@@ -1203,3 +1203,108 @@ it.
 Deferred, ledgered 2026-08-18: bucket 2 (`DEFAULT … currval()` → NULL, the successor
 slice), a missing `NO INHERIT` cascade-skip negative guard, and the surviving
 partition-ATTACH `convalidated` + independent `COMMENT ON CONSTRAINT` wording lines.
+
+## 17. M0134-0005j — a column omitted from an *explicit* INSERT column list loses its DEFAULT
+
+### 17.1 Why this slice
+
+Bucket 2 of the §16.1 measured census: the largest remaining **silent wrong-answer**
+bucket. Probe: `tmp/ralph-handoffs/m0134-0005j-probe`.
+
+`constraints.sql` declares
+
+```sql
+CREATE TABLE INSERT_TBL (
+  x INT DEFAULT nextval('insert_seq'),
+  y TEXT DEFAULT '-NULL-',
+  z INT DEFAULT -1 * currval('insert_seq'),
+  CONSTRAINT INSERT_CON CHECK (x >= 3 AND y <> 'check failed' AND x < 8),
+  CHECK (x + z = 0));
+```
+
+On goopg `INSERT INTO INSERT_TBL(y) VALUES('Y')` leaves `z` **NULL** with no error.
+That is wrong twice over: the SELECT output is corrupt, and `CHECK (x + z = 0)`
+then *accepts the violating row*, because a NULL operand makes the predicate NULL
+and PG rejects only FALSE (`postgres/src/backend/executor/execMain.c:ExecConstraints`).
+goopg's own `checkConstraints` (`internal/executor/operators_fk.go:1699`) already
+implements that NULL-passes rule correctly — so the constraint layer is **not** at
+fault, and the previously-suspected "CHECK is broken" reading is refuted. Measured
+attribution: ~26 lines of the 1122-line `constraints` diff (~24 for the NULL, ~2 for
+the `currval` off-by-one below).
+
+### 17.2 Root cause — a planner gap, not an evaluator gap
+
+goopg has **two** default-expression evaluators, and the crippled one is reached only
+for one statement shape:
+
+- **Working path.** `internal/optimizer/planner.go:157-165` (`planStmt`, `*parser.InsertStmt`)
+  calls `rewriteInsertDefaultMarkers` (`planner.go:9876`) *before* `analyzer.Analyze`,
+  substituting `col.DefaultExpr` straight into the INSERT target list. The analyzer
+  then binds it like any other cell, so at run time the ordinary
+  `evalExpr(…, ctx)` (`internal/executor/expr.go:331`) evaluates it — `currval`
+  works, because it is just a normal function call.
+- **Broken path.** That rewrite only pads omitted trailing columns when
+  `len(s.Columns) == 0` (`planner.go:9922-9934`). With an **explicit** column list
+  that omits a column, `colIndex` is built purely from `s.Columns`
+  (`planner.go:9899-9909`) and the omitted column never enters the target list at
+  all. `insertOp` therefore patches it after the fact via `applyDefaultsForMissing`
+  (`internal/executor/operators_generated.go`), a hand-rolled mini-AST-walker
+  inherited from the `GENERATED ALWAYS AS` feature. Its `evalGenFuncCall`
+  (`operators_generated.go:193-240`) special-cases only `nextval` and zero-arg
+  builtins; **every other function call falls through to `return NullDatum, nil`**
+  at `:239` — silently, no error. `evalGenBinary` (`:243`) then multiplies NULL and
+  also yields NULL.
+
+So the failure is not "`currval` is unimplemented" — it is that a *second, permanently
+incomplete* evaluator exists at all. Cause (b) of the probe's four candidates;
+(a) parse/store, (c) `currval` itself, and (d) arithmetic were each ruled out by
+narrowing (`DEFAULT currval('s')` alone reproduces; `INSERT ... DEFAULT VALUES`
+on the same table yields the correct `-1`, because it takes the working path).
+
+**Secondary bug, same mechanism.** The mini-evaluator's inline `nextval` handling
+calls `s.nextVal()` directly, bypassing `evalNextval`
+(`internal/executor/operators_sequence.go:639-689`) and therefore never writing
+`ctx.CurrSeqVals` (`internal/executor/context.go:462`), which `evalCurrval`
+(`:694-710`) reads. The regress diff shows `currval('insert_seq')` returning 7 where
+PG returns 8. Routing through the planner fixes this for free — no separate change.
+
+### 17.3 Design decisions taken before briefing
+
+1. **Fix the planner, not the mini-evaluator.** Adding `currval` to
+   `evalGenFuncCall` would be ~10 lines and would leave a second evaluator that
+   silently NULLs the *next* unhandled builtin. That is this project's Rule-#2
+   sibling-drift trap in its purest form (a silent wrong answer, not an error), and
+   it is explicitly rejected. Extending `rewriteInsertDefaultMarkers` to the
+   explicit-column-list-omits-a-column shape retires `applyDefaultsForMissing` for
+   **both** INSERT call sites (`operators_storage.go:2440`,
+   `operators_upsert.go:213`) at once, and fixes the `currval` session-state bug as
+   a side effect.
+2. **The two INSERT sites are a Rule-#2 twin pair.** Plain INSERT and
+   `INSERT … ON CONFLICT` share the gap (already noted as siblings in the `root-0020`
+   comment at `operators_upsert.go:199-205`). Both must be covered by tests; the
+   plan-time fix covers both by construction, which is a further argument for it.
+3. **Serial/identity interaction is the live hazard.** A `serial` column's
+   `DefaultExpr` *is* `nextval(...)`, and `autoGenerateSerialValues` also fills such
+   columns at run time. Substituting at plan time must not cause a **double
+   advance** of the sequence. This is the slice's primary regression risk and gets an
+   explicit guard test.
+4. **The apply worker is out of scope and deferred.** `applyworker.go:286` decodes
+   binary pgoutput tuples and has no SQL statement for the planner to rewrite, so it
+   is the one call site that would need a runtime bind-and-eval
+   (the `checkConstraints` synthetic-SELECT + Plan pattern, `operators_fk.go:1699`).
+   Ledgered, not bundled.
+5. **`computeGeneratedColumns` keeps its own swallow.** It shares the evaluator and
+   also discards errors (`operators_generated.go:33-47`); GENERATED semantics are a
+   different question from DEFAULT and are not re-litigated here. Ledgered.
+
+### 17.4 Separately discovered, out of scope
+
+- `internal/executor/copy.go:323` `insertSourceRow` never calls
+  `applyDefaultsForMissing` at all: **COPY with a partial column list drops every
+  DEFAULT expression**, not merely function calls. It contributes 0 lines to this
+  diff (`constraints.sql`'s `COPY_TBL` has no DEFAULTs), but it is a larger
+  independent gap. Ledgered.
+- The same `@@ -162,107 +160,101 @@` hunk also bundles three unrelated, unresearched
+  bugs: inherited-CHECK naming/enforcement on `INSERT_CHILD` (~19 lines), `tableoid`
+  inside a CHECK (~15 lines), and missing DDL-time rejection of `ctid` in a CHECK
+  (~5 lines). Deliberately not conflated.
