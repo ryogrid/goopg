@@ -1189,6 +1189,48 @@ repro at HEAD first; the log reflects the last nightly and may be stale).
       `RALPH_PRECOMMIT_SCOPE=units` PASS, pre-commit pgbench smoke.
       Evidence: `ci/logs/20260817-011734/testport/go-test.log`.
 
+- [x] **testport/TestPort_IsolationReindexConcurrently
+      (AI-20260819-011823-001)** — **FIXED 2026-08-19.** Reproduced at HEAD
+      (byte-identical to the nightly log), so not stale and not flaky.
+      **`REINDEX ... CONCURRENTLY` waited for concurrent lockers AFTER building
+      the shadow index — the reverse of PG's phase order.** PG runs
+      `WaitForLockersMultiple(lockTags, ShareLock, true)`
+      (`postgres/src/backend/commands/indexcmds.c:4088`) *before*
+      `index_concurrently_build` (`:4111`); goopg built first, so
+      `buildIndexShadow` → `collectBTreeEntries` heap-scanned the table while the
+      spec's concurrent **uncommitted** INSERT was still in flight.
+      `isLiveForUniqueCheck` (`operators_storage.go`) correctly counts an active
+      xmin as live, so the build saw a duplicate and raised a spurious
+      `23505 could not create unique index "reind_con_tab_pkey"` before the wait
+      that should have blocked ever executed — shifting every subsequent line by
+      one in all 4 permutations. Fix (1 source file,
+      `internal/executor/operators_reindex.go`): move
+      `waitForRelationLockers(tblRel)` above the build in **both** twins —
+      `rebuildIndexConcurrently` and `rebuildTableIndexesConcurrently` (still one
+      wait per table, now before the shadow-build loop; the post-wait shadow
+      cleanup became dead code and the non-btree early-out moved to the top, its
+      condition character-identical to `buildIndexShadow`'s own guard).
+      `waitForRelationLockers` (`context.go`) needed no change — it already polls
+      `tableLockMgr.Holders` at 10 ms and honours 57014, and it genuinely blocks,
+      which matters because the isolation runner decides `<waiting>` purely by a
+      300 ms timeout. **Not a regression from this week's work:** the test was
+      ported 2026-06-22 (`05122fde`) when REINDEX CONCURRENTLY was catalog-only
+      and passed trivially; `c8703d08` (2026-07-09) added the real build and broke
+      it silently six weeks before the nightly attributed it — *a test that passed
+      while the feature under it was a no-op proved nothing about the feature*.
+      2 ledger rows: PG's phase-3 second wait + `validate_index` scan still absent
+      (narrowed, not closed), and `CREATE INDEX CONCURRENTLY` carries the same
+      build-before-wait defect (own slice — different structure, no spec covers
+      it). Design `0122-0007-reindex-physical-rebuild.md` gained a "Phase order
+      corrected" section (its old "wait position unchanged, timing preserved"
+      claim was false) + README row. Gates: `TestPort_IsolationReindexConcurrently`
+      FAIL-pre → PASS-post (4/4), `TestPort_IsolationReindexConcurrentlyToast`
+      PASS, whole `^TestPort_IsolationReindex` family PASS,
+      `go test ./internal/executor/` PASS, `go build ./...` + `go vet` clean,
+      `RALPH_PRECOMMIT_SCOPE=units` PASS (7m46s),
+      `scripts/tpch-spotcheck.sh` PASS (**Q12=2, Q13=35**), pgbench smoke via hook.
+      Evidence: `ci/logs/20260819-011823/testport/go-test.log`.
+
 Non-blocking notice (no task): 17 `TestPort_Psql*`/`TestPort_Scripts*`/
 `TestPort_Pgbench*` cases newly SKIPPED vs the previous run — env-drift, expected
 on partial `NIGHTLY_STAGES` runs; harvest on a full run.

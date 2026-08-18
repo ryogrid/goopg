@@ -181,11 +181,11 @@ one. goopg's simpler equivalent, reusing pieces already on hand:
   file before it is considered swap-eligible.
 - **Wait.** Exactly the pre-existing `waitForRelationLockers` call this file
   already made for `CONCURRENTLY` before this follow-up — unchanged in
-  position, target relation, or semantics, so `reindex-concurrently.spec`'s
-  session-interleaving assertions (which key off this wait's exact timing)
-  are unaffected. `TABLE`/`SCHEMA` still make exactly ONE such call per
-  table (`rebuildTableIndexesConcurrently` builds every index's shadow
-  first, waits once, then swaps each), not one per index.
+  target relation and semantics. `TABLE`/`SCHEMA` make exactly ONE such call
+  per table, not one per index. **Its POSITION was wrong and was corrected on
+  2026-08-19 — see the "Phase order" amendment below; the claim this bullet
+  originally made (that leaving the wait after the build preserved
+  `reindex-concurrently.spec`'s timing) was false.**
 - **Swap.** `swapRelationPhysicalFile` (`operators_ddl.go`) atomically
   replaces the live index's on-disk file with the shadow file via
   `os.Rename` (same filesystem ⇒ atomic — a crash on either side of the
@@ -234,6 +234,62 @@ careful to preserve actually held); `scripts/tpch-spotcheck.sh` PASS
 (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh`
 PASS (0 failed txns, all 3 pgbench workloads).
 
+## Phase order corrected: wait BEFORE build, not after (2026-08-19, AI-20260819-011823-001)
+
+The 2026-07-09 follow-up above added the physical rebuild but left
+`waitForRelationLockers` where the catalog-only implementation had put it —
+*after* the build. That is the reverse of PostgreSQL's order and it is not a
+cosmetic difference:
+
+| phase | PG 18.3 `ReindexRelationConcurrently` (`indexcmds.c`) | goopg before | goopg after |
+|---|---|---|---|
+| wait for conflicting lockers | `WaitForLockersMultiple(lockTags, ShareLock, true)` — `:4088` | 2nd | **1st** |
+| build the new index | `index_concurrently_build` — `:4111` | 1st | 2nd |
+| 2nd wait + validation scan | `:4147` + `validate_index` | absent | **still absent (deferred)** |
+| wait + swap under AccessExclusive | `:4313`/`:4355`, `index_concurrently_swap` | present | present |
+
+Building first meant the shadow build's heap scan ran *while* a concurrent
+uncommitted writer was still in flight. `isLiveForUniqueCheck`
+(`operators_storage.go`) correctly counts a tuple whose `xmin` belongs to an
+active transaction as live, so the build saw the uncommitted row as a
+duplicate and raised a spurious `23505 could not create unique index "…"`
+(`operators_ddl.go`, inside `collectBTreeEntries`) — **before** the wait that
+should have blocked until that writer finished ever executed. PG never sees
+this because the writer is already committed or aborted by the time its build
+scan starts.
+
+Fix (`operators_reindex.go`): move `o.ctx.waitForRelationLockers(tblRel)` above
+`buildIndexShadow` in **both** twins — `rebuildIndexConcurrently` (INDEX form)
+and `rebuildTableIndexesConcurrently` (TABLE/SCHEMA form, still one wait per
+table, now before the shadow-build loop). Two consequences of the reorder:
+the non-btree early-out moved to the top of `rebuildIndexConcurrently` (the
+condition is character-identical to `buildIndexShadow`'s own `built=false`
+guard, so behaviour is unchanged — a non-btree index still returns without
+waiting, as before); and the post-wait shadow-cleanup branch in the
+TABLE/SCHEMA form became dead code and was removed, since no shadow exists
+yet when the wait runs.
+
+`waitForRelationLockers` (`context.go`) needed no change: it already is a
+faithful `WaitForLockers` analog — it polls `tableLockMgr.Holders(tag)` at
+10 ms and honours query cancellation (57014), and it genuinely blocks, which
+matters because the isolation runner decides `<waiting ...>` purely by a
+300 ms timeout, so nothing cosmetic could have passed this spec.
+
+**Why it took six weeks to surface:** `TestPort_IsolationReindexConcurrently`
+was ported 2026-06-22 (`05122fde`) when `REINDEX CONCURRENTLY` was
+catalog-only, so it passed trivially — with no real build there was no scan to
+race. `c8703d08` (2026-07-09, this document's follow-up) introduced the real
+build and broke it silently; the nightly batch first attributed the failure on
+2026-08-19 (`AI-20260819-011823-001`). The general lesson: **a test that passed
+while the feature under it was a no-op proves nothing about the feature.**
+
+Gates: `TestPort_IsolationReindexConcurrently` FAIL-pre → PASS-post (all 4
+permutations, `<waiting ...>` then `<... completed>`);
+`TestPort_IsolationReindexConcurrentlyToast` PASS; the whole
+`^TestPort_IsolationReindex` family PASS; `go test ./internal/executor/` PASS;
+`go build ./...` + `go vet ./internal/executor/` clean.
+
+
 ## Deferral
 
 `REINDEX SCHEMA CONCURRENTLY`'s per-table wait/swap loop does not re-validate
@@ -244,6 +300,16 @@ loop" concurrent-drop tolerance is covered (a table dropped while an
 in-flight table's own build/wait/swap window is untested and unhandled,
 mirroring a gap that already existed for the wait phase alone before this
 follow-up. `REINDEX ... CONCURRENTLY`'s single-scan-without-revalidation
-limitation (previous paragraph) is the other open item from this slice. Also
+limitation is the other open item from this slice: PG's phase-3 second wait +
+`validate_index` scan is still absent after the 2026-08-19 phase-order fix, so
+a write landing *during* the shadow build's heap scan is still not guaranteed
+to reach the rebuilt index. `CREATE INDEX CONCURRENTLY`
+(`operators_ddl.go`, `DefineIndex` analog) carries the SAME build-before-wait
+defect the 2026-08-19 amendment fixed for `REINDEX` — PG waits first there too
+(`indexcmds.c` `WaitForLockers` at `:1685`, before `index_concurrently_build`
+at `:1709`) — but its structure diverges enough (txn-slot snapshot +
+`WaitForSlotsToCommit`, live-index build rather than a shadow file,
+single-transaction rather than PG's commit cycle) that reordering it is its own
+slice; no isolation spec currently covers it. Also
 carried forward unchanged from the parent M0122-0007 bucket: `CREATE`/`DROP
 DATABASE` full DDL, tablespace physical relocation.
