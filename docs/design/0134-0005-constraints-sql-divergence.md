@@ -3284,3 +3284,96 @@ Guards (FAIL-pre / PASS-post) in
 `TestAlterTableAddPrimaryKeyOnPartitionedParentScansPartitions`, plus the
 over-fix guard `TestAlterTableSetNotNullAndValidateStillSucceedWithoutNulls`
 (a plain table with no NULLs must still succeed).
+
+---
+
+## 37. M0134-0005ad — two NOT-NULL constraint checks that the *direct* path performed and the *derived* path skipped (LANDED 2026-08-19)
+
+Bucket E of the 19-hunk census. Two hunks, two insertion points, one shared
+shape: **goopg had the correct check, and simply did not run it on the second
+code path that reaches the same state.** This is Hard-won Rule #2 (sibling paths
+must change together) in its least obvious form — the twins here are not
+encode/decode or fast-path/interpreted, but *direct target* vs *recursion
+target*, and *first column* vs *later column of the same statement*.
+
+### 37.1 E1 — the NO-INHERIT mismatch check ran once, but PG runs it per level
+
+`ALTER TABLE … ADD CONSTRAINT nn NOT NULL a` on a parent whose child already
+holds a **NO INHERIT** not-null constraint on `a` must be rejected with 55000.
+goopg's `AlterTableAddNotNull` (`internal/executor/operators_ddl.go:10345-10378`)
+already raised exactly that error — but only for the relation named in the
+`ALTER`. The cascade helper `cascadeNotNullToChildrenAt` (~:11793) then walked
+into each child and, on finding a same-column constraint, blindly did
+`InhCount++` with no re-check.
+
+PG has no such asymmetry because the check is *inside the recursion*:
+`ATAddCheckNNConstraint` recurses over the inheritance children
+(`postgres/src/backend/commands/tablecmds.c:10012-10043`) and every level lands
+in `AddRelationNewConstraints`' `CONSTR_NOTNULL` branch
+(`catalog/heap.c:2609-2662`) → `AdjustNotNullInheritance`
+(`catalog/pg_constraint.c:741-767`). Each level therefore re-validates against
+*that* level's own constraint.
+
+The fix re-runs the mismatch test on the recursion target before the
+`InhCount++`, reusing the message/HINT literal from the direct-target site, but
+naming **`child`**. That relation-naming detail is the same one §36.4 forced:
+PG's error names the relation that actually holds the conflicting object, not
+the ALTER target.
+
+The hunk carried a second `+ERROR` line ("cannot drop inherited constraint")
+further down the script. It needed no separate fix — it was a **downstream
+consequence of the false merge**: the bogus `InhCount++` made a local
+constraint look inherited, so the later `DROP CONSTRAINT` was wrongly refused.
+One cause, two visible errors.
+
+### 37.2 E2 — a duplicate constraint name within a single `CREATE TABLE`
+
+Two columns of one `CREATE TABLE` naming the same NOT NULL constraint must give
+42710. PG gets this for free because `AddRelationNewConstraints` runs
+`ConstraintNameIsUsed` (`pg_constraint.c:412`) per constraint against the
+catalog rows written by the *preceding* constraints of the same statement.
+goopg's `execCreateTable` per-column loop (~:4200) took the explicit name
+unconditionally. The fix calls the existing `fkConstraintNameInUse` helper
+(:7814-7836 — misleadingly named; it already scans FKs, CHECKs, indexes and
+not-nulls) and raises PG's literal.
+
+### 37.3 The non-transactional-DDL trap this exposed
+
+The obvious one-line fix produced a **new** diff line rather than closing the
+hunk. `execCreateTable` calls `Catalog.CreateTable` *before* processing column
+constraints, and that registration is not transactional — so rejecting the
+statement left a phantom relation behind, and the script's next
+`CREATE TABLE notnull_tbl2 (…)` then failed with a spurious 42P07.
+
+PG never has this problem: `heap_create_with_catalog` also runs before
+`AddRelationNewConstraints`, but the whole utility statement is inside one
+transaction that the `ereport` aborts. goopg's DDL has no such rollback, so the
+error path must undo the registration explicitly
+(`_ = o.ctx.Catalog.DropTable(...)`, the same compensating-drop idiom already
+used at :1712 and :18920).
+
+**Generalisation worth carrying:** every error return in `execCreateTable`
+positioned *after* `Catalog.CreateTable` leaks a phantom relation unless it
+compensates. This slice fixed the one path a regress case exercises; the class
+is ledgered (§37.5).
+
+### 37.4 Measurement
+
+**381 → 360 lines, 19 → 18 hunks.** Both bucket-E hunks closed, no new `@@`
+header, nothing unmasked. Baseline is HEAD `dceb22df` — never compare against a
+pre-2026-08-19 number.
+
+Guards (FAIL-pre / PASS-post, both verified by stashing the fix) in
+`internal/executor/operators_ddl_notnull_cascade_dup_test.go`:
+`TestAlterTableAddNotNullCascadeNoInheritMismatchRejected` and
+`TestCreateTableDuplicateExplicitNotNullNameRejected`.
+
+### 37.5 Deferred (ledgered 2026-08-19)
+
+- `CREATE TABLE … INHERITS (…)`'s merge path (`mergeNotNullEntries`) has the
+  same missing NO-INHERIT mismatch check as E1, at CREATE time instead of ALTER
+  time. No regress case exercises it, so it is inert today and nothing flips
+  when it lands.
+- The phantom-relation class of §37.3: the remaining post-`CreateTable` error
+  returns in `execCreateTable` still leave a registered relation behind. The
+  durable fix is transactional DDL, not more compensating drops.

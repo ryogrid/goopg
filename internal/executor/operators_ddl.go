@@ -4198,6 +4198,26 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				// name. §26.4.
 				isLocal = true
 				if mergedName != "" {
+					// heap.c:2645-2652 (ConstraintNameIsUsed check inside
+					// AddRelationNewConstraints' CONSTR_NOTNULL branch) — an
+					// explicit name must not collide with any constraint
+					// already recorded on this table, including a not-null
+					// constraint added for an earlier column in this same
+					// CREATE TABLE. Bare ereport, no errposition.
+					// M0134-0005ad E2.
+					if o.fkConstraintNameInUse(tbl, mergedName) {
+						// The table was already registered by CreateTable
+						// above (heap_create_with_catalog runs before
+						// AddRelationNewConstraints in PG too, but PG's whole
+						// CREATE TABLE runs inside one transaction that
+						// aborts on this ereport, leaving no relation
+						// behind) — undo the registration so a rejected
+						// CREATE TABLE leaves no phantom relation, matching
+						// PG and letting a same-named retry succeed.
+						_ = o.ctx.Catalog.DropTable(s.Name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+						return &ExecError{Code: "42710", Pos: 0,
+							Message: fmt.Sprintf("constraint %q for relation %q already exists", mergedName, tbl.Name)}
+					}
 					name = mergedName
 				} else {
 					name = childAutoName
@@ -11773,6 +11793,20 @@ func (o *ddlOp) cascadeNotNullToChildrenAt(im *catalog.InMemory, tbl *catalog.Ta
 		merged := false
 		for i := range child.NotNullConstraints {
 			if strings.EqualFold(child.NotNullConstraints[i].ColName, colName) {
+				// PG re-runs AdjustNotNullInheritance's NO INHERIT mismatch
+				// check on every recursion level (pg_constraint.c:741-767),
+				// via ATAddCheckNNConstraint recursing into children
+				// (tablecmds.c:10012-10043). The constraint being cascaded
+				// down is always inheritable (callers only invoke this
+				// cascade for !act.NoInherit constraints), so a mismatch
+				// means the child already holds a NO INHERIT constraint of
+				// this name. M0134-0005ad E1.
+				if child.NotNullConstraints[i].NoInherit {
+					return &ExecError{Code: "55000", Pos: 0,
+						Message: fmt.Sprintf("cannot change NO INHERIT status of NOT NULL constraint %q on relation %q",
+							child.NotNullConstraints[i].Name, child.Name),
+						Hint: "You might need to make the existing constraint inheritable using ALTER TABLE ... ALTER CONSTRAINT ... INHERIT."}
+				}
 				child.NotNullConstraints[i].InhCount++
 				merged = true
 				break
