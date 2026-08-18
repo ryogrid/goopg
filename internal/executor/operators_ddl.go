@@ -9930,6 +9930,56 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				return &ExecError{Code: "42703", Pos: act.Pos(),
 					Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
 			}
+			// Existing-constraint lookup + PG's three ordered
+			// AdjustNotNullInheritance checks (postgres/src/backend/catalog/
+			// pg_constraint.c:741, ~:761/:773/:788, reached from
+			// AddRelationNewConstraints's CONSTR_NOTNULL branch via
+			// ATAddCheckNNConstraint) run BEFORE the 23502 null-value table
+			// scan below — in PG these checks happen at constraint-registration
+			// time (AddRelationNewConstraints), before ATRewriteTable's later
+			// phase-3 validation scan, so an incompatible existing constraint
+			// is reported even over a table with no NULLs and even when the
+			// table WOULD also fail the null scan. All three are 55000
+			// ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE. M0134-0005n D1.
+			hasNN := false
+			nnName := ""
+			var existingNN *catalog.NamedNotNullConstraint
+			for i := range tbl.NotNullConstraints {
+				if strings.EqualFold(tbl.NotNullConstraints[i].ColName, act.ColumnName) {
+					hasNN = true
+					nnName = tbl.NotNullConstraints[i].Name
+					existingNN = &tbl.NotNullConstraints[i]
+					break
+				}
+			}
+			if hasNN && existingNN != nil {
+				// Check 1: NO INHERIT mismatch (pg_constraint.c:761-767).
+				if act.NoInherit != existingNN.NoInherit {
+					return &ExecError{Code: "55000", Pos: act.Pos(),
+						Message: fmt.Sprintf("cannot change NO INHERIT status of NOT NULL constraint %q on relation %q",
+							existingNN.Name, tbl.Name),
+						Hint: "You might need to make the existing constraint inheritable using ALTER TABLE ... ALTER CONSTRAINT ... INHERIT."}
+				}
+				// Check 2: existing NOT VALID but caller wants a valid one
+				// (pg_constraint.c:773-779). existingNN.NotValid true means
+				// convalidated=false (not yet validated).
+				if !act.NotValid && existingNN.NotValid {
+					return &ExecError{Code: "55000", Pos: act.Pos(),
+						Message: fmt.Sprintf("incompatible NOT VALID constraint %q on relation %q",
+							existingNN.Name, tbl.Name),
+						Hint: "You might need to validate it using ALTER TABLE ... VALIDATE CONSTRAINT."}
+				}
+				// Check 3: explicit differing name (pg_constraint.c:788-795).
+				// Fires only for an explicitly user-given name (PG's is_local &&
+				// new_conname); an omitted name is a silent no-op.
+				if act.ConstraintName != "" && act.ConstraintName != existingNN.Name {
+					return &ExecError{Code: "55000", Pos: act.Pos(),
+						Message: fmt.Sprintf("cannot create not-null constraint %q on column %q of table %q",
+							act.ConstraintName, act.ColumnName, tbl.Name),
+						Detail: fmt.Sprintf("A not-null constraint named %q already exists for this column.",
+							existingNN.Name)}
+				}
+			}
 			// Scan existing rows for NULLs BEFORE mutating in-memory state (same
 			// 23502 scan as SET NOT NULL; NOT VALID defers validation, mirroring
 			// PG's skip_validation). M0134-0002 C3 slice 1.
@@ -9946,16 +9996,8 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			}
 			tbl.Columns[colIdx].NotNull = true
 			// Idempotent: a column already carrying a NOT NULL constraint is left
-			// as-is (PG raises no error and adds no duplicate row).
-			hasNN := false
-			nnName := ""
-			for _, nc := range tbl.NotNullConstraints {
-				if strings.EqualFold(nc.ColName, act.ColumnName) {
-					hasNN = true
-					nnName = nc.Name
-					break
-				}
-			}
+			// as-is (PG raises no error and adds no duplicate row); the checks
+			// above already rejected any incompatible re-specification.
 			if !hasNN {
 				if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 					name := act.ConstraintName
@@ -10340,6 +10382,18 @@ func (o *ddlOp) execAlterTableAddColumn(stmt *parser.AlterTableStmt, tbl *catalo
 		if n > 0 {
 			return &ExecError{Code: "0A000", Pos: act.Pos(), Message: "ALTER TABLE ADD COLUMN ... NOT NULL is only supported on empty tables"}
 		}
+		// M0134-0005n D2: an explicit inline `CONSTRAINT name NOT NULL` name
+		// already used on this relation is 42710 ERRCODE_DUPLICATE_OBJECT
+		// (postgres/src/backend/catalog/heap.c:AddRelationNewConstraints,
+		// ~:2641-2652, the ConstraintNameIsUsed check inside CONSTR_NOTNULL).
+		// Raised BEFORE the column is added so a rejected statement leaves no
+		// phantom column. goopg's parser keeps the name inline on the
+		// ColumnDef rather than splitting it into a synthesized
+		// AT_AddConstraint subcommand the way PG's parse_utilcmd.c does.
+		if col.NotNullConstraintName != "" && o.fkConstraintNameInUse(tbl, col.NotNullConstraintName) {
+			return &ExecError{Code: "42710", Pos: act.Pos(),
+				Message: fmt.Sprintf("constraint %q for relation %q already exists", col.NotNullConstraintName, tbl.Name)}
+		}
 	}
 	newCol := catalog.Column{
 		Name:        col.Name,
@@ -10359,6 +10413,22 @@ func (o *ddlOp) execAlterTableAddColumn(stmt *parser.AlterTableStmt, tbl *catalo
 	}
 	if err := o.addColumnRecursive(tbl, newCol, act, stmt, true); err != nil {
 		return err
+	}
+	// M0134-0005n D2: register the NamedNotNullConstraint row that ADD
+	// COLUMN ... NOT NULL previously never created (design doc §18.6/§21.5).
+	// PG registers a pg_constraint contype='n' row for both the named and
+	// the unnamed inline form (postgres/src/backend/catalog/
+	// heap.c:AddRelationNewConstraints, CONSTR_NOTNULL branch); the
+	// synthesised name matches the spelling every other goopg NOT-NULL path
+	// already produces.
+	if col.NotNull {
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			name := col.NotNullConstraintName
+			if name == "" {
+				name = strings.ToLower(tbl.Name) + "_" + strings.ToLower(col.Name) + "_not_null"
+			}
+			tbl.AddNotNull(name, col.Name, im.AllocOID(), col.NotNullNoInherit, false, true, 0)
+		}
 	}
 	// M0130-S3: sync the new column set to the pg_attribute heap so a
 	// PG standby (and a goopg restart) see the added column. Same

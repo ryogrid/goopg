@@ -1648,3 +1648,170 @@ what the Project-wrap reproduces.
 `COPY FROM` and the upsert insert branch reach the same currval-blind
 `applyDefaultsForMissing` in principle. Neither is exercised by this fixture;
 recorded as a follow-up rather than widened into this slice.
+
+## 21. M0134-0005n — `ALTER TABLE` never validates a NOT-NULL constraint *name*
+
+### 21.1 Why this slice (fresh census, 2026-08-18, HEAD `9ac2ee3d`)
+
+Re-measured with the §1 command
+(`scripts/pg-regress-runner.sh --verbose constraints`, probe
+`tmp/ralph-handoffs/m0134-0005n-census`): **865 lines / 29 hunks**, down from the
+§18.6 933/31 after 0005l+0005m — a clean shrink, no unmasking, no regression.
+**Never compare to a pre-2026-08-18 number.**
+
+Re-ranked, the dominant remaining bucket is a **NOT NULL / PRIMARY KEY
+bookkeeping cluster** (18 of 29 hunks, ~600 lines) that decomposes into six
+sub-bugs. This slice takes sub-bug **1a**, the only one pinned to a specific line
+and the one with the largest masking cascade: a phantom column `b` survives a
+statement PG rejects and then taints three downstream `\d+ notnull_tbl1` blocks.
+The other five (`public.`-qualified sequence deparse; PK not synthesising NOT
+NULL under `INHERITS`/`USING INDEX`; missing NO-INHERIT/drop-PK validation;
+`pg_get_partition_constraintdef` unimplemented; and `get_nnconstraint_info`
+`coninhcount`/`convalidated` drift under multi-level inheritance, ~200 lines and
+the largest *silent* sub-bucket) stay unpinned and are **not** to be briefed
+until each gets its own research pass — the milestone's recurring lesson is to
+size from pinned code, not from the symptom.
+
+### 21.2 The two divergences
+
+Both live in `ALTER TABLE`, both are silent accepts of a statement PG rejects.
+
+**D1 — a differently-named NOT NULL on a column that already has one.**
+Fixture `postgres/src/test/regress/sql/constraints.sql:629`; expected
+`expected/constraints.out:853-854`:
+
+```
+ALTER TABLE notnull_tbl1 ADD CONSTRAINT nn NOT NULL a;
+ERROR:  cannot create not-null constraint "nn" on column "a" of table "notnull_tbl1"
+DETAIL:  A not-null constraint named "notnull_tbl1_a_not_null" already exists for this column.
+```
+
+The statement immediately before it (`:627`, the *same* name re-specified) is a
+successful no-op, and goopg already gets that right — the fix must not disturb it.
+
+**D2 — `ADD COLUMN` with an already-used constraint name.**
+Fixture `constraints.sql:632`; expected `constraints.out:865`:
+
+```
+ALTER TABLE notnull_tbl1 ADD COLUMN b INT CONSTRAINT notnull_tbl1_a_not_null NOT NULL;
+ERROR:  constraint "notnull_tbl1_a_not_null" for relation "notnull_tbl1" already exists
+```
+
+(42710 `ERRCODE_DUPLICATE_OBJECT`.)
+
+### 21.3 PG oracle — and why the two look unrelated in goopg
+
+In PostgreSQL these are **the same code path**. `parse_utilcmd.c` splits
+`ADD COLUMN … CONSTRAINT name NOT NULL` into a synthesised `AT_AddConstraint`
+subcommand, so both shapes converge on
+`tablecmds.c:ATAddCheckNNConstraint` → `heap.c:AddRelationNewConstraints`
+(`heap.c:2385`), which
+
+- for a name already used on the relation raises 42710 from its
+  `ConstraintNameIsUsed` check (`heap.c:~2641-2652`) — this is **D2**; and
+- for a column that already carries a not-null constraint delegates to
+  `pg_constraint.c:AdjustNotNullInheritance` (`:741`), whose three **ordered**
+  checks are — this is **D1**:
+
+| order | condition | message | errcode |
+|---|---|---|---|
+| 1 | `is_no_inherit != conform->connoinherit` | `cannot change NO INHERIT status of NOT NULL constraint "%s" on relation "%s"` (+ HINT) | 55000 |
+| 2 | `!is_notvalid && !conform->convalidated` | `incompatible NOT VALID constraint "%s" on relation "%s"` (+ HINT) | 55000 |
+| 3 | `is_local && new_conname && strcmp(…) != 0` | `cannot create not-null constraint "%s" on column "%s" of table "%s"` (+ DETAIL) | 55000 |
+
+goopg's parser does **not** perform the `ADD COLUMN` → `AT_AddConstraint` split;
+the constraint stays inline on the `ColumnDef`. So the fix cannot be "redirect
+ADD COLUMN into the ADD-CONSTRAINT case" — D2 must be fixed where it lives.
+That asymmetry is the whole reason this reads as two bugs.
+
+### 21.4 goopg state before the slice
+
+- **D1** — `internal/executor/operators_ddl.go:9911-9989`, the
+  `case parser.AlterTableAddNotNull` arm of `execAlterTable` (`:7708`). Its
+  existing duplicate check (`:9948-9958`) is keyed on the **column name only**:
+  it correctly makes a repeat a no-op, but never compares the incoming name,
+  `NoInherit` or `NotValid` against the existing constraint. All **three** checks
+  of §21.3 are missing, not just the name one.
+- **D2** — `internal/executor/operators_ddl.go:10291-10385`,
+  `execAlterTableAddColumn` (line confirmed by re-derivation; the round-1 census
+  of slice 0005k cited a line that proved to be a different function, so this was
+  checked rather than trusted). `col.NotNullConstraintName`
+  (`internal/parser/ast.go:1255`) is never read: there is no duplicate check
+  **and no `NamedNotNullConstraint` row is registered at all**, confirming the
+  §18.6 ledger note. ADD COLUMN … NOT NULL today sets the attribute flag and
+  nothing else.
+- **Reuse, not re-derivation**: `fkConstraintNameInUse`
+  (`operators_ddl.go:7568-7590`) is already goopg's general "name used on this
+  relation" predicate behind other 42710s — D2's check is a call to it.
+  `Table.AddNotNull` (`internal/catalog/catalog.go:254`) is the registration both
+  correct paths already use. `mergeNotNullEntries`/`nnEntry` and the parser's
+  `resolveColumnNotNull` from 0005k are CREATE-TABLE-time only and are **not**
+  reusable here.
+
+### 21.5 Slice boundary
+
+In scope: D1's three ordered checks with PG's verbatim messages/HINTs/DETAIL and
+55000; D2's 42710 duplicate-name check; and registering the missing
+`NamedNotNullConstraint` row in `execAlterTableAddColumn` so ADD COLUMN … NOT
+NULL is catalogued like every other path (PG registers for the named *and*
+unnamed forms; the duplicate-name check applies only to an explicitly given
+name, since PG's `ChooseConstraintName` avoids collisions for synthesised ones).
+
+D1 implements all three checks rather than only the name check the fixture
+exercises. They are one PG function, share the existing-constraint lookup this
+slice adds anyway, and splitting them would guarantee a second visit — the
+milestone has paid that cost twice already.
+
+Out of scope (unpinned; each needs its own research pass first): the five other
+sub-bugs of the §21.1 cluster, in particular `get_nnconstraint_info`'s
+`coninhcount`/`convalidated` drift.
+
+### 21.6 Outcome (LANDED 2026-08-18)
+
+`constraints` regress diff **865 → 845 lines** (−20) at unchanged **29 hunks** —
+no unmasking this time. Both fixture statements now produce PG's ERROR/HINT/DETAIL
+exactly, and the phantom column `b` is gone, so the three downstream `\d+
+notnull_tbl1` blocks match as well.
+
+Landed in `internal/executor/operators_ddl.go` (two call sites, as scoped):
+
+- **D1** — the `parser.AlterTableAddNotNull` arm gained the existing-constraint
+  lookup plus §21.3's three ordered checks with PG-verbatim text. The old
+  column-name-keyed duplicate check was folded into the new lookup rather than
+  left beside it, so there is one source of truth for "does this column already
+  have a not-null constraint".
+- **D2** — `execAlterTableAddColumn` gained the 42710 guard (reusing
+  `fkConstraintNameInUse`) ahead of the column insertion, and a `tbl.AddNotNull`
+  registration afterwards.
+
+**One correction the fixture forced, worth keeping:** the first implementation
+put D1's three checks *after* the pre-existing 23502 null-value scan. That is
+wrong — in PG the checks live in `AddRelationNewConstraints` (constraint
+registration), which runs *before* `ATRewriteTable`'s phase-3 validation scan, so
+an incompatible existing constraint must be reported even over a table with no
+NULLs, and even when the table would *also* fail the null scan. Only the regress
+measurement caught it; the unit tests passed under both orderings. Check ordering
+between a catalog check and a table scan is a real observable, not an
+implementation detail.
+
+Also confirmed: the name-synthesis expression
+(`lower(table)_lower(column)_not_null`) is hand-inlined at five pre-existing sites
+in this file; the new registration matches that convention. Extracting a helper
+across all six is a legitimate cleanup but was deliberately not bundled here.
+
+Guards: 6 new tests in `internal/executor/operators_ddl_addnotnull_name_test.go`
+(each FAIL-pre / PASS-post). `TestAlterTableAddNotNullNamed`
+(`operators_ddl_named_check_test.go`) was found to be **asserting the D1 bug** —
+it required a differently-named second `ADD NOT NULL` to succeed — and was
+corrected; its idempotency assertion was retained under the same-name spelling
+rather than deleted (the §20 lesson about renamed tests silently dropping guards).
+
+Ledgered 2026-08-18: PG reaches `AdjustNotNullInheritance` from every path that
+attaches a not-null to an existing column, so the NOT-VALID incompatibility check
+also belongs on `ALTER TABLE … ADD PRIMARY KEY` and `… ADD GENERATED … AS
+IDENTITY`; goopg still accepts both silently. No fixture hunk witnesses it.
+
+Gates: `go build ./...`; `go test ./internal/{executor,catalog,parser,optimizer}/`;
+`go test -run 'TestPort_.*(NotNull|Constraint|Inherit)' ./internal/testport/`;
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
+`scripts/tpch-spotcheck.sh` PASS (**Q12=2, Q13=35** — Rule #1).

@@ -421,9 +421,10 @@ func TestAlterTableAddNotNullNamed(t *testing.T) {
 		t.Errorf("NOT NULL constraint for a should be conislocal=true")
 	}
 
-	// Idempotent: a second ADD on the same column must not add a duplicate row.
-	if err := runDDL(t, ctx, `ALTER TABLE annt ADD CONSTRAINT other_nn NOT NULL a`); err != nil {
-		t.Fatalf("second ADD NOT NULL a: %v", err)
+	// Idempotent: a second ADD with the SAME name on the same column must not
+	// add a duplicate row (repeat-name no-op, constraints.sql:627).
+	if err := runDDL(t, ctx, `ALTER TABLE annt ADD CONSTRAINT my_nn NOT NULL a`); err != nil {
+		t.Fatalf("second same-name ADD NOT NULL a: %v", err)
 	}
 	count := 0
 	for _, c := range tbl.NotNullConstraints {
@@ -433,6 +434,14 @@ func TestAlterTableAddNotNullNamed(t *testing.T) {
 	}
 	if count != 1 {
 		t.Errorf("idempotent ADD NOT NULL produced %d constraints for a, want 1", count)
+	}
+	// A DIFFERENTLY-named ADD on a column that already has one is rejected
+	// with PG's 55000 (pg_constraint.c:AdjustNotNullInheritance check 3,
+	// constraints.sql:629) — M0134-0005n D1.
+	if err := runDDL(t, ctx, `ALTER TABLE annt ADD CONSTRAINT other_nn NOT NULL a`); err == nil {
+		t.Fatal("differently-named ADD NOT NULL a should be rejected with 55000")
+	} else if ee, ok := err.(*ExecError); !ok || ee.Code != "55000" {
+		t.Errorf("differently-named ADD NOT NULL: err=%v want SQLSTATE 55000", err)
 	}
 
 	// Bare `ADD NOT NULL b` (no CONSTRAINT name) falls back to the auto-name.
