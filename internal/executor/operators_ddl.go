@@ -3847,13 +3847,24 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		if c.CheckExpr != "" {
 			name := c.CheckConstraintName
 			if name == "" {
-				name = tbl.Name + "_" + c.Name + "_check"
+				// PostgreSQL's ChooseConstraintName names a CHECK by the
+				// distinct columns the *expression* references, not the
+				// syntactic column it is attached to: exactly one distinct
+				// column -> "<table>_<col>_check", otherwise "<table>_check"
+				// (postgres/src/backend/catalog/heap.c:2546-2582). M0134-0005z.
+				name = o.autoCheckName(tbl, c.CheckExpr)
 			}
 			// c.CheckNotEnforced carries a column-level `CHECK (...) NOT
 			// ENFORCED` (PG18) so the dumped constraintdef re-emits the
 			// suffix and pg_constraint reports conenforced=false. DU-002
-			// slice 430.
-			tbl.AddCheckFull(name, c.CheckExpr, o.allocConstraintOID(name), false, false, c.CheckNotEnforced)
+			// slice 430. c.CheckNoInherit (a column-level `CHECK (...) NO
+			// INHERIT`) must reach NamedChecks too — previously hardcoded
+			// false here, which was unobservable before M0134-0005z (plain
+			// INHERITS never copied CHECK constraints at all) but became a
+			// live bug the moment sub-bug A started propagating checks:
+			// without this, ATACC1's inline `CHECK (TEST > 0) NO INHERIT`
+			// would incorrectly propagate to ATACC2. M0134-0005z.
+			tbl.AddCheckFull(name, c.CheckExpr, o.allocConstraintOID(name), false, c.CheckNoInherit, c.CheckNotEnforced)
 		}
 	}
 	// Table-level CHECK constraints written without an explicit CONSTRAINT name
@@ -3907,6 +3918,40 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// previously masked this was fixed in M0097-0023-loop34). M0097-0023.
 	for _, nc := range likeCheckConstraints {
 		tbl.AddCheck(nc.Name, nc.Expr, o.allocConstraintOID(nc.Name))
+	}
+	// Inherit named CHECK constraints from `CREATE TABLE child (...) INHERITS
+	// (parent...)` parents (non-NoInherit only), mirroring the identical block
+	// in execCreatePartitionChild. IsLocal=false, InhCount=1 (AddCheckInherited).
+	// Multiple INHERITS parents carrying the same constraint name are merged
+	// into a single child constraint (PG's MergeAttributes union-by-name),
+	// deduplicated the same way appendLikeChecks dedups LIKE-sourced checks.
+	// PG oracle: postgres/src/backend/commands/tablecmds.c:MergeAttributes.
+	// M0134-0005z.
+	if imInh, isImInh := o.ctx.Catalog.(*catalog.InMemory); isImInh {
+		for _, parent := range inheritParents {
+			for _, pnc := range parent.NamedChecks {
+				if pnc.Name == "" || pnc.NoInherit {
+					continue
+				}
+				already := false
+				for _, existing := range tbl.NamedChecks {
+					if strings.EqualFold(existing.Name, pnc.Name) {
+						already = true
+						break
+					}
+				}
+				if already {
+					continue
+				}
+				tbl.AddCheckInherited(pnc.Name, pnc.Expr, imInh.AllocOID())
+				// AddCheckInherited only threads IsLocal/InhCount; a parent
+				// CHECK carrying NOT ENFORCED (PG18) must stay unenforced on
+				// the child too (constraints.sql's NE_INSERT_TBL_CON case).
+				if pnc.NotEnforced {
+					tbl.NamedChecks[len(tbl.NamedChecks)-1].NotEnforced = true
+				}
+			}
+		}
 	}
 	// PG18: register named NOT NULL constraints for every NOT-NULL column.
 	// LIKE INCLUDING ALL/CONSTRAINTS preserves the source constraint name;

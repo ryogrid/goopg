@@ -2905,3 +2905,116 @@ test covers.
 23 hunks**. Five guard tests in `internal/testport/create_table_pk_notnull_test.go`
 (named PK, INHERITS child, anonymous table-level PK, no-duplicate-rows on the
 dirty path, no-duplicate-rows on the clean path), all FAIL-pre / PASS-post.
+
+---
+
+## 33. M0134-0005z — plain `INHERITS` never copied the parent's CHECK constraints, so they were never enforced (LANDED 2026-08-19)
+
+### Symptom
+
+Live repro (goopg on :5533 vs the PG 18.3 oracle), distilled from
+`postgres/src/test/regress/sql/constraints.sql:172-183`:
+
+```sql
+CREATE TABLE p1 (x int, CONSTRAINT p1_con CHECK (x >= 3 AND x < 8));
+CREATE TABLE c1 (cy int CHECK (cy > x)) INHERITS (p1);
+INSERT INTO c1 (x, cy) VALUES (1, 5);   -- x = 1 violates p1_con
+```
+
+goopg answered `INSERT 0 1` and persisted the row. PG raises
+`ERROR: new row for relation "insert_child" violates check constraint
+"insert_tbl_check"` (23514). This is a **silent data-integrity hole**, not a
+cosmetic `\d+` divergence: any CHECK a user declares on a parent is simply not
+enforced on any of its inheritance children.
+
+### Root cause — population, not enforcement
+
+Enforcement is already correct and fully data-driven. `checkConstraints`
+(`internal/executor/operators_fk.go:1700`) evaluates whatever is in
+`tbl.CheckConstraints` / `tbl.NamedChecks`, and already reports the *child's*
+relation name together with the inherited constraint's *original* name
+(`operators_fk.go:1781-1789`) — exactly PG's wording. Nothing on that side needed
+to change.
+
+The gap is that the list is never populated. `execCreateTable`'s `s.Inherits`
+loop (`internal/executor/operators_ddl.go:~1796-1865`) copies the parent's
+columns and threads NOT-NULL `NO INHERIT` suppression, but contained **zero walk
+over `parent.NamedChecks`**. The helper it needed already existed —
+`catalog.Table.AddCheckInherited` (`internal/catalog/catalog.go:304-309`) sets
+`IsLocal:false, InhCount:1`, the correct PG bookkeeping — and was called from
+only two places: `execCreatePartitionChild` (`operators_ddl.go:4911`, the
+`PARTITION OF` path, which has always been correct and served as the template)
+and the `ALTER TABLE … ADD CONSTRAINT CHECK` cascade to *partition* children
+(`operators_ddl.go:8391`). Plain table inheritance was never wired.
+
+PG does this in `MergeAttributes`
+(`postgres/src/backend/commands/tablecmds.c`), which folds each parent's
+constraint expressions into the child's constraint list at DefineRelation time;
+enforcement is then `ExecConstraints` / `ExecRelCheck`
+(`postgres/src/backend/executor/execMain.c`) reading the child's own
+constraint descriptor. goopg's architecture matches — it just skipped the fold.
+
+### Second, inseparable bug — column-level CHECK auto-naming
+
+Landing the fold alone still left the diff red on constraint *names*.
+`operators_ddl.go:3846-3850` named a column-level CHECK
+`<tbl>_<col>_check` using the column the clause is syntactically *attached to*.
+PG counts the **distinct columns referenced by the expression**
+(`postgres/src/backend/catalog/heap.c:2546-2582` — `pull_var_clause` +
+`list_union`, then `ChooseConstraintName`): exactly one referenced column gives
+`<tbl>_<col>_check`, anything else gives `<tbl>_check`. So `CHECK (cy > x)`
+declared on column `cy` is `insert_child_check` in PG, not
+`insert_child_cy_check`.
+
+goopg already had the right algorithm — `autoCheckName`
+(`operators_ddl.go:4251-4273`, using `collectCheckExprColumns` and
+`checkNameTaken` for collision suffixing) — it was simply not called from the
+column-level branch. The fix is a one-line swap. The two sub-bugs share their
+fixtures, so they landed as one slice: either alone leaves the regress diff red.
+
+### Two latent flags the fold exposed
+
+Both were unobservable before this change, because nothing had ever inherited a
+CHECK. They are documented here because each would otherwise have shipped as a
+new bug introduced *by* the fix:
+
+1. **`CHECK (…) NO INHERIT` was parsed but never persisted.** The parser set
+   `c.CheckNoInherit`, but the column-level `AddCheckFull` call passed a
+   hardcoded `false`. With the fold in place, ATACC1's inline `NO INHERIT` check
+   would have been wrongly propagated to ATACC2. Fixed by threading
+   `c.CheckNoInherit` through. (The new loop skips `NoInherit` entries — this is
+   what makes that skip meaningful.)
+2. **`AddCheckInherited` does not carry `NotEnforced`.** `INSERT_TBL`'s
+   `NE_INSERT_TBL_CON … NOT ENFORCED` was being inherited as *enforced*, breaking
+   a statement that previously passed in the same fixture. Fixed by stamping
+   `NotEnforced` on the copied entry after the call, rather than changing
+   `AddCheckInherited`'s signature — its other two call sites are out of this
+   slice's scope. See the ledger for the resulting gap on those sites.
+
+### Scope boundary (deliberately untouched)
+
+- `ALTER TABLE child INHERIT parent` (`operators_ddl.go:~7426-7458` and its twin
+  near `:7736`) calls `mergeNotNullOnAttach` but has **no CHECK-merge
+  equivalent** — the same bug class on the deferred-attach path.
+- `ALTER TABLE … ADD CONSTRAINT CHECK` cascades to `PartitionChildren` only
+  (`operators_ddl.go:8376-8394`), never to `InheritanceChildren`
+  (`internal/catalog/catalog.go:4489` vs `:4510`).
+- Parent `CHECK … NOT VALID` is not propagated by the new loop.
+- `SYS_COL_CHECK_TBL` (system-column `tableoid`/`ctid` references inside CHECK)
+  shares the two affected hunks but is an unrelated bug, which is why those hunks
+  shrink without fully clearing.
+- The `pg_get_partition_constraintdef` missing-builtin gap is introspection, not
+  enforcement.
+
+All five are ledgered; none has current `constraints.sql` fixture reachability
+except `SYS_COL_CHECK_TBL`.
+
+### Result
+
+`scripts/pg-regress-runner.sh constraints`: **516 lines / 23 hunks → 465 lines /
+22 hunks** (−51). Five guard tests in
+`internal/testport/create_table_inherits_check_test.go`: inherited CHECK enforced
+on child INSERT, `NO INHERIT` not propagated, two-parent dedup yields one
+constraint, single-column-reference auto-name, multi-column-reference auto-name.
+Three FAIL-pre / PASS-post; the two auto-name/NO-INHERIT guards that already
+passed pre-fix are recorded as such rather than credited to this slice.
