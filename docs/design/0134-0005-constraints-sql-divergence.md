@@ -1815,3 +1815,98 @@ Gates: `go build ./...`; `go test ./internal/{executor,catalog,parser,optimizer}
 `go test -run 'TestPort_.*(NotNull|Constraint|Inherit)' ./internal/testport/`;
 `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
 `scripts/tpch-spotcheck.sh` PASS (**Q12=2, Q13=35** — Rule #1).
+
+## 22. M0134-0005o — `ALTER TABLE … ADD PRIMARY KEY` never persisted or cascaded the synthesized NOT NULL (LANDED 2026-08-18)
+
+### 22.1 Why this slice
+
+Selected from §21.1's six-sub-bug NOT-NULL/PRIMARY-KEY cluster — rank #2, "PK not
+synthesising NOT NULL". Per §21.1's standing rule the sub-bug was **unpinned**, so
+it got its own research pass first (`tmp/ralph-handoffs/m0134-0005o-pknn`) rather
+than being sized from the symptom. Census re-measured at HEAD `ecb3e523`:
+**845 lines / 29 hunks**, confirming §21.6 unchanged.
+
+That research pass materially changed the slice. The symptom read as "goopg does
+not synthesise NOT NULL for a PK"; the code says goopg **does** — since DU-002
+slice 50, `execAlterTableAddPrimaryKey` sets `col.NotNull` and registers a
+`NamedNotNullConstraint`. Two *other* things were missing, and they are what the
+fixture actually witnesses.
+
+### 22.2 The two divergences
+
+**D1 — the flip never reached the on-disk heap.** `pg_attribute` is heap-backed,
+not virtual (see the standing note "pg_class is virtual, pg_attribute is heap"),
+so an in-memory `col.NotNull = true` is invisible to `\d+` and `pg_dump`, both of
+which scan the heap. Every sibling not-null path already ends with the
+`catalogHeapSyncAvailable` → `MaterializeWriterXID` → `deleteCatalogRowsForOID` →
+`syncTableToCatalogHeap` quadruple (`AlterTableSetNotNull`,
+`operators_ddl.go:9869-9877`); the PK path alone omitted it.
+Fixture `constraints.sql:729`.
+
+**D2 — no cascade to pre-existing inheritance children.** A child created
+*before* the parent's `ADD PRIMARY KEY` never received the constraint, so it
+diverged from an otherwise identical child created *after*. M0134-0005i had
+already landed `cascadeNotNullToChildren`; the PK path simply never called it.
+Fixture `constraints.sql:735-749`.
+
+### 22.3 PG oracle — two injection sites, one terminal function
+
+Not one unified path, which is the §21.3 lesson recurring in the opposite
+direction (here PG *splits* what goopg had merged into a single arm):
+
+- Plain `ADD [CONSTRAINT n] PRIMARY KEY` — `tablecmds.c:ATPrepAddPrimaryKey`
+  (`:9499`), at execution time, re-entering `ATPrepCmd` with `recurse=true` so
+  the synthesized constraint drives the same `find_all_inheritors` cascade as
+  `ATExecSetNotNull` (`:8062-8079`).
+- `PRIMARY KEY USING INDEX` — `parse_utilcmd.c:transformIndexConstraint`
+  (`:2558-2562`), at *parse-analysis* time.
+  `catalog/index.c:index_check_primary_key` (`:202`) deliberately does **not**
+  auto-synthesize (its own doc comment records the move) and errors when the
+  not-null is still missing.
+- Both terminate in `ATAddCheckNNConstraint` → `heap.c:AddRelationNewConstraints`
+  (`:2385`) — the same function M0134-0005n (§21) already exercises.
+- `INHERITS` is **not** a third path: it is recursion off `ATPrepAddPrimaryKey`,
+  plus CREATE-TABLE-time not-null copying which goopg already gets right.
+
+### 22.4 Slice boundary
+
+Taken: plain + named spellings (one dispatch arm, `AlterTableAddPrimaryKey` at
+`:8043`, serves both) and both `INHERITS` shapes, implemented purely by **reusing
+existing helpers** — 24 added lines, no new mechanism.
+
+Deliberately excluded, each ledgered rather than forward-referenced:
+`PRIMARY KEY USING INDEX` and its `UNIQUE USING INDEX` twin (parsed to
+`AlterTableNoOp` at `parser/ddl.go:9849`/`:10081` — the whole constraint
+promotion is unimplemented, pre-existing M0097-0023 debt, far larger than this
+slice); the NO-INHERIT-PK compatibility check (already ledgered 2026-08-18 under
+§21.6, and blocked behind the `get_nnconstraint_info` coninhcount-drift bucket);
+and the `cnn2_parted` partition-PK null scan (`constraints.sql:494`, separate
+root cause).
+
+### 22.5 Outcome
+
+`constraints` regress diff **845 → 775 lines (−70)** — the largest single-slice
+shrink of this milestone so far, and it came from 24 lines of glue calling code
+that already existed. Both target fixture groups leave the diff entirely; the
+only remaining hunks in this area are the two explicitly out-of-scope ones above.
+
+Guards: 4 in-memory unit tests
+(`internal/executor/operators_ddl_addpk_notnull_test.go` — bare and named
+spellings, existing-child cascade incl. `InhCount`, and a no-duplicate guard on
+an already-not-null column) plus 3 full-server tests
+(`internal/testport/addpk_notnull_test.go`) that query
+`pg_attribute.attnotnull` directly — i.e. the same catalog `pg_dump` reads, so
+D1 cannot regress unnoticed behind a green in-memory test. FAIL-pre/PASS-post
+verified by stashing `operators_ddl.go` alone while keeping the test files.
+
+**The lesson worth carrying:** "feature missing" and "feature present but not
+persisted" produce the *same* regress hunk. The census symptom said the former;
+only reading the code found the latter. An in-memory-only catalog mutation is
+this codebase's recurring silent failure — the heap-resync quadruple is the tell,
+and its absence beside a `tbl.AddNotNull` call is a bug signature worth grepping
+for at the other five hand-inlined sites (§21.6).
+
+Gates: `go build ./...`; `go test ./internal/{executor,catalog}/`;
+`go test -run 'TestPort_.*(NotNull|Constraint|Inherit)' ./internal/testport/` (19 tests);
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
+`scripts/tpch-spotcheck.sh` PASS (**Q12=2, Q13=35** — Rule #1).

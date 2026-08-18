@@ -10737,6 +10737,30 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 		if !hasConstraint {
 			nnName := strings.ToLower(tbl.Name) + "_" + strings.ToLower(col.Name) + "_not_null"
 			tbl.AddNotNull(nnName, col.Name, im.AllocOID(), false, false, true, 0)
+			// Cascade the freshly synthesized NOT NULL to already-existing
+			// inheritance children and partitions, recursively, mirroring
+			// PG's ATPrepAddPrimaryKey re-entering ATPrepCmd with recurse=true
+			// for the synthesized AT_AddConstraint (tablecmds.c:9499-9573),
+			// which drives the same find_all_inheritors cascade as SET NOT
+			// NULL (ATExecSetNotNull, tablecmds.c:8062-8079). M0134-0005o.
+			if err := o.cascadeNotNullToChildren(tbl, col.Name, nnName); err != nil {
+				return err
+			}
+		}
+	}
+	// pg_attribute/pg_class are heap-backed, not virtual — the in-memory
+	// col.NotNull/AddNotNull mutations above are invisible to \d+/pg_dump
+	// until the table's catalog-heap rows are re-synced, same as SET NOT
+	// NULL (:9861-9869 above) and ADD NOT NULL. M0134-0005o.
+	if catalogHeapSyncAvailable(o.ctx) {
+		if err := o.ctx.MaterializeWriterXID(); err == nil {
+			xmax := o.ctx.Tx.XID
+			for _, dbOid := range tableCatalogDBOids(o.ctx) {
+				deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+			}
+		}
+		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+			return fmt.Errorf("DDL catalog sync: %w", syncErr)
 		}
 	}
 	return nil
