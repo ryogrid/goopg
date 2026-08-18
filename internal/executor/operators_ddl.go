@@ -3994,6 +3994,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				}
 			}
 			name := strings.ToLower(tbl.Name) + "_" + colKey + "_not_null"
+			childAutoName := name
 			var noInherit bool
 			isLocal := true
 			inhCount := 0
@@ -4055,8 +4056,22 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 					execErr.Pos = s.Pos()
 					return execErr
 				}
+				// heap.c:3038-3050 — any local source (explicit column NOT
+				// NULL, table-level CONSTRAINT, or PK-implied) makes the
+				// constraint conislocal='t' unconditionally, regardless of
+				// what the col.Inherited branch above decided; inhCount is
+				// left as-is since it already counts the absorbed parent
+				// constraints, yielding PG's (local, inherited). The name
+				// comes from ChooseConstraintName over the CHILD's relation
+				// name — i.e. the same auto-name computed at childAutoName
+				// above — not the parent's name the col.Inherited branch may
+				// have assigned, unless entries itself carried an explicit
+				// name. §26.4.
+				isLocal = true
 				if mergedName != "" {
 					name = mergedName
+				} else {
+					name = childAutoName
 				}
 				noInherit = mergedNoInherit
 			}

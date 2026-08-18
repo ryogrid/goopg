@@ -2254,3 +2254,175 @@ resync is deliberately omitted, matching the sibling deferred function
 - `ALTER TABLE … ADD CONSTRAINT` cascading down the inheritance tree (the
   `ditto`/`ATACC2` case, diff ~317/321) — same missing-merge-check family, different
   call site.
+
+## 26. M0134-0005s — `CREATE TABLE … INHERITS` never marks a locally-sourced NOT NULL as `conislocal`
+
+Baseline when this slice was selected: **731 diff lines / 32 hunks** (HEAD
+`d70c2e0b`, re-measured 2026-08-18 — never compare against an older number).
+Census: `tmp/ralph-handoffs/m0134-0005s-census/report.md`.
+
+### 26.1 The divergence
+
+`postgres/src/test/regress/sql/constraints.sql:789-790`:
+
+```sql
+CREATE TABLE notnull_tbl4_cld2 (PRIMARY KEY (a) DEFERRABLE) INHERITS (notnull_tbl4);
+CREATE TABLE notnull_tbl4_cld3 (PRIMARY KEY (a) DEFERRABLE, CONSTRAINT a_nn NOT NULL a)
+  INHERITS (notnull_tbl4);
+```
+
+goopg's `\d+` reports the child's NOT NULL as purely `(inherited)`, and for
+`cld2` under the *parent's* constraint name:
+
+```
+-  "notnull_tbl4_cld2_a_not_null" NOT NULL "a" (local, inherited)   <- PG
++  "notnull_tbl4_a_not_null"      NOT NULL "a" (inherited)          <- goopg
+-  "a_nn" NOT NULL "a" (local, inherited)                           <- PG
++  "a_nn" NOT NULL "a" (inherited)                                  <- goopg
+```
+
+Both children declare a NOT NULL of their own — `cld2` implicitly via
+`PRIMARY KEY (a)`, `cld3` explicitly via `CONSTRAINT a_nn NOT NULL a` — *and*
+inherit one from `notnull_tbl4`. PG's answer is that the constraint is both
+local and inherited; goopg's is that it is only inherited.
+
+### 26.2 The PG oracle
+
+`postgres/src/backend/catalog/heap.c:2897` `AddRelationNotNullConstraints`,
+called from `DefineRelation` (`tablecmds.c:1354`), takes two lists:
+
+- `constraints` — every NOT NULL the **child's own body** produced: explicit
+  column `NOT NULL`, table-level `CONSTRAINT n NOT NULL c`, **and the
+  PK-implied one**, all duplicate-merged at `heap.c:2955-2998`.
+- `old_notnulls` — the parent-inherited `CookedConstraint`s that
+  `MergeAttributes` (`tablecmds.c:2546`) carried down, built from every direct
+  parent independently of whether the child redeclares the column.
+
+The two loops that follow are the whole rule:
+
+- `heap.c:3038-3050` — for **every** entry in `constraints`, PG calls
+  `StoreRelNotNull(rel, conname, attnum, /*islocal=*/true, …, inhcount, …)`.
+  `islocal` is **unconditionally true**; `inhcount` counts however many
+  `old_notnulls` entries were absorbed (`heap.c:3009-3018`). This is the
+  `(local, inherited)` case. The name comes from `ChooseConstraintName` over
+  `RelationGetRelationName(rel)` — the **child's** name, not the parent's.
+- `heap.c:3057-3120` — only for columns with **no** entry in `constraints` at
+  all does PG store the parent's name with `islocal=false`. This is the pure
+  `(inherited)` case.
+
+So: a local source always wins both the flag and the name; inheritance only
+adds to `coninhcount`.
+
+### 26.3 goopg's divergence
+
+`internal/executor/operators_ddl.go:3966-4062`, `CreateTable`'s per-column
+NOT-NULL merge loop. `entries` (built at `:3978-3995` from the column's own
+local sources — `NotNullExplicit`, the `pkColSet` PK-implied branch, LIKE
+copies) is exactly PG's `constraints` list. But `isLocal` and `name` are
+decided earlier, at `:4012-4051`, purely from `col.Inherited` — i.e. from
+whether the column arrived via a bare `INHERITS` copy — and are **never
+revisited** by the `if len(entries) > 0` block at `:4052-4062`:
+
+```go
+if len(entries) > 0 {
+    mergedName, mergedNoInherit, execErr := mergeNotNullEntries(col.Name, entries)
+    …
+    if mergedName != "" { name = mergedName }
+    noInherit = mergedNoInherit
+}
+tbl.AddNotNull(name, col.Name, im.AllocOID(), noInherit, false, isLocal, inhCount)
+```
+
+For `notnull_tbl4_cld2`, `a` never appears in `s.Columns` (only in the
+table-level `PRIMARY KEY (a)`), so `col.Inherited=true` was stamped at
+`:3267`; the `col.Inherited` branch set `isLocal=false` and `name` = the
+parent's constraint name; and although `entries` is non-empty (the PK-implied
+`nnEntry{}` from `:3985-3987`), `mergedName` is `""` for an unnamed entry, so
+neither the flag nor the name is corrected.
+
+### 26.4 The fix
+
+Inside the `len(entries) > 0` block, mirror `heap.c:3038-3050`:
+
+1. `isLocal = true` — a column with any local NOT-NULL source is `conislocal`
+   regardless of what it also inherited. `inhCount` is unchanged (it already
+   counts the absorbed parent constraints, so the result is
+   `(local, inherited)`).
+2. When `mergedName == ""` (no explicit name anywhere in `entries`), recompute
+   `name` from the **child's** relation name — `<child>_<col>_not_null` — via
+   the same auto-naming helper the non-inherited path already uses, instead of
+   leaving the parent's name that the `col.Inherited` branch assigned. An
+   explicit name in `entries` (`cld3`'s `a_nn`) still wins, as it does today.
+
+### 26.5 Rule #2 twins — already correct, do not touch
+
+The statement-time twin `mergeNotNullOnAttach`
+(`operators_ddl.go:13422-13471`, reached from both the ATTACH PARTITION site
+`:8444` and the plain INHERIT site `:9332`) and its inverse
+`unmergeNotNullOnDetach` (`:13481-13501`) already implement this rule — they
+were fixed under M0134-0005q/M0134-0005r and never clear a pre-existing local
+flag. Only the CREATE-TABLE-time path has the gap. The deferred-to-COMMIT
+`ALTER TABLE … INHERIT` variant routes through the *same*
+`mergeNotNullOnAttach` call site (`PendingInheritanceChange`, `:9296-9302`),
+so it carries no separate merge logic and needs no separate change.
+
+### 26.6 Explicitly out of scope (verify, do not fold in)
+
+- **`ATACC3 (PRIMARY KEY (a)) INHERITS (ATACC1)`** where `ATACC1`'s own
+  not-null is `NO INHERIT` (diff `:290-301`, 4 lines). Same symptom family,
+  but goopg drops the not-null obligation *entirely* rather than mislabelling
+  it, because of the separate NO-INHERIT clearing of `col.NotNull` at
+  `operators_ddl.go:1854-1861`. Re-probe after the primary fix; if it is not
+  cleared, it is its own slice.
+- **`notnull_tbl5_child` after `ALTER TABLE ONLY notnull_tbl5 DROP CONSTRAINT
+  ann`** (diff `:486-487`). Same `(inherited)` tag, different root cause:
+  `DROP CONSTRAINT … ONLY` does not decrement the child's `InhCount` /
+  restore `IsLocal`. Separate fix site.
+
+### 26.7 Expected payoff
+
+4 diff lines guaranteed (`notnull_tbl4_cld2`, `notnull_tbl4_cld3`), i.e.
+**731 → ~727 lines**, with the ATACC3 case worth 4 more if it shares the gap.
+The census's original "~26 lines" estimate for this cluster over-counted: it
+swept in unrelated neighbours such as the `notnull_tbl2_a_seq` sequence-owner
+schema-qualification diff at `:278-283`.
+
+### 26.8 Measured outcome (LANDED 2026-08-18, M0134-0005s)
+
+`internal/executor/operators_ddl.go`: `childAutoName` is captured at `:3997`
+*before* the `col.Inherited` branch can overwrite `name` with the parent's, and
+the `len(entries) > 0` block (`:4056-4077`) now sets `isLocal = true`
+unconditionally and falls back to `childAutoName` when `mergedName == ""`.
+`inhCount` is untouched. Guard tests:
+`internal/executor/operators_ddl_createinh_notnull_test.go` (PK-implied and
+explicit-name cases; both verified FAIL-pre / PASS-post via a `git stash` A/B).
+
+**731 lines / 32 hunks → 707 lines / 31 hunks.** The drop is 24 lines, not the
+predicted 4, because once `notnull_tbl4_cld2`/`cld3` match PG byte-for-byte the
+diff tool drops the entire hunk — context lines included — rather than only the
+two changed marker lines. Both named cases are fully cleared. This is worth
+remembering when estimating future slices from this file: a hunk that goes
+fully clean is worth its context, so per-slice payoff is systematically
+under-predicted by marker-line counting.
+
+Gates: `go build ./...`; `go test ./internal/{executor,catalog}/`;
+`go test -run 'TestPort_.*(NotNull|Constraint|Inherit|Partition)' ./internal/testport/`
+(75.5s PASS); `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS
+(`internal/initdb` ran cold at 438s — cache invalidation from the diff, not a
+regression); `scripts/tpch-spotcheck.sh` PASS (**Q12=2, Q13=35**, Rule #1);
+pgbench smoke via the pre-commit hook.
+
+### 26.9 ATACC3 re-probe (§26.6) — root cause now pinned, still deferred
+
+The `ATACC3 (PRIMARY KEY (a)) INHERITS (ATACC1)` case is **not** cleared, but the
+fix changed its shape and pinned the cause. Pre-fix it had both a wrong name and
+a wrong tag; post-fix the name is correct (a side effect of §26.4's
+`childAutoName` half) and only the tag is wrong: goopg reports
+`(local, inherited)` where PG expects **no tag at all**. Root cause is a
+pre-existing, untouched loop at `operators_ddl.go:4012-4023` that counts a
+parent's NOT NULL toward `inhCount` **even when that parent's constraint is
+`NO INHERIT`** — PG's `MergeAttributes` never places a `NO INHERIT` parent
+constraint into `old_notnulls` at all, so the child inherits nothing and
+`coninhcount` stays 0. This is one bug, not the two-part entanglement §26.6
+guessed at: the `col.NotNull` clearing at `:1854-1861` is the *correct* half.
+Ledgered with this resume point; a good ~4-line follow-up slice.
