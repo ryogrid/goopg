@@ -6801,6 +6801,28 @@ listed `select.sql`, `delete.sql` and `sysviews.sql` already carry CSV status
 - [ ] **M0134-0014 — mvcc.sql** — **PARKED 2026-08-20** (commit `d2460abe`). The standing "possible regression, verify" rule was applied FIRST: `scripts/pg-regress-runner.sh --verbose mvcc` at HEAD **still fails** (17 diff lines / 2 `^+ERROR`), so it is NOT a stale status — no CSV flip, row stays `failed`, `make regen-testport` NOT run. Two serially-masked root causes. (1) SHIPPED: `IF EXISTS(SELECT ...)` in a `DO` block raised `EXISTS is not supported in PL/pgSQL expressions in v0` — a routing gap, since goopg'"'"'s SQL layer implements sublinks fully while `lowerPLpgSQLExpr` cannot represent a sub-`SELECT`; sublink-bearing plpgsql expressions now fall back to a synthetic `SELECT <expr>` through `optimizer.Plan`/`Build` (design `docs/design/m0134-0014-plpgsql-sublink-sql-fallback.md`). (2) BLOCKING, REFACTOR-tier: with EXISTS fixed the loop reached a previously-unreachable bug — `substitutePlpgsqlFrameVarsInSQL` binds variables by TEXTUAL substitution before parsing and splices the `FOR i` loop variable into the FROM-item column-alias list `g(i)` -> `g(1)`. That and the shipped path'"'"'s missing frame-variable resolution are one design fault from opposite sides; PG uses parser hooks + `PARAM_EXTERN` bound parameters instead (three ledger rows, 2026-08-20). **Re-arm trigger:** when parse-then-bind lands, re-run `scripts/pg-regress-runner.sh --verbose mvcc` (17 lines / 2 `^+ERROR` at `d2460abe`) and flip the CSV row if clean.
 - [ ] **M0134-0015 — join.sql** — **PARKED 2026-08-20** on the established M0134 pattern. Sized at HEAD at 20920 diff lines / 146 `^+ERROR` across six independent root causes, most of the raw line count being out-of-scope cost-model plan-shape noise. The loop shipped the two contained causes (design `docs/design/m0134-0015-join-sql-star-suffix-and-function-scan.md`): the legacy inheritance star suffix `ALTER TABLE tbl*` failed to parse because `internal/parser/ddl.go:8829` tested `TokenOperator` where the lexer emits `TokenSymbol` (high leverage — the statement lives in the SHARED `create_misc.sql` setup that `join` depends on), and non-SETOF routines were rejected as FROM-clause sources because `planTableFuncRangeVar` gated its whole user-routine branch on `if r.ReturnsSet`. Result **146 -> 131 `^+ERROR`** (diff lines rose to 20946 because formerly-aborting statements now emit real rows and EXPLAIN output — the error count is the meaningful metric; Q12=2/Q13=35 exact). CSV row stays `failed`, `pass_required=no`, **no `make regen-testport`**. Remaining buckets are ledgered (2026-08-20): the dominant one is a REFACTOR-tier recursive `table_ref`/`joined_table` grammar for chained/nested join trees. **Re-arm trigger:** re-select once that parser grammar refactor lands. One discovery worth its own task — slice D unmasked that `ALTER TABLE <root>* RENAME COLUMN` does not propagate the rename to inheritance children.
 - [ ] **M0134-0016 — create_table.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
+      **PARKED 2026-08-20** — the standing "possible stale status, verify first"
+      rule was applied and the case still FAILS at HEAD, so the CSV row stays
+      `failed` and NO `make regen-testport` was run. Sized at 762 diff lines /
+      17 `^+ERROR` across seven independent root causes. The loop shipped the
+      single contained highest-leverage one — bucket A, ~114 of the 178 missing
+      lines (~64%): PG annotates most CREATE TABLE validation errors with an
+      `errposition` (psql's `LINE n:`/`^`) and goopg emitted none, with zero
+      message-text mismatches underneath. Root cause was a sentinel collision —
+      `ExecError.Pos` is 0-based with `0` meaning "unset", and both partition
+      validators stamped every error with the statement's own `s.Pos()`, which
+      is 0 for a regress statement starting at `CREATE`. Fix stamps each error
+      with the offending sub-node's own `.Pos()`, and adds
+      `PartitionByClause.MethodPos`/`KeyColPos` (upstream's
+      `PartitionSpec.location`/`PartitionElem.location`) for the two errors that
+      operate on bare strings. Design:
+      `docs/design/m0134-0016-createtable-errposition.md`. Result 762 -> 610
+      diff lines, `-LINE` 57 -> 29, `+ERROR` unchanged at 17.
+      **Re-arm trigger:** select again once bucket B has a standalone repro (the
+      range-partition MINVALUE overlap miss, which serially masks ~13 downstream
+      errors) — it is the next-largest contained candidate. The other five
+      unshipped buckets and the two remaining errposition gaps are in
+      `.ralph/deferral_ledger.md` (2026-08-20, M0134-0016) with resume points.
 - [ ] **M0134-0017 — hash_index.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
 - [ ] **M0134-0018 — create_index.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
 - [ ] **M0134-0019 — indexing.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.

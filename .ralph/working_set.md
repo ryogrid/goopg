@@ -1,68 +1,64 @@
-# Working set — M0134-0014 PARKED; real engine fix LANDED; next is M0134-0015
+# Working set — M0134-0016 PARKED; errposition fix LANDED; next is M0134-0017
 
-**Task:** M0134-0014 (`mvcc.sql`). Commit `d2460abe`.
+**Task:** M0134-0016 (`create_table.sql`). Commit `56f17b13` (+ bookkeeping).
+Design: `docs/design/m0134-0016-createtable-errposition.md` (indexed).
 
-**The standing rule was applied first and paid off differently than expected.**
-`mvcc` is one of the "possible regression, verify" cases, so the loop ran
-`scripts/pg-regress-runner.sh --verbose mvcc` at HEAD BEFORE any implementation.
-It **still fails** (17 diff lines / 2 `^+ERROR`) — NOT a stale status. So no CSV
-flip, row stays `failed`, **no `make regen-testport`**. The one remaining
-verify-first case is `reindex_catalog`.
+**Sizing.** Still FAILS at HEAD (not a stale status) — 762 diff lines /
+17 `^+ERROR`, seven independent root causes. Shipped the one contained
+highest-leverage bucket.
 
-**What landed.** goopg evaluates PL/pgSQL expressions with a bespoke
-`parser.Expr`→`optimizer.Expr` interpreter (`lowerPLpgSQLExpr`,
-`internal/executor/plpgsql_runtime.go:2174`) that has no representation for a
-sub-`SELECT`, so it rejected `ExistsExpr` / `SubqueryExpr` / `InExpr`-with-subquery
-outright — while the SQL layer implements sublinks fully and generally. Routing
-gap, not a missing feature. The three sites now wrap a sentinel; `evalPLpgSQLExpr`
-catches it and re-evaluates the ORIGINAL expression as a synthetic no-`FROM`
-`SELECT <expr>` via `optimizer.Plan`/`Build` (new `evalExprViaSQL`, mirroring the
-pre-existing `evalScalarSubquery`). Regression-safe by construction: reachable
-only through sites that unconditionally errored, so no working expression changes
-path. Design: `docs/design/m0134-0014-plpgsql-sublink-sql-fallback.md` (indexed).
+**The fix (bucket A, ~64% of the missing lines).** PG annotates most CREATE
+TABLE validation errors with an `errposition` — wire field `P`, rendered by psql
+as `LINE n:`/`^`. goopg emitted none, with **zero message-text mismatches
+underneath**: the messages were already byte-correct, only the position was
+absent. Root cause was a **sentinel collision**, not a missing feature —
+`ExecError.Pos` is 0-based with `0` doubling as "unset"
+(`internal/postmaster/copy.go:854-858`), while `validatePartitionKey`
+(`operators_ddl_partition.go:144`) and `validatePartitionChildBounds` (`:346`)
+each computed ONE position from the statement (`s.Pos()`) and stamped it on
+every error. A regress statement starts with `CREATE` at offset 0, so the
+position WAS the sentinel and was dropped silently; surviving, it would have
+pointed at `CREATE`. PG threads a per-node `location` into `parser_errposition`
+(`parse_expr.c:585-601`).
 
-**PG oracle that decided the design:** PG has NO plpgsql expression interpreter at
-all. `exec_prepare_plan` (`pl_exec.c:4173`) literally builds `SELECT <expr>` and
-SPI-plans it for EVERY expression; `exec_eval_simple_expr` is a planned-`Expr`
-fast path, not a node-kind allow-list. goopg's allow-list is an artifact.
+Errors now carry the offending sub-node's own `.Pos()`. `validatePartBoundExpr`'s
+aggregate arm swapped its `containsColumnRef` bool probe for a real recursive
+call — preserves PG's priority (column ref in the args outranks the aggregate
+error) AND yields that ref's position (caret on `a` in `sum(a)`, not `sum`).
+`PARTITION BY` errors had no node (parser unwraps each key's `ColumnRef` to a
+bare string and discards it), so `PartitionByClause` gained `MethodPos`/
+`KeyColPos` — the PG-faithful shape, matching upstream `PartitionSpec.location`/
+`PartitionElem.location`.
 
-**The second cause — found only AFTER the fix, and the loop's real insight.**
-With EXISTS fixed the loop body reached, for the first time,
-`INSERT ... FROM generate_series(1,100) g(i)` and died on
-`PL/pgSQL embedded SQL parse error ... "expected identifier (got 1)"`.
-`substitutePlpgsqlFrameVarsInSQL` (`:3157`) binds variables into embedded SQL by
-**textual substitution before parsing**, so the `FOR i` loop variable is spliced
-into the FROM-item column-alias list `g(i)` → `g(1)`. This and the shipped path's
-missing frame-variable resolution are **one design fault from opposite sides**:
-text substitution over-applies in non-expression positions and under-applies in
-AST-planned paths, because position-correctness is the parser's job and goopg does
-it pre-parse. PG avoids both with parser hooks (`plpgsql_pre_column_ref` /
-`plpgsql_param_ref_hook`, `pl_comp.c`) making variables `PARAM_EXTERN` bound
-parameters. Fix = parse-then-bind; REFACTOR-tier (single funnel for ALL plpgsql
-embedded SQL). A narrow "skip identifiers in a parenthesised alias list" patch was
-explicitly REJECTED as guessing grammar from a byte scanner — do not re-open.
+**Faithfulness discipline that mattered:** positions added ONLY where PG's
+expected output shows a `LINE`/`^` pair, verified case by case; three errors keep
+`Pos: 0` deliberately. Line NUMBERS are never computed — the field is a byte
+offset, psql derives `LINE n`. Guard tests assert the position EQUALS the token's
+byte offset, not merely non-zero (a non-zero assertion misses a wrong caret).
 
-**Three deferral rows appended** (2026-08-20, M0134-0014): the alias-list
-corruption + parse-then-bind resume point; the new path's absent frame-variable
-binding (pinned by `TestPlpgSQLSublinkExprFrameVariableDeferred`); and converging
-on PG by deleting the interpreter (sequence AFTER parse-then-bind).
+**Result: 762 -> 610 diff lines, `-LINE` 57 -> 29, `+ERROR` unchanged at 17.**
+CSV row stays `failed`, **no `make regen-testport`**.
 
-**Next step:** select **M0134-0015 (`join.sql`)** — a plain `failed` case, no
-verify-first rule. Size it at HEAD with `scripts/pg-regress-runner.sh --verbose
-join` before designing.
+**Three deferral rows appended** (2026-08-20, M0134-0016): errposition still
+missing on the temp-schema pair; missing on `validatePartitionChildBounds`'s
+CLAUSE-level errors (no offending expr node — needs parser positions for
+`FOR VALUES`/`WITH (MODULUS ...)`/`DEFAULT` tokens); and the six unshipped
+buckets (B MINVALUE overlap miss, C "No partition constraint", D `DROP DOMAIN
+CASCADE` via column domain type, E DETAIL-text gaps, F index deparse parens,
+G row-typed list-partition pruning).
 
-**Gates run:** `scripts/pg-regress-runner.sh --verbose mvcc` at HEAD 17 lines /
-2 `^+ERROR`, and 17 lines / 2 `^+ERROR` post-fix — same counts, **different
-error** (EXISTS rejection → alias-list parse error); do not read the equal count
-as "no progress". `go build ./...`, `go vet ./internal/executor/`,
-`go test ./internal/executor/` PASS (5 new tests in
-`plpgsql_sublink_expr_test.go`; FAIL-pre demonstrated verbatim for each).
-`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS.
-`scripts/tpch-spotcheck.sh` PASS with **Q12=2 / Q13=35 exactly**. Pre-commit
-pgbench smoke PASS.
+**Next step:** select **M0134-0017 (`hash_index.sql`)** — a plain `failed` case.
+Apply the stale-status rule first: `scripts/pg-regress-runner.sh --verbose
+hash_index` at HEAD before designing. (Re-check the fix_plan banner first; it is
+the sole ordering authority.)
 
-**Delegation:** `tmp/ralph-handoffs/M0134-0014a` (tester, verify-at-HEAD, 1 round,
-DONE), `M0134-0014b` (researcher, sizing + PG oracle, 1 round, DONE),
-`M0134-0014c` (implementer, 1 round, NEEDS-DECISION → coordinator parked the case;
-same dir holds the tester's `gates.md`).
+**Gates run:** `go build ./...`, `go vet`, `go test
+./internal/{executor,parser,optimizer}/` PASS. `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh` PASS (8m19s; `cmd/goopg` + `internal/initdb`
+ran cache-cold — not a regression signal). `scripts/tpch-spotcheck.sh` PASS with
+**Q12=2 / Q13=35 exactly**. Pre-commit pgbench smoke PASS.
+
+**Delegation:** `tmp/ralph-handoffs/M0134-0016a` (researcher, sizing, 1 round,
+DONE), `M0134-0016b` (implementer, bucket A, 1 round, DONE), `M0134-0016c`
+(tester, gates, 1 round, DONE).
 **In-flight:** none.
