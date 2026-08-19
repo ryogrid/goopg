@@ -5400,11 +5400,37 @@ func validatePartitionChild(s *parser.CreateTableStmt, parent *catalog.Table, ct
 }
 
 func validateDefaultPartition(childName string, parent *catalog.Table, ctx *Context, pos int) error {
-	for _, pb := range parent.PartitionBounds {
-		if pb.IsDefault {
-			return &ExecError{Code: "42P16", Pos: pos,
-				Message: fmt.Sprintf("partition %q conflicts with existing default partition %q", childName, pb.ChildName)}
+	// M0134-0013b (corrected): parent.PartitionBounds is the PARENT-side list
+	// of the parent's own CHILDREN's bounds (each entry's ChildName names the
+	// child that owns it, set at :4944; the sole writer is :5011). That list
+	// is correct in content, merely never pruned when a child is dropped or
+	// detached, so filter it by the set of still-live children rather than
+	// abandoning it — scanning a live child's OWN PartitionBounds instead (a
+	// first-attempt mistake) inspects the parent's GRANDchildren and matches
+	// the wrong tree level. Matches PG's check_new_partition_bound()
+	// (postgres/src/backend/partitioning/partbounds.c:2895-2923), which
+	// recomputes the partition descriptor from RelationGetPartitionDesc on
+	// every check rather than consulting a cache — a dropped child is simply
+	// absent from the rebuilt descriptor. NOTE: the sibling
+	// validateDefaultPartitionConflict (operators_ddl_partition.go:854) has
+	// this same wrong-tree-level bug and is NOT a reference implementation —
+	// it is dead code that has never been exercised.
+	var live map[string]bool
+	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+		live = make(map[string]bool)
+		for _, c := range im.PartitionChildren(parent.OID) {
+			live[c.Name] = true
 		}
+	}
+	for _, pb := range parent.PartitionBounds {
+		if !pb.IsDefault {
+			continue
+		}
+		if live != nil && !live[pb.ChildName] {
+			continue // stale entry: that child was dropped/detached
+		}
+		return &ExecError{Code: "42P16", Pos: pos,
+			Message: fmt.Sprintf("partition %q conflicts with existing default partition %q", childName, pb.ChildName)}
 	}
 	return nil
 }
