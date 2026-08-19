@@ -2042,6 +2042,7 @@ type Update struct {
 	pos             int
 	Table           *catalog.Table
 	Child           Node
+	Only            bool   // UPDATE ONLY <table> — skip inheritance/partition children
 	Set             []Expr // len == len(Table.Columns)
 	Returning       []Expr // per-target RETURNING expressions (nil = no RETURNING)
 	ReturningSchema Schema // output schema when Returning is non-nil
@@ -2071,6 +2072,7 @@ type Delete struct {
 	pos             int
 	Table           *catalog.Table
 	Child           Node
+	Only            bool // DELETE FROM ONLY <table> — skip inheritance/partition children
 	Returning       []Expr
 	ReturningSchema Schema
 	// DELETE … USING (M0097-0076): additional source tables.

@@ -10831,7 +10831,7 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 		// itself would expose (root-0025 deferred item 3).
 		tgtScan := &SeqScan{pos: s.Pos(), Table: tbl, schema: tableSchemaWithSource(resolveScope, 1)}
 		upd := &Update{
-			pos: s.Pos(), Table: tbl, Child: tgtScan, Set: set,
+			pos: s.Pos(), Table: tbl, Child: tgtScan, Only: s.Target.Only, Set: set,
 			FromTables: fromTables, FromScans: fromScans, FromSchema: fromSchema,
 			FromPred:      andExpr(s.Pos(), viewQual, pred),
 			ViewCheckQual: viewCheckQual, ViewCheckName: viewCheckName,
@@ -10891,7 +10891,7 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 			return nil, err
 		}
 	}
-	upd := &Update{pos: s.Pos(), Table: tbl, Child: node, Set: set, ViewCheckQual: viewCheckQual, ViewCheckName: viewCheckName}
+	upd := &Update{pos: s.Pos(), Table: tbl, Child: node, Only: s.Target.Only, Set: set, ViewCheckQual: viewCheckQual, ViewCheckName: viewCheckName}
 	if len(s.Returning) > 0 {
 		retExprs, retSchema, err := resolveTargets(s.Returning, ctx)
 		if err != nil {
@@ -10999,7 +10999,7 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 		// target is a view (root-0025 deferred item 3).
 		tgtScan := &SeqScan{pos: s.Pos(), Table: tbl, schema: tableSchemaWithSource(resolveScope, 1)}
 		del := &Delete{
-			pos: s.Pos(), Table: tbl, Child: tgtScan,
+			pos: s.Pos(), Table: tbl, Child: tgtScan, Only: s.Target.Only,
 			UsingTables: usingTables, UsingScans: usingScans, UsingSchema: usingSchema,
 			UsingPred: andExpr(s.Pos(), viewQual, pred),
 		}
@@ -11050,7 +11050,7 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 	} else if viewQual != nil {
 		node = &Filter{pos: s.Pos(), Child: node, Predicate: viewQual}
 	}
-	del := &Delete{pos: s.Pos(), Table: tbl, Child: node}
+	del := &Delete{pos: s.Pos(), Table: tbl, Child: node, Only: s.Target.Only}
 	if len(s.Returning) > 0 {
 		retExprs, retSchema, err := resolveTargets(s.Returning, ctx)
 		if err != nil {

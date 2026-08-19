@@ -5125,7 +5125,11 @@ func (o *updateOp) Next() (TupleSlot, error) {
 	// expressions (resolved against parent ordinals) work on child rows. M0097-0078.
 	updateScanTables := []*catalog.Table{tbl}
 	var inheritChildOIDs map[uint32]bool
-	if imU, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+	// UPDATE ONLY skips inheritance/partition children entirely — mirrors
+	// planScanRangeVar's `!rv.Only` gate (internal/optimizer/planner.go) and
+	// PG's expand_inherited_rtentry, which is gated on the identical
+	// rte->inh flag for both inheritance and partitioning. M0134-0005ao.
+	if imU, ok := o.ctx.Catalog.(*catalog.InMemory); ok && !o.plan.Only {
 		updateScanTables = append(updateScanTables, imU.PartitionChildren(tbl.OID)...)
 		// Drop other-session temp inheritance children (RELATION_IS_OTHER_TEMP).
 		// Design 0118-0036 (M0118-0008 inherit-temp).
@@ -6161,7 +6165,9 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 	var victims []victim
 	scanTables := []*catalog.Table{tbl}
 	var delInheritChildOIDs map[uint32]bool
-	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+	// DELETE FROM ONLY skips inheritance/partition children entirely — see
+	// updateOp.Next's identical gate. M0134-0005ao.
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && !o.plan.Only {
 		scanTables = append(scanTables, im.PartitionChildren(tbl.OID)...)
 		// Drop other-session temp inheritance children (RELATION_IS_OTHER_TEMP).
 		// Design 0118-0036 (M0118-0008 inherit-temp).
@@ -6607,7 +6613,9 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 		tbl    *catalog.Table
 	}
 	fromScanTargets := []fromScanTarget{{rel: rel, cols: tgtCols, tbl: o.plan.Table}}
-	if imFrom, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+	// UPDATE ONLY … FROM skips inheritance/partition children entirely — see
+	// updateOp.Next's identical gate. M0134-0005ao.
+	if imFrom, ok := o.ctx.Catalog.(*catalog.InMemory); ok && !o.plan.Only {
 		// Partition children: same column ordinals as parent, possibly overridden GeneratedExpr.
 		for _, pc := range imFrom.PartitionChildren(o.plan.Table.OID) {
 			if err := o.ctx.acquireRelLock(o.ctx.Catalog.RelFileNode(pc), lmgr.RowExclusiveLock); err != nil {
@@ -7127,7 +7135,9 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 		colMap []int // nil = parent; set for inheritance children
 	}
 	usingScanTargets := []usingScanTarget{{rel: rel, cols: tgtCols}}
-	if imDel, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+	// DELETE FROM ONLY … USING skips inheritance children entirely — see
+	// updateOp.Next's identical gate. M0134-0005ao.
+	if imDel, ok := o.ctx.Catalog.(*catalog.InMemory); ok && !o.plan.Only {
 		// Drop other-session temp inheritance children. Design 0118-0036.
 		for _, ic := range catalog.AccessibleInheritanceChildren(imDel.InheritanceChildren(tbl.OID), sessionTempOwner(o.ctx)) {
 			if err := o.ctx.acquireRelLock(o.ctx.Catalog.RelFileNode(ic), lmgr.RowExclusiveLock); err != nil {

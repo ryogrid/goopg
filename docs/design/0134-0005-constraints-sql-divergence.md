@@ -4131,3 +4131,105 @@ plumbing on `AlterTableValidateConstraint` at all, and PG's per-descendant skip
 of an already-convalidated descendant *during the row scan* (the
 `alter_table.sql:408-411` `boo()` NOTICE case) would require restructuring
 goopg's single whole-tree pass into per-relation passes.
+
+## 46. M0134-0005ao — `ONLY` was parsed, planned away, and never reached the executor (LANDED 2026-08-19)
+
+**Not a `constraints.sql` slice.** Like §45 this one's witness is
+`alter_table.sql` (`:412-425`), and unlike every slice before it the defect is
+not in DDL at all — it is **DML**. It was surfaced *by* §45: the guard test for
+`NO INHERIT` validation could not be a literal port of the upstream case,
+because the upstream case leans on `delete from only parent_noinh_convalid`
+leaving the child's row alive, and goopg deleted it. §45 worked around it by
+splitting the fixture in two and ledgering the finding
+(`.ralph/deferral_ledger.md:1572`); this slice discharges that row.
+
+### The shape of the bug: a flag with a complete front half and no back half
+
+`ONLY` was never *missing* from goopg. The parser has always captured it:
+`parser.RangeVar.Only` (`internal/parser/ast.go:658`) is set by the shared
+`parseRangeVar` (`internal/parser/select.go:1373,1476`), and both DML targets
+route through it (`internal/parser/dml.go:390` UPDATE, `:556` DELETE). The flag
+then **died at the planner boundary**: `optimizer.Update` (`plan.go:2041`) and
+`optimizer.Delete` (`:2070`) had no field to carry it, so `planUpdate`
+(`planner.go:10721`) and `planDelete` (`:10906`) simply never read
+`s.Target.Only`. Downstream, the executor did what it always does — expanded to
+the whole tree.
+
+This is the most easily-missed defect class in the campaign so far, and worth
+naming: **the feature looked implemented from both ends.** `ONLY` parsed without
+error (so no user-visible syntax failure), and the executor's expansion was
+correct for the no-`ONLY` case (so every existing test was green). Nothing on
+either side was wrong; the wire between them did not exist. Grepping for `Only`
+finds plenty of hits and none of them are the bug.
+
+### One flag, four sites (Rule #2, ×2)
+
+goopg splits each DML verb into a plain form and a cross-product form, and the
+descendant expansion is written out **separately in all four**
+(`internal/executor/operators_storage.go`):
+
+| site | verb | form |
+|---|---|---|
+| `updateOp.Next` `:5126` | UPDATE | plain |
+| `updateOp.updateWithFrom` `:6613` | UPDATE | `… FROM` |
+| `deleteOp.Next` `:6165` | DELETE | plain |
+| `deleteOp.deleteWithUsing` `:7135` | DELETE | `… USING` |
+
+Each opens with the same `if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {`
+and appends `PartitionChildren` + `InheritanceChildren`. The fix is the same one
+conjunct at each — `&& !o.plan.Only` — plus `Only bool` on the two plan nodes
+and `Only: s.Target.Only` at all **four** construction sites in the planner
+(`planUpdate` has two, `planDelete` has two; the cross-product forms build their
+node separately). Total +20/−8 across three files. Gating any three of the four
+would have produced a silently half-correct `ONLY` — the exact failure mode
+Hard-won Rule #2 exists to catch.
+
+### Why partitioning and inheritance are gated together, not selectively
+
+Upstream there is only ever **one** flag and **one** expansion site.
+`gram.y:13922-13950` (`relation_expr` / `extended_relation_expr`) sets
+`RangeVar.inh` from the presence of `ONLY`; that becomes `rte->inh`; and
+`expand_inherited_rtentry` (`postgres/src/backend/optimizer/util/inherit.c:86`)
+is the **sole** place any descendant RTE is ever added, gated on exactly that
+flag. A partitioned parent is not a special case there — it takes the identical
+path. So goopg gates `PartitionChildren` and `InheritanceChildren` with the one
+conjunct rather than reasoning about them separately. `ONLY` on a partitioned
+table is legal in PG and simply matches nothing (a partitioned parent stores no
+rows of its own); **no new error path was added**, and two of the eight guards
+pin precisely that no-op-not-error behaviour.
+
+The correct precedent already existed one subsystem over, twice:
+`planner.go:3047` gates `collectInheritanceDescendants` on `!rv.Only` for
+SELECT, and `truncateTableAndPartitions(..., only)`
+(`operators_ddl.go:15118,15244,15280`) does the equivalent for `TRUNCATE ONLY`.
+SELECT and TRUNCATE were right the whole time; only DML was wrong.
+
+### Guards
+
+`internal/executor/operators_dml_only_test.go` (new, 277 lines), 8 tests, each
+asserting **both** the surviving rows in parent and child **and** the reported
+affected-row count: DELETE/UPDATE `ONLY` over an `INHERITS` child; the matching
+no-`ONLY` pair as explicit no-regression guards; the `… USING` / `… FROM`
+cross-product twins; and the partitioned-parent no-op pair. FAIL-pre was proven
+by stashing only the three source files: the six `ONLY` tests failed, the two
+no-`ONLY` regression guards stayed green.
+
+### Measurement
+
+**No regress-diff number is claimed for this slice.** Its witness file
+`alter_table.sql` sits at a pre-existing 3781 lines / 110 hunks (§45), where a
+single-hunk correction is not a meaningful signal; `constraints.sql` — the
+campaign's tracked metric — does not exercise `DELETE FROM ONLY` at all and
+stays at its **176 lines / 8 hunks** baseline. The real value here is blast
+radius rather than diff lines: `ONLY` is now honoured for every `UPDATE`/`DELETE`
+in every regress file at once, and §45's split fixture can be re-joined into a
+literal port whenever a later slice touches that test.
+
+### Deferred (ledgered 2026-08-19)
+
+`deleteOp.deleteWithUsing` never fanned out to `PartitionChildren` at all —
+**independently of `ONLY`**. `DELETE FROM <partitioned_parent> USING …` misses
+every partition, while the other three sites and plain `DELETE` handle
+partitions correctly. Found while gating the four sites (three append both child
+kinds; this one appends only inheritance children). Pre-existing, orthogonal to
+this slice, and left untouched per the brief's no-scope-creep clause.
