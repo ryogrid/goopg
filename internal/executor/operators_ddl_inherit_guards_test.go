@@ -183,6 +183,32 @@ func TestAlterTableInheritGuardsRenameColumn(t *testing.T) {
 	}
 }
 
+// TestAlterTableInheritGuardsRenameColumnStarSuffix pins the legacy
+// `ALTER TABLE <tbl>* ...` inheritance-star suffix: it parses (M0134-0015b —
+// the lexer emits '*' as TokenSymbol, not TokenOperator, so the old check
+// never matched) and is a no-op marker, since the unqualified (non-ONLY)
+// form already recurses into descendants by default in goopg, matching PG's
+// `interpretInhOption` default (postgres/src/backend/parser/gram.y).
+func TestAlterTableInheritGuardsRenameColumnStarSuffix(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	for _, s := range []string{
+		"CREATE TABLE b_star (a int, b int)",
+	} {
+		if err := runDDL(t, ctx, s); err != nil {
+			t.Fatalf("setup %q: %v", s, err)
+		}
+	}
+
+	if err := runDDL(t, ctx, "ALTER TABLE b_star* RENAME COLUMN b TO bb"); err != nil {
+		t.Fatalf("ALTER TABLE b_star* RENAME COLUMN b TO bb: %v", err)
+	}
+	if err := runDDL(t, ctx, "ALTER TABLE b_star* ADD COLUMN c int"); err != nil {
+		t.Fatalf("ALTER TABLE b_star* ADD COLUMN c int: %v", err)
+	}
+}
+
 // TestAlterTableInheritGuardsAddColumnOnly pins the ADD COLUMN ONLY guard:
 // `ADD COLUMN` with ONLY on a parent that has children is refused; the
 // recursive (non-ONLY) form and a childless ONLY table still work.

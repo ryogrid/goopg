@@ -4473,6 +4473,70 @@ func wrapOrdinality(node Node, b rangeBinding, rv parser.RangeVar, sourceIdx int
 	return wrapped, rangeBinding{table: newTbl, alias: b.alias, offset: b.offset, sourceIdx: b.sourceIdx}
 }
 
+// userRoutineColumnSchema computes the FROM-clause column schema for a
+// user-defined routine used as a table-function source, shared between the
+// SETOF and non-SETOF (scalar) arms of planTableFuncRangeVar. PG treats
+// naming/typing as shared machinery independent of proretset:
+// postgres/src/backend/parser/parse_clause.c:463 transformRangeFunction
+// builds funcnames/funcexprs/coldeflists for every function regardless of
+// set-ness, resolving types via
+// postgres/src/backend/utils/fmgr/funcapi.c:299/:410
+// get_expr_result_type/get_func_result_type. Returns one catalog.Column per
+// OUT parameter, or the composite return type's own columns, or a single
+// scalar column named alias — with colAliases (from rv.Columns, minus a
+// stripped WITH ORDINALITY tail) overriding names positionally. M0134-0015c.
+func userRoutineColumnSchema(cat catalog.Catalog, r *catalog.Routine, alias string, colAliases []string) []catalog.Column {
+	// If the routine has OUT parameters, expand them as separate columns
+	// (matches PostgreSQL's treatment of SETOF record functions with named
+	// OUT params).
+	var outCols []catalog.Column
+	for i, mode := range r.ArgModes {
+		if mode == "o" || mode == "b" {
+			name := ""
+			if i < len(r.ArgNames) {
+				name = r.ArgNames[i]
+			}
+			if name == "" {
+				name = fmt.Sprintf("column%d", len(outCols)+1)
+			}
+			typ := catalog.Type{Name: "text"}
+			if i < len(r.ArgTypes) {
+				typ = r.ArgTypes[i]
+			}
+			outCols = append(outCols, catalog.Column{Name: name, Type: typ, Ordinal: len(outCols)})
+		}
+	}
+	if len(outCols) > 0 {
+		for i := range outCols {
+			if i < len(colAliases) {
+				outCols[i].Name = colAliases[i]
+			}
+		}
+		return outCols
+	}
+	retTypeName := r.ReturnType.Name
+	if retTypeName == "" {
+		retTypeName = "text"
+	}
+	// If the return type is a composite (table) type, expand its columns.
+	if compTbl, ok := cat.LookupTable(parser.ObjectName{Name: retTypeName}); ok && len(compTbl.Columns) > 0 {
+		compositeCols := make([]catalog.Column, len(compTbl.Columns))
+		copy(compositeCols, compTbl.Columns)
+		for i := range compositeCols {
+			compositeCols[i].Ordinal = i
+			if i < len(colAliases) {
+				compositeCols[i].Name = colAliases[i]
+			}
+		}
+		return compositeCols
+	}
+	colName := alias
+	if len(colAliases) > 0 {
+		colName = colAliases[0]
+	}
+	return []catalog.Column{{Name: colName, Type: catalog.Type{Name: retTypeName}, Ordinal: 0}}
+}
+
 // planTableFuncRangeVar plans a table-valued function in the FROM clause.
 // Currently only generate_series(start, stop[, step]) and pg_input_error_info(value, type)
 // are supported.
@@ -4580,100 +4644,52 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 		if rs := cat.Routines(); rs != nil {
 			cands := rs.LookupByName(parser.ObjectName{Name: tf.Name})
 			for _, r := range cands {
-				if r.ReturnsSet {
-					ctx := &resolveContext{}
-					resolvedArgs := make([]Expr, len(tf.Args))
-					for i, a := range tf.Args {
-						re, err := resolveExpr(a, ctx)
-						if err != nil {
-							return nil, rangeBinding{}, err
-						}
-						resolvedArgs[i] = re
+				ctx := &resolveContext{}
+				resolvedArgs := make([]Expr, len(tf.Args))
+				for i, a := range tf.Args {
+					re, err := resolveExpr(a, ctx)
+					if err != nil {
+						return nil, rangeBinding{}, err
 					}
-					alias := rv.Alias
-					if alias == "" {
-						alias = strings.ToLower(tf.Name)
-					}
-					// If the routine has OUT parameters, expand them as separate
-					// columns (matches PostgreSQL's treatment of SETOF record
-					// functions with named OUT params).
-					var outCols []catalog.Column
-					for i, mode := range r.ArgModes {
-						if mode == "o" || mode == "b" {
-							name := ""
-							if i < len(r.ArgNames) {
-								name = r.ArgNames[i]
-							}
-							if name == "" {
-								name = fmt.Sprintf("column%d", len(outCols)+1)
-							}
-							typ := catalog.Type{Name: "text"}
-							if i < len(r.ArgTypes) {
-								typ = r.ArgTypes[i]
-							}
-							outCols = append(outCols, catalog.Column{Name: name, Type: typ, Ordinal: len(outCols)})
-						}
-					}
-					// Strip ordinality alias if WITH ORDINALITY.
-					userSrfColAliases := rv.Columns
-					if tf.WithOrdinality && len(userSrfColAliases) > 0 {
-						userSrfColAliases = userSrfColAliases[:len(userSrfColAliases)-1]
-					}
-					var tbl *catalog.Table
-					var schema Schema
-					if len(outCols) > 0 {
-						// Multi-column schema from OUT parameters.
-						// Apply column aliases.
-						for i := range outCols {
-							if i < len(userSrfColAliases) {
-								outCols[i].Name = userSrfColAliases[i]
-							}
-						}
-						tbl = &catalog.Table{Name: alias, Columns: outCols}
-						for _, c := range outCols {
-							schema = append(schema, SchemaColumn{Name: c.Name, Type: c.Type, SourceTableIdx: sourceIdx})
-						}
-					} else {
-						retTypeName := r.ReturnType.Name
-						if retTypeName == "" {
-							retTypeName = "text"
-						}
-						// If the return type is a composite (table) type, expand its columns.
-						if compTbl, ok := cat.LookupTable(parser.ObjectName{Name: retTypeName}); ok && len(compTbl.Columns) > 0 {
-							compositeCols := make([]catalog.Column, len(compTbl.Columns))
-							copy(compositeCols, compTbl.Columns)
-							for i := range compositeCols {
-								compositeCols[i].Ordinal = i
-								if i < len(userSrfColAliases) {
-									compositeCols[i].Name = userSrfColAliases[i]
-								}
-							}
-							tbl = &catalog.Table{Name: alias, Columns: compositeCols}
-							for _, c := range compositeCols {
-								schema = append(schema, SchemaColumn{Name: c.Name, Type: c.Type, SourceTableIdx: sourceIdx})
-							}
-						} else {
-							colName := alias
-							if len(userSrfColAliases) > 0 {
-								colName = userSrfColAliases[0]
-							}
-							tbl = &catalog.Table{
-								Name: alias,
-								Columns: []catalog.Column{
-									{Name: colName, Type: catalog.Type{Name: retTypeName}, Ordinal: 0},
-								},
-							}
-							schema = Schema{SchemaColumn{Name: colName, Type: catalog.Type{Name: retTypeName}, SourceTableIdx: sourceIdx}}
-						}
-					}
-					node := &UserSrfScan{pos: tf.Pos(), Routine: r, Args: resolvedArgs, Alias: alias, schema: schema}
-					b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
-					if tf.WithOrdinality {
-						node2, b2 := wrapOrdinality(node, b, rv, sourceIdx)
-						return node2, b2, nil
-					}
-					return node, b, nil
+					resolvedArgs[i] = re
 				}
+				alias := rv.Alias
+				if alias == "" {
+					alias = strings.ToLower(tf.Name)
+				}
+				// Strip ordinality alias if WITH ORDINALITY.
+				userSrfColAliases := rv.Columns
+				if tf.WithOrdinality && len(userSrfColAliases) > 0 {
+					userSrfColAliases = userSrfColAliases[:len(userSrfColAliases)-1]
+				}
+				cols := userRoutineColumnSchema(cat, r, alias, userSrfColAliases)
+				tbl := &catalog.Table{Name: alias, Columns: cols}
+				var schema Schema
+				for _, c := range cols {
+					schema = append(schema, SchemaColumn{Name: c.Name, Type: c.Type, SourceTableIdx: sourceIdx})
+				}
+				var node Node
+				if r.ReturnsSet {
+					node = &UserSrfScan{pos: tf.Pos(), Routine: r, Args: resolvedArgs, Alias: alias, schema: schema}
+				} else {
+					// Non-SETOF (scalar or composite-returning) routine used as a
+					// FROM source. PG calls it exactly once and always produces
+					// exactly one row — postgres/src/backend/executor/execSRF.c:101
+					// ExecMakeTableFunctionResult, the no_function_result: block
+					// (~386-410) manufactures one all-NULL row even when the call
+					// itself returns NULL, never zero rows. scalarFuncScanOp
+					// already implements this one-call/one-row contract via the
+					// same executeStoredRoutine dispatch used for scalar-context
+					// calls like WHERE x = f(1). M0134-0015c.
+					fc := &FuncCall{pos: tf.Pos(), Name: strings.ToLower(tf.Name), Args: resolvedArgs}
+					node = &ScalarFuncScan{pos: tf.Pos(), Func: fc, schema: schema}
+				}
+				b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+				if tf.WithOrdinality {
+					node2, b2 := wrapOrdinality(node, b, rv, sourceIdx)
+					return node2, b2, nil
+				}
+				return node, b, nil
 			}
 		}
 		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "0A000",

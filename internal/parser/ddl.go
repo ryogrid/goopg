@@ -8825,8 +8825,12 @@ func (p *parser) parseAlter() (Stmt, error) {
 		return nil, err
 	}
 	stmt.Name = name
-	// Optional trailing '*' (include children) — accept and discard.
-	if p.cur().Kind == TokenOperator && p.cur().Value == "*" {
+	// Optional trailing '*' (include children) — accept and discard. The
+	// lexer emits '*' as TokenSymbol (lexer.go:391,424), matching every
+	// other star-suffix site (ddl.go:5827, parser.go:1855,3484,
+	// select.go:1121,3039,4134,4285); this comparison used to test
+	// TokenOperator and never matched. M0134-0015b.
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "*" {
 		p.advance()
 	}
 	// OWNER TO role — record the target role name so the executor can update the
