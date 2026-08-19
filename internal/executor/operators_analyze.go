@@ -70,6 +70,29 @@ func (o *analyzeOp) Next() (TupleSlot, error) {
 	}
 	for _, at := range targets {
 		tbl := at.tbl
+		// Maintenance-privilege check (vacuum_is_permitted_to_vacuum, analyze
+		// verb), performed here — in the main per-target execution loop over
+		// the FLATTENED target list, after partition expansion — rather than
+		// in expandAnalyzeTargets' add() closure. SIBLING of the identical
+		// check in operators_vacuum.go's Next() loop (Hard-won Rule #2):
+		// mirrors analyze_rel() (analyze.c:156), which calls
+		// vacuum_is_permitted_for_relation() once per flattened target; PG's
+		// expand_vacuum_rel() does not check ownership when it appends
+		// partition children (vacuum.c:1003-1005). So every target — parent
+		// or expanded child, explicit or not — gets its own WARNING on
+		// denial, independent of the others. Design doc:
+		// docs/design/m0134-0021-vacuum-partition-child-permission.md.
+		//
+		// Gated on an explicit target list: bare `ANALYZE;` (no targets) already
+		// filters non-owned relations SILENTLY in expandAnalyzeTargets (matching
+		// upstream's get_all_vacuum_rels, vacuum.c:1082 — a plain `continue`, no
+		// WARNING), so those denied relations never reach `targets` at all; this
+		// check only needs to fire for the explicit-target-list path, where a
+		// partition child can be denied independently of its parent.
+		if len(o.stmt.Targets) > 0 && !maintenancePermitted(o.ctx, tbl) {
+			o.ctx.AddWarning(fmt.Sprintf("permission denied to analyze %q, skipping it", tbl.Name))
+			continue
+		}
 		rel := o.ctx.Catalog.RelFileNode(tbl)
 		// ANALYZE takes the per-relation ShareUpdateExclusiveLock (analyze.c).
 		// With SKIP_LOCKED the acquire is conditional and a contended relation is
@@ -169,15 +192,32 @@ func (o *analyzeOp) expandAnalyzeTargets() ([]vacuumTarget, []*catalog.Table, *E
 	var out []vacuumTarget
 	var parents []*catalog.Table
 	var add func(tbl *catalog.Table, explicit bool)
+	// expandChildren records tbl as a partitioned parent (for the inheritance
+	// ANALYZE pass) and recurses into its leaf partitions, WITHOUT adding tbl
+	// itself to `out` (it has no storage). SIBLING of the identical helper in
+	// operators_vacuum.go's expandVacuumTargets (Hard-won Rule #2):
+	// deliberately independent of whether tbl passed its own permission check
+	// below, mirroring PG's expand_vacuum_rel(), which appends partition
+	// children unconditionally regardless of the named relation's own
+	// ownership result (vacuum.c:1003-1005), so a denied parent still yields
+	// independent per-child WARNINGs for any denied child
+	// (postgres/src/test/regress/expected/vacuum.out:646-648, "Only one
+	// partition owned by other user").
+	expandChildren := func(tbl *catalog.Table) {
+		if im == nil {
+			return
+		}
+		parents = append(parents, tbl)
+		for _, child := range im.PartitionChildren(tbl.OID, nsOid) {
+			add(child, false)
+		}
+	}
 	add = func(tbl *catalog.Table, explicit bool) {
 		if tbl == nil || tbl.Virtual {
 			return
 		}
 		if tbl.PartitionMethod != "" && im != nil {
-			parents = append(parents, tbl)
-			for _, child := range im.PartitionChildren(tbl.OID, nsOid) {
-				add(child, false)
-			}
+			expandChildren(tbl)
 			return
 		}
 		out = append(out, vacuumTarget{tbl: tbl, explicit: explicit})
@@ -230,13 +270,21 @@ func (o *analyzeOp) expandAnalyzeTargets() ([]vacuumTarget, []*catalog.Table, *E
 			}
 		}
 		// Maintenance-privilege check (vacuum_is_permitted_to_vacuum, analyze
-		// verb). A non-superuser session may only analyze a relation it owns (or
-		// holds MAINTAIN on); otherwise the relation is skipped with a WARNING,
-		// emitted with NO lock so an unprivileged ANALYZE skips immediately rather
-		// than waiting behind a conflicting lock holder. M0118-0008
-		// (vacuum-conflict).
+		// verb) on the EXPLICITLY named relation, at expansion time — mirrors
+		// expand_vacuum_rel's call to vacuum_is_permitted_for_relation()
+		// (vacuum.c:974), which is the ONLY site that ever checks this
+		// relation's own permission (a denial here excludes it from the
+		// flattened target list entirely, so analyze_rel()'s per-target check
+		// — the main loop's maintenancePermitted call in Next() — is never
+		// reached for it). A partitioned table's children are still expanded
+		// and independently checked regardless of this result. M0118-0008
+		// (vacuum-conflict); design doc
+		// docs/design/m0134-0021-vacuum-partition-child-permission.md.
 		if !maintenancePermitted(o.ctx, tbl) {
 			o.ctx.AddWarning(fmt.Sprintf("permission denied to analyze %q, skipping it", tbl.Name))
+			if tbl.PartitionMethod != "" && im != nil {
+				expandChildren(tbl)
+			}
 			continue
 		}
 		add(tbl, true)

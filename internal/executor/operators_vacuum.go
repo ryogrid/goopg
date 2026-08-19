@@ -91,6 +91,29 @@ func (o *vacuumOp) Next() (TupleSlot, error) {
 	}
 	for _, vt := range targets {
 		tbl := vt.tbl
+		// Maintenance-privilege check (vacuum_is_permitted_to_vacuum), performed
+		// here — in the main per-target execution loop over the FLATTENED target
+		// list, after partition expansion — rather than in expandVacuumTargets'
+		// add() closure. This mirrors vacuum_rel() (vacuum.c:2124), which calls
+		// vacuum_is_permitted_for_relation() once per flattened target; PG's
+		// expand_vacuum_rel() explicitly does NOT check ownership when it appends
+		// partition children to the target list (vacuum.c:1003-1005: "we do not
+		// yet check the ownership of the partitions/tables ... Ownership will be
+		// checked later on anyway"). So every target — parent or expanded child,
+		// explicit or not — gets its own WARNING on denial, independent of the
+		// others. Design doc: docs/design/m0134-0021-vacuum-partition-child-permission.md.
+		//
+		// Gated on an explicit target list: a database-wide `VACUUM;` (no
+		// targets) goes through get_all_vacuum_rels upstream, which filters
+		// non-owned relations out of the list SILENTLY before this loop even
+		// runs (vacuum.c:1082 — a plain `continue`, no WARNING) — a distinct,
+		// ledgered asymmetry this case does not touch (design doc "Scope
+		// explicitly excluded"). goopg's database-wide arm does no filtering at
+		// all yet; this check must not change that.
+		if len(vs.Targets) > 0 && !maintenancePermitted(o.ctx, tbl) {
+			o.ctx.AddWarning(fmt.Sprintf("permission denied to vacuum %q, skipping it", tbl.Name))
+			continue
+		}
 		rel := o.ctx.Catalog.RelFileNode(tbl)
 		if vs.SkipLocked {
 			if !o.ctx.tryAcquireMaintenanceLock(rel, lmMode) {
@@ -242,17 +265,32 @@ func (o *vacuumOp) expandVacuumTargets(vs *parser.VacuumStmt) ([]vacuumTarget, [
 	var out []vacuumTarget
 	var parents []*catalog.Table
 	var add func(tbl *catalog.Table, explicit bool)
+	// expandChildren records tbl as a partitioned parent (for the inheritance
+	// ANALYZE pass) and recurses into its leaf partitions, WITHOUT adding tbl
+	// itself to `out` (it has no storage). Deliberately independent of
+	// whether tbl passed its own permission check below: PG's
+	// expand_vacuum_rel() appends partition children to the target list
+	// unconditionally, regardless of the named relation's own ownership
+	// result (vacuum.c:1003-1005 — "we do not yet check the ownership of the
+	// partitions/tables ... Ownership will be checked later on anyway"), so a
+	// denied parent still yields independent per-child WARNINGs for any
+	// denied child (postgres/src/test/regress/expected/vacuum.out:646-648,
+	// "Only one partition owned by other user").
+	expandChildren := func(tbl *catalog.Table) {
+		if im == nil {
+			return
+		}
+		parents = append(parents, tbl)
+		for _, child := range im.PartitionChildren(tbl.OID, nsOid) {
+			add(child, false)
+		}
+	}
 	add = func(tbl *catalog.Table, explicit bool) {
 		if tbl == nil || tbl.Virtual {
 			return
 		}
 		if tbl.PartitionMethod != "" && im != nil {
-			// Partitioned table: expand to children (silent skip on lock), and
-			// remember it for the inheritance ANALYZE pass.
-			parents = append(parents, tbl)
-			for _, child := range im.PartitionChildren(tbl.OID, nsOid) {
-				add(child, false)
-			}
+			expandChildren(tbl)
 			return
 		}
 		out = append(out, vacuumTarget{tbl: tbl, explicit: explicit})
@@ -273,15 +311,22 @@ func (o *vacuumOp) expandVacuumTargets(vs *parser.VacuumStmt) ([]vacuumTarget, [
 					return nil, nil, cerr
 				}
 			}
-			// Maintenance-privilege check (vacuum_is_permitted_to_vacuum). A
-			// non-superuser session (SET ROLE) may only vacuum a relation it owns
-			// (or holds MAINTAIN on); otherwise the relation is skipped with a
-			// WARNING. PostgreSQL performs this in expand_vacuum_rel using the
-			// pg_class syscache with NO lock, so an unprivileged VACUUM skips
-			// immediately instead of waiting behind a conflicting lock holder.
-			// M0118-0008 (vacuum-conflict).
+			// Maintenance-privilege check (vacuum_is_permitted_to_vacuum) on the
+			// EXPLICITLY named relation, at expansion time — mirrors
+			// expand_vacuum_rel's call to vacuum_is_permitted_for_relation()
+			// (vacuum.c:974), which is the ONLY site that ever checks this
+			// relation's own permission (a denial here excludes it from the
+			// flattened target list entirely, so vacuum_rel()'s per-target
+			// check — the main loop's maintenancePermitted call in Next() — is
+			// never reached for it). A partitioned table's children are still
+			// expanded and independently checked regardless of this result.
+			// M0118-0008 (vacuum-conflict); design doc
+			// docs/design/m0134-0021-vacuum-partition-child-permission.md.
 			if !maintenancePermitted(o.ctx, tbl) {
 				o.ctx.AddWarning(fmt.Sprintf("permission denied to vacuum %q, skipping it", tbl.Name))
+				if tbl.PartitionMethod != "" && im != nil {
+					expandChildren(tbl)
+				}
 				continue
 			}
 			add(tbl, true)
