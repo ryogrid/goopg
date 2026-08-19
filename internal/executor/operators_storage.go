@@ -2933,22 +2933,7 @@ func routeToPartitionDepth(parent *catalog.Table, row Row, im *catalog.InMemory,
 	var child *catalog.Table
 	switch parent.PartitionMethod {
 	case "LIST":
-		keyStr := ""
-		if keyDatum.Kind == KindInt {
-			keyStr = fmt.Sprintf("%d", keyDatum.Int)
-		} else if keyDatum.Kind == KindString {
-			keyStr = keyDatum.StringValue()
-		} else if keyDatum.Kind == KindBool {
-			// Try both long ("true"/"false") and short ("t"/"f") boolean formats.
-			// Partition bound values come from string literals like 'true'/'false'.
-			if keyDatum.Int != 0 {
-				keyStr = "true"
-			} else {
-				keyStr = "false"
-			}
-		} else if keyDatum.IsNull() {
-			keyStr = "null" // matches FOR VALUES IN (null)
-		}
+		keyStr := partitionKeyDatumToListStr(keyDatum)
 		child = im.FindPartitionForValue(parent.OID, keyStr)
 		// Also try short boolean format if no match with long format.
 		if child == nil && keyDatum.Kind == KindBool {
@@ -3206,8 +3191,10 @@ func partitionKeyDatumToRangeStr(d Datum) string {
 	}
 }
 
-// partitionKeyDatumToListStr formats a datum the way FindPartitionForValue expects
-// (mirrors the LIST arm of routeToPartitionDepth).
+// partitionKeyDatumToListStr formats a datum the way FindPartitionForValue expects.
+// This is the single formatter used by BOTH the LIST arm of
+// routeToPartitionDepth and routePartitionKeyToImmediateChild — do not let
+// them drift apart again (M0134-0012).
 func partitionKeyDatumToListStr(d Datum) string {
 	switch d.Kind {
 	case KindInt:

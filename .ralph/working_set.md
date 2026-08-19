@@ -1,60 +1,69 @@
-# Working set — M0134-0009 PARKED (parser gaps); real engine fix LANDED; next is M0134-0010
+# Working set — M0134-0012 PARKED; real engine fix LANDED; next is M0134-0013
 
-**Task:** M0134-0009 (`select_views.sql`). Parked like 0008 — but unlike 0008 this
-loop extracted a **real, shipped engine fix** from the sizing round.
+**Task:** M0134-0012 (`update.sql`). Parked like 0008-0011 — and like those, the
+sizing round yielded a **real, shipped engine fix**.
 
-**What landed.** Session identity: `current_user` / `current_role` / `user` /
-`session_user` were the hardcoded literal `"postgres"`
-(`internal/executor/expr.go`), so `SET SESSION AUTHORIZATION` was invisible to
-every query. Design: `docs/design/m0134-0009-session-user-identity.md` (indexed).
-New `Context.SessionUser` + `SetRoleIsActive`, threaded from the site that
-already seeds the `session_authorization` GUC; `SET ROLE` split from
-`SET SESSION AUTHORIZATION` (they were literally the same closure);
-`current_role` added to `IsNoParenFuncName`.
+**What landed.** `routeToPartitionDepth`'s `case "LIST":` arm
+(`internal/executor/operators_storage.go:2934`) formatted the routing key with a
+CLOSED if/else over `KindInt`/`KindString`/`KindBool`/null and **no default arm**.
+A `numeric` LIST key (already coerced by `coerceRowForConstraintChecks` before
+routing) therefore produced `keyStr == ""`, matched no bound, and raised
+`23514 no partition of relation ... found for row`. Net effect: a LIST-partitioned
+table with a numeric/float/date/uuid key could not accept **any** row. Fix = one
+line: call the existing `partitionKeyDatumToListStr` helper. Design:
+`docs/design/m0134-0012-list-partition-numeric-routing.md` (indexed).
 
-**The lesson worth carrying (put in the design doc's Review section):**
-**adding a field to `executor.Context` is a SEVEN-site change.** The brief named
-2 siblings (`dispatch.go`, `query.go` fast path); the implementer found 2 more
-(`dispatch_extended.go`, `extended.go`); adversarial review found 3 more
-(`conn_tx.go` SET LOCAL snapshot/restore, `parallel_worker_ctx.go`, `copy.go`).
-Every miss was a **silent wrong answer**, not a compile error — the field stayed
-at its zero value and fell back to `"postgres"`. Start any future
-Context-state addition from that list.
+**Refuted en route:** the obvious theory — that multi-value `FOR VALUES IN (2,3)`
+bound storage only honoured the first value — is WRONG. Bounds are stored
+per-value on both DDL paths (`operators_ddl.go:8926` ATTACH, `:4982` PARTITION OF),
+matching PG's flattened `create_list_bounds`. Do not re-open it.
 
-**Second lesson:** a passing test proves nothing about which path it ran.
-`TestDispatchPathSessionUserIdentity` sent SETs over the extended protocol (eaten
-by `extended.go`'s fast path) and its SELECT over the simple protocol, so the
-dispatch closures it was named for had **zero coverage** — proven by a coverage
-profile, not by reading. Reaching them needs the multi-statement simple-query
-shape (`SET ROLE alice; SELECT current_user;`).
+**Lesson worth carrying — the sibling pair's *copy* was the correct twin.**
+Three sites format a partition key for the same `FindPartitionForValue` string
+compare: the RANGE arm (`:2966`) and `partitionKeyDatumToListStr` (`:3211`) both
+have `default: d.Format()`; only the LIST arm did not. The helper's own doc
+comment said it "mirrors the LIST arm" — the mirror had drifted *ahead* of the
+original. Usual `pattern_sibling_paths_must_agree` instinct, inverted: when you
+find a duplicated formatter, check which copy is stale, don't assume the
+canonical-looking one is right.
 
-**Review verdict trail:** reviewer returned DO-NOT-SHIP with 13 findings; round 2
-fixed the 7-item ship bar (each FAIL-pre verified by reverting, then restored);
-independent tester re-run returned GO.
-
-**Why PARKED.** `select_views.sql` still needs three unrelated gaps: `?#`
-operator lexing (`?` is not an operator-start char at all), unary prefix `#`, and
-`CREATE SCHEMA <n> CREATE TABLE ...` sub-commands (silently no-op → 52 `ERROR:`
-lines loading `create_view.sql`). CSV row stays `failed` → **no
+**Why PARKED.** Eight independent root causes. The dominant bucket (~300 of 841
+lines) is multi-level partition row routing through column-reordered intermediate
+partitions — REFACTOR-tier. Buckets 2 (partition constraint not enforced on
+UPDATE, 9 stmts) and 3 (RLS on row movement, 4 stmts) are partially CONFOUNDED by
+it: those partitions may look "silently accepting" only because they hold zero
+rows. Re-arm trigger recorded on the task. CSV row stays `failed` → **no
 `make regen-testport`**.
 
-**Five deferral rows appended** (2026-08-19, task-id M0134-0009): privilege gates
-still read `NonSuperuserRole` while identity reads `EffectiveUserName()`;
-`SHOW session_authorization` not tracking `session_user()` (supersedes the
-M0134-0008 row); EXPLAIN deparsing `CURRENT_USER` as `current_user()`;
-`searchPathSchemas` `$user` still hardcoded; the three `select_views` parser gaps.
+**Three deferral rows appended** (2026-08-20, M0134-0012): the nested-routing
+gap; the remaining six buckets + re-arm trigger; string-vs-typed-Datum bound
+comparison (`2` vs `2.0`) plus the still-suspect HASH arm.
 
-**Next step:** select **M0134-0010 (`predicate.sql`)** — a `not-tried` case. Grep
-`postgres/src/test/regress/parallel_schedule` for a `depends on` line FIRST, then
-`scripts/pg-regress-runner.sh --verbose predicate` to size it.
+**Next step:** select **M0134-0013 (`insert.sql`)** — a `failed` case. This loop's
+gate run already measured it at HEAD+fix: **1062 diff lines, 58 `^+ERROR`, 57
+`^-ERROR`**, with the visible diff tail being multi-column-range-partition
+(`mcrparted`) `Partition constraint:` display via `\d+`/`pg_get_expr` — a
+pretty-print gap, NOT tuple routing. Start from that, and check
+`parallel_schedule` for a prerequisite before assuming the failure is real.
 
-**Gates run:** `go build ./...` PASS; `go vet` (executor/postmaster/parser) PASS;
-`go test ./internal/executor/ ./internal/postmaster/ ./internal/parser/` PASS;
-15 named session-identity guard tests PASS; coverage profile confirms
-`dispatch.go:363-401` + `dispatch_extended.go:330-371` now non-zero;
-`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS (postmaster is
-excluded from that scope by design — covered explicitly above).
+**Gates run:** `go build ./...` PASS; `go vet ./internal/executor/` PASS;
+`go test ./internal/executor/` PASS (4 new tests in
+`list_partition_numeric_routing_test.go`; FAIL-pre verified by stashing only the
+`operators_storage.go` edit — 2 of the 4 failed with the verbatim `23514 no
+partition of relation "list_parted" found for row`, and the negative control +
+int/text/bool regression guard correctly passed both before and after, so the
+guard cannot become dead code);
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS (~7.5 min,
+warm cache); `scripts/tpch-spotcheck.sh` PASS with **Q12=2 / Q13=35 exactly
+matching `bench/tpch/spotcheck_expected.env`**;
+`scripts/pg-regress-runner.sh --verbose update` 823 lines / 11 `^+ERROR` (from
+841 / 13) with the reproducer row now appearing as unchanged context. Pre-commit
+pgbench smoke PASS. Caveat: `insert`/`create_table` were re-run as partition-heavy
+regression checks (1062 and 762 lines) but **no HEAD baseline was captured** for
+them — stashing was avoided with foreign WIP in the tree, so "unchanged" is
+inferred from their diff content being display-only, not measured.
 
-**Delegation:** `tmp/ralph-handoffs/M0134-0009a` (tester, sizing, DONE),
-`M0134-0009b` (researcher, DONE), `M0134-0009c` (implementer, 2 rounds, DONE).
+**Delegation:** `tmp/ralph-handoffs/M0134-0012a` (tester, sizing, DONE),
+`M0134-0012b` (researcher, root-cause + verdicts, DONE), `M0134-0012c`
+(implementer, 1 round, DONE), `M0134-0012d` (tester, gates, DONE).
 **In-flight:** none.
