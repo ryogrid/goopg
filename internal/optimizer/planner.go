@@ -2598,6 +2598,13 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 	}
 	*nextSourceIdx++
 	leftCtx := newResolveContext([]rangeBinding{leftBinding}, leftNode.Output())
+	// M0134-0011c: give every per-join resolve context a catalog handle
+	// so IN (subquery) / EXISTS in a JOIN ... ON clause can plan the
+	// sublink via planInExpr (planner.go's `ctx.cat == nil` guard) the
+	// same way the WHERE/target-list path already does. Previously
+	// only the TOP-LEVEL ctx got `.cat` (planFromClause's post-hoc
+	// patch-up), which runs AFTER every ON clause here is resolved.
+	leftCtx.cat = cat
 	for _, j := range item.Joins {
 		// LATERAL on the right side of a JOIN can reference the
 		// left side. Merge the outer lateralCtx with the current
@@ -2620,6 +2627,7 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 		}
 
 		rightCtx := newResolveContext([]rangeBinding{rightBinding}, appendSchema(leftCtx.schema, rightNode.Output()))
+		rightCtx.cat = cat
 		// Build a separate right binding for the merged context with usingHidden set.
 		// This hides the right-side copy of USING columns from unqualified lookup
 		// while rightCtx (above) retains full access for the join predicate.
@@ -2632,6 +2640,7 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 		mergedBindings = append(mergedBindings, mergedRightBinding)
 		mergedSchema := appendSchema(leftCtx.schema, rightNode.Output())
 		mergedCtx := newResolveContext(mergedBindings, mergedSchema)
+		mergedCtx.cat = cat
 
 		pred, err := planJoinPredicate(j, leftCtx, rightCtx, mergedCtx)
 		if err != nil {

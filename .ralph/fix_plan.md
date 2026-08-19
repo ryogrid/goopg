@@ -62,7 +62,7 @@ diverging EXPLAINs with zero hard blockers but five independent root causes, of
 which the loop shipped the smallest (single-baserel NOT NULL qual reduction,
 design `docs/design/m0134-0010-notnull-qual-reduction.md`), taking it to 14/22;
 the rest need outer-join nullability tracking first (re-arm trigger on the task)
-— so the next M0134 task to select is **M0134-0011 (`subselect.sql`)**. Standing rule for the two remaining
+— and **0011 (`subselect.sql`) was PARKED 2026-08-19** on the same pattern: sized at ~90-120 of ~335 statements diverging across seven independent root causes (no missing prerequisite — verified against `parallel_schedule`), of which the loop shipped the only contained one (`IN (subquery)` in a `JOIN ... ON` clause, design `docs/design/m0134-0011-join-on-sublink-catalog.md`), clearing all 5 of the case's SQLSTATE 0A000 errors; the highest-value remainder needs a parser-AST + join-tree refactor first (re-arm trigger on the task) — so the next M0134 task to select is **M0134-0012 (`update.sql`)**. Standing rule for the two remaining
 "possible regression, verify" cases (`mvcc`, `reindex_catalog`, whatever their
 task IDs): re-run `scripts/pg-regress-runner.sh --verbose <case>` at HEAD FIRST
 and, if it already passes, flip the CSV row to `pass` / `pass_required=yes`
@@ -6751,7 +6751,47 @@ listed `select.sql`, `delete.sql` and `sysviews.sql` already carry CSV status
       (c) inheritance per-child constraint exclusion / qual pushdown, and
       (d) `Sort`/`Materialize` emission parity. CSV row stays `not-tried` —
       **no `make regen-testport` needed**. Three ledger rows appended 2026-08-19.
-- [ ] **M0134-0011 — subselect.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
+- [ ] **M0134-0011 — subselect.sql** — **PARKED 2026-08-19.** Sized at HEAD
+      (`scripts/pg-regress-runner.sh --verbose subselect`): ~90-120 of ~335
+      statements diverging, 2831 diff lines, across **seven independent root
+      causes**. Confirmed NOT a stale status and NOT a missing-prerequisite
+      artifact — `parallel_schedule` attaches the "depends on `create_misc`" note
+      to `join`, not `subselect`, and every table the file touches comes from
+      `test_setup.sql`, which the runner already runs. Like 0009 and 0010, the
+      sizing round yielded a **real, shipped engine fix**: `IN (subquery)` inside
+      a `JOIN ... ON` clause was rejected outright with SQLSTATE 0A000
+      (`IN (subquery) not supported in this context`) because
+      `newResolveContext` (`internal/optimizer/planner.go:486-493`) never sets
+      `.cat` and the top-level context gets its catalog only in a post-hoc
+      patch-up (`:1085-1088`) that runs AFTER every ON clause is resolved —
+      hence the asymmetry where the identical sublink worked in `WHERE`/the
+      target list. Fix: three lines in `planFromItem` giving `leftCtx`,
+      `rightCtx` and `mergedCtx` the catalog already in scope. All 5 of the
+      case's 0A000 errors are gone (`^+ERROR` 36 → 31); the diff-line count rose
+      2831 → 2848 because each fixed statement traded a one-line ERROR for a
+      multi-line **plan-shape** mismatch — goopg emits a `SubPlan` in the join
+      qual where PG's `pull_up_sublinks` builds a semijoin (explicit non-goal,
+      ledgered). Design `docs/design/m0134-0011-join-on-sublink-catalog.md`.
+      **Why parked:** the highest-value remaining pair (~27 statements — nested
+      parenthesized-JOIN scoping + VALUES-to-Array with correlated elements) is
+      blocked on an **architectural** gap, not a bug: goopg's parser lowers a
+      parenthesized join to an opaque derived table (`tryParseParenJoin`,
+      `internal/parser/select.go:1175-1245`) and `JoinExpr.Right`
+      (`internal/parser/ast.go:697-704`) cannot hold a nested subtree, so inner
+      aliases are sealed inside a subquery scope before the planner sees them,
+      where PG treats parenthesization as pure grouping with no scoping effect
+      (`parse_clause.c:1149 transformFromClauseItem`, flat
+      `list_concat(l_namespace, r_namespace)` at `:1218`). Fixing that means
+      parser AST + `planFromItem` recursion + the eight optimizer files that
+      consume the flat join-tree shape (`collapse.go deconstructJointree`,
+      `reduce_outer_joins.go`, `joinorder.go`, `with.go` + corpora) — every
+      multi-table query, all of TPC-H/TPC-DS, runs through those. The other four
+      buckets are a SubPlan parameter-lifecycle bug, systemic `EXPLAIN VERBOSE`
+      fidelity (the largest share of the diff, recurs in every regress file),
+      array-subscript result naming, and ten unrelated one-statement bugs.
+      Four deferral rows appended 2026-08-19. CSV row stays `failed` → **no
+      `make regen-testport`**. **RE-ARM TRIGGER:** reselect once either the
+      nested-JOIN scope refactor or an EXPLAIN-VERBOSE-fidelity milestone lands.
 - [ ] **M0134-0012 — update.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
 - [ ] **M0134-0013 — insert.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
 - [ ] **M0134-0014 — mvcc.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). Re-verify at HEAD first (possible regression); if it already passes, flip the CSV row to `pass` with a "stale — already fixed" note instead of implementing.
