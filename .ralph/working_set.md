@@ -1,64 +1,67 @@
-# Working set — M0134-0016 PARKED; errposition fix LANDED; next is M0134-0017
+# Working set — M0134-0018 PARKED; shipped a silent catalog-loss fix out of it
 
-**Task:** M0134-0016 (`create_table.sql`). Commit `56f17b13` (+ bookkeeping).
-Design: `docs/design/m0134-0016-createtable-errposition.md` (indexed).
+**Task:** M0134-0018 (`create_index.sql`) — **PARKED** (case still FAILS; CSV row
+stays `failed`/`pass_required=no`, **no `make regen-testport`**). The loop's
+shipped work is a general correctness fix found while sizing it.
+Design: `docs/design/m0134-0018-temp-shadow-drop-rollback.md` (indexed).
 
-**Sizing.** Still FAILS at HEAD (not a stale status) — 762 diff lines /
-17 `^+ERROR`, seven independent root causes. Shipped the one contained
-highest-leverage bucket.
+**The method note that mattered this loop (carry it).** The researcher's first
+verdict was again "PARK, no bucket is CLOSE-sized" — and it was right about the
+case. But its own report *buried* the real find in an "anomaly flagged, not
+resolved" aside: `public.point_tbl` vanished from `pg_class` mid-case with no
+error. One follow-up round demanding a bisection (which statement, catalog-loss
+vs data-loss, session-scoped vs cluster-wide, restart behavior, root-cause
+file:line) turned that aside into the loop's entire deliverable. **Interrogating
+a park verdict has now paid off two loops running — and this time the prize was
+not in the recommendation, it was in the footnote. Read subagent reports for what
+they under-rate, not just for what they conclude.**
 
-**The fix (bucket A, ~64% of the missing lines).** PG annotates most CREATE
-TABLE validation errors with an `errposition` — wire field `P`, rendered by psql
-as `LINE n:`/`^`. goopg emitted none, with **zero message-text mismatches
-underneath**: the messages were already byte-correct, only the position was
-absent. Root cause was a **sentinel collision**, not a missing feature —
-`ExecError.Pos` is 0-based with `0` doubling as "unset"
-(`internal/postmaster/copy.go:854-858`), while `validatePartitionKey`
-(`operators_ddl_partition.go:144`) and `validatePartitionChildBounds` (`:346`)
-each computed ONE position from the statement (`s.Pos()`) and stamped it on
-every error. A regress statement starts with `CREATE` at offset 0, so the
-position WAS the sentinel and was dropped silently; surviving, it would have
-pointed at `CREATE`. PG threads a per-node `location` into `parser_errposition`
-(`parse_expr.c:585-601`).
+**The bug.** `CREATE TEMP TABLE zz AS SELECT * FROM public.zz` (goopg's
+`create_index.sql:84`) errored *and* permanently deleted `public.zz` from the
+live catalog for every session until restart. `execCreateTable`
+(`operators_ddl.go:1713`) implements TEMP shadowing (M0097-0003) by destructive
+pre-emption: stash the permanent table in `TempTableShadows`, `DropTable` it
+(`:1750-1766`), restore only from `DROP TABLE` on the temp relation
+(`:6936-6945`). That assumes the CREATE succeeds; the self-shadowing CTAS
+guarantees it does not — the drop removes the SELECT's own source, `optimizer.Plan`
+fails at `:4714-4716` before any `CreateTable`, no temp relation exists, so the
+restore is unreachable. Loss is catalog-entry-only (heap file intact),
+cluster-wide (`catalog.InMemory` is shared), and heals on restart — hence silent.
+**Fix:** named-error-return `defer` in `execCreateTable` restoring via a new
+shared `restoreTempShadow` helper (the DROP path was rewired to it, so there is
+ONE notion of "undo a shadow"), covering every post-drop error exit; success path
+bit-identical.
 
-Errors now carry the offending sub-node's own `.Pos()`. `validatePartBoundExpr`'s
-aggregate arm swapped its `containsColumnRef` bool probe for a real recursive
-call — preserves PG's priority (column ref in the args outranks the aggregate
-error) AND yields that ref's position (caret on `a` in `sum(a)`, not `sum`).
-`PARTITION BY` errors had no node (parser unwraps each key's `ColumnRef` to a
-bare string and discards it), so `PartitionByClause` gained `MethodPos`/
-`KeyColPos` — the PG-faithful shape, matching upstream `PartitionSpec.location`/
-`PartitionElem.location`.
+**Sizing (clean, `--no-setup`):** 3475 lines / 43 hunks / 112 `^+ERROR`. The
+runner's setup phase runs `create_index.sql` once already (prereq for
+`aggregates.sql`) then again as the test — that double-run adds ~28 spurious
+`already exists` errors. Buckets 1 (geometric lexer, 58) + 3 (CONCURRENTLY, 25)
+= 74%, both REFACTOR-tier and ledgered; fixing both still leaves 29/112.
 
-**Faithfulness discipline that mattered:** positions added ONLY where PG's
-expected output shows a `LINE`/`^` pair, verified case by case; three errors keep
-`Pos: 0` deliberately. Line NUMBERS are never computed — the field is a byte
-offset, psql derives `LINE n`. Guard tests assert the position EQUALS the token's
-byte offset, not merely non-zero (a non-zero assertion misses a wrong caret).
+**Three deferral rows appended** (2026-08-20, M0134-0018): namespace-keyed
+catalog lookup (PG has no shadow-drop at all — `pg_temp` vs `public` coexist via
+`search_path`, `namespace.c:RangeVarGetRelid`; that end state retires
+`TempTableShadows` entirely and would make the statement SUCCEED); the two
+parked `create_index` buckets; and `SET SESSION ROLE` (no case in the
+string-prefix SET dispatcher — sibling pair `internal/postmaster/query.go` +
+`extended.go`, ~15 LOC, whole `SET SESSION <any-guc>` form affected).
 
-**Result: 762 -> 610 diff lines, `-LINE` 57 -> 29, `+ERROR` unchanged at 17.**
-CSV row stays `failed`, **no `make regen-testport`**.
+**Next step:** select **M0134-0019 (`indexing.sql`)** — re-read the fix_plan
+banner first (sole ordering authority; its "next to select" pointer was stale by
+three tasks this loop and has been refreshed). Then the standing rule: run
+`scripts/pg-regress-runner.sh --verbose <case>` at HEAD BEFORE designing, size
+into buckets, and interrogate any park verdict once.
 
-**Three deferral rows appended** (2026-08-20, M0134-0016): errposition still
-missing on the temp-schema pair; missing on `validatePartitionChildBounds`'s
-CLAUSE-level errors (no offending expr node — needs parser positions for
-`FOR VALUES`/`WITH (MODULUS ...)`/`DEFAULT` tokens); and the six unshipped
-buckets (B MINVALUE overlap miss, C "No partition constraint", D `DROP DOMAIN
-CASCADE` via column domain type, E DETAIL-text gaps, F index deparse parens,
-G row-typed list-partition pruning).
+**Gates run:** `go build ./...` + `go vet ./internal/executor/` clean;
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS
+(`internal/initdb` cache-cold at 439s, not a regression signal);
+`scripts/tpch-spotcheck.sh` PASS with **Q12=2 / Q13=35** exactly;
+`go test -run TestDDL ./internal/executor/` PASS (47 subtests) incl. FAIL-pre /
+PASS-post guard `TestDDLFailedTempShadowCreateRestoresPermanentTable`;
+end-to-end real-server repro on port 5533 confirmed `public.zz` survives and is
+visible from a SECOND connection; pre-commit pgbench smoke PASS.
 
-**Next step:** select **M0134-0017 (`hash_index.sql`)** — a plain `failed` case.
-Apply the stale-status rule first: `scripts/pg-regress-runner.sh --verbose
-hash_index` at HEAD before designing. (Re-check the fix_plan banner first; it is
-the sole ordering authority.)
-
-**Gates run:** `go build ./...`, `go vet`, `go test
-./internal/{executor,parser,optimizer}/` PASS. `RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh` PASS (8m19s; `cmd/goopg` + `internal/initdb`
-ran cache-cold — not a regression signal). `scripts/tpch-spotcheck.sh` PASS with
-**Q12=2 / Q13=35 exactly**. Pre-commit pgbench smoke PASS.
-
-**Delegation:** `tmp/ralph-handoffs/M0134-0016a` (researcher, sizing, 1 round,
-DONE), `M0134-0016b` (implementer, bucket A, 1 round, DONE), `M0134-0016c`
-(tester, gates, 1 round, DONE).
+**Delegation:** `tmp/ralph-handoffs/M0134-0018a` (researcher, sizing + 3
+follow-ups, 2 rounds, DONE), `M0134-0018b` (implementer, 1 round, DONE),
+`M0134-0018c` (tester, gates, 1 round, DONE).
 **In-flight:** none.
