@@ -146,7 +146,7 @@ below**, after the 2026-08-19 priority renumbering; rows that moved say so in th
 | M0134-0005 | `constraints.sql` | failed |  |
 | M0134-0006 | `select_having.sql` | **pass** | renumbered 2026-08-19 (was M0134-0066); **DONE 2026-08-19 — stale `failed`, no goopg change: runner 1/1 PASS at HEAD, CSV flipped to `pass`/`pass_required=yes`** |
 | M0134-0007 | `select_implicit.sql` | **pass** | renumbered 2026-08-19 (was M0134-0067); **DONE 2026-08-19 — stale `failed`, no goopg change: runner 1/1 PASS at HEAD (316 lines byte-identical), CSV flipped to `pass`/`pass_required=yes`** |
-| M0134-0008 | `select_parallel.sql` | not-tried | renumbered 2026-08-19 (was M0134-0166) |
+| M0134-0008 | `select_parallel.sql` | not-tried | **PARKED 2026-08-19** — needs parallel-query execution (see "Prerequisite fixtures, and the first parked case") |
 | M0134-0009 | `select_views.sql` | failed | renumbered 2026-08-19 (was M0134-0068) |
 | M0134-0010 | `predicate.sql` | not-tried | renumbered 2026-08-19 (was M0134-0153) |
 | M0134-0011 | `subselect.sql` | failed | renumbered 2026-08-19 (was M0134-0071) |
@@ -328,6 +328,50 @@ below**, after the 2026-08-19 priority renumbering; rows that moved say so in th
 | M0134-0187 | `generated_stored.sql` | failed | renumbered 2026-08-19 (was M0134-0023) |
 | M0134-0188 | `xml.sql` | not-tried |  |
 | M0134-0189 | `xmlmap.sql` | not-tried |  |
+
+## Prerequisite fixtures, and the first parked case (added 2026-08-19, M0134-0008)
+
+`select_parallel.sql` was the milestone's first `not-tried` case, and sizing it
+produced two findings worth generalising.
+
+**(a) The runner was missing an upstream prerequisite.** Upstream's
+`postgres/src/test/regress/parallel_schedule` documents cross-case dependencies
+explicitly — `# select_parallel depends on create_misc` (`:88`), and the same
+for `join` (`:62`) and `with` (`:114`), with `create_misc` running in the first
+group at `:45`. `scripts/pg-regress-runner.sh`'s `RUN_SETUP` phase ran
+`test_setup.sql`, `create_index.sql` and `create_aggregate.sql` but not
+`create_misc.sql`, so the `a_star`..`f_star` inheritance chain never existed and
+`select_parallel.sql:23` failed on its very first statement — 90% of the
+1526-line diff was one 25P02 cascade from that single missing fixture, masking
+everything real underneath. The step was added in upstream's position (before
+`create_index.sql`), verified non-regressive (`select_having` and
+`select_implicit` still 1/1 PASS; `aggregates` FAILs identically before and
+after, confirmed against a stashed clean baseline).
+
+**Generalised rule for the rest of this milestone: before sizing any case,
+check `parallel_schedule` for a documented `depends on` line.** A case that
+fails on its first statement is far more likely to be missing a fixture than to
+have found an engine bug, and the diff line count will not tell you apart — when
+the prerequisite landed here, the diff stayed *byte-identically* 1526 lines
+because a second root cause took over at the same position.
+
+**(b) Not every case is reachable, and parking beats forcing.** With the fixture
+in place, `create_misc.sql` still cannot finish: goopg's parser rejects
+`ALTER TABLE <table>*` (the legacy trailing-`*` wildcard suffix) and postfix
+`ISNULL`/`NOTNULL`, so `a_star.a` is never renamed to `aa`. But that is *also*
+not the blocker. `select_parallel.sql`'s tail asserts
+`pg_stat_database.parallel_workers_launched` increased (expects `t|t`, goopg
+gives `f|f`), and goopg has no `Gather`/parallel-worker execution path at all —
+so no harness or parser fix can make this case PASS. M0134-0008 is therefore
+**PARKED** with an executable re-arm trigger (land a parallel-query milestone,
+then re-run and re-size), its CSV row left `not-tried`, and six deferral-ledger
+rows appended 2026-08-19 covering the parallel-query blocker, the two parser
+gaps, `SET SESSION AUTHORIZATION` not reaching `current_setting`, function-level
+`SET ROLE`, and a pre-existing `aggregates` planner bug found en route.
+
+**Precedent this sets:** a case that cannot pass without a milestone-sized
+capability is parked with a re-arm trigger and full ledger coverage — never
+closed with a forward reference, and never forced green by weakening the case.
 
 ## Definition of done
 

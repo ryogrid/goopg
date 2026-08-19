@@ -47,8 +47,12 @@ eighteen highest-value cases occupy M0134-0006..0023 (details in the M0134 secti
 preamble at the foot of this file). **M0134-0002, -0003, -0004 and -0005 are all
 PARKED** — 0005 was parked 2026-08-19 by the same directive — and **0006
 (`select_having.sql`) and 0007 (`select_implicit.sql`) were both CLOSED
-2026-08-19 as stale `failed` statuses with no goopg change**, so the next M0134
-task to select is **M0134-0008**. Standing rule for the two remaining
+2026-08-19 as stale `failed` statuses with no goopg change, and **0008
+(`select_parallel.sql`) was PARKED 2026-08-19** — it asserts
+`pg_stat_database.parallel_workers_launched` and goopg has no parallel-worker
+execution path at all, so it is unreachable until a parallel-query milestone
+lands (re-arm trigger recorded on the task) — so the next M0134
+task to select is **M0134-0009**. Standing rule for the two remaining
 "possible regression, verify" cases (`mvcc`, `reindex_catalog`, whatever their
 task IDs): re-run `scripts/pg-regress-runner.sh --verbose <case>` at HEAD FIRST
 and, if it already passes, flip the CSV row to `pass` / `pass_required=yes`
@@ -6672,7 +6676,31 @@ listed `select.sql`, `delete.sql` and `sysviews.sql` already carry CSV status
   - [x] **M0134-0005m — `INSERT … SELECT` silently dropped omitted columns' DEFAULT expressions** — `INSERT INTO INSERT_TBL(y) SELECT yd FROM tmp` left `z INT DEFAULT -1 * currval('insert_seq')` NULL where PG fills it (`constraints.diff:110-166`, 3 hunks, the third pure downstream corruption of the second); the no-column-list narrower-SELECT form (`INSERT INTO INSERT_TBL SELECT * FROM tmp`) had the same hole. **LANDED 2026-08-18.** **The obvious diagnosis was the wrong half:** `rewriteInsertDefaultMarkers` does bail at `planner.go:9877` on `s.Select != nil`, but the DEFAULT was still *attempted* — the executor derives `insertMissing` purely from "ordinal not in `ColumnIndex`" (`internal/executor/operators_storage.go:2405-2440`) and routed the column to `applyDefaultsForMissing`, whose deliberately lightweight `evalGenExpr`/`evalGenFuncCall` (`operators_generated.go:101-230`) has **no `currval` case** and silently returns `NullDatum, nil`. Fix is therefore planner-side and routes the DEFAULT through the FULL evaluator: `planInsert`'s SELECT branch wraps the planned SELECT in an `optimizer.Project` passing its own columns through as `ColumnRef`s and appending one `resolveExpr`-resolved `DefaultExpr` per omitted eligible column, extending `colIndex` in lockstep — **the executor needed zero change** (`Insert.Next` is already generic over `ColumnIndex` width). Rule-#2 twin pair closed by factoring the eligibility predicate into shared `defaultAppendableColumns` (`DefaultExpr != nil && !GeneratedAlways`, skip present), called by both the VALUES marker rewriter and the new SELECT path — the predicate is what keeps serial/identity columns on `autoGenerateSerialValues` and avoids a double sequence advance. PG oracle: `rewriteHandler.c:rewriteTargetListIU` (~`:775`) from `RewriteQuery` (~`:4046-4070`) — PG runs ONE INSERT rewrite path regardless of source shape; the only branch there is a VALUES-RTE *optimization*, not a semantic fork. Guards: `internal/executor/default_omitted_column_select_test.go` (currval fixture, no-column-list narrower SELECT, explicit-NULL-beats-DEFAULT, serial-no-double-advance) plus `TestPlanInsertSelectFewerColumns{AppendsOmittedDefault,TruncatesUndefaultedColumn}` — the latter re-added after the rename, since the original was the sole guard for the 0118-0038 panic regression. **Assertion lesson:** `SELECT 1, 2` already plans to a `*Project` on its own, so "Source is/isn't a `*Project`" tests nothing; assert `len(ins.Source.Output())` instead. Design: `docs/design/0134-0005-constraints-sql-divergence.md` §20. Deferral ledgered 2026-08-18 (COPY FROM / upsert reach the same currval-blind evaluator).
 - [x] **M0134-0006 — select_having.sql** — **STALE `failed`, CLOSED 2026-08-19 with no goopg change.** Per the case's own "possible regression, verify" note, re-verified at HEAD first: `scripts/pg-regress-runner.sh --verbose select_having` reports **1/1 PASS (100.0% parity)**, 84/84 lines byte-identical to `postgres/src/test/regress/expected/select_having.out`, no diff file emitted under `tmp/regress-diffs/`. Independently corroborated by the same night's nightly batch — `ci/logs/20260819-011823/testport/results.csv` records `TestPort_RegressSuite/select_having,PASS`. The `failed` status originated from a baseline capture that contradicted the inventory's own `pass`; it does not reproduce. CSV row flipped to `pass` / `pass_required=yes` with the evidence in its rationale, derived docs regenerated (`make regen-testport`), validator green (`make check-testport-inventory`). No deferral: nothing PG implements here is missing from goopg. **Lesson for the sibling "verify" cases (M0134-0007 `select_implicit`, and the other two named in the milestone doc's Per-task discipline §3): run the runner BEFORE any design work — this one cost one gate run instead of an implementation slice.**
 - [x] **M0134-0007 — select_implicit.sql** — **STALE `failed`, CLOSED 2026-08-19 with no goopg change** (second of the four "possible regression, verify" cases, same outcome as M0134-0006). Verified at HEAD before any design work: `scripts/pg-regress-runner.sh --verbose select_implicit` reports **1/1 PASS (100.0% parity, 0 skipped)**, 316 lines byte-identical to `postgres/src/test/regress/expected/select_implicit.out`, and no diff file was emitted under `tmp/regress-diffs/`. Independently corroborated by the same night's nightly — `ci/logs/20260819-011823/testport/results.csv` line 795 records `TestPort_RegressSuite/select_implicit,PASS,0.08`. The two sources agree; the `failed` status came from a baseline capture that contradicted the inventory's own `pass` and does not reproduce. CSV row flipped to `pass` / `pass_required=yes` with the evidence in its rationale, all **5** derived artifacts regenerated by `make regen-testport` (four under `docs/test-port/` **plus `analysis/postgres-oracle-compatibility-report.md`, which lives outside `docs/`** — stage it explicitly or it silently contradicts the CSV it is generated from), validator `make check-testport-inventory` green. No deferral row: nothing PG implements in this case is missing from goopg. **Two-for-two on the verify cases, but do not generalise to a flip-on-inference:** the remaining two (`mvcc`, `reindex_catalog`) exercise far more engine surface than these two `select_*` cases, so run the runner on each before concluding anything.
-- [ ] **M0134-0008 — select_parallel.sql** — regress-sql `not-tried`: make the case match PG 18.3 (normalise against `./postgres/`). Run the case, fix the divergence; on pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
+- [ ] **M0134-0008 — select_parallel.sql** — **PARKED 2026-08-19: structurally
+      unreachable until goopg has real parallel-query execution.** Sized over two
+      delegated rounds (`tmp/ralph-handoffs/M0134-0008a`, `-0008b`): the case is
+      0/1 FAIL with a 1526-line diff, 90% of it one cascade. Root-caused twice —
+      first to a harness gap (the runner never ran `create_misc.sql`, so `a_star`
+      did not exist; **FIXED this loop**, see below), then, once unmasked, to a
+      goopg parser gap (`ALTER TABLE <table>*` wildcard suffix, postfix
+      `ISNULL`/`NOTNULL`) that stops `create_misc.sql` renaming `a_star.a`→`aa`.
+      **Neither is the blocker.** The file's tail asserts
+      `pg_stat_database.parallel_workers_launched` increased
+      (`select_parallel.sql` ~1341-1347, expects `t|t`, goopg gives `f|f`), and
+      goopg has no `Gather`/parallel-worker path whatsoever — so no harness or
+      parser fix can make this case PASS. **Re-arm trigger:** file and land a
+      parallel-query execution milestone; then re-run
+      `scripts/pg-regress-runner.sh --verbose select_parallel` and re-size.
+      Ledger rows appended 2026-08-19 for the parallel-query blocker, the two
+      parser gaps, `SET SESSION AUTHORIZATION`/`current_setting`, function-level
+      `SET ROLE`, and a pre-existing `aggregates` planner bug found en route.
+      **Landed this loop (net progress, kept):** `scripts/pg-regress-runner.sh`
+      RUN_SETUP now runs `create_misc.sql` in upstream's first-group position
+      (`postgres/src/test/regress/parallel_schedule:45`), which upstream records
+      as a prerequisite for `select_parallel`, **`join` (M0134-0015) and `with`**
+      (`:62,88,114`) — verified no regression: `select_having` and
+      `select_implicit` still 1/1 PASS, `aggregates` FAILs identically before and
+      after (clean stashed-baseline re-run). CSV row stays `not-tried`.
 - [ ] **M0134-0009 — select_views.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
 - [ ] **M0134-0010 — predicate.sql** — regress-sql `not-tried`: make the case match PG 18.3 (normalise against `./postgres/`). Run the case, fix the divergence; on pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
 - [ ] **M0134-0011 — subselect.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
