@@ -126,6 +126,25 @@ func (m *relationStatsManager) stagingFor(sessionID uint64, oid uint32) *relXact
 	return c
 }
 
+// peekStaging reads a session's current-transaction staging counters for one
+// OID WITHOUT allocating a session or OID entry. Mirrors find_tabstat_entry,
+// which is a pure lookup: reading pg_stat_get_xact_tuples_inserted for an OID
+// the session never wrote in this transaction must not materialise a zeroed
+// staging entry for it. M0134-0020.
+func (m *relationStatsManager) peekStaging(sessionID uint64, oid uint32) (relXactCounters, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sess, ok := m.staging[sessionID]
+	if !ok {
+		return relXactCounters{}, false
+	}
+	c, ok := sess[oid]
+	if !ok {
+		return relXactCounters{}, false
+	}
+	return *c, true
+}
+
 // recordScan records one sequential scan over a relation that read `returned`
 // visible tuples. Mirrors pgstat_count_heap_scan + per-tuple
 // pgstat_count_heap_getnext. Scans are NON-transactional, so this writes

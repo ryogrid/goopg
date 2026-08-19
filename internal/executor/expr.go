@@ -12575,6 +12575,26 @@ case "pg_char_to_encoding":
 			return NewIntDatum(c.calls), nil
 		}
 		return NullDatum, nil
+	// pg_stat_get_xact_function_calls(oid) → bigint: number of times the
+	// function has been called so far in the CURRENT open transaction (the
+	// backend-local pending counters, not yet flushed), or NULL when the
+	// session has not called it in this transaction. Unlike the shared-tier
+	// getter above, this reads the pending tier directly (not fetchFuncStat's
+	// stats_fetch_consistency snapshot) — PG's find_funcstat_entry always
+	// reads the backend's own live pending state, which has no cross-session
+	// consistency concern. PG: pgstatfuncs.c:1804. M0134-0020.
+	case "pg_stat_get_xact_function_calls":
+		oid, ok, err := statFuncOIDArg(x, row, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if !ok {
+			return NullDatum, nil
+		}
+		if c, found := funcStats.peekPending(sessionStatsID(ctx), oid); found {
+			return NewIntDatum(c.calls), nil
+		}
+		return NullDatum, nil
 	// pg_stat_get_function_total_time(oid) → double precision: total wall time
 	// spent in the function (and the functions it called), in milliseconds, or
 	// NULL when no stats exist. Design 0118-0124.
@@ -12685,6 +12705,24 @@ case "pg_char_to_encoding":
 			v = 0
 		}
 		return NewIntDatum(v), nil
+	// pg_stat_get_xact_tuples_inserted(oid) → bigint: rows inserted into the
+	// relation so far in the CURRENT open transaction (the per-transaction
+	// staging tier, not yet folded into pending at commit/abort) — visible
+	// BEFORE COMMIT, unlike the shared-tier getter above. An OID the session
+	// has not written in this transaction reads 0, never NULL — the found-bool
+	// is deliberately discarded, matching PG's PG_STAT_GET_XACT_RELENTRY_INT64
+	// macro (find_tabstat_entry == NULL → result = 0). PG: pgstatfuncs.c:1758,
+	// instantiated :1796. M0134-0020.
+	case "pg_stat_get_xact_tuples_inserted":
+		oid, ok, err := statFuncOIDArg(x, row, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if !ok {
+			return NullDatum, nil
+		}
+		c, _ := relStats.peekStaging(sessionStatsID(ctx), oid)
+		return NewIntDatum(c.tuplesInserted), nil
 	}
 
 	// Function-style type casts: int4(x), float8(x), text(x), etc.
