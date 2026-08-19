@@ -3393,6 +3393,7 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				pos2 := p.cur().Pos
 				p.advance() // PARTITION
 				p.advance() // BY
+				methodPos := p.cur().Pos
 				method := ""
 				switch {
 				case p.acceptIdentKeyword("list"):
@@ -3413,14 +3414,14 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				if !p.acceptSymbol("(") {
 					return nil, p.errAtCur("expected '(' after partition method")
 				}
-				keyCols, keyExprs, opClasses, colls, err2 := p.parsePartitionKeyCols()
+				keyCols, keyColPos, keyExprs, opClasses, colls, err2 := p.parsePartitionKeyCols()
 				if err2 != nil {
 					return nil, err2
 				}
 				if !p.acceptSymbol(")") {
 					return nil, p.errAtCur("expected ')'")
 				}
-				stmt.PartitionBy = &PartitionByClause{pos: pos2, Method: method, KeyCols: keyCols, KeyExprs: keyExprs, OpClasses: opClasses, Collations: colls}
+				stmt.PartitionBy = &PartitionByClause{pos: pos2, Method: method, MethodPos: methodPos, KeyCols: keyCols, KeyColPos: keyColPos, KeyExprs: keyExprs, OpClasses: opClasses, Collations: colls}
 			}
 		}
 		// Optional USING <access_method> on a partition child, e.g.
@@ -3685,6 +3686,7 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 		if _, err := p.expectKeyword(KwBy); err != nil {
 			return nil, err
 		}
+		methodPos := p.cur().Pos
 		method := ""
 		switch {
 		case p.acceptIdentKeyword("list"):
@@ -3706,14 +3708,14 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 			return nil, p.errAtCur("expected '(' after partition method")
 		}
 		// Parse column names (or expressions) with optional operator class names. M0097-0015/M0097-0027/M0097-0023.
-		keyCols, keyExprs, opClasses, colls, err2 := p.parsePartitionKeyCols()
+		keyCols, keyColPos, keyExprs, opClasses, colls, err2 := p.parsePartitionKeyCols()
 		if err2 != nil {
 			return nil, err2
 		}
 		if !p.acceptSymbol(")") {
 			return nil, p.errAtCur("expected ')'")
 		}
-		stmt.PartitionBy = &PartitionByClause{pos: pos, Method: method, KeyCols: keyCols, KeyExprs: keyExprs, OpClasses: opClasses, Collations: colls}
+		stmt.PartitionBy = &PartitionByClause{pos: pos, Method: method, MethodPos: methodPos, KeyCols: keyCols, KeyColPos: keyColPos, KeyExprs: keyExprs, OpClasses: opClasses, Collations: colls}
 	}
 	if p.acceptKeyword(KwWith) {
 		opts, err := p.parseWithOptions()
@@ -4199,9 +4201,10 @@ func (p *parser) consumeCreateTableSuffix(stmt *CreateTableStmt) {
 // parsePartitionKeyCols parses the column-list (and possibly expression-list)
 // inside PARTITION BY (key1, key2, ...). Each key may be either a plain column
 // name or a parenthesised expression such as (abs(b)) or ((a+b)/2). M0097-0023.
-func (p *parser) parsePartitionKeyCols() (keyCols []string, keyExprs []Expr, opClasses []string, collations []string, err error) {
+func (p *parser) parsePartitionKeyCols() (keyCols []string, keyColPos []int, keyExprs []Expr, opClasses []string, collations []string, err error) {
 	for {
 		var colName string
+		var colPos int
 		var expr Expr
 		var collation string
 		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
@@ -4225,19 +4228,26 @@ func (p *parser) parsePartitionKeyCols() (keyCols []string, keyExprs []Expr, opC
 			}
 			// Unwrap: ColumnRef → plain column name (most common case).
 			// CollateExpr wrapping a ColumnRef → use column name + store collation.
+			// The column reference's own .Pos() is preserved in colPos (M0134-0016b
+			// errposition) even though the expr node itself is discarded, so the
+			// "column %q named in partition key does not exist" / "cannot use system
+			// column" errors can carry the caret PG puts on the column token.
 			switch v := expr.(type) {
 			case *ColumnRef:
 				colName = v.Column
+				colPos = v.Pos()
 				expr = nil
 			case *CollateExpr:
 				if cr, ok := v.Operand.(*ColumnRef); ok {
 					colName = cr.Column
+					colPos = cr.Pos()
 					collation = v.CollationName
 					expr = nil
 				}
 			}
 		}
 		keyCols = append(keyCols, colName)
+		keyColPos = append(keyColPos, colPos)
 		keyExprs = append(keyExprs, expr)
 		// Optional operator class name (e.g. part_test_int4_ops). M0097-0027.
 		opClass := ""

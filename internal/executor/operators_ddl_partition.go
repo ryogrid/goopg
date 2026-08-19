@@ -19,13 +19,22 @@ import (
 
 // validateDefaultExpr checks that a column DEFAULT expression is valid:
 // no column references, aggregates, subqueries, or SRFs.
+//
+// M0134-0016b: each error stamps the position of the offending sub-node
+// (v.Pos()) rather than the caller-supplied `pos` (the statement's own
+// position, always 0 within a single-statement text and therefore the
+// "unset" sentinel — see ExecError.Pos doc). `pos` is retained only as the
+// value forwarded through pure structural recursion (BinaryOp, CastExpr,
+// …) that never itself raises an error. Mirrors PG's per-node `location`
+// threaded into parser_errposition (postgres/src/backend/parser/
+// parse_expr.c:585-601).
 func validateDefaultExpr(e parser.Expr, pos int, ctx *Context) error {
 	if e == nil {
 		return nil
 	}
 	switch v := e.(type) {
 	case *parser.ColumnRef:
-		return &ExecError{Code: "42P17", Pos: pos,
+		return &ExecError{Code: "42P17", Pos: v.Pos(),
 			Message: "cannot use column reference in DEFAULT expression"}
 	case *parser.FuncCall:
 		name := strings.ToLower(v.Name.Name)
@@ -36,25 +45,25 @@ func validateDefaultExpr(e parser.Expr, pos int, ctx *Context) error {
 			}
 		}
 		if isKnownAggregate(name) || isUserDefinedAggregate(name, ctx) {
-			return &ExecError{Code: "42803", Pos: pos,
+			return &ExecError{Code: "42803", Pos: v.Pos(),
 				Message: "aggregate functions are not allowed in DEFAULT expressions"}
 		}
 		if isBuiltinSRF(name) {
-			return &ExecError{Code: "0A000", Pos: pos,
+			return &ExecError{Code: "0A000", Pos: v.Pos(),
 				Message: "set-returning functions are not allowed in DEFAULT expressions"}
 		}
 		// Check catalog for user-defined SRFs.
 		if rs := ctx.Catalog.Routines(); rs != nil {
 			for _, r := range rs.LookupByName(v.Name) {
 				if r.ReturnsSet {
-					return &ExecError{Code: "0A000", Pos: pos,
+					return &ExecError{Code: "0A000", Pos: v.Pos(),
 						Message: "set-returning functions are not allowed in DEFAULT expressions"}
 				}
 			}
 		}
 	case *parser.SubqueryExpr, *parser.ExistsExpr, *parser.ArraySubqueryExpr:
 		// All three carry a nested SELECT in expression position.
-		return &ExecError{Code: "42P17", Pos: pos,
+		return &ExecError{Code: "42P17", Pos: v.Pos(),
 			Message: "cannot use subquery in DEFAULT expression"}
 	case *parser.BinaryOp:
 		if err := validateDefaultExpr(v.Left, pos, ctx); err != nil {
@@ -147,7 +156,11 @@ func validatePartitionKey(s *parser.CreateTableStmt, cols []catalog.Column, ctx 
 	switch method {
 	case "list", "range", "hash":
 	default:
-		return &ExecError{Code: "42P16", Pos: pos,
+		// M0134-0016b: caret on the method token ("MAGIC" in `PARTITION BY
+		// MAGIC (a)`), not the statement start — matches PG's
+		// parser_errposition(@2) on the partition strategy token
+		// (postgres/src/backend/commands/tablecmds.c: transformPartitionSpec).
+		return &ExecError{Code: "42P16", Pos: pb.MethodPos,
 			Message: fmt.Sprintf("unrecognized partitioning strategy %q", method)}
 	}
 
@@ -175,6 +188,13 @@ func validatePartitionKey(s *parser.CreateTableStmt, cols []catalog.Column, ctx 
 		if i < len(pb.OpClasses) {
 			opClass = pb.OpClasses[i]
 		}
+		// M0134-0016b: the column-reference token's own position, captured by
+		// the parser at parsePartitionKeyCols time (KeyColPos[i]); 0 (no
+		// caret) for expression keys, matching the colName=="" branch below.
+		colPos := 0
+		if i < len(pb.KeyColPos) {
+			colPos = pb.KeyColPos[i]
+		}
 
 		if colName == "" {
 			// Expression key.
@@ -201,14 +221,14 @@ func validatePartitionKey(s *parser.CreateTableStmt, cols []catalog.Column, ctx 
 
 		// System column check.
 		if isSystemColumn(lower) {
-			return &ExecError{Code: "42P16", Pos: pos,
+			return &ExecError{Code: "42P16", Pos: colPos,
 				Message: fmt.Sprintf("cannot use system column %q in partition key", lower)}
 		}
 
 		// Column existence check.
 		col, found := colsByName[lower]
 		if !found {
-			return &ExecError{Code: "42601", Pos: pos,
+			return &ExecError{Code: "42601", Pos: colPos,
 				Message: fmt.Sprintf("column %q named in partition key does not exist", colName)}
 		}
 
@@ -500,23 +520,25 @@ func validatePartBoundExpr(e parser.Expr, pos int, parent *catalog.Table) error 
 	}
 	switch v := e.(type) {
 	case *parser.ColumnRef:
-		return &ExecError{Code: "42P16", Pos: pos,
+		return &ExecError{Code: "42P16", Pos: v.Pos(),
 			Message: "cannot use column reference in partition bound expression"}
 	case *parser.FuncCall:
 		name := strings.ToLower(v.Name.Name)
 		if isKnownAggregate(name) {
-			// PG checks args for column refs before reporting aggregate error.
+			// PG checks args for column refs before reporting aggregate error;
+			// recursing through validatePartBoundExpr (rather than the old
+			// containsColumnRef bool probe) also carries the column ref's own
+			// position (M0134-0016b), e.g. the caret on "a" in `sum(a)`.
 			for _, arg := range v.Args {
-				if containsColumnRef(arg) {
-					return &ExecError{Code: "42P16", Pos: pos,
-						Message: "cannot use column reference in partition bound expression"}
+				if err := validatePartBoundExpr(arg, pos, parent); err != nil {
+					return err
 				}
 			}
-			return &ExecError{Code: "42803", Pos: pos,
+			return &ExecError{Code: "42803", Pos: v.Pos(),
 				Message: "aggregate functions are not allowed in partition bound"}
 		}
 		if isBuiltinSRF(name) {
-			return &ExecError{Code: "0A000", Pos: pos,
+			return &ExecError{Code: "0A000", Pos: v.Pos(),
 				Message: "set-returning functions are not allowed in partition bound"}
 		}
 		for _, arg := range v.Args {
@@ -525,11 +547,11 @@ func validatePartBoundExpr(e parser.Expr, pos int, parent *catalog.Table) error 
 			}
 		}
 	case *parser.SubqueryExpr:
-		return &ExecError{Code: "42P16", Pos: pos,
+		return &ExecError{Code: "42P16", Pos: v.Pos(),
 			Message: "cannot use subquery in partition bound"}
 	case *parser.CollateExpr:
 		if partKeyHasIntegerType(parent) {
-			return &ExecError{Code: "42P18", Pos: pos,
+			return &ExecError{Code: "42P18", Pos: v.Pos(),
 				Message: fmt.Sprintf("collations are not supported by type %s", partKeyFirstTypeName(parent))}
 		}
 		return validatePartBoundExpr(v.Operand, pos, parent)
