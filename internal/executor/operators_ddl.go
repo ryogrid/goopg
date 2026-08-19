@@ -8726,6 +8726,18 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				if act.NoInherit && tbl.PartitionKey != nil {
 					return &ExecError{Code: "42P16", Pos: act.Pos(), Message: fmt.Sprintf("cannot add NO INHERIT constraint to partitioned table %q", tbl.Name)}
 				}
+				// ONLY on a parent with children is refused — mirrors the
+				// ADD COLUMN twin (:11053-11054) and PG's
+				// ATAddCheckNNConstraint (tablecmds.c:10020-10023). Evaluated
+				// AFTER the NO INHERIT gate above (PG :10004-10005 precedes
+				// :10020-10023), so `ONLY ... NO INHERIT` on a table with
+				// children does not error. hasInheritanceChildren covers both
+				// plain-INHERITS children and partitions uniformly, matching
+				// PG's single find_inheritance_children call here.
+				// M0134-0005at.
+				if s.Only && !act.NoInherit && o.hasInheritanceChildren(tbl) {
+					return &ExecError{Code: "42P16", Pos: 0, Message: "constraint must be added to child tables too"}
+				}
 				// Resolve the constraint's name once — PG's ATAddCheckNNConstraint
 				// fills newConstraint->conname a single time at the top and
 				// reuses that same node for every child (tablecmds.c:9911-10049),
@@ -8756,7 +8768,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				// re-emits the ` NOT ENFORCED` suffix (taking precedence over
 				// NOT VALID) and pg_constraint reports conenforced=false.
 				// DU-002 slice 430.
-				tbl.AddCheckFull(act.ConstraintName, act.CheckExpr, o.allocConstraintOID(act.ConstraintName), act.NotValid, act.NoInherit, act.CheckNotEnforced)
+				tbl.AddCheckFull(conName, act.CheckExpr, o.allocConstraintOID(conName), act.NotValid, act.NoInherit, act.CheckNotEnforced)
 				// Propagate to the FULL descendant set (plain-INHERITS children
 				// AND partitions, transitively) — cascadeCheckToChildren mirrors
 				// the NOT NULL twin cascadeNotNullToChildren. M0134-0005as.

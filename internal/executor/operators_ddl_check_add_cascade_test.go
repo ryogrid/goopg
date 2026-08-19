@@ -215,6 +215,27 @@ func TestCheckAddCascadeAnonymousNameResolved(t *testing.T) {
 		t.Errorf("cacan_child's cascaded CHECK name = %q, want %q (PG's <table>_<col>_check auto-naming for a single-column CHECK, resolved on the PARENT)",
 			child.NamedChecks[0].Name, "cacan_parent_b_check")
 	}
+
+	// M0134-0005at fix (B): the PARENT's own NamedChecks entry must carry the
+	// SAME resolved name and a non-zero OID — before the fix, :8759 passed
+	// the raw (empty) act.ConstraintName to both AddCheckFull and
+	// allocConstraintOID, so the parent's entry had Name=="" and OID==0
+	// while the child (fed by the already-resolved conName) got the proper
+	// name and OID.
+	parent, ok := cat.LookupTable(parser.ObjectName{Name: "cacan_parent"})
+	if !ok {
+		t.Fatal("cacan_parent not found")
+	}
+	if len(parent.NamedChecks) != 1 {
+		t.Fatalf("cacan_parent.NamedChecks has %d entries, want 1", len(parent.NamedChecks))
+	}
+	if parent.NamedChecks[0].Name != "cacan_parent_b_check" {
+		t.Errorf("cacan_parent's anonymous CHECK name = %q, want %q (resolved conName, matching the child's cascaded name)",
+			parent.NamedChecks[0].Name, "cacan_parent_b_check")
+	}
+	if parent.NamedChecks[0].OID == 0 {
+		t.Errorf("cacan_parent's anonymous CHECK OID = 0, want a non-zero allocated OID")
+	}
 }
 
 // TestCheckAddCascadeDiamondTerminates covers acceptance criterion 5: a

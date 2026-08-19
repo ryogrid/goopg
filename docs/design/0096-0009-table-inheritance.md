@@ -121,7 +121,52 @@ Oracle: `postgres/src/backend/commands/tablecmds.c:ATAddCheckNNConstraint`
    Previously goopg passed the raw `act.ConstraintName`, so an anonymous
    `ADD CHECK (x > 0)` propagated an empty name to every child.
 
-Still unimplemented (see the deferral ledger): the `ONLY`-with-existing-children
-rejection (`errmsg("constraint must be added to child tables too")`, :10020-10023),
-and the parent's own `AddCheckFull` still registers the raw (possibly empty)
-`act.ConstraintName` while its children now get the resolved one.
+### The ONLY refusal and the parent's own name (M0134-0005at)
+
+Both items the 0005as addendum listed as "still unimplemented" are now closed;
+this section replaces that note.
+
+5. **`ONLY` is a refusal, not a narrowing.** PG raises
+   `ERROR: constraint must be added to child tables too` (42P16,
+   `ERRCODE_INVALID_TABLE_DEFINITION`, no detail, no hint) at :10020-10023
+   whenever the recursion is suppressed and `children != NIL`. Note what this is
+   *not*: `ALTER TABLE ONLY p ADD CHECK …` does **not** mean "add to the parent
+   alone" — PG refuses the statement outright, because a parent-only CHECK would
+   leave the inheritance tree permanently inconsistent with no way to express it
+   in the catalog. goopg previously did neither: it ignored `s.Only` in this case
+   entirely and **cascaded anyway**, so the divergence was the opposite of what
+   the 0005as ledger row predicted ("silently adds to the parent alone").
+   The guard is `if s.Only && !act.NoInherit && o.hasInheritanceChildren(tbl)`,
+   placed after the NO INHERIT gate and before any catalog mutation — the
+   ordering is load-bearing and comes straight from PG, where the `is_no_inherit`
+   return at :10004 precedes the ONLY refusal at :10020, so
+   `ALTER TABLE ONLY t ADD CHECK (…) NO INHERIT` on a table with children is
+   *accepted*. One rule covers partitioned and plain-inheritance parents alike —
+   PG makes a single `find_inheritance_children` call here. Do **not** import the
+   `ATExecSetNotNull` variant (:8017-8028), which does split partitioned from
+   plain and adds an errhint: that is a different function with a different rule,
+   and it is a standing trap in this area.
+6. **The parent stores the resolved name too.** Item 4 above hoisted the name
+   resolution for the *cascade*; the parent's own registration kept passing the
+   raw `act.ConstraintName`, and since `allocConstraintOID` returns 0 for an
+   empty name, an anonymous `ALTER TABLE t ADD CHECK (x > 0)` left the parent
+   with `Name==""` **and `OID==0`** while every child carried a proper
+   `<table>_<col>_check` and a real OID — the tree disagreed with itself. Both
+   arguments now take `conName`. goopg's `o.autoCheckName` already reproduces
+   `ChooseConstraintName`'s shape (`postgres/src/backend/catalog/heap.c`
+   :2548-2575); the gap was purely in which value reached the store.
+
+Upstream coverage: `postgres/src/test/regress/sql/alter_table.sql:2862-2877`
+carries both arms — the reject case on a partitioned parent *with* partitions
+(:2862-2863) and the allow case on a parent with none yet (:2873-2877). Both are
+ported (`operators_ddl_check_add_only_test.go`); the allow arm is what proves the
+guard is not over-broad, and is the arm a narrower port would have missed.
+`constraints.sql` exercises no ONLY+ADD-CHECK case at all, so this slice does not
+move the M0134 metric — it is paid for by correctness and by the `alter_table.sql`
+hunks it retires.
+
+Still unimplemented here (see the deferral ledger): PG's parent-level constraint
+**merge** short-circuit at :9998-9999, which detects an ALTER-added CHECK
+identical to one the relation already holds and returns without erroring or
+recursing. goopg has no parent-side equivalent, so re-adding an identical
+constraint takes the ordinary path.

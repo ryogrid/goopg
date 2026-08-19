@@ -273,11 +273,13 @@ func TestC9DropConstraintOnlyDoesNotCascade(t *testing.T) {
 		return count, inhCount, isLocal
 	}
 
-	// Seed: the regress :2863 form — goopg's ONLY-guard for ADD CONSTRAINT is a
-	// separate ledgered item, so the ONLY ADD propagates to the child (the child
-	// copy is inherited, InhCount=1).
-	if err := runDDL(t, ctx, "ALTER TABLE ONLY p ADD CONSTRAINT check_b CHECK (b <> 'zz')"); err != nil {
-		t.Fatalf("ONLY ADD CONSTRAINT check_b: %v", err)
+	// Seed: goopg's ONLY-guard for ADD CONSTRAINT (M0134-0005at) now rejects
+	// `ONLY ... ADD CONSTRAINT` on a parent with children (42P16), so this
+	// test — which is about DROP ... ONLY, not ADD — seeds with a plain
+	// (non-ONLY) ADD that cascades to the child normally (the child copy is
+	// inherited, InhCount=1).
+	if err := runDDL(t, ctx, "ALTER TABLE p ADD CONSTRAINT check_b CHECK (b <> 'zz')"); err != nil {
+		t.Fatalf("ADD CONSTRAINT check_b: %v", err)
 	}
 	if n, _, _ := checkB("c"); n != 1 {
 		t.Fatalf("after ONLY ADD, child c has %d check_b, want 1", n)
