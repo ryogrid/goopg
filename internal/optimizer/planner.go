@@ -1125,7 +1125,49 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 				if err != nil {
 					return nil, err
 				}
-				node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
+				// M0134-0010 §4: NOT NULL-driven reduction of IS [NOT] NULL
+				// restriction quals (initsplan.c add_base_clause_to_rel /
+				// restriction_is_always_true / restriction_is_always_false),
+				// single-baserel only — this branch IS that gate. See
+				// docs/design/m0134-0010-notnull-qual-reduction.md and
+				// notnull_qual_reduce.go.
+				var reduceTbl *catalog.Table
+				var reduceSrcIdx int
+				if len(ctx.bindings) == 1 {
+					reduceTbl = ctx.bindings[0].table
+					reduceSrcIdx = int(ctx.bindings[0].sourceIdx)
+				}
+				rewritten, alwaysFalse := reduceNotNullQuals(pred, reduceTbl, reduceSrcIdx)
+				switch {
+				case alwaysFalse:
+					// restriction_is_always_false: replace the scan with a
+					// CHILDLESS Result{OneTimeFilter: false} — PG's plan is
+					// `Result / One-Time Filter: false` with NO scan
+					// underneath at all (predicate.out lines 34-40/75-81: 2
+					// rows total, no `->` line). The now-unreachable scan
+					// must not be attached as Child (round 2: it was
+					// wrongly kept, producing a dangling `-> Seq Scan` line
+					// PG never emits). resultOp.Open evaluates OneTimeFilter
+					// against a nil slot and short-circuits to EOF BEFORE
+					// ever touching Child (operators.go Open/Next/Close all
+					// gate on qualFailed first) — the same childless shape
+					// already used by the S6 min/max top-node Result, so a
+					// nil Child here is a pre-existing, exercised path, not
+					// a new one. Targets stay a pass-through identity
+					// projection so Output()/row description still reports
+					// the scan's original column shape for `SELECT *`; they
+					// are never evaluated at runtime since qualFailed always
+					// short-circuits first.
+					scanSchema := node.Output()
+					node = &Result{pos: s.Where.Pos(), Targets: identityResultTargets(scanSchema),
+						OneTimeFilter: &BooleanConst{pos: s.Where.Pos(), Value: false},
+						Child:         nil, schema: scanSchema}
+				case rewritten == nil:
+					// restriction_is_always_true for every conjunct: bare
+					// scan, no Filter node at all.
+				default:
+					node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: rewritten}
+				}
 			}
 		} else {
 			pred, err := resolveExpr(whereQual, ctx)

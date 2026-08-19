@@ -56,8 +56,13 @@ PARKED 2026-08-19** — it needs three independent parser/DDL gaps (`?#` operato
 lexing, unary prefix `#`, `CREATE SCHEMA ... CREATE TABLE` sub-commands) before
 it can pass, though the loop that sized it landed a real engine fix out of it
 (session identity for `current_user`/`session_user`, design
-`docs/design/m0134-0009-session-user-identity.md`) — so the next M0134
-task to select is **M0134-0010 (`predicate.sql`)**. Standing rule for the two remaining
+`docs/design/m0134-0009-session-user-identity.md`) — and **0010
+(`predicate.sql`) was PARKED 2026-08-19** on the same pattern: sized at 18/22
+diverging EXPLAINs with zero hard blockers but five independent root causes, of
+which the loop shipped the smallest (single-baserel NOT NULL qual reduction,
+design `docs/design/m0134-0010-notnull-qual-reduction.md`), taking it to 14/22;
+the rest need outer-join nullability tracking first (re-arm trigger on the task)
+— so the next M0134 task to select is **M0134-0011 (`subselect.sql`)**. Standing rule for the two remaining
 "possible regression, verify" cases (`mvcc`, `reindex_catalog`, whatever their
 task IDs): re-run `scripts/pg-regress-runner.sh --verbose <case>` at HEAD FIRST
 and, if it already passes, flip the CSV row to `pass` / `pass_required=yes`
@@ -6727,7 +6732,25 @@ listed `select.sql`, `delete.sql` and `sysviews.sql` already carry CSV status
       Upstream prerequisite: `postgres/src/test/regress/parallel_schedule:103`
       (`# select_views depends on create_view`). CSV row stays `failed` —
       **no `make regen-testport` needed**. Ledger rows appended 2026-08-19.
-- [ ] **M0134-0010 — predicate.sql** — regress-sql `not-tried`: make the case match PG 18.3 (normalise against `./postgres/`). Run the case, fix the divergence; on pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
+- [ ] **M0134-0010 — predicate.sql** — **PARKED 2026-08-19.** Sized at HEAD
+      (`scripts/pg-regress-runner.sh --verbose predicate`): the file is 100%
+      `EXPLAIN (COSTS OFF)` plan-shape assertions, **18 of 22 diverging with ZERO
+      `ERROR` lines** — no hard blockers, but five *independent* root causes, four
+      of which are separate features. The loop that sized it landed the smallest
+      shippable one: **NOT NULL-driven reduction of `IS NULL`/`IS NOT NULL`
+      restriction quals for single-baserel queries**, mirroring
+      `initsplan.c restriction_is_always_true/_false` — design
+      `docs/design/m0134-0010-notnull-qual-reduction.md` (indexed). That took the
+      case **18/22 → 14/22**, with the entire single-table restriction/OR-clause
+      block now byte-identical to PG. Also fixed en route: the always-false `Result`
+      is now childless (PG emits no `->` line) and `One-Time Filter:` no longer
+      parenthesizes a bare literal. **Re-arm trigger:** the remaining 14 need
+      (a) outer-join nullability tracking (`Var.varnullingrels` — goopg has no
+      equivalent; this is the HARD prerequisite, since the "must NOT reduce" cases
+      pass today only accidentally), then (b) join `ON`-clause qual reduction,
+      (c) inheritance per-child constraint exclusion / qual pushdown, and
+      (d) `Sort`/`Materialize` emission parity. CSV row stays `not-tried` —
+      **no `make regen-testport` needed**. Three ledger rows appended 2026-08-19.
 - [ ] **M0134-0011 — subselect.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
 - [ ] **M0134-0012 — update.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
 - [ ] **M0134-0013 — insert.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.

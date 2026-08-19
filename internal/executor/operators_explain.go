@@ -627,8 +627,21 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		// as the scan `Filter:` line. formatExprQual's IsNullExpr arm renders
 		// `(100 IS NOT NULL)` with its parens already built in, and wrapParen
 		// does not double-wrap a single paren group.
+		//
+		// M0134-0010c round 2: a bare literal constant (goopg's always-false
+		// NOT NULL reduction wraps the scan in
+		// `Result{OneTimeFilter: BooleanConst{false}}`) must NOT be
+		// parenthesized — PG's ruleutils never wraps a lone Const in this
+		// position (`predicate.out`: `One-Time Filter: false`, no parens).
+		// Every compound expression (NullTest, OpExpr, ...) already carries
+		// its own parens from formatExprQual and is unaffected by this
+		// literal-only exception.
 		if p.OneTimeFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "One-Time Filter: " + wrapParen(formatExprQual(p.OneTimeFilter, reg, qualify)))})
+			otf := formatExprQual(p.OneTimeFilter, reg, qualify)
+			if !isLiteralOneTimeFilterConst(p.OneTimeFilter) {
+				otf = wrapParen(otf)
+			}
+			*rows = append(*rows, Row{NewStringDatum(indent + "One-Time Filter: " + otf)})
 		}
 	case *optimizer.Gather:
 		// PG emits `Workers Planned:` in PLAIN EXPLAIN — it is a plan-time
@@ -950,6 +963,26 @@ func formatIndexCond(p *optimizer.IndexScan, reg *subPlanReg) string {
 		}
 	}
 	return ""
+}
+
+// isLiteralOneTimeFilterConst reports whether e is a bare literal constant —
+// the ONLY case PG's ruleutils leaves unparenthesised in a `One-Time Filter:`
+// position (verified against `false` in predicate.out/case.out/join.out/
+// inherit.out/groupingsets.out; every compound OneTimeFilter observed there
+// — NullTest, OpExpr, function calls, InitPlan refs — already renders with
+// its own parens via formatExprQual). Narrowly scoped to the literal-Const
+// node kinds this pass can actually produce (BooleanConst) plus the other
+// planner literal kinds for consistency; NOT extended to bare Var/FuncExpr
+// (`"*VALUES*".column1`, `tattle(9, 8)`) since goopg does not yet build a
+// One-Time Filter of those shapes — deferred with the rest of the join-qual
+// slice (M0134-0010c round 2 report).
+func isLiteralOneTimeFilterConst(e optimizer.Expr) bool {
+	switch e.(type) {
+	case *optimizer.BooleanConst, *optimizer.IntegerConst, *optimizer.NumericConst,
+		*optimizer.StringConst, *optimizer.NullConst:
+		return true
+	}
+	return false
 }
 
 // wrapParen wraps s in parentheses unless it already is parenthesised.
