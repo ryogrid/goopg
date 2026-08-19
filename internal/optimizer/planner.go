@@ -8830,7 +8830,12 @@ func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.
 			if !ok {
 				return nil, false, nil
 			}
-			idx := findBTreeIndexForColumn(cat, tbl, col.Name)
+			// resolvedKey is an OuterColumnRef here, never a Const, so this
+			// synthetic clause can never satisfy provePartialIndexPredicate's
+			// Var-op-Const shape — it is passed through only so the helper's
+			// (correct) refusal is by shape, not by omission.
+			queryClause := Expr(&BinaryOp{pos: where.Pos(), Op: b.Op, Left: col, Right: resolvedKey})
+			idx := findBTreeIndexForColumn(cat, tbl, col.Name, queryClause)
 			if idx == nil {
 				return nil, false, nil
 			}
@@ -8902,7 +8907,13 @@ func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.
 		return nil, false, nil
 	}
 
-	idx := findBTreeIndexForColumn(cat, tbl, col.Name)
+	// b.Op is OpEq here (checked above), so this is `col = resolvedKey` —
+	// exactly the Var-op-Const shape provePartialIndexPredicate proves
+	// against a partial index's predicate. resolvedKey is not always a
+	// literal Const (ParamRef, CastExpr, TypedStringLit) — the helper's
+	// toLiteralValue-based recognizer refuses those by shape, as it should.
+	queryClause := Expr(&BinaryOp{pos: where.Pos(), Op: b.Op, Left: col, Right: resolvedKey})
+	idx := findBTreeIndexForColumn(cat, tbl, col.Name, queryClause)
 	if idx == nil {
 		return nil, false, nil
 	}
@@ -9105,7 +9116,7 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 		// agg column (the IOS decodes just the covered column; any other ref would be
 		// out-of-range on the 1-wide row — e.g. `min(unique1) WHERE ten = 3` stays on
 		// the SeqScan fallback, as PG would leave it a heap-fetch residual).
-		if idx := findBTreeIndexForColumn(cat, tbl, argCR.Name); idx != nil &&
+		if idx := findBTreeIndexForColumn(cat, tbl, argCR.Name, nil); idx != nil &&
 			(wherePred == nil || wherePredSafeForIOS(wherePred, argCR)) {
 			covered, ok := cat.LookupColumn(tbl, argCR.Name)
 			if !ok {
@@ -9488,7 +9499,17 @@ func wherePredSafeForIOS(wherePred Expr, argCR *ColumnRef) bool {
 // A single-column-only index is preferred when both shapes match the
 // column (cheaper probe — exact equality vs. prefix range) so the
 // search returns a single-column index first when one exists.
-func findBTreeIndexForColumn(cat catalog.Catalog, tbl *catalog.Table, col string) *catalog.Index {
+//
+// queryClause is the resolved (planner.Expr) restriction clause the caller
+// has in hand for this scan, or nil when no literal clause is available
+// (e.g. the min/max IOS rewrite, the range-scan and conjunct-absorption
+// callers below). For a partial index (`idx.HasPredicate`), the index is
+// only accepted when `provePartialIndexPredicate` proves queryClause implies
+// the index's predicate — the M0134-0017b narrow `operator_predicate_proof`
+// specialization (both clauses are `Var op Const` over the same column, same
+// operator, equal constant). A nil queryClause can never prove anything, so
+// callers that pass nil keep today's blanket decline exactly as before.
+func findBTreeIndexForColumn(cat catalog.Catalog, tbl *catalog.Table, col string, queryClause Expr) *catalog.Index {
 	var composite *catalog.Index
 	for _, idx := range cat.IndexesOnTable(tbl) {
 		if strings.ToLower(idx.Method) != "btree" {
@@ -9497,18 +9518,31 @@ func findBTreeIndexForColumn(cat catalog.Catalog, tbl *catalog.Table, col string
 		// A partial index. PG only reaches `build_index_paths` for an index
 		// whose predicate was PROVEN from the query's restriction clauses
 		// (`check_index_predicates` sets `index->predOK`; an unproven partial
-		// index is skipped in `create_index_paths`). goopg has no
-		// predicate-implication prover, so the honest answer is to decline
-		// rather than to emit a scan that silently drops every row the index
-		// predicate excludes. This mirrors the identical guard on the ordered
-		// path (`pathindexordered.go` `addOneOrderedIndexPath`), which was
-		// left un-mirrored here — the gap returned 0 rows for
-		// `onek2 WHERE unique1 = 50` against `onek2_u1_prtl (WHERE unique1 <
-		// 20 OR unique1 > 980)` in the regress cases `portals_p2`/`select`.
-		// Ledgered: teaching goopg the prover would let it USE the index when
-		// the qual does imply the predicate, as PG does.
+		// index is skipped in `create_index_paths`). goopg has no general
+		// predicate-implication prover, but M0134-0017b ports the narrow leaf
+		// case: when queryClause and the index predicate are both `Var op
+		// Const` over the same column with the same operator and an equal
+		// constant, the index predicate IS the query's own qual, so the index
+		// provably contains every row the scan may return. Anything else
+		// still declines — using an unproven partial index silently drops
+		// the rows its predicate excludes. This mirrors the identical guard
+		// on the ordered path (`pathindexordered.go`
+		// `addOneOrderedIndexPath`), which was left un-mirrored here — the
+		// gap returned 0 rows for `onek2 WHERE unique1 = 50` against
+		// `onek2_u1_prtl (WHERE unique1 < 20 OR unique1 > 980)` in the
+		// regress cases `portals_p2`/`select` (deferral ledger, 2026-08-07,
+		// `M0127 S7 gate / AI-20260806-232940-001,-002`).
 		if idx.HasPredicate {
-			continue
+			if queryClause == nil {
+				continue
+			}
+			resolvedPred, err := ResolveIndexPredicate(idx.Predicate, tbl)
+			if err != nil || resolvedPred == nil {
+				continue
+			}
+			if !provePartialIndexPredicate(resolvedPred, queryClause) {
+				continue
+			}
 		}
 		if len(idx.Columns) == 0 || idx.Columns[0] != col {
 			continue
@@ -9802,7 +9836,7 @@ func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContex
 		// Ensure column is from the target table (not outer ref)
 		if chosenColName == "" {
 			// First indexed column: look up a B-tree index for it
-			idx := findBTreeIndexForColumn(cat, tbl, col.Name)
+			idx := findBTreeIndexForColumn(cat, tbl, col.Name, nil)
 			if idx == nil {
 				continue
 			}

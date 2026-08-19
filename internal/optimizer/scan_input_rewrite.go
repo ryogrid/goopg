@@ -189,7 +189,7 @@ func absorbConjunctsIntoSubtree(pred Expr, parent *Filter, cat catalog.Catalog) 
 	}
 	chosen := map[*SeqScan]scanChoice{}
 	for k, b := range groups {
-		idx := findBTreeIndexForColumn(cat, k.scan.Table, k.col)
+		idx := findBTreeIndexForColumn(cat, k.scan.Table, k.col, nil)
 		if idx == nil {
 			continue
 		}
@@ -207,7 +207,7 @@ func absorbConjunctsIntoSubtree(pred Expr, parent *Filter, cat catalog.Catalog) 
 	// Apply chosen rewrites + remember which conjuncts to drop.
 	dropEqConjuncts := make(map[Expr]struct{})
 	for ss, ch := range chosen {
-		idx := findBTreeIndexForColumn(cat, ss.Table, ch.key.col)
+		idx := findBTreeIndexForColumn(cat, ss.Table, ch.key.col, nil)
 		if idx == nil {
 			continue
 		}
