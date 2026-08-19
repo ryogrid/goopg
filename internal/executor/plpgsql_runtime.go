@@ -2105,6 +2105,86 @@ func exceptionHandlerMatches(conditions []string, sqlstate string, conditionName
 	return false
 }
 
+// errPLpgSQLExprNeedsSQL is a sentinel signalling that a PL/pgSQL expression
+// contains a sublink (EXISTS / IN (subquery) / a non-root scalar subquery)
+// and cannot be lowered to the bespoke interpreter's optimizer.Expr tree —
+// it must instead be planned and run as a real SQL query. PostgreSQL has no
+// such split at all: every PL/pgSQL expression is planned as literal
+// `SELECT <expr>` text (postgres/src/pl/plpgsql/src/pl_exec.c,
+// exec_prepare_plan ~4173). goopg's node-kind allow-list in
+// lowerPLpgSQLExpr is the divergence; this sentinel routes the three
+// sublink-bearing node kinds to evalExprViaSQL instead of failing outright.
+// docs/design/m0134-0014-plpgsql-sublink-sql-fallback.md, M0134-0014c.
+var errPLpgSQLExprNeedsSQL = errors.New("plpgsql expression contains a sublink; needs SQL evaluation")
+
+// plpgsqlExprNeedsSQLError wraps the *ExecError a rejection site would have
+// returned unchanged, while additionally satisfying
+// errors.Is(err, errPLpgSQLExprNeedsSQL). It uses the Go 1.20+ multi-error
+// Unwrap() []error form so BOTH errors.Is (via the sentinel) and errors.As
+// (via the embedded *ExecError) succeed on the same value — callers that
+// still do a bare `err.(*ExecError)` type assertion never see this wrapper
+// because evalPLpgSQLExpr intercepts and resolves it before it can leak
+// past the lowering call; callers that inspect an error escaping the SQL
+// route itself see evalExprViaSQL's own *ExecError/planner error directly.
+type plpgsqlExprNeedsSQLError struct {
+	execErr *ExecError
+}
+
+func (e *plpgsqlExprNeedsSQLError) Error() string { return e.execErr.Error() }
+
+func (e *plpgsqlExprNeedsSQLError) Unwrap() []error {
+	return []error{errPLpgSQLExprNeedsSQL, e.execErr}
+}
+
+// wrapNeedsSQL is the constructor lowerPLpgSQLExpr's three sublink
+// rejection sites use in place of returning ee directly.
+func wrapNeedsSQL(ee *ExecError) error {
+	return &plpgsqlExprNeedsSQLError{execErr: ee}
+}
+
+// evalExprViaSQL plans and runs the original (un-lowered) PL/pgSQL
+// expression as a synthetic single-target, no-FROM `SELECT <e>`, exactly
+// the way PostgreSQL plans every PL/pgSQL expression (pl_exec.c
+// exec_prepare_plan / exec_run_select). Mirrors evalScalarSubquery's
+// Plan/Build/Open/Next sequence and EOF convention: no row (or a
+// zero-width row) yields a NULL Datum{}. The AST is built directly — not
+// re-parsed from generated SQL text, since an expression has no reliable
+// textual round-trip. docs/design/m0134-0014-plpgsql-sublink-sql-fallback.md
+// §Design step 3. Known limitation: this plans e untouched, with no
+// PL/pgSQL frame-variable substitution (same limitation evalScalarSubquery
+// already has for sq.Inner) — see the design doc's §"Known limitation".
+func evalExprViaSQL(e parser.Expr, ctx *Context) (Datum, error) {
+	stmt := &parser.SelectStmt{
+		Targets: []parser.ResTarget{{Expr: e}},
+	}
+	plan, err := optimizer.Plan(stmt, ctxPlanCatalog(ctx))
+	if err != nil {
+		return Datum{}, err
+	}
+	op, err := Build(plan)
+	if err != nil {
+		return Datum{}, err
+	}
+	if err := op.Open(ctx); err != nil {
+		op.Close()
+		return Datum{}, err
+	}
+	defer op.Close()
+	slot, nerr := op.Next()
+	if nerr != nil && nerr != EOF {
+		return Datum{}, nerr
+	}
+	if slot == nil || nerr == EOF {
+		// No rows ⇒ NULL.
+		return Datum{}, nil
+	}
+	row := slotRow(slot)
+	if len(row) == 0 {
+		return Datum{}, nil
+	}
+	return row[0], nil
+}
+
 func evalPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame, ctx *Context) (Datum, error) {
 	// A top-level scalar subquery (`x := (SELECT ...)`) cannot be lowered to a
 	// planner.Expr — it must be planned and executed against the live catalog to
@@ -2116,6 +2196,15 @@ func evalPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame, ctx *Context) (Datum, e
 	}
 	pe, err := lowerPLpgSQLExpr(e, frame)
 	if err != nil {
+		// A sublink nested below the expression root (EXISTS(...), IN
+		// (subquery), or a non-root scalar subquery) cannot be lowered to
+		// the interpreter's optimizer.Expr tree; fall back to planning and
+		// running the original expression as real SQL, exactly as
+		// PostgreSQL always does. docs/design/m0134-0014-plpgsql-sublink-sql-fallback.md
+		// §Design steps 2/4, M0134-0014c.
+		if errors.Is(err, errPLpgSQLExprNeedsSQL) {
+			return evalExprViaSQL(e, ctx)
+		}
 		return Datum{}, err
 	}
 	d, err := evalExpr(pe, frame.values, ctx)
@@ -2219,7 +2308,7 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (optimizer.Expr, error
 		return out, nil
 	case *parser.InExpr:
 		if x.Subquery != nil {
-			return nil, &ExecError{Code: "0A000", Pos: x.Pos(), Message: "IN (subquery) is not supported in PL/pgSQL expressions in v0"}
+			return nil, wrapNeedsSQL(&ExecError{Code: "0A000", Pos: x.Pos(), Message: "IN (subquery) is not supported in PL/pgSQL expressions in v0"})
 		}
 		op, err := lowerPLpgSQLExpr(x.Operand, frame)
 		if err != nil {
@@ -2235,9 +2324,9 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (optimizer.Expr, error
 		}
 		return &optimizer.InExpr{Operand: op, Negated: x.Negated, List: list}, nil
 	case *parser.ExistsExpr:
-		return nil, &ExecError{Code: "0A000", Pos: x.Pos(), Message: "EXISTS is not supported in PL/pgSQL expressions in v0"}
+		return nil, wrapNeedsSQL(&ExecError{Code: "0A000", Pos: x.Pos(), Message: "EXISTS is not supported in PL/pgSQL expressions in v0"})
 	case *parser.SubqueryExpr:
-		return nil, &ExecError{Code: "0A000", Pos: x.Pos(), Message: "subqueries are not supported in PL/pgSQL expressions in v0"}
+		return nil, wrapNeedsSQL(&ExecError{Code: "0A000", Pos: x.Pos(), Message: "subqueries are not supported in PL/pgSQL expressions in v0"})
 	case *parser.NullConst:
 		return &optimizer.NullConst{}, nil
 	case *parser.BooleanConst:
