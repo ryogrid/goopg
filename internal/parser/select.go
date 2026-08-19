@@ -4257,7 +4257,7 @@ func IsNoParenFuncName(name string) bool {
 	switch name {
 	case "current_timestamp", "current_date", "current_time",
 		"localtime", "localtimestamp",
-		"current_user", "session_user", "user",
+		"current_user", "session_user", "user", "current_role",
 		"current_catalog", "current_schema":
 		return true
 	}

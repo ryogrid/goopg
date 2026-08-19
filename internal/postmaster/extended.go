@@ -592,13 +592,20 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *misc.SessionReg
 	case upper == "RESET ALL":
 		sess.ResetAll()
 		return &extendedQueryResult{CommandTag: "RESET"}, nil
-	// RESET SESSION AUTHORIZATION / RESET ROLE — restore the bootstrap
-	// superuser's full privileges. Must be checked before the generic
-	// "RESET " case. M0119-0004.
-	case upper == "RESET SESSION AUTHORIZATION", upper == "RESET ROLE":
+	// RESET SESSION AUTHORIZATION / RESET ROLE — must be checked before the
+	// generic "RESET " case. Split (M0134-0009): RESET SESSION AUTHORIZATION
+	// restores the connect-time login user (and clears any active SET ROLE);
+	// RESET ROLE only clears the active role, leaving session_user alone.
+	case upper == "RESET SESSION AUTHORIZATION":
 		if connTx != nil {
-			connTx.NonSuperuserRole = ""
-			setIsSuperuserGUC(sess, true)
+			applySetSessionAuthorization(connTx, "")
+			setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
+		}
+		return &extendedQueryResult{CommandTag: "RESET"}, nil
+	case upper == "RESET ROLE":
+		if connTx != nil {
+			applySetRole(connTx, "")
+			setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
 		}
 		return &extendedQueryResult{CommandTag: "RESET"}, nil
 	case strings.HasPrefix(upper, "RESET "):
@@ -758,12 +765,7 @@ func setSessionAuthorizationFastPath(sess *misc.SessionRegistry, connTx *connTxS
 	role := strings.TrimSpace(matchable[len(prefix):])
 	role = strings.Trim(role, `"'`)
 	connTx.SnapshotLocalRoleIfNeeded(local)
-	switch strings.ToUpper(role) {
-	case "", "DEFAULT", "RESET", "POSTGRES":
-		connTx.NonSuperuserRole = ""
-	default:
-		connTx.NonSuperuserRole = role
-	}
+	applySetSessionAuthorization(connTx, role)
 	setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
 }
 
@@ -777,12 +779,7 @@ func setRoleFastPath(sess *misc.SessionRegistry, connTx *connTxState, matchable,
 	role := strings.TrimSpace(matchable[len(prefix):])
 	role = strings.Trim(role, `"'`)
 	connTx.SnapshotLocalRoleIfNeeded(local)
-	switch strings.ToUpper(role) {
-	case "", "DEFAULT", "NONE", "POSTGRES":
-		connTx.NonSuperuserRole = ""
-	default:
-		connTx.NonSuperuserRole = role
-	}
+	applySetRole(connTx, role)
 	setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
 }
 

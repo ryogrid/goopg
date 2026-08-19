@@ -53,9 +53,13 @@ func (o *utilitySettingsOp) Next() (TupleSlot, error) {
 					o.ctx.SetRole("", stmt.Local)
 				} else {
 					switch strings.ToUpper(stmt.Value) {
-					case "", "NONE", "POSTGRES":
+					case "", "NONE":
 						o.ctx.SetRole("", stmt.Local)
 					default:
+						// "postgres" is NOT collapsed to "" here — it is an
+						// explicit role target, not a NONE/DEFAULT synonym
+						// (round-2 review R6/R7); ctx.SetRole's own switch
+						// distinguishes it from a genuine reset.
 						o.ctx.SetRole(stmt.Value, stmt.Local)
 					}
 				}
@@ -71,9 +75,15 @@ func (o *utilitySettingsOp) Next() (TupleSlot, error) {
 				} else {
 					role := stmt.Value
 					switch strings.ToUpper(role) {
-					case "", "RESET", "POSTGRES":
+					case "", "RESET":
 						o.ctx.SetSessionAuthorization("", stmt.Local)
 					default:
+						// "postgres" is NOT collapsed to "" here — see the
+						// SET ROLE case above (round-2 review R6):
+						// SetSessionAuthorization's own switch already
+						// distinguishes an explicit "postgres" target from
+						// DEFAULT/RESET (it sets SessionUser="postgres"
+						// rather than restoring LoginUser).
 						o.ctx.SetSessionAuthorization(role, stmt.Local)
 					}
 				}

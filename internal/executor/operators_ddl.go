@@ -926,32 +926,31 @@ func (o *ddlOp) execAlterConversion(s *parser.AlterConversionStmt) error {
 }
 
 // currentDDLOwnerOID resolves the OID that should own an object created by
-// the current statement: the role currently in effect via SET ROLE / SET
-// SESSION AUTHORIZATION (o.ctx.NonSuperuserRole), or the bootstrap superuser
-// (OID 10) when no such role is active. Mirrors PostgreSQL's
-// GetUserId()-as-owner convention (e.g. CreatePublication, publicationcmds.c).
-// An unresolvable role name (should not happen — NonSuperuserRole is only
-// ever set from a previously-validated role) falls back to the bootstrap
-// superuser rather than minting a bogus owner. DU-002 slice 424.
+// the current statement: the session's effective role (o.ctx.EffectiveUserName —
+// the SET ROLE target when active, else the session/login user; M0134-0009),
+// falling back to the bootstrap superuser (OID 10) when unresolvable.
+// Mirrors PostgreSQL's GetUserId()-as-owner convention (e.g.
+// CreatePublication, publicationcmds.c). DU-002 slice 424.
 func (o *ddlOp) currentDDLOwnerOID() uint32 {
-	if o.ctx.NonSuperuserRole != "" {
-		if oid, ok := o.ctx.Catalog.RoleOID(o.ctx.NonSuperuserRole); ok {
-			return oid
-		}
+	if o.ctx.Catalog == nil {
+		// Round-2 review R10: the old code short-circuited to 10 before ever
+		// dereferencing Catalog (it only consulted NonSuperuserRole, a plain
+		// string); guard so a Context built without a Catalog (some unit
+		// tests) cannot panic here now that this always calls RoleOID.
+		return 10
+	}
+	if oid, ok := o.ctx.Catalog.RoleOID(o.ctx.EffectiveUserName()); ok {
+		return oid
 	}
 	return 10
 }
 
 // currentDDLOwnerName is currentDDLOwnerOID's name-string sibling, for call
 // sites that store a role NAME rather than an OID (e.g. catalog.UserMapping's
-// UmUser). Resolves to the role currently in effect via SET ROLE / SET
-// SESSION AUTHORIZATION (o.ctx.NonSuperuserRole), or the bootstrap superuser
-// name when no such role is active.
+// UmUser). Resolves to the session's effective role (o.ctx.EffectiveUserName,
+// M0134-0009): the SET ROLE target when active, else the session/login user.
 func (o *ddlOp) currentDDLOwnerName() string {
-	if o.ctx.NonSuperuserRole != "" {
-		return o.ctx.NonSuperuserRole
-	}
-	return "postgres"
+	return o.ctx.EffectiveUserName()
 }
 
 // checkCommentObjectOwnerOID enforces PG's "must be owner of <kind> <name>"

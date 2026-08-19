@@ -1257,7 +1257,7 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 		return
 	}
 
-	s.runPostStartupLoop(connCtx, cancelEntry, raw, r, w, sess, logger, isReplication, app, params["database"], sessCtx, pid, procNum)
+	s.runPostStartupLoop(connCtx, cancelEntry, raw, r, w, sess, logger, isReplication, app, params["database"], sessCtx, pid, procNum, user)
 }
 
 // isReplicationStartupParam interprets the StartupMessage `replication`
@@ -1536,7 +1536,7 @@ func (s *Server) cleanupSessionTempObjects(sess *misc.SessionRegistry) {
 	im.DropTempNamespace(owner)
 }
 
-func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw net.Conn, r *libpq.FrameReader, w *libpq.FrameWriter, sess *misc.SessionRegistry, logger *slog.Logger, isReplication bool, appName, dbName string, sessCtx *mmgr.Context, pid uint32, procNum int32) {
+func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw net.Conn, r *libpq.FrameReader, w *libpq.FrameWriter, sess *misc.SessionRegistry, logger *slog.Logger, isReplication bool, appName, dbName string, sessCtx *mmgr.Context, pid uint32, procNum int32, loginUser string) {
 	extended := newExtendedState()
 	// procNum is the connection-lifetime ProcArray slot acquired by
 	// serveConn via mvcc.AcquireConnSlot (M0107-0004; the slot is reused
@@ -1546,6 +1546,13 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 	extended.ProcNum = procNum                                                                   // thread through to executeExtendedQueryViaExecutor
 	extended.DBName = dbName                                                                     // scopes pg_extension per database (M0110-0003 gap #7c)
 	connTx := &connTxState{SessCtx: sessCtx, ProcNum: procNum, DBName: dbName, AdvisoryID: sess} // per-connection explicit transaction state (M0096-0005); DBName scopes pg_extension (M0110-0003 gap #7c); AdvisoryID = stable advisory-lock owner identity (M0118-0003)
+	// LoginUser/SessionUser seed the session_user()/current_user() identity
+	// from the same StartupMessage "user" value already written into the
+	// session_authorization GUC (server.go, checkAuth caller) so the two
+	// cannot drift. LoginUser is immutable; SessionUser moves with SET/RESET
+	// SESSION AUTHORIZATION. M0134-0009.
+	connTx.LoginUser = loginUser
+	connTx.SessionUser = loginUser
 	// Stable per-connection lock-manager identity for transaction-scoped LOCK
 	// TABLE heavyweight locks (M0118-0003 lock-nowait). Minted once from the
 	// same monotonic counter as per-statement BackendIDs so it never collides

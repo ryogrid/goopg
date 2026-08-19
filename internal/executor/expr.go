@@ -12358,10 +12358,16 @@ case "pg_char_to_encoding":
 			}
 			return Datum{Kind: KindInt, Int: int64(len(v.Format()))}, nil
 		}
-	case "current_user", "session_user":
-		return NewStringDatum("postgres"), nil
-	case "user":
-		return NewStringDatum("postgres"), nil
+	case "session_user":
+		// session_user() is the authenticated login role, unaffected by SET
+		// ROLE — only SET/RESET SESSION AUTHORIZATION changes it. M0134-0009,
+		// PG oracle: miscinit.c GetSessionUserId.
+		return NewStringDatum(ctx.SessionUserName()), nil
+	case "current_user", "current_role", "user":
+		// current_user()/current_role/user are the effective role: the SET
+		// ROLE target when active, else the session user. M0134-0009, PG
+		// oracle: miscinit.c GetCurrentRoleId.
+		return NewStringDatum(ctx.EffectiveUserName()), nil
 	case "version":
 		return NewStringDatum("PostgreSQL 18.3 goopg compatible"), nil
 	case "pg_current_xact_id", "txid_current":

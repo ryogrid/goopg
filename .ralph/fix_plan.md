@@ -51,8 +51,13 @@ PARKED** — 0005 was parked 2026-08-19 by the same directive — and **0006
 (`select_parallel.sql`) was PARKED 2026-08-19** — it asserts
 `pg_stat_database.parallel_workers_launched` and goopg has no parallel-worker
 execution path at all, so it is unreachable until a parallel-query milestone
-lands (re-arm trigger recorded on the task) — so the next M0134
-task to select is **M0134-0009**. Standing rule for the two remaining
+lands (re-arm trigger recorded on the task), and **0009 (`select_views.sql`) was
+PARKED 2026-08-19** — it needs three independent parser/DDL gaps (`?#` operator
+lexing, unary prefix `#`, `CREATE SCHEMA ... CREATE TABLE` sub-commands) before
+it can pass, though the loop that sized it landed a real engine fix out of it
+(session identity for `current_user`/`session_user`, design
+`docs/design/m0134-0009-session-user-identity.md`) — so the next M0134
+task to select is **M0134-0010 (`predicate.sql`)**. Standing rule for the two remaining
 "possible regression, verify" cases (`mvcc`, `reindex_catalog`, whatever their
 task IDs): re-run `scripts/pg-regress-runner.sh --verbose <case>` at HEAD FIRST
 and, if it already passes, flip the CSV row to `pass` / `pass_required=yes`
@@ -6702,6 +6707,26 @@ listed `select.sql`, `delete.sql` and `sysviews.sql` already carry CSV status
       `select_implicit` still 1/1 PASS, `aggregates` FAILs identically before and
       after (clean stashed-baseline re-run). CSV row stays `not-tried`.
 - [ ] **M0134-0009 — select_views.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
+      **PARKED 2026-08-19 after landing the dominant fix.** Sizing found the case
+      blocked on three independent parser/DDL gaps, but ALSO found one real
+      engine bug worth more than the case itself, which was fixed and shipped:
+      `current_user`/`current_role`/`user`/`session_user` were the hardcoded
+      literal `"postgres"` (`internal/executor/expr.go`), so
+      `SET SESSION AUTHORIZATION` was invisible to every query and every
+      `WHERE name = current_user` leaky-view predicate returned 0 rows. Design:
+      `docs/design/m0134-0009-session-user-identity.md`. Seven sibling sites
+      moved together; an adversarial review caught three of them (DO-NOT-SHIP →
+      fixed → GO).
+      **Re-arm trigger** (all three needed before this case can pass): (1) lex
+      `?`-prefixed geometric operators — `?#` is currently a lex error, blocking
+      the `street`/`iexit` views; (2) unary prefix `#` (path point-count);
+      (3) `CREATE SCHEMA <n> CREATE TABLE ...` sub-commands, which today
+      silently no-op and cascade ~13 "relation does not exist" errors (52
+      `ERROR:` lines total when `create_view.sql` loads). Then re-run
+      `scripts/pg-regress-runner.sh --verbose select_views` and re-size.
+      Upstream prerequisite: `postgres/src/test/regress/parallel_schedule:103`
+      (`# select_views depends on create_view`). CSV row stays `failed` —
+      **no `make regen-testport` needed**. Ledger rows appended 2026-08-19.
 - [ ] **M0134-0010 — predicate.sql** — regress-sql `not-tried`: make the case match PG 18.3 (normalise against `./postgres/`). Run the case, fix the divergence; on pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
 - [ ] **M0134-0011 — subselect.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
 - [ ] **M0134-0012 — update.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
