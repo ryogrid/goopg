@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/optimizer"
@@ -892,20 +893,65 @@ func (o *sortOp) sortTailWithCTIDs() {
 	o.ctids = newCtids
 }
 
+// isRegSortFamilyTypeName reports whether name is one of the reg* OID-alias
+// types that define NO comparison operators/opclass of their own in PG
+// (grepped postgres/src/include/catalog/pg_operator.dat and pg_opclass.dat —
+// zero hits for all eleven). Per pg_cast.dat:182-185 each has an IMPLICIT
+// BINARY-COERCIBLE cast to/from oid, so operator resolution for `<`/`ORDER
+// BY` falls back to oid's own btree comparator (btoidcmp,
+// nbtcompare.c:441) — an unsigned OID compare, not a name compare.
+// M0134-0005aj (hunk 12): scoped to the Sort operator only; do NOT reuse
+// this for `=`/`IN`/hashing — those paths don't yet carry a KindInt OID for
+// the CastExpr-sourced case (see the round-2 research report for why that's
+// a separate, larger slice).
+func isRegSortFamilyTypeName(name string) bool {
+	switch strings.ToLower(name) {
+	case "regclass", "regproc", "regprocedure", "regtype", "regoper",
+		"regoperator", "regrole", "regnamespace", "regcollation",
+		"regconfig", "regdictionary":
+		return true
+	}
+	return false
+}
+
+// evalSortKeyValue evaluates a single ORDER BY key expression for one row,
+// yielding the value the Sort comparator should compare against its peer.
+// For a reg*-family cast (`*optimizer.CastExpr` whose TargetType is in
+// isRegSortFamilyTypeName), PG sorts by the underlying OID rather than the
+// cast's own (nonexistent) comparison operator — see
+// isRegSortFamilyTypeName's doc comment. Evaluating the operand directly
+// yields that OID as a KindInt datum when the operand is already numeric
+// (the `conrelid::regclass` shape); when the operand is instead a string
+// literal (`'pg_class'::regclass`), the operand alone is a relation name,
+// not an OID, so the full cast is evaluated instead — its KindString arm
+// (expr.go's CastExpr evaluator) already resolves the name to the OID and
+// returns it as KindInt. Both branches therefore yield a KindInt OID, so
+// the two source shapes compare consistently. Any other expression shape
+// is evaluated exactly as before. M0134-0005aj (hunk 12).
+func evalSortKeyValue(e optimizer.Expr, row Row, ctx *Context) (Datum, error) {
+	if ce, ok := e.(*optimizer.CastExpr); ok && isRegSortFamilyTypeName(ce.TargetType) {
+		ov, err := evalExpr(ce.Operand, row, ctx)
+		if err == nil && ov.Kind == KindInt {
+			return ov, nil
+		}
+	}
+	return evalExpr(e, row, ctx)
+}
+
 // lessRows returns true iff a should sort before b under the
 // configured key list. Records the first evaluator error in
 // o.sortErr and returns false on error so the comparator stays
 // strict-weak-ordered for the rest of the sort.
 func (o *sortOp) lessRows(a, b Row) bool {
 	for _, k := range o.keys {
-		av, err := evalExpr(k.Expr, a, o.ctx)
+		av, err := evalSortKeyValue(k.Expr, a, o.ctx)
 		if err != nil {
 			if o.sortErr == nil {
 				o.sortErr = err
 			}
 			return false
 		}
-		bv, err := evalExpr(k.Expr, b, o.ctx)
+		bv, err := evalSortKeyValue(k.Expr, b, o.ctx)
 		if err != nil {
 			if o.sortErr == nil {
 				o.sortErr = err

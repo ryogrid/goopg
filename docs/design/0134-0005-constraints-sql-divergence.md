@@ -3670,3 +3670,101 @@ so the ledger row, not a half-corrected comment, owns the discrepancy.
 Guards (`internal/executor/comment_on_domain_constraint_test.go`, all
 FAIL-pre/PASS-post): domain-spelling success, unknown constraint, unknown
 domain, non-owner rejection on both spellings, owner/superuser acceptance.
+
+## 41. M0134-0005aj — `ORDER BY …::regclass` sorted by the rendered NAME, because the cast stringified two layers earlier (LANDED 2026-08-19)
+
+`constraints.sql`'s `… ORDER BY conrelid::regclass` emitted rows in a different
+order than PG (hunk 12 of the 13-hunk census). The rows themselves were right;
+only their order was wrong.
+
+### Why the ordering was wrong
+
+PostgreSQL has **no comparison operators for `regclass` at all** — grepping
+`postgres/src/include/catalog/pg_operator.dat`, `pg_opclass.dat` and
+`pg_amop.dat` yields zero hits for all eleven reg* OID-alias types. What makes
+`ORDER BY <regclass>` work is `pg_cast.dat:182-185`: `regclass→oid` is an
+**IMPLICIT, BINARY-COERCIBLE** cast, so operator resolution falls straight
+through to `oid`'s own btree comparator, `btoidcmp`
+(`postgres/src/backend/access/nbtree/nbtcompare.c:441`) — an **unsigned OID**
+compare. PG therefore orders by OID and merely *renders* the name.
+
+goopg inverted that. `internal/executor/expr.go:806-845` — the `CastExpr` arm
+for `TargetType == "regclass"` with a `KindInt` source — eagerly renders the
+relation name (`NewStringDatum(tbl.Name)`, :830) at expression-evaluation time.
+By the time `sortOp.lessRows` (`internal/executor/operators.go`) reached
+`compareDatum` (`expr.go:2651`) it held two plain strings and did
+`strings.Compare`. No reg*-awareness existed anywhere in the comparator; the
+ordering bug is a *consequence* of a representation bug.
+
+### The representation bug is wider than the ordering bug — and was NOT fixed here
+
+The eager stringify is only reached from the `KindInt` source arm. A
+string-literal source (`'pg_class'::regclass`, `expr.go:846-865`) returns the
+resolved OID as `KindInt`, and real regclass-typed *columns*
+(`pg_class.reltoastrelid`, `pg_partition_tree()`) stay `KindInt` end-to-end.
+So goopg carries two disagreeing representations of the same type — the
+sibling-divergence class this project treats as law. Live probes against the
+PG 18.3 oracle confirmed it is already causing wrong ANSWERS, not just wrong
+order:
+
+| query | goopg | PG 18.3 |
+|---|---|---|
+| `SELECT oid::regclass = 1259 FROM pg_class WHERE relname='pg_class'` | `f` | `t` |
+| `SELECT oid::regclass = 'pg_class'::regclass FROM pg_class WHERE relname='pg_class'` | `f` | `t` |
+| `SELECT oid::regclass IN ('pg_class','pg_type') FROM …` | `t` | `t` (goopg agrees only by coincidence — see below) |
+
+**The root-cause fix was scoped out deliberately, and the reason is worth
+recording, because the obvious "just stop stringifying" one-liner is a trap.**
+Removing the eager render *without* also teaching the comparison path about
+reg* types does not half-fix the problem — it trades a broken shape for a
+different broken shape. `oid::regclass IN ('a_star','c_star')`
+(`src/test/regress/sql/create_misc.sql:250-251`) passes today only because
+goopg compares a name-string against name-literals and coincidentally agrees
+with PG, which actually resolves the IN-list through `select_common_type` +
+`regclassin`. Make the left side a `KindInt` OID and `compareEq`
+(`expr.go:8242`) formats it as a *decimal string*, compares it to `a_star`, and
+that currently-passing regress query goes red.
+
+Doing it properly requires a static type hint on the comparison IR
+(`optimizer.InExpr` and the bare-`=` node), because `Datum` carries a `Kind`
+and no type tag — reg*-ness is simply not recoverable inside `compareEq` /
+`promoteCrossKind`. That is 150-250+ lines across three packages and is
+ledgered as its own indivisible slice (three rows, 2026-08-19), together with
+an unaudited hash-keying risk (GROUP BY/DISTINCT/hash-join) and a missing
+`22P02` error parity on `x::regclass = '<literal>'` — a shape PG actually
+*rejects*, via `oidin`, not `regclassin`.
+
+### What landed
+
+A Sort-operator-local fix, `internal/executor/operators.go`:
+
+- `isRegSortFamilyTypeName` — the single membership test for the eleven reg*
+  types, carrying the oracle citations above and an explicit warning not to
+  reuse it for `=`/`IN`/hashing.
+- `evalSortKeyValue` — for a reg*-family `*optimizer.CastExpr` sort key,
+  evaluate the cast's `.Operand`; if it yields `KindInt` that IS the OID (the
+  `conrelid::regclass` shape). Otherwise fall back to evaluating the full cast,
+  whose `KindString` arm already resolves a name literal to a `KindInt` OID.
+  **Both branches yield a `KindInt` OID**, so the two source shapes now sort
+  consistently *with each other* — that consistency, not just the row order, is
+  the point. Every other expression shape is evaluated exactly as before.
+- `sortOp.lessRows` calls it in place of `evalExpr` for both operands,
+  preserving the existing `sortErr` strict-weak-ordering discipline; ASC/DESC
+  and NULLS handling are untouched.
+
+`ORDER BY <ordinal>` comes free: `resolveOrderBySubstitution`
+(`internal/optimizer/planner.go:5511`) substitutes the ordinal with the
+target-list AST *before* lowering to `CastExpr`, so `ORDER BY 1` — the shape
+the real PG corpus uses at `src/test/regress/sql/partition_prune.sql:283` —
+reaches `evalSortKeyValue` with the real cast node. Verified, not assumed.
+
+Guards (`internal/executor/operators_regsort_test.go`, FAIL-pre/PASS-post
+against a fixture whose OID order and NAME order genuinely disagree — a fixture
+where they agree proves nothing): ASC, DESC, mixed-key tiebreak, and
+string-literal-source vs int-source consistency.
+
+**Measurement: 230 lines / 12 hunks → 216 / 11.** Gates: `go build ./...`,
+`go test ./internal/executor/ ./internal/optimizer/ ./internal/postmaster/`,
+`RALPH_PRECOMMIT_SCOPE=units`, and — this being an executor change per
+Hard-won Rule #1 — `scripts/tpch-spotcheck.sh` on a fresh capped server
+(Q12=2, Q13=35, canonical).
