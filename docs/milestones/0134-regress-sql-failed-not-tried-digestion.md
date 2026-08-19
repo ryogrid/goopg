@@ -33,15 +33,23 @@ from `./postgres/`.
    already passes, flip the row to `pass` with a "stale — already fixed" note
    instead of implementing anything.
 
-   **Outcome so far (keep this list current):** `select_having` was re-run at
-   HEAD on 2026-08-19 (M0134-0006) and PASSes — 1/1, 100.0% parity, 84/84 lines
-   byte-identical, corroborated by the same night's nightly
-   `TestPort_RegressSuite/select_having,PASS`. It cost one gate run instead of
-   an implementation slice, which is the whole point of this rule; the pattern
-   is that these four rows were captured by a baseline that disagreed with the
-   inventory's own status, so treat the remaining three (`mvcc`,
-   `reindex_catalog`, `select_implicit`) as *probably* stale too — but re-run
-   each, never flip on inference.
+   **Outcome so far (keep this list current):** **two of the four are now
+   confirmed stale, zero engine changes between them.** `select_having` was
+   re-run at HEAD on 2026-08-19 (M0134-0006) and PASSes — 1/1, 100.0% parity,
+   84/84 lines byte-identical, corroborated by the same night's nightly
+   `TestPort_RegressSuite/select_having,PASS`. `select_implicit` was re-run the
+   same day (M0134-0007) and also PASSes — 1/1, 100.0% parity, 316 lines
+   byte-identical, no diff emitted under `tmp/regress-diffs/`, corroborated by
+   `ci/logs/20260819-011823/testport/results.csv`
+   (`TestPort_RegressSuite/select_implicit,PASS`). Each cost one gate run
+   instead of an implementation slice, which is the whole point of this rule;
+   the pattern is that these four rows were captured by a baseline that
+   disagreed with the inventory's own status, so treat the remaining two
+   (`mvcc`, `reindex_catalog`) as *probably* stale too — but re-run each, never
+   flip on inference. Note both confirmed-stale cases so far are cheap
+   `select_*` cases; `mvcc` and `reindex_catalog` exercise far more engine
+   surface, so a genuine divergence there is likelier than this 2-for-2 start
+   suggests.
 
 ## Priority renumbering — 2026-08-19 (user directive)
 
@@ -137,7 +145,7 @@ below**, after the 2026-08-19 priority renumbering; rows that moved say so in th
 | M0134-0004 | `cluster.sql` | failed |  |
 | M0134-0005 | `constraints.sql` | failed |  |
 | M0134-0006 | `select_having.sql` | **pass** | renumbered 2026-08-19 (was M0134-0066); **DONE 2026-08-19 — stale `failed`, no goopg change: runner 1/1 PASS at HEAD, CSV flipped to `pass`/`pass_required=yes`** |
-| M0134-0007 | `select_implicit.sql` | failed | renumbered 2026-08-19 (was M0134-0067) |
+| M0134-0007 | `select_implicit.sql` | **pass** | renumbered 2026-08-19 (was M0134-0067); **DONE 2026-08-19 — stale `failed`, no goopg change: runner 1/1 PASS at HEAD (316 lines byte-identical), CSV flipped to `pass`/`pass_required=yes`** |
 | M0134-0008 | `select_parallel.sql` | not-tried | renumbered 2026-08-19 (was M0134-0166) |
 | M0134-0009 | `select_views.sql` | failed | renumbered 2026-08-19 (was M0134-0068) |
 | M0134-0010 | `predicate.sql` | not-tried | renumbered 2026-08-19 (was M0134-0153) |
