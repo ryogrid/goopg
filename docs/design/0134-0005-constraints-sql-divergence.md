@@ -3768,3 +3768,82 @@ string-literal-source vs int-source consistency.
 `RALPH_PRECOMMIT_SCOPE=units`, and — this being an executor change per
 Hard-won Rule #1 — `scripts/tpch-spotcheck.sh` on a fresh capped server
 (Q12=2, Q13=35, canonical).
+
+## 42. M0134-0005ak — validating a constraint validated only the table you named (LANDED 2026-08-19)
+
+**Measurement: 216 lines / 11 hunks → 188 / 9.** Two hunks closed
+(`expected/constraints.out:1446` and `:1483`), no new `@@`, no existing hunk grew.
+
+The symptom was a stale flag: after `ALTER TABLE notnull_inhparent ALTER i SET
+NOT NULL`, PG reports `convalidated = t` for `notnull_inhchild` and
+`notnull_inhgrand`, and goopg reported `f`. The same shape recurred on the
+partitioned tree (`notnull_tbl1_3`'s `nn3`). Both hunks are ONE root cause.
+
+**Why the existing in-code comment was misleading.** goopg's merge branch carried
+a comment citing `tablecmds.c:7950-8010` and asserting that PG's
+`ATExecSetNotNull` existing-constraint branch "returns WITHOUT recursing to
+children". That is true of two of the three existing-tuple sub-arms and **false
+of the third — the one this test exercises**. `tablecmds.c:7913`
+`ATExecSetNotNull` handles `recursing` (bump `coninhcount`) and
+`!conislocal` (set `conislocal`) in place, but the third arm,
+`if (!conForm->convalidated)`, does not flip anything itself: it *delegates
+entirely* to `ATExecValidateConstraint` (`:12908`). Validation is a different
+operation from marking, and it is the one that recurses.
+
+**What PG actually does.** `ATExecValidateConstraint` dispatches
+(`tablecmds.c:12974-12976`) to `QueueNNConstraintValidation`
+(`:13220-13309`), which — when `!recursing`, i.e. only at the top-level call —
+walks `find_all_inheritors` (`:13245-13246`). That is **every descendant at
+every depth**, partitions included, not `find_inheritance_children`'s single
+level. It skips the relation itself (`:13256-13257`), skips a descendant already
+`convalidated` (`:13277-13278`), and treats a descendant with no matching NOT
+NULL constraint for the column as an internal `elog` invariant violation
+(`:13272-13274`) rather than a user-facing error.
+
+**goopg's two gaps, not one.** The merge branch of `AlterTableSetNotNull` flipped
+only the parent's `NotValid` and left `shouldCascade` false (the existing
+`cascadeNotNullToChildrenAt` call belongs to the sibling "no constraint yet"
+arm). The named `ALTER TABLE ... VALIDATE CONSTRAINT` NOT NULL sub-branch had the
+**identical** defect independently. Fixing one without the other would have left
+a path that still diverges — the sibling-path rule, paid again.
+
+**Fix** (`internal/executor/operators_ddl.go`, 91 lines): a new
+`cascadeNotNullValidateToDescendants`, wired at both call sites. It is
+deliberately a *separate* helper rather than a mode flag on
+`cascadeNotNullToChildrenAt`: that helper's merge sub-branch only bumps
+`InhCount` and never touches `NotValid`, because the ADD direction and the
+VALIDATE direction are different operations — the DROP direction is already
+factored out for the same reason. The new helper mirrors the DROP twins'
+shape (`collectInheritanceAndPartitionChildren` for direct children, edge-keyed
+`visited` map, `maxNotNullCascadeDepth`, `syncConstraintCatalogRow` per touched
+child), and self-recurses to reach every depth because goopg has no one-shot
+`find_all_inheritors` equivalent — only single-level `InheritanceChildren` /
+`PartitionChildren` (`internal/catalog/catalog.go:4489`, `:4510`).
+
+**One deliberate divergence from PG's skip rule.** PG skips an
+already-`convalidated` descendant entirely; goopg flips nothing on such a child
+but still *recurses through* it. This is not laxity — it is what PG's flat
+`find_all_inheritors` list gives for free. PG enumerates the whole tree up front,
+so an already-validated intermediate node can never hide a still-unvalidated
+grandchild behind it; goopg's level-at-a-time descent would let exactly that
+happen if the skip also pruned the walk. Same end state, different traversal.
+
+A missing constraint on a descendant is a **skip**, not an error: goopg's catalog
+can legitimately reach that state, and PG's `elog` there is an internal-invariant
+assertion, so promoting it to a user-visible error would invent a new failure mode.
+
+Guards (`internal/executor/operators_ddl_notnull_validate_cascade_test.go`,
+FAIL-pre verified against reverted source, PASS-post): 3-level plain inheritance
+(`postgres/src/test/regress/sql/constraints.sql:908-917`), a partitioned tree
+(`:920-939`), the already-validated-descendant no-drift case (`InhCount` /
+`IsLocal` untouched), and both entry points.
+
+Confirmed not a risk: the row-scan backing SET NOT NULL already descends the full
+tree (`forEachLiveRow` → `allDescendants` → `forEachLiveRowRel`), so the new
+cascade cannot introduce a false-negative `23502`.
+
+Two deferrals recorded (2026-08-19): the CHECK-constraint VALIDATE cascade
+(PG's `QueueCheckConstraintValidation`, `tablecmds.c:13117-13210`) has the
+identical gap and is untouched; and PG's `ONLY`-with-children error
+(`ERRCODE_INVALID_TABLE_DEFINITION`, `tablecmds.c:13260-13263`) is unreproducible
+today because neither goopg call site plumbs an ONLY/recurse flag this deep.

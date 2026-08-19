@@ -8664,6 +8664,19 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 								}
 							}
 							tbl.NotNullConstraints[i].NotValid = false
+							// Cascade the NOT VALID→VALID flip to every
+							// already-existing descendant's matching
+							// constraint, mirroring
+							// QueueNNConstraintValidation
+							// (tablecmds.c:13220-13309). Sibling of the SET
+							// NOT NULL merge-branch cascade above.
+							// M0134-0005ak.
+							if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+								visited := make(map[[2]uint32]bool)
+								if err := o.cascadeNotNullValidateToDescendants(im, tbl, colName, visited, 0); err != nil {
+									return err
+								}
+							}
 						}
 						found = true
 						break
@@ -10382,6 +10395,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			hasNN := false
 			nnName := ""
 			shouldCascade := false
+			shouldCascadeValidate := false
 			for i := range tbl.NotNullConstraints {
 				nc := &tbl.NotNullConstraints[i]
 				if strings.EqualFold(nc.ColName, act.ColumnName) {
@@ -10394,11 +10408,20 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					// way ATExecSetNotNull's existing-constraint branch
 					// (tablecmds.c:7950-8010) returns WITHOUT recursing to
 					// children — only the "no constraint yet" branch below
-					// cascades. M0134-0005p sub-slice A.
+					// cascades. M0134-0005p sub-slice A. The NOT VALID→VALID
+					// flip is the same VALIDATE-direction event as
+					// ATExecValidateConstraint (ATExecSetNotNull calls it
+					// directly when the constraint is already-present-but-
+					// NOT-VALID, tablecmds.c:7994-8010), so it MUST propagate
+					// validation down descendants via
+					// QueueNNConstraintValidation (tablecmds.c:13220-13309) —
+					// unlike the "not local yet" arm above, which touches
+					// only this table. M0134-0005ak.
 					if !nc.IsLocal {
 						nc.IsLocal = true
 					} else if nc.NotValid {
 						nc.NotValid = false
+						shouldCascadeValidate = true
 					}
 					break
 				}
@@ -10430,6 +10453,19 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if shouldCascade && nnName != "" {
 				if err := o.cascadeNotNullToChildren(tbl, act.ColumnName, nnName, false); err != nil {
 					return err
+				}
+			}
+			// Cascade the NOT VALID→VALID flip to every already-existing
+			// descendant's matching constraint (VALIDATE direction, distinct
+			// from the ADD-direction cascade above), mirroring
+			// QueueNNConstraintValidation (tablecmds.c:13220-13309).
+			// M0134-0005ak.
+			if shouldCascadeValidate {
+				if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+					visited := make(map[[2]uint32]bool)
+					if err := o.cascadeNotNullValidateToDescendants(im, tbl, act.ColumnName, visited, 0); err != nil {
+						return err
+					}
 				}
 			}
 		case parser.AlterTableDropNotNull:
@@ -12170,6 +12206,60 @@ func (o *ddlOp) cascadeNotNullDropToChildren(im *catalog.InMemory, tbl *catalog.
 			child.NotNullConstraints[idx].IsLocal = true
 		}
 		if err := o.syncConstraintCatalogRow(child); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// cascadeNotNullValidateToDescendants propagates VALIDATE-direction
+// convalidated 'f'->'t' flips for a NOT NULL constraint on colName down
+// every already-existing inheritance child and partition, recursively
+// (grandchildren, sub-partitions, ...), mirroring PG's
+// QueueNNConstraintValidation (postgres/src/backend/commands/tablecmds.c:
+// 13220-13309). A descendant already convalidated is left untouched
+// (:13277-13278, no InhCount/IsLocal drift) but its own children are still
+// visited: PG's find_all_inheritors flattens the WHOLE transitive
+// descendant set up front and walks it flat, so an already-validated child
+// does not gate whether an unvalidated grandchild gets visited — goopg has
+// no one-shot find_all_inheritors equivalent, so this self-recurses
+// unconditionally into every child instead, achieving the same flat-walk
+// coverage one level at a time. A descendant with no matching NOT NULL
+// constraint on colName is skipped, not errored: PG's :13272-13274 is an
+// elog "can't happen" invariant assertion (every inheritor is supposed to
+// already carry a matching constraint), not a user-facing ereport, and
+// goopg's catalog can legitimately reach that state without it being a bug
+// worth crashing over. Uses the same edge-keyed visited guard + depth
+// backstop as cascadeNotNullToChildrenAt / cascadeNotNullDropToChildren
+// (diamond-inheritance correctness, M0134-0005p sub-slice B). Sibling of
+// cascadeNotNullDropToChildren but VALIDATE-direction, not DROP-direction —
+// kept separate per the brief rather than folded into
+// cascadeNotNullToChildrenAt's ADD-direction merge branch, whose semantics
+// (coninhcount bump only) are unrelated. M0134-0005ak.
+func (o *ddlOp) cascadeNotNullValidateToDescendants(im *catalog.InMemory, tbl *catalog.Table, colName string, visited map[[2]uint32]bool, depth int) error {
+	if depth >= maxNotNullCascadeDepth {
+		return nil
+	}
+	for _, child := range collectInheritanceAndPartitionChildren(im, tbl) {
+		edge := [2]uint32{child.OID, tbl.OID}
+		if visited[edge] {
+			continue
+		}
+		visited[edge] = true
+
+		for i := range child.NotNullConstraints {
+			if strings.EqualFold(child.NotNullConstraints[i].ColName, colName) {
+				if child.NotNullConstraints[i].NotValid {
+					child.NotNullConstraints[i].NotValid = false
+					if err := o.syncConstraintCatalogRow(child); err != nil {
+						return err
+					}
+				}
+				break
+			}
+		}
+
+		if err := o.cascadeNotNullValidateToDescendants(im, child, colName, visited, depth+1); err != nil {
 			return err
 		}
 	}
