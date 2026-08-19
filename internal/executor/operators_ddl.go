@@ -8726,6 +8726,17 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				if act.NoInherit && tbl.PartitionKey != nil {
 					return &ExecError{Code: "42P16", Pos: act.Pos(), Message: fmt.Sprintf("cannot add NO INHERIT constraint to partitioned table %q", tbl.Name)}
 				}
+				// Resolve the constraint's name once — PG's ATAddCheckNNConstraint
+				// fills newConstraint->conname a single time at the top and
+				// reuses that same node for every child (tablecmds.c:9911-10049),
+				// so an anonymous ADD CHECK must cascade the AUTO-GENERATED
+				// name, not the empty act.ConstraintName. Both the validation
+				// scan below and the child cascade share this one value.
+				// M0134-0005as.
+				conName := act.ConstraintName
+				if conName == "" {
+					conName = o.autoCheckName(tbl, act.CheckExpr)
+				}
 				// Scan existing rows when the constraint is validating
 				// (not NOT VALID / not NOT ENFORCED). PG queues the constraint
 				// for ATRewriteTable's phase-3 scan when !skip_validation
@@ -8736,10 +8747,6 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				// rolls back). An anonymous constraint uses the auto-generated
 				// name so the message matches PG's. M0134-0002 C3 slice 1.
 				if !act.NotValid && !act.CheckNotEnforced {
-					conName := act.ConstraintName
-					if conName == "" {
-						conName = o.autoCheckName(tbl, act.CheckExpr)
-					}
 					if err := o.validateCheckConstraintRows(tbl, conName, act.CheckExpr, act.NoInherit); err != nil {
 						return err
 					}
@@ -8750,34 +8757,11 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				// NOT VALID) and pg_constraint reports conenforced=false.
 				// DU-002 slice 430.
 				tbl.AddCheckFull(act.ConstraintName, act.CheckExpr, o.allocConstraintOID(act.ConstraintName), act.NotValid, act.NoInherit, act.CheckNotEnforced)
-				// Propagate to partition children: merge if child already has the
-				// same constraint (locally defined), otherwise inherit it. M0097-0023.
-				if im3, ok3 := o.ctx.Catalog.(*catalog.InMemory); ok3 {
-					for _, childTbl := range im3.PartitionChildren(tbl.OID) {
-						merged := false
-						for j := range childTbl.NamedChecks {
-							if strings.EqualFold(childTbl.NamedChecks[j].Name, act.ConstraintName) {
-								// Child already has it locally — merge: mark inherited.
-								childTbl.NamedChecks[j].IsLocal = false
-								childTbl.NamedChecks[j].InhCount = 1
-								o.ctx.AddNotice(fmt.Sprintf("merging constraint %q with inherited definition", act.ConstraintName))
-								merged = true
-								break
-							}
-						}
-						if !merged {
-							oid3 := im3.AllocOID()
-							// ALTER-time cascade reuses the SAME Constraint
-							// node for every child (ATAddCheckNNConstraint,
-							// tablecmds.c:9912-10049, recursion at
-							// :10042-10043), so each child gets the user's
-							// literal NOT VALID / NOT ENFORCED clause
-							// unchanged — unlike the CREATE-time sites above,
-							// which derive NotValid from NotEnforced alone.
-							// M0134-0005ar.
-							childTbl.AddCheckInherited(act.ConstraintName, act.CheckExpr, oid3, act.NotValid, act.CheckNotEnforced)
-						}
-					}
+				// Propagate to the FULL descendant set (plain-INHERITS children
+				// AND partitions, transitively) — cascadeCheckToChildren mirrors
+				// the NOT NULL twin cascadeNotNullToChildren. M0134-0005as.
+				if err := o.cascadeCheckToChildren(tbl, conName, act.CheckExpr, act.NotValid, act.CheckNotEnforced, act.NoInherit); err != nil {
+					return err
 				}
 			}
 		case parser.AlterTableNoOp:
@@ -12199,6 +12183,72 @@ func collectInheritanceAndPartitionChildren(im *catalog.InMemory, tbl *catalog.T
 		}
 	}
 	return children
+}
+
+// cascadeCheckToChildren propagates a CHECK constraint newly added on tbl to
+// the FULL descendant set — plain-INHERITS children AND partitions,
+// transitively through intermediate nodes — mirroring
+// ATAddCheckNNConstraint's own recursion (postgres/src/backend/commands/
+// tablecmds.c:9911-10049). This is the ADD-direction CHECK twin of
+// cascadeNotNullToChildren; see that function's doc comment for the
+// edge-keyed visited-guard rationale (diamond inheritance counts once per
+// EDGE, not once per node).
+//
+// noInherit mirrors tablecmds.c:10004's `if (is_no_inherit) return address;`
+// — a NO INHERIT constraint returns BEFORE enumerating any children, no
+// recursion at all. M0134-0005as.
+func (o *ddlOp) cascadeCheckToChildren(tbl *catalog.Table, name, expr string, notValid, notEnforced, noInherit bool) error {
+	if noInherit {
+		return nil
+	}
+	im, isIM := o.ctx.Catalog.(*catalog.InMemory)
+	if !isIM {
+		return nil
+	}
+	visited := make(map[[2]uint32]bool)
+	return o.cascadeCheckToChildrenAt(im, tbl, name, expr, notValid, notEnforced, visited, 0)
+}
+
+// cascadeCheckToChildrenAt is the depth/visited-bounded recursive body of
+// cascadeCheckToChildren. Per-child behavior mirrors what the inline
+// ADD-CHECK cascade used to do before this helper existed: merge with an
+// existing same-named child constraint (mark inherited, notice), or register
+// a brand-new inherited copy. The ALTER-time cascade reuses the user's
+// LITERAL NotValid/NotEnforced flags unchanged at every recursion level
+// (tablecmds.c:9912-10049, recursion at :10042-10043) — unlike the
+// CREATE-time sites elsewhere in this file, which derive NotValid from
+// NotEnforced alone. M0134-0005ar, M0134-0005as.
+func (o *ddlOp) cascadeCheckToChildrenAt(im *catalog.InMemory, tbl *catalog.Table, name, expr string, notValid, notEnforced bool, visited map[[2]uint32]bool, depth int) error {
+	if depth >= maxNotNullCascadeDepth {
+		return nil
+	}
+	for _, child := range collectInheritanceAndPartitionChildren(im, tbl) {
+		edge := [2]uint32{child.OID, tbl.OID}
+		if visited[edge] {
+			continue
+		}
+		visited[edge] = true
+
+		merged := false
+		for j := range child.NamedChecks {
+			if strings.EqualFold(child.NamedChecks[j].Name, name) {
+				// Child already has it locally — merge: mark inherited.
+				child.NamedChecks[j].IsLocal = false
+				child.NamedChecks[j].InhCount = 1
+				o.ctx.AddNotice(fmt.Sprintf("merging constraint %q with inherited definition", name))
+				merged = true
+				break
+			}
+		}
+		if !merged {
+			child.AddCheckInherited(name, expr, im.AllocOID(), notValid, notEnforced)
+		}
+
+		if err := o.cascadeCheckToChildrenAt(im, child, name, expr, notValid, notEnforced, visited, depth+1); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // cascadeCheckDropToChildren mirrors dropconstraint_internal's per-child

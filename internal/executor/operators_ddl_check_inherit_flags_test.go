@@ -27,15 +27,15 @@ import (
 // alter_table.sql:397-406 (attmp3/attmp6/attmp7, constraint b_le_20): a CHECK
 // added NOT VALID via ALTER TABLE on a parent that already has plain INHERITS
 // children must FAIL VALIDATE CONSTRAINT while a child row violates it, and
-// only succeed once the offending row is deleted. NOTE: this scenario's
-// scan (forEachLiveRow walking descendant storage, gated only on the
-// PARENT's own NamedChecks[i].NotValid) is independent of this brief's fix —
-// AlterTableAddCheck's cascade loop (operators_ddl.go:~8751) only walks
-// PartitionChildren, never plain InheritanceChildren, so attmp6/attmp7-style
-// children never receive a NamedChecks entry for a check ADDED after they
-// already exist (a separate, already-ledgered gap — see report.md). This
-// subtest is a no-regression pin, not a FAIL-pre proof for this brief's
-// specific edit; subtests b-e below are.
+// only succeed once the offending row is deleted. As of M0134-0005as,
+// AlterTableAddCheck's cascade (operators_ddl.go, cascadeCheckToChildren)
+// walks the FULL descendant set — plain-INHERITS children and partitions,
+// transitively — so cif_attmp6/cif_attmp7 now DO receive a b_le_20
+// NamedChecks entry for a check ADDED after they already existed, each with
+// the ALTER-time literal-clause flags (NotValid=true, IsLocal=false,
+// InhCount=1). This test asserts both the parent-side VALIDATE CONSTRAINT
+// behavior (scan gated on the parent's own NamedChecks[i].NotValid) and the
+// now-correct child-side cascade state.
 func TestCheckInheritFlagsPortedAlterTableInheritedNotValid(t *testing.T) {
 	ctx, cat, cleanup := newDDLFixture(t)
 	defer cleanup()
@@ -49,6 +49,24 @@ func TestCheckInheritFlagsPortedAlterTableInheritedNotValid(t *testing.T) {
 	} {
 		if err := runDDL(t, ctx, stmt); err != nil {
 			t.Fatalf("setup %q: %v", stmt, err)
+		}
+	}
+
+	for _, childName := range []string{"cif_attmp6", "cif_attmp7"} {
+		child, ok := cat.LookupTable(parser.ObjectName{Name: childName})
+		if !ok {
+			t.Fatalf("%s not found", childName)
+		}
+		idx := findNamedCheck(t, child, "b_le_20")
+		nc := child.NamedChecks[idx]
+		if !nc.NotValid {
+			t.Errorf("%s's b_le_20.NotValid = false after parent ADD CONSTRAINT ... NOT VALID, want true (ALTER-time literal-clause rule)", childName)
+		}
+		if nc.IsLocal {
+			t.Errorf("%s's b_le_20.IsLocal = true after cascade from parent ADD CONSTRAINT, want false", childName)
+		}
+		if nc.InhCount != 1 {
+			t.Errorf("%s's b_le_20.InhCount = %d after cascade from parent ADD CONSTRAINT, want 1", childName, nc.InhCount)
 		}
 	}
 

@@ -239,8 +239,11 @@ func TestAlterTableInheritGuardsAddColumnOnly(t *testing.T) {
 
 // TestAlterTableInheritGuardsDropConstraint pins the DROP CONSTRAINT inherited
 // guard on a PARTITION OF child whose parent got an inherited CHECK via ADD
-// CONSTRAINT propagation (the only goopg path that sets
-// NamedCheckConstraint.InhCount — plain INHERITS does not copy CHECKs yet).
+// CONSTRAINT propagation. ALTER TABLE ... ADD CONSTRAINT CHECK now cascades
+// to the full descendant set — plain-INHERITS children AND partitions
+// (M0134-0005as) — but a CREATE TABLE ... INHERITS of an ALREADY-EXISTING
+// parent CHECK still does not copy it onto the new child (that CREATE-time
+// gap is untouched by this brief).
 func TestAlterTableInheritGuardsDropConstraint(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
