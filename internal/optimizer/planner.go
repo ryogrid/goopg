@@ -6261,7 +6261,56 @@ func buildWindowFunc(fc *parser.FuncCall, inputCtx *resolveContext, agg *aggrega
 		}
 		return WindowFunc{pos: fc.Pos(), Name: name, Type: catalog.Type{Name: "int4"}, Args: []Expr{argResolved}}, nil
 	default:
-		return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "0A000", Message: fmt.Sprintf("window function %q is not supported in v0 planner", name)}
+		// PostgreSQL has no window-function allow-list: any ordinary
+		// aggregate is usable as a window function
+		// (postgres/src/backend/parser/parse_agg.c:transformWindowFuncCall).
+		// This is the planner's twin of analyzeWindowFuncCall's default
+		// arm (internal/parser/analyzer/analyzer.go) — a fourth serial
+		// gate the M0134-0022b brief's 3-site scope did not name; without
+		// widening it too, the analyzer's ACCEPT is immediately re-rejected
+		// here with the same "not supported in v0 <stage>" shape, net diff
+		// reduction zero. M0134-0022b.
+		if !isAggregateFuncName(fc) {
+			return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "0A000", Message: fmt.Sprintf("window function %q is not supported in v0 planner", name)}
+		}
+		if fc.Distinct {
+			return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "0A000", Message: "DISTINCT is not implemented for window functions"}
+		}
+		if len(fc.OrderBy) > 0 {
+			return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "0A000", Message: "aggregate ORDER BY is not implemented for window functions"}
+		}
+		var filterExpr Expr
+		if fc.Filter != nil {
+			var ferr error
+			filterExpr, ferr = resolveExprForWindowInput(fc.Filter, inputCtx, agg)
+			if ferr != nil {
+				return WindowFunc{}, ferr
+			}
+		}
+		if fc.Star {
+			if name != "count" {
+				return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "42601", Message: fmt.Sprintf("%s(*) is not supported", name)}
+			}
+			return WindowFunc{pos: fc.Pos(), Name: name, Type: catalog.Type{Name: "int8"}, Star: true, Filter: filterExpr}, nil
+		}
+		args := make([]Expr, 0, len(fc.Args))
+		for _, a := range fc.Args {
+			resolved, err := resolveExprForWindowInput(a, inputCtx, agg)
+			if err != nil {
+				return WindowFunc{}, err
+			}
+			args = append(args, resolved)
+		}
+		var argType catalog.Type
+		if len(args) > 0 {
+			argType = exprType(args[0])
+		}
+		// The concrete result type is resolved by the executor's
+		// aggregate machinery (aggHelper.applyAgg/finishAgg via
+		// windowFuncToAggregateCall), same as the ordinary (non-window)
+		// aggregate path — "unknown" here mirrors resolveExpr's default
+		// FuncCall handling for these same names.
+		return WindowFunc{pos: fc.Pos(), Name: name, Type: catalog.Type{Name: "unknown"}, Args: args, Filter: filterExpr, InputType: argType}, nil
 	}
 }
 
@@ -7885,6 +7934,20 @@ func isAggregateFunc(fc *parser.FuncCall) bool {
 	if fc.Over != nil {
 		return false
 	}
+	return isAggregateFuncName(fc)
+}
+
+// isAggregateFuncName is isAggregateFunc's standard-aggregate name
+// classification, factored out so buildWindowFunc's default arm
+// (M0134-0022b) can reuse the exact same "complete" name set without a
+// 7th stale copy (docs/design/m0134-0022-window-aggregate-gates.md).
+// A window aggregate call necessarily has fc.Over != nil, which
+// isAggregateFunc's guard above treats as "not an aggregate" for its
+// own callers (GROUP BY/HAVING collection, where a window function must
+// never be mistaken for a plain aggregate) — this helper skips that
+// guard so it can also answer "is name an aggregate at all" for the
+// window-function gate.
+func isAggregateFuncName(fc *parser.FuncCall) bool {
 	name := strings.ToLower(fc.Name.Name)
 	// Ordered-set / hypothetical-set aggregates: rank, dense_rank, cume_dist,
 	// percent_rank are aggregate functions ONLY when WITHIN GROUP is present;

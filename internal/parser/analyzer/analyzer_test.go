@@ -132,14 +132,30 @@ func TestAnalyzeWindowFunctionAccepted(t *testing.T) {
 func TestAnalyzeWindowFunctionUnsupportedRejected(t *testing.T) {
 	cat := analyzerCatalog(t)
 	// count(*) OVER () and first_value/last_value/nth_value/ntile/
-	// cume_dist/percent_rank/dense_rank are now supported (M0122-0004) —
-	// array_agg() as a window function is a real PostgreSQL general
-	// aggregate still unimplemented as a window function in v0 (only
-	// sum/count/avg/min/max are wired to the frame-consuming path), so
-	// it remains the rejection case.
+	// cume_dist/percent_rank/dense_rank are now supported (M0122-0004).
+	// PostgreSQL has no window-function allow-list — any ordinary
+	// aggregate is usable as a window function
+	// (postgres/src/backend/parser/parse_agg.c:transformWindowFuncCall) —
+	// so array_agg() OVER () is now ACCEPTED (M0134-0022b widened
+	// analyzeWindowFuncCall's default arm to isAnalyzerAggregateName; see
+	// TestAnalyzeWindowAggregateFunctionAccepted below). The rejection
+	// case is now a genuine non-aggregate, non-window scalar function.
 	expectAnalyzeCode(t, cat,
-		"SELECT array_agg(aid) OVER () FROM pgbench_accounts",
+		"SELECT abs(aid) OVER () FROM pgbench_accounts",
 		"0A000")
+}
+
+// TestAnalyzeWindowAggregateFunctionAccepted pins the M0134-0022b
+// widening: array_agg() OVER () — previously rejected here as the
+// canonical "not supported in v0 analyzer" case (see the comment above)
+// — analyzes cleanly now that the analyzer's default arm routes any
+// standard-aggregate name through the same validation an ordinary
+// aggregate call gets.
+func TestAnalyzeWindowAggregateFunctionAccepted(t *testing.T) {
+	cat := analyzerCatalog(t)
+	if err := Analyze(parseOne(t, "SELECT array_agg(aid) OVER () FROM pgbench_accounts"), cat); err != nil {
+		t.Fatalf("Analyze(array_agg(aid) OVER ()): %v", err)
+	}
 }
 
 // TestAnalyzeWindowValueFunctionsAccepted pins the M0122-0004

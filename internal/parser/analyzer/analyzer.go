@@ -1730,7 +1730,47 @@ func analyzeWindowFuncCall(x *parser.FuncCall, ctx *scope) (catalog.Type, error)
 		}
 		retType = catalog.Type{Name: "int4"}
 	default:
-		return catalog.Type{}, analyzeError(x.Pos(), "0A000", fmt.Sprintf("window function %q is not supported in v0 analyzer", name))
+		// PostgreSQL has no window-function allow-list: any ordinary
+		// aggregate (pg_aggregate) is usable as a window function —
+		// postgres/src/backend/parser/parse_agg.c:transformWindowFuncCall
+		// only rejects names that resolve to neither a window function
+		// nor an aggregate. Route through the same name set the plain
+		// (non-window) aggregate path uses (isAnalyzerAggregateName,
+		// analyzer.go:545) and validate args the way that plain path
+		// does (analyzeExpr's *parser.FuncCall default arm above: walk
+		// args, return "unknown" — the concrete result type is resolved
+		// by the executor's aggregate machinery, not the analyzer).
+		// DISTINCT/aggregate-ORDER BY are real PG restrictions on
+		// aggregates used as window functions (parse_func.c:843-867),
+		// not a v0 gap — mirrored here the same way the sum/count/avg/
+		// min/max arm above already does. M0134-0022b.
+		if !isAnalyzerAggregateName(name) {
+			return catalog.Type{}, analyzeError(x.Pos(), "0A000", fmt.Sprintf("window function %q is not supported in v0 analyzer", name))
+		}
+		if x.Distinct {
+			return catalog.Type{}, analyzeError(x.Pos(), "0A000", "DISTINCT is not implemented for window functions")
+		}
+		if len(x.OrderBy) > 0 {
+			return catalog.Type{}, analyzeError(x.Pos(), "0A000", "aggregate ORDER BY is not implemented for window functions")
+		}
+		if x.Filter != nil {
+			if _, err := analyzeExpr(x.Filter, ctx); err != nil {
+				return catalog.Type{}, err
+			}
+		}
+		if x.Star {
+			if name != "count" {
+				return catalog.Type{}, analyzeError(x.Pos(), "42601", fmt.Sprintf("%s(*) is not supported", name))
+			}
+			retType = catalog.Type{Name: "int8"}
+			break
+		}
+		for _, a := range x.Args {
+			if _, err := analyzeExpr(a, ctx); err != nil {
+				return catalog.Type{}, err
+			}
+		}
+		retType = catalog.Type{Name: "unknown"}
 	}
 	for _, pe := range x.Over.PartitionBy {
 		if exprHasWindowFunc(pe) {
