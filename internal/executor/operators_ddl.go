@@ -954,6 +954,57 @@ func (o *ddlOp) currentDDLOwnerName() string {
 	return "postgres"
 }
 
+// checkCommentObjectOwnerOID enforces PG's "must be owner of <kind> <name>"
+// check (aclchk.c aclcheck_error, ACLCHECK_NOT_OWNER) for COMMENT ON
+// CONSTRAINT's two spellings. ownerOID is the object's owning role (already
+// defaulted — see catalog.Domain.OwnerOrDefault and the table-spelling
+// wrapper checkCommentObjectOwner below); superusers always bypass. Scoped to
+// the two constraint arms only — M0134-0005ai; goopg's COMMENT ON otherwise
+// performs no ownership check for any object kind.
+func (o *ddlOp) checkCommentObjectOwnerOID(ownerOID uint32, kind, name string) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	currentOID := o.currentDDLOwnerOID()
+	if im.IsSuperuser(currentOID) {
+		return nil
+	}
+	if ownerOID != currentOID {
+		return &ExecError{Code: "42501",
+			Message: fmt.Sprintf("must be owner of %s %s", kind, name)}
+	}
+	return nil
+}
+
+// checkCommentObjectOwner is checkCommentObjectOwnerOID's sibling for
+// catalog.Table.Owner, which is stored as a role NAME string (empty means
+// "owned by the bootstrap superuser") rather than an OID — see
+// catalog.Table.Owner's doc comment and the CREATE TABLE owner-stamping site
+// (currentDDLOwnerName's counterpart). M0134-0005ai.
+func (o *ddlOp) checkCommentObjectOwner(ownerName, kind, name string) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	currentOID := o.currentDDLOwnerOID()
+	if im.IsSuperuser(currentOID) {
+		return nil
+	}
+	if ownerName == "" {
+		ownerName = "postgres"
+	}
+	ownerOID, ok := im.RoleOID(ownerName)
+	if !ok {
+		ownerOID = 10
+	}
+	if ownerOID != currentOID {
+		return &ExecError{Code: "42501",
+			Message: fmt.Sprintf("must be owner of %s %s", kind, name)}
+	}
+	return nil
+}
+
 // resolveUserMappingRoleName resolves a CREATE/DROP USER MAPPING FOR <user>
 // role-spec to the name that should be stored/looked-up in the
 // catalog.UserMapping registry. CURRENT_USER / SESSION_USER / CURRENT_ROLE /
@@ -21787,37 +21838,88 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		if !ok {
 			return undefinedRelation()
 		}
+		var constrOID uint32
 		for _, nc := range tbl.NamedChecks {
 			if strings.EqualFold(nc.Name, s.SubName) {
-				im.SetComment(oidPgConstraint, nc.OID, 0, s.Description)
-				return nil
+				constrOID = nc.OID
+				break
 			}
 		}
 		// PG18 NOT NULL constraints are also named constraints. M0097-0023.
-		for _, nn := range tbl.NotNullConstraints {
-			if strings.EqualFold(nn.Name, s.SubName) && nn.OID != 0 {
-				im.SetComment(oidPgConstraint, nn.OID, 0, s.Description)
-				return nil
+		if constrOID == 0 {
+			for _, nn := range tbl.NotNullConstraints {
+				if strings.EqualFold(nn.Name, s.SubName) && nn.OID != 0 {
+					constrOID = nn.OID
+					break
+				}
 			}
 		}
 		// UNIQUE / PRIMARY KEY / EXCLUDE constraints are backed by indexes whose
 		// Name equals the constraint name; the index OID is the pg_constraint OID
 		// emitted by pg_constraint's VirtualRows. DU-002 slice 144.
-		for _, idx := range im.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
-			if (idx.IsConstraint || idx.IsExclusion) && idx.OID != 0 && strings.EqualFold(idx.Name, s.SubName) {
-				im.SetComment(oidPgConstraint, idx.OID, 0, s.Description)
-				return nil
+		if constrOID == 0 {
+			for _, idx := range im.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
+				if (idx.IsConstraint || idx.IsExclusion) && idx.OID != 0 && strings.EqualFold(idx.Name, s.SubName) {
+					constrOID = idx.OID
+					break
+				}
 			}
 		}
 		// FOREIGN KEY constraints (contype='f') are stored on the child table.
-		for _, fk := range tbl.ForeignKeys {
-			if strings.EqualFold(fk.Name, s.SubName) && fk.OID != 0 {
-				im.SetComment(oidPgConstraint, fk.OID, 0, s.Description)
-				return nil
+		if constrOID == 0 {
+			for _, fk := range tbl.ForeignKeys {
+				if strings.EqualFold(fk.Name, s.SubName) && fk.OID != 0 {
+					constrOID = fk.OID
+					break
+				}
 			}
 		}
-		return &ExecError{Code: "42704", Pos: s.Pos(),
-			Message: fmt.Sprintf("constraint %q for table %q does not exist", s.SubName, tbl.Name)}
+		if constrOID == 0 {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("constraint %q for table %q does not exist", s.SubName, tbl.Name)}
+		}
+		// Ownership check, mirroring PG's comment.c CommentObject ->
+		// aclchk.c check_object_ownership (ACLCHECK_NOT_OWNER, OBJECT_TABLE):
+		// checked AFTER the object address (here, the constraint) resolves,
+		// BEFORE pg_description is touched. Superusers bypass. goopg's
+		// COMMENT ON otherwise performs no ownership check for any object kind
+		// (out of scope here — M0134-0005ai; see deferral candidate in report).
+		if err := o.checkCommentObjectOwner(tbl.Owner, "relation", tbl.Name); err != nil {
+			return err
+		}
+		im.SetComment(oidPgConstraint, constrOID, 0, s.Description)
+		return nil
+	case "domain constraint":
+		// COMMENT ON CONSTRAINT <name> ON DOMAIN <domain> IS '...'. PG resolves
+		// the domain type FIRST (get_object_address's OBJECT_DOMCONSTRAINT case,
+		// objectaddress.c:975-990) — a missing domain reports the type error, NOT
+		// the constraint error — then get_domain_constraint_oid
+		// (pg_constraint.c:1391,1427) raises the "for domain" message if the
+		// named constraint isn't found on that domain. M0134-0005ai.
+		dom, ok := im.LookupDomain(s.ObjName.Name, o.ctx.CurrentDatabaseOid)
+		if !ok {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("type %q does not exist", s.ObjName.String())}
+		}
+		var constrOID uint32
+		for _, ck := range dom.Checks {
+			if strings.EqualFold(ck.Name, s.SubName) && ck.OID != 0 {
+				constrOID = ck.OID
+				break
+			}
+		}
+		if constrOID == 0 {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("constraint %q for domain %s does not exist", s.SubName, dom.Name)}
+		}
+		// Ownership check — see the "constraint" case above for the PG oracle
+		// citation and ordering rationale; here it's OBJECT_TYPE ("must be owner
+		// of type ...", the domain's own typowner).
+		if err := o.checkCommentObjectOwnerOID(dom.OwnerOrDefault(), "type", dom.Name); err != nil {
+			return err
+		}
+		im.SetComment(oidPgConstraint, constrOID, 0, s.Description)
+		return nil
 	case "trigger":
 		// Triggers live in pg_trigger (classoid 2620). pg_dump's dumpTrigger keys
 		// the comment lookup on the trigger's catalogId.tableoid (pg_trigger =

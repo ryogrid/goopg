@@ -3584,3 +3584,89 @@ recursive descent. That guard already existed and is unaffected by this change;
 the test pins the refusal rather than inventing an unverified multi-level
 cascade, because the upstream regress suite contains no multi-level `ONLY`-drop
 case to derive one from.
+
+## 40. M0134-0005ai — a statement shape that never parsed, and a blind fallback that reported success anyway (LANDED 2026-08-19)
+
+Baseline entering this slice: **257 lines / 13 hunks** (M0134-0005ah's exit).
+Exit: **230 / 12**. The closed hunk is the `constraint_comments` window —
+`COMMENT ON CONSTRAINT <name> ON DOMAIN <domain>`.
+
+### The failure was not where the symptom pointed
+
+The diff showed four `COMMENT ON CONSTRAINT … ON DOMAIN …` statements where PG
+raises four distinct errors (unknown constraint, unknown domain, and two
+non-owner rejections) and goopg printed a bare `COMMENT` tag for all four. The
+natural reading — "goopg's error messages for this case are wrong" — is wrong
+twice over:
+
+1. **The executor's `"constraint"` arm is never reached for this spelling.**
+   `parseCommentOnTail`'s `CONSTRAINT` branch (`internal/parser/parser.go:3118`)
+   handled only `… ON <table>`; it called `parseObjectName()` immediately after
+   the second `ON`, so for the DOMAIN spelling it consumed the bare ident
+   `domain` as the object name, left the cursor on the domain's actual name, and
+   the shared trailer at `:3389` failed with "expected IS after object name in
+   COMMENT ON". The statement **never parsed at all**.
+2. **The parse failure was then converted into a success.**
+   `dispatchSimpleQueryViaExecutor` falls through to `compatNoopCommandTag`
+   (`internal/postmaster/dispatch.go:1752-1779`), which pattern-matches the raw
+   SQL prefix `"comment on "` and writes `CommandComplete("COMMENT")` with zero
+   catalog access. Verified empirically against a live server: even
+   `COMMENT ON CONSTRAINT c ON DOMAIN 12345 !!! IS 'x'` returns `COMMENT`, and
+   `pg_description` gains no row.
+
+Consequence worth recording: the ONE line in this window that *matched* PG —
+the successful `COMMENT ON CONSTRAINT the_constraint ON DOMAIN … IS '…'` — was a
+**coincidence of identical wire text over completely different mechanisms**. A
+regression test asserting only on that line's success would have been a
+false-positive pin. This is the second time in this campaign that a matching
+output line concealed a missing mechanism (cf. §37).
+
+The doc comment at `dispatch.go:1800-1804` asserts the invariant this depends on
+— *"a lone instance of [GRANT/REVOKE/COMMENT ON/SECURITY LABEL] always parses
+successfully"* — and this statement shape falsified it.
+
+### What landed
+
+- **Parser** (`parser.go:3124`): after the second `ON`, an optional `domain`
+  ident-keyword sets `cs.ObjKind = "domain constraint"`, mirroring the top-level
+  `COMMENT ON DOMAIN` case at `:3256`.
+- **Executor** (`operators_ddl.go`, `execCommentOn`): a new
+  `case "domain constraint"` resolving the domain FIRST, then the constraint —
+  the order is PG's, not incidental: `get_object_address`'s `OBJECT_DOMCONSTRAINT`
+  arm (`postgres/src/backend/catalog/objectaddress.c:975-990`) resolves the type
+  before `get_domain_constraint_oid`, so a missing *domain* reports
+  `type … does not exist` (42704) rather than the constraint error. The
+  not-found message is PG's verbatim from
+  `postgres/src/backend/catalog/pg_constraint.c:1391` —
+  `constraint "%s" for domain %s does not exist`.
+- **Ownership check** — new machinery, not a tweak. Pre-slice,
+  `grep -rn "must be owner" internal/executor/*.go` returned **zero hits**:
+  goopg's `COMMENT ON` never performed an ownership check for *any* object kind.
+  PG's `comment.c:CommentObject` calls `check_object_ownership` unconditionally
+  before touching `pg_description`. Two helpers now exist
+  (`checkCommentObjectOwnerOID` for OID-valued owners such as a domain's
+  typowner, `checkCommentObjectOwner` for `catalog.Table.Owner`'s role-NAME
+  string), raising 42501 `must be owner of {relation,type} <name>` with a
+  superuser bypass. **Deliberately scoped to the two constraint arms**; every
+  other `COMMENT ON` kind is still ungated — ledgered.
+- The table-constraint arm was refactored from four early-returning match loops
+  to OID-first resolution so the ownership check sits between "address resolved"
+  and "pg_description mutated", which is exactly PG's ordering.
+
+### The fallback was probed and deliberately left in place
+
+Removing the `"comment on "` arm of `compatNoopCommandTag` reddens
+`TestExtendedProtocolCompatNoopCommentOnMalformed`
+(`internal/postmaster/dispatch_extended_ddl_test.go:365`), which pins a
+*different* deliberate invariant (M0097-0023): a truncated clause of a
+**supported** ObjKind is absorbed as a silent no-op. So the fallback is
+load-bearing for two distinct reasons — genuinely unimplemented ObjKinds
+(`parseCommentOnTail`'s bare `default:` covers AGGREGATE, LANGUAGE, ROLE,
+TABLESPACE, TEXT SEARCH …, none of them tested) and that malformed-clause
+absorption. Narrowing it is real design work, not a comment fix; `dispatch.go`
+carries **zero diff** from this slice and the stale doc comment is left in place
+so the ledger row, not a half-corrected comment, owns the discrepancy.
+
+Guards (`internal/executor/comment_on_domain_constraint_test.go`, all
+FAIL-pre/PASS-post): domain-spelling success, unknown constraint, unknown
+domain, non-owner rejection on both spellings, owner/superuser acceptance.
