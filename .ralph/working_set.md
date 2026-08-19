@@ -1,69 +1,68 @@
-# Working set — M0134-0012 PARKED; real engine fix LANDED; next is M0134-0013
+# Working set — M0134-0014 PARKED; real engine fix LANDED; next is M0134-0015
 
-**Task:** M0134-0012 (`update.sql`). Parked like 0008-0011 — and like those, the
-sizing round yielded a **real, shipped engine fix**.
+**Task:** M0134-0014 (`mvcc.sql`). Commit `d2460abe`.
 
-**What landed.** `routeToPartitionDepth`'s `case "LIST":` arm
-(`internal/executor/operators_storage.go:2934`) formatted the routing key with a
-CLOSED if/else over `KindInt`/`KindString`/`KindBool`/null and **no default arm**.
-A `numeric` LIST key (already coerced by `coerceRowForConstraintChecks` before
-routing) therefore produced `keyStr == ""`, matched no bound, and raised
-`23514 no partition of relation ... found for row`. Net effect: a LIST-partitioned
-table with a numeric/float/date/uuid key could not accept **any** row. Fix = one
-line: call the existing `partitionKeyDatumToListStr` helper. Design:
-`docs/design/m0134-0012-list-partition-numeric-routing.md` (indexed).
+**The standing rule was applied first and paid off differently than expected.**
+`mvcc` is one of the "possible regression, verify" cases, so the loop ran
+`scripts/pg-regress-runner.sh --verbose mvcc` at HEAD BEFORE any implementation.
+It **still fails** (17 diff lines / 2 `^+ERROR`) — NOT a stale status. So no CSV
+flip, row stays `failed`, **no `make regen-testport`**. The one remaining
+verify-first case is `reindex_catalog`.
 
-**Refuted en route:** the obvious theory — that multi-value `FOR VALUES IN (2,3)`
-bound storage only honoured the first value — is WRONG. Bounds are stored
-per-value on both DDL paths (`operators_ddl.go:8926` ATTACH, `:4982` PARTITION OF),
-matching PG's flattened `create_list_bounds`. Do not re-open it.
+**What landed.** goopg evaluates PL/pgSQL expressions with a bespoke
+`parser.Expr`→`optimizer.Expr` interpreter (`lowerPLpgSQLExpr`,
+`internal/executor/plpgsql_runtime.go:2174`) that has no representation for a
+sub-`SELECT`, so it rejected `ExistsExpr` / `SubqueryExpr` / `InExpr`-with-subquery
+outright — while the SQL layer implements sublinks fully and generally. Routing
+gap, not a missing feature. The three sites now wrap a sentinel; `evalPLpgSQLExpr`
+catches it and re-evaluates the ORIGINAL expression as a synthetic no-`FROM`
+`SELECT <expr>` via `optimizer.Plan`/`Build` (new `evalExprViaSQL`, mirroring the
+pre-existing `evalScalarSubquery`). Regression-safe by construction: reachable
+only through sites that unconditionally errored, so no working expression changes
+path. Design: `docs/design/m0134-0014-plpgsql-sublink-sql-fallback.md` (indexed).
 
-**Lesson worth carrying — the sibling pair's *copy* was the correct twin.**
-Three sites format a partition key for the same `FindPartitionForValue` string
-compare: the RANGE arm (`:2966`) and `partitionKeyDatumToListStr` (`:3211`) both
-have `default: d.Format()`; only the LIST arm did not. The helper's own doc
-comment said it "mirrors the LIST arm" — the mirror had drifted *ahead* of the
-original. Usual `pattern_sibling_paths_must_agree` instinct, inverted: when you
-find a duplicated formatter, check which copy is stale, don't assume the
-canonical-looking one is right.
+**PG oracle that decided the design:** PG has NO plpgsql expression interpreter at
+all. `exec_prepare_plan` (`pl_exec.c:4173`) literally builds `SELECT <expr>` and
+SPI-plans it for EVERY expression; `exec_eval_simple_expr` is a planned-`Expr`
+fast path, not a node-kind allow-list. goopg's allow-list is an artifact.
 
-**Why PARKED.** Eight independent root causes. The dominant bucket (~300 of 841
-lines) is multi-level partition row routing through column-reordered intermediate
-partitions — REFACTOR-tier. Buckets 2 (partition constraint not enforced on
-UPDATE, 9 stmts) and 3 (RLS on row movement, 4 stmts) are partially CONFOUNDED by
-it: those partitions may look "silently accepting" only because they hold zero
-rows. Re-arm trigger recorded on the task. CSV row stays `failed` → **no
-`make regen-testport`**.
+**The second cause — found only AFTER the fix, and the loop's real insight.**
+With EXISTS fixed the loop body reached, for the first time,
+`INSERT ... FROM generate_series(1,100) g(i)` and died on
+`PL/pgSQL embedded SQL parse error ... "expected identifier (got 1)"`.
+`substitutePlpgsqlFrameVarsInSQL` (`:3157`) binds variables into embedded SQL by
+**textual substitution before parsing**, so the `FOR i` loop variable is spliced
+into the FROM-item column-alias list `g(i)` → `g(1)`. This and the shipped path's
+missing frame-variable resolution are **one design fault from opposite sides**:
+text substitution over-applies in non-expression positions and under-applies in
+AST-planned paths, because position-correctness is the parser's job and goopg does
+it pre-parse. PG avoids both with parser hooks (`plpgsql_pre_column_ref` /
+`plpgsql_param_ref_hook`, `pl_comp.c`) making variables `PARAM_EXTERN` bound
+parameters. Fix = parse-then-bind; REFACTOR-tier (single funnel for ALL plpgsql
+embedded SQL). A narrow "skip identifiers in a parenthesised alias list" patch was
+explicitly REJECTED as guessing grammar from a byte scanner — do not re-open.
 
-**Three deferral rows appended** (2026-08-20, M0134-0012): the nested-routing
-gap; the remaining six buckets + re-arm trigger; string-vs-typed-Datum bound
-comparison (`2` vs `2.0`) plus the still-suspect HASH arm.
+**Three deferral rows appended** (2026-08-20, M0134-0014): the alias-list
+corruption + parse-then-bind resume point; the new path's absent frame-variable
+binding (pinned by `TestPlpgSQLSublinkExprFrameVariableDeferred`); and converging
+on PG by deleting the interpreter (sequence AFTER parse-then-bind).
 
-**Next step:** select **M0134-0013 (`insert.sql`)** — a `failed` case. This loop's
-gate run already measured it at HEAD+fix: **1062 diff lines, 58 `^+ERROR`, 57
-`^-ERROR`**, with the visible diff tail being multi-column-range-partition
-(`mcrparted`) `Partition constraint:` display via `\d+`/`pg_get_expr` — a
-pretty-print gap, NOT tuple routing. Start from that, and check
-`parallel_schedule` for a prerequisite before assuming the failure is real.
+**Next step:** select **M0134-0015 (`join.sql`)** — a plain `failed` case, no
+verify-first rule. Size it at HEAD with `scripts/pg-regress-runner.sh --verbose
+join` before designing.
 
-**Gates run:** `go build ./...` PASS; `go vet ./internal/executor/` PASS;
-`go test ./internal/executor/` PASS (4 new tests in
-`list_partition_numeric_routing_test.go`; FAIL-pre verified by stashing only the
-`operators_storage.go` edit — 2 of the 4 failed with the verbatim `23514 no
-partition of relation "list_parted" found for row`, and the negative control +
-int/text/bool regression guard correctly passed both before and after, so the
-guard cannot become dead code);
-`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS (~7.5 min,
-warm cache); `scripts/tpch-spotcheck.sh` PASS with **Q12=2 / Q13=35 exactly
-matching `bench/tpch/spotcheck_expected.env`**;
-`scripts/pg-regress-runner.sh --verbose update` 823 lines / 11 `^+ERROR` (from
-841 / 13) with the reproducer row now appearing as unchanged context. Pre-commit
-pgbench smoke PASS. Caveat: `insert`/`create_table` were re-run as partition-heavy
-regression checks (1062 and 762 lines) but **no HEAD baseline was captured** for
-them — stashing was avoided with foreign WIP in the tree, so "unchanged" is
-inferred from their diff content being display-only, not measured.
+**Gates run:** `scripts/pg-regress-runner.sh --verbose mvcc` at HEAD 17 lines /
+2 `^+ERROR`, and 17 lines / 2 `^+ERROR` post-fix — same counts, **different
+error** (EXISTS rejection → alias-list parse error); do not read the equal count
+as "no progress". `go build ./...`, `go vet ./internal/executor/`,
+`go test ./internal/executor/` PASS (5 new tests in
+`plpgsql_sublink_expr_test.go`; FAIL-pre demonstrated verbatim for each).
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS.
+`scripts/tpch-spotcheck.sh` PASS with **Q12=2 / Q13=35 exactly**. Pre-commit
+pgbench smoke PASS.
 
-**Delegation:** `tmp/ralph-handoffs/M0134-0012a` (tester, sizing, DONE),
-`M0134-0012b` (researcher, root-cause + verdicts, DONE), `M0134-0012c`
-(implementer, 1 round, DONE), `M0134-0012d` (tester, gates, DONE).
+**Delegation:** `tmp/ralph-handoffs/M0134-0014a` (tester, verify-at-HEAD, 1 round,
+DONE), `M0134-0014b` (researcher, sizing + PG oracle, 1 round, DONE),
+`M0134-0014c` (implementer, 1 round, NEEDS-DECISION → coordinator parked the case;
+same dir holds the tester's `gates.md`).
 **In-flight:** none.
