@@ -4390,3 +4390,87 @@ the DML fixture helpers cannot express two statements observing different snapsh
 epochs around a live `DETACH PARTITION CONCURRENTLY`. The code path is identical to
 the single-level case already covered by
 `internal/catalog/partition_detach_visibility_test.go`. Ledgered.
+
+## 49. M0134-0005ar — one helper, two flags, three call sites, and only ONE of them symmetric (LANDED 2026-08-19)
+
+**The gap.** `catalog.Table.AddCheckInherited` (`internal/catalog/catalog.go:305`)
+threaded only `Name/Expr/OID/IsLocal/InhCount` and hard-zeroed `NotValid` and
+`NotEnforced`. Every CHECK constraint goopg propagated to an inheritance or
+partition child was therefore born **enforced and pre-validated**, regardless of
+what the parent said. Two ledger rows independently found the two halves —
+`.ralph/deferral_ledger.md:1540` (M0134-0005z, the `NotEnforced` half) and `:1573`
+(M0134-0005an, the `NotValid` half) — and each deferred with the same instruction:
+land them together, because the fix is one signature change across three call
+sites the individual briefs had fenced off. That instruction was correct. The
+*prediction* attached to it was not.
+
+**Where the ledger was wrong.** Both rows assumed the fix is symmetric: "copy the
+parent's `NotValid` and `NotEnforced` onto the child at all three sites." Upstream
+does not do that. PG has **two different rules**, and which one applies depends on
+whether the child existed when the constraint was declared:
+
+- **CREATE-time** (`INHERITS`, `PARTITION OF` — both routed through
+  `MergeAttributes` → `MergeCheckConstraint`,
+  `postgres/src/backend/commands/tablecmds.c:3167-3222`) sets
+  `newcon->is_enforced = is_enforced; newcon->skip_validation = !is_enforced;`
+  at `:3219-3220`. The child's validity is derived **purely from enforcement** and
+  never from the parent's own `convalidated` — a freshly created child is empty, so
+  any enforced constraint is trivially satisfied. PG never needs a regress case for
+  "NOT VALID parent CHECK inherited by a fresh child" because the answer is always
+  *valid*.
+- **ALTER-time cascade** (`ATAddCheckNNConstraint`, `tablecmds.c:9912-10049`,
+  recursing at `:10042-10043`) reuses the **same `Constraint` node** for every
+  child, so each child receives the user's literal `NOT VALID` / `NOT ENFORCED`
+  clause unchanged, and Phase 3 queues an independent per-child validation
+  (`:9956-9966`) precisely because those children may already hold violating rows.
+
+**The fix.** `AddCheckInherited` widened to
+`(name, expr string, oid uint32, notValid, notEnforced bool)` — matching its
+already-parameterized sibling `AddCheckFull` (`catalog.go:295`), which had had all
+three flags since the beginning; `AddCheckInherited` was simply the stale narrow
+twin. The three call sites in `internal/executor/operators_ddl.go` then split along
+PG's own seam:
+
+| site | rule |
+|---|---|
+| `execCreateTable` INHERITS loop (`:4049`) | `notEnforced = parent.NotEnforced`, `notValid = parent.NotEnforced` |
+| `execCreatePartitionChild` (`:5175`) | identical — the drifted twin |
+| `AlterTableAddCheck` partition cascade (`:8765`) | `act.NotValid`, `act.CheckNotEnforced` passed through unchanged |
+
+M0134-0005z's post-hoc `NotEnforced` stamp at `:4050-4055` is deleted; the helper
+now owns it. +35/−12 across two files.
+
+**Rule #2 sighting, again.** `execCreatePartitionChild` carries a comment at
+`:4026` asserting it mirrors the `execCreateTable` INHERITS loop. It did not: site
+1 had 0005z's post-hoc stamp, site 2 had nothing at all. The twin had silently
+drifted for a whole slice. This is the seventh consecutive instance of the campaign
+shape — *behaviour exists, grep hits, but on a sibling.*
+
+**Guards** (`internal/executor/operators_ddl_check_inherit_flags_test.go`, 5 tests,
+FAIL-pre proven by stashing only the two source files — 3 of 5 fail pre-fix):
+`…AlterCascadeNotEnforced`, `…CreateInheritsNotEnforced`,
+`…CreatePartitionOfNotEnforced`, plus
+`TestCheckInheritFlagsCreateTimeAntiSymmetryNotValid/{INHERITS,PARTITION_OF}` —
+the **anti-symmetry guard**, which pins that an enforced-but-`NOT VALID` parent
+CHECK produces a child with `NotValid=FALSE`. That test exists specifically to stop
+a future loop from "tidying up" the three sites into one symmetric rule and
+silently reintroducing the divergence.
+
+**One acceptance criterion did not bite, and the reason is already ledgered.** The
+literal port of `alter_table.sql:397-406` (`-- Test inherited NOT VALID CHECK
+constraints`) passes both before and after this change: `AlterTableAddCheck`'s
+cascade walks `PartitionChildren` only and never `InheritanceChildren`, so
+`attmp6`/`attmp7` never receive a `NamedChecks` entry at all and there is no flag
+to get wrong. That is the M0134-0005z ledger row at `.ralph/deferral_ledger.md:1539`
+(second clause), still open and now the **blocking** prerequisite for that fixture
+rather than a parallel one. The port is retained as a regression pin.
+
+**Metric.** `constraints.sql` enters and exits at **176 lines / 8 hunks**
+(unchanged) — the file exercises neither a `NOT VALID` nor a `NOT ENFORCED`
+inherited CHECK. This slice is paid for by correctness and by unblocking
+`alter_table.sql:397-428`, not by a diff-line count.
+
+**Gates.** 5/5 new guards PASS; `RALPH_PRECOMMIT_SCOPE=units` PASS (~7m,
+`internal/initdb` + `cmd/goopg` cold — cache cold-start, not a regression);
+`scripts/tpch-spotcheck.sh` **PASS (Q12=2, Q13=35)**; `go build ./...` + `go vet`
+clean.

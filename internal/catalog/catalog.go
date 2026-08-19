@@ -300,12 +300,22 @@ func (t *Table) AddCheckFull(name, expr string, oid uint32, notValid, noInherit,
 	})
 }
 
-// AddCheckInherited appends a CHECK constraint inherited from a partition parent
-// (IsLocal=false, InhCount=1). Used when creating partition children.
-func (t *Table) AddCheckInherited(name, expr string, oid uint32) {
+// AddCheckInherited appends a CHECK constraint inherited from a partition
+// parent (IsLocal=false, InhCount=1). Used when creating partition/inheritance
+// children and cascading an ALTER TABLE ADD CONSTRAINT to existing partition
+// children. notValid/notEnforced are threaded through by the caller — the two
+// flags are NOT symmetric across call sites (see the three call sites'
+// comments): CREATE-time inheritance (MergeCheckConstraint, tablecmds.c:
+// 3167-3222) derives validity PURELY from enforcement (`skip_validation =
+// !is_enforced`) since a fresh empty child is trivially valid, while an
+// ALTER-time cascade (ATAddCheckNNConstraint reusing the same Constraint node
+// per child, tablecmds.c:9912-10049) passes through the user's literal
+// clauses unchanged. M0134-0005ar.
+func (t *Table) AddCheckInherited(name, expr string, oid uint32, notValid, notEnforced bool) {
 	t.CheckConstraints = append(t.CheckConstraints, expr)
 	t.NamedChecks = append(t.NamedChecks, NamedCheckConstraint{
 		Name: name, Expr: expr, OID: oid, IsLocal: false, InhCount: 1,
+		NotValid: notValid, NotEnforced: notEnforced,
 	})
 }
 

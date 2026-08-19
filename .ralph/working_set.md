@@ -1,66 +1,84 @@
-# Working set — M0134-0005al LANDED (nullable PRIMARY KEY column)
+# Working set — M0134-0005ar LANDED (AddCheckInherited flag blindness, both halves)
 
-**Task:** M0134-0005 / sub-item **M0134-0005al** — LANDED, committed, pushed.
-Clean slice, one implementer round, zero deviations. No resume needed.
+**Task:** M0134-0005 / sub-item **M0134-0005ar** — LANDED, committed, pushed.
+One researcher + one implementer + one tester round, zero escalations, one
+non-blocking deviation. No resume needed.
 
-**Selection:** M-NIGHTLY had nothing new (`ci/logs/action-items.md` still at run
-20260819-011823, its only `AI-…-001` already filed AND fixed at fix_plan :1192);
-M0134 next per the banner.
+**Selection:** M-NIGHTLY had nothing new — `ci/logs/action-items.md` still at run
+20260819-011823, whose only `AI-…-001` is filed AND `[x]` fixed. M0134 next per
+the banner; took the baton's ranked #1.
 
-**What landed.** `ALTER TABLE t ALTER COLUMN a DROP NOT NULL` on a PK column
-returned success and cleared the flag — a **nullable PRIMARY KEY**, a catalog
-hole, not a wording hunk. The guard was not overlooked, it was implemented on
-the **wrong twin**: Bucket 3 (2026-08-18) put PG's PK refusal on the
-DROP-**by-name** path and its own ledger row named the by-column arm as
-"equally unguarded" to fix in the same pass — it wasn't. Third occurrence of
-this campaign's shape: the guard exists, the grep hits, on the sibling.
-PG keeps the check in `dropconstraint_internal` (`tablecmds.c:14128-14159`),
-NOT `ATExecDropNotNull` — four ordered refusals, PK first, before
-replica-identity/identity/`attnotnull`-clear. Fix: `IndexesOnTable` +
-`idx.Primary`/`idx.Columns` walk in the `case parser.AlterTableDropNotNull:`
-arm (`operators_ddl.go:10491`), before `clearNotNullConstraint` (guard in the
-case arm, NOT the helper — 3 callers). `42P16`, no detail/hint — **not** the
-`55000` of the adjacent `verifyNotNullPKCompatible`.
+**What landed.** `catalog.Table.AddCheckInherited` (`catalog.go:305`) hard-zeroed
+`NotValid`/`NotEnforced`, so every CHECK propagated to an inheritance or partition
+child was born enforced and pre-validated. Widened to
+`(name, expr, oid, notValid, notEnforced)`, matching sibling `AddCheckFull`
+(`:295`) which had all three flags from the start. All three call sites fixed.
+Closes ledger rows `:1540` (0005z, NotEnforced half) and `:1573` (0005an,
+NotValid half), which had each deferred with "land them together." +35/−12.
 
-**Measurement: constraints 188/9 -> 176/8.** Baseline for the next loop is
-**176/8**. Never compare to a pre-2026-08-19 number.
+**THE FINDING — both ledger rows predicted a SYMMETRIC fix, and PG is not.**
+PG has two rules, split on whether the child existed when the constraint was
+declared:
+- CREATE-time (`INHERITS`, `PARTITION OF` → `MergeCheckConstraint`,
+  `tablecmds.c:3219-3220`): `is_enforced = is_enforced; skip_validation =
+  !is_enforced` — validity derives **purely from enforcement**, never from the
+  parent's `convalidated`. A fresh child is empty ⇒ trivially valid. Upstream has
+  no regress case for it because the answer is always *valid*.
+- ALTER-time (`ATAddCheckNNConstraint`, `tablecmds.c:9912-10049`): the **same
+  `Constraint` node** is reused per child ⇒ user's literal clause passes through,
+  and Phase 3 queues per-child validation (`:9956-9966`) since children may
+  already hold rows.
+Sites: `operators_ddl.go:4049` + `:5175` get `(parent.NotEnforced, ×2)`; `:8765`
+gets `(act.NotValid, act.CheckNotEnforced)`. An **anti-symmetry guard**
+(`TestCheckInheritFlagsCreateTimeAntiSymmetryNotValid/{INHERITS,PARTITION_OF}`)
+pins this so a future loop cannot "tidy" the three sites into one rule.
 
-**Gates run:** `go build ./...` PASS; `go test ./internal/executor/
-./internal/catalog/` PASS; 4x `TestAlterTableDropNotNullOnPrimaryKey*`
-FAIL-pre/PASS-post (re-verified by the coordinator's tester before commit);
-`RALPH_PRECOMMIT_SCOPE=units` PASS; regress `constraints` 176/8 with no hunk new
-or grown; pgbench smoke via hook. No tpch-spotcheck: DDL guard only, no
-planner/executor row-path change.
+**Seventh consecutive Rule-#2 sighting.** `execCreatePartitionChild`'s comment at
+`:4026` claims it mirrors the INHERITS loop; it did not — site 1 had 0005z's
+post-hoc stamp, site 2 had nothing at all. Drifted for a whole slice.
 
-**Next step:** continue M0134-0005 at the **176/8** baseline. Ranked remaining
-(from the 0005ai census, `tmp/ralph-handoffs/m0134-0005ai-research/report.md` —
-reuse it, do NOT re-run the census):
-1. **CHECK-constraint VALIDATE cascade** — ledgered 2026-08-19, twin of 0005ak.
-   Bigger than the NOT NULL version: CHECK validation implies re-scanning each
-   descendant's rows, not a flag flip. PG's `QueueCheckConstraintValidation`
-   (`tablecmds.c:13117-13210`) has NO already-convalidated skip.
-2. The two remaining `dropconstraint_internal` NOT NULL refusals
-   (replica-identity index `:14162-14167`; identity column `:14174-14181`) —
-   ledgered TWICE now; must land on **both** spellings in ONE pass (Rule #2).
-   Small, and this row exists precisely because a prior slice did one side only.
-3. **TRAP — do not size from the diff:** the `ADD GENERATED … AS IDENTITY` hunk
-   looks ~2 lines and adjacent to what just landed, but `ALTER COLUMN … ADD
-   GENERATED` does not parse at all (no parser branch / action kind / executor
-   case; silent no-op). Closing it = porting `ATExecAddIdentity`
-   (`tablecmds.c:8240-8362`), a feature slice. Ledgered 3x (0005n/v/w).
-4. Not recommended: hunk 6 (circle gist opclass), hunk 5 (`SET CONSTRAINTS ALL
-   IMMEDIATE` checked at commit not INSERT — real but large), hunks 1-4/7
-   (generic error-text/formatting — known trap).
+**Deviation (non-blocking, now ledgered as BLOCKING for the fixture).** The
+literal port of `alter_table.sql:397-406` passes **vacuously** both pre- and
+post-fix: `AlterTableAddCheck`'s cascade walks `PartitionChildren` only, never
+`InheritanceChildren`, so `attmp6`/`attmp7` never get a `NamedChecks` entry to get
+wrong. Retained as a regression pin. That is the 0005z row's second clause
+(`:1539`) — now the blocking prerequisite for the fixture, not a parallel gap.
 
-**Key finding carried forward.** goopg has NO one-shot `find_all_inheritors` —
-only single-level `InheritanceChildren`/`PartitionChildren` (`catalog.go:4489`,
-`:4510`) — so every cascade self-recurses, and PG's "skip an already-convalidated
-descendant" prune is UNSAFE to copy verbatim (a validated intermediate would hide
-an invalid grandchild). Any future cascade slice inherits this.
+**Metric:** `constraints.sql` enters and exits at **176 lines / 8 hunks**
+(unchanged) — it exercises neither a NOT VALID nor a NOT ENFORCED inherited
+CHECK. No per-slice diff number claimed, deliberately.
 
-**Delegation:** `tmp/ralph-handoffs/m0134-0005al-{research,impl,gate}/`. All DONE,
-one round each. NOTE (3rd loop running): subagents are blocked by a tool rule from
-writing `report.md` and return findings inline instead — brief them to return
-content inline and fold it here; the impl brief's research report DID get written.
+**Gates run:** 5/5 new guards PASS (3 FAIL-pre proven by stashing only the two
+source files); `RALPH_PRECOMMIT_SCOPE=units` PASS (~7m, `internal/initdb` +
+`cmd/goopg` cold — cache cold-start, not a regression);
+**`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35)**; build + vet clean; pgbench
+smoke via hook.
 
-**In-flight:** none.
+**Next step:** continue M0134-0005 at the **176/8** baseline. Ranked:
+1. **`AlterTableAddCheck` cascade `PartitionChildren` → full descendant set**
+   (`operators_ddl.go:~8740-8780`) — this slice's own deferral, and it converts
+   the retained vacuous port into a real guard. NOTE: `collectDMLPartitionLeaves`
+   (`operators_storage.go:2869`) is leaves-only/partitions-only and NOT reusable —
+   an ALTER cascade must hit intermediate nodes AND inheritance children. The
+   correct node set is an open design question; that is the slice's real work.
+2. Cheap cleanup, bundle with any slice touching that file: re-join 0005an's split
+   `parent_noinh_convalid` fixture
+   (`operators_ddl_check_validate_cascade_test.go:212-226`) into a literal upstream
+   port — its `DELETE FROM ONLY` blocker is gone as of 0005ao.
+3. `validateCheckConstraintRows` whole-tree → per-relation walk (0005an row): PG
+   skips re-scanning an already-`convalidated` descendant (`tablecmds.c:12960`).
+4. **TRAP — do not size from the diff:** `ADD GENERATED … AS IDENTITY` looks
+   ~2 lines but does not parse at all; closing it = porting `ATExecAddIdentity`
+   (`tablecmds.c:8240-8362`), a feature slice. Ledgered 5×.
+5. Not recommended: hunk 6 (circle gist opclass), hunk 5 (`SET CONSTRAINTS ALL
+   IMMEDIATE`), the generic error-text/formatting hunks (known trap).
+
+**Standing finding (unchanged).** goopg still has NO one-shot `find_all_inheritors`.
+Three walks now exist with different node sets and epoch semantics:
+`collectDMLPartitionLeaves` (DML, snapshot epoch), `allDescendants`
+(`operators_fk.go:1004`, FK/RI, current epoch), and the ALTER cascade's flat
+`PartitionChildren`. Item 1 above will need a fourth or a unification — real work,
+not a rename.
+
+**Delegation:** none active. `tmp/ralph-handoffs/m0134-0005ar{,-research}/` closed
+(DONE). **In-flight:** none.

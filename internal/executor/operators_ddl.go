@@ -4046,13 +4046,14 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				if already {
 					continue
 				}
-				tbl.AddCheckInherited(pnc.Name, pnc.Expr, imInh.AllocOID())
-				// AddCheckInherited only threads IsLocal/InhCount; a parent
-				// CHECK carrying NOT ENFORCED (PG18) must stay unenforced on
-				// the child too (constraints.sql's NE_INSERT_TBL_CON case).
-				if pnc.NotEnforced {
-					tbl.NamedChecks[len(tbl.NamedChecks)-1].NotEnforced = true
-				}
+				// CREATE-time inheritance derives validity PURELY from
+				// enforcement (MergeCheckConstraint, tablecmds.c:3167-3222:
+				// `newcon->is_enforced = is_enforced; newcon->skip_validation
+				// = !is_enforced;`) — never from the parent's own
+				// convalidated. A fresh empty child is trivially valid, so
+				// NotValid mirrors NotEnforced, NOT the parent's NotValid.
+				// M0134-0005ar.
+				tbl.AddCheckInherited(pnc.Name, pnc.Expr, imInh.AllocOID(), pnc.NotEnforced, pnc.NotEnforced)
 			}
 		}
 	}
@@ -5172,7 +5173,11 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 		if isIM2 {
 			oid = im2.AllocOID()
 		}
-		tbl.AddCheckInherited(pnc.Name, pnc.Expr, oid)
+		// Same CREATE-time rule as the execCreateTable INHERITS loop above
+		// (operators_ddl.go:~4030) — MergeCheckConstraint derives validity
+		// purely from enforcement, never from the parent's own convalidated.
+		// M0134-0005ar.
+		tbl.AddCheckInherited(pnc.Name, pnc.Expr, oid, pnc.NotEnforced, pnc.NotEnforced)
 	}
 	// Apply CHECK constraints declared explicitly in the PARTITION OF column list
 	// (e.g. CONSTRAINT check_b CHECK (b > 0)). If the same name was already
@@ -8762,7 +8767,15 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 						}
 						if !merged {
 							oid3 := im3.AllocOID()
-							childTbl.AddCheckInherited(act.ConstraintName, act.CheckExpr, oid3)
+							// ALTER-time cascade reuses the SAME Constraint
+							// node for every child (ATAddCheckNNConstraint,
+							// tablecmds.c:9912-10049, recursion at
+							// :10042-10043), so each child gets the user's
+							// literal NOT VALID / NOT ENFORCED clause
+							// unchanged — unlike the CREATE-time sites above,
+							// which derive NotValid from NotEnforced alone.
+							// M0134-0005ar.
+							childTbl.AddCheckInherited(act.ConstraintName, act.CheckExpr, oid3, act.NotValid, act.CheckNotEnforced)
 						}
 					}
 				}
