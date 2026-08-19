@@ -4313,3 +4313,80 @@ expansion sites therefore misses grandchild partitions under multi-level
 introduced or widened here, so no multi-level capability test was written. It is
 the DML analogue of the FK-side row `M0134-0005h`, whose sibling scans were
 already converted to the recursive `allDescendants` walk.
+
+## 48. M0134-0005aq — the partition walk that stopped one level down (LANDED 2026-08-19)
+
+**Symptom.** With a sub-partitioned table — root → intermediate partition that is
+itself `PARTITION BY` → leaf — every `UPDATE`/`DELETE` against the root reported
+**0 rows** and left the leaf untouched. No error. All four DML forms, live-verified
+against PG 18.3:
+
+```sql
+CREATE TABLE root_p (id int, v int) PARTITION BY RANGE (id);
+CREATE TABLE mid_p PARTITION OF root_p FOR VALUES FROM (0) TO (100) PARTITION BY RANGE (id);
+CREATE TABLE leaf_p PARTITION OF mid_p FOR VALUES FROM (0) TO (50);
+INSERT INTO root_p VALUES (10, 1);
+```
+
+| statement | goopg (pre) | PG 18.3 |
+|---|---|---|
+| `UPDATE root_p SET v=100 WHERE id=10` | `UPDATE 0` | `UPDATE 1` |
+| `DELETE FROM root_p` | `DELETE 0` | `DELETE 1` |
+| `UPDATE root_p SET v=other_t.v FROM other_t WHERE …` | `UPDATE 0` | `UPDATE 1` |
+| `DELETE FROM root_p USING other_t WHERE …` | `DELETE 0` | `DELETE 1` |
+
+`SELECT` saw the rows the whole time, which is what made the gap invisible.
+
+**Root cause.** `catalog.InMemory.PartitionChildren` (`internal/catalog/catalog.go:4510`)
+returns **direct children only** — it does not recurse. All four DML
+descendant-expansion sites in `internal/executor/operators_storage.go` called it
+directly, so the fan-out list contained `mid_p` (a storage-less intermediate node)
+and never `leaf_p`. The other two consumers of the same hierarchy had each already
+solved this independently: INSERT routing via `routeToPartitionDepth`
+(`operators_storage.go:3014`) and the read path via `collectAllPartitionLeaves`
+(`internal/optimizer/planner.go:3350`). Only the DML fan-out was still flat.
+
+Upstream cannot express this: expansion is ONE site, `expand_inherited_rtentry`
+(`postgres/src/backend/optimizer/util/inherit.c:86`), and it recurses. This is the
+**sixth** consecutive instance of the campaign's shape — the behaviour exists and
+greps, but on a sibling path.
+
+**Fix.** New unexported `collectDMLPartitionLeaves(im, parentOID, detachEpoch)`
+(`operators_storage.go:2869`): BFS over `PartitionChildren`, **partitions-only**
+(inheritance children remain a separate branch at each call site),
+**leaves-only** (a node with a non-empty `PartitionKey` is recursed into, never
+scanned — intermediate nodes have no storage and must not be heap-locked), with a
+`seen` cycle guard. Swapped in at all four sites — `updateOp.Next:5166`,
+`deleteOp.Next:6204`, `updateOp.updateWithFrom:6655`, `deleteOp.deleteWithUsing:7180` —
+leaving the `!o.plan.Only` gate (§46), `colMap: nil` for partitions, and the
+per-child `acquireRelLock(RowExclusiveLock)` exactly as they were. 42 insertions,
+one file.
+
+**Two deliberate rejections.**
+- `allDescendants` (`internal/executor/operators_fk.go:1004`) is the existing
+  recursive executor walk, but is **not** reusable here: it mixes in inheritance
+  children, returns non-leaf nodes, and filters on
+  `transam.CurrentPartitionDetachEpoch()` — a globally-current epoch that is
+  intentionally FK/RI-specific (`operators_fk.go:1036-1049`).
+- The helper therefore filters on **`ctx.Snap.PartitionDetachEpoch`**, the
+  statement's own snapshot epoch (mirroring `operators_storage.go:3008`), via
+  `catalog.VisiblePartitionChildren`. Side effect worth naming: the four DML sites
+  previously applied **no** detach-visibility filter at all, so a concurrently
+  detached partition is now correctly excluded from the fan-out as well.
+
+**Guards.** `internal/executor/operators_dml_subpartition_test.go` (new, 6 tests):
+one per broken form asserting both the reported count and the **leaf table queried
+by its own name**, plus a one-level regression guard and an `UPDATE ONLY`
+fan-out-suppression guard. FAIL-pre proven by stashing only the source file — all
+four report `RowsAffected=0` with the leaf row unchanged.
+
+**Gates.** 6/6 new guards PASS; §47's four `TestDeleteUsingPartitioned*` guards and
+`TestAlterTablePartitionDescendantRecursion` still PASS;
+`RALPH_PRECOMMIT_SCOPE=units` PASS (~8 min, `internal/initdb` cold);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35 — exact anchors).
+
+**Left open.** The detached-**grandchild** epoch path is not exercised by a test:
+the DML fixture helpers cannot express two statements observing different snapshot
+epochs around a live `DETACH PARTITION CONCURRENTLY`. The code path is identical to
+the single-level case already covered by
+`internal/catalog/partition_detach_visibility_test.go`. Ledgered.
