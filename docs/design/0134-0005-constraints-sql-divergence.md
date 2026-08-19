@@ -4233,3 +4233,83 @@ every partition, while the other three sites and plain `DELETE` handle
 partitions correctly. Found while gating the four sites (three append both child
 kinds; this one appends only inheritance children). Pre-existing, orthogonal to
 this slice, and left untouched per the brief's no-scope-creep clause.
+
+## 47. M0134-0005ap — `DELETE … USING` was the one expansion site that forgot partitions (LANDED 2026-08-19)
+
+Filed by §46's ledger row and fixed here. `DELETE FROM <partitioned_parent>
+USING <other> WHERE …` silently deleted **zero** rows from every partition: it
+reported an affected-row count of 0, raised nothing, and left the data in place.
+Plain `DELETE`, `UPDATE` and `UPDATE … FROM` were all correct.
+
+### The shape: four hand-written copies of one PG concept
+
+goopg writes descendant expansion out **four separate times** in
+`internal/executor/operators_storage.go` — `updateOp.Next` (`:5126-5144`),
+`deleteOp.Next` (`:6165-6182`), `updateOp.updateWithFrom` (`:6605-6638`) and
+`deleteOp.deleteWithUsing` (`:7132-7152`). Three of the four append **both**
+`PartitionChildren` and `AccessibleInheritanceChildren`; `deleteWithUsing`
+appended only the inheritance children. There is no planner-side pre-expansion
+to compensate — `usingScanTargets` is seeded solely inside the function itself
+(`:7137`, the parent alone), and the plan carries one `o.plan.Table` plus
+`o.plan.UsingScans`. The partitions genuinely never reached victim collection.
+
+Upstream has exactly **one** such site: `expand_inherited_rtentry`
+(`postgres/src/backend/optimizer/util/inherit.c:86`) expands any RTE whose
+`rte->inh` is set, and that flag is assigned once at parse/rewrite time
+independently of whether the RTE is the DML target, a `FROM` item or a `USING`
+item. `nodeModifyTable.c` has **no** USING-specific partition branch. PG cannot
+express this bug; goopg's 4× duplication is what makes it expressible. §46
+gated all four sites for `ONLY` and that exercise is precisely what exposed the
+asymmetry — a fifth consecutive instance of this campaign's recurring shape
+(the behaviour exists, the grep hits, but on the sibling).
+
+### Fix
+
++12 lines, one file. Inside the **existing** `if imDel, ok :=
+o.ctx.Catalog.(*catalog.InMemory); ok && !o.plan.Only {` guard (`:7140`, added
+by §46), a loop over `imDel.PartitionChildren(tbl.OID)` appends one
+`usingScanTarget` per child, taking `o.ctx.acquireRelLock(...,
+lmgr.RowExclusiveLock)` first, exactly as the inheritance loop below it does.
+
+`colMap` is deliberately **nil** for partition children and non-nil
+(`buildInheritColMap`) for inheritance children: a partition shares its parent's
+column ordinals in goopg's model, an inheritance child need not. All three
+sibling sites already make that same split; the RETURNING path needs nothing
+extra because a nil `colMap` means `oldRow` is already parent-aligned.
+
+Placing the loop **inside** the existing `if` rather than in a new one is what
+keeps `DELETE FROM ONLY <partitioned_parent> USING …` a no-op — a dedicated
+guard test pins that, and it is green both pre- and post-fix.
+
+The stamp-phase EPQ retry loop (`:7248+`) needed no change: it is generic over
+`victim{rel,blk,slot,cols}`, and `epqSlotMovedToAnotherPartition` (`:7321`) keys
+off `vRel`/`v.blk`/`v.slot`, so a partition-sourced victim (including one moved
+to a sibling partition under RC) flows through unmodified — `deleteOp.Next`
+already proved that path.
+
+### Guards
+
+`internal/executor/operators_dml_using_partition_test.go` (new):
+`TestDeleteUsingPartitionedTarget` (2+ partitions, victims in more than one,
+each partition queried **by its own name** so a parent-level read cannot mask a
+miss), `TestDeleteUsingPartitionedReturning`, `TestDeleteFromOnlyUsingPartitionedNoop`,
+`TestDeleteUsingInheritNoPartitionRegression`. FAIL-pre was proven by reverting
+only `operators_storage.go` and keeping the tests: the two partition-targeting
+tests failed with `RowsAffected=0` / `0 rows returned`, while the `ONLY` guard
+and the inheritance regression guard stayed green — the exact expected pattern.
+
+### Metric
+
+`constraints.sql` enters and exits at **176 lines / 8 hunks**; it never writes
+`DELETE … USING`. As in §46, **no per-slice diff number is claimed** — this is a
+silent wrong-answer DML bug harvested from the campaign, not a diff-line fix.
+
+### Deferred (ledgered 2026-08-19)
+
+`catalog.InMemory.PartitionChildren` (`internal/catalog/catalog.go:4510`) is
+**flat — direct children only, no recursion**. Every one of the four DML
+expansion sites therefore misses grandchild partitions under multi-level
+(sub-partitioned) tables. This is pre-existing and common to all four, not
+introduced or widened here, so no multi-level capability test was written. It is
+the DML analogue of the FK-side row `M0134-0005h`, whose sibling scans were
+already converted to the recursive `allDescendants` walk.

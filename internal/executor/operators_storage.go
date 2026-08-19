@@ -7138,6 +7138,18 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 	// DELETE FROM ONLY … USING skips inheritance children entirely — see
 	// updateOp.Next's identical gate. M0134-0005ao.
 	if imDel, ok := o.ctx.Catalog.(*catalog.InMemory); ok && !o.plan.Only {
+		// Partition children: same column ordinals as parent (no remapping).
+		// Mirrors updateOp.updateWithFrom's partition loop and deleteOp.Next's
+		// PartitionChildren append. M0134-0005ap.
+		for _, pc := range imDel.PartitionChildren(tbl.OID) {
+			if err := o.ctx.acquireRelLock(o.ctx.Catalog.RelFileNode(pc), lmgr.RowExclusiveLock); err != nil {
+				return nil, err
+			}
+			usingScanTargets = append(usingScanTargets, usingScanTarget{
+				rel:  o.ctx.Catalog.RelFileNode(pc),
+				cols: pc.Columns,
+			})
+		}
 		// Drop other-session temp inheritance children. Design 0118-0036.
 		for _, ic := range catalog.AccessibleInheritanceChildren(imDel.InheritanceChildren(tbl.OID), sessionTempOwner(o.ctx)) {
 			if err := o.ctx.acquireRelLock(o.ctx.Catalog.RelFileNode(ic), lmgr.RowExclusiveLock); err != nil {
