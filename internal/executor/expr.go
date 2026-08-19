@@ -1466,6 +1466,85 @@ func evalPgLSNBinary(op parser.OpCode, left, right Datum, pos int) (Datum, bool,
 	return Datum{}, false, nil
 }
 
+// dpow implements PostgreSQL's `^` exponentiation operator (float8 ^ float8),
+// ported verbatim from postgres/src/backend/utils/adt/float.c:dpow. The NaN
+// and infinity handling is explicit because platform pow(3) gets several of
+// these cases wrong; math.Pow is trusted only for the residual case at the
+// bottom. M0134-0019b.
+func dpow(a, b float64, pos int) (float64, *ExecError) {
+	// POSIX: NaN ^ 0 = 1, 1 ^ NaN = 1; every other NaN input yields NaN.
+	if math.IsNaN(a) {
+		if math.IsNaN(b) || b != 0.0 {
+			return math.NaN(), nil
+		}
+		return 1.0, nil
+	}
+	if math.IsNaN(b) {
+		if a != 1.0 {
+			return math.NaN(), nil
+		}
+		return 1.0, nil
+	}
+
+	// The SQL spec requires a specific SQLSTATE for these domain errors —
+	// not the divide-by-zero code — for 0 ^ negative and negative ^
+	// non-integer.
+	if a == 0 && b < 0 {
+		return 0, &ExecError{Code: "22023", Pos: pos, Message: "zero raised to a negative power is undefined"}
+	}
+	if a < 0 && math.Floor(b) != b {
+		return 0, &ExecError{Code: "22023", Pos: pos, Message: "a negative number raised to a non-integer power yields a complex result"}
+	}
+
+	// Infinite exponent: handle before infinite base so it doesn't matter
+	// whether the base is also infinite.
+	if math.IsInf(b, 0) {
+		absx := math.Abs(a)
+		switch {
+		case absx == 1.0:
+			return 1.0, nil
+		case b > 0.0: // y = +Inf
+			if absx > 1.0 {
+				return b, nil
+			}
+			return 0.0, nil
+		default: // y = -Inf
+			if absx > 1.0 {
+				return 0.0, nil
+			}
+			return -b, nil
+		}
+	}
+	if math.IsInf(a, 0) {
+		switch {
+		case b == 0.0:
+			return 1.0, nil
+		case a > 0.0: // x = +Inf
+			if b > 0.0 {
+				return a, nil
+			}
+			return 0.0, nil
+		default: // x = -Inf
+			// The domain check above already established b is an integer
+			// (since a < 0). It's odd iff b/2 is not also an integer.
+			halfy := b / 2
+			yisoddinteger := math.Floor(halfy) != halfy
+			if b > 0.0 {
+				if yisoddinteger {
+					return a, nil
+				}
+				return -a, nil
+			}
+			if yisoddinteger {
+				return math.Copysign(0, -1), nil
+			}
+			return 0.0, nil
+		}
+	}
+
+	return math.Pow(a, b), nil
+}
+
 // evalBinary handles arithmetic, comparison, and boolean operators.
 // SQL three-valued logic: NULL operand on most operators yields NULL;
 // AND/OR follow Kleene's rules.
@@ -1574,6 +1653,17 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int, ctx *Context) (Dat
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s requires integer operands", op)}
 		}
 		return arithmetic(op, left.Int, right.Int, pos)
+	case parser.OpPow:
+		a, aok := datumToFloat64(left)
+		b, bok := datumToFloat64(right)
+		if !aok || !bok {
+			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s requires numeric operands", op)}
+		}
+		result, err := dpow(a, b, pos)
+		if err != nil {
+			return Datum{}, err
+		}
+		return floatTextDatum(PGFloatOut(result, 64)), nil
 	case parser.OpConcat:
 		// || requires at least one string-typed operand. When one side is text
 		// (or string-like), the other side is coerced to text. When both sides

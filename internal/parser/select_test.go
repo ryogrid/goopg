@@ -98,6 +98,44 @@ func TestParseSelectExpressionPrecedence(t *testing.T) {
 	}
 }
 
+// TestPowPrecedenceAndAssociativity pins `^`'s tree shape: it binds
+// tighter than * / % (gram.y's `%left '^'` sits above them) and looser
+// than unary minus (verified against real PostgreSQL — see the -2^2 case
+// below), and it is left-associative like every other operator in
+// goopg's precedence-climbing parser (PG's `^` is unusually
+// left-associative too, unlike most languages' right-associative `^`).
+// M0134-0019b.
+func TestPowPrecedenceAndAssociativity(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		// left-assoc: (2^3)^2, NOT 2^(3^2). Digits chosen so the two
+		// readings diverge (64 vs 512) — a same-digit pair like 2^2^2
+		// would pass either way and prove nothing.
+		{"SELECT 2^3^2", "((2 ^ 3) ^ 2)"},
+		// ^ binds tighter than * : 2*3^2 == 2*(3^2), not (2*3)^2.
+		{"SELECT 2*3^2", "(2 * (3 ^ 2))"},
+		// unary minus binds TIGHTER than ^ (verified against real PostgreSQL
+		// 17.6, `postgres --single`: -2^2 = 4, not -4 — the PG precedence
+		// table (postgres/doc/src/sgml/syntax.sgml "Operator Precedence,
+		// highest to lowest") lists unary +/- above ^, and gram.y's UMINUS
+		// token (line 891) is declared after '^' (line 887), i.e. higher
+		// precedence, so -2 reduces before ^ is shifted): -2^2 == (-2)^2.
+		{"SELECT -2^2", "((- 2) ^ 2)"},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		got := exprString(stmts[0].(*SelectStmt).Targets[0].Expr)
+		if got != c.want {
+			t.Errorf("Parse(%q) expr = %s, want %s", c.in, got, c.want)
+		}
+	}
+}
+
 // TestParseSelectOrderLimitOffset: trailing clauses parse as the right
 // node types and integers attach to LIMIT/OFFSET.
 func TestParseSelectOrderLimitOffset(t *testing.T) {

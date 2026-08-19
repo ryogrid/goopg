@@ -27,6 +27,7 @@ const (
 	OpMul // a * b
 	OpDiv // a / b
 	OpMod // a % b
+	OpPow // a ^ b (float8 exponentiation, PG dpow semantics)
 
 	// Binary text
 	OpConcat // a || b
@@ -105,6 +106,8 @@ func ParseBinaryOp(s string) OpCode {
 		return OpDiv
 	case "%":
 		return OpMod
+	case "^":
+		return OpPow
 	case "||":
 		return OpConcat
 	case "=":
@@ -186,6 +189,8 @@ func (o OpCode) String() string {
 		return "/"
 	case OpMod:
 		return "%"
+	case OpPow:
+		return "^"
 	case OpConcat:
 		return "||"
 	case OpEq:

@@ -12000,6 +12000,12 @@ func exprType(e Expr) catalog.Type {
 		// cell text — without this, sum(numeric * numeric) lands as
 		// int8 and libpq's Go driver fails ParseInt on `20667.0000`.
 		switch x.Op {
+		case parser.OpPow:
+			// PG has no int^int operator: both operands implicitly cast to
+			// float8 and the resolution lands on dpow, always float8 —
+			// unlike +-*/%, never numeric/int regardless of operand types.
+			// postgres/src/backend/utils/adt/float.c:dpow. M0134-0019b.
+			return catalog.Type{Name: "float8"}
 		case parser.OpAdd, parser.OpSub, parser.OpMul, parser.OpDiv, parser.OpMod:
 			lt := exprType(x.Left)
 			rt := exprType(x.Right)
