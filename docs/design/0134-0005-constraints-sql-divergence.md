@@ -3847,3 +3847,72 @@ Two deferrals recorded (2026-08-19): the CHECK-constraint VALIDATE cascade
 identical gap and is untouched; and PG's `ONLY`-with-children error
 (`ERRCODE_INVALID_TABLE_DEFINITION`, `tablecmds.c:13260-13263`) is unreproducible
 today because neither goopg call site plumbs an ONLY/recurse flag this deep.
+
+## 43. M0134-0005al — a PRIMARY KEY column could be made nullable (LANDED 2026-08-19)
+
+Entered at the **188 lines / 9 hunks** baseline left by §42 (0005ak); exits at
+**176 / 8** (−12 lines, −1 hunk, no new `@@`, no existing hunk grew).
+
+**The divergence.** `constraints.out:1072-1074`:
+
+```
+CREATE TABLE notnull_tbl2 (a INTEGER PRIMARY KEY);
+ALTER TABLE notnull_tbl2 ALTER a DROP NOT NULL;
+ERROR:  column "a" is in a primary key
+```
+
+goopg returned success and cleared the flag, leaving a **nullable PRIMARY KEY
+column**. This is not a message-wording hunk like most of the remaining
+constraints tail — it is a catalog-integrity hole that the diff happened to
+witness.
+
+**Why it was missing, and why that is the interesting part.** The guard was not
+overlooked; it was implemented on the *wrong twin*. M0134-0005 Bucket 3 (ledger
+2026-08-18) ported PG's PK-membership refusal into
+`execAlterTableDropConstraint` — the DROP-a-NOT-NULL-**by-name** path — and its
+own ledger row explicitly recorded that the DROP-NOT-NULL-**by-column** arm was
+"equally unguarded (Rule #2)" and should be fixed in the same pass. It was not.
+So for one day goopg refused `DROP CONSTRAINT <nn-name>` on a PK column while
+cheerfully accepting the `ALTER COLUMN a DROP NOT NULL` spelling of the exact
+same operation. A third occurrence of this campaign's recurring shape: **the
+guard exists, the reviewer greps, the grep hits — on the sibling.**
+
+**PG's structure.** `ATExecDropNotNull` (`tablecmds.c:7742`) does not hold the
+check itself; it delegates to `dropconstraint_internal` (called `:7817`), whose
+`CONSTRAINT_NOTNULL` branch carries **four** ordered refusals at `:14128-14181`.
+The PK refusal (`:14128-14159`) is FIRST — before the replica-identity check
+(`:14161`), before the identity-column check (`:14169`), and before
+`attnotnull` is cleared (`:14184`). Both goopg spellings must therefore reject
+before any mutation, which is why the guard sits in the `case` arm ahead of
+`clearNotNullConstraint` rather than inside it (that helper has three callers;
+putting the guard inside would have changed the by-name path's already-correct
+ordering too).
+
+**Landed.** `internal/executor/operators_ddl.go`, `case
+parser.AlterTableDropNotNull:` — after the 42703 column-existence check, walk
+`IndexesOnTable(tbl, NamespaceDBOid(...))` for `idx.Primary` and match
+`idx.Columns` case-insensitively; on a hit return `ExecError{Code: "42P16"}`
+with `column "%s" is in a primary key`, no detail, no hint. `42P16`
+(`ERRCODE_INVALID_TABLE_DEFINITION`), **not** the `55000` used by the
+neighbouring `verifyNotNullPKCompatible` — same family, different PG errcode.
+
+Pinned by four `TestAlterTableDropNotNullOnPrimaryKey*` tests (all FAIL-pre /
+PASS-post): the rejection itself, catalog-unchanged-after-rejection, a non-PK
+sibling column still droppable, and each member of a multi-column PK rejected
+independently. Wire-level SQLSTATE + message verified through psql against a
+cgroup-capped throwaway server.
+
+**Still missing on this path (ledgered).** goopg now runs 1 of PG's 4
+`dropconstraint_internal` NOT NULL refusals on the by-column arm. The
+replica-identity-index refusal (`:14162-14167`) and the identity-column refusal
+(`:14174-14181`) remain absent from **both** spellings.
+
+**Note for the next slice — the `ADD GENERATED … AS IDENTITY` hunk is a trap.**
+It sits in the same tail hunk as the lines this slice closed, so it looks
+adjacent and small (~2 diff lines). It is not: `ALTER COLUMN … ADD GENERATED`
+does not parse in goopg at all (no `ADD` branch in `parseAlterColumnAction`, no
+`AlterTableActionKind`, no executor case) — the statement is a silent no-op, so
+the `incompatible NOT VALID constraint` check has no path to live on. Closing it
+means porting `ATExecAddIdentity` (`tablecmds.c:8240-8362`) — a feature slice,
+not a guard. Already ledgered three times (0005n, 0005v, 0005w); do not
+re-estimate it from the diff's line count.

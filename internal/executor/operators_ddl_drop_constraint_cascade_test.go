@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -256,4 +257,108 @@ func findNotNull(t *testing.T, tbl *catalog.Table, colName string) int {
 	}
 	t.Fatalf("table %q has no NotNullConstraints entry for column %q: %+v", tbl.Name, colName, tbl.NotNullConstraints)
 	return -1
+}
+
+// TestAlterTableDropNotNullOnPrimaryKeyColumnFails pins M0134-0005al: a
+// column participating in the table's PRIMARY KEY can never lose its NOT
+// NULL via ALTER TABLE ... ALTER COLUMN ... DROP NOT NULL. Mirrors
+// dropconstraint_internal's CONSTRAINT_NOTNULL branch
+// (postgres/src/backend/commands/tablecmds.c:14128-14159) and
+// constraints.out:1072-1074 (notnull_tbl2): 42P16
+// ERRCODE_INVALID_TABLE_DEFINITION, message is the column name only (no
+// table name), no detail, no hint.
+func TestAlterTableDropNotNullOnPrimaryKeyColumnFails(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE notnull_tbl2 (a INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatalf("CREATE TABLE notnull_tbl2: %v", err)
+	}
+
+	err := runDDL(t, ctx, `ALTER TABLE notnull_tbl2 ALTER a DROP NOT NULL`)
+	ee := requireExecError(t, err, "42P16", `column "a" is in a primary key`)
+	if ee.Message != `column "a" is in a primary key` {
+		t.Fatalf("Message = %q, want exactly %q", ee.Message, `column "a" is in a primary key`)
+	}
+	if ee.Detail != "" {
+		t.Fatalf("Detail = %q, want empty", ee.Detail)
+	}
+	if ee.Hint != "" {
+		t.Fatalf("Hint = %q, want empty", ee.Hint)
+	}
+}
+
+// TestAlterTableDropNotNullOnPrimaryKeyLeavesCatalogUnchanged verifies the
+// rejection is transactionally clean: after the 42P16 error, the column's
+// NOT NULL is still enforced (the constraint was NOT cleared before the
+// guard fired).
+func TestAlterTableDropNotNullOnPrimaryKeyLeavesCatalogUnchanged(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE notnull_pk_unchanged (a INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatalf("CREATE TABLE notnull_pk_unchanged: %v", err)
+	}
+	if err := runDDL(t, ctx, `ALTER TABLE notnull_pk_unchanged ALTER a DROP NOT NULL`); err == nil {
+		t.Fatal("ALTER TABLE ... DROP NOT NULL over a PK column succeeded, want 42P16")
+	}
+
+	err := runDDL(t, ctx, `INSERT INTO notnull_pk_unchanged VALUES (NULL)`)
+	if err == nil {
+		t.Fatal("INSERT NULL into still-PK column succeeded — DROP NOT NULL guard leaked a catalog mutation")
+	}
+	ee, ok := err.(*ExecError)
+	if !ok {
+		t.Fatalf("error is %T, want *ExecError: %v", err, err)
+	}
+	if ee.Code != "23502" {
+		t.Fatalf("Code = %q, want 23502 (not_null_violation)", ee.Code)
+	}
+}
+
+// TestAlterTableDropNotNullOnNonPrimaryKeyColumnSucceeds is the regression
+// guard: a NOT NULL, non-PK column on a table that also has a PK must still
+// allow DROP NOT NULL.
+func TestAlterTableDropNotNullOnPrimaryKeySiblingColumnSucceeds(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE notnull_pk_and_plain (a INTEGER PRIMARY KEY, b INTEGER NOT NULL)`); err != nil {
+		t.Fatalf("CREATE TABLE notnull_pk_and_plain: %v", err)
+	}
+	if err := runDDL(t, ctx, `ALTER TABLE notnull_pk_and_plain ALTER b DROP NOT NULL`); err != nil {
+		t.Fatalf("ALTER TABLE ... ALTER b DROP NOT NULL: %v", err)
+	}
+
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "notnull_pk_and_plain"})
+	if !ok {
+		t.Fatal("notnull_pk_and_plain not found")
+	}
+	for _, col := range tbl.Columns {
+		if strings.EqualFold(col.Name, "b") && col.NotNull {
+			t.Fatalf("column b still NotNull=true after DROP NOT NULL")
+		}
+	}
+
+	// Confirm the PK column itself is still guarded.
+	err := runDDL(t, ctx, `ALTER TABLE notnull_pk_and_plain ALTER a DROP NOT NULL`)
+	requireExecError(t, err, "42P16", `column "a" is in a primary key`)
+}
+
+// TestAlterTableDropNotNullOnMultiColumnPrimaryKeyRejectsEachMember pins
+// acceptance criterion 5: a multi-column PK rejects DROP NOT NULL on EACH
+// member column independently.
+func TestAlterTableDropNotNullOnPrimaryKeyMultiColumnRejectsEachMember(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE notnull_pk_multi (a INTEGER, b INTEGER, PRIMARY KEY (a, b))`); err != nil {
+		t.Fatalf("CREATE TABLE notnull_pk_multi: %v", err)
+	}
+
+	errA := runDDL(t, ctx, `ALTER TABLE notnull_pk_multi ALTER a DROP NOT NULL`)
+	requireExecError(t, errA, "42P16", `column "a" is in a primary key`)
+
+	errB := runDDL(t, ctx, `ALTER TABLE notnull_pk_multi ALTER b DROP NOT NULL`)
+	requireExecError(t, errB, "42P16", `column "b" is in a primary key`)
 }

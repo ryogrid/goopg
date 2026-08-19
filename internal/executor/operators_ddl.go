@@ -10488,6 +10488,25 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				return &ExecError{Code: "42703", Pos: act.Pos(),
 					Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
 			}
+			// PK guard — mirrors dropconstraint_internal's CONSTRAINT_NOTNULL
+			// branch (tablecmds.c:14128-14159): a column that participates in
+			// the table's primary key can never lose its NOT NULL, and this
+			// check fires BEFORE the replica-identity check, the identity-
+			// column check, and attnotnull being cleared. 42P16, no detail,
+			// no hint. M0134-0005al.
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				for _, idx := range im.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
+					if !idx.Primary {
+						continue
+					}
+					for _, pkCol := range idx.Columns {
+						if strings.EqualFold(pkCol, act.ColumnName) {
+							return &ExecError{Code: "42P16", Pos: act.Pos(),
+								Message: fmt.Sprintf("column %q is in a primary key", act.ColumnName)}
+						}
+					}
+				}
+			}
 			if err := o.clearNotNullConstraint(tbl, act.ColumnName); err != nil {
 				return err
 			}
