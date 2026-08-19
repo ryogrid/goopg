@@ -1150,7 +1150,7 @@ branch, the case a depth-formula gets wrong), all in
 verbatim PG 18.3 captures rather than transcribed.
 
 **Cross-case leverage:** this is an emitter fix, so every M0134 case that emits
-a nested `EXPLAIN` inherits it — `explain.sql` (M0134-0017) most directly.
+a nested `EXPLAIN` inherits it — `explain.sql` (M0134-0082, renumbered 2026-08-19 — was 0017) most directly.
 
 ## S17 — landed 2026-08-17 (the `"Parallel "` node-label prefix)
 
@@ -1380,7 +1380,7 @@ unchanged — the only trustworthy sentinel (see the S18 ledger rows).
 ## Cross-case relevance
 
 Every M0134 regress case whose `.sql` emits `EXPLAIN` inherits the formatter
-classes (S1–S5) verbatim; `explain.sql` (M0134-0017) is the direct beneficiary of
+classes (S1–S5) verbatim; `explain.sql` (M0134-0082, renumbered 2026-08-19 — was 0017) is the direct beneficiary of
 the whole set. The planner classes (S6–S10) also move `explain.sql` and any case
 with min/max or grouped aggregates. Slices should be planned as cross-case
 emitter/planner fixes, then re-measured per case, not hardcoded to `aggregates.sql`.

@@ -1,78 +1,47 @@
-# Working set — M0134-0005as LANDED (ALTER ADD CHECK full-descendant cascade)
+# Working set — M0134 renumbered; 0005 PARKED, next is M0134-0006
 
-**Task:** M0134-0005 / sub-item **M0134-0005as** — LANDED, committed, pushed.
-One researcher + one implementer (2 rounds) + one tester round, zero escalations,
-one non-blocking deviation. No resume needed.
+**Task:** bookkeeping-only loop (user directive 2026-08-19): re-prioritise M0134
+by renumbering, park M0134-0005, point the loop at the new M0134-0006.
+No production code touched.
 
-**Selection:** M-NIGHTLY had nothing new — `ci/logs/action-items.md` still at run
-20260819-011823, whose only `AI-…-001` is filed AND `[x]` fixed. M0134 next per the
-banner; took the baton's ranked #1.
+**What changed.** Eighteen user-named cases were **pair-swapped** into
+M0134-0006..0023; the sixteen tasks they displaced took the vacated numbers in
+ascending order; the other 155 tasks keep their filed numbers. The task lines in
+`.ralph/fix_plan.md` and the table in the milestone doc were renumbered AND
+re-sorted ascending, so "topmost unchecked" still equals "lowest ID".
 
-**What landed.** `AlterTableAddCheck`'s cascade (`operators_ddl.go:8752-8781`) was a
-flat one-level loop over `PartitionChildren`: no plain-INHERITS child, no grandchild
-of any kind. Replaced by new `cascadeCheckToChildren`/`…At` (beside the DROP twin
-`cascadeCheckDropToChildren`, `:12220`), copying `cascadeNotNullToChildren`'s shape —
-`collectInheritanceAndPartitionChildren` per level + per-EDGE visited guard +
-`maxNotNullCascadeDepth`. Mirrors PG's `ATAddCheckNNConstraint`
-(`tablecmds.c:9911-10049`): one level via `find_inheritance_children`, then DFS.
-+87/−34 across 2 files + 1 new test file.
+**Files:**
+- `.ralph/fix_plan.md` — 184 task lines renumbered+resorted; M0134 preamble
+  rewritten; Current Priority banner extended; M0134-0005 line marked PARKED with
+  its full resume ranking folded in (the baton is no longer the only copy).
+- `docs/milestones/0134-regress-sql-failed-not-tried-digestion.md` — new
+  "Priority renumbering — 2026-08-19" section with the old→new table and the
+  three list-reconciliation rulings; Goals §2 and the task-list order text fixed.
+- `docs/design/README.md` — 0134-0005 row marked `case PARKED 2026-08-19`.
+- `docs/design/0134-0002-…md:358` (vacuum 0084→0021),
+  `docs/design/0134-0001-p2-…md:1153,1383` (explain 0017→0082) — cross-refs.
 
-**Two latent bugs the widening surfaced, both fixed.**
-1. **No `NoInherit` early return.** PG returns at `:10004` *before* enumerating any
-   child. goopg had no gate — accidentally safe only because the partitions-only walk
-   was empty whenever NoInherit held. Adding inheritance children destroys that
-   accident; the gate is now explicit.
-2. **Empty constraint name.** The cascade passed raw `act.ConstraintName`, so an
-   anonymous `ADD CHECK (x>0)` propagated `""` to every child. `o.autoCheckName`
-   resolution hoisted and now shared with the validation scan.
+**Findings worth carrying.**
+- **The ID band no longer segregates status.** `failed`=0001..0087 /
+  `not-tried`=0088..0189 was true only at filing. `select_parallel`
+  (`not-tried`) is now 0008; `float4` (`failed`) is now 0153. Read each task
+  line's own `` `failed` ``/`` `not-tried` `` word, never the number.
+- **Three cases the user listed have no task:** `select.sql`, `delete.sql`,
+  `sysviews.sql` already carry CSV `pass`. And `index.sql` does not exist
+  upstream — read as `indexing.sql` (confirmed by the user).
+- **M0134-0002/0003/0004/0005 are ALL parked.** 0006 is the first selectable
+  M0134 task.
 
-**THE REUSE TRAP (record this).** `allDescendants` (`operators_fk.go:1004`) has the
-IDENTICAL reachability set and looks like the obvious reuse — but it dedups per
-**node**, and PG's `coninhcount` counts once per inheritance **EDGE**
-(`heap.c:2774-2845`). A diamond descendant is legitimately visited twice. Never
-substitute a node-deduped walk into a DDL cascade.
+**Next step:** select **M0134-0006 (`select_having.sql`)** and, before any design
+or implementation, run `scripts/pg-regress-runner.sh select_having` at HEAD — it
+is one of the four "possible regression, verify" cases (milestone doc, Per-task
+discipline §3). If it already passes, the whole task is a CSV flip to `pass` /
+`pass_required=yes` with a "stale — already fixed" rationale plus
+`make check-testport-inventory`; no implementation, no design doc.
 
-**Vacuous port flipped.** `TestCheckInheritFlagsPortedAlterTableInheritedNotValid` was
-0005ar's retained no-op pin; round 2 rewrote its stale comment and made it assert
-`cif_attmp6/7` carry `b_le_20` with `NotValid=true, IsLocal=false, InhCount=1`.
-FAIL-pre proven.
+**Gates run:** none required — documentation/bookkeeping only, no code changed.
+Integrity verified instead: 189 IDs present exactly once and covering
+0001..0189, exactly 34 IDs changed, task block sorted ascending, and the
+(id, case) pairs in `.ralph/fix_plan.md` and the milestone doc identical.
 
-**Metric:** `constraints.sql` unchanged at **176 lines / 8 hunks** — it exercises no
-inherited ALTER-added CHECK. Paid for by correctness + unblocking `alter_table.sql`.
-
-**Gates run:** build+vet clean; 5/5 new `TestCheckAddCascade*` PASS (3 FAIL-pre proven
-by stashing only `operators_ddl.go`); round-2 10/10 PASS;
-`RALPH_PRECOMMIT_SCOPE=units` PASS (`internal/initdb` 412s — cold cache, not a
-regression); **`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35)**; pgbench smoke via
-hook.
-
-**Next step:** continue M0134-0005 at the **176/8** baseline. Ranked:
-1. **`ONLY`-with-existing-children rejection** (this slice's own deferral) —
-   `ALTER TABLE ONLY p ADD CHECK …` with children must raise `constraint must be
-   added to child tables too` (`tablecmds.c:10020-10023`); goopg silently adds to the
-   parent alone. Needs the `s.Only` plumbing shared with other ALTER subcommands.
-2. Bundle with #1 (same lines): parent's `AddCheckFull` still stores the raw
-   (possibly empty) `act.ConstraintName` while children now get the resolved one —
-   pass `conName` to both `AddCheckFull` and `allocConstraintOID`, then re-check
-   `pg_constraint` / pg_dump constraintdef output.
-3. Cheap cleanup, bundle with any slice touching that file: re-join 0005an's split
-   `parent_noinh_convalid` fixture
-   (`operators_ddl_check_validate_cascade_test.go:212-226`) into a literal upstream
-   port — its `DELETE FROM ONLY` blocker is gone as of 0005ao.
-4. `validateCheckConstraintRows` whole-tree → per-relation walk (0005an row): PG skips
-   re-scanning an already-`convalidated` descendant (`tablecmds.c:12960`).
-5. **TRAP — do not size from the diff:** `ADD GENERATED … AS IDENTITY` looks ~2 lines
-   but does not parse at all; closing it = porting `ATExecAddIdentity`
-   (`tablecmds.c:8240-8362`), a feature slice. Ledgered 5×.
-6. Not recommended: hunk 6 (circle gist opclass), hunk 5 (`SET CONSTRAINTS ALL
-   IMMEDIATE`), the generic error-text/formatting hunks (known trap).
-
-**Standing finding (UPDATED — now four walks, tabulated in the design addendum).**
-`collectDMLPartitionLeaves` (partitions/leaves only, snapshot epoch),
-`allDescendants` (all descendants, per-NODE guard, current epoch),
-`collectInheritanceAndPartitionChildren` (one level), and the DDL cascades'
-transitive per-EDGE recursion. Still no one-shot `find_all_inheritors`; the node-set
-differences are deliberate, not drift.
-
-**Delegation:** none active. `tmp/ralph-handoffs/m0134-0005as{,-research}/` closed
-(DONE). **In-flight:** none.
+**Delegation:** none. **In-flight:** none.

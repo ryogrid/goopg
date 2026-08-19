@@ -355,7 +355,7 @@ statement parser. PG grammar: `AnalyzeStmt`/`VacuumStmt` →
 and the trailing-token check emits `syntax error at or near "expected ';' or end
 of input (got ()"`. All 4 alter_table sites (alter_table.sql:1056-1059) name
 DROPPED columns of `atacc1`, so this case needs only the 42703 error path; the
-valid-column stats *restriction* is deferred (ledger row) to vacuum.sql (M0134-0084).
+valid-column stats *restriction* is deferred (ledger row) to vacuum.sql (M0134-0021, renumbered 2026-08-19 — was 0084).
 
 Design — three coordinated changes in one slice (parser+AST+executor, so the
 gate passes atomically):
