@@ -228,14 +228,20 @@ func TestC9S4CircularAttachRejected(t *testing.T) {
 }
 
 // TestC9DropConstraintOnlyDoesNotCascade pins the DROP-CONSTRAINT recurse
-// semantics (dropconstraint_internal, tablecmds.c:14025-14110): `ALTER TABLE
-// ONLY parent DROP CONSTRAINT name` removes the constraint from the parent but
-// leaves each child's inherited copy (coninhcount) intact, while the plain
-// (recursive) form cascades the drop to the children. Exposed by S4 — before
-// the cyclic-ATTACH rejection, the alter_table regress's ONLY-drop errored
-// with "cannot drop inherited constraint" (the cyclic self-loop had made the
+// semantics (dropconstraint_internal, tablecmds.c:14300-14343): `ALTER TABLE
+// ONLY parent DROP CONSTRAINT name` removes the constraint from the parent
+// AND still walks each child to decrement coninhcount (flipping conislocal
+// to true on reaching zero) — it does NOT delete the child's own row, but it
+// is not a no-op on the child either. The plain (recursive) form instead
+// cascades an outright DELETE of the child's row. Exposed by S4 — before the
+// cyclic-ATTACH rejection, the alter_table regress's ONLY-drop errored with
+// "cannot drop inherited constraint" (the cyclic self-loop had made the
 // parent's own constraint InhCount=1), which masked the missing recurse=false
-// handling.
+// handling. The name is legacy (kept to avoid an unrelated rename) — the
+// assertions below were corrected under M0134-0005ah slice B: this test
+// previously pinned an INVERTED reading ("ONLY-drop must not cascade" as
+// "must not touch children at all"), which is not what PG does — see
+// tmp/ralph-handoffs/m0134-0005ah-research/report.md item B.
 func TestC9DropConstraintOnlyDoesNotCascade(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
@@ -250,7 +256,7 @@ func TestC9DropConstraintOnlyDoesNotCascade(t *testing.T) {
 		}
 	}
 
-	checkB := func(tblName string) (count int, inhCount int) {
+	checkB := func(tblName string) (count int, inhCount int, isLocal bool) {
 		tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: tblName})
 		if !ok {
 			t.Fatalf("%s not found in catalog", tblName)
@@ -261,9 +267,10 @@ func TestC9DropConstraintOnlyDoesNotCascade(t *testing.T) {
 				if n.InhCount > inhCount {
 					inhCount = n.InhCount
 				}
+				isLocal = n.IsLocal
 			}
 		}
-		return count, inhCount
+		return count, inhCount, isLocal
 	}
 
 	// Seed: the regress :2863 form — goopg's ONLY-guard for ADD CONSTRAINT is a
@@ -272,36 +279,41 @@ func TestC9DropConstraintOnlyDoesNotCascade(t *testing.T) {
 	if err := runDDL(t, ctx, "ALTER TABLE ONLY p ADD CONSTRAINT check_b CHECK (b <> 'zz')"); err != nil {
 		t.Fatalf("ONLY ADD CONSTRAINT check_b: %v", err)
 	}
-	if n, _ := checkB("c"); n != 1 {
+	if n, _, _ := checkB("c"); n != 1 {
 		t.Fatalf("after ONLY ADD, child c has %d check_b, want 1", n)
 	}
 
-	// P1: ONLY (recurse=false) drop leaves the child's inherited copy intact.
+	// P1: ONLY (recurse=false) drop removes the parent's copy and decrements
+	// the child's coninhcount to 0 (flipping conislocal to true) — but the
+	// child's row is NOT deleted (dropconstraint_internal, tablecmds.c:
+	// 14300-14343; M0134-0005ah slice B corrected this from the prior
+	// "child untouched" reading).
 	if err := runDDL(t, ctx, "ALTER TABLE ONLY p DROP CONSTRAINT check_b"); err != nil {
 		t.Fatalf("ONLY DROP CONSTRAINT check_b: %v", err)
 	}
-	if n, _ := checkB("p"); n != 0 {
+	if n, _, _ := checkB("p"); n != 0 {
 		t.Errorf("after ONLY DROP, parent p has %d check_b, want 0", n)
 	}
-	if n, ic := checkB("c"); n != 1 || ic != 1 {
-		t.Errorf("after ONLY DROP, child c has %d check_b (InhCount=%d), want 1 (InhCount=1) — ONLY-drop must not cascade", n, ic)
+	if n, ic, local := checkB("c"); n != 1 || ic != 0 || !local {
+		t.Errorf("after ONLY DROP, child c has %d check_b (InhCount=%d, IsLocal=%v), want 1 (InhCount=0, IsLocal=true) — ONLY-drop must still decrement/orphan, not skip the child", n, ic, local)
 	}
 
-	// P2: the plain (recursive) drop still cascades to the child.
-	// Re-add to the parent (the child already has check_b → merged, not duplicated).
+	// P2: the plain (recursive) drop deletes the child's own row outright.
+	// Re-add to the parent; the child's now-local copy (from P1) merges back
+	// to inherited (InhCount=1, IsLocal=false).
 	if err := runDDL(t, ctx, "ALTER TABLE p ADD CONSTRAINT check_b CHECK (b <> 'zz')"); err != nil {
 		t.Fatalf("ADD CONSTRAINT check_b: %v", err)
 	}
-	if n, _ := checkB("c"); n != 1 {
+	if n, _, _ := checkB("c"); n != 1 {
 		t.Fatalf("after re-ADD, child c has %d check_b, want 1", n)
 	}
 	if err := runDDL(t, ctx, "ALTER TABLE p DROP CONSTRAINT check_b"); err != nil {
 		t.Fatalf("DROP CONSTRAINT check_b: %v", err)
 	}
-	if n, _ := checkB("p"); n != 0 {
+	if n, _, _ := checkB("p"); n != 0 {
 		t.Errorf("after plain DROP, parent p has %d check_b, want 0", n)
 	}
-	if n, _ := checkB("c"); n != 0 {
+	if n, _, _ := checkB("c"); n != 0 {
 		t.Errorf("after plain DROP, child c has %d check_b, want 0 (recursive drop must cascade)", n)
 	}
 }

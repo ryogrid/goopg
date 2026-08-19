@@ -9904,6 +9904,18 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			v, _ := strconv.ParseUint(strings.TrimSpace(arg.StringValue()), 10, 32)
 			targetOID = uint32(v)
 		}
+		// pretty: psql's \d+/\dD+ always call the two-arg form with pretty=true
+		// (postgres/src/bin/psql/describe.c:2530); pg_dump uses the one-arg form
+		// (implicit false) or the two-arg form with pretty=false explicitly
+		// (pg_dump.c:7768, ruleutils.c:2152). Default false when the second arg
+		// is absent, matching PG's 1-arg pg_get_constraintdef. DU-002-ah slice A.
+		pretty := false
+		if len(x.Args) >= 2 {
+			prettyArg, err := evalExpr(x.Args[1], row, ctx)
+			if err == nil && !prettyArg.IsNull() {
+				pretty = prettyArg.BoolValue()
+			}
+		}
 		for _, idx := range ctx.Catalog.AllIndexes() {
 			if idx.OID != targetOID || (!idx.IsConstraint && !idx.IsExclusion) {
 				continue
@@ -9923,7 +9935,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 					if nc.OID == 0 || nc.OID != targetOID {
 						continue
 					}
-					def := renderCheckPredicate(nc.Expr)
+					def := renderCheckPredicate(nc.Expr, pretty)
 					if nc.NoInherit {
 						def += " NO INHERIT"
 					}
@@ -9971,7 +9983,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 					if len(ck.InValues) > 0 {
 						return NewStringDatum("CHECK ((" + ck.Expr + "))"), nil
 					}
-					return NewStringDatum(renderDomainCheckPredicate(ck.Expr)), nil
+					return NewStringDatum(renderDomainCheckPredicate(ck.Expr, pretty)), nil
 				}
 			}
 		}

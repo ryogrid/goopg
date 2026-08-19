@@ -5618,15 +5618,54 @@ func defaultExprToSQL(e parser.Expr) string {
 // is not itself re-parseable (defaultExprToSQL hit a node it cannot render and fell
 // through to its Go-value fallback), keep the legacy double-paren raw wrap so we
 // never emit non-SQL garbage. DU-002 slice 362.
-func renderCheckPredicate(rawExpr string) string {
+//
+// pretty mirrors PG's pg_get_constraintdef(oid, pretty): psql's \d+ always calls
+// the two-arg form with pretty=true (describe.c:2530), while pg_dump uses the
+// one-arg form / pretty=false (pg_dump.c:7768). ruleutils.c's get_oper_expr only
+// self-wraps an OpExpr in parens `if (!PRETTY_PAREN(context))`
+// (ruleutils.c:10735-10769), so under pretty mode a bare top-level comparison
+// loses its self-wrap entirely: `CHECK (a > 0)` instead of `CHECK ((a > 0))`.
+// Only the single bare-comparison case is handled here (stripTopLevelSelfWrapParen
+// excludes AND/OR); a compound predicate under pretty mode would need PG's full
+// recursive isSimpleNode precedence logic and is out of scope (DU-002-ah slice A).
+func renderCheckPredicate(rawExpr string, pretty bool) string {
 	if e, err := parser.ParseExpr(rawExpr); err == nil {
 		if deparsed := defaultExprToSQL(e); deparsed != "" {
 			if _, err2 := parser.ParseExpr(deparsed); err2 == nil {
+				if pretty {
+					if stripped, ok := stripTopLevelSelfWrapParen(e, deparsed); ok {
+						deparsed = stripped
+					}
+				}
 				return "CHECK (" + deparsed + ")"
 			}
 		}
 	}
 	return "CHECK ((" + rawExpr + "))"
+}
+
+// stripTopLevelSelfWrapParen implements the pretty=true half of PG's
+// PRETTY_PAREN behavior (ruleutils.c:10735-10769 get_oper_expr) for the single
+// case in scope: a bare top-level binary COMPARISON node. defaultExprToSQL
+// unconditionally self-wraps every *parser.BinaryOp in one paren layer
+// (operators_ddl.go binaryOpSymbolForDefault case); under pretty mode PG drops
+// that self-wrap for the expression root. AND/OR (compound predicates) are
+// deliberately excluded — PG's pretty mode drops their inner parens too, but
+// reproducing that needs recursive pretty support, out of scope for this slice
+// (DU-002-ah slice A boundary).
+func stripTopLevelSelfWrapParen(e parser.Expr, deparsed string) (string, bool) {
+	bo, ok := e.(*parser.BinaryOp)
+	if !ok {
+		return "", false
+	}
+	switch bo.Op {
+	case parser.OpAnd, parser.OpOr:
+		return "", false
+	}
+	if strings.HasPrefix(deparsed, "(") && strings.HasSuffix(deparsed, ")") {
+		return deparsed[1 : len(deparsed)-1], true
+	}
+	return "", false
 }
 
 // renderDomainCheckPredicate is renderCheckPredicate's domain twin: it produces
@@ -5653,11 +5692,20 @@ func renderCheckPredicate(rawExpr string) string {
 // is stored as a pre-synthesized, byte-exact ScalarArrayOp deparse
 // (domainInValuesCheckExpr) that defaultExprToSQL cannot reproduce; the dump site
 // keeps its legacy wrap for that case. DU-002 slice 363.
-func renderDomainCheckPredicate(rawExpr string) string {
+//
+// pretty is the table-CHECK twin's pretty flag (see renderCheckPredicate): psql's
+// \dD+ calls pg_get_constraintdef(oid, true), pg_dump uses false/1-arg. Same
+// single-bare-comparison scope, same stripTopLevelSelfWrapParen helper.
+func renderDomainCheckPredicate(rawExpr string, pretty bool) string {
 	if e, err := parser.ParseExpr(rawExpr); err == nil {
 		upcaseDomainValuePlaceholder(e)
 		if deparsed := defaultExprToSQL(e); deparsed != "" {
 			if _, err2 := parser.ParseExpr(deparsed); err2 == nil {
+				if pretty {
+					if stripped, ok := stripTopLevelSelfWrapParen(e, deparsed); ok {
+						deparsed = stripped
+					}
+				}
 				return "CHECK (" + deparsed + ")"
 			}
 		}
@@ -10356,6 +10404,17 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if err := o.clearNotNullConstraint(tbl, act.ColumnName); err != nil {
 				return err
 			}
+			// Cascade the coninhcount/conislocal bookkeeping to inheritance/
+			// partition children — `ALTER TABLE ONLY ... DROP NOT NULL` must
+			// still walk children (dropconstraint_internal,
+			// tablecmds.c:14300-14343); previously this case had zero cascade
+			// logic at all, in either the ONLY or recursing case.
+			// M0134-0005ah slice B (ledger row M0134-0005ae).
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				if err := o.cascadeNotNullDropToChildren(im, tbl, act.ColumnName, !s.Only, make(map[[2]uint32]bool), 0); err != nil {
+					return err
+				}
+			}
 		case parser.AlterTableAddNotNull:
 			// ADD [CONSTRAINT name] NOT NULL col — the named (PG18) counterpart
 			// of SET NOT NULL. Marks the column NOT NULL AND records a contype='n'
@@ -11914,6 +11973,158 @@ func (o *ddlOp) clearNotNullConstraint(tbl *catalog.Table, colName string) error
 	return nil
 }
 
+// syncConstraintCatalogRow re-syncs tbl's pg_constraint-adjacent catalog heap
+// rows after an in-place NamedChecks/NotNullConstraints mutation, matching
+// the identical 3-step dance duplicated elsewhere in this file (e.g.
+// clearNotNullConstraint, cascadeNotNullToChildrenAt): delete the table's old
+// catalog heap rows, then re-derive them from the in-memory struct. No-op
+// when catalog heap sync isn't available for this context. M0134-0005ah
+// slice B.
+func (o *ddlOp) syncConstraintCatalogRow(tbl *catalog.Table) error {
+	if !catalogHeapSyncAvailable(o.ctx) {
+		return nil
+	}
+	if err := o.ctx.MaterializeWriterXID(); err == nil {
+		xmax := o.ctx.Tx.XID
+		for _, dbOid := range tableCatalogDBOids(o.ctx) {
+			deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+		}
+	}
+	if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+		return fmt.Errorf("DDL catalog sync: %w", syncErr)
+	}
+	return nil
+}
+
+// collectInheritanceAndPartitionChildren returns tbl's direct inheritance AND
+// partition children, deduplicated by OID. Shared by the DROP-direction
+// cascades below (cascadeCheckDropToChildren, cascadeNotNullDropToChildren);
+// mirrors the identical dedup already inlined in cascadeNotNullToChildrenAt
+// (the ADD-direction twin).
+func collectInheritanceAndPartitionChildren(im *catalog.InMemory, tbl *catalog.Table) []*catalog.Table {
+	children := append([]*catalog.Table(nil), im.InheritanceChildren(tbl.OID)...)
+	for _, pc := range im.PartitionChildren(tbl.OID) {
+		dup := false
+		for _, c := range children {
+			if c.OID == pc.OID {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			children = append(children, pc)
+		}
+	}
+	return children
+}
+
+// cascadeCheckDropToChildren mirrors dropconstraint_internal's per-child
+// coninhcount/conislocal bookkeeping (postgres/src/backend/commands/
+// tablecmds.c:14300-14343) when dropping a CHECK constraint from tbl. It
+// ALWAYS walks descendants — `ONLY` (recurse=false) means "don't delete the
+// child's row", not "don't touch children at all" (the bug this fixes;
+// ledger row M0134-0005ae / m0134-0005ah research report item B). When
+// recurse is true and the child's own copy is about to become orphaned
+// (coninhcount==1 && !conislocal) the child's row is deleted outright and the
+// walk continues into grandchildren (mirroring dropconstraint_internal's own
+// recursive self-call on the child); otherwise coninhcount is just
+// decremented. Only the ONLY-mode decrement flips conislocal to true on
+// reaching zero — PG's recurse-mode decrement-only `else` branch does NOT set
+// conislocal; that asymmetry is preserved exactly, not generalized away. Uses
+// the same edge-keyed visited guard + depth backstop as
+// cascadeNotNullToChildrenAt (diamond-inheritance correctness, M0134-0005p
+// sub-slice B). M0134-0005ah slice B.
+func (o *ddlOp) cascadeCheckDropToChildren(im *catalog.InMemory, tbl *catalog.Table, constraintName string, recurse bool, visited map[[2]uint32]bool, depth int) error {
+	if depth >= maxNotNullCascadeDepth {
+		return nil
+	}
+	for _, child := range collectInheritanceAndPartitionChildren(im, tbl) {
+		edge := [2]uint32{child.OID, tbl.OID}
+		if visited[edge] {
+			continue
+		}
+		visited[edge] = true
+
+		idx := -1
+		for j, cnc := range child.NamedChecks {
+			if strings.EqualFold(cnc.Name, constraintName) {
+				idx = j
+				break
+			}
+		}
+		if idx == -1 {
+			continue
+		}
+		if recurse && child.NamedChecks[idx].InhCount <= 1 && !child.NamedChecks[idx].IsLocal {
+			child.CheckConstraints = append(child.CheckConstraints[:idx], child.CheckConstraints[idx+1:]...)
+			child.NamedChecks = append(child.NamedChecks[:idx], child.NamedChecks[idx+1:]...)
+			if err := o.syncConstraintCatalogRow(child); err != nil {
+				return err
+			}
+			if err := o.cascadeCheckDropToChildren(im, child, constraintName, recurse, visited, depth+1); err != nil {
+				return err
+			}
+			continue
+		}
+		child.NamedChecks[idx].InhCount--
+		if !recurse && child.NamedChecks[idx].InhCount <= 0 {
+			child.NamedChecks[idx].IsLocal = true
+		}
+		if err := o.syncConstraintCatalogRow(child); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// cascadeNotNullDropToChildren is cascadeCheckDropToChildren's NOT NULL twin,
+// used both by `ALTER TABLE ... DROP CONSTRAINT <name>` (when the resolved
+// constraint is a NOT NULL) and by `ALTER TABLE ... ALTER c DROP NOT NULL`.
+// Children are matched BY COLUMN NAME, not constraint name (tablecmds.c:
+// 14251-14255: "we search for not-null constraints by column name, and
+// others by constraint name") — the same asymmetry the ADD-direction
+// cascadeNotNullToChildren observes. M0134-0005ah slice B.
+func (o *ddlOp) cascadeNotNullDropToChildren(im *catalog.InMemory, tbl *catalog.Table, colName string, recurse bool, visited map[[2]uint32]bool, depth int) error {
+	if depth >= maxNotNullCascadeDepth {
+		return nil
+	}
+	for _, child := range collectInheritanceAndPartitionChildren(im, tbl) {
+		edge := [2]uint32{child.OID, tbl.OID}
+		if visited[edge] {
+			continue
+		}
+		visited[edge] = true
+
+		idx := -1
+		for j, cnc := range child.NotNullConstraints {
+			if strings.EqualFold(cnc.ColName, colName) {
+				idx = j
+				break
+			}
+		}
+		if idx == -1 {
+			continue
+		}
+		if recurse && child.NotNullConstraints[idx].InhCount <= 1 && !child.NotNullConstraints[idx].IsLocal {
+			if err := o.clearNotNullConstraint(child, colName); err != nil {
+				return err
+			}
+			if err := o.cascadeNotNullDropToChildren(im, child, colName, recurse, visited, depth+1); err != nil {
+				return err
+			}
+			continue
+		}
+		child.NotNullConstraints[idx].InhCount--
+		if !recurse && child.NotNullConstraints[idx].InhCount <= 0 {
+			child.NotNullConstraints[idx].IsLocal = true
+		}
+		if err := o.syncConstraintCatalogRow(child); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // execAlterTableDropConstraint handles `ALTER TABLE t DROP CONSTRAINT name [RESTRICT|CASCADE]`.
 // Checked in the order CHECK / FOREIGN KEY / UNIQUE / PRIMARY KEY, mirroring
 // real PG's name-based pg_constraint lookup (the constraint kind only matters
@@ -11952,19 +12163,16 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 		// Drop from this table (keep CheckConstraints and NamedChecks in sync).
 		tbl.CheckConstraints = append(tbl.CheckConstraints[:i], tbl.CheckConstraints[i+1:]...)
 		tbl.NamedChecks = append(tbl.NamedChecks[:i], tbl.NamedChecks[i+1:]...)
-		// Cascade to partition children: drop the inherited copy from each child.
-		// ONLY (recurse=false) must NOT propagate — PG's dropconstraint_internal
-		// removes the constraint from the parent only, leaving each child's
-		// inherited copy (coninhcount) intact (tablecmds.c:14025-14110).
-		if isIM && !only {
-			for _, childTbl := range im.PartitionChildren(tbl.OID) {
-				for j, cnc := range childTbl.NamedChecks {
-					if strings.EqualFold(cnc.Name, act.ConstraintName) {
-						childTbl.CheckConstraints = append(childTbl.CheckConstraints[:j], childTbl.CheckConstraints[j+1:]...)
-						childTbl.NamedChecks = append(childTbl.NamedChecks[:j], childTbl.NamedChecks[j+1:]...)
-						break
-					}
-				}
+		// Cascade to inheritance/partition children: ONLY (recurse=false) does
+		// NOT mean "don't touch children" — it means "don't delete the
+		// child's row", per dropconstraint_internal
+		// (tablecmds.c:14300-14343). Every child still gets its coninhcount
+		// decremented (and conislocal flipped to true on reaching zero under
+		// ONLY); only the recursing (!only) path deletes an orphaned child's
+		// own copy outright. M0134-0005ah slice B (ledger row M0134-0005ae).
+		if isIM {
+			if err := o.cascadeCheckDropToChildren(im, tbl, act.ConstraintName, !only, make(map[[2]uint32]bool), 0); err != nil {
+				return err
 			}
 		}
 		return nil
@@ -12061,16 +12269,11 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 		if err := o.clearNotNullConstraint(tbl, colName); err != nil {
 			return err
 		}
-		if isIM && !only {
-			for _, childTbl := range im.PartitionChildren(tbl.OID) {
-				for _, cnc := range childTbl.NotNullConstraints {
-					if strings.EqualFold(cnc.ColName, colName) {
-						if err := o.clearNotNullConstraint(childTbl, colName); err != nil {
-							return err
-						}
-						break
-					}
-				}
+		// Same ONLY-still-walks-children rule as the CHECK branch above —
+		// M0134-0005ah slice B.
+		if isIM {
+			if err := o.cascadeNotNullDropToChildren(im, tbl, colName, !only, make(map[[2]uint32]bool), 0); err != nil {
+				return err
 			}
 		}
 		return nil

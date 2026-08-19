@@ -3492,3 +3492,95 @@ partial-predicate enforcement), and doing it **partially is worse than not at
 all**, because a half-implementation creates exclusion constraints that are
 catalogued but unenforced — precisely the silent-integrity class §38.1 just
 closed. It gets its own slice, ledgered.
+
+## 39. M0134-0005ah — one output the psql client asked to be *pretty*, and one catalog field `ONLY` was never allowed to touch (LANDED 2026-08-19)
+
+Two independent residues, both discovered while landing §0005ag's
+`pg_get_partition_constraintdef` and both ledgered under that task-id. Baseline
+at entry: `constraints` **290 diff lines / 15 hunks**; at exit **257 / 13**.
+Research: `tmp/ralph-handoffs/m0134-0005ah-research/report.md`.
+
+### 39.1 `pg_get_constraintdef(oid, pretty)` ignored its second argument
+
+goopg printed `CHECK ((a > 0))` where PG's `\d+` prints `CHECK (a > 0)`. The
+naive reading — "goopg emits one paren too many" — is **wrong**, and acting on
+it would have regressed `pg_dump`. PG emits *both* spellings, chosen by the
+caller:
+
+- `ruleutils.c:pg_oper_expr` (~:10735-10769) self-wraps every `OpExpr` in
+  parentheses **only when `!PRETTY_PAREN(context)`**.
+- psql `\d+` always calls the two-arg form with `pretty = true`
+  (`src/bin/psql/describe.c:2530`) — hence `CHECK (a > 0)`.
+- `pg_dump` calls the one-arg form / `false` (`pg_dump.c:7768`,
+  `ruleutils.c:2152`) — hence `CHECK ((a > 0))`, which is the form goopg was
+  already producing and must keep producing.
+
+goopg's `pg_get_constraintdef` dispatch arm (`internal/executor/expr.go`) never
+read argument 1 at all, so every consumer got the non-pretty spelling. Fix:
+thread `pretty` from the dispatch arm into `renderCheckPredicate` and
+`renderDomainCheckPredicate` (`internal/executor/operators_ddl.go`), which strip
+exactly one self-wrap layer for a **bare top-level binary comparison** when
+`pretty` is set. The shared `defaultExprToSQL` deparser is deliberately
+**untouched** — its other consumers (index predicates, column defaults,
+partition keys) are all non-pretty, so a change there would have been a silent
+cross-subsystem regression.
+
+The non-pretty assertions in `check_predicate_render_test.go` are the pg_dump
+regression guard and are as load-bearing as the new pretty ones.
+
+**Bounded deliberately:** compound (`AND`/`OR`) predicates under `pretty = true`
+keep their current shape. PG's pretty mode drops parens there too
+(`alter_table.out:3413`), but faithfully doing so needs real recursive
+pretty-mode support rather than a top-level strip. A test pins the current
+compound output so the boundary cannot move silently. Nothing in
+`constraints.sql` exercises it; ledgered.
+
+### 39.2 `ALTER TABLE ONLY … DROP` must still walk children
+
+goopg read "`ONLY` must not propagate" as "`ONLY` must not touch children at
+all". PG reads it as "do not recursively **DELETE** the child's constraint, but
+**do** fix up the child's inheritance bookkeeping": `dropconstraint_internal`
+(`postgres/src/backend/commands/tablecmds.c:14300-14343`) always walks
+`find_inheritance_children`, decrements each child's `coninhcount`, and flips
+`conislocal = true` on reaching zero; only the recursive DELETE is conditional.
+
+Skipping the walk leaves the child at `coninhcount > 0` with its parent's
+constraint gone — real `pg_constraint` state corruption. Its visible symptom is
+the one the ledger recorded from the other end: psql `\d+` printing a **spurious
+`(inherited)` tag**. Note the M0134-0005ag ledger row described this as goopg
+*omitting* the tag; that summary was inverted. It is one bug, previously
+ledgered as G4 under M0134-0005ae — not two.
+
+Three sites, one rule (Hard-won Rule #2 in its "direct target vs recursion
+target" form), all in `internal/executor/operators_ddl.go`:
+
+1. `execAlterTableDropConstraint`, CHECK branch — the `if isIM && !only` guard,
+   whose in-code comment was inverted relative to the oracle.
+2. `execAlterTableDropConstraint`, NOT-NULL-by-constraint-name branch — same
+   guard shape.
+3. `AlterTableDropNotNull` (the column-name path) — no cascade logic at all.
+
+All three now call new helpers `cascadeCheckDropToChildren` /
+`cascadeNotNullDropToChildren`, which mirror `dropconstraint_internal` and reuse
+the edge-keyed visited set + depth backstop of the ADD-direction twin
+`cascadeNotNullToChildrenAt` (diamond-inheritance safety) rather than
+introducing a second traversal. **The oracle's asymmetry is preserved verbatim,
+not tidied away:** the recurse branch deletes an orphan-to-be outright, while
+only the non-recurse (`ONLY`) branch sets `conislocal = true` on reaching zero.
+
+The pre-existing `TestC9DropConstraintOnlyDoesNotCascade` had pinned the *bug*
+(child untouched, `InhCount == 1`, no `conislocal` check). Its P1 assertion was
+corrected to the oracle's behaviour — row still present, `InhCount == 0`,
+`IsLocal == true`; P2 (recursive drop deletes the child's row) was already right
+and is unchanged. Correcting an assertion that encoded the inverted semantics is
+unavoidable when fixing that exact bug, and is recorded here rather than made
+silently.
+
+**Multi-level:** with a mid-level table whose own copy is itself inherited,
+`ALTER TABLE ONLY mid DROP CONSTRAINT` is **refused** with 42P16 — the
+"cannot drop inherited constraint" guard at the top of `dropconstraint_internal`
+fires on the target whenever `coninhcount > 0` and the call is not itself a
+recursive descent. That guard already existed and is unaffected by this change;
+the test pins the refusal rather than inventing an unverified multi-level
+cascade, because the upstream regress suite contains no multi-level `ONLY`-drop
+case to derive one from.
