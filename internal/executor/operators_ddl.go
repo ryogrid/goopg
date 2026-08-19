@@ -1710,7 +1710,28 @@ func columnTypeStorageCode(cat catalog.Catalog, col catalog.Column) byte {
 	return userTypeAttrsForOID(typOID).TypStorage
 }
 
-func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
+// restoreTempShadow undoes a TEMP-table shadow drop: if ctx.TempTableShadows
+// has an entry under key, the stashed permanent table is re-registered in the
+// catalog and the shadow entry is removed. This is the ONE notion of "undo a
+// shadow" — shared by the normal DROP TABLE restore (the temp relation was
+// dropped, so its permanent shadow comes back) and by execCreateTable's
+// failure-path rollback (the CREATE TEMP TABLE that triggered the shadow drop
+// itself failed, so the drop must not stick). M0097-0003, M0134-0018b.
+func restoreTempShadow(ctx *Context, key string) {
+	if ctx.TempTableShadows == nil {
+		return
+	}
+	permTbl, hasShadow := ctx.TempTableShadows[key]
+	if !hasShadow || permTbl == nil {
+		return
+	}
+	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+		im.RegisterTable(permTbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
+	}
+	delete(ctx.TempTableShadows, key)
+}
+
+func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) (retErr error) {
 	// Temporary tables may only be created in the temp schema (pg_temp),
 	// not in a permanent schema like public.
 	if s.Temporary && s.Name.Schema != "" && !strings.EqualFold(s.Name.Schema, "pg_temp") {
@@ -1762,6 +1783,21 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			if err := o.ctx.Catalog.DropTable(s.Name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
 				return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
 			}
+			// The shadow drop above must be transactional with respect to the
+			// CREATE it precedes: if anything below fails (CTAS SELECT
+			// resolution, partition-child validation, the ordinary column
+			// path, tablespace resolution, ...) restore the stashed permanent
+			// table instead of stranding it — the failing CREATE TEMP TABLE
+			// must not permanently delete a live permanent relation.
+			// Armed ONLY on this branch, since only this branch performed the
+			// drop. Mirrors the DROP TABLE restore (restoreTempShadow, shared
+			// with :6936-6945) so there is one notion of "undo a shadow", not
+			// two. M0134-0018b.
+			defer func() {
+				if retErr != nil {
+					restoreTempShadow(o.ctx, key)
+				}
+			}()
 		} else {
 			return &ExecError{Code: "42P07", Pos: s.Pos(), Message: fmt.Sprintf("relation %q already exists", s.Name.String())}
 		}
@@ -6934,15 +6970,7 @@ func (o *ddlOp) dropTableByRefImmediate(name parser.ObjectName, tbl *catalog.Tab
 		}
 	}
 	// If this table was shadowing a permanent one, restore it. M0097-0003.
-	if o.ctx.TempTableShadows != nil {
-		key := strings.ToLower(name.Name)
-		if permTbl, hasShadow := o.ctx.TempTableShadows[key]; hasShadow && permTbl != nil {
-			if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
-				im.RegisterTable(permTbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
-			}
-			delete(o.ctx.TempTableShadows, key)
-		}
-	}
+	restoreTempShadow(o.ctx, strings.ToLower(name.Name))
 	o.ctx.Pool.InvalidateRel(rel)
 	if err := o.ctx.Pool.Manager().DropRelation(rel); err != nil {
 		return &ExecError{Code: "XX000", Message: err.Error()}
