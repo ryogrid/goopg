@@ -362,3 +362,148 @@ func TestAlterTableDropNotNullOnPrimaryKeyMultiColumnRejectsEachMember(t *testin
 	errB := runDDL(t, ctx, `ALTER TABLE notnull_pk_multi ALTER b DROP NOT NULL`)
 	requireExecError(t, errB, "42P16", `column "b" is in a primary key`)
 }
+
+// TestAlterTableDropNotNullOnReplicaIdentityIndexColumnFails pins
+// M0134-0005am: a column participating in the index chosen as the table's
+// replica identity via `ALTER TABLE ... REPLICA IDENTITY USING INDEX` can
+// never lose its NOT NULL via `ALTER TABLE ... ALTER COLUMN ... DROP NOT
+// NULL`. Mirrors dropconstraint_internal's CONSTRAINT_NOTNULL branch
+// (postgres/src/backend/commands/tablecmds.c:14161-14167): 42P16
+// ERRCODE_INVALID_TABLE_DEFINITION, message is the column name only (no
+// table name), no detail, no hint.
+func TestAlterTableDropNotNullOnReplicaIdentityIndexColumnFails(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE notnull_ri (a INTEGER NOT NULL, b INTEGER)`); err != nil {
+		t.Fatalf("CREATE TABLE notnull_ri: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE UNIQUE INDEX notnull_ri_uidx ON notnull_ri (a)`); err != nil {
+		t.Fatalf("CREATE UNIQUE INDEX notnull_ri_uidx: %v", err)
+	}
+	if err := runDDL(t, ctx, `ALTER TABLE notnull_ri REPLICA IDENTITY USING INDEX notnull_ri_uidx`); err != nil {
+		t.Fatalf("ALTER TABLE notnull_ri REPLICA IDENTITY USING INDEX notnull_ri_uidx: %v", err)
+	}
+
+	err := runDDL(t, ctx, `ALTER TABLE notnull_ri ALTER a DROP NOT NULL`)
+	ee := requireExecError(t, err, "42P16", `column "a" is in index used as replica identity`)
+	if ee.Message != `column "a" is in index used as replica identity` {
+		t.Fatalf("Message = %q, want exactly %q", ee.Message, `column "a" is in index used as replica identity`)
+	}
+	if ee.Detail != "" {
+		t.Fatalf("Detail = %q, want empty", ee.Detail)
+	}
+	if ee.Hint != "" {
+		t.Fatalf("Hint = %q, want empty", ee.Hint)
+	}
+}
+
+// TestAlterTableDropNotNullOnReplicaIdentityIndexLeavesCatalogUnchanged
+// mirrors TestAlterTableDropNotNullOnPrimaryKeyLeavesCatalogUnchanged for the
+// replica-identity-index refusal: after the 42P16 error, the column's NOT
+// NULL is still enforced.
+func TestAlterTableDropNotNullOnReplicaIdentityIndexLeavesCatalogUnchanged(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE notnull_ri_unchanged (a INTEGER NOT NULL, b INTEGER)`); err != nil {
+		t.Fatalf("CREATE TABLE notnull_ri_unchanged: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE UNIQUE INDEX notnull_ri_unchanged_uidx ON notnull_ri_unchanged (a)`); err != nil {
+		t.Fatalf("CREATE UNIQUE INDEX notnull_ri_unchanged_uidx: %v", err)
+	}
+	if err := runDDL(t, ctx, `ALTER TABLE notnull_ri_unchanged REPLICA IDENTITY USING INDEX notnull_ri_unchanged_uidx`); err != nil {
+		t.Fatalf("ALTER TABLE notnull_ri_unchanged REPLICA IDENTITY USING INDEX notnull_ri_unchanged_uidx: %v", err)
+	}
+	if err := runDDL(t, ctx, `ALTER TABLE notnull_ri_unchanged ALTER a DROP NOT NULL`); err == nil {
+		t.Fatal("ALTER TABLE ... DROP NOT NULL over a replica-identity-index column succeeded, want 42P16")
+	}
+
+	err := runDDL(t, ctx, `INSERT INTO notnull_ri_unchanged VALUES (NULL, 1)`)
+	if err == nil {
+		t.Fatal("INSERT NULL into still-guarded column succeeded — DROP NOT NULL guard leaked a catalog mutation")
+	}
+	ee, ok := err.(*ExecError)
+	if !ok {
+		t.Fatalf("error is %T, want *ExecError: %v", err, err)
+	}
+	if ee.Code != "23502" {
+		t.Fatalf("Code = %q, want 23502 (not_null_violation)", ee.Code)
+	}
+}
+
+// TestAlterTableDropNotNullOnIdentityColumnFails pins M0134-0005am: a
+// GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY column can never lose its NOT
+// NULL via `ALTER TABLE ... ALTER COLUMN ... DROP NOT NULL`. Mirrors
+// dropconstraint_internal's CONSTRAINT_NOTNULL branch
+// (postgres/src/backend/commands/tablecmds.c:14169-14181): 55000
+// ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE, message includes both the column
+// name AND the relation name (unlike the PK and replica-identity messages).
+func TestAlterTableDropNotNullOnIdentityColumnFails(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE notnull_ident (id int GENERATED ALWAYS AS IDENTITY NOT NULL, b INTEGER)`); err != nil {
+		t.Fatalf("CREATE TABLE notnull_ident: %v", err)
+	}
+
+	err := runDDL(t, ctx, `ALTER TABLE notnull_ident ALTER id DROP NOT NULL`)
+	ee := requireExecError(t, err, "55000", `column "id" of relation "notnull_ident" is an identity column`)
+	if ee.Message != `column "id" of relation "notnull_ident" is an identity column` {
+		t.Fatalf("Message = %q, want exactly %q", ee.Message, `column "id" of relation "notnull_ident" is an identity column`)
+	}
+	if ee.Detail != "" {
+		t.Fatalf("Detail = %q, want empty", ee.Detail)
+	}
+	if ee.Hint != "" {
+		t.Fatalf("Hint = %q, want empty", ee.Hint)
+	}
+}
+
+// TestAlterTableDropNotNullOrderingPKBeforeReplicaIdentityBeforeIdentity pins
+// acceptance criterion 2: PG's exact ordering — PK -> replica-identity ->
+// identity -> clear. A column that is BOTH the table's PRIMARY KEY and an
+// identity column must report the PK error (42P16 "is in a primary key"),
+// not the identity error (55000), proving the PK check fires first.
+func TestAlterTableDropNotNullOrderingPKBeforeReplicaIdentityBeforeIdentity(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE notnull_order (id int GENERATED ALWAYS AS IDENTITY NOT NULL PRIMARY KEY, b INTEGER)`); err != nil {
+		t.Fatalf("CREATE TABLE notnull_order: %v", err)
+	}
+
+	err := runDDL(t, ctx, `ALTER TABLE notnull_order ALTER id DROP NOT NULL`)
+	requireExecError(t, err, "42P16", `column "id" is in a primary key`)
+}
+
+// TestAlterTableDropNotNullOnReplicaIdentityIndexSiblingColumnSucceeds is the
+// regression guard: a NOT NULL, non-replica-identity-member column on a
+// table that has a replica-identity index must still allow DROP NOT NULL.
+func TestAlterTableDropNotNullOnReplicaIdentityIndexSiblingColumnSucceeds(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE notnull_ri_sibling (a INTEGER NOT NULL, b INTEGER NOT NULL)`); err != nil {
+		t.Fatalf("CREATE TABLE notnull_ri_sibling: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE UNIQUE INDEX notnull_ri_sibling_uidx ON notnull_ri_sibling (a)`); err != nil {
+		t.Fatalf("CREATE UNIQUE INDEX notnull_ri_sibling_uidx: %v", err)
+	}
+	if err := runDDL(t, ctx, `ALTER TABLE notnull_ri_sibling REPLICA IDENTITY USING INDEX notnull_ri_sibling_uidx`); err != nil {
+		t.Fatalf("ALTER TABLE notnull_ri_sibling REPLICA IDENTITY USING INDEX notnull_ri_sibling_uidx: %v", err)
+	}
+	if err := runDDL(t, ctx, `ALTER TABLE notnull_ri_sibling ALTER b DROP NOT NULL`); err != nil {
+		t.Fatalf("ALTER TABLE notnull_ri_sibling ALTER b DROP NOT NULL: %v", err)
+	}
+
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "notnull_ri_sibling"})
+	if !ok {
+		t.Fatal("notnull_ri_sibling not found")
+	}
+	for _, col := range tbl.Columns {
+		if strings.EqualFold(col.Name, "b") && col.NotNull {
+			t.Fatalf("column b still NotNull=true after DROP NOT NULL")
+		}
+	}
+}

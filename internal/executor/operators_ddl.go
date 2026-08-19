@@ -10507,6 +10507,54 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					}
 				}
 			}
+			// Replica-identity-index guard — mirrors dropconstraint_internal's
+			// CONSTRAINT_NOTNULL branch (tablecmds.c:14161-14167): a column that
+			// participates in the index chosen as the table's replica identity
+			// (`ALTER TABLE ... REPLICA IDENTITY USING INDEX <idx>`) can never
+			// lose its NOT NULL. This check fires BEFORE the identity-column
+			// check and attnotnull being cleared. 42P16, column name only, no
+			// relation name, no detail, no hint (message shape differs from
+			// the PK guard's message text but shares the SQLSTATE).
+			//
+			// PG derives the replica-identity attribute set from
+			// rd_replidindex (relcache.c:4938-4945), which for relreplident='d'
+			// (the default) resolves to the table's PRIMARY KEY index — so in
+			// PG this check is exactly redundant with the PK check above for
+			// the default replica identity mode. goopg never sets
+			// IsReplicaIdentity on the PK index for mode 'd' (chosenIdx is
+			// resolved only when mode=="i", operators_ddl.go:9940-9981), so
+			// this check fires only for the explicit USING INDEX case. End
+			// behavior is identical: for 'd' the PK check above already fired
+			// first with the PK message; for 'f'/'n' PG's rd_replidindex is
+			// InvalidOid and neither check fires. §44 (docs/design/0134-0005-
+			// constraints-sql-divergence.md). M0134-0005am.
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				for _, idx := range im.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
+					if !idx.IsReplicaIdentity {
+						continue
+					}
+					for _, riCol := range idx.Columns {
+						if strings.EqualFold(riCol, act.ColumnName) {
+							return &ExecError{Code: "42P16", Pos: act.Pos(),
+								Message: fmt.Sprintf("column %q is in index used as replica identity", act.ColumnName)}
+						}
+					}
+				}
+			}
+			// Identity-column guard — mirrors dropconstraint_internal's
+			// CONSTRAINT_NOTNULL branch (tablecmds.c:14169-14181): a
+			// GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY column can never lose
+			// its NOT NULL. Fires BEFORE attnotnull being cleared.
+			// ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE = 55000, column name
+			// AND relation name (unlike the PK and replica-identity
+			// messages). Both 'a' (ALWAYS) and 'd' (BY DEFAULT) identity
+			// kinds refuse. M0134-0005am.
+			for i := range tbl.Columns {
+				if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) && tbl.Columns[i].IdentityColumn {
+					return &ExecError{Code: "55000", Pos: act.Pos(),
+						Message: fmt.Sprintf("column %q of relation %q is an identity column", act.ColumnName, tbl.Name)}
+				}
+			}
 			if err := o.clearNotNullConstraint(tbl, act.ColumnName); err != nil {
 				return err
 			}
@@ -12392,9 +12440,11 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 	// as CHECK for the inherited-constraint guard
 	// (tablecmds.c:14103-14107) and additionally refuses to drop a not-null
 	// backing a PRIMARY KEY column (tablecmds.c:14154-14159, `"column \"%s\"
-	// is in a primary key"`). The replica-identity-index
-	// (tablecmds.c:14162-14167) and identity-column (tablecmds.c:14174-14181)
-	// refusals are NOT implemented — out of scope, M0134-0005 S04 (ledgered).
+	// is in a primary key"`), the replica-identity index
+	// (tablecmds.c:14161-14167, `"column \"%s\" is in index used as replica
+	// identity"`), and an identity column (tablecmds.c:14169-14181, `"column
+	// \"%s\" of relation \"%s\" is an identity column"`) — §44
+	// (docs/design/0134-0005-constraints-sql-divergence.md). M0134-0005am.
 	// Recursion to children matches by COLUMN NAME, not constraint name
 	// (tablecmds.c:14251-14255: "We search for not-null constraints by column
 	// name, and others by constraint name") — unlike the CHECK cascade above,
@@ -12424,6 +12474,36 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 				}
 			}
 			break
+		}
+		// Replica-identity-index guard — see the comment on the
+		// `case parser.AlterTableDropNotNull:` arm's twin check above for the
+		// full PG-derivation rationale (relcache.c:4938-4945, §44). 42P16,
+		// column name only, no relation name. M0134-0005am.
+		for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
+			if !idx.IsReplicaIdentity {
+				continue
+			}
+			for _, riCol := range idx.Columns {
+				if strings.EqualFold(riCol, nc.ColName) {
+					return &ExecError{
+						Code:    "42P16",
+						Pos:     act.Pos(),
+						Message: fmt.Sprintf("column %q is in index used as replica identity", nc.ColName),
+					}
+				}
+			}
+		}
+		// Identity-column guard — 55000, column name AND relation name.
+		// Both 'a' (ALWAYS) and 'd' (BY DEFAULT) identity kinds refuse.
+		// M0134-0005am.
+		for i := range tbl.Columns {
+			if strings.EqualFold(tbl.Columns[i].Name, nc.ColName) && tbl.Columns[i].IdentityColumn {
+				return &ExecError{
+					Code:    "55000",
+					Pos:     act.Pos(),
+					Message: fmt.Sprintf("column %q of relation %q is an identity column", nc.ColName, tbl.Name),
+				}
+			}
 		}
 		colName := nc.ColName
 		if err := o.clearNotNullConstraint(tbl, colName); err != nil {

@@ -3916,3 +3916,98 @@ the `incompatible NOT VALID constraint` check has no path to live on. Closing it
 means porting `ATExecAddIdentity` (`tablecmds.c:8240-8362`) — a feature slice,
 not a guard. Already ledgered three times (0005n, 0005v, 0005w); do not
 re-estimate it from the diff's line count.
+
+## 44. M0134-0005am — the other two refusals PG makes before a NOT NULL may be dropped (LANDED 2026-08-19)
+
+Entered and exits at the **176 lines / 8 hunks** baseline left by §43 (0005al) —
+**unchanged, and that is the expected result**. Neither refusal is witnessed by
+any statement in `src/test/regress/sql/constraints.sql` (confirmed by grep), so
+this slice moves the diff by zero lines. It is here because the *ledger* asked
+for it twice, not because the fixture did: a regress-diff campaign that only
+ever lands what the fixture witnesses accumulates exactly the kind of
+half-ported guard that produced §43.
+
+**What was missing.** PG's `dropconstraint_internal` `CONSTRAINT_NOTNULL` branch
+(`tablecmds.c:14109-14191`) makes **four** ordered decisions: refuse if the
+column is in the PRIMARY KEY (`:14128-14159`), refuse if it is in the index used
+as replica identity (`:14161-14167`), refuse if it is an identity column
+(`:14169-14181`), and only then clear `attnotnull` (`:14183-14188`). §43 landed
+refusal 1 on both spellings. Refusals 2 and 3 were absent from **both** — goopg
+silently dropped a NOT NULL that PG protects. Ledgered as a pair on 2026-08-18
+(Bucket 3) and again on 2026-08-19 (§43); this slice closes them, on both
+spellings, in one pass, because the reason the pair was ledgered twice is that a
+prior slice fixed one side only.
+
+**The two refusals, exactly.**
+
+| # | PG source | SQLSTATE | message |
+|---|---|---|---|
+| 2 | `tablecmds.c:14161-14167` (`ERRCODE_INVALID_TABLE_DEFINITION`) | `42P16` | `column "%s" is in index used as replica identity` |
+| 3 | `tablecmds.c:14169-14181` (`ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE`) | `55000` | `column "%s" of relation "%s" is an identity column` |
+
+Note the message shapes differ from each other and from refusal 1: refusal 2
+names only the column (and shares `42P16` with the PK refusal), refusal 3 names
+the column **and** the relation and uses a different errcode entirely. Getting
+that pairing backwards is invisible to a Go unit test that only asserts "an
+error occurred", which is why the pins assert the exact SQLSTATE *and* the exact
+message text.
+
+**A deliberate divergence in how the replica-identity attribute set is derived.**
+PG does not consult `pg_index.indisreplident` directly here; it asks
+`RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_IDENTITY_KEY)`, backed by
+`rd_replidindex`, which `RelationGetIndexList` (`relcache.c:4938-4945`) sets to
+**the PRIMARY KEY index** when `relreplident = 'd'` (the default, PK not
+deferrable), to the user-chosen index when `'i'`, and to `InvalidOid` otherwise.
+So in PG, for the default mode, refusal 2 is *exactly redundant* with refusal 1
+— the PK check has already fired on the same attribute set one branch earlier.
+goopg does not model it that way: `catalog.Index.IsReplicaIdentity` is set only
+by `ALTER TABLE … REPLICA IDENTITY USING INDEX` (`operators_ddl.go:9940-9981`
+resolves `chosenIdx` only when `mode == "i"`), so goopg's refusal 2 fires only
+for the explicit `USING INDEX` case. **End behavior is identical** — for `'d'`
+the PK refusal already fired first with the PK message, and for `'f'`/`'n'` PG's
+`rd_replidindex` is `InvalidOid` so neither fires — but the reasoning is
+recorded in-code because the two implementations reach the same answer by
+different routes, and a future reader comparing goopg's guard to PG's line by
+line would otherwise conclude goopg's is under-inclusive.
+
+A research note worth correcting for the record: the M0119-0004 ledger row
+states that `REPLICA IDENTITY USING INDEX` is rejected with `0A000`. That is
+**stale** — the parser accepts it (`internal/parser/ddl.go:9603-9631`) and the
+executor sets `Index.IsReplicaIdentity`, which is precisely what makes refusal 2
+reachable and observable today rather than dead code.
+
+**Landed.** `internal/executor/operators_ddl.go`, both twins, each inserted
+after that site's existing PK-membership loop and before its
+`clearNotNullConstraint` call, so PG's ordering (PK → replica-identity →
+identity → clear) holds on both and the catalog is untouched on every rejection:
+
+- `case parser.AlterTableDropNotNull:` (the by-column spelling) — column name
+  from `act.ColumnName`.
+- the "3.7. NOT NULL constraints" branch of `execAlterTableDropConstraint` (the
+  by-name spelling) — column name from `nc.ColName`, *not* `act.ColumnName`,
+  since the constraint is matched by name and carries its own column. That
+  branch's header comment, which asserted these two refusals were "NOT
+  implemented — out of scope", was updated in the same hunk.
+
+Identity membership reads `catalog.Column.IdentityColumn` (the `attidentity`
+equivalent) off the `*catalog.Table` both paths already hold; both `ALWAYS` and
+`BY DEFAULT` refuse, matching PG's `attidentity != '\0'` test. No catalog field,
+parser branch, or helper signature was added.
+
+**Pinned** (all FAIL-pre verified by reverting the guard hunk, then PASS-post) —
+5 tests beside the `TestAlterTableDropNotNullOnPrimaryKey*` family in
+`operators_ddl_drop_constraint_cascade_test.go` (replica-identity refusal,
+catalog-unchanged-after-rejection, identity-column refusal, **PK-beats-identity
+ordering** on a column that is both, and a sibling-column-still-drops
+regression guard) and 2 subtests beside `NotNullPkMemberRefused` in
+`operators_fk_unique_drop_constraint_test.go` for the by-name twin. The ordering
+test is the one that would catch a future refactor that reorders the guards:
+without it, three independently-correct checks can still produce the wrong
+error message for a column that trips two of them.
+
+**Gates.** `go build ./...` PASS; `go test ./internal/executor/
+./internal/catalog/` PASS; named guards PASS (re-run by the coordinator before
+commit); `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
+`scripts/pg-regress-runner.sh constraints` **176 / 8, unchanged** as predicted;
+pgbench smoke via the hook. No tpch-spotcheck — DDL guards only, no
+planner/executor row-path change.
