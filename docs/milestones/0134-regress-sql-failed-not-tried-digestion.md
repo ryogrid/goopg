@@ -33,6 +33,16 @@ from `./postgres/`.
    already passes, flip the row to `pass` with a "stale — already fixed" note
    instead of implementing anything.
 
+   **Outcome so far (keep this list current):** `select_having` was re-run at
+   HEAD on 2026-08-19 (M0134-0006) and PASSes — 1/1, 100.0% parity, 84/84 lines
+   byte-identical, corroborated by the same night's nightly
+   `TestPort_RegressSuite/select_having,PASS`. It cost one gate run instead of
+   an implementation slice, which is the whole point of this rule; the pattern
+   is that these four rows were captured by a baseline that disagreed with the
+   inventory's own status, so treat the remaining three (`mvcc`,
+   `reindex_catalog`, `select_implicit`) as *probably* stale too — but re-run
+   each, never flip on inference.
+
 ## Priority renumbering — 2026-08-19 (user directive)
 
 Task IDs are the selection order, so re-prioritising this milestone means
@@ -126,7 +136,7 @@ below**, after the 2026-08-19 priority renumbering; rows that moved say so in th
 | M0134-0003 | `arrays.sql` | failed |  |
 | M0134-0004 | `cluster.sql` | failed |  |
 | M0134-0005 | `constraints.sql` | failed |  |
-| M0134-0006 | `select_having.sql` | failed | renumbered 2026-08-19 (was M0134-0066) |
+| M0134-0006 | `select_having.sql` | **pass** | renumbered 2026-08-19 (was M0134-0066); **DONE 2026-08-19 — stale `failed`, no goopg change: runner 1/1 PASS at HEAD, CSV flipped to `pass`/`pass_required=yes`** |
 | M0134-0007 | `select_implicit.sql` | failed | renumbered 2026-08-19 (was M0134-0067) |
 | M0134-0008 | `select_parallel.sql` | not-tried | renumbered 2026-08-19 (was M0134-0166) |
 | M0134-0009 | `select_views.sql` | failed | renumbered 2026-08-19 (was M0134-0068) |
