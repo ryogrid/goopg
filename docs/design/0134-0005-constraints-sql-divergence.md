@@ -4011,3 +4011,123 @@ commit); `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
 `scripts/pg-regress-runner.sh constraints` **176 / 8, unchanged** as predicted;
 pgbench smoke via the hook. No tpch-spotcheck — DDL guards only, no
 planner/executor row-path change.
+
+## 45. M0134-0005an — the CHECK twin of §42, and the word `NO INHERIT` that nobody was reading (LANDED 2026-08-19)
+
+**Baseline note first.** This slice is the only one in the §37-§44 run whose
+witness is **not** `constraints.sql`. The `constraints` regress diff enters and
+exits at **176 lines / 8 hunks, unchanged and expected to be unchanged** —
+`constraints.sql`'s five `VALIDATE CONSTRAINT` sites (`:864, :866, :904, :934,
+:947`) all target NOT NULL constraints, which §42 already closed. The witness
+here is `alter_table.sql:397-428`. Do not read the flat 176/8 as a null result.
+
+### What was wrong
+
+§42 (M0134-0005ak) made NOT NULL validation cascade to every
+inheritance/partition descendant and, in its own deferral row, recorded that
+`ALTER TABLE … VALIDATE CONSTRAINT <check>` had "the IDENTICAL gap and is
+untouched". That row was right about the gap and **wrong about its size**: it
+predicted a materially larger change on the grounds that CHECK validation
+"implies re-scanning each descendant's rows". It does not — not in goopg, not
+any more. M0134-0005ac had already made `forEachLiveRow`
+(`internal/executor/operators_ddl.go:12850`) walk `allDescendants` recursively,
+and `validateCheckConstraintRows` (`:12954`) is one of its callers. The row-scan
+half of this feature had been quietly correct for two slices. Only the catalog
+flag cascade was missing, making this the *smaller* of the two twins, not the
+larger.
+
+Investigating that led to the more interesting defect. PG's
+`QueueCheckConstraintValidation` (`postgres/src/backend/commands/tablecmds.c:13109-13210`)
+makes exactly **one** decision about the inheritance tree, at `:13140`:
+
+```c
+if (!recursing && !con->connoinherit)
+    children = find_all_inheritors(RelationGetRelid(rel), lockmode, NULL);
+```
+
+`connoinherit` gates the descendant walk — and because PG queues its Phase-3
+row scan **per relation** off that same list, `connoinherit` gates the row scan
+too. One flag, both halves. goopg had the flag (`catalog.NamedCheckConstraint.NoInherit`,
+`internal/catalog/catalog.go:221`) and consulted it nowhere on this path, so it
+got both halves wrong in opposite directions: it *never* cascaded (bug 1) and it
+*always* descended when scanning (bug 2). Bug 2 is the live one —
+`alter_table.sql:412-425` exists specifically to pin it:
+
+```sql
+create table parent_noinh_convalid (a int);
+create table child_noinh_convalid () inherits (parent_noinh_convalid);
+insert into parent_noinh_convalid values (1);
+insert into child_noinh_convalid values (1);
+alter table parent_noinh_convalid add constraint check_a_is_2 check (a = 2) no inherit not valid;
+alter table parent_noinh_convalid validate constraint check_a_is_2;  -- fails: parent row
+delete from only parent_noinh_convalid;
+alter table parent_noinh_convalid validate constraint check_a_is_2;  -- ok, despite the child row
+```
+
+goopg failed the second `validate` on the child's `a=1`, which by the
+constraint's own `NO INHERIT` declaration it has no business reading.
+
+### The fix
+
+Three edits, `internal/executor/operators_ddl.go` (+92/−5).
+
+1. `validateCheckConstraintRows` (`:12954`) takes a trailing `noInherit bool`
+   and, when set, scans only the named relation via `forEachLiveRowRel(tbl, tbl, …)`
+   instead of `forEachLiveRow(tbl, …)`.
+2. **Both** of its callers pass it — the Rule-#2 twin pair, and the reason bug 2
+   is fixed for `ADD CHECK … NO INHERIT` as well as `VALIDATE CONSTRAINT`:
+   the VALIDATE CHECK sub-branch (`:8619`, passing `tbl.NamedChecks[i].NoInherit`)
+   and `case parser.AlterTableAddCheck:` (`:8735`, passing `act.NoInherit`).
+3. New `cascadeCheckValidateToDescendants` (`:12352`), a near-verbatim copy of
+   §42's `cascadeNotNullValidateToDescendants` (`:12306`) matching by constraint
+   **name** — `cascadeCheckDropToChildren`'s (`:12191`) lookup key — rather than
+   by column name, called from the VALIDATE branch under `!NoInherit`.
+
+**The one divergence, inherited from §42 and still load-bearing.** PG's CHECK
+path has *no* already-convalidated skip — no analog of
+`QueueNNConstraintValidation`'s `:13277-13278` — so on paper goopg could recurse
+unconditionally with a clear conscience. It does, but for a *different* reason
+than PG's absence of the check: goopg has no one-shot `find_all_inheritors`
+(only single-level `InheritanceChildren`/`PartitionChildren`,
+`internal/catalog/catalog.go:4489`, `:4510`), so its descent is level-at-a-time
+and any prune on an intermediate node would hide that node's grandchildren. The
+`NotValid` guard therefore wraps the *flip only*, never the recursive call. A
+descendant carrying no matching-named CHECK is a silent skip; PG's 42704 there
+is reached only through an internal invariant violation and reproducing it would
+invent a failure mode goopg's catalog can legitimately, benignly reach.
+
+Guards: `internal/executor/operators_ddl_check_validate_cascade_test.go`, 10
+subtests, FAIL-pre proven by stashing *only* the source file (the tests drive
+everything through SQL, so they compile against the pre-fix tree) — 3-level
+plain inheritance, partitioned tree, NO INHERIT suppresses the cascade,
+NO INHERIT confines the scan, inheritable scan still descends (a
+no-regression pin for M0134-0005ac, green pre and post), already-validated
+descendant no-drift with a still-invalid grandchild behind it, and the ADD CHECK
+twin.
+
+### Three things found while writing the tests, all deferred
+
+Each is separately ledgered 2026-08-19; none is folded in here.
+
+- **`DELETE FROM ONLY <t>` does not honour `ONLY`** and deletes descendant rows
+  too. Newly surfaced, no prior ledger row, and the widest-blast-radius of the
+  three — it is a DML correctness bug, not a DDL one. It is also why the NO
+  INHERIT scan test could not be a literal port of `alter_table.sql:412-425`
+  and was restructured into two independent fixtures.
+- **`catalog.AddCheckInherited` stamps `NotValid=false` unconditionally**
+  (`internal/catalog/catalog.go:305`), so a CHECK propagated from a parent whose
+  own copy is `NOT VALID` arrives on the child pre-validated. Three call sites.
+  This compounds with §45: the cascade this slice adds is what *would* have
+  fixed such a child, and it has nothing to fix because the child was born
+  wrongly valid. The M0134-0005z row already flagged the `NotEnforced` half of
+  the same helper's blindness; this is the `NotValid` half.
+- **`AlterTableAddCheck` propagates only to `PartitionChildren`**
+  (`:8749`), never `InheritanceChildren` — re-confirmation of the M0134-0005ac
+  row, now with a second independent sighting.
+
+Also still open and unrelated to `connoinherit`: PG's `ONLY`/recurse guard
+(`:13146-13150`, "constraint must be validated on child tables too") has no
+plumbing on `AlterTableValidateConstraint` at all, and PG's per-descendant skip
+of an already-convalidated descendant *during the row scan* (the
+`alter_table.sql:408-411` `boo()` NOTICE case) would require restructuring
+goopg's single whole-tree pass into per-relation passes.

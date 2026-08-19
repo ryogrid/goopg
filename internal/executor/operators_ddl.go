@@ -8616,10 +8616,26 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 						// the SAME 23514 scan as ADD CHECK (tablecmds.c:13116);
 						// on success convalidated 'f'→'t'. M0134-0002 C3 slice 1.
 						if tbl.NamedChecks[i].NotValid {
-							if err := o.validateCheckConstraintRows(tbl, act.ConstraintName, tbl.NamedChecks[i].Expr); err != nil {
+							if err := o.validateCheckConstraintRows(tbl, act.ConstraintName, tbl.NamedChecks[i].Expr, tbl.NamedChecks[i].NoInherit); err != nil {
 								return err
 							}
 							tbl.NamedChecks[i].NotValid = false
+							// Cascade the NOT VALID→VALID flip to every
+							// already-existing descendant's own matching-named
+							// CHECK entry, mirroring
+							// QueueCheckConstraintValidation's find_all_inheritors
+							// walk (tablecmds.c:13109-13210). Gated on
+							// !NoInherit — a NO INHERIT constraint is never
+							// looked for in children at all (:13140).
+							// M0134-0005an.
+							if !tbl.NamedChecks[i].NoInherit {
+								if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+									visited := make(map[[2]uint32]bool)
+									if err := o.cascadeCheckValidateToDescendants(im, tbl, tbl.NamedChecks[i].Name, visited, 0); err != nil {
+										return err
+									}
+								}
+							}
 						}
 						found = true
 						break
@@ -8719,7 +8735,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					if conName == "" {
 						conName = o.autoCheckName(tbl, act.CheckExpr)
 					}
-					if err := o.validateCheckConstraintRows(tbl, conName, act.CheckExpr); err != nil {
+					if err := o.validateCheckConstraintRows(tbl, conName, act.CheckExpr, act.NoInherit); err != nil {
 						return err
 					}
 				}
@@ -12333,6 +12349,64 @@ func (o *ddlOp) cascadeNotNullValidateToDescendants(im *catalog.InMemory, tbl *c
 	return nil
 }
 
+// cascadeCheckValidateToDescendants is the CHECK-direction twin of
+// cascadeNotNullValidateToDescendants immediately above: it propagates a
+// CHECK constraint's NOT VALID→VALID flip to every already-existing
+// inheritance/partition descendant's own matching-named NamedChecks entry,
+// mirroring QueueCheckConstraintValidation's recursive
+// ATExecValidateConstraint self-call per descendant
+// (tablecmds.c:13109-13210). Unlike the NOT NULL twin (which matches by
+// column name, since attnotnull is a pg_attribute flag), CHECK constraints
+// are matched by constraint NAME — the same lookup key
+// cascadeCheckDropToChildren uses for its DROP-direction walk. PG's CHECK
+// path has NO already-convalidated skip analogous to the NOT NULL version's
+// :13277-13278 (confirmed absent in QueueCheckConstraintValidation), so the
+// NotValid flip below gates only the flip itself, never the recursive
+// descent — an already-valid intermediate descendant must not hide an
+// unvalidated grandchild behind it (M0134-0005ak's load-bearing
+// divergence). A descendant with no matching-named CHECK constraint at all
+// is a silent skip, not an error: PG's own recursive
+// ATExecValidateConstraint 42704 there is effectively an internal
+// invariant (every inheritor is supposed to carry a matching row), not a
+// user-facing refusal goopg needs to reproduce — same rationale the NOT
+// NULL twin's doc comment gives for its own analogous case. Uses the same
+// edge-keyed visited guard + depth backstop as
+// cascadeNotNullValidateToDescendants (diamond-inheritance correctness,
+// M0134-0005p sub-slice B). Caller gates this call on !NoInherit — PG never
+// even looks for NO INHERIT constraints in children
+// (QueueCheckConstraintValidation's `!con->connoinherit` gate,
+// tablecmds.c:13140), so this helper assumes the caller has already made
+// that check and does not re-check NoInherit on tbl itself. M0134-0005an.
+func (o *ddlOp) cascadeCheckValidateToDescendants(im *catalog.InMemory, tbl *catalog.Table, constraintName string, visited map[[2]uint32]bool, depth int) error {
+	if depth >= maxNotNullCascadeDepth {
+		return nil
+	}
+	for _, child := range collectInheritanceAndPartitionChildren(im, tbl) {
+		edge := [2]uint32{child.OID, tbl.OID}
+		if visited[edge] {
+			continue
+		}
+		visited[edge] = true
+
+		for i := range child.NamedChecks {
+			if strings.EqualFold(child.NamedChecks[i].Name, constraintName) {
+				if child.NamedChecks[i].NotValid {
+					child.NamedChecks[i].NotValid = false
+					if err := o.syncConstraintCatalogRow(child); err != nil {
+						return err
+					}
+				}
+				break
+			}
+		}
+
+		if err := o.cascadeCheckValidateToDescendants(im, child, constraintName, visited, depth+1); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // execAlterTableDropConstraint handles `ALTER TABLE t DROP CONSTRAINT name [RESTRICT|CASCADE]`.
 // Checked in the order CHECK / FOREIGN KEY / UNIQUE / PRIMARY KEY, mirroring
 // real PG's name-based pg_constraint lookup (the constraint kind only matters
@@ -12951,7 +13025,16 @@ func (o *ddlOp) forEachLiveRowRel(targetTbl, leafTbl *catalog.Table, fn func(row
 // carries Pos 0. Used by ADD CHECK and VALIDATE CHECK (CHECK), M0134-0002 C3
 // slice 1. conName is used verbatim; for an anonymous ADD CHECK callers pass
 // the auto-generated name so the message matches PG's.
-func (o *ddlOp) validateCheckConstraintRows(tbl *catalog.Table, conName, exprSQL string) error {
+//
+// noInherit mirrors QueueCheckConstraintValidation's `!con->connoinherit`
+// gate (tablecmds.c:13140): PG only queues the whole-tree Phase-3 scan for an
+// inheritable CHECK; a NO INHERIT constraint's row scan (whether via ADD
+// CHECK or VALIDATE CONSTRAINT) is confined to the named relation because
+// PG's Phase-3 scan is queued per relation and NO INHERIT never enters
+// find_all_inheritors in the first place. When true, this scans only tbl's
+// own storage (forEachLiveRowRel) instead of the whole inheritance/partition
+// tree (forEachLiveRow). M0134-0005an.
+func (o *ddlOp) validateCheckConstraintRows(tbl *catalog.Table, conName, exprSQL string, noInherit bool) error {
 	if exprSQL == "" {
 		return nil
 	}
@@ -12992,7 +13075,7 @@ func (o *ddlOp) validateCheckConstraintRows(tbl *catalog.Table, conName, exprSQL
 		}
 		return err
 	}
-	return o.forEachLiveRow(tbl, func(row Row, relName string) error {
+	scanFn := func(row Row, relName string) error {
 		pv, pErr := evalExpr(planned, row, o.ctx)
 		if pErr != nil {
 			return pErr
@@ -13007,7 +13090,11 @@ func (o *ddlOp) validateCheckConstraintRows(tbl *catalog.Table, conName, exprSQL
 		}
 		return &ExecError{Code: "23514", Pos: 0,
 			Message: fmt.Sprintf("check constraint %q of relation %q is violated by some row", conName, relName)}
-	})
+	}
+	if noInherit {
+		return o.forEachLiveRowRel(tbl, tbl, scanFn)
+	}
+	return o.forEachLiveRow(tbl, scanFn)
 }
 
 // validateFKConstraintExistingRows scans every live row of fkOwnerTbl and, for
