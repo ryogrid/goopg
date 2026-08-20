@@ -2437,7 +2437,7 @@ func (p *parser) parseAnyTail(left Expr, pos int) (Expr, error) {
 		return &InExpr{pos: pos, Operand: left, Negated: false, Subquery: sel}, nil
 	}
 	// `expr op ANY|ALL (SELECT ...)` — subquery form, mirroring parseInTail.
-	if p.cur().Kind == TokenKeyword && (p.cur().Keyword == KwSelect || p.cur().Keyword == KwValues) {
+	if p.cur().Kind == TokenKeyword && (p.cur().Keyword == KwSelect || p.cur().Keyword == KwValues || p.cur().Keyword == KwWith) {
 		old, oldNoPos := p.selectIntoErrMsg, p.selectIntoNoPos
 		p.selectIntoErrMsg = "SELECT ... INTO is not allowed here"
 		p.selectIntoNoPos = false
@@ -2948,7 +2948,7 @@ func (p *parser) parsePrimary() (Expr, error) {
 			// nested-paren forms like `((SELECT …) UNION SELECT …)`.
 			// Look ahead through leading `(` tokens to find SELECT/VALUES.
 			isSubqStart := false
-			if p.cur().Kind == TokenKeyword && (p.cur().Keyword == KwSelect || p.cur().Keyword == KwValues) {
+			if p.cur().Kind == TokenKeyword && (p.cur().Keyword == KwSelect || p.cur().Keyword == KwValues || p.cur().Keyword == KwWith) {
 				isSubqStart = true
 			} else if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
 				for i := 0; ; i++ {
@@ -2956,7 +2956,7 @@ func (p *parser) parsePrimary() (Expr, error) {
 					if tok.Kind == TokenSymbol && tok.Value == "(" {
 						continue
 					}
-					if tok.Kind == TokenKeyword && (tok.Keyword == KwSelect || tok.Keyword == KwValues) {
+					if tok.Kind == TokenKeyword && (tok.Keyword == KwSelect || tok.Keyword == KwValues || tok.Keyword == KwWith) {
 						isSubqStart = true
 					}
 					break
@@ -3804,7 +3804,7 @@ func (p *parser) parseInTail(left Expr, pos int, negated bool) (Expr, error) {
 		}
 		return &InExpr{pos: pos, Operand: left, Negated: negated, Subquery: sel}, nil
 	}
-	if p.cur().Kind == TokenKeyword && (p.cur().Keyword == KwSelect || p.cur().Keyword == KwValues) {
+	if p.cur().Kind == TokenKeyword && (p.cur().Keyword == KwSelect || p.cur().Keyword == KwValues || p.cur().Keyword == KwWith) {
 		// SELECT/VALUES … inside IN (...). M0097-0020.
 		old, oldNoPos := p.selectIntoErrMsg, p.selectIntoNoPos
 		p.selectIntoErrMsg = "SELECT ... INTO is not allowed here"

@@ -11934,6 +11934,36 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			return Datum{Kind: KindInt, Int: 0}, nil
 		}
+	case "trim_scale", "min_scale":
+		// trim_scale(numeric) reduces the value's display scale to the
+		// minimum needed to represent it exactly (drop trailing zero
+		// decimal digits); min_scale(numeric) reports that minimum scale
+		// as an int without altering the value. Mirrors PG's
+		// numeric_trim_scale / numeric_min_scale, both built on
+		// get_min_scale (postgres/src/backend/utils/adt/numeric.c:4323,
+		// :4253): peel trailing zero digits off the mantissa one decimal
+		// place at a time while scale > 0.
+		if len(x.Args) == 1 {
+			v, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || v.IsNull() {
+				return NullDatum, nil
+			}
+			m := numericMant(v)
+			scale := int(v.Scale)
+			ten := big.NewInt(10)
+			for scale > 0 {
+				q, r := new(big.Int).QuoRem(m, ten, new(big.Int))
+				if r.Sign() != 0 {
+					break
+				}
+				m = q
+				scale--
+			}
+			if name == "min_scale" {
+				return Datum{Kind: KindInt, Int: int64(scale)}, nil
+			}
+			return newNumeric(m, scale), nil
+		}
 	case "sqrt":
 		if len(x.Args) == 1 {
 			v, err := evalExpr(x.Args[0], row, ctx)

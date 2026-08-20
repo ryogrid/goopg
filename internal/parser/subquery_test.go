@@ -79,3 +79,29 @@ func TestParseSubqueryExpr(t *testing.T) {
 		t.Errorf("Inner is nil")
 	}
 }
+
+// TestParseSubqueryExprWithClause covers a WITH-prefixed scalar subquery
+// inside parens (M0134-0058, bucket A): `( WITH cte AS (...) SELECT ... )`
+// used by the ks_test_* plpgsql functions in random.sql. PG's
+// select_with_parens grammar production (postgres/src/backend/parser/gram.y)
+// accepts a leading WITH uniformly with SELECT/VALUES.
+func TestParseSubqueryExprWithClause(t *testing.T) {
+	stmts, err := Parse("SELECT ( WITH x AS (SELECT 1 AS v) SELECT v FROM x )")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sel := stmts[0].(*SelectStmt)
+	if len(sel.Targets) != 1 {
+		t.Fatalf("Targets len=%d want 1", len(sel.Targets))
+	}
+	sq, ok := sel.Targets[0].Expr.(*SubqueryExpr)
+	if !ok {
+		t.Fatalf("target=%T want *SubqueryExpr", sel.Targets[0].Expr)
+	}
+	if sq.Inner == nil {
+		t.Errorf("Inner is nil")
+	}
+	if sq.Inner.With == nil {
+		t.Errorf("Inner.With is nil, want the WITH clause to be attached")
+	}
+}
