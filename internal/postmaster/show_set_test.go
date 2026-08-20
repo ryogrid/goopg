@@ -178,6 +178,106 @@ func TestShowAllReturnsAllVariables(t *testing.T) {
 	}
 }
 
+// TestShowTimeZone / TestSetTimeZoneStringValue / TestSetTimeZoneDefault /
+// TestResetTimeZone pin M0134-0028a round 2: `SHOW`/`SET`/`RESET TIME ZONE`
+// is PG's dedicated two-word alias for the "timezone" GUC (gram.y:1709,
+// 1904, 1974). handleQuery's string-matching fast path used to have no
+// TIME ZONE case, so it fell through to the generic per-word handlers
+// (`splitSet` reads only up to the first whitespace as the GUC name) and
+// errored with `unrecognized configuration parameter "TIME"` (SET/SHOW) or
+// `"TIME ZONE"` (RESET, which takes the whole remainder verbatim) — the
+// same shape of gap the SESSION AUTHORIZATION/ROLE cases already had a
+// dedicated fix for. These drive handleQuery end-to-end via the wire
+// protocol, matching this file's existing style.
+func TestShowTimeZone(t *testing.T) {
+	addr, stop := startTestServer(t)
+	defer stop()
+	conn := dialAndComplete(t, addr)
+	defer conn.Close()
+
+	writeQuery(t, conn, "SHOW TIME ZONE")
+	frames := readUntilReady(t, conn)
+	if len(frames) < 2 || frames[0].Type != libpq.MsgRowDescription || frames[1].Type != libpq.MsgDataRow {
+		t.Fatalf("unexpected frames for SHOW TIME ZONE: %+v", frames)
+	}
+	dr := frames[1].Payload
+	colLen := int(dr[2])<<24 | int(dr[3])<<16 | int(dr[4])<<8 | int(dr[5])
+	value := string(dr[6 : 6+colLen])
+	if value != "UTC" {
+		t.Fatalf("SHOW TIME ZONE = %q, want %q (boot value)", value, "UTC")
+	}
+}
+
+func TestSetTimeZoneStringValue(t *testing.T) {
+	addr, stop := startTestServer(t)
+	defer stop()
+	conn := dialAndComplete(t, addr)
+	defer conn.Close()
+
+	writeQuery(t, conn, "SET TIME ZONE 'America/New_York'")
+	frames := readUntilReady(t, conn)
+	if len(frames) == 0 || frames[0].Type == libpq.MsgErrorResponse {
+		t.Fatalf("SET TIME ZONE 'America/New_York' failed, frames=%+v", frames)
+	}
+
+	writeQuery(t, conn, "SHOW TIME ZONE")
+	frames = readUntilReady(t, conn)
+	dr := frames[1].Payload
+	colLen := int(dr[2])<<24 | int(dr[3])<<16 | int(dr[4])<<8 | int(dr[5])
+	value := string(dr[6 : 6+colLen])
+	if value != "America/New_York" {
+		t.Fatalf("SHOW TIME ZONE after SET = %q, want %q", value, "America/New_York")
+	}
+}
+
+func TestSetTimeZoneDefault(t *testing.T) {
+	addr, stop := startTestServer(t)
+	defer stop()
+	conn := dialAndComplete(t, addr)
+	defer conn.Close()
+
+	writeQuery(t, conn, "SET TIME ZONE 'America/New_York'")
+	_ = readUntilReady(t, conn)
+	writeQuery(t, conn, "SET TIME ZONE DEFAULT")
+	frames := readUntilReady(t, conn)
+	if len(frames) == 0 || frames[0].Type == libpq.MsgErrorResponse {
+		t.Fatalf("SET TIME ZONE DEFAULT failed, frames=%+v", frames)
+	}
+
+	writeQuery(t, conn, "SHOW TIME ZONE")
+	frames = readUntilReady(t, conn)
+	dr := frames[1].Payload
+	colLen := int(dr[2])<<24 | int(dr[3])<<16 | int(dr[4])<<8 | int(dr[5])
+	value := string(dr[6 : 6+colLen])
+	if value != "UTC" {
+		t.Fatalf("SHOW TIME ZONE after SET TIME ZONE DEFAULT = %q, want %q (boot value)", value, "UTC")
+	}
+}
+
+func TestResetTimeZone(t *testing.T) {
+	addr, stop := startTestServer(t)
+	defer stop()
+	conn := dialAndComplete(t, addr)
+	defer conn.Close()
+
+	writeQuery(t, conn, "SET TIME ZONE 'America/New_York'")
+	_ = readUntilReady(t, conn)
+	writeQuery(t, conn, "RESET TIME ZONE")
+	frames := readUntilReady(t, conn)
+	if len(frames) == 0 || frames[0].Type == libpq.MsgErrorResponse {
+		t.Fatalf("RESET TIME ZONE failed, frames=%+v", frames)
+	}
+
+	writeQuery(t, conn, "SHOW TIME ZONE")
+	frames = readUntilReady(t, conn)
+	dr := frames[1].Payload
+	colLen := int(dr[2])<<24 | int(dr[3])<<16 | int(dr[4])<<8 | int(dr[5])
+	value := string(dr[6 : 6+colLen])
+	if value != "UTC" {
+		t.Fatalf("SHOW TIME ZONE after RESET TIME ZONE = %q, want %q (boot value)", value, "UTC")
+	}
+}
+
 func bytesContains(haystack, needle []byte) bool {
 	if len(needle) == 0 {
 		return true
