@@ -6176,6 +6176,22 @@ func toCharScientific(val Datum, mantissaFmt string, lowercase bool, fm bool) st
 		}
 	}
 
+	// Special values (Infinity/-Infinity/NaN): PostgreSQL never errors for these
+	// in EEEE format; it emits a fixed "#" pattern with no sign marker, regardless
+	// of Inf's sign or NaN. postgres/src/backend/utils/adt/formatting.c, the
+	// isnan(value) || isinf(value) branch inside float4_to_char/float8_to_char
+	// (numeric_to_char follows the identical NUMERIC_IS_SPECIAL pattern):
+	// one sign-slot space (stripped by FM), Num.pre '#'s (always 1 for a valid
+	// EEEE format), '.', then Num.post+4 '#'s.
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		const pre = 1
+		special := strings.Repeat("#", pre) + "." + strings.Repeat("#", decPlaces+4)
+		if !fm {
+			special = " " + special
+		}
+		return special
+	}
+
 	// Format using Go's scientific notation, then reformat the exponent to ±NN.
 	raw := fmt.Sprintf("%.*e", decPlaces, f)
 	// raw is like "1.23e+03" or "1.23e+003" (platform-dependent).
