@@ -7400,7 +7400,11 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	// two-level tree where two ancestor indexes both reach the same leaf yields
 	// `_id_idx` and `_id_idx1` — the names the partition-drop-index-locking
 	// isolation spec observes. M0118-0008.
-	if tbl.PartitionMethod != "" {
+	// `ON ONLY` (s.OnOnly) opts out of this fan-out: PG's DefineIndex gates the
+	// recursion on stmt->relation->inh, which is false when ONLY was specified
+	// (postgres/src/backend/commands/indexcmds.c:1230,1303). The user is left
+	// to attach child indexes explicitly via ATTACH PARTITION.
+	if tbl.PartitionMethod != "" && !s.OnOnly {
 		if parentIdx, ok := o.ctx.Catalog.LookupIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok {
 			if err := o.createPartitionChildIndexes(s, tbl, parentIdx, resolvedPred); err != nil {
 				return err

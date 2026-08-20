@@ -137,7 +137,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-sql,regress,postgres/src/test/regress/sql/oidjoins.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/opr_sanity.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/partition_aggregate.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/partition_info.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+,regress-sql,regress,postgres/src/test/regress/sql/partition_info.sql,pass,yes,-,M0134-0051: fixed CREATE INDEX ON ONLY to skip partition-child fan-out; 0-line diff 1/1 PASS
 ,regress-sql,regress,postgres/src/test/regress/sql/partition_join.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/partition_prune.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/password.sql,not-tried,no,-,
