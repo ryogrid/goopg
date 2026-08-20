@@ -496,6 +496,10 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 				break // first matching clause wins
 			}
 			row := make(Row, n)
+			insertMissing := make([]bool, n)
+			for i := range insertMissing {
+				insertMissing[i] = true
+			}
 			if clause.InsertExprs != nil {
 				for i, expr := range clause.InsertExprs {
 					if i >= len(clause.InsertColIdx) {
@@ -506,8 +510,20 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 						continue
 					}
 					row[clause.InsertColIdx[i]] = val
+					insertMissing[clause.InsertColIdx[i]] = false
 				}
 			}
+			// Parity with the plain-insert and upsert paths
+			// (operators_storage.go, operators_upsert.go:198-214): fill DEFAULT
+			// expressions and auto-generate SERIAL/IDENTITY values for target
+			// columns the MERGE INSERT column list did not provide, BEFORE
+			// generated-column computation and partition routing — PG's MERGE
+			// NOT MATCHED insert funnels through the same ExecInsert
+			// default-substitution machinery as plain INSERT (no separate
+			// default-skipping code path; see
+			// postgres/src/backend/executor/nodeModifyTable.c ExecMergeMatched).
+			applyDefaultsForMissing(tbl.Columns, row, insertMissing, ctxSeqDBOid(o.ctx))
+			autoGenerateSerialValues(o.ctx, tbl.Name, tbl.Columns, row, insertMissing)
 			_ = computeGeneratedColumns(tbl.Columns, row)
 
 			// Partition routing: route the row to the correct leaf partition.
