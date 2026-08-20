@@ -3043,7 +3043,8 @@ func checkDefaultPartitionInsertConstraint(ctx *Context, leaf *catalog.Table, le
 			sib := routePartitionKeyToImmediateChild(parent, leafCols, leafRow, im, ctx)
 			if sib != nil && sib.OID != cur.OID {
 				return &ExecError{Code: "23514", Pos: pos,
-					Message: fmt.Sprintf("new row for relation %q violates partition constraint", cur.Name)}
+					Message: fmt.Sprintf("new row for relation %q violates partition constraint", cur.Name),
+					Detail:  formatRowForDetail(leafCols, leafRow)}
 			}
 		}
 		cur = parent

@@ -769,10 +769,12 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 						schema := plan.Output()
 						if len(schema) > 0 {
 							resultTypes := make([]string, len(schema))
+							resultNames := make([]string, len(schema))
 							for k, col := range schema {
 								resultTypes[k] = normResultType(col.Type.Name)
+								resultNames[k] = col.Name
 							}
-							prepStmts.SetResultTypes(ps.Name, resultTypes)
+							prepStmts.SetResultSchema(ps.Name, resultNames, resultTypes)
 						}
 					}
 					// Infer parameter types from comparison contexts.
@@ -793,6 +795,37 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 				if prepDef, found := prepStmts.Lookup(es.Name); found {
 					if prepDef.stmt == nil {
 						return s.writeQueryError(w, errcodes.SystemError, fmt.Sprintf("prepared statement %q has no body", es.Name))
+					}
+					// Detect a cached-plan result-type change before executing
+					// (M0134-0054 bucket 5), mirroring PostgreSQL's
+					// RevalidateCachedQuery (plancache.c:858): it compares
+					// PlanCacheComputeResultDesc(tlist) against
+					// plansource->resultDesc via equalRowTypes whenever
+					// plansource->fixed_result is set (i.e. the statement is
+					// row-returning). goopg has no cached physical plan, so we
+					// re-derive the current result descriptor by re-planning
+					// against the live catalog and compare it against the
+					// descriptor captured at PREPARE time. Only applies when
+					// PREPARE captured a non-empty result descriptor — a
+					// non-data-returning statement (INSERT/UPDATE/DELETE
+					// without RETURNING, DDL, …) has none, mirroring PG's
+					// fixed_result gate.
+					if len(prepDef.resultTypes) > 0 && ectx.Catalog != nil {
+						if plan, planErr := optimizer.Plan(prepDef.stmt, sessionPlanCatalog(sess, ectx.Catalog, ectx.CurrentDatabaseOid)); planErr == nil {
+							schema := plan.Output()
+							changed := len(schema) != len(prepDef.resultTypes)
+							if !changed {
+								for k, col := range schema {
+									if col.Name != prepDef.resultNames[k] || normResultType(col.Type.Name) != prepDef.resultTypes[k] {
+										changed = true
+										break
+									}
+								}
+							}
+							if changed {
+								return s.writeQueryError(w, "0A000", "cached plan must not change result type")
+							}
+						}
 					}
 					// Validate parameter count when the PREPARE declared a type list.
 					if prepDef.paramTypes != nil && len(es.Params) != len(prepDef.paramTypes) {
