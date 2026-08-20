@@ -3727,6 +3727,14 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 			return nil, err
 		}
 		stmt.With = opts
+		if v, ok := opts["oids"]; ok {
+			stmt.WithOIDS = !strings.EqualFold(v, "false") && v != "0"
+		}
+	} else if p.acceptIdentKeyword("without") {
+		// WITHOUT OIDS — legacy backward-compat clause, accepted and silently
+		// ignored (OIDs were removed in PG12). postgres/src/backend/parser/gram.y
+		// OptWith: "WITHOUT OIDS { $$ = NIL; }".
+		_ = p.acceptIdentKeyword("oids")
 	}
 	if p.acceptKeyword(KwTablespace) {
 		// M0122-0007: capture the name; the executor resolves it against the

@@ -2467,6 +2467,22 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (optimizer.Expr, error
 			sub = &optimizer.BinaryOp{Op: parser.OpAdd, Left: sub, Right: &optimizer.IntegerConst{Value: 1}}
 		}
 		return &optimizer.FuncCall{Name: "array_subscript", Args: []optimizer.Expr{arr, sub}}, nil
+	case *parser.RowExpr:
+		// ROW(...) constructor (e.g. `RETURN row(10,'aaa',NULL,30)`). Lower
+		// each field expression and reuse optimizer.RowExpr — the same node
+		// the SQL planner produces for row constructors (planner.go's
+		// resolveExpr case *parser.RowExpr) — so evaluation goes through the
+		// existing evalRowExpr composite-text builder (expr.go) shared by
+		// both callers. M0134-0055 bucket B.
+		elems := make([]optimizer.Expr, len(x.Elems))
+		for i, el := range x.Elems {
+			le, err := lowerPLpgSQLExpr(el, frame)
+			if err != nil {
+				return nil, err
+			}
+			elems[i] = le
+		}
+		return &optimizer.RowExpr{Elems: elems}, nil
 	default:
 		return nil, &ExecError{Code: "0A000", Pos: e.Pos(), Message: fmt.Sprintf("unsupported PL/pgSQL expression %T", e)}
 	}
