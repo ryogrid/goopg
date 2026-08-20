@@ -3,6 +3,7 @@ package executor
 import (
 	"testing"
 
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -101,5 +102,62 @@ func TestJSONArrowChained(t *testing.T) {
 	}
 	if step3.IsNull() || step3.StringValue() != "2" {
 		t.Fatalf("got %+v, want 2", step3)
+	}
+}
+
+// TestJsonExtractPath pins json_extract_path/json_extract_path_text/
+// jsonb_extract_path/jsonb_extract_path_text — the VARIADIC text[] path-array
+// siblings of -> / ->> (M0134-0037). Oracle:
+// postgres/src/backend/utils/adt/jsonfuncs.c get_path_all/get_jsonb_path_all.
+func TestJsonExtractPath(t *testing.T) {
+	sconst := func(s string) optimizer.Expr { return &optimizer.StringConst{Value: s} }
+	doc := `{"f2":{"f3":1},"f4":{"f5":99,"f6":"stringy"}}`
+
+	cases := []struct {
+		name     string
+		fn       string
+		src      string
+		path     []string
+		want     string
+		wantNull bool
+	}{
+		{"json-nested-scalar-as-json", "json_extract_path", doc, []string{"f4", "f6"}, `"stringy"`, false},
+		{"json-nested-scalar-as-text", "json_extract_path_text", doc, []string{"f4", "f6"}, "stringy", false},
+		{"jsonb-nested-scalar-as-json", "jsonb_extract_path", doc, []string{"f4", "f6"}, `"stringy"`, false},
+		{"jsonb-nested-scalar-as-text", "jsonb_extract_path_text", doc, []string{"f4", "f6"}, "stringy", false},
+		{"json-numeric-path-indexes-array", "json_extract_path", `{"a":[1,2,3]}`, []string{"a", "1"}, "2", false},
+		{"jsonb-numeric-path-indexes-array", "jsonb_extract_path", `{"a":[1,2,3]}`, []string{"a", "1"}, "2", false},
+		{"json-missing-key-is-null", "json_extract_path", `{"a":1}`, []string{"b"}, "", true},
+		{"jsonb-missing-key-is-null", "jsonb_extract_path", `{"a":1}`, []string{"b"}, "", true},
+		{"json-oob-array-index-is-null", "json_extract_path", `{"a":[1,2,3]}`, []string{"a", "5"}, "", true},
+		{"json-non-numeric-index-against-array-is-null", "json_extract_path", `{"a":[1,2,3]}`, []string{"a", "x"}, "", true},
+		{"json-nested-object-as-json-not-unwrapped", "json_extract_path", doc, []string{"f4"}, `{"f5":99,"f6":"stringy"}`, false},
+		{"json-nested-object-as-text-not-unwrapped", "json_extract_path_text", doc, []string{"f4"}, `{"f5":99,"f6":"stringy"}`, false},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			args := []optimizer.Expr{sconst(c.src)}
+			for _, p := range c.path {
+				args = append(args, sconst(p))
+			}
+			fc := &optimizer.FuncCall{Name: c.fn, Args: args}
+			got, err := evalFuncCall(fc, nil, &Context{})
+			if err != nil {
+				t.Fatalf("evalFuncCall: %v", err)
+			}
+			if c.wantNull {
+				if !got.IsNull() {
+					t.Fatalf("got %+v, want NULL", got)
+				}
+				return
+			}
+			if got.IsNull() {
+				t.Fatalf("got NULL, want %q", c.want)
+			}
+			if got.StringValue() != c.want {
+				t.Fatalf("got %q, want %q", got.StringValue(), c.want)
+			}
+		})
 	}
 }

@@ -1933,34 +1933,83 @@ func evalJSONArrow(op parser.OpCode, left, right Datum, pos int) (Datum, error) 
 
 	if op == parser.OpJSONGetText {
 		// ->> : a JSON null element is SQL NULL; scalars become their bare
-		// text; objects/arrays become their compact JSON text.
-		if elem == nil {
-			return NullDatum, nil
-		}
-		switch x := elem.(type) {
-		case string:
-			return NewStringDatum(x), nil
-		case json.Number:
-			return NewStringDatum(x.String()), nil
-		case bool:
-			if x {
-				return NewStringDatum("true"), nil
-			}
-			return NewStringDatum("false"), nil
-		default:
-			b, err := json.Marshal(x)
-			if err != nil {
-				return NullDatum, nil
-			}
-			return NewStringDatum(string(b)), nil
-		}
+		// text; objects/arrays become their compact JSON text. Shared with
+		// json_extract_path_text/jsonb_extract_path_text (M0134-0037).
+		return jsonElemAsTextDatum(elem), nil
 	}
-	// -> : return the element re-encoded as JSON (a JSON null → the text "null").
+	// -> : return the element re-encoded as JSON (a JSON null → the text
+	// "null"). Shared with json_extract_path/jsonb_extract_path.
+	return jsonElemAsJSONDatum(elem), nil
+}
+
+// jsonPathStep performs one step of a json{b}_extract_path[_text] path walk:
+// unlike -> / ->> (whose array-vs-object dispatch is fixed by the operator's
+// static right-operand type, evalJSONArrow above), get_path_all's per-element
+// dispatch is driven by the actual JSON structure encountered at each level
+// (postgres/src/backend/utils/adt/jsonfuncs.c get_array_start/get_object_field_start,
+// via a single text[] path threaded as both tpath/ipath). A numeric-string key
+// against an array indexes it (negative counts from the end); any key against
+// an object looks up that field; anything else — including a non-numeric key
+// against an array — is "not found" (SQL NULL), matching PG's INT_MIN sentinel
+// for a non-numeric path element that will never match an index.
+func jsonPathStep(doc any, key string) (any, bool) {
+	switch v := doc.(type) {
+	case []any:
+		idx, err := strconv.Atoi(key)
+		if err != nil {
+			return nil, false
+		}
+		if idx < 0 {
+			idx += len(v)
+		}
+		if idx < 0 || idx >= len(v) {
+			return nil, false
+		}
+		return v[idx], true
+	case map[string]any:
+		elem, found := v[key]
+		return elem, found
+	default:
+		return nil, false
+	}
+}
+
+// jsonElemAsJSONDatum re-encodes a decoded JSON element (any/json.Number/
+// map[string]any/[]any/bool/nil) as its compact JSON text form — the shared
+// tail of -> and json_extract_path/jsonb_extract_path.
+func jsonElemAsJSONDatum(elem any) Datum {
 	b, err := json.Marshal(elem)
 	if err != nil {
-		return NullDatum, nil
+		return NullDatum
 	}
-	return NewStringDatum(string(b)), nil
+	return NewStringDatum(string(b))
+}
+
+// jsonElemAsTextDatum unwraps a decoded JSON element to its ->> text form: a
+// JSON null is SQL NULL, scalars become their bare text, and objects/arrays
+// become their compact JSON text — the shared tail of ->> and
+// json_extract_path_text/jsonb_extract_path_text.
+func jsonElemAsTextDatum(elem any) Datum {
+	if elem == nil {
+		return NullDatum
+	}
+	switch x := elem.(type) {
+	case string:
+		return NewStringDatum(x)
+	case json.Number:
+		return NewStringDatum(x.String())
+	case bool:
+		if x {
+			return NewStringDatum("true")
+		}
+		return NewStringDatum("false")
+	default:
+		b, err := json.Marshal(x)
+		if err != nil {
+			return NullDatum
+		}
+		return NewStringDatum(string(b))
+	}
 }
 
 // datumAsString returns d's character payload as a Go string when
@@ -11643,6 +11692,83 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 				return Datum{}, ferr
 			}
 			return NewStringDatum(result), nil
+		}
+
+	case "json_extract_path", "json_extract_path_text", "jsonb_extract_path", "jsonb_extract_path_text":
+		// json{b}_extract_path[_text](from_json, VARIADIC path_elems text[]).
+		// Oracle: postgres/src/backend/utils/adt/jsonfuncs.c get_path_all /
+		// get_jsonb_path_all — both walk the shared per-step navigation
+		// jsonPathStep also used by evalJSONArrow (-> / ->>), just driven by a
+		// text[] path array instead of a single operator RHS. goopg carries
+		// json and jsonb identically as KindString text, so the json/jsonb
+		// pairs share one implementation (M0134-0037).
+		if len(x.Args) >= 1 {
+			asText := name == "json_extract_path_text" || name == "jsonb_extract_path_text"
+			jv, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			if jv.IsNull() {
+				return NullDatum, nil
+			}
+			ls, ok := datumAsString(jv)
+			if !ok {
+				return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(),
+					Message: fmt.Sprintf("function %s requires a json argument", x.Name)}
+			}
+
+			// Evaluate the path elements, expanding a VARIADIC text[] argument
+			// if present — mirrors the format()/concat() VARIADIC handling
+			// above. A NULL path element (or a NULL path array) yields NULL,
+			// matching get_path_all's array_contains_nulls check.
+			var path []string
+			pathArgs := x.Args[1:]
+			if x.Variadic && len(pathArgs) == 1 {
+				v, e := evalExpr(pathArgs[0], row, ctx)
+				if e != nil {
+					return Datum{}, e
+				}
+				if v.IsNull() {
+					return NullDatum, nil
+				}
+				sv := v.StringValue()
+				if len(sv) == 0 || sv[0] != '{' {
+					return Datum{}, &ExecError{Code: "42809",
+						Message: "VARIADIC argument must be an array", Pos: x.Pos()}
+				}
+				path = parseTextArray(sv)
+			} else {
+				for _, a := range pathArgs {
+					v, e := evalExpr(a, row, ctx)
+					if e != nil {
+						return Datum{}, e
+					}
+					if v.IsNull() {
+						return NullDatum, nil
+					}
+					path = append(path, v.StringValue())
+				}
+			}
+
+			dec := json.NewDecoder(strings.NewReader(ls))
+			dec.UseNumber()
+			var doc any
+			if err := dec.Decode(&doc); err != nil {
+				return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(),
+					Message: "invalid input syntax for type json"}
+			}
+
+			elem, found := doc, true
+			for _, key := range path {
+				elem, found = jsonPathStep(elem, key)
+				if !found {
+					return NullDatum, nil
+				}
+			}
+			if asText {
+				return jsonElemAsTextDatum(elem), nil
+			}
+			return jsonElemAsJSONDatum(elem), nil
 		}
 
 	// ── Mathematical functions (M0097-0005) ───────────────────────────────
