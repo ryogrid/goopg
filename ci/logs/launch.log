@@ -193,3 +193,8 @@
 2026-08-20T00:37:04+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
 2026-08-20T03:16:33+09:00 [RUN]	S1 barrier reached
 2026-08-20T03:54:10+09:00 [RUN]	end status_rc=3 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-08-20T03:55:53+09:00 [RUN]	log-push: committed + pushed batch logs to origin/regress-renumbering
+2026-08-21T00:29:06+09:00 [RUN]	start run_id=20260821-002906 sha=80476eec dirty=9 src_fp=21fe15cd7b751941 stages=preflight,units,race,testport,pgbench,tpch,tpcds,summary
+2026-08-21T00:29:16+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
+2026-08-21T01:08:12+09:00 [RUN]	S1 barrier reached
+2026-08-21T01:45:33+09:00 [RUN]	end status_rc=0 (0 pass / 2 fail / 3 inconclusive) — see summary.md
