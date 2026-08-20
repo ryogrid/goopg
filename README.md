@@ -141,8 +141,6 @@ goopg is an ongoing experiment; the current state in brief:
 - **Replication** — goopg can form a streaming-replication pair with vanilla
   PostgreSQL 18.3, and even keeps working when the two sides' data-cluster
   directories are swapped; a notable result for a from-scratch engine.
-- **Test parity** — roughly 70% of PostgreSQL's own test suite passes against
-  goopg.
 
 ---
 

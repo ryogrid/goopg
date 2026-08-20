@@ -1055,6 +1055,19 @@ func (p *parser) acceptIdentKeyword(names ...string) bool {
 	return false
 }
 
+// peekTimeZone reports whether the next two tokens are the idents "time"
+// then "zone" — PG's dedicated two-word alias for the "timezone" GUC in
+// SET/SHOW/RESET (postgres/src/backend/parser/gram.y:1709 set_rest, :1904
+// generic_reset, :1974 VariableShowStmt). TIME and ZONE are both plain
+// idents in goopg's lexer (no KwTime/KwZone), so this is a pure two-token
+// lookahead — peeking rather than consume-then-unwind so a false match
+// (e.g. a GUC literally named "time") never disturbs parser state.
+// Does not consume; callers must advance() twice on a true result.
+func (p *parser) peekTimeZone() bool {
+	return p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "time") &&
+		p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "zone")
+}
+
 // parseStatement dispatches on the leading keyword.
 func (p *parser) parseStatement() (Stmt, error) {
 	t := p.cur()
@@ -2269,6 +2282,12 @@ func (p *parser) parseShow() (Stmt, error) {
 	if p.acceptKeyword(KwAll) {
 		return &ShowStmt{pos: t.Pos, All: true}, nil
 	}
+	// SHOW TIME ZONE — M0134-0028a.
+	if p.peekTimeZone() {
+		p.advance() // consume "time"
+		p.advance() // consume "zone"
+		return &ShowStmt{pos: t.Pos, Name: "timezone"}, nil
+	}
 	name, err := p.parseGUCName()
 	if err != nil {
 		return nil, err
@@ -2391,6 +2410,29 @@ func (p *parser) parseSet() (Stmt, error) {
 			return nil, p.errAtCur("expected DEFERRED or IMMEDIATE after SET CONSTRAINTS")
 		}
 		return sc, nil
+	}
+	// SET TIME ZONE zone_value — PG's dedicated two-word alias for the
+	// "timezone" GUC (gram.y:1709 set_rest). Unlike the generic
+	// `SET name = value` path below, TIME ZONE has no '=' / TO separator
+	// before the value, so the DEFAULT/parseSetValue tail is duplicated
+	// here rather than falling through (LOCAL — PG's "reset to server
+	// default zone" spelling — already tokenizes as the KwLocal keyword,
+	// which parseSetValueAtoms accepts as a plain value atom; no extra
+	// handling needed). M0134-0028a.
+	if p.peekTimeZone() {
+		p.advance() // consume "time"
+		p.advance() // consume "zone"
+		s.Name = "timezone"
+		if p.acceptKeyword(KwDefault) {
+			s.Default = true
+			return s, nil
+		}
+		val, err := p.parseSetValue()
+		if err != nil {
+			return nil, err
+		}
+		s.Value = val
+		return s, nil
 	}
 	name, err := p.parseGUCName()
 	if err != nil {
@@ -2839,6 +2881,12 @@ func (p *parser) parseReset() (Stmt, error) {
 			return nil, p.errAtCur("expected AUTHORIZATION after RESET SESSION")
 		}
 		return &ResetStmt{pos: t.Pos, Name: "session_authorization"}, nil
+	}
+	// RESET TIME ZONE — M0134-0028a.
+	if p.peekTimeZone() {
+		p.advance() // consume "time"
+		p.advance() // consume "zone"
+		return &ResetStmt{pos: t.Pos, Name: "timezone"}, nil
 	}
 	name, err := p.parseGUCName()
 	if err != nil {

@@ -347,6 +347,82 @@ func TestParseShowSetReset(t *testing.T) {
 			t.Fatalf("not All")
 		}
 	})
+	// M0134-0028a: SET/SHOW/RESET TIME ZONE is PG's dedicated two-word
+	// alias for the "timezone" GUC (gram.y:1709,1904,1974), a separate
+	// grammar production rather than a generic SET name=value lookup.
+	t.Run("set time zone string", func(t *testing.T) {
+		stmts, err := Parse("SET TIME ZONE 'America/New_York'")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := stmts[0].(*SetStmt)
+		if s.Name != "timezone" || s.Value != "America/New_York" || s.Default {
+			t.Fatalf("unexpected: %+v", s)
+		}
+	})
+	t.Run("set time zone numeric", func(t *testing.T) {
+		stmts, err := Parse("SET TIME ZONE -7")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := stmts[0].(*SetStmt)
+		if s.Name != "timezone" || s.Value != "-7" {
+			t.Fatalf("unexpected: %+v", s)
+		}
+	})
+	t.Run("set time zone default", func(t *testing.T) {
+		stmts, err := Parse("SET TIME ZONE DEFAULT")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := stmts[0].(*SetStmt)
+		if s.Name != "timezone" || !s.Default {
+			t.Fatalf("unexpected: %+v", s)
+		}
+	})
+	t.Run("set time zone local", func(t *testing.T) {
+		stmts, err := Parse("SET TIME ZONE LOCAL")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := stmts[0].(*SetStmt)
+		if s.Name != "timezone" || s.Value != "local" || s.Default {
+			t.Fatalf("unexpected: %+v", s)
+		}
+	})
+	t.Run("show time zone", func(t *testing.T) {
+		stmts, err := Parse("SHOW TIME ZONE")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := stmts[0].(*ShowStmt)
+		if s.All || s.Name != "timezone" {
+			t.Fatalf("unexpected: %+v", s)
+		}
+	})
+	t.Run("reset time zone", func(t *testing.T) {
+		stmts, err := Parse("RESET TIME ZONE")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := stmts[0].(*ResetStmt)
+		if s.All || s.Name != "timezone" {
+			t.Fatalf("unexpected: %+v", s)
+		}
+	})
+	t.Run("set timezone generic spelling still works", func(t *testing.T) {
+		// Regression guard: the ordinary `SET name = value` spelling of the
+		// same GUC must keep parsing exactly as before the TIME ZONE
+		// intercept was added.
+		stmts, err := Parse("SET timezone = 'UTC'")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := stmts[0].(*SetStmt)
+		if s.Name != "timezone" || s.Value != "UTC" || s.Default {
+			t.Fatalf("unexpected: %+v", s)
+		}
+	})
 }
 
 // TestParseMultiStatement verifies semicolon-separated statements

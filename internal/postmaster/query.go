@@ -250,6 +250,15 @@ func (s *Server) handleQuery(ctx context.Context, r *libpq.FrameReader, w *libpq
 	switch {
 	case upper == "SHOW ALL":
 		return s.handleShowAll(w, sess)
+	// SHOW TIME ZONE — PG's dedicated two-word alias for the "timezone" GUC
+	// (gram.y:1974 VariableShowStmt). Must be checked before the generic
+	// "SHOW " case, which would otherwise mis-read "TIME" as the bare GUC
+	// name and fail with `unrecognized configuration parameter "TIME"`.
+	// M0134-0028a round 2 (mirrors the parser-level fix in
+	// internal/parser/parser.go's parseShow — this fast path never reaches
+	// the parser for a single-statement simple-query message).
+	case upper == "SHOW TIME ZONE":
+		return s.handleShow(w, sess, "timezone")
 	case strings.HasPrefix(upper, "SHOW "):
 		name := strings.TrimSpace(matchable[len("SHOW "):])
 		if strings.EqualFold(name, "ALL") {
@@ -291,6 +300,24 @@ func (s *Server) handleQuery(ctx context.Context, r *libpq.FrameReader, w *libpq
 			return err
 		}
 		return w.ReadyForQuery()
+	// SET [LOCAL] TIME ZONE <zone_value> — PG's dedicated two-word alias for
+	// the "timezone" GUC (gram.y:1709 set_rest). Must be checked before the
+	// generic "SET LOCAL "/"SET " cases below, which would otherwise
+	// mis-read "TIME" as the bare GUC name (splitSet stops at the first
+	// whitespace) and fail with `unrecognized configuration parameter
+	// "TIME"`. Rewrites "TIME ZONE <value>" to "timezone <value>" and hands
+	// it to the existing handleSet/splitSet path rather than duplicating
+	// its quote-stripping/TO/DEFAULT value parsing — splitSet already
+	// canonicalizes DEFAULT to a Reset via SessionRegistry.Set. M0134-0028a
+	// round 2 (mirrors the parser-level fix in internal/parser/parser.go's
+	// parseSet — this fast path never reaches the parser for a
+	// single-statement simple-query message).
+	case strings.HasPrefix(upper, "SET LOCAL TIME ZONE "), upper == "SET LOCAL TIME ZONE":
+		value := strings.TrimSpace(matchable[len("SET LOCAL TIME ZONE"):])
+		return s.handleSet(w, sess, "timezone "+value, true)
+	case strings.HasPrefix(upper, "SET TIME ZONE "), upper == "SET TIME ZONE":
+		value := strings.TrimSpace(matchable[len("SET TIME ZONE"):])
+		return s.handleSet(w, sess, "timezone "+value, false)
 	// SET LOCAL SESSION AUTHORIZATION name — must check before generic "SET LOCAL ".
 	case strings.HasPrefix(upper, "SET LOCAL SESSION AUTHORIZATION "),
 		upper == "SET LOCAL SESSION AUTHORIZATION":
@@ -383,6 +410,20 @@ func (s *Server) handleQuery(ctx context.Context, r *libpq.FrameReader, w *libpq
 		if connTx != nil {
 			applySetRole(connTx, "")
 			setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
+		}
+		if err := w.WriteCommandComplete("RESET"); err != nil {
+			return err
+		}
+		return w.ReadyForQuery()
+	// RESET TIME ZONE — PG's dedicated two-word alias for the "timezone" GUC
+	// (gram.y:1904 generic_reset). Must be checked before the generic
+	// "RESET " case, which would otherwise take the whole remainder "TIME
+	// ZONE" verbatim as the GUC name and fail with `unrecognized
+	// configuration parameter "TIME ZONE"`. M0134-0028a round 2 (mirrors
+	// the parser-level fix in internal/parser/parser.go's parseReset).
+	case upper == "RESET TIME ZONE":
+		if err := sess.Reset("timezone"); err != nil {
+			return s.writeQueryError(w, errcodes.UndefinedObject, err.Error())
 		}
 		if err := w.WriteCommandComplete("RESET"); err != nil {
 			return err
