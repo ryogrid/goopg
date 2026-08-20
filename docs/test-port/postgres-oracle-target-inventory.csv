@@ -163,7 +163,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-sql,regress,postgres/src/test/regress/sql/rangetypes.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/regex.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/regproc.sql,not-tried,no,-,
-,regress-sql,regress,postgres/src/test/regress/sql/reindex_catalog.sql,failed,no,-,"Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13) [baseline says fail; inventory had pass — possible regression, verify]"
+,regress-sql,regress,postgres/src/test/regress/sql/reindex_catalog.sql,pass,yes,-,"M0134-0062 (2026-08-21): registered pg_shdescription virtual table + 6 nailed system-index stubs (Table=nil, no-op REINDEX) in catalog.InMemory.registerSystemTables — 1/1 PASS 100% parity via pg-regress-runner"
 ,regress-sql,regress,postgres/src/test/regress/sql/reloptions.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/replica_identity.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/returning.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope

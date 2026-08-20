@@ -8347,6 +8347,62 @@ func (c *InMemory) registerSystemTables() {
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_database"] = pgDatabase
 
+	// pg_shdescription — stores COMMENT ON <shared object> descriptions (OID
+	// 3592, matches the placeholder heap file initdb bootstraps under
+	// global/3592 — bootstrapSharedCatalogPlaceholders,
+	// internal/initdb/initdb.go). goopg doesn't track shared-object comments
+	// yet (COMMENT ON DATABASE/ROLE/TABLESPACE is a no-op), so this is a
+	// permanently-empty stub — same rationale as pg_description above, but for
+	// the shared (cluster-wide, not per-database) comment catalog. Registered
+	// so `REINDEX TABLE pg_shdescription` and any plain `SELECT * FROM
+	// pg_shdescription` resolve instead of erroring "relation does not exist".
+	// M0134-0062 (reindex_catalog.sql regress parity).
+	pgShdescription := &Table{
+		Schema: "pg_catalog", Name: "pg_shdescription", Virtual: true,
+		Columns: []Column{
+			{Name: "objoid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "classoid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "description", Type: Type{Name: "text"}, Ordinal: 2},
+		},
+		OID: 3592,
+	}
+	pgShdescription.VirtualRows = func() [][]string { return nil }
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_shdescription"] = pgShdescription
+
+	// Nailed system index stubs — REINDEX INDEX <name> on a nailed catalog
+	// index (pg_class_oid_index etc.) needs LookupIndex to resolve the name;
+	// upstream PG's relcache always knows every nailed index, but goopg's
+	// ns.indexes map is otherwise populated only by user CREATE INDEX +
+	// heap-reload (never by the bootstrap-time nailed indexes). Table is left
+	// nil deliberately: rebuildIndex's existing `idx.Table == nil` guard
+	// (operators_reindex.go) then makes REINDEX INDEX on these a safe no-op —
+	// a real physical rebuild would require resolving the pg_class
+	// virtual/heap dual-representation problem, out of scope here. OIDs/names
+	// mirror internal/initdb/relcache_init.go's nailedSharedRels/
+	// nailedLocalRels tables (pg_shdescription_o_c_index isn't listed there —
+	// it takes its OID, 2397, from upstream's DECLARE_UNIQUE_INDEX_PKEY in
+	// postgres/src/include/catalog/pg_shdescription.h since goopg has no
+	// physical pg_shdescription heap/btree to nail). M0134-0062.
+	for _, stub := range []struct {
+		name string
+		oid  uint32
+	}{
+		{"pg_class_oid_index", 2662},
+		{"pg_class_relname_nsp_index", 2663},
+		{"pg_index_indexrelid_index", 2679},
+		{"pg_index_indrelid_index", 2678},
+		{"pg_database_oid_index", 2672},
+		{"pg_shdescription_o_c_index", 2397},
+	} {
+		c.ns(DefaultDBOid).indexes[stub.name] = &Index{
+			Schema: "pg_catalog",
+			Name:   stub.name,
+			Method: "btree",
+			OID:    stub.oid,
+			DBOid:  DefaultDBOid,
+		}
+	}
+
 	// pg_roles — HammerDB probes
 	// `SELECT 1 FROM pg_roles WHERE rolname = '<user>'` before
 	// CREATE USER. v0's auth layer doesn't expose role state
