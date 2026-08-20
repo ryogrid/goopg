@@ -94,6 +94,14 @@ func NewWorkerContext(leader *Context, workerMctx *mmgr.Context, workerCtx conte
 	w.SyncCommitMode = leader.SyncCommitMode
 	w.AsyncCommit = leader.AsyncCommit
 	w.NonSuperuserRole = leader.NonSuperuserRole
+	// SessionUser/SetRoleIsActive are NonSuperuserRole's M0134-0009
+	// siblings — PostgreSQL propagates session/current user identity to
+	// parallel workers deliberately (variable.c check_session_authorization's
+	// InitializingParallelWorker branch), so a worker evaluating
+	// current_user()/session_user() must see the same values as the leader,
+	// not the connection's login default. Round-2 review R4.
+	w.SessionUser = leader.SessionUser
+	w.SetRoleIsActive = leader.SetRoleIsActive
 	w.AnalyzeRandSeed = leader.AnalyzeRandSeed
 
 	// Parallel settings ride along so a worker can reason about its own

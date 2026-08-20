@@ -291,6 +291,35 @@ func TestDDLCreateTempTableShadowsPermanentTable(t *testing.T) {
 	}
 }
 
+// TestDDLFailedTempShadowCreateRestoresPermanentTable pins M0134-0018b: a
+// CREATE TEMP TABLE that shadows-and-drops a same-named permanent table but
+// then fails (self-shadowing CTAS — the SELECT can no longer resolve the
+// permanent source it just dropped) must not strand the permanent table.
+// Before the fix, execCreateTable dropped the permanent relation up front and
+// only restored it from the DROP TABLE path, which is unreachable once the
+// temp relation was never created — the permanent relation vanished from the
+// live catalog for the rest of the process. docs/design/m0134-0018-temp-shadow-drop-rollback.md.
+func TestDDLFailedTempShadowCreateRestoresPermanentTable(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE zz (i int)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO zz (i) VALUES (1), (2)"); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runDDL(t, ctx, "CREATE TEMP TABLE zz AS SELECT * FROM public.zz")
+	if err == nil {
+		t.Fatal("self-shadowing CTAS should error (source relation was shadow-dropped)")
+	}
+
+	if _, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: "zz"}); !ok {
+		t.Fatalf("permanent table zz was lost after the failing CREATE TEMP TABLE errored: %v", err)
+	}
+}
+
 func TestDDLInsertIntIntoVarcharPreservesDigits(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()

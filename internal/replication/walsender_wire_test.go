@@ -1,3 +1,11 @@
+// Wire-level walsender tests. They live in the EXTERNAL test package because
+// they drive a real postmaster server, and postmaster imports this package —
+// an in-package test importing it back would be a test import cycle. The
+// unexported-symbol walsender tests are in walsender_test.go instead.
+//
+// The server + client harness declared here (startReplicationTestServer*,
+// dialReplication, sendQuery, readUntilReadyForQuery, ...) is shared with
+// walreceiver_wire_test.go.
 package replication_test
 
 import (

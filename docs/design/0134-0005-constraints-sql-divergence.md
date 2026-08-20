@@ -2012,3 +2012,2465 @@ Gates: `go build ./...`; `go test ./internal/{executor,catalog}/`;
 `go test -run 'TestPort_.*(NotNull|Constraint|Inherit|Partition)' ./internal/testport/`
 (40 subtests); `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
 `scripts/tpch-spotcheck.sh` PASS (**Q12=2, Q13=35** — Rule #1).
+
+## 24. M0134-0005q — `ATTACH`/`DETACH PARTITION` never absorb the child's NOT NULL constraints
+
+Status: **accepted / LANDED 2026-08-18**. Baseline at selection: **763 diff lines / 30 hunks**
+(re-measured at `bae52414`, unchanged from §23.5 — 0005p unmasked nothing).
+
+### 24.1 Symptom (what the regress diff witnesses)
+
+Two hunks, ~54 diff lines total:
+
+| hunk | source | symptom |
+|---|---|---|
+| `@@ -1468,54 +1466,49 @@` | `constraints.sql:918-960` | `notnull_tbl1_2`/`_3` keep `conislocal=t, coninhcount=0` after `ATTACH PARTITION` (PG: `f`/`1`); the follow-on `SET NOT NULL` / `VALIDATE CONSTRAINT nn3` errors PG raises never fire; and `ALTER TABLE pp_nn ATTACH PARTITION pp_nn_1` silently succeeds where PG raises `42P17 constraint "nn1" conflicts with NOT VALID constraint on child table "pp_nn_1"`, desynchronising ~12 further lines |
+| `@@ -1545,18 +1538,17 @@` | `constraints.sql:983-991` | the `notnull_part1_*_upg` pg_upgrade fixture — same `t/0` vs `f/1` divergence, **4 lines only** |
+
+**Not this bug, inside the same spans** (do not credit to this slice): the
+`regclass` `ORDER BY` sort bug and the suppressed `merging column` NOTICE (both
+ledgered under the 0005p rows), the recursive `QueueNNConstraintValidation` gap
+(ledgered under 0005p), and the ATACC3/`ALTER TABLE … INHERIT` validation hunks
+(0005k) — the latter share PG's fan-in function but arrive from a **different
+call site**.
+
+### 24.2 Root cause — PG's fan-in function has no goopg counterpart
+
+The 0005p ledger guessed `AdjustNotNullInheritance`; **that guess is wrong for
+this path**. `AdjustNotNullInheritance` serves only same-table paths (`ADD
+CONSTRAINT` / `ADD PRIMARY KEY` / identity — 0005n/0005o). ATTACH flows through:
+
+- `tablecmds.c:ATExecAttachPartition` (:20250) → `CreateInheritance(attachrel,
+  rel, ispartition=true)` (:20448)
+- `CreateInheritance` (:17374) → `MergeAttributesIntoExisting` (:17419, the
+  column-level twin goopg *does* implement as `markAttachedColumnsInherited`)
+  → **`MergeConstraintsIntoExisting` (:17422)** — the constraint-level merge,
+  **entirely absent in goopg**.
+
+`MergeConstraintsIntoExisting` (:17638-17817), per parent constraint with
+`contype IN (CHECK, NOTNULL)` and `!connoinherit`, matching the child's NOT NULL
+**by attribute number, not by name** (:17709-17718):
+
+1. child `connoinherit` → `42P17` `constraint "%s" conflicts with non-inherited constraint on child table "%s"` (:17736)
+2. parent validated && child enforced && !child validated → `42P17` `constraint "%s" conflicts with NOT VALID constraint on child table "%s"` (:17746) ← the missing `pp_nn` error
+3. parent enforced && !child enforced → `42P17` NOT ENFORCED conflict (:17758) — **goopg's model has no `conenforced` on NOT NULL; out of scope, ledgered**
+4. otherwise absorb: `coninhcount++` (:17771); **only when the parent is `RELKIND_PARTITIONED_TABLE`** `conislocal = false` (:17782) — plain `INHERITS` leaves `conislocal` alone
+5. no matching child constraint → `42804` `column "%s" in child table "%s" must be marked NOT NULL` (:17797)
+
+DETACH is the exact twin: `ATExecDetachPartition`/`…Finalize` → `RemoveInheritance`
+(:17950-18144, shared with `ATExecDropInherit`): `coninhcount--`, and
+`conislocal = true` once it reaches 0 (:18123). Never decrement past 0 (PG
+`elog`s an internal assert there, :18119).
+
+The constraint **keeps its own name** across absorb and detach — the merge is
+positional, never a rename.
+
+### 24.3 goopg's gap (confirmed, both directions)
+
+- `internal/executor/operators_ddl.go:8332` (`AlterTableAttachPartition`): clones
+  FKs, checks default-partition conflicts, propagates indexes, calls
+  `markAttachedColumnsInherited` (:8508) — and touches `NotNullConstraints`
+  **zero times**.
+- `:8730` / `:8763` (`AlterTableDetachPartition`, both branches): call
+  `clearAttachedColumnsInherited` (:13273), likewise never touching
+  `NotNullConstraints`.
+- The column-level pair `markAttachedColumnsInherited` (:13250) /
+  `clearAttachedColumnsInherited` (:13273) is the **structural template** — this
+  slice adds their constraint-level twins.
+- `catalog.Table.AddNotNull` (`internal/catalog/catalog.go:254`) is a pure append
+  that validates nothing (the 0005p root cause); the in-place-merge shape to
+  reuse is `AlterTableSetNotNull`'s already-exists branch
+  (`operators_ddl.go:9862-9882`).
+- **Heap resync**: per the 0005o convention every `NotNullConstraints` write site
+  needs `catalogHeapSyncAvailable` → `MaterializeWriterXID` →
+  `deleteCatalogRowsForOID` (looped over `tableCatalogDBOids`) →
+  `syncTableToCatalogHeap` (template at `:9891-9901`). ATTACH/DETACH run none of
+  it today. PG writes rows only on `conrelid = attachrel`, so **only the child**
+  needs the resync — the parent's own constraint rows are untouched.
+
+### 24.4 Design
+
+Add the two constraint-level twins alongside the existing column-level ones, and
+run the merge at **statement execution time** in every ATTACH branch (including
+the deferred one): PG raises its `42P17`/`42804` errors from
+`ATExecAttachPartition` itself, so deferring the check to COMMIT would report the
+error at the wrong statement.
+
+1. `mergeNotNullOnAttach(parent, child *catalog.Table) error` — cases 1, 2, 4, 5
+   of §24.2 (case 3 omitted, ledgered). Match on `ColName` case-folded (goopg's
+   proxy for PG's attnum match — equivalent because a column name is unique
+   within a table).
+2. `unmergeNotNullOnDetach(parent, child *catalog.Table)` — `InhCount--`,
+   `IsLocal = (InhCount == 0)`, clamped at 0.
+3. Heap-resync quadruple for the child after either mutation.
+4. Error messages byte-identical to PG's, with PG's SQLSTATEs (`42P17`, `42804`).
+
+### 24.5 Out of scope (ledgered, not fixed here)
+
+- The **CHECK-constraint half** of `MergeConstraintsIntoExisting` — same function
+  upstream, separate witness set.
+- The **NOT ENFORCED** conflict branch — goopg's `NamedNotNullConstraint` has no
+  `conenforced` field; unwitnessed by this fixture.
+- The plain `ALTER TABLE … INHERIT` call site (`ATExecAddInherit`), which shares
+  the upstream function but differs in the `conislocal` rule (§24.2 step 4) —
+  that is 0005k's territory.
+
+### 24.6 Outcome (LANDED 2026-08-18)
+
+Measured **763 → 738 lines**, hunks 30 → **31** — the +1 is a pure split of the
+shrunk hunk (the surrounding `@@` header list is byte-identical). The §24.1 sizing
+prediction held exactly: ~54 lines were ever this bug's, and the rest of the span
+belongs to the separately-ledgered `regclass` sort / suppressed NOTICE /
+`QueueNNConstraintValidation` gaps, which were correctly not chased.
+
+Landed as `mergeNotNullOnAttach` (`internal/executor/operators_ddl.go:13347`) and
+`unmergeNotNullOnDetach` (`:13405`), wired at ATTACH (~:8409), concurrent-detach
+phase 2 (~:8757) and plain DETACH/FINALIZE (~:8790), each followed by the
+child-only heap-resync quadruple. 144 production lines, 4 new real-server guards in
+`internal/testport/notnull_inherit_counters_test.go` (all FAIL-pre / PASS-post).
+
+**One oracle correction worth carrying forward:** §24.2's steps 1 and 2 quote PG's
+`errmsg` with `%s` = the constraint name, and the brief assumed that meant the
+*parent's*. It is the **child's** (`NameStr(child_con->conname)`), confirmed
+against `expected/constraints.out:1581`, where `nn1` is `pp_nn_1`'s own
+constraint. **When pinning a message's arguments, read the expected output, not
+only the `errmsg` call site** — the call site alone is ambiguous about which of
+two same-typed variables is in scope.
+
+Gates: `go build ./...`; `go test ./internal/{executor,catalog}/`;
+`go test -run 'TestPort_.*(NotNull|Constraint|Inherit|Partition)' ./internal/testport/`;
+`scripts/pg-regress-runner.sh constraints`;
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35 — Rule #1).
+
+## 25. M0134-0005r — plain `ALTER TABLE … INHERIT / NO INHERIT` never merges NOT NULL
+
+**Baseline at entry:** 738 lines / 31 hunks (re-measured 2026-08-18 at `2f1d324d`;
+never compare to a pre-2026-08-18 number).
+
+### 25.1 The discovery
+
+M0134-0005q (§24) implemented the *partition* half of NOT NULL constraint
+absorption: `mergeNotNullOnAttach` / `unmergeNotNullOnDetach`
+(`internal/executor/operators_ddl.go:13357` / `:13413`), wired at `ATTACH` and the
+three `DETACH` sites. Upstream, the partition and the plain-inheritance halves are
+**the same function**: `CreateInheritance(…, ispartition)`
+(`postgres/src/backend/commands/tablecmds.c:17374`) → `MergeConstraintsIntoExisting`
+(`:17636`) is reached from `ATExecAttachPartition` *and* from `ATExecAddInherit`
+(`:17261`, `ispartition=false`). goopg had only wired the partition caller.
+
+goopg's plain-inheritance paths therefore do **no** NOT NULL bookkeeping at all:
+
+- `parser.AlterTableInherit` (`operators_ddl.go:9234-9296`) copies missing *columns*
+  only; the comment at `:9286` admits the constraint half is unimplemented ("v0").
+- `parser.AlterTableNoInherit` (`:9297-9341`) unregisters the inheritance edge and
+  clears `col.Inherited`, but never decrements the NOT NULL constraint's `InhCount`.
+
+Consequence in `constraints.sql`: `ALTER TABLE … INHERIT` leaves the child's NOT NULL
+`InhCount` at 0 / `IsLocal` true, so later `\d+` and `pg_constraint` probes diverge,
+and the conflict checks PG raises at merge time (NO INHERIT status change, NOT VALID
+conflict, NOT ENFORCED conflict, parent constraint missing on child) never fire.
+
+### 25.2 The one behavioural delta vs the partition half
+
+`MergeConstraintsIntoExisting` branches on `is_partition` in exactly one place —
+`tablecmds.c:17771-17777`: `conislocal` is cleared to false **only** when the parent
+is a partitioned table. For plain `INHERITS`, the child's constraint keeps
+`conislocal = true` while `coninhcount` is incremented; the constraint is then both
+local and inherited, and survives a later `NO INHERIT` as a local constraint.
+
+`RemoveInheritance` (`:17950`, decrement loop at `:18103-18125`) has **no**
+`is_partition` branch — the detach-side helper is reusable unchanged.
+
+### 25.3 Message-argument sources (pinned, not guessed)
+
+Per §24's lesson, arguments are pinned from the oracle source and, where witnessed,
+from `postgres/src/test/regress/expected/constraints.out`:
+
+- NO-INHERIT / NOT-VALID / NOT-ENFORCED conflicts (`tablecmds.c:17736-17762`) name
+  the **child's** constraint name.
+- The "missing constraint on child" error (`:17797-17812`) names the **parent's**
+  attname.
+
+### 25.4 The slice
+
+Parameterize `mergeNotNullOnAttach(parent, child *catalog.Table, isPartition bool)`;
+gate the `IsLocal = false` assignment (`:13399`) on `isPartition`. Wire it into
+`AlterTableInherit` with `isPartition=false` and wire the unchanged
+`unmergeNotNullOnDetach` into `AlterTableNoInherit`. Update the existing ATTACH /
+DETACH call sites to pass `isPartition=true`. **Twin pair:** INHERIT ↔ NO INHERIT
+must land together (the §24 precedent — a merge without its unmerge leaves
+`InhCount` monotonically climbing across INHERIT/NO INHERIT cycles).
+
+**Measured result: 738/31 → 731 lines / 32 hunks** (predicted ~715-724/31 — the
+shrink landed 7 lines short of the band, and hunk count rose by one; see §25.6
+for the root cause, which is a newly *unmasked* pre-existing bug, not a
+regression). The plain-
+inheritance NOT NULL cluster owns only ~45-55 of the 738 lines and splits three ways;
+this slice takes cluster A (the missing call, ~14-18 lines). Deliberately out of
+scope, carried to the ledger:
+
+- **Cluster B (~26 lines)** — `CREATE TABLE … INHERITS` merge-time NOT NULL name /
+  `conislocal` handling (`operators_ddl.go:3966-4051`) is a *different, pre-existing*
+  bug, not a missing call: the witnessed case is a child column redeclared **without**
+  its own `NOT NULL` keyword, which the code's "verified live against PG 18.3"
+  comment (`:4032`) does not actually cover.
+- **Cluster C (~4 lines)** — the single-parent redeclare case emits no "merging
+  column" NOTICE; goopg's only NOTICE site (`:1831`) is the multi-parent dedup path.
+
+### 25.5 The deferred-to-COMMIT twin (round 2)
+
+`ALTER TABLE … {NO} INHERIT` has **two** execution paths in goopg, and only wiring
+the immediate one would have left the bug unfixed under `BEGIN`/`COMMIT`. Inside an
+explicit transaction the case records a `PendingInheritanceChange` and `break`s
+(M0118-0008 alter-table-4, transactional-DDL visibility: the link must stay invisible
+to concurrent sessions until commit); the real catalog mutation happens in
+`ApplyPendingInheritanceChanges` (`operators_ddl.go:7341`), which already replayed the
+column copy but did no constraint merge. Both arms are now mirrored there —
+`unmergeNotNullOnDetach` before `UnregisterInheritanceChild`, and
+`mergeNotNullOnAttach(…, false)` after the column copy with `RegisterInheritanceChild`
+moved after it, matching the immediate path's ordering.
+
+`ApplyPendingInheritanceChanges` has no error-return channel and runs before
+`TxnMgr.Commit`, so the merge error is deliberately discarded there; see §25.6. Heap
+resync is deliberately omitted, matching the sibling deferred function
+`ApplyPendingPartitionAttaches`, which omits it too.
+
+### 25.6 Carried out of this slice (all ledgered)
+
+- **The `LINE N:` / `^` echo quirk** — the `mergeNotNullOnAttach` call sites stamp
+  `ee.Pos = act.Pos()`, so goopg annotates these `42P17`/`42804` errors with a cursor
+  position PG does not set for them. Pre-existing (already present at the
+  ATTACH-PARTITION baseline), but this slice *unmasks* it at the new INHERIT sites —
+  which is why the diff shrank only to 731 and gained a hunk instead of hitting the
+  predicted 715-724/31.
+- **No statement-time conflict check on the deferred path** — PG's `ATExecAddInherit`
+  raises `42P17`/`42804` synchronously regardless of transaction wrapping; goopg's
+  deferred path performs the merge only at COMMIT, so a genuine conflict is silently
+  skipped rather than raised at the `ALTER TABLE`. Unwitnessed by `constraints.sql`
+  (autocommit-only fixtures).
+- **Cluster B** (`CREATE TABLE … INHERITS` merge-time NOT NULL name / `conislocal`)
+  and **cluster C** (missing single-parent "merging column" NOTICE), per §25.4.
+- `ALTER TABLE … ADD CONSTRAINT` cascading down the inheritance tree (the
+  `ditto`/`ATACC2` case, diff ~317/321) — same missing-merge-check family, different
+  call site.
+
+## 26. M0134-0005s — `CREATE TABLE … INHERITS` never marks a locally-sourced NOT NULL as `conislocal`
+
+Baseline when this slice was selected: **731 diff lines / 32 hunks** (HEAD
+`d70c2e0b`, re-measured 2026-08-18 — never compare against an older number).
+Census: `tmp/ralph-handoffs/m0134-0005s-census/report.md`.
+
+### 26.1 The divergence
+
+`postgres/src/test/regress/sql/constraints.sql:789-790`:
+
+```sql
+CREATE TABLE notnull_tbl4_cld2 (PRIMARY KEY (a) DEFERRABLE) INHERITS (notnull_tbl4);
+CREATE TABLE notnull_tbl4_cld3 (PRIMARY KEY (a) DEFERRABLE, CONSTRAINT a_nn NOT NULL a)
+  INHERITS (notnull_tbl4);
+```
+
+goopg's `\d+` reports the child's NOT NULL as purely `(inherited)`, and for
+`cld2` under the *parent's* constraint name:
+
+```
+-  "notnull_tbl4_cld2_a_not_null" NOT NULL "a" (local, inherited)   <- PG
++  "notnull_tbl4_a_not_null"      NOT NULL "a" (inherited)          <- goopg
+-  "a_nn" NOT NULL "a" (local, inherited)                           <- PG
++  "a_nn" NOT NULL "a" (inherited)                                  <- goopg
+```
+
+Both children declare a NOT NULL of their own — `cld2` implicitly via
+`PRIMARY KEY (a)`, `cld3` explicitly via `CONSTRAINT a_nn NOT NULL a` — *and*
+inherit one from `notnull_tbl4`. PG's answer is that the constraint is both
+local and inherited; goopg's is that it is only inherited.
+
+### 26.2 The PG oracle
+
+`postgres/src/backend/catalog/heap.c:2897` `AddRelationNotNullConstraints`,
+called from `DefineRelation` (`tablecmds.c:1354`), takes two lists:
+
+- `constraints` — every NOT NULL the **child's own body** produced: explicit
+  column `NOT NULL`, table-level `CONSTRAINT n NOT NULL c`, **and the
+  PK-implied one**, all duplicate-merged at `heap.c:2955-2998`.
+- `old_notnulls` — the parent-inherited `CookedConstraint`s that
+  `MergeAttributes` (`tablecmds.c:2546`) carried down, built from every direct
+  parent independently of whether the child redeclares the column.
+
+The two loops that follow are the whole rule:
+
+- `heap.c:3038-3050` — for **every** entry in `constraints`, PG calls
+  `StoreRelNotNull(rel, conname, attnum, /*islocal=*/true, …, inhcount, …)`.
+  `islocal` is **unconditionally true**; `inhcount` counts however many
+  `old_notnulls` entries were absorbed (`heap.c:3009-3018`). This is the
+  `(local, inherited)` case. The name comes from `ChooseConstraintName` over
+  `RelationGetRelationName(rel)` — the **child's** name, not the parent's.
+- `heap.c:3057-3120` — only for columns with **no** entry in `constraints` at
+  all does PG store the parent's name with `islocal=false`. This is the pure
+  `(inherited)` case.
+
+So: a local source always wins both the flag and the name; inheritance only
+adds to `coninhcount`.
+
+### 26.3 goopg's divergence
+
+`internal/executor/operators_ddl.go:3966-4062`, `CreateTable`'s per-column
+NOT-NULL merge loop. `entries` (built at `:3978-3995` from the column's own
+local sources — `NotNullExplicit`, the `pkColSet` PK-implied branch, LIKE
+copies) is exactly PG's `constraints` list. But `isLocal` and `name` are
+decided earlier, at `:4012-4051`, purely from `col.Inherited` — i.e. from
+whether the column arrived via a bare `INHERITS` copy — and are **never
+revisited** by the `if len(entries) > 0` block at `:4052-4062`:
+
+```go
+if len(entries) > 0 {
+    mergedName, mergedNoInherit, execErr := mergeNotNullEntries(col.Name, entries)
+    …
+    if mergedName != "" { name = mergedName }
+    noInherit = mergedNoInherit
+}
+tbl.AddNotNull(name, col.Name, im.AllocOID(), noInherit, false, isLocal, inhCount)
+```
+
+For `notnull_tbl4_cld2`, `a` never appears in `s.Columns` (only in the
+table-level `PRIMARY KEY (a)`), so `col.Inherited=true` was stamped at
+`:3267`; the `col.Inherited` branch set `isLocal=false` and `name` = the
+parent's constraint name; and although `entries` is non-empty (the PK-implied
+`nnEntry{}` from `:3985-3987`), `mergedName` is `""` for an unnamed entry, so
+neither the flag nor the name is corrected.
+
+### 26.4 The fix
+
+Inside the `len(entries) > 0` block, mirror `heap.c:3038-3050`:
+
+1. `isLocal = true` — a column with any local NOT-NULL source is `conislocal`
+   regardless of what it also inherited. `inhCount` is unchanged (it already
+   counts the absorbed parent constraints, so the result is
+   `(local, inherited)`).
+2. When `mergedName == ""` (no explicit name anywhere in `entries`), recompute
+   `name` from the **child's** relation name — `<child>_<col>_not_null` — via
+   the same auto-naming helper the non-inherited path already uses, instead of
+   leaving the parent's name that the `col.Inherited` branch assigned. An
+   explicit name in `entries` (`cld3`'s `a_nn`) still wins, as it does today.
+
+### 26.5 Rule #2 twins — already correct, do not touch
+
+The statement-time twin `mergeNotNullOnAttach`
+(`operators_ddl.go:13422-13471`, reached from both the ATTACH PARTITION site
+`:8444` and the plain INHERIT site `:9332`) and its inverse
+`unmergeNotNullOnDetach` (`:13481-13501`) already implement this rule — they
+were fixed under M0134-0005q/M0134-0005r and never clear a pre-existing local
+flag. Only the CREATE-TABLE-time path has the gap. The deferred-to-COMMIT
+`ALTER TABLE … INHERIT` variant routes through the *same*
+`mergeNotNullOnAttach` call site (`PendingInheritanceChange`, `:9296-9302`),
+so it carries no separate merge logic and needs no separate change.
+
+### 26.6 Explicitly out of scope (verify, do not fold in)
+
+- **`ATACC3 (PRIMARY KEY (a)) INHERITS (ATACC1)`** where `ATACC1`'s own
+  not-null is `NO INHERIT` (diff `:290-301`, 4 lines). Same symptom family,
+  but goopg drops the not-null obligation *entirely* rather than mislabelling
+  it, because of the separate NO-INHERIT clearing of `col.NotNull` at
+  `operators_ddl.go:1854-1861`. Re-probe after the primary fix; if it is not
+  cleared, it is its own slice.
+- **`notnull_tbl5_child` after `ALTER TABLE ONLY notnull_tbl5 DROP CONSTRAINT
+  ann`** (diff `:486-487`). Same `(inherited)` tag, different root cause:
+  `DROP CONSTRAINT … ONLY` does not decrement the child's `InhCount` /
+  restore `IsLocal`. Separate fix site.
+
+### 26.7 Expected payoff
+
+4 diff lines guaranteed (`notnull_tbl4_cld2`, `notnull_tbl4_cld3`), i.e.
+**731 → ~727 lines**, with the ATACC3 case worth 4 more if it shares the gap.
+The census's original "~26 lines" estimate for this cluster over-counted: it
+swept in unrelated neighbours such as the `notnull_tbl2_a_seq` sequence-owner
+schema-qualification diff at `:278-283`.
+
+### 26.8 Measured outcome (LANDED 2026-08-18, M0134-0005s)
+
+`internal/executor/operators_ddl.go`: `childAutoName` is captured at `:3997`
+*before* the `col.Inherited` branch can overwrite `name` with the parent's, and
+the `len(entries) > 0` block (`:4056-4077`) now sets `isLocal = true`
+unconditionally and falls back to `childAutoName` when `mergedName == ""`.
+`inhCount` is untouched. Guard tests:
+`internal/executor/operators_ddl_createinh_notnull_test.go` (PK-implied and
+explicit-name cases; both verified FAIL-pre / PASS-post via a `git stash` A/B).
+
+**731 lines / 32 hunks → 707 lines / 31 hunks.** The drop is 24 lines, not the
+predicted 4, because once `notnull_tbl4_cld2`/`cld3` match PG byte-for-byte the
+diff tool drops the entire hunk — context lines included — rather than only the
+two changed marker lines. Both named cases are fully cleared. This is worth
+remembering when estimating future slices from this file: a hunk that goes
+fully clean is worth its context, so per-slice payoff is systematically
+under-predicted by marker-line counting.
+
+Gates: `go build ./...`; `go test ./internal/{executor,catalog}/`;
+`go test -run 'TestPort_.*(NotNull|Constraint|Inherit|Partition)' ./internal/testport/`
+(75.5s PASS); `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS
+(`internal/initdb` ran cold at 438s — cache invalidation from the diff, not a
+regression); `scripts/tpch-spotcheck.sh` PASS (**Q12=2, Q13=35**, Rule #1);
+pgbench smoke via the pre-commit hook.
+
+### 26.9 ATACC3 re-probe (§26.6) — root cause now pinned, still deferred
+
+The `ATACC3 (PRIMARY KEY (a)) INHERITS (ATACC1)` case is **not** cleared, but the
+fix changed its shape and pinned the cause. Pre-fix it had both a wrong name and
+a wrong tag; post-fix the name is correct (a side effect of §26.4's
+`childAutoName` half) and only the tag is wrong: goopg reports
+`(local, inherited)` where PG expects **no tag at all**. Root cause is a
+pre-existing, untouched loop at `operators_ddl.go:4012-4023` that counts a
+parent's NOT NULL toward `inhCount` **even when that parent's constraint is
+`NO INHERIT`** — PG's `MergeAttributes` never places a `NO INHERIT` parent
+constraint into `old_notnulls` at all, so the child inherits nothing and
+`coninhcount` stays 0. This is one bug, not the two-part entanglement §26.6
+guessed at: the `col.NotNull` clearing at `:1854-1861` is the *correct* half.
+Ledgered with this resume point; a good ~4-line follow-up slice.
+
+## 27. M0134-0005t — a `NO INHERIT` parent NOT NULL was counted toward the child's `coninhcount`
+
+Closes the deferral §26.9 opened, and with it the last of §26.6's carve-out.
+
+### 27.1 The divergence
+
+`constraints.sql`'s `CREATE TABLE ATACC3 (PRIMARY KEY (a)) INHERITS (ATACC1)`
+(diff `:290-301`), where ATACC1's own not-null is `NO INHERIT`: goopg tagged the
+child's PK-implied constraint `(local, inherited)`; PG 18.3 emits **no tag** —
+the constraint is purely local, `coninhcount = 0`.
+
+### 27.2 The PG oracle (re-verified, not inherited from §26.9's note)
+
+`MergeAttributes` never sees a `NO INHERIT` parent not-null at all. It collects
+the parent's constraints via
+
+```c
+/* tablecmds.c:2757 */
+nnconstrs = RelationGetNotNullConstraints(RelationGetRelid(relation),
+                                          true, /* include_noinh = */ false);
+```
+
+and `RelationGetNotNullConstraints` (`catalog/pg_constraint.c:834`) filters at
+the top of its scan:
+
+```c
+if (conForm->connoinherit && !include_noinh)
+    continue;
+```
+
+That single list feeds **both** consumers: `nncols` (the `attnotnull` request
+set, built at `:2759-2760`) and the `nnconstraints` list appended at
+`tablecmds.c:2952`. So a `NO INHERIT` parent constraint contributes neither an
+inherited count nor a name — it is invisible to inheritance, full stop.
+
+### 27.3 The fix
+
+Three `if …NoInherit { continue }` guards, 9 lines total, in
+`internal/executor/operators_ddl.go`:
+
+1. `execCreateTable`'s `col.Inherited && s.PartitionOf == nil` parent-scan loop
+   (`:4013`) — the one that both increments `inhCount` and may assign
+   `name = pnc.Name`. Guarding before the `EqualFold` match kills both effects at
+   once, which is why the name half needed no separate change.
+2. The sibling `!col.Inherited && s.PartitionOf == nil` loop (`:4043`) that sets
+   `inhCount = 1` for a child re-declaring the column in its own list. Same
+   oracle, same filter — Rule #2 demanded both loops move together.
+3. `unmergeNotNullOnDetach` (`:13504`), which selected parent constraints
+   *without* the `NoInherit` skip its ATTACH twin `mergeNotNullOnAttach` already
+   had. Behaviourally a no-op today (a `NO INHERIT` parent constraint was never
+   absorbed, so the `InhCount > 0` clamp already swallowed the decrement) — this
+   closes the latent Rule-#2 twin divergence ledgered under M0134-0005q rather
+   than leaving a future CHECK/multi-parent extension to make it live.
+
+`:1854-1861`'s `col.NotNull` clearing is the correct half and was **not**
+touched, per §26.9.
+
+### 27.4 Measured outcome (LANDED 2026-08-18)
+
+`constraints` regress diff **707 → 702 lines**, hunks unchanged at **31** — the
+~4-line estimate in §26.9's ledger row, met (5). The ATACC3 hunk's
+`(local, inherited)` mis-tag is gone and goopg now matches PG byte-for-byte on
+that line.
+
+Guard: `TestPort_NotNullNoInheritParentSkippedOnCreateInherits`
+(`internal/testport/notnull_inherit_counters_test.go`), asserting all three
+properties the oracle implies — `coninhcount = 0`, `conislocal = true`, and a
+name that is *not* the parent's. FAIL pre (`coninhcount = "1", want 0`) / PASS
+post, verified by stashing the executor edits in-session.
+
+Gates: `go build ./...`; `go test ./internal/{executor,catalog}/`;
+`go test -run 'TestPort_.*(NotNull|Constraint|Inherit|Partition)'
+./internal/testport/` (75.3s PASS, 12 pre-existing guards + the new one);
+`scripts/pg-regress-runner.sh constraints` (702/31);
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS
+(`internal/initdb` cold at 436s — diff cache invalidation, not a regression;
+note this scope EXCLUDES `internal/testport`); `scripts/tpch-spotcheck.sh` PASS
+(**Q12=2, Q13=35**, Rule #1); pgbench smoke via the pre-commit hook.
+
+### 27.5 Carried out of this slice (ledgered)
+
+One residual line remains in the ATACC3 hunk, **pre-existing and unchanged by
+this diff**: `\d+`'s per-column *Nullable* display shows blank where PG shows
+`not null`, for a column that is both `col.Inherited` (plain INHERITS) and
+PK-implied NOT NULL. The describe renderer evidently reads a different signal
+than `catalog.Table.Columns[i].NotNull` / the `pg_constraint` row — a separate
+bug in the describe path, not in the inheritance bookkeeping this section fixes.
+
+## 28. M0134-0005u — goopg stamped a cursor position PG does not set on the NOT-NULL merge errors
+
+Baseline when this slice was selected: **702 diff lines / 31 hunks** (HEAD
+`26b6b5ac`, per §27 — never compare against an older number). Research pass:
+`tmp/ralph-handoffs/m0134-0005u-eepos-audit/report.md`.
+
+### 28.1 The divergence
+
+Both `mergeNotNullOnAttach` call sites wrapped their error return in
+
+```go
+if ee, ok := err.(*ExecError); ok && ee.Pos == 0 { ee.Pos = act.Pos() }
+```
+
+so goopg emitted a `FieldPosition` — rendered by psql as a `LINE N:` / `^`
+caret block — on the `42P17` / `42804` NOT-NULL merge conflicts raised by
+`ALTER TABLE … ATTACH PARTITION` and plain `ALTER TABLE … INHERIT`. PG 18.3
+raises both from `MergeConstraintsIntoExisting`
+(`postgres/src/backend/commands/tablecmds.c:17638-17817`), which calls no
+`errposition()`; `postgres/src/test/regress/expected/constraints.out:1497,1581`
+accordingly carries no caret block. This is the §25.6 quirk, ledgered under
+M0134-0005r and re-measured under M0134-0005s.
+
+Note the gate asymmetry that makes this visible at all: `scripts/pg-regress-runner.sh`
+uses its own bash `normalise_output` (script lines ~250-266), which does **not**
+strip `LINE `/`^`, whereas `NormalizeRegressOutput`
+(`internal/testport/framework/regress.go`) does. A payoff claim about error
+positions is meaningless until you name which normaliser it is about.
+
+### 28.2 The audit — the ledger's "36 lines across ~20 sites" was wrong
+
+The M0134-0005s ledger row scoped this as "a single audit of all ~20
+`ee.Pos == 0` stamping sites … worth 36 lines". The research pass enumerated all
+20 sites in `internal/executor/operators_ddl.go` and found that number does not
+survive contact:
+
+- **15 sites** are lock-acquire / deadlock / cancel paths (`acquireDDLLockTxn`
+  and friends, plus `detachPartitionFKRefCheck`). PG never attaches a position to
+  these either (`lock.c`, `proc.c`, `deadlock.c` call no `errposition`), so
+  removing the stamps *would* be PG-faithful — but none are witnessed by
+  `constraints.sql`, which is serial and cannot reach a lock wait. Payoff on this
+  gate: **zero**. Risk: non-zero, because the isolation specs (`alter-table-*`,
+  `detach-partition-concurrently-*`) do exercise them and were not checked.
+- **1 site** (`:11600`, the FK phase-3 `validateFKConstraintExistingRows` scan,
+  23503) is a real instance of the same bug — PG's `ri_triggers.c`
+  `ri_ReportViolation` sets no position — but it is witnessed by
+  `foreign_key.sql`, not `constraints.sql`, and its sibling at `:8196` already
+  skips the wrap. It belongs to a `foreign_key`-scoped slice.
+- **2 sites** (`:8466` ATTACH, `:9354` INHERIT) are both PG-cited and
+  byte-witnessed in `constraints.out`. Those are this slice.
+
+The lesson generalises past this file: an `ee.Pos` site count is not a payoff
+estimate. Only sites whose error is *reached by the fixture under measurement*
+move the number, and "PG-faithful to remove" and "safe to remove blind" are
+different predicates — M0129-S10 broke 26 regress cases by treating a
+position-stripping change as site-blind (2026-08-10 ledger row).
+
+### 28.3 What landed
+
+Six lines in `internal/executor/operators_ddl.go`: the two stamping wrappers
+replaced by a comment citing `tablecmds.c:17638-17817`. The third
+`mergeNotNullOnAttach` call site (`~:7416`, the deferred-to-commit path of §25.5)
+already discards its error and carried no stamp.
+
+**Measured result: 702/31 → 672 lines / 30 hunks** — predicted −6/0, actual
+−30/−1. The four directly-removed diff lines are real; the rest is unified-diff
+realignment, two previously separate hunks merging once the caret lines
+disappeared (consistent with the hunk count falling by exactly one). Verified
+non-vacuous: `grep 'conflicts with NOT VALID constraint on child table'` over the
+new diff returns zero matches — both target errors now match PG byte-for-byte —
+and all 30 surviving hunks are pre-existing, unrelated divergences. **This is the
+inverse of §27's marker-line rule:** a hunk that goes clean can take far more than
+its own line count with it, in either direction. Predict the *sign*, not the
+magnitude, and re-measure.
+
+### 28.4 Carried out of this slice (ledgered)
+
+- The 15 lock-acquire `ee.Pos` sites — PG-faithful to remove, zero payoff here,
+  unverified against the isolation specs.
+- The FK phase-3 site (`:11600`) — same bug, `foreign_key.sql` scope.
+
+## 29. M0134-0005v — `ADD PRIMARY KEY` never verified the pre-existing NOT NULL is VALID and inheritable
+
+### 29.1 Selection — the reachability pass overturned the carried ranking
+
+The §28 baton ranked three candidates. A fixture-reachability pass at HEAD
+`fa84e214` (baseline **672 lines / 30 hunks**) retired the top two outright:
+
+- **`ATExecValidateConstraint` descendant recursion** (`postgres/src/backend/commands/tablecmds.c:13219-13300`,
+  `QueueNNConstraintValidation`) — every `VALIDATE CONSTRAINT` in the fixture
+  (`constraints.sql:864,866,904,934,947`) targets a table with **zero descendants
+  at that moment**. The apparent counter-example at `:904` inverts: the preceding
+  `ALTER TABLE notnull_tbl1 INHERIT notnull_chld0` (`:901`) makes `notnull_chld0`
+  the *parent*. Payoff **0**.
+- **The CHECK half of `MergeConstraintsIntoExisting`** (`tablecmds.c:17638-17817`,
+  reached only from `ATAddInherit`) — all five `ALTER TABLE … INHERIT` sites
+  (`:710,855,857,897,901`) carry NOT NULL constraints only; no shared-name CHECK
+  scenario exists in the fixture. Payoff **0**.
+- **`DROP CONSTRAINT … ONLY` child `InhCount`/`IsLocal`** — reachable
+  (`constraints.sql:803-806`, `notnull_tbl5_child`) but owns exactly **4 lines in
+  1 hunk**.
+
+This is the second consecutive loop in which the reachability pass, not the site
+census, decided the slice — see §28.2. **A carried ranking is a hypothesis, not a
+queue.** Re-measure it against the current diff before briefing.
+
+### 29.2 The divergence
+
+PG's `verifyNotNullPKCompatible` (`tablecmds.c:9577-9608`) rejects an
+`ADD PRIMARY KEY` whose column is already covered by a NOT NULL constraint that is
+either `NO INHERIT` or not validated — such a constraint cannot back a primary
+key. Both arms raise `55000` (`ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE`)
+`cannot create primary key on column "%s"`, differing only in the DETAIL's marking
+and the HINT (`… ALTER CONSTRAINT … INHERIT` vs `… VALIDATE CONSTRAINT`). Neither
+`ereport` carries an `errposition`, so goopg must leave `Pos` at 0 (the §28 rule).
+It is called from `ATPrepAddPrimaryKey`'s not-recurse loop (`:9556`), which walks
+children as well.
+
+goopg's `execAlterTableAddPrimaryKey` (`internal/executor/operators_ddl.go:10876-10913`)
+tests only `alreadyHadNotNull := col.NotNull` and, when true, `continue`s at
+`:10890` — it never inspects the matching `NotNullConstraints` entry's
+`NoInherit`/`NotValid` flags. Three fixture sites hit this today:
+`constraints.sql:834-835` (`notnull_tbl1`, `nn` is `NOT VALID`), `:954-955`
+(`pp_nn_1` `NOT VALID` via `ALTER TABLE ONLY pp_nn ADD PRIMARY KEY`), and
+`:960-961` (same shape, `NO INHERIT`) — together **~10 diff lines across 2 of the
+30 hunks**, 2.5x the retired candidate 3.
+
+### 29.3 Scope boundary
+
+`constraints.sql:838` — `ADD GENERATED ALWAYS AS IDENTITY` over an invalid NOT
+NULL — looks adjacent but is a **different** PG check (`incompatible NOT VALID
+constraint`, `tablecmds.c:8311`, inside `ATExecSetNotNull`'s identity path), worth
+~2 more diff lines. Deliberately out of scope; ledgered, not conflated.
+
+### 29.4 Implementation and measured result
+
+Two helpers in `internal/executor/operators_ddl.go`, plus an `only bool` threaded
+into `execAlterTableAddPrimaryKey` from its single call site (`:8096` — the
+call-site sweep found exactly one caller, so §29.2's "second caller" risk did not
+materialise):
+
+- `verifyNotNullPKCompatible(nc, colName, relName)` — the direct port, both arms
+  `Pos: 0`.
+- `verifyNotNullPKCompatibleChildren` — the `ALTER TABLE ONLY` arm, mirroring PG's
+  `!recurse` branch (`tablecmds.c:9532-9557`). It gathers direct
+  `InheritanceChildren` + `PartitionChildren` deduped (the `cascadeNotNullToChildrenAt`
+  pattern) and names the **child** in the DETAIL, matching the oracle's expected
+  output (`pp_nn_1`, not the parent `pp_nn`).
+
+The check block sits after the `42P16` multiple-PK guard and before
+`createBTreeIndex`/the null scan — PG's `ATPrepAddPrimaryKey`-before-`ATExecAddIndex`
+ordering, the same ordering trap §21 hit.
+
+**Measured: 672 → 647 lines / 30 hunks** (predicted ~662). The over-delivery is
+the `ONLY` branch: §29.2 named three fixture sites and two of them
+(`constraints.sql:954-955`, `:960-961`) require the children walk, so the narrow
+own-column-only reading of the slice would have closed one site out of three.
+**Where the brief's file/line pointer and the design section's fixture list
+disagree, the fixture list is the real scope** — the pointer is a starting
+address, not a boundary. Hunk count held at 30, as neither hunk fully empties.
+Verified non-vacuous: the surviving `cannot create primary key on column` lines in
+the diff are context-only (no `-` prefix), and a before/after content comparison
+(ignoring `@@` churn) shows only the three named sites changed — no new divergence.
+
+### 29.5 Carried out of this slice (ledgered)
+
+- PG's other `!recurse` error — a child with **no** NOT NULL at all
+  (`tablecmds.c:9552-9554`); no fixture reaches it.
+- The identity-column `NOT VALID` check (§29.3).
+- A latent `execAlterTableDropConstraint` cascade gap: it appears to walk only
+  `PartitionChildren`, not plain-`INHERITS` children — masked today because the
+  one plain-INHERITS fixture case also uses `ONLY`.
+
+## 30. M0134-0005w — four more spurious `LINE n:` cursor positions on constraint-name / NOT-NULL errors (LANDED 2026-08-18)
+
+### 30.1 Symptom
+
+`scripts/pg-regress-runner.sh constraints` differed on five hunks (@248, @261,
+@485 ×2, @546) purely because goopg appended a `LINE 1: …` echo plus a `^` caret
+under statements where PG 18.3 emits the bare message alone. Same family as §28
+(commit `fa84e214`), different call sites — §28 fixed the merge path
+(`mergeNotNullOnAttach`); the sites here are on the `ALTER TABLE … ADD
+CONSTRAINT … NOT NULL` and `ADD COLUMN … CONSTRAINT <name> NOT NULL` paths.
+
+### 30.2 PG oracle — these `ereport`s carry no `errposition()`
+
+The implementer read `postgres/src/backend/catalog/pg_constraint.c` end to end:
+the file contains **zero** `errposition()` calls, so none of
+`AdjustNotNullInheritance`'s three rejections sets a cursor position.
+
+| goopg site (`internal/executor/operators_ddl.go`) | PG oracle | error |
+|---|---|---|
+| `:10121` | `pg_constraint.c:759-767` | `55000` cannot change NO INHERIT status |
+| `:10130` | `pg_constraint.c:770-779` | `55000` incompatible NOT VALID constraint |
+| `:10139` | `pg_constraint.c:788-795` | `55000` cannot create not-null constraint |
+| `:10557` | `heap.c:2645-2652` (`ConstraintNameIsUsed`, in `AddRelationNewConstraints`) | `42710` constraint … already exists |
+
+All four were verified individually — the brief required leaving alone any site
+whose PG counterpart *does* set a position; none did.
+
+### 30.3 The fix
+
+`Pos: act.Pos()` → `Pos: 0` at the four sites, each with the PG citation inline.
+12 insertions / 4 deletions. Guard tests:
+`internal/executor/operators_ddl_errpos_identity_test.go`, one per site,
+asserting `ExecError.Pos == 0` alongside the code (FAIL-pre / PASS-post).
+
+**Measured: 647 → 601 lines / 30 → 28 hunks** against a ~635/25-26 prediction —
+a 46-line drop where ~12 was forecast. The estimate counted only the diff lines
+that name these errors; each spurious position actually costs **three** lines
+(the message, the `LINE 1:` echo, and the caret) and the caret line displaces
+context, so a position-only bug is consistently ~3-4× the naive line estimate.
+Worth carrying: **`Pos` bugs are the cheapest lines-per-source-edit in this
+gate** — 4 edited lines closed 46 diff lines.
+
+### 30.4 Sibling check (Hard-won Rule #2)
+
+`Pos: act.Pos()` in this file went 57 → 53 sites. The `42710 already exists`
+message also appears at `:9161`, `:9185`, `:9210` inside `RENAME CONSTRAINT`,
+but those route through PG's `rename_constraint_internal`, a different function
+that was not verified — deliberately left alone rather than changed for symmetry.
+
+### 30.5 Carried out of this slice (ledgered)
+
+Part B of the brief (the identity-column `NOT VALID` check, PG
+`tablecmds.c:8311`, carried from §29.5) is **blocked by a larger gap**:
+`ALTER TABLE … ALTER COLUMN … ADD GENERATED … AS IDENTITY` is not implemented at
+all. `parser/ddl.go:parseAlterColumnAction` has no `ADD` branch and falls through
+to `AlterTableNoOp`; there is no `AlterTableActionKind` for it. Verified live
+against a running goopg — the statement **returns success while `attidentity` is
+never set**, a silent-no-op correctness gap well beyond a local `NOT VALID`
+check. Finishing it needs a new action kind, a parser branch, and a port of
+`ATExecAddIdentity` (`tablecmds.c:8239-8326`). Ledgered; not a 2-line fix as
+§29.5 assumed.
+
+## 31. M0134-0005x — `ADD CONSTRAINT … {PRIMARY KEY|UNIQUE} USING INDEX` was a silent no-op (LANDED 2026-08-19)
+
+### 31.1 Symptom
+
+`constraints.sql`'s `cnn_pk` fixture promotes a pre-existing unique index into a
+primary key:
+
+```sql
+ALTER TABLE cnn_pk ADD CONSTRAINT cnn_primarykey PRIMARY KEY USING INDEX cnn_uq;
+```
+
+PG renames `cnn_uq` to `cnn_primarykey` (with a NOTICE), marks it
+`indisprimary`, and sets `attnotnull` on the key column. goopg accepted the
+statement and did **nothing**: `\d+ cnn_pk` still showed `"cnn_uq" UNIQUE`, the
+`Nullable` column stayed blank, and the "Not-null constraints:" footer was
+missing. The sibling `ADD CONSTRAINT … UNIQUE USING INDEX` had the identical
+defect.
+
+### 31.2 Root cause — parser discard, not executor desync
+
+The preceding census (§30.5 ranking) filed this under the "`Nullable`-blank
+family" and assumed a catalog-heap sync gap like §30's path 2. That was wrong,
+and the research pass that preceded this slice is the reason it did not cost a
+wasted implementation round: the two other paths of that family had **already
+been fixed** by M0134-0005o and M0134-0005v, and path 3's cause is upstream of
+the executor entirely. `internal/parser/ddl.go` parsed `USING INDEX <name>`,
+**threw the name away**, and downgraded the action to `AlterTableNoOp` — so
+`execAlterTableAddPrimaryKey` never ran. No amount of executor-side tracing
+would have found it.
+
+### 31.3 The fix
+
+- `internal/parser/ast.go` — `AlterTableAction.UsingIndexName string`.
+- `internal/parser/ddl.go` — both the `PRIMARY KEY USING INDEX` and
+  `UNIQUE USING INDEX` arms keep their real `Kind` and populate
+  `UsingIndexName`; both also now parse the trailing
+  `DEFERRABLE [INITIALLY DEFERRED]` per `gram.y:4249/4283`.
+- `internal/executor/operators_ddl.go`:
+  - `adoptExistingIndexAsConstraint` (new, shared by PK and UNIQUE) — ports
+    `tablecmds.c:ATExecAddIndexConstraint`'s validation set (missing index
+    `42704`; already-a-constraint `55000`; non-unique / expression / partial
+    `42809`), renames on name mismatch with PG's exact NOTICE text, and sets
+    `IsConstraint`/`Primary`/`Deferrable`/`InitiallyDeferred` + `resyncIndexHeapRow`.
+  - `finishPrimaryKeyConstraint` (new) — the previously-inline PK tail,
+    extracted so the USING-INDEX path reuses the *already-correct*
+    not-null-synthesis block rather than cloning it. Its `IncludeColumns`
+    write is now guarded so adopting an index cannot erase its own INCLUDE list.
+  - `execAlterTableAddUnique` — the matching no-op stub replaced with the same
+    helper at `primary=false` (Hard-won Rule #2: the twin shipped together).
+
+### 31.4 Result
+
+`scripts/pg-regress-runner.sh constraints`: **601 → 555 lines, 28 → 26 hunks.**
+The sibling UNIQUE fix closed the `cnn_uq_idx` hunk on its own, beating the
+24-line/1-hunk forecast — fixing the Rule-#2 twin was worth ~22 extra diff lines
+here, not merely hygiene.
+
+### 31.5 Worth carrying
+
+**Re-verify a carried ranking's *cause*, not just its reachability.** The census
+correctly measured that these hunks were open; its attributed root cause was
+stale by two commits. A ~20-minute read-only research pass reclassified the bug
+from "executor catalog-sync" to "parser discard" before any code was written.
+On a diff being ground down slice-by-slice, carried causal attributions decay
+faster than carried line counts.
+
+### 31.6 Carried out of this slice (ledgered)
+
+- Inline `CONSTRAINT … PRIMARY KEY (b)` **at CREATE TABLE time** sets
+  `col.NotNull` and the footer but leaves `\d+`'s `Nullable` blank — the same
+  heap-resync class fixed for `ALTER TABLE ADD CONSTRAINT` in M0134-0005o, never
+  applied to CREATE TABLE's own inline-PK path. 2 of the remaining 26 hunks.
+- `adoptExistingIndexAsConstraint` omits PG's "cannot use a deferrable index"
+  rejection (`parse_utilcmd.c:2486-2492`): unreachable in goopg's model because
+  the already-associated-with-a-constraint check fires first. Documented in-code.
+
+## 32. M0134-0005y — `CREATE TABLE` never re-synced the catalog heap after its constraint arms flipped NOT NULL (LANDED 2026-08-19)
+
+### Symptom
+
+`constraints.sql` fixture (`postgres/src/test/regress/sql/constraints.sql:744-748`):
+
+```sql
+CREATE TABLE cnn_pk (a int, b int, CONSTRAINT cnn_primarykey PRIMARY KEY (b));
+CREATE TABLE cnn_pk_child () INHERITS (cnn_pk);
+```
+
+`\d+ cnn_pk` printed `b | integer | | |` where PG prints
+`b | integer | | not null |` — for both the parent and the inherited child —
+even though the `Not-null constraints:` footer of the same `\d+` output was
+byte-identical to PG's. Two hunks of the `constraints.sql` diff.
+
+### Root cause
+
+`execCreateTable` (`internal/executor/operators_ddl.go`) calls
+`syncTableToCatalogHeap` **exactly once**, immediately after `CreateTable` /
+`DDLUndoEntry` recording — and *before* every constraint-processing arm. Four
+later blocks mutate NOT-NULL state and none of them reached the heap:
+
+1. named table-level `CONSTRAINT … PRIMARY KEY (cols)` (`col.NotNull = true`)
+2. anonymous table-level / `LIKE … INCLUDING`-folded PK, shared `pkCols` block
+3. `s.TableNotNullCols` table-level NOT NULL merge
+4. the INHERITS / `LIKE` NOT-NULL merge (`tbl.AddNotNull`) — this is why the
+   inherited child was wrong too
+
+pg_class is a virtual catalog but **pg_attribute is heap-backed**, and `\d+` /
+pg_dump read the heap. An in-memory `col.NotNull` flip after the sync is
+therefore invisible to them, while the footer — which renders from the live
+`catalog.Table` — stays correct. That asymmetry is the whole bug, and it is the
+same class M0134-0005o (§22) fixed on the `ALTER TABLE ADD CONSTRAINT` path but
+never applied to CREATE TABLE's own arm.
+
+PG has no equivalent staging problem: `heap_create_with_catalog`
+(`postgres/src/backend/catalog/heap.c`) writes pg_attribute from a tuple
+descriptor whose `attnotnull` bits are already final, so PG writes once.
+
+### Fix
+
+A `notNullHeapDirty bool` local, set at all four mutation sites (Rule #2 — a
+green test on one arm proves nothing about the other three), and a
+delete-old-then-resync at the end of `execCreateTable`, gated on
+`notNullHeapDirty && catalogHeapSyncAvailable(o.ctx)`:
+
+```
+MaterializeWriterXID → deleteCatalogRowsForOID (per DB, via tableCatalogDBOids)
+                     → syncTableToCatalogHeap
+```
+
+The **delete step is mandatory**, not defensive: `syncTableToCatalogHeap` is
+append-only (`writeHeapRowCanonical`), so a bare second sync would leave
+duplicate *live* pg_class/pg_attribute rows — a silent corruption that only
+surfaces later as doubled columns in `\d`/pg_dump. Guard tests assert each
+column appears exactly once on both the dirty and the clean path.
+
+The early sync is **not** moved: the constraint arms depend on catalog state
+(`namedPKCreated`, index lookups, inherited-parent columns) that does not exist
+at that point. `execCreatePartitionChild` applies its NOT NULL overrides
+*before* its own sync and needs no resync — the correct pattern where the
+ordering allows it; the in-code comment cites it for contrast.
+
+### Not a bug (checked)
+
+Inline **column-level** `b int PRIMARY KEY` does *not* reproduce: the parser
+(`internal/parser/ddl.go`) sets `col.NotNull = true` on the `ColumnDef` at parse
+time for both the bare and the named-constraint inline spellings, so it is
+already true before the early sync. The genuine twin of the named table-level
+form is the **anonymous** table-level `PRIMARY KEY (b)`, which is what the guard
+test covers.
+
+### Result
+
+`scripts/pg-regress-runner.sh constraints`: **555 lines / 26 hunks → 516 lines /
+23 hunks**. Five guard tests in `internal/testport/create_table_pk_notnull_test.go`
+(named PK, INHERITS child, anonymous table-level PK, no-duplicate-rows on the
+dirty path, no-duplicate-rows on the clean path), all FAIL-pre / PASS-post.
+
+---
+
+## 33. M0134-0005z — plain `INHERITS` never copied the parent's CHECK constraints, so they were never enforced (LANDED 2026-08-19)
+
+### Symptom
+
+Live repro (goopg on :5533 vs the PG 18.3 oracle), distilled from
+`postgres/src/test/regress/sql/constraints.sql:172-183`:
+
+```sql
+CREATE TABLE p1 (x int, CONSTRAINT p1_con CHECK (x >= 3 AND x < 8));
+CREATE TABLE c1 (cy int CHECK (cy > x)) INHERITS (p1);
+INSERT INTO c1 (x, cy) VALUES (1, 5);   -- x = 1 violates p1_con
+```
+
+goopg answered `INSERT 0 1` and persisted the row. PG raises
+`ERROR: new row for relation "insert_child" violates check constraint
+"insert_tbl_check"` (23514). This is a **silent data-integrity hole**, not a
+cosmetic `\d+` divergence: any CHECK a user declares on a parent is simply not
+enforced on any of its inheritance children.
+
+### Root cause — population, not enforcement
+
+Enforcement is already correct and fully data-driven. `checkConstraints`
+(`internal/executor/operators_fk.go:1700`) evaluates whatever is in
+`tbl.CheckConstraints` / `tbl.NamedChecks`, and already reports the *child's*
+relation name together with the inherited constraint's *original* name
+(`operators_fk.go:1781-1789`) — exactly PG's wording. Nothing on that side needed
+to change.
+
+The gap is that the list is never populated. `execCreateTable`'s `s.Inherits`
+loop (`internal/executor/operators_ddl.go:~1796-1865`) copies the parent's
+columns and threads NOT-NULL `NO INHERIT` suppression, but contained **zero walk
+over `parent.NamedChecks`**. The helper it needed already existed —
+`catalog.Table.AddCheckInherited` (`internal/catalog/catalog.go:304-309`) sets
+`IsLocal:false, InhCount:1`, the correct PG bookkeeping — and was called from
+only two places: `execCreatePartitionChild` (`operators_ddl.go:4911`, the
+`PARTITION OF` path, which has always been correct and served as the template)
+and the `ALTER TABLE … ADD CONSTRAINT CHECK` cascade to *partition* children
+(`operators_ddl.go:8391`). Plain table inheritance was never wired.
+
+PG does this in `MergeAttributes`
+(`postgres/src/backend/commands/tablecmds.c`), which folds each parent's
+constraint expressions into the child's constraint list at DefineRelation time;
+enforcement is then `ExecConstraints` / `ExecRelCheck`
+(`postgres/src/backend/executor/execMain.c`) reading the child's own
+constraint descriptor. goopg's architecture matches — it just skipped the fold.
+
+### Second, inseparable bug — column-level CHECK auto-naming
+
+Landing the fold alone still left the diff red on constraint *names*.
+`operators_ddl.go:3846-3850` named a column-level CHECK
+`<tbl>_<col>_check` using the column the clause is syntactically *attached to*.
+PG counts the **distinct columns referenced by the expression**
+(`postgres/src/backend/catalog/heap.c:2546-2582` — `pull_var_clause` +
+`list_union`, then `ChooseConstraintName`): exactly one referenced column gives
+`<tbl>_<col>_check`, anything else gives `<tbl>_check`. So `CHECK (cy > x)`
+declared on column `cy` is `insert_child_check` in PG, not
+`insert_child_cy_check`.
+
+goopg already had the right algorithm — `autoCheckName`
+(`operators_ddl.go:4251-4273`, using `collectCheckExprColumns` and
+`checkNameTaken` for collision suffixing) — it was simply not called from the
+column-level branch. The fix is a one-line swap. The two sub-bugs share their
+fixtures, so they landed as one slice: either alone leaves the regress diff red.
+
+### Two latent flags the fold exposed
+
+Both were unobservable before this change, because nothing had ever inherited a
+CHECK. They are documented here because each would otherwise have shipped as a
+new bug introduced *by* the fix:
+
+1. **`CHECK (…) NO INHERIT` was parsed but never persisted.** The parser set
+   `c.CheckNoInherit`, but the column-level `AddCheckFull` call passed a
+   hardcoded `false`. With the fold in place, ATACC1's inline `NO INHERIT` check
+   would have been wrongly propagated to ATACC2. Fixed by threading
+   `c.CheckNoInherit` through. (The new loop skips `NoInherit` entries — this is
+   what makes that skip meaningful.)
+2. **`AddCheckInherited` does not carry `NotEnforced`.** `INSERT_TBL`'s
+   `NE_INSERT_TBL_CON … NOT ENFORCED` was being inherited as *enforced*, breaking
+   a statement that previously passed in the same fixture. Fixed by stamping
+   `NotEnforced` on the copied entry after the call, rather than changing
+   `AddCheckInherited`'s signature — its other two call sites are out of this
+   slice's scope. See the ledger for the resulting gap on those sites.
+
+### Scope boundary (deliberately untouched)
+
+- `ALTER TABLE child INHERIT parent` (`operators_ddl.go:~7426-7458` and its twin
+  near `:7736`) calls `mergeNotNullOnAttach` but has **no CHECK-merge
+  equivalent** — the same bug class on the deferred-attach path.
+- `ALTER TABLE … ADD CONSTRAINT CHECK` cascades to `PartitionChildren` only
+  (`operators_ddl.go:8376-8394`), never to `InheritanceChildren`
+  (`internal/catalog/catalog.go:4489` vs `:4510`).
+- Parent `CHECK … NOT VALID` is not propagated by the new loop.
+- `SYS_COL_CHECK_TBL` (system-column `tableoid`/`ctid` references inside CHECK)
+  shares the two affected hunks but is an unrelated bug, which is why those hunks
+  shrink without fully clearing.
+- The `pg_get_partition_constraintdef` missing-builtin gap is introspection, not
+  enforcement.
+
+All five are ledgered; none has current `constraints.sql` fixture reachability
+except `SYS_COL_CHECK_TBL`.
+
+### Result
+
+`scripts/pg-regress-runner.sh constraints`: **516 lines / 23 hunks → 465 lines /
+22 hunks** (−51). Five guard tests in
+`internal/testport/create_table_inherits_check_test.go`: inherited CHECK enforced
+on child INSERT, `NO INHERIT` not propagated, two-parent dedup yields one
+constraint, single-column-reference auto-name, multi-column-reference auto-name.
+Three FAIL-pre / PASS-post; the two auto-name/NO-INHERIT guards that already
+passed pre-fix are recorded as such rather than credited to this slice.
+
+## 34. M0134-0005aa — a CHECK on `tableoid` was never enforced, and a CHECK on any other system column was never rejected (LANDED 2026-08-19)
+
+Selected from a fresh census at HEAD (`tmp/ralph-handoffs/m0134-0005aa-census/`),
+which re-confirmed the **465 lines / 22 hunks** baseline — 0005y and 0005z moved
+neither number, so the ranking was made on causes, not on a stale map.
+
+Upstream this is **one rule** (`postgres/src/backend/parser/parse_relation.c:707-713`,
+`scanNSItemForColumn`): inside `EXPR_KIND_CHECK_CONSTRAINT`, no system column is
+allowed **except** `tableoid`, and a violation is `ERRCODE_INVALID_COLUMN_REFERENCE`
+(42703) with `parser_errposition`. goopg got both halves of that rule wrong, in two
+different files, in opposite directions.
+
+### 34.1 The `tableoid` half was a SILENT INTEGRITY GAP
+
+`checkConstraints` (`internal/executor/operators_fk.go:1700`) — the single runtime
+fan-in for INSERT/COPY/UPDATE — evaluates each CHECK by re-planning it against a
+synthetic `SELECT (expr) FROM (VALUES (…)) AS _chk(<the table's real columns>)`.
+`tableoid` is not a real column, so `optimizer.Plan` failed — and the failure hit
+`if err != nil { continue }`, which **skipped the constraint and passed the row**.
+goopg therefore accepted a row PG rejects with 23514, the same class as 0005e /
+0005h / 0005z.
+
+Fix: bind `tableoid` as an extra synthetic column carrying `<tbl.OID>::oid`.
+
+### 34.2 The durable half — the `continue`s themselves were the bug
+
+Binding `tableoid` fixes *one* cause of an unevaluable CHECK. The design decision
+that matters is that **every** parse/plan/build/open/next failure in that loop now
+returns an `XX000` naming the constraint, the relation and the failing stage,
+instead of silently passing the row. Only the three legitimate no-ops remain
+`continue`: an empty expression, a `NOT ENFORCED` constraint (§ bucket 2), and a
+NULL result (SQL NULL is not a violation). Without this, the next expression form
+goopg cannot plan would have been just as silently unenforced, and equally
+invisible to the regress diff.
+
+### 34.3 The `ctid` half — a missing DDL gate
+
+`validateCheckExprSystemColumns` (`internal/executor/operators_ddl.go`) reuses the
+existing `collectCheckExprColumns` walker (which already lower-cases names, so
+`CTID` is caught too) and rejects `ctid`/`xmin`/`xmax`/`cmin`/`cmax` with PG's exact
+message and SQLSTATE. It is wired into **both** sites — `execCreateTable` and
+`ALTER TABLE … ADD CONSTRAINT … CHECK` — a Rule-#2 sibling pair.
+
+The gate runs **before** `Catalog.CreateTable`, not after the brief's literal call
+sites, so a rejected CHECK never leaves a half-created relation behind. A
+malformed expression is passed through untouched for the existing planner-time
+error path to report, rather than being masked by this gate.
+
+### 34.4 Two things this slice deliberately did NOT do
+
+- **No cursor position.** PG *does* set one here (the expected output shows
+  `LINE 3:` and a caret), so this is a real remaining divergence — but goopg's
+  parser stores a CHECK body as a token-rejoined string with no source offset on
+  `CheckExpr`/`TableChecks`/`TableNamedChecks`. The error carries `Pos: 0` rather
+  than an invented position; inventing one is the exact defect 0005u and 0005w
+  had to clean up. Ledgered.
+- **Generated columns are the same upstream rule** (`EXPR_KIND_GENERATED_COLUMN`,
+  same function, lines 715-724, different message) and goopg has **no DDL-time
+  validation of generated-column expressions at all** — not merely a missing
+  system-column gate. Separate path, separate slice. Ledgered.
+
+### 34.5 Measurement
+
+`GOOPG_CG_UNIT=m0134-0005aa-impl scripts/pg-regress-runner.sh --verbose constraints`:
+**465 → 460 lines**, hunks **22 → 23**. Both target divergences are gone (the
+23514 hunk and the `ctid` ERROR line now match byte-for-byte); the hunk rise is
+unified-diff context splitting around the shrunk region, not new divergence — the
+recurring "unmasking" signature already recorded in §§ 1, 3, 6.
+
+Guards (`internal/executor/operators_fk_syscol_check_test.go`, all FAIL-pre /
+PASS-post): `TestCheckConstraintTableoidEnforcedOnInsert`,
+`TestCheckConstraintSystemColumnRejectedAtCreateTable`,
+`TestCheckConstraintSystemColumnRejectedAtAlterTable`, and
+`TestCheckConstraintTableoidAcceptedAtAlterTable` — the last one guarding against
+**over**-rejection, since the whole point of the rule is that `tableoid` stays legal.
+
+## 35. M0134-0005ab — plain `INHERITS` never merged a redeclared column, so it silently created the column TWICE (LANDED 2026-08-19)
+
+Selected from the 0005aa census as the largest remaining cluster (4 of 23 hunks).
+Measured **460 lines / 23 hunks → 406 lines / 21 hunks**.
+
+### 35.1 One root cause, three symptoms
+
+PG collects a new table's columns in two ordered passes (`MergeAttributes`,
+`postgres/src/backend/commands/tablecmds.c`): first the `INHERITS` parent scan,
+then a separate loop over the child's own declared columns. When a child-declared
+column collides by name with one already collected from a parent,
+`MergeChildAttribute` (`tablecmds.c:3259`) **merges into the existing entry** and
+emits `NOTICE: merging column "%s" with inherited definition`. The sibling
+`MergeInheritedAttribute` (`tablecmds.c:3430`) does the same across parents with
+`merging multiple inherited definitions of column "%s"` (N parents sharing a
+column ⇒ N−1 notices). `transformTableLikeClause`
+(`postgres/src/backend/parser/parse_utilcmd.c`) emits **none** of these — LIKE
+columns are simply more entries the same merge logic sees, which is why one
+shared code path is the faithful shape.
+
+goopg had implemented that merge **only inside the `@@LIKE:` branch** of
+`execCreateTable` (`internal/executor/operators_ddl.go`). The plain
+explicit-column path — the `addCol` closure — never consulted
+`inheritedColNames` and unconditionally appended, and nothing between there and
+`catalog.InMemory.CreateTable` de-duplicates. This is a textbook instance of
+Hard-won Rule #2: two siblings of one rule, one of them silently unimplemented.
+
+Three diff symptoms, all downstream of that single append:
+
+1. **Missing NOTICE.** `CREATE TABLE c (a int) INHERITS (p)` emitted nothing.
+2. **A genuinely duplicated column.** Verified live before the fix: `c (a int, b
+   int) INHERITS (p)` produced **four** `pg_attribute` rows, not two.
+3. **A DOUBLE "merging multiple inherited definitions" NOTICE** on a 3-level
+   chain (`notnull_inhparent`/`notnull_inhchild`/`notnull_inhgrand`). The
+   multi-parent site was *not itself* buggy — it faithfully fires once per
+   colliding parent — but it iterated a middle table whose own `Columns` slice
+   already carried `i` twice from symptom 2. Fixing `addCol` made it correct with
+   **zero changes to that site**, which is why the brief forbade touching it in
+   the first round.
+
+### 35.2 The merge needs a provenance signal `col.Inherited` cannot carry
+
+Satisfying PG's constraint identity for a merged column (`conname` from the
+parent, `conislocal=false`, `coninhcount=1`) exposed a second gap. The
+NOT-NULL locality branch keyed off `col.Inherited`, which is false whenever the
+child textually redeclares a column — so it could not tell apart:
+
+- `child (a int) INHERITS (p)` — retype only ⇒ **merge**, keep the parent's
+  constraint name, `conislocal=false`; from
+- `child2_t (id integer NOT NULL, …) INHERITS (parent_t)` — the child wrote
+  `NOT NULL` itself ⇒ the constraint stays **local** with the child's own name.
+
+Both redeclare; only the second is local. The distinguishing fact is whether the
+child's `ColumnDef` carried an explicit `NOT NULL` token, which the parse already
+records as `NotNullExplicit`. Threading that through as an `explicitNotNullLocal`
+signal is what makes both cases correct simultaneously. The pre-existing
+`child2_t` assertion was kept untouched **as the over-merge guard** — a fix that
+made the new case pass by relaxing that test would have traded one wrong answer
+for another.
+
+### 35.3 Shape of the fix
+
+A single shared helper (`mergeExplicitColumnIntoInherited`) now owns the whole
+rule — collision lookup, the 42701 "specified more than once" error for a
+non-inherited collision, the storage/type-conflict checks, the NOT-NULL OR-in,
+and the NOTICE — and **both** the `addCol` path and the `@@LIKE:` branch call it.
+The LIKE branch's bespoke inline copy was deleted rather than left in place, so
+the two siblings cannot drift apart again.
+
+Guards (FAIL-pre / PASS-post), in
+`internal/executor/operators_ddl_named_check_test.go`:
+`TestInheritsMergesRedeclaredColumnCount` (the duplicate-column half — the
+symptom that was invisible in the diff text),
+`TestInheritsThreeLevelChainMergeNoticeFiresOnce` (the double emission), and
+`TestInheritsRedeclaredColumnKeepsInheritedNotNullIdentity` (constraint
+identity), alongside the retained `child2_t` over-merge guard.
+
+### 35.4 Deferred (ledgered 2026-08-19)
+
+`ALTER TABLE parent ALTER col SET NOT NULL` does not propagate
+`convalidated=true` down to an already-merged NOT NULL constraint on an INHERITS
+descendant — `notnull_inhchild`/`notnull_inhgrand` keep `convalidated=f`. That is
+a cascade-validation gap in the ALTER path, structurally separate from this
+slice's CREATE-time merge, and it survives into the remaining 21 hunks.
+
+## 36. M0134-0005ac — the NOT-NULL / PK verification scan did not cover the rows it must (LANDED 2026-08-19)
+
+Baseline entering this slice: **406 lines / 21 hunks** (measured at `3083cd1c`;
+never compare to a pre-2026-08-19 number). A fresh census attributed all 21 hunks
+to 12 buckets; four of those hunks — 13, 17, 18a, 18b — turned out to share one
+root cause, stated at the level that makes it one bug rather than four:
+
+> goopg's existing-row verification for NOT NULL / PRIMARY KEY either never ran,
+> or ran against storage that is empty by construction.
+
+### 36.1 Failure mode B — the scan never ran
+
+`ALTER TABLE … VALIDATE CONSTRAINT <notnull>` simply set `NotValid = false`. It
+was guarded by an in-code comment asserting that PG never scans for
+`CONSTR_NOTNULL`. That comment is **wrong**, and it is wrong in an instructive
+way: it conflates two distinct PG sites.
+
+- `postgres/src/backend/commands/tablecmds.c:9956` — `CONSTR_NOTNULL` **is**
+  excluded from the generic Phase-3 queue, but that is the *ADD*-constraint path.
+- `postgres/src/backend/commands/tablecmds.c:13291-13295` — `ATExecValidateConstraint`'s
+  notnull branch **independently** sets `tab->verify_new_notnull = true`, which
+  does trigger a full-relation scan.
+
+Reading only the first site and generalising produced a comment that then
+protected the bug from review for as long as it stood. The lesson generalises
+beyond this slice: an exclusion in one PG code path is not a statement about the
+feature.
+
+### 36.2 Failure mode C — the scan read storage that cannot hold rows
+
+`forEachLiveRow` scanned exactly `o.ctx.Catalog.RelFileNode(tbl)` — the target's
+own heap. A **partitioned parent has no own storage**, so `SET NOT NULL` and
+`ADD PRIMARY KEY` on such a parent iterated zero rows and reported success over
+NULL-bearing partitions. The scan was not broken in any way a unit test on a
+plain table could observe; it was correct code applied to the wrong extent.
+
+### 36.3 The fix
+
+`forEachLiveRow` now recurses the partition/inheritance tree using the
+`allDescendants` + `snapDetachEpoch` helpers that `validateFKConstraintExistingRows`
+already relied on — i.e. the recursion machinery existed and this caller had
+simply never been wired to it. The per-relation work moved to a new
+`forEachLiveRowRel(targetTbl, leafTbl, fn)`, which scans the leaf's heap, decodes
+with the **leaf's** `Columns`, and remaps the row **by name** into a buffer shaped
+like `targetTbl.Columns`. The by-name remap is not defensive padding: a partition's
+physical column order may legitimately differ from its parent's, and
+`validateFKConstraintExistingRowsRel` already resolves columns this way.
+
+The VALIDATE branch gained a real 23502 scan, gated on `NotValid` so that
+re-validating an already-valid constraint stays a no-op — mirroring the FK and
+CHECK branches immediately above it in the same function.
+
+### 36.4 The signature change the oracle forced
+
+The callback became `func(row Row, relName string) error` at all five call sites.
+PG's phase-3 error names the relation that actually **holds** the violating row,
+not the relation named in the `ALTER TABLE`: `constraints.out:1254` says
+`cnn_part1` (not `cnn2_parted`) and `:1561` says `notnull_tbl1_3` (not
+`notnull_tbl1`). The first implementation pass named the ALTER target and the
+regress runner caught it — the recursion is only half the fidelity, error
+attribution is the other half.
+
+### 36.5 Sibling audit (Hard-won Rule #2)
+
+All five `forEachLiveRow` callers were checked against PG before the helper's
+default behaviour was changed:
+
+| caller | PG behaviour | verdict |
+|---|---|---|
+| `SET NOT NULL` | recurses the tree | correct, no caller edit needed |
+| `ADD NOT NULL` | recurses the tree | correct, no caller edit needed |
+| `ADD PRIMARY KEY` | recurses the tree | correct, no caller edit needed |
+| VALIDATE CONSTRAINT (new) | targets exactly the named relation | correct — non-recursive in PG too, and the named relation is the scan root |
+| `validateCheckConstraintRows` | PG cascades CHECK to partitions and scans the tree | now **more** PG-correct, but inert (see 36.6) |
+
+### 36.6 Deferred (ledgered 2026-08-19)
+
+`ALTER TABLE <partitioned parent> ADD CHECK …` does not cascade the CHECK
+constraint's **registration** to partitions, where PG's `ATAddCheckNNConstraint`
+creates a `pg_constraint` row on every descendant. After this slice the *scan*
+half is correct while the *registration* half is not, so the two are out of step;
+nothing observable flips until registration lands, because no `constraints.sql`
+case inserts into a partition after a parent-level ADD CHECK.
+
+### 36.7 Result, and the one new `@@` header
+
+Measured **406 → 381 lines, 21 → 19 hunks**. Hunks 13, 17, 18a and 18b closed.
+One new `@@` header appeared, and it is an **unmasking, not a regression**:
+`VALIDATE CONSTRAINT nn3` on a partition used to succeed silently, and that
+accidental success happened to leave `nn3` in exactly the state PG's real cascade
+produces. Now that the statement correctly ERRORs, the already-ledgered
+`SET NOT NULL` descendant-`convalidated` cascade gap (§35.4) becomes visible at a
+second point in the script. Worth carrying forward: **a bug that is fixed can
+reveal a second bug it was compensating for**, and the hunk count is the honest
+metric there, not the `@@` count.
+
+Guards (FAIL-pre / PASS-post) in
+`internal/executor/operators_ddl_notnull_partition_scan_test.go`:
+`TestAlterTableValidateConstraintNotNullScansExistingRows`,
+`TestAlterTableValidateConstraintNotNullOnPartitionScans`,
+`TestAlterTableSetNotNullOnPartitionedParentScansPartitions`,
+`TestAlterTableAddPrimaryKeyOnPartitionedParentScansPartitions`, plus the
+over-fix guard `TestAlterTableSetNotNullAndValidateStillSucceedWithoutNulls`
+(a plain table with no NULLs must still succeed).
+
+---
+
+## 37. M0134-0005ad — two NOT-NULL constraint checks that the *direct* path performed and the *derived* path skipped (LANDED 2026-08-19)
+
+Bucket E of the 19-hunk census. Two hunks, two insertion points, one shared
+shape: **goopg had the correct check, and simply did not run it on the second
+code path that reaches the same state.** This is Hard-won Rule #2 (sibling paths
+must change together) in its least obvious form — the twins here are not
+encode/decode or fast-path/interpreted, but *direct target* vs *recursion
+target*, and *first column* vs *later column of the same statement*.
+
+### 37.1 E1 — the NO-INHERIT mismatch check ran once, but PG runs it per level
+
+`ALTER TABLE … ADD CONSTRAINT nn NOT NULL a` on a parent whose child already
+holds a **NO INHERIT** not-null constraint on `a` must be rejected with 55000.
+goopg's `AlterTableAddNotNull` (`internal/executor/operators_ddl.go:10345-10378`)
+already raised exactly that error — but only for the relation named in the
+`ALTER`. The cascade helper `cascadeNotNullToChildrenAt` (~:11793) then walked
+into each child and, on finding a same-column constraint, blindly did
+`InhCount++` with no re-check.
+
+PG has no such asymmetry because the check is *inside the recursion*:
+`ATAddCheckNNConstraint` recurses over the inheritance children
+(`postgres/src/backend/commands/tablecmds.c:10012-10043`) and every level lands
+in `AddRelationNewConstraints`' `CONSTR_NOTNULL` branch
+(`catalog/heap.c:2609-2662`) → `AdjustNotNullInheritance`
+(`catalog/pg_constraint.c:741-767`). Each level therefore re-validates against
+*that* level's own constraint.
+
+The fix re-runs the mismatch test on the recursion target before the
+`InhCount++`, reusing the message/HINT literal from the direct-target site, but
+naming **`child`**. That relation-naming detail is the same one §36.4 forced:
+PG's error names the relation that actually holds the conflicting object, not
+the ALTER target.
+
+The hunk carried a second `+ERROR` line ("cannot drop inherited constraint")
+further down the script. It needed no separate fix — it was a **downstream
+consequence of the false merge**: the bogus `InhCount++` made a local
+constraint look inherited, so the later `DROP CONSTRAINT` was wrongly refused.
+One cause, two visible errors.
+
+### 37.2 E2 — a duplicate constraint name within a single `CREATE TABLE`
+
+Two columns of one `CREATE TABLE` naming the same NOT NULL constraint must give
+42710. PG gets this for free because `AddRelationNewConstraints` runs
+`ConstraintNameIsUsed` (`pg_constraint.c:412`) per constraint against the
+catalog rows written by the *preceding* constraints of the same statement.
+goopg's `execCreateTable` per-column loop (~:4200) took the explicit name
+unconditionally. The fix calls the existing `fkConstraintNameInUse` helper
+(:7814-7836 — misleadingly named; it already scans FKs, CHECKs, indexes and
+not-nulls) and raises PG's literal.
+
+### 37.3 The non-transactional-DDL trap this exposed
+
+The obvious one-line fix produced a **new** diff line rather than closing the
+hunk. `execCreateTable` calls `Catalog.CreateTable` *before* processing column
+constraints, and that registration is not transactional — so rejecting the
+statement left a phantom relation behind, and the script's next
+`CREATE TABLE notnull_tbl2 (…)` then failed with a spurious 42P07.
+
+PG never has this problem: `heap_create_with_catalog` also runs before
+`AddRelationNewConstraints`, but the whole utility statement is inside one
+transaction that the `ereport` aborts. goopg's DDL has no such rollback, so the
+error path must undo the registration explicitly
+(`_ = o.ctx.Catalog.DropTable(...)`, the same compensating-drop idiom already
+used at :1712 and :18920).
+
+**Generalisation worth carrying:** every error return in `execCreateTable`
+positioned *after* `Catalog.CreateTable` leaks a phantom relation unless it
+compensates. This slice fixed the one path a regress case exercises; the class
+is ledgered (§37.5).
+
+### 37.4 Measurement
+
+**381 → 360 lines, 19 → 18 hunks.** Both bucket-E hunks closed, no new `@@`
+header, nothing unmasked. Baseline is HEAD `dceb22df` — never compare against a
+pre-2026-08-19 number.
+
+Guards (FAIL-pre / PASS-post, both verified by stashing the fix) in
+`internal/executor/operators_ddl_notnull_cascade_dup_test.go`:
+`TestAlterTableAddNotNullCascadeNoInheritMismatchRejected` and
+`TestCreateTableDuplicateExplicitNotNullNameRejected`.
+
+### 37.5 Deferred (ledgered 2026-08-19)
+
+- `CREATE TABLE … INHERITS (…)`'s merge path (`mergeNotNullEntries`) has the
+  same missing NO-INHERIT mismatch check as E1, at CREATE time instead of ALTER
+  time. No regress case exercises it, so it is inert today and nothing flips
+  when it lands.
+- The phantom-relation class of §37.3: the remaining post-`CreateTable` error
+  returns in `execCreateTable` still leave a registered relation behind. The
+  durable fix is transactional DDL, not more compensating drops.
+
+## 38. M0134-0005af — the two *located* exclusion-constraint gaps: a build that never scanned, and an arbiter check that never asked (LANDED 2026-08-19)
+
+Bucket F of the census, re-pinned at the **322 lines / 16 hunks** baseline left
+by 0005ae (`tmp/ralph-handoffs/m0134-0005af-research/report.md`). The bucket
+holds three sub-items; this slice took the two whose code sites are exactly
+located and low-risk. **F7 is deliberately out** — see §38.4.
+
+### 38.1 F9 — `ALTER TABLE … ADD EXCLUDE (col WITH =)` accepted conflicting rows
+
+A **silent integrity gap**, the same class as §34/§36: the statement succeeded
+over data that violates the constraint it just created.
+
+goopg implements a btree-equality exclusion constraint by building a real btree
+so `checkExclusionConstraintsForInsert` can probe it later
+(`internal/executor/operators_ddl.go`, `execAlterTableAddExclude`). That call
+hardcoded `unique=false` — and `unique` was the **only** gate on the duplicate
+scan in `collectBTreeEntries`, the sole place in the whole build path that ever
+looks at existing rows. So the ALTER built its index and validated nothing.
+
+The naive fix (flip `unique` to `true`) is wrong twice over: `idx.Unique` is read
+elsewhere and an exclusion constraint is not a unique constraint, and the
+CREATE-TABLE-time `EXCLUDE (col WITH =)` branch passes the identical `unique=false`
+— flipping only the ALTER site would leave the two paths building
+catalog-divergent indexes for one constraint shape (Hard-won Rule #2 in its
+"two producers of one artifact" form). The landed fix therefore **decouples the
+two meanings**: a new `CheckDup` field on the existing variadic
+`btreeIndexProps` drives the duplicate scan, `unique` still solely drives
+`idx.Unique`, and both call sites pass the same props. Existing callers are
+byte-identical (`checkDup = unique`).
+
+Two further fields, `IsExclusion`/`ExclusionOp`, had to move onto the same props
+struct for an ordering reason worth recording: `execAlterTableAddExclude`
+already set `idx.IsExclusion` — but *after* `LookupIndex`, i.e. after the build
+had already run and already had to choose its error shape. The flag must be set
+**before** `bulkBuildBTreeFull`, not after.
+
+PG oracle: `postgres/src/backend/executor/execIndexing.c:893-918`,
+`check_exclusion_or_unique_constraint`. One function backs both INSERT-time and
+build-time checking; its `newIndex` branch raises `ERRCODE_EXCLUSION_VIOLATION`
+(**23P01**) `could not create exclusion constraint "%s"` with a **two-sided**
+detail `Key %s conflicts with key %s.` — unlike the unique-index path's
+one-sided `Key %s is duplicated.` (23505). goopg's duplicate block now branches
+on `idx.IsExclusion` to pick the shape; the 23505 branch is untouched.
+
+### 38.2 F8 — every exclusion constraint was rejected as an ON CONFLICT arbiter
+
+`INSERT … ON CONFLICT ON CONSTRAINT <excl> DO NOTHING` returned
+`42P10 constraint "…" is not a unique constraint`. Two sibling sites gated
+arbiter validity on `idx.Unique` alone — `analyzeOnConflict`
+(`internal/parser/analyzer/analyzer.go`) and its self-described defensive
+re-check `resolveArbiterIndex` (`internal/optimizer/planner.go`). Since
+`idx.Unique` is false for *every* exclusion constraint, goopg rejected them all,
+deferred or not — a broader bug than the regress case exposes.
+
+PG (`execIndexing.c:592-610`, `ExecCheckIndexConstraints`) does two distinct
+things goopg conflated into one:
+
+```c
+if (!indexInfo->ii_Unique && !indexInfo->ii_ExclusionOps)
+    continue;                       /* not an arbiter candidate at all */
+...
+if (!indexRelation->rd_index->indimmediate)
+    ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+        errmsg("ON CONFLICT does not support deferrable unique constraints/"
+               "exclusion constraints as arbiters"), ...));
+```
+
+So an exclusion constraint **is** a legal arbiter; what disqualifies it is
+deferredness. Both goopg sites now read
+`if !idx.Unique && !idx.IsExclusion` (unchanged 42P10) followed by a new
+`if idx.InitiallyDeferred` → **55000** with PG's exact message.
+
+The gate is `InitiallyDeferred`, **not** `Deferrable`: PG keys on
+`indimmediate`, which is false only for `INITIALLY DEFERRED`. A plain
+`DEFERRABLE` constraint has `indimmediate = true` and is a valid arbiter.
+
+One diagnostic-shape note: this error carries `Pos: 0`. PG raises it at
+execution time from `execIndexing.c` with no `errposition()`, so the expected
+output has no `LINE N:` — goopg front-loads the check to analyze time (the
+property is catalog-static and cannot change per statement) but must not
+front-load a cursor position with it.
+
+### 38.3 Measurement
+
+`constraints` **322 → 294 lines, 16 → 14 hunks**; both targeted hunks closed and
+the `deferred_excl` block is now byte-identical to PG. **No new `@@` header** —
+so unlike §34/§36 this slice unmasked nothing downstream. Guards, all
+FAIL-pre/PASS-post verified in both directions:
+`TestAlterTableAddExcludeRejectsExistingConflict`,
+`TestAlterTableAddExcludeSucceedsOverCleanData` (the over-rejection guard —
+clean data must still succeed), `TestAnalyzeOnConflict{AcceptsExclusionConstraintArbiter,
+RejectsDeferrableExclusionArbiter,RejectsDeferrableUniqueArbiter}`,
+`TestResolveArbiterIndex{AcceptsExclusionConstraintArbiter,RejectsDeferrableExclusionArbiter}`.
+
+The planner guards call `resolveArbiterIndex` directly rather than through
+`Plan()`, because `Plan()` runs `analyzer.Analyze` first and the analyzer's own
+check masks the planner's — a test-topology trap for whoever next touches
+either arbiter site.
+
+### 38.4 F7 stays open, and the census's framing of it was wrong
+
+The census recorded F7 as "missing default gist opclass for circle — catalog
+seed data, cascades hugely". It is not seed data: `gist/circle_ops` is already
+seeded correctly (`internal/initdb/initdb.go`, `pg_amproc_entries.go`,
+`pg_opfamily_bootstrap.go`). The real blocker is a **hardcoded box-only
+allow-list** in `createExclusionIndexStub`
+(`internal/executor/operators_ddl.go`) compounded by `checkGistOverlapExclusion`
+(`internal/executor/operators_storage.go`) supporting only single-column box
+overlap — no expression columns, no `WHERE` predicate. Closing F7 is a
+multi-piece feature (DDL opclass lookup + multi-column + expression-column +
+partial-predicate enforcement), and doing it **partially is worse than not at
+all**, because a half-implementation creates exclusion constraints that are
+catalogued but unenforced — precisely the silent-integrity class §38.1 just
+closed. It gets its own slice, ledgered.
+
+## 39. M0134-0005ah — one output the psql client asked to be *pretty*, and one catalog field `ONLY` was never allowed to touch (LANDED 2026-08-19)
+
+Two independent residues, both discovered while landing §0005ag's
+`pg_get_partition_constraintdef` and both ledgered under that task-id. Baseline
+at entry: `constraints` **290 diff lines / 15 hunks**; at exit **257 / 13**.
+Research: `tmp/ralph-handoffs/m0134-0005ah-research/report.md`.
+
+### 39.1 `pg_get_constraintdef(oid, pretty)` ignored its second argument
+
+goopg printed `CHECK ((a > 0))` where PG's `\d+` prints `CHECK (a > 0)`. The
+naive reading — "goopg emits one paren too many" — is **wrong**, and acting on
+it would have regressed `pg_dump`. PG emits *both* spellings, chosen by the
+caller:
+
+- `ruleutils.c:pg_oper_expr` (~:10735-10769) self-wraps every `OpExpr` in
+  parentheses **only when `!PRETTY_PAREN(context)`**.
+- psql `\d+` always calls the two-arg form with `pretty = true`
+  (`src/bin/psql/describe.c:2530`) — hence `CHECK (a > 0)`.
+- `pg_dump` calls the one-arg form / `false` (`pg_dump.c:7768`,
+  `ruleutils.c:2152`) — hence `CHECK ((a > 0))`, which is the form goopg was
+  already producing and must keep producing.
+
+goopg's `pg_get_constraintdef` dispatch arm (`internal/executor/expr.go`) never
+read argument 1 at all, so every consumer got the non-pretty spelling. Fix:
+thread `pretty` from the dispatch arm into `renderCheckPredicate` and
+`renderDomainCheckPredicate` (`internal/executor/operators_ddl.go`), which strip
+exactly one self-wrap layer for a **bare top-level binary comparison** when
+`pretty` is set. The shared `defaultExprToSQL` deparser is deliberately
+**untouched** — its other consumers (index predicates, column defaults,
+partition keys) are all non-pretty, so a change there would have been a silent
+cross-subsystem regression.
+
+The non-pretty assertions in `check_predicate_render_test.go` are the pg_dump
+regression guard and are as load-bearing as the new pretty ones.
+
+**Bounded deliberately:** compound (`AND`/`OR`) predicates under `pretty = true`
+keep their current shape. PG's pretty mode drops parens there too
+(`alter_table.out:3413`), but faithfully doing so needs real recursive
+pretty-mode support rather than a top-level strip. A test pins the current
+compound output so the boundary cannot move silently. Nothing in
+`constraints.sql` exercises it; ledgered.
+
+### 39.2 `ALTER TABLE ONLY … DROP` must still walk children
+
+goopg read "`ONLY` must not propagate" as "`ONLY` must not touch children at
+all". PG reads it as "do not recursively **DELETE** the child's constraint, but
+**do** fix up the child's inheritance bookkeeping": `dropconstraint_internal`
+(`postgres/src/backend/commands/tablecmds.c:14300-14343`) always walks
+`find_inheritance_children`, decrements each child's `coninhcount`, and flips
+`conislocal = true` on reaching zero; only the recursive DELETE is conditional.
+
+Skipping the walk leaves the child at `coninhcount > 0` with its parent's
+constraint gone — real `pg_constraint` state corruption. Its visible symptom is
+the one the ledger recorded from the other end: psql `\d+` printing a **spurious
+`(inherited)` tag**. Note the M0134-0005ag ledger row described this as goopg
+*omitting* the tag; that summary was inverted. It is one bug, previously
+ledgered as G4 under M0134-0005ae — not two.
+
+Three sites, one rule (Hard-won Rule #2 in its "direct target vs recursion
+target" form), all in `internal/executor/operators_ddl.go`:
+
+1. `execAlterTableDropConstraint`, CHECK branch — the `if isIM && !only` guard,
+   whose in-code comment was inverted relative to the oracle.
+2. `execAlterTableDropConstraint`, NOT-NULL-by-constraint-name branch — same
+   guard shape.
+3. `AlterTableDropNotNull` (the column-name path) — no cascade logic at all.
+
+All three now call new helpers `cascadeCheckDropToChildren` /
+`cascadeNotNullDropToChildren`, which mirror `dropconstraint_internal` and reuse
+the edge-keyed visited set + depth backstop of the ADD-direction twin
+`cascadeNotNullToChildrenAt` (diamond-inheritance safety) rather than
+introducing a second traversal. **The oracle's asymmetry is preserved verbatim,
+not tidied away:** the recurse branch deletes an orphan-to-be outright, while
+only the non-recurse (`ONLY`) branch sets `conislocal = true` on reaching zero.
+
+The pre-existing `TestC9DropConstraintOnlyDoesNotCascade` had pinned the *bug*
+(child untouched, `InhCount == 1`, no `conislocal` check). Its P1 assertion was
+corrected to the oracle's behaviour — row still present, `InhCount == 0`,
+`IsLocal == true`; P2 (recursive drop deletes the child's row) was already right
+and is unchanged. Correcting an assertion that encoded the inverted semantics is
+unavoidable when fixing that exact bug, and is recorded here rather than made
+silently.
+
+**Multi-level:** with a mid-level table whose own copy is itself inherited,
+`ALTER TABLE ONLY mid DROP CONSTRAINT` is **refused** with 42P16 — the
+"cannot drop inherited constraint" guard at the top of `dropconstraint_internal`
+fires on the target whenever `coninhcount > 0` and the call is not itself a
+recursive descent. That guard already existed and is unaffected by this change;
+the test pins the refusal rather than inventing an unverified multi-level
+cascade, because the upstream regress suite contains no multi-level `ONLY`-drop
+case to derive one from.
+
+## 40. M0134-0005ai — a statement shape that never parsed, and a blind fallback that reported success anyway (LANDED 2026-08-19)
+
+Baseline entering this slice: **257 lines / 13 hunks** (M0134-0005ah's exit).
+Exit: **230 / 12**. The closed hunk is the `constraint_comments` window —
+`COMMENT ON CONSTRAINT <name> ON DOMAIN <domain>`.
+
+### The failure was not where the symptom pointed
+
+The diff showed four `COMMENT ON CONSTRAINT … ON DOMAIN …` statements where PG
+raises four distinct errors (unknown constraint, unknown domain, and two
+non-owner rejections) and goopg printed a bare `COMMENT` tag for all four. The
+natural reading — "goopg's error messages for this case are wrong" — is wrong
+twice over:
+
+1. **The executor's `"constraint"` arm is never reached for this spelling.**
+   `parseCommentOnTail`'s `CONSTRAINT` branch (`internal/parser/parser.go:3118`)
+   handled only `… ON <table>`; it called `parseObjectName()` immediately after
+   the second `ON`, so for the DOMAIN spelling it consumed the bare ident
+   `domain` as the object name, left the cursor on the domain's actual name, and
+   the shared trailer at `:3389` failed with "expected IS after object name in
+   COMMENT ON". The statement **never parsed at all**.
+2. **The parse failure was then converted into a success.**
+   `dispatchSimpleQueryViaExecutor` falls through to `compatNoopCommandTag`
+   (`internal/postmaster/dispatch.go:1752-1779`), which pattern-matches the raw
+   SQL prefix `"comment on "` and writes `CommandComplete("COMMENT")` with zero
+   catalog access. Verified empirically against a live server: even
+   `COMMENT ON CONSTRAINT c ON DOMAIN 12345 !!! IS 'x'` returns `COMMENT`, and
+   `pg_description` gains no row.
+
+Consequence worth recording: the ONE line in this window that *matched* PG —
+the successful `COMMENT ON CONSTRAINT the_constraint ON DOMAIN … IS '…'` — was a
+**coincidence of identical wire text over completely different mechanisms**. A
+regression test asserting only on that line's success would have been a
+false-positive pin. This is the second time in this campaign that a matching
+output line concealed a missing mechanism (cf. §37).
+
+The doc comment at `dispatch.go:1800-1804` asserts the invariant this depends on
+— *"a lone instance of [GRANT/REVOKE/COMMENT ON/SECURITY LABEL] always parses
+successfully"* — and this statement shape falsified it.
+
+### What landed
+
+- **Parser** (`parser.go:3124`): after the second `ON`, an optional `domain`
+  ident-keyword sets `cs.ObjKind = "domain constraint"`, mirroring the top-level
+  `COMMENT ON DOMAIN` case at `:3256`.
+- **Executor** (`operators_ddl.go`, `execCommentOn`): a new
+  `case "domain constraint"` resolving the domain FIRST, then the constraint —
+  the order is PG's, not incidental: `get_object_address`'s `OBJECT_DOMCONSTRAINT`
+  arm (`postgres/src/backend/catalog/objectaddress.c:975-990`) resolves the type
+  before `get_domain_constraint_oid`, so a missing *domain* reports
+  `type … does not exist` (42704) rather than the constraint error. The
+  not-found message is PG's verbatim from
+  `postgres/src/backend/catalog/pg_constraint.c:1391` —
+  `constraint "%s" for domain %s does not exist`.
+- **Ownership check** — new machinery, not a tweak. Pre-slice,
+  `grep -rn "must be owner" internal/executor/*.go` returned **zero hits**:
+  goopg's `COMMENT ON` never performed an ownership check for *any* object kind.
+  PG's `comment.c:CommentObject` calls `check_object_ownership` unconditionally
+  before touching `pg_description`. Two helpers now exist
+  (`checkCommentObjectOwnerOID` for OID-valued owners such as a domain's
+  typowner, `checkCommentObjectOwner` for `catalog.Table.Owner`'s role-NAME
+  string), raising 42501 `must be owner of {relation,type} <name>` with a
+  superuser bypass. **Deliberately scoped to the two constraint arms**; every
+  other `COMMENT ON` kind is still ungated — ledgered.
+- The table-constraint arm was refactored from four early-returning match loops
+  to OID-first resolution so the ownership check sits between "address resolved"
+  and "pg_description mutated", which is exactly PG's ordering.
+
+### The fallback was probed and deliberately left in place
+
+Removing the `"comment on "` arm of `compatNoopCommandTag` reddens
+`TestExtendedProtocolCompatNoopCommentOnMalformed`
+(`internal/postmaster/dispatch_extended_ddl_test.go:365`), which pins a
+*different* deliberate invariant (M0097-0023): a truncated clause of a
+**supported** ObjKind is absorbed as a silent no-op. So the fallback is
+load-bearing for two distinct reasons — genuinely unimplemented ObjKinds
+(`parseCommentOnTail`'s bare `default:` covers AGGREGATE, LANGUAGE, ROLE,
+TABLESPACE, TEXT SEARCH …, none of them tested) and that malformed-clause
+absorption. Narrowing it is real design work, not a comment fix; `dispatch.go`
+carries **zero diff** from this slice and the stale doc comment is left in place
+so the ledger row, not a half-corrected comment, owns the discrepancy.
+
+Guards (`internal/executor/comment_on_domain_constraint_test.go`, all
+FAIL-pre/PASS-post): domain-spelling success, unknown constraint, unknown
+domain, non-owner rejection on both spellings, owner/superuser acceptance.
+
+## 41. M0134-0005aj — `ORDER BY …::regclass` sorted by the rendered NAME, because the cast stringified two layers earlier (LANDED 2026-08-19)
+
+`constraints.sql`'s `… ORDER BY conrelid::regclass` emitted rows in a different
+order than PG (hunk 12 of the 13-hunk census). The rows themselves were right;
+only their order was wrong.
+
+### Why the ordering was wrong
+
+PostgreSQL has **no comparison operators for `regclass` at all** — grepping
+`postgres/src/include/catalog/pg_operator.dat`, `pg_opclass.dat` and
+`pg_amop.dat` yields zero hits for all eleven reg* OID-alias types. What makes
+`ORDER BY <regclass>` work is `pg_cast.dat:182-185`: `regclass→oid` is an
+**IMPLICIT, BINARY-COERCIBLE** cast, so operator resolution falls straight
+through to `oid`'s own btree comparator, `btoidcmp`
+(`postgres/src/backend/access/nbtree/nbtcompare.c:441`) — an **unsigned OID**
+compare. PG therefore orders by OID and merely *renders* the name.
+
+goopg inverted that. `internal/executor/expr.go:806-845` — the `CastExpr` arm
+for `TargetType == "regclass"` with a `KindInt` source — eagerly renders the
+relation name (`NewStringDatum(tbl.Name)`, :830) at expression-evaluation time.
+By the time `sortOp.lessRows` (`internal/executor/operators.go`) reached
+`compareDatum` (`expr.go:2651`) it held two plain strings and did
+`strings.Compare`. No reg*-awareness existed anywhere in the comparator; the
+ordering bug is a *consequence* of a representation bug.
+
+### The representation bug is wider than the ordering bug — and was NOT fixed here
+
+The eager stringify is only reached from the `KindInt` source arm. A
+string-literal source (`'pg_class'::regclass`, `expr.go:846-865`) returns the
+resolved OID as `KindInt`, and real regclass-typed *columns*
+(`pg_class.reltoastrelid`, `pg_partition_tree()`) stay `KindInt` end-to-end.
+So goopg carries two disagreeing representations of the same type — the
+sibling-divergence class this project treats as law. Live probes against the
+PG 18.3 oracle confirmed it is already causing wrong ANSWERS, not just wrong
+order:
+
+| query | goopg | PG 18.3 |
+|---|---|---|
+| `SELECT oid::regclass = 1259 FROM pg_class WHERE relname='pg_class'` | `f` | `t` |
+| `SELECT oid::regclass = 'pg_class'::regclass FROM pg_class WHERE relname='pg_class'` | `f` | `t` |
+| `SELECT oid::regclass IN ('pg_class','pg_type') FROM …` | `t` | `t` (goopg agrees only by coincidence — see below) |
+
+**The root-cause fix was scoped out deliberately, and the reason is worth
+recording, because the obvious "just stop stringifying" one-liner is a trap.**
+Removing the eager render *without* also teaching the comparison path about
+reg* types does not half-fix the problem — it trades a broken shape for a
+different broken shape. `oid::regclass IN ('a_star','c_star')`
+(`src/test/regress/sql/create_misc.sql:250-251`) passes today only because
+goopg compares a name-string against name-literals and coincidentally agrees
+with PG, which actually resolves the IN-list through `select_common_type` +
+`regclassin`. Make the left side a `KindInt` OID and `compareEq`
+(`expr.go:8242`) formats it as a *decimal string*, compares it to `a_star`, and
+that currently-passing regress query goes red.
+
+Doing it properly requires a static type hint on the comparison IR
+(`optimizer.InExpr` and the bare-`=` node), because `Datum` carries a `Kind`
+and no type tag — reg*-ness is simply not recoverable inside `compareEq` /
+`promoteCrossKind`. That is 150-250+ lines across three packages and is
+ledgered as its own indivisible slice (three rows, 2026-08-19), together with
+an unaudited hash-keying risk (GROUP BY/DISTINCT/hash-join) and a missing
+`22P02` error parity on `x::regclass = '<literal>'` — a shape PG actually
+*rejects*, via `oidin`, not `regclassin`.
+
+### What landed
+
+A Sort-operator-local fix, `internal/executor/operators.go`:
+
+- `isRegSortFamilyTypeName` — the single membership test for the eleven reg*
+  types, carrying the oracle citations above and an explicit warning not to
+  reuse it for `=`/`IN`/hashing.
+- `evalSortKeyValue` — for a reg*-family `*optimizer.CastExpr` sort key,
+  evaluate the cast's `.Operand`; if it yields `KindInt` that IS the OID (the
+  `conrelid::regclass` shape). Otherwise fall back to evaluating the full cast,
+  whose `KindString` arm already resolves a name literal to a `KindInt` OID.
+  **Both branches yield a `KindInt` OID**, so the two source shapes now sort
+  consistently *with each other* — that consistency, not just the row order, is
+  the point. Every other expression shape is evaluated exactly as before.
+- `sortOp.lessRows` calls it in place of `evalExpr` for both operands,
+  preserving the existing `sortErr` strict-weak-ordering discipline; ASC/DESC
+  and NULLS handling are untouched.
+
+`ORDER BY <ordinal>` comes free: `resolveOrderBySubstitution`
+(`internal/optimizer/planner.go:5511`) substitutes the ordinal with the
+target-list AST *before* lowering to `CastExpr`, so `ORDER BY 1` — the shape
+the real PG corpus uses at `src/test/regress/sql/partition_prune.sql:283` —
+reaches `evalSortKeyValue` with the real cast node. Verified, not assumed.
+
+Guards (`internal/executor/operators_regsort_test.go`, FAIL-pre/PASS-post
+against a fixture whose OID order and NAME order genuinely disagree — a fixture
+where they agree proves nothing): ASC, DESC, mixed-key tiebreak, and
+string-literal-source vs int-source consistency.
+
+**Measurement: 230 lines / 12 hunks → 216 / 11.** Gates: `go build ./...`,
+`go test ./internal/executor/ ./internal/optimizer/ ./internal/postmaster/`,
+`RALPH_PRECOMMIT_SCOPE=units`, and — this being an executor change per
+Hard-won Rule #1 — `scripts/tpch-spotcheck.sh` on a fresh capped server
+(Q12=2, Q13=35, canonical).
+
+## 42. M0134-0005ak — validating a constraint validated only the table you named (LANDED 2026-08-19)
+
+**Measurement: 216 lines / 11 hunks → 188 / 9.** Two hunks closed
+(`expected/constraints.out:1446` and `:1483`), no new `@@`, no existing hunk grew.
+
+The symptom was a stale flag: after `ALTER TABLE notnull_inhparent ALTER i SET
+NOT NULL`, PG reports `convalidated = t` for `notnull_inhchild` and
+`notnull_inhgrand`, and goopg reported `f`. The same shape recurred on the
+partitioned tree (`notnull_tbl1_3`'s `nn3`). Both hunks are ONE root cause.
+
+**Why the existing in-code comment was misleading.** goopg's merge branch carried
+a comment citing `tablecmds.c:7950-8010` and asserting that PG's
+`ATExecSetNotNull` existing-constraint branch "returns WITHOUT recursing to
+children". That is true of two of the three existing-tuple sub-arms and **false
+of the third — the one this test exercises**. `tablecmds.c:7913`
+`ATExecSetNotNull` handles `recursing` (bump `coninhcount`) and
+`!conislocal` (set `conislocal`) in place, but the third arm,
+`if (!conForm->convalidated)`, does not flip anything itself: it *delegates
+entirely* to `ATExecValidateConstraint` (`:12908`). Validation is a different
+operation from marking, and it is the one that recurses.
+
+**What PG actually does.** `ATExecValidateConstraint` dispatches
+(`tablecmds.c:12974-12976`) to `QueueNNConstraintValidation`
+(`:13220-13309`), which — when `!recursing`, i.e. only at the top-level call —
+walks `find_all_inheritors` (`:13245-13246`). That is **every descendant at
+every depth**, partitions included, not `find_inheritance_children`'s single
+level. It skips the relation itself (`:13256-13257`), skips a descendant already
+`convalidated` (`:13277-13278`), and treats a descendant with no matching NOT
+NULL constraint for the column as an internal `elog` invariant violation
+(`:13272-13274`) rather than a user-facing error.
+
+**goopg's two gaps, not one.** The merge branch of `AlterTableSetNotNull` flipped
+only the parent's `NotValid` and left `shouldCascade` false (the existing
+`cascadeNotNullToChildrenAt` call belongs to the sibling "no constraint yet"
+arm). The named `ALTER TABLE ... VALIDATE CONSTRAINT` NOT NULL sub-branch had the
+**identical** defect independently. Fixing one without the other would have left
+a path that still diverges — the sibling-path rule, paid again.
+
+**Fix** (`internal/executor/operators_ddl.go`, 91 lines): a new
+`cascadeNotNullValidateToDescendants`, wired at both call sites. It is
+deliberately a *separate* helper rather than a mode flag on
+`cascadeNotNullToChildrenAt`: that helper's merge sub-branch only bumps
+`InhCount` and never touches `NotValid`, because the ADD direction and the
+VALIDATE direction are different operations — the DROP direction is already
+factored out for the same reason. The new helper mirrors the DROP twins'
+shape (`collectInheritanceAndPartitionChildren` for direct children, edge-keyed
+`visited` map, `maxNotNullCascadeDepth`, `syncConstraintCatalogRow` per touched
+child), and self-recurses to reach every depth because goopg has no one-shot
+`find_all_inheritors` equivalent — only single-level `InheritanceChildren` /
+`PartitionChildren` (`internal/catalog/catalog.go:4489`, `:4510`).
+
+**One deliberate divergence from PG's skip rule.** PG skips an
+already-`convalidated` descendant entirely; goopg flips nothing on such a child
+but still *recurses through* it. This is not laxity — it is what PG's flat
+`find_all_inheritors` list gives for free. PG enumerates the whole tree up front,
+so an already-validated intermediate node can never hide a still-unvalidated
+grandchild behind it; goopg's level-at-a-time descent would let exactly that
+happen if the skip also pruned the walk. Same end state, different traversal.
+
+A missing constraint on a descendant is a **skip**, not an error: goopg's catalog
+can legitimately reach that state, and PG's `elog` there is an internal-invariant
+assertion, so promoting it to a user-visible error would invent a new failure mode.
+
+Guards (`internal/executor/operators_ddl_notnull_validate_cascade_test.go`,
+FAIL-pre verified against reverted source, PASS-post): 3-level plain inheritance
+(`postgres/src/test/regress/sql/constraints.sql:908-917`), a partitioned tree
+(`:920-939`), the already-validated-descendant no-drift case (`InhCount` /
+`IsLocal` untouched), and both entry points.
+
+Confirmed not a risk: the row-scan backing SET NOT NULL already descends the full
+tree (`forEachLiveRow` → `allDescendants` → `forEachLiveRowRel`), so the new
+cascade cannot introduce a false-negative `23502`.
+
+Two deferrals recorded (2026-08-19): the CHECK-constraint VALIDATE cascade
+(PG's `QueueCheckConstraintValidation`, `tablecmds.c:13117-13210`) has the
+identical gap and is untouched; and PG's `ONLY`-with-children error
+(`ERRCODE_INVALID_TABLE_DEFINITION`, `tablecmds.c:13260-13263`) is unreproducible
+today because neither goopg call site plumbs an ONLY/recurse flag this deep.
+
+## 43. M0134-0005al — a PRIMARY KEY column could be made nullable (LANDED 2026-08-19)
+
+Entered at the **188 lines / 9 hunks** baseline left by §42 (0005ak); exits at
+**176 / 8** (−12 lines, −1 hunk, no new `@@`, no existing hunk grew).
+
+**The divergence.** `constraints.out:1072-1074`:
+
+```
+CREATE TABLE notnull_tbl2 (a INTEGER PRIMARY KEY);
+ALTER TABLE notnull_tbl2 ALTER a DROP NOT NULL;
+ERROR:  column "a" is in a primary key
+```
+
+goopg returned success and cleared the flag, leaving a **nullable PRIMARY KEY
+column**. This is not a message-wording hunk like most of the remaining
+constraints tail — it is a catalog-integrity hole that the diff happened to
+witness.
+
+**Why it was missing, and why that is the interesting part.** The guard was not
+overlooked; it was implemented on the *wrong twin*. M0134-0005 Bucket 3 (ledger
+2026-08-18) ported PG's PK-membership refusal into
+`execAlterTableDropConstraint` — the DROP-a-NOT-NULL-**by-name** path — and its
+own ledger row explicitly recorded that the DROP-NOT-NULL-**by-column** arm was
+"equally unguarded (Rule #2)" and should be fixed in the same pass. It was not.
+So for one day goopg refused `DROP CONSTRAINT <nn-name>` on a PK column while
+cheerfully accepting the `ALTER COLUMN a DROP NOT NULL` spelling of the exact
+same operation. A third occurrence of this campaign's recurring shape: **the
+guard exists, the reviewer greps, the grep hits — on the sibling.**
+
+**PG's structure.** `ATExecDropNotNull` (`tablecmds.c:7742`) does not hold the
+check itself; it delegates to `dropconstraint_internal` (called `:7817`), whose
+`CONSTRAINT_NOTNULL` branch carries **four** ordered refusals at `:14128-14181`.
+The PK refusal (`:14128-14159`) is FIRST — before the replica-identity check
+(`:14161`), before the identity-column check (`:14169`), and before
+`attnotnull` is cleared (`:14184`). Both goopg spellings must therefore reject
+before any mutation, which is why the guard sits in the `case` arm ahead of
+`clearNotNullConstraint` rather than inside it (that helper has three callers;
+putting the guard inside would have changed the by-name path's already-correct
+ordering too).
+
+**Landed.** `internal/executor/operators_ddl.go`, `case
+parser.AlterTableDropNotNull:` — after the 42703 column-existence check, walk
+`IndexesOnTable(tbl, NamespaceDBOid(...))` for `idx.Primary` and match
+`idx.Columns` case-insensitively; on a hit return `ExecError{Code: "42P16"}`
+with `column "%s" is in a primary key`, no detail, no hint. `42P16`
+(`ERRCODE_INVALID_TABLE_DEFINITION`), **not** the `55000` used by the
+neighbouring `verifyNotNullPKCompatible` — same family, different PG errcode.
+
+Pinned by four `TestAlterTableDropNotNullOnPrimaryKey*` tests (all FAIL-pre /
+PASS-post): the rejection itself, catalog-unchanged-after-rejection, a non-PK
+sibling column still droppable, and each member of a multi-column PK rejected
+independently. Wire-level SQLSTATE + message verified through psql against a
+cgroup-capped throwaway server.
+
+**Still missing on this path (ledgered).** goopg now runs 1 of PG's 4
+`dropconstraint_internal` NOT NULL refusals on the by-column arm. The
+replica-identity-index refusal (`:14162-14167`) and the identity-column refusal
+(`:14174-14181`) remain absent from **both** spellings.
+
+**Note for the next slice — the `ADD GENERATED … AS IDENTITY` hunk is a trap.**
+It sits in the same tail hunk as the lines this slice closed, so it looks
+adjacent and small (~2 diff lines). It is not: `ALTER COLUMN … ADD GENERATED`
+does not parse in goopg at all (no `ADD` branch in `parseAlterColumnAction`, no
+`AlterTableActionKind`, no executor case) — the statement is a silent no-op, so
+the `incompatible NOT VALID constraint` check has no path to live on. Closing it
+means porting `ATExecAddIdentity` (`tablecmds.c:8240-8362`) — a feature slice,
+not a guard. Already ledgered three times (0005n, 0005v, 0005w); do not
+re-estimate it from the diff's line count.
+
+## 44. M0134-0005am — the other two refusals PG makes before a NOT NULL may be dropped (LANDED 2026-08-19)
+
+Entered and exits at the **176 lines / 8 hunks** baseline left by §43 (0005al) —
+**unchanged, and that is the expected result**. Neither refusal is witnessed by
+any statement in `src/test/regress/sql/constraints.sql` (confirmed by grep), so
+this slice moves the diff by zero lines. It is here because the *ledger* asked
+for it twice, not because the fixture did: a regress-diff campaign that only
+ever lands what the fixture witnesses accumulates exactly the kind of
+half-ported guard that produced §43.
+
+**What was missing.** PG's `dropconstraint_internal` `CONSTRAINT_NOTNULL` branch
+(`tablecmds.c:14109-14191`) makes **four** ordered decisions: refuse if the
+column is in the PRIMARY KEY (`:14128-14159`), refuse if it is in the index used
+as replica identity (`:14161-14167`), refuse if it is an identity column
+(`:14169-14181`), and only then clear `attnotnull` (`:14183-14188`). §43 landed
+refusal 1 on both spellings. Refusals 2 and 3 were absent from **both** — goopg
+silently dropped a NOT NULL that PG protects. Ledgered as a pair on 2026-08-18
+(Bucket 3) and again on 2026-08-19 (§43); this slice closes them, on both
+spellings, in one pass, because the reason the pair was ledgered twice is that a
+prior slice fixed one side only.
+
+**The two refusals, exactly.**
+
+| # | PG source | SQLSTATE | message |
+|---|---|---|---|
+| 2 | `tablecmds.c:14161-14167` (`ERRCODE_INVALID_TABLE_DEFINITION`) | `42P16` | `column "%s" is in index used as replica identity` |
+| 3 | `tablecmds.c:14169-14181` (`ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE`) | `55000` | `column "%s" of relation "%s" is an identity column` |
+
+Note the message shapes differ from each other and from refusal 1: refusal 2
+names only the column (and shares `42P16` with the PK refusal), refusal 3 names
+the column **and** the relation and uses a different errcode entirely. Getting
+that pairing backwards is invisible to a Go unit test that only asserts "an
+error occurred", which is why the pins assert the exact SQLSTATE *and* the exact
+message text.
+
+**A deliberate divergence in how the replica-identity attribute set is derived.**
+PG does not consult `pg_index.indisreplident` directly here; it asks
+`RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_IDENTITY_KEY)`, backed by
+`rd_replidindex`, which `RelationGetIndexList` (`relcache.c:4938-4945`) sets to
+**the PRIMARY KEY index** when `relreplident = 'd'` (the default, PK not
+deferrable), to the user-chosen index when `'i'`, and to `InvalidOid` otherwise.
+So in PG, for the default mode, refusal 2 is *exactly redundant* with refusal 1
+— the PK check has already fired on the same attribute set one branch earlier.
+goopg does not model it that way: `catalog.Index.IsReplicaIdentity` is set only
+by `ALTER TABLE … REPLICA IDENTITY USING INDEX` (`operators_ddl.go:9940-9981`
+resolves `chosenIdx` only when `mode == "i"`), so goopg's refusal 2 fires only
+for the explicit `USING INDEX` case. **End behavior is identical** — for `'d'`
+the PK refusal already fired first with the PK message, and for `'f'`/`'n'` PG's
+`rd_replidindex` is `InvalidOid` so neither fires — but the reasoning is
+recorded in-code because the two implementations reach the same answer by
+different routes, and a future reader comparing goopg's guard to PG's line by
+line would otherwise conclude goopg's is under-inclusive.
+
+A research note worth correcting for the record: the M0119-0004 ledger row
+states that `REPLICA IDENTITY USING INDEX` is rejected with `0A000`. That is
+**stale** — the parser accepts it (`internal/parser/ddl.go:9603-9631`) and the
+executor sets `Index.IsReplicaIdentity`, which is precisely what makes refusal 2
+reachable and observable today rather than dead code.
+
+**Landed.** `internal/executor/operators_ddl.go`, both twins, each inserted
+after that site's existing PK-membership loop and before its
+`clearNotNullConstraint` call, so PG's ordering (PK → replica-identity →
+identity → clear) holds on both and the catalog is untouched on every rejection:
+
+- `case parser.AlterTableDropNotNull:` (the by-column spelling) — column name
+  from `act.ColumnName`.
+- the "3.7. NOT NULL constraints" branch of `execAlterTableDropConstraint` (the
+  by-name spelling) — column name from `nc.ColName`, *not* `act.ColumnName`,
+  since the constraint is matched by name and carries its own column. That
+  branch's header comment, which asserted these two refusals were "NOT
+  implemented — out of scope", was updated in the same hunk.
+
+Identity membership reads `catalog.Column.IdentityColumn` (the `attidentity`
+equivalent) off the `*catalog.Table` both paths already hold; both `ALWAYS` and
+`BY DEFAULT` refuse, matching PG's `attidentity != '\0'` test. No catalog field,
+parser branch, or helper signature was added.
+
+**Pinned** (all FAIL-pre verified by reverting the guard hunk, then PASS-post) —
+5 tests beside the `TestAlterTableDropNotNullOnPrimaryKey*` family in
+`operators_ddl_drop_constraint_cascade_test.go` (replica-identity refusal,
+catalog-unchanged-after-rejection, identity-column refusal, **PK-beats-identity
+ordering** on a column that is both, and a sibling-column-still-drops
+regression guard) and 2 subtests beside `NotNullPkMemberRefused` in
+`operators_fk_unique_drop_constraint_test.go` for the by-name twin. The ordering
+test is the one that would catch a future refactor that reorders the guards:
+without it, three independently-correct checks can still produce the wrong
+error message for a column that trips two of them.
+
+**Gates.** `go build ./...` PASS; `go test ./internal/executor/
+./internal/catalog/` PASS; named guards PASS (re-run by the coordinator before
+commit); `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
+`scripts/pg-regress-runner.sh constraints` **176 / 8, unchanged** as predicted;
+pgbench smoke via the hook. No tpch-spotcheck — DDL guards only, no
+planner/executor row-path change.
+
+## 45. M0134-0005an — the CHECK twin of §42, and the word `NO INHERIT` that nobody was reading (LANDED 2026-08-19)
+
+**Baseline note first.** This slice is the only one in the §37-§44 run whose
+witness is **not** `constraints.sql`. The `constraints` regress diff enters and
+exits at **176 lines / 8 hunks, unchanged and expected to be unchanged** —
+`constraints.sql`'s five `VALIDATE CONSTRAINT` sites (`:864, :866, :904, :934,
+:947`) all target NOT NULL constraints, which §42 already closed. The witness
+here is `alter_table.sql:397-428`. Do not read the flat 176/8 as a null result.
+
+### What was wrong
+
+§42 (M0134-0005ak) made NOT NULL validation cascade to every
+inheritance/partition descendant and, in its own deferral row, recorded that
+`ALTER TABLE … VALIDATE CONSTRAINT <check>` had "the IDENTICAL gap and is
+untouched". That row was right about the gap and **wrong about its size**: it
+predicted a materially larger change on the grounds that CHECK validation
+"implies re-scanning each descendant's rows". It does not — not in goopg, not
+any more. M0134-0005ac had already made `forEachLiveRow`
+(`internal/executor/operators_ddl.go:12850`) walk `allDescendants` recursively,
+and `validateCheckConstraintRows` (`:12954`) is one of its callers. The row-scan
+half of this feature had been quietly correct for two slices. Only the catalog
+flag cascade was missing, making this the *smaller* of the two twins, not the
+larger.
+
+Investigating that led to the more interesting defect. PG's
+`QueueCheckConstraintValidation` (`postgres/src/backend/commands/tablecmds.c:13109-13210`)
+makes exactly **one** decision about the inheritance tree, at `:13140`:
+
+```c
+if (!recursing && !con->connoinherit)
+    children = find_all_inheritors(RelationGetRelid(rel), lockmode, NULL);
+```
+
+`connoinherit` gates the descendant walk — and because PG queues its Phase-3
+row scan **per relation** off that same list, `connoinherit` gates the row scan
+too. One flag, both halves. goopg had the flag (`catalog.NamedCheckConstraint.NoInherit`,
+`internal/catalog/catalog.go:221`) and consulted it nowhere on this path, so it
+got both halves wrong in opposite directions: it *never* cascaded (bug 1) and it
+*always* descended when scanning (bug 2). Bug 2 is the live one —
+`alter_table.sql:412-425` exists specifically to pin it:
+
+```sql
+create table parent_noinh_convalid (a int);
+create table child_noinh_convalid () inherits (parent_noinh_convalid);
+insert into parent_noinh_convalid values (1);
+insert into child_noinh_convalid values (1);
+alter table parent_noinh_convalid add constraint check_a_is_2 check (a = 2) no inherit not valid;
+alter table parent_noinh_convalid validate constraint check_a_is_2;  -- fails: parent row
+delete from only parent_noinh_convalid;
+alter table parent_noinh_convalid validate constraint check_a_is_2;  -- ok, despite the child row
+```
+
+goopg failed the second `validate` on the child's `a=1`, which by the
+constraint's own `NO INHERIT` declaration it has no business reading.
+
+### The fix
+
+Three edits, `internal/executor/operators_ddl.go` (+92/−5).
+
+1. `validateCheckConstraintRows` (`:12954`) takes a trailing `noInherit bool`
+   and, when set, scans only the named relation via `forEachLiveRowRel(tbl, tbl, …)`
+   instead of `forEachLiveRow(tbl, …)`.
+2. **Both** of its callers pass it — the Rule-#2 twin pair, and the reason bug 2
+   is fixed for `ADD CHECK … NO INHERIT` as well as `VALIDATE CONSTRAINT`:
+   the VALIDATE CHECK sub-branch (`:8619`, passing `tbl.NamedChecks[i].NoInherit`)
+   and `case parser.AlterTableAddCheck:` (`:8735`, passing `act.NoInherit`).
+3. New `cascadeCheckValidateToDescendants` (`:12352`), a near-verbatim copy of
+   §42's `cascadeNotNullValidateToDescendants` (`:12306`) matching by constraint
+   **name** — `cascadeCheckDropToChildren`'s (`:12191`) lookup key — rather than
+   by column name, called from the VALIDATE branch under `!NoInherit`.
+
+**The one divergence, inherited from §42 and still load-bearing.** PG's CHECK
+path has *no* already-convalidated skip — no analog of
+`QueueNNConstraintValidation`'s `:13277-13278` — so on paper goopg could recurse
+unconditionally with a clear conscience. It does, but for a *different* reason
+than PG's absence of the check: goopg has no one-shot `find_all_inheritors`
+(only single-level `InheritanceChildren`/`PartitionChildren`,
+`internal/catalog/catalog.go:4489`, `:4510`), so its descent is level-at-a-time
+and any prune on an intermediate node would hide that node's grandchildren. The
+`NotValid` guard therefore wraps the *flip only*, never the recursive call. A
+descendant carrying no matching-named CHECK is a silent skip; PG's 42704 there
+is reached only through an internal invariant violation and reproducing it would
+invent a failure mode goopg's catalog can legitimately, benignly reach.
+
+Guards: `internal/executor/operators_ddl_check_validate_cascade_test.go`, 10
+subtests, FAIL-pre proven by stashing *only* the source file (the tests drive
+everything through SQL, so they compile against the pre-fix tree) — 3-level
+plain inheritance, partitioned tree, NO INHERIT suppresses the cascade,
+NO INHERIT confines the scan, inheritable scan still descends (a
+no-regression pin for M0134-0005ac, green pre and post), already-validated
+descendant no-drift with a still-invalid grandchild behind it, and the ADD CHECK
+twin.
+
+### Three things found while writing the tests, all deferred
+
+Each is separately ledgered 2026-08-19; none is folded in here.
+
+- **`DELETE FROM ONLY <t>` does not honour `ONLY`** and deletes descendant rows
+  too. Newly surfaced, no prior ledger row, and the widest-blast-radius of the
+  three — it is a DML correctness bug, not a DDL one. It is also why the NO
+  INHERIT scan test could not be a literal port of `alter_table.sql:412-425`
+  and was restructured into two independent fixtures.
+- **`catalog.AddCheckInherited` stamps `NotValid=false` unconditionally**
+  (`internal/catalog/catalog.go:305`), so a CHECK propagated from a parent whose
+  own copy is `NOT VALID` arrives on the child pre-validated. Three call sites.
+  This compounds with §45: the cascade this slice adds is what *would* have
+  fixed such a child, and it has nothing to fix because the child was born
+  wrongly valid. The M0134-0005z row already flagged the `NotEnforced` half of
+  the same helper's blindness; this is the `NotValid` half.
+- **`AlterTableAddCheck` propagates only to `PartitionChildren`**
+  (`:8749`), never `InheritanceChildren` — re-confirmation of the M0134-0005ac
+  row, now with a second independent sighting.
+
+Also still open and unrelated to `connoinherit`: PG's `ONLY`/recurse guard
+(`:13146-13150`, "constraint must be validated on child tables too") has no
+plumbing on `AlterTableValidateConstraint` at all, and PG's per-descendant skip
+of an already-convalidated descendant *during the row scan* (the
+`alter_table.sql:408-411` `boo()` NOTICE case) would require restructuring
+goopg's single whole-tree pass into per-relation passes.
+
+## 46. M0134-0005ao — `ONLY` was parsed, planned away, and never reached the executor (LANDED 2026-08-19)
+
+**Not a `constraints.sql` slice.** Like §45 this one's witness is
+`alter_table.sql` (`:412-425`), and unlike every slice before it the defect is
+not in DDL at all — it is **DML**. It was surfaced *by* §45: the guard test for
+`NO INHERIT` validation could not be a literal port of the upstream case,
+because the upstream case leans on `delete from only parent_noinh_convalid`
+leaving the child's row alive, and goopg deleted it. §45 worked around it by
+splitting the fixture in two and ledgering the finding
+(`.ralph/deferral_ledger.md:1572`); this slice discharges that row.
+
+### The shape of the bug: a flag with a complete front half and no back half
+
+`ONLY` was never *missing* from goopg. The parser has always captured it:
+`parser.RangeVar.Only` (`internal/parser/ast.go:658`) is set by the shared
+`parseRangeVar` (`internal/parser/select.go:1373,1476`), and both DML targets
+route through it (`internal/parser/dml.go:390` UPDATE, `:556` DELETE). The flag
+then **died at the planner boundary**: `optimizer.Update` (`plan.go:2041`) and
+`optimizer.Delete` (`:2070`) had no field to carry it, so `planUpdate`
+(`planner.go:10721`) and `planDelete` (`:10906`) simply never read
+`s.Target.Only`. Downstream, the executor did what it always does — expanded to
+the whole tree.
+
+This is the most easily-missed defect class in the campaign so far, and worth
+naming: **the feature looked implemented from both ends.** `ONLY` parsed without
+error (so no user-visible syntax failure), and the executor's expansion was
+correct for the no-`ONLY` case (so every existing test was green). Nothing on
+either side was wrong; the wire between them did not exist. Grepping for `Only`
+finds plenty of hits and none of them are the bug.
+
+### One flag, four sites (Rule #2, ×2)
+
+goopg splits each DML verb into a plain form and a cross-product form, and the
+descendant expansion is written out **separately in all four**
+(`internal/executor/operators_storage.go`):
+
+| site | verb | form |
+|---|---|---|
+| `updateOp.Next` `:5126` | UPDATE | plain |
+| `updateOp.updateWithFrom` `:6613` | UPDATE | `… FROM` |
+| `deleteOp.Next` `:6165` | DELETE | plain |
+| `deleteOp.deleteWithUsing` `:7135` | DELETE | `… USING` |
+
+Each opens with the same `if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {`
+and appends `PartitionChildren` + `InheritanceChildren`. The fix is the same one
+conjunct at each — `&& !o.plan.Only` — plus `Only bool` on the two plan nodes
+and `Only: s.Target.Only` at all **four** construction sites in the planner
+(`planUpdate` has two, `planDelete` has two; the cross-product forms build their
+node separately). Total +20/−8 across three files. Gating any three of the four
+would have produced a silently half-correct `ONLY` — the exact failure mode
+Hard-won Rule #2 exists to catch.
+
+### Why partitioning and inheritance are gated together, not selectively
+
+Upstream there is only ever **one** flag and **one** expansion site.
+`gram.y:13922-13950` (`relation_expr` / `extended_relation_expr`) sets
+`RangeVar.inh` from the presence of `ONLY`; that becomes `rte->inh`; and
+`expand_inherited_rtentry` (`postgres/src/backend/optimizer/util/inherit.c:86`)
+is the **sole** place any descendant RTE is ever added, gated on exactly that
+flag. A partitioned parent is not a special case there — it takes the identical
+path. So goopg gates `PartitionChildren` and `InheritanceChildren` with the one
+conjunct rather than reasoning about them separately. `ONLY` on a partitioned
+table is legal in PG and simply matches nothing (a partitioned parent stores no
+rows of its own); **no new error path was added**, and two of the eight guards
+pin precisely that no-op-not-error behaviour.
+
+The correct precedent already existed one subsystem over, twice:
+`planner.go:3047` gates `collectInheritanceDescendants` on `!rv.Only` for
+SELECT, and `truncateTableAndPartitions(..., only)`
+(`operators_ddl.go:15118,15244,15280`) does the equivalent for `TRUNCATE ONLY`.
+SELECT and TRUNCATE were right the whole time; only DML was wrong.
+
+### Guards
+
+`internal/executor/operators_dml_only_test.go` (new, 277 lines), 8 tests, each
+asserting **both** the surviving rows in parent and child **and** the reported
+affected-row count: DELETE/UPDATE `ONLY` over an `INHERITS` child; the matching
+no-`ONLY` pair as explicit no-regression guards; the `… USING` / `… FROM`
+cross-product twins; and the partitioned-parent no-op pair. FAIL-pre was proven
+by stashing only the three source files: the six `ONLY` tests failed, the two
+no-`ONLY` regression guards stayed green.
+
+### Measurement
+
+**No regress-diff number is claimed for this slice.** Its witness file
+`alter_table.sql` sits at a pre-existing 3781 lines / 110 hunks (§45), where a
+single-hunk correction is not a meaningful signal; `constraints.sql` — the
+campaign's tracked metric — does not exercise `DELETE FROM ONLY` at all and
+stays at its **176 lines / 8 hunks** baseline. The real value here is blast
+radius rather than diff lines: `ONLY` is now honoured for every `UPDATE`/`DELETE`
+in every regress file at once, and §45's split fixture can be re-joined into a
+literal port whenever a later slice touches that test.
+
+### Deferred (ledgered 2026-08-19)
+
+`deleteOp.deleteWithUsing` never fanned out to `PartitionChildren` at all —
+**independently of `ONLY`**. `DELETE FROM <partitioned_parent> USING …` misses
+every partition, while the other three sites and plain `DELETE` handle
+partitions correctly. Found while gating the four sites (three append both child
+kinds; this one appends only inheritance children). Pre-existing, orthogonal to
+this slice, and left untouched per the brief's no-scope-creep clause.
+
+## 47. M0134-0005ap — `DELETE … USING` was the one expansion site that forgot partitions (LANDED 2026-08-19)
+
+Filed by §46's ledger row and fixed here. `DELETE FROM <partitioned_parent>
+USING <other> WHERE …` silently deleted **zero** rows from every partition: it
+reported an affected-row count of 0, raised nothing, and left the data in place.
+Plain `DELETE`, `UPDATE` and `UPDATE … FROM` were all correct.
+
+### The shape: four hand-written copies of one PG concept
+
+goopg writes descendant expansion out **four separate times** in
+`internal/executor/operators_storage.go` — `updateOp.Next` (`:5126-5144`),
+`deleteOp.Next` (`:6165-6182`), `updateOp.updateWithFrom` (`:6605-6638`) and
+`deleteOp.deleteWithUsing` (`:7132-7152`). Three of the four append **both**
+`PartitionChildren` and `AccessibleInheritanceChildren`; `deleteWithUsing`
+appended only the inheritance children. There is no planner-side pre-expansion
+to compensate — `usingScanTargets` is seeded solely inside the function itself
+(`:7137`, the parent alone), and the plan carries one `o.plan.Table` plus
+`o.plan.UsingScans`. The partitions genuinely never reached victim collection.
+
+Upstream has exactly **one** such site: `expand_inherited_rtentry`
+(`postgres/src/backend/optimizer/util/inherit.c:86`) expands any RTE whose
+`rte->inh` is set, and that flag is assigned once at parse/rewrite time
+independently of whether the RTE is the DML target, a `FROM` item or a `USING`
+item. `nodeModifyTable.c` has **no** USING-specific partition branch. PG cannot
+express this bug; goopg's 4× duplication is what makes it expressible. §46
+gated all four sites for `ONLY` and that exercise is precisely what exposed the
+asymmetry — a fifth consecutive instance of this campaign's recurring shape
+(the behaviour exists, the grep hits, but on the sibling).
+
+### Fix
+
++12 lines, one file. Inside the **existing** `if imDel, ok :=
+o.ctx.Catalog.(*catalog.InMemory); ok && !o.plan.Only {` guard (`:7140`, added
+by §46), a loop over `imDel.PartitionChildren(tbl.OID)` appends one
+`usingScanTarget` per child, taking `o.ctx.acquireRelLock(...,
+lmgr.RowExclusiveLock)` first, exactly as the inheritance loop below it does.
+
+`colMap` is deliberately **nil** for partition children and non-nil
+(`buildInheritColMap`) for inheritance children: a partition shares its parent's
+column ordinals in goopg's model, an inheritance child need not. All three
+sibling sites already make that same split; the RETURNING path needs nothing
+extra because a nil `colMap` means `oldRow` is already parent-aligned.
+
+Placing the loop **inside** the existing `if` rather than in a new one is what
+keeps `DELETE FROM ONLY <partitioned_parent> USING …` a no-op — a dedicated
+guard test pins that, and it is green both pre- and post-fix.
+
+The stamp-phase EPQ retry loop (`:7248+`) needed no change: it is generic over
+`victim{rel,blk,slot,cols}`, and `epqSlotMovedToAnotherPartition` (`:7321`) keys
+off `vRel`/`v.blk`/`v.slot`, so a partition-sourced victim (including one moved
+to a sibling partition under RC) flows through unmodified — `deleteOp.Next`
+already proved that path.
+
+### Guards
+
+`internal/executor/operators_dml_using_partition_test.go` (new):
+`TestDeleteUsingPartitionedTarget` (2+ partitions, victims in more than one,
+each partition queried **by its own name** so a parent-level read cannot mask a
+miss), `TestDeleteUsingPartitionedReturning`, `TestDeleteFromOnlyUsingPartitionedNoop`,
+`TestDeleteUsingInheritNoPartitionRegression`. FAIL-pre was proven by reverting
+only `operators_storage.go` and keeping the tests: the two partition-targeting
+tests failed with `RowsAffected=0` / `0 rows returned`, while the `ONLY` guard
+and the inheritance regression guard stayed green — the exact expected pattern.
+
+### Metric
+
+`constraints.sql` enters and exits at **176 lines / 8 hunks**; it never writes
+`DELETE … USING`. As in §46, **no per-slice diff number is claimed** — this is a
+silent wrong-answer DML bug harvested from the campaign, not a diff-line fix.
+
+### Deferred (ledgered 2026-08-19)
+
+`catalog.InMemory.PartitionChildren` (`internal/catalog/catalog.go:4510`) is
+**flat — direct children only, no recursion**. Every one of the four DML
+expansion sites therefore misses grandchild partitions under multi-level
+(sub-partitioned) tables. This is pre-existing and common to all four, not
+introduced or widened here, so no multi-level capability test was written. It is
+the DML analogue of the FK-side row `M0134-0005h`, whose sibling scans were
+already converted to the recursive `allDescendants` walk.
+
+## 48. M0134-0005aq — the partition walk that stopped one level down (LANDED 2026-08-19)
+
+**Symptom.** With a sub-partitioned table — root → intermediate partition that is
+itself `PARTITION BY` → leaf — every `UPDATE`/`DELETE` against the root reported
+**0 rows** and left the leaf untouched. No error. All four DML forms, live-verified
+against PG 18.3:
+
+```sql
+CREATE TABLE root_p (id int, v int) PARTITION BY RANGE (id);
+CREATE TABLE mid_p PARTITION OF root_p FOR VALUES FROM (0) TO (100) PARTITION BY RANGE (id);
+CREATE TABLE leaf_p PARTITION OF mid_p FOR VALUES FROM (0) TO (50);
+INSERT INTO root_p VALUES (10, 1);
+```
+
+| statement | goopg (pre) | PG 18.3 |
+|---|---|---|
+| `UPDATE root_p SET v=100 WHERE id=10` | `UPDATE 0` | `UPDATE 1` |
+| `DELETE FROM root_p` | `DELETE 0` | `DELETE 1` |
+| `UPDATE root_p SET v=other_t.v FROM other_t WHERE …` | `UPDATE 0` | `UPDATE 1` |
+| `DELETE FROM root_p USING other_t WHERE …` | `DELETE 0` | `DELETE 1` |
+
+`SELECT` saw the rows the whole time, which is what made the gap invisible.
+
+**Root cause.** `catalog.InMemory.PartitionChildren` (`internal/catalog/catalog.go:4510`)
+returns **direct children only** — it does not recurse. All four DML
+descendant-expansion sites in `internal/executor/operators_storage.go` called it
+directly, so the fan-out list contained `mid_p` (a storage-less intermediate node)
+and never `leaf_p`. The other two consumers of the same hierarchy had each already
+solved this independently: INSERT routing via `routeToPartitionDepth`
+(`operators_storage.go:3014`) and the read path via `collectAllPartitionLeaves`
+(`internal/optimizer/planner.go:3350`). Only the DML fan-out was still flat.
+
+Upstream cannot express this: expansion is ONE site, `expand_inherited_rtentry`
+(`postgres/src/backend/optimizer/util/inherit.c:86`), and it recurses. This is the
+**sixth** consecutive instance of the campaign's shape — the behaviour exists and
+greps, but on a sibling path.
+
+**Fix.** New unexported `collectDMLPartitionLeaves(im, parentOID, detachEpoch)`
+(`operators_storage.go:2869`): BFS over `PartitionChildren`, **partitions-only**
+(inheritance children remain a separate branch at each call site),
+**leaves-only** (a node with a non-empty `PartitionKey` is recursed into, never
+scanned — intermediate nodes have no storage and must not be heap-locked), with a
+`seen` cycle guard. Swapped in at all four sites — `updateOp.Next:5166`,
+`deleteOp.Next:6204`, `updateOp.updateWithFrom:6655`, `deleteOp.deleteWithUsing:7180` —
+leaving the `!o.plan.Only` gate (§46), `colMap: nil` for partitions, and the
+per-child `acquireRelLock(RowExclusiveLock)` exactly as they were. 42 insertions,
+one file.
+
+**Two deliberate rejections.**
+- `allDescendants` (`internal/executor/operators_fk.go:1004`) is the existing
+  recursive executor walk, but is **not** reusable here: it mixes in inheritance
+  children, returns non-leaf nodes, and filters on
+  `transam.CurrentPartitionDetachEpoch()` — a globally-current epoch that is
+  intentionally FK/RI-specific (`operators_fk.go:1036-1049`).
+- The helper therefore filters on **`ctx.Snap.PartitionDetachEpoch`**, the
+  statement's own snapshot epoch (mirroring `operators_storage.go:3008`), via
+  `catalog.VisiblePartitionChildren`. Side effect worth naming: the four DML sites
+  previously applied **no** detach-visibility filter at all, so a concurrently
+  detached partition is now correctly excluded from the fan-out as well.
+
+**Guards.** `internal/executor/operators_dml_subpartition_test.go` (new, 6 tests):
+one per broken form asserting both the reported count and the **leaf table queried
+by its own name**, plus a one-level regression guard and an `UPDATE ONLY`
+fan-out-suppression guard. FAIL-pre proven by stashing only the source file — all
+four report `RowsAffected=0` with the leaf row unchanged.
+
+**Gates.** 6/6 new guards PASS; §47's four `TestDeleteUsingPartitioned*` guards and
+`TestAlterTablePartitionDescendantRecursion` still PASS;
+`RALPH_PRECOMMIT_SCOPE=units` PASS (~8 min, `internal/initdb` cold);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=35 — exact anchors).
+
+**Left open.** The detached-**grandchild** epoch path is not exercised by a test:
+the DML fixture helpers cannot express two statements observing different snapshot
+epochs around a live `DETACH PARTITION CONCURRENTLY`. The code path is identical to
+the single-level case already covered by
+`internal/catalog/partition_detach_visibility_test.go`. Ledgered.
+
+## 49. M0134-0005ar — one helper, two flags, three call sites, and only ONE of them symmetric (LANDED 2026-08-19)
+
+**The gap.** `catalog.Table.AddCheckInherited` (`internal/catalog/catalog.go:305`)
+threaded only `Name/Expr/OID/IsLocal/InhCount` and hard-zeroed `NotValid` and
+`NotEnforced`. Every CHECK constraint goopg propagated to an inheritance or
+partition child was therefore born **enforced and pre-validated**, regardless of
+what the parent said. Two ledger rows independently found the two halves —
+`.ralph/deferral_ledger.md:1540` (M0134-0005z, the `NotEnforced` half) and `:1573`
+(M0134-0005an, the `NotValid` half) — and each deferred with the same instruction:
+land them together, because the fix is one signature change across three call
+sites the individual briefs had fenced off. That instruction was correct. The
+*prediction* attached to it was not.
+
+**Where the ledger was wrong.** Both rows assumed the fix is symmetric: "copy the
+parent's `NotValid` and `NotEnforced` onto the child at all three sites." Upstream
+does not do that. PG has **two different rules**, and which one applies depends on
+whether the child existed when the constraint was declared:
+
+- **CREATE-time** (`INHERITS`, `PARTITION OF` — both routed through
+  `MergeAttributes` → `MergeCheckConstraint`,
+  `postgres/src/backend/commands/tablecmds.c:3167-3222`) sets
+  `newcon->is_enforced = is_enforced; newcon->skip_validation = !is_enforced;`
+  at `:3219-3220`. The child's validity is derived **purely from enforcement** and
+  never from the parent's own `convalidated` — a freshly created child is empty, so
+  any enforced constraint is trivially satisfied. PG never needs a regress case for
+  "NOT VALID parent CHECK inherited by a fresh child" because the answer is always
+  *valid*.
+- **ALTER-time cascade** (`ATAddCheckNNConstraint`, `tablecmds.c:9912-10049`,
+  recursing at `:10042-10043`) reuses the **same `Constraint` node** for every
+  child, so each child receives the user's literal `NOT VALID` / `NOT ENFORCED`
+  clause unchanged, and Phase 3 queues an independent per-child validation
+  (`:9956-9966`) precisely because those children may already hold violating rows.
+
+**The fix.** `AddCheckInherited` widened to
+`(name, expr string, oid uint32, notValid, notEnforced bool)` — matching its
+already-parameterized sibling `AddCheckFull` (`catalog.go:295`), which had had all
+three flags since the beginning; `AddCheckInherited` was simply the stale narrow
+twin. The three call sites in `internal/executor/operators_ddl.go` then split along
+PG's own seam:
+
+| site | rule |
+|---|---|
+| `execCreateTable` INHERITS loop (`:4049`) | `notEnforced = parent.NotEnforced`, `notValid = parent.NotEnforced` |
+| `execCreatePartitionChild` (`:5175`) | identical — the drifted twin |
+| `AlterTableAddCheck` partition cascade (`:8765`) | `act.NotValid`, `act.CheckNotEnforced` passed through unchanged |
+
+M0134-0005z's post-hoc `NotEnforced` stamp at `:4050-4055` is deleted; the helper
+now owns it. +35/−12 across two files.
+
+**Rule #2 sighting, again.** `execCreatePartitionChild` carries a comment at
+`:4026` asserting it mirrors the `execCreateTable` INHERITS loop. It did not: site
+1 had 0005z's post-hoc stamp, site 2 had nothing at all. The twin had silently
+drifted for a whole slice. This is the seventh consecutive instance of the campaign
+shape — *behaviour exists, grep hits, but on a sibling.*
+
+**Guards** (`internal/executor/operators_ddl_check_inherit_flags_test.go`, 5 tests,
+FAIL-pre proven by stashing only the two source files — 3 of 5 fail pre-fix):
+`…AlterCascadeNotEnforced`, `…CreateInheritsNotEnforced`,
+`…CreatePartitionOfNotEnforced`, plus
+`TestCheckInheritFlagsCreateTimeAntiSymmetryNotValid/{INHERITS,PARTITION_OF}` —
+the **anti-symmetry guard**, which pins that an enforced-but-`NOT VALID` parent
+CHECK produces a child with `NotValid=FALSE`. That test exists specifically to stop
+a future loop from "tidying up" the three sites into one symmetric rule and
+silently reintroducing the divergence.
+
+**One acceptance criterion did not bite, and the reason is already ledgered.** The
+literal port of `alter_table.sql:397-406` (`-- Test inherited NOT VALID CHECK
+constraints`) passes both before and after this change: `AlterTableAddCheck`'s
+cascade walks `PartitionChildren` only and never `InheritanceChildren`, so
+`attmp6`/`attmp7` never receive a `NamedChecks` entry at all and there is no flag
+to get wrong. That is the M0134-0005z ledger row at `.ralph/deferral_ledger.md:1539`
+(second clause), still open and now the **blocking** prerequisite for that fixture
+rather than a parallel one. The port is retained as a regression pin.
+
+**Metric.** `constraints.sql` enters and exits at **176 lines / 8 hunks**
+(unchanged) — the file exercises neither a `NOT VALID` nor a `NOT ENFORCED`
+inherited CHECK. This slice is paid for by correctness and by unblocking
+`alter_table.sql:397-428`, not by a diff-line count.
+
+**Gates.** 5/5 new guards PASS; `RALPH_PRECOMMIT_SCOPE=units` PASS (~7m,
+`internal/initdb` + `cmd/goopg` cold — cache cold-start, not a regression);
+`scripts/tpch-spotcheck.sh` **PASS (Q12=2, Q13=35)**; `go build ./...` + `go vet`
+clean.

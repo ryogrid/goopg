@@ -300,12 +300,22 @@ func (t *Table) AddCheckFull(name, expr string, oid uint32, notValid, noInherit,
 	})
 }
 
-// AddCheckInherited appends a CHECK constraint inherited from a partition parent
-// (IsLocal=false, InhCount=1). Used when creating partition children.
-func (t *Table) AddCheckInherited(name, expr string, oid uint32) {
+// AddCheckInherited appends a CHECK constraint inherited from a partition
+// parent (IsLocal=false, InhCount=1). Used when creating partition/inheritance
+// children and cascading an ALTER TABLE ADD CONSTRAINT to existing partition
+// children. notValid/notEnforced are threaded through by the caller — the two
+// flags are NOT symmetric across call sites (see the three call sites'
+// comments): CREATE-time inheritance (MergeCheckConstraint, tablecmds.c:
+// 3167-3222) derives validity PURELY from enforcement (`skip_validation =
+// !is_enforced`) since a fresh empty child is trivially valid, while an
+// ALTER-time cascade (ATAddCheckNNConstraint reusing the same Constraint node
+// per child, tablecmds.c:9912-10049) passes through the user's literal
+// clauses unchanged. M0134-0005ar.
+func (t *Table) AddCheckInherited(name, expr string, oid uint32, notValid, notEnforced bool) {
 	t.CheckConstraints = append(t.CheckConstraints, expr)
 	t.NamedChecks = append(t.NamedChecks, NamedCheckConstraint{
 		Name: name, Expr: expr, OID: oid, IsLocal: false, InhCount: 1,
+		NotValid: notValid, NotEnforced: notEnforced,
 	})
 }
 
@@ -12188,6 +12198,40 @@ func (c *InMemory) CreateTable(name parser.ObjectName, cols []Column, dbOid ...u
 	if _, exists := ns.tables[k]; exists {
 		return nil, fmt.Errorf("relation %q already exists", k)
 	}
+	for i := range cols {
+		cols[i].Ordinal = i
+	}
+	t := &Table{
+		Schema:  name.Schema,
+		Name:    name.Name,
+		Columns: append([]Column(nil), cols...),
+		OID:     c.nextOID,
+		DBOid:   resolveDBOid(dbOid),
+	}
+	c.nextOID++
+	ns.tables[k] = t
+	return t, nil
+}
+
+// CreateTableReplacingPendingDrop installs a table in the catalog, overwriting
+// an existing map slot WITHOUT the duplicate-key guard CreateTable enforces.
+// It exists solely for the same-transaction DROP-then-CREATE-of-the-same-name
+// idiom (M0134-0023): the deferred-DROP mechanism deliberately leaves the
+// dropped table's catalog row in place until COMMIT (see PendingTableDrop), so
+// a same-session recreate of that exact name must overwrite the slot instead
+// of colliding with it. Callers MUST only invoke this after confirming — via
+// the session's pending-drop bookkeeping (BasicSession.CancelPendingTableDropMatching)
+// — that the slot being overwritten is a same-txn deferred drop, never as a
+// general-purpose replace-on-collision: an unconditional relaxation of
+// CreateTable's guard would let genuine duplicate CREATEs through. PG oracle:
+// heap_create_with_catalog's collision check runs against the MVCC snapshot,
+// so a same-transaction-deleted tuple is simply invisible to it
+// (postgres/src/backend/catalog/heap.c:heap_create_with_catalog).
+func (c *InMemory) CreateTableReplacingPendingDrop(name parser.ObjectName, cols []Column, dbOid ...uint32) (*Table, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ns := c.getOrCreateNS(resolveDBOid(dbOid))
+	k := key(name)
 	for i := range cols {
 		cols[i].Ordinal = i
 	}

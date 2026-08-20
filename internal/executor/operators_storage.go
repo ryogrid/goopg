@@ -2866,6 +2866,39 @@ func evalPartitionKeyExpr(expr parser.Expr, cols []catalog.Column, row Row) (Dat
 	return NullDatum, fmt.Errorf("unsupported partition key expression type %T", expr)
 }
 
+// collectDMLPartitionLeaves does a BFS over the partition hierarchy rooted at
+// parentOID and returns all LEAF partitions (tables that are not themselves
+// PARTITION BY), recursing through intermediate sub-partitioned nodes so that
+// UPDATE/DELETE fan-out reaches storage-bearing descendants at any depth.
+// Mirrors internal/optimizer/planner.go's collectAllPartitionLeaves (the
+// SELECT-side equivalent, M0097-0105) — partitions-only (inheritance children
+// are collected separately by callers via InheritanceChildren), leaves-only
+// (intermediate PARTITION BY nodes have no storage and must not be scanned or
+// lock-acquired as heaps), filtered by the statement's own snapshot epoch via
+// catalog.VisiblePartitionChildren (design 0118-0059), with a visited-set
+// cycle guard. M0134-0005aq.
+func collectDMLPartitionLeaves(im *catalog.InMemory, parentOID uint32, detachEpoch uint64) []*catalog.Table {
+	var leaves []*catalog.Table
+	seen := make(map[uint32]bool)
+	queue := catalog.VisiblePartitionChildren(im.PartitionChildren(parentOID), detachEpoch)
+	for len(queue) > 0 {
+		child := queue[0]
+		queue = queue[1:]
+		if child == nil || seen[child.OID] {
+			continue
+		}
+		seen[child.OID] = true
+		if len(child.PartitionKey) > 0 {
+			// Intermediate partitioned node: recurse into its children.
+			queue = append(queue, catalog.VisiblePartitionChildren(im.PartitionChildren(child.OID), detachEpoch)...)
+		} else {
+			// Leaf partition: include in the scan.
+			leaves = append(leaves, child)
+		}
+	}
+	return leaves
+}
+
 // routeToPartitionDepth recurses through nested partition hierarchies. The
 // depth guard (max 8) prevents infinite loops on circular catalog states.
 func routeToPartitionDepth(parent *catalog.Table, row Row, im *catalog.InMemory, ctx *Context, depth int) (*catalog.Table, error) {
@@ -2900,22 +2933,7 @@ func routeToPartitionDepth(parent *catalog.Table, row Row, im *catalog.InMemory,
 	var child *catalog.Table
 	switch parent.PartitionMethod {
 	case "LIST":
-		keyStr := ""
-		if keyDatum.Kind == KindInt {
-			keyStr = fmt.Sprintf("%d", keyDatum.Int)
-		} else if keyDatum.Kind == KindString {
-			keyStr = keyDatum.StringValue()
-		} else if keyDatum.Kind == KindBool {
-			// Try both long ("true"/"false") and short ("t"/"f") boolean formats.
-			// Partition bound values come from string literals like 'true'/'false'.
-			if keyDatum.Int != 0 {
-				keyStr = "true"
-			} else {
-				keyStr = "false"
-			}
-		} else if keyDatum.IsNull() {
-			keyStr = "null" // matches FOR VALUES IN (null)
-		}
+		keyStr := partitionKeyDatumToListStr(keyDatum)
 		child = im.FindPartitionForValue(parent.OID, keyStr)
 		// Also try short boolean format if no match with long format.
 		if child == nil && keyDatum.Kind == KindBool {
@@ -3173,8 +3191,10 @@ func partitionKeyDatumToRangeStr(d Datum) string {
 	}
 }
 
-// partitionKeyDatumToListStr formats a datum the way FindPartitionForValue expects
-// (mirrors the LIST arm of routeToPartitionDepth).
+// partitionKeyDatumToListStr formats a datum the way FindPartitionForValue expects.
+// This is the single formatter used by BOTH the LIST arm of
+// routeToPartitionDepth and routePartitionKeyToImmediateChild — do not let
+// them drift apart again (M0134-0012).
 func partitionKeyDatumToListStr(d Datum) string {
 	switch d.Kind {
 	case KindInt:
@@ -5125,8 +5145,12 @@ func (o *updateOp) Next() (TupleSlot, error) {
 	// expressions (resolved against parent ordinals) work on child rows. M0097-0078.
 	updateScanTables := []*catalog.Table{tbl}
 	var inheritChildOIDs map[uint32]bool
-	if imU, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-		updateScanTables = append(updateScanTables, imU.PartitionChildren(tbl.OID)...)
+	// UPDATE ONLY skips inheritance/partition children entirely — mirrors
+	// planScanRangeVar's `!rv.Only` gate (internal/optimizer/planner.go) and
+	// PG's expand_inherited_rtentry, which is gated on the identical
+	// rte->inh flag for both inheritance and partitioning. M0134-0005ao.
+	if imU, ok := o.ctx.Catalog.(*catalog.InMemory); ok && !o.plan.Only {
+		updateScanTables = append(updateScanTables, collectDMLPartitionLeaves(imU, tbl.OID, o.ctx.Snap.PartitionDetachEpoch)...)
 		// Drop other-session temp inheritance children (RELATION_IS_OTHER_TEMP).
 		// Design 0118-0036 (M0118-0008 inherit-temp).
 		inheritChildren := catalog.AccessibleInheritanceChildren(imU.InheritanceChildren(tbl.OID), sessionTempOwner(o.ctx))
@@ -6161,8 +6185,10 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 	var victims []victim
 	scanTables := []*catalog.Table{tbl}
 	var delInheritChildOIDs map[uint32]bool
-	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-		scanTables = append(scanTables, im.PartitionChildren(tbl.OID)...)
+	// DELETE FROM ONLY skips inheritance/partition children entirely — see
+	// updateOp.Next's identical gate. M0134-0005ao.
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && !o.plan.Only {
+		scanTables = append(scanTables, collectDMLPartitionLeaves(im, tbl.OID, o.ctx.Snap.PartitionDetachEpoch)...)
 		// Drop other-session temp inheritance children (RELATION_IS_OTHER_TEMP).
 		// Design 0118-0036 (M0118-0008 inherit-temp).
 		delInheritChildren := catalog.AccessibleInheritanceChildren(im.InheritanceChildren(tbl.OID), sessionTempOwner(o.ctx))
@@ -6607,9 +6633,13 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 		tbl    *catalog.Table
 	}
 	fromScanTargets := []fromScanTarget{{rel: rel, cols: tgtCols, tbl: o.plan.Table}}
-	if imFrom, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-		// Partition children: same column ordinals as parent, possibly overridden GeneratedExpr.
-		for _, pc := range imFrom.PartitionChildren(o.plan.Table.OID) {
+	// UPDATE ONLY … FROM skips inheritance/partition children entirely — see
+	// updateOp.Next's identical gate. M0134-0005ao.
+	if imFrom, ok := o.ctx.Catalog.(*catalog.InMemory); ok && !o.plan.Only {
+		// Partition children: same column ordinals as parent, possibly overridden
+		// GeneratedExpr. Recurses through sub-partitioned intermediate nodes to
+		// leaf partitions. M0134-0005aq.
+		for _, pc := range collectDMLPartitionLeaves(imFrom, o.plan.Table.OID, o.ctx.Snap.PartitionDetachEpoch) {
 			if err := o.ctx.acquireRelLock(o.ctx.Catalog.RelFileNode(pc), lmgr.RowExclusiveLock); err != nil {
 				return nil, err
 			}
@@ -7127,7 +7157,22 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 		colMap []int // nil = parent; set for inheritance children
 	}
 	usingScanTargets := []usingScanTarget{{rel: rel, cols: tgtCols}}
-	if imDel, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+	// DELETE FROM ONLY … USING skips inheritance children entirely — see
+	// updateOp.Next's identical gate. M0134-0005ao.
+	if imDel, ok := o.ctx.Catalog.(*catalog.InMemory); ok && !o.plan.Only {
+		// Partition children: same column ordinals as parent (no remapping).
+		// Mirrors updateOp.updateWithFrom's partition loop and deleteOp.Next's
+		// partition-leaf collection. Recurses through sub-partitioned
+		// intermediate nodes to leaf partitions. M0134-0005ap, M0134-0005aq.
+		for _, pc := range collectDMLPartitionLeaves(imDel, tbl.OID, o.ctx.Snap.PartitionDetachEpoch) {
+			if err := o.ctx.acquireRelLock(o.ctx.Catalog.RelFileNode(pc), lmgr.RowExclusiveLock); err != nil {
+				return nil, err
+			}
+			usingScanTargets = append(usingScanTargets, usingScanTarget{
+				rel:  o.ctx.Catalog.RelFileNode(pc),
+				cols: pc.Columns,
+			})
+		}
 		// Drop other-session temp inheritance children. Design 0118-0036.
 		for _, ic := range catalog.AccessibleInheritanceChildren(imDel.InheritanceChildren(tbl.OID), sessionTempOwner(o.ctx)) {
 			if err := o.ctx.acquireRelLock(o.ctx.Catalog.RelFileNode(ic), lmgr.RowExclusiveLock); err != nil {

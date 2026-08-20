@@ -114,11 +114,29 @@ type connTxState struct {
 	// until this field was added.  map[name(lowercase)]=true.  M0122-0007 4e
 	// follow-up (fifth loop).
 	PendingCreatedRangeTypes map[string]bool
-	// NonSuperuserRole is set when SET SESSION AUTHORIZATION is called with a
-	// non-default role name. While non-empty, privilege checks that require
-	// superuser (e.g. LEAKPROOF function attribute) are rejected. Cleared by
-	// RESET SESSION AUTHORIZATION or SET SESSION AUTHORIZATION DEFAULT/postgres.
+	// NonSuperuserRole is set when SET SESSION AUTHORIZATION or SET ROLE is
+	// called with a non-default role name. While non-empty, privilege checks
+	// that require superuser (e.g. LEAKPROOF function attribute) are
+	// rejected. Cleared by RESET SESSION AUTHORIZATION / RESET ROLE or the
+	// DEFAULT/postgres spellings of either.
 	NonSuperuserRole string
+	// SetRoleIsActive mirrors PostgreSQL's SetRoleIsActive (miscinit.c):
+	// true while a SET ROLE (as opposed to SET SESSION AUTHORIZATION) is in
+	// effect. current_user/current_role read NonSuperuserRole only while
+	// this is true; otherwise they fall back to SessionUser. SET SESSION
+	// AUTHORIZATION always clears it (PG parity: "SET SESSION AUTHORIZATION
+	// implies SET ROLE NONE"). M0134-0009.
+	SetRoleIsActive bool
+	// LoginUser is the authenticated login role for this connection (the
+	// StartupMessage "user" value), captured once at connection start and
+	// never mutated thereafter. RESET SESSION AUTHORIZATION / SET SESSION
+	// AUTHORIZATION DEFAULT restore SessionUser to this value. M0134-0009.
+	LoginUser string
+	// SessionUser is the current session_user identity (PostgreSQL's
+	// GetSessionUserId(), miscinit.c). It starts equal to LoginUser and is
+	// updated only by SET/RESET SESSION AUTHORIZATION — SET ROLE never
+	// touches it. M0134-0009.
+	SessionUser string
 	// LocalRolePriorValue, when non-nil, is the NonSuperuserRole value
 	// captured just before the first SET LOCAL ROLE / SET LOCAL SESSION
 	// AUTHORIZATION within the current explicit transaction. End() restores
@@ -128,6 +146,16 @@ type connTxState struct {
 	// provides for ordinary GUCs (see SessionRegistry.EndTransaction).
 	// Populated via SnapshotLocalRoleIfNeeded. M0119-0004.
 	LocalRolePriorValue *string
+	// LocalSessionUserPriorValue / LocalSetRoleIsActivePriorValue are
+	// SessionUser's and SetRoleIsActive's LocalRolePriorValue siblings:
+	// captured by the same first-SET-LOCAL-wins snapshot in
+	// SnapshotLocalRoleIfNeeded and restored alongside LocalRolePriorValue
+	// in End(). Without these, `BEGIN; SET LOCAL SESSION AUTHORIZATION
+	// alice; COMMIT;` left SessionUser="alice" leaked past COMMIT for the
+	// rest of the connection even though NonSuperuserRole correctly
+	// reverted (M0134-0009 round-2 review, R1/R11).
+	LocalSessionUserPriorValue     *string
+	LocalSetRoleIsActivePriorValue *bool
 	// AdvisoryID is the stable per-connection advisory-lock owner identity (the
 	// SessionRegistry). It is assigned once at connection start in
 	// runPostStartupLoop and matches advisorySessionIDFromContext's preferred
@@ -376,23 +404,33 @@ func (c *connTxState) Begin(tx transam.Transaction) {
 	c.mu.Unlock()
 }
 
-// SnapshotLocalRoleIfNeeded captures NonSuperuserRole's current value the
+// SnapshotLocalRoleIfNeeded captures NonSuperuserRole's (and its
+// M0134-0009 siblings SessionUser/SetRoleIsActive's) current value the
 // first time a SET LOCAL ROLE / SET LOCAL SESSION AUTHORIZATION occurs
-// within the active explicit transaction, so End() can restore it at COMMIT
-// or ROLLBACK. A no-op when local is false, no explicit transaction is
-// active, or a snapshot was already taken this transaction (only the
+// within the active explicit transaction, so End() can restore them at
+// COMMIT or ROLLBACK. A no-op when local is false, no explicit transaction
+// is active, or a snapshot was already taken this transaction (only the
 // pre-transaction value — captured by the FIRST local change — is ever
 // restored, matching PostgreSQL's stack-based revert: later SET/SET LOCAL
 // calls in the same transaction do not move the restore target). SET LOCAL
 // outside a transaction block behaves like a plain SET for the rest of the
 // current auto-commit statement (nothing to revert to), matching upstream
 // and config.SessionRegistry.Set's identical comment for ordinary GUCs.
+// All three fields snapshot/restore together — SET LOCAL SESSION
+// AUTHORIZATION touches SessionUser and NonSuperuserRole together (and
+// clears SetRoleIsActive); SET LOCAL ROLE touches NonSuperuserRole and
+// SetRoleIsActive together — so partial revert would desync the
+// EffectiveUserName() invariant (see its doc comment).
 func (c *connTxState) SnapshotLocalRoleIfNeeded(local bool) {
 	if !local || !c.active || c.LocalRolePriorValue != nil {
 		return
 	}
 	prior := c.NonSuperuserRole
 	c.LocalRolePriorValue = &prior
+	priorSessionUser := c.SessionUser
+	c.LocalSessionUserPriorValue = &priorSessionUser
+	priorSetRoleIsActive := c.SetRoleIsActive
+	c.LocalSetRoleIsActivePriorValue = &priorSetRoleIsActive
 }
 
 // wireStatus computes the ReadyForQuery transaction-status byte for this
@@ -517,6 +555,14 @@ func (c *connTxState) End() {
 	if c.LocalRolePriorValue != nil {
 		c.NonSuperuserRole = *c.LocalRolePriorValue
 		c.LocalRolePriorValue = nil
+	}
+	if c.LocalSessionUserPriorValue != nil {
+		c.SessionUser = *c.LocalSessionUserPriorValue
+		c.LocalSessionUserPriorValue = nil
+	}
+	if c.LocalSetRoleIsActivePriorValue != nil {
+		c.SetRoleIsActive = *c.LocalSetRoleIsActivePriorValue
+		c.LocalSetRoleIsActivePriorValue = nil
 	}
 	// Discard any NOTIFYs not yet published. On COMMIT the publish happens
 	// before End() is called; reaching here with a non-empty buffer means

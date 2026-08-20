@@ -127,6 +127,98 @@ func TestDefaultExprAcceptsConstantCompounds(t *testing.T) {
 	}
 }
 
+// TestDefaultExprErrposition is the acceptance test for M0134-0016b: goopg
+// must stamp ExecError.Pos with the byte offset of the offending sub-node
+// (not the statement's own s.Pos(), which is always 0 for a single-statement
+// text and therefore collides with the "unset" sentinel — see
+// internal/postmaster/copy.go FieldPosition, and the "unset" doc on
+// ExecError.Pos above operators_ddl_partition.go's validateDefaultExpr).
+// Each case's `want` offset is computed with strings.Index against the exact
+// DDL text so the test breaks if the caret ever drifts off the PG-expected
+// token (create_table.sql: default_expr_column / default_expr_agg /
+// default_expr_agg_column cases).
+func TestDefaultExprErrposition(t *testing.T) {
+	cases := []struct {
+		name    string
+		ddl     string
+		token   string // the exact PG-expected caret token to locate via strings.Index
+		wantMsg string
+	}{
+		{
+			name:    "DEFAULT column reference",
+			ddl:     "CREATE TABLE default_expr_column (id int DEFAULT (id))",
+			token:   "id))",
+			wantMsg: "cannot use column reference in DEFAULT expression",
+		},
+		{
+			name:    "DEFAULT aggregate call",
+			ddl:     "CREATE TABLE default_expr_agg (a int DEFAULT (avg(1)))",
+			token:   "avg(1)",
+			wantMsg: "aggregate functions are not allowed in DEFAULT expressions",
+		},
+		{
+			name:    "DEFAULT subquery",
+			ddl:     "CREATE TABLE default_expr_agg (a int DEFAULT (select 1))",
+			token:   "(select 1)",
+			wantMsg: "cannot use subquery in DEFAULT expression",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, _, cleanup := newDDLFixture(t)
+			defer cleanup()
+
+			err := runDDL(t, ctx, tc.ddl)
+			ee, ok := err.(*ExecError)
+			if !ok {
+				t.Fatalf("expected *ExecError, got %T (%v)", err, err)
+			}
+			if !strings.Contains(ee.Message, tc.wantMsg) {
+				t.Fatalf("message = %q, want substring %q", ee.Message, tc.wantMsg)
+			}
+			wantPos := strings.Index(tc.ddl, tc.token)
+			if wantPos < 0 {
+				t.Fatalf("test bug: token %q not found in ddl %q", tc.token, tc.ddl)
+			}
+			if ee.Pos <= 0 {
+				t.Fatalf("Pos = %d, want > 0 (sentinel collision — no errposition would reach the client)", ee.Pos)
+			}
+			if ee.Pos != wantPos {
+				t.Fatalf("Pos = %d, want %d (byte offset of %q in %q)", ee.Pos, wantPos, tc.token, tc.ddl)
+			}
+		})
+	}
+}
+
+// TestPartitionKeyColumnErrposition is the partition-key-column-error twin of
+// TestDefaultExprErrposition (M0134-0016b): validatePartitionKey must stamp
+// the "column %q named in partition key does not exist" ExecError with the
+// byte offset of the column-reference token in the PARTITION BY clause, not
+// s.Pos() (create_table.sql: `) PARTITION BY RANGE (b);` → LINE 3, caret on "b").
+func TestPartitionKeyColumnErrposition(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	ddl := "CREATE TABLE partitioned (a int) PARTITION BY RANGE (b)"
+	err := runDDL(t, ctx, ddl)
+	ee, ok := err.(*ExecError)
+	if !ok {
+		t.Fatalf("expected *ExecError, got %T (%v)", err, err)
+	}
+	wantMsg := `column "b" named in partition key does not exist`
+	if !strings.Contains(ee.Message, wantMsg) {
+		t.Fatalf("message = %q, want substring %q", ee.Message, wantMsg)
+	}
+	wantPos := strings.LastIndex(ddl, "b)")
+	if ee.Pos <= 0 {
+		t.Fatalf("Pos = %d, want > 0 (sentinel collision — no errposition would reach the client)", ee.Pos)
+	}
+	if ee.Pos != wantPos {
+		t.Fatalf("Pos = %d, want %d (byte offset of the partition-key column reference \"b\")", ee.Pos, wantPos)
+	}
+}
+
 // TestDefaultExprToSQLBinaryParen guards the executor-side deparse renderer's
 // BinaryOp full parenthesization (DU-002 slice 298). defaultExprToSQL feeds the
 // non-pretty pg_get_expr contexts — index predicates (CREATE INDEX ... WHERE),

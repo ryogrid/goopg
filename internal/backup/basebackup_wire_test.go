@@ -383,7 +383,7 @@ func TestBaseBackupRejectsWithoutDataDir(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Wire harness. Copies of internal/replication/replication_test.go's helpers.
+// Wire harness. Copies of internal/replication/walsender_wire_test.go's helpers.
 // This file is an EXTERNAL test package (backup_test) so it can import
 // postmaster and drive a real server through BASE_BACKUP; that also puts
 // postmaster's and replication's unexported test helpers out of reach, so the

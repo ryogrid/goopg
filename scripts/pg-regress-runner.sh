@@ -224,6 +224,17 @@ if [[ "$RUN_SETUP" -eq 1 ]]; then
     # and test_setup.sql has no \setenv. Best-effort: the C-language regresslib
     # CREATE FUNCTIONs cannot load in goopg, so tolerate their failures.
     "${PSQL[@]}" -f "${REGRESS_SQL}/test_setup.sql" >/dev/null 2>&1 || true
+    echo "pg-regress-runner: running create_misc.sql (a_star..f_star inheritance chain for select_parallel.sql)..."
+    # create_misc.sql creates the a_star/b_star/c_star/d_star/e_star/f_star
+    # single/multiple-inheritance chain that select_parallel.sql:23 reads
+    # (select round(avg(aa)), sum(aa) from a_star). Upstream runs it as a
+    # first-group prerequisite before create_index, and select_parallel,
+    # join, and with all depend on it (postgres/src/test/regress/
+    # parallel_schedule:45,62,88,114). Best-effort like the siblings: goopg
+    # may not support every construct in the file, but the tables that do
+    # get created must persist so the separate psql -f of select_parallel.sql
+    # sees them in the same 'postgres' DB.
+    "${PSQL[@]}" -f "${REGRESS_SQL}/create_misc.sql" >/dev/null 2>&1 || true
     echo "pg-regress-runner: running create_index.sql (btree indexes for aggregates.sql)..."
     # create_index.sql creates the btree indexes (tenk1_unique1/unique2/
     # hundred/thous_tenthous, tenk2_unique1/unique2, onek_*) that the S6

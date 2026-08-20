@@ -80,6 +80,25 @@ func (m *functionStatsManager) record(sessionID uint64, oid uint32, total, self 
 	c.selfTime += self
 }
 
+// peekPending reads a session's not-yet-flushed pending counters for one OID
+// WITHOUT allocating a session or OID entry. Mirrors find_funcstat_entry, which
+// is a pure lookup: reading pg_stat_get_xact_function_calls for an OID the
+// session never called must not materialise a zeroed pending entry for it.
+// M0134-0020.
+func (m *functionStatsManager) peekPending(sessionID uint64, oid uint32) (funcStatCounters, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sess, ok := m.pending[sessionID]
+	if !ok {
+		return funcStatCounters{}, false
+	}
+	c, ok := sess[oid]
+	if !ok {
+		return funcStatCounters{}, false
+	}
+	return *c, true
+}
+
 // flush merges a session's pending counters into the shared store and clears
 // the pending set. Mirrors pgstat_report_stat flushing function stats; the
 // `stats` spec triggers this via pg_stat_force_next_flush().

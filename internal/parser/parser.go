@@ -3124,9 +3124,15 @@ func (p *parser) parseCommentOnTail(pos int) (Stmt, bool, error) {
 		}
 		cs.SubName = tok.Value
 		p.advance()
-		// ON table
+		// ON table (or ON DOMAIN domain — mirrors the top-level COMMENT ON
+		// DOMAIN case above: an optional "domain" ident-keyword before the
+		// object name distinguishes a domain constraint from a table one, so
+		// the executor can dispatch — M0134-0005ai).
 		if !p.acceptKeyword(KwOn) {
 			return nil, true, p.errAtCur("expected ON after constraint name in COMMENT ON CONSTRAINT")
+		}
+		if p.acceptIdentKeyword("domain") {
+			cs.ObjKind = "domain constraint"
 		}
 		name, err := p.parseObjectName()
 		if err != nil {

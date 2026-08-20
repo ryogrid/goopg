@@ -211,6 +211,57 @@ func TestDropConstraintForeignKeyAndUnique(t *testing.T) {
 		}
 	})
 
+	t.Run("NotNullReplicaIdentityIndexMemberRefused", func(t *testing.T) {
+		// A NOT NULL constraint backing a column that participates in the
+		// index chosen as the table's replica identity cannot be dropped by
+		// name — dropconstraint_internal (tablecmds.c:14161-14167) raises
+		// 42P16 "column %q is in index used as replica identity" before
+		// resetting attnotnull. M0134-0005am.
+		ctx, _, cleanup := newDDLFixture(t)
+		defer cleanup()
+
+		if err := runDDL(t, ctx, `CREATE TABLE dcnnri_t (a integer NOT NULL, b integer)`); err != nil {
+			t.Fatalf("CREATE TABLE dcnnri_t: %v", err)
+		}
+		if err := runDDL(t, ctx, `CREATE UNIQUE INDEX dcnnri_t_uidx ON dcnnri_t (a)`); err != nil {
+			t.Fatalf("CREATE UNIQUE INDEX dcnnri_t_uidx: %v", err)
+		}
+		if err := runDDL(t, ctx, `ALTER TABLE dcnnri_t REPLICA IDENTITY USING INDEX dcnnri_t_uidx`); err != nil {
+			t.Fatalf("ALTER TABLE dcnnri_t REPLICA IDENTITY USING INDEX dcnnri_t_uidx: %v", err)
+		}
+
+		err := runDDL(t, ctx, `ALTER TABLE dcnnri_t DROP CONSTRAINT dcnnri_t_a_not_null`)
+		ee, ok := err.(*ExecError)
+		if !ok || ee.Code != "42P16" {
+			t.Fatalf("expected 42P16, got: %v", err)
+		}
+		if ee.Message != `column "a" is in index used as replica identity` {
+			t.Fatalf("unexpected message: %q", ee.Message)
+		}
+	})
+
+	t.Run("NotNullIdentityColumnRefused", func(t *testing.T) {
+		// A NOT NULL constraint backing a GENERATED ... AS IDENTITY column
+		// cannot be dropped by name — dropconstraint_internal
+		// (tablecmds.c:14169-14181) raises 55000 "column %q of relation %q
+		// is an identity column" before resetting attnotnull. M0134-0005am.
+		ctx, _, cleanup := newDDLFixture(t)
+		defer cleanup()
+
+		if err := runDDL(t, ctx, `CREATE TABLE dcnnid_t (id int GENERATED ALWAYS AS IDENTITY NOT NULL, b integer)`); err != nil {
+			t.Fatalf("CREATE TABLE dcnnid_t: %v", err)
+		}
+
+		err := runDDL(t, ctx, `ALTER TABLE dcnnid_t DROP CONSTRAINT dcnnid_t_id_not_null`)
+		ee, ok := err.(*ExecError)
+		if !ok || ee.Code != "55000" {
+			t.Fatalf("expected 55000, got: %v", err)
+		}
+		if ee.Message != `column "id" of relation "dcnnid_t" is an identity column` {
+			t.Fatalf("unexpected message: %q", ee.Message)
+		}
+	})
+
 	t.Run("UndefinedConstraintStillRejected", func(t *testing.T) {
 		ctx, _, cleanup := newDDLFixture(t)
 		defer cleanup()

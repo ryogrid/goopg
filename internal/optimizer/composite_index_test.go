@@ -108,7 +108,7 @@ func TestSingleColumnIndexPreferredOverComposite(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	idx := findBTreeIndexForColumn(cat, tbl, "a")
+	idx := findBTreeIndexForColumn(cat, tbl, "a", nil)
 	if idx == nil {
 		t.Fatal("findBTreeIndexForColumn returned nil")
 	}

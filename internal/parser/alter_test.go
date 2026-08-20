@@ -866,6 +866,37 @@ func TestParseAlterTableRenameColumn(t *testing.T) {
 	}
 }
 
+// TestParseAlterTableInheritanceStarSuffix covers the ALTER TABLE relation-
+// name trailing '*' (include descendants) form. PG lexes '*' as a plain
+// symbol here (see relation_expr in postgres/src/backend/parser/gram.y);
+// goopg's lexer produces TokenSymbol for '*' (lexer.go:391,424), matching the
+// sibling star-suffix sites (ddl.go:5827, parser.go:1855,3484,
+// select.go:1121,3039,4134,4285). M0134-0015b.
+func TestParseAlterTableInheritanceStarSuffix(t *testing.T) {
+	for _, tc := range []struct {
+		sql      string
+		wantKind AlterTableActionKind
+	}{
+		{"ALTER TABLE t* RENAME COLUMN a TO b", AlterTableRenameColumn},
+		{"ALTER TABLE t* ADD COLUMN c int", AlterTableAddColumn},
+	} {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T", tc.sql, stmts[0])
+		}
+		if len(at.Actions) != 1 || at.Actions[0].Kind != tc.wantKind {
+			t.Fatalf("Parse(%q): actions=%+v", tc.sql, at.Actions)
+		}
+		if at.Name.Name != "t" {
+			t.Errorf("Parse(%q): Name=%+v want relation name %q (bare, star consumed)", tc.sql, at.Name, "t")
+		}
+	}
+}
+
 // TestParseCreateTableColumnCompression covers the inline `COMPRESSION <method>`
 // clause in a CREATE TABLE column definition (`a text COMPRESSION lz4`), which
 // threads the method onto ColumnDef.Compression. DU-002 slice 183.

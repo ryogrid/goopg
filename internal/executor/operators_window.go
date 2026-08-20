@@ -322,8 +322,6 @@ func (o *windowOp) evalWindowFuncs() error {
 						}
 						o.rows[i][colIdx] = v
 					}
-				case "sum", "count", "avg", "min", "max":
-					// Already computed per-frame in evalFrameAggFuncs above.
 				case "ntile":
 					// Already computed per-partition in evalNtileFuncs above.
 				case "percent_rank":
@@ -425,6 +423,16 @@ func (o *windowOp) evalWindowFuncs() error {
 					}
 					o.rows[i][colIdx] = v
 				default:
+					if isFrameAggWindowFunc(fn.Name) {
+						// Already computed per-frame by evalFrameAggFuncs /
+						// evalExplicitFrameAggFuncs above (called before this
+						// per-row loop), which are name-agnostic: they route
+						// through windowFuncToAggregateCall (operators_window.go)
+						// into the same aggHelper.applyAgg/finishAgg machinery
+						// every ordinary aggregate call uses. Nothing further
+						// to compute per row here. M0134-0022b.
+						continue
+					}
 					return &ExecError{Code: "0A000", Pos: fn.Pos(), Message: "window function is not supported in v0 executor"}
 				}
 			}
@@ -433,16 +441,17 @@ func (o *windowOp) evalWindowFuncs() error {
 	return nil
 }
 
-// isFrameAggWindowFunc reports whether name is one of the ordinary
-// aggregates usable as a window function (sum/count/avg/min/max).
-// These consume a frame rather than a fixed row offset like
-// row_number/rank/lag/lead.
+// isFrameAggWindowFunc reports whether name is an ordinary aggregate
+// usable as a window function over an explicit frame (sum/count/avg/
+// min/max/var_pop/stddev/array_agg/...). PostgreSQL has no allow-list
+// here — any pg_aggregate is window-capable
+// (postgres/src/backend/parser/parse_agg.c:transformWindowFuncCall) —
+// so this delegates to isKnownAggregate
+// (operators_ddl_partition.go:899), the executor package's existing
+// complete aggregate-name set, rather than keeping a 7th stale copy.
+// M0134-0022b.
 func isFrameAggWindowFunc(name string) bool {
-	switch strings.ToLower(name) {
-	case "sum", "count", "avg", "min", "max":
-		return true
-	}
-	return false
+	return isKnownAggregate(strings.ToLower(name))
 }
 
 // hasFrameValueWindowFunc reports whether fns contains first_value,

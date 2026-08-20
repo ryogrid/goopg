@@ -280,10 +280,13 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 			sess.EndTransaction(committed)
 			// Re-sync is_superuser / the executor-context mirror after
 			// connTx.End() (called by the caller just before this) restores
-			// NonSuperuserRole from a pending SET LOCAL ROLE / SESSION
-			// AUTHORIZATION snapshot (SnapshotLocalRoleIfNeeded). M0119-0004.
+			// NonSuperuserRole/SessionUser/SetRoleIsActive from a pending
+			// SET LOCAL ROLE / SESSION AUTHORIZATION snapshot
+			// (SnapshotLocalRoleIfNeeded). M0119-0004, M0134-0009 round 2 (R1).
 			if connTx != nil {
 				ectx.NonSuperuserRole = connTx.NonSuperuserRole
+				ectx.SessionUser = connTx.SessionUser
+				ectx.SetRoleIsActive = connTx.SetRoleIsActive
 				setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
 			}
 		}
@@ -329,13 +332,59 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 	// so any such statement here was silently dropped.
 	if connTx != nil {
 		ectx.NonSuperuserRole = connTx.NonSuperuserRole
+		ectx.SetRoleIsActive = connTx.SetRoleIsActive
+		ectx.SessionUser = connTx.SessionUser
+		// Split SET SESSION AUTHORIZATION from SET ROLE exactly as
+		// dispatch.go's simple-query wiring does (M0134-0009 — this
+		// extended-protocol wiring was a third, previously-unnoticed copy of
+		// the same aliased closure).
 		ectx.SetSessionAuthorization = func(role string, local bool) {
 			connTx.SnapshotLocalRoleIfNeeded(local)
-			connTx.NonSuperuserRole = role
-			ectx.NonSuperuserRole = role
-			setIsSuperuserGUC(sess, role == "")
+			if role == "" {
+				role = connTx.LoginUser
+			}
+			connTx.SessionUser = role
+			connTx.SetRoleIsActive = false
+			if strings.EqualFold(role, "postgres") {
+				connTx.NonSuperuserRole = ""
+			} else {
+				connTx.NonSuperuserRole = role
+			}
+			ectx.SessionUser = connTx.SessionUser
+			ectx.SetRoleIsActive = connTx.SetRoleIsActive
+			ectx.NonSuperuserRole = connTx.NonSuperuserRole
+			setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
 		}
-		ectx.SetRole = ectx.SetSessionAuthorization
+		ectx.SetRole = func(role string, local bool) {
+			connTx.SnapshotLocalRoleIfNeeded(local)
+			switch {
+			case role == "":
+				// A bare RESET ROLE with no SET ROLE active must be a no-op
+				// (PG parity, miscinit.c SetRoleIsActive) — it must not wipe
+				// out a SET SESSION AUTHORIZATION role override.
+				if connTx.SetRoleIsActive {
+					connTx.NonSuperuserRole = ""
+				}
+				connTx.SetRoleIsActive = false
+			case strings.EqualFold(role, "postgres"):
+				// SET ROLE postgres: explicit target, not a NONE/DEFAULT
+				// synonym (round-2 review R7). NonSuperuserRole stays "" —
+				// postgres is the bootstrap superuser, so the
+				// NonSuperuserRole=="" privilege-check convention must
+				// still see "superuser" — but SetRoleIsActive=true records
+				// that a role IS active so EffectiveUserName reports
+				// "postgres" (see its invariant comment) instead of
+				// falling back to SessionUser.
+				connTx.NonSuperuserRole = ""
+				connTx.SetRoleIsActive = true
+			default:
+				connTx.NonSuperuserRole = role
+				connTx.SetRoleIsActive = true
+			}
+			ectx.NonSuperuserRole = connTx.NonSuperuserRole
+			ectx.SetRoleIsActive = connTx.SetRoleIsActive
+			setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
+		}
 		// pg_notify(channel, payload) buffers into the connection's transaction
 		// so it publishes to LISTENers at commit, exactly like the NOTIFY
 		// statement. Mirrors dispatch.go's identical wiring (the simple path

@@ -7,7 +7,8 @@
 // import internal/replication (nor internal/postmaster) from here: the
 // dependency runs postmaster -> replication -> backup, and an import in the
 // other direction is an immediate cycle. The two helpers this package used to
-// borrow from replication.go — writeStreamingError and formatLSN — are
+// borrow from walsender.go / replication_util.go — writeStreamingError and
+// formatLSN — are
 // therefore carried locally.
 //
 // Implements the upstream `pg_basebackup`-compatible replication

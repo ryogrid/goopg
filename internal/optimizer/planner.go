@@ -1125,7 +1125,49 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 				if err != nil {
 					return nil, err
 				}
-				node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
+				// M0134-0010 §4: NOT NULL-driven reduction of IS [NOT] NULL
+				// restriction quals (initsplan.c add_base_clause_to_rel /
+				// restriction_is_always_true / restriction_is_always_false),
+				// single-baserel only — this branch IS that gate. See
+				// docs/design/m0134-0010-notnull-qual-reduction.md and
+				// notnull_qual_reduce.go.
+				var reduceTbl *catalog.Table
+				var reduceSrcIdx int
+				if len(ctx.bindings) == 1 {
+					reduceTbl = ctx.bindings[0].table
+					reduceSrcIdx = int(ctx.bindings[0].sourceIdx)
+				}
+				rewritten, alwaysFalse := reduceNotNullQuals(pred, reduceTbl, reduceSrcIdx)
+				switch {
+				case alwaysFalse:
+					// restriction_is_always_false: replace the scan with a
+					// CHILDLESS Result{OneTimeFilter: false} — PG's plan is
+					// `Result / One-Time Filter: false` with NO scan
+					// underneath at all (predicate.out lines 34-40/75-81: 2
+					// rows total, no `->` line). The now-unreachable scan
+					// must not be attached as Child (round 2: it was
+					// wrongly kept, producing a dangling `-> Seq Scan` line
+					// PG never emits). resultOp.Open evaluates OneTimeFilter
+					// against a nil slot and short-circuits to EOF BEFORE
+					// ever touching Child (operators.go Open/Next/Close all
+					// gate on qualFailed first) — the same childless shape
+					// already used by the S6 min/max top-node Result, so a
+					// nil Child here is a pre-existing, exercised path, not
+					// a new one. Targets stay a pass-through identity
+					// projection so Output()/row description still reports
+					// the scan's original column shape for `SELECT *`; they
+					// are never evaluated at runtime since qualFailed always
+					// short-circuits first.
+					scanSchema := node.Output()
+					node = &Result{pos: s.Where.Pos(), Targets: identityResultTargets(scanSchema),
+						OneTimeFilter: &BooleanConst{pos: s.Where.Pos(), Value: false},
+						Child:         nil, schema: scanSchema}
+				case rewritten == nil:
+					// restriction_is_always_true for every conjunct: bare
+					// scan, no Filter node at all.
+				default:
+					node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: rewritten}
+				}
 			}
 		} else {
 			pred, err := resolveExpr(whereQual, ctx)
@@ -2556,6 +2598,13 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 	}
 	*nextSourceIdx++
 	leftCtx := newResolveContext([]rangeBinding{leftBinding}, leftNode.Output())
+	// M0134-0011c: give every per-join resolve context a catalog handle
+	// so IN (subquery) / EXISTS in a JOIN ... ON clause can plan the
+	// sublink via planInExpr (planner.go's `ctx.cat == nil` guard) the
+	// same way the WHERE/target-list path already does. Previously
+	// only the TOP-LEVEL ctx got `.cat` (planFromClause's post-hoc
+	// patch-up), which runs AFTER every ON clause here is resolved.
+	leftCtx.cat = cat
 	for _, j := range item.Joins {
 		// LATERAL on the right side of a JOIN can reference the
 		// left side. Merge the outer lateralCtx with the current
@@ -2578,6 +2627,7 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 		}
 
 		rightCtx := newResolveContext([]rangeBinding{rightBinding}, appendSchema(leftCtx.schema, rightNode.Output()))
+		rightCtx.cat = cat
 		// Build a separate right binding for the merged context with usingHidden set.
 		// This hides the right-side copy of USING columns from unqualified lookup
 		// while rightCtx (above) retains full access for the join predicate.
@@ -2590,6 +2640,7 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 		mergedBindings = append(mergedBindings, mergedRightBinding)
 		mergedSchema := appendSchema(leftCtx.schema, rightNode.Output())
 		mergedCtx := newResolveContext(mergedBindings, mergedSchema)
+		mergedCtx.cat = cat
 
 		pred, err := planJoinPredicate(j, leftCtx, rightCtx, mergedCtx)
 		if err != nil {
@@ -4422,6 +4473,70 @@ func wrapOrdinality(node Node, b rangeBinding, rv parser.RangeVar, sourceIdx int
 	return wrapped, rangeBinding{table: newTbl, alias: b.alias, offset: b.offset, sourceIdx: b.sourceIdx}
 }
 
+// userRoutineColumnSchema computes the FROM-clause column schema for a
+// user-defined routine used as a table-function source, shared between the
+// SETOF and non-SETOF (scalar) arms of planTableFuncRangeVar. PG treats
+// naming/typing as shared machinery independent of proretset:
+// postgres/src/backend/parser/parse_clause.c:463 transformRangeFunction
+// builds funcnames/funcexprs/coldeflists for every function regardless of
+// set-ness, resolving types via
+// postgres/src/backend/utils/fmgr/funcapi.c:299/:410
+// get_expr_result_type/get_func_result_type. Returns one catalog.Column per
+// OUT parameter, or the composite return type's own columns, or a single
+// scalar column named alias — with colAliases (from rv.Columns, minus a
+// stripped WITH ORDINALITY tail) overriding names positionally. M0134-0015c.
+func userRoutineColumnSchema(cat catalog.Catalog, r *catalog.Routine, alias string, colAliases []string) []catalog.Column {
+	// If the routine has OUT parameters, expand them as separate columns
+	// (matches PostgreSQL's treatment of SETOF record functions with named
+	// OUT params).
+	var outCols []catalog.Column
+	for i, mode := range r.ArgModes {
+		if mode == "o" || mode == "b" {
+			name := ""
+			if i < len(r.ArgNames) {
+				name = r.ArgNames[i]
+			}
+			if name == "" {
+				name = fmt.Sprintf("column%d", len(outCols)+1)
+			}
+			typ := catalog.Type{Name: "text"}
+			if i < len(r.ArgTypes) {
+				typ = r.ArgTypes[i]
+			}
+			outCols = append(outCols, catalog.Column{Name: name, Type: typ, Ordinal: len(outCols)})
+		}
+	}
+	if len(outCols) > 0 {
+		for i := range outCols {
+			if i < len(colAliases) {
+				outCols[i].Name = colAliases[i]
+			}
+		}
+		return outCols
+	}
+	retTypeName := r.ReturnType.Name
+	if retTypeName == "" {
+		retTypeName = "text"
+	}
+	// If the return type is a composite (table) type, expand its columns.
+	if compTbl, ok := cat.LookupTable(parser.ObjectName{Name: retTypeName}); ok && len(compTbl.Columns) > 0 {
+		compositeCols := make([]catalog.Column, len(compTbl.Columns))
+		copy(compositeCols, compTbl.Columns)
+		for i := range compositeCols {
+			compositeCols[i].Ordinal = i
+			if i < len(colAliases) {
+				compositeCols[i].Name = colAliases[i]
+			}
+		}
+		return compositeCols
+	}
+	colName := alias
+	if len(colAliases) > 0 {
+		colName = colAliases[0]
+	}
+	return []catalog.Column{{Name: colName, Type: catalog.Type{Name: retTypeName}, Ordinal: 0}}
+}
+
 // planTableFuncRangeVar plans a table-valued function in the FROM clause.
 // Currently only generate_series(start, stop[, step]) and pg_input_error_info(value, type)
 // are supported.
@@ -4529,100 +4644,52 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 		if rs := cat.Routines(); rs != nil {
 			cands := rs.LookupByName(parser.ObjectName{Name: tf.Name})
 			for _, r := range cands {
-				if r.ReturnsSet {
-					ctx := &resolveContext{}
-					resolvedArgs := make([]Expr, len(tf.Args))
-					for i, a := range tf.Args {
-						re, err := resolveExpr(a, ctx)
-						if err != nil {
-							return nil, rangeBinding{}, err
-						}
-						resolvedArgs[i] = re
+				ctx := &resolveContext{}
+				resolvedArgs := make([]Expr, len(tf.Args))
+				for i, a := range tf.Args {
+					re, err := resolveExpr(a, ctx)
+					if err != nil {
+						return nil, rangeBinding{}, err
 					}
-					alias := rv.Alias
-					if alias == "" {
-						alias = strings.ToLower(tf.Name)
-					}
-					// If the routine has OUT parameters, expand them as separate
-					// columns (matches PostgreSQL's treatment of SETOF record
-					// functions with named OUT params).
-					var outCols []catalog.Column
-					for i, mode := range r.ArgModes {
-						if mode == "o" || mode == "b" {
-							name := ""
-							if i < len(r.ArgNames) {
-								name = r.ArgNames[i]
-							}
-							if name == "" {
-								name = fmt.Sprintf("column%d", len(outCols)+1)
-							}
-							typ := catalog.Type{Name: "text"}
-							if i < len(r.ArgTypes) {
-								typ = r.ArgTypes[i]
-							}
-							outCols = append(outCols, catalog.Column{Name: name, Type: typ, Ordinal: len(outCols)})
-						}
-					}
-					// Strip ordinality alias if WITH ORDINALITY.
-					userSrfColAliases := rv.Columns
-					if tf.WithOrdinality && len(userSrfColAliases) > 0 {
-						userSrfColAliases = userSrfColAliases[:len(userSrfColAliases)-1]
-					}
-					var tbl *catalog.Table
-					var schema Schema
-					if len(outCols) > 0 {
-						// Multi-column schema from OUT parameters.
-						// Apply column aliases.
-						for i := range outCols {
-							if i < len(userSrfColAliases) {
-								outCols[i].Name = userSrfColAliases[i]
-							}
-						}
-						tbl = &catalog.Table{Name: alias, Columns: outCols}
-						for _, c := range outCols {
-							schema = append(schema, SchemaColumn{Name: c.Name, Type: c.Type, SourceTableIdx: sourceIdx})
-						}
-					} else {
-						retTypeName := r.ReturnType.Name
-						if retTypeName == "" {
-							retTypeName = "text"
-						}
-						// If the return type is a composite (table) type, expand its columns.
-						if compTbl, ok := cat.LookupTable(parser.ObjectName{Name: retTypeName}); ok && len(compTbl.Columns) > 0 {
-							compositeCols := make([]catalog.Column, len(compTbl.Columns))
-							copy(compositeCols, compTbl.Columns)
-							for i := range compositeCols {
-								compositeCols[i].Ordinal = i
-								if i < len(userSrfColAliases) {
-									compositeCols[i].Name = userSrfColAliases[i]
-								}
-							}
-							tbl = &catalog.Table{Name: alias, Columns: compositeCols}
-							for _, c := range compositeCols {
-								schema = append(schema, SchemaColumn{Name: c.Name, Type: c.Type, SourceTableIdx: sourceIdx})
-							}
-						} else {
-							colName := alias
-							if len(userSrfColAliases) > 0 {
-								colName = userSrfColAliases[0]
-							}
-							tbl = &catalog.Table{
-								Name: alias,
-								Columns: []catalog.Column{
-									{Name: colName, Type: catalog.Type{Name: retTypeName}, Ordinal: 0},
-								},
-							}
-							schema = Schema{SchemaColumn{Name: colName, Type: catalog.Type{Name: retTypeName}, SourceTableIdx: sourceIdx}}
-						}
-					}
-					node := &UserSrfScan{pos: tf.Pos(), Routine: r, Args: resolvedArgs, Alias: alias, schema: schema}
-					b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
-					if tf.WithOrdinality {
-						node2, b2 := wrapOrdinality(node, b, rv, sourceIdx)
-						return node2, b2, nil
-					}
-					return node, b, nil
+					resolvedArgs[i] = re
 				}
+				alias := rv.Alias
+				if alias == "" {
+					alias = strings.ToLower(tf.Name)
+				}
+				// Strip ordinality alias if WITH ORDINALITY.
+				userSrfColAliases := rv.Columns
+				if tf.WithOrdinality && len(userSrfColAliases) > 0 {
+					userSrfColAliases = userSrfColAliases[:len(userSrfColAliases)-1]
+				}
+				cols := userRoutineColumnSchema(cat, r, alias, userSrfColAliases)
+				tbl := &catalog.Table{Name: alias, Columns: cols}
+				var schema Schema
+				for _, c := range cols {
+					schema = append(schema, SchemaColumn{Name: c.Name, Type: c.Type, SourceTableIdx: sourceIdx})
+				}
+				var node Node
+				if r.ReturnsSet {
+					node = &UserSrfScan{pos: tf.Pos(), Routine: r, Args: resolvedArgs, Alias: alias, schema: schema}
+				} else {
+					// Non-SETOF (scalar or composite-returning) routine used as a
+					// FROM source. PG calls it exactly once and always produces
+					// exactly one row — postgres/src/backend/executor/execSRF.c:101
+					// ExecMakeTableFunctionResult, the no_function_result: block
+					// (~386-410) manufactures one all-NULL row even when the call
+					// itself returns NULL, never zero rows. scalarFuncScanOp
+					// already implements this one-call/one-row contract via the
+					// same executeStoredRoutine dispatch used for scalar-context
+					// calls like WHERE x = f(1). M0134-0015c.
+					fc := &FuncCall{pos: tf.Pos(), Name: strings.ToLower(tf.Name), Args: resolvedArgs}
+					node = &ScalarFuncScan{pos: tf.Pos(), Func: fc, schema: schema}
+				}
+				b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+				if tf.WithOrdinality {
+					node2, b2 := wrapOrdinality(node, b, rv, sourceIdx)
+					return node2, b2, nil
+				}
+				return node, b, nil
 			}
 		}
 		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "0A000",
@@ -6194,7 +6261,56 @@ func buildWindowFunc(fc *parser.FuncCall, inputCtx *resolveContext, agg *aggrega
 		}
 		return WindowFunc{pos: fc.Pos(), Name: name, Type: catalog.Type{Name: "int4"}, Args: []Expr{argResolved}}, nil
 	default:
-		return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "0A000", Message: fmt.Sprintf("window function %q is not supported in v0 planner", name)}
+		// PostgreSQL has no window-function allow-list: any ordinary
+		// aggregate is usable as a window function
+		// (postgres/src/backend/parser/parse_agg.c:transformWindowFuncCall).
+		// This is the planner's twin of analyzeWindowFuncCall's default
+		// arm (internal/parser/analyzer/analyzer.go) — a fourth serial
+		// gate the M0134-0022b brief's 3-site scope did not name; without
+		// widening it too, the analyzer's ACCEPT is immediately re-rejected
+		// here with the same "not supported in v0 <stage>" shape, net diff
+		// reduction zero. M0134-0022b.
+		if !isAggregateFuncName(fc) {
+			return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "0A000", Message: fmt.Sprintf("window function %q is not supported in v0 planner", name)}
+		}
+		if fc.Distinct {
+			return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "0A000", Message: "DISTINCT is not implemented for window functions"}
+		}
+		if len(fc.OrderBy) > 0 {
+			return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "0A000", Message: "aggregate ORDER BY is not implemented for window functions"}
+		}
+		var filterExpr Expr
+		if fc.Filter != nil {
+			var ferr error
+			filterExpr, ferr = resolveExprForWindowInput(fc.Filter, inputCtx, agg)
+			if ferr != nil {
+				return WindowFunc{}, ferr
+			}
+		}
+		if fc.Star {
+			if name != "count" {
+				return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "42601", Message: fmt.Sprintf("%s(*) is not supported", name)}
+			}
+			return WindowFunc{pos: fc.Pos(), Name: name, Type: catalog.Type{Name: "int8"}, Star: true, Filter: filterExpr}, nil
+		}
+		args := make([]Expr, 0, len(fc.Args))
+		for _, a := range fc.Args {
+			resolved, err := resolveExprForWindowInput(a, inputCtx, agg)
+			if err != nil {
+				return WindowFunc{}, err
+			}
+			args = append(args, resolved)
+		}
+		var argType catalog.Type
+		if len(args) > 0 {
+			argType = exprType(args[0])
+		}
+		// The concrete result type is resolved by the executor's
+		// aggregate machinery (aggHelper.applyAgg/finishAgg via
+		// windowFuncToAggregateCall), same as the ordinary (non-window)
+		// aggregate path — "unknown" here mirrors resolveExpr's default
+		// FuncCall handling for these same names.
+		return WindowFunc{pos: fc.Pos(), Name: name, Type: catalog.Type{Name: "unknown"}, Args: args, Filter: filterExpr, InputType: argType}, nil
 	}
 }
 
@@ -7267,6 +7383,16 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		if err != nil {
 			return nil, err
 		}
+		// M0134-0025: a correlated (outer-level) reference is not part of this
+		// query's grouping surface at all — PG's check_ungrouped_columns
+		// (parse_agg.c) skips any Var with varlevelsup != 0. Return it
+		// unchanged: no groupByInputCol/funcDepCols lookup, no Passthrough
+		// registration, since that machinery proves LOCAL GROUP BY membership
+		// only and OuterColumnRef.Index addresses ctx.OuterRows[Level], a
+		// different address space than agg.input's local child schema.
+		if oc, ok := resolved.(*OuterColumnRef); ok {
+			return oc, nil
+		}
 		col := resolved.(*ColumnRef)
 		idx, ok := agg.groupByInputCol[col.Index]
 		// M0097-0155: reject USING-merge GROUP BY match for qualified SELECT refs.
@@ -7818,6 +7944,20 @@ func isAggregateFunc(fc *parser.FuncCall) bool {
 	if fc.Over != nil {
 		return false
 	}
+	return isAggregateFuncName(fc)
+}
+
+// isAggregateFuncName is isAggregateFunc's standard-aggregate name
+// classification, factored out so buildWindowFunc's default arm
+// (M0134-0022b) can reuse the exact same "complete" name set without a
+// 7th stale copy (docs/design/m0134-0022-window-aggregate-gates.md).
+// A window aggregate call necessarily has fc.Over != nil, which
+// isAggregateFunc's guard above treats as "not an aggregate" for its
+// own callers (GROUP BY/HAVING collection, where a window function must
+// never be mistaken for a plain aggregate) — this helper skips that
+// guard so it can also answer "is name an aggregate at all" for the
+// window-function gate.
+func isAggregateFuncName(fc *parser.FuncCall) bool {
 	name := strings.ToLower(fc.Name.Name)
 	// Ordered-set / hypothetical-set aggregates: rank, dense_rank, cume_dist,
 	// percent_rank are aggregate functions ONLY when WITHIN GROUP is present;
@@ -8763,7 +8903,12 @@ func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.
 			if !ok {
 				return nil, false, nil
 			}
-			idx := findBTreeIndexForColumn(cat, tbl, col.Name)
+			// resolvedKey is an OuterColumnRef here, never a Const, so this
+			// synthetic clause can never satisfy provePartialIndexPredicate's
+			// Var-op-Const shape — it is passed through only so the helper's
+			// (correct) refusal is by shape, not by omission.
+			queryClause := Expr(&BinaryOp{pos: where.Pos(), Op: b.Op, Left: col, Right: resolvedKey})
+			idx := findBTreeIndexForColumn(cat, tbl, col.Name, queryClause)
 			if idx == nil {
 				return nil, false, nil
 			}
@@ -8835,7 +8980,13 @@ func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.
 		return nil, false, nil
 	}
 
-	idx := findBTreeIndexForColumn(cat, tbl, col.Name)
+	// b.Op is OpEq here (checked above), so this is `col = resolvedKey` —
+	// exactly the Var-op-Const shape provePartialIndexPredicate proves
+	// against a partial index's predicate. resolvedKey is not always a
+	// literal Const (ParamRef, CastExpr, TypedStringLit) — the helper's
+	// toLiteralValue-based recognizer refuses those by shape, as it should.
+	queryClause := Expr(&BinaryOp{pos: where.Pos(), Op: b.Op, Left: col, Right: resolvedKey})
+	idx := findBTreeIndexForColumn(cat, tbl, col.Name, queryClause)
 	if idx == nil {
 		return nil, false, nil
 	}
@@ -9038,7 +9189,7 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 		// agg column (the IOS decodes just the covered column; any other ref would be
 		// out-of-range on the 1-wide row — e.g. `min(unique1) WHERE ten = 3` stays on
 		// the SeqScan fallback, as PG would leave it a heap-fetch residual).
-		if idx := findBTreeIndexForColumn(cat, tbl, argCR.Name); idx != nil &&
+		if idx := findBTreeIndexForColumn(cat, tbl, argCR.Name, nil); idx != nil &&
 			(wherePred == nil || wherePredSafeForIOS(wherePred, argCR)) {
 			covered, ok := cat.LookupColumn(tbl, argCR.Name)
 			if !ok {
@@ -9421,7 +9572,17 @@ func wherePredSafeForIOS(wherePred Expr, argCR *ColumnRef) bool {
 // A single-column-only index is preferred when both shapes match the
 // column (cheaper probe — exact equality vs. prefix range) so the
 // search returns a single-column index first when one exists.
-func findBTreeIndexForColumn(cat catalog.Catalog, tbl *catalog.Table, col string) *catalog.Index {
+//
+// queryClause is the resolved (planner.Expr) restriction clause the caller
+// has in hand for this scan, or nil when no literal clause is available
+// (e.g. the min/max IOS rewrite, the range-scan and conjunct-absorption
+// callers below). For a partial index (`idx.HasPredicate`), the index is
+// only accepted when `provePartialIndexPredicate` proves queryClause implies
+// the index's predicate — the M0134-0017b narrow `operator_predicate_proof`
+// specialization (both clauses are `Var op Const` over the same column, same
+// operator, equal constant). A nil queryClause can never prove anything, so
+// callers that pass nil keep today's blanket decline exactly as before.
+func findBTreeIndexForColumn(cat catalog.Catalog, tbl *catalog.Table, col string, queryClause Expr) *catalog.Index {
 	var composite *catalog.Index
 	for _, idx := range cat.IndexesOnTable(tbl) {
 		if strings.ToLower(idx.Method) != "btree" {
@@ -9430,18 +9591,31 @@ func findBTreeIndexForColumn(cat catalog.Catalog, tbl *catalog.Table, col string
 		// A partial index. PG only reaches `build_index_paths` for an index
 		// whose predicate was PROVEN from the query's restriction clauses
 		// (`check_index_predicates` sets `index->predOK`; an unproven partial
-		// index is skipped in `create_index_paths`). goopg has no
-		// predicate-implication prover, so the honest answer is to decline
-		// rather than to emit a scan that silently drops every row the index
-		// predicate excludes. This mirrors the identical guard on the ordered
-		// path (`pathindexordered.go` `addOneOrderedIndexPath`), which was
-		// left un-mirrored here — the gap returned 0 rows for
-		// `onek2 WHERE unique1 = 50` against `onek2_u1_prtl (WHERE unique1 <
-		// 20 OR unique1 > 980)` in the regress cases `portals_p2`/`select`.
-		// Ledgered: teaching goopg the prover would let it USE the index when
-		// the qual does imply the predicate, as PG does.
+		// index is skipped in `create_index_paths`). goopg has no general
+		// predicate-implication prover, but M0134-0017b ports the narrow leaf
+		// case: when queryClause and the index predicate are both `Var op
+		// Const` over the same column with the same operator and an equal
+		// constant, the index predicate IS the query's own qual, so the index
+		// provably contains every row the scan may return. Anything else
+		// still declines — using an unproven partial index silently drops
+		// the rows its predicate excludes. This mirrors the identical guard
+		// on the ordered path (`pathindexordered.go`
+		// `addOneOrderedIndexPath`), which was left un-mirrored here — the
+		// gap returned 0 rows for `onek2 WHERE unique1 = 50` against
+		// `onek2_u1_prtl (WHERE unique1 < 20 OR unique1 > 980)` in the
+		// regress cases `portals_p2`/`select` (deferral ledger, 2026-08-07,
+		// `M0127 S7 gate / AI-20260806-232940-001,-002`).
 		if idx.HasPredicate {
-			continue
+			if queryClause == nil {
+				continue
+			}
+			resolvedPred, err := ResolveIndexPredicate(idx.Predicate, tbl)
+			if err != nil || resolvedPred == nil {
+				continue
+			}
+			if !provePartialIndexPredicate(resolvedPred, queryClause) {
+				continue
+			}
 		}
 		if len(idx.Columns) == 0 || idx.Columns[0] != col {
 			continue
@@ -9735,7 +9909,7 @@ func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContex
 		// Ensure column is from the target table (not outer ref)
 		if chosenColName == "" {
 			// First indexed column: look up a B-tree index for it
-			idx := findBTreeIndexForColumn(cat, tbl, col.Name)
+			idx := findBTreeIndexForColumn(cat, tbl, col.Name, nil)
 			if idx == nil {
 				continue
 			}
@@ -10527,8 +10701,19 @@ func resolveArbiterIndex(target *parser.OnConflictTarget, tbl *catalog.Table, re
 		if idx.Table != tbl {
 			return nil, nil, &PlanError{Pos: target.Pos(), Code: "42704", Message: fmt.Sprintf("constraint %q does not belong to table %q", target.Constraint, tbl.Name)}
 		}
-		if !idx.Unique {
+		if !idx.Unique && !idx.IsExclusion {
 			return nil, nil, &PlanError{Pos: target.Pos(), Code: "42P10", Message: fmt.Sprintf("constraint %q is not a unique constraint", target.Constraint)}
+		}
+		// M0134-0005af: an exclusion constraint IS a legal arbiter (PG oracle
+		// execIndexing.c:592-596), sibling of the analyzer's identical check
+		// (analyzer.go analyzeOnConflict) — this defensive re-check must stay
+		// in lockstep. Deferrable exclusion/unique constraints are rejected
+		// regardless of kind, keyed on InitiallyDeferred (indimmediate is
+		// false only for INITIALLY DEFERRED). execIndexing.c:604-610.
+		if idx.InitiallyDeferred {
+			// Pos: 0 — see analyzer.go's identical check; PG raises this at
+			// execution time with no errposition.
+			return nil, nil, &PlanError{Pos: 0, Code: "55000", Message: "ON CONFLICT does not support deferrable unique constraints/exclusion constraints as arbiters"}
 		}
 		ords := make([]int, 0, len(idx.Columns))
 		for _, ic := range idx.Columns {
@@ -10820,7 +11005,7 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 		// itself would expose (root-0025 deferred item 3).
 		tgtScan := &SeqScan{pos: s.Pos(), Table: tbl, schema: tableSchemaWithSource(resolveScope, 1)}
 		upd := &Update{
-			pos: s.Pos(), Table: tbl, Child: tgtScan, Set: set,
+			pos: s.Pos(), Table: tbl, Child: tgtScan, Only: s.Target.Only, Set: set,
 			FromTables: fromTables, FromScans: fromScans, FromSchema: fromSchema,
 			FromPred:      andExpr(s.Pos(), viewQual, pred),
 			ViewCheckQual: viewCheckQual, ViewCheckName: viewCheckName,
@@ -10880,7 +11065,7 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 			return nil, err
 		}
 	}
-	upd := &Update{pos: s.Pos(), Table: tbl, Child: node, Set: set, ViewCheckQual: viewCheckQual, ViewCheckName: viewCheckName}
+	upd := &Update{pos: s.Pos(), Table: tbl, Child: node, Only: s.Target.Only, Set: set, ViewCheckQual: viewCheckQual, ViewCheckName: viewCheckName}
 	if len(s.Returning) > 0 {
 		retExprs, retSchema, err := resolveTargets(s.Returning, ctx)
 		if err != nil {
@@ -10988,7 +11173,7 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 		// target is a view (root-0025 deferred item 3).
 		tgtScan := &SeqScan{pos: s.Pos(), Table: tbl, schema: tableSchemaWithSource(resolveScope, 1)}
 		del := &Delete{
-			pos: s.Pos(), Table: tbl, Child: tgtScan,
+			pos: s.Pos(), Table: tbl, Child: tgtScan, Only: s.Target.Only,
 			UsingTables: usingTables, UsingScans: usingScans, UsingSchema: usingSchema,
 			UsingPred: andExpr(s.Pos(), viewQual, pred),
 		}
@@ -11039,7 +11224,7 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 	} else if viewQual != nil {
 		node = &Filter{pos: s.Pos(), Child: node, Predicate: viewQual}
 	}
-	del := &Delete{pos: s.Pos(), Table: tbl, Child: node}
+	del := &Delete{pos: s.Pos(), Table: tbl, Child: node, Only: s.Target.Only}
 	if len(s.Returning) > 0 {
 		retExprs, retSchema, err := resolveTargets(s.Returning, ctx)
 		if err != nil {
@@ -11888,6 +12073,12 @@ func exprType(e Expr) catalog.Type {
 		// cell text — without this, sum(numeric * numeric) lands as
 		// int8 and libpq's Go driver fails ParseInt on `20667.0000`.
 		switch x.Op {
+		case parser.OpPow:
+			// PG has no int^int operator: both operands implicitly cast to
+			// float8 and the resolution lands on dpow, always float8 —
+			// unlike +-*/%, never numeric/int regardless of operand types.
+			// postgres/src/backend/utils/adt/float.c:dpow. M0134-0019b.
+			return catalog.Type{Name: "float8"}
 		case parser.OpAdd, parser.OpSub, parser.OpMul, parser.OpDiv, parser.OpMod:
 			lt := exprType(x.Left)
 			rt := exprType(x.Right)

@@ -249,7 +249,7 @@ func (o *reindexOp) rebuildIndex(idx *catalog.Index, pos int) error {
 	}
 	defer release()
 	dop := &ddlOp{ctx: o.ctx}
-	return dop.bulkBuildBTreeFull(idx, idxRel, tbl, cols, resolveIndexKeyExprs(tbl, idx), idx.Unique, idx.NullsNotDistinct, idx.Name, pos, predExpr)
+	return dop.bulkBuildBTreeFull(idx, idxRel, tbl, cols, resolveIndexKeyExprs(tbl, idx), idx.Unique, idx.Unique, idx.NullsNotDistinct, idx.Name, pos, predExpr)
 }
 
 // rebuildTableIndexes rebuilds every btree index on tbl. Used by plain
@@ -264,41 +264,46 @@ func (o *reindexOp) rebuildTableIndexes(tbl *catalog.Table, pos int) error {
 }
 
 // rebuildIndexConcurrently is REINDEX INDEX CONCURRENTLY's physical rebuild:
+// wait for every transaction that already held the PARENT TABLE locked at
+// the start of this call to finish (the existing waitForRelationLockers
+// contract, unchanged from before this slice — the CONCURRENTLY guarantee
+// real PostgreSQL gives via WaitForLockersMultiple, indexcmds.c:4088), THEN
 // build idx's replacement btree into a fresh, catalog-invisible shadow file
-// (buildIndexShadow) while every other backend's reads/writes of idx and its
-// table proceed unimpeded, wait for every transaction that already held the
-// PARENT TABLE locked at the start of this build to finish (the existing
-// waitForRelationLockers contract, unchanged from before this slice — the
-// CONCURRENTLY guarantee real PostgreSQL gives via WaitForLockers), then
-// atomically swap the shadow file in under a brief ACCESS EXCLUSIVE hold on
-// the index (acquireReindexLocks — the same locking plain REINDEX INDEX
-// holds for its *entire* rebuild, here held only for the swap itself, which
-// is the whole point of CONCURRENTLY not blocking for the build). idx's
-// OID/RelFileNode never changes; only its on-disk bytes do, so the swap
-// needs no catalog mutation or WAL record — see swapRelationPhysicalFile's
-// doc comment (operators_ddl.go). Mirrors the same single-scan-then-wait
-// simplification CREATE INDEX CONCURRENTLY already makes (M0122-0007, design
-// 0122-0007-reindex-physical-rebuild "Deferral"): a write that lands on the
-// table WHILE the shadow build's heap scan is in flight is not guaranteed to
-// appear in the rebuilt index — real PostgreSQL closes this gap with a
-// second validation scan, which goopg implements for neither CONCURRENTLY
-// form.
+// (buildIndexShadow) — mirrors PG's phase order, WaitForLockersMultiple
+// before index_concurrently_build (indexcmds.c:4111): waiting first means
+// the shadow build's heap scan never observes an in-flight uncommitted
+// writer as live (isLiveForUniqueCheck, operators_storage.go), which used to
+// raise a spurious 23505 unique-violation when goopg built before waiting.
+// After the build, atomically swap the shadow file in under a brief ACCESS
+// EXCLUSIVE hold on the index (acquireReindexLocks — the same locking plain
+// REINDEX INDEX holds for its *entire* rebuild, here held only for the swap
+// itself, which is the whole point of CONCURRENTLY not blocking for the
+// build). idx's OID/RelFileNode never changes; only its on-disk bytes do, so
+// the swap needs no catalog mutation or WAL record — see
+// swapRelationPhysicalFile's doc comment (operators_ddl.go).
+//
+// Known remaining gap (unchanged by this slice, still deferred): PG closes
+// the window between "wait returns" and "build scan completes" with a
+// second wait + validation scan (indexcmds.c, phase 3) that catches rows
+// inserted *during* the build. goopg does not implement that second phase —
+// a write that lands on the table WHILE the shadow build's heap scan is in
+// flight is not guaranteed to appear in the rebuilt index (M0122-0007,
+// design 0122-0007-reindex-physical-rebuild "Deferral").
 func (o *reindexOp) rebuildIndexConcurrently(idx *catalog.Index, pos int) error {
-	if idx == nil || idx.Table == nil {
+	if idx == nil || idx.Table == nil || idx.Method != "btree" {
+		// Non-btree access method: catalog-only, matches the pre-existing no-op.
 		return nil
+	}
+	tblRel := o.ctx.Catalog.RelFileNode(idx.Table)
+	if err := o.ctx.waitForRelationLockers(tblRel); err != nil {
+		return err
 	}
 	shadowRel, built, err := o.buildIndexShadow(idx, pos)
 	if err != nil {
 		return err
 	}
 	if !built {
-		// Non-btree access method: catalog-only, matches the pre-existing no-op.
 		return nil
-	}
-	tblRel := o.ctx.Catalog.RelFileNode(idx.Table)
-	if err := o.ctx.waitForRelationLockers(tblRel); err != nil {
-		o.removeShadowFile(shadowRel)
-		return err
 	}
 	idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
 	release, err := o.acquireReindexLocks(idxRel, tblRel)
@@ -315,18 +320,33 @@ func (o *reindexOp) rebuildIndexConcurrently(idx *catalog.Index, pos int) error 
 }
 
 // rebuildTableIndexesConcurrently is REINDEX TABLE/SCHEMA CONCURRENTLY's
-// per-table physical rebuild: builds a shadow file for every btree index on
-// tbl up front (mirroring how CREATE INDEX CONCURRENTLY's own start-time
-// snapshot is captured before its single build+wait), then performs the
-// SAME single waitForRelationLockers call on the table this code path took
-// before this slice added a physical rebuild at all — so the isolation-spec
-// timing (reindex-concurrently.spec's session interleavings) is unchanged —
-// and finally swaps each index's shadow in, one at a time, exactly as plain
-// REINDEX TABLE's rebuildTableIndexes already does per index. A build
-// failure on any index cleans up every shadow already built for earlier
-// indexes on this table before returning the error. M0122-0007.
+// per-table physical rebuild: performs a SINGLE waitForRelationLockers call
+// on the table FIRST — waiting for every transaction that already held the
+// table locked at the start of this call to finish, the same
+// WaitForLockersMultiple-before-build phase order real PostgreSQL uses per
+// parent heap relation (indexcmds.c:4088 before :4111, ReindexRelation
+// Concurrently) — and only then builds a shadow file for every btree index
+// on tbl (mirroring how CREATE INDEX CONCURRENTLY's own start-time snapshot
+// is captured before its build), and finally swaps each index's shadow in,
+// one at a time, exactly as plain REINDEX TABLE's rebuildTableIndexes
+// already does per index. Waiting first (rather than building first, as
+// before this slice) means the shadow build's heap scan never observes an
+// in-flight uncommitted writer as live, which used to raise a spurious
+// 23505 unique-violation. A build failure on any index cleans up every
+// shadow already built for earlier indexes on this table before returning
+// the error. M0122-0007.
+//
+// Known remaining gap (unchanged by this slice, still deferred): PG closes
+// the window between "wait returns" and "build scan completes" with a
+// second wait + validation scan (indexcmds.c, phase 3) that catches rows
+// inserted *during* the build; goopg implements neither CONCURRENTLY form's
+// second phase (design 0122-0007-reindex-physical-rebuild "Deferral").
 func (o *reindexOp) rebuildTableIndexesConcurrently(tbl *catalog.Table, pos int) error {
 	idxs := o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+	tblRel := o.ctx.Catalog.RelFileNode(tbl)
+	if err := o.ctx.waitForRelationLockers(tblRel); err != nil {
+		return err
+	}
 	shadows := make(map[uint32]storage.RelFileNode, len(idxs))
 	for _, idx := range idxs {
 		shadowRel, built, err := o.buildIndexShadow(idx, pos)
@@ -339,13 +359,6 @@ func (o *reindexOp) rebuildTableIndexesConcurrently(tbl *catalog.Table, pos int)
 		if built {
 			shadows[idx.OID] = shadowRel
 		}
-	}
-	tblRel := o.ctx.Catalog.RelFileNode(tbl)
-	if err := o.ctx.waitForRelationLockers(tblRel); err != nil {
-		for _, sr := range shadows {
-			o.removeShadowFile(sr)
-		}
-		return err
 	}
 	dop := &ddlOp{ctx: o.ctx}
 	for _, idx := range idxs {
@@ -405,7 +418,7 @@ func (o *reindexOp) buildIndexShadow(idx *catalog.Index, pos int) (storage.RelFi
 	shadowRel := o.ctx.Catalog.IndexRelFileNode(idx)
 	shadowRel.RelOid = o.ctx.Catalog.AllocOID()
 	dop := &ddlOp{ctx: o.ctx}
-	buildErr := dop.bulkBuildBTreeFull(idx, shadowRel, tbl, cols, resolveIndexKeyExprs(tbl, idx), idx.Unique, idx.NullsNotDistinct, idx.Name, pos, predExpr)
+	buildErr := dop.bulkBuildBTreeFull(idx, shadowRel, tbl, cols, resolveIndexKeyExprs(tbl, idx), idx.Unique, idx.Unique, idx.NullsNotDistinct, idx.Name, pos, predExpr)
 	if buildErr != nil {
 		o.removeShadowFile(shadowRel)
 		return storage.RelFileNode{}, false, buildErr

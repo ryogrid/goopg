@@ -71,3 +71,102 @@ included at the front of the UNION ALL chain.
 `INSERT INTO c1 SELECT ...` correctly inserts rows into c1.
 `SELECT * FROM p` now returns rows from p, c1, c2, and c3 via UNION ALL.
 All core unit tests pass.
+
+---
+
+## Addendum (2026-08-19, M0134-0005as) — the descendant-walk taxonomy
+
+The "Limitations" list above is a v0 snapshot; multi-level inheritance and
+constraint propagation have since been implemented piecewise, and the pieces did
+NOT converge on one walk. goopg still has no single `find_all_inheritors`
+equivalent. Four walks exist, each with a deliberately different node set:
+
+| walk | node set | epoch | cycle guard |
+|---|---|---|---|
+| `collectDMLPartitionLeaves` (`internal/executor/operators_storage.go:2880`) | partitions only, **leaves only** | snapshot | per-node `seen` |
+| `allDescendants` (`internal/executor/operators_fk.go:1004`) | inheritance ∪ partitions, all descendants | current | per-**node** visited |
+| `collectInheritanceAndPartitionChildren` (`internal/executor/operators_ddl.go:12187`) | inheritance ∪ partitions, **one level** | current | n/a |
+| DDL cascades (`cascadeNotNullToChildren`, `cascadeCheckToChildren`, and the DROP-direction twins) | transitive recursion over the one-level primitive | current | per-**EDGE** visited, depth-bounded |
+
+The per-node vs per-edge distinction is not cosmetic. PG's DDL cascades carry
+`coninhcount`/`attinhcount` bookkeeping that counts **one increment per inheritance
+edge**, so a diamond descendant is legitimately visited once per incoming edge
+(`heap.c:2774-2845`). `allDescendants` dedups per node and therefore must never be
+substituted into a DDL cascade, even though its reachability set looks identical.
+
+### ALTER TABLE … ADD CHECK (M0134-0005as)
+
+Oracle: `postgres/src/backend/commands/tablecmds.c:ATAddCheckNNConstraint`
+(:9911-10049), shared by CHECK and NOT NULL.
+
+1. `is_no_inherit` returns at :10004 **before enumerating any children** — no
+   recursion whatsoever. goopg mirrors this with `cascadeCheckToChildren`'s
+   leading `if noInherit { return nil }`. Before this slice the omission was
+   only accidentally safe: the walk was partitions-only, and NO INHERIT on a
+   partitioned table already errors 42P16 earlier, so the child list was always
+   empty. Adding inheritance children removed that accident.
+2. Children come from `find_inheritance_children` — **one level per call**, then
+   DFS recursion (:10028-10046). `pg_inherits` unifies plain inheritance and
+   partition attachment, so one call covers both. goopg matches this with
+   `collectInheritanceAndPartitionChildren` + explicit recursion, rather than a
+   flat descendant set.
+3. Flags: every recursion level receives the user's **literal**
+   NOT VALID / NOT ENFORCED clause (the same `Constraint` node is reused). This
+   is the ALTER-time rule and is deliberately *asymmetric* with the CREATE-time
+   rule (`MergeCheckConstraint`, :3219-3220), where validity derives purely from
+   enforcement. `TestCheckInheritFlagsCreateTimeAntiSymmetry*` pins the
+   difference so the two rules are not "tidied" into one. See M0134-0005ar.
+4. The constraint name is resolved **once** at the top (PG fills
+   `newConstraint->conname` before recursing) and that resolved name cascades.
+   Previously goopg passed the raw `act.ConstraintName`, so an anonymous
+   `ADD CHECK (x > 0)` propagated an empty name to every child.
+
+### The ONLY refusal and the parent's own name (M0134-0005at)
+
+Both items the 0005as addendum listed as "still unimplemented" are now closed;
+this section replaces that note.
+
+5. **`ONLY` is a refusal, not a narrowing.** PG raises
+   `ERROR: constraint must be added to child tables too` (42P16,
+   `ERRCODE_INVALID_TABLE_DEFINITION`, no detail, no hint) at :10020-10023
+   whenever the recursion is suppressed and `children != NIL`. Note what this is
+   *not*: `ALTER TABLE ONLY p ADD CHECK …` does **not** mean "add to the parent
+   alone" — PG refuses the statement outright, because a parent-only CHECK would
+   leave the inheritance tree permanently inconsistent with no way to express it
+   in the catalog. goopg previously did neither: it ignored `s.Only` in this case
+   entirely and **cascaded anyway**, so the divergence was the opposite of what
+   the 0005as ledger row predicted ("silently adds to the parent alone").
+   The guard is `if s.Only && !act.NoInherit && o.hasInheritanceChildren(tbl)`,
+   placed after the NO INHERIT gate and before any catalog mutation — the
+   ordering is load-bearing and comes straight from PG, where the `is_no_inherit`
+   return at :10004 precedes the ONLY refusal at :10020, so
+   `ALTER TABLE ONLY t ADD CHECK (…) NO INHERIT` on a table with children is
+   *accepted*. One rule covers partitioned and plain-inheritance parents alike —
+   PG makes a single `find_inheritance_children` call here. Do **not** import the
+   `ATExecSetNotNull` variant (:8017-8028), which does split partitioned from
+   plain and adds an errhint: that is a different function with a different rule,
+   and it is a standing trap in this area.
+6. **The parent stores the resolved name too.** Item 4 above hoisted the name
+   resolution for the *cascade*; the parent's own registration kept passing the
+   raw `act.ConstraintName`, and since `allocConstraintOID` returns 0 for an
+   empty name, an anonymous `ALTER TABLE t ADD CHECK (x > 0)` left the parent
+   with `Name==""` **and `OID==0`** while every child carried a proper
+   `<table>_<col>_check` and a real OID — the tree disagreed with itself. Both
+   arguments now take `conName`. goopg's `o.autoCheckName` already reproduces
+   `ChooseConstraintName`'s shape (`postgres/src/backend/catalog/heap.c`
+   :2548-2575); the gap was purely in which value reached the store.
+
+Upstream coverage: `postgres/src/test/regress/sql/alter_table.sql:2862-2877`
+carries both arms — the reject case on a partitioned parent *with* partitions
+(:2862-2863) and the allow case on a parent with none yet (:2873-2877). Both are
+ported (`operators_ddl_check_add_only_test.go`); the allow arm is what proves the
+guard is not over-broad, and is the arm a narrower port would have missed.
+`constraints.sql` exercises no ONLY+ADD-CHECK case at all, so this slice does not
+move the M0134 metric — it is paid for by correctness and by the `alter_table.sql`
+hunks it retires.
+
+Still unimplemented here (see the deferral ledger): PG's parent-level constraint
+**merge** short-circuit at :9998-9999, which detects an ALTER-added CHECK
+identical to one the relation already holds and returns without erroring or
+recursing. goopg has no parent-side equivalent, so re-adding an identical
+constraint takes the ordinary path.

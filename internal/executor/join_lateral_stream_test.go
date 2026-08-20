@@ -460,3 +460,81 @@ func assertLateralRows(t *testing.T, got, want []string) {
 		}
 	}
 }
+
+// TestLateralOuterColumnRefInAggregatingTargetList — M0134-0025 regression.
+//
+// A correlated (outer-level) column reference in the target list of a
+// LATERAL subquery that also contains an aggregate call panicked the
+// backend: resolveExprAfterAggregate (planner.go) unconditionally asserted
+// the resolved reference to *ColumnRef, but an outer-level match resolves to
+// *OuterColumnRef instead (a different addressing space — ctx.OuterRows,
+// not the local aggregate input). See
+// docs/design/m0134-0025-lateral-outer-colref-aggregate-crash.md and PG's
+// check_ungrouped_columns (parse_agg.c), which skips any Var with
+// varlevelsup != 0. The bug is engine-wide (not grouping-sets-specific),
+// so this guard lives alongside the rest of the LATERAL/aggregate coverage
+// in this file rather than in a groupingsets test file.
+//
+// Both branches below reproduce the panic pre-fix (with GROUP BY and
+// without), and the guard asserts real row VALUES — not merely "did not
+// panic" — verified byte-for-byte against real PG 18.3.
+func TestLateralOuterColumnRefInAggregatingTargetList(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE onek (four int, ten int)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO onek SELECT i%4, i%10 FROM generate_series(1,20) i"); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	t.Run("with GROUP BY", func(t *testing.T) {
+		rows := runSQL(t, ctx, `
+			SELECT * FROM (VALUES (1),(2)) v(a)
+			LEFT JOIN LATERAL (
+				SELECT v.a, four, count(*) FROM onek GROUP BY four
+			) s ON true
+			ORDER BY v.a, four`)
+		want := [][3]int64{
+			{1, 0, 5}, {1, 1, 5}, {1, 2, 5}, {1, 3, 5},
+			{2, 0, 5}, {2, 1, 5}, {2, 2, 5}, {2, 3, 5},
+		}
+		if len(rows) != len(want) {
+			t.Fatalf("row count = %d, want %d (rows=%v)", len(rows), len(want), rows)
+		}
+		for i, r := range rows {
+			if len(r) != 4 {
+				t.Fatalf("row %d width = %d, want 4 (row=%v)", i, len(r), r)
+			}
+			va, sa, four, cnt := r[0].Int, r[1].Int, r[2].Int, r[3].Int
+			if va != want[i][0] || sa != want[i][0] || four != want[i][1] || cnt != want[i][2] {
+				t.Fatalf("row %d = (%d,%d,%d,%d), want (%d,%d,%d,%d) (full: %v)",
+					i, va, sa, four, cnt, want[i][0], want[i][0], want[i][1], want[i][2], rows)
+			}
+		}
+	})
+
+	t.Run("without GROUP BY", func(t *testing.T) {
+		rows := runSQL(t, ctx, `
+			SELECT * FROM (VALUES (1),(2)) v(a)
+			LEFT JOIN LATERAL (
+				SELECT v.a, count(*) FROM onek
+			) s ON true
+			ORDER BY v.a`)
+		want := [][2]int64{{1, 20}, {2, 20}}
+		if len(rows) != len(want) {
+			t.Fatalf("row count = %d, want %d (rows=%v)", len(rows), len(want), rows)
+		}
+		for i, r := range rows {
+			if len(r) != 3 {
+				t.Fatalf("row %d width = %d, want 3 (row=%v)", i, len(r), r)
+			}
+			va, sa, cnt := r[0].Int, r[1].Int, r[2].Int
+			if va != want[i][0] || sa != want[i][0] || cnt != want[i][1] {
+				t.Fatalf("row %d = (%d,%d,%d), want (%d,%d,%d) (full: %v)",
+					i, va, sa, cnt, want[i][0], want[i][0], want[i][1], rows)
+			}
+		}
+	})
+}

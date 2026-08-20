@@ -345,3 +345,63 @@ func TestPlanInsertOnConflictDoNothingNoTargetUsesUniqueIndex(t *testing.T) {
 		t.Fatalf("ArbiterColumns = %v, want [0]", ins.OnConflict.ArbiterColumns)
 	}
 }
+
+// TestResolveArbiterIndexAcceptsExclusionConstraintArbiter (M0134-0005af,
+// bucket F8) exercises resolveArbiterIndex DIRECTLY (not through Plan(),
+// which runs analyzer.Analyze first and would mask this site — the same
+// package as planner.go lets the test call the unexported function so the
+// planner's own defensive re-check — self-described as covering "paths
+// that bypass" the analyzer — is verified in isolation). An exclusion
+// constraint IS a legal arbiter (execIndexing.c:592-596), not just an
+// idx.Unique one.
+func TestResolveArbiterIndexAcceptsExclusionConstraintArbiter(t *testing.T) {
+	cat := pgbenchCatalog(t)
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "pgbench_accounts"})
+	idx, err := cat.CreateIndex(parser.ObjectName{Name: "pgbench_accounts_excl"}, tbl, []string{"aid"}, false, "btree", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx.IsExclusion = true
+	idx.ExclusionOp = "="
+	stmt := parseOne(t,
+		"INSERT INTO pgbench_accounts (aid, abalance) VALUES (1, 0) "+
+			"ON CONFLICT ON CONSTRAINT pgbench_accounts_excl DO NOTHING").(*parser.InsertStmt)
+	if _, _, err := resolveArbiterIndex(stmt.OnConflict.Target, tbl, nil, cat); err != nil {
+		t.Fatalf("resolveArbiterIndex: %v", err)
+	}
+}
+
+// TestResolveArbiterIndexRejectsDeferrableExclusionArbiter (M0134-0005af,
+// bucket F8) is the direct-call twin of
+// TestResolveArbiterIndexAcceptsExclusionConstraintArbiter and the
+// planner-side counterpart of analyzer_test.go's
+// TestAnalyzeOnConflictRejectsDeferrableExclusionArbiter: a deferrable
+// (INITIALLY DEFERRED) exclusion constraint is not a legal ON CONFLICT
+// arbiter (execIndexing.c:604-610, indimmediate check), and must surface
+// 55000, not the plain 42P10 "is not a unique constraint".
+func TestResolveArbiterIndexRejectsDeferrableExclusionArbiter(t *testing.T) {
+	cat := pgbenchCatalog(t)
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "pgbench_accounts"})
+	idx, err := cat.CreateIndex(parser.ObjectName{Name: "pgbench_accounts_dexcl"}, tbl, []string{"aid"}, false, "btree", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx.IsExclusion = true
+	idx.ExclusionOp = "="
+	idx.Deferrable = true
+	idx.InitiallyDeferred = true
+	stmt := parseOne(t,
+		"INSERT INTO pgbench_accounts (aid, abalance) VALUES (1, 0) "+
+			"ON CONFLICT ON CONSTRAINT pgbench_accounts_dexcl DO NOTHING").(*parser.InsertStmt)
+	_, _, err = resolveArbiterIndex(stmt.OnConflict.Target, tbl, nil, cat)
+	if err == nil {
+		t.Fatal("expected 55000 error, got nil")
+	}
+	pe, ok := err.(*PlanError)
+	if !ok {
+		t.Fatalf("err type=%T, want *PlanError", err)
+	}
+	if pe.Code != "55000" {
+		t.Errorf("code=%s, want 55000", pe.Code)
+	}
+}

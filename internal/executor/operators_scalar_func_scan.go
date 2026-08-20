@@ -29,5 +29,14 @@ func (o *scalarFuncScanOp) Next() (TupleSlot, error) {
 	if err != nil {
 		return nil, err
 	}
+	sch := o.Schema()
+	// When the schema has multiple columns (a composite/table-returning
+	// non-SETOF routine, e.g. `FROM mki8(1,2)`), the datum is a composite
+	// text "(v1,v2,...)" — decompose it into individual column values, same
+	// as the SETOF sibling userSrfScanOp.Next(). M0134-0015c.
+	if len(sch) > 1 && val.Kind == KindString {
+		row := decomposeCompositeText(val.StringValue(), len(sch))
+		return SlotFromRow(nil, row), nil
+	}
 	return SlotFromRow(nil, Row{val}), nil
 }

@@ -1466,6 +1466,85 @@ func evalPgLSNBinary(op parser.OpCode, left, right Datum, pos int) (Datum, bool,
 	return Datum{}, false, nil
 }
 
+// dpow implements PostgreSQL's `^` exponentiation operator (float8 ^ float8),
+// ported verbatim from postgres/src/backend/utils/adt/float.c:dpow. The NaN
+// and infinity handling is explicit because platform pow(3) gets several of
+// these cases wrong; math.Pow is trusted only for the residual case at the
+// bottom. M0134-0019b.
+func dpow(a, b float64, pos int) (float64, *ExecError) {
+	// POSIX: NaN ^ 0 = 1, 1 ^ NaN = 1; every other NaN input yields NaN.
+	if math.IsNaN(a) {
+		if math.IsNaN(b) || b != 0.0 {
+			return math.NaN(), nil
+		}
+		return 1.0, nil
+	}
+	if math.IsNaN(b) {
+		if a != 1.0 {
+			return math.NaN(), nil
+		}
+		return 1.0, nil
+	}
+
+	// The SQL spec requires a specific SQLSTATE for these domain errors —
+	// not the divide-by-zero code — for 0 ^ negative and negative ^
+	// non-integer.
+	if a == 0 && b < 0 {
+		return 0, &ExecError{Code: "22023", Pos: pos, Message: "zero raised to a negative power is undefined"}
+	}
+	if a < 0 && math.Floor(b) != b {
+		return 0, &ExecError{Code: "22023", Pos: pos, Message: "a negative number raised to a non-integer power yields a complex result"}
+	}
+
+	// Infinite exponent: handle before infinite base so it doesn't matter
+	// whether the base is also infinite.
+	if math.IsInf(b, 0) {
+		absx := math.Abs(a)
+		switch {
+		case absx == 1.0:
+			return 1.0, nil
+		case b > 0.0: // y = +Inf
+			if absx > 1.0 {
+				return b, nil
+			}
+			return 0.0, nil
+		default: // y = -Inf
+			if absx > 1.0 {
+				return 0.0, nil
+			}
+			return -b, nil
+		}
+	}
+	if math.IsInf(a, 0) {
+		switch {
+		case b == 0.0:
+			return 1.0, nil
+		case a > 0.0: // x = +Inf
+			if b > 0.0 {
+				return a, nil
+			}
+			return 0.0, nil
+		default: // x = -Inf
+			// The domain check above already established b is an integer
+			// (since a < 0). It's odd iff b/2 is not also an integer.
+			halfy := b / 2
+			yisoddinteger := math.Floor(halfy) != halfy
+			if b > 0.0 {
+				if yisoddinteger {
+					return a, nil
+				}
+				return -a, nil
+			}
+			if yisoddinteger {
+				return math.Copysign(0, -1), nil
+			}
+			return 0.0, nil
+		}
+	}
+
+	return math.Pow(a, b), nil
+}
+
 // evalBinary handles arithmetic, comparison, and boolean operators.
 // SQL three-valued logic: NULL operand on most operators yields NULL;
 // AND/OR follow Kleene's rules.
@@ -1574,6 +1653,17 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int, ctx *Context) (Dat
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s requires integer operands", op)}
 		}
 		return arithmetic(op, left.Int, right.Int, pos)
+	case parser.OpPow:
+		a, aok := datumToFloat64(left)
+		b, bok := datumToFloat64(right)
+		if !aok || !bok {
+			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s requires numeric operands", op)}
+		}
+		result, err := dpow(a, b, pos)
+		if err != nil {
+			return Datum{}, err
+		}
+		return floatTextDatum(PGFloatOut(result, 64)), nil
 	case parser.OpConcat:
 		// || requires at least one string-typed operand. When one side is text
 		// (or string-like), the other side is coerced to text. When both sides
@@ -6062,6 +6152,167 @@ func buildConstraintDefString(idx *catalog.Index) string {
 	return def
 }
 
+// buildPartitionConstraintDef renders the pg_get_partition_constraintdef text
+// for a single-level partition child, given its parent (the table carrying
+// PARTITION BY) and the child's own bound. Dispatches to a per-strategy local
+// builder (LIST / RANGE / HASH), each mirroring the matching
+// get_qual_for_{list,range,hash} in postgres/src/backend/partitioning/partbounds.c.
+// Returns "" for any case out of scope for this slice: an expression-based
+// partition key, or a multi-column RANGE key (see the per-strategy builders).
+// Design 0134-0005ag; option 2 (local builder) — deliberately independent of
+// the shared defaultExprToSQL deparser (operators_ddl.go), whose *IsNullExpr
+// case does not self-parenthesize and is shared with the CHECK-constraint and
+// index-predicate deparse paths.
+func buildPartitionConstraintDef(parent *catalog.Table, pb catalog.PartitionBound) string {
+	keys := parent.PartitionKey
+	if len(keys) == 0 {
+		return ""
+	}
+	for i := range keys {
+		if i < len(parent.PartitionKeyExprs) && parent.PartitionKeyExprs[i] != nil {
+			// Expression-based partition key — deferred (M0134-0005ag ledger row).
+			return ""
+		}
+	}
+	switch strings.ToUpper(parent.PartitionMethod) {
+	case "LIST":
+		return buildListPartitionConstraintDef(keys, pb)
+	case "RANGE":
+		return buildRangePartitionConstraintDef(keys, pb)
+	case "HASH":
+		return buildHashPartitionConstraintDef(parent.OID, keys, pb)
+	}
+	return ""
+}
+
+// buildListPartitionConstraintDef mirrors get_qual_for_list (partbounds.c:4065)
+// for single-column LIST partitioning (PG only supports single-column LIST
+// keys — Assert(key->partnatts == 1) — so len(keys) is always 1 for a
+// well-formed catalog; the length check is defensive).
+//
+// Non-NULL values build an equality (single value) or `= ANY (ARRAY[...])`
+// (multiple values) OpExpr/ScalarArrayOpExpr, ANDed with a `keyCol IS NOT
+// NULL` NullTest. If the LIST bound includes NULL (list_has_null), PG instead
+// ORs a `keyCol IS NULL` NullTest with the value-equality expr (get_qual_for_
+// list :4176-4200). Every deparsed AND_EXPR/OR_EXPR self-wraps in an extra
+// outer paren pair on top of each arm's own parens because PRETTYFLAG_PAREN
+// is not set (ruleutils.c:9465 — see the design doc's "paren hazard"
+// section); replicated here by always parenthesizing each atom and adding
+// the outer wrap only when two atoms are joined.
+func buildListPartitionConstraintDef(keys []string, pb catalog.PartitionBound) string {
+	if len(keys) != 1 {
+		return ""
+	}
+	k := keys[0]
+	var nonNullVals []string
+	hasNull := false
+	for i, raw := range pb.InValues {
+		if strings.EqualFold(raw, "null") {
+			hasNull = true
+			continue
+		}
+		var lit string
+		if i < len(pb.InValueLiterals) {
+			lit = pb.InValueLiterals[i]
+		}
+		if lit == "" {
+			// Can't safely re-render this value as a SQL literal — bail to
+			// NULL rather than emit a wrong-but-plausible qual.
+			return ""
+		}
+		nonNullVals = append(nonNullVals, lit)
+	}
+	var opexpr string
+	switch len(nonNullVals) {
+	case 0:
+	case 1:
+		opexpr = "(" + k + " = " + nonNullVals[0] + ")"
+	default:
+		opexpr = "(" + k + " = ANY (ARRAY[" + strings.Join(nonNullVals, ", ") + "]))"
+	}
+	if hasNull {
+		nulltest := "(" + k + " IS NULL)"
+		if opexpr == "" {
+			return nulltest
+		}
+		return "(" + nulltest + " OR " + opexpr + ")"
+	}
+	nulltest := "(" + k + " IS NOT NULL)"
+	if opexpr == "" {
+		return nulltest
+	}
+	return "(" + nulltest + " AND " + opexpr + ")"
+}
+
+// buildRangePartitionConstraintDef mirrors get_qual_for_range (partbounds.c:
+// 4274) for the common single-column case: `(keyCol IS NOT NULL) AND (keyCol
+// >= lower) AND (keyCol < upper)`, omitting either comparison arm when its
+// bound is MINVALUE/MAXVALUE (get_range_key_properties returns no Const for
+// an unbounded edge, so no arm is emitted for it). Multi-column RANGE keys
+// require the lexicographic OR-chain construction in get_qual_for_range
+// (partbounds.c:4236-4266 comment) — out of scope for this slice (no
+// constraints.sql fixture forces it); returns "" (deferred, M0134-0005ag
+// ledger row).
+func buildRangePartitionConstraintDef(keys []string, pb catalog.PartitionBound) string {
+	if len(keys) != 1 {
+		return ""
+	}
+	if len(pb.FromValues) != 1 || len(pb.ToValues) != 1 {
+		return ""
+	}
+	if len(pb.FromUnbounded) != 1 || len(pb.ToUnbounded) != 1 {
+		// Legacy bound predating DU-002 slice 261 (no explicit unbounded
+		// flags) — bail to NULL rather than guess from the sentinel string.
+		return ""
+	}
+	k := keys[0]
+	fromUnbounded := pb.FromUnbounded[0]
+	toUnbounded := pb.ToUnbounded[0]
+	var fromLit, toLit string
+	if !fromUnbounded {
+		if len(pb.FromValueLiterals) != 1 || pb.FromValueLiterals[0] == "" {
+			return ""
+		}
+		fromLit = pb.FromValueLiterals[0]
+	}
+	if !toUnbounded {
+		if len(pb.ToValueLiterals) != 1 || pb.ToValueLiterals[0] == "" {
+			return ""
+		}
+		toLit = pb.ToValueLiterals[0]
+	}
+	arms := []string{"(" + k + " IS NOT NULL)"}
+	if !fromUnbounded {
+		arms = append(arms, "("+k+" >= "+fromLit+")")
+	}
+	if !toUnbounded {
+		arms = append(arms, "("+k+" < "+toLit+")")
+	}
+	if len(arms) == 1 {
+		return arms[0]
+	}
+	return "(" + strings.Join(arms, " AND ") + ")"
+}
+
+// buildHashPartitionConstraintDef mirrors get_qual_for_hash (partbounds.c:
+// 3982): a single call to the built-in satisfies_hash_partition(parentoid,
+// modulus, remainder, k1, k2, ...). No NOT NULL conjunct (HASH partitioning
+// has no DEFAULT partition in PG, and NULL routes to a specific bucket like
+// any other value), and no self-parenthesization at the top level (a bare
+// FuncExpr does not get PG's need_paren wrap).
+func buildHashPartitionConstraintDef(parentOID uint32, keys []string, pb catalog.PartitionBound) string {
+	if len(keys) == 0 {
+		return ""
+	}
+	args := []string{
+		fmt.Sprintf("%d", parentOID),
+		fmt.Sprintf("%d", pb.Modulus),
+		fmt.Sprintf("%d", pb.Remainder),
+	}
+	args = append(args, keys...)
+	return "satisfies_hash_partition(" + strings.Join(args, ", ") + ")"
+}
+
 // buildForeignKeyDefString builds the pg_get_constraintdef text for a FOREIGN
 // KEY constraint, mirroring ruleutils.c pg_get_constraintdef_worker. pg_dump
 // runs with search_path=” so the referenced relation is fully schema-qualified
@@ -9743,6 +9994,18 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			v, _ := strconv.ParseUint(strings.TrimSpace(arg.StringValue()), 10, 32)
 			targetOID = uint32(v)
 		}
+		// pretty: psql's \d+/\dD+ always call the two-arg form with pretty=true
+		// (postgres/src/bin/psql/describe.c:2530); pg_dump uses the one-arg form
+		// (implicit false) or the two-arg form with pretty=false explicitly
+		// (pg_dump.c:7768, ruleutils.c:2152). Default false when the second arg
+		// is absent, matching PG's 1-arg pg_get_constraintdef. DU-002-ah slice A.
+		pretty := false
+		if len(x.Args) >= 2 {
+			prettyArg, err := evalExpr(x.Args[1], row, ctx)
+			if err == nil && !prettyArg.IsNull() {
+				pretty = prettyArg.BoolValue()
+			}
+		}
 		for _, idx := range ctx.Catalog.AllIndexes() {
 			if idx.OID != targetOID || (!idx.IsConstraint && !idx.IsExclusion) {
 				continue
@@ -9762,7 +10025,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 					if nc.OID == 0 || nc.OID != targetOID {
 						continue
 					}
-					def := renderCheckPredicate(nc.Expr)
+					def := renderCheckPredicate(nc.Expr, pretty)
 					if nc.NoInherit {
 						def += " NO INHERIT"
 					}
@@ -9810,11 +10073,71 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 					if len(ck.InValues) > 0 {
 						return NewStringDatum("CHECK ((" + ck.Expr + "))"), nil
 					}
-					return NewStringDatum(renderDomainCheckPredicate(ck.Expr)), nil
+					return NewStringDatum(renderDomainCheckPredicate(ck.Expr, pretty)), nil
 				}
 			}
 		}
 		return NullDatum, nil
+
+	case "pg_get_partition_constraintdef":
+		// pg_get_partition_constraintdef(relation oid) → text. M0134-0005ag.
+		// ruleutils.c:2096 pg_get_partition_constraintdef → partcache.c:299
+		// get_partition_qual_relid → partcache.c:337 generate_partition_qual →
+		// partbounds.c:249 get_qual_from_partbound, dispatching by the PARENT's
+		// strategy to get_qual_for_list / get_qual_for_range / get_qual_for_hash
+		// (partbounds.c). Returns SQL NULL (never an error) when the relation
+		// is not a partition, the OID is unknown, or the computed qual is
+		// deliberately deferred (DEFAULT partition, multi-level partitioning,
+		// expression-based partition keys, multi-column RANGE keys) — see
+		// docs/design/0134-0005ag-partition-constraintdef.md. Design option 2
+		// (local builder below) is used instead of touching the shared
+		// defaultExprToSQL deparser, to avoid perturbing its CHECK-constraint
+		// and index-predicate siblings.
+		if len(x.Args) < 1 {
+			return NullDatum, nil
+		}
+		arg, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil || arg.IsNull() {
+			return NullDatum, nil
+		}
+		var targetOID uint32
+		if arg.Kind == KindInt {
+			targetOID = uint32(arg.Int)
+		} else {
+			v, _ := strconv.ParseUint(strings.TrimSpace(arg.StringValue()), 10, 32)
+			targetOID = uint32(v)
+		}
+		im, ok := ctx.Catalog.(*catalog.InMemory)
+		if !ok {
+			return NullDatum, nil
+		}
+		tbl, found := im.LookupTableByOID(targetOID)
+		if !found || tbl.PartitionParentOID == 0 || len(tbl.PartitionBounds) == 0 {
+			return NullDatum, nil
+		}
+		parent, found := im.LookupTableByOID(tbl.PartitionParentOID)
+		if !found {
+			return NullDatum, nil
+		}
+		// Multi-level partitioning: generate_partition_qual recurses and ANDs
+		// every ancestor level's own qual (partcache.c:387-390). Not attempted
+		// here — deferred (M0134-0005ag ledger row).
+		if parent.PartitionParentOID != 0 {
+			return NullDatum, nil
+		}
+		pb := tbl.PartitionBounds[0]
+		if pb.IsDefault {
+			// DEFAULT-partition constraint is the negation of every sibling
+			// partition's own qual (get_qual_for_list :4099-4225 /
+			// get_qual_for_range :4300-4368) — not derivable from this
+			// partition's own bound alone. Deferred (M0134-0005ag ledger row).
+			return NullDatum, nil
+		}
+		def := buildPartitionConstraintDef(parent, pb)
+		if def == "" {
+			return NullDatum, nil
+		}
+		return NewStringDatum(def), nil
 
 	case "array_to_string":
 		// array_to_string(anyarray, text [, text]) → text — joins array elements with separator.
@@ -12125,10 +12448,16 @@ case "pg_char_to_encoding":
 			}
 			return Datum{Kind: KindInt, Int: int64(len(v.Format()))}, nil
 		}
-	case "current_user", "session_user":
-		return NewStringDatum("postgres"), nil
-	case "user":
-		return NewStringDatum("postgres"), nil
+	case "session_user":
+		// session_user() is the authenticated login role, unaffected by SET
+		// ROLE — only SET/RESET SESSION AUTHORIZATION changes it. M0134-0009,
+		// PG oracle: miscinit.c GetSessionUserId.
+		return NewStringDatum(ctx.SessionUserName()), nil
+	case "current_user", "current_role", "user":
+		// current_user()/current_role/user are the effective role: the SET
+		// ROLE target when active, else the session user. M0134-0009, PG
+		// oracle: miscinit.c GetCurrentRoleId.
+		return NewStringDatum(ctx.EffectiveUserName()), nil
 	case "version":
 		return NewStringDatum("PostgreSQL 18.3 goopg compatible"), nil
 	case "pg_current_xact_id", "txid_current":
@@ -12246,6 +12575,26 @@ case "pg_char_to_encoding":
 			return NewIntDatum(c.calls), nil
 		}
 		return NullDatum, nil
+	// pg_stat_get_xact_function_calls(oid) → bigint: number of times the
+	// function has been called so far in the CURRENT open transaction (the
+	// backend-local pending counters, not yet flushed), or NULL when the
+	// session has not called it in this transaction. Unlike the shared-tier
+	// getter above, this reads the pending tier directly (not fetchFuncStat's
+	// stats_fetch_consistency snapshot) — PG's find_funcstat_entry always
+	// reads the backend's own live pending state, which has no cross-session
+	// consistency concern. PG: pgstatfuncs.c:1804. M0134-0020.
+	case "pg_stat_get_xact_function_calls":
+		oid, ok, err := statFuncOIDArg(x, row, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if !ok {
+			return NullDatum, nil
+		}
+		if c, found := funcStats.peekPending(sessionStatsID(ctx), oid); found {
+			return NewIntDatum(c.calls), nil
+		}
+		return NullDatum, nil
 	// pg_stat_get_function_total_time(oid) → double precision: total wall time
 	// spent in the function (and the functions it called), in milliseconds, or
 	// NULL when no stats exist. Design 0118-0124.
@@ -12356,6 +12705,24 @@ case "pg_char_to_encoding":
 			v = 0
 		}
 		return NewIntDatum(v), nil
+	// pg_stat_get_xact_tuples_inserted(oid) → bigint: rows inserted into the
+	// relation so far in the CURRENT open transaction (the per-transaction
+	// staging tier, not yet folded into pending at commit/abort) — visible
+	// BEFORE COMMIT, unlike the shared-tier getter above. An OID the session
+	// has not written in this transaction reads 0, never NULL — the found-bool
+	// is deliberately discarded, matching PG's PG_STAT_GET_XACT_RELENTRY_INT64
+	// macro (find_tabstat_entry == NULL → result = 0). PG: pgstatfuncs.c:1758,
+	// instantiated :1796. M0134-0020.
+	case "pg_stat_get_xact_tuples_inserted":
+		oid, ok, err := statFuncOIDArg(x, row, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if !ok {
+			return NullDatum, nil
+		}
+		c, _ := relStats.peekStaging(sessionStatsID(ctx), oid)
+		return NewIntDatum(c.tuplesInserted), nil
 	}
 
 	// Function-style type casts: int4(x), float8(x), text(x), etc.

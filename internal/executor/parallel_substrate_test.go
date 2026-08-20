@@ -142,6 +142,46 @@ func TestNewWorkerContextSharesAndSeparates(t *testing.T) {
 	}
 }
 
+// TestNewWorkerContextInheritsSessionIdentity pins M0134-0009 round-2
+// review R4 (MISSED SIBLING): NonSuperuserRole was already copied
+// field-by-field, but its M0134-0009 siblings SessionUser/SetRoleIsActive
+// were not, so a worker evaluating `WHERE owner = current_user` under an
+// active SET ROLE/SET SESSION AUTHORIZATION would see the connection's
+// login default instead of the leader's actual identity — silent
+// partial/zero rows depending on which worker touched a given tuple. PG
+// propagates this deliberately (variable.c check_session_authorization's
+// InitializingParallelWorker branch). FAIL-pre: w.SessionUser=="" and
+// w.SetRoleIsActive==false regardless of the leader's values.
+func TestNewWorkerContextInheritsSessionIdentity(t *testing.T) {
+	leader := NewContext()
+	leader.SessionUser = "alice"
+	leader.NonSuperuserRole = "bob"
+	leader.SetRoleIsActive = true
+
+	arena := mmgr.Acquire(nil, mmgr.KindStmt)
+	defer arena.Release()
+	wctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w := NewWorkerContext(leader, arena, wctx)
+
+	if w.SessionUser != "alice" {
+		t.Errorf("worker SessionUser = %q, want %q", w.SessionUser, "alice")
+	}
+	if w.NonSuperuserRole != "bob" {
+		t.Errorf("worker NonSuperuserRole = %q, want %q", w.NonSuperuserRole, "bob")
+	}
+	if !w.SetRoleIsActive {
+		t.Error("worker SetRoleIsActive = false, want true")
+	}
+	if got := w.EffectiveUserName(); got != "bob" {
+		t.Errorf("worker EffectiveUserName() = %q, want %q (leader's SET ROLE target)", got, "bob")
+	}
+	if got := w.SessionUserName(); got != "alice" {
+		t.Errorf("worker SessionUserName() = %q, want %q (leader's login/session user)", got, "alice")
+	}
+}
+
 func TestMergeWorkerContextFoldsNotices(t *testing.T) {
 	leader := NewContext()
 	leader.Notices = []string{"a"}

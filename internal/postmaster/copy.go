@@ -196,6 +196,15 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *libpq.FrameWrit
 	ectx.Snap = snap
 	asyncCommit := sessionAsyncCommit(sess)
 	ectx.AsyncCommit = asyncCommit
+	// Thread session identity (M0134-0009 round 2, R5 — the named SELECT/COPY
+	// twin): without this, `COPY (SELECT current_user) TO STDOUT` reported the
+	// hardcoded/login default instead of the connection's actual SET ROLE /
+	// SET SESSION AUTHORIZATION state that plain SELECT already honoured.
+	if connTx != nil {
+		ectx.SessionUser = connTx.SessionUser
+		ectx.NonSuperuserRole = connTx.NonSuperuserRole
+		ectx.SetRoleIsActive = connTx.SetRoleIsActive
+	}
 	// A standalone `COPY ... TO STDOUT` built its executor context by hand and
 	// never attached the session GUC hooks, so it was the one COPY path that
 	// could not see `SET datestyle` / `SET timezone` — RunCopyTo's lookups all

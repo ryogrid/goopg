@@ -778,6 +778,25 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeSession | ScopeTransaction,
 		Flags:   FlagExplain,
 	}))
+	// maintenance_work_mem / vacuum_truncate: inert registrations (M0134-0021b).
+	// goopg's VACUUM never truncates trailing pages regardless of these
+	// settings (see internal/parser/parser.go:1947-1953), so both are accepted
+	// and stored but do not yet steer behavior — SET/RESET simply stops
+	// raising "unrecognized configuration parameter". PG 18.3 authority:
+	// postgres/src/backend/utils/misc/guc_tables.c:2593 (maintenance_work_mem,
+	// PGC_USERSET, RESOURCES_MEM, default 65536 kB / 64MB) and :2147
+	// (vacuum_truncate, PGC_USERSET, VACUUM_DEFAULT, default on).
+	r.MustRegister(NewVariable(Variable{
+		Name: "maintenance_work_mem", Type: TypeInt, Unit: UnitKB, BootVal: "64MB",
+		MinVal: 64, MaxVal: 1 << 40,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "vacuum_truncate", Type: TypeBool, BootVal: "on",
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "extra_float_digits", Type: TypeInt, BootVal: "1",
 		MinVal: -15, MaxVal: 3,

@@ -36,6 +36,56 @@ func TestLikeIncludingIndexesCopiesPK(t *testing.T) {
 	}
 }
 
+// TestLikeIncludingIndexesCopiesPKDeferrable verifies that LIKE source
+// INCLUDING INDEXES also copies the source PK's DEFERRABLE INITIALLY DEFERRED
+// property onto the cloned PK index, mirroring PG's generateClonedIndexStmt
+// (postgres/src/backend/parser/parse_utilcmd.c:1804-1805):
+//
+//	index->deferrable = conrec->condeferrable;
+//	index->initdeferred = conrec->condeferred;
+//
+// Before the fix, operators_ddl.go's LIKE INCLUDING INDEXES PK-copy branch
+// appended idx.Columns to s.PrimaryKey but never set
+// s.PrimaryKeyDeferrable/s.PrimaryKeyInitiallyDeferred, so the cloned PK
+// index was always created non-deferrable.
+func TestLikeIncludingIndexesCopiesPKDeferrable(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE src (id int, PRIMARY KEY (id) DEFERRABLE INITIALLY DEFERRED)`); err != nil {
+		t.Fatalf("CREATE TABLE src: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE dst (extra text, LIKE src INCLUDING INDEXES)`); err != nil {
+		t.Fatalf("CREATE TABLE dst: %v", err)
+	}
+
+	im, ok := cat.(*catalog.InMemory)
+	if !ok {
+		t.Fatal("catalog is not InMemory")
+	}
+	dstTbl, ok := cat.LookupTable(parser.ObjectName{Name: "dst"})
+	if !ok {
+		t.Fatal("dst table not found")
+	}
+	idxs := im.IndexesOnTable(dstTbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
+	var pk *catalog.Index
+	for i := range idxs {
+		if idxs[i].Primary {
+			pk = idxs[i]
+			break
+		}
+	}
+	if pk == nil {
+		t.Fatal("dst has no PK index after LIKE INCLUDING INDEXES")
+	}
+	if !pk.Deferrable {
+		t.Errorf("cloned PK index %q: Deferrable=false, want true (source PK is DEFERRABLE)", pk.Name)
+	}
+	if !pk.InitiallyDeferred {
+		t.Errorf("cloned PK index %q: InitiallyDeferred=false, want true (source PK is INITIALLY DEFERRED)", pk.Name)
+	}
+}
+
 // TestLikeIncludingIndexesMultiplePKError verifies that specifying two primary
 // keys (one explicit and one via LIKE INCLUDING INDEXES) causes an error.
 func TestLikeIncludingIndexesMultiplePKError(t *testing.T) {

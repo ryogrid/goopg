@@ -817,10 +817,30 @@ type Context struct {
 	PgSubscriptionRows func() [][]string
 
 	// NonSuperuserRole, when non-empty, means the session is currently running
-	// under a non-superuser role (set via SET SESSION AUTHORIZATION). Privilege
-	// checks that require superuser (e.g. LEAKPROOF function attribute) must
-	// reject when this is set.
+	// under a non-superuser role (set via SET SESSION AUTHORIZATION or SET
+	// ROLE). Privilege checks that require superuser (e.g. LEAKPROOF function
+	// attribute) must reject when this is set. When SetRoleIsActive is true,
+	// this field holds the SET ROLE target (the effective role); otherwise it
+	// holds the SET SESSION AUTHORIZATION target (which is also the session
+	// user in that case). See EffectiveUserName/SessionUserName below.
 	NonSuperuserRole string
+
+	// SetRoleIsActive mirrors PostgreSQL's SetRoleIsActive flag
+	// (miscinit.c): true while a SET ROLE (as opposed to a plain SET SESSION
+	// AUTHORIZATION) is in effect. It is what lets EffectiveUserName tell
+	// "no SET ROLE" apart from "SET ROLE to the session user" — both leave
+	// NonSuperuserRole set to a name, but only the former should NOT be
+	// cleared by a subsequent SET SESSION AUTHORIZATION. M0134-0009.
+	SetRoleIsActive bool
+
+	// SessionUser is the authenticated login role for this connection (the
+	// StartupMessage "user" field), threaded in once by the postmaster
+	// (server.go, alongside the session_authorization GUC seed) so the two
+	// cannot drift. SET SESSION AUTHORIZATION updates it; SET ROLE does not.
+	// Empty in Contexts built outside the postmaster (unit tests, internal
+	// callers) — SessionUserName/EffectiveUserName fall back to "postgres"
+	// in that case, preserving pre-M0134-0009 behaviour. M0134-0009.
+	SessionUser string
 
 	// SetSessionAuthorization, when non-nil, updates the per-connection
 	// NonSuperuserRole when SET SESSION AUTHORIZATION is executed via the
@@ -911,6 +931,57 @@ type SubPlanSiteStats struct {
 	// hash-map path). A miss is normally followed by a Rebuild.
 	CacheHits   int64
 	CacheMisses int64
+}
+
+// SessionUserName returns the authenticated login role for this connection
+// (PostgreSQL's session_user()/GetSessionUserId(), miscinit.c). It is
+// unaffected by SET ROLE and only changes via SET/RESET SESSION
+// AUTHORIZATION. Falls back to "postgres" when SessionUser is unset (a
+// Context built outside the postmaster), matching pre-M0134-0009 behaviour.
+func (c *Context) SessionUserName() string {
+	if c == nil || c.SessionUser == "" {
+		return "postgres"
+	}
+	return c.SessionUser
+}
+
+// EffectiveUserName returns the currently-effective role (PostgreSQL's
+// current_user()/current_role/GetUserId(), miscinit.c GetCurrentRoleId): the
+// currently-active non-superuser role override (c.NonSuperuserRole, which
+// the postmaster's SET ROLE/SET SESSION AUTHORIZATION closures keep in sync
+// with whichever is active — see SetRoleIsActive's doc comment for why
+// RESET ROLE does not blindly clear it) when non-empty, otherwise the
+// session user. Falls back to "postgres" when nothing is set, matching
+// pre-M0134-0009 behaviour. This is also the pre-existing convention many
+// hand-built test Contexts already rely on (set NonSuperuserRole directly
+// to simulate "acting under this role").
+//
+// Invariant this relies on (round-2 review, R6/R7/R11/R1 are exactly the
+// states where it broke before being fixed): whenever SetRoleIsActive is
+// false, NonSuperuserRole must be either "" or equal to SessionUser — i.e.
+// the postmaster's SetSessionAuthorization closures must never leave
+// NonSuperuserRole pointing at a role that ISN'T also the current
+// SessionUser once SetRoleIsActive is false. SetSessionAuthorization
+// upholds this by construction (it always writes SessionUser and
+// NonSuperuserRole together, see dispatch.go). The one legitimate exception
+// is `SET ROLE postgres`: NonSuperuserRole stays "" (preserving the
+// is_superuser/"" privilege-check convention) while SetRoleIsActive=true
+// records that a role assignment IS active — handled by the branch below
+// rather than by breaking the invariant above.
+func (c *Context) EffectiveUserName() string {
+	if c == nil {
+		return "postgres"
+	}
+	if c.NonSuperuserRole != "" {
+		return c.NonSuperuserRole
+	}
+	if c.SetRoleIsActive {
+		// SET ROLE postgres: see the invariant note above — NonSuperuserRole
+		// is "" (postgres is the bootstrap superuser) but a role really is
+		// active, and it is literally "postgres".
+		return "postgres"
+	}
+	return c.SessionUserName()
 }
 
 // subPlanStat returns the counter block for sublink e, allocating

@@ -25,6 +25,7 @@ func TestM0073OpCodeRoundTrip(t *testing.T) {
 		{OpMul, "*", false, true},
 		{OpDiv, "/", false, true},
 		{OpMod, "%", false, true},
+		{OpPow, "^", false, true},
 		// Binary text
 		{OpConcat, "||", false, true},
 		// Binary comparison

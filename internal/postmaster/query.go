@@ -34,6 +34,68 @@ func setIsSuperuserGUC(sess *misc.SessionRegistry, isSuper bool) {
 	_ = sess.SetInternal("is_superuser", val)
 }
 
+// applySetSessionAuthorization implements SET/SET LOCAL/RESET SESSION
+// AUTHORIZATION on the query.go string-matching fast path — the sibling of
+// dispatch.go's ectx.SetSessionAuthorization closure (M0134-0009, both must
+// agree: a query routed through either path yields the same session_user()/
+// current_user() result). role=="" covers DEFAULT/RESET/no-argument: it
+// restores the connect-time login user. A non-empty role sets the session
+// user AND clears any active SET ROLE (PG parity: guc.c:4092-4127 — SET
+// session_authorization forcibly performs "SET ROLE NONE"/"RESET role" with
+// the same context/source, per the SQL spec; NOT miscinit.c
+// SetSessionAuthorization, which does not itself clear SetRoleIsActive).
+func applySetSessionAuthorization(connTx *connTxState, role string) {
+	switch strings.ToUpper(strings.TrimSpace(role)) {
+	case "", "DEFAULT", "RESET":
+		role = connTx.LoginUser
+	}
+	connTx.SessionUser = role
+	connTx.SetRoleIsActive = false
+	if strings.EqualFold(role, "postgres") {
+		connTx.NonSuperuserRole = ""
+	} else {
+		connTx.NonSuperuserRole = role
+	}
+}
+
+// applySetRole implements SET/SET LOCAL/RESET ROLE on the query.go
+// string-matching fast path — the sibling of dispatch.go's ectx.SetRole
+// closure (M0134-0009). Unlike applySetSessionAuthorization, session_user is
+// left untouched: SET ROLE only changes the effective role
+// (current_user()/current_role), never session_user() (miscinit.c
+// GetSessionUserId is unaffected by SET ROLE).
+func applySetRole(connTx *connTxState, role string) {
+	switch strings.ToUpper(strings.TrimSpace(role)) {
+	case "", "DEFAULT", "NONE":
+		// Only clear NonSuperuserRole if a SET ROLE was actually the thing
+		// that set it — a bare RESET ROLE with no SET ROLE active (e.g. only
+		// SET SESSION AUTHORIZATION ran) must be a no-op, not blindly wipe
+		// out the session-authorization role override (PG parity:
+		// miscinit.c GetCurrentRoleId's SetRoleIsActive gate).
+		if connTx.SetRoleIsActive {
+			connTx.NonSuperuserRole = ""
+		}
+		connTx.SetRoleIsActive = false
+	case "POSTGRES":
+		// SET ROLE postgres is an explicit role target, NOT a synonym for
+		// NONE/DEFAULT (round-2 review R7 — the old code conflated them,
+		// which made `SET ROLE postgres` report the session/login user
+		// instead of "postgres" for current_user()). NonSuperuserRole stays
+		// "" because "postgres" is the bootstrap superuser — the
+		// NonSuperuserRole=="" privilege-check convention (is_superuser,
+		// LEAKPROOF, …) must still read "superuser" here, per guc.c's
+		// GUC_check_errcode for the "role" variable. SetRoleIsActive=true
+		// records that a role assignment IS active, so
+		// Context.EffectiveUserName can report "postgres" instead of
+		// falling back to SessionUser (see its invariant comment).
+		connTx.NonSuperuserRole = ""
+		connTx.SetRoleIsActive = true
+	default:
+		connTx.NonSuperuserRole = role
+		connTx.SetRoleIsActive = true
+	}
+}
+
 // handleQuery implements the simple Query path. v0 recognises:
 //
 //   - SELECT 1                       → single int4 column, value "1"
@@ -236,12 +298,7 @@ func (s *Server) handleQuery(ctx context.Context, r *libpq.FrameReader, w *libpq
 			role := strings.TrimSpace(matchable[len("SET LOCAL SESSION AUTHORIZATION"):])
 			role = strings.Trim(role, `"'`)
 			connTx.SnapshotLocalRoleIfNeeded(true)
-			switch strings.ToUpper(role) {
-			case "", "DEFAULT", "RESET", "POSTGRES":
-				connTx.NonSuperuserRole = ""
-			default:
-				connTx.NonSuperuserRole = role
-			}
+			applySetSessionAuthorization(connTx, role)
 			setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
 		}
 		if err := w.WriteCommandComplete("SET"); err != nil {
@@ -259,12 +316,7 @@ func (s *Server) handleQuery(ctx context.Context, r *libpq.FrameReader, w *libpq
 			role := strings.TrimSpace(matchable[len("SET LOCAL ROLE"):])
 			role = strings.Trim(role, `"'`)
 			connTx.SnapshotLocalRoleIfNeeded(true)
-			switch strings.ToUpper(role) {
-			case "", "DEFAULT", "NONE", "POSTGRES":
-				connTx.NonSuperuserRole = ""
-			default:
-				connTx.NonSuperuserRole = role
-			}
+			applySetRole(connTx, role)
 			setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
 		}
 		if err := w.WriteCommandComplete("SET"); err != nil {
@@ -282,12 +334,7 @@ func (s *Server) handleQuery(ctx context.Context, r *libpq.FrameReader, w *libpq
 			// Extract the role name after "SET SESSION AUTHORIZATION ".
 			role := strings.TrimSpace(matchable[len("SET SESSION AUTHORIZATION"):])
 			role = strings.Trim(role, `"'`)
-			switch strings.ToUpper(role) {
-			case "", "DEFAULT", "RESET", "POSTGRES":
-				connTx.NonSuperuserRole = ""
-			default:
-				connTx.NonSuperuserRole = role
-			}
+			applySetSessionAuthorization(connTx, role)
 			setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
 		}
 		if err := w.WriteCommandComplete("SET"); err != nil {
@@ -304,12 +351,7 @@ func (s *Server) handleQuery(ctx context.Context, r *libpq.FrameReader, w *libpq
 		if connTx != nil {
 			role := strings.TrimSpace(matchable[len("SET ROLE"):])
 			role = strings.Trim(role, `"'`)
-			switch strings.ToUpper(role) {
-			case "", "DEFAULT", "NONE", "POSTGRES":
-				connTx.NonSuperuserRole = ""
-			default:
-				connTx.NonSuperuserRole = role
-			}
+			applySetRole(connTx, role)
 			setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
 		}
 		if err := w.WriteCommandComplete("SET"); err != nil {
@@ -329,8 +371,8 @@ func (s *Server) handleQuery(ctx context.Context, r *libpq.FrameReader, w *libpq
 	// is not used verbatim as a GUC parameter name.
 	case upper == "RESET SESSION AUTHORIZATION":
 		if connTx != nil {
-			connTx.NonSuperuserRole = ""
-			setIsSuperuserGUC(sess, true)
+			applySetSessionAuthorization(connTx, "")
+			setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
 		}
 		if err := w.WriteCommandComplete("RESET"); err != nil {
 			return err
@@ -339,8 +381,8 @@ func (s *Server) handleQuery(ctx context.Context, r *libpq.FrameReader, w *libpq
 	// RESET ROLE — restore the bootstrap superuser's full privileges.
 	case upper == "RESET ROLE":
 		if connTx != nil {
-			connTx.NonSuperuserRole = ""
-			setIsSuperuserGUC(sess, true)
+			applySetRole(connTx, "")
+			setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
 		}
 		if err := w.WriteCommandComplete("RESET"); err != nil {
 			return err

@@ -1842,6 +1842,7 @@ const (
 	precJSON   = 6
 	precAddSub = 7
 	precMulDiv = 8
+	precPow    = 9 // ^ — between * / % and unary minus, matching gram.y's %left '^'
 	precUnary  = 10
 )
 
@@ -2824,6 +2825,8 @@ func (p *parser) peekBinaryOp() (OpCode, int, bool) {
 			return OpDiv, precMulDiv, true
 		case "%":
 			return OpMod, precMulDiv, true
+		case "^":
+			return OpPow, precPow, true
 		case "||":
 			return OpConcat, precConcat, true
 		case "=":
@@ -4257,7 +4260,7 @@ func IsNoParenFuncName(name string) bool {
 	switch name {
 	case "current_timestamp", "current_date", "current_time",
 		"localtime", "localtimestamp",
-		"current_user", "session_user", "user",
+		"current_user", "session_user", "user", "current_role",
 		"current_catalog", "current_schema":
 		return true
 	}

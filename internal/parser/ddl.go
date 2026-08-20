@@ -3393,6 +3393,7 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				pos2 := p.cur().Pos
 				p.advance() // PARTITION
 				p.advance() // BY
+				methodPos := p.cur().Pos
 				method := ""
 				switch {
 				case p.acceptIdentKeyword("list"):
@@ -3413,14 +3414,14 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				if !p.acceptSymbol("(") {
 					return nil, p.errAtCur("expected '(' after partition method")
 				}
-				keyCols, keyExprs, opClasses, colls, err2 := p.parsePartitionKeyCols()
+				keyCols, keyColPos, keyExprs, opClasses, colls, err2 := p.parsePartitionKeyCols()
 				if err2 != nil {
 					return nil, err2
 				}
 				if !p.acceptSymbol(")") {
 					return nil, p.errAtCur("expected ')'")
 				}
-				stmt.PartitionBy = &PartitionByClause{pos: pos2, Method: method, KeyCols: keyCols, KeyExprs: keyExprs, OpClasses: opClasses, Collations: colls}
+				stmt.PartitionBy = &PartitionByClause{pos: pos2, Method: method, MethodPos: methodPos, KeyCols: keyCols, KeyColPos: keyColPos, KeyExprs: keyExprs, OpClasses: opClasses, Collations: colls}
 			}
 		}
 		// Optional USING <access_method> on a partition child, e.g.
@@ -3685,6 +3686,7 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 		if _, err := p.expectKeyword(KwBy); err != nil {
 			return nil, err
 		}
+		methodPos := p.cur().Pos
 		method := ""
 		switch {
 		case p.acceptIdentKeyword("list"):
@@ -3706,14 +3708,14 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 			return nil, p.errAtCur("expected '(' after partition method")
 		}
 		// Parse column names (or expressions) with optional operator class names. M0097-0015/M0097-0027/M0097-0023.
-		keyCols, keyExprs, opClasses, colls, err2 := p.parsePartitionKeyCols()
+		keyCols, keyColPos, keyExprs, opClasses, colls, err2 := p.parsePartitionKeyCols()
 		if err2 != nil {
 			return nil, err2
 		}
 		if !p.acceptSymbol(")") {
 			return nil, p.errAtCur("expected ')'")
 		}
-		stmt.PartitionBy = &PartitionByClause{pos: pos, Method: method, KeyCols: keyCols, KeyExprs: keyExprs, OpClasses: opClasses, Collations: colls}
+		stmt.PartitionBy = &PartitionByClause{pos: pos, Method: method, MethodPos: methodPos, KeyCols: keyCols, KeyColPos: keyColPos, KeyExprs: keyExprs, OpClasses: opClasses, Collations: colls}
 	}
 	if p.acceptKeyword(KwWith) {
 		opts, err := p.parseWithOptions()
@@ -4199,9 +4201,10 @@ func (p *parser) consumeCreateTableSuffix(stmt *CreateTableStmt) {
 // parsePartitionKeyCols parses the column-list (and possibly expression-list)
 // inside PARTITION BY (key1, key2, ...). Each key may be either a plain column
 // name or a parenthesised expression such as (abs(b)) or ((a+b)/2). M0097-0023.
-func (p *parser) parsePartitionKeyCols() (keyCols []string, keyExprs []Expr, opClasses []string, collations []string, err error) {
+func (p *parser) parsePartitionKeyCols() (keyCols []string, keyColPos []int, keyExprs []Expr, opClasses []string, collations []string, err error) {
 	for {
 		var colName string
+		var colPos int
 		var expr Expr
 		var collation string
 		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
@@ -4225,19 +4228,26 @@ func (p *parser) parsePartitionKeyCols() (keyCols []string, keyExprs []Expr, opC
 			}
 			// Unwrap: ColumnRef → plain column name (most common case).
 			// CollateExpr wrapping a ColumnRef → use column name + store collation.
+			// The column reference's own .Pos() is preserved in colPos (M0134-0016b
+			// errposition) even though the expr node itself is discarded, so the
+			// "column %q named in partition key does not exist" / "cannot use system
+			// column" errors can carry the caret PG puts on the column token.
 			switch v := expr.(type) {
 			case *ColumnRef:
 				colName = v.Column
+				colPos = v.Pos()
 				expr = nil
 			case *CollateExpr:
 				if cr, ok := v.Operand.(*ColumnRef); ok {
 					colName = cr.Column
+					colPos = cr.Pos()
 					collation = v.CollationName
 					expr = nil
 				}
 			}
 		}
 		keyCols = append(keyCols, colName)
+		keyColPos = append(keyColPos, colPos)
 		keyExprs = append(keyExprs, expr)
 		// Optional operator class name (e.g. part_test_int4_ops). M0097-0027.
 		opClass := ""
@@ -8825,8 +8835,12 @@ func (p *parser) parseAlter() (Stmt, error) {
 		return nil, err
 	}
 	stmt.Name = name
-	// Optional trailing '*' (include children) — accept and discard.
-	if p.cur().Kind == TokenOperator && p.cur().Value == "*" {
+	// Optional trailing '*' (include children) — accept and discard. The
+	// lexer emits '*' as TokenSymbol (lexer.go:391,424), matching every
+	// other star-suffix site (ddl.go:5827, parser.go:1855,3484,
+	// select.go:1121,3039,4134,4285); this comparison used to test
+	// TokenOperator and never matched. M0134-0015b.
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "*" {
 		p.advance()
 	}
 	// OWNER TO role — record the target role name so the executor can update the
@@ -9846,11 +9860,19 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		if _, err := p.expectKeyword(KwKey); err != nil {
 			return AlterTableAction{}, err
 		}
-		// PRIMARY KEY USING INDEX name — adopt existing index. Treat as no-op.
+		// PRIMARY KEY USING INDEX name — adopt existing index as the PK's
+		// backing index. tablecmds.c:ATExecAddIndexConstraint. M0134-0005x.
 		if p.acceptKeyword(KwUsing) || p.acceptIdentKeyword("using") {
 			p.acceptKeyword(KwIndex) // consume INDEX keyword
-			_, _ = p.parseIdent()    // consume index name
-			return AlterTableAction{pos: pos, Kind: AlterTableNoOp}, nil
+			idxTok, err := p.parseIdent()
+			if err != nil {
+				return AlterTableAction{}, err
+			}
+			act.Kind = AlterTableAddPrimaryKey
+			act.UsingIndexName = identText(idxTok)
+			// ExistingIndex ConstraintAttributeSpec — gram.y:4283.
+			p.parseConstraintDeferrable(&act.Deferrable, &act.InitiallyDeferred)
+			return act, nil
 		}
 		if !p.acceptSymbol("(") {
 			return AlterTableAction{}, p.errAtCur("expected '(' after PRIMARY KEY")
@@ -10078,10 +10100,18 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 				}
 			}
 		} else {
-			// ADD UNIQUE USING INDEX indexname — adopt existing index as unique constraint.
-			// Treat as no-op; the index already exists in the catalog. M0097-0023.
-			_, _ = p.parseIdent() // consume indexname
-			return AlterTableAction{pos: pos, Kind: AlterTableNoOp}, nil
+			// ADD UNIQUE USING INDEX indexname — adopt existing index as the
+			// unique constraint's backing index. tablecmds.c:ATExecAddIndexConstraint.
+			// M0134-0005x (was a no-op stub, M0097-0023).
+			idxTok, err := p.parseIdent()
+			if err != nil {
+				return AlterTableAction{}, err
+			}
+			act.Kind = AlterTableAddUnique
+			act.UsingIndexName = identText(idxTok)
+			// ExistingIndex ConstraintAttributeSpec — gram.y:4249.
+			p.parseConstraintDeferrable(&act.Deferrable, &act.InitiallyDeferred)
+			return act, nil
 		}
 		// Optional DEFERRABLE [INITIALLY {DEFERRED|IMMEDIATE}].
 		// pg_dump emits `UNIQUE (col) DEFERRABLE INITIALLY DEFERRED`

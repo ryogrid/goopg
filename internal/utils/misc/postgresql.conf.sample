@@ -57,6 +57,8 @@
                                         # 0 = auto from shared_buffers
                                         # (change requires restart)
 #work_mem = 512MB                       # min 64kB
+#maintenance_work_mem = 64MB            # min 64kB; accepted, VACUUM/CREATE
+                                        # INDEX do not yet size off this GUC
 
 # - Background Writer -
 
@@ -290,6 +292,8 @@
 #------------------------------------------------------------------------------
 
 #vacuum_cost_delay = 0                  # 0-100 ms; 0 disables cost-based delay
+#vacuum_truncate = on                   # accepted; goopg's VACUUM never
+                                        # truncates trailing empty pages yet
 #autovacuum_worker_slots = 16           # 1-262143; accepted, goopg has no
                                         # autovacuum worker pool
                                         # (change requires restart)

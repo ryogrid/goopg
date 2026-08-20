@@ -1536,7 +1536,9 @@ func (s *CreateTableStmt) stmtNode() {}
 type PartitionByClause struct {
 	pos        int
 	Method     string   // "LIST", "RANGE", or "HASH"
+	MethodPos  int      // byte offset of the method token (e.g. "MAGIC" in `PARTITION BY MAGIC (a)`); M0134-0016b errposition
 	KeyCols    []string // partition key column names; empty string for expression keys
+	KeyColPos  []int    // byte offset of each KeyCols[i] column-reference token (0 for expression keys); M0134-0016b errposition
 	KeyExprs   []Expr   // expression-based partition keys; nil for plain column keys (M0097-0023)
 	OpClasses  []string // operator class per key col (empty string = default); M0097-0027
 	Collations []string // per-key collation name ("" = default, i.e. not shown); M0097-0023
@@ -3430,6 +3432,13 @@ type AlterTableAction struct {
 	// M0134-0005 S05.
 	AlterConstraintNoInherit         bool
 	AlterConstraintHasInheritability bool
+
+	// UsingIndexName is populated for `ADD [CONSTRAINT name] PRIMARY KEY|UNIQUE
+	// USING INDEX idxname` (AlterTableAddPrimaryKey/AlterTableAddUnique with
+	// Columns left empty): the existing unique index to adopt as the
+	// constraint's backing index. tablecmds.c:ATExecAddIndexConstraint.
+	// M0134-0005x.
+	UsingIndexName string
 }
 
 func (a AlterTableAction) Pos() int { return a.pos }

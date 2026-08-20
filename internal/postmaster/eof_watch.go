@@ -45,7 +45,7 @@ import (
 // connection deadlines, so it cannot interfere with protocol reads. It is
 // armed per query by runPostStartupLoop and stopped as soon as the handler
 // returns; replication-mode connections never arm it (the walsender manages
-// its own socket lifecycle, replication.go).
+// its own socket lifecycle, internal/replication/walsender.go).
 //
 // This project targets x86_64 Linux only (see .ralph/AGENT.md), so the raw
 // recvfrom is not a portability concern. Connections whose net.Conn does not

@@ -42,6 +42,15 @@ type ddlOp struct {
 	plan *optimizer.DDL
 	ctx  *Context
 	done bool
+	// pendingDropShadow carries the table a CREATE displaced by overwriting a
+	// same-transaction deferred-DROP's still-present catalog slot
+	// (M0134-0023). Set by execCreateTable right after
+	// CancelPendingTableDropMatching confirms the collision is a same-session
+	// recreate, and read by both the direct CREATE TABLE path (below) and
+	// execCreateTableAs (CTAS / SELECT INTO share this ddlOp instance) so each
+	// can (a) use CreateTableReplacingPendingDrop instead of the guarded
+	// CreateTable, and (b) stash it on the DDLUndoEntry for ROLLBACK restore.
+	pendingDropShadow *catalog.Table
 }
 
 func newDDLOp(p *optimizer.DDL) *ddlOp { return &ddlOp{plan: p} }
@@ -926,32 +935,82 @@ func (o *ddlOp) execAlterConversion(s *parser.AlterConversionStmt) error {
 }
 
 // currentDDLOwnerOID resolves the OID that should own an object created by
-// the current statement: the role currently in effect via SET ROLE / SET
-// SESSION AUTHORIZATION (o.ctx.NonSuperuserRole), or the bootstrap superuser
-// (OID 10) when no such role is active. Mirrors PostgreSQL's
-// GetUserId()-as-owner convention (e.g. CreatePublication, publicationcmds.c).
-// An unresolvable role name (should not happen — NonSuperuserRole is only
-// ever set from a previously-validated role) falls back to the bootstrap
-// superuser rather than minting a bogus owner. DU-002 slice 424.
+// the current statement: the session's effective role (o.ctx.EffectiveUserName —
+// the SET ROLE target when active, else the session/login user; M0134-0009),
+// falling back to the bootstrap superuser (OID 10) when unresolvable.
+// Mirrors PostgreSQL's GetUserId()-as-owner convention (e.g.
+// CreatePublication, publicationcmds.c). DU-002 slice 424.
 func (o *ddlOp) currentDDLOwnerOID() uint32 {
-	if o.ctx.NonSuperuserRole != "" {
-		if oid, ok := o.ctx.Catalog.RoleOID(o.ctx.NonSuperuserRole); ok {
-			return oid
-		}
+	if o.ctx.Catalog == nil {
+		// Round-2 review R10: the old code short-circuited to 10 before ever
+		// dereferencing Catalog (it only consulted NonSuperuserRole, a plain
+		// string); guard so a Context built without a Catalog (some unit
+		// tests) cannot panic here now that this always calls RoleOID.
+		return 10
+	}
+	if oid, ok := o.ctx.Catalog.RoleOID(o.ctx.EffectiveUserName()); ok {
+		return oid
 	}
 	return 10
 }
 
 // currentDDLOwnerName is currentDDLOwnerOID's name-string sibling, for call
 // sites that store a role NAME rather than an OID (e.g. catalog.UserMapping's
-// UmUser). Resolves to the role currently in effect via SET ROLE / SET
-// SESSION AUTHORIZATION (o.ctx.NonSuperuserRole), or the bootstrap superuser
-// name when no such role is active.
+// UmUser). Resolves to the session's effective role (o.ctx.EffectiveUserName,
+// M0134-0009): the SET ROLE target when active, else the session/login user.
 func (o *ddlOp) currentDDLOwnerName() string {
-	if o.ctx.NonSuperuserRole != "" {
-		return o.ctx.NonSuperuserRole
+	return o.ctx.EffectiveUserName()
+}
+
+// checkCommentObjectOwnerOID enforces PG's "must be owner of <kind> <name>"
+// check (aclchk.c aclcheck_error, ACLCHECK_NOT_OWNER) for COMMENT ON
+// CONSTRAINT's two spellings. ownerOID is the object's owning role (already
+// defaulted — see catalog.Domain.OwnerOrDefault and the table-spelling
+// wrapper checkCommentObjectOwner below); superusers always bypass. Scoped to
+// the two constraint arms only — M0134-0005ai; goopg's COMMENT ON otherwise
+// performs no ownership check for any object kind.
+func (o *ddlOp) checkCommentObjectOwnerOID(ownerOID uint32, kind, name string) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
 	}
-	return "postgres"
+	currentOID := o.currentDDLOwnerOID()
+	if im.IsSuperuser(currentOID) {
+		return nil
+	}
+	if ownerOID != currentOID {
+		return &ExecError{Code: "42501",
+			Message: fmt.Sprintf("must be owner of %s %s", kind, name)}
+	}
+	return nil
+}
+
+// checkCommentObjectOwner is checkCommentObjectOwnerOID's sibling for
+// catalog.Table.Owner, which is stored as a role NAME string (empty means
+// "owned by the bootstrap superuser") rather than an OID — see
+// catalog.Table.Owner's doc comment and the CREATE TABLE owner-stamping site
+// (currentDDLOwnerName's counterpart). M0134-0005ai.
+func (o *ddlOp) checkCommentObjectOwner(ownerName, kind, name string) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	currentOID := o.currentDDLOwnerOID()
+	if im.IsSuperuser(currentOID) {
+		return nil
+	}
+	if ownerName == "" {
+		ownerName = "postgres"
+	}
+	ownerOID, ok := im.RoleOID(ownerName)
+	if !ok {
+		ownerOID = 10
+	}
+	if ownerOID != currentOID {
+		return &ExecError{Code: "42501",
+			Message: fmt.Sprintf("must be owner of %s %s", kind, name)}
+	}
+	return nil
 }
 
 // resolveUserMappingRoleName resolves a CREATE/DROP USER MAPPING FOR <user>
@@ -1660,7 +1719,45 @@ func columnTypeStorageCode(cat catalog.Catalog, col catalog.Column) byte {
 	return userTypeAttrsForOID(typOID).TypStorage
 }
 
-func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
+// restoreTempShadow undoes a TEMP-table shadow drop: if ctx.TempTableShadows
+// has an entry under key, the stashed permanent table is re-registered in the
+// catalog and the shadow entry is removed. This is the ONE notion of "undo a
+// shadow" — shared by the normal DROP TABLE restore (the temp relation was
+// dropped, so its permanent shadow comes back) and by execCreateTable's
+// failure-path rollback (the CREATE TEMP TABLE that triggered the shadow drop
+// itself failed, so the drop must not stick). M0097-0003, M0134-0018b.
+func restoreTempShadow(ctx *Context, key string) {
+	if ctx.TempTableShadows == nil {
+		return
+	}
+	permTbl, hasShadow := ctx.TempTableShadows[key]
+	if !hasShadow || permTbl == nil {
+		return
+	}
+	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+		im.RegisterTable(permTbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
+	}
+	delete(ctx.TempTableShadows, key)
+}
+
+// createTableHonoringPendingDrop installs a new table, routing through
+// InMemory.CreateTableReplacingPendingDrop instead of the ordinary
+// Catalog.CreateTable when this call is recreating a name whose collision
+// check was waived because it matched a same-transaction deferred DROP
+// (o.pendingDropShadow != nil — set by execCreateTable's existence check).
+// Shared by the direct CREATE TABLE path and execCreateTableAs (CTAS /
+// SELECT INTO), which is why the shadow is threaded through the ddlOp
+// receiver rather than a parameter. M0134-0023.
+func (o *ddlOp) createTableHonoringPendingDrop(name parser.ObjectName, cols []catalog.Column, dbOid uint32) (*catalog.Table, error) {
+	if o.pendingDropShadow != nil {
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			return im.CreateTableReplacingPendingDrop(name, cols, dbOid)
+		}
+	}
+	return o.ctx.Catalog.CreateTable(name, cols, dbOid)
+}
+
+func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) (retErr error) {
 	// Temporary tables may only be created in the temp schema (pg_temp),
 	// not in a permanent schema like public.
 	if s.Temporary && s.Name.Schema != "" && !strings.EqualFold(s.Name.Schema, "pg_temp") {
@@ -1692,6 +1789,24 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		checkName.Schema = "public"
 	}
 	if _, exists := o.ctx.Catalog.LookupTable(checkName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); exists {
+		// M0134-0023: a name this same session DROPped inside the current
+		// explicit transaction stays physically present in the shared catalog
+		// until COMMIT (deferred removal, see PendingTableDrop) so a concurrent
+		// session and ROLLBACK still see it — but it must be INVISIBLE to this
+		// session's own collision check here, mirroring PG's MVCC-snapshot
+		// collision check in heap_create_with_catalog (a same-txn-deleted tuple
+		// is invisible to the creator too). Not applied to CREATE TEMP TABLE:
+		// the deferred-drop bookkeeping is for permanent-table drops, and the
+		// TEMP TABLE shadow path below is the established mechanism for that
+		// name-collision shape.
+		if !s.Temporary {
+			if bsess, ok := o.ctx.Session.(*BasicSession); ok {
+				if pending := bsess.CancelPendingTableDropMatching(checkName); pending != nil {
+					o.pendingDropShadow = pending.Table
+					goto afterExistsCheck
+				}
+			}
+		}
 		if s.IfNotExists {
 			o.ctx.Notices = append(o.ctx.Notices,
 				fmt.Sprintf("relation %q already exists, skipping", s.Name.String()))
@@ -1712,10 +1827,26 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			if err := o.ctx.Catalog.DropTable(s.Name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
 				return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
 			}
+			// The shadow drop above must be transactional with respect to the
+			// CREATE it precedes: if anything below fails (CTAS SELECT
+			// resolution, partition-child validation, the ordinary column
+			// path, tablespace resolution, ...) restore the stashed permanent
+			// table instead of stranding it — the failing CREATE TEMP TABLE
+			// must not permanently delete a live permanent relation.
+			// Armed ONLY on this branch, since only this branch performed the
+			// drop. Mirrors the DROP TABLE restore (restoreTempShadow, shared
+			// with :6936-6945) so there is one notion of "undo a shadow", not
+			// two. M0134-0018b.
+			defer func() {
+				if retErr != nil {
+					restoreTempShadow(o.ctx, key)
+				}
+			}()
 		} else {
 			return &ExecError{Code: "42P07", Pos: s.Pos(), Message: fmt.Sprintf("relation %q already exists", s.Name.String())}
 		}
 	}
+afterExistsCheck:
 
 	// CREATE TABLE child PARTITION OF parent FOR VALUES … (M0096-0007)
 	if s.PartitionOf != nil {
@@ -1797,7 +1928,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	var inheritParents []*catalog.Table // collect for post-creation registration
 	if len(s.Inherits) > 0 {
 		for _, parentName := range s.Inherits {
-			parent, ok := o.ctx.Catalog.LookupTable(parentName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+			parent, ok := o.lookupTableWithSearch(parentName)
 			if !ok {
 				return &ExecError{Code: "42P01", Pos: s.Pos(),
 					Message: fmt.Sprintf("relation %q does not exist", parentName.String())}
@@ -1943,6 +2074,59 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				}
 			}
 		}
+		// mergeExplicitColumnIntoInherited implements PostgreSQL's column-merge
+		// semantics shared by plain explicit columns and LIKE-sourced columns
+		// (postgres/src/backend/commands/tablecmds.c:3259 MergeChildAttribute):
+		// a column redeclared by the child that collides by name with an
+		// already-inherited column merges into the SAME cols[] entry (emitting
+		// "merging column %q with inherited definition") instead of appending a
+		// second entry; a collision with a column that was NOT inherited (a
+		// duplicate explicit/LIKE column) is a hard 42701 error. Both the addCol
+		// closure below and the @@LIKE: branch call this helper so they cannot
+		// drift out of sync (Hard-won Rule #2 — sibling paths must stay in
+		// sync). M0134-0005ab.
+		mergeExplicitColumnIntoInherited := func(c catalog.Column) (merged bool, err error) {
+			lname := strings.ToLower(c.Name)
+			for i := range cols {
+				if !strings.EqualFold(cols[i].Name, c.Name) {
+					continue
+				}
+				if !inheritedColNames[lname] {
+					// Column already defined by an explicit column or a previous LIKE
+					// clause. PostgreSQL raises "column X specified more than once" (42701).
+					return false, &ExecError{
+						Code:    "42701",
+						Pos:     s.Pos(),
+						Message: fmt.Sprintf("column %q specified more than once", c.Name),
+					}
+				}
+				// PostgreSQL emits the merging NOTICE before the storage conflict error.
+				o.ctx.AddNotice(fmt.Sprintf("merging column %q with inherited definition", c.Name))
+				if c.Storage != "" {
+					ecStor := strings.ToLower(cols[i].Storage)
+					ccStor := strings.ToLower(c.Storage)
+					if ecStor == "" {
+						ecStor = "extended"
+					}
+					if ccStor == "" {
+						ccStor = "extended"
+					}
+					if ecStor != ccStor {
+						return false, &ExecError{
+							Code:    "42611",
+							Pos:     s.Pos(),
+							Message: fmt.Sprintf("inherited column %q has a storage parameter conflict", c.Name),
+							Detail:  fmt.Sprintf("%s versus %s", strings.ToUpper(ecStor), strings.ToUpper(ccStor)),
+						}
+					}
+				}
+				if c.NotNull {
+					cols[i].NotNull = true
+				}
+				return true, nil
+			}
+			return false, nil
+		}
 		addCol := func(c parser.ColumnDef) error {
 			typeName := strings.ToLower(c.Type.Name)
 			declaredTypeName := "" // non-empty only when a domain is resolved
@@ -1985,7 +2169,13 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			if verr := validateColumnStorage(o.ctx.Catalog, col); verr != nil {
 				return verr
 			}
-			cols = append(cols, col)
+			merged, err := mergeExplicitColumnIntoInherited(col)
+			if err != nil {
+				return err
+			}
+			if !merged {
+				cols = append(cols, col)
+			}
 			return nil
 		}
 		for _, item := range s.BodyOrder {
@@ -2014,57 +2204,6 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 					likeStatisticsSources = append(likeStatisticsSources, likeStatisticsSource{src: src})
 				}
 				for _, sc := range src.Columns {
-					colNameLower := strings.ToLower(sc.Name)
-					found := false
-					for _, ec := range cols {
-						if strings.EqualFold(ec.Name, sc.Name) {
-							found = true
-							break
-						}
-					}
-					if found {
-						if inheritedColNames[colNameLower] {
-							// PostgreSQL emits the merging NOTICE before the storage conflict error.
-							o.ctx.AddNotice(fmt.Sprintf("merging column %q with inherited definition", sc.Name))
-							// Check for storage conflict when INCLUDING STORAGE.
-							if includeStorage {
-								for _, ec := range cols {
-									if strings.EqualFold(ec.Name, sc.Name) {
-										ecStor := strings.ToLower(ec.Storage)
-										scStor := strings.ToLower(sc.Storage)
-										if ecStor == "" {
-											ecStor = "extended"
-										}
-										if scStor == "" {
-											scStor = "extended"
-										}
-										if ecStor != scStor {
-											return &ExecError{
-												Code:    "42611",
-												Pos:     s.Pos(),
-												Message: fmt.Sprintf("inherited column %q has a storage parameter conflict", sc.Name),
-												Detail:  fmt.Sprintf("%s versus %s", strings.ToUpper(ecStor), strings.ToUpper(scStor)),
-											}
-										}
-										break
-									}
-								}
-							}
-						} else {
-							// Column already defined by an explicit column or a previous LIKE clause.
-							// PostgreSQL raises "column X specified more than once" (42701).
-							return &ExecError{
-								Code:    "42701",
-								Pos:     s.Pos(),
-								Message: fmt.Sprintf("column %q specified more than once", sc.Name),
-							}
-						}
-						// Either way, skip (don't add the column again) and continue.
-						if includeConstraints {
-							likeCheckConstraints = appendLikeChecks(likeCheckConstraints, src)
-						}
-						continue
-					}
 					c := sc
 					// Clear IdentityColumn unless INCLUDING IDENTITY or INCLUDING ALL was specified.
 					if !includeIdentity {
@@ -2083,6 +2222,17 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 					// Clear Storage unless INCLUDING STORAGE or INCLUDING ALL was specified.
 					if !includeStorage {
 						c.Storage = ""
+					}
+					merged, err := mergeExplicitColumnIntoInherited(c)
+					if err != nil {
+						return err
+					}
+					if merged {
+						// Either way, skip (don't add the column again) and continue.
+						if includeConstraints {
+							likeCheckConstraints = appendLikeChecks(likeCheckConstraints, src)
+						}
+						continue
 					}
 					cols = append(cols, c)
 					// Carry forward the source table's NOT NULL constraint name for
@@ -2123,6 +2273,12 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 							for _, idx := range im2.IndexesOnTable(src, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 								if idx.Primary {
 									s.PrimaryKey = append(s.PrimaryKey, idx.Columns...)
+									// Carry forward the source PK's deferrability, mirroring
+									// PG's generateClonedIndexStmt (parse_utilcmd.c:1804-1805):
+									// index->deferrable = conrec->condeferrable;
+									// index->initdeferred = conrec->condeferred;
+									s.PrimaryKeyDeferrable = idx.Deferrable
+									s.PrimaryKeyInitiallyDeferred = idx.InitiallyDeferred
 									break
 								}
 							}
@@ -3288,7 +3444,29 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	if err != nil {
 		return err
 	}
-	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+	// CHECK expressions may reference no system column except tableoid
+	// (parse_relation.c:707-713, scanNSItemForColumn,
+	// EXPR_KIND_CHECK_CONSTRAINT). Validated before CreateTable, like the
+	// SERVER-name check above, so a bad CHECK never leaves a half-created
+	// relation behind. M0134-0005aa.
+	for _, c := range s.Columns {
+		if c.CheckExpr != "" {
+			if err := validateCheckExprSystemColumns(c.CheckExpr); err != nil {
+				return err
+			}
+		}
+	}
+	for _, chk := range s.TableChecks {
+		if err := validateCheckExprSystemColumns(chk); err != nil {
+			return err
+		}
+	}
+	for _, nc := range s.TableNamedChecks {
+		if err := validateCheckExprSystemColumns(nc.Expr); err != nil {
+			return err
+		}
+	}
+	tbl, err := o.createTableHonoringPendingDrop(s.Name, cols, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
 	}
@@ -3573,7 +3751,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// Record for rollback before heap sync — if heap sync fails the catalog
 	// entry is already live and must be cleaned up on ROLLBACK.
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
-		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false})
+		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false, ShadowedTable: o.pendingDropShadow})
 	}
 	if catalogHeapSyncAvailable(o.ctx) {
 		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
@@ -3584,6 +3762,12 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// Named UNIQUE/PRIMARY KEY/EXCLUDE constraints with optional INCLUDE columns. M0097-0023.
 	// These override the generic PK/UNIQUE index name with the constraint name.
 	namedPKCreated := false
+	// notNullHeapDirty tracks whether any block below flips col.NotNull /
+	// calls tbl.AddNotNull AFTER the single early syncTableToCatalogHeap call
+	// above — pg_attribute is heap-backed (goopg_pg_class_virtual_pg_attribute_heap),
+	// so those in-memory mutations are invisible to \d+/pg_dump until a
+	// second sync runs. M0134-0005y.
+	notNullHeapDirty := false
 	for _, nc := range s.NamedConstraints {
 		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: nc.Name}
 		if nc.IsExclusion {
@@ -3637,6 +3821,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			for _, pkCol := range nc.Columns {
 				if col, ok := o.ctx.Catalog.LookupColumn(tbl, pkCol); ok {
 					col.NotNull = true
+					notNullHeapDirty = true
 				}
 			}
 		}
@@ -3699,6 +3884,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		for _, pkCol := range pkCols {
 			if col, ok := o.ctx.Catalog.LookupColumn(tbl, pkCol); ok {
 				col.NotNull = true
+				notNullHeapDirty = true
 			}
 		}
 	}
@@ -3768,7 +3954,12 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		ec.Name = name
 		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: name}
 		if ec.ExclusionOp == "=" && strings.ToLower(ec.Method) == "btree" {
-			if err := o.createBTreeIndex(s.Pos(), idxName, tbl, ec.Columns, nil, false, false, false, nil, nil); err != nil {
+			// Rule-#2 sibling of execAlterTableAddExclude's identical branch
+			// (M0134-0005af): CREATE TABLE never has pre-existing rows, so
+			// checkDup is a behavioural no-op here, but the constraint shape
+			// is identical to the ALTER path and must not silently diverge —
+			// e.g. via a future LIKE/inheritance-copy that does carry rows.
+			if err := o.createBTreeIndex(s.Pos(), idxName, tbl, ec.Columns, nil, false, false, false, nil, nil, &btreeIndexProps{CheckDup: true, IsExclusion: true, ExclusionOp: "="}); err != nil {
 				return err
 			}
 			if idx, ok := o.ctx.Catalog.LookupIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok {
@@ -3839,13 +4030,24 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		if c.CheckExpr != "" {
 			name := c.CheckConstraintName
 			if name == "" {
-				name = tbl.Name + "_" + c.Name + "_check"
+				// PostgreSQL's ChooseConstraintName names a CHECK by the
+				// distinct columns the *expression* references, not the
+				// syntactic column it is attached to: exactly one distinct
+				// column -> "<table>_<col>_check", otherwise "<table>_check"
+				// (postgres/src/backend/catalog/heap.c:2546-2582). M0134-0005z.
+				name = o.autoCheckName(tbl, c.CheckExpr)
 			}
 			// c.CheckNotEnforced carries a column-level `CHECK (...) NOT
 			// ENFORCED` (PG18) so the dumped constraintdef re-emits the
 			// suffix and pg_constraint reports conenforced=false. DU-002
-			// slice 430.
-			tbl.AddCheckFull(name, c.CheckExpr, o.allocConstraintOID(name), false, false, c.CheckNotEnforced)
+			// slice 430. c.CheckNoInherit (a column-level `CHECK (...) NO
+			// INHERIT`) must reach NamedChecks too — previously hardcoded
+			// false here, which was unobservable before M0134-0005z (plain
+			// INHERITS never copied CHECK constraints at all) but became a
+			// live bug the moment sub-bug A started propagating checks:
+			// without this, ATACC1's inline `CHECK (TEST > 0) NO INHERIT`
+			// would incorrectly propagate to ATACC2. M0134-0005z.
+			tbl.AddCheckFull(name, c.CheckExpr, o.allocConstraintOID(name), false, c.CheckNoInherit, c.CheckNotEnforced)
 		}
 	}
 	// Table-level CHECK constraints written without an explicit CONSTRAINT name
@@ -3899,6 +4101,41 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// previously masked this was fixed in M0097-0023-loop34). M0097-0023.
 	for _, nc := range likeCheckConstraints {
 		tbl.AddCheck(nc.Name, nc.Expr, o.allocConstraintOID(nc.Name))
+	}
+	// Inherit named CHECK constraints from `CREATE TABLE child (...) INHERITS
+	// (parent...)` parents (non-NoInherit only), mirroring the identical block
+	// in execCreatePartitionChild. IsLocal=false, InhCount=1 (AddCheckInherited).
+	// Multiple INHERITS parents carrying the same constraint name are merged
+	// into a single child constraint (PG's MergeAttributes union-by-name),
+	// deduplicated the same way appendLikeChecks dedups LIKE-sourced checks.
+	// PG oracle: postgres/src/backend/commands/tablecmds.c:MergeAttributes.
+	// M0134-0005z.
+	if imInh, isImInh := o.ctx.Catalog.(*catalog.InMemory); isImInh {
+		for _, parent := range inheritParents {
+			for _, pnc := range parent.NamedChecks {
+				if pnc.Name == "" || pnc.NoInherit {
+					continue
+				}
+				already := false
+				for _, existing := range tbl.NamedChecks {
+					if strings.EqualFold(existing.Name, pnc.Name) {
+						already = true
+						break
+					}
+				}
+				if already {
+					continue
+				}
+				// CREATE-time inheritance derives validity PURELY from
+				// enforcement (MergeCheckConstraint, tablecmds.c:3167-3222:
+				// `newcon->is_enforced = is_enforced; newcon->skip_validation
+				// = !is_enforced;`) — never from the parent's own
+				// convalidated. A fresh empty child is trivially valid, so
+				// NotValid mirrors NotEnforced, NOT the parent's NotValid.
+				// M0134-0005ar.
+				tbl.AddCheckInherited(pnc.Name, pnc.Expr, imInh.AllocOID(), pnc.NotEnforced, pnc.NotEnforced)
+			}
+		}
 	}
 	// PG18: register named NOT NULL constraints for every NOT-NULL column.
 	// LIKE INCLUDING ALL/CONSTRAINTS preserves the source constraint name;
@@ -3954,6 +4191,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		for _, colName := range s.TableNotNullCols {
 			if col, ok2 := o.ctx.Catalog.LookupColumn(tbl, colName); ok2 {
 				col.NotNull = true
+				notNullHeapDirty = true
 			}
 		}
 		// PG18 records a contype='n' NOT NULL constraint for EVERY not-null
@@ -3994,6 +4232,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				}
 			}
 			name := strings.ToLower(tbl.Name) + "_" + colKey + "_not_null"
+			childAutoName := name
 			var noInherit bool
 			isLocal := true
 			inhCount := 0
@@ -4009,9 +4248,36 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			// but partitions always print every column inline regardless of
 			// locality (pg_dump.c's `tbinfo->ispartition` check), so this
 			// re-derivation only matters for s.PartitionOf == nil. DU-002.
-			if col.Inherited && s.PartitionOf == nil {
+			//
+			// col.Inherited alone under-fires here: it is FALSE whenever the
+			// child textually redeclares the column (attislocal must be true
+			// per MergeChildAttribute, tablecmds.c:3392 `inhdef->is_local =
+			// true` unconditionally) -- even when the redeclaration carries no
+			// NOT NULL keyword of its own (`CREATE TABLE child (a int, ...)
+			// INHERITS (parent)` where parent has a NAMED not-null
+			// constraint). PG's constraint-level merge (MergeChildAttribute
+			// tablecmds.c:3332 `inhdef->is_not_null |= newdef->is_not_null`)
+			// does NOT make that case locally-owned at the pg_constraint
+			// level: verified live against goopg (constraints.sql's
+			// notnull_tbl1_child) and cross-checked against
+			// constraints.out:1437-1445 -- expects conname='nn' (the parent's
+			// name), conislocal='f', coninhcount=1. So the pg_constraint
+			// locality signal here must be "did the child's OWN ColumnDef
+			// carry an explicit NOT NULL keyword" (explicitNotNullLocal), not
+			// "is the column absent from the child's column list"
+			// (col.Inherited) -- a bare retype-only redeclaration must still
+			// route through the parent-name/non-local branch below.
+			// M0134-0005ab.
+			explicitNotNullLocal := false
+			if oc, ok2 := origColByName[colKey]; ok2 && oc.NotNullExplicit {
+				explicitNotNullLocal = true
+			}
+			if (col.Inherited || !explicitNotNullLocal) && s.PartitionOf == nil {
 				for _, parent := range inheritParents {
 					for _, pnc := range parent.NotNullConstraints {
+						if pnc.NoInherit {
+							continue
+						}
 						if strings.EqualFold(pnc.ColName, col.Name) {
 							if inhCount == 0 && pnc.Name != "" {
 								name = pnc.Name
@@ -4024,21 +4290,28 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				if inhCount > 0 {
 					isLocal = false
 				}
-			} else if !col.Inherited && s.PartitionOf == nil {
+			} else if !col.Inherited && explicitNotNullLocal && s.PartitionOf == nil {
 				// Column explicitly re-declared in the child's own column
-				// list (e.g. `CREATE TABLE child (id int NOT NULL, ...)
-				// INHERITS (parent)`) that ALSO matches a NOT NULL
-				// constraint enforced by an INHERITS parent: PG's
-				// MergeAttributes ("merging column ... with inherited
-				// definition") still counts the parent's enforcement,
-				// giving coninhcount=1 despite conislocal=t and the child's
-				// own auto-generated name (verified live against PG 18.3).
-				// No pg_dump text impact (print_notnull only gates on
+				// list WITH its own literal NOT NULL keyword (e.g. `CREATE
+				// TABLE child (id int NOT NULL, ...) INHERITS (parent)`) that
+				// ALSO matches a NOT NULL constraint enforced by an INHERITS
+				// parent: PG's MergeAttributes ("merging column ... with
+				// inherited definition") still counts the parent's
+				// enforcement, giving coninhcount=1 despite conislocal=t and
+				// the child's own auto-generated name (verified live against
+				// PG 18.3). A retype-only redeclaration (no literal NOT NULL
+				// keyword) does NOT reach this branch -- it is routed through
+				// the branch above instead (explicitNotNullLocal is false),
+				// matching PG's own conislocal=f/parent-name behavior for that
+				// case. No pg_dump text impact (print_notnull only gates on
 				// conislocal for a plain-INHERITS child), but pg_constraint
 				// itself must match for direct-catalog consumers
-				// (pg_upgrade, introspection). DU-002.
+				// (pg_upgrade, introspection). DU-002 / M0134-0005ab.
 				for _, parent := range inheritParents {
 					for _, pnc := range parent.NotNullConstraints {
+						if pnc.NoInherit {
+							continue
+						}
 						if strings.EqualFold(pnc.ColName, col.Name) {
 							inhCount = 1
 							break
@@ -4055,12 +4328,51 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 					execErr.Pos = s.Pos()
 					return execErr
 				}
+				// heap.c:3038-3050 — any local source (explicit column NOT
+				// NULL, table-level CONSTRAINT, or PK-implied) makes the
+				// constraint conislocal='t' unconditionally, regardless of
+				// what the col.Inherited branch above decided; inhCount is
+				// left as-is since it already counts the absorbed parent
+				// constraints, yielding PG's (local, inherited). The name
+				// comes from ChooseConstraintName over the CHILD's relation
+				// name — i.e. the same auto-name computed at childAutoName
+				// above — not the parent's name the col.Inherited branch may
+				// have assigned, unless entries itself carried an explicit
+				// name. §26.4.
+				isLocal = true
 				if mergedName != "" {
+					// heap.c:2645-2652 (ConstraintNameIsUsed check inside
+					// AddRelationNewConstraints' CONSTR_NOTNULL branch) — an
+					// explicit name must not collide with any constraint
+					// already recorded on this table, including a not-null
+					// constraint added for an earlier column in this same
+					// CREATE TABLE. Bare ereport, no errposition.
+					// M0134-0005ad E2.
+					if o.fkConstraintNameInUse(tbl, mergedName) {
+						// The table was already registered by CreateTable
+						// above (heap_create_with_catalog runs before
+						// AddRelationNewConstraints in PG too, but PG's whole
+						// CREATE TABLE runs inside one transaction that
+						// aborts on this ereport, leaving no relation
+						// behind) — undo the registration so a rejected
+						// CREATE TABLE leaves no phantom relation, matching
+						// PG and letting a same-named retry succeed.
+						_ = o.ctx.Catalog.DropTable(s.Name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+						return &ExecError{Code: "42710", Pos: 0,
+							Message: fmt.Sprintf("constraint %q for relation %q already exists", mergedName, tbl.Name)}
+					}
 					name = mergedName
+				} else {
+					name = childAutoName
 				}
 				noInherit = mergedNoInherit
 			}
 			tbl.AddNotNull(name, col.Name, im.AllocOID(), noInherit, false, isLocal, inhCount)
+			// AddNotNull runs after the single early syncTableToCatalogHeap
+			// call above; this covers PK-implied NOT NULL absorbed via
+			// INHERITS/LIKE as well as any not-null column not yet flagged
+			// dirty above. M0134-0005y.
+			notNullHeapDirty = true
 		}
 	}
 	// Copy pg_description comments from LIKE INCLUDING COMMENTS sources:
@@ -4134,6 +4446,31 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 					}
 				}
 			}
+		}
+	}
+	// pg_attribute/pg_class are heap-backed, not virtual — the named/anonymous
+	// PRIMARY KEY blocks above and the INHERITS/LIKE NOT-NULL merge all run
+	// AFTER the single early syncTableToCatalogHeap call near the top of this
+	// function, so their col.NotNull/AddNotNull mutations never reached the
+	// heap row that sync wrote. Re-sync now, same delete-old-then-resync
+	// pattern as finishPrimaryKeyConstraint (M0134-0005o/-0005x), but only
+	// when a downstream arm actually flipped NOT-NULL state — a table with
+	// no PK/NOT NULL columns must not pay for (or duplicate) a resync.
+	// execCreatePartitionChild applies its NOT NULL overrides BEFORE its own
+	// syncTableToCatalogHeap call instead; CREATE TABLE can't do the same
+	// because the constraint-processing blocks above depend on catalog state
+	// (namedPKCreated, index lookups, inherited-parent columns) that isn't
+	// available until after the table/columns are fully constructed and the
+	// initial sync has already run. M0134-0005y.
+	if notNullHeapDirty && catalogHeapSyncAvailable(o.ctx) {
+		if err := o.ctx.MaterializeWriterXID(); err == nil {
+			xmax := o.ctx.Tx.XID
+			for _, dbOid := range tableCatalogDBOids(o.ctx) {
+				deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+			}
+		}
+		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+			return fmt.Errorf("DDL catalog sync: %w", syncErr)
 		}
 	}
 	return nil
@@ -4223,6 +4560,33 @@ func checkNameTaken(tbl *catalog.Table, name string) bool {
 	return false
 }
 
+// constraintNameTaken reports whether name is already used by ANY constraint
+// on tbl — CHECK, foreign key, or PK/unique/exclusion index — mirroring PG's
+// single per-relation pg_constraint namespace that ChooseConstraintName probes
+// via ConstraintNameIsUsed (postgres/src/backend/catalog/pg_constraint.c:513).
+// Unlike checkNameTaken (CHECK-only, reused elsewhere and left untouched),
+// this is the broader namespace check needed by callers that clone a
+// constraint of unknown kind onto a table that may already own a
+// same-named constraint of a DIFFERENT kind.
+func constraintNameTaken(ctx *Context, tbl *catalog.Table, name string) bool {
+	if checkNameTaken(tbl, name) {
+		return true
+	}
+	for _, fk := range tbl.ForeignKeys {
+		if fk.Name == name {
+			return true
+		}
+	}
+	if ctx != nil && ctx.Catalog != nil {
+		for _, idx := range ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
+			if idx.Name == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // collectCheckExprColumns walks a parsed CHECK expression and appends the
 // lowercased names of every bare column reference it finds to *out. Mirrors
 // PostgreSQL's pull_var_clause: subqueries (sublinks) are not descended into,
@@ -4281,6 +4645,47 @@ func collectCheckExprColumns(e parser.Expr, out *[]string) {
 		collectCheckExprColumns(n.Base, out)
 		collectCheckExprColumns(n.Index, out)
 	}
+}
+
+// checkConstraintForbiddenSystemColumns are PostgreSQL's system columns that
+// a CHECK constraint expression may NOT reference. tableoid is the sole
+// exception (postgres/src/backend/parser/parse_relation.c:707-713,
+// scanNSItemForColumn: "In constraint check, no system column is allowed
+// except tableOid"). M0134-0005aa.
+var checkConstraintForbiddenSystemColumns = map[string]bool{
+	"ctid": true,
+	"xmin": true,
+	"xmax": true,
+	"cmin": true,
+	"cmax": true,
+}
+
+// validateCheckExprSystemColumns rejects a CHECK expression that references
+// any system column other than tableoid, mirroring PG's
+// scanNSItemForColumn EXPR_KIND_CHECK_CONSTRAINT gate (SQLSTATE 42703,
+// parse_relation.c:707-713). exprSQL is goopg's already-reconstructed
+// (token-joined) CHECK body text — the parser does not thread source
+// positions through CheckExpr/TableChecks/TableNamedChecks, so unlike PG's
+// LINE/cursor-position rendering the returned ExecError carries Pos 0
+// rather than an invented cursor position (M0134-0005aa report.md).
+// A malformed expression is left for the existing planner-time error path
+// to report, not this gate.
+func validateCheckExprSystemColumns(exprSQL string) error {
+	parsed, err := parser.ParseExpr(exprSQL)
+	if err != nil {
+		return nil
+	}
+	var cols []string
+	collectCheckExprColumns(parsed, &cols)
+	for _, c := range cols {
+		if checkConstraintForbiddenSystemColumns[c] {
+			return &ExecError{
+				Code:    "42703",
+				Message: fmt.Sprintf("system column %q reference in check constraint is invalid", c),
+			}
+		}
+	}
+	return nil
 }
 
 // appendLikeChecks copies src's CHECK constraints (name + expression) into
@@ -4380,7 +4785,7 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 	}
 	if o.ctx.Pool == nil || o.ctx.Catalog == nil || o.ctx.TxnMgr == nil {
 		// No storage: create an empty table with no columns.
-		_, err := o.ctx.Catalog.CreateTable(s.Name, nil, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+		_, err := o.createTableHonoringPendingDrop(s.Name, nil, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if err != nil {
 			return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
 		}
@@ -4431,7 +4836,7 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 	if err != nil {
 		return err
 	}
-	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+	tbl, err := o.createTableHonoringPendingDrop(s.Name, cols, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
 	}
@@ -4454,7 +4859,7 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 		}
 	}
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
-		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false})
+		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false, ShadowedTable: o.pendingDropShadow})
 	}
 	if catalogHeapSyncAvailable(o.ctx) {
 		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
@@ -4848,7 +5253,11 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 		if isIM2 {
 			oid = im2.AllocOID()
 		}
-		tbl.AddCheckInherited(pnc.Name, pnc.Expr, oid)
+		// Same CREATE-time rule as the execCreateTable INHERITS loop above
+		// (operators_ddl.go:~4030) — MergeCheckConstraint derives validity
+		// purely from enforcement, never from the parent's own convalidated.
+		// M0134-0005ar.
+		tbl.AddCheckInherited(pnc.Name, pnc.Expr, oid, pnc.NotEnforced, pnc.NotEnforced)
 	}
 	// Apply CHECK constraints declared explicitly in the PARTITION OF column list
 	// (e.g. CONSTRAINT check_b CHECK (b > 0)). If the same name was already
@@ -5072,11 +5481,37 @@ func validatePartitionChild(s *parser.CreateTableStmt, parent *catalog.Table, ct
 }
 
 func validateDefaultPartition(childName string, parent *catalog.Table, ctx *Context, pos int) error {
-	for _, pb := range parent.PartitionBounds {
-		if pb.IsDefault {
-			return &ExecError{Code: "42P16", Pos: pos,
-				Message: fmt.Sprintf("partition %q conflicts with existing default partition %q", childName, pb.ChildName)}
+	// M0134-0013b (corrected): parent.PartitionBounds is the PARENT-side list
+	// of the parent's own CHILDREN's bounds (each entry's ChildName names the
+	// child that owns it, set at :4944; the sole writer is :5011). That list
+	// is correct in content, merely never pruned when a child is dropped or
+	// detached, so filter it by the set of still-live children rather than
+	// abandoning it — scanning a live child's OWN PartitionBounds instead (a
+	// first-attempt mistake) inspects the parent's GRANDchildren and matches
+	// the wrong tree level. Matches PG's check_new_partition_bound()
+	// (postgres/src/backend/partitioning/partbounds.c:2895-2923), which
+	// recomputes the partition descriptor from RelationGetPartitionDesc on
+	// every check rather than consulting a cache — a dropped child is simply
+	// absent from the rebuilt descriptor. NOTE: the sibling
+	// validateDefaultPartitionConflict (operators_ddl_partition.go:854) has
+	// this same wrong-tree-level bug and is NOT a reference implementation —
+	// it is dead code that has never been exercised.
+	var live map[string]bool
+	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+		live = make(map[string]bool)
+		for _, c := range im.PartitionChildren(parent.OID) {
+			live[c.Name] = true
 		}
+	}
+	for _, pb := range parent.PartitionBounds {
+		if !pb.IsDefault {
+			continue
+		}
+		if live != nil && !live[pb.ChildName] {
+			continue // stale entry: that child was dropped/detached
+		}
+		return &ExecError{Code: "42P16", Pos: pos,
+			Message: fmt.Sprintf("partition %q conflicts with existing default partition %q", childName, pb.ChildName)}
 	}
 	return nil
 }
@@ -5345,15 +5780,54 @@ func defaultExprToSQL(e parser.Expr) string {
 // is not itself re-parseable (defaultExprToSQL hit a node it cannot render and fell
 // through to its Go-value fallback), keep the legacy double-paren raw wrap so we
 // never emit non-SQL garbage. DU-002 slice 362.
-func renderCheckPredicate(rawExpr string) string {
+//
+// pretty mirrors PG's pg_get_constraintdef(oid, pretty): psql's \d+ always calls
+// the two-arg form with pretty=true (describe.c:2530), while pg_dump uses the
+// one-arg form / pretty=false (pg_dump.c:7768). ruleutils.c's get_oper_expr only
+// self-wraps an OpExpr in parens `if (!PRETTY_PAREN(context))`
+// (ruleutils.c:10735-10769), so under pretty mode a bare top-level comparison
+// loses its self-wrap entirely: `CHECK (a > 0)` instead of `CHECK ((a > 0))`.
+// Only the single bare-comparison case is handled here (stripTopLevelSelfWrapParen
+// excludes AND/OR); a compound predicate under pretty mode would need PG's full
+// recursive isSimpleNode precedence logic and is out of scope (DU-002-ah slice A).
+func renderCheckPredicate(rawExpr string, pretty bool) string {
 	if e, err := parser.ParseExpr(rawExpr); err == nil {
 		if deparsed := defaultExprToSQL(e); deparsed != "" {
 			if _, err2 := parser.ParseExpr(deparsed); err2 == nil {
+				if pretty {
+					if stripped, ok := stripTopLevelSelfWrapParen(e, deparsed); ok {
+						deparsed = stripped
+					}
+				}
 				return "CHECK (" + deparsed + ")"
 			}
 		}
 	}
 	return "CHECK ((" + rawExpr + "))"
+}
+
+// stripTopLevelSelfWrapParen implements the pretty=true half of PG's
+// PRETTY_PAREN behavior (ruleutils.c:10735-10769 get_oper_expr) for the single
+// case in scope: a bare top-level binary COMPARISON node. defaultExprToSQL
+// unconditionally self-wraps every *parser.BinaryOp in one paren layer
+// (operators_ddl.go binaryOpSymbolForDefault case); under pretty mode PG drops
+// that self-wrap for the expression root. AND/OR (compound predicates) are
+// deliberately excluded — PG's pretty mode drops their inner parens too, but
+// reproducing that needs recursive pretty support, out of scope for this slice
+// (DU-002-ah slice A boundary).
+func stripTopLevelSelfWrapParen(e parser.Expr, deparsed string) (string, bool) {
+	bo, ok := e.(*parser.BinaryOp)
+	if !ok {
+		return "", false
+	}
+	switch bo.Op {
+	case parser.OpAnd, parser.OpOr:
+		return "", false
+	}
+	if strings.HasPrefix(deparsed, "(") && strings.HasSuffix(deparsed, ")") {
+		return deparsed[1 : len(deparsed)-1], true
+	}
+	return "", false
 }
 
 // renderDomainCheckPredicate is renderCheckPredicate's domain twin: it produces
@@ -5380,11 +5854,20 @@ func renderCheckPredicate(rawExpr string) string {
 // is stored as a pre-synthesized, byte-exact ScalarArrayOp deparse
 // (domainInValuesCheckExpr) that defaultExprToSQL cannot reproduce; the dump site
 // keeps its legacy wrap for that case. DU-002 slice 363.
-func renderDomainCheckPredicate(rawExpr string) string {
+//
+// pretty is the table-CHECK twin's pretty flag (see renderCheckPredicate): psql's
+// \dD+ calls pg_get_constraintdef(oid, true), pg_dump uses false/1-arg. Same
+// single-bare-comparison scope, same stripTopLevelSelfWrapParen helper.
+func renderDomainCheckPredicate(rawExpr string, pretty bool) string {
 	if e, err := parser.ParseExpr(rawExpr); err == nil {
 		upcaseDomainValuePlaceholder(e)
 		if deparsed := defaultExprToSQL(e); deparsed != "" {
 			if _, err2 := parser.ParseExpr(deparsed); err2 == nil {
+				if pretty {
+					if stripped, ok := stripTopLevelSelfWrapParen(e, deparsed); ok {
+						deparsed = stripped
+					}
+				}
 				return "CHECK (" + deparsed + ")"
 			}
 		}
@@ -6532,15 +7015,7 @@ func (o *ddlOp) dropTableByRefImmediate(name parser.ObjectName, tbl *catalog.Tab
 		}
 	}
 	// If this table was shadowing a permanent one, restore it. M0097-0003.
-	if o.ctx.TempTableShadows != nil {
-		key := strings.ToLower(name.Name)
-		if permTbl, hasShadow := o.ctx.TempTableShadows[key]; hasShadow && permTbl != nil {
-			if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
-				im.RegisterTable(permTbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
-			}
-			delete(o.ctx.TempTableShadows, key)
-		}
-	}
+	restoreTempShadow(o.ctx, strings.ToLower(name.Name))
 	o.ctx.Pool.InvalidateRel(rel)
 	if err := o.ctx.Pool.Manager().DropRelation(rel); err != nil {
 		return &ExecError{Code: "XX000", Message: err.Error()}
@@ -7352,9 +7827,18 @@ func ApplyPendingInheritanceChanges(ctx *Context, sess *BasicSession) {
 	}
 	for _, ch := range changes {
 		if ch.NoInherit {
+			// Un-absorb the child's NOT NULL constraints BEFORE unregistering
+			// the edge, matching the immediate NO INHERIT path's ordering
+			// (RemoveInheritance's decrement loop runs while the relationship
+			// is still live) and mergeNotNullOnAttach's own twin call in the
+			// immediate AlterTableInherit case. M0134-0005r round 2.
+			if childTbl, okc := im.LookupTableByOID(ch.ChildOID); okc {
+				if parentTbl, okp := im.LookupTableByOID(ch.ParentOID); okp {
+					unmergeNotNullOnDetach(parentTbl, childTbl)
+				}
+			}
 			im.UnregisterInheritanceChild(ch.ParentOID, ch.ChildOID)
 		} else {
-			im.RegisterInheritanceChild(ch.ParentOID, ch.ChildOID)
 			// Copy parent columns the child doesn't already have, matching the
 			// immediate (autocommit) INHERIT path. In alter-table-4 the child
 			// already has matching columns so this is a no-op.
@@ -7369,8 +7853,24 @@ func ApplyPendingInheritanceChanges(ctx *Context, sess *BasicSession) {
 							childTbl.Columns = append(childTbl.Columns, pc)
 						}
 					}
+					// Absorb the child's NOT NULL constraints, matching the
+					// immediate AlterTableInherit path's mergeNotNullOnAttach
+					// call. ApplyPendingInheritanceChanges runs at COMMIT with
+					// no error-return channel (M0118-0008 alter-table-4) and PG
+					// raises these conflicts (42P17/42804) synchronously from
+					// ATExecAddInherit at ALTER TABLE statement time, not at
+					// commit — so reaching here with a still-live pending
+					// change means the statement-time path already accepted
+					// it. goopg does not yet re-run the equivalent check at
+					// statement time on the deferred path (M0118-0008's
+					// transactional-visibility deferral predates this merge),
+					// so a genuine conflict is possible here; ignore it rather
+					// than invent a mid-commit abort path — deferral candidate,
+					// M0134-0005r round 2.
+					_ = mergeNotNullOnAttach(parentTbl, childTbl, false)
 				}
 			}
+			im.RegisterInheritanceChild(ch.ParentOID, ch.ChildOID)
 		}
 		im.UnmarkInheritanceChangePending()
 	}
@@ -8047,7 +8547,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				return err
 			}
 		case parser.AlterTableAddPrimaryKey:
-			if err := o.execAlterTableAddPrimaryKey(tbl, act); err != nil {
+			if err := o.execAlterTableAddPrimaryKey(tbl, act, s.Only); err != nil {
 				return err
 			}
 		case parser.AlterTableAddUnique:
@@ -8219,27 +8719,84 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 						// the SAME 23514 scan as ADD CHECK (tablecmds.c:13116);
 						// on success convalidated 'f'→'t'. M0134-0002 C3 slice 1.
 						if tbl.NamedChecks[i].NotValid {
-							if err := o.validateCheckConstraintRows(tbl, act.ConstraintName, tbl.NamedChecks[i].Expr); err != nil {
+							if err := o.validateCheckConstraintRows(tbl, act.ConstraintName, tbl.NamedChecks[i].Expr, tbl.NamedChecks[i].NoInherit); err != nil {
 								return err
 							}
 							tbl.NamedChecks[i].NotValid = false
+							// Cascade the NOT VALID→VALID flip to every
+							// already-existing descendant's own matching-named
+							// CHECK entry, mirroring
+							// QueueCheckConstraintValidation's find_all_inheritors
+							// walk (tablecmds.c:13109-13210). Gated on
+							// !NoInherit — a NO INHERIT constraint is never
+							// looked for in children at all (:13140).
+							// M0134-0005an.
+							if !tbl.NamedChecks[i].NoInherit {
+								if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+									visited := make(map[[2]uint32]bool)
+									if err := o.cascadeCheckValidateToDescendants(im, tbl, tbl.NamedChecks[i].Name, visited, 0); err != nil {
+										return err
+									}
+								}
+							}
 						}
 						found = true
 						break
 					}
 				}
 			}
-			// Named NOT NULL constraints (contype='n') are validatable too. PG
-			// excludes CONSTR_NOTNULL from the Phase-3 pre-scan
-			// (ATExecValidateConstraint, tablecmds.c:9956) — there are no
-			// existing rows to scan, so the convalidated 'f'→'t' flip is the
-			// whole behavior. pg_constraint is virtual, so flipping the
-			// in-memory struct is what makes psql's \d+ re-render without the
-			// ` NOT VALID` suffix. M0134-0002 C2 slice 10.
+			// Named NOT NULL constraints (contype='n') are validatable too.
+			// tablecmds.c:9956 excludes CONSTR_NOTNULL from the GENERIC
+			// ADD-constraint Phase-3 queue only — that earlier comment
+			// conflated this with VALIDATE CONSTRAINT's own scan.
+			// ATExecValidateConstraint's notnull branch
+			// (tablecmds.c:13291-13295) independently sets
+			// tab->verify_new_notnull = true, which DOES trigger a full
+			// existing-row scan (ATRewriteTable, same 23502 wording as SET
+			// NOT NULL / ADD PRIMARY KEY). Only an unvalidated constraint is
+			// re-scanned (mirrors the FK/CHECK branches above,
+			// tablecmds.c:12960); an already-valid one is a no-op. On
+			// success the convalidated 'f'→'t' flip makes psql's \d+
+			// re-render without the ` NOT VALID` suffix (pg_constraint is
+			// virtual). M0134-0005ac.
 			if !found {
 				for i := range tbl.NotNullConstraints {
 					if strings.EqualFold(tbl.NotNullConstraints[i].Name, act.ConstraintName) {
-						tbl.NotNullConstraints[i].NotValid = false
+						if tbl.NotNullConstraints[i].NotValid {
+							colName := tbl.NotNullConstraints[i].ColName
+							colIdx := -1
+							for ci := range tbl.Columns {
+								if strings.EqualFold(tbl.Columns[ci].Name, colName) {
+									colIdx = ci
+									break
+								}
+							}
+							if colIdx >= 0 {
+								if err := o.forEachLiveRow(tbl, func(row Row, relName string) error {
+									if row[colIdx].IsNull() {
+										return &ExecError{Code: "23502", Pos: 0,
+											Message: fmt.Sprintf("column %q of relation %q contains null values", colName, relName)}
+									}
+									return nil
+								}); err != nil {
+									return err
+								}
+							}
+							tbl.NotNullConstraints[i].NotValid = false
+							// Cascade the NOT VALID→VALID flip to every
+							// already-existing descendant's matching
+							// constraint, mirroring
+							// QueueNNConstraintValidation
+							// (tablecmds.c:13220-13309). Sibling of the SET
+							// NOT NULL merge-branch cascade above.
+							// M0134-0005ak.
+							if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+								visited := make(map[[2]uint32]bool)
+								if err := o.cascadeNotNullValidateToDescendants(im, tbl, colName, visited, 0); err != nil {
+									return err
+								}
+							}
+						}
 						found = true
 						break
 					}
@@ -8255,12 +8812,40 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// (the latent virtual-table join crash was fixed in
 			// M0097-0023-loop34). M0097-0023.
 			if act.CheckExpr != "" {
+				// System-column gate — see the CREATE TABLE sibling above
+				// (execCreateTable). M0134-0005aa.
+				if err := validateCheckExprSystemColumns(act.CheckExpr); err != nil {
+					return err
+				}
 				// PG18: NO INHERIT constraints cannot be added to partitioned
 				// tables — ATAddCheckConstraint raises 42P16
 				// (tablecmds.c). Mirrors the CREATE TABLE sibling above
 				// (same Code 42P16, same message, same %q). M0134-0002 C2.
 				if act.NoInherit && tbl.PartitionKey != nil {
 					return &ExecError{Code: "42P16", Pos: act.Pos(), Message: fmt.Sprintf("cannot add NO INHERIT constraint to partitioned table %q", tbl.Name)}
+				}
+				// ONLY on a parent with children is refused — mirrors the
+				// ADD COLUMN twin (:11053-11054) and PG's
+				// ATAddCheckNNConstraint (tablecmds.c:10020-10023). Evaluated
+				// AFTER the NO INHERIT gate above (PG :10004-10005 precedes
+				// :10020-10023), so `ONLY ... NO INHERIT` on a table with
+				// children does not error. hasInheritanceChildren covers both
+				// plain-INHERITS children and partitions uniformly, matching
+				// PG's single find_inheritance_children call here.
+				// M0134-0005at.
+				if s.Only && !act.NoInherit && o.hasInheritanceChildren(tbl) {
+					return &ExecError{Code: "42P16", Pos: 0, Message: "constraint must be added to child tables too"}
+				}
+				// Resolve the constraint's name once — PG's ATAddCheckNNConstraint
+				// fills newConstraint->conname a single time at the top and
+				// reuses that same node for every child (tablecmds.c:9911-10049),
+				// so an anonymous ADD CHECK must cascade the AUTO-GENERATED
+				// name, not the empty act.ConstraintName. Both the validation
+				// scan below and the child cascade share this one value.
+				// M0134-0005as.
+				conName := act.ConstraintName
+				if conName == "" {
+					conName = o.autoCheckName(tbl, act.CheckExpr)
 				}
 				// Scan existing rows when the constraint is validating
 				// (not NOT VALID / not NOT ENFORCED). PG queues the constraint
@@ -8272,11 +8857,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				// rolls back). An anonymous constraint uses the auto-generated
 				// name so the message matches PG's. M0134-0002 C3 slice 1.
 				if !act.NotValid && !act.CheckNotEnforced {
-					conName := act.ConstraintName
-					if conName == "" {
-						conName = o.autoCheckName(tbl, act.CheckExpr)
-					}
-					if err := o.validateCheckConstraintRows(tbl, conName, act.CheckExpr); err != nil {
+					if err := o.validateCheckConstraintRows(tbl, conName, act.CheckExpr, act.NoInherit); err != nil {
 						return err
 					}
 				}
@@ -8285,27 +8866,12 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				// re-emits the ` NOT ENFORCED` suffix (taking precedence over
 				// NOT VALID) and pg_constraint reports conenforced=false.
 				// DU-002 slice 430.
-				tbl.AddCheckFull(act.ConstraintName, act.CheckExpr, o.allocConstraintOID(act.ConstraintName), act.NotValid, act.NoInherit, act.CheckNotEnforced)
-				// Propagate to partition children: merge if child already has the
-				// same constraint (locally defined), otherwise inherit it. M0097-0023.
-				if im3, ok3 := o.ctx.Catalog.(*catalog.InMemory); ok3 {
-					for _, childTbl := range im3.PartitionChildren(tbl.OID) {
-						merged := false
-						for j := range childTbl.NamedChecks {
-							if strings.EqualFold(childTbl.NamedChecks[j].Name, act.ConstraintName) {
-								// Child already has it locally — merge: mark inherited.
-								childTbl.NamedChecks[j].IsLocal = false
-								childTbl.NamedChecks[j].InhCount = 1
-								o.ctx.AddNotice(fmt.Sprintf("merging constraint %q with inherited definition", act.ConstraintName))
-								merged = true
-								break
-							}
-						}
-						if !merged {
-							oid3 := im3.AllocOID()
-							childTbl.AddCheckInherited(act.ConstraintName, act.CheckExpr, oid3)
-						}
-					}
+				tbl.AddCheckFull(conName, act.CheckExpr, o.allocConstraintOID(conName), act.NotValid, act.NoInherit, act.CheckNotEnforced)
+				// Propagate to the FULL descendant set (plain-INHERITS children
+				// AND partitions, transitively) — cascadeCheckToChildren mirrors
+				// the NOT NULL twin cascadeNotNullToChildren. M0134-0005as.
+				if err := o.cascadeCheckToChildren(tbl, conName, act.CheckExpr, act.NotValid, act.CheckNotEnforced, act.NoInherit); err != nil {
+					return err
 				}
 			}
 		case parser.AlterTableNoOp:
@@ -8404,6 +8970,33 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if !poc.Default && !poc.IsHash {
 				if err := checkDefaultPartitionDataConflict(childTbl.Name, tbl, poc, act.Pos(), o.ctx); err != nil {
 					return err
+				}
+			}
+			// Absorb the child's NOT NULL constraints into the parent's,
+			// mirroring PG's CreateInheritance → MergeConstraintsIntoExisting
+			// (tablecmds.c:17422, :17638-17817), reached from
+			// ATExecAttachPartition itself — run at statement time, BEFORE
+			// any catalog mutation below (FK cloning, bound assignment,
+			// index propagation), so a failed merge (42P17/42804) leaves no
+			// partial attach behind. Runs in every ATTACH branch — including
+			// the deferred-to-commit one below — because PG raises these
+			// errors synchronously from ATExecAttachPartition, not at
+			// commit. M0134-0005q.
+			if err := mergeNotNullOnAttach(tbl, childTbl, true); err != nil {
+				// PG raises these from MergeConstraintsIntoExisting
+				// (tablecmds.c:17638-17817) with no errposition(), so no
+				// cursor position is stamped — M0134-0005u.
+				return err
+			}
+			if catalogHeapSyncAvailable(o.ctx) {
+				if err := o.ctx.MaterializeWriterXID(); err == nil {
+					xmax := o.ctx.Tx.XID
+					for _, dbOid := range tableCatalogDBOids(o.ctx) {
+						deleteCatalogRowsForOID(o.ctx, dbOid, childTbl.OID, xmax)
+					}
+				}
+				if syncErr := syncTableToCatalogHeap(o.ctx, childTbl); syncErr != nil {
+					return fmt.Errorf("DDL catalog sync: %w", syncErr)
 				}
 			}
 			// Clone the parent partitioned table's foreign keys onto the new
@@ -8728,6 +9321,21 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				// Phase 2: finalize the detach.
 				im.UnregisterPartitionChild(tbl.OID, childTbl.OID)
 				clearAttachedColumnsInherited(tbl, childTbl)
+				// Un-absorb the child's NOT NULL constraints, mirroring PG's
+				// RemoveInheritance (tablecmds.c:17950-18144), twin of
+				// mergeNotNullOnAttach. M0134-0005q.
+				unmergeNotNullOnDetach(tbl, childTbl)
+				if catalogHeapSyncAvailable(o.ctx) {
+					if err := o.ctx.MaterializeWriterXID(); err == nil {
+						xmax := o.ctx.Tx.XID
+						for _, dbOid := range tableCatalogDBOids(o.ctx) {
+							deleteCatalogRowsForOID(o.ctx, dbOid, childTbl.OID, xmax)
+						}
+					}
+					if syncErr := syncTableToCatalogHeap(o.ctx, childTbl); syncErr != nil {
+						return fmt.Errorf("DDL catalog sync: %w", syncErr)
+					}
+				}
 				childTbl.PartitionParentOID = 0
 				childTbl.PartitionBounds = nil
 				im.ClearPartitionDetachPending(childTbl.OID)
@@ -8761,6 +9369,20 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				}
 				im.UnregisterPartitionChild(tbl.OID, childTbl.OID)
 				clearAttachedColumnsInherited(tbl, childTbl)
+				// Un-absorb the child's NOT NULL constraints — twin of the
+				// concurrent-detach phase-2 branch above. M0134-0005q.
+				unmergeNotNullOnDetach(tbl, childTbl)
+				if catalogHeapSyncAvailable(o.ctx) {
+					if err := o.ctx.MaterializeWriterXID(); err == nil {
+						xmax := o.ctx.Tx.XID
+						for _, dbOid := range tableCatalogDBOids(o.ctx) {
+							deleteCatalogRowsForOID(o.ctx, dbOid, childTbl.OID, xmax)
+						}
+					}
+					if syncErr := syncTableToCatalogHeap(o.ctx, childTbl); syncErr != nil {
+						return fmt.Errorf("DDL catalog sync: %w", syncErr)
+					}
+				}
 				childTbl.PartitionParentOID = 0
 				childTbl.PartitionBounds = nil
 				im.ClearPartitionDetachPending(childTbl.OID)
@@ -9178,7 +9800,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 		case parser.AlterTableInherit:
 			// INHERIT parent_table — register the named table as a parent of tbl
 			// so that scanning the parent includes tbl's rows (M0097-0048).
-			parentTbl, ok := o.ctx.Catalog.LookupTable(act.InheritParent, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+			parentTbl, ok := o.lookupTableWithSearch(act.InheritParent)
 			if !ok {
 				return &ExecError{Code: "42P01", Pos: act.Pos(), Message: fmt.Sprintf("relation %q does not exist", act.InheritParent.String())}
 			}
@@ -9211,9 +9833,10 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					}
 				}
 				// Inside an explicit transaction, defer the registration (and the
-				// column copy below) to COMMIT so the new inheritance link is
-				// invisible to concurrent sessions until commit — PG transactional-
-				// DDL visibility (alter-table-4). In autocommit, apply immediately.
+				// column/constraint merge below) to COMMIT so the new inheritance
+				// link is invisible to concurrent sessions until commit — PG
+				// transactional-DDL visibility (alter-table-4). In autocommit,
+				// apply immediately.
 				if defSess := o.inheritDeferSession(); defSess != nil {
 					defSess.AddPendingInheritanceChange(PendingInheritanceChange{
 						ParentOID:      parentTbl.OID,
@@ -9224,19 +9847,47 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					im.MarkInheritanceChangePending()
 					break
 				}
-				im.RegisterInheritanceChild(parentTbl.OID, tbl.OID)
-			}
-			// Copy parent columns that the child doesn't already have.
-			// In PostgreSQL, ALTER TABLE child INHERIT parent validates that child
-			// already has matching columns; goopg v0 just ensures they are present.
-			childColByName := make(map[string]bool, len(tbl.Columns))
-			for _, c := range tbl.Columns {
-				childColByName[strings.ToLower(c.Name)] = true
-			}
-			for _, pc := range parentTbl.Columns {
-				if !childColByName[strings.ToLower(pc.Name)] {
-					tbl.Columns = append(tbl.Columns, pc)
+				// Copy parent columns that the child doesn't already have.
+				// In PostgreSQL, ALTER TABLE child INHERIT parent validates that
+				// child already has matching columns; goopg v0 just ensures they
+				// are present.
+				childColByName := make(map[string]bool, len(tbl.Columns))
+				for _, c := range tbl.Columns {
+					childColByName[strings.ToLower(c.Name)] = true
 				}
+				for _, pc := range parentTbl.Columns {
+					if !childColByName[strings.ToLower(pc.Name)] {
+						tbl.Columns = append(tbl.Columns, pc)
+					}
+				}
+				// Absorb the child's NOT NULL constraints into the parent's,
+				// mirroring PG's CreateInheritance → MergeConstraintsIntoExisting
+				// (tablecmds.c:17422, :17636-17817), reached from ATExecAddInherit
+				// with ispartition=false. Run BEFORE registering the inheritance
+				// edge, matching PG's ordering (duplicate-parent check, then
+				// MergeAttributesIntoExisting/column merge, then
+				// MergeConstraintsIntoExisting, then StoreCatalogInheritance1) —
+				// a failed merge must NOT leave a half-registered edge behind, or
+				// a retried INHERIT falsely trips the duplicate-parent check
+				// above. M0134-0005r (design doc §25.4).
+				if err := mergeNotNullOnAttach(parentTbl, tbl, false); err != nil {
+					// PG raises these from MergeConstraintsIntoExisting
+					// (tablecmds.c:17638-17817) with no errposition(), so no
+					// cursor position is stamped — M0134-0005u.
+					return err
+				}
+				if catalogHeapSyncAvailable(o.ctx) {
+					if err := o.ctx.MaterializeWriterXID(); err == nil {
+						xmax := o.ctx.Tx.XID
+						for _, dbOid := range tableCatalogDBOids(o.ctx) {
+							deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+						}
+					}
+					if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+						return fmt.Errorf("DDL catalog sync: %w", syncErr)
+					}
+				}
+				im.RegisterInheritanceChild(parentTbl.OID, tbl.OID)
 			}
 		case parser.AlterTableNoInherit:
 			// NO INHERIT parent_table — unregister the inheritance relationship.
@@ -9255,6 +9906,14 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				}
 				return err
 			}
+			// Un-absorb the child's NOT NULL constraints, mirroring PG's
+			// RemoveInheritance (tablecmds.c:17950-18144, decrement loop
+			// :18103-18125) — twin of the mergeNotNullOnAttach call in the
+			// AlterTableInherit case above. Run before the edge is unregistered
+			// / col.Inherited is cleared below, matching RemoveInheritance's own
+			// ordering (the decrement loop runs while the relationship is still
+			// live). M0134-0005r (design doc §25.4).
+			unmergeNotNullOnDetach(parentTbl, tbl)
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 				// Inside an explicit transaction, defer the unregister to COMMIT so
 				// concurrent sessions keep seeing the child until commit (and a
@@ -9844,10 +10503,10 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// (`null value in column %q ... violates not-null constraint`,
 			// operators_fk.go:1831). No errposition, so Pos stays 0.
 			// M0134-0002 C3 slice 1.
-			if err := o.forEachLiveRow(tbl, func(row Row) error {
+			if err := o.forEachLiveRow(tbl, func(row Row, relName string) error {
 				if row[colIdx].IsNull() {
 					return &ExecError{Code: "23502", Pos: 0,
-						Message: fmt.Sprintf("column %q of relation %q contains null values", act.ColumnName, tbl.Name)}
+						Message: fmt.Sprintf("column %q of relation %q contains null values", act.ColumnName, relName)}
 				}
 				return nil
 			}); err != nil {
@@ -9859,6 +10518,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			hasNN := false
 			nnName := ""
 			shouldCascade := false
+			shouldCascadeValidate := false
 			for i := range tbl.NotNullConstraints {
 				nc := &tbl.NotNullConstraints[i]
 				if strings.EqualFold(nc.ColName, act.ColumnName) {
@@ -9871,11 +10531,20 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					// way ATExecSetNotNull's existing-constraint branch
 					// (tablecmds.c:7950-8010) returns WITHOUT recursing to
 					// children — only the "no constraint yet" branch below
-					// cascades. M0134-0005p sub-slice A.
+					// cascades. M0134-0005p sub-slice A. The NOT VALID→VALID
+					// flip is the same VALIDATE-direction event as
+					// ATExecValidateConstraint (ATExecSetNotNull calls it
+					// directly when the constraint is already-present-but-
+					// NOT-VALID, tablecmds.c:7994-8010), so it MUST propagate
+					// validation down descendants via
+					// QueueNNConstraintValidation (tablecmds.c:13220-13309) —
+					// unlike the "not local yet" arm above, which touches
+					// only this table. M0134-0005ak.
 					if !nc.IsLocal {
 						nc.IsLocal = true
 					} else if nc.NotValid {
 						nc.NotValid = false
+						shouldCascadeValidate = true
 					}
 					break
 				}
@@ -9909,6 +10578,19 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					return err
 				}
 			}
+			// Cascade the NOT VALID→VALID flip to every already-existing
+			// descendant's matching constraint (VALIDATE direction, distinct
+			// from the ADD-direction cascade above), mirroring
+			// QueueNNConstraintValidation (tablecmds.c:13220-13309).
+			// M0134-0005ak.
+			if shouldCascadeValidate {
+				if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+					visited := make(map[[2]uint32]bool)
+					if err := o.cascadeNotNullValidateToDescendants(im, tbl, act.ColumnName, visited, 0); err != nil {
+						return err
+					}
+				}
+			}
 		case parser.AlterTableDropNotNull:
 			// DROP NOT NULL — clear the column's NOT NULL flag and drop its
 			// contype='n' constraint (same heap re-sync as SET NOT NULL). DROP
@@ -9929,8 +10611,86 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				return &ExecError{Code: "42703", Pos: act.Pos(),
 					Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
 			}
+			// PK guard — mirrors dropconstraint_internal's CONSTRAINT_NOTNULL
+			// branch (tablecmds.c:14128-14159): a column that participates in
+			// the table's primary key can never lose its NOT NULL, and this
+			// check fires BEFORE the replica-identity check, the identity-
+			// column check, and attnotnull being cleared. 42P16, no detail,
+			// no hint. M0134-0005al.
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				for _, idx := range im.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
+					if !idx.Primary {
+						continue
+					}
+					for _, pkCol := range idx.Columns {
+						if strings.EqualFold(pkCol, act.ColumnName) {
+							return &ExecError{Code: "42P16", Pos: act.Pos(),
+								Message: fmt.Sprintf("column %q is in a primary key", act.ColumnName)}
+						}
+					}
+				}
+			}
+			// Replica-identity-index guard — mirrors dropconstraint_internal's
+			// CONSTRAINT_NOTNULL branch (tablecmds.c:14161-14167): a column that
+			// participates in the index chosen as the table's replica identity
+			// (`ALTER TABLE ... REPLICA IDENTITY USING INDEX <idx>`) can never
+			// lose its NOT NULL. This check fires BEFORE the identity-column
+			// check and attnotnull being cleared. 42P16, column name only, no
+			// relation name, no detail, no hint (message shape differs from
+			// the PK guard's message text but shares the SQLSTATE).
+			//
+			// PG derives the replica-identity attribute set from
+			// rd_replidindex (relcache.c:4938-4945), which for relreplident='d'
+			// (the default) resolves to the table's PRIMARY KEY index — so in
+			// PG this check is exactly redundant with the PK check above for
+			// the default replica identity mode. goopg never sets
+			// IsReplicaIdentity on the PK index for mode 'd' (chosenIdx is
+			// resolved only when mode=="i", operators_ddl.go:9940-9981), so
+			// this check fires only for the explicit USING INDEX case. End
+			// behavior is identical: for 'd' the PK check above already fired
+			// first with the PK message; for 'f'/'n' PG's rd_replidindex is
+			// InvalidOid and neither check fires. §44 (docs/design/0134-0005-
+			// constraints-sql-divergence.md). M0134-0005am.
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				for _, idx := range im.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
+					if !idx.IsReplicaIdentity {
+						continue
+					}
+					for _, riCol := range idx.Columns {
+						if strings.EqualFold(riCol, act.ColumnName) {
+							return &ExecError{Code: "42P16", Pos: act.Pos(),
+								Message: fmt.Sprintf("column %q is in index used as replica identity", act.ColumnName)}
+						}
+					}
+				}
+			}
+			// Identity-column guard — mirrors dropconstraint_internal's
+			// CONSTRAINT_NOTNULL branch (tablecmds.c:14169-14181): a
+			// GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY column can never lose
+			// its NOT NULL. Fires BEFORE attnotnull being cleared.
+			// ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE = 55000, column name
+			// AND relation name (unlike the PK and replica-identity
+			// messages). Both 'a' (ALWAYS) and 'd' (BY DEFAULT) identity
+			// kinds refuse. M0134-0005am.
+			for i := range tbl.Columns {
+				if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) && tbl.Columns[i].IdentityColumn {
+					return &ExecError{Code: "55000", Pos: act.Pos(),
+						Message: fmt.Sprintf("column %q of relation %q is an identity column", act.ColumnName, tbl.Name)}
+				}
+			}
 			if err := o.clearNotNullConstraint(tbl, act.ColumnName); err != nil {
 				return err
+			}
+			// Cascade the coninhcount/conislocal bookkeeping to inheritance/
+			// partition children — `ALTER TABLE ONLY ... DROP NOT NULL` must
+			// still walk children (dropconstraint_internal,
+			// tablecmds.c:14300-14343); previously this case had zero cascade
+			// logic at all, in either the ONLY or recursing case.
+			// M0134-0005ah slice B (ledger row M0134-0005ae).
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				if err := o.cascadeNotNullDropToChildren(im, tbl, act.ColumnName, !s.Only, make(map[[2]uint32]bool), 0); err != nil {
+					return err
+				}
 			}
 		case parser.AlterTableAddNotNull:
 			// ADD [CONSTRAINT name] NOT NULL col — the named (PG18) counterpart
@@ -9979,7 +10739,9 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if hasNN && existingNN != nil {
 				// Check 1: NO INHERIT mismatch (pg_constraint.c:761-767).
 				if act.NoInherit != existingNN.NoInherit {
-					return &ExecError{Code: "55000", Pos: act.Pos(),
+					// PG's AdjustNotNullInheritance (pg_constraint.c:759-767)
+					// raises this via bare ereport — no errposition. M0134-0005w Part A.
+					return &ExecError{Code: "55000", Pos: 0,
 						Message: fmt.Sprintf("cannot change NO INHERIT status of NOT NULL constraint %q on relation %q",
 							existingNN.Name, tbl.Name),
 						Hint: "You might need to make the existing constraint inheritable using ALTER TABLE ... ALTER CONSTRAINT ... INHERIT."}
@@ -9988,7 +10750,9 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				// (pg_constraint.c:773-779). existingNN.NotValid true means
 				// convalidated=false (not yet validated).
 				if !act.NotValid && existingNN.NotValid {
-					return &ExecError{Code: "55000", Pos: act.Pos(),
+					// pg_constraint.c:770-779 — bare ereport, no errposition.
+					// M0134-0005w Part A.
+					return &ExecError{Code: "55000", Pos: 0,
 						Message: fmt.Sprintf("incompatible NOT VALID constraint %q on relation %q",
 							existingNN.Name, tbl.Name),
 						Hint: "You might need to validate it using ALTER TABLE ... VALIDATE CONSTRAINT."}
@@ -9997,7 +10761,9 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				// Fires only for an explicitly user-given name (PG's is_local &&
 				// new_conname); an omitted name is a silent no-op.
 				if act.ConstraintName != "" && act.ConstraintName != existingNN.Name {
-					return &ExecError{Code: "55000", Pos: act.Pos(),
+					// pg_constraint.c:788-795 — bare ereport, no errposition.
+					// M0134-0005w Part A.
+					return &ExecError{Code: "55000", Pos: 0,
 						Message: fmt.Sprintf("cannot create not-null constraint %q on column %q of table %q",
 							act.ConstraintName, act.ColumnName, tbl.Name),
 						Detail: fmt.Sprintf("A not-null constraint named %q already exists for this column.",
@@ -10008,10 +10774,10 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// 23502 scan as SET NOT NULL; NOT VALID defers validation, mirroring
 			// PG's skip_validation). M0134-0002 C3 slice 1.
 			if !act.NotValid {
-				if err := o.forEachLiveRow(tbl, func(row Row) error {
+				if err := o.forEachLiveRow(tbl, func(row Row, relName string) error {
 					if row[colIdx].IsNull() {
 						return &ExecError{Code: "23502", Pos: 0,
-							Message: fmt.Sprintf("column %q of relation %q contains null values", act.ColumnName, tbl.Name)}
+							Message: fmt.Sprintf("column %q of relation %q contains null values", act.ColumnName, relName)}
 					}
 					return nil
 				}); err != nil {
@@ -10415,7 +11181,9 @@ func (o *ddlOp) execAlterTableAddColumn(stmt *parser.AlterTableStmt, tbl *catalo
 		// ColumnDef rather than splitting it into a synthesized
 		// AT_AddConstraint subcommand the way PG's parse_utilcmd.c does.
 		if col.NotNullConstraintName != "" && o.fkConstraintNameInUse(tbl, col.NotNullConstraintName) {
-			return &ExecError{Code: "42710", Pos: act.Pos(),
+			// heap.c:2645-2652 (ConstraintNameIsUsed check) — bare ereport,
+			// no errposition. M0134-0005w Part A.
+			return &ExecError{Code: "42710", Pos: 0,
 				Message: fmt.Sprintf("constraint %q for relation %q already exists", col.NotNullConstraintName, tbl.Name)}
 		}
 	}
@@ -10666,7 +11434,7 @@ func stringConstAsType(s string, t catalog.Type) (Datum, bool) {
 	return Datum{}, false
 }
 
-func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.AlterTableAction) error {
+func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.AlterTableAction, only bool) error {
 	if o.ctx.Pool == nil {
 		return &ExecError{Code: "XX000", Pos: act.Pos(), Message: "ALTER TABLE ADD PRIMARY KEY requires Pool in Context"}
 	}
@@ -10690,6 +11458,49 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 	}
 	if o.ctx.Catalog.HasPrimaryKey(tbl) {
 		return &ExecError{Code: "42P16", Pos: act.Pos(), Message: fmt.Sprintf("multiple primary keys for table %q are not allowed", tbl.QualifiedName())}
+	}
+	// PRIMARY KEY USING INDEX name — adopt an existing unique index as the
+	// PK's backing index instead of building a new one.
+	// tablecmds.c:ATExecAddIndexConstraint. M0134-0005x.
+	if act.UsingIndexName != "" {
+		return o.execAlterTableAddPrimaryKeyUsingIndex(tbl, act, only)
+	}
+	// PG's ATPrepAddPrimaryKey (tablecmds.c:9512-9531) checks each PK column's
+	// existing NOT NULL constraint, if any, for PK-compatibility BEFORE the
+	// index is built (verifyNotNullPKCompatible, tablecmds.c:9577-9608): a
+	// NO INHERIT or NOT VALID NOT NULL is incompatible with a primary key.
+	// Both arms are 55000 ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE, no
+	// errposition() — Pos stays 0. M0134-0005v.
+	for _, pkCol := range act.Columns {
+		col, ok := o.ctx.Catalog.LookupColumn(tbl, pkCol)
+		if !ok {
+			continue
+		}
+		ownFound := false
+		for i := range tbl.NotNullConstraints {
+			nc := &tbl.NotNullConstraints[i]
+			if !strings.EqualFold(nc.ColName, col.Name) {
+				continue
+			}
+			ownFound = true
+			if ee := verifyNotNullPKCompatible(nc, col.Name, tbl.Name); ee != nil {
+				return ee
+			}
+			break
+		}
+		// PG only reaches this branch (tablecmds.c:9532-9557) when the
+		// parent has no matching NOT NULL of its own AND was asked not to
+		// recurse (ALTER TABLE ONLY): it then verifies every direct
+		// inheritance/partition child carries a compatible NOT NULL, instead
+		// of synthesizing one on the parent. With `only` false (the
+		// default), PG instead queues a new NOT NULL that cascades to
+		// children — already handled below by cascadeNotNullToChildren, so
+		// no child check applies in that case. M0134-0005v.
+		if !ownFound && only {
+			if childErr := o.verifyNotNullPKCompatibleChildren(tbl, col.Name); childErr != nil {
+				return childErr
+			}
+		}
 	}
 	name := act.ConstraintName
 	if name == "" {
@@ -10716,11 +11527,11 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 		pkv = append(pkv, col.Ordinal)
 	}
 	if len(pkv) > 0 {
-		if err := o.forEachLiveRow(tbl, func(row Row) error {
+		if err := o.forEachLiveRow(tbl, func(row Row, relName string) error {
 			for _, ci := range pkv {
 				if row[ci].IsNull() {
 					return &ExecError{Code: "23502", Pos: 0,
-						Message: fmt.Sprintf("column %q of relation %q contains null values", tbl.Columns[ci].Name, tbl.Name)}
+						Message: fmt.Sprintf("column %q of relation %q contains null values", tbl.Columns[ci].Name, relName)}
 				}
 			}
 			return nil
@@ -10728,9 +11539,73 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 			return err
 		}
 	}
-	if idx, ok := o.ctx.Catalog.LookupIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok {
+	idx, _ := o.ctx.Catalog.LookupIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+	return o.finishPrimaryKeyConstraint(tbl, act, idx)
+}
+
+// execAlterTableAddPrimaryKeyUsingIndex handles `ADD [CONSTRAINT name]
+// PRIMARY KEY USING INDEX idxname`: adopts idxname as the table's PK index
+// (renaming it to the constraint name when they differ, emitting PG's
+// NOTICE) instead of building a fresh one, then applies the same
+// NOT-NULL-compatibility checks and not-null synthesis the column-list form
+// applies. tablecmds.c:ATExecAddIndexConstraint calls index_check_primary_key
+// (catalog/index.c) for this — the same not-null enforcement point the
+// column-list path reaches via ATPrepAddPrimaryKey/cascadeNotNullToChildren.
+// M0134-0005x.
+func (o *ddlOp) execAlterTableAddPrimaryKeyUsingIndex(tbl *catalog.Table, act parser.AlterTableAction, only bool) error {
+	idx, verr := o.adoptExistingIndexAsConstraint(tbl, act, true)
+	if verr != nil {
+		return verr
+	}
+	act.Columns = append([]string(nil), idx.Columns...)
+	// Same PK-compatibility check the column-list form runs before building
+	// its index (tablecmds.c:9577-9608 verifyNotNullPKCompatible), just
+	// against the adopted index's existing key columns instead of a freshly
+	// parsed column list. M0134-0005v's error shape applies unchanged.
+	for _, pkCol := range act.Columns {
+		col, ok := o.ctx.Catalog.LookupColumn(tbl, pkCol)
+		if !ok {
+			continue
+		}
+		ownFound := false
+		for i := range tbl.NotNullConstraints {
+			nc := &tbl.NotNullConstraints[i]
+			if !strings.EqualFold(nc.ColName, col.Name) {
+				continue
+			}
+			ownFound = true
+			if ee := verifyNotNullPKCompatible(nc, col.Name, tbl.Name); ee != nil {
+				return ee
+			}
+			break
+		}
+		if !ownFound && only {
+			if childErr := o.verifyNotNullPKCompatibleChildren(tbl, col.Name); childErr != nil {
+				return childErr
+			}
+		}
+	}
+	return o.finishPrimaryKeyConstraint(tbl, act, idx)
+}
+
+// finishPrimaryKeyConstraint marks idx as the constraint's backing index,
+// synthesizes NOT NULL on every key column (SQL standard: PRIMARY KEY implies
+// NOT NULL; PG18 also materializes it as a contype='n' pg_constraint row,
+// cascading to inheritance children/partitions), and re-syncs the table's
+// catalog-heap rows so \d+/pg_dump observe it. Shared by the column-list
+// PRIMARY KEY form and the USING INDEX adopt form — mirrors how PG's
+// index_check_primary_key (catalog/index.c) serves both ATExecAddIndexConstraint
+// and the ATPrepAddPrimaryKey column-list path. Extracted from
+// execAlterTableAddPrimaryKey by M0134-0005x (previously inline).
+func (o *ddlOp) finishPrimaryKeyConstraint(tbl *catalog.Table, act parser.AlterTableAction, idx *catalog.Index) error {
+	if idx != nil {
 		idx.IsConstraint = true
-		idx.IncludeColumns = act.IncludeColumns
+		// USING INDEX carries no INCLUDE (…) clause of its own — only
+		// overwrite the adopted index's existing covering columns when the
+		// caller actually parsed some (the column-list form).
+		if act.UsingIndexName == "" {
+			idx.IncludeColumns = act.IncludeColumns
+		}
 		idx.Deferrable = act.Deferrable
 		idx.InitiallyDeferred = act.InitiallyDeferred
 	}
@@ -10785,6 +11660,155 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 		}
 		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
 			return fmt.Errorf("DDL catalog sync: %w", syncErr)
+		}
+	}
+	return nil
+}
+
+// adoptExistingIndexAsConstraint locates the index named by `USING INDEX
+// idxname` on tbl, validates it per PG's transformIndexConstraint
+// (parse_utilcmd.c:2391-2492) and ATExecAddIndexConstraint
+// (tablecmds.c:9704-9787), renames it to the constraint name when they
+// differ (emitting PG's rename NOTICE), and marks it as the backing index
+// for a PRIMARY KEY (primary=true) or UNIQUE (primary=false) constraint.
+// Shared by execAlterTableAddPrimaryKeyUsingIndex and execAlterTableAddUnique.
+// M0134-0005x.
+func (o *ddlOp) adoptExistingIndexAsConstraint(tbl *catalog.Table, act parser.AlterTableAction, primary bool) (*catalog.Index, *ExecError) {
+	pos := act.Pos()
+	var idx *catalog.Index
+	for _, candidate := range o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
+		if strings.EqualFold(candidate.Name, act.UsingIndexName) {
+			idx = candidate
+			break
+		}
+	}
+	if idx == nil {
+		return nil, &ExecError{Code: "42704", Pos: pos,
+			Message: fmt.Sprintf("index %q does not exist", act.UsingIndexName)}
+	}
+	// parse_utilcmd.c:2427-2433 — an index already backing another
+	// constraint cannot be adopted a second time.
+	if idx.IsConstraint {
+		return nil, &ExecError{Code: "55000", Pos: pos,
+			Message: fmt.Sprintf("index %q is already associated with a constraint", idx.Name)}
+	}
+	// parse_utilcmd.c:2456-2462 — "Today we forbid non-unique indexes".
+	if !idx.Unique {
+		return nil, &ExecError{Code: "42809", Pos: pos,
+			Message: fmt.Sprintf("%q is not a unique index", idx.Name),
+			Detail:  "Cannot create a primary key or unique constraint using such an index."}
+	}
+	// parse_utilcmd.c:2465-2474 — expression key columns are rejected.
+	for _, col := range idx.Columns {
+		if col == "" {
+			return nil, &ExecError{Code: "42809", Pos: pos,
+				Message: fmt.Sprintf("index %q contains expressions", idx.Name),
+				Detail:  "Cannot create a primary key or unique constraint using such an index."}
+		}
+	}
+	// parse_utilcmd.c:2476-2481 — a partial index cannot back a constraint.
+	if idx.HasPredicate {
+		return nil, &ExecError{Code: "42809", Pos: pos,
+			Message: fmt.Sprintf("%q is a partial index", idx.Name),
+			Detail:  "Cannot create a primary key or unique constraint using such an index."}
+	}
+	// Constraint name defaults to the index's own name; an explicit name
+	// that differs renames the index (and emits PG's NOTICE).
+	// tablecmds.c:9739-9755.
+	constraintName := act.ConstraintName
+	if constraintName != "" && !strings.EqualFold(constraintName, idx.Name) {
+		o.ctx.Notices = append(o.ctx.Notices,
+			fmt.Sprintf("ALTER TABLE / ADD CONSTRAINT USING INDEX will rename index %q to %q", idx.Name, constraintName))
+		im, isIM := o.ctx.Catalog.(*catalog.InMemory)
+		if !isIM {
+			return nil, &ExecError{Code: "XX000", Pos: pos, Message: "catalog does not support index rename"}
+		}
+		oldObjName := parser.ObjectName{Schema: idx.Schema, Name: idx.Name}
+		newObjName := parser.ObjectName{Schema: idx.Schema, Name: constraintName}
+		if err := im.RenameIndex(oldObjName, newObjName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
+			return nil, &ExecError{Code: "42P07", Pos: pos, Message: err.Error()}
+		}
+		if catalogHeapSyncAvailable(o.ctx) {
+			if syncErr := resyncIndexClassHeapRow(o.ctx, idx); syncErr != nil {
+				return nil, &ExecError{Code: "XX000", Pos: pos, Message: syncErr.Error()}
+			}
+		}
+	}
+	idx.IsConstraint = true
+	idx.Primary = primary
+	idx.Deferrable = act.Deferrable
+	idx.InitiallyDeferred = act.InitiallyDeferred
+	if catalogHeapSyncAvailable(o.ctx) {
+		if syncErr := resyncIndexHeapRow(o.ctx, idx); syncErr != nil {
+			return nil, &ExecError{Code: "XX000", Pos: pos, Message: syncErr.Error()}
+		}
+	}
+	return idx, nil
+}
+
+// verifyNotNullPKCompatible mirrors PG's verifyNotNullPKCompatible
+// (postgres/src/backend/commands/tablecmds.c:9577-9608): a NO INHERIT or
+// NOT VALID NOT NULL constraint cannot back a primary key. Both arms are
+// 55000 ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE with no errposition().
+// relName is the table the constraint lives on — the PK-adding table for an
+// own constraint, or a child's name when called from
+// verifyNotNullPKCompatibleChildren. M0134-0005v.
+func verifyNotNullPKCompatible(nc *catalog.NamedNotNullConstraint, colName, relName string) *ExecError {
+	if nc.NoInherit {
+		return &ExecError{Code: "55000", Pos: 0,
+			Message: fmt.Sprintf("cannot create primary key on column %q", colName),
+			Detail: fmt.Sprintf("The constraint %q on column %q of table %q, marked %s, is incompatible with a primary key.",
+				nc.Name, colName, relName, "NO INHERIT"),
+			Hint: "You might need to make the existing constraint inheritable using ALTER TABLE ... ALTER CONSTRAINT ... INHERIT."}
+	}
+	if nc.NotValid {
+		return &ExecError{Code: "55000", Pos: 0,
+			Message: fmt.Sprintf("cannot create primary key on column %q", colName),
+			Detail: fmt.Sprintf("The constraint %q on column %q of table %q, marked %s, is incompatible with a primary key.",
+				nc.Name, colName, relName, "NOT VALID"),
+			Hint: "You might need to validate it using ALTER TABLE ... VALIDATE CONSTRAINT."}
+	}
+	return nil
+}
+
+// verifyNotNullPKCompatibleChildren mirrors the `!recurse` arm of PG's
+// ATPrepAddPrimaryKey (tablecmds.c:9532-9557, reached by
+// `ALTER TABLE ONLY parent ADD PRIMARY KEY (col)` when the parent itself has
+// no matching NOT NULL): every direct inheritance/partition child's NOT
+// NULL constraint on colName must independently pass
+// verifyNotNullPKCompatible. A child with no such constraint at all is a
+// different PG error ("column ... is not marked NOT NULL",
+// tablecmds.c:9552-9554) that no fixture in this slice's scope reaches —
+// left unhandled here, matching the design-doc scope boundary
+// (M0134-0005v §29.3). M0134-0005v.
+func (o *ddlOp) verifyNotNullPKCompatibleChildren(tbl *catalog.Table, colName string) *ExecError {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	children := append([]*catalog.Table(nil), im.InheritanceChildren(tbl.OID)...)
+	for _, pc := range im.PartitionChildren(tbl.OID) {
+		dup := false
+		for _, c := range children {
+			if c.OID == pc.OID {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			children = append(children, pc)
+		}
+	}
+	for _, child := range children {
+		for i := range child.NotNullConstraints {
+			nc := &child.NotNullConstraints[i]
+			if !strings.EqualFold(nc.ColName, colName) {
+				continue
+			}
+			if ee := verifyNotNullPKCompatible(nc, colName, child.Name); ee != nil {
+				return ee
+			}
+			break
 		}
 	}
 	return nil
@@ -10975,6 +11999,19 @@ func waitPgClassRowMarkReleased(ctx *Context, holderXID storage.TransactionID, r
 // execAlterTableAddUnique handles ADD [CONSTRAINT name] UNIQUE (cols) [INCLUDE (incl)].
 // Creates a btree unique index. M0097-0023.
 func (o *ddlOp) execAlterTableAddUnique(tbl *catalog.Table, act parser.AlterTableAction) error {
+	if act.UsingIndexName != "" {
+		// ADD UNIQUE USING INDEX indexname — adopt the existing index as the
+		// unique constraint's backing index. Unlike PRIMARY KEY, UNIQUE does
+		// not synthesize NOT NULL (index_check_primary_key is only called
+		// when stmt->primary, tablecmds.c:9757-9759), so there's nothing to
+		// share with finishPrimaryKeyConstraint beyond the adopt/rename step
+		// itself. M0134-0005x (was a no-op stub, M0097-0023).
+		_, verr := o.adoptExistingIndexAsConstraint(tbl, act, false)
+		if verr != nil {
+			return verr
+		}
+		return nil
+	}
 	if len(act.Columns) == 0 {
 		return nil // UNIQUE USING INDEX — index already exists, treat as no-op
 	}
@@ -11017,7 +12054,12 @@ func (o *ddlOp) execAlterTableAddExclude(tbl *catalog.Table, act parser.AlterTab
 	if act.ExclusionOp == "=" && strings.ToLower(method) == "btree" {
 		// btree equality exclusion ≈ unique constraint: build a real
 		// btree so checkExclusionConstraintsForInsert can probe it.
-		if err := o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, false, false, false, nil, nil); err != nil {
+		// unique stays false (idx.Unique must not be set — this is not a
+		// unique constraint), but checkDup=true so the build validates
+		// pre-existing rows for conflicts exactly like PG's
+		// check_exclusion_or_unique_constraint does at build time
+		// (execIndexing.c:893-918, newIndex branch). M0134-0005af.
+		if err := o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, false, false, false, nil, nil, &btreeIndexProps{CheckDup: true, IsExclusion: true, ExclusionOp: "="}); err != nil {
 			return err
 		}
 		if idx, ok := o.ctx.Catalog.LookupIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok {
@@ -11130,6 +12172,20 @@ func (o *ddlOp) cascadeNotNullToChildrenAt(im *catalog.InMemory, tbl *catalog.Ta
 		merged := false
 		for i := range child.NotNullConstraints {
 			if strings.EqualFold(child.NotNullConstraints[i].ColName, colName) {
+				// PG re-runs AdjustNotNullInheritance's NO INHERIT mismatch
+				// check on every recursion level (pg_constraint.c:741-767),
+				// via ATAddCheckNNConstraint recursing into children
+				// (tablecmds.c:10012-10043). The constraint being cascaded
+				// down is always inheritable (callers only invoke this
+				// cascade for !act.NoInherit constraints), so a mismatch
+				// means the child already holds a NO INHERIT constraint of
+				// this name. M0134-0005ad E1.
+				if child.NotNullConstraints[i].NoInherit {
+					return &ExecError{Code: "55000", Pos: 0,
+						Message: fmt.Sprintf("cannot change NO INHERIT status of NOT NULL constraint %q on relation %q",
+							child.NotNullConstraints[i].Name, child.Name),
+						Hint: "You might need to make the existing constraint inheritable using ALTER TABLE ... ALTER CONSTRAINT ... INHERIT."}
+				}
 				child.NotNullConstraints[i].InhCount++
 				merged = true
 				break
@@ -11194,6 +12250,336 @@ func (o *ddlOp) clearNotNullConstraint(tbl *catalog.Table, colName string) error
 	return nil
 }
 
+// syncConstraintCatalogRow re-syncs tbl's pg_constraint-adjacent catalog heap
+// rows after an in-place NamedChecks/NotNullConstraints mutation, matching
+// the identical 3-step dance duplicated elsewhere in this file (e.g.
+// clearNotNullConstraint, cascadeNotNullToChildrenAt): delete the table's old
+// catalog heap rows, then re-derive them from the in-memory struct. No-op
+// when catalog heap sync isn't available for this context. M0134-0005ah
+// slice B.
+func (o *ddlOp) syncConstraintCatalogRow(tbl *catalog.Table) error {
+	if !catalogHeapSyncAvailable(o.ctx) {
+		return nil
+	}
+	if err := o.ctx.MaterializeWriterXID(); err == nil {
+		xmax := o.ctx.Tx.XID
+		for _, dbOid := range tableCatalogDBOids(o.ctx) {
+			deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+		}
+	}
+	if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+		return fmt.Errorf("DDL catalog sync: %w", syncErr)
+	}
+	return nil
+}
+
+// collectInheritanceAndPartitionChildren returns tbl's direct inheritance AND
+// partition children, deduplicated by OID. Shared by the DROP-direction
+// cascades below (cascadeCheckDropToChildren, cascadeNotNullDropToChildren);
+// mirrors the identical dedup already inlined in cascadeNotNullToChildrenAt
+// (the ADD-direction twin).
+func collectInheritanceAndPartitionChildren(im *catalog.InMemory, tbl *catalog.Table) []*catalog.Table {
+	children := append([]*catalog.Table(nil), im.InheritanceChildren(tbl.OID)...)
+	for _, pc := range im.PartitionChildren(tbl.OID) {
+		dup := false
+		for _, c := range children {
+			if c.OID == pc.OID {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			children = append(children, pc)
+		}
+	}
+	return children
+}
+
+// cascadeCheckToChildren propagates a CHECK constraint newly added on tbl to
+// the FULL descendant set — plain-INHERITS children AND partitions,
+// transitively through intermediate nodes — mirroring
+// ATAddCheckNNConstraint's own recursion (postgres/src/backend/commands/
+// tablecmds.c:9911-10049). This is the ADD-direction CHECK twin of
+// cascadeNotNullToChildren; see that function's doc comment for the
+// edge-keyed visited-guard rationale (diamond inheritance counts once per
+// EDGE, not once per node).
+//
+// noInherit mirrors tablecmds.c:10004's `if (is_no_inherit) return address;`
+// — a NO INHERIT constraint returns BEFORE enumerating any children, no
+// recursion at all. M0134-0005as.
+func (o *ddlOp) cascadeCheckToChildren(tbl *catalog.Table, name, expr string, notValid, notEnforced, noInherit bool) error {
+	if noInherit {
+		return nil
+	}
+	im, isIM := o.ctx.Catalog.(*catalog.InMemory)
+	if !isIM {
+		return nil
+	}
+	visited := make(map[[2]uint32]bool)
+	return o.cascadeCheckToChildrenAt(im, tbl, name, expr, notValid, notEnforced, visited, 0)
+}
+
+// cascadeCheckToChildrenAt is the depth/visited-bounded recursive body of
+// cascadeCheckToChildren. Per-child behavior mirrors what the inline
+// ADD-CHECK cascade used to do before this helper existed: merge with an
+// existing same-named child constraint (mark inherited, notice), or register
+// a brand-new inherited copy. The ALTER-time cascade reuses the user's
+// LITERAL NotValid/NotEnforced flags unchanged at every recursion level
+// (tablecmds.c:9912-10049, recursion at :10042-10043) — unlike the
+// CREATE-time sites elsewhere in this file, which derive NotValid from
+// NotEnforced alone. M0134-0005ar, M0134-0005as.
+func (o *ddlOp) cascadeCheckToChildrenAt(im *catalog.InMemory, tbl *catalog.Table, name, expr string, notValid, notEnforced bool, visited map[[2]uint32]bool, depth int) error {
+	if depth >= maxNotNullCascadeDepth {
+		return nil
+	}
+	for _, child := range collectInheritanceAndPartitionChildren(im, tbl) {
+		edge := [2]uint32{child.OID, tbl.OID}
+		if visited[edge] {
+			continue
+		}
+		visited[edge] = true
+
+		merged := false
+		for j := range child.NamedChecks {
+			if strings.EqualFold(child.NamedChecks[j].Name, name) {
+				// Child already has it locally — merge: mark inherited.
+				child.NamedChecks[j].IsLocal = false
+				child.NamedChecks[j].InhCount = 1
+				o.ctx.AddNotice(fmt.Sprintf("merging constraint %q with inherited definition", name))
+				merged = true
+				break
+			}
+		}
+		if !merged {
+			child.AddCheckInherited(name, expr, im.AllocOID(), notValid, notEnforced)
+		}
+
+		if err := o.cascadeCheckToChildrenAt(im, child, name, expr, notValid, notEnforced, visited, depth+1); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// cascadeCheckDropToChildren mirrors dropconstraint_internal's per-child
+// coninhcount/conislocal bookkeeping (postgres/src/backend/commands/
+// tablecmds.c:14300-14343) when dropping a CHECK constraint from tbl. It
+// ALWAYS walks descendants — `ONLY` (recurse=false) means "don't delete the
+// child's row", not "don't touch children at all" (the bug this fixes;
+// ledger row M0134-0005ae / m0134-0005ah research report item B). When
+// recurse is true and the child's own copy is about to become orphaned
+// (coninhcount==1 && !conislocal) the child's row is deleted outright and the
+// walk continues into grandchildren (mirroring dropconstraint_internal's own
+// recursive self-call on the child); otherwise coninhcount is just
+// decremented. Only the ONLY-mode decrement flips conislocal to true on
+// reaching zero — PG's recurse-mode decrement-only `else` branch does NOT set
+// conislocal; that asymmetry is preserved exactly, not generalized away. Uses
+// the same edge-keyed visited guard + depth backstop as
+// cascadeNotNullToChildrenAt (diamond-inheritance correctness, M0134-0005p
+// sub-slice B). M0134-0005ah slice B.
+func (o *ddlOp) cascadeCheckDropToChildren(im *catalog.InMemory, tbl *catalog.Table, constraintName string, recurse bool, visited map[[2]uint32]bool, depth int) error {
+	if depth >= maxNotNullCascadeDepth {
+		return nil
+	}
+	for _, child := range collectInheritanceAndPartitionChildren(im, tbl) {
+		edge := [2]uint32{child.OID, tbl.OID}
+		if visited[edge] {
+			continue
+		}
+		visited[edge] = true
+
+		idx := -1
+		for j, cnc := range child.NamedChecks {
+			if strings.EqualFold(cnc.Name, constraintName) {
+				idx = j
+				break
+			}
+		}
+		if idx == -1 {
+			continue
+		}
+		if recurse && child.NamedChecks[idx].InhCount <= 1 && !child.NamedChecks[idx].IsLocal {
+			child.CheckConstraints = append(child.CheckConstraints[:idx], child.CheckConstraints[idx+1:]...)
+			child.NamedChecks = append(child.NamedChecks[:idx], child.NamedChecks[idx+1:]...)
+			if err := o.syncConstraintCatalogRow(child); err != nil {
+				return err
+			}
+			if err := o.cascadeCheckDropToChildren(im, child, constraintName, recurse, visited, depth+1); err != nil {
+				return err
+			}
+			continue
+		}
+		child.NamedChecks[idx].InhCount--
+		if !recurse && child.NamedChecks[idx].InhCount <= 0 {
+			child.NamedChecks[idx].IsLocal = true
+		}
+		if err := o.syncConstraintCatalogRow(child); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// cascadeNotNullDropToChildren is cascadeCheckDropToChildren's NOT NULL twin,
+// used both by `ALTER TABLE ... DROP CONSTRAINT <name>` (when the resolved
+// constraint is a NOT NULL) and by `ALTER TABLE ... ALTER c DROP NOT NULL`.
+// Children are matched BY COLUMN NAME, not constraint name (tablecmds.c:
+// 14251-14255: "we search for not-null constraints by column name, and
+// others by constraint name") — the same asymmetry the ADD-direction
+// cascadeNotNullToChildren observes. M0134-0005ah slice B.
+func (o *ddlOp) cascadeNotNullDropToChildren(im *catalog.InMemory, tbl *catalog.Table, colName string, recurse bool, visited map[[2]uint32]bool, depth int) error {
+	if depth >= maxNotNullCascadeDepth {
+		return nil
+	}
+	for _, child := range collectInheritanceAndPartitionChildren(im, tbl) {
+		edge := [2]uint32{child.OID, tbl.OID}
+		if visited[edge] {
+			continue
+		}
+		visited[edge] = true
+
+		idx := -1
+		for j, cnc := range child.NotNullConstraints {
+			if strings.EqualFold(cnc.ColName, colName) {
+				idx = j
+				break
+			}
+		}
+		if idx == -1 {
+			continue
+		}
+		if recurse && child.NotNullConstraints[idx].InhCount <= 1 && !child.NotNullConstraints[idx].IsLocal {
+			if err := o.clearNotNullConstraint(child, colName); err != nil {
+				return err
+			}
+			if err := o.cascadeNotNullDropToChildren(im, child, colName, recurse, visited, depth+1); err != nil {
+				return err
+			}
+			continue
+		}
+		child.NotNullConstraints[idx].InhCount--
+		if !recurse && child.NotNullConstraints[idx].InhCount <= 0 {
+			child.NotNullConstraints[idx].IsLocal = true
+		}
+		if err := o.syncConstraintCatalogRow(child); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// cascadeNotNullValidateToDescendants propagates VALIDATE-direction
+// convalidated 'f'->'t' flips for a NOT NULL constraint on colName down
+// every already-existing inheritance child and partition, recursively
+// (grandchildren, sub-partitions, ...), mirroring PG's
+// QueueNNConstraintValidation (postgres/src/backend/commands/tablecmds.c:
+// 13220-13309). A descendant already convalidated is left untouched
+// (:13277-13278, no InhCount/IsLocal drift) but its own children are still
+// visited: PG's find_all_inheritors flattens the WHOLE transitive
+// descendant set up front and walks it flat, so an already-validated child
+// does not gate whether an unvalidated grandchild gets visited — goopg has
+// no one-shot find_all_inheritors equivalent, so this self-recurses
+// unconditionally into every child instead, achieving the same flat-walk
+// coverage one level at a time. A descendant with no matching NOT NULL
+// constraint on colName is skipped, not errored: PG's :13272-13274 is an
+// elog "can't happen" invariant assertion (every inheritor is supposed to
+// already carry a matching constraint), not a user-facing ereport, and
+// goopg's catalog can legitimately reach that state without it being a bug
+// worth crashing over. Uses the same edge-keyed visited guard + depth
+// backstop as cascadeNotNullToChildrenAt / cascadeNotNullDropToChildren
+// (diamond-inheritance correctness, M0134-0005p sub-slice B). Sibling of
+// cascadeNotNullDropToChildren but VALIDATE-direction, not DROP-direction —
+// kept separate per the brief rather than folded into
+// cascadeNotNullToChildrenAt's ADD-direction merge branch, whose semantics
+// (coninhcount bump only) are unrelated. M0134-0005ak.
+func (o *ddlOp) cascadeNotNullValidateToDescendants(im *catalog.InMemory, tbl *catalog.Table, colName string, visited map[[2]uint32]bool, depth int) error {
+	if depth >= maxNotNullCascadeDepth {
+		return nil
+	}
+	for _, child := range collectInheritanceAndPartitionChildren(im, tbl) {
+		edge := [2]uint32{child.OID, tbl.OID}
+		if visited[edge] {
+			continue
+		}
+		visited[edge] = true
+
+		for i := range child.NotNullConstraints {
+			if strings.EqualFold(child.NotNullConstraints[i].ColName, colName) {
+				if child.NotNullConstraints[i].NotValid {
+					child.NotNullConstraints[i].NotValid = false
+					if err := o.syncConstraintCatalogRow(child); err != nil {
+						return err
+					}
+				}
+				break
+			}
+		}
+
+		if err := o.cascadeNotNullValidateToDescendants(im, child, colName, visited, depth+1); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// cascadeCheckValidateToDescendants is the CHECK-direction twin of
+// cascadeNotNullValidateToDescendants immediately above: it propagates a
+// CHECK constraint's NOT VALID→VALID flip to every already-existing
+// inheritance/partition descendant's own matching-named NamedChecks entry,
+// mirroring QueueCheckConstraintValidation's recursive
+// ATExecValidateConstraint self-call per descendant
+// (tablecmds.c:13109-13210). Unlike the NOT NULL twin (which matches by
+// column name, since attnotnull is a pg_attribute flag), CHECK constraints
+// are matched by constraint NAME — the same lookup key
+// cascadeCheckDropToChildren uses for its DROP-direction walk. PG's CHECK
+// path has NO already-convalidated skip analogous to the NOT NULL version's
+// :13277-13278 (confirmed absent in QueueCheckConstraintValidation), so the
+// NotValid flip below gates only the flip itself, never the recursive
+// descent — an already-valid intermediate descendant must not hide an
+// unvalidated grandchild behind it (M0134-0005ak's load-bearing
+// divergence). A descendant with no matching-named CHECK constraint at all
+// is a silent skip, not an error: PG's own recursive
+// ATExecValidateConstraint 42704 there is effectively an internal
+// invariant (every inheritor is supposed to carry a matching row), not a
+// user-facing refusal goopg needs to reproduce — same rationale the NOT
+// NULL twin's doc comment gives for its own analogous case. Uses the same
+// edge-keyed visited guard + depth backstop as
+// cascadeNotNullValidateToDescendants (diamond-inheritance correctness,
+// M0134-0005p sub-slice B). Caller gates this call on !NoInherit — PG never
+// even looks for NO INHERIT constraints in children
+// (QueueCheckConstraintValidation's `!con->connoinherit` gate,
+// tablecmds.c:13140), so this helper assumes the caller has already made
+// that check and does not re-check NoInherit on tbl itself. M0134-0005an.
+func (o *ddlOp) cascadeCheckValidateToDescendants(im *catalog.InMemory, tbl *catalog.Table, constraintName string, visited map[[2]uint32]bool, depth int) error {
+	if depth >= maxNotNullCascadeDepth {
+		return nil
+	}
+	for _, child := range collectInheritanceAndPartitionChildren(im, tbl) {
+		edge := [2]uint32{child.OID, tbl.OID}
+		if visited[edge] {
+			continue
+		}
+		visited[edge] = true
+
+		for i := range child.NamedChecks {
+			if strings.EqualFold(child.NamedChecks[i].Name, constraintName) {
+				if child.NamedChecks[i].NotValid {
+					child.NamedChecks[i].NotValid = false
+					if err := o.syncConstraintCatalogRow(child); err != nil {
+						return err
+					}
+				}
+				break
+			}
+		}
+
+		if err := o.cascadeCheckValidateToDescendants(im, child, constraintName, visited, depth+1); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // execAlterTableDropConstraint handles `ALTER TABLE t DROP CONSTRAINT name [RESTRICT|CASCADE]`.
 // Checked in the order CHECK / FOREIGN KEY / UNIQUE / PRIMARY KEY, mirroring
 // real PG's name-based pg_constraint lookup (the constraint kind only matters
@@ -11232,19 +12618,16 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 		// Drop from this table (keep CheckConstraints and NamedChecks in sync).
 		tbl.CheckConstraints = append(tbl.CheckConstraints[:i], tbl.CheckConstraints[i+1:]...)
 		tbl.NamedChecks = append(tbl.NamedChecks[:i], tbl.NamedChecks[i+1:]...)
-		// Cascade to partition children: drop the inherited copy from each child.
-		// ONLY (recurse=false) must NOT propagate — PG's dropconstraint_internal
-		// removes the constraint from the parent only, leaving each child's
-		// inherited copy (coninhcount) intact (tablecmds.c:14025-14110).
-		if isIM && !only {
-			for _, childTbl := range im.PartitionChildren(tbl.OID) {
-				for j, cnc := range childTbl.NamedChecks {
-					if strings.EqualFold(cnc.Name, act.ConstraintName) {
-						childTbl.CheckConstraints = append(childTbl.CheckConstraints[:j], childTbl.CheckConstraints[j+1:]...)
-						childTbl.NamedChecks = append(childTbl.NamedChecks[:j], childTbl.NamedChecks[j+1:]...)
-						break
-					}
-				}
+		// Cascade to inheritance/partition children: ONLY (recurse=false) does
+		// NOT mean "don't touch children" — it means "don't delete the
+		// child's row", per dropconstraint_internal
+		// (tablecmds.c:14300-14343). Every child still gets its coninhcount
+		// decremented (and conislocal flipped to true on reaching zero under
+		// ONLY); only the recursing (!only) path deletes an orphaned child's
+		// own copy outright. M0134-0005ah slice B (ledger row M0134-0005ae).
+		if isIM {
+			if err := o.cascadeCheckDropToChildren(im, tbl, act.ConstraintName, !only, make(map[[2]uint32]bool), 0); err != nil {
+				return err
 			}
 		}
 		return nil
@@ -11304,9 +12687,11 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 	// as CHECK for the inherited-constraint guard
 	// (tablecmds.c:14103-14107) and additionally refuses to drop a not-null
 	// backing a PRIMARY KEY column (tablecmds.c:14154-14159, `"column \"%s\"
-	// is in a primary key"`). The replica-identity-index
-	// (tablecmds.c:14162-14167) and identity-column (tablecmds.c:14174-14181)
-	// refusals are NOT implemented — out of scope, M0134-0005 S04 (ledgered).
+	// is in a primary key"`), the replica-identity index
+	// (tablecmds.c:14161-14167, `"column \"%s\" is in index used as replica
+	// identity"`), and an identity column (tablecmds.c:14169-14181, `"column
+	// \"%s\" of relation \"%s\" is an identity column"`) — §44
+	// (docs/design/0134-0005-constraints-sql-divergence.md). M0134-0005am.
 	// Recursion to children matches by COLUMN NAME, not constraint name
 	// (tablecmds.c:14251-14255: "We search for not-null constraints by column
 	// name, and others by constraint name") — unlike the CHECK cascade above,
@@ -11337,20 +12722,45 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 			}
 			break
 		}
+		// Replica-identity-index guard — see the comment on the
+		// `case parser.AlterTableDropNotNull:` arm's twin check above for the
+		// full PG-derivation rationale (relcache.c:4938-4945, §44). 42P16,
+		// column name only, no relation name. M0134-0005am.
+		for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
+			if !idx.IsReplicaIdentity {
+				continue
+			}
+			for _, riCol := range idx.Columns {
+				if strings.EqualFold(riCol, nc.ColName) {
+					return &ExecError{
+						Code:    "42P16",
+						Pos:     act.Pos(),
+						Message: fmt.Sprintf("column %q is in index used as replica identity", nc.ColName),
+					}
+				}
+			}
+		}
+		// Identity-column guard — 55000, column name AND relation name.
+		// Both 'a' (ALWAYS) and 'd' (BY DEFAULT) identity kinds refuse.
+		// M0134-0005am.
+		for i := range tbl.Columns {
+			if strings.EqualFold(tbl.Columns[i].Name, nc.ColName) && tbl.Columns[i].IdentityColumn {
+				return &ExecError{
+					Code:    "55000",
+					Pos:     act.Pos(),
+					Message: fmt.Sprintf("column %q of relation %q is an identity column", nc.ColName, tbl.Name),
+				}
+			}
+		}
 		colName := nc.ColName
 		if err := o.clearNotNullConstraint(tbl, colName); err != nil {
 			return err
 		}
-		if isIM && !only {
-			for _, childTbl := range im.PartitionChildren(tbl.OID) {
-				for _, cnc := range childTbl.NotNullConstraints {
-					if strings.EqualFold(cnc.ColName, colName) {
-						if err := o.clearNotNullConstraint(childTbl, colName); err != nil {
-							return err
-						}
-						break
-					}
-				}
+		// Same ONLY-still-walks-children rule as the CHECK branch above —
+		// M0134-0005ah slice B.
+		if isIM {
+			if err := o.cascadeNotNullDropToChildren(im, tbl, colName, !only, make(map[[2]uint32]bool), 0); err != nil {
+				return err
 			}
 		}
 		return nil
@@ -11656,23 +13066,70 @@ func (o *ddlOp) nonFKConstraintExists(tbl *catalog.Table, name string) bool {
 	return false
 }
 
-// forEachLiveRow invokes fn for every live heap row of tbl. The row passed to
-// fn is a reused decode buffer and is only valid for the duration of the call.
-// Iterates with the same page-Pin loop as validateFKConstraintExistingRows and
-// collectBTreeEntries: the simplified "Xmin valid, Xmax invalid" liveness check
-// (no snapshot MVCC visibility), the established pattern for DDL-time
-// existing-row scans. Aborts on the first fn error, unpinning the current page.
-// M0134-0002 C3 slice 1 (shared by the ADD CHECK / SET NOT NULL / VALIDATE
-// CHECK scans).
-func (o *ddlOp) forEachLiveRow(tbl *catalog.Table, fn func(row Row) error) error {
-	rel := o.ctx.Catalog.RelFileNode(tbl)
+// forEachLiveRow invokes fn for every live heap row of tbl, INCLUDING every
+// row held only by a partition/inheritance descendant's own storage. The row
+// passed to fn is a reused decode buffer, shaped like tbl.Columns (so a
+// caller's column indices/ordinals resolved against tbl stay valid even for
+// a descendant row), and is only valid for the duration of the call. relName
+// is the relation that ACTUALLY holds the row on disk — tbl.Name for a
+// same-shape (non-recursive) row, or the descendant's own name for a row
+// found only in its storage; PG's phase-3 verify errors always name the
+// relation being scanned at that moment (ATRewriteTable operates per queued
+// relation), not the ALTER TABLE target, so a caller building a 23502/23514
+// message must use relName, not tbl.Name. Iterates with the same page-Pin
+// loop as validateFKConstraintExistingRows and collectBTreeEntries: the
+// simplified "Xmin valid, Xmax invalid" liveness check (no snapshot MVCC
+// visibility), the established pattern for DDL-time existing-row scans.
+// Aborts on the first fn error, unpinning the current page. M0134-0002 C3
+// slice 1 (shared by the ADD CHECK / SET NOT NULL / VALIDATE CHECK scans).
+//
+// A partitioned parent has NO storage of its own — ATExecSetNotNull /
+// ATRewriteTable queue phase-3 verification work per relation across the
+// whole partition tree (ATSimpleRecursion / find_all_inheritors,
+// tablecmds.c), never just the parent's (empty) heap. M0134-0005ac closes
+// that gap here so every existing caller (SET NOT NULL, ADD PRIMARY KEY, ADD
+// NOT NULL, and the CHECK-constraint validators via
+// validateCheckConstraintRows) picks up partition/inheritance coverage
+// without its own edit. Descendants are resolved the same way
+// validateFKConstraintExistingRows already does (allDescendants +
+// snapDetachEpoch), so detach-pending partitions stay excluded consistently
+// with FK scans.
+func (o *ddlOp) forEachLiveRow(tbl *catalog.Table, fn func(row Row, relName string) error) error {
+	if err := o.forEachLiveRowRel(tbl, tbl, fn); err != nil {
+		return err
+	}
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		for _, child := range allDescendants(im, tbl, snapDetachEpoch(o.ctx)) {
+			if err := o.forEachLiveRowRel(tbl, child, fn); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// forEachLiveRowRel scans exactly leafTbl's own storage and invokes fn once
+// per live row, passing leafTbl.Name as relName (see forEachLiveRow's doc).
+// Each row is decoded using leafTbl.Columns (so a leaf whose physical column
+// order differs from targetTbl's — same caveat
+// validateFKConstraintExistingRowsRel documents — still decodes correctly),
+// then remapped BY NAME into a buffer shaped like targetTbl.Columns before fn
+// is called, so a caller's column indices (resolved against targetTbl) stay
+// valid regardless of which relation in the tree actually held the row. When
+// leafTbl == targetTbl (the common, non-recursive case) the remap is a
+// same-shape identity copy, matching forEachLiveRow's pre-M0134-0005ac
+// behavior exactly.
+func (o *ddlOp) forEachLiveRowRel(targetTbl, leafTbl *catalog.Table, fn func(row Row, relName string) error) error {
+	rel := o.ctx.Catalog.RelFileNode(leafTbl)
 	nBlocks, err := o.ctx.Pool.NBlocks(rel)
 	if err != nil {
 		return &ExecError{Code: "XX000", Message: err.Error()}
 	}
 	sctx := mmgr.Acquire(o.ctx.Mctx, mmgr.KindExpr)
 	defer sctx.Release()
-	var scanRow Row
+	sameShape := leafTbl == targetTbl
+	var leafRow Row
+	var outRow Row
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
@@ -11697,13 +13154,29 @@ func (o *ddlOp) forEachLiveRow(tbl *catalog.Table, fn func(row Row) error) error
 			if !isLiveForUniqueCheck(o.ctx, tuple.Header.Xmin, tuple.Header.Xmax) {
 				continue
 			}
-			if scanRow == nil || len(scanRow) != len(tbl.Columns) {
-				scanRow = make(Row, len(tbl.Columns))
+			if leafRow == nil || len(leafRow) != len(leafTbl.Columns) {
+				leafRow = make(Row, len(leafTbl.Columns))
 			}
-			if decErr := DecodeHeapTupleRowInto(scanRow, tbl.Columns, tuple, sctx); decErr != nil {
+			if decErr := DecodeHeapTupleRowInto(leafRow, leafTbl.Columns, tuple, sctx); decErr != nil {
 				continue
 			}
-			if fnErr := fn(scanRow); fnErr != nil {
+			passRow := leafRow
+			if !sameShape {
+				if outRow == nil || len(outRow) != len(targetTbl.Columns) {
+					outRow = make(Row, len(targetTbl.Columns))
+				}
+				for ti, tc := range targetTbl.Columns {
+					outRow[ti] = Datum{}
+					for li, lc := range leafTbl.Columns {
+						if strings.EqualFold(tc.Name, lc.Name) {
+							outRow[ti] = leafRow[li]
+							break
+						}
+					}
+				}
+				passRow = outRow
+			}
+			if fnErr := fn(passRow, leafTbl.Name); fnErr != nil {
 				o.ctx.Pool.Unpin(slot)
 				return fnErr
 			}
@@ -11725,7 +13198,16 @@ func (o *ddlOp) forEachLiveRow(tbl *catalog.Table, fn func(row Row) error) error
 // carries Pos 0. Used by ADD CHECK and VALIDATE CHECK (CHECK), M0134-0002 C3
 // slice 1. conName is used verbatim; for an anonymous ADD CHECK callers pass
 // the auto-generated name so the message matches PG's.
-func (o *ddlOp) validateCheckConstraintRows(tbl *catalog.Table, conName, exprSQL string) error {
+//
+// noInherit mirrors QueueCheckConstraintValidation's `!con->connoinherit`
+// gate (tablecmds.c:13140): PG only queues the whole-tree Phase-3 scan for an
+// inheritable CHECK; a NO INHERIT constraint's row scan (whether via ADD
+// CHECK or VALIDATE CONSTRAINT) is confined to the named relation because
+// PG's Phase-3 scan is queued per relation and NO INHERIT never enters
+// find_all_inheritors in the first place. When true, this scans only tbl's
+// own storage (forEachLiveRowRel) instead of the whole inheritance/partition
+// tree (forEachLiveRow). M0134-0005an.
+func (o *ddlOp) validateCheckConstraintRows(tbl *catalog.Table, conName, exprSQL string, noInherit bool) error {
 	if exprSQL == "" {
 		return nil
 	}
@@ -11766,7 +13248,7 @@ func (o *ddlOp) validateCheckConstraintRows(tbl *catalog.Table, conName, exprSQL
 		}
 		return err
 	}
-	return o.forEachLiveRow(tbl, func(row Row) error {
+	scanFn := func(row Row, relName string) error {
 		pv, pErr := evalExpr(planned, row, o.ctx)
 		if pErr != nil {
 			return pErr
@@ -11780,8 +13262,12 @@ func (o *ddlOp) validateCheckConstraintRows(tbl *catalog.Table, conName, exprSQL
 			return nil
 		}
 		return &ExecError{Code: "23514", Pos: 0,
-			Message: fmt.Sprintf("check constraint %q of relation %q is violated by some row", conName, tbl.Name)}
-	})
+			Message: fmt.Sprintf("check constraint %q of relation %q is violated by some row", conName, relName)}
+	}
+	if noInherit {
+		return o.forEachLiveRowRel(tbl, tbl, scanFn)
+	}
+	return o.forEachLiveRow(tbl, scanFn)
 }
 
 // validateFKConstraintExistingRows scans every live row of fkOwnerTbl and, for
@@ -12112,6 +13598,21 @@ type btreeIndexProps struct {
 	Deferrable        bool
 	InitiallyDeferred bool
 	IsConstraint      bool
+	// CheckDup forces collectBTreeEntries' existing-row duplicate scan on even
+	// when unique is false. M0134-0005af: `ALTER TABLE … ADD EXCLUDE (col WITH
+	// =)` builds a non-unique btree (idx.Unique must stay false — it is not a
+	// unique constraint, PG oracle execIndexing.c check_exclusion_or_unique_
+	// constraint's newIndex branch) but must still validate pre-existing rows
+	// for conflicts, exactly like a real unique-index build does. Every other
+	// caller leaves this false, so checkDup collapses to `unique` for them —
+	// byte-identical behaviour.
+	CheckDup bool
+	// IsExclusion / ExclusionOp (M0134-0005af) let a checkDup=true caller mark
+	// idx.IsExclusion BEFORE the build runs (see createBTreeIndex), so
+	// collectBTreeEntries' duplicate-scan branch picks the exclusion-
+	// constraint 23P01 message shape rather than the unique-index 23505 one.
+	IsExclusion bool
+	ExclusionOp string
 }
 
 func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalog.Table, columns []string, colExprs []parser.Expr, unique bool, primary bool, nullsNotDistinct bool, colDescending, colNullsFirst []bool, props ...*btreeIndexProps) error {
@@ -12213,6 +13714,15 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 		idx.Deferrable = xp.Deferrable
 		idx.InitiallyDeferred = xp.InitiallyDeferred
 		idx.IsConstraint = xp.IsConstraint
+		if xp.IsExclusion {
+			// M0134-0005af: must be set BEFORE bulkBuildBTreeFull below so
+			// collectBTreeEntries' checkDup duplicate scan can see it and pick
+			// the 23P01 exclusion-constraint DETAIL shape instead of 23505's —
+			// the caller's own post-LookupIndex idx.IsExclusion=true assignment
+			// (execAlterTableAddExclude) runs too late for that.
+			idx.IsExclusion = true
+			idx.ExclusionOp = xp.ExclusionOp
+		}
 	}
 	// Store parsed expressions for expression-based index columns so the
 	// planner and executor can evaluate them at conflict-detection time.
@@ -12230,14 +13740,18 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 	idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
 	var buildErr error
 	var predExpr optimizer.Expr
+	checkDup := unique
 	if xp != nil {
 		predExpr = xp.Predicate
+		if xp.CheckDup {
+			checkDup = true
+		}
 	}
 	// M0119-0006: resolve expression key columns so the build indexes them too.
 	// Before this, `CREATE INDEX ON t(lower(c))` over pre-existing rows built an
 	// EMPTY index while INSERT-time maintenance did populate it.
 	keyExprs := resolveIndexKeyExprs(tbl, idx)
-	buildErr = o.bulkBuildBTreeFull(idx, idxRel, tbl, cols, keyExprs, unique, nullsNotDistinct, idxName.String(), pos, predExpr)
+	buildErr = o.bulkBuildBTreeFull(idx, idxRel, tbl, cols, keyExprs, unique, checkDup, nullsNotDistinct, idxName.String(), pos, predExpr)
 	if buildErr != nil {
 		_ = o.ctx.Catalog.DropIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		o.ctx.Pool.InvalidateRel(idxRel)
@@ -12275,8 +13789,11 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 // is not derivable from idxRel — REINDEX CONCURRENTLY builds into a shadow
 // relfile — and the bulk sort needs it: the build's own ordering and every
 // later reader's must come from the same key descriptor.
-func (o *ddlOp) bulkBuildBTreeFull(idx *catalog.Index, idxRel storage.RelFileNode, tbl *catalog.Table, cols []*catalog.Column, keyExprs []optimizer.Expr, unique, nullsNotDistinct bool, indexName string, pos int, predExpr optimizer.Expr) error {
-	entries, err := o.collectBTreeEntries(idx, tbl, cols, keyExprs, unique, nullsNotDistinct, indexName, pos, predExpr)
+// checkDup (M0134-0005af) decouples "scan existing rows for conflicts" from
+// unique (which also drives idx.Unique upstream in createBTreeIndex); every
+// caller other than the ALTER-EXCLUDE btree build passes checkDup == unique.
+func (o *ddlOp) bulkBuildBTreeFull(idx *catalog.Index, idxRel storage.RelFileNode, tbl *catalog.Table, cols []*catalog.Column, keyExprs []optimizer.Expr, unique, checkDup, nullsNotDistinct bool, indexName string, pos int, predExpr optimizer.Expr) error {
+	entries, err := o.collectBTreeEntries(idx, tbl, cols, keyExprs, unique, checkDup, nullsNotDistinct, indexName, pos, predExpr)
 	if err != nil {
 		return err
 	}
@@ -12332,7 +13849,7 @@ func btreeBuildKeyDescription(idx *catalog.Index, cols []*catalog.Column, row Ro
 // also performs PG's duplicate-key check (23505, comparetup_index_btree
 // tuplesortvariants.c:1686-1693) over the sorted entries.
 
-func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols []*catalog.Column, keyExprs []optimizer.Expr, unique, nullsNotDistinct bool, indexName string, pos int, predExpr optimizer.Expr) ([]nbtree.BulkEntry, error) {
+func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols []*catalog.Column, keyExprs []optimizer.Expr, unique, checkDup, nullsNotDistinct bool, indexName string, pos int, predExpr optimizer.Expr) ([]nbtree.BulkEntry, error) {
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 	nBlocks, err := o.ctx.Pool.NBlocks(rel)
 	if err != nil {
@@ -12473,12 +13990,14 @@ func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols
 				continue
 			}
 			entry := nbtree.BulkEntry{Key: append([]byte(nil), key...), Ptr: storage.ItemPointer{Block: blk, Offset: i}}
-			if unique {
+			if checkDup {
 				// Capture the rendered "Key (cols)=(vals)" description now —
 				// after the post-sort duplicate walk below the source row is
-				// gone, and only the entry list survives. Non-unique builds
-				// never read KeyDesc, so skip the per-row string allocation.
-				// M0134-0002 C3 slice 2.
+				// gone, and only the entry list survives. Builds that skip the
+				// duplicate scan never read KeyDesc, so skip the per-row string
+				// allocation. M0134-0002 C3 slice 2; M0134-0005af widened the
+				// gate from `unique` to `checkDup` so an ALTER TABLE … ADD
+				// EXCLUDE build (non-unique, checkDup=true) also captures it.
 				entry.KeyDesc = btreeBuildKeyDescription(idx, cols, row, false)
 			}
 			entries = append(entries, entry)
@@ -12496,13 +14015,30 @@ func (o *ddlOp) collectBTreeEntries(idx *catalog.Index, tbl *catalog.Table, cols
 	// the entries by key before inserting, so we sort here
 	// (matching its convention) and walk adjacencies for the
 	// unique check.
-	if unique && len(entries) > 1 {
+	//
+	// checkDup (M0134-0005af) widens this from `unique`-only: an `ALTER TABLE
+	// … ADD EXCLUDE (col WITH =)` build is non-unique (idx.Unique stays
+	// false — an exclusion constraint is not a unique constraint) but must
+	// still reject pre-existing conflicting rows, exactly like PG's
+	// check_exclusion_or_unique_constraint (execIndexing.c:893-918) does for
+	// both index kinds via its shared `newIndex` branch.
+	if checkDup && len(entries) > 1 {
 		// di is the index of the second entry of the first adjacent duplicate
 		// pair; both carry the same rendered key description, so either renders
 		// PG's `Key (…)=(…) is duplicated.` DETAIL (comparetup_index_btree,
 		// tuplesortvariants.c:1686-1693). No errposition — Pos stays 0.
 		// M0134-0002 C3 slice 2.
 		if di := sortBuildEntriesFindDuplicate(o.ctx.pgIndexKeyDesc(idx), entries); di >= 0 {
+			if idx.IsExclusion {
+				// PG's exclusion-constraint build-time DETAIL needs BOTH
+				// sides of the conflict (execIndexing.c:908-916:
+				// `errdetail("Key %s conflicts with key %s.", error_new,
+				// error_existing)`), unlike the one-sided unique-index
+				// wording above. M0134-0005af.
+				return nil, &ExecError{Code: "23P01", Pos: 0,
+					Message: fmt.Sprintf("could not create exclusion constraint %q", indexName),
+					Detail:  entries[di-1].KeyDesc + " conflicts with key " + entries[di].KeyDesc[len("Key "):] + "."}
+			}
 			return nil, &ExecError{Code: "23505", Pos: 0,
 				Message: fmt.Sprintf("could not create unique index %q", indexName),
 				Detail:  entries[di].KeyDesc + " is duplicated."}
@@ -13284,6 +14820,103 @@ func clearAttachedColumnsInherited(parent, child *catalog.Table) {
 				col.Inherited = false
 				break
 			}
+		}
+	}
+}
+
+// mergeNotNullOnAttach absorbs the CHILD's NOT NULL constraints into the
+// PARENT's on ALTER TABLE … ATTACH PARTITION and on plain ALTER TABLE …
+// INHERIT, mirroring PG's shared MergeConstraintsIntoExisting
+// (postgres/src/backend/commands/tablecmds.c:17638-17817), restricted to the
+// NOT NULL half (CHECK-constraint merging is a separately ledgered gap,
+// M0134-0005q §24.5). For each PARENT NamedNotNullConstraint with
+// !NoInherit, find the CHILD's constraint on the same column (ColName,
+// case-folded — goopg's proxy for PG's attnum match). The constraint keeps
+// its own name; only IsLocal/InhCount are mutated. Callers must run the
+// heap-resync quadruple for the CHILD afterwards (PG writes rows only on
+// conrelid = attachrel). isPartition selects the is_partition delta at
+// tablecmds.c:17771-17777 (see below); it is true for ATTACH PARTITION,
+// false for plain INHERIT. M0134-0005q, M0134-0005r (design doc §25.2).
+func mergeNotNullOnAttach(parent, child *catalog.Table, isPartition bool) error {
+	for pi := range parent.NotNullConstraints {
+		pnc := &parent.NotNullConstraints[pi]
+		if pnc.NoInherit {
+			continue
+		}
+		var cnc *catalog.NamedNotNullConstraint
+		for ci := range child.NotNullConstraints {
+			if strings.EqualFold(child.NotNullConstraints[ci].ColName, pnc.ColName) {
+				cnc = &child.NotNullConstraints[ci]
+				break
+			}
+		}
+		if cnc == nil {
+			// tablecmds.c:17797-17812 — no matching child constraint.
+			return &ExecError{Code: "42804",
+				Message: fmt.Sprintf("column %q in child table %q must be marked NOT NULL", pnc.ColName, child.Name)}
+		}
+		if cnc.NoInherit {
+			// tablecmds.c:17736-17740. PG's errmsg names the CHILD
+			// constraint (NameStr(child_con->conname)), confirmed against
+			// live expected/constraints.out — not the parent's, despite the
+			// brief's parenthetical.
+			return &ExecError{Code: "42P17",
+				Message: fmt.Sprintf("constraint %q conflicts with non-inherited constraint on child table %q", cnc.Name, child.Name)}
+		}
+		if !pnc.NotValid && cnc.NotValid {
+			// tablecmds.c:17746-17751 — the missing pp_nn/nn1 ATTACH-time
+			// error. Uses the CHILD constraint's name (see note above);
+			// pinned against expected/constraints.out:1581
+			// (`ERROR: constraint "nn1" conflicts with NOT VALID constraint
+			// on child table "pp_nn_1"` — nn1 is pp_nn_1's OWN constraint).
+			return &ExecError{Code: "42P17",
+				Message: fmt.Sprintf("constraint %q conflicts with NOT VALID constraint on child table %q", cnc.Name, child.Name)}
+		}
+		// NOT ENFORCED conflict (tablecmds.c:17758-17762) intentionally
+		// omitted — goopg's NamedNotNullConstraint has no conenforced field
+		// and the fixture does not witness it. M0134-0005q §24.5.
+		//
+		// Absorb: coninhcount++ always (tablecmds.c:17764-17770); conislocal
+		// = false only when the parent is a partitioned table
+		// (tablecmds.c:17771-17777, the is_partition delta) — plain INHERIT
+		// leaves conislocal exactly as-is. M0134-0005r (design doc §25.2).
+		cnc.InhCount++
+		if isPartition {
+			cnc.IsLocal = false
+		}
+	}
+	return nil
+}
+
+// unmergeNotNullOnDetach is the DETACH twin of mergeNotNullOnAttach, mirroring
+// PG's RemoveInheritance (postgres/src/backend/commands/tablecmds.c:
+// 17950-18144): for each CHILD NamedNotNullConstraint whose column matches a
+// PARENT constraint's column, decrement InhCount and set IsLocal=true once it
+// reaches 0 (:18123-18125). Never decrements below 0 (PG elog-asserts this
+// internally at :18119-18121; goopg treats it as an invariant, not a
+// user-facing error). Callers must run the heap-resync quadruple for the
+// CHILD afterwards. M0134-0005q.
+func unmergeNotNullOnDetach(parent, child *catalog.Table) {
+	for ci := range child.NotNullConstraints {
+		cnc := &child.NotNullConstraints[ci]
+		matched := false
+		for pi := range parent.NotNullConstraints {
+			if parent.NotNullConstraints[pi].NoInherit {
+				continue
+			}
+			if strings.EqualFold(parent.NotNullConstraints[pi].ColName, cnc.ColName) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		if cnc.InhCount > 0 {
+			cnc.InhCount--
+		}
+		if cnc.InhCount == 0 {
+			cnc.IsLocal = true
 		}
 	}
 }
@@ -17371,7 +19004,7 @@ func (o *ddlOp) materializeView(tbl *catalog.Table, selectPlan optimizer.Node) e
 				}
 			}
 			idxName := idx.QualifiedName()
-			if err := o.bulkBuildBTreeFull(idx, idxRel, tbl, cols, resolveIndexKeyExprs(tbl, idx), idx.Unique, idx.NullsNotDistinct, idxName, 0, nil); err != nil {
+			if err := o.bulkBuildBTreeFull(idx, idxRel, tbl, cols, resolveIndexKeyExprs(tbl, idx), idx.Unique, idx.Unique, idx.NullsNotDistinct, idxName, 0, nil); err != nil {
 				return err
 			}
 		}
@@ -20654,37 +22287,88 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		if !ok {
 			return undefinedRelation()
 		}
+		var constrOID uint32
 		for _, nc := range tbl.NamedChecks {
 			if strings.EqualFold(nc.Name, s.SubName) {
-				im.SetComment(oidPgConstraint, nc.OID, 0, s.Description)
-				return nil
+				constrOID = nc.OID
+				break
 			}
 		}
 		// PG18 NOT NULL constraints are also named constraints. M0097-0023.
-		for _, nn := range tbl.NotNullConstraints {
-			if strings.EqualFold(nn.Name, s.SubName) && nn.OID != 0 {
-				im.SetComment(oidPgConstraint, nn.OID, 0, s.Description)
-				return nil
+		if constrOID == 0 {
+			for _, nn := range tbl.NotNullConstraints {
+				if strings.EqualFold(nn.Name, s.SubName) && nn.OID != 0 {
+					constrOID = nn.OID
+					break
+				}
 			}
 		}
 		// UNIQUE / PRIMARY KEY / EXCLUDE constraints are backed by indexes whose
 		// Name equals the constraint name; the index OID is the pg_constraint OID
 		// emitted by pg_constraint's VirtualRows. DU-002 slice 144.
-		for _, idx := range im.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
-			if (idx.IsConstraint || idx.IsExclusion) && idx.OID != 0 && strings.EqualFold(idx.Name, s.SubName) {
-				im.SetComment(oidPgConstraint, idx.OID, 0, s.Description)
-				return nil
+		if constrOID == 0 {
+			for _, idx := range im.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
+				if (idx.IsConstraint || idx.IsExclusion) && idx.OID != 0 && strings.EqualFold(idx.Name, s.SubName) {
+					constrOID = idx.OID
+					break
+				}
 			}
 		}
 		// FOREIGN KEY constraints (contype='f') are stored on the child table.
-		for _, fk := range tbl.ForeignKeys {
-			if strings.EqualFold(fk.Name, s.SubName) && fk.OID != 0 {
-				im.SetComment(oidPgConstraint, fk.OID, 0, s.Description)
-				return nil
+		if constrOID == 0 {
+			for _, fk := range tbl.ForeignKeys {
+				if strings.EqualFold(fk.Name, s.SubName) && fk.OID != 0 {
+					constrOID = fk.OID
+					break
+				}
 			}
 		}
-		return &ExecError{Code: "42704", Pos: s.Pos(),
-			Message: fmt.Sprintf("constraint %q for table %q does not exist", s.SubName, tbl.Name)}
+		if constrOID == 0 {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("constraint %q for table %q does not exist", s.SubName, tbl.Name)}
+		}
+		// Ownership check, mirroring PG's comment.c CommentObject ->
+		// aclchk.c check_object_ownership (ACLCHECK_NOT_OWNER, OBJECT_TABLE):
+		// checked AFTER the object address (here, the constraint) resolves,
+		// BEFORE pg_description is touched. Superusers bypass. goopg's
+		// COMMENT ON otherwise performs no ownership check for any object kind
+		// (out of scope here — M0134-0005ai; see deferral candidate in report).
+		if err := o.checkCommentObjectOwner(tbl.Owner, "relation", tbl.Name); err != nil {
+			return err
+		}
+		im.SetComment(oidPgConstraint, constrOID, 0, s.Description)
+		return nil
+	case "domain constraint":
+		// COMMENT ON CONSTRAINT <name> ON DOMAIN <domain> IS '...'. PG resolves
+		// the domain type FIRST (get_object_address's OBJECT_DOMCONSTRAINT case,
+		// objectaddress.c:975-990) — a missing domain reports the type error, NOT
+		// the constraint error — then get_domain_constraint_oid
+		// (pg_constraint.c:1391,1427) raises the "for domain" message if the
+		// named constraint isn't found on that domain. M0134-0005ai.
+		dom, ok := im.LookupDomain(s.ObjName.Name, o.ctx.CurrentDatabaseOid)
+		if !ok {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("type %q does not exist", s.ObjName.String())}
+		}
+		var constrOID uint32
+		for _, ck := range dom.Checks {
+			if strings.EqualFold(ck.Name, s.SubName) && ck.OID != 0 {
+				constrOID = ck.OID
+				break
+			}
+		}
+		if constrOID == 0 {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("constraint %q for domain %s does not exist", s.SubName, dom.Name)}
+		}
+		// Ownership check — see the "constraint" case above for the PG oracle
+		// citation and ordering rationale; here it's OBJECT_TYPE ("must be owner
+		// of type ...", the domain's own typowner).
+		if err := o.checkCommentObjectOwnerOID(dom.OwnerOrDefault(), "type", dom.Name); err != nil {
+			return err
+		}
+		im.SetComment(oidPgConstraint, constrOID, 0, s.Description)
+		return nil
 	case "trigger":
 		// Triggers live in pg_trigger (classoid 2620). pg_dump's dumpTrigger keys
 		// the comment lookup on the trigger's catalogId.tableoid (pg_trigger =

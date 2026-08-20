@@ -33,6 +33,79 @@ from `./postgres/`.
    already passes, flip the row to `pass` with a "stale — already fixed" note
    instead of implementing anything.
 
+   **Outcome so far (keep this list current):** **two of the four are now
+   confirmed stale, zero engine changes between them.** `select_having` was
+   re-run at HEAD on 2026-08-19 (M0134-0006) and PASSes — 1/1, 100.0% parity,
+   84/84 lines byte-identical, corroborated by the same night's nightly
+   `TestPort_RegressSuite/select_having,PASS`. `select_implicit` was re-run the
+   same day (M0134-0007) and also PASSes — 1/1, 100.0% parity, 316 lines
+   byte-identical, no diff emitted under `tmp/regress-diffs/`, corroborated by
+   `ci/logs/20260819-011823/testport/results.csv`
+   (`TestPort_RegressSuite/select_implicit,PASS`). Each cost one gate run
+   instead of an implementation slice, which is the whole point of this rule;
+   the pattern is that these four rows were captured by a baseline that
+   disagreed with the inventory's own status, so treat the remaining two
+   (`mvcc`, `reindex_catalog`) as *probably* stale too — but re-run each, never
+   flip on inference. Note both confirmed-stale cases so far are cheap
+   `select_*` cases; `mvcc` and `reindex_catalog` exercise far more engine
+   surface, so a genuine divergence there is likelier than this 2-for-2 start
+   suggests.
+
+## Priority renumbering — 2026-08-19 (user directive)
+
+Task IDs are the selection order, so re-prioritising this milestone means
+renumbering. On 2026-08-19 the user named eighteen higher-value cases and asked
+for them to occupy the block starting at **M0134-0006** (M0134-0001..0005 were
+left alone: 0001 is in progress and 0002-0005 are parked).
+
+The method is a **pair swap**, not a shift: the eighteen named tasks took
+0006..0023 in the order the user listed them, and the sixteen tasks they
+displaced took the vacated numbers in ascending order. The other 155 tasks keep
+their filed numbers.
+
+| new | case | was | | displaced case | was | now |
+|---|---|---|---|---|---|---|
+| M0134-0006 | `select_having.sql` | 0066 | | `copy.sql` | 0006 | 0027 |
+| M0134-0007 | `select_implicit.sql` | 0067 | | `copy2.sql` | 0007 | 0031 |
+| M0134-0008 | `select_parallel.sql` | 0166 | | `create_procedure.sql` | 0009 | 0033 |
+| M0134-0009 | `select_views.sql` | 0068 | | `create_table_like.sql` | 0011 | 0036 |
+| M0134-0010 | `predicate.sql` | 0153 | | `create_view.sql` | 0012 | 0048 |
+| M0134-0011 | `subselect.sql` | 0071 | | `date.sql` | 0013 | 0066 |
+| M0134-0012 | `update.sql` | 0082 | | `domain.sql` | 0014 | 0067 |
+| M0134-0013 | `insert.sql` | 0033 | | `drop_if_exists.sql` | 0015 | 0068 |
+| M0134-0014 | `mvcc.sql` | 0048 | | `equivclass.sql` | 0016 | 0071 |
+| M0134-0015 | `join.sql` | 0036 | | `explain.sql` | 0017 | 0082 |
+| M0134-0016 | `create_table.sql` | 0010 | | `expressions.sql` | 0018 | 0084 |
+| M0134-0017 | `hash_index.sql` | 0027 | | `fast_default.sql` | 0019 | 0085 |
+| M0134-0018 | `create_index.sql` | 0008 | | `float4.sql` | 0020 | 0153 |
+| M0134-0019 | `indexing.sql` | 0031 | | `float8.sql` | 0021 | 0166 |
+| M0134-0020 | `stats.sql` | 0171 | | `foreign_key.sql` | 0022 | 0171 |
+| M0134-0021 | `vacuum.sql` | 0084 | | `generated_stored.sql` | 0023 | 0187 |
+| M0134-0022 | `window.sql` | 0085 | | | | |
+| M0134-0023 | `write_parallel.sql` | 0187 | | | | |
+
+`create_index` (0008) and `create_table` (0010) already sat inside 0006..0023 and
+are themselves promoted, so they are not in the displaced column.
+
+**Three resolutions the user confirmed when the list was reconciled against the
+suite:**
+
+- **`index.sql` does not exist** in PG 18.3's regress suite. The three `index*`
+  cases are `indexing.sql` (`failed`), `index_including.sql` and
+  `index_including_gist.sql` (both already `pass`). Read as `indexing.sql`.
+- **`select*.sql` expands to the four not-yet-passing cases only** —
+  `select_having`, `select_implicit`, `select_parallel`, `select_views`, placed in
+  that (alphabetical) order. `select_distinct`, `select_distinct_on` and
+  `select_into` already carry `pass`.
+- **`select.sql`, `delete.sql` and `sysviews.sql` already carry `pass`** and so
+  have no M0134 task to promote; they are absent from the table above by design,
+  not by oversight.
+
+**Invariant broken on purpose — do not assume it elsewhere.** After this swap the
+ID band no longer segregates `failed` from `not-tried`: `select_parallel`
+(`not-tried`) is M0134-0008 and `float4` (`failed`) is M0134-0153. Read the
+`status` column, never the number.
+
 ## Background
 
 `docs/test-port/postgres-oracle-target-inventory.csv` is the authoritative
@@ -49,17 +122,20 @@ one case per task, **`failed` first with the smaller item numbers**.
    either made to **pass** against PG 18.3 (CSV row flipped to `pass`,
    `pass_required = yes`) or explicitly **deferred** with a deferral-ledger row
    naming the blocker and resume point.
-2. One task per case; `failed` cases carry M0134-0001..0087, `not-tried` carry
-   M0134-0088..0189, listed in this order.
+2. One task per case. **At filing** `failed` cases carried M0134-0001..0087 and
+   `not-tried` carried M0134-0088..0189, in that order; the 2026-08-19 priority
+   renumbering (below) broke that band correspondence for 34 tasks. The per-task
+   `status` column of the table below is the authority, not the ID band.
 3. Status changes land in the inventory CSV in the same commit.
 4. No case is closed silently: a green case with an un-updated CSV row, or a
    skipped case without a ledger row, is a bookkeeping defect.
 
 ## Task list (one case per task)
 
-Order: **87 `failed`** (M0134-0001..M0134-0087, CSV order) then **102
-`not-tried`** (M0134-0088..M0134-0189, CSV order). Each task body in
-`.ralph/fix_plan.md` carries the same text.
+Order at filing: **87 `failed`** (M0134-0001..M0134-0087, CSV order) then **102
+`not-tried`** (M0134-0088..M0134-0189, CSV order). **Current order = the table
+below**, after the 2026-08-19 priority renumbering; rows that moved say so in the
+`note` column. Each task body in `.ralph/fix_plan.md` carries the same text.
 
 | task | case | status | note |
 |---|---|---|---|
@@ -68,37 +144,37 @@ Order: **87 `failed`** (M0134-0001..M0134-0087, CSV order) then **102
 | M0134-0003 | `arrays.sql` | failed |  |
 | M0134-0004 | `cluster.sql` | failed |  |
 | M0134-0005 | `constraints.sql` | failed |  |
-| M0134-0006 | `copy.sql` | failed |  |
-| M0134-0007 | `copy2.sql` | failed |  |
-| M0134-0008 | `create_index.sql` | failed |  |
-| M0134-0009 | `create_procedure.sql` | failed |  |
-| M0134-0010 | `create_table.sql` | failed |  |
-| M0134-0011 | `create_table_like.sql` | failed |  |
-| M0134-0012 | `create_view.sql` | failed |  |
-| M0134-0013 | `date.sql` | failed |  |
-| M0134-0014 | `domain.sql` | failed |  |
-| M0134-0015 | `drop_if_exists.sql` | failed |  |
-| M0134-0016 | `equivclass.sql` | failed |  |
-| M0134-0017 | `explain.sql` | failed |  |
-| M0134-0018 | `expressions.sql` | failed |  |
-| M0134-0019 | `fast_default.sql` | failed |  |
-| M0134-0020 | `float4.sql` | failed |  |
-| M0134-0021 | `float8.sql` | failed |  |
-| M0134-0022 | `foreign_key.sql` | failed |  |
-| M0134-0023 | `generated_stored.sql` | failed |  |
+| M0134-0006 | `select_having.sql` | **pass** | renumbered 2026-08-19 (was M0134-0066); **DONE 2026-08-19 — stale `failed`, no goopg change: runner 1/1 PASS at HEAD, CSV flipped to `pass`/`pass_required=yes`** |
+| M0134-0007 | `select_implicit.sql` | **pass** | renumbered 2026-08-19 (was M0134-0067); **DONE 2026-08-19 — stale `failed`, no goopg change: runner 1/1 PASS at HEAD (316 lines byte-identical), CSV flipped to `pass`/`pass_required=yes`** |
+| M0134-0008 | `select_parallel.sql` | not-tried | **PARKED 2026-08-19** — needs parallel-query execution (see "Prerequisite fixtures, and the first parked case") |
+| M0134-0009 | `select_views.sql` | failed | renumbered 2026-08-19 (was M0134-0068) |
+| M0134-0010 | `predicate.sql` | not-tried | renumbered 2026-08-19 (was M0134-0153) |
+| M0134-0011 | `subselect.sql` | failed | renumbered 2026-08-19 (was M0134-0071) |
+| M0134-0012 | `update.sql` | failed | renumbered 2026-08-19 (was M0134-0082) |
+| M0134-0013 | `insert.sql` | failed | renumbered 2026-08-19 (was M0134-0033) |
+| M0134-0014 | `mvcc.sql` | failed | renumbered 2026-08-19 (was M0134-0048) |
+| M0134-0015 | `join.sql` | failed | renumbered 2026-08-19 (was M0134-0036) |
+| M0134-0016 | `create_table.sql` | failed | renumbered 2026-08-19 (was M0134-0010) |
+| M0134-0017 | `hash_index.sql` | failed | renumbered 2026-08-19 (was M0134-0027) |
+| M0134-0018 | `create_index.sql` | failed | renumbered 2026-08-19 (was M0134-0008) |
+| M0134-0019 | `indexing.sql` | failed | renumbered 2026-08-19 (was M0134-0031) |
+| M0134-0020 | `stats.sql` | not-tried | renumbered 2026-08-19 (was M0134-0171) |
+| M0134-0021 | `vacuum.sql` | failed | renumbered 2026-08-19 (was M0134-0084) |
+| M0134-0022 | `window.sql` | failed | renumbered 2026-08-19 (was M0134-0085) |
+| M0134-0023 | `write_parallel.sql` | not-tried | renumbered 2026-08-19 (was M0134-0187) |
 | M0134-0024 | `generated_virtual.sql` | failed |  |
 | M0134-0025 | `groupingsets.sql` | failed |  |
 | M0134-0026 | `guc.sql` | failed |  |
-| M0134-0027 | `hash_index.sql` | failed |  |
+| M0134-0027 | `copy.sql` | failed | renumbered 2026-08-19 (was M0134-0006) |
 | M0134-0028 | `horology.sql` | failed |  |
 | M0134-0029 | `identity.sql` | failed |  |
 | M0134-0030 | `incremental_sort.sql` | failed |  |
-| M0134-0031 | `indexing.sql` | failed |  |
+| M0134-0031 | `copy2.sql` | failed | renumbered 2026-08-19 (was M0134-0007) |
 | M0134-0032 | `inherit.sql` | failed |  |
-| M0134-0033 | `insert.sql` | failed |  |
+| M0134-0033 | `create_procedure.sql` | failed | renumbered 2026-08-19 (was M0134-0009) |
 | M0134-0034 | `insert_conflict.sql` | failed |  |
 | M0134-0035 | `interval.sql` | failed |  |
-| M0134-0036 | `join.sql` | failed |  |
+| M0134-0036 | `create_table_like.sql` | failed | renumbered 2026-08-19 (was M0134-0011) |
 | M0134-0037 | `join_hash.sql` | failed |  |
 | M0134-0038 | `json.sql` | failed |  |
 | M0134-0039 | `jsonb.sql` | failed |  |
@@ -110,7 +186,7 @@ Order: **87 `failed`** (M0134-0001..M0134-0087, CSV order) then **102
 | M0134-0045 | `misc.sql` | failed |  |
 | M0134-0046 | `misc_functions.sql` | failed |  |
 | M0134-0047 | `multirangetypes.sql` | failed |  |
-| M0134-0048 | `mvcc.sql` | failed | verify at HEAD first (possible regression) |
+| M0134-0048 | `create_view.sql` | failed | renumbered 2026-08-19 (was M0134-0012) |
 | M0134-0049 | `numeric.sql` | failed |  |
 | M0134-0050 | `numeric_big.sql` | failed |  |
 | M0134-0051 | `partition_info.sql` | failed |  |
@@ -128,12 +204,12 @@ Order: **87 `failed`** (M0134-0001..M0134-0087, CSV order) then **102
 | M0134-0063 | `returning.sql` | failed |  |
 | M0134-0064 | `rowtypes.sql` | failed |  |
 | M0134-0065 | `rules.sql` | failed |  |
-| M0134-0066 | `select_having.sql` | failed | verify at HEAD first (possible regression) |
-| M0134-0067 | `select_implicit.sql` | failed | verify at HEAD first (possible regression) |
-| M0134-0068 | `select_views.sql` | failed |  |
+| M0134-0066 | `date.sql` | failed | renumbered 2026-08-19 (was M0134-0013) |
+| M0134-0067 | `domain.sql` | failed | renumbered 2026-08-19 (was M0134-0014) |
+| M0134-0068 | `drop_if_exists.sql` | failed | renumbered 2026-08-19 (was M0134-0015) |
 | M0134-0069 | `sequence.sql` | failed |  |
 | M0134-0070 | `strings.sql` | failed |  |
-| M0134-0071 | `subselect.sql` | failed |  |
+| M0134-0071 | `equivclass.sql` | failed | renumbered 2026-08-19 (was M0134-0016) |
 | M0134-0072 | `temp.sql` | failed |  |
 | M0134-0073 | `tidrangescan.sql` | failed |  |
 | M0134-0074 | `tidscan.sql` | failed |  |
@@ -144,10 +220,10 @@ Order: **87 `failed`** (M0134-0001..M0134-0087, CSV order) then **102
 | M0134-0079 | `tuplesort.sql` | failed |  |
 | M0134-0080 | `txid.sql` | failed |  |
 | M0134-0081 | `updatable_views.sql` | failed |  |
-| M0134-0082 | `update.sql` | failed |  |
+| M0134-0082 | `explain.sql` | failed | renumbered 2026-08-19 (was M0134-0017) |
 | M0134-0083 | `uuid.sql` | failed |  |
-| M0134-0084 | `vacuum.sql` | failed |  |
-| M0134-0085 | `window.sql` | failed |  |
+| M0134-0084 | `expressions.sql` | failed | renumbered 2026-08-19 (was M0134-0018) |
+| M0134-0085 | `fast_default.sql` | failed | renumbered 2026-08-19 (was M0134-0019) |
 | M0134-0086 | `with.sql` | failed |  |
 | M0134-0087 | `xid.sql` | failed |  |
 | M0134-0088 | `alter_generic.sql` | not-tried |  |
@@ -215,7 +291,7 @@ Order: **87 `failed`** (M0134-0001..M0134-0087, CSV order) then **102
 | M0134-0150 | `point.sql` | not-tried |  |
 | M0134-0151 | `polygon.sql` | not-tried |  |
 | M0134-0152 | `polymorphism.sql` | not-tried |  |
-| M0134-0153 | `predicate.sql` | not-tried |  |
+| M0134-0153 | `float4.sql` | failed | renumbered 2026-08-19 (was M0134-0020) |
 | M0134-0154 | `privileges.sql` | not-tried |  |
 | M0134-0155 | `psql.sql` | not-tried |  |
 | M0134-0156 | `psql_crosstab.sql` | not-tried |  |
@@ -228,12 +304,12 @@ Order: **87 `failed`** (M0134-0001..M0134-0087, CSV order) then **102
 | M0134-0163 | `rowsecurity.sql` | not-tried |  |
 | M0134-0164 | `sanity_check.sql` | not-tried |  |
 | M0134-0165 | `security_label.sql` | not-tried |  |
-| M0134-0166 | `select_parallel.sql` | not-tried |  |
+| M0134-0166 | `float8.sql` | failed | renumbered 2026-08-19 (was M0134-0021) |
 | M0134-0167 | `spgist.sql` | not-tried |  |
 | M0134-0168 | `sqljson.sql` | not-tried |  |
 | M0134-0169 | `sqljson_jsontable.sql` | not-tried |  |
 | M0134-0170 | `sqljson_queryfuncs.sql` | not-tried |  |
-| M0134-0171 | `stats.sql` | not-tried |  |
+| M0134-0171 | `foreign_key.sql` | failed | renumbered 2026-08-19 (was M0134-0022) |
 | M0134-0172 | `stats_ext.sql` | not-tried |  |
 | M0134-0173 | `stats_import.sql` | not-tried |  |
 | M0134-0174 | `subscription.sql` | not-tried |  |
@@ -249,9 +325,53 @@ Order: **87 `failed`** (M0134-0001..M0134-0087, CSV order) then **102
 | M0134-0184 | `unicode.sql` | not-tried |  |
 | M0134-0185 | `vacuum_parallel.sql` | not-tried |  |
 | M0134-0186 | `without_overlaps.sql` | not-tried |  |
-| M0134-0187 | `write_parallel.sql` | not-tried |  |
+| M0134-0187 | `generated_stored.sql` | failed | renumbered 2026-08-19 (was M0134-0023) |
 | M0134-0188 | `xml.sql` | not-tried |  |
 | M0134-0189 | `xmlmap.sql` | not-tried |  |
+
+## Prerequisite fixtures, and the first parked case (added 2026-08-19, M0134-0008)
+
+`select_parallel.sql` was the milestone's first `not-tried` case, and sizing it
+produced two findings worth generalising.
+
+**(a) The runner was missing an upstream prerequisite.** Upstream's
+`postgres/src/test/regress/parallel_schedule` documents cross-case dependencies
+explicitly — `# select_parallel depends on create_misc` (`:88`), and the same
+for `join` (`:62`) and `with` (`:114`), with `create_misc` running in the first
+group at `:45`. `scripts/pg-regress-runner.sh`'s `RUN_SETUP` phase ran
+`test_setup.sql`, `create_index.sql` and `create_aggregate.sql` but not
+`create_misc.sql`, so the `a_star`..`f_star` inheritance chain never existed and
+`select_parallel.sql:23` failed on its very first statement — 90% of the
+1526-line diff was one 25P02 cascade from that single missing fixture, masking
+everything real underneath. The step was added in upstream's position (before
+`create_index.sql`), verified non-regressive (`select_having` and
+`select_implicit` still 1/1 PASS; `aggregates` FAILs identically before and
+after, confirmed against a stashed clean baseline).
+
+**Generalised rule for the rest of this milestone: before sizing any case,
+check `parallel_schedule` for a documented `depends on` line.** A case that
+fails on its first statement is far more likely to be missing a fixture than to
+have found an engine bug, and the diff line count will not tell you apart — when
+the prerequisite landed here, the diff stayed *byte-identically* 1526 lines
+because a second root cause took over at the same position.
+
+**(b) Not every case is reachable, and parking beats forcing.** With the fixture
+in place, `create_misc.sql` still cannot finish: goopg's parser rejects
+`ALTER TABLE <table>*` (the legacy trailing-`*` wildcard suffix) and postfix
+`ISNULL`/`NOTNULL`, so `a_star.a` is never renamed to `aa`. But that is *also*
+not the blocker. `select_parallel.sql`'s tail asserts
+`pg_stat_database.parallel_workers_launched` increased (expects `t|t`, goopg
+gives `f|f`), and goopg has no `Gather`/parallel-worker execution path at all —
+so no harness or parser fix can make this case PASS. M0134-0008 is therefore
+**PARKED** with an executable re-arm trigger (land a parallel-query milestone,
+then re-run and re-size), its CSV row left `not-tried`, and six deferral-ledger
+rows appended 2026-08-19 covering the parallel-query blocker, the two parser
+gaps, `SET SESSION AUTHORIZATION` not reaching `current_setting`, function-level
+`SET ROLE`, and a pre-existing `aggregates` planner bug found en route.
+
+**Precedent this sets:** a case that cannot pass without a milestone-sized
+capability is parked with a re-arm trigger and full ledger coverage — never
+closed with a forward reference, and never forced green by weakening the case.
 
 ## Definition of done
 

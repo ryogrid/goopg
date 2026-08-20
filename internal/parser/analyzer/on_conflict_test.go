@@ -187,3 +187,66 @@ func TestAnalyzeOnConflictUpdateWhereNonBoolean(t *testing.T) {
 		"INSERT INTO pgbench_accounts (aid, abalance) VALUES (1, 0) ON CONFLICT (aid) DO UPDATE SET abalance = 1 WHERE abalance",
 		"42804")
 }
+
+// TestAnalyzeOnConflictAcceptsExclusionConstraintArbiter (M0134-0005af,
+// bucket F8) — an exclusion constraint IS a legal ON CONFLICT arbiter in PG
+// (execIndexing.c:592-596, ExecCheckIndexConstraints: the skip condition is
+// `!ii_Unique && !ii_ExclusionOps`, so an exclusion index passes). Before
+// this fix the analyzer gated solely on idx.Unique, so ANY exclusion
+// constraint — not just a deferrable one — was rejected with the generic
+// 42P10 "is not a unique constraint".
+func TestAnalyzeOnConflictAcceptsExclusionConstraintArbiter(t *testing.T) {
+	cat := analyzerCatalog(t)
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "pgbench_accounts"})
+	idx, err := cat.CreateIndex(parser.ObjectName{Name: "pgbench_accounts_excl"}, tbl, []string{"aid"}, false, "btree", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx.IsExclusion = true
+	idx.ExclusionOp = "="
+	sql := `INSERT INTO pgbench_accounts (aid, abalance) VALUES (1, 0)
+		ON CONFLICT ON CONSTRAINT pgbench_accounts_excl DO NOTHING`
+	if err := Analyze(parseOne(t, sql), cat); err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+}
+
+// TestAnalyzeOnConflictRejectsDeferrableExclusionArbiter (M0134-0005af,
+// bucket F8) pins the NEW 55000 check: a deferrable (INITIALLY DEFERRED)
+// exclusion — or unique — constraint may not be used as an ON CONFLICT
+// arbiter, matching PG's indimmediate-keyed check (execIndexing.c:604-610).
+func TestAnalyzeOnConflictRejectsDeferrableExclusionArbiter(t *testing.T) {
+	cat := analyzerCatalog(t)
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "pgbench_accounts"})
+	idx, err := cat.CreateIndex(parser.ObjectName{Name: "pgbench_accounts_dexcl"}, tbl, []string{"aid"}, false, "btree", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx.IsExclusion = true
+	idx.ExclusionOp = "="
+	idx.Deferrable = true
+	idx.InitiallyDeferred = true
+	expectAnalyzeCode(t, cat,
+		`INSERT INTO pgbench_accounts (aid, abalance) VALUES (1, 0)
+			ON CONFLICT ON CONSTRAINT pgbench_accounts_dexcl DO NOTHING`,
+		"55000")
+}
+
+// TestAnalyzeOnConflictRejectsDeferrableUniqueArbiter is the sibling of
+// TestAnalyzeOnConflictRejectsDeferrableExclusionArbiter for a plain unique
+// constraint: the 55000 check applies to both kinds (PG's DETAIL wording
+// covers "deferrable unique constraints/exclusion constraints" together).
+func TestAnalyzeOnConflictRejectsDeferrableUniqueArbiter(t *testing.T) {
+	cat := analyzerCatalog(t)
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "pgbench_accounts"})
+	idx, err := cat.CreateIndex(parser.ObjectName{Name: "pgbench_accounts_duniq"}, tbl, []string{"aid"}, true, "btree", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx.Deferrable = true
+	idx.InitiallyDeferred = true
+	expectAnalyzeCode(t, cat,
+		`INSERT INTO pgbench_accounts (aid, abalance) VALUES (1, 0)
+			ON CONFLICT ON CONSTRAINT pgbench_accounts_duniq DO NOTHING`,
+		"55000")
+}
