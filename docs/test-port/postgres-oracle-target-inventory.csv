@@ -227,7 +227,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-sql,regress,postgres/src/test/regress/sql/window.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/with.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/without_overlaps.sql,not-tried,no,-,
-,regress-sql,regress,postgres/src/test/regress/sql/write_parallel.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/write_parallel.sql,failed,no,"M0134-0023: RUN 2026-08-20 (was not-tried) — genuinely FAILS, 80 diff lines / 0 ^+ERROR. Structurally unreachable: 55% of expected output is Gather/Parallel Seq Scan plan shape and goopg has no parallel-worker execution path (same blocker as select_parallel). PARKED; re-arm after a parallel-query milestone.",
 ,regress-sql,regress,postgres/src/test/regress/sql/xid.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/xml.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/xmlmap.sql,not-tried,no,-,
@@ -489,7 +489,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-expected,regress,postgres/src/test/regress/expected/window.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/with.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/without_overlaps.out,not-tried,no,-,
-,regress-expected,regress,postgres/src/test/regress/expected/write_parallel.out,not-tried,no,-,
+,regress-expected,regress,postgres/src/test/regress/expected/write_parallel.out,failed,no,"M0134-0023: RUN 2026-08-20 (was not-tried) — genuinely FAILS, 80 diff lines / 0 ^+ERROR. Structurally unreachable: 55% of expected output is Gather/Parallel Seq Scan plan shape and goopg has no parallel-worker execution path (same blocker as select_parallel). PARKED; re-arm after a parallel-query milestone.",
 ,regress-expected,regress,postgres/src/test/regress/expected/xid.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/xml.out,not-tried,no,-,
 ,regress-expected,regress,postgres/src/test/regress/expected/xml_1.out,not-tried,no,-,

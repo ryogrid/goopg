@@ -51,6 +51,13 @@ type DDLUndoEntry struct {
 	Name    parser.ObjectName
 	RelOID  uint32 // physical relfile OID (= table.OID or index.OID)
 	IsIndex bool
+	// ShadowedTable is the *catalog.Table this CREATE displaced by overwriting
+	// a same-txn deferred-DROP's still-present map slot (M0134-0023;
+	// CancelPendingTableDropMatching). Non-nil only for a CREATE that recreated
+	// a name this same transaction had already DROPped. ROLLBACK restores it
+	// via InMemory.RegisterTable instead of leaving the slot empty, mirroring
+	// the TempTableShadows precedent (operators_ddl.go).
+	ShadowedTable *catalog.Table
 }
 
 // DDLDropUndoEntry records a DROP TABLE performed inside an active savepoint
@@ -914,6 +921,42 @@ func (s *BasicSession) CancelPendingTableDropsToDepth(depth int) {
 		}
 	}
 	s.pendingTableDrops = keep
+}
+
+// CancelPendingTableDropMatching removes and returns the deferred DROP TABLE
+// entry (see PendingTableDrop) whose target name matches the given name, or nil
+// if none. execCreateTable calls this so a same-transaction DROP-then-CREATE of
+// the identical name proceeds cleanly: the deferred drop is cancelled now (the
+// recreate reuses the catalog map slot in place of it) instead of surviving to
+// delete the freshly created replacement at the outer COMMIT. Matching is
+// case-insensitive on name and schema (an empty schema on either side means
+// "public", matching how CreateTable/DropTable key their bare-schema entries).
+// M0134-0023.
+func (s *BasicSession) CancelPendingTableDropMatching(name parser.ObjectName) *PendingTableDrop {
+	wantSchema := strings.ToLower(name.Schema)
+	if wantSchema == "" {
+		wantSchema = "public"
+	}
+	wantName := strings.ToLower(name.Name)
+	for i, e := range s.pendingTableDrops {
+		var tSchema, tName string
+		if e.Table != nil {
+			tSchema, tName = e.Table.Schema, e.Table.Name
+		} else {
+			tSchema, tName = e.Name.Schema, e.Name.Name
+		}
+		tSchema = strings.ToLower(tSchema)
+		if tSchema == "" {
+			tSchema = "public"
+		}
+		tName = strings.ToLower(tName)
+		if tSchema == wantSchema && tName == wantName {
+			match := e
+			s.pendingTableDrops = append(s.pendingTableDrops[:i], s.pendingTableDrops[i+1:]...)
+			return &match
+		}
+	}
+	return nil
 }
 
 // AddDeferredRoutineDrop records a DROP FUNCTION whose registry removal and

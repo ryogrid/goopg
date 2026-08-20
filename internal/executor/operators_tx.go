@@ -309,6 +309,18 @@ func rollbackDDLCreate(ctx *Context, entry DDLUndoEntry) {
 	}
 	if entry.IsIndex {
 		_ = ctx.Catalog.DropIndex(entry.Name, dbOid)
+	} else if entry.ShadowedTable != nil {
+		// This CREATE recreated a name whose collision check was waived
+		// because it matched a same-transaction deferred DROP (M0134-0023):
+		// restore the table it displaced instead of leaving the slot empty —
+		// a bare DropTable here would lose the original already-committed
+		// table entirely. Mirrors the TempTableShadows restore precedent
+		// (restoreTempShadow / RegisterTable, operators_ddl.go).
+		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+			im.RegisterTable(entry.ShadowedTable, dbOid)
+		} else {
+			_ = ctx.Catalog.DropTable(entry.Name, dbOid)
+		}
 	} else {
 		_ = ctx.Catalog.DropTable(entry.Name, dbOid)
 	}

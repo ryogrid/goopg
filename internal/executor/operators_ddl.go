@@ -42,6 +42,15 @@ type ddlOp struct {
 	plan *optimizer.DDL
 	ctx  *Context
 	done bool
+	// pendingDropShadow carries the table a CREATE displaced by overwriting a
+	// same-transaction deferred-DROP's still-present catalog slot
+	// (M0134-0023). Set by execCreateTable right after
+	// CancelPendingTableDropMatching confirms the collision is a same-session
+	// recreate, and read by both the direct CREATE TABLE path (below) and
+	// execCreateTableAs (CTAS / SELECT INTO share this ddlOp instance) so each
+	// can (a) use CreateTableReplacingPendingDrop instead of the guarded
+	// CreateTable, and (b) stash it on the DDLUndoEntry for ROLLBACK restore.
+	pendingDropShadow *catalog.Table
 }
 
 func newDDLOp(p *optimizer.DDL) *ddlOp { return &ddlOp{plan: p} }
@@ -1731,6 +1740,23 @@ func restoreTempShadow(ctx *Context, key string) {
 	delete(ctx.TempTableShadows, key)
 }
 
+// createTableHonoringPendingDrop installs a new table, routing through
+// InMemory.CreateTableReplacingPendingDrop instead of the ordinary
+// Catalog.CreateTable when this call is recreating a name whose collision
+// check was waived because it matched a same-transaction deferred DROP
+// (o.pendingDropShadow != nil — set by execCreateTable's existence check).
+// Shared by the direct CREATE TABLE path and execCreateTableAs (CTAS /
+// SELECT INTO), which is why the shadow is threaded through the ddlOp
+// receiver rather than a parameter. M0134-0023.
+func (o *ddlOp) createTableHonoringPendingDrop(name parser.ObjectName, cols []catalog.Column, dbOid uint32) (*catalog.Table, error) {
+	if o.pendingDropShadow != nil {
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			return im.CreateTableReplacingPendingDrop(name, cols, dbOid)
+		}
+	}
+	return o.ctx.Catalog.CreateTable(name, cols, dbOid)
+}
+
 func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) (retErr error) {
 	// Temporary tables may only be created in the temp schema (pg_temp),
 	// not in a permanent schema like public.
@@ -1763,6 +1789,24 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) (retErr error) {
 		checkName.Schema = "public"
 	}
 	if _, exists := o.ctx.Catalog.LookupTable(checkName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); exists {
+		// M0134-0023: a name this same session DROPped inside the current
+		// explicit transaction stays physically present in the shared catalog
+		// until COMMIT (deferred removal, see PendingTableDrop) so a concurrent
+		// session and ROLLBACK still see it — but it must be INVISIBLE to this
+		// session's own collision check here, mirroring PG's MVCC-snapshot
+		// collision check in heap_create_with_catalog (a same-txn-deleted tuple
+		// is invisible to the creator too). Not applied to CREATE TEMP TABLE:
+		// the deferred-drop bookkeeping is for permanent-table drops, and the
+		// TEMP TABLE shadow path below is the established mechanism for that
+		// name-collision shape.
+		if !s.Temporary {
+			if bsess, ok := o.ctx.Session.(*BasicSession); ok {
+				if pending := bsess.CancelPendingTableDropMatching(checkName); pending != nil {
+					o.pendingDropShadow = pending.Table
+					goto afterExistsCheck
+				}
+			}
+		}
 		if s.IfNotExists {
 			o.ctx.Notices = append(o.ctx.Notices,
 				fmt.Sprintf("relation %q already exists, skipping", s.Name.String()))
@@ -1802,6 +1846,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) (retErr error) {
 			return &ExecError{Code: "42P07", Pos: s.Pos(), Message: fmt.Sprintf("relation %q already exists", s.Name.String())}
 		}
 	}
+afterExistsCheck:
 
 	// CREATE TABLE child PARTITION OF parent FOR VALUES … (M0096-0007)
 	if s.PartitionOf != nil {
@@ -3421,7 +3466,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) (retErr error) {
 			return err
 		}
 	}
-	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+	tbl, err := o.createTableHonoringPendingDrop(s.Name, cols, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
 	}
@@ -3706,7 +3751,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) (retErr error) {
 	// Record for rollback before heap sync — if heap sync fails the catalog
 	// entry is already live and must be cleaned up on ROLLBACK.
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
-		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false})
+		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false, ShadowedTable: o.pendingDropShadow})
 	}
 	if catalogHeapSyncAvailable(o.ctx) {
 		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
@@ -4740,7 +4785,7 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 	}
 	if o.ctx.Pool == nil || o.ctx.Catalog == nil || o.ctx.TxnMgr == nil {
 		// No storage: create an empty table with no columns.
-		_, err := o.ctx.Catalog.CreateTable(s.Name, nil, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+		_, err := o.createTableHonoringPendingDrop(s.Name, nil, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if err != nil {
 			return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
 		}
@@ -4791,7 +4836,7 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 	if err != nil {
 		return err
 	}
-	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+	tbl, err := o.createTableHonoringPendingDrop(s.Name, cols, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
 	}
@@ -4814,7 +4859,7 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 		}
 	}
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
-		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false})
+		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false, ShadowedTable: o.pendingDropShadow})
 	}
 	if catalogHeapSyncAvailable(o.ctx) {
 		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
