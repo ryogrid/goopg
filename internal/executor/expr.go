@@ -1636,6 +1636,22 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int, ctx *Context) (Dat
 				right = newNumeric(m, int(s))
 			}
 		}
+		// interval * numeric/int/float and interval / numeric/int/float
+		// route through interval_mul / interval_div (timestamp.c) before
+		// the generic numeric path below, mirroring the established
+		// KindInterval && KindInterval arm for OpAdd/OpSub above. PG has
+		// no interval-modulo operator, so OpMod on an interval falls
+		// through to the int-only error below unchanged. M0134-0035.
+		if left.Kind == KindInterval && (op == parser.OpMul || op == parser.OpDiv) {
+			factor, ok := datumToFloat64(right)
+			if !ok {
+				return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator does not exist: interval %s %s", op, pgKindTypeName(right.Kind))}
+			}
+			if op == parser.OpMul {
+				return intervalMul(left, factor, pos)
+			}
+			return intervalDiv(left, factor, pos)
+		}
 		if left.Kind == KindNumeric || right.Kind == KindNumeric {
 			a, b, err := promoteToNumeric(left, right, op, pos)
 			if err != nil {
@@ -2282,6 +2298,222 @@ func finiteIntervalArith(left, right Datum, subtract bool, pos int) (Datum, erro
 	res := NewIntervalDatumFull(int32(months), int32(days), micros)
 	if res.IsIntervalNotFinite() {
 		// Finite arithmetic must never synthesise a ±infinity sentinel.
+		return Datum{}, intervalOutOfRange(pos)
+	}
+	return res, nil
+}
+
+// intervalDaysPerMonthF / intervalSecsPerDayF / intervalUsecsPerSecF mirror
+// upstream's DAYS_PER_MONTH / SECS_PER_DAY / USECS_PER_SEC (timestamp.h),
+// used only by the float-factor interval_mul / interval_div carry math below.
+const (
+	intervalDaysPerMonthF = 30.0
+	intervalSecsPerDayF   = 86400.0
+	intervalUsecsPerSecF  = 1000000.0
+)
+
+// tsround mirrors upstream's TSROUND macro (datatype/timestamp.h): round to
+// MAX_TIMESTAMP_PRECISION (6 fractional digits) using round-to-nearest,
+// ties-to-even (C's rint under the default rounding mode).
+func tsround(j float64) float64 {
+	return math.RoundToEven(j*1e6) / 1e6
+}
+
+// float8FitsInInt32 / float8FitsInInt64 mirror upstream's FLOAT8_FITS_IN_INT32
+// / FLOAT8_FITS_IN_INT64 macros (c.h): true iff the float, when truncated
+// toward zero, lands within the target integer's representable range.
+func float8FitsInInt32(f float64) bool {
+	return f >= float64(math.MinInt32) && f < -float64(math.MinInt32)
+}
+
+func float8FitsInInt64(f float64) bool {
+	return f >= float64(math.MinInt64) && f < -float64(math.MinInt64)
+}
+
+// intervalLinearSign returns the sign of the interval's linear span (months
+// widened to days at a fixed 30-day rate, plus days, plus the whole-day part
+// of the microsecond field; the sub-day remainder breaks a zero-days tie) —
+// mirroring interval_sign / interval_cmp_value (timestamp.c). Used only by
+// intervalMul's ±infinity-factor short-circuit; ordinary comparisons and
+// in_range go through the equivalent inline widening at expr.go's KindInterval
+// compare arm and operators_window.go respectively (established pattern).
+func intervalLinearSign(iv Datum) int {
+	days := int64(iv.IntervalMonthsValue())*30 + int64(iv.IntervalDaysValue()) + iv.IntervalMicrosValue()/usecsPerDay
+	frac := iv.IntervalMicrosValue() % usecsPerDay
+	switch {
+	case days != 0:
+		if days < 0 {
+			return -1
+		}
+		return 1
+	case frac < 0:
+		return -1
+	case frac > 0:
+		return 1
+	}
+	return 0
+}
+
+// addS32Overflow mirrors upstream's pg_add_s32_overflow: adds two int32s and
+// reports whether the true sum overflowed int32 range.
+func addS32Overflow(a, b int32) (int32, bool) {
+	r := int64(a) + int64(b)
+	if r > math.MaxInt32 || r < math.MinInt32 {
+		return 0, true
+	}
+	return int32(r), false
+}
+
+// intervalMul implements `interval * factor` (interval_mul,
+// postgres/src/backend/utils/adt/timestamp.c). Months and days are scaled by
+// the float8 factor and truncated toward zero for their whole-unit part; any
+// fractional whole-month remainder is cascaded into days (at a fixed 30-day
+// rate) and any fractional whole-day remainder is cascaded into the
+// microsecond time field (at a fixed 86400s day) — never cascading upward,
+// matching upstream's comment that the user must call justify_hours /
+// justify_days themselves. ±infinity/NaN factors and non-finite (±infinity
+// sentinel) spans are handled exactly as upstream. M0134-0035.
+func intervalMul(iv Datum, factor float64, pos int) (Datum, error) {
+	if math.IsNaN(factor) {
+		return Datum{}, intervalOutOfRange(pos)
+	}
+	if iv.IsIntervalNotFinite() {
+		if factor == 0.0 {
+			return Datum{}, intervalOutOfRange(pos)
+		}
+		if factor < 0.0 {
+			return negateInterval(iv, pos)
+		}
+		return iv, nil
+	}
+	if math.IsInf(factor, 0) {
+		sign := intervalLinearSign(iv)
+		if sign == 0 {
+			return Datum{}, intervalOutOfRange(pos)
+		}
+		if factor*float64(sign) < 0 {
+			return NewIntervalInfinity(false), nil
+		}
+		return NewIntervalInfinity(true), nil
+	}
+
+	origMonth := iv.IntervalMonthsValue()
+	origDay := iv.IntervalDaysValue()
+
+	resultMonthF := float64(origMonth) * factor
+	if math.IsNaN(resultMonthF) || !float8FitsInInt32(resultMonthF) {
+		return Datum{}, intervalOutOfRange(pos)
+	}
+	resultMonth := int32(resultMonthF)
+
+	resultDayF := float64(origDay) * factor
+	if math.IsNaN(resultDayF) || !float8FitsInInt32(resultDayF) {
+		return Datum{}, intervalOutOfRange(pos)
+	}
+	resultDay := int32(resultDayF)
+
+	// Fractional months cascade into days; the whole-day part of that
+	// cascade further folds into monthRemainderDays, and the leftover
+	// sub-day fraction (plus the days field's own fractional remainder)
+	// cascades into seconds.
+	monthRemainderDays := tsround((float64(origMonth)*factor - float64(resultMonth)) * intervalDaysPerMonthF)
+	secRemainder := tsround((float64(origDay)*factor - float64(resultDay) +
+		monthRemainderDays - float64(int64(monthRemainderDays))) * intervalSecsPerDayF)
+
+	// May have accumulated a full day (or more) of seconds via rounding or
+	// cascade from months/days.
+	if math.Abs(secRemainder) >= intervalSecsPerDayF {
+		carry := int32(secRemainder / intervalSecsPerDayF)
+		var overflow bool
+		resultDay, overflow = addS32Overflow(resultDay, carry)
+		if overflow {
+			return Datum{}, intervalOutOfRange(pos)
+		}
+		secRemainder -= float64(carry) * intervalSecsPerDayF
+	}
+
+	var overflow bool
+	resultDay, overflow = addS32Overflow(resultDay, int32(monthRemainderDays))
+	if overflow {
+		return Datum{}, intervalOutOfRange(pos)
+	}
+
+	resultTimeF := math.RoundToEven(float64(iv.IntervalMicrosValue())*factor + secRemainder*intervalUsecsPerSecF)
+	if math.IsNaN(resultTimeF) || !float8FitsInInt64(resultTimeF) {
+		return Datum{}, intervalOutOfRange(pos)
+	}
+
+	res := NewIntervalDatumFull(resultMonth, resultDay, int64(resultTimeF))
+	if res.IsIntervalNotFinite() {
+		return Datum{}, intervalOutOfRange(pos)
+	}
+	return res, nil
+}
+
+// intervalDiv implements `interval / factor` (interval_div,
+// postgres/src/backend/utils/adt/timestamp.c). Mirrors intervalMul's
+// month/day/time carry logic with division substituted for multiplication
+// (and a division_by_zero guard PG's interval_mul has no equivalent of,
+// since 0 is never a valid multiplier's reciprocal). M0134-0035.
+func intervalDiv(iv Datum, factor float64, pos int) (Datum, error) {
+	if factor == 0.0 {
+		return Datum{}, &ExecError{Code: "22012", Pos: pos, Message: "division by zero"}
+	}
+	if math.IsNaN(factor) {
+		return Datum{}, intervalOutOfRange(pos)
+	}
+	if iv.IsIntervalNotFinite() {
+		if math.IsInf(factor, 0) {
+			return Datum{}, intervalOutOfRange(pos)
+		}
+		if factor < 0.0 {
+			return negateInterval(iv, pos)
+		}
+		return iv, nil
+	}
+
+	origMonth := iv.IntervalMonthsValue()
+	origDay := iv.IntervalDaysValue()
+
+	resultMonthF := float64(origMonth) / factor
+	if math.IsNaN(resultMonthF) || !float8FitsInInt32(resultMonthF) {
+		return Datum{}, intervalOutOfRange(pos)
+	}
+	resultMonth := int32(resultMonthF)
+
+	resultDayF := float64(origDay) / factor
+	if math.IsNaN(resultDayF) || !float8FitsInInt32(resultDayF) {
+		return Datum{}, intervalOutOfRange(pos)
+	}
+	resultDay := int32(resultDayF)
+
+	monthRemainderDays := tsround((float64(origMonth)/factor - float64(resultMonth)) * intervalDaysPerMonthF)
+	secRemainder := tsround((float64(origDay)/factor - float64(resultDay) +
+		monthRemainderDays - float64(int64(monthRemainderDays))) * intervalSecsPerDayF)
+
+	if math.Abs(secRemainder) >= intervalSecsPerDayF {
+		carry := int32(secRemainder / intervalSecsPerDayF)
+		var overflow bool
+		resultDay, overflow = addS32Overflow(resultDay, carry)
+		if overflow {
+			return Datum{}, intervalOutOfRange(pos)
+		}
+		secRemainder -= float64(carry) * intervalSecsPerDayF
+	}
+
+	var overflow bool
+	resultDay, overflow = addS32Overflow(resultDay, int32(monthRemainderDays))
+	if overflow {
+		return Datum{}, intervalOutOfRange(pos)
+	}
+
+	resultTimeF := math.RoundToEven(float64(iv.IntervalMicrosValue())/factor + secRemainder*intervalUsecsPerSecF)
+	if math.IsNaN(resultTimeF) || !float8FitsInInt64(resultTimeF) {
+		return Datum{}, intervalOutOfRange(pos)
+	}
+
+	res := NewIntervalDatumFull(resultMonth, resultDay, int64(resultTimeF))
+	if res.IsIntervalNotFinite() {
 		return Datum{}, intervalOutOfRange(pos)
 	}
 	return res, nil

@@ -1417,6 +1417,15 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 				(x.Op == parser.OpAdd || x.Op == parser.OpSub) {
 				return catalog.Type{Name: "interval"}, nil
 			}
+			// interval * numeric/int/float and interval / numeric/int/float
+			// → interval (interval_mul / interval_div, timestamp.c). PG has
+			// no interval-modulo operator, so OpMod falls through to the
+			// numeric-operand error below unchanged. Executor: intervalMul /
+			// intervalDiv in internal/executor/expr.go. M0134-0035.
+			if strings.EqualFold(leftTyp.Name, "interval") && isNumericLike(rightTyp) &&
+				(x.Op == parser.OpMul || x.Op == parser.OpDiv) {
+				return catalog.Type{Name: "interval"}, nil
+			}
 			// date + integer → date (date_pli).  PG treats the integer as
 			// a day count; executor: addDateTimeInt in expr.go.
 			if strings.EqualFold(leftTyp.Name, "date") && isIntegerLike(rightTyp) && x.Op == parser.OpAdd {

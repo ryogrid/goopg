@@ -11764,6 +11764,14 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	if tsl, ok := e.(*TypedStringLit); ok {
 		return tsl.Type, exprType(e)
 	}
+	// IntervalLit `interval '1 day'` (SQL-standard `interval 'N' unit` syntax,
+	// resolved from parser.IntervalLit by resolveExpr above): column name is
+	// the type name "interval", same rule PostgreSQL's FigureColname()
+	// applies to any T_TypeCast whose arg is a bare Const (parse_target.c:
+	// FigureColnameInternal, case T_TypeCast). M0134-0035.
+	if _, ok := e.(*IntervalLit); ok {
+		return "interval", exprType(e)
+	}
 	// CastExpr `expr::type` or `CAST(expr AS type)`: use the type name as the
 	// column label for literal→type casts (e.g. 0::boolean → "bool").
 	// For column-ref casts (e.g. f1::int2), propagate the column's name.
@@ -12261,6 +12269,14 @@ func exprType(e Expr) catalog.Type {
 			}
 			if isPgLSN(rt.Name) && x.Op == parser.OpAdd {
 				return catalog.Type{Name: "pg_lsn"}
+			}
+			// interval * numeric/int/float and interval / numeric/int/float →
+			// interval (interval_mul / interval_div, timestamp.c). Must run
+			// before the numeric-dominance check below, which would otherwise
+			// misreport the wire TypeOID as numeric (right-aligning the
+			// interval text in psql instead of left-aligning it). M0134-0035.
+			if strings.EqualFold(lt.Name, "interval") && (x.Op == parser.OpMul || x.Op == parser.OpDiv) {
+				return catalog.Type{Name: "interval"}
 			}
 			if isFloat(lt.Name) || isFloat(rt.Name) {
 				// Wider float type wins.
