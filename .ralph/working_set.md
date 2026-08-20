@@ -1,64 +1,51 @@
-# Working set — M0134-0024 PARKED; INHERITS search_path fix shipped
+# Working set — M0134-0027 PARKED (copy.sql), legacy CSV/BINARY COPY fix shipped
 
-**Task:** M0134-0024 (`generated_virtual.sql`) — **PARKED** (case still FAILS).
-Design: `docs/design/m0134-0024-inherits-searchpath-lookup.md` (indexed). CSV row
-unchanged (`failed` -> `failed`), so **no `make regen-testport` this loop**.
+**Task:** M0134-0027 (`copy.sql`) — **PARKED** (case still FAILS; CSV row stays
+`failed`, no `make regen-testport`).
 
-**The method note that mattered (carry it) — now NINE loops running.** Round 1
-recommended the INSERT/UPDATE generated-column bucket and left the biggest
-cascade "unexplained". Interrogation did two things: it resolved an apparent
-self-contradiction in that recommendation (goopg EXCLUDES generated columns yet
-emits arity errors — all 18 turned out to pull the SAME direction), and it
-forced the unexplained bucket to be isolated **by live experiment**, which
-yielded a smaller, zero-landmine, higher-yield fix. Keep interrogating; it has
-now changed the work materially nine loops in a row.
+**Re-run at HEAD confirmed not stale:** 364 diff lines / 21 `^+ERROR` / 15
+`^-ERROR`. Also re-ran under the PG-parity env (`PGTZ`/`PGDATESTYLE`/
+`PGOPTIONS` intervalstyle/`LC_MESSAGES=C`, per the M0134-0026 harness-gap
+lesson) — **byte-identical to default**, so this case is NOT a harness false
+negative (recorded as a negative-result deferral row so this isn't re-checked).
 
-**The generalisable lesson — the bug in a case is often not ABOUT the case.**
-`generated_virtual.sql` is a generated-columns file, but its dominant cascade was
-a plain `search_path` bug in INHERITS parent lookup, reproducible with a table
-that has no generated columns at all. It only surfaced here because the file runs
-under a non-public schema. Sizing by *file topic* would have missed it entirely;
-sizing by *root cause, isolated experimentally* found it. Corollary reaffirmed:
-a plausible-looking site that has never executed is not evidence — the
-reproduction was required before the fix was accepted.
+**What shipped:** `validateCopyOptions` (`internal/optimizer/copy.go`) now
+accepts the legacy pre-9.0 bareword `COPY ... CSV` / `COPY ... BINARY` trail.
+The parser (`internal/parser/copy.go:311`, `parseCopyLegacyTrail`) already
+emitted `CopyOption{Name:"csv"/"binary", Bool:true}` and the executor already
+consumed that exact shape (`internal/executor/copy.go:24`,
+`copy_csv.go:46`) — only the optimizer's validator switch had no case for it,
+so every legacy-syntax COPY was rejected with `42601 option not recognized`
+before reaching either already-compatible end. Fix: two new switch cases
+sharing the `formatSpecified` guard with the existing `case "format"`, mirrors
+PG's grammar (`gram.y` `copy_opt_item`: BINARY/CSV both produce
+`makeDefElem("format", ...)`, so a real duplicate is caught by ONE guard).
+364 -> 334 diff lines (21 -> 19 `^+ERROR`). Unit test
+`TestPlanCopyLegacyTrailFormat` added in `internal/optimizer/copy_test.go`.
 
-**What shipped:** `internal/executor/operators_ddl.go:1931` (CREATE TABLE ...
-INHERITS) and `:9803` (ALTER TABLE ... INHERIT) now call the pre-existing
-`(o *ddlOp) lookupTableWithSearch` (M0097-0022, written for LOCK TABLE, never
-wired here) instead of the raw `Catalog.LookupTable`. Qualified names provably
-unaffected (helper tries the raw lookup first). PG oracle: `RangeVarGetRelid` in
-`DefineRelation`, `postgres/src/backend/commands/tablecmds.c:868`.
-Guard: `TestInheritsUnqualifiedParentHonoursSearchPath` — asserts inheritance
-**actually works** (child columns match parent; row inserted into child visible
-via the parent), not merely that the DDL stopped erroring.
+**Two deferral rows appended** (2026-08-20, M0134-0027): the ranked remaining
+bucket breakdown (file-based `COPY ... TO 'file'` unsupported ~35 lines is
+next-largest, then `HEADER MATCH` validation ~31, lone `\.` marker detection
+~16, `WHERE (...)` clause on COPY FROM file ~7, `COPY DEFAULT` option ~7, misc
+tail ~13) with resume points; and the negative PG-parity-env result.
 
-**Sizing:** 4438 lines / 114 `^+ERROR` / 102 `^-ERROR` at HEAD -> **4397 / 96 /
-102**. Case does NOT pass and is far from it.
+**Next step:** select **M0134-0028 (`horology.sql`)** — re-read the fix_plan
+banner first (sole ordering authority). CSV status is `failed`. Apply the
+standing rule: re-run `scripts/pg-regress-runner.sh --verbose horology` at
+HEAD FIRST (this is a datetime-heavy case — near-certain to need the
+PG-parity env per the M0134-0026 lesson; run BOTH ways and compare before
+sizing). Then interrogate the park verdict once, as always.
 
-**Three deferral rows appended** (2026-08-20, M0134-0024): ~25 sibling raw-
-`LookupTable` DDL sites in two classes (**do the SILENT-degradation class first**
-— ATTACH/DETACH PARTITION, identity-sequence heap sync, ALTER SEQUENCE lock,
-GRANT bookkeeping — it loses a guarantee with no visible error); Bucket 1
-(implicit INSERT/UPDATE target list excludes `GeneratedAlways`) with the proof
-that its two sites must move ATOMICALLY plus the non-trailing-column positional
-landmine; and `VIRTUAL` being silently treated as `STORED`.
+**Gates run:** `go build ./...` PASS; `go test ./internal/optimizer/...
+./internal/executor/...` PASS; `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh` PASS; `scripts/pg-regress-runner.sh
+--verbose copy` before/after 364->334 confirmed; pre-commit pgbench smoke PASS
+on both commits (375/691/12841 tps last run); `make ralph-state-guard`
+INCONSISTENT -> auto-REPAIRED -> OK (progress.json completed-marker was the
+prior loop's clean-exit marker, reconciled to in_progress; committed
+separately).
 
-**Next step:** select **M0134-0025 (`groupingsets.sql`)** — re-read the fix_plan
-banner first (sole ordering authority; its pointer was refreshed this loop). Its
-CSV status is `failed`, so apply the standing rule: re-run
-`scripts/pg-regress-runner.sh --verbose groupingsets` at HEAD FIRST and let the
-result decide whether the row is stale or gets sized into buckets with exact NET
-grep counts. Then interrogate the park verdict once, as always.
-
-**Gates run:** new guard test PASS (FAIL-pre proven via `git stash`:
-`42P01: relation "plain1" does not exist`); `go build ./...` + `go vet
-./internal/executor/...` clean; `go test ./internal/executor/...` PASS (6.7s);
-`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS
-(`internal/initdb` 427s cache-cold, not a regression signal);
-`scripts/tpch-spotcheck.sh` PASS with **Q12=2 / Q13=35** exactly.
-
-**Delegation:** `tmp/ralph-handoffs/M0134-0024a` (researcher, sizing + 1
-interrogation round, 2 rounds, DONE), `M0134-0024b` (implementer, 1 round, DONE
-— report persisted by me, the worker returned it in-message), `M0134-0024c`
-(tester, gates + re-measure, 1 round, DONE).
+**Delegation:** `tmp/ralph-handoffs/M0134-0027a` (researcher sizing, DONE;
+implementer, 1 round, DONE — report captured by coordinator, worker tool
+policy blocked its own report.md write again, same as M0134-0026b).
 **In-flight:** none.

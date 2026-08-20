@@ -471,7 +471,12 @@ func copyTextToDatum(t catalog.Type, raw []byte, timeZone string) (Datum, error)
 		// The column's own type decides whether a zone in the text is applied or
 		// thrown away (tsZoneMode): a COPY of '2020-01-02 02:00:00+05:30' into a
 		// date column is 2020-01-02 upstream, not the previous day.
-		ts, err := parseCopyTimestampZone(string(raw), tsZoneModeForType(t.Name))
+		//
+		// M0134-0026: a zone-less timestamptz value is read as local wall-clock
+		// time in the session TimeZone GUC, matching `COPY ... FROM` on real PG
+		// (DecodeDateTime, datetime.c:1573-1583) — timeZone is this function's
+		// own parameter, already threaded through for the OUTPUT side above.
+		ts, err := parseCopyTimestampZoneSession(string(raw), tsZoneModeForType(t.Name), timeZone)
 		if err != nil {
 			return Datum{}, err
 		}
@@ -912,6 +917,16 @@ var pgTimestampLayouts = []string{
 	"2006-01-02",
 }
 
+// layoutHasZoneField reports whether a pgTimestampLayouts entry decodes a zone
+// out of the input text (the "Z07*" elements) as opposed to leaving Go to
+// default the parsed Time's location to UTC. M0134-0026: this is how
+// parsePGTimestampTextParts tells applyTSZoneMode a "+00:00" literal (offset
+// present, zero-valued, Location ends up UTC too) apart from a genuinely
+// zone-less one — the two cannot be told apart from the parsed time.Time alone.
+func layoutHasZoneField(layout string) bool {
+	return strings.Contains(layout, "Z07")
+}
+
 // tsZoneMode says what a timestamp text-input path must do with a time zone
 // field it decoded out of the input, and it is NOT a stylistic choice: upstream
 // decodes the zone for every one of these types and then keeps it for exactly
@@ -972,15 +987,37 @@ func isTimestampTZTypeName(typeName string) bool {
 }
 
 // applyTSZoneMode turns the time.Parse result into the value the target type
-// stores. Go hands back the wall clock plus a fixed zone; tsApplyZone converts
-// to the UTC instant it denotes, tsDiscardZone re-reads the very same wall-clock
+// stores. Go hands back the wall clock plus a fixed zone when the matched
+// layout carried one (hasZone); tsApplyZone with hasZone converts to the UTC
+// instant that offset denotes, tsDiscardZone re-reads the very same wall-clock
 // fields as UTC, which is upstream's "tm2timestamp(tm, fsec, NULL, &result)".
-func applyTSZoneMode(ts time.Time, zone tsZoneMode) time.Time {
+// tsApplyZone WITHOUT hasZone — a zone-less timestamptz literal — is the one
+// case DecodeDateTime does neither of: M0134-0026. sessionZone is read only in
+// that branch; the returned bool reports whether it was (see
+// parsePGTimestampTextZoneSession for why callers that cache the result need
+// to know).
+func applyTSZoneMode(ts time.Time, zone tsZoneMode, sessionZone string, hasZone bool) (time.Time, bool) {
 	if zone == tsApplyZone {
-		return ts.UTC()
+		if !hasZone {
+			// M0134-0026: DecodeDateTime's "timezone not specified? then use
+			// session timezone" rule (postgres/src/backend/utils/adt/
+			// datetime.c:1573-1583). The wall clock is read as LOCAL time in
+			// the session TimeZone GUC and converted to the UTC instant it
+			// denotes — reusing the already-correct timestamp::timestamptz
+			// conversion (misc.TimestampToTimestampTZ, which also carries the
+			// PG-faithful DST tie-break) rather than a second, divergent
+			// implementation. usedSessionZone=true tells the caller the
+			// answer depends on the session and must not be cached across
+			// sessions.
+			return misc.TimestampToTimestampTZ(
+				time.Date(ts.Year(), ts.Month(), ts.Day(), ts.Hour(), ts.Minute(),
+					ts.Second(), ts.Nanosecond(), time.UTC),
+				sessionZone), true
+		}
+		return ts.UTC(), false
 	}
 	return time.Date(ts.Year(), ts.Month(), ts.Day(),
-		ts.Hour(), ts.Minute(), ts.Second(), ts.Nanosecond(), time.UTC)
+		ts.Hour(), ts.Minute(), ts.Second(), ts.Nanosecond(), time.UTC), false
 }
 
 // errNoTimestampLayout is parsePGTimestampText's "nothing matched" failure. It
@@ -1016,17 +1053,49 @@ func parsePGTimestampText(s string) (time.Time, error) {
 
 // parsePGTimestampTextZone is parsePGTimestampText with the target type's zone
 // rule made explicit. See tsZoneMode for why the rule is per-type.
+//
+// This is the UTC-session convenience form: callers that cannot reach the
+// session TimeZone GUC (or genuinely want the boot default) get it via the
+// empty sessionZone, matching this function's pre-M0134-0026 behavior
+// exactly. A caller that HAS a session must use parsePGTimestampTextZoneSession
+// instead — a zone-less timestamptz literal now depends on it (M0134-0026).
 func parsePGTimestampTextZone(s string, zone tsZoneMode) (time.Time, error) {
-	ts, dayCarry, err := parsePGTimestampTextParts(s, zone)
-	if err != nil {
-		return time.Time{}, err
-	}
-	ts = ts.AddDate(0, 0, dayCarry)
-	return ts, checkTimeCarrierRange(ts)
+	ts, _, err := parsePGTimestampTextZoneSession(s, zone, "")
+	return ts, err
 }
 
-// parsePGTimestampTextParts is parsePGTimestampTextZone with the whole-day carry
-// of an hour-24 / leap-second time of day left UNAPPLIED and returned instead.
+// parsePGTimestampTextParts is parsePGTimestampTextPartsSession with
+// sessionZone fixed at "" (UTC) and the usedSessionZone bool dropped — the
+// UTC-session convenience form kept for callers that cannot reach the session
+// TimeZone GUC. See parsePGTimestampTextPartsSession for the general form.
+func parsePGTimestampTextParts(s string, zone tsZoneMode) (time.Time, int, error) {
+	ts, carry, _, err := parsePGTimestampTextPartsSession(s, zone, "")
+	return ts, carry, err
+}
+
+// parsePGTimestampTextZoneSession is parsePGTimestampTextZone with the session
+// TimeZone GUC threaded through for the zone-less timestamptz branch
+// (DecodeDateTime's "timezone not specified? then use session timezone" rule,
+// postgres/src/backend/utils/adt/datetime.c:1573-1583). usedSessionZone
+// reports whether the session zone was actually consulted — true only when
+// zone==tsApplyZone and the literal carried no zone of its own. A caller that
+// caches the parsed result on a plan node (evalTypedStringLit's
+// x.CachedTime) MUST NOT do so when this is true: a different session with a
+// different TimeZone reusing that node would get the first session's answer.
+func parsePGTimestampTextZoneSession(s string, zone tsZoneMode, sessionZone string) (time.Time, bool, error) {
+	ts, dayCarry, usedSession, err := parsePGTimestampTextPartsSession(s, zone, sessionZone)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	ts = ts.AddDate(0, 0, dayCarry)
+	rangeErr := checkTimeCarrierRange(ts)
+	return ts, usedSession, rangeErr
+}
+
+// parsePGTimestampTextPartsSession is parsePGTimestampTextZone with the whole-day carry
+// of an hour-24 / leap-second time of day left UNAPPLIED and returned instead,
+// and the session TimeZone GUC (sessionZone) and whether it was consulted
+// (the bool result) threaded through — see parsePGTimestampTextZoneSession.
 //
 // The split mirrors upstream's: DecodeDateTime hands back a struct pg_tm whose
 // tm_hour may be 24 (or whose tm_sec may be 60), and it is tm2timestamp() — the
@@ -1034,7 +1103,7 @@ func parsePGTimestampTextZone(s string, zone tsZoneMode) (time.Time, error) {
 // turns that into the next day. date_in() never calls tm2timestamp, so it must
 // see the parts, not the composed value: '2020-01-01 24:00:00'::date is
 // 2020-01-01 even though the identical text as a timestamp is 2020-01-02 00:00:00.
-func parsePGTimestampTextParts(s string, zone tsZoneMode) (time.Time, int, error) {
+func parsePGTimestampTextPartsSession(s string, zone tsZoneMode, sessionZone string) (time.Time, int, bool, error) {
 	body, bc := datetime.SplitEra(s)
 	// M0125-0007: PG decodes date/time fields one numeric run at a time, so an
 	// unpadded month, day, hour, minute or second is legal input. Normalise
@@ -1059,7 +1128,7 @@ func parsePGTimestampTextParts(s string, zone tsZoneMode) (time.Time, int, error
 	// error, not a spelling the layouts should get a second go at.
 	canon, canonCarry, canonErr := canonicalizeTimestampTimeToken(body)
 	if errors.Is(canonErr, datetime.ErrTimeFieldOverflow) {
-		return time.Time{}, 0, datetime.ErrFieldOutOfRange
+		return time.Time{}, 0, false, datetime.ErrFieldOutOfRange
 	}
 	// M0119-0006: a month/day ValidateDate() would reject ('20201301',
 	// '2020-13-01') matches no layout below and previously fell through to the
@@ -1068,7 +1137,7 @@ func parsePGTimestampTextParts(s string, zone tsZoneMode) (time.Time, int, error
 	// token is the same for both candidates (only the time token differs), so
 	// one check ahead of the loop covers it.
 	if err := validateDateTokenFull(dateTokenPrefix(body), bc); err != nil {
-		return time.Time{}, 0, err
+		return time.Time{}, 0, false, err
 	}
 	cands := [2]struct {
 		text  string
@@ -1080,11 +1149,12 @@ func parsePGTimestampTextParts(s string, zone tsZoneMode) (time.Time, int, error
 		}
 		for _, layout := range pgTimestampLayouts {
 			if ts, err := time.Parse(layout, cand.text); err == nil {
-				ts, err := datetime.ApplyEra(applyTSZoneMode(ts, zone), bc)
+				adjusted, usedSession := applyTSZoneMode(ts, zone, sessionZone, layoutHasZoneField(layout))
+				adjusted, err := datetime.ApplyEra(adjusted, bc)
 				if err != nil {
-					return time.Time{}, 0, err
+					return time.Time{}, 0, false, err
 				}
-				return ts, cand.carry, nil
+				return adjusted, cand.carry, usedSession, nil
 			}
 		}
 		// M0119-0006 §15.2: the TIMESTAMP half of the BC leap-day race the
@@ -1096,11 +1166,11 @@ func parsePGTimestampTextParts(s string, zone tsZoneMode) (time.Time, int, error
 		// where PG answers a field-range error. Try the proxy-year rebuild
 		// before giving up on this candidate, so the hour-24 / leap-second
 		// canonical candidate still gets its own turn afterwards.
-		if ts, ok := bcLeapTimestampFallback(cand.text, bc, zone); ok {
-			return ts, cand.carry, nil
+		if ts, usedSession, ok := bcLeapTimestampFallback(cand.text, bc, zone, sessionZone); ok {
+			return ts, cand.carry, usedSession, nil
 		}
 	}
-	return time.Time{}, 0, errNoTimestampLayout
+	return time.Time{}, 0, false, errNoTimestampLayout
 }
 
 // bcLeapProxyYear is the year bcLeapTimestampFallback substitutes into the date
@@ -1132,19 +1202,19 @@ const bcLeapProxyYear = 2000
 // whose fields do not read back, the no-year-zero refusal, and any candidate
 // the proxy rebuild still fails to parse — all of which keep the caller's
 // existing errNoTimestampLayout.
-func bcLeapTimestampFallback(text string, bc bool, zone tsZoneMode) (time.Time, bool) {
+func bcLeapTimestampFallback(text string, bc bool, zone tsZoneMode, sessionZone string) (time.Time, bool, bool) {
 	if !bc {
-		return time.Time{}, false
+		return time.Time{}, false, false
 	}
 	dateTok := dateTokenPrefix(text)
 	month, day, mdok := datetime.DateTokenMonthDay(dateTok)
 	year, yok := datetime.DateTokenYear(dateTok)
 	if !mdok || !yok {
-		return time.Time{}, false
+		return time.Time{}, false, false
 	}
 	astroYear, ok := datetime.AstronomicalYear(year, bc)
 	if !ok {
-		return time.Time{}, false
+		return time.Time{}, false, false
 	}
 	probe := fmt.Sprintf("%04d-%02d-%02d", bcLeapProxyYear, month, day) + text[len(dateTok):]
 	for _, layout := range pgTimestampLayouts {
@@ -1152,14 +1222,14 @@ func bcLeapTimestampFallback(text string, bc bool, zone tsZoneMode) (time.Time, 
 		if err != nil {
 			continue
 		}
-		ts = applyTSZoneMode(ts, zone)
+		ts, usedSession := applyTSZoneMode(ts, zone, sessionZone, layoutHasZoneField(layout))
 		dayShift := int(time.Date(ts.Year(), ts.Month(), ts.Day(), 0, 0, 0, 0, time.UTC).
 			Sub(time.Date(bcLeapProxyYear, time.Month(month), day, 0, 0, 0, 0, time.UTC)).Hours() / 24)
 		return time.Date(astroYear, time.Month(month), day,
 			ts.Hour(), ts.Minute(), ts.Second(), ts.Nanosecond(), time.UTC).
-			AddDate(0, 0, dayShift), true
+			AddDate(0, 0, dayShift), usedSession, true
 	}
-	return time.Time{}, false
+	return time.Time{}, false, false
 }
 
 // dateTokenPrefix returns the leading date token of a normalized "date<sep>
@@ -1352,7 +1422,7 @@ func validateDateTokenFull(dateToken string, bc bool) error {
 // The returned value still carries the decoded wall clock; callers truncate it
 // to midnight as they already did.
 func parseDateInputText(s string) (time.Time, error) {
-	ts, _, err := parseCopyTimestampZoneParts(s, tsDiscardZone)
+	ts, _, err := parseCopyTimestampZoneParts(s, tsDiscardZone, "")
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -1371,7 +1441,14 @@ func parseCopyTimestamp(s string) (time.Time, error) {
 // parseCopyTimestampZone is parseCopyTimestamp with the target type's zone rule
 // made explicit.
 func parseCopyTimestampZone(s string, zone tsZoneMode) (time.Time, error) {
-	ts, dayCarry, err := parseCopyTimestampZoneParts(s, zone)
+	return parseCopyTimestampZoneSession(s, zone, "")
+}
+
+// parseCopyTimestampZoneSession is parseCopyTimestampZone with the session
+// TimeZone GUC threaded through — see parsePGTimestampTextZoneSession, whose
+// caching caveat does not apply here: nothing on this path caches its result.
+func parseCopyTimestampZoneSession(s string, zone tsZoneMode, sessionZone string) (time.Time, error) {
+	ts, dayCarry, err := parseCopyTimestampZoneParts(s, zone, sessionZone)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -1381,8 +1458,8 @@ func parseCopyTimestampZone(s string, zone tsZoneMode) (time.Time, error) {
 
 // parseCopyTimestampZoneParts is parseCopyTimestampZone with the whole-day carry
 // left unapplied; see parsePGTimestampTextParts for why date_in needs it that way.
-func parseCopyTimestampZoneParts(s string, zone tsZoneMode) (time.Time, int, error) {
-	ts, dayCarry, err := parsePGTimestampTextParts(s, zone)
+func parseCopyTimestampZoneParts(s string, zone tsZoneMode, sessionZone string) (time.Time, int, error) {
+	ts, dayCarry, _, err := parsePGTimestampTextPartsSession(s, zone, sessionZone)
 	if err == nil {
 		return ts, dayCarry, nil
 	}
@@ -1393,7 +1470,13 @@ func parseCopyTimestampZoneParts(s string, zone tsZoneMode) (time.Time, int, err
 		return time.Time{}, 0, err
 	}
 	// Try verbose natural-language format used by PostgreSQL's datetime output
-	// e.g. "Tuesday, February 22, 2022 2:22:22.00 PM GMT+05:00".
+	// e.g. "Tuesday, February 22, 2022 2:22:22.00 PM GMT+05:00". M0134-0026:
+	// this fallback has its own small layout table (parseFullTimestamp) with
+	// zone-less spellings of its own that still anchor to UTC rather than the
+	// session zone — a real but low-yield gap this slice did not close (out of
+	// scope: it is not part of pgTimestampLayouts / the shared root, and this
+	// verbose spelling is rarely, if ever, used as INPUT rather than OUTPUT).
+	// See the M0134-0026b report's PG-semantics discoveries.
 	if ts, err := parseFullTimestamp(datetime.NormalizeDateTimeInput(s, false)); err == nil {
 		return ts, 0, nil
 	}

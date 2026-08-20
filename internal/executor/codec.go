@@ -264,9 +264,13 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 
 // encodeValuePGCtx is the ctx+pos-carrying sibling of encodeValuePG (see
 // EncodeRowPGCtx for why): a reg*[] element resolves its name→OID through the
-// session catalog (regIdentifierInput). The no-ctx wrapper (nil ctx, pos 0) is
-// what the non-writer callers (tests, toast chunk rows, index keys, catalog
-// heap tuples) use. M0119-0006 reg* element slice.
+// session catalog (regIdentifierInput), and (M0134-0026 round 2) a zone-less
+// timestamptz string resolves the session TimeZone GUC the same way. The
+// no-ctx wrapper (nil ctx, pos 0) is what the non-writer callers (tests,
+// toast chunk rows, index keys, catalog heap tuples) use; both ctx-consuming
+// arms fall back to their pre-ctx behaviour (no reg* qualification / UTC
+// session) when ctx is nil, so this remains safe. M0119-0006 reg* element
+// slice.
 func encodeValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]byte, error) {
 	// A user array column (e.g. `p int4[]`) carries Type.Name="int4" plus
 	// Type.IsArray=true; its value is the array text "{1,2}". Encode it as a
@@ -415,7 +419,30 @@ func encodeValuePGCtx(t catalog.Type, d Datum, ctx *Context, pos int) ([]byte, e
 			} else {
 				// A zone in the text belongs to the value only for timestamptz;
 				// `timestamp` decodes and discards it (tsZoneMode).
-				ts, err := parseCopyTimestampZone(d.StringValue(), tsZoneModeForType(t.Name))
+				//
+				// M0134-0026 EXTENSION (round 2, coordinator-authorised): a
+				// zone-less timestamptz reads as local wall-clock time in the
+				// SESSION TimeZone GUC and converts to UTC (DecodeDateTime,
+				// postgres/src/backend/utils/adt/datetime.c:1573-1583), exactly
+				// as the typed-literal (evalTypedStringLit) and CAST (evalCast)
+				// paths were fixed in round 1. Without this, goopg was
+				// internally INCONSISTENT: `INSERT INTO t(tstz) VALUES
+				// ('2006-08-13 12:34:56')` (reaches this arm) stored a
+				// different instant than `... VALUES ('2006-08-13
+				// 12:34:56'::timestamptz)` (reaches evalCast) — worse than
+				// uniformly wrong. timeZoneFromCtx(ctx) is nil-ctx-safe (falls
+				// back to "" = UTC, matching the pre-extension behaviour
+				// exactly): several callers of encodeValuePGCtx pass a nil ctx
+				// (EncodeRowPG's toast.go/sys_pg_sequence.go/
+				// sys_pg_database.go/operators_vacuum_datfrozenxid.go chunk and
+				// catalog-row encoders, all of internal/initdb's bootstrap row
+				// encoders) — none of those are user INSERT/UPDATE paths and
+				// none carry a KindString timestamptz value through this arm in
+				// practice, but the fallback keeps them behaviourally identical
+				// either way. The real INSERT/UPDATE row encoder
+				// (operators_storage.go's EncodeRowPGCtx call sites) DOES pass
+				// a live session ctx.
+				ts, err := parseCopyTimestampZoneSession(d.StringValue(), tsZoneModeForType(t.Name), timeZoneFromCtx(ctx))
 				if err != nil {
 					return nil, &ExecError{Code: "22007", Pos: 0, Message: fmt.Sprintf("invalid input syntax for type timestamp: %q", d.StringValue())}
 				}
