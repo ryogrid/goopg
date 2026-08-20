@@ -692,6 +692,20 @@ func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos in
 		defer op.Close()
 		var out []Datum
 		retType := normalizeCatalogType(r.ReturnType)
+		// A SETOF <composite-table-type> function's body yields one row per
+		// output tuple with N columns (N = the composite's arity), not a
+		// single pre-packed composite Datum — e.g. `RETURNS SETOF rngfunc2`
+		// with a body of `SELECT * FROM rngfunc2 ...` produces 2-column
+		// rows. Serialize each such row into composite text notation so the
+		// caller (userSrfScanOp.Next, decomposeCompositeText) can decompose
+		// it back into individual columns, matching the OUT-parameter /
+		// non-SETOF composite convention elsewhere in this file
+		// (rowToCompositeText). Before this fix only row[0] was kept,
+		// silently dropping every column past the first. M0134-0059.
+		var compositeCols []catalog.Column
+		if compTbl, ok := ctxPlanCatalog(child).LookupTable(parser.ObjectName{Name: strings.ToLower(r.ReturnType.Name)}); ok && len(compTbl.Columns) > 0 {
+			compositeCols = compTbl.Columns
+		}
 		for {
 			slot, nextErr := op.Next()
 			if nextErr == EOF {
@@ -703,6 +717,10 @@ func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos in
 			row := slotRow(slot)
 			if len(row) == 0 {
 				out = append(out, NullDatum)
+				continue
+			}
+			if compositeCols != nil && len(row) > 1 {
+				out = append(out, NewStringDatum(rowToCompositeText(compositeCols, row)))
 				continue
 			}
 			coerced, err := coerceDatumToType(row[0], retType, pos, fmt.Sprintf("return value of function %s", r.QualifiedName()))
