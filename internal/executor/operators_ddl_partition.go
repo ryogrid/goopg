@@ -6,6 +6,7 @@ package executor
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -1018,9 +1019,15 @@ func parseBoundValue(e parser.Expr) (val int64, isMin bool, isMax bool, ok bool)
 			}
 		}
 	case *parser.StringConst:
-		var n int64
-		_, err := fmt.Sscanf(v.Value, "%d", &n)
-		if err == nil {
+		// Only succeed when the ENTIRE string is a valid integer — a naive
+		// fmt.Sscanf("%d") would silently accept a numeric-looking PREFIX
+		// (e.g. "2016-07-01" -> 2016) and discard the rest, corrupting
+		// order comparisons between date-like string bounds. Real PG
+		// compares bounds via the partition key's typed operators
+		// (partbounds.c check_new_partition_bound); this int-only fast
+		// path must reject what it cannot handle instead of mis-parsing
+		// it. M0134-0029.
+		if n, err := strconv.ParseInt(v.Value, 10, 64); err == nil {
 			return n, false, false, true
 		}
 		switch strings.ToLower(v.Value) {
