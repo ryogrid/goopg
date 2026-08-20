@@ -72,6 +72,10 @@ const (
 	// JSON accessor operators (M0118-0009, horizons enabler)
 	OpJSONGet     // a -> b   (json array element / object field, returns json)
 	OpJSONGetText // a ->> b  (json array element / object field as text)
+
+	// JSON path-extraction operators (M0134-0039)
+	OpJSONPathGet     // a #> b   (json value at path, returns json)
+	OpJSONPathGetText // a #>> b  (json value at path, returns text)
 )
 
 // ParseUnaryOp converts the token text the parser emits
@@ -162,6 +166,10 @@ func ParseBinaryOp(s string) OpCode {
 		return OpJSONGet
 	case "->>":
 		return OpJSONGetText
+	case "#>":
+		return OpJSONPathGet
+	case "#>>":
+		return OpJSONPathGetText
 	}
 	return OpUnknown
 }
@@ -247,6 +255,10 @@ func (o OpCode) String() string {
 		return "->"
 	case OpJSONGetText:
 		return "->>"
+	case OpJSONPathGet:
+		return "#>"
+	case OpJSONPathGetText:
+		return "#>>"
 	}
 	return "<unknown>"
 }

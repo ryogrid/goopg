@@ -2861,6 +2861,10 @@ func (p *parser) peekBinaryOp() (OpCode, int, bool) {
 			return OpJSONGet, precJSON, true
 		case "->>":
 			return OpJSONGetText, precJSON, true
+		case "#>":
+			return OpJSONPathGet, precJSON, true
+		case "#>>":
+			return OpJSONPathGetText, precJSON, true
 		}
 	case TokenSymbol:
 		// '*' is also a symbol token (target-list wildcard) — but in

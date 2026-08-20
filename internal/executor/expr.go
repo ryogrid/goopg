@@ -1864,6 +1864,10 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int, ctx *Context) (Dat
 		// goopg carries json/jsonb as KindString; NULL operands already
 		// returned NullDatum above. M0118-0009 (horizons enabler).
 		return evalJSONArrow(op, left, right, pos)
+	case parser.OpJSONPathGet, parser.OpJSONPathGetText:
+		// json/jsonb #> text[]  →  value at path (json), and #>> → text.
+		// M0134-0039.
+		return evalJSONPathGet(op, left, right, pos)
 	}
 	return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("unknown operator %s", op)}
 }
@@ -1939,6 +1943,62 @@ func evalJSONArrow(op parser.OpCode, left, right Datum, pos int) (Datum, error) 
 	}
 	// -> : return the element re-encoded as JSON (a JSON null → the text
 	// "null"). Shared with json_extract_path/jsonb_extract_path.
+	return jsonElemAsJSONDatum(elem), nil
+}
+
+// evalJSONPathGet evaluates the JSON path-extraction operators #> and #>>.
+//
+//	json #> text[]   → value at path (json)
+//	json #>> text[]  → value at path (text)
+//
+// Operator aliases for jsonb_extract_path(jsonb, text[]) /
+// jsonb_extract_path_text(jsonb, text[]) per
+// postgres/src/include/catalog/pg_operator.dat; PG oracle:
+// postgres/src/backend/utils/adt/jsonfuncs.c get_path_all. The left operand
+// is decoded exactly like evalJSONArrow (22P02 on invalid JSON); the right
+// operand is a text[] path, walked left-to-right via the existing
+// jsonPathStep helper (shared with json[b]_extract_path[_text], M0134-0037).
+// A path element that doesn't resolve yields SQL NULL immediately. An empty
+// path array is the identity (returns the original document unchanged).
+func evalJSONPathGet(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
+	ls, ok := datumAsString(left)
+	if !ok {
+		return Datum{}, &ExecError{Code: "42883", Pos: pos,
+			Message: fmt.Sprintf("operator %s requires a json left operand", op)}
+	}
+	dec := json.NewDecoder(strings.NewReader(ls))
+	dec.UseNumber()
+	var doc any
+	if err := dec.Decode(&doc); err != nil {
+		return Datum{}, &ExecError{Code: "22P02", Pos: pos,
+			Message: "invalid input syntax for type json"}
+	}
+
+	switch right.Kind {
+	case KindString, KindBytes:
+	default:
+		return Datum{}, &ExecError{Code: "42883", Pos: pos,
+			Message: fmt.Sprintf("operator %s requires a text[] path operand", op)}
+	}
+	rs, ok := datumAsString(right)
+	if !ok {
+		return Datum{}, &ExecError{Code: "42883", Pos: pos,
+			Message: fmt.Sprintf("operator %s requires a text[] path operand", op)}
+	}
+	path := parseTextArray(rs)
+
+	var elem any = doc
+	for _, key := range path {
+		v, found := jsonPathStep(elem, key)
+		if !found {
+			return NullDatum, nil
+		}
+		elem = v
+	}
+
+	if op == parser.OpJSONPathGetText {
+		return jsonElemAsTextDatum(elem), nil
+	}
 	return jsonElemAsJSONDatum(elem), nil
 }
 

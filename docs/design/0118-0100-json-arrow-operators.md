@@ -1,7 +1,8 @@
-# 0118-0100 — JSON accessor operators `->` and `->>` (M0118-0009, horizons enabler)
+# 0118-0100 — JSON accessor operators `->`, `->>`, `#>`, `#>>` (M0118-0009, M0134-0039)
 
 Status: accepted
-Milestone: M0118 (Upstream Isolation Spec Suite Pass-Through), task M0118-0009
+Milestone: M0118 (Upstream Isolation Spec Suite Pass-Through), task M0118-0009;
+extended by M0134-0039 (jsonb.sql sizing) for `#>`/`#>>`
 Spec advanced (NOT promoted): `postgres/src/test/isolation/specs/horizons.spec`
 Tests: `internal/executor/json_arrow_test.go`, `internal/parser/json_arrow_test.go`
 
@@ -73,8 +74,49 @@ operand is a json-typed string:
   (text) type is normalized jsonb-style. The *scalar* surface form is identical
   to PG; only object/array key-order fidelity differs. horizons extracts a scalar
   integer, so this does not affect it.
-- `#>` / `#>>` (path operators) and the json containment/existence operators are
-  out of scope; horizons needs only `->`.
+- The json containment/existence operators (`@>`/`<@` on jsonb, `?`/`?|`/`?&`)
+  and the jsonpath match operators (`@@`/`@?`) remain out of scope — none is
+  a mechanical mirror of `->`, each needs its own evaluator semantics
+  (`@>`/`<@` needs recursive `JsonbDeepContains`-style deep-containment logic;
+  `?`-family needs an "existence" evaluator; `@@`/`@?` need a jsonpath
+  parser). Sized during M0134-0039 (jsonb.sql), ledgered separately.
+
+## `#>` / `#>>` path-extraction operators (M0134-0039)
+
+Added while sizing `jsonb.sql` (M0134): the case's diff had 38 `^+ERROR` lines
+from `#>`/`#>>` lexing as `#` then `>` (a bare `#` is already a lexable
+single-char operator token, so `col#>array['a']` tokenized as two operators and
+blew up in the parser). PG oracle: `postgres/src/backend/utils/adt/jsonfuncs.c`
+`jsonb_extract_path`/`jsonb_extract_path_text` (`#>`/`#>>` are operator aliases
+for the same `get_path_all` walk as the function forms, see
+`postgres/src/backend/utils/adt/jsonpath_gram.y`... functionally:
+`postgres/src/include/catalog/pg_operator.dat` entries for `#>`/`#>>` map
+straight to `jsonb_extract_path(jsonb, text[])` /
+`jsonb_extract_path_text(jsonb, text[])`).
+
+Mechanism (mirrors `->`/`->>` exactly, one precedence/associativity level
+lower is NOT needed — PG gives `#>`/`#>>` the same "other operator" precedence
+class as `->`/`->>`, `postgres/src/include/parser/gram.y` operator precedence
+table, both in the unnamed op-class bucket):
+
+1. **Lexer** (`internal/parser/lexer.go`) — `#>` joins the two-char greedy
+   set (alongside `->`), and `#>` followed by a further `>` promotes to the
+   three-char token `#>>`, mirroring the existing `->`/`->>` 3-char bump.
+2. **OpCode** (`internal/parser/op.go`) — new `OpJSONPathGet` /
+   `OpJSONPathGetText`, wired into `ParseBinaryOp` and `String()`.
+3. **Precedence** (`internal/parser/select.go`) — both map to `precJSON`
+   (same bucket as `->`/`->>`), left-associative.
+4. **Evaluator** (`internal/executor/expr.go`) — the right operand is a text
+   array literal (`array['a','0']` or `'{a,0}'::text[]` — goopg carries
+   arrays as text, see `isArrayLiteralText`/array-literal parsing already
+   used by the box/array `@>`/`<@`/`&&` operators in the same function). The
+   evaluator decodes the left json/jsonb text once, then walks the path
+   left-to-right reusing `jsonPathStep` (already shared by
+   `json[b]_extract_path[_text]`, M0134-0037) for each path element. Final
+   result rendering reuses `jsonElemAsJSONDatum` (`#>`) /
+   `jsonElemAsTextDatum` (`#>>`) — the exact same tail as `->`/`->>` and the
+   `extract_path` builtins. Any path element that doesn't resolve (per
+   `jsonPathStep`'s existing not-found rules) yields SQL NULL, matching PG.
 
 ## Remaining horizons blockers (spec stays deferred)
 

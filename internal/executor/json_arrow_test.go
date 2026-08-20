@@ -105,6 +105,72 @@ func TestJSONArrowChained(t *testing.T) {
 	}
 }
 
+// TestJSONPathGetOperators pins the json path-extraction operators #> and
+// #>> (M0134-0039), the operator-form siblings of json_extract_path[_text].
+// The right operand is a text[] path, carried the same way goopg carries any
+// array Datum: text in PG's array-literal form "{elem1,elem2,...}".
+func TestJSONPathGetOperators(t *testing.T) {
+	jdat := func(s string) Datum { return NewStringDatum(s) }
+
+	cases := []struct {
+		name     string
+		op       parser.OpCode
+		left     Datum
+		right    Datum
+		want     string
+		wantNull bool
+	}{
+		// 2+ level object path
+		{"path-object-2deep", parser.OpJSONPathGet, jdat(`{"a":{"b":1}}`), jdat("{a,b}"), "1", false},
+		// array-index path element
+		{"path-array-index", parser.OpJSONPathGet, jdat(`{"a":{"b":[1,2,3]}}`), jdat("{a,b,1}"), "2", false},
+		// missing path → NULL
+		{"path-missing", parser.OpJSONPathGet, jdat(`{"a":1}`), jdat("{x}"), "", true},
+		// empty path array → identity (whole document, unchanged)
+		{"path-empty", parser.OpJSONPathGet, jdat(`{"a":1}`), jdat("{}"), `{"a":1}`, false},
+		// #>> scalar as text
+		{"pathtext-scalar", parser.OpJSONPathGetText, jdat(`{"a":1}`), jdat("{x}"), "", true},
+		{"pathtext-found-scalar", parser.OpJSONPathGetText, jdat(`{"a":{"b":"x"}}`), jdat("{a,b}"), "x", false},
+		// #>> on a nested object/array → compact json text
+		{"pathtext-nested-object", parser.OpJSONPathGetText, jdat(`{"a":{"b":{"c":1}}}`), jdat("{a,b}"), `{"c":1}`, false},
+		{"pathtext-nested-array", parser.OpJSONPathGetText, jdat(`{"a":[1,2,3]}`), jdat("{a}"), `[1,2,3]`, false},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := evalBinary(c.op, c.left, c.right, 0, nil)
+			if err != nil {
+				t.Fatalf("evalBinary: %v", err)
+			}
+			if c.wantNull {
+				if !got.IsNull() {
+					t.Fatalf("got %+v, want NULL", got)
+				}
+				return
+			}
+			if got.IsNull() {
+				t.Fatalf("got NULL, want %q", c.want)
+			}
+			if got.StringValue() != c.want {
+				t.Fatalf("got %q, want %q", got.StringValue(), c.want)
+			}
+		})
+	}
+}
+
+// TestJSONPathGetInvalidJSON pins the 22P02 error for a non-JSON left
+// operand, mirroring TestJSONArrowInvalidJSON.
+func TestJSONPathGetInvalidJSON(t *testing.T) {
+	_, err := evalBinary(parser.OpJSONPathGet, NewStringDatum("not json"), NewStringDatum("{a}"), 0, nil)
+	if err == nil {
+		t.Fatal("expected error for invalid json, got nil")
+	}
+	ee, ok := err.(*ExecError)
+	if !ok || ee.Code != "22P02" {
+		t.Fatalf("got %v, want ExecError 22P02", err)
+	}
+}
+
 // TestJsonExtractPath pins json_extract_path/json_extract_path_text/
 // jsonb_extract_path/jsonb_extract_path_text — the VARIADIC text[] path-array
 // siblings of -> / ->> (M0134-0037). Oracle:
