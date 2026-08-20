@@ -146,6 +146,39 @@ goopg is an ongoing experiment; the current state in brief:
 
 ---
 
+## PostgreSQL Test Coverage
+
+goopg tracks its compatibility against upstream PostgreSQL 18.3 by porting
+that release's own test suites and running them against goopg instead of
+real PG. The live, generated snapshot of this coverage — current pass/fail
+counts per suite — is
+[`docs/test-port/postgres-oracle-target-inventory.md`](docs/test-port/postgres-oracle-target-inventory.md),
+rendered from the authoritative per-case CSV
+[`docs/test-port/postgres-oracle-target-inventory.csv`](docs/test-port/postgres-oracle-target-inventory.csv)
+(schema and status vocabulary in
+[`docs/test-port/README.md`](docs/test-port/README.md)). Each row there is an
+individual upstream test case, grouped by a `suite_id` naming which upstream
+suite it came from:
+
+| `suite_id` | What it covers |
+| --- | --- |
+| `regress-sql` | `postgres/src/test/regress/sql/*.sql` — the core SQL-level regression suite (`pg_regress`): one case per script, exercising a feature area end to end (types, joins, DDL, functions, …). This is the primary correctness suite and the largest single bucket. |
+| `regress-expected` | `postgres/src/test/regress/expected/*.out` — the expected-output files pg_regress diffs against. Most cases have exactly one `.sql`/`.out` pair, so their outcome is tracked once under `regress-sql`; this bucket holds only the upstream *alternate-output* variants that have no `.sql` of their own (pg_regress picks between them by platform/encoding/collation, e.g. `char_1.out`, `xml_2.out`, `collate.icu.utf8_1.out`). |
+| `isolation-specs` | `postgres/src/test/isolation/specs/*.spec` — the multi-session isolation-tester suite: concurrent-session interleaving specs that exercise MVCC, locking, and serializability behavior. |
+| `recovery-tap` | `postgres/src/test/recovery/t/*.pl` — TAP tests for crash recovery, WAL replay, and physical (streaming) replication. |
+| `subscription-tap` | `postgres/src/test/subscription/t/*.pl` — TAP tests for logical replication (`CREATE SUBSCRIPTION`/`CREATE PUBLICATION`, `pgoutput`). |
+| `client-tools-tap` | `postgres/src/bin/*/t/*.pl` — TAP tests for the client-side tools themselves (`psql`, `pg_dump`, `pg_basebackup`, `initdb`, …) run against a goopg server. |
+| `modules-suites` | `postgres/src/test/modules/*` — the in-tree PostgreSQL test/extension modules (each a feature-focused mini test suite). |
+| `contrib-suites` | `postgres/contrib/*` — the bundled contrib extensions' own test suites (each contrib module ships its own regress-style tests). |
+
+A case's `status` (`pass` / `failed` / `not-tried` / `port` / `defer` /
+`excluded`) and whether it is part of the must-pass set (`pass_required`) are
+also defined in `docs/test-port/README.md`; the generated inventory doc is
+regenerated with `make regen-testport` whenever the CSV changes, so it never
+drifts from the authoritative data.
+
+---
+
 ## Quickstart
 
 The lifecycle below — build, init, start, connect with psql, stop, drop —
