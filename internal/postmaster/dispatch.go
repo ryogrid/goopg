@@ -3723,16 +3723,19 @@ func (s *Server) executeFetch(_ context.Context, w *libpq.FrameWriter, ectx *exe
 
 	// Determine which rows to emit based on direction and position.
 	//
-	// Cursor position model (PostgreSQL semantics, M0097-0042):
+	// Cursor position model (PostgreSQL semantics, M0097-0042, corrected by M0134-0056):
 	//   pos=0       = BOF (before first row)
 	//   pos=1..N    = AT row k; next FORWARD returns rows[k..], next BACKWARD returns rows[k-1]
 	//   pos=N+1     = EOF (past last row); FORWARD returns nothing
 	//
 	// FETCH FORWARD n from pos P: return rows[P..P+n-1] (0-indexed), new pos = min(P+n, N)
 	//   (where N = total rows; we use N not N+1 as EOF sentinel because len(cur.Rows) == N)
-	// FETCH BACKWARD n (finite) from pos P: return rows[P-n..P-1] reversed, new pos = max(P-n, 1)
-	//   The minimum finite-backward pos is 1 (not 0 = BOF). Only BACKWARD ALL reaches BOF.
-	// FETCH BACKWARD ALL from pos P: return rows[0..P-1] reversed, new pos = 0 (BOF)
+	// FETCH BACKWARD n (finite) from pos P: the row at index P-1 is the CURRENT row (already
+	//   returned by the preceding fetch) and must NOT be re-returned. Return
+	//   rows[P-1-n..P-2] reversed (nearest-first), new pos = max(P-n, 1). Only BACKWARD ALL
+	//   includes the current row. M0134-0056.
+	// FETCH BACKWARD ALL from pos P: return rows[0..P-1] reversed (includes the current row),
+	//   new pos = 0 (BOF)
 	// FETCH FORWARD ALL from pos P: return rows[P..N-1], new pos = N (EOF)
 	total := len(cur.Rows)
 	fetchAll := count < 0
@@ -3756,19 +3759,13 @@ func (s *Server) executeFetch(_ context.Context, w *libpq.FrameWriter, ectx *exe
 		} else {
 			cur.Pos = end
 		}
-	} else {
-		// FETCH BACKWARD [n|ALL]
+	} else if fetchAll {
+		// FETCH BACKWARD ALL: includes the current row (index cur.Pos-1).
 		end := cur.Pos // exclusive upper bound for 0-indexed slice
 		if end > total {
 			end = total
 		}
-		start := 0 // ALL: go all the way to BOF
-		if !fetchAll {
-			start = end - int(count)
-			if start < 0 {
-				start = 0
-			}
-		}
+		start := 0 // go all the way to BOF
 		// The rows from start..end-1 in reverse order.
 		n := end - start
 		rev := make([]executor.Row, n)
@@ -3776,21 +3773,29 @@ func (s *Server) executeFetch(_ context.Context, w *libpq.FrameWriter, ectx *exe
 			rev[i] = cur.Rows[start+n-1-i]
 		}
 		rowsToSend = rev
-		if fetchAll {
-			cur.Pos = 0 // BOF
+		cur.Pos = 0 // BOF
+	} else {
+		// FETCH BACKWARD n (finite): exclude the current row (index cur.Pos-1) from the
+		// window — it was already returned by the preceding fetch. M0134-0056.
+		if cur.Pos == 0 {
+			// already at BOF, nothing precedes
+			rowsToSend = nil
 		} else {
-			// Finite BACKWARD: new pos = max(P-n, 1) when P > 0; stays at 0 when already at BOF.
-			// Minimum is 1 (not 0=BOF) so that the row just fetched can be re-fetched on the next
-			// FETCH ALL — but only when we actually were above BOF. M0097-0042.
-			if end == 0 {
-				cur.Pos = 0 // already at BOF, no change
-			} else {
-				newPos := end - int(count)
-				if newPos < 1 {
-					newPos = 1
-				}
-				cur.Pos = newPos
+			end := cur.Pos - 1 // exclusive bound; excludes the current row
+			if end > total {
+				end = total
 			}
+			start := end - int(count)
+			if start < 0 {
+				start = 0
+			}
+			n := end - start
+			rev := make([]executor.Row, n)
+			for i := 0; i < n; i++ {
+				rev[i] = cur.Rows[start+n-1-i]
+			}
+			rowsToSend = rev
+			cur.Pos = start + 1
 		}
 	}
 

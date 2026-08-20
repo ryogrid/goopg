@@ -2023,6 +2023,25 @@ func (p *parser) parseIntLit() (int64, error) {
 	return n, nil
 }
 
+// parseSignedIntLit parses an optional leading '-' (a separate unary-minus
+// operator token, since integer literals never carry a sign in the lexer)
+// followed by an integer literal, e.g. for `FETCH ABSOLUTE -1`. M0134-0056.
+func (p *parser) parseSignedIntLit() (int64, error) {
+	neg := false
+	if p.cur().Kind == TokenOperator && p.cur().Value == "-" {
+		neg = true
+		p.advance()
+	}
+	n, err := p.parseIntLit()
+	if err != nil {
+		return 0, err
+	}
+	if neg {
+		n = -n
+	}
+	return n, nil
+}
+
 // parseStrLit consumes a TokenStringLit and returns its (unquoted) value.
 func (p *parser) parseStrLit() (string, error) {
 	t := p.cur()
@@ -3010,8 +3029,10 @@ func (p *parser) parseDeclareCursor() (Stmt, error) {
 		return nil, p.errAtCur("expected CURSOR")
 	}
 
-	// optional WITH/WITHOUT HOLD
-	if p.acceptIdentKeyword("with") || p.acceptIdentKeyword("without") {
+	// optional WITH/WITHOUT HOLD. WITH is a reserved keyword (lexed as
+	// TokenKeyword/KwWith, never TokenIdent) so it must be matched via
+	// acceptKeyword, not acceptIdentKeyword — M0134-0056.
+	if p.acceptKeyword(KwWith) || p.acceptIdentKeyword("without") {
 		p.acceptIdentKeyword("hold")
 	}
 
@@ -3054,17 +3075,21 @@ func (p *parser) parseFetchCursor() (Stmt, error) {
 		forward = false
 		count = 1
 	case p.acceptIdentKeyword("absolute"):
-		if p.cur().Kind == TokenIntLit {
+		// Optional leading '-' (unary minus token) before the literal, e.g.
+		// `FETCH ABSOLUTE -1`. M0134-0056.
+		if p.cur().Kind == TokenIntLit || (p.cur().Kind == TokenOperator && p.cur().Value == "-") {
 			var err error
-			count, err = p.parseIntLit()
+			count, err = p.parseSignedIntLit()
 			if err != nil {
 				return nil, err
 			}
 		}
 	case p.acceptIdentKeyword("relative"):
-		if p.cur().Kind == TokenIntLit {
+		// Optional leading '-' (unary minus token) before the literal, e.g.
+		// `FETCH RELATIVE -1`. M0134-0056.
+		if p.cur().Kind == TokenIntLit || (p.cur().Kind == TokenOperator && p.cur().Value == "-") {
 			var err error
-			count, err = p.parseIntLit()
+			count, err = p.parseSignedIntLit()
 			if err != nil {
 				return nil, err
 			}
