@@ -189,6 +189,23 @@ func TestExecDropFunctionMissingNoIfExistsErrors(t *testing.T) {
 	}
 }
 
+// TestExecDropProcedureMissingNoHint pins M0134-0033: unlike CALL's
+// candidate-matching failure (operators_call.go), DROP PROCEDURE/FUNCTION's
+// not-found error must carry no HINT — real PG's LookupFuncName
+// (namespace.c, used by the DROP object-address resolution) never attaches
+// one, contrasting with parse_func.c's func_get_detail (the CALL path).
+func TestExecDropProcedureMissingNoHint(t *testing.T) {
+	cat := catalog.NewInMemory()
+	err := runRoutineDDL(t, `DROP PROCEDURE nonexistent()`, cat)
+	ee, ok := err.(*ExecError)
+	if !ok || ee.Code != "42883" {
+		t.Fatalf("got err=%v, want ExecError SQLSTATE 42883", err)
+	}
+	if ee.Hint != "" {
+		t.Errorf("Hint = %q, want empty (no hint on DROP PROCEDURE not-found)", ee.Hint)
+	}
+}
+
 // TestExecDropFunctionMissingSchemaQualifiedErrorMessage pins the DU-002
 // slice 437 fix: DROP FUNCTION's "does not exist" / "could not find a
 // function named" messages must include the schema qualifier the statement

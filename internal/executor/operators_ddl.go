@@ -16749,7 +16749,6 @@ func (o *ddlOp) execDropProcedure(s *parser.DropProcedureStmt) error {
 		argListStr := buildCallArgListStr(s.Args)
 		return &ExecError{Code: "42883", Pos: s.Pos(),
 			Message: fmt.Sprintf("%s %s%s does not exist", objKind, s.Name.Name, argListStr),
-			Hint:    "No procedure matches the given name and argument types. You might need to add explicit type casts.",
 		}
 	}
 	// DROP PROCEDURE on a function should fail.
