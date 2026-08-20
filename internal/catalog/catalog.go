@@ -4149,9 +4149,32 @@ func (c *InMemory) BuildStatisticsObjDef(obj *StatisticsObject) string {
 	}
 
 	sb.WriteString(" ON ")
-	// PG emits all simple columns first (in stxkeys order) then all expression
-	// targets, regardless of their original ON-list order; colno spans both lists
-	// for comma separation. Mirrors pg_get_statisticsobj_worker (ruleutils.c).
+	sb.WriteString(c.statisticsObjColumnsList(obj))
+
+	// FROM relation, schema-qualified (pg_dump runs with an empty search_path so
+	// generate_relation_name always qualifies).
+	sb.WriteString(" FROM ")
+	relSchema, relName := schema, ""
+	if tbl, ok := c.LookupTableByOID(obj.TableOID); ok {
+		relName = tbl.Name
+		if tbl.Schema != "" {
+			relSchema = tbl.Schema
+		}
+	}
+	sb.WriteString(quoteCollationIdent(relSchema))
+	sb.WriteByte('.')
+	sb.WriteString(quoteCollationIdent(relName))
+	return sb.String()
+}
+
+// statisticsObjColumnsList renders the comma-joined "col1, col2, (expr)" list
+// for a statistics object's ON target list (no leading "ON ", no trailing
+// "FROM ..."). PG emits all simple columns first (in stxkeys order) then all
+// expression targets, regardless of their original ON-list order; colno spans
+// both lists for comma separation. Mirrors pg_get_statisticsobj_worker
+// (ruleutils.c). Shared by BuildStatisticsObjDef and BuildStatisticsObjDefColumns.
+func (c *InMemory) statisticsObjColumnsList(obj *StatisticsObject) string {
+	var sb strings.Builder
 	colno := 0
 	for _, col := range obj.Columns {
 		if colno > 0 {
@@ -4169,21 +4192,20 @@ func (c *InMemory) BuildStatisticsObjDef(obj *StatisticsObject) string {
 		sb.WriteString(e)
 		colno++
 	}
-
-	// FROM relation, schema-qualified (pg_dump runs with an empty search_path so
-	// generate_relation_name always qualifies).
-	sb.WriteString(" FROM ")
-	relSchema, relName := schema, ""
-	if tbl, ok := c.LookupTableByOID(obj.TableOID); ok {
-		relName = tbl.Name
-		if tbl.Schema != "" {
-			relSchema = tbl.Schema
-		}
-	}
-	sb.WriteString(quoteCollationIdent(relSchema))
-	sb.WriteByte('.')
-	sb.WriteString(quoteCollationIdent(relName))
 	return sb.String()
+}
+
+// BuildStatisticsObjDefColumns returns the columns_only rendering used by
+// pg_get_statisticsobjdef_columns — psql's \d+ "Statistics objects:" footer
+// queries this directly (describe.c) and appends its own "FROM <regclass>"
+// using stxrelid, so this must NOT include "FROM". Mirrors
+// pg_get_statisticsobj_worker(statextid, columns_only=true, ...) in
+// ruleutils.c (postgres/src/backend/utils/adt/ruleutils.c:1654).
+func (c *InMemory) BuildStatisticsObjDefColumns(obj *StatisticsObject) string {
+	if obj == nil || (obj.HasExpr && len(obj.Exprs) == 0) {
+		return ""
+	}
+	return c.statisticsObjColumnsList(obj)
 }
 
 // SetComment stores a description for an object in pg_description.

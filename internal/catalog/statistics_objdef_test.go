@@ -116,6 +116,69 @@ func TestBuildStatisticsObjDef(t *testing.T) {
 	}
 }
 
+// TestBuildStatisticsObjDefColumns pins the columns_only rendering used by
+// pg_get_statisticsobjdef_columns — psql's \d+ "Statistics objects:" footer
+// (describe.c) appends its own "FROM <regclass>", so this must render neither
+// "CREATE STATISTICS ns.name (kinds)" nor "FROM". Mirrors
+// pg_get_statisticsobj_worker(statextid, columns_only=true) in ruleutils.c.
+// M0134-0036.
+func TestBuildStatisticsObjDefColumns(t *testing.T) {
+	c := NewInMemory()
+	const relOID = uint32(16400)
+	tbl := &Table{Schema: "public", Name: "t", OID: relOID}
+	c.RegisterTable(tbl)
+
+	cases := []struct {
+		name    string
+		cols    []string
+		exprs   []string
+		hasExpr bool
+		want    string
+	}{
+		{
+			name: "multicol",
+			cols: []string{"a", "b"},
+			want: "a, b",
+		},
+		{
+			name:    "expr-target-uncaptured-declined",
+			cols:    nil,
+			hasExpr: true,
+			want:    "",
+		},
+		{
+			name:    "single-expr",
+			exprs:   []string{"(a + b)"},
+			hasExpr: true,
+			want:    "(a + b)",
+		},
+		{
+			name:    "col-plus-expr",
+			cols:    []string{"a"},
+			exprs:   []string{"(b + c)"},
+			hasExpr: true,
+			want:    "a, (b + c)",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			obj := &StatisticsObject{
+				Name:     "s",
+				Schema:   "public",
+				OID:      99999,
+				TableOID: relOID,
+				Columns:  tc.cols,
+				Exprs:    tc.exprs,
+				HasExpr:  tc.hasExpr,
+			}
+			if got := c.BuildStatisticsObjDefColumns(obj); got != tc.want {
+				t.Errorf("BuildStatisticsObjDefColumns = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 
 // TestSetStatisticsTargetProjection pins ALTER STATISTICS ... SET STATISTICS n
 // onto pg_statistic_ext.stxstattarget so pg_dump round-trips the target

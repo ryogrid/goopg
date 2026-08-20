@@ -2193,6 +2193,7 @@ afterExistsCheck:
 				includeComments := strings.Contains(likeFlags, ":+comments")
 				includeStatistics := strings.Contains(likeFlags, ":+statistics")
 				includeStorage := strings.Contains(likeFlags, ":+storage")
+				includeCompression := strings.Contains(likeFlags, ":+compression")
 				src, ok := likeByKey[baseKey]
 				if !ok {
 					continue
@@ -2222,6 +2223,10 @@ afterExistsCheck:
 					// Clear Storage unless INCLUDING STORAGE or INCLUDING ALL was specified.
 					if !includeStorage {
 						c.Storage = ""
+					}
+					// Clear Compression unless INCLUDING COMPRESSION or INCLUDING ALL was specified.
+					if !includeCompression {
+						c.Compression = ""
 					}
 					merged, err := mergeExplicitColumnIntoInherited(c)
 					if err != nil {

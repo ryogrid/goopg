@@ -3627,6 +3627,10 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 					if isIncluding {
 						likeKey += ":+storage"
 					}
+				case p.acceptIdentKeyword("compression"):
+					if isIncluding {
+						likeKey += ":+compression"
+					}
 				case p.acceptIdentKeyword("generated"):
 					if isIncluding {
 						likeKey += ":+generated"
@@ -3637,7 +3641,7 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 					}
 				case p.acceptKeyword(KwAll):
 					if isIncluding {
-						likeKey += ":+defaults:+identity:+generated:+constraints:+indexes:+comments:+statistics:+storage"
+						likeKey += ":+defaults:+identity:+generated:+constraints:+indexes:+comments:+statistics:+storage:+compression"
 					}
 				}
 			}

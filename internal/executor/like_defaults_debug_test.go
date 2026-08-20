@@ -95,6 +95,43 @@ func TestLIKEMergesWithINHERITSColumns(t *testing.T) {
 	}
 }
 
+// TestLIKEIncludingCompression verifies that LIKE ... INCLUDING COMPRESSION
+// copies a column's compression setting, while LIKE ... INCLUDING STORAGE
+// alone (no COMPRESSION) does not — COMPRESSION and STORAGE are independent
+// options (create_table.sgml; tablecmds.c gates attcompression behind
+// CREATE_TABLE_LIKE_COMPRESSION separately from CREATE_TABLE_LIKE_STORAGE).
+// M0134-0036.
+func TestLIKEIncludingCompression(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE ctlt1 (a text COMPRESSION pglz)`); err != nil {
+		t.Fatalf("create ctlt1: %v", err)
+	}
+
+	if err := runDDL(t, ctx, `CREATE TABLE ctlt_compr (LIKE ctlt1 INCLUDING COMPRESSION)`); err != nil {
+		t.Fatalf("create ctlt_compr: %v", err)
+	}
+	compr, ok := cat.LookupTable(parser.ObjectName{Name: "ctlt_compr"})
+	if !ok {
+		t.Fatal("ctlt_compr not found")
+	}
+	if len(compr.Columns) == 0 || compr.Columns[0].Compression != "pglz" {
+		t.Errorf("expected ctlt_compr.a Compression=pglz, got %+v", compr.Columns)
+	}
+
+	if err := runDDL(t, ctx, `CREATE TABLE ctlt_storage_only (LIKE ctlt1 INCLUDING STORAGE)`); err != nil {
+		t.Fatalf("create ctlt_storage_only: %v", err)
+	}
+	storageOnly, ok := cat.LookupTable(parser.ObjectName{Name: "ctlt_storage_only"})
+	if !ok {
+		t.Fatal("ctlt_storage_only not found")
+	}
+	if len(storageOnly.Columns) == 0 || storageOnly.Columns[0].Compression != "" {
+		t.Errorf("expected ctlt_storage_only.a Compression=\"\" (STORAGE alone must not copy COMPRESSION), got %+v", storageOnly.Columns)
+	}
+}
+
 // runSQLErr attempts to run a SQL statement and returns any runtime or plan error.
 func runSQLErr(t *testing.T, sql string) ([]Row, error) {
 	t.Helper()

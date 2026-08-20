@@ -10164,6 +10164,35 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 		return NullDatum, nil
 
+	case "pg_get_statisticsobjdef_columns":
+		// pg_get_statisticsobjdef_columns(oid) → text — columns-only rendering used
+		// by psql \d+'s "Statistics objects:" footer (describe.c appends its own
+		// "FROM <regclass>"). ruleutils.c pg_get_statisticsobjdef_columns.
+		if len(x.Args) < 1 {
+			return NullDatum, nil
+		}
+		arg, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil || arg.IsNull() {
+			return NullDatum, nil
+		}
+		var targetOID uint32
+		if arg.Kind == KindInt {
+			targetOID = uint32(arg.Int)
+		} else {
+			v, _ := strconv.ParseUint(strings.TrimSpace(arg.StringValue()), 10, 32)
+			targetOID = uint32(v)
+		}
+		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+			if obj, ok := im.StatisticsByOID(targetOID); ok {
+				def := im.BuildStatisticsObjDefColumns(obj)
+				if def == "" {
+					return NullDatum, nil
+				}
+				return NewStringDatum(def), nil
+			}
+		}
+		return NullDatum, nil
+
 	case "pg_get_ruledef", "pg_get_ruledef_ext":
 		// pg_get_ruledef(oid [, pretty bool]) → text — reconstructs the CREATE
 		// RULE statement. pg_dump's dumpRule selects pg_get_ruledef(r.oid) and
