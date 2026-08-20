@@ -1,69 +1,58 @@
-Task: M0134-0053 (partition_prune.sql) — PARTIAL this loop. Landed a real
-HASH multi-column routing bugfix from sizing; case itself stays `failed`
-(pruning subsystem PARKED). CSV row unchanged. Next: select M0134-0054
-(plancache.sql).
+Task: M0134-0057 (prepared_xacts.sql) — PARTIAL this loop. Landed 1 contained
+bucket (SERIALIZABLE-path duplicate-gid check on PREPARE TRANSACTION); case
+itself stays `failed`. CSV row unchanged. Next: select M0134-0058
+(random.sql).
 
-Files this loop: `internal/executor/hash_partition.go` (new shared helper
-`computeHashPartitionRowHash`), `internal/executor/expr.go`
-(`satisfies_hash_partition` now calls the shared helper),
-`internal/executor/operators_storage.go` (`routeToPartitionDepth`'s HASH
-case now folds ALL partition-key columns via the shared helper + routes via
-`FindHashPartitionByHash` uniformly), `internal/executor/
-hash_partition_multicol_routing_test.go` (new, 2 tests), `.ralph/
-deferral_ledger.md` (new row, M0134-0053 bucket breakdown), `.ralph/
-fix_plan.md` (M0134-0053 entry rewritten with PARTIAL verdict + next-task
-pointer), `.ralph/progress.json` (state-guard auto-repair, recurring).
+Files this loop: `internal/postmaster/twophase.go` (`execPrepareTransaction`
+duplicate-gid check hoisted above the isolation-level branch + shared nil
+marker registered in `s.preparedXactStore` for the SERIALIZABLE keep-open
+path; `execFinalizePrepared` frees the marker on same-backend finalise and
+guards `px == nil` on the detached-path lookup),
+`internal/postmaster/twophase_dupgid_test.go` (new,
+`TestPrepareTransactionDuplicateGidSerializable`), `.ralph/deferral_ledger.md`
+(new row, M0134-0057 bucket breakdown), `.ralph/fix_plan.md` (M0134-0057
+entry rewritten with PARTIAL verdict + next-task pointer).
 
-Key symbols: `computeHashPartitionRowHash` (hash_partition.go, new),
-`routeToPartitionDepth` (operators_storage.go), `satisfies_hash_partition`
-case in expr.go's evalExpr dispatch, `im.FindHashPartitionByHash`
-(catalog.go:5036, untouched — confirmed already PG-faithful modulus match).
+Key symbols: `execPrepareTransaction`, `execFinalizePrepared`,
+`preparedXactStore.put/has/take` (internal/postmaster/twophase.go).
 
-Hypothesis/Findings: partition_prune.sql's dominant gap (~85-90% of a
-6417-line diff) is that partition pruning — BOTH planner-time (static,
-constant-folded WHERE clauses collapsing an Append to matching children)
-and executor-time (runtime pruning via InitPlan/param bounds, "Subplans
-Removed: N" output) — is entirely unimplemented anywhere in
-`internal/optimizer`/`internal/executor`. This is the SAME missing
-foundation class as M0134-0052's partition-wise-join gap: goopg's
-partitioning support handles DDL/routing but has zero plan-shape awareness
-of partition bounds. Two more independent contained bugs were sized but
-NOT landed this loop (recorded in the M0134-0053 ledger row, available for
-a future standalone slice if picked up): (3) nested LIST/RANGE overlap
-false-positive in `internal/executor/operators_ddl_partition.go`
-(`validateListOverlap`/`validateRangeOverlap`/`validateHashBounds` read a
-contaminated `PartitionBounds` field on multi-level sub-partitioned
-tables — same root-cause family as the already-fixed M0134-0013b
-`validateDefaultPartition`, needs the identical live-children-filter
-rewrite); (5) custom multi-char operator `===` fails to lex (2
-occurrences, low priority, not investigated further).
+Hypothesis/Findings: prepared_xacts.sql's diff (234 lines, 12 `^+ERROR`/7
+`^-ERROR`) breaks down as: (3, landed) duplicate-gid check ran only on the
+RC/RR detach path, never the SERIALIZABLE same-backend keep-open path, so a
+second SERIALIZABLE PREPARE TRANSACTION of an in-use gid silently succeeded;
+(1, LARGE, dominant ~90%) SERIALIZABLE PREPARE TRANSACTION keeps the
+transaction open on the SAME connTx handle instead of truly dissociating the
+backend (PG's PrepareTransaction releases the PGPROC + gives a fresh txn
+state) — statements on the originating connection between PREPARE and
+finalise still see the prepared txn's own uncommitted state; needs
+DetachToDedicatedSlot extended to SERIALIZABLE with SSI predicate-lock state
+re-keyed off the Handle, design-doc scale; (2, LARGE) `pg_prepared_xacts` is
+a permanent 0-row stub, same pattern class as the already-ledgered
+`pg_cursors` stub (M0134-0056); cascade (not independent) — write-skew
+section fallout of bucket 1's wrong-visibility state.
 
-Next step: select **M0134-0054 (plancache.sql)** per the fix_plan
+Next step: select **M0134-0058 (random.sql)** per the fix_plan
 task-ID-ascending selection rule. Size it via `scripts/pg-regress-runner.sh
---verbose plancache` (delegate to researcher) before deciding
-fix/split/park, same pattern as M0134-0044..0053. NOTE: partition_prune's
-bucket-(3) nested-overlap fix and the growing "partition bound reasoning in
-the optimizer" gap (now 2 parked tests pointing at it: M0134-0052 +
-M0134-0053) may warrant a design-doc scoping pass at some point — not yet
-done, flagged for future consideration, not blocking M0134-0054 selection.
+--verbose random` (delegate to researcher) before deciding fix/split/park,
+same pattern as M0134-0049..0057.
 
-Gates run this loop: `go build ./...` PASS; `go test ./internal/executor/
--run 'TestHashPartitionMultiColumnRouting|TestHashPartitionSingleColumn
-RoutingRegression'` PASS; `go test ./internal/executor/` (full package)
-PASS; `make ralph-state-guard` ran clean after one auto-repair
-(status/progress reconciliation, recurring, not new); pre-commit pgbench
-smoke PASS (374/696/12838 TPS across the 3 builtin scripts, no failed
+Gates run this loop: `go build ./...` PASS; `GOOPG_CG_UNIT=... go test
+./internal/postmaster/...` PASS (52.7s, no new panics);
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS (via
+tester, ~71s dominated by cmd/goopg cold run, rest cache-warm); `make
+ralph-state-guard` to be run before status block; pre-commit pgbench smoke
+PASS (382/727/13013 TPS across the 3 builtin scripts, no failed
 transactions).
 
-Delegation: researcher agent (1 round, sizing, found 6 buckets + PG oracle
-citations, recommended PARK+PARTIAL — accepted as-is). implementer agent
-`a0cba4a4a734cd4d6` (1 round, landed the HASH multi-column fix cleanly per
-brief, DONE — no follow-up round needed; note: this agent's Write tool was
-blocked from creating report.md by harness policy, so its findings were
-relayed inline in the tool-result text instead of a file under
-tmp/ralph-handoffs/ — folded directly into the ledger/fix_plan write-up
-above, no durable-artifact loss).
+Delegation: researcher agent `ae667fda4087304f7` (1 round, sizing, found
+diff 234 lines/12+ERROR, 2 LARGE + 1 CONTAINED bucket, recommended landing
+bucket 3 only — accepted). implementer agent `a39ddac082d726b9a` (1 round,
+landed the duplicate-gid fix cleanly per brief, DONE — no follow-up round
+needed; flagged one edge-case deferral candidate re: cross-backend
+COMMIT/ROLLBACK PREPARED racing a live SERIALIZABLE marker, noted in the
+ledger row's bucket-1 text, not separately actioned since it requires
+cross-backend finalisation which is already out of scope).
 
-In-flight: none. Commit `8312478e` pushed to `regress-renumbering`. No
-server left running (regress runner + pgbench smoke both self-start/stop
-their own throwaway goopg instances via the cgroup wrapper).
+In-flight: none. Commit `94207664` pushed to `regress-renumbering`. No
+server left running (regress runner + pgbench smoke + postmaster tests all
+self-start/stop their own throwaway goopg instances via the cgroup wrapper).
