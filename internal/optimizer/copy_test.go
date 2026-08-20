@@ -271,6 +271,93 @@ func TestPlanCopyIncorrectOptions(t *testing.T) {
 	}
 }
 
+// TestPlanCopyLegacyTrailFormat: legacy bareword `COPY ... CSV` /
+// `COPY ... BINARY` (pre-9.0, parenthesis-free trail) must validate
+// identically to the modern `WITH (FORMAT csv/binary)` spellings — PG's
+// grammar folds both forms into the same "format" DefElem (gram.y
+// copy_opt_item), so a real duplicate/conflict across legacy and modern
+// spellings is caught by the SAME formatSpecified guard. M0134-0027a.
+func TestPlanCopyLegacyTrailFormat(t *testing.T) {
+	cat := pgbenchCatalog(t)
+
+	// Legacy CSV alone succeeds and behaves like FORMAT csv (HEADER
+	// trailing on too, exercising the multi-option legacy trail).
+	if _, err := Plan(parseOne(t, "COPY pgbench_accounts TO STDOUT CSV"), cat); err != nil {
+		t.Fatalf("legacy CSV: expected accept, got %v", err)
+	}
+	if _, err := Plan(parseOne(t, "COPY pgbench_accounts TO STDOUT CSV HEADER"), cat); err != nil {
+		t.Fatalf("legacy CSV HEADER: expected accept, got %v", err)
+	}
+	// Legacy BINARY alone succeeds.
+	if _, err := Plan(parseOne(t, "COPY pgbench_accounts FROM STDIN BINARY"), cat); err != nil {
+		t.Fatalf("legacy BINARY: expected accept, got %v", err)
+	}
+
+	cases := []struct {
+		sql  string
+		want string
+	}{
+		// Legacy CSV + legacy BINARY together: both fold to "format" ->
+		// same conflicting-option error as WITH (FORMAT csv, FORMAT
+		// binary).
+		{"COPY pgbench_accounts TO STDOUT CSV BINARY", "conflicting or redundant options"},
+		{"COPY pgbench_accounts TO STDOUT BINARY CSV", "conflicting or redundant options"},
+		// Legacy CSV + modern FORMAT csv: same "format" DefElem in PG's
+		// model, so this is a redundant-option conflict too. The parser
+		// only accepts one option-list shape per statement (parenthesised
+		// XOR bareword trail — internal/parser/copy.go:114), so this is
+		// exercised via the bareword "csv"/"binary" token inside the
+		// modern WITH (…) list, which parseCopyOption accepts identically
+		// (CopyOption{Name:"csv"/"binary", Bool:true}) to the legacy trail.
+		{"COPY pgbench_accounts TO STDOUT WITH (CSV, FORMAT csv)", "conflicting or redundant options"},
+		{"COPY pgbench_accounts TO STDOUT WITH (CSV, FORMAT binary)", "conflicting or redundant options"},
+	}
+	for _, tc := range cases {
+		_, err := Plan(parseOne(t, tc.sql), cat)
+		if err == nil {
+			t.Errorf("expected error for %q", tc.sql)
+			continue
+		}
+		pe, ok := err.(*PlanError)
+		if !ok {
+			t.Errorf("unexpected error type for %q: %T", tc.sql, err)
+			continue
+		}
+		if pe.Message != tc.want {
+			t.Errorf("for %q:\n got  %q\n want %q", tc.sql, pe.Message, tc.want)
+		}
+	}
+
+	// csvMode set via the legacy path still feeds the SAME downstream
+	// incompatible-combination checks as the modern FORMAT csv path:
+	// CSV + FORCE_NOT_NULL combined with COPY TO still errors.
+	_, err := Plan(parseOne(t, "COPY pgbench_accounts TO STDOUT CSV FORCE NOT NULL aid"), cat)
+	if err == nil {
+		t.Fatal("legacy CSV + FORCE NOT NULL on COPY TO: expected error, got nil")
+	}
+	pe, ok := err.(*PlanError)
+	if !ok {
+		t.Fatalf("unexpected error type: %T", err)
+	}
+	if want := "COPY FORCE_NOT_NULL cannot be used with COPY TO"; pe.Message != want {
+		t.Errorf("got %q want %q", pe.Message, want)
+	}
+
+	// And the reverse direction requirement (CSV mode) still fires when
+	// legacy CSV is NOT present but FORCE_NOT_NULL legacy option is.
+	_, err = Plan(parseOne(t, "COPY pgbench_accounts FROM STDIN FORCE NOT NULL aid"), cat)
+	if err == nil {
+		t.Fatal("legacy FORCE NOT NULL without CSV: expected error, got nil")
+	}
+	pe, ok = err.(*PlanError)
+	if !ok {
+		t.Fatalf("unexpected error type: %T", err)
+	}
+	if want := "COPY FORCE_NOT_NULL requires CSV mode"; pe.Message != want {
+		t.Errorf("got %q want %q", pe.Message, want)
+	}
+}
+
 // TestPlanCopyTableErrors pins SQLSTATE codes for the obvious
 // catalog-resolution failures.
 func TestPlanCopyTableErrors(t *testing.T) {

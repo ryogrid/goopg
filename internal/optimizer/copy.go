@@ -307,6 +307,25 @@ func validateCopyOptions(s *parser.CopyStmt) error {
 			default:
 				return &PlanError{Pos: o.Pos(), Code: "22023", Message: fmt.Sprintf("COPY format \"%s\" not recognized", o.Value)}
 			}
+		case "csv":
+			// Legacy bareword trail (pre-9.0 syntax, `COPY ... CSV`).
+			// PG's grammar folds this into the same "format" DefElem as
+			// `WITH (FORMAT csv)` (gram.y copy_opt_item: BINARY/CSV both
+			// produce makeDefElem("format", ...)), so a real duplicate
+			// (legacy CSV + legacy CSV, or legacy CSV + FORMAT csv/binary)
+			// is caught by the same formatSpecified guard.
+			if formatSpecified {
+				return conflict(o)
+			}
+			formatSpecified = true
+			csvMode = true
+		case "binary":
+			// Legacy bareword trail (`COPY ... BINARY`) — see "csv" above.
+			if formatSpecified {
+				return conflict(o)
+			}
+			formatSpecified = true
+			binary = true
 		case "freeze":
 			if freezeSpecified {
 				return conflict(o)
