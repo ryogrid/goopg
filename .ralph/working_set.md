@@ -1,67 +1,64 @@
-# Working set — M0134-0018 PARKED; shipped a silent catalog-loss fix out of it
+# Working set — M0134-0024 PARKED; INHERITS search_path fix shipped
 
-**Task:** M0134-0018 (`create_index.sql`) — **PARKED** (case still FAILS; CSV row
-stays `failed`/`pass_required=no`, **no `make regen-testport`**). The loop's
-shipped work is a general correctness fix found while sizing it.
-Design: `docs/design/m0134-0018-temp-shadow-drop-rollback.md` (indexed).
+**Task:** M0134-0024 (`generated_virtual.sql`) — **PARKED** (case still FAILS).
+Design: `docs/design/m0134-0024-inherits-searchpath-lookup.md` (indexed). CSV row
+unchanged (`failed` -> `failed`), so **no `make regen-testport` this loop**.
 
-**The method note that mattered this loop (carry it).** The researcher's first
-verdict was again "PARK, no bucket is CLOSE-sized" — and it was right about the
-case. But its own report *buried* the real find in an "anomaly flagged, not
-resolved" aside: `public.point_tbl` vanished from `pg_class` mid-case with no
-error. One follow-up round demanding a bisection (which statement, catalog-loss
-vs data-loss, session-scoped vs cluster-wide, restart behavior, root-cause
-file:line) turned that aside into the loop's entire deliverable. **Interrogating
-a park verdict has now paid off two loops running — and this time the prize was
-not in the recommendation, it was in the footnote. Read subagent reports for what
-they under-rate, not just for what they conclude.**
+**The method note that mattered (carry it) — now NINE loops running.** Round 1
+recommended the INSERT/UPDATE generated-column bucket and left the biggest
+cascade "unexplained". Interrogation did two things: it resolved an apparent
+self-contradiction in that recommendation (goopg EXCLUDES generated columns yet
+emits arity errors — all 18 turned out to pull the SAME direction), and it
+forced the unexplained bucket to be isolated **by live experiment**, which
+yielded a smaller, zero-landmine, higher-yield fix. Keep interrogating; it has
+now changed the work materially nine loops in a row.
 
-**The bug.** `CREATE TEMP TABLE zz AS SELECT * FROM public.zz` (goopg's
-`create_index.sql:84`) errored *and* permanently deleted `public.zz` from the
-live catalog for every session until restart. `execCreateTable`
-(`operators_ddl.go:1713`) implements TEMP shadowing (M0097-0003) by destructive
-pre-emption: stash the permanent table in `TempTableShadows`, `DropTable` it
-(`:1750-1766`), restore only from `DROP TABLE` on the temp relation
-(`:6936-6945`). That assumes the CREATE succeeds; the self-shadowing CTAS
-guarantees it does not — the drop removes the SELECT's own source, `optimizer.Plan`
-fails at `:4714-4716` before any `CreateTable`, no temp relation exists, so the
-restore is unreachable. Loss is catalog-entry-only (heap file intact),
-cluster-wide (`catalog.InMemory` is shared), and heals on restart — hence silent.
-**Fix:** named-error-return `defer` in `execCreateTable` restoring via a new
-shared `restoreTempShadow` helper (the DROP path was rewired to it, so there is
-ONE notion of "undo a shadow"), covering every post-drop error exit; success path
-bit-identical.
+**The generalisable lesson — the bug in a case is often not ABOUT the case.**
+`generated_virtual.sql` is a generated-columns file, but its dominant cascade was
+a plain `search_path` bug in INHERITS parent lookup, reproducible with a table
+that has no generated columns at all. It only surfaced here because the file runs
+under a non-public schema. Sizing by *file topic* would have missed it entirely;
+sizing by *root cause, isolated experimentally* found it. Corollary reaffirmed:
+a plausible-looking site that has never executed is not evidence — the
+reproduction was required before the fix was accepted.
 
-**Sizing (clean, `--no-setup`):** 3475 lines / 43 hunks / 112 `^+ERROR`. The
-runner's setup phase runs `create_index.sql` once already (prereq for
-`aggregates.sql`) then again as the test — that double-run adds ~28 spurious
-`already exists` errors. Buckets 1 (geometric lexer, 58) + 3 (CONCURRENTLY, 25)
-= 74%, both REFACTOR-tier and ledgered; fixing both still leaves 29/112.
+**What shipped:** `internal/executor/operators_ddl.go:1931` (CREATE TABLE ...
+INHERITS) and `:9803` (ALTER TABLE ... INHERIT) now call the pre-existing
+`(o *ddlOp) lookupTableWithSearch` (M0097-0022, written for LOCK TABLE, never
+wired here) instead of the raw `Catalog.LookupTable`. Qualified names provably
+unaffected (helper tries the raw lookup first). PG oracle: `RangeVarGetRelid` in
+`DefineRelation`, `postgres/src/backend/commands/tablecmds.c:868`.
+Guard: `TestInheritsUnqualifiedParentHonoursSearchPath` — asserts inheritance
+**actually works** (child columns match parent; row inserted into child visible
+via the parent), not merely that the DDL stopped erroring.
 
-**Three deferral rows appended** (2026-08-20, M0134-0018): namespace-keyed
-catalog lookup (PG has no shadow-drop at all — `pg_temp` vs `public` coexist via
-`search_path`, `namespace.c:RangeVarGetRelid`; that end state retires
-`TempTableShadows` entirely and would make the statement SUCCEED); the two
-parked `create_index` buckets; and `SET SESSION ROLE` (no case in the
-string-prefix SET dispatcher — sibling pair `internal/postmaster/query.go` +
-`extended.go`, ~15 LOC, whole `SET SESSION <any-guc>` form affected).
+**Sizing:** 4438 lines / 114 `^+ERROR` / 102 `^-ERROR` at HEAD -> **4397 / 96 /
+102**. Case does NOT pass and is far from it.
 
-**Next step:** select **M0134-0019 (`indexing.sql`)** — re-read the fix_plan
-banner first (sole ordering authority; its "next to select" pointer was stale by
-three tasks this loop and has been refreshed). Then the standing rule: run
-`scripts/pg-regress-runner.sh --verbose <case>` at HEAD BEFORE designing, size
-into buckets, and interrogate any park verdict once.
+**Three deferral rows appended** (2026-08-20, M0134-0024): ~25 sibling raw-
+`LookupTable` DDL sites in two classes (**do the SILENT-degradation class first**
+— ATTACH/DETACH PARTITION, identity-sequence heap sync, ALTER SEQUENCE lock,
+GRANT bookkeeping — it loses a guarantee with no visible error); Bucket 1
+(implicit INSERT/UPDATE target list excludes `GeneratedAlways`) with the proof
+that its two sites must move ATOMICALLY plus the non-trailing-column positional
+landmine; and `VIRTUAL` being silently treated as `STORED`.
 
-**Gates run:** `go build ./...` + `go vet ./internal/executor/` clean;
+**Next step:** select **M0134-0025 (`groupingsets.sql`)** — re-read the fix_plan
+banner first (sole ordering authority; its pointer was refreshed this loop). Its
+CSV status is `failed`, so apply the standing rule: re-run
+`scripts/pg-regress-runner.sh --verbose groupingsets` at HEAD FIRST and let the
+result decide whether the row is stale or gets sized into buckets with exact NET
+grep counts. Then interrogate the park verdict once, as always.
+
+**Gates run:** new guard test PASS (FAIL-pre proven via `git stash`:
+`42P01: relation "plain1" does not exist`); `go build ./...` + `go vet
+./internal/executor/...` clean; `go test ./internal/executor/...` PASS (6.7s);
 `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS
-(`internal/initdb` cache-cold at 439s, not a regression signal);
-`scripts/tpch-spotcheck.sh` PASS with **Q12=2 / Q13=35** exactly;
-`go test -run TestDDL ./internal/executor/` PASS (47 subtests) incl. FAIL-pre /
-PASS-post guard `TestDDLFailedTempShadowCreateRestoresPermanentTable`;
-end-to-end real-server repro on port 5533 confirmed `public.zz` survives and is
-visible from a SECOND connection; pre-commit pgbench smoke PASS.
+(`internal/initdb` 427s cache-cold, not a regression signal);
+`scripts/tpch-spotcheck.sh` PASS with **Q12=2 / Q13=35** exactly.
 
-**Delegation:** `tmp/ralph-handoffs/M0134-0018a` (researcher, sizing + 3
-follow-ups, 2 rounds, DONE), `M0134-0018b` (implementer, 1 round, DONE),
-`M0134-0018c` (tester, gates, 1 round, DONE).
+**Delegation:** `tmp/ralph-handoffs/M0134-0024a` (researcher, sizing + 1
+interrogation round, 2 rounds, DONE), `M0134-0024b` (implementer, 1 round, DONE
+— report persisted by me, the worker returned it in-message), `M0134-0024c`
+(tester, gates + re-measure, 1 round, DONE).
 **In-flight:** none.

@@ -1928,7 +1928,7 @@ afterExistsCheck:
 	var inheritParents []*catalog.Table // collect for post-creation registration
 	if len(s.Inherits) > 0 {
 		for _, parentName := range s.Inherits {
-			parent, ok := o.ctx.Catalog.LookupTable(parentName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+			parent, ok := o.lookupTableWithSearch(parentName)
 			if !ok {
 				return &ExecError{Code: "42P01", Pos: s.Pos(),
 					Message: fmt.Sprintf("relation %q does not exist", parentName.String())}
@@ -9800,7 +9800,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 		case parser.AlterTableInherit:
 			// INHERIT parent_table — register the named table as a parent of tbl
 			// so that scanning the parent includes tbl's rows (M0097-0048).
-			parentTbl, ok := o.ctx.Catalog.LookupTable(act.InheritParent, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+			parentTbl, ok := o.lookupTableWithSearch(act.InheritParent)
 			if !ok {
 				return &ExecError{Code: "42P01", Pos: act.Pos(), Message: fmt.Sprintf("relation %q does not exist", act.InheritParent.String())}
 			}
