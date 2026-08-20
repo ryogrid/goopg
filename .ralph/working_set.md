@@ -1,50 +1,49 @@
-(idle — nothing in flight)
+Task: M0134-0040 (jsonb_jsonpath.sql) — PARKED, no code change this loop.
 
-Last completed: M0134-0038 (json.sql) PARKED with deferral ledger rows
-(no code change — bookkeeping-only loop). Sized at HEAD via
-`scripts/pg-regress-runner.sh --verbose json`: 3156 raw diff lines, 325
-`^+ERROR` / 93 `^-ERROR`, 0/1 PASS. Unlike the prior several M0134 cases,
-no CONTAINED bucket existed to ship this loop — every bucket is either a
-genuinely missing feature family (REFACTOR-tier) or unsized:
-- Bucket 1 (DOMINANT, ~280+ of 325 `^+ERROR`): almost the entire JSON
-  constructor/deconstructor builtin family (`to_json`, `json_build_object`,
-  `json_build_array`, `json_object`, `row_to_json`, `array_to_json`,
-  `json_strip_nulls`, `json_array_length`, `json_object_keys`, ~15+ fns) is
-  unimplemented past its pg_proc seed row. `internal/executor/expr.go:11697`
-  has exactly one JSON case (the M0134-0037 extract_path family). Needs a
-  shared JSON-value internal encoder goopg doesn't have yet. Already flagged
-  systemic in M0134-0002's ledger row.
-- Bucket 2: table-valued JSON SRFs (json_each, json_array_elements,
-  json_populate_record[set]) entirely unimplemented — needs real
-  SRF/tupledesc plumbing.
-- Bucket 3: parser has NO support for function column-definition lists
-  (`AS q(a text, b text)`) — blocks several Bucket-2 SRFs even once built.
-  `internal/parser/select.go:1591-1632`.
-- Bucket 4 (out of scope): to_tsvector/ts_headline calls incidental to this
-  file — full-text-search subsystem, unrelated.
-- Bucket 5 (unsized, likely CONTAINED): `::json #> array[...]` parser
-  syntax error on `#>` operator token — not root-caused this loop.
-- Confirmed: json.sql has ZERO `RETURNS TABLE` plpgsql functions, so
-  M0134-0037's Bucket A does not resurface here.
+Files: `.ralph/deferral_ledger.md` (new row), `.ralph/fix_plan.md` (M0134-0040
+entry updated to PARKED with sizing).
 
-Most-leveraged next slice if this JSON-builtins epic gets its own task:
-scalar-only `to_json`/`row_to_json`/`array_to_json` (no SRF, no Bucket-3
-parser work needed) — cross-links to the already-ledgered M0134-0002 gap,
-but it's net-new implementation (needs a JSON encoder), not a bug fix, so
-it should be scoped as its own dedicated task rather than folded into a
-"size the next case" loop.
+Key symbols: none touched (bookkeeping-only loop) — the file's own gap is the
+absent jsonpath grammar/evaluator subsystem (would live under a new
+`internal/executor/jsonpath/` or similar, none exists yet).
 
-Next loop: per fix_plan.md banner, select M0134-0039 (jsonb.sql, status
-`failed`) — same sizing pattern (researcher sizes at HEAD first, confirm
-not stale, bucket root causes CONTAINED vs REFACTOR-tier, ship the
-smallest CONTAINED bucket or PARK with ledger rows). jsonb.sql likely
-shares Bucket 1's missing-JSON-builtin-family root cause with json.sql —
-if so, sizing should explicitly cross-reference this row rather than
-re-deriving it, and the JSON-builtins epic may be worth promoting to its
-own dedicated multi-loop task given it now blocks (at least) two regress
-cases.
+Hypothesis/Findings: `researcher` sized jsonb_jsonpath.sql at HEAD via
+`scripts/pg-regress-runner.sh --verbose jsonb_jsonpath`: 6175 diff lines, 818
+`^+ERROR` / 244 `^-ERROR`, 0/1 PASS. 817/818 (99.9%) trace to ONE gap: no SQL/JSON
+jsonpath parser or evaluator exists anywhere in goopg (confirmed via
+`grep jsonb_path internal/executor/expr.go` = zero hits; `pg_proc` has the
+catalog rows but no dispatch case). Breakdown: 717 `^+ERROR` from
+`jsonb_path_query[_tz/_array/_first]`/`jsonb_path_match`/`jsonb_path_exists`
+family (uncalled builtins), 87 from `@?`/`@@` operators entirely unlexed
+(`internal/parser/lexer.go` has no token for either), 13 downstream
+parse-cascade. No CONTAINED bucket exists to peel off (unlike M0134-0037/0038/
+0039) — the whole file is REFACTOR-tier. PG oracle: `postgres/src/backend/
+utils/adt/jsonpath.c` (grammar), `jsonpath_exec.c` (evaluator). Ledger row
+appended with full detail. This is now the SECOND file (after jsonb.sql,
+M0134-0039) confirmed dominated by this exact gap.
 
-Gates run this loop: none required — bookkeeping-only PARK, no code
-changed. make ralph-state-guard: run before finishing this loop.
+Next step: per fix_plan.md banner, select **M0134-0041 (jsonpath.sql, status
+`failed`)** next. Size it first via `scripts/pg-regress-runner.sh --verbose
+jsonpath` (delegate to researcher). Strong prior expectation (by name alone)
+that it will ALSO be dominated by the same absent jsonpath subsystem — if
+confirmed (3-for-3), stop parking individual files and instead promote
+"implement the SQL/JSON jsonpath grammar+evaluator" to its own dedicated
+multi-loop epic: write a design doc under `docs/design/` (grammar subset
+needed: `$.foo`, array/object accessors, `==`/`&&`/`||`/comparison operators,
+filter expressions `?()`, `strict`/`lax` mode), decompose into slices (lexer/
+parser for the jsonpath literal type itself, tree-walking evaluator over
+decoded jsonb, wire `@?`/`@@` operators + `jsonb_path_*` function family
+dispatch), and work it across several loops. That epic would very likely flip
+all three files (jsonb.sql's jsonpath bucket, jsonb_jsonpath.sql,
+jsonpath.sql) plus unblock jsonb.sql's remaining `?`/`?|`/`?&` bucket at the
+same time.
+
+Gates run this loop: none (bookkeeping-only loop, no source/test files
+touched) — `make ralph-state-guard` still run before status block per
+standing rule.
+
+Delegation: none in flight — the sizing researcher call completed and its
+findings are folded into the ledger/fix_plan rows above; no handoff dir left
+open.
 
 In-flight: none.
