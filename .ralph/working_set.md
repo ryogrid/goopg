@@ -1,55 +1,50 @@
 (idle — nothing in flight)
 
-Last completed: M0134-0037 (join_hash.sql) PARKED and committed
-(866cbc26 impl + 48e68067 bookkeeping) — sized at HEAD via
-`scripts/pg-regress-runner.sh --verbose join_hash` (no env-sensitivity):
-1001 raw diff lines / 21 `^+ERROR` / 0 `^-ERROR`, five root-cause buckets.
-Shipped the one CONTAINED bucket (A2, 4/21 errors): `json_extract_path`,
-`json_extract_path_text`, `jsonb_extract_path`, `jsonb_extract_path_text`
-were seeded in pg_proc but had no case in the executor builtin-function
-dispatch (`internal/executor/expr.go`) — added shared path-walk primitive
-`jsonPathStep` (mirrors PG's `get_path_all`/`get_worker`,
-postgres/src/backend/utils/adt/jsonfuncs.c) and reused `evalJSONArrow`'s
-rendering tail (factored into `jsonElemAsJSONDatum`/`jsonElemAsTextDatum`,
-pure refactor). Verified live: `hash_join_batches('select 1')` no longer
-42883s on the missing builtin.
+Last completed: M0134-0038 (json.sql) PARKED with deferral ledger rows
+(no code change — bookkeeping-only loop). Sized at HEAD via
+`scripts/pg-regress-runner.sh --verbose json`: 3156 raw diff lines, 325
+`^+ERROR` / 93 `^-ERROR`, 0/1 PASS. Unlike the prior several M0134 cases,
+no CONTAINED bucket existed to ship this loop — every bucket is either a
+genuinely missing feature family (REFACTOR-tier) or unsized:
+- Bucket 1 (DOMINANT, ~280+ of 325 `^+ERROR`): almost the entire JSON
+  constructor/deconstructor builtin family (`to_json`, `json_build_object`,
+  `json_build_array`, `json_object`, `row_to_json`, `array_to_json`,
+  `json_strip_nulls`, `json_array_length`, `json_object_keys`, ~15+ fns) is
+  unimplemented past its pg_proc seed row. `internal/executor/expr.go:11697`
+  has exactly one JSON case (the M0134-0037 extract_path family). Needs a
+  shared JSON-value internal encoder goopg doesn't have yet. Already flagged
+  systemic in M0134-0002's ledger row.
+- Bucket 2: table-valued JSON SRFs (json_each, json_array_elements,
+  json_populate_record[set]) entirely unimplemented — needs real
+  SRF/tupledesc plumbing.
+- Bucket 3: parser has NO support for function column-definition lists
+  (`AS q(a text, b text)`) — blocks several Bucket-2 SRFs even once built.
+  `internal/parser/select.go:1591-1632`.
+- Bucket 4 (out of scope): to_tsvector/ts_headline calls incidental to this
+  file — full-text-search subsystem, unrelated.
+- Bucket 5 (unsized, likely CONTAINED): `::json #> array[...]` parser
+  syntax error on `#>` operator token — not root-caused this loop.
+- Confirmed: json.sql has ZERO `RETURNS TABLE` plpgsql functions, so
+  M0134-0037's Bucket A does not resurface here.
 
-Left unshipped, all ledgered 2026-08-20 under M0134-0037:
-- Bucket A (DOMINANT, ~71% of errors): `RETURNS TABLE` plpgsql function
-  used unaliased in FROM fails 42703 on explicit OUT-column refs at plan
-  time, and even `SELECT *` returns NULL values — engine-wide (repro'd
-  with a throwaway 2-line function), traced to
-  `internal/optimizer/planner.go`'s `isSimpleSingle` fast path (~1001-1054)
-  but not pinned to one line. **Top re-arm priority** — needs a live-debug
-  trace session (print `b.table.Columns` post-`planScanRangeVar` vs what
-  `resolveColumnRefAt` sees), likely affects other regress cases using
-  `RETURNS TABLE` too.
-- Bucket B: no Parallel Hash/Parallel Hash Join executor node (REFACTOR,
-  sibling of M0134-0023's parallel-worker gap).
-- Bucket C: FULL JOIN planned Merge not Hash — same cost-model territory
-  as the CLOSED M0126 dead end (`q9_costdriven_mhj_cannot_be_cost_forced`);
-  do not re-attempt without new evidence.
-- Bucket D: correlated-subplan-as-HashCond planning + EXPLAIN VERBOSE
-  subplan rendering (REFACTOR, engine-wide).
-- Bucket E: LATERAL subquery's nested JOIN ON-clause can't see the
-  lateral sibling's column — likely CONTAINED once traced, not
-  investigated to a fix location this loop.
-Design doc not needed (mechanical, same size class as prior shipped
-buckets — thin wrapper around an existing rendering primitive).
+Most-leveraged next slice if this JSON-builtins epic gets its own task:
+scalar-only `to_json`/`row_to_json`/`array_to_json` (no SRF, no Bucket-3
+parser work needed) — cross-links to the already-ledgered M0134-0002 gap,
+but it's net-new implementation (needs a JSON encoder), not a bug fix, so
+it should be scoped as its own dedicated task rather than folded into a
+"size the next case" loop.
 
-Next loop: per fix_plan.md banner, select M0134-0038 (json.sql, status
-`failed`) — same sizing pattern as 0006..0037 (researcher sizes at HEAD
-first, confirm not stale, bucket root causes CONTAINED vs REFACTOR-tier,
-ship the smallest CONTAINED bucket or PARK with ledger rows). Also worth
-noting: Bucket A above (RETURNS TABLE column resolution) may resurface
-independently in json.sql/jsonb.sql if either uses RETURNS TABLE
-functions — check for it opportunistically while sizing.
+Next loop: per fix_plan.md banner, select M0134-0039 (jsonb.sql, status
+`failed`) — same sizing pattern (researcher sizes at HEAD first, confirm
+not stale, bucket root causes CONTAINED vs REFACTOR-tier, ship the
+smallest CONTAINED bucket or PARK with ledger rows). jsonb.sql likely
+shares Bucket 1's missing-JSON-builtin-family root cause with json.sql —
+if so, sizing should explicitly cross-reference this row rather than
+re-deriving it, and the JSON-builtins epic may be worth promoting to its
+own dedicated multi-loop task given it now blocks (at least) two regress
+cases.
 
-Gates run this loop: go build ./... PASS; go test
-./internal/executor/... ./internal/parser/... ./internal/catalog/... PASS;
-RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh PASS (worker
-round); live-server smoke of all 6 AC queries + AC-8 PASS (worker round);
-pgbench pre-commit smoke PASS on both commits; make ralph-state-guard TBD
-(run before finishing this loop).
+Gates run this loop: none required — bookkeeping-only PARK, no code
+changed. make ralph-state-guard: run before finishing this loop.
 
 In-flight: none.
