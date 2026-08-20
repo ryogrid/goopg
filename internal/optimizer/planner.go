@@ -7383,6 +7383,16 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		if err != nil {
 			return nil, err
 		}
+		// M0134-0025: a correlated (outer-level) reference is not part of this
+		// query's grouping surface at all — PG's check_ungrouped_columns
+		// (parse_agg.c) skips any Var with varlevelsup != 0. Return it
+		// unchanged: no groupByInputCol/funcDepCols lookup, no Passthrough
+		// registration, since that machinery proves LOCAL GROUP BY membership
+		// only and OuterColumnRef.Index addresses ctx.OuterRows[Level], a
+		// different address space than agg.input's local child schema.
+		if oc, ok := resolved.(*OuterColumnRef); ok {
+			return oc, nil
+		}
 		col := resolved.(*ColumnRef)
 		idx, ok := agg.groupByInputCol[col.Index]
 		// M0097-0155: reject USING-merge GROUP BY match for qualified SELECT refs.
