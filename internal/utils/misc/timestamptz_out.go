@@ -95,15 +95,81 @@ func TimeTZSessionOffset(zone string, hour, min, sec int) int {
 // zone-less timestamp); the result is the corresponding absolute instant, again
 // expressed in UTC.
 //
-// Upstream calls DetermineTimeZoneOffset(tm, session_timezone) for the offset;
-// Go's time.Date(..., loc) performs the same local→absolute resolution. The two
-// agree on the ordinary case and on the DST-ambiguity preference (both take the
-// earlier of two candidate offsets); the spring-forward "nonexistent local time"
-// case is NOT asserted to match — see the deferral ledger. M0119-0006.
+// Upstream calls DetermineTimeZoneOffset(tm, session_timezone) for the offset
+// (postgres/src/backend/utils/adt/datetime.c:1591-1740); M0134-0026 replaced
+// the previous plain time.Date(..., loc) call with resolveLocalWallClock below,
+// which reproduces that function's DST tie-break explicitly rather than
+// inheriting Go's own resolution — the two disagreed by exactly one hour, in
+// opposite directions, for BOTH the spring-forward "nonexistent local time" and
+// fall-back "ambiguous local time" cases (measured against a live PG 18.3
+// oracle for America/Los_Angeles; see the M0134-0026 report). This was
+// previously deferred (M0119-0006); the deferral is now resolved.
 func TimestampToTimestampTZ(t time.Time, zone string) time.Time {
 	u := t.UTC()
-	return time.Date(u.Year(), u.Month(), u.Day(), u.Hour(), u.Minute(), u.Second(),
-		u.Nanosecond(), sessionLocation(zone)).UTC()
+	wall := time.Date(u.Year(), u.Month(), u.Day(), u.Hour(), u.Minute(), u.Second(),
+		u.Nanosecond(), time.UTC)
+	return resolveLocalWallClock(wall, sessionLocation(zone))
+}
+
+// resolveLocalWallClock ports DetermineTimeZoneOffset (postgres/src/backend/
+// utils/adt/datetime.c:1591-1740): wall carries LOCAL wall-clock fields tagged
+// UTC (goopg's zone-less convention, as TimestampToTimestampTZ's `t` does), and
+// the result is the absolute UTC instant those fields denote in loc.
+//
+// Upstream treats an ordinary local time (exactly one candidate GMT offset)
+// differently from the two DST-transition edge cases (datetime.c:1719-1733),
+// and the difference is a defined rule, not an implementation detail:
+//
+//   - spring-forward / NON-EXISTENT local time (the clock skips this wall time
+//     entirely) → prefer the offset in effect BEFORE the transition;
+//   - fall-back / AMBIGUOUS local time (the clock reaches this wall time
+//     twice) → prefer the offset in effect AFTER the transition.
+//
+// Go's time.Date resolves both cases by its own rule, which measured against a
+// live PG 18.3 oracle disagreed with upstream by exactly one hour, in opposite
+// directions, for both edge cases on America/Los_Angeles — so the tie-break is
+// implemented here explicitly. The two candidate offsets and the transition
+// boundary between them are read from Go's own tzdata via Time.Zone and
+// Time.ZoneBounds, sampled 36h to either side of wall — comfortably outside any
+// single DST gap or overlap, which upstream's own SECS_PER_DAY backup-and-scan
+// in DetermineTimeZoneOffsetInternal relies on the same property for.
+func resolveLocalWallClock(wall time.Time, loc *time.Location) time.Time {
+	const probe = 36 * time.Hour
+	before := wall.Add(-probe)
+	after := wall.Add(probe)
+	_, beforeOff := before.In(loc).Zone()
+	_, afterOff := after.In(loc).Zone()
+	if beforeOff == afterOff {
+		// No DST transition within the sampled window: one candidate offset,
+		// upstream's "non-DST zone, life is simple" arm.
+		return wall.Add(-time.Duration(beforeOff) * time.Second)
+	}
+	_, boundary := before.In(loc).ZoneBounds()
+	beforeTime := wall.Add(-time.Duration(beforeOff) * time.Second)
+	afterTime := wall.Add(-time.Duration(afterOff) * time.Second)
+	if boundary.IsZero() {
+		// No upper bound within the sampled window (should not happen given
+		// beforeOff != afterOff, but fall back to the after-transition offset
+		// rather than risk a zero Time comparison below).
+		return afterTime
+	}
+	switch {
+	case beforeTime.Before(boundary) && afterTime.Before(boundary):
+		// Both candidates land before the transition: ordinary time using the
+		// before-transition offset.
+		return beforeTime
+	case beforeTime.After(boundary) && !afterTime.Before(boundary):
+		// Both candidates land at-or-after the transition: ordinary time using
+		// the after-transition offset.
+		return afterTime
+	case beforeTime.After(afterTime):
+		// Spring-forward gap: prefer the before-transition offset
+		// (datetime.c:1719-1733).
+		return beforeTime
+	default:
+		// Fall-back overlap: prefer the after-transition offset.
+		return afterTime
+	}
 }
 
 // TimestampTZToTimestamp ports timestamptz2timestamp (same file): the stored

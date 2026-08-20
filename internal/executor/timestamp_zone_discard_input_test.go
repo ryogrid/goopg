@@ -44,8 +44,21 @@ func TestTimestampInputDiscardsZoneButTimestamptzKeepsIt(t *testing.T) {
 		{"2020-01-01 10:00:00Z", tsDiscardZone, wall(2020, 1, 1, 10, 0, 0)},
 		{"2020-01-01T10:00:00+05:30", tsDiscardZone, wall(2020, 1, 1, 10, 0, 0)},
 		{"2020-01-02 02:00:00+05:30", tsDiscardZone, wall(2020, 1, 2, 2, 0, 0)},
-		// A zone-less spelling is unaffected by the rule — both modes agree.
+		// A zone-less `timestamp` spelling is unaffected by the tsZoneMode rule
+		// (there is no zone to keep or discard either way).
 		{"2020-01-01 10:00:00", tsDiscardZone, wall(2020, 1, 1, 10, 0, 0)},
+		// M0134-0026: a zone-less `timestamptz` spelling is NOT simply "the
+		// same as tsDiscardZone" in general — DecodeDateTime reads it as local
+		// wall-clock time in the SESSION TimeZone GUC and converts to UTC
+		// (datetime.c:1573-1583). This assertion only continues to hold
+		// because parsePGTimestampTextZone (unlike the production callers) is
+		// the UTC-session convenience wrapper: it always resolves the
+		// zone-less branch against sessionZone="" (UTC), where "read as local
+		// time and convert to UTC" is the identity. A real, non-UTC session
+		// answers a DIFFERENT UTC instant — see
+		// TestTimestamptzLiteralAppliesSessionTimeZone
+		// (timestamptz_literal_session_zone_test.go), which pins that case
+		// against a live PG 18.3 oracle and is the guard for the actual fix.
 		{"2020-01-01 10:00:00", tsApplyZone, wall(2020, 1, 1, 10, 0, 0)},
 		// timestamptz: the offset shifts the value onto the UTC line, which is
 		// what the KindTime carrier stores.

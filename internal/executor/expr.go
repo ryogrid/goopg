@@ -3023,6 +3023,10 @@ func evalOr(a, b Datum) Datum {
 // SESSION TimeZone. That arm never fills CachedTime — it must not, since the
 // cache is keyed on the planner node alone and would freeze one session's zone
 // into a plan another session reuses.
+//
+// M0134-0026: the timestamptz arm now has the same hazard for a zone-less
+// literal (it also reads the session TimeZone) and follows the same rule —
+// see usedSession in that arm.
 func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error) {
 	if x.CacheValid {
 		return NewTimeDatum(x.CachedTime), nil
@@ -3205,23 +3209,34 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 		// input carries — TIMESTAMP '2020-01-01 10:00:00+05:30' is 10:00:00, the
 		// offset parsed and thrown away, while the TIMESTAMPTZ spelling of the
 		// same text is 04:30:00 UTC. See tsZoneMode.
-		t, err := parsePGTimestampTextZone(x.Value, tsZoneModeForType(x.Type))
+		//
+		// M0134-0026: a zone-less TIMESTAMPTZ literal is read as local wall-clock
+		// time in the session TimeZone GUC (DecodeDateTime, datetime.c:1573-
+		// 1583), which parsePGTimestampTextZoneSession needs ctx's setting for.
+		// usedSession reports whether that branch actually fired; when it did,
+		// the answer depends on THIS session's TimeZone, so — like the timetz
+		// arm above — it must not be written to x.CachedTime/x.CacheValid, or a
+		// different session with a different TimeZone reusing this plan node
+		// would get the wrong instant.
+		t, usedSession, err := parsePGTimestampTextZoneSession(x.Value, tsZoneModeForType(x.Type), timeZoneFromCtx(ctx))
 		if err != nil {
 			if ee := dateTimeInputError(err, x.Type, x.Value, x.Pos()); ee.Code == "22008" {
 				return Datum{}, ee
 			}
 			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid timestamp %q", x.Value)}
 		}
-		x.CachedTime = t
-		x.CacheValid = true
+		if !usedSession {
+			x.CachedTime = t
+			x.CacheValid = true
+		}
 		// M0119-0006 (40th slice): the literal's own type also decides how the
 		// value is later RENDERED by type-agnostic paths, not just how its zone
 		// was read above — so tag the timestamptz spelling. Same split as
 		// tsZoneModeForType makes on the input side, one type name apart.
 		if isTimestampTZTypeName(x.Type) {
-			return NewTimestampTZDatum(x.CachedTime), nil
+			return NewTimestampTZDatum(t), nil
 		}
-		return NewTimeDatum(x.CachedTime), nil
+		return NewTimeDatum(t), nil
 	default:
 		// Unknown type — treat as text literal. Covers enum/domain casts in v0.
 		// M0097-0017: enum/domain type casts return the string value as-is.
@@ -4072,8 +4087,15 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 				return inf, nil
 			}
 			// `::timestamp` discards a zone the text carries, `::timestamptz`
-			// applies it (tsZoneMode).
-			ts, err := parseCopyTimestampZone(d.StringValue(), tsZoneModeForType(targetType))
+			// applies it (tsZoneMode). M0134-0026: a zone-less `::timestamptz`
+			// reads the wall clock as local time in the session TimeZone GUC
+			// (DecodeDateTime, datetime.c:1573-1583) — this arm also covers a
+			// bound extended-protocol text parameter coerced to timestamptz
+			// (CoerceParamToDeclaredType → evalCast), so timeZoneFromCtx(ctx)
+			// must be threaded through here too, not just the typed-literal
+			// arm (evalTypedStringLit). No caching hazard here: evalCast does
+			// not cache its result on a plan node.
+			ts, err := parseCopyTimestampZoneSession(d.StringValue(), tsZoneModeForType(targetType), timeZoneFromCtx(ctx))
 			if err != nil {
 				return Datum{}, dateTimeInputError(err, "timestamp", d.StringValue(), pos)
 			}
