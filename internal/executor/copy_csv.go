@@ -137,7 +137,11 @@ func EncodeCopyCsvRow(dst []byte, row Row, cols []catalog.Column, f copyToFormat
 		if err != nil {
 			return nil, err
 		}
-		fq := f.forceQuoteAll || f.forceQuote[c.Name]
+		// Force-quote when the rendered text would otherwise be
+		// indistinguishable from NULL (matches f.nullStr unquoted) or,
+		// on a single-column row, from the COPY end-of-data marker `\.`
+		// (postgres/src/backend/commands/copyto.c CopyAttributeOutCSV).
+		fq := f.forceQuoteAll || f.forceQuote[c.Name] || s == f.nullStr || (len(cols) == 1 && s == "\\.")
 		dst = appendCsvField(dst, s, fq, f.delim, f.quote, f.escape)
 	}
 	return append(dst, '\n'), nil
