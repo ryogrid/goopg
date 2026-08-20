@@ -49,6 +49,11 @@ The regress directory alone is intentionally counted under two `suite_id`
 buckets (`regress-sql` = the `.sql` inputs, `regress-expected` = the expected
 outputs) — these describe the *same* cases from two sides.
 
+> **Superseded 2026-08-20.** This double-bucketing was judged accidental, not
+> intentional, and was undone: the 232 duplicated `regress-expected` rows are
+> gone and only 33 alternate-output rows remain. The table row above records
+> the historical counts. See §B.4.
+
 ---
 
 ## B. What a regression batch must do to avoid double-counting
@@ -66,7 +71,15 @@ outputs) — these describe the *same* cases from two sides.
    `regress-sql` inventory row. Pick one execution path per spec (the Go
    `testport` entry is the runnable one; the CSV rows are tracking metadata).
 4. **Reconcile `regress-sql` vs `regress-expected`** as one logical case per
-   test name, not two.
+   test name, not two. — **RESOLVED 2026-08-20.** The 232 `regress-expected`
+   rows that duplicated a `regress-sql` case were deleted from
+   `docs/test-port/postgres-oracle-target-inventory.csv` (914 → 682 lines;
+   `regress-expected` 265 → 33). A regress case with a `.sql` file is now
+   tracked exactly once, in `regress-sql`; the surviving 33 `regress-expected`
+   rows are the upstream alternate-output variants that have no `.sql`
+   (`char_1.out`, `xml_2.out`, `collate.icu.utf8_1.out`, …). See the
+   "One row per logical regress case" section of `docs/test-port/README.md`.
+   The prose in §A.3 below describes the pre-2026-08-20 layout.
 
 ---
 

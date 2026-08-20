@@ -35,6 +35,22 @@ id, suite_id, kind, item_path, status, pass_required, deferred_to, rationale
 | `deferred_to` | milestone/task reference for `defer` rows, `-` otherwise |
 | `rationale` | human rationale; a `port` row must name its `TestPort_*`/`TestE2E_*` func |
 
+### One row per logical regress case
+
+`regress-sql` and `regress-expected` used to carry a row for the *same* case —
+`sql/<name>.sql` and `expected/<name>.out` — which double-counted every regress
+case in every derived report. The 232 duplicate `regress-expected` rows were
+removed on 2026-08-20.
+
+The invariant now: **a regress case that has a `.sql` file is tracked exactly
+once, in `regress-sql`.** `regress-expected` holds only the 33 upstream
+*alternate-output* files that have no `.sql` of their own — the
+platform/encoding/collation variants pg_regress picks between (`char_1.out`,
+`xml_2.out`, `collate.icu.utf8_1.out`, `float4-misrounded-input.out`, …).
+
+Do not re-add an `expected/<name>.out` row for a case that already has a
+`sql/<name>.sql` row; record its outcome on the `regress-sql` row instead.
+
 ## Status vocabulary
 
 - `pass` / `failed` / `not-tried` — per-case execution outcome
