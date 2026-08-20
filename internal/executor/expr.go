@@ -13817,6 +13817,19 @@ func evalSubstr(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "substr first argument must be text"}
 	}
 	if fromArg.Kind != KindInt {
+		// SQL-standard regex form: SUBSTRING(str FROM pattern) with a TEXT
+		// pattern rather than an integer start position. PG resolves this via
+		// overload resolution on the static argument type (int4 vs text); goopg's
+		// eval-time Kind check plays the same role. Only the 2-arg FROM-only form
+		// is valid here — a 3-arg call with a text pattern isn't a real PG form
+		// (PG's grammar has no FROM-pattern-FOR-count overload), so it falls
+		// through to the same error as today. M0134-0061.
+		if len(x.Args) == 2 && fromArg.Kind == KindString {
+			if src.Kind != KindString {
+				return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "substr first argument must be text"}
+			}
+			return evalSubstrRegex(src.StringValue(), fromArg.StringValue(), x.Pos())
+		}
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "substr second argument must be integer"}
 	}
 	// bytea_substr (varlena.c) slices BYTES and returns bytea. The window
@@ -13874,6 +13887,44 @@ func evalSubstr(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		endIdx = len(s)
 	}
 	return mkResult(s[startIdx:endIdx]), nil
+}
+
+// evalSubstrRegex implements the SQL-standard regex form of SUBSTRING —
+// `SUBSTRING(str FROM pattern)` where pattern is POSIX-regex text, not an
+// integer start position. Mirrors upstream's `textregexsubstr`
+// (postgres/src/backend/utils/adt/regexp.c:583-627): compile the pattern
+// (REG_ADVANCED upstream; here via the shared pgPatternToGoRE2 + regexp.Compile
+// path already used by evalPOSIXRegex and friends), execute with nmatch=2 (Go:
+// FindStringSubmatchIndex). If the pattern has a parenthesized subexpression
+// (re_nsub > 0), the result is ALWAYS taken from that subexpression's match —
+// even when it didn't participate in an otherwise-successful overall match
+// (upstream's own comment: `'foo(bar)?'` matches `'foo'` overall but the
+// subexpression doesn't participate, so `so < 0 || eo < 0` and the function
+// returns NULL, not the whole match). Only when the pattern has NO
+// parenthesized subexpression at all does the whole match get returned.
+// M0134-0061.
+func evalSubstrRegex(src, pattern string, pos int) (Datum, error) {
+	goPattern := pgPatternToGoRE2(pattern)
+	re, err := regexp.Compile(goPattern)
+	if err != nil {
+		return Datum{}, &ExecError{Code: "2201B", Pos: pos, Message: fmt.Sprintf("invalid regular expression: %v", err)}
+	}
+	loc := re.FindStringSubmatchIndex(src)
+	if loc == nil {
+		// Overall match failed: upstream's RE_execute returns no match → NULL.
+		return NullDatum, nil
+	}
+	// loc[0],loc[1] = whole match; loc[2],loc[3] = first subexpression (if any).
+	var so, eo int
+	if len(loc) >= 4 {
+		so, eo = loc[2], loc[3]
+	} else {
+		so, eo = loc[0], loc[1]
+	}
+	if so < 0 || eo < 0 {
+		return NullDatum, nil
+	}
+	return NewStringDatum(src[so:eo]), nil
 }
 
 // evalToTimestamp implements PostgreSQL's `to_timestamp(text,
