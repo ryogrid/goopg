@@ -1,49 +1,53 @@
-Task: M0134-0040 (jsonb_jsonpath.sql) — PARKED, no code change this loop.
+Task: M0134-0041 (jsonpath.sql) — PARKED, no code change this loop. Promoted
+the 3-for-3 confirmed jsonpath gap to its own milestone **M0135** (design
+doc written, 4 slices filed).
 
-Files: `.ralph/deferral_ledger.md` (new row), `.ralph/fix_plan.md` (M0134-0040
-entry updated to PARKED with sizing).
+Files: `.ralph/fix_plan.md` (M0134-0041 entry PARKED; new M0135 milestone
+section with S1-S4 appended at foot), `.ralph/deferral_ledger.md` (2 new
+rows: the jsonpath-subsystem gap + the unrelated `unnest(...) str` alias
+bug), `docs/design/m0135-0001-jsonpath-subsystem.md` (new, draft),
+`docs/design/README.md` (indexed).
 
-Key symbols: none touched (bookkeeping-only loop) — the file's own gap is the
-absent jsonpath grammar/evaluator subsystem (would live under a new
-`internal/executor/jsonpath/` or similar, none exists yet).
+Key symbols: none touched (bookkeeping/design-only loop). Future S1 work
+lands in a new `internal/executor/jsonpath/` package (lexer.go/parser.go/
+ast.go/eval.go), wiring `jsonpath_in`/`jsonpath_out`
+(`internal/initdb/pg_proc_seed_data.go:2713-2715`, currently zero executor
+dispatch).
 
-Hypothesis/Findings: `researcher` sized jsonb_jsonpath.sql at HEAD via
-`scripts/pg-regress-runner.sh --verbose jsonb_jsonpath`: 6175 diff lines, 818
-`^+ERROR` / 244 `^-ERROR`, 0/1 PASS. 817/818 (99.9%) trace to ONE gap: no SQL/JSON
-jsonpath parser or evaluator exists anywhere in goopg (confirmed via
-`grep jsonb_path internal/executor/expr.go` = zero hits; `pg_proc` has the
-catalog rows but no dispatch case). Breakdown: 717 `^+ERROR` from
-`jsonb_path_query[_tz/_array/_first]`/`jsonb_path_match`/`jsonb_path_exists`
-family (uncalled builtins), 87 from `@?`/`@@` operators entirely unlexed
-(`internal/parser/lexer.go` has no token for either), 13 downstream
-parse-cascade. No CONTAINED bucket exists to peel off (unlike M0134-0037/0038/
-0039) — the whole file is REFACTOR-tier. PG oracle: `postgres/src/backend/
-utils/adt/jsonpath.c` (grammar), `jsonpath_exec.c` (evaluator). Ledger row
-appended with full detail. This is now the SECOND file (after jsonb.sql,
-M0134-0039) confirmed dominated by this exact gap.
+Hypothesis/Findings: `researcher` sized jsonpath.sql at HEAD — 1443 diff
+lines, 0/1 PASS, only 1 `^+ERROR` / 36 `^-ERROR` (a DIFFERENT shape than
+M0134-0039/0040's `+ERROR`-dominated failures). This file never calls
+`jsonb_path_query`/`@?`/`@@`; it's pure `::jsonpath` type-I/O
+(parse-text→tree→canonical-print), and goopg's cast is a naive passthrough.
+~950 lines are canonicalization mismatches (quoting/spacing/numeric
+normalization), 36 `^-ERROR` are malformed-jsonpath-text goopg wrongly
+accepts. **3-for-3 confirmed**: jsonb.sql (M0134-0039), jsonb_jsonpath.sql
+(M0134-0040), jsonpath.sql (M0134-0041) all trace to the same absent
+jsonpath subsystem (no lexer/parser/pretty-printer/evaluator anywhere in
+goopg, only pg_type/pg_proc catalog scaffolding). Per the standing plan
+(recorded in the M0134-0040 fix_plan row), promoted to milestone M0135
+rather than parking a fourth isolated file. One incidental unrelated bug
+surfaced: `FROM unnest(...) str` single-column-SRF-alias resolution
+(`column "str" does not exist"`) — deliberately kept OUT of M0135 (own
+ledger row, file as its own M0134 task later).
 
-Next step: per fix_plan.md banner, select **M0134-0041 (jsonpath.sql, status
-`failed`)** next. Size it first via `scripts/pg-regress-runner.sh --verbose
-jsonpath` (delegate to researcher). Strong prior expectation (by name alone)
-that it will ALSO be dominated by the same absent jsonpath subsystem — if
-confirmed (3-for-3), stop parking individual files and instead promote
-"implement the SQL/JSON jsonpath grammar+evaluator" to its own dedicated
-multi-loop epic: write a design doc under `docs/design/` (grammar subset
-needed: `$.foo`, array/object accessors, `==`/`&&`/`||`/comparison operators,
-filter expressions `?()`, `strict`/`lax` mode), decompose into slices (lexer/
-parser for the jsonpath literal type itself, tree-walking evaluator over
-decoded jsonb, wire `@?`/`@@` operators + `jsonb_path_*` function family
-dispatch), and work it across several loops. That epic would very likely flip
-all three files (jsonb.sql's jsonpath bucket, jsonb_jsonpath.sql,
-jsonpath.sql) plus unblock jsonb.sql's remaining `?`/`?|`/`?&` bucket at the
-same time.
+Next step: per fix_plan.md banner (M-NIGHTLY → M0134), select the next
+M0134 task in ascending ID order (M0134-0042 onward — check
+`.ralph/fix_plan.md` for the next unchecked entry after 0041). M0135 itself
+is NOT auto-prioritized ahead of M0134's remaining single-file tasks; select
+M0135-S1 only when the banner names M0135 explicitly, or opportunistically
+if a future M0134 task lands back on jsonb.sql/jsonb_jsonpath.sql/
+jsonpath.sql and a real fix is wanted instead of another park. M0135-S1
+(lexer+parser+pretty-printer, `docs/design/m0135-0001-jsonpath-subsystem.md`
+§S1) is sized as a normal implementer-brief-sized slice when selected — it
+alone is expected to flip M0134-0041 to `pass`.
 
-Gates run this loop: none (bookkeeping-only loop, no source/test files
-touched) — `make ralph-state-guard` still run before status block per
+Gates run this loop: none (bookkeeping/design-only loop, no source/test
+files touched) — `make ralph-state-guard` still run before status block per
 standing rule.
 
-Delegation: none in flight — the sizing researcher call completed and its
-findings are folded into the ledger/fix_plan rows above; no handoff dir left
-open.
+Delegation: none in flight — the sizing researcher call (agentId
+afe6de915fea438a0) completed and its findings are folded into the ledger/
+fix_plan/design-doc rows above; no handoff dir opened this loop.
 
 In-flight: none.
