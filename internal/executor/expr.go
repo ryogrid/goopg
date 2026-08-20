@@ -11039,64 +11039,12 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 		// Compute hash: for each non-NULL key value, call the operator class hash
 		// function (or the built-in type default) and fold with hash_combine64.
-		var rowHash uint64
-		seedInt64 := int64(hashPartitionSeed)
-		for i := 0; i < numKeys; i++ {
-			valDatum, verr := evalExpr(x.Args[3+i], row, ctx)
-			if verr != nil {
-				return NullDatum, verr
-			}
-			if valDatum.IsNull() {
-				continue // NULL values are skipped (PG behavior)
-			}
-			opClass := ""
-			if i < len(tbl.PartitionKeyOpClasses) {
-				opClass = tbl.PartitionKeyOpClasses[i]
-			}
-			var h uint64
-			if opClass != "" {
-				// Custom operator class: look up FUNCTION 2 and call it(val, seed).
-				hashFuncName, hasFn := im.LookupOpClassHashFunc(opClass)
-				if hasFn {
-					routines := ctx.Catalog.Routines()
-					rs := routines.LookupByName(parser.ObjectName{Name: hashFuncName})
-					seedDatum := NewIntDatum(seedInt64)
-					var bestRoutine *catalog.Routine
-					for _, r := range rs {
-						if len(r.ArgTypes) == 2 {
-							bestRoutine = r
-							break
-						}
-					}
-					if bestRoutine != nil {
-						hResult, herr := executeStoredRoutine(bestRoutine, []Datum{valDatum, seedDatum}, ctx, x.Pos())
-						if herr != nil {
-							return NullDatum, herr
-						}
-						if !hResult.IsNull() {
-							h = uint64(hResult.Int)
-						}
-					}
-				}
-			} else {
-				// Default hash: type-based built-in hash functions.
-				colType := ""
-				for _, col := range tbl.Columns {
-					if strings.EqualFold(col.Name, tbl.PartitionKey[i]) {
-						colType = strings.ToLower(col.Type.Name)
-						break
-					}
-				}
-				switch {
-				case colType == "int4" || colType == "integer" || colType == "int" || valDatum.Kind == KindInt:
-					h = pgHashUint32Extended(uint32(valDatum.Int), hashPartitionSeed)
-				case colType == "text" || colType == "varchar" || colType == "bpchar" || valDatum.Kind == KindString:
-					h = pgHashBytesExtended([]byte(valDatum.StringValue()), hashPartitionSeed)
-				default:
-					h = pgHashUint32Extended(uint32(valDatum.Int), hashPartitionSeed)
-				}
-			}
-			rowHash = pgHashCombine64(rowHash, h)
+		// Shared with INSERT-time HASH partition routing — M0134-0053.
+		rowHash, herr := computeHashPartitionRowHash(tbl, im, ctx, x.Pos(), func(i int) (Datum, error) {
+			return evalExpr(x.Args[3+i], row, ctx)
+		})
+		if herr != nil {
+			return NullDatum, herr
 		}
 		return NewBoolDatum(uint64(rowHash)%uint64(modulus) == uint64(remainder)), nil
 	case "merge_action":

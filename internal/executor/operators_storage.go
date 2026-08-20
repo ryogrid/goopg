@@ -2970,50 +2970,16 @@ func routeToPartitionDepth(parent *catalog.Table, row Row, im *catalog.InMemory,
 		}
 		child = im.FindRangePartitionForDatums(parent.OID, keyStrs)
 	case "HASH":
-		opClass := ""
-		if len(parent.PartitionKeyOpClasses) > 0 {
-			opClass = parent.PartitionKeyOpClasses[0]
+		// Fold the hash of ALL partition-key columns (not just column 0) via
+		// the shared satisfies_hash_partition() algorithm, then match against
+		// each partition's (modulus, remainder) bound — mirrors PG's
+		// satisfies_hash_partition()/compute_partition_hash_value() in
+		// postgres/src/backend/partitioning/partbounds.c. M0134-0053.
+		rowHash, herr := computeHashPartitionRowHash(parent, im, ctx, 0, resolvePartitionKeyDatum)
+		if herr != nil {
+			return nil, herr
 		}
-		if opClass != "" && ctx != nil {
-			// Use custom operator class hash function (FUNCTION 2). M0097-0022.
-			hashFuncName, hasFn := im.LookupOpClassHashFunc(opClass)
-			if hasFn {
-				routines := ctx.Catalog.Routines()
-				if routines != nil {
-					rs := routines.LookupByName(parser.ObjectName{Name: hashFuncName})
-					var bestRoutine *catalog.Routine
-					for _, r := range rs {
-						if len(r.ArgTypes) == 2 {
-							bestRoutine = r
-							break
-						}
-					}
-					if bestRoutine != nil {
-						seedDatum := NewIntDatum(int64(hashPartitionSeed))
-						hResult, herr := executeStoredRoutine(bestRoutine, []Datum{keyDatum, seedDatum}, ctx, 0)
-						if herr != nil {
-							return nil, herr
-						}
-						if !hResult.IsNull() {
-							h := uint64(hResult.Int)
-							child = im.FindHashPartitionByHash(parent.OID, h)
-						}
-					}
-				}
-			}
-		}
-		if child == nil && opClass == "" {
-			// Default built-in hash: use string representation of key. M0097-0015.
-			keyStr := ""
-			if keyDatum.Kind == KindInt {
-				keyStr = fmt.Sprintf("%d", keyDatum.Int)
-			} else if keyDatum.Kind == KindString {
-				keyStr = keyDatum.StringValue()
-			} else {
-				keyStr = keyDatum.Format()
-			}
-			child = im.FindHashPartitionForValue(parent.OID, keyStr)
-		}
+		child = im.FindHashPartitionByHash(parent.OID, rowHash)
 	}
 	// Snapshot-relative partition visibility: a child marked detach-pending by an
 	// in-progress ALTER TABLE … DETACH PARTITION … CONCURRENTLY is invisible to
