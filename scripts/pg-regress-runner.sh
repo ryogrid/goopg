@@ -246,6 +246,18 @@ if [[ "$RUN_SETUP" -eq 1 ]]; then
     # siblings: the btree CREATE INDEXes at create_index.sql:12-34 come first,
     # so an early timeout 300 still leaves tenk1/tenk2/onek indexed.
     timeout 300 "${PSQL[@]}" -f "${REGRESS_SQL}/create_index.sql" >/dev/null 2>&1 || true
+    echo "pg-regress-runner: running create_view.sql (street/iexit/toyemp/my_property_secure etc. for select_views.sql)..."
+    # create_view.sql creates the views (street, iexit, toyemp,
+    # my_property_normal/my_property_secure, and friends) that
+    # select_views.sql references throughout. Upstream runs create_view in
+    # the same schedule group as create_index (postgres/src/test/regress/
+    # parallel_schedule:46), and the very next group's comment says it
+    # explicitly: "select_views depends on create_view"
+    # (postgres/src/test/regress/parallel_schedule:103,105). Best-effort like
+    # the siblings: goopg may not support every view form in the file, but
+    # the views that do get created must persist so the separate psql -f of
+    # select_views.sql sees them in the same 'postgres' DB.
+    "${PSQL[@]}" -f "${REGRESS_SQL}/create_view.sql" >/dev/null 2>&1 || true
     echo "pg-regress-runner: running create_aggregate.sql (user-defined aggregates for aggregates.sql)..."
     # create_aggregate.sql defines the user-defined aggregates that
     # aggregates.sql references (newavg/newsum/newcnt/oldcnt/aggfstr/aggfns/
