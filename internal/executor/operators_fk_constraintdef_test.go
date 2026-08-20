@@ -82,8 +82,8 @@ func TestForeignKeySurfacesInPgConstraint(t *testing.T) {
 	if !ok {
 		t.Fatal("catalog is not *InMemory")
 	}
-	got := buildForeignKeyDefString(im, fk)
-	want := "FOREIGN KEY (pid) REFERENCES public.parent(id)"
+	got := buildForeignKeyDefString(ctx, im, fk)
+	want := "FOREIGN KEY (pid) REFERENCES parent(id)"
 	if got != want {
 		t.Errorf("buildForeignKeyDefString = %q, want %q", got, want)
 	}
@@ -128,8 +128,8 @@ func TestAlterTableAddForeignKeyCapturesActions(t *testing.T) {
 	if !ok {
 		t.Fatal("catalog is not *InMemory")
 	}
-	got := buildForeignKeyDefString(im, fk)
-	want := "FOREIGN KEY (pid) REFERENCES public.parent(id) ON UPDATE CASCADE ON DELETE SET NULL"
+	got := buildForeignKeyDefString(ctx, im, fk)
+	want := "FOREIGN KEY (pid) REFERENCES parent(id) ON UPDATE CASCADE ON DELETE SET NULL"
 	if got != want {
 		t.Errorf("buildForeignKeyDefString = %q, want %q", got, want)
 	}
@@ -211,12 +211,12 @@ func TestForeignKeyMatchFullRoundTrip(t *testing.T) {
 	if !ok {
 		t.Fatal("catalog is not *InMemory")
 	}
-	if got, want := buildForeignKeyDefString(im, fkFull),
-		"FOREIGN KEY (a, b) REFERENCES public.mref(a, b) MATCH FULL"; got != want {
+	if got, want := buildForeignKeyDefString(ctx, im, fkFull),
+		"FOREIGN KEY (a, b) REFERENCES mref(a, b) MATCH FULL"; got != want {
 		t.Errorf("buildForeignKeyDefString(MATCH FULL) = %q, want %q", got, want)
 	}
-	if got, want := buildForeignKeyDefString(im, fkSimple),
-		"FOREIGN KEY (a, b) REFERENCES public.mref(a, b) ON DELETE CASCADE"; got != want {
+	if got, want := buildForeignKeyDefString(ctx, im, fkSimple),
+		"FOREIGN KEY (a, b) REFERENCES mref(a, b) ON DELETE CASCADE"; got != want {
 		t.Errorf("buildForeignKeyDefString(MATCH SIMPLE) = %q, want %q", got, want)
 	}
 }
@@ -291,12 +291,12 @@ func TestForeignKeyOnDeleteSetColsRoundTrip(t *testing.T) {
 	if !ok {
 		t.Fatal("catalog is not *InMemory")
 	}
-	if got, want := buildForeignKeyDefString(im, fkSet),
-		"FOREIGN KEY (b) REFERENCES public.sref(id) ON DELETE SET NULL (b)"; got != want {
+	if got, want := buildForeignKeyDefString(ctx, im, fkSet),
+		"FOREIGN KEY (b) REFERENCES sref(id) ON DELETE SET NULL (b)"; got != want {
 		t.Errorf("buildForeignKeyDefString(SET NULL (b)) = %q, want %q", got, want)
 	}
-	if got, want := buildForeignKeyDefString(im, fkPlain),
-		"FOREIGN KEY (b) REFERENCES public.sref(id) ON DELETE SET NULL"; got != want {
+	if got, want := buildForeignKeyDefString(ctx, im, fkPlain),
+		"FOREIGN KEY (b) REFERENCES sref(id) ON DELETE SET NULL"; got != want {
 		t.Errorf("buildForeignKeyDefString(plain SET NULL) = %q, want %q", got, want)
 	}
 }
@@ -389,8 +389,8 @@ func TestCreateTableTableLevelCompositeForeignKey(t *testing.T) {
 	if !ok {
 		t.Fatal("catalog is not *InMemory")
 	}
-	got := buildForeignKeyDefString(im, bazFK)
-	want := "FOREIGN KEY (x, y) REFERENCES public.bar(a, b) ON DELETE CASCADE"
+	got := buildForeignKeyDefString(ctx, im, bazFK)
+	want := "FOREIGN KEY (x, y) REFERENCES bar(a, b) ON DELETE CASCADE"
 	if got != want {
 		t.Errorf("buildForeignKeyDefString = %q, want %q", got, want)
 	}

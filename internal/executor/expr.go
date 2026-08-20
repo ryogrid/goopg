@@ -6342,7 +6342,7 @@ func buildHashPartitionConstraintDef(parentOID uint32, keys []string, pb catalog
 // DEFERRABLE clause are appended; MATCH SIMPLE (the default) is omitted, as PG
 // does. A trailing ` NOT VALID` is appended for an unvalidated FK
 // (convalidated='f'). DU-002 slices 51, 307.
-func buildForeignKeyDefString(im *catalog.InMemory, fk catalog.ForeignKey, dbOid ...uint32) string {
+func buildForeignKeyDefString(ctx *Context, im *catalog.InMemory, fk catalog.ForeignKey, dbOid ...uint32) string {
 	var refTbl *catalog.Table
 	for _, t := range im.AllTables() {
 		if t.Virtual || t.OID == 0 {
@@ -6371,8 +6371,14 @@ func buildForeignKeyDefString(im *catalog.InMemory, fk catalog.ForeignKey, dbOid
 			}
 		}
 	}
+	var refQualified string
+	if refSchema != "" && !RegObjectSchemaVisible(ctx, refSchema) {
+		refQualified = refSchema + "." + refName
+	} else {
+		refQualified = refName
+	}
 	def := "FOREIGN KEY (" + strings.Join(fk.Columns, ", ") + ") REFERENCES " +
-		refSchema + "." + refName + "(" + strings.Join(refCols, ", ") + ")"
+		refQualified + "(" + strings.Join(refCols, ", ") + ")"
 	// MATCH FULL is emitted between the REFERENCES column list and the ON
 	// UPDATE/DELETE clauses, mirroring pg_get_constraintdef_worker
 	// (ruleutils.c). MATCH SIMPLE (the default, confmatchtype='s') and the
@@ -10073,7 +10079,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 					if fk.OID == 0 || fk.OID != targetOID {
 						continue
 					}
-					return NewStringDatum(buildForeignKeyDefString(im, fk, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))), nil
+					return NewStringDatum(buildForeignKeyDefString(ctx, im, fk, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))), nil
 				}
 			}
 			// Domain CHECK constraints (contype='c', keyed on contypid). pg_dump's
