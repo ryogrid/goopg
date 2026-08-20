@@ -1518,3 +1518,25 @@ sources agree:
   criterion directly.
 - **Scope.** S11.4 and S11.5 are each plausibly multi-loop. They are listed as
   single slices for planning, and may be decomposed further when reached.
+
+## Known follow-up: dedup does not build posting tuples (blocks M0134-0045)
+
+Discovered 2026-08-21 while sizing regress case `misc.sql` (server-crashing
+panic `storage: not enough free space in page`, `internal/access/nbtree/
+btree.go`'s split path): `dedupConsolidate` (~3551) does not actually build
+posting tuples despite its name and its caller's comment at `insertIntoBlock`
+(~2825, "consolidate adjacent same-key items into postings... reduces split
+frequency dramatically for duplicate-heavy workloads") — it only drops
+byte-identical `(key, TID)` pairs. Meanwhile `pageItems` (~2171) unconditionally
+expands every on-page posting tuple into individual items before any
+split/dedup-recovery decision runs. A page holding compact posting-tuple
+content (plausible via the bulk loader) is therefore permanently unpacked the
+moment a split touches it, and the expanded form's real per-item cost can
+legitimately exceed what two fresh pages hold even though the packed form fit
+one — this is what panics on `onek`'s duplicate-heavy indexes under
+`create_index.sql` + a bulk `UPDATE`. Full diagnosis, ruled-out candidates, and
+citations: `.ralph/deferral_ledger.md` row dated 2026-08-21, M0134-0045. Real
+fix needs posting-tuple construction mirroring PG oracle
+`postgres/src/backend/access/nbtree/nbtdedup.c`'s `_bt_dedup_pass` (including
+its posting-list byte-size cap) — not yet designed in detail; a future slice
+should do that design pass here before implementing.
