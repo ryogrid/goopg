@@ -332,6 +332,12 @@ func (p *bodyParser) parseStmt() (Stmt, error) {
 	case t.Kind == parser.TokenIdent &&
 		(strings.EqualFold(t.Value, "grant") || strings.EqualFold(t.Value, "revoke")):
 		return p.parseSQLStmt()
+	// SET [LOCAL|SESSION] name = value; — embedded SQL command, matching PG's
+	// plpgsql grammar which treats SET as an ordinary stmt_execsql form (no
+	// special-cased SET statement type; see pl_gram.y). Routes through the
+	// same embedded-SQL path as GRANT/REVOKE above. M0134-0046.
+	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwSet:
+		return p.parseSQLStmt()
 	case t.Kind == parser.TokenIdent:
 		// Stage A 4b: bare identifier at statement start.
 		// Handle: ident := value (assignment)
