@@ -1392,6 +1392,37 @@ func TestPlanLateralSrfArgResolvesAgainstLeftFromItem(t *testing.T) {
 	}
 }
 
+// TestPlanLateralDerivedTableCorrelatedOnlyColumnRef pins the M0134-0030 fix:
+// a LATERAL derived table whose sole projected column is a bare correlated
+// reference to an outer-query column (not a local computed expression) must
+// still be resolvable by qualified name from the enclosing query. Before the
+// fix, targetMeta had no case for *OuterColumnRef, so the synthetic derived
+// table's column got the generic "?column?" label and `sub.a` failed with
+// "column sub.a does not exist" even though the row data was correct.
+// PostgreSQL's FigureColname() has no special case for correlated Vars — it
+// names the target from the underlying attribute like any other bare column
+// reference (postgres/src/backend/parser/parse_target.c).
+func TestPlanLateralDerivedTableCorrelatedOnlyColumnRef(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "a", Type: catalog.Type{Name: "int4"}, Ordinal: 0},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sql := `SELECT sub.a FROM t, LATERAL (SELECT t.a) AS sub`
+	plan, err := Plan(parseOne(t, sql), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	out := plan.Output()
+	if len(out) != 1 {
+		t.Fatalf("output cols = %d, want 1", len(out))
+	}
+	if got := out[0].Name; got != "a" {
+		t.Errorf("output col name = %q, want %q", got, "a")
+	}
+}
+
 // TestPlanVerifyHeapamLateralArgResolvesAgainstLeftFromItem pins the
 // M0110-0003 gap #6 fix: pg_amcheck builds each per-relation heap check as
 // an implicit-LATERAL comma-join

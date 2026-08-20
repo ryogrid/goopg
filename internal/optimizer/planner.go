@@ -11566,6 +11566,18 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	if cr, ok := e.(*ColumnRef); ok {
 		return cr.Name, cr.Type
 	}
+	// A bare correlated reference to an outer-query column (e.g. `t.a` inside
+	// a LATERAL derived table `(SELECT t.a) AS sub`) resolves to an
+	// OuterColumnRef rather than a local ColumnRef. PostgreSQL's
+	// FigureColname() has nothing special for correlated Vars — it names the
+	// target from the underlying attribute, same as any other bare column
+	// reference (postgres/src/backend/parser/parse_target.c: FigureColname).
+	// Without this arm, the derived table's synthetic schema column falls
+	// through to "?column?" and the outer query cannot resolve `sub.a` by
+	// name. M0134-0030.
+	if ocr, ok := e.(*OuterColumnRef); ok {
+		return ocr.Name, ocr.Type
+	}
 	// Whole-row variable: resolveExpr converts *parser.ColumnRef → *RowExpr.
 	// Name comes from the original column reference. M0097-0020.
 	if _, ok := e.(*RowExpr); ok {
