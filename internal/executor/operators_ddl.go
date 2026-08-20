@@ -6165,6 +6165,7 @@ type transitiveDep struct {
 // each entry record which immediate ancestor pulled the object in.
 func collectAllViewTransitiveDeps(im *catalog.InMemory, startName parser.ObjectName, dbOid uint32) []transitiveDep {
 	seen := map[string]bool{}
+	seen[startName.String()] = true
 	queue := []parser.ObjectName{startName}
 	var result []transitiveDep
 
