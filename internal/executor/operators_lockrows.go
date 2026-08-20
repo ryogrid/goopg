@@ -657,7 +657,6 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 		if lk.Table != nil && lk.Table.IsMatView {
 			return &ExecError{
 				Code:    "55000",
-				Pos:     o.plan.Pos(),
 				Message: fmt.Sprintf(`cannot lock rows in materialized view "%s"`, lk.Table.Name),
 			}
 		}

@@ -1392,7 +1392,7 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	}
 	// Reject scans of unpopulated materialized views (WITH NO DATA / before REFRESH). M0097-0025.
 	if o.tbl != nil && o.tbl.IsMatView && !o.tbl.IsPopulated {
-		return &ExecError{Code: "55000", Pos: o.pos,
+		return &ExecError{Code: "55000",
 			Message: fmt.Sprintf("materialized view %q has not been populated", o.tbl.Name),
 			Hint:    "Use the REFRESH MATERIALIZED VIEW command."}
 	}
