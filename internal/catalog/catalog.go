@@ -23580,6 +23580,116 @@ func (c *InMemory) DropDomain(name string, ifExists bool, cascade bool, dbOid ..
 	return dropped, nil
 }
 
+// FindColumnUsingDomainTransitively scans every non-virtual table's columns
+// for the first one whose type IS domainName, or transitively CONTAINS it
+// through a composite field, a domain-of-domain base, or a range subtype.
+// Mirrors PG's get_rels_with_domain (typecmds.c:3316), which
+// validateDomainCheckConstraint (typecmds.c:3196) calls before running the
+// new CHECK against existing rows, and which delegates the transitive walk to
+// find_composite_type_dependencies (tablecmds.c:6936) — used by
+// execAlterDomain's "addconstraint" case to reject ALTER DOMAIN ADD
+// CONSTRAINT up front, matching PG's ERRCODE_FEATURE_NOT_SUPPORTED
+// "cannot alter type %q because column %q.%q uses it" (tablecmds.c:7039-7044).
+// Returns the FIRST dependent table+column found; PG's test suite only ever
+// exercises a single dependent column per case, and enumerating every one is
+// out of scope (M0134-0067 Bucket 3).
+func (c *InMemory) FindColumnUsingDomainTransitively(domainName string, dbOid uint32) (tableName, columnName string, found bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	// Translate the connection's raw dbOid the same way LookupTable/
+	// execCreateTable's callers do, so a 0 (test fixture default) or the
+	// bootstrap "postgres" dbOid both resolve to the namespace tables are
+	// actually registered under (DefaultDBOid). See NamespaceDBOid's doc
+	// comment.
+	dbOid = NamespaceDBOid(dbOid)
+	domainKeyLower := strings.ToLower(domainName)
+	for _, tbl := range c.ns(dbOid).tables {
+		if tbl.Virtual {
+			continue
+		}
+		for _, col := range tbl.Columns {
+			if col.Dropped {
+				continue
+			}
+			// DeclaredTypeName holds the original DDL type name (e.g.
+			// "posint") when addCol's CREATE TABLE handling already resolved
+			// col.Type.Name to the domain's base type — check both, since a
+			// direct domain column only survives in DeclaredTypeName while a
+			// column nested inside a composite/range/domain-of-domain still
+			// carries its declared name in Type.Name.
+			if c.typeUsesDomainLocked(col.Type.Name, domainKeyLower, dbOid, nil, 0) ||
+				c.typeUsesDomainLocked(col.DeclaredTypeName, domainKeyLower, dbOid, nil, 0) {
+				return tbl.Name, col.Name, true
+			}
+		}
+	}
+	return "", "", false
+}
+
+// typeUsesDomainLocked reports whether typeName equals domainKeyLower
+// (already lower-cased) or transitively resolves to it through a composite
+// type's field, a domain-of-domain's base type, or a range type's subtype.
+// Caller must already hold c.mu (read or write) — mirrors the
+// locked-recursive-helper idiom of resolveColumnTypeLocked (~line 23609).
+// visited guards cycles by type name; depth caps runaway recursion at 16.
+func (c *InMemory) typeUsesDomainLocked(typeName, domainKeyLower string, dbOid uint32, visited map[string]bool, depth int) bool {
+	if depth > 16 {
+		return false
+	}
+	k := strings.ToLower(typeName)
+	if k == "" {
+		return false
+	}
+	if k == domainKeyLower {
+		return true
+	}
+	if visited == nil {
+		visited = make(map[string]bool)
+	}
+	if visited[k] {
+		return false
+	}
+	visited[k] = true
+	// The array-ness suffix ("[]", possibly repeated) doesn't change which
+	// named type is nested (CREATE DOMAIN's parser appends it literally to
+	// BaseType, e.g. "ddtest1[]" — see internal/parser/ddl.go's
+	// parseCreateDomain), so strip it before every registry lookup below.
+	base := strings.TrimSuffix(k, "[]")
+	// Composite type: recurse into every field's declared type.
+	ct, ok := c.compositeTypes[compositeKey(dbOid, base)]
+	if !ok {
+		ct = c.lookupCompositeTypeByNameLocked(base)
+	}
+	if ct != nil {
+		for _, f := range ct.Fields {
+			if c.typeUsesDomainLocked(f.ColType, domainKeyLower, dbOid, visited, depth+1) {
+				return true
+			}
+		}
+	}
+	// Domain-of-domain: recurse into the base type name.
+	d, ok := c.domains[domainKey(dbOid, base)]
+	if !ok {
+		d = c.lookupDomainByNameLocked(base)
+	}
+	if d != nil {
+		if c.typeUsesDomainLocked(d.Base.Name, domainKeyLower, dbOid, visited, depth+1) {
+			return true
+		}
+	}
+	// Range type: recurse into the subtype name.
+	rt, ok := c.rangeTypes[rangeKey(dbOid, base)]
+	if !ok {
+		rt = c.lookupRangeTypeByNameLocked(base)
+	}
+	if rt != nil {
+		if c.typeUsesDomainLocked(rt.SubtypeName, domainKeyLower, dbOid, visited, depth+1) {
+			return true
+		}
+	}
+	return false
+}
+
 // ResolveColumnType resolves a column type name through the domain and enum
 // registries to determine the effective storage type. For enums → "text"; for
 // domains → recursively resolves the base type. Returns the input unchanged if

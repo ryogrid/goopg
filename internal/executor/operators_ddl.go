@@ -24254,6 +24254,18 @@ func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
 			// DOMAIN's CHECK (VALUE IN (...)) shortcut form.
 			expr = domainInValuesCheckExpr(d.Base.Name, s.CheckInValues, cat)
 		}
+		// PG's validateDomainCheckConstraint (typecmds.c:3196) calls
+		// get_rels_with_domain (typecmds.c:3215) to find every table
+		// column whose type transitively contains the domain, directly,
+		// via a composite field, a domain-of-domain, or a range subtype,
+		// and rejects before running the new CHECK against a single row.
+		// find_composite_type_dependencies (tablecmds.c:6936) raises this
+		// exact error/SQLSTATE (tablecmds.c:7039-7044,
+		// ERRCODE_FEATURE_NOT_SUPPORTED = 0A000) for a stored relation
+		// column. M0134-0067 Bucket 3.
+		if tableName, columnName, found := cat.FindColumnUsingDomainTransitively(s.Name, dbOid); found {
+			return &ExecError{Code: "0A000", Pos: s.Pos(), Message: fmt.Sprintf("cannot alter type %q because column \"%s.%s\" uses it", s.Name, tableName, columnName)}
+		}
 		if err := cat.AddDomainConstraint(s.Name, s.ConstraintName, expr, s.CheckInValues, dbOid); err != nil {
 			code := "42704" // ERRCODE_UNDEFINED_OBJECT — missing domain, matches real PG's typenameTypeId
 			if strings.Contains(err.Error(), "already exists") {
