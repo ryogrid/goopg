@@ -168,6 +168,19 @@ func (o *pgInputErrorInfoOp) Next() (TupleSlot, error) {
 	case "int2vector":
 		// int2vector: space-separated int2 values. Validate each.
 		message, sqlCode = validateInt2Vector(v)
+	case "bytea":
+		// bytea: reuse byteaIn (bytea.go, mirrors byteain() in varlena.c) so the
+		// hex/escape error text and SQLSTATE (22023/22P02) stay identical to the
+		// CAST path. M0134-0070.
+		if _, e := byteaIn(v, 0); e != nil {
+			if ee, ok := e.(*ExecError); ok {
+				message = ee.Message
+				sqlCode = ee.Code
+			} else {
+				message = e.Error()
+				sqlCode = "22P02"
+			}
+		}
 	default:
 		// varchar(N) / character varying(N) / char(N) — length validation. M0097-0003.
 		var im *catalog.InMemory

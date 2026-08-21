@@ -10408,6 +10408,12 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 				}
 				_, err := parseCopyTimestampZone(v, tsZoneModeForType(t))
 				return NewBoolDatum(err == nil), nil
+			case "bytea":
+				// bytea: reuse byteaIn (bytea.go, mirrors byteain() in
+				// varlena.c) so the valid/invalid answer agrees with the CAST
+				// path and pg_input_error_info. M0134-0070.
+				_, err := byteaIn(v, 0)
+				return NewBoolDatum(err == nil), nil
 			default:
 				// varchar(N) / character varying(N) / char(N) / bpchar(N). M0097-0003.
 				if valid, ok := pgInputIsValidTypedLen(v, t); ok {
