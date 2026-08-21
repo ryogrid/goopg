@@ -6628,8 +6628,45 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 		if s.Behavior != parser.DropCascade {
 			if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
 				var depDescs []string
-				directViews := viewsDependingOnTable(im, name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
-				directMVs := matViewsDependingOnRelation(im, name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+				// M0134-0069: scan by the RESOLVED table identity (tbl.Schema/tbl.Name),
+				// not the raw parsed `name` (which may have an empty Schema for an
+				// unqualified DROP TABLE). viewsDependingOnTable/matViewsDependingOnRelation
+				// skip their schema filter entirely when tblSchema=="", so passing the raw
+				// name let a same-named table in an unrelated schema's dependent views
+				// falsely block this drop. PG walks pg_depend by OID (pg_depend.c
+				// findDependentObjects), never by bare name, so this can't happen upstream.
+				resolvedName := parser.ObjectName{Schema: tbl.Schema, Name: tbl.Name}
+				directViews := viewsDependingOnTable(im, resolvedName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+				directMVs := matViewsDependingOnRelation(im, resolvedName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+				// M0134-0069: viewsDependingOnTable/matViewsDependingOnRelation
+				// match a dependent by bare relation NAME with no OID binding
+				// (selectRefsViewName does plain text FROM-clause comparison), so
+				// a TEMP table and a same-named PERMANENT table sharing the
+				// shadow-map slot (catalog.go key(), which drops Schema for both
+				// "public" and "pg_temp") key identically as unqualified "t1" and
+				// cannot be told apart by schema alone (sequence.sql's `t1` temp
+				// table shadows create_view.sql's permanent `t1`, which has real
+				// view dependents nontemp1/temporal1). PostgreSQL forbids a
+				// non-temp view from referencing a temp relation (a view over a
+				// temp table must itself be temp — createViewCommand.c
+				// "views cannot reference temporary tables"), so a genuinely
+				// non-temp view can never truly depend on a temp target and vice
+				// versa: drop any dependent whose own Temp-ness doesn't match the
+				// drop target's.
+				dropDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+				filterTempMismatch := func(deps []parser.ObjectName) []parser.ObjectName {
+					var out []parser.ObjectName
+					for _, dn := range deps {
+						dep, ok3 := im.LookupTable(dn, dropDBOid)
+						if ok3 && dep.Temp != tbl.Temp {
+							continue
+						}
+						out = append(out, dn)
+					}
+					return out
+				}
+				directViews = filterTempMismatch(directViews)
+				directMVs = filterTempMismatch(directMVs)
 				for _, vn := range directViews {
 					depDescs = append(depDescs, fmt.Sprintf("view %s depends on table %s", vn.String(), name.String()))
 				}

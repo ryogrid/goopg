@@ -3587,21 +3587,52 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 
 // roundNumericToInt rounds a KindNumeric datum using "round half away from zero"
 // (PostgreSQL's numeric→integer rounding rule). M0097-0003.
+//
+// M0134-0069: unlike roundFloatToInt (whose source value is genuinely a
+// float8/float4 and therefore already float-imprecise), a KindNumeric
+// datum's mantissa+scale is exact, so bounds-checking must operate on the
+// exact big.Int mantissa rather than round-tripping through float64 —
+// a float64 bounds check silently accepts boundary values like
+// -9223372036854775809 because strconv.ParseFloat rounds that exact string
+// to precisely -9223372036854775808 (MinInt64) in IEEE double precision,
+// letting the true overflow slip past an f<MinInt64 comparison. PG oracle:
+// postgres/src/backend/utils/adt/numeric.c numericvar_to_int64 operates on
+// the exact decimal digit array, never on a lossy float conversion.
 func roundNumericToInt(d Datum, pos int) (int64, error) {
-	text := numericText(d)
-	f, err := strconv.ParseFloat(text, 64)
-	if err != nil {
-		return 0, &ExecError{Code: "22P02", Pos: pos,
-			Message: fmt.Sprintf("invalid numeric value for integer cast: %s", text)}
+	scale := d.Scale
+	if scale < 0 {
+		scale = 0
 	}
-	// Round half away from zero (PostgreSQL's numeric→integer rule).
-	var rounded int64
-	if f >= 0 {
-		rounded = int64(f + 0.5)
+	var mantissa *big.Int
+	if d.Flags&flagBigNumeric != 0 {
+		mantissa = new(big.Int).Set(d.NumericBigValue())
 	} else {
-		rounded = int64(f - 0.5)
+		mantissa = big.NewInt(d.Int)
 	}
-	return rounded, nil
+	if scale == 0 {
+		if !mantissa.IsInt64() {
+			return 0, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+		}
+		return mantissa.Int64(), nil
+	}
+	divisor := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil)
+	quo, rem := new(big.Int).QuoRem(mantissa, divisor, new(big.Int))
+	// Round half away from zero (PostgreSQL's numeric→integer rule):
+	// bump the quotient away from zero when the remainder is at least half
+	// the divisor.
+	absRem := new(big.Int).Abs(rem)
+	doubledRem := new(big.Int).Lsh(absRem, 1)
+	if doubledRem.Cmp(divisor) >= 0 {
+		if mantissa.Sign() >= 0 {
+			quo.Add(quo, big.NewInt(1))
+		} else {
+			quo.Sub(quo, big.NewInt(1))
+		}
+	}
+	if !quo.IsInt64() {
+		return 0, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+	}
+	return quo.Int64(), nil
 }
 
 // roundFloatToInt rounds a KindNumeric or KindString datum using banker's rounding
