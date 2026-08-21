@@ -245,3 +245,90 @@ func TestAlterSequenceRenamePropagatesToImplicitSerialDefault(t *testing.T) {
 		t.Errorf("expected row 1 = [2 b] (sequence must keep advancing after rename, not reset to 1), got %v", rows[1])
 	}
 }
+
+// TestDropSequenceRestrictBlocksImplicitSerialDefault verifies that DROP
+// SEQUENCE (RESTRICT, the default) fails with 2BP01 + DETAIL + HINT when an
+// implicit SERIAL column's owned sequence is targeted. M0134-0069 bucket 3.
+// PG oracle: postgres/src/test/regress/sql/sequence.sql:151-160,
+// postgres/src/test/regress/expected/sequence.out:293-296.
+func TestDropSequenceRestrictBlocksImplicitSerialDefault(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE t1 (f1 serial)`); err != nil {
+		t.Fatalf("create table t1: %v", err)
+	}
+
+	err := runDDL(t, ctx, `DROP SEQUENCE t1_f1_seq`)
+	if err == nil {
+		t.Fatalf("expected DROP SEQUENCE t1_f1_seq to fail with 2BP01, got nil error")
+	}
+	ee, ok := err.(*ExecError)
+	if !ok {
+		t.Fatalf("expected *ExecError, got %T: %v", err, err)
+	}
+	wantMsg := "cannot drop sequence t1_f1_seq because other objects depend on it"
+	wantDetail := "default value for column f1 of table t1 depends on sequence t1_f1_seq"
+	wantHint := "Use DROP ... CASCADE to drop the dependent objects too."
+	if ee.Code != "2BP01" || ee.Message != wantMsg || ee.Detail != wantDetail || ee.Hint != wantHint {
+		t.Errorf("err = %+v, want Code=2BP01 Message=%q Detail=%q Hint=%q", ee, wantMsg, wantDetail, wantHint)
+	}
+}
+
+// TestDropSequenceRestrictBlocksExplicitNextvalDefault verifies that DROP
+// SEQUENCE (RESTRICT) fails with 2BP01 when an explicit nextval('seqname')
+// DEFAULT (bare string literal, no cast) references the sequence.
+// M0134-0069 bucket 3.
+// PG oracle: postgres/src/test/regress/sql/sequence.sql:151-161,
+// postgres/src/test/regress/expected/sequence.out:297-300.
+func TestDropSequenceRestrictBlocksExplicitNextvalDefault(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE SEQUENCE myseq2`); err != nil {
+		t.Fatalf("create sequence myseq2: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE t1 (f2 int DEFAULT nextval('myseq2'))`); err != nil {
+		t.Fatalf("create table t1: %v", err)
+	}
+
+	err := runDDL(t, ctx, `DROP SEQUENCE myseq2`)
+	if err == nil {
+		t.Fatalf("expected DROP SEQUENCE myseq2 to fail with 2BP01, got nil error")
+	}
+	ee, ok := err.(*ExecError)
+	if !ok {
+		t.Fatalf("expected *ExecError, got %T: %v", err, err)
+	}
+	wantMsg := "cannot drop sequence myseq2 because other objects depend on it"
+	wantDetail := "default value for column f2 of table t1 depends on sequence myseq2"
+	wantHint := "Use DROP ... CASCADE to drop the dependent objects too."
+	if ee.Code != "2BP01" || ee.Message != wantMsg || ee.Detail != wantDetail || ee.Hint != wantHint {
+		t.Errorf("err = %+v, want Code=2BP01 Message=%q Detail=%q Hint=%q", ee, wantMsg, wantDetail, wantHint)
+	}
+}
+
+// TestDropSequenceRestrictAllowsTextCastNextvalDefault is the regression
+// guard for the ::text-cast exemption: PG's dependency-recording
+// (parse_utilcmd.c) only fires for a bare literal or an explicit ::regclass
+// cast, never for ::text (or any other cast), so DROP SEQUENCE on a
+// sequence referenced only via nextval('seqname'::text) must succeed with
+// no error. M0134-0069 bucket 3.
+// PG oracle: postgres/src/test/regress/sql/sequence.sql:151-155,161-162,
+// postgres/src/test/regress/expected/sequence.out:301-302 ("This however
+// will work: DROP SEQUENCE myseq3;").
+func TestDropSequenceRestrictAllowsTextCastNextvalDefault(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE SEQUENCE myseq3`); err != nil {
+		t.Fatalf("create sequence myseq3: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE t1 (f3 int DEFAULT nextval('myseq3'::text))`); err != nil {
+		t.Fatalf("create table t1: %v", err)
+	}
+
+	if err := runDDL(t, ctx, `DROP SEQUENCE myseq3`); err != nil {
+		t.Fatalf("DROP SEQUENCE myseq3 should succeed (::text cast is exempt from dependency tracking), got: %v", err)
+	}
+}

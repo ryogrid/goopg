@@ -6876,6 +6876,69 @@ func functionsDependingOnSequence(cat catalog.Catalog, seqName string, seqSchema
 	return result
 }
 
+// columnDefaultsDependingOnSequence returns "column of table" dependency
+// descriptions for every column whose DEFAULT depends on seqName (dropped
+// sequence's bare, lowercased name), covering both implicit
+// SERIAL/IDENTITY-owned sequences (resolved via
+// catalog.FindSequenceOwnedByFunc, which already tracks post-RENAME
+// identity — M0134-0069 bucket 4) and explicit nextval(...) DEFAULT
+// literals. Matches PG's dependency-recording rule (parse_utilcmd.c /
+// pg_depend): only a bare string literal or an explicit ::regclass cast
+// creates a dependency; ::text (or any other cast) does not.
+func columnDefaultsDependingOnSequence(im *catalog.InMemory, seqName parser.ObjectName, dbOid uint32) []struct{ Table, Column string } {
+	var deps []struct{ Table, Column string }
+	seqBare := strings.ToLower(strings.TrimSpace(seqName.Name))
+	for _, tbl := range im.AllTables(dbOid) {
+		for i := range tbl.Columns {
+			col := &tbl.Columns[i]
+			if col.Dropped {
+				continue
+			}
+			// 1. Implicit SERIAL/IDENTITY-owned sequence.
+			colTypeLow := strings.ToLower(col.Type.Name)
+			isSerial := colTypeLow == "serial" || colTypeLow == "serial4" || colTypeLow == "bigserial" || colTypeLow == "serial8" || colTypeLow == "smallserial" || colTypeLow == "serial2"
+			if col.IdentityColumn || isSerial {
+				if curName, ok := catalog.FindSequenceOwnedByFunc(tbl.Name+"."+col.Name, dbOid); ok {
+					if strings.EqualFold(curName, seqBare) {
+						deps = append(deps, struct{ Table, Column string }{Table: tbl.Name, Column: col.Name})
+					}
+				}
+				continue
+			}
+			// 2. Explicit nextval(...) DEFAULT literal.
+			if col.DefaultExpr == nil {
+				continue
+			}
+			fc, ok := col.DefaultExpr.(*parser.FuncCall)
+			if !ok || !strings.EqualFold(fc.Name.Name, "nextval") || len(fc.Args) < 1 {
+				continue
+			}
+			arg := fc.Args[0]
+			if cast, ok2 := arg.(*parser.CastExpr); ok2 {
+				// Only ::regclass creates a dependency; ::text (or any other
+				// cast) is exempt — do NOT unwrap in that case.
+				if !strings.EqualFold(cast.Type.Name, "regclass") {
+					continue
+				}
+				arg = cast.Operand
+			}
+			sc, ok3 := arg.(*parser.StringConst)
+			if !ok3 {
+				continue
+			}
+			litName := sc.Value
+			bareName := litName
+			if idx := strings.LastIndex(litName, "."); idx >= 0 {
+				bareName = litName[idx+1:]
+			}
+			if strings.EqualFold(strings.TrimSpace(bareName), seqBare) {
+				deps = append(deps, struct{ Table, Column string }{Table: tbl.Name, Column: col.Name})
+			}
+		}
+	}
+	return deps
+}
+
 // functionsDependingOnRoutineOID returns all routines whose RoutineCallOIDs include the given OID.
 func functionsDependingOnRoutineOID(cat catalog.Catalog, oid uint32) []*catalog.Routine {
 	rs := cat.Routines()
@@ -19852,6 +19915,27 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				}
 			}
 			seqDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+			// RESTRICT (default): block the drop if any column DEFAULT
+			// (implicit SERIAL/IDENTITY-owned or explicit nextval(...))
+			// depends on this sequence. M0134-0069 bucket 3.
+			if s.Behavior != parser.DropCascade {
+				if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+					colDeps := columnDefaultsDependingOnSequence(im, name, seqDBOid)
+					if len(colDeps) > 0 {
+						details := make([]string, len(colDeps))
+						for i, dep := range colDeps {
+							details[i] = fmt.Sprintf("default value for column %s of table %s depends on sequence %s", dep.Column, dep.Table, name.String())
+						}
+						return &ExecError{
+							Code:    "2BP01",
+							Pos:     s.Pos(),
+							Message: fmt.Sprintf("cannot drop sequence %s because other objects depend on it", name.String()),
+							Detail:  strings.Join(details, "\n"),
+							Hint:    "Use DROP ... CASCADE to drop the dependent objects too.",
+						}
+					}
+				}
+			}
 			if !DropSequence(name.String(), seqDBOid) {
 				if s.IfExists {
 					o.ctx.AddNotice(fmt.Sprintf("sequence %q does not exist, skipping", name.String()))
