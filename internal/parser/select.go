@@ -4127,6 +4127,61 @@ func (p *parser) parseSubstringFuncCall(pos int, name string) (Expr, error) {
 	return &FuncCall{pos: pos, Name: ObjectName{pos: pos, Name: name}, Args: args}, nil
 }
 
+// parsePositionFuncCall handles the SQL-standard POSITION(substring IN
+// string) form, alongside the goopg-legacy comma form
+// POSITION(substring, string) — both desugar to the existing two-arg
+// "position" FuncCall dispatch (internal/executor/expr.go,
+// `case "strpos", "position":`). Modeled on parseSubstringFuncCall's
+// dual-form pattern. PG oracle: postgres/src/backend/parser/gram.y,
+// `POSITION_P '(' b_expr IN_P b_expr ')'` (func_expr_common_subexpr).
+func (p *parser) parsePositionFuncCall(pos int) (Expr, error) {
+	if !p.acceptSymbol("(") {
+		return nil, p.errAtCur("expected '(' after POSITION")
+	}
+	// Parse the substring operand at precCompare+1 so a trailing IN
+	// keyword is left for us to detect below rather than being consumed
+	// by the generic precedence-climbing loop's `expr [NOT] IN (...)`
+	// postfix check (which expects '(' right after IN and would error
+	// on the SQL-standard `IN str` form here).
+	sub, err := p.parseExprPrec(precCompare + 1)
+	if err != nil {
+		return nil, err
+	}
+
+	// Comma form: POSITION(sub, str). Already reachable via the generic
+	// call-parsing fallback too, but handling it here keeps both forms
+	// together in one place, mirroring parseSubstringFuncCall.
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "," {
+		p.advance()
+		str, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')' to close POSITION")
+		}
+		return &FuncCall{pos: pos, Name: ObjectName{pos: pos, Name: "position"}, Args: []Expr{sub, str}}, nil
+	}
+
+	// SQL-standard form: POSITION(sub IN str)
+	if _, err := p.expectKeyword(KwIn); err != nil {
+		return nil, err
+	}
+	str, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if !p.acceptSymbol(")") {
+		return nil, p.errAtCur("expected ')' to close POSITION")
+	}
+	// The executor's `case "strpos", "position":` (internal/executor/expr.go)
+	// treats Args[0] as the haystack string and Args[1] as the needle
+	// substring — the strpos(string, substring) convention. The SQL-standard
+	// IN form is written substring-first (`POSITION(sub IN str)`), so the
+	// desugared FuncCall args must be reordered to {str, sub} to match.
+	return &FuncCall{pos: pos, Name: ObjectName{pos: pos, Name: "position"}, Args: []Expr{str, sub}}, nil
+}
+
 // parseColumnOrCall handles `name`, `name.name`, `name.name.name`,
 // `name(args)`, `name.name(args)`, `name.*`, `name.name.*`. The
 // distinction between a function call and a column reference is the
@@ -4218,6 +4273,11 @@ func (p *parser) parseColumnOrCall() (Expr, error) {
 		// Intercept before the generic call path. M0097-0042.
 		if len(parts) == 1 && strings.EqualFold(parts[0], "trim") {
 			return p.parseTrimFuncCall(startPos)
+		}
+		// POSITION(substring IN string) — SQL standard, desugars to the
+		// existing two-arg position(sub, str) FuncCall. M0134-0070.
+		if len(parts) == 1 && strings.EqualFold(parts[0], "position") {
+			return p.parsePositionFuncCall(startPos)
 		}
 		var name ObjectName
 		switch len(parts) {
