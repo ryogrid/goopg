@@ -658,6 +658,46 @@ func resolveSeqCatalogTable(ctx *Context, name string, dbOid uint32) *catalog.Ta
 	return nil
 }
 
+// seqWrongRelkindError returns the 42809 error PG raises when a
+// nextval/currval/setval/lastval/ALTER SEQUENCE target resolves to a catalog
+// relation that exists but is NOT a sequence. Mirrors PG's sequence_open ->
+// validate_relation_kind (postgres/src/backend/access/sequence/sequence.c:37-46,
+// 66-77): ERRCODE_WRONG_OBJECT_TYPE (42809), errmsg("cannot open relation
+// \"%s\"", name), errdetail_relkind_not_supported(relkind) for DETAIL
+// (postgres/src/backend/catalog/pg_class.c:24-52).
+//
+// Returns nil when name doesn't resolve to any catalog relation at all (the
+// caller falls through to its own not-found handling) or when it resolves to
+// a genuine sequence.
+func seqWrongRelkindError(ctx *Context, name string, dbOid uint32) *ExecError {
+	tbl := resolveSeqCatalogTable(ctx, name, dbOid)
+	if tbl == nil || tbl.IsSequence {
+		return nil
+	}
+	return &ExecError{
+		Code:    "42809",
+		Message: fmt.Sprintf("cannot open relation %q", name),
+		Detail:  seqRelkindNotSupportedDetail(tbl),
+	}
+}
+
+// seqRelkindNotSupportedDetail mirrors errdetail_relkind_not_supported
+// (postgres/src/backend/catalog/pg_class.c:24-52) for the relkinds
+// resolveSeqCatalogTable can actually return (ordinary/partitioned tables,
+// views, materialized views — sequences are excluded by the caller).
+func seqRelkindNotSupportedDetail(tbl *catalog.Table) string {
+	switch relkindByteForTable(tbl) {
+	case 'p':
+		return "This operation is not supported for partitioned tables."
+	case 'm':
+		return "This operation is not supported for materialized views."
+	case 'v':
+		return "This operation is not supported for views."
+	default:
+		return "This operation is not supported for tables."
+	}
+}
+
 func evalNextval(args []Datum, ctx *Context) (Datum, error) {
 	if len(args) == 0 {
 		return NullDatum, nil
@@ -673,6 +713,9 @@ func evalNextval(args []Datum, ctx *Context) (Datum, error) {
 	}
 	s := LookupSequence(name, dbOid)
 	if s == nil {
+		if rkErr := seqWrongRelkindError(ctx, name, dbOid); rkErr != nil {
+			return Datum{}, rkErr
+		}
 		return Datum{}, &ExecError{Code: "42P01", Message: fmt.Sprintf("relation %q does not exist", name)}
 	}
 	// nextval holds a RowExclusiveLock on the sequence relation (mirrors
@@ -720,6 +763,9 @@ func evalCurrval(args []Datum, ctx *Context) (Datum, error) {
 	}
 	name := seqNameFromDatum(args[0], ctx)
 	dbOid := ctxSeqDBOid(ctx)
+	if rkErr := seqWrongRelkindError(ctx, name, dbOid); rkErr != nil {
+		return Datum{}, rkErr
+	}
 	if tbl := resolveSeqCatalogTable(ctx, name, dbOid); tbl != nil {
 		// currval requires SELECT or USAGE (sequence.c currval_oid ~876-881).
 		if !dmlPrivilegePermittedAsAny(ctx, tbl, ctx.NonSuperuserRole, "SELECT", "USAGE") {
@@ -758,6 +804,9 @@ func evalSetval(args []Datum, ctx *Context) (Datum, error) {
 		isCalled = args[2].BoolValue()
 	}
 
+	if rkErr := seqWrongRelkindError(ctx, name, dbOid); rkErr != nil {
+		return Datum{}, rkErr
+	}
 	if tbl := resolveSeqCatalogTable(ctx, name, dbOid); tbl != nil {
 		// setval requires UPDATE only (sequence.c do_setval ~960-964).
 		if !dmlPrivilegePermittedAs(ctx, tbl, "UPDATE", ctx.NonSuperuserRole) {

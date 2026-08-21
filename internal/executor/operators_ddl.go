@@ -18944,6 +18944,10 @@ func (o *ddlOp) execAlterSequence(s *parser.AlterSequenceStmt) error {
 	seqDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 	seq := LookupSequence(name, seqDBOid)
 	if seq == nil {
+		if rkErr := seqWrongRelkindError(o.ctx, name, seqDBOid); rkErr != nil {
+			rkErr.Pos = s.Pos()
+			return rkErr
+		}
 		if s.IfExists {
 			o.ctx.AddNotice(fmt.Sprintf("relation %q does not exist, skipping", name))
 			return nil
@@ -19937,6 +19941,16 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		for _, name := range s.Names {
 			if o.dropSchemaQualifiedNotice(name) {
 				continue
+			}
+			// Wrong-relkind guard: a name that resolves to an existing
+			// catalog relation which isn't a sequence gets 42809, not the
+			// registry-miss 42704 below. Different message template than
+			// the nextval-family (no DETAIL). Mirrors PG's
+			// get_object_address_relobject, OBJECT_SEQUENCE case.
+			// postgres/src/backend/catalog/objectaddress.c:1362-1368.
+			if tbl := resolveSeqCatalogTable(o.ctx, name.String(), catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); tbl != nil && !tbl.IsSequence {
+				return &ExecError{Code: "42809", Pos: s.Pos(),
+					Message: fmt.Sprintf("%q is not a sequence", name.String())}
 			}
 			// CASCADE: drop functions that depend on this sequence before dropping it.
 			if s.Behavior == parser.DropCascade {
