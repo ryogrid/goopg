@@ -13701,6 +13701,44 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			return NewStringDatum(fmt.Sprintf("%x", uint32(v.Int))), nil
 		}
+	case "to_bin":
+		// to_bin32/to_bin64 zero-extend the argument's two's-complement bit
+		// pattern rather than sign-formatting it (PG oracle:
+		// postgres/src/backend/utils/adt/varlena.c:5190-5248, 5254-5267).
+		// ArgWidth is stamped at plan time (see resolveExpr's to_hex/to_bin/
+		// to_oct intercept in internal/optimizer/planner.go); default/empty
+		// ArgWidth uses the uint32 (int4 overload) path, which is also
+		// correct for all positive-value cases since strconv.FormatUint does
+		// not zero-pad.
+		if len(x.Args) == 1 {
+			v, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || v.IsNull() {
+				return NullDatum, nil
+			}
+			if x.ArgWidth == "int8" {
+				return NewStringDatum(strconv.FormatUint(uint64(v.Int), 2)), nil
+			}
+			return NewStringDatum(strconv.FormatUint(uint64(uint32(v.Int)), 2)), nil
+		}
+	case "to_oct":
+		// to_oct32/to_oct64 zero-extend the argument's two's-complement bit
+		// pattern rather than sign-formatting it (PG oracle:
+		// postgres/src/backend/utils/adt/varlena.c:5190-5248, 5254-5267).
+		// ArgWidth is stamped at plan time (see resolveExpr's to_hex/to_bin/
+		// to_oct intercept in internal/optimizer/planner.go); default/empty
+		// ArgWidth uses the uint32 (int4 overload) path, which is also
+		// correct for all positive-value cases since strconv.FormatUint does
+		// not zero-pad.
+		if len(x.Args) == 1 {
+			v, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || v.IsNull() {
+				return NullDatum, nil
+			}
+			if x.ArgWidth == "int8" {
+				return NewStringDatum(strconv.FormatUint(uint64(v.Int), 8)), nil
+			}
+			return NewStringDatum(strconv.FormatUint(uint64(uint32(v.Int)), 8)), nil
+		}
 	case "encode":
 		// encode(bytea, format) -> text. Formats: base64, escape, hex
 		// (binary_encode, postgres/src/backend/utils/adt/encode.c). This was a

@@ -13550,16 +13550,18 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 			}
 			return &FuncCall{pos: x.Pos(), Name: "pg_collation_for", Args: []Expr{result}}, nil
 		}
-		// to_hex(int): PG dispatches to distinct to_hex32/to_hex64 overloads
-		// (varlena.c:5254-5267) whose two's-complement zero-extension width
-		// differs for negative arguments. Resolve the arg's static type here
-		// (plan time) and stamp the chosen width onto ArgWidth so the
-		// executor can pick uint32 vs uint64 zero-extension. Bare integer
-		// literals default to the int4/8-hex-char overload, mirroring the
-		// generate_series literal carve-out above: exprType always types an
-		// untyped integer literal as int8, which would otherwise
-		// mis-resolve to_hex(-1234) (no cast) into the int8/16-hex path.
-		if strings.EqualFold(x.Name.String(), "to_hex") && len(x.Args) == 1 {
+		// to_hex(int)/to_bin(int)/to_oct(int): PG dispatches each to distinct
+		// 32-bit/64-bit overloads (varlena.c:5190-5267) whose two's-complement
+		// zero-extension width differs for negative arguments. Resolve the
+		// arg's static type here (plan time) and stamp the chosen width onto
+		// ArgWidth so the executor can pick uint32 vs uint64 zero-extension.
+		// Bare integer literals default to the int4/32-bit overload,
+		// mirroring the generate_series literal carve-out above: exprType
+		// always types an untyped integer literal as int8, which would
+		// otherwise mis-resolve to_hex(-1234)/to_bin(-1234)/to_oct(-1234)
+		// (no cast) into the int8/64-bit path.
+		if (strings.EqualFold(x.Name.String(), "to_hex") || strings.EqualFold(x.Name.String(), "to_bin") || strings.EqualFold(x.Name.String(), "to_oct")) && len(x.Args) == 1 {
+			fname := strings.ToLower(x.Name.String())
 			resolvedArg, err := resolveExpr(x.Args[0], ctx)
 			if err != nil {
 				return nil, err
@@ -13585,7 +13587,7 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 					width = "int8"
 				}
 			}
-			return &FuncCall{pos: x.Pos(), Name: "to_hex", Args: []Expr{resolvedArg}, ArgWidth: width}, nil
+			return &FuncCall{pos: x.Pos(), Name: fname, Args: []Expr{resolvedArg}, ArgWidth: width}, nil
 		}
 		args := make([]Expr, 0, len(x.Args))
 		for _, a := range x.Args {
