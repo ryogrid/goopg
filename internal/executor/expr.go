@@ -3648,7 +3648,12 @@ func roundNumericToInt(d Datum, pos int) (int64, error) {
 	}
 	if scale == 0 {
 		if !mantissa.IsInt64() {
-			return 0, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+			// PG oracle: postgres/src/backend/utils/adt/numeric.c
+			// numeric_int8_opt_error's ereport(bigint out of range) never
+			// calls errposition() — runtime CAST-evaluation errors carry no
+			// LINE/caret context regardless of literal-vs-column origin.
+			// M0134-0070.
+			return 0, &ExecError{Code: "22003", Message: "bigint out of range"}
 		}
 		return mantissa.Int64(), nil
 	}
@@ -3667,7 +3672,9 @@ func roundNumericToInt(d Datum, pos int) (int64, error) {
 		}
 	}
 	if !quo.IsInt64() {
-		return 0, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+		// PG oracle: same numeric_int8_opt_error ereport as above, no
+		// errposition(). M0134-0070.
+		return 0, &ExecError{Code: "22003", Message: "bigint out of range"}
 	}
 	return quo.Int64(), nil
 }
@@ -4095,7 +4102,10 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 				return Datum{}, err
 			}
 			if n < -32768 || n > 32767 {
-				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "smallint out of range"}
+				// PG oracle: postgres/src/backend/utils/adt/numeric.c
+				// numeric_int2's ereport(smallint out of range) never calls
+				// errposition(). M0134-0070.
+				return Datum{}, &ExecError{Code: "22003", Message: "smallint out of range"}
 			}
 			return Datum{Kind: KindInt, Int: n}, nil
 		default:
@@ -4129,7 +4139,10 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 				return Datum{}, err
 			}
 			if n < -2147483648 || n > 2147483647 {
-				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "integer out of range"}
+				// PG oracle: postgres/src/backend/utils/adt/numeric.c
+				// numeric_int4_opt_error's ereport(integer out of range)
+				// never calls errposition(). M0134-0070.
+				return Datum{}, &ExecError{Code: "22003", Message: "integer out of range"}
 			}
 			return Datum{Kind: KindInt, Int: n}, nil
 		default:

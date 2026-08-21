@@ -91,32 +91,96 @@ func TestRuntimeEvalErrorsCarryNoPos(t *testing.T) {
 	}
 }
 
-// TestLiteralCastOverflowStillCarriesPos is the out-of-scope-but-verifying
-// counterpart: a literal-constant CAST to int8 that overflows still carries
-// a nonzero Pos, both for a bare literal and for a literal routed through a
-// VALUES-derived column — both reach roundNumericToInt (expr.go), a
-// DIFFERENT raise-site family this brief does not touch (flagged as a
-// deferral candidate: goopg does not yet distinguish "bare literal" from
-// "column-derived CAST" the way PG's parser_errposition callback would,
-// so both currently get Pos — that finer PG-matching gap is out of scope
-// here, this test just pins the current, unchanged behavior so a future
-// change to roundNumericToInt is deliberate, not a silent regression).
-func TestLiteralCastOverflowStillCarriesPos(t *testing.T) {
+// TestNumericToIntCastOverflowsCarryNoPos verifies the roundNumericToInt
+// (and int2/int4 narrowing-check) pos-strip follow-on to M0134-0070: goopg
+// no longer attaches a source position to ExecErrors raised when a numeric
+// value overflows a CAST to int2/int4/int8, matching PostgreSQL —
+// postgres/src/backend/utils/adt/numeric.c numeric_int8_opt_error/
+// numeric_int4_opt_error/numeric_int2's ereport(ERROR, ...) sites never
+// call errposition(), so the server never renders "LINE N: ... ^" for these
+// errors, regardless of whether the overflowing value came from a bare
+// literal or a column. This corrects the (backwards) prior assumption in
+// this file's predecessor test, TestLiteralCastOverflowStillCarriesPos,
+// which asserted the opposite.
+func TestNumericToIntCastOverflowsCarryNoPos(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
 
-	_, err := runSQLCtxErr(t, ctx, `SELECT 99999999999999999999::int8`)
-	if err == nil {
-		t.Fatal("expected bigint out of range error, got nil")
+	if err := runDDL(t, ctx, `CREATE TABLE m0134_0070_numint_t (n numeric)`); err != nil {
+		t.Fatalf("create table: %v", err)
 	}
-	var ee *ExecError
-	if !errors.As(err, &ee) {
-		t.Fatalf("expected *ExecError, got %T: %v", err, err)
+	if err := runDDL(t, ctx, `INSERT INTO m0134_0070_numint_t VALUES (99999999999999999999)`); err != nil {
+		t.Fatalf("insert: %v", err)
 	}
-	if ee.Code != "22003" {
-		t.Errorf("code = %s, want 22003", ee.Code)
+
+	cases := []struct {
+		name    string
+		sql     string
+		code    string
+		message string
+	}{
+		{
+			name:    "bigint overflow, scale-0 branch (literal)",
+			sql:     `SELECT 99999999999999999999::int8`,
+			code:    "22003",
+			message: "bigint out of range",
+		},
+		{
+			name:    "bigint overflow, scaled/rounding branch (literal)",
+			sql:     `SELECT 9223372036854775807.5::int8`,
+			code:    "22003",
+			message: "bigint out of range",
+		},
+		{
+			name:    "smallint overflow (literal)",
+			sql:     `SELECT 99999.9::int2`,
+			code:    "22003",
+			message: "smallint out of range",
+		},
+		{
+			// Note: a plain integer literal like `99999999999::int4` parses
+			// as KindInt (int8) and hits the separate d.Int bounds check at
+			// expr.go's KindInt CAST arm — a different, out-of-scope raise
+			// site that still carries Pos. Forcing a numeric intermediate
+			// (decimal literal) routes through roundNumericToInt's KindNumeric
+			// arm, the site this brief actually strips Pos from. M0134-0070.
+			name:    "integer overflow (literal, numeric-typed)",
+			sql:     `SELECT 99999999999.0::int4`,
+			code:    "22003",
+			message: "integer out of range",
+		},
+		{
+			name:    "bigint overflow, scale-0 branch (column-sourced)",
+			sql:     `SELECT n::int8 FROM (VALUES (99999999999999999999::numeric)) t(n)`,
+			code:    "22003",
+			message: "bigint out of range",
+		},
+		{
+			name:    "bigint overflow, scale-0 branch (real column)",
+			sql:     `SELECT n::int8 FROM m0134_0070_numint_t`,
+			code:    "22003",
+			message: "bigint out of range",
+		},
 	}
-	if ee.Pos == 0 {
-		t.Errorf("Pos = 0, want nonzero (literal-cast path, unchanged by M0134-0070)")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := runSQLCtxErr(t, ctx, tc.sql)
+			if err == nil {
+				t.Fatalf("expected error for %q, got nil", tc.sql)
+			}
+			var ee *ExecError
+			if !errors.As(err, &ee) {
+				t.Fatalf("expected *ExecError for %q, got %T: %v", tc.sql, err, err)
+			}
+			if ee.Code != tc.code {
+				t.Errorf("%s: code = %s, want %s (err=%v)", tc.name, ee.Code, tc.code, err)
+			}
+			if !strings.Contains(ee.Message, tc.message) {
+				t.Errorf("%s: message = %q, want to contain %q", tc.name, ee.Message, tc.message)
+			}
+			if ee.Pos != 0 {
+				t.Errorf("%s: Pos = %d, want 0 (PG attaches no errposition to numeric-to-int CAST overflow)", tc.name, ee.Pos)
+			}
+		})
 	}
 }
