@@ -371,15 +371,24 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 		// Integer-overflow check, mirroring evalExprSlot. The fast path
 		// previously skipped this, silently returning out-of-range int2/int4
 		// arithmetic results. M0097 regression fix.
+		//
+		// No Pos on either raise site: this mirrors expr.go's evalExprSlot
+		// BinaryOp overflow check (interpreted twin) — int2pl/int4pl etc.
+		// (postgres/src/backend/utils/adt/int.c) never call errposition, so
+		// PG never attaches LINE-context to a runtime arithmetic overflow
+		// regardless of whether an operand was a literal or a column.
+		// M0134-0070; the interpreted twin was fixed in the same round —
+		// leaving only one twin Pos-less would silently reintroduce the
+		// sibling divergence M0127-PS6.2 fixed.
 		if result.Kind == KindInt {
 			switch n.payload[1] {
 			case ovfInt2:
 				if result.Int < -32768 || result.Int > 32767 {
-					return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "smallint out of range"}
+					return Datum{}, &ExecError{Code: "22003", Message: "smallint out of range"}
 				}
 			case ovfInt4:
 				if result.Int < -2147483648 || result.Int > 2147483647 {
-					return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "integer out of range"}
+					return Datum{}, &ExecError{Code: "22003", Message: "integer out of range"}
 				}
 			}
 		}

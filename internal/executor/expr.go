@@ -1102,7 +1102,11 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 				fResult = lf * rf
 			case parser.OpDiv:
 				if rf == 0 {
-					return Datum{}, &ExecError{Code: "22012", Pos: x.Pos(), Message: "division by zero"}
+					// No Pos: pure runtime evaluation (float8_div,
+					// postgres/src/backend/utils/adt/float.c) — PG never
+					// attaches errposition to row-by-row arithmetic, only to
+					// parse-time literal coercion. M0134-0070.
+					return Datum{}, &ExecError{Code: "22012", Message: "division by zero"}
 				}
 				fResult = lf / rf
 			default:
@@ -1159,11 +1163,17 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 			switch overflowCodeForType(x.ResultType) {
 			case ovfInt2:
 				if result.Int < -32768 || result.Int > 32767 {
-					return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "smallint out of range"}
+					// No Pos: pure runtime evaluation (int2pl/int2mi/int2mul,
+					// postgres/src/backend/utils/adt/int.c, has no
+					// errposition call). M0134-0070.
+					return Datum{}, &ExecError{Code: "22003", Message: "smallint out of range"}
 				}
 			case ovfInt4:
 				if result.Int < -2147483648 || result.Int > 2147483647 {
-					return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "integer out of range"}
+					// No Pos: pure runtime evaluation (int4pl/int4mi/int4mul,
+					// postgres/src/backend/utils/adt/int.c, has no
+					// errposition call). M0134-0070.
+					return Datum{}, &ExecError{Code: "22003", Message: "integer out of range"}
 				}
 			}
 		}
@@ -1267,7 +1277,10 @@ func evalUnary(op parser.OpCode, d Datum, pos int) (Datum, error) {
 		switch d.Kind {
 		case KindInt:
 			if d.Int == math.MinInt64 {
-				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+				// No Pos: pure runtime evaluation (int8um,
+				// postgres/src/backend/utils/adt/int8.c, has no
+				// errposition call). M0134-0070.
+				return Datum{}, &ExecError{Code: "22003", Message: "bigint out of range"}
 			}
 			return Datum{Kind: KindInt, Int: -d.Int}, nil
 		case KindNumeric:
@@ -1420,12 +1433,15 @@ func evalPgLSNBinary(op parser.OpCode, left, right Datum, pos int) (Datum, bool,
 					// pg_lsn - (-N) = pg_lsn + N
 					result := lu + abs
 					if result < lu {
-						return Datum{}, true, &ExecError{Code: "22003", Pos: pos, Message: "pg_lsn out of range"}
+						// No Pos: pure runtime evaluation (pg_lsn_mi,
+						// postgres/src/backend/utils/adt/pg_lsn.c, has no
+						// errposition call). M0134-0070.
+						return Datum{}, true, &ExecError{Code: "22003", Message: "pg_lsn out of range"}
 					}
 					return NewStringDatum(formatPgLSN(result)), true, nil
 				}
 				if abs > lu {
-					return Datum{}, true, &ExecError{Code: "22003", Pos: pos, Message: "pg_lsn out of range"}
+					return Datum{}, true, &ExecError{Code: "22003", Message: "pg_lsn out of range"}
 				}
 				return NewStringDatum(formatPgLSN(lu - abs)), true, nil
 			}
@@ -1452,15 +1468,17 @@ func evalPgLSNBinary(op parser.OpCode, left, right Datum, pos int) (Datum, bool,
 					Message: "cannot add NaN to pg_lsn"}
 			}
 			if isNeg {
-				// pg_lsn + (-N) = pg_lsn - N
+				// pg_lsn + (-N) = pg_lsn - N. No Pos: pure runtime evaluation
+				// (pg_lsn_pli, postgres/src/backend/utils/adt/pg_lsn.c, has
+				// no errposition call). M0134-0070.
 				if abs > lsnVal {
-					return Datum{}, true, &ExecError{Code: "22003", Pos: pos, Message: "pg_lsn out of range"}
+					return Datum{}, true, &ExecError{Code: "22003", Message: "pg_lsn out of range"}
 				}
 				return NewStringDatum(formatPgLSN(lsnVal - abs)), true, nil
 			}
 			result := lsnVal + abs
 			if result < lsnVal {
-				return Datum{}, true, &ExecError{Code: "22003", Pos: pos, Message: "pg_lsn out of range"}
+				return Datum{}, true, &ExecError{Code: "22003", Message: "pg_lsn out of range"}
 			}
 			return NewStringDatum(formatPgLSN(result)), true, nil
 		}
@@ -1823,7 +1841,10 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int, ctx *Context) (Dat
 		}
 		matched, err := evalPOSIXRegex(ls, rs, op == parser.OpRegexIMatch || op == parser.OpRegexINoMatch)
 		if err != nil {
-			return Datum{}, &ExecError{Code: "2201B", Pos: pos, Message: fmt.Sprintf("invalid regular expression: %v", err)}
+			// No Pos: pure runtime evaluation (RE_compile_and_cache,
+			// postgres/src/backend/utils/adt/regexp.c, has no errposition
+			// call). M0134-0070.
+			return Datum{}, &ExecError{Code: "2201B", Message: fmt.Sprintf("invalid regular expression: %v", err)}
 		}
 		if op == parser.OpRegexNoMatch || op == parser.OpRegexINoMatch {
 			matched = !matched
@@ -2312,9 +2333,11 @@ func addTimeInterval(t, iv Datum, subtract bool, pos int) (Datum, error) {
 // timestampOutOfRange is PG's error for a non-representable timestamp result
 // (here: "infinity − infinity", which the timestamp type cannot express since
 // it has no NaN). Mirrors ereport(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE,
-// "timestamp out of range").
+// "timestamp out of range"). No Pos: every call site is pure runtime
+// timestamp/interval arithmetic (postgres/src/backend/utils/adt/timestamp.c
+// has no errposition call anywhere in this file). M0134-0070.
 func timestampOutOfRange(pos int) error {
-	return &ExecError{Code: "22008", Pos: pos, Message: "timestamp out of range"}
+	return &ExecError{Code: "22008", Message: "timestamp out of range"}
 }
 
 // usecsPerDay is the microsecond count in a 24-hour day, used by the
@@ -2373,8 +2396,11 @@ func subTimeTime(left, right Datum, pos int) (Datum, error) {
 // intervalOutOfRange is PG's error for a non-representable interval result
 // (overflow, or an "infinity − infinity" that has no NaN equivalent).
 // Mirrors ereport(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE, "interval out of range").
+// No Pos: every call site is pure runtime interval arithmetic
+// (postgres/src/backend/utils/adt/timestamp.c has no errposition call
+// anywhere in this file). M0134-0070.
 func intervalOutOfRange(pos int) error {
-	return &ExecError{Code: "22008", Pos: pos, Message: "interval out of range"}
+	return &ExecError{Code: "22008", Message: "interval out of range"}
 }
 
 // finiteIntervalArith adds (or subtracts, when subtract) two FINITE intervals
@@ -2568,7 +2594,10 @@ func intervalMul(iv Datum, factor float64, pos int) (Datum, error) {
 // since 0 is never a valid multiplier's reciprocal). M0134-0035.
 func intervalDiv(iv Datum, factor float64, pos int) (Datum, error) {
 	if factor == 0.0 {
-		return Datum{}, &ExecError{Code: "22012", Pos: pos, Message: "division by zero"}
+		// No Pos: pure runtime evaluation (interval_div,
+		// postgres/src/backend/utils/adt/timestamp.c, has no errposition
+		// call). M0134-0070.
+		return Datum{}, &ExecError{Code: "22012", Message: "division by zero"}
 	}
 	if math.IsNaN(factor) {
 		return Datum{}, intervalOutOfRange(pos)
@@ -2716,6 +2745,12 @@ func negateInterval(d Datum, pos int) (Datum, error) {
 	return res, nil
 }
 
+// arithmetic implements int64 (bigint) +, -, *, /, % with PostgreSQL's exact
+// overflow detection. No Pos on any raise site: every one mirrors a pure
+// runtime C function (int8pl/int8mi/int8mul/int8div/int8mod,
+// postgres/src/backend/utils/adt/int8.c:445-530) that calls ereport(ERROR,
+// ...) with no errposition — confirmed no int8.c function in that range
+// calls errposition. M0134-0070.
 func arithmetic(op parser.OpCode, a, b int64, pos int) (Datum, error) {
 	var r int64
 	switch op {
@@ -2723,13 +2758,13 @@ func arithmetic(op parser.OpCode, a, b int64, pos int) (Datum, error) {
 		r = a + b
 		// Detect int64 add overflow: same-sign inputs with opposite-sign result.
 		if (a^r)&(b^r) < 0 {
-			return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+			return Datum{}, &ExecError{Code: "22003", Message: "bigint out of range"}
 		}
 	case parser.OpSub:
 		r = a - b
 		// Detect int64 sub overflow: different-sign inputs with result differing from a's sign.
 		if (a^b)&(a^r) < 0 {
-			return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+			return Datum{}, &ExecError{Code: "22003", Message: "bigint out of range"}
 		}
 	case parser.OpMul:
 		// Detect int64 multiplication overflow. M0097-int8-overflow.
@@ -2738,24 +2773,24 @@ func arithmetic(op parser.OpCode, a, b int64, pos int) (Datum, error) {
 			if a == math.MinInt64 || b == math.MinInt64 {
 				// MinInt64 * 1 = MinInt64 (OK); MinInt64 * anything_else overflows.
 				if a != 1 && b != 1 {
-					return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+					return Datum{}, &ExecError{Code: "22003", Message: "bigint out of range"}
 				}
 			} else if r/a != b {
-				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+				return Datum{}, &ExecError{Code: "22003", Message: "bigint out of range"}
 			}
 		}
 	case parser.OpDiv:
 		if b == 0 {
-			return Datum{}, &ExecError{Code: "22012", Pos: pos, Message: "division by zero"}
+			return Datum{}, &ExecError{Code: "22012", Message: "division by zero"}
 		}
 		// MinInt64 / -1 overflows: the mathematical result 2^63 doesn't fit in int64.
 		if a == math.MinInt64 && b == -1 {
-			return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+			return Datum{}, &ExecError{Code: "22003", Message: "bigint out of range"}
 		}
 		r = a / b
 	case parser.OpMod:
 		if b == 0 {
-			return Datum{}, &ExecError{Code: "22012", Pos: pos, Message: "division by zero"}
+			return Datum{}, &ExecError{Code: "22012", Message: "division by zero"}
 		}
 		r = a % b
 	}
@@ -12649,7 +12684,10 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			re, rerr := regexp.Compile(reStr)
 			if rerr != nil {
-				return NullDatum, &ExecError{Code: "2201B", Pos: x.Pos(), Message: fmt.Sprintf("invalid regular expression: %v", rerr)}
+				// No Pos: pure runtime evaluation (RE_compile_and_cache,
+				// postgres/src/backend/utils/adt/regexp.c, has no
+				// errposition call). M0134-0070.
+				return NullDatum, &ExecError{Code: "2201B", Message: fmt.Sprintf("invalid regular expression: %v", rerr)}
 			}
 			parts := re.Split(strD.StringValue(), -1)
 			return NewStringDatum(formatTextArray(parts)), nil
@@ -14019,7 +14057,10 @@ func evalSubstr(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	}
 	count := cntArg.Int
 	if count < 0 {
-		return Datum{}, &ExecError{Code: "22011", Pos: x.Pos(), Message: "negative substring length not allowed"}
+		// No Pos: pure runtime evaluation (text_substring,
+		// postgres/src/backend/utils/adt/varlena.c, has no errposition
+		// call). M0134-0070.
+		return Datum{}, &ExecError{Code: "22011", Message: "negative substring length not allowed"}
 	}
 	end := from + count
 	if from < 1 {
@@ -14057,7 +14098,10 @@ func evalSubstrRegex(src, pattern string, pos int) (Datum, error) {
 	goPattern := pgPatternToGoRE2(pattern)
 	re, err := regexp.Compile(goPattern)
 	if err != nil {
-		return Datum{}, &ExecError{Code: "2201B", Pos: pos, Message: fmt.Sprintf("invalid regular expression: %v", err)}
+		// No Pos: pure runtime evaluation (textregexsubstr,
+		// postgres/src/backend/utils/adt/regexp.c, has no errposition
+		// call). M0134-0070.
+		return Datum{}, &ExecError{Code: "2201B", Message: fmt.Sprintf("invalid regular expression: %v", err)}
 	}
 	loc := re.FindStringSubmatchIndex(src)
 	if loc == nil {

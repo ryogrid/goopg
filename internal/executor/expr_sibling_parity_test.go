@@ -590,8 +590,13 @@ func TestExprSiblingParityPlannerBuilt(t *testing.T) {
 // a future refactor could make both twins report 0 and still be "in parity" —
 // agreement on a lost position is not the property under audit.
 func TestExprSiblingParityCompiledPositionIsTheSourcePosition(t *testing.T) {
-	// The overflow raise is the compiled twin's own ExecError (it does not
-	// delegate), so it is the one that proves the position survived the slab.
+	// M0134-0070 update: PG never attaches errposition to a runtime
+	// arithmetic overflow (int4pl etc., postgres/src/backend/utils/adt/int.c,
+	// has no errposition call) — only to parse-time literal-coercion errors.
+	// So both twins must now report Pos==0 for this raise, NOT the source
+	// position; the property under audit is unchanged (the twins must agree
+	// with each other, not merely coincide at 0 by omission), so this test
+	// pins BOTH twins explicitly rather than only the compiled one.
 	// The explicit ::int4 is required: `c0 + <literal>` resolves to int8.
 	e := parityResolve(t, "c0 + 2147483647::int4 > 0")
 	add, ok := e.(*optimizer.BinaryOp).Left.(*optimizer.BinaryOp)
@@ -601,6 +606,18 @@ func TestExprSiblingParityCompiledPositionIsTheSourcePosition(t *testing.T) {
 	if add.Pos() == 0 {
 		t.Fatalf("planner produced pos 0; the test cannot distinguish carried from lost")
 	}
+
+	// Interpreted twin (evalExprSlot, via evalExpr's public entry point).
+	_, interpErr := evalExpr(add, parityRow(), nil)
+	iee, ok := interpErr.(*ExecError)
+	if !ok {
+		t.Fatalf("interpreted eval: err = %v (%T), want *ExecError 22003", interpErr, interpErr)
+	}
+	if iee.Code != "22003" || iee.Pos != 0 {
+		t.Errorf("interpreted ExecError = {code=%s pos=%d}, want {code=22003 pos=0}", iee.Code, iee.Pos)
+	}
+
+	// Compiled twin (evalFastExpr, ExprNode slab).
 	var slab exprTreeSlab
 	idx := slab.buildExpr(e)
 	_, err := evalFastExpr(slab, idx, SlotFromRow(nil, parityRow()), nil)
@@ -608,8 +625,8 @@ func TestExprSiblingParityCompiledPositionIsTheSourcePosition(t *testing.T) {
 	if !ok {
 		t.Fatalf("compiled eval: err = %v (%T), want *ExecError 22003", err, err)
 	}
-	if ee.Code != "22003" || ee.Pos != add.Pos() {
-		t.Errorf("compiled ExecError = {code=%s pos=%d}, want {code=22003 pos=%d}", ee.Code, ee.Pos, add.Pos())
+	if ee.Code != "22003" || ee.Pos != 0 {
+		t.Errorf("compiled ExecError = {code=%s pos=%d}, want {code=22003 pos=0}", ee.Code, ee.Pos)
 	}
 }
 
