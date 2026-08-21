@@ -79,6 +79,17 @@ type SeqParams struct {
 // meant DefaultDBOid. M0110-0001 (DU-002 slice 115).
 var SequenceParamsFunc func(qualifiedName string, dbOid uint32) (SeqParams, bool)
 
+// FindSequenceOwnedByFunc is set by the executor at init, sibling to
+// SequenceParamsFunc above (same "avoids an import cycle" rationale: the
+// planner needs to resolve a SERIAL/IDENTITY column's *current* sequence
+// name — which may differ from the naming-convention name after an ALTER
+// SEQUENCE ... RENAME — without importing internal/executor). owner is
+// "table.column" (matches the format internal/executor/operators_sequence.go's
+// SetSequenceOwnedBy already uses). Returns the current sequence name and
+// whether one was found; nil until the executor registers it. M0134-0069
+// bucket 4.
+var FindSequenceOwnedByFunc func(owner string, dbOid uint32) (string, bool)
+
 // Type is the textual type tag plus an optional typmod argument list.
 // v0 keeps types as strings so the planner doesn't need a real type
 // system; the executor casts based on Type.Name until the type system

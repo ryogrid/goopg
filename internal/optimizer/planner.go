@@ -10019,9 +10019,13 @@ func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContex
 // otherwise collapse to NULL and trip the NOT NULL constraint. Mirroring
 // PostgreSQL, where SERIAL's column default literally IS nextval(...), we emit
 // that call so the value path produces the next sequence value. The standard
-// "<table>_<column>_seq" name matches the executor's seqName derivation; a
-// renamed sequence (rare, and not survivable by name anywhere in goopg) is not
-// resolved here.
+// "<table>_<column>_seq" name is the fallback; if the sequence has since been
+// renamed (ALTER SEQUENCE ... RENAME TO, e.g. sequence.sql's serialtest1_f2_seq
+// -> serialtest1_f2_foo), catalog.FindSequenceOwnedByFunc (wired by the
+// executor at init, mirroring catalog.SequenceParamsFunc's "avoids an import
+// cycle" pattern) resolves the CURRENT sequence name via its ownedBy record so
+// nextval(...) keeps advancing the renamed sequence instead of erroring or
+// reading a stale/nonexistent one. M0134-0069 bucket 4.
 func defaultMarkerReplacement(tbl *catalog.Table, ordinal int) parser.Expr {
 	if ordinal >= 0 && ordinal < len(tbl.Columns) {
 		col := tbl.Columns[ordinal]
@@ -10030,6 +10034,12 @@ func defaultMarkerReplacement(tbl *catalog.Table, ordinal int) parser.Expr {
 		}
 		if catalog.IsSerialTypeName(col.Type.Name) || col.IdentityColumn {
 			seqName := strings.ToLower(tbl.Name) + "_" + strings.ToLower(col.Name) + "_seq"
+			if catalog.FindSequenceOwnedByFunc != nil {
+				owner := tbl.Name + "." + col.Name
+				if resolved, ok := catalog.FindSequenceOwnedByFunc(owner, tbl.DBOid); ok {
+					seqName = resolved
+				}
+			}
 			return &parser.FuncCall{
 				Name: parser.ObjectName{Name: "nextval"},
 				Args: []parser.Expr{&parser.StringConst{Value: seqName}},

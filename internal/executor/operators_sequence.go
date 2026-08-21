@@ -988,6 +988,29 @@ func boolTextSeq(b bool) string {
 // owns the per-sequence parameters. M0110-0001 (DU-002 slice 115).
 func init() {
 	catalog.SequenceParamsFunc = sequenceParamsForCatalog
+	catalog.FindSequenceOwnedByFunc = findSequenceOwnedByForCatalog
+}
+
+// findSequenceOwnedByForCatalog resolves owner ("table.column")'s CURRENT
+// sequence name, mirroring autoGenerateSerialValues's two-step lookup above:
+// try the naming-convention name first, then fall back to a
+// FindSequenceOwnedBy scan (handles ALTER SEQUENCE ... RENAME on an
+// implicit SERIAL/IDENTITY column's sequence). Wired to
+// catalog.FindSequenceOwnedByFunc so the planner can resolve the renamed
+// sequence without importing internal/executor. M0134-0069 bucket 4.
+func findSequenceOwnedByForCatalog(owner string, dbOid uint32) (string, bool) {
+	tbl, col, ok := strings.Cut(owner, ".")
+	if !ok {
+		return "", false
+	}
+	namingConventionName := strings.ToLower(tbl) + "_" + strings.ToLower(col) + "_seq"
+	if LookupSequence(namingConventionName, dbOid) != nil {
+		return namingConventionName, true
+	}
+	if renamed := FindSequenceOwnedBy(owner, dbOid); renamed != "" {
+		return renamed, true
+	}
+	return "", false
 }
 
 // sequenceParamsForCatalog returns the pg_sequence parameter row for the named

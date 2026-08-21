@@ -201,3 +201,47 @@ func TestAlterSequenceRenamePropagatesToDependentDefault(t *testing.T) {
 		t.Errorf("expected t_other unaffected: [[1]], got %v", otherRows)
 	}
 }
+
+// TestAlterSequenceRenamePropagatesToImplicitSerialDefault is the SERIAL
+// twin of TestAlterSequenceRenamePropagatesToDependentDefault above: a bare
+// SERIAL column leaves catalog.Column.DefaultExpr nil, so the planner's
+// defaultMarkerReplacement synthesizes nextval('<tbl>_<col>_seq') by naming
+// convention instead of reading an explicit DEFAULT. After the synthesized
+// sequence is renamed, an INSERT that omits the serial column must still
+// advance the RENAMED sequence rather than erroring "sequence does not
+// exist" or resetting to 1. M0134-0069 bucket 4.
+// PG oracle: postgres/src/test/regress/sql/sequence.sql:143-146 (ALTER TABLE
+// serialtest1_f2_seq RENAME TO serialtest1_f2_foo; INSERT INTO serialTest1
+// VALUES ('more'); SELECT * FROM serialTest1;), expected output
+// postgres/src/test/regress/expected/sequence.out:271-280 — nextval keeps
+// advancing the renamed sequence, no reset.
+func TestAlterSequenceRenamePropagatesToImplicitSerialDefault(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE t (id SERIAL, name text)`); err != nil {
+		t.Fatalf("create table t: %v", err)
+	}
+	if err := runDDL(t, ctx, `INSERT INTO t (name) VALUES ('a')`); err != nil {
+		t.Fatalf("INSERT INTO t (name) VALUES ('a'): %v", err)
+	}
+
+	if err := runDDL(t, ctx, `ALTER SEQUENCE t_id_seq RENAME TO t_id_foo`); err != nil {
+		t.Fatalf("alter sequence rename: %v", err)
+	}
+
+	if err := runDDL(t, ctx, `INSERT INTO t (name) VALUES ('b')`); err != nil {
+		t.Fatalf("INSERT INTO t (name) VALUES ('b') should succeed after rename, got: %v", err)
+	}
+
+	rows := runSQL(t, ctx, `SELECT id, name FROM t ORDER BY id`)
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows, got %v", rows)
+	}
+	if rows[0][0].Int != 1 || string(rows[0][1].Buf) != "a" {
+		t.Errorf("expected row 0 = [1 a], got %v", rows[0])
+	}
+	if rows[1][0].Int != 2 || string(rows[1][1].Buf) != "b" {
+		t.Errorf("expected row 1 = [2 b] (sequence must keep advancing after rename, not reset to 1), got %v", rows[1])
+	}
+}
