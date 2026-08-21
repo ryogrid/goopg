@@ -1,79 +1,62 @@
 Task: M0134-0070 (strings.sql) — regress-sql `failed`, still in progress.
-This loop fixed the cross-cutting LINE/caret false-diff gap sized last loop
-(BinaryExpr/UnaryExpr/shared-arithmetic-helper `ExecError` sites only).
+This loop landed the `unistr.go` Pos-strip fast-follow flagged by the prior
+loop's ledger row (item 1 of that row's "deferred" list).
 
-Files this loop: `internal/executor/expr.go` (removed `Pos:` from the
-runtime-eval raise sites — division-by-zero, arithmetic overflow, pg_lsn
-overflow, invalid-regex, negative-substring-length, timestamp/interval
-out-of-range, shared `arithmetic()` int64 helper), `internal/executor/exprnode.go`
-(compiled twin, mirrored the int2/int4 overflow fix — Rule 4 sibling sync),
-`internal/executor/expr_sibling_parity_test.go` (corrected a `Pos != 0`
-assumption that was itself wrong per PG oracle), new
-`internal/executor/expr_error_position_test.go`. Also `.ralph/fix_plan.md`
-(M0134-0070 entry) and `.ralph/deferral_ledger.md` (new row, 2026-08-21,
-LINE/caret entry).
+Files this loop: `internal/executor/unistr.go` (removed `Pos: pos` from all 5
+`ExecError` raise sites: `unistrDecode`'s `invalidPair` closure + its default
+"invalid Unicode escape" branch; `unistrApplyCodepoint`'s "invalid Unicode
+code point" branch and its two "invalid Unicode surrogate pair" branches),
+new `internal/executor/unistr_error_position_test.go`
+(`TestUnistrErrorsCarryNoPos`, 3 cases). Also `.ralph/deferral_ledger.md`
+(new resolved row, 2026-08-21) and `.ralph/fix_plan.md` untouched (no entry
+needed a tick — M0134-0070 stays open, this was a sub-item).
 
-Key symbols: `evalExprSlot`/`evalUnary`/`evalBinary`/`evalPgLSNBinary`/
-`timestampOutOfRange`/`intervalOutOfRange`/`intervalDiv`/`arithmetic()`
-(all `internal/executor/expr.go`) — the sites that lost `Pos:`.
+Key symbols: `unistrDecode`, `unistrApplyCodepoint`
+(`internal/executor/unistr.go`) — the 5 sites that lost `Pos:`. `pos int`
+params left in place, unused (legal Go, avoids signature churn); single call
+site unaffected (`expr.go:12900`).
 
-Hypothesis/Findings: PG server-side never renders "LINE N:" text itself; it
-only sets `ErrorData.cursorpos` via `errposition()`
-(`postgres/src/backend/utils/error/elog.c:1468`), and the CLIENT
-(`fe-protocol3.c:1200` `reportErrorPosition`) draws LINE+caret only when
-that field is present. PG sets it for lex/parse errors and for literal-
-constant type coercion at parse time (`parse_node.c:140,354-459`'s
-`setup_parser_errposition_callback`) — NOT for plain runtime execution of
-operator/function C code (confirmed: no `errposition()` calls anywhere in
-`int.c`/`int8.c`/`float.c`/`pg_lsn.c`/`timestamp.c`/`regexp.c`'s runtime
-arithmetic/function bodies). goopg's `expr.go` set `Pos` unconditionally on
-all ~174 `ExecError` sites; fixed the BinaryExpr/UnaryExpr/shared-helper
-subset this loop. `strings.sql` diff shrank 2539→2501 lines (live psql
-probe confirmed the fix: `SELECT 1/c FROM (VALUES (0)) t(c);` now omits
-LINE/caret). Three follow-on gaps discovered, NOT fixed (own deferral-ledger
-entries, same row): (1) `internal/executor/unistr.go`'s 3 raise sites are
-NOT Pos-less as a prior loop's row incorrectly assumed — same fix pattern,
-small/contained, good next-slice candidate; (2) `roundNumericToInt`
-(numeric→int8 CAST path) doesn't distinguish bare-literal casts (PG: Pos
-present) from column-derived casts (PG: likely Pos-absent, not
-independently reverified) — harder, needs literal-vs-column AST
-classification; (3) `abs()`/`gcd()`/`lcm()`/`mod()` FuncCall builtin sites
-in expr.go are the same "pure runtime, no PG errposition" shape but weren't
-in this loop's scope (different call-site family).
+Hypothesis/Findings: confirmed via PG oracle
+(`postgres/src/backend/utils/adt/varlena.c:6762-6929`, `unistr` function) —
+all 5 `ereport(ERROR, ...)` sites in PG's `unistr()` never call
+`errposition()`, matching the established pattern from the BinaryExpr/
+UnaryExpr/arithmetic() fix two loops ago. No sibling/compiled-twin exists for
+`unistrDecode`/`unistrApplyCodepoint` in `exprnode.go` — single call site,
+no Rule-4 sync needed. Two other LINE/caret gaps from the same ledger row
+remain unfixed (see next step).
 
-Next step: pick ONE of: (a) fix `unistr.go`'s 3 Pos-setting sites (small,
-same pattern as this loop — good first candidate); (b) another `strings.sql`
-REFACTOR-tier bucket (Unicode-escape/bit-string/hex-string literals;
-POSITION/OVERLAY/LIKE ESCAPE/SIMILAR TO grammar; regexp_count/regexp_like/
-regexp_instr/regexp_substr family; regexp_replace backreferences;
-regexp_matches(...,'g') multi-match; regexp_split_to_table); (c) the
-`abs`/`gcd`/`lcm`/`mod` Pos-stripping fast-follow. Re-verify against the
-fix_plan banner (M0134 next-priority-after-M-NIGHTLY) at the START of next
-loop; also re-check `ci/logs/action-items.md` for new `## AI-` items (none
-found this loop — nightly run 20260821-002906 was `status: pass`, `items:
-0`, only non-blocking env-drift notices about newly-SKIPPED TestPort_*
-tests, no action required).
+Next step: pick ONE of the two remaining LINE/caret fast-follows flagged in
+the deferral ledger's 2026-08-21 M0134-0070 rows: (a) `roundNumericToInt`
+(numeric→int8 CAST path, expr.go) — needs literal-vs-column AST
+classification (harder, PG only sets Pos for bare-literal casts at parse
+time, not column-derived casts; not yet independently reverified); (b)
+`abs()`/`gcd()`/`lcm()`/`mod()` FuncCall builtin sites in expr.go
+(~11882/12135/12138/12167/12170 per a prior implementer report) — same
+"pure runtime, no PG errposition" shape as the already-fixed sites, just a
+different call-site family (evalFuncCall not BinaryExpr/UnaryExpr). (b) is
+likely the smaller/safer next slice, matching this loop's and the prior
+loop's sizing pattern. Alternatively pick a fresh `strings.sql` REFACTOR-tier
+bucket (Unicode-escape/bit-string/hex-string literals; POSITION/OVERLAY/
+LIKE ESCAPE/SIMILAR TO grammar; regexp_count/regexp_like/regexp_instr/
+regexp_substr family; regexp_replace backreferences; regexp_matches(...,'g')
+multi-match; regexp_split_to_table). Re-verify against the fix_plan banner
+(M0134 next-priority-after-M-NIGHTLY) at the START of next loop; also
+re-check `ci/logs/action-items.md` for new `## AI-` items (none found this
+loop — nightly run 20260821-002906 was `status: pass`, `items: 0`, only
+non-blocking env-drift notices about newly-SKIPPED TestPort_* tests, no
+action required).
 
-Gates run this loop: `go build ./...` PASS; `go test ./internal/executor/...
--run 'TestRuntimeEvalErrorsCarryNoPos|TestLiteralCastOverflowStillCarriesPos'`
-PASS; `go test ./internal/executor/... -run 'TestExprSiblingParity'` PASS;
-full `go test ./internal/executor/...` PASS (7.4s, coordinator re-verified);
-`go vet ./internal/executor/...` clean; `scripts/pg-regress-runner.sh
---verbose strings` (tester, cgroup-capped) — diff 2539→2501 lines, confirmed
-no brief-target error messages carry `+LINE` noise anymore;
-`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS (tester);
-`make ralph-state-guard` — same recurring stale completed-marker
-inconsistency as every prior loop, auto-repaired, then PASS; pre-commit
-pgbench smoke PASS (362-673-12098 TPS, 0 failed).
+Gates run this loop: `go build ./...` PASS; `go vet ./internal/executor/...`
+clean; `go test ./internal/executor/... -run 'TestUnistrErrorsCarryNoPos'`
+PASS; full `go test ./internal/executor/...` PASS (7.1s, implementer);
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS
+(coordinator, direct run — all packages ok, ~446s for internal/initdb cold
+cache, rest cached); pre-commit pgbench smoke runs via git hook at commit
+time (result folded into this loop's commit).
 
-Delegation: researcher agent `adc568f39c939393d` (2 rounds — first sized
-the LINE/caret gap end-to-end with PG-oracle + goopg citations; follow-up
-via SendMessage resolved the literal-cast-vs-runtime-eval classification
-unknown, confirming the exact site list was safe to strip); implementer
-agent `aed8429b621548edc` (1 round — landed the fix cleanly per brief, ran
-its own pre-edit verification probe per the brief's mandate, documented 3
-deviations and 3 deferral candidates in report.md, all reasonable). Both
-agents completed; no further rounds needed.
+Delegation: implementer agent `a74a5eb2af2f0cfce` (1 round — landed the fix
+exactly per brief, no deviations, oracle re-check confirmed premise, all
+gates green). No further rounds needed.
 
-In-flight: none. Commit `b6524e0b` pushed to `regress-renumbering`. No
-server left running.
+In-flight: none. Commit pending (staged, about to commit + push to
+`regress-renumbering`). No server left running.

@@ -20,7 +20,7 @@ func unistrDecode(s string, pos int) (string, *ExecError) {
 	var pairFirst int64 // 0 means "no pending high surrogate"
 
 	invalidPair := func() (string, *ExecError) {
-		return "", &ExecError{Code: "42601", Pos: pos,
+		return "", &ExecError{Code: "42601",
 			Message: "invalid Unicode surrogate pair"}
 	}
 
@@ -75,7 +75,7 @@ func unistrDecode(s string, pos int) (string, *ExecError) {
 				instr = instr[10:]
 
 			default:
-				return "", &ExecError{Code: "42601", Pos: pos,
+				return "", &ExecError{Code: "42601",
 					Message: "invalid Unicode escape",
 					Hint:    `Unicode escapes must be \XXXX, \+XXXXXX, \uXXXX, or \UXXXXXXXX.`}
 			}
@@ -102,7 +102,7 @@ func unistrDecode(s string, pos int) (string, *ExecError) {
 func unistrApplyCodepoint(out *[]byte, pairFirst int64, cp int64, pos int) (int64, *ExecError) {
 	// is_valid_unicode_codepoint: c > 0 && c <= 0x10FFFF.
 	if cp <= 0 || cp > 0x10FFFF {
-		return 0, &ExecError{Code: "22023", Pos: pos,
+		return 0, &ExecError{Code: "22023",
 			Message: fmt.Sprintf("invalid Unicode code point: %04X", uint32(cp))}
 	}
 
@@ -114,11 +114,11 @@ func unistrApplyCodepoint(out *[]byte, pairFirst int64, cp int64, pos int) (int6
 			cp = 0x10000 + (pairFirst-0xD800)*0x400 + (cp - 0xDC00)
 			pairFirst = 0
 		} else {
-			return 0, &ExecError{Code: "42601", Pos: pos,
+			return 0, &ExecError{Code: "42601",
 				Message: "invalid Unicode surrogate pair"}
 		}
 	} else if isLowSurrogate {
-		return 0, &ExecError{Code: "42601", Pos: pos,
+		return 0, &ExecError{Code: "42601",
 			Message: "invalid Unicode surrogate pair"}
 	}
 
