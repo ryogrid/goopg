@@ -12095,7 +12095,25 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return NewStringDatum(pgQuoteIdent(s.StringValue())), nil
 		}
 	case "regexp_replace":
-		// regexp_replace(text, pattern, replacement [, flags]) M0097-0011.
+		// regexp_replace(text, pattern, replacement [, flags | start [, N [, flags]]]).
+		// M0097-0011 (3/4-arg forms) + M0134-0070 Round F (5/6-arg extended
+		// forms, pg_proc.dat:3755-3768 oids 6251/6252/6253:
+		//   6251 (6-arg): string, pattern, replacement, start, N, flags
+		//   6252 (5-arg): string, pattern, replacement, start, N       (no flags)
+		//   6253 (4-arg): string, pattern, replacement, start          (no N, no flags)
+		// oid 6253 collides in arity with the pre-existing 4-arg flags form
+		// (oid 2285: string, pattern, replacement, flags) — goopg's untyped
+		// AST can't disambiguate by arity, so branch on the arg-3 Datum kind
+		// (string Datum -> flags form; int Datum -> start form), which is
+		// exactly what upstream's own overload resolution keys off for an
+		// unquoted numeric literal vs a quoted string literal (see
+		// strings.sql "erroneous invocation of non-extended form" case:
+		// regexp_replace(..., 'X', '1') stays on the 4-arg flags form and
+		// errors "invalid regular expression option").
+		// See postgres/src/backend/utils/adt/regexp.c:700-741
+		// (textregexreplace_extended) for the start/N validation rules and
+		// postgres/src/backend/utils/adt/varlena.c:4457-4618
+		// (replace_text_regexp) for the match-and-replace loop mirrored below.
 		if len(x.Args) >= 3 {
 			s, e1 := evalExpr(x.Args[0], row, ctx)
 			pat, e2 := evalExpr(x.Args[1], row, ctx)
@@ -12103,20 +12121,85 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if e1 != nil || e2 != nil || e3 != nil || s.IsNull() || pat.IsNull() {
 				return NullDatum, nil
 			}
-			replaceAll := false
-			goFlags := ""
-			if len(x.Args) >= 4 {
-				flags, e4 := evalExpr(x.Args[3], row, ctx)
-				if e4 == nil && !flags.IsNull() {
-					var ferr error
-					goFlags, replaceAll, ferr = pgRegexFlagsToGoModifiers(flags.StringValue())
-					if ferr != nil {
-						return NullDatum, ferr
+			flagsStr := ""
+			start := int64(1)
+			n := int64(1)
+			haveStartN := false
+			switch len(x.Args) {
+			case 4:
+				v, e4 := evalExpr(x.Args[3], row, ctx)
+				if e4 != nil {
+					return NullDatum, e4
+				}
+				if !v.IsNull() {
+					if v.Kind == KindInt {
+						// oid 6253: (string, pattern, replacement, start) — no N, no flags.
+						haveStartN = true
+						start = v.Int
+					} else {
+						flagsStr = v.StringValue()
 					}
 				}
+			case 5:
+				// oid 6252: (string, pattern, replacement, start, N) — no flags.
+				v4, e4 := evalExpr(x.Args[3], row, ctx)
+				if e4 != nil {
+					return NullDatum, e4
+				}
+				v5, e5 := evalExpr(x.Args[4], row, ctx)
+				if e5 != nil {
+					return NullDatum, e5
+				}
+				if v4.IsNull() || v5.IsNull() {
+					return NullDatum, nil
+				}
+				haveStartN = true
+				start = v4.Int
+				n = v5.Int
+			case 6:
+				// oid 6251: (string, pattern, replacement, start, N, flags).
+				v4, e4 := evalExpr(x.Args[3], row, ctx)
+				if e4 != nil {
+					return NullDatum, e4
+				}
+				v5, e5 := evalExpr(x.Args[4], row, ctx)
+				if e5 != nil {
+					return NullDatum, e5
+				}
+				v6, e6 := evalExpr(x.Args[5], row, ctx)
+				if e6 != nil {
+					return NullDatum, e6
+				}
+				if v4.IsNull() || v5.IsNull() {
+					return NullDatum, nil
+				}
+				haveStartN = true
+				start = v4.Int
+				n = v5.Int
+				if !v6.IsNull() {
+					flagsStr = v6.StringValue()
+				}
 			}
-			pattern := goFlags + pgPatternToGoRE2(pat.StringValue())
-			re, err := regexp.Compile(pattern)
+			if haveStartN {
+				if start <= 0 {
+					return NullDatum, &ExecError{Code: "22023",
+						Message: fmt.Sprintf("invalid value for parameter %q: %d", "start", start)}
+				}
+				if n < 0 {
+					return NullDatum, &ExecError{Code: "22023",
+						Message: fmt.Sprintf("invalid value for parameter %q: %d", "n", n)}
+				}
+			}
+			goFlags := ""
+			replaceAll := false
+			if flagsStr != "" {
+				var ferr error
+				goFlags, replaceAll, ferr = pgRegexFlagsToGoModifiers(flagsStr)
+				if ferr != nil {
+					return NullDatum, ferr
+				}
+			}
+			re, err := regexpCompilePattern(pat.StringValue(), flagsStr, goFlags)
 			if err != nil {
 				return NewStringDatum(s.StringValue()), nil // invalid pattern: return input
 			}
@@ -12124,21 +12207,58 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			// Convert PostgreSQL \1, \2 backreferences to Go $1, $2.
 			replacement = strings.ReplaceAll(replacement, `\1`, `${1}`)
 			replacement = strings.ReplaceAll(replacement, `\2`, `${2}`)
-			var result string
-			if replaceAll {
-				result = re.ReplaceAllString(s.StringValue(), replacement)
-			} else {
-				// Replace only first occurrence.
-				found := false
-				result = re.ReplaceAllStringFunc(s.StringValue(), func(m string) string {
-					if found {
-						return m
-					}
-					found = true
-					return re.ReplaceAllString(m, replacement)
-				})
+
+			if !haveStartN {
+				var result string
+				if replaceAll {
+					result = re.ReplaceAllString(s.StringValue(), replacement)
+				} else {
+					// Replace only first occurrence.
+					found := false
+					result = re.ReplaceAllStringFunc(s.StringValue(), func(m string) string {
+						if found {
+							return m
+						}
+						found = true
+						return re.ReplaceAllString(m, replacement)
+					})
+				}
+				return NewStringDatum(result), nil
 			}
-			return NewStringDatum(result), nil
+
+			// start/N-scoped replace: mirror varlena.c:replace_text_regexp's
+			// successive-match loop. search_start is the 0-based char offset
+			// (start-1); N==0 means replace every match at/after search_start
+			// (like the 'g' flag, scoped to start); N>0 replaces only the
+			// Nth match found and leaves all others (before and after)
+			// unchanged.
+			runes := []rune(s.StringValue())
+			searchStart := int(start) - 1
+			if searchStart > len(runes) {
+				searchStart = len(runes)
+			}
+			prefix := string(runes[:searchStart])
+			window := string(runes[searchStart:])
+			matches := re.FindAllStringSubmatchIndex(window, -1)
+			var b strings.Builder
+			b.WriteString(prefix)
+			last := 0
+			nmatches := int64(0)
+			for _, loc := range matches {
+				nmatches++
+				if n > 0 && nmatches != n {
+					continue // not the target match: leave it unchanged
+				}
+				mstart, mend := loc[0], loc[1]
+				b.WriteString(window[last:mstart])
+				b.Write(re.ExpandString(nil, replacement, window, loc))
+				last = mend
+				if n > 0 {
+					break // only one target match; stop after replacing it
+				}
+			}
+			b.WriteString(window[last:])
+			return NewStringDatum(b.String()), nil
 		}
 	case "format":
 		// format(fmt, args...) — PostgreSQL format() with positional args, width, flags.

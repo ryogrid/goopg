@@ -271,3 +271,97 @@ Out of scope for this round (unchanged): `regexp_replace` backreferences,
 `regexp_matches(...,'g')` multi-match FROM-clause/SELECT-list SRF wiring, and
 any further `'x'`/`'s'` correctness work on the shared
 `pgRegexFlagsToGoModifiers` translator or its other call sites.
+
+## Round F (landed 2026-08-22): `regexp_replace` extended (start/N) overloads
+
+`regexp_replace` had two working overloads — 3-arg `(s, pattern,
+replacement)` and 4-arg `(s, pattern, replacement, flags)` — but PG defines
+three more (`pg_proc.dat:3755-3768`, `regexp.c:700-741
+textregexreplace_extended`):
+
+- oid 6253, 4-arg: `(s, pattern, replacement, start)` — no N, no flags.
+- oid 6252, 5-arg: `(s, pattern, replacement, start, N)` — no flags.
+- oid 6251, 6-arg: `(s, pattern, replacement, start, N, flags)`.
+
+Before this round, ANY call with `len(Args) >= 4` blindly read `Args[3]` as
+a flags string — so a real 6-arg call's `start` (an int Datum) was silently
+misparsed as a flags string (garbage `pgRegexFlagsToGoModifiers` input,
+usually an error). This was an existing correctness bug, fixed as part of
+this slice.
+
+**Arity collision, resolved by Datum kind, not arity.** `len(Args)==4` is
+genuinely ambiguous between oid 2285 (flags-string) and oid 6253
+(int-start) — PG itself resolves this by parse-time type resolution of the
+literal (`strings.sql`'s own "erroneous invocation" fixture:
+`regexp_replace(..., 'X', '1')` — a *quoted* string literal — stays on the
+flags overload and errors `invalid regular expression option: "1"`, while
+an *unquoted* `1` picks the int overload). goopg's untyped AST can't do
+overload resolution, but by the time the case arm runs, args have already
+been evaluated to Datums — a quoted literal evaluates to `KindString`, an
+unquoted numeric literal to `KindInt` — so branching on `Args[3].Kind`
+reproduces PG's real resolution outcome for both fixture shapes without
+needing type inference. `len(Args)==5` has only one PG overload (6252,
+start+N, no flags) so no branch is needed there; `len(Args)==6` is fully
+determined (6251).
+
+**Match-and-replace loop** (`varlena.c:4457-4618 replace_text_regexp`):
+`search_start = start-1` (0-based, char/rune offset — same rune-window
+idiom as Round E's `regexpInstrSubstrLocate`/`regexpWindowCharPos`);
+`re.FindAllStringSubmatchIndex` over that window enumerates all matches;
+`N==0` replaces every match in the window (like `g`, but scoped to
+`start`); `N>0` replaces only the Nth match and leaves all others —
+including ones before and after it — untouched, and stops (this is the
+"`'g'` is ignored when `N` is specified" fixture line,
+`strings.sql`/`strings.out` "N=1 wins over 'g'": passing `'g'` alongside an
+explicit `N` has no effect, because presence of `N` bypasses the
+`glob`-derived default entirely in the extended form — matching
+`textregexreplace_extended`'s own `PG_NARGS()<=4` guard, which only derives
+`n` from `re_flags.glob` when NEITHER `start` nor `N` was supplied). Each
+matched span is replaced via `re.ExpandString` against the SAME `\1`/`\2`→
+`${1}`/`${2}` replacement string used by the existing 3/4-arg forms — no
+change to Round-C's `\1`/`\2`-only backreference-in-replacement scope.
+
+**Pattern compilation switched to the shared `regexpCompilePattern` helper**
+(previously this case arm called Go's stdlib `regexp.Compile` directly,
+bypassing Round E's `s`/`x`-flag-aware compiler) — for ALL arities,
+including the pre-existing 3/4-arg forms, since it's the same case arm.
+Verified this is a **behavior fix, not just hygiene**, for the case with no
+flags arg at all (3-arg, or the 6253/6252 start-forms): PG's `regexp_replace`
+default mode does NOT set `REG_NEWLINE` (so `.` matches newline by default,
+same as Round E's finding for `regexp_like`/etc.) — this default now applies
+uniformly.
+
+**`internal/optimizer/planner.go` `exprType`**: added
+`case "regexp_replace": return catalog.Type{Name: "text"}`. Confirmed via a
+throwaway revert-and-retest that this is **not** purely hygiene — without
+it, `pg_typeof(regexp_replace(...))` folds to the generic `"unknown"`
+fallback (there was no prior case arm for `regexp_replace` at all in this
+switch), not `"text"`. New assertion added to the existing
+`TestPgTypeofFoldsToCompileTimeType` (`internal/optimizer/pg_typeof_test.go`).
+
+New test: `internal/executor/regexp_replace_extended_test.go`
+(`TestRegexpReplaceExtendedForm`) — the 6 acceptance-criteria fixture lines
+(`strings.out` extended-form block), the 4-arg Datum-kind arity-ambiguity
+branch (both sides), and confirmation that the pre-existing 3-arg/4-arg-flags
+forms (incl. `\1`/`\2` backreference-in-replacement) are unchanged. Live
+psql spot-check against a cgroup-capped throwaway goopg server vs the PG
+18.3 oracle: every `regexp_replace` line in `strings.sql`'s pre-existing
+(224-234) and new extended (236-251) blocks is byte-identical, including
+exact `22023` error text — EXCEPT the pre-existing (unrelated,
+Round-C-out-of-scope) backreference-*in-pattern* gap noted below, confirmed
+identical before/after this round (not a regression).
+
+**Deferral candidates (unchanged by this round, confirmed pre-existing):**
+- Backreferences *inside the regexp pattern itself* (e.g. `(.)\1` matching
+  two identical adjacent characters) are not supported at all — Go's RE2
+  engine cannot execute pattern-level backreferences (fundamentally, not a
+  goopg gap to close with more code); `strings.sql:225-228`'s
+  `E'(.)\\1'`-pattern fixtures fall through to the "invalid pattern: return
+  input unchanged" path both before and after this round. This is a
+  different, deeper gap than the Round-C `\1`/`\2`-in-*replacement*-only
+  scope (which this round explicitly left untouched) and would need a
+  backtracking regex engine swap to close — out of scope here.
+- `\3` and higher backreferences in the replacement string are also still
+  unsupported (Round-C scope: `\1`/`\2` only) — `strings.sql:224`'s
+  `(\1) \2-\3` fixture leaves the literal `\3` un-substituted (PG:
+  `3333`; goopg: `\3`), same before and after this round.

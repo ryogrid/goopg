@@ -12576,6 +12576,10 @@ func exprType(e Expr) catalog.Type {
 			case "regexp_substr":
 				// pg_proc.dat oids 6265-6269: prorettype text. M0134-0070.
 				return catalog.Type{Name: "text"}
+			case "regexp_replace":
+				// pg_proc.dat oids 2284/2285/6251/6252/6253: prorettype text in
+				// all 5 overloads (3/4/5/6-arg). M0134-0070 Round F.
+				return catalog.Type{Name: "text"}
 		case "array_agg":
 			// array_agg(expr) returns the element type with [] suffix. M0097-0035.
 			if len(x.Args) > 0 {
