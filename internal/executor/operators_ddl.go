@@ -18660,6 +18660,7 @@ func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
 	name := s.Name.String()
 	seqDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 	if LookupSequence(name, seqDBOid) != nil && s.IfNotExists {
+		o.ctx.AddNotice(fmt.Sprintf("relation %q already exists, skipping", name))
 		return nil
 	}
 	// Validate data type.
@@ -18863,7 +18864,8 @@ func (o *ddlOp) validateSeqOwnedBy(pos int, seqName, ownedBy string) error {
 	// rejects a valid 3-part OWNED BY. Mirrors InMemory.dependVirtualRows.
 	lastDot := strings.LastIndex(ownedBy, ".")
 	if lastDot < 0 {
-		return &ExecError{Code: "42601", Pos: pos, Message: "invalid OWNED BY option"}
+		return &ExecError{Code: "42601", Pos: pos, Message: "invalid OWNED BY option",
+			Hint: "Specify OWNED BY table.column or OWNED BY NONE."}
 	}
 	tblPart := ownedBy[:lastDot]
 	colPart := ownedBy[lastDot+1:]
@@ -18924,6 +18926,7 @@ func (o *ddlOp) execAlterSequence(s *parser.AlterSequenceStmt) error {
 	seq := LookupSequence(name, seqDBOid)
 	if seq == nil {
 		if s.IfExists {
+			o.ctx.AddNotice(fmt.Sprintf("relation %q does not exist, skipping", name))
 			return nil
 		}
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", name)}
