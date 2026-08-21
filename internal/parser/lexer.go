@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // LexError reports a lexing failure with byte position.
@@ -600,7 +601,64 @@ func (l *lexer) lexEscapeString(start int) (Token, error) {
 // the input runs out first — the caller reports "unterminated escape
 // string literal".
 func (l *lexer) scanEscapeQuoteInto(b *strings.Builder) (bool, error) {
+	// hasPendingSurrogate tracks a UTF-16 surrogate-first \u/\U escape
+	// (e.g. \uD800-\uDBFF) that is waiting to be paired with an
+	// immediately-following surrogate-second escape, per
+	// postgres/src/backend/parser/scan.l:642-696 (states <xe>/<xeu>).
+	// Whatever is scanned next — a valid pairing \u/\U escape, a
+	// malformed one, or anything else at all — resolves or rejects the
+	// pending surrogate before normal scanning resumes.
+	var hasPendingSurrogate bool
+	var pendingSurrogateVal rune
 	for l.pos < len(l.src) {
+		if hasPendingSurrogate {
+			if l.pos+1 < len(l.src) && l.src[l.pos] == '\\' && (l.src[l.pos+1] == 'u' || l.src[l.pos+1] == 'U') {
+				escStart := l.pos
+				digits := 4
+				if l.src[l.pos+1] == 'U' {
+					digits = 8
+				}
+				l.pos += 2 // consume backslash + u/U
+				val, count := l.scanUnicodeEscapeDigits(digits)
+				if count < digits {
+					// postgres/src/backend/parser/scan.l:697-705
+					// (<xe,xeu>{xeunicodefail}) — digit-count failure
+					// takes priority over surrogate-pairing state.
+					return false, &SyntaxError{
+						Pos: escStart, Raw: true, Code: "22025",
+						Message: "invalid Unicode escape",
+						Hint:    "Unicode escapes must be \\uXXXX or \\UXXXXXXXX.",
+					}
+				}
+				if isUTF16SurrogateSecond(val) {
+					b.WriteRune(surrogatePairToCodepoint(pendingSurrogateVal, val))
+					hasPendingSurrogate = false
+					continue
+				}
+				// postgres/src/backend/parser/scan.l:670-687 (<xeu>{xeunicode}
+				// action) — well-formed escape, but not a valid low
+				// surrogate: near-text is the whole matched escape token.
+				near := l.src[escStart:l.pos]
+				return false, &SyntaxError{
+					Pos: escStart, Raw: true, Code: "42601",
+					Message: fmt.Sprintf(`invalid Unicode surrogate pair at or near "%s"`, near),
+				}
+			}
+			// postgres/src/backend/parser/scan.l:688-696
+			// (<xeu>. |<xeu>\n |<xeu><<EOF>>) — anything else (one
+			// arbitrary character, or nothing left) resolves the pending
+			// surrogate as an error; near-text is that single character.
+			pos := l.pos
+			near := ""
+			if l.pos < len(l.src) {
+				r, _ := utf8.DecodeRuneInString(l.src[l.pos:])
+				near = string(r)
+			}
+			return false, &SyntaxError{
+				Pos: pos, Raw: true, Code: "42601",
+				Message: fmt.Sprintf(`invalid Unicode surrogate pair at or near "%s"`, near),
+			}
+		}
 		ch := l.src[l.pos]
 		if ch == '\'' {
 			if l.pos+1 < len(l.src) && l.src[l.pos+1] == '\'' {
@@ -645,22 +703,47 @@ func (l *lexer) scanEscapeQuoteInto(b *strings.Builder) (bool, error) {
 					count++
 				}
 				b.WriteByte(val)
-			case 'u':
-				// Unicode 4-hex-digit.
-				val := rune(0)
-				for i := 0; i < 4 && l.pos < len(l.src) && isHexDigit(l.src[l.pos]); i++ {
-					val = val*16 + rune(hexVal(l.src[l.pos]))
-					l.pos++
+			case 'u', 'U':
+				// Unicode 4-hex-digit (\u) or 8-hex-digit (\U) escape.
+				// postgres/src/backend/parser/scan.l:266-267,642-705.
+				escStart := l.pos - 2 // position of the backslash
+				digits := 4
+				if esc == 'U' {
+					digits = 8
 				}
-				b.WriteRune(val)
-			case 'U':
-				// Unicode 8-hex-digit.
-				val := rune(0)
-				for i := 0; i < 8 && l.pos < len(l.src) && isHexDigit(l.src[l.pos]); i++ {
-					val = val*16 + rune(hexVal(l.src[l.pos]))
-					l.pos++
+				val, count := l.scanUnicodeEscapeDigits(digits)
+				if count < digits {
+					return false, &SyntaxError{
+						Pos: escStart, Raw: true, Code: "22025",
+						Message: "invalid Unicode escape",
+						Hint:    "Unicode escapes must be \\uXXXX or \\UXXXXXXXX.",
+					}
 				}
-				b.WriteRune(val)
+				switch {
+				case isUTF16SurrogateFirst(val):
+					// Wait for a pairing low surrogate on the next
+					// escape/character; nothing written yet.
+					hasPendingSurrogate = true
+					pendingSurrogateVal = val
+				case isUTF16SurrogateSecond(val):
+					// Lone low surrogate with no preceding high
+					// surrogate. postgres/src/backend/parser/scan.l:659-660.
+					near := l.src[escStart:l.pos]
+					return false, &SyntaxError{
+						Pos: escStart, Raw: true, Code: "42601",
+						Message: fmt.Sprintf(`invalid Unicode surrogate pair at or near "%s"`, near),
+					}
+				case val <= 0 || val > 0x10FFFF:
+					// postgres/src/backend/parser/scan.l:1378-1395
+					// (addunicode) — is_valid_unicode_codepoint.
+					near := l.src[escStart:l.pos]
+					return false, &SyntaxError{
+						Pos: escStart, Raw: true, Code: "42601",
+						Message: fmt.Sprintf(`invalid Unicode escape value at or near "%s"`, near),
+					}
+				default:
+					b.WriteRune(val)
+				}
 			default:
 				if esc >= '0' && esc <= '7' {
 					// Octal: 1-3 digits.
@@ -682,6 +765,33 @@ func (l *lexer) scanEscapeQuoteInto(b *strings.Builder) (bool, error) {
 		l.pos++
 	}
 	return false, nil
+}
+
+// scanUnicodeEscapeDigits scans up to `digits` hex digits starting at
+// l.pos (positioned just after the \u or \U marker), advancing l.pos as
+// it goes. It returns the accumulated value and the number of digits
+// actually consumed; callers must check count == digits themselves —
+// PG requires an exact count (postgres/src/backend/parser/scan.l:266-267).
+func (l *lexer) scanUnicodeEscapeDigits(digits int) (rune, int) {
+	val := rune(0)
+	count := 0
+	for count < digits && l.pos < len(l.src) && isHexDigit(l.src[l.pos]) {
+		val = val*16 + rune(hexVal(l.src[l.pos]))
+		l.pos++
+		count++
+	}
+	return val, count
+}
+
+// isUTF16SurrogateFirst/isUTF16SurrogateSecond mirror
+// postgres/src/include/mb/pg_wchar.h:540-550.
+func isUTF16SurrogateFirst(c rune) bool  { return c >= 0xD800 && c <= 0xDBFF }
+func isUTF16SurrogateSecond(c rune) bool { return c >= 0xDC00 && c <= 0xDFFF }
+
+// surrogatePairToCodepoint mirrors
+// postgres/src/include/mb/pg_wchar.h:552-556.
+func surrogatePairToCodepoint(first, second rune) rune {
+	return ((first & 0x3FF) << 10) + 0x10000 + (second & 0x3FF)
 }
 
 func hexVal(c byte) byte {
