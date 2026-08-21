@@ -1,83 +1,78 @@
-Task: M0134-0070 (strings.sql) — regress-sql `failed`. This loop closed the
-`reverse(bytea)` + `split_part()` bucket (researcher sizing round found both
-CONTAINED, single-`case`-block fixes).
-Committed/pushed: code `bc7402f3`, bookkeeping `7ab5e89b`
-(`3f77636d..bc7402f3..7ab5e89b` on `regress-renumbering`).
+Task: M0134-0070 (strings.sql) — regress-sql `failed`. This loop implemented
+the SQL:2003 `SUBSTRING(str SIMILAR pattern ESCAPE escape)` form, the
+sizing researcher's largest identified remaining bucket.
+Committed/pushed: code `0a04e518`, bookkeeping `a4e7b471`
+(`e59785b1..0a04e518..a4e7b471` on `regress-renumbering`).
 
-Landed: `reverse()` (`internal/executor/expr.go`) now branches on
-`Kind==KindBytes` to byte-reverse via `NewBytesDatum` (matches PG's
-`bytea_reverse`, `varlena.c:3458-3474`), was unconditionally rune-reversing
-`s.StringValue()` producing U+FFFD garbage on non-UTF8 bytea payloads.
-`split_part()` rewritten to match PG's `split_part` (`varlena.c:4621-4750`)
-exactly: `fldnum==0` raises `22023` "field position must not be zero",
-negative field indices count from the end, empty delimiter returns the
-whole string for field ±1 / empty otherwise (was Go per-rune
-`strings.Split(s, "")`). `exprType()` (`internal/optimizer/planner.go`)
-gained a matching `reverse` bytea/text wire-type case (same pattern as the
-prior loop's btrim/ltrim/rtrim fix — without it the wire layer advertised
-`text`/`unknown` for `reverse(bytea)` and rendered the byte-correct result as
-mangled UTF-8; this was flagged as a scope deviation by the implementer
-since the brief said "no dispatch-table changes" but was judged necessary to
-satisfy the brief's own acceptance criterion, and is directly precedented by
-the same-milestone `btrim`/`ltrim`/`rtrim`/`substr`/`overlay` arms already
-in that switch). New test `internal/executor/reverse_splitpart_test.go` (15
-subtests). `strings.sql` diff shrank **1029→952 lines**. Case still
-`failed`.
+Landed: goopg's `parseSubstringFuncCall` had no `SIMILAR`/`ESCAPE` grammar
+branch at all (hard-required `FROM`). Added a mandatory-`ESCAPE` `SIMILAR`
+branch (`internal/parser/select.go`) that parse-time constant-folds literal
+str/pattern/escape into a plain 2-arg `substring(text, <POSIX ERE>)` call
+(mirrors `buildSimilarTo`'s literal-fold shape, adapted for 3-operand STRICT
+NULL propagation) — lands unchanged on the existing `evalSubstrRegex`
+capturing-group executor path, zero executor changes needed.
+`internal/utils/adt/similarto.Convert` refactored into a shared
+`convert(pattern, escape, substringMode)`; new `ConvertSubstring` adds the
+escape-double-quote (`#"..#"`) part-separator convention (PG oracle
+`regexp.c:920-953`) the package's own doc comment had flagged as
+deliberately unported since the original SIMILAR TO work. A third separator
+raises `ErrTooManyQuoteSeparators` → SQLSTATE `2200C`. New tests:
+`similarto_test.go` (ConvertSubstring ERE-shape pins),
+`internal/parser/substring_similar_test.go` (constant-fold pins + 2200C +
+NULL-propagation), `internal/executor/substring_similar_escape_test.go`
+(11/13 end-to-end byte-exact pins vs PG 18.3 + 2 documented-gap tests).
+`strings.sql` diff shrank **941→857 lines**. Case still `failed`.
 
-Deferred (ledger row appended 2026-08-22): `to_hex(int)` on negative
-arguments (`internal/executor/expr.go` ~13648-13655,
-`fmt.Sprintf("%x", v.Int)`) prints a signed hex string (e.g. `-4d2`) instead
-of PG's unsigned two's-complement hex (`fffffb2e` int4 / `fffffffffffffb2e`
-int8) — needs the arg's declared width to pick the mask; ~4-line bucket, not
-fixed this round.
+Deferred (ledger row appended 2026-08-22, 2 items): (1) Go's `regexp`
+package is RE2 leftmost-first, not PG's POSIX-ARE leftmost-longest — 1/13
+SIMILAR/ESCAPE statements (`'a*#"%#"g*'`) picks the wrong non-greedy
+division; `regexp.CompilePOSIX` can't compile PG's `{1,1}?` syntax, so this
+needs either an engine swap (cross-cutting) or a targeted rewrite — pinned
+as a documented-divergence test, not fixed. (2) the `2200C` error case
+omits PG's `CONTEXT:  SQL function "substring" statement 1` line — no
+CONTEXT-stack mechanism exists anywhere in goopg for constant-folded
+builtin-SQL-wrapper errors (not substring-specific, out of this slice's
+scope). Both are 1-line-of-diff residuals.
 
-Key symbols: `case "reverse":`, `case "split_part":`
-(`internal/executor/expr.go`, ~line 12013-12028 and ~12166 pre-this-loop
-offsets — re-grep, line numbers shift); `exprType()`'s FuncCall switch
-(`internal/optimizer/planner.go`, ~line 12564).
+Key symbols: `similarto.convert`/`ConvertSubstring`/`Convert`
+(`internal/utils/adt/similarto/similarto.go`), `parseSubstringFuncCall`'s
+new `SIMILAR` branch + `buildSubstringSimilar`
+(`internal/parser/select.go`, grep for `KwSimilar` inside
+`parseSubstringFuncCall`).
 
 Next step: re-check the fix_plan banner at loop start first (M-NIGHTLY
-filing unconditional; 5 items already filed from the 20260822-001356 run,
-none block M0134's gates, none selected — re-verify no NEW nightly run
-landed since). Then continue sizing the 952-line `strings.sql` diff.
-Candidates named this loop: `to_hex` negative-int two's-complement fix
-(small/contained, same shape as this loop — recommended next), OR open the
-dedicated `ascii()`/`bit_count()` wire-trace investigation slice (needs a
-protocol-logging patch or packet capture vs a live PG 18.3 server for the
-identical query — larger/riskier than a normal implementer round, consider
-whether it needs a researcher round with Bash access to a running
-goopg+PG pair rather than static reading). Remaining known buckets in the
-952-line diff: the deferred `ascii()`/`bit_count()` spacing bucket,
-obsolete-SQL99 `SUBSTRING(... SIMILAR ... ESCAPE ...)`, residual
-Unicode-escape parser error-message/DETAIL mismatches, and now `to_hex`
-negative-int. Also still open, no urgency: `scripts/pg-oracle-diff.sh
+filing unconditional). Then continue sizing the now-857-line `strings.sql`
+diff. Named candidates, none yet sized in detail this loop: (a) the
+cross-cutting `psql` aligned-output column-width bug affecting
+`ascii()`/`bit_count()` (also present in `misc_functions.diff`/`stats.sql`
+per the 2026-08-22 sizing researcher — needs protocol-logging/packet-capture
+investigation, not a normal implementer round); (b) residual Unicode-escape
+parser error-message/DETAIL mismatches; (c) `scripts/pg-oracle-diff.sh
 --auto-start`'s `initdb -q` breakage (ledger row dated 2026-08-22, M0134-0070
-infra entry).
+infra entry) — none of (a)/(b)/(c) sized this loop, run a researcher sizing
+pass on the 857-line diff before picking the next bucket (the SIMILAR/ESCAPE
+bucket that was previously largest is now mostly closed).
 
-Gates run this loop: `go build ./...` PASS; `go test
-./internal/executor/... ./internal/optimizer/...` PASS (cached, both
-implementer + this session); `go test ./internal/executor/ -run
-'TestReverseByteaByteReversal|TestSplitPartPGSemantics' -v` PASS all 15
-subtests (implementer + re-verified this session); `RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh` PASS (implementer + this session); live
-psql spot-check via cgroup-capped throwaway server + PG oracle (implementer)
-— all 4 brief acceptance-criteria queries byte-exact;
-`scripts/pg-regress-runner.sh --verbose strings` 1029→952 lines
-(implementer); pre-commit pgbench smoke via git hook — PASS twice (code
-commit: 372/694/13036 TPS; bookkeeping commit: 376/693/13073 TPS, 0 failed
-both times). `make ralph-state-guard` — ran this session, found the
-running/completed status/progress mismatch from a normal prior-loop
-clean-exit marker, self-repaired to consistent (status="running",
-progress="in_progress"), final check OK.
+Gates run this loop: `go build ./...` PASS; `go test ./internal/parser/...
+./internal/executor/... ./internal/utils/adt/similarto/...` PASS (all
+cached); `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS;
+`scripts/pg-regress-runner.sh --verbose strings` 941→857 lines (coordinator
+re-ran directly to verify before commit, not just trusting the worker's
+report); pre-commit pgbench smoke via git hook — PASS twice (code commit:
+376/697/13180 TPS; bookkeeping commit: 376/697/13179 TPS, 0 failed both
+times). `make ralph-state-guard` — pending, run before final status block.
 
-Delegation: researcher round (sizing reverse(bytea) + finding split_part as
-a second bucket, no handoff dir — inline in this conversation) DONE.
-implementer round (tmp/ralph-handoffs/m0134-0070-reverse-splitpart/), DONE
-in round 1, converged. report.md write was blocked by the implementer's own
-tooling guard again (same recurring friction as prior loops); coordinator
-wrote report.md manually into the handoff dir from the relayed agent output
-— durable trail intact. No open handoff.
+Delegation: researcher round (sizing SUBSTRING SIMILAR ESCAPE, inline
+in-conversation, no handoff dir) DONE. implementer round
+(`tmp/ralph-handoffs/m0134-0070-substring-similar-escape/`) DONE in one
+round — hit the same recurring tooling friction as recent prior loops (could
+not write report.md via its own tools; relayed full report text in its
+final message instead). Coordinator persisted the ledger row from the
+relayed report and independently re-ran the regress-runner + precommit gates
+before committing (did not just trust the relayed numbers). No open
+handoff — brief.md remains on disk as a completed record, no report.md file
+(report text preserved in this working_set entry + the ledger row).
 
-In-flight: none. Commits `bc7402f3` (code) and `7ab5e89b` (bookkeeping)
-landed and pushed to `regress-renumbering` (`3f77636d..bc7402f3..7ab5e89b`).
-No server left running.
+In-flight: none. Commits `0a04e518` (code) and `a4e7b471` (bookkeeping)
+landed and pushed to `regress-renumbering`
+(`e59785b1..0a04e518..a4e7b471`). No server left running.
