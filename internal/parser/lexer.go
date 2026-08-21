@@ -101,6 +101,94 @@ func (l *lexer) skipWhitespaceAndComments() error {
 	return nil
 }
 
+// scanPlainQuoteInto scans a plain `'...'` literal body (with `''` doubling
+// to a literal `'`) into b, starting at l.pos (positioned just after the
+// opening quote, or just after a continuation's reopening quote). It stops
+// and returns true, consuming the closing quote, when it finds an unescaped
+// `'`. It returns false (with l.pos == len(l.src)) if the input runs out
+// first — the caller reports "unterminated string literal".
+func (l *lexer) scanPlainQuoteInto(b *strings.Builder) (bool, error) {
+	for l.pos < len(l.src) {
+		if l.src[l.pos] == '\'' {
+			if l.peekAt(1) == '\'' {
+				b.WriteByte('\'')
+				l.pos += 2
+				continue
+			}
+			l.pos++
+			return true, nil
+		}
+		b.WriteByte(l.src[l.pos])
+		l.pos++
+	}
+	return false, nil
+}
+
+// tryQuoteContinuation implements PG scan.l's <xqs> lookahead state
+// (lines 574-631, quotecontinue/quotecontinuefail macros at lines 224-239):
+// after a string literal's closing quote, look ahead past whitespace and
+// comments. If that gap contains at least one newline AND the next
+// non-whitespace character is a `'`, this is a continuation — consume the
+// gap and the reopening quote (so the caller can resume scanning the next
+// fragment into the same buffer) and return true. Otherwise restore l.pos
+// to where it was on entry (mirrors yyless(0)) and return false, leaving
+// the token to be emitted as-is. Same-line adjacent literals (`'a' 'b'`,
+// no newline in the gap) deliberately do NOT concatenate.
+func (l *lexer) tryQuoteContinuation() (bool, error) {
+	save := l.pos
+	sawNewline := false
+scan:
+	for l.pos < len(l.src) {
+		c := l.src[l.pos]
+		switch {
+		case c == ' ' || c == '\t' || c == '\r':
+			l.pos++
+		case c == '\n':
+			sawNewline = true
+			l.pos++
+		case c == '-' && l.peekAt(1) == '-':
+			// Line comment: doesn't itself contain a newline, but the
+			// newline that ends it is picked up on the next loop iteration.
+			for l.pos < len(l.src) && l.src[l.pos] != '\n' {
+				l.pos++
+			}
+		case c == '/' && l.peekAt(1) == '*':
+			// Block comment, nestable per upstream; a newline anywhere
+			// inside it counts toward quotecontinue.
+			cstart := l.pos
+			depth := 0
+			for l.pos < len(l.src) {
+				if l.src[l.pos] == '\n' {
+					sawNewline = true
+				}
+				if l.src[l.pos] == '/' && l.peekAt(1) == '*' {
+					depth++
+					l.pos += 2
+				} else if l.src[l.pos] == '*' && l.peekAt(1) == '/' {
+					depth--
+					l.pos += 2
+					if depth == 0 {
+						break
+					}
+				} else {
+					l.pos++
+				}
+			}
+			if depth != 0 {
+				return false, l.errf(cstart, "unterminated block comment")
+			}
+		default:
+			break scan
+		}
+	}
+	if sawNewline && l.pos < len(l.src) && l.src[l.pos] == '\'' {
+		l.pos++ // consume the continuation fragment's opening quote
+		return true, nil
+	}
+	l.pos = save
+	return false, nil
+}
+
 func (l *lexer) next() (Token, error) {
 	if err := l.skipWhitespaceAndComments(); err != nil {
 		return Token{}, err
@@ -149,20 +237,30 @@ func (l *lexer) next() (Token, error) {
 	case c == '\'':
 		l.pos++
 		var b strings.Builder
-		for l.pos < len(l.src) {
-			if l.src[l.pos] == '\'' {
-				if l.peekAt(1) == '\'' {
-					b.WriteByte('\'')
-					l.pos += 2
-					continue
-				}
-				l.pos++
+		for {
+			closed, err := l.scanPlainQuoteInto(&b)
+			if err != nil {
+				return Token{}, err
+			}
+			if !closed {
+				return Token{}, l.errf(start, "unterminated string literal")
+			}
+			// PG string-literal continuation (scan.l <xqs> lookahead state,
+			// lines 574-631): two or more single-quoted literals separated
+			// ONLY by whitespace/comments that include at least one newline
+			// concatenate into one token. `'a' 'b'` on one line (no newline
+			// in the gap) does NOT concatenate — matches quotecontinuefail.
+			cont, err := l.tryQuoteContinuation()
+			if err != nil {
+				return Token{}, err
+			}
+			if !cont {
 				return Token{Kind: TokenStringLit, Value: b.String(), Pos: start}, nil
 			}
-			b.WriteByte(l.src[l.pos])
-			l.pos++
+			// tryQuoteContinuation already consumed the whitespace/comments
+			// and the reopening quote; loop back to scan the next fragment
+			// into the same builder using the plain-quote decoding rule.
 		}
-		return Token{}, l.errf(start, "unterminated string literal")
 
 	case isDigit(c):
 		// l.pos currently points to c (not yet advanced past it).
@@ -491,6 +589,37 @@ func (l *lexer) next() (Token, error) {
 func (l *lexer) lexEscapeString(start int) (Token, error) {
 	l.pos++ // consume opening '\''
 	var b strings.Builder
+	for {
+		closed, err := l.scanEscapeQuoteInto(&b)
+		if err != nil {
+			return Token{}, err
+		}
+		if !closed {
+			return Token{}, l.errf(start, "unterminated escape string literal")
+		}
+		// PG scan.l resumes an E'...' literal's <xqs> continuation lookahead
+		// in state_before_str_stop — i.e. the SAME state the opener was in.
+		// A bare `'...'` continuation fragment after an E'...' opener is
+		// therefore still backslash-decoded per escape-string rules, not
+		// the plain `''`-doubling rule (scan.l lines 574-631).
+		cont, err := l.tryQuoteContinuation()
+		if err != nil {
+			return Token{}, err
+		}
+		if !cont {
+			return Token{Kind: TokenStringLit, Value: b.String(), Pos: start}, nil
+		}
+	}
+}
+
+// scanEscapeQuoteInto scans an escape-string (`E'...'`) literal body,
+// applying PostgreSQL's backslash-decoding rules, into b, starting at
+// l.pos (positioned just after the opening quote, or just after a
+// continuation's reopening quote). It stops and returns true, consuming
+// the closing quote, when it finds an unescaped `'`. It returns false if
+// the input runs out first — the caller reports "unterminated escape
+// string literal".
+func (l *lexer) scanEscapeQuoteInto(b *strings.Builder) (bool, error) {
 	for l.pos < len(l.src) {
 		ch := l.src[l.pos]
 		if ch == '\'' {
@@ -500,7 +629,7 @@ func (l *lexer) lexEscapeString(start int) (Token, error) {
 				continue
 			}
 			l.pos++
-			return Token{Kind: TokenStringLit, Value: b.String(), Pos: start}, nil
+			return true, nil
 		}
 		if ch == '\\' {
 			l.pos++ // consume backslash
@@ -572,7 +701,7 @@ func (l *lexer) lexEscapeString(start int) (Token, error) {
 		b.WriteByte(ch)
 		l.pos++
 	}
-	return Token{}, l.errf(start, "unterminated escape string literal")
+	return false, nil
 }
 
 func hexVal(c byte) byte {
