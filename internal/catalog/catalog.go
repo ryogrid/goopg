@@ -3498,6 +3498,49 @@ var BuiltinTSDictOID = map[string]uint32{
 	"simple": 3765,
 }
 
+// BuiltinTSConfigLanguages is the set of snowball-stemmer language names real
+// PG's initdb creates as pg_ts_config rows (each `CREATE TEXT SEARCH
+// CONFIGURATION pg_catalog.<lang> (PARSER = default);` + a mapping to
+// `<lang>_stem`, `postgres/src/backend/snowball/snowball_create.sql`) — unlike
+// `simple` (the only *bootstrap* pg_ts_config.dat row, `postgres/src/include/
+// catalog/pg_ts_config.dat`), these are not static catalog constants with
+// fixed OIDs, so goopg does not model them as real catalog rows. This set only
+// lets `CREATE TEXT SEARCH CONFIGURATION x (COPY = <lang>)` resolve a valid
+// COPY source name (with an empty mapping set, since goopg implements no
+// snowball stemming) instead of erroring 42704 "does not exist". DU-002
+// follow-up (M0134-0068).
+var BuiltinTSConfigLanguages = map[string]bool{
+	"arabic":     true,
+	"armenian":   true,
+	"basque":     true,
+	"catalan":    true,
+	"danish":     true,
+	"dutch":      true,
+	"english":    true,
+	"estonian":   true,
+	"finnish":    true,
+	"french":     true,
+	"german":     true,
+	"greek":      true,
+	"hindi":      true,
+	"hungarian":  true,
+	"indonesian": true,
+	"irish":      true,
+	"italian":    true,
+	"lithuanian": true,
+	"nepali":     true,
+	"norwegian":  true,
+	"portuguese": true,
+	"romanian":   true,
+	"russian":    true,
+	"serbian":    true,
+	"spanish":    true,
+	"swedish":    true,
+	"tamil":      true,
+	"turkish":    true,
+	"yiddish":    true,
+}
+
 // TSTokenType is one row of ts_token_type()'s fixed output for the "default"
 // parser: (tokid, alias, description). Mirrors wparser_def.c's static
 // lex_descr table (the only parser goopg models). Order matches upstream's

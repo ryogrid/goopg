@@ -56,7 +56,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-sql,regress,postgres/src/test/regress/sql/delete.sql,pass,yes,-,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
 ,regress-sql,regress,postgres/src/test/regress/sql/dependency.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/domain.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/drop_if_exists.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+,regress-sql,regress,postgres/src/test/regress/sql/drop_if_exists.sql,pass,yes,-,M0134-0068: CREATE TEXT SEARCH CONFIGURATION COPY=<snowball language> fallback landed; scripts/pg-regress-runner.sh --verbose drop_if_exists 100% parity
 ,regress-sql,regress,postgres/src/test/regress/sql/drop_operator.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/encoding.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/enum.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope

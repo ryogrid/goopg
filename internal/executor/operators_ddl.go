@@ -21338,6 +21338,17 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 					break
 				}
 			}
+			if copySource == nil && catalog.BuiltinTSConfigLanguages[strings.ToLower(copySourceName)] {
+				// COPY = <snowball language> (e.g. "english"): real PG's
+				// initdb seeds one pg_ts_config row per language (see
+				// catalog.BuiltinTSConfigLanguages doc comment); goopg has no
+				// such row, so synthesize an equivalent COPY source here
+				// (default parser, no mappings — no snowball stemming
+				// modeled) rather than erroring 42704. This synthetic value
+				// is never registered in the catalog; only the new
+				// configuration being created is. M0134-0068.
+				copySource = &catalog.UserTSConfig{Parser: catalog.BuiltinTSParserOID["default"]}
+			}
 			if copySource == nil {
 				return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", copySourceName)}
 			}
