@@ -1,77 +1,47 @@
-Task: M0134-0059 (rangefuncs.sql) — PARTIAL this loop, landed & committed
-(c3ce58b8). Case stays `failed`. CSV row unchanged. Next: select
-M0134-0060 (rangetypes.sql).
+Task: M0134-0065 (rules.sql) — sized + landed one CONTAINED fix (ALTER RULE
+RENAME TO), PARKED (case still `failed`, CSV row unchanged). Committed &
+pushed (fcfb60f9). Next: select M0134-0066 (date.sql).
 
-Files this loop: `internal/executor/plpgsql_runtime.go`
-(`evalSQLFunctionSetof` — SQL-language `RETURNS SETOF <composite-type>`
-functions were collapsing multi-column result rows to `row[0]` only;
-fixed by packing them into composite text via `rowToCompositeText` so
-`userSrfScanOp`/`decomposeCompositeText` can decompose on read),
-`internal/executor/ordinality_composite_srf_test.go` (new,
-`TestOrdinalityCompositeSRFSelectStar`), `.ralph/deferral_ledger.md` (new
-row, M0134-0059 breakdown of remaining gaps), `.ralph/fix_plan.md`
-(M0134-0059 entry rewritten with PARTIAL verdict + next-task pointer).
+Files this loop: `internal/parser/ast.go` (new `AlterRuleRenameStmt`),
+`internal/parser/ddl.go` (`parseAlter` — ALTER RULE ... RENAME TO dispatch),
+`internal/executor/operators_ddl.go` (`execAlterRuleRename`),
+`internal/optimizer/planner.go` (DDL passthrough type-switch entry),
+`internal/parser/alter_rule_rename_test.go` (new, `TestParseAlterRuleRename`),
+`internal/executor/storage_ddl_test.go` (added `TestDDLAlterRuleRename`),
+`.ralph/deferral_ledger.md` (new row, M0134-0065), `.ralph/fix_plan.md`
+(M0134-0065 marked PARKED with bucket summary, still unchecked).
 
-Key symbols: `evalSQLFunctionSetof` (plpgsql_runtime.go) — the actual bug
-site; NOT `userRoutineColumnSchema`/`wrapOrdinality`
-(internal/optimizer/planner.go) or the `expr.go:390` slot-width guard —
-those were red herrings the researcher's sizing pass flagged as candidate
-files but all three were confirmed correct on inspection; the guard at
-expr.go:390 was working as designed and is what surfaced the bug.
+Key symbols: `parseAlter` (ddl.go ~7075), `execAlterRuleRename`
+(operators_ddl.go), `catalog.RuleInfo` (catalog.go:1412),
+`parseCreateRuleTail` (ddl.go:1826 — only reifies DO-NOTHING rules).
 
-Hypothesis/Findings: rangefuncs.sql's diff was ~2330 lines almost
-entirely because the goopg server CRASHED partway through the file
-(`server closed the connection unexpectedly`, no panic in the structured
-slog) on `CREATE TEMPORARY VIEW ... JOIN rngfunct(1) WITH ORDINALITY ...
-ON (n=ord)`, truncating everything after (~2280 of the 2330 lines were
-"missing due to truncation" not independent mismatches). Root cause
-traced to ONE bug: `evalSQLFunctionSetof` fed `userSrfScanOp` malformed
-single-column rows for every composite-returning SETOF tuple. Fixing it
-BOTH resolved the preceding "out of Slot range" error AND made the crash
-trigger itself succeed cleanly (same root cause, confirmed live).
-Re-diffing post-fix (2524 lines now, further into the file, no longer
-crash-truncated) surfaces the file's OTHER independent gaps, first of
-which: `select a,b,ord from rngfunct(1) with ordinality as z(a,b,ord)`
-(explicit `ord` column NAME in the SELECT list, not `select *`) still
-raises `column "ord" does not exist` — a distinct, un-landed bug, related
-to but not the same as the already-ledgered M0122-0002 scalar-SRF
-ordinality-naming gap. Other remaining buckets (JSON constructors —
-already ledgered M0134-0038; pg_views; ROWS FROM column-flattening;
-table-valued-function column-alias-list parsing; OUT-param RETURNS
-inference; whole-row-Var lateral args) are each their own gap, none sized
-in detail this loop.
+Hypothesis/Findings: `rules.sql` dominant gap (~35+ of ~90 diverging blocks,
+3403-line diff, 51 `^+ERROR`/18 `^-ERROR`) is architectural — goopg has ZERO
+query-rewrite/rule-execution subsystem; `CREATE RULE` only persists the
+trivial DO-NOTHING form, any real DO INSTEAD/DO ALSO action rule is a no-op,
+and `pg_rules`/`pg_views` don't exist. REFACTOR-tier (parser+catalog+new
+planner/rewrite phase+executor), same tier as the rowtypes.sql (M0134-0064)
+and returning.sql (M0134-0063) precedents. Secondary independent gaps found
+but NOT landed: `session_replication_role` GUC missing, `int4smaller`/
+`pg_get_function_arg_default` builtins missing, a `SubPlan parameter $0 read
+before assignment` planner/executor bug (correlated-subquery eval-order,
+worth its own investigation later), MERGE `\sf` deparse losing PG18
+`RETURNING WITH (OLD/NEW)`. All ledgered under M0134-0065.
 
-Next step: select **M0134-0060 (rangetypes.sql)** per the fix_plan
-task-ID-ascending selection rule. Size it via `scripts/pg-regress-runner.sh
---verbose rangetypes` (delegate to researcher) before deciding
-fix/split/park, same pattern as M0134-0049..0059.
+Next step: select **M0134-0066 (date.sql)** per the fix_plan
+task-ID-ascending selection rule — size via researcher first.
 
-Gates run this loop: `go build ./...` PASS; `go test ./internal/executor/...
-./internal/optimizer/...` PASS (implementer, targeted); `RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh` PASS (via tester, ~421s cold internal/initdb
-+ 73s cmd/goopg, rest cached — expected on fresh/switched tree); pre-commit
-pgbench smoke PASS (376/694/12935 TPS across the 3 builtin scripts, 0
-failed transactions); live regress re-diff via `pg-regress-runner.sh
---verbose rangefuncs` confirmed the fix's effect and the case's continued
-`failed` status; `make ralph-state-guard` PASS (auto-repaired a stale
-status/progress mismatch from the previous loop's clean-exit marker, same
-pattern as last loop).
+Gates run this loop: `go build ./...` PASS; `go test ./internal/parser/...
+./internal/executor/...` PASS (both new tests + full package suites);
+`make ralph-state-guard` PASS (auto-repaired the same recurring stale
+clean-exit-marker mismatch as prior loops — known benign); pre-commit
+pgbench smoke PASS (701/12992 TPS, 0 failed transactions).
 
-Delegation: researcher agent `a0ee295ef7d2217ea` (1 round, sizing from
-cached CI diffs, found the crash-truncation pattern + Bucket 1/2/3
-breakdown — accepted). implementer agent `a6aede0bc03ac82c3` (1 round,
-traced the brief's 3 candidate files, found none of them was the actual
-bug, correctly identified the real root cause one layer below
-(plpgsql_runtime.go) and fixed it there, also verified the crash-fix side
-effect live — DONE, no further round needed, flagged the scope deviation
-clearly in its report per protocol). tester agent `a3286273c47ed44c7`
-(precommit units gate, PASS). tester agent `a7a5990cdce080536` (live
-regress re-diff verification, confirmed case stays `failed` with a
-smaller/different remaining diff).
+Delegation: researcher agent `a97b3841495548d70` (1 round — full bucket
+breakdown + PARK recommendation with the specific contained slice, accepted
+as-is); implementer agent `af8c7375d5c9e373f` (1 round — DONE, no escalation,
+report relayed inline since Write of report.md was blocked by tool policy —
+content captured verbatim into the deferral ledger row instead).
 
-In-flight: none. Commit `c3ce58b8` pushed to `regress-renumbering`. No
-server left running (regress runner + pgbench smoke + package tests all
-self-start/stop their own throwaway goopg instances via the cgroup
-wrapper). Handoff dir `tmp/ralph-handoffs/m0134-0059-rangefuncs-ordinality/`
-and `tmp/regress-diffs/rangefuncs.diff` cleaned up (scratch, folded into
-the ledger/fix_plan already).
+In-flight: none. Commit `fcfb60f9` pushed to `regress-renumbering`. No
+server left running.
