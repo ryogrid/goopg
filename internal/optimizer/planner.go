@@ -12476,6 +12476,13 @@ func exprType(e Expr) catalog.Type {
 				return catalog.Type{Name: "bytea"}
 			}
 			return catalog.Type{Name: "text"}
+		case "overlay":
+			// text_overlay/bytea_overlay (varlena.c): same argument-typed
+			// dispatch as substr/substring above. M0134-0070.
+			if len(x.Args) > 0 && strings.EqualFold(exprType(x.Args[0]).Name, "bytea") {
+				return catalog.Type{Name: "bytea"}
+			}
+			return catalog.Type{Name: "text"}
 		case "decode":
 			// decode(text, format) -> bytea (encode.c). Untyped before
 			// M0125-0021, so `SELECT decode('aabb','hex')` reached the wire as

@@ -4167,6 +4167,52 @@ func (p *parser) parseSubstringFuncCall(pos int, name string) (Expr, error) {
 	return &FuncCall{pos: pos, Name: ObjectName{pos: pos, Name: name}, Args: args}, nil
 }
 
+
+// parseOverlayFuncCall parses the SQL-standard
+// OVERLAY(str PLACING replacement FROM start [FOR count]) syntax and
+// desugars it to a plain overlay(str, replacement, start[, count]) FuncCall.
+// PLACING is not a `KwXxx` token in goopg's lexer (unlike FROM/FOR), so it is
+// matched via acceptIdentKeyword rather than expectKeyword. M0134-0070.
+// PG oracle: postgres/src/backend/parser/gram.y:15910-15927 (OVERLAY
+// productions), :16797-16808 (overlay_list — arg order target, replacement,
+// start[, length]).
+func (p *parser) parseOverlayFuncCall(pos int) (Expr, error) {
+	if !p.acceptSymbol("(") {
+		return nil, p.errAtCur("expected '(' after OVERLAY")
+	}
+	str, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if !p.acceptIdentKeyword("placing") {
+		return nil, p.errAtCur("expected PLACING")
+	}
+	repl, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expectKeyword(KwFrom); err != nil {
+		return nil, err
+	}
+	start, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	args := []Expr{str, repl, start}
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwFor {
+		p.advance() // consume FOR
+		count, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, count)
+	}
+	if !p.acceptSymbol(")") {
+		return nil, p.errAtCur("expected ')' to close OVERLAY")
+	}
+	return &FuncCall{pos: pos, Name: ObjectName{pos: pos, Name: "overlay"}, Args: args}, nil
+}
+
 // parsePositionFuncCall handles the SQL-standard POSITION(substring IN
 // string) form, alongside the goopg-legacy comma form
 // POSITION(substring, string) — both desugar to the existing two-arg
@@ -4318,6 +4364,12 @@ func (p *parser) parseColumnOrCall() (Expr, error) {
 		// existing two-arg position(sub, str) FuncCall. M0134-0070.
 		if len(parts) == 1 && strings.EqualFold(parts[0], "position") {
 			return p.parsePositionFuncCall(startPos)
+		}
+		// OVERLAY(str PLACING replacement FROM start [FOR count]) — SQL
+		// standard, desugars to overlay(str, replacement, start[, count]).
+		// M0134-0070.
+		if len(parts) == 1 && strings.EqualFold(parts[0], "overlay") {
+			return p.parseOverlayFuncCall(startPos)
 		}
 		var name ObjectName
 		switch len(parts) {

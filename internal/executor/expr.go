@@ -9146,6 +9146,8 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return evalToDate(x, row, ctx)
 	case "substr", "substring":
 		return evalSubstr(x, row, ctx)
+	case "overlay":
+		return evalOverlay(x, row, ctx)
 	case "date_part":
 		return evalDatePart(x, row, ctx)
 	case "date_trunc":
@@ -14233,6 +14235,97 @@ func evalSubstr(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		endIdx = len(s)
 	}
 	return mkResult(s[startIdx:endIdx]), nil
+}
+
+
+// evalOverlay implements the SQL-standard
+// OVERLAY(str PLACING replacement FROM start [FOR count]) function,
+// desugared by the parser to overlay(str, replacement, start[, count]).
+// Mirrors evalSubstr's byte-indexed simplification (no multibyte
+// correctness) and text/bytea Kind-branch structure. M0134-0070.
+// PG oracle: postgres/src/backend/utils/adt/varlena.c text_overlay
+// (~line 1167) and bytea_overlay (~line 3221) — same algorithm/errors.
+func evalOverlay(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
+	if len(x.Args) != 3 && len(x.Args) != 4 {
+		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "overlay requires 3 or 4 arguments"}
+	}
+	src, err := evalExpr(x.Args[0], row, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	repl, err := evalExpr(x.Args[1], row, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	startArg, err := evalExpr(x.Args[2], row, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	if src.IsNull() || repl.IsNull() || startArg.IsNull() {
+		return NullDatum, nil
+	}
+	if src.Kind != KindString && src.Kind != KindBytes {
+		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "overlay first argument must be text"}
+	}
+	if repl.Kind != src.Kind {
+		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "overlay second argument must match first argument type"}
+	}
+	if startArg.Kind != KindInt {
+		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "overlay third argument must be integer"}
+	}
+
+	// bytea_overlay (varlena.c) slices BYTES and returns bytea — same split
+	// as evalSubstr's text/bytea Kind branch above. M0134-0070.
+	mkResult := NewStringDatum
+	if src.Kind == KindBytes {
+		mkResult = func(v string) Datum { return NewBytesDatum([]byte(v)) }
+	}
+
+	s := src.StringValue()
+	r := repl.StringValue()
+	sp := startArg.Int
+	if sp <= 0 {
+		// text_overlay/bytea_overlay: sp<=0 raises this exact wording under
+		// ERRCODE_SUBSTRING_ERROR (22011) — same constant/message evalSubstr
+		// already uses for its negative-length check above. No Pos: pure
+		// runtime evaluation (text_overlay has no errposition call).
+		return Datum{}, &ExecError{Code: "22011", Message: "negative substring length not allowed"}
+	}
+
+	sl := int64(len(r))
+	if len(x.Args) == 4 {
+		cntArg, err := evalExpr(x.Args[3], row, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if cntArg.IsNull() {
+			return NullDatum, nil
+		}
+		if cntArg.Kind != KindInt {
+			return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "overlay fourth argument must be integer"}
+		}
+		sl = cntArg.Int
+	}
+
+	// result = substring(s, 1, sp-1) + r + substring(s, sp+sl, <rest>).
+	// Mirrors text_overlay's two text_substring calls (varlena.c).
+	part1End := int(sp) - 1
+	if part1End > len(s) {
+		part1End = len(s)
+	}
+	part1 := s[:part1End]
+
+	tailStart := sp + sl
+	if tailStart < 1 {
+		tailStart = 1
+	}
+	tailIdx := int(tailStart) - 1
+	var part2 string
+	if tailIdx < len(s) {
+		part2 = s[tailIdx:]
+	}
+
+	return mkResult(part1 + r + part2), nil
 }
 
 // evalSubstrRegex implements the SQL-standard regex form of SUBSTRING —
