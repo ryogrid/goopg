@@ -456,6 +456,48 @@ func TestParseSyntaxError(t *testing.T) {
 }
 
 
+// TestParseSyntaxErrorAtOrNearWording verifies M0134-0070: the trailing-token
+// -after-statement error now goes through errSyntaxAtCur() and echoes PG's
+// raw-source "near" text (postgres/src/backend/parser/scan.c
+// scanner_yyerror), not goopg's old "expected ';' or end of input (got …)"
+// phrasing. Covers the strings.sql illegal-comment-in-continuation fixture
+// (TokenStringLit, quoted with embedded '' doubling), a plain trailing
+// identifier (TokenIdent, no regression), and a trailing double-quoted
+// identifier (TokenQuotedIdent, quoted with embedded "" doubling).
+func TestParseSyntaxErrorAtOrNearWording(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "string-lit continuation (strings.sql)",
+			in:   "SELECT 'first line'\n' - next line' /* this comment is not allowed here */\n' - third line'\n\tAS \"Illegal comment within continuation\";",
+			want: `' - third line'`,
+		},
+		{
+			name: "trailing identifier",
+			in:   "SELECT 1 foo bar",
+			want: `bar`,
+		},
+		{
+			name: "trailing quoted identifier",
+			in:   `SELECT 1 "foo" "bar"`,
+			want: `"bar"`,
+		},
+	}
+	for _, c := range cases {
+		_, err := Parse(c.in)
+		se, ok := err.(*SyntaxError)
+		if !ok {
+			t.Fatalf("%s: err type=%T (%v), want *SyntaxError", c.name, err, err)
+		}
+		if se.Message != c.want {
+			t.Errorf("%s: Message=%q, want %q", c.name, se.Message, c.want)
+		}
+	}
+}
+
 // TestParseDeclareCursorWithHold verifies M0134-0056: `WITH` is a reserved
 // keyword (lexed as TokenKeyword/KwWith, not TokenIdent), so the WITH/WITHOUT
 // HOLD clause on DECLARE CURSOR must be matched via acceptKeyword, not

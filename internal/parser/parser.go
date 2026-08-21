@@ -181,7 +181,7 @@ func Parse(input string, mc ...*mmgr.Context) ([]Stmt, error) {
 			continue
 		}
 		if p.cur().Kind != TokenEOF {
-			err := p.errAtCur("expected ';' or end of input")
+			err := p.errSyntaxAtCur()
 			if sp != nil {
 				tokenSlicePool.Put(sp)
 			}
@@ -1002,6 +1002,14 @@ func (p *parser) errSyntaxAtCur() error {
 		case "oids":
 			near = strings.ToUpper(t.Value)
 		}
+	} else if t.Kind == TokenStringLit {
+		// PG's scanner_yyerror echoes the raw source text of the offending
+		// token (postgres/src/backend/parser/scan.c scanner_yyerror), so a
+		// string literal's "near" text is its quoted source form — not the
+		// decoded value — with embedded quotes doubled.
+		near = "'" + strings.ReplaceAll(t.Value, "'", "''") + "'"
+	} else if t.Kind == TokenQuotedIdent {
+		near = "\"" + strings.ReplaceAll(t.Value, "\"", "\"\"") + "\""
 	}
 	return &SyntaxError{Pos: t.Pos, Message: near}
 }
