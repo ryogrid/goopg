@@ -7746,6 +7746,34 @@ func (p *parser) parseAlter() (Stmt, error) {
 		}
 		return stmt, nil
 	}
+	// ALTER RULE name ON table RENAME TO newname — the only ALTER RULE form
+	// in PG's grammar (gram.y AlterRuleStmt). Mirrors
+	// postgres/src/backend/rewrite/rewriteDefine.c:793 RenameRewriteRule.
+	// M0134-0065.
+	if p.acceptIdentKeyword("rule") {
+		nameTok, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expectKeyword(KwOn); err != nil {
+			return nil, err
+		}
+		tbl, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		if !p.acceptIdentKeyword("rename") {
+			return nil, p.errAtCur("expected RENAME")
+		}
+		if _, err := p.expectKeyword(KwTo); err != nil {
+			return nil, err
+		}
+		newNameTok, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		return &AlterRuleRenameStmt{pos: t.Pos, Name: identText(nameTok), Table: tbl, NewName: identText(newNameTok)}, nil
+	}
 	// ALTER INDEX name ALTER COLUMN col SET (options) — emit the action so
 	// the executor can raise the appropriate error. M0097-0023.
 	if p.acceptKeyword(KwIndex) {

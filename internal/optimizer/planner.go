@@ -195,7 +195,7 @@ func planStmt(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		*parser.CreateProcedureStmt, *parser.DropProcedureStmt,
 		*parser.CreateTriggerStmt, *parser.DropTriggerStmt,
 		*parser.CreatePolicyStmt, *parser.DropPolicyStmt,
-		*parser.CreateRuleStmt, *parser.DropRuleStmt,
+		*parser.CreateRuleStmt, *parser.DropRuleStmt, *parser.AlterRuleRenameStmt,
 		*parser.DropCompatStmt,
 		*parser.CreateSequenceStmt, *parser.AlterSequenceStmt,
 		*parser.CreateMatViewStmt, *parser.RefreshMatViewStmt,

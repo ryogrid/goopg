@@ -159,6 +159,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execCreateRule(s)
 	case *parser.DropRuleStmt:
 		return nil, o.execDropRule(s)
+	case *parser.AlterRuleRenameStmt:
+		return nil, o.execAlterRuleRename(s)
 	case *parser.DropTriggerStmt:
 		return nil, o.execDropTrigger(s)
 	case *parser.DropCompatStmt:
@@ -18408,6 +18410,50 @@ func (o *ddlOp) execDropRule(s *parser.DropRuleStmt) error {
 	}
 	return &ExecError{Code: "42704", Pos: s.Pos(),
 		Message: fmt.Sprintf("rule %q for relation %q does not exist", s.Name, s.Table.Name)}
+}
+
+// execAlterRuleRename handles `ALTER RULE name ON table RENAME TO newname`.
+// Only the DO-NOTHING rule form goopg reifies into catalog.RuleInfo
+// (tbl.Rules — see execCreateRule) is renameable; any rule that fell to the
+// CompatNoopStmt path (a real DO INSTEAD/DO ALSO action) is not in tbl.Rules
+// and correctly reports "does not exist" here, matching this slice's scope
+// boundary. Mirrors postgres/src/backend/rewrite/rewriteDefine.c:793
+// RenameRewriteRule (including the reserved-name check for "_RETURN", the
+// view SELECT rule, and the duplicate-name collision check). M0134-0065.
+func (o *ddlOp) execAlterRuleRename(s *parser.AlterRuleRenameStmt) error {
+	tbl, ok := o.ctx.Catalog.LookupTable(s.Table, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+	if !ok {
+		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Table.Name)}
+	}
+	idx := -1
+	for i := range tbl.Rules {
+		if tbl.Rules[i].Name == s.Name {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		return &ExecError{Code: "42704", Pos: s.Pos(),
+			Message: fmt.Sprintf("rule %q for relation %q does not exist", s.Name, tbl.Name)}
+	}
+	// RenameRewriteRule disallows renaming a view's ON SELECT rule (which PG
+	// always names "_RETURN"), since that would break the invariant that a
+	// view's rewrite rule is discoverable by that fixed name. goopg does not
+	// model view rules in tbl.Rules (only the DO-NOTHING form reaches here),
+	// so this is effectively unreachable today but guarded for fidelity
+	// should that change.
+	if strings.EqualFold(s.Name, "_RETURN") {
+		return &ExecError{Code: "42939", Pos: s.Pos(),
+			Message: "renaming an ON SELECT rule is not allowed"}
+	}
+	for i := range tbl.Rules {
+		if i != idx && tbl.Rules[i].Name == s.NewName {
+			return &ExecError{Code: "42710", Pos: s.Pos(),
+				Message: fmt.Sprintf("rule %q for relation %q already exists", s.NewName, tbl.Name)}
+		}
+	}
+	tbl.Rules[idx].Name = s.NewName
+	return nil
 }
 
 // seqTypeBounds returns the min/max int64 bounds for a sequence data type.
