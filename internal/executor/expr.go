@@ -7464,6 +7464,61 @@ func regexpApplyExpandedWhitespace(pattern, flags string) string {
 	return b.String()
 }
 
+// pgRegexpReplacementTemplate converts a PostgreSQL regexp_replace()
+// replacement string into a Go regexp expansion template usable with
+// (*regexp.Regexp).Expand{String}/ReplaceAllString. Mirrors
+// postgres/src/backend/utils/adt/varlena.c:4357-4447
+// (appendStringInfoRegexpSubstr), which walks the replacement string
+// splitting on literal '\': "\1".."\9" -> single-digit backreference index
+// (never multi-digit -- "*p - '0'" reads exactly one byte), "\&" -> whole
+// match (pmatch[0]), "\\" -> emits one literal '\' and continues (does NOT
+// treat the following char as an escape), any other "\c" -> emits a literal
+// '\' then falls through to normal-text copying of 'c' (net effect: '\'
+// followed by 'c', both literal, unchanged from input), and a trailing lone
+// '\' at end of string is emitted as literal '\'. M0134-0070 Round G.
+func pgRegexpReplacementTemplate(replacement string) string {
+	// First pass: escape any literal '$' in the original replacement text so
+	// Go's expander doesn't misinterpret it as a template reference.
+	replacement = strings.ReplaceAll(replacement, "$", "$$")
+
+	// Second pass: scan byte-by-byte for PG's '\'-escape grammar.
+	var b strings.Builder
+	b.Grow(len(replacement))
+	for i := 0; i < len(replacement); i++ {
+		c := replacement[i]
+		if c != '\\' {
+			b.WriteByte(c)
+			continue
+		}
+		if i+1 >= len(replacement) {
+			// Trailing lone '\' at end of string: emitted as literal '\'.
+			b.WriteByte('\\')
+			break
+		}
+		next := replacement[i+1]
+		switch {
+		case next >= '1' && next <= '9':
+			b.WriteString("${")
+			b.WriteByte(next)
+			b.WriteByte('}')
+			i++
+		case next == '&':
+			b.WriteString("${0}")
+			i++
+		case next == '\\':
+			// "\\" emits one literal '\' and does NOT consume the next char
+			// as an escape target -- advance past both backslashes only.
+			b.WriteByte('\\')
+			i++
+		default:
+			// Any other "\c": emit literal '\' then let the loop copy 'c'
+			// through unchanged on the next iteration.
+			b.WriteByte('\\')
+		}
+	}
+	return b.String()
+}
+
 // regexpCompilePattern compiles a PG regexp_* pattern for the four
 // M0134-0070 Round E functions, combining the shared pgRegexFlagsToGoModifiers
 // output (goFlags — 'i'/(?i), 'm'/'n'/'p'/'w'/(?m)) with the LOCAL
@@ -12204,9 +12259,10 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 				return NewStringDatum(s.StringValue()), nil // invalid pattern: return input
 			}
 			replacement := repl.StringValue()
-			// Convert PostgreSQL \1, \2 backreferences to Go $1, $2.
-			replacement = strings.ReplaceAll(replacement, `\1`, `${1}`)
-			replacement = strings.ReplaceAll(replacement, `\2`, `${2}`)
+			// Convert PostgreSQL's replacement-string escape grammar
+			// (\1-\9, \&, \\, other-\c passthrough) to a Go regexp expansion
+			// template. M0134-0070 Round G.
+			replacement = pgRegexpReplacementTemplate(replacement)
 
 			if !haveStartN {
 				var result string

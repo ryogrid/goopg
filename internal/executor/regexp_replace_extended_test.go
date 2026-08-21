@@ -203,3 +203,85 @@ func TestRegexpReplaceExtendedForm(t *testing.T) {
 		}
 	})
 }
+
+// TestRegexpReplaceBackreferenceGrammar pins the M0134-0070 Round G
+// generalized replacement-string escape grammar --
+// postgres/src/backend/utils/adt/varlena.c:4357-4447
+// (appendStringInfoRegexpSubstr): "\1".."\9" single-digit backreferences,
+// "\&" whole-match, "\\" literal backslash, unrecognized "\c" passthrough,
+// and a trailing lone "\". strings.sql:224 is the multi-digit-group
+// (\1-\3) fixture that motivated this round (see Round F working-set entry).
+func TestRegexpReplaceBackreferenceGrammar(t *testing.T) {
+	strC := func(v string) *optimizer.StringConst { return &optimizer.StringConst{Value: v} }
+
+	cases := []struct {
+		name string
+		args []optimizer.Expr
+		want string
+	}{
+		// \1-\9 single-digit backrefs (only 2 groups used here; \3-\9
+		// covered by the out-of-range case below).
+		{"backreferences \\1 \\2 reordered", []optimizer.Expr{
+			strC("foobarbaz"), strC("(bar)(baz)"), strC(`\2\1`),
+		}, "foobazbar"},
+
+		// strings.sql:224 fixture (expected/strings.out:694-697): 3
+		// capture groups referenced in the replacement, the exact case
+		// that motivated Round G (the prior \1/\2-only hardcoding had no
+		// \3 handling at all).
+		{"strings.sql:224 three-group replacement", []optimizer.Expr{
+			strC("1112223333"), strC(`(\d{3})(\d{3})(\d{4})`), strC(`(\1) \2-\3`),
+		}, "(111) 222-3333"},
+
+		// \& -> whole match, doubled ('g' flag so all 3 chars are hit —
+		// regexp_replace only replaces the first match without 'g').
+		{"whole-match backreference doubled", []optimizer.Expr{
+			strC("abc"), strC("."), strC(`\&\&`), strC("g"),
+		}, "aabbcc"},
+
+		// \\ -> literal backslash, does NOT consume the following char as
+		// an escape target (varlena.c: "\\\\" case continues the loop
+		// without falling through to normal-text copying of the next char
+		// as anything special -- but the next char itself still gets
+		// copied through normally on its own iteration).
+		{"literal backslash before ordinary char", []optimizer.Expr{
+			strC("abc"), strC("b"), strC(`x\\y`),
+		}, "ax\\yc"},
+
+		// \9 when only 2 groups exist in the pattern: PG's pmatch[9] guard
+		// (so >= 0 && eo >= 0) yields "no substitution" (silent, not an
+		// error). Go's regexp.Expand/ReplaceAllString independently returns
+		// an empty string for an out-of-range submatch index, which
+		// matches PG's net effect (verified via /tmp probe: both produce
+		// empty output for the missing group -- no divergence to report).
+		{"out-of-range group index \\9 is silent no-op", []optimizer.Expr{
+			strC("ab"), strC("(a)(b)"), strC(`\9-tail`),
+		}, "-tail"},
+
+		// Unrecognized escape \a passes through literally (backslash + 'a'
+		// unchanged).
+		{"unrecognized escape passes through literally", []optimizer.Expr{
+			strC("abc"), strC("b"), strC(`\a`),
+		}, `a\ac`},
+
+		// Trailing lone backslash at end of replacement string.
+		{"trailing lone backslash", []optimizer.Expr{
+			strC("abc"), strC("b"), strC(`x\`),
+		}, `ax\c`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fc := &optimizer.FuncCall{Name: "regexp_replace", Args: c.args}
+			got, err := evalFuncCall(fc, nil, &Context{})
+			if err != nil {
+				t.Fatalf("evalFuncCall: %v", err)
+			}
+			if got.IsNull() {
+				t.Fatalf("got NULL, want %q", c.want)
+			}
+			if got.StringValue() != c.want {
+				t.Fatalf("got %q, want %q", got.StringValue(), c.want)
+			}
+		})
+	}
+}

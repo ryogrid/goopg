@@ -365,3 +365,72 @@ identical before/after this round (not a regression).
   unsupported (Round-C scope: `\1`/`\2` only) — `strings.sql:224`'s
   `(\1) \2-\3` fixture leaves the literal `\3` un-substituted (PG:
   `3333`; goopg: `\3`), same before and after this round.
+
+## Round G (landed 2026-08-22): `regexp_replace` replacement-string backreference generalization
+
+Generalized the Round-C-era hardcoded `\1`/`\2`-only replacement conversion
+(two `strings.ReplaceAll` calls) to the full PG replacement-string escape
+grammar per `postgres/src/backend/utils/adt/varlena.c:4357-4447`
+(`appendStringInfoRegexpSubstr`): `\1`-`\9` (single-digit only — PG's `*p -
+'0'` reads exactly one byte, never multi-digit), `\&` (whole match,
+`pmatch[0]`), `\\` (literal backslash — does NOT treat the following char as
+an escape target), any other `\c` (emits literal `\` then falls through to
+normal-text copying of `c`, net effect unchanged from input), and a trailing
+lone `\` at end of string (emitted as literal `\`). This explicitly excludes
+**pattern-side** backreferences (`(.)\1`) — that remains the separate
+RE2-vs-ARE engine-capability gap documented above, untouched by this round.
+
+New unexported helper `pgRegexpReplacementTemplate(replacement string)
+string` (`internal/executor/expr.go`, placed just before
+`regexpCompilePattern`): first escapes any literal `$` in the original
+replacement text (`strings.ReplaceAll(replacement, "$", "$$")`) so Go's
+template expander doesn't misinterpret a literal `$` that was present in the
+PG replacement string, then does a single byte-by-byte scan translating PG's
+`\`-escape grammar to Go's `regexp` expansion template (`${1}`-`${9}`,
+`${0}` for `\&`, literal `\` passthrough for `\\` and other-`\c`/trailing-`\`
+cases). The single `regexp_replace` case arm (`internal/executor/expr.go`,
+~line 12097) now calls this helper once; both consumers of the resulting
+`replacement` variable — the non-start/N path's
+`re.ReplaceAllString`/`re.ReplaceAllStringFunc` and the start/N path's
+`re.ExpandString` — get the same converted template (verified: only one call
+site existed, no sibling to update).
+
+**Out-of-range group reference (`\9` with fewer capture groups): no
+divergence found.** PG's `pmatch[idx]` guard (`so >= 0 && eo >= 0`) silently
+substitutes nothing for an out-of-range/unmatched group. Verified via a
+throwaway Go probe that `(*regexp.Regexp).ReplaceAllString`/`Expand` with a
+`${9}` template referencing a nonexistent group 9 also silently expands to
+an empty string (not a panic, not an error) — so Go's behavior already
+matches PG's net effect for this case; no special-case code was needed and
+no deferral is required here.
+
+New test `TestRegexpReplaceBackreferenceGrammar`
+(`internal/executor/regexp_replace_extended_test.go`): `\1`/`\2` reordering,
+the exact `strings.sql:224` three-group fixture (`(\1) \2-\3` on a 3-group
+pattern), `\&` doubled under `'g'`, `\\` before an ordinary char (does not
+consume it as an escape target), `\9` against a 2-group pattern (silent
+no-op, confirmed matches PG), an unrecognized `\a` escape (passthrough), and
+a trailing lone `\`.
+
+Live psql spot-check against a cgroup-capped throwaway goopg server vs a
+manually-started PG 18.3 oracle (per the Round F workaround for
+`pg-oracle-diff.sh --auto-start`'s `initdb -q` breakage — ledger row
+"infra, discovered during Round F"): all of `regexp_replace('foobarbaz',
+'(bar)(baz)', '\2\1')` → `foobazbar`, `regexp_replace('abc', '.', '\&\&',
+'g')` → `aabbcc`, `regexp_replace('abc', 'b', 'x\\y')` → `ax\yc`, and the
+`strings.sql:224` fixture `regexp_replace('1112223333',
+'(\d{3})(\d{3})(\d{4})', '(\1) \2-\3')` → `(111) 222-3333` are byte-identical
+to the PG oracle.
+
+`scripts/pg-regress-runner.sh --verbose strings` confirms `strings.sql:224`
+(the Round-G target named in the Round F ledger row) is now a clean,
+non-diffing line; the remaining `regexp_replace`-family diff lines in
+`strings.sql` (lines 225-228) are exclusively the pre-existing, out-of-scope
+**pattern-side** backreference gap (`(.)\1` — `E'(.)\\1'` patterns), confirmed
+unaffected by this round (same "invalid pattern: return input unchanged"
+fallback before and after).
+
+**Deferral candidates:** none newly discovered this round — the one
+pre-existing gap this round targeted (`\3`+ in the replacement string) is
+now closed; the pattern-side-backreference gap remains exactly as documented
+above.
