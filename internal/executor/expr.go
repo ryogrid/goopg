@@ -10,8 +10,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"math"
 	"math/big"
+	"math/bits"
 	mathrand "math/rand"
 	"regexp"
 	"strconv"
@@ -12762,6 +12764,106 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		default:
 			return NullDatum, &ExecError{Code: "22023", Pos: x.Pos(),
 				Message: fmt.Sprintf("unrecognized encoding: %q", fmtArg.Format())}
+		}
+	case "crc32":
+		// crc32(bytea) -> int8. Standard CRC-32 (IEEE/zlib polynomial).
+		// PG oracle: pg_crc.c:106-116 (crc32_bytea) —
+		// INIT_TRADITIONAL_CRC32/COMP_TRADITIONAL_CRC32/FIN_TRADITIONAL_CRC32,
+		// which is exactly the zlib CRC-32 that crc32.ChecksumIEEE computes.
+		// M0134-0070.
+		if len(x.Args) == 1 {
+			src, serr := evalExpr(x.Args[0], row, ctx)
+			if serr != nil {
+				return NullDatum, serr
+			}
+			if src.IsNull() {
+				return NullDatum, nil
+			}
+			raw := src.BytesValue()
+			if src.Kind != KindBytes {
+				b, berr := byteaIn(src.StringValue(), x.Pos())
+				if berr != nil {
+					return NullDatum, berr
+				}
+				raw = b
+			}
+			return Datum{Kind: KindInt, Int: int64(crc32.ChecksumIEEE(raw))}, nil
+		}
+	case "crc32c":
+		// crc32c(bytea) -> int8. CRC-32C (Castagnoli polynomial).
+		// PG oracle: pg_crc.c:119-128 (crc32c_bytea). M0134-0070.
+		if len(x.Args) == 1 {
+			src, serr := evalExpr(x.Args[0], row, ctx)
+			if serr != nil {
+				return NullDatum, serr
+			}
+			if src.IsNull() {
+				return NullDatum, nil
+			}
+			raw := src.BytesValue()
+			if src.Kind != KindBytes {
+				b, berr := byteaIn(src.StringValue(), x.Pos())
+				if berr != nil {
+					return NullDatum, berr
+				}
+				raw = b
+			}
+			checksum := crc32.Checksum(raw, crc32.MakeTable(crc32.Castagnoli))
+			// A CRC-32C result is unsigned 32-bit; widen to int64 without sign
+			// extension so values above 2^31 stay positive (PG_RETURN_INT64
+			// widens the unsigned pg_crc32c the same way).
+			return Datum{Kind: KindInt, Int: int64(checksum)}, nil
+		}
+	case "bit_count":
+		// bit_count(bytea) -> int8. Population count over the raw bytes.
+		// PG oracle: varlena.c bytea_bit_count — pg_popcount(VARDATA_ANY(t1),
+		// VARSIZE_ANY_EXHDR(t1)). Only the bytea overload (OID 6162) is
+		// implemented; the bit(n) overload (OID 6163) is out of scope.
+		// M0134-0070.
+		if len(x.Args) == 1 {
+			src, serr := evalExpr(x.Args[0], row, ctx)
+			if serr != nil {
+				return NullDatum, serr
+			}
+			if src.IsNull() {
+				return NullDatum, nil
+			}
+			raw := src.BytesValue()
+			if src.Kind != KindBytes {
+				b, berr := byteaIn(src.StringValue(), x.Pos())
+				if berr != nil {
+					return NullDatum, berr
+				}
+				raw = b
+			}
+			var count int64
+			i := 0
+			for ; i+8 <= len(raw); i += 8 {
+				count += int64(bits.OnesCount64(uint64(raw[i]) | uint64(raw[i+1])<<8 |
+					uint64(raw[i+2])<<16 | uint64(raw[i+3])<<24 | uint64(raw[i+4])<<32 |
+					uint64(raw[i+5])<<40 | uint64(raw[i+6])<<48 | uint64(raw[i+7])<<56))
+			}
+			for ; i < len(raw); i++ {
+				count += int64(bits.OnesCount8(raw[i]))
+			}
+			return Datum{Kind: KindInt, Int: count}, nil
+		}
+	case "unistr":
+		// unistr(text) -> text. PG oracle: varlena.c:6762-6925 (unistr).
+		// M0134-0070; see internal/executor/unistr.go for the escape scanner.
+		if len(x.Args) == 1 {
+			s, serr := evalExpr(x.Args[0], row, ctx)
+			if serr != nil {
+				return NullDatum, serr
+			}
+			if s.IsNull() {
+				return NullDatum, nil
+			}
+			out, uerr := unistrDecode(s.StringValue(), x.Pos())
+			if uerr != nil {
+				return NullDatum, uerr
+			}
+			return NewStringDatum(out), nil
 		}
 
 	// ── Misc functions (M0097-0005) ────────────────────────────────────────
