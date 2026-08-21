@@ -18762,6 +18762,17 @@ func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
 	// surfaces the sequence in pg_class (relkind='S') / pg_depend / pg_sequence
 	// so pg_dump can discover and dump it. M0097-0024.
 	o.createSeqCatalogTable(s.Name, name)
+	// CREATE UNLOGGED SEQUENCE: stamp relpersistence on the just-created
+	// catalog row. Post-hoc LookupTable+set (rather than threading unlogged
+	// through createSeqCatalogTable/CreateSequenceCatalogRelation) keeps the
+	// WAL-replay and CREATE-DATABASE-template callers of
+	// CreateSequenceCatalogRelation untouched. M0134-0069.
+	if s.Unlogged {
+		if seqTbl, ok := o.ctx.Catalog.LookupTable(s.Name, seqDBOid); ok && seqTbl != nil {
+			seqTbl.Unlogged = true
+			syncTableToCatalogHeap(o.ctx, seqTbl)
+		}
+	}
 	// Restart persistence: WAL-log the full sequence definition (no-op for
 	// TEMPORARY sequences — session-scoped). See RecordKindSequenceState.
 	WALLogSequenceState(o.ctx, name)
@@ -18981,6 +18992,13 @@ func (o *ddlOp) execAlterSequence(s *parser.AlterSequenceStmt) error {
 				ee.Pos = s.Pos()
 			}
 			return err
+		}
+		// ALTER SEQUENCE ... SET LOGGED/UNLOGGED: re-derive relpersistence
+		// (pg_class.relpersistence 'p'/'u') the same way ATExecSetRelPersistence
+		// does for tables. M0134-0069.
+		if s.SetLogged != "" {
+			tbl.Unlogged = s.SetLogged == "unlogged"
+			syncTableToCatalogHeap(o.ctx, tbl)
 		}
 	}
 

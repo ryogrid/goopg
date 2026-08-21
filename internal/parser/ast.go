@@ -1755,6 +1755,7 @@ type CreateSequenceStmt struct {
 	Cache       *int64
 	Cycle       bool
 	OwnedBy     string // "table.column" or empty
+	Unlogged    bool   // CREATE UNLOGGED SEQUENCE — M0134-0069
 }
 
 func (s *CreateSequenceStmt) Pos() int  { return s.pos }
@@ -1898,6 +1899,7 @@ type AlterSequenceStmt struct {
 	NoCycle      bool   // NO CYCLE
 	OwnedBy      string // "table.column" or "" from OWNED BY clause
 	ClearOwnedBy bool   // OWNED BY NONE
+	SetLogged    string // "" unchanged / "logged" / "unlogged" — M0134-0069, mirrors AlterTableStmt.SetLogged
 }
 
 func (s *AlterSequenceStmt) Pos() int  { return s.pos }
