@@ -12581,6 +12581,15 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: "bytea"}
 		case "encode":
 			return catalog.Type{Name: "text"}
+		case "set_byte", "set_bit":
+			// byteaSetByte/byteaSetBit (varlena.c) -> bytea. Untyped falls
+			// through to appendTypedCellText's default AppendValueText,
+			// which prints KindBytes raw instead of `\x…`/escape form (same
+			// M0125-0021 class of bug as decode above). M0134-0070.
+			return catalog.Type{Name: "bytea"}
+		case "get_byte", "get_bit":
+			// byteaGetByte/byteaGetBit (varlena.c) -> int4. M0134-0070.
+			return catalog.Type{Name: "int4"}
 		case "date_part":
 			return catalog.Type{Name: "int8"}
 		case "gcd", "lcm", "abs", "mod", "div":

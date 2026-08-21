@@ -13739,6 +13739,162 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			return NewStringDatum(strconv.FormatUint(uint64(uint32(v.Int)), 8)), nil
 		}
+	case "get_byte":
+		// get_byte(bytea, int4) -> int4 (postgres/src/backend/utils/adt/
+		// varlena.c:3310-3329 byteaGetByte). M0134-0070.
+		if len(x.Args) == 2 {
+			bv, berr := evalExpr(x.Args[0], row, ctx)
+			if berr != nil {
+				return NullDatum, berr
+			}
+			if bv.IsNull() {
+				return NullDatum, nil
+			}
+			nv, nerr := evalExpr(x.Args[1], row, ctx)
+			if nerr != nil {
+				return NullDatum, nerr
+			}
+			if nv.IsNull() {
+				return NullDatum, nil
+			}
+			b := bv.BytesValue()
+			n := nv.Int
+			if n < 0 || n >= int64(len(b)) {
+				// No Pos: byteaGetByte (varlena.c:3310-3329) has no
+				// errposition call. M0134-0070.
+				return Datum{}, &ExecError{Code: "2202E",
+					Message: fmt.Sprintf("index %d out of valid range, 0..%d", n, len(b)-1)}
+			}
+			return Datum{Kind: KindInt, Int: int64(b[n])}, nil
+		}
+	case "set_byte":
+		// set_byte(bytea, int4, int4) -> bytea (postgres/src/backend/utils/
+		// adt/varlena.c:3369-3399 byteaSetByte). M0134-0070.
+		if len(x.Args) == 3 {
+			bv, berr := evalExpr(x.Args[0], row, ctx)
+			if berr != nil {
+				return NullDatum, berr
+			}
+			if bv.IsNull() {
+				return NullDatum, nil
+			}
+			nv, nerr := evalExpr(x.Args[1], row, ctx)
+			if nerr != nil {
+				return NullDatum, nerr
+			}
+			if nv.IsNull() {
+				return NullDatum, nil
+			}
+			newv, verr := evalExpr(x.Args[2], row, ctx)
+			if verr != nil {
+				return NullDatum, verr
+			}
+			if newv.IsNull() {
+				return NullDatum, nil
+			}
+			src := bv.BytesValue()
+			n := nv.Int
+			if n < 0 || n >= int64(len(src)) {
+				// No Pos: byteaSetByte (varlena.c:3369-3399) has no
+				// errposition call. M0134-0070.
+				return Datum{}, &ExecError{Code: "2202E",
+					Message: fmt.Sprintf("index %d out of valid range, 0..%d", n, len(src)-1)}
+			}
+			out := make([]byte, len(src))
+			copy(out, src)
+			out[n] = byte(newv.Int)
+			return NewBytesDatum(out), nil
+		}
+	case "get_bit":
+		// get_bit(bytea, int8) -> int4 (postgres/src/backend/utils/adt/
+		// varlena.c:3330-3364 byteaGetBit). Bit numbering is LSB-first within
+		// each byte: bitNo = n%8, tested via `byte & (1 << bitNo)`
+		// (varlena.c:3361), so bitNo 0 is the byte's least-significant bit.
+		// M0134-0070.
+		if len(x.Args) == 2 {
+			bv, berr := evalExpr(x.Args[0], row, ctx)
+			if berr != nil {
+				return NullDatum, berr
+			}
+			if bv.IsNull() {
+				return NullDatum, nil
+			}
+			nv, nerr := evalExpr(x.Args[1], row, ctx)
+			if nerr != nil {
+				return NullDatum, nerr
+			}
+			if nv.IsNull() {
+				return NullDatum, nil
+			}
+			b := bv.BytesValue()
+			n := nv.Int
+			bitLen := int64(len(b)) * 8
+			if n < 0 || n >= bitLen {
+				// No Pos: byteaGetBit (varlena.c:3330-3364) has no
+				// errposition call. M0134-0070.
+				return Datum{}, &ExecError{Code: "2202E",
+					Message: fmt.Sprintf("index %d out of valid range, 0..%d", n, bitLen-1)}
+			}
+			byteNo := n / 8
+			bitNo := uint(n % 8)
+			if b[byteNo]&(1<<bitNo) != 0 {
+				return Datum{Kind: KindInt, Int: 1}, nil
+			}
+			return Datum{Kind: KindInt, Int: 0}, nil
+		}
+	case "set_bit":
+		// set_bit(bytea, int8, int4) -> bytea (postgres/src/backend/utils/
+		// adt/varlena.c:3400-3448 byteaSetBit). Same LSB-first bit numbering
+		// as get_bit; also validates the new-bit-value arg is 0 or 1
+		// (varlena.c:3437-3439, ERRCODE_INVALID_PARAMETER_VALUE=22023).
+		// M0134-0070.
+		if len(x.Args) == 3 {
+			bv, berr := evalExpr(x.Args[0], row, ctx)
+			if berr != nil {
+				return NullDatum, berr
+			}
+			if bv.IsNull() {
+				return NullDatum, nil
+			}
+			nv, nerr := evalExpr(x.Args[1], row, ctx)
+			if nerr != nil {
+				return NullDatum, nerr
+			}
+			if nv.IsNull() {
+				return NullDatum, nil
+			}
+			newv, verr := evalExpr(x.Args[2], row, ctx)
+			if verr != nil {
+				return NullDatum, verr
+			}
+			if newv.IsNull() {
+				return NullDatum, nil
+			}
+			src := bv.BytesValue()
+			n := nv.Int
+			bitLen := int64(len(src)) * 8
+			if n < 0 || n >= bitLen {
+				// No Pos: byteaSetBit (varlena.c:3400-3448) has no
+				// errposition call. M0134-0070.
+				return Datum{}, &ExecError{Code: "2202E",
+					Message: fmt.Sprintf("index %d out of valid range, 0..%d", n, bitLen-1)}
+			}
+			newBit := newv.Int
+			if newBit != 0 && newBit != 1 {
+				return Datum{}, &ExecError{Code: "22023",
+					Message: "new bit must be 0 or 1"}
+			}
+			byteNo := n / 8
+			bitNo := uint(n % 8)
+			out := make([]byte, len(src))
+			copy(out, src)
+			if newBit == 0 {
+				out[byteNo] &^= 1 << bitNo
+			} else {
+				out[byteNo] |= 1 << bitNo
+			}
+			return NewBytesDatum(out), nil
+		}
 	case "encode":
 		// encode(bytea, format) -> text. Formats: base64, escape, hex
 		// (binary_encode, postgres/src/backend/utils/adt/encode.c). This was a
