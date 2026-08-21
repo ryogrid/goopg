@@ -11238,6 +11238,11 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if err != nil || n.IsNull() {
 				return NullDatum, nil
 			}
+			// PG text_repeat (varlena.c): count <= 0 returns empty string,
+			// not an error.
+			if n.Int < 0 {
+				n.Int = 0
+			}
 			return NewStringDatum(strings.Repeat(s.StringValue(), int(n.Int))), nil
 		}
 	case "char_length", "character_length":
