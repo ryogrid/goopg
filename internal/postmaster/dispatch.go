@@ -3043,7 +3043,18 @@ func (s *Server) executeOneSimpleStmt(w *libpq.FrameWriter, ctx *executor.Contex
 				} else {
 					valueBuf = d.AppendValueText(valueBuf)
 				}
-				cells = append(cells, valueBuf[start:len(valueBuf)])
+				cell := valueBuf[start:len(valueBuf)]
+				if cell == nil {
+					// Non-null Datum rendered to zero bytes (empty
+					// string/bytea) on a still-nil scratch buffer: slicing
+					// a nil []byte with [0:0] yields nil, indistinguishable
+					// from the d.IsNull() sentinel above. Coerce to a
+					// non-nil zero-length slice so the DataRow encoder
+					// emits length 0, not the NULL length -1
+					// (M0134-datarow-empty-string).
+					cell = []byte{}
+				}
+				cells = append(cells, cell)
 			}
 			cells = s.maybeConvertCellsForClientEncoding(cells, ctx.GetSetting)
 			if err := w.PutDataRowScratch(cells, valueBuf); err != nil {
@@ -3810,7 +3821,18 @@ func (s *Server) executeFetch(_ context.Context, w *libpq.FrameWriter, ectx *exe
 				}
 				start := len(valueBuf)
 				valueBuf = d.AppendValueText(valueBuf)
-				cells = append(cells, valueBuf[start:len(valueBuf)])
+				cell := valueBuf[start:len(valueBuf)]
+				if cell == nil {
+					// Non-null Datum rendered to zero bytes (empty
+					// string/bytea) on a still-nil scratch buffer: slicing
+					// a nil []byte with [0:0] yields nil, indistinguishable
+					// from the d.IsNull() sentinel above. Coerce to a
+					// non-nil zero-length slice so the DataRow encoder
+					// emits length 0, not the NULL length -1
+					// (M0134-datarow-empty-string).
+					cell = []byte{}
+				}
+				cells = append(cells, cell)
 			}
 			cells = s.maybeConvertCellsForClientEncoding(cells, ectx.GetSetting)
 			if err := w.PutDataRowScratch(cells, valueBuf); err != nil {
