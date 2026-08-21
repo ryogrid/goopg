@@ -13524,7 +13524,13 @@ func initCap(s string) string {
 }
 
 // padLeft left-pads s to length n using the fill string. M0097-0005.
+// PG clamps a negative target length to 0 before any buffer sizing
+// (postgres/src/backend/utils/adt/varlena.c text_lpad), returning ''.
+// M0134-0070.
 func padLeft(s string, n int, fill string) string {
+	if n < 0 {
+		n = 0
+	}
 	runes := []rune(s)
 	if len(runes) >= n {
 		return string(runes[:n])
@@ -13546,7 +13552,13 @@ func padLeft(s string, n int, fill string) string {
 }
 
 // padRight right-pads s to length n using the fill string. M0097-0005.
+// PG clamps a negative target length to 0 before any buffer sizing
+// (postgres/src/backend/utils/adt/varlena.c text_rpad), returning ''.
+// M0134-0070.
 func padRight(s string, n int, fill string) string {
+	if n < 0 {
+		n = 0
+	}
 	runes := []rune(s)
 	if len(runes) >= n {
 		return string(runes[:n])
