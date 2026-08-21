@@ -2241,6 +2241,21 @@ func dmlPrivilegePermittedAs(ctx *Context, tbl *catalog.Table, priv, checkRole s
 	return ctx.Catalog.HasTablePrivilege(tbl.OID, checkRole, priv)
 }
 
+// dmlPrivilegePermittedAsAny is dmlPrivilegePermittedAs but ORs the check
+// across several privileges — mirrors PostgreSQL sequence.c's multi-bit ACL
+// masks (e.g. nextval_internal's ACL_USAGE | ACL_UPDATE, currval_oid's and
+// lastval's ACL_SELECT | ACL_USAGE). Delegates to dmlPrivilegePermittedAs for
+// each privilege so the owner/bootstrap-superuser-bypass/HasTablePrivilege
+// core logic is never duplicated. M0134-0069 bucket 5.
+func dmlPrivilegePermittedAsAny(ctx *Context, tbl *catalog.Table, checkRole string, privs ...string) bool {
+	for _, priv := range privs {
+		if dmlPrivilegePermittedAs(ctx, tbl, priv, checkRole) {
+			return true
+		}
+	}
+	return false
+}
+
 // selectPrivilegeCheckRole resolves the role whose SELECT grant a scan
 // operator should check: the view owner when the scan was tagged by
 // planner.tagViewOwnerScans (roleSet), otherwise the querying session's own

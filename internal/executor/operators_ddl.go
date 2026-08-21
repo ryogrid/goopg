@@ -18781,6 +18781,18 @@ func (o *ddlOp) createSeqCatalogTable(seqObjName parser.ObjectName, name string)
 	// name/schema (the retired kind-65 carried them before). Write it like
 	// any relation; the sequence reload re-registers the virtual relation.
 	if seqTbl, ok := o.ctx.Catalog.LookupTable(seqObjName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok && seqTbl != nil {
+		// Stamp the creating role as owner, mirroring CREATE TABLE's owner
+		// stamp (tablecmds.c DefineRelation -> heap_create_with_catalog
+		// ownerId = GetUserId(), see the CREATE TABLE call site above) — a
+		// non-superuser role's CREATE SEQUENCE otherwise leaves Owner at the
+		// zero-value sentinel (= bootstrap superuser), which made the new
+		// nextval/currval/setval/lastval ACL checks (M0134-0069 bucket 5)
+		// deny the creating role immediate, ungranted use of its own
+		// sequence — a pre-existing gap this brief's ACL enforcement
+		// exposed rather than one it introduced.
+		if o.ctx.NonSuperuserRole != "" {
+			seqTbl.Owner = o.ctx.NonSuperuserRole
+		}
 		syncTableToCatalogHeap(o.ctx, seqTbl)
 	}
 }
@@ -18924,6 +18936,20 @@ func (o *ddlOp) execAlterSequence(s *parser.AlterSequenceStmt) error {
 	// another session holds an in-progress nextval lock. M0118-0008
 	// (sequence-ddl isolation spec).
 	if tbl, ok := o.ctx.Catalog.LookupTable(s.Name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok {
+		// Owner check: ALTER SEQUENCE requires ownership (sequence.c
+		// AlterSequence ~437, via RangeVarGetRelidExtended +
+		// RangeVarCallbackOwnsRelation shared with ALTER TABLE →
+		// object_ownercheck → aclcheck_error). Reuses the COMMENT-path owner
+		// checker (checkCommentObjectOwner), the only "must be owner of"
+		// idiom already landed for goopg's Table.Owner string field — no ALTER
+		// TABLE owner-check idiom exists yet to mirror instead (grepped,
+		// M0134-0069 bucket 5).
+		if err := o.checkCommentObjectOwner(tbl.Owner, "sequence", tbl.Name); err != nil {
+			if ee, ok := err.(*ExecError); ok {
+				ee.Pos = s.Pos()
+			}
+			return err
+		}
 		if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lmgr.AccessExclusiveLock); err != nil {
 			if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 				ee.Pos = s.Pos()

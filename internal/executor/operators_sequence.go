@@ -637,6 +637,27 @@ func ctxSeqDBOid(ctx *Context) uint32 {
 	return catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)
 }
 
+// resolveSeqCatalogTable resolves the *catalog.Table for a sequence name
+// (bare or schema-qualified), used by the nextval/currval/setval/lastval ACL
+// checks below. Mirrors the name-splitting evalNextval already did for its
+// lock lookup (M0134-0069 bucket 5). Returns nil if ctx/catalog is unset or
+// the sequence isn't found in the catalog (e.g. a not-yet-flushed test
+// registry entry) — callers treat a nil table as "no ACL to enforce",
+// matching goopg's existing catalog-optional test-harness convention.
+func resolveSeqCatalogTable(ctx *Context, name string, dbOid uint32) *catalog.Table {
+	if ctx == nil || ctx.Catalog == nil {
+		return nil
+	}
+	on := parser.ObjectName{Name: name}
+	if i := strings.LastIndex(name, "."); i >= 0 {
+		on = parser.ObjectName{Schema: name[:i], Name: name[i+1:]}
+	}
+	if tbl, ok := ctx.Catalog.LookupTable(on, dbOid); ok {
+		return tbl
+	}
+	return nil
+}
+
 func evalNextval(args []Datum, ctx *Context) (Datum, error) {
 	if len(args) == 0 {
 		return NullDatum, nil
@@ -658,15 +679,13 @@ func evalNextval(args []Datum, ctx *Context) (Datum, error) {
 	// PostgreSQL's lock_and_open_sequence), so it waits while another session is
 	// mid-ALTER SEQUENCE (AccessExclusiveLock) and a later ALTER SEQUENCE waits
 	// for an in-progress nextval. M0118-0008 (sequence-ddl isolation spec).
-	if ctx != nil && ctx.Catalog != nil {
-		on := parser.ObjectName{Name: name}
-		if i := strings.LastIndex(name, "."); i >= 0 {
-			on = parser.ObjectName{Schema: name[:i], Name: name[i+1:]}
+	if tbl := resolveSeqCatalogTable(ctx, name, dbOid); tbl != nil {
+		// nextval requires USAGE or UPDATE (sequence.c nextval_internal ~649-655).
+		if !dmlPrivilegePermittedAsAny(ctx, tbl, ctx.NonSuperuserRole, "USAGE", "UPDATE") {
+			return Datum{}, &ExecError{Code: "42501", Message: fmt.Sprintf("permission denied for sequence %s", tbl.Name)}
 		}
-		if tbl, ok := ctx.Catalog.LookupTable(on, dbOid); ok {
-			if err := ctx.acquireSequenceLockTxn(ctx.Catalog.RelFileNode(tbl)); err != nil {
-				return Datum{}, err
-			}
+		if err := ctx.acquireSequenceLockTxn(ctx.Catalog.RelFileNode(tbl)); err != nil {
+			return Datum{}, err
 		}
 	}
 	v, err := s.nextVal()
@@ -700,10 +719,17 @@ func evalCurrval(args []Datum, ctx *Context) (Datum, error) {
 		return NullDatum, nil
 	}
 	name := seqNameFromDatum(args[0], ctx)
+	dbOid := ctxSeqDBOid(ctx)
+	if tbl := resolveSeqCatalogTable(ctx, name, dbOid); tbl != nil {
+		// currval requires SELECT or USAGE (sequence.c currval_oid ~876-881).
+		if !dmlPrivilegePermittedAsAny(ctx, tbl, ctx.NonSuperuserRole, "SELECT", "USAGE") {
+			return Datum{}, &ExecError{Code: "42501", Message: fmt.Sprintf("permission denied for sequence %s", tbl.Name)}
+		}
+	}
 	if ctx == nil || ctx.CurrSeqVals == nil {
 		return Datum{}, &ExecError{Code: "55000", Message: fmt.Sprintf("currval of sequence %q is not yet defined in this session", name)}
 	}
-	v, ok := ctx.CurrSeqVals[seqKey(name, ctxSeqDBOid(ctx))]
+	v, ok := ctx.CurrSeqVals[seqKey(name, dbOid)]
 	if !ok {
 		return Datum{}, &ExecError{Code: "55000", Message: fmt.Sprintf("currval of sequence %q is not yet defined in this session", name)}
 	}
@@ -730,6 +756,13 @@ func evalSetval(args []Datum, ctx *Context) (Datum, error) {
 	isCalled := true
 	if len(args) >= 3 && !args[2].IsNull() && args[2].Kind == KindBool {
 		isCalled = args[2].BoolValue()
+	}
+
+	if tbl := resolveSeqCatalogTable(ctx, name, dbOid); tbl != nil {
+		// setval requires UPDATE only (sequence.c do_setval ~960-964).
+		if !dmlPrivilegePermittedAs(ctx, tbl, "UPDATE", ctx.NonSuperuserRole) {
+			return Datum{}, &ExecError{Code: "42501", Message: fmt.Sprintf("permission denied for sequence %s", tbl.Name)}
+		}
 	}
 
 	s := LookupSequence(name, dbOid)
@@ -777,9 +810,18 @@ func evalLastval(ctx *Context) (Datum, error) {
 		return Datum{}, &ExecError{Code: "55000", Message: "lastval is not yet defined in this session"}
 	}
 	// If the last-used sequence was dropped, lastval() must error.
-	if ctx.LastSeqName != "" && LookupSequence(ctx.LastSeqName, ctxSeqDBOid(ctx)) == nil {
+	dbOid := ctxSeqDBOid(ctx)
+	if ctx.LastSeqName != "" && LookupSequence(ctx.LastSeqName, dbOid) == nil {
 		ctx.LastSeqSet = false
 		return Datum{}, &ExecError{Code: "55000", Message: "lastval is not yet defined in this session"}
+	}
+	// lastval() operates on "the last sequence used by nextval in this
+	// session" (sequence.c lastval ~918-923) — the ACL check (SELECT or
+	// USAGE) still applies to that resolved sequence.
+	if tbl := resolveSeqCatalogTable(ctx, ctx.LastSeqName, dbOid); tbl != nil {
+		if !dmlPrivilegePermittedAsAny(ctx, tbl, ctx.NonSuperuserRole, "SELECT", "USAGE") {
+			return Datum{}, &ExecError{Code: "42501", Message: fmt.Sprintf("permission denied for sequence %s", tbl.Name)}
+		}
 	}
 	return Datum{Kind: KindInt, Int: ctx.LastSeqVal}, nil
 }
