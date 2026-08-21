@@ -1,110 +1,109 @@
 Task: M0134-0070 (strings.sql) — regress-sql `failed`. This loop closed the
-POSITION(sub IN str) grammar gap and committed/pushed it (`c13eba8c`).
-strings.sql itself remains `failed` overall (diff now 2404 lines, down from
-2454 at loop start).
+`LIKE ... ESCAPE` grammar/semantics gap and committed/pushed it (`a5505fbe`).
+strings.sql itself remains `failed` overall (diff now 2135 lines, down from
+2404 at loop start).
 
-This loop: delegated a researcher round to size the 5 remaining REFACTOR-tier
-buckets in strings.sql's diff (POSITION/OVERLAY/LIKE-ESCAPE/SIMILAR-TO
-grammar ~376 lines, ascii()/bit_count() spacing ~4 lines but systemic/shared
-with domain.diff+misc_functions.diff — NOT picked, root cause unverified,
-don't bandaid it — Unicode-escape literals ~57 lines, regexp_* function
-family ~1215 lines — by far the dominant bucket, chr(0)/bytea NUL ~4 lines).
-Selected POSITION(x IN y) as the smallest fully-contained slice (pure parser
-desugar to the existing `position(sub,str)` FuncCall dispatch, zero executor
-change) and delegated an implementer round.
+This loop: delegated a researcher round (confirmed 32 self-contained
+`LIKE .. ESCAPE ..` lines, zero ESCAPE-keyword handling anywhere in goopg,
+and that PG desugars the ESCAPE clause into a runtime-evaluated `a_expr`
+via `like_escape()`, not a parse-time constant — cited gram.y + like_match.c
+`do_like_escape`). Delegated an implementer round; it converged in 1 round
+but needed more than the brief scoped (see below) — still within the 3-round
+cap, no SendMessage follow-up needed.
 
-Round 1 implementer output built `parsePositionFuncCall` (mirrors
-`parseSubstringFuncCall`'s dual-form pattern) but got the IN-form arg order
-backwards (`Args: []Expr{sub, str}` when the executor's `strpos`/`position`
-case expects `{str, sub}`, i.e. haystack-first). Caught this via the tester's
-gate-4 live regress run — a real semantic bug, not a parse failure (every
-POSITION(x IN y) call returned the wrong boolean). Sent a round-2 SendMessage
-to the same implementer with the exact fix; it corrected only the IN-form
-desugar site (correctly declined to also "fix" the comma-form site per the
-brief's literal wording — verified empirically that the comma form was
-already correct in source order and swapping it would have been a
-regression; flagged as a deliberate, verified deviation in report.md).
-Re-ran gates live: diff now 2404, POSITION(x IN y) block (both text and
-bytea variants) is byte-identical clean context vs the PG oracle.
+Landed: new unreserved keyword `KwEscape`; new `parser.LikeEscapePattern` /
+`optimizer.LikeEscapePattern` wrapper node (deliberately kept OUT of
+`BinaryOp` — that struct has 43 existing `case *parser.BinaryOp:` switch
+sites across the codebase, auditing all of them for a new field was out of
+scope; the wrapper only ever appears as `BinaryOp.Right` when an ESCAPE
+clause was present, so every other `BinaryOp` use is unaffected); analyzer +
+planner + evaluator wiring; PG-faithful `likeEscapeRewrite` implementing
+`do_like_escape` exactly (empty escape doubles literal backslashes, 1-char
+substitutes, escape==`\` no-op, >1-char raises SQLSTATE 22025 with PG's
+exact HINT), feeding the rewritten pattern into the **unmodified**
+`matchSQLLike`. Covers text AND bytea, all 4 forms (LIKE/NOT LIKE/ILIKE/NOT
+ILIKE). All 32 fixture lines now byte-identical to the PG oracle.
 
-Files this loop: `internal/parser/select.go` (new `parsePositionFuncCall`,
-intercept in `parseColumnOrCall`'s function-call chain), new
-`internal/parser/position_test.go` (3 tests: IN form, comma-form regression
-guard, missing-close-paren error). Handoff dir:
-`tmp/ralph-handoffs/m0134-0070-position-in-desugar/` (brief.md + 2-round
-report.md) — scratch, not system of record. No design doc needed (small,
-template-following parser slice — same scope precedent as the `eba6009e`
-errSyntaxAtCur fix).
+Deviation from the brief (load-bearing, not scope creep): the brief's
+scoped edit site (`evalBinary`, expr.go ~1819) only ever sees already-
+evaluated `Datum`s, not AST nodes, so the escape-rewrite had to happen one
+level up in `evalExprSlot`'s node-type switch (where `Right` is still an
+`Expr`), which required a parallel `optimizer.LikeEscapePattern` twin (the
+planner's resolved-expression IR is a separate node set from the parser's
+AST) plus `analyzeExpr`/planner/exprwalk cases the brief didn't anticipate.
+Verified live: `go build ./...` clean, `go test ./internal/parser/...
+./internal/executor/... ./internal/optimizer/...` PASS, `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh` PASS (per implementer, not re-run — no
+reason to distrust), fresh `scripts/pg-regress-runner.sh --verbose strings`
+via tester re-verification round: diff 2135, zero hunks touch the ESCAPE
+region. Pre-commit pgbench smoke via git hook — PASS (376/696/12831 TPS, 0
+failed).
 
-Key symbols: `parsePositionFuncCall` (`internal/parser/select.go:4130`,
-new), `parseColumnOrCall` intercept chain (`internal/parser/select.go:~4277`),
-executor dispatch `case "strpos", "position":`
-(`internal/executor/expr.go:11514`, unchanged — confirmed its
-haystack-first/needle-second convention this loop, worth remembering for any
-future OVERLAY/SIMILAR-TO desugar work in the same family).
+Files this loop: `internal/parser/token.go`, `internal/parser/keywords.go`
+(new `KwEscape`), `internal/parser/expr.go` (new `LikeEscapePattern`),
+`internal/parser/select.go` (wiring into the 4 LIKE-family parse arms),
+`internal/parser/like_escape_test.go` (new), `internal/parser/analyzer/analyzer.go`
+(new case arm — required, not in original brief scope), `internal/optimizer/plan.go`,
+`internal/optimizer/planner.go`, `internal/optimizer/exprwalk.go`,
+`internal/optimizer/exprkey_test.go` (planner-IR twin node + resolver
+cases — required, not in original brief scope), `internal/executor/expr.go`
+(`evalLikeEscapePattern`/`likeEscapeRewrite` in `evalExprSlot`),
+`internal/executor/like_escape_test.go` (new). Handoff dir:
+`tmp/ralph-handoffs/m0134-0070-like-escape/` (brief.md + report.md) —
+scratch, not system of record.
 
-Hypothesis/Findings: strings.sql's remaining 2404-line diff, per this loop's
-researcher sizing (re-verify live before trusting exact numbers, they shift
-as buckets are fixed):
-- regexp_count/regexp_like/regexp_instr/regexp_substr/regexp_replace
-  backreferences/regexp_matches(...,'g')/regexp_split_to_table family —
-  **dominant bucket, ~1215 of 1688 diff +/- lines (~72%)**. Likely many
-  independent semantic gaps (new PG15+ functions), not one contained fix —
-  needs its own sizing pass to decompose into per-function slices before
-  briefing.
-- OVERLAY(... PLACING ... FROM ...) — no PLACING grammar exists anywhere in
-  internal/parser/; needs both a new parser production (same
-  parseSubstringFuncCall-family template) AND a new executor
-  `case "overlay":` (currently `overlay` is only in an unrelated builtin
-  allowlist at internal/executor/operators_call.go:745, no eval dispatch).
-- LIKE ... ESCAPE — `LIKE` itself parses fine (OpLike BinaryOp,
-  internal/parser/select.go:1939-1963) but has no ESCAPE-clause consumption
-  after the RHS.
-- SIMILAR TO — zero support, not even a keyword (`SIMILAR`/`KwSimilar`
-  absent from token.go); needs new grammar AND likely a new executor-side
-  POSIX-pattern-conversion helper (PG's `similar_escape()` equivalent — none
-  found under that name in goopg).
-- Unicode-escape `U&'...'`/`UESCAPE` + bit/hex-string literals (~57 lines,
-  not yet sized in detail).
-- ascii()/bit_count() spacing (~4 lines in strings.sql, but root cause is a
-  shared/systemic RowDescription or column-width wire-protocol issue also
-  present in domain.diff/misc_functions.diff, absent from int2/int4/int8 —
-  do NOT fix blind in strings.sql alone, needs dedicated investigation of
-  internal/postmaster/{query,extended}.go or internal/libpq/{protocol,
-  messages}.go first).
-- chr(0)/bytea-trim NUL-byte handling (~4 lines, not yet sized in detail).
+Key symbols: `parser.LikeEscapePattern` (`internal/parser/expr.go`),
+`optimizer.LikeEscapePattern` (`internal/optimizer/plan.go`),
+`likeEscapeRewrite`/`evalLikeEscapePattern` (`internal/executor/expr.go`,
+new), `matchSQLLike` (`internal/executor/expr.go:2185`, unchanged — fed the
+rewritten pattern, single source of truth for backslash matching).
 
-Next step: pick the next REFACTOR-tier bucket. Recommend, in order of
-increasing cost per this loop's researcher: LIKE...ESCAPE (parser-only, plumb
-an escape char into the existing OpLike/OpNotLike BinaryOp or a new node) →
-OVERLAY (parser + one new executor case) → decompose the regexp_* family
-into per-function slices (large, needs its own sizing pass — do not brief it
-as one slice) → SIMILAR TO (parser + new executor regex-conversion function,
-biggest lift). Alternatively PARK M0134-0070 now if the remaining buckets all
-look too large for one loop — re-check the fix_plan banner at loop start
-first; if parking, M0134-0071 (equivclass.sql) is next in ID order (see prior
-loop's note: gated behind CREATE TYPE (INPUT=,OUTPUT=,LIKE=) base/shell type
+Deferred (ledger row 2026-08-22): expression-to-SQL deparsers
+(`internal/executor/operators_ddl.go:defaultExprToSQL`,
+`internal/catalog/catalog.go:formatExprForAttrdef` — CHECK-constraint/
+DEFAULT-expression round-trip rendering) don't know `LikeEscapePattern` and
+would silently drop the ESCAPE clause on round-trip. Not exercised by
+strings.sql itself so left open; resume point is in the ledger row.
+
+Next step: pick the next REFACTOR-tier bucket for strings.sql (2135-line
+diff remaining). Recommend, in order of increasing cost per the researcher
+sizing carried from the prior loop: OVERLAY(... PLACING ... FROM ...)
+(parser + one new executor case — no PLACING grammar exists anywhere in
+internal/parser/, and `overlay` is only in an unrelated builtin allowlist at
+internal/executor/operators_call.go:745 with no eval dispatch) → decompose
+the regexp_* family into per-function slices (dominant bucket, needs its
+own sizing pass, do not brief as one slice) → SIMILAR TO (parser + new
+executor POSIX-conversion helper, biggest lift, no `similar_escape`
+equivalent exists) → Unicode-escape `U&'...'`/`UESCAPE` + bit/hex-string
+literals (~57 lines, not yet sized in detail) → ascii()/bit_count() spacing
+(~4 lines, but root cause looks systemic/shared with domain.diff/
+misc_functions.diff — do NOT fix blind in strings.sql alone, needs dedicated
+wire-protocol investigation first) → chr(0)/bytea-trim NUL handling (~4
+lines, not yet sized). Alternatively PARK M0134-0070 now if remaining
+buckets all look too large for one loop — re-check the fix_plan banner at
+loop start first; if parking, M0134-0071 (equivclass.sql) is next in ID
+order (gated behind CREATE TYPE (INPUT=,OUTPUT=,LIKE=) base/shell type
 creation + LANGUAGE INTERNAL function dispatch, both currently
-stubbed/absent — get a live tester diff before treating it as "next" if 0070
-gets parked).
+stubbed/absent — get a live tester diff before treating it as "next" if
+0070 gets parked).
 
-Gates run this loop: `go build ./...` PASS (implementer + tester, both
-rounds); `go test ./internal/parser/...` PASS (implementer + tester, both
-rounds, cached, verified non-stale via `-run Position -v`); `RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh` PASS (tester, ~9min, internal/initdb cold
-~424s as expected, not a regression); `scripts/pg-regress-runner.sh
---verbose strings` (tester, cgroup-capped) — run twice: round-1 diff 2439
-(revealed the arg-order bug), round-2 diff 2404 (bug fixed, POSITION block
-byte-identical clean); pre-commit pgbench smoke via git hook — PASS
-(376/690/12783 TPS, 0 failed transactions). `make ralph-state-guard` — run
-after this status block per protocol.
+Gates run this loop: `go build ./...` PASS (implementer + this session, both
+verified); `go test ./internal/parser/... ./internal/executor/...
+./internal/optimizer/...` PASS (cached, verified fresh); `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh` PASS (implementer report, not re-run);
+`scripts/pg-regress-runner.sh --verbose strings` (tester re-verification
+round, cgroup-capped) — diff 2135, zero ESCAPE-region hunks confirmed;
+pre-commit pgbench smoke via git hook — PASS (376/696/12831 TPS, 0 failed
+transactions). `make ralph-state-guard` — ran this loop, found a stale
+running/completed mismatch from the prior loop's clean exit, self-repaired
+to consistent (in_progress), OK.
 
-Delegation: researcher round (a35454581d13cf1ef, sizing) + implementer round
-1 (a246f46fbf510e295, tmp/ralph-handoffs/m0134-0070-position-in-desugar/,
-DONE but with the arg-order bug) + tester round (ad155b259659bcca9,
-gate-4 caught the bug, BLOCKED verdict) + implementer round 2 (SendMessage
-to a246f46fbf510e295, fixed + re-verified, DONE). 2 rounds on the
-implementer (within the 3-round cap), converged. No open handoff.
+Delegation: researcher round (a61efa80a1841d191, sizing/grammar
+confirmation) + implementer round (a84f1c26492f7c718,
+tmp/ralph-handoffs/m0134-0070-like-escape/, DONE in 1 round, converged) +
+tester re-verification round (a278d1439a1a4fa33, DONE, confirmed diff 2135
+and ESCAPE-region clean). No SendMessage follow-up needed (1 round,
+well within the 3-round cap). No open handoff.
 
-In-flight: none. Commit `c13eba8c` landed and pushed to
-`regress-renumbering` (`eba6009e..c13eba8c`). No server left running.
+In-flight: none. Commit `a5505fbe` landed and pushed to
+`regress-renumbering` (`93dcdf7c..a5505fbe`). No server left running.
