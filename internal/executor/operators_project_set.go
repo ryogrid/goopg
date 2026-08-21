@@ -213,7 +213,10 @@ func (o *projectSetOp) openSelectSrfMode(ctx *Context) error {
 					return err
 				}
 			}
-			vals := evalRegexpMatchesSRF(sD, patD, flagsD)
+			vals, rmErr := evalRegexpMatchesSRF(sD, patD, flagsD)
+			if rmErr != nil {
+				return rmErr
+			}
 			regexpMatchesResults[k] = regexpMatchesResult{colIdx: rc.ColIdx, vals: vals}
 			if len(vals) > maxLen {
 				maxLen = len(vals)

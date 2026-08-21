@@ -1260,6 +1260,42 @@ Non-blocking notice (no task): 17 `TestPort_Psql*`/`TestPort_Scripts*`/
 `TestPort_Pgbench*` cases newly SKIPPED vs the previous run — env-drift, expected
 on partial `NIGHTLY_STAGES` runs; harvest on a full run.
 
+### Nightly run 20260822-001356 (sha `fb67cba988b2`, 5 items) — filed 2026-08-22
+
+Filed per the standing M-NIGHTLY obligation; NOT selected on the filing loop (the
+Current Priority banner puts M0134 next-priority and the M0134-0070 U&/UESCAPE
+slice was in flight and just landed). Triage each per the M-NIGHTLY selection rule
+before working (re-run the repro at HEAD first — the log reflects the last
+nightly and may be stale).
+
+- [ ] **testport/TestPort_PgDumpConnectionSetup (AI-20260822-001356-001)** — new
+      tonight. Repro: `go test -v -run '^TestPort_PgDumpConnectionSetup$'
+      ./internal/testport/`. Evidence:
+      `ci/logs/20260822-001356/testport/go-test.log`.
+- [ ] **testport/TestPort_RegressSuite — limit, numerology (AI-20260822-001356-002)**
+      — new tonight. Repro: `go test -v -run '^TestPort_RegressSuite$'
+      ./internal/testport/`. Evidence:
+      `ci/logs/20260822-001356/testport/go-test.log`.
+- [ ] **testport/TestSyntax_AdvisoryLock_SessionUnlockAcrossBeginBoundary
+      (AI-20260822-001356-003)** — new tonight. Repro: `go test -v -run
+      '^TestSyntax_AdvisoryLock_SessionUnlockAcrossBeginBoundary$'
+      ./internal/testport/`. Evidence:
+      `ci/logs/20260822-001356/testport/go-test.log`.
+- [ ] **race/stage (AI-20260822-001356-004)** — stage race FAILED with no
+      parseable cause; inspect stage logs before triaging further. Repro: `bash
+      ci/batch/stages/stage-race.sh` (REPO_ROOT/RUN_DIR set; see
+      `ci/logs/20260822-001356/race/`). Evidence:
+      `ci/logs/20260822-001356/race/stage.log`. Note item -005 below records that
+      the working tree mutated mid-run (a concurrent Ralph loop's edit/commit),
+      so this result may be contaminated — re-verify at a clean HEAD before
+      trusting it.
+- [ ] **race/build-broke-mid-stage (AI-20260822-001356-005)** — `internal/executor`
+      failed to compile mid-stage so it never ran (not a regression by itself);
+      the working tree mutated mid-run (preflight fp `8a4496c2c9eed0be`, race fp
+      `e7b294ceca30ceee`) — a concurrent edit/commit, not a code defect. Repro:
+      `go build ./...` at the run's recorded sha (clean sha ⇒ nothing to fix in
+      the code). Evidence: `ci/logs/20260822-001356/race/go-test.log`.
+
 ## M0130 — Cluster-directory compat with PG 18.3 + PG physical replication (filed 2026-08-09)
 
 **Milestone doc:** `docs/milestones/0130-cluster-dir-compat-and-pg-physical-replication.md`

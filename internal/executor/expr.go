@@ -7339,27 +7339,84 @@ func regexpAllMatchesArrays(re *regexp.Regexp, s string, global bool) []Datum {
 	return out
 }
 
+// pgRegexFlagsToGoModifiers translates a PG regexp_* "flags" argument
+// (postgres/src/backend/utils/adt/regexp.c:parse_re_flags, :385-449) into a
+// Go regexp inline-modifier prefix plus the 'g'/global bit, which Go's
+// regexp package has no inline equivalent for (call sites already loop for
+// 'g' themselves). Per the design doc
+// (docs/design/m0134-0070-regexp-flags-and-family.md):
+//   - 'i' (case-insensitive)                       → Go (?i)
+//   - 'm'/'n' (newline-sensitive) and PG's 'p'/'w'
+//     partial-newline-sensitive variants            → Go (?m) (goopg does not
+//     distinguish full vs. partial newline-sensitivity beyond ^/$ anchoring;
+//     documented simplification, not a silent drop)
+//   - 's' (PG's "single line, \n ordinary", i.e. PG's *default* newline
+//     behavior) is a naming collision with Go's `(?s)` ("dot matches
+//     newline") — they are NOT the same thing, so 's' must NOT map to Go's
+//     (?s). It is a no-op here since goopg's default already matches PG's 's'
+//     behavior.
+//   - 'c'/'e'/'b'/'t'/'q'/'x' are accepted (PG ARE-mode/syntax selectors) but
+//     not yet meaningfully implemented — NOT flagged unknown, matching PG's
+//     own acceptance of them as valid selectors.
+//   - 'g' sets global=true; not folded into goFlags.
+//   - Any other character → 22023 (ERRCODE_INVALID_PARAMETER_VALUE; PG's own
+//     parse_re_flags default case raises invalid_parameter_value, not
+//     invalid_regular_expression, despite the ereport wording).
+func pgRegexFlagsToGoModifiers(flags string) (goFlags string, global bool, err error) {
+	var caseInsensitive, newlineSensitive bool
+	for _, r := range flags {
+		switch r {
+		case 'g':
+			global = true
+		case 'i':
+			caseInsensitive = true
+		case 'm', 'n', 'p', 'w':
+			newlineSensitive = true
+		case 's', 'c', 'e', 'b', 't', 'q', 'x':
+			// Accepted PG flag chars with no goopg-side effect (yet).
+		default:
+			return "", false, &ExecError{Code: "22023",
+				Message: fmt.Sprintf("invalid regular expression option: %q", string(r))}
+		}
+	}
+	if !caseInsensitive && !newlineSensitive {
+		return "", global, nil
+	}
+	var b strings.Builder
+	b.WriteString("(?")
+	if caseInsensitive {
+		b.WriteByte('i')
+	}
+	if newlineSensitive {
+		b.WriteByte('m')
+	}
+	b.WriteByte(')')
+	return b.String(), global, nil
+}
+
 // evalRegexpMatchesSRF evaluates regexp_matches(string, pattern[, flags]) in
 // SELECT-list SRF position (see projectSetOp.openSelectSrfMode). Invalid
 // patterns / NULL string or pattern args yield zero rows rather than an
-// error, matching the permissiveness of the pre-existing scalar case arm.
-func evalRegexpMatchesSRF(sD, patD, flagsD Datum) []Datum {
+// error, matching the permissiveness of the pre-existing scalar case arm. An
+// unrecognized flag character still raises 22023 (M0134-0070).
+func evalRegexpMatchesSRF(sD, patD, flagsD Datum) ([]Datum, error) {
 	if sD.IsNull() || patD.IsNull() {
-		return nil
+		return nil, nil
 	}
 	flags := ""
 	if !flagsD.IsNull() {
 		flags = flagsD.StringValue()
 	}
-	pattern := patD.StringValue()
-	if strings.Contains(flags, "i") {
-		pattern = "(?i)" + pattern
+	goFlags, global, ferr := pgRegexFlagsToGoModifiers(flags)
+	if ferr != nil {
+		return nil, ferr
 	}
+	pattern := goFlags + patD.StringValue()
 	re, err := regexp.Compile(pattern)
 	if err != nil {
-		return nil
+		return nil, nil
 	}
-	return regexpAllMatchesArrays(re, sD.StringValue(), strings.Contains(flags, "g"))
+	return regexpAllMatchesArrays(re, sD.StringValue(), global), nil
 }
 
 // evalIsFinite implements isfinite(date/timestamp/timestamptz/interval),
@@ -11857,19 +11914,18 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 				return NullDatum, nil
 			}
 			replaceAll := false
-			caseInsensitive := false
+			goFlags := ""
 			if len(x.Args) >= 4 {
 				flags, e4 := evalExpr(x.Args[3], row, ctx)
 				if e4 == nil && !flags.IsNull() {
-					fs := flags.StringValue()
-					replaceAll = strings.Contains(fs, "g")
-					caseInsensitive = strings.Contains(fs, "i")
+					var ferr error
+					goFlags, replaceAll, ferr = pgRegexFlagsToGoModifiers(flags.StringValue())
+					if ferr != nil {
+						return NullDatum, ferr
+					}
 				}
 			}
-			pattern := pgPatternToGoRE2(pat.StringValue())
-			if caseInsensitive {
-				pattern = "(?i)" + pattern
-			}
+			pattern := goFlags + pgPatternToGoRE2(pat.StringValue())
 			re, err := regexp.Compile(pattern)
 			if err != nil {
 				return NewStringDatum(s.StringValue()), nil // invalid pattern: return input
@@ -12833,12 +12889,19 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 					flags = flagD.StringValue()
 				}
 			}
+			goFlags, global, ferr := pgRegexFlagsToGoModifiers(flags)
+			if ferr != nil {
+				return NullDatum, ferr
+			}
+			if global {
+				// regexp_split_to_array() rejects 'g' (regexp.c:1818-1826
+				// regexp_split_to_array — "User mustn't specify 'g'").
+				return NullDatum, &ExecError{Code: "22023",
+					Message: `regexp_split_to_array() does not support the "global" option`}
+			}
 			pat := patD.StringValue()
 			// Build RE2 pattern with flags.
-			reStr := pat
-			if strings.Contains(flags, "i") {
-				reStr = "(?i)" + reStr
-			}
+			reStr := goFlags + pat
 			re, rerr := regexp.Compile(reStr)
 			if rerr != nil {
 				// No Pos: pure runtime evaluation (RE_compile_and_cache,
