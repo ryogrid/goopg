@@ -12011,7 +12011,8 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return Datum{Kind: KindInt, Int: int64(len(runes) + 1)}, nil
 		}
 	case "split_part":
-		// split_part(text, delimiter, field)
+		// split_part(text, delimiter, field) — mirrors PG's split_part()
+		// (postgres/src/backend/utils/adt/varlena.c:4621-4750).
 		if len(x.Args) == 3 {
 			s, e1 := evalExpr(x.Args[0], row, ctx)
 			d, e2 := evalExpr(x.Args[1], row, ctx)
@@ -12019,12 +12020,39 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if e1 != nil || e2 != nil || e3 != nil || s.IsNull() || d.IsNull() || n.IsNull() {
 				return NullDatum, nil
 			}
-			parts := strings.Split(s.StringValue(), d.StringValue())
-			idx := int(n.Int)
-			if idx <= 0 || idx > len(parts) {
+			fldnum := int(n.Int)
+			// field number is 1 based
+			if fldnum == 0 {
+				return Datum{}, &ExecError{Code: "22023",
+					Message: "field position must not be zero"}
+			}
+			str := s.StringValue()
+			sep := d.StringValue()
+			// return empty string for empty input string
+			if len(str) < 1 {
 				return NewStringDatum(""), nil
 			}
-			return NewStringDatum(parts[idx-1]), nil
+			// handle empty field separator: if first or last field, return
+			// input string, else empty string.
+			if len(sep) < 1 {
+				if fldnum == 1 || fldnum == -1 {
+					return NewStringDatum(str), nil
+				}
+				return NewStringDatum(""), nil
+			}
+			parts := strings.Split(str, sep)
+			if fldnum < 0 {
+				// convert negative field number to positive by counting from
+				// the end (total field count).
+				fldnum += len(parts) + 1
+				if fldnum <= 0 {
+					return NewStringDatum(""), nil
+				}
+			}
+			if fldnum > len(parts) {
+				return NewStringDatum(""), nil
+			}
+			return NewStringDatum(parts[fldnum-1]), nil
 		}
 	case "concat":
 		// concat(any, ...) → text — NULL inputs are treated as empty string.
@@ -12137,6 +12165,16 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			s, err := evalExpr(x.Args[0], row, ctx)
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
+			}
+			if s.Kind == KindBytes {
+				// bytea_reverse (postgres/src/backend/utils/adt/varlena.c:3458-3474)
+				// is a plain byte-for-byte reversal, no codepoint awareness.
+				src := s.BytesValue()
+				out := make([]byte, len(src))
+				for i, b := range src {
+					out[len(src)-1-i] = b
+				}
+				return NewBytesDatum(out), nil
 			}
 			runes := []rune(s.StringValue())
 			for i, j := 0, len(runes)-1; i < j; i, j = i+1, j-1 {
