@@ -89,6 +89,8 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 		return maybeInstrument(p, newPgOptionsToTableOp(p)), nil
 	case *optimizer.FromRegexpMatches:
 		return maybeInstrument(p, newFromRegexpMatchesOp(p)), nil
+	case *optimizer.FromRegexpSplitToTable:
+		return maybeInstrument(p, newFromRegexpSplitToTableOp(p)), nil
 	case *optimizer.CTEScan:
 		// CTEScan wraps the inlined CTE body. Use cteScanOp which materializes
 		// all rows on first Open() and replays them on subsequent Open() calls

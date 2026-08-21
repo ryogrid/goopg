@@ -7419,6 +7419,52 @@ func evalRegexpMatchesSRF(sD, patD, flagsD Datum) ([]Datum, error) {
 	return regexpAllMatchesArrays(re, sD.StringValue(), global), nil
 }
 
+// evalRegexpSplitToTable evaluates regexp_split_to_table(string, pattern[,
+// flags]) in FROM-clause SRF position, one row per substring (plain text,
+// not array-wrapped). Unlike evalRegexpMatchesSRF, this is strict like the
+// scalar regexp_split_to_array case it mirrors: NULL string/pattern yields
+// zero rows, but an explicit 'g' flag and an invalid pattern both raise
+// errors rather than silently returning nothing — regexp_split_to_table and
+// regexp_split_to_array share PG's setup_regexp_matches/split machinery
+// (postgres/src/backend/utils/adt/regexp.c:1748-1797 rejects 'g', then
+// forces glob=true internally so split always finds ALL matches; :1862-1897
+// build_regexp_split_result — N matches → N+1 rows). M0134-0070 Round D.
+func evalRegexpSplitToTable(sD, patD, flagsD Datum) ([]Datum, error) {
+	if sD.IsNull() || patD.IsNull() {
+		return nil, nil
+	}
+	flags := ""
+	if !flagsD.IsNull() {
+		flags = flagsD.StringValue()
+	}
+	goFlags, global, ferr := pgRegexFlagsToGoModifiers(flags)
+	if ferr != nil {
+		return nil, ferr
+	}
+	if global {
+		// regexp_split_to_table() rejects 'g' (regexp.c:1766-1773 — "User
+		// mustn't specify 'g'"), then forces glob=true internally, i.e.
+		// split always finds ALL matches regardless.
+		return nil, &ExecError{Code: "22023",
+			Message: `regexp_split_to_table() does not support the "global" option`}
+	}
+	pattern := goFlags + patD.StringValue()
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		// Unlike evalRegexpMatchesSRF's permissiveness (a matches-only
+		// simplification), regexp_split_to_table follows the stricter
+		// regexp_split_to_array precedent: no Pos, pure runtime evaluation
+		// (RE_compile_and_cache has no errposition call). M0134-0070.
+		return nil, &ExecError{Code: "2201B", Message: fmt.Sprintf("invalid regular expression: %v", err)}
+	}
+	parts := re.Split(sD.StringValue(), -1)
+	vals := make([]Datum, len(parts))
+	for i, s := range parts {
+		vals[i] = NewStringDatum(s)
+	}
+	return vals, nil
+}
+
 // evalIsFinite implements isfinite(date/timestamp/timestamptz/interval),
 // line-porting PG's date_finite / timestamp_finite / interval_finite
 // (postgres/src/backend/utils/adt/{date,timestamp}.c): the result is FALSE

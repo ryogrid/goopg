@@ -1,6 +1,7 @@
 # M0134-0070 Round C: `regexp_*` family — shared flags translator + `regexp_matches` multi-flag fix
 
-Status: accepted. Scope: `strings.sql` regress case, Round C of the M0134-0070
+Status: Round C accepted/landed; Round D accepted/landed (see addendum at end
+of file). Scope: `strings.sql` regress case, Round C of the M0134-0070
 sizing pass (Round A `E'...'` Unicode-escape validation, Round B `U&'...'`/
 `UESCAPE`, both landed 2026-08-22). This round only — see "Follow-on slices"
 below for the rest of the `regexp_*` bucket (~815 of 1804 remaining diff
@@ -119,3 +120,58 @@ PG oracle for all rounds: `postgres/src/backend/utils/adt/regexp.c`
 (`regexp_count`/`regexp_like`/`regexp_instr`/`regexp_substr`/`regexp_replace`/
 `regexp_matches`/`regexp_split_to_array`/`regexp_split_to_table`,
 `parse_re_flags`).
+
+## Round D (landed 2026-08-22): `regexp_split_to_table` FROM-clause SRF wiring
+
+`regexp_split_to_table(...)` was catalog-visible (`pg_proc` OIDs 2765/2766,
+`RetSet: true`) but completely unwired as a table-valued function: any
+`FROM regexp_split_to_table(...)` fell through `planTableFuncRangeVar`
+(`internal/optimizer/planner.go`) into the generic user-routine lookup and
+raised `0A000 "table-valued function \"regexp_split_to_table\" not
+supported"`.
+
+Fix mirrors the existing `regexp_matches` FROM-clause SRF wiring end to end,
+with three deliberate divergences (split returns plain `text` rows not
+`text[]`; default column alias is `"regexp_split_to_table"`; and — since PG's
+`regexp_split_to_table`/`regexp_split_to_array` share `setup_regexp_matches`
+and are both stricter than `regexp_matches` — an invalid pattern raises
+`2201B` rather than `evalRegexpMatchesSRF`'s permissive empty-rows behavior):
+
+- `internal/optimizer/plan.go` — new `FromRegexpSplitToTable` plan node
+  (same `StringExpr`/`PatternExpr`/`FlagsExpr` shape as `FromRegexpMatches`,
+  `text`-typed single output column).
+- `internal/optimizer/planner.go` — dispatch branch in
+  `planTableFuncRangeVar` + new `planFromRegexpSplitToTable` (arg validation,
+  lateral-aware resolution, `WITH ORDINALITY` wrapping — all mirrored from
+  `planFromRegexpMatches`).
+- `internal/executor/executor.go` — dispatch case for
+  `*optimizer.FromRegexpSplitToTable`.
+- `internal/executor/operators_from_regexp_split_to_table.go` (new) —
+  `fromRegexpSplitToTableOp`, mirrors `fromRegexpMatchesOp`'s
+  Open/Next/Close skeleton.
+- `internal/executor/expr.go` — new `evalRegexpSplitToTable`: reuses the
+  shared `pgRegexFlagsToGoModifiers` (Round C), rejects explicit `'g'` with
+  `22023` (message parameterized as `regexp_split_to_table()`, not copy-pasted
+  from the `regexp_split_to_array()` sibling), raises `2201B` on invalid
+  pattern, splits via `re.Split(s, -1)` (same algorithm the existing scalar
+  `regexp_split_to_array` case already uses — PG's `build_regexp_split_result`
+  confirms N matches -> N+1 rows, the same semantics).
+
+New test: `internal/executor/from_regexp_split_to_table_test.go`
+(`TestFromRegexpSplitToTable`), mirroring
+`from_regexp_matches_test.go`'s `TestFromRegexpMatches` structure.
+
+PG-regress verification: `strings.sql`'s
+`regexp_split_to_table('the quick brown fox jumps over the lazy dog',
+$re$\s+$re$)` case is now byte-identical context in
+`tmp/regress-diffs/strings.diff` (zero `+`/`-` markers) — this function's
+diff contribution is fully closed. `strings.sql` overall stays `failed`
+(unrelated pre-existing gaps: `standard_conforming_strings=off` lexing,
+`chr(0)`, bytea trim/LIKE, `char(N)` literal concat syntax — see ledger).
+
+Deferred (not this round): `string_to_table` — same table-valued-SRF shape,
+literal-delimiter instead of regex; natural next follow-on using the same
+wiring pattern. Also unexplored: `SELECT regexp_split_to_table(...)` in
+SELECT-list (non-FROM) position — the `strings.sql` fixture only exercises
+the FROM-clause form, so no evidence either way that SELECT-list position is
+broken or fixed by this round.

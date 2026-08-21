@@ -4639,6 +4639,9 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	if strings.EqualFold(tf.Name, "regexp_matches") {
 		return planFromRegexpMatches(rv, sourceIdx, lateralCtx)
 	}
+	if strings.EqualFold(tf.Name, "regexp_split_to_table") {
+		return planFromRegexpSplitToTable(rv, sourceIdx, lateralCtx)
+	}
 	if strings.EqualFold(tf.Name, "generate_subscripts") {
 		return planGenerateSubscripts(rv, sourceIdx, lateralCtx)
 	}
@@ -5176,6 +5179,70 @@ func planFromRegexpMatches(rv parser.RangeVar, sourceIdx int16, lateralCtx *reso
 	tbl := &catalog.Table{Name: alias, Columns: []catalog.Column{{Name: colName, Type: colType, Ordinal: 0}}}
 	schema := Schema{SchemaColumn{Name: colName, Type: colType, SourceTableIdx: sourceIdx}}
 	node := &FromRegexpMatches{pos: tf.Pos(), StringExpr: stringExpr, PatternExpr: patternExpr, FlagsExpr: flagsExpr, schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	if tf.WithOrdinality {
+		node2, b2 := wrapOrdinality(node, b, rv, sourceIdx)
+		return node2, b2, nil
+	}
+	return node, b, nil
+}
+
+// planFromRegexpSplitToTable plans FROM regexp_split_to_table(string,
+// pattern[, flags]) [AS alias(col)] [WITH ORDINALITY]. Produces a single
+// text output column (default name "regexp_split_to_table", the same
+// default PG uses); N matches always produce N+1 rows (the 'g' flag is
+// rejected, then glob=true is forced internally — split always finds ALL
+// matches). Mirrors planFromRegexpMatches. M0134-0070 Round D.
+func planFromRegexpSplitToTable(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	if len(tf.Args) < 2 || len(tf.Args) > 3 {
+		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "42883",
+			Message: "regexp_split_to_table requires 2 or 3 arguments"}
+	}
+	// Build arg context: lateral siblings + outer-scope parent chain, mirrors
+	// planFromRegexpMatches so a correlated pattern/string argument resolves
+	// up the lexical scope.
+	ctx := &resolveContext{parent: planParent}
+	if lateralCtx != nil {
+		if lateralCtx.parent == nil {
+			cp := *lateralCtx
+			cp.parent = planParent
+			ctx = &cp
+		} else {
+			ctx = lateralCtx
+		}
+	}
+	stringExpr, err := resolveExpr(tf.Args[0], ctx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	patternExpr, err := resolveExpr(tf.Args[1], ctx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	var flagsExpr Expr
+	if len(tf.Args) == 3 {
+		flagsExpr, err = resolveExpr(tf.Args[2], ctx)
+		if err != nil {
+			return nil, rangeBinding{}, err
+		}
+	}
+	alias := rv.Alias
+	if alias == "" {
+		alias = "regexp_split_to_table"
+	}
+	colAliases := rv.Columns
+	if tf.WithOrdinality && len(colAliases) > 0 {
+		colAliases = colAliases[:len(colAliases)-1]
+	}
+	colName := alias
+	if len(colAliases) > 0 {
+		colName = colAliases[0]
+	}
+	colType := catalog.Type{Name: "text"}
+	tbl := &catalog.Table{Name: alias, Columns: []catalog.Column{{Name: colName, Type: colType, Ordinal: 0}}}
+	schema := Schema{SchemaColumn{Name: colName, Type: colType, SourceTableIdx: sourceIdx}}
+	node := &FromRegexpSplitToTable{pos: tf.Pos(), StringExpr: stringExpr, PatternExpr: patternExpr, FlagsExpr: flagsExpr, schema: schema}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	if tf.WithOrdinality {
 		node2, b2 := wrapOrdinality(node, b, rv, sourceIdx)

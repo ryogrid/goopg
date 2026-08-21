@@ -1833,6 +1833,25 @@ type FromRegexpMatches struct {
 func (n *FromRegexpMatches) Pos() int       { return n.pos }
 func (n *FromRegexpMatches) Output() Schema { return n.schema }
 
+// FromRegexpSplitToTable is the FROM-clause SRF plan node for
+// FROM regexp_split_to_table(string, pattern[, flags]). Unlike
+// FromRegexpMatches, output is a single plain text column (one row per
+// substring produced by splitting on the pattern) — mirrors PG's
+// regexp_split_to_table / build_regexp_split_result. N matches produce N+1
+// rows, always (the 'g' flag is rejected up front, then glob=true is forced
+// internally per postgres/src/backend/utils/adt/regexp.c:1748-1797). M0134-0070
+// Round D.
+type FromRegexpSplitToTable struct {
+	pos         int
+	StringExpr  Expr
+	PatternExpr Expr
+	FlagsExpr   Expr // nil when not given
+	schema      Schema
+}
+
+func (n *FromRegexpSplitToTable) Pos() int       { return n.pos }
+func (n *FromRegexpSplitToTable) Output() Schema { return n.schema }
+
 // VerifyHeapam is the FROM-clause SRF plan node for amcheck's
 // verify_heapam(regclass, ...) — slice S3 of docs/design/0110-0008. It carries
 // the relation argument plus the optional startblock / endblock block-range
