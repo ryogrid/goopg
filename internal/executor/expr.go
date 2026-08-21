@@ -11863,6 +11863,19 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
+			// PG: postgres/src/backend/utils/adt/oracle_compat.c:638-703
+			// (dobyteatrim / byteatrim) — bytea input trims by byte-set
+			// membership, not rune semantics, and must stay tagged KindBytes.
+			if s.Kind == KindBytes {
+				cutset := []byte(" ")
+				if len(x.Args) >= 2 {
+					c, err := evalExpr(x.Args[1], row, ctx)
+					if err == nil && !c.IsNull() {
+						cutset = c.BytesValue()
+					}
+				}
+				return NewBytesDatum(bytes.Trim(s.BytesValue(), string(cutset))), nil
+			}
 			cutset := " "
 			if len(x.Args) >= 2 {
 				c, err := evalExpr(x.Args[1], row, ctx)
@@ -11878,6 +11891,18 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
+			// PG: postgres/src/backend/utils/adt/oracle_compat.c:638-703
+			// (dobyteatrim / bytealtrim) — same byte-set semantics as btrim.
+			if s.Kind == KindBytes {
+				cutset := []byte(" ")
+				if len(x.Args) >= 2 {
+					c, err := evalExpr(x.Args[1], row, ctx)
+					if err == nil && !c.IsNull() {
+						cutset = c.BytesValue()
+					}
+				}
+				return NewBytesDatum(bytes.TrimLeft(s.BytesValue(), string(cutset))), nil
+			}
 			cutset := " "
 			if len(x.Args) >= 2 {
 				c, err := evalExpr(x.Args[1], row, ctx)
@@ -11892,6 +11917,18 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			s, err := evalExpr(x.Args[0], row, ctx)
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
+			}
+			// PG: postgres/src/backend/utils/adt/oracle_compat.c:638-703
+			// (dobyteatrim / byteartrim) — same byte-set semantics as btrim.
+			if s.Kind == KindBytes {
+				cutset := []byte(" ")
+				if len(x.Args) >= 2 {
+					c, err := evalExpr(x.Args[1], row, ctx)
+					if err == nil && !c.IsNull() {
+						cutset = c.BytesValue()
+					}
+				}
+				return NewBytesDatum(bytes.TrimRight(s.BytesValue(), string(cutset))), nil
 			}
 			cutset := " "
 			if len(x.Args) >= 2 {
@@ -12124,6 +12161,14 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			n, err := evalExpr(x.Args[0], row, ctx)
 			if err != nil || n.IsNull() {
 				return NullDatum, nil
+			}
+			// PG: postgres/src/backend/utils/adt/oracle_compat.c:1030-1047 (chr)
+			// — reject non-positive/zero codepoints with PG's exact SQLSTATEs.
+			if n.Int < 0 {
+				return Datum{}, &ExecError{Code: "22023", Message: "character number must be positive"}
+			}
+			if n.Int == 0 {
+				return Datum{}, &ExecError{Code: "54000", Message: "null character not permitted"}
 			}
 			return NewStringDatum(string(rune(n.Int))), nil
 		}

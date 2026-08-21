@@ -12550,6 +12550,17 @@ func exprType(e Expr) catalog.Type {
 				return catalog.Type{Name: "bytea"}
 			}
 			return catalog.Type{Name: "text"}
+		case "btrim", "ltrim", "rtrim":
+			// byteatrim/bytealtrim/byteartrim (oracle_compat.c) vs the text
+			// overloads: same argument-typed dispatch as substr/substring and
+			// overlay above — the executor keys off the first argument's
+			// Kind, so the advertised type must match or the wire layer
+			// renders a raw (unescaped) byte slice instead of `\x…`/escape
+			// form and truncates at an embedded 0x00. M0134-0070.
+			if len(x.Args) > 0 && strings.EqualFold(exprType(x.Args[0]).Name, "bytea") {
+				return catalog.Type{Name: "bytea"}
+			}
+			return catalog.Type{Name: "text"}
 		case "decode":
 			// decode(text, format) -> bytea (encode.c). Untyped before
 			// M0125-0021, so `SELECT decode('aabb','hex')` reached the wire as
