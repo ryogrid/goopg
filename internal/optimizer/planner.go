@@ -12567,6 +12567,15 @@ func exprType(e Expr) catalog.Type {
 			"cardinality", "strpos", "position":
 			// String/array length functions return int4. M0097-0003.
 			return catalog.Type{Name: "int4"}
+			case "regexp_instr", "regexp_count":
+				// pg_proc.dat oids 6254-6262: both prorettype int4. M0134-0070.
+				return catalog.Type{Name: "int4"}
+			case "regexp_like":
+				// pg_proc.dat oids 6263-6264: prorettype bool. M0134-0070.
+				return catalog.Type{Name: "bool"}
+			case "regexp_substr":
+				// pg_proc.dat oids 6265-6269: prorettype text. M0134-0070.
+				return catalog.Type{Name: "text"}
 		case "array_agg":
 			// array_agg(expr) returns the element type with [] suffix. M0097-0035.
 			if len(x.Args) > 0 {

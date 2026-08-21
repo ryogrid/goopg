@@ -7394,6 +7394,150 @@ func pgRegexFlagsToGoModifiers(flags string) (goFlags string, global bool, err e
 	return b.String(), global, nil
 }
 
+// regexpLocalDotMatchesNewline computes PG's REG_NEWLINE-derived
+// dot-matches-newline behavior LOCALLY for the four M0134-0070 Round E
+// functions (regexp_count/like/instr/substr) only — it does NOT change
+// pgRegexFlagsToGoModifiers's own return value (that function's "'s' is a
+// no-op" contract is pinned by TestPgRegexFlagsToGoModifiers and shared by
+// every other regexp_* call site, out of this slice's scope).
+// postgres/src/backend/utils/adt/regexp.c:385-449 parse_re_flags: cflags
+// default to REG_ADVANCED only (REG_NEWLINE unset), meaning PG's *default*
+// (and explicit 's', "single line, \n ordinary") behavior is that `.`
+// (and `[^...]`) DO match a newline; 'n'/'m' (REG_NEWLINE) and 'p'
+// (REG_NLSTOP only) make `.` stop at a newline; 'w' (REG_NLANCH only)
+// leaves `.` newline-matching but is otherwise handled by the shared
+// (?m) ^/$ anchoring pgRegexFlagsToGoModifiers already applies. Go's RE2
+// requires an explicit (?s) for `.` to match \n (its default is the
+// opposite of PG's), so this reports whether that group must be added.
+func regexpLocalDotMatchesNewline(flags string) bool {
+	dotStops := false
+	for _, r := range flags {
+		switch r {
+		case 'n', 'm', 'p':
+			dotStops = true
+		case 's':
+			dotStops = false
+		}
+	}
+	return !dotStops
+}
+
+// regexpApplyExpandedWhitespace implements the 'x' ("expanded"/free-spacing,
+// REG_EXPANDED) PG regex flag (postgres/src/backend/utils/adt/regexp.c:439
+// parse_re_flags) for the four M0134-0070 Round E functions: when 'x' is
+// present, unescaped whitespace and '#'-to-end-of-line comments in the
+// pattern are insignificant. Go's RE2 has no REG_EXPANDED equivalent, so
+// this strips them from the pattern text before compiling — a
+// simplification of PG's actual ARE tokenizer (e.g. it does not exempt
+// bracket expressions), sufficient for the strings.sql fixture this slice
+// targets.
+func regexpApplyExpandedWhitespace(pattern, flags string) string {
+	if !strings.ContainsRune(flags, 'x') {
+		return pattern
+	}
+	var b strings.Builder
+	inComment := false
+	for i := 0; i < len(pattern); i++ {
+		c := pattern[i]
+		if inComment {
+			if c == '\n' {
+				inComment = false
+				b.WriteByte(c)
+			}
+			continue
+		}
+		if c == '\\' && i+1 < len(pattern) {
+			b.WriteByte(c)
+			b.WriteByte(pattern[i+1])
+			i++
+			continue
+		}
+		if c == '#' {
+			inComment = true
+			continue
+		}
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			continue
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
+// regexpCompilePattern compiles a PG regexp_* pattern for the four
+// M0134-0070 Round E functions, combining the shared pgRegexFlagsToGoModifiers
+// output (goFlags — 'i'/(?i), 'm'/'n'/'p'/'w'/(?m)) with the LOCAL
+// dot-matches-newline and expanded-whitespace handling above (both scoped to
+// this slice's four call sites; see regexpLocalDotMatchesNewline's comment
+// for why they aren't folded into the shared translator).
+func regexpCompilePattern(pattern, flags, goFlags string) (*regexp.Regexp, error) {
+	pattern = regexpApplyExpandedWhitespace(pattern, flags)
+	pattern = pgPatternToGoRE2(pattern)
+	prefix := goFlags
+	if regexpLocalDotMatchesNewline(flags) {
+		prefix = "(?s)" + prefix
+	}
+	return regexp.Compile(prefix + pattern)
+}
+
+// regexpInstrSubstrLocate implements the shared match-and-select core of
+// regexp_instr() and regexp_substr() (postgres/src/backend/utils/adt/regexp.c
+// :1198,1904 — near-identical start_search/n-th-match/subexpr selection,
+// consolidated here so the two "pos" computations can't drift apart,
+// M0134-0070 Round E). `start` is the 1-based char position to begin
+// searching from; the search window is `s` sliced from that rune offset
+// (mirrors evalSubstr's rune-window arithmetic — a documented simplification
+// vs. PG's true start_search-offset-into-the-original-string approach: a
+// `^`-anchored pattern would re-anchor at the window start here rather than
+// the true string start). `n` selects the n-th non-overlapping match
+// (1-based); `subexpr` selects a capture group within that match (0 = whole
+// match). Returns ok=false — NOT an error — when n exceeds the match count,
+// subexpr exceeds the pattern's capture-group count, or the selected group
+// didn't participate in the match (regexp.c:1267-1273,1965-1971 "return
+// 0/NULL" cases). so/eo are BYTE offsets into `window` (valid substring
+// boundaries since match positions always land on rune boundaries for valid
+// UTF-8 input).
+func regexpInstrSubstrLocate(s, pattern, flags, goFlags string, start, n, subexpr int) (window string, so, eo int, ok bool, err error) {
+	runes := []rune(s)
+	winStart := start - 1
+	if winStart > len(runes) {
+		winStart = len(runes)
+	}
+	window = string(runes[winStart:])
+	re, cerr := regexpCompilePattern(pattern, flags, goFlags)
+	if cerr != nil {
+		return "", 0, 0, false, &ExecError{Code: "2201B", Message: fmt.Sprintf("invalid regular expression: %v", cerr)}
+	}
+	npatterns := re.NumSubexp()
+	if subexpr > npatterns {
+		return window, 0, 0, false, nil
+	}
+	matches := re.FindAllStringSubmatchIndex(window, -1)
+	if n > len(matches) {
+		return window, 0, 0, false, nil
+	}
+	loc := matches[n-1]
+	idx := subexpr * 2
+	if idx+1 >= len(loc) {
+		return window, 0, 0, false, nil
+	}
+	so, eo = loc[idx], loc[idx+1]
+	if so < 0 || eo < 0 {
+		return window, 0, 0, false, nil
+	}
+	return window, so, eo, true, nil
+}
+
+// regexpWindowCharPos converts a BYTE offset within `window` (as returned by
+// regexpInstrSubstrLocate) to the 1-based char position within the ORIGINAL
+// string that regexp_instr() reports, given the same `start` used to build
+// the window — mirrors the byte→char idiom `case "strpos", "position"`
+// already uses (expr.go ~11774), extended to add back the (start-1) runes
+// the window skipped.
+func regexpWindowCharPos(window string, start, byteOff int) int {
+	return (start - 1) + len([]rune(window[:byteOff])) + 1
+}
+
 // evalRegexpMatchesSRF evaluates regexp_matches(string, pattern[, flags]) in
 // SELECT-list SRF position (see projectSetOp.openSelectSrfMode). Invalid
 // patterns / NULL string or pattern args yield zero rows rather than an
@@ -12957,6 +13101,312 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			parts := re.Split(strD.StringValue(), -1)
 			return NewStringDatum(formatTextArray(parts)), nil
+		}
+
+	case "regexp_count":
+		// regexp_count(string, pattern [, start [, flags]]) → int4
+		// postgres/src/backend/utils/adt/regexp.c:1138 regexp_count.
+		if len(x.Args) >= 2 && len(x.Args) <= 4 {
+			strD, e1 := evalExpr(x.Args[0], row, ctx)
+			patD, e2 := evalExpr(x.Args[1], row, ctx)
+			if e1 != nil {
+				return Datum{}, e1
+			}
+			if e2 != nil {
+				return Datum{}, e2
+			}
+			if strD.IsNull() || patD.IsNull() {
+				return NullDatum, nil
+			}
+			start := int64(1)
+			if len(x.Args) >= 3 {
+				d, e := evalExpr(x.Args[2], row, ctx)
+				if e != nil {
+					return Datum{}, e
+				}
+				if d.IsNull() {
+					return NullDatum, nil
+				}
+				start = d.Int
+				if start <= 0 {
+					return Datum{}, &ExecError{Code: "22023",
+						Message: fmt.Sprintf("invalid value for parameter %q: %d", "start", start)}
+				}
+			}
+			flags := ""
+			if len(x.Args) >= 4 {
+				d, e := evalExpr(x.Args[3], row, ctx)
+				if e != nil {
+					return Datum{}, e
+				}
+				if d.IsNull() {
+					return NullDatum, nil
+				}
+				flags = d.StringValue()
+			}
+			goFlags, global, ferr := pgRegexFlagsToGoModifiers(flags)
+			if ferr != nil {
+				return Datum{}, ferr
+			}
+			if global {
+				// regexp.c:1160-1166 — "User mustn't specify 'g'".
+				return Datum{}, &ExecError{Code: "22023",
+					Message: `regexp_count() does not support the "global" option`}
+			}
+			re, rerr := regexpCompilePattern(patD.StringValue(), flags, goFlags)
+			if rerr != nil {
+				return Datum{}, &ExecError{Code: "2201B", Message: fmt.Sprintf("invalid regular expression: %v", rerr)}
+			}
+			runes := []rune(strD.StringValue())
+			winStart := int(start) - 1
+			if winStart > len(runes) {
+				winStart = len(runes)
+			}
+			window := string(runes[winStart:])
+			matches := re.FindAllStringIndex(window, -1)
+			return Datum{Kind: KindInt, Int: int64(len(matches))}, nil
+		}
+
+	case "regexp_like":
+		// regexp_like(string, pattern [, flags]) → bool.
+		// postgres/src/backend/utils/adt/regexp.c:1329 regexp_like — direct
+		// compile+execute, no start/N, always searches from position 0.
+		if len(x.Args) >= 2 && len(x.Args) <= 3 {
+			strD, e1 := evalExpr(x.Args[0], row, ctx)
+			patD, e2 := evalExpr(x.Args[1], row, ctx)
+			if e1 != nil {
+				return Datum{}, e1
+			}
+			if e2 != nil {
+				return Datum{}, e2
+			}
+			if strD.IsNull() || patD.IsNull() {
+				return NullDatum, nil
+			}
+			flags := ""
+			if len(x.Args) >= 3 {
+				d, e := evalExpr(x.Args[2], row, ctx)
+				if e != nil {
+					return Datum{}, e
+				}
+				if d.IsNull() {
+					return NullDatum, nil
+				}
+				flags = d.StringValue()
+			}
+			goFlags, global, ferr := pgRegexFlagsToGoModifiers(flags)
+			if ferr != nil {
+				return Datum{}, ferr
+			}
+			if global {
+				return Datum{}, &ExecError{Code: "22023",
+					Message: `regexp_like() does not support the "global" option`}
+			}
+			re, rerr := regexpCompilePattern(patD.StringValue(), flags, goFlags)
+			if rerr != nil {
+				return Datum{}, &ExecError{Code: "2201B", Message: fmt.Sprintf("invalid regular expression: %v", rerr)}
+			}
+			return NewBoolDatum(re.MatchString(strD.StringValue())), nil
+		}
+
+	case "regexp_instr":
+		// regexp_instr(string, pattern [, start [, N [, endoption [, flags [, subexpr]]]]]) → int4
+		// postgres/src/backend/utils/adt/regexp.c:1198 regexp_instr.
+		if len(x.Args) >= 2 && len(x.Args) <= 7 {
+			strD, e1 := evalExpr(x.Args[0], row, ctx)
+			patD, e2 := evalExpr(x.Args[1], row, ctx)
+			if e1 != nil {
+				return Datum{}, e1
+			}
+			if e2 != nil {
+				return Datum{}, e2
+			}
+			if strD.IsNull() || patD.IsNull() {
+				return NullDatum, nil
+			}
+			start := int64(1)
+			if len(x.Args) >= 3 {
+				d, e := evalExpr(x.Args[2], row, ctx)
+				if e != nil {
+					return Datum{}, e
+				}
+				if d.IsNull() {
+					return NullDatum, nil
+				}
+				start = d.Int
+				if start <= 0 {
+					return Datum{}, &ExecError{Code: "22023",
+						Message: fmt.Sprintf("invalid value for parameter %q: %d", "start", start)}
+				}
+			}
+			n := int64(1)
+			if len(x.Args) >= 4 {
+				d, e := evalExpr(x.Args[3], row, ctx)
+				if e != nil {
+					return Datum{}, e
+				}
+				if d.IsNull() {
+					return NullDatum, nil
+				}
+				n = d.Int
+				if n <= 0 {
+					return Datum{}, &ExecError{Code: "22023",
+						Message: fmt.Sprintf("invalid value for parameter %q: %d", "n", n)}
+				}
+			}
+			endoption := int64(0)
+			if len(x.Args) >= 5 {
+				d, e := evalExpr(x.Args[4], row, ctx)
+				if e != nil {
+					return Datum{}, e
+				}
+				if d.IsNull() {
+					return NullDatum, nil
+				}
+				endoption = d.Int
+				if endoption != 0 && endoption != 1 {
+					return Datum{}, &ExecError{Code: "22023",
+						Message: fmt.Sprintf("invalid value for parameter %q: %d", "endoption", endoption)}
+				}
+			}
+			flags := ""
+			if len(x.Args) >= 6 {
+				d, e := evalExpr(x.Args[5], row, ctx)
+				if e != nil {
+					return Datum{}, e
+				}
+				if d.IsNull() {
+					return NullDatum, nil
+				}
+				flags = d.StringValue()
+			}
+			subexpr := int64(0)
+			if len(x.Args) >= 7 {
+				d, e := evalExpr(x.Args[6], row, ctx)
+				if e != nil {
+					return Datum{}, e
+				}
+				if d.IsNull() {
+					return NullDatum, nil
+				}
+				subexpr = d.Int
+				if subexpr < 0 {
+					return Datum{}, &ExecError{Code: "22023",
+						Message: fmt.Sprintf("invalid value for parameter %q: %d", "subexpr", subexpr)}
+				}
+			}
+			goFlags, global, ferr := pgRegexFlagsToGoModifiers(flags)
+			if ferr != nil {
+				return Datum{}, ferr
+			}
+			if global {
+				return Datum{}, &ExecError{Code: "22023",
+					Message: `regexp_instr() does not support the "global" option`}
+			}
+			window, so, eo, ok, merr := regexpInstrSubstrLocate(strD.StringValue(), patD.StringValue(), flags, goFlags, int(start), int(n), int(subexpr))
+			if merr != nil {
+				return Datum{}, merr
+			}
+			if !ok {
+				return Datum{Kind: KindInt, Int: 0}, nil
+			}
+			byteOff := so
+			if endoption == 1 {
+				byteOff = eo
+			}
+			return Datum{Kind: KindInt, Int: int64(regexpWindowCharPos(window, int(start), byteOff))}, nil
+		}
+
+	case "regexp_substr":
+		// regexp_substr(string, pattern [, start [, N [, flags [, subexpr]]]]) → text
+		// postgres/src/backend/utils/adt/regexp.c:1904 regexp_substr. Same
+		// start/N/subexpr validation as regexp_instr above, but flags/subexpr
+		// are ONE SLOT EARLIER (no endoption arg) — shares
+		// regexpInstrSubstrLocate so the two "pos" computations can't drift.
+		if len(x.Args) >= 2 && len(x.Args) <= 6 {
+			strD, e1 := evalExpr(x.Args[0], row, ctx)
+			patD, e2 := evalExpr(x.Args[1], row, ctx)
+			if e1 != nil {
+				return Datum{}, e1
+			}
+			if e2 != nil {
+				return Datum{}, e2
+			}
+			if strD.IsNull() || patD.IsNull() {
+				return NullDatum, nil
+			}
+			start := int64(1)
+			if len(x.Args) >= 3 {
+				d, e := evalExpr(x.Args[2], row, ctx)
+				if e != nil {
+					return Datum{}, e
+				}
+				if d.IsNull() {
+					return NullDatum, nil
+				}
+				start = d.Int
+				if start <= 0 {
+					return Datum{}, &ExecError{Code: "22023",
+						Message: fmt.Sprintf("invalid value for parameter %q: %d", "start", start)}
+				}
+			}
+			n := int64(1)
+			if len(x.Args) >= 4 {
+				d, e := evalExpr(x.Args[3], row, ctx)
+				if e != nil {
+					return Datum{}, e
+				}
+				if d.IsNull() {
+					return NullDatum, nil
+				}
+				n = d.Int
+				if n <= 0 {
+					return Datum{}, &ExecError{Code: "22023",
+						Message: fmt.Sprintf("invalid value for parameter %q: %d", "n", n)}
+				}
+			}
+			flags := ""
+			if len(x.Args) >= 5 {
+				d, e := evalExpr(x.Args[4], row, ctx)
+				if e != nil {
+					return Datum{}, e
+				}
+				if d.IsNull() {
+					return NullDatum, nil
+				}
+				flags = d.StringValue()
+			}
+			subexpr := int64(0)
+			if len(x.Args) >= 6 {
+				d, e := evalExpr(x.Args[5], row, ctx)
+				if e != nil {
+					return Datum{}, e
+				}
+				if d.IsNull() {
+					return NullDatum, nil
+				}
+				subexpr = d.Int
+				if subexpr < 0 {
+					return Datum{}, &ExecError{Code: "22023",
+						Message: fmt.Sprintf("invalid value for parameter %q: %d", "subexpr", subexpr)}
+				}
+			}
+			goFlags, global, ferr := pgRegexFlagsToGoModifiers(flags)
+			if ferr != nil {
+				return Datum{}, ferr
+			}
+			if global {
+				return Datum{}, &ExecError{Code: "22023",
+					Message: `regexp_substr() does not support the "global" option`}
+			}
+			window, so, eo, ok, merr := regexpInstrSubstrLocate(strD.StringValue(), patD.StringValue(), flags, goFlags, int(start), int(n), int(subexpr))
+			if merr != nil {
+				return Datum{}, merr
+			}
+			if !ok {
+				return NullDatum, nil
+			}
+			return NewStringDatum(window[so:eo]), nil
 		}
 
 	// ── Type conversion functions (M0097-0005) ────────────────────────────
