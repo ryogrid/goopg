@@ -1,64 +1,67 @@
-Task: M0134-0070 (strings.sql) — regress-sql `failed`. This loop fixed a
-higher-severity bug discovered while sizing 0070's remaining diff buckets:
-the DataRow empty-string-vs-NULL wire-encoding bug (unconditional under
-extended protocol, state-dependent under simple query). strings.sql itself
-still `failed` (2624-line diff pre-fix, not yet re-measured post-fix).
+Task: M0134-0070 (strings.sql) — regress-sql `failed`, still in progress.
+This loop landed the "string-literal continuation across newlines" bucket
+(one of many buckets sized in prior loops) and re-measured the diff.
 
-Files this loop: `internal/postmaster/dispatch.go` (SELECT result loop
-~3046, FETCH-from-cursor loop ~3813 — coerce nil post-render slice to
-`[]byte{}` when Datum non-null), `internal/postmaster/dispatch_extended.go`
-(Bind/Execute row builder ~521/525, same coercion), new test
-`internal/postmaster/datarow_empty_string_test.go` (4 cases). Also
+Files this loop: `internal/parser/lexer.go` (plain `'...'` branch in
+`next()` + `lexEscapeString` (`E'...'`) both now loop through new
+`tryQuoteContinuation()` lookahead — newline-tracking, mirrors
+`skipWhitespaceAndComments` — plus `scanPlainQuoteInto`/
+`scanEscapeQuoteInto` scan helpers), new test
+`internal/parser/string_continuation_test.go` (5 cases). Also
 `.ralph/fix_plan.md` (M0134-0070 entry) and `.ralph/deferral_ledger.md`
-(flipped the prior "discovered" row to `resolved`, appended a new row with
-full fix detail).
+(new row dated 2026-08-21, string-literal-continuation entry).
 
-Key symbols: the 4 DataRow-cell-building call sites above. `d.IsNull()`
-branches untouched (still emit literal `nil` for the true NULL sentinel).
-`internal/libpq/frame.go`'s `PutDataRowScratch`/`WriteDataRow` untouched
-(correct by contract — nil is NULL there).
+Key symbols: `tryQuoteContinuation()`, `scanPlainQuoteInto`,
+`scanEscapeQuoteInto` (all `internal/parser/lexer.go`).
 
-Hypothesis/Findings: root cause confirmed — Go's `nilSlice[0:0]` and
-`append(nil, ...zero bytes...)` both stay `nil`, indistinguishable from the
-NULL sentinel at the DataRow-cell layer. Extended protocol (Bind/Execute)
-was UNCONDITIONALLY broken (every empty non-null cell, every connection —
-affects any JDBC/psycopg-style prepared-statement client). Simple-query was
-broken only on the very first non-null-empty cell rendered onto a
-connection's still-nil scratch buffer. Researcher scanned
-`internal/postmaster/query.go`, `internal/backup/basebackup.go`,
-`internal/replication/walsender.go` for a 5th call site — those build rows
-from Go literals directly (not `Datum.AppendValueText`), likely unaffected,
-not exhaustively audited.
+Hypothesis/Findings: PG's continuation is a pure lexer-state-machine
+feature (`scan.l` `<xqs>` lookahead state) — resumes scanning the
+continuation fragment IN THE SAME decode-state as the opener, so an
+`E'...'`-opened literal's bare `'...'` continuation piece still gets
+backslash-escape decoding. Confirmed self-contained: no grammar/executor/
+planner touch needed, `TokenStringLit` stays a single atomic token
+downstream. `strings.sql` diff shrank 2624→2614 lines (small bucket, as
+sized). Remaining buckets are all REFACTOR-tier (missing builtins
+`unistr`/`bit_count`/`regexp_instr`/`regexp_substr` now drive the largest
+diff share; Unicode-escape/bit-string/hex-string literals; `POSITION`/
+`OVERLAY`/`LIKE ESCAPE`/`SIMILAR TO` grammar; `regexp_replace`
+backreferences; `regexp_matches(...,'g')` multi-match;
+`regexp_split_to_table`; bytea trim/overlay edge cases) — each is a new
+literal-quote-kind, new builtin-function family, or new grammar form, not
+a small contained slice.
 
-Next step: re-run `scripts/pg-regress-runner.sh --verbose strings` to get
-strings.sql's post-fix diff line count (several fixture lines depended on
-empty-string results, so it should shrink from 2624), then continue sizing
-M0134-0070's remaining buckets — start with the string-literal continuation
-gap (small/contained); REFACTOR-tier buckets (Unicode-escape literals,
-POSITION/OVERLAY/LIKE ESCAPE/SIMILAR TO grammar, regexp_count/like/instr/
-substr family, regexp_replace backreferences, regexp_matches 'g' flag,
-regexp_split_to_table) are multi-file and should be split into their own
-milestone-scale slices, not attempted in one round.
+Next step: pick ONE remaining M0134-0070 bucket and size/scope it as its
+own slice (or its own milestone-scale task if it turns out multi-file).
+Suggest starting with the missing-builtins family
+(`unistr`/`bit_count`/`crc32c`) since it's flagged as driving the largest
+remaining diff share and may be more contained than the regexp-family or
+grammar-form buckets — but re-verify sizing via `researcher` before
+committing to that choice, since the last several M0134-0070 rounds have
+each revealed the "next" bucket is bigger than expected. Alternatively,
+if M0134-0070 buckets are all now REFACTOR-tier/milestone-scale, consider
+whether to PARK 0070 (same pattern as 0069) and move to M0134-0071 next —
+weigh this against the fix_plan banner (M0134 next-priority-after-
+M-NIGHTLY) at the START of next loop.
 
 Gates run this loop: `go build ./...` PASS; `go test
-./internal/postmaster/... ./internal/libpq/...` PASS (implementer, 57.4s,
-no -count=1); `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
-PASS (tester, ~90s mostly cached); targeted `go test -v -run
-'TestSimpleQueryEmptyStringNotNull|...|TestExtendedProtocolRepeatEmptyNotNull'
-./internal/postmaster/` PASS (tester, all 4 new tests individually
-verified); manual live verification via cgroup-capped server + psql
-`\pset null`/`\bind` for both simple-query and extended-protocol paths
-(implementer, both blank not NULLMARKER; non-regression `SELECT 'x'; SELECT
-'';` still correct); `make ralph-state-guard` — same recurring stale
+./internal/parser/...` PASS (implementer, cached-fast); `RALPH_PRECOMMIT_
+SCOPE=units scripts/ralph-precommit-test.sh` PASS (tester); `scripts/pg-
+regress-runner.sh --verbose strings` run twice (pre- and post-fix
+sizing/verification, both via tester under cgroup cap) — FAIL as
+expected (0/1 PASS, case still open), diff 2624→2614 lines confirming the
+fix's narrow scope; `make ralph-state-guard` — same recurring stale
 completed-marker inconsistency as every prior loop, auto-repaired, then
-PASS; pre-commit pgbench smoke PASS (347-663-12160 TPS, 0 failed).
+PASS; pre-commit pgbench smoke PASS (359-666-12040 TPS, 0 failed).
 
-Delegation: researcher agent `ab295c97e6fcc0074` (1 round — reproduced the
-bug, isolated root cause to all 4 call sites, recommended fix shape);
-implementer agent `aa2082fd88aaaf813` (1 round — landed the fix + 4 tests +
-manual verification cleanly, no deviations, no 5th call site found); tester
-agent `a32ee0c1700278b63` (1 round — confirmed units + postmaster gates
-PASS).
+Delegation: tester agent `a45675493664587a3` (1 round — pre-fix
+strings.sql diff re-measurement, confirmed DataRow fix from last loop
+didn't move this file's diff); researcher agent `a379df97aeb84216f` (1
+round — cited PG oracle scan.l mechanism, confirmed goopg has no
+continuation handling, recommended lexer-internal implementation site);
+implementer agent `a3cdf2147f8cb686f` (1 round — landed the fix + 5 tests
+cleanly, one test-authoring correction noted in report, no scope
+deviation); tester agent `ad3c733a4d856f173` (1 round — precommit PASS +
+post-fix diff re-measurement, 2624→2614).
 
-In-flight: none. Commit `fd24fa33` pushed to `regress-renumbering`. No
+In-flight: none. Commit `dfc15b7f` pushed to `regress-renumbering`. No
 server left running.
