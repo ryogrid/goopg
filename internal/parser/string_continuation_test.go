@@ -73,11 +73,17 @@ func TestLexStringContinuationEscapeString(t *testing.T) {
 	}
 }
 
-// TestLexStringContinuationWithComments confirms line (--) and block (/* */)
-// comments between fragments, with a newline present somewhere in the gap,
-// still allow concatenation.
+// TestLexStringContinuationWithComments confirms that a `--` line comment
+// between fragments (with a newline present somewhere in the gap) allows
+// concatenation, but a `/* */` block comment in the gap does NOT — PG's
+// scan.l quotecontinue macro (lines ~215-225) only admits `--` comments;
+// `/* */` is a separate <xc> start-condition entirely absent from the gap
+// grammar, so any `/*` there must fail the continuation attempt (M0134-0070
+// regression fix: goopg previously treated a block comment in the gap as
+// skippable "gap" content and wrongly continued the literal).
 func TestLexStringContinuationWithComments(t *testing.T) {
 	// Line comment case: newline is inherent to terminating a -- comment.
+	// This must still SUCCEED (regression guard — do not change this part).
 	toks, err := Lex("SELECT 'a' -- comment\n'b';")
 	if err != nil {
 		t.Fatal(err)
@@ -89,20 +95,27 @@ func TestLexStringContinuationWithComments(t *testing.T) {
 		t.Fatalf("tok[1]=%+v want string 'ab'", toks[1])
 	}
 
-	// Block comment case containing a newline.
+	// Block comment case containing a newline: must NOT concatenate — the
+	// `/*` immediately fails the quotecontinue lookahead, so 'a' ends as its
+	// own token, the block comment is skipped as ordinary whitespace, and
+	// 'b' starts a new, separate string literal token.
 	toks, err = Lex("SELECT 'a' /* multi\nline */ 'b';")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(toks) != 4 {
-		t.Fatalf("got %d tokens, want 4: %+v", len(toks), toks)
+	if len(toks) != 5 {
+		t.Fatalf("got %d tokens, want 5: %+v", len(toks), toks)
 	}
-	if toks[1].Kind != TokenStringLit || toks[1].Value != "ab" {
-		t.Fatalf("tok[1]=%+v want string 'ab'", toks[1])
+	if toks[1].Kind != TokenStringLit || toks[1].Value != "a" {
+		t.Fatalf("tok[1]=%+v want string 'a'", toks[1])
+	}
+	if toks[2].Kind != TokenStringLit || toks[2].Value != "b" {
+		t.Fatalf("tok[2]=%+v want string 'b'", toks[2])
 	}
 
 	// Block comment on ONE line (no newline anywhere in the gap) must NOT
-	// concatenate.
+	// concatenate either (same failure mode, doubly so since there's no
+	// newline at all).
 	toks, err = Lex("SELECT 'a' /* comment */ 'b';")
 	if err != nil {
 		t.Fatal(err)
@@ -115,6 +128,60 @@ func TestLexStringContinuationWithComments(t *testing.T) {
 	}
 	if toks[2].Kind != TokenStringLit || toks[2].Value != "b" {
 		t.Fatalf("tok[2]=%+v want string 'b'", toks[2])
+	}
+}
+
+// TestLexStringContinuationBlockCommentBetweenFragmentsIsSyntaxError pins
+// the exact strings.sql regression case (M0134-0070): three fragments where
+// a block comment sits between the second and third. The first two
+// fragments (separated only by a newline) still concatenate; the block
+// comment then breaks the chain, so the third fragment starts a brand-new,
+// unrelated string literal token — which the SQL grammar rejects as a
+// syntax error (two adjacent string literals with no operator between them
+// in expression position).
+func TestLexStringContinuationBlockCommentBetweenFragmentsIsSyntaxError(t *testing.T) {
+	sql := "SELECT 'first line' ' - next line' /* comment */ ' - third line';"
+	toks, err := Lex(sql)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// select, 'first line', ' - next line', ' - third line', ;, EOF — no
+	// continuation anywhere here since the ' - next line' fragment is on the
+	// SAME line as 'first line' (no newline in that gap either), and the
+	// block comment gap before ' - third line' fails outright.
+	if len(toks) != 6 {
+		t.Fatalf("got %d tokens, want 6: %+v", len(toks), toks)
+	}
+	if toks[1].Kind != TokenStringLit || toks[1].Value != "first line" {
+		t.Fatalf("tok[1]=%+v want string 'first line'", toks[1])
+	}
+	if toks[2].Kind != TokenStringLit || toks[2].Value != " - next line" {
+		t.Fatalf("tok[2]=%+v want string ' - next line'", toks[2])
+	}
+	if toks[3].Kind != TokenStringLit || toks[3].Value != " - third line" {
+		t.Fatalf("tok[3]=%+v want string ' - third line'", toks[3])
+	}
+
+	if _, err := Parse(sql); err == nil {
+		t.Fatalf("expected a syntax error parsing two adjacent bare string literals, got none")
+	}
+}
+
+// TestBlockCommentAsOrdinaryWhitespaceUnaffected confirms a block comment
+// used as plain whitespace OUTSIDE a quote-continuation gap (i.e. before a
+// string literal token, not between two closing/opening quotes) still
+// parses fine — this path goes through skipWhitespaceAndComments, not
+// tryQuoteContinuation, and must be untouched by this fix.
+func TestBlockCommentAsOrdinaryWhitespaceUnaffected(t *testing.T) {
+	toks, err := Lex("SELECT /* c */ 'a';")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(toks) != 4 {
+		t.Fatalf("got %d tokens, want 4: %+v", len(toks), toks)
+	}
+	if toks[1].Kind != TokenStringLit || toks[1].Value != "a" {
+		t.Fatalf("tok[1]=%+v want string 'a'", toks[1])
 	}
 }
 

@@ -127,13 +127,18 @@ func (l *lexer) scanPlainQuoteInto(b *strings.Builder) (bool, error) {
 // tryQuoteContinuation implements PG scan.l's <xqs> lookahead state
 // (lines 574-631, quotecontinue/quotecontinuefail macros at lines 224-239):
 // after a string literal's closing quote, look ahead past whitespace and
-// comments. If that gap contains at least one newline AND the next
-// non-whitespace character is a `'`, this is a continuation — consume the
-// gap and the reopening quote (so the caller can resume scanning the next
-// fragment into the same buffer) and return true. Otherwise restore l.pos
-// to where it was on entry (mirrors yyless(0)) and return false, leaving
-// the token to be emitted as-is. Same-line adjacent literals (`'a' 'b'`,
-// no newline in the gap) deliberately do NOT concatenate.
+// `--` line comments only — block comments (`/* */`) are NOT part of the
+// quotecontinue gap in upstream (scan.l's `comment`/`non_newline_whitespace`
+// macros around lines 215-225 only cover `--` comments; `/* */` is a
+// separate <xc> start-condition), so a `/*` in the gap must fall through to
+// the default case below and fail the continuation attempt. If the gap
+// contains at least one newline AND the next non-whitespace character is a
+// `'`, this is a continuation — consume the gap and the reopening quote (so
+// the caller can resume scanning the next fragment into the same buffer)
+// and return true. Otherwise restore l.pos to where it was on entry
+// (mirrors yyless(0)) and return false, leaving the token to be emitted
+// as-is. Same-line adjacent literals (`'a' 'b'`, no newline in the gap)
+// deliberately do NOT concatenate.
 func (l *lexer) tryQuoteContinuation() (bool, error) {
 	save := l.pos
 	sawNewline := false
@@ -151,31 +156,6 @@ scan:
 			// newline that ends it is picked up on the next loop iteration.
 			for l.pos < len(l.src) && l.src[l.pos] != '\n' {
 				l.pos++
-			}
-		case c == '/' && l.peekAt(1) == '*':
-			// Block comment, nestable per upstream; a newline anywhere
-			// inside it counts toward quotecontinue.
-			cstart := l.pos
-			depth := 0
-			for l.pos < len(l.src) {
-				if l.src[l.pos] == '\n' {
-					sawNewline = true
-				}
-				if l.src[l.pos] == '/' && l.peekAt(1) == '*' {
-					depth++
-					l.pos += 2
-				} else if l.src[l.pos] == '*' && l.peekAt(1) == '/' {
-					depth--
-					l.pos += 2
-					if depth == 0 {
-						break
-					}
-				} else {
-					l.pos++
-				}
-			}
-			if depth != 0 {
-				return false, l.errf(cstart, "unterminated block comment")
 			}
 		default:
 			break scan
