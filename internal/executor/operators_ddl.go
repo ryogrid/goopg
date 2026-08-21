@@ -18883,6 +18883,25 @@ func (o *ddlOp) validateSeqOwnedBy(pos int, seqName, ownedBy string) error {
 		}
 	}
 	if !ok {
+		// Not a table/view — check whether it names an index instead, which
+		// PG rejects with 42809 (ERRCODE_WRONG_OBJECT_TYPE) rather than the
+		// generic "does not exist". postgres/src/backend/commands/sequence.c:1629-1638
+		// (process_owned_by), errdetail_relkind_not_supported (pg_class.c:24-52).
+		_, idxOk := o.ctx.Catalog.LookupIndex(parser.ObjectName{Name: tblPart}, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+		if !idxOk {
+			schemaDot := strings.Index(tblPart, ".")
+			if schemaDot >= 0 {
+				_, idxOk = o.ctx.Catalog.LookupIndex(parser.ObjectName{
+					Schema: tblPart[:schemaDot],
+					Name:   tblPart[schemaDot+1:],
+				}, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+			}
+		}
+		if idxOk {
+			return &ExecError{Code: "42809", Pos: pos,
+				Message: fmt.Sprintf("sequence cannot be owned by relation %q", tblPart),
+				Detail:  "This operation is not supported for indexes."}
+		}
 		return &ExecError{Code: "42P01", Pos: pos,
 			Message: fmt.Sprintf("sequence cannot be owned by relation %q", tblPart)}
 	}

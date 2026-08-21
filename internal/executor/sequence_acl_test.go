@@ -424,3 +424,37 @@ func TestAlterSequenceRequiresOwnership(t *testing.T) {
 		t.Fatalf("ALTER SEQUENCE as superuser: unexpected error: %v", err)
 	}
 }
+
+// TestValidateSeqOwnedByIndexTarget pins the index-relkind branch of
+// validateSeqOwnedBy: naming an index (rather than a table/view) in OWNED BY
+// must return 42809 (ERRCODE_WRONG_OBJECT_TYPE) with the PG-faithful DETAIL,
+// not the generic 42P01 "does not exist" that a plain LookupTable miss
+// produces. PG oracle: postgres/src/backend/commands/sequence.c:1629-1638
+// (process_owned_by), errdetail_relkind_not_supported (pg_class.c:24-52).
+// M0134-0069 bucket 6 item 4.
+func TestValidateSeqOwnedByIndexTarget(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE seq_owned_idx_tbl (id int)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE INDEX seq_owned_idx ON seq_owned_idx_tbl (id)"); err != nil {
+		t.Fatalf("create index: %v", err)
+	}
+
+	err := runDDL(t, ctx, "CREATE SEQUENCE seq_owned_idx_seq OWNED BY seq_owned_idx.id")
+	if err == nil {
+		t.Fatal("expected 42809, got nil")
+	}
+	ee := mustExecErr(t, err)
+	if ee.Code != "42809" {
+		t.Fatalf("expected 42809, got %s (%v)", ee.Code, ee)
+	}
+	if want := `sequence cannot be owned by relation "seq_owned_idx"`; ee.Message != want {
+		t.Fatalf("expected message %q, got %q", want, ee.Message)
+	}
+	if want := "This operation is not supported for indexes."; ee.Detail != want {
+		t.Fatalf("expected detail %q, got %q", want, ee.Detail)
+	}
+}
