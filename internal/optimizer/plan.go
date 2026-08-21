@@ -582,6 +582,9 @@ type FuncCall struct {
 	Star       bool
 	Variadic   bool   // true when args were expanded from VARIADIC array syntax
 	ReturnType string // return type for user-defined functions; empty for unknown
+	// ArgWidth is the resolved overload width for width-sensitive builtins
+	// such as to_hex; empty means default int4.
+	ArgWidth string
 }
 
 func (e *FuncCall) Pos() int { return e.pos }

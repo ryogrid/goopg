@@ -13684,12 +13684,22 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return newNumeric(m, int(sc)), nil
 		}
 	case "to_hex":
+		// to_hex32/to_hex64 zero-extend the argument's two's-complement bit
+		// pattern rather than sign-formatting it (PG oracle:
+		// postgres/src/backend/utils/adt/varlena.c:5254-5267). ArgWidth is
+		// stamped at plan time (see resolveExpr's to_hex intercept in
+		// internal/optimizer/planner.go); default/empty ArgWidth uses the
+		// uint32 (int4 overload) path, which is also correct for all
+		// positive-value cases since %x does not zero-pad.
 		if len(x.Args) == 1 {
 			v, err := evalExpr(x.Args[0], row, ctx)
 			if err != nil || v.IsNull() {
 				return NullDatum, nil
 			}
-			return NewStringDatum(fmt.Sprintf("%x", v.Int)), nil
+			if x.ArgWidth == "int8" {
+				return NewStringDatum(fmt.Sprintf("%x", uint64(v.Int))), nil
+			}
+			return NewStringDatum(fmt.Sprintf("%x", uint32(v.Int))), nil
 		}
 	case "encode":
 		// encode(bytea, format) -> text. Formats: base64, escape, hex

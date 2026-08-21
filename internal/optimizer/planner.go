@@ -12571,6 +12571,9 @@ func exprType(e Expr) catalog.Type {
 				return catalog.Type{Name: "bytea"}
 			}
 			return catalog.Type{Name: "text"}
+		case "to_hex":
+			// to_hex(int) -> text (varlena.c to_hex32/to_hex64). M0134-0070.
+			return catalog.Type{Name: "text"}
 		case "decode":
 			// decode(text, format) -> bytea (encode.c). Untyped before
 			// M0125-0021, so `SELECT decode('aabb','hex')` reached the wire as
@@ -13546,6 +13549,43 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 				return nil, perr
 			}
 			return &FuncCall{pos: x.Pos(), Name: "pg_collation_for", Args: []Expr{result}}, nil
+		}
+		// to_hex(int): PG dispatches to distinct to_hex32/to_hex64 overloads
+		// (varlena.c:5254-5267) whose two's-complement zero-extension width
+		// differs for negative arguments. Resolve the arg's static type here
+		// (plan time) and stamp the chosen width onto ArgWidth so the
+		// executor can pick uint32 vs uint64 zero-extension. Bare integer
+		// literals default to the int4/8-hex-char overload, mirroring the
+		// generate_series literal carve-out above: exprType always types an
+		// untyped integer literal as int8, which would otherwise
+		// mis-resolve to_hex(-1234) (no cast) into the int8/16-hex path.
+		if strings.EqualFold(x.Name.String(), "to_hex") && len(x.Args) == 1 {
+			resolvedArg, err := resolveExpr(x.Args[0], ctx)
+			if err != nil {
+				return nil, err
+			}
+			at := exprType(resolvedArg).Name
+			isLit := false
+			if _, ok := resolvedArg.(*IntegerConst); ok {
+				isLit = true
+			} else if negArg, ok := resolvedArg.(*UnaryOp); ok && negArg.Op == parser.OpUnaryNeg {
+				// Negation of a bare literal (e.g. `-1234`) is still an untyped
+				// literal in PG's typing rules — parse analysis folds unary
+				// minus over a numeric constant rather than typing it via the
+				// int8 default. Without unwrapping this, `to_hex(-1234)`
+				// (Op=OpUnaryNeg wrapping IntegerConst) would fall through to
+				// the int8/16-hex-char path instead of int4/8-hex-char.
+				if _, ok := negArg.Operand.(*IntegerConst); ok {
+					isLit = true
+				}
+			}
+			width := "int4"
+			if !isLit {
+				if strings.EqualFold(at, "int8") || strings.EqualFold(at, "bigint") {
+					width = "int8"
+				}
+			}
+			return &FuncCall{pos: x.Pos(), Name: "to_hex", Args: []Expr{resolvedArg}, ArgWidth: width}, nil
 		}
 		args := make([]Expr, 0, len(x.Args))
 		for _, a := range x.Args {
