@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/goopg/goopg/internal/utils/adt/similarto"
 )
 
 // parseValuesStmt parses a bare VALUES (row1), (row2), ... statement.
@@ -2062,6 +2064,57 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				left = &BinaryOp{pos: pos, Op: OpNotILike, Left: left, Right: rhs}
 				continue
 			}
+			// `expr SIMILAR TO pattern [ESCAPE escape_expr]` and its NOT
+			// variant. PG oracle: postgres/src/backend/parser/gram.y:15080-
+			// 15115 desugars this to `x ~ similar_to_escape(pattern[,
+			// escape])` / `x !~ similar_to_escape(...)` — real PG's planner
+			// constant-folds that function call away when its arguments are
+			// literals, so `EXPLAIN` shows the plain `~`/`!~` BinaryOp with a
+			// pre-converted POSIX pattern. goopg mirrors that by performing
+			// the conversion here, at parse time, via buildSimilarTo.
+			// M0134-0070.
+			if t := p.cur(); t.Kind == TokenKeyword && t.Keyword == KwSimilar &&
+				p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwTo {
+				pos := t.Pos
+				p.advance() // SIMILAR
+				p.advance() // TO
+				rhs, err := p.parseExprPrec(precCompare + 1)
+				if err != nil {
+					return nil, err
+				}
+				escExpr, err := p.parseOptionalEscape()
+				if err != nil {
+					return nil, err
+				}
+				newLeft, err := p.buildSimilarTo(left, rhs, escExpr, pos, false)
+				if err != nil {
+					return nil, err
+				}
+				left = newLeft
+				continue
+			}
+			if t := p.cur(); t.Kind == TokenKeyword && t.Keyword == KwNot &&
+				p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwSimilar &&
+				p.peek(2).Kind == TokenKeyword && p.peek(2).Keyword == KwTo {
+				pos := t.Pos
+				p.advance() // NOT
+				p.advance() // SIMILAR
+				p.advance() // TO
+				rhs, err := p.parseExprPrec(precCompare + 1)
+				if err != nil {
+					return nil, err
+				}
+				escExpr, err := p.parseOptionalEscape()
+				if err != nil {
+					return nil, err
+				}
+				newLeft, err := p.buildSimilarTo(left, rhs, escExpr, pos, true)
+				if err != nil {
+					return nil, err
+				}
+				left = newLeft
+				continue
+			}
 			// POSIX regex operators: ~ ~* !~ !~* (M0097-0011).
 			if t := p.cur(); t.Kind == TokenOperator {
 				var op OpCode
@@ -3826,6 +3879,92 @@ func (p *parser) wrapLikeEscape(rhs Expr) (Expr, error) {
 		return &LikeEscapePattern{pos: pos, Pattern: rhs, Escape: escExpr}, nil
 	}
 	return rhs, nil
+}
+
+// parseOptionalEscape consumes a trailing `ESCAPE escape_expr` clause if
+// present (same comparison-precedence level as the preceding pattern
+// operand) and returns it, or nil if no ESCAPE clause was written. Shared by
+// buildSimilarTo's callers; unlike wrapLikeEscape it does not wrap the
+// pattern — SIMILAR TO's pattern and escape are combined by buildSimilarTo
+// instead. M0134-0070.
+func (p *parser) parseOptionalEscape() (Expr, error) {
+	if t := p.cur(); t.Kind == TokenKeyword && t.Keyword == KwEscape {
+		p.advance()
+		return p.parseExprPrec(precCompare + 1)
+	}
+	return nil, nil
+}
+
+// similarToLiteralValue reports whether e is a literal usable for
+// parse-time SIMILAR TO constant folding: a plain string literal (returns
+// its Value, isNull=false) or the NULL literal (isNull=true, Value
+// meaningless). ok=false for anything else (a column ref, subquery, etc.),
+// signalling the caller to fall back to runtime evaluation. M0134-0070.
+func similarToLiteralValue(e Expr) (value string, isNull bool, ok bool) {
+	switch x := e.(type) {
+	case *StringConst:
+		return x.Value, false, true
+	case *NullConst:
+		return "", true, true
+	}
+	return "", false, false
+}
+
+// buildSimilarTo implements the parse-time constant-fold half of `expr
+// SIMILAR TO pattern [ESCAPE escape]` / `expr NOT SIMILAR TO pattern
+// [ESCAPE escape]` (PG oracle: postgres/src/backend/parser/gram.y:15080-
+// 15115 desugar to similar_to_escape_1/2; postgres/src/backend/utils/adt/
+// regexp.c:768-1063 similar_escape_internal). escape is nil when no ESCAPE
+// clause was written (defaults to backslash, similarto.DefaultEscape).
+//
+// When pattern and escape (if present) are both literal, the conversion
+// runs immediately and the result is a plain BinaryOp{Op: OpRegexMatch /
+// OpRegexNoMatch} with a `'<posix>'::text` right operand — the same shape
+// real PG's planner constant-folding produces, so EXPLAIN output matches
+// byte-for-byte. A NULL pattern or escape literal folds the whole
+// expression to NULL (the underlying PG function is STRICT). An
+// escape string of more than one character is ERROR 22025 raised
+// immediately, matching similar_escape_internal's ereport (no
+// errposition call in the C source, hence Pos: -1 here to suppress the
+// wire LINE/caret PG itself doesn't emit for this error).
+//
+// When either operand isn't a literal, folding is deferred to a
+// SimilarToPattern runtime node — not exercised by strings.sql, see
+// M0134-0070 report for the deferral note.
+func (p *parser) buildSimilarTo(left, pattern, escape Expr, pos int, negate bool) (Expr, error) {
+	patVal, patNull, patOK := similarToLiteralValue(pattern)
+	escVal, escNull, escOK := similarto.DefaultEscape, false, true
+	if escape != nil {
+		escVal, escNull, escOK = similarToLiteralValue(escape)
+	}
+	if !patOK || !escOK {
+		return &SimilarToPattern{pos: pos, Left: left, Pattern: pattern, Escape: escape, Negate: negate}, nil
+	}
+	if patNull || escNull {
+		return &NullConst{pos: pos}, nil
+	}
+	if err := similarto.ValidateEscape(escVal); err != nil {
+		return nil, &SyntaxError{
+			Pos: -1, Raw: true, Code: "22025",
+			Message: "invalid escape string",
+			Hint:    "Escape string must be empty or one character.",
+		}
+	}
+	converted := similarto.Convert(patVal, escVal)
+	op := OpRegexMatch
+	if negate {
+		op = OpRegexNoMatch
+	}
+	return &BinaryOp{
+		pos:  pos,
+		Op:   op,
+		Left: left,
+		Right: &TypedStringLit{
+			pos:   pos,
+			Type:  "text",
+			Value: converted,
+		},
+	}, nil
 }
 
 func (p *parser) parseInTail(left Expr, pos int, negated bool) (Expr, error) {

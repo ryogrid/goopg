@@ -70,10 +70,13 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 			msg, extra := syntaxErrorMsg(err)
 			qerr := &extendedQueryError{Code: syntaxErrorCode(err), Message: msg}
 			for _, f := range extra {
-				if f.Code == libpq.FieldPosition {
+				switch f.Code {
+				case libpq.FieldPosition:
 					if p, _ := strconv.Atoi(f.Value); p > 0 {
 						qerr.Position = p
 					}
+				case libpq.FieldHint:
+					qerr.Hint = f.Value
 				}
 			}
 			return nil, qerr

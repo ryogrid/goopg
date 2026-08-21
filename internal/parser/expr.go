@@ -239,6 +239,27 @@ type LikeEscapePattern struct {
 func (n *LikeEscapePattern) Pos() int { return n.pos }
 func (*LikeEscapePattern) exprNode()  {}
 
+// SimilarToPattern is a full `expr SIMILAR TO pattern [ESCAPE escape]`
+// expression, used only when Pattern and/or Escape are not literal at parse
+// time (buildSimilarTo could not constant-fold them into the usual
+// BinaryOp{Op: OpRegexMatch/OpRegexNoMatch} shape — see
+// internal/parser/select.go buildSimilarTo). Escape is nil when the source
+// had no ESCAPE clause (runtime evaluation must then default to
+// similarto.DefaultEscape). Not exercised by strings.sql — see M0134-0070
+// report for the coverage note. PG oracle: postgres/src/backend/parser/
+// gram.y:15080-15115 (similar_to_escape_1/2 desugar),
+// postgres/src/backend/utils/adt/regexp.c:768-1063 (similar_escape_internal).
+type SimilarToPattern struct {
+	pos     int
+	Left    Expr
+	Pattern Expr
+	Escape  Expr // nil = no ESCAPE clause (default backslash escape)
+	Negate  bool // NOT SIMILAR TO
+}
+
+func (n *SimilarToPattern) Pos() int { return n.pos }
+func (*SimilarToPattern) exprNode()  {}
+
 // ExistsExpr is `EXISTS (subquery)` and its NOT variant. The
 // executor opens the inner plan, asks for the first row, and
 // returns true (or false for NOT EXISTS) iff at least one row

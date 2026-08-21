@@ -143,6 +143,7 @@ var keywordCategory = map[Keyword]KeywordCategory{
 	KwIs:      KwCatTypeFunc,
 	KwLike:    KwCatTypeFunc,
 	KwIlike:   KwCatTypeFunc,
+	KwSimilar: KwCatTypeFunc,
 	KwLateral: KwCatTypeFunc,
 
 	// ── reserved ────────────────────────────────────────────────────────

@@ -37,6 +37,12 @@ type SyntaxError struct {
 	// Kept as a bare string so internal/parser stays free of an sqlstate
 	// import.
 	Code string
+	// Hint carries an optional HINT wire field alongside Code, for the same
+	// kind of non-syntax error raised during parsing (e.g. SIMILAR TO's
+	// parse-time constant-fold rejecting a >1-char ESCAPE string with
+	// 22025/"Escape string must be empty or one character."). Empty means no
+	// HINT field. M0134-0070.
+	Hint string
 }
 
 func (e *SyntaxError) Error() string {

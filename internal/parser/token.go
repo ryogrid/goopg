@@ -126,6 +126,10 @@ const (
 	KwLike        Keyword = "like"
 	KwIlike       Keyword = "ilike"
 	KwEscape      Keyword = "escape"
+	// KwSimilar is `a_expr SIMILAR TO a_expr [ESCAPE a_expr]` (PG oracle:
+	// postgres/src/backend/parser/gram.y:15080-15115, kwlist.h SIMILAR is
+	// TYPE_FUNC_NAME_KEYWORD like LIKE/ILIKE). M0134-0070.
+	KwSimilar     Keyword = "similar"
 	KwBetween     Keyword = "between"
 	KwSymmetric   Keyword = "symmetric"
 	KwAsymmetric  Keyword = "asymmetric"
@@ -344,6 +348,7 @@ var keywords = map[string]Keyword{
 	"like":         KwLike,
 	"ilike":        KwIlike,
 	"escape":       KwEscape,
+	"similar":      KwSimilar,
 	"between":      KwBetween,
 	"symmetric":    KwSymmetric,
 	"asymmetric":   KwAsymmetric,
