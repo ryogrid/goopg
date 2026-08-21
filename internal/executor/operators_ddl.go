@@ -9501,6 +9501,70 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 						calledStr,
 					}}
 				}
+				// M0134-0069 B4: propagate the rename to every OTHER table's
+				// column DEFAULT that names this sequence via nextval(...).
+				// goopg's Column.DefaultExpr stores the sequence reference by
+				// name literal (unlike PG, whose pg_attrdef.adbin is OID-based
+				// via the dependency system — ruleutils.c resolves the OID to
+				// the current name at print time, so PG needs no textual
+				// fixup here). Without this, INSERT against a column whose
+				// DEFAULT still names the old sequence 42P01s after the
+				// rename. Skips the sequence's own row (a sequence has no
+				// nextval-DEFAULT columns of its own) and SET SCHEMA (a
+				// separate, already-known out-of-scope gap).
+				if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+					for _, other := range im.AllTables(seqDBOid) {
+						if other.OID == tbl.OID {
+							continue
+						}
+						touched := false
+						for i := range other.Columns {
+							col := &other.Columns[i]
+							if col.Dropped || col.DefaultExpr == nil {
+								continue
+							}
+							fc, ok3 := col.DefaultExpr.(*parser.FuncCall)
+							if !ok3 || !strings.EqualFold(fc.Name.Name, "nextval") || len(fc.Args) == 0 {
+								continue
+							}
+							arg := fc.Args[0]
+							if cast, ok4 := arg.(*parser.CastExpr); ok4 {
+								arg = cast.Operand
+							}
+							sc, ok5 := arg.(*parser.StringConst)
+							if !ok5 {
+								continue
+							}
+							litName := sc.Value
+							litSchema := ""
+							bareName := litName
+							if idx := strings.LastIndex(litName, "."); idx >= 0 {
+								litSchema = litName[:idx]
+								bareName = litName[idx+1:]
+							}
+							// Match against the old sequence's bare name,
+							// case-insensitively, whether or not the literal
+							// carried a schema prefix (a bare literal with no
+							// schema still refers to this sequence when
+							// resolved against the target table's own
+							// schema).
+							if !strings.EqualFold(strings.TrimSpace(bareName), oldBare) {
+								continue
+							}
+							if litSchema == "" {
+								sc.Value = newName
+							} else {
+								sc.Value = litSchema + "." + newName
+							}
+							touched = true
+						}
+						if touched {
+							if syncErr := syncTableToCatalogHeap(o.ctx, other); syncErr != nil {
+								return fmt.Errorf("DDL catalog sync (sequence rename default fixup): %w", syncErr)
+							}
+						}
+					}
+				}
 			}
 			// 02e item B: persist the new relname to the pg_class heap. Without
 			// this, a renamed table/view/matview/sequence reverts to its old name

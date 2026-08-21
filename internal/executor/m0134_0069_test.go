@@ -150,3 +150,54 @@ func TestDropTableTempShadowIgnoresPermanentViewDependents(t *testing.T) {
 		t.Errorf("expected m0134_0069_nontemp1 to still exist with 0 rows, got %v", rows)
 	}
 }
+
+// TestAlterSequenceRenamePropagatesToDependentDefault verifies that
+// ALTER SEQUENCE ... RENAME rewrites every OTHER table's column DEFAULT
+// nextval(...) literal that names the OLD sequence, so a subsequent INSERT
+// succeeds against the renamed sequence instead of 42P01ing against the
+// stale name. goopg's Column.DefaultExpr stores the sequence reference by
+// name literal (unlike PG's OID-based pg_attrdef.adbin), so this textual
+// fixup is goopg's own correctness requirement. M0134-0069 Bucket 4.
+// PG oracle: postgres/src/test/regress/sql/sequence.sql:143-145 (renaming
+// serial sequences).
+func TestAlterSequenceRenamePropagatesToDependentDefault(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE SEQUENCE s1`); err != nil {
+		t.Fatalf("create sequence s1: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE t (x int DEFAULT nextval('s1'))`); err != nil {
+		t.Fatalf("create table t: %v", err)
+	}
+	// Regression guard against over-matching: an unrelated table whose
+	// DEFAULT names a DIFFERENT, un-renamed sequence must be untouched.
+	if err := runDDL(t, ctx, `CREATE SEQUENCE s_other`); err != nil {
+		t.Fatalf("create sequence s_other: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE t_other (y int DEFAULT nextval('s_other'))`); err != nil {
+		t.Fatalf("create table t_other: %v", err)
+	}
+
+	if err := runDDL(t, ctx, `ALTER SEQUENCE s1 RENAME TO s2`); err != nil {
+		t.Fatalf("alter sequence rename: %v", err)
+	}
+
+	if err := runDDL(t, ctx, `INSERT INTO t DEFAULT VALUES`); err != nil {
+		t.Fatalf("INSERT INTO t DEFAULT VALUES should succeed after rename, got: %v", err)
+	}
+	rows := runSQL(t, ctx, `SELECT x FROM t`)
+	if len(rows) != 1 || rows[0][0].Int != 1 {
+		t.Errorf("expected [[1]], got %v", rows)
+	}
+
+	// t_other's DEFAULT must still reference s_other, unaffected by the s1
+	// rename.
+	if err := runDDL(t, ctx, `INSERT INTO t_other DEFAULT VALUES`); err != nil {
+		t.Fatalf("INSERT INTO t_other DEFAULT VALUES should still succeed, got: %v", err)
+	}
+	otherRows := runSQL(t, ctx, `SELECT y FROM t_other`)
+	if len(otherRows) != 1 || otherRows[0][0].Int != 1 {
+		t.Errorf("expected t_other unaffected: [[1]], got %v", otherRows)
+	}
+}
