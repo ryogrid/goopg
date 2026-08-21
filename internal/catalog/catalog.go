@@ -2073,6 +2073,15 @@ type Catalog interface {
 	MaterializeOwnerACL(relOID uint32, owner string, ownerPrivs []string)
 	// HasTablePrivilege reports whether role was granted priv on relOID.
 	HasTablePrivilege(relOID uint32, role, priv string) bool
+	// IsOwnerACLRevoked reports whether relOID's owner has had its implicit
+	// default ACL touched by an explicit REVOKE — i.e. relACLEmptied or
+	// relACLOwnerRevoked is set for relOID. M0134-0069 bucket 7.
+	IsOwnerACLRevoked(relOID uint32) bool
+	// HasOwnerPrivilege reports whether relOID's materialized owner ACL entry
+	// (stored under the internal owner sentinel role) grants priv. Only
+	// meaningful once IsOwnerACLRevoked is true; callers should fall back to
+	// the unconditional owner bypass otherwise. M0134-0069 bucket 7.
+	HasOwnerPrivilege(relOID uint32, priv string) bool
 	// ProcACLText renders the materialized pg_proc.proacl text for a routine OID,
 	// or "" when proacl is still NULL (no GRANT/REVOKE recorded). The function
 	// REVOKE recorder uses the NULL result to decide whether to expand the
@@ -16540,6 +16549,22 @@ func (c *InMemory) HasTablePrivilege(relOID uint32, role, priv string) bool {
 	}
 	_, ok := privs[priv]
 	return ok
+}
+
+// IsOwnerACLRevoked reports whether relOID's owner has had its implicit
+// default ACL touched by an explicit REVOKE. Mirrors the inline check used by
+// MaterializeOwnerACL and relaclTextLockedFor. M0134-0069 bucket 7.
+func (c *InMemory) IsOwnerACLRevoked(relOID uint32) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.relACLEmptied[relOID] || c.relACLOwnerRevoked[relOID]
+}
+
+// HasOwnerPrivilege reports whether relOID's materialized owner ACL entry
+// grants priv. Equivalent to HasTablePrivilege(relOID, aclOwnerRole, priv).
+// M0134-0069 bucket 7.
+func (c *InMemory) HasOwnerPrivilege(relOID uint32, priv string) bool {
+	return c.HasTablePrivilege(relOID, aclOwnerRole, priv)
 }
 
 // DropTableACL forgets all privileges recorded for relOID. M0118-0008.

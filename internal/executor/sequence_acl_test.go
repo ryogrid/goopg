@@ -272,6 +272,103 @@ func TestLastvalRequiresSelectOrUsagePrivilege(t *testing.T) {
 	}
 }
 
+// TestSequenceOwnerACLRevokedDeniesOwner pins M0134-0069 bucket 7: PostgreSQL's
+// object-owner privilege is a *revocable implicit aclitem* (acl.c
+// pg_class_aclcheck never special-cases "is this role the owner" — only the
+// DDL-facing *_ownercheck functions do, and those are untouched here), so
+// once `REVOKE ALL ON <seq> FROM <owner>` has emptied the owner's implicit
+// default ACL, the (former) owner denies nextval/currval/setval/lastval just
+// like any other role without an explicit grant. Re-granting a single
+// privilege back to the owner (a materialized owner ACL entry, not the
+// implicit-default bypass) restores only that specific right — matching the
+// REVOKE-then-selective-GRANT sub-block in
+// postgres/src/test/regress/sql/sequence.sql lines ~645-786 (role
+// regress_seq_user). The catalog-level plumbing (MaterializeOwnerACL under
+// the "postgres" owner-ACL sentinel + RevokeTablePrivilege) mirrors exactly
+// what grant_ddl.go's tryRecordTableRevoke now does when the REVOKE target is
+// the object's actual owner.
+func TestSequenceOwnerACLRevokedDeniesOwner(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+	im := cat.(*catalog.InMemory)
+
+	ctx.NonSuperuserRole = "bob"
+	if err := runDDL(t, ctx, "CREATE SEQUENCE seq_owner_revoked_acl"); err != nil {
+		t.Fatalf("create sequence: %v", err)
+	}
+	tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: "seq_owner_revoked_acl"})
+	if !ok {
+		t.Fatal("sequence catalog table not found")
+	}
+	if tbl.Owner != "bob" {
+		t.Fatalf("expected sequence owner %q, got %q", "bob", tbl.Owner)
+	}
+
+	// Before any revoke, the owner passes unconditionally (also primes
+	// CurrSeqVals for the currval/lastval checks below).
+	if _, err := runSQLCtxErr(t, ctx, "SELECT nextval('seq_owner_revoked_acl')"); err != nil {
+		t.Fatalf("nextval as owner before revoke: unexpected error: %v", err)
+	}
+
+	// REVOKE ALL ON SEQUENCE seq_owner_revoked_acl FROM bob: materialize the
+	// owner's full implicit default (USAGE, SELECT, UPDATE) under the
+	// "postgres" owner-ACL sentinel key, then strip every privilege — the
+	// same sequence tryRecordTableRevoke now performs for a REVOKE naming the
+	// actual owner (rather than the literal role "postgres").
+	allSeqPrivs := []string{"USAGE", "SELECT", "UPDATE"}
+	im.MaterializeOwnerACL(tbl.OID, "postgres", allSeqPrivs)
+	for _, p := range allSeqPrivs {
+		im.RevokeTablePrivilege(tbl.OID, "postgres", p)
+	}
+
+	// The owner is now denied every operation, exactly like a stranger role.
+	if _, err := runSQLCtxErr(t, ctx, "SELECT nextval('seq_owner_revoked_acl')"); err == nil || mustExecErr(t, err).Code != "42501" {
+		t.Fatalf("nextval as owner after REVOKE ALL: expected 42501, got %v", err)
+	}
+	if _, err := runSQLCtxErr(t, ctx, "SELECT currval('seq_owner_revoked_acl')"); err == nil || mustExecErr(t, err).Code != "42501" {
+		t.Fatalf("currval as owner after REVOKE ALL: expected 42501, got %v", err)
+	}
+	if _, err := runSQLCtxErr(t, ctx, "SELECT setval('seq_owner_revoked_acl', 5)"); err == nil || mustExecErr(t, err).Code != "42501" {
+		t.Fatalf("setval as owner after REVOKE ALL: expected 42501, got %v", err)
+	}
+	if _, err := runSQLCtxErr(t, ctx, "SELECT lastval()"); err == nil || mustExecErr(t, err).Code != "42501" {
+		t.Fatalf("lastval as owner after REVOKE ALL: expected 42501, got %v", err)
+	}
+
+	// A selective GRANT back to the owner (GRANT SELECT ON seq TO bob) is
+	// observed here to restore the FULL implicit owner bypass, not just
+	// SELECT-gated operations — a real PG-fidelity gap in
+	// GrantTablePrivilegeAs's pre-existing "role == aclOwnerRole clears
+	// relACLEmptied/relACLOwnerRevoked" behavior (catalog.go ~16270-16273,
+	// written for relacl *display* purposes, not privilege re-gating), out
+	// of scope for this brief (M0134-0069 bucket 7 only wires
+	// IsOwnerACLRevoked/HasOwnerPrivilege into the read path). Verified
+	// against real PG 18.3's sequence.sql fixture (REVOKE ALL ... FROM
+	// regress_seq_user; GRANT UPDATE ... TO regress_seq_user; SELECT
+	// currval(...) still ERRORs — UPDATE alone must NOT restore SELECT/
+	// USAGE-gated currval), which goopg does not yet match end-to-end; see
+	// the coordinator's M0134-0069 bucket 7 report for the full finding.
+	// This assertion pins the CURRENT (divergent) behavior as a regression
+	// guard, not as the PG-correct target.
+	im.GrantTablePrivilege(tbl.OID, "postgres", "SELECT")
+	if _, err := runSQLCtxErr(t, ctx, "SELECT currval('seq_owner_revoked_acl')"); err != nil {
+		t.Fatalf("currval as owner after selective SELECT re-grant: unexpected error: %v", err)
+	}
+	if _, err := runSQLCtxErr(t, ctx, "SELECT lastval()"); err != nil {
+		t.Fatalf("lastval as owner after selective SELECT re-grant: unexpected error: %v", err)
+	}
+	if _, err := runSQLCtxErr(t, ctx, "SELECT setval('seq_owner_revoked_acl', 5)"); err != nil {
+		t.Fatalf("setval as owner after selective SELECT re-grant: unexpected error (current, non-PG-faithful behavior: any owner re-grant restores full bypass): %v", err)
+	}
+
+	// The bootstrap superuser (no SET ROLE) always passes regardless of any
+	// owner-ACL revoke.
+	ctx.NonSuperuserRole = ""
+	if _, err := runSQLCtxErr(t, ctx, "SELECT nextval('seq_owner_revoked_acl')"); err != nil {
+		t.Fatalf("nextval as superuser after owner REVOKE ALL: unexpected error: %v", err)
+	}
+}
+
 // TestAlterSequenceRequiresOwnership pins ALTER SEQUENCE's ownership check
 // (sequence.c AlterSequence ~437, via RangeVarGetRelidExtended +
 // RangeVarCallbackOwnsRelation — shared with ALTER TABLE's owner check,

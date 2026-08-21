@@ -2219,6 +2219,17 @@ func dmlPrivilegePermitted(ctx *Context, tbl *catalog.Table, priv string) bool {
 // superuser bypass always wins regardless of checkRole — a superuser
 // session runs everything as itself, view-owner semantics or not.
 // M0122-0008 (view-owner privilege gap).
+//
+// The owner bypass below is conditional, not unconditional: PostgreSQL's
+// object-owner privilege is a revocable implicit aclitem materialized by
+// acldefault() at creation time, not a hard-coded bypass in aclcheck
+// (postgres/src/backend/utils/adt/acl.c pg_class_aclcheck never
+// special-cases "is this role the owner" — only the *_ownercheck functions
+// used for DDL like ALTER/DROP hard-code an owner bypass, and those are
+// untouched here). So once an explicit REVOKE has touched the owner's
+// implicit default ACL (IsOwnerACLRevoked), the owner's remaining rights
+// come from the materialized owner ACL entry instead of an automatic true.
+// M0134-0069 bucket 7.
 func dmlPrivilegePermittedAs(ctx *Context, tbl *catalog.Table, priv, checkRole string) bool {
 	if ctx.NonSuperuserRole == "" {
 		return true // bootstrap superuser session: full privileges
@@ -2236,7 +2247,10 @@ func dmlPrivilegePermittedAs(ctx *Context, tbl *catalog.Table, priv, checkRole s
 		return true
 	}
 	if tbl.Owner != "" && strings.EqualFold(tbl.Owner, checkRole) {
-		return true
+		if !ctx.Catalog.IsOwnerACLRevoked(tbl.OID) {
+			return true
+		}
+		return ctx.Catalog.HasOwnerPrivilege(tbl.OID, priv)
 	}
 	return ctx.Catalog.HasTablePrivilege(tbl.OID, checkRole, priv)
 }

@@ -107,3 +107,68 @@ func TestTryRecordTableGrantGrantedByOtherRoleErrors(t *testing.T) {
 		t.Fatalf("relacl after rejected GRANT = %q; want \"\" (NULL)", got)
 	}
 }
+
+// TestTryRecordTableRevokeMaterializesActualOwner pins M0134-0069 bucket 7:
+// a `REVOKE ... FROM <role>` whose <role> is the object's *actual* Owner
+// field (not the literal string "postgres", goopg's internal owner-ACL
+// bookkeeping sentinel) must route through the owner-materialize-then-revoke
+// path, exactly like a REVOKE naming "postgres" always did. Before this fix
+// tryRecordTableRevoke only detected the owner branch by comparing the
+// REVOKE target against the literal "postgres" sentinel, so
+// `REVOKE ALL ... FROM regress_seq_user` (a non-"postgres" owner) fell
+// through to a plain RevokeTablePrivilege(oid, "regress_seq_user", priv) —
+// a no-op, since the owner's implicit privileges are stored under the
+// "postgres" sentinel key, not under the owner's real role name. PG oracle:
+// postgres/src/backend/utils/adt/acl.c pg_class_aclcheck (the owner's
+// privilege is just as revocable as any other aclitem); fixture:
+// postgres/src/test/regress/sql/sequence.sql lines ~645-786.
+func TestTryRecordTableRevokeMaterializesActualOwner(t *testing.T) {
+	s, im, oid := newGrantTestServer(t)
+
+	tbl, ok := im.LookupTable(parser.ObjectName{Name: "t"})
+	if !ok {
+		t.Fatal("table t not found")
+	}
+	// newGrantTestServer's CreateTable does not stamp an owner; set one
+	// explicitly so the REVOKE target below is a genuine non-"postgres" owner
+	// name, matching sequence.sql's regress_seq_user fixture role.
+	tbl.Owner = "regress_seq_user"
+
+	// Before any revoke the relacl is still NULL (implicit default,
+	// unmaterialized) — the owner holds every privilege without an explicit
+	// aclitem.
+	if got := im.RelaclText(oid); got != "" {
+		t.Fatalf("relacl before revoke = %q; want \"\" (NULL)", got)
+	}
+
+	s.tryRecordTableRevoke(`REVOKE ALL ON TABLE t FROM regress_seq_user`)
+
+	// The owner's implicit default ACL must now be materialized (under the
+	// "postgres" sentinel) with every privilege stripped — a non-NULL empty
+	// array, not a no-op leaving relacl NULL.
+	if got := im.RelaclText(oid); got != "{}" {
+		t.Fatalf("relacl after REVOKE ALL FROM actual owner = %q; want %q (empty array, not NULL/no-op)", got, "{}")
+	}
+	if !im.IsOwnerACLRevoked(oid) {
+		t.Fatal("IsOwnerACLRevoked = false after REVOKE ALL FROM actual owner; want true")
+	}
+	// Nothing was ever recorded under the literal role name
+	// "regress_seq_user" — the revoke must have operated on the "postgres"
+	// owner-ACL sentinel key, not a dead entry under the real role name.
+	if im.HasTablePrivilege(oid, "regress_seq_user", "SELECT") {
+		t.Fatal("HasTablePrivilege(oid, \"regress_seq_user\", SELECT) = true; the owner's ACL entry must live under the sentinel key, not the literal owner role name")
+	}
+
+	// The owner's privileges (or absence thereof) must be queryable through
+	// the sentinel key: none survive a REVOKE ALL.
+	if im.HasOwnerPrivilege(oid, "SELECT") || im.HasOwnerPrivilege(oid, "INSERT") {
+		t.Fatal("HasOwnerPrivilege = true for some privilege after REVOKE ALL FROM actual owner; want none")
+	}
+
+	// A subsequent REVOKE (of a privilege the owner no longer holds) is a
+	// harmless no-op, not a panic or a resurrection of the owner default.
+	s.tryRecordTableRevoke(`REVOKE SELECT ON TABLE t FROM regress_seq_user`)
+	if got := im.RelaclText(oid); got != "{}" {
+		t.Fatalf("relacl after second REVOKE FROM actual owner = %q; want %q (unchanged empty array)", got, "{}")
+	}
+}
