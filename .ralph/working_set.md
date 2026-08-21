@@ -1,70 +1,67 @@
-Task: M0134-0069 (sequence.sql) — Buckets 1+2 of 6 LANDED, case still `failed`
-(diff 359→330 lines, CSV row unchanged since case not fully passing). Committed
-& pushed (8b0756c1). Next: resume M0134-0069 Buckets 3+4 (or re-evaluate via
-fresh researcher pass if the deferral ledger scope is judged stale).
+Task: M0134-0069 (sequence.sql) — Bucket 4 now FULLY landed (both explicit-
+and implicit-DEFAULT halves). Case still `failed` (0/1, diff 330→307 lines
+this loop). Committed & pushed (8ee2f743).
 
-Files this loop: `internal/executor/expr.go` (`roundNumericToInt` rewritten to
-exact `big.Int` mantissa/scale arithmetic — a float64 round-trip can't detect
-boundary-adjacent overflow like `-9223372036854775809`), `internal/executor/
-operators_ddl.go` (`execDropTable` RESTRICT-mode dependency scan now uses
-resolved `tbl.Schema`/`tbl.Name` + a Temp-mismatch filter instead of the raw
-parsed name), `internal/executor/m0134_0069_test.go` (new, 3 tests),
-`.ralph/fix_plan.md` (M0134-0069 entry updated, still unchecked — case not
-PASS), `.ralph/deferral_ledger.md` (new row, M0134-0069 — records buckets 3-6
-plus a newly-discovered INSERT column-DEFAULT-evaluation-order bug found while
-verifying bucket 1: PG evaluates all column DEFAULTs, including side-effecting
-`nextval()`, before an encode-time bounds check can abort a failing INSERT;
-goopg appears to short-circuit early, under-consuming sequence values).
+Files this loop: `internal/catalog/catalog.go` (new
+`FindSequenceOwnedByFunc` function-var hook, sibling to `SequenceParamsFunc`),
+`internal/executor/operators_sequence.go` (`init()` wires
+`catalog.FindSequenceOwnedByFunc = findSequenceOwnedByForCatalog`, new helper
+mirrors `autoGenerateSerialValues`'s naming-convention→`FindSequenceOwnedBy`
+two-step lookup), `internal/optimizer/planner.go` (`defaultMarkerReplacement`
+~line 10025 now calls the hook to resolve the CURRENT/renamed sequence name
+for implicit SERIAL/IDENTITY DEFAULTs instead of the dead naming-convention
+literal; stale doc comment updated), `internal/executor/m0134_0069_test.go`
+(new `TestAlterSequenceRenamePropagatesToImplicitSerialDefault`),
+`.ralph/deferral_ledger.md` (new row, M0134-0069 dated 2026-08-21 — records
+6 residual sub-buckets), `.ralph/fix_plan.md` (M0134-0069 entry updated,
+still unchecked — not all buckets done).
 
-Key symbols: `roundNumericToInt`/`roundFloatToInt` (internal/executor/expr.go
-~3588-3660); `execDropTable`, `viewsDependingOnTable`, `matViewsDependingOnRelation`
-(internal/executor/operators_ddl.go ~6498-6680).
+Key symbols: `catalog.FindSequenceOwnedByFunc` (catalog.go, right after
+`SequenceParamsFunc`); `findSequenceOwnedByForCatalog`
+(operators_sequence.go); `defaultMarkerReplacement`/
+`rewriteInsertDefaultMarkers` (planner.go ~10025, now rename-survival-safe).
 
-Hypothesis/Findings: sequence.sql sizing (researcher agent acc8671331696b8a0)
-found 6 independent buckets, none architectural — all CONTAINED but too large
-for one round (~140 changed lines total). Bucket 1 (numeric overflow) and
-Bucket 2 (DROP TABLE dependency scan by unresolved name) were the two most
-load-bearing (data-corruption-class / false-error-class) and were landed this
-loop. Remaining: Bucket 3 (DROP SEQUENCE RESTRICT missing column-DEFAULT
-dependency check — new helper cloning `viewsDependingOnTable`'s pattern over
-`im.AllTables()` column defaults), Bucket 4 (sequence RENAME doesn't update
-owning column's stored DEFAULT text — `RenameSequence`/`SetSequenceOwnedBy` in
-operators_ddl.go:237/18594), Bucket 5 (sequence-level ACL entirely unenforced
-on nextval/currval/setval/lastval — reuse existing `dmlPrivilegePermittedAs`
-helper, expr.go ~10145-10176), Bucket 6 (assorted small HINT/DETAIL/NOTICE
-text gaps + missing `pg_sequence_parameters` SRF). Full citations in the
-ledger row dated 2026-08-21, M0134-0069.
+Hypothesis/Findings: the case as a whole is still `failed` — Bucket 4 was
+only one of 6 sizing buckets. Remaining, per the ledger: Bucket 3 (DROP
+SEQUENCE RESTRICT missing column-default dependency check — researcher
+agent a9606871a3f807476 already confirmed the parser-cast risk is REAL: PG
+only records a dependency for a bare-literal or `::regclass`-cast `nextval`
+arg, never `::text`; safe to start coding without further research), Bucket
+5 (sequence ACL/owner enforcement — `nextval`/`currval`/`lastval`/`setval`
+in `internal/executor/expr.go` ~10145-10176 never call the existing
+`dmlPrivilegePermittedAs` helper), Bucket 6 (small text/HINT/DETAIL gaps),
+plus newly-surfaced-this-loop small items: `pg_sequence_parameters()` SRF
+missing, `\d` doesn't label UNLOGGED sequences, orphaned `sequence_test2`
+catalog row after cascading DROP TABLE (wrong min/start), `pg_get_sequence_data`
+after CACHE 10 returns 3 not 10 (cache-vs-persisted mismatch, not yet
+root-caused).
 
-Next step: spawn a fresh researcher to confirm Bucket 3+4 scope is still
-accurate (catalog may have shifted slightly from this loop's edits), then
-brief+delegate an implementer for Bucket 3+4 as a paired dependency-tracking
-slice (same pattern as this loop's brief). If time/context is short next loop,
-Bucket 5 (ACL enforcement, reuses an existing helper — likely the cheapest
-remaining bucket) is an equally valid alternative starting point.
+Next step: start Bucket 3 (DROP SEQUENCE RESTRICT dependency scan) — the
+parser-risk research is already done, so this can go straight to an
+implementer brief: clone the `viewsDependingOnTable` pattern in
+`internal/executor/operators_ddl.go`'s DROP SEQUENCE handler (~line
+19825-19875, currently only checks function deps via
+`functionsDependingOnSequence`) to also scan `im.AllTables()` column
+`DefaultExpr`s (plus implicit-serial synthesized names) for `nextval(arg)`
+where `arg` is a bare `StringConst` or `::regclass`-cast — NOT `::text` or
+other casts — matching the OLD sequence name; emit PG's `2BP01` error with
+DETAIL `default value for column "X" of table "Y" depends on sequence "Z"`.
+Acceptance pair: `sequence.sql:151-167` (`myseq2`/`myseq3`/`t1_f1_seq`).
 
-Gates run this loop: `go build ./...` PASS; `go test ./internal/executor/...`
-PASS (targeted, no -count=1, includes 3 new tests); `scripts/pg-regress-runner.sh
---verbose sequence` — 0/1 PASS but diff line count confirmed dropped 359→330,
-both target statement blocks (bigint-overflow INSERTs, unqualified DROP TABLE)
-now match PG; `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
-PASS (full unit suite, internal/initdb cold at 466s, rest cache-warm);
-`make ralph-state-guard` — found 2 inconsistencies (stale running/completed
-markers from prior loop's clean-exit), auto-repaired, then PASS; pre-commit
-pgbench smoke PASS (11722 TPS select-only, 649 TPS simple-update, 349 TPS
-TPC-B, 0 failed transactions across all three).
+Gates run this loop: `go build ./...` PASS; targeted test PASS; full
+`go test ./internal/executor/...` PASS; full `go test ./internal/optimizer/...`
+PASS; `scripts/pg-regress-runner.sh --verbose sequence` — diff 330→307,
+anchor line now matches PG; `RALPH_PRECOMMIT_SCOPE=units
+scripts/ralph-precommit-test.sh` PASS (full suite incl. slow initdb/goopg
+packages); `make ralph-state-guard` — found 2 stale markers, auto-repaired,
+then PASS; pre-commit pgbench smoke PASS (11677 TPS select-only, 650 TPS
+simple-update, 0 failed).
 
-Delegation: researcher agent `acc8671331696b8a0` (1 round — sized the full
-case, found 6 buckets, recommended splitting into 2+ implementer briefs,
-accepted as-is); implementer agent `a5682bbb3d4b0afe0` (1 round — DONE,
-2 deviations from the literal brief text, both well-justified and verified
-against the brief's own acceptance criteria: exact big.Int arithmetic instead
-of the literally-specified float64 mirror for Bucket 1 (the float64 approach
-provably fails the brief's own cited boundary literals), and an additional
-Temp-mismatch filter for Bucket 2 (the real sequence.sql scenario is a temp/
-permanent name collision, not the cross-schema collision originally
-hypothesized) — both verified independently before commit, not blindly
-trusted.
+Delegation: researcher agent `a9606871a3f807476` (1 round — resolved the
+implicit-serial fallback design AND confirmed Bucket 3's parser-cast risk
+is real, both in one pass); implementer agent `ac9833ec36a9e4862` (1 round
+— landed the full brief cleanly, no escalation needed, diff shrank as
+expected).
 
-In-flight: none. Commit `8b0756c1` pushed to `regress-renumbering`. No server
-left running (pgbench smoke cluster stopped/cleaned by the pre-commit hook
-itself; pg-regress-runner's throwaway server self-stopped too).
+In-flight: none. Commit `8ee2f743` pushed to `regress-renumbering`. No
+server left running.
