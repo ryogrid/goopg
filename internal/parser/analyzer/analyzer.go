@@ -2276,6 +2276,24 @@ func tableFuncBaseColumns(tf *parser.TableFuncRef, alias string, colAliases []st
 			cols[i] = catalog.Column{Name: names[i], Type: catalog.Type{Name: types[i]}, Ordinal: i}
 		}
 		return cols
+	case "pg_sequence_parameters":
+		// pg_sequence_parameters(regclass) → (start_value int8, minimum_value
+		// int8, maximum_value int8, increment int8, cycle_option bool,
+		// cache_size int8, data_type oid). Mirrors planPgSequenceParameters.
+		// PG oracle: postgres/src/backend/commands/sequence.c:1740
+		// pg_sequence_parameters; pg_proc.dat:3426-3431. M0134-0069.
+		names := []string{"start_value", "minimum_value", "maximum_value", "increment", "cycle_option", "cache_size", "data_type"}
+		types := []string{"int8", "int8", "int8", "int8", "bool", "int8", "oid"}
+		for i := range names {
+			if i < len(colAliases) && colAliases[i] != "" {
+				names[i] = colAliases[i]
+			}
+		}
+		cols := make([]catalog.Column, len(names))
+		for i := range names {
+			cols[i] = catalog.Column{Name: names[i], Type: catalog.Type{Name: types[i]}, Ordinal: i}
+		}
+		return cols
 	case "ts_token_type":
 		// ts_token_type(parser_oid) → (tokid int4, alias text, description
 		// text). Mirrors planTSTokenType; pg_dump's dumpTSConfig selects the

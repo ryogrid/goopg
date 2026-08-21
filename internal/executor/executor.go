@@ -69,6 +69,8 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 		return maybeInstrument(p, newPgAvailableWalSummariesOp(p)), nil
 	case *optimizer.PgGetSequenceData:
 		return maybeInstrument(p, newPgGetSequenceDataOp(p)), nil
+	case *optimizer.PgSequenceParameters:
+		return maybeInstrument(p, newPgSequenceParametersOp(p)), nil
 	case *optimizer.TSTokenType:
 		return maybeInstrument(p, newTSTokenTypeOp(p)), nil
 	case *optimizer.VerifyHeapam:

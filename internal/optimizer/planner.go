@@ -4561,6 +4561,9 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	if strings.EqualFold(tf.Name, "pg_get_sequence_data") {
 		return planPgGetSequenceData(rv, sourceIdx, lateralCtx)
 	}
+	if strings.EqualFold(tf.Name, "pg_sequence_parameters") {
+		return planPgSequenceParameters(rv, sourceIdx, lateralCtx)
+	}
 	if strings.EqualFold(tf.Name, "ts_token_type") {
 		return planTSTokenType(rv, sourceIdx, lateralCtx)
 	}
@@ -5366,6 +5369,51 @@ func planPgGetSequenceData(rv parser.RangeVar, sourceIdx int16, lateralCtx *reso
 	}
 	tbl := &catalog.Table{Name: alias, Columns: cols}
 	node := &PgGetSequenceData{pos: tf.Pos(), Args: args, schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
+// planPgSequenceParameters translates a table-function reference to
+// pg_sequence_parameters(regclass) into a PgSequenceParameters plan node.
+// Takes a single, plain (non-lateral) regclass argument. PG oracle:
+// postgres/src/backend/commands/sequence.c:1740 pg_sequence_parameters;
+// pg_proc.dat:3426-3431. M0134-0069.
+func planPgSequenceParameters(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	ctx := lateralCtx
+	if ctx == nil {
+		ctx = &resolveContext{}
+	}
+	if len(tf.Args) != 1 {
+		return nil, rangeBinding{}, &PlanError{
+			Code:    "42883",
+			Message: fmt.Sprintf("function pg_sequence_parameters(%d args) does not exist", len(tf.Args))}
+	}
+	arg, err := resolveExpr(tf.Args[0], ctx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	alias := rv.Alias
+	if alias == "" {
+		alias = "pg_sequence_parameters"
+	}
+	colNames := []string{"start_value", "minimum_value", "maximum_value", "increment", "cycle_option", "cache_size", "data_type"}
+	if len(rv.Columns) > 0 {
+		for i := range colNames {
+			if i < len(rv.Columns) {
+				colNames[i] = rv.Columns[i]
+			}
+		}
+	}
+	colTypes := []string{"int8", "int8", "int8", "int8", "bool", "int8", "oid"}
+	schema := make(Schema, len(colNames))
+	cols := make([]catalog.Column, len(colNames))
+	for i := range colNames {
+		schema[i] = SchemaColumn{Name: colNames[i], Type: catalog.Type{Name: colTypes[i]}, SourceTableIdx: sourceIdx}
+		cols[i] = catalog.Column{Name: colNames[i], Type: catalog.Type{Name: colTypes[i]}, Ordinal: i}
+	}
+	tbl := &catalog.Table{Name: alias, Columns: cols}
+	node := &PgSequenceParameters{pos: tf.Pos(), Arg: arg, schema: schema}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	return node, b, nil
 }

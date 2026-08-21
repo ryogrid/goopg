@@ -1711,6 +1711,23 @@ type PgGetSequenceData struct {
 func (n *PgGetSequenceData) Pos() int       { return n.pos }
 func (n *PgGetSequenceData) Output() Schema { return n.schema }
 
+// PgSequenceParameters implements pg_sequence_parameters(regclass) as a
+// FROM-clause SRF. Returns the persisted DDL parameters of a sequence
+// (start_value, minimum_value, maximum_value, increment, cycle_option,
+// cache_size, data_type) — unlike PgGetSequenceData, this reads catalog
+// state, not the live current value. Takes a plain constant regclass arg
+// (no lateral correlation observed in PG's grammar/pg_proc.dat for this
+// function). PG oracle: postgres/src/backend/commands/sequence.c:1740
+// pg_sequence_parameters; pg_proc.dat:3426-3431. M0134-0069.
+type PgSequenceParameters struct {
+	pos    int
+	Arg    Expr
+	schema Schema
+}
+
+func (n *PgSequenceParameters) Pos() int       { return n.pos }
+func (n *PgSequenceParameters) Output() Schema { return n.schema }
+
 // TSTokenType implements ts_token_type(parser_oid) as a FROM-clause SRF:
 // (tokid int4, alias text, description text). pg_dump's dumpTSConfig issues
 // `FROM pg_catalog.ts_token_type('%u'::oid) AS t` (a literal argument, not
