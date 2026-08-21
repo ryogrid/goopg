@@ -1,69 +1,64 @@
-Task: M0134-0069 (sequence.sql) — landed a real CREATE/ALTER SEQUENCE
-UNLOGGED bug this loop (not just the header-text cosmetic it looked like).
-Diff shrank 239→226. Case still `failed` (0/1). Committed & pushed
-(a61c7b46 impl, f2b7aa7c bookkeeping).
+Task: M0134-0070 (strings.sql) — regress-sql `failed`. This loop fixed a
+higher-severity bug discovered while sizing 0070's remaining diff buckets:
+the DataRow empty-string-vs-NULL wire-encoding bug (unconditional under
+extended protocol, state-dependent under simple query). strings.sql itself
+still `failed` (2624-line diff pre-fix, not yet re-measured post-fix).
 
-Files this loop: `internal/parser/ast.go` (new `CreateSequenceStmt.Unlogged`,
-`AlterSequenceStmt.SetLogged` fields), `internal/parser/ddl.go`
-(`parseCreateSequenceTail` gained a 3rd `unlogged bool` param — was
-conflated into the `temp` param before; ALTER SEQUENCE SET LOGGED/UNLOGGED
-option-parsing now stores instead of discarding), `internal/executor/
-operators_ddl.go` (`execCreateSequence`/`execAlterSequence` now set
-`catalog.Table.Unlogged` so `buildUserPGClassRow`'s existing
-relpersistence logic picks it up), `internal/executor/
-sequence_unlogged_test.go` (new, 2 tests). Also updated
-`.ralph/fix_plan.md` (M0134-0069 entry, no new ledger row needed — this
-was a full landing, not a deferral).
+Files this loop: `internal/postmaster/dispatch.go` (SELECT result loop
+~3046, FETCH-from-cursor loop ~3813 — coerce nil post-render slice to
+`[]byte{}` when Datum non-null), `internal/postmaster/dispatch_extended.go`
+(Bind/Execute row builder ~521/525, same coercion), new test
+`internal/postmaster/datarow_empty_string_test.go` (4 cases). Also
+`.ralph/fix_plan.md` (M0134-0070 entry) and `.ralph/deferral_ledger.md`
+(flipped the prior "discovered" row to `resolved`, appended a new row with
+full fix detail).
 
-Key symbols: `parseCreateSequenceTail` (internal/parser/ddl.go),
-`execCreateSequence`/`execAlterSequence` (internal/executor/
-operators_ddl.go), `catalog.Table.Unlogged`, `buildUserPGClassRow`
-(internal/executor/pg18_user_catalog_rows.go).
+Key symbols: the 4 DataRow-cell-building call sites above. `d.IsNull()`
+branches untouched (still emit literal `nil` for the true NULL sentinel).
+`internal/libpq/frame.go`'s `PutDataRowScratch`/`WriteDataRow` untouched
+(correct by contract — nil is NULL there).
 
-Hypothesis/Findings: a researcher audit (delegated before implementing)
-refuted the working_set's prior "new SESSION AUTHORIZATION ACL gap"
-hypothesis — it's the SAME already-ledgered Bucket 7 blocker (GRANT/REVOKE
-inside BEGIN...ROLLBACK never reaching the catalog; autocommit-only gate
-in internal/postmaster/query.go), not new plumbing; `ctx.NonSuperuserRole`
-is already correctly threaded from SET SESSION AUTHORIZATION into all four
-sequence ACL checks. The SAME audit found the `\d` UNLOGGED-header gap was
-NOT cosmetic: `CREATE UNLOGGED SEQUENCE` was silently mis-flagging the
-sequence as session-TEMPORARY (both booleans shared one param), and ALTER
-SEQUENCE SET LOGGED/UNLOGGED was a parsed-then-discarded no-op. Fixed both;
-confirmed live via cgroup-capped psql that `\d` now matches PG's
-describe.c:1857-1861 header logic. `information_schema.sequences.
-sequence_catalog` DB-name mismatch confirmed to be a harness artifact (
-pg-regress-runner.sh connects to DB "postgres" not "regression"), not an
-engine bug — no fix needed, just documented.
+Hypothesis/Findings: root cause confirmed — Go's `nilSlice[0:0]` and
+`append(nil, ...zero bytes...)` both stay `nil`, indistinguishable from the
+NULL sentinel at the DataRow-cell layer. Extended protocol (Bind/Execute)
+was UNCONDITIONALLY broken (every empty non-null cell, every connection —
+affects any JDBC/psycopg-style prepared-statement client). Simple-query was
+broken only on the very first non-null-empty cell rendered onto a
+connection's still-nil scratch buffer. Researcher scanned
+`internal/postmaster/query.go`, `internal/backup/basebackup.go`,
+`internal/replication/walsender.go` for a 5th call site — those build rows
+from Go literals directly (not `Datum.AppendValueText`), likely unaffected,
+not exhaustively audited.
 
-Next step: two paths sized by the researcher audit, pick one: (a) Bucket 7
-— transactional GRANT/REVOKE deferred-catalog-mutation plumbing (NOT a
-small fix per the audit; needs a design pass reconciling
-relACLEmptied/relACLOwnerRevoked's existing display-only semantics with a
-new enforcement consumer — mirror the execCompatNoop xmax/lock deferral
-pattern per the ledger's Bucket-7 rows) — or (b) `pg_sequence_parameters()`
-SRF as a standalone smaller slice (currently `table-valued function ...
-not supported`). Recommend researching (b) first since it's likely smaller
-and self-contained, then tackle (a) as its own design-doc-backed task. If
-the banner has moved off M0134, re-check `.ralph/fix_plan.md`'s Current
-Priority banner before continuing.
+Next step: re-run `scripts/pg-regress-runner.sh --verbose strings` to get
+strings.sql's post-fix diff line count (several fixture lines depended on
+empty-string results, so it should shrink from 2624), then continue sizing
+M0134-0070's remaining buckets — start with the string-literal continuation
+gap (small/contained); REFACTOR-tier buckets (Unicode-escape literals,
+POSITION/OVERLAY/LIKE ESCAPE/SIMILAR TO grammar, regexp_count/like/instr/
+substr family, regexp_replace backreferences, regexp_matches 'g' flag,
+regexp_split_to_table) are multi-file and should be split into their own
+milestone-scale slices, not attempted in one round.
 
-Gates run this loop: `go build ./...` PASS; `go test ./internal/parser/...
-./internal/executor/...` PASS (implementer, no -count=1); live cgroup-
-capped psql probe confirmed \d header parity; `scripts/pg-regress-
-runner.sh --verbose sequence` 226 lines (down from 239), zero
-unlogged-related hunks remain; `RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh` PASS (tester agent, ~8 min, internal/
-initdb cold-build dominated); `make ralph-state-guard` — found 2 stale
-markers (prior loop's clean-exit marker), auto-repaired, then PASS;
-pre-commit pgbench smoke PASS x2 (both commits, ~355-360 TPS TPC-B,
-~657-661 TPS simple-update, ~11800-11900 TPS select-only, 0 failed).
+Gates run this loop: `go build ./...` PASS; `go test
+./internal/postmaster/... ./internal/libpq/...` PASS (implementer, 57.4s,
+no -count=1); `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
+PASS (tester, ~90s mostly cached); targeted `go test -v -run
+'TestSimpleQueryEmptyStringNotNull|...|TestExtendedProtocolRepeatEmptyNotNull'
+./internal/postmaster/` PASS (tester, all 4 new tests individually
+verified); manual live verification via cgroup-capped server + psql
+`\pset null`/`\bind` for both simple-query and extended-protocol paths
+(implementer, both blank not NULLMARKER; non-regression `SELECT 'x'; SELECT
+'';` still correct); `make ralph-state-guard` — same recurring stale
+completed-marker inconsistency as every prior loop, auto-repaired, then
+PASS; pre-commit pgbench smoke PASS (347-663-12160 TPS, 0 failed).
 
-Delegation: researcher agent `a7dd22b1ef13901e3` (sized the SESSION
-AUTHORIZATION gap, refuted it as new, found the real UNLOGGED bug);
-implementer agent `a9b3694126b3f8da5` (1 round — landed parser+executor
-fix + tests cleanly, no deviations); tester agent `a186792720efb2d91` (1
-round — confirmed units gate PASS).
+Delegation: researcher agent `ab295c97e6fcc0074` (1 round — reproduced the
+bug, isolated root cause to all 4 call sites, recommended fix shape);
+implementer agent `aa2082fd88aaaf813` (1 round — landed the fix + 4 tests +
+manual verification cleanly, no deviations, no 5th call site found); tester
+agent `a32ee0c1700278b63` (1 round — confirmed units + postmaster gates
+PASS).
 
-In-flight: none. Commits `a61c7b46` and `f2b7aa7c` pushed to
-`regress-renumbering`. No server left running.
+In-flight: none. Commit `fd24fa33` pushed to `regress-renumbering`. No
+server left running.
