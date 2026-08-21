@@ -1,69 +1,71 @@
-Task: M0134-0069 (sequence.sql) — Bucket 5 now FULLY landed (sequence ACL/owner
-enforcement). Case still `failed` (0/1, diff 286→275 lines this loop).
-Committed & pushed (08b403d1).
+Task: M0134-0069 (sequence.sql) — Bucket 7 (owner-ACL-revocation enforcement)
+partially landed this loop, autocommit path only. Case still `failed` (0/1,
+diff held at 275 lines — unchanged, the fixture's owner-ACL sub-block runs
+inside BEGIN...ROLLBACK which the fix doesn't reach yet). Committed & pushed
+(7ff7303c).
 
-Files this loop: `internal/executor/operators_sequence.go` (new
-`resolveSeqCatalogTable` helper; `evalNextval`/`evalCurrval`/`evalSetval`/
-`evalLastval` each now require a privilege before acting), `internal/executor/
-operators_storage.go` (new `dmlPrivilegePermittedAsAny` OR-wrapper delegating
-to `dmlPrivilegePermittedAs`), `internal/executor/operators_ddl.go`
-(`execAlterSequence` owner check via `checkCommentObjectOwner`;
-`createSeqCatalogTable` now stamps `Owner` at sequence creation — was always
-empty before), `internal/executor/sequence_acl_test.go` (5 new tests),
-`.ralph/deferral_ledger.md` (new row, M0134-0069 dated 2026-08-21 — fourth
-entry), `.ralph/fix_plan.md` (M0134-0069 entry updated, still unchecked).
+Files this loop: `internal/catalog/catalog.go` (new `IsOwnerACLRevoked`/
+`HasOwnerPrivilege` Catalog methods), `internal/executor/operators_storage.go`
+(`dmlPrivilegePermittedAs`'s owner-bypass now conditional on
+`IsOwnerACLRevoked`), `internal/postmaster/grant_ddl.go`
+(`tryRecordTableGrant`/`tryRecordTableRevoke` now detect an owner-targeted
+GRANT/REVOKE by comparing against `tbl.Owner` instead of the internal
+`aclOwnerRole` sentinel, routing storage through the sentinel key either way),
+`internal/executor/sequence_acl_test.go` + `internal/postmaster/
+grant_ddl_test.go` (new tests), `.ralph/deferral_ledger.md` (2 new rows, 6th/
+7th M0134-0069 entries), `.ralph/fix_plan.md` (M0134-0069 entry updated).
 
-Key symbols: `resolveSeqCatalogTable`, `dmlPrivilegePermittedAsAny`
-(operators_storage.go), `execAlterSequence`'s new owner-check block,
-`createSeqCatalogTable`'s new `Owner` stamp.
+Key symbols: `Catalog.IsOwnerACLRevoked`/`HasOwnerPrivilege` (catalog.go),
+`dmlPrivilegePermittedAs` (operators_storage.go:2222), `tryRecordTableGrant`/
+`tryRecordTableRevoke`'s new `aclKey` local (grant_ddl.go).
 
-Hypothesis/Findings: case still `failed` overall — 5 of 6 sizing buckets now
-fully landed (1, 2, 3, 4, 5). A broader gap was discovered and deliberately
-LEFT UNFIXED this loop (per the brief's own scope boundary, escalated not
-patched around): `dmlPrivilegePermittedAs`'s owner-bypass
-(`operators_storage.go:2238-2240`) is unconditional — PG's owner privilege is
-actually a revocable implicit aclitem (`REVOKE ALL ON seq FROM
-<owning-role>` denies the owner too), and `sequence.sql:645-786`'s
-REVOKE-then-selective-GRANT sub-block needs that. This fix is TABLE-WIDE (used
-by every DML/SELECT/TRUNCATE owner-bypass check), not sequence-specific —
-needs its own sizing/design pass before briefing, and must first confirm no
-currently-green test (e.g. `TestDMLRequiresTablePrivilege`) depends on the
-current unconditional-bypass semantics. Groundwork exists:
-`internal/catalog/catalog.go`'s `aclOwnerRole` sentinel +
-`relACLOwnerRevoked`/`relACLEmptied` bookkeeping (`RevokeTablePrivilege`,
-catalog.go:16346-16371) already tracks this for ACL-*display* purposes
-(`\dp`, pg_dump relacl) — only the *enforcement* consult is missing.
+Hypothesis/Findings: the fix is real and verified correct live (autocommit
+mode, port 5534) but doesn't move `sequence.sql`'s diff because that fixture
+wraps its whole owner-ACL sub-block (lines 294-396, `regress_seq_user`) in an
+explicit `BEGIN...ROLLBACK`. Two NEW blockers discovered and ledgered (not yet
+fixed): (1) GRANT/REVOKE only gets recorded into the catalog ACL store in
+autocommit mode — `internal/postmaster/query.go` (~line 224/242) gates
+`tryRecordTableGrant`/`tryRecordTableRevoke` on
+`connTx == nil || !connTx.InExplicit()`; inside a transaction it falls through
+to `execCompatNoop` (`internal/executor/operators_ddl.go:20839`) which only
+does xmax/lock bookkeeping, never the catalog ACL mutation. (2) even once (1)
+is fixed, `GrantTablePrivilegeAs` (catalog.go ~16262-16273) unconditionally
+clears `relACLEmptied`/`relACLOwnerRevoked` on ANY owner-targeted GRANT
+(not just a full re-grant), so a single selective re-GRANT after a REVOKE ALL
+restores the owner's full bypass instead of just the one privilege — opposite
+of PG's per-privilege-independent semantics. Neither fix is achievable within
+a narrow brief; each needs its own sizing/design pass (transactional-DDL
+commit path for (1); reconciling the flags' original display-only purpose vs.
+this new enforcement consumer for (2)).
 
-Remaining M0134-0069 buckets/items per the ledger: Bucket 6 (small
-text/HINT/DETAIL gaps), `pg_sequence_parameters()` SRF missing, `\d` doesn't
-label UNLOGGED sequences, orphaned `sequence_test2` catalog row after
-cascading DROP TABLE, `pg_get_sequence_data` cache-vs-persisted mismatch,
-CASCADE-mode column-DEFAULT cascade drop, and the new owner-ACL-revocation
-gap above.
+Next step: decide between (a) sizing/briefing blocker (1) (transactional ACL
+recording — likely the bigger lever, unblocks (2) as well since the fixture
+needs both), or (b) picking a smaller standalone M0134-0069 item instead
+(Bucket 6 small text/HINT/DETAIL gaps — 9 diff lines, `pg_sequence_parameters`
+SRF — 7 lines, `\d` UNLOGGED label + `pg_get_sequence_data` cache mismatch — 2
+lines each; full bucketing from this loop's researcher round, agent
+`ada9081fbcdb3f63d`, still valid) to keep landing quick wins while blocker (1)
+awaits its own design pass. Recommend (b) next loop (Bucket 6, cheapest/
+lowest-risk remaining item) unless the banner has moved on from M0134.
 
-Next step: size and decide between (a) Bucket 6 (small text gaps — likely
-fastest remaining win) or (b) the owner-ACL-revocation table-wide fix (larger,
-higher-risk, but may be needed to fully close sequence.sql's privilege
-sub-block regardless of Bucket 6). Recommend delegating a researcher round
-first to size Bucket 6's line-count impact vs. the owner-ACL-revocation gap's
-remaining diff-line impact, so the next loop picks the higher-leverage one.
+Gates run this loop: `go build ./...` PASS; `go test
+./internal/executor/... ./internal/catalog/... ./internal/postmaster/...`
+PASS (incl. new tests); `scripts/pg-regress-runner.sh --verbose sequence` —
+275 lines, unchanged (no regression, confirmed via tester agent);
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS (tester
+agent, ~full run); `make ralph-state-guard` — found 2 stale markers,
+auto-repaired, then PASS; pre-commit pgbench smoke PASS (11864 TPS
+select-only, 663 TPS simple-update, 330 TPS TPC-B, 0 failed).
 
-Gates run this loop: `go build ./...` PASS; targeted test PASS (5/5 new
-tests); full `go test ./internal/executor/...` PASS (no regressions);
-`scripts/pg-regress-runner.sh --verbose sequence` — diff 286→275, the ALTER
-SEQUENCE-as-non-owner anchor now matches PG byte-for-byte;
-`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS (full
-suite incl. slow initdb/goopg packages, ~470s, run twice to confirm no
-flakiness); `make ralph-state-guard` — found 2 stale markers, auto-repaired,
-then PASS; pre-commit pgbench smoke PASS (11714 TPS select-only, 649 TPS
-simple-update, 353 TPS TPC-B, 0 failed).
+Delegation: researcher agent `ada9081fbcdb3f63d` (1 round — bucketed the
+275-line diff precisely, confirmed owner-ACL-revocation fix safety); coordinator
+did the root-cause dig itself this loop (sentinel-vs-actual-owner bug in
+grant_ddl.go, not caught by the researcher round) before briefing; implementer
+agent `a148454f78c4a6f4c` (1 round — landed the full brief, correctly widened
+scope to the GRANT twin per its own judgment, escalated NEEDS-DECISION when
+the regress diff didn't shrink rather than thrashing — right call, the root
+cause was outside its 3-file scope); tester agent `a60a863b4ec838261` (1
+round — confirmed no regression, ran both required gates).
 
-Delegation: researcher agent `ad828c8810a35bd55` (1 round — sized Bucket 5,
-confirmed PG semantics + reuse path, no escalation); implementer agent
-`a375f50ed827527aa` (1 round — landed the full brief, escalated the
-owner-ACL-revocation gap per its own escalation trigger rather than patching
-around it, no re-brief needed); tester agent `a3a63024eefe6f89f` (1 round —
-ran the full units pre-commit gate twice, PASS both times).
-
-In-flight: none. Commit `08b403d1` pushed to `regress-renumbering`. No
-server left running.
+In-flight: none. Commit `7ff7303c` pushed to `regress-renumbering`. No server
+left running.
