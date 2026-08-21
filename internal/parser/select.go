@@ -1931,11 +1931,15 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				left = inExpr
 				continue
 			}
-			// `expr [NOT] LIKE pattern` mirrors the IN handling. The
-			// pattern is a comparison-precedence operand so a bare
-			// string literal binds correctly without parens; nesting
-			// LIKE inside arithmetic expressions still works because
-			// we ascend at precCompare+1 for the rhs.
+			// `expr [NOT] LIKE pattern [ESCAPE escape_expr]` mirrors the IN
+			// handling. The pattern is a comparison-precedence operand so a
+			// bare string literal binds correctly without parens; nesting
+			// LIKE inside arithmetic expressions still works because we
+			// ascend at precCompare+1 for the rhs. An optional trailing
+			// ESCAPE clause (PG oracle: gram.y `a_expr LIKE a_expr ESCAPE
+			// a_expr`) is wrapped into a LikeEscapePattern so it survives
+			// as the BinaryOp's Right operand without touching the
+			// BinaryOp struct itself. M0134-0070.
 			if t := p.cur(); t.Kind == TokenKeyword && t.Keyword == KwLike {
 				pos := t.Pos
 				p.advance()
@@ -1956,6 +1960,10 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 					continue
 				}
 				rhs, err := p.parseExprPrec(precCompare + 1)
+				if err != nil {
+					return nil, err
+				}
+				rhs, err = p.wrapLikeEscape(rhs)
 				if err != nil {
 					return nil, err
 				}
@@ -1986,6 +1994,10 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				if err != nil {
 					return nil, err
 				}
+				rhs, err = p.wrapLikeEscape(rhs)
+				if err != nil {
+					return nil, err
+				}
 				left = &BinaryOp{pos: pos, Op: OpNotLike, Left: left, Right: rhs}
 				continue
 			}
@@ -2009,6 +2021,10 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 					continue
 				}
 				rhs, err := p.parseExprPrec(precCompare + 1)
+				if err != nil {
+					return nil, err
+				}
+				rhs, err = p.wrapLikeEscape(rhs)
 				if err != nil {
 					return nil, err
 				}
@@ -2036,6 +2052,10 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 					continue
 				}
 				rhs, err := p.parseExprPrec(precCompare + 1)
+				if err != nil {
+					return nil, err
+				}
+				rhs, err = p.wrapLikeEscape(rhs)
 				if err != nil {
 					return nil, err
 				}
@@ -3788,6 +3808,26 @@ func (p *parser) parseQueryOperandWithParens() (*SelectStmt, error) {
 // after the IN keyword. The parenthesised body is either a
 // parenthesised SELECT (uncorrelated subquery) or a value list
 // — disambiguated by whether the first inner token is SELECT.
+// wrapLikeEscape checks for a trailing `ESCAPE escape_expr` clause after a
+// LIKE/NOT LIKE/ILIKE/NOT ILIKE pattern rhs. If present, it consumes the
+// ESCAPE keyword and the escape expression (parsed at the same
+// comparison-precedence level as the pattern rhs) and wraps rhs in a
+// LikeEscapePattern; otherwise rhs is returned unchanged. PG oracle:
+// postgres/src/backend/parser/gram.y `a_expr LIKE a_expr ESCAPE a_expr`.
+// M0134-0070.
+func (p *parser) wrapLikeEscape(rhs Expr) (Expr, error) {
+	if t := p.cur(); t.Kind == TokenKeyword && t.Keyword == KwEscape {
+		pos := t.Pos
+		p.advance()
+		escExpr, err := p.parseExprPrec(precCompare + 1)
+		if err != nil {
+			return nil, err
+		}
+		return &LikeEscapePattern{pos: pos, Pattern: rhs, Escape: escExpr}, nil
+	}
+	return rhs, nil
+}
+
 func (p *parser) parseInTail(left Expr, pos int, negated bool) (Expr, error) {
 	if !p.acceptSymbol("(") {
 		return nil, p.errAtCur("expected '(' after IN")

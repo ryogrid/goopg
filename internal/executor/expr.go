@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 	"unsafe"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -428,6 +429,8 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 		return evalExprSlot(x.Operand, slot, ctx)
 	case *optimizer.MultiAssignSubqElem:
 		return evalMultiAssignSubqElem(x, slotToRow(slot), ctx)
+	case *optimizer.LikeEscapePattern:
+		return evalLikeEscapePattern(x, slot, ctx)
 	case *optimizer.InExpr:
 		return evalInExpr(x, slot, ctx)
 	case *optimizer.ExistsExpr:
@@ -2175,13 +2178,152 @@ func parseBoxText(s string) (ur, ll [2]float64, ok bool) {
 	return p1, p2, true
 }
 
+// evalLikeEscapePattern evaluates a LikeEscapePattern's Pattern and Escape
+// operands and rewrites Pattern into PostgreSQL's standard backslash-escape
+// convention, so the caller (evalBinary's LIKE/ILIKE arm, via
+// datumAsString+matchSQLLike) never has to know about ESCAPE at all — a
+// LikeEscapePattern only ever appears as a BinaryOp's Right operand, so this
+// is the single place the rewrite happens. M0134-0070.
+func evalLikeEscapePattern(x *optimizer.LikeEscapePattern, slot SlotView, ctx *Context) (Datum, error) {
+	pat, err := evalExprSlot(x.Pattern, slot, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	if pat.IsNull() {
+		return NullDatum, nil
+	}
+	esc, err := evalExprSlot(x.Escape, slot, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	if esc.IsNull() {
+		return NullDatum, nil
+	}
+	patStr, patOK := datumAsString(pat)
+	escStr, escOK := datumAsString(esc)
+	if !patOK || !escOK {
+		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "ESCAPE requires string operands"}
+	}
+	rewritten, err := likeEscapeRewrite(patStr, escStr, pat.Kind != KindBytes, x.Pos())
+	if err != nil {
+		return Datum{}, err
+	}
+	if pat.Kind == KindBytes {
+		return NewBytesDatum([]byte(rewritten)), nil
+	}
+	return NewStringDatum(rewritten), nil
+}
+
+// likeEscapeRewrite implements PostgreSQL's do_like_escape (PG oracle:
+// postgres/src/backend/utils/adt/like_match.c:392-486): rewrite pattern to
+// use the standard backslash-escape convention given an explicit ESCAPE
+// string.
+//
+//   - escape length 0: double every literal '\' in pattern so it stays
+//     literal against the always-backslash matcher.
+//   - escape length 1 and the char IS '\': pattern unchanged.
+//   - escape length 1 and char is anything else: substitute each occurrence
+//     of the escape char with '\', and double each literal '\' not
+//     immediately preceded by a substituted escape.
+//   - escape length > 1: ERROR 22025 invalid_escape_sequence.
+//
+// runeMode selects character-based (text) vs byte-based (bytea) counting
+// and iteration, matching PG's MB-aware text path vs single-byte bytea
+// path. M0134-0070.
+func likeEscapeRewrite(pattern, escape string, runeMode bool, pos int) (string, error) {
+	invalidEscapeErr := func() error {
+		return &ExecError{Code: "22025", Pos: pos, Message: "invalid escape string",
+			Hint: "Escape string must be empty or one character."}
+	}
+	if runeMode {
+		switch utf8.RuneCountInString(escape) {
+		case 0:
+			var b strings.Builder
+			for _, r := range pattern {
+				if r == '\\' {
+					b.WriteByte('\\')
+				}
+				b.WriteRune(r)
+			}
+			return b.String(), nil
+		case 1:
+			escRune, _ := utf8.DecodeRuneInString(escape)
+			if escRune == '\\' {
+				return pattern, nil
+			}
+			var b strings.Builder
+			afterEscape := false
+			for _, r := range pattern {
+				switch {
+				case r == escRune && !afterEscape:
+					b.WriteByte('\\')
+					afterEscape = true
+				case r == '\\':
+					b.WriteByte('\\')
+					if !afterEscape {
+						b.WriteByte('\\')
+					}
+					afterEscape = false
+				default:
+					b.WriteRune(r)
+					afterEscape = false
+				}
+			}
+			return b.String(), nil
+		default:
+			return "", invalidEscapeErr()
+		}
+	}
+	// Byte mode (bytea): PG's bytea_like_escape counts and iterates raw bytes.
+	switch len(escape) {
+	case 0:
+		var b strings.Builder
+		for i := 0; i < len(pattern); i++ {
+			if pattern[i] == '\\' {
+				b.WriteByte('\\')
+			}
+			b.WriteByte(pattern[i])
+		}
+		return b.String(), nil
+	case 1:
+		escByte := escape[0]
+		if escByte == '\\' {
+			return pattern, nil
+		}
+		var b strings.Builder
+		afterEscape := false
+		for i := 0; i < len(pattern); i++ {
+			c := pattern[i]
+			switch {
+			case c == escByte && !afterEscape:
+				b.WriteByte('\\')
+				afterEscape = true
+			case c == '\\':
+				b.WriteByte('\\')
+				if !afterEscape {
+					b.WriteByte('\\')
+				}
+				afterEscape = false
+			default:
+				b.WriteByte(c)
+				afterEscape = false
+			}
+		}
+		return b.String(), nil
+	default:
+		return "", invalidEscapeErr()
+	}
+}
+
 // matchSQLLike implements SQL LIKE pattern semantics: '%' matches
 // any (possibly empty) sequence, '_' matches exactly one character,
-// every other byte matches itself. v0 does not honour an ESCAPE
-// clause — escapes are upstream's default backslash where the next
-// character is taken literally. The implementation is the standard
-// recursive-descent matcher (no regex translation, so embedded
-// special chars in the input never interact with regex syntax).
+// every other byte matches itself. An ESCAPE clause is handled upstream by
+// evalLikeEscapePattern/likeEscapeRewrite, which rewrite the pattern into
+// this function's standard-backslash convention before it ever runs — this
+// function itself always uses the default backslash escape. M0134-0070.
+// The implementation is the standard recursive-descent matcher (no regex
+// translation, so embedded special chars in the input never interact with
+// regex syntax).
 func matchSQLLike(s, pat string) bool {
 	si, pi := 0, 0
 	starS, starP := -1, -1

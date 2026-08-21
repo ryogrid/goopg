@@ -514,6 +514,22 @@ type BinaryOp struct {
 	ResultType string // non-empty for arithmetic with typed result (e.g., "int2")
 }
 
+// LikeEscapePattern is the optimizer-side mirror of parser.LikeEscapePattern.
+// It appears ONLY as the Right operand of a BinaryOp{Op: OpLike/OpNotLike/
+// OpILike/OpNotILike} when the source had a LIKE...ESCAPE clause; the
+// executor evaluates Pattern and Escape and rewrites the pattern into
+// PostgreSQL's standard backslash-escape convention before the normal LIKE
+// match runs (PG oracle: postgres/src/backend/utils/adt/like_match.c:392-486
+// do_like_escape). M0134-0070.
+type LikeEscapePattern struct {
+	pos     int
+	Pattern Expr
+	Escape  Expr
+}
+
+func (e *LikeEscapePattern) Pos() int { return e.pos }
+func (*LikeEscapePattern) exprNode()  {}
+
 func (e *BinaryOp) Pos() int { return e.pos }
 func (*BinaryOp) exprNode()  {}
 

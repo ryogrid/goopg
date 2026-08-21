@@ -125,6 +125,7 @@ const (
 	KwReplace     Keyword = "replace"
 	KwLike        Keyword = "like"
 	KwIlike       Keyword = "ilike"
+	KwEscape      Keyword = "escape"
 	KwBetween     Keyword = "between"
 	KwSymmetric   Keyword = "symmetric"
 	KwAsymmetric  Keyword = "asymmetric"
@@ -342,6 +343,7 @@ var keywords = map[string]Keyword{
 	"checkpoint":  KwCheckpoint,
 	"like":         KwLike,
 	"ilike":        KwIlike,
+	"escape":       KwEscape,
 	"between":      KwBetween,
 	"symmetric":    KwSymmetric,
 	"asymmetric":   KwAsymmetric,

@@ -221,6 +221,24 @@ type InExpr struct {
 func (e *InExpr) Pos() int { return e.pos }
 func (*InExpr) exprNode()  {}
 
+// LikeEscapePattern wraps a LIKE/ILIKE pattern together with its ESCAPE
+// clause operand. It implements Expr and appears ONLY as the Right operand
+// of a BinaryOp{Op: OpLike/OpNotLike/OpILike/OpNotILike} when an ESCAPE
+// clause was present in the source; ordinary LIKE (no ESCAPE) still puts
+// the bare pattern expr directly in Right, so this is fully backward
+// compatible with every other BinaryOp use. M0134-0070.
+//
+// PG oracle: postgres/src/backend/parser/gram.y (a_expr LIKE a_expr ESCAPE
+// a_expr productions).
+type LikeEscapePattern struct {
+	pos     int
+	Pattern Expr
+	Escape  Expr
+}
+
+func (n *LikeEscapePattern) Pos() int { return n.pos }
+func (*LikeEscapePattern) exprNode()  {}
+
 // ExistsExpr is `EXISTS (subquery)` and its NOT variant. The
 // executor opens the inner plan, asks for the first row, and
 // returns true (or false for NOT EXISTS) iff at least one row

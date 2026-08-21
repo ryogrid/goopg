@@ -162,6 +162,7 @@ var allExprTypes = []parser.Expr{
 	&parser.IsBoolExpr{},
 	&parser.IsDistinctFromExpr{},
 	&parser.IsNullExpr{},
+	&parser.LikeEscapePattern{},
 	&parser.NullConst{},
 	&parser.NumericConst{},
 	&parser.ParamRef{},

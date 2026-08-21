@@ -1254,6 +1254,18 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			}
 		}
 		return catalog.Type{Name: "bool"}, nil
+	case *parser.LikeEscapePattern:
+		// Only ever appears as a LIKE/ILIKE BinaryOp's Right operand (see
+		// parser.LikeEscapePattern doc); walk Pattern/Escape for nested
+		// errors and report text so the enclosing OpLike/OpILike arm's
+		// isStringLike(rightTyp) check passes. M0134-0070.
+		if _, err := analyzeExpr(x.Pattern, ctx); err != nil {
+			return catalog.Type{}, err
+		}
+		if _, err := analyzeExpr(x.Escape, ctx); err != nil {
+			return catalog.Type{}, err
+		}
+		return catalog.Type{Name: "text"}, nil
 	case *parser.IsNullExpr:
 		// IS [NOT] NULL always returns bool. Recurse into operand to catch errors.
 		if _, err := analyzeExpr(x.Operand, ctx); err != nil {

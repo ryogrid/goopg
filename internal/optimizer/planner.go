@@ -7387,6 +7387,18 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		return planInExpr(x, buildHavingParentCtx(agg))
 	case *parser.ExistsExpr:
 		return planExistsExpr(x, buildHavingParentCtx(agg))
+	case *parser.LikeEscapePattern:
+		// Mirrors the resolveExpr case: only ever the Right operand of a
+		// LIKE/ILIKE BinaryOp. M0134-0070.
+		pat, err := resolveExprAfterAggregate(x.Pattern, agg)
+		if err != nil {
+			return nil, err
+		}
+		esc, err := resolveExprAfterAggregate(x.Escape, agg)
+		if err != nil {
+			return nil, err
+		}
+		return &LikeEscapePattern{pos: x.Pos(), Pattern: pat, Escape: esc}, nil
 	case *parser.IsNullExpr:
 		operand, err := resolveExpr(x.Operand, agg.input)
 		if err != nil {
@@ -13253,6 +13265,18 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		return planInExpr(x, ctx)
 	case *parser.ExistsExpr:
 		return planExistsExpr(x, ctx)
+	case *parser.LikeEscapePattern:
+		// Only ever appears as the Right operand of a LIKE/ILIKE BinaryOp
+		// (see parser.LikeEscapePattern doc). M0134-0070.
+		pat, err := resolveExpr(x.Pattern, ctx)
+		if err != nil {
+			return nil, err
+		}
+		esc, err := resolveExpr(x.Escape, ctx)
+		if err != nil {
+			return nil, err
+		}
+		return &LikeEscapePattern{pos: x.Pos(), Pattern: pat, Escape: esc}, nil
 	case *parser.RowExpr:
 		elems := make([]Expr, len(x.Elems))
 		types := make([]catalog.Type, len(x.Elems))
