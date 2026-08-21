@@ -71,6 +71,17 @@ export PG_ABS_SRCDIR="${REGRESS_SQL%/*}"   # postgres/src/test/regress (holds da
 export PG_LIBDIR="${REGRESS_SQL%/*}"
 export PG_DLSUFFIX=".so"
 
+# Export the same session-format env vars pg_regress sets before invoking each
+# test's psql client (postgres/src/test/regress/pg_regress.c:783-796), so the
+# expected/*.out files (captured under Postgres/MDY datestyle, America/Los_Angeles
+# timezone, and postgres_verbose interval style) compare against a matching
+# session instead of goopg's ISO/MDY session defaults. Append to any
+# caller-supplied PGOPTIONS rather than clobbering it, matching pg_regress.c's
+# own append behavior.
+export PGTZ="America/Los_Angeles"
+export PGDATESTYLE="Postgres, MDY"
+export PGOPTIONS="${PGOPTIONS:+${PGOPTIONS} }-c intervalstyle=postgres_verbose"
+
 # -------------------------------------------------------------------------- #
 # Defaults
 # -------------------------------------------------------------------------- #
