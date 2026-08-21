@@ -4283,6 +4283,40 @@ func (p *parser) parseSubstringFuncCall(pos int, name string) (Expr, error) {
 		return &FuncCall{pos: pos, Name: ObjectName{pos: pos, Name: name}, Args: args}, nil
 	}
 
+	// SQL:1999/2003 form: SUBSTRING(str SIMILAR pattern ESCAPE escape).
+	// PG oracle: postgres/src/backend/parser/gram.y substr_list production
+	// `a_expr SIMILAR a_expr ESCAPE a_expr` — unlike the boolean `SIMILAR TO`
+	// operator's optional ESCAPE clause (parseOptionalEscape), the grammar
+	// makes ESCAPE mandatory here; there is no escape-optional alternative
+	// for this production. Desugars (via system_functions.sql's
+	// substring(text,text,text) SQL wrapper, `RETURN substring($1,
+	// similar_to_escape($2, $3))`) to a plain 2-arg substring(str, pattern)
+	// call once pattern/escape are constant-folded through
+	// similarto.ConvertSubstring. M0134-0070; see
+	// docs/design/m0134-0070-substring-similar-escape.md. The older SQL:1999
+	// `SUBSTRING(str FROM pattern FOR escape)` overload spelling of this same
+	// semantics is a separate, out-of-scope mechanism (overload resolution
+	// on FROM/FOR operand types, not a distinct grammar production) — not
+	// handled here.
+	if t := p.cur(); t.Kind == TokenKeyword && t.Keyword == KwSimilar {
+		p.advance() // SIMILAR
+		pattern, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expectKeyword(KwEscape); err != nil {
+			return nil, err
+		}
+		escape, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')' to close SUBSTRING")
+		}
+		return p.buildSubstringSimilar(str, pattern, escape, pos)
+	}
+
 	// SQL-standard form: SUBSTRING(str FROM start [FOR count])
 	if _, err := p.expectKeyword(KwFrom); err != nil {
 		return nil, err
@@ -4304,6 +4338,54 @@ func (p *parser) parseSubstringFuncCall(pos int, name string) (Expr, error) {
 		return nil, p.errAtCur("expected ')' to close SUBSTRING")
 	}
 	return &FuncCall{pos: pos, Name: ObjectName{pos: pos, Name: name}, Args: args}, nil
+}
+
+// buildSubstringSimilar constant-folds SUBSTRING(str SIMILAR pattern ESCAPE
+// escape) (SQL:1999/2003 form) into a plain 2-arg substring(str,
+// <converted-pattern>) FuncCall, mirroring buildSimilarTo's literal-check →
+// validate-escape → convert → fold shape but adapted for this form's
+// 3-operand STRICT semantics: str, pattern, AND escape all participate in
+// NULL propagation (PG oracle: system_functions.sql's substring(text,text,
+// text) wrapper is declared STRICT, so any of the three being SQL NULL
+// makes the whole call NULL), not just pattern/escape as in buildSimilarTo's
+// 2-operand boolean-operator case. The converted pattern lands directly on
+// the existing evalSubstr/evalSubstrRegex 2-arg path — no executor changes.
+// M0134-0070.
+func (p *parser) buildSubstringSimilar(str, pattern, escape Expr, pos int) (Expr, error) {
+	_, strNull, strOK := similarToLiteralValue(str)
+	patVal, patNull, patOK := similarToLiteralValue(pattern)
+	escVal, escNull, escOK := similarToLiteralValue(escape)
+	if !strOK || !patOK || !escOK {
+		return nil, p.errAtCur("SUBSTRING(... SIMILAR ... ESCAPE ...) with non-literal operands is not yet supported")
+	}
+	if strNull || patNull || escNull {
+		return &NullConst{pos: pos}, nil
+	}
+	if err := similarto.ValidateEscape(escVal); err != nil {
+		return nil, &SyntaxError{
+			Pos: -1, Raw: true, Code: "22025",
+			Message: "invalid escape string",
+			Hint:    "Escape string must be empty or one character.",
+		}
+	}
+	converted, err := similarto.ConvertSubstring(patVal, escVal)
+	if err != nil {
+		if err == similarto.ErrTooManyQuoteSeparators {
+			return nil, &SyntaxError{
+				Pos: -1, Raw: true, Code: "2200C",
+				Message: err.Error(),
+			}
+		}
+		return nil, err
+	}
+	return &FuncCall{
+		pos:  pos,
+		Name: ObjectName{pos: pos, Name: "substring"},
+		Args: []Expr{
+			str,
+			&TypedStringLit{pos: pos, Type: "text", Value: converted},
+		},
+	}, nil
 }
 
 
