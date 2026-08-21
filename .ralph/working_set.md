@@ -1,67 +1,79 @@
 Task: M0134-0070 (strings.sql) — regress-sql `failed`, still in progress.
-This loop landed the "string-literal continuation across newlines" bucket
-(one of many buckets sized in prior loops) and re-measured the diff.
+This loop fixed the cross-cutting LINE/caret false-diff gap sized last loop
+(BinaryExpr/UnaryExpr/shared-arithmetic-helper `ExecError` sites only).
 
-Files this loop: `internal/parser/lexer.go` (plain `'...'` branch in
-`next()` + `lexEscapeString` (`E'...'`) both now loop through new
-`tryQuoteContinuation()` lookahead — newline-tracking, mirrors
-`skipWhitespaceAndComments` — plus `scanPlainQuoteInto`/
-`scanEscapeQuoteInto` scan helpers), new test
-`internal/parser/string_continuation_test.go` (5 cases). Also
-`.ralph/fix_plan.md` (M0134-0070 entry) and `.ralph/deferral_ledger.md`
-(new row dated 2026-08-21, string-literal-continuation entry).
+Files this loop: `internal/executor/expr.go` (removed `Pos:` from the
+runtime-eval raise sites — division-by-zero, arithmetic overflow, pg_lsn
+overflow, invalid-regex, negative-substring-length, timestamp/interval
+out-of-range, shared `arithmetic()` int64 helper), `internal/executor/exprnode.go`
+(compiled twin, mirrored the int2/int4 overflow fix — Rule 4 sibling sync),
+`internal/executor/expr_sibling_parity_test.go` (corrected a `Pos != 0`
+assumption that was itself wrong per PG oracle), new
+`internal/executor/expr_error_position_test.go`. Also `.ralph/fix_plan.md`
+(M0134-0070 entry) and `.ralph/deferral_ledger.md` (new row, 2026-08-21,
+LINE/caret entry).
 
-Key symbols: `tryQuoteContinuation()`, `scanPlainQuoteInto`,
-`scanEscapeQuoteInto` (all `internal/parser/lexer.go`).
+Key symbols: `evalExprSlot`/`evalUnary`/`evalBinary`/`evalPgLSNBinary`/
+`timestampOutOfRange`/`intervalOutOfRange`/`intervalDiv`/`arithmetic()`
+(all `internal/executor/expr.go`) — the sites that lost `Pos:`.
 
-Hypothesis/Findings: PG's continuation is a pure lexer-state-machine
-feature (`scan.l` `<xqs>` lookahead state) — resumes scanning the
-continuation fragment IN THE SAME decode-state as the opener, so an
-`E'...'`-opened literal's bare `'...'` continuation piece still gets
-backslash-escape decoding. Confirmed self-contained: no grammar/executor/
-planner touch needed, `TokenStringLit` stays a single atomic token
-downstream. `strings.sql` diff shrank 2624→2614 lines (small bucket, as
-sized). Remaining buckets are all REFACTOR-tier (missing builtins
-`unistr`/`bit_count`/`regexp_instr`/`regexp_substr` now drive the largest
-diff share; Unicode-escape/bit-string/hex-string literals; `POSITION`/
-`OVERLAY`/`LIKE ESCAPE`/`SIMILAR TO` grammar; `regexp_replace`
-backreferences; `regexp_matches(...,'g')` multi-match;
-`regexp_split_to_table`; bytea trim/overlay edge cases) — each is a new
-literal-quote-kind, new builtin-function family, or new grammar form, not
-a small contained slice.
+Hypothesis/Findings: PG server-side never renders "LINE N:" text itself; it
+only sets `ErrorData.cursorpos` via `errposition()`
+(`postgres/src/backend/utils/error/elog.c:1468`), and the CLIENT
+(`fe-protocol3.c:1200` `reportErrorPosition`) draws LINE+caret only when
+that field is present. PG sets it for lex/parse errors and for literal-
+constant type coercion at parse time (`parse_node.c:140,354-459`'s
+`setup_parser_errposition_callback`) — NOT for plain runtime execution of
+operator/function C code (confirmed: no `errposition()` calls anywhere in
+`int.c`/`int8.c`/`float.c`/`pg_lsn.c`/`timestamp.c`/`regexp.c`'s runtime
+arithmetic/function bodies). goopg's `expr.go` set `Pos` unconditionally on
+all ~174 `ExecError` sites; fixed the BinaryExpr/UnaryExpr/shared-helper
+subset this loop. `strings.sql` diff shrank 2539→2501 lines (live psql
+probe confirmed the fix: `SELECT 1/c FROM (VALUES (0)) t(c);` now omits
+LINE/caret). Three follow-on gaps discovered, NOT fixed (own deferral-ledger
+entries, same row): (1) `internal/executor/unistr.go`'s 3 raise sites are
+NOT Pos-less as a prior loop's row incorrectly assumed — same fix pattern,
+small/contained, good next-slice candidate; (2) `roundNumericToInt`
+(numeric→int8 CAST path) doesn't distinguish bare-literal casts (PG: Pos
+present) from column-derived casts (PG: likely Pos-absent, not
+independently reverified) — harder, needs literal-vs-column AST
+classification; (3) `abs()`/`gcd()`/`lcm()`/`mod()` FuncCall builtin sites
+in expr.go are the same "pure runtime, no PG errposition" shape but weren't
+in this loop's scope (different call-site family).
 
-Next step: pick ONE remaining M0134-0070 bucket and size/scope it as its
-own slice (or its own milestone-scale task if it turns out multi-file).
-Suggest starting with the missing-builtins family
-(`unistr`/`bit_count`/`crc32c`) since it's flagged as driving the largest
-remaining diff share and may be more contained than the regexp-family or
-grammar-form buckets — but re-verify sizing via `researcher` before
-committing to that choice, since the last several M0134-0070 rounds have
-each revealed the "next" bucket is bigger than expected. Alternatively,
-if M0134-0070 buckets are all now REFACTOR-tier/milestone-scale, consider
-whether to PARK 0070 (same pattern as 0069) and move to M0134-0071 next —
-weigh this against the fix_plan banner (M0134 next-priority-after-
-M-NIGHTLY) at the START of next loop.
+Next step: pick ONE of: (a) fix `unistr.go`'s 3 Pos-setting sites (small,
+same pattern as this loop — good first candidate); (b) another `strings.sql`
+REFACTOR-tier bucket (Unicode-escape/bit-string/hex-string literals;
+POSITION/OVERLAY/LIKE ESCAPE/SIMILAR TO grammar; regexp_count/regexp_like/
+regexp_instr/regexp_substr family; regexp_replace backreferences;
+regexp_matches(...,'g') multi-match; regexp_split_to_table); (c) the
+`abs`/`gcd`/`lcm`/`mod` Pos-stripping fast-follow. Re-verify against the
+fix_plan banner (M0134 next-priority-after-M-NIGHTLY) at the START of next
+loop; also re-check `ci/logs/action-items.md` for new `## AI-` items (none
+found this loop — nightly run 20260821-002906 was `status: pass`, `items:
+0`, only non-blocking env-drift notices about newly-SKIPPED TestPort_*
+tests, no action required).
 
-Gates run this loop: `go build ./...` PASS; `go test
-./internal/parser/...` PASS (implementer, cached-fast); `RALPH_PRECOMMIT_
-SCOPE=units scripts/ralph-precommit-test.sh` PASS (tester); `scripts/pg-
-regress-runner.sh --verbose strings` run twice (pre- and post-fix
-sizing/verification, both via tester under cgroup cap) — FAIL as
-expected (0/1 PASS, case still open), diff 2624→2614 lines confirming the
-fix's narrow scope; `make ralph-state-guard` — same recurring stale
-completed-marker inconsistency as every prior loop, auto-repaired, then
-PASS; pre-commit pgbench smoke PASS (359-666-12040 TPS, 0 failed).
+Gates run this loop: `go build ./...` PASS; `go test ./internal/executor/...
+-run 'TestRuntimeEvalErrorsCarryNoPos|TestLiteralCastOverflowStillCarriesPos'`
+PASS; `go test ./internal/executor/... -run 'TestExprSiblingParity'` PASS;
+full `go test ./internal/executor/...` PASS (7.4s, coordinator re-verified);
+`go vet ./internal/executor/...` clean; `scripts/pg-regress-runner.sh
+--verbose strings` (tester, cgroup-capped) — diff 2539→2501 lines, confirmed
+no brief-target error messages carry `+LINE` noise anymore;
+`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS (tester);
+`make ralph-state-guard` — same recurring stale completed-marker
+inconsistency as every prior loop, auto-repaired, then PASS; pre-commit
+pgbench smoke PASS (362-673-12098 TPS, 0 failed).
 
-Delegation: tester agent `a45675493664587a3` (1 round — pre-fix
-strings.sql diff re-measurement, confirmed DataRow fix from last loop
-didn't move this file's diff); researcher agent `a379df97aeb84216f` (1
-round — cited PG oracle scan.l mechanism, confirmed goopg has no
-continuation handling, recommended lexer-internal implementation site);
-implementer agent `a3cdf2147f8cb686f` (1 round — landed the fix + 5 tests
-cleanly, one test-authoring correction noted in report, no scope
-deviation); tester agent `ad3c733a4d856f173` (1 round — precommit PASS +
-post-fix diff re-measurement, 2624→2614).
+Delegation: researcher agent `adc568f39c939393d` (2 rounds — first sized
+the LINE/caret gap end-to-end with PG-oracle + goopg citations; follow-up
+via SendMessage resolved the literal-cast-vs-runtime-eval classification
+unknown, confirming the exact site list was safe to strip); implementer
+agent `aed8429b621548edc` (1 round — landed the fix cleanly per brief, ran
+its own pre-edit verification probe per the brief's mandate, documented 3
+deviations and 3 deferral candidates in report.md, all reasonable). Both
+agents completed; no further rounds needed.
 
-In-flight: none. Commit `dfc15b7f` pushed to `regress-renumbering`. No
+In-flight: none. Commit `b6524e0b` pushed to `regress-renumbering`. No
 server left running.
