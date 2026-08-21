@@ -11879,7 +11879,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 				n := v.Int
 				if n == math.MinInt64 {
 					// abs(MinInt64) overflows: MinInt64 = -2^63, abs = 2^63 which can't fit int64.
-					return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "bigint out of range"}
+					return Datum{}, &ExecError{Code: "22003", Message: "bigint out of range"}
 				}
 				if n < 0 {
 					n = -n
@@ -12132,10 +12132,10 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 				bv.Int >= -2147483648 && bv.Int <= 2147483647
 			if isInt4Range {
 				if ua > 2147483647 {
-					return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "integer out of range"}
+					return Datum{}, &ExecError{Code: "22003", Message: "integer out of range"}
 				}
 			} else if ua > maxInt64 {
-				return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "bigint out of range"}
+				return Datum{}, &ExecError{Code: "22003", Message: "bigint out of range"}
 			}
 			return Datum{Kind: KindInt, Int: int64(ua)}, nil
 		}
@@ -12164,10 +12164,10 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 				bv.Int >= -2147483648 && bv.Int <= 2147483647
 			if isInt4Range {
 				if result > 2147483647 {
-					return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "integer out of range"}
+					return Datum{}, &ExecError{Code: "22003", Message: "integer out of range"}
 				}
 			} else if result > maxInt64 {
-				return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "bigint out of range"}
+				return Datum{}, &ExecError{Code: "22003", Message: "bigint out of range"}
 			}
 			return Datum{Kind: KindInt, Int: int64(result)}, nil
 		}
@@ -12180,7 +12180,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 				return NullDatum, nil
 			}
 			if b.Int == 0 {
-				return Datum{}, &ExecError{Code: "22012", Pos: x.Pos(), Message: "division by zero"}
+				return Datum{}, &ExecError{Code: "22012", Message: "division by zero"}
 			}
 			return Datum{Kind: KindInt, Int: a.Int % b.Int}, nil
 		}
