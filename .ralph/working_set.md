@@ -1,84 +1,91 @@
-Task: M0134-0070 (strings.sql) — regress-sql `failed`. This loop landed Round B
-of the 2-round Unicode-escape sizing pass (`U&'...'`/`U&"..."` + `UESCAPE`
-literal syntax), committed/pushed (`edfa14de`). strings.sql itself remains
-`failed` overall (diff now 1804 lines, down from 1848 at loop start).
+Task: M0134-0070 (strings.sql) — regress-sql `failed`. This loop landed Round
+D of the `regexp_*` family sizing pass: `regexp_split_to_table(...)`
+FROM-clause table-valued-SRF wiring, committed/pushed (`3f4d7c5a`).
+strings.sql remains `failed` overall (many unrelated pre-existing gaps: e.g.
+`standard_conforming_strings=off` lexing, `chr(0)`, bytea trim/LIKE,
+`char(N)` literal concat syntax — untouched).
 
-This loop: delegated a researcher round to confirm goopg's exact lexer
-insertion point, UESCAPE-lookahead approach, `standard_conforming_strings`
-gate status, and PG oracle semantics for `U&` escape forms (4-hex `\XXXX` /
-6-hex `\+XXXXXX`, no 8-hex form — that stays `E'...'`-only) before briefing —
-per the prior loop's own "worth a short researcher round first" note. Wrote
-a new design doc `docs/design/m0134-0070-uescape-unicode-literals.md`
-(indexed in `docs/design/README.md`) documenting the lexer-only approach (no
-new parser production, no new `TokenKind` — reuses `TokenStringLit`/
-`TokenQuotedIdent`) and why (goopg's lexer fully materializes tokens up
-front, unlike PG's two-layer scanner/parser split, so UESCAPE must collapse
-into the decoded value before token emission). Delegated one implementer
+This loop: (1) re-checked fix_plan banner (M0134 still next-priority after
+M-NIGHTLY per 2026-08-15 directive) and `ci/logs/action-items.md` — same
+nightly run (20260822-001356) as last loop, its 5 items were already filed
+last loop as AI-20260822-001356-001..005, nothing new to file, none block
+M0134's gates. (2) Delegated a researcher round confirming Round D's exact
+wiring shape (planner.go:4639 dispatch site, planFromRegexpMatches at
+5129-5185 as the mirror target, FromRegexpMatches plan node at
+plan.go:1819-1834, fromRegexpMatchesOp operator, plus the reusable split
+algorithm already in the scalar regexp_split_to_array case at
+expr.go:12876-12914) and the PG oracle (regexp.c:1748-1897, confirms N
+matches -> N+1 rows via re.Split(s,-1), and that PG forces glob=true
+internally after rejecting explicit 'g'). (3) Delegated one implementer
 round; converged in round 1 (within the 3-round cap).
 
-Landed: `internal/parser/lexer.go` gained `lexUnicodeEscapeQuote` (dispatch
-sibling to the existing `E'...'` branch in `next()`'s `isIdentStart` case),
-`decodeUnicodeEscapes` (local-cursor decoder mirroring PG's `str_udeescape`,
-reuses Round A's surrogate-pair helpers verbatim), a shared
-`scanUnicodeEscapeDigitsAt` free function factored out of Round A's
-`l.pos`-based `scanUnicodeEscapeDigits` (now a thin wrapper — both Round A's
-and Round B's call sites share one implementation), and `isValidUescapeChar`
-mirroring `check_uescapechar`. `UESCAPE` is a lexer-local raw-text peek
-(save/restore `l.pos` on mismatch) — NOT registered in `token.go`'s
-`keywords` map, so it stays an ordinary identifier everywhere else, matching
-PG's `UNRESERVED_KEYWORD` classification. New test
-`internal/parser/unicode_escape_literal_test.go` (14 subtests: default/custom
-escape char, 4-hex/6-hex-wide forms, surrogate pairing success/failure,
-codepoint-range rejection, malformed-escape 22025 with U&-specific hint text
-distinct from Round A's, 4 rejected UESCAPE chars, string+identifier forms,
-continuation interaction). Handoff dir:
-`tmp/ralph-handoffs/m0134-0070-uescape-literals/` (brief.md +
-report.md, report.md written by this session since the implementer role is
-blocked from writing report files directly) — scratch, not system of record.
+Landed: `internal/optimizer/plan.go` gained `FromRegexpSplitToTable` (mirrors
+`FromRegexpMatches`, `text`-typed single column not `text[]`);
+`internal/optimizer/planner.go` gained a `planTableFuncRangeVar` dispatch
+branch + `planFromRegexpSplitToTable`; `internal/executor/executor.go`
+gained the plan-node dispatch case; new file
+`internal/executor/operators_from_regexp_split_to_table.go`
+(`fromRegexpSplitToTableOp`, mirrors `fromRegexpMatchesOp`'s Open/Next/Close);
+`internal/executor/expr.go` gained `evalRegexpSplitToTable` — reuses shared
+`pgRegexFlagsToGoModifiers` (Round C), rejects explicit `g` with `22023`
+correctly naming `regexp_split_to_table()` (not copy-pasted from the
+`_array` sibling's message), raises `2201B` on invalid pattern (stricter
+than `evalRegexpMatchesSRF`'s permissive silent-empty, matching PG's shared
+`setup_regexp_matches` behavior for both split functions). New test
+`internal/executor/from_regexp_split_to_table_test.go`
+(`TestFromRegexpSplitToTable`: basic split N->N+1 rows, no-match, column
+alias, `g`-rejection, invalid-pattern 2201B, WITH ORDINALITY). Handoff dir:
+`tmp/ralph-handoffs/m0134-0070-regexp-split-to-table/` (brief.md +
+report.md) — scratch, not system of record.
 
-Key symbols: `lexUnicodeEscapeQuote`, `decodeUnicodeEscapes`,
-`scanUnicodeEscapeDigitsAt`, `isValidUescapeChar` (all
-`internal/parser/lexer.go`).
+Key symbols: `planFromRegexpSplitToTable`, `FromRegexpSplitToTable`
+(`internal/optimizer/`), `fromRegexpSplitToTableOp`, `evalRegexpSplitToTable`
+(`internal/executor/`).
 
-Deferred (ledger row 2026-08-22, M0134-0070 U&/UESCAPE entry):
-`standard_conforming_strings=off` gate (goopg has no functioning off-mode
-string lexing anywhere — dead code until that lands generally) and PG's
-dedicated "UESCAPE must be followed by a simple string literal" diagnostic
-(goopg falls back to a generic syntax error on a malformed UESCAPE clause).
-Neither is exercised by strings.sql's own fixture lines.
+Deferred (ledger row 2026-08-22, M0134-0070 Round D entry): (1)
+`string_to_table(string, delimiter[, null_string])` — literal-delimiter twin
+of `regexp_split_to_table`, same table-valued-SRF shape, completely unwired
+(currently only denylisted in `operators_ddl_partition.go`'s
+`isBuiltinSRF`); PG oracle `varlena.c` `text_to_table`/`text_to_array`
+family. (2) `SELECT regexp_split_to_table(...)` in SELECT-list (non-FROM)
+position — PG allows it via `operators_project_set.go`'s SRF-in-targetlist
+machinery (parallel to existing `regexpMatchesResults` handling), but
+strings.sql's fixture only exercises FROM-clause form so no evidence either
+way this round.
 
-Next step: pick the next bucket for strings.sql (1804-line diff remaining).
-Best candidate: decompose the dominant `regexp_*` family
-(`regexp_count`/`regexp_like`/`regexp_instr`/`regexp_substr`,
-`regexp_replace` backreferences, `regexp_matches(...,'g')` multi-match,
-`regexp_split_to_table`) — largest remaining bucket by line count (~1215 of
-1688 lines per the 2026-08-21 researcher sizing pass, likely still dominant
-now), still needs its own sizing/decomposition pass first, do NOT brief as
-one slice — spawn a researcher round to split it into per-function slices
-before briefing any of them. Smaller remaining buckets (not yet re-measured
-post-Round-B): `ascii()`/`bit_count()` spacing (~4 lines, root cause may be
-systemic/shared with other regress diffs — do not fix blind here without
-checking), `chr(0)`/bytea-trim NUL handling (~4 lines). Re-check the
-fix_plan banner at loop start first (M-NIGHTLY has no open selectable items
-as of last check; M0134 stays next-priority).
+Next step: work Round E from the design doc —
+`regexp_count`/`regexp_like`/`regexp_instr`/`regexp_substr` (currently all
+`function ... does not exist`, ~426 diff lines combined per the 2026-08-22
+sizing pass; do `regexp_instr` first at 193 lines, it exercises
+subexpr/endoption logic reusable by `regexp_substr`). All four are thin
+wrappers over the already-landed compiled-pattern + `pgRegexFlagsToGoModifiers`
+machinery (Rounds C/D). After that: Round F (`regexp_replace` extended 6-arg
+form, start/N dispatch bug, ~81 lines), Round G (backreference
+generalization `\1`/`\2`-only -> any `\N`/`\&`, ~35 lines, explicitly
+excluding the `(.)\1` pattern-backreference RE2 gap — ledger that
+sub-case). Re-check the fix_plan banner at loop start first (M-NIGHTLY
+items AI-20260822-001356-001..005 remain unselected/unworked as of this
+loop — none block M0134's gates so stay that way unless the banner or a new
+nightly run changes the picture).
 
-Gates run this loop: `go build ./...` PASS; `go test ./internal/parser/...`
-PASS (both this session and implementer, cached-fresh, 14/14 new subtests
-verified individually with `-v`); `RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh` PASS (re-run by this session, not just
-trusted from the implementer — full unit suite green including the 420s
-`internal/initdb` package); `GOOPG_CG_UNIT=... scripts/goopg-test-run.sh
+Gates run this loop: `go build ./...` PASS (implementer + this session);
+`go test ./internal/executor/... ./internal/optimizer/...` PASS
+(implementer, cached-fresh); `go test ./internal/executor/ -run
+TestFromRegexpSplitToTable -v` PASS (this session, re-verified before
+commit); `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh` PASS
+(implementer); `GOOPG_CG_UNIT=... scripts/goopg-test-run.sh
 scripts/pg-regress-runner.sh --verbose strings` (implementer, cgroup-capped)
-— diff 1848→1804, all core U&/UESCAPE decode paths byte-identical to PG
-(modulo the two ledgered gaps); pre-commit pgbench smoke via git hook — PASS
-(378/701/12955 TPS, 0 failed transactions). `make ralph-state-guard` — not
-yet run this loop, will run immediately before the status block per the
-protocol (see below).
+— confirmed the `regexp_split_to_table` fixture line is now pure
+unchanged-context (zero +/- markers) in `tmp/regress-diffs/strings.diff`;
+pre-commit pgbench smoke via git hook — PASS (377/701/13004 TPS, 0 failed
+transactions). `make ralph-state-guard` — ran this session: found the same
+expected running/completed status/progress mismatch from a prior loop's
+clean-exit marker (recurring pattern, not a new bug), auto-repaired, green
+after repair.
 
-Delegation: researcher round (confirming lexer insertion point + PG U&
-semantics) + implementer round
-(tmp/ralph-handoffs/m0134-0070-uescape-literals/, DONE in round 1,
-converged). No SendMessage follow-up needed. No open handoff.
+Delegation: researcher round (Round D wiring confirmation) + implementer
+round (tmp/ralph-handoffs/m0134-0070-regexp-split-to-table/, DONE in round
+1, converged). No SendMessage follow-up needed. No open handoff.
 
-In-flight: none. Commit `edfa14de` landed and pushed to `regress-renumbering`
-(`9fe8f673..edfa14de`). No server left running.
+In-flight: none. Commit `3f4d7c5a` landed and pushed to `regress-renumbering`
+(`15b59428..3f4d7c5a`). No server left running.
