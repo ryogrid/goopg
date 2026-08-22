@@ -1103,7 +1103,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		// plan, cache, then execute.
 		var precached optimizer.Node
 		var cacheKey string
-		if s.pc != nil && len(stmts) == 1 && !disablePlanCache && !isNotifyStmt(stmt) && !isTwoPhaseStmt(stmt) && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
+		if s.pc != nil && len(stmts) == 1 && !disablePlanCache && !isNotifyStmt(stmt) && !isTwoPhaseStmt(stmt) && !isCurrentOfDML(stmt) && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
 			cacheKey = planCacheKey(sql, ectx.CurrentDatabaseOid)
 			if cached, ok := s.pc.Get(cacheKey); ok {
 				precached = cached
@@ -2947,6 +2947,18 @@ func (s *Server) executeOneSimpleStmt(w *libpq.FrameWriter, ctx *executor.Contex
 	if handled, err := s.execTwoPhaseStmt(w, ctx, stmt, connTx, autoCommitPtr); handled {
 		return err
 	}
+	// M0134-0074: resolve WHERE CURRENT OF at dispatch time. The cursor's
+	// current tid is substituted as a concrete `ctid = '(block,off)'` equality
+	// that flows through the existing ctid-string-equality path — no
+	// optimizer/executor change. The tid is statement-scoped, so CURRENT OF
+	// statements bypass the plan cache (see isCurrentOfDML at the cache site).
+	// EXPLAIN (ANALYZE ...) wraps the DML in an ExplainStmt — tidscan.sql runs
+	// every CURRENT OF statement under EXPLAIN ANALYZE — and optimizer.Plan
+	// recursively plans the ExplainStmt's Inner (planner.go:260), so resolving
+	// the inner DML's Where before the Plan call below covers both forms.
+	if err := s.resolveCurrentOfInStmt(connTx, stmt); err != nil {
+		return s.writeQueryError(w, execErrCode(err), execErrMsg(err))
+	}
 	var node optimizer.Node
 	if len(cachedNode) > 0 && cachedNode[0] != nil {
 		node = cachedNode[0]
@@ -3794,8 +3806,12 @@ func (s *Server) executeFetch(_ context.Context, w *libpq.FrameWriter, ectx *exe
 		rowsToSend = cur.Rows[start:end]
 		if fetchAll {
 			cur.Pos = total // EOF
+			cur.AtEnd = true // FETCH ALL always ends at EOF (M0134-0074)
 		} else {
 			cur.Pos = end
+			// Past-end forward fetch returned nothing → positioned past the
+			// last row (M0134-0074).
+			cur.AtEnd = (len(rowsToSend) == 0)
 		}
 	} else if fetchAll {
 		// FETCH BACKWARD ALL: includes the current row (index cur.Pos-1).
@@ -3812,9 +3828,11 @@ func (s *Server) executeFetch(_ context.Context, w *libpq.FrameWriter, ectx *exe
 		}
 		rowsToSend = rev
 		cur.Pos = 0 // BOF
+		cur.AtEnd = false // BACKWARD moves toward BOF, not EOF (M0134-0074)
 	} else {
 		// FETCH BACKWARD n (finite): exclude the current row (index cur.Pos-1) from the
 		// window — it was already returned by the preceding fetch. M0134-0056.
+		cur.AtEnd = false // BACKWARD moves toward BOF, not EOF (M0134-0074)
 		if cur.Pos == 0 {
 			// already at BOF, nothing precedes
 			rowsToSend = nil
@@ -3911,6 +3929,7 @@ func (s *Server) materializeCursor(ectx *executor.Context, cur *cursorEntry, cur
 
 	cur.Schema = op.Schema()
 	cur.Rows = nil
+	cur.TIDs = nil
 	for {
 		slot, nextErr := op.Next()
 		if nextErr == executor.EOF {
@@ -3925,9 +3944,98 @@ func (s *Server) materializeCursor(ectx *executor.Context, cur *cursorEntry, cur
 			cloned := make(executor.Row, len(row))
 			copy(cloned, row)
 			cur.Rows = append(cur.Rows, cloned)
+			// Capture the slot's carried self-tid for WHERE CURRENT OF
+			// resolution (M0134-0074), in lockstep with Rows. A zero
+			// tid is stored when the slot does not carry one (synthesized
+			// rows) — CURRENT OF on such a row is a pre-existing gap.
+			block, off, ok := slot.TID()
+			tid := storage.ItemPointer{}
+			if ok {
+				tid.Block = storage.BlockNumber(block)
+				tid.Offset = off
+			}
+			cur.TIDs = append(cur.TIDs, tid)
 		}
 	}
 	cur.Pos = 0
+	cur.AtEnd = false
 	cur.Materialized = true
 	return nil
+}
+
+// resolveCurrentOf resolves a WHERE CURRENT OF cursor reference to a concrete
+// `ctid = '(block,off)'` equality on the cursor's current row. Mirrors PG's
+// execCurrentOf (postgres/src/backend/executor/execCurrent.c:44,65-70,134-139):
+// an unknown cursor raises 34000 (ERRCODE_UNDEFINED_CURSOR) and a cursor
+// before the first row or past the last row raises 24000
+// (ERRCODE_INVALID_CURSOR_STATE). M0134-0074.
+func (s *Server) resolveCurrentOf(connTx *connTxState, name string) (parser.Expr, error) {
+	cur, ok := connTx.cursorLookup(name)
+	if !ok {
+		return nil, &executor.ExecError{Code: "34000", Message: fmt.Sprintf("cursor %q does not exist", name)}
+	}
+	if cur.Pos == 0 || cur.AtEnd {
+		return nil, &executor.ExecError{Code: "24000", Message: fmt.Sprintf("cursor %q is not positioned on a row", name)}
+	}
+	tid := cur.TIDs[cur.Pos-1]
+	return &parser.BinaryOp{
+		Op:    parser.OpEq,
+		Left:  &parser.ColumnRef{Column: "ctid"},
+		Right: &parser.StringConst{Value: fmt.Sprintf("(%d,%d)", tid.Block, tid.Offset)},
+	}, nil
+}
+
+// resolveCurrentOfInStmt resolves the WHERE CURRENT OF clause (if any) on an
+// UPDATE/DELETE to a concrete `ctid = '(block,off)'` equality, mutating the
+// DML's Where field in place. EXPLAIN (ANALYZE ...) wraps the DML in an
+// ExplainStmt (tidscan.sql does this for every CURRENT OF statement); the
+// inner DML is planned by the same optimizer.Plan call in the caller
+// (planner.go:260 ExplainStmt → Plan(s.Inner)), so resolving before that call
+// covers both the bare and EXPLAIN-wrapped forms. Returns nil when stmt
+// carries no CURRENT OF clause. M0134-0074.
+func (s *Server) resolveCurrentOfInStmt(connTx *connTxState, stmt parser.Stmt) error {
+	inner := stmt
+	if es, ok := stmt.(*parser.ExplainStmt); ok {
+		inner = es.Inner
+	}
+	switch d := inner.(type) {
+	case *parser.UpdateStmt:
+		if d.CurrentOf == "" {
+			return nil
+		}
+		where, err := s.resolveCurrentOf(connTx, d.CurrentOf)
+		if err != nil {
+			return err
+		}
+		d.Where = where
+	case *parser.DeleteStmt:
+		if d.CurrentOf == "" {
+			return nil
+		}
+		where, err := s.resolveCurrentOf(connTx, d.CurrentOf)
+		if err != nil {
+			return err
+		}
+		d.Where = where
+	}
+	return nil
+}
+
+// isCurrentOfDML reports whether stmt is an UPDATE or DELETE with a WHERE
+// CURRENT OF clause, unwrapping an EXPLAIN wrapper. Such statements carry a
+// statement-scoped tid resolution and must never be served from the
+// cross-session plan cache (the cursor position changes between executions).
+// M0134-0074.
+func isCurrentOfDML(stmt parser.Stmt) bool {
+	inner := stmt
+	if es, ok := stmt.(*parser.ExplainStmt); ok {
+		inner = es.Inner
+	}
+	switch d := inner.(type) {
+	case *parser.UpdateStmt:
+		return d.CurrentOf != ""
+	case *parser.DeleteStmt:
+		return d.CurrentOf != ""
+	}
+	return false
 }

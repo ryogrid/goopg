@@ -126,6 +126,13 @@ func (s *Slot) Materialize() *MaterializedSlot {
 // Release implements TupleSlot — no-op for concrete slots.
 func (s *Slot) Release() {}
 
+// TID implements TupleSlot. Returns the ctid forwarded from the source
+// MaterializedSlot by fillFromTupleSlot (M0097-0062); slots without a
+// carried ctid report ok=false.
+func (s *Slot) TID() (block uint32, off uint16, ok bool) {
+	return s.ctidBlock, s.ctidOff, s.hasCTID
+}
+
 // fillFromTupleSlot copies a TupleSlot into s. Used by the
 // opAdapterState adapter for non-migrated operators.
 // ts==nil sets HasRow=false (DML nil-row signal).
@@ -782,6 +789,13 @@ func projectOpNext(tree *opTreeSlab, n *OpNode, dst *Slot) error {
 	dst.Cells = s.outCells
 	dst.schema = tree.schemas[s.schemaIdx] // pool lookup — no GC-traced pointer in projectState
 	dst.HasRow = true                      // always a real row when we reach here
+	// M0134-0074: propagate the ctid side-channel from the source slot so
+	// CTIDExpr evaluation and cursor TID capture survive projection. Mirrors
+	// the interpreted projectOp.Next() propagation (operators.go:366-378);
+	// without this the fast path silently drops hasCTID (a sibling twin gap).
+	dst.hasCTID = s.srcSlot.hasCTID
+	dst.ctidBlock = s.srcSlot.ctidBlock
+	dst.ctidOff = s.srcSlot.ctidOff
 	return nil
 }
 

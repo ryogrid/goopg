@@ -27,6 +27,7 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/executor"
+	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/storage/lmgr"
 	"github.com/goopg/goopg/internal/utils/mmgr"
 	"github.com/goopg/goopg/internal/access/transam"
@@ -45,6 +46,14 @@ type cursorEntry struct {
 	Rows         []executor.Row // all result rows, nil until Materialized
 	Schema       optimizer.Schema // output schema from the first execution
 	Pos          int            // current position: 0 = before first row, len(Rows) = past last
+	// AtEnd distinguishes "positioned past the last row" from "at the last
+	// row" (Pos == len(Rows) is ambiguous today: a past-end forward fetch
+	// leaves Pos unchanged). M0134-0074.
+	AtEnd bool
+	// TIDs holds the per-row self-tid captured at materialization, in
+	// lockstep with Rows: TIDs[i] is the ctid of Rows[i]. Used to resolve
+	// UPDATE/DELETE … WHERE CURRENT OF at dispatch time. M0134-0074.
+	TIDs []storage.ItemPointer
 	Materialized bool
 }
 
