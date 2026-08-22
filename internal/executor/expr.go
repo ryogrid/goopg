@@ -5569,6 +5569,21 @@ func evalExtract(x *optimizer.ExtractExpr, row Row, ctx *Context) (Datum, error)
 	// For time-of-day source types, validate and handle allowed fields only. M0097-0004.
 	srcType := strings.ToLower(x.SourceTypeName)
 	isTimeOnly := srcType == "time" || srcType == "timetz"
+	// M0134-0076: a timestamptz source extracts in the session TimeZone — PG's
+	// timestamptz_part passes NULL zone to timestamp2tm, which means
+	// session_timezone (postgres/src/backend/utils/adt/timestamp.c:5824). Every
+	// other source kind keeps its stored wall clock; epoch is zone-independent
+	// (Unix()), so it needs no special-casing.
+	if srcType == "timestamptz" {
+		u = u.In(sessionTimeZoneLocation(timeZoneFromCtx(ctx)))
+	}
+	// TIMESTAMP_NOT_FINITE arms (timestamp.c:5794): oscillating units → NULL,
+	// monotonically-increasing units → ±Infinity.
+	if src.IsTimestampNotFinite() {
+		if d, handled := extractNonFiniteField(field, src.IsTimestampPosInf()); handled {
+			return d, nil
+		}
+	}
 	switch field {
 	case "second", "seconds":
 		// EXTRACT returns numeric: (tm_sec*1e6 + fsec) / 1e6 at scale 6
@@ -5576,9 +5591,18 @@ func evalExtract(x *optimizer.ExtractExpr, row Row, ctx *Context) (Datum, error)
 		// prints `40.500000` not `40.5`.
 		usec := int64(u.Second())*1_000_000 + int64(u.Nanosecond())/1000
 		return int64DivFastToNumeric(usec, 6), nil
-	case "milliseconds", "millisecond":
+	case "milliseconds", "millisecond", "msec":
+		// msec is the datetktbl alias for DTK_MILLISEC (datetime.c). Sibling of
+		// evalDatePart's identical arm — they must agree. M0134-0076.
 		usec := int64(u.Second())*1_000_000 + int64(u.Nanosecond())/1000
 		return int64DivFastToNumeric(usec, 3), nil
+	case "microseconds", "microsecond", "usec":
+		// usec is the datetktbl alias for DTK_MICROSEC. Unlike milliseconds/
+		// seconds, DTK_MICROSEC stores a plain intresult (timestamp.c:5557) and
+		// returns int64_to_numeric — an INTEGER numeric (scale 0), so PG prints
+		// `1000000` not `1000000.000000` (timestamptz.out extract block).
+		usec := int64(u.Second())*1_000_000 + int64(u.Nanosecond())/1000
+		return int64DivFastToNumeric(usec, 0), nil
 	case "epoch":
 		// EXTRACT returns numeric (retnumeric=true), so the display scale is
 		// preserved. PG's epoch is source-type dependent (timestamp_part /
@@ -5604,6 +5628,19 @@ func evalExtract(x *optimizer.ExtractExpr, row Row, ctx *Context) (Datum, error)
 			return int64DivFastToNumeric(epochMicros, 6), nil
 		}
 	case "timezone", "timezone_hour", "timezone_minute":
+		if srcType == "timestamptz" {
+			// Session offset, seconds east of UTC (DTK_TZ arms,
+			// timestamp.c:5831-5841; Go's Zone() uses the same sign convention).
+			_, off := u.Zone()
+			switch field {
+			case "timezone":
+				return Datum{Kind: KindInt, Int: int64(off)}, nil
+			case "timezone_hour":
+				return Datum{Kind: KindInt, Int: int64(off / 3600)}, nil
+			case "timezone_minute":
+				return Datum{Kind: KindInt, Int: int64((off % 3600) / 60)}, nil
+			}
+		}
 		if srcType == "time" {
 			return Datum{}, &ExecError{Code: "22023", Pos: x.Pos(),
 				Message: fmt.Sprintf("unit %q not supported for type time without time zone", field)}
@@ -5648,6 +5685,12 @@ func evalExtract(x *optimizer.ExtractExpr, row Row, ctx *Context) (Datum, error)
 			return Datum{}, &ExecError{Code: "22023", Pos: x.Pos(),
 				Message: fmt.Sprintf("unit %q not recognized for type %s", field, typeName)}
 		}
+	}
+	if field == "julian" {
+		// DTK_JULIAN (timestamp.c:5651): a fractional day, returned numeric like
+		// the other fractional fields (the "msec"/"usec"/"julian" aliases land
+		// here rather than in extractTimestampField, which returns int64).
+		return newNumericFromFloat(julianNumber(u)), nil
 	}
 	n, err := extractTimestampField(x.Field, u, x.Pos())
 	if err != nil {
@@ -5808,68 +5851,139 @@ func intervalUnitError(field string, pos int) (Datum, error) {
 // calendar field from a UTC timestamp. Shared by evalExtract and
 // evalDatePart.
 func extractTimestampField(field string, t time.Time, pos int) (int64, error) {
-	u := t.UTC()
+	// M0134-0076: the caller (evalExtract/evalDatePart) passes t already
+	// zone-adjusted for a timestamptz source; this helper no longer strips the
+	// zone with .UTC(). A plain timestamp/date/time/timetz keeps its wall clock.
 	switch field {
 	case "year":
-		return int64(u.Year()), nil
+		return int64(t.Year()), nil
 	case "month":
-		return int64(u.Month()), nil
+		return int64(t.Month()), nil
 	case "day":
-		return int64(u.Day()), nil
+		return int64(t.Day()), nil
 	case "hour":
-		return int64(u.Hour()), nil
+		return int64(t.Hour()), nil
 	case "minute":
-		return int64(u.Minute()), nil
+		return int64(t.Minute()), nil
 	case "second":
-		return int64(u.Second()), nil
+		return int64(t.Second()), nil
 	case "dow":
-		return int64(u.Weekday()), nil // Sunday=0, matches upstream
+		return int64(t.Weekday()), nil // Sunday=0, matches upstream
 	case "doy":
-		return int64(u.YearDay()), nil
+		return int64(t.YearDay()), nil
 	case "epoch":
-		return u.Unix(), nil
+		return t.Unix(), nil
 	case "quarter":
-		return int64((int(u.Month())-1)/3 + 1), nil
+		return int64((int(t.Month())-1)/3 + 1), nil
 	// M0097-0004: additional calendar fields.
 	case "week", "isoweek":
-		_, week := u.ISOWeek()
+		_, week := t.ISOWeek()
 		return int64(week), nil
 	case "isoyear":
-		year, _ := u.ISOWeek()
+		year, _ := t.ISOWeek()
 		return int64(year), nil
 	case "isodow":
-		wd := u.Weekday()
+		wd := t.Weekday()
 		if wd == 0 {
 			wd = 7 // ISO: Sunday = 7
 		}
 		return int64(wd), nil
 	case "decade":
-		y := int64(u.Year())
+		y := int64(t.Year())
 		if y >= 0 {
 			return y / 10, nil
 		}
 		return (y - 9) / 10, nil
 	case "century":
-		y := int64(u.Year())
+		y := int64(t.Year())
 		if y > 0 {
 			return (y + 99) / 100, nil
 		}
 		return -((-y + 99) / 100), nil
 	case "millennium":
-		y := int64(u.Year())
+		y := int64(t.Year())
 		if y > 0 {
 			return (y + 999) / 1000, nil
 		}
 		return -((-y + 999) / 1000), nil
-	case "microseconds", "microsecond":
-		return int64(u.Second())*1_000_000 + int64(u.Nanosecond()/1000), nil
-	case "milliseconds", "millisecond":
-		return int64(u.Second())*1000 + int64(u.Nanosecond()/1_000_000), nil
-	case "timezone", "timezone_hour", "timezone_minute":
-		return 0, nil // goopg v0 is UTC-only
+	case "microseconds", "microsecond", "usec":
+		return int64(t.Second())*1_000_000 + int64(t.Nanosecond()/1000), nil
+	case "milliseconds", "millisecond", "msec":
+		return int64(t.Second())*1000 + int64(t.Nanosecond()/1_000_000), nil
+	// timezone/timezone_hour/timezone_minute are owned by the callers, which
+	// know the source type (timestamptz → session offset, else 22023). M0134-0076.
 	default:
 		return 0, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("date field %q is not supported in v0", field)}
 	}
+}
+
+// sessionTimeZoneLocation resolves the session's TimeZone GUC to a
+// *time.Location with exactly the renderer's semantics (sessionLocation,
+// internal/utils/misc/timestamptz_out.go:37): "" → UTC, and any spelling Go's
+// tzdata does not know (POSIX-style fixed offsets like "+05:30") falls back to
+// UTC — so EXTRACT/date_part and FormatTimestampTZ always agree. M0134-0076.
+func sessionTimeZoneLocation(zone string) *time.Location {
+	if zone == "" {
+		return time.UTC
+	}
+	loc, err := time.LoadLocation(zone)
+	if err != nil {
+		return time.UTC
+	}
+	return loc
+}
+
+// julianNumber ports DTK_JULIAN (postgres/src/backend/utils/adt/timestamp.c:5651):
+// date2j(year,mon,day) + (hour*3600 + min*60 + sec + fsec)/86400 — the Julian day
+// number plus the fraction of the day elapsed since midday. t carries the fields
+// in the session zone (timestamptz) or the stored wall clock. The callers return
+// it as numeric (EXTRACT) / float8 (date_part), like the other fractional fields.
+func julianNumber(t time.Time) float64 {
+	year, month, day := t.Date()
+	jd := date2j(year, int(month), day)
+	f := (float64(t.Hour()*3600+t.Minute()*60+t.Second())*1e9 + float64(t.Nanosecond())) / 86400e9
+	return float64(jd) + f
+}
+
+// date2j ports PostgreSQL's Gregorian day-number function
+// (postgres/src/backend/utils/adt/datetime.c:296). PG feeds it tm_year, the
+// astronomical year (1 BC = 0), which is exactly Go's time.Year() convention.
+func date2j(year, month, day int) int {
+	if month > 2 {
+		month += 1
+		year += 4800
+	} else {
+		month += 13
+		year += 4799
+	}
+	century := year / 100
+	julian := year*365 - 32167
+	julian += year/4 - century + century/4
+	julian += 7834*month/256 + day
+	return julian
+}
+
+// extractNonFiniteField ports the TIMESTAMP_NOT_FINITE arms of
+// NonFiniteTimestampTzPart (postgres/src/backend/utils/adt/timestamp.c:5441),
+// reached by both callers for ±infinity timestamps and dates (NewTimestampInfinity
+// and NewDateInfinity both carry Int=±MaxInt64): oscillating units return NULL,
+// monotonically-increasing units return ±Infinity. handled=false means the field
+// is not one of those arms, so the caller falls through to normal extraction
+// (which raises the same unit error it would for a finite input).
+func extractNonFiniteField(field string, positive bool) (Datum, bool) {
+	switch field {
+	case "microseconds", "microsecond", "milliseconds", "millisecond",
+		"msec", "usec", "second", "seconds", "minute", "hour", "day", "month",
+		"quarter", "week", "isoweek", "dow", "isodow", "doy",
+		"timezone", "timezone_hour", "timezone_minute":
+		return NullDatum, true
+	case "year", "decade", "century", "millennium", "isoyear", "julian", "epoch":
+		if positive {
+			return NewStringDatum("Infinity"), true
+		}
+		return NewStringDatum("-Infinity"), true
+	}
+	return Datum{}, false
 }
 
 // evalDatePart implements PostgreSQL's `date_part(text, timestamp)`
@@ -5905,13 +6019,31 @@ func evalDatePart(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 	}
 	// Fractional-second fields return float8 (numeric), like evalExtract. M0097-0004.
 	u := src.TimeValue().UTC()
+	// M0134-0076: sibling of evalExtract — a timestamptz source extracts in the
+	// session TimeZone (timestamp.c:5824); other kinds keep their stored wall
+	// clock. Discriminator is the datum's TimeSub tag, since a FuncCall carries
+	// no declared source type.
+	if src.IsTimestampTZ() {
+		u = u.In(sessionTimeZoneLocation(timeZoneFromCtx(ctx)))
+	}
 	field := strings.ToLower(strings.TrimSpace(fieldArg.StringValue()))
+	// TIMESTAMP_NOT_FINITE arms (timestamp.c:5794).
+	if src.IsTimestampNotFinite() {
+		if d, handled := extractNonFiniteField(field, src.IsTimestampPosInf()); handled {
+			return d, nil
+		}
+	}
 	switch field {
 	case "second", "seconds":
 		f := float64(u.Second()) + float64(u.Nanosecond())/1e9
 		return newNumericFromFloat(f), nil
-	case "milliseconds", "millisecond":
+	case "milliseconds", "millisecond", "msec":
+		// msec/usec are the datetktbl aliases (datetime.c), sibling of
+		// evalExtract's identical arms — they must agree. M0134-0076.
 		f := float64(u.Second())*1000 + float64(u.Nanosecond())/1_000_000.0
+		return newNumericFromFloat(f), nil
+	case "microseconds", "microsecond", "usec":
+		f := float64(u.Second())*1_000_000 + float64(u.Nanosecond())/1000.0
 		return newNumericFromFloat(f), nil
 	case "epoch":
 		// date_part returns float8 (retnumeric=false) → trailing zeros stripped.
@@ -5926,6 +6058,27 @@ func evalDatePart(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		}
 		epochMicros := u.Unix()*1_000_000 + int64(u.Nanosecond())/1000
 		return newNumericFromFloat(float64(epochMicros)/1e6), nil
+	case "julian":
+		// DTK_JULIAN (timestamp.c:5651), returned float8 like the other
+		// fractional fields.
+		return newNumericFromFloat(julianNumber(u)), nil
+	case "timezone", "timezone_hour", "timezone_minute":
+		if src.IsTimestampTZ() {
+			// Session offset, seconds east of UTC (timestamp.c:5831-5841).
+			_, off := u.Zone()
+			switch field {
+			case "timezone":
+				return Datum{Kind: KindInt, Int: int64(off)}, nil
+			case "timezone_hour":
+				return Datum{Kind: KindInt, Int: int64(off / 3600)}, nil
+			case "timezone_minute":
+				return Datum{Kind: KindInt, Int: int64((off % 3600) / 60)}, nil
+			}
+		}
+		// A zone-less timestamp/date has no offset to report. PG rejects with
+		// 0A000 (timestamp.c:5683-5691); goopg keeps evalExtract's 22023.
+		return Datum{}, &ExecError{Code: "22023", Pos: x.Pos(),
+			Message: fmt.Sprintf("unit %q not supported for type timestamp without time zone", field)}
 	}
 	n, err := extractTimestampField(field, u, x.Pos())
 	if err != nil {
@@ -12802,6 +12955,17 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			v, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || v.IsNull() {
 				return NullDatum, nil
+			}
+			// PG: round(±Infinity) = ±Infinity for both float8 and numeric
+			// (dround / numeric_round). The julian/epoch infinity results of
+			// EXTRACT/date_part are carried as the strings "Infinity"/"-Infinity"
+			// (no numeric-Infinity wire type in goopg) — pass them through instead
+			// of ParseFloat/FormatFloat, which would mangle them to "+Inf"/"-Inf".
+			// The regress extract/date_part blocks round() the julian column
+			// (timestamptz.sql) and expect ±Infinity on the infinity rows
+			// (timestamptz.out:1341-1342, 1187-1188). M0134-0076.
+			if s := v.Format(); s == "Infinity" || s == "-Infinity" {
+				return v, nil
 			}
 			scale := int64(0)
 			if len(x.Args) >= 2 {
