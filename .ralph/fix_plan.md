@@ -6994,6 +6994,33 @@ listed `select.sql`, `delete.sql` and `sysviews.sql` already carry CSV status
       (IntervalStyle, REFACTOR, ledger 1680), **O** (`interval * 2`, ledger 1679). CSV row
       stays `failed`/`pass_required=no`; no `make regen-testport`.
 - [ ] **M0134-0076 — timestamptz.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
+      **Bucket F landed 2026-08-22** (design
+      `docs/design/m0134-0076-extract-datepart-session-zone.md`): sized at HEAD
+      (`scripts/pg-regress-runner.sh --verbose timestamptz`, PGTZ=America/Los_Angeles)
+      at 3969 diff lines / 5 hunks / 204 `^+ERROR` / 32 `^-ERROR`, no crash. F was the
+      largest CONTAINED slice: `extractTimestampField` (`expr.go:5810`) and both callers
+      `evalExtract` (`:5567`) / `evalDatePart` (`:5907`) extracted in `.UTC()`, so
+      calendar fields ignored the session `TimeZone`, `msec`/`usec`/`julian` were
+      missing, `timezone*` returned 0/error, and `±infinity` rendered boundary values.
+      Fix: apply the session zone (timestamptz only, via `timeZoneFromCtx` +
+      `sessionTimeZoneLocation`), add the field aliases + `julian` (`date2j` port),
+      real session-offset `timezone*` arms, and the `NonFiniteTimestampTzPart`
+      oscillating→NULL / monotonic→±Infinity arms (plus a companion `round(±Infinity)`
+      pass-through so the regress `round(julian)` column renders `Infinity` not `+Inf`).
+      Result **3969 → 3945 diff lines** (extract region 455 → 418); `msec`/`usec`/`julian`
+      `+ERROR` lines → 0, every loaded row's extract values now byte-identical to PG.
+      The originally-projected ≥250-line collapse did NOT materialise — only 7/66 rows
+      load (bucket A) and B2 leaves 2 boundary rows/block. Gates: tpch-spotcheck
+      Q12=2/Q13=35 PASS, units pre-commit PASS, regress measured. CSV row stays
+      `failed`/`pass_required=no`; no `make regen-testport`. Remaining buckets ledgered
+      2026-08-22: **A** (input-literal tokenizer, REFACTOR, dominant), **G** (`to_char`
+      template engine, REFACTOR, ~1200 lines), **B2** (infinity renderer sentinel,
+      CONTAINED next), **C** (`AT TIME ZONE`), **E/E2** (`date_bin`/`date_trunc`),
+      **H/H2** (`make_timestamptz`/`to_timestamp`), **I** (`generate_series` timestamptz),
+      **J/K** (`age` infinity / `pg_input_is_valid`), **B1** (int64-ns carrier REFACTOR),
+      plus the `date_part` wire-type (already ledgered under M0134-0075) and the
+      timezone-field 0A000-vs-22023 error-class gap. **Next slice:** B2 (3 one-line
+      sentinel checks) or A (the re-baselining prerequisite for the whole case).
 - [ ] **M0134-0077 — transactions.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
 - [ ] **M0134-0078 — triggers.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
 - [ ] **M0134-0079 — tuplesort.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
