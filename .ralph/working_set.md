@@ -1,46 +1,39 @@
 Task: M0134-0070 (strings.sql) — regress-sql `failed`. This loop landed the
-`ascii()`/`crc32`/`crc32c`/`bit_count` wire-TypeOID bucket (the recorded deferred
-"ascii()/bit_count() column-width" bucket, root-caused: NOT a wire-trace, a
-4-case exprType change). Code commit `e8eb7214` (+ bookkeeping), both pushed.
+`lpad`/`rpad` empty-fill value bug (the recorded "smallest remaining CONTAINED
+value-bug, ~6 lines"). Code commit `db647aad` (+ bookkeeping), pushed.
 
-Landed: `exprType` (`internal/optimizer/planner.go` ~12598) gained
-`case "ascii": -> int4` and `case "crc32","crc32c","bit_count": -> int8` arms
-mirroring the `get_byte`/`get_bit` arm, so the wire layer (`typeOIDFor`,
-`internal/postmaster/dispatch.go:3639`) advertises int4/int8 instead of text
-(default `unknown`→OID 25), making psql right-align these numeric columns
-(`column_type_alignment`, print.c:3614-3638). No sibling/twin — all RowDescription
-paths call `typeOIDFor(sc.Type)`. New test
-`internal/optimizer/expr_type_wire_test.go`. `strings.sql` diff shrank 451→395
-lines (three hunks closed); cross-cutting (also fixes misc_functions/domain/stats).
+Landed: `padLeft`/`padRight` (`internal/executor/expr.go:15049-15051/15077-15079`)
+substituted a space for an explicitly-empty third argument (`if fill == "" {
+fill = " " }`), so `lpad('hi',5,'')` returned `'   hi'` and `lpad('hi',1,'')`
+returned `' '`. PG (`oracle_compat.c:196-197/294-295`) sets `len=s1len` when
+`s2len<=0` — no padding, but truncation (runs BEFORE the empty-fill check) still
+applies. Fixed both siblings to `if fill == "" { return s }`; the pre-existing
+`len(runes) >= n` early return already does truncation; the 2-arg call-site
+default `fill := " "` (PG's separate `lpad(text,int)` overload) is untouched.
+New test `internal/executor/pad_empty_fill_test.go` (8 subtests). `strings.sql`
+diff shrank 395→367 lines (zero residual lpad/rpad lines).
 
-Key symbols: `internal/optimizer/planner.go` `exprType` FuncCall switch
-(~12598-12608, new arms), `get_byte`/`get_bit` arm (the mirror pattern),
-`internal/postmaster/dispatch.go` `typeOIDFor` (:3639).
+Key symbols: `internal/executor/expr.go` `padLeft` (~15041) / `padRight` (~15069)
+(the twin pair), call sites `case "lpad":` (~12129) / `case "rpad":` (~12146).
 
-Hypothesis/Findings: the researcher retriage confirmed the recorded four-bucket
-list and re-ranked it. Remaining 395-line diff buckets (counts from the retriage):
-`standard_conforming_strings=off` lexing + `escape_string_warning` (REFACTOR-tier,
-69); RE2-vs-ARE regex backrefs/zero-width/SIMILAR-ambiguity (28); Unicode-escape
-error-message/DETAIL text (16); `char(20) '...'` typed-literal grammar (14); SQL99
-`SUBSTRING FROM..FOR` + missing CONTEXT (8); regexp error-path HINT (7);
-**lpad/rpad empty-fill value bug (6)**; bytea LIKE (6); toasttest
-`pg_relation_size` NULL (2). Deferred (ledger 2026-08-22): `bit_count(bit)`
-overload (OID 6163) unimplemented at runtime.
+Hypothesis/Findings: the oracle order matters — `if (s1len > len) s1len = len;`
+(truncate) precedes `if (s2len <= 0) len = s1len;` (no-pad), so `lpad('hi',1,'')`
+→ `'h'` not `'hi'`. goopg's early-truncation return already mirrors this order,
+so `return s` is only reachable when no truncation occurred.
 
-Next step: the `lpad`/`rpad` empty-fill value bug — smallest remaining CONTAINED
-value-bug (~6 lines). `internal/executor/expr.go:15049-15051` and `:15077-15079`
-do `if fill == "" { fill = " " }`; PG does NOT pad (oracle_compat.c:196-197
-`if (s2len <= 0) len = s1len;`). Brief + implement this next.
+Next step: re-triage the fresh 367-line `strings.sql` diff to size the next
+smallest CONTAINED bucket — candidates: `bytea LIKE` (~6 lines), regexp
+error-path HINT (~7), toasttest `pg_relation_size` NULL (~2). Then brief +
+implement that bucket. (The `standard_conforming_strings=off` + `escape_string_warning`
+bucket is REFACTOR-tier and stays deferred/ledgered.)
 
-Gates run this loop: `go build ./...` PASS; `go test ./internal/optimizer/ -run
-TestExprTypeWireTypeOID -v` PASS (6/6); `go test ./internal/optimizer/
-./internal/executor/` PASS; `scripts/pg-regress-runner.sh --verbose strings`
-451→395 lines; `\gdesc` wire-flip verified (ascii→23, crc32/crc32c/bit_count→20);
-pre-commit pgbench smoke PASS (357/617/11860 TPS, 0 failed) via git hook.
-`make ralph-state-guard` — to run before status block.
+Gates run this loop: `go build ./...` PASS; `go test ./internal/executor/ -run
+TestPad -v` PASS (8/8 + pre-existing pad tests); `go test ./internal/executor/`
+PASS; `scripts/pg-regress-runner.sh --verbose strings` 395→367 lines; pre-commit
+pgbench smoke PASS (11972 TPS, 0 failed) via git hook. `make ralph-state-guard`
+— run before status block.
 
-Delegation: researcher (m0134-0070-retriage) DONE — root-caused the wire-TypeOID
-bucket, no wire-trace needed; implementer (m0134-0070-wire-typeoid) DONE — all
-gates PASS, committed as `e8eb7214`.
+Delegation: implementer (m0134-0070-lpad-rpad-empty-fill) DONE — all gates PASS,
+committed as `db647aad`. Handoff dir `tmp/ralph-handoffs/m0134-0070-lpad-rpad-empty-fill/`.
 
 In-flight: none.
