@@ -74,24 +74,71 @@ func TestLexUnicodeEscapeQuote(t *testing.T) {
 		ec := ec
 		t.Run("bad-uescape-char/"+ec, func(t *testing.T) {
 			sql := `SELECT U&'\0061' UESCAPE '` + ec + `';`
+			raw := `'` + ec + `'`
 			if ec == "'" {
 				sql = `SELECT U&'\0061' UESCAPE '''';`
+				raw = `''''`
 			}
+			// scanner_yyerror (scan.l:1221-1240) echoes the SCONST's raw
+			// source text, quote-doubling included.
 			_, err := Lex(sql)
-			requireSyntaxError(t, sql, err, "42601", "invalid Unicode escape character", "")
+			requireSyntaxError(t, sql, err, "42601",
+				`invalid Unicode escape character at or near "`+raw+`"`, "")
 		})
 	}
+
+	t.Run("uescape-followed-by-non-sconst", func(t *testing.T) {
+		// postgres/src/backend/parser/parser.c:271-274: once UESCAPE is
+		// recognized, the clause is a hard commit — the third token must be
+		// a simple string literal. A bare operator raises the dedicated
+		// message (echoing the token's raw source text) rather than a
+		// generic "syntax error at or near".
+		sql := `SELECT U&'wrong: +0061' UESCAPE +;`
+		_, err := Lex(sql)
+		requireSyntaxError(t, sql, err, "42601",
+			`UESCAPE must be followed by a simple string literal at or near "+"`, "")
+	})
+
+	t.Run("uescape-followed-by-eof", func(t *testing.T) {
+		// At end of input PG renders "... at end of input" (scan.l:1226-1233).
+		sql := `SELECT U&'wrong: +0061' UESCAPE`
+		_, err := Lex(sql)
+		requireSyntaxError(t, sql, err, "42601",
+			`UESCAPE must be followed by a simple string literal at end of input`, "")
+	})
 
 	t.Run("out-of-range-codepoint", func(t *testing.T) {
 		sql := `SELECT U&'\+11FFFF';`
 		_, err := Lex(sql)
-		requireSyntaxError(t, sql, err, "42601", `invalid Unicode escape value at or near "\+11FFFF"`, "")
+		requireSyntaxError(t, sql, err, "42601", `invalid Unicode escape value`, "")
 	})
 
 	t.Run("unpaired-surrogate-first-at-eof", func(t *testing.T) {
 		sql := `SELECT U&'\D800';`
 		_, err := Lex(sql)
-		requireSyntaxError(t, sql, err, "42601", `invalid Unicode surrogate pair at or near ""`, "")
+		requireSyntaxError(t, sql, err, "42601", `invalid Unicode surrogate pair`, "")
+	})
+
+	t.Run("regress-message-parity", func(t *testing.T) {
+		// The five surrogate-pair statements plus the wide escape value from
+		// strings.sql: all report bare errmsg text with position-only carets
+		// (postgres/src/backend/parser/parser.c:341-348 check_unicode_value,
+		// :371-527 str_udeescape), not the E-string "at or near" convention.
+		cases := []struct {
+			sql     string
+			message string
+		}{
+			{`SELECT U&'wrong: \db99';`, `invalid Unicode surrogate pair`},
+			{`SELECT U&'wrong: \db99xy';`, `invalid Unicode surrogate pair`},
+			{`SELECT U&'wrong: \db99\\';`, `invalid Unicode surrogate pair`},
+			{`SELECT U&'wrong: \db99\0061';`, `invalid Unicode surrogate pair`},
+			{`SELECT U&'wrong: \+00db99\+000061';`, `invalid Unicode surrogate pair`},
+			{`SELECT U&'wrong: \+2FFFFF';`, `invalid Unicode escape value`},
+		}
+		for _, tc := range cases {
+			_, err := Lex(tc.sql)
+			requireSyntaxError(t, tc.sql, err, "42601", tc.message, "")
+		}
 	})
 
 	t.Run("malformed-escape", func(t *testing.T) {

@@ -1183,7 +1183,7 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 		}
 		return result, nil
 	case *optimizer.FuncCall:
-		return evalFuncCall(x, slotToRow(slot), ctx)
+		return evalFuncCall(x, slot, ctx)
 	case *optimizer.IsNullExpr:
 		// IS [NOT] NULL never propagates NULL — it always returns a boolean.
 		// A row-valued operand follows SQL/PG row null semantics: `row IS NULL`
@@ -5030,8 +5030,8 @@ func parsePgSnapshotValid(s string) bool {
 // A regclass value already carries its OID once evaluated (or, less
 // commonly, arrives as the textual OID from an explicit ::regclass cast) —
 // same pattern already used by pg_get_indexdef/pg_get_statisticsobjdef.
-func resolveRegclassOID(argExpr optimizer.Expr, row Row, ctx *Context) (uint32, bool) {
-	arg, err := evalExpr(argExpr, row, ctx)
+func resolveRegclassOID(argExpr optimizer.Expr, slot SlotView, ctx *Context) (uint32, bool) {
+	arg, err := evalExprSlot(argExpr, slot, ctx)
 	if err != nil || arg.IsNull() {
 		return 0, false
 	}
@@ -5112,11 +5112,11 @@ func relationFileNodeForOID(cat *catalog.InMemory, oid uint32) (storage.RelFileN
 // evalPgRelationSize implements pg_relation_size(relation [, fork]) → bigint,
 // mirroring PG's calculate_relation_size (dbsize.c): the byte size of one
 // named fork (default "main") of the relation's own storage. M0122-0002.
-func evalPgRelationSize(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalPgRelationSize(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
 	if len(x.Args) < 1 {
 		return NullDatum, nil
 	}
-	oid, ok := resolveRegclassOID(x.Args[0], row, ctx)
+	oid, ok := resolveRegclassOID(x.Args[0], slot, ctx)
 	if !ok {
 		return NullDatum, nil
 	}
@@ -5130,7 +5130,7 @@ func evalPgRelationSize(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, er
 	}
 	fork := storage.MainFork
 	if len(x.Args) >= 2 {
-		forkArg, err := evalExpr(x.Args[1], row, ctx)
+		forkArg, err := evalExprSlot(x.Args[1], slot, ctx)
 		if err != nil {
 			return NullDatum, err
 		}
@@ -5150,11 +5150,11 @@ func evalPgRelationSize(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, er
 // PG's calculate_table_size: the table's own main/fsm/vm forks plus its
 // TOAST relation's forks (but not its indexes — pg_indexes_size covers
 // those separately). M0122-0002.
-func evalPgTableSize(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalPgTableSize(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
 	if len(x.Args) < 1 {
 		return NullDatum, nil
 	}
-	oid, ok := resolveRegclassOID(x.Args[0], row, ctx)
+	oid, ok := resolveRegclassOID(x.Args[0], slot, ctx)
 	if !ok {
 		return NullDatum, nil
 	}
@@ -5175,11 +5175,11 @@ func evalPgTableSize(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error
 
 // evalPgIndexesSize implements pg_indexes_size(relation) → bigint: the
 // summed size of every index belonging to the named table. M0122-0002.
-func evalPgIndexesSize(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalPgIndexesSize(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
 	if len(x.Args) < 1 {
 		return NullDatum, nil
 	}
-	oid, ok := resolveRegclassOID(x.Args[0], row, ctx)
+	oid, ok := resolveRegclassOID(x.Args[0], slot, ctx)
 	if !ok {
 		return NullDatum, nil
 	}
@@ -5200,12 +5200,12 @@ func evalPgIndexesSize(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, err
 // evalPgTotalRelationSize implements pg_total_relation_size(relation) →
 // bigint: pg_table_size + pg_indexes_size, matching PG's
 // calculate_total_relation_size. M0122-0002.
-func evalPgTotalRelationSize(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
-	tableSize, err := evalPgTableSize(x, row, ctx)
+func evalPgTotalRelationSize(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
+	tableSize, err := evalPgTableSize(x, slot, ctx)
 	if err != nil || tableSize.IsNull() {
 		return tableSize, err
 	}
-	idxSize, err := evalPgIndexesSize(x, row, ctx)
+	idxSize, err := evalPgIndexesSize(x, slot, ctx)
 	if err != nil {
 		return NullDatum, err
 	}
@@ -5876,15 +5876,15 @@ func extractTimestampField(field string, t time.Time, pos int) (int64, error) {
 // builtin. The first argument is a string literal naming the field
 // (e.g. 'year', 'month', 'quarter'). Semantics match
 // extractTimestampField, which is shared with EXTRACT.
-func evalDatePart(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalDatePart(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
 	if len(x.Args) != 2 {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "date_part(text, timestamp) requires exactly 2 arguments"}
 	}
-	fieldArg, err := evalExpr(x.Args[0], row, ctx)
+	fieldArg, err := evalExprSlot(x.Args[0], slot, ctx)
 	if err != nil {
 		return Datum{}, err
 	}
-	src, err := evalExpr(x.Args[1], row, ctx)
+	src, err := evalExprSlot(x.Args[1], slot, ctx)
 	if err != nil {
 		return Datum{}, err
 	}
@@ -5937,15 +5937,15 @@ func evalDatePart(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 // evalToChar implements to_char(value, fmt) → text.
 // Converts a timestamp or number to a string using a PostgreSQL format string.
 // Supports a subset of PostgreSQL format codes. M0097-0004.
-func evalToChar(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalToChar(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
 	if len(x.Args) < 2 {
 		return NullDatum, nil
 	}
-	srcArg, err := evalExpr(x.Args[0], row, ctx)
+	srcArg, err := evalExprSlot(x.Args[0], slot, ctx)
 	if err != nil || srcArg.IsNull() {
 		return NullDatum, nil
 	}
-	fmtArg, err := evalExpr(x.Args[1], row, ctx)
+	fmtArg, err := evalExprSlot(x.Args[1], slot, ctx)
 	if err != nil || fmtArg.IsNull() {
 		return NullDatum, nil
 	}
@@ -6678,15 +6678,15 @@ func pgToCharToGoFormat(pg string) string {
 
 // evalDateTrunc implements date_trunc(field, source) → timestamp.
 // Truncates a timestamp to the specified field granularity. M0097-0004.
-func evalDateTrunc(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalDateTrunc(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
 	if len(x.Args) < 2 {
 		return NullDatum, nil
 	}
-	fieldArg, err := evalExpr(x.Args[0], row, ctx)
+	fieldArg, err := evalExprSlot(x.Args[0], slot, ctx)
 	if err != nil || fieldArg.IsNull() {
 		return NullDatum, nil
 	}
-	src, err := evalExpr(x.Args[1], row, ctx)
+	src, err := evalExprSlot(x.Args[1], slot, ctx)
 	if err != nil || src.IsNull() {
 		return NullDatum, nil
 	}
@@ -6752,22 +6752,22 @@ func evalDateTrunc(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) 
 }
 
 // evalAge implements age(ts) and age(ts2, ts1) → interval. M0097-0004.
-func evalAge(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalAge(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
 	var ts1, ts2 time.Time
 	switch len(x.Args) {
 	case 1:
-		d, err := evalExpr(x.Args[0], row, ctx)
+		d, err := evalExprSlot(x.Args[0], slot, ctx)
 		if err != nil || d.IsNull() || d.Kind != KindTime {
 			return NullDatum, nil
 		}
 		ts1 = d.TimeValue().UTC()
 		ts2 = ctx.Now.UTC()
 	case 2:
-		d2, err := evalExpr(x.Args[0], row, ctx)
+		d2, err := evalExprSlot(x.Args[0], slot, ctx)
 		if err != nil || d2.IsNull() || d2.Kind != KindTime {
 			return NullDatum, nil
 		}
-		d1, err := evalExpr(x.Args[1], row, ctx)
+		d1, err := evalExprSlot(x.Args[1], slot, ctx)
 		if err != nil || d1.IsNull() || d1.Kind != KindTime {
 			return NullDatum, nil
 		}
@@ -7332,19 +7332,19 @@ func buildRuleDefString(tbl *catalog.Table, r catalog.RuleInfo) string {
 }
 
 // evalMakeDate implements make_date(year, month, day) → date. M0097-0004.
-func evalMakeDate(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalMakeDate(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
 	if len(x.Args) != 3 {
 		return NullDatum, nil
 	}
-	yArg, err := evalExpr(x.Args[0], row, ctx)
+	yArg, err := evalExprSlot(x.Args[0], slot, ctx)
 	if err != nil || yArg.IsNull() {
 		return NullDatum, nil
 	}
-	mArg, err := evalExpr(x.Args[1], row, ctx)
+	mArg, err := evalExprSlot(x.Args[1], slot, ctx)
 	if err != nil || mArg.IsNull() {
 		return NullDatum, nil
 	}
-	dArg, err := evalExpr(x.Args[2], row, ctx)
+	dArg, err := evalExprSlot(x.Args[2], slot, ctx)
 	if err != nil || dArg.IsNull() {
 		return NullDatum, nil
 	}
@@ -7354,13 +7354,13 @@ func evalMakeDate(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 
 // evalMakeTimestamp implements make_timestamp/make_timestamptz(y,m,d,h,min,sec).
 // M0097-0004.
-func evalMakeTimestamp(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalMakeTimestamp(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
 	if len(x.Args) < 6 {
 		return NullDatum, nil
 	}
 	args := make([]int64, 6)
 	for i := 0; i < 6; i++ {
-		d, err := evalExpr(x.Args[i], row, ctx)
+		d, err := evalExprSlot(x.Args[i], slot, ctx)
 		if err != nil || d.IsNull() {
 			return NullDatum, nil
 		}
@@ -7372,19 +7372,19 @@ func evalMakeTimestamp(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, err
 }
 
 // evalMakeTime implements make_time(h, min, sec) → time. M0097-0004.
-func evalMakeTime(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalMakeTime(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
 	if len(x.Args) < 3 {
 		return NullDatum, nil
 	}
-	h, err := evalExpr(x.Args[0], row, ctx)
+	h, err := evalExprSlot(x.Args[0], slot, ctx)
 	if err != nil || h.IsNull() {
 		return NullDatum, nil
 	}
-	m, err := evalExpr(x.Args[1], row, ctx)
+	m, err := evalExprSlot(x.Args[1], slot, ctx)
 	if err != nil || m.IsNull() {
 		return NullDatum, nil
 	}
-	s, err := evalExpr(x.Args[2], row, ctx)
+	s, err := evalExprSlot(x.Args[2], slot, ctx)
 	if err != nil || s.IsNull() {
 		return NullDatum, nil
 	}
@@ -7788,11 +7788,11 @@ func evalRegexpSplitToTable(sD, patD, flagsD Datum) ([]Datum, error) {
 // agnostic) and the interval sentinels on KindInterval (unimplemented_feat
 // #5(d-iv)), so both must be checked. NULL input propagates to NULL (isfinite
 // is strict — no NotStrict marker on its pg_proc OIDs; see isfinite_test.go).
-func evalIsFinite(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalIsFinite(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
 	if len(x.Args) != 1 {
 		return NullDatum, nil
 	}
-	d, err := evalExpr(x.Args[0], row, ctx)
+	d, err := evalExprSlot(x.Args[0], slot, ctx)
 	if err != nil || d.IsNull() {
 		return NullDatum, nil
 	}
@@ -7815,11 +7815,11 @@ var errIntervalRange = &ExecError{Code: "22008", Message: "interval out of range
 // field (Datum.IntervalMicrosValue, populated by timestamp − timestamp and by
 // sub-day literals), justify_hours is no longer the identity: it folds whole
 // 24h chunks of the time field into days. M0097-0004 (extended 2026-07-11).
-func evalJustify(name string, x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalJustify(name string, x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
 	if len(x.Args) != 1 {
 		return NullDatum, nil
 	}
-	d, err := evalExpr(x.Args[0], row, ctx)
+	d, err := evalExprSlot(x.Args[0], slot, ctx)
 	if err != nil || d.IsNull() || d.Kind != KindInterval {
 		return d, err
 	}
@@ -7945,19 +7945,19 @@ func justifyIntervalDays(months, days int32) (int32, int32) {
 // evalDateBin implements date_bin(step interval, source timestamp, origin timestamp).
 // Bins the source timestamp into the bucket identified by origin aligned to step.
 // M0097-0004.
-func evalDateBin(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalDateBin(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
 	if len(x.Args) < 3 {
 		return NullDatum, nil
 	}
-	stepArg, err := evalExpr(x.Args[0], row, ctx)
+	stepArg, err := evalExprSlot(x.Args[0], slot, ctx)
 	if err != nil || stepArg.IsNull() || stepArg.Kind != KindInterval {
 		return NullDatum, nil
 	}
-	srcArg, err := evalExpr(x.Args[1], row, ctx)
+	srcArg, err := evalExprSlot(x.Args[1], slot, ctx)
 	if err != nil || srcArg.IsNull() || srcArg.Kind != KindTime {
 		return NullDatum, nil
 	}
-	originArg, err := evalExpr(x.Args[2], row, ctx)
+	originArg, err := evalExprSlot(x.Args[2], slot, ctx)
 	if err != nil || originArg.IsNull() || originArg.Kind != KindTime {
 		return NullDatum, nil
 	}
@@ -9462,7 +9462,7 @@ func declaredBpcharTypmod(e optimizer.Expr) int64 {
 // v0 is small: current_timestamp / now / current_date are the only
 // no-arg time functions pgbench needs; HammerDB TPC-H also uses
 // to_timestamp(text, fmt) to load TIMESTAMP columns.
-func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
 	name := strings.ToLower(x.Name)
 	// Strip pg_catalog. prefix for matching — these are schema-qualified
 	// versions of the same built-in functions.
@@ -9486,9 +9486,9 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	switch name {
 	case "bt_index_check":
 		// amcheck B-tree structural verification (slice S4 of 0110-0008).
-		return evalBtIndexCheck(x, row, ctx, false)
+		return evalBtIndexCheck(x, slot, ctx, false)
 	case "bt_index_parent_check":
-		return evalBtIndexCheck(x, row, ctx, true)
+		return evalBtIndexCheck(x, slot, ctx, true)
 	case "current_timestamp", "now", "transaction_timestamp", "statement_timestamp":
 		// All four are declared `timestamp with time zone` upstream
 		// (pg_proc.dat: now/statement_timestamp/transaction_timestamp prorettype
@@ -9505,7 +9505,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		t := ctx.Now.UTC()
 		ns := t.Nanosecond()
 		if len(x.Args) > 0 {
-			prec, err := evalExpr(x.Args[0], row, ctx)
+			prec, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err == nil && prec.Kind == KindInt && prec.Int < 6 {
 				factor := int64(1)
 				for i := int64(0); i < 6-prec.Int; i++ {
@@ -9518,18 +9518,18 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "current_catalog":
 		return NewStringDatum("postgres"), nil
 	case "pg_client_encoding":
-		return evalPgClientEncoding(row, ctx)
+		return evalPgClientEncoding(ctx)
 	case "getdatabaseencoding":
-		return evalGetDatabaseEncoding(row, ctx)
+		return evalGetDatabaseEncoding(ctx)
 	case "current_setting":
 		if len(x.Args) >= 1 {
-			nameArg, err := evalExpr(x.Args[0], row, ctx)
+			nameArg, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || nameArg.IsNull() {
 				return NullDatum, nil
 			}
 			missingOK := false
 			if len(x.Args) >= 2 {
-				missingArg, err := evalExpr(x.Args[1], row, ctx)
+				missingArg, err := evalExprSlot(x.Args[1], slot, ctx)
 				if err == nil && !missingArg.IsNull() {
 					missingOK = missingArg.BoolValue()
 				}
@@ -9556,19 +9556,19 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 		return NullDatum, nil
 	case "pg_sleep":
-		return evalPgSleep(x, row, ctx)
+		return evalPgSleep(x, slot, ctx)
 	case "to_timestamp":
-		return evalToTimestamp(x, row, ctx)
+		return evalToTimestamp(x, slot, ctx)
 	case "to_date":
-		return evalToDate(x, row, ctx)
+		return evalToDate(x, slot, ctx)
 	case "substr", "substring":
-		return evalSubstr(x, row, ctx)
+		return evalSubstr(x, slot, ctx)
 	case "overlay":
-		return evalOverlay(x, row, ctx)
+		return evalOverlay(x, slot, ctx)
 	case "date_part":
-		return evalDatePart(x, row, ctx)
+		return evalDatePart(x, slot, ctx)
 	case "date_trunc":
-		return evalDateTrunc(x, row, ctx)
+		return evalDateTrunc(x, slot, ctx)
 	case "timezone":
 		// Implements AT LOCAL (1-arg) and AT TIME ZONE (2-arg). M0097-0004.
 		// One-arg:  timezone(timetz)       → convert to session local time (UTC for goopg).
@@ -9582,13 +9582,13 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			// AT LOCAL: session timezone is UTC.
 			zoneStr = "UTC"
 			var err error
-			src, err = evalExpr(x.Args[0], row, ctx)
+			src, err = evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil {
 				return Datum{}, err
 			}
 		} else {
 			// AT TIME ZONE: zone is first arg, value is second arg.
-			zoneArg, err := evalExpr(x.Args[0], row, ctx)
+			zoneArg, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil {
 				return Datum{}, err
 			}
@@ -9596,7 +9596,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 				return NullDatum, nil
 			}
 			zoneStr = zoneArg.StringValue()
-			src, err = evalExpr(x.Args[1], row, ctx)
+			src, err = evalExprSlot(x.Args[1], slot, ctx)
 			if err != nil {
 				return Datum{}, err
 			}
@@ -9636,7 +9636,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		if len(x.Args) < 1 {
 			return NullDatum, nil
 		}
-		arg, err := evalExpr(x.Args[0], row, ctx)
+		arg, err := evalExprSlot(x.Args[0], slot, ctx)
 		if err != nil || arg.IsNull() {
 			return NullDatum, nil
 		}
@@ -9701,7 +9701,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			// evaluated Datum kind. A collatable (string) result defaults to
 			// "default"; anything else is conservatively reported as having no
 			// determinable collation rather than guessing a name PG wouldn't use.
-			v, err := evalExpr(x.Args[0], row, ctx)
+			v, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil {
 				return NullDatum, err
 			}
@@ -9711,37 +9711,37 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 		return NullDatum, nil
 	case "to_char":
-		return evalToChar(x, row, ctx)
+		return evalToChar(x, slot, ctx)
 	case "age":
-		return evalAge(x, row, ctx)
+		return evalAge(x, slot, ctx)
 	case "make_date":
-		return evalMakeDate(x, row, ctx)
+		return evalMakeDate(x, slot, ctx)
 	case "make_timestamp", "make_timestamptz":
-		return evalMakeTimestamp(x, row, ctx)
+		return evalMakeTimestamp(x, slot, ctx)
 	case "make_time":
-		return evalMakeTime(x, row, ctx)
+		return evalMakeTime(x, slot, ctx)
 	case "isfinite":
-		return evalIsFinite(x, row, ctx)
+		return evalIsFinite(x, slot, ctx)
 	case "justify_hours", "justify_days", "justify_interval":
-		return evalJustify(name, x, row, ctx)
+		return evalJustify(name, x, slot, ctx)
 	case "date_bin":
-		return evalDateBin(x, row, ctx)
+		return evalDateBin(x, slot, ctx)
 	case "set_config":
 		// set_config(setting_name, new_value, is_local) → text
 		// vacuumdb calls SELECT pg_catalog.set_config('search_path', '', false)
 		// to restrict the search path for security. Accept and return new_value.
 		if len(x.Args) >= 2 {
-			nameArg, err := evalExpr(x.Args[0], row, ctx)
+			nameArg, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || nameArg.IsNull() {
 				return NullDatum, nil
 			}
-			newVal, err := evalExpr(x.Args[1], row, ctx)
+			newVal, err := evalExprSlot(x.Args[1], slot, ctx)
 			if err != nil {
 				return NullDatum, nil
 			}
 			isLocal := false
 			if len(x.Args) >= 3 {
-				localArg, err := evalExpr(x.Args[2], row, ctx)
+				localArg, err := evalExprSlot(x.Args[2], slot, ctx)
 				if err == nil && !localArg.IsNull() {
 					isLocal = localArg.BoolValue()
 				}
@@ -9814,7 +9814,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		if len(x.Args) < 1 {
 			return NullDatum, nil
 		}
-		pidArg, err := evalExpr(x.Args[0], row, ctx)
+		pidArg, err := evalExprSlot(x.Args[0], slot, ctx)
 		if err != nil {
 			return NullDatum, err
 		}
@@ -9840,7 +9840,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		if len(x.Args) < 1 {
 			return NullDatum, nil
 		}
-		pidArg, err := evalExpr(x.Args[0], row, ctx)
+		pidArg, err := evalExprSlot(x.Args[0], slot, ctx)
 		if err != nil {
 			return NullDatum, err
 		}
@@ -9872,7 +9872,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		if len(x.Args) < 1 {
 			return NullDatum, nil
 		}
-		chArg, err := evalExpr(x.Args[0], row, ctx)
+		chArg, err := evalExprSlot(x.Args[0], slot, ctx)
 		if err != nil {
 			return NullDatum, err
 		}
@@ -9881,7 +9881,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 		payload := ""
 		if len(x.Args) >= 2 {
-			pArg, perr := evalExpr(x.Args[1], row, ctx)
+			pArg, perr := evalExprSlot(x.Args[1], slot, ctx)
 			if perr != nil {
 				return NullDatum, perr
 			}
@@ -9927,7 +9927,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// pg_catalog is prepended (mirrors PG's current_schemas semantics).
 		includeImplicit := false
 		if len(x.Args) >= 1 {
-			v, err := evalExpr(x.Args[0], row, ctx)
+			v, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err == nil && !v.IsNull() {
 				includeImplicit = v.BoolValue()
 			}
@@ -9940,7 +9940,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	// the table will have 1 row rather than N. M0096-0008.
 	case "generate_series":
 		if len(x.Args) >= 1 {
-			v, err := evalExpr(x.Args[0], row, ctx)
+			v, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil {
 				return NullDatum, nil
 			}
@@ -10005,8 +10005,8 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		vals := et.Values
 		if len(x.Args) >= 2 {
 			// enum_range(lo, hi): lo=NULL means start from first; hi=NULL means end at last.
-			loVal, loErr := evalExpr(x.Args[0], row, ctx)
-			hiVal, hiErr := evalExpr(x.Args[1], row, ctx)
+			loVal, loErr := evalExprSlot(x.Args[0], slot, ctx)
+			hiVal, hiErr := evalExprSlot(x.Args[1], slot, ctx)
 			if loErr == nil && !loVal.IsNull() {
 				loStr := loVal.StringValue()
 				for i, v := range vals {
@@ -10047,12 +10047,12 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 
 	case "pg_advisory_lock":
 		// pg_advisory_lock(bigint) or pg_advisory_lock(int4, int4) → void
-		return evalAdvisoryLock(x, row, ctx, false, false, false)
+		return evalAdvisoryLock(x, slot, ctx, false, false, false)
 
 	case "pg_advisory_unlock":
 		// pg_advisory_unlock(bigint) → boolean
 		// pg_advisory_unlock(int4, int4) → boolean
-		return evalAdvisoryUnlock(x, row, ctx, false)
+		return evalAdvisoryUnlock(x, slot, ctx, false)
 
 	case "pg_advisory_unlock_all":
 		// pg_advisory_unlock_all() → void
@@ -10060,43 +10060,43 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 
 	case "pg_advisory_xact_lock":
 		// pg_advisory_xact_lock(bigint) or pg_advisory_xact_lock(int4, int4) → void  (xact-scoped)
-		return evalAdvisoryLock(x, row, ctx, false, true, false)
+		return evalAdvisoryLock(x, slot, ctx, false, true, false)
 
 	case "pg_try_advisory_xact_lock":
 		// pg_try_advisory_xact_lock(bigint) or pg_try_advisory_xact_lock(int4, int4) → boolean
-		return evalAdvisoryLock(x, row, ctx, true, true, false)
+		return evalAdvisoryLock(x, slot, ctx, true, true, false)
 
 	case "pg_try_advisory_lock":
 		// pg_try_advisory_lock(bigint) → boolean  (non-blocking)
-		return evalAdvisoryLock(x, row, ctx, true, false, false)
+		return evalAdvisoryLock(x, slot, ctx, true, false, false)
 
 	// ── Shared-mode advisory lock variants (M0097-0021) ──────────────────
 	case "pg_advisory_lock_shared":
 		// pg_advisory_lock_shared(bigint) or pg_advisory_lock_shared(int4, int4) → void
-		return evalAdvisoryLock(x, row, ctx, false, false, true)
+		return evalAdvisoryLock(x, slot, ctx, false, false, true)
 	case "pg_advisory_xact_lock_shared":
 		// pg_advisory_xact_lock_shared(bigint) or pg_advisory_xact_lock_shared(int4, int4) → void
-		return evalAdvisoryLock(x, row, ctx, false, true, true)
+		return evalAdvisoryLock(x, slot, ctx, false, true, true)
 	case "pg_try_advisory_lock_shared":
 		// pg_try_advisory_lock_shared(bigint) → boolean
-		return evalAdvisoryLock(x, row, ctx, true, false, true)
+		return evalAdvisoryLock(x, slot, ctx, true, false, true)
 	case "pg_try_advisory_xact_lock_shared":
 		// pg_try_advisory_xact_lock_shared(bigint) → boolean
-		return evalAdvisoryLock(x, row, ctx, true, true, true)
+		return evalAdvisoryLock(x, slot, ctx, true, true, true)
 	case "pg_advisory_unlock_shared":
 		// pg_advisory_unlock_shared(bigint) or pg_advisory_unlock_shared(int4, int4) → boolean
-		return evalAdvisoryUnlock(x, row, ctx, true)
+		return evalAdvisoryUnlock(x, slot, ctx, true)
 
 	// ── Boolean comparison functions (M0097-0003) ─────────────────────────
 	// These are the C-level backing functions for bool operators; the
 	// boolean.sql regress test calls them explicitly.
 	case "booleq":
 		if len(x.Args) == 2 {
-			a, err := evalExpr(x.Args[0], row, ctx)
+			a, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil {
 				return NullDatum, nil
 			}
-			b, err2 := evalExpr(x.Args[1], row, ctx)
+			b, err2 := evalExprSlot(x.Args[1], slot, ctx)
 			if err2 != nil {
 				return NullDatum, nil
 			}
@@ -10107,11 +10107,11 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 	case "boolne":
 		if len(x.Args) == 2 {
-			a, err := evalExpr(x.Args[0], row, ctx)
+			a, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil {
 				return NullDatum, nil
 			}
-			b, err2 := evalExpr(x.Args[1], row, ctx)
+			b, err2 := evalExprSlot(x.Args[1], slot, ctx)
 			if err2 != nil {
 				return NullDatum, nil
 			}
@@ -10126,11 +10126,11 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	// booland_statefunc / boolor_statefunc internals.
 	case "booland_statefunc":
 		if len(x.Args) == 2 {
-			a, err := evalExpr(x.Args[0], row, ctx)
+			a, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || a.IsNull() {
 				return NullDatum, nil
 			}
-			b, err2 := evalExpr(x.Args[1], row, ctx)
+			b, err2 := evalExprSlot(x.Args[1], slot, ctx)
 			if err2 != nil || b.IsNull() {
 				return NullDatum, nil
 			}
@@ -10138,11 +10138,11 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 	case "boolor_statefunc":
 		if len(x.Args) == 2 {
-			a, err := evalExpr(x.Args[0], row, ctx)
+			a, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || a.IsNull() {
 				return NullDatum, nil
 			}
-			b, err2 := evalExpr(x.Args[1], row, ctx)
+			b, err2 := evalExprSlot(x.Args[1], slot, ctx)
 			if err2 != nil || b.IsNull() {
 				return NullDatum, nil
 			}
@@ -10153,11 +10153,11 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// Array element access: arr[idx] (1-based). Used for SQL a[N] syntax. M0097-0003.
 		// Returns the element as its natural type (int for integer arrays, else text).
 		if len(x.Args) == 2 {
-			arr, err := evalExpr(x.Args[0], row, ctx)
+			arr, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil {
 				return NullDatum, err
 			}
-			idxDatum, err := evalExpr(x.Args[1], row, ctx)
+			idxDatum, err := evalExprSlot(x.Args[1], slot, ctx)
 			if err != nil {
 				return NullDatum, err
 			}
@@ -10227,11 +10227,11 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// For 1-D arrays, returns the number of elements (lower is always 1).
 		// Returns NULL for empty arrays, NULL inputs, or dim != 1.
 		if len(x.Args) == 2 {
-			arr, err := evalExpr(x.Args[0], row, ctx)
+			arr, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil {
 				return NullDatum, err
 			}
-			dimDatum, err := evalExpr(x.Args[1], row, ctx)
+			dimDatum, err := evalExprSlot(x.Args[1], slot, ctx)
 			if err != nil {
 				return NullDatum, err
 			}
@@ -10258,11 +10258,11 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// For standard PostgreSQL arrays the lower bound is always 1.
 		// Returns NULL for empty arrays, NULL inputs, or dim != 1.
 		if len(x.Args) == 2 {
-			arr, err := evalExpr(x.Args[0], row, ctx)
+			arr, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil {
 				return NullDatum, err
 			}
-			dimDatum, err := evalExpr(x.Args[1], row, ctx)
+			dimDatum, err := evalExprSlot(x.Args[1], slot, ctx)
 			if err != nil {
 				return NullDatum, err
 			}
@@ -10289,11 +10289,11 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// Equivalent to array_upper - array_lower + 1 = upper (since lower=1).
 		// Returns NULL for empty arrays, NULL inputs, or dim != 1.
 		if len(x.Args) == 2 {
-			arr, err := evalExpr(x.Args[0], row, ctx)
+			arr, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil {
 				return NullDatum, err
 			}
-			dimDatum, err := evalExpr(x.Args[1], row, ctx)
+			dimDatum, err := evalExprSlot(x.Args[1], slot, ctx)
 			if err != nil {
 				return NullDatum, err
 			}
@@ -10319,11 +10319,11 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// array_fill(val, dims_array[, lb_array]) → fills an array with val repeated N times.
 		// array_fill(1.0, ARRAY[4]) = {1.0,1.0,1.0,1.0}. Only 1-D supported. M0097-0113.
 		if len(x.Args) >= 2 {
-			val, err := evalExpr(x.Args[0], row, ctx)
+			val, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil {
 				return NullDatum, err
 			}
-			dimsD, err := evalExpr(x.Args[1], row, ctx)
+			dimsD, err := evalExprSlot(x.Args[1], slot, ctx)
 			if err != nil {
 				return NullDatum, err
 			}
@@ -10357,7 +10357,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if i > 0 {
 				sb.WriteByte(',')
 			}
-			v, err := evalExpr(arg, row, ctx)
+			v, err := evalExprSlot(arg, slot, ctx)
 			if err != nil {
 				return NullDatum, err
 			}
@@ -10380,7 +10380,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if i > 0 {
 				sbRow.WriteByte(',')
 			}
-			v, err := evalExpr(arg, row, ctx)
+			v, err := evalExprSlot(arg, slot, ctx)
 			if err != nil {
 				return NullDatum, err
 			}
@@ -10423,13 +10423,13 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// Parses a qualified SQL identifier string and returns its components
 		// as a text array {comp1,comp2,...}. M0097-0003.
 		if len(x.Args) >= 1 {
-			strDatum, err := evalExpr(x.Args[0], row, ctx)
+			strDatum, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || strDatum.IsNull() {
 				return NullDatum, nil
 			}
 			strict := true
 			if len(x.Args) >= 2 {
-				strictDatum, err2 := evalExpr(x.Args[1], row, ctx)
+				strictDatum, err2 := evalExprSlot(x.Args[1], slot, ctx)
 				if err2 == nil && !strictDatum.IsNull() {
 					strict = strictDatum.BoolValue()
 				}
@@ -10451,8 +10451,8 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "pg_input_is_valid":
 		// M0097-0018: enhanced to validate xid/xid8 inputs.
 		if len(x.Args) == 2 {
-			val, _ := evalExpr(x.Args[0], row, ctx)
-			typName, _ := evalExpr(x.Args[1], row, ctx)
+			val, _ := evalExprSlot(x.Args[0], slot, ctx)
+			typName, _ := evalExprSlot(x.Args[1], slot, ctx)
 			if val.IsNull() || typName.IsNull() {
 				return NullDatum, nil
 			}
@@ -10561,7 +10561,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "uuidv7":
 		var uuidV7Ns int64
 		if len(x.Args) == 1 {
-			iv, ivErr := evalExpr(x.Args[0], row, ctx)
+			iv, ivErr := evalExprSlot(x.Args[0], slot, ctx)
 			if ivErr != nil {
 				return NullDatum, ivErr
 			}
@@ -10585,7 +10585,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return NewStringDatum(u), nil
 	case "uuid_extract_version":
 		if len(x.Args) == 1 {
-			v, evalErr := evalExpr(x.Args[0], row, ctx)
+			v, evalErr := evalExprSlot(x.Args[0], slot, ctx)
 			if evalErr != nil || v.IsNull() {
 				return NullDatum, evalErr
 			}
@@ -10598,7 +10598,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return NullDatum, nil
 	case "uuid_extract_timestamp":
 		if len(x.Args) == 1 {
-			v, evalErr := evalExpr(x.Args[0], row, ctx)
+			v, evalErr := evalExprSlot(x.Args[0], slot, ctx)
 			if evalErr != nil || v.IsNull() {
 				return NullDatum, evalErr
 			}
@@ -10626,7 +10626,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	// ── Size functions (M0097-0018) ───────────────────────────────────────
 	case "pg_size_pretty":
 		if len(x.Args) == 1 {
-			v, err := evalExpr(x.Args[0], row, ctx)
+			v, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || v.IsNull() {
 				return NullDatum, nil
 			}
@@ -10640,7 +10640,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 
 	case "pg_size_bytes":
 		if len(x.Args) == 1 {
-			s, err := evalExpr(x.Args[0], row, ctx)
+			s, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
@@ -10659,22 +10659,22 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return Datum{Kind: KindInt, Int: 8 * 1024 * 1024}, nil
 
 	case "pg_relation_size":
-		return evalPgRelationSize(x, row, ctx)
+		return evalPgRelationSize(x, slot, ctx)
 
 	case "pg_total_relation_size":
-		return evalPgTotalRelationSize(x, row, ctx)
+		return evalPgTotalRelationSize(x, slot, ctx)
 
 	case "pg_indexes_size":
-		return evalPgIndexesSize(x, row, ctx)
+		return evalPgIndexesSize(x, slot, ctx)
 
 	case "pg_table_size":
-		return evalPgTableSize(x, row, ctx)
+		return evalPgTableSize(x, slot, ctx)
 
 	// ── xid8 comparison function (M0097-0018) ─────────────────────────────
 	case "xid8cmp":
 		if len(x.Args) == 2 {
-			a, err1 := evalExpr(x.Args[0], row, ctx)
-			b, err2 := evalExpr(x.Args[1], row, ctx)
+			a, err1 := evalExprSlot(x.Args[0], slot, ctx)
+			b, err2 := evalExprSlot(x.Args[1], slot, ctx)
 			if err1 != nil || err2 != nil || a.IsNull() || b.IsNull() {
 				return NullDatum, nil
 			}
@@ -10702,7 +10702,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	// ── Hash / crypto functions (M0097-0011) ─────────────────────────────
 	case "md5":
 		if len(x.Args) == 1 {
-			v, err := evalExpr(x.Args[0], row, ctx)
+			v, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || v.IsNull() {
 				return NullDatum, nil
 			}
@@ -10714,7 +10714,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// Digest length 28 bytes. postgres/src/include/common/sha2.h:20.
 		// M0134-0070 — previously fell through the switch ("function does not exist").
 		if len(x.Args) == 1 {
-			src, serr := evalExpr(x.Args[0], row, ctx)
+			src, serr := evalExprSlot(x.Args[0], slot, ctx)
 			if serr != nil {
 				return NullDatum, serr
 			}
@@ -10737,7 +10737,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// Digest length 32 bytes. postgres/src/include/common/sha2.h:21.
 		// M0134-0070 — used to return hex TEXT (KindString) instead of bytea.
 		if len(x.Args) == 1 {
-			src, serr := evalExpr(x.Args[0], row, ctx)
+			src, serr := evalExprSlot(x.Args[0], slot, ctx)
 			if serr != nil {
 				return NullDatum, serr
 			}
@@ -10760,7 +10760,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// Digest length 48 bytes. postgres/src/include/common/sha2.h:22.
 		// M0134-0070 — previously fell through the switch ("function does not exist").
 		if len(x.Args) == 1 {
-			src, serr := evalExpr(x.Args[0], row, ctx)
+			src, serr := evalExprSlot(x.Args[0], slot, ctx)
 			if serr != nil {
 				return NullDatum, serr
 			}
@@ -10783,7 +10783,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// Digest length 64 bytes. postgres/src/include/common/sha2.h:23.
 		// M0134-0070 — used to return hex TEXT (KindString) instead of bytea.
 		if len(x.Args) == 1 {
-			src, serr := evalExpr(x.Args[0], row, ctx)
+			src, serr := evalExprSlot(x.Args[0], slot, ctx)
 			if serr != nil {
 				return NullDatum, serr
 			}
@@ -10804,8 +10804,8 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "digest":
 		// digest(text, algorithm) — subset: only 'md5', 'sha256', 'sha512'
 		if len(x.Args) == 2 {
-			s, err1 := evalExpr(x.Args[0], row, ctx)
-			alg, err2 := evalExpr(x.Args[1], row, ctx)
+			s, err1 := evalExprSlot(x.Args[0], slot, ctx)
+			alg, err2 := evalExprSlot(x.Args[1], slot, ctx)
 			if err1 != nil || err2 != nil || s.IsNull() || alg.IsNull() {
 				return NullDatum, nil
 			}
@@ -10840,14 +10840,14 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// FROM-clause form (`FROM regexp_matches(...)`) is still unwired
 		// (ledger M0122-0002/regexp_matches-srf).
 		if len(x.Args) >= 2 {
-			s, e1 := evalExpr(x.Args[0], row, ctx)
-			pat, e2 := evalExpr(x.Args[1], row, ctx)
+			s, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			pat, e2 := evalExprSlot(x.Args[1], slot, ctx)
 			if e1 != nil || e2 != nil || s.IsNull() || pat.IsNull() {
 				return NullDatum, nil
 			}
 			caseInsensitive := false
 			if len(x.Args) >= 3 {
-				flags, e3 := evalExpr(x.Args[2], row, ctx)
+				flags, e3 := evalExprSlot(x.Args[2], slot, ctx)
 				if e3 == nil && !flags.IsNull() {
 					caseInsensitive = strings.Contains(flags.StringValue(), "i")
 				}
@@ -10867,7 +10867,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "nextval":
 		args := make([]Datum, len(x.Args))
 		for i, a := range x.Args {
-			v, err := evalExpr(a, row, ctx)
+			v, err := evalExprSlot(a, slot, ctx)
 			if err != nil {
 				return NullDatum, nil
 			}
@@ -10877,7 +10877,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "currval":
 		args := make([]Datum, len(x.Args))
 		for i, a := range x.Args {
-			v, err := evalExpr(a, row, ctx)
+			v, err := evalExprSlot(a, slot, ctx)
 			if err != nil {
 				return NullDatum, nil
 			}
@@ -10887,7 +10887,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "setval":
 		args := make([]Datum, len(x.Args))
 		for i, a := range x.Args {
-			v, err := evalExpr(a, row, ctx)
+			v, err := evalExprSlot(a, slot, ctx)
 			if err != nil {
 				return NullDatum, nil
 			}
@@ -10905,8 +10905,8 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// unconditionally — wrong for a renamed sequence, an explicit OWNED BY
 		// target, or any plain (non-serial) column. M0122 follow-up.
 		if len(x.Args) == 2 {
-			tbl, err1 := evalExpr(x.Args[0], row, ctx)
-			col, err2 := evalExpr(x.Args[1], row, ctx)
+			tbl, err1 := evalExprSlot(x.Args[0], slot, ctx)
+			col, err2 := evalExprSlot(x.Args[1], slot, ctx)
 			if err1 != nil || err2 != nil || tbl.IsNull() || col.IsNull() {
 				return NullDatum, nil
 			}
@@ -10945,7 +10945,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		if len(x.Args) < 1 {
 			return NullDatum, nil
 		}
-		arg, err := evalExpr(x.Args[0], row, ctx)
+		arg, err := evalExprSlot(x.Args[0], slot, ctx)
 		if err != nil || arg.IsNull() {
 			return NullDatum, nil
 		}
@@ -10958,7 +10958,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 		var colno int
 		if len(x.Args) >= 2 {
-			colArg, err := evalExpr(x.Args[1], row, ctx)
+			colArg, err := evalExprSlot(x.Args[1], slot, ctx)
 			if err != nil {
 				return NullDatum, nil
 			}
@@ -10989,7 +10989,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		if len(x.Args) < 1 {
 			return NullDatum, nil
 		}
-		arg, err := evalExpr(x.Args[0], row, ctx)
+		arg, err := evalExprSlot(x.Args[0], slot, ctx)
 		if err != nil || arg.IsNull() {
 			return NullDatum, nil
 		}
@@ -11018,7 +11018,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		if len(x.Args) < 1 {
 			return NullDatum, nil
 		}
-		arg, err := evalExpr(x.Args[0], row, ctx)
+		arg, err := evalExprSlot(x.Args[0], slot, ctx)
 		if err != nil || arg.IsNull() {
 			return NullDatum, nil
 		}
@@ -11050,7 +11050,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		if len(x.Args) < 1 {
 			return NullDatum, nil
 		}
-		arg, err := evalExpr(x.Args[0], row, ctx)
+		arg, err := evalExprSlot(x.Args[0], slot, ctx)
 		if err != nil || arg.IsNull() {
 			return NullDatum, nil
 		}
@@ -11086,7 +11086,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		if len(x.Args) < 1 {
 			return NullDatum, nil
 		}
-		arg, err := evalExpr(x.Args[0], row, ctx)
+		arg, err := evalExprSlot(x.Args[0], slot, ctx)
 		if err != nil || arg.IsNull() {
 			return NullDatum, nil
 		}
@@ -11119,7 +11119,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		if len(x.Args) < 1 {
 			return NullDatum, nil
 		}
-		arg, err := evalExpr(x.Args[0], row, ctx)
+		arg, err := evalExprSlot(x.Args[0], slot, ctx)
 		if err != nil || arg.IsNull() {
 			return NullDatum, nil
 		}
@@ -11137,7 +11137,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// is absent, matching PG's 1-arg pg_get_constraintdef. DU-002-ah slice A.
 		pretty := false
 		if len(x.Args) >= 2 {
-			prettyArg, err := evalExpr(x.Args[1], row, ctx)
+			prettyArg, err := evalExprSlot(x.Args[1], slot, ctx)
 			if err == nil && !prettyArg.IsNull() {
 				pretty = prettyArg.BoolValue()
 			}
@@ -11232,7 +11232,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		if len(x.Args) < 1 {
 			return NullDatum, nil
 		}
-		arg, err := evalExpr(x.Args[0], row, ctx)
+		arg, err := evalExprSlot(x.Args[0], slot, ctx)
 		if err != nil || arg.IsNull() {
 			return NullDatum, nil
 		}
@@ -11280,11 +11280,11 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		if len(x.Args) < 2 {
 			return NullDatum, nil
 		}
-		arrDatum, err := evalExpr(x.Args[0], row, ctx)
+		arrDatum, err := evalExprSlot(x.Args[0], slot, ctx)
 		if err != nil || arrDatum.IsNull() {
 			return NullDatum, nil
 		}
-		sepDatum, err := evalExpr(x.Args[1], row, ctx)
+		sepDatum, err := evalExprSlot(x.Args[1], slot, ctx)
 		if err != nil {
 			return NullDatum, nil
 		}
@@ -11295,7 +11295,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		nullStr := ""
 		useNullStr := false
 		if len(x.Args) >= 3 {
-			nsDatum, err2 := evalExpr(x.Args[2], row, ctx)
+			nsDatum, err2 := evalExprSlot(x.Args[2], slot, ctx)
 			if err2 == nil && !nsDatum.IsNull() {
 				nullStr = nsDatum.StringValue()
 				useNullStr = true
@@ -11319,7 +11319,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		if len(x.Args) < 1 {
 			return NullDatum, nil
 		}
-		arg, err := evalExpr(x.Args[0], row, ctx)
+		arg, err := evalExprSlot(x.Args[0], slot, ctx)
 		if err != nil || arg.IsNull() {
 			return NullDatum, nil
 		}
@@ -11393,7 +11393,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// Decompiles an internal expression tree. Goopg stores pre-formatted strings
 		// in pg_node_tree columns (e.g. relpartbound), so pass them through directly.
 		if len(x.Args) >= 1 {
-			treeArg, err := evalExpr(x.Args[0], row, ctx)
+			treeArg, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil {
 				return Datum{}, err
 			}
@@ -11415,7 +11415,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// obj_description(object_oid [, catalog_name]) → text
 		// Returns the description for a database object from pg_description.
 		if len(x.Args) >= 1 {
-			oidDatum, err := evalExpr(x.Args[0], row, ctx)
+			oidDatum, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil {
 				return Datum{}, err
 			}
@@ -11448,7 +11448,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// (postgres/src/bin/psql/describe.c:1986); objsubid 0 returns the
 		// table's own comment. M0134-0002 C15.
 		if len(x.Args) >= 2 {
-			oidDatum, err := evalExpr(x.Args[0], row, ctx)
+			oidDatum, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil {
 				return Datum{}, err
 			}
@@ -11460,7 +11460,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 				n, _ := strconv.ParseUint(oidDatum.StringValue(), 10, 32)
 				objOID = uint32(n)
 			}
-			attnumDatum, err := evalExpr(x.Args[1], row, ctx)
+			attnumDatum, err := evalExprSlot(x.Args[1], slot, ctx)
 			if err != nil {
 				return Datum{}, err
 			}
@@ -11487,11 +11487,11 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// freshly bootstrapped cluster with no shared comments recorded.
 		// M0119-0004-ACLHEAP (datacl half).
 		if len(x.Args) >= 2 {
-			oidDatum, err := evalExpr(x.Args[0], row, ctx)
+			oidDatum, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil {
 				return Datum{}, err
 			}
-			catArg, err := evalExpr(x.Args[1], row, ctx)
+			catArg, err := evalExprSlot(x.Args[1], slot, ctx)
 			if err != nil {
 				return Datum{}, err
 			}
@@ -11524,7 +11524,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// pg_relation_filenode(relation regclass) → oid
 		// Returns the filenode for a relation. For temporary tables returns NULL.
 		if len(x.Args) >= 1 {
-			relDatum, err := evalExpr(x.Args[0], row, ctx)
+			relDatum, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil {
 				return Datum{}, err
 			}
@@ -11557,8 +11557,8 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "point":
 		// point(x, y) → text "(x,y)" — minimal geometric point. M0097-0023.
 		if len(x.Args) == 2 {
-			av, aerr := evalExpr(x.Args[0], row, ctx)
-			bv, berr := evalExpr(x.Args[1], row, ctx)
+			av, aerr := evalExprSlot(x.Args[0], slot, ctx)
+			bv, berr := evalExprSlot(x.Args[1], slot, ctx)
 			if aerr != nil {
 				return Datum{}, aerr
 			}
@@ -11576,8 +11576,8 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "box":
 		// box(point, point) → text "(max_x,max_y),(min_x,min_y)". M0097-0023.
 		if len(x.Args) == 2 {
-			av, aerr := evalExpr(x.Args[0], row, ctx)
-			bv, berr := evalExpr(x.Args[1], row, ctx)
+			av, aerr := evalExprSlot(x.Args[0], slot, ctx)
+			bv, berr := evalExprSlot(x.Args[1], slot, ctx)
 			if aerr != nil {
 				return Datum{}, aerr
 			}
@@ -11617,7 +11617,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		if len(x.Args) != 1 || ctx == nil || ctx.Catalog == nil {
 			return NullDatum, nil
 		}
-		v, err := evalExpr(x.Args[0], row, ctx)
+		v, err := evalExprSlot(x.Args[0], slot, ctx)
 		if err != nil || v.IsNull() {
 			return NullDatum, nil
 		}
@@ -11672,11 +11672,11 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		if len(x.Args) < 3 || ctx == nil || ctx.Catalog == nil {
 			return NewBoolDatum(false), nil
 		}
-		modulusDatum, err := evalExpr(x.Args[1], row, ctx)
+		modulusDatum, err := evalExprSlot(x.Args[1], slot, ctx)
 		if err != nil {
 			return NullDatum, err
 		}
-		remainderDatum, err := evalExpr(x.Args[2], row, ctx)
+		remainderDatum, err := evalExprSlot(x.Args[2], slot, ctx)
 		if err != nil {
 			return NullDatum, err
 		}
@@ -11698,7 +11698,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return NullDatum, &ExecError{Code: "22023",
 				Message: "remainder for hash partition must be less than modulus"}
 		}
-		tableoidDatum, err := evalExpr(x.Args[0], row, ctx)
+		tableoidDatum, err := evalExprSlot(x.Args[0], slot, ctx)
 		if err != nil {
 			return NullDatum, err
 		}
@@ -11763,7 +11763,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// function (or the built-in type default) and fold with hash_combine64.
 		// Shared with INSERT-time HASH partition routing — M0134-0053.
 		rowHash, herr := computeHashPartitionRowHash(tbl, im, ctx, x.Pos(), func(i int) (Datum, error) {
-			return evalExpr(x.Args[3+i], row, ctx)
+			return evalExprSlot(x.Args[3+i], slot, ctx)
 		})
 		if herr != nil {
 			return NullDatum, herr
@@ -11778,7 +11778,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "pg_get_functiondef":
 		// pg_get_functiondef(func_oid) → text — returns function DDL.
 		if len(x.Args) == 1 {
-			oidArg, err := evalExpr(x.Args[0], row, ctx)
+			oidArg, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || oidArg.IsNull() {
 				return NullDatum, nil
 			}
@@ -11812,7 +11812,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "pg_get_function_arguments":
 		// pg_get_function_arguments(oid) → text: comma-separated arg list
 		if len(x.Args) == 1 && ctx != nil && ctx.Catalog != nil {
-			oidArg, err := evalExpr(x.Args[0], row, ctx)
+			oidArg, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err == nil && !oidArg.IsNull() && oidArg.Kind == KindInt {
 				if r := routineOrAggregateArgs(ctx.Catalog, uint32(oidArg.Int)); r != nil {
 					return NewStringDatum(buildFunctionArguments(r, true)), nil
@@ -11828,7 +11828,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// DEFAULT clauses. buildFunctionArguments takes printDefaults=false here,
 		// so the identity form drops any ` DEFAULT <expr>` carried by the full form.
 		if len(x.Args) == 1 && ctx != nil && ctx.Catalog != nil {
-			oidArg, err := evalExpr(x.Args[0], row, ctx)
+			oidArg, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err == nil && !oidArg.IsNull() && oidArg.Kind == KindInt {
 				if r := routineOrAggregateArgs(ctx.Catalog, uint32(oidArg.Int)); r != nil {
 					return NewStringDatum(buildFunctionArguments(r, false)), nil
@@ -11848,7 +11848,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "pg_get_function_result":
 		// pg_get_function_result(oid) → text: return type
 		if len(x.Args) == 1 && ctx != nil && ctx.Catalog != nil {
-			oidArg, err := evalExpr(x.Args[0], row, ctx)
+			oidArg, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err == nil && !oidArg.IsNull() && oidArg.Kind == KindInt {
 				if rs := ctx.Catalog.Routines(); rs != nil {
 					if r := rs.LookupByOID(uint32(oidArg.Int)); r != nil && !r.IsProcedure {
@@ -11894,7 +11894,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		if len(x.Args) != 1 {
 			return NullDatum, nil
 		}
-		v, err := evalExpr(x.Args[0], row, ctx)
+		v, err := evalExprSlot(x.Args[0], slot, ctx)
 		if err != nil || v.IsNull() {
 			return v, err
 		}
@@ -11921,11 +11921,11 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "repeat":
 		// repeat(text, int) → text
 		if len(x.Args) == 2 {
-			s, err := evalExpr(x.Args[0], row, ctx)
+			s, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
-			n, err := evalExpr(x.Args[1], row, ctx)
+			n, err := evalExprSlot(x.Args[1], slot, ctx)
 			if err != nil || n.IsNull() {
 				return NullDatum, nil
 			}
@@ -11939,7 +11939,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "char_length", "character_length":
 		// char_length(text) → int
 		if len(x.Args) == 1 {
-			s, err := evalExpr(x.Args[0], row, ctx)
+			s, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
@@ -11950,7 +11950,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// Only valid for text/varchar/char/bytea — integer/numeric/etc. must error
 		// because PostgreSQL does not define length(integer). M0097-0063.
 		if len(x.Args) == 1 {
-			s, err := evalExpr(x.Args[0], row, ctx)
+			s, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
@@ -11981,7 +11981,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 	case "octet_length":
 		if len(x.Args) == 1 {
-			s, err := evalExpr(x.Args[0], row, ctx)
+			s, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
@@ -12012,7 +12012,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// not 80. goopg's bpchar datum is already trimmed (M0103-0007), so the
 		// plain byte length below is the trimmed length. M0119-0006 (65th slice).
 		if len(x.Args) == 1 {
-			s, err := evalExpr(x.Args[0], row, ctx)
+			s, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
@@ -12029,7 +12029,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 	case "upper":
 		if len(x.Args) == 1 {
-			s, err := evalExpr(x.Args[0], row, ctx)
+			s, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
@@ -12037,7 +12037,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 	case "lower":
 		if len(x.Args) == 1 {
-			s, err := evalExpr(x.Args[0], row, ctx)
+			s, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
@@ -12045,7 +12045,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 	case "initcap":
 		if len(x.Args) == 1 {
-			s, err := evalExpr(x.Args[0], row, ctx)
+			s, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
@@ -12054,7 +12054,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "btrim":
 		// btrim(text [, chars]) — trim chars from both ends
 		if len(x.Args) >= 1 {
-			s, err := evalExpr(x.Args[0], row, ctx)
+			s, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
@@ -12064,7 +12064,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if s.Kind == KindBytes {
 				cutset := []byte(" ")
 				if len(x.Args) >= 2 {
-					c, err := evalExpr(x.Args[1], row, ctx)
+					c, err := evalExprSlot(x.Args[1], slot, ctx)
 					if err == nil && !c.IsNull() {
 						cutset = c.BytesValue()
 					}
@@ -12073,7 +12073,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			cutset := " "
 			if len(x.Args) >= 2 {
-				c, err := evalExpr(x.Args[1], row, ctx)
+				c, err := evalExprSlot(x.Args[1], slot, ctx)
 				if err == nil && !c.IsNull() {
 					cutset = c.StringValue()
 				}
@@ -12082,7 +12082,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 	case "ltrim":
 		if len(x.Args) >= 1 {
-			s, err := evalExpr(x.Args[0], row, ctx)
+			s, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
@@ -12091,7 +12091,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if s.Kind == KindBytes {
 				cutset := []byte(" ")
 				if len(x.Args) >= 2 {
-					c, err := evalExpr(x.Args[1], row, ctx)
+					c, err := evalExprSlot(x.Args[1], slot, ctx)
 					if err == nil && !c.IsNull() {
 						cutset = c.BytesValue()
 					}
@@ -12100,7 +12100,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			cutset := " "
 			if len(x.Args) >= 2 {
-				c, err := evalExpr(x.Args[1], row, ctx)
+				c, err := evalExprSlot(x.Args[1], slot, ctx)
 				if err == nil && !c.IsNull() {
 					cutset = c.StringValue()
 				}
@@ -12109,7 +12109,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 	case "rtrim":
 		if len(x.Args) >= 1 {
-			s, err := evalExpr(x.Args[0], row, ctx)
+			s, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
@@ -12118,7 +12118,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if s.Kind == KindBytes {
 				cutset := []byte(" ")
 				if len(x.Args) >= 2 {
-					c, err := evalExpr(x.Args[1], row, ctx)
+					c, err := evalExprSlot(x.Args[1], slot, ctx)
 					if err == nil && !c.IsNull() {
 						cutset = c.BytesValue()
 					}
@@ -12127,7 +12127,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			cutset := " "
 			if len(x.Args) >= 2 {
-				c, err := evalExpr(x.Args[1], row, ctx)
+				c, err := evalExprSlot(x.Args[1], slot, ctx)
 				if err == nil && !c.IsNull() {
 					cutset = c.StringValue()
 				}
@@ -12137,14 +12137,14 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "lpad":
 		// lpad(text, int [, fill_text])
 		if len(x.Args) >= 2 {
-			s, err := evalExpr(x.Args[0], row, ctx)
-			n, err2 := evalExpr(x.Args[1], row, ctx)
+			s, err := evalExprSlot(x.Args[0], slot, ctx)
+			n, err2 := evalExprSlot(x.Args[1], slot, ctx)
 			if err != nil || err2 != nil || s.IsNull() || n.IsNull() {
 				return NullDatum, nil
 			}
 			fill := " "
 			if len(x.Args) >= 3 {
-				f, ferr := evalExpr(x.Args[2], row, ctx)
+				f, ferr := evalExprSlot(x.Args[2], slot, ctx)
 				if ferr == nil && !f.IsNull() {
 					fill = f.StringValue()
 				}
@@ -12153,14 +12153,14 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 	case "rpad":
 		if len(x.Args) >= 2 {
-			s, err := evalExpr(x.Args[0], row, ctx)
-			n, err2 := evalExpr(x.Args[1], row, ctx)
+			s, err := evalExprSlot(x.Args[0], slot, ctx)
+			n, err2 := evalExprSlot(x.Args[1], slot, ctx)
 			if err != nil || err2 != nil || s.IsNull() || n.IsNull() {
 				return NullDatum, nil
 			}
 			fill := " "
 			if len(x.Args) >= 3 {
-				f, ferr := evalExpr(x.Args[2], row, ctx)
+				f, ferr := evalExprSlot(x.Args[2], slot, ctx)
 				if ferr == nil && !f.IsNull() {
 					fill = f.StringValue()
 				}
@@ -12170,9 +12170,9 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "replace":
 		// replace(text, from, to)
 		if len(x.Args) == 3 {
-			s, e1 := evalExpr(x.Args[0], row, ctx)
-			f, e2 := evalExpr(x.Args[1], row, ctx)
-			t, e3 := evalExpr(x.Args[2], row, ctx)
+			s, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			f, e2 := evalExprSlot(x.Args[1], slot, ctx)
+			t, e3 := evalExprSlot(x.Args[2], slot, ctx)
 			if e1 != nil || e2 != nil || e3 != nil || s.IsNull() {
 				return NullDatum, nil
 			}
@@ -12181,9 +12181,9 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "translate":
 		// translate(text, from_chars, to_chars)
 		if len(x.Args) == 3 {
-			s, e1 := evalExpr(x.Args[0], row, ctx)
-			f, e2 := evalExpr(x.Args[1], row, ctx)
-			t, e3 := evalExpr(x.Args[2], row, ctx)
+			s, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			f, e2 := evalExprSlot(x.Args[1], slot, ctx)
+			t, e3 := evalExprSlot(x.Args[2], slot, ctx)
 			if e1 != nil || e2 != nil || e3 != nil || s.IsNull() {
 				return NullDatum, nil
 			}
@@ -12192,8 +12192,8 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "strpos", "position":
 		// strpos(string, substring) → int; position(substring in string) via FuncCall rewrite
 		if len(x.Args) == 2 {
-			s, e1 := evalExpr(x.Args[0], row, ctx)
-			sub, e2 := evalExpr(x.Args[1], row, ctx)
+			s, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			sub, e2 := evalExprSlot(x.Args[1], slot, ctx)
 			if e1 != nil || e2 != nil || s.IsNull() || sub.IsNull() {
 				return NullDatum, nil
 			}
@@ -12209,9 +12209,9 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// split_part(text, delimiter, field) — mirrors PG's split_part()
 		// (postgres/src/backend/utils/adt/varlena.c:4621-4750).
 		if len(x.Args) == 3 {
-			s, e1 := evalExpr(x.Args[0], row, ctx)
-			d, e2 := evalExpr(x.Args[1], row, ctx)
-			n, e3 := evalExpr(x.Args[2], row, ctx)
+			s, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			d, e2 := evalExprSlot(x.Args[1], slot, ctx)
+			n, e3 := evalExprSlot(x.Args[2], slot, ctx)
 			if e1 != nil || e2 != nil || e3 != nil || s.IsNull() || d.IsNull() || n.IsNull() {
 				return NullDatum, nil
 			}
@@ -12255,7 +12255,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// Expand VARIADIC array arguments into individual string values.
 		if x.Variadic && len(x.Args) == 1 {
 			// concat(VARIADIC arr) — single array arg with VARIADIC flag.
-			v, err := evalExpr(x.Args[0], row, ctx)
+			v, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || v.IsNull() {
 				return NullDatum, nil
 			}
@@ -12268,7 +12268,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 		var buf strings.Builder
 		for _, arg := range x.Args {
-			v, err := evalExpr(arg, row, ctx)
+			v, err := evalExprSlot(arg, slot, ctx)
 			if err != nil || v.IsNull() {
 				continue
 			}
@@ -12279,7 +12279,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// concat_ws(sep, any, ...) → text.
 		// concat_ws(sep, VARIADIC arr) — expand array elements. M0097-0063.
 		if len(x.Args) >= 1 {
-			sepArg, err := evalExpr(x.Args[0], row, ctx)
+			sepArg, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || sepArg.IsNull() {
 				return NullDatum, nil
 			}
@@ -12287,7 +12287,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 
 			// Check for VARIADIC last argument.
 			if x.Variadic && len(x.Args) == 2 {
-				arrVal, verr := evalExpr(x.Args[1], row, ctx)
+				arrVal, verr := evalExprSlot(x.Args[1], slot, ctx)
 				if verr != nil || arrVal.IsNull() {
 					return NullDatum, nil
 				}
@@ -12308,7 +12308,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 
 			var parts []string
 			for _, arg := range x.Args[1:] {
-				v, verr := evalExpr(arg, row, ctx)
+				v, verr := evalExprSlot(arg, slot, ctx)
 				if verr != nil || v.IsNull() {
 					continue
 				}
@@ -12319,8 +12319,8 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "left":
 		// left(text, n) → text
 		if len(x.Args) == 2 {
-			s, e1 := evalExpr(x.Args[0], row, ctx)
-			n, e2 := evalExpr(x.Args[1], row, ctx)
+			s, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			n, e2 := evalExprSlot(x.Args[1], slot, ctx)
 			if e1 != nil || e2 != nil || s.IsNull() || n.IsNull() {
 				return NullDatum, nil
 			}
@@ -12335,8 +12335,8 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 	case "right":
 		if len(x.Args) == 2 {
-			s, e1 := evalExpr(x.Args[0], row, ctx)
-			n, e2 := evalExpr(x.Args[1], row, ctx)
+			s, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			n, e2 := evalExprSlot(x.Args[1], slot, ctx)
 			if e1 != nil || e2 != nil || s.IsNull() || n.IsNull() {
 				return NullDatum, nil
 			}
@@ -12357,7 +12357,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 	case "reverse":
 		if len(x.Args) == 1 {
-			s, err := evalExpr(x.Args[0], row, ctx)
+			s, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
@@ -12379,7 +12379,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 	case "ascii":
 		if len(x.Args) == 1 {
-			s, err := evalExpr(x.Args[0], row, ctx)
+			s, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
@@ -12391,7 +12391,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 	case "chr":
 		if len(x.Args) == 1 {
-			n, err := evalExpr(x.Args[0], row, ctx)
+			n, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || n.IsNull() {
 				return NullDatum, nil
 			}
@@ -12407,7 +12407,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 	case "quote_literal":
 		if len(x.Args) == 1 {
-			s, err := evalExpr(x.Args[0], row, ctx)
+			s, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || s.IsNull() {
 				return NewStringDatum("NULL"), nil
 			}
@@ -12415,7 +12415,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 	case "quote_ident":
 		if len(x.Args) == 1 {
-			s, err := evalExpr(x.Args[0], row, ctx)
+			s, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
@@ -12448,9 +12448,9 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// postgres/src/backend/utils/adt/varlena.c:4457-4618
 		// (replace_text_regexp) for the match-and-replace loop mirrored below.
 		if len(x.Args) >= 3 {
-			s, e1 := evalExpr(x.Args[0], row, ctx)
-			pat, e2 := evalExpr(x.Args[1], row, ctx)
-			repl, e3 := evalExpr(x.Args[2], row, ctx)
+			s, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			pat, e2 := evalExprSlot(x.Args[1], slot, ctx)
+			repl, e3 := evalExprSlot(x.Args[2], slot, ctx)
 			if e1 != nil || e2 != nil || e3 != nil || s.IsNull() || pat.IsNull() {
 				return NullDatum, nil
 			}
@@ -12460,7 +12460,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			haveStartN := false
 			switch len(x.Args) {
 			case 4:
-				v, e4 := evalExpr(x.Args[3], row, ctx)
+				v, e4 := evalExprSlot(x.Args[3], slot, ctx)
 				if e4 != nil {
 					return NullDatum, e4
 				}
@@ -12486,11 +12486,11 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 				}
 			case 5:
 				// oid 6252: (string, pattern, replacement, start, N) — no flags.
-				v4, e4 := evalExpr(x.Args[3], row, ctx)
+				v4, e4 := evalExprSlot(x.Args[3], slot, ctx)
 				if e4 != nil {
 					return NullDatum, e4
 				}
-				v5, e5 := evalExpr(x.Args[4], row, ctx)
+				v5, e5 := evalExprSlot(x.Args[4], slot, ctx)
 				if e5 != nil {
 					return NullDatum, e5
 				}
@@ -12502,15 +12502,15 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 				n = v5.Int
 			case 6:
 				// oid 6251: (string, pattern, replacement, start, N, flags).
-				v4, e4 := evalExpr(x.Args[3], row, ctx)
+				v4, e4 := evalExprSlot(x.Args[3], slot, ctx)
 				if e4 != nil {
 					return NullDatum, e4
 				}
-				v5, e5 := evalExpr(x.Args[4], row, ctx)
+				v5, e5 := evalExprSlot(x.Args[4], slot, ctx)
 				if e5 != nil {
 					return NullDatum, e5
 				}
-				v6, e6 := evalExpr(x.Args[5], row, ctx)
+				v6, e6 := evalExprSlot(x.Args[5], slot, ctx)
 				if e6 != nil {
 					return NullDatum, e6
 				}
@@ -12610,7 +12610,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// %[position][flags][width]type where type = s | I | L | %. M0097-0003 / M0097-0063.
 		// format(fmt, VARIADIC arr) expands the array into individual arguments. M0097-0063.
 		if len(x.Args) >= 1 {
-			f, err := evalExpr(x.Args[0], row, ctx)
+			f, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil {
 				return Datum{}, err
 			}
@@ -12625,7 +12625,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			nonFmtArgs := x.Args[1:]
 			if x.Variadic && len(nonFmtArgs) == 1 {
 				// format(fmt, VARIADIC arr) — single variadic array.
-				v, e := evalExpr(nonFmtArgs[0], row, ctx)
+				v, e := evalExprSlot(nonFmtArgs[0], slot, ctx)
 				if e != nil {
 					return Datum{}, e
 				}
@@ -12644,7 +12644,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 				// If v is NULL, args stays empty → format string must not use any args.
 			} else {
 				for _, a := range nonFmtArgs {
-					v, e := evalExpr(a, row, ctx)
+					v, e := evalExprSlot(a, slot, ctx)
 					if e != nil {
 						return Datum{}, e
 					}
@@ -12669,7 +12669,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// pairs share one implementation (M0134-0037).
 		if len(x.Args) >= 1 {
 			asText := name == "json_extract_path_text" || name == "jsonb_extract_path_text"
-			jv, err := evalExpr(x.Args[0], row, ctx)
+			jv, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil {
 				return Datum{}, err
 			}
@@ -12689,7 +12689,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			var path []string
 			pathArgs := x.Args[1:]
 			if x.Variadic && len(pathArgs) == 1 {
-				v, e := evalExpr(pathArgs[0], row, ctx)
+				v, e := evalExprSlot(pathArgs[0], slot, ctx)
 				if e != nil {
 					return Datum{}, e
 				}
@@ -12704,7 +12704,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 				path = parseTextArray(sv)
 			} else {
 				for _, a := range pathArgs {
-					v, e := evalExpr(a, row, ctx)
+					v, e := evalExprSlot(a, slot, ctx)
 					if e != nil {
 						return Datum{}, e
 					}
@@ -12739,7 +12739,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	// ── Mathematical functions (M0097-0005) ───────────────────────────────
 	case "abs":
 		if len(x.Args) == 1 {
-			v, err := evalExpr(x.Args[0], row, ctx)
+			v, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || v.IsNull() {
 				return NullDatum, nil
 			}
@@ -12769,7 +12769,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 	case "ceil", "ceiling":
 		if len(x.Args) == 1 {
-			v, err := evalExpr(x.Args[0], row, ctx)
+			v, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || v.IsNull() {
 				return NullDatum, nil
 			}
@@ -12784,7 +12784,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 	case "floor":
 		if len(x.Args) == 1 {
-			v, err := evalExpr(x.Args[0], row, ctx)
+			v, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || v.IsNull() {
 				return NullDatum, nil
 			}
@@ -12799,13 +12799,13 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 	case "round":
 		if len(x.Args) >= 1 {
-			v, err := evalExpr(x.Args[0], row, ctx)
+			v, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || v.IsNull() {
 				return NullDatum, nil
 			}
 			scale := int64(0)
 			if len(x.Args) >= 2 {
-				sc, serr := evalExpr(x.Args[1], row, ctx)
+				sc, serr := evalExprSlot(x.Args[1], slot, ctx)
 				if serr == nil && !sc.IsNull() {
 					scale = sc.Int
 				}
@@ -12828,7 +12828,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 	case "trunc":
 		if len(x.Args) >= 1 {
-			v, err := evalExpr(x.Args[0], row, ctx)
+			v, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || v.IsNull() {
 				return NullDatum, nil
 			}
@@ -12841,7 +12841,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			scale := int64(0)
 			if len(x.Args) >= 2 {
-				sc, serr := evalExpr(x.Args[1], row, ctx)
+				sc, serr := evalExprSlot(x.Args[1], slot, ctx)
 				if serr == nil && !sc.IsNull() {
 					scale = sc.Int
 				}
@@ -12852,7 +12852,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 	case "sign":
 		if len(x.Args) == 1 {
-			v, err := evalExpr(x.Args[0], row, ctx)
+			v, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || v.IsNull() {
 				return NullDatum, nil
 			}
@@ -12885,7 +12885,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// :4253): peel trailing zero digits off the mantissa one decimal
 		// place at a time while scale > 0.
 		if len(x.Args) == 1 {
-			v, err := evalExpr(x.Args[0], row, ctx)
+			v, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || v.IsNull() {
 				return NullDatum, nil
 			}
@@ -12907,7 +12907,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 	case "sqrt":
 		if len(x.Args) == 1 {
-			v, err := evalExpr(x.Args[0], row, ctx)
+			v, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || v.IsNull() {
 				return NullDatum, nil
 			}
@@ -12925,8 +12925,8 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 	case "power", "pow":
 		if len(x.Args) == 2 {
-			base, e1 := evalExpr(x.Args[0], row, ctx)
-			exp, e2 := evalExpr(x.Args[1], row, ctx)
+			base, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			exp, e2 := evalExprSlot(x.Args[1], slot, ctx)
 			if e1 != nil || e2 != nil || base.IsNull() || exp.IsNull() {
 				return NullDatum, nil
 			}
@@ -12945,7 +12945,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 	case "exp":
 		if len(x.Args) == 1 {
-			v, err := evalExpr(x.Args[0], row, ctx)
+			v, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || v.IsNull() {
 				return NullDatum, nil
 			}
@@ -12960,7 +12960,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 	case "ln", "log":
 		if len(x.Args) >= 1 {
-			v, err := evalExpr(x.Args[0], row, ctx)
+			v, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || v.IsNull() {
 				return NullDatum, nil
 			}
@@ -12969,7 +12969,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if name == "ln" || len(x.Args) == 1 {
 				result = math.Log(f)
 			} else {
-				base, _ := evalExpr(x.Args[1], row, ctx)
+				base, _ := evalExprSlot(x.Args[1], slot, ctx)
 				b, _ := strconv.ParseFloat(base.Format(), 64)
 				result = math.Log(f) / math.Log(b)
 			}
@@ -12984,8 +12984,8 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// gcd(a, b) — greatest common divisor, non-negative. M0097-0003.
 		// Uses uint64 absolute values so MinInt64 doesn't overflow on negation.
 		if len(x.Args) == 2 {
-			av, e1 := evalExpr(x.Args[0], row, ctx)
-			bv, e2 := evalExpr(x.Args[1], row, ctx)
+			av, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			bv, e2 := evalExprSlot(x.Args[1], slot, ctx)
 			if e1 != nil || e2 != nil || av.IsNull() || bv.IsNull() {
 				return NullDatum, nil
 			}
@@ -13011,8 +13011,8 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// lcm(a, b) — least common multiple, non-negative. M0097-0003.
 		// Uses uint64 to handle MinInt64 without overflow.
 		if len(x.Args) == 2 {
-			av, e1 := evalExpr(x.Args[0], row, ctx)
-			bv, e2 := evalExpr(x.Args[1], row, ctx)
+			av, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			bv, e2 := evalExprSlot(x.Args[1], slot, ctx)
 			if e1 != nil || e2 != nil || av.IsNull() || bv.IsNull() {
 				return NullDatum, nil
 			}
@@ -13042,8 +13042,8 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "mod":
 		// mod(a, b) → a % b
 		if len(x.Args) == 2 {
-			a, e1 := evalExpr(x.Args[0], row, ctx)
-			b, e2 := evalExpr(x.Args[1], row, ctx)
+			a, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			b, e2 := evalExprSlot(x.Args[1], slot, ctx)
 			if e1 != nil || e2 != nil || a.IsNull() || b.IsNull() {
 				return NullDatum, nil
 			}
@@ -13058,8 +13058,8 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// random() → float8 in [0, 1).
 		// random(min, max) → uniform integer/numeric in [min, max]. M0097-0071.
 		if len(x.Args) >= 2 {
-			loD, loErr := evalExpr(x.Args[0], row, ctx)
-			hiD, hiErr := evalExpr(x.Args[1], row, ctx)
+			loD, loErr := evalExprSlot(x.Args[0], slot, ctx)
+			hiD, hiErr := evalExprSlot(x.Args[1], slot, ctx)
 			if loErr != nil || hiErr != nil || loD.IsNull() || hiD.IsNull() {
 				return NullDatum, nil
 			}
@@ -13161,7 +13161,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		if len(x.Args) < 1 {
 			return NullDatum, nil
 		}
-		seedD, err := evalExpr(x.Args[0], row, ctx)
+		seedD, err := evalExprSlot(x.Args[0], slot, ctx)
 		if err != nil || seedD.IsNull() {
 			return NullDatum, nil
 		}
@@ -13181,8 +13181,8 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// random_normal(mean, stddev) → N(mean, stddev). M0097-0071.
 		mean, stddev := 0.0, 1.0
 		if len(x.Args) >= 2 {
-			mD, mErr := evalExpr(x.Args[0], row, ctx)
-			sD, sErr := evalExpr(x.Args[1], row, ctx)
+			mD, mErr := evalExprSlot(x.Args[0], slot, ctx)
+			sD, sErr := evalExprSlot(x.Args[1], slot, ctx)
 			if mErr != nil || sErr != nil || mD.IsNull() || sD.IsNull() {
 				return NullDatum, nil
 			}
@@ -13213,8 +13213,8 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// float8_accum(float8[], float8) -> float8[]
 		// Accumulates one value into a 3-element Youngs-Cramer state {N, Sx, Sxx}.
 		if len(x.Args) == 2 {
-			stateD, e1 := evalExpr(x.Args[0], row, ctx)
-			valD, e2 := evalExpr(x.Args[1], row, ctx)
+			stateD, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			valD, e2 := evalExprSlot(x.Args[1], slot, ctx)
 			if e1 != nil || e2 != nil || valD.IsNull() {
 				return NullDatum, nil
 			}
@@ -13257,9 +13257,9 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// Accumulates one (Y, X) pair into a 6-element regression state
 		// {N, Sx, Sxx, Sy, Syy, Sxy}.
 		if len(x.Args) == 3 {
-			stateD, e1 := evalExpr(x.Args[0], row, ctx)
-			yD, e2 := evalExpr(x.Args[1], row, ctx)
-			xD, e3 := evalExpr(x.Args[2], row, ctx)
+			stateD, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			yD, e2 := evalExprSlot(x.Args[1], slot, ctx)
+			xD, e3 := evalExprSlot(x.Args[2], slot, ctx)
 			if e1 != nil || e2 != nil || e3 != nil || yD.IsNull() || xD.IsNull() {
 				return NullDatum, nil
 			}
@@ -13304,8 +13304,8 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// float8_combine(float8[], float8[]) -> float8[]
 		// Merges two 3-element Youngs-Cramer states {N, Sx, Sxx}.
 		if len(x.Args) == 2 {
-			s1D, e1 := evalExpr(x.Args[0], row, ctx)
-			s2D, e2 := evalExpr(x.Args[1], row, ctx)
+			s1D, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			s2D, e2 := evalExprSlot(x.Args[1], slot, ctx)
 			if e1 != nil || e2 != nil {
 				return NullDatum, nil
 			}
@@ -13352,8 +13352,8 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// float8_regr_combine(float8[], float8[]) -> float8[]
 		// Merges two 6-element regression states {N, Sx, Sxx, Sy, Syy, Sxy}.
 		if len(x.Args) == 2 {
-			s1D, e1 := evalExpr(x.Args[0], row, ctx)
-			s2D, e2 := evalExpr(x.Args[1], row, ctx)
+			s1D, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			s2D, e2 := evalExprSlot(x.Args[1], slot, ctx)
 			if e1 != nil || e2 != nil {
 				return NullDatum, nil
 			}
@@ -13411,8 +13411,8 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// array_append(anyarray, anyelement) → anyarray
 		// Appends element to the end of an array. M0097-0035.
 		if len(x.Args) == 2 {
-			arrD, e1 := evalExpr(x.Args[0], row, ctx)
-			elemD, e2 := evalExpr(x.Args[1], row, ctx)
+			arrD, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			elemD, e2 := evalExprSlot(x.Args[1], slot, ctx)
 			if e1 != nil || e2 != nil {
 				return NullDatum, nil
 			}
@@ -13433,8 +13433,8 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "array_prepend":
 		// array_prepend(anyelement, anyarray) → anyarray
 		if len(x.Args) == 2 {
-			elemD, e1 := evalExpr(x.Args[0], row, ctx)
-			arrD, e2 := evalExpr(x.Args[1], row, ctx)
+			elemD, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			arrD, e2 := evalExprSlot(x.Args[1], slot, ctx)
 			if e1 != nil || e2 != nil {
 				return NullDatum, nil
 			}
@@ -13455,8 +13455,8 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "array_cat":
 		// array_cat(anyarray, anyarray) → anyarray
 		if len(x.Args) == 2 {
-			a1, e1 := evalExpr(x.Args[0], row, ctx)
-			a2, e2 := evalExpr(x.Args[1], row, ctx)
+			a1, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			a2, e2 := evalExprSlot(x.Args[1], slot, ctx)
 			if e1 != nil || e2 != nil {
 				return NullDatum, nil
 			}
@@ -13483,8 +13483,8 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// compares the formatted element text, with a NULL element matching the
 		// "NULL" placeholder produced by the array_append/_cat siblings.
 		if len(x.Args) == 2 {
-			arrD, e1 := evalExpr(x.Args[0], row, ctx)
-			elemD, e2 := evalExpr(x.Args[1], row, ctx)
+			arrD, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			elemD, e2 := evalExprSlot(x.Args[1], slot, ctx)
 			if e1 != nil || e2 != nil {
 				return NullDatum, nil
 			}
@@ -13509,7 +13509,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "array_dims":
 		// array_dims(anyarray) → text — returns '[1:N]' for a 1-D array of N elements.
 		if len(x.Args) == 1 {
-			arrD, err := evalExpr(x.Args[0], row, ctx)
+			arrD, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || arrD.IsNull() {
 				return NullDatum, nil
 			}
@@ -13520,7 +13520,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "array_ndims":
 		// array_ndims(anyarray) → int — returns 1 for a 1-D array.
 		if len(x.Args) == 1 {
-			arrD, err := evalExpr(x.Args[0], row, ctx)
+			arrD, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || arrD.IsNull() {
 				return NullDatum, nil
 			}
@@ -13532,14 +13532,14 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// regexp_split_to_array(string, pattern [, flags]) → text[]
 		// Splits string by regexp and returns the parts as an array. M0097-0035.
 		if len(x.Args) >= 2 {
-			strD, e1 := evalExpr(x.Args[0], row, ctx)
-			patD, e2 := evalExpr(x.Args[1], row, ctx)
+			strD, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			patD, e2 := evalExprSlot(x.Args[1], slot, ctx)
 			if e1 != nil || e2 != nil || strD.IsNull() || patD.IsNull() {
 				return NullDatum, nil
 			}
 			flags := ""
 			if len(x.Args) >= 3 {
-				flagD, fe := evalExpr(x.Args[2], row, ctx)
+				flagD, fe := evalExprSlot(x.Args[2], slot, ctx)
 				if fe == nil && !flagD.IsNull() {
 					flags = flagD.StringValue()
 				}
@@ -13572,8 +13572,8 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// regexp_count(string, pattern [, start [, flags]]) → int4
 		// postgres/src/backend/utils/adt/regexp.c:1138 regexp_count.
 		if len(x.Args) >= 2 && len(x.Args) <= 4 {
-			strD, e1 := evalExpr(x.Args[0], row, ctx)
-			patD, e2 := evalExpr(x.Args[1], row, ctx)
+			strD, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			patD, e2 := evalExprSlot(x.Args[1], slot, ctx)
 			if e1 != nil {
 				return Datum{}, e1
 			}
@@ -13585,7 +13585,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			start := int64(1)
 			if len(x.Args) >= 3 {
-				d, e := evalExpr(x.Args[2], row, ctx)
+				d, e := evalExprSlot(x.Args[2], slot, ctx)
 				if e != nil {
 					return Datum{}, e
 				}
@@ -13600,7 +13600,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			flags := ""
 			if len(x.Args) >= 4 {
-				d, e := evalExpr(x.Args[3], row, ctx)
+				d, e := evalExprSlot(x.Args[3], slot, ctx)
 				if e != nil {
 					return Datum{}, e
 				}
@@ -13637,8 +13637,8 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// postgres/src/backend/utils/adt/regexp.c:1329 regexp_like — direct
 		// compile+execute, no start/N, always searches from position 0.
 		if len(x.Args) >= 2 && len(x.Args) <= 3 {
-			strD, e1 := evalExpr(x.Args[0], row, ctx)
-			patD, e2 := evalExpr(x.Args[1], row, ctx)
+			strD, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			patD, e2 := evalExprSlot(x.Args[1], slot, ctx)
 			if e1 != nil {
 				return Datum{}, e1
 			}
@@ -13650,7 +13650,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			flags := ""
 			if len(x.Args) >= 3 {
-				d, e := evalExpr(x.Args[2], row, ctx)
+				d, e := evalExprSlot(x.Args[2], slot, ctx)
 				if e != nil {
 					return Datum{}, e
 				}
@@ -13678,8 +13678,8 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// regexp_instr(string, pattern [, start [, N [, endoption [, flags [, subexpr]]]]]) → int4
 		// postgres/src/backend/utils/adt/regexp.c:1198 regexp_instr.
 		if len(x.Args) >= 2 && len(x.Args) <= 7 {
-			strD, e1 := evalExpr(x.Args[0], row, ctx)
-			patD, e2 := evalExpr(x.Args[1], row, ctx)
+			strD, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			patD, e2 := evalExprSlot(x.Args[1], slot, ctx)
 			if e1 != nil {
 				return Datum{}, e1
 			}
@@ -13691,7 +13691,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			start := int64(1)
 			if len(x.Args) >= 3 {
-				d, e := evalExpr(x.Args[2], row, ctx)
+				d, e := evalExprSlot(x.Args[2], slot, ctx)
 				if e != nil {
 					return Datum{}, e
 				}
@@ -13706,7 +13706,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			n := int64(1)
 			if len(x.Args) >= 4 {
-				d, e := evalExpr(x.Args[3], row, ctx)
+				d, e := evalExprSlot(x.Args[3], slot, ctx)
 				if e != nil {
 					return Datum{}, e
 				}
@@ -13721,7 +13721,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			endoption := int64(0)
 			if len(x.Args) >= 5 {
-				d, e := evalExpr(x.Args[4], row, ctx)
+				d, e := evalExprSlot(x.Args[4], slot, ctx)
 				if e != nil {
 					return Datum{}, e
 				}
@@ -13736,7 +13736,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			flags := ""
 			if len(x.Args) >= 6 {
-				d, e := evalExpr(x.Args[5], row, ctx)
+				d, e := evalExprSlot(x.Args[5], slot, ctx)
 				if e != nil {
 					return Datum{}, e
 				}
@@ -13747,7 +13747,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			subexpr := int64(0)
 			if len(x.Args) >= 7 {
-				d, e := evalExpr(x.Args[6], row, ctx)
+				d, e := evalExprSlot(x.Args[6], slot, ctx)
 				if e != nil {
 					return Datum{}, e
 				}
@@ -13789,8 +13789,8 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// are ONE SLOT EARLIER (no endoption arg) — shares
 		// regexpInstrSubstrLocate so the two "pos" computations can't drift.
 		if len(x.Args) >= 2 && len(x.Args) <= 6 {
-			strD, e1 := evalExpr(x.Args[0], row, ctx)
-			patD, e2 := evalExpr(x.Args[1], row, ctx)
+			strD, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			patD, e2 := evalExprSlot(x.Args[1], slot, ctx)
 			if e1 != nil {
 				return Datum{}, e1
 			}
@@ -13802,7 +13802,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			start := int64(1)
 			if len(x.Args) >= 3 {
-				d, e := evalExpr(x.Args[2], row, ctx)
+				d, e := evalExprSlot(x.Args[2], slot, ctx)
 				if e != nil {
 					return Datum{}, e
 				}
@@ -13817,7 +13817,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			n := int64(1)
 			if len(x.Args) >= 4 {
-				d, e := evalExpr(x.Args[3], row, ctx)
+				d, e := evalExprSlot(x.Args[3], slot, ctx)
 				if e != nil {
 					return Datum{}, e
 				}
@@ -13832,7 +13832,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			flags := ""
 			if len(x.Args) >= 5 {
-				d, e := evalExpr(x.Args[4], row, ctx)
+				d, e := evalExprSlot(x.Args[4], slot, ctx)
 				if e != nil {
 					return Datum{}, e
 				}
@@ -13843,7 +13843,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			subexpr := int64(0)
 			if len(x.Args) >= 6 {
-				d, e := evalExpr(x.Args[5], row, ctx)
+				d, e := evalExprSlot(x.Args[5], slot, ctx)
 				if e != nil {
 					return Datum{}, e
 				}
@@ -13878,7 +13878,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "to_number":
 		// to_number(text, fmt) → numeric — simplified: parse as numeric
 		if len(x.Args) >= 1 {
-			s, err := evalExpr(x.Args[0], row, ctx)
+			s, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
@@ -13898,7 +13898,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// uint32 (int4 overload) path, which is also correct for all
 		// positive-value cases since %x does not zero-pad.
 		if len(x.Args) == 1 {
-			v, err := evalExpr(x.Args[0], row, ctx)
+			v, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || v.IsNull() {
 				return NullDatum, nil
 			}
@@ -13917,7 +13917,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// correct for all positive-value cases since strconv.FormatUint does
 		// not zero-pad.
 		if len(x.Args) == 1 {
-			v, err := evalExpr(x.Args[0], row, ctx)
+			v, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || v.IsNull() {
 				return NullDatum, nil
 			}
@@ -13936,7 +13936,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// correct for all positive-value cases since strconv.FormatUint does
 		// not zero-pad.
 		if len(x.Args) == 1 {
-			v, err := evalExpr(x.Args[0], row, ctx)
+			v, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || v.IsNull() {
 				return NullDatum, nil
 			}
@@ -13949,14 +13949,14 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// get_byte(bytea, int4) -> int4 (postgres/src/backend/utils/adt/
 		// varlena.c:3310-3329 byteaGetByte). M0134-0070.
 		if len(x.Args) == 2 {
-			bv, berr := evalExpr(x.Args[0], row, ctx)
+			bv, berr := evalExprSlot(x.Args[0], slot, ctx)
 			if berr != nil {
 				return NullDatum, berr
 			}
 			if bv.IsNull() {
 				return NullDatum, nil
 			}
-			nv, nerr := evalExpr(x.Args[1], row, ctx)
+			nv, nerr := evalExprSlot(x.Args[1], slot, ctx)
 			if nerr != nil {
 				return NullDatum, nerr
 			}
@@ -13977,21 +13977,21 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// set_byte(bytea, int4, int4) -> bytea (postgres/src/backend/utils/
 		// adt/varlena.c:3369-3399 byteaSetByte). M0134-0070.
 		if len(x.Args) == 3 {
-			bv, berr := evalExpr(x.Args[0], row, ctx)
+			bv, berr := evalExprSlot(x.Args[0], slot, ctx)
 			if berr != nil {
 				return NullDatum, berr
 			}
 			if bv.IsNull() {
 				return NullDatum, nil
 			}
-			nv, nerr := evalExpr(x.Args[1], row, ctx)
+			nv, nerr := evalExprSlot(x.Args[1], slot, ctx)
 			if nerr != nil {
 				return NullDatum, nerr
 			}
 			if nv.IsNull() {
 				return NullDatum, nil
 			}
-			newv, verr := evalExpr(x.Args[2], row, ctx)
+			newv, verr := evalExprSlot(x.Args[2], slot, ctx)
 			if verr != nil {
 				return NullDatum, verr
 			}
@@ -14018,14 +14018,14 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// (varlena.c:3361), so bitNo 0 is the byte's least-significant bit.
 		// M0134-0070.
 		if len(x.Args) == 2 {
-			bv, berr := evalExpr(x.Args[0], row, ctx)
+			bv, berr := evalExprSlot(x.Args[0], slot, ctx)
 			if berr != nil {
 				return NullDatum, berr
 			}
 			if bv.IsNull() {
 				return NullDatum, nil
 			}
-			nv, nerr := evalExpr(x.Args[1], row, ctx)
+			nv, nerr := evalExprSlot(x.Args[1], slot, ctx)
 			if nerr != nil {
 				return NullDatum, nerr
 			}
@@ -14055,21 +14055,21 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// (varlena.c:3437-3439, ERRCODE_INVALID_PARAMETER_VALUE=22023).
 		// M0134-0070.
 		if len(x.Args) == 3 {
-			bv, berr := evalExpr(x.Args[0], row, ctx)
+			bv, berr := evalExprSlot(x.Args[0], slot, ctx)
 			if berr != nil {
 				return NullDatum, berr
 			}
 			if bv.IsNull() {
 				return NullDatum, nil
 			}
-			nv, nerr := evalExpr(x.Args[1], row, ctx)
+			nv, nerr := evalExprSlot(x.Args[1], slot, ctx)
 			if nerr != nil {
 				return NullDatum, nerr
 			}
 			if nv.IsNull() {
 				return NullDatum, nil
 			}
-			newv, verr := evalExpr(x.Args[2], row, ctx)
+			newv, verr := evalExprSlot(x.Args[2], slot, ctx)
 			if verr != nil {
 				return NullDatum, verr
 			}
@@ -14109,14 +14109,14 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		if len(x.Args) != 2 {
 			return NullDatum, nil
 		}
-		src, serr := evalExpr(x.Args[0], row, ctx)
+		src, serr := evalExprSlot(x.Args[0], slot, ctx)
 		if serr != nil {
 			return NullDatum, serr
 		}
 		if src.IsNull() {
 			return NullDatum, nil
 		}
-		encFmt, ferr := evalExpr(x.Args[1], row, ctx)
+		encFmt, ferr := evalExprSlot(x.Args[1], slot, ctx)
 		if ferr != nil {
 			return NullDatum, ferr
 		}
@@ -14149,11 +14149,11 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		if len(x.Args) != 2 {
 			return NullDatum, nil
 		}
-		src, serr := evalExpr(x.Args[0], row, ctx)
+		src, serr := evalExprSlot(x.Args[0], slot, ctx)
 		if serr != nil || src.IsNull() {
 			return NullDatum, nil
 		}
-		fmtArg, ferr := evalExpr(x.Args[1], row, ctx)
+		fmtArg, ferr := evalExprSlot(x.Args[1], slot, ctx)
 		if ferr != nil || fmtArg.IsNull() {
 			return NullDatum, nil
 		}
@@ -14195,7 +14195,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// which is exactly the zlib CRC-32 that crc32.ChecksumIEEE computes.
 		// M0134-0070.
 		if len(x.Args) == 1 {
-			src, serr := evalExpr(x.Args[0], row, ctx)
+			src, serr := evalExprSlot(x.Args[0], slot, ctx)
 			if serr != nil {
 				return NullDatum, serr
 			}
@@ -14216,7 +14216,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// crc32c(bytea) -> int8. CRC-32C (Castagnoli polynomial).
 		// PG oracle: pg_crc.c:119-128 (crc32c_bytea). M0134-0070.
 		if len(x.Args) == 1 {
-			src, serr := evalExpr(x.Args[0], row, ctx)
+			src, serr := evalExprSlot(x.Args[0], slot, ctx)
 			if serr != nil {
 				return NullDatum, serr
 			}
@@ -14244,7 +14244,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// implemented; the bit(n) overload (OID 6163) is out of scope.
 		// M0134-0070.
 		if len(x.Args) == 1 {
-			src, serr := evalExpr(x.Args[0], row, ctx)
+			src, serr := evalExprSlot(x.Args[0], slot, ctx)
 			if serr != nil {
 				return NullDatum, serr
 			}
@@ -14275,7 +14275,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// unistr(text) -> text. PG oracle: varlena.c:6762-6925 (unistr).
 		// M0134-0070; see internal/executor/unistr.go for the escape scanner.
 		if len(x.Args) == 1 {
-			s, serr := evalExpr(x.Args[0], row, ctx)
+			s, serr := evalExprSlot(x.Args[0], slot, ctx)
 			if serr != nil {
 				return NullDatum, serr
 			}
@@ -14292,7 +14292,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	// ── Misc functions (M0097-0005) ────────────────────────────────────────
 	case "coalesce":
 		for _, arg := range x.Args {
-			v, err := evalExpr(arg, row, ctx)
+			v, err := evalExprSlot(arg, slot, ctx)
 			if err == nil && !v.IsNull() {
 				return v, nil
 			}
@@ -14300,8 +14300,8 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return NullDatum, nil
 	case "nullif":
 		if len(x.Args) == 2 {
-			a, e1 := evalExpr(x.Args[0], row, ctx)
-			b, e2 := evalExpr(x.Args[1], row, ctx)
+			a, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			b, e2 := evalExprSlot(x.Args[1], slot, ctx)
 			if e1 != nil || e2 != nil {
 				return NullDatum, nil
 			}
@@ -14313,7 +14313,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "greatest":
 		best := NullDatum
 		for _, arg := range x.Args {
-			v, err := evalExpr(arg, row, ctx)
+			v, err := evalExprSlot(arg, slot, ctx)
 			if err != nil || v.IsNull() {
 				continue
 			}
@@ -14330,7 +14330,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "least":
 		best := NullDatum
 		for _, arg := range x.Args {
-			v, err := evalExpr(arg, row, ctx)
+			v, err := evalExprSlot(arg, slot, ctx)
 			if err != nil || v.IsNull() {
 				continue
 			}
@@ -14347,7 +14347,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "num_nonnulls":
 		cnt := 0
 		for _, arg := range x.Args {
-			v, err := evalExpr(arg, row, ctx)
+			v, err := evalExprSlot(arg, slot, ctx)
 			if err == nil && !v.IsNull() {
 				cnt++
 			}
@@ -14356,7 +14356,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "num_nulls":
 		cnt := 0
 		for _, arg := range x.Args {
-			v, err := evalExpr(arg, row, ctx)
+			v, err := evalExprSlot(arg, slot, ctx)
 			if err != nil || v.IsNull() {
 				cnt++
 			}
@@ -14386,7 +14386,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			// Runtime path: evaluate arg and map Datum kind to PG type name.
 			// KindString must map to "text" here (NOT the string value).
-			v, err := evalExpr(x.Args[0], row, ctx)
+			v, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || v.IsNull() {
 				return NewIntDatum(int64(pgTypeofOIDForName(cat, "unknown"))), nil
 			}
@@ -14413,14 +14413,14 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// NULL OID → NULL result. typemod=-1 or NULL means no modifier.
 		// M0097-0023.
 		if len(x.Args) >= 1 {
-			oidArg, err := evalExpr(x.Args[0], row, ctx)
+			oidArg, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || oidArg.IsNull() {
 				return NullDatum, nil
 			}
 			typeOID := oidArg.Int
 			typmod := int64(-1)
 			if len(x.Args) >= 2 {
-				modArg, merr := evalExpr(x.Args[1], row, ctx)
+				modArg, merr := evalExprSlot(x.Args[1], slot, ctx)
 				if merr == nil && !modArg.IsNull() {
 					typmod = modArg.Int
 				}
@@ -14452,7 +14452,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// pg_conversion.conforencoding / contoencoding to render the FOR/TO
 		// encoding-name literals. NULL input → NULL. DU-002 slice 399.
 		if len(x.Args) >= 1 {
-			encArg, err := evalExpr(x.Args[0], row, ctx)
+			encArg, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || encArg.IsNull() {
 				return NullDatum, nil
 			}
@@ -14464,7 +14464,7 @@ case "pg_char_to_encoding":
 	// strips) to its pg_enc integer ID, or -1 if unknown. Mirrors
 	// pg_char_to_encoding in encnames.c. NULL input → NULL. M0122-0008.
 	if len(x.Args) >= 1 {
-		encArg, err := evalExpr(x.Args[0], row, ctx)
+		encArg, err := evalExprSlot(x.Args[0], slot, ctx)
 		if err != nil || encArg.IsNull() {
 			return NullDatum, nil
 		}
@@ -14472,7 +14472,7 @@ case "pg_char_to_encoding":
 	}
 	case "pg_column_size":
 		if len(x.Args) == 1 {
-			v, err := evalExpr(x.Args[0], row, ctx)
+			v, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil || v.IsNull() {
 				return NullDatum, nil
 			}
@@ -14506,7 +14506,7 @@ case "pg_char_to_encoding":
 		t := ctx.Now.UTC()
 		ns := t.Nanosecond()
 		if len(x.Args) > 0 {
-			prec, err := evalExpr(x.Args[0], row, ctx)
+			prec, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err == nil && prec.Kind == KindInt && prec.Int < 6 {
 				factor := int64(1)
 				for i := int64(0); i < 6-prec.Int; i++ {
@@ -14541,19 +14541,19 @@ case "pg_char_to_encoding":
 	// on a goopg primary. See expr_replslot.go.
 	// M-NIGHTLY AI-20260810-011258-003.
 	case "pg_create_physical_replication_slot":
-		return evalPgCreatePhysicalReplicationSlot(x, row, ctx)
+		return evalPgCreatePhysicalReplicationSlot(x, slot, ctx)
 	case "pg_drop_replication_slot":
-		return evalPgDropReplicationSlot(x, row, ctx)
+		return evalPgDropReplicationSlot(x, slot, ctx)
 	// currtid2(relname text, tid tid) → tid: returns the latest visible TID
 	// for a row in the named relation. M0097-0038.
 	case "currtid2":
-		return evalCurrtid2(x, row, ctx)
+		return evalCurrtid2(x, slot, ctx)
 	// acldefault("char", oid) → aclitem[]: the hard-wired default access
 	// privileges for a newly-created object of the given type. pg_dump's
 	// getNamespaces/getTypes/getTables/... call it as the baseline to diff
 	// against the stored *acl column. M0110-0001 / DU-002 slice 2.
 	case "acldefault":
-		return evalAclDefault(x, row, ctx)
+		return evalAclDefault(x, slot, ctx)
 	// pg_get_userbyid(oid) → name: resolves a role OID to its name, or PG's
 	// literal fallback "unknown (OID=n)" when no such role exists
 	// (pg_get_userbyid, ruleutils.c). pg_dumpall's dumpRoleGUCPrivs calls it
@@ -14565,7 +14565,7 @@ case "pg_char_to_encoding":
 			return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(),
 				Message: "pg_get_userbyid(oid) requires exactly 1 argument"}
 		}
-		oidArg, err := evalExpr(x.Args[0], row, ctx)
+		oidArg, err := evalExprSlot(x.Args[0], slot, ctx)
 		if err != nil {
 			return NullDatum, err
 		}
@@ -14594,7 +14594,7 @@ case "pg_char_to_encoding":
 	// pg_stat_get_function_calls(oid) → bigint: number of times the function has
 	// been called (flushed), or NULL when no stats exist for it. Design 0118-0124.
 	case "pg_stat_get_function_calls":
-		oid, ok, err := statFuncOIDArg(x, row, ctx)
+		oid, ok, err := statFuncOIDArg(x, slot, ctx)
 		if err != nil {
 			return Datum{}, err
 		}
@@ -14614,7 +14614,7 @@ case "pg_char_to_encoding":
 	// reads the backend's own live pending state, which has no cross-session
 	// consistency concern. PG: pgstatfuncs.c:1804. M0134-0020.
 	case "pg_stat_get_xact_function_calls":
-		oid, ok, err := statFuncOIDArg(x, row, ctx)
+		oid, ok, err := statFuncOIDArg(x, slot, ctx)
 		if err != nil {
 			return Datum{}, err
 		}
@@ -14629,7 +14629,7 @@ case "pg_char_to_encoding":
 	// spent in the function (and the functions it called), in milliseconds, or
 	// NULL when no stats exist. Design 0118-0124.
 	case "pg_stat_get_function_total_time":
-		oid, ok, err := statFuncOIDArg(x, row, ctx)
+		oid, ok, err := statFuncOIDArg(x, slot, ctx)
 		if err != nil {
 			return Datum{}, err
 		}
@@ -14645,7 +14645,7 @@ case "pg_char_to_encoding":
 	// no stats exist. goopg does not separate nested time, so self == total
 	// (the spec only checks > 0). Design 0118-0124.
 	case "pg_stat_get_function_self_time":
-		oid, ok, err := statFuncOIDArg(x, row, ctx)
+		oid, ok, err := statFuncOIDArg(x, slot, ctx)
 		if err != nil {
 			return Datum{}, err
 		}
@@ -14660,7 +14660,7 @@ case "pg_char_to_encoding":
 	// counters for one function. A non-existent OID is a silent no-op (matching
 	// PG, which only resets a present shared entry). Design 0118-0124.
 	case "pg_stat_reset_single_function_counters":
-		oid, ok, err := statFuncOIDArg(x, row, ctx)
+		oid, ok, err := statFuncOIDArg(x, slot, ctx)
 		if err != nil {
 			return Datum{}, err
 		}
@@ -14696,7 +14696,7 @@ case "pg_char_to_encoding":
 		"pg_stat_get_live_tuples",
 		"pg_stat_get_dead_tuples",
 		"pg_stat_get_vacuum_count":
-		oid, ok, err := statFuncOIDArg(x, row, ctx)
+		oid, ok, err := statFuncOIDArg(x, slot, ctx)
 		if err != nil {
 			return Datum{}, err
 		}
@@ -14744,7 +14744,7 @@ case "pg_char_to_encoding":
 	// macro (find_tabstat_entry == NULL → result = 0). PG: pgstatfuncs.c:1758,
 	// instantiated :1796. M0134-0020.
 	case "pg_stat_get_xact_tuples_inserted":
-		oid, ok, err := statFuncOIDArg(x, row, ctx)
+		oid, ok, err := statFuncOIDArg(x, slot, ctx)
 		if err != nil {
 			return Datum{}, err
 		}
@@ -14770,7 +14770,7 @@ case "pg_char_to_encoding":
 			"bool", "boolean",
 			"oid", "date", "timestamp", "timestamptz",
 			"time", "timetz", "interval":
-			v, err := evalExpr(x.Args[0], row, ctx)
+			v, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err != nil {
 				return Datum{}, err
 			}
@@ -14781,7 +14781,7 @@ case "pg_char_to_encoding":
 		}
 	}
 
-	return evalStoredRoutineFuncCall(x, row, ctx)
+	return evalStoredRoutineFuncCall(x, slot, ctx)
 }
 
 // ACL privilege bits, mirroring src/include/nodes/parsenodes.h. Used by
@@ -14841,16 +14841,16 @@ func aclRoleNameForOID(oid int64) string {
 // e.g. acldefault('n', 10) → "{postgres=UC/postgres}". The world (PUBLIC) entry
 // is emitted first, then the owner entry, each only when non-empty. NULL input
 // yields NULL. M0110-0001 / DU-002 slice 2.
-func evalAclDefault(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalAclDefault(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
 	if len(x.Args) != 2 {
 		return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(),
 			Message: "acldefault(\"char\", oid) requires exactly 2 arguments"}
 	}
-	typeArg, err := evalExpr(x.Args[0], row, ctx)
+	typeArg, err := evalExprSlot(x.Args[0], slot, ctx)
 	if err != nil {
 		return NullDatum, err
 	}
-	ownerArg, err := evalExpr(x.Args[1], row, ctx)
+	ownerArg, err := evalExprSlot(x.Args[1], slot, ctx)
 	if err != nil {
 		return NullDatum, err
 	}
@@ -14915,12 +14915,12 @@ func evalAclDefault(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error)
 // Returns the latest visible TID for the named relation, or an error for
 // unsupported relation kinds (indexes, partitioned tables, views without ctid).
 // M0097-0038.
-func evalCurrtid2(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalCurrtid2(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
 	if len(x.Args) != 2 {
 		return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(),
 			Message: fmt.Sprintf("function currtid2(unknown, unknown) does not exist")}
 	}
-	nameD, err := evalExpr(x.Args[0], row, ctx)
+	nameD, err := evalExprSlot(x.Args[0], slot, ctx)
 	if err != nil {
 		return NullDatum, err
 	}
@@ -14929,7 +14929,7 @@ func evalCurrtid2(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	}
 	relname := strings.TrimSpace(nameD.StringValue())
 
-	tidD, err := evalExpr(x.Args[1], row, ctx)
+	tidD, err := evalExprSlot(x.Args[1], slot, ctx)
 	if err != nil {
 		return NullDatum, err
 	}
@@ -15158,14 +15158,14 @@ func parseNumericOrZero(s string) *big.Int {
 //
 //	(bigint)        → key = bigint, twoArg=false
 //	(int4, int4)    → key = (classid, objid), twoArg=true
-func evalAdvisoryLock(x *optimizer.FuncCall, row Row, ctx *Context, tryOnly bool, xactScoped bool, shared bool) (Datum, error) {
+func evalAdvisoryLock(x *optimizer.FuncCall, slot SlotView, ctx *Context, tryOnly bool, xactScoped bool, shared bool) (Datum, error) {
 	sess := advisorySessionIDFromContext(ctx)
 
 	var key advisoryKey
 	var twoArg bool
 	switch len(x.Args) {
 	case 1:
-		v, err := evalExpr(x.Args[0], row, ctx)
+		v, err := evalExprSlot(x.Args[0], slot, ctx)
 		if err != nil {
 			return NullDatum, err
 		}
@@ -15176,11 +15176,11 @@ func evalAdvisoryLock(x *optimizer.FuncCall, row Row, ctx *Context, tryOnly bool
 		key = bigintToKey(n)
 		twoArg = false
 	case 2:
-		v0, err := evalExpr(x.Args[0], row, ctx)
+		v0, err := evalExprSlot(x.Args[0], slot, ctx)
 		if err != nil {
 			return NullDatum, err
 		}
-		v1, err2 := evalExpr(x.Args[1], row, ctx)
+		v1, err2 := evalExprSlot(x.Args[1], slot, ctx)
 		if err2 != nil {
 			return NullDatum, err2
 		}
@@ -15215,24 +15215,24 @@ func evalAdvisoryLock(x *optimizer.FuncCall, row Row, ctx *Context, tryOnly bool
 // pg_advisory_unlock_shared(bigint), and pg_advisory_unlock_shared(int4,int4).
 // Returns true if the lock was held by this session and has been released, false otherwise.
 // Emits WARNING "you don't own a lock of type <mode>" when returning false. M0097-0021.
-func evalAdvisoryUnlock(x *optimizer.FuncCall, row Row, ctx *Context, shared bool) (Datum, error) {
+func evalAdvisoryUnlock(x *optimizer.FuncCall, slot SlotView, ctx *Context, shared bool) (Datum, error) {
 	sess := advisorySessionIDFromContext(ctx)
 
 	var key advisoryKey
 	switch len(x.Args) {
 	case 1:
-		v, err := evalExpr(x.Args[0], row, ctx)
+		v, err := evalExprSlot(x.Args[0], slot, ctx)
 		if err != nil {
 			return NullDatum, err
 		}
 		n, _ := datumInt64(v)
 		key = bigintToKey(n)
 	case 2:
-		v0, err := evalExpr(x.Args[0], row, ctx)
+		v0, err := evalExprSlot(x.Args[0], slot, ctx)
 		if err != nil {
 			return NullDatum, err
 		}
-		v1, err2 := evalExpr(x.Args[1], row, ctx)
+		v1, err2 := evalExprSlot(x.Args[1], slot, ctx)
 		if err2 != nil {
 			return NullDatum, err2
 		}
@@ -15289,15 +15289,15 @@ func datumInt64(d Datum) (int64, bool) {
 // timestamp. Real upstream parity (timezone, era handling, locale
 // month names) waits on the type system; this is scoped to "make
 // Q15 plan and run without rejecting the conversion".
-func evalToDate(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalToDate(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
 	if len(x.Args) != 2 {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "to_date(text, text) requires exactly 2 arguments"}
 	}
-	src, err := evalExpr(x.Args[0], row, ctx)
+	src, err := evalExprSlot(x.Args[0], slot, ctx)
 	if err != nil {
 		return Datum{}, err
 	}
-	fmtArg, err := evalExpr(x.Args[1], row, ctx)
+	fmtArg, err := evalExprSlot(x.Args[1], slot, ctx)
 	if err != nil {
 		return Datum{}, err
 	}
@@ -15328,11 +15328,11 @@ func evalToDate(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 // The 2-argument form returns the substring from `from` to the end of
 // evalPgSleep implements pg_sleep(seconds). Sleeps for the given
 // duration while honouring query cancellation via ctx.Ctx.
-func evalPgSleep(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalPgSleep(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
 	if len(x.Args) != 1 {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "pg_sleep(double precision) requires exactly 1 argument"}
 	}
-	secs, err := evalExpr(x.Args[0], row, ctx)
+	secs, err := evalExprSlot(x.Args[0], slot, ctx)
 	if err != nil {
 		return Datum{}, err
 	}
@@ -15371,15 +15371,15 @@ func evalPgSleep(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 // `substr('abcdef', -2, 4)` returns `'a'` (start at position 1, length
 // becomes 1 after subtracting the negative offset). For a v0 simple
 // implementation we follow the spec exactly.
-func evalSubstr(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalSubstr(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
 	if len(x.Args) != 2 && len(x.Args) != 3 {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "substr requires 2 or 3 arguments"}
 	}
-	src, err := evalExpr(x.Args[0], row, ctx)
+	src, err := evalExprSlot(x.Args[0], slot, ctx)
 	if err != nil {
 		return Datum{}, err
 	}
-	fromArg, err := evalExpr(x.Args[1], row, ctx)
+	fromArg, err := evalExprSlot(x.Args[1], slot, ctx)
 	if err != nil {
 		return Datum{}, err
 	}
@@ -15430,7 +15430,7 @@ func evalSubstr(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 		return mkResult(s[idx:]), nil
 	}
-	cntArg, err := evalExpr(x.Args[2], row, ctx)
+	cntArg, err := evalExprSlot(x.Args[2], slot, ctx)
 	if err != nil {
 		return Datum{}, err
 	}
@@ -15473,19 +15473,19 @@ func evalSubstr(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 // correctness) and text/bytea Kind-branch structure. M0134-0070.
 // PG oracle: postgres/src/backend/utils/adt/varlena.c text_overlay
 // (~line 1167) and bytea_overlay (~line 3221) — same algorithm/errors.
-func evalOverlay(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalOverlay(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
 	if len(x.Args) != 3 && len(x.Args) != 4 {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "overlay requires 3 or 4 arguments"}
 	}
-	src, err := evalExpr(x.Args[0], row, ctx)
+	src, err := evalExprSlot(x.Args[0], slot, ctx)
 	if err != nil {
 		return Datum{}, err
 	}
-	repl, err := evalExpr(x.Args[1], row, ctx)
+	repl, err := evalExprSlot(x.Args[1], slot, ctx)
 	if err != nil {
 		return Datum{}, err
 	}
-	startArg, err := evalExpr(x.Args[2], row, ctx)
+	startArg, err := evalExprSlot(x.Args[2], slot, ctx)
 	if err != nil {
 		return Datum{}, err
 	}
@@ -15522,7 +15522,7 @@ func evalOverlay(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 
 	sl := int64(len(r))
 	if len(x.Args) == 4 {
-		cntArg, err := evalExpr(x.Args[3], row, ctx)
+		cntArg, err := evalExprSlot(x.Args[3], slot, ctx)
 		if err != nil {
 			return Datum{}, err
 		}
@@ -15604,15 +15604,15 @@ func evalSubstrRegex(src, pattern string, pos int) (Datum, error) {
 // names, fractional seconds) waits on the type system; this is
 // deliberately scoped to "make the loader work without rejecting
 // rows".
-func evalToTimestamp(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalToTimestamp(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
 	if len(x.Args) != 2 {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "to_timestamp(text, text) requires exactly 2 arguments"}
 	}
-	src, err := evalExpr(x.Args[0], row, ctx)
+	src, err := evalExprSlot(x.Args[0], slot, ctx)
 	if err != nil {
 		return Datum{}, err
 	}
-	fmtArg, err := evalExpr(x.Args[1], row, ctx)
+	fmtArg, err := evalExprSlot(x.Args[1], slot, ctx)
 	if err != nil {
 		return Datum{}, err
 	}
@@ -18130,7 +18130,7 @@ func canonicalTypeName(name string, oid uint32) string {
 // mirroring PG's pg_client_encoding() (postgres/src/backend/utils/adt/mb/pg_wchar.c).
 // It reads the live client_encoding GUC value; falls back to "UTF8" when the
 // setting is unavailable (nil context / nil GetSetting). M0122-0008.
-func evalPgClientEncoding(row Row, ctx *Context) (Datum, error) {
+func evalPgClientEncoding(ctx *Context) (Datum, error) {
 	enc := "UTF8"
 	if ctx != nil && ctx.GetSetting != nil {
 		if v, ok := ctx.GetSetting("client_encoding"); ok {
@@ -18145,7 +18145,7 @@ func evalPgClientEncoding(row Row, ctx *Context) (Datum, error) {
 // It reads the encoding ID from the in-memory catalog and maps it to a canonical
 // name; falls back to "UTF8" when the context or catalog is unavailable.
 // M0122-0008.
-func evalGetDatabaseEncoding(row Row, ctx *Context) (Datum, error) {
+func evalGetDatabaseEncoding(ctx *Context) (Datum, error) {
 	if ctx == nil || ctx.Catalog == nil {
 		return NewStringDatum("UTF8"), nil
 	}

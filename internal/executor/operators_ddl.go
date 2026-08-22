@@ -114,7 +114,7 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 	case *parser.DropViewStmt:
 		return nil, o.execDropView(s)
 	case *parser.TruncateStmt:
-		return nil, o.execTruncate(s)
+		return nil, o.execTruncate(s, false)
 	case *parser.AlterTableStmt:
 		return nil, o.execAlterTable(s)
 	case *parser.CreateCollationStmt:
@@ -1773,6 +1773,17 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) (retErr error) {
 		}
 		s.Temporary = true
 		s.Name.Schema = "" // store under bare key like other temp tables
+	}
+	// ON COMMIT is only valid on temporary tables (DefineRelation guard,
+	// tablecmds.c:799-803). The implicit pg_temp promotion above has already
+	// marked a bare `CREATE TABLE pg_temp.x ... ON COMMIT ...` as temporary,
+	// consistent with goopg's established temp-promotion semantics. Note that
+	// ON COMMIT PRESERVE ROWS collapsed to parser.OnCommitNone ("") in the
+	// parser, so it does not trip this guard (a deliberate deviation — see
+	// the M0134-0072 design doc). M0134-0072.
+	if s.OnCommit != "" && !s.Temporary {
+		return &ExecError{Code: "42P16", Pos: s.Pos(),
+			Message: "ON COMMIT can only be used on temporary tables"}
 	}
 	// Pre-resolve schema from search_path before the existence check so that
 	// CREATE TABLE ctlt1 in ctl_schema context doesn't falsely collide with
@@ -4480,6 +4491,15 @@ afterExistsCheck:
 			return fmt.Errorf("DDL catalog sync: %w", syncErr)
 		}
 	}
+	// Register ON COMMIT {DELETE ROWS|DROP} for the commit-time pass. Mirrors
+	// DefineRelation → register_on_commit_action (tablecmds.c:19261). PRESERVE
+	// ROWS / no clause were collapsed to "" in the parser and are no-ops; the
+	// 42P16 guard above already rejected a non-temp ON COMMIT. M0134-0072.
+	if s.OnCommit != "" && s.Temporary {
+		if sess, ok := o.ctx.Session.(*BasicSession); ok {
+			sess.RegisterOnCommitAction(tbl.OID, s.OnCommit)
+		}
+	}
 	return nil
 }
 
@@ -4783,6 +4803,14 @@ func mergeNotNullEntries(colName string, entries []nnEntry) (name string, noInhe
 // It plans and executes the SELECT, derives column definitions from the result
 // schema, creates the table, and inserts all rows from the SELECT.  M0096-0008.
 func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
+	// ON COMMIT is only valid on temporary tables (DefineRelation guard,
+	// tablecmds.c:799-803). execCreateTable normally runs this before
+	// dispatching CTAS here, but CTAS is also reachable directly — keep the
+	// guard on this path too. M0134-0072.
+	if s.OnCommit != "" && !s.Temporary {
+		return &ExecError{Code: "42P16", Pos: s.Pos(),
+			Message: "ON COMMIT can only be used on temporary tables"}
+	}
 	// Validate storage parameter names (same rule as execCreateTable).
 	for k := range s.With {
 		if k != strings.ToLower(k) {
@@ -4867,6 +4895,14 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 	}
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
 		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false, ShadowedTable: o.pendingDropShadow})
+		// Register ON COMMIT {DELETE ROWS|DROP} for the commit-time pass.
+		// Mirrors DefineRelation → register_on_commit_action (tablecmds.c:19261).
+		// CTAS never sets tbl.Temp (a pre-existing gap), so gate on the
+		// statement's Temporary flag instead — the 42P16 guard at the top of this
+		// function already rejected a non-temp ON COMMIT. M0134-0072.
+		if s.OnCommit != "" && s.Temporary {
+			sess.RegisterOnCommitAction(tbl.OID, s.OnCommit)
+		}
 	}
 	if catalogHeapSyncAvailable(o.ctx) {
 		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
@@ -5340,6 +5376,16 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 				// AddRelationNewConstraints). M0134-0005p sub-slice B.
 				tbl.AddNotNull(parentNC.Name, col.Name, im2.AllocOID(), parentNC.NoInherit, false, false, 1)
 			}
+		}
+	}
+	// Register ON COMMIT {DELETE ROWS|DROP} for the commit-time pass. The
+	// partition-child parser arm captures the clause, and the child carries its
+	// own ON COMMIT action (PG registers each DefineRelation independently —
+	// tablecmds.c:19261). The 42P16 guard in execCreateTable already rejected a
+	// non-temp ON COMMIT before dispatching here. M0134-0072.
+	if s.OnCommit != "" && s.Temporary {
+		if sess, ok := o.ctx.Session.(*BasicSession); ok {
+			sess.RegisterOnCommitAction(tbl.OID, s.OnCommit)
 		}
 	}
 	return nil
@@ -7071,6 +7117,12 @@ func (o *ddlOp) dropTableByRefImmediate(name parser.ObjectName, tbl *catalog.Tab
 	}
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 	relOID := tbl.OID
+	// Drop the relation's ON COMMIT registration, if any. Mirrors
+	// heap_drop_with_catalog → remove_on_commit_action (catalog/heap.c:1902), so
+	// a temp table dropped before commit no longer fires at COMMIT. M0134-0072.
+	if sess, ok := o.ctx.Session.(*BasicSession); ok {
+		sess.RemoveOnCommitAction(relOID)
+	}
 	// Cumulative relation stats are removed with the relation (pgstat_drop_relation):
 	// after the drop the getters read 0 and any concurrent backend's stale pending
 	// counts for this OID are discarded rather than revived. This hook fires when
@@ -15451,7 +15503,11 @@ func sortedTruncateTableSet(tableSet map[uint32]*truncateTableEntry, nameOrder m
 	return entries
 }
 
-func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
+// execTruncate truncates the named relations. tempTables marks an ON COMMIT
+// DELETE ROWS truncate: the FK-check failure then raises PG's temp-specific
+// message (heap_truncate_check_FKs tempTables branch, catalog/heap.c:3738)
+// instead of the generic truncate error. M0134-0072.
+func (o *ddlOp) execTruncate(s *parser.TruncateStmt, tempTables bool) error {
 	if o.ctx.Pool == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "TRUNCATE requires Pool in Context"}
 	}
@@ -15545,6 +15601,18 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 							tableSet[other.OID] = &truncateTableEntry{tbl: other, only: false}
 							o.ctx.AddNotice(fmt.Sprintf("truncate cascades to table %q", other.Name))
 							expanded = true
+						} else if tempTables {
+							// ON COMMIT DELETE ROWS truncate hitting an FK from a
+							// differently-ON-COMMIT table: PG's temp-specific
+							// message (heap_truncate_check_FKs tempTables branch,
+							// catalog/heap.c:3738) — no HINT, unlike the generic
+							// case. M0134-0072.
+							return &ExecError{
+								Code:    "0A000",
+								Pos:     s.Pos(),
+								Message: "unsupported ON COMMIT and foreign key combination",
+								Detail:  fmt.Sprintf("Table %q references %q, but they do not have the same ON COMMIT setting.", other.Name, tbl.Name),
+							}
 						} else {
 							return &ExecError{
 								Code:    "0A000",
@@ -15684,6 +15752,147 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 	}
 
 	return nil
+}
+
+// RunOnCommitActions performs the ON COMMIT {DELETE ROWS|DROP} pass at
+// transaction commit. Callers MUST invoke it from the commit paths BEFORE
+// CommitTransaction and BEFORE the SSI pre-commit check, mirroring xact.c:2311
+// (PreCommit_on_commit_actions) → :2339 (PreCommit_CheckForSerializationFailure)
+// → :2365 (RecordTransactionCommit). DELETE ROWS tables are truncated first and
+// DROP tables dropped afterwards, so dependencies between the two groups resolve
+// (a relation being both truncated and dropped is harmless — tablecmds.c:19356).
+//
+// Unlike PG, entries are not keyed to subtransactions and ROLLBACK does not
+// remove them: AtAbort has no ON-COMMIT pass, and a stale entry left by a
+// rolled-back CREATE is harmless because OIDs are monotonic (never reused) and
+// the pass skips missing relations. A DELETE ROWS entry persists across commits
+// and fires at every commit until its relation is dropped (PG's
+// AtEOXact_on_commit_actions preserves committed entries, tablecmds.c:19427).
+//
+// PG additionally skips the DELETE ROWS truncate when the transaction never
+// accessed the temp namespace (XACT_FLAGS_ACCESSEDTEMPNAMESPACE,
+// tablecmds.c:19347); goopg does not track that flag, so it always truncates —
+// truncating an already-empty table is a semantic no-op. M0134-0072.
+func RunOnCommitActions(ctx *Context, sess *BasicSession) error {
+	if ctx == nil || sess == nil {
+		return nil
+	}
+	actions := sess.OnCommitActions()
+	if len(actions) == 0 {
+		return nil
+	}
+	im, hasIM := ctx.Catalog.(*catalog.InMemory)
+	if !hasIM {
+		return nil
+	}
+	op := &ddlOp{ctx: ctx}
+	// Partition the registrations: truncate first, then drop (PG order).
+	var toTruncate []parser.ObjectName
+	type onCommitDropEntry struct {
+		name parser.ObjectName
+		tbl  *catalog.Table
+	}
+	var toDrop []onCommitDropEntry
+	for _, a := range actions {
+		tbl, ok := im.LookupTableByOID(a.RelOID)
+		if !ok {
+			// Relation already gone (dropped earlier, or its entry was left
+			// stale by a ROLLBACK). PG ignores entries marked deleted
+			// (tablecmds.c:19331); skip. M0134-0072.
+			continue
+		}
+		name := parser.ObjectName{Schema: tbl.Schema, Name: tbl.Name}
+		switch a.Action {
+		case parser.OnCommitDeleteRows:
+			// A storage-less partitioned table has no heap to truncate, and the
+			// ON COMMIT DELETE ROWS pass truncates ONLY the registered relations —
+			// PG's heap_truncate_one_rel returns early for RELKIND_PARTITIONED_TABLE
+			// and heap_truncate never expands partitions (catalog/heap.c:3631), so
+			// a PRESERVE ROWS partition keeps its rows. The partition itself is
+			// still truncated when it has its own DELETE ROWS registration.
+			if tbl.PartitionMethod != "" {
+				continue
+			}
+			toTruncate = append(toTruncate, name)
+		case parser.OnCommitDrop:
+			toDrop = append(toDrop, onCommitDropEntry{name: name, tbl: tbl})
+		}
+	}
+	// Truncate before dropping (tablecmds.c:19356-19395) so FK/dependency
+	// checks run against a consistent set.
+	if len(toTruncate) > 0 {
+		if err := op.execTruncate(&parser.TruncateStmt{Names: toTruncate}, true); err != nil {
+			return err
+		}
+	}
+	for _, d := range toDrop {
+		if _, still := im.LookupTableByOID(d.tbl.OID); !still {
+			// Already dropped this transaction — e.g. a partition whose parent's
+			// ON COMMIT DROP cascaded through it (temp.sql's
+			// temp_parted_oncommit_test2). PG's performMultipleDeletions passes
+			// PERFORM_DELETION_QUIETLY (tablecmds.c:19394) and the dependency
+			// machinery's remove_on_commit_action marks such entries as deleted, so
+			// a gone relation is a no-op here rather than an error. M0134-0072.
+			continue
+		}
+		if err := op.dropOnCommitTable(d.name, d.tbl); err != nil {
+			return err
+		}
+	}
+	// An ON COMMIT DROP removed relations from the catalog at COMMIT with no
+	// DDL statement to trigger the dispatch layer's per-statement plan-cache
+	// invalidation — without this, a plan cached before the commit (e.g. a
+	// SELECT on the dropped temp table) keeps running against the gone
+	// relation and returns 0 rows instead of "relation does not exist".
+	// PG's commit-time drop (PreCommit_on_commit_actions → performMultiple
+	// Deletions) emits relcache invalidation exactly like a DROP statement,
+	// so this mirrors upstream plan-cache invalidation. M0134-0072.
+	if len(toDrop) > 0 && ctx.OnCommitDDL != nil {
+		ctx.OnCommitDDL()
+	}
+	return nil
+}
+
+// dropOnCommitTable drops a temp relation registered for ON COMMIT DROP,
+// cascading to its partition and inheritance children. PG's commit pass uses
+// performMultipleDeletions(targetObjects, DROP_CASCADE,
+// PERFORM_DELETION_INTERNAL | PERFORM_DELETION_QUIETLY) (tablecmds.c:19394), so
+// partition children are always dropped and inheritance children cascade too;
+// the AccessibleInheritanceChildren filter excludes other-session temp children
+// (RELATION_IS_OTHER_TEMP). The drop is immediate (allowDefer=false): this pass
+// already runs at COMMIT, so deferring to the same commit's
+// ApplyPendingTableDrops would be pointless. M0134-0072.
+func (o *ddlOp) dropOnCommitTable(name parser.ObjectName, tbl *catalog.Table) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return o.dropTableByRef(name, tbl, false)
+	}
+	visited := map[uint32]bool{tbl.OID: true}
+	var dropDescendants func(parent *catalog.Table) error
+	dropDescendants = func(parent *catalog.Table) error {
+		// Partition children always; inheritance children via DROP CASCADE.
+		var children []*catalog.Table
+		children = append(children, im.PartitionChildren(parent.OID)...)
+		children = append(children, catalog.AccessibleInheritanceChildren(im.InheritanceChildren(parent.OID), sessionTempOwner(o.ctx))...)
+		for _, child := range children {
+			if visited[child.OID] {
+				continue
+			}
+			visited[child.OID] = true
+			// Depth-first so grandchildren drop before their parents.
+			if err := dropDescendants(child); err != nil {
+				return err
+			}
+			if err := o.dropTableByRef(parser.ObjectName{Schema: child.Schema, Name: child.Name}, child, false); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := dropDescendants(tbl); err != nil {
+		return err
+	}
+	return o.dropTableByRef(name, tbl, false)
 }
 
 // extractNextvalSeqNameFromExpr extracts the sequence name from a nextval() AST expression.
@@ -15963,8 +16172,22 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 			return &ExecError{Code: "42P13", Pos: s.Pos(), Message: "CREATE FUNCTION requires a LANGUAGE clause"}
 		}
 	}
-	if lang != "plpgsql" && lang != "sql" && lang != "c" {
+	if lang != "plpgsql" && lang != "sql" && lang != "c" && lang != "internal" {
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("language %q is not supported (Stage A: plpgsql, sql)", s.Language)}
+	}
+	// LANGUAGE internal: the AS clause is the C symbol name (interpret_AS_clause,
+	// postgres/src/backend/commands/functioncmds.c:866) — no SQL body, no
+	// prosrc string lookup. Validate it against the built-in pg_proc name set;
+	// an unknown name errors exactly like PG's fmgr_internal_validator
+	// (postgres/src/backend/catalog/pg_proc.c:768-771): ERRCODE_UNDEFINED_FUNCTION
+	// (42883), NOT 42704 as the design doc once claimed.
+	if lang == "internal" {
+		if s.Body == "" {
+			return &ExecError{Code: "42601", Pos: s.Pos(), Message: "internal function requires an AS clause naming the C function"}
+		}
+		if _, ok := catalog.LookupBuiltinProcByProname(s.Body); !ok {
+			return &ExecError{Code: "42883", Pos: s.Pos(), Message: fmt.Sprintf("there is no built-in function named %q", s.Body)}
+		}
 	}
 	// LANGUAGE C: store as a stub. When called, evalFuncCall detects lang=="c"
 	// and returns a type-appropriate default value (true for bool, 0 for int, etc.).
@@ -16710,7 +16933,7 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 			return &ExecError{Code: "42P13", Pos: s.Pos(), Message: "CREATE PROCEDURE requires a LANGUAGE clause"}
 		}
 	}
-	if lang != "plpgsql" && lang != "sql" && lang != "c" {
+	if lang != "plpgsql" && lang != "sql" && lang != "c" && lang != "internal" {
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("language %q is not supported (Stage B: plpgsql, sql)", s.Language)}
 	}
 	// Validate procedure-invalid attributes.

@@ -3207,6 +3207,30 @@ func (p *parser) tryTypedLiteral() (Expr, bool) {
 				return &TypedStringLit{pos: pos, Type: typName, Value: strTok.Value}, true
 			}
 		}
+		// `typename ( intlit ) 'string'` — the character-string types char(N),
+		// varchar(N), bpchar(N) take a single-integer length typmod. PG
+		// grammar `character '(' Iconst ')' Sconst` (gram.y ConstTypename Sconst
+		// → makeStringConstCast); padding/truncation is applied later at
+		// coercion, so the typmod is deliberately ignored here and the raw
+		// string is returned (M0134-0070). Restricted to char/bpchar/varchar;
+		// text/numeric/etc. must NOT consume this shape.
+		if (name == "char" || name == "bpchar" || name == "varchar") &&
+			p.peek(1).Kind == TokenSymbol && p.peek(1).Value == "(" {
+			numTok := p.peek(2)
+			closeTok := p.peek(3)
+			strTok := p.peek(4)
+			if numTok.Kind == TokenIntLit && closeTok.Kind == TokenSymbol &&
+				closeTok.Value == ")" && strTok.Kind == TokenStringLit {
+				p.advance() // type name
+				p.advance() // (
+				p.advance() // N
+				p.advance() // )
+				p.advance() // string literal
+				return &TypedStringLit{pos: t.Pos, Type: name, Value: strTok.Value}, true
+			}
+			// `char(` that is not a valid `( N ) '...'` is not a literal.
+			return nil, false
+		}
 		next := p.peek(1)
 		if next.Kind != TokenStringLit {
 			return nil, false
@@ -4331,6 +4355,26 @@ func (p *parser) parseSubstringFuncCall(pos int, name string) (Expr, error) {
 		count, err := p.parseExpr()
 		if err != nil {
 			return nil, err
+		}
+		// Older SQL:1999 overload: SUBSTRING(str FROM pattern FOR escape). PG
+		// desugars this spelling (`a_expr FROM a_expr FOR a_expr` in gram.y's
+		// substr_list production) to the SAME 3-arg substring(text,text,text)
+		// SQL wrapper as the SIMILAR form (system_functions.sql: `RETURN
+		// substring($1, similar_to_escape($2, $3))`), disambiguating it from
+		// `start FOR count` by function overload resolution on operand types
+		// at plan time. goopg has no plan-time overload machinery, so
+		// constant-fold here: when BOTH FROM and FOR operands are
+		// string-or-NULL literals, route through the same buildSubstringSimilar
+		// fold as the SIMILAR form. M0134-0070; see
+		// docs/design/m0134-0070-substring-similar-escape.md §"Explicitly out
+		// of scope".
+		if _, _, startOK := similarToLiteralValue(start); startOK {
+			if _, _, countOK := similarToLiteralValue(count); countOK {
+				if !p.acceptSymbol(")") {
+					return nil, p.errAtCur("expected ')' to close SUBSTRING")
+				}
+				return p.buildSubstringSimilar(str, start, count, pos)
+			}
 		}
 		args = append(args, count)
 	}

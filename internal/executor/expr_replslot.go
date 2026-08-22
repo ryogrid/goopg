@@ -45,11 +45,11 @@ func replSlotExecError(err error, pos int, prefix string) *ExecError {
 
 // replSlotBoolArg evaluates optional boolean argument `idx`, defaulting to
 // `def` when the argument is absent or NULL.
-func replSlotBoolArg(x *optimizer.FuncCall, idx int, def bool, row Row, ctx *Context) (bool, error) {
+func replSlotBoolArg(x *optimizer.FuncCall, idx int, def bool, slot SlotView, ctx *Context) (bool, error) {
 	if len(x.Args) <= idx {
 		return def, nil
 	}
-	d, err := evalExpr(x.Args[idx], row, ctx)
+	d, err := evalExprSlot(x.Args[idx], slot, ctx)
 	if err != nil {
 		return false, err
 	}
@@ -74,7 +74,7 @@ func replSlotBoolArg(x *optimizer.FuncCall, idx int, def bool, row Row, ctx *Con
 // write position; only the *reported* LSN follows upstream's NULL/value
 // rule. That is strictly safer for retention (it never retains more WAL
 // than upstream would) and is recorded in the deferral ledger.
-func evalPgCreatePhysicalReplicationSlot(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalPgCreatePhysicalReplicationSlot(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
 	if len(x.Args) == 0 {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(),
 			Message: "pg_create_physical_replication_slot requires a slot name"}
@@ -83,7 +83,7 @@ func evalPgCreatePhysicalReplicationSlot(x *optimizer.FuncCall, row Row, ctx *Co
 		return Datum{}, &ExecError{Code: "0A000", Pos: x.Pos(),
 			Message: "replication slots are not configured on this server"}
 	}
-	nameD, err := evalExpr(x.Args[0], row, ctx)
+	nameD, err := evalExprSlot(x.Args[0], slot, ctx)
 	if err != nil {
 		return Datum{}, err
 	}
@@ -94,11 +94,11 @@ func evalPgCreatePhysicalReplicationSlot(x *optimizer.FuncCall, row Row, ctx *Co
 	}
 	name := nameD.StringValue()
 
-	reserve, err := replSlotBoolArg(x, 1, false, row, ctx)
+	reserve, err := replSlotBoolArg(x, 1, false, slot, ctx)
 	if err != nil {
 		return Datum{}, err
 	}
-	temporary, err := replSlotBoolArg(x, 2, false, row, ctx)
+	temporary, err := replSlotBoolArg(x, 2, false, slot, ctx)
 	if err != nil {
 		return Datum{}, err
 	}
@@ -119,7 +119,7 @@ func evalPgCreatePhysicalReplicationSlot(x *optimizer.FuncCall, row Row, ctx *Co
 	if ctx.WAL != nil {
 		startLSN = ctx.WAL.WrittenLSN() + 1
 	}
-	slot, err := ctx.ReplSlots.Create(name, xlog.SlotPhysical, startLSN)
+	repSlot, err := ctx.ReplSlots.Create(name, xlog.SlotPhysical, startLSN)
 	if err != nil {
 		return Datum{}, replSlotExecError(err, x.Pos(), "")
 	}
@@ -130,9 +130,9 @@ func evalPgCreatePhysicalReplicationSlot(x *optimizer.FuncCall, row Row, ctx *Co
 	// the record, but typed text rather than record (ledger row).
 	lsnCol := ""
 	if reserve {
-		lsnCol = fmt.Sprintf("%X/%X", uint32(slot.RestartLSN>>32), uint32(slot.RestartLSN))
+		lsnCol = fmt.Sprintf("%X/%X", uint32(repSlot.RestartLSN>>32), uint32(repSlot.RestartLSN))
 	}
-	return NewStringDatum(fmt.Sprintf("(%s,%s)", slot.Name, lsnCol)), nil
+	return NewStringDatum(fmt.Sprintf("(%s,%s)", repSlot.Name, lsnCol)), nil
 }
 
 // evalPgDropReplicationSlot implements
@@ -141,7 +141,7 @@ func evalPgCreatePhysicalReplicationSlot(x *optimizer.FuncCall, row Row, ctx *Co
 //
 // Upstream (slotfuncs.c) errors if the slot does not exist or is held by
 // an active walsender; wal.Slots.Drop enforces the same two conditions.
-func evalPgDropReplicationSlot(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalPgDropReplicationSlot(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
 	if len(x.Args) == 0 {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(),
 			Message: "pg_drop_replication_slot requires a slot name"}
@@ -150,7 +150,7 @@ func evalPgDropReplicationSlot(x *optimizer.FuncCall, row Row, ctx *Context) (Da
 		return Datum{}, &ExecError{Code: "0A000", Pos: x.Pos(),
 			Message: "replication slots are not configured on this server"}
 	}
-	nameD, err := evalExpr(x.Args[0], row, ctx)
+	nameD, err := evalExprSlot(x.Args[0], slot, ctx)
 	if err != nil {
 		return Datum{}, err
 	}

@@ -59,6 +59,27 @@ func pgHashFinal(a, b, c *uint32) {
 	*c -= (*b<<24 | *b>>8)
 }
 
+// pgHashInt8 is hashint8 from postgres/src/backend/access/hash/hashfunc.c:84.
+// The lohalf/hihalf xor keeps the hash compatible with hashint4/hashint2 for
+// logically equal inputs (the cross-type hash-join requirement); the final step
+// is hash_uint32(lohalf) == hash_bytes_uint32(lohalf) (common/hashfn.c:609),
+// whose low 32 bits equal hash_bytes_extended of the 4-byte little-endian
+// value with seed 0 (hash_bytes_uint32's own doc: "same result as
+// hash_bytes(&k, sizeof(uint32))"). M0134-0071 Bucket A: LANGUAGE internal
+// dispatch for the equivclass int8alias1 hash function.
+func pgHashInt8(val int64) uint32 {
+	lohalf := uint32(val)
+	hihalf := uint32(val >> 32)
+	if val >= 0 {
+		lohalf ^= hihalf
+	} else {
+		lohalf ^= ^hihalf
+	}
+	var buf [4]byte
+	binary.LittleEndian.PutUint32(buf[:], lohalf)
+	return uint32(pgHashBytesExtended(buf[:], 0))
+}
+
 // pgHashBytesExtended is hash_bytes_extended from hashfn.c.
 // Returns a 64-bit hash of the byte slice combined with seed.
 func pgHashBytesExtended(k []byte, seed uint64) uint64 {

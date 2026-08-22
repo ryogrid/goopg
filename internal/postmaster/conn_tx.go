@@ -80,6 +80,18 @@ type connTxState struct {
 	// TempTableShadows maps table name → original permanent *catalog.Table.
 	// Populated when CREATE TEMP TABLE shadows a permanent table. M0097-0003.
 	TempTableShadows map[string]*catalog.Table
+	// OnCommitActions carries the session's ON COMMIT {DELETE ROWS|DROP}
+	// registrations across messages. Autocommit CREATE TEMP TABLE ... ON
+	// COMMIT ... runs in a message-scoped throwaway session (dispatch.go
+	// seeds connTx.Session()==nil with NewAutocommitUndoSession), so without
+	// this write-back a DELETE ROWS registration made outside an explicit
+	// transaction would vanish before the next message's explicit COMMIT —
+	// PG keeps on_commits in backend-local CacheMemoryContext (tablecmds.c
+	// register_on_commit_action), session-scoped, surviving autocommit
+	// commits. Written back by writeBackConnTxState + dispatch.go's
+	// per-statement write-back; seeded into each ectx's Session at setup.
+	// M0134-0072.
+	OnCommitActions []executor.OnCommitAction
 	// Cursors holds open SQL cursors declared by DECLARE ... CURSOR FOR select.
 	// Key = cursor name (case-insensitive), value = cursor state.
 	// M0097-0042: cursor entries track materialized rows and position for

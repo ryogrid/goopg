@@ -1385,6 +1385,16 @@ type TableForeignKeyDef struct {
 	NotEnforced bool
 }
 
+// OnCommit* are the values of CreateTableStmt.OnCommit. The zero value ""
+// (no clause, or an explicit ON COMMIT PRESERVE ROWS) is the default no-op.
+// Mirrors PG's OnCommitAction enum (gram.y OnCommitOption; commands/tablecmds.c:118).
+// M0134-0072.
+const (
+	OnCommitNone       = ""           // no clause, or ON COMMIT PRESERVE ROWS (default no-op)
+	OnCommitDeleteRows = "delete rows" // ON COMMIT DELETE ROWS
+	OnCommitDrop       = "drop"        // ON COMMIT DROP
+)
+
 // CreateTableStmt — `CREATE [UNLOGGED] TABLE [IF NOT EXISTS] name
 //
 //	(column_def [, …]) [WITH (option = value [, …])]`. Foreign keys,
@@ -1541,6 +1551,12 @@ type CreateTableStmt struct {
 	// Empty means unspecified (the table lands in the database's default
 	// tablespace). M0122-0007.
 	Tablespace string
+	// OnCommit holds the action from an `ON COMMIT {PRESERVE ROWS|DELETE ROWS|DROP}`
+	// clause on a CREATE [TEMP] TABLE. The zero value ("" — no clause, or
+	// PRESERVE ROWS) is the default no-op; DELETE ROWS and DROP are captured so
+	// the executor can register the end-of-transaction action (M0134-0072). The
+	// non-temp guard (42P16) and the commit-time pass live in the executor.
+	OnCommit string
 }
 
 func (s *CreateTableStmt) Pos() int  { return s.pos }

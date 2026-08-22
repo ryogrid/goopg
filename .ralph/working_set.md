@@ -1,47 +1,39 @@
-Task: M0134-0070 (strings.sql) — regress-sql `failed`. This loop landed the
-regexp error-path HINT bucket. Code commit `1c6e8a86`, pushed.
+Task: M0134-0071 (equivclass.sql) — Bucket A (`LANGUAGE internal` CREATE
+FUNCTION) landed and committed `f70edc85`; case PARKED (not flipped to pass).
 
-Landed: `evalFuncCall` `case "regexp_replace"` `case 4:` flags branch
-(`internal/executor/expr.go:12474`) gained a digit-first guard returning
-`&ExecError{Code:"22023", Message:"invalid regular expression option: \"" +
-flagsStr + "\"", Hint:"If you meant to use regexp_replace() with a start
-parameter, cast the fourth argument to integer explicitly."}`. Mirrors PG oracle
-`textregexreplace` (`postgres/src/backend/utils/adt/regexp.c:673-684`). Prints
-the WHOLE `flagsStr` (so `"1z"` → `"1z"`, not `"1"`). Single-site — the shared
-`pgRegexFlagsToGoModifiers` (8 callers, expr.go:7493) is untouched: PG hints
-only in `textregexreplace`; `regexp_matches(...,'1')` etc. raise 22023 with no
-hint via `parse_re_flags`. New test
-`internal/executor/regexp_replace_hint_test.go` (4 tests incl. the sibling
-"must not over-hint" guard).
+Landed: `internal/executor/operators_ddl.go` `execCreateFunction`/`execCreateProcedure`
+allowlist now admit `internal`; new `catalog.LookupBuiltinProcByProname`
+(name→OID reverse of `pgProcNamesByOID`) binds `AS '<name>'` (unknown → 42883,
+PG `fmgr_internal_validator` `pg_proc.c:746/770-771`); `plpgsql_runtime.go`
+`dispatchStoredRoutineByLanguage` gains a real `case "internal"` →
+`dispatchInternalFunction` (int8eq/ne/lt/le/gt/ge, btint8cmp, int8in/out,
+hashint8; strict; Datum-level — no coercion needed for `like int8` aliases);
+`hash_partition.go` `pgHashInt8` (PG `hashfunc.c:84`). Design
+`docs/design/m0134-0071-language-internal-function.md` + README index; test
+`internal/executor/create_function_language_internal_test.go`.
 
-Key symbols: `evalFuncCall` (expr.go, case "regexp_replace" case 4:),
-`pgRegexFlagsToGoModifiers` (expr.go:7493), `ExecError.Hint` (expr.go:46-54).
+Result: equivclass **594 → 573 diff lines, 40 → 28 `^+ERROR`** (10 `language
+internal` + 2 cross-type `only boolean operators` cleared). CSV row stays
+`failed`/`pass_required=no`; no `make regen-testport`.
 
-Hypothesis/Findings: the "~7 lines" bucket was actually ONE missing `-HINT:`
-line (`tmp/regress-diffs/strings.diff:193`); the ERROR line above already
-matched. `strings.sql` diff 348→347 lines, grep-confirmed zero residual
-regexp-HINT lines. No deferral — the fix is complete (whole-opt printing was
-handled inline, no unimplemented PG behavior remains for this bucket).
+Key finding (re-attribution): the 13 `incompatible operand types` errors are an
+INDEPENDENT analyzer gap, NOT a cascade of the internal-language wall — the
+BinaryOp type-check (`analyzer.go:1359-1362`/`:3186`) is a builtin name-switch
+with no user-operator lookup, so `int8 = int8alias1` (a user operator) is never
+resolved. Largest contained next slice (16/28 remaining). Bucket C (built-in
+`integer_ops` opfamily rows) is second. Both ledgered 2026-08-22.
 
-Remaining buckets in the 347-line diff (all named in the fix_plan entry):
-`standard_conforming_strings=off` lexing + `escape_string_warning`
-(REFACTOR-tier), RE2-vs-ARE regex backrefs/zero-width/SIMILAR-ambiguity,
-Unicode-escape error-message/DETAIL text (~16), `char(20) '...'`
-typed-literal grammar (~14), SQL99 `SUBSTRING FROM..FOR` + missing CONTEXT
-(~8), toasttest `pg_relation_size` hunk 2 (J2).
+Next step: M0134-0072 (temp.sql) — regress-sql `failed`, not yet sized. Same
+pattern: researcher sizes (run `scripts/pg-regress-runner.sh --verbose temp`),
+then pick the largest contained slice, design + implement.
 
-Next step: re-size the three remaining SMALL contained buckets (Unicode-escape
-error-message/DETAIL, `char(20) '...'` typed-literal, SQL99 `SUBSTRING
-FROM..FOR`+CONTEXT) via researcher to pick the next contained fix, or open
-toasttest hunk 2 (J2). NOTE the "missing CONTEXT" is likely the known
-cross-cutting no-CONTEXT-stack gap (see ledger: `2200C` error omits PG's
-CONTEXT line) — do not assume it is a self-contained 8-line fix without sizing.
+Gates run this loop: researcher ran the regress runner twice (deterministic, 594
+lines, exit 1); implementer `go test ./internal/executor/` + `./internal/catalog/`
+PASS, `go build ./...` PASS, regress 594→573/40→28; pre-commit pgbench smoke
+PASS (0 failed, `f70edc85`).
 
-Gates run this loop: `go test ./internal/executor/` PASS (7.2s incl. new
-tests); `go build ./...` PASS; pre-commit pgbench smoke PASS (0 failed, via
-git hook); `make ralph-state-guard` clean.
-
-Delegation: implementer (m0134-0070-regexp-hint) DONE — all gates PASS,
-committed `1c6e8a86`. Researcher (m0134-0070-regexp-hint) DONE pre-slicing.
+Delegation: researcher m0134-0071-equivclass-sizing DONE; implementer
+m0134-0071-internal-lang DONE (report delivered inline — the harness blocked the
+`report.md` Write). No open brief.
 
 In-flight: none.

@@ -295,11 +295,11 @@ func sessionStatsID(ctx *Context) uint64 {
 // getter. It returns ok=false when the argument evaluates to SQL NULL (the
 // getter then returns NULL), and an error only when argument evaluation itself
 // fails.
-func statFuncOIDArg(x *optimizer.FuncCall, row Row, ctx *Context) (uint32, bool, error) {
+func statFuncOIDArg(x *optimizer.FuncCall, slot SlotView, ctx *Context) (uint32, bool, error) {
 	if len(x.Args) == 0 {
 		return 0, false, nil
 	}
-	d, err := evalExpr(x.Args[0], row, ctx)
+	d, err := evalExprSlot(x.Args[0], slot, ctx)
 	if err != nil {
 		return 0, false, err
 	}

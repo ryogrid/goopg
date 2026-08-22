@@ -53,7 +53,7 @@ import (
 // evalBtIndexCheck implements bt_index_check (parentCheck=false) and
 // bt_index_parent_check (parentCheck=true). Both share the structural
 // orchestration; parent-check additionally runs the parent-downlink tier.
-func evalBtIndexCheck(x *optimizer.FuncCall, row Row, ctx *Context, parentCheck bool) (Datum, error) {
+func evalBtIndexCheck(x *optimizer.FuncCall, slot SlotView, ctx *Context, parentCheck bool) (Datum, error) {
 	fname := "bt_index_check"
 	if parentCheck {
 		fname = "bt_index_parent_check"
@@ -73,7 +73,7 @@ func evalBtIndexCheck(x *optimizer.FuncCall, row Row, ctx *Context, parentCheck 
 	}
 
 	// Resolve the regclass argument to an index relation.
-	argVal, err := evalExpr(x.Args[0], row, ctx)
+	argVal, err := evalExprSlot(x.Args[0], slot, ctx)
 	if err != nil {
 		return NullDatum, err
 	}
@@ -149,7 +149,7 @@ func evalBtIndexCheck(x *optimizer.FuncCall, row Row, ctx *Context, parentCheck 
 		// bt_entry_unique_check from inside bt_target_page_check, which never
 		// runs once an earlier per-page invariant has ereport(ERROR)ed.
 		var ureports []amcheck.BtreeReport
-		ureports, err = btIndexCheckUnique(x, row, ctx, idx, src, parentCheck, cmpKeys, keyFmt)
+		ureports, err = btIndexCheckUnique(x, slot, ctx, idx, src, parentCheck, cmpKeys, keyFmt)
 		reports = append(reports, ureports...)
 	}
 	if err != nil {
@@ -237,7 +237,7 @@ func btIndexVerify(src amcheck.PageSource, nblocks storage.BlockNumber, name str
 // transaction snapshot taken once per index check (verify_nbtree.c:471). Without
 // a snapshot in Context there is nothing to judge liveness against, so the tier
 // is skipped rather than answered wrongly. M0119-0006.
-func btIndexCheckUnique(x *optimizer.FuncCall, row Row, ctx *Context, idx *catalog.Index,
+func btIndexCheckUnique(x *optimizer.FuncCall, slot SlotView, ctx *Context, idx *catalog.Index,
 	src amcheck.PageSource, parentCheck bool, cmpKeys amcheck.KeyComparator, keyFmt nbtree.IndexFormat,
 ) ([]amcheck.BtreeReport, error) {
 	argIdx := 2
@@ -247,7 +247,7 @@ func btIndexCheckUnique(x *optimizer.FuncCall, row Row, ctx *Context, idx *catal
 	if len(x.Args) <= argIdx {
 		return nil, nil
 	}
-	d, err := evalExpr(x.Args[argIdx], row, ctx)
+	d, err := evalExprSlot(x.Args[argIdx], slot, ctx)
 	if err != nil {
 		return nil, err
 	}
