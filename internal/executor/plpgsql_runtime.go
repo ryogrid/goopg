@@ -252,13 +252,13 @@ func bindSelectIntoRow(targets []string, row Row, schema optimizer.Schema, frame
 // evalStoredRoutineFuncCall resolves and executes user-defined
 // routines (M0015 Stage A runtime path) when a call is not one of
 // the built-ins handled directly in expr.go.
-func evalStoredRoutineFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
+func evalStoredRoutineFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
 	if x.Star {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("function %s does not exist", x.Name)}
 	}
 	args := make([]Datum, len(x.Args))
 	for i, a := range x.Args {
-		d, err := evalExpr(a, row, ctx)
+		d, err := evalExprSlot(a, slot, ctx)
 		if err != nil {
 			return Datum{}, err
 		}

@@ -13,7 +13,7 @@ import (
 func TestEvalPgClientEncoding(t *testing.T) {
 	// Default: no GetSetting → UTF8.
 	ctx := &Context{}
-	d, err := evalPgClientEncoding(nil, ctx)
+	d, err := evalPgClientEncoding(ctx)
 	if err != nil {
 		t.Fatalf("evalPgClientEncoding: %v", err)
 	}
@@ -30,7 +30,7 @@ func TestEvalPgClientEncoding(t *testing.T) {
 			return "", false
 		},
 	}
-	d, err = evalPgClientEncoding(nil, ctx2)
+	d, err = evalPgClientEncoding(ctx2)
 	if err != nil {
 		t.Fatalf("evalPgClientEncoding with GetSetting: %v", err)
 	}
@@ -39,7 +39,7 @@ func TestEvalPgClientEncoding(t *testing.T) {
 	}
 
 	// Nil context → UTF8 fallback.
-	d, err = evalPgClientEncoding(nil, nil)
+	d, err = evalPgClientEncoding(nil)
 	if err != nil {
 		t.Fatalf("evalPgClientEncoding nil ctx: %v", err)
 	}
@@ -58,7 +58,7 @@ func TestEvalGetDatabaseEncoding(t *testing.T) {
 		Catalog:         cat,
 		CurrentDatabase: "postgres",
 	}
-	d, err := evalGetDatabaseEncoding(nil, ctx)
+	d, err := evalGetDatabaseEncoding(ctx)
 	if err != nil {
 		t.Fatalf("evalGetDatabaseEncoding: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestEvalGetDatabaseEncoding(t *testing.T) {
 	cat.CreateDatabase("mydb", 10) // owner = bootstrap superuser
 	cat.SetDatabaseEncoding("mydb", 8) // PG_LATIN1
 	ctx.CurrentDatabase = "mydb"
-	d, err = evalGetDatabaseEncoding(nil, ctx)
+	d, err = evalGetDatabaseEncoding(ctx)
 	if err != nil {
 		t.Fatalf("evalGetDatabaseEncoding LATIN1: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestEvalGetDatabaseEncoding(t *testing.T) {
 	}
 
 	// Nil context → UTF8 fallback.
-	d, err = evalGetDatabaseEncoding(nil, nil)
+	d, err = evalGetDatabaseEncoding(nil)
 	if err != nil {
 		t.Fatalf("evalGetDatabaseEncoding nil ctx: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestEvalGetDatabaseEncoding(t *testing.T) {
 		CurrentDatabase: "",
 	}
 	cat.SetDatabaseEncoding("postgres", 6)
-	d, err = evalGetDatabaseEncoding(nil, ctx2)
+	d, err = evalGetDatabaseEncoding(ctx2)
 	if err != nil {
 		t.Fatalf("evalGetDatabaseEncoding empty db: %v", err)
 	}
