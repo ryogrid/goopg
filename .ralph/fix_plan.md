@@ -6940,6 +6940,24 @@ listed `select.sql`, `delete.sql` and `sysviews.sql` already carry CSV status
 - [ ] **M0134-0073 — tidrangescan.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
       **Bucket B landed 2026-08-22** (design `docs/design/m0134-0073-ctid-function-arg-eval.md`). Sized at HEAD: 590 diff lines / 7 hunks / 0 `^+ERROR` / 0 `^-ERROR`, deterministic, four buckets. The dominant bucket (B, ~420 lines) was a CONTAINED correctness bug: ctid lives only on the scan slot (`MaterializedSlot.hasCTID/ctidBlock/ctidOff`, `slot.go:60-65`), not the `Row []Datum`, so `evalExprSlot`'s `FuncCall` case (`expr.go:1186`) reduced the slot to a bare Row via `slotToRow`, and any builtin re-evaluating an arg via `evalExpr(x.Args[i], row, ctx)` (`evalSubstr`, inline `"length"`, …) hit the `*CTIDExpr` case (`expr.go:480-495`) under a `rowSlotView` and fell through to `NullDatum` — `DELETE … WHERE substring(ctid::text FROM …)::integer > 2` deleted 0 rows where PG prunes all but two. Fix (fork c, over a rejected ambient-ctx side-channel and a deferred resjunk-Row fork b): thread `SlotView` through `evalFuncCall` + its 25-handler family, re-evaluating args via `evalExprSlot(x.Args[i], slot, ctx)` (297 sites); the compiled twin (`exprnode.go` ExprAdapter) delegates to `evalExprSlot` so one fix covers both evaluators. Result **590 → 254 diff lines** (Bucket B collapsed; `ctid < '(1,0)'` returns 10 rows not 58). New test `internal/executor/ctid_function_arg_test.go` (regression-verified: reverse-applied → FAILS, re-applied → PASS); live-oracle byte-identical. CSV row stays `failed`/`pass_required=no`; no `make regen-testport`. Remaining buckets (ledgered 2026-08-22, M0134-0073): Bucket A (no TidRangeScan node — REFACTOR, own milestone), Bucket C (outer-ctid across subquery/LATERAL → self-comparison — REFACTOR, seeds the `0129-0003` resjunk-ctid path), Bucket D (SCROLL `FETCH FIRST/LAST` aliased to NEXT/PRIOR — contained but gated on B's pruned layout), plus the latent ctid-drop in the other 9 `slotToRow` sites and the xmin/xmax system-column gap. **Re-arm trigger:** Bucket D is the next contained slice once B's data layout is re-measured; A and C are their own milestone-scale tasks.
 - [ ] **M0134-0074 — tidscan.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
+      **Bucket E landed 2026-08-22** (`WHERE CURRENT OF` → full-table UPDATE/DELETE, design
+      `docs/design/m0134-0074-current-of-tid-resolution.md`): the parser captured
+      `stmt.CurrentOf` but the optimizer never copied it, so `UPDATE/DELETE … WHERE CURRENT OF c`
+      swept the whole table and the past-end case ran another full update instead of erroring.
+      Resolved in the postmaster at dispatch time (where `connTx.Cursors` lives — the executor
+      has zero cursor access): `cursorEntry` gained `AtEnd bool` + `TIDs []storage.ItemPointer`,
+      `materializeCursor` captures per-row tids via a new `TupleSlot.TID()` accessor (which also
+      surfaced and fixed a fast-path `projectOpNext` ctid-propagation sibling gap vs the
+      interpreted twin), FETCH arms set/clear `AtEnd`, and `resolveCurrentOf` substitutes a
+      concrete `ctid = '(block,off)'` equality flowing through the existing ctid-string-equality
+      path (no optimizer/executor logic change); 34000 `cursor "%s" does not exist` / 24000
+      `cursor "%s" is not positioned on a row`, and CURRENT OF statements bypass the plan cache.
+      Diff **301 → 279 lines / 8 → 9 hunks**; the destructive UPDATE/DELETE now updates exactly
+      the cursor's row (`actual rows=1.00`, `SELECT *` → `1/-2/-3`) and the past-end case raises
+      24000. Remaining buckets ledgered 2026-08-22: **A** (no `Tid Scan` node — REFACTOR, shared
+      with 0073 Bucket A), **D** (ctid self-join 0 rows — first-class tid Datum), **B/C**
+      (tid[] deparser + `::tid` cast), **F** (SERIALIZABLE SIReadLock), **h6** (FETCH BACKWARD
+      off-by-one), plus the materialized-tid-vs-re-resolve fidelity gap.
 - [ ] **M0134-0075 — timestamp.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
 - [ ] **M0134-0076 — timestamptz.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
 - [ ] **M0134-0077 — transactions.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
