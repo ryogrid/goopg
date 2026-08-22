@@ -6959,6 +6959,40 @@ listed `select.sql`, `delete.sql` and `sysviews.sql` already carry CSV status
       (tid[] deparser + `::tid` cast), **F** (SERIALIZABLE SIReadLock), **h6** (FETCH BACKWARD
       off-by-one), plus the materialized-tid-vs-re-resolve fidelity gap.
 - [ ] **M0134-0075 — timestamp.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
+      **Bucket D1 landed 2026-08-22** (`RESET` restores the session-start GUC value, design
+      `docs/design/m0134-0075-guc-reset-session-start-value.md`): sized at HEAD
+      (`scripts/pg-regress-runner.sh --verbose timestamp`) at 2493 diff lines / 8 hunks /
+      90 `^+ERROR` / 23 `^-ERROR`, no crash. D1 was the highest-leverage CONTAINED fix:
+      `RESET datestyle` restored the compiled `BootVal` (`ISO, MDY`) instead of the
+      session-start value (`Postgres, MDY`, from `PGDATESTYLE` via the startup packet),
+      so every surviving column SELECT after `timestamp.sql:93` rendered ISO instead of
+      Postgres style. Root cause: `SessionRegistry.Reset`
+      (`internal/utils/misc/session.go:217`) deleted the session override outright,
+      exposing the global `Variable.Value`; the startup-packet GUC loop
+      (`server.go:1214-1226`) used the same `Set` a client SET uses, so nothing recorded
+      the session-start value. Fix mirrors PG's `reset_val` (`guc.c:3308-3309,3679,3727`
+      — RESET restores `reset_val` not `boot_val`; `reset_val` updated only for
+      `source <= PGC_S_OVERRIDE`, startup packet = `PGC_S_CLIENT` at `postinit.c:1298`):
+      a third per-session `startup` map, a new `SetStartup` writer (writes session AND
+      startup), and `Reset` restores `startup[key]` when present (else falls through to
+      the global default as before); both `server.go` startup call sites swapped to
+      `SetStartup`. Diff **2493 → 2467 lines (−26, ~13 Postgres-vs-ISO pairs)** — the
+      predicted whole-block collapse did NOT materialise (the `@@ -696,1382` block is
+      dominated by out-of-scope buckets, not the rendering baseline); the fix is
+      nonetheless verified by a wire probe (PGDATESTYLE=Postgres,MDY → `set datestyle to
+      ymd` → `reset` → `Postgres, MDY`; no PGDATESTYLE → `reset` → `ISO, MDY` global
+      fall-through). Guard `TestSessionResetRestoresStartupValue`
+      (`internal/utils/misc/guc_test.go`, 2 cases, FAIL-pre/PASS-post). Remaining buckets
+      ledgered 2026-08-22: **D2** (function-result timestamps bypass DateStyle —
+      `exprType` FuncCall arm returns "unknown" for date_trunc/date_bin/make_timestamp/
+      age/generate_series + `date_part` hardcoded int8 vs PG float8), **E** (`evalDateBin`
+      day-only), **E2** (`evalDateTrunc` invalid-unit silent), **F**
+      (`extractTimestampField` missing msec/usec/julian), **H** (`evalMakeTimestamp` drops
+      micros), **I** (`generate_series(timestamp,...)` 1 row), **J** (`age` infinity), **K**
+      (`pg_input_is_valid` stubs), **A** (input literal parser — ISO-only layouts), **B**
+      (int64-ns carrier vs PG int64-us, REFACTOR), **G** (`to_char`, REFACTOR ~35%), **M**
+      (IntervalStyle, REFACTOR, ledger 1680), **O** (`interval * 2`, ledger 1679). CSV row
+      stays `failed`/`pass_required=no`; no `make regen-testport`.
 - [ ] **M0134-0076 — timestamptz.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
 - [ ] **M0134-0077 — transactions.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
 - [ ] **M0134-0078 — triggers.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
