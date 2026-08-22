@@ -15047,7 +15047,7 @@ func padLeft(s string, n int, fill string) string {
 		return string(runes[:n])
 	}
 	if fill == "" {
-		fill = " "
+		return s
 	}
 	fillRunes := []rune(fill)
 	var buf []rune
@@ -15075,7 +15075,7 @@ func padRight(s string, n int, fill string) string {
 		return string(runes[:n])
 	}
 	if fill == "" {
-		fill = " "
+		return s
 	}
 	fillRunes := []rune(fill)
 	result := make([]rune, len(runes), n)
