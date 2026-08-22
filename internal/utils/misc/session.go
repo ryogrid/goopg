@@ -25,6 +25,14 @@ type SessionRegistry struct {
 	id      uint64            // stable, process-unique per-session identity (see UniqueID)
 	session map[string]string // session-scoped values, canonicalised
 	local   map[string]string // transaction-scoped values, canonicalised
+	// startup is the per-session RESET target (PG's reset_val): the value the
+	// connection supplied at session start (startup packet / environment, PG's
+	// PGC_S_CLIENT source). SetStartup is its only writer; Reset restores it
+	// when present instead of falling through to the global default. Mirrors
+	// guc.c's RESET restoring reset_val rather than boot_val
+	// (postgres/src/backend/utils/misc/guc.c:3308-3309, :3727). Design
+	// 0134-0075-guc-reset-session-start-value.
+	startup map[string]string
 	custom  map[string]*Variable
 	inTx    bool
 
@@ -51,6 +59,7 @@ func NewSessionRegistry(global *Registry) *SessionRegistry {
 		id:      sessionIDCounter.Add(1),
 		session: map[string]string{},
 		local:   map[string]string{},
+		startup: map[string]string{},
 		custom:  map[string]*Variable{},
 		txPrior: map[string]*string{},
 	}
@@ -121,9 +130,15 @@ func (s *SessionRegistry) AllDisplay() []ReportableValue {
 // Set applies SET name = value (or SET LOCAL ...). Returns an error if
 // the variable doesn't exist, the value fails validation, or the
 // variable's Context forbids SQL-driven changes.
+//
+// NOTE: a user SET must NOT write the startup map (the session-start RESET
+// target, PG's reset_val) — that is SetStartup's job. A session override must
+// never become the value RESET restores; the reciprocal note lives at
+// SetStartup so the pair cannot drift.
 func (s *SessionRegistry) Set(name, value string, isLocal bool) error {
-	// SET x TO DEFAULT / SET x = DEFAULT resets to the boot value.
-	// Treat "DEFAULT" (case-insensitive) the same as RESET.
+	// SET x TO DEFAULT / SET x = DEFAULT resets the same way RESET does —
+	// restoring the session-start (startup) value when one exists, else the
+	// boot value. Treat "DEFAULT" (case-insensitive) the same as RESET.
 	if strings.EqualFold(value, "DEFAULT") {
 		return s.Reset(name)
 	}
@@ -181,6 +196,54 @@ func (s *SessionRegistry) Set(name, value string, isLocal bool) error {
 	return nil
 }
 
+// SetStartup records the value the connection supplied at session start — the
+// startup-packet / environment value (PG's PGC_S_CLIENT source) — as BOTH the
+// session-layer value AND the per-session RESET target (PG's reset_val). It is
+// the ONLY writer of the startup map; user SET must NOT touch it (the
+// reciprocal note lives at Set, so the pair cannot drift). At session start
+// there is no transaction and no local layer, so there is deliberately no local
+// branch here and the global Variable.Value is never mutated — the session
+// layer simply shadows it, and Reset later restores it rather than exposing the
+// global default.
+func (s *SessionRegistry) SetStartup(name, value string) error {
+	v, ok := s.lookupVariable(name)
+	if !ok {
+		if !IsCustomGUCName(name) {
+			return fmt.Errorf("unrecognized configuration parameter %q", name)
+		}
+		v = NewVariable(Variable{
+			Name:    name,
+			Type:    TypeString,
+			BootVal: "",
+			Context: ContextUserset,
+			Scope:   ScopeSession | ScopeTransaction,
+			Flags:   FlagCustom | FlagDisallowInFile | FlagNotInSample,
+		})
+		s.custom[strings.ToLower(name)] = v
+	}
+	if v.Context < ContextSuset {
+		// Postmaster / SigHup / Internal contexts cannot be changed by the
+		// startup packet either — ProcessStartupPacket's GUC loop rejects
+		// them the same way a SQL SET does.
+		return fmt.Errorf("parameter %q cannot be changed now", v.Name)
+	}
+	_, current, _ := s.Get(name)
+	canon, err := v.canonicalizeFrom(current, value)
+	if err != nil {
+		return err
+	}
+	key := strings.ToLower(name)
+	s.session[key] = canon
+	s.startup[key] = canon
+	if v.Flags&FlagReport != 0 && s.onReportableChange != nil {
+		_, eff, _ := s.Get(name)
+		s.onReportableChange(v.Name, eff)
+	}
+	_, eff, _ := s.Get(name)
+	s.global.invokeOnChange(v.Name, eff)
+	return nil
+}
+
 // SetInternal writes a ContextInternal variable's session-layer value
 // (e.g. "is_superuser") — the class of GUC_REPORT variable upstream
 // only ever assigns from backend C code, never from a client SET
@@ -212,8 +275,10 @@ func (s *SessionRegistry) SetInternal(name, value string) error {
 	return nil
 }
 
-// Reset drops session and transaction overrides for the named variable
-// so it falls through to the global value.
+// Reset drops session and transaction overrides for the named variable.
+// If the connection supplied a startup value for it (SetStartup), that
+// value is restored (PG's reset_val semantics); otherwise the variable
+// falls through to the global value exactly as before.
 func (s *SessionRegistry) Reset(name string) error {
 	v, ok := s.lookupVariable(name)
 	if !ok {
@@ -221,14 +286,25 @@ func (s *SessionRegistry) Reset(name string) error {
 	}
 	key := strings.ToLower(name)
 	s.snapshotPrior(key)
-	delete(s.session, key)
 	delete(s.local, key)
-	if v.Flags&FlagReport != 0 && s.onReportableChange != nil {
-		s.onReportableChange(v.Name, v.Value)
+	if startup, ok := s.startup[key]; ok {
+		// Restore the session-start value (PG's reset_val) rather than
+		// exposing the global default — mirrors guc.c's RESET restoring
+		// reset_val, not boot_val (postgres/src/backend/utils/misc/guc.c:3727,
+		// doc at :3308-3309).
+		s.session[key] = startup
+	} else {
+		delete(s.session, key)
 	}
-	// M0054-0006e-followup: invoke the process-global change
-	// callback for the post-Reset value (which is the global default).
-	s.global.invokeOnChange(v.Name, v.Value)
+	if v.Flags&FlagReport != 0 && s.onReportableChange != nil {
+		_, eff, _ := s.Get(name)
+		s.onReportableChange(v.Name, eff)
+	}
+	// M0054-0006e-followup: invoke the process-global change callback for
+	// the post-Reset effective value (the startup value when one exists,
+	// else the global default).
+	_, eff, _ := s.Get(name)
+	s.global.invokeOnChange(v.Name, eff)
 	return nil
 }
 
