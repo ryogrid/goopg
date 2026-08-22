@@ -154,6 +154,31 @@ func (o *transactionOp) execCommit() error {
 			return err
 		}
 	}
+	// M0134-0072: ON COMMIT {DELETE ROWS|DROP} pass for temp tables. Mirrors
+	// xact.c PreCommit_on_commit_actions (:2311), which runs BEFORE the SSI
+	// pre-commit check (:2339) and RecordTransactionCommit (:2365). A failure
+	// (e.g. the ON COMMIT FK 0A000) aborts the commit exactly like the deferred
+	// checks above. execRollback is a deliberate no-op for this pass — PG's
+	// AtAbort has no ON-COMMIT action, and stale registrations left by a
+	// rolled-back CREATE are skipped at the next commit (OIDs are monotonic).
+	if sess, isBas := o.ctx.Session.(*BasicSession); isBas {
+		if err := RunOnCommitActions(o.ctx, sess); err != nil {
+			// A failed COMMIT aborts the transaction exactly like a ROLLBACK
+			// (PG's AbortTransaction runs on COMMIT failure too), so DDL
+			// creates made in the block — including the temp tables whose ON
+			// COMMIT action just failed — must be undone BEFORE
+			// TxnMgr.Rollback (ProcessRollbackUndos needs the catalog entries
+			// live to find them). Without this the tables persist with a stale
+			// ON COMMIT registration and a later commit fires the same FK
+			// error again (temp.sql's temptest3/temptest4 case). M0134-0072.
+			ProcessRollbackUndos(o.ctx, sess)
+			_ = o.ctx.TxnMgr.Rollback(tx)
+			o.ctx.Session.EndExplicitTransaction()
+			undoEnumDDLFromContext(o.ctx)
+			o.clearCtxTransaction()
+			return err
+		}
+	}
 	// M0104-0007: SSI pre-commit dangerous-structure check for SERIALIZABLE.
 	// Runs BEFORE TxnMgr.Commit so a detected rw-cycle can be translated to
 	// SQLSTATE 40001 and rolled back here without burning a commit record.
@@ -231,6 +256,14 @@ func (o *transactionOp) execRollback() error {
 		// PostgreSQL returns a warning for ROLLBACK outside tx block.
 		return nil
 	}
+	// ON COMMIT actions never fire on ROLLBACK: PG's AtAbort has no ON-COMMIT
+	// pass (only AtEOXact_on_commit_actions prunes entries in the abort case,
+	// tablecmds.c:19427). goopg deliberately leaves the per-session
+	// registrations untouched here — a stale entry left by a rolled-back CREATE
+	// is skipped at the next commit because the relation no longer exists (OIDs
+	// are monotonic and never reused), and an entry from an earlier committed
+	// transaction must keep firing (a DELETE ROWS table fires at every commit).
+	// M0134-0072.
 	// Undo any DDL creates that happened in this transaction before
 	// marking the transaction as aborted.  Must happen BEFORE
 	// TxnMgr.Rollback so the catalog DropTable/DropIndex can still

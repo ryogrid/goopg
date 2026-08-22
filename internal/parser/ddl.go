@@ -3049,10 +3049,36 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				break
 			}
 		}
-		if ok && p.acceptSymbol(")") && p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAs {
-			// Confirmed CTAS column-alias list: keep the aliases and let the
-			// AS check below consume and process the CREATE TABLE AS body.
-			stmt.ColumnAliases = aliasCandidate
+		if ok && p.acceptSymbol(")") {
+			// Optional ON COMMIT clause may sit between the alias list and AS
+			// (gram.y: create_as_target: qualified_name opt_column_list OptOnCommit
+			// OPT_TABLESPACE). Capture it into a local so a failed disambiguation
+			// (AS not following) restores the token index without leaving a stale
+			// OnCommit behind. M0134-0072.
+			var onCommit string
+			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwOn {
+				p.advance()
+				if p.acceptKeyword(KwCommit) {
+					if p.acceptIdentKeyword("preserve") {
+						_ = p.acceptIdentKeyword("rows")
+					} else if p.acceptKeyword(KwDelete) {
+						_ = p.acceptIdentKeyword("rows")
+						onCommit = OnCommitDeleteRows
+					} else if p.acceptKeyword(KwDrop) {
+						onCommit = OnCommitDrop
+					}
+				}
+			}
+			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAs {
+				// Confirmed CTAS column-alias list: keep the aliases and let the
+				// AS check below consume and process the CREATE TABLE AS body.
+				stmt.ColumnAliases = aliasCandidate
+				stmt.OnCommit = onCommit
+			} else {
+				// Not a CTAS alias list: restore and let regular column-def
+				// parsing handle the '(' (which may be empty `()` or real defs).
+				p.idx = savedIdx
+			}
 		} else {
 			// Not a CTAS alias list: restore and let regular column-def
 			// parsing handle the '(' (which may be empty `()` or real defs).
@@ -3457,11 +3483,19 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 			}
 		}
 		// ON COMMIT clause may follow FOR VALUES ... in partition tables.
+		// Capture the action (M0134-0072), the sibling of the plain CREATE TABLE
+		// arm; PRESERVE ROWS stays "" (default no-op).
 		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwOn {
 			p.advance()
 			if p.acceptKeyword(KwCommit) {
-				_ = p.acceptIdentKeyword("preserve") || p.acceptKeyword(KwDelete)
-				_ = p.acceptIdentKeyword("rows") || p.acceptKeyword(KwDrop)
+				if p.acceptIdentKeyword("preserve") {
+					_ = p.acceptIdentKeyword("rows")
+				} else if p.acceptKeyword(KwDelete) {
+					_ = p.acceptIdentKeyword("rows")
+					stmt.OnCommit = OnCommitDeleteRows
+				} else if p.acceptKeyword(KwDrop) {
+					stmt.OnCommit = OnCommitDrop
+				}
 			}
 		}
 		// Optional TABLESPACE clause on a partition child, e.g.
@@ -3750,11 +3784,21 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 		stmt.Tablespace = identText(tsTok)
 	}
 	// ON COMMIT { PRESERVE ROWS | DELETE ROWS | DROP } for temp tables.
+	// Capture the action (M0134-0072) instead of discarding it; the executor
+	// rejects a non-temp ON COMMIT (42P16) and registers the action to run at
+	// transaction commit. PRESERVE ROWS (and the absent clause) stay "" — the
+	// default no-op, mirroring gram.y's OnCommitOption.
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwOn {
 		p.advance()
 		if p.acceptKeyword(KwCommit) {
-			_ = p.acceptIdentKeyword("preserve") || p.acceptKeyword(KwDelete)
-			_ = p.acceptIdentKeyword("rows") || p.acceptKeyword(KwDrop)
+			if p.acceptIdentKeyword("preserve") {
+				_ = p.acceptIdentKeyword("rows")
+			} else if p.acceptKeyword(KwDelete) {
+				_ = p.acceptIdentKeyword("rows")
+				stmt.OnCommit = OnCommitDeleteRows
+			} else if p.acceptKeyword(KwDrop) {
+				stmt.OnCommit = OnCommitDrop
+			}
 		}
 	}
 	return stmt, nil
@@ -4153,9 +4197,10 @@ func (p *parser) parseTableConstraintElement(stmt *CreateTableStmt) (bool, error
 	return true, nil
 }
 
-// consumeCreateTableSuffix skips INHERITS, PARTITION BY, WITH, and TABLESPACE
-// clauses after a column list that has already been closed with ')'.
-// Used when the column list is empty. M0096-0009.
+// consumeCreateTableSuffix skips INHERITS, PARTITION BY, WITH, TABLESPACE, and
+// ON COMMIT clauses after a column list that has already been closed with ')'.
+// Used when the column list is empty (M0096-0009) and for typed-table OF. The
+// ON COMMIT action is captured, not discarded (M0134-0072).
 func (p *parser) consumeCreateTableSuffix(stmt *CreateTableStmt) {
 	for {
 		switch {
@@ -4200,12 +4245,23 @@ func (p *parser) consumeCreateTableSuffix(stmt *CreateTableStmt) {
 			}
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwOn:
 			// ON COMMIT { PRESERVE ROWS | DELETE ROWS | DROP } — temp table option.
+			// Capture the action (M0134-0072) instead of discarding it; the
+			// executor registers it to run at transaction commit (mirroring
+			// gram.y's OnCommitOption). PRESERVE ROWS stays "" (default no-op).
+			// This path serves the empty-column-list `() INHERITS(...) ON COMMIT`
+			// form (plain arm's :3561) and the typed-table OF form (:3171).
 			p.advance()
 			if !p.acceptKeyword(KwCommit) {
 				return
 			}
-			_ = p.acceptIdentKeyword("preserve") || p.acceptKeyword(KwDelete)
-			_ = p.acceptIdentKeyword("rows") || p.acceptKeyword(KwDrop)
+			if p.acceptIdentKeyword("preserve") {
+				_ = p.acceptIdentKeyword("rows")
+			} else if p.acceptKeyword(KwDelete) {
+				_ = p.acceptIdentKeyword("rows")
+				stmt.OnCommit = OnCommitDeleteRows
+			} else if p.acceptKeyword(KwDrop) {
+				stmt.OnCommit = OnCommitDrop
+			}
 		default:
 			return
 		}

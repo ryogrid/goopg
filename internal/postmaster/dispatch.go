@@ -342,6 +342,16 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 			// below for why this must never reach connTx).
 			ectx.Session = executor.NewAutocommitUndoSession()
 		}
+		// Seed the statement session's ON COMMIT {DELETE ROWS|DROP}
+		// registrations from the connection's persisted list (written back at
+		// each statement end, writeBackConnTxState + below), so a registration
+		// made by an autocommit CREATE TEMP TABLE in an earlier message
+		// reaches the explicit COMMIT of a later one — PG keeps on_commits in
+		// backend-local CacheMemoryContext (tablecmds.c register_on_commit_
+		// action), session-scoped across transactions. M0134-0072.
+		if bs, ok := ectx.Session.(*executor.BasicSession); ok {
+			bs.SetOnCommitActions(connTx.OnCommitActions)
+		}
 		// Share the per-connection TEMP TABLE shadow map so it persists
 		// across statements in the same connection. M0097-0003.
 		ectx.TempTableShadows = connTx.TempTableShadows
@@ -584,6 +594,13 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 	ectx.OnRoleDropped = func(name string) {
 		_ = s.unregisterRole(name, true)
 		s.removeRoleCredential(name)
+	}
+	// ON COMMIT DROP at transaction COMMIT changes the catalog with no DDL
+	// statement to trip the per-statement invalidation below; runOnCommit
+	// calls this hook so a plan cached before the commit (referencing the
+	// dropped temp relation) is not reused. M0134-0072.
+	if s.pc != nil {
+		ectx.OnCommitDDL = s.pc.Invalidate
 	}
 	ectx.Promote = s.cfg.Promote
 	// Same registry the walsender's CREATE_REPLICATION_SLOT /
@@ -1232,6 +1249,16 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		// Write back the temp-table shadow map so it persists across statements. M0097-0003.
 		if connTx != nil && ectx.TempTableShadows != nil {
 			connTx.TempTableShadows = ectx.TempTableShadows
+		}
+		// Write back the session's ON COMMIT registrations so an autocommit
+		// CREATE TEMP TABLE ... ON COMMIT ... registration made in a
+		// message-scoped session survives to a later message's explicit
+		// COMMIT (seeded back into each ectx's Session at setup above).
+		// M0134-0072.
+		if connTx != nil {
+			if bs, ok := ectx.Session.(*executor.BasicSession); ok {
+				connTx.OnCommitActions = bs.OnCommitActions()
+			}
 		}
 		// Write back pending enum values/renames/creates (including nil after
 		// COMMIT/ROLLBACK) — but ONLY while an explicit transaction is open.

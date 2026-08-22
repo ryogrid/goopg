@@ -557,6 +557,17 @@ type Context struct {
 	// (root-0021; the recurring sibling-path trap). Set by dispatch.
 	OnRoleDropped func(name string)
 
+	// OnCommitDDL, when non-nil, notifies the server layer that the COMMIT
+	// transaction pass ran a catalog-changing DDL (an ON COMMIT DROP). The
+	// plan cache holds plans referencing the dropped temp relation (e.g. a
+	// SELECT cached before the commit), and without invalidation the cached
+	// plan keeps scanning the gone relation (0 rows) instead of the fresh
+	// plan erroring "relation does not exist" — PG drops via PreCommit_
+	// on_commit_actions (tablecmds.c:19394) issue relcache invalidation the
+	// same way a DROP TABLE statement does. The postmaster wires this to the
+	// plan cache's Invalidate(). M0134-0072.
+	OnCommitDDL func()
+
 	// Promote, when non-nil, is invoked by pg_promote() to trigger the
 	// standby-to-primary promotion sequence. nil means the server is not
 	// a standby (or pg_promote is not yet wired) — pg_promote() returns

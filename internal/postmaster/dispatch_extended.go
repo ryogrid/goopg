@@ -327,6 +327,14 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 		// what fires. M0132-S10.
 		ectx.Session = executor.NewAutocommitUndoSession()
 	}
+	// Seed the statement session's ON COMMIT {DELETE ROWS|DROP} registrations
+	// from the connection's persisted list (sibling of dispatch.go's seeding)
+	// so an autocommit CREATE TEMP TABLE ... ON COMMIT ... registration made
+	// by an earlier message reaches the explicit COMMIT of a later one.
+	// M0134-0072.
+	if bs, ok := ectx.Session.(*executor.BasicSession); ok {
+		bs.SetOnCommitActions(connTx.OnCommitActions)
+	}
 	// Wire session-authorization/role tracking so a SET SESSION AUTHORIZATION
 	// or SET ROLE that reaches the executor (rather than the fast-path
 	// switch in executeExtendedQuery) still updates connTx.NonSuperuserRole
@@ -412,6 +420,14 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 	ectx.AsyncCommit = sessionAsyncCommit(sess)
 	if s.applyLauncher != nil {
 		ectx.OnSubscriptionChange = s.applyLauncher.Wake
+	}
+	// ON COMMIT DROP at COMMIT changes the catalog with no DDL statement to
+	// trip the per-statement invalidation (sibling of the simple-query wiring
+	// in dispatch.go); runOnCommit calls this hook so a plan cached before the
+	// commit (referencing the dropped temp relation) is not reused.
+	// M0134-0072.
+	if s.pc != nil {
+		ectx.OnCommitDDL = s.pc.Invalidate
 	}
 	// Wire pg_cancel_backend(pid) here too (sibling of the simple-query path) so
 	// the SQL function works regardless of protocol. Depends only on the

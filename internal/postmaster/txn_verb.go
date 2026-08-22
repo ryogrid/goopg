@@ -199,6 +199,14 @@ func (s *Server) writeBackConnTxState(ctx *executor.Context, connTx *connTxState
 	if ctx.TempTableShadows != nil {
 		connTx.TempTableShadows = ctx.TempTableShadows
 	}
+	// Carry the session's ON COMMIT {DELETE ROWS|DROP} registrations across
+	// messages: an autocommit CREATE TEMP TABLE ... ON COMMIT ... runs in a
+	// message-scoped throwaway session (dispatch.go) whose registrations must
+	// survive to a later explicit COMMIT. Mirrors the TempTableShadows
+	// write-back above. M0134-0072.
+	if bs, ok := ctx.Session.(*executor.BasicSession); ok {
+		connTx.OnCommitActions = bs.OnCommitActions()
+	}
 	// Pending type-DDL undo state is written back ONLY while an explicit
 	// transaction is open — see dispatch.go's identical guard for why an
 	// autocommit statement must not leak its pending set onto the connection.
@@ -268,8 +276,18 @@ func (s *Server) applyTransactionVerb(ctx *executor.Context, connTx *connTxState
 			// the same message can no longer undo t1 via ProcessRollbackUndos
 			// (root-0024 residual: "compound batch still loses t1's undo entry").
 			var priorDDLCreates []executor.DDLUndoEntry
+			var priorOnCommit []executor.OnCommitAction
 			if bs, ok := ctx.Session.(*executor.BasicSession); ok && bs != nil {
 				priorDDLCreates = bs.TakePendingDDLCreates()
+				// Same transfer for ON COMMIT registrations: the throwaway
+				// autocommit session was seeded (dispatch.go) with the
+				// connection's persisted list — including a DELETE ROWS entry
+				// registered by an EARLIER message's autonomous CREATE TEMP
+				// TABLE — so a BEGIN that swaps it for connTx's fresh
+				// persistent session must carry the list across, or the later
+				// COMMIT sees zero actions (temp.sql's autonomous-ON-COMMIT
+				// case). M0134-0072.
+				priorOnCommit = bs.OnCommitActions()
 			}
 			connTx.Begin(ctx.Tx)
 			// connTx.Begin lazily creates the BasicSession; when BEGIN is the
@@ -283,6 +301,7 @@ func (s *Server) applyTransactionVerb(ctx *executor.Context, connTx *connTxState
 				for _, e := range priorDDLCreates {
 					sess.RecordDDLCreate(e)
 				}
+				sess.SetOnCommitActions(priorOnCommit)
 			}
 			// Propagate READ ONLY / READ WRITE mode from START TRANSACTION / BEGIN.
 			if connTx.Session() != nil {
@@ -357,6 +376,44 @@ func (s *Server) applyTransactionVerb(ctx *executor.Context, connTx *connTxState
 					return txnVerbOutcome{Handled: true, Err: &txnVerbError{Code: code, Msg: deferErr.Error()}}
 				}
 			}
+			// M0134-0072: ON COMMIT {DELETE ROWS|DROP} pass for temp tables
+			// (the simple-query dispatch bypasses transactionOp.execCommit, so
+			// the pass must be re-run here). Mirrors xact.c:2311
+			// (PreCommit_on_commit_actions), before the SSI check (:2339) and
+			// TxnMgr.Commit (:2365). A failure aborts the commit exactly like
+			// the deferred-check block above; ROLLBACK deliberately never fires
+			// ON COMMIT actions (PG's AtAbort has no pass).
+			if sess := connTx.Session(); sess != nil {
+				if ocErr := executor.RunOnCommitActions(ctx, sess); ocErr != nil {
+					// A failed COMMIT aborts the transaction exactly like a
+					// ROLLBACK (PG's AbortTransaction runs on COMMIT failure
+					// too), so the DDL creates made in the block — including
+					// the temp tables whose ON COMMIT action just failed —
+					// must be undone BEFORE TxnMgr.Rollback (ProcessRollback
+					// Undos needs the catalog entries live to find them).
+					// Without this, the tables persist with a stale ON COMMIT
+					// registration and a LATER commit fires the same FK error
+					// again (temp.sql's temptest3/temptest4 case). M0134-0072.
+					executor.ProcessRollbackUndos(ctx, sess)
+					_ = s.cfg.TxnMgr.Rollback(explicitTx)
+					s.endExplicitBlock(ctx, connTx, true)
+					code := errcodes.FeatureNotSupported
+					var ocFields []libpq.ErrorField
+					if ee, ok := ocErr.(*executor.ExecError); ok {
+						if ee.Code != "" {
+							code = errcodes.Code(ee.Code)
+						}
+						if ee.Detail != "" {
+							ocFields = append(ocFields, libpq.ErrorField{Code: libpq.FieldDetail, Value: ee.Detail})
+						}
+						if ee.Pos > 0 {
+							ocFields = append(ocFields, libpq.ErrorField{Code: libpq.FieldPosition, Value: strconv.Itoa(ee.Pos + 1)})
+						}
+						return txnVerbOutcome{Handled: true, Err: &txnVerbError{Code: code, Msg: ee.Message, Fields: ocFields}}
+					}
+					return txnVerbOutcome{Handled: true, Err: &txnVerbError{Code: code, Msg: ocErr.Error()}}
+				}
+			}
 			// M0104-0008: SSI pre-commit dangerous-structure check.
 			// The executor's transactionOp.execCommit invokes this for
 			// COMMIT routed through the executor; the simple-query
@@ -428,6 +485,11 @@ func (s *Server) applyTransactionVerb(ctx *executor.Context, connTx *connTxState
 			// Undo DDL creates, TRUNCATE page snapshots, and RESTART IDENTITY
 			// before TxnMgr.Rollback so catalog lookups still work.
 			if sess := connTx.Session(); sess != nil {
+				// ON COMMIT actions never fire on ROLLBACK (PG's AtAbort has no
+				// ON-COMMIT pass); the per-session registrations are deliberately
+				// left untouched — a stale entry left by a rolled-back CREATE is
+				// skipped at the next commit because the relation no longer
+				// exists (OIDs are monotonic and never reused). M0134-0072.
 				executor.ProcessRollbackUndos(ctx, sess)
 			}
 			_ = s.cfg.TxnMgr.Rollback(connTx.Tx())

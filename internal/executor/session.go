@@ -182,6 +182,14 @@ type SeqRestoreEntry struct {
 	DBOid   uint32 // owning database oid (M0122-0007 4e)
 }
 
+// OnCommitAction records one CREATE TEMP TABLE ... ON COMMIT {DELETE ROWS|DROP}
+// registration for the commit-time pass. Mirrors tablecmds.c OnCommitItem /
+// register_on_commit_action (M0134-0072).
+type OnCommitAction struct {
+	RelOID uint32 // the temp relation's catalog OID
+	Action string // parser.OnCommitDeleteRows or parser.OnCommitDrop
+}
+
 // BasicSession is a minimal Session implementation for the v0
 // executor path.
 type BasicSession struct {
@@ -211,6 +219,7 @@ type BasicSession struct {
 	statsSnapshot       *funcStatSnapshot          // per-txn cumulative-stats snapshot (M0118-0009 stats_fetch_consistency)
 	autocommitUndoScope bool                       // see NewAutocommitUndoSession / TracksDDLUndo (root-0024 residual, M0110-0001)
 	cmdCounter          CommandCounter             // per-transaction command counter (M0129-S8.3)
+	onCommitActions     []OnCommitAction           // ON COMMIT {DELETE ROWS|DROP} registrations (M0134-0072)
 }
 
 // NewBasicSession constructs an explicit-transaction session state
@@ -302,6 +311,50 @@ func (s *BasicSession) OnTopLevelXIDAssigned(xid storage.TransactionID) {
 	if s.tx.XID == storage.InvalidTransactionID {
 		s.tx.XID = xid
 	}
+}
+
+// RegisterOnCommitAction records the (relation, action) pair for the next
+// transaction commit. Only DELETE ROWS / DROP are ever registered — PRESERVE
+// ROWS and the no-clause default are collapsed to parser.OnCommitNone ("") in
+// the parser and never reach here. Mirrors register_on_commit_action,
+// tablecmds.c:19261. M0134-0072.
+func (s *BasicSession) RegisterOnCommitAction(relOID uint32, action string) {
+	s.onCommitActions = append(s.onCommitActions, OnCommitAction{RelOID: relOID, Action: action})
+}
+
+// RemoveOnCommitAction drops a relation's ON COMMIT entry. Called when the temp
+// relation itself is dropped so a dropped table's entry stops firing at the
+// next commit. Mirrors remove_on_commit_action, which heap_drop_with_catalog
+// invokes (tablecmds.c:19297, catalog/heap.c:1902). M0134-0072.
+func (s *BasicSession) RemoveOnCommitAction(relOID uint32) {
+	for i := range s.onCommitActions {
+		if s.onCommitActions[i].RelOID == relOID {
+			s.onCommitActions = append(s.onCommitActions[:i], s.onCommitActions[i+1:]...)
+			return
+		}
+	}
+}
+
+// SetOnCommitActions replaces the session's ON COMMIT registration list.
+// Used by the dispatch layer to seed a message-scoped session from the
+// connection's persisted list (connTx.OnCommitActions), so an autocommit
+// CREATE TEMP TABLE ... ON COMMIT registration survives into the next
+// message's explicit COMMIT — PG's on_commits lives in backend-local
+// CacheMemoryContext (tablecmds.c register_on_commit_action), session-scoped
+// across transactions. M0134-0072.
+func (s *BasicSession) SetOnCommitActions(actions []OnCommitAction) {
+	s.onCommitActions = actions
+}
+
+// OnCommitActions returns the current ON COMMIT registration list. The commit
+// pass iterates it; PG's PreCommit_on_commit_actions reads the same per-session
+// state. Entries persist across commits (a DELETE ROWS table fires at every
+// commit until dropped); a ROLLBACK deliberately leaves the list untouched —
+// AtAbort has no ON-COMMIT pass, and a stale entry for a table undone by
+// ROLLBACK is harmless because OIDs are monotonic and the pass skips missing
+// relations. M0134-0072.
+func (s *BasicSession) OnCommitActions() []OnCommitAction {
+	return s.onCommitActions
 }
 
 func (s *BasicSession) EndExplicitTransaction() {
