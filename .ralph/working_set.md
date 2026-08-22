@@ -1,48 +1,42 @@
 Task: M0134-0070 (strings.sql) — regress-sql `failed`. This loop landed the
-sha-digests bucket: sha224/sha384 added + sha256/sha512 fixed to return bytea.
-Code commit `4109aea4` (+ this bookkeeping commit), both pushed.
+bytea↔intN casts bucket — the last CONTAINED bucket from the sizing pass.
+Code commit `c262a3ea` (+ bookkeeping), both pushed.
 
-Landed: `internal/executor/expr.go` `evalFuncCall` now has FOUR sha arms
-(`sha224`=`crypto/sha256.Sum224`, `sha256`=`.Sum256`, `sha384`=
-`crypto/sha512.Sum384`, `sha512`=`.Sum512`), each returning `NewBytesDatum(h[:])`
-(KindBytes) instead of hex TEXT; input mirrors the sibling `crc32` arm
-(`BytesValue()` + `byteaIn` fallback for non-bytea Kind). `exprType`
-(`internal/optimizer/planner.go`) gained `case "sha224","sha256","sha384",
-"sha512" -> bytea` (mandatory — the builtin pg_proc seed does not feed
-`ReturnType`). `isKnownBuiltinFunction` (`internal/executor/operators_call.go`)
-gained sha224/sha384/sha512. New `internal/executor/sha_test.go` (8 subtests).
-`strings.sql` diff shrank 691→599 lines, grep-confirmed zero residual sha
-divergence. sha224/sha384 were already catalogued (OID 3419-3422) — only the
-executor switch arms were missing.
+Landed: all six explicit int2/int4/int8 ↔ bytea casts now byte-exact.
+Forward `intN_bytea` via an `evalCastTyped` intercept keyed on the already-
+stamped `CastExpr.SourceType` (NOT a new mechanism as the prior loop assumed —
+`plan.go:540-546`, set `planner.go:13662`, preserved by fold/remap/shift).
+Reverse `bytea_intN` via new `case KindBytes:` in the int2/int4/int8 arms of
+`evalCast` + shared `byteaToIntN`/`byteaIntSourceWidth`. No parser/planner/
+catalog/fold change needed. New `internal/executor/bytea_int_cast_test.go`
+(27 subtests). `strings.sql` diff shrank 599→451 lines.
 
-Key symbols: `internal/executor/expr.go` `evalFuncCall` (~10597 sha arms);
-`internal/optimizer/planner.go` `exprType` (~12587 sha→bytea case);
-`internal/executor/operators_call.go` `isKnownBuiltinFunction` (~753).
+Key symbols: `internal/executor/expr.go` `evalCastTyped` (~3959, forward
+intercept), `evalCast` int2/int4/int8 arms (~4214/4247/4285, KindBytes arms),
+`byteaToIntN`/`byteaIntSourceWidth` helpers.
 
-Hypothesis/Findings: the sha bucket was fully CONTAINED (3 files + 1 test, zero
-catalog changes). Deferred (ledger 2026-08-22): the adjacent pgcrypto `digest()`
-arm still returns hex TEXT not bytea — same class, out of strings.sql scope.
+Hypothesis/Findings: the "new width-disambiguation mechanism" the prior loop
+anticipated was UNNECESSARY — `CastExpr.SourceType` already carries the source
+type. Deferred (ledger 2026-08-22): (1) `typename(expr)` functional-cast syntax
+`bytea(int4_col)`; (2) `coerceExecParam` EXECUTE-param bytea arm; (3) bare
+`5::bytea` int8-vs-int4 literal-typing quirk.
 
-Next step: continue M0134-0070. The last CONTAINED bucket is bytea↔intN casts
-(int2/int4/int8 ↔ bytea, ~138 lines at the prior sizing). It needs a NEW
-width-disambiguation mechanism on CastExpr (bytea casts don't carry
-source-int-width) — same `ArgWidth` plan-stamp precedent as the to_hex/to_bin/
-to_oct work (internal/optimizer/plan.go `FuncCall.ArgWidth` + a `resolveExpr`
-intercept). Bigger lift than sha; size it via researcher first (does the regress
-fixture distinguish int2/int4/int8 source widths? what does PG's bytea↔int cast
-set look like in pg_cast/pg_proc?). REFACTOR-tier buckets (do NOT brief as one
-round): `standard_conforming_strings=off` lexing + escape_string_warning warning
-path (ledger-rowed), ascii()/bit_count() psql-column-width wire-trace
-(ledger-tracked), the deferred digest() hex-vs-bytea.
+Next step: re-measure/triage the 451-line `strings.sql` diff (delegate to
+researcher) to enumerate the remaining buckets. Expected remaining: the deferred
+`ascii()`/`bit_count()` psql-column-width wire-trace (needs a dedicated
+wire-trace slice), `standard_conforming_strings=off` lexing +
+`escape_string_warning` warning path (REFACTOR-tier, ledgered), residual
+Unicode-escape error-message/DETAIL mismatches, deferred pgcrypto `digest()`
+hex-vs-bytea. Pick the next contained fix.
 
-Gates run this loop: `go build ./...` PASS; `go test ./internal/executor/
--run TestSha -v` PASS (8/8); `go test ./internal/executor/ ./internal/optimizer/`
-PASS; `scripts/pg-regress-runner.sh --verbose strings` 691→599 lines; pre-commit
-pgbench smoke PASS (381/704/13144 TPS, 0 failed) via git hook. `make
-ralph-state-guard` — to run before status block.
+Gates run this loop: `go build ./...` PASS; `go test ./internal/executor/ -run
+TestByteaIntCast -v` PASS (27/27); `go test ./internal/executor/
+./internal/optimizer/` PASS; `scripts/pg-regress-runner.sh --verbose strings`
+599→451 lines; pre-commit pgbench smoke PASS (379/693/12883 TPS, 0 failed) via
+git hook. `make ralph-state-guard` — to run before status block.
 
-Delegation: researcher (m0134-0070-sha-digests sizing) DONE; implementer
-(m0134-0070-sha-digests, Round 1) DONE — all four gates PASS, tree left
-uncommitted and committed by coordinator as `4109aea4`.
+Delegation: researcher (m0134-0070-bytea-int-casts sizing) DONE; implementer
+(m0134-0070-bytea-int-casts, Round 1) DONE — all gates PASS, committed as
+`c262a3ea`.
 
 In-flight: none.
