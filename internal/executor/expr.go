@@ -5098,6 +5098,14 @@ func relationFileNodeForOID(cat *catalog.InMemory, oid uint32) (storage.RelFileN
 	if idx, ok := cat.LookupIndexByOID(oid); ok {
 		return cat.IndexRelFileNode(idx), true
 	}
+	// A synthetic TOAST relation OID (parent OID + 100M) has no table/index
+	// registry entry — its pg_class row is virtual-only — so resolve it through
+	// the catalog helper instead. pg_relation_size(reltoastrelid) then sizes the
+	// live toast heap; mirrors PG, where reltoastrelid is a real relkind='t'
+	// relation (dbsize.c:371-381). M0134-0070.
+	if toastRel, ok := cat.ToastRelFileNodeByOID(oid); ok {
+		return toastRel, true
+	}
 	return storage.RelFileNode{}, false
 }
 

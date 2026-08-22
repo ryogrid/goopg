@@ -1270,6 +1270,27 @@ func (c *InMemory) ToastRelFileNode(parentRel storage.RelFileNode) (storage.RelF
 	return toast, true
 }
 
+// ToastRelFileNodeByOID resolves a synthetic TOAST relation OID (parent OID +
+// toastRelidOffset, the range [100M, 200M)) to its main-fork RelFileNode, so
+// pg_relation_size(reltoastrelid) can size the live toast heap. Returns false
+// for the TOAST index range [200M, 300M) (which must NOT be routed through
+// ToastRelFileNode — that returns the toast *relation* relid, the wrong file;
+// goopg materializes no physical toast index) and for non-TOAST OIDs. Mirrors
+// PG, where reltoastrelid is a real relkind='t' relation that try_relation_open
+// opens (postgres/src/backend/utils/adt/dbsize.c:371-381) and
+// calculate_relation_size (dbsize.c:326) sizes. M0134-0070 (design
+// m0134-0070-toast-pg-relation-size.md).
+func (c *InMemory) ToastRelFileNodeByOID(toastRelOID uint32) (storage.RelFileNode, bool) {
+	if toastRelOID < toastRelidOffset || toastRelOID >= toastIndexOidOffset {
+		return storage.RelFileNode{}, false
+	}
+	parent, ok := c.ToastParentTable(toastRelOID)
+	if !ok {
+		return storage.RelFileNode{}, false
+	}
+	return c.ToastRelFileNode(c.RelFileNode(parent))
+}
+
 // toastBearingTables returns every relation in dbOid's namespace that owns an
 // auto-exposed TOAST relation, under the SAME visibility filter the pg_class
 // virtual builder applies to its main table loop (non-virtual ordinary tables
