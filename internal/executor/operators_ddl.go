@@ -15963,8 +15963,22 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 			return &ExecError{Code: "42P13", Pos: s.Pos(), Message: "CREATE FUNCTION requires a LANGUAGE clause"}
 		}
 	}
-	if lang != "plpgsql" && lang != "sql" && lang != "c" {
+	if lang != "plpgsql" && lang != "sql" && lang != "c" && lang != "internal" {
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("language %q is not supported (Stage A: plpgsql, sql)", s.Language)}
+	}
+	// LANGUAGE internal: the AS clause is the C symbol name (interpret_AS_clause,
+	// postgres/src/backend/commands/functioncmds.c:866) — no SQL body, no
+	// prosrc string lookup. Validate it against the built-in pg_proc name set;
+	// an unknown name errors exactly like PG's fmgr_internal_validator
+	// (postgres/src/backend/catalog/pg_proc.c:768-771): ERRCODE_UNDEFINED_FUNCTION
+	// (42883), NOT 42704 as the design doc once claimed.
+	if lang == "internal" {
+		if s.Body == "" {
+			return &ExecError{Code: "42601", Pos: s.Pos(), Message: "internal function requires an AS clause naming the C function"}
+		}
+		if _, ok := catalog.LookupBuiltinProcByProname(s.Body); !ok {
+			return &ExecError{Code: "42883", Pos: s.Pos(), Message: fmt.Sprintf("there is no built-in function named %q", s.Body)}
+		}
 	}
 	// LANGUAGE C: store as a stub. When called, evalFuncCall detects lang=="c"
 	// and returns a type-appropriate default value (true for bool, 0 for int, etc.).
@@ -16710,7 +16724,7 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 			return &ExecError{Code: "42P13", Pos: s.Pos(), Message: "CREATE PROCEDURE requires a LANGUAGE clause"}
 		}
 	}
-	if lang != "plpgsql" && lang != "sql" && lang != "c" {
+	if lang != "plpgsql" && lang != "sql" && lang != "c" && lang != "internal" {
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("language %q is not supported (Stage B: plpgsql, sql)", s.Language)}
 	}
 	// Validate procedure-invalid attributes.

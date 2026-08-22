@@ -20025,6 +20025,38 @@ func RegprocName(oid uint32) (string, bool) {
 	return name, ok
 }
 
+// pgProcNamesReverse is a lazily-built name→OID reverse of the generated
+// pgProcNamesByOID. Guarded by pgProcNamesReverseOnce (built once per process;
+// pgProcNamesByOID is immutable).
+var (
+	pgProcNamesReverse     map[string]uint32
+	pgProcNamesReverseOnce sync.Once
+)
+
+// LookupBuiltinProcByProname resolves a pg_proc proname to its built-in OID,
+// the name→OID direction CREATE FUNCTION ... LANGUAGE internal AS '<name>'
+// needs when binding the AS clause to a pg_proc row. Backed by the full
+// generated ~3397-row table (a superset of the hand-curated
+// builtinProcsByName/LookupBuiltinProc, which only covers the handful of
+// builtins goopg's DDL surface references by name — int8eq/btint8cmp/hashint8
+// are not in it). PostgreSQL resolves internal names with fmgr_lookupByName
+// (utils/fmgr/fmgr.c), but the pg_proc.dat proname set is a faithful superset
+// of the FmgrBuiltin table's aliases for the builtin I/O/comparison routines,
+// and goopg has no fmgr alias table — see the M0134-0071 deferral candidate.
+func LookupBuiltinProcByProname(name string) (uint32, bool) {
+	if name == "" {
+		return 0, false
+	}
+	pgProcNamesReverseOnce.Do(func() {
+		pgProcNamesReverse = make(map[string]uint32, len(pgProcNamesByOID))
+		for oid, n := range pgProcNamesByOID {
+			pgProcNamesReverse[n] = oid
+		}
+	})
+	oid, ok := pgProcNamesReverse[strings.ToLower(name)]
+	return oid, ok
+}
+
 // IsStrictProc reports whether a built-in function is strict (returns NULL on
 // any NULL input). It consults the generated pgProcIsStrictByOID map, which
 // mirrors pg_proc.proisstrict for every PG18 built-in function. Returns false

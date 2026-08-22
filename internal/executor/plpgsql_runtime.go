@@ -356,9 +356,136 @@ func dispatchStoredRoutineByLanguage(r *catalog.Routine, args []Datum, ctx *Cont
 		default:
 			return NullDatum, nil
 		}
+	case "internal":
+		return dispatchInternalFunction(r, args, ctx, pos)
 	default:
 		return NullDatum, &ExecError{Code: "42704", Pos: pos, Message: fmt.Sprintf("language %q is not supported in v0", r.Language)}
 	}
+}
+
+// dispatchInternalFunction runs a LANGUAGE internal routine bound to a built-in
+// C function name via the AS '<cname>' clause (M0134-0071 Bucket A). The bound
+// name lives in r.Body. This is REAL dispatch — unlike the LANGUAGE c stub's
+// default-value behavior — because the equivclass.sql shell-type idiom
+// (int8alias1in/out/eq/lt, btint8cmp, hashint8) declares user routines that
+// must actually compute. The design doc says to route "through the evalFuncCall
+// builtin switch", but none of these names have an evalFuncCall case (they fall
+// through to evalStoredRoutineFuncCall → here), so the dispatch is implemented
+// at the Datum level instead — the design's intent (real semantics, no silent
+// default) is what matters.
+//
+// int8alias1/int8alias2 are `like int8` binary-compatible aliases, so their
+// Datums arrive as KindInt and need NO coercion — evalBinary/compareDatum
+// dispatch by Datum kind, not by declared SQL type (verified: no
+// binary-coercible-arg normalisation needed). All six bound builtins are strict
+// in PG (pg_proc.proisstrict), so NULL args → NULL result here.
+func dispatchInternalFunction(r *catalog.Routine, args []Datum, ctx *Context, pos int) (Datum, error) {
+	name := strings.ToLower(r.Body)
+	for _, a := range args {
+		if a.Kind == KindNull {
+			return NullDatum, nil // strict
+		}
+	}
+	switch name {
+	case "int8eq":
+		if len(args) != 2 {
+			return Datum{}, internalArityError(name, 2, len(args), pos)
+		}
+		cmp, err := compareDatum(args[0], args[1], pos)
+		if err != nil {
+			return Datum{}, err
+		}
+		return NewBoolDatum(cmpResult(parser.OpEq, cmp)), nil
+	case "int8ne":
+		if len(args) != 2 {
+			return Datum{}, internalArityError(name, 2, len(args), pos)
+		}
+		cmp, err := compareDatum(args[0], args[1], pos)
+		if err != nil {
+			return Datum{}, err
+		}
+		return NewBoolDatum(cmpResult(parser.OpNe, cmp)), nil
+	case "int8lt":
+		if len(args) != 2 {
+			return Datum{}, internalArityError(name, 2, len(args), pos)
+		}
+		cmp, err := compareDatum(args[0], args[1], pos)
+		if err != nil {
+			return Datum{}, err
+		}
+		return NewBoolDatum(cmpResult(parser.OpLt, cmp)), nil
+	case "int8le":
+		if len(args) != 2 {
+			return Datum{}, internalArityError(name, 2, len(args), pos)
+		}
+		cmp, err := compareDatum(args[0], args[1], pos)
+		if err != nil {
+			return Datum{}, err
+		}
+		return NewBoolDatum(cmpResult(parser.OpLe, cmp)), nil
+	case "int8gt":
+		if len(args) != 2 {
+			return Datum{}, internalArityError(name, 2, len(args), pos)
+		}
+		cmp, err := compareDatum(args[0], args[1], pos)
+		if err != nil {
+			return Datum{}, err
+		}
+		return NewBoolDatum(cmpResult(parser.OpGt, cmp)), nil
+	case "int8ge":
+		if len(args) != 2 {
+			return Datum{}, internalArityError(name, 2, len(args), pos)
+		}
+		cmp, err := compareDatum(args[0], args[1], pos)
+		if err != nil {
+			return Datum{}, err
+		}
+		return NewBoolDatum(cmpResult(parser.OpGe, cmp)), nil
+	case "btint8cmp":
+		if len(args) != 2 {
+			return Datum{}, internalArityError(name, 2, len(args), pos)
+		}
+		cmp, err := compareDatum(args[0], args[1], pos)
+		if err != nil {
+			return Datum{}, err
+		}
+		return NewIntDatum(int64(cmp)), nil
+	case "int8in":
+		if len(args) != 1 {
+			return Datum{}, internalArityError(name, 1, len(args), pos)
+		}
+		raw := args[0].Format()
+		v, err := parseIntegerInput(raw, "bigint", 64)
+		if err != nil {
+			return Datum{}, err
+		}
+		return NewIntDatum(v), nil
+	case "int8out":
+		if len(args) != 1 {
+			return Datum{}, internalArityError(name, 1, len(args), pos)
+		}
+		if args[0].Kind != KindInt {
+			return Datum{}, &ExecError{Code: "42804", Pos: pos, Message: "int8out: argument is not an integer datum"}
+		}
+		return NewStringDatum(strconv.FormatInt(args[0].Int, 10)), nil
+	case "hashint8":
+		if len(args) != 1 {
+			return Datum{}, internalArityError(name, 1, len(args), pos)
+		}
+		if args[0].Kind != KindInt {
+			return Datum{}, &ExecError{Code: "42804", Pos: pos, Message: "hashint8: argument is not an integer datum"}
+		}
+		return NewIntDatum(int64(pgHashInt8(args[0].Int))), nil
+	}
+	// Unreachable at CREATE time (execCreateFunction validated the name), but a
+	// WAL-replayed or hand-registered routine may still hold a bad name.
+	return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("there is no built-in function named %q", r.Body)}
+}
+
+// internalArityError formats a PG-style function-call arity failure for an
+// internal dispatch that does not go through normal overload resolution.
+func internalArityError(name string, want, got int, pos int) error {
+	return &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("function %s() does not exist: expected %d argument(s), got %d", name, want, got)}
 }
 
 func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) (Datum, error) {
