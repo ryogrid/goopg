@@ -12598,6 +12598,15 @@ func exprType(e Expr) catalog.Type {
 		case "get_byte", "get_bit":
 			// byteaGetByte/byteaGetBit (varlena.c) -> int4. M0134-0070.
 			return catalog.Type{Name: "int4"}
+		case "ascii":
+			// ascii(text) -> int4 (pg_proc.dat:3610, varlena.c ascii). M0134-0070.
+			return catalog.Type{Name: "int4"}
+		case "crc32", "crc32c", "bit_count":
+			// crc32/crc32c(bytea) -> int8 (pg_proc.dat:7954/7957); bit_count(bytea|bit)
+			// -> int8 (pg_proc.dat:1534/4201). Untyped these fall through to TypeOID 25,
+			// so psql's column_type_alignment left-aligns the numeric column (print.c).
+			// M0134-0070.
+			return catalog.Type{Name: "int8"}
 		case "date_part":
 			return catalog.Type{Name: "int8"}
 		case "gcd", "lcm", "abs", "mod", "div":
