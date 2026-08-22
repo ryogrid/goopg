@@ -4356,6 +4356,26 @@ func (p *parser) parseSubstringFuncCall(pos int, name string) (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
+		// Older SQL:1999 overload: SUBSTRING(str FROM pattern FOR escape). PG
+		// desugars this spelling (`a_expr FROM a_expr FOR a_expr` in gram.y's
+		// substr_list production) to the SAME 3-arg substring(text,text,text)
+		// SQL wrapper as the SIMILAR form (system_functions.sql: `RETURN
+		// substring($1, similar_to_escape($2, $3))`), disambiguating it from
+		// `start FOR count` by function overload resolution on operand types
+		// at plan time. goopg has no plan-time overload machinery, so
+		// constant-fold here: when BOTH FROM and FOR operands are
+		// string-or-NULL literals, route through the same buildSubstringSimilar
+		// fold as the SIMILAR form. M0134-0070; see
+		// docs/design/m0134-0070-substring-similar-escape.md §"Explicitly out
+		// of scope".
+		if _, _, startOK := similarToLiteralValue(start); startOK {
+			if _, _, countOK := similarToLiteralValue(count); countOK {
+				if !p.acceptSymbol(")") {
+					return nil, p.errAtCur("expected ')' to close SUBSTRING")
+				}
+				return p.buildSubstringSimilar(str, start, count, pos)
+			}
+		}
 		args = append(args, count)
 	}
 	if !p.acceptSymbol(")") {

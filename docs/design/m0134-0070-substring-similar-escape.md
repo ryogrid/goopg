@@ -1,6 +1,8 @@
 # M0134-0070: `SUBSTRING(str SIMILAR pattern ESCAPE escape)` (SQL:1999 form)
 
-Status: designed, not yet implemented. Scope: `strings.sql` regress case,
+Status: implemented — `SIMILAR ... ESCAPE` form (commit `0a04e518`) and the
+obsolete SQL99 `FROM pattern FOR escape` spelling (2026-08-22, see addendum
+below). Scope: `strings.sql` regress case,
 one bucket of the M0134-0070 sizing pass (`tmp/regress-diffs/strings.diff`,
 941 lines at time of writing). This bucket: 13 statements, ~121 of 941 diff
 lines (~13%, largest identifiable remaining bucket at the time this doc was
@@ -77,8 +79,23 @@ not via distinct grammar productions — goopg's `parseSubstringFuncCall`
 already desugars `FROM ... FOR ...` unconditionally to the 2/3-int-arg form,
 so making this variant work needs overload dispatch on the resolved static
 type of the FROM/FOR operands, a materially different (and separable)
-mechanism from the SIMILAR/ESCAPE grammar addition above. **Deferred** — not
-this slice; ledger row to be appended when this slice lands.
+mechanism from the SIMILAR/ESCAPE grammar addition above.
+
+### Addendum 2026-08-22: `FROM pattern FOR escape` landed (literal operands)
+
+Rather than full plan-time overload dispatch, the FROM/FOR branch of
+`parseSubstringFuncCall` now detects the obsolete-SQL99 spelling via
+`similarToLiteralValue`: when BOTH the `FROM` and `FOR` operands are
+string-or-NULL literals (`*StringConst`/`*NullConst`), it routes through the
+same `buildSubstringSimilar` fold as the `SIMILAR ... ESCAPE` branch, closing
+`strings.out:447` byte-for-byte. Integer literals (the `start FOR count`
+position form) still fall through to the plain 3-arg `substring(str, start,
+count)` call unchanged. This deliberately mirrors the SIMILAR branch's
+existing literal-only limitation rather than introducing a new overload
+mechanism: a *typed* string operand (`FROM 'pat'::text FOR '#'`) or any
+non-literal text expression still routes to the position form — PG's true
+`substring(text,int4,int4)`-vs-`substring(text,text,text)` overload resolution
+is a wider, separately-tracked gap (deferral ledger, M0134-0070 FROM/FOR row).
 
 ## Fix design
 
