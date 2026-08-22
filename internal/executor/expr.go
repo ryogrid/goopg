@@ -10594,23 +10594,97 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			h := md5.Sum([]byte(v.StringValue()))
 			return NewStringDatum(hex.EncodeToString(h[:])), nil
 		}
-	case "sha256":
+	case "sha224":
+		// sha224(bytea) -> bytea (cryptohashfuncs.c sha224_bytea, PG_RETURN_BYTEA_P).
+		// Digest length 28 bytes. postgres/src/include/common/sha2.h:20.
+		// M0134-0070 — previously fell through the switch ("function does not exist").
 		if len(x.Args) == 1 {
-			v, err := evalExpr(x.Args[0], row, ctx)
-			if err != nil || v.IsNull() {
+			src, serr := evalExpr(x.Args[0], row, ctx)
+			if serr != nil {
+				return NullDatum, serr
+			}
+			if src.IsNull() {
 				return NullDatum, nil
 			}
-			h := sha256.Sum256([]byte(v.StringValue()))
-			return NewStringDatum(hex.EncodeToString(h[:])), nil
+			raw := src.BytesValue()
+			if src.Kind != KindBytes {
+				b, berr := byteaIn(src.StringValue(), x.Pos())
+				if berr != nil {
+					return NullDatum, berr
+				}
+				raw = b
+			}
+			h := sha256.Sum224(raw)
+			return NewBytesDatum(h[:]), nil
+		}
+	case "sha256":
+		// sha256(bytea) -> bytea (cryptohashfuncs.c sha256_bytea, PG_RETURN_BYTEA_P).
+		// Digest length 32 bytes. postgres/src/include/common/sha2.h:21.
+		// M0134-0070 — used to return hex TEXT (KindString) instead of bytea.
+		if len(x.Args) == 1 {
+			src, serr := evalExpr(x.Args[0], row, ctx)
+			if serr != nil {
+				return NullDatum, serr
+			}
+			if src.IsNull() {
+				return NullDatum, nil
+			}
+			raw := src.BytesValue()
+			if src.Kind != KindBytes {
+				b, berr := byteaIn(src.StringValue(), x.Pos())
+				if berr != nil {
+					return NullDatum, berr
+				}
+				raw = b
+			}
+			h := sha256.Sum256(raw)
+			return NewBytesDatum(h[:]), nil
+		}
+	case "sha384":
+		// sha384(bytea) -> bytea (cryptohashfuncs.c sha384_bytea, PG_RETURN_BYTEA_P).
+		// Digest length 48 bytes. postgres/src/include/common/sha2.h:22.
+		// M0134-0070 — previously fell through the switch ("function does not exist").
+		if len(x.Args) == 1 {
+			src, serr := evalExpr(x.Args[0], row, ctx)
+			if serr != nil {
+				return NullDatum, serr
+			}
+			if src.IsNull() {
+				return NullDatum, nil
+			}
+			raw := src.BytesValue()
+			if src.Kind != KindBytes {
+				b, berr := byteaIn(src.StringValue(), x.Pos())
+				if berr != nil {
+					return NullDatum, berr
+				}
+				raw = b
+			}
+			h := sha512.Sum384(raw)
+			return NewBytesDatum(h[:]), nil
 		}
 	case "sha512":
+		// sha512(bytea) -> bytea (cryptohashfuncs.c sha512_bytea, PG_RETURN_BYTEA_P).
+		// Digest length 64 bytes. postgres/src/include/common/sha2.h:23.
+		// M0134-0070 — used to return hex TEXT (KindString) instead of bytea.
 		if len(x.Args) == 1 {
-			v, err := evalExpr(x.Args[0], row, ctx)
-			if err != nil || v.IsNull() {
+			src, serr := evalExpr(x.Args[0], row, ctx)
+			if serr != nil {
+				return NullDatum, serr
+			}
+			if src.IsNull() {
 				return NullDatum, nil
 			}
-			h := sha512.Sum512([]byte(v.StringValue()))
-			return NewStringDatum(hex.EncodeToString(h[:])), nil
+			raw := src.BytesValue()
+			if src.Kind != KindBytes {
+				b, berr := byteaIn(src.StringValue(), x.Pos())
+				if berr != nil {
+					return NullDatum, berr
+				}
+				raw = b
+			}
+			h := sha512.Sum512(raw)
+			return NewBytesDatum(h[:]), nil
 		}
 	case "digest":
 		// digest(text, algorithm) — subset: only 'md5', 'sha256', 'sha512'

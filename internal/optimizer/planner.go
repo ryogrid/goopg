@@ -12587,6 +12587,14 @@ func exprType(e Expr) catalog.Type {
 			// which prints KindBytes raw instead of `\x…`/escape form (same
 			// M0125-0021 class of bug as decode above). M0134-0070.
 			return catalog.Type{Name: "bytea"}
+		case "sha224", "sha256", "sha384", "sha512":
+			// sha{224,256,384,512}(bytea) -> bytea (cryptohashfuncs.c, all four
+			// PG_RETURN_BYTEA_P). Untyped falls through to appendTypedCellText's
+			// default AppendValueText, which prints KindBytes raw instead of
+			// `\x…`/escape form (same M0125-0021 class of bug as decode above).
+			// The builtin pg_proc seed does not feed ReturnType, so this is the
+			// only stamp of the wire TypeOID. M0134-0070.
+			return catalog.Type{Name: "bytea"}
 		case "get_byte", "get_bit":
 			// byteaGetByte/byteaGetBit (varlena.c) -> int4. M0134-0070.
 			return catalog.Type{Name: "int4"}
