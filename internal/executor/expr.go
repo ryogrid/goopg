@@ -7,6 +7,7 @@ import (
 	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"crypto/sha512"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -3956,9 +3957,83 @@ func roundNumericToScale(d Datum, scale int16) Datum {
 	return d
 }
 
+// byteaIntSourceWidth returns the fixed byte width of the integer type named
+// by typeName, or 0 if typeName is not an integer type. It accepts both the
+// canonical short names (int2/int4/int8) and their SQL display spellings
+// (smallint/integer/bigint): CastExpr.SourceType is stamped from the operand's
+// declared catalog type name, which can be either spelling depending on where
+// the operand came from (a CastExpr target uses the short form, a column ref
+// uses whatever the catalog stores). M0134-0070.
+func byteaIntSourceWidth(typeName string) int {
+	switch strings.ToLower(typeName) {
+	case "int2", "smallint":
+		return 2
+	case "int4", "integer", "int":
+		return 4
+	case "int8", "bigint":
+		return 8
+	}
+	return 0
+}
+
+// byteaToIntN decodes a big-endian bytea payload to a signed integer of the
+// given byte width, mirroring PG's bytea_int2/int4/int8
+// (postgres/src/backend/utils/adt/varlena.c:4139-4211): MSB-first; a payload
+// longer than the width raises 22003 with the width's type name in the message
+// and NO errposition (the cast functions never call errposition, and
+// strings.out's overflow rows expect no LINE/caret — same no-Pos convention as
+// the numeric_int2 note above); short payloads are zero-extended. The unsigned
+// accumulation is re-interpreted through the signed type so the min-value bit
+// pattern wraps (e.g. \x8000 → -32768, \x8000000000000000 →
+// -9223372036854775808). M0134-0070.
+func byteaToIntN(b []byte, width int, typeName string) (int64, error) {
+	if len(b) > width {
+		return 0, &ExecError{Code: "22003", Message: typeName + " out of range"}
+	}
+	var u uint64
+	for _, by := range b {
+		u = u<<8 | uint64(by)
+	}
+	switch width {
+	case 2:
+		return int64(int16(u)), nil
+	case 4:
+		return int64(int32(u)), nil
+	default:
+		return int64(u), nil
+	}
+}
+
 func evalCastTyped(d Datum, targetType, sourceType string, pos int, ctx *Context) (Datum, error) {
 	if sourceType == "" {
 		return evalCast(d, targetType, pos, ctx)
+	}
+	// M0134-0070: intN → bytea casts (pg_cast.dat:323-335, castfuncs
+	// int2_bytea/int4_bytea/int8_bytea = varlena.c:4214-4233, each just the
+	// corresponding intNsend) emit the big-endian two's-complement binary at
+	// exactly the source type's fixed width — NOT a text rendering.
+	// CastExpr.SourceType (stamped from the operand's declared type at
+	// planner.go) supplies the width; evalCast has no source-type parameter.
+	// A NULL (KindNull) or non-int datum falls through to evalCast's bytea
+	// arm unchanged. Bare integer literals stamp int8 (goopg's exprType quirk;
+	// PG would use int4 — the known literal-typing divergence documented for
+	// to_hex at planner.go, out of scope here; the fixture spells widths
+	// explicitly via ::intN).
+	if strings.EqualFold(targetType, "bytea") && d.Kind == KindInt {
+		switch byteaIntSourceWidth(sourceType) {
+		case 2:
+			b := make([]byte, 2)
+			binary.BigEndian.PutUint16(b, uint16(int16(d.Int)))
+			return NewBytesDatum(b), nil
+		case 4:
+			b := make([]byte, 4)
+			binary.BigEndian.PutUint32(b, uint32(int32(d.Int)))
+			return NewBytesDatum(b), nil
+		case 8:
+			b := make([]byte, 8)
+			binary.BigEndian.PutUint64(b, uint64(d.Int))
+			return NewBytesDatum(b), nil
+		}
 	}
 	// M0119-0006 (deferral row 1350): a reg* datum is a plain KindInt holding an
 	// object OID, so casting one to a string type must render its OBJECT NAME via
@@ -4222,6 +4297,16 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "smallint out of range"}
 			}
 			return d, nil
+		case KindBytes:
+			// bytea_int2 (postgres/src/backend/utils/adt/varlena.c:4139):
+			// big-endian MSB-first; len > 2 → 22003 with no errposition;
+			// short payloads zero-extended; uint→signed re-interpretation
+			// wraps the min-value pattern (\x8000 → -32768). M0134-0070.
+			n, err := byteaToIntN(d.BytesValue(), 2, "smallint")
+			if err != nil {
+				return Datum{}, err
+			}
+			return Datum{Kind: KindInt, Int: n}, nil
 		case KindString:
 			s := d.StringValue()
 			// Array literals like '{1,2,3}'::int2[] pass through — the parser strips '[]'
@@ -4260,6 +4345,17 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "integer out of range"}
 			}
 			return d, nil
+		case KindBytes:
+			// bytea_int4 (postgres/src/backend/utils/adt/varlena.c:4166):
+			// big-endian MSB-first; len > 4 → 22003 with no errposition;
+			// short payloads zero-extended; uint→signed re-interpretation
+			// wraps the min-value pattern (\x80000000 → -2147483648).
+			// M0134-0070.
+			n, err := byteaToIntN(d.BytesValue(), 4, "integer")
+			if err != nil {
+				return Datum{}, err
+			}
+			return Datum{Kind: KindInt, Int: n}, nil
 		case KindString:
 			s := d.StringValue()
 			// Array literals like '{1,2,3}'::int4[] pass through — the parser strips '[]'
@@ -4294,6 +4390,17 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 		switch d.Kind {
 		case KindInt:
 			return d, nil
+		case KindBytes:
+			// bytea_int8 (postgres/src/backend/utils/adt/varlena.c:4193):
+			// big-endian MSB-first; len > 8 → 22003 with no errposition;
+			// short payloads zero-extended; uint64→int64 re-interpretation
+			// wraps the min-value pattern
+			// (\x8000000000000000 → -9223372036854775808). M0134-0070.
+			n, err := byteaToIntN(d.BytesValue(), 8, "bigint")
+			if err != nil {
+				return Datum{}, err
+			}
+			return Datum{Kind: KindInt, Int: n}, nil
 		case KindString:
 			s := d.StringValue()
 			// Array literals like '{1,2,3}'::int8[] pass through — parser strips '[]'. M0097-0063.
