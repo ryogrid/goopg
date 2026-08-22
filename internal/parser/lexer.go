@@ -704,12 +704,39 @@ func (l *lexer) lexUnicodeEscapeQuote(start int, quoteChar byte) (Token, error) 
 					// postgres/src/backend/parser/parser.c:352-362
 					// check_uescapechar. This is a hard error once we've
 					// committed to the UESCAPE clause — no fallback.
+					// scanner_yyerror (scan.l:1221-1240) echoes the SCONST's
+					// raw source text: l.pos now sits just past the closing
+					// quote, so l.src[uescPos:l.pos] is the verbatim `'...'`.
 					return Token{}, &SyntaxError{
 						Pos: uescPos, Raw: true, Code: "42601",
-						Message: "invalid Unicode escape character",
+						Message: fmt.Sprintf(`invalid Unicode escape character at or near "%s"`, l.src[uescPos:l.pos]),
 					}
 				}
 				escape = escStr[0]
+			} else {
+				// postgres/src/backend/parser/parser.c:271-274 — once UESCAPE
+				// is recognized, the clause is a hard commit: the third token
+				// must be a simple string literal. If it isn't, PG raises a
+				// dedicated error pointing at that token (instead of letting
+				// the parser emit a generic syntax error), echoing the token's
+				// raw source text the way scanner_yyerror does
+				// (scan.l:1221-1240). At end of input PG appends
+				// "at end of input" rather than a quoted token.
+				msg := "UESCAPE must be followed by a simple string literal"
+				if l.pos >= len(l.src) {
+					return Token{}, &SyntaxError{
+						Pos: l.pos, Raw: true, Code: "42601",
+						Message: msg + " at end of input",
+					}
+				}
+				start := l.pos
+				if _, err := l.next(); err != nil {
+					return Token{}, err
+				}
+				return Token{}, &SyntaxError{
+					Pos: start, Raw: true, Code: "42601",
+					Message: fmt.Sprintf(`%s at or near "%s"`, msg, l.src[start:l.pos]),
+				}
 			}
 		}
 	}
@@ -758,14 +785,9 @@ func (l *lexer) decodeUnicodeEscapes(raw string, escape byte) (string, error) {
 				// `else` branch, `if (pair_first) goto invalid_pair`) — an
 				// ordinary character immediately after a pending surrogate-
 				// first escape resolves it as an error.
-				near := ""
-				if pos < len(raw) {
-					r, _ := utf8.DecodeRuneInString(raw[pos:])
-					near = string(r)
-				}
 				return "", &SyntaxError{
 					Pos: pos, Raw: true, Code: "42601",
-					Message: fmt.Sprintf(`invalid Unicode surrogate pair at or near "%s"`, near),
+					Message: "invalid Unicode surrogate pair",
 				}
 			}
 			b.WriteByte(ch)
@@ -776,10 +798,9 @@ func (l *lexer) decodeUnicodeEscapes(raw string, escape byte) (string, error) {
 		// <esc><esc> → literal escape-char byte.
 		if pos+1 < len(raw) && raw[pos+1] == escape {
 			if hasPendingSurrogate {
-				near := raw[escStart : escStart+2]
 				return "", &SyntaxError{
 					Pos: escStart, Raw: true, Code: "42601",
-					Message: fmt.Sprintf(`invalid Unicode surrogate pair at or near "%s"`, near),
+					Message: "invalid Unicode surrogate pair",
 				}
 			}
 			b.WriteByte(escape)
@@ -804,10 +825,9 @@ func (l *lexer) decodeUnicodeEscapes(raw string, escape byte) (string, error) {
 		pos = newPos
 		if val <= 0 || val > 0x10FFFF {
 			// postgres/src/backend/parser/parser.c:328-334 (check_unicode_value).
-			near := raw[escStart:pos]
 			return "", &SyntaxError{
 				Pos: escStart, Raw: true, Code: "42601",
-				Message: fmt.Sprintf(`invalid Unicode escape value at or near "%s"`, near),
+				Message: "invalid Unicode escape value",
 			}
 		}
 		if hasPendingSurrogate {
@@ -816,18 +836,16 @@ func (l *lexer) decodeUnicodeEscapes(raw string, escape byte) (string, error) {
 				hasPendingSurrogate = false
 				continue
 			}
-			near := raw[escStart:pos]
 			return "", &SyntaxError{
 				Pos: escStart, Raw: true, Code: "42601",
-				Message: fmt.Sprintf(`invalid Unicode surrogate pair at or near "%s"`, near),
+				Message: "invalid Unicode surrogate pair",
 			}
 		}
 		if isUTF16SurrogateSecond(val) {
 			// Lone low surrogate with no preceding high surrogate.
-			near := raw[escStart:pos]
 			return "", &SyntaxError{
 				Pos: escStart, Raw: true, Code: "42601",
-				Message: fmt.Sprintf(`invalid Unicode surrogate pair at or near "%s"`, near),
+				Message: "invalid Unicode surrogate pair",
 			}
 		}
 		if isUTF16SurrogateFirst(val) {
@@ -843,7 +861,7 @@ func (l *lexer) decodeUnicodeEscapes(raw string, escape byte) (string, error) {
 		// postgres/src/backend/parser/parser.c:512-518.
 		return "", &SyntaxError{
 			Pos: len(raw), Raw: true, Code: "42601",
-			Message: `invalid Unicode surrogate pair at or near ""`,
+			Message: "invalid Unicode surrogate pair",
 		}
 	}
 	return b.String(), nil
