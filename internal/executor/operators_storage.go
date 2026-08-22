@@ -8633,10 +8633,12 @@ func uniqueCheckWithWait(ctx *Context, rel storage.RelFileNode, tree *nbtree.BTr
 				return true, nil
 			}
 			xmin := tuple.Header.Xmin
-			selfXID := ctx.Tx.XID
-			// In-flight other-xact insert: must wait.
+			// In-flight other-xact insert: must wait. A sub-XID of our own
+			// transaction tree must never enter this branch (the row is live and
+			// the caller raises 23505 instead), or the wait blocks forever on
+			// goopg's own subtransaction. M0134-0077.
 			if ctx.TxnMgr != nil && xmin != storage.InvalidTransactionID &&
-				(selfXID == storage.InvalidTransactionID || xmin != selfXID) &&
+				!xidIsSelf(ctx, xmin) &&
 				ctx.TxnMgr.IsXIDActive(xmin) {
 				inflightXmin = xmin
 				return false, nil
@@ -8797,6 +8799,31 @@ func remapParentRowToChild(parentRow Row, childRaw Row, parentCols, childCols []
 	return out
 }
 
+// xidIsSelf reports whether xid belongs to this backend's own transaction tree
+// — the top-level xact or any of its sub-xacts. A subtransaction's INSERT must
+// never block on, nor be classified as foreign to, a tuple stamped by its own
+// parent or a sibling savepoint: inside a SAVEPOINT the row's xmin is the
+// sub-XID (EffectiveWriterXID) while the statement context's ctx.Tx.XID is
+// rebuilt per statement from the top-level transaction, so a plain
+// `xid == ctx.Tx.XID` test misses it. Resolving both sides to their top-level
+// ancestor (mirroring lockRowsOp.isSelfXID and PG's
+// TransactionIdIsCurrentTransactionId, postgres/src/backend/access/transam/xact.c:941,
+// which counts the top-level xact and any subxact as "current") catches the
+// whole tree. Reduces to xid == ctx.Tx.XID when no savepoint is open.
+// M0134-0077 (docs/design/m0134-0077-unique-check-subxid-self-wait.md).
+func xidIsSelf(ctx *Context, xid storage.TransactionID) bool {
+	if xid == storage.InvalidTransactionID {
+		return false
+	}
+	if xid == ctx.Tx.XID {
+		return true
+	}
+	if ctx.TxnMgr == nil {
+		return false
+	}
+	return ctx.TxnMgr.TopLevelXid(xid) == ctx.TxnMgr.TopLevelXid(ctx.Tx.XID)
+}
+
 // isLiveForUniqueCheck decides whether a tuple with the given xmin/xmax
 // should be considered a live duplicate for INSERT-time uniqueness
 // enforcement. Mirrors the conservative reading described on
@@ -8813,8 +8840,10 @@ func isLiveForUniqueCheck(ctx *Context, xmin, xmax storage.TransactionID) bool {
 	selfXID := ctx.Tx.XID
 	if ctx.TxnMgr != nil {
 		switch {
-		case selfXID != storage.InvalidTransactionID && xmin == selfXID:
-			// Inserted by our own xact in this transaction — live.
+		case xidIsSelf(ctx, xmin):
+			// Inserted by our own xact (top-level or any subtransaction) in
+			// this transaction — live. A sub-XID stays "self" even after
+			// RELEASE SAVEPOINT makes it inactive. M0134-0077.
 			xminLive = true
 		case ctx.TxnMgr.IsXIDActive(xmin):
 			xminLive = true
