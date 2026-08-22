@@ -6916,6 +6916,27 @@ listed `select.sql`, `delete.sql` and `sysviews.sql` already carry CSV status
 - [ ] **M0134-0071 — equivclass.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
   **PARKED 2026-08-22** — sized at HEAD (`05a3448a`): 594 diff lines / 11 hunks / 40 `^+ERROR` / 0 `^-ERROR`, deterministic across two fresh-cluster runs (NOT stale; CSV row `failed` accurate). 34/40 error lines were one root cause + cascade: goopg's `execCreateFunction` language allowlist (plpgsql/sql/c only) rejected `LANGUAGE internal`, so the `int8alias1`/`int8alias2` shell types never got their I/O/comparison/hash routines. Shipped Bucket A (design `docs/design/m0134-0071-language-internal-function.md`, commit `f70edc85`): accept `internal` in the allowlist (sibling pair `execCreateFunction` ↔ `execCreateProcedure`), bind `AS '<name>'` against the pg_proc seed via new `catalog.LookupBuiltinProcByProname` (unknown → 42883, PG's `fmgr_internal_validator` `pg_proc.c:746/770-771` — NOT 42704 as the sizing first cited), real Datum-level dispatch in `dispatchStoredRoutineByLanguage` (int8eq/ne/lt/le/gt/ge, btint8cmp, int8in/out, hashint8), plus `pgHashInt8` (PG `hashfunc.c:84`). Result **594 → 573 diff lines, 40 → 28 `^+ERROR`** (the 10 `language "internal"` lines gone; 2 of 4 cross-type `only boolean operators` cleared). The sizing's "cascade of A" attribution for the 13 `incompatible operand types` errors was WRONG — they are an INDEPENDENT analyzer gap: `isComparable(int8,int8alias1)` = false because the BinaryOp type-check (`analyzer.go:1359-1362`/`:3186`) is a builtin name-switch with no user-operator lookup, so a user-defined `= (int8,int8alias1)` operator is never consulted. CSV row stays `failed`/`pass_required=no`; no `make regen-testport`. **Re-arm trigger:** re-run `scripts/pg-regress-runner.sh --verbose equivclass`, then take the analyzer user-operator-resolution gap (16 of 28 remaining errors — the largest contained next slice, engine-wide) first, then Bucket C (built-in `integer_ops` opfamily rows absent, 6 errors). Both ledgered 2026-08-22.
 - [ ] **M0134-0072 — temp.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
+      **Bucket A + B landed 2026-08-22** (design
+      `docs/design/m0134-0072-oncommit-temp-table.md`): `ON COMMIT {DELETE ROWS|DROP}`
+      is now parsed (was parsed-and-discarded) and executed at transaction commit.
+      Parser captures `OnCommit` at all four CREATE TABLE arms + the CTAS `(col) ON
+      COMMIT … AS` lookahead; 42P16 `ON COMMIT can only be used on temporary tables`
+      guard (both `execCreateTable` and `execCreateTableAs`); per-session registration
+      list (`BasicSession.RegisterOnCommitAction`) run from BOTH commit paths — executor
+      `transactionOp.execCommit` AND the simple-query `applyTransactionVerb` — before
+      the SSI check, mirroring `xact.c:2311→2339`; DELETE ROWS via
+      `execTruncate(tempTables=true)`, DROP via `dropOnCommitTable` (partition +
+      inheritance cascade); temp FK 0A000 `unsupported ON COMMIT and foreign key
+      combination` + DETAIL (`heap.c:3738`); plan-cache invalidation via
+      `Context.OnCommitDDL`. Three extra PG-semantics bugs fixed en route: plan-cache
+      not invalidated by commit-time DROP; autonomous-CREATE registration lost across
+      the BEGIN session swap (persisted on `connTxState`); failed COMMIT not undoing
+      DDL before `TxnMgr.Rollback`. Diff **507→288 lines, 11→4 hunks, 37→30
+      `^+ERROR`** (every ON COMMIT region byte-green). Remaining 4 hunks are
+      independent out-of-scope gaps — Bucket C (PREPARE TRANSACTION temp guard, the
+      natural next tiny slice), G (DECLARE CURSOR/portal, milestone), `temp_buffers`
+      GUC, temp `current_schema()` search-path. CSV row stays `failed`/
+      `pass_required=no`; no `make regen-testport`.
 - [ ] **M0134-0073 — tidrangescan.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
 - [ ] **M0134-0074 — tidscan.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
 - [ ] **M0134-0075 — timestamp.sql** — regress-sql `failed`: make the case match PG 18.3 (normalise against `./postgres/`). On pass, flip the CSV row to `pass` / `pass_required=yes` in the same commit.
