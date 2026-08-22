@@ -107,6 +107,43 @@ func TestAnalyzeTypeErrors(t *testing.T) {
 	expectAnalyzeCode(t, cat, "SELECT aid FROM pgbench_accounts LIMIT true", "42804")
 }
 
+func TestAnalyzeByteaLike(t *testing.T) {
+	// bytea column `a`, text column `t`, int column `i` — exercises the
+	// bytea/bytea lane of the OpLike gate (M0134-0070) without creating
+	// cross-type operators.
+	cat := catalog.NewInMemory()
+	if _, err := cat.CreateTable(parser.ObjectName{Name: "byteatest"}, []catalog.Column{
+		{Name: "a", Type: catalog.Type{Name: "bytea"}},
+		{Name: "t", Type: catalog.Type{Name: "text"}},
+		{Name: "i", Type: catalog.Type{Name: "int4"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// bytea lane: column vs unknown literal, bytea/bytea, unknown-literal
+	// (via ::bytea cast) vs column, and NOT LIKE all analyze clean and
+	// yield bool.
+	for _, sql := range []string{
+		"SELECT a FROM byteatest WHERE a LIKE '%1%'",
+		"SELECT a FROM byteatest WHERE a LIKE 'x'::bytea",
+		"SELECT a FROM byteatest WHERE a LIKE a",
+		"SELECT a FROM byteatest WHERE 'x'::bytea LIKE a",
+		"SELECT a FROM byteatest WHERE a NOT LIKE '%1%'",
+	} {
+		if err := Analyze(parseOne(t, sql), cat); err != nil {
+			t.Fatalf("Analyze(%q): %v", sql, err)
+		}
+	}
+	// No cross-type operator: bytea vs text stays a 42804.
+	expectAnalyzeCode(t, cat, "SELECT a FROM byteatest WHERE a LIKE t", "42804")
+	expectAnalyzeCode(t, cat, "SELECT a FROM byteatest WHERE t LIKE a", "42804")
+	// OpConcat must NOT gain a bytea lane: int || bytea stays 42883.
+	expectAnalyzeCode(t, cat, "SELECT i || a FROM byteatest", "42883")
+	// Existing string lane is unchanged.
+	if err := Analyze(parseOne(t, "SELECT a FROM byteatest WHERE t LIKE 'x%'"), cat); err != nil {
+		t.Fatalf("Analyze(text LIKE): %v", err)
+	}
+}
+
 func TestAnalyzeDMLTypeAndReturningErrors(t *testing.T) {
 	// String literals ('x') are now allowed for integer columns at analysis time
 	// (for PostgreSQL compatibility: untyped literals can be assigned to any type,

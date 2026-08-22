@@ -1498,8 +1498,13 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			return catalog.Type{Name: "text"}, nil
 		case parser.OpLike, parser.OpNotLike:
 			// Both operands must be string-like (text/varchar/char/
-			// bpchar/unknown). Pattern can be a literal or column.
-			if !isStringLike(leftTyp) || !isStringLike(rightTyp) {
+			// bpchar/unknown) or both bytea/unknown. PG resolves the
+			// string pair to textlike/textnlike and the bytea pair to
+			// bytealike (~~(bytea,bytea), pg_operator.dat:2383-2384,
+			// like.c:326). Pattern can be a literal or column. M0134-0070.
+			leftStr, rightStr := isStringLike(leftTyp), isStringLike(rightTyp)
+			leftByt, rightByt := isByteaOrUnknown(leftTyp), isByteaOrUnknown(rightTyp)
+			if !((leftStr && rightStr) || (leftByt && rightByt)) {
 				return catalog.Type{}, analyzeError(x.Pos(), "42804", fmt.Sprintf("operator %s requires string operands", x.Op))
 			}
 			return catalog.Type{Name: "bool"}, nil
@@ -3164,6 +3169,18 @@ func isStringLike(t catalog.Type) bool {
 		return true
 	}
 	return isStringTypeName(t.Name)
+}
+
+// isByteaOrUnknown reports whether t is bytea (or an unknown literal),
+// the operand class for PG's bytealike (~~(bytea,bytea)) lane. Kept
+// separate from isStringLike: bytea must NOT be admitted into OpConcat
+// (analyzer.go:1491), where isStringLike feeds the int || bytea 42883
+// rejection. M0134-0070.
+func isByteaOrUnknown(t catalog.Type) bool {
+	if isUnknownType(t) {
+		return true
+	}
+	return strings.ToLower(t.Name) == "bytea"
 }
 
 func isComparable(left, right catalog.Type) bool {
