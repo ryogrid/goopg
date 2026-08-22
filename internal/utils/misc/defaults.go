@@ -88,6 +88,16 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextUserset, Flags: FlagReport,
 		Scope: ScopeSession | ScopeTransaction,
 	}))
+	// escape_string_warning controls whether ordinary string literals containing
+	// backslash escapes emit a deprecation warning (COMPAT_OPTIONS_PREVIOUS,
+	// postgres/src/backend/utils/misc/guc_tables.c). goopg does not implement the
+	// lexer-side warning at all, so this is a settable/gettable no-op stub only —
+	// not GUC_REPORT-flagged upstream, so no FlagReport here. M0134-0070.
+	r.MustRegister(NewVariable(Variable{
+		Name: "escape_string_warning", Type: TypeBool, BootVal: "on",
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "is_superuser", Type: TypeBool, BootVal: "off",
 		Context: ContextInternal, Flags: FlagReport | FlagDisallowInFile,

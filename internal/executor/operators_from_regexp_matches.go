@@ -49,7 +49,11 @@ func (o *fromRegexpMatchesOp) Open(ctx *Context) error {
 			return err
 		}
 	}
-	for _, d := range evalRegexpMatchesSRF(sD, patD, flagsD) {
+	vals, err := evalRegexpMatchesSRF(sD, patD, flagsD)
+	if err != nil {
+		return err
+	}
+	for _, d := range vals {
 		o.rows = append(o.rows, Row{d})
 	}
 	return nil

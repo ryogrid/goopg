@@ -55,3 +55,45 @@ func TestToCharNumericFormat(t *testing.T) {
 		}
 	}
 }
+
+// TestToCharScientificSpecialValues covers Infinity/-Infinity/NaN inputs to the
+// EEEE format modifier (to_char(numeric_val, '9.999EEEE')). goopg previously
+// panicked here (strings.LastIndex(raw, "e") == -1 on Go's "+Inf"/"NaN" output
+// from fmt.Sprintf("%.*e", ...), then a negative-bound slice). PostgreSQL never
+// errors for these; it emits a fixed "#" pattern with no sign marker regardless
+// of sign/NaN-ness. postgres/src/backend/utils/adt/formatting.c, isnan(value) ||
+// isinf(value) branch; verified against postgres/src/test/regress/expected/
+// numeric.out lines 2009-2022 (M0134-0049 bucket #1).
+func TestToCharScientificSpecialValues(t *testing.T) {
+	cases := []struct {
+		val         Datum
+		mantissaFmt string
+		expect      string
+	}{
+		// decPlaces=3 ("9.999") -> Num.post+4 = 7 '#'s after the dot.
+		{NewStringDatum("Infinity"), "9.999", " #.#######"},
+		{NewStringDatum("-Infinity"), "9.999", " #.#######"},
+		{NewStringDatum("NaN"), "9.999", " #.#######"},
+		// decPlaces=2 ("9.99") -> Num.post+4 = 6 '#'s after the dot.
+		{NewStringDatum("Infinity"), "9.99", " #.######"},
+		{NewStringDatum("-Infinity"), "9.99", " #.######"},
+		{NewStringDatum("NaN"), "9.99", " #.######"},
+	}
+	for _, tc := range cases {
+		got := toCharScientific(tc.val, tc.mantissaFmt, false, false)
+		if got != tc.expect {
+			t.Errorf("toCharScientific(%v, %q, fm=false) = %q, want %q", tc.val.Format(), tc.mantissaFmt, got, tc.expect)
+		}
+	}
+
+	// fm=true strips the leading sign-slot space, same as the existing
+	// negative/positive-sign handling at the bottom of toCharScientific.
+	if got := toCharScientific(NewStringDatum("Infinity"), "9.999", false, true); got != "#.#######" {
+		t.Errorf("toCharScientific(Infinity, %q, fm=true) = %q, want %q", "9.999", got, "#.#######")
+	}
+
+	// Ordinary finite value: the existing (working) path is unaffected.
+	if got := toCharScientific(NewIntDatum(1234), "9.99", false, false); got != " 1.23e+03" {
+		t.Errorf("toCharScientific(1234, %q) = %q, want %q", "9.99", got, " 1.23e+03")
+	}
+}

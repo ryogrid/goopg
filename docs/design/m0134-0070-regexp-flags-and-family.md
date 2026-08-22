@@ -1,0 +1,436 @@
+# M0134-0070 Round C: `regexp_*` family — shared flags translator + `regexp_matches` multi-flag fix
+
+Status: Round C accepted/landed; Round D accepted/landed; Round E
+accepted/landed (see addenda at end of file). Scope: `strings.sql` regress
+case, Round C of the M0134-0070
+sizing pass (Round A `E'...'` Unicode-escape validation, Round B `U&'...'`/
+`UESCAPE`, both landed 2026-08-22). This round only — see "Follow-on slices"
+below for the rest of the `regexp_*` bucket (~815 of 1804 remaining diff
+lines), which stay separate slices by design.
+
+## Problem
+
+The 2026-08-22 sizing pass (`tmp/regress-diffs/strings.diff` at 1804 lines)
+found the `regexp_*` family is not one gap but four independent root causes.
+This slice targets the smallest, highest-leverage one: **PG regex flag
+translation is incomplete and duplicated**. `internal/executor/expr.go`'s
+`evalRegexpMatchesSRF` (and its `regexp_split_to_array`/`regexp_replace`
+siblings) only recognize `i` (case-insensitive) and `g` (global) out of PG's
+full flag set `b/c/e/i/m/n/p/q/s/t/w/x` (`postgres/src/backend/utils/adt/
+regexp.c:parse_re_flags`, `:117-200`). In particular `m`/`s`/`n` (line-anchor
+modes) are silently dropped — a `regexp_matches(text, pattern, 'mg')` call
+anchors `^`/`$` to the whole string instead of per-line, returning 1 row
+where PG returns N. Unknown flag characters (e.g. `'z'`) are also silently
+accepted instead of raising `22023 invalid regular expression option`.
+
+PG's flag semantics (`regexp.c:319-380 RE_compile_and_cache` /
+`parse_re_flags`):
+- `g` — global (goopg-side loop semantics, unaffected by this slice)
+- `i` — case-insensitive → Go `(?i)`
+- `m`/`n` — newline-sensitive matching: `^`/`$` match at each line boundary,
+  `.` does not match `\n` → Go `(?m)` covers the `^`/`$` half; Go's `.` never
+  matches `\n` unless `(?s)` is given, which already matches PG's default (PG
+  `.` also excludes `\n` under `n`), so `m`/`n` both map to Go `(?m)` for our
+  purposes (PG distinguishes `m` full newline-sensitive vs `n` partial, but
+  neither goopg nor this test exercises the distinction beyond `^`/`$`
+  anchoring — documented as a known simplification below, not silently
+  dropped).
+- `s` — non-newline-sensitive (PG default without `n`/`m`) — no-op relative
+  to Go's default; **do not** map to Go's `(?s)` (that flag means something
+  different in Go: dot matches newline). This is a naming collision between
+  PG's `s` flag and Go's `(?s)` modifier — the translator must not conflate
+  them.
+- `p` — partial newline-sensitive (like `n` but `.` still matches `\n`) — map
+  to Go `(?m)` only, not `(?s)`.
+- `w` — inverse partial newline-sensitive — treat as `(?m)` for this slice
+  (same reasoning as `p`).
+- unknown char → `22023`.
+
+## Design
+
+1. New shared helper in `internal/executor/expr.go` (near the existing
+   ad-hoc `strings.Contains(flags, "i")` call sites):
+   `func pgRegexFlagsToGoModifiers(flags string) (goFlags string, global bool, err error)`.
+   Iterates each rune, maps `i`→`i`, `m`/`n`/`p`/`w`→`m` (deduped), `s`/`c`/
+   `e`/`b`/`t`/`q`/`x`→ no-op (accepted, not yet meaningfully implemented —
+   NOT flagged unknown, matching PG which accepts them as valid ARE-mode
+   selectors), `g`→ sets `global=true` (not folded into `goFlags`, since Go's
+   `regexp` has no inline "global" modifier — call sites already loop for
+   `g`), anything else → `22023 invalid regular expression option "<ch>"`
+   (`errors.New` wrapped via the existing goopg pgerror helper used elsewhere
+   in this file — grep `pgerrcode.InvalidRegularExpression` or equivalent for
+   the exact call convention already in use for regex compile errors in this
+   file, reuse it verbatim).
+2. Replace the three duplicated inline flag checks with calls to this helper:
+   - `evalRegexpMatchesSRF` (regexp_matches SRF path, `expr.go:7346`)
+   - `regexp_split_to_array` case (`expr.go:12820`)
+   - `regexp_replace` case's flags handling (`expr.go:11850` region) — flags
+     only; the separate start/N extended-arg bug in this same case is
+     EXPLICITLY OUT OF SCOPE for this slice (Round D, see below) — do not
+     touch arg-count dispatch here.
+3. Prepend `goFlags` (e.g. `"(?im)"`) to the pattern before
+   `regexp.Compile`/`regexp.CompilePOSIX` (whichever this file already uses —
+   confirm at the call site rather than assuming) instead of the current
+   ad-hoc `"(?i)"` string literal.
+4. Any existing pattern-translation step (`pgPatternToGoRE2`, `expr.go:2375`)
+   runs first as today; the flag prefix is prepended to ITS output, not to
+   the raw PG pattern — order matters if that function already emits its own
+   leading `(?...)` group.
+
+## Acceptance criteria
+
+- `regexp_matches('...multi-line text...', '^...$', 'mg')` returns the same
+  row count/content as PG for the `strings.sql` fixture lines (diff lines
+  852-927 close).
+- `regexp_matches(..., 'z')` (or any single unrecognized flag char) raises
+  `22023`, matching PG's error text shape (message wording may still differ
+  slightly — that residual is acceptable for this slice; row-shape/error-code
+  parity is the bar, not byte-identical message text, per Hard-won Rule #1's
+  "row-count" framing — DETAIL/HINT wording gaps get their own ledger row if
+  still present after this slice).
+- `regexp_split_to_array` correctly rejects `'z'` and reports "does not
+  support 'global' option" for `'g'` on split, per the diff's PG-oracle lines.
+- No regression in existing `regexp_matches`/`regexp_replace`/
+  `regexp_split_to_array` unit tests (`internal/executor/*_test.go` — grep
+  for existing coverage before adding new cases; add targeted cases for the
+  `m`/`s`/`n`/`p`/`w`/unknown-flag paths since none currently exist).
+
+## Follow-on slices (Round C is this doc; do NOT fold these in)
+
+Per the 2026-08-22 sizing researcher round, in priority order:
+- **Round D** — `regexp_split_to_table` SRF wiring (mechanical: mirror
+  `planFromRegexpMatches`/`fromRegexpMatchesOp` in
+  `internal/optimizer/planner.go:4639`, reusing `evalRegexpMatchesSRF`). ~129
+  diff lines, no new engine work.
+- **Round E** — `regexp_count`/`regexp_like`/`regexp_instr`/`regexp_substr`
+  (all four currently `function ... does not exist`, ~426 diff lines
+  combined). Thin wrappers over the same compiled-pattern + flags machinery
+  this round builds; do `regexp_instr` first (193 lines, exercises
+  subexpr/endoption logic reusable by `regexp_substr`).
+- **Round F** — `regexp_replace` extended 6-arg form (`text, pattern,
+  replacement, start, N, flags`) — currently misreads `start` as `flags` for
+  any call past the 4-arg form. ~81 diff lines.
+- **Round G** — `regexp_replace` backreference translator generalization
+  (`\1`/`\2`-only → any `\N`/`\&`). ~35 diff lines. The `(.)\1`
+  **pattern-side** backreference form is a genuine Go `regexp`(RE2)-vs-PG-ARE
+  engine capability gap (RE2 forbids backreferences in the pattern
+  structurally) — defer that specific sub-case to the ledger rather than
+  blocking Round G; do not attempt a regex-engine swap for this.
+
+PG oracle for all rounds: `postgres/src/backend/utils/adt/regexp.c`
+(`regexp_count`/`regexp_like`/`regexp_instr`/`regexp_substr`/`regexp_replace`/
+`regexp_matches`/`regexp_split_to_array`/`regexp_split_to_table`,
+`parse_re_flags`).
+
+## Round D (landed 2026-08-22): `regexp_split_to_table` FROM-clause SRF wiring
+
+`regexp_split_to_table(...)` was catalog-visible (`pg_proc` OIDs 2765/2766,
+`RetSet: true`) but completely unwired as a table-valued function: any
+`FROM regexp_split_to_table(...)` fell through `planTableFuncRangeVar`
+(`internal/optimizer/planner.go`) into the generic user-routine lookup and
+raised `0A000 "table-valued function \"regexp_split_to_table\" not
+supported"`.
+
+Fix mirrors the existing `regexp_matches` FROM-clause SRF wiring end to end,
+with three deliberate divergences (split returns plain `text` rows not
+`text[]`; default column alias is `"regexp_split_to_table"`; and — since PG's
+`regexp_split_to_table`/`regexp_split_to_array` share `setup_regexp_matches`
+and are both stricter than `regexp_matches` — an invalid pattern raises
+`2201B` rather than `evalRegexpMatchesSRF`'s permissive empty-rows behavior):
+
+- `internal/optimizer/plan.go` — new `FromRegexpSplitToTable` plan node
+  (same `StringExpr`/`PatternExpr`/`FlagsExpr` shape as `FromRegexpMatches`,
+  `text`-typed single output column).
+- `internal/optimizer/planner.go` — dispatch branch in
+  `planTableFuncRangeVar` + new `planFromRegexpSplitToTable` (arg validation,
+  lateral-aware resolution, `WITH ORDINALITY` wrapping — all mirrored from
+  `planFromRegexpMatches`).
+- `internal/executor/executor.go` — dispatch case for
+  `*optimizer.FromRegexpSplitToTable`.
+- `internal/executor/operators_from_regexp_split_to_table.go` (new) —
+  `fromRegexpSplitToTableOp`, mirrors `fromRegexpMatchesOp`'s
+  Open/Next/Close skeleton.
+- `internal/executor/expr.go` — new `evalRegexpSplitToTable`: reuses the
+  shared `pgRegexFlagsToGoModifiers` (Round C), rejects explicit `'g'` with
+  `22023` (message parameterized as `regexp_split_to_table()`, not copy-pasted
+  from the `regexp_split_to_array()` sibling), raises `2201B` on invalid
+  pattern, splits via `re.Split(s, -1)` (same algorithm the existing scalar
+  `regexp_split_to_array` case already uses — PG's `build_regexp_split_result`
+  confirms N matches -> N+1 rows, the same semantics).
+
+New test: `internal/executor/from_regexp_split_to_table_test.go`
+(`TestFromRegexpSplitToTable`), mirroring
+`from_regexp_matches_test.go`'s `TestFromRegexpMatches` structure.
+
+PG-regress verification: `strings.sql`'s
+`regexp_split_to_table('the quick brown fox jumps over the lazy dog',
+$re$\s+$re$)` case is now byte-identical context in
+`tmp/regress-diffs/strings.diff` (zero `+`/`-` markers) — this function's
+diff contribution is fully closed. `strings.sql` overall stays `failed`
+(unrelated pre-existing gaps: `standard_conforming_strings=off` lexing,
+`chr(0)`, bytea trim/LIKE, `char(N)` literal concat syntax — see ledger).
+
+Deferred (not this round): `string_to_table` — same table-valued-SRF shape,
+literal-delimiter instead of regex; natural next follow-on using the same
+wiring pattern. Also unexplored: `SELECT regexp_split_to_table(...)` in
+SELECT-list (non-FROM) position — the `strings.sql` fixture only exercises
+the FROM-clause form, so no evidence either way that SELECT-list position is
+broken or fixed by this round.
+
+## Round E (landed 2026-08-22): `regexp_count`/`regexp_like`/`regexp_instr`/`regexp_substr`
+
+The four Oracle-style regexp builtins (`pg_proc.dat` oids 6254-6269) were
+entirely unimplemented — `SELECT regexp_instr(...)` etc. raised `42883
+function ... does not exist`. This round wires all four as ordinary scalar
+`FuncCall` case arms in `internal/executor/expr.go` (no parser change; PG
+resolves the optional-arg overload sets purely by arg count, and goopg's
+existing convention — see `regexp_split_to_array` — already does the same
+arg-count-keyed defaulting at eval time).
+
+- `regexp_count(string, pattern [, start [, flags]])` →
+  `regexp.c:1138 regexp_count`. `start<=0` → `22023`. Counts non-overlapping
+  matches in the search window via `re.FindAllStringIndex`.
+- `regexp_like(string, pattern [, flags])` → `regexp.c:1329 regexp_like`.
+  Direct compile+execute, no start/N, bool result.
+- `regexp_instr(string, pattern [, start [, N [, endoption [, flags
+  [, subexpr]]]]])` → `regexp.c:1198 regexp_instr`, int4 position result.
+- `regexp_substr(string, pattern [, start [, N [, flags [, subexpr]]]])` →
+  `regexp.c:1904 regexp_substr` — same start/N/subexpr validation as
+  `regexp_instr` but flags/subexpr are one arg slot earlier (no `endoption`).
+  text result, NULL (not 0) for the "not found" cases.
+
+All four validate numeric args in PG's exact arg-position order (start, N,
+endoption [instr only], subexpr — all `22023 invalid value for parameter
+"<name>": <n>`, no `errposition`/`Pos` per `regexp.c`'s own bare `ereport`),
+then run flags through the shared `pgRegexFlagsToGoModifiers` (Round C) for
+`i`/`m`/`n`/`p`/`w` translation and unknown-char rejection, then reject an
+explicit `'g'` with `22023` and a per-function message
+(`"<name>() does not support the \"global\" option"` — NOT copy-pasted from
+`regexp_split_to_array`'s template; each case arm substitutes its own name).
+
+**Shared instr/substr core** (`regexpInstrSubstrLocate` in `expr.go`): both
+functions need identical start/N/subexpr match-selection arithmetic (PG's
+own C source literally near-duplicates them), so a single helper locates the
+n-th non-overlapping match in the search window and selects the requested
+capture group's byte-offset span, returning `ok=false` (not an error) when N
+exceeds the match count, subexpr exceeds the capture-group count, or the
+selected group didn't participate — `regexp_instr` maps that to `0`,
+`regexp_substr` to SQL `NULL`, exactly matching `regexp.c:1267-1273` /
+`:1965-1971`. This keeps the two "pos" computations from drifting apart, per
+the brief's explicit ask.
+
+**start>1 char-position arithmetic**: mirrors the existing
+`case "strpos", "position"` byte→char idiom (`runes := []rune(s[:idx]);
+pos := len(runes)+1`) and `evalSubstr`'s rune-window slicing — the search
+window is `string([]rune(s)[start-1:])`, matches are found within that
+window, and `regexpWindowCharPos` adds `(start-1)` runes back onto the
+reported byte offset. This is a documented simplification vs. PG's true
+start-search-offset-into-the-original-string approach: a `^`-anchored
+pattern re-anchors at the window start here rather than the true string
+start (untested by `strings.sql`, so not a landed-behavior regression, but a
+known gap for a hypothetical `regexp_instr('ab^c...)` case). Verified byte-
+identical against the fixture's idiom-correctness check:
+`regexp_instr('abcabcabc','a.c',2)` → `4`.
+
+**Newline/whitespace flag semantics — local, not shared.** Two of
+`strings.sql`'s `regexp_like` fixture lines
+(`regexp_like('a'||CHR(10)||'d','a.d','s')` → `t`;
+`regexp_like('abc',' a . c ','x')` → `t`) require behavior
+`pgRegexFlagsToGoModifiers` does not (and, per its own pinned unit test
+`TestPgRegexFlagsToGoModifiers`'s `"s-is-noop-not-go-dotall"` case, must
+not) provide: PG's *default* regex mode (and explicit `'s'`) has `.` match a
+newline (`regexp.c` `parse_re_flags`: `cflags` default to `REG_ADVANCED`
+only, i.e. `REG_NEWLINE` unset), the opposite of Go RE2's default — and `'x'`
+(`REG_EXPANDED`) makes unescaped whitespace/`#`-comments in the pattern
+insignificant, which Go RE2 has no flag for at all. Rather than change the
+shared translator (whose "`'s'` is a no-op" contract is relied on by every
+other `regexp_*` call site and locked by an existing test — changing it was
+out of this round's scope per the brief and risked an untested blast radius
+across `regexp_match`/`regexp_matches`/`regexp_replace`/`regexp_split_to_*`/
+the `~` operators), this round adds two small helpers used **only** by these
+four new case arms: `regexpLocalDotMatchesNewline` (computes whether a local
+`(?s)` prefix is needed, from `'n'/'m'/'p'` vs `'s'`) and
+`regexpApplyExpandedWhitespace` (strips insignificant whitespace/comments
+when `'x'` is present — a simplified, non-bracket-aware approximation of PG's
+ARE tokenizer, sufficient for this fixture). Both are folded together in
+`regexpCompilePattern`, the single pattern-compilation entry point all four
+new case arms use.
+
+New test: `internal/executor/regexp_instr_family_test.go`
+(`TestRegexpInstrFamily`) — happy paths for all four, the `start>1` idiom
+check, N-th match selection, `endoption` 0 vs 1, `subexpr` 0/whole-match vs
+>0/capture-group vs non-participating-group (0 for instr, NULL for substr),
+all 6 named PG error cases with exact SQLSTATE + message text, and `'g'`
+rejection for all four with per-function message text.
+
+`internal/optimizer/planner.go` `exprType`: `regexp_instr`/`regexp_count` →
+`int4`, `regexp_like` → `bool`, `regexp_substr` → `text` (`pg_proc.dat`
+`prorettype` per oid).
+
+Out of scope for this round (unchanged): `regexp_replace` backreferences,
+`regexp_matches(...,'g')` multi-match FROM-clause/SELECT-list SRF wiring, and
+any further `'x'`/`'s'` correctness work on the shared
+`pgRegexFlagsToGoModifiers` translator or its other call sites.
+
+## Round F (landed 2026-08-22): `regexp_replace` extended (start/N) overloads
+
+`regexp_replace` had two working overloads — 3-arg `(s, pattern,
+replacement)` and 4-arg `(s, pattern, replacement, flags)` — but PG defines
+three more (`pg_proc.dat:3755-3768`, `regexp.c:700-741
+textregexreplace_extended`):
+
+- oid 6253, 4-arg: `(s, pattern, replacement, start)` — no N, no flags.
+- oid 6252, 5-arg: `(s, pattern, replacement, start, N)` — no flags.
+- oid 6251, 6-arg: `(s, pattern, replacement, start, N, flags)`.
+
+Before this round, ANY call with `len(Args) >= 4` blindly read `Args[3]` as
+a flags string — so a real 6-arg call's `start` (an int Datum) was silently
+misparsed as a flags string (garbage `pgRegexFlagsToGoModifiers` input,
+usually an error). This was an existing correctness bug, fixed as part of
+this slice.
+
+**Arity collision, resolved by Datum kind, not arity.** `len(Args)==4` is
+genuinely ambiguous between oid 2285 (flags-string) and oid 6253
+(int-start) — PG itself resolves this by parse-time type resolution of the
+literal (`strings.sql`'s own "erroneous invocation" fixture:
+`regexp_replace(..., 'X', '1')` — a *quoted* string literal — stays on the
+flags overload and errors `invalid regular expression option: "1"`, while
+an *unquoted* `1` picks the int overload). goopg's untyped AST can't do
+overload resolution, but by the time the case arm runs, args have already
+been evaluated to Datums — a quoted literal evaluates to `KindString`, an
+unquoted numeric literal to `KindInt` — so branching on `Args[3].Kind`
+reproduces PG's real resolution outcome for both fixture shapes without
+needing type inference. `len(Args)==5` has only one PG overload (6252,
+start+N, no flags) so no branch is needed there; `len(Args)==6` is fully
+determined (6251).
+
+**Match-and-replace loop** (`varlena.c:4457-4618 replace_text_regexp`):
+`search_start = start-1` (0-based, char/rune offset — same rune-window
+idiom as Round E's `regexpInstrSubstrLocate`/`regexpWindowCharPos`);
+`re.FindAllStringSubmatchIndex` over that window enumerates all matches;
+`N==0` replaces every match in the window (like `g`, but scoped to
+`start`); `N>0` replaces only the Nth match and leaves all others —
+including ones before and after it — untouched, and stops (this is the
+"`'g'` is ignored when `N` is specified" fixture line,
+`strings.sql`/`strings.out` "N=1 wins over 'g'": passing `'g'` alongside an
+explicit `N` has no effect, because presence of `N` bypasses the
+`glob`-derived default entirely in the extended form — matching
+`textregexreplace_extended`'s own `PG_NARGS()<=4` guard, which only derives
+`n` from `re_flags.glob` when NEITHER `start` nor `N` was supplied). Each
+matched span is replaced via `re.ExpandString` against the SAME `\1`/`\2`→
+`${1}`/`${2}` replacement string used by the existing 3/4-arg forms — no
+change to Round-C's `\1`/`\2`-only backreference-in-replacement scope.
+
+**Pattern compilation switched to the shared `regexpCompilePattern` helper**
+(previously this case arm called Go's stdlib `regexp.Compile` directly,
+bypassing Round E's `s`/`x`-flag-aware compiler) — for ALL arities,
+including the pre-existing 3/4-arg forms, since it's the same case arm.
+Verified this is a **behavior fix, not just hygiene**, for the case with no
+flags arg at all (3-arg, or the 6253/6252 start-forms): PG's `regexp_replace`
+default mode does NOT set `REG_NEWLINE` (so `.` matches newline by default,
+same as Round E's finding for `regexp_like`/etc.) — this default now applies
+uniformly.
+
+**`internal/optimizer/planner.go` `exprType`**: added
+`case "regexp_replace": return catalog.Type{Name: "text"}`. Confirmed via a
+throwaway revert-and-retest that this is **not** purely hygiene — without
+it, `pg_typeof(regexp_replace(...))` folds to the generic `"unknown"`
+fallback (there was no prior case arm for `regexp_replace` at all in this
+switch), not `"text"`. New assertion added to the existing
+`TestPgTypeofFoldsToCompileTimeType` (`internal/optimizer/pg_typeof_test.go`).
+
+New test: `internal/executor/regexp_replace_extended_test.go`
+(`TestRegexpReplaceExtendedForm`) — the 6 acceptance-criteria fixture lines
+(`strings.out` extended-form block), the 4-arg Datum-kind arity-ambiguity
+branch (both sides), and confirmation that the pre-existing 3-arg/4-arg-flags
+forms (incl. `\1`/`\2` backreference-in-replacement) are unchanged. Live
+psql spot-check against a cgroup-capped throwaway goopg server vs the PG
+18.3 oracle: every `regexp_replace` line in `strings.sql`'s pre-existing
+(224-234) and new extended (236-251) blocks is byte-identical, including
+exact `22023` error text — EXCEPT the pre-existing (unrelated,
+Round-C-out-of-scope) backreference-*in-pattern* gap noted below, confirmed
+identical before/after this round (not a regression).
+
+**Deferral candidates (unchanged by this round, confirmed pre-existing):**
+- Backreferences *inside the regexp pattern itself* (e.g. `(.)\1` matching
+  two identical adjacent characters) are not supported at all — Go's RE2
+  engine cannot execute pattern-level backreferences (fundamentally, not a
+  goopg gap to close with more code); `strings.sql:225-228`'s
+  `E'(.)\\1'`-pattern fixtures fall through to the "invalid pattern: return
+  input unchanged" path both before and after this round. This is a
+  different, deeper gap than the Round-C `\1`/`\2`-in-*replacement*-only
+  scope (which this round explicitly left untouched) and would need a
+  backtracking regex engine swap to close — out of scope here.
+- `\3` and higher backreferences in the replacement string are also still
+  unsupported (Round-C scope: `\1`/`\2` only) — `strings.sql:224`'s
+  `(\1) \2-\3` fixture leaves the literal `\3` un-substituted (PG:
+  `3333`; goopg: `\3`), same before and after this round.
+
+## Round G (landed 2026-08-22): `regexp_replace` replacement-string backreference generalization
+
+Generalized the Round-C-era hardcoded `\1`/`\2`-only replacement conversion
+(two `strings.ReplaceAll` calls) to the full PG replacement-string escape
+grammar per `postgres/src/backend/utils/adt/varlena.c:4357-4447`
+(`appendStringInfoRegexpSubstr`): `\1`-`\9` (single-digit only — PG's `*p -
+'0'` reads exactly one byte, never multi-digit), `\&` (whole match,
+`pmatch[0]`), `\\` (literal backslash — does NOT treat the following char as
+an escape target), any other `\c` (emits literal `\` then falls through to
+normal-text copying of `c`, net effect unchanged from input), and a trailing
+lone `\` at end of string (emitted as literal `\`). This explicitly excludes
+**pattern-side** backreferences (`(.)\1`) — that remains the separate
+RE2-vs-ARE engine-capability gap documented above, untouched by this round.
+
+New unexported helper `pgRegexpReplacementTemplate(replacement string)
+string` (`internal/executor/expr.go`, placed just before
+`regexpCompilePattern`): first escapes any literal `$` in the original
+replacement text (`strings.ReplaceAll(replacement, "$", "$$")`) so Go's
+template expander doesn't misinterpret a literal `$` that was present in the
+PG replacement string, then does a single byte-by-byte scan translating PG's
+`\`-escape grammar to Go's `regexp` expansion template (`${1}`-`${9}`,
+`${0}` for `\&`, literal `\` passthrough for `\\` and other-`\c`/trailing-`\`
+cases). The single `regexp_replace` case arm (`internal/executor/expr.go`,
+~line 12097) now calls this helper once; both consumers of the resulting
+`replacement` variable — the non-start/N path's
+`re.ReplaceAllString`/`re.ReplaceAllStringFunc` and the start/N path's
+`re.ExpandString` — get the same converted template (verified: only one call
+site existed, no sibling to update).
+
+**Out-of-range group reference (`\9` with fewer capture groups): no
+divergence found.** PG's `pmatch[idx]` guard (`so >= 0 && eo >= 0`) silently
+substitutes nothing for an out-of-range/unmatched group. Verified via a
+throwaway Go probe that `(*regexp.Regexp).ReplaceAllString`/`Expand` with a
+`${9}` template referencing a nonexistent group 9 also silently expands to
+an empty string (not a panic, not an error) — so Go's behavior already
+matches PG's net effect for this case; no special-case code was needed and
+no deferral is required here.
+
+New test `TestRegexpReplaceBackreferenceGrammar`
+(`internal/executor/regexp_replace_extended_test.go`): `\1`/`\2` reordering,
+the exact `strings.sql:224` three-group fixture (`(\1) \2-\3` on a 3-group
+pattern), `\&` doubled under `'g'`, `\\` before an ordinary char (does not
+consume it as an escape target), `\9` against a 2-group pattern (silent
+no-op, confirmed matches PG), an unrecognized `\a` escape (passthrough), and
+a trailing lone `\`.
+
+Live psql spot-check against a cgroup-capped throwaway goopg server vs a
+manually-started PG 18.3 oracle (per the Round F workaround for
+`pg-oracle-diff.sh --auto-start`'s `initdb -q` breakage — ledger row
+"infra, discovered during Round F"): all of `regexp_replace('foobarbaz',
+'(bar)(baz)', '\2\1')` → `foobazbar`, `regexp_replace('abc', '.', '\&\&',
+'g')` → `aabbcc`, `regexp_replace('abc', 'b', 'x\\y')` → `ax\yc`, and the
+`strings.sql:224` fixture `regexp_replace('1112223333',
+'(\d{3})(\d{3})(\d{4})', '(\1) \2-\3')` → `(111) 222-3333` are byte-identical
+to the PG oracle.
+
+`scripts/pg-regress-runner.sh --verbose strings` confirms `strings.sql:224`
+(the Round-G target named in the Round F ledger row) is now a clean,
+non-diffing line; the remaining `regexp_replace`-family diff lines in
+`strings.sql` (lines 225-228) are exclusively the pre-existing, out-of-scope
+**pattern-side** backreference gap (`(.)\1` — `E'(.)\\1'` patterns), confirmed
+unaffected by this round (same "invalid pattern: return input unchanged"
+fallback before and after).
+
+**Deferral candidates:** none newly discovered this round — the one
+pre-existing gap this round targeted (`\3`+ in the replacement string) is
+now closed; the pattern-side-backreference gap remains exactly as documented
+above.

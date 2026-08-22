@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // LexError reports a lexing failure with byte position.
@@ -101,6 +102,74 @@ func (l *lexer) skipWhitespaceAndComments() error {
 	return nil
 }
 
+// scanPlainQuoteInto scans a plain `'...'` literal body (with `''` doubling
+// to a literal `'`) into b, starting at l.pos (positioned just after the
+// opening quote, or just after a continuation's reopening quote). It stops
+// and returns true, consuming the closing quote, when it finds an unescaped
+// `'`. It returns false (with l.pos == len(l.src)) if the input runs out
+// first — the caller reports "unterminated string literal".
+func (l *lexer) scanPlainQuoteInto(b *strings.Builder) (bool, error) {
+	for l.pos < len(l.src) {
+		if l.src[l.pos] == '\'' {
+			if l.peekAt(1) == '\'' {
+				b.WriteByte('\'')
+				l.pos += 2
+				continue
+			}
+			l.pos++
+			return true, nil
+		}
+		b.WriteByte(l.src[l.pos])
+		l.pos++
+	}
+	return false, nil
+}
+
+// tryQuoteContinuation implements PG scan.l's <xqs> lookahead state
+// (lines 574-631, quotecontinue/quotecontinuefail macros at lines 224-239):
+// after a string literal's closing quote, look ahead past whitespace and
+// `--` line comments only — block comments (`/* */`) are NOT part of the
+// quotecontinue gap in upstream (scan.l's `comment`/`non_newline_whitespace`
+// macros around lines 215-225 only cover `--` comments; `/* */` is a
+// separate <xc> start-condition), so a `/*` in the gap must fall through to
+// the default case below and fail the continuation attempt. If the gap
+// contains at least one newline AND the next non-whitespace character is a
+// `'`, this is a continuation — consume the gap and the reopening quote (so
+// the caller can resume scanning the next fragment into the same buffer)
+// and return true. Otherwise restore l.pos to where it was on entry
+// (mirrors yyless(0)) and return false, leaving the token to be emitted
+// as-is. Same-line adjacent literals (`'a' 'b'`, no newline in the gap)
+// deliberately do NOT concatenate.
+func (l *lexer) tryQuoteContinuation() (bool, error) {
+	save := l.pos
+	sawNewline := false
+scan:
+	for l.pos < len(l.src) {
+		c := l.src[l.pos]
+		switch {
+		case c == ' ' || c == '\t' || c == '\r':
+			l.pos++
+		case c == '\n':
+			sawNewline = true
+			l.pos++
+		case c == '-' && l.peekAt(1) == '-':
+			// Line comment: doesn't itself contain a newline, but the
+			// newline that ends it is picked up on the next loop iteration.
+			for l.pos < len(l.src) && l.src[l.pos] != '\n' {
+				l.pos++
+			}
+		default:
+			break scan
+		}
+	}
+	if sawNewline && l.pos < len(l.src) && l.src[l.pos] == '\'' {
+		l.pos++ // consume the continuation fragment's opening quote
+		return true, nil
+	}
+	l.pos = save
+	return false, nil
+}
+
 func (l *lexer) next() (Token, error) {
 	if err := l.skipWhitespaceAndComments(); err != nil {
 		return Token{}, err
@@ -121,6 +190,19 @@ func (l *lexer) next() (Token, error) {
 		// followed by a single-quote with no whitespace.
 		if (text == "e") && l.pos < len(l.src) && l.src[l.pos] == '\'' {
 			return l.lexEscapeString(start)
+		}
+		// U&'...'/U&"..." Unicode-escape string/identifier literal: single
+		// character 'u'/'U' immediately followed by '&' immediately followed
+		// by a quote, with zero whitespace tolerance anywhere (mirrors PG's
+		// xusstart/xuistart lexer states, scan.l:301-304). PG additionally
+		// gates this syntax on standard_conforming_strings (parser.c's
+		// UIDENT/USCONST case, ERRCODE_FEATURE_NOT_SUPPORTED when off) —
+		// SKIPPED here: goopg's lexer has no functioning off-mode string
+		// lexing today (nothing under internal/parser reads that GUC), so
+		// that check has no reachable state. M0134-0070 Round B.
+		if text == "u" && l.pos < len(l.src) && l.src[l.pos] == '&' &&
+			l.pos+1 < len(l.src) && (l.src[l.pos+1] == '\'' || l.src[l.pos+1] == '"') {
+			return l.lexUnicodeEscapeQuote(start, l.src[l.pos+1])
 		}
 		if kw, ok := keywords[text]; ok {
 			return Token{Kind: TokenKeyword, Keyword: kw, Value: text, Pos: start}, nil
@@ -149,20 +231,30 @@ func (l *lexer) next() (Token, error) {
 	case c == '\'':
 		l.pos++
 		var b strings.Builder
-		for l.pos < len(l.src) {
-			if l.src[l.pos] == '\'' {
-				if l.peekAt(1) == '\'' {
-					b.WriteByte('\'')
-					l.pos += 2
-					continue
-				}
-				l.pos++
+		for {
+			closed, err := l.scanPlainQuoteInto(&b)
+			if err != nil {
+				return Token{}, err
+			}
+			if !closed {
+				return Token{}, l.errf(start, "unterminated string literal")
+			}
+			// PG string-literal continuation (scan.l <xqs> lookahead state,
+			// lines 574-631): two or more single-quoted literals separated
+			// ONLY by whitespace/comments that include at least one newline
+			// concatenate into one token. `'a' 'b'` on one line (no newline
+			// in the gap) does NOT concatenate — matches quotecontinuefail.
+			cont, err := l.tryQuoteContinuation()
+			if err != nil {
+				return Token{}, err
+			}
+			if !cont {
 				return Token{Kind: TokenStringLit, Value: b.String(), Pos: start}, nil
 			}
-			b.WriteByte(l.src[l.pos])
-			l.pos++
+			// tryQuoteContinuation already consumed the whitespace/comments
+			// and the reopening quote; loop back to scan the next fragment
+			// into the same builder using the plain-quote decoding rule.
 		}
-		return Token{}, l.errf(start, "unterminated string literal")
 
 	case isDigit(c):
 		// l.pos currently points to c (not yet advanced past it).
@@ -450,7 +542,7 @@ func (l *lexer) next() (Token, error) {
 			two = l.src[l.pos : l.pos+2]
 		}
 		switch two {
-		case "<=", ">=", "<>", "!=", "||", "<<", ">>", "~*", "!~", "=>", "<@", "@>", "&&", "->":
+		case "<=", ">=", "<>", "!=", "||", "<<", ">>", "~*", "!~", "=>", "<@", "@>", "&&", "->", "#>":
 			l.pos += 2
 			// Check for 3-char operators (e.g., !~*).
 			if l.pos < len(l.src) && l.src[l.pos] == '*' && (two == "!~") {
@@ -461,6 +553,11 @@ func (l *lexer) next() (Token, error) {
 			if l.pos < len(l.src) && l.src[l.pos] == '>' && two == "->" {
 				l.pos++
 				return Token{Kind: TokenOperator, Value: "->>", Pos: start}, nil
+			}
+			// JSON path text-extraction operator #>> (3-char). M0134-0039.
+			if l.pos < len(l.src) && l.src[l.pos] == '>' && two == "#>" {
+				l.pos++
+				return Token{Kind: TokenOperator, Value: "#>>", Pos: start}, nil
 			}
 			return Token{Kind: TokenOperator, Value: two, Pos: start}, nil
 		}
@@ -486,7 +583,352 @@ func (l *lexer) next() (Token, error) {
 func (l *lexer) lexEscapeString(start int) (Token, error) {
 	l.pos++ // consume opening '\''
 	var b strings.Builder
+	for {
+		closed, err := l.scanEscapeQuoteInto(&b)
+		if err != nil {
+			return Token{}, err
+		}
+		if !closed {
+			return Token{}, l.errf(start, "unterminated escape string literal")
+		}
+		// PG scan.l resumes an E'...' literal's <xqs> continuation lookahead
+		// in state_before_str_stop — i.e. the SAME state the opener was in.
+		// A bare `'...'` continuation fragment after an E'...' opener is
+		// therefore still backslash-decoded per escape-string rules, not
+		// the plain `''`-doubling rule (scan.l lines 574-631).
+		cont, err := l.tryQuoteContinuation()
+		if err != nil {
+			return Token{}, err
+		}
+		if !cont {
+			return Token{Kind: TokenStringLit, Value: b.String(), Pos: start}, nil
+		}
+	}
+}
+
+// lexUnicodeEscapeQuote handles U&'...' Unicode-escape string literals and
+// U&"..." Unicode-escape quoted identifiers (SQL standard syntax; PG oracle
+// postgres/src/backend/parser/scan.l:301-304 xusstart/xuistart states,
+// parser.c:253-320 base_yylex UIDENT/USCONST handling, :352-362
+// check_uescapechar, :371-527 str_udeescape). The 'u'/'U' prefix has
+// already been consumed by next(); l.pos points at the '&'. quoteChar is
+// '\'' for the string form or '"' for the identifier form.
+//
+// Unlike E'...', the body is captured RAW (undecoded) first — matches PG:
+// the <xus>/<xui> states are undecoded, only <xe> decodes inline
+// (scan.l:636 vs :639) — because the UESCAPE clause (which determines how
+// to decode) can only be discovered by scanning past the closing quote.
+// M0134-0070 Round B.
+func (l *lexer) lexUnicodeEscapeQuote(start int, quoteChar byte) (Token, error) {
+	l.pos++ // consume '&'
+	l.pos++ // consume opening quote
+
+	var b strings.Builder
+	bodyStart := l.pos
+	if quoteChar == '\'' {
+		for {
+			closed, err := l.scanPlainQuoteInto(&b)
+			if err != nil {
+				return Token{}, err
+			}
+			if !closed {
+				return Token{}, l.errf(start, "unterminated string literal")
+			}
+			// U&'...' participates in the same <xqs> continuation
+			// lookahead as plain/escape strings (scan.l:574).
+			cont, err := l.tryQuoteContinuation()
+			if err != nil {
+				return Token{}, err
+			}
+			if !cont {
+				break
+			}
+		}
+	} else {
+		// U&"..." quoted identifier: "" doubles to " (mirrors the plain
+		// `"..."` case in next()); identifiers never continue.
+		closed := false
+		for l.pos < len(l.src) {
+			if l.src[l.pos] == '"' {
+				if l.peekAt(1) == '"' {
+					b.WriteByte('"')
+					l.pos += 2
+					continue
+				}
+				l.pos++
+				closed = true
+				break
+			}
+			b.WriteByte(l.src[l.pos])
+			l.pos++
+		}
+		if !closed {
+			return Token{}, l.errf(start, "unterminated quoted identifier")
+		}
+	}
+	raw := b.String()
+
+	// UESCAPE lookahead (parser.c:253-274 base_yylex UIDENT/USCONST case):
+	// `UESCAPE '<char>'` immediately after the closing quote, modulo
+	// whitespace/comments. `uescape` is NOT registered in token.go's
+	// keywords map — this is a lexer-local raw-text peek, not a parser
+	// production. Any mismatch restores l.pos and falls back to the
+	// default escape char '\'.
+	escape := byte('\\')
+	save := l.pos
+	if err := l.skipWhitespaceAndComments(); err != nil {
+		return Token{}, err
+	}
+	matched := false
+	if l.pos+7 <= len(l.src) && strings.EqualFold(l.src[l.pos:l.pos+7], "uescape") {
+		boundary := l.pos + 7
+		if boundary >= len(l.src) || !isIdentCont(l.src[boundary]) {
+			l.pos = boundary
+			if err := l.skipWhitespaceAndComments(); err != nil {
+				return Token{}, err
+			}
+			if l.pos < len(l.src) && l.src[l.pos] == '\'' {
+				matched = true
+				uescPos := l.pos
+				l.pos++
+				var eb strings.Builder
+				closed, err := l.scanPlainQuoteInto(&eb)
+				if err != nil {
+					return Token{}, err
+				}
+				if !closed {
+					return Token{}, l.errf(uescPos, "unterminated string literal")
+				}
+				escStr := eb.String()
+				if len(escStr) != 1 || !isValidUescapeChar(escStr[0]) {
+					// postgres/src/backend/parser/parser.c:352-362
+					// check_uescapechar. This is a hard error once we've
+					// committed to the UESCAPE clause — no fallback.
+					return Token{}, &SyntaxError{
+						Pos: uescPos, Raw: true, Code: "42601",
+						Message: "invalid Unicode escape character",
+					}
+				}
+				escape = escStr[0]
+			}
+		}
+	}
+	if !matched {
+		l.pos = save
+	}
+
+	decoded, err := l.decodeUnicodeEscapes(raw, escape)
+	if err != nil {
+		// decodeUnicodeEscapes' positions are relative to raw (its own
+		// local cursor, not l.pos); translate to an absolute source
+		// position now that we know where the body started.
+		if se, ok := err.(*SyntaxError); ok {
+			se.Pos += bodyStart
+		}
+		return Token{}, err
+	}
+	if quoteChar == '\'' {
+		return Token{Kind: TokenStringLit, Value: decoded, Pos: start}, nil
+	}
+	return Token{Kind: TokenQuotedIdent, Value: decoded, Pos: start}, nil
+}
+
+// decodeUnicodeEscapes decodes a raw U&'...'/U&"..." body (already fully
+// captured, undecoded, quote-doubling already resolved) using the resolved
+// escape character, mirroring postgres/src/backend/parser/parser.c:371-527
+// (str_udeescape) with error wording/position conventions matching Round A's
+// scanEscapeQuoteInto (near-text on 42601 errors; plain message + Hint on
+// 22025). Operates on a local cursor over raw, NOT l.pos — the body is
+// already fully captured by the time this runs. Positions in returned
+// SyntaxErrors are relative to raw (0-based); the caller offsets them by
+// the body's absolute start position. M0134-0070 Round B.
+//
+// Unlike E'...', U&'...' has no 8-hex \U form — its wide form is the
+// `<esc>+XXXXXX` (6-hex) form.
+func (l *lexer) decodeUnicodeEscapes(raw string, escape byte) (string, error) {
+	var b strings.Builder
+	var hasPendingSurrogate bool
+	var pendingSurrogateVal rune
+	pos := 0
+	for pos < len(raw) {
+		ch := raw[pos]
+		if ch != escape {
+			if hasPendingSurrogate {
+				// postgres/src/backend/parser/parser.c:494-495 (str_udeescape
+				// `else` branch, `if (pair_first) goto invalid_pair`) — an
+				// ordinary character immediately after a pending surrogate-
+				// first escape resolves it as an error.
+				near := ""
+				if pos < len(raw) {
+					r, _ := utf8.DecodeRuneInString(raw[pos:])
+					near = string(r)
+				}
+				return "", &SyntaxError{
+					Pos: pos, Raw: true, Code: "42601",
+					Message: fmt.Sprintf(`invalid Unicode surrogate pair at or near "%s"`, near),
+				}
+			}
+			b.WriteByte(ch)
+			pos++
+			continue
+		}
+		escStart := pos
+		// <esc><esc> → literal escape-char byte.
+		if pos+1 < len(raw) && raw[pos+1] == escape {
+			if hasPendingSurrogate {
+				near := raw[escStart : escStart+2]
+				return "", &SyntaxError{
+					Pos: escStart, Raw: true, Code: "42601",
+					Message: fmt.Sprintf(`invalid Unicode surrogate pair at or near "%s"`, near),
+				}
+			}
+			b.WriteByte(escape)
+			pos += 2
+			continue
+		}
+		// <esc>XXXX (4-hex) or <esc>+XXXXXX (6-hex, the wide form).
+		val, count, newPos := scanUnicodeEscapeDigitsAt(raw, pos+1, 4)
+		required := 4
+		if count < 4 && pos+1 < len(raw) && raw[pos+1] == '+' {
+			val, count, newPos = scanUnicodeEscapeDigitsAt(raw, pos+2, 6)
+			required = 6
+		}
+		if count != required {
+			// postgres/src/backend/parser/parser.c:483-486.
+			return "", &SyntaxError{
+				Pos: escStart, Raw: true, Code: "22025",
+				Message: "invalid Unicode escape",
+				Hint:    "Unicode escapes must be \\XXXX or \\+XXXXXX.",
+			}
+		}
+		pos = newPos
+		if val <= 0 || val > 0x10FFFF {
+			// postgres/src/backend/parser/parser.c:328-334 (check_unicode_value).
+			near := raw[escStart:pos]
+			return "", &SyntaxError{
+				Pos: escStart, Raw: true, Code: "42601",
+				Message: fmt.Sprintf(`invalid Unicode escape value at or near "%s"`, near),
+			}
+		}
+		if hasPendingSurrogate {
+			if isUTF16SurrogateSecond(val) {
+				b.WriteRune(surrogatePairToCodepoint(pendingSurrogateVal, val))
+				hasPendingSurrogate = false
+				continue
+			}
+			near := raw[escStart:pos]
+			return "", &SyntaxError{
+				Pos: escStart, Raw: true, Code: "42601",
+				Message: fmt.Sprintf(`invalid Unicode surrogate pair at or near "%s"`, near),
+			}
+		}
+		if isUTF16SurrogateSecond(val) {
+			// Lone low surrogate with no preceding high surrogate.
+			near := raw[escStart:pos]
+			return "", &SyntaxError{
+				Pos: escStart, Raw: true, Code: "42601",
+				Message: fmt.Sprintf(`invalid Unicode surrogate pair at or near "%s"`, near),
+			}
+		}
+		if isUTF16SurrogateFirst(val) {
+			hasPendingSurrogate = true
+			pendingSurrogateVal = val
+			continue
+		}
+		b.WriteRune(val)
+	}
+	if hasPendingSurrogate {
+		// Unfinished surrogate pair at end of body (no closing quote is
+		// present in raw — it was already stripped by the caller).
+		// postgres/src/backend/parser/parser.c:512-518.
+		return "", &SyntaxError{
+			Pos: len(raw), Raw: true, Code: "42601",
+			Message: `invalid Unicode surrogate pair at or near ""`,
+		}
+	}
+	return b.String(), nil
+}
+
+// isValidUescapeChar mirrors check_uescapechar
+// (postgres/src/backend/parser/parser.c:352-362): rejects hex digits, '+',
+// '\'', '"', and whitespace as UESCAPE characters.
+func isValidUescapeChar(c byte) bool {
+	if isHexDigit(c) || c == '+' || c == '\'' || c == '"' {
+		return false
+	}
+	switch c {
+	case ' ', '\t', '\n', '\r', '\v', '\f':
+		return false
+	}
+	return true
+}
+
+// scanEscapeQuoteInto scans an escape-string (`E'...'`) literal body,
+// applying PostgreSQL's backslash-decoding rules, into b, starting at
+// l.pos (positioned just after the opening quote, or just after a
+// continuation's reopening quote). It stops and returns true, consuming
+// the closing quote, when it finds an unescaped `'`. It returns false if
+// the input runs out first — the caller reports "unterminated escape
+// string literal".
+func (l *lexer) scanEscapeQuoteInto(b *strings.Builder) (bool, error) {
+	// hasPendingSurrogate tracks a UTF-16 surrogate-first \u/\U escape
+	// (e.g. \uD800-\uDBFF) that is waiting to be paired with an
+	// immediately-following surrogate-second escape, per
+	// postgres/src/backend/parser/scan.l:642-696 (states <xe>/<xeu>).
+	// Whatever is scanned next — a valid pairing \u/\U escape, a
+	// malformed one, or anything else at all — resolves or rejects the
+	// pending surrogate before normal scanning resumes.
+	var hasPendingSurrogate bool
+	var pendingSurrogateVal rune
 	for l.pos < len(l.src) {
+		if hasPendingSurrogate {
+			if l.pos+1 < len(l.src) && l.src[l.pos] == '\\' && (l.src[l.pos+1] == 'u' || l.src[l.pos+1] == 'U') {
+				escStart := l.pos
+				digits := 4
+				if l.src[l.pos+1] == 'U' {
+					digits = 8
+				}
+				l.pos += 2 // consume backslash + u/U
+				val, count := l.scanUnicodeEscapeDigits(digits)
+				if count < digits {
+					// postgres/src/backend/parser/scan.l:697-705
+					// (<xe,xeu>{xeunicodefail}) — digit-count failure
+					// takes priority over surrogate-pairing state.
+					return false, &SyntaxError{
+						Pos: escStart, Raw: true, Code: "22025",
+						Message: "invalid Unicode escape",
+						Hint:    "Unicode escapes must be \\uXXXX or \\UXXXXXXXX.",
+					}
+				}
+				if isUTF16SurrogateSecond(val) {
+					b.WriteRune(surrogatePairToCodepoint(pendingSurrogateVal, val))
+					hasPendingSurrogate = false
+					continue
+				}
+				// postgres/src/backend/parser/scan.l:670-687 (<xeu>{xeunicode}
+				// action) — well-formed escape, but not a valid low
+				// surrogate: near-text is the whole matched escape token.
+				near := l.src[escStart:l.pos]
+				return false, &SyntaxError{
+					Pos: escStart, Raw: true, Code: "42601",
+					Message: fmt.Sprintf(`invalid Unicode surrogate pair at or near "%s"`, near),
+				}
+			}
+			// postgres/src/backend/parser/scan.l:688-696
+			// (<xeu>. |<xeu>\n |<xeu><<EOF>>) — anything else (one
+			// arbitrary character, or nothing left) resolves the pending
+			// surrogate as an error; near-text is that single character.
+			pos := l.pos
+			near := ""
+			if l.pos < len(l.src) {
+				r, _ := utf8.DecodeRuneInString(l.src[l.pos:])
+				near = string(r)
+			}
+			return false, &SyntaxError{
+				Pos: pos, Raw: true, Code: "42601",
+				Message: fmt.Sprintf(`invalid Unicode surrogate pair at or near "%s"`, near),
+			}
+		}
 		ch := l.src[l.pos]
 		if ch == '\'' {
 			if l.pos+1 < len(l.src) && l.src[l.pos+1] == '\'' {
@@ -495,7 +937,7 @@ func (l *lexer) lexEscapeString(start int) (Token, error) {
 				continue
 			}
 			l.pos++
-			return Token{Kind: TokenStringLit, Value: b.String(), Pos: start}, nil
+			return true, nil
 		}
 		if ch == '\\' {
 			l.pos++ // consume backslash
@@ -531,22 +973,47 @@ func (l *lexer) lexEscapeString(start int) (Token, error) {
 					count++
 				}
 				b.WriteByte(val)
-			case 'u':
-				// Unicode 4-hex-digit.
-				val := rune(0)
-				for i := 0; i < 4 && l.pos < len(l.src) && isHexDigit(l.src[l.pos]); i++ {
-					val = val*16 + rune(hexVal(l.src[l.pos]))
-					l.pos++
+			case 'u', 'U':
+				// Unicode 4-hex-digit (\u) or 8-hex-digit (\U) escape.
+				// postgres/src/backend/parser/scan.l:266-267,642-705.
+				escStart := l.pos - 2 // position of the backslash
+				digits := 4
+				if esc == 'U' {
+					digits = 8
 				}
-				b.WriteRune(val)
-			case 'U':
-				// Unicode 8-hex-digit.
-				val := rune(0)
-				for i := 0; i < 8 && l.pos < len(l.src) && isHexDigit(l.src[l.pos]); i++ {
-					val = val*16 + rune(hexVal(l.src[l.pos]))
-					l.pos++
+				val, count := l.scanUnicodeEscapeDigits(digits)
+				if count < digits {
+					return false, &SyntaxError{
+						Pos: escStart, Raw: true, Code: "22025",
+						Message: "invalid Unicode escape",
+						Hint:    "Unicode escapes must be \\uXXXX or \\UXXXXXXXX.",
+					}
 				}
-				b.WriteRune(val)
+				switch {
+				case isUTF16SurrogateFirst(val):
+					// Wait for a pairing low surrogate on the next
+					// escape/character; nothing written yet.
+					hasPendingSurrogate = true
+					pendingSurrogateVal = val
+				case isUTF16SurrogateSecond(val):
+					// Lone low surrogate with no preceding high
+					// surrogate. postgres/src/backend/parser/scan.l:659-660.
+					near := l.src[escStart:l.pos]
+					return false, &SyntaxError{
+						Pos: escStart, Raw: true, Code: "42601",
+						Message: fmt.Sprintf(`invalid Unicode surrogate pair at or near "%s"`, near),
+					}
+				case val <= 0 || val > 0x10FFFF:
+					// postgres/src/backend/parser/scan.l:1378-1395
+					// (addunicode) — is_valid_unicode_codepoint.
+					near := l.src[escStart:l.pos]
+					return false, &SyntaxError{
+						Pos: escStart, Raw: true, Code: "42601",
+						Message: fmt.Sprintf(`invalid Unicode escape value at or near "%s"`, near),
+					}
+				default:
+					b.WriteRune(val)
+				}
 			default:
 				if esc >= '0' && esc <= '7' {
 					// Octal: 1-3 digits.
@@ -567,7 +1034,47 @@ func (l *lexer) lexEscapeString(start int) (Token, error) {
 		b.WriteByte(ch)
 		l.pos++
 	}
-	return Token{}, l.errf(start, "unterminated escape string literal")
+	return false, nil
+}
+
+// scanUnicodeEscapeDigits scans up to `digits` hex digits starting at
+// l.pos (positioned just after the \u or \U marker), advancing l.pos as
+// it goes. It returns the accumulated value and the number of digits
+// actually consumed; callers must check count == digits themselves —
+// PG requires an exact count (postgres/src/backend/parser/scan.l:266-267).
+func (l *lexer) scanUnicodeEscapeDigits(digits int) (rune, int) {
+	val, count, newPos := scanUnicodeEscapeDigitsAt(l.src, l.pos, digits)
+	l.pos = newPos
+	return val, count
+}
+
+// scanUnicodeEscapeDigitsAt is the l.pos-independent core of
+// scanUnicodeEscapeDigits: it scans up to `digits` hex digits from s
+// starting at pos, returning the accumulated value, the number of digits
+// actually consumed, and the new cursor position. Shared (M0134-0070 Round
+// B) by the l.pos-based E'...' escape-string decoder above and
+// decodeUnicodeEscapes below, which decodes an already-captured U&'...'/
+// U&"..." body string instead of scanning l.src/l.pos directly.
+func scanUnicodeEscapeDigitsAt(s string, pos, digits int) (rune, int, int) {
+	val := rune(0)
+	count := 0
+	for count < digits && pos < len(s) && isHexDigit(s[pos]) {
+		val = val*16 + rune(hexVal(s[pos]))
+		pos++
+		count++
+	}
+	return val, count, pos
+}
+
+// isUTF16SurrogateFirst/isUTF16SurrogateSecond mirror
+// postgres/src/include/mb/pg_wchar.h:540-550.
+func isUTF16SurrogateFirst(c rune) bool  { return c >= 0xD800 && c <= 0xDBFF }
+func isUTF16SurrogateSecond(c rune) bool { return c >= 0xDC00 && c <= 0xDFFF }
+
+// surrogatePairToCodepoint mirrors
+// postgres/src/include/mb/pg_wchar.h:552-556.
+func surrogatePairToCodepoint(first, second rune) rune {
+	return ((first & 0x3FF) << 10) + 0x10000 + (second & 0x3FF)
 }
 
 func hexVal(c byte) byte {

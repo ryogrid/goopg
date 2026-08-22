@@ -454,3 +454,108 @@ func TestParseSyntaxError(t *testing.T) {
 		t.Errorf("err type=%T (%v)", err, err)
 	}
 }
+
+
+// TestParseSyntaxErrorAtOrNearWording verifies M0134-0070: the trailing-token
+// -after-statement error now goes through errSyntaxAtCur() and echoes PG's
+// raw-source "near" text (postgres/src/backend/parser/scan.c
+// scanner_yyerror), not goopg's old "expected ';' or end of input (got …)"
+// phrasing. Covers the strings.sql illegal-comment-in-continuation fixture
+// (TokenStringLit, quoted with embedded '' doubling), a plain trailing
+// identifier (TokenIdent, no regression), and a trailing double-quoted
+// identifier (TokenQuotedIdent, quoted with embedded "" doubling).
+func TestParseSyntaxErrorAtOrNearWording(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "string-lit continuation (strings.sql)",
+			in:   "SELECT 'first line'\n' - next line' /* this comment is not allowed here */\n' - third line'\n\tAS \"Illegal comment within continuation\";",
+			want: `' - third line'`,
+		},
+		{
+			name: "trailing identifier",
+			in:   "SELECT 1 foo bar",
+			want: `bar`,
+		},
+		{
+			name: "trailing quoted identifier",
+			in:   `SELECT 1 "foo" "bar"`,
+			want: `"bar"`,
+		},
+	}
+	for _, c := range cases {
+		_, err := Parse(c.in)
+		se, ok := err.(*SyntaxError)
+		if !ok {
+			t.Fatalf("%s: err type=%T (%v), want *SyntaxError", c.name, err, err)
+		}
+		if se.Message != c.want {
+			t.Errorf("%s: Message=%q, want %q", c.name, se.Message, c.want)
+		}
+	}
+}
+
+// TestParseDeclareCursorWithHold verifies M0134-0056: `WITH` is a reserved
+// keyword (lexed as TokenKeyword/KwWith, not TokenIdent), so the WITH/WITHOUT
+// HOLD clause on DECLARE CURSOR must be matched via acceptKeyword, not
+// acceptIdentKeyword — previously the `with` arm could never match and
+// `DECLARE ... WITH HOLD ... FOR ...` raised a spurious "expected FOR" error.
+func TestParseDeclareCursorWithHold(t *testing.T) {
+	cases := []string{
+		"DECLARE c1 CURSOR WITH HOLD FOR SELECT 1",
+		"DECLARE c2 CURSOR WITHOUT HOLD FOR SELECT 1",
+		"DECLARE c3 CURSOR FOR SELECT 1", // no HOLD clause at all, still fine
+	}
+	for _, in := range cases {
+		stmts, err := Parse(in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", in, err)
+		}
+		if len(stmts) != 1 {
+			t.Fatalf("Parse(%q): %d stmts, want 1", in, len(stmts))
+		}
+		if _, ok := stmts[0].(*DeclareCursorStmt); !ok {
+			t.Fatalf("Parse(%q): %T, want *DeclareCursorStmt", in, stmts[0])
+		}
+	}
+}
+
+// TestParseFetchAbsoluteNegative verifies M0134-0056: `FETCH ABSOLUTE -1` and
+// `FETCH RELATIVE -1` must parse (the leading `-` is a separate unary-minus
+// token, never fused into the integer literal by the lexer). True
+// ABSOLUTE/RELATIVE positioning semantics are out of scope for this brief —
+// only the parse-acceptance is verified here.
+func TestParseFetchAbsoluteNegative(t *testing.T) {
+	cases := []struct {
+		in            string
+		wantCount     int64
+		wantForward   bool
+		wantCursorFOO string
+	}{
+		{"FETCH ABSOLUTE -1 FROM c", -1, true, "c"},
+		{"FETCH ABSOLUTE 5 FROM c", 5, true, "c"},
+		{"FETCH RELATIVE -2 FROM c", -2, true, "c"},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		if len(stmts) != 1 {
+			t.Fatalf("Parse(%q): %d stmts, want 1", c.in, len(stmts))
+		}
+		fs, ok := stmts[0].(*FetchStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): %T, want *FetchStmt", c.in, stmts[0])
+		}
+		if fs.Count != c.wantCount {
+			t.Errorf("Parse(%q): Count=%d, want %d", c.in, fs.Count, c.wantCount)
+		}
+		if fs.CursorName != c.wantCursorFOO {
+			t.Errorf("Parse(%q): CursorName=%q, want %q", c.in, fs.CursorName, c.wantCursorFOO)
+		}
+	}
+}

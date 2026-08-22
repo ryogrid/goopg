@@ -961,6 +961,51 @@ func TestDDLCreateRuleRoundTrip(t *testing.T) {
 	}
 }
 
+// TestDDLAlterRuleRename verifies `ALTER RULE name ON table RENAME TO
+// newname` renames the catalog.RuleInfo entry in place, and errors 42704 for
+// a nonexistent rule name. Mirrors
+// postgres/src/backend/rewrite/rewriteDefine.c:793 RenameRewriteRule.
+// M0134-0065.
+func TestDDLAlterRuleRename(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (a int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "t"})
+	if !ok {
+		t.Fatal("table t not in catalog")
+	}
+	if err := runDDL(t, ctx, "CREATE RULE somerule AS ON INSERT TO t DO INSTEAD NOTHING"); err != nil {
+		t.Fatalf("CREATE RULE somerule: %v", err)
+	}
+
+	// Success: renames the RuleInfo in place.
+	if err := runDDL(t, ctx, "ALTER RULE somerule ON t RENAME TO newname"); err != nil {
+		t.Fatalf("ALTER RULE ... RENAME TO: %v", err)
+	}
+	if len(tbl.Rules) != 1 || tbl.Rules[0].Name != "newname" {
+		t.Fatalf("after rename: tbl.Rules = %+v, want single rule named newname", tbl.Rules)
+	}
+
+	// Nonexistent rule name is 42704.
+	err := runDDL(t, ctx, "ALTER RULE missing ON t RENAME TO x")
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42704" {
+		t.Fatalf("ALTER RULE missing ... RENAME TO: err = %v, want *ExecError{Code: 42704}", err)
+	}
+
+	// Renaming to a name that collides with another rule on the same table
+	// is 42710.
+	if err := runDDL(t, ctx, "CREATE RULE other AS ON UPDATE TO t DO INSTEAD NOTHING"); err != nil {
+		t.Fatalf("CREATE RULE other: %v", err)
+	}
+	err = runDDL(t, ctx, "ALTER RULE newname ON t RENAME TO other")
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42710" {
+		t.Fatalf("ALTER RULE ... RENAME TO (duplicate): err = %v, want *ExecError{Code: 42710}", err)
+	}
+}
+
 // TestDDLCreateRuleConditionalRoundTrip verifies a conditional DO-NOTHING
 // CREATE RULE (`WHERE (qual) DO INSTEAD NOTHING`) records its deparsed qual and
 // pg_get_ruledef reconstructs the WHERE clause byte-identically to real PG 18.3

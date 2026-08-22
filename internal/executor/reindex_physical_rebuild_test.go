@@ -401,3 +401,34 @@ func TestReindexIndexConcurrentlyDoesNotBlockConcurrentIndexReader(t *testing.T)
 		t.Fatal("REINDEX INDEX CONCURRENTLY never completed with no concurrent lockers")
 	}
 }
+
+// TestReindexNailedSystemIndexNoError is the non-vacuous DoD test for
+// M0134-0062: a fresh server (no user CREATE INDEX involved) must resolve
+// REINDEX INDEX on every nailed system index reindex_catalog.sql exercises,
+// rather than erroring "relation does not exist" (the pre-fix behavior —
+// these six indexes were never registered in the runtime ns.indexes map).
+// Table is deliberately left nil on these stub catalog.Index entries
+// (registerSystemTables, catalog.go), which makes the REINDEX a safe no-op
+// via rebuildIndex's existing `idx.Table == nil` guard — this test only
+// asserts "runs without error", matching what reindex_catalog.sql itself
+// checks (it makes no post-REINDEX assertions).
+func TestReindexNailedSystemIndexNoError(t *testing.T) {
+	ctx, cleanup := newFSMFixture(t)
+	defer cleanup()
+
+	for _, name := range []string{
+		"pg_class_oid_index",
+		"pg_class_relname_nsp_index",
+		"pg_index_indexrelid_index",
+		"pg_index_indrelid_index",
+		"pg_database_oid_index",
+		"pg_shdescription_o_c_index",
+	} {
+		if err := runDDL(t, ctx, "REINDEX INDEX "+name); err != nil {
+			t.Fatalf("REINDEX INDEX %s: %v", name, err)
+		}
+	}
+	if err := runDDL(t, ctx, "REINDEX TABLE pg_shdescription"); err != nil {
+		t.Fatalf("REINDEX TABLE pg_shdescription: %v", err)
+	}
+}

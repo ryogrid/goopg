@@ -1,6 +1,7 @@
 package postmaster
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/libpq"
@@ -77,5 +78,36 @@ func TestPrepareExecuteParametersUseExecuteArgs(t *testing.T) {
 	row := decodeDataRow(t, dataRows[0])
 	if got := string(row[0]); got != "beta" {
 		t.Fatalf("label=%q, want beta", got)
+	}
+}
+
+// TestPrepareExecuteRejectsResultTypeChange verifies PostgreSQL's cached-plan
+// result-type revalidation: PREPARE p AS SELECT * FROM t; ALTER TABLE t ADD
+// COLUMN …; EXECUTE p; must raise "cached plan must not change result type"
+// rather than silently returning the widened row. Mirrors
+// RevalidateCachedQuery (postgres/src/backend/utils/cache/plancache.c:858).
+// M0134-0054 bucket 5.
+func TestPrepareExecuteRejectsResultTypeChange(t *testing.T) {
+	addr, _, stop := startCopyExecServer(t)
+	defer stop()
+
+	conn := dialAndComplete(t, addr)
+	defer conn.Close()
+
+	writeQuery(t, conn, "CREATE TABLE rtchg (i int); PREPARE p AS SELECT * FROM rtchg; ALTER TABLE rtchg ADD COLUMN q int; EXECUTE p;")
+	frames := readUntilReady(t, conn)
+
+	var errMsg string
+	for _, f := range frames {
+		if f.Type == libpq.MsgErrorResponse {
+			errMsg = string(f.Payload)
+			break
+		}
+	}
+	if errMsg == "" {
+		t.Fatalf("expected an ErrorResponse for EXECUTE after result-type change; frames=%+v", frames)
+	}
+	if !strings.Contains(errMsg, "cached plan must not change result type") {
+		t.Fatalf("error = %q, want substring %q", errMsg, "cached plan must not change result type")
 	}
 }

@@ -73,7 +73,9 @@ func FoldConstants(e Expr) Expr {
 		// ReturnType is a plan-time type stamp (user-defined functions, and the
 		// array_subscript element type resolveExpr computes) — a clone that drops
 		// it silently re-types the node as unknown downstream. M0119-0006.
-		return &FuncCall{pos: x.pos, Name: x.Name, Args: foldedArgs, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType}
+		// ArgWidth is likewise a plan-time overload-width stamp (to_hex's
+		// int4/int8 dispatch) that a clone must preserve. M0134-0070.
+		return &FuncCall{pos: x.pos, Name: x.Name, Args: foldedArgs, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType, ArgWidth: x.ArgWidth}
 
 	// ── Non-foldable: return unchanged ─────────────────────────────────
 	default:

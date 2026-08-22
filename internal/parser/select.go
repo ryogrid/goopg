@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/goopg/goopg/internal/utils/adt/similarto"
 )
 
 // parseValuesStmt parses a bare VALUES (row1), (row2), ... statement.
@@ -1931,11 +1933,15 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				left = inExpr
 				continue
 			}
-			// `expr [NOT] LIKE pattern` mirrors the IN handling. The
-			// pattern is a comparison-precedence operand so a bare
-			// string literal binds correctly without parens; nesting
-			// LIKE inside arithmetic expressions still works because
-			// we ascend at precCompare+1 for the rhs.
+			// `expr [NOT] LIKE pattern [ESCAPE escape_expr]` mirrors the IN
+			// handling. The pattern is a comparison-precedence operand so a
+			// bare string literal binds correctly without parens; nesting
+			// LIKE inside arithmetic expressions still works because we
+			// ascend at precCompare+1 for the rhs. An optional trailing
+			// ESCAPE clause (PG oracle: gram.y `a_expr LIKE a_expr ESCAPE
+			// a_expr`) is wrapped into a LikeEscapePattern so it survives
+			// as the BinaryOp's Right operand without touching the
+			// BinaryOp struct itself. M0134-0070.
 			if t := p.cur(); t.Kind == TokenKeyword && t.Keyword == KwLike {
 				pos := t.Pos
 				p.advance()
@@ -1956,6 +1962,10 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 					continue
 				}
 				rhs, err := p.parseExprPrec(precCompare + 1)
+				if err != nil {
+					return nil, err
+				}
+				rhs, err = p.wrapLikeEscape(rhs)
 				if err != nil {
 					return nil, err
 				}
@@ -1986,6 +1996,10 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				if err != nil {
 					return nil, err
 				}
+				rhs, err = p.wrapLikeEscape(rhs)
+				if err != nil {
+					return nil, err
+				}
 				left = &BinaryOp{pos: pos, Op: OpNotLike, Left: left, Right: rhs}
 				continue
 			}
@@ -2009,6 +2023,10 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 					continue
 				}
 				rhs, err := p.parseExprPrec(precCompare + 1)
+				if err != nil {
+					return nil, err
+				}
+				rhs, err = p.wrapLikeEscape(rhs)
 				if err != nil {
 					return nil, err
 				}
@@ -2039,7 +2057,62 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				if err != nil {
 					return nil, err
 				}
+				rhs, err = p.wrapLikeEscape(rhs)
+				if err != nil {
+					return nil, err
+				}
 				left = &BinaryOp{pos: pos, Op: OpNotILike, Left: left, Right: rhs}
+				continue
+			}
+			// `expr SIMILAR TO pattern [ESCAPE escape_expr]` and its NOT
+			// variant. PG oracle: postgres/src/backend/parser/gram.y:15080-
+			// 15115 desugars this to `x ~ similar_to_escape(pattern[,
+			// escape])` / `x !~ similar_to_escape(...)` — real PG's planner
+			// constant-folds that function call away when its arguments are
+			// literals, so `EXPLAIN` shows the plain `~`/`!~` BinaryOp with a
+			// pre-converted POSIX pattern. goopg mirrors that by performing
+			// the conversion here, at parse time, via buildSimilarTo.
+			// M0134-0070.
+			if t := p.cur(); t.Kind == TokenKeyword && t.Keyword == KwSimilar &&
+				p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwTo {
+				pos := t.Pos
+				p.advance() // SIMILAR
+				p.advance() // TO
+				rhs, err := p.parseExprPrec(precCompare + 1)
+				if err != nil {
+					return nil, err
+				}
+				escExpr, err := p.parseOptionalEscape()
+				if err != nil {
+					return nil, err
+				}
+				newLeft, err := p.buildSimilarTo(left, rhs, escExpr, pos, false)
+				if err != nil {
+					return nil, err
+				}
+				left = newLeft
+				continue
+			}
+			if t := p.cur(); t.Kind == TokenKeyword && t.Keyword == KwNot &&
+				p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwSimilar &&
+				p.peek(2).Kind == TokenKeyword && p.peek(2).Keyword == KwTo {
+				pos := t.Pos
+				p.advance() // NOT
+				p.advance() // SIMILAR
+				p.advance() // TO
+				rhs, err := p.parseExprPrec(precCompare + 1)
+				if err != nil {
+					return nil, err
+				}
+				escExpr, err := p.parseOptionalEscape()
+				if err != nil {
+					return nil, err
+				}
+				newLeft, err := p.buildSimilarTo(left, rhs, escExpr, pos, true)
+				if err != nil {
+					return nil, err
+				}
+				left = newLeft
 				continue
 			}
 			// POSIX regex operators: ~ ~* !~ !~* (M0097-0011).
@@ -2437,7 +2510,7 @@ func (p *parser) parseAnyTail(left Expr, pos int) (Expr, error) {
 		return &InExpr{pos: pos, Operand: left, Negated: false, Subquery: sel}, nil
 	}
 	// `expr op ANY|ALL (SELECT ...)` — subquery form, mirroring parseInTail.
-	if p.cur().Kind == TokenKeyword && (p.cur().Keyword == KwSelect || p.cur().Keyword == KwValues) {
+	if p.cur().Kind == TokenKeyword && (p.cur().Keyword == KwSelect || p.cur().Keyword == KwValues || p.cur().Keyword == KwWith) {
 		old, oldNoPos := p.selectIntoErrMsg, p.selectIntoNoPos
 		p.selectIntoErrMsg = "SELECT ... INTO is not allowed here"
 		p.selectIntoNoPos = false
@@ -2861,6 +2934,10 @@ func (p *parser) peekBinaryOp() (OpCode, int, bool) {
 			return OpJSONGet, precJSON, true
 		case "->>":
 			return OpJSONGetText, precJSON, true
+		case "#>":
+			return OpJSONPathGet, precJSON, true
+		case "#>>":
+			return OpJSONPathGetText, precJSON, true
 		}
 	case TokenSymbol:
 		// '*' is also a symbol token (target-list wildcard) — but in
@@ -2944,7 +3021,7 @@ func (p *parser) parsePrimary() (Expr, error) {
 			// nested-paren forms like `((SELECT …) UNION SELECT …)`.
 			// Look ahead through leading `(` tokens to find SELECT/VALUES.
 			isSubqStart := false
-			if p.cur().Kind == TokenKeyword && (p.cur().Keyword == KwSelect || p.cur().Keyword == KwValues) {
+			if p.cur().Kind == TokenKeyword && (p.cur().Keyword == KwSelect || p.cur().Keyword == KwValues || p.cur().Keyword == KwWith) {
 				isSubqStart = true
 			} else if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
 				for i := 0; ; i++ {
@@ -2952,7 +3029,7 @@ func (p *parser) parsePrimary() (Expr, error) {
 					if tok.Kind == TokenSymbol && tok.Value == "(" {
 						continue
 					}
-					if tok.Kind == TokenKeyword && (tok.Keyword == KwSelect || tok.Keyword == KwValues) {
+					if tok.Kind == TokenKeyword && (tok.Keyword == KwSelect || tok.Keyword == KwValues || tok.Keyword == KwWith) {
 						isSubqStart = true
 					}
 					break
@@ -3784,6 +3861,112 @@ func (p *parser) parseQueryOperandWithParens() (*SelectStmt, error) {
 // after the IN keyword. The parenthesised body is either a
 // parenthesised SELECT (uncorrelated subquery) or a value list
 // — disambiguated by whether the first inner token is SELECT.
+// wrapLikeEscape checks for a trailing `ESCAPE escape_expr` clause after a
+// LIKE/NOT LIKE/ILIKE/NOT ILIKE pattern rhs. If present, it consumes the
+// ESCAPE keyword and the escape expression (parsed at the same
+// comparison-precedence level as the pattern rhs) and wraps rhs in a
+// LikeEscapePattern; otherwise rhs is returned unchanged. PG oracle:
+// postgres/src/backend/parser/gram.y `a_expr LIKE a_expr ESCAPE a_expr`.
+// M0134-0070.
+func (p *parser) wrapLikeEscape(rhs Expr) (Expr, error) {
+	if t := p.cur(); t.Kind == TokenKeyword && t.Keyword == KwEscape {
+		pos := t.Pos
+		p.advance()
+		escExpr, err := p.parseExprPrec(precCompare + 1)
+		if err != nil {
+			return nil, err
+		}
+		return &LikeEscapePattern{pos: pos, Pattern: rhs, Escape: escExpr}, nil
+	}
+	return rhs, nil
+}
+
+// parseOptionalEscape consumes a trailing `ESCAPE escape_expr` clause if
+// present (same comparison-precedence level as the preceding pattern
+// operand) and returns it, or nil if no ESCAPE clause was written. Shared by
+// buildSimilarTo's callers; unlike wrapLikeEscape it does not wrap the
+// pattern — SIMILAR TO's pattern and escape are combined by buildSimilarTo
+// instead. M0134-0070.
+func (p *parser) parseOptionalEscape() (Expr, error) {
+	if t := p.cur(); t.Kind == TokenKeyword && t.Keyword == KwEscape {
+		p.advance()
+		return p.parseExprPrec(precCompare + 1)
+	}
+	return nil, nil
+}
+
+// similarToLiteralValue reports whether e is a literal usable for
+// parse-time SIMILAR TO constant folding: a plain string literal (returns
+// its Value, isNull=false) or the NULL literal (isNull=true, Value
+// meaningless). ok=false for anything else (a column ref, subquery, etc.),
+// signalling the caller to fall back to runtime evaluation. M0134-0070.
+func similarToLiteralValue(e Expr) (value string, isNull bool, ok bool) {
+	switch x := e.(type) {
+	case *StringConst:
+		return x.Value, false, true
+	case *NullConst:
+		return "", true, true
+	}
+	return "", false, false
+}
+
+// buildSimilarTo implements the parse-time constant-fold half of `expr
+// SIMILAR TO pattern [ESCAPE escape]` / `expr NOT SIMILAR TO pattern
+// [ESCAPE escape]` (PG oracle: postgres/src/backend/parser/gram.y:15080-
+// 15115 desugar to similar_to_escape_1/2; postgres/src/backend/utils/adt/
+// regexp.c:768-1063 similar_escape_internal). escape is nil when no ESCAPE
+// clause was written (defaults to backslash, similarto.DefaultEscape).
+//
+// When pattern and escape (if present) are both literal, the conversion
+// runs immediately and the result is a plain BinaryOp{Op: OpRegexMatch /
+// OpRegexNoMatch} with a `'<posix>'::text` right operand — the same shape
+// real PG's planner constant-folding produces, so EXPLAIN output matches
+// byte-for-byte. A NULL pattern or escape literal folds the whole
+// expression to NULL (the underlying PG function is STRICT). An
+// escape string of more than one character is ERROR 22025 raised
+// immediately, matching similar_escape_internal's ereport (no
+// errposition call in the C source, hence Pos: -1 here to suppress the
+// wire LINE/caret PG itself doesn't emit for this error).
+//
+// When either operand isn't a literal, folding is deferred to a
+// SimilarToPattern runtime node — not exercised by strings.sql, see
+// M0134-0070 report for the deferral note.
+func (p *parser) buildSimilarTo(left, pattern, escape Expr, pos int, negate bool) (Expr, error) {
+	patVal, patNull, patOK := similarToLiteralValue(pattern)
+	escVal, escNull, escOK := similarto.DefaultEscape, false, true
+	if escape != nil {
+		escVal, escNull, escOK = similarToLiteralValue(escape)
+	}
+	if !patOK || !escOK {
+		return &SimilarToPattern{pos: pos, Left: left, Pattern: pattern, Escape: escape, Negate: negate}, nil
+	}
+	if patNull || escNull {
+		return &NullConst{pos: pos}, nil
+	}
+	if err := similarto.ValidateEscape(escVal); err != nil {
+		return nil, &SyntaxError{
+			Pos: -1, Raw: true, Code: "22025",
+			Message: "invalid escape string",
+			Hint:    "Escape string must be empty or one character.",
+		}
+	}
+	converted := similarto.Convert(patVal, escVal)
+	op := OpRegexMatch
+	if negate {
+		op = OpRegexNoMatch
+	}
+	return &BinaryOp{
+		pos:  pos,
+		Op:   op,
+		Left: left,
+		Right: &TypedStringLit{
+			pos:   pos,
+			Type:  "text",
+			Value: converted,
+		},
+	}, nil
+}
+
 func (p *parser) parseInTail(left Expr, pos int, negated bool) (Expr, error) {
 	if !p.acceptSymbol("(") {
 		return nil, p.errAtCur("expected '(' after IN")
@@ -3800,7 +3983,7 @@ func (p *parser) parseInTail(left Expr, pos int, negated bool) (Expr, error) {
 		}
 		return &InExpr{pos: pos, Operand: left, Negated: negated, Subquery: sel}, nil
 	}
-	if p.cur().Kind == TokenKeyword && (p.cur().Keyword == KwSelect || p.cur().Keyword == KwValues) {
+	if p.cur().Kind == TokenKeyword && (p.cur().Keyword == KwSelect || p.cur().Keyword == KwValues || p.cur().Keyword == KwWith) {
 		// SELECT/VALUES … inside IN (...). M0097-0020.
 		old, oldNoPos := p.selectIntoErrMsg, p.selectIntoNoPos
 		p.selectIntoErrMsg = "SELECT ... INTO is not allowed here"
@@ -4100,6 +4283,40 @@ func (p *parser) parseSubstringFuncCall(pos int, name string) (Expr, error) {
 		return &FuncCall{pos: pos, Name: ObjectName{pos: pos, Name: name}, Args: args}, nil
 	}
 
+	// SQL:1999/2003 form: SUBSTRING(str SIMILAR pattern ESCAPE escape).
+	// PG oracle: postgres/src/backend/parser/gram.y substr_list production
+	// `a_expr SIMILAR a_expr ESCAPE a_expr` — unlike the boolean `SIMILAR TO`
+	// operator's optional ESCAPE clause (parseOptionalEscape), the grammar
+	// makes ESCAPE mandatory here; there is no escape-optional alternative
+	// for this production. Desugars (via system_functions.sql's
+	// substring(text,text,text) SQL wrapper, `RETURN substring($1,
+	// similar_to_escape($2, $3))`) to a plain 2-arg substring(str, pattern)
+	// call once pattern/escape are constant-folded through
+	// similarto.ConvertSubstring. M0134-0070; see
+	// docs/design/m0134-0070-substring-similar-escape.md. The older SQL:1999
+	// `SUBSTRING(str FROM pattern FOR escape)` overload spelling of this same
+	// semantics is a separate, out-of-scope mechanism (overload resolution
+	// on FROM/FOR operand types, not a distinct grammar production) — not
+	// handled here.
+	if t := p.cur(); t.Kind == TokenKeyword && t.Keyword == KwSimilar {
+		p.advance() // SIMILAR
+		pattern, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expectKeyword(KwEscape); err != nil {
+			return nil, err
+		}
+		escape, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')' to close SUBSTRING")
+		}
+		return p.buildSubstringSimilar(str, pattern, escape, pos)
+	}
+
 	// SQL-standard form: SUBSTRING(str FROM start [FOR count])
 	if _, err := p.expectKeyword(KwFrom); err != nil {
 		return nil, err
@@ -4121,6 +4338,155 @@ func (p *parser) parseSubstringFuncCall(pos int, name string) (Expr, error) {
 		return nil, p.errAtCur("expected ')' to close SUBSTRING")
 	}
 	return &FuncCall{pos: pos, Name: ObjectName{pos: pos, Name: name}, Args: args}, nil
+}
+
+// buildSubstringSimilar constant-folds SUBSTRING(str SIMILAR pattern ESCAPE
+// escape) (SQL:1999/2003 form) into a plain 2-arg substring(str,
+// <converted-pattern>) FuncCall, mirroring buildSimilarTo's literal-check →
+// validate-escape → convert → fold shape but adapted for this form's
+// 3-operand STRICT semantics: str, pattern, AND escape all participate in
+// NULL propagation (PG oracle: system_functions.sql's substring(text,text,
+// text) wrapper is declared STRICT, so any of the three being SQL NULL
+// makes the whole call NULL), not just pattern/escape as in buildSimilarTo's
+// 2-operand boolean-operator case. The converted pattern lands directly on
+// the existing evalSubstr/evalSubstrRegex 2-arg path — no executor changes.
+// M0134-0070.
+func (p *parser) buildSubstringSimilar(str, pattern, escape Expr, pos int) (Expr, error) {
+	_, strNull, strOK := similarToLiteralValue(str)
+	patVal, patNull, patOK := similarToLiteralValue(pattern)
+	escVal, escNull, escOK := similarToLiteralValue(escape)
+	if !strOK || !patOK || !escOK {
+		return nil, p.errAtCur("SUBSTRING(... SIMILAR ... ESCAPE ...) with non-literal operands is not yet supported")
+	}
+	if strNull || patNull || escNull {
+		return &NullConst{pos: pos}, nil
+	}
+	if err := similarto.ValidateEscape(escVal); err != nil {
+		return nil, &SyntaxError{
+			Pos: -1, Raw: true, Code: "22025",
+			Message: "invalid escape string",
+			Hint:    "Escape string must be empty or one character.",
+		}
+	}
+	converted, err := similarto.ConvertSubstring(patVal, escVal)
+	if err != nil {
+		if err == similarto.ErrTooManyQuoteSeparators {
+			return nil, &SyntaxError{
+				Pos: -1, Raw: true, Code: "2200C",
+				Message: err.Error(),
+			}
+		}
+		return nil, err
+	}
+	return &FuncCall{
+		pos:  pos,
+		Name: ObjectName{pos: pos, Name: "substring"},
+		Args: []Expr{
+			str,
+			&TypedStringLit{pos: pos, Type: "text", Value: converted},
+		},
+	}, nil
+}
+
+
+// parseOverlayFuncCall parses the SQL-standard
+// OVERLAY(str PLACING replacement FROM start [FOR count]) syntax and
+// desugars it to a plain overlay(str, replacement, start[, count]) FuncCall.
+// PLACING is not a `KwXxx` token in goopg's lexer (unlike FROM/FOR), so it is
+// matched via acceptIdentKeyword rather than expectKeyword. M0134-0070.
+// PG oracle: postgres/src/backend/parser/gram.y:15910-15927 (OVERLAY
+// productions), :16797-16808 (overlay_list — arg order target, replacement,
+// start[, length]).
+func (p *parser) parseOverlayFuncCall(pos int) (Expr, error) {
+	if !p.acceptSymbol("(") {
+		return nil, p.errAtCur("expected '(' after OVERLAY")
+	}
+	str, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if !p.acceptIdentKeyword("placing") {
+		return nil, p.errAtCur("expected PLACING")
+	}
+	repl, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expectKeyword(KwFrom); err != nil {
+		return nil, err
+	}
+	start, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	args := []Expr{str, repl, start}
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwFor {
+		p.advance() // consume FOR
+		count, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, count)
+	}
+	if !p.acceptSymbol(")") {
+		return nil, p.errAtCur("expected ')' to close OVERLAY")
+	}
+	return &FuncCall{pos: pos, Name: ObjectName{pos: pos, Name: "overlay"}, Args: args}, nil
+}
+
+// parsePositionFuncCall handles the SQL-standard POSITION(substring IN
+// string) form, alongside the goopg-legacy comma form
+// POSITION(substring, string) — both desugar to the existing two-arg
+// "position" FuncCall dispatch (internal/executor/expr.go,
+// `case "strpos", "position":`). Modeled on parseSubstringFuncCall's
+// dual-form pattern. PG oracle: postgres/src/backend/parser/gram.y,
+// `POSITION_P '(' b_expr IN_P b_expr ')'` (func_expr_common_subexpr).
+func (p *parser) parsePositionFuncCall(pos int) (Expr, error) {
+	if !p.acceptSymbol("(") {
+		return nil, p.errAtCur("expected '(' after POSITION")
+	}
+	// Parse the substring operand at precCompare+1 so a trailing IN
+	// keyword is left for us to detect below rather than being consumed
+	// by the generic precedence-climbing loop's `expr [NOT] IN (...)`
+	// postfix check (which expects '(' right after IN and would error
+	// on the SQL-standard `IN str` form here).
+	sub, err := p.parseExprPrec(precCompare + 1)
+	if err != nil {
+		return nil, err
+	}
+
+	// Comma form: POSITION(sub, str). Already reachable via the generic
+	// call-parsing fallback too, but handling it here keeps both forms
+	// together in one place, mirroring parseSubstringFuncCall.
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "," {
+		p.advance()
+		str, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')' to close POSITION")
+		}
+		return &FuncCall{pos: pos, Name: ObjectName{pos: pos, Name: "position"}, Args: []Expr{sub, str}}, nil
+	}
+
+	// SQL-standard form: POSITION(sub IN str)
+	if _, err := p.expectKeyword(KwIn); err != nil {
+		return nil, err
+	}
+	str, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if !p.acceptSymbol(")") {
+		return nil, p.errAtCur("expected ')' to close POSITION")
+	}
+	// The executor's `case "strpos", "position":` (internal/executor/expr.go)
+	// treats Args[0] as the haystack string and Args[1] as the needle
+	// substring — the strpos(string, substring) convention. The SQL-standard
+	// IN form is written substring-first (`POSITION(sub IN str)`), so the
+	// desugared FuncCall args must be reordered to {str, sub} to match.
+	return &FuncCall{pos: pos, Name: ObjectName{pos: pos, Name: "position"}, Args: []Expr{str, sub}}, nil
 }
 
 // parseColumnOrCall handles `name`, `name.name`, `name.name.name`,
@@ -4214,6 +4580,17 @@ func (p *parser) parseColumnOrCall() (Expr, error) {
 		// Intercept before the generic call path. M0097-0042.
 		if len(parts) == 1 && strings.EqualFold(parts[0], "trim") {
 			return p.parseTrimFuncCall(startPos)
+		}
+		// POSITION(substring IN string) — SQL standard, desugars to the
+		// existing two-arg position(sub, str) FuncCall. M0134-0070.
+		if len(parts) == 1 && strings.EqualFold(parts[0], "position") {
+			return p.parsePositionFuncCall(startPos)
+		}
+		// OVERLAY(str PLACING replacement FROM start [FOR count]) — SQL
+		// standard, desugars to overlay(str, replacement, start[, count]).
+		// M0134-0070.
+		if len(parts) == 1 && strings.EqualFold(parts[0], "overlay") {
+			return p.parseOverlayFuncCall(startPos)
 		}
 		var name ObjectName
 		switch len(parts) {

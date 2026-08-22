@@ -3,6 +3,7 @@ package executor
 import (
 	"testing"
 
+	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -101,5 +102,128 @@ func TestJSONArrowChained(t *testing.T) {
 	}
 	if step3.IsNull() || step3.StringValue() != "2" {
 		t.Fatalf("got %+v, want 2", step3)
+	}
+}
+
+// TestJSONPathGetOperators pins the json path-extraction operators #> and
+// #>> (M0134-0039), the operator-form siblings of json_extract_path[_text].
+// The right operand is a text[] path, carried the same way goopg carries any
+// array Datum: text in PG's array-literal form "{elem1,elem2,...}".
+func TestJSONPathGetOperators(t *testing.T) {
+	jdat := func(s string) Datum { return NewStringDatum(s) }
+
+	cases := []struct {
+		name     string
+		op       parser.OpCode
+		left     Datum
+		right    Datum
+		want     string
+		wantNull bool
+	}{
+		// 2+ level object path
+		{"path-object-2deep", parser.OpJSONPathGet, jdat(`{"a":{"b":1}}`), jdat("{a,b}"), "1", false},
+		// array-index path element
+		{"path-array-index", parser.OpJSONPathGet, jdat(`{"a":{"b":[1,2,3]}}`), jdat("{a,b,1}"), "2", false},
+		// missing path → NULL
+		{"path-missing", parser.OpJSONPathGet, jdat(`{"a":1}`), jdat("{x}"), "", true},
+		// empty path array → identity (whole document, unchanged)
+		{"path-empty", parser.OpJSONPathGet, jdat(`{"a":1}`), jdat("{}"), `{"a":1}`, false},
+		// #>> scalar as text
+		{"pathtext-scalar", parser.OpJSONPathGetText, jdat(`{"a":1}`), jdat("{x}"), "", true},
+		{"pathtext-found-scalar", parser.OpJSONPathGetText, jdat(`{"a":{"b":"x"}}`), jdat("{a,b}"), "x", false},
+		// #>> on a nested object/array → compact json text
+		{"pathtext-nested-object", parser.OpJSONPathGetText, jdat(`{"a":{"b":{"c":1}}}`), jdat("{a,b}"), `{"c":1}`, false},
+		{"pathtext-nested-array", parser.OpJSONPathGetText, jdat(`{"a":[1,2,3]}`), jdat("{a}"), `[1,2,3]`, false},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := evalBinary(c.op, c.left, c.right, 0, nil)
+			if err != nil {
+				t.Fatalf("evalBinary: %v", err)
+			}
+			if c.wantNull {
+				if !got.IsNull() {
+					t.Fatalf("got %+v, want NULL", got)
+				}
+				return
+			}
+			if got.IsNull() {
+				t.Fatalf("got NULL, want %q", c.want)
+			}
+			if got.StringValue() != c.want {
+				t.Fatalf("got %q, want %q", got.StringValue(), c.want)
+			}
+		})
+	}
+}
+
+// TestJSONPathGetInvalidJSON pins the 22P02 error for a non-JSON left
+// operand, mirroring TestJSONArrowInvalidJSON.
+func TestJSONPathGetInvalidJSON(t *testing.T) {
+	_, err := evalBinary(parser.OpJSONPathGet, NewStringDatum("not json"), NewStringDatum("{a}"), 0, nil)
+	if err == nil {
+		t.Fatal("expected error for invalid json, got nil")
+	}
+	ee, ok := err.(*ExecError)
+	if !ok || ee.Code != "22P02" {
+		t.Fatalf("got %v, want ExecError 22P02", err)
+	}
+}
+
+// TestJsonExtractPath pins json_extract_path/json_extract_path_text/
+// jsonb_extract_path/jsonb_extract_path_text — the VARIADIC text[] path-array
+// siblings of -> / ->> (M0134-0037). Oracle:
+// postgres/src/backend/utils/adt/jsonfuncs.c get_path_all/get_jsonb_path_all.
+func TestJsonExtractPath(t *testing.T) {
+	sconst := func(s string) optimizer.Expr { return &optimizer.StringConst{Value: s} }
+	doc := `{"f2":{"f3":1},"f4":{"f5":99,"f6":"stringy"}}`
+
+	cases := []struct {
+		name     string
+		fn       string
+		src      string
+		path     []string
+		want     string
+		wantNull bool
+	}{
+		{"json-nested-scalar-as-json", "json_extract_path", doc, []string{"f4", "f6"}, `"stringy"`, false},
+		{"json-nested-scalar-as-text", "json_extract_path_text", doc, []string{"f4", "f6"}, "stringy", false},
+		{"jsonb-nested-scalar-as-json", "jsonb_extract_path", doc, []string{"f4", "f6"}, `"stringy"`, false},
+		{"jsonb-nested-scalar-as-text", "jsonb_extract_path_text", doc, []string{"f4", "f6"}, "stringy", false},
+		{"json-numeric-path-indexes-array", "json_extract_path", `{"a":[1,2,3]}`, []string{"a", "1"}, "2", false},
+		{"jsonb-numeric-path-indexes-array", "jsonb_extract_path", `{"a":[1,2,3]}`, []string{"a", "1"}, "2", false},
+		{"json-missing-key-is-null", "json_extract_path", `{"a":1}`, []string{"b"}, "", true},
+		{"jsonb-missing-key-is-null", "jsonb_extract_path", `{"a":1}`, []string{"b"}, "", true},
+		{"json-oob-array-index-is-null", "json_extract_path", `{"a":[1,2,3]}`, []string{"a", "5"}, "", true},
+		{"json-non-numeric-index-against-array-is-null", "json_extract_path", `{"a":[1,2,3]}`, []string{"a", "x"}, "", true},
+		{"json-nested-object-as-json-not-unwrapped", "json_extract_path", doc, []string{"f4"}, `{"f5":99,"f6":"stringy"}`, false},
+		{"json-nested-object-as-text-not-unwrapped", "json_extract_path_text", doc, []string{"f4"}, `{"f5":99,"f6":"stringy"}`, false},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			args := []optimizer.Expr{sconst(c.src)}
+			for _, p := range c.path {
+				args = append(args, sconst(p))
+			}
+			fc := &optimizer.FuncCall{Name: c.fn, Args: args}
+			got, err := evalFuncCall(fc, nil, &Context{})
+			if err != nil {
+				t.Fatalf("evalFuncCall: %v", err)
+			}
+			if c.wantNull {
+				if !got.IsNull() {
+					t.Fatalf("got %+v, want NULL", got)
+				}
+				return
+			}
+			if got.IsNull() {
+				t.Fatalf("got NULL, want %q", c.want)
+			}
+			if got.StringValue() != c.want {
+				t.Fatalf("got %q, want %q", got.StringValue(), c.want)
+			}
+		})
 	}
 }

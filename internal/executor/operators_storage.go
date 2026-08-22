@@ -1392,7 +1392,7 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	}
 	// Reject scans of unpopulated materialized views (WITH NO DATA / before REFRESH). M0097-0025.
 	if o.tbl != nil && o.tbl.IsMatView && !o.tbl.IsPopulated {
-		return &ExecError{Code: "55000", Pos: o.pos,
+		return &ExecError{Code: "55000",
 			Message: fmt.Sprintf("materialized view %q has not been populated", o.tbl.Name),
 			Hint:    "Use the REFRESH MATERIALIZED VIEW command."}
 	}
@@ -2219,6 +2219,17 @@ func dmlPrivilegePermitted(ctx *Context, tbl *catalog.Table, priv string) bool {
 // superuser bypass always wins regardless of checkRole — a superuser
 // session runs everything as itself, view-owner semantics or not.
 // M0122-0008 (view-owner privilege gap).
+//
+// The owner bypass below is conditional, not unconditional: PostgreSQL's
+// object-owner privilege is a revocable implicit aclitem materialized by
+// acldefault() at creation time, not a hard-coded bypass in aclcheck
+// (postgres/src/backend/utils/adt/acl.c pg_class_aclcheck never
+// special-cases "is this role the owner" — only the *_ownercheck functions
+// used for DDL like ALTER/DROP hard-code an owner bypass, and those are
+// untouched here). So once an explicit REVOKE has touched the owner's
+// implicit default ACL (IsOwnerACLRevoked), the owner's remaining rights
+// come from the materialized owner ACL entry instead of an automatic true.
+// M0134-0069 bucket 7.
 func dmlPrivilegePermittedAs(ctx *Context, tbl *catalog.Table, priv, checkRole string) bool {
 	if ctx.NonSuperuserRole == "" {
 		return true // bootstrap superuser session: full privileges
@@ -2236,9 +2247,27 @@ func dmlPrivilegePermittedAs(ctx *Context, tbl *catalog.Table, priv, checkRole s
 		return true
 	}
 	if tbl.Owner != "" && strings.EqualFold(tbl.Owner, checkRole) {
-		return true
+		if !ctx.Catalog.IsOwnerACLRevoked(tbl.OID) {
+			return true
+		}
+		return ctx.Catalog.HasOwnerPrivilege(tbl.OID, priv)
 	}
 	return ctx.Catalog.HasTablePrivilege(tbl.OID, checkRole, priv)
+}
+
+// dmlPrivilegePermittedAsAny is dmlPrivilegePermittedAs but ORs the check
+// across several privileges — mirrors PostgreSQL sequence.c's multi-bit ACL
+// masks (e.g. nextval_internal's ACL_USAGE | ACL_UPDATE, currval_oid's and
+// lastval's ACL_SELECT | ACL_USAGE). Delegates to dmlPrivilegePermittedAs for
+// each privilege so the owner/bootstrap-superuser-bypass/HasTablePrivilege
+// core logic is never duplicated. M0134-0069 bucket 5.
+func dmlPrivilegePermittedAsAny(ctx *Context, tbl *catalog.Table, checkRole string, privs ...string) bool {
+	for _, priv := range privs {
+		if dmlPrivilegePermittedAs(ctx, tbl, priv, checkRole) {
+			return true
+		}
+	}
+	return false
 }
 
 // selectPrivilegeCheckRole resolves the role whose SELECT grant a scan
@@ -2970,50 +2999,16 @@ func routeToPartitionDepth(parent *catalog.Table, row Row, im *catalog.InMemory,
 		}
 		child = im.FindRangePartitionForDatums(parent.OID, keyStrs)
 	case "HASH":
-		opClass := ""
-		if len(parent.PartitionKeyOpClasses) > 0 {
-			opClass = parent.PartitionKeyOpClasses[0]
+		// Fold the hash of ALL partition-key columns (not just column 0) via
+		// the shared satisfies_hash_partition() algorithm, then match against
+		// each partition's (modulus, remainder) bound — mirrors PG's
+		// satisfies_hash_partition()/compute_partition_hash_value() in
+		// postgres/src/backend/partitioning/partbounds.c. M0134-0053.
+		rowHash, herr := computeHashPartitionRowHash(parent, im, ctx, 0, resolvePartitionKeyDatum)
+		if herr != nil {
+			return nil, herr
 		}
-		if opClass != "" && ctx != nil {
-			// Use custom operator class hash function (FUNCTION 2). M0097-0022.
-			hashFuncName, hasFn := im.LookupOpClassHashFunc(opClass)
-			if hasFn {
-				routines := ctx.Catalog.Routines()
-				if routines != nil {
-					rs := routines.LookupByName(parser.ObjectName{Name: hashFuncName})
-					var bestRoutine *catalog.Routine
-					for _, r := range rs {
-						if len(r.ArgTypes) == 2 {
-							bestRoutine = r
-							break
-						}
-					}
-					if bestRoutine != nil {
-						seedDatum := NewIntDatum(int64(hashPartitionSeed))
-						hResult, herr := executeStoredRoutine(bestRoutine, []Datum{keyDatum, seedDatum}, ctx, 0)
-						if herr != nil {
-							return nil, herr
-						}
-						if !hResult.IsNull() {
-							h := uint64(hResult.Int)
-							child = im.FindHashPartitionByHash(parent.OID, h)
-						}
-					}
-				}
-			}
-		}
-		if child == nil && opClass == "" {
-			// Default built-in hash: use string representation of key. M0097-0015.
-			keyStr := ""
-			if keyDatum.Kind == KindInt {
-				keyStr = fmt.Sprintf("%d", keyDatum.Int)
-			} else if keyDatum.Kind == KindString {
-				keyStr = keyDatum.StringValue()
-			} else {
-				keyStr = keyDatum.Format()
-			}
-			child = im.FindHashPartitionForValue(parent.OID, keyStr)
-		}
+		child = im.FindHashPartitionByHash(parent.OID, rowHash)
 	}
 	// Snapshot-relative partition visibility: a child marked detach-pending by an
 	// in-progress ALTER TABLE … DETACH PARTITION … CONCURRENTLY is invisible to
@@ -3077,7 +3072,8 @@ func checkDefaultPartitionInsertConstraint(ctx *Context, leaf *catalog.Table, le
 			sib := routePartitionKeyToImmediateChild(parent, leafCols, leafRow, im, ctx)
 			if sib != nil && sib.OID != cur.OID {
 				return &ExecError{Code: "23514", Pos: pos,
-					Message: fmt.Sprintf("new row for relation %q violates partition constraint", cur.Name)}
+					Message: fmt.Sprintf("new row for relation %q violates partition constraint", cur.Name),
+					Detail:  formatRowForDetail(leafCols, leafRow)}
 			}
 		}
 		cur = parent

@@ -136,6 +136,10 @@ func (s *Server) execPrepareTransaction(w *libpq.FrameWriter, ctx *executor.Cont
 		// reports "does not exist", exactly as upstream. M0118-0009.
 		return s.executeOneSimpleStmt(w, ctx, &parser.RollbackStmt{}, connTx, autoCommitPtr)
 	}
+	if s.preparedXacts.has(st.Gid) {
+		return s.writeQueryError(w, errcodes.DuplicateObject,
+			"transaction identifier \""+st.Gid+"\" is already in use")
+	}
 	explicitTx := connTx.Tx()
 	if explicitTx.Isolation == transam.IsolationSerializable {
 		// SSI dangerous-structure check at PREPARE time. Upstream's
@@ -158,6 +162,13 @@ func (s *Server) execPrepareTransaction(w *libpq.FrameWriter, ctx *executor.Cont
 		// wired. SERIALIZABLE specs never run further work on this connection
 		// before finalising, so keeping the slot is safe.
 		connTx.MarkPrepared(st.Gid)
+		// Register a nil-valued marker in the shared registry so a later
+		// PREPARE TRANSACTION of the same gid — from any backend, on either
+		// path — sees it as in-use. The real transaction state stays on
+		// connTx; this entry exists only to make the gid visible to the
+		// duplicate-gid check (and to pg_prepared_xacts sizing in a future
+		// task), not to carry state. M0134-0057.
+		s.preparedXacts.put(st.Gid, nil)
 		if autoCommitPtr != nil {
 			*autoCommitPtr = false
 		}
@@ -167,10 +178,6 @@ func (s *Server) execPrepareTransaction(w *libpq.FrameWriter, ctx *executor.Cont
 	// proc slot and park it in the registry so the originating connection is
 	// freed and a later COMMIT/ROLLBACK PREPARED (same OR different backend) can
 	// finalise it. M0118-0009 (stats).
-	if s.preparedXacts.has(st.Gid) {
-		return s.writeQueryError(w, errcodes.DuplicateObject,
-			"transaction identifier \""+st.Gid+"\" is already in use")
-	}
 	newTx, err := s.cfg.TxnMgr.DetachToDedicatedSlot(explicitTx)
 	if err != nil {
 		// Relocation failed (e.g. no free slot): fall back to the same-backend
@@ -261,6 +268,10 @@ func (s *Server) execFinalizePrepared(w *libpq.FrameWriter, ctx *executor.Contex
 	// holds the prepared transaction on its slot.
 	if connTx != nil && connTx.PreparedGid() == gid {
 		connTx.ClearPrepared()
+		// Free the gid marker registered at PREPARE TRANSACTION time so it can
+		// be reused. The marker is nil-valued; take() only needs to run for
+		// its side effect here. M0134-0057.
+		s.preparedXacts.take(gid)
 		return s.executeOneSimpleStmt(w, ctx, finalize, connTx, autoCommitPtr)
 	}
 	// Detached path (RC/RR): look the gid up in the process-wide registry and
@@ -268,7 +279,13 @@ func (s *Server) execFinalizePrepared(w *libpq.FrameWriter, ctx *executor.Contex
 	// with the executor context retargeted at the parked session/transaction.
 	// Works regardless of which backend issues the COMMIT/ROLLBACK PREPARED.
 	px, ok := s.preparedXacts.take(gid)
-	if !ok {
+	if !ok || px == nil {
+		// px == nil means this gid was reserved by a SERIALIZABLE keep-open
+		// PREPARE TRANSACTION that has not yet been finalised on its
+		// originating connection: goopg does not support cross-backend
+		// finalisation of a SERIALIZABLE prepared xact (see the file-header
+		// comment), so treat it the same as a genuinely-missing gid rather
+		// than dereferencing a nil px. M0134-0057.
 		return s.writeQueryError(w, errcodes.UndefinedObject,
 			"prepared transaction with identifier \""+gid+"\" does not exist")
 	}

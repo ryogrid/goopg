@@ -786,9 +786,10 @@ func syntaxErrorMsg(err error) (msg string, extra []libpq.ErrorField) {
 			msg = msg[:idx]
 		}
 		if se.Pos >= 0 {
-			extra = []libpq.ErrorField{
-				{Code: libpq.FieldPosition, Value: strconv.Itoa(se.Pos + 1)},
-			}
+			extra = append(extra, libpq.ErrorField{Code: libpq.FieldPosition, Value: strconv.Itoa(se.Pos + 1)})
+		}
+		if se.Hint != "" {
+			extra = append(extra, libpq.ErrorField{Code: libpq.FieldHint, Value: se.Hint})
 		}
 		return msg, extra
 	}

@@ -70,10 +70,13 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 			msg, extra := syntaxErrorMsg(err)
 			qerr := &extendedQueryError{Code: syntaxErrorCode(err), Message: msg}
 			for _, f := range extra {
-				if f.Code == libpq.FieldPosition {
+				switch f.Code {
+				case libpq.FieldPosition:
 					if p, _ := strconv.Atoi(f.Value); p > 0 {
 						qerr.Position = p
 					}
+				case libpq.FieldHint:
+					qerr.Hint = f.Value
 				}
 			}
 			return nil, qerr
@@ -520,9 +523,21 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 					// cannot drift from simple-query on arg-type qualification.
 					cells[i] = s.appendTypedCellText(nil, d, schema[i].Type, ectx.GetSetting,
 						func(s string) bool { return executor.RegObjectSchemaVisible(ectx, s) })
+					if cells[i] == nil {
+						// Non-null Datum rendered to zero bytes (empty
+						// string/bytea) on a nil dest buffer: append(nil, ...)
+						// with no bytes yields nil, indistinguishable from the
+						// d.IsNull() sentinel above. Coerce to a non-nil
+						// zero-length slice so the DataRow encoder emits
+						// length 0, not the NULL length -1 (M0134-datarow-empty-string).
+						cells[i] = []byte{}
+					}
 					continue
 				}
 				cells[i] = d.AppendValueText(nil)
+				if cells[i] == nil {
+					cells[i] = []byte{}
+				}
 			}
 			res.Rows = append(res.Rows, cells)
 			rowCount++

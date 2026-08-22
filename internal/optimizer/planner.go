@@ -195,7 +195,7 @@ func planStmt(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		*parser.CreateProcedureStmt, *parser.DropProcedureStmt,
 		*parser.CreateTriggerStmt, *parser.DropTriggerStmt,
 		*parser.CreatePolicyStmt, *parser.DropPolicyStmt,
-		*parser.CreateRuleStmt, *parser.DropRuleStmt,
+		*parser.CreateRuleStmt, *parser.DropRuleStmt, *parser.AlterRuleRenameStmt,
 		*parser.DropCompatStmt,
 		*parser.CreateSequenceStmt, *parser.AlterSequenceStmt,
 		*parser.CreateMatViewStmt, *parser.RefreshMatViewStmt,
@@ -4561,6 +4561,9 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	if strings.EqualFold(tf.Name, "pg_get_sequence_data") {
 		return planPgGetSequenceData(rv, sourceIdx, lateralCtx)
 	}
+	if strings.EqualFold(tf.Name, "pg_sequence_parameters") {
+		return planPgSequenceParameters(rv, sourceIdx, lateralCtx)
+	}
 	if strings.EqualFold(tf.Name, "ts_token_type") {
 		return planTSTokenType(rv, sourceIdx, lateralCtx)
 	}
@@ -4635,6 +4638,9 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	}
 	if strings.EqualFold(tf.Name, "regexp_matches") {
 		return planFromRegexpMatches(rv, sourceIdx, lateralCtx)
+	}
+	if strings.EqualFold(tf.Name, "regexp_split_to_table") {
+		return planFromRegexpSplitToTable(rv, sourceIdx, lateralCtx)
 	}
 	if strings.EqualFold(tf.Name, "generate_subscripts") {
 		return planGenerateSubscripts(rv, sourceIdx, lateralCtx)
@@ -5181,6 +5187,70 @@ func planFromRegexpMatches(rv parser.RangeVar, sourceIdx int16, lateralCtx *reso
 	return node, b, nil
 }
 
+// planFromRegexpSplitToTable plans FROM regexp_split_to_table(string,
+// pattern[, flags]) [AS alias(col)] [WITH ORDINALITY]. Produces a single
+// text output column (default name "regexp_split_to_table", the same
+// default PG uses); N matches always produce N+1 rows (the 'g' flag is
+// rejected, then glob=true is forced internally — split always finds ALL
+// matches). Mirrors planFromRegexpMatches. M0134-0070 Round D.
+func planFromRegexpSplitToTable(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	if len(tf.Args) < 2 || len(tf.Args) > 3 {
+		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "42883",
+			Message: "regexp_split_to_table requires 2 or 3 arguments"}
+	}
+	// Build arg context: lateral siblings + outer-scope parent chain, mirrors
+	// planFromRegexpMatches so a correlated pattern/string argument resolves
+	// up the lexical scope.
+	ctx := &resolveContext{parent: planParent}
+	if lateralCtx != nil {
+		if lateralCtx.parent == nil {
+			cp := *lateralCtx
+			cp.parent = planParent
+			ctx = &cp
+		} else {
+			ctx = lateralCtx
+		}
+	}
+	stringExpr, err := resolveExpr(tf.Args[0], ctx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	patternExpr, err := resolveExpr(tf.Args[1], ctx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	var flagsExpr Expr
+	if len(tf.Args) == 3 {
+		flagsExpr, err = resolveExpr(tf.Args[2], ctx)
+		if err != nil {
+			return nil, rangeBinding{}, err
+		}
+	}
+	alias := rv.Alias
+	if alias == "" {
+		alias = "regexp_split_to_table"
+	}
+	colAliases := rv.Columns
+	if tf.WithOrdinality && len(colAliases) > 0 {
+		colAliases = colAliases[:len(colAliases)-1]
+	}
+	colName := alias
+	if len(colAliases) > 0 {
+		colName = colAliases[0]
+	}
+	colType := catalog.Type{Name: "text"}
+	tbl := &catalog.Table{Name: alias, Columns: []catalog.Column{{Name: colName, Type: colType, Ordinal: 0}}}
+	schema := Schema{SchemaColumn{Name: colName, Type: colType, SourceTableIdx: sourceIdx}}
+	node := &FromRegexpSplitToTable{pos: tf.Pos(), StringExpr: stringExpr, PatternExpr: patternExpr, FlagsExpr: flagsExpr, schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	if tf.WithOrdinality {
+		node2, b2 := wrapOrdinality(node, b, rv, sourceIdx)
+		return node2, b2, nil
+	}
+	return node, b, nil
+}
+
 func planScalarFuncScan(rv parser.RangeVar, sourceIdx int16, colType string) (Node, rangeBinding, error) {
 	tf := rv.TableFunc
 	alias := rv.Alias
@@ -5366,6 +5436,51 @@ func planPgGetSequenceData(rv parser.RangeVar, sourceIdx int16, lateralCtx *reso
 	}
 	tbl := &catalog.Table{Name: alias, Columns: cols}
 	node := &PgGetSequenceData{pos: tf.Pos(), Args: args, schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
+// planPgSequenceParameters translates a table-function reference to
+// pg_sequence_parameters(regclass) into a PgSequenceParameters plan node.
+// Takes a single, plain (non-lateral) regclass argument. PG oracle:
+// postgres/src/backend/commands/sequence.c:1740 pg_sequence_parameters;
+// pg_proc.dat:3426-3431. M0134-0069.
+func planPgSequenceParameters(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	ctx := lateralCtx
+	if ctx == nil {
+		ctx = &resolveContext{}
+	}
+	if len(tf.Args) != 1 {
+		return nil, rangeBinding{}, &PlanError{
+			Code:    "42883",
+			Message: fmt.Sprintf("function pg_sequence_parameters(%d args) does not exist", len(tf.Args))}
+	}
+	arg, err := resolveExpr(tf.Args[0], ctx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	alias := rv.Alias
+	if alias == "" {
+		alias = "pg_sequence_parameters"
+	}
+	colNames := []string{"start_value", "minimum_value", "maximum_value", "increment", "cycle_option", "cache_size", "data_type"}
+	if len(rv.Columns) > 0 {
+		for i := range colNames {
+			if i < len(rv.Columns) {
+				colNames[i] = rv.Columns[i]
+			}
+		}
+	}
+	colTypes := []string{"int8", "int8", "int8", "int8", "bool", "int8", "oid"}
+	schema := make(Schema, len(colNames))
+	cols := make([]catalog.Column, len(colNames))
+	for i := range colNames {
+		schema[i] = SchemaColumn{Name: colNames[i], Type: catalog.Type{Name: colTypes[i]}, SourceTableIdx: sourceIdx}
+		cols[i] = catalog.Column{Name: colNames[i], Type: catalog.Type{Name: colTypes[i]}, Ordinal: i}
+	}
+	tbl := &catalog.Table{Name: alias, Columns: cols}
+	node := &PgSequenceParameters{pos: tf.Pos(), Arg: arg, schema: schema}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	return node, b, nil
 }
@@ -7339,6 +7454,18 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		return planInExpr(x, buildHavingParentCtx(agg))
 	case *parser.ExistsExpr:
 		return planExistsExpr(x, buildHavingParentCtx(agg))
+	case *parser.LikeEscapePattern:
+		// Mirrors the resolveExpr case: only ever the Right operand of a
+		// LIKE/ILIKE BinaryOp. M0134-0070.
+		pat, err := resolveExprAfterAggregate(x.Pattern, agg)
+		if err != nil {
+			return nil, err
+		}
+		esc, err := resolveExprAfterAggregate(x.Escape, agg)
+		if err != nil {
+			return nil, err
+		}
+		return &LikeEscapePattern{pos: x.Pos(), Pattern: pat, Escape: esc}, nil
 	case *parser.IsNullExpr:
 		operand, err := resolveExpr(x.Operand, agg.input)
 		if err != nil {
@@ -10019,9 +10146,13 @@ func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContex
 // otherwise collapse to NULL and trip the NOT NULL constraint. Mirroring
 // PostgreSQL, where SERIAL's column default literally IS nextval(...), we emit
 // that call so the value path produces the next sequence value. The standard
-// "<table>_<column>_seq" name matches the executor's seqName derivation; a
-// renamed sequence (rare, and not survivable by name anywhere in goopg) is not
-// resolved here.
+// "<table>_<column>_seq" name is the fallback; if the sequence has since been
+// renamed (ALTER SEQUENCE ... RENAME TO, e.g. sequence.sql's serialtest1_f2_seq
+// -> serialtest1_f2_foo), catalog.FindSequenceOwnedByFunc (wired by the
+// executor at init, mirroring catalog.SequenceParamsFunc's "avoids an import
+// cycle" pattern) resolves the CURRENT sequence name via its ownedBy record so
+// nextval(...) keeps advancing the renamed sequence instead of erroring or
+// reading a stale/nonexistent one. M0134-0069 bucket 4.
 func defaultMarkerReplacement(tbl *catalog.Table, ordinal int) parser.Expr {
 	if ordinal >= 0 && ordinal < len(tbl.Columns) {
 		col := tbl.Columns[ordinal]
@@ -10030,6 +10161,12 @@ func defaultMarkerReplacement(tbl *catalog.Table, ordinal int) parser.Expr {
 		}
 		if catalog.IsSerialTypeName(col.Type.Name) || col.IdentityColumn {
 			seqName := strings.ToLower(tbl.Name) + "_" + strings.ToLower(col.Name) + "_seq"
+			if catalog.FindSequenceOwnedByFunc != nil {
+				owner := tbl.Name + "." + col.Name
+				if resolved, ok := catalog.FindSequenceOwnedByFunc(owner, tbl.DBOid); ok {
+					seqName = resolved
+				}
+			}
 			return &parser.FuncCall{
 				Name: parser.ObjectName{Name: "nextval"},
 				Args: []parser.Expr{&parser.StringConst{Value: seqName}},
@@ -10728,17 +10865,26 @@ func resolveArbiterIndex(target *parser.OnConflictTarget, tbl *catalog.Table, re
 	if len(target.Columns) == 0 {
 		return nil, nil, &PlanError{Pos: target.Pos(), Code: "42601", Message: "ON CONFLICT target requires at least one column"}
 	}
-	// Build a set of plain column names and count expression columns in the
-	// target. PostgreSQL uses liberal/subset matching: every index column must
-	// be satisfied by at least one target column; the target may contain
-	// duplicates or extra columns. This mirrors upstream's permissive inference
-	// logic (documented as "The implementation is liberal in accepting inference
-	// specifications").
+	// Build the set of plain column names and collect the expression-column
+	// ASTs named in the target. PostgreSQL's infer_arbiter_indexes requires
+	// EXACT set equality between the index's plain columns and the target's
+	// named plain columns (plancat.c:883-885, bms_equal — not "every index
+	// column covered, target may have extras"), plus each index expression
+	// slot must structurally match some target expression slot
+	// (plancat.c:892-950, equal()). M0134-0034: the prior "liberal/subset"
+	// comment here misquoted upstream — the "liberal in accepting inference
+	// specifications" doc comment is about tolerating duplicate entries
+	// within one inference clause (e.g. `ON CONFLICT (a, a)`), not about
+	// accepting an index that doesn't exactly match the named columns.
 	plainWanted := make(map[string]struct{}, len(target.Columns))
-	exprCount := 0
-	for _, c := range target.Columns {
+	var exprWanted []parser.Expr
+	for i, c := range target.Columns {
 		if c == "" {
-			exprCount++
+			var e parser.Expr
+			if i < len(target.Exprs) {
+				e = target.Exprs[i]
+			}
+			exprWanted = append(exprWanted, e)
 		} else if resolveTbl != nil {
 			// Translate the view's own column name to the base
 			// relation's real column name before it enters the
@@ -10763,21 +10909,78 @@ func resolveArbiterIndex(target *parser.OnConflictTarget, tbl *catalog.Table, re
 		if idx.HasPredicate && target.Where == nil {
 			continue
 		}
-		// Liberal matching: each index column must be covered by the target.
-		// Target may have more or duplicate columns (allowed per PG semantics).
-		match := true
-		for _, ic := range idx.Columns {
+		// Exact-set matching (plancat.c:883-960): the index's plain-column
+		// set must equal the target's plain-column set exactly (bms_equal).
+		// The index's expression columns and the target's named
+		// expressions must match as SETS (bidirectional membership via
+		// list_member/list_difference at plancat.c:892-936) — NOT
+		// multiset/count equality: PG explicitly tolerates the same
+		// expression (or plain column) appearing redundantly more than
+		// once within one ON CONFLICT clause or within the index
+		// definition ("This does the right thing when unique indexes
+		// redundantly repeat the same attribute, or if attributes
+		// redundantly appear multiple times within an inference clause",
+		// plancat.c:928-933) — so no len()-count check here, only
+		// membership in both directions.
+		indexedAttrs := make(map[string]struct{}, len(idx.Columns))
+		var idxExprs []parser.Expr
+		for i, ic := range idx.Columns {
 			if ic == "" {
-				// Expression index column — satisfied by any expression in target.
-				if exprCount == 0 {
-					match = false
-					break
+				// idx.ColExprs is parallel to idx.Columns (same index i,
+				// not a compacted expr-only list) — see catalog.go's
+				// Index.ColExprs doc comment.
+				var e parser.Expr
+				if i < len(idx.ColExprs) && idx.ColExprs[i] != nil {
+					e = *idx.ColExprs[i]
 				}
+				idxExprs = append(idxExprs, e)
 			} else {
-				if _, ok := plainWanted[strings.ToLower(ic)]; !ok {
-					match = false
+				indexedAttrs[strings.ToLower(ic)] = struct{}{}
+			}
+		}
+		if len(indexedAttrs) != len(plainWanted) {
+			continue
+		}
+		match := true
+		for ic := range indexedAttrs {
+			if _, ok := plainWanted[ic]; !ok {
+				match = false
+				break
+			}
+		}
+		if !match {
+			continue
+		}
+		// Every index expression column must be named in the target...
+		for _, ie := range idxExprs {
+			found := false
+			for _, we := range exprWanted {
+				if parserExprStructEqual(ie, we) {
+					found = true
 					break
 				}
+			}
+			if !found {
+				match = false
+				break
+			}
+		}
+		if !match {
+			continue
+		}
+		// ...and every target expression must correspond to a cataloged
+		// index expression (list_difference(idxExprs, inferElems) == NIL).
+		for _, we := range exprWanted {
+			found := false
+			for _, ie := range idxExprs {
+				if parserExprStructEqual(ie, we) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				match = false
+				break
 			}
 		}
 		if !match {
@@ -10802,7 +11005,92 @@ func resolveArbiterIndex(target *parser.OnConflictTarget, tbl *catalog.Table, re
 		}
 		return idx, ords, nil
 	}
-	return nil, nil, &PlanError{Pos: target.Pos(), Code: "42P10", Message: "there is no unique or exclusion constraint matching the ON CONFLICT specification"}
+	// Pos: 0 — PG's ereport for this case (plancat.c:957-960) carries no
+	// errposition(), same convention as the sibling InitiallyDeferred branch
+	// above (M0134-0034).
+	return nil, nil, &PlanError{Pos: 0, Code: "42P10", Message: "there is no unique or exclusion constraint matching the ON CONFLICT specification"}
+}
+
+// parserExprStructEqual is a position-insensitive structural equality
+// comparator for parser.Expr, scoped to the node kinds that
+// insert_conflict.sql's expression-index fixtures actually exercise:
+// *parser.FuncCall, *parser.ColumnRef, *parser.IntegerConst (the
+// `coalesce(a, 0)` literal argument), and *parser.CollateExpr (unwrapped,
+// see below — not a real comparison target).
+// M0134-0034: resolveArbiterIndex's column-list branch needs to compare
+// unresolved parser.Expr ASTs (index definitions and ON CONFLICT targets
+// are both parsed but never planned), which is a different type from the
+// already-resolved optimizer.Expr that exprEqual/exprIdentityKey
+// (planner.go above) compare — those cannot be reused here.
+//
+// FAIL-SAFE DIRECTION: an undecidable or unsupported node kind on either
+// side compares NOT equal, never silently matches — same convention as
+// exprEqual's comment (planner.go, "FAIL-CLOSED DIRECTION"). A false
+// negative here is at worst a spurious 42P10 (diagnosable); a false
+// positive would silently pick the wrong arbiter index.
+func parserExprStructEqual(a, b parser.Expr) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	// Unwrap a trailing COLLATE clause on either side before comparing.
+	// PG's index-expression equal() match (plancat.c:892-925) never sees
+	// collation as part of the expression tree at all — indcollation is
+	// separate per-column index metadata, checked independently by
+	// infer_collation_opclass_match (only when the ON CONFLICT element
+	// itself carries an explicit COLLATE/opclass, elem->infercollid /
+	// elem->inferopclass). goopg's general expression parser instead
+	// folds a trailing COLLATE into the expr tree as *parser.CollateExpr
+	// (both for the index column definition, e.g. `lower(fruit) collate
+	// "C"`, and — via the same general parseExpr path — the ON CONFLICT
+	// target), so unwrap it here rather than reject the match outright.
+	if ce, ok := a.(*parser.CollateExpr); ok {
+		return parserExprStructEqual(ce.Operand, b)
+	}
+	if ce, ok := b.(*parser.CollateExpr); ok {
+		return parserExprStructEqual(a, ce.Operand)
+	}
+	switch av := a.(type) {
+	case *parser.FuncCall:
+		bv, ok := b.(*parser.FuncCall)
+		if !ok {
+			return false
+		}
+		if !strings.EqualFold(av.Name.Schema, bv.Name.Schema) || !strings.EqualFold(av.Name.Name, bv.Name.Name) {
+			return false
+		}
+		if av.Star != bv.Star || av.Distinct != bv.Distinct {
+			return false
+		}
+		if len(av.Args) != len(bv.Args) {
+			return false
+		}
+		for i := range av.Args {
+			if !parserExprStructEqual(av.Args[i], bv.Args[i]) {
+				return false
+			}
+		}
+		return true
+	case *parser.ColumnRef:
+		bv, ok := b.(*parser.ColumnRef)
+		if !ok {
+			return false
+		}
+		return strings.EqualFold(av.Column, bv.Column)
+	case *parser.IntegerConst:
+		// insert_conflict.sql exercises a literal-arg expression index
+		// (`create unique index insertconflicti1 on
+		// insertconflict(coalesce(a, 0))`, matched by `on conflict
+		// (coalesce(a, 0))`), so a bare integer literal argument must
+		// compare structurally too.
+		bv, ok := b.(*parser.IntegerConst)
+		if !ok {
+			return false
+		}
+		return av.Value == bv.Value
+	default:
+		// Unsupported node kind — fail safe, never claim equality.
+		return false
+	}
 }
 
 func insertValuesSchema(tbl *catalog.Table, colIndex []int) Schema {
@@ -11566,6 +11854,18 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	if cr, ok := e.(*ColumnRef); ok {
 		return cr.Name, cr.Type
 	}
+	// A bare correlated reference to an outer-query column (e.g. `t.a` inside
+	// a LATERAL derived table `(SELECT t.a) AS sub`) resolves to an
+	// OuterColumnRef rather than a local ColumnRef. PostgreSQL's
+	// FigureColname() has nothing special for correlated Vars — it names the
+	// target from the underlying attribute, same as any other bare column
+	// reference (postgres/src/backend/parser/parse_target.c: FigureColname).
+	// Without this arm, the derived table's synthetic schema column falls
+	// through to "?column?" and the outer query cannot resolve `sub.a` by
+	// name. M0134-0030.
+	if ocr, ok := e.(*OuterColumnRef); ok {
+		return ocr.Name, ocr.Type
+	}
 	// Whole-row variable: resolveExpr converts *parser.ColumnRef → *RowExpr.
 	// Name comes from the original column reference. M0097-0020.
 	if _, ok := e.(*RowExpr); ok {
@@ -11600,6 +11900,14 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	// Matches PostgreSQL's FigureColname() for `type 'string'` syntax. M0097-0003.
 	if tsl, ok := e.(*TypedStringLit); ok {
 		return tsl.Type, exprType(e)
+	}
+	// IntervalLit `interval '1 day'` (SQL-standard `interval 'N' unit` syntax,
+	// resolved from parser.IntervalLit by resolveExpr above): column name is
+	// the type name "interval", same rule PostgreSQL's FigureColname()
+	// applies to any T_TypeCast whose arg is a bare Const (parse_target.c:
+	// FigureColnameInternal, case T_TypeCast). M0134-0035.
+	if _, ok := e.(*IntervalLit); ok {
+		return "interval", exprType(e)
 	}
 	// CastExpr `expr::type` or `CAST(expr AS type)`: use the type name as the
 	// column label for literal→type casts (e.g. 0::boolean → "bool").
@@ -12099,6 +12407,14 @@ func exprType(e Expr) catalog.Type {
 			if isPgLSN(rt.Name) && x.Op == parser.OpAdd {
 				return catalog.Type{Name: "pg_lsn"}
 			}
+			// interval * numeric/int/float and interval / numeric/int/float →
+			// interval (interval_mul / interval_div, timestamp.c). Must run
+			// before the numeric-dominance check below, which would otherwise
+			// misreport the wire TypeOID as numeric (right-aligning the
+			// interval text in psql instead of left-aligning it). M0134-0035.
+			if strings.EqualFold(lt.Name, "interval") && (x.Op == parser.OpMul || x.Op == parser.OpDiv) {
+				return catalog.Type{Name: "interval"}
+			}
 			if isFloat(lt.Name) || isFloat(rt.Name) {
 				// Wider float type wins.
 				if lt.Name == "float8" || lt.Name == "double precision" || lt.Name == "double" ||
@@ -12227,6 +12543,37 @@ func exprType(e Expr) catalog.Type {
 				return catalog.Type{Name: "bytea"}
 			}
 			return catalog.Type{Name: "text"}
+		case "overlay":
+			// text_overlay/bytea_overlay (varlena.c): same argument-typed
+			// dispatch as substr/substring above. M0134-0070.
+			if len(x.Args) > 0 && strings.EqualFold(exprType(x.Args[0]).Name, "bytea") {
+				return catalog.Type{Name: "bytea"}
+			}
+			return catalog.Type{Name: "text"}
+		case "btrim", "ltrim", "rtrim":
+			// byteatrim/bytealtrim/byteartrim (oracle_compat.c) vs the text
+			// overloads: same argument-typed dispatch as substr/substring and
+			// overlay above — the executor keys off the first argument's
+			// Kind, so the advertised type must match or the wire layer
+			// renders a raw (unescaped) byte slice instead of `\x…`/escape
+			// form and truncates at an embedded 0x00. M0134-0070.
+			if len(x.Args) > 0 && strings.EqualFold(exprType(x.Args[0]).Name, "bytea") {
+				return catalog.Type{Name: "bytea"}
+			}
+			return catalog.Type{Name: "text"}
+		case "reverse":
+			// bytea_reverse vs text_reverse (varlena.c): same argument-typed
+			// dispatch as substr/overlay/btrim above — the executor keys off
+			// the argument's Kind, so the advertised type must match or the
+			// wire layer renders the byte-reversed bytea as raw UTF-8 text
+			// instead of `\x…`/escape form. M0134-0070.
+			if len(x.Args) > 0 && strings.EqualFold(exprType(x.Args[0]).Name, "bytea") {
+				return catalog.Type{Name: "bytea"}
+			}
+			return catalog.Type{Name: "text"}
+		case "to_hex":
+			// to_hex(int) -> text (varlena.c to_hex32/to_hex64). M0134-0070.
+			return catalog.Type{Name: "text"}
 		case "decode":
 			// decode(text, format) -> bytea (encode.c). Untyped before
 			// M0125-0021, so `SELECT decode('aabb','hex')` reached the wire as
@@ -12234,6 +12581,32 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: "bytea"}
 		case "encode":
 			return catalog.Type{Name: "text"}
+		case "set_byte", "set_bit":
+			// byteaSetByte/byteaSetBit (varlena.c) -> bytea. Untyped falls
+			// through to appendTypedCellText's default AppendValueText,
+			// which prints KindBytes raw instead of `\x…`/escape form (same
+			// M0125-0021 class of bug as decode above). M0134-0070.
+			return catalog.Type{Name: "bytea"}
+		case "sha224", "sha256", "sha384", "sha512":
+			// sha{224,256,384,512}(bytea) -> bytea (cryptohashfuncs.c, all four
+			// PG_RETURN_BYTEA_P). Untyped falls through to appendTypedCellText's
+			// default AppendValueText, which prints KindBytes raw instead of
+			// `\x…`/escape form (same M0125-0021 class of bug as decode above).
+			// The builtin pg_proc seed does not feed ReturnType, so this is the
+			// only stamp of the wire TypeOID. M0134-0070.
+			return catalog.Type{Name: "bytea"}
+		case "get_byte", "get_bit":
+			// byteaGetByte/byteaGetBit (varlena.c) -> int4. M0134-0070.
+			return catalog.Type{Name: "int4"}
+		case "ascii":
+			// ascii(text) -> int4 (pg_proc.dat:3610, varlena.c ascii). M0134-0070.
+			return catalog.Type{Name: "int4"}
+		case "crc32", "crc32c", "bit_count":
+			// crc32/crc32c(bytea) -> int8 (pg_proc.dat:7954/7957); bit_count(bytea|bit)
+			// -> int8 (pg_proc.dat:1534/4201). Untyped these fall through to TypeOID 25,
+			// so psql's column_type_alignment left-aligns the numeric column (print.c).
+			// M0134-0070.
+			return catalog.Type{Name: "int8"}
 		case "date_part":
 			return catalog.Type{Name: "int8"}
 		case "gcd", "lcm", "abs", "mod", "div":
@@ -12244,6 +12617,19 @@ func exprType(e Expr) catalog.Type {
 			"cardinality", "strpos", "position":
 			// String/array length functions return int4. M0097-0003.
 			return catalog.Type{Name: "int4"}
+			case "regexp_instr", "regexp_count":
+				// pg_proc.dat oids 6254-6262: both prorettype int4. M0134-0070.
+				return catalog.Type{Name: "int4"}
+			case "regexp_like":
+				// pg_proc.dat oids 6263-6264: prorettype bool. M0134-0070.
+				return catalog.Type{Name: "bool"}
+			case "regexp_substr":
+				// pg_proc.dat oids 6265-6269: prorettype text. M0134-0070.
+				return catalog.Type{Name: "text"}
+			case "regexp_replace":
+				// pg_proc.dat oids 2284/2285/6251/6252/6253: prorettype text in
+				// all 5 overloads (3/4/5/6-arg). M0134-0070 Round F.
+				return catalog.Type{Name: "text"}
 		case "array_agg":
 			// array_agg(expr) returns the element type with [] suffix. M0097-0035.
 			if len(x.Args) > 0 {
@@ -13016,6 +13402,18 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		return planInExpr(x, ctx)
 	case *parser.ExistsExpr:
 		return planExistsExpr(x, ctx)
+	case *parser.LikeEscapePattern:
+		// Only ever appears as the Right operand of a LIKE/ILIKE BinaryOp
+		// (see parser.LikeEscapePattern doc). M0134-0070.
+		pat, err := resolveExpr(x.Pattern, ctx)
+		if err != nil {
+			return nil, err
+		}
+		esc, err := resolveExpr(x.Escape, ctx)
+		if err != nil {
+			return nil, err
+		}
+		return &LikeEscapePattern{pos: x.Pos(), Pattern: pat, Escape: esc}, nil
 	case *parser.RowExpr:
 		elems := make([]Expr, len(x.Elems))
 		types := make([]catalog.Type, len(x.Elems))
@@ -13177,6 +13575,45 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 				return nil, perr
 			}
 			return &FuncCall{pos: x.Pos(), Name: "pg_collation_for", Args: []Expr{result}}, nil
+		}
+		// to_hex(int)/to_bin(int)/to_oct(int): PG dispatches each to distinct
+		// 32-bit/64-bit overloads (varlena.c:5190-5267) whose two's-complement
+		// zero-extension width differs for negative arguments. Resolve the
+		// arg's static type here (plan time) and stamp the chosen width onto
+		// ArgWidth so the executor can pick uint32 vs uint64 zero-extension.
+		// Bare integer literals default to the int4/32-bit overload,
+		// mirroring the generate_series literal carve-out above: exprType
+		// always types an untyped integer literal as int8, which would
+		// otherwise mis-resolve to_hex(-1234)/to_bin(-1234)/to_oct(-1234)
+		// (no cast) into the int8/64-bit path.
+		if (strings.EqualFold(x.Name.String(), "to_hex") || strings.EqualFold(x.Name.String(), "to_bin") || strings.EqualFold(x.Name.String(), "to_oct")) && len(x.Args) == 1 {
+			fname := strings.ToLower(x.Name.String())
+			resolvedArg, err := resolveExpr(x.Args[0], ctx)
+			if err != nil {
+				return nil, err
+			}
+			at := exprType(resolvedArg).Name
+			isLit := false
+			if _, ok := resolvedArg.(*IntegerConst); ok {
+				isLit = true
+			} else if negArg, ok := resolvedArg.(*UnaryOp); ok && negArg.Op == parser.OpUnaryNeg {
+				// Negation of a bare literal (e.g. `-1234`) is still an untyped
+				// literal in PG's typing rules — parse analysis folds unary
+				// minus over a numeric constant rather than typing it via the
+				// int8 default. Without unwrapping this, `to_hex(-1234)`
+				// (Op=OpUnaryNeg wrapping IntegerConst) would fall through to
+				// the int8/16-hex-char path instead of int4/8-hex-char.
+				if _, ok := negArg.Operand.(*IntegerConst); ok {
+					isLit = true
+				}
+			}
+			width := "int4"
+			if !isLit {
+				if strings.EqualFold(at, "int8") || strings.EqualFold(at, "bigint") {
+					width = "int8"
+				}
+			}
+			return &FuncCall{pos: x.Pos(), Name: fname, Args: []Expr{resolvedArg}, ArgWidth: width}, nil
 		}
 		args := make([]Expr, 0, len(x.Args))
 		for _, a := range x.Args {

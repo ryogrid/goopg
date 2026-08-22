@@ -50,6 +50,39 @@ func TestDefaultPartitionInsertConstraint(t *testing.T) {
 	}
 }
 
+// TestDefaultPartitionConstraintDetail verifies the ERROR carries PostgreSQL's
+// "Failing row contains (...)" DETAIL clause alongside the partition-constraint
+// violation, mirroring execMain.c's ExecConstraints callers, which build
+// val_desc via ExecBuildSlotValueDescription and attach it via errdetail().
+// M0134-0054 bucket 1.
+func TestDefaultPartitionConstraintDetail(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	for _, s := range []string{
+		"CREATE TABLE rpd (i int, j text) PARTITION BY RANGE (i)",
+		"CREATE TABLE rpd_1 PARTITION OF rpd FOR VALUES FROM (0) TO (100)",
+		"CREATE TABLE rpd_def PARTITION OF rpd DEFAULT",
+	} {
+		if err := runDDL(t, ctx, s); err != nil {
+			t.Fatalf("runDDL(%q): %v", s, err)
+		}
+	}
+
+	_, err := runQueryWithErr(ctx, "INSERT INTO rpd_def VALUES (50, 'b')")
+	if err == nil {
+		t.Fatal("direct insert into default of a sibling-owned value should fail")
+	}
+	ee, ok := err.(*ExecError)
+	if !ok || ee.Code != "23514" {
+		t.Fatalf("expected 23514 partition constraint violation, got %v", err)
+	}
+	const want = "Failing row contains (50, b)."
+	if ee.Detail != want {
+		t.Fatalf("Detail = %q, want %q", ee.Detail, want)
+	}
+}
+
 // TestDefaultPartitionConstraintSubPartitioned exercises the multi-level walk-up:
 // the default partition is itself sub-partitioned, so the violating ancestor is
 // two levels above the routed leaf (mirrors the partition-concurrent-attach spec's

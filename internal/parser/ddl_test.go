@@ -99,6 +99,60 @@ func TestParseCreateTableSignedReloption(t *testing.T) {
 	}
 }
 
+// TestParseCreateTableWithoutOidsAccepted covers the legacy `WITHOUT OIDS`
+// table-option clause (OIDs were removed in PG12; the clause is kept
+// parse-only for backward compat — postgres/src/backend/parser/gram.y
+// OptWith: "WITHOUT OIDS { $$ = NIL; }"). It must be silently accepted on the
+// mainline CREATE TABLE (col defs...) path, not just the `()`/typed-table
+// suffix paths. M0134-0055 bucket A.
+func TestParseCreateTableWithoutOidsAccepted(t *testing.T) {
+	stmts, err := Parse("create table transition_table_status (id int, note text) without oids;")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	ct := stmts[0].(*CreateTableStmt)
+	if ct.WithOIDS {
+		t.Errorf("WITHOUT OIDS must not set WithOIDS, got true")
+	}
+	if len(ct.Columns) != 2 {
+		t.Errorf("expected 2 columns, got %d (%+v)", len(ct.Columns), ct.Columns)
+	}
+}
+
+// TestParseCreateTableWithOidsParsesAndFlags covers `WITH (oids)` /
+// `WITH (oids = true)` on the mainline column-def path: it must parse (PG
+// accepts the syntax at the grammar level) and set stmt.WithOIDS so the
+// executor can raise PG18's real rejection ("tables declared WITH OIDS are
+// not supported", ERRCODE_FEATURE_NOT_SUPPORTED — see
+// postgres/src/backend/access/common/reloptions.c). `WITH (oids = false)`
+// must NOT set the flag. Bare `WITH OIDS` (no parens) stays a syntax error,
+// matching PG's OptWith grammar (reloptions requires parens).
+func TestParseCreateTableWithOidsParsesAndFlags(t *testing.T) {
+	stmts, err := Parse("create table t1 (id int) with (oids);")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	ct := stmts[0].(*CreateTableStmt)
+	if !ct.WithOIDS {
+		t.Errorf("WITH (oids) must set WithOIDS=true")
+	}
+
+	stmts2, err2 := Parse("create table t2 (id int) with (oids = false);")
+	if err2 != nil {
+		t.Fatalf("unexpected error: %v", err2)
+	}
+	ct2 := stmts2[0].(*CreateTableStmt)
+	if ct2.WithOIDS {
+		t.Errorf("WITH (oids = false) must not set WithOIDS")
+	}
+
+	if _, err3 := Parse("create table t3 (id int) with oids;"); err3 == nil {
+		t.Errorf("bare WITH OIDS (no parens) should be a syntax error")
+	} else if !strings.Contains(err3.Error(), "syntax error") {
+		t.Errorf("expected syntax error, got %v", err3)
+	}
+}
+
 func TestParseCreateTableBareCharDefaultsToCharacterOne(t *testing.T) {
 	stmts, err := Parse(`CREATE TABLE t (a char, b "char")`)
 	if err != nil {

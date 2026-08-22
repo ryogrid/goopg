@@ -152,6 +152,11 @@ func exprChildSlots(e Expr) ([]exprSlot, bool) {
 			{kind: slotSameScope, expr: &x.Left},
 			{kind: slotSameScope, expr: &x.Right},
 		}, true
+	case *LikeEscapePattern:
+		return []exprSlot{
+			{kind: slotSameScope, expr: &x.Pattern},
+			{kind: slotSameScope, expr: &x.Escape},
+		}, true
 
 	// ---- same-scope lists ------------------------------------------
 	case *FuncCall:
@@ -702,6 +707,8 @@ func exprSelfKey(e Expr) (string, bool) {
 		return fmt.Sprintf("binary:%d", x.Op), true
 	case *IsDistinctFromExpr:
 		return fmt.Sprintf("isdistinct:%t", x.Negated), true
+	case *LikeEscapePattern:
+		return "likeescape", true
 
 	// ---- containers -------------------------------------------------
 	case *FuncCall:
@@ -822,6 +829,9 @@ func shallowCloneExpr(e Expr) (Expr, bool) {
 		c := *x
 		return &c, true
 	case *IsDistinctFromExpr:
+		c := *x
+		return &c, true
+	case *LikeEscapePattern:
 		c := *x
 		return &c, true
 	case *ArraySubqueryExpr:

@@ -412,6 +412,20 @@ type DropRuleStmt struct {
 func (s *DropRuleStmt) Pos() int  { return s.pos }
 func (s *DropRuleStmt) stmtNode() {}
 
+// AlterRuleRenameStmt — `ALTER RULE name ON table RENAME TO newname`. This is
+// the only ALTER RULE form in PG's grammar (gram.y AlterRuleStmt). Mirrors
+// postgres/src/backend/rewrite/rewriteDefine.c:793 RenameRewriteRule.
+// M0134-0065.
+type AlterRuleRenameStmt struct {
+	pos     int
+	Name    string
+	Table   ObjectName
+	NewName string
+}
+
+func (s *AlterRuleRenameStmt) Pos() int  { return s.pos }
+func (s *AlterRuleRenameStmt) stmtNode() {}
+
 // DropTriggerStmt — `DROP TRIGGER [IF EXISTS] name ON table [CASCADE|RESTRICT]`.
 // M0096-0012.
 type DropTriggerStmt struct {
@@ -1741,6 +1755,7 @@ type CreateSequenceStmt struct {
 	Cache       *int64
 	Cycle       bool
 	OwnedBy     string // "table.column" or empty
+	Unlogged    bool   // CREATE UNLOGGED SEQUENCE — M0134-0069
 }
 
 func (s *CreateSequenceStmt) Pos() int  { return s.pos }
@@ -1884,6 +1899,7 @@ type AlterSequenceStmt struct {
 	NoCycle      bool   // NO CYCLE
 	OwnedBy      string // "table.column" or "" from OWNED BY clause
 	ClearOwnedBy bool   // OWNED BY NONE
+	SetLogged    string // "" unchanged / "logged" / "unlogged" — M0134-0069, mirrors AlterTableStmt.SetLogged
 }
 
 func (s *AlterSequenceStmt) Pos() int  { return s.pos }

@@ -154,10 +154,17 @@ func mulInt64Overflow(a, b int64) (int64, bool) {
 // upstream's TPC-H output byte-for-byte.
 const numericMinSigDigits = 16
 
-// numericMaxDisplayScale mirrors upstream's NUMERIC_MAX_DISPLAY_SCALE
-// (NUMERIC_MAX_PRECISION = 1000) — the upper bound on a result's
-// fractional-digit count.
-const numericMaxDisplayScale = 1000
+// numericMaxDisplayScale mirrors upstream's NUMERIC_DSCALE_MASK =
+// 0x3FFF = 16383 (postgres/src/backend/utils/adt/numeric.c:236-237)
+// — the 14-bit dscale field width, i.e. the internal-arithmetic
+// ceiling on intermediate results' fractional-digit count.
+//
+// This is distinct from NUMERIC_MAX_PRECISION = 1000
+// (postgres/src/include/utils/numeric.h), which caps only
+// typmod-coercion (NUMERIC(P,S) column/cast precision) and is
+// enforced separately in roundNumericToScale (expr.go) — do not
+// conflate the two. (M0134-0050.)
+const numericMaxDisplayScale = 16383
 
 // numericMant returns d's mantissa as a *big.Int, regardless of
 // whether d is in the int64 fast-path lane (NumericBig == nil) or
@@ -175,7 +182,7 @@ func numericMant(d Datum) *big.Int {
 // result lands on the fast path (NumericMantissa); otherwise it
 // stays in the *big.Int lane (NumericBig). Scale ≤ 0 is rejected
 // only for negative values (the caller should already have clamped
-// to the upstream-compatible 0..1000 range); we tolerate scale=0
+// to the upstream-compatible 0..16383 range); we tolerate scale=0
 // because that's the common case for integer-shaped NUMERICs.
 func newNumeric(b *big.Int, scale int) Datum {
 	if scale > numericMaxDisplayScale {

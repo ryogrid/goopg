@@ -75,7 +75,9 @@ func (p *parser) parseCreate() (Stmt, error) {
 			_ = p.acceptKeyword(KwView) || p.acceptIdentKeyword("view")
 			return p.parseCreateMatViewTail(t.Pos)
 		case p.acceptIdentKeyword("sequence"):
-			return p.parseCreateSequenceTail(t.Pos, true)
+			// CREATE TEMP UNLOGGED SEQUENCE is not valid PG syntax (temp
+			// sequences are already non-persistent) — unlogged=false here.
+			return p.parseCreateSequenceTail(t.Pos, true, false)
 		default:
 			// Consume optional TABLE keyword that follows TEMP/TEMPORARY.
 			p.acceptKeyword(KwTable)
@@ -187,7 +189,7 @@ func (p *parser) parseCreate() (Stmt, error) {
 		return p.parseCreateTriggerTail(t.Pos, false)
 	// CREATE SEQUENCE [IF NOT EXISTS] name [options…] (M0097-0009)
 	case p.acceptIdentKeyword("sequence"):
-		return p.parseCreateSequenceTail(t.Pos, unlogged)
+		return p.parseCreateSequenceTail(t.Pos, false, unlogged)
 	// CREATE MATERIALIZED VIEW [IF NOT EXISTS] name AS query [WITH NO DATA] (M0097-0013)
 	case p.acceptIdentKeyword("materialized"):
 		_ = p.acceptKeyword(KwView) || p.acceptIdentKeyword("view")
@@ -3627,6 +3629,10 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 					if isIncluding {
 						likeKey += ":+storage"
 					}
+				case p.acceptIdentKeyword("compression"):
+					if isIncluding {
+						likeKey += ":+compression"
+					}
 				case p.acceptIdentKeyword("generated"):
 					if isIncluding {
 						likeKey += ":+generated"
@@ -3637,7 +3643,7 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 					}
 				case p.acceptKeyword(KwAll):
 					if isIncluding {
-						likeKey += ":+defaults:+identity:+generated:+constraints:+indexes:+comments:+statistics:+storage"
+						likeKey += ":+defaults:+identity:+generated:+constraints:+indexes:+comments:+statistics:+storage:+compression"
 					}
 				}
 			}
@@ -3723,6 +3729,14 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 			return nil, err
 		}
 		stmt.With = opts
+		if v, ok := opts["oids"]; ok {
+			stmt.WithOIDS = !strings.EqualFold(v, "false") && v != "0"
+		}
+	} else if p.acceptIdentKeyword("without") {
+		// WITHOUT OIDS — legacy backward-compat clause, accepted and silently
+		// ignored (OIDs were removed in PG12). postgres/src/backend/parser/gram.y
+		// OptWith: "WITHOUT OIDS { $$ = NIL; }".
+		_ = p.acceptIdentKeyword("oids")
 	}
 	if p.acceptKeyword(KwTablespace) {
 		// M0122-0007: capture the name; the executor resolves it against the
@@ -6503,9 +6517,10 @@ func (p *parser) parseCreatePolicyTail(pos int) (Stmt, error) {
 
 // parseCreateTriggerTail picks up after CREATE [CONSTRAINT] TRIGGER.
 // Grammar (simplified):
-// parseCreateSequenceTail picks up after CREATE [TEMP] SEQUENCE. M0097-0009.
-func (p *parser) parseCreateSequenceTail(pos int, temp bool) (Stmt, error) {
-	stmt := &CreateSequenceStmt{pos: pos, Temporary: temp}
+// parseCreateSequenceTail picks up after CREATE [TEMP] [UNLOGGED] SEQUENCE.
+// M0097-0009; unlogged param added M0134-0069.
+func (p *parser) parseCreateSequenceTail(pos int, temp bool, unlogged bool) (Stmt, error) {
+	stmt := &CreateSequenceStmt{pos: pos, Temporary: temp, Unlogged: unlogged}
 	// Optional IF NOT EXISTS.
 	if p.acceptKeyword(KwIf) {
 		if _, err := p.expectKeyword(KwNot); err != nil {
@@ -7414,8 +7429,12 @@ func (p *parser) parseAlter() (Stmt, error) {
 				}
 				stmt.Cache = &val
 			case p.acceptIdentKeyword("set") || p.acceptKeyword(KwSet):
-				// SET LOGGED / SET UNLOGGED — no-op.
-				_ = p.acceptIdentKeyword("logged") || p.acceptIdentKeyword("unlogged") || p.acceptKeyword(KwUnlogged)
+				// SET LOGGED / SET UNLOGGED — M0134-0069: apply, don't discard.
+				if p.acceptIdentKeyword("logged") {
+					stmt.SetLogged = "logged"
+				} else if p.acceptIdentKeyword("unlogged") || p.acceptKeyword(KwUnlogged) {
+					stmt.SetLogged = "unlogged"
+				}
 			case p.acceptIdentKeyword("owned"):
 				_ = p.acceptKeyword(KwBy)
 				if p.acceptIdentKeyword("none") {
@@ -7733,6 +7752,34 @@ func (p *parser) parseAlter() (Stmt, error) {
 			}
 		}
 		return stmt, nil
+	}
+	// ALTER RULE name ON table RENAME TO newname — the only ALTER RULE form
+	// in PG's grammar (gram.y AlterRuleStmt). Mirrors
+	// postgres/src/backend/rewrite/rewriteDefine.c:793 RenameRewriteRule.
+	// M0134-0065.
+	if p.acceptIdentKeyword("rule") {
+		nameTok, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expectKeyword(KwOn); err != nil {
+			return nil, err
+		}
+		tbl, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		if !p.acceptIdentKeyword("rename") {
+			return nil, p.errAtCur("expected RENAME")
+		}
+		if _, err := p.expectKeyword(KwTo); err != nil {
+			return nil, err
+		}
+		newNameTok, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		return &AlterRuleRenameStmt{pos: t.Pos, Name: identText(nameTok), Table: tbl, NewName: identText(newNameTok)}, nil
 	}
 	// ALTER INDEX name ALTER COLUMN col SET (options) — emit the action so
 	// the executor can raise the appropriate error. M0097-0023.

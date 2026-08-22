@@ -270,6 +270,38 @@ func TestPlanInsertOnConflictWithUniqueIndex(t *testing.T) {
 	}
 }
 
+// TestPlanInsertOnConflictExactSetMatchRejectsSubset — M0134-0034:
+// a bare column-list arbiter target must EXACTLY match an index's
+// column set (plancat.c:883-885 bms_equal), not merely be covered
+// by it. A two-column unique index (aid, abalance) does not match
+// an `ON CONFLICT (aid)` target — the prior liberal/subset matcher
+// wrongly accepted this and would have updated through the wrong
+// arbiter; real PG raises 42P10.
+func TestPlanInsertOnConflictExactSetMatchRejectsSubset(t *testing.T) {
+	cat := pgbenchCatalog(t)
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "pgbench_accounts"})
+	if _, err := cat.CreateIndex(parser.ObjectName{Name: "pgbench_accounts_aid_abalance_key"}, tbl, []string{"aid", "abalance"}, true, "btree", false); err != nil {
+		t.Fatal(err)
+	}
+	stmt := parseOne(t,
+		"INSERT INTO pgbench_accounts (aid, abalance) VALUES (1, 0) "+
+			"ON CONFLICT (aid) DO UPDATE SET abalance = excluded.abalance")
+	_, err := Plan(stmt, cat)
+	if err == nil {
+		t.Fatal("expected arbiter-resolution error, got nil")
+	}
+	pe, ok := err.(*PlanError)
+	if !ok {
+		t.Fatalf("err type=%T, want *PlanError", err)
+	}
+	if pe.Code != "42P10" {
+		t.Errorf("code=%s, want 42P10", pe.Code)
+	}
+	if pe.Pos != 0 {
+		t.Errorf("Pos=%d, want 0 (PG's ereport carries no errposition() here)", pe.Pos)
+	}
+}
+
 // TestPlanInsertOnConflictByConstraintName — Stage B path: the
 // arbiter is resolved by a named constraint instead of column
 // inference. Pins (1) the planner accepts the constraint-name

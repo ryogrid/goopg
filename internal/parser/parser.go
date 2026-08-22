@@ -37,6 +37,12 @@ type SyntaxError struct {
 	// Kept as a bare string so internal/parser stays free of an sqlstate
 	// import.
 	Code string
+	// Hint carries an optional HINT wire field alongside Code, for the same
+	// kind of non-syntax error raised during parsing (e.g. SIMILAR TO's
+	// parse-time constant-fold rejecting a >1-char ESCAPE string with
+	// 22025/"Escape string must be empty or one character."). Empty means no
+	// HINT field. M0134-0070.
+	Hint string
 }
 
 func (e *SyntaxError) Error() string {
@@ -181,7 +187,7 @@ func Parse(input string, mc ...*mmgr.Context) ([]Stmt, error) {
 			continue
 		}
 		if p.cur().Kind != TokenEOF {
-			err := p.errAtCur("expected ';' or end of input")
+			err := p.errSyntaxAtCur()
 			if sp != nil {
 				tokenSlicePool.Put(sp)
 			}
@@ -1002,6 +1008,14 @@ func (p *parser) errSyntaxAtCur() error {
 		case "oids":
 			near = strings.ToUpper(t.Value)
 		}
+	} else if t.Kind == TokenStringLit {
+		// PG's scanner_yyerror echoes the raw source text of the offending
+		// token (postgres/src/backend/parser/scan.c scanner_yyerror), so a
+		// string literal's "near" text is its quoted source form — not the
+		// decoded value — with embedded quotes doubled.
+		near = "'" + strings.ReplaceAll(t.Value, "'", "''") + "'"
+	} else if t.Kind == TokenQuotedIdent {
+		near = "\"" + strings.ReplaceAll(t.Value, "\"", "\"\"") + "\""
 	}
 	return &SyntaxError{Pos: t.Pos, Message: near}
 }
@@ -2023,6 +2037,25 @@ func (p *parser) parseIntLit() (int64, error) {
 	return n, nil
 }
 
+// parseSignedIntLit parses an optional leading '-' (a separate unary-minus
+// operator token, since integer literals never carry a sign in the lexer)
+// followed by an integer literal, e.g. for `FETCH ABSOLUTE -1`. M0134-0056.
+func (p *parser) parseSignedIntLit() (int64, error) {
+	neg := false
+	if p.cur().Kind == TokenOperator && p.cur().Value == "-" {
+		neg = true
+		p.advance()
+	}
+	n, err := p.parseIntLit()
+	if err != nil {
+		return 0, err
+	}
+	if neg {
+		n = -n
+	}
+	return n, nil
+}
+
 // parseStrLit consumes a TokenStringLit and returns its (unquoted) value.
 func (p *parser) parseStrLit() (string, error) {
 	t := p.cur()
@@ -3010,8 +3043,10 @@ func (p *parser) parseDeclareCursor() (Stmt, error) {
 		return nil, p.errAtCur("expected CURSOR")
 	}
 
-	// optional WITH/WITHOUT HOLD
-	if p.acceptIdentKeyword("with") || p.acceptIdentKeyword("without") {
+	// optional WITH/WITHOUT HOLD. WITH is a reserved keyword (lexed as
+	// TokenKeyword/KwWith, never TokenIdent) so it must be matched via
+	// acceptKeyword, not acceptIdentKeyword — M0134-0056.
+	if p.acceptKeyword(KwWith) || p.acceptIdentKeyword("without") {
 		p.acceptIdentKeyword("hold")
 	}
 
@@ -3054,17 +3089,21 @@ func (p *parser) parseFetchCursor() (Stmt, error) {
 		forward = false
 		count = 1
 	case p.acceptIdentKeyword("absolute"):
-		if p.cur().Kind == TokenIntLit {
+		// Optional leading '-' (unary minus token) before the literal, e.g.
+		// `FETCH ABSOLUTE -1`. M0134-0056.
+		if p.cur().Kind == TokenIntLit || (p.cur().Kind == TokenOperator && p.cur().Value == "-") {
 			var err error
-			count, err = p.parseIntLit()
+			count, err = p.parseSignedIntLit()
 			if err != nil {
 				return nil, err
 			}
 		}
 	case p.acceptIdentKeyword("relative"):
-		if p.cur().Kind == TokenIntLit {
+		// Optional leading '-' (unary minus token) before the literal, e.g.
+		// `FETCH RELATIVE -1`. M0134-0056.
+		if p.cur().Kind == TokenIntLit || (p.cur().Kind == TokenOperator && p.cur().Value == "-") {
 			var err error
-			count, err = p.parseIntLit()
+			count, err = p.parseSignedIntLit()
 			if err != nil {
 				return nil, err
 			}

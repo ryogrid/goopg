@@ -82,3 +82,21 @@ while probing is `intra-grant-inplace` (output already matches except a single
 `<waiting>` divergence on `ALTER TABLE … ADD PRIMARY KEY`), but it requires
 modeling pg_class catalog-tuple xmax row locks for GRANT/REVOKE/ALTER across nine
 permutations — a large semantic gap against goopg's virtual pg_class, deferred.
+
+## Follow-up: defaults on NOT MATCHED INSERT (M0134-0044)
+
+The MERGE `WHEN NOT MATCHED THEN INSERT (col-list)` path (`operators_merge.go`
+Step 3) filled the target row directly from `clause.InsertExprs` /
+`clause.InsertColIdx` and then went straight to `computeGeneratedColumns` and
+partition routing, leaving every column not named in the INSERT column list
+as SQL NULL — it never called `applyDefaultsForMissing` or
+`autoGenerateSerialValues`. PG has no separate default-skipping code path for
+MERGE's NOT MATCHED insert: it funnels through the same `ExecInsert`
+default-substitution machinery as plain INSERT
+(`postgres/src/backend/executor/nodeModifyTable.c` `ExecMergeMatched`). The
+fix builds an `insertMissing []bool` mask (true for every target column index
+not actually written this iteration) and calls
+`applyDefaultsForMissing`/`autoGenerateSerialValues` before
+`computeGeneratedColumns`, mirroring the already-correct `INSERT ... ON
+CONFLICT` sibling at `operators_upsert.go:198-214` (`upsertMissing`) and the
+plain-INSERT twin in `operators_storage.go`.

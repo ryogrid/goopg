@@ -1254,6 +1254,18 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			}
 		}
 		return catalog.Type{Name: "bool"}, nil
+	case *parser.LikeEscapePattern:
+		// Only ever appears as a LIKE/ILIKE BinaryOp's Right operand (see
+		// parser.LikeEscapePattern doc); walk Pattern/Escape for nested
+		// errors and report text so the enclosing OpLike/OpILike arm's
+		// isStringLike(rightTyp) check passes. M0134-0070.
+		if _, err := analyzeExpr(x.Pattern, ctx); err != nil {
+			return catalog.Type{}, err
+		}
+		if _, err := analyzeExpr(x.Escape, ctx); err != nil {
+			return catalog.Type{}, err
+		}
+		return catalog.Type{Name: "text"}, nil
 	case *parser.IsNullExpr:
 		// IS [NOT] NULL always returns bool. Recurse into operand to catch errors.
 		if _, err := analyzeExpr(x.Operand, ctx); err != nil {
@@ -1417,6 +1429,15 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 				(x.Op == parser.OpAdd || x.Op == parser.OpSub) {
 				return catalog.Type{Name: "interval"}, nil
 			}
+			// interval * numeric/int/float and interval / numeric/int/float
+			// → interval (interval_mul / interval_div, timestamp.c). PG has
+			// no interval-modulo operator, so OpMod falls through to the
+			// numeric-operand error below unchanged. Executor: intervalMul /
+			// intervalDiv in internal/executor/expr.go. M0134-0035.
+			if strings.EqualFold(leftTyp.Name, "interval") && isNumericLike(rightTyp) &&
+				(x.Op == parser.OpMul || x.Op == parser.OpDiv) {
+				return catalog.Type{Name: "interval"}, nil
+			}
 			// date + integer → date (date_pli).  PG treats the integer as
 			// a day count; executor: addDateTimeInt in expr.go.
 			if strings.EqualFold(leftTyp.Name, "date") && isIntegerLike(rightTyp) && x.Op == parser.OpAdd {
@@ -1477,8 +1498,13 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			return catalog.Type{Name: "text"}, nil
 		case parser.OpLike, parser.OpNotLike:
 			// Both operands must be string-like (text/varchar/char/
-			// bpchar/unknown). Pattern can be a literal or column.
-			if !isStringLike(leftTyp) || !isStringLike(rightTyp) {
+			// bpchar/unknown) or both bytea/unknown. PG resolves the
+			// string pair to textlike/textnlike and the bytea pair to
+			// bytealike (~~(bytea,bytea), pg_operator.dat:2383-2384,
+			// like.c:326). Pattern can be a literal or column. M0134-0070.
+			leftStr, rightStr := isStringLike(leftTyp), isStringLike(rightTyp)
+			leftByt, rightByt := isByteaOrUnknown(leftTyp), isByteaOrUnknown(rightTyp)
+			if !((leftStr && rightStr) || (leftByt && rightByt)) {
 				return catalog.Type{}, analyzeError(x.Pos(), "42804", fmt.Sprintf("operator %s requires string operands", x.Op))
 			}
 			return catalog.Type{Name: "bool"}, nil
@@ -2257,6 +2283,24 @@ func tableFuncBaseColumns(tf *parser.TableFuncRef, alias string, colAliases []st
 		// with pg_catalog.pg_sequence. DU-002 slice 32 (M0110-0001).
 		names := []string{"last_value", "is_called"}
 		types := []string{"int8", "bool"}
+		for i := range names {
+			if i < len(colAliases) && colAliases[i] != "" {
+				names[i] = colAliases[i]
+			}
+		}
+		cols := make([]catalog.Column, len(names))
+		for i := range names {
+			cols[i] = catalog.Column{Name: names[i], Type: catalog.Type{Name: types[i]}, Ordinal: i}
+		}
+		return cols
+	case "pg_sequence_parameters":
+		// pg_sequence_parameters(regclass) → (start_value int8, minimum_value
+		// int8, maximum_value int8, increment int8, cycle_option bool,
+		// cache_size int8, data_type oid). Mirrors planPgSequenceParameters.
+		// PG oracle: postgres/src/backend/commands/sequence.c:1740
+		// pg_sequence_parameters; pg_proc.dat:3426-3431. M0134-0069.
+		names := []string{"start_value", "minimum_value", "maximum_value", "increment", "cycle_option", "cache_size", "data_type"}
+		types := []string{"int8", "int8", "int8", "int8", "bool", "int8", "oid"}
 		for i := range names {
 			if i < len(colAliases) && colAliases[i] != "" {
 				names[i] = colAliases[i]
@@ -3125,6 +3169,18 @@ func isStringLike(t catalog.Type) bool {
 		return true
 	}
 	return isStringTypeName(t.Name)
+}
+
+// isByteaOrUnknown reports whether t is bytea (or an unknown literal),
+// the operand class for PG's bytealike (~~(bytea,bytea)) lane. Kept
+// separate from isStringLike: bytea must NOT be admitted into OpConcat
+// (analyzer.go:1491), where isStringLike feeds the int || bytea 42883
+// rejection. M0134-0070.
+func isByteaOrUnknown(t catalog.Type) bool {
+	if isUnknownType(t) {
+		return true
+	}
+	return strings.ToLower(t.Name) == "bytea"
 }
 
 func isComparable(left, right catalog.Type) bool {

@@ -31,6 +31,14 @@ func TestPgTypeofFoldsToCompileTimeType(t *testing.T) {
 			sql:  "SELECT pg_typeof('hello')",
 			want: "text",
 		},
+		{
+			// M0134-0070 Round F: regexp_replace's new 6-arg extended
+			// form (oid 6251, pg_proc.dat:3755-3759) is text-returning
+			// like all 5 of its overloads.
+			name: "regexp_replace extended form",
+			sql:  "SELECT pg_typeof(regexp_replace('a', 'a', 'b', 1, 2, 'i'))",
+			want: "text",
+		},
 	}
 	cat := pgbenchCatalog(t)
 	for _, tc := range tests {

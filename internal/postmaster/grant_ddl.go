@@ -207,8 +207,23 @@ func (s *Server) tryRecordTableGrant(stmt string, actingRole string) error {
 			continue
 		}
 		for _, role := range roles {
+			// A GRANT naming the object's actual owner (by real role name, not
+			// the internal "postgres" owner-ACL sentinel) must land under the
+			// sentinel key too — that is where RevokeTablePrivilege/
+			// HasTablePrivilege/MaterializeOwnerACL all look for the owner's
+			// entry. Without this, a REVOKE-then-selective-GRANT sequence
+			// naming the real owner (sequence.sql's regress_seq_user fixture)
+			// silently creates a dead entry under the literal owner role name
+			// that the owner-bypass check in dmlPrivilegePermittedAs never
+			// consults, leaving the (former) owner permanently denied even
+			// after a valid re-GRANT. Twin of the aclKey fix in
+			// tryRecordTableRevoke above. M0134-0069 bucket 7.
+			aclKey := role
+			if strings.EqualFold(role, tbl.Owner) {
+				aclKey = aclOwnerRole
+			}
 			for _, p := range privs {
-				s.cfg.Catalog.GrantTablePrivilegeAs(tbl.OID, role, p, withGrantOption, grantor)
+				s.cfg.Catalog.GrantTablePrivilegeAs(tbl.OID, aclKey, p, withGrantOption, grantor)
 			}
 		}
 	}
@@ -324,17 +339,28 @@ func (s *Server) tryRecordTableRevoke(stmt string) {
 			continue
 		}
 		for _, role := range roles {
-			// An owner-side REVOKE (`REVOKE … FROM postgres`) materializes the
-			// owner's full default ACL first so the surviving privileges render
-			// explicitly; PostgreSQL leaves relacl NULL until then. allPrivs is the
-			// owner's full default set for the object class (table or sequence), so
-			// the subsequent RevokeTablePrivilege yields relacl = default − revoked.
-			// DU-002 slice 340.
-			if strings.EqualFold(role, aclOwnerRole) {
+			// An owner-side REVOKE materializes the owner's full default ACL
+			// first so the surviving privileges render explicitly; PostgreSQL
+			// leaves relacl NULL until then. allPrivs is the owner's full
+			// default set for the object class (table or sequence), so the
+			// subsequent RevokeTablePrivilege yields relacl = default −
+			// revoked. The owner's implicit privilege is a revocable aclitem
+			// like any other (postgres/src/backend/utils/adt/acl.c
+			// pg_class_aclcheck never special-cases the owner), so detect the
+			// owner not by the internal "postgres" bookkeeping sentinel but by
+			// comparing against the object's actual Owner field -- a REVOKE
+			// naming a role that literally happens to be "postgres" would
+			// otherwise be misrouted, and a REVOKE naming the real owner under
+			// any other name would otherwise be silently dropped since no
+			// explicit grant was ever recorded under that role name.
+			// M0134-0069 bucket 7. DU-002 slice 340.
+			aclKey := role
+			if strings.EqualFold(role, tbl.Owner) {
+				aclKey = aclOwnerRole
 				s.cfg.Catalog.MaterializeOwnerACL(tbl.OID, aclOwnerRole, allPrivs)
 			}
 			for _, p := range privs {
-				s.cfg.Catalog.RevokeTablePrivilege(tbl.OID, role, p)
+				s.cfg.Catalog.RevokeTablePrivilege(tbl.OID, aclKey, p)
 			}
 		}
 	}

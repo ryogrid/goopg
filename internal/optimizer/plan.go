@@ -514,6 +514,22 @@ type BinaryOp struct {
 	ResultType string // non-empty for arithmetic with typed result (e.g., "int2")
 }
 
+// LikeEscapePattern is the optimizer-side mirror of parser.LikeEscapePattern.
+// It appears ONLY as the Right operand of a BinaryOp{Op: OpLike/OpNotLike/
+// OpILike/OpNotILike} when the source had a LIKE...ESCAPE clause; the
+// executor evaluates Pattern and Escape and rewrites the pattern into
+// PostgreSQL's standard backslash-escape convention before the normal LIKE
+// match runs (PG oracle: postgres/src/backend/utils/adt/like_match.c:392-486
+// do_like_escape). M0134-0070.
+type LikeEscapePattern struct {
+	pos     int
+	Pattern Expr
+	Escape  Expr
+}
+
+func (e *LikeEscapePattern) Pos() int { return e.pos }
+func (*LikeEscapePattern) exprNode()  {}
+
 func (e *BinaryOp) Pos() int { return e.pos }
 func (*BinaryOp) exprNode()  {}
 
@@ -566,6 +582,9 @@ type FuncCall struct {
 	Star       bool
 	Variadic   bool   // true when args were expanded from VARIADIC array syntax
 	ReturnType string // return type for user-defined functions; empty for unknown
+	// ArgWidth is the resolved overload width for width-sensitive builtins
+	// such as to_hex; empty means default int4.
+	ArgWidth string
 }
 
 func (e *FuncCall) Pos() int { return e.pos }
@@ -1711,6 +1730,23 @@ type PgGetSequenceData struct {
 func (n *PgGetSequenceData) Pos() int       { return n.pos }
 func (n *PgGetSequenceData) Output() Schema { return n.schema }
 
+// PgSequenceParameters implements pg_sequence_parameters(regclass) as a
+// FROM-clause SRF. Returns the persisted DDL parameters of a sequence
+// (start_value, minimum_value, maximum_value, increment, cycle_option,
+// cache_size, data_type) — unlike PgGetSequenceData, this reads catalog
+// state, not the live current value. Takes a plain constant regclass arg
+// (no lateral correlation observed in PG's grammar/pg_proc.dat for this
+// function). PG oracle: postgres/src/backend/commands/sequence.c:1740
+// pg_sequence_parameters; pg_proc.dat:3426-3431. M0134-0069.
+type PgSequenceParameters struct {
+	pos    int
+	Arg    Expr
+	schema Schema
+}
+
+func (n *PgSequenceParameters) Pos() int       { return n.pos }
+func (n *PgSequenceParameters) Output() Schema { return n.schema }
+
 // TSTokenType implements ts_token_type(parser_oid) as a FROM-clause SRF:
 // (tokid int4, alias text, description text). pg_dump's dumpTSConfig issues
 // `FROM pg_catalog.ts_token_type('%u'::oid) AS t` (a literal argument, not
@@ -1799,6 +1835,25 @@ type FromRegexpMatches struct {
 
 func (n *FromRegexpMatches) Pos() int       { return n.pos }
 func (n *FromRegexpMatches) Output() Schema { return n.schema }
+
+// FromRegexpSplitToTable is the FROM-clause SRF plan node for
+// FROM regexp_split_to_table(string, pattern[, flags]). Unlike
+// FromRegexpMatches, output is a single plain text column (one row per
+// substring produced by splitting on the pattern) — mirrors PG's
+// regexp_split_to_table / build_regexp_split_result. N matches produce N+1
+// rows, always (the 'g' flag is rejected up front, then glob=true is forced
+// internally per postgres/src/backend/utils/adt/regexp.c:1748-1797). M0134-0070
+// Round D.
+type FromRegexpSplitToTable struct {
+	pos         int
+	StringExpr  Expr
+	PatternExpr Expr
+	FlagsExpr   Expr // nil when not given
+	schema      Schema
+}
+
+func (n *FromRegexpSplitToTable) Pos() int       { return n.pos }
+func (n *FromRegexpSplitToTable) Output() Schema { return n.schema }
 
 // VerifyHeapam is the FROM-clause SRF plan node for amcheck's
 // verify_heapam(regclass, ...) — slice S3 of docs/design/0110-0008. It carries

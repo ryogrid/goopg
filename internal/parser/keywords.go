@@ -117,6 +117,11 @@ var keywordCategory = map[Keyword]KeywordCategory{
 	KwReverse:  KwCatUnreserved,
 	KwPerform:  KwCatUnreserved,
 
+	// ESCAPE is UNRESERVED_KEYWORD in PG (kwlist.h:159); usable as an
+	// ordinary identifier/column alias outside the LIKE...ESCAPE tail.
+	// M0134-0070.
+	KwEscape: KwCatUnreserved,
+
 	// ── col_name ────────────────────────────────────────────────────────
 	KwValues:  KwCatColName,
 	KwExists:  KwCatColName,
@@ -138,6 +143,7 @@ var keywordCategory = map[Keyword]KeywordCategory{
 	KwIs:      KwCatTypeFunc,
 	KwLike:    KwCatTypeFunc,
 	KwIlike:   KwCatTypeFunc,
+	KwSimilar: KwCatTypeFunc,
 	KwLateral: KwCatTypeFunc,
 
 	// ── reserved ────────────────────────────────────────────────────────

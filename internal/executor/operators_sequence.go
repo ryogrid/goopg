@@ -637,6 +637,67 @@ func ctxSeqDBOid(ctx *Context) uint32 {
 	return catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)
 }
 
+// resolveSeqCatalogTable resolves the *catalog.Table for a sequence name
+// (bare or schema-qualified), used by the nextval/currval/setval/lastval ACL
+// checks below. Mirrors the name-splitting evalNextval already did for its
+// lock lookup (M0134-0069 bucket 5). Returns nil if ctx/catalog is unset or
+// the sequence isn't found in the catalog (e.g. a not-yet-flushed test
+// registry entry) — callers treat a nil table as "no ACL to enforce",
+// matching goopg's existing catalog-optional test-harness convention.
+func resolveSeqCatalogTable(ctx *Context, name string, dbOid uint32) *catalog.Table {
+	if ctx == nil || ctx.Catalog == nil {
+		return nil
+	}
+	on := parser.ObjectName{Name: name}
+	if i := strings.LastIndex(name, "."); i >= 0 {
+		on = parser.ObjectName{Schema: name[:i], Name: name[i+1:]}
+	}
+	if tbl, ok := ctx.Catalog.LookupTable(on, dbOid); ok {
+		return tbl
+	}
+	return nil
+}
+
+// seqWrongRelkindError returns the 42809 error PG raises when a
+// nextval/currval/setval/lastval/ALTER SEQUENCE target resolves to a catalog
+// relation that exists but is NOT a sequence. Mirrors PG's sequence_open ->
+// validate_relation_kind (postgres/src/backend/access/sequence/sequence.c:37-46,
+// 66-77): ERRCODE_WRONG_OBJECT_TYPE (42809), errmsg("cannot open relation
+// \"%s\"", name), errdetail_relkind_not_supported(relkind) for DETAIL
+// (postgres/src/backend/catalog/pg_class.c:24-52).
+//
+// Returns nil when name doesn't resolve to any catalog relation at all (the
+// caller falls through to its own not-found handling) or when it resolves to
+// a genuine sequence.
+func seqWrongRelkindError(ctx *Context, name string, dbOid uint32) *ExecError {
+	tbl := resolveSeqCatalogTable(ctx, name, dbOid)
+	if tbl == nil || tbl.IsSequence {
+		return nil
+	}
+	return &ExecError{
+		Code:    "42809",
+		Message: fmt.Sprintf("cannot open relation %q", name),
+		Detail:  seqRelkindNotSupportedDetail(tbl),
+	}
+}
+
+// seqRelkindNotSupportedDetail mirrors errdetail_relkind_not_supported
+// (postgres/src/backend/catalog/pg_class.c:24-52) for the relkinds
+// resolveSeqCatalogTable can actually return (ordinary/partitioned tables,
+// views, materialized views — sequences are excluded by the caller).
+func seqRelkindNotSupportedDetail(tbl *catalog.Table) string {
+	switch relkindByteForTable(tbl) {
+	case 'p':
+		return "This operation is not supported for partitioned tables."
+	case 'm':
+		return "This operation is not supported for materialized views."
+	case 'v':
+		return "This operation is not supported for views."
+	default:
+		return "This operation is not supported for tables."
+	}
+}
+
 func evalNextval(args []Datum, ctx *Context) (Datum, error) {
 	if len(args) == 0 {
 		return NullDatum, nil
@@ -652,21 +713,22 @@ func evalNextval(args []Datum, ctx *Context) (Datum, error) {
 	}
 	s := LookupSequence(name, dbOid)
 	if s == nil {
+		if rkErr := seqWrongRelkindError(ctx, name, dbOid); rkErr != nil {
+			return Datum{}, rkErr
+		}
 		return Datum{}, &ExecError{Code: "42P01", Message: fmt.Sprintf("relation %q does not exist", name)}
 	}
 	// nextval holds a RowExclusiveLock on the sequence relation (mirrors
 	// PostgreSQL's lock_and_open_sequence), so it waits while another session is
 	// mid-ALTER SEQUENCE (AccessExclusiveLock) and a later ALTER SEQUENCE waits
 	// for an in-progress nextval. M0118-0008 (sequence-ddl isolation spec).
-	if ctx != nil && ctx.Catalog != nil {
-		on := parser.ObjectName{Name: name}
-		if i := strings.LastIndex(name, "."); i >= 0 {
-			on = parser.ObjectName{Schema: name[:i], Name: name[i+1:]}
+	if tbl := resolveSeqCatalogTable(ctx, name, dbOid); tbl != nil {
+		// nextval requires USAGE or UPDATE (sequence.c nextval_internal ~649-655).
+		if !dmlPrivilegePermittedAsAny(ctx, tbl, ctx.NonSuperuserRole, "USAGE", "UPDATE") {
+			return Datum{}, &ExecError{Code: "42501", Message: fmt.Sprintf("permission denied for sequence %s", tbl.Name)}
 		}
-		if tbl, ok := ctx.Catalog.LookupTable(on, dbOid); ok {
-			if err := ctx.acquireSequenceLockTxn(ctx.Catalog.RelFileNode(tbl)); err != nil {
-				return Datum{}, err
-			}
+		if err := ctx.acquireSequenceLockTxn(ctx.Catalog.RelFileNode(tbl)); err != nil {
+			return Datum{}, err
 		}
 	}
 	v, err := s.nextVal()
@@ -700,10 +762,20 @@ func evalCurrval(args []Datum, ctx *Context) (Datum, error) {
 		return NullDatum, nil
 	}
 	name := seqNameFromDatum(args[0], ctx)
+	dbOid := ctxSeqDBOid(ctx)
+	if rkErr := seqWrongRelkindError(ctx, name, dbOid); rkErr != nil {
+		return Datum{}, rkErr
+	}
+	if tbl := resolveSeqCatalogTable(ctx, name, dbOid); tbl != nil {
+		// currval requires SELECT or USAGE (sequence.c currval_oid ~876-881).
+		if !dmlPrivilegePermittedAsAny(ctx, tbl, ctx.NonSuperuserRole, "SELECT", "USAGE") {
+			return Datum{}, &ExecError{Code: "42501", Message: fmt.Sprintf("permission denied for sequence %s", tbl.Name)}
+		}
+	}
 	if ctx == nil || ctx.CurrSeqVals == nil {
 		return Datum{}, &ExecError{Code: "55000", Message: fmt.Sprintf("currval of sequence %q is not yet defined in this session", name)}
 	}
-	v, ok := ctx.CurrSeqVals[seqKey(name, ctxSeqDBOid(ctx))]
+	v, ok := ctx.CurrSeqVals[seqKey(name, dbOid)]
 	if !ok {
 		return Datum{}, &ExecError{Code: "55000", Message: fmt.Sprintf("currval of sequence %q is not yet defined in this session", name)}
 	}
@@ -730,6 +802,16 @@ func evalSetval(args []Datum, ctx *Context) (Datum, error) {
 	isCalled := true
 	if len(args) >= 3 && !args[2].IsNull() && args[2].Kind == KindBool {
 		isCalled = args[2].BoolValue()
+	}
+
+	if rkErr := seqWrongRelkindError(ctx, name, dbOid); rkErr != nil {
+		return Datum{}, rkErr
+	}
+	if tbl := resolveSeqCatalogTable(ctx, name, dbOid); tbl != nil {
+		// setval requires UPDATE only (sequence.c do_setval ~960-964).
+		if !dmlPrivilegePermittedAs(ctx, tbl, "UPDATE", ctx.NonSuperuserRole) {
+			return Datum{}, &ExecError{Code: "42501", Message: fmt.Sprintf("permission denied for sequence %s", tbl.Name)}
+		}
 	}
 
 	s := LookupSequence(name, dbOid)
@@ -777,9 +859,18 @@ func evalLastval(ctx *Context) (Datum, error) {
 		return Datum{}, &ExecError{Code: "55000", Message: "lastval is not yet defined in this session"}
 	}
 	// If the last-used sequence was dropped, lastval() must error.
-	if ctx.LastSeqName != "" && LookupSequence(ctx.LastSeqName, ctxSeqDBOid(ctx)) == nil {
+	dbOid := ctxSeqDBOid(ctx)
+	if ctx.LastSeqName != "" && LookupSequence(ctx.LastSeqName, dbOid) == nil {
 		ctx.LastSeqSet = false
 		return Datum{}, &ExecError{Code: "55000", Message: "lastval is not yet defined in this session"}
+	}
+	// lastval() operates on "the last sequence used by nextval in this
+	// session" (sequence.c lastval ~918-923) — the ACL check (SELECT or
+	// USAGE) still applies to that resolved sequence.
+	if tbl := resolveSeqCatalogTable(ctx, ctx.LastSeqName, dbOid); tbl != nil {
+		if !dmlPrivilegePermittedAsAny(ctx, tbl, ctx.NonSuperuserRole, "SELECT", "USAGE") {
+			return Datum{}, &ExecError{Code: "42501", Message: fmt.Sprintf("permission denied for sequence %s", tbl.Name)}
+		}
 	}
 	return Datum{Kind: KindInt, Int: ctx.LastSeqVal}, nil
 }
@@ -988,6 +1079,29 @@ func boolTextSeq(b bool) string {
 // owns the per-sequence parameters. M0110-0001 (DU-002 slice 115).
 func init() {
 	catalog.SequenceParamsFunc = sequenceParamsForCatalog
+	catalog.FindSequenceOwnedByFunc = findSequenceOwnedByForCatalog
+}
+
+// findSequenceOwnedByForCatalog resolves owner ("table.column")'s CURRENT
+// sequence name, mirroring autoGenerateSerialValues's two-step lookup above:
+// try the naming-convention name first, then fall back to a
+// FindSequenceOwnedBy scan (handles ALTER SEQUENCE ... RENAME on an
+// implicit SERIAL/IDENTITY column's sequence). Wired to
+// catalog.FindSequenceOwnedByFunc so the planner can resolve the renamed
+// sequence without importing internal/executor. M0134-0069 bucket 4.
+func findSequenceOwnedByForCatalog(owner string, dbOid uint32) (string, bool) {
+	tbl, col, ok := strings.Cut(owner, ".")
+	if !ok {
+		return "", false
+	}
+	namingConventionName := strings.ToLower(tbl) + "_" + strings.ToLower(col) + "_seq"
+	if LookupSequence(namingConventionName, dbOid) != nil {
+		return namingConventionName, true
+	}
+	if renamed := FindSequenceOwnedBy(owner, dbOid); renamed != "" {
+		return renamed, true
+	}
+	return "", false
 }
 
 // sequenceParamsForCatalog returns the pg_sequence parameter row for the named

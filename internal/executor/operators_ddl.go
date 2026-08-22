@@ -159,6 +159,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execCreateRule(s)
 	case *parser.DropRuleStmt:
 		return nil, o.execDropRule(s)
+	case *parser.AlterRuleRenameStmt:
+		return nil, o.execAlterRuleRename(s)
 	case *parser.DropTriggerStmt:
 		return nil, o.execDropTrigger(s)
 	case *parser.DropCompatStmt:
@@ -2193,6 +2195,7 @@ afterExistsCheck:
 				includeComments := strings.Contains(likeFlags, ":+comments")
 				includeStatistics := strings.Contains(likeFlags, ":+statistics")
 				includeStorage := strings.Contains(likeFlags, ":+storage")
+				includeCompression := strings.Contains(likeFlags, ":+compression")
 				src, ok := likeByKey[baseKey]
 				if !ok {
 					continue
@@ -2222,6 +2225,10 @@ afterExistsCheck:
 					// Clear Storage unless INCLUDING STORAGE or INCLUDING ALL was specified.
 					if !includeStorage {
 						c.Storage = ""
+					}
+					// Clear Compression unless INCLUDING COMPRESSION or INCLUDING ALL was specified.
+					if !includeCompression {
+						c.Compression = ""
 					}
 					merged, err := mergeExplicitColumnIntoInherited(c)
 					if err != nil {
@@ -6160,6 +6167,7 @@ type transitiveDep struct {
 // each entry record which immediate ancestor pulled the object in.
 func collectAllViewTransitiveDeps(im *catalog.InMemory, startName parser.ObjectName, dbOid uint32) []transitiveDep {
 	seen := map[string]bool{}
+	seen[startName.String()] = true
 	queue := []parser.ObjectName{startName}
 	var result []transitiveDep
 
@@ -6620,8 +6628,45 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 		if s.Behavior != parser.DropCascade {
 			if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
 				var depDescs []string
-				directViews := viewsDependingOnTable(im, name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
-				directMVs := matViewsDependingOnRelation(im, name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+				// M0134-0069: scan by the RESOLVED table identity (tbl.Schema/tbl.Name),
+				// not the raw parsed `name` (which may have an empty Schema for an
+				// unqualified DROP TABLE). viewsDependingOnTable/matViewsDependingOnRelation
+				// skip their schema filter entirely when tblSchema=="", so passing the raw
+				// name let a same-named table in an unrelated schema's dependent views
+				// falsely block this drop. PG walks pg_depend by OID (pg_depend.c
+				// findDependentObjects), never by bare name, so this can't happen upstream.
+				resolvedName := parser.ObjectName{Schema: tbl.Schema, Name: tbl.Name}
+				directViews := viewsDependingOnTable(im, resolvedName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+				directMVs := matViewsDependingOnRelation(im, resolvedName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+				// M0134-0069: viewsDependingOnTable/matViewsDependingOnRelation
+				// match a dependent by bare relation NAME with no OID binding
+				// (selectRefsViewName does plain text FROM-clause comparison), so
+				// a TEMP table and a same-named PERMANENT table sharing the
+				// shadow-map slot (catalog.go key(), which drops Schema for both
+				// "public" and "pg_temp") key identically as unqualified "t1" and
+				// cannot be told apart by schema alone (sequence.sql's `t1` temp
+				// table shadows create_view.sql's permanent `t1`, which has real
+				// view dependents nontemp1/temporal1). PostgreSQL forbids a
+				// non-temp view from referencing a temp relation (a view over a
+				// temp table must itself be temp — createViewCommand.c
+				// "views cannot reference temporary tables"), so a genuinely
+				// non-temp view can never truly depend on a temp target and vice
+				// versa: drop any dependent whose own Temp-ness doesn't match the
+				// drop target's.
+				dropDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+				filterTempMismatch := func(deps []parser.ObjectName) []parser.ObjectName {
+					var out []parser.ObjectName
+					for _, dn := range deps {
+						dep, ok3 := im.LookupTable(dn, dropDBOid)
+						if ok3 && dep.Temp != tbl.Temp {
+							continue
+						}
+						out = append(out, dn)
+					}
+					return out
+				}
+				directViews = filterTempMismatch(directViews)
+				directMVs = filterTempMismatch(directMVs)
 				for _, vn := range directViews {
 					depDescs = append(depDescs, fmt.Sprintf("view %s depends on table %s", vn.String(), name.String()))
 				}
@@ -6829,6 +6874,69 @@ func functionsDependingOnSequence(cat catalog.Catalog, seqName string, seqSchema
 		}
 	}
 	return result
+}
+
+// columnDefaultsDependingOnSequence returns "column of table" dependency
+// descriptions for every column whose DEFAULT depends on seqName (dropped
+// sequence's bare, lowercased name), covering both implicit
+// SERIAL/IDENTITY-owned sequences (resolved via
+// catalog.FindSequenceOwnedByFunc, which already tracks post-RENAME
+// identity — M0134-0069 bucket 4) and explicit nextval(...) DEFAULT
+// literals. Matches PG's dependency-recording rule (parse_utilcmd.c /
+// pg_depend): only a bare string literal or an explicit ::regclass cast
+// creates a dependency; ::text (or any other cast) does not.
+func columnDefaultsDependingOnSequence(im *catalog.InMemory, seqName parser.ObjectName, dbOid uint32) []struct{ Table, Column string } {
+	var deps []struct{ Table, Column string }
+	seqBare := strings.ToLower(strings.TrimSpace(seqName.Name))
+	for _, tbl := range im.AllTables(dbOid) {
+		for i := range tbl.Columns {
+			col := &tbl.Columns[i]
+			if col.Dropped {
+				continue
+			}
+			// 1. Implicit SERIAL/IDENTITY-owned sequence.
+			colTypeLow := strings.ToLower(col.Type.Name)
+			isSerial := colTypeLow == "serial" || colTypeLow == "serial4" || colTypeLow == "bigserial" || colTypeLow == "serial8" || colTypeLow == "smallserial" || colTypeLow == "serial2"
+			if col.IdentityColumn || isSerial {
+				if curName, ok := catalog.FindSequenceOwnedByFunc(tbl.Name+"."+col.Name, dbOid); ok {
+					if strings.EqualFold(curName, seqBare) {
+						deps = append(deps, struct{ Table, Column string }{Table: tbl.Name, Column: col.Name})
+					}
+				}
+				continue
+			}
+			// 2. Explicit nextval(...) DEFAULT literal.
+			if col.DefaultExpr == nil {
+				continue
+			}
+			fc, ok := col.DefaultExpr.(*parser.FuncCall)
+			if !ok || !strings.EqualFold(fc.Name.Name, "nextval") || len(fc.Args) < 1 {
+				continue
+			}
+			arg := fc.Args[0]
+			if cast, ok2 := arg.(*parser.CastExpr); ok2 {
+				// Only ::regclass creates a dependency; ::text (or any other
+				// cast) is exempt — do NOT unwrap in that case.
+				if !strings.EqualFold(cast.Type.Name, "regclass") {
+					continue
+				}
+				arg = cast.Operand
+			}
+			sc, ok3 := arg.(*parser.StringConst)
+			if !ok3 {
+				continue
+			}
+			litName := sc.Value
+			bareName := litName
+			if idx := strings.LastIndex(litName, "."); idx >= 0 {
+				bareName = litName[idx+1:]
+			}
+			if strings.EqualFold(strings.TrimSpace(bareName), seqBare) {
+				deps = append(deps, struct{ Table, Column string }{Table: tbl.Name, Column: col.Name})
+			}
+		}
+	}
+	return deps
 }
 
 // functionsDependingOnRoutineOID returns all routines whose RoutineCallOIDs include the given OID.
@@ -7394,7 +7502,11 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	// two-level tree where two ancestor indexes both reach the same leaf yields
 	// `_id_idx` and `_id_idx1` — the names the partition-drop-index-locking
 	// isolation spec observes. M0118-0008.
-	if tbl.PartitionMethod != "" {
+	// `ON ONLY` (s.OnOnly) opts out of this fan-out: PG's DefineIndex gates the
+	// recursion on stmt->relation->inh, which is false when ONLY was specified
+	// (postgres/src/backend/commands/indexcmds.c:1230,1303). The user is left
+	// to attach child indexes explicitly via ATTACH PARTITION.
+	if tbl.PartitionMethod != "" && !s.OnOnly {
 		if parentIdx, ok := o.ctx.Catalog.LookupIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok {
 			if err := o.createPartitionChildIndexes(s, tbl, parentIdx, resolvedPred); err != nil {
 				return err
@@ -9451,6 +9563,70 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 						fmt.Sprintf("%d", lc),
 						calledStr,
 					}}
+				}
+				// M0134-0069 B4: propagate the rename to every OTHER table's
+				// column DEFAULT that names this sequence via nextval(...).
+				// goopg's Column.DefaultExpr stores the sequence reference by
+				// name literal (unlike PG, whose pg_attrdef.adbin is OID-based
+				// via the dependency system — ruleutils.c resolves the OID to
+				// the current name at print time, so PG needs no textual
+				// fixup here). Without this, INSERT against a column whose
+				// DEFAULT still names the old sequence 42P01s after the
+				// rename. Skips the sequence's own row (a sequence has no
+				// nextval-DEFAULT columns of its own) and SET SCHEMA (a
+				// separate, already-known out-of-scope gap).
+				if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+					for _, other := range im.AllTables(seqDBOid) {
+						if other.OID == tbl.OID {
+							continue
+						}
+						touched := false
+						for i := range other.Columns {
+							col := &other.Columns[i]
+							if col.Dropped || col.DefaultExpr == nil {
+								continue
+							}
+							fc, ok3 := col.DefaultExpr.(*parser.FuncCall)
+							if !ok3 || !strings.EqualFold(fc.Name.Name, "nextval") || len(fc.Args) == 0 {
+								continue
+							}
+							arg := fc.Args[0]
+							if cast, ok4 := arg.(*parser.CastExpr); ok4 {
+								arg = cast.Operand
+							}
+							sc, ok5 := arg.(*parser.StringConst)
+							if !ok5 {
+								continue
+							}
+							litName := sc.Value
+							litSchema := ""
+							bareName := litName
+							if idx := strings.LastIndex(litName, "."); idx >= 0 {
+								litSchema = litName[:idx]
+								bareName = litName[idx+1:]
+							}
+							// Match against the old sequence's bare name,
+							// case-insensitively, whether or not the literal
+							// carried a schema prefix (a bare literal with no
+							// schema still refers to this sequence when
+							// resolved against the target table's own
+							// schema).
+							if !strings.EqualFold(strings.TrimSpace(bareName), oldBare) {
+								continue
+							}
+							if litSchema == "" {
+								sc.Value = newName
+							} else {
+								sc.Value = litSchema + "." + newName
+							}
+							touched = true
+						}
+						if touched {
+							if syncErr := syncTableToCatalogHeap(o.ctx, other); syncErr != nil {
+								return fmt.Errorf("DDL catalog sync (sequence rename default fixup): %w", syncErr)
+							}
+						}
+					}
 				}
 			}
 			// 02e item B: persist the new relname to the pg_class heap. Without
@@ -16749,7 +16925,6 @@ func (o *ddlOp) execDropProcedure(s *parser.DropProcedureStmt) error {
 		argListStr := buildCallArgListStr(s.Args)
 		return &ExecError{Code: "42883", Pos: s.Pos(),
 			Message: fmt.Sprintf("%s %s%s does not exist", objKind, s.Name.Name, argListStr),
-			Hint:    "No procedure matches the given name and argument types. You might need to add explicit type casts.",
 		}
 	}
 	// DROP PROCEDURE on a function should fail.
@@ -18401,6 +18576,50 @@ func (o *ddlOp) execDropRule(s *parser.DropRuleStmt) error {
 		Message: fmt.Sprintf("rule %q for relation %q does not exist", s.Name, s.Table.Name)}
 }
 
+// execAlterRuleRename handles `ALTER RULE name ON table RENAME TO newname`.
+// Only the DO-NOTHING rule form goopg reifies into catalog.RuleInfo
+// (tbl.Rules — see execCreateRule) is renameable; any rule that fell to the
+// CompatNoopStmt path (a real DO INSTEAD/DO ALSO action) is not in tbl.Rules
+// and correctly reports "does not exist" here, matching this slice's scope
+// boundary. Mirrors postgres/src/backend/rewrite/rewriteDefine.c:793
+// RenameRewriteRule (including the reserved-name check for "_RETURN", the
+// view SELECT rule, and the duplicate-name collision check). M0134-0065.
+func (o *ddlOp) execAlterRuleRename(s *parser.AlterRuleRenameStmt) error {
+	tbl, ok := o.ctx.Catalog.LookupTable(s.Table, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+	if !ok {
+		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Table.Name)}
+	}
+	idx := -1
+	for i := range tbl.Rules {
+		if tbl.Rules[i].Name == s.Name {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		return &ExecError{Code: "42704", Pos: s.Pos(),
+			Message: fmt.Sprintf("rule %q for relation %q does not exist", s.Name, tbl.Name)}
+	}
+	// RenameRewriteRule disallows renaming a view's ON SELECT rule (which PG
+	// always names "_RETURN"), since that would break the invariant that a
+	// view's rewrite rule is discoverable by that fixed name. goopg does not
+	// model view rules in tbl.Rules (only the DO-NOTHING form reaches here),
+	// so this is effectively unreachable today but guarded for fidelity
+	// should that change.
+	if strings.EqualFold(s.Name, "_RETURN") {
+		return &ExecError{Code: "42939", Pos: s.Pos(),
+			Message: "renaming an ON SELECT rule is not allowed"}
+	}
+	for i := range tbl.Rules {
+		if i != idx && tbl.Rules[i].Name == s.NewName {
+			return &ExecError{Code: "42710", Pos: s.Pos(),
+				Message: fmt.Sprintf("rule %q for relation %q already exists", s.NewName, tbl.Name)}
+		}
+	}
+	tbl.Rules[idx].Name = s.NewName
+	return nil
+}
+
 // seqTypeBounds returns the min/max int64 bounds for a sequence data type.
 // Accepts PG aliases ("int2", "int4", "int8", "int", etc.). M0097-0068.
 func seqTypeBounds(dt string) (min, max int64) {
@@ -18441,6 +18660,7 @@ func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
 	name := s.Name.String()
 	seqDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 	if LookupSequence(name, seqDBOid) != nil && s.IfNotExists {
+		o.ctx.AddNotice(fmt.Sprintf("relation %q already exists, skipping", name))
 		return nil
 	}
 	// Validate data type.
@@ -18542,6 +18762,17 @@ func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
 	// surfaces the sequence in pg_class (relkind='S') / pg_depend / pg_sequence
 	// so pg_dump can discover and dump it. M0097-0024.
 	o.createSeqCatalogTable(s.Name, name)
+	// CREATE UNLOGGED SEQUENCE: stamp relpersistence on the just-created
+	// catalog row. Post-hoc LookupTable+set (rather than threading unlogged
+	// through createSeqCatalogTable/CreateSequenceCatalogRelation) keeps the
+	// WAL-replay and CREATE-DATABASE-template callers of
+	// CreateSequenceCatalogRelation untouched. M0134-0069.
+	if s.Unlogged {
+		if seqTbl, ok := o.ctx.Catalog.LookupTable(s.Name, seqDBOid); ok && seqTbl != nil {
+			seqTbl.Unlogged = true
+			syncTableToCatalogHeap(o.ctx, seqTbl)
+		}
+	}
 	// Restart persistence: WAL-log the full sequence definition (no-op for
 	// TEMPORARY sequences — session-scoped). See RecordKindSequenceState.
 	WALLogSequenceState(o.ctx, name)
@@ -18562,6 +18793,18 @@ func (o *ddlOp) createSeqCatalogTable(seqObjName parser.ObjectName, name string)
 	// name/schema (the retired kind-65 carried them before). Write it like
 	// any relation; the sequence reload re-registers the virtual relation.
 	if seqTbl, ok := o.ctx.Catalog.LookupTable(seqObjName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok && seqTbl != nil {
+		// Stamp the creating role as owner, mirroring CREATE TABLE's owner
+		// stamp (tablecmds.c DefineRelation -> heap_create_with_catalog
+		// ownerId = GetUserId(), see the CREATE TABLE call site above) — a
+		// non-superuser role's CREATE SEQUENCE otherwise leaves Owner at the
+		// zero-value sentinel (= bootstrap superuser), which made the new
+		// nextval/currval/setval/lastval ACL checks (M0134-0069 bucket 5)
+		// deny the creating role immediate, ungranted use of its own
+		// sequence — a pre-existing gap this brief's ACL enforcement
+		// exposed rather than one it introduced.
+		if o.ctx.NonSuperuserRole != "" {
+			seqTbl.Owner = o.ctx.NonSuperuserRole
+		}
 		syncTableToCatalogHeap(o.ctx, seqTbl)
 	}
 }
@@ -18632,7 +18875,8 @@ func (o *ddlOp) validateSeqOwnedBy(pos int, seqName, ownedBy string) error {
 	// rejects a valid 3-part OWNED BY. Mirrors InMemory.dependVirtualRows.
 	lastDot := strings.LastIndex(ownedBy, ".")
 	if lastDot < 0 {
-		return &ExecError{Code: "42601", Pos: pos, Message: "invalid OWNED BY option"}
+		return &ExecError{Code: "42601", Pos: pos, Message: "invalid OWNED BY option",
+			Hint: "Specify OWNED BY table.column or OWNED BY NONE."}
 	}
 	tblPart := ownedBy[:lastDot]
 	colPart := ownedBy[lastDot+1:]
@@ -18650,6 +18894,25 @@ func (o *ddlOp) validateSeqOwnedBy(pos int, seqName, ownedBy string) error {
 		}
 	}
 	if !ok {
+		// Not a table/view — check whether it names an index instead, which
+		// PG rejects with 42809 (ERRCODE_WRONG_OBJECT_TYPE) rather than the
+		// generic "does not exist". postgres/src/backend/commands/sequence.c:1629-1638
+		// (process_owned_by), errdetail_relkind_not_supported (pg_class.c:24-52).
+		_, idxOk := o.ctx.Catalog.LookupIndex(parser.ObjectName{Name: tblPart}, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+		if !idxOk {
+			schemaDot := strings.Index(tblPart, ".")
+			if schemaDot >= 0 {
+				_, idxOk = o.ctx.Catalog.LookupIndex(parser.ObjectName{
+					Schema: tblPart[:schemaDot],
+					Name:   tblPart[schemaDot+1:],
+				}, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+			}
+		}
+		if idxOk {
+			return &ExecError{Code: "42809", Pos: pos,
+				Message: fmt.Sprintf("sequence cannot be owned by relation %q", tblPart),
+				Detail:  "This operation is not supported for indexes."}
+		}
 		return &ExecError{Code: "42P01", Pos: pos,
 			Message: fmt.Sprintf("sequence cannot be owned by relation %q", tblPart)}
 	}
@@ -18692,7 +18955,12 @@ func (o *ddlOp) execAlterSequence(s *parser.AlterSequenceStmt) error {
 	seqDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 	seq := LookupSequence(name, seqDBOid)
 	if seq == nil {
+		if rkErr := seqWrongRelkindError(o.ctx, name, seqDBOid); rkErr != nil {
+			rkErr.Pos = s.Pos()
+			return rkErr
+		}
 		if s.IfExists {
+			o.ctx.AddNotice(fmt.Sprintf("relation %q does not exist, skipping", name))
 			return nil
 		}
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", name)}
@@ -18705,11 +18973,32 @@ func (o *ddlOp) execAlterSequence(s *parser.AlterSequenceStmt) error {
 	// another session holds an in-progress nextval lock. M0118-0008
 	// (sequence-ddl isolation spec).
 	if tbl, ok := o.ctx.Catalog.LookupTable(s.Name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok {
+		// Owner check: ALTER SEQUENCE requires ownership (sequence.c
+		// AlterSequence ~437, via RangeVarGetRelidExtended +
+		// RangeVarCallbackOwnsRelation shared with ALTER TABLE →
+		// object_ownercheck → aclcheck_error). Reuses the COMMENT-path owner
+		// checker (checkCommentObjectOwner), the only "must be owner of"
+		// idiom already landed for goopg's Table.Owner string field — no ALTER
+		// TABLE owner-check idiom exists yet to mirror instead (grepped,
+		// M0134-0069 bucket 5).
+		if err := o.checkCommentObjectOwner(tbl.Owner, "sequence", tbl.Name); err != nil {
+			if ee, ok := err.(*ExecError); ok {
+				ee.Pos = s.Pos()
+			}
+			return err
+		}
 		if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lmgr.AccessExclusiveLock); err != nil {
 			if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 				ee.Pos = s.Pos()
 			}
 			return err
+		}
+		// ALTER SEQUENCE ... SET LOGGED/UNLOGGED: re-derive relpersistence
+		// (pg_class.relpersistence 'p'/'u') the same way ATExecSetRelPersistence
+		// does for tables. M0134-0069.
+		if s.SetLogged != "" {
+			tbl.Unlogged = s.SetLogged == "unlogged"
+			syncTableToCatalogHeap(o.ctx, tbl)
 		}
 	}
 
@@ -19671,6 +19960,16 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			if o.dropSchemaQualifiedNotice(name) {
 				continue
 			}
+			// Wrong-relkind guard: a name that resolves to an existing
+			// catalog relation which isn't a sequence gets 42809, not the
+			// registry-miss 42704 below. Different message template than
+			// the nextval-family (no DETAIL). Mirrors PG's
+			// get_object_address_relobject, OBJECT_SEQUENCE case.
+			// postgres/src/backend/catalog/objectaddress.c:1362-1368.
+			if tbl := resolveSeqCatalogTable(o.ctx, name.String(), catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); tbl != nil && !tbl.IsSequence {
+				return &ExecError{Code: "42809", Pos: s.Pos(),
+					Message: fmt.Sprintf("%q is not a sequence", name.String())}
+			}
 			// CASCADE: drop functions that depend on this sequence before dropping it.
 			if s.Behavior == parser.DropCascade {
 				funcDeps := functionsDependingOnSequence(o.ctx.Catalog, name.Name, name.Schema)
@@ -19696,6 +19995,27 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				}
 			}
 			seqDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+			// RESTRICT (default): block the drop if any column DEFAULT
+			// (implicit SERIAL/IDENTITY-owned or explicit nextval(...))
+			// depends on this sequence. M0134-0069 bucket 3.
+			if s.Behavior != parser.DropCascade {
+				if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+					colDeps := columnDefaultsDependingOnSequence(im, name, seqDBOid)
+					if len(colDeps) > 0 {
+						details := make([]string, len(colDeps))
+						for i, dep := range colDeps {
+							details[i] = fmt.Sprintf("default value for column %s of table %s depends on sequence %s", dep.Column, dep.Table, name.String())
+						}
+						return &ExecError{
+							Code:    "2BP01",
+							Pos:     s.Pos(),
+							Message: fmt.Sprintf("cannot drop sequence %s because other objects depend on it", name.String()),
+							Detail:  strings.Join(details, "\n"),
+							Hint:    "Use DROP ... CASCADE to drop the dependent objects too.",
+						}
+					}
+				}
+			}
 			if !DropSequence(name.String(), seqDBOid) {
 				if s.IfExists {
 					o.ctx.AddNotice(fmt.Sprintf("sequence %q does not exist, skipping", name.String()))
@@ -21282,6 +21602,17 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 					copySource = existing
 					break
 				}
+			}
+			if copySource == nil && catalog.BuiltinTSConfigLanguages[strings.ToLower(copySourceName)] {
+				// COPY = <snowball language> (e.g. "english"): real PG's
+				// initdb seeds one pg_ts_config row per language (see
+				// catalog.BuiltinTSConfigLanguages doc comment); goopg has no
+				// such row, so synthesize an equivalent COPY source here
+				// (default parser, no mappings — no snowball stemming
+				// modeled) rather than erroring 42704. This synthetic value
+				// is never registered in the catalog; only the new
+				// configuration being created is. M0134-0068.
+				copySource = &catalog.UserTSConfig{Parser: catalog.BuiltinTSParserOID["default"]}
 			}
 			if copySource == nil {
 				return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", copySourceName)}
@@ -24198,6 +24529,18 @@ func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
 			// Synthesize the deparsed ScalarArrayOpExpr text, same as CREATE
 			// DOMAIN's CHECK (VALUE IN (...)) shortcut form.
 			expr = domainInValuesCheckExpr(d.Base.Name, s.CheckInValues, cat)
+		}
+		// PG's validateDomainCheckConstraint (typecmds.c:3196) calls
+		// get_rels_with_domain (typecmds.c:3215) to find every table
+		// column whose type transitively contains the domain, directly,
+		// via a composite field, a domain-of-domain, or a range subtype,
+		// and rejects before running the new CHECK against a single row.
+		// find_composite_type_dependencies (tablecmds.c:6936) raises this
+		// exact error/SQLSTATE (tablecmds.c:7039-7044,
+		// ERRCODE_FEATURE_NOT_SUPPORTED = 0A000) for a stored relation
+		// column. M0134-0067 Bucket 3.
+		if tableName, columnName, found := cat.FindColumnUsingDomainTransitively(s.Name, dbOid); found {
+			return &ExecError{Code: "0A000", Pos: s.Pos(), Message: fmt.Sprintf("cannot alter type %q because column \"%s.%s\" uses it", s.Name, tableName, columnName)}
 		}
 		if err := cat.AddDomainConstraint(s.Name, s.ConstraintName, expr, s.CheckInValues, dbOid); err != nil {
 			code := "42704" // ERRCODE_UNDEFINED_OBJECT — missing domain, matches real PG's typenameTypeId

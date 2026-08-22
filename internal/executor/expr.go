@@ -7,11 +7,14 @@ import (
 	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"crypto/sha512"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"math"
 	"math/big"
+	"math/bits"
 	mathrand "math/rand"
 	"regexp"
 	"strconv"
@@ -19,6 +22,7 @@ import (
 	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 	"unsafe"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -426,6 +430,8 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 		return evalExprSlot(x.Operand, slot, ctx)
 	case *optimizer.MultiAssignSubqElem:
 		return evalMultiAssignSubqElem(x, slotToRow(slot), ctx)
+	case *optimizer.LikeEscapePattern:
+		return evalLikeEscapePattern(x, slot, ctx)
 	case *optimizer.InExpr:
 		return evalInExpr(x, slot, ctx)
 	case *optimizer.ExistsExpr:
@@ -1100,7 +1106,11 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 				fResult = lf * rf
 			case parser.OpDiv:
 				if rf == 0 {
-					return Datum{}, &ExecError{Code: "22012", Pos: x.Pos(), Message: "division by zero"}
+					// No Pos: pure runtime evaluation (float8_div,
+					// postgres/src/backend/utils/adt/float.c) — PG never
+					// attaches errposition to row-by-row arithmetic, only to
+					// parse-time literal coercion. M0134-0070.
+					return Datum{}, &ExecError{Code: "22012", Message: "division by zero"}
 				}
 				fResult = lf / rf
 			default:
@@ -1157,11 +1167,17 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 			switch overflowCodeForType(x.ResultType) {
 			case ovfInt2:
 				if result.Int < -32768 || result.Int > 32767 {
-					return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "smallint out of range"}
+					// No Pos: pure runtime evaluation (int2pl/int2mi/int2mul,
+					// postgres/src/backend/utils/adt/int.c, has no
+					// errposition call). M0134-0070.
+					return Datum{}, &ExecError{Code: "22003", Message: "smallint out of range"}
 				}
 			case ovfInt4:
 				if result.Int < -2147483648 || result.Int > 2147483647 {
-					return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "integer out of range"}
+					// No Pos: pure runtime evaluation (int4pl/int4mi/int4mul,
+					// postgres/src/backend/utils/adt/int.c, has no
+					// errposition call). M0134-0070.
+					return Datum{}, &ExecError{Code: "22003", Message: "integer out of range"}
 				}
 			}
 		}
@@ -1265,7 +1281,10 @@ func evalUnary(op parser.OpCode, d Datum, pos int) (Datum, error) {
 		switch d.Kind {
 		case KindInt:
 			if d.Int == math.MinInt64 {
-				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+				// No Pos: pure runtime evaluation (int8um,
+				// postgres/src/backend/utils/adt/int8.c, has no
+				// errposition call). M0134-0070.
+				return Datum{}, &ExecError{Code: "22003", Message: "bigint out of range"}
 			}
 			return Datum{Kind: KindInt, Int: -d.Int}, nil
 		case KindNumeric:
@@ -1418,12 +1437,15 @@ func evalPgLSNBinary(op parser.OpCode, left, right Datum, pos int) (Datum, bool,
 					// pg_lsn - (-N) = pg_lsn + N
 					result := lu + abs
 					if result < lu {
-						return Datum{}, true, &ExecError{Code: "22003", Pos: pos, Message: "pg_lsn out of range"}
+						// No Pos: pure runtime evaluation (pg_lsn_mi,
+						// postgres/src/backend/utils/adt/pg_lsn.c, has no
+						// errposition call). M0134-0070.
+						return Datum{}, true, &ExecError{Code: "22003", Message: "pg_lsn out of range"}
 					}
 					return NewStringDatum(formatPgLSN(result)), true, nil
 				}
 				if abs > lu {
-					return Datum{}, true, &ExecError{Code: "22003", Pos: pos, Message: "pg_lsn out of range"}
+					return Datum{}, true, &ExecError{Code: "22003", Message: "pg_lsn out of range"}
 				}
 				return NewStringDatum(formatPgLSN(lu - abs)), true, nil
 			}
@@ -1450,15 +1472,17 @@ func evalPgLSNBinary(op parser.OpCode, left, right Datum, pos int) (Datum, bool,
 					Message: "cannot add NaN to pg_lsn"}
 			}
 			if isNeg {
-				// pg_lsn + (-N) = pg_lsn - N
+				// pg_lsn + (-N) = pg_lsn - N. No Pos: pure runtime evaluation
+				// (pg_lsn_pli, postgres/src/backend/utils/adt/pg_lsn.c, has
+				// no errposition call). M0134-0070.
 				if abs > lsnVal {
-					return Datum{}, true, &ExecError{Code: "22003", Pos: pos, Message: "pg_lsn out of range"}
+					return Datum{}, true, &ExecError{Code: "22003", Message: "pg_lsn out of range"}
 				}
 				return NewStringDatum(formatPgLSN(lsnVal - abs)), true, nil
 			}
 			result := lsnVal + abs
 			if result < lsnVal {
-				return Datum{}, true, &ExecError{Code: "22003", Pos: pos, Message: "pg_lsn out of range"}
+				return Datum{}, true, &ExecError{Code: "22003", Message: "pg_lsn out of range"}
 			}
 			return NewStringDatum(formatPgLSN(result)), true, nil
 		}
@@ -1636,6 +1660,22 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int, ctx *Context) (Dat
 				right = newNumeric(m, int(s))
 			}
 		}
+		// interval * numeric/int/float and interval / numeric/int/float
+		// route through interval_mul / interval_div (timestamp.c) before
+		// the generic numeric path below, mirroring the established
+		// KindInterval && KindInterval arm for OpAdd/OpSub above. PG has
+		// no interval-modulo operator, so OpMod on an interval falls
+		// through to the int-only error below unchanged. M0134-0035.
+		if left.Kind == KindInterval && (op == parser.OpMul || op == parser.OpDiv) {
+			factor, ok := datumToFloat64(right)
+			if !ok {
+				return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator does not exist: interval %s %s", op, pgKindTypeName(right.Kind))}
+			}
+			if op == parser.OpMul {
+				return intervalMul(left, factor, pos)
+			}
+			return intervalDiv(left, factor, pos)
+		}
 		if left.Kind == KindNumeric || right.Kind == KindNumeric {
 			a, b, err := promoteToNumeric(left, right, op, pos)
 			if err != nil {
@@ -1805,7 +1845,10 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int, ctx *Context) (Dat
 		}
 		matched, err := evalPOSIXRegex(ls, rs, op == parser.OpRegexIMatch || op == parser.OpRegexINoMatch)
 		if err != nil {
-			return Datum{}, &ExecError{Code: "2201B", Pos: pos, Message: fmt.Sprintf("invalid regular expression: %v", err)}
+			// No Pos: pure runtime evaluation (RE_compile_and_cache,
+			// postgres/src/backend/utils/adt/regexp.c, has no errposition
+			// call). M0134-0070.
+			return Datum{}, &ExecError{Code: "2201B", Message: fmt.Sprintf("invalid regular expression: %v", err)}
 		}
 		if op == parser.OpRegexNoMatch || op == parser.OpRegexINoMatch {
 			matched = !matched
@@ -1848,6 +1891,10 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int, ctx *Context) (Dat
 		// goopg carries json/jsonb as KindString; NULL operands already
 		// returned NullDatum above. M0118-0009 (horizons enabler).
 		return evalJSONArrow(op, left, right, pos)
+	case parser.OpJSONPathGet, parser.OpJSONPathGetText:
+		// json/jsonb #> text[]  →  value at path (json), and #>> → text.
+		// M0134-0039.
+		return evalJSONPathGet(op, left, right, pos)
 	}
 	return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("unknown operator %s", op)}
 }
@@ -1917,34 +1964,139 @@ func evalJSONArrow(op parser.OpCode, left, right Datum, pos int) (Datum, error) 
 
 	if op == parser.OpJSONGetText {
 		// ->> : a JSON null element is SQL NULL; scalars become their bare
-		// text; objects/arrays become their compact JSON text.
-		if elem == nil {
+		// text; objects/arrays become their compact JSON text. Shared with
+		// json_extract_path_text/jsonb_extract_path_text (M0134-0037).
+		return jsonElemAsTextDatum(elem), nil
+	}
+	// -> : return the element re-encoded as JSON (a JSON null → the text
+	// "null"). Shared with json_extract_path/jsonb_extract_path.
+	return jsonElemAsJSONDatum(elem), nil
+}
+
+// evalJSONPathGet evaluates the JSON path-extraction operators #> and #>>.
+//
+//	json #> text[]   → value at path (json)
+//	json #>> text[]  → value at path (text)
+//
+// Operator aliases for jsonb_extract_path(jsonb, text[]) /
+// jsonb_extract_path_text(jsonb, text[]) per
+// postgres/src/include/catalog/pg_operator.dat; PG oracle:
+// postgres/src/backend/utils/adt/jsonfuncs.c get_path_all. The left operand
+// is decoded exactly like evalJSONArrow (22P02 on invalid JSON); the right
+// operand is a text[] path, walked left-to-right via the existing
+// jsonPathStep helper (shared with json[b]_extract_path[_text], M0134-0037).
+// A path element that doesn't resolve yields SQL NULL immediately. An empty
+// path array is the identity (returns the original document unchanged).
+func evalJSONPathGet(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
+	ls, ok := datumAsString(left)
+	if !ok {
+		return Datum{}, &ExecError{Code: "42883", Pos: pos,
+			Message: fmt.Sprintf("operator %s requires a json left operand", op)}
+	}
+	dec := json.NewDecoder(strings.NewReader(ls))
+	dec.UseNumber()
+	var doc any
+	if err := dec.Decode(&doc); err != nil {
+		return Datum{}, &ExecError{Code: "22P02", Pos: pos,
+			Message: "invalid input syntax for type json"}
+	}
+
+	switch right.Kind {
+	case KindString, KindBytes:
+	default:
+		return Datum{}, &ExecError{Code: "42883", Pos: pos,
+			Message: fmt.Sprintf("operator %s requires a text[] path operand", op)}
+	}
+	rs, ok := datumAsString(right)
+	if !ok {
+		return Datum{}, &ExecError{Code: "42883", Pos: pos,
+			Message: fmt.Sprintf("operator %s requires a text[] path operand", op)}
+	}
+	path := parseTextArray(rs)
+
+	var elem any = doc
+	for _, key := range path {
+		v, found := jsonPathStep(elem, key)
+		if !found {
 			return NullDatum, nil
 		}
-		switch x := elem.(type) {
-		case string:
-			return NewStringDatum(x), nil
-		case json.Number:
-			return NewStringDatum(x.String()), nil
-		case bool:
-			if x {
-				return NewStringDatum("true"), nil
-			}
-			return NewStringDatum("false"), nil
-		default:
-			b, err := json.Marshal(x)
-			if err != nil {
-				return NullDatum, nil
-			}
-			return NewStringDatum(string(b)), nil
-		}
+		elem = v
 	}
-	// -> : return the element re-encoded as JSON (a JSON null → the text "null").
+
+	if op == parser.OpJSONPathGetText {
+		return jsonElemAsTextDatum(elem), nil
+	}
+	return jsonElemAsJSONDatum(elem), nil
+}
+
+// jsonPathStep performs one step of a json{b}_extract_path[_text] path walk:
+// unlike -> / ->> (whose array-vs-object dispatch is fixed by the operator's
+// static right-operand type, evalJSONArrow above), get_path_all's per-element
+// dispatch is driven by the actual JSON structure encountered at each level
+// (postgres/src/backend/utils/adt/jsonfuncs.c get_array_start/get_object_field_start,
+// via a single text[] path threaded as both tpath/ipath). A numeric-string key
+// against an array indexes it (negative counts from the end); any key against
+// an object looks up that field; anything else — including a non-numeric key
+// against an array — is "not found" (SQL NULL), matching PG's INT_MIN sentinel
+// for a non-numeric path element that will never match an index.
+func jsonPathStep(doc any, key string) (any, bool) {
+	switch v := doc.(type) {
+	case []any:
+		idx, err := strconv.Atoi(key)
+		if err != nil {
+			return nil, false
+		}
+		if idx < 0 {
+			idx += len(v)
+		}
+		if idx < 0 || idx >= len(v) {
+			return nil, false
+		}
+		return v[idx], true
+	case map[string]any:
+		elem, found := v[key]
+		return elem, found
+	default:
+		return nil, false
+	}
+}
+
+// jsonElemAsJSONDatum re-encodes a decoded JSON element (any/json.Number/
+// map[string]any/[]any/bool/nil) as its compact JSON text form — the shared
+// tail of -> and json_extract_path/jsonb_extract_path.
+func jsonElemAsJSONDatum(elem any) Datum {
 	b, err := json.Marshal(elem)
 	if err != nil {
-		return NullDatum, nil
+		return NullDatum
 	}
-	return NewStringDatum(string(b)), nil
+	return NewStringDatum(string(b))
+}
+
+// jsonElemAsTextDatum unwraps a decoded JSON element to its ->> text form: a
+// JSON null is SQL NULL, scalars become their bare text, and objects/arrays
+// become their compact JSON text — the shared tail of ->> and
+// json_extract_path_text/jsonb_extract_path_text.
+func jsonElemAsTextDatum(elem any) Datum {
+	if elem == nil {
+		return NullDatum
+	}
+	switch x := elem.(type) {
+	case string:
+		return NewStringDatum(x)
+	case json.Number:
+		return NewStringDatum(x.String())
+	case bool:
+		if x {
+			return NewStringDatum("true")
+		}
+		return NewStringDatum("false")
+	default:
+		b, err := json.Marshal(x)
+		if err != nil {
+			return NullDatum
+		}
+		return NewStringDatum(string(b))
+	}
 }
 
 // datumAsString returns d's character payload as a Go string when
@@ -2027,13 +2179,152 @@ func parseBoxText(s string) (ur, ll [2]float64, ok bool) {
 	return p1, p2, true
 }
 
+// evalLikeEscapePattern evaluates a LikeEscapePattern's Pattern and Escape
+// operands and rewrites Pattern into PostgreSQL's standard backslash-escape
+// convention, so the caller (evalBinary's LIKE/ILIKE arm, via
+// datumAsString+matchSQLLike) never has to know about ESCAPE at all — a
+// LikeEscapePattern only ever appears as a BinaryOp's Right operand, so this
+// is the single place the rewrite happens. M0134-0070.
+func evalLikeEscapePattern(x *optimizer.LikeEscapePattern, slot SlotView, ctx *Context) (Datum, error) {
+	pat, err := evalExprSlot(x.Pattern, slot, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	if pat.IsNull() {
+		return NullDatum, nil
+	}
+	esc, err := evalExprSlot(x.Escape, slot, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	if esc.IsNull() {
+		return NullDatum, nil
+	}
+	patStr, patOK := datumAsString(pat)
+	escStr, escOK := datumAsString(esc)
+	if !patOK || !escOK {
+		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "ESCAPE requires string operands"}
+	}
+	rewritten, err := likeEscapeRewrite(patStr, escStr, pat.Kind != KindBytes, x.Pos())
+	if err != nil {
+		return Datum{}, err
+	}
+	if pat.Kind == KindBytes {
+		return NewBytesDatum([]byte(rewritten)), nil
+	}
+	return NewStringDatum(rewritten), nil
+}
+
+// likeEscapeRewrite implements PostgreSQL's do_like_escape (PG oracle:
+// postgres/src/backend/utils/adt/like_match.c:392-486): rewrite pattern to
+// use the standard backslash-escape convention given an explicit ESCAPE
+// string.
+//
+//   - escape length 0: double every literal '\' in pattern so it stays
+//     literal against the always-backslash matcher.
+//   - escape length 1 and the char IS '\': pattern unchanged.
+//   - escape length 1 and char is anything else: substitute each occurrence
+//     of the escape char with '\', and double each literal '\' not
+//     immediately preceded by a substituted escape.
+//   - escape length > 1: ERROR 22025 invalid_escape_sequence.
+//
+// runeMode selects character-based (text) vs byte-based (bytea) counting
+// and iteration, matching PG's MB-aware text path vs single-byte bytea
+// path. M0134-0070.
+func likeEscapeRewrite(pattern, escape string, runeMode bool, pos int) (string, error) {
+	invalidEscapeErr := func() error {
+		return &ExecError{Code: "22025", Pos: pos, Message: "invalid escape string",
+			Hint: "Escape string must be empty or one character."}
+	}
+	if runeMode {
+		switch utf8.RuneCountInString(escape) {
+		case 0:
+			var b strings.Builder
+			for _, r := range pattern {
+				if r == '\\' {
+					b.WriteByte('\\')
+				}
+				b.WriteRune(r)
+			}
+			return b.String(), nil
+		case 1:
+			escRune, _ := utf8.DecodeRuneInString(escape)
+			if escRune == '\\' {
+				return pattern, nil
+			}
+			var b strings.Builder
+			afterEscape := false
+			for _, r := range pattern {
+				switch {
+				case r == escRune && !afterEscape:
+					b.WriteByte('\\')
+					afterEscape = true
+				case r == '\\':
+					b.WriteByte('\\')
+					if !afterEscape {
+						b.WriteByte('\\')
+					}
+					afterEscape = false
+				default:
+					b.WriteRune(r)
+					afterEscape = false
+				}
+			}
+			return b.String(), nil
+		default:
+			return "", invalidEscapeErr()
+		}
+	}
+	// Byte mode (bytea): PG's bytea_like_escape counts and iterates raw bytes.
+	switch len(escape) {
+	case 0:
+		var b strings.Builder
+		for i := 0; i < len(pattern); i++ {
+			if pattern[i] == '\\' {
+				b.WriteByte('\\')
+			}
+			b.WriteByte(pattern[i])
+		}
+		return b.String(), nil
+	case 1:
+		escByte := escape[0]
+		if escByte == '\\' {
+			return pattern, nil
+		}
+		var b strings.Builder
+		afterEscape := false
+		for i := 0; i < len(pattern); i++ {
+			c := pattern[i]
+			switch {
+			case c == escByte && !afterEscape:
+				b.WriteByte('\\')
+				afterEscape = true
+			case c == '\\':
+				b.WriteByte('\\')
+				if !afterEscape {
+					b.WriteByte('\\')
+				}
+				afterEscape = false
+			default:
+				b.WriteByte(c)
+				afterEscape = false
+			}
+		}
+		return b.String(), nil
+	default:
+		return "", invalidEscapeErr()
+	}
+}
+
 // matchSQLLike implements SQL LIKE pattern semantics: '%' matches
 // any (possibly empty) sequence, '_' matches exactly one character,
-// every other byte matches itself. v0 does not honour an ESCAPE
-// clause — escapes are upstream's default backslash where the next
-// character is taken literally. The implementation is the standard
-// recursive-descent matcher (no regex translation, so embedded
-// special chars in the input never interact with regex syntax).
+// every other byte matches itself. An ESCAPE clause is handled upstream by
+// evalLikeEscapePattern/likeEscapeRewrite, which rewrite the pattern into
+// this function's standard-backslash convention before it ever runs — this
+// function itself always uses the default backslash escape. M0134-0070.
+// The implementation is the standard recursive-descent matcher (no regex
+// translation, so embedded special chars in the input never interact with
+// regex syntax).
 func matchSQLLike(s, pat string) bool {
 	si, pi := 0, 0
 	starS, starP := -1, -1
@@ -2185,9 +2476,11 @@ func addTimeInterval(t, iv Datum, subtract bool, pos int) (Datum, error) {
 // timestampOutOfRange is PG's error for a non-representable timestamp result
 // (here: "infinity − infinity", which the timestamp type cannot express since
 // it has no NaN). Mirrors ereport(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE,
-// "timestamp out of range").
+// "timestamp out of range"). No Pos: every call site is pure runtime
+// timestamp/interval arithmetic (postgres/src/backend/utils/adt/timestamp.c
+// has no errposition call anywhere in this file). M0134-0070.
 func timestampOutOfRange(pos int) error {
-	return &ExecError{Code: "22008", Pos: pos, Message: "timestamp out of range"}
+	return &ExecError{Code: "22008", Message: "timestamp out of range"}
 }
 
 // usecsPerDay is the microsecond count in a 24-hour day, used by the
@@ -2246,8 +2539,11 @@ func subTimeTime(left, right Datum, pos int) (Datum, error) {
 // intervalOutOfRange is PG's error for a non-representable interval result
 // (overflow, or an "infinity − infinity" that has no NaN equivalent).
 // Mirrors ereport(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE, "interval out of range").
+// No Pos: every call site is pure runtime interval arithmetic
+// (postgres/src/backend/utils/adt/timestamp.c has no errposition call
+// anywhere in this file). M0134-0070.
 func intervalOutOfRange(pos int) error {
-	return &ExecError{Code: "22008", Pos: pos, Message: "interval out of range"}
+	return &ExecError{Code: "22008", Message: "interval out of range"}
 }
 
 // finiteIntervalArith adds (or subtracts, when subtract) two FINITE intervals
@@ -2282,6 +2578,225 @@ func finiteIntervalArith(left, right Datum, subtract bool, pos int) (Datum, erro
 	res := NewIntervalDatumFull(int32(months), int32(days), micros)
 	if res.IsIntervalNotFinite() {
 		// Finite arithmetic must never synthesise a ±infinity sentinel.
+		return Datum{}, intervalOutOfRange(pos)
+	}
+	return res, nil
+}
+
+// intervalDaysPerMonthF / intervalSecsPerDayF / intervalUsecsPerSecF mirror
+// upstream's DAYS_PER_MONTH / SECS_PER_DAY / USECS_PER_SEC (timestamp.h),
+// used only by the float-factor interval_mul / interval_div carry math below.
+const (
+	intervalDaysPerMonthF = 30.0
+	intervalSecsPerDayF   = 86400.0
+	intervalUsecsPerSecF  = 1000000.0
+)
+
+// tsround mirrors upstream's TSROUND macro (datatype/timestamp.h): round to
+// MAX_TIMESTAMP_PRECISION (6 fractional digits) using round-to-nearest,
+// ties-to-even (C's rint under the default rounding mode).
+func tsround(j float64) float64 {
+	return math.RoundToEven(j*1e6) / 1e6
+}
+
+// float8FitsInInt32 / float8FitsInInt64 mirror upstream's FLOAT8_FITS_IN_INT32
+// / FLOAT8_FITS_IN_INT64 macros (c.h): true iff the float, when truncated
+// toward zero, lands within the target integer's representable range.
+func float8FitsInInt32(f float64) bool {
+	return f >= float64(math.MinInt32) && f < -float64(math.MinInt32)
+}
+
+func float8FitsInInt64(f float64) bool {
+	return f >= float64(math.MinInt64) && f < -float64(math.MinInt64)
+}
+
+// intervalLinearSign returns the sign of the interval's linear span (months
+// widened to days at a fixed 30-day rate, plus days, plus the whole-day part
+// of the microsecond field; the sub-day remainder breaks a zero-days tie) —
+// mirroring interval_sign / interval_cmp_value (timestamp.c). Used only by
+// intervalMul's ±infinity-factor short-circuit; ordinary comparisons and
+// in_range go through the equivalent inline widening at expr.go's KindInterval
+// compare arm and operators_window.go respectively (established pattern).
+func intervalLinearSign(iv Datum) int {
+	days := int64(iv.IntervalMonthsValue())*30 + int64(iv.IntervalDaysValue()) + iv.IntervalMicrosValue()/usecsPerDay
+	frac := iv.IntervalMicrosValue() % usecsPerDay
+	switch {
+	case days != 0:
+		if days < 0 {
+			return -1
+		}
+		return 1
+	case frac < 0:
+		return -1
+	case frac > 0:
+		return 1
+	}
+	return 0
+}
+
+// addS32Overflow mirrors upstream's pg_add_s32_overflow: adds two int32s and
+// reports whether the true sum overflowed int32 range.
+func addS32Overflow(a, b int32) (int32, bool) {
+	r := int64(a) + int64(b)
+	if r > math.MaxInt32 || r < math.MinInt32 {
+		return 0, true
+	}
+	return int32(r), false
+}
+
+// intervalMul implements `interval * factor` (interval_mul,
+// postgres/src/backend/utils/adt/timestamp.c). Months and days are scaled by
+// the float8 factor and truncated toward zero for their whole-unit part; any
+// fractional whole-month remainder is cascaded into days (at a fixed 30-day
+// rate) and any fractional whole-day remainder is cascaded into the
+// microsecond time field (at a fixed 86400s day) — never cascading upward,
+// matching upstream's comment that the user must call justify_hours /
+// justify_days themselves. ±infinity/NaN factors and non-finite (±infinity
+// sentinel) spans are handled exactly as upstream. M0134-0035.
+func intervalMul(iv Datum, factor float64, pos int) (Datum, error) {
+	if math.IsNaN(factor) {
+		return Datum{}, intervalOutOfRange(pos)
+	}
+	if iv.IsIntervalNotFinite() {
+		if factor == 0.0 {
+			return Datum{}, intervalOutOfRange(pos)
+		}
+		if factor < 0.0 {
+			return negateInterval(iv, pos)
+		}
+		return iv, nil
+	}
+	if math.IsInf(factor, 0) {
+		sign := intervalLinearSign(iv)
+		if sign == 0 {
+			return Datum{}, intervalOutOfRange(pos)
+		}
+		if factor*float64(sign) < 0 {
+			return NewIntervalInfinity(false), nil
+		}
+		return NewIntervalInfinity(true), nil
+	}
+
+	origMonth := iv.IntervalMonthsValue()
+	origDay := iv.IntervalDaysValue()
+
+	resultMonthF := float64(origMonth) * factor
+	if math.IsNaN(resultMonthF) || !float8FitsInInt32(resultMonthF) {
+		return Datum{}, intervalOutOfRange(pos)
+	}
+	resultMonth := int32(resultMonthF)
+
+	resultDayF := float64(origDay) * factor
+	if math.IsNaN(resultDayF) || !float8FitsInInt32(resultDayF) {
+		return Datum{}, intervalOutOfRange(pos)
+	}
+	resultDay := int32(resultDayF)
+
+	// Fractional months cascade into days; the whole-day part of that
+	// cascade further folds into monthRemainderDays, and the leftover
+	// sub-day fraction (plus the days field's own fractional remainder)
+	// cascades into seconds.
+	monthRemainderDays := tsround((float64(origMonth)*factor - float64(resultMonth)) * intervalDaysPerMonthF)
+	secRemainder := tsround((float64(origDay)*factor - float64(resultDay) +
+		monthRemainderDays - float64(int64(monthRemainderDays))) * intervalSecsPerDayF)
+
+	// May have accumulated a full day (or more) of seconds via rounding or
+	// cascade from months/days.
+	if math.Abs(secRemainder) >= intervalSecsPerDayF {
+		carry := int32(secRemainder / intervalSecsPerDayF)
+		var overflow bool
+		resultDay, overflow = addS32Overflow(resultDay, carry)
+		if overflow {
+			return Datum{}, intervalOutOfRange(pos)
+		}
+		secRemainder -= float64(carry) * intervalSecsPerDayF
+	}
+
+	var overflow bool
+	resultDay, overflow = addS32Overflow(resultDay, int32(monthRemainderDays))
+	if overflow {
+		return Datum{}, intervalOutOfRange(pos)
+	}
+
+	resultTimeF := math.RoundToEven(float64(iv.IntervalMicrosValue())*factor + secRemainder*intervalUsecsPerSecF)
+	if math.IsNaN(resultTimeF) || !float8FitsInInt64(resultTimeF) {
+		return Datum{}, intervalOutOfRange(pos)
+	}
+
+	res := NewIntervalDatumFull(resultMonth, resultDay, int64(resultTimeF))
+	if res.IsIntervalNotFinite() {
+		return Datum{}, intervalOutOfRange(pos)
+	}
+	return res, nil
+}
+
+// intervalDiv implements `interval / factor` (interval_div,
+// postgres/src/backend/utils/adt/timestamp.c). Mirrors intervalMul's
+// month/day/time carry logic with division substituted for multiplication
+// (and a division_by_zero guard PG's interval_mul has no equivalent of,
+// since 0 is never a valid multiplier's reciprocal). M0134-0035.
+func intervalDiv(iv Datum, factor float64, pos int) (Datum, error) {
+	if factor == 0.0 {
+		// No Pos: pure runtime evaluation (interval_div,
+		// postgres/src/backend/utils/adt/timestamp.c, has no errposition
+		// call). M0134-0070.
+		return Datum{}, &ExecError{Code: "22012", Message: "division by zero"}
+	}
+	if math.IsNaN(factor) {
+		return Datum{}, intervalOutOfRange(pos)
+	}
+	if iv.IsIntervalNotFinite() {
+		if math.IsInf(factor, 0) {
+			return Datum{}, intervalOutOfRange(pos)
+		}
+		if factor < 0.0 {
+			return negateInterval(iv, pos)
+		}
+		return iv, nil
+	}
+
+	origMonth := iv.IntervalMonthsValue()
+	origDay := iv.IntervalDaysValue()
+
+	resultMonthF := float64(origMonth) / factor
+	if math.IsNaN(resultMonthF) || !float8FitsInInt32(resultMonthF) {
+		return Datum{}, intervalOutOfRange(pos)
+	}
+	resultMonth := int32(resultMonthF)
+
+	resultDayF := float64(origDay) / factor
+	if math.IsNaN(resultDayF) || !float8FitsInInt32(resultDayF) {
+		return Datum{}, intervalOutOfRange(pos)
+	}
+	resultDay := int32(resultDayF)
+
+	monthRemainderDays := tsround((float64(origMonth)/factor - float64(resultMonth)) * intervalDaysPerMonthF)
+	secRemainder := tsround((float64(origDay)/factor - float64(resultDay) +
+		monthRemainderDays - float64(int64(monthRemainderDays))) * intervalSecsPerDayF)
+
+	if math.Abs(secRemainder) >= intervalSecsPerDayF {
+		carry := int32(secRemainder / intervalSecsPerDayF)
+		var overflow bool
+		resultDay, overflow = addS32Overflow(resultDay, carry)
+		if overflow {
+			return Datum{}, intervalOutOfRange(pos)
+		}
+		secRemainder -= float64(carry) * intervalSecsPerDayF
+	}
+
+	var overflow bool
+	resultDay, overflow = addS32Overflow(resultDay, int32(monthRemainderDays))
+	if overflow {
+		return Datum{}, intervalOutOfRange(pos)
+	}
+
+	resultTimeF := math.RoundToEven(float64(iv.IntervalMicrosValue())/factor + secRemainder*intervalUsecsPerSecF)
+	if math.IsNaN(resultTimeF) || !float8FitsInInt64(resultTimeF) {
+		return Datum{}, intervalOutOfRange(pos)
+	}
+
+	res := NewIntervalDatumFull(resultMonth, resultDay, int64(resultTimeF))
+	if res.IsIntervalNotFinite() {
 		return Datum{}, intervalOutOfRange(pos)
 	}
 	return res, nil
@@ -2373,6 +2888,12 @@ func negateInterval(d Datum, pos int) (Datum, error) {
 	return res, nil
 }
 
+// arithmetic implements int64 (bigint) +, -, *, /, % with PostgreSQL's exact
+// overflow detection. No Pos on any raise site: every one mirrors a pure
+// runtime C function (int8pl/int8mi/int8mul/int8div/int8mod,
+// postgres/src/backend/utils/adt/int8.c:445-530) that calls ereport(ERROR,
+// ...) with no errposition — confirmed no int8.c function in that range
+// calls errposition. M0134-0070.
 func arithmetic(op parser.OpCode, a, b int64, pos int) (Datum, error) {
 	var r int64
 	switch op {
@@ -2380,13 +2901,13 @@ func arithmetic(op parser.OpCode, a, b int64, pos int) (Datum, error) {
 		r = a + b
 		// Detect int64 add overflow: same-sign inputs with opposite-sign result.
 		if (a^r)&(b^r) < 0 {
-			return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+			return Datum{}, &ExecError{Code: "22003", Message: "bigint out of range"}
 		}
 	case parser.OpSub:
 		r = a - b
 		// Detect int64 sub overflow: different-sign inputs with result differing from a's sign.
 		if (a^b)&(a^r) < 0 {
-			return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+			return Datum{}, &ExecError{Code: "22003", Message: "bigint out of range"}
 		}
 	case parser.OpMul:
 		// Detect int64 multiplication overflow. M0097-int8-overflow.
@@ -2395,24 +2916,24 @@ func arithmetic(op parser.OpCode, a, b int64, pos int) (Datum, error) {
 			if a == math.MinInt64 || b == math.MinInt64 {
 				// MinInt64 * 1 = MinInt64 (OK); MinInt64 * anything_else overflows.
 				if a != 1 && b != 1 {
-					return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+					return Datum{}, &ExecError{Code: "22003", Message: "bigint out of range"}
 				}
 			} else if r/a != b {
-				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+				return Datum{}, &ExecError{Code: "22003", Message: "bigint out of range"}
 			}
 		}
 	case parser.OpDiv:
 		if b == 0 {
-			return Datum{}, &ExecError{Code: "22012", Pos: pos, Message: "division by zero"}
+			return Datum{}, &ExecError{Code: "22012", Message: "division by zero"}
 		}
 		// MinInt64 / -1 overflows: the mathematical result 2^63 doesn't fit in int64.
 		if a == math.MinInt64 && b == -1 {
-			return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+			return Datum{}, &ExecError{Code: "22003", Message: "bigint out of range"}
 		}
 		r = a / b
 	case parser.OpMod:
 		if b == 0 {
-			return Datum{}, &ExecError{Code: "22012", Pos: pos, Message: "division by zero"}
+			return Datum{}, &ExecError{Code: "22012", Message: "division by zero"}
 		}
 		r = a % b
 	}
@@ -3246,21 +3767,59 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 
 // roundNumericToInt rounds a KindNumeric datum using "round half away from zero"
 // (PostgreSQL's numeric→integer rounding rule). M0097-0003.
+//
+// M0134-0069: unlike roundFloatToInt (whose source value is genuinely a
+// float8/float4 and therefore already float-imprecise), a KindNumeric
+// datum's mantissa+scale is exact, so bounds-checking must operate on the
+// exact big.Int mantissa rather than round-tripping through float64 —
+// a float64 bounds check silently accepts boundary values like
+// -9223372036854775809 because strconv.ParseFloat rounds that exact string
+// to precisely -9223372036854775808 (MinInt64) in IEEE double precision,
+// letting the true overflow slip past an f<MinInt64 comparison. PG oracle:
+// postgres/src/backend/utils/adt/numeric.c numericvar_to_int64 operates on
+// the exact decimal digit array, never on a lossy float conversion.
 func roundNumericToInt(d Datum, pos int) (int64, error) {
-	text := numericText(d)
-	f, err := strconv.ParseFloat(text, 64)
-	if err != nil {
-		return 0, &ExecError{Code: "22P02", Pos: pos,
-			Message: fmt.Sprintf("invalid numeric value for integer cast: %s", text)}
+	scale := d.Scale
+	if scale < 0 {
+		scale = 0
 	}
-	// Round half away from zero (PostgreSQL's numeric→integer rule).
-	var rounded int64
-	if f >= 0 {
-		rounded = int64(f + 0.5)
+	var mantissa *big.Int
+	if d.Flags&flagBigNumeric != 0 {
+		mantissa = new(big.Int).Set(d.NumericBigValue())
 	} else {
-		rounded = int64(f - 0.5)
+		mantissa = big.NewInt(d.Int)
 	}
-	return rounded, nil
+	if scale == 0 {
+		if !mantissa.IsInt64() {
+			// PG oracle: postgres/src/backend/utils/adt/numeric.c
+			// numeric_int8_opt_error's ereport(bigint out of range) never
+			// calls errposition() — runtime CAST-evaluation errors carry no
+			// LINE/caret context regardless of literal-vs-column origin.
+			// M0134-0070.
+			return 0, &ExecError{Code: "22003", Message: "bigint out of range"}
+		}
+		return mantissa.Int64(), nil
+	}
+	divisor := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil)
+	quo, rem := new(big.Int).QuoRem(mantissa, divisor, new(big.Int))
+	// Round half away from zero (PostgreSQL's numeric→integer rule):
+	// bump the quotient away from zero when the remainder is at least half
+	// the divisor.
+	absRem := new(big.Int).Abs(rem)
+	doubledRem := new(big.Int).Lsh(absRem, 1)
+	if doubledRem.Cmp(divisor) >= 0 {
+		if mantissa.Sign() >= 0 {
+			quo.Add(quo, big.NewInt(1))
+		} else {
+			quo.Sub(quo, big.NewInt(1))
+		}
+	}
+	if !quo.IsInt64() {
+		// PG oracle: same numeric_int8_opt_error ereport as above, no
+		// errposition(). M0134-0070.
+		return 0, &ExecError{Code: "22003", Message: "bigint out of range"}
+	}
+	return quo.Int64(), nil
 }
 
 // roundFloatToInt rounds a KindNumeric or KindString datum using banker's rounding
@@ -3398,9 +3957,83 @@ func roundNumericToScale(d Datum, scale int16) Datum {
 	return d
 }
 
+// byteaIntSourceWidth returns the fixed byte width of the integer type named
+// by typeName, or 0 if typeName is not an integer type. It accepts both the
+// canonical short names (int2/int4/int8) and their SQL display spellings
+// (smallint/integer/bigint): CastExpr.SourceType is stamped from the operand's
+// declared catalog type name, which can be either spelling depending on where
+// the operand came from (a CastExpr target uses the short form, a column ref
+// uses whatever the catalog stores). M0134-0070.
+func byteaIntSourceWidth(typeName string) int {
+	switch strings.ToLower(typeName) {
+	case "int2", "smallint":
+		return 2
+	case "int4", "integer", "int":
+		return 4
+	case "int8", "bigint":
+		return 8
+	}
+	return 0
+}
+
+// byteaToIntN decodes a big-endian bytea payload to a signed integer of the
+// given byte width, mirroring PG's bytea_int2/int4/int8
+// (postgres/src/backend/utils/adt/varlena.c:4139-4211): MSB-first; a payload
+// longer than the width raises 22003 with the width's type name in the message
+// and NO errposition (the cast functions never call errposition, and
+// strings.out's overflow rows expect no LINE/caret — same no-Pos convention as
+// the numeric_int2 note above); short payloads are zero-extended. The unsigned
+// accumulation is re-interpreted through the signed type so the min-value bit
+// pattern wraps (e.g. \x8000 → -32768, \x8000000000000000 →
+// -9223372036854775808). M0134-0070.
+func byteaToIntN(b []byte, width int, typeName string) (int64, error) {
+	if len(b) > width {
+		return 0, &ExecError{Code: "22003", Message: typeName + " out of range"}
+	}
+	var u uint64
+	for _, by := range b {
+		u = u<<8 | uint64(by)
+	}
+	switch width {
+	case 2:
+		return int64(int16(u)), nil
+	case 4:
+		return int64(int32(u)), nil
+	default:
+		return int64(u), nil
+	}
+}
+
 func evalCastTyped(d Datum, targetType, sourceType string, pos int, ctx *Context) (Datum, error) {
 	if sourceType == "" {
 		return evalCast(d, targetType, pos, ctx)
+	}
+	// M0134-0070: intN → bytea casts (pg_cast.dat:323-335, castfuncs
+	// int2_bytea/int4_bytea/int8_bytea = varlena.c:4214-4233, each just the
+	// corresponding intNsend) emit the big-endian two's-complement binary at
+	// exactly the source type's fixed width — NOT a text rendering.
+	// CastExpr.SourceType (stamped from the operand's declared type at
+	// planner.go) supplies the width; evalCast has no source-type parameter.
+	// A NULL (KindNull) or non-int datum falls through to evalCast's bytea
+	// arm unchanged. Bare integer literals stamp int8 (goopg's exprType quirk;
+	// PG would use int4 — the known literal-typing divergence documented for
+	// to_hex at planner.go, out of scope here; the fixture spells widths
+	// explicitly via ::intN).
+	if strings.EqualFold(targetType, "bytea") && d.Kind == KindInt {
+		switch byteaIntSourceWidth(sourceType) {
+		case 2:
+			b := make([]byte, 2)
+			binary.BigEndian.PutUint16(b, uint16(int16(d.Int)))
+			return NewBytesDatum(b), nil
+		case 4:
+			b := make([]byte, 4)
+			binary.BigEndian.PutUint32(b, uint32(int32(d.Int)))
+			return NewBytesDatum(b), nil
+		case 8:
+			b := make([]byte, 8)
+			binary.BigEndian.PutUint64(b, uint64(d.Int))
+			return NewBytesDatum(b), nil
+		}
 	}
 	// M0119-0006 (deferral row 1350): a reg* datum is a plain KindInt holding an
 	// object OID, so casting one to a string type must render its OBJECT NAME via
@@ -3664,6 +4297,16 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "smallint out of range"}
 			}
 			return d, nil
+		case KindBytes:
+			// bytea_int2 (postgres/src/backend/utils/adt/varlena.c:4139):
+			// big-endian MSB-first; len > 2 → 22003 with no errposition;
+			// short payloads zero-extended; uint→signed re-interpretation
+			// wraps the min-value pattern (\x8000 → -32768). M0134-0070.
+			n, err := byteaToIntN(d.BytesValue(), 2, "smallint")
+			if err != nil {
+				return Datum{}, err
+			}
+			return Datum{Kind: KindInt, Int: n}, nil
 		case KindString:
 			s := d.StringValue()
 			// Array literals like '{1,2,3}'::int2[] pass through — the parser strips '[]'
@@ -3686,7 +4329,10 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 				return Datum{}, err
 			}
 			if n < -32768 || n > 32767 {
-				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "smallint out of range"}
+				// PG oracle: postgres/src/backend/utils/adt/numeric.c
+				// numeric_int2's ereport(smallint out of range) never calls
+				// errposition(). M0134-0070.
+				return Datum{}, &ExecError{Code: "22003", Message: "smallint out of range"}
 			}
 			return Datum{Kind: KindInt, Int: n}, nil
 		default:
@@ -3699,6 +4345,17 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "integer out of range"}
 			}
 			return d, nil
+		case KindBytes:
+			// bytea_int4 (postgres/src/backend/utils/adt/varlena.c:4166):
+			// big-endian MSB-first; len > 4 → 22003 with no errposition;
+			// short payloads zero-extended; uint→signed re-interpretation
+			// wraps the min-value pattern (\x80000000 → -2147483648).
+			// M0134-0070.
+			n, err := byteaToIntN(d.BytesValue(), 4, "integer")
+			if err != nil {
+				return Datum{}, err
+			}
+			return Datum{Kind: KindInt, Int: n}, nil
 		case KindString:
 			s := d.StringValue()
 			// Array literals like '{1,2,3}'::int4[] pass through — the parser strips '[]'
@@ -3720,7 +4377,10 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 				return Datum{}, err
 			}
 			if n < -2147483648 || n > 2147483647 {
-				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "integer out of range"}
+				// PG oracle: postgres/src/backend/utils/adt/numeric.c
+				// numeric_int4_opt_error's ereport(integer out of range)
+				// never calls errposition(). M0134-0070.
+				return Datum{}, &ExecError{Code: "22003", Message: "integer out of range"}
 			}
 			return Datum{Kind: KindInt, Int: n}, nil
 		default:
@@ -3730,6 +4390,17 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 		switch d.Kind {
 		case KindInt:
 			return d, nil
+		case KindBytes:
+			// bytea_int8 (postgres/src/backend/utils/adt/varlena.c:4193):
+			// big-endian MSB-first; len > 8 → 22003 with no errposition;
+			// short payloads zero-extended; uint64→int64 re-interpretation
+			// wraps the min-value pattern
+			// (\x8000000000000000 → -9223372036854775808). M0134-0070.
+			n, err := byteaToIntN(d.BytesValue(), 8, "bigint")
+			if err != nil {
+				return Datum{}, err
+			}
+			return Datum{Kind: KindInt, Int: n}, nil
 		case KindString:
 			s := d.StringValue()
 			// Array literals like '{1,2,3}'::int8[] pass through — parser strips '[]'. M0097-0063.
@@ -4426,6 +5097,14 @@ func relationFileNodeForOID(cat *catalog.InMemory, oid uint32) (storage.RelFileN
 	}
 	if idx, ok := cat.LookupIndexByOID(oid); ok {
 		return cat.IndexRelFileNode(idx), true
+	}
+	// A synthetic TOAST relation OID (parent OID + 100M) has no table/index
+	// registry entry — its pg_class row is virtual-only — so resolve it through
+	// the catalog helper instead. pg_relation_size(reltoastrelid) then sizes the
+	// live toast heap; mirrors PG, where reltoastrelid is a real relkind='t'
+	// relation (dbsize.c:371-381). M0134-0070.
+	if toastRel, ok := cat.ToastRelFileNodeByOID(oid); ok {
+		return toastRel, true
 	}
 	return storage.RelFileNode{}, false
 }
@@ -5835,6 +6514,22 @@ func toCharScientific(val Datum, mantissaFmt string, lowercase bool, fm bool) st
 		}
 	}
 
+	// Special values (Infinity/-Infinity/NaN): PostgreSQL never errors for these
+	// in EEEE format; it emits a fixed "#" pattern with no sign marker, regardless
+	// of Inf's sign or NaN. postgres/src/backend/utils/adt/formatting.c, the
+	// isnan(value) || isinf(value) branch inside float4_to_char/float8_to_char
+	// (numeric_to_char follows the identical NUMERIC_IS_SPECIAL pattern):
+	// one sign-slot space (stripped by FM), Num.pre '#'s (always 1 for a valid
+	// EEEE format), '.', then Num.post+4 '#'s.
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		const pre = 1
+		special := strings.Repeat("#", pre) + "." + strings.Repeat("#", decPlaces+4)
+		if !fm {
+			special = " " + special
+		}
+		return special
+	}
+
 	// Format using Go's scientific notation, then reformat the exponent to ±NN.
 	raw := fmt.Sprintf("%.*e", decPlaces, f)
 	// raw is like "1.23e+03" or "1.23e+003" (platform-dependent).
@@ -6342,7 +7037,7 @@ func buildHashPartitionConstraintDef(parentOID uint32, keys []string, pb catalog
 // DEFERRABLE clause are appended; MATCH SIMPLE (the default) is omitted, as PG
 // does. A trailing ` NOT VALID` is appended for an unvalidated FK
 // (convalidated='f'). DU-002 slices 51, 307.
-func buildForeignKeyDefString(im *catalog.InMemory, fk catalog.ForeignKey, dbOid ...uint32) string {
+func buildForeignKeyDefString(ctx *Context, im *catalog.InMemory, fk catalog.ForeignKey, dbOid ...uint32) string {
 	var refTbl *catalog.Table
 	for _, t := range im.AllTables() {
 		if t.Virtual || t.OID == 0 {
@@ -6371,8 +7066,14 @@ func buildForeignKeyDefString(im *catalog.InMemory, fk catalog.ForeignKey, dbOid
 			}
 		}
 	}
+	var refQualified string
+	if refSchema != "" && !RegObjectSchemaVisible(ctx, refSchema) {
+		refQualified = refSchema + "." + refName
+	} else {
+		refQualified = refName
+	}
 	def := "FOREIGN KEY (" + strings.Join(fk.Columns, ", ") + ") REFERENCES " +
-		refSchema + "." + refName + "(" + strings.Join(refCols, ", ") + ")"
+		refQualified + "(" + strings.Join(refCols, ", ") + ")"
 	// MATCH FULL is emitted between the REFERENCES column list and the ON
 	// UPDATE/DELETE clauses, mirroring pg_get_constraintdef_worker
 	// (ruleutils.c). MATCH SIMPLE (the default, confmatchtype='s') and the
@@ -6753,27 +7454,329 @@ func regexpAllMatchesArrays(re *regexp.Regexp, s string, global bool) []Datum {
 	return out
 }
 
+// pgRegexFlagsToGoModifiers translates a PG regexp_* "flags" argument
+// (postgres/src/backend/utils/adt/regexp.c:parse_re_flags, :385-449) into a
+// Go regexp inline-modifier prefix plus the 'g'/global bit, which Go's
+// regexp package has no inline equivalent for (call sites already loop for
+// 'g' themselves). Per the design doc
+// (docs/design/m0134-0070-regexp-flags-and-family.md):
+//   - 'i' (case-insensitive)                       → Go (?i)
+//   - 'm'/'n' (newline-sensitive) and PG's 'p'/'w'
+//     partial-newline-sensitive variants            → Go (?m) (goopg does not
+//     distinguish full vs. partial newline-sensitivity beyond ^/$ anchoring;
+//     documented simplification, not a silent drop)
+//   - 's' (PG's "single line, \n ordinary", i.e. PG's *default* newline
+//     behavior) is a naming collision with Go's `(?s)` ("dot matches
+//     newline") — they are NOT the same thing, so 's' must NOT map to Go's
+//     (?s). It is a no-op here since goopg's default already matches PG's 's'
+//     behavior.
+//   - 'c'/'e'/'b'/'t'/'q'/'x' are accepted (PG ARE-mode/syntax selectors) but
+//     not yet meaningfully implemented — NOT flagged unknown, matching PG's
+//     own acceptance of them as valid selectors.
+//   - 'g' sets global=true; not folded into goFlags.
+//   - Any other character → 22023 (ERRCODE_INVALID_PARAMETER_VALUE; PG's own
+//     parse_re_flags default case raises invalid_parameter_value, not
+//     invalid_regular_expression, despite the ereport wording).
+func pgRegexFlagsToGoModifiers(flags string) (goFlags string, global bool, err error) {
+	var caseInsensitive, newlineSensitive bool
+	for _, r := range flags {
+		switch r {
+		case 'g':
+			global = true
+		case 'i':
+			caseInsensitive = true
+		case 'm', 'n', 'p', 'w':
+			newlineSensitive = true
+		case 's', 'c', 'e', 'b', 't', 'q', 'x':
+			// Accepted PG flag chars with no goopg-side effect (yet).
+		default:
+			return "", false, &ExecError{Code: "22023",
+				Message: fmt.Sprintf("invalid regular expression option: %q", string(r))}
+		}
+	}
+	if !caseInsensitive && !newlineSensitive {
+		return "", global, nil
+	}
+	var b strings.Builder
+	b.WriteString("(?")
+	if caseInsensitive {
+		b.WriteByte('i')
+	}
+	if newlineSensitive {
+		b.WriteByte('m')
+	}
+	b.WriteByte(')')
+	return b.String(), global, nil
+}
+
+// regexpLocalDotMatchesNewline computes PG's REG_NEWLINE-derived
+// dot-matches-newline behavior LOCALLY for the four M0134-0070 Round E
+// functions (regexp_count/like/instr/substr) only — it does NOT change
+// pgRegexFlagsToGoModifiers's own return value (that function's "'s' is a
+// no-op" contract is pinned by TestPgRegexFlagsToGoModifiers and shared by
+// every other regexp_* call site, out of this slice's scope).
+// postgres/src/backend/utils/adt/regexp.c:385-449 parse_re_flags: cflags
+// default to REG_ADVANCED only (REG_NEWLINE unset), meaning PG's *default*
+// (and explicit 's', "single line, \n ordinary") behavior is that `.`
+// (and `[^...]`) DO match a newline; 'n'/'m' (REG_NEWLINE) and 'p'
+// (REG_NLSTOP only) make `.` stop at a newline; 'w' (REG_NLANCH only)
+// leaves `.` newline-matching but is otherwise handled by the shared
+// (?m) ^/$ anchoring pgRegexFlagsToGoModifiers already applies. Go's RE2
+// requires an explicit (?s) for `.` to match \n (its default is the
+// opposite of PG's), so this reports whether that group must be added.
+func regexpLocalDotMatchesNewline(flags string) bool {
+	dotStops := false
+	for _, r := range flags {
+		switch r {
+		case 'n', 'm', 'p':
+			dotStops = true
+		case 's':
+			dotStops = false
+		}
+	}
+	return !dotStops
+}
+
+// regexpApplyExpandedWhitespace implements the 'x' ("expanded"/free-spacing,
+// REG_EXPANDED) PG regex flag (postgres/src/backend/utils/adt/regexp.c:439
+// parse_re_flags) for the four M0134-0070 Round E functions: when 'x' is
+// present, unescaped whitespace and '#'-to-end-of-line comments in the
+// pattern are insignificant. Go's RE2 has no REG_EXPANDED equivalent, so
+// this strips them from the pattern text before compiling — a
+// simplification of PG's actual ARE tokenizer (e.g. it does not exempt
+// bracket expressions), sufficient for the strings.sql fixture this slice
+// targets.
+func regexpApplyExpandedWhitespace(pattern, flags string) string {
+	if !strings.ContainsRune(flags, 'x') {
+		return pattern
+	}
+	var b strings.Builder
+	inComment := false
+	for i := 0; i < len(pattern); i++ {
+		c := pattern[i]
+		if inComment {
+			if c == '\n' {
+				inComment = false
+				b.WriteByte(c)
+			}
+			continue
+		}
+		if c == '\\' && i+1 < len(pattern) {
+			b.WriteByte(c)
+			b.WriteByte(pattern[i+1])
+			i++
+			continue
+		}
+		if c == '#' {
+			inComment = true
+			continue
+		}
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			continue
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
+// pgRegexpReplacementTemplate converts a PostgreSQL regexp_replace()
+// replacement string into a Go regexp expansion template usable with
+// (*regexp.Regexp).Expand{String}/ReplaceAllString. Mirrors
+// postgres/src/backend/utils/adt/varlena.c:4357-4447
+// (appendStringInfoRegexpSubstr), which walks the replacement string
+// splitting on literal '\': "\1".."\9" -> single-digit backreference index
+// (never multi-digit -- "*p - '0'" reads exactly one byte), "\&" -> whole
+// match (pmatch[0]), "\\" -> emits one literal '\' and continues (does NOT
+// treat the following char as an escape), any other "\c" -> emits a literal
+// '\' then falls through to normal-text copying of 'c' (net effect: '\'
+// followed by 'c', both literal, unchanged from input), and a trailing lone
+// '\' at end of string is emitted as literal '\'. M0134-0070 Round G.
+func pgRegexpReplacementTemplate(replacement string) string {
+	// First pass: escape any literal '$' in the original replacement text so
+	// Go's expander doesn't misinterpret it as a template reference.
+	replacement = strings.ReplaceAll(replacement, "$", "$$")
+
+	// Second pass: scan byte-by-byte for PG's '\'-escape grammar.
+	var b strings.Builder
+	b.Grow(len(replacement))
+	for i := 0; i < len(replacement); i++ {
+		c := replacement[i]
+		if c != '\\' {
+			b.WriteByte(c)
+			continue
+		}
+		if i+1 >= len(replacement) {
+			// Trailing lone '\' at end of string: emitted as literal '\'.
+			b.WriteByte('\\')
+			break
+		}
+		next := replacement[i+1]
+		switch {
+		case next >= '1' && next <= '9':
+			b.WriteString("${")
+			b.WriteByte(next)
+			b.WriteByte('}')
+			i++
+		case next == '&':
+			b.WriteString("${0}")
+			i++
+		case next == '\\':
+			// "\\" emits one literal '\' and does NOT consume the next char
+			// as an escape target -- advance past both backslashes only.
+			b.WriteByte('\\')
+			i++
+		default:
+			// Any other "\c": emit literal '\' then let the loop copy 'c'
+			// through unchanged on the next iteration.
+			b.WriteByte('\\')
+		}
+	}
+	return b.String()
+}
+
+// regexpCompilePattern compiles a PG regexp_* pattern for the four
+// M0134-0070 Round E functions, combining the shared pgRegexFlagsToGoModifiers
+// output (goFlags — 'i'/(?i), 'm'/'n'/'p'/'w'/(?m)) with the LOCAL
+// dot-matches-newline and expanded-whitespace handling above (both scoped to
+// this slice's four call sites; see regexpLocalDotMatchesNewline's comment
+// for why they aren't folded into the shared translator).
+func regexpCompilePattern(pattern, flags, goFlags string) (*regexp.Regexp, error) {
+	pattern = regexpApplyExpandedWhitespace(pattern, flags)
+	pattern = pgPatternToGoRE2(pattern)
+	prefix := goFlags
+	if regexpLocalDotMatchesNewline(flags) {
+		prefix = "(?s)" + prefix
+	}
+	return regexp.Compile(prefix + pattern)
+}
+
+// regexpInstrSubstrLocate implements the shared match-and-select core of
+// regexp_instr() and regexp_substr() (postgres/src/backend/utils/adt/regexp.c
+// :1198,1904 — near-identical start_search/n-th-match/subexpr selection,
+// consolidated here so the two "pos" computations can't drift apart,
+// M0134-0070 Round E). `start` is the 1-based char position to begin
+// searching from; the search window is `s` sliced from that rune offset
+// (mirrors evalSubstr's rune-window arithmetic — a documented simplification
+// vs. PG's true start_search-offset-into-the-original-string approach: a
+// `^`-anchored pattern would re-anchor at the window start here rather than
+// the true string start). `n` selects the n-th non-overlapping match
+// (1-based); `subexpr` selects a capture group within that match (0 = whole
+// match). Returns ok=false — NOT an error — when n exceeds the match count,
+// subexpr exceeds the pattern's capture-group count, or the selected group
+// didn't participate in the match (regexp.c:1267-1273,1965-1971 "return
+// 0/NULL" cases). so/eo are BYTE offsets into `window` (valid substring
+// boundaries since match positions always land on rune boundaries for valid
+// UTF-8 input).
+func regexpInstrSubstrLocate(s, pattern, flags, goFlags string, start, n, subexpr int) (window string, so, eo int, ok bool, err error) {
+	runes := []rune(s)
+	winStart := start - 1
+	if winStart > len(runes) {
+		winStart = len(runes)
+	}
+	window = string(runes[winStart:])
+	re, cerr := regexpCompilePattern(pattern, flags, goFlags)
+	if cerr != nil {
+		return "", 0, 0, false, &ExecError{Code: "2201B", Message: fmt.Sprintf("invalid regular expression: %v", cerr)}
+	}
+	npatterns := re.NumSubexp()
+	if subexpr > npatterns {
+		return window, 0, 0, false, nil
+	}
+	matches := re.FindAllStringSubmatchIndex(window, -1)
+	if n > len(matches) {
+		return window, 0, 0, false, nil
+	}
+	loc := matches[n-1]
+	idx := subexpr * 2
+	if idx+1 >= len(loc) {
+		return window, 0, 0, false, nil
+	}
+	so, eo = loc[idx], loc[idx+1]
+	if so < 0 || eo < 0 {
+		return window, 0, 0, false, nil
+	}
+	return window, so, eo, true, nil
+}
+
+// regexpWindowCharPos converts a BYTE offset within `window` (as returned by
+// regexpInstrSubstrLocate) to the 1-based char position within the ORIGINAL
+// string that regexp_instr() reports, given the same `start` used to build
+// the window — mirrors the byte→char idiom `case "strpos", "position"`
+// already uses (expr.go ~11774), extended to add back the (start-1) runes
+// the window skipped.
+func regexpWindowCharPos(window string, start, byteOff int) int {
+	return (start - 1) + len([]rune(window[:byteOff])) + 1
+}
+
 // evalRegexpMatchesSRF evaluates regexp_matches(string, pattern[, flags]) in
 // SELECT-list SRF position (see projectSetOp.openSelectSrfMode). Invalid
 // patterns / NULL string or pattern args yield zero rows rather than an
-// error, matching the permissiveness of the pre-existing scalar case arm.
-func evalRegexpMatchesSRF(sD, patD, flagsD Datum) []Datum {
+// error, matching the permissiveness of the pre-existing scalar case arm. An
+// unrecognized flag character still raises 22023 (M0134-0070).
+func evalRegexpMatchesSRF(sD, patD, flagsD Datum) ([]Datum, error) {
 	if sD.IsNull() || patD.IsNull() {
-		return nil
+		return nil, nil
 	}
 	flags := ""
 	if !flagsD.IsNull() {
 		flags = flagsD.StringValue()
 	}
-	pattern := patD.StringValue()
-	if strings.Contains(flags, "i") {
-		pattern = "(?i)" + pattern
+	goFlags, global, ferr := pgRegexFlagsToGoModifiers(flags)
+	if ferr != nil {
+		return nil, ferr
 	}
+	pattern := goFlags + patD.StringValue()
 	re, err := regexp.Compile(pattern)
 	if err != nil {
-		return nil
+		return nil, nil
 	}
-	return regexpAllMatchesArrays(re, sD.StringValue(), strings.Contains(flags, "g"))
+	return regexpAllMatchesArrays(re, sD.StringValue(), global), nil
+}
+
+// evalRegexpSplitToTable evaluates regexp_split_to_table(string, pattern[,
+// flags]) in FROM-clause SRF position, one row per substring (plain text,
+// not array-wrapped). Unlike evalRegexpMatchesSRF, this is strict like the
+// scalar regexp_split_to_array case it mirrors: NULL string/pattern yields
+// zero rows, but an explicit 'g' flag and an invalid pattern both raise
+// errors rather than silently returning nothing — regexp_split_to_table and
+// regexp_split_to_array share PG's setup_regexp_matches/split machinery
+// (postgres/src/backend/utils/adt/regexp.c:1748-1797 rejects 'g', then
+// forces glob=true internally so split always finds ALL matches; :1862-1897
+// build_regexp_split_result — N matches → N+1 rows). M0134-0070 Round D.
+func evalRegexpSplitToTable(sD, patD, flagsD Datum) ([]Datum, error) {
+	if sD.IsNull() || patD.IsNull() {
+		return nil, nil
+	}
+	flags := ""
+	if !flagsD.IsNull() {
+		flags = flagsD.StringValue()
+	}
+	goFlags, global, ferr := pgRegexFlagsToGoModifiers(flags)
+	if ferr != nil {
+		return nil, ferr
+	}
+	if global {
+		// regexp_split_to_table() rejects 'g' (regexp.c:1766-1773 — "User
+		// mustn't specify 'g'"), then forces glob=true internally, i.e.
+		// split always finds ALL matches regardless.
+		return nil, &ExecError{Code: "22023",
+			Message: `regexp_split_to_table() does not support the "global" option`}
+	}
+	pattern := goFlags + patD.StringValue()
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		// Unlike evalRegexpMatchesSRF's permissiveness (a matches-only
+		// simplification), regexp_split_to_table follows the stricter
+		// regexp_split_to_array precedent: no Pos, pure runtime evaluation
+		// (RE_compile_and_cache has no errposition call). M0134-0070.
+		return nil, &ExecError{Code: "2201B", Message: fmt.Sprintf("invalid regular expression: %v", err)}
+	}
+	parts := re.Split(sD.StringValue(), -1)
+	vals := make([]Datum, len(parts))
+	for i, s := range parts {
+		vals[i] = NewStringDatum(s)
+	}
+	return vals, nil
 }
 
 // evalIsFinite implements isfinite(date/timestamp/timestamptz/interval),
@@ -8560,6 +9563,8 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return evalToDate(x, row, ctx)
 	case "substr", "substring":
 		return evalSubstr(x, row, ctx)
+	case "overlay":
+		return evalOverlay(x, row, ctx)
 	case "date_part":
 		return evalDatePart(x, row, ctx)
 	case "date_trunc":
@@ -9518,6 +10523,12 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 				}
 				_, err := parseCopyTimestampZone(v, tsZoneModeForType(t))
 				return NewBoolDatum(err == nil), nil
+			case "bytea":
+				// bytea: reuse byteaIn (bytea.go, mirrors byteain() in
+				// varlena.c) so the valid/invalid answer agrees with the CAST
+				// path and pg_input_error_info. M0134-0070.
+				_, err := byteaIn(v, 0)
+				return NewBoolDatum(err == nil), nil
 			default:
 				// varchar(N) / character varying(N) / char(N) / bpchar(N). M0097-0003.
 				if valid, ok := pgInputIsValidTypedLen(v, t); ok {
@@ -9698,23 +10709,97 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			h := md5.Sum([]byte(v.StringValue()))
 			return NewStringDatum(hex.EncodeToString(h[:])), nil
 		}
-	case "sha256":
+	case "sha224":
+		// sha224(bytea) -> bytea (cryptohashfuncs.c sha224_bytea, PG_RETURN_BYTEA_P).
+		// Digest length 28 bytes. postgres/src/include/common/sha2.h:20.
+		// M0134-0070 — previously fell through the switch ("function does not exist").
 		if len(x.Args) == 1 {
-			v, err := evalExpr(x.Args[0], row, ctx)
-			if err != nil || v.IsNull() {
+			src, serr := evalExpr(x.Args[0], row, ctx)
+			if serr != nil {
+				return NullDatum, serr
+			}
+			if src.IsNull() {
 				return NullDatum, nil
 			}
-			h := sha256.Sum256([]byte(v.StringValue()))
-			return NewStringDatum(hex.EncodeToString(h[:])), nil
+			raw := src.BytesValue()
+			if src.Kind != KindBytes {
+				b, berr := byteaIn(src.StringValue(), x.Pos())
+				if berr != nil {
+					return NullDatum, berr
+				}
+				raw = b
+			}
+			h := sha256.Sum224(raw)
+			return NewBytesDatum(h[:]), nil
+		}
+	case "sha256":
+		// sha256(bytea) -> bytea (cryptohashfuncs.c sha256_bytea, PG_RETURN_BYTEA_P).
+		// Digest length 32 bytes. postgres/src/include/common/sha2.h:21.
+		// M0134-0070 — used to return hex TEXT (KindString) instead of bytea.
+		if len(x.Args) == 1 {
+			src, serr := evalExpr(x.Args[0], row, ctx)
+			if serr != nil {
+				return NullDatum, serr
+			}
+			if src.IsNull() {
+				return NullDatum, nil
+			}
+			raw := src.BytesValue()
+			if src.Kind != KindBytes {
+				b, berr := byteaIn(src.StringValue(), x.Pos())
+				if berr != nil {
+					return NullDatum, berr
+				}
+				raw = b
+			}
+			h := sha256.Sum256(raw)
+			return NewBytesDatum(h[:]), nil
+		}
+	case "sha384":
+		// sha384(bytea) -> bytea (cryptohashfuncs.c sha384_bytea, PG_RETURN_BYTEA_P).
+		// Digest length 48 bytes. postgres/src/include/common/sha2.h:22.
+		// M0134-0070 — previously fell through the switch ("function does not exist").
+		if len(x.Args) == 1 {
+			src, serr := evalExpr(x.Args[0], row, ctx)
+			if serr != nil {
+				return NullDatum, serr
+			}
+			if src.IsNull() {
+				return NullDatum, nil
+			}
+			raw := src.BytesValue()
+			if src.Kind != KindBytes {
+				b, berr := byteaIn(src.StringValue(), x.Pos())
+				if berr != nil {
+					return NullDatum, berr
+				}
+				raw = b
+			}
+			h := sha512.Sum384(raw)
+			return NewBytesDatum(h[:]), nil
 		}
 	case "sha512":
+		// sha512(bytea) -> bytea (cryptohashfuncs.c sha512_bytea, PG_RETURN_BYTEA_P).
+		// Digest length 64 bytes. postgres/src/include/common/sha2.h:23.
+		// M0134-0070 — used to return hex TEXT (KindString) instead of bytea.
 		if len(x.Args) == 1 {
-			v, err := evalExpr(x.Args[0], row, ctx)
-			if err != nil || v.IsNull() {
+			src, serr := evalExpr(x.Args[0], row, ctx)
+			if serr != nil {
+				return NullDatum, serr
+			}
+			if src.IsNull() {
 				return NullDatum, nil
 			}
-			h := sha512.Sum512([]byte(v.StringValue()))
-			return NewStringDatum(hex.EncodeToString(h[:])), nil
+			raw := src.BytesValue()
+			if src.Kind != KindBytes {
+				b, berr := byteaIn(src.StringValue(), x.Pos())
+				if berr != nil {
+					return NullDatum, berr
+				}
+				raw = b
+			}
+			h := sha512.Sum512(raw)
+			return NewBytesDatum(h[:]), nil
 		}
 	case "digest":
 		// digest(text, algorithm) — subset: only 'md5', 'sha256', 'sha512'
@@ -9926,6 +11011,35 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 		return NullDatum, nil
 
+	case "pg_get_statisticsobjdef_columns":
+		// pg_get_statisticsobjdef_columns(oid) → text — columns-only rendering used
+		// by psql \d+'s "Statistics objects:" footer (describe.c appends its own
+		// "FROM <regclass>"). ruleutils.c pg_get_statisticsobjdef_columns.
+		if len(x.Args) < 1 {
+			return NullDatum, nil
+		}
+		arg, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil || arg.IsNull() {
+			return NullDatum, nil
+		}
+		var targetOID uint32
+		if arg.Kind == KindInt {
+			targetOID = uint32(arg.Int)
+		} else {
+			v, _ := strconv.ParseUint(strings.TrimSpace(arg.StringValue()), 10, 32)
+			targetOID = uint32(v)
+		}
+		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+			if obj, ok := im.StatisticsByOID(targetOID); ok {
+				def := im.BuildStatisticsObjDefColumns(obj)
+				if def == "" {
+					return NullDatum, nil
+				}
+				return NewStringDatum(def), nil
+			}
+		}
+		return NullDatum, nil
+
 	case "pg_get_ruledef", "pg_get_ruledef_ext":
 		// pg_get_ruledef(oid [, pretty bool]) → text — reconstructs the CREATE
 		// RULE statement. pg_dump's dumpRule selects pg_get_ruledef(r.oid) and
@@ -10073,7 +11187,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 					if fk.OID == 0 || fk.OID != targetOID {
 						continue
 					}
-					return NewStringDatum(buildForeignKeyDefString(im, fk, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))), nil
+					return NewStringDatum(buildForeignKeyDefString(ctx, im, fk, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))), nil
 				}
 			}
 			// Domain CHECK constraints (contype='c', keyed on contypid). pg_dump's
@@ -10647,64 +11761,12 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 		// Compute hash: for each non-NULL key value, call the operator class hash
 		// function (or the built-in type default) and fold with hash_combine64.
-		var rowHash uint64
-		seedInt64 := int64(hashPartitionSeed)
-		for i := 0; i < numKeys; i++ {
-			valDatum, verr := evalExpr(x.Args[3+i], row, ctx)
-			if verr != nil {
-				return NullDatum, verr
-			}
-			if valDatum.IsNull() {
-				continue // NULL values are skipped (PG behavior)
-			}
-			opClass := ""
-			if i < len(tbl.PartitionKeyOpClasses) {
-				opClass = tbl.PartitionKeyOpClasses[i]
-			}
-			var h uint64
-			if opClass != "" {
-				// Custom operator class: look up FUNCTION 2 and call it(val, seed).
-				hashFuncName, hasFn := im.LookupOpClassHashFunc(opClass)
-				if hasFn {
-					routines := ctx.Catalog.Routines()
-					rs := routines.LookupByName(parser.ObjectName{Name: hashFuncName})
-					seedDatum := NewIntDatum(seedInt64)
-					var bestRoutine *catalog.Routine
-					for _, r := range rs {
-						if len(r.ArgTypes) == 2 {
-							bestRoutine = r
-							break
-						}
-					}
-					if bestRoutine != nil {
-						hResult, herr := executeStoredRoutine(bestRoutine, []Datum{valDatum, seedDatum}, ctx, x.Pos())
-						if herr != nil {
-							return NullDatum, herr
-						}
-						if !hResult.IsNull() {
-							h = uint64(hResult.Int)
-						}
-					}
-				}
-			} else {
-				// Default hash: type-based built-in hash functions.
-				colType := ""
-				for _, col := range tbl.Columns {
-					if strings.EqualFold(col.Name, tbl.PartitionKey[i]) {
-						colType = strings.ToLower(col.Type.Name)
-						break
-					}
-				}
-				switch {
-				case colType == "int4" || colType == "integer" || colType == "int" || valDatum.Kind == KindInt:
-					h = pgHashUint32Extended(uint32(valDatum.Int), hashPartitionSeed)
-				case colType == "text" || colType == "varchar" || colType == "bpchar" || valDatum.Kind == KindString:
-					h = pgHashBytesExtended([]byte(valDatum.StringValue()), hashPartitionSeed)
-				default:
-					h = pgHashUint32Extended(uint32(valDatum.Int), hashPartitionSeed)
-				}
-			}
-			rowHash = pgHashCombine64(rowHash, h)
+		// Shared with INSERT-time HASH partition routing — M0134-0053.
+		rowHash, herr := computeHashPartitionRowHash(tbl, im, ctx, x.Pos(), func(i int) (Datum, error) {
+			return evalExpr(x.Args[3+i], row, ctx)
+		})
+		if herr != nil {
+			return NullDatum, herr
 		}
 		return NewBoolDatum(uint64(rowHash)%uint64(modulus) == uint64(remainder)), nil
 	case "merge_action":
@@ -10867,6 +11929,11 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if err != nil || n.IsNull() {
 				return NullDatum, nil
 			}
+			// PG text_repeat (varlena.c): count <= 0 returns empty string,
+			// not an error.
+			if n.Int < 0 {
+				n.Int = 0
+			}
 			return NewStringDatum(strings.Repeat(s.StringValue(), int(n.Int))), nil
 		}
 	case "char_length", "character_length":
@@ -10991,6 +12058,19 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
+			// PG: postgres/src/backend/utils/adt/oracle_compat.c:638-703
+			// (dobyteatrim / byteatrim) — bytea input trims by byte-set
+			// membership, not rune semantics, and must stay tagged KindBytes.
+			if s.Kind == KindBytes {
+				cutset := []byte(" ")
+				if len(x.Args) >= 2 {
+					c, err := evalExpr(x.Args[1], row, ctx)
+					if err == nil && !c.IsNull() {
+						cutset = c.BytesValue()
+					}
+				}
+				return NewBytesDatum(bytes.Trim(s.BytesValue(), string(cutset))), nil
+			}
 			cutset := " "
 			if len(x.Args) >= 2 {
 				c, err := evalExpr(x.Args[1], row, ctx)
@@ -11006,6 +12086,18 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
+			// PG: postgres/src/backend/utils/adt/oracle_compat.c:638-703
+			// (dobyteatrim / bytealtrim) — same byte-set semantics as btrim.
+			if s.Kind == KindBytes {
+				cutset := []byte(" ")
+				if len(x.Args) >= 2 {
+					c, err := evalExpr(x.Args[1], row, ctx)
+					if err == nil && !c.IsNull() {
+						cutset = c.BytesValue()
+					}
+				}
+				return NewBytesDatum(bytes.TrimLeft(s.BytesValue(), string(cutset))), nil
+			}
 			cutset := " "
 			if len(x.Args) >= 2 {
 				c, err := evalExpr(x.Args[1], row, ctx)
@@ -11020,6 +12112,18 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			s, err := evalExpr(x.Args[0], row, ctx)
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
+			}
+			// PG: postgres/src/backend/utils/adt/oracle_compat.c:638-703
+			// (dobyteatrim / byteartrim) — same byte-set semantics as btrim.
+			if s.Kind == KindBytes {
+				cutset := []byte(" ")
+				if len(x.Args) >= 2 {
+					c, err := evalExpr(x.Args[1], row, ctx)
+					if err == nil && !c.IsNull() {
+						cutset = c.BytesValue()
+					}
+				}
+				return NewBytesDatum(bytes.TrimRight(s.BytesValue(), string(cutset))), nil
 			}
 			cutset := " "
 			if len(x.Args) >= 2 {
@@ -11102,7 +12206,8 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return Datum{Kind: KindInt, Int: int64(len(runes) + 1)}, nil
 		}
 	case "split_part":
-		// split_part(text, delimiter, field)
+		// split_part(text, delimiter, field) — mirrors PG's split_part()
+		// (postgres/src/backend/utils/adt/varlena.c:4621-4750).
 		if len(x.Args) == 3 {
 			s, e1 := evalExpr(x.Args[0], row, ctx)
 			d, e2 := evalExpr(x.Args[1], row, ctx)
@@ -11110,12 +12215,39 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if e1 != nil || e2 != nil || e3 != nil || s.IsNull() || d.IsNull() || n.IsNull() {
 				return NullDatum, nil
 			}
-			parts := strings.Split(s.StringValue(), d.StringValue())
-			idx := int(n.Int)
-			if idx <= 0 || idx > len(parts) {
+			fldnum := int(n.Int)
+			// field number is 1 based
+			if fldnum == 0 {
+				return Datum{}, &ExecError{Code: "22023",
+					Message: "field position must not be zero"}
+			}
+			str := s.StringValue()
+			sep := d.StringValue()
+			// return empty string for empty input string
+			if len(str) < 1 {
 				return NewStringDatum(""), nil
 			}
-			return NewStringDatum(parts[idx-1]), nil
+			// handle empty field separator: if first or last field, return
+			// input string, else empty string.
+			if len(sep) < 1 {
+				if fldnum == 1 || fldnum == -1 {
+					return NewStringDatum(str), nil
+				}
+				return NewStringDatum(""), nil
+			}
+			parts := strings.Split(str, sep)
+			if fldnum < 0 {
+				// convert negative field number to positive by counting from
+				// the end (total field count).
+				fldnum += len(parts) + 1
+				if fldnum <= 0 {
+					return NewStringDatum(""), nil
+				}
+			}
+			if fldnum > len(parts) {
+				return NewStringDatum(""), nil
+			}
+			return NewStringDatum(parts[fldnum-1]), nil
 		}
 	case "concat":
 		// concat(any, ...) → text — NULL inputs are treated as empty string.
@@ -11229,6 +12361,16 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
+			if s.Kind == KindBytes {
+				// bytea_reverse (postgres/src/backend/utils/adt/varlena.c:3458-3474)
+				// is a plain byte-for-byte reversal, no codepoint awareness.
+				src := s.BytesValue()
+				out := make([]byte, len(src))
+				for i, b := range src {
+					out[len(src)-1-i] = b
+				}
+				return NewBytesDatum(out), nil
+			}
 			runes := []rune(s.StringValue())
 			for i, j := 0, len(runes)-1; i < j; i, j = i+1, j-1 {
 				runes[i], runes[j] = runes[j], runes[i]
@@ -11252,6 +12394,14 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			n, err := evalExpr(x.Args[0], row, ctx)
 			if err != nil || n.IsNull() {
 				return NullDatum, nil
+			}
+			// PG: postgres/src/backend/utils/adt/oracle_compat.c:1030-1047 (chr)
+			// — reject non-positive/zero codepoints with PG's exact SQLSTATEs.
+			if n.Int < 0 {
+				return Datum{}, &ExecError{Code: "22023", Message: "character number must be positive"}
+			}
+			if n.Int == 0 {
+				return Datum{}, &ExecError{Code: "54000", Message: "null character not permitted"}
 			}
 			return NewStringDatum(string(rune(n.Int))), nil
 		}
@@ -11278,7 +12428,25 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return NewStringDatum(pgQuoteIdent(s.StringValue())), nil
 		}
 	case "regexp_replace":
-		// regexp_replace(text, pattern, replacement [, flags]) M0097-0011.
+		// regexp_replace(text, pattern, replacement [, flags | start [, N [, flags]]]).
+		// M0097-0011 (3/4-arg forms) + M0134-0070 Round F (5/6-arg extended
+		// forms, pg_proc.dat:3755-3768 oids 6251/6252/6253:
+		//   6251 (6-arg): string, pattern, replacement, start, N, flags
+		//   6252 (5-arg): string, pattern, replacement, start, N       (no flags)
+		//   6253 (4-arg): string, pattern, replacement, start          (no N, no flags)
+		// oid 6253 collides in arity with the pre-existing 4-arg flags form
+		// (oid 2285: string, pattern, replacement, flags) — goopg's untyped
+		// AST can't disambiguate by arity, so branch on the arg-3 Datum kind
+		// (string Datum -> flags form; int Datum -> start form), which is
+		// exactly what upstream's own overload resolution keys off for an
+		// unquoted numeric literal vs a quoted string literal (see
+		// strings.sql "erroneous invocation of non-extended form" case:
+		// regexp_replace(..., 'X', '1') stays on the 4-arg flags form and
+		// errors "invalid regular expression option").
+		// See postgres/src/backend/utils/adt/regexp.c:700-741
+		// (textregexreplace_extended) for the start/N validation rules and
+		// postgres/src/backend/utils/adt/varlena.c:4457-4618
+		// (replace_text_regexp) for the match-and-replace loop mirrored below.
 		if len(x.Args) >= 3 {
 			s, e1 := evalExpr(x.Args[0], row, ctx)
 			pat, e2 := evalExpr(x.Args[1], row, ctx)
@@ -11286,43 +12454,156 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if e1 != nil || e2 != nil || e3 != nil || s.IsNull() || pat.IsNull() {
 				return NullDatum, nil
 			}
-			replaceAll := false
-			caseInsensitive := false
-			if len(x.Args) >= 4 {
-				flags, e4 := evalExpr(x.Args[3], row, ctx)
-				if e4 == nil && !flags.IsNull() {
-					fs := flags.StringValue()
-					replaceAll = strings.Contains(fs, "g")
-					caseInsensitive = strings.Contains(fs, "i")
+			flagsStr := ""
+			start := int64(1)
+			n := int64(1)
+			haveStartN := false
+			switch len(x.Args) {
+			case 4:
+				v, e4 := evalExpr(x.Args[3], row, ctx)
+				if e4 != nil {
+					return NullDatum, e4
+				}
+				if !v.IsNull() {
+					if v.Kind == KindInt {
+						// oid 6253: (string, pattern, replacement, start) — no N, no flags.
+						haveStartN = true
+						start = v.Int
+					} else {
+						flagsStr = v.StringValue()
+						// M0134-0070: textregexreplace (4-arg text overload, oid
+						// 2285) adds a HINT when the 4th arg is non-empty and its
+						// first byte is '0'..'9' — the user probably meant the
+						// start-parameter form (regexp.c:673-684). Print the WHOLE
+						// opt via pg_mblen_range, not the shared helper's %q-of-
+						// first-rune, so "1z" doesn't truncate to "1".
+						if len(flagsStr) > 0 && flagsStr[0] >= '0' && flagsStr[0] <= '9' {
+							return NullDatum, &ExecError{Code: "22023",
+								Message: "invalid regular expression option: \"" + flagsStr + "\"",
+								Hint:    "If you meant to use regexp_replace() with a start parameter, cast the fourth argument to integer explicitly."}
+						}
+					}
+				}
+			case 5:
+				// oid 6252: (string, pattern, replacement, start, N) — no flags.
+				v4, e4 := evalExpr(x.Args[3], row, ctx)
+				if e4 != nil {
+					return NullDatum, e4
+				}
+				v5, e5 := evalExpr(x.Args[4], row, ctx)
+				if e5 != nil {
+					return NullDatum, e5
+				}
+				if v4.IsNull() || v5.IsNull() {
+					return NullDatum, nil
+				}
+				haveStartN = true
+				start = v4.Int
+				n = v5.Int
+			case 6:
+				// oid 6251: (string, pattern, replacement, start, N, flags).
+				v4, e4 := evalExpr(x.Args[3], row, ctx)
+				if e4 != nil {
+					return NullDatum, e4
+				}
+				v5, e5 := evalExpr(x.Args[4], row, ctx)
+				if e5 != nil {
+					return NullDatum, e5
+				}
+				v6, e6 := evalExpr(x.Args[5], row, ctx)
+				if e6 != nil {
+					return NullDatum, e6
+				}
+				if v4.IsNull() || v5.IsNull() {
+					return NullDatum, nil
+				}
+				haveStartN = true
+				start = v4.Int
+				n = v5.Int
+				if !v6.IsNull() {
+					flagsStr = v6.StringValue()
 				}
 			}
-			pattern := pgPatternToGoRE2(pat.StringValue())
-			if caseInsensitive {
-				pattern = "(?i)" + pattern
+			if haveStartN {
+				if start <= 0 {
+					return NullDatum, &ExecError{Code: "22023",
+						Message: fmt.Sprintf("invalid value for parameter %q: %d", "start", start)}
+				}
+				if n < 0 {
+					return NullDatum, &ExecError{Code: "22023",
+						Message: fmt.Sprintf("invalid value for parameter %q: %d", "n", n)}
+				}
 			}
-			re, err := regexp.Compile(pattern)
+			goFlags := ""
+			replaceAll := false
+			if flagsStr != "" {
+				var ferr error
+				goFlags, replaceAll, ferr = pgRegexFlagsToGoModifiers(flagsStr)
+				if ferr != nil {
+					return NullDatum, ferr
+				}
+			}
+			re, err := regexpCompilePattern(pat.StringValue(), flagsStr, goFlags)
 			if err != nil {
 				return NewStringDatum(s.StringValue()), nil // invalid pattern: return input
 			}
 			replacement := repl.StringValue()
-			// Convert PostgreSQL \1, \2 backreferences to Go $1, $2.
-			replacement = strings.ReplaceAll(replacement, `\1`, `${1}`)
-			replacement = strings.ReplaceAll(replacement, `\2`, `${2}`)
-			var result string
-			if replaceAll {
-				result = re.ReplaceAllString(s.StringValue(), replacement)
-			} else {
-				// Replace only first occurrence.
-				found := false
-				result = re.ReplaceAllStringFunc(s.StringValue(), func(m string) string {
-					if found {
-						return m
-					}
-					found = true
-					return re.ReplaceAllString(m, replacement)
-				})
+			// Convert PostgreSQL's replacement-string escape grammar
+			// (\1-\9, \&, \\, other-\c passthrough) to a Go regexp expansion
+			// template. M0134-0070 Round G.
+			replacement = pgRegexpReplacementTemplate(replacement)
+
+			if !haveStartN {
+				var result string
+				if replaceAll {
+					result = re.ReplaceAllString(s.StringValue(), replacement)
+				} else {
+					// Replace only first occurrence.
+					found := false
+					result = re.ReplaceAllStringFunc(s.StringValue(), func(m string) string {
+						if found {
+							return m
+						}
+						found = true
+						return re.ReplaceAllString(m, replacement)
+					})
+				}
+				return NewStringDatum(result), nil
 			}
-			return NewStringDatum(result), nil
+
+			// start/N-scoped replace: mirror varlena.c:replace_text_regexp's
+			// successive-match loop. search_start is the 0-based char offset
+			// (start-1); N==0 means replace every match at/after search_start
+			// (like the 'g' flag, scoped to start); N>0 replaces only the
+			// Nth match found and leaves all others (before and after)
+			// unchanged.
+			runes := []rune(s.StringValue())
+			searchStart := int(start) - 1
+			if searchStart > len(runes) {
+				searchStart = len(runes)
+			}
+			prefix := string(runes[:searchStart])
+			window := string(runes[searchStart:])
+			matches := re.FindAllStringSubmatchIndex(window, -1)
+			var b strings.Builder
+			b.WriteString(prefix)
+			last := 0
+			nmatches := int64(0)
+			for _, loc := range matches {
+				nmatches++
+				if n > 0 && nmatches != n {
+					continue // not the target match: leave it unchanged
+				}
+				mstart, mend := loc[0], loc[1]
+				b.WriteString(window[last:mstart])
+				b.Write(re.ExpandString(nil, replacement, window, loc))
+				last = mend
+				if n > 0 {
+					break // only one target match; stop after replacing it
+				}
+			}
+			b.WriteString(window[last:])
+			return NewStringDatum(b.String()), nil
 		}
 	case "format":
 		// format(fmt, args...) — PostgreSQL format() with positional args, width, flags.
@@ -11378,6 +12659,83 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return NewStringDatum(result), nil
 		}
 
+	case "json_extract_path", "json_extract_path_text", "jsonb_extract_path", "jsonb_extract_path_text":
+		// json{b}_extract_path[_text](from_json, VARIADIC path_elems text[]).
+		// Oracle: postgres/src/backend/utils/adt/jsonfuncs.c get_path_all /
+		// get_jsonb_path_all — both walk the shared per-step navigation
+		// jsonPathStep also used by evalJSONArrow (-> / ->>), just driven by a
+		// text[] path array instead of a single operator RHS. goopg carries
+		// json and jsonb identically as KindString text, so the json/jsonb
+		// pairs share one implementation (M0134-0037).
+		if len(x.Args) >= 1 {
+			asText := name == "json_extract_path_text" || name == "jsonb_extract_path_text"
+			jv, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			if jv.IsNull() {
+				return NullDatum, nil
+			}
+			ls, ok := datumAsString(jv)
+			if !ok {
+				return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(),
+					Message: fmt.Sprintf("function %s requires a json argument", x.Name)}
+			}
+
+			// Evaluate the path elements, expanding a VARIADIC text[] argument
+			// if present — mirrors the format()/concat() VARIADIC handling
+			// above. A NULL path element (or a NULL path array) yields NULL,
+			// matching get_path_all's array_contains_nulls check.
+			var path []string
+			pathArgs := x.Args[1:]
+			if x.Variadic && len(pathArgs) == 1 {
+				v, e := evalExpr(pathArgs[0], row, ctx)
+				if e != nil {
+					return Datum{}, e
+				}
+				if v.IsNull() {
+					return NullDatum, nil
+				}
+				sv := v.StringValue()
+				if len(sv) == 0 || sv[0] != '{' {
+					return Datum{}, &ExecError{Code: "42809",
+						Message: "VARIADIC argument must be an array", Pos: x.Pos()}
+				}
+				path = parseTextArray(sv)
+			} else {
+				for _, a := range pathArgs {
+					v, e := evalExpr(a, row, ctx)
+					if e != nil {
+						return Datum{}, e
+					}
+					if v.IsNull() {
+						return NullDatum, nil
+					}
+					path = append(path, v.StringValue())
+				}
+			}
+
+			dec := json.NewDecoder(strings.NewReader(ls))
+			dec.UseNumber()
+			var doc any
+			if err := dec.Decode(&doc); err != nil {
+				return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(),
+					Message: "invalid input syntax for type json"}
+			}
+
+			elem, found := doc, true
+			for _, key := range path {
+				elem, found = jsonPathStep(elem, key)
+				if !found {
+					return NullDatum, nil
+				}
+			}
+			if asText {
+				return jsonElemAsTextDatum(elem), nil
+			}
+			return jsonElemAsJSONDatum(elem), nil
+		}
+
 	// ── Mathematical functions (M0097-0005) ───────────────────────────────
 	case "abs":
 		if len(x.Args) == 1 {
@@ -11389,7 +12747,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 				n := v.Int
 				if n == math.MinInt64 {
 					// abs(MinInt64) overflows: MinInt64 = -2^63, abs = 2^63 which can't fit int64.
-					return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "bigint out of range"}
+					return Datum{}, &ExecError{Code: "22003", Message: "bigint out of range"}
 				}
 				if n < 0 {
 					n = -n
@@ -11517,6 +12875,36 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			return Datum{Kind: KindInt, Int: 0}, nil
 		}
+	case "trim_scale", "min_scale":
+		// trim_scale(numeric) reduces the value's display scale to the
+		// minimum needed to represent it exactly (drop trailing zero
+		// decimal digits); min_scale(numeric) reports that minimum scale
+		// as an int without altering the value. Mirrors PG's
+		// numeric_trim_scale / numeric_min_scale, both built on
+		// get_min_scale (postgres/src/backend/utils/adt/numeric.c:4323,
+		// :4253): peel trailing zero digits off the mantissa one decimal
+		// place at a time while scale > 0.
+		if len(x.Args) == 1 {
+			v, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || v.IsNull() {
+				return NullDatum, nil
+			}
+			m := numericMant(v)
+			scale := int(v.Scale)
+			ten := big.NewInt(10)
+			for scale > 0 {
+				q, r := new(big.Int).QuoRem(m, ten, new(big.Int))
+				if r.Sign() != 0 {
+					break
+				}
+				m = q
+				scale--
+			}
+			if name == "min_scale" {
+				return Datum{Kind: KindInt, Int: int64(scale)}, nil
+			}
+			return newNumeric(m, scale), nil
+		}
 	case "sqrt":
 		if len(x.Args) == 1 {
 			v, err := evalExpr(x.Args[0], row, ctx)
@@ -11612,10 +13000,10 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 				bv.Int >= -2147483648 && bv.Int <= 2147483647
 			if isInt4Range {
 				if ua > 2147483647 {
-					return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "integer out of range"}
+					return Datum{}, &ExecError{Code: "22003", Message: "integer out of range"}
 				}
 			} else if ua > maxInt64 {
-				return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "bigint out of range"}
+				return Datum{}, &ExecError{Code: "22003", Message: "bigint out of range"}
 			}
 			return Datum{Kind: KindInt, Int: int64(ua)}, nil
 		}
@@ -11644,10 +13032,10 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 				bv.Int >= -2147483648 && bv.Int <= 2147483647
 			if isInt4Range {
 				if result > 2147483647 {
-					return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "integer out of range"}
+					return Datum{}, &ExecError{Code: "22003", Message: "integer out of range"}
 				}
 			} else if result > maxInt64 {
-				return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "bigint out of range"}
+				return Datum{}, &ExecError{Code: "22003", Message: "bigint out of range"}
 			}
 			return Datum{Kind: KindInt, Int: int64(result)}, nil
 		}
@@ -11660,7 +13048,7 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 				return NullDatum, nil
 			}
 			if b.Int == 0 {
-				return Datum{}, &ExecError{Code: "22012", Pos: x.Pos(), Message: "division by zero"}
+				return Datum{}, &ExecError{Code: "22012", Message: "division by zero"}
 			}
 			return Datum{Kind: KindInt, Int: a.Int % b.Int}, nil
 		}
@@ -12156,18 +13544,334 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 					flags = flagD.StringValue()
 				}
 			}
+			goFlags, global, ferr := pgRegexFlagsToGoModifiers(flags)
+			if ferr != nil {
+				return NullDatum, ferr
+			}
+			if global {
+				// regexp_split_to_array() rejects 'g' (regexp.c:1818-1826
+				// regexp_split_to_array — "User mustn't specify 'g'").
+				return NullDatum, &ExecError{Code: "22023",
+					Message: `regexp_split_to_array() does not support the "global" option`}
+			}
 			pat := patD.StringValue()
 			// Build RE2 pattern with flags.
-			reStr := pat
-			if strings.Contains(flags, "i") {
-				reStr = "(?i)" + reStr
-			}
+			reStr := goFlags + pat
 			re, rerr := regexp.Compile(reStr)
 			if rerr != nil {
-				return NullDatum, &ExecError{Code: "2201B", Pos: x.Pos(), Message: fmt.Sprintf("invalid regular expression: %v", rerr)}
+				// No Pos: pure runtime evaluation (RE_compile_and_cache,
+				// postgres/src/backend/utils/adt/regexp.c, has no
+				// errposition call). M0134-0070.
+				return NullDatum, &ExecError{Code: "2201B", Message: fmt.Sprintf("invalid regular expression: %v", rerr)}
 			}
 			parts := re.Split(strD.StringValue(), -1)
 			return NewStringDatum(formatTextArray(parts)), nil
+		}
+
+	case "regexp_count":
+		// regexp_count(string, pattern [, start [, flags]]) → int4
+		// postgres/src/backend/utils/adt/regexp.c:1138 regexp_count.
+		if len(x.Args) >= 2 && len(x.Args) <= 4 {
+			strD, e1 := evalExpr(x.Args[0], row, ctx)
+			patD, e2 := evalExpr(x.Args[1], row, ctx)
+			if e1 != nil {
+				return Datum{}, e1
+			}
+			if e2 != nil {
+				return Datum{}, e2
+			}
+			if strD.IsNull() || patD.IsNull() {
+				return NullDatum, nil
+			}
+			start := int64(1)
+			if len(x.Args) >= 3 {
+				d, e := evalExpr(x.Args[2], row, ctx)
+				if e != nil {
+					return Datum{}, e
+				}
+				if d.IsNull() {
+					return NullDatum, nil
+				}
+				start = d.Int
+				if start <= 0 {
+					return Datum{}, &ExecError{Code: "22023",
+						Message: fmt.Sprintf("invalid value for parameter %q: %d", "start", start)}
+				}
+			}
+			flags := ""
+			if len(x.Args) >= 4 {
+				d, e := evalExpr(x.Args[3], row, ctx)
+				if e != nil {
+					return Datum{}, e
+				}
+				if d.IsNull() {
+					return NullDatum, nil
+				}
+				flags = d.StringValue()
+			}
+			goFlags, global, ferr := pgRegexFlagsToGoModifiers(flags)
+			if ferr != nil {
+				return Datum{}, ferr
+			}
+			if global {
+				// regexp.c:1160-1166 — "User mustn't specify 'g'".
+				return Datum{}, &ExecError{Code: "22023",
+					Message: `regexp_count() does not support the "global" option`}
+			}
+			re, rerr := regexpCompilePattern(patD.StringValue(), flags, goFlags)
+			if rerr != nil {
+				return Datum{}, &ExecError{Code: "2201B", Message: fmt.Sprintf("invalid regular expression: %v", rerr)}
+			}
+			runes := []rune(strD.StringValue())
+			winStart := int(start) - 1
+			if winStart > len(runes) {
+				winStart = len(runes)
+			}
+			window := string(runes[winStart:])
+			matches := re.FindAllStringIndex(window, -1)
+			return Datum{Kind: KindInt, Int: int64(len(matches))}, nil
+		}
+
+	case "regexp_like":
+		// regexp_like(string, pattern [, flags]) → bool.
+		// postgres/src/backend/utils/adt/regexp.c:1329 regexp_like — direct
+		// compile+execute, no start/N, always searches from position 0.
+		if len(x.Args) >= 2 && len(x.Args) <= 3 {
+			strD, e1 := evalExpr(x.Args[0], row, ctx)
+			patD, e2 := evalExpr(x.Args[1], row, ctx)
+			if e1 != nil {
+				return Datum{}, e1
+			}
+			if e2 != nil {
+				return Datum{}, e2
+			}
+			if strD.IsNull() || patD.IsNull() {
+				return NullDatum, nil
+			}
+			flags := ""
+			if len(x.Args) >= 3 {
+				d, e := evalExpr(x.Args[2], row, ctx)
+				if e != nil {
+					return Datum{}, e
+				}
+				if d.IsNull() {
+					return NullDatum, nil
+				}
+				flags = d.StringValue()
+			}
+			goFlags, global, ferr := pgRegexFlagsToGoModifiers(flags)
+			if ferr != nil {
+				return Datum{}, ferr
+			}
+			if global {
+				return Datum{}, &ExecError{Code: "22023",
+					Message: `regexp_like() does not support the "global" option`}
+			}
+			re, rerr := regexpCompilePattern(patD.StringValue(), flags, goFlags)
+			if rerr != nil {
+				return Datum{}, &ExecError{Code: "2201B", Message: fmt.Sprintf("invalid regular expression: %v", rerr)}
+			}
+			return NewBoolDatum(re.MatchString(strD.StringValue())), nil
+		}
+
+	case "regexp_instr":
+		// regexp_instr(string, pattern [, start [, N [, endoption [, flags [, subexpr]]]]]) → int4
+		// postgres/src/backend/utils/adt/regexp.c:1198 regexp_instr.
+		if len(x.Args) >= 2 && len(x.Args) <= 7 {
+			strD, e1 := evalExpr(x.Args[0], row, ctx)
+			patD, e2 := evalExpr(x.Args[1], row, ctx)
+			if e1 != nil {
+				return Datum{}, e1
+			}
+			if e2 != nil {
+				return Datum{}, e2
+			}
+			if strD.IsNull() || patD.IsNull() {
+				return NullDatum, nil
+			}
+			start := int64(1)
+			if len(x.Args) >= 3 {
+				d, e := evalExpr(x.Args[2], row, ctx)
+				if e != nil {
+					return Datum{}, e
+				}
+				if d.IsNull() {
+					return NullDatum, nil
+				}
+				start = d.Int
+				if start <= 0 {
+					return Datum{}, &ExecError{Code: "22023",
+						Message: fmt.Sprintf("invalid value for parameter %q: %d", "start", start)}
+				}
+			}
+			n := int64(1)
+			if len(x.Args) >= 4 {
+				d, e := evalExpr(x.Args[3], row, ctx)
+				if e != nil {
+					return Datum{}, e
+				}
+				if d.IsNull() {
+					return NullDatum, nil
+				}
+				n = d.Int
+				if n <= 0 {
+					return Datum{}, &ExecError{Code: "22023",
+						Message: fmt.Sprintf("invalid value for parameter %q: %d", "n", n)}
+				}
+			}
+			endoption := int64(0)
+			if len(x.Args) >= 5 {
+				d, e := evalExpr(x.Args[4], row, ctx)
+				if e != nil {
+					return Datum{}, e
+				}
+				if d.IsNull() {
+					return NullDatum, nil
+				}
+				endoption = d.Int
+				if endoption != 0 && endoption != 1 {
+					return Datum{}, &ExecError{Code: "22023",
+						Message: fmt.Sprintf("invalid value for parameter %q: %d", "endoption", endoption)}
+				}
+			}
+			flags := ""
+			if len(x.Args) >= 6 {
+				d, e := evalExpr(x.Args[5], row, ctx)
+				if e != nil {
+					return Datum{}, e
+				}
+				if d.IsNull() {
+					return NullDatum, nil
+				}
+				flags = d.StringValue()
+			}
+			subexpr := int64(0)
+			if len(x.Args) >= 7 {
+				d, e := evalExpr(x.Args[6], row, ctx)
+				if e != nil {
+					return Datum{}, e
+				}
+				if d.IsNull() {
+					return NullDatum, nil
+				}
+				subexpr = d.Int
+				if subexpr < 0 {
+					return Datum{}, &ExecError{Code: "22023",
+						Message: fmt.Sprintf("invalid value for parameter %q: %d", "subexpr", subexpr)}
+				}
+			}
+			goFlags, global, ferr := pgRegexFlagsToGoModifiers(flags)
+			if ferr != nil {
+				return Datum{}, ferr
+			}
+			if global {
+				return Datum{}, &ExecError{Code: "22023",
+					Message: `regexp_instr() does not support the "global" option`}
+			}
+			window, so, eo, ok, merr := regexpInstrSubstrLocate(strD.StringValue(), patD.StringValue(), flags, goFlags, int(start), int(n), int(subexpr))
+			if merr != nil {
+				return Datum{}, merr
+			}
+			if !ok {
+				return Datum{Kind: KindInt, Int: 0}, nil
+			}
+			byteOff := so
+			if endoption == 1 {
+				byteOff = eo
+			}
+			return Datum{Kind: KindInt, Int: int64(regexpWindowCharPos(window, int(start), byteOff))}, nil
+		}
+
+	case "regexp_substr":
+		// regexp_substr(string, pattern [, start [, N [, flags [, subexpr]]]]) → text
+		// postgres/src/backend/utils/adt/regexp.c:1904 regexp_substr. Same
+		// start/N/subexpr validation as regexp_instr above, but flags/subexpr
+		// are ONE SLOT EARLIER (no endoption arg) — shares
+		// regexpInstrSubstrLocate so the two "pos" computations can't drift.
+		if len(x.Args) >= 2 && len(x.Args) <= 6 {
+			strD, e1 := evalExpr(x.Args[0], row, ctx)
+			patD, e2 := evalExpr(x.Args[1], row, ctx)
+			if e1 != nil {
+				return Datum{}, e1
+			}
+			if e2 != nil {
+				return Datum{}, e2
+			}
+			if strD.IsNull() || patD.IsNull() {
+				return NullDatum, nil
+			}
+			start := int64(1)
+			if len(x.Args) >= 3 {
+				d, e := evalExpr(x.Args[2], row, ctx)
+				if e != nil {
+					return Datum{}, e
+				}
+				if d.IsNull() {
+					return NullDatum, nil
+				}
+				start = d.Int
+				if start <= 0 {
+					return Datum{}, &ExecError{Code: "22023",
+						Message: fmt.Sprintf("invalid value for parameter %q: %d", "start", start)}
+				}
+			}
+			n := int64(1)
+			if len(x.Args) >= 4 {
+				d, e := evalExpr(x.Args[3], row, ctx)
+				if e != nil {
+					return Datum{}, e
+				}
+				if d.IsNull() {
+					return NullDatum, nil
+				}
+				n = d.Int
+				if n <= 0 {
+					return Datum{}, &ExecError{Code: "22023",
+						Message: fmt.Sprintf("invalid value for parameter %q: %d", "n", n)}
+				}
+			}
+			flags := ""
+			if len(x.Args) >= 5 {
+				d, e := evalExpr(x.Args[4], row, ctx)
+				if e != nil {
+					return Datum{}, e
+				}
+				if d.IsNull() {
+					return NullDatum, nil
+				}
+				flags = d.StringValue()
+			}
+			subexpr := int64(0)
+			if len(x.Args) >= 6 {
+				d, e := evalExpr(x.Args[5], row, ctx)
+				if e != nil {
+					return Datum{}, e
+				}
+				if d.IsNull() {
+					return NullDatum, nil
+				}
+				subexpr = d.Int
+				if subexpr < 0 {
+					return Datum{}, &ExecError{Code: "22023",
+						Message: fmt.Sprintf("invalid value for parameter %q: %d", "subexpr", subexpr)}
+				}
+			}
+			goFlags, global, ferr := pgRegexFlagsToGoModifiers(flags)
+			if ferr != nil {
+				return Datum{}, ferr
+			}
+			if global {
+				return Datum{}, &ExecError{Code: "22023",
+					Message: `regexp_substr() does not support the "global" option`}
+			}
+			window, so, eo, ok, merr := regexpInstrSubstrLocate(strD.StringValue(), patD.StringValue(), flags, goFlags, int(start), int(n), int(subexpr))
+			if merr != nil {
+				return Datum{}, merr
+			}
+			if !ok {
+				return NullDatum, nil
+			}
+			return NewStringDatum(window[so:eo]), nil
 		}
 
 	// ── Type conversion functions (M0097-0005) ────────────────────────────
@@ -12186,12 +13890,216 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return newNumeric(m, int(sc)), nil
 		}
 	case "to_hex":
+		// to_hex32/to_hex64 zero-extend the argument's two's-complement bit
+		// pattern rather than sign-formatting it (PG oracle:
+		// postgres/src/backend/utils/adt/varlena.c:5254-5267). ArgWidth is
+		// stamped at plan time (see resolveExpr's to_hex intercept in
+		// internal/optimizer/planner.go); default/empty ArgWidth uses the
+		// uint32 (int4 overload) path, which is also correct for all
+		// positive-value cases since %x does not zero-pad.
 		if len(x.Args) == 1 {
 			v, err := evalExpr(x.Args[0], row, ctx)
 			if err != nil || v.IsNull() {
 				return NullDatum, nil
 			}
-			return NewStringDatum(fmt.Sprintf("%x", v.Int)), nil
+			if x.ArgWidth == "int8" {
+				return NewStringDatum(fmt.Sprintf("%x", uint64(v.Int))), nil
+			}
+			return NewStringDatum(fmt.Sprintf("%x", uint32(v.Int))), nil
+		}
+	case "to_bin":
+		// to_bin32/to_bin64 zero-extend the argument's two's-complement bit
+		// pattern rather than sign-formatting it (PG oracle:
+		// postgres/src/backend/utils/adt/varlena.c:5190-5248, 5254-5267).
+		// ArgWidth is stamped at plan time (see resolveExpr's to_hex/to_bin/
+		// to_oct intercept in internal/optimizer/planner.go); default/empty
+		// ArgWidth uses the uint32 (int4 overload) path, which is also
+		// correct for all positive-value cases since strconv.FormatUint does
+		// not zero-pad.
+		if len(x.Args) == 1 {
+			v, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || v.IsNull() {
+				return NullDatum, nil
+			}
+			if x.ArgWidth == "int8" {
+				return NewStringDatum(strconv.FormatUint(uint64(v.Int), 2)), nil
+			}
+			return NewStringDatum(strconv.FormatUint(uint64(uint32(v.Int)), 2)), nil
+		}
+	case "to_oct":
+		// to_oct32/to_oct64 zero-extend the argument's two's-complement bit
+		// pattern rather than sign-formatting it (PG oracle:
+		// postgres/src/backend/utils/adt/varlena.c:5190-5248, 5254-5267).
+		// ArgWidth is stamped at plan time (see resolveExpr's to_hex/to_bin/
+		// to_oct intercept in internal/optimizer/planner.go); default/empty
+		// ArgWidth uses the uint32 (int4 overload) path, which is also
+		// correct for all positive-value cases since strconv.FormatUint does
+		// not zero-pad.
+		if len(x.Args) == 1 {
+			v, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || v.IsNull() {
+				return NullDatum, nil
+			}
+			if x.ArgWidth == "int8" {
+				return NewStringDatum(strconv.FormatUint(uint64(v.Int), 8)), nil
+			}
+			return NewStringDatum(strconv.FormatUint(uint64(uint32(v.Int)), 8)), nil
+		}
+	case "get_byte":
+		// get_byte(bytea, int4) -> int4 (postgres/src/backend/utils/adt/
+		// varlena.c:3310-3329 byteaGetByte). M0134-0070.
+		if len(x.Args) == 2 {
+			bv, berr := evalExpr(x.Args[0], row, ctx)
+			if berr != nil {
+				return NullDatum, berr
+			}
+			if bv.IsNull() {
+				return NullDatum, nil
+			}
+			nv, nerr := evalExpr(x.Args[1], row, ctx)
+			if nerr != nil {
+				return NullDatum, nerr
+			}
+			if nv.IsNull() {
+				return NullDatum, nil
+			}
+			b := bv.BytesValue()
+			n := nv.Int
+			if n < 0 || n >= int64(len(b)) {
+				// No Pos: byteaGetByte (varlena.c:3310-3329) has no
+				// errposition call. M0134-0070.
+				return Datum{}, &ExecError{Code: "2202E",
+					Message: fmt.Sprintf("index %d out of valid range, 0..%d", n, len(b)-1)}
+			}
+			return Datum{Kind: KindInt, Int: int64(b[n])}, nil
+		}
+	case "set_byte":
+		// set_byte(bytea, int4, int4) -> bytea (postgres/src/backend/utils/
+		// adt/varlena.c:3369-3399 byteaSetByte). M0134-0070.
+		if len(x.Args) == 3 {
+			bv, berr := evalExpr(x.Args[0], row, ctx)
+			if berr != nil {
+				return NullDatum, berr
+			}
+			if bv.IsNull() {
+				return NullDatum, nil
+			}
+			nv, nerr := evalExpr(x.Args[1], row, ctx)
+			if nerr != nil {
+				return NullDatum, nerr
+			}
+			if nv.IsNull() {
+				return NullDatum, nil
+			}
+			newv, verr := evalExpr(x.Args[2], row, ctx)
+			if verr != nil {
+				return NullDatum, verr
+			}
+			if newv.IsNull() {
+				return NullDatum, nil
+			}
+			src := bv.BytesValue()
+			n := nv.Int
+			if n < 0 || n >= int64(len(src)) {
+				// No Pos: byteaSetByte (varlena.c:3369-3399) has no
+				// errposition call. M0134-0070.
+				return Datum{}, &ExecError{Code: "2202E",
+					Message: fmt.Sprintf("index %d out of valid range, 0..%d", n, len(src)-1)}
+			}
+			out := make([]byte, len(src))
+			copy(out, src)
+			out[n] = byte(newv.Int)
+			return NewBytesDatum(out), nil
+		}
+	case "get_bit":
+		// get_bit(bytea, int8) -> int4 (postgres/src/backend/utils/adt/
+		// varlena.c:3330-3364 byteaGetBit). Bit numbering is LSB-first within
+		// each byte: bitNo = n%8, tested via `byte & (1 << bitNo)`
+		// (varlena.c:3361), so bitNo 0 is the byte's least-significant bit.
+		// M0134-0070.
+		if len(x.Args) == 2 {
+			bv, berr := evalExpr(x.Args[0], row, ctx)
+			if berr != nil {
+				return NullDatum, berr
+			}
+			if bv.IsNull() {
+				return NullDatum, nil
+			}
+			nv, nerr := evalExpr(x.Args[1], row, ctx)
+			if nerr != nil {
+				return NullDatum, nerr
+			}
+			if nv.IsNull() {
+				return NullDatum, nil
+			}
+			b := bv.BytesValue()
+			n := nv.Int
+			bitLen := int64(len(b)) * 8
+			if n < 0 || n >= bitLen {
+				// No Pos: byteaGetBit (varlena.c:3330-3364) has no
+				// errposition call. M0134-0070.
+				return Datum{}, &ExecError{Code: "2202E",
+					Message: fmt.Sprintf("index %d out of valid range, 0..%d", n, bitLen-1)}
+			}
+			byteNo := n / 8
+			bitNo := uint(n % 8)
+			if b[byteNo]&(1<<bitNo) != 0 {
+				return Datum{Kind: KindInt, Int: 1}, nil
+			}
+			return Datum{Kind: KindInt, Int: 0}, nil
+		}
+	case "set_bit":
+		// set_bit(bytea, int8, int4) -> bytea (postgres/src/backend/utils/
+		// adt/varlena.c:3400-3448 byteaSetBit). Same LSB-first bit numbering
+		// as get_bit; also validates the new-bit-value arg is 0 or 1
+		// (varlena.c:3437-3439, ERRCODE_INVALID_PARAMETER_VALUE=22023).
+		// M0134-0070.
+		if len(x.Args) == 3 {
+			bv, berr := evalExpr(x.Args[0], row, ctx)
+			if berr != nil {
+				return NullDatum, berr
+			}
+			if bv.IsNull() {
+				return NullDatum, nil
+			}
+			nv, nerr := evalExpr(x.Args[1], row, ctx)
+			if nerr != nil {
+				return NullDatum, nerr
+			}
+			if nv.IsNull() {
+				return NullDatum, nil
+			}
+			newv, verr := evalExpr(x.Args[2], row, ctx)
+			if verr != nil {
+				return NullDatum, verr
+			}
+			if newv.IsNull() {
+				return NullDatum, nil
+			}
+			src := bv.BytesValue()
+			n := nv.Int
+			bitLen := int64(len(src)) * 8
+			if n < 0 || n >= bitLen {
+				// No Pos: byteaSetBit (varlena.c:3400-3448) has no
+				// errposition call. M0134-0070.
+				return Datum{}, &ExecError{Code: "2202E",
+					Message: fmt.Sprintf("index %d out of valid range, 0..%d", n, bitLen-1)}
+			}
+			newBit := newv.Int
+			if newBit != 0 && newBit != 1 {
+				return Datum{}, &ExecError{Code: "22023",
+					Message: "new bit must be 0 or 1"}
+			}
+			byteNo := n / 8
+			bitNo := uint(n % 8)
+			out := make([]byte, len(src))
+			copy(out, src)
+			if newBit == 0 {
+				out[byteNo] &^= 1 << bitNo
+			} else {
+				out[byteNo] |= 1 << bitNo
+			}
+			return NewBytesDatum(out), nil
 		}
 	case "encode":
 		// encode(bytea, format) -> text. Formats: base64, escape, hex
@@ -12279,6 +14187,106 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		default:
 			return NullDatum, &ExecError{Code: "22023", Pos: x.Pos(),
 				Message: fmt.Sprintf("unrecognized encoding: %q", fmtArg.Format())}
+		}
+	case "crc32":
+		// crc32(bytea) -> int8. Standard CRC-32 (IEEE/zlib polynomial).
+		// PG oracle: pg_crc.c:106-116 (crc32_bytea) —
+		// INIT_TRADITIONAL_CRC32/COMP_TRADITIONAL_CRC32/FIN_TRADITIONAL_CRC32,
+		// which is exactly the zlib CRC-32 that crc32.ChecksumIEEE computes.
+		// M0134-0070.
+		if len(x.Args) == 1 {
+			src, serr := evalExpr(x.Args[0], row, ctx)
+			if serr != nil {
+				return NullDatum, serr
+			}
+			if src.IsNull() {
+				return NullDatum, nil
+			}
+			raw := src.BytesValue()
+			if src.Kind != KindBytes {
+				b, berr := byteaIn(src.StringValue(), x.Pos())
+				if berr != nil {
+					return NullDatum, berr
+				}
+				raw = b
+			}
+			return Datum{Kind: KindInt, Int: int64(crc32.ChecksumIEEE(raw))}, nil
+		}
+	case "crc32c":
+		// crc32c(bytea) -> int8. CRC-32C (Castagnoli polynomial).
+		// PG oracle: pg_crc.c:119-128 (crc32c_bytea). M0134-0070.
+		if len(x.Args) == 1 {
+			src, serr := evalExpr(x.Args[0], row, ctx)
+			if serr != nil {
+				return NullDatum, serr
+			}
+			if src.IsNull() {
+				return NullDatum, nil
+			}
+			raw := src.BytesValue()
+			if src.Kind != KindBytes {
+				b, berr := byteaIn(src.StringValue(), x.Pos())
+				if berr != nil {
+					return NullDatum, berr
+				}
+				raw = b
+			}
+			checksum := crc32.Checksum(raw, crc32.MakeTable(crc32.Castagnoli))
+			// A CRC-32C result is unsigned 32-bit; widen to int64 without sign
+			// extension so values above 2^31 stay positive (PG_RETURN_INT64
+			// widens the unsigned pg_crc32c the same way).
+			return Datum{Kind: KindInt, Int: int64(checksum)}, nil
+		}
+	case "bit_count":
+		// bit_count(bytea) -> int8. Population count over the raw bytes.
+		// PG oracle: varlena.c bytea_bit_count — pg_popcount(VARDATA_ANY(t1),
+		// VARSIZE_ANY_EXHDR(t1)). Only the bytea overload (OID 6162) is
+		// implemented; the bit(n) overload (OID 6163) is out of scope.
+		// M0134-0070.
+		if len(x.Args) == 1 {
+			src, serr := evalExpr(x.Args[0], row, ctx)
+			if serr != nil {
+				return NullDatum, serr
+			}
+			if src.IsNull() {
+				return NullDatum, nil
+			}
+			raw := src.BytesValue()
+			if src.Kind != KindBytes {
+				b, berr := byteaIn(src.StringValue(), x.Pos())
+				if berr != nil {
+					return NullDatum, berr
+				}
+				raw = b
+			}
+			var count int64
+			i := 0
+			for ; i+8 <= len(raw); i += 8 {
+				count += int64(bits.OnesCount64(uint64(raw[i]) | uint64(raw[i+1])<<8 |
+					uint64(raw[i+2])<<16 | uint64(raw[i+3])<<24 | uint64(raw[i+4])<<32 |
+					uint64(raw[i+5])<<40 | uint64(raw[i+6])<<48 | uint64(raw[i+7])<<56))
+			}
+			for ; i < len(raw); i++ {
+				count += int64(bits.OnesCount8(raw[i]))
+			}
+			return Datum{Kind: KindInt, Int: count}, nil
+		}
+	case "unistr":
+		// unistr(text) -> text. PG oracle: varlena.c:6762-6925 (unistr).
+		// M0134-0070; see internal/executor/unistr.go for the escape scanner.
+		if len(x.Args) == 1 {
+			s, serr := evalExpr(x.Args[0], row, ctx)
+			if serr != nil {
+				return NullDatum, serr
+			}
+			if s.IsNull() {
+				return NullDatum, nil
+			}
+			out, uerr := unistrDecode(s.StringValue(), x.Pos())
+			if uerr != nil {
+				return NullDatum, uerr
+			}
+			return NewStringDatum(out), nil
 		}
 
 	// ── Misc functions (M0097-0005) ────────────────────────────────────────
@@ -13046,13 +15054,19 @@ func initCap(s string) string {
 }
 
 // padLeft left-pads s to length n using the fill string. M0097-0005.
+// PG clamps a negative target length to 0 before any buffer sizing
+// (postgres/src/backend/utils/adt/varlena.c text_lpad), returning ''.
+// M0134-0070.
 func padLeft(s string, n int, fill string) string {
+	if n < 0 {
+		n = 0
+	}
 	runes := []rune(s)
 	if len(runes) >= n {
 		return string(runes[:n])
 	}
 	if fill == "" {
-		fill = " "
+		return s
 	}
 	fillRunes := []rune(fill)
 	var buf []rune
@@ -13068,13 +15082,19 @@ func padLeft(s string, n int, fill string) string {
 }
 
 // padRight right-pads s to length n using the fill string. M0097-0005.
+// PG clamps a negative target length to 0 before any buffer sizing
+// (postgres/src/backend/utils/adt/varlena.c text_rpad), returning ''.
+// M0134-0070.
 func padRight(s string, n int, fill string) string {
+	if n < 0 {
+		n = 0
+	}
 	runes := []rune(s)
 	if len(runes) >= n {
 		return string(runes[:n])
 	}
 	if fill == "" {
-		fill = " "
+		return s
 	}
 	fillRunes := []rune(fill)
 	result := make([]rune, len(runes), n)
@@ -13370,6 +15390,19 @@ func evalSubstr(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "substr first argument must be text"}
 	}
 	if fromArg.Kind != KindInt {
+		// SQL-standard regex form: SUBSTRING(str FROM pattern) with a TEXT
+		// pattern rather than an integer start position. PG resolves this via
+		// overload resolution on the static argument type (int4 vs text); goopg's
+		// eval-time Kind check plays the same role. Only the 2-arg FROM-only form
+		// is valid here — a 3-arg call with a text pattern isn't a real PG form
+		// (PG's grammar has no FROM-pattern-FOR-count overload), so it falls
+		// through to the same error as today. M0134-0061.
+		if len(x.Args) == 2 && fromArg.Kind == KindString {
+			if src.Kind != KindString {
+				return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "substr first argument must be text"}
+			}
+			return evalSubstrRegex(src.StringValue(), fromArg.StringValue(), x.Pos())
+		}
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "substr second argument must be integer"}
 	}
 	// bytea_substr (varlena.c) slices BYTES and returns bytea. The window
@@ -13409,7 +15442,10 @@ func evalSubstr(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 	}
 	count := cntArg.Int
 	if count < 0 {
-		return Datum{}, &ExecError{Code: "22011", Pos: x.Pos(), Message: "negative substring length not allowed"}
+		// No Pos: pure runtime evaluation (text_substring,
+		// postgres/src/backend/utils/adt/varlena.c, has no errposition
+		// call). M0134-0070.
+		return Datum{}, &ExecError{Code: "22011", Message: "negative substring length not allowed"}
 	}
 	end := from + count
 	if from < 1 {
@@ -13427,6 +15463,138 @@ func evalSubstr(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 		endIdx = len(s)
 	}
 	return mkResult(s[startIdx:endIdx]), nil
+}
+
+
+// evalOverlay implements the SQL-standard
+// OVERLAY(str PLACING replacement FROM start [FOR count]) function,
+// desugared by the parser to overlay(str, replacement, start[, count]).
+// Mirrors evalSubstr's byte-indexed simplification (no multibyte
+// correctness) and text/bytea Kind-branch structure. M0134-0070.
+// PG oracle: postgres/src/backend/utils/adt/varlena.c text_overlay
+// (~line 1167) and bytea_overlay (~line 3221) — same algorithm/errors.
+func evalOverlay(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
+	if len(x.Args) != 3 && len(x.Args) != 4 {
+		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "overlay requires 3 or 4 arguments"}
+	}
+	src, err := evalExpr(x.Args[0], row, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	repl, err := evalExpr(x.Args[1], row, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	startArg, err := evalExpr(x.Args[2], row, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	if src.IsNull() || repl.IsNull() || startArg.IsNull() {
+		return NullDatum, nil
+	}
+	if src.Kind != KindString && src.Kind != KindBytes {
+		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "overlay first argument must be text"}
+	}
+	if repl.Kind != src.Kind {
+		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "overlay second argument must match first argument type"}
+	}
+	if startArg.Kind != KindInt {
+		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "overlay third argument must be integer"}
+	}
+
+	// bytea_overlay (varlena.c) slices BYTES and returns bytea — same split
+	// as evalSubstr's text/bytea Kind branch above. M0134-0070.
+	mkResult := NewStringDatum
+	if src.Kind == KindBytes {
+		mkResult = func(v string) Datum { return NewBytesDatum([]byte(v)) }
+	}
+
+	s := src.StringValue()
+	r := repl.StringValue()
+	sp := startArg.Int
+	if sp <= 0 {
+		// text_overlay/bytea_overlay: sp<=0 raises this exact wording under
+		// ERRCODE_SUBSTRING_ERROR (22011) — same constant/message evalSubstr
+		// already uses for its negative-length check above. No Pos: pure
+		// runtime evaluation (text_overlay has no errposition call).
+		return Datum{}, &ExecError{Code: "22011", Message: "negative substring length not allowed"}
+	}
+
+	sl := int64(len(r))
+	if len(x.Args) == 4 {
+		cntArg, err := evalExpr(x.Args[3], row, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if cntArg.IsNull() {
+			return NullDatum, nil
+		}
+		if cntArg.Kind != KindInt {
+			return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "overlay fourth argument must be integer"}
+		}
+		sl = cntArg.Int
+	}
+
+	// result = substring(s, 1, sp-1) + r + substring(s, sp+sl, <rest>).
+	// Mirrors text_overlay's two text_substring calls (varlena.c).
+	part1End := int(sp) - 1
+	if part1End > len(s) {
+		part1End = len(s)
+	}
+	part1 := s[:part1End]
+
+	tailStart := sp + sl
+	if tailStart < 1 {
+		tailStart = 1
+	}
+	tailIdx := int(tailStart) - 1
+	var part2 string
+	if tailIdx < len(s) {
+		part2 = s[tailIdx:]
+	}
+
+	return mkResult(part1 + r + part2), nil
+}
+
+// evalSubstrRegex implements the SQL-standard regex form of SUBSTRING —
+// `SUBSTRING(str FROM pattern)` where pattern is POSIX-regex text, not an
+// integer start position. Mirrors upstream's `textregexsubstr`
+// (postgres/src/backend/utils/adt/regexp.c:583-627): compile the pattern
+// (REG_ADVANCED upstream; here via the shared pgPatternToGoRE2 + regexp.Compile
+// path already used by evalPOSIXRegex and friends), execute with nmatch=2 (Go:
+// FindStringSubmatchIndex). If the pattern has a parenthesized subexpression
+// (re_nsub > 0), the result is ALWAYS taken from that subexpression's match —
+// even when it didn't participate in an otherwise-successful overall match
+// (upstream's own comment: `'foo(bar)?'` matches `'foo'` overall but the
+// subexpression doesn't participate, so `so < 0 || eo < 0` and the function
+// returns NULL, not the whole match). Only when the pattern has NO
+// parenthesized subexpression at all does the whole match get returned.
+// M0134-0061.
+func evalSubstrRegex(src, pattern string, pos int) (Datum, error) {
+	goPattern := pgPatternToGoRE2(pattern)
+	re, err := regexp.Compile(goPattern)
+	if err != nil {
+		// No Pos: pure runtime evaluation (textregexsubstr,
+		// postgres/src/backend/utils/adt/regexp.c, has no errposition
+		// call). M0134-0070.
+		return Datum{}, &ExecError{Code: "2201B", Message: fmt.Sprintf("invalid regular expression: %v", err)}
+	}
+	loc := re.FindStringSubmatchIndex(src)
+	if loc == nil {
+		// Overall match failed: upstream's RE_execute returns no match → NULL.
+		return NullDatum, nil
+	}
+	// loc[0],loc[1] = whole match; loc[2],loc[3] = first subexpression (if any).
+	var so, eo int
+	if len(loc) >= 4 {
+		so, eo = loc[2], loc[3]
+	} else {
+		so, eo = loc[0], loc[1]
+	}
+	if so < 0 || eo < 0 {
+		return NullDatum, nil
+	}
+	return NewStringDatum(src[so:eo]), nil
 }
 
 // evalToTimestamp implements PostgreSQL's `to_timestamp(text,

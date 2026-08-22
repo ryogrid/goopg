@@ -104,3 +104,54 @@ func TestCreateTSConfigCopy(t *testing.T) {
 		t.Errorf("err = %v, want *ExecError{Code: 42704}", err)
 	}
 }
+
+// TestCreateTSConfigCopyBuiltinLanguage guards the M0134-0068 fallback: real
+// PG's initdb seeds one pg_ts_config row per snowball language (`english`,
+// etc. — postgres/src/backend/snowball/snowball_create.sql), which goopg does
+// not model, so `COPY = english` must not 42704 like an unknown user
+// configuration. drop_if_exists.sql relies on `CREATE TEXT SEARCH
+// CONFIGURATION test_tsconfig_exists (COPY=english)` succeeding.
+func TestCreateTSConfigCopyBuiltinLanguage(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	im, ok := cat.(*catalog.InMemory)
+	if !ok {
+		t.Fatal("catalog is not *InMemory")
+	}
+
+	if err := runDDL(t, ctx, `CREATE TEXT SEARCH CONFIGURATION x (COPY=english)`); err != nil {
+		t.Fatalf("CREATE TEXT SEARCH CONFIGURATION (COPY=english): %v", err)
+	}
+
+	var xCfg *catalog.UserTSConfig
+	for _, uc := range im.ListUserTSConfigs(catalog.DefaultDBOid) {
+		if uc.Name == "x" {
+			xCfg = uc
+		}
+	}
+	if xCfg == nil {
+		t.Fatal("expected configuration x to exist")
+	}
+	if xCfg.Parser != catalog.BuiltinTSParserOID["default"] {
+		t.Errorf("x.Parser = %d, want default parser %d", xCfg.Parser, catalog.BuiltinTSParserOID["default"])
+	}
+	if len(xCfg.Mappings) != 0 {
+		t.Errorf("x.Mappings = %v, want empty (no snowball stemming modeled)", xCfg.Mappings)
+	}
+
+	if err := runDDL(t, ctx, `DROP TEXT SEARCH CONFIGURATION x`); err != nil {
+		t.Fatalf("DROP TEXT SEARCH CONFIGURATION x: %v", err)
+	}
+
+	// A genuinely unknown COPY source (not a user config, not a builtin
+	// language name) must still 42704 — the fallback must not swallow real
+	// "does not exist" errors.
+	err := runDDL(t, ctx, `CREATE TEXT SEARCH CONFIGURATION y (COPY=not_a_real_language)`)
+	if err == nil {
+		t.Fatal("COPY from a nonexistent name should error")
+	}
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42704" {
+		t.Errorf("err = %v, want *ExecError{Code: 42704}", err)
+	}
+}

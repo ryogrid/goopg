@@ -56,7 +56,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-sql,regress,postgres/src/test/regress/sql/delete.sql,pass,yes,-,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
 ,regress-sql,regress,postgres/src/test/regress/sql/dependency.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/domain.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/drop_if_exists.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+,regress-sql,regress,postgres/src/test/regress/sql/drop_if_exists.sql,pass,yes,-,M0134-0068: CREATE TEXT SEARCH CONFIGURATION COPY=<snowball language> fallback landed; scripts/pg-regress-runner.sh --verbose drop_if_exists 100% parity
 ,regress-sql,regress,postgres/src/test/regress/sql/drop_operator.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/encoding.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/enum.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
@@ -137,7 +137,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-sql,regress,postgres/src/test/regress/sql/oidjoins.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/opr_sanity.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/partition_aggregate.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/partition_info.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+,regress-sql,regress,postgres/src/test/regress/sql/partition_info.sql,pass,yes,-,M0134-0051: fixed CREATE INDEX ON ONLY to skip partition-child fan-out; 0-line diff 1/1 PASS
 ,regress-sql,regress,postgres/src/test/regress/sql/partition_join.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/partition_prune.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/password.sql,not-tried,no,-,
@@ -163,7 +163,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-sql,regress,postgres/src/test/regress/sql/rangetypes.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/regex.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/regproc.sql,not-tried,no,-,
-,regress-sql,regress,postgres/src/test/regress/sql/reindex_catalog.sql,failed,no,-,"Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13) [baseline says fail; inventory had pass — possible regression, verify]"
+,regress-sql,regress,postgres/src/test/regress/sql/reindex_catalog.sql,pass,yes,-,"M0134-0062 (2026-08-21): registered pg_shdescription virtual table + 6 nailed system-index stubs (Table=nil, no-op REINDEX) in catalog.InMemory.registerSystemTables — 1/1 PASS 100% parity via pg-regress-runner"
 ,regress-sql,regress,postgres/src/test/regress/sql/reloptions.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/replica_identity.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/returning.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope

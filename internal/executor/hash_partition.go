@@ -3,7 +3,13 @@
 // M0097-0027.
 package executor
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"strings"
+
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
+)
 
 const hashPartitionSeed uint64 = 0x7A5B22367996DCFD
 
@@ -128,4 +134,83 @@ func pgHashUint32Extended(k uint32, seed uint64) uint64 {
 	a += k
 	pgHashFinal(&a, &b, &c)
 	return (uint64(b) << 32) | uint64(c)
+}
+
+// computeHashPartitionRowHash folds the hash of every non-NULL HASH partition
+// key column into a single 64-bit row hash, mirroring PG's
+// satisfies_hash_partition()/compute_partition_hash_value() in
+// postgres/src/backend/partitioning/partbounds.c: each column's hash is
+// computed via its operator class's FUNCTION 2 hash proc (or the built-in
+// type-based hash when no custom opclass is declared), NULL columns are
+// skipped entirely (not zero-hashed), and the per-column hashes are folded
+// via hash_combine64. resolveKey(i) resolves the i-th partition key's value
+// datum (by reading the column or evaluating a partition key expression, or
+// evaluating a supplied SQL argument, depending on the caller). Shared by
+// the satisfies_hash_partition builtin (expr.go) and INSERT-time HASH
+// partition routing (operators_storage.go, routeToPartitionDepth) — M0134-0053.
+func computeHashPartitionRowHash(tbl *catalog.Table, im *catalog.InMemory, ctx *Context, pos int, resolveKey func(i int) (Datum, error)) (uint64, error) {
+	var rowHash uint64
+	numKeys := len(tbl.PartitionKey)
+	for i := 0; i < numKeys; i++ {
+		valDatum, verr := resolveKey(i)
+		if verr != nil {
+			return 0, verr
+		}
+		if valDatum.IsNull() {
+			continue // NULL values are skipped (PG behavior)
+		}
+		opClass := ""
+		if i < len(tbl.PartitionKeyOpClasses) {
+			opClass = tbl.PartitionKeyOpClasses[i]
+		}
+		var h uint64
+		if opClass != "" && im != nil && ctx != nil {
+			// Custom operator class: look up FUNCTION 2 and call it(val, seed).
+			hashFuncName, hasFn := im.LookupOpClassHashFunc(opClass)
+			if hasFn {
+				routines := ctx.Catalog.Routines()
+				if routines != nil {
+					rs := routines.LookupByName(parser.ObjectName{Name: hashFuncName})
+					seedDatum := NewIntDatum(int64(hashPartitionSeed))
+					var bestRoutine *catalog.Routine
+					for _, r := range rs {
+						if len(r.ArgTypes) == 2 {
+							bestRoutine = r
+							break
+						}
+					}
+					if bestRoutine != nil {
+						hResult, herr := executeStoredRoutine(bestRoutine, []Datum{valDatum, seedDatum}, ctx, pos)
+						if herr != nil {
+							return 0, herr
+						}
+						if !hResult.IsNull() {
+							h = uint64(hResult.Int)
+						}
+					}
+				}
+			}
+		} else {
+			// Default hash: type-based built-in hash functions.
+			colType := ""
+			if i < len(tbl.PartitionKey) {
+				for _, col := range tbl.Columns {
+					if strings.EqualFold(col.Name, tbl.PartitionKey[i]) {
+						colType = strings.ToLower(col.Type.Name)
+						break
+					}
+				}
+			}
+			switch {
+			case colType == "int4" || colType == "integer" || colType == "int" || valDatum.Kind == KindInt:
+				h = pgHashUint32Extended(uint32(valDatum.Int), hashPartitionSeed)
+			case colType == "text" || colType == "varchar" || colType == "bpchar" || valDatum.Kind == KindString:
+				h = pgHashBytesExtended([]byte(valDatum.StringValue()), hashPartitionSeed)
+			default:
+				h = pgHashUint32Extended(uint32(valDatum.Int), hashPartitionSeed)
+			}
+		}
+		rowHash = pgHashCombine64(rowHash, h)
+	}
+	return rowHash, nil
 }

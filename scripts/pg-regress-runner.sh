@@ -71,6 +71,17 @@ export PG_ABS_SRCDIR="${REGRESS_SQL%/*}"   # postgres/src/test/regress (holds da
 export PG_LIBDIR="${REGRESS_SQL%/*}"
 export PG_DLSUFFIX=".so"
 
+# Export the same session-format env vars pg_regress sets before invoking each
+# test's psql client (postgres/src/test/regress/pg_regress.c:783-796), so the
+# expected/*.out files (captured under Postgres/MDY datestyle, America/Los_Angeles
+# timezone, and postgres_verbose interval style) compare against a matching
+# session instead of goopg's ISO/MDY session defaults. Append to any
+# caller-supplied PGOPTIONS rather than clobbering it, matching pg_regress.c's
+# own append behavior.
+export PGTZ="America/Los_Angeles"
+export PGDATESTYLE="Postgres, MDY"
+export PGOPTIONS="${PGOPTIONS:+${PGOPTIONS} }-c intervalstyle=postgres_verbose"
+
 # -------------------------------------------------------------------------- #
 # Defaults
 # -------------------------------------------------------------------------- #
@@ -217,6 +228,18 @@ PSQL=(psql -h 127.0.0.1 -p "${PORT}" -U postgres -d postgres --no-psqlrc -X -a -
 # -------------------------------------------------------------------------- #
 # Run test_setup.sql (best-effort: goopg may not support everything)
 # -------------------------------------------------------------------------- #
+# is_named_test: true if $1 is one of the caller-requested named tests
+# (NAMED_TESTS[@]), which is fully populated by line 151, above this block.
+# Used below to skip a setup prerequisite that is ALSO the requested named
+# test itself, so it does not run twice against the same live DB (M0134-0048).
+is_named_test() {
+    local n
+    for n in "${NAMED_TESTS[@]}"; do
+        [[ "$n" == "$1" ]] && return 0
+    done
+    return 1
+}
+
 if [[ "$RUN_SETUP" -eq 1 ]]; then
     echo "pg-regress-runner: running test_setup.sql (errors are expected for unimplemented features)..."
     # Run the file un-stripped: \getenv/\set are standard psql meta-commands
@@ -224,7 +247,6 @@ if [[ "$RUN_SETUP" -eq 1 ]]; then
     # and test_setup.sql has no \setenv. Best-effort: the C-language regresslib
     # CREATE FUNCTIONs cannot load in goopg, so tolerate their failures.
     "${PSQL[@]}" -f "${REGRESS_SQL}/test_setup.sql" >/dev/null 2>&1 || true
-    echo "pg-regress-runner: running create_misc.sql (a_star..f_star inheritance chain for select_parallel.sql)..."
     # create_misc.sql creates the a_star/b_star/c_star/d_star/e_star/f_star
     # single/multiple-inheritance chain that select_parallel.sql:23 reads
     # (select round(avg(aa)), sum(aa) from a_star). Upstream runs it as a
@@ -234,8 +256,12 @@ if [[ "$RUN_SETUP" -eq 1 ]]; then
     # may not support every construct in the file, but the tables that do
     # get created must persist so the separate psql -f of select_parallel.sql
     # sees them in the same 'postgres' DB.
-    "${PSQL[@]}" -f "${REGRESS_SQL}/create_misc.sql" >/dev/null 2>&1 || true
-    echo "pg-regress-runner: running create_index.sql (btree indexes for aggregates.sql)..."
+    if is_named_test "create_misc"; then
+        echo "pg-regress-runner: skipping create_misc.sql prerequisite (it is also the requested named test — will run once, as the test itself)"
+    else
+        echo "pg-regress-runner: running create_misc.sql (a_star..f_star inheritance chain for select_parallel.sql)..."
+        "${PSQL[@]}" -f "${REGRESS_SQL}/create_misc.sql" >/dev/null 2>&1 || true
+    fi
     # create_index.sql creates the btree indexes (tenk1_unique1/unique2/
     # hundred/thous_tenthous, tenk2_unique1/unique2, onek_*) that the S6
     # min/max rewrite needs so aggregates.sql's min/max blocks plan as
@@ -245,8 +271,28 @@ if [[ "$RUN_SETUP" -eq 1 ]]; then
     # (postgres/src/test/regress/parallel_schedule). Best-effort like the
     # siblings: the btree CREATE INDEXes at create_index.sql:12-34 come first,
     # so an early timeout 300 still leaves tenk1/tenk2/onek indexed.
-    timeout 300 "${PSQL[@]}" -f "${REGRESS_SQL}/create_index.sql" >/dev/null 2>&1 || true
-    echo "pg-regress-runner: running create_aggregate.sql (user-defined aggregates for aggregates.sql)..."
+    if is_named_test "create_index"; then
+        echo "pg-regress-runner: skipping create_index.sql prerequisite (it is also the requested named test — will run once, as the test itself)"
+    else
+        echo "pg-regress-runner: running create_index.sql (btree indexes for aggregates.sql)..."
+        timeout 300 "${PSQL[@]}" -f "${REGRESS_SQL}/create_index.sql" >/dev/null 2>&1 || true
+    fi
+    # create_view.sql creates the views (street, iexit, toyemp,
+    # my_property_normal/my_property_secure, and friends) that
+    # select_views.sql references throughout. Upstream runs create_view in
+    # the same schedule group as create_index (postgres/src/test/regress/
+    # parallel_schedule:46), and the very next group's comment says it
+    # explicitly: "select_views depends on create_view"
+    # (postgres/src/test/regress/parallel_schedule:103,105). Best-effort like
+    # the siblings: goopg may not support every view form in the file, but
+    # the views that do get created must persist so the separate psql -f of
+    # select_views.sql sees them in the same 'postgres' DB.
+    if is_named_test "create_view"; then
+        echo "pg-regress-runner: skipping create_view.sql prerequisite (it is also the requested named test — will run once, as the test itself)"
+    else
+        echo "pg-regress-runner: running create_view.sql (street/iexit/toyemp/my_property_secure etc. for select_views.sql)..."
+        "${PSQL[@]}" -f "${REGRESS_SQL}/create_view.sql" >/dev/null 2>&1 || true
+    fi
     # create_aggregate.sql defines the user-defined aggregates that
     # aggregates.sql references (newavg/newsum/newcnt/oldcnt/aggfstr/aggfns/
     # sum2/least_agg/cleast_agg/test_rank/test_percentile_disc). Upstream runs
@@ -255,7 +301,12 @@ if [[ "$RUN_SETUP" -eq 1 ]]; then
     # test_setup.sql: goopg may not support every CREATE AGGREGATE form, but
     # the ones it does support must persist so the separate psql -f of
     # aggregates.sql sees them in the same 'postgres' DB.
-    "${PSQL[@]}" -f "${REGRESS_SQL}/create_aggregate.sql" >/dev/null 2>&1 || true
+    if is_named_test "create_aggregate"; then
+        echo "pg-regress-runner: skipping create_aggregate.sql prerequisite (it is also the requested named test — will run once, as the test itself)"
+    else
+        echo "pg-regress-runner: running create_aggregate.sql (user-defined aggregates for aggregates.sql)..."
+        "${PSQL[@]}" -f "${REGRESS_SQL}/create_aggregate.sql" >/dev/null 2>&1 || true
+    fi
     echo "pg-regress-runner: setup done."
 fi
 

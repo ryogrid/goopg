@@ -1522,6 +1522,14 @@ func decodePhysicalPGValueMctxStyled(t catalog.Type, data []byte, sctx *mmgr.Con
 			if len(data) < 1 {
 				return Datum{}, 0, fmt.Errorf("truncated char")
 			}
+			// Mirror encodeValuePGCtx's "char" branch (encodes "" as byte 0)
+			// and charTypeDisplayForm's byte-0 rule (expr.go): a stored NUL
+			// byte normalizes to the empty string, keeping encode/decode
+			// symmetric. Other bytes decode to their raw 1-byte string form
+			// unchanged (display-side octal escaping does not apply here).
+			if data[0] == 0 {
+				return NewStringDatum(""), 1, nil
+			}
 			return NewStringDatum(string(data[:1])), 1, nil
 		}
 		// char(N) = bpchar = varlena; fall through to varlena branch.

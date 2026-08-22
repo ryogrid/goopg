@@ -69,6 +69,8 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 		return maybeInstrument(p, newPgAvailableWalSummariesOp(p)), nil
 	case *optimizer.PgGetSequenceData:
 		return maybeInstrument(p, newPgGetSequenceDataOp(p)), nil
+	case *optimizer.PgSequenceParameters:
+		return maybeInstrument(p, newPgSequenceParametersOp(p)), nil
 	case *optimizer.TSTokenType:
 		return maybeInstrument(p, newTSTokenTypeOp(p)), nil
 	case *optimizer.VerifyHeapam:
@@ -87,6 +89,8 @@ func buildNode(plan optimizer.Node) (Operator, error) {
 		return maybeInstrument(p, newPgOptionsToTableOp(p)), nil
 	case *optimizer.FromRegexpMatches:
 		return maybeInstrument(p, newFromRegexpMatchesOp(p)), nil
+	case *optimizer.FromRegexpSplitToTable:
+		return maybeInstrument(p, newFromRegexpSplitToTableOp(p)), nil
 	case *optimizer.CTEScan:
 		// CTEScan wraps the inlined CTE body. Use cteScanOp which materializes
 		// all rows on first Open() and replays them on subsequent Open() calls

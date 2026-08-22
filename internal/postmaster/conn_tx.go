@@ -658,6 +658,14 @@ type preparedStatementDef struct {
 	sql         string   // original PREPARE … AS … text for pg_prepared_statements
 	paramTypes  []string // declared parameter types from PREPARE (…); nil = no declaration
 	resultTypes []string // inferred output column types; nil = unknown
+	// resultNames holds the output column names captured at PREPARE time,
+	// parallel to resultTypes. Used by EXECUTE to detect a result-type change
+	// (e.g. an intervening ALTER TABLE ADD COLUMN on a `SELECT *` source) the
+	// same way PostgreSQL's RevalidateCachedQuery compares
+	// PlanCacheComputeResultDesc(tlist) against plansource->resultDesc via
+	// equalRowTypes (postgres/src/backend/utils/cache/plancache.c:858).
+	// M0134-0054 bucket 5.
+	resultNames []string
 }
 
 // preparedStatements stores named prepared SQL statements for this connection.
@@ -698,6 +706,19 @@ func (ps *preparedStatements) SetParamTypes(name string, types []string) {
 func (ps *preparedStatements) SetResultTypes(name string, types []string) {
 	ps.mu.Lock()
 	if def, ok := ps.stmts[name]; ok {
+		def.resultTypes = types
+		ps.stmts[name] = def
+	}
+	ps.mu.Unlock()
+}
+
+// SetResultSchema updates both the inferred result column names and types for
+// an existing prepared statement, captured once at PREPARE time so EXECUTE can
+// later detect a result-type change (M0134-0054 bucket 5).
+func (ps *preparedStatements) SetResultSchema(name string, names, types []string) {
+	ps.mu.Lock()
+	if def, ok := ps.stmts[name]; ok {
+		def.resultNames = names
 		def.resultTypes = types
 		ps.stmts[name] = def
 	}

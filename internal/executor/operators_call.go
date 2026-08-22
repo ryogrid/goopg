@@ -750,7 +750,7 @@ func isKnownBuiltinFunction(name string) bool {
 		"generate_series", "unnest",
 		"pg_sleep", "pg_typeof", "version", "clock_timestamp",
 		"date_trunc", "date_part", "extract", "age", "make_date",
-		"encode", "decode", "md5", "sha256":
+		"encode", "decode", "md5", "sha224", "sha256", "sha384", "sha512":
 		return true
 	}
 	return false

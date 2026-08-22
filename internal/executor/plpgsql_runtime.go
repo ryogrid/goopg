@@ -692,6 +692,20 @@ func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos in
 		defer op.Close()
 		var out []Datum
 		retType := normalizeCatalogType(r.ReturnType)
+		// A SETOF <composite-table-type> function's body yields one row per
+		// output tuple with N columns (N = the composite's arity), not a
+		// single pre-packed composite Datum — e.g. `RETURNS SETOF rngfunc2`
+		// with a body of `SELECT * FROM rngfunc2 ...` produces 2-column
+		// rows. Serialize each such row into composite text notation so the
+		// caller (userSrfScanOp.Next, decomposeCompositeText) can decompose
+		// it back into individual columns, matching the OUT-parameter /
+		// non-SETOF composite convention elsewhere in this file
+		// (rowToCompositeText). Before this fix only row[0] was kept,
+		// silently dropping every column past the first. M0134-0059.
+		var compositeCols []catalog.Column
+		if compTbl, ok := ctxPlanCatalog(child).LookupTable(parser.ObjectName{Name: strings.ToLower(r.ReturnType.Name)}); ok && len(compTbl.Columns) > 0 {
+			compositeCols = compTbl.Columns
+		}
 		for {
 			slot, nextErr := op.Next()
 			if nextErr == EOF {
@@ -703,6 +717,10 @@ func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos in
 			row := slotRow(slot)
 			if len(row) == 0 {
 				out = append(out, NullDatum)
+				continue
+			}
+			if compositeCols != nil && len(row) > 1 {
+				out = append(out, NewStringDatum(rowToCompositeText(compositeCols, row)))
 				continue
 			}
 			coerced, err := coerceDatumToType(row[0], retType, pos, fmt.Sprintf("return value of function %s", r.QualifiedName()))
@@ -2467,6 +2485,22 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (optimizer.Expr, error
 			sub = &optimizer.BinaryOp{Op: parser.OpAdd, Left: sub, Right: &optimizer.IntegerConst{Value: 1}}
 		}
 		return &optimizer.FuncCall{Name: "array_subscript", Args: []optimizer.Expr{arr, sub}}, nil
+	case *parser.RowExpr:
+		// ROW(...) constructor (e.g. `RETURN row(10,'aaa',NULL,30)`). Lower
+		// each field expression and reuse optimizer.RowExpr — the same node
+		// the SQL planner produces for row constructors (planner.go's
+		// resolveExpr case *parser.RowExpr) — so evaluation goes through the
+		// existing evalRowExpr composite-text builder (expr.go) shared by
+		// both callers. M0134-0055 bucket B.
+		elems := make([]optimizer.Expr, len(x.Elems))
+		for i, el := range x.Elems {
+			le, err := lowerPLpgSQLExpr(el, frame)
+			if err != nil {
+				return nil, err
+			}
+			elems[i] = le
+		}
+		return &optimizer.RowExpr{Elems: elems}, nil
 	default:
 		return nil, &ExecError{Code: "0A000", Pos: e.Pos(), Message: fmt.Sprintf("unsupported PL/pgSQL expression %T", e)}
 	}

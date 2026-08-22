@@ -657,3 +657,32 @@ func TestParseGrantRevokeEmbeddedSQL(t *testing.T) {
 		}
 	}
 }
+
+// TestParseSetLocalEmbeddedSQL: a bare `SET LOCAL x = y;` (or plain `SET`)
+// statement in a PL/pgSQL body parses as an embedded SQL statement, mirroring
+// PG's plpgsql grammar which treats SET as an ordinary stmt_execsql form (no
+// dedicated SET statement type; see pl_gram.y). Before M0134-0046 this failed
+// with "unsupported PL/pgSQL statement" — misc_functions.sql's
+// explain_mask_costs() function opens with `SET LOCAL jit = 0;`.
+func TestParseSetLocalEmbeddedSQL(t *testing.T) {
+	for _, sql := range []string{
+		"BEGIN SET LOCAL jit = 0; END",
+		"BEGIN SET SESSION jit = 0; END",
+		"BEGIN SET jit = 0; END",
+	} {
+		blk, err := Parse(sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", sql, err)
+		}
+		if len(blk.Statements) != 1 {
+			t.Fatalf("Parse(%q): Statements len = %d, want 1", sql, len(blk.Statements))
+		}
+		stmt, ok := blk.Statements[0].(*SQLStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): stmt = %T, want *SQLStmt", sql, blk.Statements[0])
+		}
+		if !strings.HasPrefix(strings.ToUpper(stmt.SQL), "SET") {
+			t.Errorf("Parse(%q): SQL = %q, want it to capture the full statement", sql, stmt.SQL)
+		}
+	}
+}

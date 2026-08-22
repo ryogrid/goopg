@@ -79,6 +79,17 @@ type SeqParams struct {
 // meant DefaultDBOid. M0110-0001 (DU-002 slice 115).
 var SequenceParamsFunc func(qualifiedName string, dbOid uint32) (SeqParams, bool)
 
+// FindSequenceOwnedByFunc is set by the executor at init, sibling to
+// SequenceParamsFunc above (same "avoids an import cycle" rationale: the
+// planner needs to resolve a SERIAL/IDENTITY column's *current* sequence
+// name — which may differ from the naming-convention name after an ALTER
+// SEQUENCE ... RENAME — without importing internal/executor). owner is
+// "table.column" (matches the format internal/executor/operators_sequence.go's
+// SetSequenceOwnedBy already uses). Returns the current sequence name and
+// whether one was found; nil until the executor registers it. M0134-0069
+// bucket 4.
+var FindSequenceOwnedByFunc func(owner string, dbOid uint32) (string, bool)
+
 // Type is the textual type tag plus an optional typmod argument list.
 // v0 keeps types as strings so the planner doesn't need a real type
 // system; the executor casts based on Type.Name until the type system
@@ -1259,6 +1270,27 @@ func (c *InMemory) ToastRelFileNode(parentRel storage.RelFileNode) (storage.RelF
 	return toast, true
 }
 
+// ToastRelFileNodeByOID resolves a synthetic TOAST relation OID (parent OID +
+// toastRelidOffset, the range [100M, 200M)) to its main-fork RelFileNode, so
+// pg_relation_size(reltoastrelid) can size the live toast heap. Returns false
+// for the TOAST index range [200M, 300M) (which must NOT be routed through
+// ToastRelFileNode — that returns the toast *relation* relid, the wrong file;
+// goopg materializes no physical toast index) and for non-TOAST OIDs. Mirrors
+// PG, where reltoastrelid is a real relkind='t' relation that try_relation_open
+// opens (postgres/src/backend/utils/adt/dbsize.c:371-381) and
+// calculate_relation_size (dbsize.c:326) sizes. M0134-0070 (design
+// m0134-0070-toast-pg-relation-size.md).
+func (c *InMemory) ToastRelFileNodeByOID(toastRelOID uint32) (storage.RelFileNode, bool) {
+	if toastRelOID < toastRelidOffset || toastRelOID >= toastIndexOidOffset {
+		return storage.RelFileNode{}, false
+	}
+	parent, ok := c.ToastParentTable(toastRelOID)
+	if !ok {
+		return storage.RelFileNode{}, false
+	}
+	return c.ToastRelFileNode(c.RelFileNode(parent))
+}
+
 // toastBearingTables returns every relation in dbOid's namespace that owns an
 // auto-exposed TOAST relation, under the SAME visibility filter the pg_class
 // virtual builder applies to its main table loop (non-virtual ordinary tables
@@ -2062,6 +2094,15 @@ type Catalog interface {
 	MaterializeOwnerACL(relOID uint32, owner string, ownerPrivs []string)
 	// HasTablePrivilege reports whether role was granted priv on relOID.
 	HasTablePrivilege(relOID uint32, role, priv string) bool
+	// IsOwnerACLRevoked reports whether relOID's owner has had its implicit
+	// default ACL touched by an explicit REVOKE — i.e. relACLEmptied or
+	// relACLOwnerRevoked is set for relOID. M0134-0069 bucket 7.
+	IsOwnerACLRevoked(relOID uint32) bool
+	// HasOwnerPrivilege reports whether relOID's materialized owner ACL entry
+	// (stored under the internal owner sentinel role) grants priv. Only
+	// meaningful once IsOwnerACLRevoked is true; callers should fall back to
+	// the unconditional owner bypass otherwise. M0134-0069 bucket 7.
+	HasOwnerPrivilege(relOID uint32, priv string) bool
 	// ProcACLText renders the materialized pg_proc.proacl text for a routine OID,
 	// or "" when proacl is still NULL (no GRANT/REVOKE recorded). The function
 	// REVOKE recorder uses the NULL result to decide whether to expand the
@@ -3498,6 +3539,49 @@ var BuiltinTSDictOID = map[string]uint32{
 	"simple": 3765,
 }
 
+// BuiltinTSConfigLanguages is the set of snowball-stemmer language names real
+// PG's initdb creates as pg_ts_config rows (each `CREATE TEXT SEARCH
+// CONFIGURATION pg_catalog.<lang> (PARSER = default);` + a mapping to
+// `<lang>_stem`, `postgres/src/backend/snowball/snowball_create.sql`) — unlike
+// `simple` (the only *bootstrap* pg_ts_config.dat row, `postgres/src/include/
+// catalog/pg_ts_config.dat`), these are not static catalog constants with
+// fixed OIDs, so goopg does not model them as real catalog rows. This set only
+// lets `CREATE TEXT SEARCH CONFIGURATION x (COPY = <lang>)` resolve a valid
+// COPY source name (with an empty mapping set, since goopg implements no
+// snowball stemming) instead of erroring 42704 "does not exist". DU-002
+// follow-up (M0134-0068).
+var BuiltinTSConfigLanguages = map[string]bool{
+	"arabic":     true,
+	"armenian":   true,
+	"basque":     true,
+	"catalan":    true,
+	"danish":     true,
+	"dutch":      true,
+	"english":    true,
+	"estonian":   true,
+	"finnish":    true,
+	"french":     true,
+	"german":     true,
+	"greek":      true,
+	"hindi":      true,
+	"hungarian":  true,
+	"indonesian": true,
+	"irish":      true,
+	"italian":    true,
+	"lithuanian": true,
+	"nepali":     true,
+	"norwegian":  true,
+	"portuguese": true,
+	"romanian":   true,
+	"russian":    true,
+	"serbian":    true,
+	"spanish":    true,
+	"swedish":    true,
+	"tamil":      true,
+	"turkish":    true,
+	"yiddish":    true,
+}
+
 // TSTokenType is one row of ts_token_type()'s fixed output for the "default"
 // parser: (tokid, alias, description). Mirrors wparser_def.c's static
 // lex_descr table (the only parser goopg models). Order matches upstream's
@@ -4149,9 +4233,32 @@ func (c *InMemory) BuildStatisticsObjDef(obj *StatisticsObject) string {
 	}
 
 	sb.WriteString(" ON ")
-	// PG emits all simple columns first (in stxkeys order) then all expression
-	// targets, regardless of their original ON-list order; colno spans both lists
-	// for comma separation. Mirrors pg_get_statisticsobj_worker (ruleutils.c).
+	sb.WriteString(c.statisticsObjColumnsList(obj))
+
+	// FROM relation, schema-qualified (pg_dump runs with an empty search_path so
+	// generate_relation_name always qualifies).
+	sb.WriteString(" FROM ")
+	relSchema, relName := schema, ""
+	if tbl, ok := c.LookupTableByOID(obj.TableOID); ok {
+		relName = tbl.Name
+		if tbl.Schema != "" {
+			relSchema = tbl.Schema
+		}
+	}
+	sb.WriteString(quoteCollationIdent(relSchema))
+	sb.WriteByte('.')
+	sb.WriteString(quoteCollationIdent(relName))
+	return sb.String()
+}
+
+// statisticsObjColumnsList renders the comma-joined "col1, col2, (expr)" list
+// for a statistics object's ON target list (no leading "ON ", no trailing
+// "FROM ..."). PG emits all simple columns first (in stxkeys order) then all
+// expression targets, regardless of their original ON-list order; colno spans
+// both lists for comma separation. Mirrors pg_get_statisticsobj_worker
+// (ruleutils.c). Shared by BuildStatisticsObjDef and BuildStatisticsObjDefColumns.
+func (c *InMemory) statisticsObjColumnsList(obj *StatisticsObject) string {
+	var sb strings.Builder
 	colno := 0
 	for _, col := range obj.Columns {
 		if colno > 0 {
@@ -4169,21 +4276,20 @@ func (c *InMemory) BuildStatisticsObjDef(obj *StatisticsObject) string {
 		sb.WriteString(e)
 		colno++
 	}
-
-	// FROM relation, schema-qualified (pg_dump runs with an empty search_path so
-	// generate_relation_name always qualifies).
-	sb.WriteString(" FROM ")
-	relSchema, relName := schema, ""
-	if tbl, ok := c.LookupTableByOID(obj.TableOID); ok {
-		relName = tbl.Name
-		if tbl.Schema != "" {
-			relSchema = tbl.Schema
-		}
-	}
-	sb.WriteString(quoteCollationIdent(relSchema))
-	sb.WriteByte('.')
-	sb.WriteString(quoteCollationIdent(relName))
 	return sb.String()
+}
+
+// BuildStatisticsObjDefColumns returns the columns_only rendering used by
+// pg_get_statisticsobjdef_columns — psql's \d+ "Statistics objects:" footer
+// queries this directly (describe.c) and appends its own "FROM <regclass>"
+// using stxrelid, so this must NOT include "FROM". Mirrors
+// pg_get_statisticsobj_worker(statextid, columns_only=true, ...) in
+// ruleutils.c (postgres/src/backend/utils/adt/ruleutils.c:1654).
+func (c *InMemory) BuildStatisticsObjDefColumns(obj *StatisticsObject) string {
+	if obj == nil || (obj.HasExpr && len(obj.Exprs) == 0) {
+		return ""
+	}
+	return c.statisticsObjColumnsList(obj)
 }
 
 // SetComment stores a description for an object in pg_description.
@@ -8324,6 +8430,62 @@ func (c *InMemory) registerSystemTables() {
 		return out
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_database"] = pgDatabase
+
+	// pg_shdescription — stores COMMENT ON <shared object> descriptions (OID
+	// 3592, matches the placeholder heap file initdb bootstraps under
+	// global/3592 — bootstrapSharedCatalogPlaceholders,
+	// internal/initdb/initdb.go). goopg doesn't track shared-object comments
+	// yet (COMMENT ON DATABASE/ROLE/TABLESPACE is a no-op), so this is a
+	// permanently-empty stub — same rationale as pg_description above, but for
+	// the shared (cluster-wide, not per-database) comment catalog. Registered
+	// so `REINDEX TABLE pg_shdescription` and any plain `SELECT * FROM
+	// pg_shdescription` resolve instead of erroring "relation does not exist".
+	// M0134-0062 (reindex_catalog.sql regress parity).
+	pgShdescription := &Table{
+		Schema: "pg_catalog", Name: "pg_shdescription", Virtual: true,
+		Columns: []Column{
+			{Name: "objoid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "classoid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "description", Type: Type{Name: "text"}, Ordinal: 2},
+		},
+		OID: 3592,
+	}
+	pgShdescription.VirtualRows = func() [][]string { return nil }
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_shdescription"] = pgShdescription
+
+	// Nailed system index stubs — REINDEX INDEX <name> on a nailed catalog
+	// index (pg_class_oid_index etc.) needs LookupIndex to resolve the name;
+	// upstream PG's relcache always knows every nailed index, but goopg's
+	// ns.indexes map is otherwise populated only by user CREATE INDEX +
+	// heap-reload (never by the bootstrap-time nailed indexes). Table is left
+	// nil deliberately: rebuildIndex's existing `idx.Table == nil` guard
+	// (operators_reindex.go) then makes REINDEX INDEX on these a safe no-op —
+	// a real physical rebuild would require resolving the pg_class
+	// virtual/heap dual-representation problem, out of scope here. OIDs/names
+	// mirror internal/initdb/relcache_init.go's nailedSharedRels/
+	// nailedLocalRels tables (pg_shdescription_o_c_index isn't listed there —
+	// it takes its OID, 2397, from upstream's DECLARE_UNIQUE_INDEX_PKEY in
+	// postgres/src/include/catalog/pg_shdescription.h since goopg has no
+	// physical pg_shdescription heap/btree to nail). M0134-0062.
+	for _, stub := range []struct {
+		name string
+		oid  uint32
+	}{
+		{"pg_class_oid_index", 2662},
+		{"pg_class_relname_nsp_index", 2663},
+		{"pg_index_indexrelid_index", 2679},
+		{"pg_index_indrelid_index", 2678},
+		{"pg_database_oid_index", 2672},
+		{"pg_shdescription_o_c_index", 2397},
+	} {
+		c.ns(DefaultDBOid).indexes[stub.name] = &Index{
+			Schema: "pg_catalog",
+			Name:   stub.name,
+			Method: "btree",
+			OID:    stub.oid,
+			DBOid:  DefaultDBOid,
+		}
+	}
 
 	// pg_roles — HammerDB probes
 	// `SELECT 1 FROM pg_roles WHERE rolname = '<user>'` before
@@ -16410,6 +16572,22 @@ func (c *InMemory) HasTablePrivilege(relOID uint32, role, priv string) bool {
 	return ok
 }
 
+// IsOwnerACLRevoked reports whether relOID's owner has had its implicit
+// default ACL touched by an explicit REVOKE. Mirrors the inline check used by
+// MaterializeOwnerACL and relaclTextLockedFor. M0134-0069 bucket 7.
+func (c *InMemory) IsOwnerACLRevoked(relOID uint32) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.relACLEmptied[relOID] || c.relACLOwnerRevoked[relOID]
+}
+
+// HasOwnerPrivilege reports whether relOID's materialized owner ACL entry
+// grants priv. Equivalent to HasTablePrivilege(relOID, aclOwnerRole, priv).
+// M0134-0069 bucket 7.
+func (c *InMemory) HasOwnerPrivilege(relOID uint32, priv string) bool {
+	return c.HasTablePrivilege(relOID, aclOwnerRole, priv)
+}
+
 // DropTableACL forgets all privileges recorded for relOID. M0118-0008.
 func (c *InMemory) DropTableACL(relOID uint32) {
 	c.mu.Lock()
@@ -23500,6 +23678,116 @@ func (c *InMemory) DropDomain(name string, ifExists bool, cascade bool, dbOid ..
 	}
 	delete(c.domains, regKey)
 	return dropped, nil
+}
+
+// FindColumnUsingDomainTransitively scans every non-virtual table's columns
+// for the first one whose type IS domainName, or transitively CONTAINS it
+// through a composite field, a domain-of-domain base, or a range subtype.
+// Mirrors PG's get_rels_with_domain (typecmds.c:3316), which
+// validateDomainCheckConstraint (typecmds.c:3196) calls before running the
+// new CHECK against existing rows, and which delegates the transitive walk to
+// find_composite_type_dependencies (tablecmds.c:6936) — used by
+// execAlterDomain's "addconstraint" case to reject ALTER DOMAIN ADD
+// CONSTRAINT up front, matching PG's ERRCODE_FEATURE_NOT_SUPPORTED
+// "cannot alter type %q because column %q.%q uses it" (tablecmds.c:7039-7044).
+// Returns the FIRST dependent table+column found; PG's test suite only ever
+// exercises a single dependent column per case, and enumerating every one is
+// out of scope (M0134-0067 Bucket 3).
+func (c *InMemory) FindColumnUsingDomainTransitively(domainName string, dbOid uint32) (tableName, columnName string, found bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	// Translate the connection's raw dbOid the same way LookupTable/
+	// execCreateTable's callers do, so a 0 (test fixture default) or the
+	// bootstrap "postgres" dbOid both resolve to the namespace tables are
+	// actually registered under (DefaultDBOid). See NamespaceDBOid's doc
+	// comment.
+	dbOid = NamespaceDBOid(dbOid)
+	domainKeyLower := strings.ToLower(domainName)
+	for _, tbl := range c.ns(dbOid).tables {
+		if tbl.Virtual {
+			continue
+		}
+		for _, col := range tbl.Columns {
+			if col.Dropped {
+				continue
+			}
+			// DeclaredTypeName holds the original DDL type name (e.g.
+			// "posint") when addCol's CREATE TABLE handling already resolved
+			// col.Type.Name to the domain's base type — check both, since a
+			// direct domain column only survives in DeclaredTypeName while a
+			// column nested inside a composite/range/domain-of-domain still
+			// carries its declared name in Type.Name.
+			if c.typeUsesDomainLocked(col.Type.Name, domainKeyLower, dbOid, nil, 0) ||
+				c.typeUsesDomainLocked(col.DeclaredTypeName, domainKeyLower, dbOid, nil, 0) {
+				return tbl.Name, col.Name, true
+			}
+		}
+	}
+	return "", "", false
+}
+
+// typeUsesDomainLocked reports whether typeName equals domainKeyLower
+// (already lower-cased) or transitively resolves to it through a composite
+// type's field, a domain-of-domain's base type, or a range type's subtype.
+// Caller must already hold c.mu (read or write) — mirrors the
+// locked-recursive-helper idiom of resolveColumnTypeLocked (~line 23609).
+// visited guards cycles by type name; depth caps runaway recursion at 16.
+func (c *InMemory) typeUsesDomainLocked(typeName, domainKeyLower string, dbOid uint32, visited map[string]bool, depth int) bool {
+	if depth > 16 {
+		return false
+	}
+	k := strings.ToLower(typeName)
+	if k == "" {
+		return false
+	}
+	if k == domainKeyLower {
+		return true
+	}
+	if visited == nil {
+		visited = make(map[string]bool)
+	}
+	if visited[k] {
+		return false
+	}
+	visited[k] = true
+	// The array-ness suffix ("[]", possibly repeated) doesn't change which
+	// named type is nested (CREATE DOMAIN's parser appends it literally to
+	// BaseType, e.g. "ddtest1[]" — see internal/parser/ddl.go's
+	// parseCreateDomain), so strip it before every registry lookup below.
+	base := strings.TrimSuffix(k, "[]")
+	// Composite type: recurse into every field's declared type.
+	ct, ok := c.compositeTypes[compositeKey(dbOid, base)]
+	if !ok {
+		ct = c.lookupCompositeTypeByNameLocked(base)
+	}
+	if ct != nil {
+		for _, f := range ct.Fields {
+			if c.typeUsesDomainLocked(f.ColType, domainKeyLower, dbOid, visited, depth+1) {
+				return true
+			}
+		}
+	}
+	// Domain-of-domain: recurse into the base type name.
+	d, ok := c.domains[domainKey(dbOid, base)]
+	if !ok {
+		d = c.lookupDomainByNameLocked(base)
+	}
+	if d != nil {
+		if c.typeUsesDomainLocked(d.Base.Name, domainKeyLower, dbOid, visited, depth+1) {
+			return true
+		}
+	}
+	// Range type: recurse into the subtype name.
+	rt, ok := c.rangeTypes[rangeKey(dbOid, base)]
+	if !ok {
+		rt = c.lookupRangeTypeByNameLocked(base)
+	}
+	if rt != nil {
+		if c.typeUsesDomainLocked(rt.SubtypeName, domainKeyLower, dbOid, visited, depth+1) {
+			return true
+		}
+	}
+	return false
 }
 
 // ResolveColumnType resolves a column type name through the domain and enum
