@@ -12471,6 +12471,17 @@ func evalFuncCall(x *optimizer.FuncCall, row Row, ctx *Context) (Datum, error) {
 						start = v.Int
 					} else {
 						flagsStr = v.StringValue()
+						// M0134-0070: textregexreplace (4-arg text overload, oid
+						// 2285) adds a HINT when the 4th arg is non-empty and its
+						// first byte is '0'..'9' — the user probably meant the
+						// start-parameter form (regexp.c:673-684). Print the WHOLE
+						// opt via pg_mblen_range, not the shared helper's %q-of-
+						// first-rune, so "1z" doesn't truncate to "1".
+						if len(flagsStr) > 0 && flagsStr[0] >= '0' && flagsStr[0] <= '9' {
+							return NullDatum, &ExecError{Code: "22023",
+								Message: "invalid regular expression option: \"" + flagsStr + "\"",
+								Hint:    "If you meant to use regexp_replace() with a start parameter, cast the fourth argument to integer explicitly."}
+						}
 					}
 				}
 			case 5:
