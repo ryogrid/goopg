@@ -3207,6 +3207,30 @@ func (p *parser) tryTypedLiteral() (Expr, bool) {
 				return &TypedStringLit{pos: pos, Type: typName, Value: strTok.Value}, true
 			}
 		}
+		// `typename ( intlit ) 'string'` — the character-string types char(N),
+		// varchar(N), bpchar(N) take a single-integer length typmod. PG
+		// grammar `character '(' Iconst ')' Sconst` (gram.y ConstTypename Sconst
+		// → makeStringConstCast); padding/truncation is applied later at
+		// coercion, so the typmod is deliberately ignored here and the raw
+		// string is returned (M0134-0070). Restricted to char/bpchar/varchar;
+		// text/numeric/etc. must NOT consume this shape.
+		if (name == "char" || name == "bpchar" || name == "varchar") &&
+			p.peek(1).Kind == TokenSymbol && p.peek(1).Value == "(" {
+			numTok := p.peek(2)
+			closeTok := p.peek(3)
+			strTok := p.peek(4)
+			if numTok.Kind == TokenIntLit && closeTok.Kind == TokenSymbol &&
+				closeTok.Value == ")" && strTok.Kind == TokenStringLit {
+				p.advance() // type name
+				p.advance() // (
+				p.advance() // N
+				p.advance() // )
+				p.advance() // string literal
+				return &TypedStringLit{pos: t.Pos, Type: name, Value: strTok.Value}, true
+			}
+			// `char(` that is not a valid `( N ) '...'` is not a literal.
+			return nil, false
+		}
 		next := p.peek(1)
 		if next.Kind != TokenStringLit {
 			return nil, false
