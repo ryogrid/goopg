@@ -1,46 +1,39 @@
-Task: M0134-0070 (strings.sql) — regress-sql `failed`. This loop landed the
-Unicode-escape error-message wording bucket. Code commit `f6557f64`, pushed.
+Task: M0134-0071 (equivclass.sql) — Bucket A (`LANGUAGE internal` CREATE
+FUNCTION) landed and committed `f70edc85`; case PARKED (not flipped to pass).
 
-Landed: `internal/parser/lexer.go` — `decodeUnicodeEscapes` dropped the E-string
-`at or near "…"` suffix from its six 42601 surrogate-pair/escape-value messages
-(bare text, PG `str_udeescape`/`check_unicode_value` parser.c:341-348,371-527);
-`lexUnicodeEscapeQuote` gained the dedicated `UESCAPE must be followed by a simple
-string literal at or near "<token>"` fallthrough for a non-SCONST third token
-(parser.c:271-274) and appends the raw SCONST text to the `invalid Unicode escape
-character` message. Siblings `scanEscapeQuoteInto` (E-string) and `unistr.go`
-untouched (different PG convention). Tests updated in
-`internal/parser/unicode_escape_literal_test.go`. strings.sql diff 327→279 lines,
-`@@ -56,39 +56,39 @@` hunk closed.
+Landed: `internal/executor/operators_ddl.go` `execCreateFunction`/`execCreateProcedure`
+allowlist now admit `internal`; new `catalog.LookupBuiltinProcByProname`
+(name→OID reverse of `pgProcNamesByOID`) binds `AS '<name>'` (unknown → 42883,
+PG `fmgr_internal_validator` `pg_proc.c:746/770-771`); `plpgsql_runtime.go`
+`dispatchStoredRoutineByLanguage` gains a real `case "internal"` →
+`dispatchInternalFunction` (int8eq/ne/lt/le/gt/ge, btint8cmp, int8in/out,
+hashint8; strict; Datum-level — no coercion needed for `like int8` aliases);
+`hash_partition.go` `pgHashInt8` (PG `hashfunc.c:84`). Design
+`docs/design/m0134-0071-language-internal-function.md` + README index; test
+`internal/executor/create_function_language_internal_test.go`.
 
-Key symbols: `decodeUnicodeEscapes` (lexer.go ~748-850),
-`lexUnicodeEscapeQuote` (lexer.go ~622-745), `SyntaxError` (Pos/Raw/Code/Message).
+Result: equivclass **594 → 573 diff lines, 40 → 28 `^+ERROR`** (10 `language
+internal` + 2 cross-type `only boolean operators` cleared). CSV row stays
+`failed`/`pass_required=no`; no `make regen-testport`.
 
-Hypothesis/Findings: researcher re-ran the gate (the 11:41 diff was stale —
-predated bytea-LIKE/toasttest-hunk-1/regexp-HINT). Fresh 327-line diff. Three
-small buckets were sized: Bucket A (Unicode-escape msg wording ~16, CONTAINED —
-this loop, landed), Bucket B (`char(20) '...'` typed-literal ~13, CONTAINED,
-parser-only), Bucket C (SQL99 SUBSTRING + CONTEXT — CROSS-CUTTING: C1 7-line
-contained half via `similarto.ConvertSubstring` fold, C3 CONTEXT-line is the known
-`sql_exec_error_callback` gap + separate RE2-vs-ARE `bcdefg` 2-liner). J2 toast
-hunk 2 reconfirmed deferred (wider toast-path blast radius). No deferral this loop.
+Key finding (re-attribution): the 13 `incompatible operand types` errors are an
+INDEPENDENT analyzer gap, NOT a cascade of the internal-language wall — the
+BinaryOp type-check (`analyzer.go:1359-1362`/`:3186`) is a builtin name-switch
+with no user-operator lookup, so `int8 = int8alias1` (a user operator) is never
+resolved. Largest contained next slice (16/28 remaining). Bucket C (built-in
+`integer_ops` opfamily rows) is second. Both ledgered 2026-08-22.
 
-Next step: brief Bucket B — `char(20) '...'` typed-literal grammar
-(`tryTypedLiteral`, `internal/parser/select.go:3172-3294`): mirror the
-`interval ( p ) 'lit'` arm (3227-3239) to accept `type ( typmod ) 'lit'` when
-peek(1)='(' peek(2)=intlit peek(3)=')' peek(4)=stringlit; consume 5 tokens →
-`TypedStringLit{Type: name, Value: strTok.Value}`. Executor already ready
-(`evalTypedStringLit`, expr.go:3550). Ignore the typmod value (bpchar
-padding/truncation deferred). ~13 diff lines.
+Next step: M0134-0072 (temp.sql) — regress-sql `failed`, not yet sized. Same
+pattern: researcher sizes (run `scripts/pg-regress-runner.sh --verbose temp`),
+then pick the largest contained slice, design + implement.
 
-Gates run this loop: `go test ./internal/parser/` PASS (implementer); `go build
-./...` PASS; `scripts/pg-regress-runner.sh --verbose strings` exit 0 (279-line
-diff); pre-commit pgbench smoke PASS (0 failed, via git hook); `make
-ralph-state-guard` clean.
+Gates run this loop: researcher ran the regress runner twice (deterministic, 594
+lines, exit 1); implementer `go test ./internal/executor/` + `./internal/catalog/`
+PASS, `go build ./...` PASS, regress 594→573/40→28; pre-commit pgbench smoke
+PASS (0 failed, `f70edc85`).
 
-Delegation: researcher (m0134-0070-resize-small-buckets) DONE — sized A/B/C/J2.
-implementer (m0134-0070-unicode-msg-wording) DONE — all gates PASS, committed
-`f6557f64`. Report.md could not be written by the implementer (tool guard);
-content folded into fix_plan.md + this file.
+Delegation: researcher m0134-0071-equivclass-sizing DONE; implementer
+m0134-0071-internal-lang DONE (report delivered inline — the harness blocked the
+`report.md` Write). No open brief.
 
-In-flight: none. (Observed, not mine: a stale PG oracle process
-`tmp/oracle-74-pgdata` @ port 5534 PID 291764 predates this session; left alone.)
+In-flight: none.
