@@ -1,0 +1,16 @@
+{
+  "repo_name": "goopg",
+  "source_path": "/home/ryo/work/goopg/goopg",
+  "source_sha": "f70edc850d32093a5c247a1b195b6e6eb4e37bb3",
+  "generated_at": "2026-08-22T00:00:00Z",
+  "generator": "claude code-wiki skill",
+  "modules_documented": [
+    "cmd/goopg",
+    "internal/postmaster",
+    "internal/optimizer",
+    "internal/executor",
+    "internal/storage",
+    "internal/initdb",
+    "internal/replication"
+  ]
+}
