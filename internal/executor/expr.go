@@ -9750,24 +9750,34 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		// M0119-0006 (40th slice).
 		return NewTimestampTZDatum(ctx.Now), nil
 	case "current_date":
+		// Tag the result TimeSubDate (M0134-0084): current_date shares the
+		// KindTime carrier with timestamp, and NewTimeDatum leaves TimeSub
+		// unset, so `current_date::text` rendered the full "YYYY-MM-DD
+		// 00:00:00" timestamp shape instead of a bare date — the reason
+		// `date(now())::text = current_date::text` (expressions.sql) always
+		// compared unequal regardless of the actual day. NewDateDatum is the
+		// same site every other date-producing path already uses.
 		t := ctx.Now.UTC()
-		return NewTimeDatum(time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)), nil
+		return NewDateDatum(time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)), nil
 	case "current_time":
 		// Returns time-of-day anchored at epoch, matching parseTimeString convention.
-		// Accepts optional precision arg: current_time(N) truncates microseconds.
+		// Accepts optional precision arg: current_time(N) rounds the fractional
+		// seconds the same way `::time(N)` does — roundTimeDatumToPrecision
+		// (AdjustTimeForTypmod, date.c:1710) ROUNDS, it does not truncate.
+		// M0134-0084: the previous floor-via-integer-division here disagreed
+		// with the CastExpr Typmod path on any nanosecond value that rounds up,
+		// making `now()::time(3) = current_time(3)`-shaped comparisons flaky
+		// (they only matched when the discarded digits happened to floor and
+		// round to the same value).
 		t := ctx.Now.UTC()
-		ns := t.Nanosecond()
+		d := NewTimeDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC))
 		if len(x.Args) > 0 {
 			prec, err := evalExprSlot(x.Args[0], slot, ctx)
-			if err == nil && prec.Kind == KindInt && prec.Int < 6 {
-				factor := int64(1)
-				for i := int64(0); i < 6-prec.Int; i++ {
-					factor *= 10
-				}
-				ns = (ns / (int(factor) * 1000)) * (int(factor) * 1000)
+			if err == nil && prec.Kind == KindInt {
+				d = roundTimeDatumToPrecision(d, prec.Int)
 			}
 		}
-		return NewTimeDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), ns, time.UTC)), nil
+		return d, nil
 	case "current_catalog":
 		return NewStringDatum("postgres"), nil
 	case "pg_client_encoding":
@@ -14952,22 +14962,32 @@ case "pg_char_to_encoding":
 		return NewStringDatum(ctx.Now.Format("Mon Jan 02 15:04:05.000000 2006 UTC")), nil
 	case "localtime":
 		// Returns time-of-day anchored at epoch (same storage convention as current_time).
-		// Accepts optional precision arg: localtime(N) truncates microseconds.
+		// Accepts optional precision arg: localtime(N) rounds the fractional
+		// seconds via roundTimeDatumToPrecision, matching the `::time(N)`
+		// CastExpr path (AdjustTimeForTypmod ROUNDS, it does not truncate —
+		// see the current_time case above, M0134-0084: the previous
+		// floor-via-integer-division here is what made
+		// `now()::time(N)::text = localtime(N)::text` (expressions.sql) flaky).
 		t := ctx.Now.UTC()
-		ns := t.Nanosecond()
+		d := NewTimeDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC))
 		if len(x.Args) > 0 {
 			prec, err := evalExprSlot(x.Args[0], slot, ctx)
-			if err == nil && prec.Kind == KindInt && prec.Int < 6 {
-				factor := int64(1)
-				for i := int64(0); i < 6-prec.Int; i++ {
-					factor *= 10
-				}
-				ns = (ns / (int(factor) * 1000)) * (int(factor) * 1000)
+			if err == nil && prec.Kind == KindInt {
+				d = roundTimeDatumToPrecision(d, prec.Int)
 			}
 		}
-		return NewTimeDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), ns, time.UTC)), nil
+		return d, nil
 	case "localtimestamp":
-		return NewTimeDatum(ctx.Now), nil
+		// M0134-0084: localtimestamp is the plain-`timestamp` sibling of now()
+		// (prorettype 1083 vs now()'s 1184) and must equal `now()::timestamp`
+		// — PG derives both from the same transaction-start instant converted
+		// into the session TimeZone (timestamptz_timestamp, date.c). The
+		// `::timestamp` CastExpr path already applies that conversion
+		// (misc.TimestampTZToTimestamp, M0119-0006 40th slice); this bare
+		// FuncCall previously skipped it and returned the raw UTC instant
+		// relabelled as local wall clock, silently off by the zone's UTC
+		// offset whenever TimeZone != UTC.
+		return NewTimeDatum(misc.TimestampTZToTimestamp(ctx.Now, timeZoneFromCtx(ctx))), nil
 	case "pg_is_in_recovery":
 		return NewBoolDatum(ctx.IsStandby), nil
 	case "pg_promote":
