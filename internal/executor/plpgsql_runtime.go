@@ -2908,11 +2908,20 @@ func injectTriggerVars(frame *plpgsqlFrame, trig *plpgsqlTrigCtx) {
 //   - (newRow, true, nil): trigger returned a row (BEFORE triggers use this)
 //   - (nil, true, nil): trigger returned NULL (skip the row)
 //   - (nil, false, err): execution error
+//   - (nil, false, nil): trigger not executed (non-plpgsql — row proceeds
+//     unmodified)
 //
-// M0096-0012.
+// M0096-0012; M0134-0078 B7.
 func executePLpgSQLTriggerBody(r *catalog.Routine, trig *plpgsqlTrigCtx, ctx *Context) (Row, bool, error) {
 	if strings.ToLower(r.Language) != "plpgsql" {
-		return nil, true, nil // non-plpgsql trigger: pass-through
+		// Non-plpgsql trigger (e.g. LANGUAGE C): goopg has no C executor, so it
+		// cannot run the body. Skip it and let the row proceed unmodified —
+		// ok==false sends fireTriggers down its `!ok → continue` pass-through.
+		// ok==true here would be read as "RETURN NULL → suppress the row", which
+		// is wrong for a trigger we never executed (matches the
+		// lookupTriggerRoutine == nil → skip stance). M0134-0078 B7;
+		// postgres/src/backend/commands/trigger.c ExecCallTriggerFunc.
+		return nil, false, nil
 	}
 	block, err := plpgsql.Parse(r.Body)
 	if err != nil {
