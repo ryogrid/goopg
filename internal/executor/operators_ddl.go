@@ -748,6 +748,31 @@ func (o *ddlOp) execCreateCollation(s *parser.CreateCollationStmt) error {
 		if uc.Provider == 'i' {
 			uc.Rules = s.Rules
 		}
+		// DefineCollation calls builtin_validate_locale (pg_locale.c:1510) for
+		// the builtin provider before the pg_collation insert: only "C",
+		// "C.UTF-8"/"C.UTF8" (canonicalized to "C.UTF-8"), and
+		// "PG_UNICODE_FAST" are recognized — anything else (e.g. "unicode",
+		// "C_UTF8") raises 22023 "invalid locale name %s for builtin
+		// provider" instead of silently registering. goopg previously
+		// accepted any spelling, so `CREATE COLLATION regress_pg_unicode_fast
+		// (provider = builtin, locale = 'unicode')` -- meant to fail per
+		// collate.utf8.sql -- succeeded and left a bogus row behind,
+		// desyncing the following CREATE COLLATION with "already exists"
+		// (M0134-0102). goopg always runs UTF8 (per internal/initdb/locale.go
+		// resolveLocale), so the encoding-vs-locale cross-check
+		// (pg_locale.c:1528-1533, requiring UTF8 for C.UTF-8/PG_UNICODE_FAST)
+		// can never fire and is not reproduced here.
+		if uc.Provider == 'b' {
+			switch uc.Locale {
+			case "C":
+			case "C.UTF-8", "C.UTF8":
+				uc.Locale = "C.UTF-8"
+			case "PG_UNICODE_FAST":
+			default:
+				return &ExecError{Code: "22023", Pos: s.Pos(),
+					Message: fmt.Sprintf("invalid locale name %q for builtin provider", uc.Locale)}
+			}
+		}
 	}
 	if _, err := im.CreateCollation(uc, schema, s.IfNotExists, dbOid); err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
