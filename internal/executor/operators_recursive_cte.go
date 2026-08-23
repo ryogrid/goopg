@@ -12,6 +12,40 @@ import (
 // M0097-0006.
 const maxRecursiveDepth = 1000
 
+// maxRecursiveIterationRows bounds how many rows a SINGLE fixpoint
+// iteration may accumulate before Next() gives up and errors out.
+//
+// M0134-0086: the maxRecursiveDepth counter above only advances once per
+// *completed* iteration — Phase 2 fully drains o.recursive to EOF before
+// incrementing depth again. A recursive term that itself never reaches EOF
+// within one iteration (e.g. a WITH RECURSIVE query nested inside another
+// WITH RECURSIVE query, where the inner query's recursive term unions a
+// reference back out to the still-open outer query — with.sql's "with
+// recursive q as (... union all (with recursive x as (... union all
+// (select * from q union all select * from x)) select * from x)) select *
+// from q limit 32" is real, PG-accepted SQL, see
+// postgres/src/test/regress/sql/with.sql) never advances depth at all: it
+// is stuck accumulating rows inside the very first iteration forever. Real
+// PostgreSQL (nodeRecursiveunion.c) evaluates the recursive term and
+// returns each produced tuple to its caller as it is produced, instead of
+// fully materialising one iteration before yielding anything — that lets a
+// LIMIT above the recursive union stop the pull chain early even when the
+// query graph is not naturally finite. Reworking recursiveUnionOp to match
+// that row-at-a-time pull model is a real executor refactor (also needs a
+// shared/reentrant CTE instance so an inner "select * from q" pulls from
+// the SAME in-flight outer q rather than recursing into a second one) and
+// is deliberately out of scope here (M0134-0086 ledger row, deferred).
+// This cap is the safety net in the meantime: it turns an unbounded RSS
+// blow-up / host OOM into a bounded, catchable 54001 error, matching the
+// existing maxRecursiveDepth error family. It is set far above any
+// legitimate regress/production recursive CTE (the largest recursive CTE
+// fixtures in postgres/src/test/regress produce at most a few thousand
+// rows per iteration).
+//
+// A var (not a const) so tests can shrink it to avoid materialising
+// millions of rows just to exercise the guard.
+var maxRecursiveIterationRows = 2_000_000
+
 // recursiveUnionOp executes a WITH RECURSIVE fixpoint (M0016-0004).
 // It drains the anchor first, then iterates the recursive member with
 // the current working table (set on ctx.WorkTableRows) until no more
@@ -137,6 +171,17 @@ func (o *recursiveUnionOp) Next() (TupleSlot, error) {
 			if err != nil {
 				o.recursive.Close()
 				return nil, err
+			}
+			if len(iterRows) >= maxRecursiveIterationRows {
+				// M0134-0086: this single iteration never reached EOF on its
+				// own — see maxRecursiveIterationRows' doc comment. Without
+				// this the loop keeps materialising iterRows without bound.
+				o.recursive.Close()
+				o.done = true
+				return nil, &ExecError{
+					Code:    "54001",
+					Message: "WITH RECURSIVE exceeded maximum recursion depth " + itoa(maxRecursiveDepth),
+				}
 			}
 			row := slotRow(slot)
 			r := make(Row, len(row))
