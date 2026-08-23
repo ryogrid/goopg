@@ -1,65 +1,68 @@
 (idle — nothing in flight)
 
-Task just completed: M0134-0089 (alter_operator.sql). Sized live against the
-PG 18.3 oracle (scripts/pg-regress-runner.sh --verbose alter_operator, plus
-manual throwaway-server probing via /tmp/zzop-goopg on port 5533). Landed two
-real engine-wide fixes, both confirmed live:
-(1) catalog.InMemory.PGDependRowsForDBOid (internal/catalog/catalog.go) had
-NO code path for c.userOperators at all — every CREATE OPERATOR reported
-ZERO pg_depend rows. Fixed by adding the namespace/left-type/right-type/
-result-type/oprcode/oprrest/oprjoin dependency loop PG's
-makeOperatorDependencies (pg_operator.c:853-937) performs, including its
-pinned-object skip (IsPinnedObject: OID<12000 pinned EXCEPT the public
-namespace). New catalog.InMemory.LookupUserOperatorByNameAndTypeOIDs added.
-(2) The CastExpr regoperator branch (internal/executor/expr.go) only ever
-handled a KindInt (OID) input; a KindString (name) input like
-'===(bool,bool)'::regoperator fell through UNCHANGED as raw text, so every
-WHERE objid = '...'::regoperator comparison against an oid column silently
-evaluated false, independent of bug (1). Fixed with a new
-regoperatorNameAndArgs parser (internal/executor/reg_identifier.go) mirroring
-the regclass CastExpr arm's existing string->OID pattern (returns a bare
-NewIntDatum, not a rendered name).
-Landed internal/executor/create_operator_depend_test.go
-(TestCreateOperatorPopulatesPGDepend, TestRegoperatorCastResolvesToOID).
-Committed decd8e3e and pushed. Tests: full units gate PASSING, pgbench smoke
-PASS (pre-commit hook). Ledger row appended 2026-08-24 M0134-0089. CSV row
-flipped not-tried -> failed (genuinely failing, not stale) via
-make regen-testport. fix_plan.md M0134-0089 marked PARKED.
+Task just completed: M0134-0091 (async.sql). Sized live against the PG 18.3
+oracle (scripts/pg-regress-runner.sh --verbose async). Case was 35-line diff
+/ 0% parity from two narrow gaps (LISTEN/NOTIFY itself, M0118-0009, was
+already fully correct):
+(1) exprType's FuncCall switch (internal/optimizer/planner.go) had no arm
+for pg_notification_queue_usage() — it fell through to "unknown", and psql
+left-justifies an unknown-typed cell instead of right-justifying numeric, a
+silent column-alignment divergence (runtime value "0" was already correct).
+Added a float8 arm next to the existing random/random_normal/drandom case.
+(2) pg_notify(channel, payload) (internal/executor/expr.go) had zero
+channel-name validation: NULL was silently treated as a no-op, empty/
+over-length channels were silently accepted. PG's Async_Notify
+(postgres/src/backend/commands/async.c:604-621) substitutes a NULL channel
+with "" then raises ERRCODE_INVALID_PARAMETER_VALUE (22023) "channel name
+cannot be empty" / "channel name too long" (>= NAMEDATALEN=64) — neither
+ereport calls errposition(), so Pos must stay 0 (no LINE/^ pointer),
+matching the M0134-0070 no-errposition pattern. First attempt set
+Pos: x.Pos() and still diverged (added 2 spurious LINE/^ lines) — fixed by
+dropping Pos entirely. Landed internal/executor/async_notify_test.go
+(TestPgNotificationQueueUsageIsFloat8, TestPgNotifyChannelNameValidation).
+Case closed clean (no PARK): PASS async (35 lines), 100% parity. CSV row
+flipped not-tried -> pass/pass_required=yes (had to de-comma-and-quote the
+rationale text — the CSV has no quoting/escaping for internal commas or
+quote chars, confirmed via make check-testport-inventory failing twice on
+"bare \" in non-quoted-field" then "wrong number of fields" before the fix).
+Ledger row added noting the NOTIFY-statement form (internal/postmaster/
+notify.go's notifyStmtTag, case *parser.NotifyStmt) is UNAUDITED for the
+same channel-length gap — confirmed by reading the code (zero validation,
+just buffers n.Channel), not yet exercised by any regress/isolation case so
+no observed divergence. Design doc
+docs/design/m0134-0091-async-notify-column-type-and-channel-validation.md.
+Committed 5a5392cd and pushed... (verify push landed — see Next step).
+fix_plan.md M0134-0091 marked [x].
 
 NEXT LOOP: per the Current Priority banner in .ralph/fix_plan.md, continue
-M0134 top-to-bottom — next unworked item is **M0134-0090 (amutils.sql,
-status `not-tried`)**. Size it live against ./postgres oracle via
-scripts/pg-regress-runner.sh --verbose amutils (background, generous
-timeout — setup alone takes ~2-3 min; clear tmp/regress-goopg-data first if a
-prior run left it non-empty, `rm -rf tmp/regress-goopg-data` — the runner
-errors "Directory not empty" on a stale leftover from an interrupted run).
-CAUTION carried forward from M0134-0086: watch `ps -o rss` on the goopg PID
-while any regress file runs (some cases drove RSS to 20+ GB in <2 min); kill
--KILL promptly (never bare pkill -f) if RSS climbs unbounded before deciding
-whether it's worth fixing first. Deferred buckets left in M0134-0089 for a
-future resume (see ledger for full detail): (A) pg_describe_object is
-ENTIRELY UNIMPLEMENTED (zero non-test hits in internal/executor/*.go) — this
-is now alter_operator.sql's immediate next blocker and is a real multi-day
-own-milestone feature (PG's version dispatches over ~40 catalog classes,
-postgres/src/backend/utils/adt/objectaddress.c); (B) several builtin
-selectivity-estimator functions (contsel, contjoinsel, _int_contsel,
-_int_contjoinsel) aren't in goopg's curated builtin-proc set; (C) ALTER
-OPERATOR SET with a quoted/non-lowercase option name ("Restrict" = ...) is a
-goopg PARSER syntax error where PG accepts the syntax and raises a semantic
-error instead; (D) ALTER OPERATOR SET has no ownership permission check at
-all (same class as M0134-0088 Bucket C); (E) the "cannot change an
-already-set COMMUTATOR/NEGATOR via SET" collision guard is missing for the
-reverse-collision case (@=(real,boolean) SET (COMMUTATOR = ===) when ====
-already holds it).
+M0134 top-to-bottom — next unworked item is **M0134-0092 (bit.sql, status
+`not-tried`)**. First: `git log --oneline -1 origin/regress-renumbering` (or
+`git push` if the commit above didn't already push) to confirm 5a5392cd
+landed on the remote. Then size bit.sql live against ./postgres oracle via
+scripts/pg-regress-runner.sh --verbose bit (background, generous timeout;
+clear tmp/regress-goopg-data first if a prior run left it non-empty —
+`rm -rf tmp/regress-goopg-data`, the runner errors "Directory not empty" on
+a stale leftover from an interrupted run). bit.sql exercises the bit/varbit
+types — check whether goopg's bit-string support already exists (search
+internal/executor for "bit"/"varbit" codec/operators) before assuming a
+large gap. CAUTION carried forward from M0134-0086/0090: watch `ps -o rss`
+on the goopg PID while any regress file runs (some cases drove RSS to 20+ GB
+in <2 min); kill -KILL promptly (never bare pkill -f) if RSS climbs unbounded
+before deciding whether it's worth fixing first. If bit.sql resolves to a
+small/contained diff like async.sql did, land the fix + ledger + design doc
++ CSV flip in one loop (M0134's established per-task pattern: PARK on a
+multi-root-cause case after landing the one contained fix, CLOSE clean on a
+small one).
 
 Gates run: `go build ./...` clean; targeted go test -run
-'TestCreateOperatorPopulatesPGDepend|TestRegoperatorCastResolvesToOID|TestPgDepend|TestCreateOperator|Regoperator|TestCreateOperatorClass'
-./internal/executor/ PASS (no regressions in sibling pg_depend/operator
-tests); RALPH_PRECOMMIT_SCOPE=units ralph-precommit-test.sh PASS (full suite,
-~450s dominated by internal/initdb); make check-testport-inventory PASS; make
-regen-testport ran clean; make ralph-state-guard PASS (self-repaired a stale
-progress.json completed-marker, same pattern as the M0134-0088 loop);
-pre-commit hook's pgbench smoke PASS (331/608/12301 TPS across the 3
+'TestPgNotificationQueueUsageIsFloat8|TestPgNotifyChannelNameValidation'
+./internal/executor/ PASS; RALPH_PRECOMMIT_SCOPE=units
+ralph-precommit-test.sh PASS (full suite, ~530s dominated by
+internal/initdb); make check-testport-inventory PASS (after CSV
+comma/quote fix); make regen-testport ran clean; make ralph-state-guard
+PASS (self-repaired a stale progress.json completed-marker, same recurring
+pattern as prior loops — see the guard's own repair message, not a new
+bug); pre-commit hook's pgbench smoke PASS (325/606/11945 TPS across the 3
 pgbench transaction types).
 
 In-flight: none.
