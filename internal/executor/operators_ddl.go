@@ -1702,6 +1702,34 @@ func validateColumnStorage(cat catalog.Catalog, col catalog.Column) *ExecError {
 	}
 }
 
+// validateColumnCompression enforces GetAttributeCompression
+// (postgres/src/backend/commands/tablecmds.c:22043-22076) at both CREATE
+// TABLE time and `ALTER COLUMN ... SET COMPRESSION` time: a non-default
+// method name must be "pglz" or "lz4" (22023 "invalid compression method"
+// otherwise), and a non-default method may only be set on a TOAST-aware
+// column type (0A000 "column data type %s does not support compression" —
+// the same columnTypeStorageCode('p') non-toastable test validateColumnStorage
+// uses). col.Compression == "" (unset, or `SET COMPRESSION default`) always
+// passes. M0134-0105.
+func validateColumnCompression(cat catalog.Catalog, col catalog.Column) *ExecError {
+	if col.Compression == "" {
+		return nil
+	}
+	if col.Compression != "pglz" && col.Compression != "lz4" {
+		return &ExecError{
+			Code:    "22023",
+			Message: fmt.Sprintf("invalid compression method %q", col.Compression),
+		}
+	}
+	if columnTypeStorageCode(cat, col) != 'p' {
+		return nil
+	}
+	return &ExecError{
+		Code:    "0A000",
+		Message: fmt.Sprintf("column data type %s does not support compression", pgFormatTypeName(col.Type.Name)),
+	}
+}
+
 // validateColumnCollation rejects an inline `COLLATE <name>` clause on a
 // column whose type carries no typcollation — PostgreSQL only lets you
 // specify a collation for text/varchar/bpchar/name (and domains/arrays over
@@ -2248,6 +2276,12 @@ afterExistsCheck:
 			if verr := validateColumnStorage(o.ctx.Catalog, col); verr != nil {
 				return verr
 			}
+			// A declared COMPRESSION method must be "pglz"/"lz4" and the column
+			// type must be TOAST-aware — GetAttributeCompression
+			// (tablecmds.c:22043-22076). M0134-0105.
+			if verr := validateColumnCompression(o.ctx.Catalog, col); verr != nil {
+				return verr
+			}
 			// An inline `COLLATE` clause on a non-collatable column type (e.g.
 			// `a int COLLATE "C"`) is 42804 — transformColumnType
 			// (parse_utilcmd.c:4044-4067) rejects it before the collation name is
@@ -2453,6 +2487,16 @@ afterExistsCheck:
 				if verr := validateColumnStorage(o.ctx.Catalog, catalog.Column{
 					Type:    catalog.Type{Name: typeName, Args: c.Type.Args, IsArray: c.Type.IsArray},
 					Storage: c.Storage,
+				}); verr != nil {
+					return verr
+				}
+			}
+			// Same COMPRESSION-method/type-toastability check as the
+			// BodyOrder addCol path. M0134-0105.
+			if c.Compression != "" {
+				if verr := validateColumnCompression(o.ctx.Catalog, catalog.Column{
+					Type:        catalog.Type{Name: typeName, Args: c.Type.Args, IsArray: c.Type.IsArray},
+					Compression: c.Compression,
 				}); verr != nil {
 					return verr
 				}
@@ -10308,6 +10352,15 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				changed := false
 				for i := range tbl.Columns {
 					if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
+						// Same COMPRESSION-method/type-toastability check as
+						// CREATE TABLE's addCol path (GetAttributeCompression,
+						// tablecmds.c:22043-22076/18781). M0134-0105.
+						if verr := validateColumnCompression(o.ctx.Catalog, catalog.Column{
+							Type:        tbl.Columns[i].Type,
+							Compression: act.CompressionType,
+						}); verr != nil {
+							return verr
+						}
 						tbl.Columns[i].Compression = act.CompressionType
 						changed = true
 						break

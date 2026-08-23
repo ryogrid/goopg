@@ -4366,8 +4366,12 @@ func (p *parser) parsePartitionBoundValues() ([]Expr, error) {
 // storage on the catalog column. PG accepts "pglz", "lz4", and "default"
 // (case-insensitive); "default" resets attcompression to '\0' (the
 // default_toast_compression GUC applies) and is recorded as the empty string, so
-// no SET COMPRESSION clause is dumped. Any other / empty token also normalizes to
-// "" — goopg does not enforce the method, this is dump-fidelity only.
+// no SET COMPRESSION clause is dumped. An empty input also normalizes to "".
+// Any other token is passed through lowercased (identifiers are already
+// lexer-lowercased when unquoted) rather than silently discarded to "" — the
+// executor validates it against GetAttributeCompression's rules
+// (validateColumnCompression, tablecmds.c:22043-22076) and raises "invalid
+// compression method" (22023) for anything unrecognized. M0134-0105.
 // DU-002 slice 183.
 func normalizeCompressionMethod(method string) string {
 	switch strings.ToLower(method) {
@@ -4375,8 +4379,10 @@ func normalizeCompressionMethod(method string) string {
 		return "pglz"
 	case "lz4":
 		return "lz4"
-	default:
+	case "", "default":
 		return ""
+	default:
+		return strings.ToLower(method)
 	}
 }
 
