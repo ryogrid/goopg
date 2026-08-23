@@ -11,7 +11,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-sql,regress,postgres/src/test/regress/sql/bitmapops.sql,pass,yes,-,"M0134-0093: sized live against PG 18.3 oracle via scripts/pg-regress-runner.sh --verbose bitmapops — 100% parity (45-line diff, 0 divergence), no goopg change needed; status was stale not-tried"
 ,regress-sql,regress,postgres/src/test/regress/sql/boolean.sql,pass,yes,-,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
 ,regress-sql,regress,postgres/src/test/regress/sql/box.sql,failed,no,-,"Sized live M0134-0094 (2026-08-24); PARKED — box was a raw-varlena pass-through with zero validation; landed box_in-faithful parsing/normalization (parseBoxLiteral) wired into column-assignment coercion, `box 'lit'` typed-literal syntax, and pg_input_is_valid (diff 768->738 lines, 62->45 ^ERROR); needs area(), box comparison operators (area-based <,<=,=,>=,>, plus &<,&>,<<,>>,~=), SP-GiST/GiST index support, point <-> distance operator, see deferral ledger"
-,regress-sql,regress,postgres/src/test/regress/sql/brin.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/brin.sql,failed,no,-,"Sized M0134-0095 (2026-08-24); PARKED — cardinality() dispatch + parseTextArray comma-space bug fixed, but real BRIN summarize/desummarize functions, planner BRIN usage, inet/cidr literal arithmetic, numrange, tid-in-plpgsql still missing, see deferral ledger"
 ,regress-sql,regress,postgres/src/test/regress/sql/brin_bloom.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/brin_multi.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/btree_index.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope

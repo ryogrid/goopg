@@ -10921,6 +10921,26 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		}
 		return NullDatum, nil
 
+	case "cardinality":
+		// cardinality(anyarray) → int: total number of elements across all
+		// dimensions (postgres/src/backend/utils/adt/array_userfuncs.c
+		// array_cardinality → ArrayGetNItems). Unlike array_length, takes no
+		// dimension argument and returns 0 (not NULL) for an empty array;
+		// NULL input still yields NULL. goopg arrays are 1-D only, so this is
+		// just the element count.
+		if len(x.Args) == 1 {
+			arr, err := evalExprSlot(x.Args[0], slot, ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			if arr.IsNull() {
+				return NullDatum, nil
+			}
+			elems := parseTextArray(arr.StringValue())
+			return NewIntDatum(int64(len(elems))), nil
+		}
+		return NullDatum, nil
+
 	case "array_fill":
 		// array_fill(val, dims_array[, lb_array]) → fills an array with val repeated N times.
 		// array_fill(1.0, ARRAY[4]) = {1.0,1.0,1.0,1.0}. Only 1-D supported. M0097-0113.
@@ -17343,7 +17363,16 @@ func parseTextArray(s string) []string {
 	var elems []string
 	i := 0
 	for i < len(inner) {
-		if inner[i] == '"' {
+		// PG's ReadArrayStr (postgres/src/backend/utils/adt/arrayfuncs.c)
+		// skips leading whitespace before each element, so a raw literal
+		// like '{"(0,0)", "(0,0)"}' (space after the comma) still yields
+		// two elements, not a mis-split third. Without this skip, the
+		// unquoted branch below would swallow the leading space AND the
+		// following element's opening quote as one bogus element.
+		for i < len(inner) && inner[i] == ' ' {
+			i++
+		}
+		if i < len(inner) && inner[i] == '"' {
 			// Quoted element.
 			i++
 			var sb strings.Builder
