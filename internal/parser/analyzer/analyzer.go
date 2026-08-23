@@ -1564,6 +1564,22 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 		if err != nil {
 			return catalog.Type{}, err
 		}
+		if x.IsSlice {
+			// expr[lower:upper] slice access (M0134-0079) — either bound
+			// may be omitted, so only analyze the ones present, and the
+			// result is the array itself (not the element type).
+			if x.Index != nil {
+				if _, err := analyzeExpr(x.Index, ctx); err != nil {
+					return catalog.Type{}, err
+				}
+			}
+			if x.Upper != nil {
+				if _, err := analyzeExpr(x.Upper, ctx); err != nil {
+					return catalog.Type{}, err
+				}
+			}
+			return baseTyp, nil
+		}
 		if _, err := analyzeExpr(x.Index, ctx); err != nil {
 			return catalog.Type{}, err
 		}

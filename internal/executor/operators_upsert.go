@@ -1378,7 +1378,7 @@ func collectExprColumnNames(e parser.Expr, out map[string]struct{}) bool {
 		}
 		return true
 	case *parser.ArraySubscriptExpr:
-		return collectExprColumnNames(n.Base, out) && collectExprColumnNames(n.Index, out)
+		return collectExprColumnNames(n.Base, out) && collectExprColumnNames(n.Index, out) && collectExprColumnNames(n.Upper, out)
 	case *parser.IsNullExpr:
 		return collectExprColumnNames(n.Operand, out)
 	default:

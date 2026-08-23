@@ -643,11 +643,19 @@ type WindowDef struct {
 // Pos returns the position of the leading `OVER` keyword.
 func (w *WindowDef) Pos() int { return w.pos }
 
-// ArraySubscriptExpr is `expr[index]` — array element access.
+// ArraySubscriptExpr is `expr[index]` — array element access — or, when
+// IsSlice is set, `expr[lower:upper]` — array slice access (M0134-0079).
+// PG's grammar (`indirection_el`, gram.y) allows either bound to be
+// omitted (`expr[:upper]`, `expr[lower:]`, `expr[:]`), in which case the
+// corresponding field is nil and the slice defaults to that dimension's
+// actual lower/upper bound. Index (renamed Lower for slice reads) always
+// holds the sole bound for plain element access.
 type ArraySubscriptExpr struct {
-	pos   int
-	Base  Expr
-	Index Expr
+	pos     int
+	Base    Expr
+	Index   Expr
+	IsSlice bool
+	Upper   Expr
 }
 
 func (e *ArraySubscriptExpr) Pos() int { return e.pos }

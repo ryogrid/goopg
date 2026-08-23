@@ -1876,14 +1876,42 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 		if t := p.cur(); t.Kind == TokenSymbol && t.Value == "[" {
 			pos := t.Pos
 			p.advance() // consume '['
-			idx, err := p.parseExpr()
-			if err != nil {
-				return nil, err
+			// Array slice `expr[lower:upper]` (M0134-0079, gram.y
+			// `indirection_el`): either bound may be omitted
+			// (`[:upper]`, `[lower:]`, `[:]`), so only parse an
+			// operand when it isn't immediately the ':' separator or
+			// the closing ']'.
+			curSym := func(sym string) bool {
+				c := p.cur()
+				return c.Kind == TokenSymbol && c.Value == sym
+			}
+			var lower, upper Expr
+			if !curSym(":") && !curSym("]") {
+				var err error
+				lower, err = p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+			}
+			if curSym(":") {
+				p.advance() // consume ':'
+				if !curSym("]") {
+					var err error
+					upper, err = p.parseExpr()
+					if err != nil {
+						return nil, err
+					}
+				}
+				if !p.acceptSymbol("]") {
+					return nil, p.errAtCur("expected ']' after array slice")
+				}
+				left = &ArraySubscriptExpr{pos: pos, Base: left, IsSlice: true, Index: lower, Upper: upper}
+				continue
 			}
 			if !p.acceptSymbol("]") {
 				return nil, p.errAtCur("expected ']' after array subscript")
 			}
-			left = &ArraySubscriptExpr{pos: pos, Base: left, Index: idx}
+			left = &ArraySubscriptExpr{pos: pos, Base: left, Index: lower}
 			continue
 		}
 		// `expr COLLATE collation_name` — a high-precedence postfix in

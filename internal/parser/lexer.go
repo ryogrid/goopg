@@ -518,13 +518,16 @@ func (l *lexer) next() (Token, error) {
 		return Token{Kind: TokenSymbol, Value: string(c), Pos: start}, nil
 
 	case c == ':':
-		// `::` is upstream's typecast operator; a bare `:` is not
-		// otherwise meaningful in goopg's SQL surface and surfaces
-		// here as a lex error so the wire layer can return SQLSTATE
-		// 42601. `:=` is the PL/pgSQL assignment operator
-		// (M0015 Stage A step 4b) — recognised by the shared lexer
-		// because PL/pgSQL bodies tokenise through the same `Lex`
-		// entry point as SQL.
+		// `::` is upstream's typecast operator. `:=` is the PL/pgSQL
+		// assignment operator (M0015 Stage A step 4b) — recognised by the
+		// shared lexer because PL/pgSQL bodies tokenise through the same
+		// `Lex` entry point as SQL. A bare `:` is upstream's array-slice
+		// separator (`indirection_el: '[' a_expr ':' a_expr ']'`,
+		// gram.y) — M0134-0079. It is otherwise not meaningful in goopg's
+		// SQL surface, so emitting it as a plain symbol (rather than a lex
+		// error) only changes behaviour where the parser now consumes it
+		// (array subscripts); anywhere else it still surfaces as a parse
+		// error via the normal "unexpected token" path.
 		if l.peekAt(1) == ':' {
 			l.pos += 2
 			return Token{Kind: TokenOperator, Value: "::", Pos: start}, nil
@@ -533,7 +536,8 @@ func (l *lexer) next() (Token, error) {
 			l.pos += 2
 			return Token{Kind: TokenOperator, Value: ":=", Pos: start}, nil
 		}
-		return Token{}, l.errf(start, "unexpected character %q", c)
+		l.pos++
+		return Token{Kind: TokenSymbol, Value: ":", Pos: start}, nil
 
 	case c == '<' || c == '>' || c == '=' || c == '!' || c == '+' || c == '-' || c == '/' || c == '%' || c == '|' || c == '&' || c == '#' || c == '~' || c == '@' || c == '^':
 		// Greedy multi-char operator match. M0097-0003: added <<, >>, &, #, ~.

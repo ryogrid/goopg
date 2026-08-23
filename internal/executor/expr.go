@@ -10375,6 +10375,72 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		}
 		return NullDatum, nil
 
+	case "array_slice":
+		// Array slice access: arr[lower:upper] (1-based, inclusive, both
+		// bounds optional — the planner stamps an omitted bound as a
+		// NullConst literal). PG's array_ref (arrayfuncs.c) clamps an
+		// out-of-range bound to the array's actual bound rather than
+		// erroring, and lower > upper yields an empty array — never NULL
+		// or an error. M0134-0079.
+		if len(x.Args) == 3 {
+			arr, err := evalExprSlot(x.Args[0], slot, ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			if arr.IsNull() {
+				return NullDatum, nil
+			}
+			sv := arr.StringValue()
+			elems := splitArrayElements(sv)
+			if elems == nil {
+				// Not array-literal text (e.g. a fixed-length pseudo-array
+				// type) — slicing isn't defined for it; fall back to NULL
+				// rather than mis-splitting arbitrary text.
+				return NullDatum, nil
+			}
+			bound := func(argExpr optimizer.Expr, deflt int) (int, error) {
+				if _, isNull := argExpr.(*optimizer.NullConst); isNull {
+					return deflt, nil
+				}
+				d, err := evalExprSlot(argExpr, slot, ctx)
+				if err != nil {
+					return 0, err
+				}
+				if d.IsNull() {
+					return deflt, nil
+				}
+				return int(d.Int), nil
+			}
+			lower, err := bound(x.Args[1], 1)
+			if err != nil {
+				return NullDatum, err
+			}
+			upper, err := bound(x.Args[2], len(elems))
+			if err != nil {
+				return NullDatum, err
+			}
+			if lower < 1 {
+				lower = 1
+			}
+			if upper > len(elems) {
+				upper = len(elems)
+			}
+			if lower > upper {
+				return NewStringDatum("{}"), nil
+			}
+			var sb strings.Builder
+			sb.WriteByte('{')
+			for i := lower; i <= upper; i++ {
+				if i > lower {
+					sb.WriteByte(',')
+				}
+				sb.WriteString(elems[i-1])
+			}
+			sb.WriteByte('}')
+			return NewStringDatum(sb.String()), nil
+		}
+		return NullDatum, nil
+
 	case "array_upper":
 		// array_upper(anyarray, int) → int: upper bound of specified dimension (1-based).
 		// For 1-D arrays, returns the number of elements (lower is always 1).

@@ -2602,6 +2602,27 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (optimizer.Expr, error
 		if err != nil {
 			return nil, err
 		}
+		if x.IsSlice {
+			// array[lower:upper] slice read (M0134-0079). Either bound may
+			// be omitted; mirror the planner's resolveExpr convention of
+			// stamping a NullConst so the shared array_slice evaluator
+			// defaults it to that dimension's actual bound.
+			lower := optimizer.Expr(&optimizer.NullConst{})
+			if x.Index != nil {
+				lower, err = lowerPLpgSQLExpr(x.Index, frame)
+				if err != nil {
+					return nil, err
+				}
+			}
+			upper := optimizer.Expr(&optimizer.NullConst{})
+			if x.Upper != nil {
+				upper, err = lowerPLpgSQLExpr(x.Upper, frame)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return &optimizer.FuncCall{Name: "array_slice", Args: []optimizer.Expr{arr, lower, upper}}, nil
+		}
 		sub, err := lowerPLpgSQLExpr(x.Index, frame)
 		if err != nil {
 			return nil, err

@@ -4671,6 +4671,7 @@ func collectCheckExprColumns(e parser.Expr, out *[]string) {
 	case *parser.ArraySubscriptExpr:
 		collectCheckExprColumns(n.Base, out)
 		collectCheckExprColumns(n.Index, out)
+		collectCheckExprColumns(n.Upper, out)
 	}
 }
 

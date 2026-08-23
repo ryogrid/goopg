@@ -11967,6 +11967,16 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 			}
 			return "array", exprType(e)
 		}
+		// array_slice is the lowered form of arr[lower:upper]. PG's
+		// FigureColnameInternal (parse_target.c T_A_Indirection) skips pure
+		// subscripts/slices entirely (no field-name String in the
+		// indirection list) and recurses into the base expression's own
+		// name — e.g. `(array_agg(x))[1:2]` labels as "array_agg", not a
+		// name derived from the slice itself. M0134-0079.
+		if fc.Name == "array_slice" && len(fc.Args) > 0 {
+			name, _ := targetMeta(fc.Args[0], t)
+			return name, exprType(e)
+		}
 		return fc.Name, exprType(e)
 	}
 	// CASE expression: PostgreSQL's FigureColname() tries ELSE first, then
@@ -13693,6 +13703,32 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		}
 		return &IsDistinctFromExpr{pos: x.Pos(), Left: lv, Right: rv, Negated: x.Negated}, nil
 	case *parser.ArraySubscriptExpr:
+		if x.IsSlice {
+			// expr[lower:upper] — array slice access. Convert to
+			// array_slice(base, lower, upper) with either bound possibly
+			// a NullConst literal marking "omitted" (defaults to that
+			// dimension's actual bound at eval time). M0134-0079.
+			base, err := resolveExpr(x.Base, ctx)
+			if err != nil {
+				return nil, err
+			}
+			var lower, upper Expr = Expr(&NullConst{pos: x.Pos()}), Expr(&NullConst{pos: x.Pos()})
+			if x.Index != nil {
+				lower, err = resolveExpr(x.Index, ctx)
+				if err != nil {
+					return nil, err
+				}
+			}
+			if x.Upper != nil {
+				upper, err = resolveExpr(x.Upper, ctx)
+				if err != nil {
+					return nil, err
+				}
+			}
+			sl := &FuncCall{pos: x.Pos(), Name: "array_slice", Args: []Expr{base, lower, upper}}
+			sl.ReturnType = exprType(base).Name
+			return sl, nil
+		}
 		// expr[index] — array element access. Convert to array_subscript(base, index)
 		// so the executor can handle it without a new plan node type. M0097-0003.
 		base, err := resolveExpr(x.Base, ctx)
