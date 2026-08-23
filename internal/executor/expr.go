@@ -669,6 +669,44 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 			// instead of a bare OID. Only user-defined operators are
 			// resolvable (goopg has no builtin-operator catalog — deferred,
 			// see the ledger). DU-002 (M0119-0004) slice 411.
+			// A `'name(left,right)'::regoperator` STRING input is the reverse
+			// direction — regoperatorin (regproc.c) — and must resolve to the
+			// operator's numeric OID (not a rendered name string) so
+			// `WHERE objid = '===(bool,bool)'::regoperator` compares
+			// correctly against an oid-typed column; mirrors the `regclass`
+			// CastExpr arm's identical asymmetry (KindInt to name string,
+			// KindString to raw OID), confirmed against a live PG 18.3 oracle
+			// via alter_operator.sql. Only the 2-arg `name(a,b)` shape is
+			// handled (regoperatorNameAndArgs) — a bare name with no parens
+			// falls through to the unresolved `return v, nil` below
+			// unchanged, same as before this fix. `regoper` (no arg list at
+			// all) is NOT handled here; it stays on the pre-fix pass-through
+			// path — a bare-name lookup would still need ambiguity detection
+			// this slice doesn't add. M0134-0089.
+			if v.Kind == KindString && strings.EqualFold(x.TargetType, "regoperator") && ctx != nil && ctx.Catalog != nil {
+				raw := strings.TrimSpace(v.StringValue())
+				if oid, perr := strconv.ParseUint(raw, 10, 32); perr == nil {
+					return NewIntDatum(int64(oid)), nil
+				}
+				if name, leftType, rightType, ok := regoperatorNameAndArgs(raw); ok {
+					if im, ok2 := ctx.Catalog.(*catalog.InMemory); ok2 {
+						var leftOID, rightOID uint32
+						if leftType != "" {
+							leftOID = catalog.TypeNameToOID(leftType)
+						}
+						if rightType != "" {
+							rightOID = catalog.TypeNameToOID(rightType)
+						}
+						if op, found := im.LookupUserOperatorByNameAndTypeOIDs(name, leftOID, rightOID); found {
+							return NewIntDatum(int64(op.OID)), nil
+						}
+					}
+					if bop, found := catalog.LookupBuiltinOperator(name, leftType, rightType); found {
+						return NewIntDatum(int64(bop.OID)), nil
+					}
+					return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("operator does not exist: %s", raw)}
+				}
+			}
 			if v.Kind == KindInt {
 				oid := v.Int
 				if oid == 0 {

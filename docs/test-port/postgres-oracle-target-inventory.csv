@@ -2,7 +2,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-sql,regress,postgres/src/test/regress/sql/advisory_lock.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/aggregates.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/alter_generic.sql,failed,no,-,"Sized M0134-0088 (2026-08-24); PARKED — needs CREATE LANGUAGE parser support/ALTER AGGREGATE registry unification/OWNER TO role-membership check/full text-search DDL family/FDW-SERVER duplicate guard, see deferral ledger"
-,regress-sql,regress,postgres/src/test/regress/sql/alter_operator.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/alter_operator.sql,failed,no,-,"Sized M0134-0089 (2026-08-24); PARKED — needs pg_describe_object (entirely unimplemented), contsel/contjoinsel builtin registration, quoted ALTER OPERATOR SET option names, OWNER-check, already-set COMMUTATOR/NEGATOR collision guard, see deferral ledger"
 ,regress-sql,regress,postgres/src/test/regress/sql/alter_table.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/amutils.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/arrays.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope

@@ -15279,6 +15279,72 @@ func (c *InMemory) PGDependRowsForDBOid(dbOid uint32) [][]string {
 			}
 		}
 
+	// CREATE OPERATOR: makeOperatorDependencies (pg_operator.c) records a
+	// NORMAL ('n') dependency from the operator onto its namespace, left/
+	// right/result argument types, and its oprcode/oprrest/oprjoin
+	// functions — but skips any referenced object that isObjectPinned()
+	// (postgres/src/backend/catalog/catalog.c:IsPinnedObject): OID < 12000
+	// (FirstUnpinnedObjectId) is pinned EXCEPT the public namespace, which
+	// PG explicitly carves out as never-pinned. Confirmed against a live
+	// PG 18.3 oracle via alter_operator.sql: a fresh `CREATE OPERATOR ===`
+	// using a user-defined restrict function and builtin (pinned) join
+	// function reports exactly 3 pg_depend rows — oprcode, oprrest, and the
+	// public-namespace row — with the pinned join function and pinned bool
+	// left/right/result types omitted. Prior to this, goopg emitted ZERO
+	// pg_depend rows for any CREATE OPERATOR at all. userOperators has no
+	// per-DB scoping (same pre-existing gap as the amOpMembers/amProcMembers
+	// loops above), so this loop is unconditional like those. M0134-0089.
+	isPinnedOID := func(classOID, objOID uint32) bool {
+		if objOID >= 12000 {
+			return false
+		}
+		if classOID == 2615 && objOID == PublicNamespaceOID { // pg_namespace, public
+			return false
+		}
+		return true
+	}
+	addOperatorDep := func(opOID, refClassOID, refObjOID uint32) {
+		if refObjOID == 0 || isPinnedOID(refClassOID, refObjOID) {
+			return
+		}
+		rows = append(rows, []string{
+			"2617", // 0: classid    = pg_operator
+			strconv.FormatUint(uint64(opOID), 10), // 1: objid = operator OID
+			"0",    // 2: objsubid
+			strconv.FormatUint(uint64(refClassOID), 10), // 3: refclassid
+			strconv.FormatUint(uint64(refObjOID), 10),   // 4: refobjid
+			"0", // 5: refobjsubid
+			"n", // 6: deptype = NORMAL
+		})
+	}
+	operatorResultTypeOID := func(funcOID uint32) uint32 {
+		if funcOID == 0 {
+			return 0
+		}
+		if rs := c.routines; rs != nil {
+			if r := rs.LookupByOID(funcOID); r != nil {
+				return TypeNameToOID(r.ReturnType.Name)
+			}
+		}
+		if bp, ok := LookupBuiltinProcByOID(funcOID); ok {
+			return TypeNameToOID(bp.RetType)
+		}
+		return 0
+	}
+	for _, op := range c.userOperators {
+		addOperatorDep(op.OID, 2615, op.NamespaceOIDOrDefault()) // pg_namespace
+		if op.LeftType != "" {
+			addOperatorDep(op.OID, 1247, TypeNameToOID(op.LeftType)) // pg_type
+		}
+		if op.RightType != "" {
+			addOperatorDep(op.OID, 1247, TypeNameToOID(op.RightType))
+		}
+		addOperatorDep(op.OID, 1247, operatorResultTypeOID(op.FuncOID))
+		addOperatorDep(op.OID, 1255, op.FuncOID)     // pg_proc: oprcode
+		addOperatorDep(op.OID, 1255, op.RestrictOID) // pg_proc: oprrest
+		addOperatorDep(op.OID, 1255, op.JoinOID)     // pg_proc: oprjoin
+	}
+
 	return rows
 }
 
@@ -18907,6 +18973,39 @@ func (c *InMemory) LookupUserOperator(schema, name, leftType, rightType string) 
 	defer c.mu.RUnlock()
 	op, ok := c.userOperators[userOperatorKey(schema, name, leftType, rightType)]
 	return op, ok
+}
+
+// LookupUserOperatorByNameAndTypeOIDs finds a registered operator by symbol
+// name plus (leftType, rightType) resolved through TypeNameToOID first —
+// unlike LookupUserOperator's exact-string key, this matches an alias
+// spelling against the CREATE OPERATOR-declared type name (e.g. `bool`
+// against a LEFTARG stored as `boolean`), mirroring LookupBuiltinOperator's
+// own OID-normalized keying. Backs the `'name(left,right)'::regoperator`
+// input parser (regoperatorin, postgres/src/backend/utils/adt/regproc.c) —
+// alter_operator.sql's `WHERE objid = '===(bool,bool)'::regoperator` would
+// never match a `LEFTARG = boolean`-declared operator without this
+// normalization. leftOID/rightOID of 0 means NONE (a missing unary operand).
+// Linear scan, same scale rationale as LookupUserOperatorByOID. M0134-0089.
+func (c *InMemory) LookupUserOperatorByNameAndTypeOIDs(name string, leftOID, rightOID uint32) (*UserOperator, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, op := range c.userOperators {
+		if op.Name != name {
+			continue
+		}
+		opLeftOID := uint32(0)
+		if op.LeftType != "" {
+			opLeftOID = TypeNameToOID(op.LeftType)
+		}
+		opRightOID := uint32(0)
+		if op.RightType != "" {
+			opRightOID = TypeNameToOID(op.RightType)
+		}
+		if opLeftOID == leftOID && opRightOID == rightOID {
+			return op, true
+		}
+	}
+	return nil, false
 }
 
 // LookupUserOperatorByOID finds a previously-registered operator by its OID.

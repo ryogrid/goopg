@@ -214,6 +214,41 @@ func regprocedureNamePart(s string) string {
 	return s
 }
 
+// regoperatorNameAndArgs splits a `'name(left,right)'::regoperator` input
+// into its operator symbol and two argument-type spellings, mirroring
+// parseNameAndArgTypes' 2-arg case for regoperatorin (postgres/src/backend/
+// utils/adt/regproc.c:639-676) — unlike regprocedureNamePart's deliberate
+// name-only leniency, the operator's (left,right) pair is REQUIRED here to
+// disambiguate an overloaded symbol (alter_operator.sql declares both
+// `=== (boolean, boolean)` and `=== (boolean, real)`; resolving by name alone
+// would pick the wrong one). `NONE` denotes a missing operand of a unary
+// operator (leftType=="" / rightType==""), matching format_operator's own
+// output spelling. ok=false for anything not shaped like `name(a,b)` — a bare
+// name (no parens) or a single-argument list falls through to the caller's
+// existing numeric-OID/unresolved handling, matching regoperatorin's
+// "missing argument" case loosely (goopg does not special-case that error
+// message). M0134-0089.
+func regoperatorNameAndArgs(s string) (name, leftType, rightType string, ok bool) {
+	open := strings.IndexByte(s, '(')
+	if open < 0 || !strings.HasSuffix(s, ")") {
+		return "", "", "", false
+	}
+	argsPart := s[open+1 : len(s)-1]
+	parts := strings.Split(argsPart, ",")
+	if len(parts) != 2 {
+		return "", "", "", false
+	}
+	leftType = strings.TrimSpace(parts[0])
+	rightType = strings.TrimSpace(parts[1])
+	if strings.EqualFold(leftType, "NONE") {
+		leftType = ""
+	}
+	if strings.EqualFold(rightType, "NONE") {
+		rightType = ""
+	}
+	return strings.TrimSpace(s[:open]), leftType, rightType, true
+}
+
 func regIdentifierInput(v Datum, typeName string, ctx *Context, pos int) (Datum, error) {
 	if v.Kind != KindString {
 		// numeric literal / already-OID datum — the heap arm range-checks.
