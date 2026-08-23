@@ -12760,6 +12760,13 @@ func exprType(e Expr) catalog.Type {
 		case "random", "random_normal", "drandom":
 			// random() → float8 in [0,1). M0097-0042.
 			return catalog.Type{Name: "float8"}
+		case "pg_notification_queue_usage":
+			// pg_notification_queue_usage() → float8 in [0,1] (async.c). Without
+			// this arm the FuncCall falls through to "unknown", which psql
+			// renders left-justified (text-like) instead of right-justified
+			// numeric — diverges from the PG oracle's `async.sql` expected
+			// output even though the runtime value is correct. M0134-0091.
+			return catalog.Type{Name: "float8"}
 		case "generate_series":
 			// generate_series returns int4 for int4 args or integer literals (PG overload rules).
 			if len(x.Args) >= 1 {

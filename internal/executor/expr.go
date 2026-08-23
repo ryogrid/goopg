@@ -10225,9 +10225,12 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		// pg_notify(channel text, payload text) → void: the SQL-function form of
 		// the NOTIFY statement. Buffers a notification (delivered to LISTENers at
 		// the current transaction's commit) via ctx.QueueNotify, which the server
-		// wires to the connection's notify buffer. A NULL payload is treated as
-		// the empty payload (matching NOTIFY without a payload). A NULL/empty
-		// channel is a no-op here. Returns void (empty value). M0118-0009.
+		// wires to the connection's notify buffer. A NULL channel/payload is
+		// treated as the empty string, matching pg_notify(PG_FUNCTION_ARGS)
+		// (postgres/src/backend/commands/async.c:556-576), which then feeds
+		// Async_Notify's length checks (async.c:604-621): an empty channel name
+		// or one whose length reaches NAMEDATALEN (64, i.e. 63+ bytes) errors
+		// with ERRCODE_INVALID_PARAMETER_VALUE. M0118-0009, M0134-0091.
 		if len(x.Args) < 1 {
 			return NullDatum, nil
 		}
@@ -10235,8 +10238,9 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		if err != nil {
 			return NullDatum, err
 		}
-		if chArg.IsNull() {
-			return NullDatum, nil
+		channel := ""
+		if !chArg.IsNull() {
+			channel = chArg.StringValue()
 		}
 		payload := ""
 		if len(x.Args) >= 2 {
@@ -10248,8 +10252,17 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				payload = pArg.StringValue()
 			}
 		}
+		if channel == "" {
+			// Async_Notify's ereport has no errposition() call, so PG attaches
+			// no cursor position to this error — Pos stays 0 (no LINE/^
+			// pointer on the wire). M0134-0070/M0134-0091.
+			return NullDatum, &ExecError{Code: "22023", Message: "channel name cannot be empty"}
+		}
+		if len(channel) >= 64 {
+			return NullDatum, &ExecError{Code: "22023", Message: "channel name too long"}
+		}
 		if ctx != nil && ctx.QueueNotify != nil {
-			ctx.QueueNotify(chArg.StringValue(), payload)
+			ctx.QueueNotify(channel, payload)
 		}
 		// pg_notify returns void — a non-NULL empty value (like the advisory-lock
 		// builtins), so `count(pg_notify(...))` counts every row (PostgreSQL's
