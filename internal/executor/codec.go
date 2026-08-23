@@ -2085,8 +2085,44 @@ func pgUnsignedIDFromDatum(d Datum, typeName string, bits int) (uint64, error) {
 	case KindInt:
 		v = d.Int
 	case KindString:
+		s := strings.TrimSpace(d.StringValue())
+		// xid/xid8's own *in functions (xidin/xid8in) route through
+		// uint32in_subr/uint64in_subr, which call strto[u]l(s, &endptr, 0) —
+		// base 0, so octal ("0NNN") and hex ("0xNNN") literals are valid
+		// alongside decimal (postgres/src/backend/utils/adt/numutils.c:985-992,
+		// xid.c:187-201). coerceStringToInt64 (below) is decimal-only, which
+		// is right for oid/regproc's typed-literal path elsewhere but wrong
+		// here for xid/xid8: an `INSERT INTO t(x xid8) VALUES ('0x2a')` (a
+		// string literal implicitly coerced into the column at heap-encode
+        // time, NOT through evalCast's `'…'::xid8` parseXid8) previously
+		// raised a spurious 22003 "out of range" instead of decoding the hex.
+		// M0134-0087 (xid.sql sizing) — the CastExpr path (evalCast, expr.go)
+		// already had working parseXid/parseXid8; this was the sibling gap
+		// (pattern_sibling_paths_must_agree).
+		if typeName == "xid" || typeName == "xid8" {
+			if s == "-1" {
+				v = -1 // two's-complement image of all-ones, correct for both widths
+				break
+			}
+			if bits == 32 {
+				n, err := parseXid(s)
+				if err != nil {
+					return 0, &ExecError{Code: "22P02",
+						Message: fmt.Sprintf("invalid input syntax for type %s: %q", typeName, s)}
+				}
+				v = int64(n)
+			} else {
+				n, err := parseXid8(s)
+				if err != nil {
+					return 0, &ExecError{Code: "22P02",
+						Message: fmt.Sprintf("invalid input syntax for type %s: %q", typeName, s)}
+				}
+				v = int64(n)
+			}
+			break
+		}
 		var err error
-		v, err = coerceStringToInt64(d.StringValue(), typeName)
+		v, err = coerceStringToInt64(s, typeName)
 		if err != nil {
 			return 0, err
 		}

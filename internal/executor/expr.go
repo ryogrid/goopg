@@ -4662,6 +4662,56 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 		default:
 			return d, nil
 		}
+	case "xid", "xid8":
+		// M0134-0087 (xid.sql sizing): evalCast had NO case for xid/xid8 at
+		// all, so `'…'::xid`/`'…'::xid8` (and an implicit cast into an
+		// xid/xid8 COLUMN, e.g. `INSERT INTO t(x xid8) VALUES ('0x2a')`) fell
+		// through to the bottom default arm and returned the input datum
+		// UNCHANGED — no octal/hex parsing, no range validation, no 22P02 on
+		// garbage input ('asdf'::xid silently "succeeded" as the string
+		// "asdf"). This mirrors the CastExpr-vs-TypedStringLit split the
+		// pattern_sibling_paths_must_agree memory warns about: the `xid
+		// '42'` TypedStringLit form (evalTypedStringLit, above) already had
+		// working parseXid/parseXid8 logic; `'42'::xid` (CastExpr, this
+		// function) did not share it.
+		bits := 32
+		typeName := "xid"
+		wrapped := int64(uint32(0xffffffff)) // -1 special case, 32-bit
+		if targetType == "xid8" {
+			bits = 64
+			typeName = "xid8"
+			wrapped = -1 // int64(-1) bit-for-bit equals uint64 2^64-1
+		}
+		switch d.Kind {
+		case KindInt:
+			if bits == 32 {
+				// xid8::xid truncates to the low 32 bits (xid8toxid /
+				// XidFromFullTransactionId, postgres/src/backend/utils/adt/xid.c:187-191).
+				return Datum{Kind: KindInt, Int: int64(uint32(uint64(d.Int)))}, nil
+			}
+			return d, nil
+		case KindString:
+			v := strings.TrimSpace(d.StringValue())
+			if v == "-1" {
+				return Datum{Kind: KindInt, Int: wrapped}, nil
+			}
+			var n uint64
+			var err error
+			if bits == 32 {
+				var n32 uint32
+				n32, err = parseXid(v)
+				n = uint64(n32)
+			} else {
+				n, err = parseXid8(v)
+			}
+			if err != nil {
+				return Datum{}, &ExecError{Code: "22P02", Pos: pos,
+					Message: fmt.Sprintf("invalid input syntax for type %s: %q", typeName, d.StringValue())}
+			}
+			return Datum{Kind: KindInt, Int: int64(n)}, nil
+		default:
+			return d, nil
+		}
 	case "pg_lsn":
 		switch d.Kind {
 		case KindString:
@@ -5018,10 +5068,18 @@ func parseXid(s string) (uint32, error) {
 	return uint32(n), err
 }
 
-// parseXid8 parses an xid8 value (unsigned 64-bit). M0097-0018.
+// parseXid8 parses an xid8 value (unsigned 64-bit). Accepts decimal, octal
+// (0NNN), hex (0xNNN) — matching xid8in's uint64in_subr, which calls
+// strtou64(s, &endptr, 0) (base 0 = C's octal/hex/decimal auto-detect,
+// postgres/src/backend/utils/adt/numutils.c:985-992). M0097-0018;
+// octal support added M0134-0087 (parseXid already had it; this was the
+// sibling gap — pattern_sibling_paths_must_agree).
 func parseXid8(s string) (uint64, error) {
 	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
 		return strconv.ParseUint(s[2:], 16, 64)
+	}
+	if len(s) > 1 && s[0] == '0' {
+		return strconv.ParseUint(s[1:], 8, 64)
 	}
 	return strconv.ParseUint(s, 10, 64)
 }

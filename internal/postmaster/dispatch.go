@@ -3494,6 +3494,21 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 				s.cfg.Catalog, !publicSchemaVisible(getSetting), argVisible)...)
 		}
 		return d.AppendValueText(dst)
+	case "xid8":
+		// xid8 is a 64-bit UNSIGNED transaction ID (xid8out, xid.c) but
+		// goopg's Datum.Int carries it as a signed int64 (e.g. the wrapped
+		// literal '-1'::xid8 stores the two's-complement bit pattern for
+		// 2^64-1). The default AppendValueText below does a plain SIGNED
+		// strconv.AppendInt and would render such a value as "-1" instead of
+		// "18446744073709551615" — the same unsigned-vs-signed mismatch the
+		// binary/COPY encoders already avoid via pgUnsignedIDFromDatum
+		// (internal/executor/codec.go); this is the TEXT-protocol twin,
+		// M0134-0087 (xid.sql sizing) uncovering the same class the
+		// binary path fixed earlier without extending it here.
+		if d.Kind == executor.KindInt {
+			return strconv.AppendUint(dst, uint64(d.Int), 10)
+		}
+		return d.AppendValueText(dst)
 	default:
 		return d.AppendValueText(dst)
 	}

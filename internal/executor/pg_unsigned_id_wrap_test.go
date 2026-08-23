@@ -28,6 +28,23 @@ func TestPgUnsignedIDFromDatumNegativeWrap(t *testing.T) {
 		{"oid below int32 is out of range", "oid", 32, NewIntDatum(-2147483649), 0, true},
 		{"oid min int32 wraps to 2^31", "oid", 32, NewIntDatum(-2147483648), 2147483648, false},
 		{"xid8 wraps -1040", "xid8", 64, NewIntDatum(-1040), 18446744073709550576, false},
+		// M0134-0087 (xid.sql sizing): the KindString branch used to route
+		// through coerceStringToInt64 (decimal-only) for every typeName,
+		// including xid/xid8 — so a heap-encode-time implicit coercion (e.g.
+		// `INSERT INTO t(x xid8) VALUES ('0x2a')`) rejected hex/octal input
+		// that the CastExpr path (evalCast, parseXid/parseXid8) already
+		// accepted. These pin the fix: xid/xid8's own *in functions parse
+		// base-0 (octal/hex/decimal), matching evalCast's sibling logic.
+		{"xid string hex", "xid", 32, NewStringDatum("0x2a"), 42, false},
+		{"xid string octal", "xid", 32, NewStringDatum("010"), 8, false},
+		{"xid string decimal", "xid", 32, NewStringDatum("42"), 42, false},
+		{"xid string -1 wraps", "xid", 32, NewStringDatum("-1"), 4294967295, false},
+		{"xid string garbage errors", "xid", 32, NewStringDatum("asdf"), 0, true},
+		{"xid8 string hex", "xid8", 64, NewStringDatum("0xffffffffffffffff"), 18446744073709551615, false},
+		{"xid8 string octal", "xid8", 64, NewStringDatum("010"), 8, false},
+		{"xid8 string decimal", "xid8", 64, NewStringDatum("42"), 42, false},
+		{"xid8 string -1 wraps", "xid8", 64, NewStringDatum("-1"), 18446744073709551615, false},
+		{"xid8 string garbage errors", "xid8", 64, NewStringDatum("asdf"), 0, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
