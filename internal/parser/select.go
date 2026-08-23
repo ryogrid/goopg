@@ -3214,7 +3214,9 @@ func (p *parser) tryTypedLiteral() (Expr, bool) {
 		"name", "oid", "pg_lsn",
 		// txid_snapshot/pg_snapshot 'string' cast syntax (M0134-0080), used
 		// by txid.sql: `txid_snapshot '1000...:1000...:1000...'`.
-		"txid_snapshot", "pg_snapshot":
+		"txid_snapshot", "pg_snapshot",
+		// box 'string' cast syntax (M0134-0094), e.g. `box '(2,2),(0,0)'`.
+		"box":
 		// Handle multi-word type names: "TIME WITH TIME ZONE 'lit'" and
 		// "TIMESTAMP WITH TIME ZONE 'lit'" / "WITHOUT TIME ZONE 'lit'".
 		// Layout: peek(0)=cur(time/timestamp) peek(1)=with/without peek(2)=time peek(3)=zone peek(4)=string

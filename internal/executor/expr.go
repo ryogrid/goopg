@@ -2219,6 +2219,164 @@ func parseBoxText(s string) (ur, ll [2]float64, ok bool) {
 	return p1, p2, true
 }
 
+// parseBoxLiteral reproduces box_in's parsing (via path_decode/pair_decode,
+// postgres/src/backend/utils/adt/geo_ops.c) closely enough to give the same
+// accept/reject verdict and the same corner values on every case exercised by
+// box.sql: it accepts two coordinate pairs with an optional outer wrapper
+// paren (single, e.g. "(x1,y1,x2,y2)", or doubled, e.g.
+// "((x1,y1),(x2,y2))") and per-point optional parens, requires the ENTIRE
+// string to be consumed (box_in passes a nil endptr, so trailing garbage like
+// "(1,2,3,4) x" is rejected), and reorders the two points into (high, low) —
+// PG swaps per-axis so high >= low on each of x and y independently, which is
+// NOT simply "swap the two points" when the box is degenerate/crossed.
+// M0134-0094: this is the single chokepoint a box(n) column's assignment
+// coercion, a `box '...'` typed literal, and pg_input_is_valid('...','box')
+// all share; distinct from parseBoxText above, which parses an
+// already-canonical "(x,y),(x,y)" string for the exclusion-constraint path
+// and does not validate or reorder.
+func parseBoxLiteral(s string) (hx, hy, lx, ly float64, ok bool) {
+	skipWS := func(t string) string {
+		return strings.TrimLeft(t, " \t\n\r\v\f")
+	}
+	s = skipWS(s)
+	if s == "" {
+		return
+	}
+	// '<' is the open-path delimiter; box never accepts it (opentype=false).
+	if s[0] == '<' {
+		return
+	}
+	depth := 0
+	if s[0] == '(' {
+		cp := skipWS(s[1:])
+		if cp != "" && cp[0] == '(' {
+			depth++
+			s = cp
+		} else if strings.Count(s, "(") == 1 {
+			depth++
+			s = cp
+		}
+	}
+
+	var pts [2][2]float64
+	for i := 0; i < 2; i++ {
+		x, y, rest, okPair := pairDecode(s)
+		if !okPair {
+			return
+		}
+		s = rest
+		if s != "" && s[0] == ',' {
+			s = s[1:]
+		}
+		pts[i] = [2]float64{x, y}
+	}
+
+	for depth > 0 {
+		if s != "" && s[0] == ')' {
+			depth--
+			s = skipWS(s[1:])
+		} else {
+			return
+		}
+	}
+	if s != "" {
+		return
+	}
+
+	hx, lx = pts[0][0], pts[1][0]
+	if lx > hx {
+		hx, lx = lx, hx
+	}
+	hy, ly = pts[0][1], pts[1][1]
+	if ly > hy {
+		hy, ly = ly, hy
+	}
+	return hx, hy, lx, ly, true
+}
+
+// pairDecode parses one "(x,y)" or "x,y" coordinate pair (pair_decode in
+// geo_ops.c), returning the unconsumed remainder of s.
+func pairDecode(s string) (x, y float64, rest string, ok bool) {
+	s = strings.TrimLeft(s, " \t\n\r\v\f")
+	hasDelim := s != "" && s[0] == '('
+	if hasDelim {
+		s = s[1:]
+	}
+	x, s, ok = singleDecode(s)
+	if !ok {
+		return 0, 0, "", false
+	}
+	if s == "" || s[0] != ',' {
+		return 0, 0, "", false
+	}
+	s = s[1:]
+	y, s, ok = singleDecode(s)
+	if !ok {
+		return 0, 0, "", false
+	}
+	if hasDelim {
+		if s == "" || s[0] != ')' {
+			return 0, 0, "", false
+		}
+		s = strings.TrimLeft(s[1:], " \t\n\r\v\f")
+	}
+	return x, y, s, true
+}
+
+// singleDecode parses the longest valid float8 prefix of s (single_decode in
+// geo_ops.c, which itself calls float8in's strtod-based scan), returning the
+// unconsumed remainder.
+func singleDecode(s string) (float64, string, bool) {
+	s = strings.TrimLeft(s, " \t\n\r\v\f")
+	i := 0
+	if i < len(s) && (s[i] == '+' || s[i] == '-') {
+		i++
+	}
+	digitsBefore := i
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		i++
+	}
+	digitsBefore = i - digitsBefore
+	digitsAfter := 0
+	if i < len(s) && s[i] == '.' {
+		i++
+		start := i
+		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			i++
+		}
+		digitsAfter = i - start
+	}
+	if digitsBefore == 0 && digitsAfter == 0 {
+		return 0, "", false
+	}
+	if i < len(s) && (s[i] == 'e' || s[i] == 'E') {
+		j := i + 1
+		if j < len(s) && (s[j] == '+' || s[j] == '-') {
+			j++
+		}
+		k := j
+		for k < len(s) && s[k] >= '0' && s[k] <= '9' {
+			k++
+		}
+		if k > j {
+			i = k
+		}
+	}
+	v, err := strconv.ParseFloat(s[:i], 64)
+	if err != nil {
+		return 0, "", false
+	}
+	return v, s[i:], true
+}
+
+// boxCanonicalText formats a box's high/low corners exactly as box_out does
+// (path_encode(PATH_NONE, 2, &high) — "(hx,hy),(lx,ly)", each coordinate via
+// float8out's Ryu-based shortest-roundtrip formatting). M0134-0094.
+func boxCanonicalText(hx, hy, lx, ly float64) string {
+	return fmt.Sprintf("(%s,%s),(%s,%s)",
+		PGFloatOut(hx, 64), PGFloatOut(hy, 64), PGFloatOut(lx, 64), PGFloatOut(ly, 64))
+}
+
 // evalLikeEscapePattern evaluates a LikeEscapePattern's Pattern and Escape
 // operands and rewrites Pattern into PostgreSQL's standard backslash-escape
 // convention, so the caller (evalBinary's LIKE/ILIKE arm, via
@@ -3810,6 +3968,16 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 				Message: fmt.Sprintf("invalid input syntax for type pg_snapshot: %q", x.Value)}
 		}
 		return NewStringDatum(norm), nil
+	case "box":
+		// M0134-0094: `box '...'` shares the same validate+canonicalize
+		// chokepoint as a box(n) column's assignment coercion
+		// (coerceTextLikeDatum, codec.go) — both call parseBoxLiteral.
+		hx, hy, lx, ly, ok := parseBoxLiteral(x.Value)
+		if !ok {
+			return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(),
+				Message: fmt.Sprintf("invalid input syntax for type box: %q", x.Value)}
+		}
+		return NewStringDatum(boxCanonicalText(hx, hy, lx, ly)), nil
 	default:
 		// Unknown type — treat as text literal. Covers enum/domain casts in v0.
 		// M0097-0017: enum/domain type casts return the string value as-is.
@@ -10967,6 +11135,11 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				// path and pg_input_error_info. M0134-0070.
 				_, err := byteaIn(v, 0)
 				return NewBoolDatum(err == nil), nil
+			case "box":
+				// M0134-0094: agrees with the typed-literal/coercion path,
+				// same parseBoxLiteral.
+				_, _, _, _, ok := parseBoxLiteral(v)
+				return NewBoolDatum(ok), nil
 			default:
 				// varchar(N) / character varying(N) / char(N) / bpchar(N). M0097-0003.
 				if valid, ok := pgInputIsValidTypedLen(v, t); ok {

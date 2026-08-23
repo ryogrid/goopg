@@ -269,6 +269,21 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 					Message: fmt.Sprintf("bit string too long for type bit varying(%d)", n)}
 			}
 		}
+	} else if tname == "box" {
+		// box: validate + canonicalize on assignment, mirroring box_in
+		// (postgres/src/backend/utils/adt/geo_ops.c) — the single chokepoint
+		// every path into a box column shares (plain string literal,
+		// implicit coercion, computed text value), not just a `box '...'`
+		// typed literal (which routes through evalTypedStringLit instead,
+		// same parseBoxLiteral). Previously a box column was raw-varlena
+		// pass-through: any string, well-formed or not, was stored
+		// verbatim with no reordering of corners. M0134-0094.
+		hx, hy, lx, ly, ok := parseBoxLiteral(s)
+		if !ok {
+			return "", &ExecError{Code: "22P02",
+				Message: fmt.Sprintf("invalid input syntax for type box: %q", s)}
+		}
+		s = boxCanonicalText(hx, hy, lx, ly)
 	}
 	return s, nil
 }
