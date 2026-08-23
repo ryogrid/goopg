@@ -7,7 +7,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-sql,regress,postgres/src/test/regress/sql/amutils.sql,failed,no,-,Sized live M0134-0090 — pg_indexam_has_property/pg_index_has_property/pg_index_column_has_property landed; blocked on geometry.sql (point/circle operator lexing) never creating gcircleind
 ,regress-sql,regress,postgres/src/test/regress/sql/arrays.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/async.sql,pass,yes,-,M0134-0091: fixed pg_notification_queue_usage() FuncCall type inference (unknown -> float8 matching random()'s pattern) and pg_notify() channel-name validation (empty/NULL -> 22023 channel name cannot be empty; >=NAMEDATALEN -> 22023 channel name too long; no errposition per async.c). scripts/pg-regress-runner.sh --verbose async: 100% parity.
-,regress-sql,regress,postgres/src/test/regress/sql/bit.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/bit.sql,failed,no,-,"Sized live M0134-0092 (2026-08-24); PARKED — landed B'...'/X'...' bit-string literal syntax + bit(n)/varbit(n) column length/digit coercion (diff 1054->581 lines); needs bit-typed AST node/BITOID typing, bitwise operator family (~ & | # << >>), || concat, length()/substring() over bit, COPY hex decode, pg_input_is_valid/pg_input_error_info routing, see deferral ledger"
 ,regress-sql,regress,postgres/src/test/regress/sql/bitmapops.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/boolean.sql,pass,yes,-,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
 ,regress-sql,regress,postgres/src/test/regress/sql/box.sql,not-tried,no,-,

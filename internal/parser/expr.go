@@ -1,6 +1,9 @@
 package parser
 
-import "strconv"
+import (
+	"strconv"
+	"strings"
+)
 
 // Expr is implemented by every expression-tree node.
 type Expr interface {
@@ -26,6 +29,70 @@ type StringConst struct {
 
 func (e *StringConst) Pos() int { return e.pos }
 func (*StringConst) exprNode()  {}
+
+// decodeBitStringLit validates and decodes a B'...'/X'...' bit-string
+// literal token (Value = marker byte 'b'/'x' + raw source digits, see
+// lexBitOrHexString) into its canonical binary-digit text ('0'/'1' chars
+// only — a hex nibble expands to 4 bits, MSB first, matching varbit.c's
+// bit_in/varbit_in). PG calls bit_in eagerly while building the A_Const
+// (parse_node.c transformExprRecurse, T_BitString case) rather than
+// deferring to assignment time, so an invalid digit errors immediately
+// with ERRCODE_INVALID_TEXT_REPRESENTATION (22P02) and an errposition at
+// the literal's start — reproduced here the same way.
+//
+// The decoded text is wrapped in a plain *StringConst rather than a
+// dedicated bit-typed node: goopg's existing string->bit(n)/varbit(n)
+// column coercion already reproduces PG's length-mismatch errors
+// byte-for-byte for a plain quoted-string literal (verified: `INSERT INTO
+// t(bit_col) VALUES ('10')` already raises "bit string length 2 does not
+// match type bit(11)"), so reusing that path gets INSERT/SELECT round-trips
+// right for free. Known gap (ledgered, M0134-0092): the literal ends up
+// typed UNKNOWN/text instead of BITOID, so an untyped context (a bare
+// `SELECT b'1010'` with no target column) and bit-typed operator dispatch
+// without an explicit cast are not PG-faithful — bit.sql's literal-syntax
+// cases don't exercise that gap, only its bit(n)/varbit(n) column cases do.
+func decodeBitStringLit(t Token) (Expr, error) {
+	marker := t.Value[0]
+	body := t.Value[1:]
+	if marker == 'b' {
+		for i := 0; i < len(body); i++ {
+			if body[i] != '0' && body[i] != '1' {
+				return nil, &SyntaxError{
+					Pos: t.Pos, Raw: true, Code: "22P02",
+					Message: strconv.Quote(body[i:i+1]) + " is not a valid binary digit",
+				}
+			}
+		}
+		return &StringConst{pos: t.Pos, Value: body}, nil
+	}
+	var out strings.Builder
+	out.Grow(len(body) * 4)
+	for i := 0; i < len(body); i++ {
+		c := body[i]
+		var v byte
+		switch {
+		case c >= '0' && c <= '9':
+			v = c - '0'
+		case c >= 'A' && c <= 'F':
+			v = c - 'A' + 10
+		case c >= 'a' && c <= 'f':
+			v = c - 'a' + 10
+		default:
+			return nil, &SyntaxError{
+				Pos: t.Pos, Raw: true, Code: "22P02",
+				Message: strconv.Quote(body[i:i+1]) + " is not a valid hexadecimal digit",
+			}
+		}
+		for bit := 3; bit >= 0; bit-- {
+			if v&(1<<uint(bit)) != 0 {
+				out.WriteByte('1')
+			} else {
+				out.WriteByte('0')
+			}
+		}
+	}
+	return &StringConst{pos: t.Pos, Value: out.String()}, nil
+}
 
 // PartitionRangeBoundKeyword is the MINVALUE / MAXVALUE keyword in a RANGE
 // partition bound (an unbounded edge: -∞ / +∞). It is intentionally a distinct

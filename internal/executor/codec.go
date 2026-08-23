@@ -233,8 +233,58 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 			}
 			s = stripped
 		}
+	} else if tname == "bit" {
+		// bit(n): fixed-length, EXACT bit count — no padding/truncation on
+		// assignment. Mirrors varbit.c bit_in's binary-digit scan (only '0'/
+		// '1' accepted, ERRCODE_INVALID_TEXT_REPRESENTATION 22P02 on anything
+		// else) followed by the exact-length check (ERRCODE_STRING_DATA_
+		// LENGTH_MISMATCH 22026 when atttypmod is set and bitlen != atttypmod).
+		// A B'...'/X'...' literal (decodeBitStringLit, internal/parser/expr.go)
+		// already validated its own digit set at parse time, but this is the
+		// single chokepoint every OTHER path into a bit(n) column also passes
+		// through — a plain string literal (`'10'::bit(11)`, implicit
+		// assignment coercion) or a computed text value never went through the
+		// parser's literal decoder at all. M0134-0092.
+		if err := validateBitDigits(s); err != nil {
+			return "", err
+		}
+		if len(t.Args) > 0 {
+			n := int(t.Args[0])
+			if len(s) != n {
+				return "", &ExecError{Code: "22026",
+					Message: fmt.Sprintf("bit string length %d does not match type bit(%d)", len(s), n)}
+			}
+		}
+	} else if tname == "varbit" || tname == "bit varying" {
+		// bit varying(n): like bit(n) but the length check is an upper bound
+		// (ERRCODE_STRING_DATA_RIGHT_TRUNCATION 22001, "too long"), not an
+		// exact match — varbit.c varbit_in's `bitlen > atttypmod` arm.
+		if err := validateBitDigits(s); err != nil {
+			return "", err
+		}
+		if len(t.Args) > 0 {
+			n := int(t.Args[0])
+			if len(s) > n {
+				return "", &ExecError{Code: "22001",
+					Message: fmt.Sprintf("bit string too long for type bit varying(%d)", n)}
+			}
+		}
 	}
 	return s, nil
+}
+
+// validateBitDigits checks that s contains only '0'/'1' characters, matching
+// varbit.c bit_in/varbit_in's binary-digit scan. Reports the first offending
+// character with PG's exact wording and SQLSTATE (22P02,
+// ERRCODE_INVALID_TEXT_REPRESENTATION).
+func validateBitDigits(s string) error {
+	for i := 0; i < len(s); i++ {
+		if s[i] != '0' && s[i] != '1' {
+			return &ExecError{Code: "22P02",
+				Message: fmt.Sprintf("%q is not a valid binary digit", string(s[i]))}
+		}
+	}
+	return nil
 }
 
 // pgBoolIn reproduces PostgreSQL's boolean input conversion —

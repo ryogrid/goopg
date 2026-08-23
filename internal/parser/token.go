@@ -20,6 +20,14 @@ const (
 	// NUMERIC waits on the type system.
 	TokenNumericLit
 	TokenStringLit
+	// TokenBitStringLit covers both bit-string (B'...') and hex-string
+	// (X'...') literals (PG SQL99 bit-type literal syntax; scan.l's
+	// xbstart/xhstart, gram.y AexprConst BCONST/XCONST). Value carries a
+	// leading marker byte ('b' or 'x', mirroring scan.l's own convention
+	// of prefixing addlitchar('b'|'x', ...) onto the buffer) followed by
+	// the raw, unvalidated source digits — decodeBitStringLit in select.go
+	// validates and decodes it. M0134-0092.
+	TokenBitStringLit
 	TokenParam // $N
 	TokenSymbol
 	TokenOperator

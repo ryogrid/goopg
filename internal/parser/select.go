@@ -3035,6 +3035,9 @@ func (p *parser) parsePrimary() (Expr, error) {
 	case TokenStringLit:
 		p.advance()
 		return &StringConst{pos: t.Pos, Value: t.Value}, nil
+	case TokenBitStringLit:
+		p.advance()
+		return decodeBitStringLit(t)
 	case TokenParam:
 		p.advance()
 		n, err := strconv.Atoi(t.Value)

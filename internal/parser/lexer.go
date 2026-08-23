@@ -191,6 +191,12 @@ func (l *lexer) next() (Token, error) {
 		if (text == "e") && l.pos < len(l.src) && l.src[l.pos] == '\'' {
 			return l.lexEscapeString(start)
 		}
+		// B'...' / X'...' bit-string / hex-string literals (scan.l
+		// xbstart/xhstart): single character 'b'/'B'/'x'/'X' immediately
+		// followed by a single-quote with no whitespace. M0134-0092.
+		if (text == "b" || text == "x") && l.pos < len(l.src) && l.src[l.pos] == '\'' {
+			return l.lexBitOrHexString(start, text == "x")
+		}
 		// U&'...'/U&"..." Unicode-escape string/identifier literal: single
 		// character 'u'/'U' immediately followed by '&' immediately followed
 		// by a quote, with zero whitespace tolerance anywhere (mirrors PG's
@@ -570,6 +576,45 @@ func (l *lexer) next() (Token, error) {
 	}
 
 	return Token{}, l.errf(start, "unexpected character %q", c)
+}
+
+// lexBitOrHexString handles B'...' (bit) and X'...' (hex) string literals.
+// The B/X prefix has already been consumed as a one-letter identifier and
+// l.pos points at the opening single-quote. Body content is passed through
+// verbatim (PG's own scan.l rule accepts any character here, including
+// invalid digits — the digit set is validated later by bit_in/varbit_in, not
+// the lexer); the '' doubling and newline-gap quote-continuation rules are
+// shared with plain string literals via scanPlainQuoteInto/tryQuoteContinuation.
+// Token.Value carries a leading marker byte ('b' or 'x') ahead of the raw
+// body so decodeBitStringLit (select.go) knows which digit set to validate
+// against without a second Token field. M0134-0092.
+func (l *lexer) lexBitOrHexString(start int, isHex bool) (Token, error) {
+	l.pos++ // consume opening '\''
+	var b strings.Builder
+	if isHex {
+		b.WriteByte('x')
+	} else {
+		b.WriteByte('b')
+	}
+	for {
+		closed, err := l.scanPlainQuoteInto(&b)
+		if err != nil {
+			return Token{}, err
+		}
+		if !closed {
+			if isHex {
+				return Token{}, l.errf(start, "unterminated hexadecimal string literal")
+			}
+			return Token{}, l.errf(start, "unterminated bit string literal")
+		}
+		cont, err := l.tryQuoteContinuation()
+		if err != nil {
+			return Token{}, err
+		}
+		if !cont {
+			return Token{Kind: TokenBitStringLit, Value: b.String(), Pos: start}, nil
+		}
+	}
 }
 
 // lexEscapeString handles E'...' escape-string literals. The E/e prefix has
