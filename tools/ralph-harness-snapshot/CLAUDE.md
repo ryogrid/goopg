@@ -7,7 +7,7 @@ compatibility is absolute; the read-only oracle is PG 18.3 under `./postgres/`
 ## Delegation architecture (Ralph loop, coordinator edition)
 
 The Ralph loop's main session is a **coordinator** on the strong model tier. It
-selects tasks, designs, decomposes, reviews, bookkeeps (`.ralph/fix_plan.md`,
+selects tasks, designs, decomposes, bookkeeps (`.ralph/fix_plan.md`,
 `.ralph/deferral_ledger.md`, `docs/**`), commits (explicit pathspecs, never
 `--no-verify`), and reports — and delegates everything else to subagents defined
 in `.claude/agents/`:

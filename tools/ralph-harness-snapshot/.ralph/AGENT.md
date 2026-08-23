@@ -83,33 +83,6 @@ wrapper prints a warning and runs the command **uncapped** rather than failing.
 - No CGo unless a specific syscall is unreachable from `golang.org/x/sys/unix`.
   Justify any introduction in a design doc.
 
-## Repository layout
-
-```
-.
-├── cmd/goopg/         # Top-level CLI entrypoint (replaces postmaster + pg_ctl + initdb)
-├── internal/          # All non-public packages live here
-│   ├── server/        # Listener, connection lifecycle, shutdown orchestration
-│   ├── protocol/      # PostgreSQL wire protocol (v3) framing and messages
-│   ├── config/        # postgresql.conf, pg_hba.conf, GUC registry
-│   ├── storage/       # Buffer manager, page format, file I/O (O_DIRECT)
-│   ├── wal/           # Write-ahead log writer and recovery
-│   ├── mvcc/          # Snapshot manager, visibility, transaction IDs
-│   ├── catalog/       # System catalogs and pg_* views
-│   ├── parser/        # SQL parser/analyzer
-│   ├── planner/       # Query planner
-│   ├── executor/      # Query executor and physical operators
-│   ├── access/        # Access methods (heap, btree)
-│   └── auth/          # trust / password / md5 / scram-sha-256
-├── docs/design/       # Design documents (<id>-NNNN-..., e.g. root-0001-... / 0002-0001-...) — see §9 of the spec
-├── postgres/          # READ-ONLY upstream PostgreSQL source — reference only
-├── .ralph/            # Ralph autonomous-loop control files (DO NOT MODIFY)
-└── go.mod
-```
-
-Subdirectories under `internal/` are created on demand as their corresponding
-milestones are tackled. Do not create empty stubs ahead of time.
-
 ## Build
 
 ```bash
@@ -289,21 +262,7 @@ around it.
 
 A read-only clone of the upstream PostgreSQL source tree lives at `./postgres/`.
 It is the source of truth for wire format, on-disk format, GUC defaults, error
-codes, system catalog shape, and SQL semantics. GNU GLOBAL tags are
-pre-generated under `./postgres/`, so:
-
-```bash
-# from inside ./postgres
-global -x SymbolName            # locate definitions
-global -rx SymbolName           # locate references
-global -f path/to/file.c        # list symbols defined in a file
-```
-
-Faster than grep/global for most lookups: the `mcp__any-script__pg_*` MCP tools
-query a pre-built symbol database over this tree —
-`pg_search_symbols` (SQL-LIKE patterns like `heap_%`), `pg_symbol_source`,
-`pg_symbol_overview`/`pg_symbol_document`, and `pg_references_to`/`pg_references_from`
-for caller/callee analysis. Prefer them; fall back to `global -x` when they miss.
+codes, system catalog shape, and SQL semantics.
 
 When porting any concept, cite the upstream file path (e.g.
 `postgres/src/backend/storage/buffer/bufmgr.c`) in the relevant design doc
@@ -334,16 +293,6 @@ scripts/pg-regress-runner.sh int4              # PASS/FAIL + diff
 
 A `PASS` means goopg output (after normalisation) matches PG 18.3 exactly.
 Any `FAIL` is a goopg compatibility bug to fix — never a reason to adjust PG.
-
-### Parity dashboard (no live server needed)
-
-```bash
-make parity-dashboard       # writes docs/parity-dashboard.md
-# Current baseline: GUC 17%, SQLSTATE 100%, pg_catalog 20%
-```
-
-Rising scores here are a lagging indicator of PG compatibility coverage.
-Use them to identify which GUC or catalog gap is blocking a specific feature.
 
 ## Design reference policy
 
@@ -395,8 +344,8 @@ If Go symbol operations fail:
 - One item per loop. Pick the topmost unchecked task in
   `.ralph/fix_plan.md` unless **the `## Current Priority` banner** or a
   dependency forces another order. The banner wins over topmost placement —
-  as of 2026-08-13 it ranks M-NIGHTLY first (standing filing + selection) with
-  M0132 as the next-priority milestone, so "topmost unchecked" is NOT the
+  it ranks M-NIGHTLY first (standing filing + selection) with
+  M0134 as the next-priority milestone, so "topmost unchecked" is NOT the
   selection rule today. The banner also outranks
   `.ralph/working_set.md`'s "NEXT LOOP" note, which carries state, not
   priority.
