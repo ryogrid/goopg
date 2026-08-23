@@ -11411,6 +11411,124 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		}
 		return NullDatum, nil
 
+	case "pg_indexam_has_property":
+		// pg_indexam_has_property(am_oid, propname) → bool — AM-wide
+		// capability probe (postgres/src/backend/utils/adt/amutils.c).
+		// M0134-0090.
+		if len(x.Args) < 2 {
+			return NullDatum, nil
+		}
+		amArg, err := evalExprSlot(x.Args[0], slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		propArg, err := evalExprSlot(x.Args[1], slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if amArg.IsNull() || propArg.IsNull() {
+			return NullDatum, nil
+		}
+		amOID, ok := resolveOIDArg(amArg)
+		if !ok {
+			return NullDatum, nil
+		}
+		amName, ok := catalog.AccessMethodNameByOID(amOID)
+		if !ok {
+			return NullDatum, nil
+		}
+		return indexAMAMLevelProperty(amName, propArg.StringValue()).toDatum(), nil
+
+	case "pg_index_has_property":
+		// pg_index_has_property(index_oid, propname) → bool — index-wide
+		// capability probe. M0134-0090.
+		if len(x.Args) < 2 {
+			return NullDatum, nil
+		}
+		idxArg, err := evalExprSlot(x.Args[0], slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		propArg, err := evalExprSlot(x.Args[1], slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if idxArg.IsNull() || propArg.IsNull() {
+			return NullDatum, nil
+		}
+		idxOID, ok := resolveOIDArg(idxArg)
+		if !ok {
+			return NullDatum, nil
+		}
+		im, ok := ctx.Catalog.(*catalog.InMemory)
+		if !ok {
+			return NullDatum, nil
+		}
+		idx, found := im.LookupIndexByOID(idxOID)
+		if !found {
+			return NullDatum, nil
+		}
+		return indexAMIndexLevelProperty(indexAMNameForCapabilityLookup(idx), propArg.StringValue()).toDatum(), nil
+
+	case "pg_index_column_has_property":
+		// pg_index_column_has_property(index_oid, colno, propname) → bool —
+		// per-column capability probe (indoption ASC/DESC/NULLS bits +
+		// per-AM column flags). M0134-0090.
+		if len(x.Args) < 3 {
+			return NullDatum, nil
+		}
+		idxArg, err := evalExprSlot(x.Args[0], slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		colArg, err := evalExprSlot(x.Args[1], slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		propArg, err := evalExprSlot(x.Args[2], slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if idxArg.IsNull() || colArg.IsNull() || propArg.IsNull() {
+			return NullDatum, nil
+		}
+		idxOID, ok := resolveOIDArg(idxArg)
+		if !ok {
+			return NullDatum, nil
+		}
+		var attno int
+		if colArg.Kind == KindInt {
+			attno = int(colArg.Int)
+		} else {
+			v, err := strconv.ParseInt(strings.TrimSpace(colArg.StringValue()), 10, 32)
+			if err != nil {
+				return NullDatum, nil
+			}
+			attno = int(v)
+		}
+		// "Reject attno 0 immediately" — amutils.c's pg_index_column_has_property.
+		if attno <= 0 {
+			return NullDatum, nil
+		}
+		im, ok := ctx.Catalog.(*catalog.InMemory)
+		if !ok {
+			return NullDatum, nil
+		}
+		idx, found := im.LookupIndexByOID(idxOID)
+		if !found {
+			return NullDatum, nil
+		}
+		natts := len(idx.Columns) + len(idx.IncludeColumns)
+		if attno > natts {
+			return NullDatum, nil
+		}
+		amName := indexAMNameForCapabilityLookup(idx)
+		c, ok := catalog.IndexAMCapabilityByName(amName)
+		if !ok {
+			return NullDatum, nil
+		}
+		return indexAMColumnLevelProperty(amName, c, idx, attno, propArg.StringValue()).toDatum(), nil
+
 	case "pg_get_statisticsobjdef":
 		// pg_get_statisticsobjdef(oid) → text — reconstructs CREATE STATISTICS DDL.
 		// pg_dump's dumpStatisticsExt emits the result verbatim (plus a semicolon).

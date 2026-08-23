@@ -307,6 +307,24 @@ if [[ "$RUN_SETUP" -eq 1 ]]; then
         echo "pg-regress-runner: running create_aggregate.sql (user-defined aggregates for aggregates.sql)..."
         "${PSQL[@]}" -f "${REGRESS_SQL}/create_aggregate.sql" >/dev/null 2>&1 || true
     fi
+    # amutils.sql's own header names its prerequisites explicitly ("amutils
+    # depends on geometry, create_index_spgist, hash_index, brin" —
+    # postgres/src/test/regress/parallel_schedule:79) — it reads indexes
+    # (gcircleind, sp_radix_ind/sp_quad_ind, hash_i4_index, brinidx) those
+    # four files create rather than creating any of its own. Gated on
+    # amutils being requested (unlike the four prereqs above, nothing else
+    # in QUICK_TESTS/the named-test set needs this heavier quartet run
+    # every time). M0134-0090.
+    if is_named_test "amutils"; then
+        for prereq in geometry create_index_spgist hash_index brin; do
+            if is_named_test "${prereq}"; then
+                echo "pg-regress-runner: skipping ${prereq}.sql prerequisite (it is also the requested named test — will run once, as the test itself)"
+            else
+                echo "pg-regress-runner: running ${prereq}.sql (amutils.sql index prerequisite)..."
+                timeout 300 "${PSQL[@]}" -f "${REGRESS_SQL}/${prereq}.sql" >/dev/null 2>&1 || true
+            fi
+        done
+    fi
     echo "pg-regress-runner: setup done."
 fi
 

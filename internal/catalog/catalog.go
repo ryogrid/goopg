@@ -19848,6 +19848,118 @@ func AccessMethodOIDByName(name string) uint32 {
 	return 0
 }
 
+// AccessMethodNameByOID is the reverse of AccessMethodOIDByName, covering the
+// same 7 built-in pg_am.oid values. Returns ("", false) for anything else
+// (including a user `CREATE ACCESS METHOD` oid — callers needing those go
+// through InMemory.ListAccessMethods instead). Added for
+// pg_indexam_has_property(am_oid, propname), which is handed an oid and must
+// recover the AM name to look up its capability flags. M0134-0090.
+func AccessMethodNameByOID(oid uint32) (string, bool) {
+	switch oid {
+	case 2:
+		return "heap", true
+	case 403:
+		return "btree", true
+	case 405:
+		return "hash", true
+	case 783:
+		return "gist", true
+	case 2742:
+		return "gin", true
+	case 4000:
+		return "spgist", true
+	case 3580:
+		return "brin", true
+	}
+	return "", false
+}
+
+// IndexAMCapability is a hand-curated mirror of the static IndexAmRoutine
+// capability flags PostgreSQL's index AM handlers set (nbtree.c, hash.c,
+// gist.c, ginutil.c, spgutils.c, brin.c) — goopg has no pluggable index AM
+// framework (single physical index layout, per catalog.Index.DeclaredHash's
+// doc comment), so there is no live amroutine struct to read these from; this
+// table is the closest goopg gets to one. Used exclusively by
+// pg_indexam_has_property / pg_index_has_property / pg_index_column_has_property
+// (postgres/src/backend/utils/adt/amutils.c: indexam_property). Covers only
+// the 6 in-tree index AMs (heap has no index-property surface). M0134-0090.
+type IndexAMCapability struct {
+	CanOrder     bool // amcanorder
+	CanUnique    bool // amcanunique
+	CanMultiCol  bool // amcanmulticol
+	CanInclude   bool // amcaninclude
+	CanBackward  bool // amcanbackward
+	Clusterable  bool // amclusterable
+	CanOrderByOp bool // amcanorderbyop (generic distance_orderable source)
+	SearchArray  bool // amsearcharray
+	SearchNulls  bool // amsearchnulls
+	HasGetTuple  bool // amgettuple != NULL (index_scan, can_exclude)
+	HasGetBitmap bool // amgetbitmap != NULL (bitmap_scan)
+	CanReturn    bool // amcanreturn != NULL, generic RETURNABLE result for AMs
+	// with no custom amproperty override (btree/hash/gin/brin). gist and
+	// spgist both install a custom amproperty (gistproperty/spgistproperty)
+	// that overrides RETURNABLE/DISTANCE_ORDERABLE per opclass — goopg
+	// approximates that override inline in the caller rather than here (see
+	// indexAMColumnPropertyOverride), since it needs the index's key column
+	// type, not just the AM name.
+}
+
+// indexAMCapabilities is keyed by lowercase AM name (catalog.Index.Method /
+// AccessMethodNameByOID's return). Values transcribed 1:1 from each AM's
+// amhandler function (Get*HandlerName->amroutine literal init) in
+// postgres/src/backend/access/{nbtree,hash,gist,gin,spgist,brin}/*.c.
+var indexAMCapabilities = map[string]IndexAMCapability{
+	"btree": {
+		CanOrder: true, CanUnique: true, CanMultiCol: true, CanInclude: true,
+		CanBackward: true, Clusterable: true, CanOrderByOp: false,
+		SearchArray: true, SearchNulls: true,
+		HasGetTuple: true, HasGetBitmap: true, CanReturn: true,
+	},
+	"hash": {
+		CanOrder: false, CanUnique: false, CanMultiCol: false, CanInclude: false,
+		CanBackward: true, Clusterable: false, CanOrderByOp: false,
+		SearchArray: false, SearchNulls: false,
+		HasGetTuple: true, HasGetBitmap: true, CanReturn: false,
+	},
+	"gist": {
+		CanOrder: false, CanUnique: false, CanMultiCol: true, CanInclude: true,
+		CanBackward: false, Clusterable: true, CanOrderByOp: true,
+		SearchArray: false, SearchNulls: true,
+		HasGetTuple: true, HasGetBitmap: true, CanReturn: false,
+	},
+	"gin": {
+		CanOrder: false, CanUnique: false, CanMultiCol: true, CanInclude: false,
+		CanBackward: false, Clusterable: false, CanOrderByOp: false,
+		SearchArray: false, SearchNulls: false,
+		HasGetTuple: false, HasGetBitmap: true, CanReturn: false,
+	},
+	"spgist": {
+		CanOrder: false, CanUnique: false, CanMultiCol: false, CanInclude: true,
+		CanBackward: false, Clusterable: false, CanOrderByOp: true,
+		SearchArray: false, SearchNulls: true,
+		HasGetTuple: true, HasGetBitmap: true, CanReturn: false,
+	},
+	"brin": {
+		CanOrder: false, CanUnique: false, CanMultiCol: true, CanInclude: false,
+		CanBackward: false, Clusterable: false, CanOrderByOp: false,
+		SearchArray: false, SearchNulls: true,
+		HasGetTuple: false, HasGetBitmap: true, CanReturn: false,
+	},
+}
+
+// IndexAMCapabilityByName resolves an AM name (case-insensitive, matching
+// AccessMethodOIDByName's own normalization) to its capability flags. A
+// `DeclaredHash` index reports as "btree" everywhere else in goopg (it is
+// physically a B-tree, catalog.Index.DeclaredHash's doc comment) but must
+// report the HASH am's OWN property answers here — pg_indexam_has_property
+// is specifically a compatibility-surface probe of what real PG's hash AM
+// would say, and a caller (amutils.sql) explicitly exercises hash_i4_index.
+// Callers pass idx.Method normally and "hash" explicitly when idx.DeclaredHash.
+func IndexAMCapabilityByName(name string) (IndexAMCapability, bool) {
+	c, ok := indexAMCapabilities[strings.ToLower(name)]
+	return c, ok
+}
+
 // LanguageNameToOID maps a language name to its pg_language OID, covering the
 // 4 rows pg_language.VirtualRows serves (the 3 built-in BKI languages plus
 // plpgsql — see the pg_language registration in this file). Returns 0 for an
