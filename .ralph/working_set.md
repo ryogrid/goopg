@@ -1,65 +1,65 @@
-Task just completed: M0134-0096 (brin_bloom.sql) — sized live against the PG
-18.3 oracle (scripts/pg-regress-runner.sh --verbose brin_bloom, diff 205
+Task just completed: M0134-0097 (brin_multi.sql) — sized live against the PG
+18.3 oracle (scripts/pg-regress-runner.sh --verbose brin_multi, diff 409
 lines): PARKED, NO CODE FIX this loop (pure sizing, confirmed as predicted
-by the prior loop's baton). Confirmed cross-file with M0134-0095 (brin.sql,
-same BRIN access-method family): shares every large blocker already
-ledgered there — brin_summarize_range/brin_desummarize_range entirely
-unimplemented, planner never selects Bitmap Heap Scan over a BRIN index by
-correlation, `inet '.../nn' + int` typed-literal arithmetic is a bare
-parser syntax error, `tid '(2,0)'` inside a PL/pgSQL `EXIT WHEN` fails to
-parse, and the SAME `NULL array elements are not supported` (0A000)
-coercion bug reproduces in this second independent file (was previously
-un-root-caused; now confirmed real and cross-file, still not root-caused).
-Two NEW bloom-specific gaps found this loop: (1) every
-`..._bloom_ops(n_distinct_per_range=...)`/`(false_positive_rate=...)`
-reloption is rejected outright with `operator class ... has no options` —
-no per-opclass reloption plumbing for the bloom family at all (blocks all
-4 of the file's bounds-validation cases from even reaching the code under
-test). (2) bloom opclass filter-membership semantics (bit-per-value
-probabilistic match vs BRIN minmax range) unaudited — blocked by (1).
+by the prior loop's baton — THIRD file in the same BRIN access-method
+family). Confirmed cross-file with M0134-0095 (brin.sql)/M0134-0096
+(brin_bloom.sql): shares every large blocker already ledgered there —
+brin_summarize_range/brin_desummarize_range/brin_summarize_new_values
+entirely unimplemented (hit 11 times in this one file), planner never
+selects Bitmap Heap Scan over BRIN by correlation, `inet '.../nn' + int`
+typed-literal arithmetic syntax error, `tid '(2,0)'` in PL/pgSQL EXIT WHEN
+parse failure, and the SAME `NULL array elements are not supported`
+(0A000) coercion bug reproduces a THIRD time. Two NEW gaps: (1) minmax-multi
+opclass reloptions (`values_per_range`) rejected with `operator class ...
+has no options` — confirms the reloption-plumbing gap spans BOTH
+non-default opclass families (minmax-multi AND bloom), not just bloom.
+(2) an infinity-kind BRIN minmax-multi build-path internal error
+(`expected time, got kind 2`) when indexing a column containing
+-infinity/infinity timestamp values — distinct from the expected
+out-of-range-timestamp divergence (goopg's narrower storage window is a
+known/accepted gap; this is a genuine type-assertion mismatch bug).
 
 CSV row flipped not-tried -> failed via make regen-testport. Ledger row
-appended: .ralph/deferral_ledger.md, 2026-08-24, M0134-0096. fix_plan.md
-M0134-0096 marked [x] (PARKED convention, matches M0134-0094/-0095
+appended: .ralph/deferral_ledger.md, 2026-08-24, M0134-0097. fix_plan.md
+M0134-0097 marked [x] (PARKED convention, matches M0134-0094/-0095/-0096
 pattern). No design doc needed this loop (no engine code changed — pure
-sizing/ledger work, same as the M0134-0093 clean-close precedent).
+sizing/ledger work).
 
-Committed 636e1161 and pushed to origin/regress-renumbering (confirmed).
+Committed and pushed to origin/regress-renumbering (see git log after
+commit below — confirm on next loop's first git log check).
 
 Nightly filing: checked ci/logs/action-items.md at loop start — same run
-(20260824-013441, sha e7495e712dda) as prior 2 loops, already filed
+(20260824-013441, sha e7495e712dda) as prior 3 loops, already filed
 (AI-...-001 units/internal/executor regression, AI-...-002 AdvisoryLock
 repeat). No new filing needed this loop.
 
 NEXT LOOP: per the Current Priority banner in .ralph/fix_plan.md, continue
-M0134 top-to-bottom — next unworked item is **M0134-0097 (brin_multi.sql,
-status not-tried)**. First: `git log --oneline -1 origin/regress-renumbering`
-to confirm 636e1161 landed. Then size brin_multi.sql live against
-./postgres oracle via scripts/pg-regress-runner.sh --verbose brin_multi
-(background, generous timeout; rm -rf tmp/regress-goopg-data
-tmp/regress-diffs first if a prior run left them non-empty). Given
-brin_multi.sql is a THIRD file in the same BRIN access-method family
-(brin.sql, brin_bloom.sql both PARKED on brin_summarize_range/
-brin_desummarize_range/planner-BRIN-selection), expect the SAME core
-blockers again — if so this should again be a fast PARK-with-
-cross-reference (to M0134-0095/-0096) rather than fresh sizing work; only
-investigate genuinely NEW multi-range-specific gaps beyond what's already
-ledgered. CAUTION carried forward: watch `ps -o rss= -C goopg` while any
-regress file runs; kill -KILL promptly (never bare pkill -f) if RSS climbs
-unbounded. Worth considering after brin_multi.sql: three consecutive PARKs
-on the same brin_summarize_range/brin_desummarize_range gap may justify
-actually IMPLEMENTING those two functions in a dedicated future loop
-(cross-cutting fix that would unblock brin.sql/brin_bloom.sql/brin_multi.sql
-simultaneously) rather than continuing to just ledger it — flag this to
-whichever loop next has bandwidth for an implementation (not sizing) task.
+M0134 top-to-bottom — next unworked item is **M0134-0098** (check
+fix_plan.md for the exact filename/status; not yet inspected this loop).
+First: `git log --oneline -1 origin/regress-renumbering` to confirm this
+loop's commit landed. **STRONG RECOMMENDATION carried forward from this
+loop:** three consecutive PARKs (M0134-0095/-0096/-0097) on the identical
+`brin_summarize_range`/`brin_desummarize_range` gap (11+ call sites across
+3 files) — the next loop with implementation bandwidth (not just sizing)
+should seriously consider actually IMPLEMENTING those two functions
+(mirrors postgres/src/backend/access/brin/brin.c's brin_summarize_range/
+brinsummarize) as a standalone task, since it would unblock brin.sql,
+brin_bloom.sql, AND brin_multi.sql simultaneously — a much better ROI than
+continuing pure sizing passes on the remaining BRIN-family files (there
+are likely more: check CSV for brin_*.sql not-tried rows). If continuing
+straight sizing instead, run scripts/pg-regress-runner.sh --verbose
+<next-file> (background, generous timeout; rm -rf tmp/regress-goopg-data
+tmp/regress-diffs first). CAUTION carried forward: watch `ps -o rss= -C
+goopg` while any regress file runs; kill -KILL promptly (never bare
+pkill -f) if RSS climbs unbounded (this loop's run stayed bounded ~576MB,
+no issue).
 
 Gates run: make check-testport-inventory PASS; make regen-testport ran
 clean; make ralph-state-guard PASS (self-repaired the same recurring stale
 progress.json completed-marker pattern as prior loops — standing benign
-artifact, not a regression); pre-commit hook's pgbench smoke PASS
-(337/620/12405 TPS across the 3 pgbench transaction types). No engine code
-touched this loop so no go build/go test gate was needed beyond what the
-pre-commit hook already runs.
+artifact, not a regression). No engine code touched this loop; pre-commit
+hook's pgbench smoke will run automatically at commit time (mandatory,
+never bypassed).
 
 In-flight: none. (tmp/regress-goopg-data, tmp/regress-diffs, and
-/tmp/brin_bloom_run.log from this loop's oracle run were rm -rf'd/removed.)
+/tmp/brin_multi_run.log from this loop's oracle run were rm -rf'd/removed.)
