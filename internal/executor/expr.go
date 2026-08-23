@@ -2324,10 +2324,33 @@ func pairDecode(s string) (x, y float64, rest string, ok bool) {
 }
 
 // singleDecode parses the longest valid float8 prefix of s (single_decode in
-// geo_ops.c, which itself calls float8in's strtod-based scan), returning the
-// unconsumed remainder.
+// geo_ops.c, which itself calls float8in_internal — strtod plus PG's
+// NaN/Infinity/Inf fallback spellings, float.c:395-511), skips trailing
+// whitespace after the number (float8in_internal does the same before
+// returning its endptr — geo_ops.sql's whitespace-padded circle literals
+// like " 1 , 3 , 5 " rely on this), and returns the unconsumed remainder.
 func singleDecode(s string) (float64, string, bool) {
 	s = strings.TrimLeft(s, " \t\n\r\v\f")
+	// C99 NaN/Infinity/Inf spellings, case-insensitive, with optional sign
+	// on the Infinity/Inf forms (float8in_internal's strtod-failure
+	// fallback path).
+	for _, kw := range []struct {
+		text string
+		val  float64
+	}{
+		{"NaN", math.NaN()},
+		{"+Infinity", math.Inf(1)},
+		{"-Infinity", math.Inf(-1)},
+		{"Infinity", math.Inf(1)},
+		{"+Inf", math.Inf(1)},
+		{"-Inf", math.Inf(-1)},
+		{"Inf", math.Inf(1)},
+	} {
+		if len(s) >= len(kw.text) && strings.EqualFold(s[:len(kw.text)], kw.text) {
+			rest := strings.TrimLeft(s[len(kw.text):], " \t\n\r\v\f")
+			return kw.val, rest, true
+		}
+	}
 	i := 0
 	if i < len(s) && (s[i] == '+' || s[i] == '-') {
 		i++
@@ -2366,7 +2389,8 @@ func singleDecode(s string) (float64, string, bool) {
 	if err != nil {
 		return 0, "", false
 	}
-	return v, s[i:], true
+	rest := strings.TrimLeft(s[i:], " \t\n\r\v\f")
+	return v, rest, true
 }
 
 // boxCanonicalText formats a box's high/low corners exactly as box_out does
@@ -2375,6 +2399,78 @@ func singleDecode(s string) (float64, string, bool) {
 func boxCanonicalText(hx, hy, lx, ly float64) string {
 	return fmt.Sprintf("(%s,%s),(%s,%s)",
 		PGFloatOut(hx, 64), PGFloatOut(hy, 64), PGFloatOut(lx, 64), PGFloatOut(ly, 64))
+}
+
+// parseCircleLiteral reproduces circle_in's parsing (geo_ops.c) closely
+// enough to give the same accept/reject verdict and the same center/radius
+// values on every case exercised by circle.sql: the canonical
+// "<(x,y),r>" form, an un-bracketed "(x,y),r" / "((x,y),r)" form, and the
+// "quick entry" flat "x,y,r" form (no wrapping delimiters at all) are all
+// accepted; a negative radius (but NOT NaN — PG accepts NaN, since `NaN < 0`
+// is false under IEEE comparison) is rejected, and the ENTIRE string must be
+// consumed (circle_in passes a nil endptr, so trailing garbage like
+// "<(100,200),10> x" is rejected) just like parseBoxLiteral above, whose
+// pairDecode/singleDecode helpers this reuses. M0134-0098.
+func parseCircleLiteral(s string) (x, y, radius float64, ok bool) {
+	skipWS := func(t string) string {
+		return strings.TrimLeft(t, " \t\n\r\v\f")
+	}
+	s = skipWS(s)
+	if s == "" {
+		return
+	}
+	depth := 0
+	if s[0] == '<' {
+		depth++
+		s = s[1:]
+	} else if s[0] == '(' {
+		// If there are two left parens, consume the first one.
+		cp := skipWS(s[1:])
+		if cp != "" && cp[0] == '(' {
+			depth++
+			s = cp
+		}
+	}
+
+	// pair_decode will consume parens around the pair, if any.
+	var okPair bool
+	x, y, s, okPair = pairDecode(s)
+	if !okPair {
+		return 0, 0, 0, false
+	}
+	if s != "" && s[0] == ',' {
+		s = s[1:]
+	}
+
+	var okRadius bool
+	radius, s, okRadius = singleDecode(s)
+	if !okRadius {
+		return 0, 0, 0, false
+	}
+	// We have to accept NaN — `radius < 0.0` is false when radius is NaN.
+	if radius < 0.0 {
+		return 0, 0, 0, false
+	}
+
+	for depth > 0 {
+		if s != "" && (s[0] == ')' || (s[0] == '>' && depth == 1)) {
+			depth--
+			s = skipWS(s[1:])
+		} else {
+			return 0, 0, 0, false
+		}
+	}
+	if s != "" {
+		return 0, 0, 0, false
+	}
+	return x, y, radius, true
+}
+
+// circleCanonicalText formats a circle's center/radius exactly as
+// circle_out does — "<(x,y),r>" — each field via pair_encode/single_encode
+// (float8out's Ryu-based shortest-roundtrip formatting). M0134-0098.
+func circleCanonicalText(x, y, radius float64) string {
+	return fmt.Sprintf("<(%s,%s),%s>", PGFloatOut(x, 64), PGFloatOut(y, 64), PGFloatOut(radius, 64))
 }
 
 // evalLikeEscapePattern evaluates a LikeEscapePattern's Pattern and Escape
@@ -3978,6 +4074,16 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 				Message: fmt.Sprintf("invalid input syntax for type box: %q", x.Value)}
 		}
 		return NewStringDatum(boxCanonicalText(hx, hy, lx, ly)), nil
+	case "circle":
+		// M0134-0098: `circle '...'` shares the same validate+canonicalize
+		// chokepoint as a circle(n) column's assignment coercion
+		// (coerceTextLikeDatum, codec.go) — both call parseCircleLiteral.
+		cx, cy, r, ok := parseCircleLiteral(x.Value)
+		if !ok {
+			return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(),
+				Message: fmt.Sprintf("invalid input syntax for type circle: %q", x.Value)}
+		}
+		return NewStringDatum(circleCanonicalText(cx, cy, r)), nil
 	default:
 		// Unknown type — treat as text literal. Covers enum/domain casts in v0.
 		// M0097-0017: enum/domain type casts return the string value as-is.
@@ -11160,6 +11266,11 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				// same parseBoxLiteral.
 				_, _, _, _, ok := parseBoxLiteral(v)
 				return NewBoolDatum(ok), nil
+			case "circle":
+				// M0134-0098: agrees with the typed-literal/coercion path,
+				// same parseCircleLiteral.
+				_, _, _, ok := parseCircleLiteral(v)
+				return NewBoolDatum(ok), nil
 			default:
 				// varchar(N) / character varying(N) / char(N) / bpchar(N). M0097-0003.
 				if valid, ok := pgInputIsValidTypedLen(v, t); ok {
@@ -12348,6 +12459,68 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 					llx := math.Min(p1[0], p2[0])
 					lly := math.Min(p1[1], p2[1])
 					return NewStringDatum(fmt.Sprintf("(%g,%g),(%g,%g)", urx, ury, llx, lly)), nil
+				}
+			}
+		}
+		return NullDatum, nil
+
+	case "center":
+		// center(circle) → point "(x,y)" — circle_center in geo_ops.c.
+		// M0134-0098.
+		if len(x.Args) == 1 {
+			av, aerr := evalExprSlot(x.Args[0], slot, ctx)
+			if aerr != nil {
+				return Datum{}, aerr
+			}
+			if av.IsNull() {
+				return NullDatum, nil
+			}
+			as, aok := datumAsString(av)
+			if aok {
+				cx, cy, _, ok := parseCircleLiteral(as)
+				if ok {
+					return NewStringDatum(fmt.Sprintf("(%s,%s)", PGFloatOut(cx, 64), PGFloatOut(cy, 64))), nil
+				}
+			}
+		}
+		return NullDatum, nil
+
+	case "radius":
+		// radius(circle) → float8 — circle_radius in geo_ops.c. M0134-0098.
+		if len(x.Args) == 1 {
+			av, aerr := evalExprSlot(x.Args[0], slot, ctx)
+			if aerr != nil {
+				return Datum{}, aerr
+			}
+			if av.IsNull() {
+				return NullDatum, nil
+			}
+			as, aok := datumAsString(av)
+			if aok {
+				_, _, r, ok := parseCircleLiteral(as)
+				if ok {
+					return floatTextDatum(PGFloatOut(r, 64)), nil
+				}
+			}
+		}
+		return NullDatum, nil
+
+	case "diameter":
+		// diameter(circle) → float8, 2*radius — circle_diameter in
+		// geo_ops.c. M0134-0098.
+		if len(x.Args) == 1 {
+			av, aerr := evalExprSlot(x.Args[0], slot, ctx)
+			if aerr != nil {
+				return Datum{}, aerr
+			}
+			if av.IsNull() {
+				return NullDatum, nil
+			}
+			as, aok := datumAsString(av)
+			if aok {
+				_, _, r, ok := parseCircleLiteral(as)
+				if ok {
+					return floatTextDatum(PGFloatOut(2*r, 64)), nil
 				}
 			}
 		}

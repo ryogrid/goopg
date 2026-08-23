@@ -12748,6 +12748,18 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: "numeric"}
 		case "power", "exp", "ln", "log", "sqrt":
 			return catalog.Type{Name: "float8"}
+		case "radius", "diameter":
+			// radius(circle)/diameter(circle) → float8 (circle_radius /
+			// circle_diameter, geo_ops.c). Without this arm the FuncCall
+			// falls through to "unknown", which psql renders left-justified
+			// (text-like, no right-justify padding) instead of numeric —
+			// same category of gap as pg_notification_queue_usage above
+			// (M0134-0091). M0134-0098.
+			return catalog.Type{Name: "float8"}
+		case "center":
+			// center(circle)/center(box) → point (circle_center /
+			// box_center, geo_ops.c). M0134-0098.
+			return catalog.Type{Name: "point"}
 		case "uuid_extract_version":
 			return catalog.Type{Name: "int2"}
 		case "uuid_extract_timestamp":

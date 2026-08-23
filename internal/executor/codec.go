@@ -284,6 +284,16 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 				Message: fmt.Sprintf("invalid input syntax for type box: %q", s)}
 		}
 		s = boxCanonicalText(hx, hy, lx, ly)
+	} else if tname == "circle" {
+		// circle: validate + canonicalize on assignment, mirroring circle_in
+		// (postgres/src/backend/utils/adt/geo_ops.c), same chokepoint
+		// pattern as box above. M0134-0098.
+		cx, cy, r, ok := parseCircleLiteral(s)
+		if !ok {
+			return "", &ExecError{Code: "22P02",
+				Message: fmt.Sprintf("invalid input syntax for type circle: %q", s)}
+		}
+		s = circleCanonicalText(cx, cy, r)
 	}
 	return s, nil
 }
