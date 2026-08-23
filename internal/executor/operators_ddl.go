@@ -1677,6 +1677,47 @@ func validateColumnStorage(cat catalog.Catalog, col catalog.Column) *ExecError {
 	}
 }
 
+// validateColumnCollation rejects an inline `COLLATE <name>` clause on a
+// column whose type carries no typcollation — PostgreSQL only lets you
+// specify a collation for text/varchar/bpchar/name (and domains/arrays over
+// them); everything else (int, bool, numeric, …) errors 42804 before the
+// collation name is even looked up (transformColumnType,
+// parse_utilcmd.c:4044-4067: "collations are not supported by type %s").
+// declaredTypeName is the ORIGINAL user-written type spelling (e.g. "int"),
+// used verbatim in the error message the way format_type_be reports the
+// column's own declared type; resolvedTypeName is the domain-resolved base
+// type name used to look up collatability (a domain over text is collatable
+// even though the domain's own name isn't a recognized OID). M0134-0101.
+func validateColumnCollation(collation, declaredTypeName, resolvedTypeName string, pos int) *ExecError {
+	if collation == "" {
+		return nil
+	}
+	if columnTypeIsCollatable(resolvedTypeName) {
+		return nil
+	}
+	return &ExecError{
+		Code:    "42804",
+		Pos:     pos,
+		Message: fmt.Sprintf("collations are not supported by type %s", pgFormatTypeName(declaredTypeName)),
+	}
+}
+
+// columnTypeIsCollatable reports whether typName's pg_type.typcollation is
+// non-zero — the same base-type set goopg's other typcollation resolvers
+// special-case (pgTypeofDisplayName in internal/optimizer/planner.go;
+// rangeSubtypeIsCollatable in internal/catalog/catalog.go): text, varchar,
+// bpchar, and name. Arrays inherit their element type's collatability (an
+// int4[] column's Type.Name is the unsuffixed element name "int4" per the
+// ColumnType.IsArray convention, so no separate array case is needed here;
+// the caller already passes the element name).
+func columnTypeIsCollatable(typName string) bool {
+	switch catalog.TypeNameToOID(typName) {
+	case catalog.OIDText, catalog.OIDVarChar, catalog.OIDBpChar, catalog.OIDName:
+		return true
+	}
+	return false
+}
+
 // columnTypeStorageCode returns the intrinsic pg_type typstorage character for
 // a freshly-declared column — the attstorage PG assumes before any per-column
 // STORAGE clause. Mirrors buildUserPGAttributeRow's typOID resolution
@@ -2180,6 +2221,13 @@ afterExistsCheck:
 			// int) is 0A000 — GetAttributeStorage (tablecmds.c:22082-22112).
 			// M0134-0002 C2 slice 9.
 			if verr := validateColumnStorage(o.ctx.Catalog, col); verr != nil {
+				return verr
+			}
+			// An inline `COLLATE` clause on a non-collatable column type (e.g.
+			// `a int COLLATE "C"`) is 42804 — transformColumnType
+			// (parse_utilcmd.c:4044-4067) rejects it before the collation name is
+			// even resolved. M0134-0101.
+			if verr := validateColumnCollation(c.Collation, c.Type.Name, typeName, c.Pos()); verr != nil {
 				return verr
 			}
 			merged, err := mergeExplicitColumnIntoInherited(col)
