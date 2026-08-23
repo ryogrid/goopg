@@ -20720,8 +20720,22 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					if uc := im.FindConversion(s.Names[0].Name, s.Names[0].Schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); uc != nil {
 						convOID = uc.OID
 					}
-					if im.DropConversion(s.Names[0].Name, s.Names[0].Schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) && convOID != 0 {
-						deleteConversionCatalogRow(o.ctx, convOID)
+					if im.DropConversion(s.Names[0].Name, s.Names[0].Schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
+						if convOID != 0 {
+							deleteConversionCatalogRow(o.ctx, convOID)
+						}
+						// M0134-0106: must return here, mirroring the
+						// text-search-dictionary/-configuration cases below.
+						// Without it, a successful drop fell through to the
+						// DropCompatObject gate, which is keyed by the
+						// CREATE-time name string (schema-qualified, e.g.
+						// "public.mydef") while DROP CONVERSION supplies the
+						// bare name — the mismatch made a real, successful
+						// drop raise a spurious "conversion ... does not
+						// exist" (real PG: DropConversionById always
+						// succeeds once name resolution finds the object).
+						im.DropCompatObject(objType, s.Names[0].String())
+						return nil
 					}
 				}
 				if objType == "text search dictionary" {
@@ -22970,6 +22984,19 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 				Message: fmt.Sprintf("collation %q for encoding %q does not exist", s.ObjName.String(), "UTF8")}
 		}
 		im.SetComment(oidPgCollation, uc.OID, 0, s.Description)
+	case "conversion":
+		// Conversions live in pg_conversion (classoid 2607, DU-002 slice 399).
+		// This case was entirely missing — the switch's implicit no-op
+		// fallthrough let `COMMENT ON CONVERSION <nonexistent> IS '...'`
+		// silently succeed instead of raising PG's 42704 "conversion ...
+		// does not exist" (GetCommentObjectAddress, objectaddress.c), sized
+		// out of M0134-0106 (conversion.sql).
+		uconv := im.FindConversion(s.ObjName.Name, s.ObjName.Schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+		if uconv == nil || uconv.OID == 0 {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("conversion %q does not exist", s.ObjName.String())}
+		}
+		im.SetComment(pgConversionRelOID, uconv.OID, 0, s.Description)
 	case "cast":
 		// Casts live in pg_cast (classoid 2605). pg_dump's dumpCast keys the
 		// comment lookup on the cast's catalogId (tableoid=pg_cast=2605) and

@@ -13538,6 +13538,20 @@ func (c *InMemory) CreateConversion(uc *UserConversion, schema string, dbOid ...
 			return 0, fmt.Errorf("conversion %q already exists", uc.Name)
 		}
 	}
+	if uc.Default {
+		// Mirrors ConversionCreate's FindDefaultConversion check
+		// (pg_conversion.c:66-79): CREATE DEFAULT CONVERSION additionally
+		// requires no other default conversion already cover this
+		// (namespace, for-encoding, to-encoding) triple, independent of
+		// name. M0134-0106 (conversion.sql).
+		for _, existing := range c.userConversions {
+			if existing.DBOid == oid && existing.NamespaceOID == nsOID && existing.Default &&
+				existing.ForEncoding == uc.ForEncoding && existing.ToEncoding == uc.ToEncoding {
+				return 0, fmt.Errorf("default conversion for %s to %s already exists",
+					EncodingIDToName(uc.ForEncoding), EncodingIDToName(uc.ToEncoding))
+			}
+		}
+	}
 	uc.OID = c.allocOIDLocked()
 	uc.NamespaceOID = nsOID
 	uc.DBOid = oid
