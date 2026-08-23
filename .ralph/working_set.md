@@ -1,68 +1,101 @@
 (idle — nothing in flight)
 
-Task just completed: M0134-0091 (async.sql). Sized live against the PG 18.3
-oracle (scripts/pg-regress-runner.sh --verbose async). Case was 35-line diff
-/ 0% parity from two narrow gaps (LISTEN/NOTIFY itself, M0118-0009, was
-already fully correct):
-(1) exprType's FuncCall switch (internal/optimizer/planner.go) had no arm
-for pg_notification_queue_usage() — it fell through to "unknown", and psql
-left-justifies an unknown-typed cell instead of right-justifying numeric, a
-silent column-alignment divergence (runtime value "0" was already correct).
-Added a float8 arm next to the existing random/random_normal/drandom case.
-(2) pg_notify(channel, payload) (internal/executor/expr.go) had zero
-channel-name validation: NULL was silently treated as a no-op, empty/
-over-length channels were silently accepted. PG's Async_Notify
-(postgres/src/backend/commands/async.c:604-621) substitutes a NULL channel
-with "" then raises ERRCODE_INVALID_PARAMETER_VALUE (22023) "channel name
-cannot be empty" / "channel name too long" (>= NAMEDATALEN=64) — neither
-ereport calls errposition(), so Pos must stay 0 (no LINE/^ pointer),
-matching the M0134-0070 no-errposition pattern. First attempt set
-Pos: x.Pos() and still diverged (added 2 spurious LINE/^ lines) — fixed by
-dropping Pos entirely. Landed internal/executor/async_notify_test.go
-(TestPgNotificationQueueUsageIsFloat8, TestPgNotifyChannelNameValidation).
-Case closed clean (no PARK): PASS async (35 lines), 100% parity. CSV row
-flipped not-tried -> pass/pass_required=yes (had to de-comma-and-quote the
-rationale text — the CSV has no quoting/escaping for internal commas or
-quote chars, confirmed via make check-testport-inventory failing twice on
-"bare \" in non-quoted-field" then "wrong number of fields" before the fix).
-Ledger row added noting the NOTIFY-statement form (internal/postmaster/
-notify.go's notifyStmtTag, case *parser.NotifyStmt) is UNAUDITED for the
-same channel-length gap — confirmed by reading the code (zero validation,
-just buffers n.Channel), not yet exercised by any regress/isolation case so
-no observed divergence. Design doc
-docs/design/m0134-0091-async-notify-column-type-and-channel-validation.md.
-Committed 5a5392cd and pushed... (verify push landed — see Next step).
-fix_plan.md M0134-0091 marked [x].
+Task just completed: M0134-0092 (bit.sql) + nightly filing for run
+20260824-013441 (both done this loop, one task/loop rule: filing is
+unconditional per the M-NIGHTLY rule, not a second "task").
+
+Nightly filing: added AI-20260824-013441-001 (units/internal/executor —
+TestRecursiveUnionCapsRunawaySingleIteration nil-deref panic inside
+recursiveUnionOp.Next at operators_recursive_cte.go:163, o.ctx.Ctx.Err()) as
+a new fix_plan.md row under a new "Nightly run 20260824-013441" section.
+Investigated it live this loop: could NOT reproduce — the single test alone,
+the whole internal/executor package with -count=1, and 3x -count=1 -race
+runs of the whole package all PASS clean, no race flagged. Left OPEN as a
+suspected flake (host memory/GC pressure during the nightly's concurrent
+ci/batch stages is the working theory, unconfirmed) — re-investigate only if
+it recurs. AI-20260824-013441-002 (AdvisoryLock_SessionUnlockAcrossBeginBoundary)
+is a repeat of the already-open AI-20260822-001356-003 row, updated with a
+third-failure note.
+
+M0134-0092 (bit.sql), sized live against the PG 18.3 oracle
+(scripts/pg-regress-runner.sh --verbose bit): 1054-line diff, 0% parity.
+File's first blocker was structural: parser had ZERO support for the SQL99
+bit-string literal syntax (B'1010'/X'A') — every INSERT raised a bare
+syntax error. Landed:
+(1) internal/parser/token.go: new TokenBitStringLit kind.
+(2) internal/parser/lexer.go: lexBitOrHexString (mirrors lexEscapeString's
+    E'...' prefix-detection pattern in next()); Token.Value carries a
+    leading 'b'/'x' marker byte ahead of raw digits.
+(3) internal/parser/expr.go: decodeBitStringLit — validates digit set
+    EAGERLY (binary 0/1, hex 0-9A-Fa-f; 22P02 + errposition at literal
+    start on invalid digit, matching PG's unconditional bit_in() call in
+    parse_node.c's T_BitString case), decodes hex nibbles MSB-first, wraps
+    result in a plain *StringConst (NOT a dedicated bit-typed node —
+    deliberate ledgered simplification: literal ends up typed UNKNOWN not
+    BITOID; untyped/operator-dispatch contexts not PG-faithful, but
+    bit.sql's literal cases don't exercise that gap).
+(4) internal/parser/select.go: parsePrimary case TokenBitStringLit ->
+    decodeBitStringLit(t).
+Exposed a SECOND, independent, PRE-EXISTING gap while testing: bit(n)/
+varbit(n) COLUMNS had zero length/digit coercion at all (reproduced even
+with a plain quoted-string literal, no B prefix — confirmed via manual
+psql: INSERT INTO t(b bit(11)) VALUES ('10') silently stored "10"
+unvalidated). Fixed:
+(5) internal/executor/codec.go: coerceTextLikeDatum gained "bit"/"varbit"
+    arms + new validateBitDigits helper — bit(n) exact-length check (22026
+    ERRCODE_STRING_DATA_LENGTH_MISMATCH), bit varying(n) upper-bound check
+    (22001 ERRCODE_STRING_DATA_RIGHT_TRUNCATION "too long").
+Verified live: BIT_TABLE/VARBIT_TABLE fixture + 4 invalid-digit SELECT
+cases now byte-for-byte identical to oracle. Diff 1054 -> 581 lines (still
+0% file parity — regress-runner is all-or-nothing per file). Landed
+internal/parser/bit_string_literal_test.go (TestParseBitStringLiteral,
+TestParseBitStringLiteralInvalidDigit) + internal/executor/
+bit_string_literal_test.go (TestBitStringLiteralInsertRoundTrip,
+TestBitStringLiteralHexDecode). CSV row not-tried -> failed (genuinely
+still failing). Ledger row + design doc (docs/design/m0134-0092-bit-
+string-literal-syntax-and-column-coercion.md) both record the FULL
+remaining gap list: bitwise operator family (~ & | # << >>) entirely
+missing for bit/varbit, || concat has no bit arm, length()/SUBSTRING()
+don't recognize bit/varbit args, COPY hex-format decode doesn't run,
+pg_input_is_valid/pg_input_error_info don't route bit validation. Case
+PARKED (still `failed`) per established M0134 pattern.
+Committed eac970d2 and pushed to origin/regress-renumbering (confirmed).
+fix_plan.md M0134-0092 marked [x] (PARKED convention, matches M0134-0090).
 
 NEXT LOOP: per the Current Priority banner in .ralph/fix_plan.md, continue
-M0134 top-to-bottom — next unworked item is **M0134-0092 (bit.sql, status
-`not-tried`)**. First: `git log --oneline -1 origin/regress-renumbering` (or
-`git push` if the commit above didn't already push) to confirm 5a5392cd
-landed on the remote. Then size bit.sql live against ./postgres oracle via
-scripts/pg-regress-runner.sh --verbose bit (background, generous timeout;
-clear tmp/regress-goopg-data first if a prior run left it non-empty —
-`rm -rf tmp/regress-goopg-data`, the runner errors "Directory not empty" on
-a stale leftover from an interrupted run). bit.sql exercises the bit/varbit
-types — check whether goopg's bit-string support already exists (search
-internal/executor for "bit"/"varbit" codec/operators) before assuming a
-large gap. CAUTION carried forward from M0134-0086/0090: watch `ps -o rss`
-on the goopg PID while any regress file runs (some cases drove RSS to 20+ GB
-in <2 min); kill -KILL promptly (never bare pkill -f) if RSS climbs unbounded
-before deciding whether it's worth fixing first. If bit.sql resolves to a
-small/contained diff like async.sql did, land the fix + ledger + design doc
-+ CSV flip in one loop (M0134's established per-task pattern: PARK on a
-multi-root-cause case after landing the one contained fix, CLOSE clean on a
-small one).
+M0134 top-to-bottom — next unworked item is **M0134-0093 (bitmapops.sql,
+status not-tried)**. First: `git log --oneline -1 origin/regress-renumbering`
+to confirm eac970d2 landed (should already be true). Then size bitmapops.sql
+live against ./postgres oracle via scripts/pg-regress-runner.sh --verbose
+bitmapops (background, generous timeout; `rm -rf tmp/regress-goopg-data`
+first if a prior run left it non-empty). CAUTION carried forward from
+M0134-0086/0090/0092: watch `ps -o rss= -C goopg` while any regress file
+runs (RSS has hit 20+ GB in <2 min on prior files); kill -KILL promptly
+(never bare pkill -f) if RSS climbs unbounded before deciding whether it's
+worth fixing first. If bitmapops.sql resolves to a small/contained diff,
+land the fix + ledger + design doc + CSV flip in one loop (M0134's
+established per-task pattern: PARK on a multi-root-cause case after landing
+the one contained fix, CLOSE clean on a small one — bit.sql this loop
+followed the PARK branch; async.sql M0134-0091 followed the CLOSE branch).
+Also worth a quick look: since bit.sql exposed that PLAIN string literals
+into bit(n)/varbit(n) columns were unvalidated pre-existing (not just the
+B'...' syntax), it's plausible other typed-literal paths (CAST, UPDATE SET)
+share the same coerceTextLikeDatum chokepoint and are now ALSO fixed as a
+side effect — not verified this loop, low-priority spot-check if time
+allows during bitmapops.sql work.
 
-Gates run: `go build ./...` clean; targeted go test -run
-'TestPgNotificationQueueUsageIsFloat8|TestPgNotifyChannelNameValidation'
+Gates run: go build ./... clean; targeted go test -run
+'TestParseBitStringLiteral|TestParseBitStringLiteralInvalidDigit'
+./internal/parser/ PASS; go test -run
+'TestBitStringLiteralInsertRoundTrip|TestBitStringLiteralHexDecode'
 ./internal/executor/ PASS; RALPH_PRECOMMIT_SCOPE=units
-ralph-precommit-test.sh PASS (full suite, ~530s dominated by
-internal/initdb); make check-testport-inventory PASS (after CSV
-comma/quote fix); make regen-testport ran clean; make ralph-state-guard
-PASS (self-repaired a stale progress.json completed-marker, same recurring
-pattern as prior loops — see the guard's own repair message, not a new
-bug); pre-commit hook's pgbench smoke PASS (325/606/11945 TPS across the 3
+ralph-precommit-test.sh PASS (full suite, ~460s dominated by
+internal/initdb); make check-testport-inventory PASS; make regen-testport
+ran clean; make ralph-state-guard PASS (self-repaired a stale
+progress.json completed-marker, same recurring pattern as prior loops);
+pre-commit hook's pgbench smoke PASS (337/618/12442 TPS across the 3
 pgbench transaction types).
 
-In-flight: none.
+In-flight: none. (All throwaway test servers/datadirs from bit.sql
+manual verification were stopped and rm -rf'd this loop — /tmp/goopg-bit*,
+/tmp/bitdd*, tmp/regress-goopg-data all cleaned.)
