@@ -7307,7 +7307,15 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	if o.ctx.Pool == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "CREATE INDEX requires Pool in Context"}
 	}
-	tbl, ok := o.ctx.Catalog.LookupTable(s.Table, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+	// M0134-0085: was o.ctx.Catalog.LookupTable(s.Table, ...) directly, with no
+	// search_path fallback for an unqualified table name — an unqualified
+	// `CREATE INDEX ON t(...)` under a non-default `SET search_path` always
+	// raised a spurious 42P01 even though the table existed in the searched
+	// schema (confirmed live: SELECT/DROP TABLE resolved the same name fine
+	// via lookupTableWithSearch/its DROP-TABLE-local twin, only this site and
+	// CREATE TRIGGER's sibling below skipped the fallback). lookupTableWithSearch
+	// is the same search-path-walking helper execAlterTable already uses.
+	tbl, ok := o.lookupTableWithSearch(s.Table)
 	if !ok {
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Table.String())}
 	}
@@ -11392,7 +11400,26 @@ func (o *ddlOp) execAlterTableAddColumn(stmt *parser.AlterTableStmt, tbl *catalo
 	if stmt.Only && o.hasInheritanceChildren(tbl) {
 		return &ExecError{Code: "42P16", Pos: 0, Message: "column must be added to child tables too"}
 	}
-	if col.NotNull {
+	// M0134-0085: PostgreSQL has no "empty tables only" restriction for
+	// `ADD COLUMN ... NOT NULL` at all (postgres/src/backend/commands/
+	// tablecmds.c ATExecAddColumn, ~7217-7500) — that error string does not
+	// exist anywhere in the PG source. With a constant DEFAULT, ATExecAddColumn
+	// records attmissingval (the "fast default" backfill goopg already
+	// implements below via constDefaultDatum/MissingValue) and NOT NULL is
+	// satisfied for every pre-existing row without a rewrite or scan. Only
+	// when NO usable default exists does PG have to validate the constraint
+	// against existing data, and even then it raises a different, later
+	// error ("column %s of relation %s contains null values",
+	// tablecmds.c:6458) rather than refusing outright — so the guard here
+	// must gate on "no fast-default value", not on "table is non-empty".
+	colTypeForDefault := catalog.Type{Name: strings.ToLower(col.Type.Name), Args: append([]int64(nil), col.Type.Args...)}
+	addColMissingValue, hasAddColMissingValue := Datum{}, false
+	if col.DefaultExpr != nil {
+		if d, ok := constDefaultDatum(col.DefaultExpr, colTypeForDefault); ok && !d.IsNull() {
+			addColMissingValue, hasAddColMissingValue = d, true
+		}
+	}
+	if col.NotNull && !hasAddColMissingValue {
 		rel := o.ctx.Catalog.RelFileNode(tbl)
 		n, err := o.ctx.Pool.NBlocks(rel)
 		if err != nil {
@@ -11418,7 +11445,7 @@ func (o *ddlOp) execAlterTableAddColumn(stmt *parser.AlterTableStmt, tbl *catalo
 	}
 	newCol := catalog.Column{
 		Name:        col.Name,
-		Type:        catalog.Type{Name: strings.ToLower(col.Type.Name), Args: append([]int64(nil), col.Type.Args...)},
+		Type:        colTypeForDefault,
 		NotNull:     col.NotNull,
 		DefaultExpr: col.DefaultExpr,
 	}
@@ -11427,10 +11454,8 @@ func (o *ddlOp) execAlterTableAddColumn(stmt *parser.AlterTableStmt, tbl *catalo
 	// record the Datum on the column. The heap decoder uses it to fill the
 	// column for rows that pre-date this ALTER (storedNatts < new ordinal),
 	// so existing rows surface the default without a table rewrite. M0097-0077.
-	if col.DefaultExpr != nil {
-		if d, ok := constDefaultDatum(col.DefaultExpr, newCol.Type); ok && !d.IsNull() {
-			newCol.MissingValue = d
-		}
+	if hasAddColMissingValue {
+		newCol.MissingValue = addColMissingValue
 	}
 	if err := o.addColumnRecursive(tbl, newCol, act, stmt, true); err != nil {
 		return err
@@ -18506,8 +18531,15 @@ func writeHeapRowCanonical(ctx *Context, rel storage.RelFileNode, cols []catalog
 }
 
 // execCreateTrigger registers a trigger on a table. M0096-0012.
+//
+// M0134-0085: this and the other 7 trigger-DDL functions below (DROP/ALTER/
+// ENABLE/DISABLE TRIGGER) all previously called o.ctx.Catalog.LookupTable
+// directly with no search_path fallback for an unqualified table name —
+// switched to lookupTableWithSearch (same fallback SELECT/DROP TABLE/
+// execAlterTable already get) so `SET search_path = s; CREATE TRIGGER ...
+// ON t ...` resolves `t` in schema `s` instead of raising a spurious 42P01.
 func (o *ddlOp) execCreateTrigger(s *parser.CreateTriggerStmt) error {
-	tbl, ok := o.ctx.Catalog.LookupTable(s.Table, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+	tbl, ok := o.lookupTableWithSearch(s.Table)
 	if !ok {
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Table.Name)}
 	}
@@ -18564,7 +18596,7 @@ func (o *ddlOp) execCreateTrigger(s *parser.CreateTriggerStmt) error {
 // row-level security — this is schema fidelity only, mirroring the RLS ENABLE
 // flag landed in DU-002 slice 322. DU-002 slice 323.
 func (o *ddlOp) execCreatePolicy(s *parser.CreatePolicyStmt) error {
-	tbl, ok := o.ctx.Catalog.LookupTable(s.Table, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+	tbl, ok := o.lookupTableWithSearch(s.Table)
 	if !ok {
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Table.Name)}
 	}
@@ -18629,7 +18661,7 @@ func (o *ddlOp) execCreatePolicy(s *parser.CreatePolicyStmt) error {
 // execDropPolicy removes a row-level security policy from its table. DU-002
 // slice 323.
 func (o *ddlOp) execDropPolicy(s *parser.DropPolicyStmt) error {
-	tbl, ok := o.ctx.Catalog.LookupTable(s.Table, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+	tbl, ok := o.lookupTableWithSearch(s.Table)
 	if !ok {
 		if s.IfExists {
 			o.ctx.AddNotice(fmt.Sprintf("relation %q does not exist, skipping", s.Table.Name))
@@ -18664,7 +18696,7 @@ func (o *ddlOp) execDropPolicy(s *parser.DropPolicyStmt) error {
 // fidelity only; the rule has no runtime effect beyond the COPY-DML rule-kind
 // bookkeeping the CompatNoop path also performed. DU-002 slice 324.
 func (o *ddlOp) execCreateRule(s *parser.CreateRuleStmt) error {
-	tbl, ok := o.ctx.Catalog.LookupTable(s.Table, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+	tbl, ok := o.lookupTableWithSearch(s.Table)
 	if !ok {
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Table.Name)}
 	}
@@ -18718,7 +18750,7 @@ func (o *ddlOp) execDropTrigger(s *parser.DropTriggerStmt) error {
 			return &ExecError{Code: "3F000", Pos: s.Pos(), Message: fmt.Sprintf("schema %q does not exist", sc)}
 		}
 	}
-	tbl, ok := o.ctx.Catalog.LookupTable(s.Table, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+	tbl, ok := o.lookupTableWithSearch(s.Table)
 	if !ok {
 		if s.IfExists {
 			o.ctx.AddNotice(fmt.Sprintf("relation %q does not exist, skipping", s.Table.Name))
@@ -18750,7 +18782,7 @@ func (o *ddlOp) execDropTrigger(s *parser.DropTriggerStmt) error {
 // execDropRule handles DROP RULE. Rules are not implemented; always reports
 // "rule does not exist".
 func (o *ddlOp) execDropRule(s *parser.DropRuleStmt) error {
-	_, tblOk := o.ctx.Catalog.LookupTable(s.Table, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+	_, tblOk := o.lookupTableWithSearch(s.Table)
 	if !tblOk {
 		// When the table is schema-qualified and the schema is not a built-in,
 		// PG emits "schema X does not exist" rather than a rule/relation error.
@@ -18783,7 +18815,7 @@ func (o *ddlOp) execDropRule(s *parser.DropRuleStmt) error {
 			im.UnregisterTableRules(s.Table.Name)
 			// Drop any modelled DO-NOTHING RuleInfo so it stops being dumped via
 			// pg_rewrite → pg_get_ruledef. DU-002 slice 324.
-			if tbl, ok := o.ctx.Catalog.LookupTable(s.Table, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok && tbl != nil {
+			if tbl, ok := o.lookupTableWithSearch(s.Table); ok && tbl != nil {
 				filtered := tbl.Rules[:0]
 				for _, r := range tbl.Rules {
 					if r.Name == s.Name {
@@ -18809,7 +18841,7 @@ func (o *ddlOp) execDropRule(s *parser.DropRuleStmt) error {
 // RenameRewriteRule (including the reserved-name check for "_RETURN", the
 // view SELECT rule, and the duplicate-name collision check). M0134-0065.
 func (o *ddlOp) execAlterRuleRename(s *parser.AlterRuleRenameStmt) error {
-	tbl, ok := o.ctx.Catalog.LookupTable(s.Table, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+	tbl, ok := o.lookupTableWithSearch(s.Table)
 	if !ok {
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Table.Name)}
 	}
