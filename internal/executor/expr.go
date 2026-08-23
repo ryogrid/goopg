@@ -10890,7 +10890,11 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 					return NullDatum, aerr
 				}
 				ts := shifted.TimeValue()
-				uuidV7Ns = ts.UnixNano()
+				u, genErr := genUUIDv7FromTime(ts)
+				if genErr != nil {
+					return NullDatum, &ExecError{Code: "XX000", Pos: x.Pos(), Message: "uuidv7: " + genErr.Error()}
+				}
+				return NewStringDatum(u), nil
 			} else {
 				uuidV7Ns = uuidV7RealTimeNs()
 			}
@@ -17828,8 +17832,26 @@ func uuidV7RealTimeNs() int64 {
 // genUUIDv7 generates a UUIDv7 from the given nanosecond timestamp.
 // rand_a (bytes 6-7) carries 12 bits of sub-ms precision (RFC 9562 Method 3).
 func genUUIDv7(ns int64) (string, error) {
-	ms := ns / 1_000_000
-	subNs := ns % 1_000_000 // nanoseconds within the millisecond (0..999999)
+	return genUUIDv7FromMs(ns/1_000_000, ns%1_000_000)
+}
+
+// genUUIDv7FromTime is like genUUIDv7 but derives the ms-since-epoch and
+// sub-ms-nanosecond components from a time.Time via ts.Unix()/ts.Nanosecond()
+// instead of ts.UnixNano(). ts.UnixNano() is undefined/overflows for dates
+// before 1678 or after 2262 (int64 nanoseconds can only span ~292 years);
+// uuidv7(interval) accepts an arbitrary shift (uuid.sql exercises years
+// 1970..10888), so it must not route through UnixNano. ts.Unix() (int64
+// seconds) has no realistic overflow at those ranges.
+func genUUIDv7FromTime(ts time.Time) (string, error) {
+	ms := ts.Unix()*1_000 + int64(ts.Nanosecond())/1_000_000
+	subNs := int64(ts.Nanosecond()) % 1_000_000
+	return genUUIDv7FromMs(ms, subNs)
+}
+
+// genUUIDv7FromMs builds a UUIDv7 from ms-since-epoch and the nanosecond
+// remainder within that millisecond (0..999999). Shared by genUUIDv7 (real
+// time, ns-based) and genUUIDv7FromTime (arbitrary time.Time, overflow-safe).
+func genUUIDv7FromMs(ms int64, subNs int64) (string, error) {
 	var b [16]byte
 	b[0] = byte(ms >> 40)
 	b[1] = byte(ms >> 32)
