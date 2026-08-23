@@ -17,6 +17,7 @@ import (
 	"math/bits"
 	mathrand "math/rand"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +26,7 @@ import (
 	"unicode/utf8"
 	"unsafe"
 
+	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/utils/mmgr"
@@ -3758,6 +3760,18 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 			return NewTimestampTZDatum(t), nil
 		}
 		return NewTimeDatum(t), nil
+	case "txid_snapshot", "pg_snapshot":
+		// M0134-0080: mirrors parse_snapshot (xid8funcs.c) — xmin/xmax/xip
+		// must all parse, xmin<=xmax, each xip in [xmin,xmax) and
+		// non-decreasing (duplicates collapsed). The error always names
+		// "pg_snapshot" regardless of which spelling was cast, matching
+		// upstream's hardcoded errmsg.
+		norm, ok := parsePgSnapshot(x.Value)
+		if !ok {
+			return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(),
+				Message: fmt.Sprintf("invalid input syntax for type pg_snapshot: %q", x.Value)}
+		}
+		return NewStringDatum(norm), nil
 	default:
 		// Unknown type — treat as text literal. Covers enum/domain casts in v0.
 		// M0097-0017: enum/domain type casts return the string value as-is.
@@ -4839,6 +4853,21 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			return NewStringDatum(fmt.Sprintf("(%d,%d)", block, offset)), nil
 		}
 		return d, nil
+	case "txid_snapshot", "pg_snapshot":
+		// M0134-0080: `::txid_snapshot`/`::pg_snapshot` and CAST(...) route
+		// here (evalCastTyped falls back to evalCast); the `txid_snapshot
+		// '...'` typed-literal spelling has its own arm in
+		// evalTypedStringLit, kept in sync with this one. Mirrors
+		// parse_snapshot (xid8funcs.c) — see parsePgSnapshot.
+		if d.Kind == KindString {
+			norm, ok := parsePgSnapshot(d.StringValue())
+			if !ok {
+				return Datum{}, &ExecError{Code: "22P02", Pos: pos,
+					Message: fmt.Sprintf("invalid input syntax for type pg_snapshot: %q", d.StringValue())}
+			}
+			return NewStringDatum(norm), nil
+		}
+		return d, nil
 	case "numeric", "decimal":
 		// Cast to numeric: validate string inputs, pass through numeric/int as-is.
 		// M0097-0056: prevents 'foo'::numeric from succeeding silently.
@@ -4997,33 +5026,104 @@ func parseXid8(s string) (uint64, error) {
 	return strconv.ParseUint(s, 10, 64)
 }
 
-// parsePgSnapshotValid returns true if s is a valid pg_snapshot literal.
-// Format: xmin:xmax[:xip,...]  M0097-0018.
-func parsePgSnapshotValid(s string) bool {
+// parsePgSnapshot parses and validates a pg_snapshot/txid_snapshot text
+// literal, mirroring parse_snapshot (xid8funcs.c). Format: xmin:xmax[:xip,...].
+// On success returns the canonical form: xip values must be non-decreasing,
+// with equal-valued duplicates collapsed (matching buf_add_txid's "skip
+// duplicates" and the reject of any xip that goes backward). M0134-0080
+// widens the original M0097-0018 form (which never rejected an out-of-order
+// or zero xmin/xmax and never deduplicated) to match upstream exactly.
+func parsePgSnapshot(s string) (string, bool) {
+	xmin, xmax, xips, ok := parsePgSnapshotParts(s)
+	if !ok {
+		return "", false
+	}
+	return formatPgSnapshot(xmin, xmax, xips), true
+}
+
+// parsePgSnapshotParts is parsePgSnapshot's validating parse, exposing the
+// three fields separately for txid_snapshot_xmin/xmax/txid_visible_in_snapshot
+// (M0134-0080) instead of re-parsing the canonical string those callers would
+// otherwise have to re-split.
+func parsePgSnapshotParts(s string) (xmin, xmax uint64, xips []uint64, ok bool) {
 	parts := strings.SplitN(s, ":", 3)
 	if len(parts) < 2 {
-		return false
+		return 0, 0, nil, false
 	}
 	xmin, err1 := strconv.ParseUint(parts[0], 10, 64)
 	xmax, err2 := strconv.ParseUint(parts[1], 10, 64)
-	if err1 != nil || err2 != nil {
-		return false
-	}
-	if xmin > xmax {
-		return false
+	// FullTransactionIdIsValid checks TransactionIdIsValid on the LOW 32 BITS
+	// only (XidFromFullTransactionId): a FullTransactionId packs epoch (high
+	// 32 bits) : xid (low 32 bits), and it's the xid half that must be
+	// nonzero — the full 64-bit value itself can be nonzero while still being
+	// "invalid" this way, e.g. 9223372036854775808 (0x8000000000000000) has a
+	// zero low half. goopg's own TransactionID has no epoch packing, but
+	// txid_snapshot/pg_snapshot's on-the-wire text form must still reject
+	// exactly what upstream rejects.
+	if err1 != nil || err2 != nil || uint32(xmin) == 0 || uint32(xmax) == 0 || xmin > xmax {
+		return 0, 0, nil, false
 	}
 	if len(parts) == 3 && parts[2] != "" {
+		var last uint64
+		haveLast := false
 		for _, xip := range strings.Split(parts[2], ",") {
 			v, err := strconv.ParseUint(xip, 10, 64)
 			if err != nil {
-				return false
+				return 0, 0, nil, false
 			}
 			if v < xmin || v >= xmax {
-				return false
+				return 0, 0, nil, false
 			}
+			if haveLast && v < last {
+				return 0, 0, nil, false
+			}
+			if !haveLast || v != last {
+				xips = append(xips, v)
+			}
+			last = v
+			haveLast = true
 		}
 	}
-	return true
+	return xmin, xmax, xips, true
+}
+
+// formatPgSnapshot renders xmin:xmax[:xip,...] — the pg_snapshot_out /
+// txid_current_snapshot canonical text form. M0134-0080.
+func formatPgSnapshot(xmin, xmax uint64, xips []uint64) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d:%d:", xmin, xmax)
+	for i, v := range xips {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, "%d", v)
+	}
+	return b.String()
+}
+
+// dedupSortedUint64 collapses adjacent equal values in an ascending-sorted
+// slice, in place. Used by txid_current_snapshot to match sort_snapshot's
+// "also remove duplicates" step (xid8funcs.c) when the in-progress array
+// happens to contain the same xid twice. M0134-0080.
+func dedupSortedUint64(s []uint64) []uint64 {
+	if len(s) < 2 {
+		return s
+	}
+	out := s[:1]
+	for _, v := range s[1:] {
+		if v != out[len(out)-1] {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// parsePgSnapshotValid returns true if s is a valid pg_snapshot literal.
+// Format: xmin:xmax[:xip,...]. Thin wrapper over parsePgSnapshot for callers
+// (pg_input_is_valid) that only need the boolean. M0097-0018.
+func parsePgSnapshotValid(s string) bool {
+	_, ok := parsePgSnapshot(s)
+	return ok
 }
 
 // resolveRegclassOID evaluates a regclass/oid argument to its underlying OID.
@@ -14725,6 +14825,122 @@ case "pg_char_to_encoding":
 			return Datum{Kind: KindInt, Int: int64(ctx.Tx.XID)}, nil
 		}
 		return Datum{Kind: KindInt, Int: 0}, nil
+	// txid_current_if_assigned() → xid8: same as pg_current_xact_id() but
+	// returns NULL instead of assigning a new xid. M0134-0080 (pg_proc OID
+	// 3348, handler pg_current_xact_id_if_assigned, xid8funcs.c).
+	case "txid_current_if_assigned":
+		if ctx.Tx.XID != 0 {
+			return Datum{Kind: KindInt, Int: int64(ctx.Tx.XID)}, nil
+		}
+		return NullDatum, nil
+	// txid_current_snapshot() → pg_snapshot: the statement's active
+	// snapshot rendered in xmin:xmax:xip,... form. Mirrors pg_current_snapshot
+	// (xid8funcs.c), reading ctx.Snap directly rather than the procarray (v0
+	// has no separate GetActiveSnapshot() call). M0134-0080 (pg_proc OID 2944).
+	case "txid_current_snapshot":
+		xmin := uint64(ctx.Snap.Xmin)
+		xmax := uint64(ctx.Snap.Xmax)
+		var xips []uint64
+		for _, ip := range ctx.Snap.InProgress {
+			v := uint64(ip)
+			if v >= xmin && v < xmax {
+				xips = append(xips, v)
+			}
+		}
+		sort.Slice(xips, func(i, j int) bool { return xips[i] < xips[j] })
+		xips = dedupSortedUint64(xips)
+		return NewStringDatum(formatPgSnapshot(xmin, xmax, xips)), nil
+	// txid_snapshot_xmin(pg_snapshot) / txid_snapshot_xmax(pg_snapshot) → xid8.
+	// Mirrors pg_snapshot_xmin/pg_snapshot_xmax (xid8funcs.c). M0134-0080
+	// (pg_proc OID 2945/2946).
+	case "txid_snapshot_xmin", "txid_snapshot_xmax":
+		if len(x.Args) != 1 {
+			return NullDatum, nil
+		}
+		argD, err := evalExprSlot(x.Args[0], slot, ctx)
+		if err != nil || argD.IsNull() {
+			return NullDatum, err
+		}
+		xmin, xmax, _, ok := parsePgSnapshotParts(argD.StringValue())
+		if !ok {
+			return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(),
+				Message: fmt.Sprintf("invalid input syntax for type pg_snapshot: %q", argD.StringValue())}
+		}
+		if name == "txid_snapshot_xmin" {
+			return Datum{Kind: KindInt, Int: int64(xmin)}, nil
+		}
+		return Datum{Kind: KindInt, Int: int64(xmax)}, nil
+	// txid_visible_in_snapshot(xid8, pg_snapshot) → bool. Mirrors
+	// pg_visible_in_snapshot/is_visible_fxid (xid8funcs.c). M0134-0080
+	// (pg_proc OID 2948).
+	case "txid_visible_in_snapshot":
+		if len(x.Args) != 2 {
+			return NullDatum, nil
+		}
+		valD, err := evalExprSlot(x.Args[0], slot, ctx)
+		if err != nil || valD.IsNull() {
+			return NullDatum, err
+		}
+		snapD, err := evalExprSlot(x.Args[1], slot, ctx)
+		if err != nil || snapD.IsNull() {
+			return NullDatum, err
+		}
+		xmin, xmax, xips, ok := parsePgSnapshotParts(snapD.StringValue())
+		if !ok {
+			return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(),
+				Message: fmt.Sprintf("invalid input syntax for type pg_snapshot: %q", snapD.StringValue())}
+		}
+		value := uint64(valD.Int)
+		var visible bool
+		switch {
+		case value < xmin:
+			visible = true
+		case value >= xmax:
+			visible = false
+		default:
+			visible = true
+			for _, ip := range xips {
+				if ip == value {
+					visible = false
+					break
+				}
+			}
+		}
+		return NewBoolDatum(visible), nil
+	// txid_status(xid8) → text: 'in progress' / 'committed' / 'aborted', or
+	// NULL for a too-old xid whose CLOG entry has been truncated (unmodelled
+	// in goopg — see the M0134-0080 deferral ledger row), or ERROR for an xid
+	// that has not been assigned yet. Mirrors pg_xact_status/
+	// TransactionIdInRecentPast (xid8funcs.c). M0134-0080 (pg_proc OID 3360).
+	case "txid_status":
+		if len(x.Args) != 1 {
+			return NullDatum, nil
+		}
+		argD, err := evalExprSlot(x.Args[0], slot, ctx)
+		if err != nil || argD.IsNull() {
+			return NullDatum, err
+		}
+		xid := storage.TransactionID(argD.Int)
+		if xid == storage.InvalidTransactionID {
+			return NullDatum, nil
+		}
+		if xid >= transam.FirstNormalTransactionID && ctx.TxnMgr != nil && xid >= ctx.TxnMgr.NextXID() {
+			return Datum{}, &ExecError{Code: "22023", Pos: x.Pos(),
+				Message: fmt.Sprintf("transaction ID %d is in the future", int64(xid))}
+		}
+		if ctx.TxnMgr == nil {
+			return NullDatum, nil
+		}
+		switch ctx.TxnMgr.ClassifyXID(xid) {
+		case transam.XidVisInProgress:
+			return NewStringDatum("in progress"), nil
+		case transam.XidVisCommitted:
+			return NewStringDatum("committed"), nil
+		case transam.XidVisAborted:
+			return NewStringDatum("aborted"), nil
+		default:
+			return NullDatum, nil
+		}
 	case "clock_timestamp":
 		// prorettype 1184 (timestamptz), like the now() family. M0119-0006.
 		return NewTimestampTZDatum(ctx.Now), nil

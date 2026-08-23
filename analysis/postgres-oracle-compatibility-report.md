@@ -1,6 +1,6 @@
 # PostgreSQL Oracle Compatibility Report (M0060)
 
-Generated at: 2026-08-21T10:58:17+09:00
+Generated at: 2026-08-23T22:46:54+09:00
 
 Single authority: `docs/test-port/postgres-oracle-target-inventory.csv`.
 ## Inventory Snapshot
