@@ -4,27 +4,6 @@ goopg is a from-scratch Go reimplementation of PostgreSQL. Vanilla-PG
 compatibility is absolute; the read-only oracle is PG 18.3 under `./postgres/`
 (never modify it). Build/run/test details: `.ralph/AGENT.md`.
 
-## Delegation architecture (Ralph loop, coordinator edition)
-
-The Ralph loop's main session is a **coordinator** on the strong model tier. It
-selects tasks, designs, decomposes, reviews, bookkeeps (`.ralph/fix_plan.md`,
-`.ralph/deferral_ledger.md`, `docs/**`), commits (explicit pathspecs, never
-`--no-verify`), and reports — and delegates everything else to subagents defined
-in `.claude/agents/`:
-
-| agent | tier | writes code? | role |
-|---|---|---|---|
-| `researcher` | cheap | no | goopg + `./postgres/` oracle investigation, condensed cited findings |
-| `implementer` | cheap | yes | one narrowly-briefed slice + targeted tests; never commits |
-| `tester` | cheap | tests only | long gates (units, tpch-spotcheck, race-gate, TPC-DS SF0.5), foreground |
-| `reviewer` | strong | no | optional adversarial review of an uncommitted diff |
-
-Handoff artifacts (coordinator-written `brief.md`, worker-appended `report.md`)
-live under `tmp/ralph-handoffs/<brief-id>/` — scratch only; durable decisions go
-to the commit message / design docs / ledger / `.ralph/working_set.md`. Workers
-inherit every rule in this file and `.ralph/AGENT.md` (cgroup caps, foreground
-gates, no `-count=1`, no `pkill -f`, no commits).
-
 ## Benchmark clusters (TPC-H / TPC-DS)
 
 Two fully separate benchmark stacks. TPC-H lives under `bench/tpch/`, TPC-DS
