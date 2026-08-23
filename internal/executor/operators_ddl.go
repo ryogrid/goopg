@@ -16845,6 +16845,15 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 		for _, r := range routines {
 			oid := r.OID
 			if err := rs.RenameRoutine(r, s.RenameTo); err != nil {
+				if errors.Is(err, catalog.ErrRoutineNameConflict) {
+					// Mirrors PG's IsThereFunctionInNamespace() (functioncmds.c),
+					// called before ALTER FUNCTION/PROCEDURE/ROUTINE RENAME TO
+					// re-keys pg_proc: reject instead of silently displacing the
+					// existing routine of the same name+signature.
+					argList := routineArgListStr(argTypes)
+					return &ExecError{Code: "42723", Pos: s.Pos(),
+						Message: fmt.Sprintf("function %s%s already exists in schema %q", s.RenameTo, argList, r.Schema)}
+				}
 				return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 			}
 			// DU-002 restart-persistence follow-up (M0119-0004, loop #71 ledger
@@ -16890,6 +16899,11 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 		for _, r := range routines {
 			oid := r.OID
 			if err := rs.SetSchema(r, s.NewSchema); err != nil {
+				if errors.Is(err, catalog.ErrRoutineNameConflict) {
+					argList := routineArgListStr(argTypes)
+					return &ExecError{Code: "42723", Pos: s.Pos(),
+						Message: fmt.Sprintf("function %s%s already exists in schema %q", r.Name, argList, s.NewSchema)}
+				}
 				return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 			}
 			_ = oid

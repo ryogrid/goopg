@@ -786,6 +786,15 @@ func (rs *Routines) LookupByOID(oid uint32) *Routine {
 	return nil
 }
 
+// ErrRoutineNameConflict is returned by RenameRoutine/SetSchema when a
+// routine with the target name and the SAME argument signature already
+// exists in the destination schema — mirrors PG's
+// IsThereFunctionInNamespace() check (functioncmds.c), which
+// ALTER FUNCTION/PROCEDURE/ROUTINE RENAME TO and SET SCHEMA both call
+// before re-keying pg_proc. Callers translate this into SQLSTATE 42723
+// ("function %s already exists in schema %q").
+var ErrRoutineNameConflict = errors.New("routine name conflict")
+
 // RenameRoutine changes the Name of a routine in the registry.
 // Updates both byKey and byName indices. M0097-0022.
 func (rs *Routines) RenameRoutine(r *Routine, newName string) error {
@@ -794,6 +803,14 @@ func (rs *Routines) RenameRoutine(r *Routine, newName string) error {
 	oldKey := routineKey(r.DBOid, r.Schema, r.Name, r.Signature())
 	if _, ok := rs.byKey[oldKey]; !ok {
 		return fmt.Errorf("routine %s.%s not found in registry", r.Schema, r.Name)
+	}
+	// Duplicate-name guard: PG rejects a rename that collides with an
+	// existing routine of the same signature in the same schema
+	// (IsThereFunctionInNamespace) instead of silently displacing it.
+	if conflictKey := routineKey(r.DBOid, r.Schema, newName, r.Signature()); conflictKey != oldKey {
+		if existing, ok := rs.byKey[conflictKey]; ok && existing != r {
+			return ErrRoutineNameConflict
+		}
 	}
 	oldNK := nameKey(r.DBOid, r.Schema, r.Name)
 	// Remove old key from byKey and byName.
@@ -828,6 +845,13 @@ func (rs *Routines) SetSchema(r *Routine, newSchema string) error {
 	oldKey := routineKey(r.DBOid, r.Schema, r.Name, r.Signature())
 	if _, ok := rs.byKey[oldKey]; !ok {
 		return fmt.Errorf("routine %s.%s not found in registry", r.Schema, r.Name)
+	}
+	// Same duplicate-name guard as RenameRoutine, checked against the
+	// destination schema instead of the destination name.
+	if conflictKey := routineKey(r.DBOid, newSchema, r.Name, r.Signature()); conflictKey != oldKey {
+		if existing, ok := rs.byKey[conflictKey]; ok && existing != r {
+			return ErrRoutineNameConflict
+		}
 	}
 	oldNK := nameKey(r.DBOid, r.Schema, r.Name)
 	delete(rs.byKey, oldKey)
