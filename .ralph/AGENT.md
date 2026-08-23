@@ -282,12 +282,6 @@ global -rx SymbolName           # locate references
 global -f path/to/file.c        # list symbols defined in a file
 ```
 
-Faster than grep/global for most lookups: the `mcp__any-script__pg_*` MCP tools
-query a pre-built symbol database over this tree —
-`pg_search_symbols` (SQL-LIKE patterns like `heap_%`), `pg_symbol_source`,
-`pg_symbol_overview`/`pg_symbol_document`, and `pg_references_to`/`pg_references_from`
-for caller/callee analysis. Prefer them; fall back to `global -x` when they miss.
-
 When porting any concept, cite the upstream file path (e.g.
 `postgres/src/backend/storage/buffer/bufmgr.c`) in the relevant design doc
 and/or code comment. Never modify, vendor, or import code from `./postgres/`.

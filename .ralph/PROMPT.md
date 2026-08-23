@@ -400,14 +400,7 @@ Remember: Quality over speed. Build it right the first time. Know when you're do
 
 ## TOOLS
 - use LSP (Serena, `mcp__serena__*`) for code navigation and analysis of the Go codebase
-- For PostgreSQL internals (the oracle), prefer the dedicated MCP tools — they are
-  faster and cheaper than grepping the 1.5 GB tree:
-  - `mcp__any-script__pg_search_symbols` — SQL-LIKE pattern search (e.g. `heap_%`)
-  - `mcp__any-script__pg_symbol_source` — full source of a symbol
-  - `mcp__any-script__pg_symbol_overview` / `pg_symbol_document` — generated docs for a symbol
-  - `mcp__any-script__pg_references_to` / `pg_references_from` — caller/callee analysis
-- use GNU GLOBAL (`global -x SymbolName` from inside ./postgres) as the fallback for
-  symbol location; the index is pre-generated, so searches are fast
+- For PostgreSQL internals (the oracle), prefer the GNU GLOBAL (`global -x SymbolName` from inside ./postgres) to find symbol location; the index is pre-generated, so searches are fast
 - The official PostgreSQL manual is available as markdown under
   `postgres/official_docs_in_md/` — cite/link it for user-visible semantics (GUC
   meanings, SQL behavior) instead of re-deriving from source
