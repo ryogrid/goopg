@@ -20126,8 +20126,17 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		// Canonicalize type names (int → integer, etc.).
 		fromCanon := dropCompatCanonicalType(fromType)
 		toCanon := dropCompatCanonicalType(toType)
-		// Validate unknown types only when they don't look like schema-qualified names.
-		if fromSchema == "" && fromCanon == "" {
+		// Validate unknown types only when they don't look like schema-qualified
+		// names, and only after also checking the user type registries
+		// (enum/domain/composite — the last of which also covers "base" types
+		// created via CREATE TYPE's I/O-function form, since execCreateType
+		// falls back to RegisterCompositeType for them). Without this check a
+		// user-defined cast target/source type (e.g. `DROP CAST (text AS
+		// mytype)`) falsely raised "type does not exist" purely because
+		// dropCompatCanonicalType only recognizes PG's builtin names.
+		// M0134-0110.
+		im, _ := o.ctx.Catalog.(*catalog.InMemory)
+		if fromSchema == "" && fromCanon == "" && !isKnownUserType(im, fromType) {
 			if s.IfExists {
 				o.ctx.AddNotice(fmt.Sprintf("type %q does not exist, skipping", fromType))
 				return nil
@@ -20135,7 +20144,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("type %q does not exist", fromType)}
 		}
-		if toSchema == "" && toCanon == "" {
+		if toSchema == "" && toCanon == "" && !isKnownUserType(im, toType) {
 			if s.IfExists {
 				o.ctx.AddNotice(fmt.Sprintf("type %q does not exist, skipping", toType))
 				return nil
@@ -20982,18 +20991,71 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 	return nil
 }
 
-// castTypeOIDMatch reports whether two type-name spellings denote the same type
-// for CREATE CAST validation. Built-in aliases (integer/int4, boolean/bool, …)
-// are compared by OID via catalog.TypeNameToOID; user/unknown types (OID 0) fall
-// back to a case-insensitive name comparison. goopg does not model
-// binary-coercibility beyond identity, so this is an identity test — PG's
-// IsBinaryCoercibleWithCast additionally accepts an existing binary cast (see
-// the slice-398 deferral ledger row).
-func castTypeOIDMatch(a, b string) bool {
-	if oa, ob := catalog.TypeNameToOID(a), catalog.TypeNameToOID(b); oa != 0 && ob != 0 {
-		return oa == ob
+// castTypeOIDMatch compares two type names for CREATE CAST's argument/return
+// and same-type checks. im is the live catalog (nil in unit tests exercising
+// only builtin types); it is consulted first via resolveUserTypeOID so a
+// user-defined type (CREATE TYPE, including the base/"shell" form) resolves
+// to its own OID instead of falling through catalog.TypeNameToOID's "unknown
+// name" default (OIDText), which previously made every user type falsely
+// compare equal to `text`. M0134-0110. Beyond OID identity, this also accepts
+// an existing WITHOUT FUNCTION/WITH INOUT user cast between a and b as a
+// match — mirroring PG's IsBinaryCoercibleWithCast (cast.c), which lets a
+// WITH FUNCTION cast's argument/return type be merely binary-coercible to
+// (not identical to) the declared source/target, closing the slice-398
+// deferral ledger row's binary-coercibility gap.
+func castTypeOIDMatch(im *catalog.InMemory, a, b string) bool {
+	oa, ob := castResolveTypeOID(im, a), castResolveTypeOID(im, b)
+	if oa != 0 && ob != 0 {
+		if oa == ob {
+			return true
+		}
+	} else if strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b)) {
+		return true
 	}
-	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
+	return castUserBinaryCoercible(im, a, b)
+}
+
+// castUserBinaryCoercible reports whether a registered user CREATE CAST …
+// WITHOUT FUNCTION (pg_cast.castmethod 'b') links a and b in either
+// direction — mirroring PG's IsBinaryCoercible, which only a real binary
+// cast satisfies (a WITH INOUT cast still runs the type's own I/O functions,
+// so it is not binary-coercible). PG additionally special-cases domains and
+// a handful of hard-wired pairs (anyarray, etc.); those are out of scope
+// here — only the explicit-cast-registry form CREATE CAST test cases
+// exercise.
+func castUserBinaryCoercible(im *catalog.InMemory, a, b string) bool {
+	if im == nil {
+		return false
+	}
+	if cs := im.CastByTypes(a, b); cs != nil && cs.Method == "b" {
+		return true
+	}
+	if cs := im.CastByTypes(b, a); cs != nil && cs.Method == "b" {
+		return true
+	}
+	return false
+}
+
+// castResolveTypeOID resolves a CREATE CAST source/target/argument type name
+// to its pg_type OID: user registries first (enum/domain/composite — the
+// last of which also covers CREATE TYPE's base/I/O-function form), then the
+// builtin name table. Unlike a bare catalog.TypeNameToOID call, this returns
+// 0 — not the OIDText safe fallback — for a name that matches neither, so an
+// unrecognized name never wrongly compares equal to `text`. The only name
+// catalog.TypeNameToOID's switch statement itself maps to OIDText is the
+// literal "text" case; every other input reaches that value only through its
+// default arm, which is exactly what the EqualFold guard below distinguishes.
+func castResolveTypeOID(im *catalog.InMemory, name string) uint32 {
+	if im != nil {
+		if oid, kind := resolveUserTypeOID(im, name); kind != typeKindNone {
+			return oid
+		}
+	}
+	oid := catalog.TypeNameToOID(name)
+	if oid != catalog.OIDText || strings.EqualFold(strings.TrimSpace(name), "text") {
+		return oid
+	}
+	return 0
 }
 
 // validateCreateConversionEncodings mirrors the encoding-name checks PostgreSQL
@@ -21110,9 +21172,14 @@ func builtinProcMatchesConversionSig(b catalog.BuiltinProc) bool {
 // in CreateCast (src/backend/commands/functioncmds.c). routine is the resolved
 // WITH FUNCTION routine, or nil for WITHOUT FUNCTION / WITH INOUT (or a WITH
 // FUNCTION reference that did not resolve, which keeps the slice-397 lenient
-// register-anyway behaviour). All errors use SQLSTATE 42P17
-// (invalid_object_definition), matching PG. DU-002 slice 398.
-func validateCreateCast(s *parser.CompatNoopStmt, routine *catalog.Routine) error {
+// register-anyway behaviour). im is the live catalog (nil in unit tests that
+// only exercise builtin types) — needed so a user-defined source/target type
+// (CREATE CAST over a CREATE TYPE'd type) resolves to its real OID instead of
+// falling through catalog.TypeNameToOID's "unknown name" safe default, which
+// is OIDText and previously made every user type falsely compare equal to
+// `text`. All errors use SQLSTATE 42P17 (invalid_object_definition), matching
+// PG. DU-002 slice 398, M0134-0110.
+func validateCreateCast(s *parser.CompatNoopStmt, routine *catalog.Routine, im *catalog.InMemory) error {
 	source, target := s.ArgTypes[0], s.ArgTypes[1]
 	nargs := 0
 	if routine != nil {
@@ -21129,7 +21196,7 @@ func validateCreateCast(s *parser.CompatNoopStmt, routine *catalog.Routine) erro
 		if nargs < 1 || nargs > 3 {
 			return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "cast function must take one to three arguments"}
 		}
-		if !castTypeOIDMatch(source, inArgs[0].Name) {
+		if !castTypeOIDMatch(im, source, inArgs[0].Name) {
 			return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "argument of cast function must match or be binary-coercible from source data type"}
 		}
 		if nargs > 1 && catalog.TypeNameToOID(inArgs[1].Name) != catalog.OIDInt4 {
@@ -21138,7 +21205,7 @@ func validateCreateCast(s *parser.CompatNoopStmt, routine *catalog.Routine) erro
 		if nargs > 2 && catalog.TypeNameToOID(inArgs[2].Name) != catalog.OIDBool {
 			return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "third argument of cast function must be type boolean"}
 		}
-		if !castTypeOIDMatch(routine.ReturnType.Name, target) {
+		if !castTypeOIDMatch(im, routine.ReturnType.Name, target) {
 			return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "return data type of cast function must match or be binary-coercible to target data type"}
 		}
 		if routine.IsProcedure || routine.IsWindow {
@@ -21150,10 +21217,25 @@ func validateCreateCast(s *parser.CompatNoopStmt, routine *catalog.Routine) erro
 	}
 	// Allow source and target types to be the same only for length-coercion
 	// functions; PG assumes a multi-arg (>= 2) function does length coercion.
-	if castTypeOIDMatch(source, target) && nargs < 2 {
+	if castTypeOIDMatch(im, source, target) && nargs < 2 {
 		return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "source data type and target data type are the same"}
 	}
 	return nil
+}
+
+// isKnownUserType reports whether name resolves to a user-registered type in
+// one of the enum/domain/composite registries (resolveUserTypeOID) — the
+// last of which also covers "base" types created via CREATE TYPE's
+// INPUT/OUTPUT-function form, since execCreateType registers those through
+// RegisterCompositeType too. Used to distinguish a genuinely unknown type
+// name from a known user type that simply isn't in the builtin name tables
+// (dropCompatCanonicalType, catalog.TypeNameToOID). M0134-0110.
+func isKnownUserType(im *catalog.InMemory, name string) bool {
+	if im == nil {
+		return false
+	}
+	_, kind := resolveUserTypeOID(im, name)
+	return kind != typeKindNone
 }
 
 // resolveOperatorSupportFunc resolves a CREATE/ALTER OPERATOR RESTRICT=/JOIN=
@@ -21847,7 +21929,7 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			}
 			// Enforce PG's CREATE CAST argument/return-type rules
 			// (functioncmds.c CreateCast) before registering. DU-002 slice 398.
-			if err := validateCreateCast(s, routine); err != nil {
+			if err := validateCreateCast(s, routine, im); err != nil {
 				return err
 			}
 			cs := im.RegisterCast(s.ArgTypes[0], s.ArgTypes[1], s.CastContext, s.CastMethod, funcOID)

@@ -22304,10 +22304,26 @@ func (c *InMemory) DropEnum(name string, cascade bool, dbOid ...uint32) error {
 // M0097-0064.
 func (c *InMemory) RegisterCompositeType(name string, dbOid ...uint32) {
 	oid := resolveDBOid(dbOid)
-	k := compositeKey(oid, name)
+	lowerName := strings.ToLower(name)
+	k := compositeKey(oid, lowerName)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.compositeTypeNames[k] = true
+	// Also allocate a real OID-bearing entry in compositeTypes (mirroring
+	// RegisterCompositeTypeWithFields, just with a nil field list) so a "base"
+	// type — CREATE TYPE name (INPUT=.., OUTPUT=.., ...), the only shape that
+	// reaches this bare-name registrar since the composite-with-fields shape
+	// calls RegisterCompositeTypeWithFields directly — gets an OID that
+	// LookupCompositeType/resolveUserTypeOID (and everything built on them:
+	// CREATE CAST's same-type/argument checks, DROP CAST's type-exists check)
+	// can actually find. Before this fix compositeTypeNames-only registration
+	// meant such a type was "not found" by every OID-keyed lookup despite
+	// compositeTypeNames saying it exists — the type's own OID never leaked
+	// out anywhere. M0134-0110.
+	if _, ok := c.compositeTypes[k]; !ok {
+		c.compositeTypes[k] = &CompositeType{Name: lowerName, OID: c.nextOID, ArrayOID: c.nextOID + 1, RelOID: c.nextOID + 2, DBOid: oid}
+		c.nextOID += 3
+	}
 }
 
 // RegisterCompositeTypeWithFields records a composite type together with its
