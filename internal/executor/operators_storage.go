@@ -3926,6 +3926,18 @@ func tryApplyHOTUpdate(
 	if err := ctx.MaterializeWriterXID(); err != nil {
 		return false, err
 	}
+	// TOAST oversized column values before encoding (mirrors
+	// writeHeapRowReturning's non-HOT path, M0046-0006). Without this, a HOT
+	// update whose SET-clause produced a freshly-computed oversized value
+	// (e.g. `SET f1 = '-'||f1||'-'` on a TOASTed column) tries to encode the
+	// raw value in place and fails with "tuple too large for line pointer"
+	// instead of externalizing it — surfaced by fixing the SET-eval
+	// detoast bug above (M0134-0129, indirect_toast.sql).
+	var toastErr error
+	newRow, toastErr = ToastLargeColumnsIfNeeded(ctx, rel, cols, newRow)
+	if toastErr != nil {
+		return false, &ExecError{Code: "XX000", Message: toastErr.Error()}
+	}
 	// Always encode in PG-native physical format (M0111-0002): one on-disk
 	// heap-tuple format for HOT and non-HOT updates alike. goopg reads it back
 	// by selecting the decoder from the tuple header (natts/bitmap).
@@ -4252,6 +4264,18 @@ func (o *updateOp) appendUpdateRetRow(newRow Row) {
 func (o *updateOp) appendUpdateRetRowWithFrom(newRow Row, fromPortion Row) {
 	if len(o.plan.Returning) == 0 {
 		return
+	}
+	// Detoast before evaluating RETURNING expressions (M0134-0129 discovery,
+	// indirect_toast.sql): an unmodified out-of-line column deliberately
+	// keeps its raw KindToastPointer datum through the SET-eval/write path
+	// above (to avoid needlessly re-toasting a value nothing touched), so
+	// RETURNING — which reads the row like any other projection — must
+	// resolve it here rather than let it fall through to AppendValueText's
+	// `?datum kind=N?` fallback.
+	if needsDetoast(newRow) {
+		if dr, derr := DetoastRow(o.ctx, o.ctx.Catalog.RelFileNode(o.plan.Table), o.plan.Table.Columns, newRow); derr == nil {
+			newRow = dr
+		}
 	}
 	evalRow := newRow
 	if len(fromPortion) > 0 {
@@ -5236,7 +5260,19 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			clear(o.ctx.MultiAssignSubqCache)
 			evalRow := row
 			if isInheritChild {
-				evalRow = remapChildRowToParent(row, inheritColMap)
+				// Detoast in the child's own column/toast-relation space
+				// BEFORE remapping to parent ordinals — same rationale as
+				// the non-inherit branch below (M0134-0129 discovery):
+				// o.pred / SET-clause exprs referencing an out-of-line
+				// column must see the real value, not a raw
+				// KindToastPointer datum.
+				detoastedChildRow := row
+				if needsDetoast(row) {
+					if dr, derr := DetoastRow(o.ctx, scanRel, scanCols, row); derr == nil {
+						detoastedChildRow = dr
+					}
+				}
+				evalRow = remapChildRowToParent(detoastedChildRow, inheritColMap)
 				if o.pred != nil {
 					v, _ := evalExpr(o.pred, evalRow, o.ctx)
 					if v.IsNull() || v.Kind != KindBool || !v.BoolValue() {
@@ -5266,10 +5302,33 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			} else {
 				nCols := len(captureCols)
 				newRow = make(Row, nCols)
+				// SET-clause expressions are evaluated against a detoasted
+				// view of the row (lazily built on first use) so a
+				// self-reference like `SET f1 = '-'||f1||'-'` sees the real
+				// TOASTed value instead of the raw KindToastPointer datum —
+				// which previously stringified to the `?datum kind=N?`
+				// AppendValueText fallback and durably wrote that garbage
+				// back as the new column value (M0134-0129 discovery,
+				// indirect_toast.sql). Untouched columns keep passing
+				// through the RAW `row[i]` below (not detoastRow) so an
+				// unmodified out-of-line value keeps its existing TOAST
+				// pointer instead of being needlessly re-toasted — mirrors
+				// PG's behaviour of leaving an unchanged TOASTed datum alone.
+				var detoastedRow Row
 				for i := range captureCols {
 					setIdx := i
 					if setIdx < len(o.plan.Set) && o.plan.Set[setIdx] != nil {
-						v, err := evalExpr(o.plan.Set[setIdx], row, o.ctx)
+						if detoastedRow == nil {
+							detoastedRow = row
+							if needsDetoast(row) {
+								dr, derr := DetoastRow(o.ctx, scanRel, captureCols, row)
+								if derr != nil {
+									return derr
+								}
+								detoastedRow = dr
+							}
+						}
+						v, err := evalExpr(o.plan.Set[setIdx], detoastedRow, o.ctx)
 						if err != nil {
 							return err
 						}
@@ -7551,8 +7610,21 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, statOID uint32, cols []
 		// callbacks.
 		for _, vt := range visible {
 			if pred != nil {
+				// Evaluate the predicate against a detoasted view so a WHERE
+				// clause touching an out-of-line column (e.g. a substring
+				// probe) sees the real value, not a raw KindToastPointer
+				// datum (M0134-0129 discovery, indirect_toast.sql). vt.row
+				// itself stays untouched — the UPDATE/DELETE callback below
+				// still needs the raw row so unmodified out-of-line columns
+				// pass through with their existing TOAST pointer intact.
+				predRow := vt.row
+				if needsDetoast(predRow) {
+					if dr, derr := DetoastRow(ctx, rel, cols, predRow); derr == nil {
+						predRow = dr
+					}
+				}
 				predSlot := &MaterializedSlot{
-					row:       vt.row,
+					row:       predRow,
 					hasCTID:   true,
 					ctidBlock: uint32(blk),
 					ctidOff:   vt.slot,
