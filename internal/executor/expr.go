@@ -159,6 +159,16 @@ func oidToBuiltinTypeName(oid uint32) string {
 		return "trigger"
 	case 2281:
 		return "internal"
+	case 194:
+		// pg_node_tree: server-internal parse/plan-tree text representation
+		// (pg_class.relpartbound, pg_attrdef.adbin's sibling columns), bare
+		// name like the other pseudo-types above. M0134-0142 (misc_sanity.sql
+		// atttypid::regtype).
+		return "pg_node_tree"
+	case 2277:
+		// anyarray: polymorphic pseudo-type, bare name (pg_attribute.attmissingval).
+		// M0134-0142.
+		return "anyarray"
 	case 2950:
 		return "uuid"
 	case 3220:

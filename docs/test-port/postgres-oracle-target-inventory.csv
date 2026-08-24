@@ -122,7 +122,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-sql,regress,postgres/src/test/regress/sql/merge.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/misc.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/misc_functions.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/misc_sanity.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/misc_sanity.sql,failed,no,-,"Sized live M0134-0142 (2026-08-25); PARKED — landed pg_attribute.attoptions/attfdwoptions text[] typing fix + pg_node_tree/anyarray ::regtype name resolution (diff 72->69 lines); remaining gap is pg_shdepend catalog entirely unimplemented plus no generic system-catalog TOAST-table registration (pg_type shows spurious untoasted varlena columns), see deferral ledger"
 ,regress-sql,regress,postgres/src/test/regress/sql/money.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/multirangetypes.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/mvcc.sql,failed,no,-,"Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13) [baseline says fail; inventory had pass — possible regression, verify]"
