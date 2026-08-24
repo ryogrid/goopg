@@ -185,3 +185,48 @@ func TestEvalPgCharToEncoding(t *testing.T) {
 		}
 	})
 }
+
+// TestEvalConvertFromEucKr verifies convert_from(bytea, 'EUC_KR') decodes
+// real KS X 1001 Hangul byte sequences to UTF8 text, matching the PG 18.3
+// oracle's src/test/regress/sql/euc_kr.sql (which asserts the two decoded
+// strings' POSITION() result, not just successful conversion — a stub or
+// approximate table would silently produce the wrong count). M0134-0121.
+func TestEvalConvertFromEucKr(t *testing.T) {
+	ctx := &Context{}
+	call := &optimizer.FuncCall{Name: "convert_from", Args: []optimizer.Expr{
+		&optimizer.StringConst{Value: `\xbcf6c7d0`},
+		&optimizer.StringConst{Value: "EUC_KR"},
+	}}
+	got, err := evalFuncCall(call, nil, ctx)
+	if err != nil {
+		t.Fatalf("evalFuncCall: %v", err)
+	}
+	if want := "수학"; got.StringValue() != want {
+		t.Errorf("convert_from(bytea, 'EUC_KR') = %q, want %q", got.StringValue(), want)
+	}
+}
+
+// TestEvalConvertToEucKr verifies convert_to(text, 'EUC_KR') is the exact
+// inverse of convert_from for the same KS X 1001 characters. M0134-0121.
+func TestEvalConvertToEucKr(t *testing.T) {
+	ctx := &Context{}
+	call := &optimizer.FuncCall{Name: "convert_to", Args: []optimizer.Expr{
+		&optimizer.StringConst{Value: "수학"},
+		&optimizer.StringConst{Value: "EUC_KR"},
+	}}
+	got, err := evalFuncCall(call, nil, ctx)
+	if err != nil {
+		t.Fatalf("evalFuncCall: %v", err)
+	}
+	want := []byte{0xbc, 0xf6, 0xc7, 0xd0}
+	gotBytes := got.BytesValue()
+	if len(gotBytes) != len(want) {
+		t.Fatalf("convert_to(text, 'EUC_KR') = % x, want % x", gotBytes, want)
+	}
+	for i := range want {
+		if gotBytes[i] != want[i] {
+			t.Errorf("convert_to(text, 'EUC_KR') = % x, want % x", gotBytes, want)
+			break
+		}
+	}
+}

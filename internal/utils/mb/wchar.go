@@ -16,6 +16,7 @@ import (
 const (
 	PG_SQL_ASCII = 0
 	PG_EUC_JP    = 1
+	PG_EUC_KR    = 3
 	PG_UTF8      = 6
 	PG_LATIN1    = 8
 	PG_LATIN2    = 14

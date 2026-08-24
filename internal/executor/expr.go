@@ -35,6 +35,7 @@ import (
 	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/parser/sqlkeywords"
 	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/utils/mb"
 )
 
 // sessionPRNG is the per-process random-number generator used by random(),
@@ -15178,6 +15179,69 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			return NullDatum, &ExecError{Code: "22023", Pos: x.Pos(),
 				Message: fmt.Sprintf("unrecognized encoding: %q", fmtArg.Format())}
 		}
+	case "convert_from":
+		// convert_from(bytea, src_encoding name) -> text: decode src_encoding
+		// bytes into the server encoding (always UTF8 here). Port of
+		// pg_convert_from (postgres/src/backend/utils/adt/mbutils.c).
+		// Resolution goes through mb.BuiltinLookup, the same bootstrap-only
+		// conversion set maybeConvertCellsForClientEncoding uses for
+		// client_encoding — a CREATE CONVERSION-registered proc is not yet
+		// consulted (M0122-0008 scope note, carried forward). M0134-0121.
+		if len(x.Args) != 2 {
+			return NullDatum, nil
+		}
+		src, serr := evalExprSlot(x.Args[0], slot, ctx)
+		if serr != nil || src.IsNull() {
+			return NullDatum, nil
+		}
+		encArg, eerr := evalExprSlot(x.Args[1], slot, ctx)
+		if eerr != nil || encArg.IsNull() {
+			return NullDatum, nil
+		}
+		raw := src.BytesValue()
+		if src.Kind != KindBytes {
+			b, berr := byteaIn(src.StringValue(), x.Pos())
+			if berr != nil {
+				return NullDatum, berr
+			}
+			raw = b
+		}
+		srcEnc := catalog.EncodingNameToID(encArg.StringValue())
+		if srcEnc < 0 {
+			return NullDatum, &ExecError{Code: "22023", Pos: x.Pos(),
+				Message: fmt.Sprintf("invalid encoding name %q", encArg.StringValue())}
+		}
+		converted, cerr := mb.DoEncodingConversion(raw, srcEnc, mb.PG_UTF8, mb.BuiltinLookup)
+		if cerr != nil {
+			return NullDatum, &ExecError{Code: "22021", Pos: x.Pos(), Message: cerr.Error()}
+		}
+		return NewStringDatum(string(converted)), nil
+	case "convert_to":
+		// convert_to(text, dest_encoding name) -> bytea: encode server-
+		// encoding (UTF8) text into dest_encoding bytes. Port of
+		// pg_convert_to (postgres/src/backend/utils/adt/mbutils.c). Same
+		// mb.BuiltinLookup scope note as convert_from. M0134-0121.
+		if len(x.Args) != 2 {
+			return NullDatum, nil
+		}
+		src, serr := evalExprSlot(x.Args[0], slot, ctx)
+		if serr != nil || src.IsNull() {
+			return NullDatum, nil
+		}
+		encArg, eerr := evalExprSlot(x.Args[1], slot, ctx)
+		if eerr != nil || encArg.IsNull() {
+			return NullDatum, nil
+		}
+		destEnc := catalog.EncodingNameToID(encArg.StringValue())
+		if destEnc < 0 {
+			return NullDatum, &ExecError{Code: "22023", Pos: x.Pos(),
+				Message: fmt.Sprintf("invalid encoding name %q", encArg.StringValue())}
+		}
+		converted, cerr := mb.DoEncodingConversion([]byte(src.StringValue()), mb.PG_UTF8, destEnc, mb.BuiltinLookup)
+		if cerr != nil {
+			return NullDatum, &ExecError{Code: "22021", Pos: x.Pos(), Message: cerr.Error()}
+		}
+		return NewBytesDatum(converted), nil
 	case "crc32":
 		// crc32(bytea) -> int8. Standard CRC-32 (IEEE/zlib polynomial).
 		// PG oracle: pg_crc.c:106-116 (crc32_bytea) —
