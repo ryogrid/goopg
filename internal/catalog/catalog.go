@@ -7415,7 +7415,7 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 				relHasRules,                     // 20: relhasrules
 				relHasTriggers,                  // 21: relhastriggers
 				func() string {
-					if len(c.partitionChildren[t.OID]) > 0 {
+					if len(c.partitionChildren[t.OID]) > 0 || len(c.inheritanceChildren[t.OID]) > 0 {
 						return "t"
 					}
 					return "f"
@@ -21006,6 +21006,35 @@ func (c *InMemory) DropTable(name parser.ObjectName, dbOid ...uint32) error {
 			delete(ns.indexes, idxKey)
 		}
 		delete(ns.byTable, tbl.OID)
+	}
+	// Unlink tbl from any parent's inheritance/partition child list so the
+	// parent's pg_class.relhassubclass (see the virtual pg_class builder)
+	// drops back to 'f' once its last child is gone — mirrors PG's
+	// RemoveInheritance side effect of a table drop (tablecmds.c
+	// StoreCatalogInheritance is the write side; DROP just deletes the
+	// pg_inherits rows via the dependency scan). Without this a DROP TABLE
+	// on an inheritance/partition child left the parent's relhassubclass
+	// stuck at 't' forever (maintain_every.sql, M0134-0140).
+	for _, parentOID := range tbl.InheritsParentOIDs {
+		children := c.inheritanceChildren[parentOID]
+		for i, oid := range children {
+			if oid == tbl.OID {
+				c.inheritanceChildren[parentOID] = append(children[:i], children[i+1:]...)
+				break
+			}
+		}
+	}
+	// Sweep partitionChildren by value rather than keying off
+	// tbl.PartitionParentOID alone — an ALTER TABLE … ATTACH PARTITION child
+	// leaves that field 0 and is only findable by scanning the map (same
+	// asymmetry PartitionParentOf already works around).
+	for parentOID, children := range c.partitionChildren {
+		for i, oid := range children {
+			if oid == tbl.OID {
+				c.partitionChildren[parentOID] = append(children[:i], children[i+1:]...)
+				break
+			}
+		}
 	}
 	delete(ns.tables, k)
 	delete(c.tableACLs, tbl.OID) // forget any granted privileges (M0118-0008)
