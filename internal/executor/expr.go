@@ -5305,6 +5305,21 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			return NewStringDatum(canon), nil
 		}
 		return d, nil
+	case "json":
+		// `::json` preserves the input spelling verbatim (no re-serialisation,
+		// unlike `::jsonb` above) but still validates JSON syntax at the input
+		// boundary — coerceTextLikeDatum's `json` column-storage path must
+		// agree (Hard-won Rule #2). Unlike most 22P02 casts, PG's json parser
+		// reports this via DETAIL/CONTEXT (json_ereport_error), never a LINE/^
+		// position marker — so, unlike the numeric/int2/etc. arms above,
+		// ee.Pos is deliberately left at its zero value here (the wire layer
+		// only emits LINE when Pos > 0). M0134-0120.
+		if s, ok := datumAsString(d); ok {
+			if err := validateJSONText(s); err != nil {
+				return Datum{}, err
+			}
+		}
+		return d, nil
 	}
 	return d, nil // pass-through for unknown types
 }

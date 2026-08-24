@@ -1933,7 +1933,39 @@ func resolveColumnRefType(x *parser.ColumnRef, ctx *scope) (catalog.Type, error)
 	if x.Table != "" {
 		return catalog.Type{}, errorMissingRTE(x.Pos(), x.Schema, x.Table, ctx)
 	}
-	return catalog.Type{}, analyzeError(x.Pos(), "42703", fmt.Sprintf("column %q does not exist", x.Column))
+	ae := analyzeError(x.Pos(), "42703", fmt.Sprintf("column %q does not exist", x.Column))
+	// Unqualified miss: PG's errorMissingColumn (parse_relation.c) still
+	// scans the local FROM-clause namespace for a near-miss and hints with
+	// the RTE-qualified name of the match, even though the original
+	// reference carried no qualifier — e.g. `SELECT real_nam` against
+	// `FROM t AS x(real_name)` hints `"x.real_name"`. Mirrors the planner's
+	// suggestColumnHintAllBindings (Hard-won Rule #2). M0134-0120.
+	if x.Schema == "" && ctx != nil {
+		if hint := suggestAnalyzerColumnHintAllRels(ctx, x.Column); hint != "" {
+			ae.Hint = hint
+		}
+	}
+	return catalog.Type{}, ae
+}
+
+// suggestAnalyzerColumnHintAllRels scans the local (non-qualifiedOnly)
+// FROM-clause relations of ctx for a column whose name is within edit
+// distance 1 of want, returning the first match's suggestAnalyzerColumnHint
+// text. Returns "" when nothing close enough is found. M0134-0120.
+func suggestAnalyzerColumnHintAllRels(ctx *scope, want string) string {
+	for _, r := range ctx.rels {
+		if r.qualifiedOnly {
+			continue
+		}
+		qualifier := r.alias
+		if qualifier == "" {
+			qualifier = r.table.Name
+		}
+		if hint := suggestAnalyzerColumnHint(r.table.Columns, qualifier, want); hint != "" {
+			return hint
+		}
+	}
+	return ""
 }
 
 // resolveColumnRefTypeAt tries to resolve x at a single scope
@@ -3535,25 +3567,30 @@ func suggestAnalyzerColumnHint(cols []catalog.Column, qualifier, want string) st
 }
 
 func analyzerColumnEditDistance1(a, b string) bool {
-	la, lb := len(a), len(b)
+	// Rune-based, not byte-based: mirrors the planner's columnEditDistance1
+	// (Hard-won Rule #2 — the two suggestion engines must agree), and PG's
+	// varstr_levenshtein measures CHARACTER distance so a single non-ASCII
+	// character (e.g. § = 2 UTF-8 bytes) must count as one edit. M0134-0120.
+	ra, rb := []rune(a), []rune(b)
+	la, lb := len(ra), len(rb)
 	if la == lb {
 		diff := 0
-		for i := range a {
-			if a[i] != b[i] {
+		for i := range ra {
+			if ra[i] != rb[i] {
 				diff++
 			}
 		}
 		return diff == 1
 	}
 	if la > lb {
-		a, b, la, lb = b, a, lb, la
+		ra, rb, la, lb = rb, ra, lb, la
 	}
 	if lb-la > 1 {
 		return false
 	}
-	for i := range b {
-		candidate := b[:i] + b[i+1:]
-		if candidate == a {
+	for i := range rb {
+		candidate := append(append([]rune{}, rb[:i]...), rb[i+1:]...)
+		if string(candidate) == string(ra) {
 			return true
 		}
 	}

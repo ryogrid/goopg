@@ -164,10 +164,17 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 	// read, so `'{"b":1,"a":2}'::jsonb` renders `{"a": 2, "b": 1}`. goopg stored
 	// the text verbatim; canonicalising here makes a jsonb column hold the same
 	// text PG would show, and adds the 22P02 validation the bare pass-through
-	// was missing. `json` (text) is deliberately untouched — it preserves the
-	// input spelling.
+	// was missing. `json` (text) is deliberately left with its input spelling
+	// untouched (no re-serialisation) but still validated for syntax — must
+	// agree with evalCast's `::json` arm (Hard-won Rule #2). M0134-0120.
 	if tname == "jsonb" {
 		return canonicalizeJSONB(s)
+	}
+	if tname == "json" {
+		if err := validateJSONText(s); err != nil {
+			return "", err
+		}
+		return s, nil
 	}
 
 	// The declared length of a varchar(n)/char(n) counts CHARACTERS, not bytes:

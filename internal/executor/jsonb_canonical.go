@@ -76,6 +76,26 @@ func invalidJSONBError() *ExecError {
 	return &ExecError{Code: "22P02", Message: "invalid input syntax for type json"}
 }
 
+// validateJSONText checks that s parses as exactly one JSON value, returning
+// invalidJSONBError (message says "type json", matching PG's shared wording)
+// for malformed input or trailing garbage. Unlike canonicalizeJSONB, it
+// returns no rewritten text: the `json` type — unlike `jsonb` — preserves the
+// input's exact spelling (whitespace, key order, duplicate keys, number
+// formatting) and is never re-serialised; only syntax validity is checked
+// at the input boundary, mirroring PG's json_in (postgres/src/backend/utils/
+// adt/json.c). M0134-0120.
+func validateJSONText(s string) error {
+	dec := json.NewDecoder(strings.NewReader(s))
+	dec.UseNumber()
+	if _, err := parseJSONBValue(dec); err != nil {
+		return invalidJSONBError()
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return invalidJSONBError()
+	}
+	return nil
+}
+
 // canonicalizeJSONB parses s as a single jsonb value and returns its jsonb_out
 // canonical rendering. It returns invalidJSONBError for malformed input or for
 // a string that holds more than one value (`{} {}`).

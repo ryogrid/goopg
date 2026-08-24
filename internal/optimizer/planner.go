@@ -13812,7 +13812,39 @@ func resolveColumnRef(x *parser.ColumnRef, ctx *resolveContext) (Expr, error) {
 			level++
 		}
 	}
-	return nil, &PlanError{Pos: x.Pos(), Code: "42703", Message: fmt.Sprintf("column %q does not exist", x.Column)}
+	pe := &PlanError{Pos: x.Pos(), Code: "42703", Message: fmt.Sprintf("column %q does not exist", x.Column)}
+	// Unqualified miss: PG's errorMissingColumn (parse_relation.c) still
+	// scans the local FROM-clause namespace for a near-miss and hints with
+	// the RTE-qualified name of the match, even though the original
+	// reference carried no qualifier — e.g. `SELECT real_nam` against
+	// `FROM t AS x(real_name)` hints `"x.real_name"`. M0134-0120.
+	if x.Table == "" && x.Schema == "" {
+		if hint := suggestColumnHintAllBindings(ctx, x.Column); hint != "" {
+			pe.Hint = hint
+		}
+	}
+	return nil, pe
+}
+
+// suggestColumnHintAllBindings scans the local (non-qualifiedOnly) FROM-clause
+// bindings of ctx for a column whose name is within edit distance 1 of want,
+// returning the first match's suggestColumnHint text (qualified with the
+// binding's alias, or its underlying table name when unaliased). Returns ""
+// when nothing close enough is found. M0134-0120.
+func suggestColumnHintAllBindings(ctx *resolveContext, want string) string {
+	for _, b := range ctx.bindings {
+		if b.qualifiedOnly {
+			continue
+		}
+		qualifier := b.alias
+		if qualifier == "" {
+			qualifier = b.table.Name
+		}
+		if hint := suggestColumnHint(b.table.Columns, qualifier, want); hint != "" {
+			return hint
+		}
+	}
+	return ""
 }
 
 // resolveColumnRefAt tries to resolve x against a single
@@ -14833,27 +14865,33 @@ func suggestColumnHint(cols []catalog.Column, qualifier, want string) string {
 // columnEditDistance1 returns true when a and b differ by at most one
 // insertion, deletion, or substitution (single edit distance ≤ 1).
 func columnEditDistance1(a, b string) bool {
-	la, lb := len(a), len(b)
+	// Compare by rune, not byte: PG's varstr_levenshtein (fuzzystrmatch's
+	// engine, reused by errorMissingColumn's ruleutils suggestion) measures
+	// CHARACTER distance, so a single non-ASCII character inserted/removed
+	// (e.g. "real_name" vs "real§_name", § = 2 UTF-8 bytes) must still count
+	// as edit distance 1, not 2. M0134-0120.
+	ra, rb := []rune(a), []rune(b)
+	la, lb := len(ra), len(rb)
 	if la == lb {
 		diff := 0
-		for i := range a {
-			if a[i] != b[i] {
+		for i := range ra {
+			if ra[i] != rb[i] {
 				diff++
 			}
 		}
 		return diff == 1
 	}
 	if la > lb {
-		a, b, la, lb = b, a, lb, la
+		ra, rb, la, lb = rb, ra, lb, la
 	}
 	// la < lb; if lb-la > 1 can't be edit-1
 	if lb-la > 1 {
 		return false
 	}
 	// deletion from b gives a
-	for i := range b {
-		candidate := b[:i] + b[i+1:]
-		if candidate == a {
+	for i := range rb {
+		candidate := append(append([]rune{}, rb[:i]...), rb[i+1:]...)
+		if string(candidate) == string(ra) {
 			return true
 		}
 	}
