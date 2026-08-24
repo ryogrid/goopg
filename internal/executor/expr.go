@@ -3056,6 +3056,90 @@ func pointCanonicalText(x, y float64) string {
 	return b.String()
 }
 
+// parsePolygonLiteral reproduces poly_in's parsing (postgres/src/backend/
+// utils/adt/geo_ops.c poly_in/path_decode/pair_count) — poly_in computes
+// npts via the same pair_count as path_in, then calls path_decode with
+// opentype=false and endptr_p==NULL. opentype=false means a leading '['
+// (the "open path" delimiter) is rejected outright rather than accepted
+// as an open form — a polygon is always closed, unlike path. Also unlike
+// path_in, poly_in does NOT strip a single leading paren before calling
+// path_decode (that "quick entry" unwrap is path_in-specific); the sole
+// wrapper polygon accepts is path_decode's own doubled-paren "((...))"
+// detection. endptr_p==NULL means, like point_in, the entire string must
+// be consumed — no trailing text tolerated. polygon had zero parsing at
+// all before this: a raw-varlena pass-through accepting any string
+// verbatim. M0134-0151.
+func parsePolygonLiteral(s string) (points [][2]float64, errOut *ExecError) {
+	orig := s
+	syntaxErr := func() ([][2]float64, *ExecError) {
+		return nil, &ExecError{Code: "22P02",
+			Message: fmt.Sprintf("invalid input syntax for type polygon: %q", orig)}
+	}
+
+	// pair_count: even (including zero) comma count is rejected up front.
+	ndelim := strings.Count(s, ",")
+	if ndelim%2 == 0 {
+		return syntaxErr()
+	}
+	npts := (ndelim + 1) / 2
+
+	t := strings.TrimLeft(s, " \t\n\r\v\f")
+	// path_decode(str, opentype=false, ...): a leading '[' is the "open
+	// path" delimiter, rejected outright since opentype is false here.
+	if t != "" && t[0] == '[' {
+		return syntaxErr()
+	}
+	depth := 0
+	if t != "" && t[0] == '(' {
+		cp := strings.TrimLeft(t[1:], " \t\n\r\v\f")
+		if cp != "" && cp[0] == '(' {
+			depth++
+			t = cp
+		} else if strings.LastIndexByte(t, '(') == 0 {
+			depth++
+			t = cp
+		}
+	}
+
+	pts := make([][2]float64, npts)
+	for i := 0; i < npts; i++ {
+		x, y, rest, derr := linePairDecode(t)
+		if derr != nil {
+			if derr.Message == "" {
+				return syntaxErr()
+			}
+			return nil, &ExecError{Code: derr.Code, Message: derr.Message}
+		}
+		t = rest
+		if t != "" && t[0] == ',' {
+			t = t[1:]
+		}
+		pts[i] = [2]float64{x, y}
+	}
+
+	for depth > 0 {
+		if t != "" && t[0] == ')' {
+			depth--
+			t = strings.TrimLeft(t[1:], " \t\n\r\v\f")
+		} else {
+			return syntaxErr()
+		}
+	}
+	if t != "" {
+		return syntaxErr()
+	}
+
+	return pts, nil
+}
+
+// polygonCanonicalText formats a polygon's points exactly as poly_out
+// does — path_encode(PATH_CLOSED, npts, p) — "((x,y),...)", each
+// coordinate via float8out's Ryu-based shortest-roundtrip formatting.
+// M0134-0151.
+func polygonCanonicalText(points [][2]float64) string {
+	return pathCanonicalText(points, true)
+}
+
 // macScanCandidate is one of macaddr_in's 7 sscanf format strings
 // (postgres/src/backend/utils/adt/mac.c:71-90), reduced to its two variable
 // dimensions: the shared field width (0 = unbounded "%x", 2 = "%2x") and the
@@ -4958,6 +5042,17 @@ func evalTypedStringLit(x *optimizer.TypedStringLit, ctx *Context) (Datum, error
 			return Datum{}, &ee
 		}
 		return NewStringDatum(pointCanonicalText(px, py)), nil
+	case "polygon":
+		// M0134-0151: `polygon '...'` shares the same validate+canonicalize
+		// chokepoint as a polygon column's assignment coercion
+		// (coerceTextLikeDatum, codec.go) — both call parsePolygonLiteral.
+		pts, perr := parsePolygonLiteral(x.Value)
+		if perr != nil {
+			ee := *perr
+			ee.Pos = x.Pos()
+			return Datum{}, &ee
+		}
+		return NewStringDatum(polygonCanonicalText(pts)), nil
 	case "jsonb":
 		// M0134-0133: `jsonb '...'` must share the same validate+canonicalize
 		// chokepoint as `::jsonb` (the `case "jsonb"` arm of evalCast, above) —
@@ -6384,6 +6479,21 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 				return Datum{}, &ee
 			}
 			return NewStringDatum(pathCanonicalText(pts, closed)), nil
+		}
+		return d, nil
+	case "polygon":
+		// `'...'::polygon` had NO case here at all, and no parser at all
+		// anywhere until this loop. Must agree with coerceTextLikeDatum's
+		// polygon arm and evalTypedStringLit's polygon arm — both call
+		// parsePolygonLiteral. M0134-0151.
+		if s, ok := datumAsString(d); ok {
+			pts, perr := parsePolygonLiteral(s)
+			if perr != nil {
+				ee := *perr
+				ee.Pos = pos
+				return Datum{}, &ee
+			}
+			return NewStringDatum(polygonCanonicalText(pts)), nil
 		}
 		return d, nil
 	case "jsonb":
@@ -12488,6 +12598,11 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				// M0134-0150: agrees with the column-coercion path, same
 				// parsePointLiteral.
 				_, _, perr := parsePointLiteral(v)
+				return NewBoolDatum(perr == nil), nil
+			case "polygon":
+				// M0134-0151: agrees with the column-coercion path, same
+				// parsePolygonLiteral.
+				_, perr := parsePolygonLiteral(v)
 				return NewBoolDatum(perr == nil), nil
 			case "macaddr":
 				// M0134-0138: agrees with the column-coercion path, same

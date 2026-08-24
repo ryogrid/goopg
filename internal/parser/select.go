@@ -3244,6 +3244,13 @@ func (p *parser) tryTypedLiteral() (Expr, bool) {
 		// `path '...'`/`lseg '...'` in an expression context parsed as two
 		// unrelated tokens instead of one typed literal.
 		"lseg", "path",
+		// polygon 'string' cast syntax (M0134-0151), e.g.
+		// `p |>> polygon '((300,300),(400,600),(600,500),(700,200))'`
+		// (polygon.sql) — same sibling gap lseg/path had: parsePolygonLiteral
+		// exists but polygon was missing from this whitelist, so a bare
+		// `polygon '...'` in expression context parsed as two unrelated
+		// tokens instead of one typed literal.
+		"polygon",
 		// json/jsonb 'string' cast syntax (M0134-0133), e.g.
 		// `json '{"a": 1}' -> 'a'` used throughout json_encoding.sql.
 		"json", "jsonb":

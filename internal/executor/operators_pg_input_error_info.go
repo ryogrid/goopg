@@ -195,6 +195,13 @@ func (o *pgInputErrorInfoOp) Next() (TupleSlot, error) {
 			message = perr.Message
 			sqlCode = perr.Code
 		}
+	case "polygon":
+		// polygon: agrees with the column-coercion path, same
+		// parsePolygonLiteral. M0134-0151.
+		if _, perr := parsePolygonLiteral(v); perr != nil {
+			message = perr.Message
+			sqlCode = perr.Code
+		}
 	case "macaddr":
 		// macaddr: agrees with the column-coercion path, same
 		// parseMacaddrLiteral. M0134-0138.

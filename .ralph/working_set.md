@@ -1,57 +1,59 @@
-Task just completed: M0134-0149 (path.sql) — sized live, PARKED, real fix
-shipped (not sizing-only). Committed (64b9f9a24).
+Task just completed: M0134-0151 (polygon.sql) — sized live, PARKED, real fix
+shipped (not sizing-only). Committing this loop.
 
-What landed: `path` was a raw-varlena pass-through with zero validation, the
-same state box/circle/line/lseg were in before their own M0134 slices
-(M0134-0094/-0098/-0136/-0137). Added `parsePathLiteral`
-(`internal/executor/expr.go`), a faithful port of `path_in`/`path_decode`/
-`pair_count` (`postgres/src/backend/utils/adt/geo_ops.c`) — point count
-pre-computed from the total comma count exactly as `pair_count` does (an
-even/zero count rejects immediately, explaining `'[]'`'s error before any
-point parsing starts), a single true-leading `'('` stripped as `path_in`'s
-own outer wrapper (tracked as a SEPARATE `outerDepth` from `path_decode`'s
-own `'['`/doubled-`'(('` wrapper-depth variable — conflating the two was
-the first draft's bug, caught before commit), reusing the already-shared
-`linePairDecode`/`lineSingleDecode` primitives (same ones `parseLineLiteral`/
-`parseLsegLiteral` use via `pathDecodeTwoPoints`) for the per-point float8
-decode since path's coordinate-pair grammar is npts-count-agnostic. New
-`pathCanonicalText` mirrors `path_out`'s `path_encode`. Wired into the same
-4 chokepoints as every prior geometry type: `coerceTextLikeDatum`
-(`internal/executor/codec.go`), `pg_input_is_valid`/`pg_input_error_info`
-(`expr.go` switch on `name` + `operators_pg_input_error_info.go`), and the
-function-call dispatch switch in `evalFuncCall` (also keyed on `name`, NOT
-`funcName` — a wrong-variable-name typo caught by the build before commit)
-for `isopen`/`isclosed`/`pclose`/`popen`, which `pg_proc` already had OIDs
-1430/1431/1433/1434 for but zero dispatch (`function isopen does not
-exist` etc.).
+What landed: `polygon` was a raw-varlena pass-through with zero validation,
+the last-unaudited of the 7-type core geometry family (box/circle/line/lseg
+/path/point all graduated first via M0134-0094/-0098/-0136/-0137/-0149/
+-0150) — this loop closes the family out. New `parsePolygonLiteral`/
+`polygonCanonicalText` (`internal/executor/expr.go`), a faithful port of
+`poly_in`/`poly_out` (`postgres/src/backend/utils/adt/geo_ops.c`): `poly_in`
+computes `npts` via the same `pair_count` as `path_in`, then calls
+`path_decode` with `opentype=false` (a leading `'['` is rejected outright —
+always closed, unlike path's open form) and `endptr_p=NULL` (whole string
+must be consumed, matching point_in's strictness); unlike `path_in`, `poly_in`
+does NOT strip a single leading paren first (that "quick entry" unwrap is
+path_in-specific). `polygonCanonicalText` reuses the existing
+`pathCanonicalText(points, true)` verbatim — no new formatting logic. Wired
+into `coerceTextLikeDatum` (`codec.go`), `pg_input_is_valid`/
+`pg_input_error_info` (`operators_pg_input_error_info.go`), `evalCast`'s
+`::polygon` arm, `evalTypedStringLit`'s `polygon '...'` arm, and the parser's
+typed-literal keyword whitelist (`internal/parser/select.go` `tryTypedLiteral`)
+— same sibling gap `lseg`/`path` had before M0134-0150 (bare `polygon '...'`
+in expression context previously parsed as two unrelated tokens).
 
-Verified live: path.sql 111-line diff -> 31-line diff (0% -> still `failed`
-but every remaining line, without exception, is the box.sql/circle.sql/
-line.sql/lseg.sql-shared psql LINE-position-echo gap — `coerceTextLikeDatum`
-never threads `ExecError.Pos` through to the wire-protocol error position,
-so INSERT-time syntax errors lack the `LINE N: ...\n  ^` echo psql renders).
-No new ledger row: this is the SAME gap the prior four geometry slices
-already recorded (standing recommendation item #19 below).
+Verified live: polygon.sql 405-line diff -> 354-line diff. Like point.sql,
+NOT zero-residual: dominated by the already-known geometric operator lexer/
+dispatch gap (`<<`/`&<`/`&&`/`&>`/`>>`/`<<|`/`&<|`/`|&>`/`|>>`/`<@`/`@>`/
+`~=`/`<->`) plus GiST/SPGiST plan-integration (Seq Scan not Index Scan,
+standing item #1). One new, narrow, out-of-scope gap: `polygon(circle(
+point(...)))` 3-function scalar constructor chain errors `function circle
+does not exist` — the TYPE I/O now works but the constructor-style scalar
+functions of the same names are unregistered. Confirmed no regression on
+box.sql(722)/circle.sql(51)/line.sql(55)/lseg.sql(27)/path.sql(31)/
+point.sql(451), all unchanged.
 
-CSV: path.sql flipped `not-tried` → `failed`, `pass_required` stays `no`.
-fix_plan.md M0134-0149 marked PARKED with full landed/deferred summary.
-Design: `docs/design/m0134-0149-path-typed-literal.md` (new), indexed in
-`docs/design/README.md`.
+CSV: polygon.sql flipped `not-tried` → `failed`, `pass_required` stays `no`.
+fix_plan.md M0134-0151 marked PARKED with full landed/deferred summary.
+Design: `docs/design/m0134-0151-polygon-typed-literal.md` (new), indexed in
+`docs/design/README.md`. Ledger row: `.ralph/deferral_ledger.md`
+2026-08-25 M0134-0151.
 
 NEXT LOOP: per the Current Priority banner, continue M0134 top-to-bottom —
-next unworked item is **M0134-0150 (point.sql)**. Size it live first
-(`scripts/pg-regress-runner.sh --verbose point`). Strong prior: point is the
-MOST FUNDAMENTAL geometry type (every other geometry type's parser —
-box/circle/line/lseg/path — calls into point-pair decoding), so point.sql
-may already be closer to green than the compound types were, OR it may
-reveal that `point` itself still has gaps the compound-type parsers papered
-over with their own local point-pair decoders. Check whether `point` has a
-`coerceTextLikeDatum` chokepoint case yet (grep tname == "point" in
-codec.go) before assuming — unlike box/circle/line/lseg/path, `point` was
-NOT in the box/circle/line/lseg/path parity-audit list in this loop.
+next unworked item is **M0134-0152 (polymorphism.sql)**. Size it live first
+(`scripts/pg-regress-runner.sh --verbose polymorphism`). All 7 core geometry
+primitives (box/circle/line/lseg/path/point/polygon) are now individually
+audited with real *_in-faithful validate+canonicalize chokepoints — item #5
+in the standing list below is now FULLY COMPLETE and can be retired/
+downgraded next loop. geometry.sql itself (M0134-0125, already PARKED) may
+be worth a re-size to see how much of its 51%-unlexed-operator diff has
+shrunk now that 7/7 primitive parsers exist (its own remaining blocker was
+schedule-group table creation + operator lexer, both still open).
 
-Standing recommendation, carried across several loops (item #19 grew this
-loop's remaining-gap explanation; unchanged otherwise):
+Standing recommendation, carried across several loops (item #5 now COMPLETE
+this loop — ALL SEVEN core geometry primitives have real validate+
+canonicalize chokepoints; consider retiring/replacing this item next loop
+with "geometric operator lexer/dispatch family", which is now the sole
+remaining geometry blocker):
 1. GIN/GiST/SPGiST physical-index plan integration — Seq Scan not
    Index/Index-Only Scan because the AM is catalog-only.
 2. btree v0 opclass generality (`internal/executor/operators_ddl.go:15810`
@@ -59,9 +61,14 @@ loop's remaining-gap explanation; unchanged otherwise):
 3. Memoize plan-node type — entirely unimplemented (M0134-0141).
 4. Real parallel-worker query execution — recurs across M0134-0008/-0023/
    -0141.
-5. Geometry type-system gap — SHRINKING: box/circle/line/lseg/path now all
-   have real validate+canonicalize chokepoints (M0134-0094/-0098/-0136/
-   -0137/-0149); point/polygon still need auditing (next task).
+5. Geometry type-system gap — DONE for all 7 core primitives (box/circle/
+   line/lseg/path/point/polygon all have real *_in-faithful validate+
+   canonicalize chokepoints, M0134-0094/-0098/-0136/-0137/-0149/-0150/
+   -0151). The operator-lexer family (`<<`/`&<`/`&&`/`&>`/`>>`/`<<|`/`&<|`/
+   `|&>`/`|>>`/`<@`/`@>`/`~=`/`<->`/`?-`/`?|`/`?#`/`@@`/`#`) and several
+   cross-type operator-dispatch gaps (point<@path, polygon<<, etc.) remain
+   entirely open — this is now the SOLE remaining geometry gap, not
+   per-type parsing. Strong candidate for its own dedicated milestone next.
 6. LANGUAGE C dynamic-extension loading gap.
 7. Collation-execution-registry gap (5 parked files).
 8. BETWEEN-vs-comparison-operator precedence bug (M0134-0113).
@@ -79,16 +86,16 @@ loop's remaining-gap explanation; unchanged otherwise):
 17. jsonpath's own grammar entirely unimplemented.
 18. Full PostgreSQL Large Object facility (M0134-0135) — own milestone.
 19. `coerceTextLikeDatum` never threads `ExecError.Pos` — psql LINE echo gap
-    shared by box/circle/line/lseg/path/macaddr/macaddr8/inet/bit(n). NOW
-    CONFIRMED 5 TIMES on the geometry family alone (box/circle/line/lseg/
-    path) — every one of those 5 cases' ENTIRE residual diff is exactly
-    this gap. Strong candidate for the next contained slice: thread `Pos`
-    through the INSERT/UPDATE/COPY literal-coercion call path into
-    `coerceTextLikeDatum`'s error returns, then wire `Pos` into the
-    wire-protocol ErrorResponse (dispatch.go's existing error-send path
-    already understands `ExecError.Pos` — grep confirmed for a prior similar
-    case, e.g. parser-level errors already echo LINE N correctly).
-20. `evalCast`'s catch-all pass-through hides real validation gaps.
+    shared by box/circle/line/lseg/path/point/polygon/macaddr/macaddr8/inet/
+    bit(n). CONFIRMED 7 TIMES on the geometry family alone. Strong candidate
+    for the next contained slice: thread `Pos` through the INSERT/UPDATE/
+    COPY literal-coercion call path into `coerceTextLikeDatum`'s error
+    returns.
+20. `evalCast`'s catch-all pass-through hides real validation gaps — box/
+    circle/line's own `::box`/`::circle`/`::line` CAST arms are STILL
+    missing per earlier grep — only their `T 'lit'` typed-literal forms
+    exist (their assignment-coercion path is fine; only bare `::T` casts
+    are affected).
 21. `DropTable` on a PARENT never scrubs `inheritanceChildren`/
     `partitionChildren` (only fixed for the child side, M0134-0140).
 22. LATERAL outer-column-ref bug (memoize.sql bonus discovery) — narrow,
@@ -111,34 +118,40 @@ loop's remaining-gap explanation; unchanged otherwise):
 30. `tryHandleRoleDDL` has no wire-protocol notice sink — blocks 3 role-DDL
     NOTICE/WARNING messages in password.sql (M0134-0148's deferral; item #9
     covers a related but distinct RAISE-severity gap).
+31. pg-regress-runner.sh's prerequisite block is not schedule-group-aware —
+    always runs create_index.sql/create_misc.sql/create_view.sql/
+    create_aggregate.sql as prerequisites regardless of the named test's
+    real position in PG's own parallel_schedule (M0134-0150's point.sql
+    sizing note: a 10-vs-11 row false-positive on POINT_TBL, ruled out as a
+    goopg bug, not yet fixed in the harness). Same underlying gap
+    M0134-0125's geometry.sql sizing already flagged from the opposite
+    direction (missing companion-table creation).
+32. `circle`/`point`/`polygon` scalar CONSTRUCTOR functions (not the TYPE
+    I/O, which now works for all 3) are unregistered — `polygon.sql`'s
+    `polygon(circle(point(x,y), r))` errors `function circle does not
+    exist` (M0134-0151's deferral). Narrow, not yet its own ledger row.
 
-Gates run this loop: go build ./... PASS; GOOPG_CG_UNIT=path-test
-scripts/goopg-test-run.sh go test -timeout 10m ./internal/executor/ PASS
-(7.0s); RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh PASS
-(all packages, some cached, initdb 439.9s); scripts/pg-regress-runner.sh
---verbose path (live, before/after — 111→31-line diff, 0 residual
-^ERROR/^-ERROR); make regen-testport / make check-testport-inventory PASS;
-pre-commit hook pgbench smoke PASS (select-only 12697 tps, 0 failed);
-make ralph-state-guard: found+repaired 1 stale-marker inconsistency
-(progress.json's "completed" was the prior loop's clean-exit marker, not
-project completion — reconciled to "in_progress"), then verified consistent.
+Gates run this loop: go build ./... PASS; go test -timeout 10m
+./internal/executor/ ./internal/parser/ PASS (6.9s); RALPH_PRECOMMIT_SCOPE=
+units scripts/ralph-precommit-test.sh PASS (all packages, some cached,
+initdb 421.0s); scripts/tpch-spotcheck.sh PASS (Q12=2 rows 16.95s, Q13=35
+rows 7.57s); scripts/pg-regress-runner.sh --verbose polygon box circle line
+lseg path point (live, before/after — polygon 405→354, box/circle/line/
+lseg/path/point all unchanged); make regen-testport / make
+check-testport-inventory PASS; make ralph-state-guard: found+repaired 1
+stale-marker inconsistency (same shape as prior loops — progress.json's
+"completed" was the previous loop's clean-exit marker, reconciled to
+"in_progress"), then verified consistent. Pre-commit hook pgbench smoke will
+run automatically on `git commit` (not separately invoked this loop; hook is
+mandatory and machine-enforced).
 
 In-flight: none.
 
 Note: a concurrent peer session's WIP may still be present in the tree
-(.ralph/progress.json, .ralphrc, analysis/postgres-oracle-compatibility-
-report.md, ci/logs/launch.log, ci/logs/scheduler.log,
-docs/wiki/getting-started.md, internal/executor/operators_recursive_cte.go,
-postgres (untracked convenience symlink), third-party/tpcds-postgres,
+(.ralphrc, analysis/postgres-oracle-compatibility-report.md,
+ci/logs/launch.log, docs/wiki/getting-started.md,
+internal/executor/operators_recursive_cte.go, postgres (untracked
+convenience symlink), third-party/tpcds-postgres,
 analysis/deferral-ledger-summary-20260824/, dl_summary_session.txt,
 docs/wiki/modules/catalog.md) — deliberately left untouched/uncommitted;
 only this loop's own files were staged and committed by explicit pathspec.
-
-M-NIGHTLY note: `ci/logs/action-items.md` (run 20260824-013441, 2 items) was
-checked this loop — both already filed in fix_plan.md (§"Nightly run
-20260824-013441"): AI-...-001 already closed [x] by a prior loop;
-AI-...-002 is a duplicate of the still-open AI-20260822-001356-003
-(`TestSyntax_AdvisoryLock_SessionUnlockAcrossBeginBoundary`, now re-failed 3
-nights running) — left unselected per the banner (M0134 outranks M-NIGHTLY
-selection while M0134 has remaining unparked top-to-bottom tasks and this
-item doesn't break a build/gate M0134 depends on).
