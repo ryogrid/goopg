@@ -6,10 +6,10 @@ One checkbox ≈ one commit ≈ one push. Check off only after the item's gate
 
 ## P0 — Foundation
 
-- [ ] **P0.1 Toolchain**: add `golang.org/x/tools` (goyacc) via `tools.go`
+- [x] **P0.1 Toolchain**: add `golang.org/x/tools` (goyacc) via `tools.go`
   + go.mod with PINNED version; verify `go run golang.org/x/tools/cmd/goyacc`
   executes; record pinned version next to the conflict gate.
-- [ ] **P0.2 Keyword generator**: `cmd/gen-kwlist-go` reads
+- [x] **P0.2 Keyword generator**: `cmd/gen-kwlist-go` reads
   `postgres/src/include/parser/kwlist.h` and emits
   `internal/sqlparser/keywords_gen.go` (494 token constants — ground truth:
   rows matching `^\s*PG_KEYWORD("`, comments excluded — + category array +
