@@ -1,38 +1,41 @@
-Task just completed: M0134-0119 (drop_operator.sql) — sized live against PG 18.3
-oracle via scripts/pg-regress-runner.sh: FULL PASS (30-line/0%-parity diff →
-byte-identical, 57-line output, no PARK needed).
+Task just completed: M0134-0120 (encoding.sql) — sized live against PG 18.3
+oracle via scripts/pg-regress-runner.sh: 0/1 PASS, 0%, 361-line diff at first
+run, ending at 353-line diff / `^-ERROR` 9→8 (`^+ERROR` unchanged at 2) —
+PARKED (not full pass), dominant remainder is REFACTOR-tier (LANGUAGE C
+`regresslib` functions goopg stubs to NULL — no C-execution engine exists).
 
-Landed:
-- internal/catalog/catalog.go: `builtinProcsByName` was missing `int8eq`/
-  `int8ne`/`int8lt`/`int8gt` (PG's real pg_proc.dat OIDs 467-470). The lookup
-  miss made CREATE OPERATOR's boolean-return-for-negator validation see an
-  empty return type and misfire "only boolean operators can have negators"
-  against a genuinely-bool-returning proc.
-- catalog.InMemory.DropUserOperator: ported PG's delete-time
-  `OperatorUpd(operOid, oprcom, oprnegate, true)`
-  (postgres/src/backend/catalog/pg_operator.c ~671-820) via new
-  `userOperatorByOIDLocked` helper — previously a sibling operator's
-  CommutatorOID/NegatorOID cross-reference was never cleared when the
-  operator it pointed at was dropped, leaving pg_operator.oprcom/oprnegate
-  dangling at a freed OID (exactly what the test's two catalog-integrity
-  NOT EXISTS(...) checks catch).
+Landed (two contained, C-independent bugs):
+- Unqualified-column fuzzy-match HINT was missing entirely: both
+  `resolveColumnRefType` (internal/parser/analyzer/analyzer.go) and
+  `resolveColumnRef` (internal/optimizer/planner.go) only tried the
+  fuzzy-match hint on the qualified-miss path, never the unqualified
+  fallback — added `suggestAnalyzerColumnHintAllRels`/
+  `suggestColumnHintAllBindings`. Compounding: edit-distance-1 comparators
+  measured raw bytes not runes (a 2-byte UTF-8 char counted as 2 edits) —
+  rewrote both `[]rune`-based.
+- `::json` cast did zero syntax validation (silent pass-through, unlike
+  `::jsonb`'s sibling arm) — added `validateJSONText`
+  (internal/executor/jsonb_canonical.go, reuses canonicalizeJSONB's parser
+  minus re-serialization), wired into `evalCast`'s new `json` case
+  (internal/executor/expr.go) and `coerceTextLikeDatum`'s new `json` branch
+  (internal/executor/codec.go). ExecError.Pos left unset (PG reports this via
+  DETAIL/CONTEXT not a LINE marker) — smaller follow-up noted, unfixed.
 
-Design docs/design/m0134-0119-drop-operator-sizing.md, README.md indexed.
-CSV row flipped not-tried → pass, pass_required=yes (full pass, unlike the
-preceding M0134-0114..-0118 PARK streak). Ledger row appended
-(.ralph/deferral_ledger.md, M0134-0119). fix_plan.md M0134-0119 marked [x].
-Commit 70392935 (NOT pushed yet — eb135c5b/241c157f/9b03c653/c96a9032/
-96d49117 from prior loops are also still unpushed).
+Design docs/design/m0134-0120-encoding-sizing.md, README.md indexed. CSV row
+flipped not-tried → failed (pass_required=no, still parked) via
+make regen-testport. Ledger row appended (.ralph/deferral_ledger.md,
+2026-08-24, M0134-0120). fix_plan.md M0134-0120 marked [x] with full summary.
+Commit 0f5596bc (NOT pushed — b6079bf6/70392935/96d49117/c96a9032/eb135c5b
+from prior loops also still unpushed).
 
 NEXT LOOP: per the Current Priority banner in .ralph/fix_plan.md, continue
-M0134 top-to-bottom — next unworked item is **M0134-0120** (encoding.sql).
+M0134 top-to-bottom — next unworked item is **M0134-0121**.
 
 Standing recommendation (carried across several loops, still open — see prior
-working_set snapshots / deferral ledger for full detail on each; unchanged
-this loop, trimmed to the highest-value entries):
-1. LANGUAGE C dynamic-extension loading gap (M0134-0106) — no loader exists;
-   confirmed blocking create_operator-adjacent and create_type.sql C-function
-   types. Worth promoting to its own milestone — it recurs.
+working_set snapshots / deferral ledger for full detail; unchanged this loop):
+1. LANGUAGE C dynamic-extension loading gap — recurs across M0134-0106,
+   -0118, -0120 (regresslib C functions), and create_operator/create_type
+   adjacent files. Worth promoting to its own milestone.
 2. Collation-execution-registry gap recurs across FIVE parked files
    (M0134-0099/-0100/-0101/-0102).
 3. BETWEEN-vs-comparison-operator precedence bug (M0134-0113) — silently
@@ -40,42 +43,31 @@ this loop, trimmed to the highest-value entries):
    bug-hunt loop.
 4. RAISE INFO/LOG/DEBUG collapse to hardcoded NOTICE wire severity
    (M0134-0113, ~18-call-site blast radius in plpgsql_runtime.go).
-5. ADMIN-OPTION/ownership enforcement for ALTER/RENAME/DROP ROLE
-   (M0134-0114 remainder).
-6. CREATE SCHEMA's embedded sub-command execution (M0134-0115 remainder) —
-   REFACTOR-tier, also partially unblocks M0134-0009.
-7. CREATE TYPE base/shell-type executor stub (M0134-0116 remainder) —
-   REFACTOR-tier, own milestone candidate.
-8. Two independent gaps in M0134-0117's remainder: `UPDATE pg_database SET
-   datacl = ...` rejected outright, and `REASSIGN OWNED BY` has zero parser
-   support (same gap surfaced again in M0134-0118's DROP OWNED BY/REASSIGN
-   OWNED BY note — worth promoting to its own milestone, needs a
-   pg_shdepend-shaped object-enumeration engine spanning every ownable
-   catalog kind).
+5. `::json` cast DETAIL/CONTEXT token/context-truncation text (needs a
+   json_errdetail port) — smaller follow-up from this loop, unfixed.
+6. pg_shdepend-shaped object-enumeration engine (DROP OWNED BY / REASSIGN
+   OWNED BY, surfaced repeatedly in M0134-0117/-0118).
 
 Gates run this loop (subagent-reported): go build ./... clean; go test
 ./internal/parser/... ./internal/executor/... ./internal/postmaster/...
-./internal/catalog/... PASS; RALPH_PRECOMMIT_SCOPE=units
-scripts/ralph-precommit-test.sh PASS; pre-commit hook's pgbench smoke ran
-automatically at commit time — PASS. No planner/optimizer change, so
-tpch-spotcheck.sh was not required (none run). make ralph-state-guard PASS
-this loop (auto-repaired the same recurring stale status/progress
-clean-exit-marker mismatch seen in prior loops, then confirmed consistent).
+./internal/catalog/... ./internal/utils/... ./internal/optimizer/... PASS;
+RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh PASS; pre-commit
+hook's pgbench smoke ran automatically at commit time — PASS. No
+planner/optimizer cost-model change (touched planner.go/analyzer.go only for
+hint text, not cost/plan shape), so tpch-spotcheck.sh was not required.
 
 In-flight: none.
 
-Note: a concurrent peer session's WIP was present in the tree this loop
+Note: a concurrent peer session's WIP was present in the tree again this loop
 (.ralph/progress.json, .ralphrc, analysis/*, ci/logs/*, docs/wiki/*,
 internal/executor/operators_recursive_cte.go, third-party/tpcds-postgres,
 untracked `postgres` symlink) and was deliberately left untouched/
-uncommitted — only the M0134-0119 files were staged and committed by
-explicit pathspec by the subagent that did the work. That peer WIP file
-(operators_recursive_cte.go) matches the already-`[x]`-marked M-NIGHTLY item
-AI-20260824-013441-001's described fix verbatim — likely a concurrent loop's
-in-progress commit, not a new discovery; leave it for that loop to land.
+uncommitted — only the M0134-0120 files were staged and committed by
+explicit pathspec.
 
 M-NIGHTLY: checked ci/logs/action-items.md this loop — both current items
-(AI-20260824-013441-001, -002) were already filed in fix_plan.md from a
-prior loop (item -001 already marked [x] fixed there, matching the uncommitted
-peer WIP noted above; item -002 is a repeat of the already-open
-AI-20260822-001356-003 row). Filing obligation satisfied, nothing new to file.
+(AI-20260824-013441-001, -002) were already filed in fix_plan.md from a prior
+loop (item -001 marked [x], matching the peer WIP above; item -002 is a
+repeat of the already-open AI-20260822-001356-003 row). Filing obligation
+satisfied, nothing new to file. Neither item blocks a gate M0134 depends on,
+so M0134 selection proceeded per the banner.
