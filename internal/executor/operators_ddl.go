@@ -21698,7 +21698,7 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			if rightArg == "" {
 				return &ExecError{Code: "42P13", Pos: s.Pos(),
 					Message: "operator right argument type must be specified",
-					Hint:    "Postfix operators are not supported."}
+					Detail:  "Postfix operators are not supported."}
 			}
 			var funcOID uint32
 			var funcRetType string
