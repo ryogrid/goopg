@@ -75,7 +75,7 @@ id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-sql,regress,postgres/src/test/regress/sql/functional_deps.sql,pass,yes,-,Passes via TestPort_RegressSuite/functional_deps (M0097-0036d)
 ,regress-sql,regress,postgres/src/test/regress/sql/generated_stored.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 ,regress-sql,regress,postgres/src/test/regress/sql/generated_virtual.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/geometry.sql,not-tried,no,-,
+,regress-sql,regress,postgres/src/test/regress/sql/geometry.sql,failed,no,-,"Sized live M0134-0125 (2026-08-24); PARKED, no fix landed — 0% parity, diff 5623 lines (largest M0134 case to date); 51% of errors are cross-file setup-table deps (BOX_TBL/CIRCLE_TBL/LINE_TBL/LSEG_TBL/PATH_TBL/POLYGON_TBL from sibling regress files, a test-harness gap not this file's scope); remainder is unlexed geometric operators + missing point/lseg/line/path/polygon typed-literal parsing, same in-flight work as box.sql(M0134-0094)/circle.sql(M0134-0098); see deferral ledger"
 ,regress-sql,regress,postgres/src/test/regress/sql/gin.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/gist.sql,not-tried,no,-,
 ,regress-sql,regress,postgres/src/test/regress/sql/groupingsets.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
