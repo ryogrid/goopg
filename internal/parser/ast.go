@@ -1710,6 +1710,12 @@ type CreateIndexStmt struct {
 	// pg_get_indexdef can re-emit `WITH (pages_per_range='N')`. Valid range
 	// 1–131072. DU-002 slice 222.
 	PagesPerRange int
+	// Buffering captures the GiST `WITH (buffering=on|off|auto)` enum storage
+	// parameter, lowercased, exactly as written. Empty means unset (PG default
+	// "auto"). Validated at execution time (execCreateIndex) against the enum
+	// {on, off, auto} — an unrecognized value raises PG's exact
+	// "invalid value for enum option \"buffering\"" 22023 error. M0134-0127.
+	Buffering string
 	// AutoSummarize captures the BRIN `WITH (autosummarize=on|off)` boolean
 	// storage parameter (summarize the previous range when a new page range is
 	// created). nil means unset (PG default OFF); a non-nil pointer records the

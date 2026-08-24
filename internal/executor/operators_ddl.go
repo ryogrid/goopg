@@ -7499,6 +7499,19 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 			Message: fmt.Sprintf("value %d out of bounds for option \"fillfactor\"", s.Fillfactor),
 			Detail:  "Valid values are between \"10\" and \"100\"."}
 	}
+	// GiST `WITH (buffering=...)` enum storage parameter. goopg doesn't build a
+	// buffering-aware GiST tree, but PG validates the enum unconditionally
+	// (reloptions.c parse_one_reloption) before any index build starts, so an
+	// invalid value must reject the CREATE INDEX rather than silently succeed —
+	// a prior version of this code had no check at all, so
+	// `WITH (buffering=invalid_value)` silently created the index, breaking a
+	// following same-name CREATE INDEX with a spurious "already exists" instead
+	// of the invalid_value error real PG raises (gist.sql, M0134-0127).
+	if s.Buffering != "" && s.Buffering != "on" && s.Buffering != "off" && s.Buffering != "auto" {
+		return &ExecError{Code: "22023", Pos: s.Pos(),
+			Message: fmt.Sprintf("invalid value for enum option \"buffering\": %s", s.Buffering),
+			Detail:  "Valid values are \"on\", \"off\", and \"auto\"."}
+	}
 	// gin_pending_list_limit (GIN integer storage parameter, kB) range-validated
 	// like PG: min 64, max MAX_KILOBYTES (INT_MAX/1024). DU-002 slice 221.
 	if s.GinPendingListLimit != 0 && (s.GinPendingListLimit < 64 || s.GinPendingListLimit > 2097151) {

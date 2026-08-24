@@ -3065,3 +3065,49 @@ func TestViewSecurityInvokerSurfacesInPgClassReloptions(t *testing.T) {
 		t.Errorf("pg_class.reloptions for vsi_plain = %q, want \"\" (NULL)", got["vsi_plain"])
 	}
 }
+
+// TestCreateIndexBufferingEnumValidation pins the M0134-0127 fix: CREATE INDEX
+// `WITH (buffering=...)` (PG's GiST enum storage parameter — RELOPT_TYPE_ENUM,
+// reloptions.c) now rejects an unrecognized value with PG's exact 22023
+// "invalid value for enum option" error instead of silently succeeding.
+// Before this fix the check didn't exist at all: an invalid `buffering` value
+// created the index anyway, so a following same-named CREATE INDEX (as in
+// gist.sql, which probes several invalid WITH options against the same index
+// name in sequence) surfaced a spurious "already exists" instead of its own
+// real error — masking the fillfactor-bounds check below it in the same test
+// block. Valid values (on/off/auto) must still succeed.
+func TestCreateIndexBufferingEnumValidation(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE gbuf (id integer)`); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+
+	err := runDDL(t, ctx, `CREATE INDEX gbufidx ON gbuf USING btree (id) WITH (buffering = invalid_value)`)
+	if err == nil {
+		t.Fatal("buffering=invalid_value: expected an enum-validation error, got nil")
+	}
+	ee, ok := err.(*ExecError)
+	if !ok {
+		t.Fatalf("buffering=invalid_value: error type = %T, want *ExecError", err)
+	}
+	if ee.Code != "22023" {
+		t.Errorf("buffering=invalid_value: error code = %q, want 22023", ee.Code)
+	}
+	wantMsg := `invalid value for enum option "buffering": invalid_value`
+	if ee.Message != wantMsg {
+		t.Errorf("buffering=invalid_value: message = %q, want %q", ee.Message, wantMsg)
+	}
+
+	// The invalid attempt must NOT have created the index — a following
+	// same-named CREATE INDEX with a distinct (valid) option must succeed, not
+	// fail with 42P07 "already exists" (the exact cascading symptom this fix
+	// resolves).
+	for _, v := range []string{"on", "off", "auto"} {
+		name := "gbufidx_" + v
+		if err := runDDL(t, ctx, `CREATE INDEX `+name+` ON gbuf USING btree (id) WITH (buffering = `+v+`)`); err != nil {
+			t.Errorf("buffering=%s: expected success, got %v", v, err)
+		}
+	}
+}

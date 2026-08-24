@@ -5625,6 +5625,21 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 							continue
 						}
 					}
+				} else if p.cur().Kind == TokenIdent && strings.ToLower(p.cur().Value) == "buffering" {
+					// GiST enum storage parameter (on/off/auto). Record the raw
+					// lowercased value verbatim (including invalid ones) so
+					// execCreateIndex can raise PG's exact enum-validation error;
+					// an unrecognized value here is a semantic error, not a parse
+					// error, in real PG. M0134-0127.
+					p.advance() // consume "buffering"
+					if p.cur().Kind == TokenOperator && p.cur().Value == "=" {
+						p.advance()
+						if p.cur().Kind == TokenIdent {
+							stmt.Buffering = strings.ToLower(p.cur().Value)
+							p.advance()
+							continue
+						}
+					}
 				} else if p.cur().Kind == TokenIdent && strings.ToLower(p.cur().Value) == "autosummarize" {
 					// BRIN boolean storage parameter. PG accepts on/off/true/
 					// false/yes/no/1/0 (parse_bool); record the value so pg_dump
