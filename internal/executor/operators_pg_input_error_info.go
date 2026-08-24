@@ -181,6 +181,13 @@ func (o *pgInputErrorInfoOp) Next() (TupleSlot, error) {
 			message = lerr.Message
 			sqlCode = lerr.Code
 		}
+	case "macaddr":
+		// macaddr: agrees with the column-coercion path, same
+		// parseMacaddrLiteral. M0134-0138.
+		if _, _, _, _, _, _, merr := parseMacaddrLiteral(v); merr != nil {
+			message = merr.Message
+			sqlCode = merr.Code
+		}
 	case "int2vector":
 		// int2vector: space-separated int2 values. Validate each.
 		message, sqlCode = validateInt2Vector(v)

@@ -1390,10 +1390,19 @@ func evalUnary(op parser.OpCode, d Datum, pos int) (Datum, error) {
 		}
 		return NewBoolDatum(!d.BoolValue()), nil
 	case parser.OpBitNot:
-		if d.Kind != KindInt {
-			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "operator ~ requires integer operand"}
+		if d.Kind == KindInt {
+			return Datum{Kind: KindInt, Int: ^d.Int}, nil
 		}
-		return Datum{Kind: KindInt, Int: ^d.Int}, nil
+		// macaddr_not (mac.c): `~b` bitwise-complements each of the 6 octets.
+		// goopg backs macaddr with its canonical text form, so detect the
+		// literal shape (same pattern as the point << >> detection below).
+		// M0134-0138.
+		if d.Kind == KindString {
+			if a, b, c, dd, e, f, merr := parseMacaddrLiteral(d.StringValue()); merr == nil {
+				return NewStringDatum(macaddrCanonicalText(^a&0xff, ^b&0xff, ^c&0xff, ^dd&0xff, ^e&0xff, ^f&0xff)), nil
+			}
+		}
+		return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "operator ~ requires integer operand"}
 	}
 	return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("unknown unary operator %s", op)}
 }
@@ -1871,6 +1880,19 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int, ctx *Context) (Dat
 						}
 						return NewBoolDatum(lp[0] > rp[0]), nil
 					}
+				}
+			}
+		}
+		// macaddr_and/macaddr_or (mac.c): `b & mac` / `b | mac` combine each of
+		// the 6 octets. Same text-shape detection as the point << >> and
+		// macaddr ~ cases above. M0134-0138.
+		if (op == parser.OpBitAnd || op == parser.OpBitOr) && left.Kind == KindString && right.Kind == KindString {
+			if la, lb, lc, ld, le, lf, lerr := parseMacaddrLiteral(left.StringValue()); lerr == nil {
+				if ra, rb, rc, rd, re, rf, rerr := parseMacaddrLiteral(right.StringValue()); rerr == nil {
+					if op == parser.OpBitAnd {
+						return NewStringDatum(macaddrCanonicalText(la&ra, lb&rb, lc&rc, ld&rd, le&re, lf&rf)), nil
+					}
+					return NewStringDatum(macaddrCanonicalText(la|ra, lb|rb, lc|rc, ld|rd, le|re, lf|rf)), nil
 				}
 			}
 		}
@@ -2829,6 +2851,136 @@ func parseLsegLiteral(s string) (x1, y1, x2, y2 float64, errOut *ExecError) {
 // M0134-0137.
 func lsegCanonicalText(x1, y1, x2, y2 float64) string {
 	return fmt.Sprintf("[(%s,%s),(%s,%s)]", PGFloatOut(x1, 64), PGFloatOut(y1, 64), PGFloatOut(x2, 64), PGFloatOut(y2, 64))
+}
+
+// macScanCandidate is one of macaddr_in's 7 sscanf format strings
+// (postgres/src/backend/utils/adt/mac.c:71-90), reduced to its two variable
+// dimensions: the shared field width (0 = unbounded "%x", 2 = "%2x") and the
+// 5 inter-field separators (0 = the two fields are adjacent, no literal to
+// match). M0134-0138.
+type macScanCandidate struct {
+	width int
+	seps  [5]byte
+}
+
+var macScanCandidates = []macScanCandidate{
+	{0, [5]byte{':', ':', ':', ':', ':'}},  // "%x:%x:%x:%x:%x:%x"
+	{0, [5]byte{'-', '-', '-', '-', '-'}},  // "%x-%x-%x-%x-%x-%x"
+	{2, [5]byte{0, 0, ':', 0, 0}},          // "%2x%2x%2x:%2x%2x%2x"
+	{2, [5]byte{0, 0, '-', 0, 0}},          // "%2x%2x%2x-%2x%2x%2x"
+	{2, [5]byte{0, '.', 0, '.', 0}},        // "%2x%2x.%2x%2x.%2x%2x"
+	{2, [5]byte{0, '-', 0, '-', 0}},        // "%2x%2x-%2x%2x-%2x%2x"
+	{2, [5]byte{0, 0, 0, 0, 0}},            // "%2x%2x%2x%2x%2x%2x"
+}
+
+// hexDigitValue returns the numeric value of a single hex digit character
+// and whether c is one. Shared by macScanOne's per-field scan.
+func hexDigitValue(c byte) (int, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return int(c - '0'), true
+	case c >= 'a' && c <= 'f':
+		return int(c-'a') + 10, true
+	case c >= 'A' && c <= 'F':
+		return int(c-'A') + 10, true
+	}
+	return 0, false
+}
+
+// macScanOne attempts one macScanCandidate against str, mirroring C sscanf's
+// per-conversion whitespace-skip on %x (but not on the literal separators,
+// which are never whitespace here) and the trailing "%1s" junk check: any
+// non-whitespace character left over after the 6th field means the whole
+// format failed to match (sscanf's %1s would have consumed it, making
+// count==7, which macaddr_in also rejects).
+func macScanOne(str string, cand macScanCandidate) (vals [6]int, ok bool) {
+	i, n := 0, len(str)
+	skipSpace := func() {
+		for i < n {
+			switch str[i] {
+			case ' ', '\t', '\n', '\v', '\f', '\r':
+				i++
+			default:
+				return
+			}
+		}
+	}
+	readHex := func() (int, bool) {
+		skipSpace()
+		start, val, cnt := i, 0, 0
+		for i < n {
+			d, isHex := hexDigitValue(str[i])
+			if !isHex {
+				break
+			}
+			if cand.width > 0 && cnt >= cand.width {
+				break
+			}
+			val = val*16 + d
+			cnt++
+			i++
+		}
+		if cnt == 0 {
+			i = start
+			return 0, false
+		}
+		return val, true
+	}
+	for idx := 0; idx < 6; idx++ {
+		v, okf := readHex()
+		if !okf {
+			return vals, false
+		}
+		vals[idx] = v
+		if idx < 5 && cand.seps[idx] != 0 {
+			if i >= n || str[i] != cand.seps[idx] {
+				return vals, false
+			}
+			i++
+		}
+	}
+	skipSpace()
+	if i < n {
+		return vals, false // trailing garbage — sscanf's %1s junk match
+	}
+	return vals, true
+}
+
+// parseMacaddrLiteral reproduces macaddr_in (postgres/src/backend/utils/adt/
+// mac.c:55-114): try each of 7 sscanf formats in order until one matches all
+// 6 octets with nothing left over, then range-check each octet to 0..255 —
+// only the two unbounded colon/dash forms can overrun that range (the %2x
+// forms cap each field at 2 hex digits, i.e. at most 0xff). Returns a non-nil
+// *ExecError (distinct SQLSTATEs, matching mac.c's two ereturn sites) on
+// failure. M0134-0138.
+func parseMacaddrLiteral(str string) (a, b, c, d, e, f int, errOut *ExecError) {
+	for _, cand := range macScanCandidates {
+		vals, ok := macScanOne(str, cand)
+		if !ok {
+			continue
+		}
+		for _, v := range vals {
+			if v < 0 || v > 255 {
+				return 0, 0, 0, 0, 0, 0, &ExecError{Code: "22003",
+					Message: fmt.Sprintf("invalid octet value in \"macaddr\" value: %q", str)}
+			}
+		}
+		return vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], nil
+	}
+	return 0, 0, 0, 0, 0, 0, &ExecError{Code: "22P02",
+		Message: fmt.Sprintf("invalid input syntax for type macaddr: %q", str)}
+}
+
+// macaddrCanonicalText formats a MAC address exactly as macaddr_out does —
+// "%02x:%02x:%02x:%02x:%02x:%02x" (mac.c:120-132). M0134-0138.
+func macaddrCanonicalText(a, b, c, d, e, f int) string {
+	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", a, b, c, d, e, f)
+}
+
+// macaddrTruncOctets zeroes the last 3 octets, matching macaddr_trunc
+// (mac.c:341-356) — used by trunc(macaddr).
+func macaddrTruncOctets(a, b, c, _, _, _ int) (int, int, int, int, int, int) {
+	return a, b, c, 0, 0, 0
 }
 
 // evalLikeEscapePattern evaluates a LikeEscapePattern's Pattern and Escape
@@ -11885,6 +12037,11 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				// parseLsegLiteral.
 				_, _, _, _, lerr := parseLsegLiteral(v)
 				return NewBoolDatum(lerr == nil), nil
+			case "macaddr":
+				// M0134-0138: agrees with the column-coercion path, same
+				// parseMacaddrLiteral.
+				_, _, _, _, _, _, merr := parseMacaddrLiteral(v)
+				return NewBoolDatum(merr == nil), nil
 			default:
 				// varchar(N) / character varying(N) / char(N) / bpchar(N). M0097-0003.
 				if valid, ok := pgInputIsValidTypedLen(v, t); ok {
@@ -14470,6 +14627,16 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			}
 			if v.Kind == KindInt {
 				return v, nil
+			}
+			// macaddr_trunc (mac.c): trunc(macaddr) zeroes the last 3 octets.
+			// Detected the same way as the ~/&/| macaddr operators above —
+			// there is no static type tag on Datum, only the text shape.
+			// M0134-0138.
+			if v.Kind == KindString {
+				if a, b, c, d, e, f, merr := parseMacaddrLiteral(v.StringValue()); merr == nil {
+					a, b, c, d, e, f = macaddrTruncOctets(a, b, c, d, e, f)
+					return NewStringDatum(macaddrCanonicalText(a, b, c, d, e, f)), nil
+				}
 			}
 			f, ferr := strconv.ParseFloat(v.Format(), 64)
 			if ferr != nil {
