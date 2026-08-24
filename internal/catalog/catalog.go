@@ -8394,6 +8394,16 @@ func (c *InMemory) registerSystemTables() {
 			// acldefault('d', datdba) so pg_dump emits no ACL commands for an
 			// ungranted database.
 			{Name: "datacl", Type: Type{Name: "aclitem[]"}, Ordinal: 16},
+			// dathasloginevt: true iff at least one non-disabled `ON login`
+			// event trigger is registered (SetDatabaseHasLoginEventTriggers,
+			// postgres/src/backend/commands/event_trigger.c:390-414, called
+			// from CreateEventTrigger and from ALTER EVENT TRIGGER ... ENABLE).
+			// goopg has no login-event-trigger firing engine (M0134-0122/-0123
+			// ledger), but the flag itself only reflects registration state, so
+			// it is computed live below rather than tracked as a stored bit --
+			// there is no "reset when nothing fires" half (event_trigger.c:934-975)
+			// to replicate without a firing engine.
+			{Name: "dathasloginevt", Type: Type{Name: "bool"}, Ordinal: 17},
 		},
 		OID:     1262, // upstream's DatabaseRelationId
 		Virtual: true,
@@ -8459,6 +8469,22 @@ func (c *InMemory) registerSystemTables() {
 					datacl = aclText
 				}
 			}
+			// dathasloginevt: same "postgres" scoping as datacl above — goopg's
+			// event trigger registry (RegisterEventTrigger) isn't partitioned per
+			// database, so it can only speak for the one live-scoped row. true iff
+			// any registered `ON login` trigger is not disabled ('D'); mirrors
+			// SetDatabaseHasLoginEventTriggers's registration-time set (this loop
+			// recomputes it live instead of storing the bit, since goopg has no
+			// firing engine to ever need to reset it).
+			dathasloginevt := "false"
+			if n == "postgres" {
+				for _, et := range c.ListEventTriggers() {
+					if et.Event == "login" && et.Enabled != "D" {
+						dathasloginevt = "true"
+						break
+					}
+				}
+			}
 			out = append(out, []string{
 				oid, // oid: conventional database OID (M0097-0021)
 				n,
@@ -8481,6 +8507,7 @@ func (c *InMemory) registerSystemTables() {
 				VirtualNull,   // daticurules: NULL (no ICU rules)
 				VirtualNull,   // datcollversion: NULL (recomputed on restore, mirrors pg_collation)
 				datacl,        // datacl: GRANT/REVOKE … ON DATABASE … projection (M0119-0004-ACLHEAP)
+				dathasloginevt, // dathasloginevt: any non-disabled `ON login` event trigger registered (M0134-0123)
 			})
 		}
 		return out

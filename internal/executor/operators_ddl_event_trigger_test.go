@@ -42,6 +42,48 @@ func TestCreateEventTriggerRegistersRow(t *testing.T) {
 	}
 }
 
+// TestCreateEventTriggerLoginSetsDatHasLoginEvt pins
+// pg_database.dathasloginevt (M0134-0123): PostgreSQL sets this bit at
+// CREATE EVENT TRIGGER ... ON login / ALTER EVENT TRIGGER ... ENABLE time
+// (SetDatabaseHasLoginEventTriggers, event_trigger.c:390-414) so monitoring
+// queries can tell whether login events are wired up without a firing
+// engine having ever run. goopg has no firing engine (DU-002), but the flag
+// itself only reflects registration state and is computed live from the
+// event trigger registry, so it must still flip true/false correctly.
+func TestCreateEventTriggerLoginSetsDatHasLoginEvt(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	hasLoginEvt := func() bool {
+		rows := runQuery(t, ctx, `SELECT dathasloginevt FROM pg_database WHERE datname = 'postgres'`)
+		if len(rows) != 1 {
+			t.Fatalf("pg_database WHERE datname='postgres': got %d rows, want 1", len(rows))
+		}
+		return rows[0][0].BoolValue()
+	}
+
+	if got := hasLoginEvt(); got {
+		t.Fatalf("dathasloginevt before CREATE EVENT TRIGGER = %v, want false", got)
+	}
+
+	if err := runDDL(t, ctx, `CREATE FUNCTION on_login_proc() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN END $$`); err != nil {
+		t.Fatalf("CREATE FUNCTION: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE EVENT TRIGGER on_login_trigger ON login EXECUTE PROCEDURE on_login_proc()`); err != nil {
+		t.Fatalf("CREATE EVENT TRIGGER ... ON login: %v", err)
+	}
+	if got := hasLoginEvt(); !got {
+		t.Fatalf("dathasloginevt after CREATE EVENT TRIGGER ON login = %v, want true", got)
+	}
+
+	if err := runDDL(t, ctx, `ALTER EVENT TRIGGER on_login_trigger DISABLE`); err != nil {
+		t.Fatalf("ALTER EVENT TRIGGER ... DISABLE: %v", err)
+	}
+	if got := hasLoginEvt(); got {
+		t.Fatalf("dathasloginevt after disabling the only login trigger = %v, want false", got)
+	}
+}
+
 // TestCreateEventTriggerDuplicateNameErrors pins PG's 42710 duplicate_object
 // behavior for a repeated trigger name.
 func TestCreateEventTriggerDuplicateNameErrors(t *testing.T) {
