@@ -995,6 +995,30 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 		if castTargetType == "char" && x.Typmod > 0 {
 			castTargetType = "bpchar"
 		}
+		// integer::bit(n) / integer::bit varying(n): PG's bitfromint4/
+		// bitfromint8 (pg_cast int4→bit castfunc bit(int4,int4), varbit.c)
+		// convert the two's-complement register value into its binary-digit
+		// string, NOT a decimal rendering — evalCast has no int→bit arm at
+		// all today (falls through to a generic stringify, so `5::bit(32)`
+		// silently printed "5" instead of 32 zero/one digits). Handled here,
+		// ahead of evalCastTyped, because the bit width lives in x.Typmod,
+		// which evalCastTyped's (targetType, sourceType) signature has no
+		// slot for. Every hash*()::bit(32) probe in hash_func.sql routes
+		// through this path. M0134-0128.
+		if v.Kind == KindInt && (strings.EqualFold(castTargetType, "bit") || strings.EqualFold(castTargetType, "varbit") || strings.EqualFold(castTargetType, "bit varying")) {
+			srcWidth := 32
+			switch strings.ToLower(x.SourceType) {
+			case "int8", "bigint":
+				srcWidth = 64
+			case "int2", "smallint":
+				srcWidth = 16
+			}
+			n := int(x.Typmod)
+			if n <= 0 {
+				n = 1
+			}
+			return NewStringDatum(intToBitTypmodString(v.Int, srcWidth, n)), nil
+		}
 		result, err := evalCastTyped(v, castTargetType, x.SourceType, x.Pos(), ctx)
 		if err != nil {
 			return Datum{}, err
@@ -4228,6 +4252,186 @@ func roundFloat4ToInt(d Datum, pos int) (int64, error) {
 		return 0, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
 	}
 	return int64(rounded), nil
+}
+
+// evalHashFunc dispatches the scalar/extended SQL hash-function pair named by
+// `name` (see the evalFuncCall case list above). All ten families are STRICT
+// (PG: proisstrict) — a NULL primary argument returns NULL without
+// evaluating the seed. The *extended siblings return bigint (the full
+// pgHashUint32Extended/pgHashBytesExtended 64-bit result); the plain siblings
+// return int4 (the low 32 bits, matching hash_uint32/hash_bytes's C uint32
+// return type — PG relies on this for cross-type hash-join compatibility
+// between int2/int4/int8, hence hashint8's fold-to-32-bit-key trick below).
+// M0134-0128.
+func evalHashFunc(name string, x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
+	if len(x.Args) < 1 {
+		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(),
+			Message: fmt.Sprintf("function %s() does not exist", name)}
+	}
+	v, err := evalExprSlot(x.Args[0], slot, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	if v.IsNull() {
+		return NullDatum, nil
+	}
+	extended := strings.HasSuffix(name, "extended")
+	var seed uint64
+	if extended && len(x.Args) > 1 {
+		sd, serr := evalExprSlot(x.Args[1], slot, ctx)
+		if serr != nil {
+			return Datum{}, serr
+		}
+		if sd.IsNull() {
+			return NullDatum, nil
+		}
+		seed = uint64(sd.Int)
+	}
+	typeErr := func() (Datum, error) {
+		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(),
+			Message: fmt.Sprintf("function %s does not exist", name)}
+	}
+	uint32Result := func(key uint32) (Datum, error) {
+		if extended {
+			return Datum{Kind: KindInt, Int: int64(pgHashUint32Extended(key, seed))}, nil
+		}
+		return Datum{Kind: KindInt, Int: int64(int32(pgHashUint32(key)))}, nil
+	}
+	bytesResult := func(b []byte) (Datum, error) {
+		h := pgHashBytesExtended(b, seed)
+		if extended {
+			return Datum{Kind: KindInt, Int: int64(h)}, nil
+		}
+		return Datum{Kind: KindInt, Int: int64(int32(uint32(h)))}, nil
+	}
+	base := strings.TrimSuffix(name, "extended")
+	switch base {
+	case "hashint2":
+		if v.Kind != KindInt {
+			return typeErr()
+		}
+		return uint32Result(uint32(int32(int16(v.Int))))
+	case "hashint4":
+		if v.Kind != KindInt {
+			return typeErr()
+		}
+		return uint32Result(uint32(int32(v.Int)))
+	case "hashoid":
+		if v.Kind != KindInt {
+			return typeErr()
+		}
+		return uint32Result(uint32(v.Int))
+	case "hashchar":
+		if v.Kind != KindString {
+			return typeErr()
+		}
+		s := v.StringValue()
+		var b byte
+		if len(s) > 0 {
+			b = s[0]
+		}
+		return uint32Result(uint32(int32(int8(b))))
+	case "hashint8":
+		// hashint8/hashint8extended (hashfunc.c): fold to a 32-bit key
+		// compatible with hashint4/hashint2 for cross-type hash joins — xor
+		// the high half into the low half, complementing the high half first
+		// when negative. Mirrors pgHashInt8's own derivation (M0134-0071).
+		if v.Kind != KindInt {
+			return typeErr()
+		}
+		val := v.Int
+		lohalf := uint32(val)
+		hihalf := uint32(val >> 32)
+		if val >= 0 {
+			lohalf ^= hihalf
+		} else {
+			lohalf ^= ^hihalf
+		}
+		return uint32Result(lohalf)
+	case "hashfloat4", "hashfloat8":
+		f, ok := datumToFloat64(v)
+		if !ok {
+			return typeErr()
+		}
+		// -0/0 and every NaN bit pattern must hash identically (hashfloat4/8,
+		// hashfunc.c): zero short-circuits to 0 (or the bare seed, for the
+		// extended form — hash_any_extended's own zero-length-independent
+		// seed passthrough), NaN is normalized to a canonical value first.
+		if f == 0 {
+			if extended {
+				return Datum{Kind: KindInt, Int: int64(seed)}, nil
+			}
+			return Datum{Kind: KindInt, Int: 0}, nil
+		}
+		if math.IsNaN(f) {
+			f = math.NaN()
+		}
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], math.Float64bits(f))
+		return bytesResult(buf[:])
+	case "hashname", "hashtext", "hashbpchar":
+		if v.Kind != KindString {
+			return typeErr()
+		}
+		return bytesResult([]byte(v.StringValue()))
+	}
+	return typeErr()
+}
+
+// intToBitTypmodString converts an integer's two's-complement bit pattern
+// into an n-digit '0'/'1' string, mirroring PG's bitfromint4/bitfromint8
+// (postgres/src/backend/utils/adt/varbit.c): when n is within the source
+// integer's width the low n bits are taken verbatim (no sign handling —
+// PG's destbitsleft==srcbitsleft case falls straight to the whole/fractional
+// -byte copy loops); when n exceeds the source width the extra high-order
+// digits are the sign bit repeated (arithmetic-shift sign extension — PG's
+// zero/one-fill loop plus its `val |= ((uint)-1) << ...` fractional-byte
+// sign-fill collapse to exactly this once the byte-level bookkeeping is
+// removed). srcWidth is 16/32/64 for int2/int4/int8 sources. M0134-0128.
+func intToBitTypmodString(val int64, srcWidth, n int) string {
+	if n <= 0 {
+		n = 1
+	}
+	var full uint64
+	var sign bool
+	switch srcWidth {
+	case 16:
+		full = uint64(uint16(int16(val)))
+		sign = int16(val) < 0
+	case 32:
+		full = uint64(uint32(int32(val)))
+		sign = int32(val) < 0
+	default:
+		full = uint64(val)
+		sign = val < 0
+	}
+	var b strings.Builder
+	b.Grow(n)
+	if n > srcWidth {
+		fillBit := byte('0')
+		if sign {
+			fillBit = '1'
+		}
+		for i := 0; i < n-srcWidth; i++ {
+			b.WriteByte(fillBit)
+		}
+		for i := srcWidth - 1; i >= 0; i-- {
+			b.WriteByte(bitDigit(full, i))
+		}
+	} else {
+		for i := n - 1; i >= 0; i-- {
+			b.WriteByte(bitDigit(full, i))
+		}
+	}
+	return b.String()
+}
+
+// bitDigit renders bit i (0 = least significant) of full as '0' or '1'.
+func bitDigit(full uint64, i int) byte {
+	if full&(uint64(1)<<uint(i)) != 0 {
+		return '1'
+	}
+	return '0'
 }
 
 // datumToFloat64 converts any numeric Datum kind to float64.
@@ -15933,6 +16137,28 @@ case "pg_char_to_encoding":
 		}
 		c, _ := relStats.peekStaging(sessionStatsID(ctx), oid)
 		return NewIntDatum(c.tuplesInserted), nil
+
+	// hashint2/hashint4/hashint8/hashoid/hashchar/hashfloat4/hashfloat8/
+	// hashname/hashtext/hashbpchar and their *extended siblings — PG's
+	// SQL-callable hash-index support functions (access/hash/hashfunc.c,
+	// utils/adt/hashfunc.c). pg_proc already seeded these OIDs (they show up
+	// in \df and hash-opclass FUNCTION 1/2 lookups) but no scalar dispatch
+	// existed, so any direct SELECT hashint4(...) call fell through to the
+	// generic 42883 "does not exist". Reuses the Jenkins-hash primitives
+	// hash_partition.go already ports PG-faithfully (pgHashUint32Extended /
+	// pgHashBytesExtended / pgHashInt8, M0097-0027 + M0134-0071) — this slice
+	// is pure wiring, not new hash-algorithm work. M0134-0128 (hash_func.sql).
+	// hash_numeric/hash_array/hash_record/hash_range/hash_multirange/
+	// hash_aclitem/hashmacaddr[8]/hashinet/time_hash/timetz_hash/
+	// interval_hash/timestamp_hash/uuid_hash/pg_lsn_hash/hashenum/
+	// hashoidvector/jsonb_hash need type-specific canonical-byte encoders
+	// this loop didn't build — deferred, ledger row 2026-08-24 M0134-0128.
+	case "hashint2", "hashint2extended", "hashint4", "hashint4extended",
+		"hashint8", "hashint8extended", "hashoid", "hashoidextended",
+		"hashchar", "hashcharextended", "hashfloat4", "hashfloat4extended",
+		"hashfloat8", "hashfloat8extended", "hashname", "hashnameextended",
+		"hashtext", "hashtextextended", "hashbpchar", "hashbpcharextended":
+		return evalHashFunc(name, x, slot, ctx)
 	}
 
 	// Function-style type casts: int4(x), float8(x), text(x), etc.
