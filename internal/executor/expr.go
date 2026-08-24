@@ -5548,6 +5548,23 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			}
 		}
 		return d, nil
+	case "jsonpath":
+		// `::jsonpath` re-lexes/re-prints double-quoted string escapes the
+		// same way PG's jsonpath scanner+printer round-trip does
+		// (jsonpath_encoding.go) but does not implement the rest of PG's
+		// jsonpath grammar — path navigation, filters, and operators pass
+		// through unvalidated. M0134-0134.
+		if s, ok := datumAsString(d); ok {
+			rewritten, err := rewriteJSONPathText(s)
+			if err != nil {
+				if ee, ok := err.(*ExecError); ok {
+					ee.Pos = pos
+				}
+				return Datum{}, err
+			}
+			return NewStringDatum(rewritten), nil
+		}
+		return d, nil
 	}
 	return d, nil // pass-through for unknown types
 }
